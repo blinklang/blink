@@ -271,6 +271,14 @@ fn tc_variant_decl_node(var_idx: Int) -> Int {
     evar_decl_nodes.get(var_idx).unwrap()
 }
 
+// The evar_pool slot of variant declaration `vdecl`, or -1.
+fn tc_variant_slot_of_decl(vdecl: Int) -> Int {
+    for i in evar_slots_by_name.get(node_name(vdecl)) ?? [] {
+        if tc_variant_decl_node(i) == vdecl { return i }
+    }
+    -1
+}
+
 fn tc_variant_mixes_fields(var_idx: Int) -> Bool {
     let vdecl = tc_variant_decl_node(var_idx)
     vdecl != -1 && tc_fields_mix_named_and_unnamed(node_fields(vdecl))
@@ -5188,13 +5196,15 @@ fn tc_seed_closure_args_with_binds(sig: Int, args_sl: Int, arg_tids: List[Int], 
         let pidx = i + self_offset
         if pidx < param_count {
             let arg = sublist_get(args_sl, i)
-            let formal = substitute_typevar_tid(fnsig_param_list.get(param_start + pidx).unwrap(), binds)
-            // Only a closure is seeded again. A literal at a bare type variable was checked
-            // with no expected type, and the Int it made the variable is no type the program
-            // wrote, so it must not be range-checked against that Int as if it were.
-            if tc_formal_reaches_closure(formal) != 0 {
+            let declared = fnsig_param_list.get(param_start + pidx).unwrap()
+            let formal = substitute_typevar_tid(declared, binds)
+            // A literal at a bare type variable was checked with no expected type, and the Int
+            // it made the variable is no type the program wrote, so it must not be range-checked
+            // against that Int as if it were.
+            let v = if node_kind(arg) == NodeKind.NamedArg { node_value(arg) } else { arg }
+            if !(is_literal_tree_node(v) && tc_tid_typevar_key(declared) != "") {
                 tc_seed_expected_into_value(arg, formal)
-                tids.set(i, infer_type(arg))
+                if tc_formal_reaches_closure(formal) != 0 { tids.set(i, infer_type(arg)) }
             }
         }
         i = i + 1
@@ -5499,11 +5509,17 @@ fn tc_call_arg_parts(call: Int, expected: Int) -> List[ExpectedPart] {
         }
         return parts
     }
-    let decl = tc_call_decl_node(call)
-    if tc_own_type_param_count(decl) == 0 { return parts }
-    let sig = fnsig_by_decl.get(decl) ?? -1
+    let mut sig = -1
+    let recorded = tc_call_decl_node(call)
+    if recorded >= 0 {
+        sig = fnsig_by_decl.get(recorded) ?? -1
+    } else if k == NodeKind.MethodCall {
+        sig = tc_receiver_method_sig(call)
+    }
     if sig == -1 { return parts }
     let fs = fnsig_pool.get(sig).unwrap()
+    let decl = fs.decl
+    if tc_own_type_param_count(decl) == 0 { return parts }
     let mut found: Map[Str, Int] = Map()
     unify_typevar_binds(fs.ret, d, found)
     // Only the callee's own binders: an impl's binders are the receiver's to fix.
@@ -5521,18 +5537,61 @@ fn tc_call_arg_parts(call: Int, expected: Int) -> List[ExpectedPart] {
         b = b + 1
     }
     if binds.len() == 0 { return parts }
-    let self_offset = if k == NodeKind.MethodCall && fs.params_count > 0 && (fnsig_param_names.get(fs.params_start) ?? "") == "self" { 1 } else { 0 }
+    let self_offset = tc_call_self_offset(call, fs)
     let mut i = 0
     while i < sublist_length(args) {
         let arg = sublist_get(args, i)
-        let mut pidx = i + self_offset
-        if node_kind(arg) == NodeKind.NamedArg { pidx = tc_fnsig_param_index_by_name(fs.params_start, fs.params_count, self_offset, node_name(arg)) }
-        if pidx >= 0 && pidx < fs.params_count {
+        let pidx = tc_call_arg_param_index(fs, self_offset, arg, i)
+        if pidx >= 0 && pidx < fs.params_count && !tc_is_default_fill(arg) {
             parts.push(ExpectedPart { value: arg, expected: substitute_typevar_tid(fnsig_param_list.get(fs.params_start + pidx).unwrap(), binds) })
         }
         i = i + 1
     }
     parts
+}
+
+// The parameter that argument 0 of call `call` fills. A method called on a value passes the
+// value as `self`; one called on a type or a trait name passes its receiver as the first
+// argument. A local is known by its recorded binder, so the answer is the same once the walk
+// has closed its scope.
+fn tc_call_self_offset(call: Int, fs: FnSigEntry) -> Int {
+    if node_kind(call) != NodeKind.MethodCall || fs.params_count == 0 || (fnsig_param_names.get(fs.params_start) ?? "") != "self" { return 0 }
+    let obj = node_obj(call)
+    if obj != -1 && node_kind(obj) == NodeKind.Ident && nr_has_binding(node_name(obj)) == 0 && tc_ident_binder_node(obj) == -1 { return 0 }
+    1
+}
+
+// The parameter index argument `arg`, at position `i`, fills: its label's, else its position's.
+fn tc_call_arg_param_index(fs: FnSigEntry, self_offset: Int, arg: Int, i: Int) -> Int {
+    if node_kind(arg) == NodeKind.NamedArg { return tc_fnsig_param_index_by_name(fs.params_start, fs.params_count, self_offset, node_name(arg)) }
+    i + self_offset
+}
+
+// The signature a method call on a struct or enum value, or on the type's name, reaches
+// before the call is inferred, read from the receiver's type as the MethodCall arm of
+// infer_type_uncached reads it. -1 when the receiver's type is not known yet or two traits
+// declare the method.
+fn tc_receiver_method_sig(call: Int) -> Int {
+    let obj = node_obj(call)
+    if obj == -1 { return -1 }
+    let mut t = tc_lookup_node_tid(obj)
+    if t < 0 && node_kind(obj) == NodeKind.Ident { t = nr_get_type(node_name(obj)) }
+    // A name that binds no value is the type's own: `S.m(s, x)` passes the receiver first.
+    if tc_tid_is_no_info(t) != 0 && node_kind(obj) == NodeKind.Ident && tc_ident_binder_node(obj) == -1 { t = lookup_named_type(node_name(obj)) }
+    if t < 0 { return -1 }
+    let r = resolve_alias_tid(tc_resolve(t))
+    let rk = tc_tid_kind(r)
+    if rk != TyKind.Struct && rk != TyKind.Enum { return -1 }
+    tc_type_method_sig(ty_pool.get(r).unwrap().name, node_method(call))
+}
+
+// The signature method `method` of the struct or enum named `tname` resolves to: its sole
+// trait's impl, else the type's own. -1 when there is none or two traits declare it (§3c
+// rule 3).
+fn tc_type_method_sig(tname: Str, method: Str) -> Int {
+    if tc_method_trait_count(tname, method) >= 2 { return -1 }
+    let sole_trait = tc_method_trait_names(tname, method)
+    lookup_fnsig(if sole_trait != "" { tc_impl_method_stem(tname, sole_trait, method) } else { "{tname}_{method}" })
 }
 
 fn tc_push_tail_part(parts: List[ExpectedPart], body: Int, expected: Int) {
@@ -5565,11 +5624,28 @@ fn tc_struct_built_by_lit(lit_tid: Int, d: Int) -> Bool {
 // them.
 fn tc_variant_built_by_call(call: Int, d: Int) -> Int {
     if tc_tid_kind(d) != TyKind.Enum { return -1 }
-    let vdecl = tc_call_decl_node(call)
+    let mut vdecl = tc_call_decl_node(call)
+    if vdecl < 0 { vdecl = tc_qualified_variant_decl_of_call(call) }
     if vdecl < 0 || node_kind(vdecl) != NodeKind.TypeVariant { return -1 }
     let var_idx = get_variant_by_name(tc_enum_base_tid(d), node_name(vdecl))
     if var_idx < 0 || tc_variant_decl_node(var_idx) != vdecl || !tc_variant_fields_typed_at(var_idx, d) { return -1 }
     var_idx
+}
+
+// The variant `Enum.Variant(...)` names, read as the MethodCall arm of infer_type_uncached
+// reads it, for a call inference has not reached yet; else -1. A qualifier that is a value is
+// not the enum's type, and the binder answers for a local once its scope has closed.
+fn tc_qualified_variant_decl_of_call(call: Int) -> Int {
+    if node_kind(call) != NodeKind.MethodCall { return -1 }
+    let obj = node_obj(call)
+    if obj == -1 || node_kind(obj) != NodeKind.Ident || tc_ident_binder_node(obj) != -1 { return -1 }
+    let cname = node_name(obj)
+    if tc_tid_is_no_info(nr_get_type(cname)) == 0 { return -1 }
+    let ctor_tid = lookup_named_type(cname)
+    if ctor_tid == -1 || type_kind(ctor_tid) != TyKind.Enum { return -1 }
+    let var_idx = get_variant_by_name(ctor_tid, node_method(call))
+    if var_idx < 0 { return -1 }
+    tc_variant_decl_node(var_idx)
 }
 
 // The variant of enum type `d` that brace literal `lit`, typed `lit_tid`, constructs, or -1
@@ -5599,30 +5675,35 @@ fn tc_variant_fields_typed_at(var_idx: Int, d: Int) -> Bool {
 }
 
 // The slot of carrier `d` that a `Some(x)`, `Ok(x)` or `Err(x)` call fills, bare or qualified
-// (`Option.Some(x)`), or -1 when `call` is not one. A user variant spelled like a carrier
-// reaches its declaration instead.
+// (`Option.Some(x)`), or -1 when `call` is not one.
 fn tc_carrier_slot_built_by_call(call: Int, d: Int) -> Int {
-    let k = node_kind(call)
-    if k != NodeKind.Call && k != NodeKind.MethodCall { return -1 }
-    let args = node_args(call)
-    if args == -1 || sublist_length(args) != 1 { return -1 }
-    if node_kind(sublist_get(args, 0)) == NodeKind.NamedArg { return -1 }
-    let mut name = ""
-    if k == NodeKind.MethodCall {
-        // Mirrors the MethodCall arm of infer_type_uncached: a qualifier that is a value is not
-        // the carrier's type.
-        let obj = node_obj(call)
-        if obj == -1 || node_kind(obj) != NodeKind.Ident || tc_tid_is_no_info(nr_get_type(node_name(obj))) == 0 { return -1 }
-        if tc_qualified_carrier(node_name(obj), node_method(call)).is_none() { return -1 }
-        name = node_method(call)
-    } else {
-        let callee = node_left(call)
-        if callee == -1 || node_kind(callee) != NodeKind.Ident || tc_call_decl_node(call) >= 0 { return -1 }
-        name = node_name(callee)
-    }
+    let name = tc_carrier_variant_of_call(call)
     let carrier = tc_prelude_carrier_of(name) ?? TyKind.Unknown
     if carrier == TyKind.Unknown || carrier != tc_tid_kind(d) { return -1 }
     if name == "Err" { 1 } else { 0 }
+}
+
+// The carrier variant `Some`, `Ok` or `Err` that `call` builds from one positional argument,
+// bare or qualified (`Option.Some(x)`), or "" when it builds none. A user variant spelled like
+// a carrier reaches its declaration instead.
+fn tc_carrier_variant_of_call(call: Int) -> Str {
+    let k = node_kind(call)
+    if k != NodeKind.Call && k != NodeKind.MethodCall { return "" }
+    let args = node_args(call)
+    if args == -1 || sublist_length(args) != 1 { return "" }
+    if node_kind(sublist_get(args, 0)) == NodeKind.NamedArg { return "" }
+    if k == NodeKind.MethodCall {
+        // Mirrors the MethodCall arm of infer_type_uncached: a qualifier that is a value is not
+        // the carrier's type. The binder answers for a local once its scope has closed.
+        let obj = node_obj(call)
+        if obj == -1 || node_kind(obj) != NodeKind.Ident || tc_tid_is_no_info(nr_get_type(node_name(obj))) == 0 || tc_ident_binder_node(obj) != -1 { return "" }
+        if tc_qualified_carrier(node_name(obj), node_method(call)).is_none() { return "" }
+        return node_method(call)
+    }
+    let callee = node_left(call)
+    if callee == -1 || node_kind(callee) != NodeKind.Ident || tc_call_decl_node(call) >= 0 { return "" }
+    if tc_prelude_carrier_of(node_name(callee)).is_none() { return "" }
+    node_name(callee)
 }
 
 // The tid the checked walk recorded for a tail inside a value. A fresh infer_type would mint
@@ -20852,9 +20933,13 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                 // receiver's arguments of a static conversion; without it here, the first
                 // inference would find either ambiguous before the body walk hints it.
                 let saved_nr_hint = tc_construct_hint
-                if let_type_ann != -1 && (tc_names_bare_variant(val) || tc_names_static_conversion(val)) {
-                    let ann_tid = resolve_type_ann(let_type_ann)
-                    if tc_tid_is_no_info(ann_tid) == 0 { tc_construct_hint = resolve_alias_tid(ann_tid) }
+                let ann_tid = if let_type_ann != -1 { resolve_type_ann(let_type_ann) } else { TYPE_UNKNOWN }
+                if tc_tid_is_no_info(ann_tid) == 0 {
+                    if tc_names_bare_variant(val) || tc_names_static_conversion(val) { tc_construct_hint = resolve_alias_tid(ann_tid) }
+                    // The expected type reaches a call's type variables before its arguments
+                    // are checked (sections/03_types.md *Integer literal range*), and this is
+                    // the first check of them.
+                    if vk != NodeKind.Ident { tc_seed_expected_into_value(val, ann_tid) }
                 }
                 let inferred = infer_type(val)
                 tc_construct_hint = saved_nr_hint
@@ -26080,8 +26165,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             // one key per impl (handled via the builtin-method path
             // below), so a bare-key fallback keeps any non-trait inherent sig.
             let sole_trait = tc_method_trait_names(tname, method)
-            let sig_name = if sole_trait != "" { tc_impl_method_stem(tname, sole_trait, method) } else { "{tname}_{method}" }
-            let sig = lookup_fnsig(sig_name)
+            let sig = tc_type_method_sig(tname, method)
             if sig != -1 {
                 // Before the argument check: an argument typed by an impl binder takes the
                 // receiver's type argument as its hint, as a List poly-impl argument does.
@@ -33839,8 +33923,11 @@ fn tc_note_owner_of_each(items: Int, owner_node: Int, owner: Map[Int, Int]) {
     let mut i = 0
     while i < sublist_length(items) {
         let item = sublist_get(items, i)
-        owner.insert(item, owner_node)
-        if node_kind(item) == NodeKind.NamedArg && node_value(item) != -1 { owner.insert(node_value(item), owner_node) }
+        // A default the checker filled in is not text the user wrote, so no help repeats it.
+        if !tc_is_default_fill(item) {
+            owner.insert(item, owner_node)
+            if node_kind(item) == NodeKind.NamedArg && node_value(item) != -1 { owner.insert(node_value(item), owner_node) }
+        }
         i = i + 1
     }
 }
@@ -33870,22 +33957,20 @@ fn tc_open_variable_literal_report(n: Int, sites: LiteralSites) -> OpenLiteralRe
     let none = OpenLiteralReport { why: "", help: "" }
     let site = sites.owner.get(n) ?? -1
     if site == -1 { return none }
-    let fits = tc_literal_takes_u64(n)
-    if sites.push_let.contains(site) && tc_tid_kind(resolve_alias_tid(tc_resolve(tc_lookup_node_tid(node_obj(site))))) == TyKind.List {
-        let decl = sites.push_let.get(site) ?? -1
-        let mut help = ""
-        if fits && decl != -1 && tc_is_open_list_let(decl) { help = "{tc_let_head(decl)}: List[U64] = []" }
+    let push_decl = sites.push_let.get(site) ?? -1
+    if push_decl != -1 && tc_is_open_list_let(push_decl) && tc_push_elem_is_open(site) {
+        let help = if tc_each_push_takes_u64(push_decl, sites) { "{tc_let_head(push_decl)}: List[U64] = []" } else { "" }
         return OpenLiteralReport { why: "the element type is not known here, so the literal is Int", help: help }
     }
-    if !fits { return none }
+    if !tc_literal_takes_u64(n) { return none }
     let decl = sites.let_of.get(site) ?? -1
     let sk = node_kind(site)
     if sk == NodeKind.ListLit {
         let text = tc_index_text(site)
-        if decl == -1 || text == "" || !tc_each_takes_u64(node_elements(site), -1) { return none }
+        if decl == -1 || text == "" || !tc_each_takes_u64(node_elements(site)) { return none }
         return OpenLiteralReport { why: "", help: "{tc_let_head(decl)}: List[U64] = {text}" }
     }
-    if node_type_params(site) != -1 { return none }
+    if node_type_params(site) != -1 || tc_call_on_type_name(site) { return none }
     let head = tc_call_head_text(site)
     let args = node_args(site)
     if head == "" || args == -1 { return none }
@@ -33899,9 +33984,12 @@ fn tc_open_variable_literal_report(n: Int, sites: LiteralSites) -> OpenLiteralRe
     let mut parts: List[Str] = []
     let mut i = 0
     while i < sublist_length(args) {
-        let a = tc_index_text(sublist_get(args, i))
-        if a == "" { return none }
-        parts.push(a)
+        let arg = sublist_get(args, i)
+        if !tc_is_default_fill(arg) {
+            let a = tc_index_text(arg)
+            if a == "" { return none }
+            parts.push(a)
+        }
         i = i + 1
     }
     let call = "{head}[U64]({parts.join(", ")})"
@@ -33915,21 +34003,47 @@ fn tc_literal_takes_u64(n: Int) -> Bool {
     node_kind(n) == NodeKind.IntLit && tc_literal_fits(n, TyKind.U64)
 }
 
-// Whether every item of `items` but `except` is a literal U64 holds.
-fn tc_each_takes_u64(items: Int, except: Int) -> Bool {
+// Whether every item of `items` is a literal U64 holds.
+fn tc_each_takes_u64(items: Int) -> Bool {
     if items == -1 { return true }
     let mut i = 0
     while i < sublist_length(items) {
-        let item = sublist_get(items, i)
-        if item != except && !tc_literal_takes_u64(item) { return false }
+        if !tc_literal_takes_u64(sublist_get(items, i)) { return false }
         i = i + 1
     }
     true
 }
 
+// Whether each push to the list `decl` binds pushes a literal U64 holds: the annotation the
+// help gives fixes the element type for every push, not only the one reported.
+fn tc_each_push_takes_u64(decl: Int, sites: LiteralSites) -> Bool {
+    for (push, binder) in sites.push_let {
+        if binder == decl && !tc_each_takes_u64(node_args(push)) { return false }
+    }
+    true
+}
+
+// Whether the list `push` adds to has no element type but the Int its literals gave it: an
+// earlier push of a `Str` makes the element type known, and the literal is then the mismatch.
+fn tc_push_elem_is_open(push: Int) -> Bool {
+    let elem = tc_tid_list_elem(resolve_alias_tid(tc_resolve(tc_lookup_node_tid(node_obj(push)))))
+    elem < 0 || tc_tid_is_concrete(elem) == 0 || type_kind(elem) == TyKind.Int
+}
+
+// `W.make(...)`: a call on a type or trait name. Its type arguments are not written there,
+// so a help that adds them would not compile.
+fn tc_call_on_type_name(call: Int) -> Bool {
+    if node_kind(call) != NodeKind.MethodCall { return false }
+    let obj = node_obj(call)
+    if obj == -1 || node_kind(obj) != NodeKind.Ident { return false }
+    let name = node_name(obj)
+    if nr_has_binding(name) != 0 || tc_ident_binder_node(obj) != -1 { return false }
+    lookup_named_type(name) >= 0 || is_trait_name(name) != 0
+}
+
 // `let mut name = []`: the binding a push to an open list would annotate.
 fn tc_is_open_list_let(decl: Int) -> Bool {
-    if node_kind(decl) != NodeKind.LetBinding || node_is_mut(decl) == 0 || node_type_name(decl) != "" { return false }
+    if node_kind(decl) != NodeKind.LetBinding || node_is_mut(decl) == 0 || node_target(decl) != -1 || node_type_name(decl) != "" { return false }
     let v = node_value(decl)
     if v == -1 || node_kind(v) != NodeKind.ListLit { return false }
     let elems = node_elements(v)
@@ -33937,34 +34051,35 @@ fn tc_is_open_list_let(decl: Int) -> Bool {
 }
 
 // The type `Option` or a user enum that constructor call `call` builds, when it has one type
-// parameter and literal `n` is its only payload, at that parameter; else "".
+// parameter and literal `n` is its only payload, at that parameter; else "". The help spells
+// the type by its declared name, so a call that names it another way (an alias, a module path)
+// gets "".
 fn tc_one_param_carrier_named(call: Int, n: Int) -> Str {
     let args = node_args(call)
     if sublist_length(args) != 1 || sublist_get(args, 0) != n { return "" }
+    if tc_carrier_variant_of_call(call) == "Some" { return "Option" }
     let vdecl = tc_call_decl_node(call)
-    if vdecl == -1 {
-        let head = if node_kind(call) == NodeKind.Call && node_kind(node_left(call)) == NodeKind.Ident { node_name(node_left(call)) } else { "" }
-        if head == "Some" { return "Option" }
-        return ""
-    }
-    if node_kind(vdecl) != NodeKind.TypeVariant { return "" }
-    let mut var_idx = -1
-    for i in evar_slots_by_name.get(node_name(vdecl)) ?? [] {
-        if tc_variant_decl_node(i) == vdecl { var_idx = i }
-    }
+    if vdecl == -1 || node_kind(vdecl) != NodeKind.TypeVariant { return "" }
+    let var_idx = tc_variant_slot_of_decl(vdecl)
     if var_idx == -1 { return "" }
     let edecl = evar_pool.get(var_idx).unwrap().enum_decl
     let tps = if edecl >= 0 { node_type_params(edecl) } else { -1 }
     if tps == -1 || sublist_length(tps) != 1 { return "" }
     let tp = sublist_get(tps, 0)
     if tc_tid_typevar_key(lookup_evfield_type_by_index(var_idx, 0)) != tc_binder_key(tp, node_name(tp)) { return "" }
-    node_name(edecl)
+    let tname = node_name(edecl)
+    if node_kind(call) == NodeKind.MethodCall {
+        let obj = node_obj(call)
+        if node_kind(obj) != NodeKind.Ident || node_name(obj) != tname { return "" }
+    }
+    tname
 }
 
-// Whether generic call `call` declares one type parameter, literal `n` is checked against it
-// bare, and every other argument at that parameter is a literal U64 holds, so the list `[U64]`
-// compiles. A parameter the literal does not reach, or a sibling of another type that names a
-// type parameter, would need types the help cannot know.
+// Whether generic call `call` declares one type parameter that U64 meets the bounds of,
+// literal `n` is checked against it bare, and every other argument at that parameter is a
+// literal U64 holds, so the list `[U64]` compiles. A parameter the literal does not reach, a
+// sibling of another type that names a type parameter, or a label the callee does not declare
+// as a keyword would need edits the help cannot know.
 fn tc_call_literal_reaches_its_one_binder(call: Int, n: Int) -> Bool {
     let decl = tc_call_decl_node(call)
     if decl == -1 || node_kind(decl) != NodeKind.FnDef || tc_own_type_param_count(decl) != 1 { return false }
@@ -33972,20 +34087,20 @@ fn tc_call_literal_reaches_its_one_binder(call: Int, n: Int) -> Bool {
     if sig == -1 { return false }
     let fs = fnsig_pool.get(sig).unwrap()
     let tp = sublist_get(node_type_params(decl), 0)
+    if !tc_u64_meets_bounds_of(fs, node_name(tp)) { return false }
     let key = tc_binder_key(tp, node_name(tp))
-    let self_offset = if node_kind(call) == NodeKind.MethodCall && fs.params_count > 0 && (fnsig_param_names.get(fs.params_start) ?? "") == "self" { 1 } else { 0 }
+    let self_offset = tc_call_self_offset(call, fs)
+    let kw_start = tc_fnsig_kw_start(fs.params_start, fs.params_count, self_offset)
     let args = node_args(call)
     let mut at_n = false
     let mut i = 0
     while i < sublist_length(args) {
         let arg = sublist_get(args, i)
-        let mut pidx = i + self_offset
-        let mut v = arg
-        if node_kind(arg) == NodeKind.NamedArg {
-            pidx = tc_fnsig_param_index_by_name(fs.params_start, fs.params_count, self_offset, node_name(arg))
-            v = node_value(arg)
-        }
+        let pidx = tc_call_arg_param_index(fs, self_offset, arg, i)
         if pidx < 0 || pidx >= fs.params_count { return false }
+        let labeled = node_kind(arg) == NodeKind.NamedArg
+        if labeled && pidx < kw_start { return false }
+        let v = if labeled { node_value(arg) } else { arg }
         let formal = fnsig_param_list.get(fs.params_start + pidx).unwrap()
         let bare = tc_tid_typevar_key(formal) == key
         if v == n {
@@ -33997,6 +34112,21 @@ fn tc_call_literal_reaches_its_one_binder(call: Int, n: Int) -> Bool {
         i = i + 1
     }
     at_n
+}
+
+// Whether U64 is known to meet every bound signature `fs` declares on its type parameter
+// `name`. A trait this check does not model answers no.
+fn tc_u64_meets_bounds_of(fs: FnSigEntry, name: Str) -> Bool {
+    let mut idx = fs.type_params_start
+    while idx < fs.type_params_start + fs.type_params_count && idx < fnsig_type_param_names.len() && idx < fnsig_tparam_bounds.len() {
+        if fnsig_type_param_names.get(idx).unwrap() == name {
+            for tr in fnsig_tparam_bounds.get(idx).unwrap().split("|") {
+                if tr != "" && tc_bound_fact(TYPE_U64, tr) != 1 { return false }
+            }
+        }
+        idx = idx + 1
+    }
+    true
 }
 
 fn tc_skip_literal_beside_non_integer(lit: Int, other: Int, skip: Set[Int]) {
