@@ -1,0 +1,94 @@
+// A literal tree in operand position takes the other operand's integer type, and the range
+// check applies to each literal in it at that type (sections/03_types.md §3.2 *A literal tree
+// that does not fit*): a literal that does not fit is E0318 at that literal, and nothing else
+// is reported for it. A tree with a name in it is not a literal tree, so it keeps its own type.
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_reset}
+import std.io
+
+// Every error a source draws, as `line:col code message`, so a row states the whole answer.
+fn probe_errors(stem: Str, src: Str) -> List[Str] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    let path = "build/{stem}_probe.bl"
+    write_file(path, src)
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _rm = process_run("rm", ["-f", path])
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" { out.push("{d.line}:{d.col} {d.code} {d.message}") }
+    }
+    out
+}
+
+fn assert_errors(stem: Str, src: Str, want: List[Str]) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    let got = probe_errors(stem, src)
+    if got != want { io.println("FAIL: {stem}:\n got  {got.join(" | ")}\n want {want.join(" | ")}") }
+    assert(got == want)
+}
+
+test "a literal that does not fit the type the tree takes is E0318 at that literal" {
+    assert_errors("tree_right_literal_too_big", #"fn f(u: U8) -> U8 { u + (300 - 100) }
+"#, ["1:26 E0318 300 does not fit in U8 (0 to 255)"])
+    assert_errors("tree_left_literal_too_big", #"fn f(x: I8) -> I8 { (2 * 200) + x }
+"#, ["1:26 E0318 200 does not fit in I8 (-128 to 127)"])
+    assert_errors("tree_comparison_literal_too_big", #"fn f(u: U16) -> Bool { u < (70000 + 1) }
+"#, ["1:29 E0318 70000 does not fit in U16 (0 to 65535)"])
+    assert_errors("tree_negative_literal_unsigned", #"fn f(u: U32) -> U32 { u + (2 * -1) }
+"#, ["1:32 E0318 -1 does not fit in U32"])
+    assert_errors("tree_wide_literal_takes_u64", #"fn f(m: U64) -> U64 { m & (9223372036854775808 | 1) }
+fn g(m: U64) -> U64 { m & (18446744073709551616 | 1) }
+"#, ["2:28 E0318 no integer type holds 18446744073709551616"])
+}
+
+test "every literal of a tree that fits compiles, even when an operation overflows" {
+    assert_errors("tree_fits_and_overflows", #"fn f(u: U8) -> U8 { u + (200 + 100) }
+fn g(x: I8) -> I8 { (127 + 1) + x }
+"#, [])
+}
+
+test "the shift amount tree is U32 and the shifted literal takes the tree's type" {
+    assert_errors("tree_shift_amount_too_big", #"fn f(q: U64) -> U64 { q << (4294967296 - 1) }
+"#, ["1:29 E0318 4294967296 does not fit in U32 (0 to 4294967295)"])
+    assert_errors("tree_shift_left_takes_tree_type", #"fn f(u: U8) -> U8 { u & (256 << 1) }
+"#, ["1:26 E0318 256 does not fit in U8 (0 to 255)"])
+    assert_errors("tree_shift_amount_past_tree_width", #"fn f(u: U8) -> U8 { u & (1 << 9) }
+fn g(u: U8) -> U8 { (1 << 7) | u }
+"#, ["1:28 E0300 shift `<<` amount 9 out of range for U8 (must be 0..8)"])
+}
+
+test "a tree with a name in it is not a literal tree" {
+    assert_errors("tree_with_name", #"fn f(x: I8) -> I8 {
+    let n = 2
+    x + (n * 3)
+}
+"#, ["3:7 E0300 binary `+`: incompatible types I8 and Int"])
+}
+
+test "a literal tree beside an operand that is not an integer reports the operator only" {
+    assert_errors("tree_beside_float", #"fn f(x: Float) -> Float { x + (1 + 2) }
+"#, ["1:29 E0300 binary `+`: incompatible types Float and Int"])
+    assert_errors("wide_tree_beside_float", #"fn f(x: Float) -> Float { x + (9223372036854775808 + -9223372036854775809) }
+"#, ["1:29 E0300 binary `+`: incompatible types Float and Int"])
+}
+
+// A tree beside an operand that nothing has solved yet does not wait for a later line, so the
+// variable becomes Int, as it does beside a lone literal.
+test "a literal tree beside a closure parameter makes the parameter Int" {
+    assert_errors("tree_beside_closure_param", #"fn main() {
+    let n: U64 = 3
+    let h = fn(x) { (1 + 1) + x }
+    io.println("{h(n)}")
+}
+"#, ["4:18 E0300 function `h` argument 0 expects Int, got U64"])
+    assert_errors("tree_beside_closure_param_expected", #"fn main() {
+    let n: U64 = 3
+    let h = fn(x) {
+        let r: U64 = x * (2 << 1)
+        r
+    }
+    io.println("{h(n)}")
+}
+"#, [])
+}

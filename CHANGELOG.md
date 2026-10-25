@@ -5,6 +5,7 @@ Single source of truth for release history. `blink llms` and `blink llms --full`
 ## Changes (unreleased)
 
 - **An operator checks an inferred operand with the type it ends up with.** A lone integer literal beside a closure parameter that nothing has typed yet makes the parameter `Int`, unless an expected integer type reaches the operator. So `let h = fn(x) { x + 1 }` called with a `U64` is a type error at the call; before, it compiled. Annotate the parameter: `fn(x: U64) { x + 1 }`. An operand with no literal beside it, such as `fn(x) { x * x }`, takes its type from the call, and a wrong type, such as `Str`, is an error at the operator; before, `blink check` accepted it and the build stopped with an internal compiler error. An operand that nothing types is E0301 CannotInferType.
+- **A literal tree operand takes the other operand's integer type.** A tree of only literals, parentheses, unary `-` and `+ - * / % & | ^ << >>` now takes the type of the other operand, on either side and in a comparison: `u * (100 + 2)` with `u: U8` and `m & (1 << 63)` with `m: U64` compile; before, they were "incompatible types U8 and Int". The amount tree of a shift is `U32`, so `q << (1 + 1)` compiles too. Each literal must fit that type (E0318), and an operation in the tree that overflows it panics at run time. A tree with a name in it, such as `x + (n * 3)`, keeps its own type.
 
 ## Breaking Changes (v0.58.0)
 
