@@ -14,7 +14,7 @@ import typecheck.{
     TyKind, tc_lookup_node_tid, tc_resolve, tc_tid_kind,
 }
 import diagnostics.{
-    Diag, diag_warn_at_notes, diag_source_file, diag_file_for_node,
+    Diag, diag_warn_at_notes, diag_warn_label_at_notes, diag_source_file, diag_file_for_node,
     diag_push_allows, diag_clear_allows,
     INCOMPLETE_STATE_RESTORE, UNRESTORED_MUTATION,
 }
@@ -1402,7 +1402,6 @@ fn sr_check_call(w: SrWalk, p: SrPairs, ev: Int, fn_name: Str, speculative_pair:
 
     let wstart = ma_write_starts.get(callee_idx).unwrap()
     let mut write_items: List[Str] = []
-    let mut return_items: List[Str] = []
     let mut unsaved: List[Str] = []
     let mut restored: List[Str] = []
     // A pair saves any global the callee writes, but only one the callee can return with
@@ -1411,13 +1410,9 @@ fn sr_check_call(w: SrWalk, p: SrPairs, ev: Int, fn_name: Str, speculative_pair:
     while wi < wcount {
         let gname = ma_write_items.get(wstart + wi).unwrap()
         write_items.push(gname)
-        let on_return = rw_has(w.ret, callee_idx, global_index(gname))
-        if on_return {
-            return_items.push(gname)
-        }
         if checked.contains(gname) {
             restored.push(gname)
-        } else if on_return && !bound.contains(gname) {
+        } else if rw_has(w.ret, callee_idx, global_index(gname)) && !bound.contains(gname) {
             unsaved.push(gname)
         }
         wi = wi + 1
@@ -1425,11 +1420,10 @@ fn sr_check_call(w: SrWalk, p: SrPairs, ev: Int, fn_name: Str, speculative_pair:
     if unsaved.len() == 0 {
         return
     }
-    let mut writes_note = "`{callee}` writes \{{str_join(write_items, ", ")}}"
-    if return_items.len() < write_items.len() {
-        writes_note = "{writes_note} · on return \{{str_join(return_items, ", ")}}"
-    }
-    let site_note = rw_write_site_note(w.ret, callee_idx, global_index(unsaved.get(0).unwrap()))
+    // The write items come in declaration order, so the first unsaved global is the same on
+    // every run; the write-site note and the label both name it.
+    let first = unsaved.get(0).unwrap()
+    let site_note = rw_write_site_note(w.ret, callee_idx, global_index(first))
     let missing = str_join(unsaved, ", ")
 
     if restored.len() > 0 {
@@ -1438,7 +1432,7 @@ fn sr_check_call(w: SrWalk, p: SrPairs, ev: Int, fn_name: Str, speculative_pair:
             "call to `{callee}` in `{fn_name}` mutates [{missing}] which are not saved/restored (write-set: {wcount} globals, saved: {restored.len()})",
             call_node,
             sr_help(unsaved),
-            [sr_pair_note(w, p, restored_pair, ev), writes_note, site_note, "only [{str_join(restored, ", ")}] is restored after the call"]
+            [sr_pair_note(w, p, restored_pair, ev), "`{callee}` writes \{{str_join(write_items, ", ")}}", site_note, "only [{str_join(restored, ", ")}] is restored after the call"]
         )
         return
     }
@@ -1446,12 +1440,13 @@ fn sr_check_call(w: SrWalk, p: SrPairs, ev: Int, fn_name: Str, speculative_pair:
     if speculative_pair < 0 {
         return
     }
-    diag_warn_at_notes(
+    diag_warn_label_at_notes(
         "UnrestoredMutation", UNRESTORED_MUTATION,
         "call to `{callee}` in `{fn_name}` mutates [{missing}]; these are not saved/restored for this call, though this function uses a save/restore pattern elsewhere",
         call_node,
+        "`{callee}` can return with `{first}` changed",
         sr_help(unsaved),
-        [sr_pair_note(w, p, note_pair, ev), writes_note, site_note]
+        [sr_pair_note(w, p, note_pair, ev), site_note]
     )
 }
 

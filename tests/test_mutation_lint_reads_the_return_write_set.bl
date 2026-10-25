@@ -205,6 +205,9 @@ test "a warning that still fires names the write site and the call chain" {
     compile_test_helpers.expect_contains(out, "`pos` is saved at 14:9 and restored at 16:5 with no new value set between (speculative pair)", "chain pair note")
     let file = scratch_file(tag)
     compile_test_helpers.expect_contains(out, "`err` is written at {file}:5, in `report`, called from `item` at {file}:9", "chain write-site note")
+    compile_test_helpers.expect_contains(out, "\"message\":\"`item` can return with `err` changed\"", "chain span label")
+    // The §4.16.7 example of W0551 has no writes note: the write-site note takes its place.
+    assert(!out.contains("`item` writes"))
     compile_test_helpers.expect_contains(out, HELP_ERR, "chain help")
     compile_test_helpers.expect_contains(out, "if the function sets a global for this call, assign that global between its save and this call", "chain binding help")
 }
@@ -655,8 +658,8 @@ test "a failed match guard goes on only to the arms after it" {
 }
 
 // `err` is in the write set of `step` but not in its return write set. The pair around the
-// call still saves it, so the warning is W0550, and its notes say which writes reach the
-// return.
+// call still saves it, so the warning is W0550. Its writes note names the full write set, as
+// in the §4.16.7 example of W0550: "writes" names the write set, which §4.16.4 keeps.
 test "a pair that saves a global off the return path is still a save around the call" {
     let src = [
         #"let mut err = """#,
@@ -688,7 +691,8 @@ test "a pair that saves a global off the return path is still a save around the 
     assert_eq(diags_at(out, "W0550", 15, 13), 1)
     assert_eq(mutation_lints(out), 1)
     compile_test_helpers.expect_contains(out, "call to `step` in `peek` mutates [count] which are not saved/restored (write-set: 2 globals, saved: 1)", "off-path pair header")
-    compile_test_helpers.expect_contains(out, #"`step` writes {err, count} · on return {count}"#, "off-path writes note")
+    compile_test_helpers.expect_contains(out, #"`step` writes {err, count}""#, "off-path writes note")
+    assert(!out.contains("on return"))
     compile_test_helpers.expect_contains(out, "only [err] is restored after the call", "off-path restored note")
 }
 
@@ -753,4 +757,86 @@ test "deeply nested loops with early returns are walked a bounded number of time
     let out = compile_test_helpers.compile_and_capture(lines.join("\n"), tag)
     compile_test_helpers.expect_compiles_clean(out, tag)
     compile_test_helpers.expect_contains(out, "call to `spin` in `look` mutates [count];", "nested loops names count")
+}
+
+// §4.16.4 defines the return write set by the paths that reach the normal return, and a
+// jump has type Never. This file reads a jump as moving the path, not ending it: `return`
+// and the error edge of `?` go to the normal return, `break` and `continue` go to their
+// loop. Only an expression of type Never that is not a jump, such as env.exit, ends a path.
+test "a jump moves the path to its target and only a Never that is not a jump ends it" {
+    let src = [
+        #"let mut pos = 0"#,
+        #"let mut by_return = 0"#,
+        #"let mut by_break = 0"#,
+        #"let mut by_exit = 0"#,
+        #""#,
+        #"fn walk(n: Int) ! Env.Exit {"#,
+        #"    if n == 1 {"#,
+        #"        by_return = 1"#,
+        #"        return"#,
+        #"    }"#,
+        #"    while true {"#,
+        #"        by_break = 1"#,
+        #"        break"#,
+        #"    }"#,
+        #"    if n == 2 {"#,
+        #"        by_exit = 1"#,
+        #"        env.exit(2)"#,
+        #"    }"#,
+        #"}"#,
+        #""#,
+        #"fn look(n: Int) ! Env.Exit {"#,
+        #"    let saved = pos"#,
+        #"    walk(n)"#,
+        #"    pos = saved"#,
+        #"}"#,
+        #""#,
+        #"fn main() ! Env.Exit {"#,
+        #"    look(3)"#,
+        #"}"#,
+    ].join("\n")
+    let tag = "_rw_jump_moves_path"
+    let out = compile_test_helpers.compile_and_capture(src, tag)
+    compile_test_helpers.expect_compiles_clean(out, tag)
+    assert_eq(diags_at(out, "W0551", 23, 5), 1)
+    assert_eq(mutation_lints(out), 1)
+    compile_test_helpers.expect_contains(out, "call to `walk` in `look` mutates [by_return, by_break];", "jumps keep their writes, env.exit drops its write")
+}
+
+// §4.16.7 *Shape of a warning that still fires* names "a note that names the write site":
+// one note, for the first unsaved global in declaration order, and the label names the same
+// global.
+test "a warning with many unsaved globals has one write-site note for the first declared" {
+    let src = [
+        #"let mut pos = 0"#,
+        #"let mut alpha = 0"#,
+        #"let mut beta = 0"#,
+        #"let mut gamma = 0"#,
+        #""#,
+        #"fn many() {"#,
+        #"    gamma = 3"#,
+        #"    beta = 2"#,
+        #"    alpha = 1"#,
+        #"}"#,
+        #""#,
+        #"fn look() {"#,
+        #"    let saved = pos"#,
+        #"    many()"#,
+        #"    pos = saved"#,
+        #"}"#,
+        #""#,
+        #"fn main() {"#,
+        #"    look()"#,
+        #"}"#,
+    ].join("\n")
+    let tag = "_rw_one_site_note"
+    let out = compile_test_helpers.compile_and_capture(src, tag)
+    compile_test_helpers.expect_compiles_clean(out, tag)
+    assert_eq(diags_at(out, "W0551", 14, 5), 1)
+    assert_eq(mutation_lints(out), 1)
+    compile_test_helpers.expect_contains(out, "call to `many` in `look` mutates [alpha, beta, gamma];", "all unsaved globals in the header")
+    compile_test_helpers.expect_contains(out, "`alpha` is written at {scratch_file(tag)}:9, in `many`", "the note names the first declared")
+    assert(!out.contains("`beta` is written at"))
+    assert(!out.contains("`gamma` is written at"))
+    compile_test_helpers.expect_contains(out, "\"message\":\"`many` can return with `alpha` changed\"", "the label names the first declared")
 }
