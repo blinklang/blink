@@ -478,7 +478,7 @@ let text = #"{{x}}"#                    // a lone { is text: "{{x}}"
 | `process_pid_wait(pid)` | ProcessResult | Block until child exits; returns its `ProcessResult` |
 | `process_pid_kill(pid, sig)` | Int | Send signal to child by pid; returns 0 on success |
 | `process_pid_send_signal(pid, sig)` | Int | Alias of `process_pid_kill` for the `send_signal` trait method |
-| `exit(code)` | () | Exit with code |
+| ~~`exit(code)`~~ | — | **Removed** — use `env.exit(code)` (effect `Env.Exit`); a bare `exit(code)` is E0504 |
 | `panic(msg)` | Never | Abort with `msg`; never returns |
 | `todo()` | Never | Mark unfinished code; panics; warns `W0703` |
 | `unreachable()` | Never | Mark code that must not run; panics |
