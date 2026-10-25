@@ -2754,8 +2754,8 @@ let mut tc_ud_blamed: Map[Int, Int] = Map()
 // pins is solved by then. A call is walked again after a speculative walk, so the last
 // record of a node is the one that counts. A group in tc_call_open_tids is one of
 // [sig, self_offset, n, tid..., open...] (tc_note_generic_call),
-// [-1, im, n, tid...] (tc_note_conversion_call), [-1, -1, 1, ctor] (tc_note_open_ctor_key) or
-// [-2, -1, 0] (tc_note_deferred_conversion).
+// [-1, im, n, tid...] (tc_note_conversion_call), [-1, -1, 1, ctor] (tc_note_open_ctor_key),
+// [-2, -1, 0] (tc_note_deferred_conversion) or [-3, -1, 0] (tc_note_open_variant).
 let mut tc_call_open_calls: List[Int] = []
 let mut tc_call_open_group: Map[Int, Int] = Map()
 let mut tc_call_open_tids: List[Int] = []
@@ -3060,6 +3060,27 @@ fn tc_open_group_is_deferred_conversion(g: Int) -> Bool {
     tc_call_open_tids.get(g).unwrap() == -2
 }
 
+// A variant construction whose instance has a slot open here, as the group [-3, -1, 0]. Its
+// value may go where no binding holds it (a method receiver, a statement, `let _`), so the
+// construction itself is what the flush judges. The flush reads the type off the node, the
+// one codegen reads, since a later walk of the node mints fresh metavariables.
+fn tc_note_open_variant(node: Int, tid: Int) -> Int {
+    if tc_boundary_check_active == 0 || node < 0 { return tid }
+    if tc_tid_has_unbound_metavar(tid) == 0 { return tid }
+    let g = tc_call_open_group.get(node) ?? -1
+    if g >= 0 { return tid }
+    tc_call_open_calls.push(node)
+    tc_call_open_group.insert(node, tc_call_open_tids.len())
+    tc_call_open_tids.push(-3)
+    tc_call_open_tids.push(-1)
+    tc_call_open_tids.push(0)
+    tid
+}
+
+fn tc_open_group_is_variant(g: Int) -> Bool {
+    tc_call_open_tids.get(g).unwrap() == -3
+}
+
 // Whether the group at `g` is a conversion call's (tc_note_conversion_call).
 fn tc_open_group_is_conversion(g: Int) -> Bool {
     tc_call_open_tids.get(g).unwrap() < 0 && tc_call_open_tids.get(g + 1).unwrap() >= 0
@@ -3118,7 +3139,7 @@ fn tc_note_open_ctor_key(node: Int, ctor: Int) {
 // any report has claimed it.
 fn tc_flush_open_keys_of(call_node: Int, g: Int) ! Diag.Report {
     let sig = tc_call_open_tids.get(g).unwrap()
-    if tc_open_group_is_conversion(g) || tc_open_group_is_deferred_conversion(g) { return }
+    if tc_open_group_is_conversion(g) || tc_open_group_is_deferred_conversion(g) || tc_open_group_is_variant(g) { return }
     if sig < 0 {
         let ctor = tc_call_open_tids.get(g + 3).unwrap()
         if ctor < 0 { return }
@@ -3316,6 +3337,21 @@ fn tc_ud_flush_calls() ! Diag.Report {
             tc_ud_mark_blamed(tids.get(ti).unwrap())
             ti = ti + 1
         }
+    }
+}
+
+// Report each recorded variant construction whose type is still open once inference is
+// done and no binding, call or scrutinee has answered for it. This runs after those reports,
+// so a `let` that holds the value keeps the blame, as the spec places it (§3.4 *What pins
+// `E`*), and only a value no binding holds is blamed at its constructor.
+fn tc_ud_flush_open_variants() ! Diag.Report {
+    for node in tc_call_open_calls {
+        let g = tc_call_open_group.get(node).unwrap()
+        if !tc_open_group_is_variant(g) || tc_call_reported.contains_key(node) { continue }
+        let tid = tc_lookup_node_tid(node)
+        if tc_tid_has_unbound_metavar(tid) == 0 || tc_ud_already_blamed(tid) != 0 { continue }
+        tc_call_reported.insert(node, 1)
+        tc_report_under_determined_at(node, tid)
     }
 }
 
@@ -18060,7 +18096,7 @@ pub fn tc_qualified_carrier(qualifier: Str, variant: Str) -> Option[TyKind] {
 // A carrier variant named with no argument list, bare (`None`) or qualified (`Option.None`).
 // Only None is a value on its own. `spelled` is the name as written.
 fn tc_carrier_nullary_tid(variant: Str, spelled: Str, node: Int) -> Int ! TypeCheck.Report, Diag.Report {
-    if variant == "None" { return make_option_type(tc_carrier_slot_from_hint(TyKind.Option, 1)) }
+    if variant == "None" { return tc_note_open_variant(node, make_option_type(tc_carrier_slot_from_hint(TyKind.Option, 1))) }
     let (fewest, most) = tc_carrier_arity(variant)
     let want = if fewest == most { "{most}" } else { "{fewest} or {most}" }
     tc_report_payload_variant_value(variant, want, "fn(x) \{ {spelled}(x) \}", node)
@@ -18072,7 +18108,7 @@ fn tc_carrier_nullary_tid(variant: Str, spelled: Str, node: Int) -> Int ! TypeCh
 // (E0320) has no settled field list to offer, so its uses report nothing more.
 fn tc_declared_variant_value_tid(enum_tid: Int, var_idx: Int, spelled: Str, node: Int) -> Int ! TypeCheck.Report, Diag.Report {
     let n = variant_field_count(var_idx)
-    if n == 0 { return tc_nullary_variant_tid(enum_tid, var_idx) }
+    if n == 0 { return tc_note_open_variant(node, tc_nullary_variant_tid(enum_tid, var_idx)) }
     if tc_variant_mixes_fields(var_idx) { return tc_error_recovery_tid() }
     let mut params: List[Str] = []
     let mut names: List[Str] = []
@@ -18142,6 +18178,10 @@ fn tc_check_carrier_arity(variant: Str, args_sl: Int, call_node: Int) -> Bool ! 
 // that constrains it; an unconstrained one trips the E0301 region boundary. The singleton is
 // excluded from that boundary check, so it must not stand in for an inferable slot.
 fn tc_carrier_call_tid(variant: Str, args_sl: Int, call_node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    tc_note_open_variant(call_node, tc_carrier_call_instance_tid(variant, args_sl, call_node))
+}
+
+fn tc_carrier_call_instance_tid(variant: Str, args_sl: Int, call_node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     let fits = tc_check_carrier_arity(variant, args_sl, call_node)
     let arg = if args_sl != -1 && sublist_length(args_sl) >= 1 { sublist_get(args_sl, 0) } else { -1 }
     match variant {
@@ -18358,7 +18398,7 @@ fn tc_infer_bare_variant_call(node: Int, fn_name: Str, vpick: BareVariantPick) -
             // A generic-enum variant (`Leaf(1)`) reverse-infers its concrete
             // instance tid (`Tree[Int]`) from the ctor args so codegen mono's
             // it; a non-generic enum keeps the bare tid.
-            Some(tc_enum_ctor_instance_tid(venum, var_idx, node_args(node), payload_tids))
+            Some(tc_note_open_variant(node, tc_enum_ctor_instance_tid(venum, var_idx, node_args(node), payload_tids)))
         }
         BareVariantPick.Ambiguous(carrier, enums) => {
             tc_report_ambiguous_construction(fn_name, carrier, enums, node)
@@ -24104,7 +24144,7 @@ fn tc_infer_struct_lit_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Rep
                 if qtid != -1 && type_kind(qtid) == TyKind.Enum && get_variant_by_name(qtid, vname) != -1 {
                     check_deprecated_type(qual, node)
                     tc_check_brace_literal(tc_variant_literal_owner(get_variant_by_name(qtid, vname)), node)
-                    return tc_enum_structlit_instance_tid(qtid, vname, node_fields(node))
+                    return tc_note_open_variant(node, tc_enum_structlit_instance_tid(qtid, vname, node_fields(node)))
                 }
                 if tc_report_bad_variant_value(node, qual, vname, 2) {
                     tc_infer_orphan_field_values(node_fields(node))
@@ -24139,7 +24179,7 @@ fn tc_infer_struct_lit_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Rep
                         if tc_tid_has_bare_typevar(hint_t) != 0 {
                             let base = tc_enum_base_tid(hint_t)
                             let inst = tc_enum_structlit_instance_tid(base, sname, node_fields(node))
-                            if inst != base { return inst }
+                            if inst != base { return tc_note_open_variant(node, inst) }
                             return site_t
                         }
                         // The hint answers the literal's own type without looking inside it, so the
@@ -24182,7 +24222,7 @@ fn tc_infer_struct_lit_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Rep
                         // A generic-enum struct-style ctor (`Leaf { value: 1 }`) reverse-
                         // infers its concrete instance tid; non-generic keeps bare.
                         tc_check_brace_literal(tc_variant_literal_owner(var_idx), node)
-                        return tc_enum_structlit_instance_tid(venum, sname, node_fields(node))
+                        return tc_note_open_variant(node, tc_enum_structlit_instance_tid(venum, sname, node_fields(node)))
                     }
                     BareVariantPick.Ambiguous(carrier, enums) => {
                         tc_report_ambiguous_construction(sname, carrier, enums, node)
@@ -24660,6 +24700,9 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                         diag_error_at("QuestionMarkResultInNonResult", QM_RESULT_IN_NON_RESULT, "`?` on Result in function `{tc_current_fn_name}` which does not return Result", node, "change the return type to Result[T, E]")
                     } else if ret_kind == TyKind.Result {
                         let ret_err = ty_pool.get(tc_current_fn_ret).unwrap().inner2
+                        // Propagation is exact, so an operand error slot nothing else fixed
+                        // (`Ok(x)?`) is the enclosing return's error type.
+                        if tc_tid_has_unbound_metavar(operand_err) != 0 { let _ = tc_unify(operand_err, ret_err) }
                         if types_compatible(operand_err, ret_err) == 0 {
                             tc_errors.push("`?` error type mismatch in function `{tc_current_fn_name}`")
                             diag_error_at("QuestionMarkErrorMismatch", QM_ERROR_MISMATCH, "`?` error type mismatch: operand error type does not match return error type in `{tc_current_fn_name}`", node, "ensure the error types are compatible")
@@ -25046,7 +25089,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                         // A generic-enum qualified ctor (`Tree.Leaf(1)`) reverse-infers
                         // its concrete instance tid; a non-generic enum keeps the bare
                         // ctor_tid.
-                        return tc_enum_ctor_instance_tid(ctor_tid, cvar_idx, cargs_sl, payload_tids)
+                        return tc_note_open_variant(node, tc_enum_ctor_instance_tid(ctor_tid, cvar_idx, cargs_sl, payload_tids))
                     }
                 }
                 if tc_report_bad_variant_value(node, cname, method, 1) {
@@ -26657,7 +26700,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             if tid != -1 && type_kind(tid) == TyKind.Enum {
                 let vi = get_variant_by_name(tid, fname)
                 if vi != -1 && variant_field_count(vi) != 0 { return tc_declared_variant_value_tid(tid, vi, "{obj_name}.{fname}", node) }
-                return tc_nullary_variant_tid(tid, vi)
+                return tc_note_open_variant(node, tc_nullary_variant_tid(tid, vi))
             }
             // A MODULE qualifier. This arm covers an enum type qualifier, a struct
             // field, a tuple index, and this fourth case for `module.name` — without
@@ -32530,6 +32573,7 @@ fn tc_infer_program_body(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Di
     tc_ud_flush_pending()
     tc_ud_flush_calls()
     tc_refuse_deferred_conversions()
+    tc_ud_flush_open_variants()
     tc_drop_open_calls()
     tc_flush_untyped_type_args()
 }

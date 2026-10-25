@@ -1,0 +1,180 @@
+// A variant construction that leaves a type parameter open is under-determined wherever its
+// value goes, not only at a `let` (sections/03_types.md §3.4 *Under-Determined Types*: "The
+// judgment is a property of the type, not of the syntactic position"). When no binding holds
+// the value, as for a method receiver, a call argument, a statement, or `let _`, the error is
+// E0301 at the open constructor, and the help is an annotated binding for the value.
+//
+// Each row checks the exact set of errors a program gets, so an extra error, a missing one or
+// an internal error fails it as surely as a wrong message.
+
+import typecheck.{check_types}
+import compiler.{compile_to_program}
+import diagnostics.{diag_entries, diag_reset}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+import std.fs
+import std.io
+
+// Every error, warning and internal error the program gets: span, code, message and help.
+fn diags_of(src: Str) -> List[Str] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    let path = "build/tc_open_variant_no_binding_src.bl"
+    init_embedded_stdlib()
+    write_file(path, src)
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        out.push("{d.line}:{d.col}-{d.end_col}: {d.code} {d.message} | help: {d.help}")
+    }
+    out
+}
+
+fn line_of(src: Str, marker: Str) -> Int {
+    let lines = src.split("\n")
+    let mut i = 0
+    while i < lines.len() {
+        if lines.get(i).unwrap().contains(marker) { return i + 1 }
+        i = i + 1
+    }
+    io.eprintln("FAIL: probe has no line marked '{marker}'")
+    assert(false)
+    -1
+}
+
+// "line:col-0" at the first `word` on the line marked `marker`: the caret is a point at the
+// start of the open constructor, since an expression node records no end column.
+fn span(src: Str, marker: Str, word: Str) -> Str {
+    let line = line_of(src, marker)
+    let col = src.split("\n").get(line - 1).unwrap().index_of(word).unwrap() + 1
+    "{line}:{col}-0"
+}
+
+fn assert_diags(src: Str, want: List[Str]) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    let got = diags_of(src)
+    let mut ok = got.len() == want.len()
+    for w in want {
+        if !got.contains(w) { ok = false }
+    }
+    if !ok {
+        io.eprintln("FAIL: want:")
+        for w in want { io.eprintln("    {w}") }
+        io.eprintln("  got:")
+        for g in got { io.eprintln("    {g}") }
+    }
+    assert(ok)
+}
+
+fn open_at(src: Str, marker: Str, word: Str, hint: Str) -> Str {
+    "{span(src, marker, word)}: E0301 cannot infer a type for this value: it is left under-determined | help: add a type annotation on a binding for this value, e.g. `let x{hint} = ...` (replace each placeholder with the intended type)"
+}
+
+test "an Ok whose error type nothing fixes is E0301 at the Ok when it is a method receiver" {
+    let src = #"fn main() {
+    let x = Ok(2).unwrap()  // RECV
+    io.println("{x}")
+}
+"#
+    assert_diags(src, [open_at(src, "RECV", "Ok(2)", ": Result[T, E]")])
+}
+
+test "an open Ok as the receiver of a call argument is E0301 at the Ok" {
+    let src = #"fn add(a: Int, b: Int) -> Int { a + b }
+
+fn main() {
+    io.println("{add(1, Ok(2).unwrap())}")  // ARG
+}
+"#
+    assert_diags(src, [open_at(src, "ARG", "Ok(2)", ": Result[T, E]")])
+}
+
+test "a unit Ok whose error type nothing fixes is E0301 at the Ok" {
+    let src = #"fn main() {
+    let b = Ok().is_ok()  // UNIT
+    io.println("{b}")
+}
+"#
+    assert_diags(src, [open_at(src, "UNIT", "Ok()", ": Result[T, E]")])
+}
+
+test "a variant statement that leaves a type parameter open is E0301 at the variant" {
+    let src = #"type Pick[T, U] {
+    A(T)
+    B(U)
+}
+
+fn main() {
+    Pick.A(1)  // STMT
+}
+"#
+    assert_diags(src, [open_at(src, "STMT", "Pick.A(1)", ": Pick[...]")])
+}
+
+test "a variant bound to the wildcard that leaves a type parameter open is E0301 at the variant" {
+    let src = #"type Pick[T, U] {
+    A(T)
+    B(U)
+}
+
+fn main() {
+    let _ = Pick.A(2)  // WILD
+}
+"#
+    assert_diags(src, [open_at(src, "WILD", "Pick.A(2)", ": Pick[...]")])
+}
+
+test "a nullary variant statement of a generic enum is E0301 at the variant" {
+    let src = #"type Tree[T] {
+    Empty
+    Leaf(T)
+}
+
+fn main() {
+    Tree.Empty  // NULLARY
+}
+"#
+    assert_diags(src, [open_at(src, "NULLARY", "Tree.Empty", ": Tree[...]")])
+}
+
+test "a None statement is E0301 at the None" {
+    let src = #"fn main() {
+    None  // NONE
+}
+"#
+    assert_diags(src, [open_at(src, "NONE", "None", ": T?")])
+}
+
+test "an open variant a binding holds is reported once, at the binding" {
+    let src = #"fn main() {
+    let _r = Ok(3)  // LET
+}
+"#
+    let line = line_of(src, "LET")
+    let got = diags_of(src)
+    assert_eq(got.len(), 1)
+    assert(got.get(0).unwrap().starts_with("{line}:5-"))
+    assert(got.get(0).unwrap().contains("E0301 cannot infer a type for `_r`"))
+}
+
+test "the error type of an Ok under a question mark comes from the enclosing return type" {
+    let src = #"fn get(x: Int) -> Result[Int, Str] {
+    let y = Ok(x)?
+    Ok(y + 1)
+}
+
+fn main() {
+    io.println("{get(4).unwrap()}")
+}
+"#
+    assert_diags(src, [])
+}
+
+test "a fixed Ok receiver is not E0301" {
+    let src = #"fn main() {
+    let r: Result[Int, Str] = Ok(2)
+    let x = r.unwrap()
+    io.println("{x}")
+}
+"#
+    assert_diags(src, [])
+}
