@@ -128,10 +128,26 @@ const embedded_gc_h_priv_thread_local_alloc: Str = #embed("../bootstrap/vendor/g
 const embedded_gc_h_stubs_mach_exception: Str = #embed("../bootstrap/vendor/gc/include/zig-stubs/mach/exception.h")
 const embedded_gc_h_stubs_macho_getsect: Str = #embed("../bootstrap/vendor/gc/include/zig-stubs/mach-o/getsect.h")
 
-fn extract_embedded_gc() -> Str {
-    let base = ".tmp/gc"
-    if file_exists("{base}/include/gc.h") == 1 {
-        return base
+// Where a build keeps the objects of vendored C sources and the gc sources it extracts. It
+// lies under build/, so no build writes a scratch dir into the project itself.
+fn native_cache_dir() -> Str {
+    "build/native-cache"
+}
+
+// The embedded gc sources, written once into the native cache. They are written aside and
+// renamed into place, so a concurrent build never reads a half-written tree.
+fn extract_embedded_gc() -> Str ! IO {
+    let cache = native_cache_dir()
+    let dir = "{cache}/gc"
+    if file_exists("{dir}/include/gc.h") == 1 {
+        return dir
+    }
+    let _ = build_fs.mkdir_p(cache)
+    build_fs.reap_dead(cache, ["gc-tmp"])
+    let base = build_fs.private_dir(cache, "gc-tmp")
+    if base == "" {
+        io.eprintln("error: cannot make a staging directory in {cache}")
+        return dir
     }
     shell_exec("mkdir -p {base}/include/private {base}/include/zig-stubs/mach {base}/include/zig-stubs/mach-o")
     write_file("{base}/gc_unity.c", embedded_gc_unity_c)
@@ -170,7 +186,10 @@ fn extract_embedded_gc() -> Str {
     write_file("{base}/include/private/thread_local_alloc.h", embedded_gc_h_priv_thread_local_alloc)
     write_file("{base}/include/zig-stubs/mach/exception.h", embedded_gc_h_stubs_mach_exception)
     write_file("{base}/include/zig-stubs/mach-o/getsect.h", embedded_gc_h_stubs_macho_getsect)
-    base
+    build_fs.unmark(base)
+    // A concurrent build that renamed first wins; its tree is the same.
+    shell_exec("if [ -e {dir} ]; then rm -rf {base}; else chmod 755 {base}; mv {base} {dir}; fi")
+    dir
 }
 
 // Two emit settings the CLI learns while parsing arguments and needs again at the
@@ -296,7 +315,7 @@ fn resolve_ffi_link_flags(lib: Str, target: Str) -> Str {
     "-l{lib}"
 }
 
-fn resolve_gc_source() -> Str {
+fn resolve_gc_source() -> Str ! IO {
     let blink_root = env.var("BLINK_ROOT") ?? ""
     if blink_root != "" {
         let path = "{blink_root}/bootstrap/vendor/gc/extra/gc.c"
@@ -311,7 +330,7 @@ fn resolve_gc_source() -> Str {
     "{base}/gc_unity.c"
 }
 
-fn resolve_gc_include() -> Str {
+fn resolve_gc_include() -> Str ! IO {
     let blink_root = env.var("BLINK_ROOT") ?? ""
     if blink_root != "" {
         let path = "{blink_root}/bootstrap/vendor/gc/include"
@@ -847,9 +866,9 @@ fn vendored_header_lines(debug_mode: Int, dirs: List[Str], target: Str, written:
     build_objcache.vendored_key_lines(dirs, vendored_dirs_by_name(debug_mode, dirs, target), key_walk_skip(written))
 }
 
-// What the walk of a unit's vendored dirs passes over: the cache and what the build writes.
+// What the walk of a unit's vendored dirs passes over: the caches and what the build writes.
 fn key_walk_skip(written: List[Str]) -> List[Str] {
-    let mut skip: List[Str] = [build_objcache.obj_cache_dir()]
+    let mut skip: List[Str] = [build_objcache.obj_cache_dir(), native_cache_dir()]
     for w in written { skip.push(w) }
     skip
 }
@@ -948,10 +967,10 @@ fn resolve_vendored_objects(used_deps: List[Str], debug_mode: Int, release_mode:
     if target != "" {
         let gc_src = resolve_gc_source()
         if gc_src != "" {
-            shell_exec("mkdir -p .tmp")
+            let _ = build_fs.mkdir_p(native_cache_dir())
             did_mkdir = 1
             let gc_inc = resolve_gc_include()
-            let o_path = ".tmp/gc-{target}.o"
+            let o_path = "{native_cache_dir()}/gc-{target}.o"
             let src_mt = file_mtime(gc_src)
             let obj_mt = file_mtime(o_path)
             if obj_mt < src_mt || src_mt == -1 {
@@ -981,12 +1000,12 @@ fn resolve_vendored_objects(used_deps: List[Str], debug_mode: Int, release_mode:
         let src = resolve_native_dep_source(name)
         if src != "" {
             if did_mkdir == 0 {
-                shell_exec("mkdir -p .tmp")
+                let _ = build_fs.mkdir_p(native_cache_dir())
                 did_mkdir = 1
             }
-            let mut o_path = ".tmp/{name}.o"
+            let mut o_path = "{native_cache_dir()}/{name}.o"
             if target != "" {
-                o_path = ".tmp/{name}-{target}.o"
+                o_path = "{native_cache_dir()}/{name}-{target}.o"
             }
             let rc = compile_vendored_source(src, o_path, debug_mode, release_mode, target)
             if rc != 0 {
@@ -1009,12 +1028,12 @@ fn resolve_vendored_objects(used_deps: List[Str], debug_mode: Int, release_mode:
         let dep_path = manifest_native_dep_path(name)
         if dep_path == "" { continue }
         if did_mkdir == 0 {
-            shell_exec("mkdir -p .tmp")
+            let _ = build_fs.mkdir_p(native_cache_dir())
             did_mkdir = 1
         }
-        let mut o_path = ".tmp/{name}.o"
+        let mut o_path = "{native_cache_dir()}/{name}.o"
         if target != "" {
-            o_path = ".tmp/{name}-{target}.o"
+            o_path = "{native_cache_dir()}/{name}-{target}.o"
         }
         let rc = compile_vendored_source(dep_path, o_path, debug_mode, release_mode, target)
         if rc != 0 {
@@ -1028,7 +1047,7 @@ fn resolve_vendored_objects(used_deps: List[Str], debug_mode: Int, release_mode:
 
 // The -I flags a zig compile for target needs to find gc.h, which the host's cc finds
 // installed; none for a host build.
-fn cross_gc_includes(target: Str) -> List[Str] {
+fn cross_gc_includes(target: Str) -> List[Str] ! IO {
     let mut includes: List[Str] = []
     if target != "" {
         let gc_inc = resolve_gc_include()
@@ -1045,7 +1064,7 @@ fn cross_gc_includes(target: Str) -> List[Str] {
     includes
 }
 
-fn resolve_vendored_includes(used_deps: List[Str], target: Str) -> Str {
+fn resolve_vendored_includes(used_deps: List[Str], target: Str) -> Str ! IO {
     let mut includes = cross_gc_includes(target)
 
     let mut di = 0
@@ -1294,7 +1313,7 @@ fn verify_installed_archive(arc_dir: Str) -> Int ! Diag.Report, IO {
 // The stdlib archive a link for target takes. A host link takes the one in arc_dir. A
 // cross link takes one zig built for target from the archive's monolith.c: the archive in
 // arc_dir holds host-arch objects, built against the host's libc, whose symbols zig's libc
-// for the same arch can lack. It is cached under .tmp/ as the cross-built gc is, since
+// for the same arch can lack. It is cached under build/ beside the cross-built gc, since
 // share/blink may be read-only. "" after an error is printed.
 fn ensure_target_archive(arc_dir: Str, target: Str) -> Str ! IO {
     if target == "" {
@@ -1319,18 +1338,19 @@ fn ensure_target_archive(arc_dir: Str, target: Str) -> Str ! IO {
     id.write("cc:{cc_id}\n")
     id.write("target:{target}\n")
     id.write("flags:{cc_opt_flags(0, 1).join(" ")} {flags}\n")
-    let dir = ".tmp/std-{target}-{sha256_hex(id.to_str()).byte_slice(0, 16)}"
+    let cache = native_cache_dir()
+    let dir = "{cache}/std-{target}-{sha256_hex(id.to_str()).byte_slice(0, 16)}"
     let archive = "{dir}/libblink_std.a"
     if file_exists(archive) == 1 {
         return archive
     }
     // Built aside and renamed into place, as build_stdlib_archive_in does, so a concurrent
     // cross build never links a half-written archive.
-    let _ = build_fs.mkdir_p(".tmp")
-    build_fs.reap_dead(".tmp", ["std-tmp"])
-    let stage = build_fs.private_dir(".tmp", "std-tmp")
+    let _ = build_fs.mkdir_p(cache)
+    build_fs.reap_dead(cache, ["std-tmp"])
+    let stage = build_fs.private_dir(cache, "std-tmp")
     if stage == "" {
-        io.eprintln("error: cannot make a staging directory in .tmp")
+        io.eprintln("error: cannot make a staging directory in {cache}")
         return ""
     }
     // -w: monolith.c compiles clean under the host's cc, but clang warns on it by the
@@ -5293,7 +5313,7 @@ fn cmd_audit(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Re
     }
 }
 
-fn cmd_fmt(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit, Codegen {
+fn cmd_fmt(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit, Codegen, IO {
     let source_path = args_positional(a, 0)
     let bad_format = format_usage_error(a, report_formats())
     if bad_format != "" {
@@ -5307,7 +5327,14 @@ fn cmd_fmt(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Repo
     }
     let name = if source_path != "" { strip_extension(path_basename(source_path)) } else { "" }
     if check_flag == 1 {
-        shell_exec("mkdir -p .tmp")
+        // The formatted copies go to a dir of this run's own in the OS temp dir, never into
+        // the project.
+        let tmp = env.var("TMPDIR") ?? ""
+        let scratch = build_fs.private_dir(if tmp == "" { "/tmp" } else { tmp }, "blink-fmt")
+        if scratch == "" {
+            io.eprintln("error: cannot make a scratch directory for fmt --check")
+            exit(1)
+        }
         let mut needs_format: List[Str] = []
         let mut ok_files: List[Str] = []
         let mut check_errors = 0
@@ -5317,8 +5344,7 @@ fn cmd_fmt(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Repo
             let mut fi = 0
             while fi < fmt_files.len() {
                 let fname = fmt_files.get(fi).unwrap()
-                let tmp_name = strip_extension(path_basename(fname))
-                let tmp_path = ".tmp/fmt_check_{tmp_name}.bl"
+                let tmp_path = "{scratch}/{strip_extension(path_basename(fname))}.bl"
                 let rc = do_compile(fname, tmp_path, "blink", 0, 0)
                 if rc == 0 {
                     let original = read_file(fname)
@@ -5341,7 +5367,7 @@ fn cmd_fmt(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Repo
                 fi = fi + 1
             }
         } else {
-            let tmp_path = ".tmp/fmt_check_{name}.bl"
+            let tmp_path = "{scratch}/{name}.bl"
             let rc = do_compile(source_path, tmp_path, "blink", 0, 0)
             if rc == 0 {
                 let original = read_file(source_path)
@@ -5362,6 +5388,7 @@ fn cmd_fmt(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Repo
             }
             shell_exec("rm -f {tmp_path}")
         }
+        let _ = build_fs.remove_tree(scratch)
         if json_output != 0 {
             let mut json_needs = ""
             let mut ni = 0
@@ -5570,7 +5597,7 @@ fn cmd_init(_p: ArgParser, a: Args) {
         }
 
         if file_exists(".gitignore") == 0 {
-            let gitignore = "build/\n.tmp/\n.blink/\n"
+            let gitignore = "build/\n.blink/\n"
             write_file(".gitignore", gitignore)
             io.println("  created .gitignore")
         } else {
@@ -5578,9 +5605,6 @@ fn cmd_init(_p: ArgParser, a: Args) {
             let mut additions = ""
             if !existing.contains("build/") {
                 additions = additions.concat("build/\n")
-            }
-            if !existing.contains(".tmp/") {
-                additions = additions.concat(".tmp/\n")
             }
             if !existing.contains(".blink/") {
                 additions = additions.concat(".blink/\n")

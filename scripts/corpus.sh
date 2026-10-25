@@ -254,8 +254,8 @@ printf '#!/bin/sh\nfor a do\n    shift\n    [ "$a" = -g ] || set -- "$@" "$a"\nd
 chmod +x build/corpus/cc/cc
 
 # A file whose program links a vendored native dep compiles that dep's C source
-# into its sandbox `.tmp`, and each sandbox starts empty, so the sweep compiled
-# sqlite3 once per such file. Build each object once with the flags a corpus
+# into its sandbox `build/native-cache`, and each sandbox starts empty, so the
+# sweep compiled sqlite3 once per such file. Build each object once with the flags a corpus
 # build uses (those of `blink build --debug`, less -g); corpus_one.sh copies it
 # in with its mtime, which is what lets the build skip the compile.
 #

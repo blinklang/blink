@@ -2301,7 +2301,7 @@ with `cc -fmacro-prefix-map=... -E` on an empty file, and only when a
 build has an absolute vendored dir.
 
 The dep's own `.c` (`compile_vendored_source`, an object in
-`.tmp/<name>.o`) takes no map. It is outside the obj cache, so no key
+`build/native-cache/<name>.o`) takes no map. It is outside the obj cache, so no key
 is involved; but if that source uses `__FILE__`, a default or release
 binary still holds the tree path through that object.
 
@@ -2327,10 +2327,10 @@ the order of the dirs (`build_objcache.vendored_key_lines`):
   itself. A dir that cannot be listed, or a file that cannot be hashed,
   leaves the unit out of the cache.
 - Not a dot entry, as the glob `<dir>/*.h` of the old key skipped them:
-  a dot dir holds `.git` and the `.tmp` the build writes the dep's
-  object to.
+  a dot dir holds `.git`.
 - Not what the build writes (`cli.vendored_header_lines`): the obj
-  cache dir, the output binary, and the units dir and its work dir (the
+  cache dir, the native cache dir (`build/native-cache`, the dep
+  objects and the extracted gc), the output binary, and the units dir and its work dir (the
   one-unit build: its C and the private dir it compiles in). A dep
   whose source sits at the project root, `path = "mylib.c"`, gives
   `-I.`, and all of these lie under it. In the key, each build would

@@ -68,7 +68,7 @@ tasks:
   test-sqlite-peel:
     desc: |
       Asserts sqlite is peeled out of the stdlib archive — building a
-      non-sqlite program must (a) not produce `.tmp/sqlite3.o`, and (b)
+      non-sqlite program must (a) not produce `build/native-cache/sqlite3.o`, and (b)
       yield a binary with zero sqlite text symbols. RED on main because
       `do_link_target` unconditionally force-includes sqlite3.o into
       every user link. GREEN after the native-dep registry peels
@@ -88,17 +88,17 @@ tasks:
             io.println("hello from peel probe")
         }
         EOF
-        find .tmp -maxdepth 1 -name 'sqlite3*.o' -delete 2>/dev/null || true
-        rm -f "$PEEL/hello"
-        if ! {{.BUILD_DIR}}/blink build "$PEEL/hello.bl" --output "$PEEL/hello" > "$LOG" 2>&1; then
+        # Built in $PEEL, a fresh dir, so the native cache it writes starts empty.
+        BLINK="$PWD/{{.BUILD_DIR}}/blink"
+        if ! (cd "$PEEL" && "$BLINK" build hello.bl --output hello) > "$LOG" 2>&1; then
           echo "test-sqlite-peel: FAIL — hello-world build failed"
           tail -40 "$LOG" >&2
           exit 1
         fi
 
-        # (a) non-sqlite build must NOT produce .tmp/sqlite3.o.
-        if [ -f .tmp/sqlite3.o ]; then
-          echo "test-sqlite-peel: FAIL — non-sqlite build produced .tmp/sqlite3.o"
+        # (a) non-sqlite build must NOT produce sqlite3.o.
+        if ls "$PEEL"/build/native-cache/sqlite3*.o > /dev/null 2>&1; then
+          echo "test-sqlite-peel: FAIL — non-sqlite build produced build/native-cache/sqlite3.o"
           exit 1
         fi
 
@@ -353,10 +353,10 @@ tasks:
 
         # Case 4: program importing std.db_sqlite — exercises the peeled-
         # module path and the cold-bootstrap double-link regression (edq96x).
-        # Pre-seeds .tmp/sqlite3.o (the "leftover from prior build" condition
+        # Pre-seeds build/native-cache/sqlite3.o (the "leftover from prior build" condition
         # in the bug report) so compile_vendored_source's mtime-skip reuses
         # it instead of recompiling. v0.44.2-class regressions emit two
-        # copies of .tmp/sqlite3.o on the cc line → ld "multiple definition
+        # copies of sqlite3.o on the cc line → ld "multiple definition
         # of sqlite3_*". Asserts:
         #   (a) no "multiple definition" in stderr (named diagnostic for edq96x)
         #   (b) blink run exits 0 with stdout "sidecar-ok" (peeled-module
@@ -370,10 +370,10 @@ tasks:
             io.println("sidecar-ok")
         }
         BLINK
-        mkdir -p "$PROJECT_DIR/.tmp"
-        cc -c -o "$PROJECT_DIR/.tmp/sqlite3.o" \
+        mkdir -p "$PROJECT_DIR/build/native-cache"
+        cc -c -o "$PROJECT_DIR/build/native-cache/sqlite3.o" \
             "$INSTALL_PREFIX/share/blink/native/sqlite3/sqlite3.c"
-        touch "$PROJECT_DIR/.tmp/sqlite3.o"
+        touch "$PROJECT_DIR/build/native-cache/sqlite3.o"
         SQLITE_OUT=$(env -u BLINK_ROOT PATH="$INSTALL_PREFIX/bin:$PATH" blink run src/main.bl 2>&1 || true)
         if echo "$SQLITE_OUT" | grep -q "multiple definition"; then
           echo "FAIL test-installed (sqlite sidecar — edq96x cold-bootstrap double-link regression)"
@@ -888,7 +888,7 @@ tasks:
         build/fmt-{golden,idem,sem}.<mode>.joblog — GNU parallel per-file timings
       Modes:
         MODE=warm (default) — run as-is; reuses Taskfile `sources:` cache, std-cache, etc.
-        MODE=cold           — wipes Taskfile cache + bootstrap outputs + .tmp/ first so every phase
+        MODE=cold           — wipes Taskfile cache + bootstrap outputs + native objects first so every phase
                               pays its true cost.
       Use both back-to-back to attribute: (cold − warm) = work the cache saves us; warm = work that always pays.
     silent: true
@@ -941,11 +941,11 @@ tasks:
           # cycle, and would force the installed-blink fallback path.
           rm -rf {{.BUILD_DIR}}/.task {{.BUILD_DIR}}/libblink_std.a {{.BUILD_DIR}}/libblink_std.h
           rm -rf {{.BUILD_DIR}}/std-cache {{.BUILD_DIR}}/smoke
-          # Also wipe .tmp/ leftover object files from any prior run — the
-          # build-binaries-smoke phase re-emits .tmp/{gc,sqlite3,monolith}.o
+          # Also wipe leftover native and release objects from any prior run —
+          # the build-binaries-smoke phase re-emits {gc,sqlite3,monolith}.o
           # and will multi-define everything if stale copies linger.
-          find .tmp -type f ! -name '.gitkeep' -delete 2>/dev/null || true
-          echo "ci-profile: cold mode — cleared {{.BUILD_DIR}}/.task + archive + std-cache + smoke + .tmp/"
+          rm -rf {{.BUILD_DIR}}/native-cache {{.BUILD_DIR}}/release-objs
+          echo "ci-profile: cold mode — cleared {{.BUILD_DIR}}/.task + archive + std-cache + smoke + native-cache + release-objs"
         fi
 
         # Phase 2: bootstrap (Gen0 → archive → Gen1 → archive(force) → Gen2).
@@ -1194,10 +1194,10 @@ tasks:
         fi
         echo "stdlib-registry: ok"
 
-  clean-tmp:
-    desc: Remove all temp files from .tmp/
+  clean-native:
+    desc: Remove the native and release objects builds keep under build/
     cmds:
-      - find .tmp -type f ! -name '.gitkeep' -delete 2>/dev/null || true
+      - rm -rf {{.BUILD_DIR}}/native-cache {{.BUILD_DIR}}/release-objs
 
   bench:
     desc: Compile and run benchmarks/arena_process_batch.bl (release mode)
@@ -1227,25 +1227,25 @@ tasks:
       # Emit the user-TU cli.c in archive mode (matches build-cli).
       - "{{.BLINKC}} --link-archive {{.BUILD_DIR}}/libblink_std.h src/cli.bl {{.BUILD_DIR}}/cli.c"
       - scripts/stamp_cli_version.sh {{.BUILD_DIR}}/cli.c "{{.VERSION}}"
-      - mkdir -p .tmp
+      - mkdir -p {{.BUILD_DIR}}/release-objs
       # GC per target
-      - zig cc -c -O2 {{.GC_DEFS}} -I{{.GC_INC}} -target x86_64-linux-gnu -o .tmp/gc-linux-x86_64.o {{.GC_SRC}}
-      - zig cc -c -O2 {{.GC_DEFS}} -I{{.GC_INC}} -target aarch64-linux-gnu -o .tmp/gc-linux-aarch64.o {{.GC_SRC}}
-      - zig cc -c -O2 {{.GC_MACOS_DEFS}} -I{{.GC_STUBS}} -I{{.GC_INC}} -target x86_64-macos -o .tmp/gc-macos-x86_64.o {{.GC_SRC}}
-      - zig cc -c -O2 {{.GC_MACOS_DEFS}} -I{{.GC_STUBS}} -I{{.GC_INC}} -target aarch64-macos -o .tmp/gc-macos-aarch64.o {{.GC_SRC}}
+      - zig cc -c -O2 {{.GC_DEFS}} -I{{.GC_INC}} -target x86_64-linux-gnu -o {{.BUILD_DIR}}/release-objs/gc-linux-x86_64.o {{.GC_SRC}}
+      - zig cc -c -O2 {{.GC_DEFS}} -I{{.GC_INC}} -target aarch64-linux-gnu -o {{.BUILD_DIR}}/release-objs/gc-linux-aarch64.o {{.GC_SRC}}
+      - zig cc -c -O2 {{.GC_MACOS_DEFS}} -I{{.GC_STUBS}} -I{{.GC_INC}} -target x86_64-macos -o {{.BUILD_DIR}}/release-objs/gc-macos-x86_64.o {{.GC_SRC}}
+      - zig cc -c -O2 {{.GC_MACOS_DEFS}} -I{{.GC_STUBS}} -I{{.GC_INC}} -target aarch64-macos -o {{.BUILD_DIR}}/release-objs/gc-macos-aarch64.o {{.GC_SRC}}
       # stdlib monolith per target (uses the same archive sources that build-cli compiled host-side via __build-stdlib-archive)
       - |
         ARC_REL="{{.BUILD_DIR}}/$(readlink {{.BUILD_DIR}}/libblink_std.a | xargs dirname)"
-        zig cc -c -O2 {{.MONO_DEFS}} -target x86_64-linux-gnu -I{{.GC_INC}} -I"$ARC_REL" -o .tmp/monolith-linux-x86_64.o "$ARC_REL/monolith.c"
-        zig cc -c -O2 {{.MONO_DEFS}} -target aarch64-linux-gnu -I{{.GC_INC}} -I"$ARC_REL" -o .tmp/monolith-linux-aarch64.o "$ARC_REL/monolith.c"
-        zig cc -c -O2 {{.MONO_DEFS}} -target x86_64-macos -I{{.GC_STUBS}} -I{{.GC_INC}} -I"$ARC_REL" -o .tmp/monolith-macos-x86_64.o "$ARC_REL/monolith.c"
-        zig cc -c -O2 {{.MONO_DEFS}} -target aarch64-macos -I{{.GC_STUBS}} -I{{.GC_INC}} -I"$ARC_REL" -o .tmp/monolith-macos-aarch64.o "$ARC_REL/monolith.c"
+        zig cc -c -O2 {{.MONO_DEFS}} -target x86_64-linux-gnu -I{{.GC_INC}} -I"$ARC_REL" -o {{.BUILD_DIR}}/release-objs/monolith-linux-x86_64.o "$ARC_REL/monolith.c"
+        zig cc -c -O2 {{.MONO_DEFS}} -target aarch64-linux-gnu -I{{.GC_INC}} -I"$ARC_REL" -o {{.BUILD_DIR}}/release-objs/monolith-linux-aarch64.o "$ARC_REL/monolith.c"
+        zig cc -c -O2 {{.MONO_DEFS}} -target x86_64-macos -I{{.GC_STUBS}} -I{{.GC_INC}} -I"$ARC_REL" -o {{.BUILD_DIR}}/release-objs/monolith-macos-x86_64.o "$ARC_REL/monolith.c"
+        zig cc -c -O2 {{.MONO_DEFS}} -target aarch64-macos -I{{.GC_STUBS}} -I{{.GC_INC}} -I"$ARC_REL" -o {{.BUILD_DIR}}/release-objs/monolith-macos-aarch64.o "$ARC_REL/monolith.c"
       # Link each target binary against its own GC + stdlib monolith. The
       # CLI doesn't import any peeled native dep, so no sqlite3.o here.
-      - zig cc -O2 -Wno-parentheses-equality -I{{.GC_INC}} -I{{.BUILD_DIR}} -target x86_64-linux-gnu -o {{.BUILD_DIR}}/blink-linux-x86_64 {{.BUILD_DIR}}/cli.c .tmp/monolith-linux-x86_64.o .tmp/gc-linux-x86_64.o -lm -Wl,--gc-sections
-      - zig cc -O2 -Wno-parentheses-equality -I{{.GC_INC}} -I{{.BUILD_DIR}} -target aarch64-linux-gnu -o {{.BUILD_DIR}}/blink-linux-aarch64 {{.BUILD_DIR}}/cli.c .tmp/monolith-linux-aarch64.o .tmp/gc-linux-aarch64.o -lm -Wl,--gc-sections
-      - zig cc -O2 -Wno-parentheses-equality -I{{.GC_STUBS}} -I{{.GC_INC}} -I{{.BUILD_DIR}} -target x86_64-macos -o {{.BUILD_DIR}}/blink-macos-x86_64 {{.BUILD_DIR}}/cli.c .tmp/monolith-macos-x86_64.o .tmp/gc-macos-x86_64.o -lm -Wl,-dead_strip
-      - zig cc -O2 -Wno-parentheses-equality -I{{.GC_STUBS}} -I{{.GC_INC}} -I{{.BUILD_DIR}} -target aarch64-macos -o {{.BUILD_DIR}}/blink-macos-aarch64 {{.BUILD_DIR}}/cli.c .tmp/monolith-macos-aarch64.o .tmp/gc-macos-aarch64.o -lm -Wl,-dead_strip
+      - zig cc -O2 -Wno-parentheses-equality -I{{.GC_INC}} -I{{.BUILD_DIR}} -target x86_64-linux-gnu -o {{.BUILD_DIR}}/blink-linux-x86_64 {{.BUILD_DIR}}/cli.c {{.BUILD_DIR}}/release-objs/monolith-linux-x86_64.o {{.BUILD_DIR}}/release-objs/gc-linux-x86_64.o -lm -Wl,--gc-sections
+      - zig cc -O2 -Wno-parentheses-equality -I{{.GC_INC}} -I{{.BUILD_DIR}} -target aarch64-linux-gnu -o {{.BUILD_DIR}}/blink-linux-aarch64 {{.BUILD_DIR}}/cli.c {{.BUILD_DIR}}/release-objs/monolith-linux-aarch64.o {{.BUILD_DIR}}/release-objs/gc-linux-aarch64.o -lm -Wl,--gc-sections
+      - zig cc -O2 -Wno-parentheses-equality -I{{.GC_STUBS}} -I{{.GC_INC}} -I{{.BUILD_DIR}} -target x86_64-macos -o {{.BUILD_DIR}}/blink-macos-x86_64 {{.BUILD_DIR}}/cli.c {{.BUILD_DIR}}/release-objs/monolith-macos-x86_64.o {{.BUILD_DIR}}/release-objs/gc-macos-x86_64.o -lm -Wl,-dead_strip
+      - zig cc -O2 -Wno-parentheses-equality -I{{.GC_STUBS}} -I{{.GC_INC}} -I{{.BUILD_DIR}} -target aarch64-macos -o {{.BUILD_DIR}}/blink-macos-aarch64 {{.BUILD_DIR}}/cli.c {{.BUILD_DIR}}/release-objs/monolith-macos-aarch64.o {{.BUILD_DIR}}/release-objs/gc-macos-aarch64.o -lm -Wl,-dead_strip
       # Per-target stdlib archives, assembled from the matching monolith.o so
       # the released `blink` can link user code at user-compile time. The host
       # archive keeps the test runtime in a runtime_test.o member, but only
@@ -1255,8 +1255,8 @@ tasks:
       # ranlib'd archive regardless of host toolchain.
       - |
         for t in linux-x86_64 linux-aarch64 macos-x86_64 macos-aarch64; do
-          rm -f .tmp/libblink_std-$t.a
-          zig ar rcs .tmp/libblink_std-$t.a .tmp/monolith-$t.o
+          rm -f {{.BUILD_DIR}}/release-objs/libblink_std-$t.a
+          zig ar rcs {{.BUILD_DIR}}/release-objs/libblink_std-$t.a {{.BUILD_DIR}}/release-objs/monolith-$t.o
         done
       # Stage release layout per target: bin/blink + share/blink/{archive,headers,native/}.
       # This matches `task install` layout (bin/, share/blink/) so the
@@ -1271,7 +1271,7 @@ tasks:
           d={{.BUILD_DIR}}/dist/blink-$t
           mkdir -p $d/bin $d/share/blink
           cp {{.BUILD_DIR}}/blink-$t $d/bin/blink
-          cp .tmp/libblink_std-$t.a $d/share/blink/libblink_std.a
+          cp {{.BUILD_DIR}}/release-objs/libblink_std-$t.a $d/share/blink/libblink_std.a
           cp "$ARC_REL/libblink_std.h" $d/share/blink/libblink_std.h
           cp {{.BUILD_DIR}}/runtime.h $d/share/blink/runtime.h
           # A cross build (blink build -T) compiles the stdlib from this for its target.

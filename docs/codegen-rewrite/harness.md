@@ -103,9 +103,9 @@ an empty program either.
 
 Each file gets its own work directory under `build/corpus/work/<name>/`.
 That directory holds links to `tests/`, `src/`, `lib/`, `bootstrap/` and
-`blink.toml`, a private `.tmp/` (the compiler writes the objects of a native
-dependency there), and a private `build/` whose `blink` and `blinkc` point at
-the compiler under test. This is why the corpus can run in parallel: no two
+`blink.toml`, and a private `build/` whose `blink` and `blinkc` point at the
+compiler under test. The compiler writes the objects of a native dependency to
+`build/native-cache/`, so those are private too. This is why the corpus can run in parallel: no two
 files share an object cache, and a test that calls the relative path
 `build/blink` reaches the compiler under test.
 

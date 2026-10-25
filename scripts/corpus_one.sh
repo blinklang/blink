@@ -18,12 +18,12 @@
 #
 # Why a sandbox per file: tests reach the compiler through the RELATIVE
 # names `build/blink` and `build/blinkc` (src/compile_test_helpers.bl), and
-# the compiler writes the objects of a native dependency under `.tmp`. Each
-# file therefore runs with its own working directory that carries symlinks to
-# the real `tests/`, `src/`, `lib/` and `blink.toml`, a private `.tmp`, and a
-# private `build/` whose `blink`/`blinkc` point at the compiler under test. A
-# private `build/` also means a private object cache, so concurrent files
-# cannot poison each other's cache entries. BLINK_ROOT is never exported:
+# the compiler writes the objects of a native dependency under
+# `build/native-cache`. Each file therefore runs with its own working directory
+# that carries symlinks to the real `tests/`, `src/`, `lib/` and `blink.toml`,
+# and a private `build/` whose `blink`/`blinkc` point at the compiler under
+# test. A private `build/` also means a private object cache, so concurrent
+# files cannot poison each other's cache entries. BLINK_ROOT is never exported:
 # `blink` finds its archive from realpath(argv[0]).
 #
 # A test's own scratch files go under $TMPDIR (compile_test_helpers.scratch_root).
@@ -104,7 +104,7 @@ mkdir -p "$log_dir" "$root/build/corpus/locks"
 exec 9> "$root/build/corpus/locks/$base.lock"
 flock 9
 rm -rf "$work"
-mkdir -p "$work/build" "$work/.tmp"
+mkdir -p "$work/build/native-cache"
 # Short, outside the sandbox: a daemon test puts a socket under its scratch dir, and a
 # socket path has a length limit the sandbox path would exceed.
 if [ -n "${BLINK_CORPUS_SWEEP_TMP:-}" ]; then
@@ -119,7 +119,7 @@ export TMPDIR="$scratch"
 # mtime; a link instead of a copy saves writing the object into every sandbox.
 for o in "$root"/build/corpus/native/*.o; do
     [ -f "$o" ] || continue
-    cp -pl "$o" "$work/.tmp/" 2>/dev/null || cp -p "$o" "$work/.tmp/"
+    cp -pl "$o" "$work/build/native-cache/" 2>/dev/null || cp -p "$o" "$work/build/native-cache/"
 done
 # bootstrap/ is for tests that drive cc over the runtime headers directly, and
 # the llms docs for tests that hold the doc examples to what the compiler does.
@@ -252,9 +252,6 @@ known=null
 if [ "$status" = pass ]; then
     known=0
     if [ "$has_known" -eq 1 ]; then
-        # A fresh .tmp, so a test that creates a scratch file and asserts it
-        # is new behaves as it did on the first run.
-        rm -rf "$work/.tmp" && mkdir -p "$work/.tmp"
         report="$log_dir/$key.report.json"
         (
             cd "$work" || exit 2
