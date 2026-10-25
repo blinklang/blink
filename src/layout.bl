@@ -15,7 +15,7 @@ import typecheck.{
     tc_is_unbound_metavar, tc_lookup_node_tid, tc_type_decl_nodes, tc_tid_decl_node,
     DECL_NODE_AMBIGUOUS, tc_resolve_transparent_alias_name, tc_type_has_display_impl, tc_type_str, tc_decl_derive_args, tc_derive_arg_trait,
     TYPE_I32, tc_struct_field_slots, tc_sfield_tid, tc_sfield_name, tc_member_tid_at_instance,
-    tc_instance_has_trait, tc_tid_same_type,
+    tc_instance_has_trait, tc_tid_same_type, tc_declared_field_tids,
 }
 import parser.{
     node_fields, node_name, node_value, node_kind, node_type_params,
@@ -26,7 +26,7 @@ import mono.{instances, node_tid_for_inst}
 import diagnostics.{diag_ice_at, diag_is_ice_seg, UNSOLVED_TYPEVAR_AT_CODEGEN}
 import cname.{
     c_typedef_name, c_type_decl_name, c_seg_inner, c_tuple_member, c_vtable_type_name, c_kops_table_name,
-    td_guard_open_lines, td_guard_close_line, cname_reset, cname_mark_transparent_newtype,
+    td_guard_open_lines, td_guard_close_line, td_forward_guard_name, td_forward_decl_lines, cname_reset, cname_mark_transparent_newtype,
     cname_mark_runtime_owned, cname_is_transparent_newtype, cname_is_runtime_owned, c_gc_layout_name,
     c_gc_layout_head, c_field_name,
 }
@@ -392,10 +392,10 @@ fn lo_fn_slot_spelling(tid: Int, position: Position, node: Int) -> Str ! Diag.Re
     rec.c_spelling
 }
 
-// A variant or struct field in its owner. A field that reaches its own enum by value
-// (directly, or through a tuple at any depth) is stored boxed: the owner's C typedef is
-// incomplete while its members are declared, so the member is an opaque int64_t word
-// that holds the heap pointer. Any other field is its Field-position layout.
+// A variant or struct field in its owner. A field that reaches its owner by value
+// (lo_embeds_owner) is stored boxed: the owner's C typedef is incomplete while its members
+// are declared, so the member is an opaque int64_t word that holds the heap pointer. Any
+// other field is its Field-position layout.
 pub fn field_layout_of(owner_tid: Int, field_tid: Int) -> LayoutRecord {
     if !field_embeds_owner(owner_tid, field_tid) { return layout_of(field_tid, Position.Field) }
     LayoutRecord {
@@ -840,14 +840,19 @@ pub fn pool_spelling() -> Str { "blink_threadpool*" }
 // runtime-only spellings. Reuses the generic blink_list container, same as List/FfiScope.
 pub fn async_scope_handles_spelling() -> Str { "blink_list*" }
 
-// Does a field of this type embed its owner by value -- the owner itself, or a tuple that
-// reaches it at any depth? The owner is named by its own tid and compared as one, not by
-// its declaration: two instances of one declaration are two types, so a field at another
-// instance of the very same declaration is finite and is held by value. A declaration
-// shared by two types answers this correctly for the same reason, so nothing here needs to
-// know whether the name was ambiguous; a tid whose declaration is ambiguous declines on its
-// own in lo_decline_reason_of, where the field's Field-position layout asks. "One" is the
-// type, not the pool row: an instance built over a metavariable keeps its own row after the
+// Does a field of this type need its owner's C definition first, through any chain of
+// types that each need the next one's? Such a field is on a cycle that C cannot order, so
+// the struct would have to contain itself. A struct or enum needs each of its fields, a
+// carrier what carrier_complete_children answers, and a pointer container nothing. The question is asked of the type graph alone, so every field on one
+// cycle answers the same whichever type the typedef walk reaches first.
+//
+// The owner is named by its own tid and compared as one, not by its declaration: two
+// instances of one declaration are two types, so a field at another instance of the very
+// same declaration reaches the owner only if that instance does. A declaration shared by
+// two types answers this correctly for the same reason, so nothing here needs to know
+// whether the name was ambiguous; a tid whose declaration is ambiguous declines on its own
+// in lo_decline_reason_of, where the field's Field-position layout asks. "One" is the type,
+// not the pool row: an instance built over a metavariable keeps its own row after the
 // metavariable binds.
 fn lo_embeds_owner(field_tid: Int, owner_tid: Int) -> Bool {
     if owner_tid < 0 { return false }
@@ -855,17 +860,54 @@ fn lo_embeds_owner(field_tid: Int, owner_tid: Int) -> Bool {
 }
 
 fn lo_embeds_tid(field_tid: Int, owner: Int) -> Bool {
-    let r = lo_res(field_tid)
-    let k = tc_tid_kind(r)
-    if k == TyKind.Struct || k == TyKind.Enum { return tc_tid_same_type(r, owner) }
-    if k != TyKind.Tuple { return false }
-    let n = tc_tid_child_count(r)
+    let mut seen: Map[Int, Int] = Map()
+    let mut work: List[Int] = [lo_res(field_tid)]
     let mut i = 0
-    while i < n {
-        if lo_embeds_tid(tc_tid_child(r, i), owner) { return true }
+    while i < work.len() {
+        let r = work.get(i).unwrap()
         i = i + 1
+        if r < 0 || seen.contains_key(r) != 0 { continue }
+        seen.insert(r, 1)
+        let k = tc_tid_kind(r)
+        if k == TyKind.Struct || k == TyKind.Enum {
+            if tc_tid_same_type(r, owner) { return true }
+            let inst = if tc_tid_child_count(r) > 0 { r } else { -1 }
+            for f in tc_declared_field_tids(r) { work.push(lo_res(tc_member_tid_at_instance(f, inst))) }
+            continue
+        }
+        for c in carrier_complete_children(r) { work.push(lo_res(c)) }
     }
     false
+}
+
+// The children whose C definition an Option, Result or Tuple typedef needs ahead of its
+// own: every member it holds by value, as carrier_member_layout lays them out, and a
+// pointer payload that is itself a carrier, since a carrier typedef is anonymous and
+// nothing can declare it ahead. A nominal pointee needs only its name. Every other kind
+// answers none: a pointer container is one runtime type whatever it holds.
+pub fn carrier_complete_children(tid: Int) -> List[Int] {
+    let r = lo_res(tid)
+    let k = tc_tid_kind(r)
+    let mut out: List[Int] = []
+    if k == TyKind.Tuple {
+        let mut i = 0
+        while i < tc_tid_child_count(r) {
+            out.push(tc_tid_child(r, i))
+            i = i + 1
+        }
+        return out
+    }
+    if k == TyKind.Option {
+        let inner = lo_res(tc_tid_child(r, 0))
+        if !lo_member_is_boxed(r, inner, Slot.Inner1) || lo_is_carrier_kind(tc_tid_kind(inner)) { out.push(inner) }
+        return out
+    }
+    if k == TyKind.Result {
+        out.push(tc_tid_child(r, 0))
+        let err = lo_res(tc_tid_child(r, 1))
+        if !lo_member_is_boxed(r, err, Slot.Inner2) { out.push(err) }
+    }
+    out
 }
 
 // The reasons a tid has no C answer. A pointer container (List, Map, Set, Channel,
@@ -1276,14 +1318,35 @@ fn lo_ensure_child_typedef(child: Int) {
     if lo_is_carrier_kind(tc_tid_kind(c)) { let _ = ensure_typedef_for(c) }
 }
 
+// A member held by pointer needs its pointee declared, not defined. A nominal pointee is
+// declared by name, so the typedef walk may write its body after this carrier, which is
+// what lets a pointer close a cycle of types. A carrier typedef is anonymous and cannot
+// be declared ahead, so a carrier pointee is defined first.
+fn lo_ensure_pointee_typedef(pointee: Int) {
+    lo_ensure_child_typedef(pointee)
+    let k = tc_tid_kind(pointee)
+    if k != TyKind.Struct && k != TyKind.Enum { return }
+    let decl = tc_tid_decl_node(pointee)
+    // The runtime header declares its own types, some as anonymous structs that a forward
+    // declaration would contradict.
+    if decl < 0 || cname_is_runtime_owned(decl) { return }
+    let spelling = lo_spell(pointee)
+    if spelling == "" || diag_is_ice_seg(spelling) { return }
+    let key = td_forward_guard_name(spelling)
+    if lo_guarded(key) { return }
+    typedef_guard.own.insert(key, 1)
+    typedef_buffer.push(QueuedTypedef { tid: pointee, block: td_forward_decl_lines(spelling).join("\n") })
+}
+
 // The Option payload: word-sized values and plain enums sit inline; a struct, data
 // enum, instance, carrier or tuple sits behind a pointer.
 fn lo_emit_option_typedef(r: Int, name: Str) {
     let inner = lo_res(tc_tid_child(r, 0))
     if lo_is_opaque(inner) { return }
     if lo_guarded(name) { return }
-    lo_ensure_child_typedef(inner)
-    let member = if lo_fits_word(inner) { lo_member_spelling(inner) } else { pointer_spelling(lo_spell(inner)) }
+    let fits = lo_fits_word(inner)
+    if fits { lo_ensure_child_typedef(inner) } else { lo_ensure_pointee_typedef(inner) }
+    let member = if fits { lo_member_spelling(inner) } else { pointer_spelling(lo_spell(inner)) }
     lo_guard_and_push(r, name, "typedef struct \{ int tag; {member} value; } {name};")
 }
 
@@ -1298,10 +1361,11 @@ fn lo_emit_result_typedef(r: Int, name: Str) {
     let ok = lo_res(tc_tid_child(r, 0))
     let err = lo_res(tc_tid_child(r, 1))
     lo_ensure_child_typedef(ok)
-    lo_ensure_child_typedef(err)
+    let err_by_pointer = lo_is_struct_by_pointer_err(err)
+    if err_by_pointer { lo_ensure_pointee_typedef(err) } else { lo_ensure_child_typedef(err) }
     let ok_member = lo_member_spelling(ok)
     let mut err_member = lo_member_spelling(err)
-    if lo_is_struct_by_pointer_err(err) { err_member = pointer_spelling(err_member) }
+    if err_by_pointer { err_member = pointer_spelling(err_member) }
     lo_guard_and_push(r, name, "typedef struct \{ int tag; union \{ {ok_member} ok; {err_member} err; }; } {name};")
 }
 

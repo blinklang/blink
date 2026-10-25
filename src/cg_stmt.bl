@@ -60,6 +60,7 @@ import cg_expr.{
     cg_expr_take_pending, cg_expr_value_count, lower_expr, cg_expr_sequence,
     cg_expr_clear_old_snapshots, cg_expr_set_old_snapshot,
     x_layout_checked, x_panic_message, x_stopped, x_unbox_payload, ArithSite, lower_arith_operator,
+    cg_expr_field_stored,
 }
 import cg_eff.{
     cg_eff_async_scope_exit_symbol, cg_eff_binder_is_shared, cg_eff_block_handler_calls,
@@ -1426,7 +1427,64 @@ fn lower_assign(node: Int) -> Int ! Diag.Report {
     if tid >= 0 && cs_is_void_like(tid) && !cg_expr_is_registered(rhs) {
         return lower_stmt_tail(rhs, TAIL_DISCARD, "", -1)
     }
+    if place_crosses_box(target) { return assign_through_boxes(node, target, lower_value(rhs)) }
     ir_assign(node, lower_target(target), lower_value(rhs))
+}
+
+// Whether a place sits in, or under, a boxed field (field_layout_of). Values on a cycle of
+// types share boxes once copied, so such a place cannot be written where it lies.
+fn place_crosses_box(place: Int) -> Bool ! Diag.Report {
+    if node_kind(place) != NodeKind.FieldAccess { return false }
+    let obj = node_obj(place)
+    let owner = tid_of_node(obj)
+    let ftid = tid_of_node(place)
+    if owner < 0 || ftid < 0 { return false }
+    if tc_tid_kind(tc_resolve(owner)) == TyKind.Struct {
+        if field_layout_of(owner, ftid).slot_form == SlotForm.PointerBoxed { return true }
+    }
+    place_crosses_box(obj)
+}
+
+// §3.6.1: a write to a place changes only the value that owns it. A box can be shared by
+// copies of one value, so a write never goes through one: the write changes a copy of what
+// the box holds, and a fresh box of that copy replaces the old one, out to the first owner
+// that is not boxed.
+fn assign_through_boxes(node: Int, place: Int, value: Int) -> Int ! Diag.Report {
+    if value < 0 { return -1 }
+    let mut out: List[Int] = []
+    if !assign_place(node, place, value, out) { return -1 }
+    ir_block(node, out)
+}
+
+fn assign_place(node: Int, place: Int, value: Int, out: List[Int]) -> Bool ! Diag.Report {
+    if !place_crosses_box(place) {
+        out.push(ir_assign(node, lower_target(place), value))
+        return true
+    }
+    let obj = node_obj(place)
+    let otid = stmt_tid(obj)
+    let ftid = stmt_tid(place)
+    if otid < 0 || ftid < 0 { return false }
+    let is_struct = tc_tid_kind(tc_resolve(otid)) == TyKind.Struct
+    let mem = if is_struct { field_layout_of(otid, ftid) } else { carrier_member_layout(otid, Slot.Elem(node_name(place).to_int())) }
+    let checked = x_layout_checked(mem, place, "UnspellableFieldType",
+        "assigned field has no C layout", "monomorphisation must resolve every type codegen reads; this is a compiler bug")
+    if x_stopped(checked) { return false }
+    let member = if is_struct { c_field_name(node_name(place)) } else { c_tuple_member(node_name(place).to_int()) }
+    let stored = cg_expr_field_stored(ftid, place, checked, value)
+    if stored < 0 { return false }
+    if !place_crosses_box(obj) {
+        let base = lower_target(obj)
+        out.push(ir_assign(node, ir_field_get(ftid, place, checked.c_spelling, member, checked.slot_form, base), stored))
+        return true
+    }
+    let orec = layout_at(otid, Position.Local, obj)
+    if x_stopped(orec) { return false }
+    let tmp = c_mint_local("place")
+    out.push(ir_let(otid, obj, orec.c_spelling, tmp, orec.slot_form, lower_value(obj)))
+    let base = ir_var_ref(otid, obj, orec.c_spelling, tmp, orec.slot_form)
+    out.push(ir_assign(node, ir_field_get(ftid, place, checked.c_spelling, member, checked.slot_form, base), stored))
+    assign_place(node, obj, ir_var_ref(otid, obj, orec.c_spelling, tmp, orec.slot_form), out)
 }
 
 // Whether a target is a place this stage can build an lvalue for: a bare local this module
@@ -1489,12 +1547,14 @@ fn lower_compound_assign(node: Int) -> Int ! Diag.Report {
     if leaves_by_type(rhs) && !cg_expr_is_registered(rhs) { return leave_through(node, rhs) }
     let tid = stmt_tid(target)
     if tid < 0 { return -1 }
-    let lhs = lower_target(target)
+    let crosses = place_crosses_box(target)
+    let lhs = if crosses { -1 } else { lower_target(target) }
     let read = lower_target(target)
     // The same seam as the operator, so `x += 1` is checked wherever `x + 1` is.
     let site = ArithSite { node: node, op: node_op(node), tid: tid, lhs_node: target, rhs_node: node_value(node) }
     let sum = lower_arith_operator(site, read, lower_value(node_value(node)))
     if sum < 0 { return -1 }
+    if crosses { return assign_through_boxes(node, target, sum) }
     ir_assign(node, lhs, sum)
 }
 

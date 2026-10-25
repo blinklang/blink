@@ -1,0 +1,72 @@
+// A carrier typedef is anonymous, so the typedef walk must write every child the carrier
+// holds by value before it. A nominal behind a pointer needs only its name, which a
+// forward declaration gives, so it is left out: that is what lets a pointer close a cycle.
+
+import std.fs
+import std.io
+import typecheck.{tc_type_str, tc_lookup_node_tid, check_types}
+import layout.{carrier_complete_children, layout_reset}
+import parser.{node_count}
+import compiler.{compile_to_program}
+
+fn probe_src() -> Str {
+    #"type Point { x: Int, y: Int }
+type Color { Red, Green }
+fn main() {
+    let oi: Option[Int] = None
+    let op: Option[Point] = None
+    let ot: Option[(Int, Str)] = None
+    let rpc: Result[Point, Color] = Ok(Point { x: 1, y: 2 })
+    let rip: Result[Int, Point] = Ok(1)
+    let tp: (Point, Option[Int]) = (Point { x: 1, y: 2 }, None)
+    let lp: List[Point] = []
+    let p = Point { x: 1, y: 2 }
+    assert(lp.len() == 0)
+}
+"#
+}
+
+// The probe is deleted before any assertion so a red row never leaks the file.
+fn harvest_type_tids() -> Map[Str, Int] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
+    let path = "build/layout_carrier_children_probe_src.bl"
+    write_file(path, probe_src())
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    layout_reset()
+    let _ = fs.delete(path)
+    let mut m: Map[Str, Int] = Map()
+    let mut idx = 0
+    while idx < node_count() {
+        let tid = tc_lookup_node_tid(idx)
+        if tid >= 0 { m.insert(tc_type_str(tid), tid) }
+        idx = idx + 1
+    }
+    m
+}
+
+fn children_of(m: Map[Str, Int], key: Str) -> Str {
+    let tid = m.get(key) ?? -1
+    if tid == -1 { io.println("FAIL: the probe has no tid for '{key}'") }
+    assert(tid != -1)
+    carrier_complete_children(tid).map(fn(c: Int) -> Str { tc_type_str(c) }).join(", ")
+}
+
+test "an Option needs an inline payload, or a carrier behind its pointer, but never a nominal pointee" {
+    let m = harvest_type_tids()
+    assert_eq(children_of(m, "Option[Int]"), "Int")
+    assert_eq(children_of(m, "Option[Point]"), "")
+    assert_eq(children_of(m, "Option[(Int, Str)]"), "(Int, Str)")
+}
+
+test "a Result needs its ok value, and its error only when the error sits inline" {
+    let m = harvest_type_tids()
+    assert_eq(children_of(m, "Result[Point, Color]"), "Point, Color")
+    assert_eq(children_of(m, "Result[Int, Point]"), "Int")
+}
+
+test "a tuple needs every element, and a nominal or a pointer container needs none" {
+    let m = harvest_type_tids()
+    assert_eq(children_of(m, "(Point, Option[Int])"), "Point, Option[Int]")
+    assert_eq(children_of(m, "Point"), "")
+    assert_eq(children_of(m, "List[Point]"), "")
+}

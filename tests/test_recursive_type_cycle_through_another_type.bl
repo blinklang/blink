@@ -1,0 +1,175 @@
+// A cycle that holds every type on it by value has no finite C layout, so each field on
+// the cycle is stored behind a box. The cycle may run through an enum payload, a tuple,
+// a Result arm or a struct field, and through any number of types.
+
+@derive(Eq, Debug)
+type A { flag: Bool, b: ALink }
+
+@derive(Eq, Debug)
+type ALink {
+    Nil
+    Has(a: A)
+}
+
+// A three-type cycle: P holds Q, Q holds R, and R's variant holds P.
+type P { n: Int, q: Q }
+type Q { m: Int, r: R }
+type R {
+    End
+    More(p: P)
+}
+
+// The cycle runs through a tuple in an enum payload.
+type T { v: Int, rest: TLink }
+type TLink {
+    Stop
+    Go(pair: (Int, T))
+}
+
+// The cycle runs through the ok arm of a Result, which holds its payload by value.
+type W { v: Int, next: WNext }
+type WNext {
+    Done
+    Step(r: Result[W, Str])
+}
+
+// The cycle runs through a struct field that holds the enum: S is on the cycle A2 -> S -> SLink -> A2.
+type A2 { s: S }
+type S { n: Int, link: SLink }
+type SLink {
+    Nil
+    Has(a: A2)
+}
+
+// List and Map already hold their elements by pointer; a cycle through them keeps working.
+type Tree {
+    Leaf
+    Node(value: Int, children: List[Tree])
+    Named(labels: Map[Str, Tree])
+}
+
+fn a_depth(a: A) -> Int {
+    match a.b {
+        ALink.Nil => 1
+        ALink.Has(x) => 1 + a_depth(x)
+    }
+}
+
+fn p_sum(p: P) -> Int {
+    match p.q.r {
+        R.End => p.n + p.q.m
+        R.More(x) => p.n + p.q.m + p_sum(x)
+    }
+}
+
+fn t_sum(t: T) -> Int {
+    match t.rest {
+        TLink.Stop => t.v
+        TLink.Go((k, u)) => t.v + k + t_sum(u)
+    }
+}
+
+fn w_sum(w: W) -> Int {
+    match w.next {
+        WNext.Done => w.v
+        WNext.Step(Ok(x)) => w.v + w_sum(x)
+        WNext.Step(Err(_)) => -1
+    }
+}
+
+fn tree_sum(t: Tree) -> Int {
+    match t {
+        Tree.Leaf => 0
+        Tree.Node(v, cs) => {
+            let mut s = v
+            for c in cs { s = s + tree_sum(c) }
+            s
+        }
+        Tree.Named(m) => {
+            let mut s = 0
+            for k in m.keys() { s = s + tree_sum(m.get(k).unwrap()) }
+            s
+        }
+    }
+}
+
+test "a two-type cycle through an enum payload builds and reads back" {
+    let x = A { flag: false, b: ALink.Has(A { flag: true, b: ALink.Nil }) }
+    assert_eq(x.flag, false)
+    assert_eq(a_depth(x), 2)
+    match x.b {
+        ALink.Has(inner) => assert_eq(inner.flag, true)
+        ALink.Nil => assert(false, "the link is set")
+    }
+}
+
+test "a three-type cycle builds and reads back" {
+    let p = P { n: 1, q: Q { m: 2, r: R.More(P { n: 3, q: Q { m: 4, r: R.End } }) } }
+    assert_eq(p.q.m, 2)
+    assert_eq(p_sum(p), 10)
+}
+
+test "a cycle through a tuple in an enum payload" {
+    let t = T { v: 1, rest: TLink.Go((2, T { v: 3, rest: TLink.Stop })) }
+    assert_eq(t_sum(t), 6)
+}
+
+test "a cycle through the ok arm of a Result" {
+    let w = W { v: 1, next: WNext.Step(Ok(W { v: 2, next: WNext.Done })) }
+    assert_eq(w_sum(w), 3)
+}
+
+test "a cycle through List and Map payloads" {
+    let mut labels: Map[Str, Tree] = Map.new()
+    labels.insert("a", Tree.Node(3, []))
+    labels.insert("b", Tree.Leaf)
+    let t = Tree.Node(1, [Tree.Node(2, []), Tree.Named(labels)])
+    assert_eq(tree_sum(t), 6)
+}
+
+test "derived Eq compares a recursive value by value" {
+    let x = A { flag: false, b: ALink.Has(A { flag: true, b: ALink.Nil }) }
+    let y = A { flag: false, b: ALink.Has(A { flag: true, b: ALink.Nil }) }
+    let z = A { flag: false, b: ALink.Has(A { flag: false, b: ALink.Nil }) }
+    assert(x == y, "equal values compare equal")
+    assert(x != z, "a difference two levels down compares unequal")
+}
+
+test "derived Debug renders a recursive value" {
+    let x = A { flag: false, b: ALink.Has(A { flag: true, b: ALink.Nil }) }
+    assert_eq(x.debug(), "A \{ flag: false, b: Has(A \{ flag: true, b: Nil }) }")
+}
+
+test "a copy of a value on a cycle is a value: assigning a field of the copy leaves the original" {
+    let x = A { flag: false, b: ALink.Has(A { flag: true, b: ALink.Nil }) }
+    let mut y = x
+    y.b = ALink.Nil
+    y.flag = true
+    assert_eq(a_depth(x), 2)
+    assert_eq(x.flag, false)
+    assert_eq(a_depth(y), 1)
+}
+
+test "a write through a boxed struct field of a copy leaves the original" {
+    let x = A2 { s: S { n: 1, link: SLink.Has(A2 { s: S { n: 2, link: SLink.Nil } }) } }
+    let mut y = x
+    y.s.n = 7
+    assert_eq(x.s.n, 1)
+    assert_eq(y.s.n, 7)
+    let mut z = y.s
+    z.n = 9
+    assert_eq(y.s.n, 7)
+    assert_eq(z.n, 9)
+}
+
+test "a field read out of a boxed struct field is a copy" {
+    let x = A2 { s: S { n: 1, link: SLink.Nil } }
+    let mut s = x.s
+    s.n = 5
+    s.link = SLink.Has(A2 { s: S { n: 6, link: SLink.Nil } })
+    assert_eq(x.s.n, 1)
+    match x.s.link {
+        SLink.Nil => assert(true, "the original link is unchanged")
+        SLink.Has(_) => assert(false, "the original link must stay Nil")
+    }
+}

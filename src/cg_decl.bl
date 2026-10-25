@@ -17,6 +17,7 @@ import diagnostics.{
 }
 import layout.{
     LayoutRecord, Position, SlotForm, layout_of, field_layout_of, field_embeds_owner, ensure_typedef_for, c_type_of, enum_tag_tid,
+    carrier_complete_children,
     layout_take_typedefs, tid_of_node,
 }
 import cname.{
@@ -181,7 +182,25 @@ pub fn cg_decl_emit_typedefs_over(carriers: List[Int]) ! Diag.Report {
         }
         emit_type_decl(decl)
     }
+    for decl in cg_reg_type_decls() {
+        if is_generic_base(decl) {
+            for inst in instance_tids_of(decl) { flush_boxed_members(decl, inst) }
+            continue
+        }
+        flush_boxed_members(decl, -1)
+    }
     for tid in carriers { flush_member_typedefs(tid) }
+}
+
+// The carriers of the members emit_struct and emit_enum held boxed, once every nominal
+// typedef is written.
+fn flush_boxed_members(decl: Int, inst_tid: Int) {
+    if decl < 0 || skips_typedef(decl) { return }
+    let owner_tid = cg_owner_tid(decl, inst_tid)
+    if owner_tid < 0 { return }
+    for ftid in member_tids(decl, inst_tid) {
+        if field_embeds_owner(owner_tid, ftid) { flush_member_typedefs(ftid) }
+    }
 }
 
 // Each carrier type a node of the program spells, once, in the order of its first node. The
@@ -307,19 +326,17 @@ fn member_tids(decl: Int, inst_tid: Int) -> List[Int] {
     out
 }
 
-// The nominal types a member type reaches BY VALUE. A carrier or tuple names its members
-// inside its own typedef, so the walk goes through it; a runtime container is one C type
-// whatever it holds, so the walk stops there.
+// The nominal types whose typedef a member type needs written first. A carrier needs what
+// carrier_complete_children answers, so the walk goes through those; a nominal type a
+// carrier holds by pointer needs only its name, which layout declares ahead, and a runtime
+// container is one C type whatever it holds, so the walk stops at both.
 fn nominal_deps(tid: Int) -> List[Int] {
     let r = tc_resolve(tid)
     let k = tc_tid_kind(r)
     if k == TyKind.Struct || k == TyKind.Enum { return [r] }
-    if k != TyKind.Option && k != TyKind.Result && k != TyKind.Tuple { return [] }
     let mut out: List[Int] = []
-    let mut i = 0
-    while i < tc_tid_child_count(r) {
-        for d in nominal_deps(tc_tid_child(r, i)) { out.push(d) }
-        i = i + 1
+    for c in carrier_complete_children(r) {
+        for d in nominal_deps(c) { out.push(d) }
     }
     out
 }
@@ -395,15 +412,11 @@ fn emit_one(decl: Int, tid: Int, inst_tid: Int, c_name: Str) ! Diag.Report {
     } else {
         emit_struct(decl, inst_tid, guard, c_name)
     }
-    let owner_tid = cg_owner_tid(decl, inst_tid)
-    for ftid in member_tids(decl, inst_tid) {
-        if field_embeds_owner(owner_tid, ftid) { flush_member_typedefs(ftid) }
-    }
 }
 
 // A member that embeds its owner is held boxed, so the owner typedef needs none of its
-// carriers. Those carriers name the owner by value, so they wait until emit_one has
-// written it.
+// carriers. Those carriers need the owner's typedef, and that of every other type on the
+// cycle, some of which the walk may still be inside, so they wait for flush_boxed_members.
 fn flush_unless_embeds_owner(owner_tid: Int, ftid: Int) {
     if !field_embeds_owner(owner_tid, ftid) { flush_member_typedefs(ftid) }
 }

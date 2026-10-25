@@ -31,6 +31,7 @@ import cg_call.{
     cg_call_stdlib_symbol, cg_call_equality_fn, cg_call_container_ctor, cg_call_order_sign_helper,
 }
 import cg_promote.{cg_promote_has_pending, cg_promote_print_walkers}
+import cg_expr.{cg_expr_field_value, cg_expr_field_stored}
 import ir.{
     ir_assign, ir_binary, ir_block, ir_call_direct, ir_call_runtime, ir_cast, ir_const,
     ir_field_get, ir_if, ir_let, ir_panic, ir_return, ir_switch, ir_unary, ir_var_ref,
@@ -257,21 +258,16 @@ fn shape_refusal(decl: Int, tid: Int, derive: Str) -> Str {
 }
 
 // Whether this stage may read a field at all, recorded once. A declined layout has no
-// spelling. A boxed field is an opaque word holding a heap pointer, and every derive that
-// walks fields has to read through that pointer to answer, which this stage does not do.
-// The caller passes the field layout and asks before it builds anything, because Eq names
-// one field twice, once on each side of the comparison: asked twice it would record the
-// same refusal twice, and a count of refusals could no longer tell one gap from two.
-fn field_refused(frec: LayoutRecord, path: Str, derive: Str, span: Int) -> Bool ! Diag.Report {
+// spelling. The caller passes the field layout and asks before it builds anything, because
+// Eq names one field twice, once on each side of the comparison: asked twice it would
+// record the same refusal twice, and a count of refusals could no longer tell one gap from
+// two.
+fn field_refused(frec: LayoutRecord, path: Str, span: Int) -> Bool ! Diag.Report {
     let reason = frec.decline_reason
     if reason != "" {
         diag_ice_at("DeriveBodyNotBuildable", UNSOLVED_TYPEVAR_AT_CODEGEN,
             "no C spelling for field `{path}`: {reason}", span,
             "every type that reaches code generation must be concrete and nameable; this is a compiler bug")
-        return true
-    }
-    if frec.slot_form == SlotForm.PointerBoxed {
-        not_built(span, "@derive({derive}) on the boxed field `{path}`")
         return true
     }
     false
@@ -280,7 +276,7 @@ fn field_refused(frec: LayoutRecord, path: Str, derive: Str, span: Int) -> Bool 
 // The value of one field of `self` or `other`, or -1 after a refusal.
 fn field_value(owner_tid: Int, ftid: Int, path: Str, holder: Str, derive: Str, span: Int) -> Int ! Diag.Report {
     let frec = field_layout_of(owner_tid, ftid)
-    if field_refused(frec, path, derive, span) { return -1 }
+    if field_refused(frec, path, span) { return -1 }
     field_ref(owner_tid, holder, Position.Param, ftid, frec, path, span)
 }
 
@@ -471,7 +467,7 @@ fn eq_differs(owner_tid: Int, ftid: Int, path: Str, span: Int) -> Int ! Diag.Rep
     let bools = bool_spelling(span)
     if bools == "" { return -1 }
     let frec = field_layout_of(owner_tid, ftid)
-    if field_refused(frec, path, derive_eq, span) { return -1 }
+    if field_refused(frec, path, span) { return -1 }
     let lhs = field_ref(owner_tid, "self", Position.Param, ftid, frec, path, span)
     let rhs = field_ref(owner_tid, "other", Position.Param, ftid, frec, path, span)
     if lhs < 0 || rhs < 0 { return -1 }
@@ -559,7 +555,7 @@ fn tag_ref(owner_tid: Int, name: Str, at_pos: Position, ints: Str, span: Int) ->
 fn field_ref(owner_tid: Int, name: Str, at_pos: Position, ftid: Int, frec: LayoutRecord, path: Str, span: Int) -> Int ! Diag.Report {
     let base = value_ref(owner_tid, name, at_pos, span)
     if base < 0 { return -1 }
-    ir_field_get(ftid, span, frec.c_spelling, path, frec.slot_form, base)
+    cg_expr_field_value(ftid, span, frec, ir_field_get(ftid, span, frec.c_spelling, path, frec.slot_form, base))
 }
 
 // Whether two values differ, when a runtime helper answers whether they are equal. The
@@ -770,7 +766,7 @@ fn cmp_variant_block(decl: Int, tid: Int, slot: Int, span: Int) -> Int ! Diag.Re
 // Equal, which sorts wrongly and compiles cleanly.
 fn cmp_field(owner_tid: Int, ftid: Int, path: Str, span: Int) -> List[Int] ! Diag.Report {
     let frec = field_layout_of(owner_tid, ftid)
-    if field_refused(frec, path, derive_ord, span) { return [] }
+    if field_refused(frec, path, span) { return [] }
     let k = tc_tid_kind(tc_resolve(ftid))
     let helper = cg_call_order_sign_helper(k)
     if helper != "" { return cmp_sign_field(helper, owner_tid, ftid, frec, path, span) }
@@ -2411,7 +2407,7 @@ fn de_reader_body(decl: Int, tid: Int, r: DeReader, span: Int) -> Int ! Diag.Rep
 // the value is built from, so each member is read exactly once.
 fn de_member(r: DeReader, owner_tid: Int, ftid: Int, name: Str, span: Int) -> DeRead ! Diag.Report {
     let frec = field_layout_of(owner_tid, ftid)
-    if field_refused(frec, name, derive_deserialize, span) { return de_refused() }
+    if field_refused(frec, name, span) { return de_refused() }
     let vrec = layout_of(ftid, Position.Local)
     let vs = spelling_or_ice(vrec, "field `{name}`", span)
     let found = de_json_call(r, "json_get", [de_int_local(r, "idx", span), de_str_const(r, name, span)], span)
@@ -2423,7 +2419,9 @@ fn de_member(r: DeReader, owner_tid: Int, ftid: Int, name: Str, span: Int) -> De
     let mut pre = [ir_let(TYPE_INT, span, r.ints, node, int_form(), found)]
     for s in read.pre { pre.push(s) }
     pre.push(ir_let(ftid, span, vs, held, vrec.slot_form, read.value))
-    DeRead { pre: pre, value: ir_var_ref(ftid, span, vs, held, vrec.slot_form), ok: true }
+    let value = cg_expr_field_stored(ftid, span, frec, ir_var_ref(ftid, span, vs, held, vrec.slot_form))
+    if value < 0 { return de_refused() }
+    DeRead { pre: pre, value: value, ok: true }
 }
 
 fn de_struct_body(tid: Int, r: DeReader, span: Int) -> Int ! Diag.Report {
