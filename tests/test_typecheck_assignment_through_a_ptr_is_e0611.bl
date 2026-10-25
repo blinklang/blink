@@ -104,7 +104,7 @@ test "a compound write through a Ptr is E0611 with a read-then-write help" {
 
 test "a write through a Ptr with a right side that runs code keeps the right side on its own line" {
     probe("{compile_test_helpers.scratch_root()}/ptr_place_effectful_rhs.bl", "{IOVEC}fn next() -> U64 \{ 9 }\n\nfn main() \{\n    with ffi.scope() as s \{\n        let p = s.alloc[IoVec]()\n        p.iov_len = next()\n    }\n}\n")
-    expect_e0611("call rhs", 9, 9, "`p` is a `Ptr[IoVec]`", "`let iov_len = next()`, then `p.iov_len.write(iov_len)`", OWN_LINE, "let iov_len = next()\n        p.iov_len.write(iov_len)")
+    expect_e0611("call rhs", 9, 9, "`p` is a `Ptr[IoVec]`", "`let iov_len: U64 = next()`, then `p.iov_len.write(iov_len)`", OWN_LINE, "let iov_len: U64 = next()\n        p.iov_len.write(iov_len)")
 }
 
 test "build reports E0611 for a write through a Ptr, never an internal error" {
@@ -168,16 +168,25 @@ test "build reports a missing field through a Ptr, never an internal error" {
 test "the name the help binds is not one already in scope" {
     let node = "@ffi.struct\ntype Node \{ p: Int, n: Int }\n\nfn next() -> Int \{ 9 }\n\n"
     probe("{compile_test_helpers.scratch_root()}/ptr_place_help_name_root.bl", "{node}fn main() \{\n    with ffi.scope() as s \{\n        let p: Ptr[Node] = s.alloc()\n        p.p = next()\n    }\n}\n")
-    expect_e0611("name is the root", 9, 9, "`p` is a `Ptr[Node]`", "`let p_1 = next()`, then `p.p.write(p_1)`", OWN_LINE, "let p_1 = next()\n        p.p.write(p_1)")
+    expect_e0611("name is the root", 9, 9, "`p` is a `Ptr[Node]`", "`let p_1: Int = next()`, then `p.p.write(p_1)`", OWN_LINE, "let p_1: Int = next()\n        p.p.write(p_1)")
     probe("{compile_test_helpers.scratch_root()}/ptr_place_help_name_local.bl", "{node}fn main() \{\n    let n = 1\n    let n_1 = 2\n    with ffi.scope() as s \{\n        let p: Ptr[Node] = s.alloc()\n        p.n = next() + n + n_1\n    }\n}\n")
-    expect_e0611("name is a local", 11, 9, "`p` is a `Ptr[Node]`", "`let n_2 = next() + n + n_1`, then `p.n.write(n_2)`", OWN_LINE, "let n_2 = next() + n + n_1\n        p.n.write(n_2)")
+    expect_e0611("name is a local", 11, 9, "`p` is a `Ptr[Node]`", "`let n_2: Int = next() + n + n_1`, then `p.n.write(n_2)`", OWN_LINE, "let n_2: Int = next() + n + n_1\n        p.n.write(n_2)")
 }
 
 test "a right side the help cannot quote still gets the write help" {
     probe("{compile_test_helpers.scratch_root()}/ptr_place_unquoted_rhs.bl", "{IOVEC}fn main() \{\n    let c = true\n    with ffi.scope() as s \{\n        let p = s.alloc[IoVec]()\n        p.iov_len = if c \{ 1 } else \{ 2 }\n    }\n}\n")
-    expect_e0611("unquoted rhs", 8, 9, "`p` is a `Ptr[IoVec]`", "`let iov_len = if c \{ 1 } else \{ 2 }`, then `p.iov_len.write(iov_len)`", OWN_LINE, "let iov_len = if c \{ 1 } else \{ 2 }\n        p.iov_len.write(iov_len)")
+    expect_e0611("unquoted rhs", 8, 9, "`p` is a `Ptr[IoVec]`", "`let iov_len: U64 = if c \{ 1 } else \{ 2 }`, then `p.iov_len.write(iov_len)`", OWN_LINE, "let iov_len: U64 = if c \{ 1 } else \{ 2 }\n        p.iov_len.write(iov_len)")
     probe("{compile_test_helpers.scratch_root()}/ptr_place_unquoted_rhs_compound.bl", "{IOVEC}fn main() \{\n    let c = true\n    with ffi.scope() as s \{\n        let p = s.alloc[IoVec]()\n        p.iov_len += if c \{ 1 } else \{ 2 }\n    }\n}\n")
     expect_e0611("unquoted rhs op=", 8, 9, "`p` is a `Ptr[IoVec]`", "`p.iov_len.write(p.iov_len.read() + ...)`", NOT_ATOMIC, "")
+}
+
+// The fix's `let` names the field type (§2.22 *The type of the new name*): `.write(v)` checks
+// `v` against the field, and a bare `let` of a literal would be an Int.
+test "the applied fix for a U64 field checks clean" {
+    probe("{compile_test_helpers.scratch_root()}/ptr_place_fixed_sized.bl", "{IOVEC}fn main() \{\n    let c = true\n    with ffi.scope() as s \{\n        let p = s.alloc[IoVec]()\n        let iov_len: U64 = if c \{ 1 } else \{ 2 }\n        p.iov_len.write(iov_len)\n    }\n}\n")
+    let ok = errors().len() == 0
+    if !ok { show("applied fix") }
+    assert(ok)
 }
 
 test "a write through a Ptr in a match arm with no braces gets a fix only for an inert right side" {
@@ -186,12 +195,12 @@ test "a write through a Ptr in a match arm with no braces gets a fix only for an
     probe("{compile_test_helpers.scratch_root()}/ptr_place_arm_inert.bl", "{head}            1 => p.iov_len = 4\n{tail}")
     expect_e0611("arm inert", 11, 18, "`p` is a `Ptr[IoVec]`", "`p.iov_len.write(4)`", "", "p.iov_len.write(4)")
     probe("{compile_test_helpers.scratch_root()}/ptr_place_arm_call.bl", "{head}            1 => p.iov_len = next()\n{tail}")
-    expect_e0611("arm call", 11, 18, "`p` is a `Ptr[IoVec]`", "`let iov_len = next()`, then `p.iov_len.write(iov_len)`", OWN_LINE, "")
+    expect_e0611("arm call", 11, 18, "`p` is a `Ptr[IoVec]`", "`let iov_len: U64 = next()`, then `p.iov_len.write(iov_len)`", OWN_LINE, "")
 }
 
 test "a right side over several lines moves whole to the let" {
     probe("{compile_test_helpers.scratch_root()}/ptr_place_multiline_rhs.bl", "{IOVEC}fn add(a: U64, b: U64) -> U64 \{ a + b }\n\nfn main() \{\n    with ffi.scope() as s \{\n        let p = s.alloc[IoVec]()\n        p.iov_len = add(\n            1,\n            2)\n    }\n}\n")
-    expect_e0611("multi-line rhs", 9, 9, "`p` is a `Ptr[IoVec]`", "`let iov_len = add(1, 2)`, then `p.iov_len.write(iov_len)`", OWN_LINE, "let iov_len = add(\n            1,\n            2)\n        p.iov_len.write(iov_len)")
+    expect_e0611("multi-line rhs", 9, 9, "`p` is a `Ptr[IoVec]`", "`let iov_len: U64 = add(1, 2)`, then `p.iov_len.write(iov_len)`", OWN_LINE, "let iov_len: U64 = add(\n            1,\n            2)\n        p.iov_len.write(iov_len)")
 }
 
 test "a Ptr field of a temporary is the Ptr case, and the fix keeps the call" {
@@ -300,23 +309,23 @@ test "a write through a Ptr in a statement the parser could not read gets no fix
 
 test "a write through a Ptr in a test block gets the same fix as in a function" {
     probe("{compile_test_helpers.scratch_root()}/ptr_place_test_block.bl", "{IOVEC}fn next(n: U64) -> U64 \{ n + 1 }\n\ntest \"t\" \{\n    with ffi.scope() as s \{\n        let p = s.alloc[IoVec]()\n        p.iov_len = next(1)\n    }\n}\n\nfn main() \{}\n")
-    expect_e0611("test block", 9, 9, "`p` is a `Ptr[IoVec]`", "`let iov_len = next(1)`, then `p.iov_len.write(iov_len)`", OWN_LINE, "let iov_len = next(1)\n        p.iov_len.write(iov_len)")
+    expect_e0611("test block", 9, 9, "`p` is a `Ptr[IoVec]`", "`let iov_len: U64 = next(1)`, then `p.iov_len.write(iov_len)`", OWN_LINE, "let iov_len: U64 = next(1)\n        p.iov_len.write(iov_len)")
 }
 
 test "the name a Ptr fix binds is not a module or a builtin namespace the code reads" {
     let w = "@ffi.struct(header: \"sys/uio.h\", name: \"iovec\")\npub type W \{ io: U64, fs: U64 }\n\nfn next(n: U64) -> U64 \{ n + 1 }\n\n"
     probe("{compile_test_helpers.scratch_root()}/ptr_place_name_module.bl", "import std.io\n\n{w}fn main() \{\n    with ffi.scope() as s \{\n        let p = s.alloc[W]()\n        p.io = next(1)\n        io.println(\"x\")\n    }\n}\n")
-    expect_e0611("module name", 11, 9, "`p` is a `Ptr[W]`", "`let io_1 = next(1)`, then `p.io.write(io_1)`", OWN_LINE, "let io_1 = next(1)\n        p.io.write(io_1)")
+    expect_e0611("module name", 11, 9, "`p` is a `Ptr[W]`", "`let io_1: U64 = next(1)`, then `p.io.write(io_1)`", OWN_LINE, "let io_1: U64 = next(1)\n        p.io.write(io_1)")
     probe("{compile_test_helpers.scratch_root()}/ptr_place_name_namespace.bl", "{w}fn main() \{\n    with ffi.scope() as s \{\n        let p = s.alloc[W]()\n        p.fs = next(1)\n    }\n}\n")
-    expect_e0611("namespace name", 9, 9, "`p` is a `Ptr[W]`", "`let fs_1 = next(1)`, then `p.fs.write(fs_1)`", OWN_LINE, "let fs_1 = next(1)\n        p.fs.write(fs_1)")
+    expect_e0611("namespace name", 9, 9, "`p` is a `Ptr[W]`", "`let fs_1: U64 = next(1)`, then `p.fs.write(fs_1)`", OWN_LINE, "let fs_1: U64 = next(1)\n        p.fs.write(fs_1)")
 }
 
 test "the name a Ptr fix binds is not one a later let in the same block binds" {
     let head = "{IOVEC}fn next(n: U64) -> U64 \{ n + 1 }\n\nfn main() \{\n    with ffi.scope() as s \{\n        let p = s.alloc[IoVec]()\n        p.iov_len = next(4)\n"
     probe("{compile_test_helpers.scratch_root()}/ptr_place_name_later_let.bl", "{head}        let iov_len = 7\n        let _ = iov_len\n    }\n}\n")
-    expect_e0611("later let", 9, 9, "`p` is a `Ptr[IoVec]`", "`let iov_len_1 = next(4)`, then `p.iov_len.write(iov_len_1)`", OWN_LINE, "let iov_len_1 = next(4)\n        p.iov_len.write(iov_len_1)")
+    expect_e0611("later let", 9, 9, "`p` is a `Ptr[IoVec]`", "`let iov_len_1: U64 = next(4)`, then `p.iov_len.write(iov_len_1)`", OWN_LINE, "let iov_len_1: U64 = next(4)\n        p.iov_len.write(iov_len_1)")
     probe("{compile_test_helpers.scratch_root()}/ptr_place_name_later_pattern.bl", "{head}        let (iov_len, z) = (7, 8)\n        let _ = iov_len + z\n    }\n}\n")
-    expect_e0611("later pattern let", 9, 9, "`p` is a `Ptr[IoVec]`", "`let iov_len_1 = next(4)`, then `p.iov_len.write(iov_len_1)`", OWN_LINE, "let iov_len_1 = next(4)\n        p.iov_len.write(iov_len_1)")
+    expect_e0611("later pattern let", 9, 9, "`p` is a `Ptr[IoVec]`", "`let iov_len_1: U64 = next(4)`, then `p.iov_len.write(iov_len_1)`", OWN_LINE, "let iov_len_1: U64 = next(4)\n        p.iov_len.write(iov_len_1)")
 }
 
 test "a write to a whole temporary is E0611, never an internal error" {

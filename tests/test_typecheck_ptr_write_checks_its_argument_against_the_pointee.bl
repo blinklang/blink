@@ -20,12 +20,16 @@ let PROBE = "build/tc_ptr_write_arg_probe.bl"
 // one `let` of the pointer.
 let HEAD = "@ffi.struct(header: \"poll.h\", name: \"pollfd\")\ntype Pollfd \{ fd: I32, events: I16, revents: I16 }\n@trusted(audit: \"probe\")\nfn go() ! FFI \{\n    with ffi.scope() as scope \{\n"
 
-fn probe(body: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
-    write_file(PROBE, "{HEAD}{body}\n    }\n}\nfn main() \{ go() }\n")
+fn check(src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    write_file(PROBE, src)
     diag_reset()
     let program = compile_to_program(PROBE, 0)
     check_types(program)
     let _ = fs.delete(PROBE)
+}
+
+fn probe(body: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    check("{HEAD}{body}\n    }\n}\nfn main() \{ go() }\n")
 }
 
 fn errors() -> List[Str] {
@@ -131,11 +135,7 @@ test "a pointer of the cell's pointee type is stored" {
 // ── A type parameter pointee ─────────────────────────────────────────────────────────
 
 fn probe_generic(body: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
-    write_file(PROBE, "@trusted(audit: \"probe\")\n{body}\nfn main() \{ }\n")
-    diag_reset()
-    let program = compile_to_program(PROBE, 0)
-    check_types(program)
-    let _ = fs.delete(PROBE)
+    check("@trusted(audit: \"probe\")\n{body}\nfn main() \{ }\n")
 }
 
 test "a T value into a Ptr[T] is stored" {
@@ -163,12 +163,29 @@ test "a literal out of the field type's range is IntLiteralOutOfRange" {
 
 test "a Str into an I32 field address is a TypeError" {
     probe("        let p: Ptr[Pollfd] = scope.alloc()\n        p.fd.write(\"x\")")
-    expect_error("p.fd.write(\"x\")", "TypeError E0300 7:20: argument 1 of `Pollfd.fd.write` expects I32, got Str")
+    expect_error("p.fd.write(\"x\")", "TypeError E0300 7:20: argument 1 of `p.fd.write` expects I32, got Str")
 }
 
 test "an Int binding into an I16 field address is a TypeError" {
     probe("        let p: Ptr[Pollfd] = scope.alloc()\n        let n = 1\n        p.revents.write(n)")
-    expect_error("p.revents.write(n: Int)", "TypeError E0300 8:25: argument 1 of `Pollfd.revents.write` expects I16, got Int")
+    expect_error("p.revents.write(n: Int)", "TypeError E0300 8:25: argument 1 of `p.revents.write` expects I16, got Int")
+}
+
+// A field address takes one argument to store and none to read, as `Ptr.write` and
+// `Ptr.read` do.
+test "a field-address write with no argument is a TypeError" {
+    probe("        let p: Ptr[Pollfd] = scope.alloc()\n        p.fd.write()")
+    expect_error("p.fd.write()", "TypeError E0300 7:9: method `p.fd.write` expects 1 argument(s), got 0")
+}
+
+test "a field-address write with two arguments is a TypeError" {
+    probe("        let p: Ptr[Pollfd] = scope.alloc()\n        p.fd.write(1, 2)")
+    expect_error("p.fd.write(1, 2)", "TypeError E0300 7:9: method `p.fd.write` expects 1 argument(s), got 2")
+}
+
+test "a field-address read with an argument is a TypeError" {
+    probe("        let p: Ptr[Pollfd] = scope.alloc()\n        let _v = p.fd.read(1)")
+    expect_error("p.fd.read(1)", "TypeError E0300 7:18: method `p.fd.read` expects 0 argument(s), got 1")
 }
 
 // ── A field path through an embedded struct stores the last field's type ────────────
@@ -178,11 +195,7 @@ test "an Int binding into an I16 field address is a TypeError" {
 let NESTED = "@ffi.struct(header: \"a.h\", name: \"inner_t\")\ntype InnerS \{ p: Ptr[U8], n: I16 }\n@ffi.struct(header: \"a.h\", name: \"outer_t\")\ntype OuterS \{ inner: InnerS }\n@trusted(audit: \"probe\")\nfn go(o: Ptr[OuterS], b: Ptr[U8]) ! FFI \{\n"
 
 fn probe_nested(body: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
-    write_file(PROBE, "{NESTED}{body}\n}\nfn main() \{ }\n")
-    diag_reset()
-    let program = compile_to_program(PROBE, 0)
-    check_types(program)
-    let _ = fs.delete(PROBE)
+    check("{NESTED}{body}\n}\nfn main() \{ }\n")
 }
 
 test "a pointer into a Ptr field of an embedded struct is stored" {
@@ -192,7 +205,7 @@ test "a pointer into a Ptr field of an embedded struct is stored" {
 
 test "an Int into a Ptr field of an embedded struct is a TypeError" {
     probe_nested("    o.inner.p.write(1)")
-    expect_error("o.inner.p.write(1)", "TypeError E0300 7:21: argument 1 of `InnerS.p.write` expects Ptr[U8], got Int")
+    expect_error("o.inner.p.write(1)", "TypeError E0300 7:21: argument 1 of `o.inner.p.write` expects Ptr[U8], got Int")
 }
 
 test "a literal out of an embedded field's range is IntLiteralOutOfRange" {

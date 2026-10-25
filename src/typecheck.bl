@@ -12046,13 +12046,9 @@ fn check_deprecated_type(type_name: Str, usage_node: Int) ! Diag.Report {
     diag_warn_at("DeprecatedUsage", DEPRECATED_USAGE, msg, usage_node, help)
 }
 
-// A `Ptr[S]` whose pointee is an `@ffi.struct`. The typed field access `p.f.read()/.write(v)`
-// is lowered only for those (codegen_methods.bl's get_var_ffi_ptr_struct gate), so resolving the
-// pair on any pointer would type a call codegen cannot emit and would shadow a user `.read()`
-// on the field's own type.
 // `Ptr[Void]` is `void*`: no value lies behind it to read or store (07 §9.1.1, E0825).
 fn tc_ptr_pointee_is_void(pointee: Int) -> Bool {
-    pointee >= 0 && resolve_alias_tid(tc_resolve(pointee)) == TYPE_VOID
+    resolve_alias_tid(tc_resolve(pointee)) == TYPE_VOID
 }
 
 // The E0825 text of 07 *Diagnostic Integration*. The spec shows the deref form; the write
@@ -12069,8 +12065,8 @@ fn tc_report_void_pointee_access(node: Int, is_deref: Bool) ! Diag.Report {
 }
 
 // `p.a.b` reaches field `b` through the embedded `@ffi.struct` field `a` (07 §9.1.3): the
-// path is one place behind `p`, so walk down to `p`. The walk stops at any other node, so
-// a path that crosses a `Ptr` field (`h.q.b`) roots at `h.q`, not at `h`.
+// path is one place behind `p`, so walk down to `p`. The walk stops at the first step that
+// is not an embedded struct.
 fn tc_ptr_field_path_root(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     let mut cur = node
     while node_kind(cur) == NodeKind.FieldAccess && ffi_struct_type_set.contains_key(tc_resolve(infer_type(cur))) != 0 {
@@ -12079,6 +12075,10 @@ fn tc_ptr_field_path_root(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Repor
     cur
 }
 
+// A `Ptr[S]` whose pointee is an `@ffi.struct`. The typed field access `p.f.read()/.write(v)`
+// is lowered only for those (codegen_methods.bl's get_var_ffi_ptr_struct gate), so resolving the
+// pair on any pointer would type a call codegen cannot emit and would shadow a user `.read()`
+// on the field's own type.
 fn tc_ptr_ffi_struct_pointee(ptr_tid: Int) -> Int {
     let pt = tc_resolve(ptr_tid)
     if pt < 0 || pt >= ty_pool.len() { return 0 }
@@ -25235,19 +25235,24 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
         // `Ptr[@ffi.struct S]` (§9.1). The receiver is a PLACE reached through the pointer, not
         // an ordinary value of the field's type, so the pair is resolved on the SHAPE of the
         // receiver — a field access whose own object is a pointer, or an embedded
-        // `@ffi.struct` field reached through one (`p.a.b`) — which is the shape codegen
-        // lowers it on. Resolving on the receiver's TYPE would instead put `read` and
-        // `write` on every value of that field's type.
+        // `@ffi.struct` field reached through one (`p.a.b`, 07 §9.1.3). Codegen lowers only
+        // the first shape so far (cc_is_ptr_field_place). Resolving on the receiver's TYPE
+        // would instead put `read` and `write` on every value of that field's type.
         if method == "read" || method == "write" {
             if obj_node != -1 && node_kind(obj_node) == NodeKind.FieldAccess {
                 if tc_ptr_ffi_struct_pointee(infer_type(tc_ptr_field_path_root(node_obj(obj_node)))) != 0 {
                     let place_t = infer_type(obj_node)
-                    if method == "read" { return place_t }
+                    // Reports name the path as written (`p.a.b.write`), as the E0611 help does.
+                    let place = tc_index_text(obj_node)
+                    let label = if place == "" { node_name(obj_node) } else { place }
+                    if method == "read" {
+                        check_builtin_arity(label, method, 0, node_args(node), node)
+                        return place_t
+                    }
+                    if check_builtin_arity(label, method, 1, node_args(node), node) == 0 { return TYPE_VOID }
                     // A field address stores the field's type, checked as `Ptr.write` checks
                     // the pointee.
-                    let owner_t = tc_resolve(infer_type(node_obj(obj_node)))
-                    let owner = if type_kind(owner_t) == TyKind.Ptr { type_to_str(tc_resolve(ty_pool.get(owner_t).unwrap().inner1)) } else { type_to_str(owner_t) }
-                    check_builtin_arg("write", 0, place_t, node_args(node), "{owner}.{node_name(obj_node)}")
+                    check_builtin_arg("write", 0, place_t, node_args(node), label)
                     return TYPE_VOID
                 }
             }
@@ -26184,22 +26189,20 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
         // an Int binding; `offset` preserves the pointee.
         if obj_k == TyKind.Ptr {
             if method == "is_null" { return TYPE_BOOL }
+            let pointee = ty_pool.get(obj_t).unwrap().inner1
             // `.write(v)` is `fn write(self, value: T)` (07 §9.1.1): `v` is checked against
             // the pointee as an expected type, so a literal takes T and is range-checked
             // against it, as for `let x: T = v`. C would otherwise take the store as written
             // and cut 300 to a U8 44.
             if method == "write" {
-                let pointee = ty_pool.get(obj_t).unwrap().inner1
+                // No value of Void exists to check the argument against, so the argument is
+                // left to the unclaimed-argument pass: one report for the call, not a second
+                // for its value.
                 if tc_ptr_pointee_is_void(pointee) {
-                    // No value of Void exists to check the argument against, so the argument
-                    // is only inferred: one report for the call, not a second for its value.
                     tc_report_void_pointee_access(node, false)
-                    if args_sl != -1 && sublist_length(args_sl) >= 1 {
-                        infer_type(sublist_get(args_sl, 0))
-                    }
-                    return TYPE_VOID
+                } else {
+                    check_builtin_arg(method, 0, pointee, args_sl, "Ptr")
                 }
-                check_builtin_arg(method, 0, pointee, args_sl, "Ptr")
                 return TYPE_VOID
             }
             // `addr` is always the integer address (codegen emits `(int64_t)(intptr_t)…`).
@@ -26210,12 +26213,11 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             // let compare and laundered a sized-int pointee (Ptr[U8]) into an Int
             // binding; the honest form is `p.deref().to_int()`.
             if method == "deref" {
-                let pointee = ty_pool.get(obj_t).unwrap().inner1
                 // Unknown, not Void: Void names no value, and a binding of the result must not
                 // report again at each later use.
                 if tc_ptr_pointee_is_void(pointee) {
                     tc_report_void_pointee_access(node, true)
-                    return TYPE_UNKNOWN
+                    return tc_error_recovery_tid()
                 }
                 return pointee
             }
@@ -29859,6 +29861,12 @@ fn tc_temporary_name(tid: Int) -> Str {
 
 fn tc_ptr_write_fix() -> Str { "call `.write()`" }
 
+fn tc_is_builtin_scalar(tid: Int) -> Bool {
+    if tid < 0 || tid >= ty_pool.len() { return false }
+    let k = type_kind(tid)
+    k == TyKind.Int || k == TyKind.Float || k == TyKind.Bool || is_sized_int(k) != 0
+}
+
 // `place = rhs` runs `rhs` before it reads the root, but `p.f.write(rhs)` reads `p` before its
 // argument runs, so the fix writes `rhs` in place only when it runs no code. Any other `rhs`
 // moves to a `let` on the line before when the write is a statement in a block; elsewhere the
@@ -29890,15 +29898,20 @@ fn tc_report_write_through_ptr(node: Int, ptr: Int, ptr_t: Int, block: Int, at: 
         let field = node_name(target)
         let base = if field == "" || tc_is_decimal_digits(field) { "v" } else { field }
         let name = tc_ptr_fix_name(base, node, block, at)
+        // The `let` names the field type (§2.22 *The type of the new name*): `place = rhs` gave
+        // `rhs` that type as its expected type, and a bare `let` gives it none. A builtin
+        // scalar's name resolves at every line, so it needs none of the spelling rules.
+        let field_t = resolve_alias_tid(tc_resolve(tc_lookup_node_tid(target)))
+        let decl = if tc_is_builtin_scalar(field_t) { "{name}: {type_to_str(field_t)}" } else { name }
         let rhs_src = tc_assign_rhs_source(node, path)
         let one_line = rhs_src != "" && !rhs_src.contains("\n")
         let shown = if rhs != "" { rhs } else if one_line { rhs_src } else { "..." }
         let who = if ptr_text == "" { "the `Ptr`" } else { "`{ptr_text}`" }
         notes.push("the right side runs before {who} is read, so the fix keeps it on its own line")
-        help = "`let {name} = {shown}`, then `{pp}.write({name})`"
+        help = "`let {decl} = {shown}`, then `{pp}.write({name})`"
         if rhs_src != "" && block != -1 {
             let indent = leading_whitespace(diag_source_line(diag_file_for_node(node), node_line(node)))
-            fix = "let {name} = {rhs_src}\n{indent}{path}.write({name})"
+            fix = "let {decl} = {rhs_src}\n{indent}{path}.write({name})"
         }
     }
     tc_errors.push(message)
