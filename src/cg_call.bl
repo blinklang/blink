@@ -73,7 +73,7 @@ import cg_expr.{
     lower_expr, lower_expr_as_value, cg_expr_async_scope_current, cg_expr_push_pending, cg_expr_pending_count, cg_expr_take_pending,
     x_unbox_payload, x_layout_checked, lower_value_as_text, cg_expr_option_some, cg_expr_option_none, cg_expr_option_wrap,
     x_is_c_comparable, cg_expr_builds_carrier, cg_expr_lower_carrier_ctor, cg_expr_sequence, cg_expr_lower_pair,
-    x_lower_default,
+    x_lower_default, cg_expr_field_value, cg_expr_field_stored,
 }
 import cg_stmt.{enum_tag_word, lower_block_into}
 import cg_eff.{
@@ -766,11 +766,7 @@ fn cc_eq_variant_field(e: EqFn, ftid: Int, path: Str, side: Str) -> Int ! Diag.R
         "variant field `{path}` has no C layout", "monomorphisation must resolve every type codegen reads; this is a compiler bug")
     if cc_stopped(member) { return -1 }
     let read = ir_field_get(ftid, e.node, member.c_spelling, path, member.slot_form, cc_eq_side(e, side))
-    if member.slot_form != SlotForm.PointerBoxed { return read }
-    let held = cc_local(ftid, e.node)
-    if cc_stopped(held) { return -1 }
-    let ptr = ir_cast(ftid, e.node, pointer_spelling(held.c_spelling), read)
-    ir_unbox(ftid, e.node, held.c_spelling, held.slot_form, ptr)
+    cg_expr_field_value(ftid, e.node, member, read)
 }
 
 fn cc_eq_variant_unmatched(e: EqFn, vname: Str) -> Bool ! Diag.Report {
@@ -3364,18 +3360,9 @@ fn cc_variant_payload(node: Int, owner_tid: Int, values: List[Int]) -> List[Int]
         if cc_stopped(mem) { return refused }
         let value = lower_expr_as_value(arg)
         if value < 0 { return refused }
-        if mem.slot_form == SlotForm.PointerBoxed {
-            let held = cc_local(ftid, node)
-            if cc_stopped(held) { return refused }
-            // The owner stores this field as a bare word (mem.c_spelling names the pointee,
-            // not the pointer), the same word a match binder reads back; the box's own type
-            // is the pointer to what it heap-copies, one level up from that word. The struct
-            // literal this feeds wants the word back, so the box is cast down to it once more.
-            let boxed = ir_box(ftid, node, pointer_spelling(held.c_spelling), held.c_spelling, value)
-            out.push(ir_cast(ftid, node, mem.c_spelling, boxed))
-        } else {
-            out.push(value)
-        }
+        let stored = cg_expr_field_stored(ftid, node, mem, value)
+        if stored < 0 { return refused }
+        out.push(stored)
         i = i + 1
     }
     out

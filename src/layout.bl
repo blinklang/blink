@@ -64,9 +64,10 @@ pub type LayoutRecord {
     decline_reason: Str
 }
 
-// The memo is a pure cache over (tid, position). The typedef buffer and guard set are
+// The memo is a pure cache over (tid, position), and over the two type-graph questions
+// field_embeds_owner asks again at every field read. The typedef buffer and guard set are
 // the only side effects this module owns; the binder frames are the only scope state.
-let mut layout_memo: Map[Int, LayoutRecord] = Map()
+let mut layout_memo: LayoutMemo = LayoutMemo { records: Map(), acyclic: Map(), embeds: Map() }
 let mut typedef_buffer: List[QueuedTypedef] = []
 let mut typedef_guard: TypedefGuards = TypedefGuards { own: Map(), base: Map() }
 let mut binder_frame_parent: List[Int] = []
@@ -78,6 +79,16 @@ let mut binder_entries: List[BinderEntry] = []
 // entries a chain, newest first, so a lookup reads only the entries that carry its name:
 // it costs the name's shadow count rather than every live entry of every frame it walks.
 let mut binder_name_top: Map[Str, Int] = Map()
+
+// `acyclic` holds lo_acyclic per resolved tid; `embeds` holds lo_embeds_tid per
+// "owner field" pair of resolved tids.
+type LayoutMemo {
+    records: Map[Int, LayoutRecord]
+    acyclic: Map[Int, Bool]
+    embeds: Map[Str, Bool]
+}
+
+fn lo_empty_memo() -> LayoutMemo { LayoutMemo { records: Map(), acyclic: Map(), embeds: Map() } }
 
 // One guarded block and the tid it was queued for, so a pass that must have drained the
 // buffer can name what it left behind.
@@ -143,7 +154,7 @@ type BinderEntry {
 pub fn layout_reset() {
     cname_reset()
     lo_mark_decl_facts()
-    layout_memo = Map()
+    layout_memo = lo_empty_memo()
     typedef_buffer = []
     typedef_guard = TypedefGuards { own: Map(), base: Map() }
     binder_frame_parent = []
@@ -286,12 +297,12 @@ pub fn binder_is_celled(scope: Int, name: Str) -> Bool {
 pub fn layout_of(tid: Int, position: Position) -> LayoutRecord {
     // The index is below LO_POSITION_COUNT, so each (tid, index) pair has its own key.
     let key = tid * LO_POSITION_COUNT + lo_position_index(position)
-    match layout_memo.get(key) {
+    match layout_memo.records.get(key) {
         Some(rec) => return rec
         None => {}
     }
     let rec = lo_compute_layout(tid, position)
-    layout_memo.insert(key, rec)
+    layout_memo.records.insert(key, rec)
     rec
 }
 
@@ -841,10 +852,10 @@ pub fn pool_spelling() -> Str { "blink_threadpool*" }
 pub fn async_scope_handles_spelling() -> Str { "blink_list*" }
 
 // Does a field of this type need its owner's C definition first, through any chain of
-// types that each need the next one's? Such a field is on a cycle that C cannot order, so
-// the struct would have to contain itself. A struct or enum needs each of its fields, a
-// carrier what carrier_complete_children answers, and a pointer container nothing. The question is asked of the type graph alone, so every field on one
-// cycle answers the same whichever type the typedef walk reaches first.
+// types that each need the next one's (lo_complete_deps)? Such a field is on a cycle that
+// C cannot order, so the struct would have to contain itself. The question is asked of the
+// type graph alone, so every field on one cycle answers the same whichever type the
+// typedef walk reaches first.
 //
 // The owner is named by its own tid and compared as one, not by its declaration: two
 // instances of one declaration are two types, so a field at another instance of the very
@@ -856,28 +867,85 @@ pub fn async_scope_handles_spelling() -> Str { "blink_list*" }
 // metavariable binds.
 fn lo_embeds_owner(field_tid: Int, owner_tid: Int) -> Bool {
     if owner_tid < 0 { return false }
-    lo_embeds_tid(field_tid, lo_res(owner_tid))
+    let owner = lo_res(owner_tid)
+    let field = lo_res(field_tid)
+    if owner < 0 || field < 0 { return false }
+    // A field that is its owner embeds it whatever the owner declares; the shortcut below
+    // holds only for a field the owner itself reaches.
+    if lo_is_nominal(field) && tc_tid_same_type(field, owner) { return true }
+    // A field reaching its owner closes a cycle through both, so a type whose closure has
+    // none answers at once: every field of a type on no cycle does, without a walk.
+    if lo_acyclic(owner) || lo_acyclic(field) { return false }
+    let key = "{owner} {field}"
+    match layout_memo.embeds.get(key) {
+        Some(b) => return b
+        None => {}
+    }
+    let b = lo_embeds_tid(field, owner)
+    layout_memo.embeds.insert(key, b)
+    b
 }
 
-fn lo_embeds_tid(field_tid: Int, owner: Int) -> Bool {
+fn lo_is_nominal(r: Int) -> Bool {
+    let k = tc_tid_kind(r)
+    k == TyKind.Struct || k == TyKind.Enum
+}
+
+fn lo_embeds_tid(field: Int, owner: Int) -> Bool {
     let mut seen: Map[Int, Int] = Map()
-    let mut work: List[Int] = [lo_res(field_tid)]
+    let mut work: List[Int] = [field]
     let mut i = 0
     while i < work.len() {
         let r = work.get(i).unwrap()
         i = i + 1
         if r < 0 || seen.contains_key(r) != 0 { continue }
         seen.insert(r, 1)
-        let k = tc_tid_kind(r)
-        if k == TyKind.Struct || k == TyKind.Enum {
-            if tc_tid_same_type(r, owner) { return true }
-            let inst = if tc_tid_child_count(r) > 0 { r } else { -1 }
-            for f in tc_declared_field_tids(r) { work.push(lo_res(tc_member_tid_at_instance(f, inst))) }
-            continue
-        }
-        for c in carrier_complete_children(r) { work.push(lo_res(c)) }
+        if lo_is_nominal(r) && tc_tid_same_type(r, owner) { return true }
+        for c in lo_complete_deps(r) { work.push(c) }
     }
     false
+}
+
+// What a resolved tid needs complete ahead of its own C definition: a struct or enum each
+// of its fields, a carrier what carrier_complete_children answers, a pointer container
+// nothing.
+fn lo_complete_deps(r: Int) -> List[Int] {
+    let k = tc_tid_kind(r)
+    let mut out: List[Int] = []
+    if k == TyKind.Struct || k == TyKind.Enum {
+        let inst = if tc_tid_child_count(r) > 0 { r } else { -1 }
+        for f in tc_declared_field_tids(r) { out.push(lo_res(tc_member_tid_at_instance(f, inst))) }
+        return out
+    }
+    for c in carrier_complete_children(r) { out.push(lo_res(c)) }
+    out
+}
+
+// Whether nothing reachable from a resolved tid through lo_complete_deps lies on a cycle.
+// Pool rows are finite, so a type that reaches another row of its own type reaches a cycle
+// of rows too: rows stand in for types here without a miss.
+fn lo_acyclic(r: Int) -> Bool {
+    let mut open: Map[Int, Int] = Map()
+    lo_acyclic_walk(r, open)
+}
+
+// A tid already open is an ancestor this walk reached again, so the one that reached it is
+// on a cycle. Either answer is a fact of the graph, so both are kept.
+fn lo_acyclic_walk(r: Int, open: Map[Int, Int]) -> Bool {
+    if r < 0 { return true }
+    match layout_memo.acyclic.get(r) {
+        Some(b) => return b
+        None => {}
+    }
+    if open.contains_key(r) != 0 { return false }
+    open.insert(r, 1)
+    let mut ok = true
+    for c in lo_complete_deps(r) {
+        if !lo_acyclic_walk(c, open) { ok = false }
+    }
+    open.remove(r)
+    layout_memo.acyclic.insert(r, ok)
+    ok
 }
 
 // The children whose C definition an Option, Result or Tuple typedef needs ahead of its

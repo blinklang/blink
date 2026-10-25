@@ -30,7 +30,7 @@ import layout.{
     bind_binder_mut, binder_is_celled,
     binder_scope_pop, binder_scope_push, carrier_member_layout, child_tid,
     ensure_typedef_for, field_layout_of,
-    layout_of, pointer_spelling, tid_holds_tag_member, tid_of_binder,
+    layout_of, tid_holds_tag_member, tid_of_binder,
     tid_of_node, varargs_spelling,
 }
 import cname.{
@@ -44,7 +44,7 @@ import ir.{
     ir_cast, ir_cell_let, ir_cell_ref, ir_c_name, ir_c_spelling, ir_const, ir_continue,
     ir_expr_stmt, ir_field_get, ir_global_ref, ir_if, ir_kid, ir_kid_count, ir_kids, ir_kind, ir_let,
     ir_loop, ir_mark_materialize, ir_new, ir_return, ir_slot_form, ir_span, ir_switch, ir_tid,
-    ir_tuple_new, ir_unary, ir_unbox, ir_unreachable, ir_var_ref, ir_with_scope,
+    ir_tuple_new, ir_unary, ir_unreachable, ir_var_ref, ir_with_scope,
     ir_panic, ir_panic_catch, ir_panic_catch_exit, ir_volatile_let, ir_arena_scope,
 }
 import diagnostics.{
@@ -60,7 +60,7 @@ import cg_expr.{
     cg_expr_take_pending, cg_expr_value_count, lower_expr, cg_expr_sequence,
     cg_expr_clear_old_snapshots, cg_expr_set_old_snapshot,
     x_layout_checked, x_panic_message, x_stopped, x_unbox_payload, ArithSite, lower_arith_operator,
-    cg_expr_field_stored,
+    cg_expr_field_stored, cg_expr_field_value,
 }
 import cg_eff.{
     cg_eff_async_scope_exit_symbol, cg_eff_binder_is_shared, cg_eff_block_handler_calls,
@@ -1449,18 +1449,22 @@ fn place_crosses_box(place: Int) -> Bool ! Diag.Report {
 // copies of one value, so a write never goes through one: the write changes a copy of what
 // the box holds, and a fresh box of that copy replaces the old one, out to the first owner
 // that is not boxed.
+// The value is held first: what it runs can write the same value, and that write has to
+// be in the copy that goes back.
 fn assign_through_boxes(node: Int, place: Int, value: Int) -> Int ! Diag.Report {
     if value < 0 { return -1 }
-    let mut out: List[Int] = []
-    if !assign_place(node, place, value, out) { return -1 }
+    let tid = stmt_tid(place)
+    if tid < 0 { return -1 }
+    let rec = layout_at(tid, Position.Local, place)
+    if x_stopped(rec) { return -1 }
+    let held = c_mint_local("value")
+    let mut out: List[Int] = [ir_let(tid, place, rec.c_spelling, held, rec.slot_form, value)]
+    if !assign_place(node, place, ir_var_ref(tid, place, rec.c_spelling, held, rec.slot_form), out) { return -1 }
     ir_block(node, out)
 }
 
+// `place` crosses a box (place_crosses_box): its own field is boxed, or its owner is under one.
 fn assign_place(node: Int, place: Int, value: Int, out: List[Int]) -> Bool ! Diag.Report {
-    if !place_crosses_box(place) {
-        out.push(ir_assign(node, lower_target(place), value))
-        return true
-    }
     let obj = node_obj(place)
     let otid = stmt_tid(obj)
     let ftid = stmt_tid(place)
@@ -1548,14 +1552,13 @@ fn lower_compound_assign(node: Int) -> Int ! Diag.Report {
     let tid = stmt_tid(target)
     if tid < 0 { return -1 }
     let crosses = place_crosses_box(target)
-    let lhs = if crosses { -1 } else { lower_target(target) }
     let read = lower_target(target)
     // The same seam as the operator, so `x += 1` is checked wherever `x + 1` is.
     let site = ArithSite { node: node, op: node_op(node), tid: tid, lhs_node: target, rhs_node: node_value(node) }
     let sum = lower_arith_operator(site, read, lower_value(node_value(node)))
     if sum < 0 { return -1 }
     if crosses { return assign_through_boxes(node, target, sum) }
-    ir_assign(node, lhs, sum)
+    ir_assign(node, lower_target(target), sum)
 }
 
 fn lower_return(node: Int) -> Int ! Diag.Report {
@@ -3833,9 +3836,8 @@ fn positional_payload_binds(ctx: MatchCtx, pat: Int, vname: Str, flds: Int, out:
                 return payload_field_count_mismatch(sub, ctx.tid, vname)
             }
             let member = c_field_name(node_name(sublist_get(decl_flds, i)))
-            let held = layout_at(tid, Position.Local, sub)
             let path = "{c_enum_payload_member()}.{vname}.{member}"
-            let read = variant_field_read(ctx, sub, tid, path, held)
+            let read = variant_field_read(ctx, sub, tid, path)
             if !bind_slot(ctx, sub, read, out) { return false }
         }
         i = i + 1
@@ -3849,16 +3851,10 @@ fn positional_payload_binds(ctx: MatchCtx, pat: Int, vname: Str, flds: Int, out:
 // same way a carrier's boxed payload does. The read must then deref through that box,
 // the shared reconciliation x_unbox_payload makes for a carrier, built here for
 // ir_field_get's dotted-path reads instead of a carrier's named arm.
-fn variant_field_read(ctx: MatchCtx, node: Int, tid: Int, path: Str, held: LayoutRecord) -> Int ! Diag.Report {
+fn variant_field_read(ctx: MatchCtx, node: Int, tid: Int, path: Str) -> Int ! Diag.Report {
     let member = field_layout_of(ctx.tid, tid)
     let read = ir_field_get(tid, node, member.c_spelling, path, member.slot_form, scrut_ref(ctx, node))
-    if member.slot_form != SlotForm.PointerBoxed { return read }
-    // The owner stores this field as a bare word (its C spelling is the scalar, not a
-    // pointer type), the same way a container slot stores a boxed element: the box is
-    // read back by casting the word to a pointer before the deref, not by the word's own
-    // declared type, which names what is pointed at rather than the pointer itself.
-    let ptr = ir_cast(tid, node, pointer_spelling(held.c_spelling), read)
-    ir_unbox(tid, node, held.c_spelling, held.slot_form, ptr)
+    cg_expr_field_value(tid, node, member, read)
 }
 
 // A pattern names more positional slots than the variant declares fields for. Typecheck
@@ -3888,7 +3884,7 @@ fn field_pattern_binds(ctx: MatchCtx, pat: Int, prefix: Str, out: List[Int]) -> 
         } else {
             let held = layout_at(tid, Position.Local, holder)
             let path = if prefix == "" { node_name(f) } else { "{prefix}.{node_name(f)}" }
-            let read = variant_field_read(ctx, holder, tid, path, held)
+            let read = variant_field_read(ctx, holder, tid, path)
             if sub < 0 {
                 bind_named(holder, node_name(f), tid, held, read, out)
             } else {
@@ -4072,7 +4068,7 @@ fn positional_payload_test(ctx: MatchCtx, pat: Int, vname: Str, flds: Int) -> In
             let member = c_field_name(node_name(sublist_get(decl_flds, i)))
             let held = layout_at(tid, Position.Local, sub)
             let path = "{c_enum_payload_member()}.{vname}.{member}"
-            let read = variant_field_read(ctx, sub, tid, path, held)
+            let read = variant_field_read(ctx, sub, tid, path)
             acc = and_test(sub, acc, slot_test(ctx, sub, tid, held, read))
         }
         i = i + 1
@@ -4096,7 +4092,7 @@ fn field_pattern_test(ctx: MatchCtx, pat: Int, prefix: Str) -> Int ! Diag.Report
             if tid >= 0 {
                 let held = layout_at(tid, Position.Local, sub)
                 let path = if prefix == "" { node_name(f) } else { "{prefix}.{node_name(f)}" }
-                let read = variant_field_read(ctx, sub, tid, path, held)
+                let read = variant_field_read(ctx, sub, tid, path)
                 acc = and_test(sub, acc, slot_test(ctx, sub, tid, held, read))
             }
         }
