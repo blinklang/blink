@@ -240,17 +240,18 @@ test "a labelled paren payload takes the field checks in place of the argument c
         "  |                                ^",
         "  note: first given here: 8:19",
         "  help: remove one of the two",
-        "error[MissingField]: `Figure.Circle` literal is missing field `tag` (Int)",
+        "error[MissingField]: `Figure.Circle` is missing field `tag` (Int)",
         "  --> figure_paren_labels.bl:8:5",
         "  |",
         "8 |     Figure.Circle(radius: 1.0, radius: 2.0)",
         "  |     ^",
+        "  note: fields of `Figure.Circle`, in order: radius (Float) (given), tag (Int)",
         "  help: add `tag: ` and a value",
         "2 error(s) found",
     ])
 }
 
-test "a positional paren payload keeps the argument-count error, with a note that lists the fields" {
+test "a positional paren payload keeps the argument-count error, with a note that marks the fields it filled" {
     let src = lines(figure_decl().append([
         "fn make() -> Figure \{",
         "    Figure.Circle(1.0)",
@@ -277,18 +278,18 @@ test "a positional paren payload keeps the argument-count error, with a note tha
         "  |",
         "8 |     Figure.Circle(1.0)",
         "  |     ^",
-        "  note: fields of `Figure.Circle`, in order: radius (Float), tag (Int)",
+        "  note: fields of `Figure.Circle`, in order: radius (Float) (given), tag (Int)",
         "error[TypeError]: variant `Circle` expects 2 argument(s), got 1",
         "  --> figure_paren_positional.bl:12:5",
         "   |",
         "12 |     Circle(2.0)",
         "   |     ^",
-        "  note: fields of `Figure.Circle`, in order: radius (Float), tag (Int)",
+        "  note: fields of `Figure.Circle`, in order: radius (Float) (given), tag (Int)",
         "2 error(s) found",
     ])
 }
 
-test "a mixed paren payload keeps the argument-count error and its field note" {
+test "a paren payload that writes a label checks what its positions and labels fill, not the count" {
     let src = lines(figure_decl().append([
         "fn make() -> Figure \{",
         "    Figure.Circle(1.0, tag: 2, radius: 3.0)",
@@ -302,14 +303,92 @@ test "a mixed paren payload keeps the argument-count error and its field note" {
         "}",
     ]))
     expect_text("figure_paren_mixed.bl", src, [
-        "error[TypeError]: variant `Circle` expects 2 argument(s), got 3",
-        "  --> figure_paren_mixed.bl:8:5",
+        "error[DuplicateField]: field `radius` is given twice",
+        "  --> figure_paren_mixed.bl:8:32",
         "  |",
         "8 |     Figure.Circle(1.0, tag: 2, radius: 3.0)",
-        "  |     ^",
-        "  note: fields of `Figure.Circle`, in order: radius (Float), tag (Int)",
+        "  |                                ^",
+        "  note: argument 1 filled `radius`: 8:19",
+        "  help: remove one of the two",
         "1 error(s) found",
     ])
+}
+
+// The examples of sections/03_types.md §3.4 Variant Construction, as `blink check` prints them.
+fn figure_spec_src(body: List[Str]) -> Str {
+    lines(["type Figure \{ Circle(radius: Float, tag: Int) }", "", "fn main() \{"].append(body).append(["}"]))
+}
+
+test "the spec's well-formed paren payloads check clean" {
+    let src = figure_spec_src([
+        "    let a = Figure.Circle(1.0, 2)                 // ok",
+        "    let b = Figure.Circle(1.5, tag: 2)            // ok",
+        "    let c = Figure.Circle(tag: 2, radius: 1.5)    // ok",
+        #"    io.println("{a == b} {b == c}")"#,
+    ])
+    let got = check_stderr("figure_spec_ok.bl", src)
+    if got != "" { io.eprintln("got:\n{got}") }
+    assert(got == "")
+}
+
+fn figure_spec_errors(file: Str) -> List[Str] {
+    [
+        "error[DuplicateField]: field `radius` is given twice",
+        "  --> {file}:4:32",
+        "  |",
+        "4 |     let d = Figure.Circle(1.0, radius: 2.0)       // error[DuplicateField], error[MissingField]",
+        "  |                                ^",
+        "  note: argument 1 filled `radius`: 4:27",
+        "  help: remove one of the two",
+        "error[MissingField]: `Figure.Circle` is missing field `tag` (Int)",
+        "  --> {file}:4:13",
+        "  |",
+        "4 |     let d = Figure.Circle(1.0, radius: 2.0)       // error[DuplicateField], error[MissingField]",
+        "  |             ^",
+        "  note: fields of `Figure.Circle`, in order: radius (Float) (given), tag (Int)",
+        "  help: add `tag: ` and a value",
+        "error[PositionalAfterKeyword]: a payload cannot write a positional argument after a labelled one",
+        "  --> {file}:5:35",
+        "  |",
+        "5 |     let e = Figure.Circle(tag: 2, 1.0)            // error[PositionalAfterKeyword]",
+        "  |                                   ^",
+        "  note: `tag:` is the first label",
+        "  help: label every argument, or write the positional arguments first",
+        "error[TypeError]: variant `Circle` expects 2 argument(s), got 1",
+        "  --> {file}:6:13",
+        "  |",
+        "6 |     let f = Figure.Circle(1.0)                    // error[TypeError]",
+        "  |             ^",
+        "  note: fields of `Figure.Circle`, in order: radius (Float) (given), tag (Int)",
+        "4 error(s) found",
+    ]
+}
+
+fn figure_spec_bad_src() -> Str {
+    figure_spec_src([
+        "    let d = Figure.Circle(1.0, radius: 2.0)       // error[DuplicateField], error[MissingField]",
+        "    let e = Figure.Circle(tag: 2, 1.0)            // error[PositionalAfterKeyword]",
+        "    let f = Figure.Circle(1.0)                    // error[TypeError]",
+        #"    io.println("{d == e} {e == f}")"#,
+    ])
+}
+
+test "the spec's malformed paren payloads give the spec's errors" {
+    expect_text("figure_spec_bad.bl", figure_spec_bad_src(), figure_spec_errors("figure_spec_bad.bl"))
+}
+
+// A payload the checker refuses must stop `blink build` with the same errors, never reach
+// code generation with a field left unfilled.
+test "blink build refuses a malformed paren payload with the errors blink check gives" {
+    let dir = sh("mktemp -d /tmp/blink_literal_fields.XXXXXX").out.trim()
+    write_file("{dir}/figure_spec_build.bl", figure_spec_bad_src())
+    let r = sh("B=$(pwd)/build/blink; cd {dir} && timeout 120 $B build figure_spec_build.bl < /dev/null")
+    let _ = sh("rm -rf {dir}")
+    let want = lines(figure_spec_errors("figure_spec_build.bl"))
+    if !r.err_out.starts_with(want) { io.eprintln("want:\n{want}\ngot:\n{r.err_out}") }
+    assert(r.err_out.starts_with(want))
+    assert(!r.err_out.contains("internal compiler error"))
+    assert(r.exit_code != 0)
 }
 
 fn wide_src(body: Str) -> Str {

@@ -1,7 +1,7 @@
 // One field-set check serves every literal that names fields (sections/02_syntax.md §2.14,
 // sections/03_types.md §3.4): a struct literal, generic or not; a variant brace literal named
 // `Enum.Variant`, named bare under an expected type, or named bare by a program-unique
-// variant; and an all-labelled variant paren payload, qualified or bare. Each form must
+// variant; and a variant paren payload that writes a label, qualified or bare. Each form must
 // answer an unknown, a repeated and a missing label the same way, so each row names one form
 // and one fault.
 //
@@ -46,8 +46,7 @@ type Pair {
 
 type Spot = Point
 
-type Mixed {
-    Both(Int, b: Int)
+type Unnamed {
     Plain(Int)
 }
 "#
@@ -71,6 +70,11 @@ fn only(stem: Str, body: Str, name: Str, message: Str, help: Str) ! Lex.Tokenize
 fn missing(stem: Str, body: Str, shown: Str, field: Str, ty: Str, local_help: Bool) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
     let tail = if local_help { "\nor give `{field}` a default in `{shown}`" } else { "" }
     only(stem, body, "MissingField", "`{shown}` literal is missing field `{field}` ({ty})", "add `{field}: ` and a value{tail}")
+}
+
+// A paren payload is not a literal, so its MissingField says only what is missing (§3.4).
+fn missing_payload(stem: Str, body: Str, shown: Str, field: Str, ty: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    only(stem, body, "MissingField", "`{shown}` is missing field `{field}` ({ty})", "add `{field}: ` and a value")
 }
 
 fn unknown(stem: Str, body: Str, shown: Str, declares: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
@@ -133,13 +137,13 @@ test "a generic variant brace literal" {
 }
 
 test "a labelled qualified variant paren payload" {
-    missing("lit_qparen_missing", "    let f = Figure.Circle(radius: 1.0)", "Figure.Circle", "tag", "Int", false)
+    missing_payload("lit_qparen_missing", "    let f = Figure.Circle(radius: 1.0)", "Figure.Circle", "tag", "Int")
     unknown("lit_qparen_unknown", "    let f = Figure.Circle(radius: 1.0, tag: 2, zzz: 3)", "Figure.Circle", "radius (given), tag (given)")
     dup("lit_qparen_dup", "    let f = Figure.Circle(radius: 1.0, tag: 2, tag: 3)", "tag")
 }
 
 test "a labelled bare variant paren payload" {
-    missing("lit_bparen_missing", "    let f = Circle(tag: 1)", "Figure.Circle", "radius", "Float", false)
+    missing_payload("lit_bparen_missing", "    let f = Circle(tag: 1)", "Figure.Circle", "radius", "Float")
     unknown("lit_bparen_unknown", "    let f = Circle(radius: 1.0, tag: 2, zzz: 3)", "Figure.Circle", "radius (given), tag (given)")
     dup("lit_bparen_dup", "    let f = Circle(radius: 1.0, radius: 2.0, tag: 3)", "radius")
 }
@@ -150,9 +154,26 @@ test "a struct literal through an alias checks the target's fields" {
     missing("lit_alias_missing", "    let s = Spot \{ x: 1.0 }", "Point", "y", "Float", true)
 }
 
-test "a payload labelled only in part keeps the argument count" {
-    only("lit_mixed_count", "    let m = Mixed.Both(b: 1)", "TypeError", "variant `Both` expects 2 argument(s), got 1", "")
-    only("lit_plain_label", "    let m = Mixed.Plain(zzz: 1)", "NoSuchField", "`Mixed.Plain` has no field `zzz`", "`Mixed.Plain` has no named fields")
+test "a variant that names only some fields is refused where it is declared, not where it is used" {
+    let src = #"type Mixed {
+    Both(Int, b: Int)
+}
+
+fn main() {
+    let m = Mixed.Both(b: 1)
+}
+"#
+    let program = probe_but("lit_mixed_decl", src, "MixedVariantFields")
+    assert(program >= 0)
+    let mut got: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" { got.push("{d.name}: {d.message} | {d.help}") }
+    }
+    assert_eq_str("lit_mixed_decl", got.join("\n"), "MixedVariantFields: variant `Both` declares both named and unnamed fields | name every field or none")
+}
+
+test "a label on a variant with unnamed fields names no field" {
+    only("lit_plain_label", "    let m = Unnamed.Plain(zzz: 1)", "NoSuchField", "`Unnamed.Plain` has no field `zzz`", "`Unnamed.Plain` has no named fields")
 }
 
 test "a field with a default may be left out, and copy-update never misses a field" {

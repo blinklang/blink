@@ -1,0 +1,159 @@
+// A variant paren payload (sections/03_types.md §3.4 *Variant Construction*): positional
+// arguments come first, argument i fills field i, a label fills the field it names, and the
+// field rules of §2.14 then run on that fill. A paren variant names every field or none
+// (§3.4 *Fields of a paren variant*). Each row compares every error the checker records,
+// with its span, notes and help, so a cascade or a missing report shows up as a diff.
+import cg_test_helpers.{cg_probe_begin}
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries}
+import lower_test_helpers.{assert_eq_str}
+
+fn decls() -> Str {
+    #"type Figure {
+    Circle(radius: Float, tag: Int)
+    Dot
+}
+
+type Ring {
+    Band(tag: Int, radius: Float)
+}
+
+type Trio {
+    T(a: Int, b: Int, c: Int)
+}
+
+type Pair {
+    P(Int, Int)
+}
+"#
+}
+
+// `body` is line 19, the one line of main.
+fn with_body(body: Str) -> Str {
+    "{decls()}\nfn main() \{\n{body}\n}\n"
+}
+
+// Every error, one per line, as `name line:col: message | notes | help`.
+fn errors_of(stem: Str, src: Str) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    env.set_var("BLINK_ROOT", process_run("pwd", []).out.trim())
+    let path = "build/{stem}_probe.bl"
+    cg_probe_begin(path)
+    write_file(path, src)
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _rm = process_run("rm", ["-f", path])
+    let mut got: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" { got.push("{d.name} {d.line}:{d.col}: {d.message} | {d.notes.join("; ")} | {d.help}") }
+    }
+    got.join("\n")
+}
+
+fn row(stem: Str, body: Str, want: List[Str]) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    assert_eq_str(stem, errors_of(stem, with_body(body)), want.join("\n"))
+}
+
+fn circle_note(given: Str) -> Str {
+    "fields of `Figure.Circle`, in order: {given}"
+}
+
+test "a payload may write any field by position or by label, positions first" {
+    row("payload_ok_forms", #"    let a = Figure.Circle(1.0, 2)
+    let b = Figure.Circle(1.5, tag: 2)
+    let c = Figure.Circle(tag: 2, radius: 1.5)
+    let d = Circle(1.5, tag: 3)
+    let e = Ring.Band(1, radius: 2.0)
+    let f = Pair.P(1, 2)"#, [])
+}
+
+test "a label for a field that a position filled is DuplicateField, and the field it left is missing" {
+    row("payload_label_refills_position", "    let x = Figure.Circle(1.0, radius: 2.0)", [
+        "DuplicateField 19:32: field `radius` is given twice | argument 1 filled `radius`: 19:27 | remove one of the two",
+        "MissingField 19:13: `Figure.Circle` is missing field `tag` (Int) | {circle_note("radius (Float) (given), tag (Int)")} | add `tag: ` and a value",
+    ])
+    row("payload_label_refills_position_bare", "    let x = Circle(1.0, radius: 2.0)", [
+        "DuplicateField 19:25: field `radius` is given twice | argument 1 filled `radius`: 19:20 | remove one of the two",
+        "MissingField 19:13: `Figure.Circle` is missing field `tag` (Int) | {circle_note("radius (Float) (given), tag (Int)")} | add `tag: ` and a value",
+    ])
+    row("payload_label_refills_first_field", "    let x = Ring.Band(1, tag: 2)", [
+        "DuplicateField 19:26: field `tag` is given twice | argument 1 filled `tag`: 19:23 | remove one of the two",
+        "MissingField 19:13: `Ring.Band` is missing field `radius` (Float) | fields of `Ring.Band`, in order: tag (Int) (given), radius (Float) | add `radius: ` and a value",
+    ])
+    row("payload_label_refills_second_position", "    let x = Figure.Circle(1.0, 2, tag: 3)", [
+        "DuplicateField 19:35: field `tag` is given twice | argument 2 filled `tag`: 19:32 | remove one of the two",
+    ])
+}
+
+test "a field that no position or label fills is MissingField, with the filled fields marked" {
+    row("payload_missing_after_fill", "    let x = Trio.T(1, b: 2)", [
+        "MissingField 19:13: `Trio.T` is missing field `c` (Int) | fields of `Trio.T`, in order: a (Int) (given), b (Int) (given), c (Int) | add `c: ` and a value",
+    ])
+    row("payload_labels_only_missing", "    let x = Figure.Circle(radius: 1.0, radius: 2.0)", [
+        "DuplicateField 19:40: field `radius` is given twice | first given here: 19:27 | remove one of the two",
+        "MissingField 19:13: `Figure.Circle` is missing field `tag` (Int) | {circle_note("radius (Float) (given), tag (Int)")} | add `tag: ` and a value",
+    ])
+}
+
+test "a positional argument after a label is PositionalAfterKeyword and nothing more" {
+    row("payload_positional_after_label", "    let x = Figure.Circle(tag: 2, 1.0)", [
+        "PositionalAfterKeyword 19:35: a payload cannot write a positional argument after a labelled one | `tag:` is the first label | label every argument, or write the positional arguments first",
+    ])
+    row("payload_positional_after_label_unnamed", "    let x = Pair.P(zzz: 1, 2)", [
+        "PositionalAfterKeyword 19:28: a payload cannot write a positional argument after a labelled one | `zzz:` is the first label | write the positional arguments first",
+    ])
+}
+
+test "the count error is for a payload with no label, or with more positions than fields" {
+    row("payload_count_short", "    let x = Figure.Circle(1.0)", [
+        "TypeError 19:13: variant `Circle` expects 2 argument(s), got 1 | {circle_note("radius (Float) (given), tag (Int)")} | ",
+    ])
+    row("payload_count_long", "    let x = Figure.Circle(1.0, 2, 3)", [
+        "TypeError 19:13: variant `Circle` expects 2 argument(s), got 3 | {circle_note("radius (Float) (given), tag (Int) (given)")} | ",
+    ])
+    row("payload_count_long_with_label", "    let x = Figure.Circle(1.0, 2, 3, tag: 4)", [
+        "TypeError 19:13: variant `Circle` expects 2 argument(s), got 4 | {circle_note("radius (Float) (given), tag (Int) (given)")} | ",
+    ])
+    row("payload_count_unnamed", "    let x = Pair.P(1)", [
+        "TypeError 19:13: variant `P` expects 2 argument(s), got 1 | fields of `Pair.P`, in order: Int (given), Int | ",
+    ])
+}
+
+test "a label that names no field is NoSuchField, and a filled field is no candidate" {
+    row("payload_unknown_near", "    let x = Figure.Circle(1.0, tagg: 2)", [
+        "NoSuchField 19:32: `Figure.Circle` has no field `tagg` |  | did you mean `tag`?\nor add the field to `Figure.Circle`",
+    ])
+    row("payload_unknown_far", "    let x = Figure.Circle(1.0, zzz: 2)", [
+        "NoSuchField 19:32: `Figure.Circle` has no field `zzz` |  | `Figure.Circle` declares: radius (given), tag\nor add the field to `Figure.Circle`",
+        "MissingField 19:13: `Figure.Circle` is missing field `tag` (Int) | {circle_note("radius (Float) (given), tag (Int)")} | add `tag: ` and a value",
+    ])
+}
+
+fn mixed_src() -> Str {
+    #"type Mixed {
+    Both(Int, b: Int)
+    Rev(a: Int, Int)
+    Plain(Int)
+}
+
+fn main() {
+    let a = Mixed.Both(1, b: 2)
+    let b = Mixed.Both(b: 1)
+    let c = Mixed.Both(b: 2, 1)
+    let d = Mixed.Rev(1, 2)
+    let e = Mixed.Rev(a: 1)
+    let f = Mixed.Plain(1)
+    match a {
+        Both(x, y) => io.println("{x} {y}")
+        _ => io.println("other")
+    }
+}
+"#
+}
+
+test "a paren variant that names some fields and not others is MixedVariantFields, once, and its uses report nothing more" {
+    assert_eq_str("mixed_variant_fields", errors_of("mixed_variant_fields", mixed_src()), [
+        "MixedVariantFields 2:5: variant `Both` declares both named and unnamed fields |  | name every field or none",
+        "MixedVariantFields 3:5: variant `Rev` declares both named and unnamed fields |  | name every field or none",
+    ].join("\n"))
+}
