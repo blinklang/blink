@@ -1,0 +1,497 @@
+// test_mutation_lint_reads_the_return_write_set.bl — W0550/W0551 read the return write set
+//
+// sections/04_effects.md §4.16.4 *Return write set*: the lints read the writes of the callee
+// that lie on some path to its normal return. A path ends only at an expression of type
+// Never. A call adds the return write set of its callee only on the paths that go on after
+// it, and a callee declared `-> Never` adds nothing. §4.16.7: a warning that still fires has
+// a note that names the write site and the call chain, and the help line names both fixes.
+import compile_test_helpers
+
+// One JSON diagnostic per line: the lines that carry `code` with its span at line:col.
+fn diags_at(out: Str, code: Str, line: Int, col: Int) -> Int {
+    let mut n = 0
+    for l in out.split("\n") {
+        if l.contains("\"code\":\"{code}\"") && l.contains("\"line\":{line},\"col\":{col}}") {
+            n = n + 1
+        }
+    }
+    n
+}
+
+fn count_code(out: Str, code: Str) -> Int {
+    let mut n = 0
+    for l in out.split("\n") {
+        if l.contains("\"code\":\"{code}\"") {
+            n = n + 1
+        }
+    }
+    n
+}
+
+fn mutation_lints(out: Str) -> Int {
+    count_code(out, "W0550") + count_code(out, "W0551")
+}
+
+// The marker is a rollback the lint must flag, placed after the row's own code, so a row
+// that sees no lint proves the analysis ran to the end rather than stopped early.
+fn expect_no_mutation_lint(src: Str, tag: Str) {
+    let marker = [
+        #""#,
+        #"let mut rw_marker_g = 0"#,
+        #"let mut rw_marker_h = 0"#,
+        #""#,
+        #"fn rw_marker_w() {"#,
+        #"    rw_marker_g = 1"#,
+        #"    rw_marker_h = 1"#,
+        #"}"#,
+        #""#,
+        #"fn rw_marker() {"#,
+        #"    let s = rw_marker_g"#,
+        #"    rw_marker_w()"#,
+        #"    rw_marker_g = s"#,
+        #"}"#,
+    ].join("\n")
+    let out = compile_test_helpers.compile_and_capture("{src}\n{marker}", tag)
+    compile_test_helpers.expect_compiles_clean(out, tag)
+    compile_test_helpers.expect_contains(out, "call to `rw_marker_w` in `rw_marker`", "{tag} marker")
+    assert_eq(mutation_lints(out), 1)
+}
+
+fn scratch_file(tag: Str) -> Str {
+    "{compile_test_helpers.scratch_root()}/{tag}.bl"
+}
+
+let HELP_ERR = "save and restore `err` around the call, or end that path in a call to a `-> Never` function"
+
+// The §4.16.4 example: `die` writes `err` and then ends in env.exit, so no path takes the
+// write to a return, and `item` adds nothing through it.
+test "a write before env.exit is not in the return write set of its function or its callers" {
+    let src = [
+        #"let mut pos = 0"#,
+        #"let mut err = """#,
+        #"let mut items: List[Int] = [1, 2, 3]"#,
+        #""#,
+        #"fn die(msg: Str) ! Env.Exit {"#,
+        #"    err = msg"#,
+        #"    env.exit(101)"#,
+        #"}"#,
+        #""#,
+        #"fn item(i: Int) -> Int ! Env.Exit {"#,
+        #"    if i < 0 || i >= items.len() { die("bad index") }"#,
+        #"    items.get(i).unwrap()"#,
+        #"}"#,
+        #""#,
+        #"fn peek() -> Int ! Env.Exit {"#,
+        #"    let saved = pos"#,
+        #"    let v = item(pos)"#,
+        #"    pos = saved"#,
+        #"    v"#,
+        #"}"#,
+        #""#,
+        #"fn main() ! Env.Exit {"#,
+        #"    let _ = peek()"#,
+        #"}"#,
+    ].join("\n")
+    expect_no_mutation_lint(src, "_rw_die_item_peek")
+}
+
+// `step` from §4.16.4: `err` is written only on the path that ends in env.exit, `count` on
+// the path that returns. A caller that saves and restores `count` gets no warning.
+test "a caller that saves the one global on the return path of its callee gets no warning" {
+    let src = [
+        #"let mut err = """#,
+        #"let mut count = 0"#,
+        #""#,
+        #"fn step(n: Int) -> Int ! Env.Exit {"#,
+        #"    if n < 0 {"#,
+        #"        err = "neg""#,
+        #"        env.exit(101)"#,
+        #"    }"#,
+        #"    count = count + 1"#,
+        #"    n"#,
+        #"}"#,
+        #""#,
+        #"fn try_step(n: Int) -> Int ! Env.Exit {"#,
+        #"    let saved = count"#,
+        #"    let v = step(n)"#,
+        #"    count = saved"#,
+        #"    v"#,
+        #"}"#,
+        #""#,
+        #"fn main() ! Env.Exit {"#,
+        #"    let _ = try_step(1)"#,
+        #"}"#,
+    ].join("\n")
+    expect_no_mutation_lint(src, "_rw_step_saves_count")
+}
+
+// The same `step` under a rollback of another global: the warning names `count`, which can
+// reach the return, and not `err`, which cannot.
+test "a warning names only the globals on the return path of the callee" {
+    let src = [
+        #"let mut pos = 0"#,
+        #"let mut err = """#,
+        #"let mut count = 0"#,
+        #""#,
+        #"fn step(n: Int) -> Int ! Env.Exit {"#,
+        #"    if n < 0 {"#,
+        #"        err = "neg""#,
+        #"        env.exit(101)"#,
+        #"    }"#,
+        #"    count = count + 1"#,
+        #"    n"#,
+        #"}"#,
+        #""#,
+        #"fn look(n: Int) -> Int ! Env.Exit {"#,
+        #"    let saved = pos"#,
+        #"    let v = step(n)"#,
+        #"    pos = saved"#,
+        #"    v"#,
+        #"}"#,
+        #""#,
+        #"fn main() ! Env.Exit {"#,
+        #"    let _ = look(1)"#,
+        #"}"#,
+    ].join("\n")
+    let tag = "_rw_step_names_count"
+    let out = compile_test_helpers.compile_and_capture(src, tag)
+    compile_test_helpers.expect_compiles_clean(out, tag)
+    assert_eq(diags_at(out, "W0551", 16, 13), 1)
+    assert_eq(mutation_lints(out), 1)
+    compile_test_helpers.expect_contains(out, "call to `step` in `look` mutates [count];", "step names count only")
+    compile_test_helpers.expect_contains(out, "`count` is written at {scratch_file(tag)}:10, in `step`", "step write-site note")
+    compile_test_helpers.expect_contains(out, "save and restore `count` around the call, or end that path in a call to a `-> Never` function", "step help")
+
+    // `blink check` reads the same set as the build.
+    let chk = compile_test_helpers.check_via_cli(src, tag)
+    assert_eq(diags_at(chk, "W0551", 16, 13), 1)
+    assert_eq(mutation_lints(chk), 1)
+    compile_test_helpers.expect_contains(chk, "call to `step` in `look` mutates [count];", "check names count only")
+}
+
+// §4.16.7 *Shape of a warning that still fires*: the write reaches the return through a
+// call, so the note gives the write site and the chain of calls back to the callee.
+test "a warning that still fires names the write site and the call chain" {
+    let src = [
+        #"let mut pos = 0"#,
+        #"let mut err = """#,
+        #""#,
+        #"fn report(msg: Str) {"#,
+        #"    err = msg"#,
+        #"}"#,
+        #""#,
+        #"fn item(i: Int) -> Int {"#,
+        #"    if i < 0 { report("neg") }"#,
+        #"    i"#,
+        #"}"#,
+        #""#,
+        #"fn peek() -> Int {"#,
+        #"    let saved = pos"#,
+        #"    let v = item(pos)"#,
+        #"    pos = saved"#,
+        #"    v"#,
+        #"}"#,
+        #""#,
+        #"fn main() {"#,
+        #"    let _ = peek()"#,
+        #"}"#,
+    ].join("\n")
+    let tag = "_rw_still_fires_chain"
+    let out = compile_test_helpers.compile_and_capture(src, tag)
+    compile_test_helpers.expect_compiles_clean(out, tag)
+    assert_eq(diags_at(out, "W0551", 15, 13), 1)
+    assert_eq(mutation_lints(out), 1)
+    compile_test_helpers.expect_contains(out, "call to `item` in `peek` mutates [err];", "chain header")
+    compile_test_helpers.expect_contains(out, "`pos` is saved at 14:9 and restored at 16:5 with no new value set between (speculative pair)", "chain pair note")
+    let file = scratch_file(tag)
+    compile_test_helpers.expect_contains(out, "`err` is written at {file}:5, in `report`, called from `item` at {file}:9", "chain write-site note")
+    compile_test_helpers.expect_contains(out, HELP_ERR, "chain help")
+    compile_test_helpers.expect_contains(out, "if the function sets a global for this call, assign that global between its save and this call", "chain binding help")
+}
+
+// A callee that writes and then calls a `-> Never` function on one path, and returns on the
+// other with no write: the call adds nothing on the first path, so nothing reaches the return.
+test "a write followed by a call to a -> Never function is not in the return write set" {
+    let src = [
+        #"let mut pos = 0"#,
+        #"let mut err = """#,
+        #""#,
+        #"fn fail(msg: Str) -> Never ! Env.Exit {"#,
+        #"    err = msg"#,
+        #"    env.exit(2)"#,
+        #"}"#,
+        #""#,
+        #"fn checked(n: Int) -> Int ! Env.Exit {"#,
+        #"    if n < 0 {"#,
+        #"        err = "negative""#,
+        #"        fail("negative")"#,
+        #"    }"#,
+        #"    n"#,
+        #"}"#,
+        #""#,
+        #"fn look(n: Int) -> Int ! Env.Exit {"#,
+        #"    let saved = pos"#,
+        #"    let v = checked(n)"#,
+        #"    pos = saved"#,
+        #"    v"#,
+        #"}"#,
+        #""#,
+        #"fn main() ! Env.Exit {"#,
+        #"    let _ = look(1)"#,
+        #"}"#,
+    ].join("\n")
+    expect_no_mutation_lint(src, "_rw_write_then_never_call")
+}
+
+// env.exit as the end of a path inside a match arm; the other arm returns with the write.
+test "env.exit in a match arm ends that path, and the arm that returns keeps its write" {
+    let src = [
+        #"let mut pos = 0"#,
+        #"let mut err = """#,
+        #"let mut seen = 0"#,
+        #""#,
+        #"fn classify(n: Int) -> Int ! Env.Exit {"#,
+        #"    match n {"#,
+        #"        0 => {"#,
+        #"            err = "zero""#,
+        #"            env.exit(3)"#,
+        #"        }"#,
+        #"        _ => {"#,
+        #"            seen = n"#,
+        #"            n"#,
+        #"        }"#,
+        #"    }"#,
+        #"}"#,
+        #""#,
+        #"fn look(n: Int) -> Int ! Env.Exit {"#,
+        #"    let saved = pos"#,
+        #"    let v = classify(n)"#,
+        #"    pos = saved"#,
+        #"    v"#,
+        #"}"#,
+        #""#,
+        #"fn main() ! Env.Exit {"#,
+        #"    let _ = look(1)"#,
+        #"}"#,
+    ].join("\n")
+    let tag = "_rw_exit_in_match_arm"
+    let out = compile_test_helpers.compile_and_capture(src, tag)
+    compile_test_helpers.expect_compiles_clean(out, tag)
+    assert_eq(diags_at(out, "W0551", 20, 13), 1)
+    assert_eq(mutation_lints(out), 1)
+    compile_test_helpers.expect_contains(out, "call to `classify` in `look` mutates [seen];", "match arm names seen only")
+}
+
+// An early `return` reaches the normal return, so a write before it stays in the set.
+test "a write before an early return stays in the return write set" {
+    let src = [
+        #"let mut pos = 0"#,
+        #"let mut err = """#,
+        #""#,
+        #"fn checked(n: Int) -> Result[Int, Str] {"#,
+        #"    if n < 0 {"#,
+        #"        err = "negative""#,
+        #"        return Err("negative")"#,
+        #"    }"#,
+        #"    Ok(n)"#,
+        #"}"#,
+        #""#,
+        #"fn look(n: Int) -> Result[Int, Str] {"#,
+        #"    let saved = pos"#,
+        #"    let v = checked(n)"#,
+        #"    pos = saved"#,
+        #"    v"#,
+        #"}"#,
+        #""#,
+        #"fn main() {"#,
+        #"    let _ = look(1)"#,
+        #"}"#,
+    ].join("\n")
+    let tag = "_rw_write_before_return"
+    let out = compile_test_helpers.compile_and_capture(src, tag)
+    compile_test_helpers.expect_compiles_clean(out, tag)
+    assert_eq(diags_at(out, "W0551", 14, 13), 1)
+    assert_eq(mutation_lints(out), 1)
+    compile_test_helpers.expect_contains(out, "`err` is written at {scratch_file(tag)}:6, in `checked`", "early return write-site note")
+}
+
+// Two functions that call each other. `bounce` writes `err` only before env.exit, so the
+// pair has nothing on its return paths but `count`.
+test "a recursive pair holds only the writes on its return paths" {
+    let src = [
+        #"let mut pos = 0"#,
+        #"let mut err = """#,
+        #"let mut count = 0"#,
+        #""#,
+        #"fn walk(n: Int) ! Env.Exit {"#,
+        #"    if n > 0 { bounce(n - 1) }"#,
+        #"}"#,
+        #""#,
+        #"fn bounce(n: Int) ! Env.Exit {"#,
+        #"    if n == 7 {"#,
+        #"        err = "seven""#,
+        #"        env.exit(4)"#,
+        #"    }"#,
+        #"    count = count + 1"#,
+        #"    walk(n)"#,
+        #"}"#,
+        #""#,
+        #"fn look(n: Int) ! Env.Exit {"#,
+        #"    let saved = pos"#,
+        #"    walk(n)"#,
+        #"    pos = saved"#,
+        #"}"#,
+        #""#,
+        #"fn main() ! Env.Exit {"#,
+        #"    look(3)"#,
+        #"}"#,
+    ].join("\n")
+    let tag = "_rw_recursive_pair"
+    let out = compile_test_helpers.compile_and_capture(src, tag)
+    compile_test_helpers.expect_compiles_clean(out, tag)
+    assert_eq(diags_at(out, "W0551", 20, 5), 1)
+    assert_eq(mutation_lints(out), 1)
+    compile_test_helpers.expect_contains(out, "call to `walk` in `look` mutates [count];", "recursive pair names count only")
+    let file = scratch_file(tag)
+    compile_test_helpers.expect_contains(out, "`count` is written at {file}:14, in `bounce`, called from `walk` at {file}:6", "recursive pair write-site note")
+}
+
+// A recursive pair whose only write comes before env.exit has an empty return write set.
+test "a recursive pair whose writes all end in env.exit gives no warning" {
+    let src = [
+        #"let mut pos = 0"#,
+        #"let mut err = """#,
+        #""#,
+        #"fn walk(n: Int) ! Env.Exit {"#,
+        #"    if n > 0 { bounce(n - 1) }"#,
+        #"}"#,
+        #""#,
+        #"fn bounce(n: Int) ! Env.Exit {"#,
+        #"    if n == 7 {"#,
+        #"        err = "seven""#,
+        #"        env.exit(4)"#,
+        #"    }"#,
+        #"    walk(n)"#,
+        #"}"#,
+        #""#,
+        #"fn look(n: Int) ! Env.Exit {"#,
+        #"    let saved = pos"#,
+        #"    walk(n)"#,
+        #"    pos = saved"#,
+        #"}"#,
+        #""#,
+        #"fn main() ! Env.Exit {"#,
+        #"    look(3)"#,
+        #"}"#,
+    ].join("\n")
+    expect_no_mutation_lint(src, "_rw_recursive_pair_exits")
+}
+
+// The error edge of `?` reaches the normal return, so a write before it stays in the set
+// even when every other path ends in env.exit.
+test "the error edge of ? reaches the return" {
+    let src = [
+        #"let mut pos = 0"#,
+        #"let mut seen = 0"#,
+        #""#,
+        #"fn check(n: Int) -> Result[Int, Str] {"#,
+        #"    if n < 0 { Err("negative") } else { Ok(n) }"#,
+        #"}"#,
+        #""#,
+        #"fn run(n: Int) -> Result[Int, Str] ! Env.Exit {"#,
+        #"    seen = n"#,
+        #"    let v = check(n)?"#,
+        #"    env.exit(v)"#,
+        #"}"#,
+        #""#,
+        #"fn look(n: Int) -> Result[Int, Str] ! Env.Exit {"#,
+        #"    let saved = pos"#,
+        #"    let v = run(n)"#,
+        #"    pos = saved"#,
+        #"    v"#,
+        #"}"#,
+        #""#,
+        #"fn main() ! Env.Exit {"#,
+        #"    let _ = look(1)"#,
+        #"}"#,
+    ].join("\n")
+    let tag = "_rw_question_edge"
+    let out = compile_test_helpers.compile_and_capture(src, tag)
+    compile_test_helpers.expect_compiles_clean(out, tag)
+    assert_eq(diags_at(out, "W0551", 16, 13), 1)
+    assert_eq(mutation_lints(out), 1)
+    compile_test_helpers.expect_contains(out, "`seen` is written at {scratch_file(tag)}:9, in `run`", "? edge write-site note")
+}
+
+// A `loop` with no `break` has type Never: no path through it reaches the return.
+test "a write inside a loop with no break is not in the return write set" {
+    let src = [
+        #"let mut pos = 0"#,
+        #"let mut count = 0"#,
+        #""#,
+        #"fn spin() ! Env.Exit {"#,
+        #"    loop {"#,
+        #"        count = count + 1"#,
+        #"        if count > 9 { env.exit(0) }"#,
+        #"    }"#,
+        #"}"#,
+        #""#,
+        #"fn look() ! Env.Exit {"#,
+        #"    let saved = pos"#,
+        #"    spin()"#,
+        #"    pos = saved"#,
+        #"}"#,
+        #""#,
+        #"fn main() ! Env.Exit {"#,
+        #"    look()"#,
+        #"}"#,
+    ].join("\n")
+    expect_no_mutation_lint(src, "_rw_loop_no_break")
+}
+
+// `break` leaves the loop for the code after it, and `continue` goes back to the loop head,
+// so writes before either stay in the set when the loop can end. A write before env.exit
+// in the same loop does not.
+test "break and continue carry a write on to the return" {
+    let src = [
+        #"let mut pos = 0"#,
+        #"let mut err = """#,
+        #"let mut seen = 0"#,
+        #"let mut count = 0"#,
+        #""#,
+        #"fn scan(n: Int) ! Env.Exit {"#,
+        #"    let mut i = 0"#,
+        #"    while i < n {"#,
+        #"        i = i + 1"#,
+        #"        if i == 2 {"#,
+        #"            count = count + 1"#,
+        #"            continue"#,
+        #"        }"#,
+        #"        if i == 5 {"#,
+        #"            err = "five""#,
+        #"            env.exit(5)"#,
+        #"        }"#,
+        #"        if i == 7 {"#,
+        #"            seen = i"#,
+        #"            break"#,
+        #"        }"#,
+        #"    }"#,
+        #"}"#,
+        #""#,
+        #"fn look(n: Int) ! Env.Exit {"#,
+        #"    let saved = pos"#,
+        #"    scan(n)"#,
+        #"    pos = saved"#,
+        #"}"#,
+        #""#,
+        #"fn main() ! Env.Exit {"#,
+        #"    look(9)"#,
+        #"}"#,
+    ].join("\n")
+    let tag = "_rw_break_continue"
+    let out = compile_test_helpers.compile_and_capture(src, tag)
+    compile_test_helpers.expect_compiles_clean(out, tag)
+    assert_eq(diags_at(out, "W0551", 27, 5), 1)
+    assert_eq(mutation_lints(out), 1)
+    compile_test_helpers.expect_contains(out, "call to `scan` in `look` mutates [seen, count];", "loop names seen and count")
+}

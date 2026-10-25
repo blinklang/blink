@@ -1,7 +1,7 @@
 import ast.{NodeKind}
 import std.str.{str_join}
 import parser.{
-    node_kind, node_name, node_left, node_right, node_body, node_condition,
+    node_kind, node_name, node_left, node_right, node_body, node_condition, node_op,
     node_then_body, node_else_body, node_scrutinee, node_guard, node_value,
     node_target, node_iterable, node_is_mut, node_start, node_end, node_obj,
     node_method, node_index, node_params, node_args, node_stmts, node_arms,
@@ -11,6 +11,7 @@ import parser.{
 import typecheck.{
     tc_call_decl_is_fn, tc_call_decl_node, tc_call_declared_name, tc_global_decl_node,
     tc_ident_binder_node, tc_let_binder_is_discard, tc_prelude_carrier_of, tc_ticked_names,
+    TyKind, tc_lookup_node_tid, tc_tid_kind,
 }
 import diagnostics.{
     Diag, diag_warn_at_notes, diag_source_file, diag_file_for_node,
@@ -589,6 +590,349 @@ fn fn_writes_to(fn_name: Str, global_name: Str) -> Int {
     0
 }
 
+// ── Return write set (§4.16.4) ────────────────────────────────────────
+//
+// The writes of a fn that lie on some path to its normal return. W0550 and W0551 read this
+// set; the write set above stays whole for every other reader. A path ends only at an
+// expression typecheck types Never. A jump has that type too, but it moves the path to its
+// target: `return` and the error edge of `?` reach the return, `break` and `continue` their
+// loop. Each body is walked backward, carrying whether the path from a point goes on to the
+// return. A write counts when it does; a call adds its callee's set the same way.
+
+type RetWrites {
+    // One bit per (fn, global), laid out as writes_bits.
+    bits: List[U64]
+    // Per fn: each global in its set, beside the node that put it there (the write, or
+    // the call that brought it in) and that call's callee (-1 for a write in the fn).
+    globals: List[List[Int]]
+    sites: List[List[Int]]
+    vias: List[List[Int]]
+    // The calls that go on to the return of their caller.
+    edge_from: List[Int]
+    edge_to: List[Int]
+    edge_node: List[Int]
+}
+
+// Where the paths of one body go. A closure body gets its own: its `return` ends the
+// closure, which reaches the fn's return only when the path past the closure does.
+type RwPath {
+    fn_idx: Int
+    ret: Bool
+    // The targets of `break` and `continue`, innermost loop last.
+    brk: List[Bool]
+    cont: List[Bool]
+    kids: List[Int]
+}
+
+fn rw_has(r: RetWrites, fn_idx: Int, gi: Int) -> Bool {
+    let word = r.bits.get(fn_idx * writes_words + gi / 64).unwrap()
+    (word & (1.to_u64() << (gi % 64).to_u32())) != 0.to_u64()
+}
+
+// Keeps the set inside the write set: a write the write-set walk does not see is not
+// added here either.
+fn rw_add(r: RetWrites, fn_idx: Int, gi: Int, site: Int, via: Int) -> Bool {
+    if rw_has(r, fn_idx, gi) || mat_has_write(fn_idx, gi) == 0 {
+        return false
+    }
+    let wi = fn_idx * writes_words + gi / 64
+    r.bits.set(wi, r.bits.get(wi).unwrap() | (1.to_u64() << (gi % 64).to_u32()))
+    r.globals.get(fn_idx).unwrap().push(gi)
+    r.sites.get(fn_idx).unwrap().push(site)
+    r.vias.get(fn_idx).unwrap().push(via)
+    true
+}
+
+fn rw_write(r: RetWrites, p: RwPath, name: Str, node: Int, on: Bool) {
+    if !on || is_global(name) == 0 {
+        return
+    }
+    let _ = rw_add(r, p.fn_idx, global_index(name), node, -1)
+}
+
+fn rw_is_never(node: Int) -> Bool {
+    let tid = tc_lookup_node_tid(node)
+    tid >= 0 && tc_tid_kind(tid) == TyKind.Never
+}
+
+fn rw_top(flags: List[Bool]) -> Bool {
+    let n = flags.len()
+    n > 0 && flags.get(n - 1).unwrap()
+}
+
+// The write targets mirror walk_expr: a global, a field of one, or an element of one.
+fn rw_assign_root(target: Int) -> Str {
+    if target == -1 {
+        return ""
+    }
+    let tk = node_kind(target)
+    if tk == NodeKind.Ident {
+        return node_name(target)
+    }
+    if tk == NodeKind.FieldAccess || tk == NodeKind.IndexExpr {
+        let obj = node_obj(target)
+        if obj != -1 && node_kind(obj) == NodeKind.Ident {
+            return node_name(obj)
+        }
+    }
+    ""
+}
+
+// The children run left to right, so the walk takes them right to left.
+fn rw_walk_kids(r: RetWrites, p: RwPath, node: Int, after: Bool) -> Bool {
+    let base = p.kids.len()
+    node_push_value_child_ids(node, p.kids)
+    let mut on = after
+    let mut i = p.kids.len()
+    while i > base {
+        i = i - 1
+        on = rw_walk(r, p, p.kids.get(i).unwrap(), on)
+    }
+    sr_drop_kids_to(p.kids, base)
+    on
+}
+
+// A loop's head, the least fixpoint of `head = enter(body, head)`. The flag only grows, so
+// a second walk settles it.
+fn rw_walk_loop(r: RetWrites, p: RwPath, body: Int, exit: Bool, cond: Int, falls_out: Bool) -> Bool {
+    let mut head = false
+    loop {
+        p.brk.push(exit)
+        p.cont.push(head)
+        let b = rw_walk(r, p, body, head)
+        let _ = p.brk.pop()
+        let _ = p.cont.pop()
+        let next = rw_walk(r, p, cond, (falls_out && exit) || b)
+        if next == head {
+            return head
+        }
+        head = next
+    }
+}
+
+// Whether a path from just before `node` reaches the return, given whether the path from
+// just after it does.
+fn rw_walk(r: RetWrites, p: RwPath, node: Int, after: Bool) -> Bool {
+    if node == -1 {
+        return after
+    }
+    let kind = node_kind(node)
+    if kind == NodeKind.FnDef {
+        return after
+    }
+    if kind == NodeKind.Return {
+        return rw_walk(r, p, node_value(node), p.ret)
+    }
+    if kind == NodeKind.Break {
+        return rw_top(p.brk)
+    }
+    if kind == NodeKind.Continue {
+        return rw_top(p.cont)
+    }
+    if kind == NodeKind.Closure {
+        let inner = RwPath { fn_idx: p.fn_idx, ret: after, brk: [], cont: [], kids: p.kids }
+        let _ = rw_walk(r, inner, node_body(node), after)
+        return after
+    }
+    let out = after && !rw_is_never(node)
+    if kind == NodeKind.Block {
+        let stmts = node_stmts(node)
+        let mut on = out
+        if stmts != -1 {
+            let mut i = sublist_length(stmts)
+            while i > 0 {
+                i = i - 1
+                on = rw_walk(r, p, sublist_get(stmts, i), on)
+            }
+        }
+        return on
+    }
+    if kind == NodeKind.IfExpr {
+        let t = rw_walk(r, p, node_then_body(node), out)
+        let e = rw_walk(r, p, node_else_body(node), out)
+        return rw_walk(r, p, node_condition(node), t || e)
+    }
+    if kind == NodeKind.MatchExpr {
+        return rw_walk(r, p, node_scrutinee(node), rw_walk_arms(r, p, node_arms(node), out))
+    }
+    if kind == NodeKind.BinOp && (node_op(node) == "&&" || node_op(node) == "||" || node_op(node) == "??") {
+        let right = rw_walk(r, p, node_right(node), out)
+        return rw_walk(r, p, node_left(node), out || right)
+    }
+    if kind == NodeKind.UnaryOp && node_op(node) == "?" {
+        return rw_walk(r, p, node_left(node), out || p.ret)
+    }
+    if kind == NodeKind.WhileLoop {
+        return rw_walk_loop(r, p, node_body(node), out, node_condition(node), true)
+    }
+    if kind == NodeKind.LoopExpr {
+        return rw_walk_loop(r, p, node_body(node), out, -1, false)
+    }
+    if kind == NodeKind.ForIn {
+        let head = rw_walk_loop(r, p, node_body(node), out, -1, true)
+        return rw_walk(r, p, node_iterable(node), head)
+    }
+    if kind == NodeKind.Assignment || kind == NodeKind.CompoundAssign {
+        let target = node_target(node)
+        rw_write(r, p, rw_assign_root(target), node, out)
+        let on = rw_walk(r, p, node_value(node), out)
+        if target == -1 || node_kind(target) == NodeKind.Ident {
+            return on
+        }
+        return rw_walk(r, p, target, on)
+    }
+    if kind == NodeKind.MethodCall {
+        let obj = node_obj(node)
+        if obj != -1 && node_kind(obj) == NodeKind.Ident && is_mutating_method(node_method(node)) != 0 {
+            rw_write(r, p, node_name(obj), node, out)
+        }
+    }
+    if kind == NodeKind.Call && out {
+        let callee_name = extract_ident_name(node_left(node))
+        if callee_name.is_some() {
+            let callee_idx = fn_index(callee_name.unwrap())
+            if callee_idx >= 0 {
+                r.edge_from.push(p.fn_idx)
+                r.edge_to.push(callee_idx)
+                r.edge_node.push(node)
+            }
+        }
+    }
+    rw_walk_kids(r, p, node, out)
+}
+
+// A guard that fails moves on to a later arm, so a guard's path goes on when its own arm's
+// does or any arm's does.
+fn rw_walk_arms(r: RetWrites, p: RwPath, arms: Int, after: Bool) -> Bool {
+    if arms == -1 {
+        return false
+    }
+    let n = sublist_length(arms)
+    let mut bodies: List[Bool] = []
+    let mut any = false
+    let mut i = 0
+    while i < n {
+        let b = rw_walk(r, p, node_body(sublist_get(arms, i)), after)
+        bodies.push(b)
+        any = any || b
+        i = i + 1
+    }
+    let mut enter = false
+    i = 0
+    while i < n {
+        let guard = node_guard(sublist_get(arms, i))
+        let b = bodies.get(i).unwrap()
+        let g = if guard == -1 { b } else { rw_walk(r, p, guard, b || any) }
+        enter = enter || g
+        i = i + 1
+    }
+    enter
+}
+
+// The least fixpoint over the call edges that go on to a return, as propagate_writes does
+// for the write set. A fn's sites are set before any caller reads them, so following
+// `vias` from any fn ends at a write.
+fn rw_compute(fns: Int) -> RetWrites {
+    let n_fns = ma_fn_names.len()
+    let r = RetWrites { bits: [], globals: [], sites: [], vias: [], edge_from: [], edge_to: [], edge_node: [] }
+    let mut i = 0
+    while i < n_fns * writes_words {
+        r.bits.push(0.to_u64())
+        i = i + 1
+    }
+    i = 0
+    while i < n_fns {
+        r.globals.push([])
+        r.sites.push([])
+        r.vias.push([])
+        i = i + 1
+    }
+    let kids: List[Int] = []
+    i = 0
+    while i < n_fns {
+        let p = RwPath { fn_idx: i, ret: true, brk: [], cont: [], kids: kids }
+        let _ = rw_walk(r, p, node_body(sublist_get(fns, i)), true)
+        i = i + 1
+    }
+
+    let n_edges = r.edge_from.len()
+    let mut callers: List[List[Int]] = []
+    i = 0
+    while i < n_fns {
+        callers.push([])
+        i = i + 1
+    }
+    let mut e = 0
+    while e < n_edges {
+        callers.get(r.edge_to.get(e).unwrap()).unwrap().push(e)
+        e = e + 1
+    }
+    let mut queue: List[Int] = []
+    let mut queued: List[Bool] = []
+    i = 0
+    while i < n_fns {
+        let has = r.globals.get(i).unwrap().len() > 0
+        if has {
+            queue.push(i)
+        }
+        queued.push(has)
+        i = i + 1
+    }
+    let mut head = 0
+    while head < queue.len() {
+        let callee = queue.get(head).unwrap()
+        head = head + 1
+        queued.set(callee, false)
+        let gs = r.globals.get(callee).unwrap()
+        // Snapshot length: a self edge grows the list being read.
+        let n_gs = gs.len()
+        for edge in callers.get(callee).unwrap() {
+            let caller = r.edge_from.get(edge).unwrap()
+            let mut grew = false
+            let mut k = 0
+            while k < n_gs {
+                if rw_add(r, caller, gs.get(k).unwrap(), r.edge_node.get(edge).unwrap(), callee) {
+                    grew = true
+                }
+                k = k + 1
+            }
+            if grew && !queued.get(caller).unwrap() {
+                queue.push(caller)
+                queued.set(caller, true)
+            }
+        }
+    }
+    r
+}
+
+// The note that says where a global in the return write set of `callee` is written: the
+// write's file:line, its fn, and each call from there back up to `callee`.
+fn rw_write_site_note(r: RetWrites, callee_idx: Int, gi: Int) -> Str {
+    let mut hops: List[Str] = []
+    let mut f = callee_idx
+    loop {
+        let gs = r.globals.get(f).unwrap()
+        let k = gs.index_of(gi) ?? -1
+        if k < 0 {
+            return ""
+        }
+        let site = r.sites.get(f).unwrap().get(k).unwrap()
+        let via = r.vias.get(f).unwrap().get(k).unwrap()
+        let at = "{diag_file_for_node(site)}:{node_line(site)}"
+        if via < 0 {
+            let mut note = "`{ma_globals.get(gi).unwrap()}` is written at {at}, in `{ma_fn_names.get(f).unwrap()}`"
+            let mut h = hops.len()
+            while h > 0 {
+                h = h - 1
+                note = "{note}, {hops.get(h).unwrap()}"
+            }
+            return note
+        }
+        hops.push("called from `{ma_fn_names.get(f).unwrap()}` at {at}")
+        f = via
+    }
+}
+
 // ── W0550/W0551 Save/Restore pattern detection ──────────────────────
 //
 // §4.16.7 reads the text of one function. One walk records, in source order, each
@@ -616,10 +960,12 @@ type SrWalk {
     held: Map[Int, Int],
     // The program's fns, in the order the write-set tables index them.
     fns: Int,
+    // The return write sets the lints read.
+    ret: RetWrites,
 }
 
-fn sr_walk_new(fns: Int) -> SrWalk {
-    SrWalk { kinds: [], names: [], nodes: [], decls: [], restores: [], held: Map(), fns: fns }
+fn sr_walk_new(fns: Int, ret: RetWrites) -> SrWalk {
+    SrWalk { kinds: [], names: [], nodes: [], decls: [], restores: [], held: Map(), fns: fns, ret: ret }
 }
 
 fn sr_push_event(w: SrWalk, kind: SrEventKind, name: Str, node: Int, decl: Int, restores: Int) {
@@ -891,7 +1237,7 @@ fn sr_pair_note(w: SrWalk, p: SrPairs, i: Int, call: Int) -> Str {
 }
 
 fn sr_help(unsaved: List[Str]) -> Str {
-    "save and restore {tc_ticked_names(unsaved)} around the call\nif the function sets a global for this call, assign that global between its save and this call"
+    "save and restore {tc_ticked_names(unsaved)} around the call, or end that path in a call to a `-> Never` function\nif the function sets a global for this call, assign that global between its save and this call"
 }
 
 fn sr_check_call(w: SrWalk, p: SrPairs, ev: Int, fn_name: Str, speculative_pair: Int) ! Diag.Report {
@@ -902,7 +1248,7 @@ fn sr_check_call(w: SrWalk, p: SrPairs, ev: Int, fn_name: Str, speculative_pair:
     let call_node = w.nodes.get(ev).unwrap()
     let callee_idx = fn_index(callee)
     let wcount = ma_write_counts.get(callee_idx).unwrap()
-    if wcount == 0 {
+    if w.ret.globals.get(callee_idx).unwrap().len() == 0 {
         return
     }
 
@@ -926,7 +1272,7 @@ fn sr_check_call(w: SrWalk, p: SrPairs, ev: Int, fn_name: Str, speculative_pair:
                 if checked.len() == 0 {
                     note_pair = i
                 }
-                if restored_pair < 0 && fn_has_write(callee_idx, global) != 0 {
+                if restored_pair < 0 && is_global(global) != 0 && rw_has(w.ret, callee_idx, global_index(global)) {
                     restored_pair = i
                 }
                 checked.push(global)
@@ -939,10 +1285,15 @@ fn sr_check_call(w: SrWalk, p: SrPairs, ev: Int, fn_name: Str, speculative_pair:
     let mut write_items: List[Str] = []
     let mut unsaved: List[Str] = []
     let mut restored: List[Str] = []
+    // The write set names every write, in the note; only the return write set is checked.
     let mut wi = 0
     while wi < wcount {
         let gname = ma_write_items.get(wstart + wi).unwrap()
         write_items.push(gname)
+        if !rw_has(w.ret, callee_idx, global_index(gname)) {
+            wi = wi + 1
+            continue
+        }
         if checked.contains(gname) {
             restored.push(gname)
         } else if !bound.contains(gname) {
@@ -954,6 +1305,7 @@ fn sr_check_call(w: SrWalk, p: SrPairs, ev: Int, fn_name: Str, speculative_pair:
         return
     }
     let writes_note = "`{callee}` writes \{{str_join(write_items, ", ")}}"
+    let site_note = rw_write_site_note(w.ret, callee_idx, global_index(unsaved.get(0).unwrap()))
     let missing = str_join(unsaved, ", ")
 
     if restored.len() > 0 {
@@ -962,7 +1314,7 @@ fn sr_check_call(w: SrWalk, p: SrPairs, ev: Int, fn_name: Str, speculative_pair:
             "call to `{callee}` in `{fn_name}` mutates [{missing}] which are not saved/restored (write-set: {wcount} globals, saved: {restored.len()})",
             call_node,
             sr_help(unsaved),
-            [sr_pair_note(w, p, restored_pair, ev), writes_note, "only [{str_join(restored, ", ")}] is restored after the call"]
+            [sr_pair_note(w, p, restored_pair, ev), writes_note, site_note, "only [{str_join(restored, ", ")}] is restored after the call"]
         )
         return
     }
@@ -975,7 +1327,7 @@ fn sr_check_call(w: SrWalk, p: SrPairs, ev: Int, fn_name: Str, speculative_pair:
         "call to `{callee}` in `{fn_name}` mutates [{missing}]; these are not saved/restored for this call, though this function uses a save/restore pattern elsewhere",
         call_node,
         sr_help(unsaved),
-        [sr_pair_note(w, p, note_pair, ev), writes_note]
+        [sr_pair_note(w, p, note_pair, ev), writes_note, site_note]
     )
 }
 
@@ -983,12 +1335,12 @@ fn sr_check_call(w: SrWalk, p: SrPairs, ev: Int, fn_name: Str, speculative_pair:
 // reads a call in the assigned value as coming before the new value. So the pair is
 // speculative, and the lint checks the calls that write the allow stack against it.
 @allow(UnrestoredMutation, IncompleteStateRestore)
-fn sr_analyze_fn(fn_node: Int, fns: Int) ! Diag.Report {
+fn sr_analyze_fn(fn_node: Int, fns: Int, ret: RetWrites) ! Diag.Report {
     let body = node_body(fn_node)
     if body == -1 || node_kind(body) != NodeKind.Block {
         return
     }
-    let w = sr_walk_new(fns)
+    let w = sr_walk_new(fns, ret)
     let mut kids: List[Int] = []
     sr_walk_node(w, body, kids)
     let p = sr_find_pairs(w)
@@ -1027,9 +1379,10 @@ pub fn analyze_save_restore(program: Int) ! Diag.Report {
     if fns_sl == -1 {
         return
     }
+    let ret = rw_compute(fns_sl)
     let mut i = 0
     while i < sublist_length(fns_sl) {
-        sr_analyze_fn(sublist_get(fns_sl, i), fns_sl)
+        sr_analyze_fn(sublist_get(fns_sl, i), fns_sl, ret)
         i = i + 1
     }
 }
