@@ -1,0 +1,305 @@
+// sections/07_trust_modules_metadata.md, *Scope tags*, rule 1: an assignment `place = v` or
+// `place op= v` to a place (§2.22) stores into the place's root `let mut` binding, so a store
+// into `x.f.g` or `x.0` is a store into `x`, with the tag of the scope around its declaration.
+// Each negative row asserts the code, the line and the "assignment" store-form label, so a row
+// that some other store form catches does not pass.
+import cg_test_helpers.{cg_probe_begin}
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import escape.{analyze_escapes}
+import diagnostics.{DiagEntry, diag_entries, diag_ice_count}
+import std.io
+
+// Every error in `src` after check and escape analysis. An internal error fails the row.
+fn all_errors_in(stem: Str, src: Str) -> List[DiagEntry] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    env.set_var("BLINK_ROOT", process_run("pwd", []).out.trim())
+    let path = "build/{stem}_probe.bl"
+    cg_probe_begin(path)
+    write_file(path, src)
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    analyze_escapes(program)
+    let _rm = process_run("rm", ["-f", path])
+    assert_eq(diag_ice_count, 0)
+    let mut found: List[DiagEntry] = []
+    for d in diag_entries {
+        if d.severity == "error" { found.push(d) }
+    }
+    found
+}
+
+// The E0601 errors in `src`. Any other error fails the row: a probe that stops early reports
+// nothing.
+fn e0601_in(stem: Str, src: Str) -> List[DiagEntry] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    let mut found: List[DiagEntry] = []
+    let mut others = 0
+    for d in all_errors_in(stem, src) {
+        if d.code == "E0601" {
+            found.push(d)
+        } else {
+            io.println("FAIL: {stem} recorded an error the row does not expect: {d.name}: {d.message}")
+            others = others + 1
+        }
+    }
+    assert_eq(others, 0)
+    found
+}
+
+// "Name@line\n" for each E0601 in `src`.
+fn errors_in(stem: Str, src: Str) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    let mut out = ""
+    for d in e0601_in(stem, src) { out = "{out}{d.name}@{d.line}\n" }
+    out
+}
+
+// "Name@line\n" for each E0601 in `src` whose message gives the assignment store form.
+fn assignments_in(stem: Str, src: Str) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    let mut out = ""
+    for d in e0601_in(stem, src) {
+        if d.message.contains("stored by assignment") { out = "{out}{d.name}@{d.line}\n" }
+    }
+    out
+}
+
+// The message of the one E0601 in `src`, or "" when there is not exactly one.
+fn message_in(stem: Str, src: Str) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    let found = e0601_in(stem, src)
+    if found.len() != 1 { return "" }
+    found.get(0).unwrap().message
+}
+
+test "assigning an inner pointer to a struct field of an outer let mut is a tag mismatch" {
+    assert_eq(assignments_in("assign_struct_field", #"@ffi.struct(header: "sys/uio.h", name: "iovec")
+type IoVec {
+    iov_base: Ptr[U8],
+    iov_len: U64,
+}
+
+fn main() {
+    with ffi.scope() as outer {
+        let mut v = IoVec { iov_base: outer.alloc[U8](), iov_len: 1 }
+        with ffi.scope() as inner {
+            v.iov_base = inner.alloc[U8]()
+        }
+        let _ = v.iov_base.is_null()
+    }
+}
+"#), "PtrTagMismatch@11\n")
+}
+
+test "assigning an inner pointer to a tuple field of an outer let mut is a tag mismatch" {
+    assert_eq(assignments_in("assign_tuple_field", #"fn main() {
+    with ffi.scope() as outer {
+        let mut t = (outer.alloc[U8](), 1)
+        with ffi.scope() as inner {
+            t.0 = inner.alloc[U8]()
+        }
+        let _ = t.0.is_null()
+    }
+}
+"#), "PtrTagMismatch@5\n")
+}
+
+test "assigning an inner pointer to a struct field inside a tuple field is a tag mismatch" {
+    assert_eq(assignments_in("assign_mixed_path", #"@ffi.struct(header: "sys/uio.h", name: "iovec")
+type IoVec {
+    iov_base: Ptr[U8],
+    iov_len: U64,
+}
+
+fn main() {
+    with ffi.scope() as outer {
+        let mut w = (IoVec { iov_base: outer.alloc[U8](), iov_len: 1 }, 2)
+        with ffi.scope() as inner {
+            w.0.iov_base = inner.alloc[U8]()
+        }
+        let _ = w.0.iov_base.is_null()
+    }
+}
+"#), "PtrTagMismatch@11\n")
+}
+
+test.failing(
+    "assigning an inner pointer to a tuple field inside a tuple field is a tag mismatch",
+    reason: "the lexer reads `1.1` in `t.1.1` as a float literal, so the path does not parse",
+) {
+    // Not through e0601_in: its report of the parse error would print into the test report.
+    let mut out = ""
+    for d in all_errors_in("assign_nested_tuple", #"fn main() {
+    with ffi.scope() as outer {
+        let mut t = (1, (2, outer.alloc[U8]()))
+        with ffi.scope() as inner {
+            t.1.1 = inner.alloc[U8]()
+        }
+        let _ = t.1.1.is_null()
+    }
+}
+"#) { out = "{out}{d.name}@{d.line}:{d.message.contains("stored by assignment")}\n" }
+    assert_eq(out, "PtrTagMismatch@5:true\n")
+}
+
+test "assigning an inner pointer to an outer let mut is an assignment, not a write" {
+    assert_eq(assignments_in("assign_binding", #"fn main() {
+    with ffi.scope() as outer {
+        let mut p = outer.alloc[U8]()
+        with ffi.scope() as inner {
+            p = inner.alloc[U8]()
+        }
+        let _ = p.is_null()
+    }
+}
+"#), "PtrTagMismatch@5\n")
+}
+
+test "a field store into a cell declared in the same scope is legal" {
+    assert_eq(errors_in("assign_same_scope", #"@ffi.struct(header: "sys/uio.h", name: "iovec")
+type IoVec {
+    iov_base: Ptr[U8],
+    iov_len: U64,
+}
+
+fn main() {
+    with ffi.scope() as outer {
+        with ffi.scope() as inner {
+            let mut v = IoVec { iov_base: outer.alloc[U8](), iov_len: 1 }
+            v.iov_base = inner.alloc[U8]()
+            let mut t = (outer.alloc[U8](), 1)
+            t.0 = inner.alloc[U8]()
+            let mut w = (IoVec { iov_base: outer.alloc[U8](), iov_len: 1 }, 2)
+            w.0.iov_base = inner.alloc[U8]()
+            let _ = v.iov_base.is_null() || t.0.is_null() || w.0.iov_base.is_null()
+        }
+    }
+}
+"#), "")
+}
+
+test "an outer pointer may be assigned to a field of an inner cell" {
+    assert_eq(errors_in("assign_outer_into_inner", #"fn main() {
+    with ffi.scope() as outer {
+        let a = outer.alloc[U8]()
+        with ffi.scope() as inner {
+            let mut t = (inner.alloc[U8](), 1)
+            t.0 = a
+            let _ = t.0.is_null()
+        }
+    }
+}
+"#), "")
+}
+
+test "a pointer detached with take may be assigned to a field of an outer cell" {
+    assert_eq(errors_in("assign_take", #"fn main() {
+    with ffi.scope() as outer {
+        let mut t = (outer.alloc[U8](), 1)
+        with ffi.scope() as inner {
+            t.0 = inner.take(inner.alloc[U8]())
+        }
+        let _ = t.0.is_null()
+    }
+}
+"#), "")
+}
+
+// No operator gives a pointer-bearing value (the arithmetic traits are sealed to numeric
+// types), so `place op= v` stores a value with no tag even when the root holds a pointer.
+test "a compound assignment to a scalar field of a pointer-bearing outer cell is legal" {
+    assert_eq(errors_in("assign_compound", #"@ffi.struct(header: "sys/uio.h", name: "iovec")
+type IoVec {
+    iov_base: Ptr[U8],
+    iov_len: U64,
+}
+
+fn main() {
+    with ffi.scope() as outer {
+        let mut v = IoVec { iov_base: outer.alloc[U8](), iov_len: 1 }
+        let mut w = (IoVec { iov_base: outer.alloc[U8](), iov_len: 1 }, 2)
+        with ffi.scope() as inner {
+            v.iov_len += 1
+            w.0.iov_len *= 2
+            w.1 -= 1
+            let _ = inner.alloc[U8]().is_null()
+        }
+        let _ = v.iov_base.is_null() || w.0.iov_base.is_null()
+    }
+}
+"#), "")
+}
+
+// §2.22: no field-path step goes through a `Ptr`, so `p.f = v` is not a place. Its error is
+// NotAPlace, and the store check does not add a second one.
+test "a field assignment through a Ptr is not a place and not a tag mismatch" {
+    let mut out = ""
+    for d in all_errors_in("assign_through_ptr", #"@ffi.struct(header: "sys/uio.h", name: "iovec")
+type IoVec {
+    iov_base: Ptr[U8],
+    iov_len: U64,
+}
+
+fn main() {
+    with ffi.scope() as outer {
+        let mut p = outer.alloc[IoVec]()
+        with ffi.scope() as inner {
+            p.iov_base = inner.alloc[U8]()
+        }
+        p = outer.alloc[IoVec]()
+    }
+}
+"#) { out = "{out}{d.name}@{d.line}\n" }
+    assert_eq(out, "NotAPlace@11\n")
+}
+
+test "a field store joins the root's tag, so the root may not leave the scope as its tail" {
+    assert_eq(errors_in("assign_then_tail", #"fn main() {
+    with ffi.scope() as outer {
+        let t = with ffi.scope() as inner {
+            let mut c = (outer.alloc[U8](), 1)
+            c.0 = inner.alloc[U8]()
+            c
+        }
+        let _ = t.0.is_null()
+    }
+}
+"#), "PtrEscapesFfiScope@6\n")
+}
+
+// §9.1.1, E0601 message conditions: an assignment error names the full place and its root
+// binding with the scope around the root's declaration.
+test "an assignment mismatch names the full place, its root and the root's scope" {
+    let msg = message_in("msg_assign_path", #"@ffi.struct(header: "sys/uio.h", name: "iovec")
+type IoVec {
+    iov_base: Ptr[U8],
+    iov_len: U64,
+}
+
+fn main() {
+    with ffi.scope() as outer {
+        let mut w = (IoVec { iov_base: outer.alloc[U8](), iov_len: 1 }, 2)
+        with ffi.scope() as inner {
+            w.0.iov_base = inner.alloc[U8]()
+        }
+        let _ = w.0.iov_base.is_null()
+    }
+}
+"#)
+    assert(msg.contains("(tag-mismatch)"))
+    assert(msg.contains("assignment"))
+    assert(!msg.contains("write"))
+    assert(msg.contains("`w.0.iov_base`"))
+    assert(msg.contains("`w` (scope: outer)"))
+    assert(msg.contains("`inner`"))
+}
+
+test "an assignment mismatch into a binding names the binding once with its scope" {
+    let msg = message_in("msg_assign_binding", #"fn main() {
+    with ffi.scope() as outer {
+        let mut p = outer.alloc[U8]()
+        with ffi.scope() as inner {
+            p = inner.alloc[U8]()
+        }
+        let _ = p.is_null()
+    }
+}
+"#)
+    assert(msg.contains("assignment into `p` (scope: outer)"))
+}

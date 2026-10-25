@@ -21,6 +21,7 @@ import typecheck.{
     tc_type_str, tc_qualified_carrier,
 }
 import free_names.{closure_read_idents, pattern_names, push_param_names}
+import unparse.{unparse_expr}
 
 // Arena escape analysis: classifies allocations inside `with arena { }` as
 // promoted (tail-position return) or escaped (emits E0700).
@@ -1386,19 +1387,41 @@ fn ffi_write_cell_tag(recv: Int) -> Int {
     ffi_raw_tag_of(recv)
 }
 
-// The tag of the `let mut` cell an assignment names, or -2 when it is not a
-// cell this pass knows. A module-level `let mut` is unscoped.
+// The root binding of an assignment place (§2.22): the Ident under its struct
+// and tuple field steps, or -1 when the target is no place. A step through a
+// `Ptr` stores into the pointee, so that path is not a place.
+fn ffi_place_root(target: Int) -> Int {
+    let mut root = target
+    while root != -1 && node_kind(root) == NodeKind.FieldAccess {
+        root = node_obj(root)
+        let tid = if root == -1 { -1 } else { tc_lookup_node_tid(root) }
+        if tid >= 0 && tc_tid_kind(tc_resolve(tid)) == TyKind.Ptr { return -1 }
+    }
+    if root == -1 || node_kind(root) != NodeKind.Ident { return -1 }
+    root
+}
+
+// The tag of the `let mut` cell an assignment stores into: the cell of the
+// place's root, since a store into `x.f` or `x.0` is a store into `x`. -2 when
+// it is not a cell this pass knows. A module-level `let mut` is unscoped.
 fn ffi_assign_cell_tag(target: Int) -> Int {
-    if target == -1 || node_kind(target) != NodeKind.Ident { return -2 }
-    if tc_global_decl_node(target) >= 0 { return -1 }
-    ea_cell_tag(tc_ident_binder_node(target))
+    let root = ffi_place_root(target)
+    if root == -1 { return -2 }
+    if tc_global_decl_node(root) >= 0 { return -1 }
+    ea_cell_tag(tc_ident_binder_node(root))
 }
 
 // E0601 (tag-mismatch): a value stored into a cell must outlive it, so its tag
 // must enclose the cell's. An unscoped value encloses every cell.
 fn check_ffi_store(store_node: Int, val: Int, cell_tag: Int) ! Diag.Report {
+    check_ffi_store_tagged(store_node, val, ffi_tag_of(val), cell_tag, -1)
+}
+
+// `place` is the target of an assignment, or -1 for a `.write`. An assignment
+// error names the place and its root, since the root's declaration sets the
+// cell's tag.
+fn check_ffi_store_tagged(store_node: Int, val: Int, vtag: Int, cell_tag: Int, place: Int) ! Diag.Report {
     if cell_tag == -2 { return }
-    let vtag = ffi_tag_of(val)
     let vrank = ea_scope_rank(vtag)
     if vrank < 0 { return }
     if cell_tag >= 0 {
@@ -1407,21 +1430,38 @@ fn check_ffi_store(store_node: Int, val: Int, cell_tag: Int) ! Diag.Report {
     }
     let vtid = tc_lookup_node_tid(val)
     let is_closure = node_kind(val) == NodeKind.Closure || (vtid >= 0 && tc_tid_kind(tc_resolve(vtid)) == TyKind.Fn)
-    let form = if is_closure { "capture" } else { "write" }
+    let form = if is_closure { "capture" } else if place >= 0 { "assignment" } else { "write" }
     let what = if is_closure { "closure that captures a pointer" } else { "pointer" }
     let vname = node_name(vtag)
     let vlabel = ffi_scope_label(vtag, cell_tag)
-    let cell = if cell_tag >= 0 { "a cell of scope {ffi_scope_label(cell_tag, vtag)}" } else { "an unscoped cell" }
+    let mut dest = if cell_tag >= 0 { "into a cell of scope {ffi_scope_label(cell_tag, vtag)}" } else { "into an unscoped cell" }
+    if place >= 0 {
+        let root = ffi_place_root(place)
+        let held = if cell_tag >= 0 { "scope: {ffi_scope_name(cell_tag, vtag)}" } else { "unscoped" }
+        dest = "into `{node_name(root)}` ({held})"
+        if root != place { dest = "to `{unparse_expr(place)}` {dest}" }
+    }
     let help = if cell_tag >= 0 { "allocate the value from `{node_name(cell_tag)}`, or detach it with `{vname}.take(...)`" } else { "detach the value with `{vname}.take(...)`" }
-    emit_ffi_tag_mismatch(store_node, "{what} from scope {vlabel} stored by {form} into {cell}, which outlives it (tag-mismatch)", help)
+    emit_ffi_tag_mismatch(store_node, "{what} from scope {vlabel} stored by {form} {dest}, which outlives it (tag-mismatch)", help)
 }
 
 // A scope as the author named it, with its line when the other scope in the
 // message has the same name.
 fn ffi_scope_label(tag: Int, other: Int) -> Str {
     let name = node_name(tag)
-    if other >= 0 && other != tag && node_name(other) == name { return "`{name}` (line {node_line(tag)})" }
+    if ffi_scope_names_collide(tag, other) { return "`{name}` (line {node_line(tag)})" }
     "`{name}`"
+}
+
+// The unquoted form of ffi_scope_label, as a tag prints in `(scope: outer)`.
+fn ffi_scope_name(tag: Int, other: Int) -> Str {
+    let name = node_name(tag)
+    if ffi_scope_names_collide(tag, other) { return "{name} (line {node_line(tag)})" }
+    name
+}
+
+fn ffi_scope_names_collide(tag: Int, other: Int) -> Bool {
+    other >= 0 && other != tag && node_name(other) == node_name(tag)
 }
 
 @allow(UnrestoredMutation, IncompleteStateRestore)
@@ -1430,6 +1470,21 @@ fn emit_ffi_tag_mismatch(node: Int, msg: Str, help: Str) ! Diag.Report {
     diag_source_file = diag_file_for_node(node)
     diag_error_at("PtrTagMismatch", CLOSEABLE_ESCAPES_SCOPE, msg, node, help)
     diag_source_file = saved
+}
+
+// Rule 1 for `place = v` and `place op= v`, where `vtag` is the tag of the
+// stored value. Flow-insensitive: the root may hold any value ever stored into
+// it or into a field of it.
+fn ffi_store_by_assignment(node: Int, vtag: Int) ! Diag.Report {
+    let target = node_target(node)
+    check_ffi_store_tagged(node, node_value(node), vtag, ffi_assign_cell_tag(target), target)
+    let root = ffi_place_root(target)
+    if root == -1 { return }
+    let binder = tc_ident_binder_node(root)
+    if binder >= 0 {
+        let prev = ea_node_tags.get(binder) ?? -1
+        ea_set_binder_tag(binder, ea_innermost(prev, vtag))
+    }
 }
 
 // True when `node` is a projection (FieldAccess / IndexExpr chain) whose
@@ -1786,20 +1841,13 @@ fn walk_expr(node: Int, tail_flag: Int) ! Diag.Report {
 
     if kind == NodeKind.Assignment {
         walk_assignment(node)
-        check_ffi_store(node, node_value(node), ffi_assign_cell_tag(node_target(node)))
-        // Flow-insensitive: the binding may hold any value ever assigned to it.
-        let target = node_target(node)
-        if target != -1 && node_kind(target) == NodeKind.Ident {
-            let binder = tc_ident_binder_node(target)
-            if binder >= 0 {
-                let prev = ea_node_tags.get(binder) ?? -1
-                ea_set_binder_tag(binder, ea_innermost(prev, ffi_tag_of(node_value(node))))
-            }
-        }
+        ffi_store_by_assignment(node, ffi_tag_of(node_value(node)))
         return
     }
     if kind == NodeKind.CompoundAssign {
         walk_assignment(node)
+        // `place op= v` stores `place op v`, which carries the tags of both.
+        ffi_store_by_assignment(node, ea_innermost(ffi_tag_of(node_target(node)), ffi_tag_of(node_value(node))))
         return
     }
     if kind == NodeKind.MethodCall {

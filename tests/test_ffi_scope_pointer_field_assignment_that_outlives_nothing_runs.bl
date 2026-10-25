@@ -1,0 +1,69 @@
+// sections/07_trust_modules_metadata.md, *Scope tags*, rule 1: an assignment into a field path
+// stores into the root binding. A store that the root's scope encloses passes the check and
+// must still build and run: a cell declared in the pointer's own scope, an outer pointer stored
+// into an inner cell, and a pointer detached with `take`.
+
+import compile_test_helpers.{compile_and_run}
+
+test "field-path stores the root's scope encloses build and run" {
+    let src = #"
+import std.io
+
+@ffi.struct(header: "sys/uio.h", name: "iovec")
+type IoVec {
+    iov_base: Ptr[U8],
+    iov_len: U64,
+}
+
+fn main() {
+    with ffi.scope() as outer {
+        let a = outer.alloc[U8]()
+        a.write(3)
+        let mut kept = IoVec { iov_base: outer.alloc[U8](), iov_len: 1 }
+        with ffi.scope() as inner {
+            let mut v = IoVec { iov_base: outer.alloc[U8](), iov_len: 1 }
+            v.iov_base = inner.alloc[U8]()
+            v.iov_base.write(7)
+            let mut w = (IoVec { iov_base: inner.alloc[U8](), iov_len: 1 }, 2)
+            w.0.iov_base = a
+            io.println("{v.iov_base.deref()} {w.0.iov_base.deref()}")
+            kept.iov_base = inner.take(inner.alloc[U8]())
+        }
+        kept.iov_base.write(9)
+        kept.iov_len += 1
+        io.println("{kept.iov_base.deref()} {kept.iov_len}")
+    }
+}
+"#
+    let r = compile_and_run(src, "_ffi_field_store_outlives_nothing")
+    assert(r.exit_code == 0, "compile or run failed: {r.out}{r.err_out}")
+    assert_eq(r.out, "7 3\n9 2\n")
+}
+
+test.failing(
+    "tuple-field stores the root's scope encloses build and run",
+    reason: "a Ptr tuple element lowers to void* in C, so t.0.write(v) and t.0.deref() do not compile",
+) {
+    let src = #"
+import std.io
+
+fn main() {
+    with ffi.scope() as outer {
+        let mut kept = (outer.alloc[U8](), 1)
+        with ffi.scope() as inner {
+            let mut t = (outer.alloc[U8](), 1)
+            t.0 = inner.alloc[U8]()
+            t.0.write(7)
+            io.println("{t.0.deref()}")
+            kept.0 = inner.take(inner.alloc[U8]())
+        }
+        kept.0.write(9)
+        kept.1 += 1
+        io.println("{kept.0.deref()} {kept.1}")
+    }
+}
+"#
+    let r = compile_and_run(src, "_ffi_tuple_store_outlives_nothing")
+    assert(r.exit_code == 0, "compile or run failed: {r.out}{r.err_out}")
+    assert_eq(r.out, "7\n9 2\n")
+}
