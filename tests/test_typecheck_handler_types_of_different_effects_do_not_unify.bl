@@ -1,0 +1,247 @@
+// A Handler type is one type only with another Handler of the same effect: Blink has no
+// subtyping and no implicit conversion (sections/03_types.md §3.6 *Traits*), so a
+// `Handler[Metrics]` is not a `Handler[Other]`. Where inference joins two types, as in a list
+// literal, a generic call, a method argument and a `??`, and where the checker asks for one
+// type, as for a trait method's return and an or-pattern's binder, the two handlers do not
+// make one type. The same handler passes at each of those places.
+
+import std.fs
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_reset}
+import std.io
+
+// Every probe starts with these 21 lines, so a row's line is 21 more than in its own text.
+let HEADER = #"effect Metrics {
+    effect Emit {
+        fn counter(name: Str)
+    }
+}
+effect Other {
+    effect Go {
+        fn go(name: Str)
+    }
+}
+fn mk_h() -> Handler[Metrics] {
+    handler Metrics {
+        fn counter(_name: Str) {}
+    }
+}
+fn mk_g() -> Handler[Other] {
+    handler Other {
+        fn go(_name: Str) {}
+    }
+}
+fn pick[T](a: T, _b: T) -> T { a }
+"#
+
+fn probe(src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    let path = "build/typecheck_handler_effect_unify_probe.bl"
+    write_file(path, "{HEADER}{src}")
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+}
+
+fn show(label: Str) {
+    io.println("FAIL: {label}: got:")
+    for d in diag_entries {
+        if d.severity != "info" {
+            io.println("  {d.severity} {d.name} {d.code} {d.line}:{d.col}: {d.message}")
+        }
+    }
+}
+
+fn not_info_count() -> Int {
+    let mut n = 0
+    for d in diag_entries {
+        if d.severity != "info" { n = n + 1 }
+    }
+    n
+}
+
+// Exactly one diagnostic: this name and code at line:col with this message.
+fn only_error(name: Str, code: Str, line: Int, col: Int, message: Str) -> Bool {
+    let mut ok = not_info_count() == 1
+    for d in diag_entries {
+        if d.severity != "info" {
+            if d.severity != "error" || d.name != name || d.code != code { ok = false }
+            if d.line != line || d.col != col { ok = false }
+            if d.message != message { ok = false }
+        }
+    }
+    ok
+}
+
+fn expect_error(label: Str, name: Str, code: Str, line: Int, col: Int, message: Str) {
+    let ok = only_error(name, code, line, col, message)
+    if !ok { show(label) }
+    assert(ok)
+}
+
+fn expect_type_error(label: Str, line: Int, col: Int, message: Str) {
+    expect_error(label, "TypeError", "E0300", line, col, message)
+}
+
+// The TypeError at line:col, then E0301 for `name` at its `let` on `let_line`: the failed join
+// leaves the empty `[]` open, as it does for an Int and a Float in place of the two handlers.
+fn expect_type_error_then_open(label: Str, line: Int, col: Int, message: Str, name: Str, let_line: Int) {
+    let mut ok = not_info_count() == 2
+    let mut seen_type = false
+    let mut seen_open = false
+    for d in diag_entries {
+        if d.severity == "error" && d.name == "TypeError" && d.code == "E0300" && d.line == line && d.col == col && d.message == message {
+            seen_type = true
+        } else if d.severity == "error" && d.name == "CannotInferType" && d.code == "E0301" && d.line == let_line && d.col == 5 && d.message == "cannot infer a type for `{name}`: it is never given one by an annotation or a later use" {
+            seen_open = true
+        }
+    }
+    ok = ok && seen_type && seen_open
+    if !ok { show(label) }
+    assert(ok)
+}
+
+fn expect_clean(label: Str) {
+    let ok = not_info_count() == 0
+    if !ok { show(label) }
+    assert(ok)
+}
+
+test "two handlers of different effects do not join in a list literal" {
+    probe(#"fn main() {
+    let xs = [(mk_h(), []), (mk_g(), [1])]
+    io.println("{xs.len()}")
+}
+"#)
+    expect_type_error_then_open("list literal", 23, 29, "list element 2 has type (Handler[Other], List[Int]) but the list is built from (Handler[Metrics], List[?])", "xs", 23)
+}
+
+test "two handlers of different effects do not join at a generic call" {
+    probe(#"fn main() {
+    let x = pick((mk_h(), []), (mk_g(), [1]))
+    let _ = x
+}
+"#)
+    expect_type_error_then_open("generic call", 23, 32, "argument 2 of `pick` expects (Handler[Metrics], List[?]), got (Handler[Other], List[Int])", "x", 23)
+}
+
+test "two handlers of different effects do not join at a method argument" {
+    probe(#"fn main() {
+    let mut xs = [(mk_h(), [])]
+    xs.push((mk_g(), [1]))
+    io.println("{xs.len()}")
+}
+"#)
+    expect_type_error_then_open("method argument", 24, 13, "argument 1 of `List.push` expects (Handler[Metrics], List[?]), got (Handler[Other], List[Int])", "xs", 23)
+}
+
+test.failing(
+    "two handlers of different effects do not join at a ??",
+    reason: "a `??` default that mismatches an Option of a tuple with an open element reports E0301 twice and no TypeError; an Int and a Float in place of the handlers do the same",
+) {
+    probe(#"fn main() {
+    let a = Some((mk_h(), []))
+    let b = a ?? (mk_g(), [1])
+    let _ = b
+}
+"#)
+    // No `show`: what an expected failure prints lands inside the test report.
+    assert(only_error("TypeError", "E0300", 24, 18, "`??` default type (Handler[Other], List[Int]) does not match the Option's value type (Handler[Metrics], List[?])"))
+}
+
+test "two handlers of different effects do not join at an if" {
+    probe(#"fn main() {
+    let c = true
+    let x = if c { (mk_h(), []) } else { (mk_g(), [1]) }
+    let _ = x
+}
+"#)
+    expect_type_error("if", 24, 13, "if branches have incompatible types: (Handler[Metrics], List[?]) vs (Handler[Other], List[Int])")
+}
+
+test "two handlers of different effects do not join at a match" {
+    probe(#"fn main() {
+    let n = 1
+    let x = match n {
+        1 => (mk_h(), [])
+        _ => (mk_g(), [1])
+    }
+    let _ = x
+}
+"#)
+    expect_type_error("match", 26, 14, "match arms have incompatible types: (Handler[Metrics], List[Int]) vs (Handler[Other], List[Int])")
+}
+
+test "an impl method that returns a handler of another effect does not fit its trait" {
+    probe(#"trait Mk {
+    fn make(self) -> Handler[Metrics]
+}
+type S { n: Int }
+impl Mk for S {
+    fn make(self) -> Handler[Other] {
+        let _ = self.n
+        mk_g()
+    }
+}
+fn main() {
+    let s = S { n: 1 }
+    let _ = s.make()
+}
+"#)
+    expect_error("trait return", "TraitContract", "E0903", 27, 5, "method `make` returns `Handler[Other]`, expected `Handler[Metrics]`")
+}
+
+test "an or-pattern binder that is a handler of two effects is refused" {
+    probe(#"type E {
+    A(Handler[Metrics])
+    B(Handler[Other])
+}
+fn main() {
+    let e = E.A(mk_h())
+    match e {
+        E.A(h) | E.B(h) => {
+            let _ = h
+        }
+    }
+}
+"#)
+    expect_error("or-pattern", "InconsistentPatternBindings", "E0005", 29, 9, "inconsistent bindings in OR-pattern")
+}
+
+test "the same handler joins at each of those places" {
+    probe(#"trait Mk {
+    fn make(self) -> Handler[Metrics]
+}
+type S { n: Int }
+impl Mk for S {
+    fn make(self) -> Handler[Metrics] {
+        let _ = self.n
+        mk_h()
+    }
+}
+type E {
+    A(Handler[Metrics])
+    B(Handler[Metrics])
+}
+fn main() {
+    let xs = [(mk_h(), []), (mk_h(), [1])]
+    let x = pick((mk_h(), []), (mk_h(), [1]))
+    let mut ys = [(mk_h(), [])]
+    ys.push((mk_h(), [1]))
+    let a = Some((mk_h(), []))
+    let b = a ?? (mk_h(), [1])
+    let s = S { n: 1 }
+    let e = E.A(s.make())
+    match e {
+        E.A(h) | E.B(h) => {
+            let _ = h
+        }
+    }
+    let _ = x
+    let _ = b
+    io.println("{xs.len()} {ys.len()}")
+}
+"#)
+    expect_clean("same handler")
+}

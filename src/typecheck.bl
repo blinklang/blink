@@ -2242,6 +2242,15 @@ pub fn tc_handler_effect_root(effect_name: Str) -> Str {
     effect_name.byte_slice(0, dot)
 }
 
+// The one rule for when two handler types are one type, which types_compatible, tc_unify and
+// tc_tid_same_type all ask: the root effect picks the slot a handler installs into.
+// sections/04_effects.md *Type identity* makes a sub-effect's handler a type of its own, with
+// only a parent-to-sub *Effect projection* between them; that is not built yet, so effects of one
+// root still agree here.
+fn tc_handler_effects_agree(a_effect: Str, b_effect: Str) -> Bool {
+    tc_handler_effect_root(a_effect) == tc_handler_effect_root(b_effect)
+}
+
 // The fifth case of the audit above, and the worst of them: TyKind.Ptr did not
 // merely go unconstructed, it did not EXIST. Typecheck only ever checked `Ptr[T]` syntactically
 // (PtrOutsideFFI, InvalidPtrType), so resolve_type_ann fell through to a
@@ -2387,7 +2396,7 @@ fn tc_occurs_in(needle: Int, hay0: Int) -> Int {
     if k == TyKind.List || k == TyKind.Option || k == TyKind.Set || k == TyKind.Channel || k == TyKind.Iterator {
         return tc_occurs_in(needle, e.inner1)
     }
-    if k == TyKind.Ptr || k == TyKind.Handle || k == TyKind.Template {
+    if k == TyKind.Ptr || k == TyKind.Handle || k == TyKind.Template || k == TyKind.Raw {
         return tc_occurs_in(needle, e.inner1)
     }
     if k == TyKind.Result || k == TyKind.Map {
@@ -3608,64 +3617,47 @@ pub fn tc_unify(a0: Int, b0: Int) -> Int {
     let ka = ta.kind
     let kb = tb.kind
     if ka != kb { return 0 }
-    if ka == TyKind.List || ka == TyKind.Option || ka == TyKind.Set || ka == TyKind.Channel || ka == TyKind.Iterator {
-        return tc_unify(ta.inner1, tb.inner1)
-    }
-    // Ptr, Handle and Template keep their one child in inner1 too. Without these arms they
-    // fell through to the scalar tail, so Ptr[Int] and Ptr[Float] unified by kind alone.
-    if ka == TyKind.Ptr || ka == TyKind.Handle || ka == TyKind.Template {
-        return tc_unify(ta.inner1, tb.inner1)
-    }
-    if ka == TyKind.Result || ka == TyKind.Map {
-        if tc_unify(ta.inner1, tb.inner1) == 0 { return 0 }
-        return tc_unify(ta.inner2, tb.inner2)
-    }
-    if ka == TyKind.Tuple {
-        if ta.params_count != tb.params_count { return 0 }
-        let mut i = 0
-        while i < ta.params_count {
-            let ea = ty_param_list.get(ta.params_start + i).unwrap()
-            let eb = ty_param_list.get(tb.params_start + i).unwrap()
-            if tc_unify(ea, eb) == 0 { return 0 }
-            i = i + 1
+    // A match with no wildcard, the same shape as types_compatible, so a kind added to TyKind
+    // does not compile until it says how its type arguments unify.
+    match ka {
+        // No type arguments: the same kind is the same type.
+        TyKind.Int | TyKind.Bool | TyKind.Float | TyKind.Str | TyKind.Void | TyKind.Bytes | TyKind.StringBuilder | TyKind.FfiScope | TyKind.Char | TyKind.Never => 1
+        TyKind.I8 | TyKind.I16 | TyKind.I32 | TyKind.U8 | TyKind.U16 | TyKind.U32 | TyKind.U64 => 1
+        // Each of these answered above, before the kinds were compared; the arms repeat that answer.
+        TyKind.Unknown | TyKind.Typevar => 1
+        // One type argument, in inner1.
+        TyKind.List | TyKind.Option | TyKind.Set | TyKind.Channel | TyKind.Iterator | TyKind.Raw | TyKind.Ptr | TyKind.Handle | TyKind.Template => tc_unify(ta.inner1, tb.inner1)
+        // The effect is in the name slot, not in a child.
+        TyKind.Handler => if tc_handler_effects_agree(ta.name, tb.name) { 1 } else { 0 }
+        TyKind.Result | TyKind.Map => {
+            if tc_unify(ta.inner1, tb.inner1) == 0 { return 0 }
+            tc_unify(ta.inner2, tb.inner2)
         }
-        return 1
-    }
-    // A function type unifies component-wise. Without this arm two fn types fell through to
-    // the scalar tail and answered 1 with nothing bound, so an expected `fn(Int) -> Int` could
-    // not fix the binders of the generic function name standing under it.
-    if ka == TyKind.Fn {
-        if ta.params_count != tb.params_count { return 0 }
-        let mut fa: List[Int] = []
-        let mut fb: List[Int] = []
-        let mut i = 0
-        while i < ta.params_count {
-            fa.push(ty_param_list.get(ta.params_start + i).unwrap())
-            fb.push(ty_param_list.get(tb.params_start + i).unwrap())
-            i = i + 1
+        TyKind.Tuple => tc_unify_params(ta, tb)
+        // A function type unifies component-wise, so an expected `fn(Int) -> Int` fixes the
+        // binders of the generic function name standing under it.
+        TyKind.Fn => {
+            if tc_unify_params(ta, tb) == 0 { return 0 }
+            tc_unify(ta.inner1, tb.inner1)
         }
-        let mut j = 0
-        while j < fa.len() {
-            if tc_unify(fa.get(j).unwrap(), fb.get(j).unwrap()) == 0 { return 0 }
-            j = j + 1
+        TyKind.Struct | TyKind.Enum => {
+            if strip_module_qualifier(ta.name) != strip_module_qualifier(tb.name) { return 0 }
+            // A bare generic name, with no type arguments, unifies with each of its instances.
+            if ta.params_count == 0 || tb.params_count == 0 { return 1 }
+            tc_unify_params(ta, tb)
         }
-        return tc_unify(ta.inner1, tb.inner1)
     }
-    if ka == TyKind.Struct || ka == TyKind.Enum {
-        if strip_module_qualifier(ta.name) != strip_module_qualifier(tb.name) { return 0 }
-        if ta.params_count > 0 && tb.params_count > 0 {
-            if ta.params_count != tb.params_count { return 0 }
-            let mut i = 0
-            while i < ta.params_count {
-                let ea = ty_param_list.get(ta.params_start + i).unwrap()
-                let eb = ty_param_list.get(tb.params_start + i).unwrap()
-                if tc_unify(ea, eb) == 0 { return 0 }
-                i = i + 1
-            }
-        }
-        return 1
+}
+
+fn tc_unify_params(ta: TypePoolEntry, tb: TypePoolEntry) -> Int {
+    if ta.params_count != tb.params_count { return 0 }
+    let mut i = 0
+    while i < ta.params_count {
+        let ea = ty_param_list.get(ta.params_start + i).unwrap()
+        let eb = ty_param_list.get(tb.params_start + i).unwrap()
+        if tc_unify(ea, eb) == 0 { return 0 }
+        i = i + 1
     }
-    // Same concrete scalar kind (Int/Str/Bool/…): already equal by kind.
     1
 }
 
@@ -10250,8 +10242,8 @@ fn tc_fill_binds_from_hint(bare: Str, hint: Int, tparams_sl: Int, binds: Map[Str
         if prev < 0 {
             binds.insert(key, h)
         } else if tc_unify(prev, h) != 0 && tc_bind_has_hole(prev) != 0 && tc_bind_has_hole(h) == 0 {
-            // A success can be vacuous: tc_unify returns 1 without binding on the `?` hole,
-            // a type parameter, and Ptr, Handle and Template, which it has no arm for.
+            // A success can be vacuous: tc_unify returns 1 without binding on the `?` hole
+            // and on a type parameter.
             binds.insert(key, h)
         }
     }
@@ -22104,11 +22096,9 @@ fn types_compatible(a0: Int, b0: Int) -> Int {
         // compares strings where the arms above recurse on tids. There is no child to recurse
         // into — an effect is not a type.
         //
-        // Whether the type system SHOULD go finer than the representation — a `Handler[IO]`
-        // parameter rejecting a `Handler[IO.Print]` argument as too narrow, or accepting it as a
-        // subtype — is a sub-effect variance question the spec does not answer, and it is not
-        // this arm's to decide. Filed as friction.
-        TyKind.Handler => if tc_handler_effect_root(ta.name) == tc_handler_effect_root(tb.name) { 1 } else { 0 }
+        // Whether the type system SHOULD go finer than the representation is not this arm's to
+        // decide; tc_handler_effects_agree holds the rule for every relation.
+        TyKind.Handler => if tc_handler_effects_agree(ta.name, tb.name) { 1 } else { 0 }
         TyKind.Map | TyKind.Result => {
             if tc_type_part_compatible(ta.inner1, tb.inner1) == 0 { return 0 }
             tc_type_part_compatible(ta.inner2, tb.inner2)
@@ -33194,10 +33184,18 @@ fn tc_tid_same_type_at(a0: Int, b0: Int, open: Bool, holes: Map[Int, Int]) -> Bo
     let ta = ty_pool.get(a).unwrap()
     let tb = ty_pool.get(b).unwrap()
     if ta.kind != tb.kind { return false }
-    let k = ta.kind
-    if k == TyKind.Struct || k == TyKind.Enum || k == TyKind.Typevar {
-        if ta.name != tb.name { return false }
+    // A match with no wildcard: a kind added to TyKind does not compile until it says whether
+    // its name is part of its identity.
+    let names_agree = match ta.kind {
+        TyKind.Struct | TyKind.Enum | TyKind.Typevar => ta.name == tb.name
+        TyKind.Handler => tc_handler_effects_agree(ta.name, tb.name)
+        // The name is a spelling of the kind or of its children, which the slots below compare.
+        TyKind.Int | TyKind.Bool | TyKind.Float | TyKind.Str | TyKind.Void | TyKind.Bytes | TyKind.StringBuilder | TyKind.FfiScope | TyKind.Char | TyKind.Never => true
+        TyKind.I8 | TyKind.I16 | TyKind.I32 | TyKind.U8 | TyKind.U16 | TyKind.U32 | TyKind.U64 => true
+        TyKind.List | TyKind.Option | TyKind.Set | TyKind.Channel | TyKind.Iterator | TyKind.Raw | TyKind.Ptr | TyKind.Handle | TyKind.Template => true
+        TyKind.Result | TyKind.Map | TyKind.Tuple | TyKind.Fn | TyKind.Unknown => true
     }
+    if !names_agree { return false }
     if (ta.inner1 < 0) != (tb.inner1 < 0) { return false }
     if (ta.inner2 < 0) != (tb.inner2 < 0) { return false }
     if ta.inner1 >= 0 && !tc_tid_same_type_at(ta.inner1, tb.inner1, open, holes) { return false }
