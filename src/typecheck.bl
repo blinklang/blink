@@ -4494,7 +4494,9 @@ fn bind_target_is_concrete(tid: Int) -> Int {
     let r = tc_resolve(tid)
     if r < 0 || r >= ty_pool.len() { return 0 }
     if tc_is_unbound_metavar(r) != 0 { return 0 }
-    if ty_pool.get(r).unwrap().kind == TyKind.Typevar { return 0 }
+    // The checked body's own parameter is one fixed type there (rigid, §3 Parametricity), so
+    // it commits a binder as firmly as `Int` would. Another declaration's is still open.
+    if ty_pool.get(r).unwrap().kind == TyKind.Typevar { return tc_typevar_is_rigid(r) }
     // The `?` hole is the third spelling of "nothing to commit to", and it arrives here from
     // a closure argument whose own seed left the type-parameter position open. Counting it as
     // concrete let that placeholder claim the type parameter outright, so a later argument
@@ -5160,7 +5162,11 @@ fn tc_pin_generic_args_from_binds(sig: Int, args_sl: Int, arg_tids: List[Int], s
         if pidx < param_count && arg_t >= 0 && tc_tid_has_unbound_metavar(arg_t) != 0 {
             let ptid = fnsig_param_list.get(param_start + pidx).unwrap()
             let concrete_ptid = substitute_typevar_tid(ptid, binds)
+            // A bind to this body's own parameter came from an argument written here, so the
+            // argument's hole is that parameter, as under tc_pin_tail_ret_generic's licence.
+            tc_pin_tparam_binds = 1
             let _ = tc_unify(concrete_ptid, arg_t)
+            tc_pin_tparam_binds = 0
         }
         i = i + 1
     }
@@ -18084,7 +18090,7 @@ fn tc_carrier_nullary_tid(variant: Str, spelled: Str, node: Int) -> Int ! TypeCh
 // (E0320) has no settled field list to offer, so its uses report nothing more.
 fn tc_declared_variant_value_tid(enum_tid: Int, var_idx: Int, spelled: Str, node: Int) -> Int ! TypeCheck.Report, Diag.Report {
     let n = variant_field_count(var_idx)
-    if n == 0 { return tc_nullary_variant_tid(enum_tid, evar_pool.get(var_idx).unwrap().enum_decl, var_idx) }
+    if n == 0 { return tc_nullary_variant_tid(enum_tid, var_idx) }
     if tc_variant_mixes_fields(var_idx) { return tc_error_recovery_tid() }
     let mut params: List[Str] = []
     let mut names: List[Str] = []
@@ -18370,8 +18376,7 @@ fn tc_infer_bare_variant_call(node: Int, fn_name: Str, vpick: BareVariantPick) -
             // A generic-enum variant (`Leaf(1)`) reverse-infers its concrete
             // instance tid (`Tree[Int]`) from the ctor args so codegen mono's
             // it; a non-generic enum keeps the bare tid.
-            let vdecl = evar_pool.get(var_idx).unwrap().enum_decl
-            Some(tc_enum_ctor_instance_tid(venum, vdecl, var_idx, node_args(node), payload_tids))
+            Some(tc_enum_ctor_instance_tid(venum, var_idx, node_args(node), payload_tids))
         }
         BareVariantPick.Ambiguous(carrier, enums) => {
             tc_report_ambiguous_construction(fn_name, carrier, enums, node)
@@ -18973,7 +18978,8 @@ fn tc_report_variant_spread(owner: LitOwner, spread: Int) ! Diag.Report {
 // construction keeps the existing bare behavior unchanged. `args_sl` is the raw
 // call/ctor argument sublist, and `payload_tids` the type tc_check_variant_payload_values
 // answered for each of its arguments.
-fn tc_enum_ctor_instance_tid(enum_tid: Int, decl: Int, var_idx: Int, args_sl: Int, payload_tids: List[Int]) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+fn tc_enum_ctor_instance_tid(enum_tid: Int, var_idx: Int, args_sl: Int, payload_tids: List[Int]) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    let decl = evar_pool.get(var_idx).unwrap().enum_decl
     if decl == -1 { return enum_tid }
     let tparams_sl = node_type_params(decl)
     if tparams_sl == -1 || sublist_length(tparams_sl) == 0 { return enum_tid }
@@ -18987,16 +18993,16 @@ fn tc_enum_ctor_instance_tid(enum_tid: Int, decl: Int, var_idx: Int, args_sl: In
         }
         fi = fi + 1
     }
-    // "Concrete" excludes a typevar AND TYPE_UNKNOWN — an all-typevar / all-unknown
-    // instance carries no more information than the bare tid, so the bare path stays
-    // authoritative (mirrors tc_struct_lit_instance_tid's has_concrete gate). An unbound
-    // metavariable counts: it is a hole the expected type of the whole value fills, and the
-    // boundary check reports it if nothing does.
+    // An all-unknown instance carries no more information than the bare tid, so the bare
+    // path stays authoritative (mirrors tc_struct_lit_instance_tid). An unbound metavariable
+    // counts: it is a hole the expected type of the whole value fills, and the boundary check
+    // reports it if nothing does. So does a typevar of the enclosing generic body (`Leaf(v)`
+    // with `v: T`): the bare head has no slot for that body's monomorphised copy to fill.
     let mut has_concrete = 0
     let mut ci = 0
     while ci < sublist_length(tparams_sl) {
         let bound = binds.get(node_name(sublist_get(tparams_sl, ci))) ?? -1
-        if bound != -1 && type_kind(bound) != TyKind.Typevar && type_kind(bound) != TyKind.Unknown { has_concrete = 1 }
+        if bound != -1 && type_kind(bound) != TyKind.Unknown { has_concrete = 1 }
         if bound != -1 && tc_is_unbound_metavar(tc_resolve(bound)) != 0 { has_concrete = 1 }
         // A variant whose payload mentions none of the enum's parameters binds nothing, so
         // the enclosing annotation is the only place they can come from. Without this the
@@ -19009,17 +19015,14 @@ fn tc_enum_ctor_instance_tid(enum_tid: Int, decl: Int, var_idx: Int, args_sl: In
     let mut ti = 0
     while ti < sublist_length(tparams_sl) {
         let tp = sublist_get(tparams_sl, ti)
-        let tpname = node_name(tp)
-        let bound = binds.get(tpname) ?? -1
+        let bound = binds.get(node_name(tp)) ?? -1
         if bound != -1 {
             arg_tids.push(bound)
         } else {
+            // A slot nothing bound is a hole, as for a generic fn call's binder: the enum's own
+            // parameter is not the checked body's, so naming it would leave a free typevar.
             let h = tc_hint_enum_slot(enum_tid, tparams_sl, ti)
-            if h != -1 {
-                arg_tids.push(h)
-            } else {
-                arg_tids.push(make_typevar_bound(tpname, tp))
-            }
+            arg_tids.push(if h != -1 { h } else { make_metavar() })
         }
         ti = ti + 1
     }
@@ -19090,7 +19093,9 @@ fn tc_infer_enum_structlit_field_values(enum_tid: Int, vname: Str, flds_sl: Int)
     }
 }
 
-fn tc_enum_structlit_instance_tid(enum_tid: Int, decl: Int, vname: Str, flds_sl: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+fn tc_enum_structlit_instance_tid(enum_tid: Int, vname: Str, flds_sl: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    let var_idx = get_variant_by_name(tc_enum_base_tid(enum_tid), vname)
+    let decl = if var_idx == -1 { -1 } else { evar_pool.get(var_idx).unwrap().enum_decl }
     if decl == -1 {
         tc_infer_enum_structlit_field_values(enum_tid, vname, flds_sl)
         return enum_tid
@@ -19101,11 +19106,6 @@ fn tc_enum_structlit_instance_tid(enum_tid: Int, decl: Int, vname: Str, flds_sl:
         return enum_tid
     }
     if flds_sl == -1 { return enum_tid }
-    let var_idx = get_variant_by_name(tc_enum_base_tid(enum_tid), vname)
-    if var_idx == -1 {
-        tc_infer_enum_structlit_field_values(enum_tid, vname, flds_sl)
-        return enum_tid
-    }
     let mut binds: Map[Str, Int] = Map()
     let mut fi = 0
     while fi < sublist_length(flds_sl) {
@@ -19127,9 +19127,10 @@ fn tc_enum_structlit_instance_tid(enum_tid: Int, decl: Int, vname: Str, flds_sl:
     let mut ci = 0
     while ci < sublist_length(tparams_sl) {
         let bound = binds.get(node_name(sublist_get(tparams_sl, ci))) ?? -1
-        if bound != -1 && type_kind(bound) != TyKind.Typevar && type_kind(bound) != TyKind.Unknown { has_concrete = 1 }
         // As in tc_enum_ctor_instance_tid: an unbound metavariable is a hole the expected type
-        // of the whole value fills.
+        // of the whole value fills, and a typevar of the enclosing generic body is a slot its
+        // monomorphised copy fills.
+        if bound != -1 && type_kind(bound) != TyKind.Unknown { has_concrete = 1 }
         if bound != -1 && tc_is_unbound_metavar(tc_resolve(bound)) != 0 { has_concrete = 1 }
         // A variant whose payload mentions none of the enum's parameters binds nothing, so
         // the enclosing annotation is the only place they can come from. Without this the
@@ -19147,11 +19148,7 @@ fn tc_enum_structlit_instance_tid(enum_tid: Int, decl: Int, vname: Str, flds_sl:
             arg_tids.push(bound)
         } else {
             let h = tc_hint_enum_slot(enum_tid, tparams_sl, ti)
-            if h != -1 {
-                arg_tids.push(h)
-            } else {
-                arg_tids.push(make_typevar_bound(node_name(tp), tp))
-            }
+            arg_tids.push(if h != -1 { h } else { make_metavar() })
         }
         ti = ti + 1
     }
@@ -19175,14 +19172,20 @@ fn tc_hint_enum_slot(enum_tid: Int, tparams_sl: Int, ti: Int) -> Int {
     // from sublist_length(tparams_sl) — the bare enum decl tid has params_count==0,
     // so tc_tid_struct_arg_count(enum_tid) would be 0 and never match.
     if tc_tid_struct_arg_count(tc_construct_hint) != sublist_length(tparams_sl) { return -1 }
-    tc_tid_struct_arg_tid(tc_construct_hint, ti)
+    // A slot naming another declaration's parameter, such as a callee formal or the field type
+    // of the literal around the variant, is not solved here and no substitution reaches it.
+    let slot = tc_tid_struct_arg_tid(tc_construct_hint, ti)
+    if tc_tid_has_foreign_typevar(slot) != 0 { return -1 }
+    slot
 }
 
 // A payload-less variant of a generic enum has no argument to infer its binders from, so
 // each comes from the expected type or is a fresh metavariable a later use pins, as `None`
 // does. Left bare, the head names no instance and has no C layout.
-fn tc_nullary_variant_tid(enum_tid: Int, decl: Int, var_idx: Int) -> Int {
-    if decl == -1 || var_idx == -1 { return enum_tid }
+fn tc_nullary_variant_tid(enum_tid: Int, var_idx: Int) -> Int {
+    if var_idx == -1 { return enum_tid }
+    let decl = evar_pool.get(var_idx).unwrap().enum_decl
+    if decl == -1 { return enum_tid }
     if variant_field_count(var_idx) != 0 { return enum_tid }
     let tparams_sl = node_type_params(decl)
     if tparams_sl == -1 || sublist_length(tparams_sl) == 0 { return enum_tid }
@@ -24162,9 +24165,8 @@ fn tc_infer_struct_lit_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Rep
                 let qtid = lookup_named_type(qual)
                 if qtid != -1 && type_kind(qtid) == TyKind.Enum && get_variant_by_name(qtid, vname) != -1 {
                     check_deprecated_type(qual, node)
-                    let edecl = tc_decl_node_for_type(type_to_str(qtid))
                     tc_check_brace_literal(tc_variant_literal_owner(get_variant_by_name(qtid, vname)), node)
-                    return tc_enum_structlit_instance_tid(qtid, edecl, vname, node_fields(node))
+                    return tc_enum_structlit_instance_tid(qtid, vname, node_fields(node))
                 }
                 if tc_report_bad_variant_value(node, qual, vname, 2) {
                     tc_infer_orphan_field_values(node_fields(node))
@@ -24198,7 +24200,7 @@ fn tc_infer_struct_lit_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Rep
                         let hint_t = resolve_alias_tid(site_t)
                         if tc_tid_has_bare_typevar(hint_t) != 0 {
                             let base = tc_enum_base_tid(hint_t)
-                            let inst = tc_enum_structlit_instance_tid(base, evar_pool.get(hint_var_idx).unwrap().enum_decl, sname, node_fields(node))
+                            let inst = tc_enum_structlit_instance_tid(base, sname, node_fields(node))
                             if inst != base { return inst }
                             return site_t
                         }
@@ -24241,9 +24243,8 @@ fn tc_infer_struct_lit_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Rep
                     BareVariantPick.Declared(venum, var_idx) => {
                         // A generic-enum struct-style ctor (`Leaf { value: 1 }`) reverse-
                         // infers its concrete instance tid; non-generic keeps bare.
-                        let vdecl = evar_pool.get(var_idx).unwrap().enum_decl
                         tc_check_brace_literal(tc_variant_literal_owner(var_idx), node)
-                        return tc_enum_structlit_instance_tid(venum, vdecl, sname, node_fields(node))
+                        return tc_enum_structlit_instance_tid(venum, sname, node_fields(node))
                     }
                     BareVariantPick.Ambiguous(carrier, enums) => {
                         tc_report_ambiguous_construction(sname, carrier, enums, node)
@@ -25107,8 +25108,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                         // A generic-enum qualified ctor (`Tree.Leaf(1)`) reverse-infers
                         // its concrete instance tid; a non-generic enum keeps the bare
                         // ctor_tid.
-                        let cdecl = tc_type_decl_nodes.get(tc_written_type_nominal(cname)) ?? -1
-                        return tc_enum_ctor_instance_tid(ctor_tid, cdecl, cvar_idx, cargs_sl, payload_tids)
+                        return tc_enum_ctor_instance_tid(ctor_tid, cvar_idx, cargs_sl, payload_tids)
                     }
                 }
                 if tc_report_bad_variant_value(node, cname, method, 1) {
@@ -26717,10 +26717,9 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             }
             let tid = lookup_named_type(obj_name)
             if tid != -1 && type_kind(tid) == TyKind.Enum {
-                let edecl = tc_type_decl_nodes.get(tc_written_type_nominal(obj_name)) ?? -1
                 let vi = get_variant_by_name(tid, fname)
                 if vi != -1 && variant_field_count(vi) != 0 { return tc_declared_variant_value_tid(tid, vi, "{obj_name}.{fname}", node) }
-                return tc_nullary_variant_tid(tid, edecl, vi)
+                return tc_nullary_variant_tid(tid, vi)
             }
             // A MODULE qualifier. This arm covers an enum type qualifier, a struct
             // field, a tuple index, and this fourth case for `module.name` — without
