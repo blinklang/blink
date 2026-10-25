@@ -1,0 +1,168 @@
+// The expected type of a call reaches the type variables of its result type before the
+// arguments are checked, so a literal argument at such a variable takes the solved type
+// (sections/03_types.md §3.2 *Integer literal range*). A literal at a variable that nothing has
+// solved is Int, and its E0318 offers a help; each help the compiler prints must compile once
+// applied, so each one has a program here that compiles it.
+
+import std.process.{ProcessResult}
+import compile_test_helpers
+
+let DIR = "{compile_test_helpers.scratch_root()}/expected_type_reaches_a_generic_result"
+
+fn sh(cmd: Str) -> ProcessResult {
+    process_run("sh", ["-c", cmd])
+}
+
+fn blink_in_dir(args: Str) -> ProcessResult {
+    sh("B=$(pwd)/build/blink; cd {DIR} && timeout 120 $B {args}")
+}
+
+fn lines(xs: List[Str]) -> Str {
+    xs.join("\n").concat("\n")
+}
+
+fn expect_run(name: Str, src: Str, want: List[Str]) -> Str {
+    write_file("{DIR}/{name}.bl", src)
+    let r = blink_in_dir("run {name}.bl")
+    if r.exit_code != 0 { return "{name}: want exit 0, got {r.exit_code}:\n{r.err_out}" }
+    if r.out != lines(want) { return "{name}: want output\n{lines(want)}got\n{r.out}" }
+    ""
+}
+
+fn report(problems: List[Str]) {
+    let mut bad = false
+    for p in problems {
+        if p != "" {
+            io.eprintln(p)
+            bad = true
+        }
+    }
+    assert(!bad)
+}
+
+let GENERICS = #"fn id[T](x: T) -> T { x }
+fn show[T](x: T) { io.println("{x}") }
+type Box[T] {
+    Full(T)
+    Empty
+}
+type W { k: Int }
+trait Pass { fn pass[T](self, x: T) -> T }
+impl Pass for W { fn pass[T](self, x: T) -> T { let _w = self.k
+    x } }
+"#
+
+test "a literal argument at a variable of the result type takes the expected type" {
+    let _ = sh("rm -rf {DIR}; mkdir -p {DIR}")
+    report([
+        expect_run("solved_before_arguments", GENERICS.concat(#"fn wide(u: U64) -> U64 { id(9223372036854775808) + u }
+fn small(flag: Bool) -> U8 { if flag { id(200) } else { id(1) } }
+fn main() {
+    let w: U64 = id(9223372036854775808)
+    let n: U64 = id(id(18446744073709551615))
+    let t: U64 = { id(9223372036854775808) }
+    let b: U8 = id(254) + 1
+    let i: I8 = id(-128)
+    let c: Box[U64] = Box.Full(9223372036854775808)
+    let p: U64 = W { k: 1 }.pass(9223372036854775808)
+    let o: Option[U64] = id(Some(9223372036854775808))
+    io.println("{w}")
+    io.println("{n}")
+    io.println("{t}")
+    io.println("{b}")
+    io.println("{i}")
+    match c {
+        Box.Full(v) => io.println("{v}")
+        Box.Empty => io.println("empty")
+    }
+    io.println("{p}")
+    io.println("{o.unwrap()}")
+    io.println("{wide(1)}")
+    io.println("{small(true)}")
+}
+"#), [
+            "9223372036854775808",
+            "18446744073709551615",
+            "9223372036854775808",
+            "255",
+            "-128",
+            "9223372036854775808",
+            "9223372036854775808",
+            "9223372036854775808",
+            "9223372036854775809",
+            "200",
+        ]),
+    ])
+    let _ = sh("rm -rf {DIR}")
+}
+
+test "each help printed for a literal at an open variable compiles once applied" {
+    let _ = sh("rm -rf {DIR}; mkdir -p {DIR}")
+    report([
+        expect_run("help_fixtures", GENERICS.concat(#"fn main() {
+    let y = id[U64](9223372036854775808)
+    let mut m = id[U64](9223372036854775808)
+    m = m + 1
+    show[U64](9223372036854775808)
+    let w = W { k: 1 }
+    let q = w.pass[U64](9223372036854775808)
+    let o: Option[U64] = Some(9223372036854775808)
+    let l: List[U64] = [1, 9223372036854775808]
+    let mut xs: List[U64] = []
+    xs.push(9223372036854775808)
+    io.println("{y} {m} {q} {o.unwrap()} {l.get(1).unwrap()} {xs.get(0).unwrap()}")
+}
+"#), [
+            "9223372036854775808",
+            "9223372036854775808 9223372036854775809 9223372036854775808 9223372036854775808 9223372036854775808 9223372036854775808",
+        ]),
+    ])
+    let _ = sh("rm -rf {DIR}")
+}
+
+test "blink check, a per-module build and a one-unit build report the same E0318 at an open variable" {
+    let _ = sh("rm -rf {DIR}; mkdir -p {DIR}")
+    write_file("{DIR}/bad.bl", GENERICS.concat(#"fn pair[A, B](a: A, _b: B) -> A { a }
+fn main() {
+    let y = id(9223372036854775808)
+    let o = Some(9223372036854775808)
+    show(9223372036854775808)
+    let p = pair(9223372036854775808, "a")
+    let mut xs = []
+    xs.push(9223372036854775808)
+    let u: U8 = id(300)
+    io.println("{y} {o.unwrap()} {p} {xs.len()} {u}")
+}
+"#))
+    let check = blink_in_dir("check bad.bl")
+    let per_module = blink_in_dir("build bad.bl")
+    let one_unit = blink_in_dir("build --no-per-module bad.bl")
+    let _ = sh("rm -rf {DIR}")
+    assert(check.exit_code != 0)
+    assert(per_module.exit_code != 0)
+    assert(one_unit.exit_code != 0)
+    let shown = check.err_out.replace("error: check failed\n", "")
+    if shown != per_module.err_out || per_module.err_out != one_unit.err_out {
+        io.eprintln("check:\n{check.err_out}\nbuild:\n{per_module.err_out}\none unit:\n{one_unit.err_out}")
+    }
+    assert(shown == per_module.err_out)
+    assert(per_module.err_out == one_unit.err_out)
+    let want = [
+        "6 error(s) found",
+        "error[IntLiteralOutOfRange]: 9223372036854775808 does not fit in Int, the default type",
+        "help: let y = id[U64](9223372036854775808)",
+        "help: let o: Option[U64] = Some(9223372036854775808)",
+        "help: show[U64](9223372036854775808)",
+        "error[IntLiteralOutOfRange]: the element type is not known here, so the literal is Int",
+        "help: let mut xs: List[U64] = []",
+        "error[IntLiteralOutOfRange]: 300 does not fit in U8 (0 to 255)",
+    ]
+    for w in want {
+        if !check.err_out.contains(w) { io.eprintln("want `{w}` in:\n{check.err_out}") }
+        assert(check.err_out.contains(w))
+    }
+    if check.err_out.contains("ICE") || check.err_out.contains("TypeError") { io.eprintln(check.err_out) }
+    assert(!check.err_out.contains("ICE"))
+    assert(!check.err_out.contains("TypeError"))
+    assert(!check.err_out.contains("(-9223372036854775808 to"))
+}

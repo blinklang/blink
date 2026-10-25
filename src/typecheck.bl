@@ -5189,8 +5189,13 @@ fn tc_seed_closure_args_with_binds(sig: Int, args_sl: Int, arg_tids: List[Int], 
         if pidx < param_count {
             let arg = sublist_get(args_sl, i)
             let formal = substitute_typevar_tid(fnsig_param_list.get(param_start + pidx).unwrap(), binds)
-            tc_seed_expected_into_value(arg, formal)
-            if tc_formal_reaches_closure(formal) != 0 { tids.set(i, infer_type(arg)) }
+            // Only a closure is seeded again. A literal at a bare type variable was checked
+            // with no expected type, and the Int it made the variable is no type the program
+            // wrote, so it must not be range-checked against that Int as if it were.
+            if tc_formal_reaches_closure(formal) != 0 {
+                tc_seed_expected_into_value(arg, formal)
+                tids.set(i, infer_type(arg))
+            }
         }
         i = i + 1
     }
@@ -5465,6 +5470,67 @@ fn tc_expected_parts(val: Int, expected: Int) -> List[ExpectedPart] {
     let slot = tc_carrier_slot_built_by_call(val, d)
     if slot >= 0 {
         parts.push(ExpectedPart { value: sublist_get(node_args(val), 0), expected: tc_tid_child(d, slot) })
+    }
+    parts
+}
+
+// The arguments of call `call` that its expected type reaches, each with the type expected
+// there. The expected type of a call reaches the type variables of its result type before the
+// arguments are checked (sections/03_types.md *Integer literal range*), so an argument meets
+// its formal with those variables solved: `let w: U64 = id(9223372036854775808)` checks the
+// literal against U64. A variant call's payloads meet their field types at the expected
+// instance. A call with written type arguments has its binds from them already. Read before
+// inference, so a call whose declaration is not recorded yet reaches nothing.
+fn tc_call_arg_parts(call: Int, expected: Int) -> List[ExpectedPart] {
+    let mut parts: List[ExpectedPart] = []
+    let k = node_kind(call)
+    if k != NodeKind.Call && k != NodeKind.MethodCall { return parts }
+    let args = node_args(call)
+    if args == -1 || node_type_params(call) != -1 { return parts }
+    let d = resolve_alias_tid(tc_resolve(expected))
+    if tc_tid_is_no_info(d) != 0 { return parts }
+    let var_idx = tc_variant_built_by_call(call, d)
+    if var_idx >= 0 {
+        let mut i = 0
+        while i < sublist_length(args) {
+            let p = tc_variant_payload(var_idx, args, i)
+            if p.field != -1 { parts.push(ExpectedPart { value: p.value, expected: tc_subst_evfield_from_instance(p.field, d) }) }
+            i = i + 1
+        }
+        return parts
+    }
+    let decl = tc_call_decl_node(call)
+    if tc_own_type_param_count(decl) == 0 { return parts }
+    let sig = fnsig_by_decl.get(decl) ?? -1
+    if sig == -1 { return parts }
+    let fs = fnsig_pool.get(sig).unwrap()
+    let mut found: Map[Str, Int] = Map()
+    unify_typevar_binds(fs.ret, d, found)
+    // Only the callee's own binders: an impl's binders are the receiver's to fix.
+    let mut binds: Map[Str, Int] = Map()
+    let binders = node_type_params(decl)
+    let mut b = 0
+    while b < sublist_length(binders) {
+        let bn = sublist_get(binders, b)
+        let key = tc_binder_key(bn, node_name(bn))
+        let t = found.get(key) ?? -1
+        if t >= 0 && bind_target_is_concrete(t) != 0 {
+            binds.insert(node_name(bn), t)
+            binds.insert(key, t)
+        }
+        b = b + 1
+    }
+    if binds.len() == 0 { return parts }
+    let self_offset = if k == NodeKind.MethodCall && fs.params_count > 0 && (fnsig_param_names.get(fs.params_start) ?? "") == "self" { 1 } else { 0 }
+    let mut i = 0
+    while i < sublist_length(args) {
+        let arg = sublist_get(args, i)
+        let mut pidx = i + self_offset
+        if node_kind(arg) == NodeKind.NamedArg { pidx = tc_fnsig_param_index_by_name(fs.params_start, fs.params_count, self_offset, node_name(arg)) }
+        if pidx >= 0 && pidx < fs.params_count {
+            parts.push(ExpectedPart { value: arg, expected: substitute_typevar_tid(fnsig_param_list.get(fs.params_start + pidx).unwrap(), binds) })
+        }
+        i = i + 1
     }
     parts
 }
@@ -5799,7 +5865,7 @@ fn tc_literal_takes(node: Int, tid: Int) ! TypeCheck.Report, Diag.Report {
 // *Negative literals*), so `u + -(2 * 3)` with `u: U8` is an error where `u + -6` is E0318.
 fn tc_literal_tree_takes(node: Int, t: Int) ! TypeCheck.Report, Diag.Report {
     if is_int_literal_node(node) != 0 {
-        if !tc_literal_fits(node, type_kind(t)) { tc_report_int_literal_range(node, t, false, "") }
+        if !tc_literal_fits(node, type_kind(t)) { tc_report_int_literal_range(node, t, false, "", "") }
         tc_publish_node_tid(node, t)
         if node_kind(node) == NodeKind.UnaryOp { tc_publish_node_tid(node_left(node), t) }
         return
@@ -5818,16 +5884,17 @@ fn tc_literal_tree_takes(node: Int, t: Int) ! TypeCheck.Report, Diag.Report {
 }
 
 // error[IntLiteralOutOfRange] (E0318) at `node`, a literal whose value is outside `t`, its
-// type. `default_int` says no expected type reached it, so it is Int by default.
-fn tc_report_int_literal_range(node: Int, t: Int, default_int: Bool, help: Str) ! Diag.Report {
+// type. `default_int` says no expected type reached it, so it is Int by default; `why`, when
+// not "", is the message that says so in place of the default one.
+fn tc_report_int_literal_range(node: Int, t: Int, default_int: Bool, why: Str, help: Str) ! Diag.Report {
     let negative = node_kind(node) == NodeKind.UnaryOp
-    tc_report_int_value_range(node, node_col(node), int_lit_node_digits(node), negative, t, default_int, help)
+    tc_report_int_value_range(node, node_col(node), int_lit_node_digits(node), negative, t, default_int, why, help)
 }
 
 // The E0318 report for a value spelled `digits` (no sign), negative when `negative`, at
 // column `col` of the node's line. A value is reported once: the passes that check a
 // literal reach it more than once.
-fn tc_report_int_value_range(node: Int, col: Int, digits: Str, negative: Bool, t: Int, default_int: Bool, help: Str) ! Diag.Report {
+fn tc_report_int_value_range(node: Int, col: Int, digits: Str, negative: Bool, t: Int, default_int: Bool, why: Str, help: Str) ! Diag.Report {
     if diag_has_error_at(INT_LITERAL_OUT_OF_RANGE, node, col) { return }
     let k = type_kind(t)
     let value = if negative { "-{digits}" } else { digits }
@@ -5843,7 +5910,8 @@ fn tc_report_int_value_range(node: Int, col: Int, digits: Str, negative: Bool, t
         return
     }
     if default_int {
-        diag_error_span_at_notes(name, INT_LITERAL_OUT_OF_RANGE, "{value} does not fit in Int, the default type", node, line, col, 0, help, [])
+        let msg = if why != "" { why } else { "{value} does not fit in Int, the default type" }
+        diag_error_span_at_notes(name, INT_LITERAL_OUT_OF_RANGE, msg, node, line, col, 0, help, [])
         return
     }
     let low = tc_int_literal_limit(k, true)
@@ -7667,6 +7735,9 @@ fn tc_seed_expected_into_value(val: Int, expected: Int) ! TypeCheck.Resolve, Typ
     // each subtree again from every level above it.
     if is_literal_tree_node(v) { return tc_literal_takes(v, expected) }
     for p in tc_expected_parts(v, expected) {
+        tc_seed_expected_into_value(p.value, p.expected)
+    }
+    for p in tc_call_arg_parts(v, expected) {
         tc_seed_expected_into_value(p.value, p.expected)
     }
     if node_kind(v) == NodeKind.BinOp {
@@ -30035,7 +30106,7 @@ fn tc_check_int_pattern_bound(pat: Int, col: Int, b: Str, t: Int) ! Diag.Report 
     if !tc_is_decimal_digits(b) { return }
     let digits = int_lit_decimal(b)
     if !tc_digits_within(digits, tc_int_literal_limit(type_kind(t), false)) {
-        tc_report_int_value_range(pat, col, digits, false, t, false, "")
+        tc_report_int_value_range(pat, col, digits, false, t, false, "", "")
     }
 }
 
@@ -33702,14 +33773,20 @@ fn tc_unclaimed_receiver_is_named(tid: Int) -> Int {
 // type is final only at the same point, and it is skipped in a tree the literals are skipped in.
 fn tc_report_literals_out_of_range(order: List[Int]) ! TypeCheck.Report, Diag.Report {
     let mut skip: Set[Int] = Set()
-    let mut let_of: Map[Int, Int] = Map()
+    let mut sites = LiteralSites { let_of: Map(), owner: Map(), stmts: Set(), push_let: Map() }
     let mut found: List[Int] = []
     let mut shifts: List[Int] = []
     for n in order {
         let k = node_kind(n)
-        if k == NodeKind.LetBinding && node_target(n) == -1 && node_type_name(n) == "" && node_name(n) != "" {
+        if k == NodeKind.LetBinding && node_target(n) == -1 && node_name(n) != "" {
             let v = node_value(n)
-            if v != -1 && is_int_literal_node(v) != 0 { let_of.insert(v, n) }
+            if v != -1 && node_type_name(n) == "" { sites.let_of.insert(v, n) }
+        }
+        if k == NodeKind.ExprStmt && node_value(n) != -1 { sites.stmts.insert(node_value(n)) }
+        if k == NodeKind.Call || k == NodeKind.MethodCall { tc_note_owner_of_each(node_args(n), n, sites.owner) }
+        if k == NodeKind.ListLit { tc_note_owner_of_each(node_elements(n), n, sites.owner) }
+        if k == NodeKind.MethodCall && node_method(n) == "push" && node_obj(n) != -1 && node_kind(node_obj(n)) == NodeKind.Ident {
+            sites.push_let.insert(n, tc_ident_binder_node(node_obj(n)))
         }
         if k == NodeKind.BinOp {
             tc_skip_literal_beside_non_integer(node_left(n), node_right(n), skip)
@@ -33729,17 +33806,197 @@ fn tc_report_literals_out_of_range(order: List[Int]) ! TypeCheck.Report, Diag.Re
         let k = node_kind(n)
         let t = tc_resolve(resolve_alias_tid(tc_lookup_node_tid(n)))
         let default_int = type_kind(t) == TyKind.Int
+        let mut why = ""
         let mut help = ""
-        let decl = let_of.get(n) ?? -1
-        if default_int && decl != -1 && k == NodeKind.IntLit && tc_literal_fits(n, TyKind.U64) {
-            let p = if node_is_pub(decl) != 0 { "pub " } else { "" }
-            let m = if node_is_mut(decl) != 0 { "mut " } else { "" }
-            let kw = if node_is_const(decl) != 0 { "const" } else { "let" }
-            help = "{p}{kw} {m}{node_name(decl)}: U64 = {int_lit_node_digits(n)}"
+        if default_int {
+            let open = tc_open_variable_literal_report(n, sites)
+            why = open.why
+            help = open.help
         }
-        tc_report_int_literal_range(n, t, default_int, help)
+        let decl = sites.let_of.get(n) ?? -1
+        if default_int && decl != -1 && k == NodeKind.IntLit && tc_literal_fits(n, TyKind.U64) {
+            help = "{tc_let_head(decl)}: U64 = {int_lit_node_digits(n)}"
+        }
+        tc_report_int_literal_range(n, t, default_int, why, help)
     }
     for n in shifts.sort() { tc_check_shift_literal_amount(n) }
+}
+
+// Where each literal of a program sits, as far as the help for its E0318 needs to know.
+type LiteralSites {
+    // The value of each `let` with no annotation, to that `let`.
+    let_of: Map[Int, Int]
+    // Each argument and list element, to its call or list literal.
+    owner: Map[Int, Int]
+    // The value of each expression statement.
+    stmts: Set[Int]
+    // Each `.push` on a name, to the node that bound the name, or -1.
+    push_let: Map[Int, Int]
+}
+
+fn tc_note_owner_of_each(items: Int, owner_node: Int, owner: Map[Int, Int]) {
+    if items == -1 { return }
+    let mut i = 0
+    while i < sublist_length(items) {
+        let item = sublist_get(items, i)
+        owner.insert(item, owner_node)
+        if node_kind(item) == NodeKind.NamedArg && node_value(item) != -1 { owner.insert(node_value(item), owner_node) }
+        i = i + 1
+    }
+}
+
+// `let`, `pub let`, `const` or `let mut` and the name, as the declaration wrote them.
+fn tc_let_head(decl: Int) -> Str {
+    let p = if node_is_pub(decl) != 0 { "pub " } else { "" }
+    let m = if node_is_mut(decl) != 0 { "mut " } else { "" }
+    let kw = if node_is_const(decl) != 0 { "const" } else { "let" }
+    "{p}{kw} {m}{node_name(decl)}"
+}
+
+type OpenLiteralReport {
+    why: Str
+    help: Str
+}
+
+// The E0318 message and help for a literal that is Int because it was checked against a type
+// variable nothing had solved (sections/03_types.md §3.2 *No expected type*): a push to a list
+// whose element type is open says so, and the help names the repair that reaches the
+// variable, a type-argument list for a generic call and an annotation on the binding for a
+// constructor, a list literal or a push. A help prints only when applying it compiles, so a
+// callee with a type parameter the literal does not reach, a sibling that U64 would not hold,
+// or a value that is not the whole of a `let` or a statement gets none. Both are "" when the
+// literal sits in none of these.
+fn tc_open_variable_literal_report(n: Int, sites: LiteralSites) -> OpenLiteralReport ! Diag.Report {
+    let none = OpenLiteralReport { why: "", help: "" }
+    let site = sites.owner.get(n) ?? -1
+    if site == -1 { return none }
+    let fits = tc_literal_takes_u64(n)
+    if sites.push_let.contains(site) && tc_tid_kind(resolve_alias_tid(tc_resolve(tc_lookup_node_tid(node_obj(site))))) == TyKind.List {
+        let decl = sites.push_let.get(site) ?? -1
+        let mut help = ""
+        if fits && decl != -1 && tc_is_open_list_let(decl) { help = "{tc_let_head(decl)}: List[U64] = []" }
+        return OpenLiteralReport { why: "the element type is not known here, so the literal is Int", help: help }
+    }
+    if !fits { return none }
+    let decl = sites.let_of.get(site) ?? -1
+    let sk = node_kind(site)
+    if sk == NodeKind.ListLit {
+        let text = tc_index_text(site)
+        if decl == -1 || text == "" || !tc_each_takes_u64(node_elements(site), -1) { return none }
+        return OpenLiteralReport { why: "", help: "{tc_let_head(decl)}: List[U64] = {text}" }
+    }
+    if node_type_params(site) != -1 { return none }
+    let head = tc_call_head_text(site)
+    let args = node_args(site)
+    if head == "" || args == -1 { return none }
+    let carrier = tc_one_param_carrier_named(site, n)
+    if carrier != "" {
+        let text = tc_index_text(site)
+        if decl == -1 || text == "" { return none }
+        return OpenLiteralReport { why: "", help: "{tc_let_head(decl)}: {carrier}[U64] = {text}" }
+    }
+    if !tc_call_literal_reaches_its_one_binder(site, n) { return none }
+    let mut parts: List[Str] = []
+    let mut i = 0
+    while i < sublist_length(args) {
+        let a = tc_index_text(sublist_get(args, i))
+        if a == "" { return none }
+        parts.push(a)
+        i = i + 1
+    }
+    let call = "{head}[U64]({parts.join(", ")})"
+    if decl != -1 { return OpenLiteralReport { why: "", help: "{tc_let_head(decl)} = {call}" } }
+    if sites.stmts.contains(site) { return OpenLiteralReport { why: "", help: call } }
+    none
+}
+
+// A plain literal U64 holds: a negative literal or a tree may not compile under U64.
+fn tc_literal_takes_u64(n: Int) -> Bool {
+    node_kind(n) == NodeKind.IntLit && tc_literal_fits(n, TyKind.U64)
+}
+
+// Whether every item of `items` but `except` is a literal U64 holds.
+fn tc_each_takes_u64(items: Int, except: Int) -> Bool {
+    if items == -1 { return true }
+    let mut i = 0
+    while i < sublist_length(items) {
+        let item = sublist_get(items, i)
+        if item != except && !tc_literal_takes_u64(item) { return false }
+        i = i + 1
+    }
+    true
+}
+
+// `let mut name = []`: the binding a push to an open list would annotate.
+fn tc_is_open_list_let(decl: Int) -> Bool {
+    if node_kind(decl) != NodeKind.LetBinding || node_is_mut(decl) == 0 || node_type_name(decl) != "" { return false }
+    let v = node_value(decl)
+    if v == -1 || node_kind(v) != NodeKind.ListLit { return false }
+    let elems = node_elements(v)
+    elems == -1 || sublist_length(elems) == 0
+}
+
+// The type `Option` or a user enum that constructor call `call` builds, when it has one type
+// parameter and literal `n` is its only payload, at that parameter; else "".
+fn tc_one_param_carrier_named(call: Int, n: Int) -> Str {
+    let args = node_args(call)
+    if sublist_length(args) != 1 || sublist_get(args, 0) != n { return "" }
+    let vdecl = tc_call_decl_node(call)
+    if vdecl == -1 {
+        let head = if node_kind(call) == NodeKind.Call && node_kind(node_left(call)) == NodeKind.Ident { node_name(node_left(call)) } else { "" }
+        if head == "Some" { return "Option" }
+        return ""
+    }
+    if node_kind(vdecl) != NodeKind.TypeVariant { return "" }
+    let mut var_idx = -1
+    for i in evar_slots_by_name.get(node_name(vdecl)) ?? [] {
+        if tc_variant_decl_node(i) == vdecl { var_idx = i }
+    }
+    if var_idx == -1 { return "" }
+    let edecl = evar_pool.get(var_idx).unwrap().enum_decl
+    let tps = if edecl >= 0 { node_type_params(edecl) } else { -1 }
+    if tps == -1 || sublist_length(tps) != 1 { return "" }
+    let tp = sublist_get(tps, 0)
+    if tc_tid_typevar_key(lookup_evfield_type_by_index(var_idx, 0)) != tc_binder_key(tp, node_name(tp)) { return "" }
+    node_name(edecl)
+}
+
+// Whether generic call `call` declares one type parameter, literal `n` is checked against it
+// bare, and every other argument at that parameter is a literal U64 holds, so the list `[U64]`
+// compiles. A parameter the literal does not reach, or a sibling of another type that names a
+// type parameter, would need types the help cannot know.
+fn tc_call_literal_reaches_its_one_binder(call: Int, n: Int) -> Bool {
+    let decl = tc_call_decl_node(call)
+    if decl == -1 || node_kind(decl) != NodeKind.FnDef || tc_own_type_param_count(decl) != 1 { return false }
+    let sig = fnsig_by_decl.get(decl) ?? -1
+    if sig == -1 { return false }
+    let fs = fnsig_pool.get(sig).unwrap()
+    let tp = sublist_get(node_type_params(decl), 0)
+    let key = tc_binder_key(tp, node_name(tp))
+    let self_offset = if node_kind(call) == NodeKind.MethodCall && fs.params_count > 0 && (fnsig_param_names.get(fs.params_start) ?? "") == "self" { 1 } else { 0 }
+    let args = node_args(call)
+    let mut at_n = false
+    let mut i = 0
+    while i < sublist_length(args) {
+        let arg = sublist_get(args, i)
+        let mut pidx = i + self_offset
+        let mut v = arg
+        if node_kind(arg) == NodeKind.NamedArg {
+            pidx = tc_fnsig_param_index_by_name(fs.params_start, fs.params_count, self_offset, node_name(arg))
+            v = node_value(arg)
+        }
+        if pidx < 0 || pidx >= fs.params_count { return false }
+        let formal = fnsig_param_list.get(fs.params_start + pidx).unwrap()
+        let bare = tc_tid_typevar_key(formal) == key
+        if v == n {
+            if !bare { return false }
+            at_n = true
+        } else if tc_tid_has_bare_typevar(formal) != 0 {
+            if !bare || !tc_literal_takes_u64(v) { return false }
+        }
+        i = i + 1
+    }
+    at_n
 }
 
 fn tc_skip_literal_beside_non_integer(lit: Int, other: Int, skip: Set[Int]) {

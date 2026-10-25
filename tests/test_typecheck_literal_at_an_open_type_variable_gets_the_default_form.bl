@@ -1,0 +1,125 @@
+// The expected type of a call reaches the type variables of its result type before the
+// arguments are checked, and a literal checked against a type variable that nothing has solved
+// has no expected type (sections/03_types.md §3.2 *Integer literal range*, *No expected type*).
+// So such a literal that does not fit gets the default-type message, never a range, and the
+// help names the repair that reaches the variable: a type-argument list for a generic call, an
+// annotation on the binding for a constructor, a list literal or a push. A range message is only
+// for a type the program wrote, and no other error follows E0318 for the same literal.
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_reset}
+import std.io
+
+// Every error a source draws, as `line:col code message`, with ` | help: ...` when it has one.
+fn probe_errors(stem: Str, src: Str) -> List[Str] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    let path = "build/{stem}_probe.bl"
+    write_file(path, src)
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _rm = process_run("rm", ["-f", path])
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" {
+            if d.help == "" { out.push("{d.line}:{d.col} {d.code} {d.message}") } else { out.push("{d.line}:{d.col} {d.code} {d.message} | help: {d.help}") }
+        }
+    }
+    out
+}
+
+fn assert_errors(stem: Str, src: Str, want: List[Str]) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    let got = probe_errors(stem, src)
+    if got != want { io.println("FAIL: {stem}:\n got  {got.join(" | ")}\n want {want.join(" | ")}") }
+    assert(got == want)
+}
+
+let GENERICS = #"fn id[T](x: T) -> T { x }
+fn show[T](_x: T) { }
+fn pair[A, B](a: A, _b: B) -> A { a }
+type Box[T] {
+    Full(T)
+    Empty
+}
+type W { k: Int }
+trait Pass { fn pass[T](self, x: T) -> T }
+impl Pass for W { fn pass[T](self, x: T) -> T { let _w = self.k
+    x } }
+"#
+
+fn with_generics(body: Str) -> Str {
+    GENERICS.concat(body)
+}
+
+test "a written type reaches the type variable before the literal is checked" {
+    assert_errors("open_var_reached_by_annotation", with_generics(#"fn f() -> U64 {
+    let w: U64 = id(9223372036854775808)
+    let n: U64 = id(id(9223372036854775808))
+    let t: U64 = { id(9223372036854775808) }
+    let b: U8 = id(3) + 1
+    let i: I8 = id(-128)
+    let c: Box[U64] = Box.Full(9223372036854775808)
+    let p: U64 = W { k: 1 }.pass(9223372036854775808)
+    w + n + t + b.to_u64() + i.to_int().to_u64() + p + match c { Box.Full(v) => v
+        Box.Empty => 0 }
+}
+fn g(u: U64) -> U64 { id(9223372036854775808) + u }
+fn h(flag: Bool) -> U8 { if flag { id(200) } else { id(1) } }
+"#), [])
+}
+
+test "a literal at an open type variable of a call gets the default form and a type-argument help" {
+    assert_errors("open_var_id_let", with_generics(#"fn f() { let y = id(9223372036854775808) }
+"#), ["12:21 E0318 9223372036854775808 does not fit in Int, the default type | help: let y = id[U64](9223372036854775808)"])
+    assert_errors("open_var_id_let_mut", with_generics(#"fn f() { let mut y = id(9223372036854775808)
+    y = 1 }
+"#), ["12:25 E0318 9223372036854775808 does not fit in Int, the default type | help: let mut y = id[U64](9223372036854775808)"])
+    assert_errors("open_var_show_statement", with_generics(#"fn f() { show(9223372036854775808) }
+"#), ["12:15 E0318 9223372036854775808 does not fit in Int, the default type | help: show[U64](9223372036854775808)"])
+    assert_errors("open_var_method_statement", with_generics(#"fn f() { let w = W { k: 1 }
+    w.pass(9223372036854775808) }
+"#), ["13:12 E0318 9223372036854775808 does not fit in Int, the default type | help: w.pass[U64](9223372036854775808)"])
+}
+
+test "a literal at an open variable of a constructor or a list gets a binding annotation help" {
+    assert_errors("open_var_some_let", with_generics(#"fn f() { let o = Some(9223372036854775808) }
+"#), ["12:23 E0318 9223372036854775808 does not fit in Int, the default type | help: let o: Option[U64] = Some(9223372036854775808)"])
+    assert_errors("open_var_list_literal_let", with_generics(#"fn f() { let l = [1, 9223372036854775808] }
+"#), ["12:22 E0318 9223372036854775808 does not fit in Int, the default type | help: let l: List[U64] = [1, 9223372036854775808]"])
+    assert_errors("open_var_push", with_generics(#"fn f() {
+    let mut xs = []
+    xs.push(9223372036854775808)
+}
+"#), ["14:13 E0318 the element type is not known here, so the literal is Int | help: let mut xs: List[U64] = []"])
+    assert_errors("open_var_push_other_name", with_generics(#"fn f() {
+    let mut items = []
+    items.push(9223372036854775808)
+}
+"#), ["14:16 E0318 the element type is not known here, so the literal is Int | help: let mut items: List[U64] = []"])
+}
+
+// A help prints only when applying it compiles, so a callee with a type parameter the literal
+// does not reach, a value no integer type holds, or a call inside a larger value has none.
+test "a literal at an open variable has no help when the repair would not compile" {
+    assert_errors("open_var_pair_no_help", with_generics(#"fn f() { let p = pair(9223372036854775808, "a") }
+"#), ["12:23 E0318 9223372036854775808 does not fit in Int, the default type"])
+    assert_errors("open_var_no_type_holds", with_generics(#"fn f() { let y = id(18446744073709551616) }
+"#), ["12:21 E0318 no integer type holds 18446744073709551616"])
+    assert_errors("open_var_call_inside_value", with_generics(#"fn f() { let y = [id(9223372036854775808)] }
+"#), ["12:22 E0318 9223372036854775808 does not fit in Int, the default type"])
+}
+
+test "a literal that does not fit a written type reached through a call keeps the range form alone" {
+    assert_errors("written_type_through_call", with_generics(#"fn f() -> U8 { let w: U8 = id(300)
+    w }
+fn g() -> U64 { let n: U64 = id(18446744073709551616)
+    n }
+fn h() { let x: Int = id(9223372036854775808) }
+fn k() { let mut xs: List[Int] = []
+    xs.push(9223372036854775808) }
+"#), [
+        "12:31 E0318 300 does not fit in U8 (0 to 255)",
+        "14:33 E0318 no integer type holds 18446744073709551616",
+        "16:26 E0318 9223372036854775808 does not fit in Int (-9223372036854775808 to 9223372036854775807)",
+        "18:13 E0318 9223372036854775808 does not fit in Int (-9223372036854775808 to 9223372036854775807)",
+    ])
+}
