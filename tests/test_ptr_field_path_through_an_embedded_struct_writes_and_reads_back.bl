@@ -1,0 +1,35 @@
+// A field path on a `Ptr` to an `@ffi.struct` walks the embedded `@ffi.struct` fields at any
+// depth (sections/07_trust_modules_metadata.md §9.1.3): `o.inner.p` is field `p` of the
+// `inner_t` embedded in `*o`, so `o.inner.p.write(b)` stores there and `.read()` loads it
+// back. Typecheck accepts the path and checks the stored value against the last field's type.
+// The one-level path is the control: it proves the header and the harness work, so the
+// nested row fails only on the path itself.
+import compile_test_helpers
+
+fn header() -> Str {
+    let path = "{compile_test_helpers.scratch_root()}/ptr_field_path_nested.h"
+    write_file(path, "#include <stdint.h>\nstruct inner_t \{ uint8_t *p; int16_t n; };\nstruct outer_t \{ struct inner_t inner; };\n")
+    path
+}
+
+fn decls(h: Str) -> Str {
+    "@ffi.struct(header: \"{h}\", name: \"inner_t\")\ntype InnerS \{ p: Ptr[U8], n: I16 }\n\n@ffi.struct(header: \"{h}\", name: \"outer_t\")\ntype OuterS \{ inner: InnerS }\n\n"
+}
+
+fn run(tag: Str, body: Str) {
+    let src = "{decls(header())}@trusted(audit: \"ptr-field-path\")\nfn go() ! FFI \{\n    with ffi.scope() as scope \{\n        let o: Ptr[OuterS] = scope.alloc()\n        let i: Ptr[InnerS] = scope.alloc()\n        let b: Ptr[U8] = scope.alloc()\n{body}\n    }\n}\n\nfn main() \{ go() }\n"
+    let r = compile_test_helpers.compile_and_run(src, tag)
+    assert(r.exit_code == 0, "compile or run failed: {r.out}{r.err_out}")
+    assert_eq(r.out, "ok\n")
+}
+
+test "a field of a Ptr to an ffi struct writes and reads back" {
+    run("_ptr_field_path_flat", "        i.p.write(b)\n        i.n.write(-7)\n        if i.p.read().addr() == b.addr() && i.n.read().to_int() == -7 \{ io.println(\"ok\") }")
+}
+
+test.failing(
+    "a field through an embedded ffi struct writes and reads back",
+    reason: "codegen lowers a field address one level deep only, so `o.inner.p` stops with ICE FieldOwnerWithoutDecl",
+) {
+    run("_ptr_field_path_nested", "        o.inner.p.write(b)\n        o.inner.n.write(-7)\n        if o.inner.p.read().addr() == b.addr() && o.inner.n.read().to_int() == -7 \{ io.println(\"ok\") }")
+}
