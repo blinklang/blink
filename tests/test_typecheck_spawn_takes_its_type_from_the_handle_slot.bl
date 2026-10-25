@@ -1,0 +1,99 @@
+// `async.spawn(f)` is `spawn[T](f: fn() -> T) -> Handle[T]`, and the expected type of a call
+// reaches the type variables of its result type before the arguments are checked
+// (sections/03_types.md *Integer literal range*). So a `Handle[U8]` slot makes the task an
+// `fn() -> U8`: its literal is a `U8`, a task that never returns fits, and a task that gives
+// another type is one error, at the task's own return.
+
+import std.fs
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_reset}
+import std.io
+
+fn probe(src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    let path = "build/typecheck_spawn_handle_slot_probe.bl"
+    write_file(path, src)
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+}
+
+// Each diagnostic that is not info, as "line:col code message", in report order.
+fn got() -> List[Str] {
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity != "info" { out.push("{d.line}:{d.col} {d.code} {d.message}") }
+    }
+    out
+}
+
+fn expect(label: Str, want: List[Str]) {
+    let g = got()
+    let ok = g.join("\n") == want.join("\n")
+    if !ok {
+        io.println("FAIL: {label}: got:")
+        for line in g { io.println("  {line}") }
+    }
+    assert(ok)
+}
+
+test "a literal task body takes the integer type of the Handle slot" {
+    probe(#"fn main() ! Async {
+    let a: Handle[U8] = async.spawn(fn() { 1 })
+    let b: Handle[I32] = async.spawn(fn() { 5 })
+    let c: Handle[Option[U8]] = async.spawn(fn() { Some(1) })
+    let d: Handle[List[U8]] = async.spawn(fn() { [1, 2] })
+    let _ = a
+    let _ = b
+    let _ = c
+    let _ = d
+}
+"#)
+    expect("literal body", [])
+}
+
+test "a payload-free carrier task body takes the rest of its type from the Handle slot" {
+    probe(#"fn main() ! Async {
+    let a: Handle[Option[Int]] = async.spawn(fn() { None })
+    let b: Handle[Result[Int, Str]] = async.spawn(fn() { Ok(1) })
+    let c: Handle[Result[Int, Str]] = async.spawn(fn() { Err("e") })
+    let _ = a
+    let _ = b
+    let _ = c
+}
+"#)
+    expect("carrier body", [])
+}
+
+test "a task that never returns fits a Handle slot at a let and a return" {
+    probe(#"fn stop() -> Never { panic("x") }
+fn mk() -> Handle[Int] {
+    async.spawn(fn() { stop() })
+}
+fn main() ! Async {
+    let h: Handle[Int] = async.spawn(fn() { panic("x") })
+    let _ = h
+    let _ = mk()
+}
+"#)
+    expect("diverging body", [])
+}
+
+test "a literal that does not fit the slot's integer type is E0318 and nothing else" {
+    probe(#"fn main() ! Async {
+    let a: Handle[U8] = async.spawn(fn() { 300 })
+    let _ = a
+}
+"#)
+    expect("literal out of range", ["2:44 E0318 300 does not fit in U8 (0 to 255)"])
+}
+
+test "a task body of another type is one error at the task's return" {
+    probe(#"fn main() ! Async {
+    let c: Handle[Str] = async.spawn(fn() { 1 })
+    let _ = c
+}
+"#)
+    expect("other type", ["2:45 E0300 return value type Int does not match function `closure` return type Str"])
+}

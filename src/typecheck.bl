@@ -5515,6 +5515,14 @@ fn tc_expected_parts(val: Int, expected: Int) -> List[ExpectedPart] {
     parts
 }
 
+// The `async.spawn(f)` builtin, by the test infer_type's spawn arm makes: a local named
+// `async` is not the module.
+fn tc_is_async_spawn_call(call: Int) -> Bool {
+    if node_kind(call) != NodeKind.MethodCall || node_method(call) != "spawn" { return false }
+    let obj = node_obj(call)
+    obj != -1 && node_kind(obj) == NodeKind.Ident && node_name(obj) == "async" && tc_tid_is_no_info(nr_get_type("async")) != 0
+}
+
 // The arguments of call `call` that its expected type reaches, each with the type expected
 // there. The expected type of a call reaches the type variables of its result type before the
 // arguments are checked (sections/03_types.md *Integer literal range*), so an argument meets
@@ -5530,6 +5538,18 @@ fn tc_call_arg_parts(call: Int, expected: Int) -> List[ExpectedPart] {
     if args == -1 || node_type_params(call) != -1 { return parts }
     let d = resolve_alias_tid(tc_resolve(expected))
     if tc_tid_is_no_info(d) != 0 { return parts }
+    // `async.spawn(f)` is `spawn[T](f: fn() -> T) -> Handle[T]` with no recorded signature, so
+    // its T is bound here: a `Handle[U8]` slot makes `f` an `fn() -> U8`. infer_type's spawn
+    // arm reads T from the body of an un-annotated closure, so that body meets T too.
+    if tc_is_async_spawn_call(call) && tc_tid_kind(d) == TyKind.Handle && sublist_length(args) == 1 {
+        let f = sublist_get(args, 0)
+        let inner = tc_tid_child(d, 0)
+        parts.push(ExpectedPart { value: f, expected: make_fn_type(inner, []) })
+        if node_kind(f) == NodeKind.Closure && node_type_ann(f) == -1 && (node_params(f) == -1 || sublist_length(node_params(f)) == 0) {
+            parts.push(ExpectedPart { value: node_body(f), expected: inner })
+        }
+        return parts
+    }
     let var_idx = tc_variant_built_by_call(call, d)
     if var_idx >= 0 {
         let mut i = 0
@@ -22036,8 +22056,7 @@ fn types_compatible(a0: Int, b0: Int) -> Int {
     // via Enum.to_int() / Enum.from_int(n) -> Option[Enum].
     if ka != kb { return 0 }
     // A match with no wildcard, so a kind added to TyKind does not compile until it says how
-    // its type arguments compare. An if-chain that ended in `return 1` let Channel and Handle
-    // through on kind alone: a Channel[Int] fit a Channel[Str] slot.
+    // its type arguments compare.
     match ka {
         // No type arguments: the same kind is the same type.
         TyKind.Int | TyKind.Bool | TyKind.Float | TyKind.Str | TyKind.Void | TyKind.Bytes | TyKind.StringBuilder | TyKind.FfiScope | TyKind.Char => 1
@@ -25131,6 +25150,12 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                         // unbound metavar (tc_tid_has_unbound_metavar) — so a compound like
                         // Handle[List[?]] or Handle[Result[?,?]] is re-walked too, not just
                         // a bare Handle[?].
+                        //
+                        // A `Handle[T]` slot declares T for the closure (tc_call_arg_parts), and the
+                        // closure's body is held to it at its own return, as a generic call's is.
+                        // So T answers here, and a body that misses it is reported once, there.
+                        let sp_ctx = tc_closure_context_ret(tc_lookup_node_tid(sp_cls))
+                        if sp_ctx >= 0 { return make_handle_type(sp_ctx) }
                         let sp_memo = tc_lookup_node_tid(node)
                         if sp_memo != -1 && tc_tid_kind(sp_memo) == TyKind.Handle {
                             let memo_inner = tc_tid_child(sp_memo, 0)
