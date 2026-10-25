@@ -1,9 +1,10 @@
 #!/bin/bash
 # Proves scripts/check_build_warnings.sh goes red on one warning, counts a site
 # once when both entry points report it, never drops a warning that has no
-# span, and exits 2 (not 0) when the check itself did not run clean. Runs the
-# script against a fake blink that prints canned `check --json` output, so it
-# takes well under a second and never touches build/.
+# span, and exits 2 (not 0) when the check itself did not run clean or its
+# exit code disagrees with the rows. Runs the script against a fake blink
+# that prints canned `check --strict --json` output, so it takes well under a
+# second and never touches build/.
 set -u
 cd "$(dirname "$0")/.."
 
@@ -11,18 +12,35 @@ WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 fail=0
 
-# The fake answers `check --json src/<entry>.bl` with $FAKE/<entry>.out on
-# stdout, $FAKE/<entry>.err on stderr and the exit code in $FAKE/<entry>.rc.
-# Like the real blink, it prints the diagnostic rows on stderr and only the
-# status line on stdout.
+# The fake answers `check --strict --json src/<entry>.bl` with $FAKE/<entry>.out
+# on stdout and $FAKE/<entry>.err on stderr. Like the real blink, it prints the
+# diagnostic rows on stderr and only the status line on stdout. Under
+# --strict a warning or error row makes it exit 1 with status error, and an
+# ice row exit 101 with status ice, so a case names its rows and the fake
+# keeps the rc and status in step. $FAKE/<entry>.rc sets the exit code
+# instead, and $FAKE/<entry>.keepstatus keeps the status line as written, for
+# a case where the compiler and its rows disagree.
 FAKE="$WORK/fake"
 cat > "$WORK/blink" <<'EOF'
 #!/bin/bash
-[ "$1" = check ] && [ "$2" = --json ] || { echo "fake blink: unexpected args: $*" >&2; exit 9; }
-e=$(basename "$3" .bl)
-[ -f "$FAKE/$e.out" ] && cat "$FAKE/$e.out"
+[ "$1" = check ] && [ "$2" = --strict ] && [ "$3" = --json ] || { echo "fake blink: unexpected args: $*" >&2; exit 9; }
+e=$(basename "$4" .bl)
+if [ -f "$FAKE/$e.rc" ]; then
+    rc=$(cat "$FAKE/$e.rc")
+elif cat "$FAKE/$e.out" "$FAKE/$e.err" 2>/dev/null | grep -q '"severity":"ice"'; then
+    rc=101
+elif cat "$FAKE/$e.out" "$FAKE/$e.err" 2>/dev/null | grep -q -E '"severity":"(warning|error)"'; then
+    rc=1
+else
+    rc=0
+fi
+case "$rc" in 1) status=error ;; 101) status=ice ;; *) status=ok ;; esac
+if [ -f "$FAKE/$e.out" ]; then
+    if [ -f "$FAKE/$e.keepstatus" ]; then cat "$FAKE/$e.out"
+    else sed "s/\"status\":\"ok\"/\"status\":\"$status\"/" "$FAKE/$e.out"; fi
+fi
 [ -f "$FAKE/$e.err" ] && cat "$FAKE/$e.err" >&2
-exit "$(cat "$FAKE/$e.rc" 2>/dev/null || echo 0)"
+exit "$rc"
 EOF
 chmod +x "$WORK/blink"
 export FAKE
@@ -117,6 +135,24 @@ expect 1 "a stderr warning with a tab in the line still counts" \
 reset; echo "resolving dependencies..." > "$FAKE/cli.err"
 expect 0 "stderr chatter that is not a warning passes"
 
+reset; echo 'src/a.bl:1:5: W0600 variable `x` is never read' > "$FAKE/cli.err"; echo 1 > "$FAKE/cli.rc"
+expect 2 "the compiler says it warned but the gate read none" \
+    "(the compiler exited 1 under --strict, so it warned, but the gate read no warning)" \
+    'stderr: src/a.bl:1:5: W0600' 'stdout: {"status":"error"'
+
+reset; add cli "$W_UNUSED"; echo 0 > "$FAKE/cli.rc"
+expect 2 "the gate read a warning the compiler did not count" \
+    "(the gate read 1 warning row(s) but the compiler exited 0 under --strict)" \
+    'stderr: {"severity":"warning"'
+
+reset; printf '%s\n' 'src/a.bl:1:5: W0600 variable `x` is never read' 'note: see warning here' > "$FAKE/cli.err"
+echo 1 > "$FAKE/cli.rc"
+expect 2 "stderr text naming a warning cannot hide a warning the gate did not read" \
+    "(the compiler exited 1 under --strict, so it warned, but the gate read no warning)"
+
+reset; add cli "$W_UNUSED"; touch "$FAKE/cli.keepstatus"
+expect 2 "a warned check whose status line still says ok fails" "(it printed no single error status line)"
+
 reset; add cli "$E_ROW"
 expect 2 "an error row means the check did not run clean" "src/a.bl:1:1 E0200" "(it reported an error)"
 
@@ -124,7 +160,10 @@ reset; add_out cli "$E_ROW"
 expect 2 "an error row on stdout means the check did not run clean" "src/a.bl:1:1 E0200" "(it reported an error)"
 
 reset; add cli '{"severity":"ice","name":"Ice","code":"I0001","message":"boom"}'
-expect 2 "an ice row means the check did not run clean" "(it reported an error)"
+expect 2 "an ice means the check did not run clean" "(check exited 101)"
+
+reset; add cli '{"severity":"ice","name":"Ice","code":"I0001","message":"boom"}'; echo 0 > "$FAKE/cli.rc"
+expect 2 "an ice row fails even when the exit code says clean" "(it reported an error)"
 
 reset; add cli '{"severity":"advice","name":"X","code":"A1","message":"m"}'
 expect 2 "a row of a severity the gate does not know fails" "A1 X: m" "(it printed a row of a severity this gate does not know)"

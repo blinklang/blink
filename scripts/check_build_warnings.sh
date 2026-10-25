@@ -1,9 +1,9 @@
 #!/bin/bash
 # The warning gate of `task ci`: the compiler's own build must print no
-# warning. Runs `blink check --json` on both compiler entry points with this
-# tree's compiler (gen1), so the lint that judges src/ and lib/ is the lint
-# in src/. gen0's lint is older than the tree and would judge wrongly both
-# ways. check runs every stage that warns in a build (check_pipeline.bl).
+# warning. Runs `blink check --strict --json` on both compiler entry points
+# with this tree's compiler (gen1), so the lint that judges src/ and lib/ is
+# the lint in src/. gen0's lint is older than the tree and would judge wrongly
+# both ways. check runs every stage that warns in a build (check_pipeline.bl).
 #
 # A site counts once however many entry points reach it, so the count does
 # not move when an import moves. Each site prints as
@@ -11,11 +11,19 @@
 # `<no location>` and still counts. A warning that reaches stderr as text
 # counts too: the gate never drops one because it did not come as JSON.
 #
+# --strict makes the compiler's exit code a second, independent signal: 1
+# when it warned, 0 when it did not. It says whether, not how many. A parser
+# bug that drops a warning would read as a clean build, so when the exit code
+# and the JSON warning rows the gate read disagree, the gate fails and prints
+# the raw output. Text lines stay out of this check: the compiler does not
+# count them, and chatter that names a warning must not stand in for a row.
+#
 #   scripts/check_build_warnings.sh   (env WARNING_GATE_BLINK, default build/gen1/bin/blink)
 #
 # Exit 0 with no warning, 1 with one or more, 2 when a check did not run
-# clean (non-zero exit, an error or ice row, no ok status line, or a row
-# the gate cannot read), since such a run cannot vouch for a count of 0.
+# clean (an exit other than 0 or 1, an error or ice row, a status line that
+# does not match the exit, a row the gate cannot read, or an exit code that
+# disagrees with the rows), since such a run cannot vouch for its count.
 set -u
 cd "$(dirname "$0")/.." || exit 2
 blink="${WARNING_GATE_BLINK:-build/gen1/bin/blink}"
@@ -36,7 +44,7 @@ trap 'rm -rf "$work"' EXIT
 pids=()
 for e in $entries; do
     n=$(basename "$e" .bl)
-    ("$blink" check --json "$e" > "$work/$n.out" 2> "$work/$n.err") &
+    ("$blink" check --strict --json "$e" > "$work/$n.out" 2> "$work/$n.err") &
     pids+=("$!")
 done
 rcs=()
@@ -74,10 +82,14 @@ for e in $entries; do
     n=$(basename "$e" .bl)
     rc=${rcs[$i]}; i=$((i + 1))
     { rows "$work/$n.out" bad; rows "$work/$n.err" text; } > "$work/$n.rows"
-    awk -F'\t' '$1 == "warning" { sub(/^[^\t]*\t/, ""); print }' "$work/$n.rows" >> "$work/sites"
-    awk -F'\t' '$1 == "text" { sub(/^[^\t]*\t/, ""); if (/(^|[^[:alnum:]_])warning([^[:alnum:]_]|$)/) print "stderr: " $0 }' "$work/$n.rows" >> "$work/sites"
+    awk -F'\t' '$1 == "warning" { sub(/^[^\t]*\t/, ""); print }' "$work/$n.rows" > "$work/$n.sites"
+    awk -F'\t' '$1 == "text" { sub(/^[^\t]*\t/, ""); if (/(^|[^[:alnum:]_])warning([^[:alnum:]_]|$)/) print "stderr: " $0 }' "$work/$n.rows" >> "$work/$n.sites"
+    cat "$work/$n.sites" >> "$work/sites"
+    json_n=$(awk -F'\t' '$1 == "warning" { n++ } END { print n + 0 }' "$work/$n.rows")
+    if [ "$rc" = 1 ]; then want=error; else want=ok; fi
     why=""
-    if [ "$rc" != 0 ]; then
+    raw=0
+    if [ "$rc" != 0 ] && [ "$rc" != 1 ]; then
         why="check exited $rc"
     elif grep -q -E '^(error|ice)'$'\t' "$work/$n.rows"; then
         why="it reported an error"
@@ -85,12 +97,24 @@ for e in $entries; do
         why="it printed a row this gate cannot read"
     elif grep -q -v -E '^(warning|status|text)'$'\t' "$work/$n.rows"; then
         why="it printed a row of a severity this gate does not know"
-    elif [ "$(awk -F'\t' '$1 == "status" { print $2 }' "$work/$n.rows")" != ok ]; then
-        why="it printed no single ok status line"
+    elif [ "$(awk -F'\t' '$1 == "status" { print $2 }' "$work/$n.rows")" != "$want" ]; then
+        why="it printed no single $want status line"
+    elif [ "$rc" = 1 ] && [ "$json_n" -eq 0 ]; then
+        why="the compiler exited 1 under --strict, so it warned, but the gate read no warning"
+        raw=1
+    elif [ "$rc" = 0 ] && [ "$json_n" -ne 0 ]; then
+        why="the gate read $json_n warning row(s) but the compiler exited 0 under --strict"
+        raw=1
     fi
     if [ -n "$why" ]; then
         echo "warning-gate: FAIL the check of $e did not run clean ($why):"
-        awk -F'\t' '$1 != "status" { sub(/^[^\t]*\t/, ""); print "  " $0 }' "$work/$n.rows"
+        # The parser and the compiler disagree, so the parser's rows are suspect.
+        if [ "$raw" = 1 ]; then
+            sed 's/^/  stdout: /' "$work/$n.out"
+            sed 's/^/  stderr: /' "$work/$n.err"
+        else
+            awk -F'\t' '$1 != "status" { sub(/^[^\t]*\t/, ""); print "  " $0 }' "$work/$n.rows"
+        fi
         broken=1
     fi
 done
