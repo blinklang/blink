@@ -5,7 +5,7 @@ import parser.{
     node_then_body, node_else_body, node_scrutinee, node_guard, node_value,
     node_target, node_iterable, node_is_mut, node_start, node_end, node_obj,
     node_method, node_index, node_params, node_args, node_stmts, node_arms,
-    node_fields, node_elements,
+    node_fields, node_elements, node_line, node_col,
     node_push_value_child_ids, sublist_get, sublist_length,
 }
 import diagnostics.{
@@ -586,126 +586,161 @@ fn fn_writes_to(fn_name: Str, global_name: Str) -> Int {
 }
 
 // ── W0550/W0551 Save/Restore pattern detection ──────────────────────
-
-// Per-block analysis scratch state. Only the saved globals are tracked: W0550's
-// per-call gate reads sr_save_global, and W0551's function-scoped gate is
-// precomputed by the sr_scan_for_patterns pre-pass (which owns its own scratch).
-let mut sr_save_global: List[Str] = []
-let mut sr_current_fn: Str = ""
-
-// Function-scoped gating flag (§4.16.7): 1 if ANY block in the current function
-// exhibits at least one save→restore pairing. W0551's gating predicate is
-// function-wide ("save/restore patterns elsewhere in the function indicates
-// speculative intent"), so this is computed in a pre-pass over the whole body
-// before any call is checked, then read at each call site.
-let mut sr_fn_has_pattern: Int = 0
-
-fn sr_reset() {
-    sr_save_global = []
-    sr_fn_has_pattern = 0
-}
-
-fn sr_add_save(global_name: Str) {
-    sr_save_global.push(global_name)
-}
-
-fn sr_is_saved_global(name: Str) -> Int {
-    let mut i = 0
-    while i < sr_save_global.len() {
-        if sr_save_global.get(i).unwrap() == name {
-            return 1
-        }
-        i = i + 1
-    }
-    0
-}
-
-// ── Function-scoped save/restore pattern pre-pass ───────────────────
 //
-// W0551 gates on whether the function is speculative (§4.16.7: "save/restore
-// patterns elsewhere in the function"), but the emitting scan checks calls
-// interleaved with its block walk — so a call in an early block can't yet know
-// a save/restore pattern lives in a later block. This separate pre-pass settles
-// sr_fn_has_pattern over the whole body first. It owns private scratch lists so
-// it never disturbs the emitting scan's sr_save_global.
+// §4.16.7 reads the text of one function. One walk records, in source order, each
+// save, each assignment to a module global and each call to a module fn. An event's
+// index in the lists is its place in the text, so "after the save" and "before the
+// restore" compare indexes. Pairs, their class and each call's check come from the
+// events once the walk is done.
 
-let mut srp_save_local: List[Str] = []
-let mut srp_save_global: List[Str] = []
+type SrEventKind {
+    Save, Assign, Call,
+}
 
-fn srp_is_save_local(name: Str) -> Str {
-    let mut i = 0
-    while i < srp_save_local.len() {
-        if srp_save_local.get(i).unwrap() == name {
-            return srp_save_global.get(i).unwrap()
+type SrWalk {
+    kinds: List[SrEventKind],
+    // The global a save or an assignment names, or the callee of a call.
+    names: List[Str],
+    nodes: List[Int],
+    // For an assignment that restores: the index of the save event it restores.
+    restores: List[Int],
+    // The locals in scope, innermost last, with the save event each holds or -1.
+    scope_names: List[Str],
+    scope_saves: List[Int],
+}
+
+fn sr_walk_new() -> SrWalk {
+    SrWalk { kinds: [], names: [], nodes: [], restores: [], scope_names: [], scope_saves: [] }
+}
+
+fn sr_push_event(w: SrWalk, kind: SrEventKind, name: Str, node: Int, restores: Int) {
+    w.kinds.push(kind)
+    w.names.push(name)
+    w.nodes.push(node)
+    w.restores.push(restores)
+}
+
+// The innermost local named `name`, or -1 when no local has that name.
+fn sr_scope_find(w: SrWalk, name: Str) -> Int {
+    let mut i = w.scope_names.len() - 1
+    while i >= 0 {
+        if w.scope_names.get(i).unwrap() == name {
+            return i
         }
-        i = i + 1
+        i = i - 1
+    }
+    -1
+}
+
+// A local shadows the global of the same name.
+fn sr_names_global(w: SrWalk, name: Str) -> Bool {
+    is_global(name) != 0 && sr_scope_find(w, name) < 0
+}
+
+fn sr_scope_truncate(w: SrWalk, len: Int) {
+    while w.scope_names.len() > len {
+        let _ = w.scope_names.pop()
+        let _ = w.scope_saves.pop()
+    }
+}
+
+// The global that a save's value reads: `G` or `G.clone()`, else "".
+fn sr_saved_global(w: SrWalk, val: Int) -> Str {
+    if val == -1 {
+        return ""
+    }
+    let kind = node_kind(val)
+    if kind == NodeKind.Ident && sr_names_global(w, node_name(val)) {
+        return node_name(val)
+    }
+    if kind == NodeKind.MethodCall && node_method(val) == "clone" {
+        let args = node_args(val)
+        let obj = node_obj(val)
+        if (args == -1 || sublist_length(args) == 0) && obj != -1 && node_kind(obj) == NodeKind.Ident && sr_names_global(w, node_name(obj)) {
+            return node_name(obj)
+        }
     }
     ""
 }
 
-// Block branch saves/restores srp_save_local/global around the nested scan;
-// the recursive descent also sets sr_fn_has_pattern (the accumulated output of
-// this pre-pass), an intended broad write outside that pattern.
-@allow(UnrestoredMutation, IncompleteStateRestore)
-fn sr_scan_for_patterns_block(stmts_sl: Int, kids: List[Int]) {
-    if stmts_sl == -1 {
-        return
-    }
-    let outer_l = srp_save_local
-    let outer_g = srp_save_global
-    srp_save_local = []
-    srp_save_global = []
-
-    let num_stmts = sublist_length(stmts_sl)
-    let mut i = 0
-    while i < num_stmts {
-        let stmt = sublist_get(stmts_sl, i)
-        let kind = node_kind(stmt)
-
-        if kind == NodeKind.LetBinding {
-            let local_name = node_name(stmt)
-            let val = node_value(stmt)
-            if val != -1 && node_kind(val) == NodeKind.Ident {
-                let val_name = node_name(val)
-                if is_global(val_name) != 0 {
-                    srp_save_local.push(local_name)
-                    srp_save_global.push(val_name)
-                }
-            }
-        }
-
-        if kind == NodeKind.Assignment {
-            let target = node_target(stmt)
-            let val = node_value(stmt)
-            if target != -1 && val != -1 {
-                if node_kind(target) == NodeKind.Ident && node_kind(val) == NodeKind.Ident {
-                    let tname = node_name(target)
-                    let vname = node_name(val)
-                    let mapped = srp_is_save_local(vname)
-                    if mapped != "" && mapped == tname {
-                        sr_fn_has_pattern = 1
-                    }
-                }
-            }
-        }
-
+fn sr_walk_children(w: SrWalk, node: Int, kids: List[Int]) {
+    let base = kids.len()
+    node_push_value_child_ids(node, kids)
+    let end = kids.len()
+    let mut i = base
+    while i < end {
+        sr_walk_node(w, kids.get(i).unwrap(), kids)
         i = i + 1
     }
-
-    // Recurse into nested blocks so a pattern anywhere in the function is found.
-    i = 0
-    while i < num_stmts {
-        sr_scan_for_patterns_node(sublist_get(stmts_sl, i), kids)
-        i = i + 1
-    }
-
-    srp_save_local = outer_l
-    srp_save_global = outer_g
+    sr_drop_kids_to(kids, base)
 }
 
-// Walks the same blocks as sr_scan_node, so the W0551 gate and the emitting
-// scan agree on which blocks exist.
-fn sr_scan_for_patterns_node(node: Int, kids: List[Int]) {
+fn sr_walk_let(w: SrWalk, node: Int, kids: List[Int]) {
+    let val = node_value(node)
+    sr_walk_node(w, val, kids)
+    let local = node_name(node)
+    // A destructuring `let` and `let _` bind no one name that a restore could read.
+    if local == "" || local == "_destructure" {
+        return
+    }
+    let global = sr_saved_global(w, val)
+    let mut save = -1
+    if global != "" {
+        save = w.kinds.len()
+        sr_push_event(w, SrEventKind.Save, global, node, -1)
+    }
+    w.scope_names.push(local)
+    w.scope_saves.push(save)
+}
+
+// The name a place is rooted at: `x` for `x`, `x.f`, `x[i]` and `x.f[i].g`, else "".
+fn sr_place_root(place: Int) -> Str {
+    let mut root = place
+    while root != -1 && (node_kind(root) == NodeKind.FieldAccess || node_kind(root) == NodeKind.IndexExpr) {
+        root = node_obj(root)
+    }
+    if root != -1 && node_kind(root) == NodeKind.Ident { node_name(root) } else { "" }
+}
+
+fn sr_walk_assign(w: SrWalk, node: Int, kids: List[Int]) {
+    let target = node_target(node)
+    let val = node_value(node)
+    sr_walk_node(w, val, kids)
+    if target == -1 {
+        return
+    }
+    let whole = node_kind(target) == NodeKind.Ident
+    if !whole {
+        sr_walk_node(w, target, kids)
+    }
+    let root = sr_place_root(target)
+    if root == "" {
+        return
+    }
+    let local = sr_scope_find(w, root)
+    if local >= 0 {
+        // The local no longer holds the saved value, so `G = local` after this is no restore.
+        w.scope_saves.set(local, -1)
+        return
+    }
+    if is_global(root) == 0 {
+        return
+    }
+    // A field or element assignment gives G a new value too; only `G = x` restores.
+    let mut restores = -1
+    if whole && node_kind(node) == NodeKind.Assignment && val != -1 && node_kind(val) == NodeKind.Ident {
+        let held = sr_scope_find(w, node_name(val))
+        if held >= 0 {
+            let save = w.scope_saves.get(held).unwrap()
+            if save >= 0 && w.names.get(save).unwrap() == root {
+                restores = save
+            }
+        }
+    }
+    sr_push_event(w, SrEventKind.Assign, root, node, restores)
+}
+
+fn sr_walk_node(w: SrWalk, node: Int, kids: List[Int]) {
     if node == -1 {
         return
     }
@@ -714,18 +749,37 @@ fn sr_scan_for_patterns_node(node: Int, kids: List[Int]) {
         return
     }
     if kind == NodeKind.Block {
-        sr_scan_for_patterns_block(node_stmts(node), kids)
+        let scope_len = w.scope_names.len()
+        let stmts = node_stmts(node)
+        if stmts != -1 {
+            let mut i = 0
+            while i < sublist_length(stmts) {
+                sr_walk_node(w, sublist_get(stmts, i), kids)
+                i = i + 1
+            }
+        }
+        sr_scope_truncate(w, scope_len)
         return
     }
-    let base = kids.len()
-    node_push_value_child_ids(node, kids)
-    let end = kids.len()
-    let mut i = base
-    while i < end {
-        sr_scan_for_patterns_node(kids.get(i).unwrap(), kids)
-        i = i + 1
+    if kind == NodeKind.LetBinding {
+        sr_walk_let(w, node, kids)
+        return
     }
-    sr_drop_kids_to(kids, base)
+    if kind == NodeKind.Assignment || kind == NodeKind.CompoundAssign {
+        sr_walk_assign(w, node, kids)
+        return
+    }
+    // A call runs after its arguments, so its event comes after theirs.
+    sr_walk_children(w, node, kids)
+    if kind == NodeKind.Call {
+        let cname = extract_ident_name(node_left(node))
+        if cname.is_some() {
+            let callee = cname.unwrap()
+            if fn_index(callee) >= 0 && sr_scope_find(w, callee) < 0 {
+                sr_push_event(w, SrEventKind.Call, callee, node, -1)
+            }
+        }
+    }
 }
 
 // A closure or nested fn body does not run where it is defined, so the saves
@@ -740,154 +794,229 @@ fn sr_drop_kids_to(kids: List[Int], base: Int) {
     }
 }
 
-fn sr_check_call(call_node: Int, callee_name: Str) ! Diag.Report {
-    let callee_idx = fn_index(callee_name)
-    if callee_idx < 0 {
-        return
+// The pairs of one function: pair i is the save at events[saves[i]] and the restore
+// at events[restore_at[i]].
+type SrPairs {
+    saves: List[Int],
+    restore_at: List[Int],
+    // The first assignment to G after the save and before the restore, or -1.
+    first_assign: List[Int],
+    // The first call after the save and before the restore, or -1.
+    first_call: List[Int],
+}
+
+fn sr_find_pairs(w: SrWalk) -> SrPairs {
+    let p = SrPairs { saves: [], restore_at: [], first_assign: [], first_call: [] }
+    let mut r = 0
+    while r < w.kinds.len() {
+        let s = w.restores.get(r).unwrap()
+        if w.kinds.get(r).unwrap() == SrEventKind.Assign && s >= 0 {
+            let global = w.names.get(s).unwrap()
+            let mut first_assign = -1
+            let mut first_call = -1
+            let mut e = s + 1
+            while e < r {
+                let k = w.kinds.get(e).unwrap()
+                if first_assign < 0 && k == SrEventKind.Assign && w.names.get(e).unwrap() == global {
+                    first_assign = e
+                }
+                if first_call < 0 && k == SrEventKind.Call {
+                    first_call = e
+                }
+                e = e + 1
+            }
+            p.saves.push(s)
+            p.restore_at.push(r)
+            p.first_assign.push(first_assign)
+            p.first_call.push(first_call)
+        }
+        r = r + 1
     }
+    p
+}
+
+fn sr_pair_around(p: SrPairs, i: Int, call: Int) -> Bool {
+    p.saves.get(i).unwrap() < call && call < p.restore_at.get(i).unwrap()
+}
+
+fn sr_pair_in_binding_at(p: SrPairs, i: Int, call: Int) -> Bool {
+    let a = p.first_assign.get(i).unwrap()
+    sr_pair_around(p, i, call) && a >= 0 && a < call
+}
+
+// A binding pair has a call between and is in a binding at each such call; the
+// first call decides, since a later call comes after the same assignment.
+fn sr_pair_is_binding(p: SrPairs, i: Int) -> Bool {
+    let a = p.first_assign.get(i).unwrap()
+    let c = p.first_call.get(i).unwrap()
+    c >= 0 && a >= 0 && a < c
+}
+
+fn sr_pos(node: Int) -> Str {
+    "{node_line(node)}:{node_col(node)}"
+}
+
+// The note that names a speculative pair and says why it is not a binding. `call` is
+// the call the warning is at.
+fn sr_pair_note(w: SrWalk, p: SrPairs, i: Int, call: Int) -> Str {
+    let s = p.saves.get(i).unwrap()
+    let global = w.names.get(s).unwrap()
+    let head = "`{global}` is saved at {sr_pos(w.nodes.get(s).unwrap())} and restored at {sr_pos(w.nodes.get(p.restore_at.get(i).unwrap()).unwrap())}"
+    let a = p.first_assign.get(i).unwrap()
+    if a < 0 {
+        return "{head} with no new value set between (speculative pair)"
+    }
+    let first_call = p.first_call.get(i).unwrap()
+    if first_call < 0 {
+        return "{head} with no call between (speculative pair)"
+    }
+    let early = if sr_pair_around(p, i, call) && call < a { call } else { first_call }
+    "{head}, and the call at {sr_pos(w.nodes.get(early).unwrap())} comes before its new value at {sr_pos(w.nodes.get(a).unwrap())} (speculative pair)"
+}
+
+fn sr_list_has(xs: List[Str], x: Str) -> Bool {
+    let mut i = 0
+    while i < xs.len() {
+        if xs.get(i).unwrap() == x {
+            return true
+        }
+        i = i + 1
+    }
+    false
+}
+
+fn sr_ticked(names: List[Str]) -> Str {
+    let mut out: List[Str] = []
+    let mut i = 0
+    while i < names.len() {
+        out.push("`{names.get(i).unwrap()}`")
+        i = i + 1
+    }
+    str_join(out, ", ")
+}
+
+fn sr_help(unsaved: List[Str]) -> Str {
+    "save and restore {sr_ticked(unsaved)} around the call\nif the function sets a global for this call, assign that global between its save and this call"
+}
+
+fn sr_check_call(w: SrWalk, p: SrPairs, ev: Int, fn_name: Str, speculative_pair: Int) ! Diag.Report {
+    let callee = w.names.get(ev).unwrap()
+    let call_node = w.nodes.get(ev).unwrap()
+    let callee_idx = fn_index(callee)
     let wcount = ma_write_counts.get(callee_idx).unwrap()
     if wcount == 0 {
         return
+    }
+
+    // Each call is checked only against the speculative pairs around it; a pair in a
+    // binding here adds nothing, and the restore drops the callee's write to its G.
+    let mut checked: List[Str] = []
+    let mut bound: List[Str] = []
+    // The W0551 note names the first speculative pair around this call; a call outside
+    // every pair gets the function's first speculative pair, the one that armed the gate.
+    let mut note_pair = speculative_pair
+    let mut i = 0
+    while i < p.saves.len() {
+        if sr_pair_around(p, i, ev) {
+            let global = w.names.get(p.saves.get(i).unwrap()).unwrap()
+            if sr_pair_in_binding_at(p, i, ev) {
+                bound.push(global)
+            } else {
+                if checked.len() == 0 {
+                    note_pair = i
+                }
+                checked.push(global)
+            }
+        }
+        i = i + 1
     }
 
     let wstart = ma_write_starts.get(callee_idx).unwrap()
     let mut write_items: List[Str] = []
     let mut unsaved: List[Str] = []
     let mut restored: List[Str] = []
-
+    let mut restored_pair = -1
     let mut wi = 0
     while wi < wcount {
         let gname = ma_write_items.get(wstart + wi).unwrap()
         write_items.push(gname)
-        if sr_is_saved_global(gname) != 0 {
+        if sr_list_has(checked, gname) {
             restored.push(gname)
-        } else {
+        } else if !sr_list_has(bound, gname) {
             unsaved.push(gname)
         }
         wi = wi + 1
     }
-    let saved_count = restored.len()
+    if unsaved.len() == 0 {
+        return
+    }
+    let writes_note = "`{callee}` writes \{{str_join(write_items, ", ")}}"
+    let missing = str_join(unsaved, ", ")
 
-    if saved_count > 0 && unsaved.len() > 0 {
-        let missing = str_join(unsaved, ", ")
+    if restored.len() > 0 {
+        i = 0
+        while i < p.saves.len() && restored_pair < 0 {
+            if sr_pair_around(p, i, ev) && !sr_pair_in_binding_at(p, i, ev) && sr_list_has(restored, w.names.get(p.saves.get(i).unwrap()).unwrap()) {
+                restored_pair = i
+            }
+            i = i + 1
+        }
         diag_warn_at_notes(
             "IncompleteStateRestore", INCOMPLETE_STATE_RESTORE,
-            "call to `{callee_name}` in `{sr_current_fn}` mutates [{missing}] which are not saved/restored (write-set: {wcount} globals, saved: {saved_count})",
+            "call to `{callee}` in `{fn_name}` mutates [{missing}] which are not saved/restored (write-set: {wcount} globals, saved: {restored.len()})",
             call_node,
-            "also save and restore [{missing}] around this call, or verify the mutation is intentional",
-            ["`{callee_name}` writes \{{str_join(write_items, ", ")}}", "only [{str_join(restored, ", ")}] is restored after the call"]
+            sr_help(unsaved),
+            [sr_pair_note(w, p, restored_pair, ev), writes_note, "only [{str_join(restored, ", ")}] is restored after the call"]
         )
+        return
     }
 
-    if saved_count == 0 && sr_fn_has_pattern != 0 {
-        let all_writes = str_join(write_items, ", ")
-        diag_warn_at_notes(
-            "UnrestoredMutation", UNRESTORED_MUTATION,
-            "call to `{callee_name}` in `{sr_current_fn}` mutates [{all_writes}]; these are not saved/restored for this call, though this function uses a save/restore pattern elsewhere",
-            call_node,
-            "if this call is speculative, save and restore the affected globals; otherwise verify the mutation is intentional",
-            ["`{callee_name}` writes \{{all_writes}}"]
-        )
+    if speculative_pair < 0 {
+        return
     }
+    diag_warn_at_notes(
+        "UnrestoredMutation", UNRESTORED_MUTATION,
+        "call to `{callee}` in `{fn_name}` mutates [{missing}]; these are not saved/restored for this call, though this function uses a save/restore pattern elsewhere",
+        call_node,
+        sr_help(unsaved),
+        [sr_pair_note(w, p, note_pair, ev), writes_note]
+    )
 }
 
-fn sr_scan_stmts(stmts_sl: Int, kids: List[Int]) ! Diag.Report {
-    if stmts_sl == -1 {
-        return
-    }
-    let num_stmts = sublist_length(stmts_sl)
-    let mut i = 0
-
-    // Pass 1: collect the block's saves (`let local = global`). Restores are
-    // not tracked here — W0550's per-call gate reads sr_save_global directly,
-    // and W0551's function-scoped gate is precomputed by sr_scan_for_patterns.
-    while i < num_stmts {
-        let stmt = sublist_get(stmts_sl, i)
-        let kind = node_kind(stmt)
-
-        if kind == NodeKind.LetBinding {
-            let val = node_value(stmt)
-            if val != -1 && node_kind(val) == NodeKind.Ident {
-                let val_name = node_name(val)
-                if is_global(val_name) != 0 {
-                    sr_add_save(val_name)
-                }
-            }
-        }
-
-        i = i + 1
-    }
-
-    // Pass 2: check every call in each statement against the block's saves.
-    i = 0
-    while i < num_stmts {
-        sr_scan_node(sublist_get(stmts_sl, i), kids)
-        i = i + 1
-    }
-}
-
-// Block branch saves/restores sr_save_global around the nested scan;
-// sr_check_call writes diag_* globals outside that pattern, which the
-// analyzer correctly flags.
-@allow(UnrestoredMutation, IncompleteStateRestore)
-fn sr_scan_node(node: Int, kids: List[Int]) ! Diag.Report {
-    if node == -1 {
-        return
-    }
-    let kind = node_kind(node)
-    if sr_body_runs_later(kind) != 0 {
-        return
-    }
-
-    if kind == NodeKind.Block {
-        let outer_saves_g = sr_save_global
-        sr_save_global = []
-        sr_scan_stmts(node_stmts(node), kids)
-        sr_save_global = outer_saves_g
-        return
-    }
-
-    if kind == NodeKind.Call {
-        let cname = extract_ident_name(node_left(node))
-        if cname.is_some() {
-            sr_check_call(node, cname.unwrap())
-        }
-    }
-
-    let base = kids.len()
-    node_push_value_child_ids(node, kids)
-    let end = kids.len()
-    let mut i = base
-    while i < end {
-        sr_scan_node(kids.get(i).unwrap(), kids)
-        i = i + 1
-    }
-    sr_drop_kids_to(kids, base)
-}
-
-// Genuine save/restore of diag_source_file (saved 826, restored 842): the
-// sibling broad-write calls (diag_push_allows/sr_reset/diag_clear_allows) write
-// other globals outside that pattern, which the analyzer correctly flags.
+// Genuine save/restore of diag_source_file: the sibling broad-write calls
+// (diag_push_allows/diag_clear_allows) write other globals outside that pattern,
+// which the analyzer correctly flags.
 @allow(UnrestoredMutation, IncompleteStateRestore)
 fn sr_analyze_fn(fn_node: Int) ! Diag.Report {
-    sr_current_fn = node_name(fn_node)
+    let body = node_body(fn_node)
+    if body == -1 || node_kind(body) != NodeKind.Block {
+        return
+    }
+    let w = sr_walk_new()
+    let mut kids: List[Int] = []
+    sr_walk_node(w, body, kids)
+    let p = sr_find_pairs(w)
+
+    // W0551's gate: the first speculative pair, or -1 when the function has none.
+    let mut speculative_pair = -1
+    let mut i = 0
+    while i < p.saves.len() && speculative_pair < 0 {
+        if !sr_pair_is_binding(p, i) {
+            speculative_pair = i
+        }
+        i = i + 1
+    }
+
+    let fn_name = node_name(fn_node)
     let saved_source = diag_source_file
     diag_source_file = diag_file_for_node(fn_node)
     diag_push_allows(fn_node)
-    sr_reset()
-    let body = node_body(fn_node)
-    if body == -1 {
-        return
-    }
-    let body_kind = node_kind(body)
-    if body_kind == NodeKind.Block {
-        let body_stmts = node_stmts(body)
-        // Pre-pass: determine whether the function is speculative (has any
-        // save/restore pattern) before any call is checked, since the pattern
-        // may live in a block scanned after an early call (§4.16.7).
-        let mut kids: List[Int] = []
-        sr_scan_for_patterns_block(body_stmts, kids)
-        sr_scan_stmts(body_stmts, kids)
+    let mut ev = 0
+    while ev < w.kinds.len() {
+        if w.kinds.get(ev).unwrap() == SrEventKind.Call {
+            sr_check_call(w, p, ev, fn_name, speculative_pair)
+        }
+        ev = ev + 1
     }
     diag_clear_allows()
     diag_source_file = saved_source

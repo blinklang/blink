@@ -1,0 +1,602 @@
+// test_mutation_lint_binding_pair.bl — W0550/W0551 tell a binding pair from a speculative pair
+//
+// sections/04_effects.md §4.16.7: a save/restore pair is a save of a module `let mut` and a
+// later restore of it. A pair is in a binding at a call when an assignment to the global, not
+// the restore, comes between the save and that call. Neither lint checks a call against a
+// pair that is in a binding there, and a binding pair does not make its function speculative.
+import compile_test_helpers
+
+// One JSON diagnostic per line: the lines that carry `code` with its span at line:col.
+fn diags_at(out: Str, code: Str, line: Int, col: Int) -> Int {
+    let mut n = 0
+    for l in out.split("\n") {
+        if l.contains("\"code\":\"{code}\"") && l.contains("\"line\":{line},\"col\":{col}}") {
+            n = n + 1
+        }
+    }
+    n
+}
+
+fn count_code(out: Str, code: Str) -> Int {
+    let mut n = 0
+    for l in out.split("\n") {
+        if l.contains("\"code\":\"{code}\"") {
+            n = n + 1
+        }
+    }
+    n
+}
+
+fn mutation_lints(out: Str) -> Int {
+    count_code(out, "W0550") + count_code(out, "W0551")
+}
+
+fn expect_no_mutation_lint(src: Str, tag: Str) {
+    let out = compile_test_helpers.compile_and_capture(src, tag)
+    compile_test_helpers.expect_compiles_clean(out, tag)
+    assert_eq(mutation_lints(out), 0)
+}
+
+// p1: save, a new value, a call that writes other globals, restore. The writes are the
+// intended effect of the call.
+test "a binding pair checks no call in it" {
+    let src = [
+        #"let mut g = 0"#,
+        #"let mut h = 0"#,
+        #"let mut k = 0"#,
+        #""#,
+        #"fn w() {"#,
+        #"    h = 1"#,
+        #"    k = 1"#,
+        #"}"#,
+        #""#,
+        #"fn f() {"#,
+        #"    let s = g"#,
+        #"    g = 5"#,
+        #"    w()"#,
+        #"    g = s"#,
+        #"}"#,
+        #""#,
+        #"fn main() {"#,
+        #"    f()"#,
+        #"}"#,
+    ].join("\n")
+    expect_no_mutation_lint(src, "_bp_p1_binding")
+}
+
+// p2: a callee that writes only the bound global.
+test "a binding pair around a callee that writes only the bound global gives no warning" {
+    let src = [
+        #"let mut g = 0"#,
+        #""#,
+        #"fn w() {"#,
+        #"    g = 1"#,
+        #"}"#,
+        #""#,
+        #"fn f() {"#,
+        #"    let s = g"#,
+        #"    g = 5"#,
+        #"    w()"#,
+        #"    g = s"#,
+        #"}"#,
+        #""#,
+        #"fn main() {"#,
+        #"    f()"#,
+        #"}"#,
+    ].join("\n")
+    expect_no_mutation_lint(src, "_bp_p2_bound_only")
+}
+
+// p3: a rollback (save, call, restore) whose callee writes a global nothing saves.
+test "a rollback pair fires W0550 with the pair note" {
+    let src = [
+        #"let mut g = 0"#,
+        #"let mut h = 0"#,
+        #""#,
+        #"fn w() {"#,
+        #"    g = 1"#,
+        #"    h = 1"#,
+        #"}"#,
+        #""#,
+        #"fn f() {"#,
+        #"    let s = g"#,
+        #"    w()"#,
+        #"    g = s"#,
+        #"}"#,
+        #""#,
+        #"fn main() {"#,
+        #"    f()"#,
+        #"}"#,
+    ].join("\n")
+    let out = compile_test_helpers.compile_and_capture(src, "_bp_p3_rollback")
+    compile_test_helpers.expect_compiles_clean(out, "p3 compiles")
+    assert_eq(diags_at(out, "W0550", 11, 5), 1)
+    assert_eq(mutation_lints(out), 1)
+    compile_test_helpers.expect_contains(out, "`g` is saved at 10:5 and restored at 12:5 with no new value set between (speculative pair)", "p3 pair note")
+    compile_test_helpers.expect_contains(out, "save and restore `h` around the call", "p3 first help line")
+    compile_test_helpers.expect_contains(out, "if the function sets a global for this call, assign that global between its save and this call", "p3 binding help line")
+    assert(!out.contains("@allow"))
+}
+
+// p4, a known limit (§4.16.7 *Exit paths*): a `?` between the new value and the restore
+// leaves the bound value in `g`, and neither lint looks at exit paths.
+test "a binding pair with a ? exit before its restore gives no warning (known limit)" {
+    let src = [
+        #"let mut g = 0"#,
+        #"let mut h = 0"#,
+        #""#,
+        #"fn check(n: Int) -> Result[Int, Str] {"#,
+        #"    h = n"#,
+        #"    if n < 0 {"#,
+        #"        return Err("negative")"#,
+        #"    }"#,
+        #"    Ok(n + g)"#,
+        #"}"#,
+        #""#,
+        #"fn f(n: Int) -> Result[Int, Str] {"#,
+        #"    let s = g"#,
+        #"    g = 5"#,
+        #"    let v = check(n)?"#,
+        #"    g = s"#,
+        #"    Ok(v)"#,
+        #"}"#,
+        #""#,
+        #"fn main() {"#,
+        #"    let _ = f(1)"#,
+        #"}"#,
+    ].join("\n")
+    expect_no_mutation_lint(src, "_bp_p4_exit")
+}
+
+// p5: write sets are gross, not net of restores, so a binder's bound global is in its write
+// set. The binder gives no warning; the speculative caller still sees the binder's writes.
+test "a binder gives no warning, and its caller in a rollback still sees its gross write set" {
+    let src = [
+        #"let mut g = 0"#,
+        #"let mut h = 0"#,
+        #"let mut pos = 0"#,
+        #""#,
+        #"fn w() {"#,
+        #"    h = 1"#,
+        #"}"#,
+        #""#,
+        #"fn binder() {"#,
+        #"    let s = g"#,
+        #"    g = 1"#,
+        #"    w()"#,
+        #"    g = s"#,
+        #"}"#,
+        #""#,
+        #"fn look() -> Int {"#,
+        #"    let p = pos"#,
+        #"    binder()"#,
+        #"    pos = p"#,
+        #"    0"#,
+        #"}"#,
+        #""#,
+        #"fn main() {"#,
+        #"    let _ = look()"#,
+        #"}"#,
+    ].join("\n")
+    let out = compile_test_helpers.compile_and_capture(src, "_bp_p5_gross")
+    compile_test_helpers.expect_compiles_clean(out, "p5 compiles")
+    assert_eq(diags_at(out, "W0551", 18, 5), 1)
+    assert_eq(mutation_lints(out), 1)
+    compile_test_helpers.expect_contains(out, "call to `binder` in `look` mutates [g, h]", "p5 lists the gross write set")
+}
+
+// p6: the callee also writes the bound global; the restore drops that write.
+test "a binding pair around a callee that also writes the bound global gives no warning" {
+    let src = [
+        #"let mut g = 0"#,
+        #"let mut h = 0"#,
+        #""#,
+        #"fn w() {"#,
+        #"    g = 1"#,
+        #"    h = 1"#,
+        #"}"#,
+        #""#,
+        #"fn f() {"#,
+        #"    let s = g"#,
+        #"    g = 5"#,
+        #"    w()"#,
+        #"    g = s"#,
+        #"}"#,
+        #""#,
+        #"fn main() {"#,
+        #"    f()"#,
+        #"}"#,
+    ].join("\n")
+    expect_no_mutation_lint(src, "_bp_p6_bound_and_other")
+}
+
+// A function whose only pair is a binding pair is not speculative, so a call outside the
+// pair draws no W0551.
+test "a binding pair does not arm W0551 for a call outside it" {
+    let src = [
+        #"let mut hint = -1"#,
+        #"let mut count = 0"#,
+        #""#,
+        #"fn infer() -> Int {"#,
+        #"    count = count + 1"#,
+        #"    hint"#,
+        #"}"#,
+        #""#,
+        #"fn infer_unhinted() -> Int {"#,
+        #"    let saved = hint"#,
+        #"    hint = -1"#,
+        #"    let t = infer()"#,
+        #"    hint = saved"#,
+        #"    t + infer()"#,
+        #"}"#,
+        #""#,
+        #"fn main() {"#,
+        #"    let _ = infer_unhinted()"#,
+        #"}"#,
+    ].join("\n")
+    expect_no_mutation_lint(src, "_bp_binding_no_arm")
+}
+
+// The spec example: a binding pair in one function, a rollback in another.
+test "the spec example warns only in the rollback" {
+    let src = [
+        #"let mut hint = -1"#,
+        #"let mut depth = 0"#,
+        #"let mut count = 0"#,
+        #""#,
+        #"fn infer() -> Int {"#,
+        #"    count = count + 1"#,
+        #"    hint + depth"#,
+        #"}"#,
+        #""#,
+        #"fn infer_unhinted() -> Int {"#,
+        #"    let saved = hint"#,
+        #"    hint = -1"#,
+        #"    let t = infer()"#,
+        #"    hint = saved"#,
+        #"    t"#,
+        #"}"#,
+        #""#,
+        #"fn looks_ahead() -> Bool {"#,
+        #"    let saved = depth"#,
+        #"    let t = infer()"#,
+        #"    depth = saved"#,
+        #"    t > 0"#,
+        #"}"#,
+        #""#,
+        #"fn main() {"#,
+        #"    let _ = infer_unhinted()"#,
+        #"    let _ = looks_ahead()"#,
+        #"}"#,
+    ].join("\n")
+    let out = compile_test_helpers.compile_and_capture(src, "_bp_spec_example")
+    compile_test_helpers.expect_compiles_clean(out, "spec example compiles")
+    assert_eq(diags_at(out, "W0551", 20, 13), 1)
+    assert_eq(mutation_lints(out), 1)
+    compile_test_helpers.expect_contains(out, "`depth` is saved at 19:5 and restored at 21:5 with no new value set between (speculative pair)", "spec example pair note")
+}
+
+// A snapshot with no restore is not a pair: reading a global into a local and then
+// calling saves nothing.
+test "a snapshot with no restore is not a save" {
+    let src = [
+        #"let mut count = 0"#,
+        #"let mut h = 0"#,
+        #"let mut g = 0"#,
+        #""#,
+        #"fn bump() {"#,
+        #"    count = count + 1"#,
+        #"    h = 1"#,
+        #"}"#,
+        #""#,
+        #"fn grew() -> Bool {"#,
+        #"    let before = count"#,
+        #"    bump()"#,
+        #"    count > before"#,
+        #"}"#,
+        #""#,
+        #"fn take() -> Int {"#,
+        #"    let was = g"#,
+        #"    g = 0"#,
+        #"    bump()"#,
+        #"    was"#,
+        #"}"#,
+        #""#,
+        #"fn main() {"#,
+        #"    let _ = grew()"#,
+        #"    let _ = take()"#,
+        #"}"#,
+    ].join("\n")
+    expect_no_mutation_lint(src, "_bp_snapshot_no_restore")
+}
+
+// A known hole (§4.16.7 *Any other assignment counts*): a lookahead that sets or moves the
+// cursor before it tries reads as a binding, so the stale `err` gives no warning. This row
+// pins today's outcome so that a change to the rule shows.
+test "seek-and-try and step-then-try read as bindings (known hole)" {
+    let src = [
+        #"let mut pos = 0"#,
+        #"let mut err = 0"#,
+        #""#,
+        #"fn parse_item() -> Bool {"#,
+        #"    pos = pos + 2"#,
+        #"    err = 1"#,
+        #"    false"#,
+        #"}"#,
+        #""#,
+        #"fn seek_and_try(start: Int) -> Bool {"#,
+        #"    let s = pos"#,
+        #"    pos = start"#,
+        #"    let ok = parse_item()"#,
+        #"    pos = s"#,
+        #"    ok"#,
+        #"}"#,
+        #""#,
+        #"fn step_then_try() -> Bool {"#,
+        #"    let s = pos"#,
+        #"    pos = pos + 1"#,
+        #"    let ok = parse_item()"#,
+        #"    pos = s"#,
+        #"    ok"#,
+        #"}"#,
+        #""#,
+        #"fn main() {"#,
+        #"    let _ = seek_and_try(3)"#,
+        #"    let _ = step_then_try()"#,
+        #"}"#,
+    ].join("\n")
+    expect_no_mutation_lint(src, "_bp_seek_and_try_hole")
+}
+
+// A call before the first new value runs with the saved value, so the pair is speculative
+// there; the call after the new value is in the binding.
+test "a call before the new value is checked against the pair" {
+    let src = [
+        #"let mut g = 0"#,
+        #"let mut h = 0"#,
+        #""#,
+        #"fn w() {"#,
+        #"    g = 1"#,
+        #"    h = 1"#,
+        #"}"#,
+        #""#,
+        #"fn wg() {"#,
+        #"    g = 2"#,
+        #"}"#,
+        #""#,
+        #"fn f() {"#,
+        #"    let s = g"#,
+        #"    w()"#,
+        #"    g = 5"#,
+        #"    wg()"#,
+        #"    g = s"#,
+        #"}"#,
+        #""#,
+        #"fn main() {"#,
+        #"    f()"#,
+        #"}"#,
+    ].join("\n")
+    let out = compile_test_helpers.compile_and_capture(src, "_bp_call_before_value")
+    compile_test_helpers.expect_compiles_clean(out, "call before value compiles")
+    assert_eq(diags_at(out, "W0550", 15, 5), 1)
+    assert_eq(mutation_lints(out), 1)
+    compile_test_helpers.expect_contains(out, "`g` is saved at 14:5 and restored at 18:5, and the call at 15:5 comes before its new value at 16:5 (speculative pair)", "call before value pair note")
+}
+
+// `let x = G.clone()` is a save too.
+test "a clone save makes a pair" {
+    let src = [
+        #"@derive(Clone)"#,
+        #"type Cursor {"#,
+        #"    at: Int,"#,
+        #"}"#,
+        #""#,
+        #"let mut cur = Cursor { at: 0 }"#,
+        #"let mut h = 0"#,
+        #""#,
+        #"fn w() {"#,
+        #"    cur = Cursor { at: 1 }"#,
+        #"    h = 1"#,
+        #"}"#,
+        #""#,
+        #"fn f() {"#,
+        #"    let s = cur.clone()"#,
+        #"    w()"#,
+        #"    cur = s"#,
+        #"}"#,
+        #""#,
+        #"fn main() {"#,
+        #"    f()"#,
+        #"}"#,
+    ].join("\n")
+    let out = compile_test_helpers.compile_and_capture(src, "_bp_clone_save")
+    compile_test_helpers.expect_compiles_clean(out, "clone save compiles")
+    assert_eq(diags_at(out, "W0550", 16, 5), 1)
+    assert_eq(mutation_lints(out), 1)
+}
+
+// A method call that changes the global in place gives it no new value: only an assignment
+// to the global does.
+test "a mutating method call on the saved global is not a new value" {
+    let src = [
+        #"let mut items: List[Int] = []"#,
+        #"let mut h = 0"#,
+        #""#,
+        #"fn w() {"#,
+        #"    items.push(1)"#,
+        #"    h = 1"#,
+        #"}"#,
+        #""#,
+        #"fn f() {"#,
+        #"    let s = items"#,
+        #"    items.push(0)"#,
+        #"    w()"#,
+        #"    items = s"#,
+        #"}"#,
+        #""#,
+        #"fn main() {"#,
+        #"    f()"#,
+        #"}"#,
+    ].join("\n")
+    let out = compile_test_helpers.compile_and_capture(src, "_bp_method_not_value")
+    compile_test_helpers.expect_compiles_clean(out, "method write compiles")
+    assert_eq(diags_at(out, "W0550", 12, 5), 1)
+    assert_eq(mutation_lints(out), 1)
+}
+
+// A call in a nested block is between the pair when it sits after the save and before the
+// restore in the text.
+test "a call in a nested block between the pair is checked against it" {
+    let src = [
+        #"let mut g = 0"#,
+        #"let mut h = 0"#,
+        #""#,
+        #"fn w() {"#,
+        #"    g = 1"#,
+        #"    h = 1"#,
+        #"}"#,
+        #""#,
+        #"fn f(c: Bool) {"#,
+        #"    let s = g"#,
+        #"    if c {"#,
+        #"        w()"#,
+        #"    }"#,
+        #"    g = s"#,
+        #"}"#,
+        #""#,
+        #"fn main() {"#,
+        #"    f(true)"#,
+        #"}"#,
+    ].join("\n")
+    let out = compile_test_helpers.compile_and_capture(src, "_bp_nested_call")
+    compile_test_helpers.expect_compiles_clean(out, "nested call compiles")
+    assert_eq(diags_at(out, "W0550", 12, 9), 1)
+    assert_eq(mutation_lints(out), 1)
+}
+
+// A local that shadows the save holds another value, so `g = s` after it is not a restore.
+test "a restore through a shadowed local is not a restore" {
+    let src = [
+        #"let mut g = 0"#,
+        #"let mut h = 0"#,
+        #""#,
+        #"fn w() {"#,
+        #"    g = 1"#,
+        #"    h = 1"#,
+        #"}"#,
+        #""#,
+        #"fn f() {"#,
+        #"    let s = g"#,
+        #"    let s = 7"#,
+        #"    w()"#,
+        #"    g = s"#,
+        #"}"#,
+        #""#,
+        #"fn main() {"#,
+        #"    f()"#,
+        #"}"#,
+    ].join("\n")
+    expect_no_mutation_lint(src, "_bp_shadowed_save")
+}
+
+// W0551 names the pair that made the function speculative, and its help names the
+// binding shape, never a suppression.
+test "W0551 names the speculative pair and the binding shape" {
+    let src = [
+        #"let mut pos = 0"#,
+        #"let mut err = 0"#,
+        #""#,
+        #"fn report() {"#,
+        #"    err = 1"#,
+        #"}"#,
+        #""#,
+        #"fn peek() -> Int {"#,
+        #"    let saved = pos"#,
+        #"    report()"#,
+        #"    pos = saved"#,
+        #"    0"#,
+        #"}"#,
+        #""#,
+        #"fn main() {"#,
+        #"    let _ = peek()"#,
+        #"}"#,
+    ].join("\n")
+    let out = compile_test_helpers.compile_and_capture(src, "_bp_w0551_shape")
+    compile_test_helpers.expect_compiles_clean(out, "W0551 shape compiles")
+    assert_eq(diags_at(out, "W0551", 10, 5), 1)
+    assert_eq(mutation_lints(out), 1)
+    compile_test_helpers.expect_contains(out, "`pos` is saved at 9:5 and restored at 11:5 with no new value set between (speculative pair)", "W0551 pair note")
+    compile_test_helpers.expect_contains(out, "save and restore `err` around the call", "W0551 first help line")
+    compile_test_helpers.expect_contains(out, "if the function sets a global for this call, assign that global between its save and this call", "W0551 binding help line")
+    assert(!out.contains("@allow"))
+}
+
+// A function can hold both kinds of pair. The speculative pair makes it a speculative
+// context; the call in the binding pair writes only the bound global, so nothing fires there.
+test "a function with both kinds of pair checks each call against its speculative pairs" {
+    let src = [
+        #"let mut pos = 0"#,
+        #"let mut hint = 0"#,
+        #"let mut count = 0"#,
+        #""#,
+        #"fn step() {"#,
+        #"    pos = pos + 1"#,
+        #"}"#,
+        #""#,
+        #"fn set_hint() {"#,
+        #"    hint = 2"#,
+        #"}"#,
+        #""#,
+        #"fn bump() {"#,
+        #"    count = count + 1"#,
+        #"}"#,
+        #""#,
+        #"fn mixed() {"#,
+        #"    let p = pos"#,
+        #"    step()"#,
+        #"    pos = p"#,
+        #"    let h = hint"#,
+        #"    hint = 1"#,
+        #"    set_hint()"#,
+        #"    hint = h"#,
+        #"    bump()"#,
+        #"}"#,
+        #""#,
+        #"fn main() {"#,
+        #"    mixed()"#,
+        #"}"#,
+    ].join("\n")
+    let out = compile_test_helpers.compile_and_capture(src, "_bp_mixed_fn")
+    compile_test_helpers.expect_compiles_clean(out, "mixed fn compiles")
+    assert_eq(diags_at(out, "W0551", 25, 5), 1)
+    assert_eq(mutation_lints(out), 1)
+    compile_test_helpers.expect_contains(out, "`pos` is saved at 18:5 and restored at 20:5 with no new value set between (speculative pair)", "mixed fn names the speculative pair")
+}
+
+// An assignment to a field of G gives G a new value, so the pair is a binding.
+test "a field assignment after the save makes a binding pair" {
+    let src = [
+        #"type Cfg {"#,
+        #"    verbose: Bool,"#,
+        #"}"#,
+        #""#,
+        #"let mut cfg = Cfg { verbose: false }"#,
+        #"let mut count = 0"#,
+        #""#,
+        #"fn run() {"#,
+        #"    count = count + 1"#,
+        #"}"#,
+        #""#,
+        #"fn loud() {"#,
+        #"    let s = cfg"#,
+        #"    cfg.verbose = true"#,
+        #"    run()"#,
+        #"    cfg = s"#,
+        #"}"#,
+        #""#,
+        #"fn main() {"#,
+        #"    loud()"#,
+        #"}"#,
+    ].join("\n")
+    expect_no_mutation_lint(src, "_bp_field_binding")
+}
