@@ -45,7 +45,7 @@ import diagnostics.{
     PTR_OUTSIDE_FFI, FFI_STRUCT_GC_FIELD, BUF_OUTSIDE_FFI_SURFACE, BYTES_GROW_IN_WITH_PTR,
     MISSING_CANONICAL_HEADER,
     PINNED_BYTES_ESCAPE, BYTES_PTR_CAST_FORBIDDEN,
-    FFI_OFFSET_ON_SINGLETON, FFI_OFFSET_UNKNOWN_STRIDE, WITH_ITEM_NOT_A_HANDLER, INSUFFICIENT_HANDLER_COVERAGE,
+    FFI_OFFSET_ON_SINGLETON, FFI_OFFSET_UNKNOWN_STRIDE, VOID_POINTEE_ACCESS, WITH_ITEM_NOT_A_HANDLER, INSUFFICIENT_HANDLER_COVERAGE,
     TRAIT_CONTRACT_900, TRAIT_CONTRACT_901, TRAIT_CONTRACT_902,
     TRAIT_CONTRACT_903, TRAIT_CONTRACT_904, TRAIT_CONTRACT_905,
     TRAIT_CONTRACT_907, SEALED_METHOD_OVERRIDE,
@@ -12050,6 +12050,24 @@ fn check_deprecated_type(type_name: Str, usage_node: Int) ! Diag.Report {
 // is lowered only for those (codegen_methods.bl's get_var_ffi_ptr_struct gate), so resolving the
 // pair on any pointer would type a call codegen cannot emit and would shadow a user `.read()`
 // on the field's own type.
+// `Ptr[Void]` is `void*`: no value lies behind it to read or store (07 §9.1.1, E0825).
+fn tc_ptr_pointee_is_void(pointee: Int) -> Bool {
+    pointee >= 0 && resolve_alias_tid(tc_resolve(pointee)) == TYPE_VOID
+}
+
+// The E0825 text of 07 *Diagnostic Integration*. The spec shows the deref form; the write
+// form says the same of a store.
+fn tc_report_void_pointee_access(node: Int, is_deref: Bool) ! Diag.Report {
+    let verb = if is_deref { "deref" } else { "write through" }
+    let access = if is_deref { "read" } else { "write" }
+    let field_op = if is_deref { "read fields with `p.field.read()`" } else { "write fields with `p.field.write(v)`" }
+    diag_error_label_at_notes("VoidPointeeAccess", VOID_POINTEE_ACCESS,
+        "cannot {verb} `Ptr[Void]` — the pointee type is unknown", node,
+        "`Void` names no value to {access}",
+        "if you know the pointee type, declare it — `Ptr[Int]`, `Ptr[U8]`, …\nfor a C struct, use `@ffi.struct` and {field_op}",
+        ["`Ptr[Void]` is an opaque handle: pass it to C and test it with `.is_null()`, but there is no value behind it to read or write"])
+}
+
 fn tc_ptr_ffi_struct_pointee(ptr_tid: Int) -> Int {
     let pt = tc_resolve(ptr_tid)
     if pt < 0 || pt >= ty_pool.len() { return 0 }
@@ -25213,13 +25231,10 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                 if tc_ptr_ffi_struct_pointee(infer_type(node_obj(obj_node))) != 0 {
                     let place_t = infer_type(obj_node)
                     if method == "read" { return place_t }
-                    // Inferred, not checked against the field: a stored value that does not fit
-                    // is C's to reject until the pointee-vs-argument check the Ptr arm below
-                    // still owes exists for `.write` in both its spellings.
-                    let pw_args = node_args(node)
-                    if pw_args != -1 && sublist_length(pw_args) >= 1 {
-                        infer_type(sublist_get(pw_args, 0))
-                    }
+                    // A field address stores the field's type, checked as `Ptr.write` checks
+                    // the pointee.
+                    let owner = type_to_str(tc_resolve(ty_pool.get(tc_resolve(infer_type(node_obj(obj_node)))).unwrap().inner1))
+                    check_builtin_arg("write", 0, place_t, node_args(node), "{owner}.{node_name(obj_node)}")
                     return TYPE_VOID
                 }
             }
@@ -26156,14 +26171,22 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
         // an Int binding; `offset` preserves the pointee.
         if obj_k == TyKind.Ptr {
             if method == "is_null" { return TYPE_BOOL }
-            // `.write(v)` stores through the pointer and answers unit. The stored value is
-            // inferred but NOT checked against the pointee — that check still does not exist —
-            // and an unchecked argument is a smaller gap than a call that carries no type at
-            // all, which is what leaving this arm out meant.
+            // `.write(v)` is `fn write(self, value: T)` (07 §9.1.1): `v` is checked against
+            // the pointee as an expected type, so a literal takes T and is range-checked
+            // against it, as for `let x: T = v`. C would otherwise take the store as written
+            // and cut 300 to a U8 44.
             if method == "write" {
-                if args_sl != -1 && sublist_length(args_sl) >= 1 {
-                    infer_type(sublist_get(args_sl, 0))
+                let pointee = ty_pool.get(obj_t).unwrap().inner1
+                if tc_ptr_pointee_is_void(pointee) {
+                    // No value of Void exists to check the argument against, so the argument
+                    // is only inferred: one report for the call, not a second for its value.
+                    tc_report_void_pointee_access(node, false)
+                    if args_sl != -1 && sublist_length(args_sl) >= 1 {
+                        infer_type(sublist_get(args_sl, 0))
+                    }
+                    return TYPE_VOID
                 }
+                check_builtin_arg(method, 0, pointee, args_sl, "Ptr")
                 return TYPE_VOID
             }
             // `addr` is always the integer address (codegen emits `(int64_t)(intptr_t)…`).
@@ -26173,7 +26196,16 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             // Signing it closes the fail-open where an unsigned result skipped the
             // let compare and laundered a sized-int pointee (Ptr[U8]) into an Int
             // binding; the honest form is `p.deref().to_int()`.
-            if method == "deref" { return ty_pool.get(obj_t).unwrap().inner1 }
+            if method == "deref" {
+                let pointee = ty_pool.get(obj_t).unwrap().inner1
+                // Unknown, not Void: Void names no value, and a binding of the result must not
+                // report again at each later use.
+                if tc_ptr_pointee_is_void(pointee) {
+                    tc_report_void_pointee_access(node, true)
+                    return TYPE_UNKNOWN
+                }
+                return pointee
+            }
             // Pointer arithmetic, so the pointee is PRESERVED — `obj_t` itself, not its child
             // (sections/07_trust_modules_metadata.md:481).
             if method == "offset" {

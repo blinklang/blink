@@ -1,0 +1,172 @@
+// `p.write(v)` is `fn write(self, value: T)` (sections/07_trust_modules_metadata.md, the
+// canonical `Ptr[T]` operations table), so `v` is checked against the pointee `T` as an
+// expected type, the same as an annotated `let`. A literal takes `T`: `p.write(7)` on a
+// `Ptr[U8]` stores a U8 7, and `p.write(300)` is the range error `let b: U8 = 300` gives.
+// A value of another type is a TypeError at the argument. Before this check, C got the
+// store as written: 300 wrapped to 44 with only a cc warning, and a Str reached cc as a
+// pointer-to-int conversion with no Blink span.
+//
+// A field address of an `@ffi.struct` pointee (§9.1.3, `p.field.write(v)`) stores the
+// field's type, so the same check runs against the field type.
+import std.fs
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_reset}
+import std.io
+
+let PROBE = "build/tc_ptr_write_arg_probe.bl"
+
+// The probe puts the store on line 7, after two lines of struct, two of function head and
+// one `let` of the pointer.
+let HEAD = "@ffi.struct(header: \"poll.h\", name: \"pollfd\")\ntype Pollfd \{ fd: I32, events: I16, revents: I16 }\n@trusted(audit: \"probe\")\nfn go() ! FFI \{\n    with ffi.scope() as scope \{\n"
+
+fn probe(body: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    write_file(PROBE, "{HEAD}{body}\n    }\n}\nfn main() \{ go() }\n")
+    diag_reset()
+    let program = compile_to_program(PROBE, 0)
+    check_types(program)
+    let _ = fs.delete(PROBE)
+}
+
+fn errors() -> List[Str] {
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" { out.push("{d.name} {d.code} {d.line}:{d.col}: {d.message}") }
+    }
+    out
+}
+
+// Failures report on stderr: a failing assert aborts, and an abort drops buffered stdout.
+fn show(label: Str, want: Str) {
+    io.eprintln("FAIL: {label}: want [{want}], got:")
+    for e in errors() { io.eprintln("  {e}") }
+}
+
+// Exactly one error, and it is this one.
+fn expect_error(label: Str, want: Str) {
+    let errs = errors()
+    let ok = errs.len() == 1 && errs.get(0).unwrap() == want
+    if !ok { show(label, want) }
+    assert(ok)
+}
+
+fn expect_clean(label: Str) {
+    let ok = errors().len() == 0
+    if !ok { show(label, "") }
+    assert(ok)
+}
+
+// ── A literal takes the pointee type ─────────────────────────────────────────────────
+
+test "an int literal that fits the pointee is stored as the pointee type" {
+    probe("        let p: Ptr[U8] = scope.alloc()\n        p.write(7)")
+    expect_clean("Ptr[U8].write(7)")
+}
+
+test "an int literal out of the pointee's range is IntLiteralOutOfRange at the literal" {
+    probe("        let p: Ptr[U8] = scope.alloc()\n        p.write(300)")
+    expect_error("Ptr[U8].write(300)", "IntLiteralOutOfRange E0318 7:17: 300 does not fit in U8 (0 to 255)")
+}
+
+test "a negative literal below a signed pointee's range is IntLiteralOutOfRange" {
+    probe("        let p: Ptr[I8] = scope.alloc()\n        p.write(-200)")
+    expect_error("Ptr[I8].write(-200)", "IntLiteralOutOfRange E0318 7:17: -200 does not fit in I8 (-128 to 127)")
+}
+
+test "a negative literal into an unsigned pointee is IntLiteralOutOfRange" {
+    probe("        let p: Ptr[U32] = scope.alloc()\n        p.write(-1)")
+    expect_error("Ptr[U32].write(-1)", "IntLiteralOutOfRange E0318 7:17: -1 does not fit in U32")
+}
+
+// Past Int's range, so a literal that did not take `T` would be out of range as an Int.
+test "a literal that fits only the U64 pointee is accepted" {
+    probe("        let p: Ptr[U64] = scope.alloc()\n        p.write(18446744073709551615)")
+    expect_clean("Ptr[U64].write(18446744073709551615)")
+}
+
+// `let f: Float = 2` is a TypeError, so the store is one too.
+test "an int literal into a Float pointee is a TypeError, as for a let" {
+    probe("        let p: Ptr[Float] = scope.alloc()\n        p.write(2)")
+    expect_error("Ptr[Float].write(2)", "TypeError E0300 7:17: argument 1 of `Ptr.write` expects Float, got Int")
+}
+
+// ── A value of another type ──────────────────────────────────────────────────────────
+
+test "a Str into a Ptr[U8] is a TypeError at the argument" {
+    probe("        let p: Ptr[U8] = scope.alloc()\n        p.write(\"hi\")")
+    expect_error("Ptr[U8].write(\"hi\")", "TypeError E0300 7:17: argument 1 of `Ptr.write` expects U8, got Str")
+}
+
+test "a Float into a Ptr[Int] is a TypeError" {
+    probe("        let p: Ptr[Int] = scope.alloc()\n        p.write(1.5)")
+    expect_error("Ptr[Int].write(1.5)", "TypeError E0300 7:17: argument 1 of `Ptr.write` expects Int, got Float")
+}
+
+// An Int binding is not a literal: it does not narrow to U8.
+test "an Int binding into a Ptr[U8] is a TypeError" {
+    probe("        let p: Ptr[U8] = scope.alloc()\n        let n = 5\n        p.write(n)")
+    expect_error("Ptr[U8].write(n: Int)", "TypeError E0300 8:17: argument 1 of `Ptr.write` expects U8, got Int")
+}
+
+test "an Int into a Ptr to an ffi struct is a TypeError" {
+    probe("        let p: Ptr[Pollfd] = scope.alloc()\n        p.write(5)")
+    expect_error("Ptr[Pollfd].write(5)", "TypeError E0300 7:17: argument 1 of `Ptr.write` expects Pollfd, got Int")
+}
+
+test "a struct literal of the pointee type is stored" {
+    probe("        let p: Ptr[Pollfd] = scope.alloc()\n        p.write(Pollfd \{ fd: 1, events: 2, revents: 3 })")
+    expect_clean("Ptr[Pollfd].write(Pollfd \{ .. })")
+}
+
+test "a pointer of another pointee into a Ptr[Ptr[U8]] cell is a TypeError" {
+    probe("        let p: Ptr[Ptr[U8]] = scope.alloc()\n        let q: Ptr[I32] = scope.alloc()\n        p.write(q)")
+    expect_error("Ptr[Ptr[U8]].write(Ptr[I32])", "TypeError E0300 8:17: argument 1 of `Ptr.write` expects Ptr[U8], got Ptr[I32]")
+}
+
+test "a pointer of the cell's pointee type is stored" {
+    probe("        let p: Ptr[Ptr[U8]] = scope.alloc()\n        let q: Ptr[U8] = scope.alloc()\n        p.write(q)")
+    expect_clean("Ptr[Ptr[U8]].write(Ptr[U8])")
+}
+
+// ── A type parameter pointee ─────────────────────────────────────────────────────────
+
+fn probe_generic(body: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    write_file(PROBE, "@trusted(audit: \"probe\")\n{body}\nfn main() \{ }\n")
+    diag_reset()
+    let program = compile_to_program(PROBE, 0)
+    check_types(program)
+    let _ = fs.delete(PROBE)
+}
+
+test "a T value into a Ptr[T] is stored" {
+    probe_generic("fn put[T](p: Ptr[T], v: T) ! FFI \{ p.write(v) }")
+    expect_clean("Ptr[T].write(v: T)")
+}
+
+// `let y: T = 1` is a TypeError, so the store is one too.
+test "an int literal into a Ptr[T] is a TypeError" {
+    probe_generic("fn put[T](p: Ptr[T]) ! FFI \{ p.write(1) }")
+    expect_error("Ptr[T].write(1)", "TypeError E0300 2:38: argument 1 of `Ptr.write` expects T, got Int")
+}
+
+// ── A field address stores the field's type ─────────────────────────────────────────
+
+test "a literal into a field address takes the field type" {
+    probe("        let p: Ptr[Pollfd] = scope.alloc()\n        p.events.write(7)")
+    expect_clean("p.events.write(7)")
+}
+
+test "a literal out of the field type's range is IntLiteralOutOfRange" {
+    probe("        let p: Ptr[Pollfd] = scope.alloc()\n        p.events.write(70000)")
+    expect_error("p.events.write(70000)", "IntLiteralOutOfRange E0318 7:24: 70000 does not fit in I16 (-32768 to 32767)")
+}
+
+test "a Str into an I32 field address is a TypeError" {
+    probe("        let p: Ptr[Pollfd] = scope.alloc()\n        p.fd.write(\"x\")")
+    expect_error("p.fd.write(\"x\")", "TypeError E0300 7:20: argument 1 of `Pollfd.fd.write` expects I32, got Str")
+}
+
+test "an Int binding into an I16 field address is a TypeError" {
+    probe("        let p: Ptr[Pollfd] = scope.alloc()\n        let n = 1\n        p.revents.write(n)")
+    expect_error("p.revents.write(n: Int)", "TypeError E0300 8:25: argument 1 of `Pollfd.revents.write` expects I16, got Int")
+}

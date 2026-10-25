@@ -1,0 +1,145 @@
+// `.deref()` and `.write(v)` on a `Ptr[Void]` are E0825 (sections/07_trust_modules_metadata.md,
+// *`.deref()` / `.write()` on `Ptr[Void]` — rejected*, and *Diagnostic Integration*). `Void` has
+// no value representation, so there is no value to read or to store, and `*(void*)p` is a C
+// constraint violation. Before this check a deref typed as Void with no report, and a write
+// reached cc as "invalid use of void expression" with no Blink span.
+//
+// Every other operation on a `Ptr[Void]` stays legal, so it is still an opaque handle:
+// `.addr()`, `.is_null()`, `null_ptr[Void]()`, passing it to C, and a `Ptr[Ptr[Void]]` cell's
+// own deref and write. `.offset()` gets no E0825; it has a rule of its own (the stride).
+import std.fs
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_reset}
+import std.io
+
+let PROBE = "build/tc_ptr_void_e0825_probe.bl"
+
+// The probe puts the operation on line 8, after a C declaration, the function head and one `let`
+// of the pointer.
+let HEAD = "@ffi(\"c\", \"free\")\n@trusted(audit: \"probe\")\nfn c_free(p: Ptr[Void]) ! FFI \{ }\n@trusted(audit: \"probe\")\nfn go() ! FFI \{\n    with ffi.scope() as scope \{\n"
+
+fn probe(body: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    write_file(PROBE, "{HEAD}{body}\n    }\n}\nfn main() \{ go() }\n")
+    diag_reset()
+    let program = compile_to_program(PROBE, 0)
+    check_types(program)
+    let _ = fs.delete(PROBE)
+}
+
+fn entries() -> List[Str] {
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" {
+            out.push("{d.name} {d.code} {d.line}:{d.col}: {d.message} | label: {d.label} | help: {d.help} | notes: {d.notes.join(\"; \")}")
+        }
+    }
+    out
+}
+
+fn show(label: Str) {
+    io.eprintln("FAIL: {label}: got:")
+    for e in entries() { io.eprintln("  {e}") }
+}
+
+fn count_code(code: Str) -> Int {
+    let mut n = 0
+    for d in diag_entries {
+        if d.code == code { n = n + 1 }
+    }
+    n
+}
+
+let NOTE = "`Ptr[Void]` is an opaque handle: pass it to C and test it with `.is_null()`, but there is no value behind it to read or write"
+
+let HELP_DECLARE = "if you know the pointee type, declare it — `Ptr[Int]`, `Ptr[U8]`, …"
+
+// The one error is E0825 with the spec's text at line:col, and nothing else is reported.
+fn expect_deref_e0825(label: Str, line: Int, col: Int) {
+    let want = "VoidPointeeAccess E0825 {line}:{col}: cannot deref `Ptr[Void]` — the pointee type is unknown | label: `Void` names no value to read | help: {HELP_DECLARE}\nfor a C struct, use `@ffi.struct` and read fields with `p.field.read()` | notes: {NOTE}"
+    let errs = entries()
+    let ok = errs.len() == 1 && errs.get(0).unwrap() == want
+    if !ok {
+        io.eprintln("want: {want}")
+        show(label)
+    }
+    assert(ok)
+}
+
+fn expect_write_e0825(label: Str, line: Int, col: Int) {
+    let want = "VoidPointeeAccess E0825 {line}:{col}: cannot write through `Ptr[Void]` — the pointee type is unknown | label: `Void` names no value to write | help: {HELP_DECLARE}\nfor a C struct, use `@ffi.struct` and write fields with `p.field.write(v)` | notes: {NOTE}"
+    let errs = entries()
+    let ok = errs.len() == 1 && errs.get(0).unwrap() == want
+    if !ok {
+        io.eprintln("want: {want}")
+        show(label)
+    }
+    assert(ok)
+}
+
+fn expect_clean(label: Str) {
+    let ok = entries().len() == 0
+    if !ok { show(label) }
+    assert(ok)
+}
+
+// ── Rejected ─────────────────────────────────────────────────────────────────────────
+
+// The binding's later use reports nothing more: the deref has no type to be wrong about.
+test "deref of a Ptr[Void] is E0825 at the call" {
+    probe("        let p: Ptr[Void] = scope.alloc()\n        let v = p.deref()\n        io.println(\"\{v.addr()}\")")
+    expect_deref_e0825("let v = p.deref()", 8, 17)
+}
+
+test "deref of a Ptr[Void] in statement position is E0825" {
+    probe("        let p: Ptr[Void] = scope.alloc()\n        p.deref()")
+    expect_deref_e0825("p.deref()", 8, 9)
+}
+
+// The argument is not checked against a pointee that has no values: one report, not two.
+test "write through a Ptr[Void] is E0825 at the call" {
+    probe("        let p: Ptr[Void] = scope.alloc()\n        p.write(1)")
+    expect_write_e0825("p.write(1)", 8, 9)
+}
+
+// The inner deref yields a Ptr[Void], which is legal; the outer one is the E0825.
+test "deref of a Ptr[Void] read out of a cell is E0825 at the outer call" {
+    probe("        let c: Ptr[Ptr[Void]] = scope.alloc()\n        let _v = c.deref().deref()")
+    expect_deref_e0825("c.deref().deref()", 8, 18)
+}
+
+test "write through a Ptr[Void] read out of a cell is E0825" {
+    probe("        let c: Ptr[Ptr[Void]] = scope.alloc()\n        c.deref().write(1)")
+    expect_write_e0825("c.deref().write(1)", 8, 9)
+}
+
+// ── Still legal: Ptr[Void] is an opaque handle ───────────────────────────────────────
+
+test "addr and is_null on a Ptr[Void] are legal" {
+    probe("        let p: Ptr[Void] = scope.alloc()\n        io.println(\"\{p.addr() != 0} \{p.is_null()}\")")
+    expect_clean("p.addr(), p.is_null()")
+}
+
+test "null_ptr[Void]() is legal" {
+    probe("        let n = null_ptr[Void]()\n        io.println(\"\{n.is_null()}\")")
+    expect_clean("null_ptr[Void]()")
+}
+
+test "passing a Ptr[Void] to C is legal" {
+    probe("        let p: Ptr[Void] = scope.alloc()\n        c_free(p)")
+    expect_clean("c_free(p)")
+}
+
+// A cell of `Ptr[Void]` holds a pointer value, which deref reads and write stores.
+test "deref and write of a Ptr[Ptr[Void]] cell are legal" {
+    probe("        let c: Ptr[Ptr[Void]] = scope.alloc()\n        let h: Ptr[Void] = scope.alloc()\n        c.write(h)\n        let back: Ptr[Void] = c.deref()\n        io.println(\"\{back.addr() == h.addr()}\")")
+    expect_clean("Ptr[Ptr[Void]] deref/write")
+}
+
+// `.offset()` is refused by its stride rule (a Void pointee has no size), never by E0825.
+test "offset on a Ptr[Void] is not E0825" {
+    probe("        let p: Ptr[Void] = scope.alloc_n(2)\n        let _q = p.offset(1)")
+    let ok = count_code("E0825") == 0
+    if !ok { show("p.offset(1)") }
+    assert(ok)
+}

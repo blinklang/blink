@@ -55,9 +55,9 @@ fn malloc(size: Int) -> Ptr[Int] ! FFI
 
 | Method | Returns | Purpose |
 |--------|---------|---------|
-| `.deref()` | T | Dereference pointer. `T` is the pointee type: `Ptr[U8].deref()` is `U8` |
+| `.deref()` | T | Dereference pointer. `T` is the pointee type: `Ptr[U8].deref()` is `U8`. Rejected (`E0825`) on `Ptr[Void]` |
 | `.addr()` | Int | Get raw address |
-| `.write(val)` | () | Write value at pointer |
+| `.write(val)` | () | Write value at pointer. `val` is checked against `T`, and a literal takes `T` (`Ptr[U8].write(300)` is `E0318`). Rejected (`E0825`) on `Ptr[Void]` |
 | `.is_null()` | Bool | Null check |
 | `.to_str()` | Str | Convert to string (for char*) |
 | `.as_cstr()` | Str | Read as C string |
