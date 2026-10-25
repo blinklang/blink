@@ -3350,8 +3350,12 @@ fn tc_ud_flush_open_variants() ! Diag.Report {
         if !tc_open_group_is_variant(g) || tc_call_reported.contains_key(node) { continue }
         let tid = tc_lookup_node_tid(node)
         if tc_tid_has_unbound_metavar(tid) == 0 || tc_ud_already_blamed(tid) != 0 { continue }
+        // An error already on the construction's lines is the first report, and the open slot
+        // may be its consequence: a call that does not resolve gives its argument no type.
+        let end_line = if node_end_line(node) > node_line(node) { node_end_line(node) } else { node_line(node) }
+        if diag_errors_in_lines(diag_file_for_node(node), node_line(node), end_line) > 0 { continue }
         tc_call_reported.insert(node, 1)
-        tc_report_under_determined_at(node, tid)
+        tc_report_under_determined_at(node, tid, "no annotation, parameter type or return type gives this value its type")
     }
 }
 
@@ -3473,22 +3477,22 @@ fn tc_scrut_is_named_place(node: Int) -> Int {
 }
 
 // The materialization-boundary twin of tc_report_under_determined for a value that is
-// NOT a `let` binding — a match scrutinee. Same error[CannotInferType] (E0301), applied
-// uniformly across syntactic position (decisions/under-determined-sum-variant-parameter.md,
-// sections/03_types.md §3.4: "The judgment is a property of the type, not of the syntactic
-// position."). There is no binding name to blame, so the caret lands on the open
-// constructor (tc_locate_under_determined). The note enumerates the four things that would
-// have pinned an open sum-variant parameter — an annotation, a `?`, an error-reading arm, or
-// a return type — since a `Err(e) => ...`/`None => ...` arm that discards its payload
-// constrains nothing.
-fn tc_report_under_determined_at(scrut: Int, scrut_tid: Int) ! Diag.Report {
+// NOT a `let` binding — a match scrutinee, or a construction no binding holds. Same
+// error[CannotInferType] (E0301), applied uniformly across syntactic position
+// (decisions/under-determined-sum-variant-parameter.md, sections/03_types.md §3.4: "The
+// judgment is a property of the type, not of the syntactic position."). There is no binding
+// name to blame, so the caret lands on the open constructor (tc_locate_under_determined).
+// The caller gives the note, since what could have pinned the value depends on where it is:
+// for a scrutinee it is the four pins of an open sum-variant parameter — an annotation, a `?`,
+// an error-reading arm, or a return type — since a `Err(e) => ...`/`None => ...` arm that
+// discards its payload constrains nothing.
+fn tc_report_under_determined_at(scrut: Int, scrut_tid: Int, note: Str) ! Diag.Report {
     if scrut == -1 { return }
     let culprit = tc_locate_under_determined(scrut)
     let culprit_tid = tc_lookup_node_tid(culprit)
     let hint_tid = if tc_tid_is_no_info(culprit_tid) == 0 { culprit_tid } else { scrut_tid }
     let hint = tc_infer_annotation_hint(hint_tid)
-    let mut notes: List[Str] = []
-    notes.push("its type is never constrained by an annotation, a `?`, an error-reading arm, or a return type")
+    let notes = [note]
     // Same claim the binding report makes: an arm binder aliasing this scrutinee has
     // already deferred, and its blame must not restate what this line says.
     tc_ud_mark_blamed(scrut_tid)
@@ -5317,6 +5321,8 @@ fn tc_pin_admits_declared(d: Int) -> Int {
     // path below never sees them.
     if dt.kind == TyKind.Option || dt.kind == TyKind.Result || dt.kind == TyKind.List || dt.kind == TyKind.Ptr { return 1 }
     if dt.kind == TyKind.Tuple { return 1 }
+    // A declared `fn() -> Option[T]` fixes the open return of a closure built for it.
+    if dt.kind == TyKind.Fn { return 1 }
     if dt.kind != TyKind.Struct && dt.kind != TyKind.Enum { return 0 }
     if dt.params_count == 0 { return 0 }
     1
@@ -8032,6 +8038,9 @@ fn tc_settle_closure_ret(cls: Int, slot: Int) ! TypeCheck.Resolve, TypeCheck.Rep
         let _ = bind_metavar(slot, ret)
     } else if tc_tid_is_no_info(tail_t) == 0 && tc_tid_is_no_info(ret) == 0 && ret != TYPE_VOID && (types_compatible(ret, tail_t) == 0 || tc_value_misses_never_slot(ret, tail_t) != 0) {
         tc_error_at("return value type {type_to_str(tail_t)} does not match function `closure` return type {type_to_str(ret)}", cls)
+    } else if tc_tid_is_no_info(tail_t) == 0 {
+        // The bound return fixes an open slot of the tail, as a written `-> R` would.
+        tc_join_agreeing_values(ret, tail_t)
     }
     // A Void return drops what a `return e` carries, as a named fn with no `-> R` does.
     if ret == TYPE_VOID || tc_tid_is_no_info(ret) != 0 { return }
@@ -8039,6 +8048,8 @@ fn tc_settle_closure_ret(cls: Int, slot: Int) ! TypeCheck.Resolve, TypeCheck.Rep
         let vt = tc_lookup_node_tid(node_value(r))
         if tc_tid_is_no_info(vt) == 0 && (types_compatible(ret, vt) == 0 || tc_value_misses_never_slot(ret, vt) != 0) {
             tc_error_at("return value type {type_to_str(vt)} does not match function `closure` return type {type_to_str(ret)}", r)
+        } else {
+            tc_join_agreeing_values(ret, vt)
         }
     }
 }
@@ -22181,10 +22192,25 @@ fn tc_branch_values_agree(a_node: Int, a_t: Int, b_node: Int, b_t: Int) -> Int {
     types_compatible(tc_fn_value_open_ret(a_node, a_t), tc_fn_value_open_ret(b_node, b_t))
 }
 
+// Two values that one form yields as one type are that type: the branches of an `if`, the
+// arms of a `match`, the operands of a comparison. An open slot of one is fixed from the other,
+// as `if c { Box.Full(9) } else { Box.Vacant }` fixes the `Vacant`'s `T`. Only types that
+// already agree are unified, so the mismatch report keeps its own answer.
+fn tc_join_agreeing_values(a: Int, b: Int) {
+    if tc_boundary_check_active == 0 { return }
+    if tc_tid_is_no_info(a) != 0 || tc_tid_is_no_info(b) != 0 { return }
+    if tc_tid_has_unknown(a) != 0 || tc_tid_has_unknown(b) != 0 { return }
+    if tc_resolve(a) == TYPE_NEVER || tc_resolve(b) == TYPE_NEVER { return }
+    if tc_tid_has_unbound_metavar(a) == 0 && tc_tid_has_unbound_metavar(b) == 0 { return }
+    if types_compatible(a, b) == 0 { return }
+    let _ = tc_unify(a, b)
+}
+
 // A `match` used as a value yields one type, so every arm that yields a value must share the
 // type of the first one that does. An arm with no value makes the whole match `()` (§3.3), so
 // the others' values are dropped rather than compared; a diverging arm fits any type. One
-// report per match, at the first arm that disagrees.
+// report per match, at the first arm that disagrees. Arms that agree are joined, so an open
+// slot of one is fixed from another.
 fn tc_report_match_arm_mismatch(nodes: List[Int], types: List[Int]) ! TypeCheck.Report, Diag.Report {
     for t in types {
         if tc_tid_is_no_info(t) == 0 && tc_resolve(t) == TYPE_VOID { return }
@@ -22202,6 +22228,7 @@ fn tc_report_match_arm_mismatch(nodes: List[Int], types: List[Int]) ! TypeCheck.
                     tc_error_at("match arms have incompatible types: {type_to_str(first_t)} vs {type_to_str(t)}", tc_value_report_node(nodes.get(i).unwrap()))
                     return
                 }
+                tc_join_agreeing_values(first_t, t)
             }
         }
         i = i + 1
@@ -22250,6 +22277,29 @@ fn tc_report_walked_match_arm_mismatch(node: Int) ! TypeCheck.Report, Diag.Repor
         i = i + 1
     }
     tc_report_match_arm_mismatch(nodes, types)
+}
+
+// The arms of a match the statement walk typed again, joined as the value walk joins them, since
+// the second walk gave each arm fresh open slots. An arm with no value makes the match `()`.
+fn tc_join_walked_match_arms(node: Int) {
+    let arms_sl = node_arms(node)
+    if arms_sl == -1 { return }
+    let mut types: List[Int] = []
+    let mut i = 0
+    while i < sublist_length(arms_sl) {
+        let v = tc_arm_body_value(sublist_get(arms_sl, i))
+        if v != -1 {
+            let t = tc_scoped_value_memo(v)
+            if tc_tid_is_no_info(t) == 0 && tc_resolve(t) == TYPE_VOID { return }
+            if tc_tid_is_no_info(t) == 0 && tc_resolve(t) != TYPE_NEVER { types.push(t) }
+        }
+        i = i + 1
+    }
+    let mut j = 1
+    while j < types.len() {
+        tc_join_agreeing_values(types.get(0).unwrap(), types.get(j).unwrap())
+        j = j + 1
+    }
 }
 
 // The fn type `val` offers to a comparison made before its closure body is walked. A closure
@@ -23539,6 +23589,7 @@ fn tc_infer_comparison(node: Int, op: Str) -> Int ! TypeCheck.Resolve, TypeCheck
     // A comparison passes no expected type to its operands, so a literal settles one at Int.
     tc_settle_literal_operands(node, lt, rt, -1)
     tc_check_comparison_operands(node, op, lt, rt)
+    if cmp_is_enum_int_pair(lt, rt) == 0 { tc_join_agreeing_values(lt, rt) }
     return TYPE_BOOL
 }
 
@@ -24697,6 +24748,8 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                     let ret_kind = ty_pool.get(tc_current_fn_ret).unwrap().kind
                     if ret_kind != TyKind.Result && ret_kind != TyKind.Unknown {
                         tc_errors.push("`?` on Result in function `{tc_current_fn_name}` which does not return Result")
+                        // No return type answers the operand's error slot, and this report says why.
+                        tc_ud_mark_blamed(operand_err)
                         diag_error_at("QuestionMarkResultInNonResult", QM_RESULT_IN_NON_RESULT, "`?` on Result in function `{tc_current_fn_name}` which does not return Result", node, "change the return type to Result[T, E]")
                     } else if ret_kind == TyKind.Result {
                         let ret_err = ty_pool.get(tc_current_fn_ret).unwrap().inner2
@@ -26150,7 +26203,12 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             if sig != -1 {
                 // Before the argument check: an argument typed by an impl binder takes the
                 // receiver's type argument as its hint, as a List poly-impl argument does.
-                let ibinds = tc_impl_binds_at_call(sig, obj_t)
+                // A parameter that spells `Self` takes the receiver's type, so an argument
+                // for it is checked against the receiver.
+                let mut ibinds = tc_impl_binds_at_call(sig, obj_t)
+                for (k, v) in tc_self_binds(obj_t) {
+                    if ibinds.contains_key(k) == 0 { ibinds.insert(k, v) }
+                }
                 tc_check_impl_bounds_at_call(fnsig_pool.get(sig).unwrap().decl, ibinds, node)
                 if sole_trait == "" && fnsig_pool.get(sig).unwrap().decl < 0 {
                     tc_refuse_derived_method_at(obj_t, method, node)
@@ -26559,7 +26617,10 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                         }
                         // The receiver's type arguments answer a per-instance impl's binders,
                         // as on the instance path.
-                        let qt_ibinds = tc_impl_binds_at_call(qt_sig, qt_recv)
+                        let mut qt_ibinds = tc_impl_binds_at_call(qt_sig, qt_recv)
+                        for (k, v) in tc_self_binds(qt_recv) {
+                            if qt_ibinds.contains_key(k) == 0 { qt_ibinds.insert(k, v) }
+                        }
                         let _ = tc_check_arg_types_with_binds("{obj_name}.{method}", qt_sig, qt_args, 0, qt_ibinds)
                         return substitute_typevar_tid(qt_fs.ret, qt_ibinds)
                     }
@@ -26650,9 +26711,7 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
                             let _ = check_arg_shapes("{obj_name}.{method}", q_sig, node_args(node), 0, node)
                             return q_ret
                         }
-                        let mut self_bind: Map[Str, Int] = Map()
-                        self_bind.insert("Self", self_tid)
-                        self_bind.insert(tc_binder_key(SELF_BINDER_NODE, "Self"), self_tid)
+                        let self_bind = tc_self_binds(self_tid)
                         let _ = check_arg_shapes_with_binds("{obj_name}.{method}", q_sig, node_args(node), 0, node, self_bind)
                         return substitute_typevar_tid(q_ret, self_bind)
                     }
@@ -26968,6 +27027,8 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
             // runs again on the typecheck pass, where both sides are settled.
             if tc_branch_values_agree(node_then_body(node), then_t, else_node, else_t) == 0 {
                 tc_error_at("if branches have incompatible types: {type_to_str(then_t)} vs {type_to_str(else_t)}", node)
+            } else {
+                tc_join_agreeing_values(then_t, else_t)
             }
             if tc_tid_is_no_info(then_t) != 0 { return else_t }
             if tc_tid_is_no_info(else_t) != 0 { return then_t }
@@ -28186,7 +28247,10 @@ fn tc_check_if_value(node: Int) ! Diag.Report, TypeCheck.Report {
 fn tc_report_if_branch_mismatch(node: Int) ! Diag.Report, TypeCheck.Report {
     let then_t = tc_scoped_value_memo(node_then_body(node))
     let else_t = tc_scoped_value_memo(node_else_body(node))
-    if tc_branch_values_agree(node_then_body(node), then_t, node_else_body(node), else_t) != 0 { return }
+    if tc_branch_values_agree(node_then_body(node), then_t, node_else_body(node), else_t) != 0 {
+        tc_join_agreeing_values(then_t, else_t)
+        return
+    }
     tc_error_at("if branches have incompatible types: {type_to_str(then_t)} vs {type_to_str(else_t)}", node)
 }
 
@@ -28374,10 +28438,15 @@ fn tc_check_param_defaults(fn_node: Int) ! Diag.Report {
 // an impl.
 fn tc_self_as_receiver(tid: Int) -> Int {
     if tc_current_self_tid == -1 { return tid }
+    substitute_typevar_tid(tid, tc_self_binds(tc_current_self_tid))
+}
+
+// Binds that read `Self` as `target`, under both keys a signature may spell it by.
+fn tc_self_binds(target: Int) -> Map[Str, Int] {
     let mut binds: Map[Str, Int] = Map()
-    binds.insert("Self", tc_current_self_tid)
-    binds.insert(tc_binder_key(SELF_BINDER_NODE, "Self"), tc_current_self_tid)
-    substitute_typevar_tid(tid, binds)
+    binds.insert("Self", target)
+    binds.insert(tc_binder_key(SELF_BINDER_NODE, "Self"), target)
+    binds
 }
 
 // Each default against its parameter's type, here at the declaration, in the declaration's
@@ -30512,7 +30581,11 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
         tc_walk_value_block(node_then_body(node))
         tc_walk_value_tail = in_value
         tc_walk_value_block(node_else_body(node))
-        if in_value != 0 { tc_check_if_value(node) }
+        if in_value != 0 {
+            tc_check_if_value(node)
+        } else if node_else_body(node) != -1 {
+            tc_join_agreeing_values(tc_scoped_value_memo(node_then_body(node)), tc_scoped_value_memo(node_else_body(node)))
+        }
         // The branch bodies were walked — and memoized — inside their own block scopes, so an
         // `if` whose branch tail names a block-local `let` memoized TYPE_UNKNOWN for the `if` as
         // a whole. The answers exist now; read them back here at the `if`, exactly as the
@@ -30635,7 +30708,7 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
             }
             // A consumed match the value-context walk reached. infer_type never types this node,
             // so its arm compare is made here, as tc_check_if_value makes an `if`'s.
-            if in_value != 0 { tc_report_walked_match_arm_mismatch(node) }
+            if in_value != 0 { tc_report_walked_match_arm_mismatch(node) } else { tc_join_walked_match_arms(node) }
 
             // Materialization boundary: an anonymous temporary scrutinee is a value exactly
             // like a `let` initializer, so a metavar still unbound after every arm's
@@ -30652,7 +30725,7 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
             if tc_boundary_check_active != 0 {
                 if tc_tid_has_unbound_metavar(scrut_tid) != 0 {
                     if tc_scrut_is_named_place(node_scrutinee(node)) == 0 {
-                        tc_report_under_determined_at(node_scrutinee(node), scrut_tid)
+                        tc_report_under_determined_at(node_scrutinee(node), scrut_tid, "its type is never constrained by an annotation, a `?`, an error-reading arm, or a return type")
                     }
                 }
             }
@@ -33510,6 +33583,10 @@ fn tc_stamp_type_field_defaults(td: Int, seen: List[Int]) ! TypeCheck.Resolve, T
         }
         i = i + 1
     }
+    // The program's flush has already run, and a default is a value no binding holds, so its
+    // open constructions are judged here, where its walk ends.
+    tc_ud_flush_open_variants()
+    tc_drop_open_calls()
     tc_boundary_check_active = saved_boundary
     nr_current_module = saved_module
     tc_pop_tparam_scope(tparams)

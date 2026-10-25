@@ -178,3 +178,135 @@ test "a fixed Ok receiver is not E0301" {
 "#
     assert_diags(src, [])
 }
+
+// The names of the errors a program gets, in report order.
+fn error_names_of(src: Str) -> List[Str] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    let path = "build/tc_open_variant_no_binding_src.bl"
+    init_embedded_stdlib()
+    write_file(path, src)
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" { out.push(d.name) }
+    }
+    out
+}
+
+fn assert_errors(src: Str, want: List[Str]) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    let got = error_names_of(src)
+    if got != want {
+        let w = want.join(", ")
+        let g = got.join(", ")
+        io.eprintln("FAIL: want [{w}], got [{g}] for:\n{src}")
+    }
+    assert_eq(got, want)
+}
+
+test "an error already reported at a construction is not followed by E0301 for it" {
+    assert_errors(#"fn f() -> Int {
+    let y = Ok(1)?
+    y
+}
+
+fn main() { io.println("{f()}") }
+"#, ["QuestionMarkResultInNonResult"])
+    assert_errors(#"fn main() {
+    let r: Result[Int, Str] = Ok(1).nope()
+}
+"#, ["UnresolvedMethod"])
+    assert_errors(#"fn main() {
+    let mut xs: List[Int?] = []
+    xs.pussh(None)
+}
+"#, ["UnresolvedMethod"])
+    assert_errors(#"fn main() {
+    undefined_fn(Ok(1))
+}
+"#, ["UndefinedFunction"])
+    assert_errors(#"fn main() {
+    io.println("{Ok(1)}")
+}
+"#, ["MissingDisplayImpl"])
+    assert_errors(#"fn main() {
+    let o: Int? = Some(1)
+    let v = o ?? None
+    io.println("{v}")
+}
+"#, ["TypeError"])
+}
+
+test "a question mark under a return type that does not resolve adds no E0301" {
+    assert_errors(#"fn f() -> Bogus {
+    let y = Ok(1)?
+    y
+}
+
+fn main() { f() }
+"#, ["UnknownType", "QuestionMarkResultInNonResult"])
+}
+
+test "an open if a binding holds is reported once, at the binding" {
+    let src = #"type Pick[T, U] {
+    L(T)
+    R(U)
+}
+
+fn main() {
+    let c = true
+    let _x = if c { Pick.L(1) } else { Pick.L(2) }  // IF
+}
+"#
+    let line = line_of(src, "IF")
+    let got = diags_of(src)
+    assert_eq(got.len(), 1)
+    assert(got.get(0).unwrap().starts_with("{line}:5-"))
+    assert(got.get(0).unwrap().contains("E0301 cannot infer a type for `_x`"))
+}
+
+test "an open variant in a field default is E0301 at the variant" {
+    let src = #"type Cfg {
+    n: Int = Ok(1).unwrap()  // FIELD
+}
+
+fn main() {
+    let c = Cfg {}
+    io.println("{c.n}")
+}
+"#
+    assert_diags(src, [open_at(src, "FIELD", "Ok(1)", ": Result[T, E]")])
+}
+
+test "the note on an open variant names what would fix it" {
+    let src = #"type Pick[T, U] {
+    A(T)
+    B(U)
+}
+
+fn main() {
+    Pick.A(1)
+}
+"#
+    let _ = diags_of(src)
+    assert_eq(diag_entries.len(), 1)
+    assert_eq(diag_entries.get(0).unwrap().notes, ["no annotation, parameter type or return type gives this value its type"])
+}
+
+test "an open variant a spawned closure returns is fixed by the await" {
+    assert_errors(#"fn main() ! Async {
+    async.scope {
+        let h = async.spawn(fn() { None })
+        let x: Int? = h.await
+        io.println("{x.is_none()}")
+    }
+}
+"#, [])
+    assert_errors(#"fn main() ! Async {
+    async.scope {
+        let _h = async.spawn(fn() { None })
+    }
+}
+"#, ["CannotInferType"])
+}
