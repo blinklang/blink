@@ -3150,10 +3150,8 @@ fn tc_flush_open_keys_of(call_node: Int, g: Int) ! Diag.Report {
 // tc_refuse_deferred_conversions judges the rest at the end of the program.
 //
 // Each definition flushes before its type parameters leave scope, so a chosen impl may bind
-// a binder to one of them, under the licence the definition's own annotation has
-// (tc_pin_tail_ret_generic). The flush at the end of the program has none in scope.
+// a binder to one of them. The flush at the end of the program has none in scope.
 fn tc_flush_deferred_conversions() ! TypeCheck.Resolve, Diag.Report {
-    tc_pin_tparam_binds = 1
     let mut chose = true
     while chose {
         chose = false
@@ -3161,7 +3159,6 @@ fn tc_flush_deferred_conversions() ! TypeCheck.Resolve, Diag.Report {
             if tc_choose_deferred_conversion(call_node) { chose = true }
         }
     }
-    tc_pin_tparam_binds = 0
 }
 
 // Refuse each conversion no use settled: more than one impl fits, or none. This runs after
@@ -3473,12 +3470,6 @@ fn tc_report_under_determined_at(scrut: Int, scrut_tid: Int) ! Diag.Report {
 // only fresh per-binding metavars from make_metavar ever get pinned.
 // pub so the fail-closed range guards below can be driven directly; no surface program
 // reaches them, the same reason type_merge is pub.
-// Set only while a declared annotation is being pinned onto an under-determined value
-// (tc_pin_tail_ret_generic). It licenses ONE extra bind in tc_unify: a bare type parameter
-// of the enclosing declaration standing against the value's metavariable. Everywhere else a
-// typevar still unifies vacuously.
-let mut tc_pin_tparam_binds: Int = 0
-
 // Whether this typevar is a type parameter the DECLARATION NOW BEING CHECKED binds, by
 // binder node and not by spelling. That is what makes `a := T` a determination rather than
 // a loss: the monomorphisation pass substitutes this declaration's own parameters once per
@@ -3549,8 +3540,9 @@ pub fn tc_unify(a0: Int, b0: Int) -> Int {
     if a == TYPE_UNKNOWN || b == TYPE_UNKNOWN { return 1 }
     let ka0 = ty_pool.get(a).unwrap().kind
     let kb0 = ty_pool.get(b).unwrap().kind
+    // The one typevar a hole binds to is a parameter of the declaration being checked: it is
+    // one type in each instance of the body, as `List[T]` is in the arm below.
     if ka0 == TyKind.Typevar || kb0 == TyKind.Typevar {
-        if tc_pin_tparam_binds == 0 { return 1 }
         if ka0 == TyKind.Typevar && tc_typevar_binds_here(a) != 0 && tc_is_unbound_metavar(b) != 0 {
             return bind_metavar(b, a)
         }
@@ -4487,8 +4479,8 @@ pub fn tc_tid_subst_mono(tid: Int, mono_tparams_sl: Int, mono_arg_tids: List[Int
 // arg (see the TyKind.Typevar branch below); kind mismatches (arg not shaped like the
 // param) bind nothing.
 // A bind target is CONCRETE when, after following bound metavars, it is neither
-// an unbound metavar nor a bare typevar — i.e. it names a real type a downstream
-// substitution/pin can commit to. Used by unify_typevar_binds so a concrete arg
+// an unbound metavar nor a typevar the checked declaration does not bind — i.e. it
+// names a type a downstream substitution/pin can commit to. Used by unify_typevar_binds so a concrete arg
 // can overwrite a placeholder bind left by a metavar-carrying sibling arg.
 fn bind_target_is_concrete(tid: Int) -> Int {
     let r = tc_resolve(tid)
@@ -5162,11 +5154,7 @@ fn tc_pin_generic_args_from_binds(sig: Int, args_sl: Int, arg_tids: List[Int], s
         if pidx < param_count && arg_t >= 0 && tc_tid_has_unbound_metavar(arg_t) != 0 {
             let ptid = fnsig_param_list.get(param_start + pidx).unwrap()
             let concrete_ptid = substitute_typevar_tid(ptid, binds)
-            // A bind to this body's own parameter came from an argument written here, so the
-            // argument's hole is that parameter, as under tc_pin_tail_ret_generic's licence.
-            tc_pin_tparam_binds = 1
             let _ = tc_unify(concrete_ptid, arg_t)
-            tc_pin_tparam_binds = 0
         }
         i = i + 1
     }
@@ -5311,12 +5299,7 @@ fn tc_pin_tail_ret_generic(declared_ret: Int, inferred_ret: Int) {
     if dbg_channel_on("retpin") != 0 {
         dbg_trace("retpin", "pin declared={type_to_str(d)} inferred={type_to_str(inferred_ret)}")
     }
-    // The declared type is written in the body being checked, so a type parameter in it is
-    // one this body's own instances substitute. Nothing else in typecheck may bind a
-    // metavariable to a typevar, which is why the licence is held for this call alone.
-    tc_pin_tparam_binds = 1
     let _ = tc_unify(d, inferred_ret)
-    tc_pin_tparam_binds = 0
 }
 
 // The value node an if/match ARM BODY reduces to: a Block yields its tail value, a
@@ -14417,7 +14400,6 @@ fn init_types() ! TypeCheck.Register {
     tc_tp_frames.clear()
     // A diagnostic can stop a walk before it restores these flags.
     tc_walk_value_tail = 0
-    tc_pin_tparam_binds = 0
     tc_in_ensures_predicate = 0
     tc_trait_sig_poisoned.clear()
     tc_alias_underlying = Map()
@@ -18968,16 +18950,12 @@ fn tc_report_variant_spread(owner: LitOwner, spread: Int) ! Diag.Report {
 }
 
 // Reverse-infer a generic-enum INSTANCE tid (`Tree[Int]`) from a variant
-// construction, the enum analogue of tc_struct_lit_instance_tid. Given
-// the bare enum tid, its decl node, the variant name, and the constructor's arg
-// list, unify each declared payload field tid (evfield_pool, keyed on the
-// variant's var_idx) against the inferred ctor arg type, collect the typevar binds
-// in the enum's tparam order, and mint make_enum_instance_type. Falls back to the
-// bare `enum_tid` when the enum is non-generic or no type-param bound to a concrete
-// type — mirroring the struct path's has_concrete gate so an all-typevar / bare
-// construction keeps the existing bare behavior unchanged. `args_sl` is the raw
-// call/ctor argument sublist, and `payload_tids` the type tc_check_variant_payload_values
-// answered for each of its arguments.
+// construction, the enum analogue of tc_struct_lit_instance_tid. Unify each declared
+// payload field tid (evfield_pool, keyed on the variant's var_idx) against the inferred
+// ctor arg type, collect the typevar binds, and build the instance from them
+// (tc_enum_instance_from_binds). A non-generic enum keeps the bare `enum_tid`. `args_sl`
+// is the raw call/ctor argument sublist, and `payload_tids` the type
+// tc_check_variant_payload_values answered for each of its arguments.
 fn tc_enum_ctor_instance_tid(enum_tid: Int, var_idx: Int, args_sl: Int, payload_tids: List[Int]) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     let decl = evar_pool.get(var_idx).unwrap().enum_decl
     if decl == -1 { return enum_tid }
@@ -18993,35 +18971,24 @@ fn tc_enum_ctor_instance_tid(enum_tid: Int, var_idx: Int, args_sl: Int, payload_
         }
         fi = fi + 1
     }
-    // An all-unknown instance carries no more information than the bare tid, so the bare
-    // path stays authoritative (mirrors tc_struct_lit_instance_tid). An unbound metavariable
-    // counts: it is a hole the expected type of the whole value fills, and the boundary check
-    // reports it if nothing does. So does a typevar of the enclosing generic body (`Leaf(v)`
-    // with `v: T`): the bare head has no slot for that body's monomorphised copy to fill.
-    let mut has_concrete = 0
-    let mut ci = 0
-    while ci < sublist_length(tparams_sl) {
-        let bound = binds.get(node_name(sublist_get(tparams_sl, ci))) ?? -1
-        if bound != -1 && type_kind(bound) != TyKind.Unknown { has_concrete = 1 }
-        if bound != -1 && tc_is_unbound_metavar(tc_resolve(bound)) != 0 { has_concrete = 1 }
-        // A variant whose payload mentions none of the enum's parameters binds nothing, so
-        // the enclosing annotation is the only place they can come from. Without this the
-        // construction kept the bare head, which names no instance and has no C layout.
-        if bound == -1 && tc_hint_enum_slot(enum_tid, tparams_sl, ci) != -1 { has_concrete = 1 }
-        ci = ci + 1
-    }
-    if has_concrete == 0 { return enum_tid }
+    tc_enum_instance_from_binds(enum_tid, tparams_sl, binds, true)
+}
+
+// The instance a generic variant builds, as a generic fn call's result is: a slot an argument
+// bound takes that bind, and any other slot comes from the expected type (when `use_hint`) or
+// is a hole a later use fills, reported as E0301 if nothing does. The enum's own parameter
+// is never the slot: it is not the checked body's, so it would stay a free typevar. A bind
+// to the `?` error type answers the bare head, since the argument's error is already reported.
+fn tc_enum_instance_from_binds(enum_tid: Int, tparams_sl: Int, binds: Map[Str, Int], use_hint: Bool) -> Int {
     let mut arg_tids: List[Int] = []
     let mut ti = 0
     while ti < sublist_length(tparams_sl) {
-        let tp = sublist_get(tparams_sl, ti)
-        let bound = binds.get(node_name(tp)) ?? -1
+        let bound = binds.get(node_name(sublist_get(tparams_sl, ti))) ?? -1
+        if bound == TYPE_UNKNOWN { return enum_tid }
         if bound != -1 {
             arg_tids.push(bound)
         } else {
-            // A slot nothing bound is a hole, as for a generic fn call's binder: the enum's own
-            // parameter is not the checked body's, so naming it would leave a free typevar.
-            let h = tc_hint_enum_slot(enum_tid, tparams_sl, ti)
+            let h = if use_hint { tc_hint_enum_slot(enum_tid, tparams_sl, ti) } else { -1 }
             arg_tids.push(if h != -1 { h } else { make_metavar() })
         }
         ti = ti + 1
@@ -19032,7 +18999,7 @@ fn tc_enum_ctor_instance_tid(enum_tid: Int, var_idx: Int, args_sl: Int, payload_
 // Struct-style analogue of tc_enum_ctor_instance_tid for a `Variant { field: val }`
 // construction (a StructLit node). Unifies each declared payload field tid against
 // the inferred value by FIELD NAME (lookup_evfield_type_by_name) rather than by
-// position. Same bare-fallback / has_concrete contract.
+// position.
 // The enum-variant twin of tc_infer_struct_lit_field_values: `E.V { a: 1 }` answered its type
 // from the variant name alone, so on every path that needs no reverse-inference the field
 // VALUES were never inferred and carried no type. The declared field type is the value's hint,
@@ -19123,44 +19090,15 @@ fn tc_enum_structlit_instance_tid(enum_tid: Int, vname: Str, flds_sl: Int) -> In
         }
         fi = fi + 1
     }
-    let mut has_concrete = 0
-    let mut ci = 0
-    while ci < sublist_length(tparams_sl) {
-        let bound = binds.get(node_name(sublist_get(tparams_sl, ci))) ?? -1
-        // As in tc_enum_ctor_instance_tid: an unbound metavariable is a hole the expected type
-        // of the whole value fills, and a typevar of the enclosing generic body is a slot its
-        // monomorphised copy fills.
-        if bound != -1 && type_kind(bound) != TyKind.Unknown { has_concrete = 1 }
-        if bound != -1 && tc_is_unbound_metavar(tc_resolve(bound)) != 0 { has_concrete = 1 }
-        // A variant whose payload mentions none of the enum's parameters binds nothing, so
-        // the enclosing annotation is the only place they can come from. Without this the
-        // construction kept the bare head, which names no instance and has no C layout.
-        if bound == -1 && tc_hint_enum_slot(enum_tid, tparams_sl, ci) != -1 { has_concrete = 1 }
-        ci = ci + 1
-    }
-    if has_concrete == 0 { return enum_tid }
-    let mut arg_tids: List[Int] = []
-    let mut ti = 0
-    while ti < sublist_length(tparams_sl) {
-        let tp = sublist_get(tparams_sl, ti)
-        let bound = binds.get(node_name(tp)) ?? -1
-        if bound != -1 {
-            arg_tids.push(bound)
-        } else {
-            let h = tc_hint_enum_slot(enum_tid, tparams_sl, ti)
-            arg_tids.push(if h != -1 { h } else { make_metavar() })
-        }
-        ti = ti + 1
-    }
-    make_enum_instance_type(tc_instance_base_name(enum_tid), arg_tids)
+    tc_enum_instance_from_binds(enum_tid, tparams_sl, binds, true)
 }
 
 // When a generic-enum ctor slot is unbound after arg-unification (a subset variant
 // like `Left(L)` leaves R untouched), the enclosing annotation (tc_construct_hint)
-// may pin it. Return the hint's concrete slot tid at `ti`, or -1 unless the hint is
-// a TyKind.Enum matching THIS enum by strip_module_qualifier(base name) AND arity. Hint
-// fills gaps only; unify wins where it has evidence. An unrelated hint (Option[..],
-// a different-named enum) is rejected.
+// may pin it. Return the hint's slot tid at `ti`, or -1 unless the hint is a
+// TyKind.Enum matching THIS enum by strip_module_qualifier(base name) AND arity and the
+// slot names no other declaration's parameter. Hint fills gaps only; unify wins where it
+// has evidence. An unrelated hint (Option[..], a different-named enum) is rejected.
 fn tc_hint_enum_slot(enum_tid: Int, tparams_sl: Int, ti: Int) -> Int {
     if tc_construct_hint < 0 { return -1 }
     if tc_tid_is_enum(tc_construct_hint) == 0 { return -1 }
@@ -19186,19 +19124,12 @@ fn tc_nullary_variant_tid(enum_tid: Int, var_idx: Int) -> Int {
     if var_idx == -1 { return enum_tid }
     let decl = evar_pool.get(var_idx).unwrap().enum_decl
     if decl == -1 { return enum_tid }
-    if variant_field_count(var_idx) != 0 { return enum_tid }
     let tparams_sl = node_type_params(decl)
     if tparams_sl == -1 || sublist_length(tparams_sl) == 0 { return enum_tid }
     // An expectation with an open slot of its own names nothing, as for `None`.
     let open_hint = tc_construct_hint >= 0 && tc_tid_has_unbound_metavar(tc_construct_hint) != 0
-    let mut arg_tids: List[Int] = []
-    let mut ti = 0
-    while ti < sublist_length(tparams_sl) {
-        let h = if open_hint { -1 } else { tc_hint_enum_slot(enum_tid, tparams_sl, ti) }
-        arg_tids.push(if h != -1 { h } else { make_metavar() })
-        ti = ti + 1
-    }
-    make_enum_instance_type(tc_instance_base_name(enum_tid), arg_tids)
+    let binds: Map[Str, Int] = Map()
+    tc_enum_instance_from_binds(enum_tid, tparams_sl, binds, !open_hint)
 }
 
 // Index of the first variant named `name` in evar_pool. This index is the
@@ -24115,6 +24046,9 @@ fn tc_fn_returns_value() -> Bool {
 // descending, which leaves the arguments both untyped and unchecked. Inferring them AFTER the
 // answer keeps every hinted arm's own argument typing intact: an arm that pins a metavar from
 // a hint has already written the node, and only an argument nobody claimed is inferred here.
+// An arm that types a labelled argument's value (a variant payload `l: Tree.Empty`) claims the
+// label too: a second walk of the value would mint fresh metavars and overwrite the ones the
+// arm pinned.
 fn tc_infer_unclaimed_args(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     if node == -1 { return }
     let k = node_kind(node)
@@ -24126,7 +24060,11 @@ fn tc_infer_unclaimed_args(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Dia
     let mut i = 0
     while i < sublist_length(a_sl) {
         let a = sublist_get(a_sl, i)
-        if a != -1 && tc_tid_is_no_info(tc_lookup_node_tid(a)) != 0 { infer_type(a) }
+        if a != -1 && tc_tid_is_no_info(tc_lookup_node_tid(a)) != 0 {
+            let v = if node_kind(a) == NodeKind.NamedArg { node_value(a) } else { -1 }
+            let vt = tc_lookup_node_tid(v)
+            if tc_tid_is_no_info(vt) == 0 { tc_publish_node_tid(a, vt) } else { infer_type(a) }
+        }
         i = i + 1
     }
 }
@@ -30469,8 +30407,7 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                 // In the COMPATIBLE branch only, so a pin can never turn a reported
                 // mismatch into a silent success. A bare type parameter of THIS
                 // declaration pins too (`let m: Map[K, V] = Map()` in `fn f[K, V]()`),
-                // since mono substitutes f's own parameters once per instance; see
-                // tc_pin_tail_ret_generic for the licence that allows it.
+                // since mono substitutes f's own parameters once per instance (tc_unify).
                 tc_pin_declared_into_value(declared_tid, val, inferred_tid)
             }
         }
