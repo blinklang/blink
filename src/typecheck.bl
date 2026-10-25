@@ -271,6 +271,11 @@ fn tc_variant_decl_node(var_idx: Int) -> Int {
     evar_decl_nodes.get(var_idx).unwrap()
 }
 
+fn tc_variant_mixes_fields(var_idx: Int) -> Bool {
+    let vdecl = tc_variant_decl_node(var_idx)
+    vdecl != -1 && tc_fields_mix_named_and_unnamed(node_fields(vdecl))
+}
+
 type EnumVariantFieldEntry {
     var_idx: Int
     name: Str
@@ -17923,10 +17928,12 @@ fn tc_carrier_nullary_tid(variant: Str, spelled: Str, node: Int) -> Int ! TypeCh
 
 // A declared variant named with no argument list. One with a payload is no value on its own;
 // the closure the help offers gives each parameter its field's type where that type is
-// concrete, since nothing else would pin it.
+// concrete, since nothing else would pin it. A variant that mixes named and unnamed fields
+// (E0320) has no settled field list to offer, so its uses report nothing more.
 fn tc_declared_variant_value_tid(enum_tid: Int, var_idx: Int, spelled: Str, node: Int) -> Int ! TypeCheck.Report, Diag.Report {
     let n = variant_field_count(var_idx)
     if n == 0 { return tc_nullary_variant_tid(enum_tid, evar_pool.get(var_idx).unwrap().enum_decl, var_idx) }
+    if tc_variant_mixes_fields(var_idx) { return tc_error_recovery_tid() }
     let mut params: List[Str] = []
     let mut names: List[Str] = []
     let mut i = 0
@@ -18531,14 +18538,14 @@ fn tc_check_brace_literal(owner: Option[LitOwner], node: Int) ! Diag.Report {
 // field of a variant with unnamed fields, so there the count stays and its labels are unknown.
 // A variant that mixes the two forms (E0320) reports nothing at its uses.
 fn tc_check_variant_paren_payload(var_idx: Int, vname: Str, node: Int) ! TypeCheck.Report, Diag.Report {
-    let vdecl = tc_variant_decl_node(var_idx)
-    if vdecl != -1 && tc_fields_mix_named_and_unnamed(node_fields(vdecl)) { return }
     let args_sl = node_args(node)
     let got = if args_sl != -1 { sublist_length(args_sl) } else { 0 }
     let labels = tc_lit_labels(args_sl)
     let expected = variant_field_count(var_idx)
     if labels.len() == 0 && got == expected { return }
-    let named = match tc_variant_literal_owner(var_idx) {
+    if tc_variant_mixes_fields(var_idx) { return }
+    let owner_opt = tc_variant_literal_owner(var_idx)
+    let named = match owner_opt {
         Some(owner) => owner.rows.len() > 0 && owner.rows.len() == expected
         None => false
     }
@@ -18549,17 +18556,17 @@ fn tc_check_variant_paren_payload(var_idx: Int, vname: Str, node: Int) ! TypeChe
         positional.push(sublist_get(args_sl, i))
         i = i + 1
     }
-    match tc_variant_literal_owner(var_idx) {
+    match owner_opt {
         Some(owner) => {
             if named && labels.len() > 0 && positional.len() <= expected {
                 tc_report_literal_fields(owner, positional, labels, -1, node, -1)
                 return
             }
-            tc_report_variant_arity(owner.shown, var_idx, vname, got, positional.len(), labels, node)
+            tc_report_variant_arity(owner.shown, var_idx, vname, positional.len(), labels, node)
             let faults = literal_field_faults(owner.rows, positional, labels, false)
             for u in faults.unknowns { tc_report_unknown_label(owner, positional.len(), labels, u, false) }
         }
-        None => tc_report_variant_arity("", var_idx, vname, got, positional.len(), labels, node)
+        None => tc_report_variant_arity("", var_idx, vname, positional.len(), labels, node)
     }
 }
 
@@ -18585,8 +18592,9 @@ fn tc_report_positional_after_label(args_sl: Int, named: Bool) -> Bool ! Diag.Re
 }
 
 // The count error, with a note that lists the variant's fields when its declaration is known.
-fn tc_report_variant_arity(shown: Str, var_idx: Int, vname: Str, got: Int, positional: Int, labels: List[Int], node: Int) ! TypeCheck.Report, Diag.Report {
+fn tc_report_variant_arity(shown: Str, var_idx: Int, vname: Str, positional: Int, labels: List[Int], node: Int) ! TypeCheck.Report, Diag.Report {
     let expected = variant_field_count(var_idx)
+    let got = positional + labels.len()
     if got == expected { return }
     let msg = "variant `{vname}` expects {expected} argument(s), got {got}"
     tc_errors.push(msg)
@@ -18611,20 +18619,31 @@ fn tc_variant_fields_note(shown: Str, var_idx: Int, positional: Int, labels: Lis
 // label, marked `(given)`. The count error and MissingField share it, so the two never
 // disagree on what a payload filled.
 fn tc_fields_given_note(shown: Str, fields: List[Int], positional: Int, labels: List[Int]) -> Str {
+    let mut written: List[Str] = []
+    let mut names: List[Str] = []
+    for f in fields {
+        let t = type_ann_text(node_value(f))
+        let unnamed = node_int_val(f) != 0
+        written.push(if unnamed { t } else { "{node_name(f)} ({t})" })
+        names.push(if unnamed { "" } else { node_name(f) })
+    }
+    "fields of `{shown}`, in order: {tc_mark_given(written, names, positional, labels).join(", ")}"
+}
+
+// Marks `(given)` each field that argument i filled by position or a label named. `names`
+// holds "" for an unnamed field, which no label can name.
+fn tc_mark_given(written: List[Str], names: List[Str], filled: Int, labels: List[Int]) -> List[Str] {
     let mut labelled: Map[Str, Int] = Map()
     for l in labels { labelled.insert(node_name(l), 1) }
     let mut out: List[Str] = []
     let mut i = 0
-    while i < fields.len() {
-        let f = fields.get(i).unwrap()
-        let t = type_ann_text(node_value(f))
-        let unnamed = node_int_val(f) != 0
-        let written = if unnamed { t } else { "{node_name(f)} ({t})" }
-        let given = i < positional || (!unnamed && labelled.contains_key(node_name(f)))
-        out.push(if given { "{written} (given)" } else { written })
+    while i < written.len() {
+        let name = names.get(i).unwrap()
+        let given = i < filled || (name != "" && labelled.contains_key(name))
+        out.push(if given { "{written.get(i).unwrap()} (given)" } else { written.get(i).unwrap() })
         i = i + 1
     }
-    "fields of `{shown}`, in order: {out.join(", ")}"
+    out
 }
 
 // Every DuplicateField, then every NoSuchField, then MissingField (§2.14 Order). `lit` is the
@@ -18633,8 +18652,6 @@ fn tc_fields_given_note(shown: Str, fields: List[Int], positional: Int, labels: 
 fn tc_report_literal_fields(owner: LitOwner, positional: List[Int], labels: List[Int], spread: Int, head: Int, lit: Int) ! Diag.Report {
     let faults = tc_report_label_faults(owner, owner.rows, positional, labels, spread == -1, false)
     if faults.missing.len() == 0 { return }
-    let mut fill: List[Str] = []
-    for r in faults.missing { fill.push("{r.name}: ") }
     let one = faults.missing.len() == 1
     let first = faults.missing.get(0).unwrap().name
     let what = tc_missing_fields_phrase(faults.missing)
@@ -18648,6 +18665,8 @@ fn tc_report_literal_fields(owner: LitOwner, positional: List[Int], labels: List
         diag_error_at_notes("MissingField", MISSING_FIELD, "`{owner.shown}` is missing {what}", head, help, [tc_fields_given_note(owner.shown, fields, positional.len(), labels)])
         return
     }
+    let mut fill: List[Str] = []
+    for r in faults.missing { fill.push("{r.name}: ") }
     let before = diag_entry_count()
     diag_error_at("MissingField", MISSING_FIELD, "`{owner.shown}` literal is missing {what}", head, help)
     if diag_entry_count() > before { tc_assist_fill_fields(lit, labels, fill) }
@@ -18734,16 +18753,9 @@ fn tc_report_unknown_label(owner: LitOwner, filled: Int, labels: List[Int], u: L
 }
 
 fn tc_declared_marks(owner: LitOwner, filled: Int, labels: List[Int]) -> List[Str] {
-    let mut given: Map[Str, Int] = Map()
-    for l in labels { given.insert(node_name(l), 1) }
-    let mut out: List[Str] = []
-    let mut i = 0
-    while i < owner.rows.len() {
-        let r = owner.rows.get(i).unwrap()
-        out.push(if i < filled || given.contains_key(r.name) { "{r.name} (given)" } else { r.name })
-        i = i + 1
-    }
-    out
+    let mut names: List[Str] = []
+    for r in owner.rows { names.push(r.name) }
+    tc_mark_given(names, names, filled, labels)
 }
 
 // §3.5 Struct patterns: the labels of a struct pattern or a variant brace pattern are checked
