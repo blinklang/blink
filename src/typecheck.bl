@@ -6758,8 +6758,9 @@ fn tc_pin_param_into_arg(ptid: Int, arg_node: Int, arg_t: Int) ! TypeCheck.Resol
 
 fn check_one_arg_shape(fn_name: Str, idx: Int, arg_node: Int, ptid: Int, projects: Bool) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     tc_seed_expected_into_value(arg_node, ptid)
+    let arg_hint = resolve_alias_tid(ptid)
     let saved_hint = tc_construct_hint
-    tc_construct_hint = resolve_alias_tid(ptid)
+    tc_construct_hint = arg_hint
     let arg_t = infer_type(arg_node)
     tc_construct_hint = saved_hint
     // An argument whose own type nothing has determined cannot be judged against
@@ -10852,7 +10853,6 @@ fn tc_hash_roles_from(names: List[Str], prior: List[HashRole]) -> List[HashRole]
 // through another declaration's obliged parameter, so this repeats until no mark changes;
 // marks are only ever added, so it stops.
 fn tc_compute_type_hash_obligations(types_sl: Int) {
-    let saved_module = nr_current_module
     let mut changed = 1
     while changed != 0 {
         changed = 0
@@ -10861,7 +10861,9 @@ fn tc_compute_type_hash_obligations(types_sl: Int) {
             let td = sublist_get(types_sl, i)
             let tps = node_type_params(td)
             if tps != -1 && sublist_length(tps) > 0 {
-                nr_current_module = node_module(td)
+                let td_module = node_module(td)
+                let saved_module = nr_current_module
+                nr_current_module = td_module
                 let mut names: List[Str] = []
                 let mut p = 0
                 while p < sublist_length(tps) {
@@ -10890,11 +10892,11 @@ fn tc_compute_type_hash_obligations(types_sl: Int) {
                     tc_hash_oblig.insert(td, roles)
                     changed = 1
                 }
+                nr_current_module = saved_module
             }
             i = i + 1
         }
     }
-    nr_current_module = saved_module
 }
 
 // The roles of the generic fn behind `sig`, over its type parameters in
@@ -10915,8 +10917,9 @@ fn tc_fn_hash_obligations(sig: Int) -> List[HashRole] {
         names.push(if idx < fnsig_type_param_names.len() { fnsig_type_param_names.get(idx).unwrap() } else { "" })
         i = i + 1
     }
+    let decl_module = node_module(fs.decl)
     let saved_module = nr_current_module
-    nr_current_module = node_module(fs.decl)
+    nr_current_module = decl_module
     let roles = tc_hash_roles_from(names, none)
     tc_hash_oblig_walk_tree(fs.decl, names, roles)
     nr_current_module = saved_module
@@ -11679,8 +11682,9 @@ fn tc_check_one_derive_trait(tr: Str) ! Diag.Report {
         let td = tc_type_decl_nodes.get(tname) ?? -1
         if td != -1 && tc_decl_derives(td, tr) != 0 {
             let ttid = named_type_ids.get(ti) ?? -1
+            let td_module = node_module(td)
             let saved_module = nr_current_module
-            nr_current_module = node_module(td)
+            nr_current_module = td_module
             let flds_sl = node_fields(td)
             let mut i = 0
             while flds_sl != -1 && i < sublist_length(flds_sl) {
@@ -11844,8 +11848,9 @@ fn tc_check_derive_serialize() ! Diag.Report {
         let tname = named_type_names.get(ti).unwrap()
         let td = tc_decl_node_for_type(tname)
         if td != -1 && tc_decl_derives(td, "Serialize") != 0 {
+            let td_module = node_module(td)
             let saved_module = nr_current_module
-            nr_current_module = node_module(td)
+            nr_current_module = td_module
             let flds_sl = node_fields(td)
             let mut i = 0
             while flds_sl != -1 && i < sublist_length(flds_sl) {
@@ -14030,6 +14035,13 @@ fn check_impl_type_arg_names(args_sl: Int, binders_sl: Int, trait_name: Str, whe
     }
 }
 
+// The pair only gives back the caller's module, which the helper moves per impl. The
+// assignment is in the helper, so W0550 reads the pair as a rollback and wants each other
+// write of the helper undone. Those writes (diagnostics, the type pool, impl receivers,
+// polymorphic impls) are this pass's output: check_types runs it once to register impls,
+// and later passes read them on purpose. Nothing here reads them after the call, so no
+// path needs them undone.
+@allow(IncompleteStateRestore)
 fn validate_trait_impls(program: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.Report {
     let saved_module = nr_current_module
     validate_trait_impls_in_own_modules(program)
@@ -14726,15 +14738,9 @@ fn init_types() ! TypeCheck.Register {
 }
 
 // Declarations resolve their annotations in their own module, so a bare namesake reads
-// as the declaring module's type. The caller's module comes back after: the module context
-// also gates the used-import bookkeeping, which these passes must not touch.
+// as the declaring module's type. The caller's module comes back after each one: the module
+// context also gates the used-import bookkeeping, which these passes must not touch.
 fn tc_register_type_decls(types_sl: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.Report {
-    let saved_module = nr_current_module
-    tc_register_type_decls_in_own_modules(types_sl)
-    nr_current_module = saved_module
-}
-
-fn tc_register_type_decls_in_own_modules(types_sl: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.Report {
     if types_sl == -1 { return }
     tc_collect_namesake_type_names(types_sl)
     let mut i = 0
@@ -14771,10 +14777,13 @@ fn tc_register_type_decls_in_own_modules(types_sl: Int) ! TypeCheck.Register, Ty
             // a binder that shadows a builtin (`type Wrap[List] = List`) is a type
             // variable there, not the constructor (§3.4:1259).
             let alias_tparams = node_type_params(atd)
-            nr_current_module = node_module(atd)
+            let atd_module = node_module(atd)
+            let saved_module = nr_current_module
+            nr_current_module = atd_module
             tc_push_tparam_scope(alias_tparams)
             tc_alias_underlying.insert(tc_nominal_type_name(atd), resolve_type_ann(alias_ann))
             tc_pop_tparam_scope(alias_tparams)
+            nr_current_module = saved_module
         }
         j = j + 1
     }
@@ -14786,7 +14795,9 @@ fn tc_register_type_decls_in_own_modules(types_sl: Int) ! TypeCheck.Register, Ty
     let mut k = 0
     while k < sublist_length(types_sl) {
         let etd = sublist_get(types_sl, k)
-        nr_current_module = node_module(etd)
+        let etd_module = node_module(etd)
+        let saved_module = nr_current_module
+        nr_current_module = etd_module
         let etd_flds = node_fields(etd)
         let mut is_enum = 0
         if etd_flds != -1 && sublist_length(etd_flds) > 0 {
@@ -14801,22 +14812,20 @@ fn tc_register_type_decls_in_own_modules(types_sl: Int) ! TypeCheck.Register, Ty
         } else {
             resolve_struct_fields(etd)
         }
+        nr_current_module = saved_module
         k = k + 1
     }
 }
 
 fn tc_register_fn_sigs(fns_sl: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.Report {
-    let saved_module = nr_current_module
-    tc_register_fn_sigs_in_own_modules(fns_sl)
-    nr_current_module = saved_module
-}
-
-fn tc_register_fn_sigs_in_own_modules(fns_sl: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.Report {
     let mut i = 0
     while i < sublist_length(fns_sl) {
         let fn_node = sublist_get(fns_sl, i)
-        nr_current_module = node_module(fn_node)
+        let fn_module = node_module(fn_node)
+        let saved_module = nr_current_module
+        nr_current_module = fn_module
         register_fn_sig(fn_node)
+        nr_current_module = saved_module
         i = i + 1
     }
 }
@@ -15025,12 +15034,13 @@ pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report {
     // Register impl method signatures
     let impls_sl = node_methods(program)
     if impls_sl != -1 {
-        // A type name in a method signature means what it means in the impl's own module.
-        let saved_impl_module = nr_current_module
         let mut i = 0
         while i < sublist_length(impls_sl) {
             let im = sublist_get(impls_sl, i)
-            nr_current_module = node_module(im)
+            // A type name in a method signature means what it means in the impl's own module.
+            let im_module = node_module(im)
+            let saved_impl_module = nr_current_module
+            nr_current_module = im_module
             let impl_type = tc_impl_target_name(im)
             let trait_id = tc_impl_trait_id(im)
             // Register the canonical monomorphized poly impl
@@ -15103,9 +15113,9 @@ pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report {
                 }
             }
             tc_pop_tparam_scope(impl_binders_sl)
+            nr_current_module = saved_impl_module
             i = i + 1
         }
-        nr_current_module = saved_impl_module
     }
 
     // Validate trait impl contracts
@@ -19377,17 +19387,16 @@ fn tc_infer_enum_structlit_field_values(enum_tid: Int, vname: Str, flds_sl: Int)
                 tc_check_body(v)
                 let _ = infer_type(v)
             } else {
+                let hint_declared = declared != -1 && tc_tid_is_no_info(declared) == 0
                 let saved_hint = tc_construct_hint
-                if declared != -1 && tc_tid_is_no_info(declared) == 0 {
-                    tc_construct_hint = declared
-                    tc_seed_declared_field(raw, declared, v)
-                }
+                tc_construct_hint = if hint_declared { declared } else { saved_hint }
+                if hint_declared { tc_seed_declared_field(raw, declared, v) }
                 let vt = infer_type(v)
                 tc_construct_hint = saved_hint
-                if declared != -1 && tc_tid_is_no_info(declared) == 0 && tc_tid_has_unbound_metavar(vt) != 0 {
+                if hint_declared && tc_tid_has_unbound_metavar(vt) != 0 {
                     tc_unify(declared, vt)
                 }
-                if declared != -1 && tc_tid_is_no_info(declared) == 0 && tc_variant_fields_typed_at(var_idx, enum_tid) {
+                if hint_declared && tc_variant_fields_typed_at(var_idx, enum_tid) {
                     tc_pin_declared_into_value(declared, v, vt)
                 }
             }
@@ -24151,13 +24160,15 @@ fn tc_check_assert_eq_args(tids: List[Int], node: Int) ! TypeCheck.Resolve, Type
 }
 
 fn infer_carrier_arg(arg_node: Int, carrier: Str) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
-    let saved_hint = tc_construct_hint
     let k = type_kind(tc_construct_hint)
+    let mut inner_hint = tc_construct_hint
     if carrier == "Err" {
-        if tc_construct_hint >= 0 && k == TyKind.Result { tc_construct_hint = ty_pool.get(tc_construct_hint).unwrap().inner2 }
+        if tc_construct_hint >= 0 && k == TyKind.Result { inner_hint = ty_pool.get(tc_construct_hint).unwrap().inner2 }
     } else if (carrier == "Some" && k == TyKind.Option) || (carrier == "Ok" && k == TyKind.Result) {
-        if tc_construct_hint >= 0 { tc_construct_hint = ty_pool.get(tc_construct_hint).unwrap().inner1 }
+        if tc_construct_hint >= 0 { inner_hint = ty_pool.get(tc_construct_hint).unwrap().inner1 }
     }
+    let saved_hint = tc_construct_hint
+    tc_construct_hint = inner_hint
     let inner = infer_type(arg_node)
     tc_construct_hint = saved_hint
     // Inference never picks Never for an open slot (§3.2): a diverging payload leaves the
@@ -24618,13 +24629,13 @@ fn tc_check_lit_field_values(node: Int, lit_t: Int) ! TypeCheck.Resolve, TypeChe
 }
 
 pub fn infer_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
-    // §2.9: infer_type_uncached resets tc_if_value_ctx to 1 at entry (its consuming child
-    // descents are all value positions) and only its pass-through arms restore the incoming
-    // context. Save/restore here so a walk never clobbers the flag its caller set — the
-    // ambient a discarded statement relies on stays 0 across statements.
-    let saved_ctx = tc_if_value_ctx
-    let tid = infer_type_uncached(node)
-    tc_if_value_ctx = saved_ctx
+    // §2.9: the walk runs with tc_if_value_ctx at 1, because most child descents use their
+    // value. Restore it on return so a walk does not change the flag its caller set; a
+    // discarded statement relies on it staying 0 across statements.
+    let incoming = tc_if_value_ctx
+    tc_if_value_ctx = 1
+    let tid = infer_type_uncached(node, incoming)
+    tc_if_value_ctx = incoming
     tc_infer_unclaimed_args(node)
     tc_check_type_args_claimed(node, tid)
     if node != -1 && node < tc_node_tid.len() {
@@ -24793,8 +24804,12 @@ fn tc_ffi_alloc_unhinted_tid(node: Int) -> Int ! Diag.Report {
     -1
 }
 
+// §2.9: `incoming` is 1 when this node's value is used, so its else-less `if` needs an `else`.
+// Only the arms that hand the node on to a tail (block, with and async tails, if branches,
+// match-arm bodies) put it back in tc_if_value_ctx, so a discarded statement's else-less `if`
+// stays legal exactly at those tails.
 @allow(UnrestoredMutation)
-fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     // No node is an absence, not a type. Every caller reads it through tc_tid_is_no_info.
     if node == -1 { return -1 }
     let kind = node_kind(node)
@@ -24802,15 +24817,6 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
     // Scope is live here and nowhere later, so the one question the total-stamp pass cannot
     // answer for itself is settled now: whether this node's callee or qualifier names a value.
     tc_record_name_position_value(node)
-
-    // §2.9 value-context flag. `incoming` is whether THIS node is a consumed value (its else-less
-    // `if` needs an `else`). Reset to 1 so every consuming child descent below — operand, element,
-    // field, argument, index, scrutinee, condition — is value context by default. Only the
-    // pass-through arms (block/with/async tail, if branches, match-arm bodies) restore `incoming`,
-    // so a discarded statement's legal else-less `if` stays legal exactly at those tails. The
-    // infer_type wrapper restores the flag on return, so this write never escapes the walk.
-    let incoming = tc_if_value_ctx
-    tc_if_value_ctx = 1
 
     if kind == NodeKind.IntLit { return tc_int_literal_type(node) }
     if kind == NodeKind.FloatLit { return TYPE_FLOAT }
@@ -30730,13 +30736,13 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
         // checked against Void, so only a named function's Void body drops its tail.
         let drops_tail = is_fn_body != 0 && !value_fn_body && tc_current_fn_name != "closure"
         let last_stmt = tc_block_tail_stmt(node)
-        // A binder named for the block's value names its tail, not a statement before it.
-        let block_binder = tc_ffi_scope_binder
         if stmts_sl != -1 {
             let mut i = 0
             let mut _found_terminal = 0
             while i < sublist_length(stmts_sl) {
                 let stmt = sublist_get(stmts_sl, i)
+                // A binder named for the block's value names its tail, not a statement before it.
+                let block_binder = tc_ffi_scope_binder
                 tc_ffi_scope_binder = if stmt == last_stmt { block_binder } else { "" }
                 if _found_terminal != 0 {
                     diag_warn_at("UnreachableCode", UNREACHABLE_CODE, "unreachable code after return/break/continue", stmt, "remove this code or move it before the control flow statement")
@@ -30765,10 +30771,10 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                 if sk == NodeKind.Return || sk == NodeKind.Break || sk == NodeKind.Continue {
                     _found_terminal = 1
                 }
+                tc_ffi_scope_binder = block_binder
                 i = i + 1
             }
         }
-        tc_ffi_scope_binder = block_binder
         // ORDERING CONTRACT: this must run BEFORE nr_pop_scope. The pin
         // inside tc_check_returned_value binds metavars in place — bind_metavar mutates
         // the α slot itself, and the tail's instance tid and the scope entry for a local
@@ -32752,12 +32758,6 @@ fn tc_check_trait_method_defaults(trait_name: Str, tmethods_sl: Int) ! TypeCheck
 }
 
 fn tc_check_trait_default_bodies(tmethods_sl: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
-    let prev_walk_ret = tc_current_fn_ret
-    tc_check_each_trait_default_body(tmethods_sl)
-    tc_current_fn_ret = prev_walk_ret
-}
-
-fn tc_check_each_trait_default_body(tmethods_sl: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     let mut mj = 0
     while mj < sublist_length(tmethods_sl) {
         let dm = sublist_get(tmethods_sl, mj)
@@ -32766,8 +32766,11 @@ fn tc_check_each_trait_default_body(tmethods_sl: Int) ! TypeCheck.Resolve, TypeC
             // set it here (Self resolves to the abstract self typevar) — an
             // explicit `return expr` in the body is checked against it.
             let dm_ann = node_type_ann(dm)
-            tc_current_fn_ret = if dm_ann == -1 { TYPE_VOID } else { resolve_type_ann(dm_ann) }
+            let dm_ret = if dm_ann == -1 { TYPE_VOID } else { resolve_type_ann(dm_ann) }
+            let prev_walk_ret = tc_current_fn_ret
+            tc_current_fn_ret = dm_ret
             tc_check_fn(dm)
+            tc_current_fn_ret = prev_walk_ret
         }
         mj = mj + 1
     }
@@ -34195,9 +34198,11 @@ fn tc_report_unclaimed_calls(order: List[Int], mods: List[Str]) ! Diag.Report {
         if unclaimed.contains_key(n) { call_mod.insert(n, mods.get(i).unwrap()) }
         i = i + 1
     }
-    let saved_module = nr_current_module
+    let outer_module = nr_current_module
     for uc in calls {
-        nr_current_module = call_mod.get(uc) ?? saved_module
+        let uc_module = call_mod.get(uc) ?? outer_module
+        let saved_module = nr_current_module
+        nr_current_module = uc_module
         let obj = node_obj(uc)
         let mname = node_method(uc)
         let recv = tc_lookup_node_tid(obj)
@@ -34221,8 +34226,8 @@ fn tc_report_unclaimed_calls(order: List[Int], mods: List[Str]) ! Diag.Report {
                 diag_error_at("UnresolvedMethod", UNRESOLVED_METHOD, "no member `{mname}` on module `{q}`", uc, help)
             }
         }
+        nr_current_module = saved_module
     }
-    nr_current_module = saved_module
 }
 
 // A value receiver's type, determined all the way down. A local shadowing a module name
