@@ -41,6 +41,7 @@ Test: `task test` — compile+run all test_*.bl in tests/
 Test formatter: `task test-fmt` — golden outputs + idempotency + semantic checks; `task ci` runs the goldens with the semantic check off
 Single test: `task compile-test -- test_name` (needs a seeded build/)
 Gate: `task ci` — gen0 compiles src (gen1) + full corpus passes + lint + fmt goldens + typecheck suite + rewrite unit suite. Run after every change. See docs/codegen-rewrite/harness.md
+Warning gate: `task warning-gate` — gen1 `blink check` on src/cli.bl + src/blinkc_main.bl; any warning in the compiler build fails it and prints each site. `task ci` and `task ci-fast` run it
 Release gate: `task ci-release` — regen + test + test-fmt + per-module invariants. Run at release points
 Corpus: `task corpus` — every tests/test_*.bl compiled+run on its own under gen1 (the current source compiled by the pinned gen0); result in build/corpus.json; `task corpus-check` fails unless every file passes
 Quick run: `build/blink run <file.bl>` — compiles and runs in one step. Prefer this over manual blinkc+cc. Use `build/gen1/bin/blink` when build/ is not seeded
