@@ -9493,7 +9493,7 @@ fn tc_resolve_compiler_known_type(name: Str, elems_sl: Int, ann_node: Int) -> In
             let key_t = resolve_type_ann(key_ann)
             let val_t = resolve_type_ann(sublist_get(elems_sl, 1))
             if tc_suppress_ann_validation == 0 {
-                validate_keyed_ann(key_ann, HashRole.MapKey)
+                validate_keyed_ann(key_ann, Some(key_t), HashRole.MapKey)
                 tc_refuse_unhashable_instance(key_t, key_ann, HashRole.MapKey)
             }
             return make_map_type(key_t, val_t)
@@ -9505,7 +9505,7 @@ fn tc_resolve_compiler_known_type(name: Str, elems_sl: Int, ann_node: Int) -> In
             let elem_ann = sublist_get(elems_sl, 0)
             let elem_t = resolve_type_ann(elem_ann)
             if tc_suppress_ann_validation == 0 {
-                validate_keyed_ann(elem_ann, HashRole.SetElement)
+                validate_keyed_ann(elem_ann, Some(elem_t), HashRole.SetElement)
                 tc_refuse_unhashable_instance(elem_t, elem_ann, HashRole.SetElement)
             }
             return make_set_type(elem_t)
@@ -10485,7 +10485,8 @@ fn is_builtin_hashable(name: Str) -> Int {
 // straight through the arm above. So a hop is taken only when the underlying name is one these
 // rules can decide NOMINALLY: a hashable builtin, a Float width, or a declared struct/enum
 // (which also keeps alias chains walking, since an intermediate alias is itself a named type).
-// Anything else leaves the declared name in place and the caller's behavior unchanged.
+// Anything else leaves the alias name in place, and the caller judges the alias by its
+// underlying type instead of by the name.
 // "Tuple" is deliberately excluded even though is_primitive_type recognizes it: a NAME
 // carries no type arguments, so a tuple alias (`type Pair = (Float, Float)`) resolves to
 // the bare name "Tuple" with no element nodes to recurse into, and Tuple's hashability
@@ -10570,16 +10571,47 @@ fn tc_report_unhashable(role: HashRole, why: HashRefusal, shown: Str, name: Str,
     }
 }
 
+// The element types of a resolved tuple of `arity` elements, or none when `key_tid` is not one.
+fn tc_tuple_part_tids(key_tid: Option[Int], arity: Int) -> List[Int] {
+    let mut out: List[Int] = []
+    let tid = match key_tid {
+        Some(t) => tc_resolve(t)
+        None => { return out }
+    }
+    if type_kind(tid) != TyKind.Tuple { return out }
+    let te = ty_pool.get(tid).unwrap()
+    if te.params_count != arity { return out }
+    let mut i = 0
+    while i < arity {
+        out.push(ty_param_list.get(te.params_start + i).unwrap())
+        i = i + 1
+    }
+    out
+}
+
 // A written Map key or Set element. A Set is a keys-only hash table, so its element carries
 // the same Hash requirement as a Map key: built-in scalars OK; user structs/enums need
 // @derive(Hash); tuples OK iff every element is hashable; Float/Double rejected; generic type
 // params accepted (opaque at this point); aliases decided by their base type.
-fn validate_keyed_ann(key_ann: Int, role: HashRole) ! Diag.Report {
+// `key_tid` is the resolved type of `key_ann` where the caller has resolved it.
+fn validate_keyed_ann(key_ann: Int, key_tid: Option[Int], role: HashRole) ! Diag.Report {
     // Decisions read the base type; every message names what the USER wrote, so a rejected
     // `type Temp = Float` says "Map key type 'Temp'" and explains the Float hazard behind it.
     let decl_name = node_name(key_ann)
     if tc_name_is_tparam_in_scope(decl_name) != 0 { return }
     let key_name = resolve_alias_type_name(decl_name)
+    // A name the hops cannot see through, such as a tuple alias, is judged by the type it names.
+    // A derive written on the alias grants nothing: the alias is that type.
+    let aliased = tc_alias_underlying_of(key_name)
+    if aliased != -1 {
+        // Without the caller's type, the alias's declared type is the one it names.
+        let judged = match key_tid {
+            Some(t) => t
+            None => aliased
+        }
+        tc_refuse_unhashable_tid(judged, role, key_ann)
+        return
+    }
     if key_name == "Float" || key_name == "F32" || key_name == "F64" {
         tc_report_unhashable(role, HashRefusal.FloatKey, decl_name, key_name, key_ann)
         return
@@ -10587,9 +10619,10 @@ fn validate_keyed_ann(key_ann: Int, role: HashRole) ! Diag.Report {
     if key_name == "Tuple" {
         let elems = node_elements(key_ann)
         if elems != -1 {
+            let parts = tc_tuple_part_tids(key_tid, sublist_length(elems))
             let mut i = 0
             while i < sublist_length(elems) {
-                validate_keyed_ann(sublist_get(elems, i), role)
+                validate_keyed_ann(sublist_get(elems, i), parts.get(i), role)
                 i = i + 1
             }
         }
@@ -10713,17 +10746,17 @@ fn tc_validate_type_arg_hashability(owner_oblig: List[HashRole], elems_sl: Int) 
         let arg_name = node_name(arg)
         let arg_elems = node_elements(arg)
         match tc_hash_oblig_mark(owner_oblig, i) {
-            HashRole.SetElement => validate_keyed_ann(arg, HashRole.SetElement)
-            HashRole.MapKey => validate_keyed_ann(arg, HashRole.MapKey)
+            HashRole.SetElement => validate_keyed_ann(arg, None, HashRole.SetElement)
+            HashRole.MapKey => validate_keyed_ann(arg, None, HashRole.MapKey)
             HashRole.Free => {}
         }
         if arg_name == "Map" {
             if arg_elems != -1 && sublist_length(arg_elems) >= 1 {
-                validate_keyed_ann(sublist_get(arg_elems, 0), HashRole.MapKey)
+                validate_keyed_ann(sublist_get(arg_elems, 0), None, HashRole.MapKey)
             }
         } else if arg_name == "Set" {
             if arg_elems != -1 && sublist_length(arg_elems) >= 1 {
-                validate_keyed_ann(sublist_get(arg_elems, 0), HashRole.SetElement)
+                validate_keyed_ann(sublist_get(arg_elems, 0), None, HashRole.SetElement)
             }
         }
         tc_validate_type_arg_hashability(tc_hash_oblig_of(arg_name), arg_elems)
@@ -11522,6 +11555,15 @@ fn tc_field_type_derivable(written: Str, tr: Str) -> Int {
     // asked of what the name resolves to. The caller keeps the written name for the
     // message, because that is the text the author can change.
     let ftype_name = resolve_alias_type_name(written)
+    // A name the hops cannot see through, such as a tuple alias, is judged by the type it names.
+    // A derive written on the alias grants nothing: the alias is that type.
+    let aliased = tc_alias_underlying_of(ftype_name)
+    if aliased != -1 {
+        if type_kind(tc_resolve(aliased)) == TyKind.Tuple { return 0 }
+        if tr == "Hash" && tc_tid_hash_fact(aliased) == -1 { return 0 }
+        if tr == "Ord" && tc_ord_need(aliased, []).len() > 0 { return 0 }
+        return 1
+    }
 
     // Collections are never hashable or orderable in v1.
     if tc_is_container_name(ftype_name) != 0 { return 0 }
@@ -28383,7 +28425,7 @@ fn tc_container_ctor_from_type_args(call_node: Int, name: Str) -> Int ! TypeChec
     // written annotation is, with its text.
     if tc_suppress_ann_validation == 0 {
         let role = if declared == 1 { HashRole.SetElement } else { HashRole.MapKey }
-        validate_keyed_ann(sublist_get(targs, 0), role)
+        validate_keyed_ann(sublist_get(targs, 0), Some(first), role)
         tc_refuse_unhashable_instance(first, sublist_get(targs, 0), role)
     }
     if declared == 1 { return make_set_type(first) }
