@@ -86,6 +86,28 @@ pub fn rename(from: Str, to: Str) -> Bool ! IO {
     rc == 0
 }
 
+// Moves the finished private dir stage to dir with mode 0755, which mkdir -p would have given
+// it, and says whether dir holds key after. rename(2) does not replace a dir that holds
+// entries, so when a concurrent build put its dir there first, that dir stays and stage goes:
+// a check-then-mv would put stage inside it. A dir there without key is no dir any build
+// published, and goes first. It is tested for before key, so a dir another build renames in
+// between is never taken for one without key.
+pub fn publish_dir(stage: Str, dir: Str, key: Str) -> Bool ! IO {
+    unmark(stage)
+    if file_exists(dir) == 1 && file_exists("{dir}/{key}") == 0 {
+        let _ = remove_tree(dir)
+    }
+    let mut opened = false
+    with ffi.scope() as scope {
+        // 493 is 0755.
+        opened = bfs_chmod(scope.cstr(stage), 493.to_u32()).to_int() == 0
+    }
+    if !opened || !rename(stage, dir) {
+        let _ = remove_tree(stage)
+    }
+    file_exists("{dir}/{key}") == 1
+}
+
 let BFS_NAME_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
 
 // mktemp -d {parent}/{prefix}.XXXXXX: a new directory only its user may enter, named by six
@@ -698,6 +720,10 @@ fn bfs_rmdir(path: Ptr[U8]) -> I32 ! FFI {}
 @ffi("rename", header: "stdio.h")
 @trusted(audit: "Wraps rename(2). Both paths are NUL-terminated copies from ffi.scope().")
 fn bfs_rename(from: Ptr[U8], to: Ptr[U8]) -> I32 ! FFI {}
+
+@ffi("chmod", header: "sys/stat.h")
+@trusted(audit: "Wraps chmod(2). path is a NUL-terminated copy from ffi.scope(); mode is 0755.")
+fn bfs_chmod(path: Ptr[U8], mode: U32) -> I32 ! FFI {}
 
 @ffi("link", header: "unistd.h")
 @trusted(audit: "Wraps link(2). A Str is NUL-terminated and holds no NUL, so each path reaches C whole.")

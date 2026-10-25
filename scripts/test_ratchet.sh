@@ -429,9 +429,8 @@ check_pool_write parser-column-push src/parser.bl 'fn scratch() { columns.child_
 check_pool_write parser-column-set src/parser.bl 'fn scratch() { columns.child_at.set(0, 1) }'
 check_pool_write parser-column-slot src/parser.bl 'fn scratch() { columns.kinds[0] = 3 }'
 
-# repo_tmp_in_tests_and_scripts is an absolute zero gate: a `.tmp/` scratch path
-# added to a test or a script must fail on that row, and a `.tmp/` inside a tree
-# the file made itself (the compiler's own, under test) must not.
+# repo_tmp_in_tests_and_scripts is an absolute zero gate: a `.tmp/` path added to a
+# test or a script must fail on that row, inside a tree the file made itself too.
 check_repo_tmp() {
   label="$1"; file="$2"; extra="$3"; want="$4"
   d="$WORK/repotmp_$label"
@@ -451,7 +450,7 @@ check_repo_tmp() {
     printf '%s\n' "$out"
     fail=1
   elif [ "$want" = pass ] && [ "$hit" = 1 ]; then
-    echo "FAIL repo_tmp-$label: a .tmp/ inside a private tree was counted"
+    echo "FAIL repo_tmp-$label: a name that only ends in .tmp was counted"
     printf '%s\n' "$out"
     fail=1
   else
@@ -465,8 +464,10 @@ check_repo_tmp script-mktemp scripts/some_gate.sh 'f=$(mktemp .tmp/gate-XXXXXX)'
 check_repo_tmp test-root-prefixed tests/test_scratch_user.bl 'let p = "{root}/.tmp/probe.bl"' fail
 check_repo_tmp test-suffix-name-not-counted tests/test_scratch_user.bl 'let p = "{dir}/plain.tmp/x"' pass
 check_repo_tmp test-private-tree tests/test_scratch_user.bl 'shell_exec("mkdir -p {tree}/.tmp")
-write_file("{tree}/.tmp/x.o", "")' pass
-check_repo_tmp script-private-tree scripts/some_gate.sh 'mkdir -p "$work/.tmp/"' pass
+write_file("{tree}/.tmp/x.o", "")' fail
+check_repo_tmp script-private-tree scripts/some_gate.sh 'mkdir -p "$work/.tmp/"' fail
+check_repo_tmp taskfile-scratch Taskfile.yml '      - mkdir -p .tmp/x' fail
+check_repo_tmp test-object-read tests/test_scratch_user.bl 'shell_exec("cp .tmp/*.o {dir}/")' fail
 check_pool_write parser-column-field src/parser.bl 'fn scratch() { columns.child_slots = [] }'
 check_pool_write parser-column-whole src/parser.bl 'fn scratch() { columns = NodeColumns { kinds: [], child_at: [], child_slots: [] } }'
 

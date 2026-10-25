@@ -147,7 +147,7 @@ fn extract_embedded_gc() -> Str ! IO {
     let base = build_fs.private_dir(cache, "gc-tmp")
     if base == "" {
         io.eprintln("error: cannot make a staging directory in {cache}")
-        return dir
+        return ""
     }
     shell_exec("mkdir -p {base}/include/private {base}/include/zig-stubs/mach {base}/include/zig-stubs/mach-o")
     write_file("{base}/gc_unity.c", embedded_gc_unity_c)
@@ -186,9 +186,11 @@ fn extract_embedded_gc() -> Str ! IO {
     write_file("{base}/include/private/thread_local_alloc.h", embedded_gc_h_priv_thread_local_alloc)
     write_file("{base}/include/zig-stubs/mach/exception.h", embedded_gc_h_stubs_mach_exception)
     write_file("{base}/include/zig-stubs/mach-o/getsect.h", embedded_gc_h_stubs_macho_getsect)
-    build_fs.unmark(base)
-    // A concurrent build that renamed first wins; its tree is the same.
-    shell_exec("if [ -e {dir} ]; then rm -rf {base}; else chmod 755 {base}; mv {base} {dir}; fi")
+    // A concurrent build that published first wins; its tree is the same.
+    if !build_fs.publish_dir(base, dir, "include/gc.h") {
+        io.eprintln("error: cannot write the gc sources to {dir}")
+        return ""
+    }
     dir
 }
 
@@ -327,6 +329,7 @@ fn resolve_gc_source() -> Str ! IO {
         return "bootstrap/vendor/gc/extra/gc.c"
     }
     let base = extract_embedded_gc()
+    if base == "" { return "" }
     "{base}/gc_unity.c"
 }
 
@@ -342,6 +345,7 @@ fn resolve_gc_include() -> Str ! IO {
         return "bootstrap/vendor/gc/include"
     }
     let base = extract_embedded_gc()
+    if base == "" { return "" }
     "{base}/include"
 }
 
@@ -960,15 +964,18 @@ fn resolve_native_dep_source(name: Str) -> Str {
     ""
 }
 
+// The object a native dep compiles to in the native cache; a cross build keys it by target.
+fn vendored_object_path(name: Str, target: Str) -> Str {
+    if target == "" { "{native_cache_dir()}/{name}.o" } else { "{native_cache_dir()}/{name}-{target}.o" }
+}
+
 fn resolve_vendored_objects(used_deps: List[Str], debug_mode: Int, release_mode: Int, target: Str) -> List[Str] ! IO {
     let mut objects: List[Str] = []
-    let mut did_mkdir = 0
 
     if target != "" {
         let gc_src = resolve_gc_source()
         if gc_src != "" {
             let _ = build_fs.mkdir_p(native_cache_dir())
-            did_mkdir = 1
             let gc_inc = resolve_gc_include()
             let o_path = "{native_cache_dir()}/gc-{target}.o"
             let src_mt = file_mtime(gc_src)
@@ -999,14 +1006,8 @@ fn resolve_vendored_objects(used_deps: List[Str], debug_mode: Int, release_mode:
         let name = used_deps.get(di).unwrap()
         let src = resolve_native_dep_source(name)
         if src != "" {
-            if did_mkdir == 0 {
-                let _ = build_fs.mkdir_p(native_cache_dir())
-                did_mkdir = 1
-            }
-            let mut o_path = "{native_cache_dir()}/{name}.o"
-            if target != "" {
-                o_path = "{native_cache_dir()}/{name}-{target}.o"
-            }
+            let _ = build_fs.mkdir_p(native_cache_dir())
+            let o_path = vendored_object_path(name, target)
             let rc = compile_vendored_source(src, o_path, debug_mode, release_mode, target)
             if rc != 0 {
                 return objects
@@ -1027,14 +1028,8 @@ fn resolve_vendored_objects(used_deps: List[Str], debug_mode: Int, release_mode:
         if used_deps.contains(name) { continue }
         let dep_path = manifest_native_dep_path(name)
         if dep_path == "" { continue }
-        if did_mkdir == 0 {
-            let _ = build_fs.mkdir_p(native_cache_dir())
-            did_mkdir = 1
-        }
-        let mut o_path = "{native_cache_dir()}/{name}.o"
-        if target != "" {
-            o_path = "{native_cache_dir()}/{name}-{target}.o"
-        }
+        let _ = build_fs.mkdir_p(native_cache_dir())
+        let o_path = vendored_object_path(name, target)
         let rc = compile_vendored_source(dep_path, o_path, debug_mode, release_mode, target)
         if rc != 0 {
             return objects
@@ -1369,9 +1364,11 @@ fn ensure_target_archive(arc_dir: Str, target: Str) -> Str ! IO {
         return ""
     }
     fs_remove("{stage}/monolith.o")
-    build_fs.unmark(stage)
-    // A concurrent build that renamed first wins; its archive is as good.
-    shell_exec("if [ -e {dir} ]; then rm -rf {stage}; else chmod 755 {stage}; mv {stage} {dir}; fi")
+    // A concurrent build that published first wins; its archive is as good.
+    if !build_fs.publish_dir(stage, dir, "libblink_std.a") {
+        io.eprintln("error: cannot write the stdlib archive to {dir}")
+        return ""
+    }
     archive
 }
 
@@ -5325,31 +5322,22 @@ fn cmd_fmt(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Repo
     if source_path != "" {
         check_file_exists(source_path)
     }
-    let name = if source_path != "" { strip_extension(path_basename(source_path)) } else { "" }
     if check_flag == 1 {
-        // The formatted copies go to a dir of this run's own in the OS temp dir, never into
-        // the project.
-        let tmp = env.var("TMPDIR") ?? ""
-        let scratch = build_fs.private_dir(if tmp == "" { "/tmp" } else { tmp }, "blink-fmt")
-        if scratch == "" {
-            io.eprintln("error: cannot make a scratch directory for fmt --check")
-            exit(1)
-        }
         let mut needs_format: List[Str] = []
         let mut ok_files: List[Str] = []
         let mut check_errors = 0
+        let mut files: List[Str] = []
         if source_path == "" {
-            let mut fmt_files: List[Str] = []
-            collect_source_files(".", fmt_files)
-            let mut fi = 0
-            while fi < fmt_files.len() {
-                let fname = fmt_files.get(fi).unwrap()
-                let tmp_path = "{scratch}/{strip_extension(path_basename(fname))}.bl"
-                let rc = do_compile(fname, tmp_path, "blink", 0, 0)
-                if rc == 0 {
-                    let original = read_file(fname)
-                    let formatted = read_file(tmp_path)
-                    if original != formatted {
+            collect_source_files(".", files)
+        } else {
+            files.push(source_path)
+        }
+        let mut fi = 0
+        while fi < files.len() {
+            let fname = files.get(fi).unwrap()
+            match format_to_text(fname) {
+                Ok(formatted) => {
+                    if read_file(fname) != formatted {
                         needs_format.push(fname)
                         if json_output == 0 {
                             io.println("would reformat: {fname}")
@@ -5357,38 +5345,16 @@ fn cmd_fmt(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Repo
                     } else {
                         ok_files.push(fname)
                     }
-                } else {
+                }
+                Err(_) => {
                     check_errors = check_errors + 1
                     if json_output == 0 {
-                        io.println("error: formatting failed for {fname}")
+                        io.println(if source_path == "" { "error: formatting failed for {fname}" } else { "error: formatting failed" })
                     }
                 }
-                shell_exec("rm -f {tmp_path}")
-                fi = fi + 1
             }
-        } else {
-            let tmp_path = "{scratch}/{name}.bl"
-            let rc = do_compile(source_path, tmp_path, "blink", 0, 0)
-            if rc == 0 {
-                let original = read_file(source_path)
-                let formatted = read_file(tmp_path)
-                if original != formatted {
-                    needs_format.push(source_path)
-                    if json_output == 0 {
-                        io.println("would reformat: {source_path}")
-                    }
-                } else {
-                    ok_files.push(source_path)
-                }
-            } else {
-                check_errors = check_errors + 1
-                if json_output == 0 {
-                    io.println("error: formatting failed")
-                }
-            }
-            shell_exec("rm -f {tmp_path}")
+            fi = fi + 1
         }
-        let _ = build_fs.remove_tree(scratch)
         if json_output != 0 {
             let mut json_needs = ""
             let mut ni = 0

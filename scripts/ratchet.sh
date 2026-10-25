@@ -101,14 +101,14 @@
 #                            spec file. A root with no typecheck.bl counts 0
 #
 #   repo_tmp_in_tests_and_scripts
-#                            a `.tmp/` path in a tests/*.bl or scripts/*.sh file;
+#                            a `.tmp/` path in a tests/*.bl or scripts/*.sh file
+#                            or in Taskfile.yml;
 #                            absolute zero gate. Scratch files go in a dir of their
 #                            own under TMPDIR, so two runs at once never share
 #                            one (compile_test_helpers.scratch_root() in a test,
-#                            `mktemp -d` in a script). A path under a private
-#                            tree (`{tree}/.tmp/`, `$work/.tmp/`) is not counted: it is
-#                            the compiler's own `.tmp` inside a tree the test or
-#                            script made. Nor is a read of `.tmp/*.o`. This script
+#                            `mktemp -d` in a script). The compiler writes no
+#                            `.tmp/` either, so a path under a tree the test or
+#                            script made counts the same. This script
 #                            and its self-test are not scanned, because they name
 #                            the pattern. Counted in the live tree only: a
 #                            historical ref is materialized with src/ alone
@@ -244,16 +244,16 @@ len_in_byte_args() {
     rg -o '\.len\(\)' | wc -l | tr -d ' '
 }
 
-# A `.tmp/` path that is not inside a tree the test or script made itself. The
-# lookbehinds name the private-tree prefixes; the compiler writes its own
-# `.tmp/` inside such a tree, and that is the behavior under test there.
+# A `.tmp/` path; the lookbehind keeps a name that only ends in `.tmp` out.
 repo_tmp_uses() {
   dirs=""
   [ -d "$1/tests" ] && dirs="$dirs $1/tests"
   [ -d "$1/scripts" ] && dirs="$dirs $1/scripts"
+  # A path named on the command line is searched whatever the -g globs say.
+  [ -f "$1/Taskfile.yml" ] && dirs="$dirs $1/Taskfile.yml"
   [ -n "$dirs" ] || { echo 0; return; }
   rg -o -P -g '*.bl' -g '*.sh' -g '!ratchet.sh' -g '!test_ratchet.sh' \
-    '(?<![\w.])(?<!\{tree\}/)(?<!\$work/)\.tmp/(?!\*\.o)' $dirs 2>/dev/null | wc -l | tr -d ' '
+    '(?<![\w.])\.tmp/' $dirs 2>/dev/null | wc -l | tr -d ' '
 }
 
 SPEC_TYPES=sections/07_trust_modules_metadata.md
