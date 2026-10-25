@@ -22030,16 +22030,26 @@ fn types_compatible(a0: Int, b0: Int) -> Int {
     if is_sized_a || is_sized_b { return if ka == kb { 1 } else { 0 } }
     // Enums are nominally distinct from Int. An enum value
     // is NOT assignable to an Int target nor an Int to an enum target — INT vs ENUM
-    // falls through to `ka == kb` (false → 0), mirroring the sized-int rule above.
+    // fails the kind check below (→ 0), mirroring the sized-int rule above.
     // Comparison (==/!=/<…) is unaffected: it short-circuits to Bool before reaching
     // types_compatible, so an enum tag stays comparable to an Int. Convert explicitly
     // via Enum.to_int() / Enum.from_int(n) -> Option[Enum].
-    if ka == kb {
-        if ka == TyKind.List || ka == TyKind.Option || ka == TyKind.Iterator || ka == TyKind.Set {
-            return tc_type_part_compatible(ta.inner1, tb.inner1)
-        }
+    if ka != kb { return 0 }
+    // A match with no wildcard, so a kind added to TyKind does not compile until it says how
+    // its type arguments compare. An if-chain that ended in `return 1` let Channel and Handle
+    // through on kind alone: a Channel[Int] fit a Channel[Str] slot.
+    match ka {
+        // No type arguments: the same kind is the same type.
+        TyKind.Int | TyKind.Bool | TyKind.Float | TyKind.Str | TyKind.Void | TyKind.Bytes | TyKind.StringBuilder | TyKind.FfiScope | TyKind.Char => 1
+        TyKind.I8 | TyKind.I16 | TyKind.I32 | TyKind.U8 | TyKind.U16 | TyKind.U32 | TyKind.U64 => 1
+        // Each of these answered above, before the kinds were compared; the arms repeat that answer.
+        TyKind.Unknown | TyKind.Never => 1
+        TyKind.Typevar => tc_typevar_pair_compatible(a, b)
+        // One type argument in inner1, compared as is: there is no subtyping (§3.6 *Traits*),
+        // so Channel[Int] is not a Channel[Str] and Handle[Int] is not a Handle[Str].
+        TyKind.List | TyKind.Option | TyKind.Iterator | TyKind.Set | TyKind.Channel | TyKind.Handle | TyKind.Raw => tc_type_part_compatible(ta.inner1, tb.inner1)
         // A pointer is compatible only with a pointer to the same thing. Same
-        // one-inner recursion as the line above, spelled separately because the reason differs:
+        // one-inner recursion as the arm above, spelled separately because the reason differs:
         // for List/Option/Set the payload is a Blink value, here it is a C memory layout, and
         // `int64_t*` vs `blink_Pollfd*` is a stride and field-offset difference that the C
         // compiler rejects outright. Recursing is what turns that cc error into a TypeError.
@@ -22049,9 +22059,7 @@ fn types_compatible(a0: Int, b0: Int) -> Int {
         // assignable to every other via one Void hop — the exact hole this arm closes. If a real
         // FFI signature needs the C conversion, it belongs in an explicit cast, not in the
         // compatibility relation.
-        if ka == TyKind.Ptr {
-            return tc_type_part_compatible(ta.inner1, tb.inner1)
-        }
+        TyKind.Ptr => tc_type_part_compatible(ta.inner1, tb.inner1)
         // The phantom injection context, and the same one-inner recursion for a third
         // distinct reason: sections/03b_contracts.md:566 is normative — "`Template[DB]` and
         // `Template[Shell]` are distinct types. You cannot pass a `Template[Shell]` to a function
@@ -22063,9 +22071,7 @@ fn types_compatible(a0: Int, b0: Int) -> Int {
         // phantom resolves to a typevar and the typevar arm above already returned 1. So this
         // arm bites only when the context is a real type. Making the effect spelling bite is a
         // spec question (filed) and not something a compatibility arm can decide.
-        if ka == TyKind.Template {
-            return tc_type_part_compatible(ta.inner1, tb.inner1)
-        }
+        TyKind.Template => tc_type_part_compatible(ta.inner1, tb.inner1)
         // Two handler types are interchangeable exactly when they install into the
         // same effect slot, and the slot is picked by the ROOT effect — resolve_effect_vtable
         // (codegen_types.bl:1455) maps `IO`, `IO.Print`, `IO.Log` and `IO.Eprint` all onto
@@ -22083,18 +22089,12 @@ fn types_compatible(a0: Int, b0: Int) -> Int {
         // parameter rejecting a `Handler[IO.Print]` argument as too narrow, or accepting it as a
         // subtype — is a sub-effect variance question the spec does not answer, and it is not
         // this arm's to decide. Filed as friction.
-        if ka == TyKind.Handler {
-            return if tc_handler_effect_root(ta.name) == tc_handler_effect_root(tb.name) { 1 } else { 0 }
-        }
-        if ka == TyKind.Map {
+        TyKind.Handler => if tc_handler_effect_root(ta.name) == tc_handler_effect_root(tb.name) { 1 } else { 0 }
+        TyKind.Map | TyKind.Result => {
             if tc_type_part_compatible(ta.inner1, tb.inner1) == 0 { return 0 }
-            return tc_type_part_compatible(ta.inner2, tb.inner2)
+            tc_type_part_compatible(ta.inner2, tb.inner2)
         }
-        if ka == TyKind.Result {
-            if tc_type_part_compatible(ta.inner1, tb.inner1) == 0 { return 0 }
-            return tc_type_part_compatible(ta.inner2, tb.inner2)
-        }
-        if ka == TyKind.Tuple {
+        TyKind.Tuple => {
             if ta.params_count != tb.params_count { return 0 }
             let mut i = 0
             while i < ta.params_count {
@@ -22103,16 +22103,14 @@ fn types_compatible(a0: Int, b0: Int) -> Int {
                 if tc_type_part_compatible(ea, eb) == 0 { return 0 }
                 i = i + 1
             }
-            return 1
+            1
         }
         // A function value is called with the arguments its slot's type names and read back as
         // that type's return, so the arity and every position must agree. The spec gives no
         // variance for parameters or return (§3.3: `fn() -> Never` is not a `fn() -> Int`).
-        if ka == TyKind.Fn {
-            return if tc_fn_mismatch_detail(a, b) == "" { 1 } else { 0 }
-        }
-        if ka == TyKind.Struct || ka == TyKind.Enum {
-            // Nominal equality by base name first (mirrors the TyKind.Tuple branch
+        TyKind.Fn => if tc_fn_mismatch_detail(a, b) == "" { 1 } else { 0 }
+        TyKind.Struct | TyKind.Enum => {
+            // Nominal equality by base name first (mirrors the TyKind.Tuple arm
             // above). Two struct/enum tids are compatible iff they name the same
             // declaration; the module qualifier is stripped on both sides so a
             // qualified and bare reference to the same type still match (precedent:
@@ -22124,7 +22122,7 @@ fn types_compatible(a0: Int, b0: Int) -> Int {
             // tuple. If EITHER is the bare generic (params_count 0), it
             // is the un-specialized form and matches any specialization of the same
             // name (bare Box ~ Box[Int]); enums have no params → this is a no-op and
-            // the branch reduces to the old name-only (a==b) behavior for them.
+            // the arm reduces to the old name-only (a==b) behavior for them.
             if ta.params_count > 0 && tb.params_count > 0 {
                 if ta.params_count != tb.params_count { return 0 }
                 let mut si = 0
@@ -22135,11 +22133,9 @@ fn types_compatible(a0: Int, b0: Int) -> Int {
                     si = si + 1
                 }
             }
-            return 1
+            1
         }
-        return 1
     }
-    0
 }
 
 // The first way a function value of type `got` fails to fit a slot of type `want`, worded for

@@ -1,0 +1,177 @@
+// A type with type arguments is one type only when its arguments are the same types: Blink has
+// no subtyping (sections/03_types.md §3.6 *Traits*), and Never does not go through a type
+// constructor (§3.2). So `Channel[Int]` is not a `Channel[Str]` and `Handle[Int]` is not a
+// `Handle[Str]`, at a `let`, a call argument, a return and a struct field. The same argument
+// passes at each of those places. `Raw[Str]` is the one `Raw` a program can name (§3b.5), so
+// only its passing row is here.
+
+import std.fs
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_reset}
+import std.io
+
+fn probe(src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    let path = "build/typecheck_carrier_type_argument_probe.bl"
+    write_file(path, src)
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+}
+
+fn show(label: Str) {
+    io.println("FAIL: {label}: got:")
+    for d in diag_entries {
+        if d.severity != "info" {
+            io.println("  {d.severity} {d.name} {d.code} {d.line}:{d.col}: {d.message}")
+        }
+    }
+}
+
+fn not_info_count() -> Int {
+    let mut n = 0
+    for d in diag_entries {
+        if d.severity != "info" { n = n + 1 }
+    }
+    n
+}
+
+// Exactly one diagnostic: a TypeError at line:col with this message.
+fn expect_type_error(label: Str, line: Int, col: Int, message: Str) {
+    let mut ok = not_info_count() == 1
+    for d in diag_entries {
+        if d.severity != "info" {
+            if d.severity != "error" || d.name != "TypeError" || d.code != "E0300" { ok = false }
+            if d.line != line || d.col != col { ok = false }
+            if d.message != message { ok = false }
+        }
+    }
+    if !ok { show(label) }
+    assert(ok)
+}
+
+fn expect_clean(label: Str) {
+    let ok = not_info_count() == 0
+    if !ok { show(label) }
+    assert(ok)
+}
+
+test "a Channel[Int] is not a Channel[Str] at a let" {
+    probe(#"fn main() {
+    let ch: Channel[Int] = channel.new[Int](buffer: 2)
+    let bad: Channel[Str] = ch
+    bad.send("x")
+}
+"#)
+    expect_type_error("channel let", 3, 5, "variable `bad`: declared type Channel[Str] but got Channel[Int]")
+}
+
+test "a Channel[Int] is not a Channel[Str] at a call argument" {
+    probe(#"fn take(_c: Channel[Str]) {}
+fn main() {
+    let ch: Channel[Int] = channel.new[Int](buffer: 2)
+    take(ch)
+}
+"#)
+    expect_type_error("channel argument", 4, 10, "argument 1 of `take` expects Channel[Str], got Channel[Int]")
+}
+
+test "a Channel[Int] is not a Channel[Str] at a return" {
+    probe(#"fn give(c: Channel[Int]) -> Channel[Str] {
+    c
+}
+fn main() {
+    let _g = give(channel.new[Int](buffer: 2))
+}
+"#)
+    expect_type_error("channel return", 2, 5, "return value type Channel[Int] does not match function `give` return type Channel[Str]")
+}
+
+test "a Channel[Int] is not a Channel[Str] at a struct field" {
+    probe(#"type Box {
+    ch: Channel[Str]
+}
+fn main() {
+    let ch: Channel[Int] = channel.new[Int](buffer: 2)
+    let _b = Box { ch: ch }
+}
+"#)
+    expect_type_error("channel field", 6, 24, "field `ch` of `Box`: declared type Channel[Str] but got Channel[Int]")
+}
+
+test "a Handle[Int] is not a Handle[Str] at a let" {
+    probe(#"fn main() ! Async {
+    let h: Handle[Int] = async.spawn(fn() { 1 })
+    let bad: Handle[Str] = h
+    io.println(bad.await)
+}
+"#)
+    expect_type_error("handle let", 3, 5, "variable `bad`: declared type Handle[Str] but got Handle[Int]")
+}
+
+test "a Handle[Int] is not a Handle[Str] at a call argument" {
+    probe(#"fn take(_h: Handle[Str]) {}
+fn main() ! Async {
+    let h: Handle[Int] = async.spawn(fn() { 1 })
+    take(h)
+}
+"#)
+    expect_type_error("handle argument", 4, 10, "argument 1 of `take` expects Handle[Str], got Handle[Int]")
+}
+
+test "a Handle[Int] is not a Handle[Str] at a return" {
+    probe(#"fn give(h: Handle[Int]) -> Handle[Str] {
+    h
+}
+fn main() ! Async {
+    let _g = give(async.spawn(fn() { 1 }))
+}
+"#)
+    expect_type_error("handle return", 2, 5, "return value type Handle[Int] does not match function `give` return type Handle[Str]")
+}
+
+test "a Handle[Int] is not a Handle[Str] at a struct field" {
+    probe(#"type Box {
+    h: Handle[Str]
+}
+fn main() ! Async {
+    let h: Handle[Int] = async.spawn(fn() { 1 })
+    let _b = Box { h: h }
+}
+"#)
+    expect_type_error("handle field", 6, 23, "field `h` of `Box`: declared type Handle[Str] but got Handle[Int]")
+}
+
+test "a Channel and a Handle with the same type argument pass at each place" {
+    probe(#"type Box {
+    ch: Channel[Int]
+    h: Handle[Int]
+}
+fn take(_c: Channel[Int], _h: Handle[Int]) {}
+fn give(c: Channel[Int]) -> Channel[Int] {
+    c
+}
+fn hand(h: Handle[Int]) -> Handle[Int] {
+    h
+}
+fn main() ! Async {
+    let ch: Channel[Int] = channel.new[Int](buffer: 2)
+    let same: Channel[Int] = ch
+    let h: Handle[Int] = async.spawn(fn() { 1 })
+    let also: Handle[Int] = h
+    take(same, also)
+    let _b = Box { ch: give(same), h: hand(also) }
+}
+"#)
+    expect_clean("same argument")
+}
+
+test "a Raw[Str] binds to a Raw[Str]" {
+    probe(#"fn main() {
+    let r: Raw[Str] = Raw("x")
+    let _s: Raw[Str] = r
+}
+"#)
+    expect_clean("raw same argument")
+}
