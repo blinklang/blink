@@ -1,0 +1,71 @@
+// A `Handler[Metrics]` passed where a `Handler[Metrics.Emit]` is expected converts to a handler
+// of Metrics.Emit (sections/04_effects.md *Effect projection*). A `with` of it runs the parent
+// handler's clauses for the Emit operations, and handles no other operation: a Metrics.Query
+// operation in the block reaches the handler outside it.
+
+import compile_test_helpers.{compile_and_run}
+
+let PRELUDE = #"
+effect Metrics {
+    effect Emit {
+        fn counter(name: Str, value: Int)
+    }
+    effect Query {
+        fn get_counter(name: Str) -> Int
+    }
+}
+
+fn full_h() -> Handler[Metrics] {
+    handler Metrics {
+        fn counter(name: Str, value: Int) { io.println("full counter {name}={value}") }
+        fn get_counter(_name: Str) -> Int { 42 }
+    }
+}
+
+fn outer_h() -> Handler[Metrics] {
+    handler Metrics {
+        fn counter(name: Str, value: Int) { io.println("outer counter {name}={value}") }
+        fn get_counter(_name: Str) -> Int { 7 }
+    }
+}
+"#
+
+test "a projected handler runs the parent handler's clauses for the sub-effect's operations" {
+    let src = PRELUDE.concat(#"
+fn emit_only(h: Handler[Metrics.Emit]) ! IO {
+    with h {
+        metrics.counter("a", 1)
+    }
+}
+
+fn main() ! IO {
+    emit_only(full_h())
+}
+"#)
+    let r = compile_and_run(src, "_projected_handler_runs_sub_ops")
+    assert(r.exit_code == 0, "compile or run failed: {r.out}{r.err_out}")
+    assert_eq(r.out, "full counter a=1\n")
+}
+
+test.failing(
+    "a projected handler leaves the other sub-effects to the handler outside the with",
+    reason: "with h installs the whole vtable of h's root effect, so the projected Metrics handler still answers get_counter",
+) {
+    let src = PRELUDE.concat(#"
+fn emit_only(h: Handler[Metrics.Emit]) ! Metrics.Query, IO {
+    with h {
+        metrics.counter("a", 1)
+        io.println("query through outer: {metrics.get_counter("x")}")
+    }
+}
+
+fn main() ! IO {
+    with outer_h() {
+        emit_only(full_h())
+    }
+}
+"#)
+    let r = compile_and_run(src, "_projected_handler_leaves_other_ops")
+    assert(r.exit_code == 0, "compile or run failed: {r.out}{r.err_out}")
+    assert_eq(r.out, "full counter a=1\nquery through outer: 7\n")
+}

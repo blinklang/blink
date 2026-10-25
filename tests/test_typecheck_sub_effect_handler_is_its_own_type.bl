@@ -1,0 +1,442 @@
+// A handler of a sub-effect is a type of its own (sections/04_effects.md *Type identity*). A
+// `Handler[Metrics]` projects to a `Handler[Metrics.Emit]` where one is expected (*Effect
+// projection*), and only that way: a `Handler[Metrics.Emit]` where a `Handler[Metrics]` is
+// expected is InsufficientHandlerCoverage, a handler of a sibling sub-effect is a TypeError, and
+// a sub-effect and its parent do not join, because projection is no subtyping.
+
+import std.fs
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_reset}
+import std.io
+
+// Every probe starts with these 27 lines, so a row's line is 27 more than in its own text.
+let HEADER = #"effect Metrics {
+    effect Emit {
+        fn counter(name: Str)
+    }
+    effect Query {
+        fn get_counter(name: Str) -> Int
+    }
+}
+fn full_h() -> Handler[Metrics] {
+    handler Metrics {
+        fn counter(_name: Str) {}
+        fn get_counter(_name: Str) -> Int { 1 }
+    }
+}
+fn emit_h() -> Handler[Metrics.Emit] {
+    handler Metrics.Emit {
+        fn counter(_name: Str) {}
+    }
+}
+fn query_h() -> Handler[Metrics.Query] {
+    handler Metrics.Query {
+        fn get_counter(_name: Str) -> Int { 2 }
+    }
+}
+fn takes_full(_h: Handler[Metrics]) {}
+fn takes_emit(_h: Handler[Metrics.Emit]) {}
+fn pick[T](a: T, _b: T) -> T { a }
+"#
+
+fn probe(src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    let path = "build/typecheck_sub_effect_handler_probe.bl"
+    write_file(path, "{HEADER}{src}")
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+}
+
+fn show(label: Str) {
+    io.println("FAIL: {label}: got:")
+    for d in diag_entries {
+        if d.severity != "info" {
+            io.println("  {d.severity} {d.name} {d.code} {d.line}:{d.col}: {d.message} [{d.label}]")
+            for n in d.notes {
+                io.println("    note: {n}")
+            }
+        }
+    }
+}
+
+fn not_info_count() -> Int {
+    let mut n = 0
+    for d in diag_entries {
+        if d.severity != "info" { n = n + 1 }
+    }
+    n
+}
+
+// Exactly one diagnostic: this name and code at line:col with this message.
+fn only_error(name: Str, code: Str, line: Int, col: Int, message: Str) -> Bool {
+    let mut ok = not_info_count() == 1
+    for d in diag_entries {
+        if d.severity != "info" {
+            if d.severity != "error" || d.name != name || d.code != code { ok = false }
+            if d.line != line || d.col != col { ok = false }
+            if d.message != message { ok = false }
+        }
+    }
+    ok
+}
+
+fn expect_type_error(label: Str, line: Int, col: Int, message: Str) {
+    let ok = only_error("TypeError", "E0300", line, col, message)
+    if !ok { show(label) }
+    assert(ok)
+}
+
+// The one InsufficientHandlerCoverage at line:col, with the two notes that name what the
+// expected handler needs and what the given one has.
+fn expect_coverage(label: Str, line: Int, col: Int, want: Str, got: Str) {
+    let mut ok = only_error("InsufficientHandlerCoverage", "E0563", line, col, "insufficient handler coverage")
+    for d in diag_entries {
+        if d.severity == "error" {
+            ok = ok && d.label == "expected `{want}`, found `{got}`"
+            let notes = d.notes
+            ok = ok && notes.len() == 2
+            ok = ok && (notes.get(0) ?? "") == "`Handler[Metrics]` requires operations: counter, get_counter"
+            ok = ok && (notes.get(1) ?? "") == "`Handler[Metrics.Emit]` only provides: counter"
+        }
+    }
+    if !ok { show(label) }
+    assert(ok)
+}
+
+fn expect_clean(label: Str) {
+    let ok = not_info_count() == 0
+    if !ok { show(label) }
+    assert(ok)
+}
+
+test "a sub-effect handler is refused where its parent's handler is expected, at a call argument" {
+    probe(#"fn main() {
+    takes_full(emit_h())
+}
+"#)
+    expect_coverage("call argument", 29, 16, "Handler[Metrics]", "Handler[Metrics.Emit]")
+}
+
+test "a sub-effect handler is refused where its parent's handler is expected, at a method argument" {
+    probe(#"trait Take {
+    fn take(self, h: Handler[Metrics]) -> Int
+}
+type Taker { n: Int }
+impl Take for Taker {
+    fn take(self, _h: Handler[Metrics]) -> Int { self.n }
+}
+fn main() {
+    let s = Taker { n: 1 }
+    let _ = s.take(emit_h())
+}
+"#)
+    expect_coverage("method argument", 37, 20, "Handler[Metrics]", "Handler[Metrics.Emit]")
+}
+
+test "a sub-effect handler is refused at an annotated let of its parent's handler" {
+    probe(#"fn main() {
+    let h: Handler[Metrics] = emit_h()
+    let _ = h
+}
+"#)
+    expect_coverage("let annotation", 29, 31, "Handler[Metrics]", "Handler[Metrics.Emit]")
+}
+
+test "a sub-effect handler is refused as the tail value of a function that returns its parent's handler" {
+    probe(#"fn widen() -> Handler[Metrics] {
+    emit_h()
+}
+"#)
+    expect_coverage("return tail", 29, 5, "Handler[Metrics]", "Handler[Metrics.Emit]")
+}
+
+test "a sub-effect handler is refused at a return of its parent's handler" {
+    probe(#"fn widen(c: Bool) -> Handler[Metrics] {
+    if c { return emit_h() }
+    full_h()
+}
+"#)
+    expect_coverage("return", 29, 19, "Handler[Metrics]", "Handler[Metrics.Emit]")
+}
+
+test "a sub-effect handler is refused in a struct field of its parent's handler" {
+    probe(#"type Holder { h: Handler[Metrics] }
+fn main() {
+    let x = Holder { h: emit_h() }
+    let _ = x
+}
+"#)
+    expect_coverage("struct field", 30, 25, "Handler[Metrics]", "Handler[Metrics.Emit]")
+}
+
+test "a sub-effect handler is refused in an assignment to a place of its parent's handler" {
+    probe(#"fn main() {
+    let mut h: Handler[Metrics] = full_h()
+    h = emit_h()
+    let _ = h
+}
+"#)
+    expect_coverage("assignment", 30, 9, "Handler[Metrics]", "Handler[Metrics.Emit]")
+}
+
+test "a handler of a sibling sub-effect is a type error" {
+    probe(#"fn main() {
+    takes_emit(query_h())
+}
+"#)
+    expect_type_error("sibling", 29, 16, "argument 1 of `takes_emit` expects Handler[Metrics.Emit], got Handler[Metrics.Query]")
+}
+
+test "a sub-effect handler and its parent's do not join in a list literal" {
+    probe(#"fn main() {
+    let xs = [full_h(), emit_h()]
+    io.println("{xs.len()}")
+}
+"#)
+    expect_type_error("list literal", 29, 25, "list element 2 has type Handler[Metrics.Emit] but the list is built from Handler[Metrics]")
+}
+
+test "a sub-effect handler and its parent's do not join at an if" {
+    probe(#"fn main() {
+    let c = true
+    let x = if c { full_h() } else { emit_h() }
+    let _ = x
+}
+"#)
+    expect_type_error("if", 30, 13, "if branches have incompatible types: Handler[Metrics] vs Handler[Metrics.Emit]")
+}
+
+test "a sub-effect handler and its parent's do not join at a generic call" {
+    probe(#"fn main() {
+    let x = pick(full_h(), emit_h())
+    let _ = x
+}
+"#)
+    expect_type_error("generic call", 29, 28, "argument 2 of `pick` expects Handler[Metrics], got Handler[Metrics.Emit]")
+}
+
+test "a generic call does not join a sub-effect handler with its parent's by projection" {
+    probe(#"fn main() {
+    let x = pick(emit_h(), full_h())
+    let _ = x
+}
+"#)
+    expect_type_error("generic call, sub first", 29, 28, "argument 2 of `pick` expects Handler[Metrics.Emit], got Handler[Metrics]")
+}
+
+test "projection does not reach a handler inside a type argument" {
+    probe(#"fn takes_emits(_hs: List[Handler[Metrics.Emit]]) {}
+fn main() {
+    takes_emits([full_h()])
+}
+"#)
+    expect_type_error("type argument", 30, 17, "argument 1 of `takes_emits` expects List[Handler[Metrics.Emit]], got List[Handler[Metrics]]")
+}
+
+test "projection does not reach a handler inside the type argument of an annotated let" {
+    probe(#"fn main() {
+    let xs: List[Handler[Metrics.Emit]] = [full_h()]
+    let _ = xs
+}
+"#)
+    expect_type_error("let type argument", 29, 5, "variable `xs`: declared type List[Handler[Metrics.Emit]] but got List[Handler[Metrics]]")
+}
+
+test "a parent handler projects to its sub-effect at a let, a return, a struct field and an assignment" {
+    probe(#"type Holder { h: Handler[Metrics.Emit] }
+fn narrow() -> Handler[Metrics.Emit] {
+    full_h()
+}
+fn narrow_early(c: Bool) -> Handler[Metrics.Emit] {
+    if c { return full_h() }
+    emit_h()
+}
+fn main() {
+    let a: Handler[Metrics.Emit] = full_h()
+    let mut b: Handler[Metrics.Emit] = emit_h()
+    b = full_h()
+    let x = Holder { h: full_h() }
+    takes_emit(a)
+    takes_emit(b)
+    takes_emit(x.h)
+    takes_emit(narrow())
+    takes_emit(narrow_early(true))
+    let mut ys: List[Handler[Metrics.Emit]] = []
+    ys.push(full_h())
+    io.println("{ys.len()}")
+}
+"#)
+    expect_clean("projection at a declared type")
+}
+
+test "a parent handler projects to its sub-effect, and a handler fits its own effect" {
+    probe(#"trait Take {
+    fn take(self, h: Handler[Metrics.Emit]) -> Int
+}
+type Taker { n: Int }
+impl Take for Taker {
+    fn take(self, _h: Handler[Metrics.Emit]) -> Int { self.n }
+}
+fn main() {
+    takes_emit(full_h())
+    takes_emit(emit_h())
+    takes_full(full_h())
+    let s = Taker { n: 1 }
+    let _ = s.take(full_h())
+    let xs = [emit_h(), emit_h()]
+    let _ = pick(emit_h(), emit_h())
+    io.println("{xs.len()}")
+}
+"#)
+    expect_clean("projection")
+}
+
+test "an IO.Print handler where an IO handler is expected names the operations of each" {
+    probe(#"fn takes_io(_h: Handler[IO]) {}
+fn main() {
+    takes_io(handler IO.Print { fn print(_msg: Str) {} })
+}
+"#)
+    let mut ok = only_error("InsufficientHandlerCoverage", "E0563", 30, 14, "insufficient handler coverage")
+    for d in diag_entries {
+        if d.severity == "error" {
+            let notes = d.notes
+            ok = ok && notes.len() == 2
+            ok = ok && (notes.get(0) ?? "") == "`Handler[IO]` requires operations: print, print_no_nl, log, read_bytes, read_line, read_all"
+            ok = ok && (notes.get(1) ?? "") == "`Handler[IO.Print]` only provides: print, print_no_nl"
+        }
+    }
+    if !ok { show("IO coverage notes") }
+    assert(ok)
+}
+
+test "an IO sub-effect handler may write only the operations of its own sub-effect" {
+    probe(#"fn main() {
+    let _h = handler IO.Log { fn print(_msg: Str) {} }
+}
+"#)
+    let ok = only_error("UnresolvedMethod", "E0505", 29, 31, "effect `IO.Log` has no operation `print`")
+    if !ok { show("print clause in an IO.Log handler") }
+    assert(ok)
+}
+
+test "an IO handler projects to IO.Print, and each IO sub-effect handler writes its own operations" {
+    probe(#"fn takes_print(_h: Handler[IO.Print]) {}
+fn main() {
+    let full = handler IO {
+        fn print(_msg: Str) {}
+        fn log(_msg: Str) {}
+    }
+    takes_print(full)
+    let _p = handler IO.Print {
+        fn print(_msg: Str) {}
+        fn print_no_nl(_msg: Str) {}
+    }
+    let _l = handler IO.Log { fn log(_msg: Str) {} }
+    let _e = handler IO.Eprint { fn eprint(_msg: Str) {} }
+}
+"#)
+    expect_clean("IO projection and sub-effect clauses")
+}
+
+test "a parent handler projects to the parameter of a fn value and to a payload written as a handler type" {
+    probe(#"type Box { f: fn(Handler[Metrics.Emit]) }
+type Slot { One(Handler[Metrics.Emit]) }
+fn use_f(g: fn(Handler[Metrics.Emit])) { g(full_h()) }
+fn main() {
+    let f = fn(_h: Handler[Metrics.Emit]) {}
+    f(full_h())
+    use_f(f)
+    let b = Box { f: f }
+    b.f(full_h())
+    let _ = One(full_h())
+}
+"#)
+    expect_clean("projection to a fn value parameter and a variant payload")
+}
+
+test "a sub-effect handler is refused at a closure parameter of its parent's handler" {
+    probe(#"fn main() {
+    let f = fn(_h: Handler[Metrics]) {}
+    f(emit_h())
+}
+"#)
+    expect_coverage("closure local", 30, 7, "Handler[Metrics]", "Handler[Metrics.Emit]")
+}
+
+test "a sub-effect handler is refused at a fn-typed parameter of its parent's handler" {
+    probe(#"fn use_f(g: fn(Handler[Metrics])) { g(emit_h()) }
+"#)
+    expect_coverage("fn-typed parameter", 28, 39, "Handler[Metrics]", "Handler[Metrics.Emit]")
+}
+
+test "a sub-effect handler is refused at a fn-typed field of its parent's handler" {
+    probe(#"type Box { f: fn(Handler[Metrics]) }
+fn main() {
+    let b = Box { f: fn(_h: Handler[Metrics]) {} }
+    b.f(emit_h())
+}
+"#)
+    expect_coverage("fn-typed field", 31, 9, "Handler[Metrics]", "Handler[Metrics.Emit]")
+}
+
+test "a sub-effect handler and its parent's do not join in the fields of a generic struct" {
+    probe(#"type Pair[T] { a: T, b: T }
+fn main() {
+    let p = Pair { a: emit_h(), b: full_h() }
+    let _ = p
+}
+"#)
+    expect_type_error("struct join, sub first", 30, 36, "field `b` of `Pair[Handler[Metrics.Emit]]`: declared type Handler[Metrics.Emit] but got Handler[Metrics]")
+    probe(#"type Pair[T] { a: T, b: T }
+fn main() {
+    let p = Pair { a: full_h(), b: emit_h() }
+    let _ = p
+}
+"#)
+    expect_type_error("struct join, parent first", 30, 36, "field `b` of `Pair[Handler[Metrics]]`: declared type Handler[Metrics] but got Handler[Metrics.Emit]")
+}
+
+test "a sub-effect handler and its parent's do not join in the payload of a generic variant" {
+    probe(#"type Two[T] { Both(T, T) }
+fn main() {
+    let v = Both(emit_h(), full_h())
+    let _ = v
+}
+"#)
+    expect_type_error("variant join, sub first", 30, 28, "argument 2 of `Both` expects Handler[Metrics.Emit], got Handler[Metrics]")
+    probe(#"type Two[T] { Both(T, T) }
+fn main() {
+    let v = Both(full_h(), emit_h())
+    let _ = v
+}
+"#)
+    expect_type_error("variant join, parent first", 30, 28, "argument 2 of `Both` expects Handler[Metrics], got Handler[Metrics.Emit]")
+}
+
+test "a print clause of an IO.Print handler has the signature of io.print" {
+    probe(#"fn main() {
+    let _h = handler IO.Print { fn print(_s: Int) {} }
+}
+"#)
+    expect_type_error("print clause signature", 29, 33, "IO handler clause `print` parameter 1 is Int, but io.print takes Str: `fn print(Str) -> ()`")
+}
+
+test "an IO.Print handler may not write an operation of IO.Log or IO.Read" {
+    probe(#"fn main() {
+    let _h = handler IO.Print { fn log(_msg: Str) {} }
+}
+"#)
+    let log_ok = only_error("UnresolvedMethod", "E0505", 29, 33, "effect `IO.Print` has no operation `log`")
+    if !log_ok { show("log clause in an IO.Print handler") }
+    assert(log_ok)
+    probe(#"fn main() {
+    let _h = handler IO.Print { fn read_line() -> Str { "" } }
+}
+"#)
+    let read_ok = only_error("UnresolvedMethod", "E0505", 29, 33, "effect `IO.Print` has no operation `read_line`")
+    if !read_ok { show("read_line clause in an IO.Print handler") }
+    assert(read_ok)
+}

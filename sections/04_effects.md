@@ -2232,7 +2232,7 @@ Items nest from left to right (see *Disambiguation rules* below), so the rightmo
 Handlers are first-class values. They can be stored in variables, passed as arguments, and returned from functions. The type of a handler can name the effects that its operation bodies perform outside the handler (see *The clause row* in §4.7.1):
 
 ```blink
-fn make_test_env() -> (Handler[DB], Handler[IO]) {
+fn make_test_env() -> (Handler[DB], Handler[IO.Log]) {
     let db_handler = mock_db(test_fixtures())
     let io_handler = capture_log([])
     (db_handler, io_handler)

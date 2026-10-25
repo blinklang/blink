@@ -45,7 +45,7 @@ import diagnostics.{
     PTR_OUTSIDE_FFI, FFI_STRUCT_GC_FIELD, BUF_OUTSIDE_FFI_SURFACE, BYTES_GROW_IN_WITH_PTR,
     MISSING_CANONICAL_HEADER,
     PINNED_BYTES_ESCAPE, BYTES_PTR_CAST_FORBIDDEN,
-    FFI_OFFSET_ON_SINGLETON, FFI_OFFSET_UNKNOWN_STRIDE, WITH_ITEM_NOT_A_HANDLER,
+    FFI_OFFSET_ON_SINGLETON, FFI_OFFSET_UNKNOWN_STRIDE, WITH_ITEM_NOT_A_HANDLER, INSUFFICIENT_HANDLER_COVERAGE,
     TRAIT_CONTRACT_900, TRAIT_CONTRACT_901, TRAIT_CONTRACT_902,
     TRAIT_CONTRACT_903, TRAIT_CONTRACT_904, TRAIT_CONTRACT_905,
     TRAIT_CONTRACT_907, SEALED_METHOD_OVERRIDE,
@@ -2201,7 +2201,7 @@ pub fn make_iterator_type(elem_type: Int) -> Int {
 // tc_tid_handler_effect hands back to codegen so `resolve_effect_vtable` stays on the codegen side
 // where the ue_effects registry lives.
 //
-// Sub-effects are ROOT-COMPARED, not string-compared — see tc_handler_effect_root.
+// Each effect path is a handler type of its own; see tc_handler_effects_agree.
 pub fn make_handler_type(effect_name: Str) -> Int {
     ty_intern_simple(TyKind.Handler, effect_name, -1, -1)
 }
@@ -2215,25 +2215,8 @@ pub fn tc_tid_handler_effect(tid: Int) -> Str {
     t.name
 }
 
-// Two handler types are interchangeable exactly when they install into the same effect slot, and
-// the slot is chosen by the ROOT effect: resolve_effect_vtable (codegen_types.bl:1455) maps `IO`,
-// `IO.Print`, `IO.Log` and `IO.Eprint` all onto `blink_io_vtable`, and groups every user effect by
-// `ue.name` with `starts_with("{ue.name}.")`. So comparing roots is not a loosening of the rule —
-// it IS the equivalence the C representation already uses, which is why this cannot reject a
-// program that works today (lib/std/testing.bl returns Handler[IO.Log] / [IO.Print] / [IO.Eprint]).
-//
-// It is also representationally EXACT rather than merely convenient, which was measured and not
-// assumed: a `handler Metrics.Emit` declaration emits the PARENT'S FULL-SIZE vtable and fills the
-// unlisted slots from `blink_ue_metrics_vtable_default` (`__handler_vt_0 = *__handler_0_outer`,
-// then override). Two handler types with the same root effect therefore have literally the same C
-// type, and slot-index dispatch cannot run off the end of one — which is exactly why the earlier
-// crash above needed two DIFFERENT effects.
-//
-// So the remaining sub-effect question is not about this function. Passing a `Handler[Metrics.Emit]`
-// to a `Handler[Metrics]` parameter runs clean and returns the default stub's 0 from an unfilled
-// slot: a silent wrong answer, not a safety hole, and an effect-semantics decision (should a
-// default stub return a zero value or panic as "unhandled operation"?) rather than a type-identity
-// one.
+// The root of an effect path (`IO` for `IO.Print`). Every handler of one root fills that root's
+// whole vtable, so all of them have one C type, however their Blink types differ.
 pub fn tc_handler_effect_root(effect_name: Str) -> Str {
     let dot = match effect_name.byte_index_of(".", 0) {
         Some(i) => i
@@ -2243,12 +2226,98 @@ pub fn tc_handler_effect_root(effect_name: Str) -> Str {
 }
 
 // The one rule for when two handler types are one type, which types_compatible, tc_unify and
-// tc_tid_same_type all ask: the root effect picks the slot a handler installs into.
-// sections/04_effects.md *Type identity* makes a sub-effect's handler a type of its own, with
-// only a parent-to-sub *Effect projection* between them; that is not built yet, so effects of one
-// root still agree here.
+// tc_tid_same_type all ask. sections/04_effects.md *Type identity* makes the handler of each
+// effect path a type of its own, so `Handler[IO.Print]`, `Handler[IO.Log]` and `Handler[IO]`
+// are three types although they share a vtable. The one way between them is *Effect
+// projection*, which is not subtyping: tc_handler_projects allows it where a value meets an
+// expected type, and never in a join.
 fn tc_handler_effects_agree(a_effect: Str, b_effect: Str) -> Bool {
-    tc_handler_effect_root(a_effect) == tc_handler_effect_root(b_effect)
+    a_effect == b_effect
+}
+
+// The effect of a handler type, or "" when `tid` is no handler type.
+fn tc_handler_effect_of(tid: Int) -> Str {
+    tc_tid_handler_effect(resolve_alias_tid(tc_resolve(tid)))
+}
+
+// *Effect projection*: a handler of a parent effect where a handler of one of its sub-effects is
+// expected. The vtable is the parent's, and a `with` of the projected handler installs it whole;
+// the type is what limits a caller to the sub-effect's operations.
+fn tc_handler_projects(want: Int, got: Int) -> Bool {
+    let g = tc_handler_effect_of(got)
+    g != "" && tc_handler_effect_of(want).starts_with("{g}.")
+}
+
+// The other way, which projection refuses: a handler of a sub-effect where a handler of its
+// parent is expected. It has no clauses for the parent's other operations.
+fn tc_handler_short_of(want: Int, got: Int) -> Bool { tc_handler_projects(got, want) }
+
+// A value fits where `want` is expected: the two types agree, or a parent handler projects.
+fn tc_value_fits_expected(want: Int, got: Int) -> Bool {
+    types_compatible(got, want) == 1 || tc_handler_projects(want, got)
+}
+
+// InsufficientHandlerCoverage (sections/04_effects.md *Effect projection*), at the value.
+fn tc_report_handler_coverage(at: Int, want: Int, got: Int) ! TypeCheck.Report, Diag.Report {
+    let want_s = type_to_str(want)
+    let got_s = type_to_str(got)
+    let label = "expected `{want_s}`, found `{got_s}`"
+    tc_errors.push(label)
+    let want_eff = tc_handler_effect_of(want)
+    let need = tc_handler_op_names(want_eff)
+    let have = tc_handler_op_names(tc_handler_effect_of(got))
+    let mut notes: List[Str] = []
+    if need.len() > 0 && have.len() > 0 {
+        notes.push("`{want_s}` requires operations: {need.join(", ")}")
+        notes.push("`{got_s}` only provides: {have.join(", ")}")
+    }
+    diag_error_label_at_notes("InsufficientHandlerCoverage", INSUFFICIENT_HANDLER_COVERAGE, "insufficient handler coverage", at, label,
+        "use a handler of `{want_eff}`, which handles each of its operations", notes)
+}
+
+// The operations a handler of `eff` handles, in the order they are declared: a user effect's
+// from its declaration, and FS's, IO's and Time's from their tables. [] for an effect whose
+// operations are in no table (Env, IO.Eprint), so the report then names none.
+fn tc_handler_op_names(eff: Str) -> List[Str] {
+    let root = tc_handler_effect_root(eff)
+    let sub = if root == eff { "" } else { eff.byte_slice(root.byte_len() + 1, eff.byte_len()) }
+    let mut out: List[Str] = []
+    if root == "FS" {
+        for row in fs_op_rows() {
+            if sub == "" || row.sub_effect == sub { out.push(row.op) }
+        }
+        return out
+    }
+    if root == "IO" {
+        for row in io_op_rows() {
+            if sub == "" || row.sub_effect == sub { out.push(row.op) }
+        }
+        return out
+    }
+    if root == "Time" {
+        for row in builtin_handler_ops() {
+            if row.root == root && (sub == "" || row.sub_effect == sub) { out.push(row.op) }
+        }
+        return out
+    }
+    let decl = tc_effect_decl_named(root)
+    if decl == -1 { return out }
+    let kids = node_elements(decl)
+    if kids == -1 { return out }
+    let mut k = 0
+    while k < sublist_length(kids) {
+        let kid = sublist_get(kids, k)
+        let ops = node_methods(kid)
+        if (sub == "" || node_name(kid) == sub) && ops != -1 {
+            let mut o = 0
+            while o < sublist_length(ops) {
+                out.push(node_name(sublist_get(ops, o)))
+                o = o + 1
+            }
+        }
+        k = k + 1
+    }
+    out
 }
 
 // The fifth case of the audit above, and the worst of them: TyKind.Ptr did not
@@ -5644,6 +5713,12 @@ fn tc_push_tail_part(parts: List[ExpectedPart], body: Int, expected: Int) {
 
 // The type of field `name` read at instance `d`: of variant `var_idx` when the literal builds
 // one, else of the struct `d`. -1 when there is no such field.
+// Whether a literal's field is written as a handler type, so that a parent handler projects to it.
+fn tc_lit_field_projects(var_idx: Int, name: Str, d: Int) -> Bool {
+    let raw = if var_idx < 0 { get_struct_field_tid(d, name) } else { lookup_evfield_type_by_name(var_idx, name) }
+    raw >= 0 && tc_handler_effect_of(raw) != ""
+}
+
 fn tc_lit_field_tid_at(var_idx: Int, name: Str, d: Int) -> Int {
     if var_idx < 0 { return tc_field_tid_at_instance(d, name) }
     let field = lookup_evfield_type_by_name(var_idx, name)
@@ -5870,7 +5945,11 @@ fn tc_report_missing_return_of(kind: Str, owner_name: Str, ret: Int, at_node: In
 fn tc_check_returned_value(val_t: Int, at_node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     if tc_current_fn_ret == TYPE_VOID || tc_tid_is_no_info(tc_current_fn_ret) != 0 { return }
     if tc_tid_is_no_info(val_t) != 0 { return }
-    if types_compatible(tc_current_fn_ret, val_t) == 0 || tc_value_misses_never_slot(tc_current_fn_ret, val_t) != 0 {
+    if tc_handler_short_of(tc_current_fn_ret, val_t) {
+        let returned = node_kind(at_node) == NodeKind.Return && node_value(at_node) >= 0
+        return tc_report_handler_coverage(if returned { node_value(at_node) } else { at_node }, tc_current_fn_ret, val_t)
+    }
+    if !tc_value_fits_expected(tc_current_fn_ret, val_t) || tc_value_misses_never_slot(tc_current_fn_ret, val_t) != 0 {
         // §3.3 body completeness: the tail type must be a subtype of R, and `()` is a
         // subtype only of `()`. When the tail is a loop or an arm-bearing form that can
         // complete, the SHAPE is what names the repair, so it reports as
@@ -6620,14 +6699,18 @@ fn tc_check_arg_types_with_binds(fn_name: Str, sig: Int, args_sl: Int, self_offs
             // The second substitution is not skipped when nothing is bound: it still resolves
             // the metavariables in the formal.
             let concrete = if seen.len() == 0 { tc_no_binds } else { tc_concrete_binds(seen) }
-            let ptid = substitute_typevar_tid(substitute_typevar_tid(formal, binds), concrete)
+            let bound = substitute_typevar_tid(formal, binds)
+            let ptid = substitute_typevar_tid(bound, concrete)
             if tc_is_default_fill(arg_node) {
                 // Inferring the default here would read its names in the caller's module
                 // and scope; it was held to this parameter at the declaration.
                 arg_t = ptid
                 tc_publish_node_tid(arg_node, ptid)
             } else if tc_tid_is_no_info(ptid) == 0 {
-                arg_t = check_one_arg_shape(fn_name, i, arg_node, ptid)
+                // A type parameter that an earlier argument fixed joins the two arguments, and
+                // projection is no join; only a parameter written as a handler type projects.
+                let projects = tc_handler_effect_of(bound) != ""
+                arg_t = check_one_arg_shape(fn_name, i, arg_node, ptid, projects)
             }
             if arg_t >= 0 { unify_typevar_binds(formal, arg_t, seen) }
         }
@@ -6673,7 +6756,7 @@ fn tc_pin_param_into_arg(ptid: Int, arg_node: Int, arg_t: Int) ! TypeCheck.Resol
     tc_pin_declared_into_value(tc_resolve(ptid), v, arg_t)
 }
 
-fn check_one_arg_shape(fn_name: Str, idx: Int, arg_node: Int, ptid: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+fn check_one_arg_shape(fn_name: Str, idx: Int, arg_node: Int, ptid: Int, projects: Bool) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     tc_seed_expected_into_value(arg_node, ptid)
     let saved_hint = tc_construct_hint
     tc_construct_hint = resolve_alias_tid(ptid)
@@ -6730,7 +6813,9 @@ fn check_one_arg_shape(fn_name: Str, idx: Int, arg_node: Int, ptid: Int) -> Int 
             diag_error_at("TemplateMismatch", TEMPLATE_MISMATCH, "expected {type_to_str(ptid)}, found {type_to_str(arg_t)} — string variables cannot be implicitly converted to Template", arg_node, "pass the string literal directly, or wrap values in Raw() for dynamic SQL")
             lit_to_int = 1
         }
-        if lit_to_int == 0 && (types_compatible(arg_t, ptid) == 0 || tc_value_misses_never_slot(ptid, arg_t) != 0) {
+        if lit_to_int == 0 && projects && tc_handler_short_of(ptid, arg_t) {
+            tc_report_handler_coverage(arg_node, ptid, arg_t)
+        } else if lit_to_int == 0 && (!(types_compatible(arg_t, ptid) == 1 || (projects && tc_handler_projects(ptid, arg_t))) || tc_value_misses_never_slot(ptid, arg_t) != 0) {
             tc_arg_mismatch(fn_name, idx + 1, arg_node, ptid, arg_t)
         } else if lit_to_int == 0 {
             // A merged if/match type can read concrete from one arm while another arm's
@@ -6748,7 +6833,7 @@ fn check_one_arg_shape(fn_name: Str, idx: Int, arg_node: Int, ptid: Int) -> Int 
 // Genuinely saves/restores tc_construct_hint around infer_type; infer_type also
 // writes cumulative inference state that is intended to persist, not roll back.
 @allow(UnrestoredMutation)
-fn check_arg_value(label: Str, arg_idx: Int, expected_t: Int, value_node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+fn check_arg_value(label: Str, arg_idx: Int, expected_t: Int, value_node: Int, projects: Bool) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     if tc_tid_is_no_info(expected_t) != 0 { return }
     tc_seed_expected_into_value(value_node, expected_t)
     let saved_hint = tc_construct_hint
@@ -6802,7 +6887,9 @@ fn check_arg_value(label: Str, arg_idx: Int, expected_t: Int, value_node: Int) !
         }
         return
     }
-    if lit_to_int == 0 && (types_compatible(arg_t, expected_t) == 0 || tc_value_misses_never_slot(expected_t, arg_t) != 0) {
+    if lit_to_int == 0 && projects && tc_handler_short_of(expected_t, arg_t) {
+        tc_report_handler_coverage(value_node, expected_t, arg_t)
+    } else if lit_to_int == 0 && (!(types_compatible(arg_t, expected_t) == 1 || (projects && tc_handler_projects(expected_t, arg_t))) || tc_value_misses_never_slot(expected_t, arg_t) != 0) {
         tc_arg_mismatch(label, arg_idx + 1, value_node, expected_t, arg_t)
     } else if lit_to_int == 0 {
         tc_pin_param_into_arg(expected_t, value_node, arg_t)
@@ -6841,7 +6928,7 @@ fn tc_check_channel_new_args(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, D
         diag_error_at("MissingKeywordArg", MISSING_KEYWORD_ARG, "keyword argument `buffer` is missing from the call to `{fn_name}`", node, "add `buffer: <value>`")
         return
     }
-    check_arg_value(fn_name, 0, TYPE_INT, value)
+    check_arg_value(fn_name, 0, TYPE_INT, value, false)
 }
 
 // Validate a single argument to a built-in intrinsic method (List/Set/Str/Map).
@@ -6852,7 +6939,7 @@ fn tc_check_channel_new_args(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, D
 fn check_builtin_arg(method: Str, arg_idx: Int, expected_t: Int, args_sl: Int, container_label: Str) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     if args_sl == -1 { return }
     if arg_idx >= sublist_length(args_sl) { return }
-    check_arg_value("{container_label}.{method}", arg_idx, expected_t, sublist_get(args_sl, arg_idx))
+    check_arg_value("{container_label}.{method}", arg_idx, expected_t, sublist_get(args_sl, arg_idx), true)
 }
 
 // `byte_index_of` has no default `from`, so the help spells out the one edit that keeps the
@@ -8186,7 +8273,7 @@ fn tc_check_handler_method(m: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.R
 // A clause of an FS handler or an IO.Read clause fills the vtable slot of the operation it
 // names, and the slot's C type is that operation's signature, so a clause must name an
 // operation its effect has and take and answer exactly that operation's types (§4.4.5,
-// §4.4.9). An IO literal holds the print operations too, which this does not check.
+// §4.4.9). The print and log slots are typed the same way.
 fn tc_check_builtin_handler_clause(eff_name: Str, m: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     if m == -1 || node_kind(m) != NodeKind.FnDef { return }
     let root = tc_handler_effect_root(eff_name)
@@ -8202,16 +8289,18 @@ fn tc_check_builtin_handler_clause(eff_name: Str, m: Int) ! TypeCheck.Resolve, T
         return
     }
     if root != "IO" { return }
-    let reads = is_io_read_op(op)
-    if eff_name == "IO.Read" && !reads {
+    let sub = io_op_sub_effect(op)
+    if sub == "" && eff_name == "IO.Read" {
         diag_error_at("UnresolvedMethod", UNRESOLVED_METHOD, "effect `{eff_name}` has no operation `{op}`", m,
-            "the IO.Read operations are read_bytes, read_line and read_all (§4.4.9)")
+            "the IO.Read operations are {io_read_ops().join(", ")} (§4.4.9)")
         return
     }
-    if !reads { return }
-    if !handles_io_read(eff_name) {
+    // A name in no row (eprint, eprint_no_nl, and any other) stays unchecked until the spec
+    // gives eprint a sub-effect.
+    if sub == "" { return }
+    if eff_name != "IO" && eff_name != "IO.{sub}" {
         diag_error_at("UnresolvedMethod", UNRESOLVED_METHOD, "effect `{eff_name}` has no operation `{op}`", m,
-            "`{op}` is an operation of IO.Read (§4.4.9)")
+            "`{op}` is an operation of IO.{sub} (§4.4)")
         return
     }
     tc_check_builtin_clause_sig("IO", "io", op, m)
@@ -8511,7 +8600,10 @@ fn tc_check_call_against_fn_tid(fn_tid: Int, args_sl: Int, label: Str, node: Int
             // A closure parameter nothing has typed yet takes its type from the call, as a
             // generic parameter does. Past the name-resolution walk, as for a literal operand.
             if tc_boundary_check_active != 0 && tc_tid_is_no_info(arg_tid) == 0 && tc_tid_is_no_info(ptid) == 0 { let _ = tc_unify(ptid, arg_tid) }
-            if tc_tid_is_no_info(arg_tid) == 0 && tc_tid_is_no_info(ptid) == 0 && types_compatible(ptid, arg_tid) == 0 {
+            // A fn type's parameter is written as a type, so a handler argument projects to it.
+            if tc_handler_short_of(ptid, arg_tid) {
+                tc_report_handler_coverage(sublist_get(args_sl, li), ptid, arg_tid)
+            } else if tc_tid_is_no_info(arg_tid) == 0 && tc_tid_is_no_info(ptid) == 0 && !tc_value_fits_expected(ptid, arg_tid) {
                 let (want_s, got_s) = tc_type_pair_strs(ptid, arg_tid)
                 tc_type_error_naming("{label} argument {li} expects {want_s}, got {got_s}{tc_fn_mismatch_suffix(ptid, arg_tid)}", node, "", [ptid, arg_tid])
             }
@@ -8592,6 +8684,7 @@ fn tc_is_read_line_call(val: Int) -> Bool {
 // A binding declared as T whose value is a channel `recv()`: recv answers Option[T], and the
 // help names the forms that handle a closed channel before the `.unwrap()` that panics on one.
 fn tc_report_declared_mismatch(msg: Str, at: Int, val: Int, declared: Int, got: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    if tc_handler_short_of(declared, got) { return tc_report_handler_coverage(val, declared, got) }
     let recv_help = tc_recv_option_help(val, declared, got)
     if recv_help == "" && tc_read_line_used_as_str(val, declared) { return tc_value_mismatch_at(msg, at, val, declared) }
     let help = if recv_help != "" { recv_help } else { tc_hidden_variant_help(val, declared) }
@@ -15316,17 +15409,58 @@ pub fn fs_op_sub_effect(op: Str) -> Str {
     ""
 }
 
+// The IO handler operations of the §4.4 table, each with the sub-effect that performs it.
+// Typecheck reads the rows for the clauses a handler may write, for the signature of each
+// operation and for the operations a coverage error names; codegen reads the IO.Read rows. The
+// IO.Read rows are in the order the IO vtable lays out their slots. read_bytes is the primitive
+// and the one operation whose count the perform checks. read_line and read_all are derived:
+// std.io_read holds the spec's body of each under the operation's own name, and it runs over
+// the read_bytes of the handler that omits it. The rows leave out print_raw and print_raw_bytes,
+// which no handler can write yet, and eprint and eprint_no_nl, which IO.Eprint handles.
+pub type IoOpRow {
+    op: Str
+    sub_effect: Str
+    primitive: Bool
+}
+
+pub fn io_op_rows() -> List[IoOpRow] {
+    [
+        IoOpRow { op: "print", sub_effect: "Print", primitive: true },
+        IoOpRow { op: "print_no_nl", sub_effect: "Print", primitive: true },
+        IoOpRow { op: "log", sub_effect: "Log", primitive: true },
+        IoOpRow { op: IO_READ_PRIMITIVE, sub_effect: "Read", primitive: true },
+        IoOpRow { op: "read_line", sub_effect: "Read", primitive: false },
+        IoOpRow { op: "read_all", sub_effect: "Read", primitive: false },
+    ]
+}
+
+// The sub-effect that performs an IO operation, or "" for a name that is no IO operation.
+pub fn io_op_sub_effect(op: Str) -> Str {
+    for row in io_op_rows() {
+        if row.op == op { return row.sub_effect }
+    }
+    ""
+}
+
 // The operations of IO.Read (§4.4.9), in the order the IO vtable lays out their slots.
-// read_bytes is the primitive and the one operation whose count the perform checks.
-// read_line and read_all are derived: std.io_read holds the spec's body of each under the
-// operation's own name, and it runs over the read_bytes of the handler that omits it.
-pub fn io_read_ops() -> List[Str] { [IO_READ_PRIMITIVE, "read_line", "read_all"] }
+pub fn io_read_ops() -> List[Str] {
+    let mut out: List[Str] = []
+    for row in io_op_rows() {
+        if row.sub_effect == "Read" { out.push(row.op) }
+    }
+    out
+}
 
 pub let IO_READ_PRIMITIVE = "read_bytes"
 
-pub fn is_io_read_op(op: Str) -> Bool { io_read_ops().contains(op) }
+pub fn is_io_read_op(op: Str) -> Bool { io_op_sub_effect(op) == "Read" }
 
-pub fn is_io_read_derived_op(op: Str) -> Bool { op != IO_READ_PRIMITIVE && is_io_read_op(op) }
+pub fn is_io_read_derived_op(op: Str) -> Bool {
+    for row in io_op_rows() {
+        if row.op == op { return row.sub_effect == "Read" && !row.primitive }
+    }
+    false
+}
 
 // The module that holds the derived bodies. The loader loads it and codegen finds the bodies
 // in it, so both read the name here.
@@ -15348,7 +15482,8 @@ fn builtin_handler_op_sig(root: Str, op: Str) -> Int {
     let key = builtin_handler_op_key(root, op)
     let found = lookup_fnsig(key)
     if found != -1 { return found }
-    if root == "IO" && (op == "print" || op == "print_no_nl" || op == "log") {
+    let io_sub = if root == "IO" { io_op_sub_effect(op) } else { "" }
+    if io_sub == "Print" || io_sub == "Log" {
         register_intrinsic_fn_sig(key, [TYPE_STR], TYPE_VOID)
     } else if root == "Time" && op == "read" {
         register_intrinsic_fn_sig(key, [], runtime_instant_tid())
@@ -15357,7 +15492,7 @@ fn builtin_handler_op_sig(root: Str, op: Str) -> Int {
     } else if root == "FS" && fs_op_sub_effect(op) != "" {
         // The handle call's own signature, so a clause and the call it answers cannot differ.
         return lookup_fnsig("fs.{op}")
-    } else if root == "IO" && is_io_read_op(op) {
+    } else if io_sub == "Read" {
         return lookup_fnsig("io.{op}")
     } else {
         return -1
@@ -15381,8 +15516,8 @@ fn builtin_handler_ops() -> List[BuiltinHandlerOp] {
         BuiltinHandlerOp { root: "Time", sub_effect: "Read", op: "read", primitive: true },
         BuiltinHandlerOp { root: "Time", sub_effect: "Sleep", op: "sleep", primitive: true },
     ]
-    for op in io_read_ops() {
-        rows.push(BuiltinHandlerOp { root: "IO", sub_effect: "Read", op: op, primitive: !is_io_read_derived_op(op) })
+    for row in io_op_rows() {
+        if row.sub_effect == "Read" { rows.push(BuiltinHandlerOp { root: "IO", sub_effect: row.sub_effect, op: row.op, primitive: row.primitive }) }
     }
     rows
 }
@@ -18438,7 +18573,8 @@ fn tc_check_variant_payload_values(label: Str, var_idx: Int, args_sl: Int) -> Li
         // -1 is a named miss or an index past the arity, which the payload check has
         // reported; a mismatch against no field would be a second report of one mistake.
         if p.field != -1 && tc_tid_is_no_info(p.field) == 0 {
-            check_arg_value(label, i, tc_subst_evfield_from_instance(p.field, inst), p.value)
+            // A payload typed by the enum's own type parameter joins; projection is no join.
+            check_arg_value(label, i, tc_subst_evfield_from_instance(p.field, inst), p.value, tc_handler_effect_of(p.field) != "")
             tids.push(tc_pin_tail_tid(p.value))
         } else {
             tids.push(infer_type(p.value))
@@ -22083,21 +22219,9 @@ fn types_compatible(a0: Int, b0: Int) -> Int {
         // arm bites only when the context is a real type. Making the effect spelling bite is a
         // spec question (filed) and not something a compatibility arm can decide.
         TyKind.Template => tc_type_part_compatible(ta.inner1, tb.inner1)
-        // Two handler types are interchangeable exactly when they install into the
-        // same effect slot, and the slot is picked by the ROOT effect — resolve_effect_vtable
-        // (codegen_types.bl:1455) maps `IO`, `IO.Print`, `IO.Log` and `IO.Eprint` all onto
-        // `blink_io_vtable`, and groups every user effect by `ue.name` plus
-        // `starts_with("{ue.name}.")`. So this is not name equality and not a loosening of one:
-        // it IS the equivalence the C representation already uses, which is why it cannot reject
-        // a program that compiles today (lib/std/testing.bl returns Handler[IO.Log] /
-        // [IO.Print] / [IO.Eprint] and they flow into `Handler[IO]` positions).
-        //
         // The effect lives in the NAME slot rather than in a child (make_handler_type), so this
-        // compares strings where the arms above recurse on tids. There is no child to recurse
-        // into — an effect is not a type.
-        //
-        // Whether the type system SHOULD go finer than the representation is not this arm's to
-        // decide; tc_handler_effects_agree holds the rule for every relation.
+        // compares strings where the arms above recurse on tids: an effect is not a type.
+        // tc_handler_effects_agree holds the rule for every relation.
         TyKind.Handler => if tc_handler_effects_agree(ta.name, tb.name) { 1 } else { 0 }
         TyKind.Map | TyKind.Result => {
             if tc_type_part_compatible(ta.inner1, tb.inner1) == 0 { return 0 }
@@ -22427,6 +22551,8 @@ fn tc_std_time_type_name(tid: Int) -> Str {
 fn assignment_types_compatible(target_t: Int, val_t: Int, val_node: Int) -> Int {
     if tc_value_misses_never_slot(target_t, val_t) != 0 { return 0 }
     if types_compatible(target_t, val_t) == 1 { return 1 }
+    // The target is a declared type, so a parent handler projects to it.
+    if tc_handler_projects(target_t, val_t) { return 1 }
     let literal_to_int = is_integer_type(target_t) != 0 && is_integer_type(val_t) != 0 && is_int_literal_node(val_node) != 0
     if literal_to_int { return 1 }
     0
@@ -24378,13 +24504,17 @@ fn tc_check_lit_field_values(node: Int, lit_t: Int) ! TypeCheck.Resolve, TypeChe
         if tc_tid_is_no_info(want) != 0 { continue }
         // A field the literal's type parameters reach has its type only now.
         tc_literal_takes(v, want)
-        if assignment_types_compatible(want, got, v) != 0 { continue }
+        // A field typed by the literal's type parameter joins its handler values, and projection
+        // is no join, so neither direction is a coverage question there.
+        let joins = !tc_lit_field_projects(var_idx, fname, r) && (tc_handler_projects(want, got) || tc_handler_short_of(want, got))
+        if !joins && assignment_types_compatible(want, got, v) != 0 { continue }
         // A closure's own check ran before the literal's T was read, so it stands for this one
         // only when the literal has no type arguments.
         if ty_pool.get(r).unwrap().params_count == 0 && tc_closure_checked_against(v, want) { continue }
         let owner = if k == TyKind.Enum { "{type_to_str(r)}.{vname}" } else { type_to_str(r) }
         let (ws, gs) = tc_type_pair_strs(want, got)
-        tc_report_declared_mismatch("field `{fname}` of `{owner}`: declared type {ws} but got {gs}{tc_fn_mismatch_suffix(want, got)}", v, v, want, got)
+        let msg = "field `{fname}` of `{owner}`: declared type {ws} but got {gs}{tc_fn_mismatch_suffix(want, got)}"
+        if joins { tc_type_error_naming(msg, v, "", [want, got]) } else { tc_report_declared_mismatch(msg, v, v, want, got) }
     }
 }
 
@@ -28524,7 +28654,7 @@ fn tc_check_param_default_types(fn_name: Str, fn_node: Int, sig: Int) ! TypeChec
             let ptid = fnsig_param_list.get(fs.params_start + i) ?? -1
             if ptid >= 0 && tc_tid_is_no_info(ptid) == 0 {
                 // A signature records the abstract `Self`, which fixes nothing in the default.
-                let _ = check_one_arg_shape(fn_name, i - receiver, dflt, tc_self_as_receiver(ptid))
+                let _ = check_one_arg_shape(fn_name, i - receiver, dflt, tc_self_as_receiver(ptid), tc_handler_effect_of(ptid) != "")
             } else {
                 let _ = tc_infer_unhinted(dflt)
             }
@@ -30355,6 +30485,10 @@ fn tc_infer_returned_value(val: Int, returns_value: Bool) -> Int ! TypeCheck.Res
 // Shared by the assignment and by tc_recheck_operators.
 fn tc_assigned_type_fits(node: Int, val: Int, target_t: Int, val_t: Int) -> Bool ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     if assignment_types_compatible(target_t, val_t, val) != 0 { return true }
+    if tc_handler_short_of(target_t, val_t) {
+        tc_report_handler_coverage(val, target_t, val_t)
+        return false
+    }
     if !tc_closure_checked_against(val, target_t) { tc_value_mismatch_at("assignment: cannot assign {type_to_str(val_t)} to {type_to_str(target_t)}{tc_fn_mismatch_suffix(target_t, val_t)}", node, val, target_t) }
     false
 }
