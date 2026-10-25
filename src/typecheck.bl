@@ -12068,6 +12068,17 @@ fn tc_report_void_pointee_access(node: Int, is_deref: Bool) ! Diag.Report {
         ["`Ptr[Void]` is an opaque handle: pass it to C and test it with `.is_null()`, but there is no value behind it to read or write"])
 }
 
+// `p.a.b` reaches field `b` through the embedded `@ffi.struct` field `a` (07 §9.1.3): the
+// path is one place behind `p`, so walk down to `p`. The walk stops at any other node, so
+// a path that crosses a `Ptr` field (`h.q.b`) roots at `h.q`, not at `h`.
+fn tc_ptr_field_path_root(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    let mut cur = node
+    while node_kind(cur) == NodeKind.FieldAccess && ffi_struct_type_set.contains_key(tc_resolve(infer_type(cur))) != 0 {
+        cur = node_obj(cur)
+    }
+    cur
+}
+
 fn tc_ptr_ffi_struct_pointee(ptr_tid: Int) -> Int {
     let pt = tc_resolve(ptr_tid)
     if pt < 0 || pt >= ty_pool.len() { return 0 }
@@ -25223,17 +25234,19 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
         // `p.zzf.read()` and `p.zzf.write(v)` — the typed field access the spec documents for a
         // `Ptr[@ffi.struct S]` (§9.1). The receiver is a PLACE reached through the pointer, not
         // an ordinary value of the field's type, so the pair is resolved on the SHAPE of the
-        // receiver — a field access whose own object is a pointer — which is the same shape
-        // codegen lowers it on. Resolving on the receiver's TYPE would instead put `read` and
+        // receiver — a field access whose own object is a pointer, or an embedded
+        // `@ffi.struct` field reached through one (`p.a.b`) — which is the shape codegen
+        // lowers it on. Resolving on the receiver's TYPE would instead put `read` and
         // `write` on every value of that field's type.
         if method == "read" || method == "write" {
             if obj_node != -1 && node_kind(obj_node) == NodeKind.FieldAccess {
-                if tc_ptr_ffi_struct_pointee(infer_type(node_obj(obj_node))) != 0 {
+                if tc_ptr_ffi_struct_pointee(infer_type(tc_ptr_field_path_root(node_obj(obj_node)))) != 0 {
                     let place_t = infer_type(obj_node)
                     if method == "read" { return place_t }
                     // A field address stores the field's type, checked as `Ptr.write` checks
                     // the pointee.
-                    let owner = type_to_str(tc_resolve(ty_pool.get(tc_resolve(infer_type(node_obj(obj_node)))).unwrap().inner1))
+                    let owner_t = tc_resolve(infer_type(node_obj(obj_node)))
+                    let owner = if type_kind(owner_t) == TyKind.Ptr { type_to_str(tc_resolve(ty_pool.get(owner_t).unwrap().inner1)) } else { type_to_str(owner_t) }
                     check_builtin_arg("write", 0, place_t, node_args(node), "{owner}.{node_name(obj_node)}")
                     return TYPE_VOID
                 }
