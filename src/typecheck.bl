@@ -2849,21 +2849,26 @@ fn tc_ud_conversion_may_settle(tid: Int) -> Bool {
     let roots = tc_ud_metavar_roots(tid)
     for call_node in tc_deferred_conversion_calls() {
         let (source, target) = tc_deferred_conversion_sides(call_node)
-        for r in tc_ud_metavar_roots(source) { if roots.contains(r) { return true } }
-        for r in tc_ud_metavar_roots(target) { if roots.contains(r) { return true } }
+        if tc_ud_shares_root(roots, source) || tc_ud_shares_root(roots, target) { return true }
     }
+    false
+}
+
+fn tc_ud_shares_root(roots: List[Int], tid: Int) -> Bool {
+    for r in tc_ud_metavar_roots(tid) { if roots.contains(r) { return true } }
     false
 }
 
 // Whether a closure parameter still in scope holds one of `tid`'s metavariables: a call of
 // the closure after its body solves the parameter, and the `let` with it.
 fn tc_ud_param_may_settle(tid: Int) -> Bool {
+    if tc_tid_has_unbound_metavar(tid) == 0 { return false }
     let roots = tc_ud_metavar_roots(tid)
     let mut i = 0
     while i < nr_scope_types.len() {
         let nd = nr_scope_nodes.get(i).unwrap()
         if nd != -1 && node_kind(nd) == NodeKind.Param {
-            for r in tc_ud_metavar_roots(nr_scope_types.get(i).unwrap()) { if roots.contains(r) { return true } }
+            if tc_ud_shares_root(roots, nr_scope_types.get(i).unwrap()) { return true }
         }
         i = i + 1
     }
@@ -5846,8 +5851,8 @@ fn tc_operand_type_unsolved(tid0: Int) -> Bool {
 
 // An operand has no type yet that an operator could reject when no walk has typed it, or when
 // it is unsolved in the name-resolution walk, which a later walk repeats with the types
-// settled. Past that walk nothing checks the operator again once its operand is solved, so
-// an unsolved operand there is checked as it stands.
+// settled. Past that walk an unsolved type parameter is checked as it stands, and a
+// metavariable waits for tc_recheck_operators (see tc_operand_type_pending).
 fn tc_operand_type_open(tid: Int) -> Bool {
     tc_tid_is_no_info(tid) != 0 || (tc_boundary_check_active == 0 && tc_operand_type_unsolved(tid))
 }
@@ -5860,7 +5865,8 @@ fn tc_literal_takes_other(lit: Int, other: Int, other_t: Int) -> Bool {
 
 // An operand an operator does not reject yet: its type is open (see tc_operand_type_open), or
 // it is a metavariable a later line can still solve. tc_recheck_operators checks the operator
-// again once inference ends, with the type the operand was solved to.
+// again once inference ends, with the type the operand was solved to. An unsolved type
+// parameter is not pending, since nothing checks it again.
 fn tc_operand_type_pending(tid: Int) -> Bool {
     tc_operand_type_open(tid) || tc_is_unbound_metavar(tc_resolve(tid)) != 0
 }
@@ -5886,8 +5892,7 @@ fn tc_settle_literal_operands(node: Int, lt: Int, rt: Int, want: Int) {
 // A metavariable, solved or not, as an operand's recorded type: the operand was typed before
 // a later line could give it a type.
 fn tc_tid_is_metavar(tid: Int) -> Bool {
-    if tc_tid_is_no_info(tid) != 0 { return false }
-    ty_pool.get(tid).unwrap().kind == TyKind.Unknown
+    tc_tid_is_no_info(tid) == 0 && tc_tid_kind(tid) == TyKind.Unknown
 }
 
 fn tc_literal_fits(node: Int, k: TyKind) -> Bool {
@@ -19173,6 +19178,9 @@ fn tc_infer_receiver(recv: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Di
         let name = node_name(recv)
         if is_variant_name(name) != 0 && tc_names_a_type(name) && tc_tid_is_no_info(nr_get_type(name)) != 0 { return -1 }
     }
+    // The type expected of the call is not expected of its receiver, so it does not reach an
+    // operator there (sections/03_types.md §3.2 *Operator operands*).
+    if recv != -1 && node_kind(recv) == NodeKind.BinOp { return tc_infer_unhinted(recv) }
     infer_type(recv)
 }
 
@@ -22991,21 +22999,83 @@ pub fn type_bit_width(tid: Int) -> Int {
 // operand (tc_operand_type_pending), so once inference ends each such operator is checked again
 // with the types its operands were solved to, and an error is at the operator. An operand
 // nothing solved is E0301's to report, not the operator's.
+//
+// A function's allow set holds over its own operators, and a node names no parent, so each
+// outermost function that has one is walked from its own node first, under that set. A
+// nested function's set stacks on its enclosing one, as in the main walk.
 fn tc_recheck_operators() ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     let ranges = parser_live_ranges()
+    let mut allow_fns: List[Int] = []
     let mut r = 0
     while r + 1 < ranges.len() {
         let mut n = ranges.get(r).unwrap()
         while n < ranges.get(r + 1).unwrap() {
-            let k = node_kind(n)
-            if k == NodeKind.BinOp || k == NodeKind.CompoundAssign { tc_recheck_operator(n, k) }
+            if tc_fn_has_allows(n) { allow_fns.push(n) }
+            n = n + 1
+        }
+        r = r + 2
+    }
+    let mut nested: Map[Int, Int] = Map()
+    for f in allow_fns { tc_mark_nested_allow_fns(f, nested) }
+    let mut done: Map[Int, Int] = Map()
+    for f in allow_fns {
+        if !nested.contains_key(f) { tc_recheck_operators_under(f, done) }
+    }
+    r = 0
+    while r + 1 < ranges.len() {
+        let mut n = ranges.get(r).unwrap()
+        while n < ranges.get(r + 1).unwrap() {
+            if tc_is_rechecked_operator(n) && !done.contains_key(n) { tc_recheck_operator(n, node_kind(n)) }
             n = n + 1
         }
         r = r + 2
     }
 }
 
+fn tc_fn_has_allows(node: Int) -> Bool {
+    node_kind(node) == NodeKind.FnDef && get_annotation(node, "allow") != -1
+}
+
+fn tc_is_rechecked_operator(node: Int) -> Bool {
+    let k = node_kind(node)
+    k == NodeKind.BinOp || k == NodeKind.CompoundAssign || k == NodeKind.UnaryOp
+}
+
+fn tc_mark_nested_allow_fns(root: Int, nested: Map[Int, Int]) {
+    let mut stack: List[Int] = [root]
+    let mut kids: List[Int] = []
+    while stack.len() > 0 {
+        let n = stack.pop().unwrap()
+        if n != root && tc_fn_has_allows(n) { nested.insert(n, 1) }
+        kids.clear()
+        node_push_value_child_ids(n, kids)
+        for kid in kids { stack.push(kid) }
+    }
+}
+
+fn tc_recheck_operators_under(fn_node: Int, done: Map[Int, Int]) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    diag_enter_allows(fn_node)
+    let mut stack: List[Int] = [fn_node]
+    let mut kids: List[Int] = []
+    while stack.len() > 0 {
+        let n = stack.pop().unwrap()
+        if n != fn_node && tc_fn_has_allows(n) {
+            tc_recheck_operators_under(n, done)
+            continue
+        }
+        if tc_is_rechecked_operator(n) && !done.contains_key(n) {
+            tc_recheck_operator(n, node_kind(n))
+            done.insert(n, 1)
+        }
+        kids.clear()
+        node_push_value_child_ids(n, kids)
+        for kid in kids { stack.push(kid) }
+    }
+    diag_exit_allows()
+}
+
 fn tc_recheck_operator(node: Int, k: NodeKind) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    if k == NodeKind.UnaryOp { return tc_recheck_unary_operator(node) }
     let a = if k == NodeKind.BinOp { node_left(node) } else { node_target(node) }
     let b = if k == NodeKind.BinOp { node_right(node) } else { node_value(node) }
     let at = tc_lookup_node_tid(a)
@@ -23017,7 +23087,11 @@ fn tc_recheck_operator(node: Int, k: NodeKind) ! TypeCheck.Resolve, TypeCheck.Re
     if tc_is_unbound_metavar(lt) != 0 || tc_is_unbound_metavar(rt) != 0 { return }
     let col = node_col(node)
     if diag_has_error_at(TYPE_ERROR, node, col) || diag_has_error_at(STR_PLUS_UNSUPPORTED, node, col) { return }
-    if k == NodeKind.CompoundAssign { return tc_check_compound_operands(node, lt, rt) }
+    if k == NodeKind.CompoundAssign {
+        tc_check_compound_operands(node, lt, rt)
+        if !diag_has_error_at(TYPE_ERROR, node, col) { let _ = tc_assigned_type_fits(node, b, lt, rt) }
+        return
+    }
     let op = node_op(node)
     if is_comparison_op(op) != 0 { return tc_check_comparison_operands(node, op, lt, rt) }
     if op == "+" || op == "-" || op == "*" || op == "/" || op == "%" {
@@ -23030,6 +23104,34 @@ fn tc_recheck_operator(node: Int, k: NodeKind) ! TypeCheck.Resolve, TypeCheck.Re
         return
     }
     if op == "<<" || op == ">>" { tc_check_shift_operands(node, op, lt, rt) }
+}
+
+fn tc_recheck_unary_operator(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    let at = tc_lookup_node_tid(node_left(node))
+    if !tc_tid_is_metavar(at) { return }
+    let t = tc_resolve(at)
+    if tc_tid_is_no_info(t) != 0 || tc_is_unbound_metavar(t) != 0 { return }
+    if diag_has_error_at(TYPE_ERROR, node, node_col(node)) { return }
+    tc_check_unary_operand(node, node_op(node), t)
+}
+
+// The type of `+ - * / % & | ^`: the type a lone literal took, else the literal-free side's.
+fn tc_operator_result_type(node: Int, lit_t: Int, lt: Int, rt: Int) -> Int {
+    if lit_t >= 0 { return lit_t }
+    if tc_literal_takes_other(node_right(node), node_left(node), lt) { return lt }
+    if tc_literal_takes_other(node_left(node), node_right(node), rt) { return rt }
+    if tc_tid_is_no_info(lt) == 0 { return lt }
+    rt
+}
+
+// The operand check of unary `-` and `~`; see tc_check_arith_operands.
+fn tc_check_unary_operand(node: Int, op: Str, t: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    // Unary minus desugars to Neg.neg, a sealed arithmetic trait (spec
+    // sections/02_syntax.md:1046) — `-someStruct` / `-someOpaque` is not numeric.
+    if op == "-" { reject_non_numeric_arith_operand(op, t, node, 1) }
+    if op == "~" && !tc_operand_type_pending(t) && is_integer_type(t) == 0 {
+        tc_error_at_code("bitwise `~` requires integer operand, got {type_to_str(t)}", node, "TypeError", TYPE_ERROR, bitwise_operand_help(op, t))
+    }
 }
 
 // The operand checks of a compound assignment; see tc_check_arith_operands.
@@ -24244,21 +24346,11 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
         if tc_check_str_plus(node, op, lt, rt) { return TYPE_STR }
         if op == "+" || op == "-" || op == "*" || op == "/" || op == "%" {
             tc_settle_literal_operands(node, lt, rt, want)
-            let lit_t = tc_check_arith_operands(node, op, lt, rt)
-            if lit_t >= 0 { return lit_t }
-            if tc_literal_takes_other(node_right(node), node_left(node), lt) { return lt }
-            if tc_literal_takes_other(node_left(node), node_right(node), rt) { return rt }
-            if tc_tid_is_no_info(lt) == 0 { return lt }
-            return rt
+            return tc_operator_result_type(node, tc_check_arith_operands(node, op, lt, rt), lt, rt)
         }
         if op == "&" || op == "|" || op == "^" {
             tc_settle_literal_operands(node, lt, rt, want)
-            let lit_t = tc_check_bitwise_operands(node, op, lt, rt)
-            if lit_t >= 0 { return lit_t }
-            if tc_literal_takes_other(node_right(node), node_left(node), lt) { return lt }
-            if tc_literal_takes_other(node_left(node), node_right(node), rt) { return rt }
-            if tc_tid_is_no_info(lt) == 0 { return lt }
-            return rt
+            return tc_operator_result_type(node, tc_check_bitwise_operands(node, op, lt, rt), lt, rt)
         }
         if op == "<<" || op == ">>" {
             // The amount is U32 whatever the expected type, so an amount nothing has solved is.
@@ -24276,16 +24368,8 @@ fn infer_type_uncached(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, 
         let op = node_op(node)
         let operand = infer_type(node_left(node))
         if op == "!" { return TYPE_BOOL }
-        if op == "-" {
-            // Unary minus desugars to Neg.neg, a sealed arithmetic trait (spec
-            // sections/02_syntax.md:1046) — `-someStruct` / `-someOpaque` is not numeric.
-            reject_non_numeric_arith_operand(op, operand, node, 1)
-            return operand
-        }
-        if op == "~" {
-            if tc_tid_is_no_info(operand) == 0 && is_integer_type(operand) == 0 {
-                tc_error_at_code("bitwise `~` requires integer operand, got {type_to_str(operand)}", node, "TypeError", TYPE_ERROR, bitwise_operand_help(op, operand))
-            }
+        if op == "-" || op == "~" {
+            tc_check_unary_operand(node, op, operand)
             return operand
         }
         if op == "?" {
@@ -29835,6 +29919,14 @@ fn tc_infer_returned_value(val: Int, returns_value: Bool) -> Int ! TypeCheck.Res
 
 // `block` is the block that holds the statement and `at` its index there, or -1 when the
 // assignment is no statement of a block, such as the body of a match arm with no braces.
+// Whether an assigned value fits its target, reporting at the assignment when it does not.
+// Shared by the assignment and by tc_recheck_operators.
+fn tc_assigned_type_fits(node: Int, val: Int, target_t: Int, val_t: Int) -> Bool ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    if assignment_types_compatible(target_t, val_t, val) != 0 { return true }
+    if !tc_closure_checked_against(val, target_t) { tc_value_mismatch_at("assignment: cannot assign {type_to_str(val_t)} to {type_to_str(target_t)}{tc_fn_mismatch_suffix(target_t, val_t)}", node, val, target_t) }
+    false
+}
+
 fn tc_check_assignment(node: Int, block: Int, at: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     let kind = node_kind(node)
     let target = node_target(node)
@@ -29865,9 +29957,7 @@ fn tc_check_assignment(node: Int, block: Int, at: Int) ! TypeCheck.Resolve, Type
             tc_check_compound_operands(node, target_t, val_t)
         }
         if tc_tid_is_no_info(target_t) == 0 && tc_tid_is_no_info(val_t) == 0 {
-            if assignment_types_compatible(target_t, val_t, val) == 0 {
-                if !tc_closure_checked_against(val, target_t) { tc_value_mismatch_at("assignment: cannot assign {type_to_str(val_t)} to {type_to_str(target_t)}{tc_fn_mismatch_suffix(target_t, val_t)}", node, val, target_t) }
-            } else {
+            if tc_assigned_type_fits(node, val, target_t, val_t) {
                 // An assignment TARGET is a declared-type source for the value's
                 // metavars, not only something to compare against — the same
                 // reasoning as the LetBinding arm of tc_check_body, and the same in-place
