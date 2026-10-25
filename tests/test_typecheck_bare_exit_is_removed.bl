@@ -1,0 +1,120 @@
+// Bare `exit(c)` is a removed free function (sections/04_effects.md *Removed free functions*):
+// a call to it is the usual undefined-function error, E0504, with a fix that names the
+// replacement `env.exit(c)` and its effect `Env.Exit`. The compiler looks in the removed-name
+// table only when name lookup fails, so a program's own `exit`, a local binding or a
+// declared fn, still compiles and is called.
+
+import typecheck.{check_types}
+import compiler.{compile_to_program}
+import diagnostics.{diag_entries, diag_reset, DiagEntry}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+import compile_test_helpers
+import std.fs
+import std.io
+
+fn probe(path: Str, src: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    init_embedded_stdlib()
+    write_file(path, src)
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+    program
+}
+
+fn probe_src() -> Str {
+    #"fn bare(c: Int) ! Env {
+    exit(c)  // E_BARE
+}
+
+fn bare_tail(n: Int) -> Int ! Env {
+    if n > 0 { return n }
+    exit(2)  // E_BARE_TAIL
+}
+
+// OK_START
+fn qualified(c: Int) ! Env {
+    env.exit(c)
+}
+
+fn through_local() -> Str {
+    let exit = fn(c: Int) -> Str { "{c}" }
+    exit(3)
+}
+// OK_END
+
+fn main() {}
+"#
+}
+
+// The 1-based line of the one source line that holds `marker`.
+fn line_of(marker: Str) -> Int {
+    let lines = probe_src().split("\n")
+    let mut i = 0
+    while i < lines.len() {
+        if lines.get(i).unwrap().contains(marker) { return i + 1 }
+        i = i + 1
+    }
+    io.println("FAIL: probe has no line marked '{marker}'")
+    assert(false)
+    -1
+}
+
+fn errors_on_line(line: Int) -> List[DiagEntry] {
+    let mut out: List[DiagEntry] = []
+    for d in diag_entries {
+        if d.severity == "error" && d.line == line { out.push(d) }
+    }
+    out
+}
+
+fn all_errors() -> Str {
+    let mut out = ""
+    for d in diag_entries {
+        if d.severity == "error" { out = out.concat("{d.line}:{d.col}: {d.code} {d.message} | help: {d.help}\n") }
+    }
+    out
+}
+
+// The one error on the marked line is E0504 at column 5, with the fix that rewrites the
+// callee `exit` (columns 5..9) to `env.exit`.
+fn assert_removed_exit_at(marker: Str) {
+    let errs = errors_on_line(line_of(marker))
+    if errs.len() != 1 { io.println("FAIL: want one error on the {marker} line; errors were:\n{all_errors()}") }
+    assert_eq(errs.len(), 1)
+    let d = errs.get(0).unwrap()
+    assert_eq(d.code, "E0504")
+    assert_eq(d.message, "undefined function `exit`")
+    assert_eq(d.col, 5)
+    assert_eq(d.help, "`exit` was removed; call `env.exit(code)`")
+    assert(d.notes.contains("`exit` is an operation of `Env.Exit`"))
+    assert_eq(d.fix_action, "replace with")
+    assert_eq(d.fix_text, "env.exit")
+    assert_eq(d.fix_line, d.line)
+    assert_eq(d.fix_col, 5)
+    assert_eq(d.fix_end_col, 9)
+}
+
+test "a bare exit call is E0504 with the env.exit fix" {
+    let _p = probe("build/tc_bare_exit_removed_src.bl", probe_src())
+    assert_removed_exit_at("E_BARE")
+    assert_removed_exit_at("E_BARE_TAIL")
+}
+
+test "env.exit and a local binding named exit report nothing" {
+    let _p = probe("build/tc_bare_exit_removed_src.bl", probe_src())
+    let mut l = line_of("OK_START")
+    while l <= line_of("OK_END") {
+        let errs = errors_on_line(l)
+        if errs.len() != 0 { io.println("FAIL: error on line {l}:\n{all_errors()}") }
+        assert_eq(errs.len(), 0)
+        l = l + 1
+    }
+}
+
+test "a program's own fn exit still compiles and is called" {
+    let src = "fn exit(c: Int) -> Int \{\n    c + 1\n}\nfn main() ! IO \{\n    let v: Int = exit(4)\n    io.println(\"\{v}\")\n}\n"
+    let r = compile_test_helpers.compile_and_run(src, "bare_exit_removed_own_fn")
+    assert_eq(r.exit_code, 0)
+    compile_test_helpers.expect_contains(r.out, "5", "the program's own exit runs and returns")
+}
