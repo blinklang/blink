@@ -6,6 +6,7 @@ import parser.{
     node_stmts, node_arms, effect_derived_ops, node_fields, node_elements, node_handlers, node_methods, node_captures,
     node_type_name, node_effects, node_str_val, node_op, node_type_ann,
     node_pattern, node_for_binder, node_value_child_ids, node_push_value_child_ids, node_is_mut, node_line, sublist_get, sublist_length,
+    has_annotation,
 }
 import diagnostics.{
     Diag, diag_error_at, diag_warn_at, diag_set_last_fix,
@@ -18,7 +19,9 @@ import typecheck.{
     TyKind, tc_call_decl_is_fn, tc_call_decl_node, tc_call_declared_name, tc_fn_has_effect,
     tc_lookup_node_tid, tc_resolve, tc_tid_child, tc_tid_decl_node, tc_tid_kind,
     tc_global_decl_node, tc_ident_binder_node, tc_tid_is_pointer_bearing, tc_tid_reaches_itself,
-    tc_type_str, tc_qualified_carrier,
+    tc_type_str, tc_qualified_carrier, tc_decl_param_count, tc_decl_param_name, tc_decl_param_tid,
+    tc_struct_field_slots, tc_sfield_name, tc_sfield_tid, tc_member_tid_at_instance, tc_declared_field_tids,
+    tc_tid_child_count,
 }
 import free_names.{closure_read_idents, pattern_names, push_param_names}
 import unparse.{unparse_expr}
@@ -556,7 +559,8 @@ let mut ea_ffi_scope_blocks: List[List[Int]] = []
 // tag of the values it captures. Keyed by node, so a shadowing binder of the
 // same name never reads or clobbers another's tag. A `let mut` binder's cell
 // tag lives here too, under ea_cell_key, since the value and the cell of one
-// binder can have different tags.
+// binder can have different tags; so does the creation tag of the List, Map or
+// Set a binder holds, under ea_creation_key, since a list is shared, not copied.
 let mut ea_node_tags: Map[Int, Int] = Map()
 
 fn ea_reset_ffi_scope_state() {
@@ -564,9 +568,14 @@ fn ea_reset_ffi_scope_state() {
     ea_node_tags = Map()
 }
 
-// Node ids are never negative, so a cell key never meets a node key.
+// Node ids are never negative, so a cell key or a creation key never meets a
+// node key, and the two interleave, so they never meet each other.
 fn ea_cell_key(binder: Int) -> Int {
-    -2 - binder
+    -2 - 2 * binder
+}
+
+fn ea_creation_key(binder: Int) -> Int {
+    -3 - 2 * binder
 }
 
 // Records the tag of a `let mut` cell: the innermost ffi.scope around its
@@ -580,6 +589,18 @@ fn ea_set_cell_tag(binder: Int, tag: Int) {
 fn ea_cell_tag(binder: Int) -> Int {
     if binder < 0 { return -2 }
     ea_node_tags.get(ea_cell_key(binder)) ?? -2
+}
+
+// Records the cell tag of the List, Map or Set that `binder` holds.
+fn ea_set_creation_tag(binder: Int, tag: Int) {
+    if binder < 0 { return }
+    ea_node_tags.insert(ea_creation_key(binder), tag)
+}
+
+// The cell tag of the List, Map or Set `binder` holds, or -2 when not known.
+fn ea_creation_tag(binder: Int) -> Int {
+    if binder < 0 { return -2 }
+    ea_node_tags.get(ea_creation_key(binder)) ?? -2
 }
 
 fn ea_push_ffi_scope_block() {
@@ -623,8 +644,19 @@ fn ea_scope_depth(tag: Int) -> Int {
     -1
 }
 
+// Whether `tag` is a local scope that is still open. The caller's tag of an
+// `@trusted` body is in the chain but is no local scope: a value may leave the
+// body with it.
 fn ea_ffi_scope_live(tag: Int) -> Int {
-    if ea_scope_depth(tag) >= 0 { 1 } else { 0 }
+    if ea_scope_depth(tag) < 0 { return 0 }
+    if ea_is_caller_tag(tag) { return 0 }
+    1
+}
+
+// The tag that the pointer-bearing parameters of an `@trusted` body share: the
+// function node, which opens the outermost block of the chain.
+fn ea_is_caller_tag(tag: Int) -> Bool {
+    tag >= 0 && node_kind(tag) == NodeKind.FnDef
 }
 
 // The position of `tag` in the live chain, outermost first, or -1 once its block
@@ -654,9 +686,19 @@ fn ea_innermost_live_scope() -> Int {
 fn ea_innermost(a: Int, b: Int) -> Int {
     if a < 0 { return b }
     if b < 0 { return a }
-    let da = ea_scope_depth(a)
-    let db = ea_scope_depth(b)
-    if db > da { b } else { a }
+    if ea_scope_rank(b) > ea_scope_rank(a) { b } else { a }
+}
+
+// The outer of two cell tags, where -2 is a cell not known and -1 is unscoped.
+fn ea_outermost(a: Int, b: Int) -> Int {
+    if a == -2 { return b }
+    if b == -2 { return a }
+    if a == -1 || b == -1 { return -1 }
+    let ra = ea_scope_rank(a)
+    let rb = ea_scope_rank(b)
+    if ra < 0 { return b }
+    if rb < 0 { return a }
+    if rb < ra { b } else { a }
 }
 
 fn ea_set_binder_tag(binder: Int, tag: Int) {
@@ -1410,6 +1452,339 @@ fn ffi_assign_cell_tag(root: Int) -> Int {
     ea_cell_tag(tc_ident_binder_node(root))
 }
 
+// The cell tag of the List, Map or Set `node` gives (§9.1.1: the innermost
+// scope around the expression that creates it), or -2 when not known. A read of
+// a binding gives the list it holds, not a new one, and a value built from parts
+// may hold a list one of the parts made earlier, so it takes the outermost tag.
+fn ffi_creation_tag_of(node: Int) -> Int {
+    if node == -1 { return -2 }
+    let k = node_kind(node)
+    if k == NodeKind.Ident {
+        if tc_global_decl_node(node) >= 0 { return -1 }
+        return ea_creation_tag(tc_ident_binder_node(node))
+    }
+    if k == NodeKind.FieldAccess || k == NodeKind.IndexExpr {
+        return ffi_creation_tag_of(node_obj(node))
+    }
+    if k == NodeKind.UnaryOp {
+        if node_op(node) == "?" { return ffi_creation_tag_of(node_left(node)) }
+        return ea_innermost_live_scope()
+    }
+    if k == NodeKind.IfExpr {
+        return ea_outermost(ffi_creation_tag_of(node_then_body(node)), ffi_creation_tag_of(node_else_body(node)))
+    }
+    if k == NodeKind.MatchExpr {
+        let arms_sl = node_arms(node)
+        let mut tag = -2
+        let mut i = 0
+        while arms_sl != -1 && i < sublist_length(arms_sl) {
+            tag = ea_outermost(tag, ffi_creation_tag_of(node_body(sublist_get(arms_sl, i))))
+            i = i + 1
+        }
+        return tag
+    }
+    if k == NodeKind.Block { return ffi_creation_tag_of(block_tail_node(node)) }
+    if k == NodeKind.ExprStmt { return ffi_creation_tag_of(node_value(node)) }
+    let mut tag = ea_innermost_live_scope()
+    for kid in node_value_child_ids(node) {
+        if ffi_holds_pointer_collection(tc_lookup_node_tid(kid)) {
+            tag = ea_outermost(tag, ffi_creation_tag_of(kid))
+        }
+    }
+    tag
+}
+
+// Whether a value of this type may hold a List, Map or Set of pointers, which
+// rule 4 tracks by creation tag. A `Ptr` or a closure does not hold one by value.
+fn ffi_holds_pointer_collection(tid: Int) -> Bool {
+    let mut seen: Map[Int, Int] = Map()
+    ffi_holds_pointer_collection_walk(tc_resolve(tid), seen)
+}
+
+fn ffi_holds_pointer_collection_walk(r: Int, seen: Map[Int, Int]) -> Bool {
+    if r < 0 || seen.contains_key(r) { return false }
+    seen.insert(r, 1)
+    if tc_tid_is_pointer_bearing(r) == 0 { return false }
+    let k = tc_tid_kind(r)
+    if k == TyKind.List || k == TyKind.Map || k == TyKind.Set { return true }
+    if k == TyKind.Ptr || k == TyKind.Fn { return false }
+    if k == TyKind.Struct || k == TyKind.Enum {
+        for f in tc_declared_field_tids(r) {
+            if ffi_holds_pointer_collection_walk(tc_resolve(tc_member_tid_at_instance(f, r)), seen) { return true }
+        }
+    }
+    let mut i = 0
+    while i < tc_tid_child_count(r) {
+        if ffi_holds_pointer_collection_walk(tc_resolve(tc_tid_child(r, i)), seen) { return true }
+        i = i + 1
+    }
+    false
+}
+
+// Every binder in a pattern holds a part of the whole value, so a list it holds
+// is one the whole value holds.
+fn ea_creation_pattern(pat: Int, tag: Int) {
+    if pat < 0 { return }
+    ea_set_creation_tag(pat, tag)
+    for kid in node_value_child_ids(pat) { ea_creation_pattern(kid, tag) }
+}
+
+// An assignment of a pointer-bearing value may put an older list in the root
+// binding, so its creation tag becomes the outer of the two.
+fn ffi_creation_by_assignment(node: Int) {
+    let val = node_value(node)
+    let vtid = tc_lookup_node_tid(val)
+    if vtid < 0 || tc_tid_is_pointer_bearing(vtid) == 0 { return }
+    let root = ffi_place_root(node_target(node))
+    if root == -1 || tc_global_decl_node(root) >= 0 { return }
+    let binder = tc_ident_binder_node(root)
+    if binder < 0 { return }
+    ea_set_creation_tag(binder, ea_outermost(ea_creation_tag(binder), ffi_creation_tag_of(val)))
+}
+
+// Whether a parameter is pointer-holding (§9.1.1, rule 4) at this call. The
+// declared type decides the kind, and the argument's type the element types,
+// so a generic `List[T]` holds pointers where `T` is a pointer.
+fn ffi_is_pointer_holding(declared: Int, arg: Int) -> Bool {
+    let inst = tc_resolve(tc_lookup_node_tid(arg))
+    if inst < 0 { return false }
+    let dk = if declared >= 0 { tc_tid_kind(tc_resolve(declared)) } else { tc_tid_kind(inst) }
+    if dk != tc_tid_kind(inst) { return false }
+    if dk == TyKind.Ptr { return tc_tid_is_pointer_bearing(tc_tid_child(inst, 0)) != 0 }
+    if dk == TyKind.List || dk == TyKind.Map || dk == TyKind.Set { return tc_tid_is_pointer_bearing(inst) != 0 }
+    false
+}
+
+// The cell a call may store into through the pointer-holding argument `arg`:
+// the pointee of a `Ptr`, or the List, Map or Set itself.
+fn ffi_holder_cell_tag(arg: Int) -> Int {
+    let tid = tc_resolve(tc_lookup_node_tid(arg))
+    if tid >= 0 && tc_tid_kind(tid) == TyKind.Ptr { return ffi_write_cell_tag(arg) }
+    ffi_creation_tag_of(arg)
+}
+
+// The first `Ptr` field of a struct, at any depth, as `S.f.g: Ptr[T]`; "" when
+// it has none.
+fn ffi_ptr_field_path(struct_tid: Int, prefix: Str) -> Str {
+    for slot in tc_struct_field_slots(struct_tid) {
+        let ftid = tc_resolve(tc_member_tid_at_instance(tc_sfield_tid(slot), struct_tid))
+        if ftid < 0 || tc_tid_is_pointer_bearing(ftid) == 0 { continue }
+        let path = "{prefix}.{tc_sfield_name(slot)}"
+        if tc_tid_kind(ftid) == TyKind.Struct {
+            let inner = ffi_ptr_field_path(ftid, path)
+            if inner != "" { return inner }
+        } else {
+            return "{path}: {tc_type_str(ftid)}"
+        }
+    }
+    ""
+}
+
+// Rule 4 (§9.1.1): at a call, a tagged value passed next to a pointer-holding
+// argument is stored into that argument's cell. `recv` is the receiver of a
+// method call, or -1. A variant constructor builds a value and stores nothing.
+fn check_ffi_call_beside_holder(call: Int, recv: Int) ! Diag.Report {
+    let decl = tc_call_decl_node(call)
+    if decl >= 0 && node_kind(decl) == NodeKind.TypeVariant { return }
+    let mut args: List[Int] = []
+    let mut declared: List[Int] = []
+    let mut pnames: List[Str] = []
+    let args_sl = node_args(call)
+    if decl >= 0 {
+        let n = ffi_decl_param_count(decl)
+        let self_off = if recv != -1 && n > 0 && ffi_decl_param_name(decl, 0) == "self" { 1 } else { 0 }
+        if self_off == 1 {
+            args.push(recv)
+            declared.push(ffi_decl_param_tid(decl, 0))
+            pnames.push("self")
+        }
+        let mut i = 0
+        while args_sl != -1 && i < sublist_length(args_sl) {
+            let a = sublist_get(args_sl, i)
+            let mut pi = self_off + i
+            let mut v = a
+            if node_kind(a) == NodeKind.NamedArg {
+                v = node_value(a)
+                pi = -1
+                let mut j = 0
+                while j < n {
+                    if ffi_decl_param_name(decl, j) == node_name(a) { pi = j }
+                    j = j + 1
+                }
+            }
+            args.push(v)
+            declared.push(if pi >= 0 && pi < n { ffi_decl_param_tid(decl, pi) } else { -2 })
+            pnames.push(if pi >= 0 && pi < n { ffi_decl_param_name(decl, pi) } else { "" })
+            i = i + 1
+        }
+    } else {
+        // A builtin method: only its receiver has a declared type this pass can
+        // read, and a `Ptr` receiver stores by `.write`, which is rule 1.
+        if recv == -1 { return }
+        let rtid = tc_resolve(tc_lookup_node_tid(recv))
+        if rtid < 0 || tc_tid_kind(rtid) == TyKind.Ptr { return }
+        args.push(recv)
+        declared.push(-1)
+        pnames.push("")
+        let mut i = 0
+        while args_sl != -1 && i < sublist_length(args_sl) {
+            let a = sublist_get(args_sl, i)
+            args.push(if node_kind(a) == NodeKind.NamedArg { node_value(a) } else { a })
+            declared.push(-2)
+            pnames.push("")
+            i = i + 1
+        }
+    }
+    let mut holders: List[Int] = []
+    let mut cells: List[Int] = []
+    let mut hi = 0
+    while hi < args.len() {
+        let d = declared.get(hi).unwrap()
+        let a = args.get(hi).unwrap()
+        if d != -2 && ffi_is_pointer_holding(d, a) {
+            holders.push(hi)
+            cells.push(ffi_holder_cell_tag(a))
+        }
+        hi = hi + 1
+    }
+    if holders.len() == 0 { return }
+    let mut vi = 0
+    while vi < args.len() {
+        let v = args.get(vi).unwrap()
+        let vtag = ffi_tag_of(v)
+        let mut k = 0
+        while vtag >= 0 && k < holders.len() {
+            let h = holders.get(k).unwrap()
+            let cell = cells.get(k).unwrap()
+            if h != vi && ffi_tag_outlives_cell(vtag, cell) == 0 {
+                emit_ffi_call_store(call, args.get(h).unwrap(), declared.get(h).unwrap(), pnames.get(h).unwrap(), v, vtag, cell)
+                break
+            }
+            k = k + 1
+        }
+        vi = vi + 1
+    }
+    let mut ri = 0
+    while ri < holders.len() {
+        ffi_retag_collection_holder(args, holders.get(ri).unwrap())
+        ri = ri + 1
+    }
+}
+
+// A List, Map or Set that a call may store into now holds the tags of the
+// other arguments, as an assignment's root does, so it may not leave their
+// scopes. A `Ptr` holder's pointee is the cell, not the `Ptr`, and a
+// module-level binding is unscoped, so the check above already covers both.
+fn ffi_retag_collection_holder(args: List[Int], h: Int) {
+    let holder = args.get(h).unwrap()
+    let htid = tc_resolve(tc_lookup_node_tid(holder))
+    if htid < 0 || tc_tid_kind(htid) == TyKind.Ptr { return }
+    let mut root = holder
+    while root != -1 && (node_kind(root) == NodeKind.FieldAccess || node_kind(root) == NodeKind.IndexExpr) { root = node_obj(root) }
+    if root == -1 || node_kind(root) != NodeKind.Ident || tc_global_decl_node(root) >= 0 { return }
+    let binder = tc_ident_binder_node(root)
+    if binder < 0 { return }
+    let mut tag = ea_node_tags.get(binder) ?? -1
+    let mut i = 0
+    while i < args.len() {
+        if i != h { tag = ea_innermost(tag, ffi_tag_of(args.get(i).unwrap())) }
+        i = i + 1
+    }
+    ea_set_binder_tag(binder, tag)
+}
+
+// 1 when a value with tag `vtag` may be stored into a cell with tag `cell`: the
+// value encloses the cell, or this pass does not know one of the two.
+fn ffi_tag_outlives_cell(vtag: Int, cell: Int) -> Int {
+    if cell == -2 { return 1 }
+    let vrank = ea_scope_rank(vtag)
+    if vrank < 0 { return 1 }
+    if cell == -1 { return 0 }
+    let crank = ea_scope_rank(cell)
+    if crank < 0 || vrank <= crank { 1 } else { 0 }
+}
+
+fn ffi_decl_param_count(decl: Int) -> Int {
+    let n = tc_decl_param_count(decl)
+    if n >= 0 { return n }
+    let ps = node_params(decl)
+    if ps == -1 { 0 } else { sublist_length(ps) }
+}
+
+fn ffi_decl_param_name(decl: Int, i: Int) -> Str {
+    if tc_decl_param_count(decl) >= 0 { return tc_decl_param_name(decl, i) }
+    let ps = node_params(decl)
+    if ps == -1 || i >= sublist_length(ps) { return "" }
+    node_name(sublist_get(ps, i))
+}
+
+fn ffi_decl_param_tid(decl: Int, i: Int) -> Int {
+    if tc_decl_param_count(decl) >= 0 { return tc_decl_param_tid(decl, i) }
+    let ps = node_params(decl)
+    if ps == -1 || i >= sublist_length(ps) { return -1 }
+    let ann = node_type_ann(sublist_get(ps, i))
+    if ann == -1 { -1 } else { tc_lookup_node_tid(ann) }
+}
+
+// The name of what a call reaches, for the message.
+fn ffi_callee_name(call: Int) -> Str {
+    if node_kind(call) == NodeKind.MethodCall { return node_method(call) }
+    tc_call_declared_name(call)
+}
+
+fn emit_ffi_call_store(call: Int, holder: Int, declared: Int, pname: Str, val: Int, vtag: Int, cell: Int) ! Diag.Report {
+    let vtid = tc_lookup_node_tid(val)
+    let is_closure = node_kind(val) == NodeKind.Closure || (vtid >= 0 && tc_tid_kind(tc_resolve(vtid)) == TyKind.Fn)
+    let what = if is_closure { "closure that captures a pointer" } else { "pointer" }
+    let inst = tc_resolve(tc_lookup_node_tid(holder))
+    let param = if pname == "" || pname == "self" { "the receiver `{tc_type_str(inst)}`" } else { "parameter `{pname}: {tc_type_str(declared)}`" }
+    let mut field = ""
+    if tc_tid_kind(inst) == TyKind.Ptr {
+        let pointee = tc_resolve(tc_tid_child(inst, 0))
+        if tc_tid_kind(pointee) == TyKind.Struct {
+            let path = ffi_ptr_field_path(pointee, tc_type_str(pointee))
+            if path != "" { field = " (`{path}`)" }
+        }
+    }
+    let vtext = unparse_expr(val)
+    let source = ffi_call_rule_source(val, vtag)
+    let src_note = if source != "" { "; its tag comes from argument `{source}`" } else { "" }
+    let msg = "{what} from {ffi_scope_phrase(vtag, cell)} stored by call into `{unparse_expr(holder)}` ({ffi_scope_held(cell, vtag)}), which outlives it (tag-mismatch): {param} can hold pointers{field}, so `{ffi_callee_name(call)}` may store `{vtext}` in it{src_note}"
+    let vname = if node_kind(val) == NodeKind.Ident { "`{vtext}`" } else { "the value" }
+    emit_ffi_tag_mismatch(val, msg, ffi_store_help(vname, vtag, cell))
+}
+
+// When the tag of `val` came from the call rule, the argument of that call
+// whose tag it took. A binding made by such a call counts as the call.
+fn ffi_call_rule_source(val: Int, vtag: Int) -> Str ! Diag.Report {
+    let mut v = val
+    if v != -1 && node_kind(v) == NodeKind.Ident {
+        let binder = tc_ident_binder_node(v)
+        if binder >= 0 && node_kind(binder) == NodeKind.LetBinding { v = node_value(binder) }
+    }
+    if v == -1 { return "" }
+    let k = node_kind(v)
+    let mut parts: List[Int] = []
+    if k == NodeKind.MethodCall {
+        let m = node_method(v)
+        if ffi_scope_handle_tag(node_obj(v)) != -1 || m == "offset" || m == "deref" || m == "read" { return "" }
+        parts.push(node_obj(v))
+    } else if k != NodeKind.Call {
+        return ""
+    }
+    let args_sl = node_args(v)
+    let mut i = 0
+    while args_sl != -1 && i < sublist_length(args_sl) {
+        let a = sublist_get(args_sl, i)
+        parts.push(if node_kind(a) == NodeKind.NamedArg { node_value(a) } else { a })
+        i = i + 1
+    }
+    for p in parts {
+        if ffi_tag_of(p) == vtag { return unparse_expr(p) }
+    }
+    ""
+}
+
 // E0601 (tag-mismatch): a value stored into a cell must outlive it, so its tag
 // must enclose the cell's. An unscoped value encloses every cell.
 fn check_ffi_store(store_node: Int, val: Int, cell_tag: Int) ! Diag.Report {
@@ -1420,34 +1795,49 @@ fn check_ffi_store(store_node: Int, val: Int, cell_tag: Int) ! Diag.Report {
 // error names the place and its root, since the root's declaration sets the
 // cell's tag.
 fn check_ffi_store_tagged(store_node: Int, val: Int, vtag: Int, cell_tag: Int, place: Int) ! Diag.Report {
-    if cell_tag == -2 { return }
-    let vrank = ea_scope_rank(vtag)
-    if vrank < 0 { return }
-    if cell_tag >= 0 {
-        let crank = ea_scope_rank(cell_tag)
-        if crank < 0 || vrank <= crank { return }
-    }
+    if ffi_tag_outlives_cell(vtag, cell_tag) != 0 { return }
     let vtid = tc_lookup_node_tid(val)
     let is_closure = node_kind(val) == NodeKind.Closure || (vtid >= 0 && tc_tid_kind(tc_resolve(vtid)) == TyKind.Fn)
     let form = if is_closure { "capture" } else if place >= 0 { "assignment" } else { "write" }
     let what = if is_closure { "closure that captures a pointer" } else { "pointer" }
-    let vname = node_name(vtag)
-    let vlabel = ffi_scope_label(vtag, cell_tag)
-    let mut dest = if cell_tag >= 0 { "into a cell of scope {ffi_scope_label(cell_tag, vtag)}" } else { "into an unscoped cell" }
+    let mut dest = if cell_tag >= 0 { "into a cell of {ffi_scope_phrase(cell_tag, vtag)}" } else { "into an unscoped cell" }
     if place >= 0 {
         let root = ffi_place_root(place)
-        let held = if cell_tag >= 0 { "scope: {node_name(cell_tag)}{ffi_scope_line_suffix(cell_tag, vtag)}" } else { "unscoped" }
-        dest = "into `{node_name(root)}` ({held})"
+        dest = "into `{node_name(root)}` ({ffi_scope_held(cell_tag, vtag)})"
         if root != place { dest = "to `{unparse_expr(place)}` {dest}" }
     }
-    let help = if cell_tag >= 0 { "allocate the value from {ffi_scope_label(cell_tag, vtag)}, or detach it with `{vname}.take(...)`" } else { "detach the value with `{vname}.take(...)`" }
-    emit_ffi_tag_mismatch(store_node, "{what} from scope {vlabel} stored by {form} {dest}, which outlives it (tag-mismatch)", help)
+    let source = ffi_call_rule_source(val, vtag)
+    let src_note = if source != "" { "; its tag comes from argument `{source}`" } else { "" }
+    emit_ffi_tag_mismatch(store_node, "{what} from {ffi_scope_phrase(vtag, cell_tag)} stored by {form} {dest}, which outlives it (tag-mismatch){src_note}", ffi_store_help("the value", vtag, cell_tag))
+}
+
+// The repair for a value with tag `vtag` that a cell with tag `cell` may not
+// hold. `vname` is how the help names the value.
+fn ffi_store_help(vname: Str, vtag: Int, cell: Int) -> Str {
+    if ea_is_caller_tag(vtag) { return "the caller may free {vname} once the call returns; keep it out of a cell that outlives the call" }
+    let take = "`{node_name(vtag)}.take(...)`"
+    if cell >= 0 { return "allocate {vname} from {ffi_scope_label(cell, vtag)}, or detach it with {take}" }
+    "detach {vname} with {take}"
 }
 
 // A scope as the author named it, with its line when the other scope in the
 // message has the same name.
 fn ffi_scope_label(tag: Int, other: Int) -> Str {
+    if ea_is_caller_tag(tag) { return "the caller's scope" }
     "`{node_name(tag)}`{ffi_scope_line_suffix(tag, other)}"
+}
+
+// A tag as the message's subject: "scope `s`", or the caller's scope.
+fn ffi_scope_phrase(tag: Int, other: Int) -> Str {
+    if ea_is_caller_tag(tag) { return "the caller's scope" }
+    "scope {ffi_scope_label(tag, other)}"
+}
+
+// A cell's tag in parentheses after the cell: "scope: s", or "unscoped".
+fn ffi_scope_held(tag: Int, other: Int) -> Str {
+    if tag < 0 { return "unscoped" }
+    if ea_is_caller_tag(tag) { return "the caller's scope" }
+    "scope: {node_name(tag)}{ffi_scope_line_suffix(tag, other)}"
 }
 
 fn ffi_scope_line_suffix(tag: Int, other: Int) -> Str {
@@ -1598,6 +1988,7 @@ fn walk_method_call(node: Int) ! Diag.Report {
             check_ffi_store(node, sublist_get(args_sl, 0), ffi_write_cell_tag(obj))
         }
     }
+    check_ffi_call_beside_holder(node, obj)
 }
 
 fn walk_call(node: Int) ! Diag.Report {
@@ -1644,6 +2035,7 @@ fn walk_call(node: Int) ! Diag.Report {
             ai = ai + 1
         }
     }
+    check_ffi_call_beside_holder(node, -1)
 }
 
 fn walk_block_stmts(block_node: Int, tail_flag: Int) ! Diag.Report {
@@ -1834,6 +2226,7 @@ fn walk_expr(node: Int, tail_flag: Int) ! Diag.Report {
     if kind == NodeKind.Assignment {
         walk_assignment(node)
         ffi_store_by_assignment(node, ffi_tag_of(node_value(node)))
+        ffi_creation_by_assignment(node)
         return
     }
     if kind == NodeKind.CompoundAssign {
@@ -1925,6 +2318,11 @@ fn walk_expr(node: Int, tail_flag: Int) ! Diag.Report {
         ea_set_binder_tag(node, tag)
         ea_tag_pattern(node_elements(node), tag)
         if node_is_mut(node) != 0 { ea_set_cell_tag(node, ea_innermost_live_scope()) }
+        if ffi_holds_pointer_collection(tc_lookup_node_tid(val)) {
+            let created = ffi_creation_tag_of(val)
+            ea_set_creation_tag(node, created)
+            ea_creation_pattern(node_elements(node), created)
+        }
         return
     }
     if kind == NodeKind.ExprStmt {
@@ -1949,6 +2347,12 @@ fn walk_expr(node: Int, tail_flag: Int) ! Diag.Report {
         ea_set_binder_tag(node, iter_tag)
         ea_tag_pattern(node_for_binder(node), iter_tag)
         ea_tag_pattern(node_elements(node), iter_tag)
+        if ffi_holds_pointer_collection(tc_lookup_node_tid(node_iterable(node))) {
+            let created = ffi_creation_tag_of(node_iterable(node))
+            ea_set_creation_tag(node, created)
+            ea_creation_pattern(node_for_binder(node), created)
+            ea_creation_pattern(node_elements(node), created)
+        }
         walk_expr(node_body(node), 0)
         ea_pop_binds()
         return
@@ -2277,6 +2681,7 @@ fn analyze_fn(fn_node: Int) ! Diag.Report {
     let mut params: List[Str] = []
     push_param_names(fn_node, params)
     ea_bind_all(params)
+    ffi_tag_params(fn_node)
     let ann = node_type_ann(fn_node)
     ea_push_body(if ann == -1 { -1 } else { tc_lookup_node_tid(ann) })
     let body = node_body(fn_node)
@@ -2290,6 +2695,27 @@ fn analyze_fn(fn_node: Int) ! Diag.Report {
     check_redundant_arena_effect(fn_node, arena_eff_node)
     diag_clear_allows()
     diag_source_file = saved_source
+}
+
+// A List, Map or Set parameter was made before the call, so it outlives every
+// scope the body opens. In an `@trusted` body every pointer-bearing parameter
+// also has the caller's tag (§9.1.1): the function node, as the outermost block
+// of the chain, so a store from one parameter into another passes.
+fn ffi_tag_params(fn_node: Int) {
+    let ps = node_params(fn_node)
+    if ps == -1 { return }
+    let trusted = has_annotation(fn_node, "trusted") != 0
+    if trusted { ea_ffi_scope_blocks.push([fn_node]) }
+    let mut i = 0
+    while i < sublist_length(ps) {
+        let p = sublist_get(ps, i)
+        let tid = ffi_decl_param_tid(fn_node, i)
+        if tid >= 0 && tc_tid_is_pointer_bearing(tid) != 0 {
+            if trusted { ea_set_binder_tag(p, fn_node) }
+            ea_set_creation_tag(p, if trusted { fn_node } else { -1 })
+        }
+        i = i + 1
+    }
 }
 
 // Returns the effect AST node (not a bool) so callers can report the

@@ -1,0 +1,717 @@
+// sections/07_trust_modules_metadata.md, *Scope tags*, rule 4: at a call, a tagged value passed
+// next to an argument whose declared parameter type is pointer-holding counts as stored into
+// that argument. `Ptr[P]` for a pointer-bearing `P`, and a `List`, `Map` or `Set` whose element
+// type is pointer-bearing, are pointer-holding; `Ptr[U8]`, `Ptr[Void]` and `Ptr[S]` for a struct
+// with no `Ptr` field are not. A method receiver is an argument, so an element write such as
+// `xs.push(v)` is a rule-4 store into `xs`, whose cell is the scope around the list's creation.
+// Each negative row asserts the code, the line and the "call" store-form label, so a row that
+// some other store form catches does not pass.
+import cg_test_helpers.{cg_probe_begin}
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import escape.{analyze_escapes}
+import diagnostics.{DiagEntry, diag_entries, diag_explain, diag_ice_count}
+import std.io
+
+// Every error in `src` after check and escape analysis. An internal error fails the row.
+fn all_errors_in(stem: Str, src: Str) -> List[DiagEntry] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    env.set_var("BLINK_ROOT", process_run("pwd", []).out.trim())
+    let path = "build/{stem}_probe.bl"
+    cg_probe_begin(path)
+    write_file(path, src)
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    analyze_escapes(program)
+    let _rm = process_run("rm", ["-f", path])
+    assert_eq(diag_ice_count, 0)
+    let mut found: List[DiagEntry] = []
+    for d in diag_entries {
+        if d.severity == "error" { found.push(d) }
+    }
+    found
+}
+
+// The E0601 errors in `src`. Any other error fails the row: a probe that stops early reports
+// nothing.
+fn e0601_in(stem: Str, src: Str) -> List[DiagEntry] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    let mut found: List[DiagEntry] = []
+    let mut others = 0
+    for d in all_errors_in(stem, src) {
+        if d.code == "E0601" {
+            found.push(d)
+        } else {
+            io.println("FAIL: {stem} recorded an error the row does not expect: {d.name}: {d.message}")
+            others = others + 1
+        }
+    }
+    assert_eq(others, 0)
+    found
+}
+
+// "Name@line\n" for each E0601 in `src`.
+fn errors_in(stem: Str, src: Str) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    let mut out = ""
+    for d in e0601_in(stem, src) { out = "{out}{d.name}@{d.line}\n" }
+    out
+}
+
+// "Name@line\n" for each E0601 in `src` whose message gives the call store form.
+fn calls_in(stem: Str, src: Str) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    let mut out = ""
+    for d in e0601_in(stem, src) {
+        if d.message.contains("stored by call") { out = "{out}{d.name}@{d.line}\n" }
+    }
+    out
+}
+
+// The message of the one E0601 in `src`, or "" when there is not exactly one.
+fn message_in(stem: Str, src: Str) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    let found = e0601_in(stem, src)
+    if found.len() != 1 { return "" }
+    found.get(0).unwrap().message
+}
+
+// The help of the one E0601 in `src`, or "" when there is not exactly one.
+fn help_in(stem: Str, src: Str) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    let found = e0601_in(stem, src)
+    if found.len() != 1 { return "" }
+    found.get(0).unwrap().help
+}
+
+// The spec's own example: `set_iov` may store `buf` in the pointee of `iov`, which `outer` keeps.
+fn set_iov_src() -> Str {
+    #"@ffi.struct(header: "sys/uio.h", name: "iovec")
+pub type IoVec {
+    iov_base: Ptr[U8],
+    iov_len: U64,
+}
+
+@trusted(audit: "NET-012")
+fn set_iov(iov: Ptr[IoVec], buf: Ptr[U8], len: U64) {
+    iov.iov_base.write(buf)
+    iov.iov_len.write(len)
+}
+
+fn main() {
+    with ffi.scope() as outer {
+        let iov = outer.alloc_n[IoVec](2)
+        with ffi.scope() as inner {
+            let buf = inner.alloc_n[U8](64)
+            set_iov(iov, buf, 64)
+        }
+        let _ = iov.iov_len.read()
+    }
+}
+"#
+}
+
+test "an inner pointer passed beside an outer Ptr to a struct with a Ptr field is a call store" {
+    assert_eq(calls_in("call_set_iov", set_iov_src()), "PtrTagMismatch@18\n")
+}
+
+test "the call error names the pointer-holding parameter and the Ptr field that makes it one" {
+    let msg = message_in("call_set_iov_msg", set_iov_src())
+    assert(msg.contains("`iov: Ptr[IoVec]`"))
+    assert(msg.contains("`IoVec.iov_base: Ptr[U8]`"))
+    assert(msg.contains("`set_iov`"))
+    assert(msg.contains("`buf`"))
+    assert(msg.contains("scope `inner`"))
+    assert(msg.contains("scope: outer"))
+}
+
+test "the call error help names the scope that outlives the cell" {
+    let help = help_in("call_set_iov_help", set_iov_src())
+    assert(help.contains("`outer`"))
+    assert(help.contains("inner.take("))
+}
+
+test "pushing an inner pointer onto an outer list is a call store into the receiver" {
+    let src = #"fn main() {
+    with ffi.scope() as outer {
+        let mut ps: List[Ptr[U8]] = [outer.alloc[U8]()]
+        with ffi.scope() as inner {
+            ps.push(inner.alloc[U8]())
+        }
+        let _ = ps.len()
+    }
+}
+"#
+    assert_eq(calls_in("call_push_receiver", src), "PtrTagMismatch@5\n")
+    assert(message_in("call_push_receiver_msg", src).contains("`List[Ptr[U8]]`"))
+    assert(message_in("call_push_receiver_name", src).contains("`ps`"))
+}
+
+test "inserting an inner pointer into an outer map is a call store into the receiver" {
+    assert_eq(calls_in("call_map_insert", #"fn main() {
+    with ffi.scope() as outer {
+        let mut m: Map[Int, Ptr[U8]] = Map()
+        m.insert(0, outer.alloc[U8]())
+        with ffi.scope() as inner {
+            m.insert(1, inner.alloc[U8]())
+        }
+        let _ = m.len()
+    }
+}
+"#), "PtrTagMismatch@6\n")
+}
+
+test "setting an element of an outer list to an inner pointer is a call store into the receiver" {
+    assert_eq(calls_in("call_list_set", #"fn main() {
+    with ffi.scope() as outer {
+        let mut xs: List[Ptr[U8]] = [outer.alloc[U8]()]
+        with ffi.scope() as inner {
+            xs.set(0, inner.alloc[U8]())
+        }
+        let _ = xs.len()
+    }
+}
+"#), "PtrTagMismatch@5\n")
+}
+
+test "a list made in the outer scope keeps its cell when an inner binding aliases it" {
+    assert_eq(calls_in("call_push_alias", #"fn main() {
+    with ffi.scope() as outer {
+        let mut ps: List[Ptr[U8]] = []
+        with ffi.scope() as inner {
+            let mut alias = ps
+            alias.push(inner.alloc[U8]())
+        }
+        let _ = ps.len()
+    }
+}
+"#), "PtrTagMismatch@6\n")
+}
+
+test "an inner pointer passed beside an outer Ptr to a Ptr is a call store" {
+    assert_eq(calls_in("call_ptr_ptr", #"@trusted(audit: "X-1")
+fn put_slot(slot: Ptr[Ptr[U8]], p: Ptr[U8]) {
+    slot.write(p)
+}
+
+fn main() {
+    with ffi.scope() as outer {
+        let slot = outer.alloc[Ptr[U8]]()
+        with ffi.scope() as inner {
+            put_slot(slot, inner.alloc[U8]())
+        }
+        let _ = slot.deref().is_null()
+    }
+}
+"#), "PtrTagMismatch@10\n")
+}
+
+test "an inner pointer passed beside an outer list argument of a free function is a call store" {
+    let src = #"@trusted(audit: "X-2")
+fn keep(ps: List[Ptr[U8]], p: Ptr[U8]) {
+    ps.push(p)
+}
+
+fn main() {
+    with ffi.scope() as outer {
+        let mut ps: List[Ptr[U8]] = []
+        with ffi.scope() as inner {
+            keep(ps, inner.alloc[U8]())
+        }
+        let _ = ps.len()
+    }
+}
+"#
+    assert_eq(calls_in("call_free_list", src), "PtrTagMismatch@10\n")
+    assert(message_in("call_free_list_msg", src).contains("`ps: List[Ptr[U8]]`"))
+}
+
+test "an inner pointer passed beside an outer list to an associated function is a call store" {
+    assert_eq(calls_in("call_static", #"type Bag {
+    n: Int
+}
+
+trait Keep {
+    fn keep(ps: List[Ptr[U8]], p: Ptr[U8])
+}
+
+impl Keep for Bag {
+    @trusted(audit: "X-3")
+    fn keep(ps: List[Ptr[U8]], p: Ptr[U8]) {
+        ps.push(p)
+    }
+}
+
+fn main() {
+    with ffi.scope() as outer {
+        let mut ps: List[Ptr[U8]] = []
+        with ffi.scope() as inner {
+            Bag.keep(ps, inner.alloc[U8]())
+        }
+        let _ = ps.len()
+    }
+}
+"#), "PtrTagMismatch@20\n")
+}
+
+test "an inner pointer passed beside an outer list to a trait method is a call store" {
+    assert_eq(calls_in("call_trait_method", #"type Bag {
+    n: Int
+}
+
+trait Sink {
+    fn sink(self, ps: List[Ptr[U8]], p: Ptr[U8])
+}
+
+impl Sink for Bag {
+    @trusted(audit: "X-6")
+    fn sink(self, ps: List[Ptr[U8]], p: Ptr[U8]) {
+        ps.push(p)
+    }
+}
+
+fn main() {
+    with ffi.scope() as outer {
+        let mut ps: List[Ptr[U8]] = []
+        let bag = Bag { n: 1 }
+        with ffi.scope() as inner {
+            bag.sink(ps, inner.alloc[U8]())
+        }
+        let _ = ps.len()
+    }
+}
+"#), "PtrTagMismatch@21\n")
+}
+
+test "a Ptr field at any depth of a nested struct makes the pointer to it pointer-holding" {
+    let src = #"@ffi.struct(header: "a.h", name: "inner_t")
+pub type InnerS {
+    p: Ptr[U8],
+}
+
+@ffi.struct(header: "a.h", name: "outer_t")
+pub type OuterS {
+    inner: InnerS,
+    n: I32,
+}
+
+@trusted(audit: "X-5")
+fn nest(o: Ptr[OuterS], p: Ptr[U8]) {
+    o.inner.p.write(p)
+}
+
+fn main() {
+    with ffi.scope() as outer {
+        let o = outer.alloc[OuterS]()
+        with ffi.scope() as inner {
+            nest(o, inner.alloc[U8]())
+        }
+        let _ = o.n.read()
+    }
+}
+"#
+    assert_eq(calls_in("call_nested_struct", src), "PtrTagMismatch@21\n")
+    assert(message_in("call_nested_struct_msg", src).contains("`OuterS.inner.p: Ptr[U8]`"))
+}
+
+test "a value whose tag came from the call rule names the argument that set it" {
+    let msg = message_in("call_rule_source", #"@ffi.struct(header: "sys/uio.h", name: "iovec")
+pub type IoVec {
+    iov_base: Ptr[U8],
+    iov_len: U64,
+}
+
+@trusted(audit: "NET-012")
+fn set_iov(iov: Ptr[IoVec], buf: Ptr[U8], len: U64) {
+    iov.iov_base.write(buf)
+    iov.iov_len.write(len)
+}
+
+@trusted(audit: "X-2")
+fn wrap(p: Ptr[U8]) -> Ptr[U8] {
+    p
+}
+
+fn main() {
+    with ffi.scope() as outer {
+        let iov = outer.alloc_n[IoVec](2)
+        with ffi.scope() as inner {
+            let buf = inner.alloc_n[U8](64)
+            set_iov(iov, wrap(buf), 64)
+        }
+        let _ = iov.iov_len.read()
+    }
+}
+"#)
+    assert(msg.contains("stored by call"))
+    assert(msg.contains("argument `buf`"))
+}
+
+// Not pointer-holding: no pairing.
+
+test "two Ptr[U8] arguments from different scopes never pair, as in memcpy" {
+    assert_eq(errors_in("call_memcpy", #"@trusted(audit: "X-1")
+fn cp(dst: Ptr[U8], src: Ptr[U8]) {
+    dst.write(src.deref())
+}
+
+fn main() {
+    with ffi.scope() as outer {
+        let d = outer.alloc[U8]()
+        with ffi.scope() as inner {
+            cp(d, inner.alloc[U8]())
+        }
+        let _ = d.deref()
+    }
+}
+"#), "")
+}
+
+test "two Ptr[Void] arguments from different scopes never pair" {
+    assert_eq(errors_in("call_void", #"@trusted(audit: "X-4")
+fn two_void(a: Ptr[Void], b: Ptr[Void]) -> Bool {
+    a.is_null() && b.is_null()
+}
+
+fn main() {
+    with ffi.scope() as outer {
+        let v: Ptr[Void] = outer.alloc[Void]()
+        with ffi.scope() as inner {
+            let _ = two_void(v, inner.alloc[Void]())
+        }
+        let _ = v.is_null()
+    }
+}
+"#), "")
+}
+
+test "a Ptr to a struct with no Ptr field is not pointer-holding" {
+    assert_eq(errors_in("call_plain_struct", #"@ffi.struct(header: "poll.h", name: "pollfd")
+pub type Pollfd {
+    fd: I32,
+    events: I16,
+    revents: I16,
+}
+
+@trusted(audit: "X-7")
+fn fill(pf: Ptr[Pollfd], p: Ptr[U8]) -> Bool {
+    pf.fd.write(1)
+    p.is_null()
+}
+
+fn main() {
+    with ffi.scope() as outer {
+        let pf = outer.alloc[Pollfd]()
+        with ffi.scope() as inner {
+            let _ = fill(pf, inner.alloc[U8]())
+        }
+        let _ = pf.fd.read()
+    }
+}
+"#), "")
+}
+
+test "one pointer argument never pairs anything, as in c_writev" {
+    assert_eq(errors_in("call_one_pointer", #"@ffi.struct(header: "sys/uio.h", name: "iovec")
+pub type IoVec {
+    iov_base: Ptr[U8],
+    iov_len: U64,
+}
+
+@trusted(audit: "X-8")
+fn count(iov: Ptr[IoVec], n: Int) -> Int {
+    if iov.is_null() { 0 } else { n }
+}
+
+fn main() {
+    with ffi.scope() as outer {
+        let iov = outer.alloc_n[IoVec](2)
+        with ffi.scope() as inner {
+            let buf = inner.alloc_n[U8](64)
+            let _ = buf.is_null()
+            let _ = count(iov, 2)
+        }
+    }
+}
+"#), "")
+}
+
+// Pointer-holding, but the value outlives the cell.
+
+test "an outer pointer pushed onto an inner list is legal" {
+    assert_eq(errors_in("call_push_outer_into_inner", #"fn main() {
+    with ffi.scope() as outer {
+        let p = outer.alloc[U8]()
+        with ffi.scope() as inner {
+            let mut ps: List[Ptr[U8]] = [inner.alloc[U8]()]
+            ps.push(p)
+            let _ = ps.len()
+        }
+    }
+}
+"#), "")
+}
+
+test "a pointer pushed onto a list of its own scope is legal" {
+    assert_eq(errors_in("call_push_same_scope", #"fn main() {
+    with ffi.scope() as s {
+        let mut ps: List[Ptr[U8]] = []
+        ps.push(s.alloc[U8]())
+        let _ = ps.len()
+    }
+}
+"#), "")
+}
+
+test "a taken pointer pushed onto an outer list is legal" {
+    assert_eq(errors_in("call_push_taken", #"fn main() {
+    with ffi.scope() as outer {
+        let mut ps: List[Ptr[U8]] = []
+        with ffi.scope() as inner {
+            ps.push(inner.take(inner.alloc[U8]()))
+        }
+        let _ = ps.len()
+    }
+}
+"#), "")
+}
+
+test "set_iov with both pointers from one scope is legal" {
+    assert_eq(errors_in("call_set_iov_same", #"@ffi.struct(header: "sys/uio.h", name: "iovec")
+pub type IoVec {
+    iov_base: Ptr[U8],
+    iov_len: U64,
+}
+
+@trusted(audit: "NET-012")
+fn set_iov(iov: Ptr[IoVec], buf: Ptr[U8], len: U64) {
+    iov.iov_base.write(buf)
+    iov.iov_len.write(len)
+}
+
+fn main() {
+    with ffi.scope() as outer {
+        let iov = outer.alloc_n[IoVec](2)
+        with ffi.scope() as inner {
+            let buf = outer.alloc_n[U8](64)
+            set_iov(iov, buf, 64)
+        }
+        let _ = iov.iov_len.read()
+    }
+}
+"#), "")
+}
+
+test "a variant constructor builds a value and stores nothing" {
+    assert_eq(errors_in("call_variant_ctor", #"type Pair {
+    Both(List[Ptr[U8]], Ptr[U8])
+}
+
+fn main() {
+    with ffi.scope() as outer {
+        let ps: List[Ptr[U8]] = []
+        with ffi.scope() as inner {
+            let pair = Both(ps, inner.alloc[U8]())
+            let _ = match pair { Both(_, _) => 1 }
+        }
+        let _ = ps.len()
+    }
+}
+"#), "")
+}
+
+// Pointer parameters inside `@trusted` bodies share the caller's tag.
+
+test "a store from one pointer parameter into another passes inside a trusted body" {
+    assert_eq(errors_in("trusted_param_into_param", #"@ffi.struct(header: "sys/uio.h", name: "iovec")
+pub type IoVec {
+    iov_base: Ptr[U8],
+    iov_len: U64,
+}
+
+@trusted(audit: "NET-012")
+fn set_iov(iov: Ptr[IoVec], buf: Ptr[U8], len: U64) {
+    iov.iov_base.write(buf)
+    iov.iov_len.write(len)
+}
+
+@trusted(audit: "X-2")
+fn keep(ps: List[Ptr[U8]], p: Ptr[U8]) {
+    ps.push(p)
+}
+
+@trusted(audit: "X-9")
+fn relay(iov: Ptr[IoVec], buf: Ptr[U8]) {
+    set_iov(iov, buf, 8)
+}
+
+fn main() {
+    with ffi.scope() as s {
+        let iov = s.alloc[IoVec]()
+        relay(iov, s.alloc[U8]())
+        let mut ps: List[Ptr[U8]] = []
+        keep(ps, s.alloc[U8]())
+    }
+}
+"#), "")
+}
+
+test "a pointer from a scope a trusted body opens may not be stored into a parameter" {
+    let src = #"@ffi.struct(header: "sys/uio.h", name: "iovec")
+pub type IoVec {
+    iov_base: Ptr[U8],
+    iov_len: U64,
+}
+
+@trusted(audit: "X-10")
+fn fill(iov: Ptr[IoVec]) {
+    with ffi.scope() as s {
+        iov.iov_base.write(s.alloc[U8]())
+    }
+}
+
+fn main() {
+    with ffi.scope() as outer {
+        fill(outer.alloc[IoVec]())
+    }
+}
+"#
+    assert_eq(errors_in("trusted_body_scope_into_param", src), "PtrTagMismatch@10\n")
+    assert(message_in("trusted_body_scope_into_param_msg", src).contains("caller"))
+}
+
+test "a pointer from a scope a trusted body opens may not be pushed onto a list parameter" {
+    assert_eq(calls_in("trusted_body_scope_push", #"@trusted(audit: "X-11")
+fn fill(ps: List[Ptr[U8]]) {
+    with ffi.scope() as s {
+        ps.push(s.alloc[U8]())
+    }
+}
+
+fn main() {
+    with ffi.scope() as outer {
+        let mut ps: List[Ptr[U8]] = [outer.alloc[U8]()]
+        fill(ps)
+    }
+}
+"#), "PtrTagMismatch@4\n")
+}
+
+test "a trusted body may return a pointer parameter" {
+    assert_eq(errors_in("trusted_return_param", #"@trusted(audit: "X-2")
+fn wrap(p: Ptr[U8]) -> Ptr[U8] {
+    return p
+}
+
+fn main() {
+    with ffi.scope() as s {
+        let _ = wrap(s.alloc[U8]()).is_null()
+    }
+}
+"#), "")
+}
+
+// Two scopes one `with` opens are ordered as written, so the second is the inner one.
+
+test "the inner of two scopes one with opens is the tag a mixed value takes" {
+    let msg = message_in("one_with_two_scopes", #"@ffi.struct(header: "a.h", name: "pair_t")
+pub type PairS {
+    a: Ptr[U8],
+    b: Ptr[U8],
+}
+
+fn main() {
+    with ffi.scope() as outer {
+        let mut keep = PairS { a: outer.alloc[U8](), b: outer.alloc[U8]() }
+        with ffi.scope() as a, ffi.scope() as b {
+            keep = PairS { a: a.alloc[U8](), b: b.alloc[U8]() }
+        }
+        let _ = keep.a.is_null()
+    }
+}
+"#)
+    assert(msg.contains("from scope `b`"))
+}
+
+test "a pointer parameter stored into a module-level list from a trusted body is a call store" {
+    let src = #"let mut kept: List[Ptr[U8]] = []
+
+@trusted(audit: "X-12")
+fn stash(p: Ptr[U8]) {
+    kept.push(p)
+}
+
+fn main() {
+    with ffi.scope() as s {
+        stash(s.alloc[U8]())
+    }
+}
+"#
+    assert_eq(calls_in("trusted_param_into_global", src), "PtrTagMismatch@5\n")
+    let msg = message_in("trusted_param_into_global_msg", src)
+    assert(msg.contains("from the caller's scope"))
+    assert(msg.contains("`kept` (unscoped)"))
+}
+
+test "blink explain E0601 gives a call store example" {
+    let text = diag_explain("E0601")
+    assert(text.contains("set_iov(iov, buf, 64)           // E0601 -- call"))
+    assert(text.contains("ps.push(buf)                    // E0601 -- call"))
+}
+
+// A list a call stores into holds the tags of what it stores, so it may not leave their scope.
+
+test "a list that an inner pointer was pushed onto may not be the tail of that scope" {
+    assert_eq(errors_in("push_then_tail", #"fn main() {
+    let out = with ffi.scope() as inner {
+        let mut ps: List[Ptr[U8]] = []
+        ps.push(inner.alloc[U8]())
+        ps
+    }
+    let _ = out.len()
+}
+"#), "PtrEscapesFfiScope@5\n")
+}
+
+test "a list that an inner pointer was pushed onto may not be returned" {
+    assert_eq(errors_in("push_then_return", #"@trusted(audit: "X-13")
+fn make() -> List[Ptr[U8]] {
+    with ffi.scope() as inner {
+        let mut ps: List[Ptr[U8]] = []
+        ps.push(inner.alloc[U8]())
+        return ps
+    }
+}
+
+fn main() {
+    let _ = make().len()
+}
+"#), "PtrEscapesFfiScope@6\n")
+}
+
+test "a list that an inner pointer was pushed onto may not be assigned to an outer cell" {
+    let src = #"fn main() {
+    with ffi.scope() as outer {
+        let mut keep: List[Ptr[U8]] = [outer.alloc[U8]()]
+        with ffi.scope() as inner {
+            let mut ps: List[Ptr[U8]] = []
+            ps.push(inner.alloc[U8]())
+            keep = ps
+        }
+        let _ = keep.len()
+    }
+}
+"#
+    assert_eq(errors_in("push_then_assign", src), "PtrTagMismatch@7\n")
+    assert(message_in("push_then_assign_msg", src).contains("stored by assignment"))
+}
+
+test "a list that holds only outer pointers may leave the inner scope" {
+    assert_eq(errors_in("push_outer_then_tail", #"fn main() {
+    with ffi.scope() as outer {
+        let p = outer.alloc[U8]()
+        let out = with ffi.scope() as inner {
+            let mut ps: List[Ptr[U8]] = []
+            ps.push(p)
+            ps.push(inner.take(inner.alloc[U8]()))
+            ps
+        }
+        let _ = out.len()
+    }
+}
+"#), "")
+}
