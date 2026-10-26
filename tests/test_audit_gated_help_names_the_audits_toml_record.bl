@@ -9,7 +9,7 @@ import std.fs
 import std.io
 import compiler.{compile_to_program}
 import typecheck.{check_types}
-import diagnostics.{DiagEntry, diag_entries, diag_reset, diag_explain, PUB_FFI, TRUSTED_REQUIRES_AUDIT, AUDIT_GATED_SUPPRESSION, RAW_BYPASSES_PARAM, UNAUDITED_FFI}
+import diagnostics.{DiagEntry, diag_entries, diag_reset, diag_explain, PUB_FFI, TRUSTED_REQUIRES_AUDIT, AUDIT_GATED_SUPPRESSION, RAW_BYPASSES_PARAM, UNAUDITED_FFI, PTR_OUTSIDE_FFI}
 import embedded_stdlib_registry.{init_embedded_stdlib}
 
 fn help_probe(path: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
@@ -128,8 +128,10 @@ test "E0837 help names the audits.toml record" {
     assert_eq(d.fix_action, "")
 }
 
-test "E0811 help names the audits.toml record for a Ptr and a Ptr-holding struct" {
-    let e0811_help = "add @ffi or @trusted(audit: \"AUDIT-ID\") to the function; @trusted needs a record `AUDIT-ID` in audits.toml"
+// Section 9.1.1: one help line per fix, the fixes that need no pointer before the @trusted
+// fix, and no line that offers @ffi or `with ffi.scope()`.
+test "E0811 help gives the fixes that need no pointer first and names the audits.toml record last" {
+    let e0811_help = "to hold a value, use a Blink type here; no pointer is needed\nif `std.libc` already wraps the C function, call that wrapper; no pointer is needed\nto bind C yourself, mark this function `@trusted(audit: \"AUDIT-ID\")` and add a record `AUDIT-ID` in audits.toml"
     let probes = [
         "fn takes(p: Ptr[I32]) -> Int \{ 0 }\n\nfn main() \{}\n",
         "fn gives() -> Ptr[I32] \{ null_ptr[I32]() }\n\nfn main() \{}\n",
@@ -142,9 +144,14 @@ test "E0811 help names the audits.toml record for a Ptr and a Ptr-holding struct
         assert(ds.len() > 0, "no E0811 for: {src}")
         for d in ds {
             assert_eq(d.help, e0811_help)
+            assert(!d.help.contains("@ffi") && !d.help.contains("ffi.scope"), "E0811 help must not offer @ffi or a scope block: {d.help}")
             assert_eq(d.fix_action, "")
             seen = seen + 1
         }
     }
     assert(seen >= 3, "expected an E0811 per probe, saw {seen}")
+}
+
+test "E0811 explain gives the fixes that need no pointer first and names the audits.toml record" {
+    assert_eq(diag_explain(PTR_OUTSIDE_FFI), "E0811 -- PtrOutsideFfiContext\n\nPtr[T], or an @ffi.struct that holds a Ptr, was used outside an FFI\nregion. An FFI region is the signature or body of an @ffi or @trusted\nfunction, or a with ffi.scope() block.\n\nFix: first try a fix that needs no pointer. Use a Blink type to hold\na value, or call the `std.libc` wrapper of the C function.\n\nTo bind C yourself, put the code in an @trusted(audit: K) function,\nand add a record `K` in the package's audits.toml that holds the claim:\n\n  @trusted(audit: \"MEM-001\")\n  fn is_empty(p: Ptr[U8]) -> Bool \{\n      p.is_null()\n  \}\n\n  # audits.toml\n  [MEM-001]\n  claim = \"Callers pass a pointer from C; a null pointer means empty.\"\n\nThen run `blink audit pin MEM-001`. No tool writes the claim.")
 }
