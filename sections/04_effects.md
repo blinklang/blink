@@ -2870,7 +2870,7 @@ In v1, handler type parameters must be concrete effects: `Handler[DB]`, `Handler
 
 ### 4.7.2 Scoped Trait — Scoped Blocks
 
-Records in `decisions/` and DECISIONS.md cite this section as §4.6.3, its earlier number.
+Records in `decisions/` and DECISIONS.md cite this section by its earlier number, 4.6.3.
 
 The `Scoped` trait provides a general mechanism for types that need enter/exit semantics around a block of code. It lets a type accept a block without new syntax for each API.
 
