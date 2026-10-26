@@ -1,0 +1,86 @@
+// A daemon recheck that keeps parsed sources leaves the nodes of an edited source's old parse
+// in the pool, dead. A check that walks the pool must skip them: after `! ()` is removed from
+// a non-@ffi fn, the warm check must be clean, as a cold check is, and not report the
+// EmptyRowOutsideFfi of the old parse.
+
+import std.process.{ProcessResult}
+import std.testing.{cleanup}
+import compile_test_helpers
+
+fn sh(cmd: Str) -> Str {
+    process_run("sh", ["-c", cmd]).out.trim()
+}
+
+fn leaf_text(row: Str) -> Str {
+    "pub fn leaf_value() -> Str{row} \{\n    let parts = [\"one\", \"x\"]\n    parts.join(\"-\")\n}\n"
+}
+
+fn dev_tree(root: Str, tree: Str) {
+    shell_exec("rm -rf {tree}")
+    shell_exec("mkdir -p {tree}/build {tree}/app/src")
+    // A copy, not a link: the install root comes from realpath(argv[0]).
+    shell_exec("cp {sh("readlink -f build/blink")} {tree}/build/blink")
+    shell_exec("ln -s {root}/lib {tree}/build/lib && ln -s {root}/lib {tree}/lib")
+    for f in ["runtime.h", "libblink_std.a", "libblink_std.h", "skip_modules.txt", ".archive-id"] {
+        shell_exec("[ -e {root}/build/{f} ] && cp -L {root}/build/{f} {tree}/build/{f}")
+    }
+    shell_exec("[ -e {tree}/build/runtime.h ] || cp -L $(dirname $(readlink -f {root}/build/libblink_std.h))/runtime.h {tree}/build/runtime.h")
+    write_file("{tree}/app/blink.toml", "[package]\nname = \"daemon_row_app\"\nversion = \"0.1.0\"\n")
+    write_file("{tree}/app/blink.lock", "[metadata]\nlockfile-version = 1\n")
+    write_file("{tree}/app/src/leaf.bl", leaf_text(" ! ()"))
+    write_file("{tree}/app/src/main.bl", "import leaf.\{leaf_value}\n\nfn main() \{\n    io.println(leaf_value())\n}\n")
+    // The idle poll would check an edit cold and keep no source, if the request after the
+    // edit came later than its wait; the hold keeps it off.
+    write_file("{tree}/hold", "")
+}
+
+// The daemon serves only a client whose env is its own, so both run with the idle hold set.
+fn env_of(tree: Str) -> Str {
+    "env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE BLINK_CACHE_DIR={tree}/objcache BLINK_DEV_DAEMON_IDLE_HOLD={tree}/hold"
+}
+
+fn blink_in(tree: Str, args: Str) -> ProcessResult {
+    process_run("sh", ["-c", "cd {tree}/app && {env_of(tree)} timeout 120 ../build/blink {args}"])
+}
+
+// The pid of the daemon serving src/main.bl in tree, or -1. The timeout ends a daemon that
+// nothing stopped.
+fn start_daemon(tree: Str) -> Int {
+    shell_exec("cd {tree}/app && ({env_of(tree)} timeout 300 ../build/blink daemon start src/main.bl > {tree}/daemon.log 2>&1 &)")
+    let up = process_run("sh", ["-c", "for i in $(seq 1 600); do [ -S {tree}/app/.blink/daemon.sock ] && exit 0; sleep 0.05; done; exit 1"])
+    let pid = sh("cat {tree}/app/.blink/daemon.pid 2>/dev/null").to_int()
+    if up.exit_code != 0 {
+        stop_daemon(pid)
+        return -1
+    }
+    pid
+}
+
+fn stop_daemon(pid: Int) {
+    if pid <= 0 { return }
+    shell_exec("kill {pid} 2>/dev/null; for i in $(seq 1 100); do kill -0 {pid} 2>/dev/null || exit 0; sleep 0.05; done; kill -9 {pid}")
+}
+
+test "a daemon recheck after an empty row is removed reports no stale error" {
+    let root = sh("pwd -P")
+    let tree = "{compile_test_helpers.scratch_root()}/_daemon_row_{getpid()}"
+    dev_tree(root, tree)
+    let pid = start_daemon(tree)
+    let mut first = ""
+    let mut warm = ""
+    let mut warm_exit = -1
+    with cleanup(fn() { stop_daemon(pid) }) {
+        assert(pid > 0, "the daemon did not start: {read_file("{tree}/daemon.log")}")
+        let r1 = blink_in(tree, "check src/main.bl")
+        first = "{r1.out}{r1.err_out}"
+        write_file("{tree}/app/src/leaf.bl", leaf_text(""))
+        let r2 = blink_in(tree, "check src/main.bl")
+        warm = "{r2.out}{r2.err_out}"
+        warm_exit = r2.exit_code
+    }
+    shell_exec("rm -rf {tree}")
+
+    assert(first.contains("EmptyRowOutsideFfi"), "the first check reports the empty row, got: {first}")
+    assert(!warm.contains("EmptyRowOutsideFfi"), "the warm check reports the old parse's row, got: {warm}")
+    assert_eq(warm_exit, 0)
+}

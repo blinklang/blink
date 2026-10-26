@@ -12944,16 +12944,19 @@ fn tc_check_contract_verifiable(fn_node: Int) ! Diag.Report {
     }
 }
 
-// `! ()` and `@effects(...)` are spellings in a signature, so every fn the parser made is
-// checked, wherever it sits: top level, trait, impl, effect or handler.
+// `! ()` and `@effects(...)` are spellings in a signature, so every live fn the parser made
+// is checked, wherever it sits: top level, trait, impl, effect or handler. A daemon recheck
+// leaves the old parse of an edited source in the pool, dead, so only live ranges are walked.
 fn check_effect_row_spellings() ! Diag.Report {
-    let n = node_count()
-    let mut id = 0
-    while id < n {
-        if node_kind(id) == NodeKind.FnDef {
-            check_fn_effect_row_spelling(id)
+    let ranges = parser_live_ranges()
+    let mut r = 0
+    while r + 1 < ranges.len() {
+        let mut id = ranges.get(r).unwrap()
+        while id < ranges.get(r + 1).unwrap() {
+            if node_kind(id) == NodeKind.FnDef { check_fn_effect_row_spelling(id) }
+            id = id + 1
         }
-        id = id + 1
+        r = r + 2
     }
 }
 
@@ -12979,14 +12982,15 @@ fn check_fn_effect_row_spelling(fn_node: Int) ! Diag.Report {
     }
 }
 
-// `@effects(...)` as the author wrote it, for the help: the argument list is rebuilt from the
-// effect names, and a bare `@effects` is told apart by its span.
+// `@effects(...)` as the author wrote it, for the help. An annotation over several lines has
+// no one source slice, so its argument list is rebuilt from the effect names.
 fn effects_annotation_spelling(ann: Int, one_line: Bool) -> Str {
-    let args = node_args(ann)
-    if args == -1 {
-        if one_line && node_end_col(ann) - node_col(ann) == "@effects".byte_len() { return "@effects" }
-        return "@effects()"
+    if one_line {
+        let text = diag_source_line(diag_file_for_node(ann), node_line(ann))
+        if node_end_col(ann) - 1 <= text.byte_len() { return text.byte_slice(node_col(ann) - 1, node_end_col(ann) - 1) }
     }
+    let args = node_args(ann)
+    if args == -1 { return "@effects()" }
     let mut names: List[Str] = []
     let mut i = 0
     while i < sublist_length(args) {
@@ -12995,6 +12999,20 @@ fn effects_annotation_spelling(ann: Int, one_line: Bool) -> Str {
         i = i + 1
     }
     "@effects({names.join(", ")})"
+}
+
+// Where the signature of an `@ffi` decl ends on its first line, or 0 when it runs onto another
+// line. A decl with a body ends at the body, so its signature ends before the `{`.
+fn ffi_signature_end_col(fn_node: Int) -> Int {
+    let body = node_body(fn_node)
+    if body == -1 {
+        if node_end_line(fn_node) == node_line(fn_node) { return node_end_col(fn_node) }
+        return 0
+    }
+    if node_line(body) != node_line(fn_node) { return 0 }
+    let text = diag_source_line(diag_file_for_node(fn_node), node_line(fn_node))
+    if node_col(body) - 1 > text.byte_len() { return 0 }
+    text.byte_slice(0, node_col(body) - 1).trim_right().byte_len() + 1
 }
 
 fn validate_ffi_fn(fn_node: Int) ! Diag.Report {
@@ -13024,7 +13042,7 @@ fn validate_ffi_fn(fn_node: Int) ! Diag.Report {
         // `! ()` is an empty row that is present, so only a missing row is E0802. A decl that
         // carries `@effects` gets EffectsAnnotationRemoved alone, which names the fix.
         if node_effects(fn_node) == -1 && get_annotation(fn_node, "effects") == -1 {
-            let sig_end_col = if node_end_line(fn_node) == node_line(fn_node) { node_end_col(fn_node) } else { 0 }
+            let sig_end_col = ffi_signature_end_col(fn_node)
             diag_error_span_at_notes("FfiNoEffects", FFI_NO_EFFECTS, "foreign function `{name}` has no effect row", fn_node, node_line(fn_node), node_col(fn_node), sig_end_col, "write the effects the foreign code has after the return type (`-> Int ! IO`), or `! ()` (the empty effect row) if it has none", [])
         }
         if has_requires != 0 {

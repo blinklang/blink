@@ -36,17 +36,19 @@ Blink can call C functions via the `@ffi` annotation and `Ptr[T]` type.
 
 ```blink
 @ffi("sqlite3", "sqlite3_open")
-fn sqlite3_open(filename: Ptr[Int], db: Ptr[Ptr[Int]]) -> Int ! FFI
+fn sqlite3_open(filename: Ptr[Int], db: Ptr[Ptr[Int]]) -> Int ! IO
 ```
 
 `@ffi("library", "symbol")` — first arg is library name, second is C symbol name.
+
+An `@ffi` decl must have an effect row: the Blink effects the foreign code has (`! IO`, `! Net`). There is no `FFI` effect. If the foreign code has no effects, write the empty row `! ()`: `fn c_strlen(s: Ptr[U8]) -> Int ! ()`. A decl with no row is `E0802`. `! ()` anywhere else is `E0564`, and the `@effects(...)` annotation is gone (`E1139`).
 
 ### @trusted Audit Marker
 
 ```blink
 @trusted(audit: "SEC-101")
 @ffi("c", "malloc")
-fn malloc(size: Int) -> Ptr[Int] ! FFI
+fn malloc(size: Int) -> Ptr[Int] ! ()
 ```
 
 `@trusted(audit: "ID")` marks an FFI function as audited for safety. The `audit:` text is required: a bare `@trusted` or an empty `audit:` is `E0836`. The text is free-form (a ticket or review ID). `@allow` and `[lints]` cannot name an audit-gated diagnostic (`W0800`, `W0310`); this is `E0837`. Write `@trusted(audit: ...)` on the function instead. A `@trusted` fn, as an `@ffi` fn, may name `Ptr[T]`, or an `@ffi.struct` that holds a `Ptr`, in its signature; elsewhere that is `E0811`.
@@ -95,7 +97,7 @@ type CFile
 
 @ffi("c", "fopen")
 @trusted(audit: "SEC-103")
-fn c_fopen(path: Ptr[U8], mode: Ptr[U8]) -> Option[CFile] ! FFI { }
+fn c_fopen(path: Ptr[U8], mode: Ptr[U8]) -> Option[CFile] ! IO { }
 ```
 
 `@ffi.opaque(header, name)` declares a nominal type for a C handle such as `FILE*` or `sqlite3*`. It lowers to a bare pointer. It has no deref, `==`, fields or arithmetic, and `Option[CFile]` uses `NULL` for `None`. `blink audit --ffi` lists it as `opaque-ffi-handle`. A struct literal whose head is an `@ffi.opaque` type is `E0300`.
@@ -122,7 +124,7 @@ type File
 
 @ffi("my_file_is_closed")
 @trusted(audit: "SEC-104")
-fn file_is_closed(f: File) -> Int ! FFI { }
+fn file_is_closed(f: File) -> Int ! () { }
 
 pub fn read_line(f: File) -> Result[Str, FileError] {
     if file_is_closed(f) != 0 {

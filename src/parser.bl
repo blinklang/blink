@@ -1021,7 +1021,7 @@ fn node_strs_drop(c: Int, n: Int) {
 // comment attachment and pub marking a fn's), and a write outside the shape would move the
 // node's payload into a chunk already full.
 fn node_kind_fields(kind: NodeKind) -> Int {
-    if kind == NodeKind.FnDef { return 74309393851613184 }
+    if kind == NodeKind.FnDef { return 74309393851629568 }
     if kind == NodeKind.LetBinding || kind == NodeKind.Param || kind == NodeKind.ForIn { return 2251799813685248 }
     0
 }
@@ -2896,11 +2896,19 @@ fn parse_annotation() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
         }
     }
     let ann_last = last_token_before(pos)
+    // Only a one-line end is kept: comment attachment reads a multi-line end as a range that
+    // owns the comments inside it, and the formatter prints no comment inside an annotation.
+    let mut ann_end_l = -1
+    let mut ann_end_c = -1
+    if tokens.lines.get(ann_last).unwrap() == ann_start_line {
+        ann_end_l = ann_start_line
+        ann_end_c = tokens.end_cols.get(ann_last).unwrap()
+    }
     let ann_nd = node_count()
     node_push(AstNode {
         kind: NodeKind.Annotation, name: ann_name, args: ann_args_sl,
         line: ann_start_line, col: ann_start_col,
-        end_line: tokens.lines.get(ann_last).unwrap(), end_col: tokens.end_cols.get(ann_last).unwrap(),
+        end_line: ann_end_l, end_col: ann_end_c,
     })
     ann_nd
 }
@@ -3888,32 +3896,20 @@ fn parse_fn_def() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
             while at(TokenKind.Comma) {
                 advance()
                 skip_newlines_and_comments()
-                let _ = expect_value(TokenKind.Ident)
-                if at(TokenKind.Dot) {
-                    advance()
-                    let _ = expect_value(TokenKind.Ident)
-                }
+                let _ = parse_effect_name()
             }
         }
     } else if at(TokenKind.Bang) {
         advance()
         effects_sl = new_sublist()
-        let mut eff_name = expect_value(TokenKind.Ident)
-        if at(TokenKind.Dot) {
-            advance()
-            eff_name = eff_name.concat(".").concat(expect_value(TokenKind.Ident))
-        }
+        let eff_name = parse_effect_name()
         let eff = node_count()
         node_push(AstNode { kind: NodeKind.Ident, name: eff_name, line: peek_line(), col: peek_col() })
         sublist_push(effects_sl, eff)
         while at(TokenKind.Comma) {
             advance()
             skip_newlines_and_comments()
-            let mut eff_name2 = expect_value(TokenKind.Ident)
-            if at(TokenKind.Dot) {
-                advance()
-                eff_name2 = eff_name2.concat(".").concat(expect_value(TokenKind.Ident))
-            }
+            let eff_name2 = parse_effect_name()
             let eff2 = node_count()
             node_push(AstNode { kind: NodeKind.Ident, name: eff_name2, line: peek_line(), col: peek_col() })
             sublist_push(effects_sl, eff2)
@@ -3942,9 +3938,13 @@ fn parse_fn_def() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
         }
     } else {
         // A decl with no body ends with its signature, and E0802 marks the whole signature.
+        // Only a one-line end is kept: comment attachment reads a multi-line end as a range
+        // that owns the comments inside it, and a trait prints no comment after a signature.
         let sig_last = last_token_before(pos)
-        fn_end_l = tokens.lines.get(sig_last).unwrap()
-        fn_end_c = tokens.end_cols.get(sig_last).unwrap()
+        if tokens.lines.get(sig_last).unwrap() == fn_start_line {
+            fn_end_l = fn_start_line
+            fn_end_c = tokens.end_cols.get(sig_last).unwrap()
+        }
     }
     let nd = node_count()
     node_push(AstNode {
@@ -3957,6 +3957,16 @@ fn parse_fn_def() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
         end_line: fn_end_l, end_col: fn_end_c,
     })
     nd
+}
+
+// An effect name in a row: `IO` or `Net.Connect`.
+fn parse_effect_name() -> Str ! Parse.Advance, Diag.Report {
+    let mut name = expect_value(TokenKind.Ident)
+    if at(TokenKind.Dot) {
+        advance()
+        name = name.concat(".").concat(expect_value(TokenKind.Ident))
+    }
+    name
 }
 
 // ── Test blocks ──────────────────────────────────────────────────────
@@ -5215,9 +5225,10 @@ fn operand_text(first: Int, last: Int) -> Str {
 // The last token of an operand that ends before p: a lookahead past the operand may have
 // stopped on a newline or a comment.
 fn last_token_before(p: Int) -> Int {
-    // After a parse error at the end of the file, `pos` can run past the last token.
+    // After a parse error at the end of the file, `pos` can run past the last token, and EOF
+    // ends no operand.
     let mut q = if p > tokens.kinds.len() { tokens.kinds.len() - 1 } else { p - 1 }
-    while q > 0 && (peek_kind_at(q) == TokenKind.Newline || peek_kind_at(q) == TokenKind.Comment || peek_kind_at(q) == TokenKind.DocComment) {
+    while q > 0 && (peek_kind_at(q) == TokenKind.Newline || peek_kind_at(q) == TokenKind.Comment || peek_kind_at(q) == TokenKind.DocComment || peek_kind_at(q) == TokenKind.EOF) {
         q = q - 1
     }
     q
