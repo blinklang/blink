@@ -1,0 +1,91 @@
+// `@trusted(audit: K)` is not free text: K names a record in the package's audits.toml
+// (§9.1 *Audit Records*). So the help of the audit-gated warnings names that record, in the
+// words §9.1 and §3b.5 give, and no help line is machine-applicable: no tool writes a claim.
+// E0801 has no escape at all, so its help never offers @trusted. The explain texts say the
+// same; each one is checked here word for word.
+
+import std.fs
+import std.io
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{DiagEntry, diag_entries, diag_reset, diag_explain, PUB_FFI, TRUSTED_REQUIRES_AUDIT, AUDIT_GATED_SUPPRESSION, RAW_BYPASSES_PARAM, UNAUDITED_FFI}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+
+fn help_probe(path: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    init_embedded_stdlib()
+    write_file(path, src)
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+}
+
+fn only_named(name: Str) -> Option[DiagEntry] {
+    let mut found: List[DiagEntry] = []
+    for d in diag_entries {
+        if d.name == name { found.push(d) }
+    }
+    if found.len() != 1 {
+        for d in diag_entries {
+            io.println("  {d.severity} {d.code} {d.name}: {d.message} | help: {d.help}")
+        }
+        return None
+    }
+    found.get(0)
+}
+
+fn raw_src(body: Str) -> Str {
+    "import std.db_sqlite.\{sqlite_handler, sqlite_open, sqlite_close}\nfn main() ! IO \{\n    let h = sqlite_open(\":memory:\")\n    with sqlite_handler(h) \{\n        let table = \"items\"\n{body}        io.println(\"\{rows.unwrap().len()}\")\n    }\n    sqlite_close(h)\n}\n"
+}
+
+test "W0800 says the binding is unaudited and its help names the audits.toml record" {
+    help_probe("build/audit_help_w0800.bl", "@ffi(\"c\", \"getpid\")\nfn c_getpid() -> I32 ! IO\n\nfn main() \{}\n")
+    let d = only_named("UnauditedFfi").unwrap()
+    assert_eq(d.message, "unaudited foreign function")
+    assert_eq(d.notes, ["FFI function `c_getpid` has no @trusted annotation"])
+    assert_eq(d.help, "if `std.libc` already binds this symbol, call that binding instead\nafter you check the binding against the C header, record the review: add @trusted(audit: \"AUDIT-ID\") and a record `AUDIT-ID` in audits.toml")
+    assert_eq(d.fix_action, "")
+}
+
+test "W0310 help parameterizes the Raw argument first and names the audits.toml record" {
+    help_probe("build/audit_help_w0310.bl", raw_src("        let rows = db.query(\"SELECT * FROM \{Raw(table)}\")\n"))
+    let d = only_named("RawBypassesParam").unwrap()
+    assert_eq(d.message, "Raw() bypasses parameterization")
+    assert_eq(d.label, "concatenated into the query text, not parameterized")
+    assert_eq(d.help, "if `table` comes from user input, parameterize it instead: `\{table}`\nonly if no parameterized form exists, record the review: add @trusted(audit: \"AUDIT-ID\") to the enclosing function; it needs a record `AUDIT-ID` in audits.toml")
+    assert_eq(d.fix_action, "")
+}
+
+test "W0310 on a Raw bound to a variable does not offer the variable as the parameter" {
+    help_probe("build/audit_help_w0310_var.bl", raw_src("        let r = Raw(table)\n        let rows = db.query(\"SELECT * FROM \{r}\")\n"))
+    let d = only_named("RawBypassesParam").unwrap()
+    assert_eq(d.help, "if this value comes from user input, parameterize it instead of passing it through `Raw()`\nonly if no parameterized form exists, record the review: add @trusted(audit: \"AUDIT-ID\") to the enclosing function; it needs a record `AUDIT-ID` in audits.toml")
+}
+
+test "E0801 help offers no @trusted escape" {
+    help_probe("build/audit_help_e0801.bl", "@ffi(\"c\", \"getpid\")\npub fn c_getpid() -> I32 ! IO\n\nfn main() \{}\n")
+    let d = only_named("FfiFunctionPublic").unwrap()
+    assert_eq(d.message, "FFI function `c_getpid` cannot be public")
+    assert_eq(d.help, "make the FFI function private and create a pub wrapper")
+    assert(!d.help.contains("@trusted"), "E0801 is absolute; help must not offer @trusted: {d.help}")
+}
+
+test "W0800 explain names the audits.toml record" {
+    assert_eq(diag_explain(UNAUDITED_FFI), "W0800 -- UnauditedFfi\n\nAn @ffi function has no @trusted annotation, so no one has recorded a\nreview of the binding.\n\nThe signature and effect row of a foreign function are a claim the\ncompiler cannot check. `@trusted(audit: K)` records that an author\nchecked the claim against the C header: types, effect row, memory use.\n`K` names a record in the package's audits.toml, which holds the claim.\n\nFix: if `std.libc` already binds the symbol, call that binding\ninstead. Otherwise check the binding against the C header, then add\n@trusted(audit: K) and a record `K` in audits.toml:\n\n  @ffi(\"c\", \"puts\")\n  @trusted(audit: \"LIBC-PUTS\")\n  fn c_puts(s: Ptr[U8]) -> I32 ! IO\n\n  # audits.toml\n  [LIBC-PUTS]\n  claim = \"Checked against stdio.h: one pointer param, int return.\"\n\nThen run `blink audit pin LIBC-PUTS`. No tool writes the claim.\nUnauditedFfi is audit-gated: @allow and [lints] cannot reach it (E0837).")
+}
+
+test "E0801 explain says the rule has no exception" {
+    assert_eq(diag_explain(PUB_FFI), "E0801 -- FfiFunctionPublic\n\nAn @ffi function was declared `pub`. A foreign function is unsafe to\ncall directly, so it is always private to its module. A safe `pub`\nwrapper validates inputs, translates error codes and presents a\nBlink-native API. The rule has no exception: @trusted does not make an\n@ffi function public.\n\nFix: make the FFI function private and create a pub wrapper.\n\n  @ffi(\"c\", \"abs\")\n  @trusted(audit: \"LIBC-ABS\")\n  fn c_abs(n: I32) -> I32 ! ()\n\n  pub fn abs_i32(n: I32) -> I32 \{\n      c_abs(n)\n  \}")
+}
+
+test "E0836 explain says the audit key names a record, not free text" {
+    assert_eq(diag_explain(TRUSTED_REQUIRES_AUDIT), "E0836 -- TrustedRequiresAudit\n\n`@trusted` is the sole channel that suppresses the audit-gated\ndiagnostics of section 9.1 (UnauditedFfi, RawBypassesParam). The\n`audit:` key names the record the channel exists to create. A bare\n`@trusted`, or one with an empty `audit:`, silences the diagnostic and\nrecords nothing -- the one outcome the annotation is there to prevent.\n\nFix: name an audit record.\n\n  @ffi(\"sqlite3\", \"sqlite3_close\")\n  @trusted(audit: \"DB-004\")\n  fn sqlite3_close(db: Ptr[Void]) -> Int ! IO\n\n  @trusted                             // E0836\n  fn other(db: Ptr[Void]) -> Int\n\n`DB-004` is not free text. It names a record in the package's\naudits.toml, which holds the claim:\n\n  [DB-004]\n  claim = \"Checked against sqlite3.h: one pointer param, int return.\"\n\nA missing record, or one with an empty claim, is AuditRecordNotFound\n(E0829).")
+}
+
+test "E0837 explain sends the author to an audits.toml record" {
+    assert_eq(diag_explain(AUDIT_GATED_SUPPRESSION), "E0837 -- AuditGatedSuppression\n\nAn audit-gated diagnostic was named in `@allow(...)` or under `[lints]`\nin blink.toml. Neither channel reaches it, and naming it there is\nrefused rather than ignored.\n\nThese diagnostics exist to force a RECORD, not to report a mistake. The\nprogram they fire on is legal and may well be correct; what the language\nasks is that a human looked at it and said so somewhere a reviewer can\nfind. `@allow` and `[lints]` silence without recording anything, so they\nwould defeat the only thing the diagnostic is for.\n\nThe refusal is an error rather than silence because a suppression that\nquietly fails to apply and one that quietly succeeds are equally bad:\nthe author cannot tell which happened.\n\nFix: add @trusted(audit: K) to the enclosing function, and a record `K`\nin the package's audits.toml that holds the claim.\n\n  @allow(RawBypassesParam)              // E0837\n  @trusted(audit: \"DB-003\")              // OK -- names record DB-003\n\nThe audit-gated list is UnauditedFfi (W0800) and RawBypassesParam\n(W0310). A diagnostic joins it only when silently suppressing it would\ndestroy a record the language promises exists.")
+}
+
+test "W0310 explain parameterizes first and names the audits.toml record" {
+    assert_eq(diag_explain(RAW_BYPASSES_PARAM), "W0310 -- RawBypassesParam\n\nA `Raw[Str]` was folded into a `Template[C]`, so its text became part\nof the query and was not parameterized. Text that comes from user input\ncan then carry an injection.\n\nFix: parameterize the value instead. Reserve `Raw` for fragments such\nas table or column names that a parameter cannot hold:\n\n  db.query_one(t\"SELECT * FROM \{Raw(table)\} WHERE id = \{id\}\")  // W0310\n  db.query_one(t\"SELECT * FROM users WHERE id = \{id\}\")         // OK\n\nOnly if no parameterized form exists, record the review: add\n@trusted(audit: K) to the enclosing function, and a record `K` in the\npackage's audits.toml that holds the claim that the value cannot carry\nan injection. Keep the guard inside that function: the record's pin\ncovers only its body.\n\nRawBypassesParam is audit-gated: @allow and [lints] cannot reach it\n(E0837).")
+}

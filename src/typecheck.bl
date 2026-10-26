@@ -6489,12 +6489,29 @@ fn tc_raw_consume_template(interp: Int) ! Diag.Report {
                 // -1 is a body with no enclosing user function — a test body, or the top
                 // level. No function means no audit to find, so the warning stands.
                 if tc_enclosing_audit_id() == "" {
-                    diag_warn_at("RawBypassesParam", RAW_BYPASSES_PARAM, "Raw() bypasses query parameterization", part, "add @trusted(audit: \"AUDIT-ID\") to suppress")
+                    let input = tc_raw_call_arg_name(part)
+                    let parameterize = if input == "" { "if this value comes from user input, parameterize it instead of passing it through `Raw()`" } else { "if `{input}` comes from user input, parameterize it instead: `\{{input}\}`" }
+                    diag_warn_label_at_notes("RawBypassesParam", RAW_BYPASSES_PARAM, "Raw() bypasses parameterization", part, "concatenated into the query text, not parameterized",
+                        "{parameterize}\nonly if no parameterized form exists, record the review: add @trusted(audit: \"AUDIT-ID\") to the enclosing function; it needs a record `AUDIT-ID` in audits.toml", [])
                 }
             }
         }
         i = i + 1
     }
+}
+
+// `x` when the part is written `Raw(x)` with `x` a name, else "". Only then is `{x}` known to
+// be the parameterized form: a part that names a bound Raw would still be Raw once braced, and
+// an expression node carries no end position to quote it by.
+fn tc_raw_call_arg_name(part: Int) -> Str {
+    if node_kind(part) != NodeKind.Call { return "" }
+    let callee = node_left(part)
+    if callee == -1 || node_kind(callee) != NodeKind.Ident || node_name(callee) != "Raw" { return "" }
+    let args_sl = node_args(part)
+    if args_sl == -1 || sublist_length(args_sl) != 1 { return "" }
+    let arg = sublist_get(args_sl, 0)
+    if node_kind(arg) != NodeKind.Ident { return "" }
+    node_name(arg)
 }
 
 // Whatever no template took. Reported once the whole program has been checked, because a
@@ -13037,7 +13054,7 @@ fn validate_ffi_fn(fn_node: Int) ! Diag.Report {
 
     if has_ffi != 0 {
         if node_is_pub(fn_node) != 0 && has_trusted == 0 {
-            diag_error_at("FfiFunctionPublic", PUB_FFI, "FFI function `{name}` must not be pub — FFI functions are unsafe and should be wrapped", ffi_node, "remove `pub` or add @trusted(audit: \"ID\") to mark it as audited")
+            diag_error_label_at_notes("FfiFunctionPublic", PUB_FFI, "FFI function `{name}` cannot be public", ffi_node, "FFI functions must be wrapped in safe Blink functions", "make the FFI function private and create a pub wrapper", [])
         }
         // `! ()` is an empty row that is present, so only a missing row is E0802. A decl that
         // carries `@effects` gets EffectsAnnotationRemoved alone, which names the fix.
@@ -13052,7 +13069,9 @@ fn validate_ffi_fn(fn_node: Int) ! Diag.Report {
             diag_error_at("ContractOnFfi", CONTRACT_ON_FFI, "@ensures cannot be used on FFI function `{name}` — contracts cannot verify foreign code", ensures_node, "remove @ensures from the FFI function")
         }
         if has_trusted == 0 {
-            diag_warn_at("UnauditedFfi", UNAUDITED_FFI, "FFI function `{name}` is not marked @trusted — consider auditing and adding @trusted", ffi_node, "add @trusted(audit: \"ID\") after auditing the foreign function")
+            diag_warn_at_notes("UnauditedFfi", UNAUDITED_FFI, "unaudited foreign function", ffi_node,
+                "if `std.libc` already binds this symbol, call that binding instead\nafter you check the binding against the C header, record the review: add @trusted(audit: \"AUDIT-ID\") and a record `AUDIT-ID` in audits.toml",
+                ["FFI function `{name}` has no @trusted annotation"])
         }
     }
 
