@@ -167,7 +167,7 @@ pub fn is_live_mark(name: Str) -> Bool {
 fn hold_live(path: Str) ! IO {
     let mut fd = -1
     with ffi.scope() as scope {
-        fd = bfs_open(scope.cstr(path), 0.to_i32()).to_int()
+        fd = bfs_open_read(scope.cstr(path), 0.to_i32()).to_int()
     }
     if fd < 0 { return }
     // No child gets a descriptor of the build: a cc that outlives it would pin the dir.
@@ -216,7 +216,7 @@ pub fn reap_dead(parent: Str, prefixes: List[Str]) ! IO {
         if live_locks.contains_key(path) || file_exists("{path}/{LIVE_MARK}") == 0 { continue }
         let mut fd = -1
         with ffi.scope() as scope {
-            fd = bfs_open(scope.cstr(path), 0.to_i32()).to_int()
+            fd = bfs_open_read(scope.cstr(path), 0.to_i32()).to_int()
         }
         if fd < 0 { continue }
         // The mark is checked again under the lock: a reaper that removed the dir first
@@ -236,7 +236,7 @@ pub fn touch(path: Str) -> Bool ! IO {
     let mut err = 0
     with ffi.scope() as scope {
         // 2 is O_RDWR on Linux and macOS.
-        fd = bfs_open(scope.cstr(path), 2.to_i32()).to_int()
+        fd = bfs_open_write(scope.cstr(path), 2.to_i32()).to_int()
         if fd < 0 { err = bfs_errno() }
     }
     if fd < 0 {
@@ -280,14 +280,14 @@ pub fn hard_link(from: Str, to: Str) -> Bool ! IO {
 pub fn copy_file(from: Str, to: Str) -> Bool ! IO {
     let mut src = -1
     with ffi.scope() as scope {
-        src = bfs_open(scope.cstr(from), 0.to_i32()).to_int()
+        src = bfs_open_read(scope.cstr(from), 0.to_i32()).to_int()
     }
     if src < 0 { return false }
     write_file(to, "")
     let mut dst = -1
     with ffi.scope() as scope {
         // 1 is O_WRONLY on Linux and macOS.
-        dst = bfs_open(scope.cstr(to), 1.to_i32()).to_int()
+        dst = bfs_open_write(scope.cstr(to), 1.to_i32()).to_int()
     }
     let mut ok = dst >= 0
     let mut done = false
@@ -332,7 +332,7 @@ fn write_all(fd: Int, data: Bytes) -> Bool ! IO {
 pub fn file_size(path: Str) -> Int ! IO {
     let mut size = -1
     with ffi.scope() as scope {
-        let fd = bfs_open(scope.cstr(path), 0.to_i32()).to_int()
+        let fd = bfs_open_read(scope.cstr(path), 0.to_i32()).to_int()
         if fd >= 0 {
             // 2 is SEEK_END on Linux and macOS.
             size = bfs_lseek(fd.to_i32(), 0, 2.to_i32())
@@ -372,7 +372,7 @@ pub fn same_bytes(a: Str, b: Str) -> Bool ! IO {
 fn read_all(path: Str) -> Option[Bytes] ! IO {
     let mut fd = -1
     with ffi.scope() as scope {
-        fd = bfs_open(scope.cstr(path), 0.to_i32()).to_int()
+        fd = bfs_open_read(scope.cstr(path), 0.to_i32()).to_int()
     }
     if fd < 0 { return None }
     let mut all = Bytes.new()
@@ -505,8 +505,8 @@ pub fn spawn_to_files(program: Str, args: List[Str], out_path: Str, err_path: St
     let mut live = -1
     let mut live_w = -1
     with ffi.scope() as scope {
-        out_fd = bfs_open(scope.cstr(out_path), 1.to_i32()).to_int()
-        err_fd = bfs_open(scope.cstr(err_path), 1.to_i32()).to_int()
+        out_fd = bfs_open_write(scope.cstr(out_path), 1.to_i32()).to_int()
+        err_fd = bfs_open_write(scope.cstr(err_path), 1.to_i32()).to_int()
         let ends = scope.alloc_n[I32](2)
         if bfs_pipe(ends).to_int() == 0 {
             live = ends.deref().to_int()
@@ -729,12 +729,17 @@ fn bfs_chmod(path: Ptr[U8], mode: U32) -> I32 ! FFI {}
 @trusted(audit: "Wraps link(2). A Str is NUL-terminated and holds no NUL, so each path reaches C whole.")
 fn bfs_link(from: Str, to: Str) -> I32 ! FFI {}
 
+// open(2) is bound twice so that a caller that only reads does not need the write row.
 @ffi("open", header: "fcntl.h")
-@trusted(audit: "Wraps open(2) with no mode, so it never creates. path is a NUL-terminated copy from ffi.scope(); flags is O_RDONLY, O_WRONLY or O_RDWR, 0, 1 and 2 on every host.")
-fn bfs_open(path: Ptr[U8], flags: I32) -> I32 ! FFI {}
+@trusted(audit: "Wraps open(2) with no mode, so it never creates. path is a NUL-terminated copy from ffi.scope(); flags is O_RDONLY, 0 on every host.")
+fn bfs_open_read(path: Ptr[U8], flags: I32) -> I32 ! FFI {}
+
+@ffi("open", header: "fcntl.h")
+@trusted(audit: "Wraps open(2) with no mode, so it never creates. path is a NUL-terminated copy from ffi.scope(); flags is O_WRONLY or O_RDWR, 1 and 2 on every host.")
+fn bfs_open_write(path: Ptr[U8], flags: I32) -> I32 ! FFI {}
 
 @ffi("close", header: "unistd.h")
-@trusted(audit: "Wraps close(2) on a descriptor bfs_open or bfs_pipe returned.")
+@trusted(audit: "Wraps close(2) on a descriptor bfs_open_read, bfs_open_write or bfs_pipe returned.")
 fn bfs_close(fd: I32) -> I32 ! FFI {}
 
 @ffi("realpath", header: "stdlib.h")
@@ -742,7 +747,7 @@ fn bfs_close(fd: I32) -> I32 ! FFI {}
 fn bfs_realpath(path: Ptr[U8], resolved: Ptr[U8]) -> Ptr[U8] ! FFI {}
 
 @ffi("lseek", header: "unistd.h")
-@trusted(audit: "Wraps lseek(2). fd is one bfs_open returned; whence is SEEK_SET or SEEK_END, 0 and 2 on every host.")
+@trusted(audit: "Wraps lseek(2). fd is one bfs_open_read or bfs_open_write returned; whence is SEEK_SET or SEEK_END, 0 and 2 on every host.")
 fn bfs_lseek(fd: I32, offset: Int, whence: I32) -> Int ! FFI {}
 
 @ffi("access", header: "unistd.h")
@@ -766,13 +771,13 @@ fn bfs_waitpid(pid: I32, status: Ptr[I32], options: I32) -> I32 ! FFI {}
 fn bfs_pipe(fds: Ptr[I32]) -> I32 ! FFI {}
 
 @ffi("fcntl", header: "fcntl.h")
-@trusted(audit: "Wraps fcntl(2) with F_SETFD and FD_CLOEXEC, 2 and 1 on Linux and macOS, on a descriptor bfs_pipe or bfs_open made. The third argument is an int, as F_SETFD takes.")
+@trusted(audit: "Wraps fcntl(2) with F_SETFD and FD_CLOEXEC, 2 and 1 on Linux and macOS, on a descriptor bfs_pipe or bfs_open_read made. The third argument is an int, as F_SETFD takes.")
 fn bfs_fcntl(fd: I32, cmd: I32, arg: I32) -> I32 ! FFI {}
 
 @ffi("flock", header: "sys/file.h")
-@trusted(audit: "Wraps flock(2) on a descriptor bfs_open returned. op is LOCK_EX with LOCK_NB, 2 and 4 on Linux and macOS, so it never blocks.")
+@trusted(audit: "Wraps flock(2) on a descriptor bfs_open_read returned. op is LOCK_EX with LOCK_NB, 2 and 4 on Linux and macOS, so it never blocks.")
 fn bfs_flock(fd: I32, op: I32) -> I32 ! FFI {}
 
 @ffi("dup2", header: "unistd.h")
-@trusted(audit: "Wraps dup2(2) in a child bfs_fork made, on descriptors bfs_open returned, before it execs.")
+@trusted(audit: "Wraps dup2(2) in a child bfs_fork made, on descriptors bfs_open_write returned, before it execs.")
 fn bfs_dup2(from: I32, to: I32) -> I32 ! FFI {}
