@@ -148,6 +148,8 @@ awk -F'\t' -v f=ERROR_CATALOG.md -v bad="$work/unreadable" '
     }
     END {
         if (!nspec) print f " -> no table with a Spec ref column" > bad
+        # A Retired row is a match too: the compiler can still emit a code
+        # until the work that retires it lands.
         for (i = 1; i <= nl; i++) {
             cd = lcode[i]
             if (!(cd in codes))
