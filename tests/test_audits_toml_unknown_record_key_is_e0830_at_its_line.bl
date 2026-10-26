@@ -1,0 +1,132 @@
+// A record in audits.toml holds only `claim` and `pins` (§9.1 *Audit Records*). Any other key
+// is the error E0830 at the key's line and column in audits.toml, labelled with the allowed
+// keys, with the nearest allowed key as help when one is near, and a note on where links and
+// authorship go. A package with no audits.toml has no records, which is not an error. Each
+// package reads the audits.toml at its own root, so a dependency's file is checked as well.
+
+import std.process.{ProcessResult}
+import std.json.{json_clear, json_parse, json_get, json_as_str, json_as_int}
+
+let PACKAGE = "[package]\nname = \"app\"\nversion = \"0.1.0\"\n"
+let MAIN = "fn main() \{\n    io.println(\"hi\")\n}\n"
+let NOTE = "put ticket links and authorship in the `claim` text; version control records who wrote it"
+
+fn sh(cmd: Str) -> ProcessResult {
+    process_run("sh", ["-c", cmd])
+}
+
+// Checks src/main.bl of a fresh package whose audits.toml holds `audits`; "" writes no file.
+fn check(audits: Str, args: Str) -> ProcessResult {
+    let dir = sh("mktemp -d /tmp/blink_audits_toml.XXXXXX").out.trim()
+    let _ = sh("mkdir -p {dir}/src")
+    write_file("{dir}/blink.toml", PACKAGE)
+    // A lock no older than blink.toml keeps dependency resolution out of the check.
+    write_file("{dir}/blink.lock", "[metadata]\nlockfile-version = 1\n")
+    write_file("{dir}/src/main.bl", MAIN)
+    if audits != "" {
+        write_file("{dir}/audits.toml", audits)
+    }
+    let r = sh("B=$(pwd)/build/blink; cd {dir} && $B check {args} src/main.bl")
+    let _ = sh("rm -rf {dir}")
+    r
+}
+
+fn rows(r: ProcessResult) -> List[Int] {
+    json_clear()
+    let mut out: List[Int] = []
+    for line in r.err_out.trim().split("\n") {
+        if line != "" {
+            let row = json_parse(line)
+            assert(row >= 0, "not JSON: {r.err_out}")
+            out.push(row)
+        }
+    }
+    out
+}
+
+test "an unknown record key is E0830 at its line with the label, the nearest key and the note" {
+    let r = check("# audits.toml\n[DB-003]\nclaims = \"checked against sqlite3.h\"\npins = \{ \"db.sqlite.sqlite3_open\" = \"ast1:3f9c0a4e1b7d\" \}\n", "")
+    assert_eq(r.exit_code, 1)
+    assert(r.err_out.contains("error[AuditRecordUnknownKey]: unknown key `claims` in audit record `DB-003`\n  --> audits.toml:3:1\n"), r.err_out)
+    assert(r.err_out.contains("3 | claims = \"checked against sqlite3.h\"\n  | ^^^^^^ a record holds only `claim` and `pins`\n"), r.err_out)
+    assert(r.err_out.contains("  help: did you mean `claim`?\n"), r.err_out)
+    assert(r.err_out.contains("  note: {NOTE}\n"), r.err_out)
+}
+
+test "check --json gives one E0830 row with the key span, the help and the note" {
+    let r = check("[DB-003]\nclaim = \"c\"\npinz = \{ \"a.b\" = \"ast1:00\" \}\n", "--json")
+    assert_eq(r.exit_code, 1)
+    let all = rows(r)
+    assert_eq(all.len(), 1, r.err_out)
+    let row = all.get(0).unwrap()
+    assert_eq(json_as_str(json_get(row, "code")), "E0830")
+    assert_eq(json_as_str(json_get(row, "name")), "AuditRecordUnknownKey")
+    assert_eq(json_as_str(json_get(row, "message")), "unknown key `pinz` in audit record `DB-003`")
+    let span = json_get(row, "span")
+    assert_eq(json_as_str(json_get(span, "file")), "audits.toml")
+    assert_eq(json_as_int(json_get(span, "line")), 3)
+    assert_eq(json_as_int(json_get(span, "col")), 1)
+    assert_eq(json_as_int(json_get(span, "end_col")), 5)
+    assert_eq(json_as_str(json_get(row, "help")), "did you mean `pins`?")
+    assert(r.out.contains("\"status\":\"error\""), r.out)
+}
+
+test "a key far from both allowed keys is E0830 with no help" {
+    let r = check("[DB-003]\nclaim = \"c\"\nreviewer = \"someone\"\n", "--json")
+    assert_eq(r.exit_code, 1)
+    let all = rows(r)
+    assert_eq(all.len(), 1, r.err_out)
+    let row = all.get(0).unwrap()
+    assert_eq(json_as_str(json_get(row, "message")), "unknown key `reviewer` in audit record `DB-003`")
+    assert(json_get(row, "help") < 0)
+}
+
+test "a record with only claim and pins checks clean" {
+    let r = check("[DB-003]\nclaim = \"Checked against sqlite3.h 3.45.\"\npins = \{ \"db.sqlite.sqlite3_open\" = \"ast1:3f9c0a4e1b7d\" \}\n", "")
+    assert_eq(r.exit_code, 0, r.err_out)
+    assert_eq(r.err_out, "")
+    assert_eq(r.out.trim(), "ok: src/main.bl")
+}
+
+test "a package with no audits.toml checks clean" {
+    let r = check("", "")
+    assert_eq(r.exit_code, 0, r.err_out)
+    assert_eq(r.err_out, "")
+    assert_eq(r.out.trim(), "ok: src/main.bl")
+}
+
+test "a dependency's audits.toml is checked at its own root" {
+    let dir = sh("mktemp -d /tmp/blink_audits_toml_dep.XXXXXX").out.trim()
+    let _ = sh("mkdir -p {dir}/src {dir}/deps/mylib/src")
+    write_file("{dir}/blink.toml", "{PACKAGE}\n[dependencies]\nmylib = \{ path = \"deps/mylib\" \}\n")
+    write_file("{dir}/src/main.bl", "import mylib.\{greet\}\n\nfn main() \{\n    io.println(greet())\n}\n")
+    write_file("{dir}/audits.toml", "[APP-1]\nclaim = \"app claim\"\n")
+    write_file("{dir}/deps/mylib/blink.toml", "[package]\nname = \"mylib\"\nversion = \"0.1.0\"\n")
+    write_file("{dir}/deps/mylib/src/mylib.bl", "pub fn greet() -> Str \{\n    \"hello\"\n}\n")
+    write_file("{dir}/deps/mylib/audits.toml", "[LIB-1]\nclaim = \"lib claim\"\nclaimz = \"x\"\n")
+    let r = sh("B=$(pwd)/build/blink; cd {dir} && $B check src/main.bl")
+    let _ = sh("rm -rf {dir}")
+    assert_eq(r.exit_code, 1, "{r.out}{r.err_out}")
+    assert(r.err_out.contains("error[AuditRecordUnknownKey]: unknown key `claimz` in audit record `LIB-1`\n"), r.err_out)
+    assert(r.err_out.contains("deps/mylib/audits.toml:3:1\n"), r.err_out)
+    assert(r.err_out.contains("1 error(s) found"), r.err_out)
+}
+
+test "E0830 has a catalog entry and explain text" {
+    let res = process_run("build/blink", ["explain", "E0830"])
+    assert_eq(res.exit_code, 0)
+    assert(res.out.starts_with("E0830 -- AuditRecordUnknownKey\n"), res.out)
+    assert(res.out.contains("`claim` and `pins`"), res.out)
+}
+
+test "a bare dotted header is E0830 for its second key, at the header" {
+    let r = check("[DB-003]\nclaim = \"c\"\n[DB-003.ticket]\nid = 1\n", "")
+    assert_eq(r.exit_code, 1)
+    assert(r.err_out.contains("error[AuditRecordUnknownKey]: unknown key `ticket` in audit record `DB-003`\n  --> audits.toml:3:1\n"), r.err_out)
+    assert(r.err_out.contains("3 | [DB-003.ticket]\n  | ^^^^^^^^^^^^^^^ a record holds only `claim` and `pins`\n"), r.err_out)
+}
+
+test "a [K.pins] table and a quoted dotted record name check clean" {
+    let r = check("[DB-003]\nclaim = \"c\"\n[DB-003.pins]\n\"db.sqlite.sqlite3_open\" = \"ast1:3f9c0a4e1b7d\"\n\n[\"a.b\"]\nclaim = \"d\"\n", "")
+    assert_eq(r.exit_code, 0, r.err_out)
+}

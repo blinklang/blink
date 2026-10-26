@@ -1,0 +1,54 @@
+// A package resolves an audit key K only against the audits.toml at its own root (§9.1 *Audit
+// Records*). An app and a path dependency each have their own file, so a K that one of them
+// records is not found from the files of the other, and a stdlib file finds neither, even a K
+// that the app records under the same name as one the stdlib file uses.
+
+import compiler.{compile_to_program, audit_record_for, loaded_inputs}
+import diagnostics.{diag_entries, diag_reset}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> ProcessResult {
+    process_run("sh", ["-c", cmd])
+}
+
+fn loaded_file(suffix: Str) -> Str {
+    loaded_inputs.files.find(fn(f) { f.ends_with(suffix) }) ?? ""
+}
+
+test "each package finds only the records in its own audits.toml" {
+    let dir = sh("mktemp -d /tmp/blink_audit_k_own_file.XXXXXX").out.trim()
+    let _ = sh("mkdir -p {dir}/src {dir}/deps/mylib/src")
+    write_file("{dir}/blink.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[dependencies]\nmylib = \{ path = \"deps/mylib\" \}\n")
+    write_file("{dir}/blink.lock", "[metadata]\nlockfile-version = 1\n\n[[package]]\nname = \"mylib\"\nversion = \"0.1.0\"\nsource = \"path:{dir}/deps/mylib\"\nhash = \"0000000000000000000000000000000000000000000000000000000000000000\"\ncapabilities = []\n")
+    write_file("{dir}/src/main.bl", "import mylib.\{greet\}\n\nfn main() \{\n    io.println(greet())\n}\n")
+    write_file("{dir}/audits.toml", "[APP-1]\nclaim = \"app claim\"\n\n[STD-SB]\nclaim = \"app claim on a stdlib key\"\n")
+    write_file("{dir}/deps/mylib/blink.toml", "[package]\nname = \"mylib\"\nversion = \"0.1.0\"\n")
+    write_file("{dir}/deps/mylib/src/mylib.bl", "pub fn greet() -> Str \{\n    \"hello\"\n}\n")
+    write_file("{dir}/deps/mylib/audits.toml", "[LIB-1]\nclaim = \"lib claim\"\n")
+    init_embedded_stdlib()
+    diag_reset()
+    let _ = compile_to_program("{dir}/src/main.bl", 1)
+    let _ = sh("rm -rf {dir}")
+    assert(diag_entries.len() == 0, diag_entries.map(fn(d) { "{d.line}:{d.col}: {d.code} {d.message}" }).join("\n"))
+
+    let app = loaded_file("/src/main.bl")
+    let lib = loaded_file("/deps/mylib/src/mylib.bl")
+    assert(app != "", loaded_inputs.files.join("\n"))
+    assert(lib != "", loaded_inputs.files.join("\n"))
+    assert_eq(audit_record_for(app, "APP-1").unwrap().claim, "app claim")
+    assert(audit_record_for(app, "LIB-1").is_none())
+    assert_eq(audit_record_for(lib, "LIB-1").unwrap().claim, "lib claim")
+    assert(audit_record_for(lib, "APP-1").is_none())
+
+    let std_file = loaded_inputs.files.find(fn(f) { f != app && f != lib }) ?? ""
+    assert(std_file != "", loaded_inputs.files.join("\n"))
+    assert(audit_record_for(std_file, "APP-1").is_none())
+    assert(audit_record_for(std_file, "LIB-1").is_none())
+
+    // The stdlib loads from the embedded registry or from a lib/std on disk.
+    let sb_file = loaded_inputs.files.find(fn(f) { f == "<embedded:std/sb>" || f.ends_with("/lib/std/sb.bl") }) ?? ""
+    assert(sb_file != "", loaded_inputs.files.join("\n"))
+    assert_eq(audit_record_for(app, "STD-SB").unwrap().claim, "app claim on a stdlib key")
+    assert(audit_record_for(sb_file, "STD-SB").is_none())
+}

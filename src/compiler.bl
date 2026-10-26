@@ -1,14 +1,14 @@
 import ast.{NodeKind, trace, trace_mode}
 import lexer.{Lex, lex}
 import parser.{Parse, parser_reset, parse_program, new_node, new_sublist, sublist_push, finalize_sublist, sublist_get, sublist_length, pos, node_count, node_kind, node_name, node_args, node_elements, node_handlers, node_params, node_fields, node_stmts, node_arms, node_methods, node_module, node_captures, node_str_val, node_is_pub, node_set_module, node_set_is_pub, node_set_name, node_set_handlers, node_set_params, node_set_fields, node_set_stmts, node_set_arms, node_set_methods, node_set_args, node_set_captures, record_source_module, embed_path_of, parsed_interface_text, parsed_interface_parts, interface_text_of, parser_interface_text_deferred, parser_interface_text_wanted, parser_keeps_parsed, parser_has_parsed_end, parser_parsed_end, parser_mark_parsed, parser_rewind, parser_keep_parsed, parser_keep_load_order_only, parser_program_annotations, parser_set_program_annotations, parser_set_load_order, parser_live_ranges}
-import typecheck.{clear_module_imports, handles_io_read, io_read_module, record_module_import, tc_import_modules, tc_import_qualifiers, tc_import_nodes, tc_reexport_source, tc_reexport_modules, tc_is_module_used, tc_main_module_has_duplicates, tc_get_symbol_module, tc_set_prelude_modules, tc_record_module_package}
+import typecheck.{clear_module_imports, handles_io_read, io_read_module, record_module_import, tc_import_modules, tc_import_qualifiers, tc_import_nodes, tc_reexport_source, tc_reexport_modules, tc_is_module_used, tc_main_module_has_duplicates, tc_get_symbol_module, tc_set_prelude_modules, tc_record_module_package, nearest_name}
 import diagnostics.{
     Diag, diag_register_file_range, lint_set_override, diag_normalize_path,
     diag_set_last_fix, diag_error_no_loc, diag_warn_at, diag_reset,
     diag_source_file, diag_module_files, embedded_inner_key,
     diag_error_at, diag_file_for_node, diag_warn_in_file_notes, SHADOWED_DEPENDENCY,
-    diag_emit_in_file, diag_error_no_loc_notes, diag_entries, diag_entry_count, diag_ice_count, diag_cutoff_count,
-    INVALID_LINT_LEVEL, UNKNOWN_MANIFEST_SECTION,
+    diag_emit_in_file, diag_error_in_file_label_notes, diag_error_no_loc_notes, diag_entries, diag_entry_count, diag_ice_count, diag_cutoff_count,
+    INVALID_LINT_LEVEL, UNKNOWN_MANIFEST_SECTION, AUDIT_RECORD_UNKNOWN_KEY,
     CIRCULAR_DEPENDENCY, VERSION_CONFLICT, INVALID_MODULE_ANNOTATION,
     PACKAGE_ENTRY_NOT_FOUND, ORPHAN_FILE, MODULE_NOT_FOUND, UNUSED_IMPORT,
     FILE_NOT_FOUND,
@@ -18,6 +18,7 @@ import pkg.manifest.{manifest_clear, manifest_load, manifest_has_dep, manifest_n
 import std.path.{path_join, path_dirname, path_parent, path_basename, path_stem}
 import std.toml.{toml_read_value}
 import comment_attach.{attach_comments_pass}
+import audit_records.{audit_records_parse, audit_records_empty, audit_record_find, AuditRecord, AuditRecords}
 
 // compiler.bl — Self-hosting Blink compiler driver
 //
@@ -208,6 +209,63 @@ pub fn apply_manifest_lints(path: Str) ! Diag.Report {
     }
 }
 
+// Notes the package root of a loaded file: the directory of the blink.toml its src root
+// belongs to. The standard library and the toolchain packages resolve K only against their
+// own records, never against the audits.toml of the program that imports them.
+pub fn note_audit_dir(dotted_path: Str, file_path: Str) {
+    if dotted_path.starts_with("std.") || dotted_path.starts_with("pkg.") || file_path.starts_with("<embedded:") {
+        return
+    }
+    let root = find_src_root(file_path)
+    if root != "" {
+        loaded_inputs.audit_dirs.insert(file_path, path_dirname(manifest_path_for_src_root(root)))
+    }
+}
+
+// Reads the audits.toml at each package root a loaded file belongs to, once per root, and
+// reports each record key the schema does not allow. A root with no audits.toml has no
+// records, which is not an error: only a `@trusted(audit: K)` that names a missing K is.
+pub fn load_audit_records() ! Diag.Report {
+    for f in loaded_inputs.files {
+        let dir = loaded_inputs.audit_dirs.get(f) ?? ""
+        if dir == "" || loaded_inputs.audit_records.contains_key(dir) { continue }
+        let path = path_join(dir, "audits.toml")
+        if !probe_file(path) {
+            loaded_inputs.audit_records.insert(dir, audit_records_empty())
+            continue
+        }
+        let text = read_file(path)
+        loaded_inputs.config_paths.push(path)
+        loaded_inputs.config_texts.push(text)
+        let recs = audit_records_parse(text)
+        loaded_inputs.audit_records.insert(dir, recs)
+        report_audit_record_issues(path, recs)
+    }
+}
+
+fn report_audit_record_issues(path: Str, recs: AuditRecords) ! Diag.Report {
+    let file = if path.starts_with("./") { path.byte_slice(2, path.byte_len()) } else { path }
+    for issue in recs.issues {
+        let near = nearest_name(issue.key, ["claim", "pins"])
+        let help = if near != "" { "did you mean `{near}`?" } else { "" }
+        diag_error_in_file_label_notes("AuditRecordUnknownKey", AUDIT_RECORD_UNKNOWN_KEY,
+            "unknown key `{issue.key}` in audit record `{issue.record}`",
+            file, issue.span.line, issue.span.col, issue.span.end_line, issue.span.end_col,
+            "a record holds only `claim` and `pins`", help,
+            ["put ticket links and authorship in the `claim` text; version control records who wrote it"])
+    }
+}
+
+// The record K that `@trusted(audit: K)` in the loaded file `file_path` names: K looked up in
+// the audits.toml of that file's own package. None when the package has no such record.
+pub fn audit_record_for(file_path: Str, k: Str) -> Option[AuditRecord] {
+    let dir = loaded_inputs.audit_dirs.get(file_path) ?? ""
+    match loaded_inputs.audit_records.get(dir) {
+        Some(recs) => audit_record_find(recs, k)
+        None => None
+    }
+}
+
 // Whether a file is at path, noted in loaded_inputs. A probe that resolution acts on goes
 // through here, so the probes list every path whose answer could change the program loaded.
 fn probe_file(path: Str) -> Bool {
@@ -271,6 +329,7 @@ pub fn compile_to_program(file_path: Str, use_prelude: Int) -> Int ! Lex.Tokeniz
         let parsed = parse_source(file_path, source)
         program = parsed.program
         loaded_inputs.files.push(file_path)
+        note_audit_dir("", file_path)
         record_source_nodes("__main__", parsed)
 
         reject_empty_module_annotation(program)
@@ -286,6 +345,7 @@ pub fn compile_to_program(file_path: Str, use_prelude: Int) -> Int ! Lex.Tokeniz
     build_reexport_map(imported_programs)
 
     check_embed_targets()
+    load_audit_records()
 
     let cycle_path = detect_package_cycles()
     if cycle_path != "" {
@@ -1129,10 +1189,15 @@ pub type LoadedInputs {
     // new file that an import now finds, or that now shadows the one it found, shows here.
     probe_paths: List[Str]
     probe_found: Map[Str, Bool]
+    // The package root of each loaded file, whose audits.toml its `@trusted(audit: K)` resolves
+    // against, and the records read from each root's audits.toml (§9.1). A file of the
+    // standard library or of a toolchain package has no root here.
+    audit_dirs: Map[Str, Str]
+    audit_records: Map[Str, AuditRecords]
 }
 
 fn loaded_inputs_empty() -> LoadedInputs {
-    LoadedInputs { files: [], source_paths: [], source_texts: [], source_modules: [], source_first_nodes: [], source_end_nodes: [], source_interfaces: [], interface_parts: [], config_paths: [], config_texts: [], embed_paths: [], embed_texts: Map(), probe_paths: [], probe_found: Map() }
+    LoadedInputs { files: [], source_paths: [], source_texts: [], source_modules: [], source_first_nodes: [], source_end_nodes: [], source_interfaces: [], interface_parts: [], config_paths: [], config_texts: [], embed_paths: [], embed_texts: Map(), probe_paths: [], probe_found: Map(), audit_dirs: Map(), audit_records: Map() }
 }
 
 pub let mut loaded_inputs: LoadedInputs = loaded_inputs_empty()
@@ -1556,6 +1621,7 @@ fn is_file_loaded(path: Str) -> Int {
 @allow(UnrestoredMutation, IncompleteStateRestore)
 fn load_module(dotted_path: Str, file_path: Str, src_root: Str, all_programs: List[Int], imp_node: Int, label: Str) ! Lex.Tokenize, Parse, Diag.Report {
     loaded_inputs.files.push(file_path)
+    note_audit_dir(dotted_path, file_path)
     if trace_mode != "" { trace("parse", "{label} {dotted_path} -> {file_path}") }
     let mut source = ""
     if file_path.starts_with("<embedded:") {
