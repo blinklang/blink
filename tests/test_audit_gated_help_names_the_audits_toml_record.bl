@@ -1,7 +1,8 @@
 // `@trusted(audit: K)` is not free text: K names a record in the package's audits.toml
 // (§9.1 *Audit Records*). So the help of the audit-gated warnings names that record, in the
 // words §9.1 and §3b.5 give, and no help line is machine-applicable: no tool writes a claim.
-// E0801 has no escape at all, so its help never offers @trusted. The explain texts say the
+// E0836, E0837 and E0811 send the author to the same channel, so their help names the record
+// too. E0801 has no escape at all, so its help never offers @trusted. The explain texts say the
 // same; each one is checked here word for word.
 
 import std.fs
@@ -88,4 +89,47 @@ test "E0837 explain sends the author to an audits.toml record" {
 
 test "W0310 explain parameterizes first and names the audits.toml record" {
     assert_eq(diag_explain(RAW_BYPASSES_PARAM), "W0310 -- RawBypassesParam\n\nA `Raw[Str]` was folded into a `Template[C]`, so its text became part\nof the query and was not parameterized. Text that comes from user input\ncan then carry an injection.\n\nFix: parameterize the value instead. Reserve `Raw` for fragments such\nas table or column names that a parameter cannot hold:\n\n  db.query_one(t\"SELECT * FROM \{Raw(table)\} WHERE id = \{id\}\")  // W0310\n  db.query_one(t\"SELECT * FROM users WHERE id = \{id\}\")         // OK\n\nOnly if no parameterized form exists, record the review: add\n@trusted(audit: K) to the enclosing function, and a record `K` in the\npackage's audits.toml that holds the claim that the value cannot carry\nan injection. Keep the guard inside that function: the record's pin\ncovers only its body.\n\nRawBypassesParam is audit-gated: @allow and [lints] cannot reach it\n(E0837).")
+}
+
+fn all_named(name: Str) -> List[DiagEntry] {
+    let mut found: List[DiagEntry] = []
+    for d in diag_entries {
+        if d.name == name { found.push(d) }
+    }
+    found
+}
+
+test "E0836 help names the audits.toml record" {
+    help_probe("build/audit_help_e0836.bl", "@ffi(\"c\", \"getpid\")\n@trusted\nfn c_getpid() -> I32 ! IO\n\nfn main() \{}\n")
+    let d = only_named("TrustedRequiresAudit").unwrap()
+    assert_eq(d.help, "write @trusted(audit: \"AUDIT-ID\") and add a record `AUDIT-ID` in audits.toml")
+    assert_eq(d.fix_action, "")
+}
+
+test "E0837 help names the audits.toml record" {
+    help_probe("build/audit_help_e0837.bl", "@allow(RawBypassesParam)\nfn f() \{}\n\nfn main() \{}\n")
+    let d = only_named("AuditGatedSuppression").unwrap()
+    assert_eq(d.help, "`RawBypassesParam` records an audit, so it is suppressed only by `@trusted(audit: \"AUDIT-ID\")` on the enclosing function; it needs a record `AUDIT-ID` in audits.toml")
+    assert_eq(d.fix_action, "")
+}
+
+test "E0811 help names the audits.toml record at every signature site" {
+    let e0811_help = "add @ffi or @trusted(audit: \"AUDIT-ID\") to the function; @trusted needs a record `AUDIT-ID` in audits.toml"
+    let probes = [
+        "fn takes(p: Ptr[I32]) -> Int \{ 0 }\n\nfn main() \{}\n",
+        "fn gives() -> Ptr[I32] \{ null_ptr[I32]() }\n\nfn main() \{}\n",
+        "@ffi.struct(header: \"sys/uio.h\", name: \"iovec\")\ntype IoVec \{ base: Ptr[U8], len: U64 }\n\nfn takes(_v: IoVec) -> Int \{ 0 }\n\nfn main() \{}\n",
+    ]
+    let mut seen = 0
+    for src in probes {
+        help_probe("build/audit_help_e0811.bl", src)
+        let ds = all_named("PtrOutsideFfiContext")
+        assert(ds.len() > 0, "no E0811 for: {src}")
+        for d in ds {
+            assert_eq(d.help, e0811_help)
+            assert_eq(d.fix_action, "")
+            seen = seen + 1
+        }
+    }
+    assert(seen >= 3, "expected an E0811 per probe, saw {seen}")
 }
