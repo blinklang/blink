@@ -3,13 +3,30 @@
 // records is not found from the files of the other, and a stdlib file finds neither, even a K
 // that the app records under the same name as one the stdlib file uses.
 
-import compiler.{compile_to_program, audit_record_for, loaded_inputs}
+import compiler.{compile_to_program, compile_entry_to_program, loaded_inputs}
 import diagnostics.{diag_entries, diag_reset}
 import embedded_stdlib_registry.{init_embedded_stdlib}
 import std.process.{ProcessResult}
 
 fn sh(cmd: Str) -> ProcessResult {
     process_run("sh", ["-c", cmd])
+}
+
+// The claim of record K as the file `file` resolves it: K in the records of that file's own
+// package, or "" when the package has no such record or the file is in no package.
+fn claim_for(file: Str, k: Str) -> Str {
+    let dir = loaded_inputs.audit_dirs.get(file) ?? ""
+    match loaded_inputs.audit_records.get(dir) {
+        Some(recs) => match recs.records.get(k) {
+            Some(r) => r.claim
+            None => ""
+        }
+        None => ""
+    }
+}
+
+fn diag_lines() -> Str {
+    diag_entries.map(fn(d) { "{d.line}:{d.col}: {d.code} {d.message}" }).join("\n")
 }
 
 fn loaded_file(suffix: Str) -> Str {
@@ -30,25 +47,79 @@ test "each package finds only the records in its own audits.toml" {
     diag_reset()
     let _ = compile_to_program("{dir}/src/main.bl", 1)
     let _ = sh("rm -rf {dir}")
-    assert(diag_entries.len() == 0, diag_entries.map(fn(d) { "{d.line}:{d.col}: {d.code} {d.message}" }).join("\n"))
+    assert(diag_entries.len() == 0, diag_lines())
 
     let app = loaded_file("/src/main.bl")
     let lib = loaded_file("/deps/mylib/src/mylib.bl")
     assert(app != "", loaded_inputs.files.join("\n"))
     assert(lib != "", loaded_inputs.files.join("\n"))
-    assert_eq(audit_record_for(app, "APP-1").unwrap().claim, "app claim")
-    assert(audit_record_for(app, "LIB-1").is_none())
-    assert_eq(audit_record_for(lib, "LIB-1").unwrap().claim, "lib claim")
-    assert(audit_record_for(lib, "APP-1").is_none())
+    assert_eq(claim_for(app, "APP-1"), "app claim")
+    assert_eq(claim_for(app, "LIB-1"), "")
+    assert_eq(claim_for(lib, "LIB-1"), "lib claim")
+    assert_eq(claim_for(lib, "APP-1"), "")
 
     let std_file = loaded_inputs.files.find(fn(f) { f != app && f != lib }) ?? ""
     assert(std_file != "", loaded_inputs.files.join("\n"))
-    assert(audit_record_for(std_file, "APP-1").is_none())
-    assert(audit_record_for(std_file, "LIB-1").is_none())
+    assert_eq(claim_for(std_file, "APP-1"), "")
+    assert_eq(claim_for(std_file, "LIB-1"), "")
 
     // The stdlib loads from the embedded registry or from a lib/std on disk.
     let sb_file = loaded_inputs.files.find(fn(f) { f == "<embedded:std/sb>" || f.ends_with("/lib/std/sb.bl") }) ?? ""
     assert(sb_file != "", loaded_inputs.files.join("\n"))
-    assert_eq(audit_record_for(app, "STD-SB").unwrap().claim, "app claim on a stdlib key")
-    assert(audit_record_for(sb_file, "STD-SB").is_none())
+    assert(!loaded_inputs.audit_dirs.contains_key(sb_file))
+    assert_eq(claim_for(app, "STD-SB"), "app claim on a stdlib key")
+    assert_eq(claim_for(sb_file, "STD-SB"), "")
+}
+
+test "a local module that an import `pkg.x` loads resolves against the app's own file" {
+    let dir = sh("mktemp -d /tmp/blink_audit_k_local_pkg.XXXXXX").out.trim()
+    let _ = sh("mkdir -p {dir}/src/pkg")
+    write_file("{dir}/blink.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\n")
+    write_file("{dir}/src/main.bl", "import pkg.util\n\nfn main() \{\n    io.println(util.greet())\n}\n")
+    write_file("{dir}/src/pkg/util.bl", "pub fn greet() -> Str \{\n    \"hello\"\n}\n")
+    write_file("{dir}/audits.toml", "[APP-1]\nclaim = \"app claim\"\n")
+    init_embedded_stdlib()
+    diag_reset()
+    let _ = compile_to_program("{dir}/src/main.bl", 1)
+    let _ = sh("rm -rf {dir}")
+    assert(diag_entries.len() == 0, diag_lines())
+    let util = loaded_file("/src/pkg/util.bl")
+    assert(util != "", loaded_inputs.files.join("\n"))
+    assert_eq(claim_for(util, "APP-1"), "app claim")
+}
+
+test "a file under a src dir with no blink.toml above it has no records" {
+    let dir = sh("mktemp -d /tmp/blink_audit_k_no_manifest.XXXXXX").out.trim()
+    let _ = sh("mkdir -p {dir}/src")
+    write_file("{dir}/src/main.bl", "fn main() \{\n    io.println(\"hi\")\n}\n")
+    write_file("{dir}/audits.toml", "[APP-1]\nclaim = \"app claim\"\nreviewer = \"bob\"\n")
+    init_embedded_stdlib()
+    diag_reset()
+    let _ = compile_to_program("{dir}/src/main.bl", 1)
+    let _ = sh("rm -rf {dir}")
+    assert(diag_entries.len() == 0, diag_lines())
+    let main = loaded_file("/src/main.bl")
+    assert(main != "", loaded_inputs.files.join("\n"))
+    assert(!loaded_inputs.audit_dirs.contains_key(main))
+}
+
+test "an entry file the toolchain writes in a build dir does not take the package's records" {
+    let dir = sh("mktemp -d /tmp/blink_audit_k_archive_entry.XXXXXX").out.trim()
+    let _ = sh("mkdir -p {dir}/src {dir}/build/std-cache")
+    write_file("{dir}/blink.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\n")
+    write_file("{dir}/audits.toml", "[APP-1]\nclaim = \"app claim\"\nreviewer = \"bob\"\n")
+    let entry = "{dir}/build/std-cache/__archive_main.bl"
+    write_file(entry, "import std.sb\n\nfn main() \{\}\n")
+    init_embedded_stdlib()
+
+    // As the entry of a package, the file finds the package's records and their issue.
+    diag_reset()
+    let _ = compile_to_program(entry, 1)
+    assert(diag_entries.any(fn(d) { d.code == "E0830" }), diag_lines())
+
+    diag_reset()
+    let _ = compile_entry_to_program(entry, 1, false)
+    let _ = sh("rm -rf {dir}")
+    assert(diag_entries.len() == 0, diag_lines())
+    assert(!loaded_inputs.audit_dirs.contains_key(entry))
 }

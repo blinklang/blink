@@ -18,7 +18,7 @@ import pkg.manifest.{manifest_clear, manifest_load, manifest_has_dep, manifest_n
 import std.path.{path_join, path_dirname, path_parent, path_basename, path_stem}
 import std.toml.{toml_read_value}
 import comment_attach.{attach_comments_pass}
-import audit_records.{audit_records_parse, audit_records_empty, audit_record_find, AuditRecord, AuditRecords}
+import audit_records.{audit_records_parse, audit_records_empty, AuditRecords}
 
 // compiler.bl — Self-hosting Blink compiler driver
 //
@@ -187,7 +187,7 @@ pub fn apply_manifest_lints(path: Str) ! Diag.Report {
     if (env.var("BLINK_MANIFEST_REPORTED") ?? "") == "1" {
         return
     }
-    let file = if path.starts_with("./") { path.byte_slice(2, path.byte_len()) } else { path }
+    let file = display_config_path(path)
     for issue in manifest_issues {
         match issue.kind {
             ManifestIssueKind.InvalidLintLevel => {
@@ -211,15 +211,30 @@ pub fn apply_manifest_lints(path: Str) ! Diag.Report {
 
 // Notes the package root of a loaded file: the directory of the blink.toml its src root
 // belongs to. The standard library and the toolchain packages resolve K only against their
-// own records, never against the audits.toml of the program that imports them.
-pub fn note_audit_dir(dotted_path: Str, file_path: Str) {
-    if dotted_path.starts_with("std.") || dotted_path.starts_with("pkg.") || file_path.starts_with("<embedded:") {
-        return
-    }
+// own records, never against the audits.toml of the program that imports them. A file with
+// no blink.toml over it is in no package, so it has no records.
+pub fn note_audit_dir(file_path: Str) {
+    if is_toolchain_file(file_path) { return }
     let root = find_src_root(file_path)
-    if root != "" {
-        loaded_inputs.audit_dirs.insert(file_path, path_dirname(manifest_path_for_src_root(root)))
+    if root == "" { return }
+    let manifest = manifest_path_for_src_root(root)
+    if probe_file(manifest) {
+        loaded_inputs.audit_dirs.insert(file_path, path_dirname(manifest))
     }
+}
+
+// Whether resolve_module_path found a file in the toolchain's own lib/std or lib/pkg. A local
+// src/pkg/x.bl that an import `pkg.x` loads is the program's file, and so is not one.
+fn is_toolchain_file(file_path: Str) -> Bool {
+    if file_path.starts_with("<embedded:") { return true }
+    let compiler_dir = path_dirname(get_arg(0))
+    if under_toolchain_lib(file_path, compiler_dir) { return true }
+    let blink_root = env.var("BLINK_ROOT") ?? ""
+    blink_root != "" && under_toolchain_lib(file_path, blink_root)
+}
+
+fn under_toolchain_lib(file_path: Str, root: Str) -> Bool {
+    file_path.starts_with(path_join(root, "lib/std/")) || file_path.starts_with(path_join(root, "lib/pkg/"))
 }
 
 // Reads the audits.toml at each package root a loaded file belongs to, once per root, and
@@ -234,17 +249,14 @@ pub fn load_audit_records() ! Diag.Report {
             loaded_inputs.audit_records.insert(dir, audit_records_empty())
             continue
         }
-        let text = read_file(path)
-        loaded_inputs.config_paths.push(path)
-        loaded_inputs.config_texts.push(text)
-        let recs = audit_records_parse(text)
+        let recs = audit_records_parse(note_config_text(path, read_file(path)))
         loaded_inputs.audit_records.insert(dir, recs)
         report_audit_record_issues(path, recs)
     }
 }
 
 fn report_audit_record_issues(path: Str, recs: AuditRecords) ! Diag.Report {
-    let file = if path.starts_with("./") { path.byte_slice(2, path.byte_len()) } else { path }
+    let file = display_config_path(path)
     for issue in recs.issues {
         let near = nearest_name(issue.key, ["claim", "pins"])
         let help = if near != "" { "did you mean `{near}`?" } else { "" }
@@ -256,14 +268,9 @@ fn report_audit_record_issues(path: Str, recs: AuditRecords) ! Diag.Report {
     }
 }
 
-// The record K that `@trusted(audit: K)` in the loaded file `file_path` names: K looked up in
-// the audits.toml of that file's own package. None when the package has no such record.
-pub fn audit_record_for(file_path: Str, k: Str) -> Option[AuditRecord] {
-    let dir = loaded_inputs.audit_dirs.get(file_path) ?? ""
-    match loaded_inputs.audit_records.get(dir) {
-        Some(recs) => audit_record_find(recs, k)
-        None => None
-    }
+// A config file path as a diagnostic names it: `./blink.toml` reads as `blink.toml`.
+fn display_config_path(path: Str) -> Str {
+    if path.starts_with("./") { path.byte_slice(2, path.byte_len()) } else { path }
 }
 
 // Whether a file is at path, noted in loaded_inputs. A probe that resolution acts on goes
@@ -313,6 +320,13 @@ fn check_embed_targets() ! Diag.Report {
 }
 
 pub fn compile_to_program(file_path: Str, use_prelude: Int) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report {
+    compile_entry_to_program(file_path, use_prelude, true)
+}
+
+// `package_root` is false for an entry file the toolchain writes, such as the stdlib archive's
+// synthesized main: it sits in a build dir, so the package found above it is not its package
+// and that package's audits.toml is not its records.
+pub fn compile_entry_to_program(file_path: Str, use_prelude: Int, package_root: Bool) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report {
     check_file_exists(file_path)
     reset_compiler_state()
     diag_reset()
@@ -329,7 +343,7 @@ pub fn compile_to_program(file_path: Str, use_prelude: Int) -> Int ! Lex.Tokeniz
         let parsed = parse_source(file_path, source)
         program = parsed.program
         loaded_inputs.files.push(file_path)
-        note_audit_dir("", file_path)
+        if package_root { note_audit_dir(file_path) }
         record_source_nodes("__main__", parsed)
 
         reject_empty_module_annotation(program)
@@ -486,9 +500,7 @@ fn read_pkg_name_from_toml(path: Str) -> Str {
     if !probe_file(path) {
         return ""
     }
-    let content = read_file(path)
-    loaded_inputs.config_paths.push(path)
-    loaded_inputs.config_texts.push(content)
+    let content = note_config_text(path, read_file(path))
     toml_read_value(content, "package", "name") ?? ""
 }
 
@@ -497,8 +509,14 @@ fn read_pkg_name_from_toml(path: Str) -> Str {
 // manifest or lockfile changes the emit only through which file an import loads, which the
 // loaded files show, and through [lints], which the lint levels in force show.
 fn note_config_file(path: Str) {
+    let _ = note_config_text(path, read_file(path))
+}
+
+// A config file the loader read, with the bytes it read; returns those bytes.
+fn note_config_text(path: Str, text: Str) -> Str {
     loaded_inputs.config_paths.push(path)
-    loaded_inputs.config_texts.push(read_file(path))
+    loaded_inputs.config_texts.push(text)
+    text
 }
 
 // Given a src_root like "examples/with_deps/mathlib/src/", return the path
@@ -1621,7 +1639,7 @@ fn is_file_loaded(path: Str) -> Int {
 @allow(UnrestoredMutation, IncompleteStateRestore)
 fn load_module(dotted_path: Str, file_path: Str, src_root: Str, all_programs: List[Int], imp_node: Int, label: Str) ! Lex.Tokenize, Parse, Diag.Report {
     loaded_inputs.files.push(file_path)
-    note_audit_dir(dotted_path, file_path)
+    note_audit_dir(file_path)
     if trace_mode != "" { trace("parse", "{label} {dotted_path} -> {file_path}") }
     let mut source = ""
     if file_path.starts_with("<embedded:") {
