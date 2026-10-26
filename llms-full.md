@@ -51,7 +51,7 @@ An `@ffi` decl must have an effect row: the Blink effects the foreign code has (
 fn malloc(size: Int) -> Ptr[Int] ! ()
 ```
 
-`@trusted(audit: "ID")` marks an FFI function as audited for safety. The `audit:` text is required: a bare `@trusted` or an empty `audit:` is `E0836`. The text is free-form (a ticket or review ID). `@allow` and `[lints]` cannot name an audit-gated diagnostic (`W0800`, `W0310`); this is `E0837`. Write `@trusted(audit: ...)` on the function instead. A `@trusted` fn, as an `@ffi` fn, may name `Ptr[T]`, or an `@ffi.struct` that holds a `Ptr`, in its signature; elsewhere that is `E0811`.
+`@trusted(audit: K)` marks an FFI function as audited for safety. The `audit:` key is required: a bare `@trusted` or an empty `audit:` is `E0836`. `K` is not free text: it names a record in the package's `audits.toml`, which holds the claim (§9.1). `@allow` and `[lints]` cannot name an audit-gated diagnostic (`W0800`, `W0310`); this is `E0837`. Write `@trusted(audit: ...)` on the function instead. A `@trusted` fn, as an `@ffi` fn, may name `Ptr[T]`, or an `@ffi.struct` that holds a `Ptr`, in its signature; elsewhere that is `E0811`.
 
 ### Ptr[T] Type
 
