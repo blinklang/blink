@@ -32,11 +32,19 @@ archive_h="build/libblink_std.h"
 use_archive=0
 [ -f "$archive_a" ] && [ -f "$archive_h" ] && use_archive=1
 
+# Only a test build keeps test blocks, and it runs them, never main. A file with a main and
+# no test block gets a plain build, as in the corpus.
+# One word or none, left unquoted below: this is sh, which has no arrays.
+test_build=--test-build
+if grep -q 'fn main(' "$f" && ! grep -qE '^test "|^test\.failing\(' "$f"; then
+  test_build=
+fi
+
 # blinkc_ok <source> <c output>
 if [ "$use_archive" = 1 ]; then
-  blinkc_ok() { "$blinkc" --link-archive "$archive_h" "$1" "$2" >/dev/null 2>&1; }
+  blinkc_ok() { "$blinkc" $test_build --link-archive "$archive_h" "$1" "$2" >/dev/null 2>&1; }
 else
-  blinkc_ok() { "$blinkc" "$1" "$2" >/dev/null 2>&1; }
+  blinkc_ok() { "$blinkc" $test_build "$1" "$2" >/dev/null 2>&1; }
 fi
 # A formatted file that no longer compiles is a formatter bug only when the
 # original compiles; otherwise the compiler cannot build this program yet.
@@ -83,18 +91,13 @@ fi
 # keeps its whole stdout.
 #
 # The binary sits in the scratch dir, which has no lib/ beside it, so a test that
-# compiles a program in process finds the prelude through BLINK_ROOT. A file
-# with both test blocks and a main runs its tests, as in the corpus.
-run_args=""
-if grep -qE '^test "|^test\.failing\(' "$f" && grep -q 'fn main(' "$f"; then
-  run_args="--test"
-fi
+# compiles a program in process finds the prelude through BLINK_ROOT.
 # Both runs share one scratch path, emptied between them: a test that prints a
 # path under it must print the same text from the original and the formatted copy.
 scratch=$(mktemp -d "${TMPDIR:-/tmp}/blink-test-XXXXXX")
 outcome() {
   rm -rf "$scratch" && mkdir -m 700 "$scratch"
-  out=$(BLINK_TEST_SCRATCH_DIR="$scratch" BLINK_ROOT="$(pwd)" "$1" $run_args 2>/dev/null)
+  out=$(BLINK_TEST_SCRATCH_DIR="$scratch" BLINK_ROOT="$(pwd)" "$1" 2>/dev/null)
   rc=$?
   out=$(printf '%s\n' "$out" | sed 's/\x1b\[[0-9;]*m//g')
   if printf '%s\n' "$out" | grep -qE '^test .* \.\.\. '; then

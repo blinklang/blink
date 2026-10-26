@@ -122,9 +122,10 @@ variable, `scratch_root()` uses `$TMPDIR/blink-test-<pid>`, unique for each
 test process. `corpus_one.sh` removes its private `TMPDIR` when the file ends.
 A binary that you run by hand leaves its dir; delete it yourself.
 
-The pass rule is the same as `blink test`: build with `--debug`, then run
-the binary. A file with `test` blocks and a `fn main(` runs with `--test`.
-A file with no `test` blocks runs as a program. `blink test tests/` skips
+The pass rule is the same as `blink test`: make a `--debug` test build
+(`blink __test-build`), then run the binary. It runs the tests and never
+main. A file with a `fn main(` and no `test` blocks gets a plain build and
+runs as a program. `blink test tests/` skips
 such files; the corpus does not.
 
 Logs are in `build/corpus/logs/<name>.build.log` and `<name>.run.log`. A

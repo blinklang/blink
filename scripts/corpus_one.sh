@@ -30,9 +30,10 @@
 # Each file gets a TMPDIR of its own, removed when the file's row ends, so the
 # sweep leaves nothing behind and two files never share a scratch directory.
 #
-# Pass rule (same as `blink test` directory mode): build with --debug, then
-# run the binary; a file with test blocks and a `fn main(` runs with --test.
-# A file with no test blocks is a plain program: compile and run main.
+# Pass rule: as in `blink test` directory mode, make a --debug test build, then
+# run the binary, which runs the tests and never main. One exception, which
+# `blink test` does not make: a file with a main and no test blocks is a plain
+# program, so build it and run main.
 # The build runs with the cc corpus.sh makes first on PATH, which drops the -g
 # that --debug passes (see corpus.sh). The run keeps the real PATH, so a test
 # that runs a build of its own gets what a user's `blink build --debug` gets.
@@ -187,6 +188,12 @@ if grep -qE '^test\.failing\(' "$root/$file"; then has_known=1; fi
 
 json_str() { printf '%s' "$1" | jq -Rs .; }
 
+# Only a test build keeps test blocks, and it runs them, never main. A file with a main and
+# no test block gets a plain build. A file with no main gets a test build even when the grep
+# above finds no test block, so a test the grep misses still runs.
+build_cmd=__test-build
+if [ "$has_main" -eq 1 ] && [ "$has_tests" -eq 0 ]; then build_cmd=build; fi
+
 start=$(date +%s.%N)
 status=""
 first_error=""
@@ -205,7 +212,7 @@ timed_out() {
     unset BLINK_ROOT BLINK_BIN
     export BLINK_CACHE_DIR=""
     export PATH="$ccdir:$PATH"
-    timeout -k 10 "$build_timeout" "$blink_bin" build "tests/$base.bl" -o "build/$base" --debug
+    timeout -k 10 "$build_timeout" "$blink_bin" "$build_cmd" "tests/$base.bl" -o "build/$base" --debug
 ) > "$build_log" 2>&1
 build_rc=$?
 # The compiler archive's globals init fn: main calls it, so a binary that
@@ -225,14 +232,12 @@ elif [ "$build_rc" -ne 0 ] || [ ! -x "$work/build/$base" ]; then
     [ -z "$first_error" ] && first_error=$(grep -m1 -v '^[[:space:]]*$' "$build_log" || true)
     [ -z "$first_error" ] && first_error="blink build exited $build_rc with no output"
 else
-    run_args=()
-    if [ "$has_tests" -eq 1 ] && [ "$has_main" -eq 1 ]; then run_args=(--test); fi
     run_start=$(date +%s.%N)
     (
         cd "$work" || exit 2
         unset BLINK_ROOT BLINK_BIN
         export BLINK_CACHE_DIR=""
-        timeout -k 10 "$run_timeout" "./build/$base" "${run_args[@]}"
+        timeout -k 10 "$run_timeout" "./build/$base"
     ) > "$run_log" 2>&1
     run_rc=$?
     if timed_out "$run_rc" "$run_start" "$run_timeout"; then
@@ -257,7 +262,7 @@ if [ "$status" = pass ]; then
             cd "$work" || exit 2
             unset BLINK_ROOT BLINK_BIN
             export BLINK_CACHE_DIR=""
-            timeout -k 10 "$run_timeout" "./build/$base" "${run_args[@]}" --test-json
+            timeout -k 10 "$run_timeout" "./build/$base" --test-json
         ) > "$report" 2>/dev/null
         if [ $? -eq 0 ]; then
             known=$(jq -e '[.results[] | select(.expected_fail == true and .status == "passed")] | length' "$report" 2>/dev/null) || known=null

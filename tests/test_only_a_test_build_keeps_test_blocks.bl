@@ -1,0 +1,257 @@
+// Only the build `blink test` makes keeps test blocks. Every other build, with any option and
+// on every emit path, holds no test body, no name or tag table and no test runner, and a
+// built program gives `--test` to main like any other argument. Every build still
+// type-checks the test blocks it leaves out.
+
+import compile_test_helpers
+
+let FIXTURE: Str = "fn helperonlyfortests(x: Int) -> Int \{ x * 3 }
+
+fn identonlyfortests[T](x: T) -> T \{ x }
+
+fn main() ! IO \{
+    io.println(\"main ran\")
+    if env.args().contains(\"--test\") \{
+        io.println(\"main saw --test\")
+    }
+}
+
+test \"triples a number\" \{
+    assert_eq(helperonlyfortests(2), 6)
+    assert_eq(identonlyfortests(2.5), 2.5)
+}
+
+@tags(\"slow\", \"unit_tag_marker\")
+test \"tagged test name marker\" \{
+    assert_panics \{ panic(\"boom\") }
+}
+"
+
+let NO_TESTS: Str = "fn main() ! IO \{
+    io.println(\"main ran\")
+}
+"
+
+let BROKEN_TEST_BODY: Str = "fn main() ! IO \{
+    io.println(\"main ran\")
+}
+
+test \"has a type error\" \{
+    let n: Int = \"not an int\"
+    assert_eq(n, 1)
+}
+"
+
+fn scratch(tag: Str) -> Str {
+    let dir = "{compile_test_helpers.scratch_root()}/_test_build_{tag}_{getpid()}"
+    shell_exec("rm -rf {dir} && mkdir -p {dir}")
+    write_file("{dir}/test_strip_fixture.bl", FIXTURE)
+    dir
+}
+
+// Each marker is a test-only part: a body or tag table symbol, the name table, the runner
+// entry (static, so only the emitted C names it), the test name string and a tag string.
+fn test_parts_in(text: Str) -> List[Str] {
+    let mut found: List[Str] = []
+    for marker in ["blink_test__", "__blink_tests", "__blink_run_tests", "triples a number", "unit_tag_marker"] {
+        if text.contains(marker) {
+            found.push(marker)
+        }
+    }
+    found
+}
+
+fn assert_c_has_no_tests(c: Str, what: Str) {
+    assert(c.contains("main ran"), "{what}: the emitted C lacks main's body")
+    let parts = test_parts_in(c)
+    assert(parts.len() == 0, "{what}: the emitted C still holds test parts: {parts.join(", ")}")
+    // main's own body names "--test" too, so this looks for the shim's argv check.
+    assert(!c.contains("argv[i], \"--test\""), "{what}: the emitted C still checks argv for --test")
+}
+
+// The binary must hold no test part and not the test runner of the runtime. The functions
+// that only test bodies call are not test parts: a build may keep them, as it keeps any
+// function that nothing calls.
+fn binary_test_parts(bin: Str) -> List[Str] {
+    let r = process_run("sh", ["-c", "nm {bin}; strings -a {bin}"])
+    // Without it, a missing nm or strings would pass every row.
+    assert(r.out.contains("main ran"), "nm and strings saw nothing of {bin}: {r.err_out}")
+    let mut found = test_parts_in(r.out)
+    if r.out.contains("blink_test_run") {
+        found.push("blink_test_run")
+    }
+    found
+}
+
+fn assert_binary_has_no_tests(bin: Str) {
+    let parts = binary_test_parts(bin)
+    assert(parts.len() == 0, "binary {bin} still holds test parts: {parts.join(", ")}")
+    let run = process_run(bin, ["--test"])
+    assert_eq(run.exit_code, 0)
+    assert_eq(run.out.trim(), "main ran\nmain saw --test")
+}
+
+fn build_ok(args: List[Str]) {
+    let b = process_run("build/blink", args)
+    assert(b.exit_code == 0, "blink {args.join(" ")} failed: {b.out}{b.err_out}")
+}
+
+test "plain, --debug and --release builds emit C with no test part and no --test hook" {
+    let dir = scratch("emit")
+    for flag in ["", "--debug", "--release"] {
+        let mut args = ["build", "--emit", "c", "{dir}/test_strip_fixture.bl", "-o", "{dir}/out"]
+        if flag != "" { args.push(flag) }
+        build_ok(args)
+        assert_c_has_no_tests(read_file("{dir}/out.c"), "blink build {flag} --emit c")
+    }
+    shell_exec("rm -rf {dir}")
+}
+
+test "blinkc emits C with no test part unless it is asked for a test build" {
+    let dir = scratch("blinkc")
+    let r = process_run("build/blinkc", ["{dir}/test_strip_fixture.bl", "{dir}/out.c"])
+    assert_eq(r.exit_code, 0)
+    assert_c_has_no_tests(read_file("{dir}/out.c"), "blinkc")
+    let t = process_run("build/blinkc", ["--test-build", "{dir}/test_strip_fixture.bl", "{dir}/test.c"])
+    assert_eq(t.exit_code, 0)
+    let parts = test_parts_in(read_file("{dir}/test.c"))
+    assert_eq(parts.len(), 5)
+    shell_exec("rm -rf {dir}")
+}
+
+test "a per-module-dir emit holds no test part" {
+    let dir = scratch("pmdir")
+    build_ok(["build", "--emit", "per-module-dir", "{dir}/test_strip_fixture.bl", "{dir}/units"])
+    let all = process_run("sh", ["-c", "cat {dir}/units/*.c"])
+    assert_c_has_no_tests(all.out, "--emit per-module-dir")
+    shell_exec("rm -rf {dir}")
+}
+
+test "a plain one-unit binary holds no test part and gives --test to main" {
+    let dir = scratch("plainone")
+    build_ok(["build", "--no-per-module", "{dir}/test_strip_fixture.bl", "-o", "{dir}/bin"])
+    assert_binary_has_no_tests("{dir}/bin")
+    shell_exec("rm -rf {dir}")
+}
+
+test "a plain per-module binary holds no test part and gives --test to main" {
+    let dir = scratch("plainpm")
+    build_ok(["build", "--per-module", "{dir}/test_strip_fixture.bl", "-o", "{dir}/bin"])
+    assert_binary_has_no_tests("{dir}/bin")
+    shell_exec("rm -rf {dir}")
+}
+
+test "a --debug per-module build omits tests" {
+    let dir = scratch("debugpm")
+    build_ok(["build", "--debug", "--per-module", "{dir}/test_strip_fixture.bl", "-o", "{dir}/bin"])
+    assert_binary_has_no_tests("{dir}/bin")
+    shell_exec("rm -rf {dir}")
+}
+
+test "a one-unit release binary holds no test part and gives --test to main" {
+    let dir = scratch("one")
+    build_ok(["build", "--release", "--no-per-module", "{dir}/test_strip_fixture.bl", "-o", "{dir}/bin"])
+    assert_binary_has_no_tests("{dir}/bin")
+    shell_exec("rm -rf {dir}")
+}
+
+test "a per-module release binary holds no test part and gives --test to main" {
+    let dir = scratch("pm")
+    build_ok(["build", "--release", "{dir}/test_strip_fixture.bl", "-o", "{dir}/bin"])
+    assert_binary_has_no_tests("{dir}/bin")
+    shell_exec("rm -rf {dir}")
+}
+
+test "blink run runs main with --test as an argument and runs no test" {
+    let dir = scratch("run")
+    let r = process_run("build/blink", ["run", "{dir}/test_strip_fixture.bl", "--", "--test"])
+    assert_eq(r.exit_code, 0)
+    assert_eq(r.out.trim(), "main ran\nmain saw --test")
+    shell_exec("rm -rf {dir}")
+}
+
+// A per-module build may take the whole emit of the last build to the same output, and the
+// units of a build with the same inputs. Units that hold tests and units that leave them out
+// must never stand in for each other. A release build cuts no unit into chunks; the other
+// builds ask for the same, so each pair differs only in what decides the tests.
+fn build_with_cache(dir: Str, cmd: Str) {
+    let r = process_run("sh", ["-c", "BLINK_UNIT_CHUNK_DECLS=0 BLINK_CACHE_DIR={dir}/cache build/blink {cmd} --per-module {dir}/test_strip_fixture.bl -o {dir}/bin"])
+    assert(r.exit_code == 0, "blink {cmd} failed: {r.out}{r.err_out}")
+}
+
+test "a release build after a test build of the same output reuses no unit that holds tests" {
+    let dir = scratch("reuse")
+    build_with_cache(dir, "__test-build")
+    build_with_cache(dir, "build --release")
+    assert_binary_has_no_tests("{dir}/bin")
+    shell_exec("rm -rf {dir}")
+}
+
+test "a plain build after a test build of the same output reuses no unit that holds tests" {
+    let dir = scratch("plainreuse")
+    build_with_cache(dir, "__test-build")
+    build_with_cache(dir, "build")
+    assert_binary_has_no_tests("{dir}/bin")
+    shell_exec("rm -rf {dir}")
+}
+
+test "a test build after a plain build of the same output runs the tests" {
+    let dir = scratch("testreuse")
+    build_with_cache(dir, "build")
+    build_with_cache(dir, "__test-build")
+    let r = process_run("{dir}/bin", ["--test-json"])
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("\"total\":2,\"passed\":2"), "test build output: {r.out}")
+    assert(!r.out.contains("main ran"), "a test build ran main: {r.out}")
+    shell_exec("rm -rf {dir}")
+}
+
+test "blink test still runs the tests of a directory that every other build strips" {
+    let dir = scratch("keep")
+    let r = process_run("build/blink", ["test", "--json", dir])
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("\"total\":2,\"passed\":2"), "blink test output: {r.out}")
+    assert(r.out.contains("\"tags\":[\"slow\",\"unit_tag_marker\"]"), "blink test lost the tags: {r.out}")
+    assert(!r.out.contains("main ran"), "blink test ran main: {r.out}")
+    shell_exec("rm -rf {dir}")
+}
+
+test "blink test of a single file with fn main runs its tests and not main" {
+    let dir = scratch("single")
+    let r = process_run("sh", ["-c", "cd {dir} && {env.cwd()}/build/blink test --json test_strip_fixture.bl"])
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("\"total\":2,\"passed\":2"), "blink test output: {r.out}")
+    assert(!r.out.contains("main ran"), "blink test ran main: {r.out}")
+    shell_exec("rm -rf {dir}")
+}
+
+test "a test build with no test runs the runner over zero tests and never main" {
+    let dir = scratch("none")
+    write_file("{dir}/no_tests.bl", NO_TESTS)
+    let r = process_run("sh", ["-c", "cd {dir} && {env.cwd()}/build/blink test no_tests.bl"])
+    assert_eq(r.exit_code, 0)
+    assert(r.out.contains("0 passed, 0 failed (of 0)"), "blink test output: {r.out}")
+    assert(!r.out.contains("main ran"), "a test build ran main: {r.out}")
+    let j = process_run("sh", ["-c", "cd {dir} && {env.cwd()}/build/blink test --json no_tests.bl"])
+    assert_eq(j.exit_code, 0)
+    assert(j.out.contains("\"total\":0,\"passed\":0"), "blink test --json output: {j.out}")
+    shell_exec("rm -rf {dir}")
+}
+
+test "a type error in a test body fails every build, run and check" {
+    let dir = scratch("err")
+    write_file("{dir}/broken_test_body.bl", BROKEN_TEST_BODY)
+    for flag in ["", "--debug", "--release"] {
+        let mut args = ["build", "{dir}/broken_test_body.bl", "-o", "{dir}/bin"]
+        if flag != "" { args.push(flag) }
+        let b = process_run("build/blink", args)
+        assert(b.exit_code != 0, "blink build {flag} accepted a type error in a test body")
+    }
+    let r = process_run("build/blink", ["run", "{dir}/broken_test_body.bl"])
+    assert(r.exit_code != 0, "blink run accepted a type error in a test body")
+    assert(!r.out.contains("main ran"), "blink run ran main past a type error in a test body")
+    let c = process_run("build/blink", ["check", "{dir}/broken_test_body.bl"])
+    assert(c.exit_code != 0, "check accepted a type error in a test body")
+    assert(c.out.contains("TypeError") || c.err_out.contains("TypeError"), "check reported no type error: {c.out}{c.err_out}")
+    shell_exec("rm -rf {dir}")
+}

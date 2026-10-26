@@ -574,7 +574,7 @@ fn checked_front_end(b: DaemonBuild, strict_mode: Int) -> Result[Int, Int] ! Dia
 }
 
 fn do_compile(source_path: Str, c_path: Str, format_flag: Str, debug_mode: Int, strict_mode: Int) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit, Codegen {
-    let result = if format_flag == "blink" { format_to_text(source_path) } else { compile_to_text(source_path, debug_mode, strict_mode, 0) }
+    let result = if format_flag == "blink" { format_to_text(source_path) } else { compile_to_text(source_path, debug_mode, strict_mode, false) }
     match result {
         Ok(text) => {
             write_file(c_path, text)
@@ -609,7 +609,7 @@ fn format_to_text(source_path: Str) -> Result[Str, Int] ! Lex.Tokenize, Parse, P
     Ok(format(program))
 }
 
-fn compile_to_text(source_path: Str, debug_mode: Int, strict_mode: Int, strip_tests: Int) -> Result[Str, Int] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit, Codegen {
+fn compile_to_text(source_path: Str, debug_mode: Int, strict_mode: Int, test_build: Bool) -> Result[Str, Int] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit, Codegen {
     let final_program = match compile_front_end(source_path, strict_mode) {
         Ok(p) => p
         Err(rc) => return Err(rc)
@@ -650,7 +650,7 @@ fn compile_to_text(source_path: Str, debug_mode: Int, strict_mode: Int, strip_te
         trace_codegen: cli_trace_codegen, deterministic: cli_deterministic,
         emit_only_module: env.var("BLINK_ONLY_MODULE") ?? "", skip_modules: skip_modules,
         user_tu_mode: 1, blink_ev_extern_only: 0, archive_build_mode: 0, archive_over_std: 0,
-        compiler_archive_modules: layer_modules, strip_tests: strip_tests }
+        compiler_archive_modules: layer_modules, test_build: if test_build { 1 } else { 0 } }
     let c_output = generate(final_program, cfg)
 
     if diag_ice_count > 0 {
@@ -1549,7 +1549,7 @@ let BUILD_STATUS_HUMAN = 0
 let BUILD_STATUS_JSON = 1
 let BUILD_STATUS_NONE = 2
 
-fn do_build(source_path: Str, output_path: Str, c_path: Str, debug_mode: Int, release_mode: Int, emit_mode: Str, targets: List[Str], status_mode: Int, strict_mode: Int, unit_jobs: Int, per_module_flag: Bool, checked: Option[DaemonBuild]) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit, Codegen, IO {
+fn do_build(source_path: Str, output_path: Str, c_path: Str, debug_mode: Int, release_mode: Int, test_build: Bool, emit_mode: Str, targets: List[Str], status_mode: Int, strict_mode: Int, unit_jobs: Int, per_module_flag: Bool, checked: Option[DaemonBuild]) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit, Codegen, IO {
     fs_remove(output_path)
     // Before the compile: it checks a compiler archive against the stdlib archive's
     // stamp, which a rebuild here would change.
@@ -1562,7 +1562,7 @@ fn do_build(source_path: Str, output_path: Str, c_path: Str, debug_mode: Int, re
     if unit_jobs != 0 {
         let reason = per_module_fallback_reason(emit_mode)
         if reason == "" {
-            return do_build_units(source_path, output_path, debug_mode, release_mode, targets, status_mode, strict_mode, unit_jobs, checked)
+            return do_build_units(source_path, output_path, debug_mode, release_mode, test_build, targets, status_mode, strict_mode, unit_jobs, checked)
         }
         // BLINK_PER_MODULE alone sets a default, not a request on this command, so its
         // fallback is silent.
@@ -1583,7 +1583,7 @@ fn do_build(source_path: Str, output_path: Str, c_path: Str, debug_mode: Int, re
     // The link flags come from this text and the compile reads a private copy of it: another
     // build that writes c_path can rewrite it at any time, and a second read of c_path could
     // link the object of one program with the native deps of another.
-    let c_source = match compile_to_text(source_path, debug_mode, strict_mode, strips_tests(release_mode)) {
+    let c_source = match compile_to_text(source_path, debug_mode, strict_mode, test_build) {
         Ok(text) => text
         Err(rc) => return rc
     }
@@ -1850,7 +1850,7 @@ fn units_bail_on_diag() -> Int ! Diag.Report {
 }
 
 // The std modules the archive holds are declared, not compiled, as in the one-unit build.
-fn units_cg_config(debug_mode: Int, strip_tests: Int) -> CgConfig {
+fn units_cg_config(debug_mode: Int, test_build: Bool) -> CgConfig {
     let mut skip: Map[Str, Int] = Map()
     for k in list_stdlib_module_keys() {
         skip.insert(k, 1)
@@ -1859,7 +1859,7 @@ fn units_cg_config(debug_mode: Int, strip_tests: Int) -> CgConfig {
         trace_codegen: cli_trace_codegen, deterministic: cli_deterministic,
         emit_only_module: "", skip_modules: skip,
         user_tu_mode: 1, blink_ev_extern_only: 0, archive_build_mode: 0, archive_over_std: 0,
-        compiler_archive_modules: Map(), strip_tests: strip_tests }
+        compiler_archive_modules: Map(), test_build: if test_build { 1 } else { 0 } }
 }
 
 // The units of a per-module build in its units directory, and what its record needs.
@@ -1896,7 +1896,7 @@ fn emit_reuse_allowed() -> Bool {
 // in last_dir when the emit's inputs are the ones it records.
 // checked is the build the daemon forked this process for, whose checked program it
 // compiles; None in any other process.
-fn do_compile_units(source_path: Str, dir: Str, last_dir: Str, debug_mode: Int, strict_mode: Int, strip_tests: Int, chunk_decls: Int, checked: Option[DaemonBuild]) -> Result[CompiledUnits, Int] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Codegen, IO {
+fn do_compile_units(source_path: Str, dir: Str, last_dir: Str, debug_mode: Int, strict_mode: Int, test_build: Bool, chunk_decls: Int, checked: Option[DaemonBuild]) -> Result[CompiledUnits, Int] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Codegen, IO {
     let front = match checked {
         Some(b) => checked_front_end(b, strict_mode)
         None => {
@@ -1911,7 +1911,7 @@ fn do_compile_units(source_path: Str, dir: Str, last_dir: Str, debug_mode: Int, 
         Ok(p) => p
         Err(rc) => return Err(rc)
     }
-    let cfg = units_cg_config(debug_mode, strip_tests)
+    let cfg = units_cg_config(debug_mode, test_build)
     let modules = enumerate_program_modules(program)
     let erc = units_bail_on_diag()
     if erc != 0 { return Err(erc) }
@@ -2272,13 +2272,6 @@ fn entry_unit_key(program: Int, cfg: CgConfig, facts: ProgramFacts) -> Str ! Dia
     sha256_hex(lines.join("\n"))
 }
 
-// Whether a build leaves its test blocks out. The spec strips them from release builds and
-// keeps them for `blink test`; whether a plain build strips them is still open, so only
-// --release does. Both build paths ask here, so one-unit and per-module output agree.
-fn strips_tests(release_mode: Int) -> Int {
-    if release_mode != 0 { 1 } else { 0 }
-}
-
 // The mean number of decls in each file a large module's unit is cut into, or 0 to cut
 // none: BLINK_UNIT_CHUNK_DECLS, which tests set low so that a small module is cut, or 32. A
 // release build cuts nothing, so cc sees each module whole, to inline across its functions.
@@ -2322,7 +2315,7 @@ fn units_flush_warnings(strict_mode: Int) -> Int ! Diag.Report {
     0
 }
 
-fn do_build_units(source_path: Str, output_path: Str, debug_mode: Int, release_mode: Int, targets: List[Str], status_mode: Int, strict_mode: Int, unit_jobs: Int, checked: Option[DaemonBuild]) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Codegen, IO {
+fn do_build_units(source_path: Str, output_path: Str, debug_mode: Int, release_mode: Int, test_build: Bool, targets: List[Str], status_mode: Int, strict_mode: Int, unit_jobs: Int, checked: Option[DaemonBuild]) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Codegen, IO {
     let mut out_dir = path_dirname(output_path)
     if out_dir == "" {
         out_dir = "."
@@ -2337,7 +2330,7 @@ fn do_build_units(source_path: Str, output_path: Str, debug_mode: Int, release_m
         io.eprintln("error: cannot make a units directory in {out_dir}")
         return 1
     }
-    let compiled = match do_compile_units(source_path, work, units_dir, debug_mode, strict_mode, strips_tests(release_mode), unit_chunk_decls(release_mode), checked) {
+    let compiled = match do_compile_units(source_path, work, units_dir, debug_mode, strict_mode, test_build, unit_chunk_decls(release_mode), checked) {
         Ok(u) => u
         Err(rc) => {
             let _ = build_fs.remove_tree(work)
@@ -4008,12 +4001,13 @@ fn cmd_build(p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
     if build_through_daemon(a, "build") {
         return
     }
-    build_here(p, a, None)
+    build_here(p, a, None, false)
 }
 
 // The build `blink build` runs in its own process, or in a child of the daemon, which passes
-// the build it forked the child for as checked.
-fn build_here(p: ArgParser, a: Args, checked: Option[DaemonBuild]) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit, Codegen, IO {
+// the build it forked the child for as checked. test_build is true only for the build a
+// `blink test` worker asks for through `__test-build`.
+fn build_here(p: ArgParser, a: Args, checked: Option[DaemonBuild], test_build: Bool) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit, Codegen, IO {
     let source_path = args_positional(a, 0)
     let bad_format = build_format_usage_error(a)
     if bad_format != "" {
@@ -4047,6 +4041,11 @@ fn build_here(p: ArgParser, a: Args, checked: Option[DaemonBuild]) ! Lex.Tokeniz
     // documented surface for the per-module emit machinery that the hidden
     // `__emit-per-module` subcommand drives. See docs/build/per-module-o-default.md.
     if emit_flag == "per-module-dir" {
+        // This emit writes no entry unit, so it cannot make a test build.
+        if test_build {
+            io.eprintln("error: --emit per-module-dir cannot make a test build")
+            env.exit(1)
+        }
         let mut pm_out = args_positional(a, 1)
         if pm_out == "" {
             pm_out = args_get(a, "output")
@@ -4092,7 +4091,7 @@ fn build_here(p: ArgParser, a: Args, checked: Option[DaemonBuild]) ! Lex.Tokeniz
     let out_base = strip_extension(path_basename(output_path))
     let c_path = "{out_dir}/{out_base}.c"
     ensure_deps_resolved()
-    let rc = do_build(source_path, output_path, c_path, debug_flag, release_flag, emit_flag, targets, json_output, strict_flag, unit_jobs, args_has(a, "per-module"), checked)
+    let rc = do_build(source_path, output_path, c_path, debug_flag, release_flag, test_build, emit_flag, targets, json_output, strict_flag, unit_jobs, args_has(a, "per-module"), checked)
     if rc == 0 {
         if emit_flag == "c" {
             if json_output != 0 {
@@ -4176,7 +4175,7 @@ fn run_build_here(p: ArgParser, a: Args, checked: Option[DaemonBuild]) -> Str ! 
     }
     cli_deterministic = if args_has(a, "deterministic") { 1 } else { 0 }
     ensure_deps_resolved()
-    let rc = do_build(source_path, output_path, c_path, debug_flag, release_flag, "", targets, json_output, strict_flag, unit_jobs, args_has(a, "per-module"), checked)
+    let rc = do_build(source_path, output_path, c_path, debug_flag, release_flag, false, "", targets, json_output, strict_flag, unit_jobs, args_has(a, "per-module"), checked)
     if rc != 0 {
         if json_output != 0 {
             io.println("\{\"status\":\"error\"}")
@@ -4309,7 +4308,7 @@ fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
             diag_format = 1
         }
         let status_mode = if json_output != 0 { BUILD_STATUS_NONE } else { BUILD_STATUS_HUMAN }
-        let rc = do_build(source_path, output_path, c_path, 1, 0, "", targets, status_mode, 0, unit_jobs, args_has(a, "per-module"), None)
+        let rc = do_build(source_path, output_path, c_path, 1, 0, true, "", targets, status_mode, 0, unit_jobs, args_has(a, "per-module"), None)
         if rc != 0 {
             env.exit(1)
         }
@@ -4409,7 +4408,7 @@ fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
         // out of its output. Only the worker gets the variable: the test binaries that the
         // command runs do not. The absolute path keeps a PATH with no `env` from breaking
         // the command.
-        let mut ba: List[Str] = ["BLINK_MANIFEST_REPORTED=1", blink_bin, "build", tf, "-o", tf_out, "--debug"]
+        let mut ba: List[Str] = ["BLINK_MANIFEST_REPORTED=1", blink_bin, "__test-build", tf, "-o", tf_out, "--debug"]
         // Without --jobs the child reads BLINK_JOBS itself, and without a path flag it reads
         // BLINK_PER_MODULE, from the same environment.
         if args_has(a, "per-module") {
@@ -4425,11 +4424,7 @@ fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
         }
         build_args.push(ba)
 
-        let source = read_file(tf)
         let mut ra: List[Str] = []
-        if source.contains("fn main(") {
-            ra.push("--test")
-        }
         if filter_pattern != "" {
             ra.push("--test-filter")
             ra.push(filter_pattern)
@@ -5129,7 +5124,7 @@ fn build_in_daemon_child(b: DaemonBuild) ! Lex.Tokenize, Parse, Parse.Build, Dia
         env.exit(0)
     }
     if command == "build" {
-        build_here(p, a, Some(b))
+        build_here(p, a, Some(b), false)
     } else {
         let _ = run_build_here(p, a, Some(b))
     }
@@ -6399,6 +6394,29 @@ fn main() {
             hi = hi + 1
         }
         cmd_emit_per_module(hidden_args)
+        return
+    }
+
+    // The build a `blink test` worker makes: `blink build` with the same arguments, but a test
+    // build. It is not a public flag, since no command but `blink test` makes a test build.
+    if arg_count() >= 2 && get_arg(1) == "__test-build" {
+        let mut build_argv: List[Str] = [get_arg(0), "build"]
+        let mut hi = 2
+        while hi < arg_count() {
+            build_argv.push(get_arg(hi))
+            hi = hi + 1
+        }
+        let p = cli_parser()
+        let a = parse_argv(p, build_argv)
+        let err = args_error(a)
+        if err == "help" || err == "version" {
+            return
+        }
+        if err != "" {
+            io.eprintln("error: {err}")
+            env.exit(1)
+        }
+        build_here(p, a, None, true)
         return
     }
 

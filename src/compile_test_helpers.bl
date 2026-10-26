@@ -1,4 +1,4 @@
-import std.path.{path_join}
+import std.path.{path_join, path_basename}
 
 fn resolve_blink_root() -> Str {
     env.var("BLINK_ROOT") ?? ""
@@ -482,10 +482,21 @@ pub fn has_poly_impl_fn_instance(c: Str, base: Str) -> Int {
 // to inspect what codegen produced for a given construct without running
 // the compiled binary.
 pub fn compile_and_emit_c(src: Str, tag: Str) -> Str {
+    emit_c_with(src, tag, [])
+}
+
+// The same for the build `blink test` makes, the only build that writes the test bodies.
+pub fn compile_and_emit_test_c(src: Str, tag: Str) -> Str {
+    emit_c_with(src, tag, ["--test-build"])
+}
+
+fn emit_c_with(src: Str, tag: Str, flags: List[Str]) -> Str {
     let bl_path = "{scratch_root()}/{tag}.bl"
     let c_path = "{scratch_root()}/{tag}.c"
     write_file(bl_path, src)
-    let args = [bl_path, c_path]
+    let mut args = flags
+    args.push(bl_path)
+    args.push(c_path)
     let _result = process_run(blinkc_path(), args)
     let c_src = read_file(c_path)
     fs_remove(bl_path)
@@ -555,7 +566,7 @@ pub fn compile_and_run_test_json_opt(src: Str, tag: Str, opt: Str) -> RunResult 
     let bin_path = "{scratch_root()}/{tag}_bin"
     write_file(bl_path, src)
     let arc_dir = archive_dir()
-    let cargs = ["--link-archive", path_join(arc_dir, "libblink_std.h"), bl_path, c_path]
+    let cargs = ["--test-build", "--link-archive", path_join(arc_dir, "libblink_std.h"), bl_path, c_path]
     let cresult = process_run(blinkc_path(), cargs)
     if cresult.exit_code != 0 {
         fs_remove(bl_path)
@@ -590,6 +601,20 @@ pub fn run_via_cli(src: Str, tag: Str, flag: Str) -> RunResult {
     let result = process_run("build/blink", args)
     fs_remove(path)
     RunResult { exit_code: result.exit_code, out: result.out, err_out: result.err_out }
+}
+
+// The binary of a plain build of the test file at `path`, which runs its main. A test that runs
+// its own program as a child needs this build: the binary of a test build runs the tests and
+// never main, so it would only run the tests again. Built once per process.
+pub fn main_binary_of(path: Str) -> Str {
+    let out = "{scratch_root()}/_main_of_{path_basename(path)}"
+    if file_exists(out) == 1 { return out }
+    let r = process_run("build/blink", ["build", path, "-o", out])
+    if r.exit_code != 0 || file_exists(out) == 0 {
+        io.println("FAIL: the plain build of {path} exited {r.exit_code}\n{r.out}{r.err_out}")
+    }
+    assert(r.exit_code == 0 && file_exists(out) == 1)
+    out
 }
 
 // The emitted C for `src` as the real CLI produces it. `blink build --emit c` writes

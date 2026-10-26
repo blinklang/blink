@@ -108,9 +108,10 @@ pub type CgConfig {
     // it: the unit reads that archive's header and runs its globals init. Empty when the
     // unit links no such archive.
     compiler_archive_modules: Map[Str, Int]
-    // Leave out every test body, the test name and tag tables, and the `--test` hook: the
-    // spec strips tests from release builds. The front end still checks every test body.
-    strip_tests: Int = 0
+    // 1 for the build `blink test` makes, the only build that keeps the test bodies, the
+    // test name and tag tables and the runner, and whose shim runs the runner, never main.
+    // Every other build leaves them out. The front end checks every test body either way.
+    test_build: Int = 0
 }
 
 
@@ -809,7 +810,6 @@ fn key_tables_in_scope(cfg: CgConfig, module_key: Str, key_table_nodes: List[Int
 // and the expected-failure reasons are quoted here, where the one producer of a C literal
 // is in scope.
 fn emit_test_bodies(tests: List[Int]) ! Diag.Report {
-    if tests.len() == 0 { return }
     set_current_inst(-1)
     let mut name_lits: List[Str] = []
     let mut symbols: List[Str] = []
@@ -867,25 +867,25 @@ fn tag_arg_is_positional(arg: Int) -> Bool {
     !node_name(arg).contains(":")
 }
 
-// The entry of a whole program: the test bodies and their table, then the shim that calls
-// the runner. One list answers both what is written and whether the shim calls it, because
-// a shim that calls a runner the unit did not write is a name the linker cannot resolve.
+// The entry of a whole program: in a test build the test bodies and their table, then the
+// shim that calls the runner or main. cfg.test_build answers both what is written and whether
+// the shim calls the runner, because a shim that calls a runner the unit did not write is a
+// name the linker cannot resolve.
 // `init_fns` is every deferred-init function the shim must call before test or main
 // dispatch, in the order it must call them: one name for a single-unit build (built by
 // the caller from its own deferred list), or one name per module that needed one, in
 // module order, under the per-module mode.
 fn emit_entry(cfg: CgConfig, init_fns: List[Str]) ! Diag.Report {
-    let tests = entry_tests(cfg)
-    emit_test_bodies(tests)
-    print_main_shim(cg_reg_has_main(), tests.len() > 0, program_spawns(),
+    if cfg.test_build != 0 { emit_test_bodies(entry_tests(cfg)) }
+    print_main_shim(cg_reg_has_main(), cfg.test_build != 0, program_spawns(),
         cfg.trace_codegen != 0, cfg.deterministic, archive_init_fns(cfg).append(init_fns))
 }
 
 // The test blocks the entry unit writes. Every reader of the entry unit's tests goes
-// through here, so the bodies, the tables, the `--test` hook and the entry unit's reuse
-// key all agree on whether the build keeps them.
+// through here, so the bodies, the tables, the shim and the entry unit's reuse key all
+// agree on whether the build keeps them.
 fn entry_tests(cfg: CgConfig) -> List[Int] {
-    if cfg.strip_tests != 0 { return [] }
+    if cfg.test_build == 0 { return [] }
     cg_reg_test_decls()
 }
 
@@ -1442,12 +1442,12 @@ fn module_init_fn_names(cfg: CgConfig) -> List[Str] ! Diag.Report {
 }
 
 // The facts the entry unit's text reads that no source span carries, one per line: whether
-// a main and a spawn exist, each test's C symbol and name, and the name of each key table, in
-// the order the unit writes them. The caller adds the init names. A build takes the entry unit
-// only when these are the last build's.
+// a main and a spawn exist, whether it is a test build, each test's C symbol and name, and
+// the name of each key table, in the order the unit writes them. The caller adds the init
+// names. A build takes the entry unit only when these are the last build's.
 pub fn entry_unit_facts(program: Int, cfg: CgConfig, facts: ProgramFacts) -> List[Str] ! Diag.Report {
     begin_unit(program)
-    let mut out = ["main {cg_reg_has_main()}", "spawns {program_spawns()}"]
+    let mut out = ["main {cg_reg_has_main()}", "spawns {program_spawns()}", "test_build {cfg.test_build}"]
     for t in entry_tests(cfg) {
         let name = node_str_val(t)
         out.push("test {c_test_fn_name(t)} {name.byte_len()} {name}")

@@ -35,6 +35,8 @@ if [ "$3" = "--emit" ]; then
     { echo "// formatted"; sed 's/SELFTEST_FMT_BREAKS_RUN/SELFTEST_FAILS/' "$1"; } > "$2"
     exit 0
 fi
+test_build=0
+[ "$1" = "--test-build" ] && { test_build=1; shift; }
 [ "$1" = "--link-archive" ] && shift 2
 src="$1"; out="$2"
 {
@@ -50,8 +52,9 @@ src="$1"; out="$2"
         echo '    snprintf(p, sizeof p, "%s/lib/std", r);'
         echo '    if (access(p, F_OK) != 0) { printf("test probe ... FAIL\n\n0 passed, 1 failed (of 1)\n"); return 1; }'
     fi
-    if grep -q SELFTEST_MAIN_AND_TESTS "$src"; then
-        echo '    if (argc < 2 || strcmp(argv[1], "--test") != 0) { printf("main ran\n"); return 0; }'
+    # Only a test build runs the tests; any other build of a file with a main runs main.
+    if grep -q SELFTEST_MAIN_AND_TESTS "$src" && [ "$test_build" = 0 ]; then
+        echo '    printf("main ran\n"); return 0;'
     fi
     # A test that pins its own file name, as a panic location match does, fails
     # unless the source it was built from keeps that name.
