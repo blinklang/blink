@@ -33,7 +33,7 @@ import diagnostics.{
     UNSOLVED_TYPEVAR_AT_CODEGEN, SEALED_OPS_REWRITE_INVARIANT,
     NO_SUCH_VARIANT, TYPE_ERROR, TEMPLATE_MISMATCH, UNEXPECTED_ANNOTATION, MISSING_RETURN, NO_CONVERSION_IMPL, CANNOT_INFER_TYPE, NOT_ITERABLE, MISSING_ELSE, UNLICENSED_SELF_OP, TRAIT_BOUND_NOT_SATISFIED, CAPABILITY_BUDGET, QM_INVALID_OPERAND, UNDEFINED_FUNCTION,
     UNRESOLVED_METHOD, AMBIGUOUS_METHOD_CALL, MISSING_DISPLAY_IMPL,
-    MUTATION_REQUIRES_MUT, MUT_ON_PATTERN, NOT_A_PLACE, PARAM_ASSIGN, diag_error_label_at_notes, diag_error_span_label_at_notes, diag_warn_label_at_notes, EMPTY_ROW_OUTSIDE_FFI, EFFECTS_ANNOTATION_REMOVED, diag_fix_before_starts_with, diag_drop_fix_over_others,
+    MUTATION_REQUIRES_MUT, MUT_ON_PATTERN, NOT_A_PLACE, PARAM_ASSIGN, diag_error_label_at_notes, diag_error_span_label_at_notes, diag_warn_label_at_notes, EMPTY_ROW_OUTSIDE_FFI, EFFECTS_ANNOTATION_REMOVED, UNKNOWN_EFFECT, diag_fix_before_starts_with, diag_drop_fix_over_others,
     UNDEFINED_VARIABLE, UNKNOWN_TYPE, QM_RESULT_IN_NON_RESULT,
     QM_OPTION_IN_NON_OPTION, QM_ERROR_MISMATCH,
     QM_TEST_DISPLAY_REQUIRED, TEST_ANNOTATED_RETURN, SKIP_OUTSIDE_TEST,
@@ -20674,6 +20674,7 @@ fn nr_check_trait_method_defaults(traits_sl: Int) ! TypeCheck.Resolve, TypeCheck
             let mut j = 0
             while j < sublist_length(methods_sl) {
                 let m = sublist_get(methods_sl, j)
+                nr_check_effect_row(m)
                 let params_sl = node_params(m)
                 if params_sl != -1 {
                     let mut d = 0
@@ -20783,6 +20784,7 @@ fn nr_check_fn_as_current(fn_node: Int) ! TypeCheck.Resolve, TypeCheck.Report, D
 }
 
 fn nr_check_fn_scope(fn_node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    nr_check_effect_row(fn_node)
     nr_push_scope()
     // Bind this fn's own type params so a single-letter annotation resolves as a
     // declared type variable rather than an unknown type. Enclosing impl binders
@@ -21035,6 +21037,153 @@ fn nr_check_qualified_type_ref(name: Str, qualifier: Str, member: Str, at: Int) 
         return
     }
     tc_mark_symbol_used(member)
+}
+
+// The built-in effect tree of §4.3: the sub-effects `root` declares, [] for a leaf, or None
+// when `root` is no built-in effect.
+fn builtin_effect_children(root: Str) -> Option[List[Str]] {
+    match root {
+        "FS" => Some(["Read", "Write", "Delete", "Watch"])
+        "Net" => Some(["Connect", "Listen", "DNS"])
+        "DB" => Some(["Read", "Write"])
+        "IO" => Some(["Print", "Log", "Read"])
+        "Env" => Some(["Read", "Write", "Exit"])
+        "Time" => Some(["Read", "Sleep"])
+        "Rand" => Some([])
+        "Crypto" => Some(["Hash", "Sign", "Encrypt", "Decrypt"])
+        "Process" => Some(["Spawn", "Signal"])
+        "State" => Some([])
+        "Async" => Some([])
+        _ => None
+    }
+}
+
+// Every name in the effect row of `fn_node` must name an effect (§4.3): a built-in one, `Arena`
+// (§5.2), or one the program declares (§4.12).
+fn nr_check_effect_row(fn_node: Int) ! TypeCheck.Resolve, Diag.Report {
+    let row = node_effects(fn_node)
+    if row == -1 { return }
+    let mut i = 0
+    while i < sublist_length(row) {
+        let at = sublist_get(row, i)
+        if node_kind(at) == NodeKind.Ident { nr_check_effect_name(node_name(at), at) }
+        i = i + 1
+    }
+}
+
+fn nr_check_effect_name(name: Str, at: Int) ! TypeCheck.Resolve, Diag.Report {
+    // An empty name already has its parse error. `FFI` stays known while `@ffi` decls move to
+    // `! ()`.
+    if name == "" || name == "_" || name == "Arena" || name == "FFI" { return }
+    match name.byte_index_of(".", 0) {
+        Some(dot) => nr_check_dotted_effect_name(name, name.byte_slice(0, dot), name.byte_slice(dot + 1, name.byte_len()), at)
+        None => {
+            if builtin_effect_children(name).is_some() || tc_effect_decl_named(name) != -1 { return }
+            let other = nr_decls_by_name.get(name) ?? []
+            if other.len() > 0 {
+                nr_unknown_effect(at, node_col(at), "`{name}` is not an effect", "`{name}` is {nr_decl_kind_phrase(other.get(0).unwrap())}; an effect was expected", "", [])
+                return
+            }
+            nr_unknown_effect(at, node_col(at), "unknown effect `{name}`", "no effect named `{name}`", "", [])
+        }
+    }
+}
+
+// The first part of a dotted name is a module when an import qualifier in scope has that
+// spelling, and the parent effect when none does (§4.3).
+fn nr_check_dotted_effect_name(name: Str, head: Str, tail: Str, at: Int) ! TypeCheck.Resolve, Diag.Report {
+    let target = nr_qualifier_module_here(head)
+    if target != "" {
+        tc_mark_qualifier_used(head)
+        let decl = nr_effect_decl_in_module(target, tail, 0)
+        if decl == -1 {
+            let other = nr_resolve_decl_in_module(target, tail, 0)
+            if other != -1 {
+                nr_unknown_effect(at, node_col(at), "`{name}` is not an effect", "`{tail}` is {nr_decl_kind_phrase(other)}; an effect was expected", "", [])
+                return
+            }
+            nr_unknown_effect(at, node_col(at), "module `{head}` does not export an effect `{tail}`", "no effect `{tail}` in `{head}`", "", [])
+            return
+        }
+        if node_module(decl) != nr_current_module && node_is_pub(decl) == 0 {
+            nr_unknown_effect(at, node_col(at), "module `{head}` does not export an effect `{tail}`", "`{tail}` is private to `{head}`", "mark the effect as `pub` in its module", [])
+        }
+        return
+    }
+    match builtin_effect_children(head) {
+        Some(kids) => {
+            if kids.contains(tail) { return }
+            nr_unknown_sub_effect(name, head, tail, kids.len() == 0, at)
+            return
+        }
+        None => {}
+    }
+    let decl = tc_effect_decl_named(head)
+    if decl != -1 {
+        let kids = node_elements(decl)
+        let mut k = 0
+        while kids != -1 && k < sublist_length(kids) {
+            if node_name(sublist_get(kids, k)) == tail { return }
+            k = k + 1
+        }
+        nr_unknown_sub_effect(name, head, tail, kids == -1 || sublist_length(kids) == 0, at)
+        return
+    }
+    let caret_end = node_col(at) + head.byte_len()
+    let help = nr_missing_import_help(head)
+    tc_errors.push("unknown module `{head}` in effect `{name}`")
+    diag_error_span_label_at_notes("UnknownEffect", UNKNOWN_EFFECT, "unknown module `{head}` in effect `{name}`", at, node_line(at), node_col(at), caret_end, "no module `{head}` is imported; an effect was expected", help, [])
+}
+
+// A leaf has no sub-effects, so a name after its dot is most often one of its operations
+// (§4.12): the report lists them and names the whole effect.
+fn nr_unknown_sub_effect(name: Str, parent: Str, tail: Str, parent_is_leaf: Bool, at: Int) ! Diag.Report {
+    let label = "`{parent}` has no sub-effect `{tail}`"
+    if !parent_is_leaf {
+        nr_unknown_effect(at, node_col(at), "unknown effect `{name}`", label, "", [])
+        return
+    }
+    let ops = tc_handler_op_names(parent)
+    let note = if ops.len() == 0 { "`{parent}` is a leaf effect" } else { "`{parent}` is a leaf effect; its operations are {nr_backtick_list(ops)}" }
+    nr_unknown_effect(at, node_col(at), "unknown effect `{name}`", label, "write `! {parent}`", [note])
+}
+
+fn nr_unknown_effect(at: Int, col: Int, message: Str, label: Str, help: Str, notes: List[Str]) ! Diag.Report {
+    tc_errors.push(message)
+    diag_error_span_label_at_notes("UnknownEffect", UNKNOWN_EFFECT, message, at, node_line(at), col, node_end_col(at), label, help, notes)
+}
+
+// `a`, `a` and `b`, or `a`, `b` and `c`.
+fn nr_backtick_list(names: List[Str]) -> Str {
+    let mut quoted: List[Str] = []
+    for n in names { quoted.push("`{n}`") }
+    if quoted.len() == 1 { return quoted.get(0).unwrap() }
+    let last = quoted.pop().unwrap()
+    "{quoted.join(", ")} and {last}"
+}
+
+// The effect `member` names inside `target`, following any `pub import` that re-exports it.
+fn nr_effect_decl_in_module(target: Str, member: Str, depth: Int) -> Int {
+    for h in tc_ue_handles {
+        if node_name(h.decl) == member && node_module(h.decl) == target { return h.decl }
+    }
+    if depth >= 8 { return -1 }
+    for src in nr_reexport_sources(target, member) {
+        let hit = nr_effect_decl_in_module(src, member, depth + 1)
+        if hit != -1 { return hit }
+    }
+    -1
+}
+
+// What a module-scope declaration is, with its article, for a report that wanted an effect.
+fn nr_decl_kind_phrase(decl: Int) -> Str {
+    match node_kind(decl) {
+        NodeKind.TypeDef => "a type"
+        NodeKind.TypeVariant => "a variant"
+        NodeKind.TraitDef => "a trait"
+        NodeKind.FnDef => "a function"
+        _ => "a value"
+    }
 }
 
 fn nr_error(name: Str, code: Str, message: Str, at: Int, help: Str) ! Diag.Report {

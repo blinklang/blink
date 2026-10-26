@@ -1,0 +1,139 @@
+// Every name in an effect row must name an effect (§4.3 "An effect name must exist"): a
+// built-in one, `Arena` (§5.2), or one the program declares (§4.12). Any other name is
+// `UnknownEffect` (E0538) at the name, and the message says which part failed: the module
+// qualifier, the member of the module, or the sub-effect of the parent. A row names effects,
+// not operations: after a leaf effect the report lists the leaf's operations (§4.12).
+
+import std.fs
+import std.process.{ProcessResult}
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_reset, diag_explain, UNKNOWN_EFFECT}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+
+fn sh(cmd: Str) -> ProcessResult {
+    process_run("sh", ["-c", cmd])
+}
+
+// A package of the given files, each `name=source`, checked from src/main.bl.
+fn package_probe(files: List[(Str, Str)]) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Process.Spawn {
+    init_embedded_stdlib()
+    let dir = sh("mktemp -d /tmp/blink_unknown_effect.XXXXXX").out.trim()
+    let _ = sh("mkdir -p {dir}/src")
+    write_file("{dir}/blink.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\n")
+    for f in files {
+        write_file("{dir}/src/{f.0}.bl", f.1)
+    }
+    let main_path = "{dir}/src/main.bl"
+    diag_reset()
+    let program = compile_to_program(main_path, 1)
+    check_types(program)
+    let got = errors_in(main_path)
+    let _ = sh("rm -rf {dir}")
+    got
+}
+
+fn probe(src: Str) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Process.Spawn {
+    package_probe([("main", src)])
+}
+
+// The errors in the probe file, one per line: code, name, line:col-end_col, message, label-free
+// help, and each note.
+fn errors_in(path: Str) -> Str {
+    let mut out = ""
+    for d in diag_entries {
+        if d.severity == "error" && d.file == path {
+            let fix = if d.fix_action != "" { " fix" } else { "" }
+            out = out.concat("{d.code} {d.name} {d.line}:{d.col}-{d.end_col}: {d.message} | help: {d.help}{fix}")
+            for n in d.notes { out = out.concat(" | note: {n}") }
+            out = out.concat("\n")
+        }
+    }
+    out
+}
+
+let LOG_LIB: Str = "pub effect Log \{\n    effect Write \{\n        fn log(msg: Str)\n    }\n}\n\neffect Hidden \{\n    effect Sub \{\n        fn h()\n    }\n}\n\npub type Pt \{ x: Int }\n"
+
+// The list gets its own let: a let-initializer call types a tuple that holds a name as `<?>`.
+fn lib_probe(main_src: Str) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Process.Spawn {
+    let files = [("lib", LOG_LIB), ("main", main_src)]
+    package_probe(files)
+}
+
+test "a bare name that names no effect is E0538 at the name" {
+    let got = probe("fn f() ! Nope \{ }\n\nfn main() \{ }\n")
+    assert_eq(got, "E0538 UnknownEffect 1:10-14: unknown effect `Nope` | help: \n")
+}
+
+test "a sub-effect the built-in parent does not declare is E0538" {
+    let got = probe("fn f() ! IO.Nope \{ }\n\nfn main() \{ }\n")
+    assert_eq(got, "E0538 UnknownEffect 1:10-17: unknown effect `IO.Nope` | help: \n")
+}
+
+test "a qualifier no import binds is E0538 at the qualifier" {
+    let got = probe("fn f() ! nosuch.Log \{ }\n\nfn main() \{ }\n")
+    assert_eq(got, "E0538 UnknownEffect 1:10-16: unknown module `nosuch` in effect `nosuch.Log` | help: \n")
+}
+
+test "a member the imported module does not declare is E0538" {
+    let got = lib_probe("import lib\n\nfn f() ! lib.Nope \{ }\n\nfn main() \{ }\n")
+    assert_eq(got, "E0538 UnknownEffect 3:10-18: module `lib` does not export an effect `Nope` | help: \n")
+}
+
+test "a qualified name that is a type and not an effect is E0538" {
+    let got = lib_probe("import lib\n\nfn f() ! lib.Pt \{ }\n\nfn main() \{ }\n")
+    assert_eq(got, "E0538 UnknownEffect 3:10-16: `lib.Pt` is not an effect | help: \n")
+}
+
+test "an effect the imported module does not make pub is E0538" {
+    let got = lib_probe("import lib\n\nfn f() ! lib.Hidden \{ }\n\nfn main() \{ }\n")
+    assert_eq(got, "E0538 UnknownEffect 3:10-20: module `lib` does not export an effect `Hidden` | help: mark the effect as `pub` in its module\n")
+}
+
+test "a bare name that is a type and not an effect is E0538" {
+    let got = probe("type Pt \{ x: Int }\n\nfn f() ! Pt \{ }\n\nfn main() \{ }\n")
+    assert_eq(got, "E0538 UnknownEffect 3:10-12: `Pt` is not an effect | help: \n")
+}
+
+test "an unknown name in a method row and in a trait method row is E0538" {
+    let src = "type Pt \{ x: Int }\n\ntrait Show \{\n    fn show(self) ! Nope1\n}\n\nimpl Pt \{\n    fn get(self) -> Int ! Nope2 \{ self.x }\n}\n\nfn main() \{ }\n"
+    let got = probe(src)
+    assert(got.contains("E0538 UnknownEffect 4:21-26: unknown effect `Nope1`"), "trait method row, got: {got}")
+    assert(got.contains("E0538 UnknownEffect 8:27-32: unknown effect `Nope2`"), "impl method row, got: {got}")
+}
+
+test "an unknown name in a handler clause row is E0538" {
+    let got = probe("fn main() \{\n    with handler IO.Log \{\n        fn log(_msg: Str) ! Nope \{ }\n    } \{\n        io.log(\"x\")\n    }\n}\n")
+    assert_eq(got, "E0538 UnknownEffect 3:29-33: unknown effect `Nope` | help: \n")
+}
+
+test "an operation of a leaf effect written as a sub-effect names the whole effect" {
+    let got = probe("fn f() -> Int ! Rand.int \{ 0 }\n\nfn main() \{ }\n")
+    assert_eq(got, "E0538 UnknownEffect 1:17-25: unknown effect `Rand.int` | help: write `! Rand` | note: `Rand` is a leaf effect\n")
+}
+
+test "a missing sub-effect of a declared effect is E0538" {
+    let src = "effect Store \{\n    effect Read \{\n        fn get(k: Str) -> Int\n    }\n}\n\nfn f() -> Int ! Store.get \{ 0 }\n\nfn main() \{ }\n"
+    let got = probe(src)
+    assert_eq(got, "E0538 UnknownEffect 7:17-26: unknown effect `Store.get` | help: \n")
+}
+
+test "built-in, Arena, declared, imported and sub-effect names check" {
+    let main_src = "import lib\n\neffect Store \{\n    effect Read \{\n        fn get(k: Str) -> Int\n    }\n}\n\nfn a() ! IO, FS.Read, Net.DNS, Rand, State, Async, Time.Sleep \{ }\nfn b() ! Arena \{ }\nfn c() ! Store, Store.Read \{ }\nfn d() ! lib.Log \{ }\n\nfn main() \{ }\n"
+    let got = lib_probe(main_src)
+    assert(!got.contains("E0538"), "every name here is an effect, got: {got}")
+}
+
+test "FFI is still a known row name" {
+    let got = probe("fn f() ! FFI \{ }\n\nfn main() \{ }\n")
+    assert(!got.contains("E0538"), "got: {got}")
+}
+
+test "the E0538 explainer names the diagnostic and each cause" {
+    let e = diag_explain(UNKNOWN_EFFECT)
+    assert(e.starts_with("E0538 -- UnknownEffect"), "got: {e}")
+    assert(e.contains("nosuch.Log"), "unknown qualifier, got: {e}")
+    assert(e.contains("lib.Nope"), "unexported member, got: {e}")
+    assert(e.contains("lib.Pt"), "not an effect, got: {e}")
+    assert(e.contains("Rand.int"), "leaf operation, got: {e}")
+}
