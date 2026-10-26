@@ -2,7 +2,7 @@
 // (§9.1 *Audit Records*). The parser returns each record by K, and each other key as an issue
 // spanned on that key, which the loader reports as AuditRecordUnknownKey (E0830).
 
-import audit_records.{audit_records_parse, audit_record_find, AuditRecords}
+import audit_records.{audit_records_parse, AuditRecords}
 
 let CLEAN: Str = "# audits.toml\n[DB-003]\nclaim = \"Checked against sqlite3.h 3.45.\"\npins = \{ \"db.sqlite.sqlite3_open\" = \"ast1:3f9c0a4e1b7d\" \}\n\n[RPT-002]\nclaim = \"table is checked before Raw().\"\npins = \{ \"report.fetch_table\" = \"ast1:c08e51aa2d90\" \}\n"
 
@@ -10,16 +10,16 @@ test "a record with only claim and pins loads clean, and a quoted dotted pin pat
     let recs = audit_records_parse(CLEAN)
     assert_eq(recs.issues.len(), 0)
     assert_eq(recs.records.len(), 2)
-    let r = audit_record_find(recs, "DB-003").unwrap()
+    let r = recs.records.get("DB-003").unwrap()
     assert_eq(r.claim, "Checked against sqlite3.h 3.45.")
     assert_eq(r.pins.len(), 1)
     assert_eq(r.pins.get("db.sqlite.sqlite3_open") ?? "", "ast1:3f9c0a4e1b7d")
-    assert_eq(audit_record_find(recs, "RPT-002").unwrap().pins.get("report.fetch_table") ?? "", "ast1:c08e51aa2d90")
+    assert_eq(recs.records.get("RPT-002").unwrap().pins.get("report.fetch_table") ?? "", "ast1:c08e51aa2d90")
 }
 
 test "a K with no record finds nothing" {
-    assert(audit_record_find(audit_records_parse(CLEAN), "DB-004").is_none())
-    assert(audit_record_find(audit_records_parse(""), "DB-003").is_none())
+    assert(audit_records_parse(CLEAN).records.get("DB-004").is_none())
+    assert(audit_records_parse("").records.get("DB-003").is_none())
 }
 
 test "an unknown key is an issue at its own line and column" {
@@ -59,13 +59,13 @@ test "the issues of several records come in file order" {
     assert_eq(recs.issues.get(0).unwrap().key, "zz")
     assert_eq(recs.issues.get(1).unwrap().record, "B")
     assert_eq(recs.issues.get(1).unwrap().key, "aa")
-    assert_eq(audit_record_find(recs, "B").unwrap().claim, "d")
+    assert_eq(recs.records.get("B").unwrap().claim, "d")
 }
 
 test "a [K.pins] table gives the same pins as an inline pins table" {
     let recs = audit_records_parse("[DB-003]\nclaim = \"c\"\n[DB-003.pins]\n\"db.sqlite.sqlite3_open\" = \"ast1:3f9c0a4e1b7d\"\n")
     assert_eq(recs.issues.len(), 0)
-    let r = audit_record_find(recs, "DB-003").unwrap()
+    let r = recs.records.get("DB-003").unwrap()
     assert_eq(r.claim, "c")
     assert_eq(r.pins.len(), 1)
     assert_eq(r.pins.get("db.sqlite.sqlite3_open") ?? "", "ast1:3f9c0a4e1b7d")
@@ -80,7 +80,7 @@ test "a bare dotted header is an unknown key of its first record, at the header"
     assert_eq(issue.span.line, 3)
     assert_eq(issue.span.col, 1)
     assert_eq(issue.span.end_col, 6)
-    assert(audit_record_find(recs, "a.b").is_none())
+    assert(recs.records.get("a.b").is_none())
 }
 
 test "a bare dotted header alone still names its unknown key" {
@@ -93,12 +93,82 @@ test "a bare dotted header alone still names its unknown key" {
 test "a quoted dotted header is one record" {
     let recs = audit_records_parse("[\"a.b\"]\nclaim = \"c\"\n")
     assert_eq(recs.issues.len(), 0)
-    assert_eq(audit_record_find(recs, "a.b").unwrap().claim, "c")
-    assert(audit_record_find(recs, "a").is_none())
+    assert_eq(recs.records.get("a.b").unwrap().claim, "c")
+    assert(recs.records.get("a").is_none())
 }
 
 test "a pins list holds no pin" {
     let recs = audit_records_parse("[K]\nclaim = \"c\"\npins = [\"x\"]\n")
     assert_eq(recs.issues.len(), 0)
-    assert_eq(audit_record_find(recs, "K").unwrap().pins.len(), 0)
+    assert_eq(recs.records.get("K").unwrap().pins.len(), 0)
+}
+
+test "an array of tables inside a record is an unknown key at its header, and the record stays" {
+    let recs = audit_records_parse("[A]\nclaim = \"x\"\nreviewer = \"bob\"\n\n[[A.tickets]]\nid = 1\n")
+    assert_eq(recs.issues.len(), 2)
+    assert_eq(recs.issues.get(0).unwrap().key, "reviewer")
+    assert_eq(recs.issues.get(0).unwrap().span.line, 3)
+    let tickets = recs.issues.get(1).unwrap()
+    assert_eq(tickets.record, "A")
+    assert_eq(tickets.key, "tickets")
+    assert_eq(tickets.span.line, 5)
+    assert_eq(tickets.span.col, 1)
+    assert_eq(recs.records.get("A").unwrap().claim, "x")
+}
+
+test "an array of tables under pins holds no pin and keeps the pins table" {
+    let recs = audit_records_parse("[A]\nclaim = \"x\"\npins = \{ \"m.f\" = \"ast1:ab\" \}\n[[A.pins]]\nid = 1\n")
+    assert_eq(recs.issues.len(), 0)
+    let r = recs.records.get("A").unwrap()
+    assert_eq(r.claim, "x")
+    assert_eq(r.pins.len(), 1)
+    assert_eq(r.pins.get("m.f") ?? "", "ast1:ab")
+}
+
+test "a top-level array of tables is not a record" {
+    let recs = audit_records_parse("[[A]]\nclaimz = \"x\"\n")
+    assert_eq(recs.issues.len(), 0)
+    assert(recs.records.get("A").is_none())
+}
+
+test "a dotted unknown key that holds an inline table is spanned on its first segment" {
+    let recs = audit_records_parse("[K]\nclaim = \"c\"\nx.y = \{ a = 1 \}\n")
+    assert_eq(recs.issues.len(), 1)
+    let issue = recs.issues.get(0).unwrap()
+    assert_eq(issue.key, "x")
+    assert_eq(issue.span.line, 3)
+    assert_eq(issue.span.col, 1)
+    assert_eq(issue.span.end_col, 2)
+}
+
+test "an unknown key written twice is reported at the first one" {
+    let recs = audit_records_parse("[K]\nfoo = 1\nfoo = 2\n")
+    assert_eq(recs.issues.len(), 1)
+    assert_eq(recs.issues.get(0).unwrap().span.line, 2)
+}
+
+test "the empty quoted key is a record like any other" {
+    let bad = audit_records_parse("[\"\"]\nclaimz = \"x\"\n")
+    assert_eq(bad.issues.len(), 1)
+    assert_eq(bad.issues.get(0).unwrap().record, "")
+    assert_eq(bad.issues.get(0).unwrap().key, "claimz")
+    assert_eq(audit_records_parse("[\"\"]\nclaim = \"x\"\n").records.get("").unwrap().claim, "x")
+}
+
+test "a key the parser could not read is not reported, but a quoted empty key is" {
+    assert_eq(audit_records_parse("[K]\n= 1\n").issues.len(), 0)
+    assert_eq(audit_records_parse("[K]\n.x = 1\n").issues.len(), 0)
+    assert_eq(audit_records_parse("[K.]\n").issues.len(), 0)
+    let quoted = audit_records_parse("[K]\n\"\" = 1\n")
+    assert_eq(quoted.issues.len(), 1)
+    assert_eq(quoted.issues.get(0).unwrap().key, "")
+}
+
+test "a bare key with a slash is spanned whole" {
+    let recs = audit_records_parse("[DB-1]\nclaim = \"x\"\nfoo/bar = \"y\"\n")
+    assert_eq(recs.issues.len(), 1)
+    let issue = recs.issues.get(0).unwrap()
+    assert_eq(issue.key, "foo/bar")
+    assert_eq(issue.span.col, 1)
+    assert_eq(issue.span.end_col, 8)
 }

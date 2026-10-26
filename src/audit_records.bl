@@ -3,10 +3,9 @@
 // AuditRecordUnknownKey. This module reads text and returns values, so a test can drive it
 // without a file.
 
-import std.toml.{toml_parse_doc, TomlDoc, TomlEntry, TomlSeg, TomlSpan, TOML_STRING}
+import std.toml.{toml_parse_doc, TomlDoc, TomlEntry, TomlSpan, TOML_STRING}
 
 pub type AuditRecord {
-    key: Str
     claim: Str
     pins: Map[Str, Str]
 }
@@ -37,10 +36,11 @@ pub fn audit_records_parse(text: Str) -> AuditRecords {
     // under `[K]`. It is reported at the header, which names it, and before the entries
     // under that header, which name it again.
     for h in doc.headers {
-        if h.is_array || h.path.len() < 2 { continue }
+        if h.path.len() < 2 { continue }
         let k = h.path.get(0).unwrap()
         let first = h.path.get(1).unwrap()
         if arrays.contains(k) || first == "claim" || first == "pins" { continue }
+        if first == "" && !quoted_empty(text, h.span) { continue }
         let id = "{k}\n{first}"
         if !issue_at.contains_key(id) {
             issue_at.insert(id, issues.len())
@@ -48,10 +48,12 @@ pub fn audit_records_parse(text: Str) -> AuditRecords {
         }
     }
     for e in doc.entries {
-        let k = record_of(doc, arrays, e)
-        if k == "" { continue }
+        let k = match record_of(arrays, e) {
+            Some(name) => name
+            None => continue
+        }
         if !records.contains_key(k) {
-            records.insert(k, AuditRecord { key: k, claim: "", pins: Map() })
+            records.insert(k, AuditRecord { claim: "", pins: Map() })
         }
         let rel = e.path.slice(1, e.path.len())
         let seg = rel.get(0).unwrap()
@@ -64,21 +66,22 @@ pub fn audit_records_parse(text: Str) -> AuditRecords {
             }
         } else if first == "pins" {
             // `pins = { ... }` and `[K.pins]` give one entry for each pin in the table.
-            let pin = rel.get(1) ?? TomlSeg { key: "", index: 0 }
-            if rel.len() == 2 && pin.index < 0 && e.vtype == TOML_STRING {
+            if rel.len() == 2 && rel.get(1).unwrap().index < 0 && e.vtype == TOML_STRING {
+                let pin = rel.get(1).unwrap()
                 let r = records.get(k).unwrap()
                 let mut pins = r.pins
                 pins.insert(pin.key, e.value)
                 records.insert(k, AuditRecord { pins: pins, ..r })
             }
-        } else {
+        } else if first != "" || quoted_empty(text, e.key_span) {
             // A dotted or inline-table key gives several entries; the record key is reported
-            // once, at the entry that writes it. An inline table records its inner keys first.
+            // once, at the first place it is written. An inline table records its inner keys
+            // before the key that holds them, so the earliest span wins and not the first entry.
             let id = "{k}\n{first}"
-            let span = first_segment_span(text, e.key_span)
+            let span = first_segment_span(text, e.key_span, first)
             match issue_at.get(id) {
                 Some(i) => {
-                    if rel.len() == 1 {
+                    if span.start_byte < issues.get(i).unwrap().span.start_byte {
                         issues.set(i, AuditRecordIssue { record: k, key: first, span: span })
                     }
                 }
@@ -89,69 +92,51 @@ pub fn audit_records_parse(text: Str) -> AuditRecords {
             }
         }
     }
-    AuditRecords { records: records, issues: in_source_order(issues) }
+    let ordered = issues.sort_by(fn(a: AuditRecordIssue, b: AuditRecordIssue) -> Ordering {
+        a.span.start_byte.cmp(b.span.start_byte)
+    })
+    AuditRecords { records: records, issues: ordered }
 }
 
-fn in_source_order(issues: List[AuditRecordIssue]) -> List[AuditRecordIssue] {
-    let mut out = issues
-    let mut i = 1
-    while i < out.len() {
-        let cur = out.get(i).unwrap()
-        let mut j = i
-        while j > 0 && out.get(j - 1).unwrap().span.start_byte > cur.span.start_byte {
-            out.set(j, out.get(j - 1).unwrap())
-            j = j - 1
-        }
-        out.set(j, cur)
-        i = i + 1
-    }
-    out
-}
-
-pub fn audit_record_find(recs: AuditRecords, k: Str) -> Option[AuditRecord] {
-    recs.records.get(k)
-}
-
-// The K of the record an entry sits in, or "" when the entry is outside every record: before
-// the first header, under a `[[name]]` header, or in a K that some `[[K]]` makes an array.
-fn record_of(doc: TomlDoc, arrays: Set[Str], e: TomlEntry) -> Str {
-    if e.header < 0 || e.path.len() < 2 { return "" }
-    if doc.headers.get(e.header).unwrap().is_array { return "" }
+// The K of the record an entry sits in, or None when the entry is outside every record: above
+// the first header, or in a K that a `[[K]]` header makes an array.
+fn record_of(arrays: Set[Str], e: TomlEntry) -> Option[Str] {
+    if e.header < 0 || e.path.len() < 2 { return None }
     let k = e.path.get(0).unwrap().key
-    if arrays.contains(k) { "" } else { k }
+    if arrays.contains(k) { None } else { Some(k) }
 }
 
-// The first key of each `[[name]]` header, which makes that key an array and not a record.
+// The name of each top-level `[[name]]` header, which makes that name an array and not a
+// record. A longer `[[K.x]]` is the key x inside record K.
 fn array_names(doc: TomlDoc) -> Set[Str] {
     let mut out: Set[Str] = Set()
     for h in doc.headers {
-        if h.is_array { out.insert(h.path.get(0) ?? "") }
+        if h.is_array && h.path.len() == 1 { out.insert(h.path.get(0).unwrap()) }
     }
     out
+}
+
+// The parser gives an empty key both for `"" = 1` and for a line it could not read, such as
+// `= 1` or `.x = 1`. Only the written `""` or `''` is a key the record does not allow.
+fn quoted_empty(text: Str, span: TomlSpan) -> Bool {
+    let src = text.byte_slice(span.start_byte, span.end_byte)
+    src.contains("\"\"") || src.contains("''")
 }
 
 // The span of the first segment of a key: `a` in `a.b = 1`, `"a.b"` in `"a.b".c = 1`. The
 // caret then marks the key the record does not allow, not the whole dotted path.
-fn first_segment_span(text: Str, span: TomlSpan) -> TomlSpan {
+fn first_segment_span(text: Str, span: TomlSpan, first: Str) -> TomlSpan {
     let start = span.start_byte
-    let mut p = start
+    let mut p = start + first.byte_len()
     let q = text.byte_at(start)
     if q == 34 || q == 39 {
-        p = p + 1
+        p = start + 1
         while p < span.end_byte && text.byte_at(p) != q {
             if q == 34 && text.byte_at(p) == 92 { p = p + 1 }
             p = p + 1
         }
         p = p + 1
-    } else {
-        while p < span.end_byte && is_bare_key_byte(text.byte_at(p)) {
-            p = p + 1
-        }
     }
     if p >= span.end_byte || span.end_line != span.line { return span }
     TomlSpan { end_col: span.col + (p - start), end_byte: p, ..span }
-}
-
-fn is_bare_key_byte(b: U8) -> Bool {
-    (b >= 48 && b <= 57) || (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || b == 95 || b == 45
 }
