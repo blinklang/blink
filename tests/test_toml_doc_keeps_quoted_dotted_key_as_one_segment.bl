@@ -1,0 +1,62 @@
+// toml_parse_doc returns the parse as a value and keeps each key's segments, so a quoted key
+// that holds dots (a pin path in audits.toml) stays one segment, apart from a dotted bare key.
+// It reads and writes none of the global store that toml_parse fills.
+
+import std.toml.{toml_parse_doc, toml_clear, toml_parse, toml_keys, TomlDoc, TomlEntry, TomlSpan}
+
+let AUDITS: Str = "[DB-003]\nclaim = \"checked\"\npins = \{ \"db.sqlite.sqlite3_open\" = \"ast1:3f9c0a4e1b7d\" \}\n"
+
+fn entry_at(doc: TomlDoc, key: Str) -> Option[TomlEntry] {
+    doc.entries.find(fn(e) { e.key == key })
+}
+
+test "a quoted key with dots in an inline table is one segment" {
+    let doc = toml_parse_doc(AUDITS)
+    let e = entry_at(doc, "DB-003.pins.db.sqlite.sqlite3_open").unwrap()
+    assert_eq(e.path.len(), 3)
+    assert_eq(e.path.get(0).unwrap(), "DB-003")
+    assert_eq(e.path.get(1).unwrap(), "pins")
+    assert_eq(e.path.get(2).unwrap(), "db.sqlite.sqlite3_open")
+    assert_eq(e.value, "ast1:3f9c0a4e1b7d")
+    assert_eq(e.key_span.line, 3)
+    assert_eq(e.key_span.col, 10)
+}
+
+test "a dotted bare key splits into segments" {
+    let doc = toml_parse_doc("[t]\na.b = 1\n")
+    let e = entry_at(doc, "t.a.b").unwrap()
+    assert_eq(e.path.len(), 3)
+    assert_eq(e.path.get(1).unwrap(), "a")
+    assert_eq(e.path.get(2).unwrap(), "b")
+}
+
+test "a quoted header with dots is one segment and a bare dotted header is two" {
+    let doc = toml_parse_doc("[\"a.b\"]\nx = 1\n[c.d]\ny = 2\n")
+    assert_eq(doc.headers.len(), 2)
+    assert_eq(doc.headers.get(0).unwrap().path.len(), 1)
+    assert_eq(doc.headers.get(0).unwrap().path.get(0).unwrap(), "a.b")
+    assert_eq(doc.headers.get(1).unwrap().path.len(), 2)
+    assert_eq(doc.headers.get(1).unwrap().span.line, 3)
+    assert_eq(entry_at(doc, "a.b.x").unwrap().path.len(), 2)
+}
+
+test "an entry records the header it sits under" {
+    let doc = toml_parse_doc("top = 1\n[k]\nclaim = \"c\"\n")
+    assert_eq(entry_at(doc, "top").unwrap().header, -1)
+    assert_eq(entry_at(doc, "k.claim").unwrap().header, 0)
+}
+
+test "toml_parse_doc leaves the global store alone" {
+    toml_clear()
+    let _ = toml_parse("[package]\nname = \"x\"\n")
+    let before = toml_keys.len()
+    let _ = toml_parse_doc(AUDITS)
+    assert_eq(toml_keys.len(), before)
+}
+
+test "toml_parse still flattens a quoted key into the dotted store key" {
+    toml_clear()
+    let _ = toml_parse(AUDITS)
+    assert(toml_keys.contains("DB-003.pins.db.sqlite.sqlite3_open"))
+    assert(toml_keys.contains("DB-003.pins"))
+}
