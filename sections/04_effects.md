@@ -4018,7 +4018,7 @@ error[RowOwnerAmbiguous]: a row after a fn type result has two owners
   = help: to give `IO.Log` to `mk`, write `-> (fn(Int) -> Int) ! IO.Log`
 ```
 
-The same rule holds in a type position. A bare row after a function type whose result is a function type is an error, and the writer puts the result in parentheses. `f: fn(A) -> fn(B) -> C ! R` is an error. `f: fn(A) -> (fn(B) -> C ! R)` gives `R` to the inner function type. `f: fn(A) -> (fn(B) -> C) ! R` gives `R` to the outer function type. An `@ffi` declaration that returns a function type needs its row on the declaration, so it is written `-> (fn() -> T) ! FFI`.
+The same rule holds in a type position. A bare row after a function type whose result is a function type is an error, and the writer puts the result in parentheses. `f: fn(A) -> fn(B) -> C ! R` is an error. `f: fn(A) -> (fn(B) -> C ! R)` gives `R` to the inner function type. `f: fn(A) -> (fn(B) -> C) ! R` gives `R` to the outer function type. An `@ffi` declaration that returns a function type needs its row on the declaration, so it is written `-> (fn() -> T) ! IO`.
 
 When the body of a declaration performs an effect that only the returned function type declares, or the reverse, the ordinary `UndeclaredEffect` check fires. If the return type of that declaration is a function type, the error has a `note:` that says which function owns the row that is written.
 
