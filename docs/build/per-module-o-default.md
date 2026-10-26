@@ -2891,8 +2891,8 @@ on the whole program on every build, and a taken unit repeats the
 warnings of its last emit. The annotated fn test checks the warnings of
 each warm build against a cold build: `@deprecated` added in one module
 with its warning at a call in another, `@trusted` removed from a pub
-`@ffi` fn (refused: `PubFFI`), a private `@ffi` fn with no `@trusted`
-(`UnauditedFFI`), and a `@pure` fn that calls a fn of another module
+`@ffi` fn (refused: `FfiFunctionPublic`), a private `@ffi` fn with no `@trusted`
+(`UnauditedFfi`), and a `@pure` fn that calls a fn of another module
 that is not pure (refused: `ImpureBodyForPureAnnotation`).
 
 #### Traits

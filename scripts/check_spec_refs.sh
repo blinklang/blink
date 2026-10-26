@@ -1,9 +1,11 @@
 #!/bin/bash
 # The spec-ref gate of `task ci`: every section ref in the spec, the error
-# catalog, the language reference and the help text of src/diagnostics.bl
-# must name a numbered heading that exists. A section number is both an identifier other files cite and a
-# position that moves when someone changes the spec, so nothing stops a ref
-# from becoming wrong; this gate fails the build at the line that cites it.
+# catalog, the language reference and src/diagnostics.bl must name a
+# numbered heading that exists. A section number is both an identifier
+# other files cite and a position that moves when someone changes the spec,
+# so nothing stops a ref from becoming wrong; this gate fails the build at
+# the line that cites it. Every line of src/diagnostics.bl counts, comments
+# too, so a comment there must not write "section 9" for something else.
 #
 # A ref is `§` and a number (§3, §3c, §3b.5, §4.16.7), or prose such as
 # `section 9.3` or `sections 9.3 and 9.4`. Punctuation after it is not part
