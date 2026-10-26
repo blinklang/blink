@@ -1,58 +1,161 @@
-// The stdlib binds its pure runtime helpers (bytes, str, StringBuilder, containers) with
-// the explicit pure row `! ()`. A fn with no row must be able to reach each of them through
-// the stdlib methods, and get the right answer.
+// The stdlib binds its pure runtime helpers with the explicit pure row `! ()`. Each fn below
+// has no row and reaches those bindings through the stdlib methods. The typecheck does not
+// yet hold a caller to an `! FFI` callee's row, so this passes with `! FFI` rows too; it
+// fails the day that skip goes away and a pure binding was left at `! FFI`.
+// test_pure_std_ffi_bindings_carry_no_ffi_row.bl checks the rows themselves.
 
-fn bytes_roundtrip() -> Str {
+import std.net_tcp.{tcp_socket_from_fd, tcp_listener_from_fd, TcpSocketOps, TcpListenerOps}
+import std.fs_error.{FsError, FsOp}
+import std.errno.{Errno}
+
+fn bytes_ops() {
     let mut b = Bytes.from_str("hi")
     b.push(33)
     b.write_u32_be(258)
-    let s = b.slice(0, 3).to_str().unwrap()
-    "{s}:{b.len()}:{b.read_u32_be(3).unwrap()}:{b.to_hex()}"
+    assert_eq(b.slice(0, 3).to_str().unwrap(), "hi!")
+    assert_eq(b.len(), 7)
+    assert_eq(b.read_u32_be(3).unwrap(), 258)
+    assert_eq(b.to_hex(), "68692100000102")
+    assert_eq(b.get(0).unwrap(), 104)
+    b.set(0, 72)
+    assert_eq(b.get(0).unwrap(), 72)
+    assert_eq(b.concat(Bytes.from_str("?")).len(), 8)
+    assert_eq(Bytes.new().len(), 0)
 }
 
-fn str_ops() -> Str {
+fn bytes_widths() {
+    let mut w = Bytes.new()
+    w.write_u16_be(258)
+    w.write_u16_le(258)
+    w.write_u32_le(258)
+    w.write_i32_be(-2)
+    w.write_i32_le(-2)
+    w.write_i64_be(-3)
+    w.write_i64_le(-3)
+    assert_eq(w.read_u16_be(0).unwrap(), 258)
+    assert_eq(w.read_u16_le(2).unwrap(), 258)
+    assert_eq(w.read_u32_le(4).unwrap(), 258)
+    assert_eq(w.read_i32_be(8).unwrap(), -2)
+    assert_eq(w.read_i32_le(12).unwrap(), -2)
+    assert_eq(w.read_i64_be(16).unwrap(), -3)
+    assert_eq(w.read_i64_le(24).unwrap(), -3)
+    w.set_u16_be(0, 7).unwrap()
+    assert_eq(w.read_u16_be(0).unwrap(), 7)
+    w.set_u16_le(0, 7).unwrap()
+    assert_eq(w.read_u16_le(0).unwrap(), 7)
+    w.set_i16_be(0, -1).unwrap()
+    assert_eq(w.read_u16_be(0).unwrap(), 65535)
+    w.set_i16_le(0, -2).unwrap()
+    assert_eq(w.read_u16_le(0).unwrap(), 65534)
+    w.set_u32_be(0, 9).unwrap()
+    assert_eq(w.read_u32_be(0).unwrap(), 9)
+    w.set_u32_le(0, 9).unwrap()
+    assert_eq(w.read_u32_le(0).unwrap(), 9)
+    w.set_i32_be(0, -9).unwrap()
+    assert_eq(w.read_i32_be(0).unwrap(), -9)
+    w.set_i32_le(0, -9).unwrap()
+    assert_eq(w.read_i32_le(0).unwrap(), -9)
+    w.set_u64_be(0, 11).unwrap()
+    assert_eq(w.read_i64_be(0).unwrap(), 11)
+    w.set_u64_le(0, 11).unwrap()
+    assert_eq(w.read_i64_le(0).unwrap(), 11)
+    w.set_i64_be(0, -11).unwrap()
+    assert_eq(w.read_i64_be(0).unwrap(), -11)
+    w.set_i64_le(0, -11).unwrap()
+    assert_eq(w.read_i64_le(0).unwrap(), -11)
+}
+
+fn str_ops() {
     let s = "  héllo world  ".trim()
-    let parts = s.split(" ")
-    "{s.len()}:{s.index_of("o").unwrap()}:{s.char_at(1).unwrap()}:{parts.len()}:{parts.get(1).unwrap().replace("o", "0").to_upper()}"
+    assert_eq(s.len(), 11)
+    assert_eq(s.index_of("o").unwrap(), 4)
+    assert_eq(s.char_at(1).unwrap(), 'é')
+    assert_eq(s.split(" ").len(), 2)
+    assert_eq("world".replace("o", "0").to_upper(), "W0RLD")
+    assert(s.concat("!") == "héllo world!")
+    assert(s.contains("llo"))
+    assert(s.starts_with("hé"))
+    assert(s.ends_with("ld"))
+    assert_eq(s.byte_index_of("o", 0).unwrap(), 5)
+    assert_eq(s.substring(0, 2), "hé")
+    assert_eq("héy".into_iter().collect().len(), 3)
 }
 
-fn sb_ops() -> Str {
+fn sb_ops() {
+    let sized = StringBuilder.with_capacity(16)
+    assert(sized.capacity() >= 16)
     let mut sb = StringBuilder.new()
     sb.write("n=")
-    sb.write("{42}")
+    42.fmt(sb)
+    1.5.fmt(sb)
+    true.fmt(sb)
     sb.write_char('!')
-    let n = sb.len()
-    "{sb.to_str()}:{n}:{sb.is_empty()}"
+    assert_eq(sb.to_str(), "n=421.5true!")
+    assert_eq(sb.len(), 12)
+    assert(!sb.is_empty())
+    sb.clear()
+    assert_eq(sb.len(), 0)
+    assert(sb.is_empty())
 }
 
-fn container_ops() -> Str {
+fn list_ops() {
     let l = [1, 2, 3, 4].skip(1)
+    assert_eq(l.len(), 3)
+    assert_eq(l.get(0).unwrap(), 2)
+    let mut xs = [1, 2]
+    assert_eq(xs.append([3]).len(), 3)
+    assert(xs.capacity() >= 2)
+    xs.clear()
+    assert_eq(xs.len(), 0)
+    let bumped = [10, 20, 30].into_iter().map(fn(x: Int) -> Int { x + 1 }).collect()
+    assert_eq(bumped.get(2).unwrap(), 31)
+}
+
+fn set_and_map_ops() {
     let mut st: Set[Str] = Set.new()
-    st.insert("a")
-    st.insert("a")
+    assert(st.insert("a"))
+    assert(!st.insert("a"))
     st.insert("b")
-    st.remove("b")
+    assert(st.remove("b"))
+    assert_eq(st.len(), 1)
+    assert(st.contains("a"))
     let mut m: Map[Str, Int] = Map.new()
     m.insert("k", 1)
-    let has_k = m.contains_key("k")
-    let m_len = m.len()
+    assert(m.contains_key("k"))
+    assert_eq(m.len(), 1)
     m.clear()
-    let total = [10, 20, 30].into_iter().map(fn(x: Int) -> Int { x + 1 }).collect()
-    "{l.len()},{l.get(0).unwrap()}:{st.len()}:{st.contains("a")}:{has_k}:{m_len}:{m.len()}:{total.len()},{total.get(2).unwrap()}"
+    assert_eq(m.len(), 0)
+}
+
+fn handle_and_error_ops() {
+    let sock = tcp_socket_from_fd(-1)
+    let lis = tcp_listener_from_fd(-1)
+    assert_eq(sock.fd(), -1)
+    sock.close()
+    lis.close()
+    assert_eq(lis.fd(), -1)
+    let e = FsError { op: FsOp.Read, path: "p", code: Errno(2) }
+    assert_eq("{e}", "read p: No such file or directory")
 }
 
 test "a row-less fn reaches the pure bytes bindings" {
-    assert_eq(bytes_roundtrip(), "hi!:7:258:68692100000102")
+    bytes_ops()
+    bytes_widths()
 }
 
-test "a row-less fn reaches the pure str bindings" {
-    assert_eq(str_ops(), "11:4:é:2:W0RLD")
+test "a row-less fn reaches the pure str and str-iterator bindings" {
+    str_ops()
 }
 
 test "a row-less fn reaches the pure StringBuilder bindings" {
-    assert_eq(sb_ops(), "n=42!:5:false")
+    sb_ops()
 }
 
-test "a row-less fn reaches the pure container bindings" {
-    assert_eq(container_ops(), "3,2:1:true:true:1:0:3,31")
+test "a row-less fn reaches the pure list, set and map bindings" {
+    list_ops()
+    set_and_map_ops()
+}
+
+test "a row-less fn reaches the TCP handle and strerror bindings" {
+    handle_and_error_ops()
 }
