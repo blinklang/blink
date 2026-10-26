@@ -165,7 +165,7 @@ fn daemon_extract_type(request: Str) -> Option[Str] {
 
 // Each check sees the whole program: mono and the mutation passes judge across functions,
 // so a recheck of only the changed functions could miss what an edit broke elsewhere.
-fn daemon_check_program() -> DaemonCheck ! IO, Lex.Tokenize, Parse, Parse.Build, TypeCheck, Diag.Report {
+fn daemon_check_program() -> DaemonCheck ! IO, Lex.Tokenize, Parse, Parse.Build, TypeCheck, Diag.Report, FS.Read, FS.Write {
     daemon_settle_check(daemon_run_check(0))
 }
 
@@ -173,7 +173,7 @@ fn daemon_check_program() -> DaemonCheck ! IO, Lex.Tokenize, Parse, Parse.Build,
 // reads: the other format, the interface texts, the stats and the forced collection. A check
 // request is answered from it, and daemon_settle_check adds the rest once the reply is sent,
 // before the worker serves anything else.
-fn daemon_run_check(format: Int) -> DaemonCheck ! IO, Lex.Tokenize, Parse, Parse.Build, TypeCheck, Diag.Report {
+fn daemon_run_check(format: Int) -> DaemonCheck ! IO, Lex.Tokenize, Parse, Parse.Build, TypeCheck, Diag.Report, FS.Read, FS.Write {
     let query = daemon_index_entry()
     let out_path = path_join(daemon_origin.files, "check.out")
     let err_path = path_join(daemon_origin.files, "check.err")
@@ -217,7 +217,7 @@ fn daemon_run_check(format: Int) -> DaemonCheck ! IO, Lex.Tokenize, Parse, Parse
 
 // The check daemon_run_check gave, with what it put off. It must come before the next check,
 // which drops the diagnostics and the loaded inputs.
-fn daemon_settle_check(c: DaemonCheck) -> DaemonCheck ! IO {
+fn daemon_settle_check(c: DaemonCheck) -> DaemonCheck ! IO, FS.Read {
     fill_source_interfaces()
     // Dev knob: BLINK_DEV_TEST_SETTLE_HOOK=<sh command> runs here, after the loader read the
     // inputs and before the stats, so a test can edit a file in that window. Unset, it costs
@@ -245,7 +245,7 @@ fn daemon_settle_check(c: DaemonCheck) -> DaemonCheck ! IO {
 }
 
 // Settles the check a check request left unsettled, once its reply is sent.
-fn daemon_settle_last() ! IO {
+fn daemon_settle_last() ! IO, FS.Read {
     match daemon_last {
         Some(c) => {
             if c.unrendered >= 0 {
@@ -262,7 +262,7 @@ fn daemon_settle_last() ! IO {
 // are the ones the check makes first, so the parse starts from a cold query's state. None
 // when the lex or the parse reported an error, or the daemon could not capture what they
 // printed: a query then runs cold and prints the errors itself.
-fn daemon_index_entry() -> Option[DaemonQueryIndex] ! IO, Lex.Tokenize, Parse, Diag.Report {
+fn daemon_index_entry() -> Option[DaemonQueryIndex] ! IO, Lex.Tokenize, Parse, Diag.Report, FS.Read, FS.Write {
     reset_compiler_state()
     diag_reset()
     let text = read_file(daemon_source_path)
@@ -281,7 +281,7 @@ fn daemon_index_entry() -> Option[DaemonQueryIndex] ! IO, Lex.Tokenize, Parse, D
 // The mtime and size of each file the last check read, -1 for one it can not stat or open.
 // A same-size edit inside one mtime tick, or one whose mtime was set back, leaves these as
 // they were, so they only tell the poll when to compare bytes. A build compares bytes itself.
-fn daemon_input_stats() -> List[Int] ! IO {
+fn daemon_input_stats() -> List[Int] ! IO, FS.Read {
     let mut stats: List[Int] = []
     for p in checked_input_files() {
         stats.push(file_mtime(p))
@@ -290,7 +290,7 @@ fn daemon_input_stats() -> List[Int] ! IO {
     stats
 }
 
-fn daemon_file_size(path: Str) -> Int ! IO {
+fn daemon_file_size(path: Str) -> Int ! IO, FS.Read {
     let mut size = -1
     with ffi.scope() as scope {
         let file = daemon_open_read(scope.cstr(path), 0.to_i32()).to_int()
@@ -309,7 +309,7 @@ fn daemon_file_size(path: Str) -> Int ! IO {
 // umask. An existing directory is closed too, as an older daemon may have made it open to
 // its group. Only the daemon uses .blink/, so closing it takes nothing from anyone. False
 // when the directory is not the user's to close.
-fn daemon_private_dir(path: Str) -> Bool ! IO {
+fn daemon_private_dir(path: Str) -> Bool ! IO, FS.Write {
     let mut ok = false
     with ffi.scope() as scope {
         let p = scope.cstr(path)
@@ -322,7 +322,7 @@ fn daemon_private_dir(path: Str) -> Bool ! IO {
 
 // A socket listening at path that only its user may connect to: 384 is 0600. The directory
 // it is in is closed already; this closes the socket where a directory can not be.
-fn daemon_listen_private(path: Str) -> Int ! IO {
+fn daemon_listen_private(path: Str) -> Int ! IO, FS.Write {
     let fd = unix_socket_listen(path)
     if fd < 0 { return fd }
     let mut ok = false
@@ -336,24 +336,32 @@ fn daemon_listen_private(path: Str) -> Int ! IO {
     fd
 }
 
-// What daemon_socket_peer_uid gives where the platform has no call for the peer's uid.
+// What daemon_conn_peer_uid and daemon_stream_peer_uid give where the platform has no call for the peer's uid.
 let DAEMON_PEER_UNSUPPORTED = -2
 
 // Whether this platform can name the user at the other end of a Unix socket. The runtime
 // decides "not supported" before it looks at the fd, so on -1, which is no socket, it gives -2
 // where the check is not supported and -1 (the call failed) where it is.
-pub fn daemon_peer_check_supported() -> Bool ! IO {
-    daemon_socket_peer_uid(-1) != DAEMON_PEER_UNSUPPORTED
+pub fn daemon_peer_check_supported() -> Bool ! IO, Net.Connect {
+    daemon_stream_peer_uid(-1) != DAEMON_PEER_UNSUPPORTED
 }
 
 // The uid of the process at the other end of a Unix socket, or None where the peer check is
-// not supported or the kernel did not say.
-pub fn daemon_peer_uid(fd: Int) -> Option[Int] ! IO {
-    let uid = daemon_socket_peer_uid(fd)
+// not supported or the kernel did not say: one for a connection the daemon accepted, one for a
+// socket this process connected.
+pub fn daemon_accepted_peer_uid(fd: Int) -> Option[Int] ! IO, Net.Listen {
+    daemon_known_uid(daemon_conn_peer_uid(fd))
+}
+
+pub fn daemon_connected_peer_uid(fd: Int) -> Option[Int] ! IO, Net.Connect {
+    daemon_known_uid(daemon_stream_peer_uid(fd))
+}
+
+fn daemon_known_uid(uid: Int) -> Option[Int] {
     if uid < 0 { None } else { Some(uid) }
 }
 
-pub fn daemon_own_uid() -> Int {
+pub fn daemon_own_uid() -> Int ! Env.Read {
     daemon_getuid().to_int()
 }
 
@@ -365,15 +373,19 @@ pub fn daemon_peer_uid_allowed(uid: Int, own: Int) -> Bool {
     uid >= 0 && uid == own
 }
 
-fn daemon_peer_allowed(fd: Int) -> Bool ! IO {
-    daemon_peer_uid_allowed(daemon_socket_peer_uid(fd), daemon_own_uid())
+fn daemon_conn_peer_allowed(fd: Int) -> Bool ! IO, Env.Read, Net.Listen {
+    daemon_peer_uid_allowed(daemon_conn_peer_uid(fd), daemon_own_uid())
+}
+
+fn daemon_stream_peer_allowed(fd: Int) -> Bool ! IO, Env.Read, Net.Connect {
+    daemon_peer_uid_allowed(daemon_stream_peer_uid(fd), daemon_own_uid())
 }
 
 // A connection accepted on fd within timeout_ms that the daemon may serve, or -1. Another
 // user's connection is closed unread.
-fn daemon_accept_own(fd: Int, timeout_ms: Int) -> Int ! IO {
+fn daemon_accept_own(fd: Int, timeout_ms: Int) -> Int ! IO, Env.Read, Net.Listen {
     let client_fd = unix_socket_accept_timeout(fd, timeout_ms)
-    if client_fd >= 0 && !daemon_peer_allowed(client_fd) {
+    if client_fd >= 0 && !daemon_conn_peer_allowed(client_fd) {
         unix_socket_close(client_fd)
         return -1
     }
@@ -399,7 +411,7 @@ fn daemon_accept_own(fd: Int, timeout_ms: Int) -> Int ! IO {
 // length, so no value can stand for two variables, and the records are sorted, as a shell
 // lists them in an order that changes as it sets them. /proc holds the environment the process
 // started with; nothing before this call changes it.
-pub fn daemon_proc_identity(compiler: Str) -> Option[Str] ! IO {
+pub fn daemon_proc_identity(compiler: Str) -> Option[Str] ! IO, FS.Read, Net.Connect {
     if !daemon_peer_check_supported() { return None }
     let image = match daemon_mapped_image(compiler) {
         Some(s) => s
@@ -443,7 +455,7 @@ fn daemon_shell_own_var(v: Str) -> Bool {
 }
 
 // "<dev> <inode>" of the file mapped at offset 0 from path, from /proc/self/maps.
-fn daemon_mapped_image(path: Str) -> Option[Str] ! IO {
+fn daemon_mapped_image(path: Str) -> Option[Str] ! IO, FS.Read {
     let maps = match daemon_read_all("/proc/self/maps") {
         Some(b) => b
         None => return None
@@ -475,7 +487,7 @@ fn daemon_mapped_image(path: Str) -> Option[Str] ! IO {
 }
 
 // The whole of a file whose size stat does not give, as for a file under /proc.
-fn daemon_read_all(path: Str) -> Option[Bytes] ! IO {
+fn daemon_read_all(path: Str) -> Option[Bytes] ! IO, FS.Read {
     let mut file = -1
     with ffi.scope() as scope {
         file = daemon_open_read(scope.cstr(path), 0.to_i32()).to_int()
@@ -528,7 +540,7 @@ fn daemon_not_served(why: Str) -> Str {
 // reads and prints as a cold check in the client would. The router sends a worker only the
 // spellings of its one entry file, but the check does not trust that: a new spelling drops
 // the last check. False when the worker can not change to cwd.
-fn daemon_enter(cwd: Str, path: Str) -> Bool ! IO {
+fn daemon_enter(cwd: Str, path: Str) -> Bool ! IO, Env.Write {
     if cwd == daemon_origin.cwd && path == daemon_source_path {
         return true
     }
@@ -551,7 +563,7 @@ fn daemon_enter(cwd: Str, path: Str) -> Bool ! IO {
 // it would exit with, so the client prints the bytes and needs no rendering of its own.
 // With no input changed, the last answer still holds, so the daemon gives it again rather
 // than an empty list that would read as clean.
-fn daemon_handle_check(request: Str) -> Str ! Daemon.Serve, IO, Lex.Tokenize, Parse, Parse.Build, TypeCheck, Diag.Report {
+fn daemon_handle_check(request: Str) -> Str ! Daemon.Serve, IO, Lex.Tokenize, Parse, Parse.Build, TypeCheck, Diag.Report, Env.Write, FS.Read, FS.Write {
     json_clear()
     let root = json_parse(request)
     let cwd = json_as_str(json_get(root, "cwd"))
@@ -600,7 +612,7 @@ fn daemon_handle_check(request: Str) -> Str ! Daemon.Serve, IO, Lex.Tokenize, Pa
 // apart from std.libc's bindings over the same calls.
 @ffi("fork", header: "unistd.h")
 @trusted(audit: "Wraps fork(2). A GC with parallel marking (the system libgc) takes its locks across the fork through its fork handlers and resets them in the child; the vendored GC has no parallel marking.")
-fn daemon_fork() -> I32 ! FFI {}
+fn daemon_fork() -> I32 ! Process.Spawn {}
 
 // The GC's marker threads do not live through a fork, and the GC turns off its parallel
 // marking in the child; a worker lives as long as the daemon and rechecks on each edit, so it
@@ -615,38 +627,45 @@ fn daemon_gc_collect() ! FFI {}
 
 @ffi("waitpid", header: "sys/wait.h")
 @trusted(audit: "Wraps waitpid(2). status is one I32 cell from ffi.scope(); options is fixed to WNOHANG, 1 on every host.")
-fn daemon_waitpid(pid: I32, status: Ptr[I32], options: I32) -> I32 ! FFI {}
+fn daemon_waitpid(pid: I32, status: Ptr[I32], options: I32) -> I32 ! Process.Spawn {}
 
 // open(2) is bound twice so that a caller that only reads does not need the write row.
 @ffi("open", header: "fcntl.h")
 @trusted(audit: "Wraps open(2) with no mode. path is a NUL-terminated copy from ffi.scope(); flags is O_RDONLY, 0 on every host.")
-fn daemon_open_read(path: Ptr[U8], flags: I32) -> I32 ! FFI {}
+fn daemon_open_read(path: Ptr[U8], flags: I32) -> I32 ! FS.Read {}
 
 @ffi("open", header: "fcntl.h")
 @trusted(audit: "Wraps open(2) with no mode. path is a NUL-terminated copy from ffi.scope(); flags is O_WRONLY, 1 on every host.")
-fn daemon_open_write(path: Ptr[U8], flags: I32) -> I32 ! FFI {}
+fn daemon_open_write(path: Ptr[U8], flags: I32) -> I32 ! FS.Read, FS.Write {}
 
 @ffi("mkdir", header: "sys/stat.h")
 @trusted(audit: "Wraps mkdir(2). path is a NUL-terminated copy from ffi.scope(); mode is 0700.")
-fn daemon_mkdir(path: Ptr[U8], mode: U32) -> I32 ! FFI {}
+fn daemon_mkdir(path: Ptr[U8], mode: U32) -> I32 ! FS.Write {}
 
 @ffi("chmod", header: "sys/stat.h")
 @trusted(audit: "Wraps chmod(2). path is a NUL-terminated copy from ffi.scope(); mode is 0700 or 0600.")
-fn daemon_chmod(path: Ptr[U8], mode: U32) -> I32 ! FFI {}
+fn daemon_chmod(path: Ptr[U8], mode: U32) -> I32 ! FS.Write {}
 
 // The uid at the other end of the Unix socket fd; -1 when the call failed, which refuses the
-// peer, and -2 where the platform has no such call (daemon_peer_check_supported).
+// peer, and -2 where the platform has no such call (daemon_peer_check_supported). A socket
+// method carries the row of the call that made the socket (sections/04_effects.md, the rule
+// above the socket table), so the call is bound once for a connection the daemon accepted and
+// once for a socket this process connected.
 @ffi("blink_unix_socket_peer_uid")
-@trusted(audit: "Wraps the runtime blink_unix_socket_peer_uid(), which reads only the peer credentials of fd: SO_PEERCRED on Linux, getpeereid(2) on macOS and the BSDs.")
-fn daemon_socket_peer_uid(fd: Int) -> Int ! FFI {}
+@trusted(audit: "Wraps the runtime blink_unix_socket_peer_uid(), which reads only the peer credentials of fd: SO_PEERCRED on Linux, getpeereid(2) on macOS and the BSDs. Every fd it is given came from unix_socket_accept.")
+fn daemon_conn_peer_uid(fd: Int) -> Int ! Net.Listen {}
+
+@ffi("blink_unix_socket_peer_uid")
+@trusted(audit: "Wraps the runtime blink_unix_socket_peer_uid(), which reads only the peer credentials of fd: SO_PEERCRED on Linux, getpeereid(2) on macOS and the BSDs. Every fd it is given came from unix_socket_connect, or is -1, which is no socket.")
+fn daemon_stream_peer_uid(fd: Int) -> Int ! Net.Connect {}
 
 @ffi("getuid", header: "unistd.h")
 @trusted(audit: "Wraps getuid(2). It takes nothing and can not fail.")
-fn daemon_getuid() -> U32 ! FFI {}
+fn daemon_getuid() -> U32 ! Env.Read {}
 
 @ffi("lseek", header: "unistd.h")
 @trusted(audit: "Wraps lseek(2). fd is one daemon_open_read returned; whence is fixed to SEEK_END, 2 on every host.")
-fn daemon_lseek(fd: I32, offset: Int, whence: I32) -> Int ! FFI {}
+fn daemon_lseek(fd: I32, offset: Int, whence: I32) -> Int ! FS.Read {}
 
 @ffi("dup", header: "unistd.h")
 @trusted(audit: "Wraps dup(2). fd is 1 or 2, which the daemon holds open.")
@@ -662,7 +681,7 @@ fn daemon_setpgid(pid: I32, pgid: I32) -> I32 ! FFI {}
 
 @ffi("kill", header: "signal.h")
 @trusted(audit: "Wraps kill(2). The router sends only to the process group of a worker it forked: SIGKILL while the worker is not yet reaped, so its pid still names that group, and then signal 0, which sends nothing.")
-fn daemon_kill(pid: I32, sig: I32) -> I32 ! FFI {}
+fn daemon_kill(pid: I32, sig: I32) -> I32 ! Process.Signal {}
 
 @ffi("blink_errno_get")
 @trusted(audit: "Wraps the runtime blink_errno_get(), which returns errno. Read right after a failed waitpid.")
@@ -670,11 +689,11 @@ fn daemon_errno() -> Int ! FFI {}
 
 @ffi("chdir", header: "unistd.h")
 @trusted(audit: "Wraps chdir(2). path is a NUL-terminated copy from ffi.scope(), the working directory a client sent.")
-fn daemon_chdir(path: Ptr[U8]) -> I32 ! FFI {}
+fn daemon_chdir(path: Ptr[U8]) -> I32 ! Env.Write {}
 
 @ffi("getppid", header: "unistd.h")
 @trusted(audit: "Wraps getppid(2), which takes nothing and can not fail.")
-fn daemon_getppid() -> I32 ! FFI {}
+fn daemon_getppid() -> I32 ! Env.Read {}
 
 // What the child the daemon forked for a build runs: the client's command line, from the
 // program the daemon checked last. declined names the file the child makes when the build
@@ -699,7 +718,7 @@ type BuildTurn {
 
 // Points fd at an empty file at path, or false when it cannot. write_file makes the file, so
 // open needs only O_WRONLY, which is 1 on every host, where O_CREAT and O_TRUNC differ.
-fn redirect_to(path: Str, fd: Int) -> Bool ! IO {
+fn redirect_to(path: Str, fd: Int) -> Bool ! IO, FS.Read, FS.Write {
     write_file(path, "")
     let mut ok = false
     with ffi.scope() as scope {
@@ -714,7 +733,7 @@ fn redirect_to(path: Str, fd: Int) -> Bool ! IO {
 
 // Points stdout and stderr at the files at out_path and err_path; the descriptors they had,
 // for restore_output, or -1 for one it could not save.
-fn capture_output(out_path: Str, err_path: Str) -> (Int, Int) ! IO {
+fn capture_output(out_path: Str, err_path: Str) -> (Int, Int) ! IO, FS.Read, FS.Write {
     // What stdout holds unflushed belongs to the daemon's own output, not to the capture.
     io.write("")
     let saved_out = daemon_dup(1.to_i32()).to_int()
@@ -754,7 +773,7 @@ fn exit_code_of(status: Int) -> Int {
 
 // Reaps pid if it ended: the status it ended with, -1 when there is no such child, or -2
 // while it runs.
-fn reap(pid: Int) -> Int ! IO {
+fn reap(pid: Int) -> Int ! IO, Process.Spawn {
     let mut status = -1
     // WNOHANG is 1 on every host the daemon runs on.
     let options = 1
@@ -795,7 +814,7 @@ fn daemon_reply(client_fd: Int, text: Str) {
 // client's directory with the client's PWD, which the identity leaves out, as each directory
 // of a project has its own. Anything else is not served, and the client builds cold. The daemon serves on while the child runs
 // and replies to the client once the child ends (daemon_end_child).
-fn daemon_handle_build(request: Str, client_fd: Int, builds: DaemonBuilds) -> BuildTurn ! Daemon.Serve, IO, Lex.Tokenize, Parse, Parse.Build, TypeCheck, Diag.Report {
+fn daemon_handle_build(request: Str, client_fd: Int, builds: DaemonBuilds) -> BuildTurn ! Daemon.Serve, IO, Lex.Tokenize, Parse, Parse.Build, TypeCheck, Diag.Report, Process.Spawn, Env.Write, FS.Read, FS.Write {
     json_clear()
     let root = json_parse(request)
     let cwd = json_as_str(json_get(root, "cwd"))
@@ -912,7 +931,7 @@ fn daemon_end_child(child: DaemonChild, status: Int) ! IO {
 
 // Runs a build request with the next number for its files, and leaves a child it forked in
 // builds. Returns the reply to send, or in the child the build to run.
-fn daemon_start_build(builds: DaemonBuilds, request: Str, client_fd: Int) -> (DaemonBuilds, Option[Str], Option[DaemonBuild]) ! Daemon.Serve, IO, Lex.Tokenize, Parse, Parse.Build, TypeCheck, Diag.Report {
+fn daemon_start_build(builds: DaemonBuilds, request: Str, client_fd: Int) -> (DaemonBuilds, Option[Str], Option[DaemonBuild]) ! Daemon.Serve, IO, Lex.Tokenize, Parse, Parse.Build, TypeCheck, Diag.Report, Process.Spawn, Env.Write, FS.Read, FS.Write {
     let mut next = DaemonBuilds { seq: builds.seq + 1, ..builds }
     match daemon_handle_build(request, client_fd, next) {
         Reply(text) => (next, Some(text), None)
@@ -961,7 +980,7 @@ fn daemon_end_turn(builds: DaemonBuilds) -> DaemonBuilds {
 // The router gave the worker the turn: the oldest held build runs. A build the worker answers
 // at once does not hold the turn, so the next one runs, and the turn goes back once none is
 // left. Returns the build to run in a child forked for one.
-fn daemon_take_turn(builds: DaemonBuilds) -> (DaemonBuilds, Option[DaemonBuild]) ! Daemon.Serve, IO, Lex.Tokenize, Parse, Parse.Build, TypeCheck, Diag.Report {
+fn daemon_take_turn(builds: DaemonBuilds) -> (DaemonBuilds, Option[DaemonBuild]) ! Daemon.Serve, IO, Lex.Tokenize, Parse, Parse.Build, TypeCheck, Diag.Report, Process.Spawn, Env.Write, FS.Read, FS.Write {
     let mut b = DaemonBuilds { turn: 2, ..builds }
     while b.child.is_none() && b.queue.len() > 0 {
         let h = b.queue.get(0).unwrap()
@@ -1075,7 +1094,7 @@ fn daemon_handle_stop() -> Str {
 // program costs a stat of each input and each probed path; only a moved stat or probe costs
 // a byte compare. A missed edit costs a recheck at the next request, never a stale answer:
 // a check or build compares bytes before it uses the last check.
-fn daemon_recheck_if_changed() ! IO, Lex.Tokenize, Parse, Parse.Build, TypeCheck, Diag.Report {
+fn daemon_recheck_if_changed() ! IO, Lex.Tokenize, Parse, Parse.Build, TypeCheck, Diag.Report, FS.Read, FS.Write {
     // Dev knob: BLINK_DEV_DAEMON_IDLE_HOLD=<path> skips the poll while that file exists, so a
     // test that edits and then asks knows its request, not the poll, checks the edit, however
     // long the gap between them. Unset, it costs one getenv per idle wait.
@@ -1119,7 +1138,7 @@ let DAEMON_BUILD_SWEEP_MS = 500
 // wait left it. It waits for a client or for the child's pipe to read its end. The pipe reads
 // its end as the child ends, a moment before waitpid can see it, so once it has, or when
 // there is no pipe or poll fails, the accept waits 1 ms at most.
-fn daemon_accept_during_build(child: DaemonChild) -> (DaemonChild, Int) ! IO {
+fn daemon_accept_during_build(child: DaemonChild) -> (DaemonChild, Int) ! IO, Env.Read, Net.Listen {
     if child.wake < 0 {
         return (child, daemon_accept_own(daemon_socket_fd, 1))
     }
@@ -1149,7 +1168,7 @@ fn daemon_accept_during_build(child: DaemonChild) -> (DaemonChild, Int) ! IO {
 // (daemon_accept_during_build), reaps the child each time it wakes, and serves other requests
 // meanwhile; its build client waits for the one request being served then, past the child's
 // end.
-fn daemon_loop() -> Option[DaemonBuild] ! Daemon.Serve, IO, Lex.Tokenize, Parse, Parse.Build, TypeCheck, Diag.Report {
+fn daemon_loop() -> Option[DaemonBuild] ! Daemon.Serve, IO, Lex.Tokenize, Parse, Parse.Build, TypeCheck, Diag.Report, Env.Read, Process.Spawn, Env.Write, FS.Read, FS.Write, Net.Listen {
     let mut builds = DaemonBuilds { child: None, queue: [], stops: [], seq: 0, turn: 0 }
     while daemon_running == 1 {
         // A worker whose router is gone serves no one, as no client finds its socket: it ends
@@ -1312,7 +1331,7 @@ type RouteTurn {
 // with each symbolic link resolved, so a link and its target, and a path through a linked
 // directory, are one entry, and two files never are. A path realpath can not resolve, such as
 // a missing file, falls back to the absolute path with no `.`, `..` or empty parts.
-fn daemon_entry_key(cwd: Str, path: Str) -> Str {
+fn daemon_entry_key(cwd: Str, path: Str) -> Str ! FS.Read {
     let full = if path.starts_with("/") { path } else { "{cwd}/{path}" }
     match build_fs.real_path(full) {
         Some(p) => return p
@@ -1353,7 +1372,7 @@ fn daemon_ask_worker(name: Str, request: Str) -> Str {
 // worker, the router's own connections are closed. The worker's directory
 // is named for the router's pid too: a worker of a daemon killed before ends only once it sees
 // its router is gone, and then removes its directory, which must not be this daemon's.
-fn daemon_spawn(route: DaemonRoute, key: Str, cwd: Str, path: Str, home: Bool, client_fd: Int) -> (DaemonRoute, Option[DaemonSpawn], Str) ! IO {
+fn daemon_spawn(route: DaemonRoute, key: Str, cwd: Str, path: Str, home: Bool, client_fd: Int) -> (DaemonRoute, Option[DaemonSpawn], Str) ! IO, Process.Spawn, FS.Write {
     let mut r = route
     let router = getpid()
     let name = "w{router}-{r.next}"
@@ -1472,7 +1491,7 @@ fn daemon_make_room(route: DaemonRoute) -> DaemonRoute ! IO {
 // Sends a check, build or query to the worker of its entry, forked first for a check or build
 // if none serves it. A query never forks one: a worker's first check costs more than the cold
 // query the client runs when no worker serves the file.
-fn daemon_route_request(route: DaemonRoute, req_type: Str, request: Str, client_fd: Int) -> (DaemonRoute, RouteTurn) ! IO {
+fn daemon_route_request(route: DaemonRoute, req_type: Str, request: Str, client_fd: Int) -> (DaemonRoute, RouteTurn) ! IO, Process.Spawn, FS.Read, FS.Write {
     let mut r = route
     json_clear()
     let root = json_parse(request)
@@ -1568,7 +1587,7 @@ fn daemon_route_status(r: DaemonRoute) -> Str {
 // Until then it holds the build turn if it held it: a build child of a dead worker may still
 // write the files the next build of its entry writes. A worker that ended waits for the turn
 // no more.
-fn daemon_reap_workers(route: DaemonRoute) -> DaemonRoute ! IO {
+fn daemon_reap_workers(route: DaemonRoute) -> DaemonRoute ! IO, Process.Spawn, Process.Signal {
     let mut r = route
     let mut gone: List[Str] = []
     let mut ending: List[DaemonEntry] = []
@@ -1594,7 +1613,7 @@ fn daemon_reap_workers(route: DaemonRoute) -> DaemonRoute ! IO {
 // A worker closes its end of chan only as it exits, so the close is when the router ends the
 // rest of its group. The kill comes before the reap: until then the worker's pid, which names
 // the group, can name no other process.
-fn daemon_end_group(e: DaemonEntry) -> DaemonEntry {
+fn daemon_end_group(e: DaemonEntry) -> DaemonEntry ! Process.Signal {
     unix_socket_close(e.chan)
     // SIGKILL is 9 on every host the daemon runs on.
     let _ = daemon_kill((0 - e.pid).to_i32(), 9.to_i32())
@@ -1605,7 +1624,7 @@ fn daemon_end_group(e: DaemonEntry) -> DaemonEntry {
 // whether the group is gone. A killed process can not write once it is a zombie, but only its
 // parent reaps it, and an init that reaps none would hold the group forever; so 10 s after the
 // kill the group counts as gone.
-fn daemon_group_gone(e: DaemonEntry) -> Bool ! IO {
+fn daemon_group_gone(e: DaemonEntry) -> Bool ! IO, Process.Spawn, Process.Signal {
     with ffi.scope() as scope {
         let cell = scope.alloc[I32]()
         loop {
@@ -1677,7 +1696,7 @@ fn daemon_route_turn(route: DaemonRoute, name: Str, line: Str) -> DaemonRoute {
 // Reads what each worker sent on its connection to the router, as polled. A worker that closed
 // it is gone or going: the router ends its group, serves its entry from a new worker, and
 // frees what it held once its reap does.
-fn daemon_read_chans(route: DaemonRoute, ready: List[Int]) -> DaemonRoute {
+fn daemon_read_chans(route: DaemonRoute, ready: List[Int]) -> DaemonRoute ! Process.Signal {
     let mut r = route
     let mut names: List[Str] = []
     let mut lines: List[Str] = []
@@ -1723,7 +1742,7 @@ fn daemon_read_chans(route: DaemonRoute, ready: List[Int]) -> DaemonRoute {
 
 // Waits up to wait ms for a client or a line from a worker, reads the lines, and returns the
 // client's connection, or -1.
-fn daemon_route_wait(route: DaemonRoute, wait: Int) -> (DaemonRoute, Int) ! IO {
+fn daemon_route_wait(route: DaemonRoute, wait: Int) -> (DaemonRoute, Int) ! IO, Process.Signal, Env.Read, Net.Listen {
     let mut fds: List[Pollfd] = [Pollfd { fd: daemon_socket_fd.to_i32(), events: 1.to_i16(), revents: 0.to_i16() }]
     for e in route.entries {
         if e.chan >= 0 { fds.push(Pollfd { fd: e.chan.to_i32(), events: 1.to_i16(), revents: 0.to_i16() }) }
@@ -1788,7 +1807,7 @@ fn daemon_stop_workers(route: DaemonRoute) -> DaemonRoute {
 // the build turn as soon as it is free. While a stop waits on its workers, or a worker it
 // ended has yet to be reaped, the wait is 1 ms at most, so the stop ends as soon as the last
 // of them does.
-fn daemon_route(max: Int) -> Option[DaemonSpawn] ! IO {
+fn daemon_route(max: Int) -> Option[DaemonSpawn] ! IO, Process.Spawn, FS.Read, FS.Write, Process.Signal, Env.Read, Net.Listen {
     let mut r = DaemonRoute { entries: [], ended: [], next: 1, seq: 0, max: max, home_cwd: daemon_origin.cwd, home_path: daemon_source_path, root: daemon_entry_key(env.cwd(), path_dirname(daemon_dir())), retired_checks: 0, retired_builds: 0, retired_queries: 0, retired_reused: 0, stops: [], held: [], turn: "", waiting: [], told: [] }
     // The home worker checks the entry at once, so the first request finds it checked.
     let home_key = daemon_entry_key(r.home_cwd, r.home_path)
@@ -1848,7 +1867,7 @@ fn daemon_route(max: Int) -> Option[DaemonSpawn] ! IO {
 
 // Serves the entry a worker was forked for until a stop, then removes its files and ends the
 // worker. In a child forked for a build it returns the build instead.
-fn daemon_serve(s: DaemonSpawn) -> Option[DaemonBuild] ! Daemon.Serve, IO, Lex.Tokenize, Parse, Parse.Build, TypeCheck, Diag.Report {
+fn daemon_serve(s: DaemonSpawn) -> Option[DaemonBuild] ! Daemon.Serve, IO, Lex.Tokenize, Parse, Parse.Build, TypeCheck, Diag.Report, Env.Write, Env.Read, Process.Spawn, FS.Read, FS.Write, Net.Listen {
     daemon_socket_fd = s.fd
     daemon_origin = DaemonOrigin { router: s.router, files: s.files, chan: s.chan, ..daemon_origin }
     // The router's files are the router's to remove.
@@ -1922,10 +1941,10 @@ pub fn daemon_socket_path() -> Str {
 // worker that serves its entry, and the request goes there once. A socket another user
 // listens on, a worker that is gone by then, or a second redirect gives "", and the client
 // runs cold.
-pub fn daemon_send(fd: Int, request: Str) -> Str ! IO {
+pub fn daemon_send(fd: Int, request: Str) -> Str ! IO, Env.Read, Net.Connect {
     let line = request.concat("\n")
     // A request carries the client's environment, so a socket another user listens on gets none.
-    if !daemon_peer_allowed(fd) || socket_write(fd, line) < 0 {
+    if !daemon_stream_peer_allowed(fd) || socket_write(fd, line) < 0 {
         unix_socket_close(fd)
         return ""
     }
@@ -1939,7 +1958,7 @@ pub fn daemon_send(fd: Int, request: Str) -> Str ! IO {
     if worker_fd < 0 {
         return ""
     }
-    if !daemon_peer_allowed(worker_fd) || socket_write(worker_fd, line) < 0 {
+    if !daemon_stream_peer_allowed(worker_fd) || socket_write(worker_fd, line) < 0 {
         unix_socket_close(worker_fd)
         return ""
     }
@@ -1966,7 +1985,7 @@ fn daemon_worker_of(reply: Str) -> Str {
 // instead, for the caller to run. identity names the compiler and the environment, and
 // settings what the front end reads, which a client must share for the daemon to build for it.
 // max_entries is how many entry files the daemon keeps checked at once, each in a worker.
-pub fn daemon_start(source: Str, identity: Str, settings: Str, interface_text: Bool, max_entries: Int) -> Option[DaemonBuild] ! Daemon.Serve, IO, Lex.Tokenize, Parse, Parse.Build, TypeCheck, Diag.Report {
+pub fn daemon_start(source: Str, identity: Str, settings: Str, interface_text: Bool, max_entries: Int) -> Option[DaemonBuild] ! Daemon.Serve, IO, Lex.Tokenize, Parse, Parse.Build, TypeCheck, Diag.Report, FS.Write, Process.Spawn, Env.Write, Env.Read, FS.Read, Process.Signal, Net.Listen {
     daemon_source_path = source
     daemon_origin = DaemonOrigin { cwd: env.cwd(), identity: identity, settings: settings, interface_text: interface_text, builds: 0, queries: 0, checks: 0, reused: 0, router: 0, files: "", chan: -1 }
     daemon_start_time = time_ms()

@@ -47,21 +47,21 @@ fn cache_size_cap_mb() -> Int {
     v.to_int()
 }
 
-pub fn ensure_dir() ! IO {
+pub fn ensure_dir() ! IO, FS.Write {
     let _ = build_fs.mkdir_p("{obj_cache_dir()}/tmp")
 }
 
 // A dir of prefix no other build writes, under tmp/ so a rename out of it stays on one
 // filesystem. A pid and a counter are not enough: two pid namespaces can share a cache
 // dir. "" when it cannot be made.
-fn make_tmp_dir(prefix: Str) -> Str ! IO {
+fn make_tmp_dir(prefix: Str) -> Str ! IO, FS.Read, FS.Write, FS.Delete {
     ensure_dir()
     let tmp = "{obj_cache_dir()}/tmp"
     build_fs.reap_dead(tmp, ["unit", "hold", "stage"])
     build_fs.private_dir(tmp, prefix)
 }
 
-pub fn make_private_dir() -> Str ! IO {
+pub fn make_private_dir() -> Str ! IO, FS.Read, FS.Write, FS.Delete {
     make_tmp_dir("unit")
 }
 
@@ -121,7 +121,7 @@ pub fn compute_obj_key(
 // first in -I order, so the key holds the order; one dir has one order, and its keys stay the
 // keys made before the order was keyed. None as header_lines_named answers it. skip names what
 // the build writes, which is under a vendored dir when the dir holds the project.
-pub fn vendored_key_lines(dirs: List[Str], by_name: Bool, skip: List[Str]) -> Option[List[Str]] ! IO {
+pub fn vendored_key_lines(dirs: List[Str], by_name: Bool, skip: List[Str]) -> Option[List[Str]] ! IO, FS.Read {
     let mut lines = match lines_under(dirs, by_name, skip) {
         Some(l) => l
         None => return None
@@ -139,7 +139,7 @@ pub fn vendored_key_lines(dirs: List[Str], by_name: Bool, skip: List[Str]) -> Op
 }
 
 // vendored_key_lines for dirs spelled by their paths.
-pub fn header_lines_in(dirs: List[Str]) -> Option[List[Str]] ! IO {
+pub fn header_lines_in(dirs: List[Str]) -> Option[List[Str]] ! IO, FS.Read {
     vendored_key_lines(dirs, false, [])
 }
 
@@ -149,12 +149,12 @@ pub fn header_lines_in(dirs: List[Str]) -> Option[List[Str]] ! IO {
 // any name, so every file is in the key. None when a file cannot be hashed or a dir cannot
 // be listed, so a file the unit may read never drops out of the key. A build hashes them
 // once for every key it makes: a vendored dir can be large (sqlite3.c is 9.4 MB).
-pub fn header_lines_named(dirs: List[Str], by_name: Bool) -> Option[List[Str]] ! IO {
+pub fn header_lines_named(dirs: List[Str], by_name: Bool) -> Option[List[Str]] ! IO, FS.Read {
     lines_under(dirs, by_name, [])
 }
 
 // header_lines_named without the files at the paths in skip.
-fn lines_under(dirs: List[Str], by_name: Bool, skip: List[Str]) -> Option[List[Str]] ! IO {
+fn lines_under(dirs: List[Str], by_name: Bool, skip: List[Str]) -> Option[List[Str]] ! IO, FS.Read {
     let skip_real = skip_reals(skip)
     let mut lines: List[Str] = []
     let mut paths: List[Str] = []
@@ -187,7 +187,7 @@ fn lines_under(dirs: List[Str], by_name: Bool, skip: List[Str]) -> Option[List[S
 
 // The walk meets each entry under the realpath of its dir, so a skip path is spelled so too.
 // One whose dir does not exist yet is under no dir the walk lists.
-fn skip_reals(skip: List[Str]) -> List[Str] ! IO {
+fn skip_reals(skip: List[Str]) -> List[Str] ! IO, FS.Read {
     let mut skip_real: List[Str] = []
     for s in skip {
         let p = without_trailing_slash(s)
@@ -204,7 +204,7 @@ fn skip_reals(skip: List[Str]) -> List[Str] ! IO {
 // the top, and holds .git. A dir link back to a dir it lies in is not walked again: cc
 // reaches each file under it by a path the walk already took. None when a dir cannot be
 // listed.
-fn files_under(root: Str, rel: Str, ancestors: List[Str], skip: List[Str]) -> Option[List[Str]] ! IO {
+fn files_under(root: Str, rel: Str, ancestors: List[Str], skip: List[Str]) -> Option[List[Str]] ! IO, FS.Read {
     let dir = if rel == "" { root } else { "{root}/{rel}" }
     let real = match build_fs.real_path(dir) {
         Some(r) => r
@@ -327,7 +327,7 @@ fn nested(inner: Str, outer: Str) -> Bool {
 // so cc reads the same answer. gcc and clang compare by inode, so a stale PWD that names the
 // cwd through another mount of it is recorded where this answers the cwd; both name the same
 // dir. "" when the cwd cannot be read.
-pub fn compile_dir() -> Str ! IO {
+pub fn compile_dir() -> Str ! IO, FS.Read {
     let cwd = env.cwd()
     if cwd == "" {
         return ""
@@ -352,7 +352,7 @@ pub fn user_unit_key(
     flags: List[Str],
     target: Str,
     recorded_paths: List[Str],
-) -> Str ! IO {
+) -> Str ! IO, FS.Read {
     match header_lines_in(vendored_include_dirs) {
         Some(lines) => user_unit_key_with_headers(src_path, module_key, arc_dir, lines, blinkc_sha, cc_id, flags, target, recorded_paths)
         None => ""
@@ -370,7 +370,7 @@ pub fn user_unit_key_with_headers(
     flags: List[Str],
     target: Str,
     recorded_paths: List[Str],
-) -> Str ! IO {
+) -> Str ! IO, FS.Read {
     if blinkc_sha == "" || cc_id == "" {
         return ""
     }
@@ -400,7 +400,7 @@ pub fn user_unit_key_with_headers(
 }
 
 // The sha of each file in paths, by its path; a file that cannot be read is absent.
-fn hash_files(paths: List[Str]) -> Map[Str, Str] ! IO {
+fn hash_files(paths: List[Str]) -> Map[Str, Str] ! IO, FS.Read {
     let mut m: Map[Str, Str] = Map()
     for p in paths {
         match sha256_file_hex(p) {
@@ -431,7 +431,7 @@ pub fn unit_keys(
     cc_id: Str,
     flags: List[Str],
     target: Str,
-) -> Map[Str, Str] ! IO {
+) -> Map[Str, Str] ! IO, FS.Read {
     if blinkc_sha == "" || cc_id == "" || modules.len() == 0 {
         return Map()
     }
@@ -444,12 +444,12 @@ pub fn unit_keys(
 // The sha of each file a unit key covers: the archive's runtime.h, libblink_std.h and .gch,
 // by their path, and every .h and .c in dir, by their name in dir. A file that could not be
 // read is absent. None when dir is not a directory.
-pub fn unit_file_shas(dir: Str, arc_dir: Str) -> Option[Map[Str, Str]] ! IO {
+pub fn unit_file_shas(dir: Str, arc_dir: Str) -> Option[Map[Str, Str]] ! IO, FS.Read {
     unit_file_shas_with(dir, arc_dir, [])
 }
 
 // unit_file_shas, and the sha of each file in dir that extra names, by that name.
-pub fn unit_file_shas_with(dir: Str, arc_dir: Str, extra: List[Str]) -> Option[Map[Str, Str]] ! IO {
+pub fn unit_file_shas_with(dir: Str, arc_dir: Str, extra: List[Str]) -> Option[Map[Str, Str]] ! IO, FS.Read {
     if is_dir(dir) != 1 {
         return None
     }
@@ -487,7 +487,7 @@ pub fn unit_file_shas_with(dir: Str, arc_dir: Str, extra: List[Str]) -> Option[M
 
 // The sha of each file in dir that names lists, by that name. A file that could not be read
 // is absent.
-pub fn file_shas(dir: Str, names: List[Str]) -> Map[Str, Str] ! IO {
+pub fn file_shas(dir: Str, names: List[Str]) -> Map[Str, Str] ! IO, FS.Read {
     let mut m: Map[Str, Str] = Map()
     if is_dir(dir) != 1 {
         return m
@@ -515,7 +515,7 @@ pub fn unit_keys_from(
     cc_id: Str,
     flags: List[Str],
     target: Str,
-) -> Map[Str, Str] ! IO {
+) -> Map[Str, Str] ! IO, FS.Read {
     match header_lines_in(vendored_include_dirs) {
         Some(lines) => unit_keys_with_headers(shas, modules, unit_headers, arc_dir, lines, blinkc_sha, cc_id, flags, target, [])
         None => Map()
@@ -655,7 +655,7 @@ pub fn key_from_text(text: Str) -> Str {
 
 // Look up by key. On hit, touches .meta mtime and returns the .o path.
 // On miss, returns "".
-pub fn lookup_obj(key: Str) -> Str ! IO {
+pub fn lookup_obj(key: Str) -> Str ! IO, FS.Read, FS.Write {
     if !cache_enabled() {
         return ""
     }
@@ -669,7 +669,7 @@ pub fn lookup_obj(key: Str) -> Str ! IO {
 }
 
 // lookup_obj for each key, in order. "" for an empty key.
-pub fn lookup_objs(keys: List[Str]) -> List[Str] ! IO {
+pub fn lookup_objs(keys: List[Str]) -> List[Str] ! IO, FS.Read, FS.Write {
     let mut out: List[Str] = []
     if !cache_enabled() {
         for _k in keys {
@@ -694,13 +694,13 @@ pub fn lookup_objs(keys: List[Str]) -> List[Str] ! IO {
 // build can remove the entry in between. So the build links a name of its own for the bytes,
 // in a dir under tmp/ that no GC removes, and removes that dir after its link. "" when none
 // can be made.
-pub fn make_hold_dir() -> Str ! IO {
+pub fn make_hold_dir() -> Str ! IO, FS.Read, FS.Write, FS.Delete {
     make_tmp_dir("hold")
 }
 
 // A hard link at to for the file at from, or a copy where the filesystem makes no link. False
 // when from is gone or cannot be copied.
-fn hold_file(from: Str, to: Str) -> Bool ! IO {
+fn hold_file(from: Str, to: Str) -> Bool ! IO, FS.Write, FS.Read, FS.Delete {
     // Dev knob: BLINK_DEV_OBJCACHE_HOLD=copy fails each link, as a filesystem with no hard
     // links does; =none fails each copy too. A test makes either path happen every time.
     let knob = env.var("BLINK_DEV_OBJCACHE_HOLD") ?? ""
@@ -718,7 +718,7 @@ fn hold_file(from: Str, to: Str) -> Bool ! IO {
 // compile read files the key does not hold (<key>.reads) hits only when each of them, found
 // through dirs, the vendored include dirs of this build, still has the bytes it had. "" for an
 // empty key, a miss, or no hold dir.
-pub fn hold_objs(keys: List[Str], hold: Str, dirs: List[Str]) -> List[Str] ! IO {
+pub fn hold_objs(keys: List[Str], hold: Str, dirs: List[Str]) -> List[Str] ! IO, FS.Read, FS.Write, FS.Delete {
     let mut out: List[Str] = []
     let dir = obj_cache_dir()
     let mut read_keys: List[Int] = []
@@ -811,7 +811,7 @@ let READ_MTIME_SLACK_MS: Int = 2000
 // The ReadScope of a compile with vendored include dirs dirs, whose key walk skips skip, that
 // reads its own C and headers under own and the archive headers in arc_dir. A dir that does not
 // exist holds nothing a compile reads. Made before the compile starts.
-pub fn read_scope(dirs: List[Str], skip: List[Str], own: List[Str], arc_dir: Str) -> ReadScope ! IO {
+pub fn read_scope(dirs: List[Str], skip: List[Str], own: List[Str], arc_dir: Str) -> ReadScope ! IO, FS.Read {
     let since_ms = time.read().to_unix_ms()
     let mut real_dirs: List[Str] = []
     for d in dirs {
@@ -842,7 +842,7 @@ pub fn read_scope(dirs: List[Str], skip: List[Str], own: List[Str], arc_dir: Str
 // The "<sha256> <where>" lines of the files the depfile names that no key line holds, sorted
 // and each once. None when the depfile cannot be read or a file it names can no longer be
 // hashed: the object must not be stored, since a hit could not check that file.
-pub fn compile_reads(depfile: Str, scope: ReadScope) -> Option[List[Str]] ! IO {
+pub fn compile_reads(depfile: Str, scope: ReadScope) -> Option[List[Str]] ! IO, FS.Read {
     if file_exists(depfile) == 0 {
         return None
     }
@@ -1065,7 +1065,7 @@ fn unique_strs(xs: List[Str]) -> List[Str] {
 // Whether a PCH this build holds in hold, built by a compile that read the files the lines in
 // its reads file name, may serve its units: each file, found through dirs, still hashes to its
 // line. Its lines when it may (none without a reads file); None when it may not.
-pub fn held_pch_reads(hold: Str, dirs: List[Str]) -> Option[List[Str]] ! IO {
+pub fn held_pch_reads(hold: Str, dirs: List[Str]) -> Option[List[Str]] ! IO, FS.Read {
     let path = "{hold}/{PCH_READS}"
     if file_exists(path) == 0 {
         return Some([])
@@ -1091,7 +1091,7 @@ pub let PCH_READS: Str = "reads"
 // now in the cache.
 // reads holds what the compile read that the key does not (compile_reads); None stores
 // nothing.
-pub fn install(key: Str, obj_path: Str, module_key: Str, src_sha: Str, reads: Option[List[Str]]) -> Bool ! IO {
+pub fn install(key: Str, obj_path: Str, module_key: Str, src_sha: Str, reads: Option[List[Str]]) -> Bool ! IO, FS.Read, FS.Write, FS.Delete {
     if !cache_enabled() {
         return false
     }
@@ -1102,7 +1102,7 @@ pub fn install(key: Str, obj_path: Str, module_key: Str, src_sha: Str, reads: Op
 }
 
 // install for each (key, obj_path, module_key, reads), in order.
-pub fn install_objs(keys: List[Str], obj_paths: List[Str], module_keys: List[Str], reads: List[Option[List[Str]]]) -> List[Bool] ! IO {
+pub fn install_objs(keys: List[Str], obj_paths: List[Str], module_keys: List[Str], reads: List[Option[List[Str]]]) -> List[Bool] ! IO, FS.Read, FS.Write, FS.Delete {
     let mut out: List[Bool] = []
     for _k in keys {
         out.push(false)
@@ -1126,7 +1126,7 @@ pub fn install_objs(keys: List[Str], obj_paths: List[Str], module_keys: List[Str
 // install_at under the key reads names, then <key>.reads, so a build that finds the lines
 // finds the object too. An object whose compile read nothing the key does not hold goes
 // under key.
-fn install_reads(dir: Str, stage: Str, key: Str, obj_path: Str, meta: Str, reads: Option[List[Str]]) -> Bool ! IO {
+fn install_reads(dir: Str, stage: Str, key: Str, obj_path: Str, meta: Str, reads: Option[List[Str]]) -> Bool ! IO, FS.Write, FS.Read, FS.Delete {
     let lines = match reads {
         Some(l) => l
         None => return false
@@ -1151,7 +1151,7 @@ fn install_reads(dir: Str, stage: Str, key: Str, obj_path: Str, meta: Str, reads
 
 // A staged name in stage, so no build links a part-made copy under the key. False with no
 // stage dir.
-fn install_at(dir: Str, stage: Str, key: Str, obj_path: Str, meta: Str) -> Bool ! IO {
+fn install_at(dir: Str, stage: Str, key: Str, obj_path: Str, meta: Str) -> Bool ! IO, FS.Write, FS.Read, FS.Delete {
     if stage == "" {
         return false
     }
@@ -1169,7 +1169,7 @@ fn install_at(dir: Str, stage: Str, key: Str, obj_path: Str, meta: Str) -> Bool 
 // obj at obj_tmp_path; we rename it (so the temp path is consumed).
 // Returns true iff a new entry was installed (signal for maybe_gc); on
 // false the caller must not link <key>.o.
-pub fn store(key: Str, obj_tmp_path: Str, module_key: Str, src_sha: Str) -> Bool ! IO {
+pub fn store(key: Str, obj_tmp_path: Str, module_key: Str, src_sha: Str) -> Bool ! IO, FS.Write {
     if !cache_enabled() {
         return false
     }
@@ -1185,13 +1185,13 @@ pub fn store(key: Str, obj_tmp_path: Str, module_key: Str, src_sha: Str) -> Bool
 }
 
 // mv -f: rename(2), and mv where that fails, as it copies across filesystems.
-fn move_obj(from: Str, to: Str) -> Bool ! IO {
+fn move_obj(from: Str, to: Str) -> Bool ! IO, FS.Write {
     build_fs.rename(from, to) || shell_exec("mv -f '{from}' '{to}'") == 0
 }
 
 // store for each (key, obj_tmp_path, module_key), in order. The answer for each entry is what
 // store would answer for it.
-pub fn store_objs(keys: List[Str], obj_tmp_paths: List[Str], module_keys: List[Str]) -> List[Bool] ! IO {
+pub fn store_objs(keys: List[Str], obj_tmp_paths: List[Str], module_keys: List[Str]) -> List[Bool] ! IO, FS.Write {
     let mut out: List[Bool] = []
     for _k in keys {
         out.push(false)
@@ -1256,12 +1256,12 @@ pub fn clang_pch_name() -> Str {
 }
 
 // The PCH dir for key when its .gch is in place, and its entry marked as used; "" when not.
-pub fn lookup_pch(key: Str) -> Str ! IO {
+pub fn lookup_pch(key: Str) -> Str ! IO, FS.Read, FS.Write {
     lookup_pch_file(key, "libblink_std.h.gch")
 }
 
 // lookup_pch for the PCH file name a compiler reads.
-pub fn lookup_pch_file(key: Str, name: Str) -> Str ! IO {
+pub fn lookup_pch_file(key: Str, name: Str) -> Str ! IO, FS.Read, FS.Write {
     if !cache_enabled() || key == "" {
         return ""
     }
@@ -1276,12 +1276,12 @@ pub fn lookup_pch_file(key: Str, name: Str) -> Str ! IO {
 // Holds the PCH in dir for a build's units: a link or a copy of each of its files in hold,
 // which the units read in place of dir, so the GC of another build can remove the entry while
 // they compile. False, with nothing left in hold, when one cannot be held.
-pub fn hold_pch(dir: Str, hold: Str) -> Bool ! IO {
+pub fn hold_pch(dir: Str, hold: Str) -> Bool ! IO, FS.Write, FS.Read, FS.Delete {
     hold_pch_files(dir, hold, ["libblink_std.h", "runtime.h", "libblink_std.h.gch"])
 }
 
 // hold_pch for the files a PCH dir holds for a compiler.
-pub fn hold_pch_files(dir: Str, hold: Str, names: List[Str]) -> Bool ! IO {
+pub fn hold_pch_files(dir: Str, hold: Str, names: List[Str]) -> Bool ! IO, FS.Write, FS.Read, FS.Delete {
     if dir == "" || hold == "" || !build_fs.mkdir_p(hold) {
         return false
     }
@@ -1297,7 +1297,7 @@ pub fn hold_pch_files(dir: Str, hold: Str, names: List[Str]) -> Bool ! IO {
 // A private dir that holds copies of the archive's libblink_std.h and runtime.h, for a PCH
 // build to write its .gch beside; "" when the copies do not hash to the shas the key was
 // made from, as when the archive changed after the build hashed it.
-pub fn stage_pch(arc_dir: Str, archive_sha: Str, runtime_sha: Str) -> Str ! IO {
+pub fn stage_pch(arc_dir: Str, archive_sha: Str, runtime_sha: Str) -> Str ! IO, FS.Read, FS.Delete, FS.Write {
     let dir = make_private_dir()
     if dir == "" {
         return ""
@@ -1316,13 +1316,13 @@ pub fn stage_pch(arc_dir: Str, archive_sha: Str, runtime_sha: Str) -> Str ! IO {
 // Whether libblink_std.h and runtime.h in arc_dir still hash to the shas a PCH key was made
 // from. clang takes a PCH whose header changed but kept its size, so a PCH built from the
 // archive dir is stored only when its headers did not change while it was built.
-pub fn pch_headers_unchanged(arc_dir: Str, archive_sha: Str, runtime_sha: Str) -> Bool ! IO {
+pub fn pch_headers_unchanged(arc_dir: Str, archive_sha: Str, runtime_sha: Str) -> Bool ! IO, FS.Read {
     (sha256_file_hex("{arc_dir}/libblink_std.h") ?? "") == archive_sha && (sha256_file_hex("{arc_dir}/runtime.h") ?? "") == runtime_sha
 }
 
 // Installs the staged dir as the PCH for key. False when another build installed it first, or
 // the rename failed; the staged dir is gone either way.
-pub fn store_pch(key: Str, staged: Str) -> Bool ! IO {
+pub fn store_pch(key: Str, staged: Str) -> Bool ! IO, FS.Write, FS.Delete {
     let dir = pch_dir(key)
     // Under its key the dir is no longer one a reaper may take.
     build_fs.unmark(staged)
@@ -1335,7 +1335,7 @@ pub fn store_pch(key: Str, staged: Str) -> Bool ! IO {
 }
 
 // Drops the PCH for key, as when a unit that read it failed and compiled without it.
-pub fn drop_pch(key: Str) ! IO {
+pub fn drop_pch(key: Str) ! IO, FS.Delete {
     let _ = build_fs.remove_tree(pch_dir(key))
     fs_remove("{obj_cache_dir()}/{key}.meta")
 }
@@ -1343,7 +1343,7 @@ pub fn drop_pch(key: Str) ! IO {
 // The apparent bytes of the files under dir. du would count the blocks they take, which can
 // differ; the cap only starts an eviction and never changes what a build writes, so either
 // unit holds it, and this one starts no program.
-fn cache_total_bytes(dir: Str) -> Int ! IO {
+fn cache_total_bytes(dir: Str) -> Int ! IO, FS.Read {
     tree_bytes(dir, 0)
 }
 
@@ -1351,7 +1351,7 @@ fn cache_total_bytes(dir: Str) -> Int ! IO {
 // a link, so the depth bound ends a walk that a link to a parent would never end.
 let CACHE_WALK_DEPTH: Int = 4
 
-fn tree_bytes(path: Str, depth: Int) -> Int ! IO {
+fn tree_bytes(path: Str, depth: Int) -> Int ! IO, FS.Read {
     if is_dir(path) != 1 {
         let n = build_fs.file_size(path)
         return if n < 0 { 0 } else { n }
@@ -1381,7 +1381,7 @@ fn cache_entry_count(dir: Str) -> Int {
 
 // Opportunistic LRU eviction by .meta mtime until total <= cap_mb.
 // Caller invokes this once at end of a build that stored anything.
-pub fn maybe_gc() ! IO {
+pub fn maybe_gc() ! IO, FS.Read, FS.Delete {
     if !cache_enabled() {
         return
     }
@@ -1425,7 +1425,7 @@ pub fn dev_evict_at(point: Str) -> Bool ! IO {
     true
 }
 
-pub fn cmd_info() -> Int ! IO {
+pub fn cmd_info() -> Int ! IO, FS.Read {
     let dir = obj_cache_dir()
     let count = cache_entry_count(dir)
     let total_kb = cache_total_bytes(dir) / 1024
@@ -1482,7 +1482,7 @@ pub fn cmd_clean(older_than: Str) -> Int {
 
 // Hidden sub-subcommands used by tests to drive the cache directly.
 // Return 0/1 so the test can assert exit codes.
-pub fn cmd_internal_lookup(key: Str) -> Int ! IO {
+pub fn cmd_internal_lookup(key: Str) -> Int ! IO, FS.Read, FS.Write {
     let p = lookup_obj(key)
     if p == "" {
         return 1
@@ -1491,7 +1491,7 @@ pub fn cmd_internal_lookup(key: Str) -> Int ! IO {
     0
 }
 
-pub fn cmd_internal_store(key: Str, src_obj: Str, module_key: Str, src_sha: Str) -> Int ! IO {
+pub fn cmd_internal_store(key: Str, src_obj: Str, module_key: Str, src_sha: Str) -> Int ! IO, FS.Read, FS.Write, FS.Delete {
     if file_exists(src_obj) == 0 {
         io.eprintln("error: source obj does not exist: {src_obj}")
         return 1
@@ -1508,7 +1508,7 @@ pub fn cmd_internal_store(key: Str, src_obj: Str, module_key: Str, src_sha: Str)
     0
 }
 
-pub fn cmd_internal_gc() -> Int ! IO {
+pub fn cmd_internal_gc() -> Int ! IO, FS.Read, FS.Delete {
     maybe_gc()
     0
 }

@@ -136,7 +136,7 @@ fn native_cache_dir() -> Str {
 
 // The embedded gc sources, written once into the native cache. They are written aside and
 // renamed into place, so a concurrent build never reads a half-written tree.
-fn extract_embedded_gc() -> Str ! IO {
+fn extract_embedded_gc() -> Str ! IO, FS.Write, FS.Read, FS.Delete {
     let cache = native_cache_dir()
     let dir = "{cache}/gc"
     if file_exists("{dir}/include/gc.h") == 1 {
@@ -217,7 +217,7 @@ fn strip_extension(filename: Str) -> Str {
 // The blink a child build runs. It must be the running one: another blink can build with a
 // compiler and stdlib other than the ones that typechecked the file, and a build/blink in a
 // user project can be any program. BLINK_BIN stays as an explicit override.
-fn resolve_blink_bin() -> Str {
+fn resolve_blink_bin() -> Str ! FS.Read {
     let blink_bin = env.var("BLINK_BIN") ?? ""
     if blink_bin != "" { return blink_bin }
     let exe_path = archive_compiler_path()
@@ -317,7 +317,7 @@ fn resolve_ffi_link_flags(lib: Str, target: Str) -> Str {
     "-l{lib}"
 }
 
-fn resolve_gc_source() -> Str ! IO {
+fn resolve_gc_source() -> Str ! IO, FS.Write, FS.Read, FS.Delete {
     let blink_root = env.var("BLINK_ROOT") ?? ""
     if blink_root != "" {
         let path = "{blink_root}/bootstrap/vendor/gc/extra/gc.c"
@@ -333,7 +333,7 @@ fn resolve_gc_source() -> Str ! IO {
     "{base}/gc_unity.c"
 }
 
-fn resolve_gc_include() -> Str ! IO {
+fn resolve_gc_include() -> Str ! IO, FS.Write, FS.Read, FS.Delete {
     let blink_root = env.var("BLINK_ROOT") ?? ""
     if blink_root != "" {
         let path = "{blink_root}/bootstrap/vendor/gc/include"
@@ -349,7 +349,7 @@ fn resolve_gc_include() -> Str ! IO {
     "{base}/include"
 }
 
-fn build_link_flags(target: Str, has_async: Int, used_deps: List[Str], ffi_libs: List[Str]) -> Str {
+fn build_link_flags(target: Str, has_async: Int, used_deps: List[Str], ffi_libs: List[Str]) -> Str ! FS.Read {
     let mut flags = "-lm"
     if target == "" {
         flags = "{flags} -lgc"
@@ -573,7 +573,7 @@ fn checked_front_end(b: DaemonBuild, strict_mode: Int) -> Result[Int, Int] ! Dia
     Ok(b.program)
 }
 
-fn do_compile(source_path: Str, c_path: Str, format_flag: Str, debug_mode: Int, strict_mode: Int) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit, Codegen {
+fn do_compile(source_path: Str, c_path: Str, format_flag: Str, debug_mode: Int, strict_mode: Int) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit, Codegen, FS.Read {
     let result = if format_flag == "blink" { format_to_text(source_path) } else { compile_to_text(source_path, debug_mode, strict_mode, false) }
     match result {
         Ok(text) => {
@@ -609,7 +609,7 @@ fn format_to_text(source_path: Str) -> Result[Str, Int] ! Lex.Tokenize, Parse, P
     Ok(format(program))
 }
 
-fn compile_to_text(source_path: Str, debug_mode: Int, strict_mode: Int, test_build: Bool) -> Result[Str, Int] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit, Codegen {
+fn compile_to_text(source_path: Str, debug_mode: Int, strict_mode: Int, test_build: Bool) -> Result[Str, Int] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit, Codegen, FS.Read {
     let final_program = match compile_front_end(source_path, strict_mode) {
         Ok(p) => p
         Err(rc) => return Err(rc)
@@ -693,7 +693,7 @@ fn compiler_archive_holds_effects(program: Int, held: List[Str]) -> Bool {
 // walked up two dirs (build/blink → repo root, or <prefix>/bin/blink →
 // <prefix>). "" if neither resolves — callers then fall back to
 // cwd-relative paths.
-pub fn resolve_install_root() -> Str {
+pub fn resolve_install_root() -> Str ! FS.Read {
     if install_root_cached != "<unset>" {
         return install_root_cached
     }
@@ -712,7 +712,7 @@ pub fn resolve_install_root() -> Str {
     install_root_cached
 }
 
-pub fn resolve_archive_dir() -> Str {
+pub fn resolve_archive_dir() -> Str ! FS.Read {
     let root = resolve_install_root()
     if root != "" {
         let dev_archive = path_join(root, "build/libblink_std.a")
@@ -748,25 +748,25 @@ fn resolve_target_triple(alias: Str) -> Str {
     return alias
 }
 
-fn has_ccache() -> Int ! IO {
+fn has_ccache() -> Int ! IO, FS.Read {
     if ccache_state < 0 {
         ccache_state = if build_fs.find_program("ccache") != "" { 1 } else { 0 }
     }
     ccache_state
 }
 
-pub fn run_cc(args: Str, debug_mode: Int, release_mode: Int, target: Str) -> Int ! IO {
+pub fn run_cc(args: Str, debug_mode: Int, release_mode: Int, target: Str) -> Int ! IO, Process.Spawn, FS.Read {
     run_command(cc_command(args, debug_mode, release_mode, target))
 }
 
 // Starts what run_cc runs without waiting for it; build_fs.reap_to_files answers its end.
-pub fn spawn_cc(args: Str, debug_mode: Int, release_mode: Int, target: Str, dir: Str, name: Str) -> build_fs.FileChild ! IO {
+pub fn spawn_cc(args: Str, debug_mode: Int, release_mode: Int, target: Str, dir: Str, name: Str) -> build_fs.FileChild ! IO, FS.Read, FS.Write, Process.Spawn {
     spawn_unit(cc_command(args, debug_mode, release_mode, target), dir, name)
 }
 
 // Runs cmd as shell_exec does, but without a shell when sh would only split it into words:
 // a build runs cc once per unit and once to link, and each sh costs as much as a small unit.
-fn run_command(cmd: Str) -> Int ! IO {
+fn run_command(cmd: Str) -> Int ! IO, Process.Spawn, FS.Read {
     let words = build_fs.plain_words(cmd)
     if words.len() > 0 && build_fs.find_program(words.get(0).unwrap()) != "" {
         return build_fs.run_program(words.get(0).unwrap(), words_after_first(words))
@@ -776,7 +776,7 @@ fn run_command(cmd: Str) -> Int ! IO {
 
 // Starts cmd as process_spawn("sh", ["-c", cmd]) does, without the shell when run_command
 // would run it without one, its output written to files in dir named for name.
-fn spawn_unit(cmd: Str, dir: Str, name: Str) -> build_fs.FileChild ! IO {
+fn spawn_unit(cmd: Str, dir: Str, name: Str) -> build_fs.FileChild ! IO, FS.Read, FS.Write, Process.Spawn {
     let out_path = "{dir}/{name}.cc-out"
     let err_path = "{dir}/{name}.cc-err"
     let words = build_fs.plain_words(cmd)
@@ -796,7 +796,7 @@ fn words_after_first(words: List[Str]) -> List[Str] {
     rest
 }
 
-fn cc_command(args: Str, debug_mode: Int, release_mode: Int, target: Str) -> Str ! IO {
+fn cc_command(args: Str, debug_mode: Int, release_mode: Int, target: Str) -> Str ! IO, FS.Read {
     let mut compiler = "cc"
     let mut pipe = "-pipe "
     if target != "" {
@@ -833,7 +833,7 @@ fn unit_cc_flags() -> List[Str] {
 // is named under, and the archive dir its headers come from, each of which a debug object's
 // debug info names. An object at another level records none of them, so it serves any tree.
 // None when the compile dir cannot be read.
-fn recorded_paths(debug_mode: Int, c_dir: Str, arc_dir: Str) -> Option[List[Str]] ! IO {
+fn recorded_paths(debug_mode: Int, c_dir: Str, arc_dir: Str) -> Option[List[Str]] ! IO, FS.Read {
     if debug_mode == 0 {
         return Some([])
     }
@@ -858,7 +858,7 @@ fn vendored_dirs_in(include_flags: Str) -> List[Str] {
 // Whether a unit compile maps the vendored dirs to their names: below --debug, when one has a
 // name, and when cc takes the map. A debug object's debug info names each dir by its path
 // anyway. A cc that rejects the map compiles without it, and its object then records the path.
-fn vendored_dirs_by_name(debug_mode: Int, dirs: List[Str], target: Str) -> Bool ! IO {
+fn vendored_dirs_by_name(debug_mode: Int, dirs: List[Str], target: Str) -> Bool ! IO, FS.Read {
     debug_mode == 0 && build_objcache.vendored_dir_maps(dirs).len() > 0 && cc_takes_macro_prefix_map(target)
 }
 
@@ -866,7 +866,7 @@ fn vendored_dirs_by_name(debug_mode: Int, dirs: List[Str], target: Str) -> Bool 
 // it (vendored_map_flags). written names what this build writes. A vendored dir can hold the
 // project, as -I. does, and what the build writes there is no input of it: in the key, each
 // build would miss the objects the last one stored.
-fn vendored_header_lines(debug_mode: Int, dirs: List[Str], target: Str, written: List[Str]) -> Option[List[Str]] ! IO {
+fn vendored_header_lines(debug_mode: Int, dirs: List[Str], target: Str, written: List[Str]) -> Option[List[Str]] ! IO, FS.Read {
     build_objcache.vendored_key_lines(dirs, vendored_dirs_by_name(debug_mode, dirs, target), key_walk_skip(written))
 }
 
@@ -879,7 +879,7 @@ fn key_walk_skip(written: List[Str]) -> List[Str] {
 
 // " <flags>" a unit compile adds so its object names a vendored dir only as its key does
 // (vendored_header_lines).
-fn vendored_map_flags(debug_mode: Int, dirs: List[Str], target: Str) -> Str ! IO {
+fn vendored_map_flags(debug_mode: Int, dirs: List[Str], target: Str) -> Str ! IO, FS.Read {
     if !vendored_dirs_by_name(debug_mode, dirs, target) {
         return ""
     }
@@ -896,7 +896,7 @@ let mut cached_macro_prefix_map: Str = ""
 
 // Whether the cc run_cc runs for target takes -fmacro-prefix-map (gcc 8 and clang 10 on).
 // Probed once per cc id, and only for a build with an absolute vendored dir.
-fn cc_takes_macro_prefix_map(target: Str) -> Bool ! IO {
+fn cc_takes_macro_prefix_map(target: Str) -> Bool ! IO, FS.Read {
     let id = process_cc_id(target)
     if !cached_macro_prefix_map.starts_with("{id}\n") {
         let cmd = cc_command("-fmacro-prefix-map=/blink-probe/=probe/ -E -x c /dev/null -o /dev/null", 0, 0, target)
@@ -913,7 +913,7 @@ fn unit_key_flags(debug_mode: Int, release_mode: Int) -> List[Str] {
     flags
 }
 
-fn compile_vendored_source(c_path: Str, o_path: Str, debug_mode: Int, release_mode: Int, target: Str) -> Int ! IO {
+fn compile_vendored_source(c_path: Str, o_path: Str, debug_mode: Int, release_mode: Int, target: Str) -> Int ! IO, Process.Spawn, FS.Read {
     let src_mt = file_mtime(c_path)
     let obj_mt = file_mtime(o_path)
     if obj_mt >= src_mt && src_mt != -1 {
@@ -935,7 +935,7 @@ fn compile_vendored_source(c_path: Str, o_path: Str, debug_mode: Int, release_mo
 // custom build), (2) installed sidecar at `<install_root>/share/blink/native/<name>/`,
 // (3) dev-tree `lib/native/<name>/`. Returns "" if no source can be
 // located, leaving the caller to error out.
-fn resolve_native_dep_source(name: Str) -> Str {
+fn resolve_native_dep_source(name: Str) -> Str ! FS.Read {
     let dep_type = manifest_native_dep_type(name)
     let dep_path = manifest_native_dep_path(name)
     if dep_type == "vendored" && dep_path != "" {
@@ -969,7 +969,7 @@ fn vendored_object_path(name: Str, target: Str) -> Str {
     if target == "" { "{native_cache_dir()}/{name}.o" } else { "{native_cache_dir()}/{name}-{target}.o" }
 }
 
-fn resolve_vendored_objects(used_deps: List[Str], debug_mode: Int, release_mode: Int, target: Str) -> List[Str] ! IO {
+fn resolve_vendored_objects(used_deps: List[Str], debug_mode: Int, release_mode: Int, target: Str) -> List[Str] ! IO, FS.Write, FS.Read, Process.Spawn, FS.Delete {
     let mut objects: List[Str] = []
 
     if target != "" {
@@ -1042,7 +1042,7 @@ fn resolve_vendored_objects(used_deps: List[Str], debug_mode: Int, release_mode:
 
 // The -I flags a zig compile for target needs to find gc.h, which the host's cc finds
 // installed; none for a host build.
-fn cross_gc_includes(target: Str) -> List[Str] ! IO {
+fn cross_gc_includes(target: Str) -> List[Str] ! IO, FS.Write, FS.Read, FS.Delete {
     let mut includes: List[Str] = []
     if target != "" {
         let gc_inc = resolve_gc_include()
@@ -1059,7 +1059,7 @@ fn cross_gc_includes(target: Str) -> List[Str] ! IO {
     includes
 }
 
-fn resolve_vendored_includes(used_deps: List[Str], target: Str) -> Str ! IO {
+fn resolve_vendored_includes(used_deps: List[Str], target: Str) -> Str ! IO, FS.Read, FS.Write, FS.Delete {
     let mut includes = cross_gc_includes(target)
 
     let mut di = 0
@@ -1108,7 +1108,7 @@ let mut cached_cc_id: Str = ""
 // "<target>\n" once cached_cc_id holds that target's identity; "" before the first call.
 let mut cached_cc_id_for: Str = ""
 
-pub fn process_compiler_sha() -> Str ! IO {
+pub fn process_compiler_sha() -> Str ! IO, FS.Read {
     if cached_compiler_sha == "" {
         cached_compiler_sha = sha256_of_file_first(archive_compiler_path())
     }
@@ -1142,7 +1142,7 @@ let mut cache_did_store: Int = 0
 // The object answered sits in snap_dir, which the caller removes after its link: the GC of
 // another build can remove the cache entry before then. The key and the compile both read
 // snap, the private copy of the C the build emitted.
-fn cache_compile_snapshot(out: Str, snap: Str, c_path: Str, snap_dir: Str, debug_mode: Int, release_mode: Int, target: Str, arc_dir: Str, include_flags: Str) -> Str ! IO {
+fn cache_compile_snapshot(out: Str, snap: Str, c_path: Str, snap_dir: Str, debug_mode: Int, release_mode: Int, target: Str, arc_dir: Str, include_flags: Str) -> Str ! IO, FS.Read, FS.Write, Process.Spawn, FS.Delete {
     let vendored_dirs = vendored_dirs_in(include_flags)
     let flags = cc_opt_flags(debug_mode, release_mode)
     let paths = match recorded_paths(debug_mode, path_dirname(c_path), arc_dir) {
@@ -1189,7 +1189,7 @@ fn sha8(sha: Str) -> Str {
 // is not recomputed on each run: it costs tens of ms, and the compiler SHA is already
 // memoized for the obj cache. An installed archive is never rebuilt;
 // verify_installed_archive checks it instead.
-fn ensure_dev_archive() -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Codegen, IO {
+fn ensure_dev_archive() -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Codegen, IO, FS.Read, FS.Write, Process.Spawn, FS.Delete {
     if dev_archive_current() {
         return 0
     }
@@ -1202,7 +1202,7 @@ fn ensure_dev_archive() -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, 
 }
 
 // Whether ensure_dev_archive would leave the archive as it is.
-fn dev_archive_current() -> Bool ! IO {
+fn dev_archive_current() -> Bool ! IO, FS.Read {
     let arc_dir = resolve_archive_dir()
     if arc_dir.ends_with("share/blink") {
         return true
@@ -1224,7 +1224,7 @@ fn dev_archive_current() -> Bool ! IO {
 // std-cache entry keeps a copy of the runtime.h its archive compiled, and reading both is
 // cheaper than hashing one: the sha costs about 2 ms, and this runs on each build. An archive
 // with no such copy apart from the live header is checked by its stamp's runtime.h sha.
-fn dev_archive_runtime_h_current(arc_dir: Str, stamp_rt_sha: Str) -> Bool ! IO {
+fn dev_archive_runtime_h_current(arc_dir: Str, stamp_rt_sha: Str) -> Bool ! IO, FS.Read {
     let rt = resolve_runtime_h()
     match build_fs.real_path(path_join(arc_dir, "libblink_std.a")) {
         Some(archive) => {
@@ -1265,7 +1265,7 @@ fn dev_archive_runtime_h_current(arc_dir: Str, stamp_rt_sha: Str) -> Bool ! IO {
 // Returns 0 when the link may proceed (dev archive, or matching installed
 // stamp), 1 when an installed archive is incompatible or unstamped (a
 // diagnostic is emitted and the caller must not produce a binary).
-fn verify_installed_archive(arc_dir: Str) -> Int ! Diag.Report, IO {
+fn verify_installed_archive(arc_dir: Str) -> Int ! Diag.Report, IO, FS.Read {
     if !arc_dir.ends_with("share/blink") {
         return 0
     }
@@ -1310,7 +1310,7 @@ fn verify_installed_archive(arc_dir: Str) -> Int ! Diag.Report, IO {
 // arc_dir holds host-arch objects, built against the host's libc, whose symbols zig's libc
 // for the same arch can lack. It is cached under build/ beside the cross-built gc, since
 // share/blink may be read-only. "" after an error is printed.
-fn ensure_target_archive(arc_dir: Str, target: Str) -> Str ! IO {
+fn ensure_target_archive(arc_dir: Str, target: Str) -> Str ! IO, FS.Write, FS.Read, FS.Delete, Process.Spawn {
     if target == "" {
         return "{arc_dir}/libblink_std.a"
     }
@@ -1372,7 +1372,7 @@ fn ensure_target_archive(arc_dir: Str, target: Str) -> Str ! IO {
     archive
 }
 
-fn do_link_target(out: Str, c_path: Str, c_source: Str, link_flags: Str, obj_files: List[Str], include_flags: Str, debug_mode: Int, release_mode: Int, target: Str, compiler_archive: Str) -> Int ! Diag.Report, IO {
+fn do_link_target(out: Str, c_path: Str, c_source: Str, link_flags: Str, obj_files: List[Str], include_flags: Str, debug_mode: Int, release_mode: Int, target: Str, compiler_archive: Str) -> Int ! Diag.Report, IO, FS.Read, FS.Write, FS.Delete, Process.Spawn {
     let mut objs = ""
     if obj_files.len() > 0 {
         objs = " {obj_files.join(" ")}"
@@ -1549,7 +1549,7 @@ let BUILD_STATUS_HUMAN = 0
 let BUILD_STATUS_JSON = 1
 let BUILD_STATUS_NONE = 2
 
-fn do_build(source_path: Str, output_path: Str, c_path: Str, debug_mode: Int, release_mode: Int, test_build: Bool, emit_mode: Str, targets: List[Str], status_mode: Int, strict_mode: Int, unit_jobs: Int, per_module_flag: Bool, checked: Option[DaemonBuild]) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit, Codegen, IO {
+fn do_build(source_path: Str, output_path: Str, c_path: Str, debug_mode: Int, release_mode: Int, test_build: Bool, emit_mode: Str, targets: List[Str], status_mode: Int, strict_mode: Int, unit_jobs: Int, per_module_flag: Bool, checked: Option[DaemonBuild]) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit, Codegen, IO, FS.Read, FS.Write, FS.Delete, Process.Spawn {
     fs_remove(output_path)
     // Before the compile: it checks a compiler archive against the stdlib archive's
     // stamp, which a rebuild here would change.
@@ -1744,7 +1744,7 @@ type UnitHeaders {
 // typedefs again for each module, as the verify's cold emit does; otherwise one walk serves
 // every header. With `last`, a module whose headers emit_record.headers_unchanged allows keeps
 // the last build's, and a header whose text did not change is a link to the last build's file.
-fn write_unit_headers(program: Int, modules: List[Str], cfg: CgConfig, facts: ProgramFacts, dir: Str, full_walk: Bool, last: Option[emit_record.LastBuild]) -> Result[UnitHeaders, Int] ! Diag.Report, Codegen, IO {
+fn write_unit_headers(program: Int, modules: List[Str], cfg: CgConfig, facts: ProgramFacts, dir: Str, full_walk: Bool, last: Option[emit_record.LastBuild]) -> Result[UnitHeaders, Int] ! Diag.Report, Codegen, IO, FS.Write {
     let types = generate_types_header(program, cfg)
     let trc = units_bail_on_diag()
     if trc != 0 { return Err(trc) }
@@ -1850,7 +1850,7 @@ fn units_bail_on_diag() -> Int ! Diag.Report {
 }
 
 // The std modules the archive holds are declared, not compiled, as in the one-unit build.
-fn units_cg_config(debug_mode: Int, test_build: Bool) -> CgConfig {
+fn units_cg_config(debug_mode: Int, test_build: Bool) -> CgConfig ! FS.Read {
     let mut skip: Map[Str, Int] = Map()
     for k in list_stdlib_module_keys() {
         skip.insert(k, 1)
@@ -1896,7 +1896,7 @@ fn emit_reuse_allowed() -> Bool {
 // in last_dir when the emit's inputs are the ones it records.
 // checked is the build the daemon forked this process for, whose checked program it
 // compiles; None in any other process.
-fn do_compile_units(source_path: Str, dir: Str, last_dir: Str, debug_mode: Int, strict_mode: Int, test_build: Bool, chunk_decls: Int, checked: Option[DaemonBuild]) -> Result[CompiledUnits, Int] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Codegen, IO {
+fn do_compile_units(source_path: Str, dir: Str, last_dir: Str, debug_mode: Int, strict_mode: Int, test_build: Bool, chunk_decls: Int, checked: Option[DaemonBuild]) -> Result[CompiledUnits, Int] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Codegen, IO, FS.Read, FS.Delete, FS.Write {
     let front = match checked {
         Some(b) => checked_front_end(b, strict_mode)
         None => {
@@ -2103,7 +2103,7 @@ fn emit_reuse_verify() -> Bool {
 // not only the units taken: main, a header or a unit lowered beside a taken unit can read what
 // the taken unit's lowering would have set. The files taken are links to the last build's, so
 // nothing is written beside them.
-fn verify_against_cold_emit(program: Int, modules: List[Str], cfg: CgConfig, units: List[emit_record.EmittedUnit], dir: Str, chunk_decls: Int) -> Int ! Diag.Report, Codegen, IO {
+fn verify_against_cold_emit(program: Int, modules: List[Str], cfg: CgConfig, units: List[emit_record.EmittedUnit], dir: Str, chunk_decls: Int) -> Int ! Diag.Report, Codegen, IO, FS.Write {
     let vdir = "{dir}/.verify"
     shell_exec("rm -rf \"{vdir}\" && mkdir -p \"{vdir}\"")
     let rc = verify_cold_files(program, modules, cfg, units, dir, vdir, chunk_decls)
@@ -2111,7 +2111,7 @@ fn verify_against_cold_emit(program: Int, modules: List[Str], cfg: CgConfig, uni
     rc
 }
 
-fn verify_cold_files(program: Int, modules: List[Str], cfg: CgConfig, units: List[emit_record.EmittedUnit], dir: Str, vdir: Str, chunk_decls: Int) -> Int ! Diag.Report, Codegen, IO {
+fn verify_cold_files(program: Int, modules: List[Str], cfg: CgConfig, units: List[emit_record.EmittedUnit], dir: Str, vdir: Str, chunk_decls: Int) -> Int ! Diag.Report, Codegen, IO, FS.Write {
     let facts = program_facts(program, cfg)
     let hs = match write_unit_headers(program, modules, cfg, facts, vdir, true, None) {
         Ok(h) => h
@@ -2315,7 +2315,7 @@ fn units_flush_warnings(strict_mode: Int) -> Int ! Diag.Report {
     0
 }
 
-fn do_build_units(source_path: Str, output_path: Str, debug_mode: Int, release_mode: Int, test_build: Bool, targets: List[Str], status_mode: Int, strict_mode: Int, unit_jobs: Int, checked: Option[DaemonBuild]) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Codegen, IO {
+fn do_build_units(source_path: Str, output_path: Str, debug_mode: Int, release_mode: Int, test_build: Bool, targets: List[Str], status_mode: Int, strict_mode: Int, unit_jobs: Int, checked: Option[DaemonBuild]) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Codegen, IO, FS.Read, FS.Write, FS.Delete, Process.Spawn {
     let mut out_dir = path_dirname(output_path)
     if out_dir == "" {
         out_dir = "."
@@ -2365,7 +2365,7 @@ fn do_build_units(source_path: Str, output_path: Str, debug_mode: Int, release_m
     rc
 }
 
-fn link_units_all_targets(source_path: Str, output_path: Str, work: Str, units_dir: Str, units: List[emit_record.EmittedUnit], shas: Option[Map[Str, Str]], debug_mode: Int, release_mode: Int, targets: List[Str], status_mode: Int, unit_jobs: Int) -> Int ! Diag.Report, IO {
+fn link_units_all_targets(source_path: Str, output_path: Str, work: Str, units_dir: Str, units: List[emit_record.EmittedUnit], shas: Option[Map[Str, Str]], debug_mode: Int, release_mode: Int, targets: List[Str], status_mode: Int, unit_jobs: Int) -> Int ! Diag.Report, IO, FS.Write, FS.Read, FS.Delete, Process.Spawn {
     // The scans below read what the one-unit build reads from its single C file: each unit
     // and each header a unit includes, which is all cc compiles. A marker the scans look
     // for starts a line, so each file starts one.
@@ -2487,7 +2487,7 @@ fn no_child() -> build_fs.FileChild {
 
 // Waits for the PCH build run left running and installs its PCH. Answers whether this or run
 // installed one.
-fn finish_pch(run: UnitRun) -> Bool ! IO {
+fn finish_pch(run: UnitRun) -> Bool ! IO, Process.Spawn, FS.Write, FS.Delete, FS.Read {
     if run.pch_child.pid < 0 {
         return run.pch_stored
     }
@@ -2503,7 +2503,7 @@ fn finish_pch(run: UnitRun) -> Bool ! IO {
 // written beside the PCH in its staged dir when there is any, so a build that finds the PCH
 // can check it. None when the PCH must not be stored: the build failed, its archive headers
 // changed while it ran, or what it read cannot be told.
-fn seal_pch(pch: PchJob, exit_code: Int) -> Option[List[Str]] ! IO {
+fn seal_pch(pch: PchJob, exit_code: Int) -> Option[List[Str]] ! IO, FS.Read {
     if exit_code != 0 || !pch_inputs_unchanged(pch) {
         return None
     }
@@ -2521,7 +2521,7 @@ fn seal_pch(pch: PchJob, exit_code: Int) -> Option[List[Str]] ! IO {
     }
 }
 
-fn pch_inputs_unchanged(pch: PchJob) -> Bool ! IO {
+fn pch_inputs_unchanged(pch: PchJob) -> Bool ! IO, FS.Read {
     pch.arc_dir == "" || build_objcache.pch_headers_unchanged(pch.arc_dir, pch.archive_sha, pch.runtime_sha)
 }
 
@@ -2541,7 +2541,7 @@ fn pch_inputs_unchanged(pch: PchJob) -> Bool ! IO {
 // can a pipe.
 // Only the units are waited on by pid, so no child another part of this process started is
 // reaped here.
-fn run_unit_compiles(plain: List[Str], with_pch: List[Str], pch_ready: Bool, pch: PchJob, unit_jobs: Int, io_dir: Str) -> UnitRun ! IO {
+fn run_unit_compiles(plain: List[Str], with_pch: List[Str], pch_ready: Bool, pch: PchJob, unit_jobs: Int, io_dir: Str) -> UnitRun ! IO, FS.Read, FS.Write, Process.Spawn, FS.Delete {
     let n = plain.len()
     let mut by_idx: List[UnitCompile] = []
     if n == 0 { return UnitRun { results: by_idx, pch_stored: false, pch: no_pch_job(), pch_child: no_child(), pch_reads: [] } }
@@ -2657,7 +2657,7 @@ fn archive_header_prefix(c_path: Str) -> Option[List[Str]] ! IO {
 // beside the archive header already serves every gcc unit; clang reads no .gch.
 // BLINK_ARCHIVE_PCH=0 turns it off, so a test can build the same objects with no PCH in the
 // cache.
-fn archive_pch_eligible(target: Str, arc_dir: Str) -> Bool ! IO {
+fn archive_pch_eligible(target: Str, arc_dir: Str) -> Bool ! IO, FS.Read {
     if (env.var("BLINK_ARCHIVE_PCH") ?? "") == "0" {
         return false
     }
@@ -2674,7 +2674,7 @@ fn cc_is_clang() -> Bool ! IO {
 
 // Compiles the units the cache cannot answer, largest first, then links every unit's object
 // against the archive.
-fn link_units(out: Str, work: Str, units_dir: Str, units: List[emit_record.EmittedUnit], shas: Option[Map[Str, Str]], link_flags: Str, obj_files: List[Str], include_flags: Str, debug_mode: Int, release_mode: Int, target: Str, unit_jobs: Int) -> Int ! Diag.Report, IO {
+fn link_units(out: Str, work: Str, units_dir: Str, units: List[emit_record.EmittedUnit], shas: Option[Map[Str, Str]], link_flags: Str, obj_files: List[Str], include_flags: Str, debug_mode: Int, release_mode: Int, target: Str, unit_jobs: Int) -> Int ! Diag.Report, IO, FS.Write, FS.Read, FS.Delete, Process.Spawn {
     let arc_dir = resolve_archive_dir()
     let vrc = verify_installed_archive(arc_dir)
     if vrc != 0 {
@@ -2955,7 +2955,7 @@ fn link_units(out: Str, work: Str, units_dir: Str, units: List[emit_record.Emitt
 // Removes the objects link_units held for its link: the hold dir of its cache hits, and each
 // object it compiled that the cache now holds, which the units dir need not keep. Before the
 // GC, so it does not count them.
-fn drop_link_holds(hold: Str, compiled: List[Str], installed: List[Bool]) ! IO {
+fn drop_link_holds(hold: Str, compiled: List[Str], installed: List[Bool]) ! IO, FS.Delete {
     if hold != "" {
         let _ = build_fs.remove_tree(hold)
     }
@@ -3997,7 +3997,7 @@ fn do_ffi_audit(program: Int, json_output: Int) {
     }
 }
 
-fn cmd_build(p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit, Codegen, IO {
+fn cmd_build(p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit, Codegen, IO, FS.Write, FS.Read, Env.Read, Process.Spawn, FS.Delete, Net.Connect {
     if build_through_daemon(a, "build") {
         return
     }
@@ -4007,7 +4007,7 @@ fn cmd_build(p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
 // The build `blink build` runs in its own process, or in a child of the daemon, which passes
 // the build it forked the child for as checked. test_build is true only for the build a
 // `blink test` worker asks for through `__test-build`.
-fn build_here(p: ArgParser, a: Args, checked: Option[DaemonBuild], test_build: Bool) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit, Codegen, IO {
+fn build_here(p: ArgParser, a: Args, checked: Option[DaemonBuild], test_build: Bool) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit, Codegen, IO, FS.Write, FS.Read, FS.Delete, Process.Spawn {
     let source_path = args_positional(a, 0)
     let bad_format = build_format_usage_error(a)
     if bad_format != "" {
@@ -4108,7 +4108,7 @@ fn build_here(p: ArgParser, a: Args, checked: Option[DaemonBuild], test_build: B
     }
 }
 
-fn cmd_run(p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit, Codegen, IO {
+fn cmd_run(p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit, Codegen, IO, FS.Write, FS.Read, Env.Read, Process.Spawn, FS.Delete, Net.Connect {
     // Before the daemon is asked, so a bad value builds nothing on either path.
     let bad_format = build_format_usage_error(a)
     if bad_format != "" {
@@ -4133,7 +4133,7 @@ fn run_output_path(a: Args) -> Str {
 
 // The build `blink run` runs in its own process, or in a child of the daemon, which passes
 // checked as build_here's does: the path of the program it built.
-fn run_build_here(p: ArgParser, a: Args, checked: Option[DaemonBuild]) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit, Codegen, IO {
+fn run_build_here(p: ArgParser, a: Args, checked: Option[DaemonBuild]) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit, Codegen, IO, FS.Write, FS.Read, FS.Delete, Process.Spawn {
     let source_path = args_positional(a, 0)
     if source_path == "" {
         io.eprintln("error: no source file specified")
@@ -4255,7 +4255,7 @@ fn remove_test_scratch(dir: Str) {
     }
 }
 
-fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit, Codegen, IO {
+fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit, Codegen, IO, FS.Read, FS.Write, Process.Spawn, FS.Delete {
     let bad_format = build_format_usage_error(a)
     if bad_format != "" {
         io.eprintln(bad_format)
@@ -4674,7 +4674,7 @@ fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
     }
 }
 
-fn cmd_check(p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, IO {
+fn cmd_check(p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, IO, FS.Read, Env.Read, FS.Write, Process.Spawn, FS.Delete, Net.Connect {
     let source_path = args_positional(a, 0)
     let json_output = if json_requested(a) { 1 } else { 0 }
     let bad_format = format_usage_error(a, report_formats())
@@ -4720,7 +4720,7 @@ fn cmd_check(p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
 // machine-applicable when it names the span it replaces; one without a span is help only.
 // Prints a line for each edit it applied, then each diagnostic it did not fix as `check` prints
 // it, and exits as `check` would on those alone.
-fn cmd_fix(p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, IO {
+fn cmd_fix(p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, IO, FS.Read {
     let source_path = args_positional(a, 0)
     if source_path == "" {
         io.eprintln("error: no source file specified")
@@ -4825,7 +4825,7 @@ fn cmd_fix(p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Repor
 // the nearest directory at or above the entry that holds blink.toml, else the entry's own
 // directory. The embedded stdlib, a stdlib or vendored package on disk, and a package in the
 // cache or anywhere outside the project are someone else's code.
-fn fix_editable_sources(source_path: Str) -> Map[Str, Int] {
+fn fix_editable_sources(source_path: Str) -> Map[Str, Int] ! FS.Read {
     let mut out: Map[Str, Int] = Map()
     let entry_dir = build_fs.real_path(path_dirname(source_path)) ?? ""
     if entry_dir == "" { return out }
@@ -4920,7 +4920,7 @@ fn check_failed_status_line(source_path: Str) -> Str {
 // the client can not read, falls back to a cold check: the daemon may make a check faster,
 // never different. Called once the command's flags are applied. True when the daemon's
 // answer was printed.
-fn check_through_daemon(source_path: Str, json_status: Int, diag_json: Int, strict: Int, strict_struct_layout: Bool) -> Bool ! IO {
+fn check_through_daemon(source_path: Str, json_status: Int, diag_json: Int, strict: Int, strict_struct_layout: Bool) -> Bool ! IO, FS.Read, Env.Read, FS.Write, Process.Spawn, FS.Delete, Net.Connect {
     let sock = daemon_socket_path()
     if !file_exists(sock) {
         return false
@@ -4988,7 +4988,7 @@ fn daemon_may_build(a: Args) -> Bool {
 // with a NUL, as a value may hold a newline; an env without -0 lists them one per line, so a
 // value with a newline then splits in two. The records are kept as hex, which sorts as the
 // bytes do and holds the NUL that a Str cannot.
-fn daemon_identity() -> Str ! IO {
+fn daemon_identity() -> Str ! IO, FS.Read, FS.Write, Process.Spawn, FS.Delete, Net.Connect {
     let compiler = archive_compiler_path()
     match daemon_proc_identity(compiler) {
         Some(id) => return "{get_arg(0)}\n{compiler}\n{id}"
@@ -5006,7 +5006,7 @@ fn daemon_identity() -> Str ! IO {
 }
 
 // The hex of each sep-ended record that `env args` prints, or None when env fails.
-fn env_records(args: List[Str], sep: Int) -> Option[List[Str]] ! IO {
+fn env_records(args: List[Str], sep: Int) -> Option[List[Str]] ! IO, FS.Write, FS.Read, Process.Spawn, FS.Delete {
     let tmp = env.var("TMPDIR") ?? "/tmp"
     let dir = build_fs.private_dir(if tmp == "" { "/tmp" } else { tmp }, "blink-env")
     if dir == "" { return None }
@@ -5042,7 +5042,7 @@ fn front_settings(strict_struct_layout: Bool) -> Str {
 // A request for a daemon answer that runs the front end. It names the client's identity and
 // front-end settings, so the daemon serves only a client whose cold run would read the same.
 // Called after the connect, so a socket no daemon serves costs the client no hashing.
-fn daemon_front_request(kind: Str, settings: Str) -> Int ! IO {
+fn daemon_front_request(kind: Str, settings: Str) -> Int ! IO, FS.Read, FS.Write, Process.Spawn, FS.Delete, Net.Connect {
     let identity = daemon_identity()
     json_clear()
     let req = json_new_object()
@@ -5059,7 +5059,7 @@ fn daemon_front_request(kind: Str, settings: Str) -> Int ! IO {
 // cold build. The daemon may make a build faster, never different. True when
 // the build through the daemon succeeded and its output was printed; a failed build exits with
 // its code.
-fn build_through_daemon(a: Args, command: Str) -> Bool ! IO {
+fn build_through_daemon(a: Args, command: Str) -> Bool ! IO, FS.Read, Env.Read, FS.Write, Process.Spawn, FS.Delete, Net.Connect {
     if !daemon_may_build(a) {
         return false
     }
@@ -5115,7 +5115,7 @@ fn build_through_daemon(a: Args, command: Str) -> Bool ! IO {
 // A build that would first resolve dependencies or rebuild the stdlib archive declines, since
 // the client's cold build reads what those write, and the archive's own front end would undo
 // the checked program.
-fn build_in_daemon_child(b: DaemonBuild) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit, Codegen, IO {
+fn build_in_daemon_child(b: DaemonBuild) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit, Codegen, IO, FS.Write, FS.Read, FS.Delete, Process.Spawn {
     let p = cli_parser()
     let a = parse_argv(p, b.argv)
     let command = args_command(a)
@@ -5185,7 +5185,7 @@ fn cmd_emit_archive_header(args_list: List[Str]) ! Lex.Tokenize, Parse, Parse.Bu
 // emits with blink_ev_extern_only=1 so the linker resolves the single
 // definition. Each .c #includes its own .h. Headers are #ifndef-guarded
 // so cross-module #includes (added by callers driving cc) compose safely.
-fn cmd_emit_per_module(args_list: List[Str]) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Codegen, IO {
+fn cmd_emit_per_module(args_list: List[Str]) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Codegen, IO, FS.Write {
     if args_list.len() < 2 {
         io.println("error: __emit-per-module requires <entry.bl> <out_dir>")
         env.exit(1)
@@ -5305,7 +5305,7 @@ fn cmd_audit(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Re
     }
 }
 
-fn cmd_fmt(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit, Codegen, IO {
+fn cmd_fmt(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit, Codegen, IO, FS.Read {
     let source_path = args_positional(a, 0)
     let bad_format = format_usage_error(a, report_formats())
     if bad_format != "" {
@@ -5789,7 +5789,7 @@ fn cmd_doc(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Diag.Report {
 // as it is now would build, for a client with its compiler, environment and settings.
 // Anything else, and a reply the client can not read, falls back to a cold query: the daemon
 // may make a query faster, never different. True when the daemon's answer was printed.
-fn query_through_daemon(a: Args, source_path: Str) -> Bool ! IO {
+fn query_through_daemon(a: Args, source_path: Str) -> Bool ! IO, FS.Read, Env.Read, FS.Write, Process.Spawn, FS.Delete, Net.Connect {
     let sock = daemon_socket_path()
     if !file_exists(sock) {
         return false
@@ -5823,7 +5823,7 @@ fn query_through_daemon(a: Args, source_path: Str) -> Bool ! IO {
     true
 }
 
-fn cmd_query(p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Diag.Report, IO {
+fn cmd_query(p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Diag.Report, IO, FS.Read, Env.Read, FS.Write, Process.Spawn, FS.Delete, Net.Connect {
     let source_path = args_positional(a, 0)
     if source_path == "" {
         io.eprintln("error: no source file specified")
@@ -6061,7 +6061,7 @@ fn cmd_ast(p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Repor
 
 // blink.toml names no entry file, so start takes it as an argument. The daemon serves the
 // project, so its socket goes at the project root wherever the entry lives.
-fn cmd_daemon_start(_p: ArgParser, a: Args) ! Daemon.Serve, IO, Lex.Tokenize, Parse, Parse.Build, TypeCheck, Diag.Report, Format.Emit, Codegen {
+fn cmd_daemon_start(_p: ArgParser, a: Args) ! Daemon.Serve, IO, Lex.Tokenize, Parse, Parse.Build, TypeCheck, Diag.Report, Format.Emit, Codegen, FS.Read, FS.Write, Process.Spawn, Env.Write, Env.Read, Process.Signal, FS.Delete, Net.Connect, Net.Listen {
     let daemon_source = args_positional(a, 0)
     if daemon_source == "" {
         io.eprintln("error: daemon start needs the entry file of the program to serve")

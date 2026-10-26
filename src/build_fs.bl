@@ -16,7 +16,7 @@ let BFS_ENOTEMPTY_MACOS = 66
 
 // mkdir -p: each missing directory of path, made with mode 0777 less the umask. True when path
 // is a directory at the end, which a directory another process made first also gives.
-pub fn mkdir_p(path: Str) -> Bool ! IO {
+pub fn mkdir_p(path: Str) -> Bool ! IO, FS.Write {
     if path == "" { return false }
     if is_dir(path) == 1 { return true }
     let mut prefix = if path.starts_with("/") { "/" } else { "" }
@@ -34,7 +34,7 @@ pub fn mkdir_p(path: Str) -> Bool ! IO {
 
 // rm -rf: path and all under it. A link is removed, never followed. True when path is gone.
 // A private dir this process holds live is unlocked once it is gone.
-pub fn remove_tree(path: Str) -> Bool ! IO {
+pub fn remove_tree(path: Str) -> Bool ! IO, FS.Delete {
     if path == "" { return false }
     if live_locks.contains_key(path) {
         let gone = remove_entries(path)
@@ -44,7 +44,7 @@ pub fn remove_tree(path: Str) -> Bool ! IO {
     remove_entries(path)
 }
 
-fn remove_entries(path: Str) -> Bool ! IO {
+fn remove_entries(path: Str) -> Bool ! IO, FS.Delete {
     let mut rc = 0
     let mut err = 0
     with ffi.scope() as scope {
@@ -65,7 +65,7 @@ fn remove_entries(path: Str) -> Bool ! IO {
 }
 
 // 0 when rmdir(2) removed path, else its errno, or -1 when it set none.
-fn rmdir_errno(path: Str) -> Int ! IO {
+fn rmdir_errno(path: Str) -> Int ! IO, FS.Delete {
     let mut e = 0
     with ffi.scope() as scope {
         if bfs_rmdir(scope.cstr(path)).to_int() != 0 {
@@ -78,7 +78,7 @@ fn rmdir_errno(path: Str) -> Int ! IO {
 
 // mv -f within one filesystem. False when rename(2) fails; mv would copy across
 // filesystems, so a caller whose paths may cross one falls back to it.
-pub fn rename(from: Str, to: Str) -> Bool ! IO {
+pub fn rename(from: Str, to: Str) -> Bool ! IO, FS.Write {
     let mut rc = -1
     with ffi.scope() as scope {
         rc = bfs_rename(scope.cstr(from), scope.cstr(to)).to_int()
@@ -92,7 +92,7 @@ pub fn rename(from: Str, to: Str) -> Bool ! IO {
 // a check-then-mv would put stage inside it. A dir there without key is no dir any build
 // published, and goes first. It is tested for before key, so a dir another build renames in
 // between is never taken for one without key.
-pub fn publish_dir(stage: Str, dir: Str, key: Str) -> Bool ! IO {
+pub fn publish_dir(stage: Str, dir: Str, key: Str) -> Bool ! IO, FS.Write, FS.Delete {
     unmark(stage)
     if file_exists(dir) == 1 && file_exists("{dir}/{key}") == 0 {
         let _ = remove_tree(dir)
@@ -113,7 +113,7 @@ let BFS_NAME_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz012345
 // mktemp -d {parent}/{prefix}.XXXXXX: a new directory only its user may enter, named by six
 // random characters, which this process holds live (hold_live) until it removes it or calls
 // unmark. "" when none can be made.
-pub fn private_dir(parent: Str, prefix: Str) -> Str ! IO {
+pub fn private_dir(parent: Str, prefix: Str) -> Str ! IO, FS.Write, FS.Read {
     let mut tries = 0
     while tries < 100 {
         tries = tries + 1
@@ -164,7 +164,7 @@ pub fn is_live_mark(name: Str) -> Bool {
 // Locks the new dir at path, then marks it. The mark comes only after the lock, so no reaper
 // can take a marked dir for dead between the two. Where the lock cannot be taken the dir
 // stays unmarked, and no reaper ever removes it.
-fn hold_live(path: Str) ! IO {
+fn hold_live(path: Str) ! IO, FS.Read {
     let mut fd = -1
     with ffi.scope() as scope {
         fd = bfs_open_read(scope.cstr(path), 0.to_i32()).to_int()
@@ -205,7 +205,7 @@ fn drop_lock(path: Str) ! IO {
 // Removes each private dir {parent}/{prefix}.*, for each of prefixes, that a dead build left:
 // one that holds the mark and whose lock this process takes. It holds the lock while it
 // removes the dir.
-pub fn reap_dead(parent: Str, prefixes: List[Str]) ! IO {
+pub fn reap_dead(parent: Str, prefixes: List[Str]) ! IO, FS.Read, FS.Delete {
     for name in list_dir(parent) {
         let mut ours = false
         for prefix in prefixes {
@@ -231,7 +231,7 @@ pub fn reap_dead(parent: Str, prefixes: List[Str]) ! IO {
 // touch on a file: its mtime becomes now and its bytes stay. The first byte is written back
 // over itself, as the FFI cannot bind utimes(2). A missing file is made empty, as touch makes
 // it; an empty one is written empty again.
-pub fn touch(path: Str) -> Bool ! IO {
+pub fn touch(path: Str) -> Bool ! IO, FS.Read, FS.Write {
     let mut fd = -1
     let mut err = 0
     with ffi.scope() as scope {
@@ -270,14 +270,14 @@ pub fn touch(path: Str) -> Bool ! IO {
 
 // ln: a hard link at to for the file at from. False when link(2) fails, as it does across
 // filesystems or on one with no hard links.
-pub fn hard_link(from: Str, to: Str) -> Bool ! IO {
+pub fn hard_link(from: Str, to: Str) -> Bool ! IO, FS.Write {
     bfs_link(from, to).to_int() == 0
 }
 
 // cp: a new file at to with the bytes of the file at from, read and written in this process,
 // as a process per file costs more than a small unit's compile. False, with to removed, when
 // from cannot be read or to cannot be written.
-pub fn copy_file(from: Str, to: Str) -> Bool ! IO {
+pub fn copy_file(from: Str, to: Str) -> Bool ! IO, FS.Read, FS.Write, FS.Delete {
     let mut src = -1
     with ffi.scope() as scope {
         src = bfs_open_read(scope.cstr(from), 0.to_i32()).to_int()
@@ -329,7 +329,7 @@ fn write_all(fd: Int, data: Bytes) -> Bool ! IO {
 }
 
 // The size of the file at path in bytes, or -1 when it cannot be opened.
-pub fn file_size(path: Str) -> Int ! IO {
+pub fn file_size(path: Str) -> Int ! IO, FS.Read {
     let mut size = -1
     with ffi.scope() as scope {
         let fd = bfs_open_read(scope.cstr(path), 0.to_i32()).to_int()
@@ -344,7 +344,7 @@ pub fn file_size(path: Str) -> Int ! IO {
 
 // The path with each symbolic link resolved, or None when realpath(3) cannot resolve it, such
 // as a missing file.
-pub fn real_path(path: Str) -> Option[Str] {
+pub fn real_path(path: Str) -> Option[Str] ! FS.Read {
     let mut real: Option[Str] = None
     with ffi.scope() as scope {
         let buf = scope.alloc_n[U8](4096)
@@ -356,7 +356,7 @@ pub fn real_path(path: Str) -> Option[Str] {
 }
 
 // Whether the files at a and b hold the same bytes. False when either cannot be read.
-pub fn same_bytes(a: Str, b: Str) -> Bool ! IO {
+pub fn same_bytes(a: Str, b: Str) -> Bool ! IO, FS.Read {
     match read_all(a) {
         Some(x) => {
             match read_all(b) {
@@ -369,7 +369,7 @@ pub fn same_bytes(a: Str, b: Str) -> Bool ! IO {
 }
 
 // The whole file as bytes: a Str read would stop at the first NUL byte.
-fn read_all(path: Str) -> Option[Bytes] ! IO {
+fn read_all(path: Str) -> Option[Bytes] ! IO, FS.Read {
     let mut fd = -1
     with ffi.scope() as scope {
         fd = bfs_open_read(scope.cstr(path), 0.to_i32()).to_int()
@@ -396,7 +396,7 @@ fn read_all(path: Str) -> Option[Bytes] ! IO {
 
 // The path execvp runs for name, or "" when it finds none. An empty PATH entry is the working
 // directory, and an unset PATH is the one glibc's execvp searches.
-pub fn find_program(name: Str) -> Str ! IO {
+pub fn find_program(name: Str) -> Str ! IO, FS.Read {
     if name == "" { return "" }
     if name.contains("/") {
         return if is_executable(name) { name } else { "" }
@@ -411,7 +411,7 @@ pub fn find_program(name: Str) -> Str ! IO {
     ""
 }
 
-fn is_executable(path: Str) -> Bool ! IO {
+fn is_executable(path: Str) -> Bool ! IO, FS.Read {
     if is_dir(path) == 1 { return false }
     let mut rc = -1
     with ffi.scope() as scope {
@@ -426,7 +426,7 @@ fn is_executable(path: Str) -> Bool ! IO {
 // while the daemon lives is not seen.
 let mut bfs_cpu_count: Int = 0
 
-pub fn cpu_count() -> Int ! IO {
+pub fn cpu_count() -> Int ! IO, FS.Read {
     if bfs_cpu_count <= 0 {
         let mut n = 0
         if find_program("nproc") != "" { n = process_run("nproc", []).out.trim().to_int() }
@@ -457,7 +457,7 @@ pub fn plain_words(cmd: Str) -> List[Str] {
 // Runs program with args as sh runs a command: on this process's stdin, stdout and stderr,
 // which a captured run would turn into pipes and so take a compiler's colors away. Its exit
 // code, or -1 when a signal ended it or it could not start, as shell_exec gives.
-pub fn run_program(program: Str, args: List[Str]) -> Int ! IO {
+pub fn run_program(program: Str, args: List[Str]) -> Int ! IO, Process.Spawn {
     let pid = bfs_fork().to_int()
     if pid == 0 {
         process_exec(program, args)
@@ -496,7 +496,7 @@ pub type FileChild {
 // Starts program with args, its stdout and stderr written to out_path and err_path and its
 // stdin this process's own. Files, not pipes: a pipe this process does not drain while it
 // waits for another child fills, and its child stops.
-pub fn spawn_to_files(program: Str, args: List[Str], out_path: Str, err_path: Str) -> FileChild ! IO {
+pub fn spawn_to_files(program: Str, args: List[Str], out_path: Str, err_path: Str) -> FileChild ! IO, FS.Read, FS.Write, Process.Spawn {
     // open() here never creates.
     write_file(out_path, "")
     write_file(err_path, "")
@@ -577,7 +577,7 @@ let BFS_SWEEP_MS = 50
 // child whose pipe hung up but that no sweep has seen end is swept again a millisecond later.
 // When poll fails for more than a signal, it waits on the first running child. Answers
 // children as they were when none runs.
-pub fn wait_children(children: List[FileChild]) -> List[FileChild] ! IO {
+pub fn wait_children(children: List[FileChild]) -> List[FileChild] ! IO, Process.Spawn {
     let mut kids: List[FileChild] = []
     for c in children { kids.push(c) }
     loop {
@@ -655,7 +655,7 @@ pub fn wait_children(children: List[FileChild]) -> List[FileChild] ! IO {
 
 // The wait status of child pid once waitpid with options sees it end, -1 when WNOHANG finds
 // it running, or -2 when waitpid fails for more than a signal.
-fn wait_status(pid: Int, options: Int) -> Int ! IO {
+fn wait_status(pid: Int, options: Int) -> Int ! IO, Process.Spawn {
     let mut status = -2
     with ffi.scope() as scope {
         let cell = scope.alloc[I32]()
@@ -679,7 +679,7 @@ fn wait_status(pid: Int, options: Int) -> Int ! IO {
 // Waits for child to end, unless wait_children saw it end, and answers its exit code (128
 // plus the signal that ended it, as a captured run gives) and its output, then removes its
 // output files.
-pub fn reap_to_files(child: FileChild) -> ProcessResult ! IO {
+pub fn reap_to_files(child: FileChild) -> ProcessResult ! IO, Process.Spawn {
     if child.live >= 0 {
         let _ = bfs_close(child.live.to_i32())
     }
@@ -707,36 +707,36 @@ pub fn reap_to_files(child: FileChild) -> ProcessResult ! IO {
 // An @ffi function's C name has no module part, so these carry the module in their own names.
 @ffi("mkdir", header: "sys/stat.h")
 @trusted(audit: "Wraps mkdir(2). path is a NUL-terminated copy from ffi.scope(); mode is 0777 or 0700.")
-fn bfs_mkdir(path: Ptr[U8], mode: U32) -> I32 ! FFI {}
+fn bfs_mkdir(path: Ptr[U8], mode: U32) -> I32 ! FS.Write {}
 
 @ffi("unlink", header: "unistd.h")
 @trusted(audit: "Wraps unlink(2). path is a NUL-terminated copy from ffi.scope().")
-fn bfs_unlink(path: Ptr[U8]) -> I32 ! FFI {}
+fn bfs_unlink(path: Ptr[U8]) -> I32 ! FS.Delete {}
 
 @ffi("rmdir", header: "unistd.h")
 @trusted(audit: "Wraps rmdir(2). path is a NUL-terminated copy from ffi.scope().")
-fn bfs_rmdir(path: Ptr[U8]) -> I32 ! FFI {}
+fn bfs_rmdir(path: Ptr[U8]) -> I32 ! FS.Delete {}
 
 @ffi("rename", header: "stdio.h")
 @trusted(audit: "Wraps rename(2). Both paths are NUL-terminated copies from ffi.scope().")
-fn bfs_rename(from: Ptr[U8], to: Ptr[U8]) -> I32 ! FFI {}
+fn bfs_rename(from: Ptr[U8], to: Ptr[U8]) -> I32 ! FS.Write {}
 
 @ffi("chmod", header: "sys/stat.h")
 @trusted(audit: "Wraps chmod(2). path is a NUL-terminated copy from ffi.scope(); mode is 0755.")
-fn bfs_chmod(path: Ptr[U8], mode: U32) -> I32 ! FFI {}
+fn bfs_chmod(path: Ptr[U8], mode: U32) -> I32 ! FS.Write {}
 
 @ffi("link", header: "unistd.h")
 @trusted(audit: "Wraps link(2). A Str is NUL-terminated and holds no NUL, so each path reaches C whole.")
-fn bfs_link(from: Str, to: Str) -> I32 ! FFI {}
+fn bfs_link(from: Str, to: Str) -> I32 ! FS.Write {}
 
 // open(2) is bound twice so that a caller that only reads does not need the write row.
 @ffi("open", header: "fcntl.h")
 @trusted(audit: "Wraps open(2) with no mode, so it never creates. path is a NUL-terminated copy from ffi.scope(); flags is O_RDONLY, 0 on every host.")
-fn bfs_open_read(path: Ptr[U8], flags: I32) -> I32 ! FFI {}
+fn bfs_open_read(path: Ptr[U8], flags: I32) -> I32 ! FS.Read {}
 
 @ffi("open", header: "fcntl.h")
 @trusted(audit: "Wraps open(2) with no mode, so it never creates. path is a NUL-terminated copy from ffi.scope(); flags is O_WRONLY or O_RDWR, 1 and 2 on every host.")
-fn bfs_open_write(path: Ptr[U8], flags: I32) -> I32 ! FFI {}
+fn bfs_open_write(path: Ptr[U8], flags: I32) -> I32 ! FS.Read, FS.Write {}
 
 @ffi("close", header: "unistd.h")
 @trusted(audit: "Wraps close(2) on a descriptor bfs_open_read, bfs_open_write or bfs_pipe returned.")
@@ -744,15 +744,15 @@ fn bfs_close(fd: I32) -> I32 ! FFI {}
 
 @ffi("realpath", header: "stdlib.h")
 @trusted(audit: "Wraps realpath(3). path is a NUL-terminated copy from ffi.scope(); resolved is a 4096-byte buffer from ffi.scope(), PATH_MAX or more on every host, which realpath fills on success.")
-fn bfs_realpath(path: Ptr[U8], resolved: Ptr[U8]) -> Ptr[U8] ! FFI {}
+fn bfs_realpath(path: Ptr[U8], resolved: Ptr[U8]) -> Ptr[U8] ! FS.Read {}
 
 @ffi("lseek", header: "unistd.h")
 @trusted(audit: "Wraps lseek(2). fd is one bfs_open_read or bfs_open_write returned; whence is SEEK_SET or SEEK_END, 0 and 2 on every host.")
-fn bfs_lseek(fd: I32, offset: Int, whence: I32) -> Int ! FFI {}
+fn bfs_lseek(fd: I32, offset: Int, whence: I32) -> Int ! FS.Read {}
 
 @ffi("access", header: "unistd.h")
 @trusted(audit: "Wraps access(2). path is a NUL-terminated copy from ffi.scope(); mode is X_OK, 1 on every host.")
-fn bfs_access(path: Ptr[U8], mode: I32) -> I32 ! FFI {}
+fn bfs_access(path: Ptr[U8], mode: I32) -> I32 ! FS.Read {}
 
 @ffi("blink_errno_get")
 @trusted(audit: "Wraps the runtime blink_errno_get(), which returns errno. Read right after the failed call.")
@@ -760,11 +760,11 @@ fn bfs_errno() -> Int ! FFI {}
 
 @ffi("fork", header: "unistd.h")
 @trusted(audit: "Wraps fork(2). The child only execs, as the runtime's own process calls do after their fork.")
-fn bfs_fork() -> I32 ! FFI {}
+fn bfs_fork() -> I32 ! Process.Spawn {}
 
 @ffi("waitpid", header: "sys/wait.h")
 @trusted(audit: "Wraps waitpid(2) on a child bfs_fork made. status is one I32 cell from ffi.scope(); options is 0, so it blocks, or WNOHANG, 1 on Linux and macOS.")
-fn bfs_waitpid(pid: I32, status: Ptr[I32], options: I32) -> I32 ! FFI {}
+fn bfs_waitpid(pid: I32, status: Ptr[I32], options: I32) -> I32 ! Process.Spawn {}
 
 @ffi("pipe", header: "unistd.h")
 @trusted(audit: "Wraps pipe(2). fds is a two-I32 buffer from ffi.scope(); int is 32 bits on every host.")
