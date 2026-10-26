@@ -138,14 +138,23 @@ fn skip_ws_and_newlines(content: Str, offset: Int) -> Int {
 
 // ── Parse results ──────────────────────────────────────────────────
 
+/// One segment of an entry's path: a key, with `index` -1, or the index of an array item or of
+/// a `[[name]]` element, with `key` empty.
+pub type TomlSeg {
+    key: Str
+    index: Int
+}
+
 /// One `key = value`, or one array item, that a parse read. `key` is the dotted key the global
-/// store holds. `path` holds the segments of that key: the header's, then the key's own. A
-/// quoted segment keeps its dots, so `"a.b" = 1` is one segment and `a.b = 1` is two. An array
-/// item, and each key under a `[[name]]` header, adds a segment `[N]` for its index. `header` is
-/// the index in TomlDoc.headers of the header the entry is under, or -1 above the first one.
+/// store holds, which does not tell a quoted `"a.b"` from `a.b`; `path` does. `path` holds the
+/// segments of the key: the header's, then the key's own. A quoted segment keeps its dots, so
+/// `"a.b" = 1` is one segment and `a.b = 1` is two. An array item adds an index segment, and so
+/// does each `[[name]]` element, after the segments of that name: under `[[a]]` and then
+/// `[a.b]`, the path of `y = 1` is `a`, the index of the last `a`, `b`, `y`. `header` is the
+/// index in TomlDoc.headers of the header the entry is under, or -1 above the first one.
 pub type TomlEntry {
     key: Str
-    path: List[Str]
+    path: List[TomlSeg]
     value: Str
     vtype: Int
     key_span: TomlSpan
@@ -153,8 +162,7 @@ pub type TomlEntry {
     header: Int
 }
 
-/// One `[name]` or `[[name]]` header. `path` holds its segments as TomlEntry.path does, with no
-/// index segment.
+/// One `[name]` or `[[name]]` header. `path` holds the keys written in it, with no index.
 pub type TomlHeader {
     name: Str
     path: List[Str]
@@ -169,13 +177,16 @@ pub type TomlDoc {
     headers: List[TomlHeader]
 }
 
-// The output of one parse, which each helper adds to. The [[name]] counters belong to the
-// caller, because toml_parse counts on across parses until toml_clear.
+// The output of one parse, which each helper adds to. The [[name]] counters of the store keys
+// belong to the caller, because toml_parse counts on across parses until toml_clear. `arrays`
+// counts the elements of each [[name]] array by its path, for the index segments of one parse.
 type TomlParser {
     entries: List[TomlEntry]
     headers: List[TomlHeader]
     arr_names: List[Str]
     arr_counts: List[Int]
+    arrays: Map[Str, Int]
+    starts: List[Int]
 }
 
 // Text a helper read, and the offset after it.
@@ -193,19 +204,67 @@ type ScannedKey {
 
 // ── Store helpers ──────────────────────────────────────────────────
 
-// Lines and columns are filled in once the parse ends, from one table of line starts.
-fn byte_span(start: Int, end: Int) -> TomlSpan {
-    TomlSpan { line: 0, col: 0, end_line: 0, end_col: 0, start_byte: start, end_byte: end }
+fn key_seg(key: Str) -> TomlSeg {
+    TomlSeg { key: key, index: -1 }
 }
 
-fn add_entry(ps: TomlParser, key: Str, path: List[Str], value: Str, vtype: Int, header: Int, key_start: Int, key_end: Int, value_start: Int, value_end: Int) {
+fn index_seg(index: Int) -> TomlSeg {
+    TomlSeg { key: "", index: index }
+}
+
+fn key_segs(keys: List[Str]) -> List[TomlSeg] {
+    keys.map(fn(k: Str) -> TomlSeg { key_seg(k) })
+}
+
+// Names a path in TomlParser.arrays. Each segment says where it ends, so no key text can make
+// two paths share a name.
+fn seg_id(path: List[TomlSeg]) -> Str {
+    let mut out = ""
+    for s in path {
+        out = if s.index >= 0 { out.concat("#{s.index};") } else { out.concat("{s.key.byte_len()}:{s.key}") }
+    }
+    out
+}
+
+// The path of a header's keys, with the index of the last element after each leading part that
+// names a [[name]] array, since TOML reads `[a.b]` after `[[a]]` as a table in the last `a`.
+fn header_path(ps: TomlParser, keys: List[Str]) -> List[TomlSeg] {
+    let mut out: List[TomlSeg] = []
+    let mut i = 0
+    while i < keys.len() {
+        out.push(key_seg(keys.get(i).unwrap()))
+        if i < keys.len() - 1 {
+            let n = ps.arrays.get(seg_id(out)) ?? 0
+            if n > 0 {
+                out.push(index_seg(n - 1))
+            }
+        }
+        i = i + 1
+    }
+    out
+}
+
+fn span_of(ps: TomlParser, start: Int, end: Int) -> TomlSpan {
+    let li = line_index(ps.starts, start)
+    let eli = line_index(ps.starts, end)
+    TomlSpan {
+        line: li + 1,
+        col: start - ps.starts.get(li).unwrap() + 1,
+        end_line: eli + 1,
+        end_col: end - ps.starts.get(eli).unwrap() + 1,
+        start_byte: start,
+        end_byte: end,
+    }
+}
+
+fn add_entry(ps: TomlParser, key: Str, path: List[TomlSeg], value: Str, vtype: Int, header: Int, key_start: Int, key_end: Int, value_start: Int, value_end: Int) {
     ps.entries.push(TomlEntry {
         key: key,
         path: path,
         value: value,
         vtype: vtype,
-        key_span: byte_span(key_start, key_end),
-        value_span: byte_span(value_start, value_end),
+        key_span: span_of(ps, key_start, key_end),
+        value_span: span_of(ps, value_start, value_end),
         header: header,
     })
 }
@@ -349,10 +408,6 @@ fn parse_integer(content: Str, offset: Int) -> Scanned {
     Scanned { text: content.byte_slice(offset, p), pos: p }
 }
 
-// ── Parse an array value ["a", "b", "c"] ───────────────────────────
-// Stores individual items as key[0], key[1], etc.
-// Also stores the count as the value of the key itself with TOML_ARRAY type
-
 // Compares bytes, so a codepoint that straddles the end of the word reads as a mismatch
 // instead of a cut.
 fn word_at(s: Str, p: Int, word: Str) -> Bool {
@@ -365,8 +420,10 @@ fn word_at(s: Str, p: Int, word: Str) -> Bool {
     true
 }
 
-// Returns the offset after the array.
-fn parse_array_value(ps: TomlParser, content: Str, offset: Int, full_key: Str, path: List[Str], header: Int, key_start: Int, key_end: Int) -> Int {
+// ── Parse an array value ["a", "b", "c"] ───────────────────────────
+// Adds each item as key[0], key[1], etc., and then the array itself, with the count as its
+// value and the type TOML_ARRAY. Returns the offset after the array.
+fn parse_array_value(ps: TomlParser, content: Str, offset: Int, full_key: Str, path: List[TomlSeg], header: Int, key_start: Int, key_end: Int) -> Int {
     let mut p = offset + 1
     let mut count = 0
     p = skip_ws_and_newlines(content, p)
@@ -383,12 +440,12 @@ fn parse_array_value(ps: TomlParser, content: Str, offset: Int, full_key: Str, p
         let c = peek(content, p)
         if c == CH_DQUOTE {
             let s = parse_quoted_string(content, p)
-            add_entry(ps, "{full_key}[{count}]", path.append(["[{count}]"]), s.text, TOML_STRING, header, key_start, key_end, p, s.pos)
+            add_entry(ps, "{full_key}[{count}]", path.append([index_seg(count)]), s.text, TOML_STRING, header, key_start, key_end, p, s.pos)
             p = s.pos
             count = count + 1
         } else if is_digit(c) || c == CH_MINUS || c == CH_PLUS {
             let n = parse_integer(content, p)
-            add_entry(ps, "{full_key}[{count}]", path.append(["[{count}]"]), n.text, TOML_INT, header, key_start, key_end, p, n.pos)
+            add_entry(ps, "{full_key}[{count}]", path.append([index_seg(count)]), n.text, TOML_INT, header, key_start, key_end, p, n.pos)
             p = n.pos
             count = count + 1
         } else {
@@ -412,7 +469,7 @@ fn parse_array_value(ps: TomlParser, content: Str, offset: Int, full_key: Str, p
 // ── Parse an inline table { key = value, ... } ─────────────────────
 
 // Returns the offset after the closing brace.
-fn parse_inline_table(ps: TomlParser, content: Str, offset: Int, prefix: Str, prefix_path: List[Str], header: Int) -> Int {
+fn parse_inline_table(ps: TomlParser, content: Str, offset: Int, prefix: Str, prefix_path: List[TomlSeg], header: Int) -> Int {
     let mut p = offset + 1
     p = toml_skip_ws(content, p)
 
@@ -434,7 +491,7 @@ fn parse_inline_table(ps: TomlParser, content: Str, offset: Int, prefix: Str, pr
         p = toml_skip_ws(content, p)
 
         let full_key = "{prefix}.{k.key}"
-        let path = prefix_path.append(k.path)
+        let path = prefix_path.append(key_segs(k.path))
 
         let vc = peek(content, p)
         if vc == CH_DQUOTE {
@@ -477,7 +534,7 @@ fn parse_inline_table(ps: TomlParser, content: Str, offset: Int, prefix: Str, pr
 
 // Returns the offset after the value. An unknown value adds no entry and runs to the end of
 // the line.
-fn toml_parse_value(ps: TomlParser, content: Str, offset: Int, full_key: Str, path: List[Str], header: Int, key_start: Int, key_end: Int) -> Int {
+fn toml_parse_value(ps: TomlParser, content: Str, offset: Int, full_key: Str, path: List[TomlSeg], header: Int, key_start: Int, key_end: Int) -> Int {
     let c = peek(content, offset)
 
     if c == CH_DQUOTE {
@@ -554,7 +611,7 @@ pub fn toml_parse_doc(content: Str) -> TomlDoc {
     parse_doc_with(content, [], [])
 }
 
-/// Parse a TOML string into the global store. Returns 0 on success, -1 on error
+/// Parse a TOML string into the global store. Returns 0.
 @allow(UnrestoredMutation, IncompleteStateRestore)
 pub fn toml_parse(content: Str) -> Int {
     let doc = parse_doc_with(content, arr_table_names, arr_table_counts)
@@ -573,15 +630,15 @@ pub fn toml_parse(content: Str) -> Int {
 }
 
 fn parse_doc_with(content: Str, arr_names: List[Str], arr_counts: List[Int]) -> TomlDoc {
-    let ps = TomlParser { entries: [], headers: [], arr_names: arr_names, arr_counts: arr_counts }
+    let ps = TomlParser { entries: [], headers: [], arr_names: arr_names, arr_counts: arr_counts, arrays: Map(), starts: line_starts(content) }
     parse_entries(ps, content)
-    resolve_spans(content, TomlDoc { entries: ps.entries, headers: ps.headers })
+    TomlDoc { entries: ps.entries, headers: ps.headers }
 }
 
 fn parse_entries(ps: TomlParser, content: Str) {
     let mut cursor = 0
     let mut current_section = ""
-    let mut current_path: List[Str] = []
+    let mut current_path: List[TomlSeg] = []
     let mut header = -1
 
     while cursor < content.byte_len() {
@@ -611,11 +668,14 @@ fn parse_entries(ps: TomlParser, content: Str) {
         // Array table header [[name]]
         if c == CH_LBRACKET && cursor + 1 < content.byte_len() && peek(content, cursor + 1) == CH_LBRACKET {
             let h = parse_array_table_header(content, cursor)
-            ps.headers.push(TomlHeader { name: h.key, path: h.path, span: byte_span(cursor, h.pos), is_array: true })
+            ps.headers.push(TomlHeader { name: h.key, path: h.path, span: span_of(ps, cursor, h.pos), is_array: true })
             header = ps.headers.len() - 1
-            let index = inc_arr_table_count(ps, h.key)
-            current_section = "{h.key}[{index}]"
-            current_path = h.path.append(["[{index}]"])
+            current_section = "{h.key}[{inc_arr_table_count(ps, h.key)}]"
+            let base = header_path(ps, h.path)
+            let id = seg_id(base)
+            let index = ps.arrays.get(id) ?? 0
+            ps.arrays.insert(id, index + 1)
+            current_path = base.append([index_seg(index)])
             cursor = skip_to_newline(content, h.pos)
             if cursor < content.byte_len() {
                 cursor = cursor + 1
@@ -626,10 +686,10 @@ fn parse_entries(ps: TomlParser, content: Str) {
         // Section header [name]
         if c == CH_LBRACKET {
             let h = parse_section_header(content, cursor)
-            ps.headers.push(TomlHeader { name: h.key, path: h.path, span: byte_span(cursor, h.pos), is_array: false })
+            ps.headers.push(TomlHeader { name: h.key, path: h.path, span: span_of(ps, cursor, h.pos), is_array: false })
             header = ps.headers.len() - 1
             current_section = h.key
-            current_path = h.path
+            current_path = header_path(ps, h.path)
             cursor = skip_to_newline(content, h.pos)
             if cursor < content.byte_len() {
                 cursor = cursor + 1
@@ -650,7 +710,7 @@ fn parse_entries(ps: TomlParser, content: Str) {
         cursor = toml_skip_ws(content, cursor)
 
         let full_key = if current_section != "" { "{current_section}.{k.key}" } else { k.key }
-        cursor = toml_parse_value(ps, content, cursor, full_key, current_path.append(k.path), header, key_start, key_end)
+        cursor = toml_parse_value(ps, content, cursor, full_key, current_path.append(key_segs(k.path)), header, key_start, key_end)
 
         cursor = skip_to_newline(content, cursor)
         if cursor < content.byte_len() {
@@ -687,32 +747,6 @@ fn line_index(starts: List[Int], offset: Int) -> Int {
         }
     }
     lo
-}
-
-fn resolve_span(starts: List[Int], s: TomlSpan) -> TomlSpan {
-    let li = line_index(starts, s.start_byte)
-    let eli = line_index(starts, s.end_byte)
-    TomlSpan {
-        line: li + 1,
-        col: s.start_byte - starts.get(li).unwrap() + 1,
-        end_line: eli + 1,
-        end_col: s.end_byte - starts.get(eli).unwrap() + 1,
-        start_byte: s.start_byte,
-        end_byte: s.end_byte,
-    }
-}
-
-fn resolve_spans(content: Str, doc: TomlDoc) -> TomlDoc {
-    let starts = line_starts(content)
-    let mut entries: List[TomlEntry] = List.with_capacity(doc.entries.len())
-    for e in doc.entries {
-        entries.push(TomlEntry { key_span: resolve_span(starts, e.key_span), value_span: resolve_span(starts, e.value_span), ..e })
-    }
-    let mut headers: List[TomlHeader] = List.with_capacity(doc.headers.len())
-    for h in doc.headers {
-        headers.push(TomlHeader { span: resolve_span(starts, h.span), ..h })
-    }
-    TomlDoc { entries: entries, headers: headers }
 }
 
 // ── Query API ──────────────────────────────────────────────────────

@@ -2,7 +2,7 @@
 // that holds dots (a pin path in audits.toml) stays one segment, apart from a dotted bare key.
 // It reads and writes none of the global store that toml_parse fills.
 
-import std.toml.{toml_parse_doc, toml_clear, toml_parse, toml_keys, TomlDoc, TomlEntry, TomlSpan}
+import std.toml.{toml_parse_doc, toml_clear, toml_parse, toml_keys, TomlDoc, TomlEntry, TomlSpan, TomlSeg}
 
 let AUDITS: Str = "[DB-003]\nclaim = \"checked\"\npins = \{ \"db.sqlite.sqlite3_open\" = \"ast1:3f9c0a4e1b7d\" \}\n"
 
@@ -10,13 +10,20 @@ fn entry_at(doc: TomlDoc, key: Str) -> Option[TomlEntry] {
     doc.entries.find(fn(e) { e.key == key })
 }
 
+// The path of an entry with `|` between segments and an index written as `#N`.
+fn shape(e: TomlEntry) -> Str {
+    e.path.map(fn(s: TomlSeg) -> Str { if s.index >= 0 { "#{s.index}" } else { s.key } }).join("|")
+}
+
+fn shapes(doc: TomlDoc) -> List[Str] {
+    doc.entries.map(fn(e: TomlEntry) -> Str { "{shape(e)}={e.value}" })
+}
+
 test "a quoted key with dots in an inline table is one segment" {
     let doc = toml_parse_doc(AUDITS)
     let e = entry_at(doc, "DB-003.pins.db.sqlite.sqlite3_open").unwrap()
     assert_eq(e.path.len(), 3)
-    assert_eq(e.path.get(0).unwrap(), "DB-003")
-    assert_eq(e.path.get(1).unwrap(), "pins")
-    assert_eq(e.path.get(2).unwrap(), "db.sqlite.sqlite3_open")
+    assert_eq(shape(e), "DB-003|pins|db.sqlite.sqlite3_open")
     assert_eq(e.value, "ast1:3f9c0a4e1b7d")
     assert_eq(e.key_span.line, 3)
     assert_eq(e.key_span.col, 10)
@@ -25,9 +32,7 @@ test "a quoted key with dots in an inline table is one segment" {
 test "a dotted bare key splits into segments" {
     let doc = toml_parse_doc("[t]\na.b = 1\n")
     let e = entry_at(doc, "t.a.b").unwrap()
-    assert_eq(e.path.len(), 3)
-    assert_eq(e.path.get(1).unwrap(), "a")
-    assert_eq(e.path.get(2).unwrap(), "b")
+    assert_eq(shape(e), "t|a|b")
 }
 
 test "a quoted header with dots is one segment and a bare dotted header is two" {
@@ -59,4 +64,35 @@ test "toml_parse still flattens a quoted key into the dotted store key" {
     let _ = toml_parse(AUDITS)
     assert(toml_keys.contains("DB-003.pins.db.sqlite.sqlite3_open"))
     assert(toml_keys.contains("DB-003.pins"))
+}
+
+test "an index segment is not a key, even a key written as [0]" {
+    let doc = toml_parse_doc("[r]\npins = [\"x\"]\nkeys = \{ \"[0]\" = \"y\" \}\n")
+    let item = doc.entries.find(fn(e) { e.value == "x" }).unwrap()
+    assert_eq(item.path.get(2).unwrap().index, 0)
+    assert_eq(item.path.get(2).unwrap().key, "")
+    let key = doc.entries.find(fn(e) { e.value == "y" }).unwrap()
+    assert_eq(key.path.get(2).unwrap().index, -1)
+    assert_eq(key.path.get(2).unwrap().key, "[0]")
+}
+
+test "a quoted and a bare dotted array table each count from 0" {
+    let doc = toml_parse_doc("[[\"a.b\"]]\nx = 1\n[[a.b]]\nx = 2\n[[\"a.b\"]]\nx = 3\n")
+    assert_eq(shapes(doc), ["a.b|#0|x=1", "a|b|#0|x=2", "a.b|#1|x=3"])
+}
+
+test "a table header under an array table names its last element" {
+    let doc = toml_parse_doc("[[a]]\nx = 1\n[a.b]\ny = 2\n[[a]]\nx = 3\n[a.b]\ny = 4\n")
+    assert_eq(shapes(doc), ["a|#0|x=1", "a|#0|b|y=2", "a|#1|x=3", "a|#1|b|y=4"])
+}
+
+test "a nested array table counts within its own parent element" {
+    let doc = toml_parse_doc("[[a]]\n[[a.b]]\ny = 1\n[[a.b]]\ny = 2\n[[a]]\n[[a.b]]\ny = 3\n")
+    assert_eq(shapes(doc), ["a|#0|b|#0|y=1", "a|#0|b|#1|y=2", "a|#1|b|#0|y=3"])
+}
+
+test "the store keys of array tables do not change" {
+    toml_clear()
+    let _ = toml_parse("[[a]]\nx = 1\n[a.b]\ny = 2\n[[a]]\n[[a.b]]\nz = 3\n")
+    assert_eq(toml_keys, ["a[0].x", "a.b.y", "a.b[0].z"])
 }
