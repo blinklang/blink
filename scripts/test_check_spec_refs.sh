@@ -75,6 +75,8 @@ EOF
 EOF
     echo 'See §1.1.' > "$WORK/t/llms.md"
     echo 'See §3b.1.1.' > "$WORK/t/llms-full.md"
+    mkdir -p "$WORK/t/src"
+    echo 'pub const SOME_HELP = "see §1.2 for the rule"' > "$WORK/t/src/diagnostics.bl"
 }
 
 # expect <exit> "<label>" [<text the output must hold> ...]
@@ -141,6 +143,9 @@ expect 1 "llms.md is gated" "llms.md:2 §5 -> no numbered heading"
 
 reset; append llms-full.md 'and §5'
 expect 1 "llms-full.md is gated" "llms-full.md:2 §5 -> no numbered heading"
+
+reset; append src/diagnostics.bl 'pub const OTHER_HELP = "see §5"'
+expect 1 "the help strings of src/diagnostics.bl are gated" "src/diagnostics.bl:2 §5 -> no numbered heading"
 
 reset; append sections/01_a.md 'See §07:163.'
 expect 1 "a file coordinate with a leading zero goes red" "§07:163 -> a file:line coordinate"

@@ -1,7 +1,7 @@
 #!/bin/bash
 # The spec-ref gate of `task ci`: every section ref in the spec, the error
-# catalog and the language reference must name a numbered heading that
-# exists. A section number is both an identifier other files cite and a
+# catalog, the language reference and the help text of src/diagnostics.bl
+# must name a numbered heading that exists. A section number is both an identifier other files cite and a
 # position that moves when someone changes the spec, so nothing stops a ref
 # from becoming wrong; this gate fails the build at the line that cites it.
 #
@@ -49,7 +49,7 @@ if [ ! -f "${specs[0]}" ]; then
     echo "spec-refs: cannot read: no sections/*.md under $PWD" >&2
     exit 2
 fi
-gated=("${specs[@]}" ERROR_CATALOG.md llms.md llms-full.md)
+gated=("${specs[@]}" ERROR_CATALOG.md llms.md llms-full.md src/diagnostics.bl)
 for f in "${gated[@]}"; do
     if [ ! -f "$f" ] || [ ! -r "$f" ]; then
         echo "spec-refs: cannot read $f" >&2
