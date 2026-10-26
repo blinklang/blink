@@ -14,7 +14,7 @@ import parser.{
     node_start, node_stmts, node_str_val, node_target, node_then_body, node_trait_name,
     node_type_ann, node_type_name, node_type_params, node_value, node_var_name,
     node_impl_binders, node_recv_type_args, node_impl_where_bounds, node_source_module,
-    node_set_module, node_set_name, node_supertraits, synth_struct_decl, node_end_line, node_end_col, node_inclusive, BINDER_MUT_RECOVERED,
+    node_set_module, node_set_name, node_supertraits, node_empty_row_line, node_empty_row_col, node_empty_row_end_col, synth_struct_decl, node_end_line, node_end_col, node_inclusive, BINDER_MUT_RECOVERED,
     synth_named_arg, sublist_append, sublist_of, node_set_obj, node_set_args,
     node_set_params, node_set_stmts, node_set_fields, node_set_arms,
     node_xfail_reason, node_value_child_ids, node_push_value_child_ids, node_spell_child_ids,
@@ -33,7 +33,7 @@ import diagnostics.{
     UNSOLVED_TYPEVAR_AT_CODEGEN, SEALED_OPS_REWRITE_INVARIANT,
     NO_SUCH_VARIANT, TYPE_ERROR, TEMPLATE_MISMATCH, UNEXPECTED_ANNOTATION, MISSING_RETURN, NO_CONVERSION_IMPL, CANNOT_INFER_TYPE, NOT_ITERABLE, MISSING_ELSE, UNLICENSED_SELF_OP, TRAIT_BOUND_NOT_SATISFIED, CAPABILITY_BUDGET, QM_INVALID_OPERAND, UNDEFINED_FUNCTION,
     UNRESOLVED_METHOD, AMBIGUOUS_METHOD_CALL, MISSING_DISPLAY_IMPL,
-    MUTATION_REQUIRES_MUT, MUT_ON_PATTERN, NOT_A_PLACE, PARAM_ASSIGN, diag_error_label_at_notes, diag_warn_label_at_notes, diag_fix_before_starts_with, diag_drop_fix_over_others,
+    MUTATION_REQUIRES_MUT, MUT_ON_PATTERN, NOT_A_PLACE, PARAM_ASSIGN, diag_error_label_at_notes, diag_error_span_label_at_notes, diag_warn_label_at_notes, EMPTY_ROW_OUTSIDE_FFI, EFFECTS_ANNOTATION_REMOVED, diag_fix_before_starts_with, diag_drop_fix_over_others,
     UNDEFINED_VARIABLE, UNKNOWN_TYPE, QM_RESULT_IN_NON_RESULT,
     QM_OPTION_IN_NON_OPTION, QM_ERROR_MISMATCH,
     QM_TEST_DISPLAY_REQUIRED, TEST_ANNOTATED_RETURN, SKIP_OUTSIDE_TEST,
@@ -12944,6 +12944,59 @@ fn tc_check_contract_verifiable(fn_node: Int) ! Diag.Report {
     }
 }
 
+// `! ()` and `@effects(...)` are spellings in a signature, so every fn the parser made is
+// checked, wherever it sits: top level, trait, impl, effect or handler.
+fn check_effect_row_spellings() ! Diag.Report {
+    let n = node_count()
+    let mut id = 0
+    while id < n {
+        if node_kind(id) == NodeKind.FnDef {
+            check_fn_effect_row_spelling(id)
+        }
+        id = id + 1
+    }
+}
+
+fn check_fn_effect_row_spelling(fn_node: Int) ! Diag.Report {
+    let anns = node_handlers(fn_node)
+    if anns != -1 {
+        let mut ai = 0
+        while ai < sublist_length(anns) {
+            let ann = sublist_get(anns, ai)
+            if node_kind(ann) == NodeKind.Annotation && node_name(ann) == "effects" {
+                let one_line = node_end_line(ann) == node_line(ann)
+                let end_col = if one_line { node_end_col(ann) } else { 0 }
+                diag_error_span_label_at_notes("EffectsAnnotationRemoved", EFFECTS_ANNOTATION_REMOVED, "`@effects` is not an annotation", ann, node_line(ann), node_col(ann), end_col, "effects go in the signature, after `!`", "remove `{effects_annotation_spelling(ann, one_line)}` and write the row after the return type: `-> Int ! IO`; on an `@ffi` decl with no effects, write `! ()`", [])
+            }
+            ai = ai + 1
+        }
+    }
+    let row_line = node_empty_row_line(fn_node)
+    if row_line != -1 && has_annotation(fn_node, "ffi") == 0 {
+        let row_col = node_empty_row_col(fn_node)
+        let row_end_col = node_empty_row_end_col(fn_node)
+        diag_error_span_label_at_notes("EmptyRowOutsideFfi", EMPTY_ROW_OUTSIDE_FFI, "`! ()` is only for `@ffi` declarations", fn_node, row_line, row_col, row_end_col, "no row already means no effects", "remove `! ()`; it is required only on an `@ffi` decl whose foreign code has no effects (§9.1)", [])
+    }
+}
+
+// `@effects(...)` as the author wrote it, for the help: the argument list is rebuilt from the
+// effect names, and a bare `@effects` is told apart by its span.
+fn effects_annotation_spelling(ann: Int, one_line: Bool) -> Str {
+    let args = node_args(ann)
+    if args == -1 {
+        if one_line && node_end_col(ann) - node_col(ann) == "@effects".byte_len() { return "@effects" }
+        return "@effects()"
+    }
+    let mut names: List[Str] = []
+    let mut i = 0
+    while i < sublist_length(args) {
+        let arg = sublist_get(args, i)
+        names.push(if node_kind(arg) == NodeKind.Ident { node_name(arg) } else { "..." })
+        i = i + 1
+    }
+    "@effects({names.join(", ")})"
+}
+
 fn validate_ffi_fn(fn_node: Int) ! Diag.Report {
     let name = node_name(fn_node)
     let ffi_node = get_annotation(fn_node, "ffi")
@@ -12968,9 +13021,11 @@ fn validate_ffi_fn(fn_node: Int) ! Diag.Report {
         if node_is_pub(fn_node) != 0 && has_trusted == 0 {
             diag_error_at("FfiFunctionPublic", PUB_FFI, "FFI function `{name}` must not be pub — FFI functions are unsafe and should be wrapped", ffi_node, "remove `pub` or add @trusted(audit: \"ID\") to mark it as audited")
         }
-        let effects_sl = node_effects(fn_node)
-        if effects_sl == -1 || sublist_length(effects_sl) == 0 {
-            diag_error_at("FfiNoEffects", FFI_NO_EFFECTS, "FFI function `{name}` must declare effects — FFI calls are side-effectful", ffi_node, "add `! FFI` or appropriate effects to the function signature")
+        // `! ()` is an empty row that is present, so only a missing row is E0802. A decl that
+        // carries `@effects` gets EffectsAnnotationRemoved alone, which names the fix.
+        if node_effects(fn_node) == -1 && get_annotation(fn_node, "effects") == -1 {
+            let sig_end_col = if node_end_line(fn_node) == node_line(fn_node) { node_end_col(fn_node) } else { 0 }
+            diag_error_span_at_notes("FfiNoEffects", FFI_NO_EFFECTS, "foreign function `{name}` has no effect row", fn_node, node_line(fn_node), node_col(fn_node), sig_end_col, "write the effects the foreign code has after the return type (`-> Int ! IO`), or `! ()` (the empty effect row) if it has none", [])
         }
         if has_requires != 0 {
             diag_error_at("ContractOnFfi", CONTRACT_ON_FFI, "@requires cannot be used on FFI function `{name}` — contracts cannot verify foreign code", requires_node, "remove @requires from the FFI function")
@@ -14863,6 +14918,8 @@ pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report {
     if fns_sl != -1 {
         tc_register_fn_sigs(fns_sl)
     }
+
+    check_effect_row_spellings()
 
     // Validate FFI annotations and Ptr[T] usage
     if fns_sl != -1 {

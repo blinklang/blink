@@ -79,6 +79,7 @@ pub const NON_CONST_EXPR           = "E0533"
 pub const TEMPLATE_HOLE_TYPE       = "E0534"
 pub const NO_SUCH_VARIANT          = "E0547"
 pub const INSUFFICIENT_HANDLER_COVERAGE = "E0563"
+pub const EMPTY_ROW_OUTSIDE_FFI = "E0564"
 
 // E0600+ — closures, scoping
 pub const CLOSEABLE_ESCAPES_SCOPE = "E0601"
@@ -240,6 +241,7 @@ pub const UNTERMINATED_LITERAL    = "E1126"
 // E1127+ — parser
 pub const MIXED_OPERATOR_PRECEDENCE = "E1127"
 pub const INTERP_DOUBLE_BRACE       = "E1130"
+pub const EFFECTS_ANNOTATION_REMOVED = "E1139"
 
 // E1200+ — module resolution / enum value validation
 pub const MODULE_NOT_FOUND           = "E1200"
@@ -975,6 +977,13 @@ pub fn diag_warn_label_at_notes(name: Str, code: Str, message: Str, node_id: Int
 pub fn diag_error_label_at_notes(name: Str, code: Str, message: Str, node_id: Int, label: Str, help: Str, notes: List[Str]) ! Diag.Report {
     let before = diag_entries.len()
     diag_error_at_notes(name, code, message, node_id, help, notes)
+    diag_label_last_since(before, label)
+}
+
+// diag_error_span_at_notes with a label after the carets.
+pub fn diag_error_span_label_at_notes(name: Str, code: Str, message: Str, node_id: Int, line: Int, col: Int, end_col: Int, label: Str, help: Str, notes: List[Str]) ! Diag.Report {
+    let before = diag_entries.len()
+    diag_error_span_at_notes(name, code, message, node_id, line, col, end_col, help, notes)
     diag_label_last_since(before, label)
 }
 
@@ -1756,7 +1765,7 @@ pub fn diag_explain(code: Str) -> Str {
         return "E0801 -- FfiFunctionPublic\n\nAn @ffi function was declared as pub. FFI functions are unsafe and\nshould not be exposed in a module's public API.\n\nFix: remove `pub` and wrap the FFI call in a safe public function.\n\n  @ffi(\"strlen\")\n  @trusted(audit: \"AUDIT-001\")\n  fn c_strlen(s: Ptr[U8]) -> Int ! FFI \{ \}\n\n  pub fn string_length(s: Str) -> Int ! FFI \{\n      c_strlen(s.as_ptr())\n  \}"
     }
     if code == FFI_NO_EFFECTS {
-        return "E0802 -- FfiNoEffects\n\nAn @ffi function does not declare any effects. FFI calls are\ninherently side-effectful and must declare their effects.\n\nFix: add `! FFI` or appropriate effects to the function signature.\n\n  @ffi(\"puts\")\n  @trusted(audit: \"AUDIT-001\")\n  fn c_puts(s: Ptr[U8]) -> Int ! FFI \{ \}"
+        return "E0802 -- FfiNoEffects\n\nAn @ffi function has no effect row. The row on a foreign function is\na claim about code the compiler cannot see, so the compiler does not\nguess it, and a missing row is an error.\n\nFix: write the effects the foreign code has after the return type,\nor `! ()` (the empty effect row) if it has none. No tool writes the\nrow for you, because only the author knows what the foreign code does.\n\n  @ffi(\"c\", \"puts\")\n  @trusted(audit: \"LIBC-PUTS\")\n  fn c_puts(s: Ptr[U8]) -> Int ! IO\n\n  @ffi(\"c\", \"strlen\")\n  @trusted(audit: \"LIBC-STRLEN\")\n  fn c_strlen(s: Ptr[U8]) -> Int ! ()\n\nThere is no `FFI` effect, and no `@effects` annotation."
     }
     if code == CONTRACT_ON_FFI {
         return "E0803 -- ContractOnFfi\n\nA @requires or @ensures annotation was used on an @ffi function.\nContracts cannot verify foreign code behavior.\n\nFix: remove the contract annotation from the FFI function. If you\nneed contracts, add them to a safe wrapper function instead.\n\n  @ffi(\"sqrt\")\n  @trusted(audit: \"AUDIT-001\")\n  fn c_sqrt(x: Float) -> Float ! FFI \{ \}\n\n  @requires(x >= 0.0)\n  @verify(fallback: \"runtime\")\n  pub fn safe_sqrt(x: Float) -> Float ! FFI \{\n      c_sqrt(x)\n  \}"
@@ -1803,6 +1812,12 @@ pub fn diag_explain(code: Str) -> Str {
     if code == BUF_OUTSIDE_FFI_SURFACE {
         return "E0822 -- BufOutsideFfiSurface\n\n`Buf[T]` is the byte bridge's own type, and it is nameable only on the\nFFI surface: `@ffi.fn` parameter and return types. An inferred binding\nmay hold one, because the typechecker computes that type and nobody\nwrites it. Writing the name anywhere else -- an annotated binding, a\nparameter or return type in Blink code, a struct field, an @ffi.struct\nfield, a generic bound -- is rejected. In an @ffi.struct field a Buf\nwould be a `blink_buf_t*`, not the C pointer the field declares: use\n`Ptr[T]` there.\n\nThe buffer and its payload are malloc'd, tied to the enclosing\n`ffi.scope`, and freed when that scope unwinds. Naming the type outside\nthe bridge lets it outlive the scope that frees it, so the restriction\nis what keeps the lifetime purely lexical.\n\nFix: for a byte payload, use the helper that returns `Bytes`.\n\n  let bs = libc.recv_bytes(fd, 4096)     // OK -- also read_bytes,\n                                         //       getentropy_bytes\n\nFix: for a typed scope-tied region, use `scope.alloc_n[T]`.\n\n  let p = scope.alloc_n[Pollfd](8)       // OK\n\nSee `blink doc bytes-bridge` for the whole byte bridge."
     }
+    if code == EMPTY_ROW_OUTSIDE_FFI {
+        return "E0564 -- EmptyRowOutsideFfi\n\n`! ()` is the empty effect row written out. It means no effects, the\nsame as no row. It is legal only on an `@ffi` decl, where a row is a\nclaim the author must write. On any other function, fn type or trait\nmethod signature the compiler proves purity, so no row already means\nno effects.\n\n  fn add(a: Int, b: Int) -> Int ! () \{   // E0564\n      a + b\n  \}\n\nFix: remove `! ()`.\n\n  fn add(a: Int, b: Int) -> Int \{\n      a + b\n  \}"
+    }
+    if code == EFFECTS_ANNOTATION_REMOVED {
+        return "E1139 -- EffectsAnnotationRemoved\n\nThere is no `@effects` annotation. The effect row goes after `!` in\nthe signature, on foreign and Blink functions alike. On an `@ffi`\ndecl with `@effects` and no row this is the one error, not E0802 as\nwell.\n\n  @ffi(\"c\", \"getpid\")\n  @effects(IO)                       // E1139\n  @trusted(audit: \"LIBC-GETPID\")\n  fn c_getpid() -> Int\n\nFix: remove `@effects(...)` and write the row after the return type.\nOn an `@ffi` decl whose foreign code has no effects, write `! ()`.\nNo tool moves the row for you: the row on a foreign function is a\nclaim that only the author can make.\n\n  @ffi(\"c\", \"getpid\")\n  @trusted(audit: \"LIBC-GETPID\")\n  fn c_getpid() -> Int ! IO"
+    }
     if code == INSUFFICIENT_HANDLER_COVERAGE {
         return "E0563 -- InsufficientHandlerCoverage\n\nA handler of a sub-effect was given where a handler of its parent\neffect is expected. A `Handler[DB.Read]` handles only the operations\nof DB.Read, so it cannot stand in for a `Handler[DB]`, which must\nhandle read, write and admin.\n\n  fn run_full(h: Handler[DB]) \{ ... \}\n  run_full(read_handler)   // E0563 -- read_handler is a Handler[DB.Read]\n\nThe other way is allowed. A `Handler[DB]` given where a\n`Handler[DB.Read]` is expected converts to a handler of DB.Read:\n\n  fn read_only_test(h: Handler[DB.Read]) \{ ... \}\n  read_only_test(full)     // OK -- full is a Handler[DB]\n\nFix: pass a handler of the parent effect, or change the parameter\nto the sub-effect that the function uses."
     }
@@ -1840,7 +1855,7 @@ pub fn diag_explain(code: Str) -> Str {
         return "E0835 -- XfailMissingReason\n\n`test.failing(...)` requires a `reason:` that is a non-empty string\nliteral. The reason says why the test is expected to fail today, and\nthe test report carries it as `xfail_reason`. To point at tracked\nwork, write the reference in the reason.\n\nFix: supply a non-empty reason.\n\n  test.failing(\n      \"trait impl resolves through alias chain\",\n      reason: \"Phase 3 trait elaboration not yet implemented\",\n  ) \{\n      // ... test body, expected to fail today\n  }"
     }
     if code == TRUSTED_REQUIRES_AUDIT {
-        return "E0836 -- TrustedRequiresAudit\n\n`@trusted` is the sole channel that suppresses the audit-gated\ndiagnostics of section 9.1 (UnauditedFfi, RawBypassesParam). The\n`audit:` identifier is the record the channel exists to create. A\nbare `@trusted`, or one with an empty `audit:`, silences the\ndiagnostic and records nothing -- the one outcome the annotation\nis there to prevent.\n\nFix: give the audit a non-empty identifier.\n\n  @ffi(\"sqlite3\", \"sqlite3_close\")\n  @effects(IO)\n  @trusted(audit: \"DB-004\")\n  fn sqlite3_close(db: Ptr[Void]) -> Int\n\n  @trusted                             // E0836\n  fn other(db: Ptr[Void]) -> Int\n\nThe identifier is free-form: a ticket id, a review id, or a short\nnote on what was audited and why it is safe."
+        return "E0836 -- TrustedRequiresAudit\n\n`@trusted` is the sole channel that suppresses the audit-gated\ndiagnostics of section 9.1 (UnauditedFfi, RawBypassesParam). The\n`audit:` identifier is the record the channel exists to create. A\nbare `@trusted`, or one with an empty `audit:`, silences the\ndiagnostic and records nothing -- the one outcome the annotation\nis there to prevent.\n\nFix: give the audit a non-empty identifier.\n\n  @ffi(\"sqlite3\", \"sqlite3_close\")\n  @trusted(audit: \"DB-004\")\n  fn sqlite3_close(db: Ptr[Void]) -> Int ! IO\n\n  @trusted                             // E0836\n  fn other(db: Ptr[Void]) -> Int\n\nThe identifier is free-form: a ticket id, a review id, or a short\nnote on what was audited and why it is safe."
     }
     if code == DEPRECATED_USAGE {
         return "W2000 -- DeprecatedUsage\n\nA function or type marked @deprecated was used.\n\nThe @deprecated annotation signals that an API is scheduled for\nremoval. The warning includes the deprecation edition (if known)\nand a suggested replacement.\n\nFix: migrate to the replacement API shown in the help message.\n\n  @deprecated(replacement: \"new_fn\")\n  fn old_fn() \{ \}\n\n  fn main() \{\n      old_fn()   // W2000: use of deprecated function `old_fn`\n                 // help: use `new_fn` instead\n  \}"

@@ -1,0 +1,153 @@
+// `! ()` is the empty effect row written out (§4.2). An `@ffi` decl must carry a row, so a
+// foreign function with no effects states that claim with `! ()`; everywhere else an omitted
+// row already means pure, so `! ()` is `EmptyRowOutsideFfi`. There is no `@effects`
+// annotation: on any function it is `EffectsAnnotationRemoved`, and on an `@ffi` decl with no
+// row that one error replaces E0802 (§9.1). No fix for any of them is machine-applicable,
+// because a row on an `@ffi` decl is a claim about foreign code.
+
+import std.fs
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_reset, diag_explain, EMPTY_ROW_OUTSIDE_FFI, EFFECTS_ANNOTATION_REMOVED, FFI_NO_EFFECTS, TRUSTED_REQUIRES_AUDIT}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+
+fn row_probe(path: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    init_embedded_stdlib()
+    write_file(path, src)
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+}
+
+// The errors reported in the probe file itself, one per line: code, name, line:col-end_col,
+// message and help, and a `fix` mark when the error carries a machine-applicable fix.
+fn errors_in(path: Str) -> Str {
+    let mut out = ""
+    for d in diag_entries {
+        if d.severity == "error" && d.file == path {
+            let fix = if d.fix_action != "" { " fix" } else { "" }
+            out = out.concat("{d.code} {d.name} {d.line}:{d.col}-{d.end_col}: {d.message} | help: {d.help}{fix}\n")
+        }
+    }
+    out
+}
+
+fn count_code(got: Str, code: Str) -> Int {
+    let mut n = 0
+    for ln in got.split("\n") {
+        if ln.starts_with(code) { n = n + 1 }
+    }
+    n
+}
+
+let STRLEN_DECL = "@ffi(\"c\", \"strlen\")\n@trusted(audit: \"LIBC-STRLEN\")\nfn zz_strlen(s: Ptr[U8]) -> Int ! ()\n"
+
+test "an @ffi decl with the empty row parses and checks" {
+    let path = "/tmp/zz_empty_row_ffi_decl.bl"
+    row_probe(path, STRLEN_DECL.concat("fn main() \{ }\n"))
+    let got = errors_in(path)
+    assert(got == "", "`! ()` on an @ffi decl is the pure claim, got: {got}")
+}
+
+test "an @ffi fn with the empty row checks where a fn type with no row is expected" {
+    let path = "/tmp/zz_empty_row_as_value.bl"
+    let src = STRLEN_DECL.concat("@trusted(audit: \"ZZ-TAKE\")\nfn zz_take(f: fn(Ptr[U8]) -> Int) -> Int \{ 0 }\nfn main() \{\n    let n = zz_take(zz_strlen)\n    let _ = n\n}\n")
+    row_probe(path, src)
+    let got = errors_in(path)
+    assert(got == "", "`! ()` and no row are the same row, got: {got}")
+}
+
+test "the empty row cannot be combined with an effect name" {
+    let path = "/tmp/zz_empty_row_with_name.bl"
+    let src = "@ffi(\"c\", \"getpid\")\n@trusted(audit: \"LIBC-GETPID\")\nfn zz_getpid() -> Int ! (), IO\nfn main() \{ }\n"
+    row_probe(path, src)
+    let got = errors_in(path)
+    assert(got.contains("UnexpectedToken"), "`! (), IO` is a parse error, got: {got}")
+    assert(got.starts_with("E1100 UnexpectedToken 3:27"), "the error is at the comma after `()`, got: {got}")
+}
+
+test "the empty row on a plain fn is EmptyRowOutsideFfi with the spec's span and help" {
+    let path = "/tmp/zz_empty_row_plain_fn.bl"
+    let src = "\nfn add(a: Int, b: Int) -> Int ! () \{\n    a + b\n}\nfn main() \{ let _ = add(1, 2) }\n"
+    row_probe(path, src)
+    let got = errors_in(path)
+    assert(count_code(got, EMPTY_ROW_OUTSIDE_FFI) == 1, "expected one {EMPTY_ROW_OUTSIDE_FFI}, got: {got}")
+    let want = "{EMPTY_ROW_OUTSIDE_FFI} EmptyRowOutsideFfi 2:31-35: `! ()` is only for `@ffi` declarations | help: remove `! ()`; it is required only on an `@ffi` decl whose foreign code has no effects (§9.1)\n"
+    assert(got == want, "want: {want}got: {got}")
+}
+
+test "the empty row on a trait method signature is EmptyRowOutsideFfi" {
+    let path = "/tmp/zz_empty_row_trait_sig.bl"
+    let src = "trait Zz \{\n    fn zz_size(self) -> Int ! ()\n}\nfn main() \{ }\n"
+    row_probe(path, src)
+    let got = errors_in(path)
+    assert(count_code(got, EMPTY_ROW_OUTSIDE_FFI) == 1, "expected one {EMPTY_ROW_OUTSIDE_FFI}, got: {got}")
+    assert(got.contains("2:29-33"), "the caret covers `! ()`, got: {got}")
+    assert(!got.contains("UnexpectedToken"), "a trait signature admits `! ()` in the grammar, got: {got}")
+}
+
+test "the empty row on an impl method is EmptyRowOutsideFfi" {
+    let path = "/tmp/zz_empty_row_impl_method.bl"
+    let src = "type Zz \{ n: Int }\nimpl Zz \{\n    fn zz_get(self) -> Int ! () \{ self.n }\n}\nfn main() \{ let _ = Zz \{ n: 1 }.zz_get() }\n"
+    row_probe(path, src)
+    let got = errors_in(path)
+    assert(count_code(got, EMPTY_ROW_OUTSIDE_FFI) == 1, "expected one {EMPTY_ROW_OUTSIDE_FFI}, got: {got}")
+}
+
+test "@effects on an @ffi decl with no row is EffectsAnnotationRemoved and not E0802" {
+    let path = "/tmp/zz_effects_ann_ffi.bl"
+    let src = "@ffi(\"c\", \"getpid\")\n@effects(IO)\n@trusted(audit: \"LIBC-GETPID\")\nfn zz_getpid() -> Int\nfn main() \{ }\n"
+    row_probe(path, src)
+    let got = errors_in(path)
+    assert(count_code(got, FFI_NO_EFFECTS) == 0, "the removed annotation is the one error, got: {got}")
+    let want = "{EFFECTS_ANNOTATION_REMOVED} EffectsAnnotationRemoved 2:1-13: `@effects` is not an annotation | help: remove `@effects(IO)` and write the row after the return type: `-> Int ! IO`; on an `@ffi` decl with no effects, write `! ()`\n"
+    assert(got == want, "want: {want}got: {got}")
+}
+
+test "@effects on an @ffi decl that has a row is EffectsAnnotationRemoved" {
+    let path = "/tmp/zz_effects_ann_ffi_row.bl"
+    let src = "@ffi(\"c\", \"getpid\")\n@effects(IO)\n@trusted(audit: \"LIBC-GETPID\")\nfn zz_getpid() -> Int ! IO\nfn main() \{ }\n"
+    row_probe(path, src)
+    let got = errors_in(path)
+    assert(count_code(got, EFFECTS_ANNOTATION_REMOVED) == 1, "expected one {EFFECTS_ANNOTATION_REMOVED}, got: {got}")
+    assert(count_code(got, FFI_NO_EFFECTS) == 0, "the decl has a row, got: {got}")
+}
+
+test "@effects on a plain fn is EffectsAnnotationRemoved" {
+    let path = "/tmp/zz_effects_ann_plain.bl"
+    let src = "@effects()\nfn zz_one() -> Int \{ 1 }\nfn main() \{ let _ = zz_one() }\n"
+    row_probe(path, src)
+    let got = errors_in(path)
+    let want = "{EFFECTS_ANNOTATION_REMOVED} EffectsAnnotationRemoved 1:1-11: `@effects` is not an annotation | help: remove `@effects()` and write the row after the return type: `-> Int ! IO`; on an `@ffi` decl with no effects, write `! ()`\n"
+    assert(got == want, "want: {want}got: {got}")
+}
+
+test "@effects on an impl method is EffectsAnnotationRemoved" {
+    let path = "/tmp/zz_effects_ann_method.bl"
+    let src = "type Zz \{ n: Int }\nimpl Zz \{\n    @effects(IO)\n    fn zz_get(self) -> Int \{ self.n }\n}\nfn main() \{ let _ = Zz \{ n: 1 }.zz_get() }\n"
+    row_probe(path, src)
+    let got = errors_in(path)
+    assert(count_code(got, EFFECTS_ANNOTATION_REMOVED) == 1, "expected one {EFFECTS_ANNOTATION_REMOVED}, got: {got}")
+}
+
+test "an @ffi decl with no row gets E0802 with the real-row-or-empty-row help" {
+    let path = "/tmp/zz_ffi_no_row.bl"
+    let src = "@ffi(\"c\", \"strlen\")\n@trusted(audit: \"LIBC-STRLEN\")\nfn zz_strlen(s: Ptr[U8]) -> Int\nfn main() \{ }\n"
+    row_probe(path, src)
+    let got = errors_in(path)
+    let want = "{FFI_NO_EFFECTS} FfiNoEffects 3:1-32: foreign function `zz_strlen` has no effect row | help: write the effects the foreign code has after the return type (`-> Int ! IO`), or `! ()` (the empty effect row) if it has none\n"
+    assert(got == want, "want: {want}got: {got}")
+}
+
+test "the explainers name the empty row and never the FFI effect or @effects" {
+    let e0802 = diag_explain(FFI_NO_EFFECTS)
+    assert(e0802.contains("! ()"), "E0802 explain must name the empty row, got: {e0802}")
+    assert(!e0802.contains("! FFI"), "FFI is not an effect, got: {e0802}")
+    let e0836 = diag_explain(TRUSTED_REQUIRES_AUDIT)
+    assert(!e0836.contains("@effects"), "E0836 explain must not use @effects, got: {e0836}")
+    let empty = diag_explain(EMPTY_ROW_OUTSIDE_FFI)
+    assert(empty.contains("EmptyRowOutsideFfi"), "explain names the diagnostic, got: {empty}")
+    let removed = diag_explain(EFFECTS_ANNOTATION_REMOVED)
+    assert(removed.contains("EffectsAnnotationRemoved"), "explain names the diagnostic, got: {removed}")
+}
