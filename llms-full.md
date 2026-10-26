@@ -1,6 +1,6 @@
 # Blink Language Reference
 
-> Blink is a statically-typed, effect-tracked language compiling to C. **Compiler v0.58.0**.
+> Blink is a statically-typed, effect-tracked language compiling to C. **Compiler v0.59.0**.
 
 ## Install
 
@@ -12,7 +12,7 @@ docker pull ghcr.io/blinklang/blink:latest
 docker run --rm -v "$PWD":/workspace ghcr.io/blinklang/blink run myfile.bl
 ```
 
-Tags: `latest`, `0.58`, `0.58.0` (semver). Image is `debian:bookworm-slim` with `gcc`, `zig`, `blink`, and `libgc-dev`.
+Tags: `latest`, `0.59`, `0.59.0` (semver). Image is `debian:bookworm-slim` with `gcc`, `zig`, `blink`, and `libgc-dev`.
 
 ## Recent Changes
 
@@ -41,7 +41,7 @@ fn sqlite3_open(filename: Ptr[Int], db: Ptr[Ptr[Int]]) -> Int ! IO
 
 `@ffi("library", "symbol")` — first arg is library name, second is C symbol name.
 
-An `@ffi` decl must have an effect row: the Blink effects the foreign code has (`! IO`, `! Net`). There is no `FFI` effect. If the foreign code has no effects, write the empty row `! ()`: `fn c_strlen(s: Ptr[U8]) -> Int ! ()`. A decl with no row is `E0802`. `! ()` anywhere else is `E0564`, and the `@effects(...)` annotation is gone (`E1139`).
+An `@ffi` decl must have an effect row: the Blink effects the foreign code has (`! IO`, `! Net`). There is no `FFI` effect. If the foreign code has no effects, write the empty row `! ()`: `fn c_strlen(s: Ptr[U8]) -> Int ! ()`. A decl with no row is `E0802`. `! ()` anywhere else is `E0564 EmptyRowOutsideFfi`, and the `@effects(...)` annotation is gone (`E1139 EffectsAnnotationRemoved`).
 
 ### @trusted Audit Marker
 
@@ -51,7 +51,7 @@ An `@ffi` decl must have an effect row: the Blink effects the foreign code has (
 fn malloc(size: Int) -> Ptr[Int] ! ()
 ```
 
-`@trusted(audit: K)` marks an FFI function as audited for safety. The `audit:` key is required: a bare `@trusted` or an empty `audit:` is `E0836`. `K` is not free text: it names a record in the package's `audits.toml`, which holds the claim (§9.1). `@allow` and `[lints]` cannot name an audit-gated diagnostic (`W0800`, `W0310`); this is `E0837`. Write `@trusted(audit: ...)` on the function instead. A `@trusted` fn, as an `@ffi` fn, may name `Ptr[T]`, or an `@ffi.struct` that holds a `Ptr`, in its signature; elsewhere that is `E0811`.
+`@trusted(audit: K)` marks an FFI function as audited for safety. The `audit:` key is required: a bare `@trusted` or an empty `audit:` is `E0836`. `K` is not free text: it names a record in the package's `audits.toml`, which holds the claim (§9.1). A record holds only `claim` and `pins`; any other key is `E0830 AuditRecordUnknownKey`. `@allow` and `[lints]` cannot name an audit-gated diagnostic (`W0800`, `W0310`); this is `E0837`. Write `@trusted(audit: ...)` on the function instead. A `@trusted` fn, as an `@ffi` fn, may name `Ptr[T]`, or an `@ffi.struct` that holds a `Ptr`, in its signature; elsewhere that is `E0811`.
 
 ### Ptr[T] Type
 
@@ -1214,6 +1214,8 @@ with handler Metrics {
 
 Handlers nest — inner handlers shadow outer ones for the same effect.
 
+A handler of a sub-effect handles only that sub-effect's operations. A `Handler[E.Sub]` where a `Handler[E]` is expected (an argument, an annotated `let`, a return value, a struct field or an assignment) is `E0563 InsufficientHandlerCoverage`.
+
 An effect and an effect operation take no type parameters (`fn put[T](x: T)` and `effect Cell[T]` are `EffectOpTypeParams`, E0558). Declare the operation with concrete types and write a generic `fn` that calls it, as `io.println` does.
 
 An operation can have a default body in the effect declaration (`fn b() { ... }`); a handler may omit it. The body may perform only the leaf sub-effect it is declared in; any other effect is `DerivedOpForeignEffect` (E0557), so move that logic to a plain `fn` with its own `!` row. `@handle_all` on an effect (or sub-effect) says a handler must write every operation that has no body; a handler that omits one warns `W0545 PartialHandler`. `IO.Read` is such an effect, so a test can handle it with `std.testing.stdin_from(text)`:
@@ -1370,7 +1372,7 @@ show(42)          // "42"
 | `std.semver` | Semantic version parsing and constraints | `import std.semver` |
 | `std.testing` | Test helpers: `capture_log`, `capture_print`, `capture_eprint` (handler factories that intercept IO for assertions); `assert_close(a, b, tol)`, `assert_close_rel(a, b, rel)` (float assertions, panic on NaN / negative tol); `for_each[T](cases: List[(Str, T)], body: fn(T))` (table-driven test helper); `skip(reason: Str)` (skip a test from its body; rejected outside tests as `E0827`); `cleanup(fn: fn())` (register a teardown to run at end of test) | `import std.testing` |
 | `std.term` | Terminal styling and control: ANSI colors (`red`, `green`, `blue`, etc.), text styles (`bold`, `dim`, `italic`, `underline`, `strikethrough`), background colors, TTY detection (`is_tty`, `terminal_width`, `terminal_height`), cursor control (`move_up`, `clear_screen`, `hide_cursor`, etc.) | `import std.term` |
-| `std.toml` | TOML parser | `import std.toml` |
+| `std.toml` | TOML parser. `toml_parse_doc(s)` returns a `TomlDoc`: each entry's path segments (`TomlSeg`), value and spans (`TomlEntry`), and each header (`TomlHeader`) | `import std.toml` |
 
 ### Prelude Modules (auto-imported, no `import` needed)
 
