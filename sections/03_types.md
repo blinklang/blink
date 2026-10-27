@@ -5417,7 +5417,7 @@ impl Display for Marker {
 
 **Function types erase `mut`.** A function type such as `fn(List[Int]) -> Int` carries no `mut` marker. A closure's `mut` parameter is local to that closure. A higher-order function can therefore change a collection through a closure argument with no `mut` at its own call site; `mut` marks where a mutation starts, not every path that reaches it.
 
-**Foreign functions.** An `@ffi` or `@runtime` function has no Blink body to check. Its author declares `mut` on each parameter whose Blink value the foreign code changes (for example the `@runtime` binding `sb_write(mut sb: StringBuilder, s: Str)`). The compiler trusts this declaration and cannot verify it; it is part of the audited premise of the `@ffi` boundary (§9).
+**Foreign functions.** An `@ffi` or `@runtime` function has no Blink body to check. Its author declares `mut` on each parameter whose Blink value the foreign code changes (for example the `@runtime` binding `sb_write(mut sb: StringBuilder, s: Str)`). The compiler trusts this declaration and cannot verify it; it is part of the audited premise of the `@ffi` boundary (§9). `mut` marks a param of a Blink value type (`List`, `Set`, `Map`, `Bytes`, `StringBuilder`). It is not used on a `Ptr` or an `@ffi.opaque` handle param, because the state behind those is outside the language. A missing `mut` is an audit defect, not a compile error (§9.1 *Handle Operations and `mut` on an `@ffi` Param*).
 
 **Lints.** Two warnings support the rule. Neither is a guarantee:
 

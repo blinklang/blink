@@ -4288,7 +4288,8 @@ pub fn next_id() -> Int ! State {    // public: `State` is declared
 `State` is a built-in leaf effect (§4.3). A function's row contains `State` when the function touches module state:
 
 - its body reads or writes a module-level `let mut` binding of its module (§4.16.2), or
-- it calls a function whose row contains `State`, in any module, through a direct call, a function value, a trait method or a `! _` row (§4.15.2).
+- it calls a function whose row contains `State`, in any module, through a direct call, a function value, a trait method or a `! _` row (§4.15.2), or
+- it calls an `@ffi` decl whose declared row names `State` (*Foreign state*, below).
 
 `State` is not like the other effects:
 
@@ -4296,6 +4297,15 @@ pub fn next_id() -> Int ! State {    // public: `State` is declared
 - **The roots hold it.** `main` (§4.6) and each test block (§2.20) hold `State`. `UnhandledEffect` (E0539) never fires for `State`.
 - **Not a capability.** Module capability budgets (§4.8, §4.9) ignore `State`. Module state stays inside its module and does not cross a trust boundary, so a package that declares `capabilities = []` can still use module-level `let mut`.
 - **No run-time cost.** `State` changes no generated code (§4.16.9).
+
+**Foreign state.** `State` also covers state that foreign code holds: a C global, a thread-local or a process-wide buffer. The state must be one that no argument of the call reaches and that a later call can see. `State` is the fallback row for such state. When a built-in effect names the resource, the decl uses that effect: the current arena is `Arena` (§5.2), a file is `FS.*` and a socket is `Net.*`. The `@ffi` author writes the row, and the compiler trusts it (§4.5 *Proven and assumed rows*; §9.1 *Hidden C State — Which Row*). E0552 applies to the caller as for any other `State`: a `pub fn` whose body calls a `! State` binding declares `State`.
+
+```blink
+@ffi("lib_last_size") fn lib_last_size() -> Int ! State {}
+
+pub fn last_size() -> Int { lib_last_size() }   // E0552: declare `State`
+pub fn last_size_ok() -> Int ! State { lib_last_size() }
+```
 
 **Declared at the boundary, inferred inside.** A function at the module boundary must write `State` in its row when it touches module state. The boundary functions are:
 
@@ -4347,6 +4357,7 @@ Every rule that checks a row checks the effective row:
 | Mutating method call on module-level `let mut` (`tokens.push(t)`) | **Yes** | **Yes** | Mutation through a method |
 | Read module-level `let mut` (`return pos`) | **Yes** | No | The result depends on state that a call can change |
 | Call a function whose row contains `State` | **Yes** | The callee's write set, if the callee is in this module | `State` propagates like any effect; write sets do not cross modules (§4.16.4) |
+| Call an `@ffi` decl whose declared row names `State` | **Yes** | No | The author claims hidden foreign state; write sets cover module bindings only (§4.16.4) |
 | Read module-level `let` (immutable) or `const` | No | No | Immutable — equal to a constant |
 | Read/write function-local `let mut` | No | No | Contained within function scope |
 | Mutate collection received as parameter | No | No | The parameter must be declared `mut`, so the signature shows it (§3.6 *Mutable Parameters*) |
@@ -4370,6 +4381,8 @@ warning[ModuleLetMutNeverWritten]: module-level `let mut` `limit` is never writt
 #### 4.16.3 Purity
 
 A function whose effective row is empty is **pure**: its result depends only on its arguments. It performs no side effects and touches no module state. A function that only reads module state is not pure; its row has `State`.
+
+An `@ffi` decl with the row `! ()` makes the same claim: its result depends only on its arguments and on data they reach, so it reads no hidden state between calls (§9.1 *What `! ()` Claims on an `@ffi` Decl*). The compiler cannot check this claim.
 
 `@pure` (§3b.2) asks the compiler to prove that a function is pure. A `@pure` function whose effective row is not empty, `State` included, is `ImpureBodyForPureAnnotation` (E1307).
 

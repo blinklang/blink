@@ -43,6 +43,8 @@ fn sqlite3_open(filename: Ptr[Int], db: Ptr[Ptr[Int]]) -> Int ! IO
 
 An `@ffi` decl must have an effect row: the Blink effects the foreign code has (`! IO`, `! Net`). There is no `FFI` effect. If the foreign code has no effects, write the empty row `! ()`: `fn c_strlen(s: Ptr[U8]) -> Int ! ()`. A decl with no row is `E0802`. `! ()` anywhere else is `E0564 EmptyRowOutsideFfi`, and the `@effects(...)` annotation is gone (`E1139 EffectsAnnotationRemoved`).
 
+`! ()` on an `@ffi` decl also claims that the call reads no hidden state: its result depends only on its arguments and on data they reach. State that no argument reaches and that a later call can see (`errno`, a thread-local buffer, the counters of the current arena) is not `! ()`. Fix order: (1) have the producer return the data (a `mut out: Bytes`, a record); (2) use the effect that names the resource (`! Arena`, `! FS.Read`, `! Net.Connect`); (3) use `! State` as the fallback (GC switches, raw `strerror`). A `pub` wrapper of a `! State` binding declares `State` (`E0552`). Shims return `-errno`; no binding reads `errno`. `free(p)` and handle ops such as `fn tcp_handle_fd(h: TcpHandle) -> Int ! ()` are `! ()`. `mut` goes on an `@ffi` param of a Blink value type (`fn bytes_push(mut b: Bytes, byte: Int) ! ()`), not on a `Ptr` or `@ffi.opaque` param. A decl with no params, a non-Void return and `! ()` gets `W0817 ZeroArgPureForeign`; suppress it with `@allow(ZeroArgPureForeign)`, not `@trusted`. A `! ()` call may not move across a call that can write what its arguments reach.
+
 ### @trusted Audit Marker
 
 ```blink

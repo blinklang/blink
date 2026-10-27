@@ -88,7 +88,7 @@ Omitting the row on an `@ffi` function is a compile error (`FfiNoEffects`, E0802
 fn c_strlen(s: Ptr[U8]) -> Int ! ()
 ```
 
-`! ()` means "no effects". It is not a return type. It is legal only on an `@ffi` decl; everywhere else an omitted row already means pure, and `! ()` is an error (§4.2, `EmptyRowOutsideFfi`). The E0802 help names both choices, and neither is machine-applicable, because the row is a claim about foreign code:
+`! ()` means "no effects". It is not a return type. It is legal only on an `@ffi` decl; everywhere else an omitted row already means pure, and `! ()` is an error (§4.2, `EmptyRowOutsideFfi`). `! ()` also claims that the call reads no hidden state (§9.1 *What `! ()` Claims on an `@ffi` Decl*). The E0802 help names both choices and states this claim. Neither choice is machine-applicable, because the row is a claim about foreign code:
 
 ```
 error[FfiNoEffects]: foreign function `c_strlen` has no effect row
@@ -98,7 +98,8 @@ error[FfiNoEffects]: foreign function `c_strlen` has no effect row
   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
   |
   = help: write the effects the foreign code has after the return type
-          (`-> Int ! IO`), or `! ()` (the empty effect row) if it has none
+          (`-> Int ! IO`), or `! ()` (the empty effect row) if it has none.
+          `! ()` also claims no hidden state between calls
 ```
 
 There is no `@effects` annotation. The row goes after `!` in the signature, on foreign and Blink functions alike. Code written for an earlier draft of this section that puts `@effects(...)` on any function gets one error (`EffectsAnnotationRemoved`) and not E0802 as well:
@@ -115,6 +116,153 @@ error[EffectsAnnotationRemoved]: `@effects` is not an annotation
 ```
 
 No fix is machine-applicable: moving the row into the signature would make a tool write the claim for the author.
+
+#### What `! ()` Claims on an `@ffi` Decl
+
+The compiler cannot check the row of an `@ffi` decl (§4.5, *Proven and assumed rows*). The author states it, and callers and tools trust it. A row that is too large is safe: a caller holds a capability that it does not use. A row that is too small is a false claim. This is most true of `! ()`. An empty row lets a compiler reuse the result of a call, move the call, or delete the call when it does not use the result.
+
+The examples in the next four subsections leave out `@trusted(audit: K)` to stay short. Each real decl carries it.
+
+An `@ffi` decl may write `! ()` only if all three claims hold:
+
+1. **Reads.** The result depends only on the argument values, on data that the arguments reach, and on facts that Blink never changes. Data that an argument reaches is the cells of a `List`, `Set` or `Map`, the bytes of a `Bytes`, the memory behind a `Ptr`, and the insides of an `@ffi.opaque` handle.
+2. **Writes.** The call writes only data that its arguments reach, or a fresh result.
+3. **No hidden channel.** No later call can see a change that the call makes, except a change to data that an argument reaches.
+
+The test is one question. Does the call read state that no argument reaches, and can a later call see that state change? If yes, the row is not `! ()`. Examples of such state: `errno`, a thread-local buffer that one call fills and another call reads, the counters of the current arena, a C global. It does not matter that C owns the state. If Blink code can see the state change, the state counts.
+
+**Order of calls.** A `! ()` call may not move across another call that can write what its arguments reach. A call with a non-empty row, a `mut` argument, or a `Ptr` or `@ffi.opaque` argument counts as writing everything that argument reaches.
+
+```blink
+@ffi("blink_tcp_handle_fd")
+fn tcp_handle_fd(h: TcpHandle) -> Int ! () {}
+
+@ffi("blink_tcp_handle_take")
+fn tcp_handle_take(h: TcpHandle) -> Int ! () {}
+
+let before = tcp_handle_fd(h)
+let fd = tcp_handle_take(h)
+let after = tcp_handle_fd(h)    // can differ from `before`
+```
+
+`tcp_handle_take(h)` has a handle argument, so it counts as writing everything that `h` reaches. The compiler may not use the value of `before` for `after`. It may not move a `tcp_handle_fd(h)` call across the `tcp_handle_take(h)` call.
+
+**Facts that Blink never changes.** Blink never calls `setlocale`. The C locale of a process is `"C"` for the whole life of the process. This is a runtime invariant. A read of the locale is a read of a constant, so `strtod`, `snprintf` and a wrapper that calls `strerror_r` with a local buffer are `! ()`. A user `@ffi` decl that calls `setlocale` or `uselocale` breaks this invariant. It makes the `! ()` rows of the standard library wrong, and the author of that decl answers for it under the audit key of that decl.
+
+**A write is not a read.** A write that no Blink code can read is not visible, so it does not disqualify `! ()`. No binding reads `errno`. A shim returns `-errno` on failure, and Blink code reads the result. So `strtod`, `cos`, `sqrt` and `atoi` are `! ()`, even though they can set `errno`:
+
+```blink
+@ffi("blink_read")
+fn c_read(fd: I32, p: Ptr[U8], n: U64) -> I64 ! FS.Read {}   // <0 means -errno
+
+let rc = buf.with_ptr(fn(p) -> I64 { c_read(fd.to_i32(), p, max.to_u64()) })
+if rc < 0 { return Err(Errno((-rc).to_int())) }
+```
+
+A binding that reads `errno` in a separate call is not `! ()`. Fix it as the next subsection says.
+
+**Other bindings that are `! ()`.** An allocator that reads the current arena only to choose where to place a value is `! ()`: placement does not change the value (§5.2). `free(p)` is `! ()`: the write goes through its argument.
+
+#### Hidden C State — Which Row
+
+When an `@ffi` decl reads state that no argument reaches, use the first of these three fixes that applies.
+
+**1. Make the producer return the data.** A pair of calls that talk through hidden state becomes one call. The shape is free: a `mut out: Bytes` argument, a record, or a struct. The reader goes away, and no row has to describe the protocol between two calls.
+
+```blink
+// before: the reader depends on a buffer that the previous call filled
+@ffi("blink_fs_stat")
+fn c_fs_stat(path: Str) -> Int ! FS.Read {}
+@ffi("blink_fs_stat_size")
+fn c_fs_stat_size() -> Int ! () {}            // warning[ZeroArgPureForeign], and a false claim
+
+// after: the producer writes the data into an argument
+@ffi("blink_fs_stat")
+fn c_fs_stat(path: Str, mut out: Bytes) -> Int ! FS.Read {}   // out: kind, size, mtime_ns
+```
+
+**2. Use the effect that names the resource.** A built-in effect names the current arena (`Arena`), a file (`FS.*`) and a socket (`Net.*`). A reader of the counters of the current arena takes `! Arena`. It is discharged inside `with arena` (§5.2) and costs nothing there:
+
+```blink
+@ffi("blink_arena_bytes_used") fn arena_bytes_used_ffi() -> Int ! Arena {}
+pub fn bytes_used() -> Int ! Arena { arena_bytes_used_ffi() }
+
+with arena { let a = bytes_used(); let _ = Bytes.new(n); bytes_used() - a }   // ok
+fn f() -> Int { bytes_used() }   // E0500: missing Arena
+```
+
+**3. Use `State`.** `State` is the fallback row. It covers foreign state, such as a C global, a thread-local or a process-wide buffer, that no argument reaches and that no built-in effect names (§4.16.1). It has no handler and no run-time cost. These bindings take `! State`:
+
+```blink
+@ffi("GC_gcollect") fn gc_collect() ! State {}        // a Void `! ()` call with an unused result can be deleted
+@ffi("GC_get_free_space_divisor") fn gc_get_divisor() -> Int ! State {}
+@ffi("GC_set_free_space_divisor") fn gc_set_divisor(d: Int) ! State {}
+@ffi("strerror") fn c_strerror(code: I32) -> Ptr[U8] ! State {}   // returns a pointer into one shared buffer
+```
+
+The GC disable count takes `! State` in the same way. A `pub` wrapper whose body calls a `! State` binding declares `State` too (`UndeclaredModuleState`, E0552, §4.16.1).
+
+A binding in the standard library may carry the row of its producer as an interim upper bound until the producer returns the data (§4.5, *Proven and assumed rows*). This is not a pattern for user code.
+
+**A user decl names what the call itself does.** Take a C library that fills a thread-local in `lib_open(path)`, and a `lib_last_size()` that reads it. The first fix is to return the size from the shim. If the state cannot move into the call, the reader takes `State`:
+
+```blink
+@ffi("lib_open") fn lib_open(path: Str) -> Int ! FS.Read {}
+@ffi("lib_last_size") fn lib_last_size() -> Int ! State {}
+```
+
+This is guidance. The compiler cannot check a foreign body, so it cannot reject another row. A row that names the producer tells a reader that the call needs a capability that it does not use. It is also false when a second call fills the same state.
+
+#### Handle Operations and `mut` on an `@ffi` Param
+
+**Handle operations are `! ()`.** The insides of a handle are data that the handle argument reaches, like the cells of a `List`. An op that reads or changes them takes `! ()`, as `List.len` and `List.push` do. Copies of a handle name one object, so a change through one copy shows through the others.
+
+```blink
+@ffi("blink_tcp_handle_fd")   fn tcp_handle_fd(h: TcpHandle) -> Int ! () {}
+@ffi("blink_tcp_handle_take") fn tcp_handle_take(h: TcpHandle) -> Int ! () {}   // clears the slot of `h`
+```
+
+An op that closes the OS file descriptor, or does other I/O, writes state outside the language. It keeps its effect row:
+
+```blink
+@ffi("blink_close_socket") fn c_close_socket(fd: Int) -> Int ! Net.Connect {}
+```
+
+**`mut` marks a Blink value, not a handle.** `mut` is required on an `@ffi` param of a Blink value type whose data the foreign side changes: `List`, `Set`, `Map`, `Bytes` and `StringBuilder`. A caller with an immutable root gets `MutationRequiresMut` (E0610), as for a Blink function (§3.6 *Foreign functions*). `mut` is not used on a `Ptr` param or an `@ffi.opaque` handle param. These are state outside the language; the row and the audit key cover them (§3.6 *What `mut self` covers*).
+
+```blink
+@ffi("blink_bytes_push")
+fn bytes_push(mut b: Bytes, byte: Int) ! () {}
+
+fn fill(b: Bytes) { bytes_push(b, 1) }              // E0610: `b` is not mutable
+fn fill_ok() { let mut b = Bytes.new(4); bytes_push(b, 1) }   // ok
+```
+
+The line is the type of the param. A `Bytes` is a Blink value. A `TcpHandle` and a `Ptr[U8]` are not. The compiler cannot see a foreign body, so a missing `mut` is an audit defect, not a compile error. It is the same class of defect as a wrong row.
+
+#### Lint — `ZeroArgPureForeign`
+
+An `@ffi` decl with no params, a non-Void return type and the row `! ()` gets `warning[ZeroArgPureForeign]` (W0817) at the decl. A call with no arguments and an empty row returns a constant. A function that reads hidden state has this shape. The help names the fix first, then the suppression:
+
+```
+warning[ZeroArgPureForeign]: foreign function `c_fs_stat_size` has no params and the row `! ()`
+ --> fs.bl:4:1
+  |
+4 | fn c_fs_stat_size() -> Int ! ()
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = help: add `State` to the row, or have the producer return the value
+  = help: if the value is a real constant, write `@allow(ZeroArgPureForeign)` on the decl
+```
+
+```blink
+@ffi("blink_fs_stat_size") fn c_fs_stat_size() -> Int ! () {}   // warning
+
+@allow(ZeroArgPureForeign)
+@ffi("getpagesize") fn c_pagesize() -> Int ! () {}              // a real constant: no warning
+```
+
+`@allow(ZeroArgPureForeign)` suppresses it. `@trusted(audit: K)` does not, because every `@ffi` decl carries `@trusted` and the lint would never fire. The level is set under `[lints]` like other lints (§4.16.8). A Void return type does not trigger it. A clean run does not prove that a binding is pure: hidden state can also sit behind an argument, such as the cursor of `strtok(NULL, ...)`.
 
 #### `@trusted` — Audit Trail
 
