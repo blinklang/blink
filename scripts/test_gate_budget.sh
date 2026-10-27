@@ -112,11 +112,12 @@ done
 
 # Only default_jobs.sh reads the CPU count; any other site would size a
 # fan-out from the CPUs and not from the budget. bench_edit_loop.sh is not a
-# gate script: it only prints the count.
+# gate script: it only prints the count. install-gate-slice.sh sizes the
+# slice's CPU quota, not a fan-out.
 cpu_read='(\$\(|`) *(command +)?nproc([^a-z_-]|$)|_NPROCESSORS|numCPU|hw\.ncpu|/proc/cpuinfo'
 while IFS= read -r hit; do
     case "$hit" in
-        scripts/default_jobs.sh:* | scripts/test_gate_budget.sh:* | scripts/bench_edit_loop.sh:*) ;;
+        scripts/default_jobs.sh:* | scripts/test_gate_budget.sh:* | scripts/bench_edit_loop.sh:* | scripts/install-gate-slice.sh:*) ;;
         *) bad "a gate site reads the CPU count itself, not the budget: $hit" ;;
     esac
 done < <(grep -nHE "$cpu_read" scripts/*.sh Taskfile.yml)

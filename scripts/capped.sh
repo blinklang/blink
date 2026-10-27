@@ -526,7 +526,9 @@ if command -v systemd-run >/dev/null 2>&1 && scope_starts; then
     # drop-in gives it the shared CPU and memory limits.
     unit_files=$(systemctl --user show -p FragmentPath -p DropInPaths --value "$slice" 2>/dev/null | tr -d '[:space:]')
     if [ -z "$unit_files" ]; then
-        notice "$slice has no unit, so this run gets a plain user scope with its own caps only"
+        hint=
+        [ "$slice" = blink-gates.slice ] && hint="; scripts/install-gate-slice.sh installs it"
+        notice "$slice has no unit, so this run gets a plain user scope with its own caps only$hint"
         slice_args=()
     elif ! scope_starts "${slice_args[@]}"; then
         notice "$slice cannot hold a scope, so this run gets a plain user scope with its own caps only"

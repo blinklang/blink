@@ -2,8 +2,8 @@
 
 Status: the Taskfile applies the "one gate scope" rows (see "Applied: one gate scope"
 below), the per-child rows (see "Applied: one cap per child") and the worker budget (see
-"Knobs and how they multiply"). The slice rows are a proposal: the ticket that adds the
-slice file applies them.
+"Knobs and how they multiply"). `scripts/install-gate-slice.sh` installs the slice rows
+(see "Applied: the slice").
 
 ## Why
 
@@ -170,15 +170,20 @@ count, and when a fan-out line in a Taskfile task (`parallel -j`, `--parallel`,
 the task. `scripts/test_corpus.sh` proves that a row's test binary gets the share and one
 marker in each corpus mode, also when the caller sets a larger `BLINK_JOBS`.
 
-## Proposed budget
+## Budget
+
+The slice values are for this 64G machine with 24 CPUs; "Applied: the slice" gives the
+rule that sizes them for another machine.
 
 | Limit | Value | Reason |
 |---|---|---|
-| Slice `MemoryHigh` | 16G | Highest anon + shmem was 4.2 GiB for one gate. 16G holds three gates at once. Above it, the kernel reclaims the page cache of the gates first. Today it is 20G. |
-| Slice `MemoryMax` | 24G (no change) | 61 GB RAM less about 20 GB for the desktop and sessions, and room for a large app such as the game (22 GB). |
+| Slice `CPUQuota` | 1200% | Half the CPUs, as a gate outside the slice gets (see "Knobs and how they multiply"). |
+| Slice `MemoryHigh` | 16G | Highest anon + shmem was 4.2 GiB for one gate. 16G holds three gates at once. Above it, the kernel reclaims the page cache of the gates first. |
+| Slice `MemoryMax` | 24G | 61 GB RAM less about 20 GB for the desktop and sessions, and room for a large app such as the game (22 GB). |
 | Slice `MemorySwapMax` | 2G | On 2026-10-25 the swap was full. Gate work that does not fit must fail, not push the sessions to swap. |
 | Slice `TasksMax` | 4096 | Highest `pids.peak` for one gate was 315. 4096 holds about four gates at three times that. A self-spawn chain stops at about 1.8 GiB. |
-| Slice OOM score | `OOMScoreAdjust=500` for the gate processes | The kernel kills gate work before a session (sessions run at 200). |
+| Slice `ManagedOOMMemoryPressure`, `ManagedOOMSwap` | `kill` | When `systemd-oomd` runs, it kills a gate scope under memory pressure or when the swap fills, before the kernel's OOM killer starts. |
+| OOM score of the gate processes | 500 above the caller's (at most 1000), set by `scripts/capped.sh` | The kernel's OOM killer picks gate work before a session (sessions run at 200, so their gates run at 700). |
 | One gate scope `MemoryMax` | 12G | 2.9 times the highest anon + shmem (4.2 GiB). The page cache above this is reclaimed, not killed. Replaces the fmt scope `MemoryMax=50G`. |
 | One gate scope `TasksMax` | 1024 | 3.3 times the highest `pids.peak` (315). |
 | One gate scope `MemorySwapMax` | 2G (applied) | A fresh machine has no slice swap cap, and the plain-scope fallback has no slice. With no swap cap, a runaway gate pages out to a disk swap for minutes before the memory cap kills it, as on 2026-10-25. |
@@ -213,7 +218,7 @@ The first way that works caps the run:
 | Machine | Cap | Notice |
 |---|---|---|
 | systemd user scope, slice has a unit | scope `blink-gate-<task>-<pid>-<time>.scope` in `blink-gates.slice`, `MemoryMax=12G`, `MemorySwapMax=2G`, `TasksMax=1024` | none |
-| systemd user scope, no `blink-gates.slice` unit | the same scope in the default user slice | one line |
+| systemd user scope, no `blink-gates.slice` unit | the same scope in the default user slice | one line, with the install command |
 | systemd user scope, `BLINK_GATE_SLICE` names a unit that cannot hold a scope | the same scope in the default user slice | one line |
 | no systemd user scope, `prlimit` | address space 12G per process, user processes = running + 1024 | one line |
 | no `prlimit` | `ulimit -v` and `ulimit -u`, the same limits; no `ulimit -v` on Darwin, which does not hold a process to it | one line |
@@ -400,6 +405,57 @@ also proves the report file, a fork refused at the gate's cap, `infinity`, the s
 stop, and that a child OOM while the gate reclaims page cache names no gate cap.
 `scripts/test_corpus.sh` and `scripts/test_fmt_semantic.sh` prove that a corpus row and an
 fmt file fail with that line as their reason.
+
+## Applied: the slice
+
+`scripts/systemd/blink-gates.slice` is the unit, and `scripts/install-gate-slice.sh`
+installs it in the systemd user unit dir, `${XDG_CONFIG_HOME:-~/.config}/systemd/user`:
+
+```
+scripts/install-gate-slice.sh --dry-run   # print the unit, change nothing
+scripts/install-gate-slice.sh             # write the unit, reload the user manager
+```
+
+The script needs no `sudo`. It reloads the user manager only when the unit changed, so a
+second run changes nothing. With no systemd, as on Darwin, it prints one line and exits 0.
+Until the slice is installed, each capped gate run prints one line that names the
+script, and the gate still runs.
+
+The script fills in the values that depend on the machine:
+
+| Value | Rule | 24 CPUs, 64G | 8 CPUs, 16G |
+|---|---|---|---|
+| `CPUQuota` | half the CPUs (`nproc --all`), at least one | 1200% | 400% |
+| `MemoryHigh` | a quarter of the RAM | 16G | 4G |
+| `MemoryMax` | three eighths of the RAM | 24G | 6G |
+
+The RAM is `MemTotal`, rounded up to a multiple of 8G, since `MemTotal` is a little less
+than the RAM (61.7 GiB on a 64G machine). `MemorySwapMax`, `TasksMax` and the `ManagedOOM`
+rows are the same on each machine. `BLINK_SLICE_CPUS` and `BLINK_SLICE_MEMTOTAL_KIB` set
+the CPU count and the RAM in KiB, to size the slice for another machine.
+
+On a machine with less than 32G, `MemoryMax` is less than one gate's 12G cap, so the slice
+cap fires first. It still holds the gate away from the rest of the machine.
+
+The OOM score is not in the unit: `OOMScoreAdjust` is a setting of a process that systemd
+starts (a service), and a slice or a scope has no such setting. systemd says
+`Unknown key 'OOMScoreAdjust' in section [Slice], ignoring`. So `scripts/capped.sh` sets
+the score on the command that it runs (see "Applied: one gate scope"), and each process of
+the gate gets it.
+
+The unit sets no `ManagedOOMPreference`. That setting keeps a unit from being chosen, and
+the gates must be chosen. The `ManagedOOM` rows do nothing while `systemd-oomd` does not
+run; the kernel's OOM killer then uses the OOM score.
+
+`systemctl --user set-property blink-gates.slice ...` writes drop-ins to
+`~/.config/systemd/user.control/blink-gates.slice.d/`, and they override the unit. When
+the script finds such drop-ins, it names each file and prints the command that removes
+them.
+
+`scripts/test_gate_slice.sh`, in the gate self-tests, proves the dry-run values for 1, 8,
+24 and 64 CPUs and 16G, 64G and 100G of RAM, that a second install changes nothing, the
+drop-in warning, the no-systemd line, and the one notice of a capped run with no slice
+unit. It installs into a temp dir, with a fake `systemctl`.
 
 ## Probe dirs
 
