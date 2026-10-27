@@ -44,7 +44,7 @@
 #   BLINK_CHILD_CAP=0                   run each child in place, with no memory or process cap
 #   BLINK_CHILD_MEMORY_MAX=2G           memory cap of one child
 #   BLINK_CHILD_TASKS_MAX=256           process and thread cap of one child
-#   BLINK_CHILD_SWAP_MAX                swap cap of one child; unset leaves swap to the gate
+#   BLINK_CHILD_SWAP_MAX=0              swap cap of one child; infinity leaves swap to the gate
 #   BLINK_CHILD_TIMEOUT=600             time limit of one child in seconds; 0 sets none
 #   BLINK_CHILD_KILL_AFTER=10           seconds from SIGTERM to SIGKILL at the time limit
 set -u
@@ -57,7 +57,9 @@ swap=${BLINK_GATE_SWAP_MAX:-2G}
 slice=${BLINK_GATE_SLICE:-blink-gates.slice}
 child_mem=${BLINK_CHILD_MEMORY_MAX:-2G}
 child_tasks=${BLINK_CHILD_TASKS_MAX:-256}
-child_swap=${BLINK_CHILD_SWAP_MAX:-}
+# A child at its cap must die at once, not page out to the one swap cap that
+# all of the gate's children share.
+child_swap=${BLINK_CHILD_SWAP_MAX:-0}
 child_timeout=${BLINK_CHILD_TIMEOUT:-600}
 child_kill_after=${BLINK_CHILD_KILL_AFTER:-10}
 
@@ -354,7 +356,8 @@ run_child() {
             if mkdir "$kid" 2>/dev/null &&
                 echo "${child_mem/#infinity/max}" 2>/dev/null > "$kid/memory.max" &&
                 echo "${child_tasks/#infinity/max}" 2>/dev/null > "$kid/pids.max"; then
-                if [ -n "$child_swap" ] && ! echo "${child_swap/#infinity/max}" 2>/dev/null > "$kid/memory.swap.max"; then
+                # With no swap account the file is missing; the gate said so once.
+                if [ -e "$kid/memory.swap.max" ] && ! echo "${child_swap/#infinity/max}" 2>/dev/null > "$kid/memory.swap.max"; then
                     notice "could not set this child's swap cap (MemorySwapMax=$child_swap), so only the gate's swap cap holds it"
                 fi
                 gate_forks=$(read_event "$dir/pids.events.local" max)
@@ -414,6 +417,8 @@ if [ "${1:-}" = --inner ]; then
             echo "+memory +pids" > "$dir/kids/cgroup.subtree_control"; then
             leaf=$dir/gate
             export BLINK_CHILD_CGROUP=$dir
+            [ -e "$dir/kids/memory.swap.max" ] || [ "$child_swap" = infinity ] ||
+                notice "this kernel keeps no swap account, so a child gets no swap cap of its own (MemorySwapMax=$child_swap), only the gate's"
         else
             child_notice
         fi

@@ -66,6 +66,46 @@ if command -v systemd-run >/dev/null 2>&1 &&
         *) flunk "child cgroup (got [$caps]: $(cat "$WORK/err"))" ;;
     esac
 
+    # A child at its cap must die at once, not page out to the swap that the
+    # gate's other children share.
+    printf '%s' 'cat "/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup)/memory.swap.max"' > "$WORK/swap_max"
+    swaps=$(gate -- '"$CAPPED" --child bash '"$WORK/swap_max"'
+        BLINK_CHILD_SWAP_MAX=64M "$CAPPED" --child bash '"$WORK/swap_max"'
+        BLINK_CHILD_SWAP_MAX=infinity "$CAPPED" --child bash '"$WORK/swap_max")
+    if [ -e "/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup)/memory.swap.max" ]; then
+        if [ "$(echo $swaps)" = "0 67108864 max" ] && [ ! -s "$WORK/err" ]; then
+            pass "a child gets no swap unless BLINK_CHILD_SWAP_MAX gives it some"
+        else
+            flunk "child swap cap (got [$(echo $swaps)]: $(cat "$WORK/err"))"
+        fi
+    else
+        echo "SKIP: this kernel keeps no swap account; the child swap cap case did not run"
+    fi
+
+    # A child's cgroup goes when the child ends, whatever the way it ends, so
+    # a gate of thousands of children leaves none behind.
+    hog='x=$(head -c 512M /dev/zero | tr "\\0" a)'
+    printf '%s' "$hog" > "$WORK/hog_quiet"
+    left=$(gate BLINK_CHILD_MEMORY_MAX=64M BLINK_CHILD_TIMEOUT=1 -- 'for i in 1 2 3; do
+            "$CAPPED" --child true; "$CAPPED" --child false; "$CAPPED" --child sleep 5
+        done
+        "$CAPPED" --child bash '"$WORK/hog_quiet"'
+        d=/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup); ls "${d%/*}/kids" | grep -c "^c-"')
+    if [ "$left" = 0 ]; then
+        pass "each child's cgroup is removed when the child ends"
+    else
+        flunk "child cgroups left behind (got [$left]: $(cat "$WORK/err"))"
+    fi
+
+    # A slice with no unit gives the gate a plain user scope, which must still
+    # hand each child a cgroup of its own.
+    where=$(gate BLINK_GATE_SLICE=blink-no-such-unit-test.slice -- '"$CAPPED" --child cut -d: -f3 /proc/self/cgroup')
+    case "$where" in
+        */blink-no-such-unit-test.slice/*) flunk "plain scope (ran in the slice with no unit: [$where])" ;;
+        */blink-gate-*.scope/kids/c-*) pass "a plain user scope still gives each child a cgroup of its own" ;;
+        *) flunk "plain scope child cgroup (got [$where]: $(cat "$WORK/err"))" ;;
+    esac
+
     out=$(gate -- '"$CAPPED" --child bash -c "echo hi; exit 0"')
     rc=$?
     if [ "$out" = hi ] && [ "$rc" = 0 ] && [ ! -s "$WORK/err" ]; then

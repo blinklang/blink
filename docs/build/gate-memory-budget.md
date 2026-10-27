@@ -273,7 +273,8 @@ failed gets that line, and it is never the child's reason in the `--report` file
 Linux 6.13 the kernel counts a refused fork in the cgroup of the process that forked, not
 in the cgroup whose cap refused it, so there the child's line names both caps and the gate
 line does not show. When the child's swap cap cannot be set, a notice says that only
-the gate's swap cap holds it.
+the gate's swap cap holds it. A kernel with no swap account has no swap cap file: the gate
+then prints one notice, not one for each child.
 
 The time limit sends `SIGTERM`, then `SIGKILL` after `BLINK_CHILD_KILL_AFTER` seconds. Exit
 124 or 137 names the time limit only when the time is spent, so a child that exits 124
@@ -318,13 +319,17 @@ Settings:
 | `BLINK_CHILD_CAP` | `1` | `0` runs each child in place, with no memory or process cap; the time limit stays |
 | `BLINK_CHILD_MEMORY_MAX` | `2G` | the child's `memory.max`, or its address space for `prlimit` and `ulimit`; `infinity` sets none |
 | `BLINK_CHILD_TASKS_MAX` | `256` | the child's `pids.max`; `infinity` sets none |
-| `BLINK_CHILD_SWAP_MAX` | unset | the child's `memory.swap.max`; unset leaves swap to the gate scope (2G) |
+| `BLINK_CHILD_SWAP_MAX` | `0` | the child's `memory.swap.max`; `infinity` leaves swap to the gate scope (2G) |
 | `BLINK_CHILD_TIMEOUT` | `600` | seconds before the time limit kills the child; `0` turns it off; `--timeout` sets it for one call, so it acts on the fmt stages only: a corpus row takes `CORPUS_*_TIMEOUT` |
 | `BLINK_CHILD_KILL_AFTER` | `10` | seconds between `SIGTERM` and `SIGKILL` at the time limit |
 
 The corpus stamp (`scripts/ci_corpus_stamp.sh`) includes these variables, except
 `BLINK_CHILD_TIMEOUT`, which reaches no corpus row. So a sweep that passed under other
 caps does not let `task ci` skip the next sweep.
+
+Why no swap per child: a child at its memory cap must die at once and name the cap, not
+page out for minutes first. And the gate's children share one swap cap of 2G, so one
+child that pages out would leave no swap for the others.
 
 `scripts/test_capped_child.sh`, in the gate self-tests, proves with caps of 64M, 64 tasks
 and 2 s that a memory hog, a fork loop and a sleep each fail with one line that names the
