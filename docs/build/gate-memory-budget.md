@@ -173,13 +173,16 @@ marker in each corpus mode, also when the caller sets a larger `BLINK_JOBS`.
 ## Budget
 
 The slice values are for this 64G machine with 24 CPUs; "Applied: the slice" gives the
-rule that sizes them for another machine.
+rule that sizes them for another machine. A machine has these values only after it runs
+`scripts/install-gate-slice.sh` and removes the drop-ins that override the unit. On
+2026-10-27 this machine still had the older `set-property` drop-ins (`MemoryHigh=20G`,
+`MemoryMax=24G`, `CPUQuota=1200%`), and `systemd-oomd` did not run.
 
 | Limit | Value | Reason |
 |---|---|---|
 | Slice `CPUQuota` | 1200% | Half the CPUs, as a gate outside the slice gets (see "Knobs and how they multiply"). |
-| Slice `MemoryHigh` | 16G | Highest anon + shmem was 4.2 GiB for one gate. 16G holds three gates at once. Above it, the kernel reclaims the page cache of the gates first. |
-| Slice `MemoryMax` | 24G | 61 GB RAM less about 20 GB for the desktop and sessions, and room for a large app such as the game (22 GB). |
+| Slice `MemoryHigh` | 15789M (15.4 GiB) | Highest anon + shmem was 4.2 GiB for one gate. This holds three gates at once. Above it, the kernel reclaims the page cache of the gates first. |
+| Slice `MemoryMax` | 23683M (23.1 GiB) | 61.7 GiB RAM less about 20 GB for the desktop and sessions, and room for a large app such as the game (22 GB). |
 | Slice `MemorySwapMax` | 2G | On 2026-10-25 the swap was full. Gate work that does not fit must fail, not push the sessions to swap. |
 | Slice `TasksMax` | 4096 | Highest `pids.peak` for one gate was 315. 4096 holds about four gates at three times that. A self-spawn chain stops at about 1.8 GiB. |
 | Slice `ManagedOOMMemoryPressure`, `ManagedOOMSwap` | `kill` | When `systemd-oomd` runs, it kills a gate scope under memory pressure or when the swap fills, before the kernel's OOM killer starts. |
@@ -416,26 +419,33 @@ scripts/install-gate-slice.sh --dry-run   # print the unit, change nothing
 scripts/install-gate-slice.sh             # write the unit, reload the user manager
 ```
 
-The script needs no `sudo`. It reloads the user manager only when the unit changed, so a
-second run changes nothing. With no systemd, as on Darwin, it prints one line and exits 0.
-Until the slice is installed, each capped gate run prints one line that names the
-script, and the gate still runs.
+The script needs no `sudo`. It reloads the user manager when the unit changed or when the
+manager has not loaded it (a reload that failed on an earlier run), so a second run
+changes nothing. After the reload, it checks that the manager reads the unit from the
+same dir; when the shell and the manager have a different `XDG_CONFIG_HOME`, it says so
+and exits 1. With no systemd, as on Darwin, or with no user manager in the session, it
+prints one line and exits 0. Until the slice is installed, each capped gate run prints one
+line that names the script, and the gate still runs.
 
 The script fills in the values that depend on the machine:
 
-| Value | Rule | 24 CPUs, 64G | 8 CPUs, 16G |
+| Value | Rule | 24 CPUs, 61.7 GiB | 8 CPUs, 15.5 GiB |
 |---|---|---|---|
 | `CPUQuota` | half the CPUs (`nproc --all`), at least one | 1200% | 400% |
-| `MemoryHigh` | a quarter of the RAM | 16G | 4G |
-| `MemoryMax` | three eighths of the RAM | 24G | 6G |
+| `MemoryHigh` | a quarter of the RAM | 15789M | 3965M |
+| `MemoryMax` | three eighths of the RAM | 23683M | 5947M |
 
-The RAM is `MemTotal`, rounded up to a multiple of 8G, since `MemTotal` is a little less
-than the RAM (61.7 GiB on a 64G machine). `MemorySwapMax`, `TasksMax` and the `ManagedOOM`
-rows are the same on each machine. `BLINK_SLICE_CPUS` and `BLINK_SLICE_MEMTOTAL_KIB` set
-the CPU count and the RAM in KiB, to size the slice for another machine.
+The RAM is `MemTotal`, which is a little less than the RAM (61.7 GiB on a 64G machine), so
+the caps are always below the RAM. A value is in G when it is a whole number of GiB, else
+in M. `MemorySwapMax`, `TasksMax` and the `ManagedOOM` rows are the same on each machine.
+`BLINK_SLICE_CPUS` and `BLINK_SLICE_MEMTOTAL_KIB` set the CPU count and the RAM in KiB, to
+size the slice for another machine.
 
 On a machine with less than 32G, `MemoryMax` is less than one gate's 12G cap, so the slice
-cap fires first. It still holds the gate away from the rest of the machine.
+cap fires first. It still holds the gate away from the rest of the machine. On a 16G
+machine, `MemoryHigh` (about 3.9 GiB) is less than the 4.2 GiB that one gate needs at its
+peak, so the kernel slows the gate down to reclaim its memory. The gate still passes, but
+more slowly.
 
 The OOM score is not in the unit: `OOMScoreAdjust` is a setting of a process that systemd
 starts (a service), and a slice or a scope has no such setting. systemd says
@@ -448,14 +458,16 @@ the gates must be chosen. The `ManagedOOM` rows do nothing while `systemd-oomd` 
 run; the kernel's OOM killer then uses the OOM score.
 
 `systemctl --user set-property blink-gates.slice ...` writes drop-ins to
-`~/.config/systemd/user.control/blink-gates.slice.d/`, and they override the unit. When
-the script finds such drop-ins, it names each file and prints the command that removes
-them.
+`~/.config/systemd/user.control/blink-gates.slice.d/` (or below `/run` with `--runtime`),
+and they override the unit. The script asks the manager for each drop-in of the slice,
+names each file, and prints the command that removes them all and keeps the unit:
+`systemctl --user revert blink-gates.slice`.
 
-`scripts/test_gate_slice.sh`, in the gate self-tests, proves the dry-run values for 1, 8,
-24 and 64 CPUs and 16G, 64G and 100G of RAM, that a second install changes nothing, the
-drop-in warning, the no-systemd line, and the one notice of a capped run with no slice
-unit. It installs into a temp dir, with a fake `systemctl`.
+`scripts/test_gate_slice.sh`, in the gate self-tests, proves the dry-run values for 1,
+8, 24 and 64 CPUs and 1.9, 15.5, 61.7 and 100 GiB of RAM, that a second install changes
+nothing, that a failed reload is done on the next run, the `XDG_CONFIG_HOME` check, the
+drop-in warning, the no-systemd and no-manager lines, and the one notice of a capped run
+with no slice unit. It installs into a temp dir, with a fake `systemctl`.
 
 ## Probe dirs
 

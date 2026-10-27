@@ -7,7 +7,7 @@
 #
 # --dry-run prints the unit and changes nothing. Without it, the script writes
 # the unit to ${XDG_CONFIG_HOME:-~/.config}/systemd/user and reloads the user
-# manager, but only when the unit changed. No sudo.
+# manager when the unit changed or the manager has not loaded it. No sudo.
 #
 # Env (for tests, or to size the slice for another machine):
 #   BLINK_SLICE_CPUS          CPU count (default: nproc --all)
@@ -15,13 +15,14 @@
 set -u
 cd "$(dirname "$0")/.."
 
+usage() { echo "usage: scripts/install-gate-slice.sh [--dry-run]" >&2; exit 2; }
 dry=0
+[ $# -le 1 ] || usage
 case "${1:-}" in
     '') ;;
     --dry-run) dry=1 ;;
-    *) echo "usage: scripts/install-gate-slice.sh [--dry-run]" >&2; exit 2 ;;
+    *) usage ;;
 esac
-[ $# -le 1 ] || { echo "usage: scripts/install-gate-slice.sh [--dry-run]" >&2; exit 2; }
 
 if [ "$(uname -s 2>/dev/null)" != Linux ] || ! command -v systemctl >/dev/null 2>&1; then
     echo "install-gate-slice.sh: no systemd on this machine, so there is no slice to install; scripts/capped.sh caps each run on its own"
@@ -43,11 +44,11 @@ case "$kib" in '' | *[!0-9]* | 0) echo "install-gate-slice.sh: bad RAM size [$ki
 half=$((cpus / 2))
 [ "$half" -ge 1 ] || half=1
 quota=$((half * 100))%
-# MemTotal is a little under the RAM size (61.7 GiB on a 64G machine), so
-# round it up to a multiple of 8 GiB before the fractions.
-gib=$(( (kib + 8 * 1024 * 1024 - 1) / (8 * 1024 * 1024) * 8 ))
-high=$((gib / 4))G
-max=$((gib * 3 / 8))G
+# size <MiB>: in G when it is a whole number of GiB, else in M.
+size() { if [ $(($1 % 1024)) = 0 ]; then echo "$(($1 / 1024))G"; else echo "${1}M"; fi; }
+mib=$((kib / 1024))
+high=$(size $((mib / 4)))
+max=$(size $((mib * 3 / 8)))
 
 unit=$(sed -e "s/@CPU_QUOTA@/$quota/" -e "s/@MEMORY_HIGH@/$high/" -e "s/@MEMORY_MAX@/$max/" \
     scripts/systemd/blink-gates.slice) || exit 1
@@ -57,27 +58,45 @@ if [ "$dry" = 1 ]; then
     exit 0
 fi
 
+if ! systemctl --user show-environment >/dev/null 2>&1; then
+    echo "install-gate-slice.sh: no systemd user manager in this session, so nothing was installed; scripts/capped.sh caps each run on its own"
+    exit 0
+fi
+
 config=${XDG_CONFIG_HOME:-$HOME/.config}
 dir=$config/systemd/user
 file=$dir/blink-gates.slice
-set_values="CPUQuota=$quota MemoryHigh=$high MemoryMax=$max MemorySwapMax=2G TasksMax=4096"
-if [ -f "$file" ] && [ "$(cat "$file")" = "$unit" ]; then
-    echo "install-gate-slice.sh: $file is up to date: $set_values"
-else
+set_values=$(sed -n '/^\[Slice\]/,$s/^\([A-Za-z]*=.*\)/\1/p' <<<"$unit" | tr '\n' ' ')
+
+# show [<key>]: the manager's view of the slice, or one key from it.
+show() {
+    systemctl --user show -p FragmentPath -p NeedDaemonReload -p DropInPaths blink-gates.slice |
+        sed -n "s/^$1=//p"
+}
+
+changed=0
+if ! [ -f "$file" ] || [ "$(cat "$file")" != "$unit" ]; then
     mkdir -p "$dir" || exit 1
     printf '%s\n' "$unit" > "$file.tmp" && mv "$file.tmp" "$file" || exit 1
-    systemctl --user daemon-reload || exit 1
-    echo "install-gate-slice.sh: wrote $file and reloaded the user manager: $set_values"
+    changed=1
+fi
+# A reload that failed on an earlier run leaves the file new on disk but
+# not loaded, so look at the manager too, not only at the file.
+if [ "$changed" = 1 ] || [ "$(show NeedDaemonReload)" = yes ] || [ "$(show FragmentPath)" != "$file" ]; then
+    systemctl --user daemon-reload || { echo "install-gate-slice.sh: wrote $file, but the user manager did not reload; run the script again" >&2; exit 1; }
+    if [ "$(show FragmentPath)" != "$file" ]; then
+        echo "install-gate-slice.sh: wrote $file, but the user manager does not read it; the manager may have another XDG_CONFIG_HOME than this shell" >&2
+        exit 1
+    fi
+    echo "install-gate-slice.sh: wrote $file and reloaded the user manager: ${set_values% }"
+else
+    echo "install-gate-slice.sh: $file is up to date: ${set_values% }"
 fi
 
-# systemctl set-property writes drop-ins here, and they override the unit.
-control=$config/systemd/user.control/blink-gates.slice.d
-found=()
-for f in "$control"/*.conf; do
-    [ -e "$f" ] && found+=("$f")
-done
+# systemctl set-property and other drop-ins override the unit.
+read -r -a found <<<"$(show DropInPaths)"
 if [ ${#found[@]} -gt 0 ]; then
-    echo "install-gate-slice.sh: these drop-ins from systemctl set-property override the unit:"
+    echo "install-gate-slice.sh: these drop-ins override the unit:"
     printf '  %s\n' "${found[@]}"
-    echo "install-gate-slice.sh: to use the unit's values, run: rm -r $control && systemctl --user daemon-reload"
+    echo "install-gate-slice.sh: to use the unit's values, run: systemctl --user revert blink-gates.slice"
 fi
