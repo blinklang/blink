@@ -3,7 +3,8 @@
 # its path, `clean` removes one dir or all of them and no symlink target,
 # `check` prints each dir's size, names a tmpfs root, warns past the limit and
 # exits 0 even then, and every command refuses a root that is "/", holds
-# $HOME by any spelling, is a symlink, or is not named blink-probe-*. Each
+# $HOME by any spelling, holds //, is a symlink, or is not named
+# blink-probe-<user>. Each
 # root that clean may touch is under a mktemp dir; "/" and the real $HOME get
 # only new and check.
 set -u
@@ -19,14 +20,15 @@ flunk() { echo "FAIL: $1"; fail=1; }
 run() { env -u BLINK_SCRATCH_ROOT -u BLINK_SCRATCH_WARN TMPDIR="$WORK/tmp" "$@"; }
 mkdir -p "$WORK/tmp"
 user=$(id -un)
-root="$WORK/tmp/blink-probe-$user"
+P=blink-probe-$user
+root="$WORK/tmp/$P"
 
 # new: default root under TMPDIR, path on stdout
 p=$(run "$SCRATCH" new probe1)
 if [ "$p" = "$root/probe1" ] && [ -d "$p" ]; then pass "new makes the dir under TMPDIR"; else flunk "new printed '$p'"; fi
 p2=$(run "$SCRATCH" new probe1)
 [ "$p2" = "$p" ] && pass "new on an existing dir prints its path" || flunk "second new printed '$p2'"
-for bad in '' . .. a/b ../x '-x'; do
+for bad in '' . .. a/b ../x '-x' .hidden ..big; do
     if run "$SCRATCH" new "$bad" >/dev/null 2>&1; then flunk "new accepted name '$bad'"; else pass "new refuses name '$bad'"; fi
 done
 
@@ -127,34 +129,39 @@ refused_safe 'not an absolute path' BLINK_SCRATCH_ROOT=/
 refused_safe 'not named blink-probe' BLINK_SCRATCH_ROOT="$HOME"
 refused_safe 'not named blink-probe' BLINK_SCRATCH_ROOT="$HOME/"
 
-H=$WORK/h/blink-probe-h
+H=$WORK/h/$P
 mkdir -p "$H/home" "$WORK/h/alias"; touch "$H/home/precious"
 ln -s "$WORK/h" "$WORK/h/alias/up"
 refused 'not an absolute path' BLINK_SCRATCH_ROOT=relative/blink-probe-a
 refused 'not named blink-probe' BLINK_SCRATCH_ROOT="$WORK/tmp"
-refused 'holds \. or \.\.' BLINK_SCRATCH_ROOT="$WORK/tmp/../tmp/blink-probe-a"
-refused 'holds \. or \.\.' BLINK_SCRATCH_ROOT="$WORK/./tmp/blink-probe-a"
-refused 'no parent dir' BLINK_SCRATCH_ROOT="$WORK/nothere/blink-probe-a"
-mkdir -p "$WORK/target/blink-probe-y/d"
-ln -s "$WORK/target/blink-probe-y" "$WORK/tmp/blink-probe-link"
-refused 'is a symlink' BLINK_SCRATCH_ROOT="$WORK/tmp/blink-probe-link"
-touch "$WORK/tmp/blink-probe-file"
-refused 'is not a dir' BLINK_SCRATCH_ROOT="$WORK/tmp/blink-probe-file"
+mkdir -p "$WORK/other/blink-probe-$user-not"
+refused 'not named blink-probe' BLINK_SCRATCH_ROOT="$WORK/other/blink-probe-$user-not"
+refused 'not named blink-probe' BLINK_SCRATCH_ROOT="$WORK/other/blink-probe-x"
+refused 'holds \. or \.\.' BLINK_SCRATCH_ROOT="$WORK/tmp/../tmp/$P"
+refused 'holds \. or \.\.' BLINK_SCRATCH_ROOT="$WORK/./tmp/$P"
+refused 'holds //' BLINK_SCRATCH_ROOT="$WORK//tmp/$P"
+refused 'no parent dir' BLINK_SCRATCH_ROOT="$WORK/nothere/$P"
+mkdir -p "$WORK/target/$P/d" "$WORK/sym"
+ln -s "$WORK/target/$P" "$WORK/sym/$P"
+refused 'is a symlink' BLINK_SCRATCH_ROOT="$WORK/sym/$P"
+mkdir -p "$WORK/file"; touch "$WORK/file/$P"
+refused 'is not a dir' BLINK_SCRATCH_ROOT="$WORK/file/$P"
 refused 'holds \$HOME' HOME="$H/home" BLINK_SCRATCH_ROOT="$H"
 refused 'holds \$HOME' HOME="$H" BLINK_SCRATCH_ROOT="$H"
-refused 'holds \$HOME' HOME="$H/home" BLINK_SCRATCH_ROOT="${H%/*}//blink-probe-h"
-refused 'holds \$HOME' HOME="$WORK/h/./blink-probe-h/home" BLINK_SCRATCH_ROOT="$H"
-refused 'holds \$HOME' HOME="$H/home" BLINK_SCRATCH_ROOT="$WORK/h/alias/up/blink-probe-h"
-refused 'holds \$HOME' HOME="$WORK/h/alias/up/blink-probe-h/home" BLINK_SCRATCH_ROOT="$H"
+refused 'holds \$HOME' HOME="$WORK/h/./$P/home" BLINK_SCRATCH_ROOT="$H"
+refused 'holds \$HOME' HOME="$WORK/h//$P/home" BLINK_SCRATCH_ROOT="$H"
+refused 'holds \$HOME' HOME="$H/home" BLINK_SCRATCH_ROOT="$WORK/h/alias/up/$P"
+refused 'holds \$HOME' HOME="$WORK/h/alias/up/$P/home" BLINK_SCRATCH_ROOT="$H"
 # With no HOME there is no home to lose; the guard must not die on it.
-out=$(run env -u HOME BLINK_SCRATCH_ROOT="$WORK/tmp/blink-probe-nohome" "$SCRATCH" new z 2>&1)
-if [ "$out" = "$WORK/tmp/blink-probe-nohome/z" ]; then pass "new with HOME unset"; else flunk "HOME unset: $out"; fi
-[ -d "$WORK/target/blink-probe-y/d" ] && pass "a symlinked root's target stays" || flunk "symlinked root target removed"
+mkdir -p "$WORK/nohome"
+out=$(run env -u HOME BLINK_SCRATCH_ROOT="$WORK/nohome/$P" "$SCRATCH" new z 2>&1)
+if [ "$out" = "$WORK/nohome/$P/z" ]; then pass "new with HOME unset"; else flunk "HOME unset: $out"; fi
+[ -d "$WORK/target/$P/d" ] && pass "a symlinked root's target stays" || flunk "symlinked root target removed"
 [ -f "$H/home/precious" ] && pass "a fake HOME inside the root stays" || flunk "fake HOME removed"
 
 # an explicit root of the right shape works
 mkdir -p "$WORK/home"
-alt="$WORK/home/blink-probe-x"
+alt="$WORK/home/$P"
 p=$(run env BLINK_SCRATCH_ROOT="$alt" "$SCRATCH" new a)
 [ "$p" = "$alt/a" ] && [ -d "$p" ] && pass "BLINK_SCRATCH_ROOT sets the root" || flunk "override root printed '$p'"
 

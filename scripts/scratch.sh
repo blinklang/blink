@@ -9,14 +9,16 @@
 #   scripts/scratch.sh check           print each dir's size; warn past the limit
 #
 # Root: BLINK_SCRATCH_ROOT, else ${TMPDIR:-/tmp}/blink-probe-<user>. Its last
-# part must be blink-probe-*, so a bad value cannot point clean at / or $HOME.
+# part must be blink-probe-<user>, so a bad value cannot point clean at / or
+# $HOME or any other dir.
 # BLINK_SCRATCH_WARN (default 4G) is the total past which check warns.
 # check always exits 0: it runs at the end of `task ci` and must not fail it.
 set -u
 
 die() { echo "scratch.sh: $*" >&2; exit 2; }
 
-root=${BLINK_SCRATCH_ROOT:-${TMPDIR:-/tmp}/blink-probe-$(id -un)}
+user=$(id -un)
+root=${BLINK_SCRATCH_ROOT:-${TMPDIR:-/tmp}/blink-probe-$user}
 root=${root%/}
 
 # The root with each symlink in its parent resolved and each // folded, so
@@ -35,8 +37,11 @@ root_problem() {
         *) echo "root '$root' is not an absolute path"; return ;;
     esac
     case "${root##*/}" in
-        blink-probe-?*) ;;
-        *) echo "root '$root' is not named blink-probe-*"; return ;;
+        "blink-probe-$user") ;;
+        *) echo "root '$root' is not named blink-probe-$user"; return ;;
+    esac
+    case "$root" in
+        *//*) echo "root '$root' holds //"; return ;;
     esac
     case "/$root/" in
         */../*|*/./*) echo "root '$root' holds . or .."; return ;;
@@ -56,7 +61,7 @@ root_problem() {
 
 check_name() {
     case "$1" in
-        ''|.|..|-*|*/*) die "bad name '$1'" ;;
+        ''|.*|-*|*/*) die "bad name '$1'" ;;
     esac
 }
 
