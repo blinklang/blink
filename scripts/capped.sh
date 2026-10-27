@@ -65,21 +65,23 @@ child_kill_after=${BLINK_CHILD_KILL_AFTER:-10}
 
 notice() { echo "capped.sh: $*" >&2; }
 
-# Only builtins below: after a fork loop hits the task cap, a fork can fail.
+# Only builtins below, and each sets a variable, not a $( ): after the task
+# cap fills, a fork can fail, and bash then ends the script with no report.
 read_event() {
-    # read_event <file> <key>: the counter, or 0
+    # read_event <var> <file> <key>: set <var> to the counter, or 0
     local k v
-    [ -r "$1" ] || { echo 0; return; }
+    printf -v "$1" 0
+    [ -r "$2" ] || return 0
     while read -r k v; do
-        [ "$k" = "$2" ] && { echo "$v"; return; }
-    done < "$1"
-    echo 0
+        [ "$k" = "$3" ] && { printf -v "$1" %s "$v"; return 0; }
+    done < "$2"
 }
 
-# own_events <dir> <file>: the file that counts only the events of <dir>'s own
-# limit. The plain file also counts each child cgroup's events.
+# own_events <var> <dir> <file>: set <var> to the file that counts only the
+# events of <dir>'s own limit. The plain file also counts each child cgroup's
+# events.
 own_events() {
-    if [ -r "$1/$2.local" ]; then echo "$1/$2.local"; else echo "$1/$2"; fi
+    if [ -r "$2/$3.local" ]; then printf -v "$1" %s "$2/$3.local"; else printf -v "$1" %s "$2/$3"; fi
 }
 
 # end_procs <cgroup dir> [<pid to keep>]: kill each process left in the cgroup.
@@ -205,16 +207,17 @@ child_notice() {
 report_child() {
     local lines=() oom own_oom forks gate_forks=0 which
     if [ -n "$kid" ]; then
-        oom=$(read_event "$kid/memory.events" oom_kill)
-        own_oom=$(read_event "$kid/memory.events" oom)
-        forks=$(read_event "$kid/pids.events.local" max)
+        read_event oom "$kid/memory.events" oom_kill
+        read_event own_oom "$kid/memory.events" oom
+        read_event forks "$kid/pids.events.local" max
         which="its process cap (TasksMax=$child_tasks)"
         if [ -r "$kid/pids.events.local" ]; then
-            gate_forks=$(($(read_event "$dir/pids.events.local" max) - $4))
+            read_event gate_forks "$dir/pids.events.local" max
+            gate_forks=$((gate_forks - $4))
         else
             # Before Linux 6.13, pids.events counts a refused fork in the
             # forker's cgroup, whichever cap refused it.
-            forks=$(read_event "$kid/pids.events" max)
+            read_event forks "$kid/pids.events" max
             which="a process cap (its TasksMax=$child_tasks or the gate's TasksMax=$tasks)"
         fi
         if [ "$oom" != 0 ] && [ "$own_oom" != 0 ]; then
@@ -360,7 +363,7 @@ run_child() {
                 if [ -e "$kid/memory.swap.max" ] && ! echo "${child_swap/#infinity/max}" 2>/dev/null > "$kid/memory.swap.max"; then
                     notice "could not set this child's swap cap (MemorySwapMax=$child_swap), so only the gate's swap cap holds it"
                 fi
-                gate_forks=$(read_event "$dir/pids.events.local" max)
+                read_event gate_forks "$dir/pids.events.local" max
                 # The subshell moves itself, then execs; this script stays in
                 # the gate's cgroup, so the cap's OOM kill never picks it.
                 launch "$BASH" -c 'echo 0 2>/dev/null > "$1/cgroup.procs" ||
@@ -436,13 +439,15 @@ if [ "${1:-}" = --inner ]; then
     # The scope's own limit, not a child's: a child's cap is the child's line.
     # The plain oom_kill also counts each child's kills at its own cap, so
     # only the scope's own oom count says that the run's cap fired.
-    own_oom=$(read_event "$(own_events "$dir" memory.events)" oom)
-    oom=$(read_event "$dir/memory.events" oom_kill)
-    gate_oom=$(read_event "$leaf/memory.events" oom_kill)
-    forks=$(read_event "$(own_events "$dir" pids.events)" max)
+    own_events events "$dir" memory.events
+    read_event own_oom "$events" oom
+    read_event oom "$dir/memory.events" oom_kill
+    read_event gate_oom "$leaf/memory.events" oom_kill
+    own_events events "$dir" pids.events
+    read_event forks "$events" max
     # Before Linux 6.13, pids.events counts a refused fork in the forker's
     # cgroup, and the gate's processes are in its leaf.
-    [ -r "$dir/pids.events.local" ] || forks=$(read_event "$leaf/pids.events" max)
+    [ -r "$dir/pids.events.local" ] || read_event forks "$leaf/pids.events" max
     if [ "$own_oom" != 0 ] && [ "$leaf" = "$dir" ]; then
         notice "the run hit its memory cap (MemoryMax=$mem) and the OOM killer killed $oom of its processes; exit $rc"
     elif [ "$own_oom" != 0 ]; then

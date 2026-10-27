@@ -303,5 +303,18 @@ else
     flunk "fork loop (rc=$rc, report lines=$lines: $(cat "$WORK/err"))"
 fi
 
+# Sleepers that still fill the task cap when the command ends leave the script
+# that reports no fork to spare, so it must read its counters without one.
+fill='for i in $(seq 20); do sleep 40 & done 2>/dev/null; exit 3'
+run BLINK_GATE_TASKS_MAX=12 timeout 30 "$CAPPED" bash -c "$fill" > /dev/null 2> "$WORK/err"
+rc=$?
+lines=$(grep -c '^capped.sh: the run hit its process cap' "$WORK/err")
+others=$(grep -vc '^capped.sh: the run hit its process cap' "$WORK/err")
+if [ "$rc" != 124 ] && [ "$lines" = 1 ] && [ "$others" = 0 ]; then
+    pass "the run reports a full task cap with no fork of its own"
+else
+    flunk "report at a full task cap (rc=$rc: $(cat "$WORK/err"))"
+fi
+
 [ "$fail" = 0 ] && echo "ok: capped.sh" || echo "FAILED: capped.sh"
 exit "$fail"
