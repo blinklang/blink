@@ -254,15 +254,29 @@ check_tests_row() {
   d="$WORK/tests_row"
   rm -rf "$d"
   cp -r "$BASE" "$d"
-  printf '%s\n' '// see br xyz987' >> "$d/tests/test_fixture.bl"
+  printf '%s\n' "$1" >> "$d/tests/test_fixture.bl"
   if RATCHET_SRC_DIR="$d" RATCHET_BASELINE="$BASELINE" RATCHET_HEAD1_DIR="$BASE" ./scripts/ratchet.sh > /dev/null 2>&1; then
-    echo "FAIL br_ids_in_test_comments: a +1 on this row did not fail ratchet.sh"
+    echo "FAIL br_ids_in_tests: +1 ($2) did not fail ratchet.sh"
     fail=1
   else
-    echo "PASS br_ids_in_test_comments: +1 correctly failed ratchet.sh"
+    echo "PASS br_ids_in_tests: +1 ($2) correctly failed ratchet.sh"
   fi
 }
-check_tests_row
+check_tests_row '// see br xyz987' 'a br-prefixed id in a comment'
+check_tests_row 'test "q7tzp2 keeps the carrier" { assert(true) }' 'a bare id in a test name'
+check_tests_row '    let r = compile_and_run(src, "jkwqzv_run")' 'an id in a fixture label'
+check_tests_row '@trusted(audit: "q7tzp2-test")' 'an id in an audit key'
+d="$WORK/tests_words"
+rm -rf "$d"
+cp -r "$BASE" "$d"
+printf '%s\n' 'test "parser deadbe cafe12" { assert_eq("string_run", "string_run") }' >> "$d/tests/test_fixture.bl"
+if RATCHET_SRC_DIR="$d" RATCHET_BASELINE="$BASELINE" RATCHET_HEAD1_DIR="$BASE" ./scripts/ratchet.sh > "$d.out" 2>&1 &&
+    grep -qE '^br_ids_in_tests +0 +0 +0$' "$d.out"; then
+  echo "PASS br_ids_in_tests: words and hex that are not ids do not count"
+else
+  echo "FAIL br_ids_in_tests counted a token that is not an id:"; cat "$d.out"
+  fail=1
+fi
 check_row layout_decline_unhandled cname.bl     'let swallowed = d.decline_reason'
 
 # The two name-keyed rows. A plain "the script failed" check would pass if some
