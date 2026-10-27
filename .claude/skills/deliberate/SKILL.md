@@ -197,6 +197,7 @@ Write the new spec content into the appropriate `sections/*.md` file:
 - Blink code examples follow all syntax rules.
 - Cross-reference other sections where relevant (e.g., "see §3.6 for trait resolution").
 - If a new subsection number is needed, use the next available number in that section.
+- Do not edit `llms.md` or `llms-full.md`. They tell users and agents what the compiler does now, so a rule goes there when its implementation lands. A spec commit changes only `sections/`, `decisions/`, `DECISIONS.md` and `ERROR_CATALOG.md`. Put the `llms*.md` text the change needs in the implementation ticket (Step 10).
 
 ## Step 10: Update Tracking Files
 
@@ -204,7 +205,7 @@ Write the new spec content into the appropriate `sections/*.md` file:
 - Close the br task: `br close <id>`.
 
 ### Implementation ticket
-- File a `type:project` (or `type:feature` if it's narrow enough for one PR) ticket in `br` to implement the resolved spec. Title: `Implement: <feature> (<spec-ticket-id> spec)`. Description: list the spec sections that govern, the components that need changes (typecheck / codegen / stdlib / runner / docs / tests), and any "concerns" the panel raised in Phase C that the implementation must address (e.g. regression fixtures, sealing invariants, lowering hygiene).
+- File a `type:project` (or `type:feature` if it's narrow enough for one PR) ticket in `br` to implement the resolved spec. Title: `Implement: <feature> (<spec-ticket-id> spec)`. Description: list the spec sections that govern, the components that need changes (typecheck / codegen / stdlib / runner / docs / tests), and any "concerns" the panel raised in Phase C that the implementation must address (e.g. regression fixtures, sealing invariants, lowering hygiene). Say which `llms.md` / `llms-full.md` text the implementation must add or change when it lands.
 - The deliberation closes the *spec* gap; implementation is a separate workstream. Without an impl ticket the spec sits unimplemented and the ticket queue loses sight of it.
 - If the resolved decision is "reject" or "do nothing" (no code change required), skip this step — note in Step 12 that no impl is needed.
 
