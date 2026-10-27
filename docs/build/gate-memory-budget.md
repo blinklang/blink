@@ -132,7 +132,7 @@ Settings:
 
 | Variable | Default | Effect |
 |---|---|---|
-| `BLINK_GATE_WORKER_MEMORY` | `1G` | memory to allow for each worker: 2 times the largest single process (500 MB). `infinity` drops the memory limit from B |
+| `BLINK_GATE_WORKER_MEMORY` | `1G` | memory to allow for each worker: 2 times the largest single process (500 MB, see "Results"). `infinity` drops the memory limit from B |
 | `BLINK_GATE_MEMORY_MAX` | `12G` | the gate's cap (see "Applied: one gate scope"); B reads it too |
 
 `BLINK_JOBS` matters for every row, not only a per-module one: many tests run their own
@@ -144,11 +144,21 @@ Where stages run at once, their workers add:
 
 - `task ci` first runs gen1 (two links, 2B for about 10 s) beside the ratchet's commit walk
   (B) and the gate self-tests (about 15 processes): about 3B at the peak.
-- Then it runs the corpus (B workers) beside the fmt goldens (B workers) and the warning
-  gate (two `blink check` processes, each with one Boehm marker per CPU). That is about 2B
-  + 2 processes for the 7 s that the fmt goldens take.
+- Then it starts the corpus (B workers) beside the fmt goldens (B workers) and the warning
+  gate (two `blink check` processes, each with one Boehm marker per CPU). At most this is
+  2B + 2 processes. In practice the two fan-outs do not overlap: the corpus first builds
+  its compiler archive on one core, and the goldens end before its workers start.
 - Two gates in two worktrees at the same time double all of this. The slice holds the sum
   only when both run in it.
+
+We measured the overlap on 2026-10-27 (commit b96ac30a, `CORPUS_JOBS=12`, no other gate in
+the slice), with a sample of the gate scope each 0.1 s. `task ci` took 226 s. The fmt
+goldens ran for 9.3 s, 4.6% of the 202 s that the corpus workers ran, and the gate used at
+most 0.9 GiB in that time. No sample had both fan-outs live. The gate peak was 3.9 GiB
+(anon + shmem 3.5 GiB), at 39 s, in the corpus alone. Thus the corpus and the goldens each
+keep B. Split B between them if the goldens come to overlap more than 20% of the corpus
+time, or the gate peak during the overlap goes past 8G. Measure again, and change
+`BLINK_GATE_WORKER_MEMORY`, if the largest single process grows past 500 MB.
 
 `scripts/test_gate_budget.sh`, in the gate self-tests, runs `default_jobs.sh` and
 `inner_jobs.sh` with a fake `nproc` of 1, 4, 12 and 64 CPUs, with and without a quota,
