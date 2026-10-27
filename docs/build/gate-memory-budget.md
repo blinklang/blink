@@ -309,8 +309,8 @@ gate's 12G cap would not hold over it. A cgroup below the delegated gate scope c
 process, not per child, and `RLIMIT_NPROC` counts all processes of the user.
 
 `task test` sets `BLINK_JOBS` and `GC_MARKERS` for its workers. The children that
-`blink test` starts do not go through `scripts/capped.sh`, so they get no per-child caps,
-only the gate's.
+`blink test` starts do not go through `scripts/capped.sh`, so they have only the gate's
+cap until `blink test` caps its own children.
 
 Settings:
 
