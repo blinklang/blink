@@ -16,6 +16,7 @@ fail=0
 
 pass() { echo "PASS: $1"; }
 flunk() { echo "FAIL: $1"; fail=1; }
+notices() { grep -c '^capped.sh: ' "$WORK/err"; }
 
 # This test runs inside a gate that capped.sh already capped; each case starts
 # as a fresh top-level run.
@@ -43,14 +44,14 @@ if command -v prlimit >/dev/null 2>&1; then
     P=$(fake_path noscope)
     out=$(run PATH="$P" BLINK_GATE_MEMORY_MAX=64M "$CAPPED" bash -c 'echo "as=$(ulimit -v) scope=$BLINK_GATE_SCOPE"; exit 5' 2> "$WORK/err")
     rc=$?
-    notices=$(grep -c '^capped.sh: ' "$WORK/err")
+    notices=$(notices)
     if [ "$out" = "as=65536 scope=prlimit" ] && [ "$rc" = 5 ] && [ "$notices" = 1 ]; then
         pass "no systemd-run: prlimit caps the address space, with one notice, exit code kept"
     else
         flunk "no systemd-run: prlimit (out=[$out] rc=$rc notices=$notices: $(cat "$WORK/err"))"
     fi
     out=$(run PATH="$P" BLINK_GATE_MEMORY_MAX=64M "$CAPPED" "$CAPPED" bash -c 'ulimit -v' 2> "$WORK/err")
-    notices=$(grep -c '^capped.sh: ' "$WORK/err")
+    notices=$(notices)
     if [ "$out" = 65536 ] && [ "$notices" = 1 ]; then
         pass "no systemd-run: a nested call does not cap twice"
     else
@@ -63,17 +64,41 @@ fi
 P=$(fake_path noprlimit noprlimit)
 out=$(run PATH="$P" BLINK_GATE_MEMORY_MAX=64M "$CAPPED" bash -c 'echo "as=$(ulimit -v) scope=$BLINK_GATE_SCOPE"' 2> "$WORK/err")
 rc=$?
-notices=$(grep -c '^capped.sh: ' "$WORK/err")
+notices=$(notices)
 if [ "$out" = "as=65536 scope=ulimit" ] && [ "$rc" = 0 ] && [ "$notices" = 1 ]; then
     pass "no systemd-run and no prlimit: ulimit caps the address space, with one notice"
 else
     flunk "no systemd-run and no prlimit: ulimit (out=[$out] rc=$rc: $(cat "$WORK/err"))"
 fi
 
+# --- Taskfile dispatchers ----------------------------------------------------
+
+missing=
+for t in $(sed -n 's/^  \([a-z0-9-]*\):$/\1/p' Taskfile.yml); do
+    if sed -n "/^  $t:\$/,/^  [^ ]/p" Taskfile.yml | grep -Eq '[&*]capped$|scripts/capped.sh --name'; then
+        grep -q "^  __$t:\$" Taskfile.yml || missing="$missing $t"
+    fi
+done
+if [ -z "$missing" ]; then
+    pass "each capped Taskfile task has a __<task> body"
+else
+    flunk "capped Taskfile tasks with no __<task> body:$missing"
+fi
+
+# A Task that ignores the cmd-level if: runs the dispatcher inside the capped
+# run; capped.sh must stop there, not exec task again.
+out=$(env BLINK_GATE_SCOPE=selftest "$CAPPED" --name selftest echo ran 2> "$WORK/err")
+rc=$?
+if [ "$rc" = 2 ] && [ -z "$out" ] && grep -q 'Task 3.47' "$WORK/err"; then
+    pass "a dispatcher inside its own capped run stops with one line"
+else
+    flunk "dispatcher inside its capped run (out=[$out] rc=$rc: $(cat "$WORK/err"))"
+fi
+
 # --- Opt-out -----------------------------------------------------------------
 
 out=$(env -u BLINK_GATE_SCOPE BLINK_GATE_CAP=0 "$CAPPED" cut -d: -f3 /proc/self/cgroup 2> "$WORK/err")
-notices=$(grep -c '^capped.sh: ' "$WORK/err")
+notices=$(notices)
 if [ "$out" = "$own_cgroup" ] && [ "$notices" = 1 ]; then
     pass "BLINK_GATE_CAP=0 runs in place, with one notice"
 else
@@ -82,7 +107,10 @@ fi
 
 # --- systemd scope ------------------------------------------------------------
 
-if ! command -v systemd-run >/dev/null 2>&1 || ! systemd-run --user --scope -q true >/dev/null 2>&1; then
+# The same properties capped.sh asks for: a user manager with no memory or pids
+# controller starts a bare scope but not this one, and capped.sh falls back.
+if ! command -v systemd-run >/dev/null 2>&1 ||
+    ! systemd-run --user --scope -q -p MemoryMax=64M -p TasksMax=64 -p OOMPolicy=continue true >/dev/null 2>&1; then
     echo "SKIP: no systemd user scope on this machine; the scope cases did not run"
     [ "$fail" = 0 ] && echo "ok: capped.sh" || echo "FAILED: capped.sh"
     exit "$fail"
@@ -98,7 +126,9 @@ case "$cg" in
     */blink-gate-*.scope) in_scope=1 ;;
     *) in_scope=0 ;;
 esac
-if [ "$in_scope" = 1 ] && [ "$first" = "$second" ] && [ ! -s "$WORK/err" ]; then
+# A slice with no unit adds that notice; nothing else may print.
+extra=$(grep -v '^capped.sh: .* has no unit, so this run gets a plain user scope' "$WORK/err")
+if [ "$in_scope" = 1 ] && [ "$first" = "$second" ] && [ -z "$extra" ]; then
     pass "the run gets one scope, and a nested call stays in it"
 else
     flunk "one scope (first=[$first] second=[$second] err=[$(cat "$WORK/err")])"
@@ -135,7 +165,7 @@ for code in 0 1 7; do
 done
 
 out=$(run BLINK_GATE_SLICE=blink-gates-selftest-no-unit.slice "$CAPPED" cut -d: -f3 /proc/self/cgroup 2> "$WORK/err")
-notices=$(grep -c '^capped.sh: ' "$WORK/err")
+notices=$(notices)
 case "$out" in
     *blink-gates-selftest-no-unit.slice*) where=slice ;;
     */blink-gate-*.scope) where=scope ;;
@@ -145,6 +175,20 @@ if [ "$where" = scope ] && [ "$notices" = 1 ]; then
     pass "a slice with no unit: a plain capped user scope, with one notice"
 else
     flunk "slice with no unit (cgroup [$out], notices=$notices)"
+fi
+
+# default.target has a unit but is not a slice, so no scope can start in it.
+out=$(run BLINK_GATE_SLICE=default.target "$CAPPED" cut -d: -f3 /proc/self/cgroup 2> "$WORK/err")
+rc=$?
+notices=$(notices)
+case "$out" in
+    */blink-gate-*.scope) where=scope ;;
+    *) where=none ;;
+esac
+if [ "$rc" = 0 ] && [ "$where" = scope ] && [ "$notices" = 1 ]; then
+    pass "a unit that cannot hold a scope: a plain capped user scope, with one notice"
+else
+    flunk "unit that is not a slice (rc=$rc cgroup [$out]: $(cat "$WORK/err"))"
 fi
 
 # A command substitution holds its whole output in memory: 512M here, eight

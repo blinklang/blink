@@ -1,12 +1,13 @@
 #!/bin/bash
-# Run a command under one gate's memory and process caps, so a runaway gate
-# dies alone and the kernel's global OOM killer never has to pick a victim.
+# Run a command under one gate's memory and process caps. A runaway gate then
+# hits its own caps, and the kernel's global OOM killer does not kill other
+# programs to free memory for it.
 # See docs/build/gate-memory-budget.md for the numbers.
 #
 #   scripts/capped.sh [--name <name>] <command> [<arg> ...]
 #
 # --name names the scope unit, blink-gate-<name>-<pid>-<time>.scope; without
-# it the command's own name does.
+# it the command's own name does. Only a Taskfile dispatcher passes --name.
 #
 # Each heavy Taskfile task re-runs itself through this script. The capped run
 # exports BLINK_GATE_SCOPE, and a call that finds it set runs the command in
@@ -89,7 +90,16 @@ if [ "${1:-}" = --name ]; then
 fi
 [ $# -gt 0 ] || { echo "usage: capped.sh [--name <name>] <command> [<arg> ...]" >&2; exit 2; }
 
-[ -n "${BLINK_GATE_SCOPE:-}" ] && exec "$@"
+if [ -n "${BLINK_GATE_SCOPE:-}" ]; then
+    # In a capped run a dispatcher calls its body, not this script. A Task
+    # before 3.47 ignores the cmd-level `if:` and would re-run the dispatcher
+    # here, which execs task again, with no end.
+    if [ -n "$name" ]; then
+        echo "capped.sh: task $name ran its dispatcher inside its capped run; the Taskfile needs Task 3.47 or later" >&2
+        exit 2
+    fi
+    exec "$@"
+fi
 
 if [ "${BLINK_GATE_CAP:-1}" = 0 ]; then
     notice "BLINK_GATE_CAP=0, so this run has no memory or process cap"
@@ -112,8 +122,10 @@ fi
 # Try the exact scope first: a box with no user bus, or with no memory or pids
 # controller for the user, fails here, and systemd-run's own exit 1 would
 # otherwise read as the command's.
-if command -v systemd-run >/dev/null 2>&1 &&
-    systemd-run --user --scope -q "${props[@]}" true >/dev/null 2>&1; then
+scope_starts() {
+    systemd-run --user --scope -q "$@" "${props[@]}" true >/dev/null 2>&1
+}
+if command -v systemd-run >/dev/null 2>&1 && scope_starts; then
     slice_args=(--slice="$slice")
     # systemd makes a slice on first use, with no limits; only a unit file or a
     # drop-in gives it the shared CPU and memory limits.
@@ -121,13 +133,18 @@ if command -v systemd-run >/dev/null 2>&1 &&
     if [ -z "$unit_files" ]; then
         notice "$slice has no unit, so this run gets a plain user scope with its own caps only"
         slice_args=()
+    elif ! scope_starts "${slice_args[@]}"; then
+        notice "$slice cannot hold a scope, so this run gets a plain user scope with its own caps only"
+        slice_args=()
     fi
     [ -n "$name" ] || name=${1##*/}
     name=${name//[^A-Za-z0-9_-]/_}
-    unit=blink-gate-$name-$$-$EPOCHSECONDS.scope
+    # EPOCHSECONDS needs bash 5.0.
+    unit=blink-gate-$name-$$-${EPOCHSECONDS:-$(date +%s)}.scope
     export BLINK_GATE_SCOPE=$unit
-    # --collect: a scope that ends failed would keep its name loaded.
-    exec systemd-run --user --scope -q --collect --unit="$unit" "${slice_args[@]}" "${props[@]}" \
+    # --collect: a scope that ends failed would keep its name loaded. The
+    # ${a[@]+...} form keeps an empty array legal under set -u before bash 4.4.
+    exec systemd-run --user --scope -q --collect --unit="$unit" ${slice_args[@]+"${slice_args[@]}"} "${props[@]}" \
         bash "$0" --inner "$@"
 fi
 
@@ -155,10 +172,17 @@ kib=$(size_kib "$mem")
 # RLIMIT_NPROC counts every process and thread of the user, not only this run,
 # so the cap is what runs now plus the run's share.
 procs=
-# ps -L lists threads on Linux; elsewhere it fails and plain ps counts processes.
-running=$(ps -L -u "$(id -u)" -o lwp= 2>/dev/null | wc -l)
-running=${running//[[:space:]]/}
-[ "${running:-0}" != 0 ] || running=$(ps -u "$(id -u)" 2>/dev/null | wc -l)
+uid=$(id -u)
+if [ -d /proc/self/task ]; then
+    # Linux counts threads against RLIMIT_NPROC, and ps -L lists them.
+    running=$(ps -L -u "$uid" -o lwp= 2>/dev/null | wc -l)
+else
+    # BSD and macOS count processes; there ps -L lists keywords, not threads.
+    running=0
+    while read -r u; do
+        [ "$u" = "$uid" ] && running=$((running + 1))
+    done < <(ps -ax -o uid= 2>/dev/null)
+fi
 running=${running//[[:space:]]/}
 case "$running" in '' | *[!0-9]* | 0) ;; *) procs=$((running + tasks)) ;; esac
 
