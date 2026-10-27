@@ -16,16 +16,17 @@ fmt_bin=$(mktemp "${TMPDIR:-/tmp}/fmt-sem-XXXXXX")
 orig_c=$(mktemp "${TMPDIR:-/tmp}/fmt-sem-XXXXXX.c")
 orig_bin=$(mktemp "${TMPDIR:-/tmp}/fmt-sem-XXXXXX")
 # child <command...>: run the command as a capped child (scripts/capped.sh
-# --child). Its stderr, with the line capped.sh prints for a cap it hit, goes
-# to $child_err; check_limit fails the file when such a line is there, so a
-# runaway file fails as itself and names the limit.
-child_err=$(mktemp "${TMPDIR:-/tmp}/fmt-child-XXXXXX")
-child() { "$(dirname "$0")/capped.sh" --child "$@" 2>>"$child_err"; }
-cleanup() { rm -f "$fmt_src" "$fmt_c" "$fmt_bin" "$orig_c" "$orig_bin" "$child_err"; }
-# check_limit: fail the file when a child hit a cap. A step that a cap killed
-# says nothing about the formatter, so no later verdict may stand in for it.
+# --child). When a cap ends it, $limit_file holds the line that names the cap,
+# so a runaway file fails as itself and names the limit.
+capped="$(dirname "$0")/capped.sh"
+limit_file=$(mktemp "${TMPDIR:-/tmp}/fmt-limit-XXXXXX")
+child() { "$capped" --child --report "$limit_file" "$@"; }
+cleanup() { rm -f "$fmt_src" "$fmt_c" "$fmt_bin" "$orig_c" "$orig_bin" "$limit_file"; }
+# check_limit: fail the file when a cap ended the last child. A step that a
+# cap killed says nothing about the formatter, so no later verdict may stand
+# in for it.
 check_limit() {
-  limit=$(grep '^capped.sh: the child' "$child_err" | tail -1)
+  limit=$(cat "$limit_file")
   [ -z "$limit" ] && return
   [ -n "${scratch:-}" ] && rm -rf "$scratch"
   cleanup
@@ -34,7 +35,7 @@ check_limit() {
 }
 # A file the formatter cannot format is a formatter bug; only the skip list
 # may excuse it.
-if ! child "$blinkc" "$f" "$fmt_src" --emit blink; then
+if ! child "$blinkc" "$f" "$fmt_src" --emit blink 2>/dev/null; then
   check_limit
   cleanup
   echo "FAIL (format) ${name}"
@@ -59,9 +60,9 @@ fi
 
 # blinkc_ok <source> <c output>
 if [ "$use_archive" = 1 ]; then
-  blinkc_ok() { child "$blinkc" $test_build --link-archive "$archive_h" "$1" "$2" >/dev/null; }
+  blinkc_ok() { child "$blinkc" $test_build --link-archive "$archive_h" "$1" "$2" >/dev/null 2>&1; }
 else
-  blinkc_ok() { child "$blinkc" $test_build "$1" "$2" >/dev/null; }
+  blinkc_ok() { child "$blinkc" $test_build "$1" "$2" >/dev/null 2>&1; }
 fi
 # A formatted file that no longer compiles is a formatter bug only when the
 # original compiles; otherwise the compiler cannot build this program yet.
@@ -118,7 +119,7 @@ fi
 scratch=$(mktemp -d "${TMPDIR:-/tmp}/blink-test-XXXXXX")
 outcome() {
   rm -rf "$scratch" && mkdir -m 700 "$scratch"
-  out=$(child env BLINK_TEST_SCRATCH_DIR="$scratch" BLINK_ROOT="$(pwd)" "$1")
+  out=$(child env BLINK_TEST_SCRATCH_DIR="$scratch" BLINK_ROOT="$(pwd)" "$1" 2>/dev/null)
   rc=$?
   out=$(printf '%s\n' "$out" | sed 's/\x1b\[[0-9;]*m//g')
   if printf '%s\n' "$out" | grep -qE '^test .* \.\.\. '; then

@@ -4,8 +4,11 @@
 # line that names the limit hit, a crash and a plain failure name no limit, a
 # pass still passes, the exit code passes through, a child killed by its own
 # cap gives no line about the gate's cap, and a nested --child stays in its
-# parent child's caps. With no systemd-run, each child gets prlimit caps and a
-# time limit, and the gate prints the one notice for that, not each child.
+# parent child's caps. It also proves the --report file, a fork refused at the
+# gate's cap, "infinity", a signal to the wrapper, and that a child OOM while
+# the gate reclaims page cache names no gate cap. With no systemd-run, each
+# child gets prlimit caps and a time limit, and the gate prints the one notice
+# for that, not each child.
 # Every hog and fork loop here runs under a cap of 64M or 64 tasks, with a
 # timeout, so this test cannot grow past a few hundred MB.
 set -u
@@ -22,7 +25,8 @@ flunk() { echo "FAIL: $1"; fail=1; }
 # Each case starts as a fresh top-level gate run, as test_capped.sh does.
 run() {
     env -u BLINK_GATE_SCOPE -u BLINK_GATE_CAP -u BLINK_CHILD_CAP -u BLINK_CHILD_CAP_MODE -u BLINK_CHILD_CGROUP \
-        -u BLINK_CHILD_MEMORY_MAX -u BLINK_CHILD_TASKS_MAX -u BLINK_CHILD_SWAP_MAX -u BLINK_CHILD_TIMEOUT "$@"
+        -u BLINK_CHILD_CAPPED -u BLINK_CHILD_MEMORY_MAX -u BLINK_CHILD_TASKS_MAX -u BLINK_CHILD_SWAP_MAX \
+        -u BLINK_CHILD_TIMEOUT -u BLINK_CHILD_KILL_AFTER "$@"
 }
 
 # gate <env assignments...> -- <shell text>: run the shell text as a gate's
@@ -68,8 +72,8 @@ if command -v systemd-run >/dev/null 2>&1 &&
 
     gate -- '"$CAPPED" --child bash -c "kill -SEGV \$\$"'
     rc=$?
-    if [ "$rc" = 139 ] && [ "$(any_child_lines)" = 0 ]; then
-        pass "a crash stays a crash and names no limit"
+    if [ "$rc" = 139 ] && [ "$(any_child_lines)" = 0 ] && ! grep -q 'Segmentation fault' "$WORK/err"; then
+        pass "a crash stays a crash, names no limit, and adds no job line to stderr"
     else
         flunk "crash (rc=$rc: $(cat "$WORK/err"))"
     fi
@@ -154,6 +158,104 @@ if command -v systemd-run >/dev/null 2>&1 &&
         flunk "leftover child processes (out=[$out]: $(cat "$WORK/err"))"
     fi
 
+    # A child may exit 124 itself; only a spent time limit names the limit.
+    gate BLINK_CHILD_TIMEOUT=60 -- '"$CAPPED" --child bash -c "exit 124"'
+    rc=$?
+    if [ "$rc" = 124 ] && [ "$(any_child_lines)" = 0 ]; then
+        pass "a child that exits 124 before its time limit names no limit"
+    else
+        flunk "fast exit 124 (rc=$rc: $(cat "$WORK/err"))"
+    fi
+
+    # systemd's "infinity" lifts one cap; the other cap still holds.
+    caps=$(gate BLINK_CHILD_MEMORY_MAX=infinity BLINK_CHILD_TASKS_MAX=64 -- \
+        '"$CAPPED" --child bash -c '\''d=/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup); echo "${d##*/} $(cat "$d/memory.max") $(cat "$d/pids.max")"'\''')
+    case "$caps" in
+        "c-"*" max 64") pass "BLINK_CHILD_MEMORY_MAX=infinity lifts the memory cap and keeps the task cap" ;;
+        *) flunk "memory cap infinity (got [$caps]: $(cat "$WORK/err"))" ;;
+    esac
+
+    # A gate started from a shell that a child left BLINK_CHILD_CAPPED in
+    # still caps its own children.
+    caps=$(gate BLINK_CHILD_CAPPED=1 BLINK_CHILD_MEMORY_MAX=64M -- \
+        '"$CAPPED" --child bash -c '\''d=/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup); echo "${d##*/} $(cat "$d/memory.max")"'\''')
+    case "$caps" in
+        "c-"*" 67108864") pass "an inherited BLINK_CHILD_CAPPED does not lift a new gate's child caps" ;;
+        *) flunk "inherited BLINK_CHILD_CAPPED (got [$caps]: $(cat "$WORK/err"))" ;;
+    esac
+
+    # A signal to the wrapper ends the child at once and removes its cgroup.
+    # Job control keeps SIGINT at its default in the background wrapper, as a
+    # terminal's Ctrl-C would reach a foreground one.
+    for sig in TERM INT; do
+        start=$EPOCHSECONDS
+        out=$(gate -- 'set -m; "$CAPPED" --child bash -c "echo \$\$ > '"$WORK"'/kidpid; exec sleep 300" > /dev/null & w=$!; set +m
+            for _ in $(seq 50); do [ -s '"$WORK"'/kidpid ] && break; sleep 0.1; done
+            kill -'"$sig"' "$w"; wait "$w"; echo "rc=$?"
+            d=/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup); ls -d "${d%/*}"/kids/c-* 2>/dev/null | wc -l')
+        took=$((EPOCHSECONDS - start))
+        kidpid=$(cat "$WORK/kidpid" 2>/dev/null)
+        rm -f "$WORK/kidpid"
+        want=143
+        [ "$sig" = INT ] && want=130
+        if [ "$out" = "$(printf 'rc=%s\n0' "$want")" ] && [ "$took" -lt 15 ] && [ -n "$kidpid" ] && ! kill -0 "$kidpid" 2>/dev/null; then
+            pass "SIG$sig to the wrapper ends the child at once and removes its cgroup"
+        else
+            flunk "SIG$sig to the wrapper (out=[$out] took=${took}s kid=[$kidpid]: $(cat "$WORK/err"))"
+            [ -n "$kidpid" ] && kill "$kidpid" 2>/dev/null
+        fi
+    done
+
+    # The report file gets the line of the cap that ended a failed child.
+    # Here a fork loop in a subshell fills the task cap, then the hog the
+    # memory cap; bash retries the hog's forks until the sleepers end.
+    printf '%s\n%s' '( for i in $(seq 100); do sleep 1 & done ) 2>/dev/null' "$hog" > "$WORK/both"
+    gate BLINK_CHILD_MEMORY_MAX=64M BLINK_CHILD_SWAP_MAX=0 BLINK_CHILD_TASKS_MAX=64 -- \
+        '"$CAPPED" --child --report '"$WORK/report"' bash '"$WORK/both" > /dev/null
+    rc=$?
+    case "$(cat "$WORK/report")" in
+        "capped.sh: the child hit its memory cap (MemoryMax=64M)"*)
+            if [ "$rc" != 0 ] && [ "$(child_lines 'hit its process cap (TasksMax=64)')" = 1 ]; then
+                pass "a child that hits both caps prints both and reports the memory cap that ended it"
+            else
+                flunk "both caps (rc=$rc: $(cat "$WORK/err"))"
+            fi
+            ;;
+        *) flunk "both caps report (rc=$rc report=[$(cat "$WORK/report")]: $(cat "$WORK/err"))" ;;
+    esac
+
+    # A child that passed in spite of a cap hit has nothing to report.
+    printf '%s\n%s' '( for i in $(seq 100); do sleep 1 & done ) 2>/dev/null' 'exit 0' > "$WORK/forks_pass"
+    gate BLINK_CHILD_TASKS_MAX=64 -- '"$CAPPED" --child --report '"$WORK/report"' bash '"$WORK/forks_pass" > /dev/null
+    rc=$?
+    if [ "$rc" = 0 ] && [ ! -s "$WORK/report" ] && [ "$(child_lines 'hit its process cap (TasksMax=64)')" = 1 ]; then
+        pass "a child that passes after a cap hit leaves the report file empty"
+    else
+        flunk "passing child after a cap hit (rc=$rc report=[$(cat "$WORK/report")]: $(cat "$WORK/err"))"
+    fi
+
+    # Forks the gate's own cap refuses leave the child's count at 0, so the
+    # line must come from the gate's count.
+    printf '%s' 'for i in $(seq 200); do sleep 3 & done 2>/dev/null; wait; exit 1' > "$WORK/gate_forks"
+    gate BLINK_GATE_TASKS_MAX=64 BLINK_CHILD_TASKS_MAX=256 -- \
+        '"$CAPPED" --child --report '"$WORK/report"' bash '"$WORK/gate_forks" > /dev/null
+    case "$(cat "$WORK/report")" in
+        "capped.sh: the gate refused "*" forks at its process cap (TasksMax=64) while this child ran; exit "*)
+            pass "a child whose forks the gate's cap refused names the gate's cap" ;;
+        *) flunk "gate fork cap (report=[$(cat "$WORK/report")]: $(cat "$WORK/err"))" ;;
+    esac
+
+    # Page cache from a big write fills the gate's cap and makes it reclaim;
+    # with a child killed at its own cap, that is still no OOM of the gate.
+    gate BLINK_GATE_MEMORY_MAX=128M BLINK_GATE_SWAP_MAX=0 BLINK_CHILD_MEMORY_MAX=48M BLINK_CHILD_SWAP_MAX=0 -- \
+        '"$CAPPED" --child bash '"$WORK/hog"' > /dev/null; dd if=/dev/zero of='"$WORK/fill"' bs=1M count=400 status=none; rm -f '"$WORK/fill"
+    rc=$?
+    if [ "$rc" = 0 ] && [ "$(child_lines 'hit its memory cap (MemoryMax=48M)')" = 1 ] && [ "$(gate_lines)" = 0 ]; then
+        pass "a child OOM while the gate reclaims page cache prints no line about the gate's cap"
+    else
+        flunk "child OOM with gate reclaim (rc=$rc: $(cat "$WORK/err"))"
+    fi
+
     out=$(gate BLINK_CHILD_CAP=0 -- '"$CAPPED" --child cut -d: -f3 /proc/self/cgroup')
     case "$out" in
         */gate) pass "BLINK_CHILD_CAP=0 runs a child in place, with no cgroup of its own" ;;
@@ -168,7 +270,7 @@ fi
 # A PATH with the tools capped.sh and the cases need, minus systemd-run.
 P="$WORK/noscope"
 mkdir -p "$P"
-for t in bash sh env cat cut ps wc id tr head sleep seq timeout grep uname prlimit; do
+for t in bash sh env cat cut ps wc id tr head sleep seq timeout grep uname prlimit dd rm; do
     p=$(command -v "$t") && ln -sf "$p" "$P/$t"
 done
 
@@ -188,6 +290,13 @@ if command -v prlimit >/dev/null 2>&1; then
         pass "no systemd-run: a sleep past the time limit still names the limit"
     else
         flunk "no systemd-run: child time limit (rc=$rc: $(cat "$WORK/err"))"
+    fi
+    gate PATH="$P" BLINK_CHILD_TASKS_MAX=infinity -- '"$CAPPED" --child bash -c "exit 0"'
+    rc=$?
+    if [ "$rc" = 0 ] && [ "$(grep -c 'integer expression\|syntax error' "$WORK/err")" = 0 ]; then
+        pass "no systemd-run: BLINK_CHILD_TASKS_MAX=infinity runs the child"
+    else
+        flunk "no systemd-run: tasks infinity (rc=$rc: $(cat "$WORK/err"))"
     fi
 else
     echo "SKIP: no prlimit on this machine; the prlimit child cases did not run"

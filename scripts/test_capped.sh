@@ -178,7 +178,7 @@ first=$(echo "$out" | head -1)
 second=$(echo "$out" | sed -n 2p)
 cg=${first%% *}
 case "$cg" in
-    */blink-gate-*.scope/gate) in_scope=1 ;;
+    */blink-gate-*.scope | */blink-gate-*.scope/gate) in_scope=1 ;;
     *) in_scope=0 ;;
 esac
 # A slice with no unit adds that notice; nothing else may print.
@@ -191,7 +191,7 @@ fi
 
 out=$(run "$CAPPED" --name selftest-probe cut -d: -f3 /proc/self/cgroup)
 case "$out" in
-    */blink-gate-selftest-probe-*.scope/gate) pass "--name names the scope" ;;
+    */blink-gate-selftest-probe-*.scope | */blink-gate-selftest-probe-*.scope/gate) pass "--name names the scope" ;;
     *) flunk "--name (cgroup [$out])" ;;
 esac
 
@@ -246,7 +246,7 @@ out=$(run BLINK_GATE_SLICE=blink-gates-selftest-no-unit.slice "$CAPPED" cut -d: 
 notices=$(notices)
 case "$out" in
     *blink-gates-selftest-no-unit.slice*) where=slice ;;
-    */blink-gate-*.scope/gate) where=scope ;;
+    */blink-gate-*.scope | */blink-gate-*.scope/gate) where=scope ;;
     *) where=none ;;
 esac
 if [ "$where" = scope ] && [ "$notices" = 1 ]; then
@@ -260,7 +260,7 @@ out=$(run BLINK_GATE_SLICE=default.target "$CAPPED" cut -d: -f3 /proc/self/cgrou
 rc=$?
 notices=$(notices)
 case "$out" in
-    */blink-gate-*.scope/gate) where=scope ;;
+    */blink-gate-*.scope | */blink-gate-*.scope/gate) where=scope ;;
     *) where=none ;;
 esac
 if [ "$rc" = 0 ] && [ "$where" = scope ] && [ "$notices" = 1 ]; then

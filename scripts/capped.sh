@@ -5,15 +5,17 @@
 # See docs/build/gate-memory-budget.md for the numbers.
 #
 #   scripts/capped.sh [--name <name>] <command> [<arg> ...]
-#   scripts/capped.sh --child [--timeout <seconds>] <command> [<arg> ...]
+#   scripts/capped.sh --child [--timeout <seconds>] [--report <file>] <command> [<arg> ...]
 #
 # --name names the scope unit, blink-gate-<name>-<pid>-<time>.scope; without
 # it the command's own name does. Only a Taskfile dispatcher passes --name.
 #
 # --child runs one test child (a test binary or a fixture build) under caps of
 # its own inside the gate run, so a runaway child dies alone and fails as one
-# test. When the child hits a cap, one line on stderr names it. --timeout sets
-# the child's time limit for this call.
+# test. When the child hits a cap, a line on stderr names it. --timeout sets
+# the child's time limit for this call. --report <file> gets the line of the
+# cap that ended a failed child, and is empty after any other run, so a caller
+# reads the reason without parsing the child's output.
 #
 # Each heavy Taskfile task re-runs itself through this script. The capped run
 # exports BLINK_GATE_SCOPE, and a call that finds it set runs the command in
@@ -28,8 +30,10 @@
 # Ways 2 to 4 print a one-line notice.
 #
 # A child gets a cgroup of its own below the gate's scope when systemd
-# delegates the scope; else prlimit or ulimit caps it as in ways 2 and 3. The
-# gate prints the one notice for that fallback, not each child.
+# delegates the scope; else prlimit or ulimit caps its address space per
+# process, and no line names that cap when the child hits it. The gate prints
+# the one notice for that fallback, not each child. Every way gets the time
+# limit when a timeout command exists.
 #
 # Env:
 #   BLINK_GATE_CAP=0                    run in place, uncapped (a machine that caps gates another way)
@@ -133,7 +137,10 @@ rlimit_plan() {
         done < <(ps -ax -o uid= 2>/dev/null)
     fi
     running=${running//[[:space:]]/}
-    case "$running" in '' | *[!0-9]* | 0) ;; *) procs=$((running + $2)) ;; esac
+    # A count of 0 means ps failed; a cap such as "infinity" sets no count.
+    case "$running" in '' | *[!0-9]* | 0) running= ;; esac
+    case "$2" in '' | *[!0-9]*) running= ;; esac
+    [ -n "$running" ] && procs=$((running + $2))
     limits=()
     [ -n "$kib" ] && limits+=("address space $1 per process")
     [ -n "$procs" ] && limits+=("$procs processes for the user")
@@ -154,58 +161,141 @@ timeout_tool() {
     command -v timeout 2>/dev/null || command -v gtimeout 2>/dev/null
 }
 
-# child_notice <way>: the gate's one notice for a child cap that is not a
-# cgroup of its own, and the export that tells each child which way to take.
+# child_notice: the gate's one notice for a child cap that is not a cgroup of
+# its own, and the export that tells each child which way to take: prlimit or
+# ulimit for the address space, or none. A child gets no process cap of its
+# own this way: RLIMIT_NPROC counts every process of the user, so a sibling
+# that starts after a child would eat that child's share. The gate's process
+# cap still holds.
 child_notice() {
-    export BLINK_CHILD_CAP_MODE=$1
-    [ "${BLINK_CHILD_CAP:-1}" = 0 ] && return
-    rlimit_plan "$child_mem" "$child_tasks"
-    local caps=()
-    [ -n "$kib" ] && caps+=("address space $child_mem per process")
-    [ -n "$procs" ] && caps+=("$child_tasks more processes for the user")
-    if [ ${#caps[@]} -gt 0 ]; then
-        notice "each child gets per-process caps, not a cgroup of its own: $(join "${caps[@]}")"
+    local os kib
+    if [ "${BLINK_CHILD_CAP:-1}" = 0 ]; then
+        export BLINK_CHILD_CAP_MODE=none
+        return
+    fi
+    os=$(uname -s 2>/dev/null)
+    kib=
+    # Darwin takes ulimit -v and does not hold a process to it.
+    [ "$os" = Darwin ] || kib=$(size_kib "$child_mem")
+    if [ -z "$kib" ]; then
+        export BLINK_CHILD_CAP_MODE=none
+        notice "each child gets no memory or process cap of its own: this machine has no cgroup for it, and no address space cap holds here"
     else
-        notice "each child gets no memory or process cap: this machine has no cgroup, prlimit or ulimit way"
+        if command -v prlimit >/dev/null 2>&1 && prlimit --as=$((kib * 1024)) "$BASH" -c : 2>/dev/null; then
+            export BLINK_CHILD_CAP_MODE=prlimit
+        else
+            export BLINK_CHILD_CAP_MODE=ulimit
+        fi
+        notice "each child gets an address space cap of $child_mem per process, not a cgroup of its own, so no line names a memory or process cap it hits"
     fi
     [ "$child_timeout" = 0 ] || timeout_tool >/dev/null || notice "no timeout command, so a child has no time limit"
 }
 
 # --- One child ------------------------------------------------------------------
 
-# report_child <dir> <rc> <elapsed> <limit>: one line per cap the child hit.
+# report_child <rc> <elapsed> <limit> <gate forks before>: print one line per
+# cap the child hit, the cap that ended it first. A child that failed keeps
+# that first line in the --report file; a child that passed hit no cap that
+# matters to it.
 report_child() {
-    local oom own_oom forks
-    if [ -n "$1" ]; then
-        oom=$(read_event "$1/memory.events" oom_kill)
-        own_oom=$(read_event "$1/memory.events" oom)
-        forks=$(read_event "$(own_events "$1" pids.events)" max)
-        if [ "$oom" != 0 ]; then
-            if [ "$own_oom" != 0 ]; then
-                notice "the child hit its memory cap (MemoryMax=$child_mem) and the OOM killer killed $oom of its processes; exit $2"
-            else
-                notice "the child lost $oom processes to the OOM killer below its memory cap (MemoryMax=$child_mem), so the gate or the machine ran out; exit $2"
-            fi
-        fi
-        if [ "$forks" != 0 ]; then
-            notice "the child hit its process cap (TasksMax=$child_tasks): $forks forks failed; exit $2"
+    local lines=() oom own_oom forks gate_forks
+    if [ -n "$kid" ]; then
+        oom=$(read_event "$kid/memory.events" oom_kill)
+        own_oom=$(read_event "$kid/memory.events" oom)
+        forks=$(read_event "$(own_events "$kid" pids.events)" max)
+        gate_forks=$(($(read_event "$(own_events "$dir" pids.events)" max) - $4))
+        if [ "$oom" != 0 ] && [ "$own_oom" != 0 ]; then
+            lines+=("the child hit its memory cap (MemoryMax=$child_mem) and the OOM killer killed $oom of its processes; exit $1")
         fi
     fi
     # timeout exits 124 at the limit, or 137 when SIGTERM did not end the
-    # child. 137 is also an OOM kill, so it counts only when the time is spent.
-    if [ "$4" != 0 ] && { [ "$2" = 124 ] || { [ "$2" = 137 ] && [ "$3" -ge "$4" ]; }; }; then
-        notice "the child ran past its time limit (${4}s) and was killed; exit $2"
+    # child. A child can exit 124 itself, and 137 is also an OOM kill, so
+    # either counts only when the time is spent.
+    if [ "$3" != 0 ] && [ "$2" -ge "$3" ] && { [ "$1" = 124 ] || [ "$1" = 137 ]; }; then
+        lines+=("the child ran past its time limit (${3}s) and was killed; exit $1")
+    fi
+    if [ -n "$kid" ]; then
+        if [ "$oom" != 0 ] && [ "$own_oom" = 0 ]; then
+            lines+=("the child lost $oom processes to the OOM killer below its memory cap (MemoryMax=$child_mem), so the gate or the machine ran out; exit $1")
+        fi
+        if [ "$forks" != 0 ]; then
+            lines+=("the child hit its process cap (TasksMax=$child_tasks): $forks forks failed; exit $1")
+        fi
+        # The gate's count is shared, so a sibling may own these failures;
+        # only a child that failed names them.
+        if [ "$gate_forks" -gt 0 ] && [ "$1" != 0 ]; then
+            lines+=("the gate refused $gate_forks forks at its process cap (TasksMax=$tasks) while this child ran; exit $1")
+        fi
+    fi
+    local l
+    for l in ${lines[@]+"${lines[@]}"}; do notice "$l"; done
+    if [ -n "$report" ] && [ "$1" != 0 ] && [ ${#lines[@]} -gt 0 ]; then
+        echo "capped.sh: ${lines[0]}" > "$report"
     fi
 }
 
-run_child() {
-    local limit=$child_timeout tool start rc cg dir kid
-    if [ "${1:-}" = --timeout ]; then
-        limit=${2:-}
-        shift 2 || shift
+# launch <command...>: run the command in the background and wait for it, so
+# the trap in run_child can stop it. Job control puts it in a process group of
+# its own and keeps its SIGINT at the default; a shell without job control
+# makes a background command ignore SIGINT. The wait's stderr goes nowhere, so
+# bash prints no job line ("Segmentation fault ...") into the child's log.
+launch() {
+    set -m
+    "$@" &
+    pid=$!
+    set +m
+    wait "$pid" 2>/dev/null
+    rc=$?
+}
+
+# end_kid: kill what is left in the child's cgroup and remove it. A process
+# the child left behind would hold the cgroup open.
+end_kid() {
+    [ -n "$kid" ] || return
+    if [ -w "$kid/cgroup.kill" ]; then
+        echo 1 > "$kid/cgroup.kill"
+    else
+        end_procs "$kid"
     fi
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+        rmdir "$kid" 2>/dev/null && break
+        sleep 0.05 2>/dev/null || sleep 1
+    done
+}
+
+# stop_child <exit code>: a signal stopped the wrapper, so stop the child.
+# timeout runs in its own process group, so a terminal's SIGINT reaches only
+# this script; without this the child would run on to its time limit.
+stop_child() {
+    if [ -n "$pid" ]; then
+        if [ -n "$kid" ] && [ -w "$kid/cgroup.kill" ]; then
+            echo 1 > "$kid/cgroup.kill"
+        else
+            kill -TERM -- "-$pid" 2>/dev/null
+        fi
+        wait "$pid" 2>/dev/null
+    fi
+    end_kid
+    exit "$1"
+}
+
+run_child() {
+    local limit=$child_timeout tool start cg gate_forks=0 kib
+    report=
+    while :; do
+        case "${1:-}" in
+            --timeout) limit=${2:-}; shift 2 || shift ;;
+            --report)
+                report=${2:-}
+                shift 2 || shift
+                [ -n "$report" ] || { echo "capped.sh: --report takes a file" >&2; exit 2; }
+                ;;
+            *) break ;;
+        esac
+    done
     case "$limit" in '' | *[!0-9]*) echo "capped.sh: --timeout takes whole seconds, not [$limit]" >&2; exit 2 ;; esac
-    [ $# -gt 0 ] || { echo "usage: capped.sh --child [--timeout <seconds>] <command> [<arg> ...]" >&2; exit 2; }
+    [ $# -gt 0 ] || { echo "usage: capped.sh --child [--timeout <seconds>] [--report <file>] <command> [<arg> ...]" >&2; exit 2; }
+    [ -z "$report" ] || : > "$report"
 
     tl=()
     if [ "$limit" != 0 ] && tool=$(timeout_tool); then
@@ -215,78 +305,68 @@ run_child() {
     fi
 
     local mode=${BLINK_CHILD_CAP_MODE:-}
-    [ "${BLINK_CHILD_CAP:-1}" = 0 ] && mode=off
+    [ "${BLINK_CHILD_CAP:-1}" = 0 ] && mode=none
     # A child of a child is already under its parent's caps.
-    [ -n "${BLINK_CHILD_CAPPED:-}" ] && mode=off
+    [ -n "${BLINK_CHILD_CAPPED:-}" ] && mode=none
+    dir=
     if [ "$mode" = cgroup ]; then
         IFS=: read -r _ _ cg < /proc/self/cgroup
         dir=${BLINK_CHILD_CGROUP:-}
         # Only the gate's own processes may start a child cgroup: from inside
         # a child, the move would take the new child out of its parent's caps.
-        [ "/sys/fs/cgroup$cg" = "$dir/gate" ] || mode=off
+        [ "/sys/fs/cgroup$cg" = "$dir/gate" ] || mode=none
     fi
     if [ -z "$mode" ]; then
         # No gate run set the way: a direct call, so this call gives the notice.
-        child_notice rlimit
-        mode=rlimit
+        child_notice
+        mode=$BLINK_CHILD_CAP_MODE
     fi
     export BLINK_CHILD_CAPPED=1
 
-    start=${EPOCHSECONDS:-$(date +%s)}
+    pid=
     kid=
+    trap 'stop_child 129' HUP
+    trap 'stop_child 130' INT
+    trap 'stop_child 143' TERM
+    start=${EPOCHSECONDS:-$(date +%s)}
     case "$mode" in
         cgroup)
             kid=$dir/kids/c-$$
+            # systemd's word for no cap is "infinity"; the cgroup file's is "max".
             if mkdir "$kid" 2>/dev/null &&
-                echo "$child_mem" > "$kid/memory.max" &&
-                echo "$child_tasks" > "$kid/pids.max" &&
-                { [ -z "$child_swap" ] || echo "${child_swap/#infinity/max}" > "$kid/memory.swap.max"; }; then
+                echo "${child_mem/#infinity/max}" 2>/dev/null > "$kid/memory.max" &&
+                echo "${child_tasks/#infinity/max}" 2>/dev/null > "$kid/pids.max"; then
+                if [ -n "$child_swap" ] && ! echo "${child_swap/#infinity/max}" 2>/dev/null > "$kid/memory.swap.max"; then
+                    notice "could not set this child's swap cap (MemorySwapMax=$child_swap), so only the gate's swap cap holds it"
+                fi
+                gate_forks=$(read_event "$(own_events "$dir" pids.events)" max)
                 # The subshell moves itself, then execs; this script stays in
                 # the gate's cgroup, so the cap's OOM kill never picks it.
-                "$BASH" -c 'echo 0 2>/dev/null > "$1/cgroup.procs" ||
+                launch "$BASH" -c 'echo 0 2>/dev/null > "$1/cgroup.procs" ||
                     echo "capped.sh: could not move this child into its cgroup, so it runs uncapped" >&2
                     shift; exec "$@"' _ "$kid" ${tl[@]+"${tl[@]}"} "$@"
-                rc=$?
             else
                 notice "could not make a cgroup for this child in $dir/kids, so it runs uncapped"
                 rmdir "$kid" 2>/dev/null
                 kid=
-                ${tl[@]+"${tl[@]}"} "$@"
-                rc=$?
+                launch ${tl[@]+"${tl[@]}"} "$@"
             fi
             ;;
-        rlimit)
-            rlimit_plan "$child_mem" "$child_tasks"
-            if prlimit_args; then
-                prlimit "${plargs[@]}" -- ${tl[@]+"${tl[@]}"} "$@"
-                rc=$?
-            else
-                (
-                    [ -n "$kib" ] && ulimit -v "$kib" 2>/dev/null
-                    [ -n "$procs" ] && ulimit -u "$procs" 2>/dev/null
-                    exec ${tl[@]+"${tl[@]}"} "$@"
-                )
-                rc=$?
-            fi
+        prlimit)
+            kib=$(size_kib "$child_mem")
+            launch prlimit --as=$((kib * 1024)) -- ${tl[@]+"${tl[@]}"} "$@"
+            ;;
+        ulimit)
+            kib=$(size_kib "$child_mem")
+            launch "$BASH" -c 'ulimit -v "$1" 2>/dev/null; shift; exec "$@"' _ "$kib" ${tl[@]+"${tl[@]}"} "$@"
             ;;
         *)
-            ${tl[@]+"${tl[@]}"} "$@"
-            rc=$?
+            launch ${tl[@]+"${tl[@]}"} "$@"
             ;;
     esac
-    report_child "$kid" "$rc" "$(( ${EPOCHSECONDS:-$(date +%s)} - start ))" "$limit"
-    if [ -n "$kid" ]; then
-        # A process the child left behind would hold its cgroup open.
-        if [ -w "$kid/cgroup.kill" ]; then
-            echo 1 > "$kid/cgroup.kill"
-        else
-            end_procs "$kid"
-        fi
-        for _ in 1 2 3 4 5 6 7 8 9 10; do
-            rmdir "$kid" 2>/dev/null && break
-            read -rt 0.05 <> <(:) 2>/dev/null
-        done
-    fi
+    trap - HUP INT TERM
+    report_child "$rc" "$(( ${EPOCHSECONDS:-$(date +%s)} - start ))" "$limit" "$gate_forks"
+    end_kid
     exit "$rc"
 }
 
@@ -315,18 +395,22 @@ if [ "${1:-}" = --inner ]; then
             leaf=$dir/gate
             export BLINK_CHILD_CGROUP=$dir
         else
-            child_notice rlimit
+            child_notice
         fi
     fi
     "$@"
     rc=$?
     # The scope's own limit, not a child's: a child's cap is the child's line.
-    at_max=$(read_event "$(own_events "$dir" memory.events)" max)
+    # The plain oom_kill also counts each child's kills at its own cap, so
+    # only the scope's own oom count says that the run's cap fired.
+    own_oom=$(read_event "$(own_events "$dir" memory.events)" oom)
     oom=$(read_event "$dir/memory.events" oom_kill)
     gate_oom=$(read_event "$leaf/memory.events" oom_kill)
     forks=$(read_event "$(own_events "$dir" pids.events)" max)
-    if [ "$at_max" != 0 ] && [ "$oom" != 0 ]; then
+    if [ "$own_oom" != 0 ] && [ "$leaf" = "$dir" ]; then
         notice "the run hit its memory cap (MemoryMax=$mem) and the OOM killer killed $oom of its processes; exit $rc"
+    elif [ "$own_oom" != 0 ]; then
+        notice "the run hit its memory cap (MemoryMax=$mem) and the OOM killer killed $gate_oom of the gate's own processes; a child it killed has a line of its own; exit $rc"
     elif [ "$gate_oom" != 0 ]; then
         notice "the OOM killer killed $gate_oom of the run's processes below its memory cap (MemoryMax=$mem), so the slice or the machine ran out; exit $rc"
     fi
@@ -334,7 +418,7 @@ if [ "${1:-}" = --inner ]; then
         notice "the run hit its process cap (TasksMax=$tasks): $forks forks failed; exit $rc"
     fi
     # A runaway leaves children that would hold the scope open; end them.
-    if [ "$oom" != 0 ] || [ "$forks" != 0 ]; then
+    if [ "$own_oom" != 0 ] || [ "$gate_oom" != 0 ] || [ "$forks" != 0 ]; then
         end_procs "$leaf" "$$"
         [ -w "$dir/kids/cgroup.kill" ] && echo 1 > "$dir/kids/cgroup.kill"
     fi
@@ -359,10 +443,14 @@ if [ -n "${BLINK_GATE_SCOPE:-}" ]; then
     exec "$@"
 fi
 
+# A new gate run is never inside a child's caps, even when this script runs
+# from inside a child: the run sets these again for its own children.
+unset BLINK_CHILD_CAPPED BLINK_CHILD_CGROUP BLINK_CHILD_CAP_MODE
+
 if [ "${BLINK_GATE_CAP:-1}" = 0 ]; then
     notice "BLINK_GATE_CAP=0, so this run has no memory or process cap"
     export BLINK_GATE_SCOPE=off
-    child_notice rlimit
+    child_notice
     exec "$@"
 fi
 
@@ -390,7 +478,7 @@ if command -v systemd-run >/dev/null 2>&1 && scope_starts; then
         props+=(-p Delegate=yes)
         export BLINK_CHILD_CAP_MODE=cgroup
     else
-        child_notice rlimit
+        child_notice
     fi
     slice_args=(--slice="$slice")
     # systemd makes a slice on first use, with no limits; only a unit file or a
@@ -419,7 +507,7 @@ rlimit_plan "$mem" "$tasks"
 if prlimit_args; then
     notice "no systemd user scope, so prlimit caps this run: $(join "${limits[@]}")"
     export BLINK_GATE_SCOPE=prlimit
-    child_notice rlimit
+    child_notice
     exec prlimit "${plargs[@]}" -- "$@"
 fi
 
@@ -433,5 +521,5 @@ else
     notice "no systemd user scope, prlimit or ulimit, so this run has no memory or process cap"
     export BLINK_GATE_SCOPE=none
 fi
-child_notice rlimit
+child_notice
 exec "$@"

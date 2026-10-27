@@ -157,6 +157,13 @@ if BLINK_CHILD_CGROUP=/sys/fs/cgroup/other BLINK_CHILD_CAP_MODE=rlimit $S check 
 else
     echo "FAIL: BLINK_CHILD_CGROUP or BLINK_CHILD_CAP_MODE busts the stamp"; fail=1
 fi
+# corpus_one.sh gives each row its CORPUS_*_TIMEOUT, so BLINK_CHILD_TIMEOUT
+# reaches no row.
+if BLINK_CHILD_TIMEOUT=5 $S check >/dev/null 2>&1; then
+    echo "PASS: BLINK_CHILD_TIMEOUT -> stamp still valid"
+else
+    echo "FAIL: BLINK_CHILD_TIMEOUT busts the stamp"; fail=1
+fi
 
 # override outputs
 fresh

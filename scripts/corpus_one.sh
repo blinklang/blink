@@ -60,9 +60,10 @@
 # unit must read false.
 #
 # Each build and run is a child of scripts/capped.sh --child: in a gate run
-# it gets a memory and process cap of its own, and every way gets the time
-# limit. A child that hits a cap fails as its own row, and the line capped.sh
-# prints for the cap is the row's first error, so the row names the limit.
+# it gets a memory and process cap of its own, and it gets the time limit when
+# a timeout command exists. A child that a cap ends fails as its own row, and
+# the line capped.sh reports for that cap is the row's first error, so the row
+# names the limit.
 #
 # Env:
 #   CORPUS_BUILD_TIMEOUT  seconds per compile (default 900)
@@ -193,23 +194,24 @@ if grep -qE '^test\.failing\(' "$root/$file"; then has_known=1; fi
 
 json_str() { printf '%s' "$1" | jq -Rs .; }
 
-# child <seconds> <command...>: run the command as a capped child.
+# child <seconds> <report> <command...>: run the command as a capped child.
+# <report> gets the line of the cap that ended it, if one did.
 child() {
-    local limit=$1
-    shift
-    "$root/scripts/capped.sh" --child --timeout "$limit" "$@"
+    local limit=$1 report=$2
+    shift 2
+    "$root/scripts/capped.sh" --child --timeout "$limit" --report "$report" "$@"
 }
 
-# limit_line <log>: the line capped.sh printed for a cap the child hit. The
-# wrapper prints it after the child ends, so the last one is the wrapper's.
+# limit_line <report>: the line of the cap that ended the child, if any.
 limit_line() {
-    grep '^capped.sh: the child' "$1" | tail -1
+    cat "$1" 2>/dev/null
+    rm -f "$1"
 }
 
-# first_line <log> <ERE>: the first line that matches, skipping the notice
-# capped.sh gives when no gate run set the way to cap a child.
+# first_line <log> <ERE>: the first line that matches, skipping capped.sh's
+# own lines: its notices and cap lines say nothing about the test.
 first_line() {
-    grep -vE '^capped.sh: (each child|no timeout)' "$1" | grep -m1 -E "$2"
+    grep -v '^capped.sh: ' "$1" | grep -m1 -E "$2"
 }
 
 # Only a test build keeps test blocks, and it runs them, never main. A file with a main and
@@ -222,21 +224,12 @@ start=$(date +%s.%N)
 status=""
 first_error=""
 
-# timed_out <rc> <phase start> <budget>: rc 124 is timeout's own deadline;
-# rc 137 is a SIGKILL, which is the deadline only when the budget is spent.
-# An OOM kill or a crash under load must stay a failure, not a timeout.
-timed_out() {
-    [ "$1" -eq 124 ] && return 0
-    [ "$1" -eq 137 ] || return 1
-    [ "$(echo "$(date +%s.%N) - $2 >= $3" | bc)" = 1 ]
-}
-
 (
     cd "$work" || exit 2
     unset BLINK_ROOT BLINK_BIN
     export BLINK_CACHE_DIR=""
     export PATH="$ccdir:$PATH"
-    child "$build_timeout" "$blink_bin" "$build_cmd" "tests/$base.bl" -o "build/$base" --debug
+    child "$build_timeout" "$build_log.limit" "$blink_bin" "$build_cmd" "tests/$base.bl" -o "build/$base" --debug
 ) > "$build_log" 2>&1
 build_rc=$?
 # The compiler archive's globals init fn: main calls it, so a binary that
@@ -247,13 +240,10 @@ if [ -f "$work/build/$base" ] && nm --defined-only "$work/build/$base" 2>/dev/nu
 fi
 per_module=false
 [ -d "$work/build/$base.units" ] && per_module=true
-build_limit=$(limit_line "$build_log")
+build_limit=$(limit_line "$build_log.limit")
 if [[ "$build_limit" == *"ran past its time limit"* ]]; then
     status=timeout
     first_error=$build_limit
-elif [ -z "$build_limit" ] && timed_out "$build_rc" "$start" "$build_timeout"; then
-    status=timeout
-    first_error="compile exceeded ${build_timeout}s"
 elif [ "$build_rc" -ne 0 ] || [ ! -x "$work/build/$base" ]; then
     status=compile_fail
     first_error=$build_limit
@@ -261,26 +251,22 @@ elif [ "$build_rc" -ne 0 ] || [ ! -x "$work/build/$base" ]; then
     [ -z "$first_error" ] && first_error=$(first_line "$build_log" '[^[:space:]]' || true)
     [ -z "$first_error" ] && first_error="blink build exited $build_rc with no output"
 else
-    run_start=$(date +%s.%N)
     (
         cd "$work" || exit 2
         unset BLINK_ROOT BLINK_BIN
         export BLINK_CACHE_DIR=""
-        child "$run_timeout" "./build/$base"
+        child "$run_timeout" "$run_log.limit" "./build/$base"
     ) > "$run_log" 2>&1
     run_rc=$?
-    run_limit=$(limit_line "$run_log")
+    run_limit=$(limit_line "$run_log.limit")
     if [[ "$run_limit" == *"ran past its time limit"* ]]; then
         status=timeout
         first_error=$run_limit
-    elif [ -z "$run_limit" ] && timed_out "$run_rc" "$run_start" "$run_timeout"; then
-        status=timeout
-        first_error="run exceeded ${run_timeout}s"
     elif [ "$run_rc" -ne 0 ]; then
         status=run_fail
         first_error=$run_limit
         [ -z "$first_error" ] && first_error=$(first_line "$run_log" '\bFAIL\b|\bPANIC\b|panic|Segmentation|Aborted' || true)
-        [ -z "$first_error" ] && first_error=$(grep -vE '^capped.sh: (each child|no timeout)' "$run_log" | grep -E 'error|assert' | grep -m1 -vE '\.\.\. .*ok' || true)
+        [ -z "$first_error" ] && first_error=$(grep -v '^capped.sh: ' "$run_log" | grep -E 'error|assert' | grep -m1 -vE '\.\.\. .*ok' || true)
         [ -z "$first_error" ] && first_error=$(first_line "$run_log" '[^[:space:]]' || true)
         [ -z "$first_error" ] && first_error="test binary exited $run_rc with no output"
     else
@@ -296,9 +282,11 @@ if [ "$status" = pass ]; then
             cd "$work" || exit 2
             unset BLINK_ROOT BLINK_BIN
             export BLINK_CACHE_DIR=""
-            child "$run_timeout" "./build/$base" --test-json
+            child "$run_timeout" "$report.limit" "./build/$base" --test-json
         ) > "$report" 2>/dev/null
-        if [ $? -eq 0 ]; then
+        json_rc=$?
+        rm -f "$report.limit"
+        if [ "$json_rc" -eq 0 ]; then
             known=$(jq -e '[.results[] | select(.expected_fail == true and .status == "passed")] | length' "$report" 2>/dev/null) || known=null
         else
             known=null
