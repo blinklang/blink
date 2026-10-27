@@ -9,6 +9,9 @@
 # src/cg.bl is named on its own: the `cg_*.bl` glob does not match it, and a
 # driver outside the scope escapes every row.
 #
+# L7 and L10 read all of src/*.bl: a twin producer or a ticket id is as wrong
+# outside the codegen layer as inside it.
+#
 # Files that do not exist yet contribute nothing. tests/ and docs/ are never
 # scanned for violations; L11 reads tests/ only to find references.
 #
@@ -40,6 +43,8 @@
 #   LINT_HEAD1_REF  git ref to materialize when LINT_HEAD1_DIR is unset
 #   LINT_BASE_REF   the ref the branch walk starts from. Default: main. The walk
 #                   is skipped when LINT_HEAD1_DIR is set
+#   BR_IDS_FILE     the ticket ids L10 looks for, one per line. Default: ask br
+#                   through scripts/br_ids.sh
 set -u
 cd "$(dirname "$0")/.." || exit 2
 
@@ -243,8 +248,14 @@ compute_rows() {
         ' "$f" >> "$det/fn_length.txt"
     done
 
-    # L10: a br ticket id in source. Ids are six [0-9a-z] with at least one digit.
-    scan '\bbr [0-9a-z]{6}\b|\b(ticket|bug|task|issue|fixes|closes)[: ]+#?(?=[0-9a-z]{6}\b)(?=[a-z]*[0-9])[0-9a-z]{6}\b|#(?=[0-9a-z]{6}\b)(?=[a-z]*[0-9])[0-9a-z]{6}\b' "$@" > "$det/br_ids_in_source.txt"
+    # L10: a br ticket id anywhere in src/: any token br knows as an id, bare or
+    # not, plus the prefixed shapes, which also catch an id br no longer lists.
+    # The shape alone needs a digit, as most six-letter tokens are words.
+    # shellcheck disable=SC2086
+    {
+        scan '\bbr [0-9a-z]{6}\b|\b(ticket|bug|task|issue|fixes|closes)[: ]+#?(?=[0-9a-z]{6}\b)(?=[a-z]*[0-9])[0-9a-z]{6}\b|#(?=[0-9a-z]{6}\b)(?=[a-z]*[0-9])[0-9a-z]{6}\b' "$root"/src/*.bl
+        ./scripts/br_ids.sh scan "$br_ids" "$root"/src/*.bl
+    } | awk -F: '!seen[$1 ":" $2]++' > "$det/br_ids_in_source.txt"
 
     # L11: every pub fn of the reading layer and mono must be named in some test.
     : > "$det/untested_pub_fns.txt"
@@ -341,6 +352,13 @@ ROWLIST
 
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
+
+# Asked once here, not per ref: the walk computes every ref's rows at once.
+br_ids="$work/br_ids.txt"
+if ! ./scripts/br_ids.sh list > "$br_ids"; then
+    : > "$br_ids"
+    echo "lint_codegen: warning: no ticket id list, so L10 sees only the prefixed shapes (\`br <id>\`) and misses a bare id" >&2
+fi
 
 base_ref="${LINT_BASE_REF:-main}"
 walk_pid=""

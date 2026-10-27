@@ -8,8 +8,11 @@
 #   scripts/ratchet.sh --update   rewrite the baseline from the current counts
 #
 # Rows:
-#   br_ids_in_source         a br ticket id anywhere in src/ or Taskfile.yml;
-#                            absolute zero gate (br is local-only)
+#   br_ids_in_source         a line in src/*.bl or Taskfile.yml that holds a br
+#                            ticket id: a token br knows as an id (see
+#                            scripts/br_ids.sh), or `br <id>`, which also
+#                            catches an id br no longer lists; absolute zero
+#                            gate (br is local-only)
 #   br_ids_in_test_comments  a `br <id>` in a `//` comment under tests/; absolute
 #                            zero gate. Counted in the live tree only: a
 #                            historical ref is materialized with src/ alone
@@ -144,6 +147,9 @@
 #   RATCHET_BASE_REF  the ref the branch walk starts from. Default: main. The
 #                     walk is skipped when RATCHET_HEAD1_DIR is set.
 #   RATCHET_NO_LINT   1 to skip scripts/lint_codegen.sh.
+#   BR_IDS_FILE       the ticket ids br_ids_in_source looks for, one per line.
+#                     Default: ask br through scripts/br_ids.sh, once, and hand
+#                     the list on to scripts/lint_codegen.sh.
 set -u
 cd "$(dirname "$0")/.."
 
@@ -228,6 +234,13 @@ pool_writes() {
 lib_substr() {
   [ -d "$1/lib" ] || { echo 0; return; }
   rg -o -g '*.bl' '\.substr\(' "$1/lib" 2>/dev/null | wc -l | tr -d ' '
+}
+
+# Lines that hold an id, so a `br <id>` line br also lists counts once.
+br_id_lines() {
+  # shellcheck disable=SC2086
+  { grep -nHoE '\bbr [0-9a-z]{6}\b' $1 2>/dev/null; ./scripts/br_ids.sh scan "$BR_IDS_FILE" $1; } |
+    awk -F: '!seen[$1 ":" $2]++' | wc -l | tr -d ' '
 }
 
 tests_br_ids() {
@@ -321,7 +334,7 @@ compute_rows() {
   tf="$root/Taskfile.yml"
 
   cat <<ROWS
-br_ids_in_source $(( $(cnt '\bbr [0-9a-z]{6}\b' "$allbl $tf") + $(cnt '\b(g3sba0|qf1vzx|0kpmac)\b' "$allbl $tf") ))
+br_ids_in_source $(br_id_lines "$allbl $tf")
 br_ids_in_test_comments $(tests_br_ids "$root")
 module_let_mut $(cnt '^(pub )?let mut ' "$allbl")
 typecheck_module_let_mut $(cnt '^(pub )?let mut ' "$tcbl")
@@ -387,6 +400,17 @@ walk_branch() {
 }
 
 check_root "$now_root"
+# Asked once here, not per ref; the lint this script runs last reads it too.
+if [ -z "${BR_IDS_FILE:-}" ]; then
+  BR_IDS_FILE=$(mktemp)
+  br_ids_tmp="$BR_IDS_FILE"
+  trap 'rm -f "$br_ids_tmp"' EXIT
+  if ! ./scripts/br_ids.sh list > "$BR_IDS_FILE"; then
+    : > "$BR_IDS_FILE"
+    echo "ratchet: warning: no ticket id list, so br_ids_in_source sees only \`br <id>\` and misses a bare id" >&2
+  fi
+fi
+export BR_IDS_FILE
 rows_now=$(compute_rows "$now_root")
 
 if [ "$update_flag" = "--update" ]; then
@@ -400,7 +424,7 @@ fi
 
 head1_tracked=""
 failmark=""
-trap 'rm -f "$failmark"; [ -n "${head1_root:-}" ] && [ -z "${RATCHET_HEAD1_DIR:-}" ] && rm -rf "$head1_root"' EXIT
+trap 'rm -f "$failmark" "${br_ids_tmp:-}"; [ -n "${head1_root:-}" ] && [ -z "${RATCHET_HEAD1_DIR:-}" ] && rm -rf "$head1_root"' EXIT
 if [ -n "${RATCHET_HEAD1_DIR:-}" ]; then
   head1_root="$RATCHET_HEAD1_DIR"
   check_root "$head1_root"

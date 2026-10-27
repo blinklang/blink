@@ -11,6 +11,10 @@ WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 fail=0
 
+# The ids L10 knows, in place of br's list: one with a digit, one all letters.
+export BR_IDS_FILE="$WORK/br_ids.txt"
+printf 'q7tzp2\njkwqzv\n' > "$BR_IDS_FILE"
+
 write_clean() {
     rm -rf "$1"
     mkdir -p "$1/src" "$1/tests"
@@ -110,6 +114,31 @@ check_unparse_import stdlib  'import std.io'
 long_fn=$(printf 'fn long() -> Int {\n'; for i in $(seq 1 80); do printf '    let v%d = %d\n' "$i" "$i"; done; printf '    1\n}')
 expect_red fn_length           cg_b.bl "$long_fn"
 expect_red br_ids_in_source    cg_b.bl '// tracked as br abc123'
+expect_red br_ids_in_source    cg_b.bl '// q7tzp2: why this is here'
+expect_red br_ids_in_source    cg_b.bl '// see bug jkwqzv for why'
+expect_red br_ids_in_source    cg_b.bl 'let tag = "q7tzp2_run"'
+# L10 reads all of src/, not only the codegen layer.
+expect_red br_ids_in_source    typecheck.bl '// jkwqzv: why this is here'
+# A six-character word or hex token that is no id is not a hit.
+dir="$WORK/case_br_ids_words"
+write_clean "$dir"
+printf '// the parser reads deadbe and cafe12 as a string\nlet tag = "string_run"\n' > "$dir/src/typecheck.bl"
+if run_lint "$dir" > "$dir.out" 2>&1 && grep -qE '^L10 +br_ids_in_source +0 +0 +0 +0$' "$dir.out"; then
+    echo "ok   br_ids_in_source ignores words and hex that are not ids"
+else
+    echo "FAIL br_ids_in_source counted a token that is not an id:"; cat "$dir.out"; fail=1
+fi
+# With no id list, the row still sees the prefixed shape and says what it misses.
+dir="$WORK/case_br_ids_no_list"
+write_clean "$dir"
+printf '// tracked as br abc123\n' > "$dir/src/typecheck.bl"
+if env -u BR_IDS_FILE PATH=/usr/bin:/bin LINT_SRC_DIR="$dir" LINT_HEAD1_DIR="$CLEAN" LINT_BASELINE="$BASELINE" \
+        LINT_ALLOWLIST="$ALLOW" ./scripts/lint_codegen.sh > "$dir.out" 2>&1 ||
+        ! grep -qE '^L10 +br_ids_in_source .*OVER' "$dir.out" || ! grep -q 'misses a bare id' "$dir.out"; then
+    echo "FAIL br_ids_in_source without an id list:"; cat "$dir.out"; fail=1
+else
+    echo "ok   br_ids_in_source without an id list warns and still sees the prefixed shape"
+fi
 expect_red untested_pub_fns    mono.bl 'pub fn mono_orphan() -> Int { 1 }'
 
 # module_let_mut: eight allowlisted globals pass, a ninth is over the cap.
@@ -182,7 +211,7 @@ fi
 # throwaway repo so its own `cd "$(dirname "$0")/.."` lands there.
 GITWORK="$WORK/gitrepo"
 mkdir -p "$GITWORK/scripts" "$GITWORK/src" "$GITWORK/tests"
-cp ./scripts/lint_codegen.sh "$GITWORK/scripts/lint_codegen.sh"
+cp ./scripts/lint_codegen.sh ./scripts/br_ids.sh "$GITWORK/scripts/"
 cp ./scripts/lint_pub_let_mut_allow.txt "$GITWORK/scripts/lint_pub_let_mut_allow.txt"
 : > "$GITWORK/tests/test_fixture.bl"
 printf '// br abc123\n' > "$GITWORK/src/cg_a.bl"
@@ -227,7 +256,7 @@ fi
 # compare alone cannot see a rise that a later commit on the branch paid back.
 WALKWORK="$WORK/walkrepo"
 mkdir -p "$WALKWORK/scripts" "$WALKWORK/src" "$WALKWORK/tests"
-cp ./scripts/lint_codegen.sh "$WALKWORK/scripts/lint_codegen.sh"
+cp ./scripts/lint_codegen.sh ./scripts/br_ids.sh "$WALKWORK/scripts/"
 cp ./scripts/lint_pub_let_mut_allow.txt "$WALKWORK/scripts/lint_pub_let_mut_allow.txt"
 : > "$WALKWORK/tests/test_fixture.bl"
 printf '// br abc123\n' > "$WALKWORK/src/cg_a.bl"

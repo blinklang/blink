@@ -13,6 +13,9 @@ cd "$(dirname "$0")/.."
 export RATCHET_NO_LINT=1
 
 WORK=$(mktemp -d)
+# The ids br_ids_in_source knows, in place of br's list: one with a digit, one all letters.
+export BR_IDS_FILE="$WORK/br_ids.txt"
+printf 'q7tzp2\njkwqzv\n' > "$BR_IDS_FILE"
 trap 'rm -rf "$WORK"' EXIT
 fail=0
 
@@ -220,6 +223,31 @@ check_row() {
 
 check_row module_let_mut           codegen.bl   'pub let mut other_global2: Int = 0'
 check_row br_ids_in_source         codegen.bl   '// also see br xyz987'
+# A bare id, an all-letter one, and one in a file outside the codegen layer.
+check_row br_ids_in_source         codegen.bl   '// q7tzp2: why this is here'
+check_row br_ids_in_source         codegen.bl   'let tag = "jkwqzv_run"'
+check_row br_ids_in_source         typecheck.bl '// see jkwqzv'
+d="$WORK/row_br_ids_taskfile"
+rm -rf "$d"
+cp -r "$BASE" "$d"
+printf '# the q7tzp2 regression\n' >> "$d/Taskfile.yml"
+if RATCHET_SRC_DIR="$d" RATCHET_BASELINE="$BASELINE" RATCHET_HEAD1_DIR="$BASE" ./scripts/ratchet.sh > /dev/null 2>&1; then
+  echo "FAIL br_ids_in_source: a bare id in Taskfile.yml did not fail ratchet.sh"
+  fail=1
+else
+  echo "PASS br_ids_in_source: a bare id in Taskfile.yml failed ratchet.sh"
+fi
+d="$WORK/row_br_ids_words"
+rm -rf "$d"
+cp -r "$BASE" "$d"
+printf '// the parser reads deadbe and cafe12 as a string\n' >> "$d/src/typecheck.bl"
+if RATCHET_SRC_DIR="$d" RATCHET_BASELINE="$BASELINE" RATCHET_HEAD1_DIR="$BASE" ./scripts/ratchet.sh > "$d.out" 2>&1 &&
+    grep -qE '^br_ids_in_source +0 +0 +0$' "$d.out"; then
+  echo "PASS br_ids_in_source: words and hex that are not ids do not count"
+else
+  echo "FAIL br_ids_in_source counted a token that is not an id:"; cat "$d.out"
+  fail=1
+fi
 mkdir -p "$BASE/tests"
 printf '%s\n' 'test "x" { assert(true) }' > "$BASE/tests/test_fixture.bl"
 check_tests_row() {
@@ -546,7 +574,7 @@ fi
 # `cd "$(dirname "$0")/.."` and git commands operate on that repo.
 GITWORK="$WORK/gitrepo"
 mkdir -p "$GITWORK/scripts" "$GITWORK/src"
-cp ./scripts/ratchet.sh "$GITWORK/scripts/ratchet.sh"
+cp ./scripts/ratchet.sh ./scripts/br_ids.sh "$GITWORK/scripts/"
 chmod +x "$GITWORK/scripts/ratchet.sh"
 echo 'pub let mut a: Int = 0' > "$GITWORK/src/codegen.bl"
 : > "$GITWORK/src/mono.bl"
@@ -642,7 +670,7 @@ if [ $? != 0 ]; then fail=1; fi
 # compare alone cannot see a rise that a later commit on the branch paid back.
 WALKWORK="$WORK/walkrepo"
 mkdir -p "$WALKWORK/scripts" "$WALKWORK/src"
-cp ./scripts/ratchet.sh "$WALKWORK/scripts/ratchet.sh"
+cp ./scripts/ratchet.sh ./scripts/br_ids.sh "$WALKWORK/scripts/"
 chmod +x "$WALKWORK/scripts/ratchet.sh"
 echo 'pub let mut a: Int = 0' > "$WALKWORK/src/codegen.bl"
 : > "$WALKWORK/Taskfile.yml"
