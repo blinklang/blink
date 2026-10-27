@@ -265,8 +265,11 @@ capped.sh: the child lost 1 processes to the OOM killer below its memory cap (Me
 capped.sh: the gate refused 3 forks at its process cap (TasksMax=1024) while this child ran; exit 254
 ```
 
-The gate's fork count is shared, so a sibling may own those failures; only a child that
-failed gets that line. When the child's swap cap cannot be set, a notice says that only
+The gate's fork count is shared, so a sibling may own those failures: only a child that
+failed gets that line, and it is never the child's reason in the `--report` file. Before
+Linux 6.13 the kernel counts a refused fork in the cgroup of the process that forked, not
+in the cgroup whose cap refused it, so there the child's line names both caps and the gate
+line does not show. When the child's swap cap cannot be set, a notice says that only
 the gate's swap cap holds it.
 
 The time limit sends `SIGTERM`, then `SIGKILL` after `BLINK_CHILD_KILL_AFTER` seconds. Exit
@@ -278,9 +281,14 @@ child. The script then kills each process that the child left in its cgroup and 
 the cgroup.
 
 A `SIGHUP`, `SIGINT` or `SIGTERM` to the script, for example Ctrl-C at a terminal, kills
-the child's cgroup (or the child's process group outside a cgroup) at once, removes the
-cgroup, and exits 129, 130 or 143. The `timeout` command runs in a process group of its
-own, so without this the child would run on to its time limit.
+the child's process group and cgroup at once, removes the cgroup, and then kills the
+script with the same signal. The `timeout` command runs in a process group of its own, so
+without this the child would run on to its time limit. A shell that runs a loop of
+children stops at Ctrl-C only when the child died by the signal, so the script does not
+just exit 130.
+
+The child runs in a process group of its own, which stops if it reads the terminal. So a
+child whose stdin is a terminal reads `/dev/null`; a pipe or a file stays its stdin.
 
 With `--report <file>`, the script writes the first line to the file when the child
 failed, and leaves the file empty otherwise: a child that passed hit no cap that matters

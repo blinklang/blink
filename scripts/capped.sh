@@ -110,7 +110,7 @@ size_kib() {
         M | m) echo $((n * 1024)) ;;
         G | g) echo $((n * 1024 * 1024)) ;;
         T | t) echo $((n * 1024 * 1024 * 1024)) ;;
-        *) echo $((n / 1024)) ;;
+        *) echo $(((n + 1023) / 1024)) ;;
     esac
 }
 
@@ -177,9 +177,12 @@ child_notice() {
     kib=
     # Darwin takes ulimit -v and does not hold a process to it.
     [ "$os" = Darwin ] || kib=$(size_kib "$child_mem")
-    if [ -z "$kib" ]; then
+    if [ -z "$kib" ] && [ "$os" = Darwin ]; then
         export BLINK_CHILD_CAP_MODE=none
         notice "each child gets no memory or process cap of its own: this machine has no cgroup for it, and no address space cap holds here"
+    elif [ -z "$kib" ]; then
+        export BLINK_CHILD_CAP_MODE=none
+        notice "each child gets no memory or process cap of its own: this machine has no cgroup for it, and BLINK_CHILD_MEMORY_MAX=$child_mem sets no address space cap"
     else
         if command -v prlimit >/dev/null 2>&1 && prlimit --as=$((kib * 1024)) "$BASH" -c : 2>/dev/null; then
             export BLINK_CHILD_CAP_MODE=prlimit
@@ -198,12 +201,20 @@ child_notice() {
 # that first line in the --report file; a child that passed hit no cap that
 # matters to it.
 report_child() {
-    local lines=() oom own_oom forks gate_forks
+    local lines=() oom own_oom forks gate_forks=0 which
     if [ -n "$kid" ]; then
         oom=$(read_event "$kid/memory.events" oom_kill)
         own_oom=$(read_event "$kid/memory.events" oom)
-        forks=$(read_event "$(own_events "$kid" pids.events)" max)
-        gate_forks=$(($(read_event "$(own_events "$dir" pids.events)" max) - $4))
+        forks=$(read_event "$kid/pids.events.local" max)
+        which="its process cap (TasksMax=$child_tasks)"
+        if [ -r "$kid/pids.events.local" ]; then
+            gate_forks=$(($(read_event "$dir/pids.events.local" max) - $4))
+        else
+            # Before Linux 6.13, pids.events counts a refused fork in the
+            # forker's cgroup, whichever cap refused it.
+            forks=$(read_event "$kid/pids.events" max)
+            which="a process cap (its TasksMax=$child_tasks or the gate's TasksMax=$tasks)"
+        fi
         if [ "$oom" != 0 ] && [ "$own_oom" != 0 ]; then
             lines+=("the child hit its memory cap (MemoryMax=$child_mem) and the OOM killer killed $oom of its processes; exit $1")
         fi
@@ -219,12 +230,7 @@ report_child() {
             lines+=("the child lost $oom processes to the OOM killer below its memory cap (MemoryMax=$child_mem), so the gate or the machine ran out; exit $1")
         fi
         if [ "$forks" != 0 ]; then
-            lines+=("the child hit its process cap (TasksMax=$child_tasks): $forks forks failed; exit $1")
-        fi
-        # The gate's count is shared, so a sibling may own these failures;
-        # only a child that failed names them.
-        if [ "$gate_forks" -gt 0 ] && [ "$1" != 0 ]; then
-            lines+=("the gate refused $gate_forks forks at its process cap (TasksMax=$tasks) while this child ran; exit $1")
+            lines+=("the child hit $which: $forks forks failed; exit $1")
         fi
     fi
     local l
@@ -232,16 +238,23 @@ report_child() {
     if [ -n "$report" ] && [ "$1" != 0 ] && [ ${#lines[@]} -gt 0 ]; then
         echo "capped.sh: ${lines[0]}" > "$report"
     fi
+    # The gate's count is shared, so a sibling may own these failures: a
+    # child that failed names them, but not as its reason.
+    if [ "$gate_forks" -gt 0 ] && [ "$1" != 0 ]; then
+        notice "the gate refused $gate_forks forks at its process cap (TasksMax=$tasks) while this child ran; exit $1"
+    fi
 }
 
 # launch <command...>: run the command in the background and wait for it, so
 # the trap in run_child can stop it. Job control puts it in a process group of
 # its own and keeps its SIGINT at the default; a shell without job control
-# makes a background command ignore SIGINT. The wait's stderr goes nowhere, so
-# bash prints no job line ("Segmentation fault ...") into the child's log.
+# makes a background command ignore SIGINT. A process group that is not the
+# terminal's stops when it reads the terminal, so the child reads nothing from
+# it. The wait's stderr goes nowhere, so bash prints no job line
+# ("Segmentation fault ...") into the child's log.
 launch() {
     set -m
-    "$@" &
+    if [ -t 0 ]; then "$@" < /dev/null & else "$@" & fi
     pid=$!
     set +m
     wait "$pid" 2>/dev/null
@@ -263,20 +276,25 @@ end_kid() {
     done
 }
 
-# stop_child <exit code>: a signal stopped the wrapper, so stop the child.
-# timeout runs in its own process group, so a terminal's SIGINT reaches only
-# this script; without this the child would run on to its time limit.
+# stop_child <signal>: a signal stopped the wrapper, so stop the child, then
+# die by the same signal. timeout runs in its own process group, so a
+# terminal's SIGINT reaches only this script; without this the child would
+# run on to its time limit. A shell that waits for this script goes on after
+# a child that exits 130, but stops after one that SIGINT killed.
 stop_child() {
-    if [ -n "$pid" ]; then
-        if [ -n "$kid" ] && [ -w "$kid/cgroup.kill" ]; then
-            echo 1 > "$kid/cgroup.kill"
-        else
-            kill -TERM -- "-$pid" 2>/dev/null
-        fi
-        wait "$pid" 2>/dev/null
+    # A signal just after the fork comes before pid=$!.
+    local p=${pid:-${!:-}}
+    if [ -n "$p" ]; then
+        # The child's process group too: it may not have moved into its
+        # cgroup yet.
+        kill -TERM -- "-$p" 2>/dev/null
+        [ -n "$kid" ] && [ -w "$kid/cgroup.kill" ] && echo 1 > "$kid/cgroup.kill"
+        wait "$p" 2>/dev/null
     fi
     end_kid
-    exit "$1"
+    trap - "$1"
+    kill -"$1" "$$"
+    exit $((128 + $(kill -l "$1")))
 }
 
 run_child() {
@@ -325,9 +343,9 @@ run_child() {
 
     pid=
     kid=
-    trap 'stop_child 129' HUP
-    trap 'stop_child 130' INT
-    trap 'stop_child 143' TERM
+    trap 'stop_child HUP' HUP
+    trap 'stop_child INT' INT
+    trap 'stop_child TERM' TERM
     start=${EPOCHSECONDS:-$(date +%s)}
     case "$mode" in
         cgroup)
@@ -339,7 +357,7 @@ run_child() {
                 if [ -n "$child_swap" ] && ! echo "${child_swap/#infinity/max}" 2>/dev/null > "$kid/memory.swap.max"; then
                     notice "could not set this child's swap cap (MemorySwapMax=$child_swap), so only the gate's swap cap holds it"
                 fi
-                gate_forks=$(read_event "$(own_events "$dir" pids.events)" max)
+                gate_forks=$(read_event "$dir/pids.events.local" max)
                 # The subshell moves itself, then execs; this script stays in
                 # the gate's cgroup, so the cap's OOM kill never picks it.
                 launch "$BASH" -c 'echo 0 2>/dev/null > "$1/cgroup.procs" ||
@@ -352,13 +370,15 @@ run_child() {
                 launch ${tl[@]+"${tl[@]}"} "$@"
             fi
             ;;
-        prlimit)
+        prlimit | ulimit)
             kib=$(size_kib "$child_mem")
-            launch prlimit --as=$((kib * 1024)) -- ${tl[@]+"${tl[@]}"} "$@"
-            ;;
-        ulimit)
-            kib=$(size_kib "$child_mem")
-            launch "$BASH" -c 'ulimit -v "$1" 2>/dev/null; shift; exec "$@"' _ "$kib" ${tl[@]+"${tl[@]}"} "$@"
+            if [ -z "$kib" ]; then
+                launch ${tl[@]+"${tl[@]}"} "$@"
+            elif [ "$mode" = prlimit ]; then
+                launch prlimit --as=$((kib * 1024)) -- ${tl[@]+"${tl[@]}"} "$@"
+            else
+                launch "$BASH" -c 'ulimit -v "$1" 2>/dev/null; shift; exec "$@"' _ "$kib" ${tl[@]+"${tl[@]}"} "$@"
+            fi
             ;;
         *)
             launch ${tl[@]+"${tl[@]}"} "$@"
@@ -407,6 +427,9 @@ if [ "${1:-}" = --inner ]; then
     oom=$(read_event "$dir/memory.events" oom_kill)
     gate_oom=$(read_event "$leaf/memory.events" oom_kill)
     forks=$(read_event "$(own_events "$dir" pids.events)" max)
+    # Before Linux 6.13, pids.events counts a refused fork in the forker's
+    # cgroup, and the gate's processes are in its leaf.
+    [ -r "$dir/pids.events.local" ] || forks=$(read_event "$leaf/pids.events" max)
     if [ "$own_oom" != 0 ] && [ "$leaf" = "$dir" ]; then
         notice "the run hit its memory cap (MemoryMax=$mem) and the OOM killer killed $oom of its processes; exit $rc"
     elif [ "$own_oom" != 0 ]; then

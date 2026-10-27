@@ -235,15 +235,37 @@ if command -v systemd-run >/dev/null 2>&1 &&
     fi
 
     # Forks the gate's own cap refuses leave the child's count at 0, so the
-    # line must come from the gate's count.
+    # line must come from the gate's count. A sibling may own that count, so
+    # it is not the child's reason in the report.
     printf '%s' 'for i in $(seq 200); do sleep 3 & done 2>/dev/null; wait; exit 1' > "$WORK/gate_forks"
     gate BLINK_GATE_TASKS_MAX=64 BLINK_CHILD_TASKS_MAX=256 -- \
         '"$CAPPED" --child --report '"$WORK/report"' bash '"$WORK/gate_forks" > /dev/null
-    case "$(cat "$WORK/report")" in
-        "capped.sh: the gate refused "*" forks at its process cap (TasksMax=64) while this child ran; exit "*)
-            pass "a child whose forks the gate's cap refused names the gate's cap" ;;
-        *) flunk "gate fork cap (report=[$(cat "$WORK/report")]: $(cat "$WORK/err"))" ;;
-    esac
+    if [ ! -s "$WORK/report" ] &&
+        grep -q '^capped.sh: the gate refused .* forks at its process cap (TasksMax=64) while this child ran; exit ' "$WORK/err"; then
+        pass "a child whose forks the gate's cap refused names the gate's cap, but not as its reason"
+    else
+        flunk "gate fork cap (report=[$(cat "$WORK/report")]: $(cat "$WORK/err"))"
+    fi
+
+    # A sibling's fork loop at the gate's cap is not the reason another child
+    # failed: the report stays empty and the child's own error stands.
+    gate BLINK_GATE_TASKS_MAX=64 -- 'bash '"$WORK/gate_forks"' 2>/dev/null &
+        "$CAPPED" --child --report '"$WORK/report"' bash -c "sleep 3; exit 1"; echo "rc=$?"; wait' > "$WORK/out"
+    if [ "$(cat "$WORK/out")" = rc=1 ] && [ ! -s "$WORK/report" ]; then
+        pass "a sibling's forks at the gate's cap do not become another child's reason"
+    else
+        flunk "sibling at the gate cap (out=[$(cat "$WORK/out")] report=[$(cat "$WORK/report")]: $(cat "$WORK/err"))"
+    fi
+
+    # Ctrl-C ends a loop of children, as it ends a loop of plain commands: the
+    # wrapper dies by the signal, so the loop's shell sees it.
+    out=$(gate -- 'set -m; bash -c '\''for i in 1 2 3; do "$CAPPED" --child sleep 3; echo "iter $i"; done'\'' & w=$!; set +m
+        sleep 1; kill -INT -- "-$w"; wait "$w"; echo "rc=$?"')
+    if [ "$out" = rc=130 ]; then
+        pass "Ctrl-C to a loop of children ends the loop"
+    else
+        flunk "Ctrl-C to a loop (out=[$out]: $(cat "$WORK/err"))"
+    fi
 
     # Page cache from a big write fills the gate's cap and makes it reclaim;
     # with a child killed at its own cap, that is still no OOM of the gate.
@@ -263,6 +285,19 @@ if command -v systemd-run >/dev/null 2>&1 &&
     esac
 else
     echo "SKIP: no systemd user scope with delegation on this machine; the cgroup cases did not run"
+fi
+
+# A child in a process group of its own must not read the terminal: it would
+# stop for ever when it has no time limit.
+if command -v script >/dev/null 2>&1; then
+    out=$(run CAPPED="$CAPPED" timeout 30 script -qec '"$CAPPED" --child --timeout 0 head -c1; echo "rc=$?"' /dev/null < /dev/null 2>&1)
+    rc=$?
+    case "$out" in
+        *rc=0*) pass "a child with no time limit does not stop on the terminal" ;;
+        *) flunk "child on a terminal (rc=$rc out=[$out])" ;;
+    esac
+else
+    echo "SKIP: no script command; the terminal case did not run"
 fi
 
 # --- No systemd-run: prlimit caps each child ----------------------------------
@@ -291,6 +326,14 @@ if command -v prlimit >/dev/null 2>&1; then
     else
         flunk "no systemd-run: child time limit (rc=$rc: $(cat "$WORK/err"))"
     fi
+    out=$(gate PATH="$P" -- 'BLINK_CHILD_MEMORY_MAX=infinity "$CAPPED" --child bash -c "echo hi"')
+    rc=$?
+    if [ "$out" = hi ] && [ "$rc" = 0 ]; then
+        pass "no systemd-run: BLINK_CHILD_MEMORY_MAX=infinity for one child sets no address space cap"
+    else
+        flunk "no systemd-run: memory infinity for one child (out=[$out] rc=$rc: $(cat "$WORK/err"))"
+    fi
+
     gate PATH="$P" BLINK_CHILD_TASKS_MAX=infinity -- '"$CAPPED" --child bash -c "exit 0"'
     rc=$?
     if [ "$rc" = 0 ] && [ "$(grep -c 'integer expression\|syntax error' "$WORK/err")" = 0 ]; then
