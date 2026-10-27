@@ -3,7 +3,10 @@
 # dies alone and the kernel's global OOM killer never has to pick a victim.
 # See docs/build/gate-memory-budget.md for the numbers.
 #
-#   scripts/capped.sh <command> [<arg> ...]
+#   scripts/capped.sh [--name <name>] <command> [<arg> ...]
+#
+# --name names the scope unit, blink-gate-<name>-<pid>-<time>.scope; without
+# it the command's own name does.
 #
 # Each heavy Taskfile task re-runs itself through this script. The capped run
 # exports BLINK_GATE_SCOPE, and a call that finds it set runs the command in
@@ -79,7 +82,12 @@ if [ "${1:-}" = --inner ]; then
     exit "$rc"
 fi
 
-[ $# -gt 0 ] || { echo "usage: capped.sh <command> [<arg> ...]" >&2; exit 2; }
+name=
+if [ "${1:-}" = --name ]; then
+    name=${2:-}
+    shift 2 || shift
+fi
+[ $# -gt 0 ] || { echo "usage: capped.sh [--name <name>] <command> [<arg> ...]" >&2; exit 2; }
 
 [ -n "${BLINK_GATE_SCOPE:-}" ] && exec "$@"
 
@@ -114,14 +122,7 @@ if command -v systemd-run >/dev/null 2>&1 &&
         notice "$slice has no unit, so this run gets a plain user scope with its own caps only"
         slice_args=()
     fi
-    # The unit name says what the scope holds: blink-gate-<task>-<pid> for a
-    # task run, else the command's own name.
-    name=${1##*/}
-    if [ "$name" = task ]; then
-        for a in "${@:2}"; do
-            case "$a" in -* | *=*) ;; *) name=$a; break ;; esac
-        done
-    fi
+    [ -n "$name" ] || name=${1##*/}
     name=${name//[^A-Za-z0-9_-]/_}
     unit=blink-gate-$name-$$-$EPOCHSECONDS.scope
     export BLINK_GATE_SCOPE=$unit

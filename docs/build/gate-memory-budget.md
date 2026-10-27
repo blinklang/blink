@@ -1,8 +1,8 @@
 # Gate memory and process budget
 
-Status: proposal. The tickets that add the slice file, the default cgroup wrapper, the
-per-child caps and the concurrency bound apply these numbers. This page does not change
-any limit.
+Status: the "one gate scope" rows are applied (see "Applied: one gate scope" below). The
+other rows are a proposal: the tickets that add the slice file, the per-child caps and the
+concurrency bound apply them.
 
 ## Why
 
@@ -81,9 +81,9 @@ then fork failed and the run ended. With `TasksMax=64` it ended in 1 s. Without 
 it grows at about 1100 processes per second until the RAM is full.
 
 Other memory users made the OOM worse on that day: a game used 22 GB and tmpfs held
-14.7 GB. The fmt stage starts its own scope with `MemoryMax=50G` when it is not in the
-slice. That cap is more than the free RAM, so the global OOM killer ran before the cgroup
-limit could. Also, `scripts/run_fmt_semantic.sh` runs each test binary with no timeout.
+14.7 GB. The fmt stage then started its own scope with `MemoryMax=50G` when it was not in
+the slice. That cap is more than the free RAM, so the global OOM killer ran before the
+cgroup limit could. The gate scope below replaces it. Also, `scripts/run_fmt_semantic.sh` runs each test binary with no timeout.
 
 ## Knobs and how they multiply
 
@@ -126,3 +126,66 @@ The products:
 
 These numbers come from one machine and one commit. Measure again when a gate adds a
 stage or when its `pids.peak` or anon + shmem doubles.
+
+## Applied: one gate scope
+
+`scripts/capped.sh` applies the two "one gate scope" rows. Each heavy Taskfile task
+re-runs itself through it: `bootstrap`, `regen`, `gen0`, `gen1`, `build-cli`, `build`,
+`compile-test`, `test`, `test-fmt`, `test-installed`, `fuzz`, `bench`, `build-binaries`,
+`ci`, `ci-fast`, `ci-release`, `ci-monolith`, `ci-per-module-checks`, `ci-profile`,
+`corpus`, `corpus-per-module`, `corpus-sample`, `corpus-only`, `warning-gate`,
+`typecheck-suite` and `rewrite-suite`. The task `<name>` holds only the re-run; its steps
+are in the internal task `__<name>`.
+
+The capped run sets `BLINK_GATE_SCOPE`. A task that finds it set calls its body in
+place, so `task ci` gets one scope for the whole gate, and its nested tasks do not stack
+scopes or run again. The two fmt scopes with `MemoryMax=50G` are gone: the fmt stage runs
+in the gate's scope.
+
+The first way that works caps the run:
+
+| Machine | Cap | Notice |
+|---|---|---|
+| systemd user scope, slice has a unit | scope `blink-gate-<task>-<pid>-<time>.scope` in `blink-gates.slice`, `MemoryMax=12G`, `TasksMax=1024` | none |
+| systemd user scope, no `blink-gates.slice` unit | the same scope in the default user slice | one line |
+| no systemd user scope, `prlimit` | address space 12G per process, user processes = running + 1024 | one line |
+| no `prlimit` | `ulimit -v` and `ulimit -u`, the same limits | one line |
+| none of these work | no cap; the task still runs | one line |
+
+The scope sits in the slice even when the caller already does, for example a run that a
+person starts with `systemd-run --user --scope --slice=blink-gates.slice task ci`. That
+caller's scope has no memory or task cap of its own, so being in the slice does not prove
+a cap. The new scope is a second child of the slice, so the slice's CPU and memory limits
+still hold over it, and its own caps hold over the gate. The old fmt scope left the slice
+only because it had no `--slice`.
+
+`prlimit` and `ulimit` are weaker. The address space cap is per process, not per run.
+`RLIMIT_NPROC` counts every process and thread of the user, so the cap is the count at
+the start plus 1024.
+
+When the scope's run ends, the script reads the scope's `memory.events` and
+`pids.events` and prints one line per cap the run hit, for example:
+
+```
+capped.sh: the run hit its memory cap (MemoryMax=12G) and the OOM killer killed 1 of its processes; exit 137
+capped.sh: the run hit its process cap (TasksMax=1024): 7 forks failed; exit 254
+```
+
+It then ends the processes still in the scope. The scope has `OOMPolicy=continue`, else
+systemd stops it at the first OOM kill and the report goes with it.
+
+Settings:
+
+| Variable | Default | Effect |
+|---|---|---|
+| `BLINK_GATE_CAP` | `1` | `0` runs every task in place, uncapped, with one notice. For a machine that caps gates some other way. |
+| `BLINK_GATE_MEMORY_MAX` | `12G` | the scope's `MemoryMax` |
+| `BLINK_GATE_TASKS_MAX` | `1024` | the scope's `TasksMax` |
+| `BLINK_GATE_SWAP_MAX` | unset | the scope's `MemorySwapMax`; unset leaves swap to the slice |
+| `BLINK_GATE_SLICE` | `blink-gates.slice` | the slice that holds the scope |
+
+`scripts/test_capped.sh`, in `task ci`'s gate self-tests, proves each path with caps of
+64M and 64 tasks.
+
+`task bench-edit-loop` is not capped this way: it waits for an empty slice before it
+starts, and a gate scope of its own would keep the slice busy.

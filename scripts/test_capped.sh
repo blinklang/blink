@@ -104,6 +104,12 @@ else
     flunk "one scope (first=[$first] second=[$second] err=[$(cat "$WORK/err")])"
 fi
 
+out=$(run "$CAPPED" --name selftest-probe cut -d: -f3 /proc/self/cgroup)
+case "$out" in
+    */blink-gate-selftest-probe-*.scope) pass "--name names the scope" ;;
+    *) flunk "--name (cgroup [$out])" ;;
+esac
+
 caps=$(run BLINK_GATE_MEMORY_MAX=64M BLINK_GATE_TASKS_MAX=64 "$CAPPED" bash -c 'd=/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup); echo "$(cat "$d/memory.max") $(cat "$d/pids.max")"')
 if [ "$caps" = "67108864 64" ]; then
     pass "the scope carries the memory and task caps"

@@ -11,6 +11,21 @@ vars:
 tasks:
   bootstrap:
     desc: Build compiler from bootstrap and verify self-hosting
+    # A heavy task re-runs itself through scripts/capped.sh, which caps the
+    # run's memory and processes, and the capped run calls its body,
+    # __<task>. scripts/capped.sh sets BLINK_GATE_SCOPE in the capped run, so a
+    # nested call goes straight to the body and the caps never stack. Each
+    # heavy task reuses this list; a task with vars of its own forwards them.
+    cmds: &capped
+      - cmd: ./scripts/capped.sh --name {{.TASK}} {{.TASK_EXE}} -x --taskfile "{{.TASKFILE}}" {{.TASK}}{{if .CLI_FORCE}} --force{{end}}{{if .CLI_SILENT}} --silent{{end}}{{if .CLI_VERBOSE}} --verbose{{end}}{{if .CLI_ARGS}} -- {{.CLI_ARGS}}{{end}}
+        silent: true
+        if: '[ -z "$BLINK_GATE_SCOPE" ]'
+      - task: '__{{.TASK}}'
+        if: '[ -n "$BLINK_GATE_SCOPE" ]'
+
+  __bootstrap:
+    internal: true
+    label: bootstrap
     sources:
       - bootstrap/runtime*.h
       - bootstrap/bootstrap.sh
@@ -25,11 +40,21 @@ tasks:
 
   gen0:
     desc: Build the pinned gen0 compiler from the tag into build/gen0/ (with .provenance)
+    cmds: *capped
+
+  __gen0:
+    internal: true
+    label: gen0
     cmds:
       - ./scripts/gen0.sh
 
   regen:
     desc: Rebuild compiler and verify self-hosting
+    cmds: *capped
+
+  __regen:
+    internal: true
+    label: regen
     cmds:
       - task: gen-stdlib-registry
       - cp -f {{.BUILD_DIR}}/blinkc {{.BUILD_DIR}}/blinkc.bak 2>/dev/null || true
@@ -114,12 +139,22 @@ tasks:
 
   compile-test:
     desc: "Compile a single test file (usage: task compile-test -- test_name)"
+    cmds: *capped
+
+  __compile-test:
+    internal: true
+    label: compile-test
     deps: [build-cli]
     cmds:
       - '{{.BUILD_DIR}}/blink __test-build tests/{{.CLI_ARGS}}.bl'
 
   test:
     desc: Compile and run all test_*.bl files
+    cmds: *capped
+
+  __test:
+    internal: true
+    label: test
     deps: [build-cli]
     cmds:
       # Each test binary lands in build/tests/, which has no lib/ beside it, so a
@@ -128,6 +163,11 @@ tasks:
 
   build-cli:
     desc: Build the blink CLI tool
+    cmds: *capped
+
+  __build-cli:
+    internal: true
+    label: build-cli
     deps: [bootstrap]
     sources:
       - src/*.bl
@@ -158,6 +198,11 @@ tasks:
 
   build:
     desc: Build and install blink to ~/.local/bin/
+    cmds: *capped
+
+  __build:
+    internal: true
+    label: build
     deps: [build-cli]
     cmds:
       # build/'s archive links can name another blink's archive (build-cli
@@ -195,6 +240,11 @@ tasks:
 
   test-fmt:
     desc: Test formatter idempotency and golden outputs (release compiler at build/blinkc)
+    cmds: *capped
+
+  __test-fmt:
+    internal: true
+    label: test-fmt
     deps: [bootstrap]
     cmds:
       - task: __fmt-goldens
@@ -219,18 +269,14 @@ tasks:
         export GC_MARKERS=1
         printf '%s\n' test_hof test_lazy_iter test_semver test_toml test_manifest test_lockfile test_http_types test_http_error test_json test_json_builder test_args test_args_cli test_derive_nested test_embed test_combining_iterators test_http_client test_iterators test_match_void_if test_multifile_visibility test_question_ops test_string_iter test_audit test_e2e_gitdep test_e2e_transitive test_e2e_pub_visibility test_async_spawn_types test_tcp_socket test_pub_import test_std_testing test_c_reserved_names test_module_qualified_types test_ue_complex_returns test_effects test_effect_vtable test_sqlite test_builtin_methods test_priv_access test_unused_import test_cross_module_effects test_cross_module_effects_helper test_map_seed_deterministic > "$skip_file"
 
-        # Under blink-gates.slice the slice already holds memory below this cap,
-        # and a scope of its own would move the work out of the slice's CPU cap.
-        scope="systemd-run --user --scope -p MemoryMax=50G --quiet"
-        grep -q '/blink-gates.slice/' /proc/self/cgroup && scope=""
-        golden_results=$($scope parallel -j {{.JOBS}} --halt never ./scripts/run_fmt_golden.sh {} {{.FMT_BLINKC}} ::: tests/fmt/input_*.bl 2>&1 || true)
-        idem_results=$($scope parallel -j {{.JOBS}} --halt never ./scripts/run_fmt_idempotent.sh {} {{.FMT_BLINKC}} "$skip_file" ::: tests/test_*.bl 2>&1 || true)
+        golden_results=$(parallel -j {{.JOBS}} --halt never ./scripts/run_fmt_golden.sh {} {{.FMT_BLINKC}} ::: tests/fmt/input_*.bl 2>&1 || true)
+        idem_results=$(parallel -j {{.JOBS}} --halt never ./scripts/run_fmt_idempotent.sh {} {{.FMT_BLINKC}} "$skip_file" ::: tests/test_*.bl 2>&1 || true)
         # The semantic pass compiles and RUNS every formatted test. Those
         # binaries call the relative build/blink and build/blinkc, which only
         # a release build provides, so the rewrite gate skips this pass.
         sem_results=""
         if [ "{{.FMT_SEMANTIC}}" = 1 ]; then
-          sem_results=$($scope parallel -j {{.JOBS}} --halt never ./scripts/run_fmt_semantic.sh {} {{.FMT_BLINKC}} "$skip_file" ::: tests/test_*.bl 2>&1 || true)
+          sem_results=$(parallel -j {{.JOBS}} --halt never ./scripts/run_fmt_semantic.sh {} {{.FMT_BLINKC}} "$skip_file" ::: tests/test_*.bl 2>&1 || true)
         fi
 
         all_results=$(printf '%s\n%s\n%s' "$golden_results" "$idem_results" "$sem_results")
@@ -244,9 +290,9 @@ tasks:
           echo "$all_results" | grep "^FAIL" | sed 's/^/  /'
           exit 1
         fi
-        # Zero passes is not a pass. The runner needs the session bus, so a run
-        # whose environment lost it gets no results at all, and counting only
-        # failures reads that as a clean stage.
+        # Zero passes is not a pass. A runner that cannot start gives no
+        # results at all, and counting only failures reads that as a clean
+        # stage.
         if [ "$passed" -eq 0 ]; then
           echo "fmt: no check ran, so this stage measured nothing"
           echo "$all_results" | sed 's/^/  /'
@@ -255,12 +301,22 @@ tasks:
 
   fuzz:
     desc: Run fuzz testing against lexer and parser
+    cmds: *capped
+
+  __fuzz:
+    internal: true
+    label: fuzz
     deps: [bootstrap]
     cmds:
       - ./scripts/fuzz.sh {{.BLINKC}} {{.CLI_ARGS | default "500"}}
 
   test-installed:
     desc: Test that installed blink works outside project tree
+    cmds: *capped
+
+  __test-installed:
+    internal: true
+    label: test-installed
     deps: [build-cli]
     cmds:
       - |
@@ -576,6 +632,12 @@ tasks:
   ci-release:
     desc: Release CI (self-host regen + full suite + per-module invariants)
     silent: true
+    cmds: *capped
+
+  __ci-release:
+    internal: true
+    label: ci-release
+    silent: true
     cmds:
       - task: ratchet
       - task: test-ratchet
@@ -589,6 +651,12 @@ tasks:
   gen1:
     desc: Compile the current compiler sources with the pinned gen0 (build/gen1/blinkc)
     silent: true
+    cmds: *capped
+
+  __gen1:
+    internal: true
+    label: gen1
+    silent: true
     # A gate reaches gen1 through several steps; one build per run serves them all.
     run: once
     cmds:
@@ -597,6 +665,18 @@ tasks:
 
   corpus:
     desc: Compile+run every tests/test_*.bl under gen1 independently; writes build/corpus.json, then lints
+    silent: true
+    cmds:
+      - cmd: ./scripts/capped.sh --name {{.TASK}} {{.TASK_EXE}} -x --taskfile "{{.TASKFILE}}" {{.TASK}}{{if .CLI_FORCE}} --force{{end}}{{if .CLI_SILENT}} --silent{{end}}{{if .CLI_VERBOSE}} --verbose{{end}}{{if .CORPUS_LINT}} CORPUS_LINT={{.CORPUS_LINT}}{{end}}{{if .CORPUS_PM_SLICE}} CORPUS_PM_SLICE={{.CORPUS_PM_SLICE}}{{end}}
+        silent: true
+        if: '[ -z "$BLINK_GATE_SCOPE" ]'
+      - task: __corpus
+        if: '[ -n "$BLINK_GATE_SCOPE" ]'
+        vars: { CORPUS_LINT: '{{.CORPUS_LINT}}', CORPUS_PM_SLICE: '{{.CORPUS_PM_SLICE}}' }
+
+  __corpus:
+    internal: true
+    label: corpus
     silent: true
     vars:
       CORPUS_LINT: '{{.CORPUS_LINT | default "1"}}'
@@ -614,6 +694,12 @@ tasks:
   # results directory as `task corpus`: never run the two at once in one checkout.
   corpus-per-module:
     desc: Compile+run every tests/test_*.bl per-module under gen1; writes build/corpus_per_module.json and checks it
+    silent: true
+    cmds: *capped
+
+  __corpus-per-module:
+    internal: true
+    label: corpus-per-module
     silent: true
     cmds:
       - task: gen1
@@ -650,6 +736,12 @@ tasks:
   warning-gate:
     desc: Fail on any warning gen1 reports in the compiler build (src/cli.bl, src/blinkc_main.bl), printing each site
     silent: true
+    cmds: *capped
+
+  __warning-gate:
+    internal: true
+    label: warning-gate
+    silent: true
     cmds:
       - task: gen1
       - WARNING_GATE_BLINK={{.BUILD_DIR}}/gen1/bin/blink ./scripts/check_build_warnings.sh
@@ -675,6 +767,12 @@ tasks:
   typecheck-suite:
     desc: Run the typechecker tests listed in scripts/typecheck_suite.txt under gen1; all must pass
     silent: true
+    cmds: *capped
+
+  __typecheck-suite:
+    internal: true
+    label: typecheck-suite
+    silent: true
     cmds:
       - task: gen1
       - |
@@ -694,6 +792,12 @@ tasks:
 
   rewrite-suite:
     desc: Run every rewrite unit-test file (cg, layout, cname, ir) under gen1; all must pass
+    silent: true
+    cmds: *capped
+
+  __rewrite-suite:
+    internal: true
+    label: rewrite-suite
     silent: true
     cmds:
       - task: gen1
@@ -777,6 +881,7 @@ tasks:
         ./scripts/test_lint_commit_messages.sh
         ./scripts/test_release_notes.sh
         ./scripts/test_check_build_warnings.sh
+        ./scripts/test_capped.sh
         ./scripts/check_spec_refs.sh
         ./scripts/test_check_spec_refs.sh
         './scripts/corpus_per_module_slice_drift.sh scripts/corpus_per_module_slice.txt'
@@ -809,6 +914,12 @@ tasks:
   ci:
     desc: CI gate (gen0 compiles src, full corpus passes, lint, fmt goldens, no compiler-build warning, suite files pass in the corpus)
     silent: true
+    cmds: *capped
+
+  __ci:
+    internal: true
+    label: ci
+    silent: true
     cmds:
       - task: __ci-corpus-ratchet-and-selftests
       - task: corpus-check
@@ -824,6 +935,12 @@ tasks:
   # runs on main, where every file has to pass.
   ci-fast:
     desc: "Branch gate: everything in ci, with the corpus sample in place of the full corpus"
+    silent: true
+    cmds: *capped
+
+  __ci-fast:
+    internal: true
+    label: ci-fast
     silent: true
     cmds:
       - task: __gen1-ratchet-and-selftests
@@ -841,6 +958,12 @@ tasks:
   corpus-sample:
     desc: Compile+run the fixed corpus sample under gen1 and hold it to the floor in the list
     silent: true
+    cmds: *capped
+
+  __corpus-sample:
+    internal: true
+    label: corpus-sample
+    silent: true
     cmds:
       - task: gen1
       - ./scripts/corpus_sample.sh {{.CLI_ARGS}}
@@ -856,6 +979,12 @@ tasks:
         msg: "usage: task corpus-only -- <list file>   (one tests/*.bl path per line)"
       - sh: test -f "{{.CLI_ARGS}}"
         msg: "corpus-only: no such list file: {{.CLI_ARGS}}"
+    cmds: *capped
+
+  __corpus-only:
+    internal: true
+    label: corpus-only
+    silent: true
     cmds:
       - task: gen1
       - ./scripts/corpus.sh --only {{.CLI_ARGS}} --no-lint
@@ -867,6 +996,12 @@ tasks:
   # See docs/build/per-module-o-default.md.
   ci-monolith:
     desc: Monolith-path CI — regen bootstrap + run all tests with --no-per-module
+    silent: true
+    cmds: *capped
+
+  __ci-monolith:
+    internal: true
+    label: ci-monolith
     silent: true
     sources:
       - src/*.bl
@@ -918,6 +1053,12 @@ tasks:
         MODE=cold           — wipes Taskfile cache + bootstrap outputs + native objects first so every phase
                               pays its true cost.
       Use both back-to-back to attribute: (cold − warm) = work the cache saves us; warm = work that always pays.
+    silent: true
+    cmds: *capped
+
+  __ci-profile:
+    internal: true
+    label: ci-profile
     silent: true
     cmds:
       - |
@@ -1001,13 +1142,9 @@ tasks:
         # given its own --joblog so per-file timings are available for free.
         printf "%s\n" test_hof test_lazy_iter test_semver test_toml test_manifest test_lockfile test_http_types test_http_error test_json test_json_builder test_args test_args_cli test_derive_nested test_embed test_combining_iterators test_http_client test_iterators test_match_void_if test_multifile_visibility test_question_ops test_string_iter test_audit test_e2e_gitdep test_e2e_transitive test_e2e_pub_visibility test_async_spawn_types test_tcp_socket test_pub_import test_std_testing test_c_reserved_names test_module_qualified_types test_ue_complex_returns test_effects test_effect_vtable test_sqlite test_builtin_methods test_priv_access test_unused_import test_cross_module_effects test_cross_module_effects_helper test_test_compile_errors test_map_seed_deterministic > "$skip_file"
 
-        # Under blink-gates.slice the slice already holds memory below this cap,
-        # and a scope of its own would move the work out of the slice's CPU cap.
-        scope="systemd-run --user --scope -p MemoryMax=50G --quiet"
-        grep -q '/blink-gates.slice/' /proc/self/cgroup && scope=""
-        time_phase fmt-golden "$scope parallel --joblog {{.BUILD_DIR}}/fmt-golden.${MODE}.joblog -j {{.JOBS}} --halt never ./scripts/run_fmt_golden.sh {} {{.BLINKC}} ::: tests/fmt/input_*.bl > /dev/null 2>&1 || true"
-        time_phase fmt-idempotent "$scope parallel --joblog {{.BUILD_DIR}}/fmt-idem.${MODE}.joblog -j {{.JOBS}} --halt never ./scripts/run_fmt_idempotent.sh {} {{.BLINKC}} \"$skip_file\" ::: tests/test_*.bl > /dev/null 2>&1 || true"
-        time_phase fmt-semantic "$scope parallel --joblog {{.BUILD_DIR}}/fmt-sem.${MODE}.joblog -j {{.JOBS}} --halt never ./scripts/run_fmt_semantic.sh {} {{.BLINKC}} \"$skip_file\" ::: tests/test_*.bl > /dev/null 2>&1 || true"
+        time_phase fmt-golden "parallel --joblog {{.BUILD_DIR}}/fmt-golden.${MODE}.joblog -j {{.JOBS}} --halt never ./scripts/run_fmt_golden.sh {} {{.BLINKC}} ::: tests/fmt/input_*.bl > /dev/null 2>&1 || true"
+        time_phase fmt-idempotent "parallel --joblog {{.BUILD_DIR}}/fmt-idem.${MODE}.joblog -j {{.JOBS}} --halt never ./scripts/run_fmt_idempotent.sh {} {{.BLINKC}} \"$skip_file\" ::: tests/test_*.bl > /dev/null 2>&1 || true"
+        time_phase fmt-semantic "parallel --joblog {{.BUILD_DIR}}/fmt-sem.${MODE}.joblog -j {{.JOBS}} --halt never ./scripts/run_fmt_semantic.sh {} {{.BLINKC}} \"$skip_file\" ::: tests/test_*.bl > /dev/null 2>&1 || true"
 
         # Phase 7: per-module .o pipeline + gen1/gen2 byte-equality.
         time_phase ci-per-module-checks 'task ci-per-module-checks > /dev/null'
@@ -1047,6 +1184,12 @@ tasks:
   # See docs/build/per-module-o-default.md for why this path is the default.
   ci-per-module-checks:
     desc: Verify per-module .c/.h emit — four invariants (byte-equality, self-host, determinism, gen1/gen2)
+    silent: true
+    cmds: *capped
+
+  __ci-per-module-checks:
+    internal: true
+    label: ci-per-module-checks
     silent: true
     deps: [build-cli]
     sources:
@@ -1228,6 +1371,11 @@ tasks:
 
   bench:
     desc: Compile and run benchmarks/arena_process_batch.bl (release mode)
+    cmds: *capped
+
+  __bench:
+    internal: true
+    label: bench
     deps: [build-cli]
     cmds:
       - '{{.BUILD_DIR}}/blink build --release benchmarks/arena_process_batch.bl -o {{.BUILD_DIR}}/arena_process_batch'
@@ -1235,6 +1383,11 @@ tasks:
 
   build-binaries:
     desc: Cross-compile blink CLI binaries for all platforms
+    cmds: *capped
+
+  __build-binaries:
+    internal: true
+    label: build-binaries
     deps: [build-cli]
     vars:
       GC_SRC: bootstrap/vendor/gc/extra/gc.c

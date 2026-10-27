@@ -41,6 +41,7 @@ Test: `task test` — compile+run all test_*.bl in tests/
 Test formatter: `task test-fmt` — golden outputs + idempotency + semantic checks; `task ci` runs the goldens with the semantic check off
 Single test: `task compile-test -- test_name` (needs a seeded build/)
 Gate: `task ci` — gen0 compiles src (gen1) + full corpus passes + lint + fmt goldens + typecheck suite + rewrite unit suite. Run after every change. See docs/codegen-rewrite/harness.md
+Gate caps: each heavy task (ci, test, regen, gen1, corpus, ...) re-runs itself in a capped user scope in blink-gates.slice (scripts/capped.sh, MemoryMax 12G, TasksMax 1024), so a gate needs no `systemd-run` wrapper. `BLINK_GATE_CAP=0` opts out. See docs/build/gate-memory-budget.md
 Warning gate: `task warning-gate` — gen1 `blink check --strict --json` on src/cli.bl + src/blinkc_main.bl; any warning in the compiler build fails it and prints each site. `task ci` and `task ci-fast` run it
 Spec-ref gate: `task spec-refs` — every § ref and prose "section N.N" ref in sections/, ERROR_CATALOG.md, llms*.md and src/diagnostics.bl names a numbered heading, the headings nest, and the catalog tables have a valid format; prints each broken site. `task ci` and `task ci-fast` run it
 Release gate: `task ci-release` — regen + test + test-fmt + per-module invariants. Run at release points
