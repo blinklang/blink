@@ -1,9 +1,11 @@
 #!/bin/bash
 # Proves scripts/scratch.sh: `new` makes a probe dir under one root and prints
-# its path, `clean` removes one dir or all of them, `check` prints each dir's
-# size, warns past the limit and on a tmpfs root, and exits 0 even then, and
-# every command refuses a root that is "/", $HOME, a symlink, or not named
-# blink-probe-*. Each root here is under a mktemp dir.
+# its path, `clean` removes one dir or all of them and no symlink target,
+# `check` prints each dir's size, names a tmpfs root, warns past the limit and
+# exits 0 even then, and every command refuses a root that is "/", holds
+# $HOME by any spelling, is a symlink, or is not named blink-probe-*. Each
+# root that clean may touch is under a mktemp dir; "/" and the real $HOME get
+# only new and check.
 set -u
 cd "$(dirname "$0")/.."
 SCRATCH="$PWD/scripts/scratch.sh"
@@ -29,7 +31,7 @@ for bad in '' . .. a/b ../x '-x'; do
 done
 
 # check: sizes, no warning under the limit, warning past it, exit 0
-dd if=/dev/zero of="$p/fill" bs=1024 count=64 status=none
+dd if=/dev/zero of="$p/fill" bs=1024 count=10240 status=none
 run "$SCRATCH" new probe2 >/dev/null
 out=$(run "$SCRATCH" check 2>&1); rc=$?
 if [ $rc -eq 0 ] && grep -q 'probe1' <<<"$out" && grep -q 'probe2' <<<"$out" && ! grep -qi 'warning' <<<"$out"; then
@@ -40,7 +42,20 @@ if [ $rc -eq 0 ] && [ "$(grep -ci 'warning' <<<"$out")" -eq 1 ]; then
     pass "check warns in one line past the limit and exits 0"
 else flunk "check over the limit: rc=$rc out=$out"; fi
 out=$(run env BLINK_SCRATCH_WARN=junk "$SCRATCH" check 2>&1); rc=$?
-[ $rc -eq 0 ] && pass "check exits 0 on a bad limit" || flunk "check bad limit rc=$rc"
+if [ $rc -eq 0 ] && grep -q "not a size; using 4G" <<<"$out"; then
+    pass "check falls back to 4G on a bad limit and exits 0"
+else flunk "check bad limit: rc=$rc out=$out"; fi
+# A leading zero is base 10, not octal: the 10M here is past 09M and not past 011M.
+out=$(run env BLINK_SCRATCH_WARN=09M "$SCRATCH" check 2>&1)
+if grep -q 'warning: .* past 09M' <<<"$out"; then pass "09M reads as 9M"; else flunk "09M: $out"; fi
+out=$(run env BLINK_SCRATCH_WARN=011M "$SCRATCH" check 2>&1)
+if ! grep -qi warning <<<"$out"; then pass "011M reads as 11M"; else flunk "011M: $out"; fi
+# Each entry counts, also one named ..x
+mkdir "$root/..big"
+dd if=/dev/zero of="$root/..big/fill" bs=1024 count=10240 status=none
+out=$(run env BLINK_SCRATCH_WARN=15M "$SCRATCH" check 2>&1)
+if grep -q '\.\.big' <<<"$out" && grep -q 'warning' <<<"$out"; then pass "check counts an entry named ..x"; else flunk "..big: $out"; fi
+rm -rf "$root/..big"
 
 # check: names tmpfs, by a fake stat that says the root is on tmpfs
 mkdir -p "$WORK/bin"
@@ -81,24 +96,64 @@ run "$SCRATCH" clean --all && pass "clean --all with no root exits 0" || flunk "
 out=$(run "$SCRATCH" check 2>&1); rc=$?
 [ $rc -eq 0 ] && pass "check with no root exits 0" || flunk "check no root rc=$rc"
 
-# hostile roots: refused by new and clean, check exits 0 and touches nothing
-mkdir -p "$WORK/home/blink-probe-x" "$WORK/target/blink-probe-y/d"
+# hostile roots. Each row names the reason it must give, so a refusal by an
+# earlier guard cannot pass it. new and check run on the real / and $HOME;
+# clean runs only on roots under $WORK.
+# refused <expect reason> <env...>: new and clean --all refuse with the
+# reason; check exits 0 with the reason and measures nothing.
+refused() {
+    local reason=$1; shift
+    local label="$*"
+    out=$(run env "$@" "$SCRATCH" new z 2>&1)
+    if [ $? -ne 0 ] && grep -q "$reason" <<<"$out"; then pass "new refuses: $label"; else flunk "new on $label: $out"; fi
+    out=$(run env "$@" "$SCRATCH" clean --all 2>&1)
+    if [ $? -ne 0 ] && grep -q "$reason" <<<"$out"; then pass "clean --all refuses: $label"; else flunk "clean --all on $label: $out"; fi
+    out=$(run env "$@" "$SCRATCH" check 2>&1); rc=$?
+    if [ $rc -eq 0 ] && grep -q "$reason.*not checked" <<<"$out" && ! grep -q '^scratch:' <<<"$out"; then
+        pass "check skips: $label"
+    else flunk "check on $label: rc=$rc $out"; fi
+}
+# Only new and check, so a broken guard cannot remove a real dir.
+refused_safe() {
+    local reason=$1; shift
+    out=$(run env "$@" "$SCRATCH" new z 2>&1)
+    if [ $? -ne 0 ] && grep -q "$reason" <<<"$out"; then pass "new refuses: $*"; else flunk "new on $*: $out"; fi
+    out=$(run env "$@" "$SCRATCH" check 2>&1); rc=$?
+    if [ $rc -eq 0 ] && grep -q "$reason.*not checked" <<<"$out" && ! grep -q '^scratch:' <<<"$out"; then
+        pass "check skips: $*"
+    else flunk "check on $*: rc=$rc $out"; fi
+}
+refused_safe 'not an absolute path' BLINK_SCRATCH_ROOT=/
+refused_safe 'not named blink-probe' BLINK_SCRATCH_ROOT="$HOME"
+refused_safe 'not named blink-probe' BLINK_SCRATCH_ROOT="$HOME/"
+
+H=$WORK/h/blink-probe-h
+mkdir -p "$H/home" "$WORK/h/alias"; touch "$H/home/precious"
+ln -s "$WORK/h" "$WORK/h/alias/up"
+refused 'not an absolute path' BLINK_SCRATCH_ROOT=relative/blink-probe-a
+refused 'not named blink-probe' BLINK_SCRATCH_ROOT="$WORK/tmp"
+refused 'holds \. or \.\.' BLINK_SCRATCH_ROOT="$WORK/tmp/../tmp/blink-probe-a"
+refused 'holds \. or \.\.' BLINK_SCRATCH_ROOT="$WORK/./tmp/blink-probe-a"
+refused 'no parent dir' BLINK_SCRATCH_ROOT="$WORK/nothere/blink-probe-a"
+mkdir -p "$WORK/target/blink-probe-y/d"
 ln -s "$WORK/target/blink-probe-y" "$WORK/tmp/blink-probe-link"
-for hostile in / "$HOME" "$HOME/" "$WORK/tmp" relative/blink-probe-a "$WORK/tmp/blink-probe-link" \
-               "$WORK/tmp/blink-probe-a/.." "$WORK/home/notprobe"; do
-    if run env BLINK_SCRATCH_ROOT="$hostile" "$SCRATCH" new z >/dev/null 2>&1; then
-        flunk "new accepted root '$hostile'"
-    else pass "new refuses root '$hostile'"; fi
-    if run env BLINK_SCRATCH_ROOT="$hostile" "$SCRATCH" clean --all >/dev/null 2>&1; then
-        flunk "clean --all accepted root '$hostile'"
-    else pass "clean --all refuses root '$hostile'"; fi
-    run env BLINK_SCRATCH_ROOT="$hostile" "$SCRATCH" check >/dev/null 2>&1 \
-        && pass "check exits 0 on root '$hostile'" || flunk "check rc on root '$hostile'"
-done
+refused 'is a symlink' BLINK_SCRATCH_ROOT="$WORK/tmp/blink-probe-link"
+touch "$WORK/tmp/blink-probe-file"
+refused 'is not a dir' BLINK_SCRATCH_ROOT="$WORK/tmp/blink-probe-file"
+refused 'holds \$HOME' HOME="$H/home" BLINK_SCRATCH_ROOT="$H"
+refused 'holds \$HOME' HOME="$H" BLINK_SCRATCH_ROOT="$H"
+refused 'holds \$HOME' HOME="$H/home" BLINK_SCRATCH_ROOT="${H%/*}//blink-probe-h"
+refused 'holds \$HOME' HOME="$WORK/h/./blink-probe-h/home" BLINK_SCRATCH_ROOT="$H"
+refused 'holds \$HOME' HOME="$H/home" BLINK_SCRATCH_ROOT="$WORK/h/alias/up/blink-probe-h"
+refused 'holds \$HOME' HOME="$WORK/h/alias/up/blink-probe-h/home" BLINK_SCRATCH_ROOT="$H"
+# With no HOME there is no home to lose; the guard must not die on it.
+out=$(run env -u HOME BLINK_SCRATCH_ROOT="$WORK/tmp/blink-probe-nohome" "$SCRATCH" new z 2>&1)
+if [ "$out" = "$WORK/tmp/blink-probe-nohome/z" ]; then pass "new with HOME unset"; else flunk "HOME unset: $out"; fi
 [ -d "$WORK/target/blink-probe-y/d" ] && pass "a symlinked root's target stays" || flunk "symlinked root target removed"
-[ -d "$HOME" ] || flunk "HOME is gone"
+[ -f "$H/home/precious" ] && pass "a fake HOME inside the root stays" || flunk "fake HOME removed"
 
 # an explicit root of the right shape works
+mkdir -p "$WORK/home"
 alt="$WORK/home/blink-probe-x"
 p=$(run env BLINK_SCRATCH_ROOT="$alt" "$SCRATCH" new a)
 [ "$p" = "$alt/a" ] && [ -d "$p" ] && pass "BLINK_SCRATCH_ROOT sets the root" || flunk "override root printed '$p'"

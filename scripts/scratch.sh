@@ -19,6 +19,15 @@ die() { echo "scratch.sh: $*" >&2; exit 2; }
 root=${BLINK_SCRATCH_ROOT:-${TMPDIR:-/tmp}/blink-probe-$(id -un)}
 root=${root%/}
 
+# The root with each symlink in its parent resolved and each // folded, so
+# the $HOME test below compares paths, not spellings. Fails when the parent
+# is not a dir.
+canon_root() {
+    local parent
+    parent=$(cd -P -- "${root%/*}/" 2>/dev/null && pwd -P) || return 1
+    echo "${parent%/}/${root##*/}"
+}
+
 # Empty when the root is safe, else why not.
 root_problem() {
     case "$root" in
@@ -32,13 +41,16 @@ root_problem() {
     case "/$root/" in
         */../*|*/./*) echo "root '$root' holds . or .."; return ;;
     esac
-    [ -L "$root" ] && { echo "root '$root' is a symlink"; return; }
-    if [ -e "$root" ] && [ ! -d "$root" ]; then echo "root '$root' is not a dir"; return; fi
+    local r h
+    r=$(canon_root) || { echo "root '$root' has no parent dir"; return; }
+    [ -L "$r" ] && { echo "root '$root' is a symlink"; return; }
+    if [ -e "$r" ] && [ ! -d "$r" ]; then echo "root '$root' is not a dir"; return; fi
     # In a shared /tmp another user could make the root first.
-    if [ -e "$root" ] && [ ! -O "$root" ]; then echo "root '$root' is not yours"; return; fi
-    local h=${HOME%/}
-    case "$h/" in
-        "$root"/*) echo "root '$root' holds \$HOME"; return ;;
+    if [ -e "$r" ] && [ ! -O "$r" ]; then echo "root '$root' is not yours"; return; fi
+    # A $HOME that does not exist cannot be lost.
+    h=$(cd -P -- "${HOME:-/nonexistent}" 2>/dev/null && pwd -P) || return 0
+    case "${h%/}/" in
+        "$r"/*) echo "root '$root' holds \$HOME"; return ;;
     esac
 }
 
@@ -53,6 +65,7 @@ kib() {
     local u=${1^^}
     local n=${u%[KMGT]}
     case "$n" in ''|*[!0-9]*) return ;; esac
+    n=$((10#$n))
     case "$u" in
         *K) echo "$n" ;;
         *M) echo $((n * 1024)) ;;
@@ -72,12 +85,15 @@ human() {
 cmd=${1:-}
 case "$cmd" in
     new|clean)
-        why=$(root_problem)
+        # A check that fails without a reason must still refuse.
+        why=$(root_problem) || why="root check failed on '$root'"
         [ -z "$why" ] || die "refused: $why"
+        root=$(canon_root) || die "refused: root '$root' has no parent dir"
         ;;
     check)
-        why=$(root_problem)
+        why=$(root_problem) || why="root check failed on '$root'"
         [ -z "$why" ] || { echo "scratch.sh: warning: $why; not checked"; exit 0; }
+        root=$(canon_root) || exit 0
         ;;
     *) die "usage: scratch.sh new <name> | clean <name> | clean --all | check" ;;
 esac
@@ -106,7 +122,7 @@ case "$cmd" in
         limit_k=$(kib "$limit")
         [ -n "$limit_k" ] || { echo "scratch.sh: warning: BLINK_SCRATCH_WARN='$limit' is not a size; using 4G"; limit=4G; limit_k=$(kib 4G); }
         total=0
-        for d in "$root"/* "$root"/.[!.]*; do
+        for d in "$root"/* "$root"/.[!.]* "$root"/..?*; do
             [ -e "$d" ] || [ -L "$d" ] || continue
             k=$(du -sk -- "$d" 2>/dev/null | cut -f1)
             k=${k:-0}
