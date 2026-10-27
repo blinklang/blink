@@ -18,15 +18,79 @@ pub type ProcessResult {
     out: Str
     err_out: Str
     exit_code: Int
+    /// How the child ended (sections/04_effects.md §4.4.8).
+    end: ChildEnd
 }
 
-/// Common signal numbers (POSIX). Provided as constants since Blink has
-/// no `signal.h` import; values are stable across all Unix targets.
+/// How a child ended. A signal is `Signaled(n)`, never an exit code of 128 + n.
+@derive(Eq, Debug)
+pub type ChildEnd {
+    Exited(Int)
+    Signaled(Int)
+    Limit(LimitKind)
+}
+
+/// The limit that the runtime ended a child for.
+@derive(Eq, Debug)
+pub type LimitKind {
+    Timeout
+    Memory
+    Processes
+}
+
+// An end renders as `exit N`, `signal <name>` or `limit <kind>` (sections/04_effects.md
+// §4.4.8), so a log line reads the same on every host.
+impl Display for ChildEnd {
+    fn fmt(self, sb: StringBuilder) {
+        match self {
+            Exited(code) => sb.write("exit {code}")
+            Signaled(n) => sb.write("signal {signal_name(n)}")
+            Limit(kind) => {
+                let name = match kind {
+                    LimitKind.Timeout => "timeout"
+                    LimitKind.Memory => "memory"
+                    LimitKind.Processes => "processes"
+                }
+                sb.write("limit {name}")
+            }
+        }
+    }
+}
+
+// A method needs a trait (Blink has no inherent methods); this one carries the one
+// predicate the spec gives ProcessResult.
+pub trait ProcessResultOps {
+    /// True exactly when the child exited with code 0. Every signal and limit end is false.
+    fn success(self) -> Bool
+}
+
+impl ProcessResultOps for ProcessResult {
+    fn success(self) -> Bool {
+        self.end == ChildEnd.Exited(0)
+    }
+}
+
+/// Signal numbers, as constants because Blink has no `signal.h` import. These are the
+/// Linux numbers; match on the constants, never on a number or a name.
 pub let SIGHUP = 1
 pub let SIGINT = 2
 pub let SIGQUIT = 3
+pub let SIGABRT = 6
+pub let SIGBUS = 7
 pub let SIGKILL = 9
+pub let SIGSEGV = 11
 pub let SIGTERM = 15
+pub let SIGXCPU = 24
+
+@ffi("blink_process_signal_name")
+@trusted(audit: "Reads a static table of the host's signal names and returns an owned GC copy, or SIG<n> formatted into a local buffer. Pure lookup, no side effects, no memory shared back to C.")
+fn c_signal_name(n: Int) -> Str ! () {}
+
+/// The host's name for signal `n`, such as `"SIGSEGV"`, or `"SIG<n>"` for a number the
+/// host has no name for.
+pub fn signal_name(n: Int) -> Str {
+    c_signal_name(n)
+}
 
 /// Opaque handle to a spawned child process. Wraps a runtime-side slot
 /// index that tracks the OS pid plus stdout/stderr read pipes.

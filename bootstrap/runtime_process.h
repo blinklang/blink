@@ -7,11 +7,88 @@
 #include <poll.h>
 #endif
 
+/* LimitKind and ChildEnd as lib/std/process.bl declares them. They are runtime-owned
+ * (src/layout.bl), so codegen spells them as these names and skips its own typedefs; the
+ * shape, tag values and enumerator names here must match what it would emit. */
+#ifndef BLINK_TD_blink_LimitKind
+#define BLINK_TD_blink_LimitKind
+typedef enum { blink_LimitKind_Timeout, blink_LimitKind_Memory, blink_LimitKind_Processes } blink_LimitKind;
+#endif
+#ifndef BLINK_TD_blink_ChildEnd
+#define BLINK_TD_blink_ChildEnd
+typedef struct blink_ChildEnd {
+    int32_t tag;
+    union {
+        struct {
+            int64_t _0;
+        } Exited;
+        struct {
+            int64_t _0;
+        } Signaled;
+        struct {
+            blink_LimitKind _0;
+        } Limit;
+    } data;
+} blink_ChildEnd;
+#endif
+#ifndef blink_ChildEnd_Exited_TAG
+#define blink_ChildEnd_Exited_TAG 0
+#endif
+#ifndef blink_ChildEnd_Signaled_TAG
+#define blink_ChildEnd_Signaled_TAG 1
+#endif
+#ifndef blink_ChildEnd_Limit_TAG
+#define blink_ChildEnd_Limit_TAG 2
+#endif
+
 typedef struct {
     const char* out;
     const char* err_out;
     int64_t exit_code;
+    blink_ChildEnd end;
 } blink_ProcessResult;
+
+static inline blink_ChildEnd blink_child_end_exited(int64_t code) {
+    blink_ChildEnd e;
+    memset(&e, 0, sizeof(e));
+    e.tag = blink_ChildEnd_Exited_TAG;
+    e.data.Exited._0 = code;
+    return e;
+}
+
+static inline blink_ChildEnd blink_child_end_signaled(int64_t sig) {
+    blink_ChildEnd e;
+    memset(&e, 0, sizeof(e));
+    e.tag = blink_ChildEnd_Signaled_TAG;
+    e.data.Signaled._0 = sig;
+    return e;
+}
+
+/* The end of a result that names no child that ended: a spawn that failed, a wait that
+ * failed, or a handle whose result is gone. It mirrors exit_code -1 only until run and
+ * spawn return a Result; the spec makes each of these paths an Err, not an end. */
+static inline blink_ChildEnd blink_child_end_none(void) {
+    return blink_child_end_exited(-1);
+}
+
+/* exit_code and end from one wait status, so the two never disagree. */
+static inline void blink_process_result_set_status(blink_ProcessResult* r, int status) {
+    if (WIFEXITED(status)) {
+        r->exit_code = (int64_t)WEXITSTATUS(status);
+        r->end = blink_child_end_exited((int64_t)WEXITSTATUS(status));
+    } else if (WIFSIGNALED(status)) {
+        r->exit_code = 128 + (int64_t)WTERMSIG(status);
+        r->end = blink_child_end_signaled((int64_t)WTERMSIG(status));
+    } else {
+        r->exit_code = -1;
+        r->end = blink_child_end_none();
+    }
+}
+
+static inline blink_ProcessResult blink_process_result_none(const char* err_out) {
+    blink_ProcessResult r = { BLINK_STR_EMPTY, err_out, -1, blink_child_end_none() };
+    return r;
+}
 
 #ifdef BLINK_USE_EXTERN_RUNTIME_STORAGE
   #ifdef BLINK_RUNTIME_STORAGE_DEFINE
@@ -105,7 +182,7 @@ BLINK_RT_FN void blink_process_exec(const char* cmd, const blink_list* args) {
 BLINK_RT_FN blink_ProcessResult blink_process_run_with_stdin(const char* cmd, const blink_list* args, const char* stdin_data);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN blink_ProcessResult blink_process_run_with_stdin(const char* cmd, const blink_list* args, const char* stdin_data) {
-    blink_ProcessResult result = { BLINK_STR_EMPTY, BLINK_STR_EMPTY, -1 };
+    blink_ProcessResult result = blink_process_result_none(BLINK_STR_EMPTY);
     int stdin_pipe[2] = {-1, -1}, stdout_pipe[2] = {-1, -1}, stderr_pipe[2] = {-1, -1};
     if (pipe(stdin_pipe) < 0 || pipe(stdout_pipe) < 0 || pipe(stderr_pipe) < 0) {
         if (stdin_pipe[0] >= 0) { close(stdin_pipe[0]); close(stdin_pipe[1]); }
@@ -168,17 +245,14 @@ BLINK_RT_FN blink_ProcessResult blink_process_run_with_stdin(const char* cmd, co
     sa_int_new.sa_handler = blink_sigint_handler;
     sa_int_new.sa_flags = SA_RESTART;
     sigaction(SIGINT, &sa_int_new, &sa_int_old);
-    int status;
-    waitpid(pid, &status, 0);
+    int status = 0;
+    int wrc;
+    while ((wrc = waitpid(pid, &status, 0)) < 0) {
+        if (errno != EINTR) break;
+    }
     sigaction(SIGINT, &sa_int_old, NULL);
     blink_child_pid = 0;
-    if (WIFEXITED(status)) {
-        result.exit_code = (int64_t)WEXITSTATUS(status);
-    } else if (WIFSIGNALED(status)) {
-        result.exit_code = 128 + (int64_t)WTERMSIG(status);
-    } else {
-        result.exit_code = -1;
-    }
+    if (wrc >= 0) blink_process_result_set_status(&result, status);
     if (blink_got_sigint) {
         raise(SIGINT);
     }
@@ -298,6 +372,7 @@ static int64_t blink_pid_table_alloc(void) {
         slot->cached.out = BLINK_STR_EMPTY;
         slot->cached.err_out = BLINK_STR_EMPTY;
         slot->cached.exit_code = -1;
+        slot->cached.end = blink_child_end_none();
         slot->kept_bytes = 0;
         h = slot->gen * BLINK_PID_TABLE_CAP + i;
     }
@@ -383,8 +458,7 @@ BLINK_RT_FN blink_ProcessResult blink_process_pid_wait(int64_t handle) {
     int reaped = slot ? slot->reaped : 0;
     pthread_mutex_unlock(&blink_pid_table_mu);
     if (!slot) {
-        blink_ProcessResult r = { BLINK_STR_EMPTY, blink_str_from_cstr_gc("invalid pid handle"), -1 };
-        return r;
+        return blink_process_result_none(blink_str_from_cstr_gc("invalid pid handle"));
     }
     if (!reaped) {
         /* The slot cannot be reused until this wait frees it, so it is read without the lock.
@@ -395,22 +469,18 @@ BLINK_RT_FN blink_ProcessResult blink_process_pid_wait(int64_t handle) {
         blink_drain_two_fds(slot->out_fd, slot->err_fd, &out, &err);
         slot->out_fd = -1;
         slot->err_fd = -1;
-        int status = 0;
-        int64_t exit_code = -1;
+        blink_ProcessResult waited = blink_process_result_none(err);
+        waited.out = out;
         if (slot->pid > 0) {
-            while (waitpid(slot->pid, &status, 0) < 0) {
+            int status = 0;
+            int rc;
+            while ((rc = waitpid(slot->pid, &status, 0)) < 0) {
                 if (errno != EINTR) break;
             }
-            if (WIFEXITED(status)) {
-                exit_code = (int64_t)WEXITSTATUS(status);
-            } else if (WIFSIGNALED(status)) {
-                exit_code = 128 + (int64_t)WTERMSIG(status);
-            }
+            if (rc >= 0) blink_process_result_set_status(&waited, status);
         }
         pthread_mutex_lock(&blink_pid_table_mu);
-        slot->cached.out = out;
-        slot->cached.err_out = err;
-        slot->cached.exit_code = exit_code;
+        slot->cached = waited;
         slot->reaped = 1;
         pthread_mutex_unlock(&blink_pid_table_mu);
     }
@@ -421,8 +491,7 @@ BLINK_RT_FN blink_ProcessResult blink_process_pid_wait(int64_t handle) {
         /* Another wait on this handle freed the slot while this one drained, and a spawn
          * took it since. */
         pthread_mutex_unlock(&blink_pid_table_mu);
-        blink_ProcessResult r = { BLINK_STR_EMPTY, blink_str_from_cstr_gc("invalid pid handle"), -1 };
-        return r;
+        return blink_process_result_none(blink_str_from_cstr_gc("invalid pid handle"));
     }
     blink_ProcessResult result = slot->cached;
     if (!slot->free) {
@@ -528,6 +597,45 @@ BLINK_RT_FN void blink_process_install_signal_forwarding(void) {
     sigaction(SIGINT, &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
     blink_process_signal_installed = 1;
+}
+#endif
+
+/* The host's name for signal n, or "SIG<n>" when the host has none (a real-time signal
+ * included). A table and not a switch: some hosts give two names one number (SIGIOT is
+ * SIGABRT), and the first row wins. */
+BLINK_RT_FN const char* blink_process_signal_name(int64_t n);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN const char* blink_process_signal_name(int64_t n) {
+    static const struct { int num; const char* name; } names[] = {
+        { SIGHUP, "SIGHUP" }, { SIGINT, "SIGINT" }, { SIGQUIT, "SIGQUIT" },
+        { SIGILL, "SIGILL" }, { SIGTRAP, "SIGTRAP" }, { SIGABRT, "SIGABRT" },
+        { SIGBUS, "SIGBUS" }, { SIGFPE, "SIGFPE" }, { SIGKILL, "SIGKILL" },
+        { SIGUSR1, "SIGUSR1" }, { SIGSEGV, "SIGSEGV" }, { SIGUSR2, "SIGUSR2" },
+        { SIGPIPE, "SIGPIPE" }, { SIGALRM, "SIGALRM" }, { SIGTERM, "SIGTERM" },
+        { SIGCHLD, "SIGCHLD" }, { SIGCONT, "SIGCONT" }, { SIGSTOP, "SIGSTOP" },
+        { SIGTSTP, "SIGTSTP" }, { SIGTTIN, "SIGTTIN" }, { SIGTTOU, "SIGTTOU" },
+        { SIGURG, "SIGURG" }, { SIGXCPU, "SIGXCPU" }, { SIGXFSZ, "SIGXFSZ" },
+        { SIGVTALRM, "SIGVTALRM" }, { SIGPROF, "SIGPROF" }, { SIGWINCH, "SIGWINCH" },
+        { SIGIO, "SIGIO" }, { SIGSYS, "SIGSYS" },
+#ifdef SIGSTKFLT
+        { SIGSTKFLT, "SIGSTKFLT" },
+#endif
+#ifdef SIGPWR
+        { SIGPWR, "SIGPWR" },
+#endif
+#ifdef SIGEMT
+        { SIGEMT, "SIGEMT" },
+#endif
+#ifdef SIGINFO
+        { SIGINFO, "SIGINFO" },
+#endif
+    };
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+        if ((int64_t)names[i].num == n) return blink_str_from_cstr_gc(names[i].name);
+    }
+    char buf[32];
+    snprintf(buf, sizeof(buf), "SIG%lld", (long long)n);
+    return blink_str_from_cstr_gc(buf);
 }
 #endif
 
