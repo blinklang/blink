@@ -70,8 +70,12 @@ rm -f "$P/uname" "$P/ps"
 printf '#!/bin/sh\necho Darwin\n' > "$P/uname"
 printf '#!/bin/sh\n[ "$*" = "-ax -o uid=" ] || exit 1\nu=$(id -u)\nprintf "%%s\\n" "$u" 0 "$u" 0 "$u"\n' > "$P/ps"
 chmod +x "$P/uname" "$P/ps"
-out=$(run PATH="$P" BLINK_GATE_TASKS_MAX=100000 "$CAPPED" bash -c 'echo "$(ulimit -u) $(ulimit -v)"' 2> "$WORK/err")
-if [ "$out" = "100003 unlimited" ] && [ "$(notices)" = 1 ]; then
+# The cap lands on the hard nproc limit: ulimit -u cannot go above it, and on
+# Linux the real processes of this user count against a lower one.
+hard=$(ulimit -Hu)
+[ "$hard" = unlimited ] && hard=100003
+out=$(run PATH="$P" BLINK_GATE_TASKS_MAX=$((hard - 3)) "$CAPPED" bash -c 'echo "$(ulimit -u) $(ulimit -v)"' 2> "$WORK/err")
+if [ "$out" = "$hard unlimited" ] && [ "$(notices)" = 1 ]; then
     pass "Darwin: the process cap counts this user's processes, and no address space cap"
 else
     flunk "Darwin (out=[$out]: $(cat "$WORK/err"))"
@@ -104,19 +108,22 @@ fi
 # The capped re-run gets the vars set on the command line, and only those, and
 # its body sees them. dispatch prints the dispatcher's command; body runs that
 # command with --dry, through capped.sh's opt-out path, and prints the body's
-# `blink test` line.
+# `blink test` line, which holds BUILD_DIR and JOBS.
 dispatch() {
     env -u BLINK_GATE_SCOPE -u BLINK_GATE_CAP task --dry --verbose "$@" 2>&1 |
         grep -o 'scripts/capped.sh --name .*'
 }
 body() {
     (unset BLINK_GATE_SCOPE; export BLINK_GATE_CAP=0; eval "$1 --dry") 2>&1 |
-        grep -o 'blink test tests/ --parallel .*'
+        grep -o '[^ ]*blink test tests/ --parallel .*'
 }
-line=$(dispatch test JOBS=3 BUILD_DIR=build FMT_SEMANTIC=0)
-plain=$(dispatch test)
+# A value equal to its default is not passed on, so JOBS must differ from it.
+default_jobs=$(./scripts/default_jobs.sh)
+jobs=$((default_jobs + 1))
+line=$(dispatch test JOBS="$jobs" BUILD_DIR=bd BLINKC='/a b/x' VERSION=1.2 FMT_SEMANTIC=0 CORPUS_LINT=0 CORPUS_PM_SLICE=s)
+plain=$(dispatch test BUILD_DIR=build JOBS="$default_jobs")
 case "$line" in
-    *" test --verbose JOBS=3 FMT_SEMANTIC=0") forwarded=1 ;;
+    *" test --verbose BUILD_DIR=bd BLINKC='/a b/x' JOBS=$jobs VERSION=1.2 FMT_SEMANTIC=0 CORPUS_LINT=0 CORPUS_PM_SLICE=s") forwarded=1 ;;
     *) forwarded=0 ;;
 esac
 case "$plain" in
@@ -125,8 +132,8 @@ case "$plain" in
 esac
 got=$(body "$line")
 got_plain=$(body "$plain")
-want_plain="blink test tests/ --parallel $(./scripts/default_jobs.sh)"
-if [ "$forwarded" = 1 ] && [ "$bare" = 1 ] && [ "$got" = "blink test tests/ --parallel 3" ] && [ "$got_plain" = "$want_plain" ]; then
+if [ "$forwarded" = 1 ] && [ "$bare" = 1 ] && [ "$got" = "bd/blink test tests/ --parallel $jobs" ] &&
+    [ "$got_plain" = "build/blink test tests/ --parallel $default_jobs" ]; then
     pass "a dispatcher forwards the vars set on the command line, and no others, to its body"
 else
     flunk "dispatcher vars (with vars: [$line] -> [$got], without: [$plain] -> [$got_plain])"
@@ -187,20 +194,33 @@ case "$out" in
     *) flunk "--name (cgroup [$out])" ;;
 esac
 
-caps=$(run BLINK_GATE_MEMORY_MAX=64M BLINK_GATE_TASKS_MAX=64 "$CAPPED" bash -c 'd=/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup); echo "$(cat "$d/memory.max") $(cat "$d/memory.swap.max") $(cat "$d/pids.max")"')
-if [ "$caps" = "67108864 2147483648 64" ]; then
-    pass "the scope carries the memory, swap (2G by default) and task caps"
-else
-    flunk "scope caps (got [$caps])"
-fi
+# A kernel with no swap accounting (swapaccount=0) has no memory.swap.max.
+caps=$(run BLINK_GATE_MEMORY_MAX=64M BLINK_GATE_TASKS_MAX=64 "$CAPPED" bash -c 'd=/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup); echo "$(cat "$d/memory.max") $(cat "$d/pids.max") $(cat "$d/memory.swap.max" 2>/dev/null || echo none)"')
+case "$caps" in
+    "67108864 64 2147483648")
+        swap_files=1
+        pass "the scope carries the memory, swap (2G by default) and task caps"
+        ;;
+    "67108864 64 none")
+        swap_files=0
+        pass "the scope carries the memory and task caps"
+        echo "SKIP: no swap accounting in this kernel; the swap cases did not run"
+        ;;
+    *)
+        swap_files=0
+        flunk "scope caps (got [$caps])"
+        ;;
+esac
 
-swap='cat /sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup)/memory.swap.max'
-out=$(run BLINK_GATE_SWAP_MAX=32M "$CAPPED" bash -c "$swap")
-out_inf=$(run BLINK_GATE_SWAP_MAX=infinity "$CAPPED" bash -c "$swap")
-if [ "$out" = 33554432 ] && [ "$out_inf" = max ]; then
-    pass "BLINK_GATE_SWAP_MAX sets the swap cap, and infinity lifts it"
-else
-    flunk "swap override (32M: [$out], infinity: [$out_inf])"
+if [ "$swap_files" = 1 ]; then
+    swap='cat /sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup)/memory.swap.max'
+    out=$(run BLINK_GATE_SWAP_MAX=32M "$CAPPED" bash -c "$swap")
+    out_inf=$(run BLINK_GATE_SWAP_MAX=infinity "$CAPPED" bash -c "$swap")
+    if [ "$out" = 33554432 ] && [ "$out_inf" = max ]; then
+        pass "BLINK_GATE_SWAP_MAX sets the swap cap, and infinity lifts it"
+    else
+        flunk "swap override (32M: [$out], infinity: [$out_inf])"
+    fi
 fi
 
 out=$(run "$CAPPED" bash -c 'x="a b"; echo "$x ${#x}"')
