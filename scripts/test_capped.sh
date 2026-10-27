@@ -18,7 +18,8 @@ fail=0
 
 pass() { echo "PASS: $1"; }
 flunk() { echo "FAIL: $1"; fail=1; }
-notices() { grep -c '^capped.sh: ' "$WORK/err"; }
+# The notice about each child's caps is test_capped_child.sh's to check.
+notices() { grep '^capped.sh: ' "$WORK/err" | grep -vc '^capped.sh: each child'; }
 
 # This test runs inside a gate that capped.sh already capped; each case starts
 # as a fresh top-level run.
@@ -177,7 +178,7 @@ first=$(echo "$out" | head -1)
 second=$(echo "$out" | sed -n 2p)
 cg=${first%% *}
 case "$cg" in
-    */blink-gate-*.scope) in_scope=1 ;;
+    */blink-gate-*.scope/gate) in_scope=1 ;;
     *) in_scope=0 ;;
 esac
 # A slice with no unit adds that notice; nothing else may print.
@@ -190,12 +191,13 @@ fi
 
 out=$(run "$CAPPED" --name selftest-probe cut -d: -f3 /proc/self/cgroup)
 case "$out" in
-    */blink-gate-selftest-probe-*.scope) pass "--name names the scope" ;;
+    */blink-gate-selftest-probe-*.scope/gate) pass "--name names the scope" ;;
     *) flunk "--name (cgroup [$out])" ;;
 esac
 
 # A kernel with no swap accounting (swapaccount=0) has no memory.swap.max.
-caps=$(run BLINK_GATE_MEMORY_MAX=64M BLINK_GATE_TASKS_MAX=64 "$CAPPED" bash -c 'd=/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup); echo "$(cat "$d/memory.max") $(cat "$d/pids.max") $(cat "$d/memory.swap.max" 2>/dev/null || echo none)"')
+# The run's own processes sit in the scope's leaf gate/, so the caps are one up.
+caps=$(run BLINK_GATE_MEMORY_MAX=64M BLINK_GATE_TASKS_MAX=64 "$CAPPED" bash -c 'd=/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup); d=${d%/gate}; echo "$(cat "$d/memory.max") $(cat "$d/pids.max") $(cat "$d/memory.swap.max" 2>/dev/null || echo none)"')
 case "$caps" in
     "67108864 64 2147483648")
         swap_files=1
@@ -213,7 +215,7 @@ case "$caps" in
 esac
 
 if [ "$swap_files" = 1 ]; then
-    swap='cat /sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup)/memory.swap.max'
+    swap='d=/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup); cat "${d%/gate}/memory.swap.max"'
     out=$(run BLINK_GATE_SWAP_MAX=32M "$CAPPED" bash -c "$swap")
     out_inf=$(run BLINK_GATE_SWAP_MAX=infinity "$CAPPED" bash -c "$swap")
     if [ "$out" = 33554432 ] && [ "$out_inf" = max ]; then
@@ -244,7 +246,7 @@ out=$(run BLINK_GATE_SLICE=blink-gates-selftest-no-unit.slice "$CAPPED" cut -d: 
 notices=$(notices)
 case "$out" in
     *blink-gates-selftest-no-unit.slice*) where=slice ;;
-    */blink-gate-*.scope) where=scope ;;
+    */blink-gate-*.scope/gate) where=scope ;;
     *) where=none ;;
 esac
 if [ "$where" = scope ] && [ "$notices" = 1 ]; then
@@ -258,7 +260,7 @@ out=$(run BLINK_GATE_SLICE=default.target "$CAPPED" cut -d: -f3 /proc/self/cgrou
 rc=$?
 notices=$(notices)
 case "$out" in
-    */blink-gate-*.scope) where=scope ;;
+    */blink-gate-*.scope/gate) where=scope ;;
     *) where=none ;;
 esac
 if [ "$rc" = 0 ] && [ "$where" = scope ] && [ "$notices" = 1 ]; then
