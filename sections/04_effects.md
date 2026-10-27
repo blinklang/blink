@@ -202,7 +202,9 @@ error[UnknownEffect]: unknown effect `FFI`
   |                        ^^^ no effect named `FFI`
   |
   = help: a foreign call is not an effect of its own; declare the effects the
-          foreign code has (`IO`, `Net`, ...), or `! ()` if it has none (§9.1)
+          foreign code has (`IO`, `FS`, `Net`, ...); `State` if it changes
+          process-wide C state no argument reaches (the fd table, errno, a C
+          global); or `! ()` if it has none (§9.1)
 ```
 
 No fix is machine-applicable: an effect row on an `@ffi` decl is a claim about foreign code, and no tool writes that claim for the author.
@@ -1343,6 +1345,8 @@ The second sentence is why `accept` and `unix_connect` return different types. A
 | `UnixConn` | `UnixListener.accept` | `read_line`, `write`, `close` | `Net.Listen` |
 | `UnixStream` | `unix_connect` | `read_line`, `write`, `close` | `Net.Connect` |
 
+The `close` rows follow one rule for every fd: an op on an existing fd takes the row of the call that made it (§9.1 *fd-Table and Process-Control Calls — Which Row*). A raw `close` on a file fd takes `FS.Read` or `FS.Write`, not `! ()`.
+
 When a `UnixConn` is given where a `UnixStream` is expected, or the other way, the type-mismatch error names the other type and the function that makes it:
 
 ```
@@ -1505,7 +1509,7 @@ error[TypeError]: mismatched types
 
 #### 4.4.8 Process Operations
 
-The `process` handle is in scope when a function declares `! Process` or one of its sub-effects. `Process.Spawn` runs other programs, waits for them, and replaces this program with another one. `Process.Signal` sends signals to child processes.
+The `process` handle is in scope when a function declares `! Process` or one of its sub-effects. `Process.Spawn` runs other programs, waits for them, and replaces this program with another one. It also covers the set-up of the process tree, such as `setpgid` (§9.1 *fd-Table and Process-Control Calls — Which Row*). `Process.Signal` sends signals to child processes.
 
 `ChildEnv` says which environment variables a child gets. It describes the child's environment only. The type lives in `std.process`:
 
@@ -4299,6 +4303,8 @@ pub fn next_id() -> Int ! State {    // public: `State` is declared
 - **No run-time cost.** `State` changes no generated code (§4.16.9).
 
 **Foreign state.** `State` also covers state that foreign code holds: a C global, a thread-local or a process-wide buffer. The state must be one that no argument of the call reaches and that a later call can see. `State` is the fallback row for such state. When a built-in effect names the resource, the decl uses that effect: the current arena is `Arena` (§5.2), a file is `FS.*` and a socket is `Net.*`. The `@ffi` author writes the row, and the compiler trusts it (§4.5 *Proven and assumed rows*; §9.1 *Hidden C State — Which Row*). E0552 applies to the caller as for any other `State`: a `pub fn` whose body calls a `! State` binding declares `State`.
+
+The fd table is an example. A `pipe`, `memfd_create` or `socketpair` call makes an fd that no built-in effect names, and a later `open` sees the fd number that it took. Those calls take `! State` (§9.1 *fd-Table and Process-Control Calls — Which Row*).
 
 ```blink
 @ffi("lib_last_size") fn lib_last_size() -> Int ! State {}

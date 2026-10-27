@@ -88,7 +88,7 @@ Omitting the row on an `@ffi` function is a compile error (`FfiNoEffects`, E0802
 fn c_strlen(s: Ptr[U8]) -> Int ! ()
 ```
 
-`! ()` means "no effects". It is not a return type. It is legal only on an `@ffi` decl; everywhere else an omitted row already means pure, and `! ()` is an error (§4.2, `EmptyRowOutsideFfi`). `! ()` also claims that the call reads no hidden state (§9.1 *What `! ()` Claims on an `@ffi` Decl*). The E0802 help names both choices and states this claim. Neither choice is machine-applicable, because the row is a claim about foreign code:
+`! ()` means "no effects". It is not a return type. It is legal only on an `@ffi` decl; everywhere else an omitted row already means pure, and `! ()` is an error (§4.2, `EmptyRowOutsideFfi`). `! ()` also claims that the call reads no hidden state (§9.1 *What `! ()` Claims on an `@ffi` Decl*). The E0802 help names the choices, `State` among them, and states this claim. Neither choice is machine-applicable, because the row is a claim about foreign code:
 
 ```
 error[FfiNoEffects]: foreign function `c_strlen` has no effect row
@@ -97,8 +97,10 @@ error[FfiNoEffects]: foreign function `c_strlen` has no effect row
 3 | fn c_strlen(s: Ptr[U8]) -> Int
   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
   |
-  = help: write the effects the foreign code has after the return type
-          (`-> Int ! IO`), or `! ()` (the empty effect row) if it has none.
+  = help: write the effects the foreign code has (`IO`, `FS`, `Net`, ...)
+          after the return type (`-> Int ! IO`); `State` if it changes
+          process-wide C state no argument reaches (the fd table, errno, a
+          C global); or `! ()` (the empty effect row) if it has none.
           `! ()` also claims no hidden state between calls
 ```
 
@@ -212,6 +214,96 @@ A binding in the standard library may carry the row of its producer as an interi
 ```
 
 This is guidance. The compiler cannot check a foreign body, so it cannot reject another row. A row that names the producer tells a reader that the call needs a capability that it does not use. It is also false when a second call fills the same state.
+
+#### fd-Table and Process-Control Calls — Which Row
+
+An `I32` file descriptor is an index into a table that the process holds. No argument reaches the object that the index names. So a call such as `close`, `dup2` or `flock` is never `! ()` (§9.1 *What `! ()` Claims on an `@ffi` Decl*). The row of the call comes from the call or calls that made the fd. This is the rule that sockets already follow, where `close` takes the row of the socket (§4.4.6). It now holds for every fd.
+
+1. **An op on an existing fd takes the row of the call that made the fd.** An fd from `open` on a path for reading is `FS.Read`. An fd from a call that opens for writing is `FS.Read, FS.Write` or `FS.Write`, as that decl states. A socket fd is `Net.*`. The fds 0, 1 and 2 count as made by `IO.Read`, `IO.Print` and `IO.Log`.
+2. **A decl whose audit lists several makers takes the union of their rows.** The author may also split the decl, one decl per fd kind. Splitting is better: each caller then holds only the row of the fd that it passes.
+3. **`pipe`, `memfd_create` and `socketpair` are `! State`, not `! ()`.** They take no path and no address, so no built-in effect names what they make. A later `open` sees the fd numbers that they take.
+4. **A built-in effect that names the resource of the fd replaces `State`.** `State` appears only where the fd came from `pipe`, `memfd_create` or `socketpair`.
+5. **No new effect and no new leaf.** A caller that lacks a row gets the missing-effect error (`UndeclaredEffect`, E0500). A `pub fn` whose body calls a `! State` binding declares `State` (`UndeclaredModuleState`, E0552, §4.16.1).
+
+```blink
+@ffi("pipe", header: "unistd.h")
+fn bfs_pipe(fds: Ptr[I32]) -> I32 ! State {}
+
+@ffi("close", header: "unistd.h")       // fds from open_read, open_write and bfs_pipe
+fn bfs_close(fd: I32) -> I32 ! FS.Read, FS.Write, State {}
+
+@ffi("close", header: "unistd.h")       // fds from open on a path for reading
+fn sha256_close(fd: I32) -> I32 ! FS.Read {}
+
+fn release(fd: I32) -> I32 ! FS.Read {
+    bfs_close(fd)    // E0500: `release` does not declare `FS.Write`, and not `State`
+}
+
+fn release_read(fd: I32) -> I32 ! FS.Read {
+    sha256_close(fd)    // ok
+}
+```
+
+`close` has an effect on the thing that the fd names. The close of the last write end of a pipe gives the reader end of file. The close of an fd that holds a `flock` lock releases the lock. The close of a write fd can report a write error that was deferred. So `close` carries the row of the fd, as in the examples above, and never `! ()`.
+
+**One decl per fd kind.** A decl that takes fds of many kinds needs a wide row, and every caller of it holds that wide row. Write one decl per kind. Both `bfs_close` and `sha256_close` above bind the C symbol `close`; the symbol may have many decls with different rows. The wide row is correct, only larger.
+
+**`dup2` takes the union of the makers of both fds.** After `dup2(logfd, 1)`, every later print writes to the log file. The function that sets this up must therefore hold the write row of the file, and not only the row of the stream.
+
+```blink
+@ffi("dup2", header: "unistd.h")        // from: open_write fds; to: 1 or 2
+fn bfs_dup2(from: I32, to: I32) -> I32 ! FS.Read, FS.Write, IO.Print, IO.Log {}
+
+@ffi("dup2", header: "unistd.h")        // old_fd: open or dup fds; new_fd: 1 or 2
+fn daemon_dup2(old_fd: I32, new_fd: I32) -> I32 ! FS.Read, FS.Write, IO.Print, IO.Log {}
+
+@ffi("dup2", header: "unistd.h")        // a memfd onto fd 0
+fn t_dup2(from: I32, to: I32) -> I32 ! State, IO.Read {}
+```
+
+The same row holds for a `bfs_dup2` call in a forked child before `exec`. The `FS` rows come from the maker of the source fd, which is the `open_write` call. They do not mean that `dup2` writes files. The `IO` rows come from the fds 0, 1 and 2, which the call can replace. The caller that opened the source fd already holds the `FS` rows, so the union adds no capability to it.
+
+**`dup` and `fcntl` take the row of the maker of the fd.** `dup` makes a second handle to the same object, and a write through it is a write to that object.
+
+```blink
+@ffi("dup", header: "unistd.h")         // fd is 1 or 2
+fn daemon_dup(fd: I32) -> I32 ! IO.Print, IO.Log {}
+
+@ffi("fcntl", header: "fcntl.h")        // F_SETFD on fds from bfs_pipe or open_read
+fn bfs_fcntl(fd: I32, cmd: I32, arg: I32) -> I32 ! FS.Read, State {}
+```
+
+A `cmd` that has an effect of its own adds that leaf to the row. `F_SETLK` sets a lock that other processes see, so it adds `FS.Write` in the way that `flock` does. A decl for `fcntl` with "any cmd" takes the union for all the cmds that its audit lists. Write one decl per cmd to keep the row small.
+
+**`flock` takes the row of the maker of the fd, and `FS.Write`.** Other processes see the lock, so the call writes shared file state, even when the fd was opened for reading.
+
+```blink
+@ffi("flock", header: "sys/file.h")     // fds from open_read
+fn bfs_flock(fd: I32, op: I32) -> I32 ! FS.Read, FS.Write {}
+
+pub fn take_lock(fd: I32) -> I32 ! FS.Read {
+    bfs_flock(fd, 2)    // E0500: `take_lock` does not declare `FS.Write`
+}
+```
+
+**`lseek` takes the row of the maker of the fd, not a row by name.** A path fd gives `FS.Read`, and a memfd gives `State`.
+
+```blink
+@ffi("lseek", header: "unistd.h")       // fds from open on a path for reading
+fn bfs_lseek(fd: I32, offset: Int, whence: I32) -> Int ! FS.Read {}
+
+@ffi("lseek", header: "unistd.h")       // fds from memfd_create
+fn t_lseek(fd: I32, offset: Int, whence: I32) -> Int ! State {}
+```
+
+**`setpgid` takes `Process.Spawn`.** It arranges the process tree. It sends no signal, so it does not take `Process.Signal` (§4.4.8). The later `kill` of the group pays `Process.Signal`. `Process.Spawn` covers the set-up of the process tree, and this includes a call that sets the group of the calling process, `setpgid(0, 0)`. The rule names `setpgid` only. It does not move other calls, such as `setsid`, to `Process.Spawn`.
+
+```blink
+@ffi("setpgid", header: "unistd.h")
+fn daemon_setpgid(pid: I32, pgid: I32) -> I32 ! Process.Spawn {}
+```
+
+The `State` row in these decls follows the rule of *Hidden C State — Which Row*: it is the fallback, and it appears only for fds that no built-in effect names. Do not add `State` to a decl out of habit. The compiler cannot check the audit text that lists the makers, so the row is a claim of the author, like every other `@ffi` row (§4.5, *Proven and assumed rows*).
 
 #### Handle Operations and `mut` on an `@ffi` Param
 
