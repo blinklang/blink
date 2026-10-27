@@ -431,7 +431,7 @@ The `IO.Read` operations take and return other types (§4.4.9). The wrapper sele
 | `Time` / `Time.*` | `time` | `time.read() -> Instant` (wall clock), `time.monotonic() -> Monotonic`, `time.sleep(Duration)` (§3.2.3) |
 | `Rand` | `rand` | `rand.int(Range[Int])`, `rand.float()`, `rand.bytes(Int)` (§4.4.7) |
 | `Crypto` / `Crypto.*` | `crypto` | `crypto.hash(...)`, `crypto.sign(...)`, `crypto.encrypt(...)`, `crypto.decrypt(...)`; a plain SHA-256 digest is the pure `Sha256.of` in `std.digest` and needs no effect |
-| `Process` / `Process.*` | `process` | `process.run(...)`, `process.spawn(...)`, `process.wait(...)`, `process.signal(...)`, `process.exec(...)` (§4.4.8) |
+| `Process` / `Process.*` | `process` | `process.run(...)`, `process.spawn(...)`, `process.wait(...)`, `process.signal(...)`, `process.exec(...)`, `process.can_limit(...)` (§4.4.8) |
 | `Async` | `async` | `async.spawn(...)`, `async.scope(...)` (§4.13) |
 
 The handle is always the lowercase form of the top-level effect name. Sub-effects do not create separate handles -- they control which *methods* on the handle are available. Declaring `! FS.Read` gives you the `fs` handle, but only `fs.read(...)`, `fs.list_dir(...)` and `fs.stat(...)` compile. Calling `fs.write(...)` with only `FS.Read` declared is a compile error:
@@ -1518,7 +1518,7 @@ error[TypeError]: mismatched types
 
 #### 4.4.8 Process Operations
 
-The `process` handle is in scope when a function declares `! Process` or one of its sub-effects. `Process.Spawn` runs other programs, waits for them, and replaces this program with another one. It also covers the set-up of the process tree, such as `setpgid` (§9.1 *fd-Table and Process-Control Calls — Which Row*). `Process.Signal` sends signals to child processes.
+The `process` handle is in scope when a function declares `! Process` or one of its sub-effects. `Process.Spawn` runs other programs, waits for them, and replaces this program with another one. It also covers the set-up of the process tree, such as `setpgid` (§9.1 *fd-Table and Process-Control Calls — Which Row*), and the limits on a child (*Child limits* below). `Process.Signal` sends signals to child processes.
 
 `ChildEnv` says which environment variables a child gets. It describes the child's environment only. The type lives in `std.process`:
 
@@ -1535,10 +1535,10 @@ pub type ChildEnv {
 effect Process {
     effect Spawn {
         /// Run cmd with args, wait for it to exit, and return what it wrote.
-        fn run(cmd: Str, args: List[Str], *, stdin: Str? = None, env: ChildEnv = ChildEnv.Inherit, cwd: Str? = None) -> Result[ProcessResult, ProcessError]
+        fn run(cmd: Str, args: List[Str], *, stdin: Str? = None, env: ChildEnv = ChildEnv.Inherit, cwd: Str? = None, limits: ChildLimits = ChildLimits {}) -> Result[ProcessResult, ProcessError]
 
         /// Start cmd with args and return at once.
-        fn spawn(cmd: Str, args: List[Str], *, env: ChildEnv = ChildEnv.Inherit, cwd: Str? = None) -> Result[Child, ProcessError]
+        fn spawn(cmd: Str, args: List[Str], *, env: ChildEnv = ChildEnv.Inherit, cwd: Str? = None, limits: ChildLimits = ChildLimits {}) -> Result[Child, ProcessError]
 
         /// Wait for a child that spawn started to exit, and return what it wrote.
         fn wait(child: Child) -> Result[ProcessResult, ProcessError]
@@ -1546,6 +1546,9 @@ effect Process {
         /// Replace this program with cmd. Returns only if cmd cannot start.
         /// A call also needs Env.Exit (see below).
         fn exec(cmd: Str, args: List[Str], *, env: ChildEnv = ChildEnv.Inherit, cwd: Str? = None) -> Result[Never, ProcessError]
+
+        /// Whether run and spawn can apply this limit on this host. Advice only.
+        fn can_limit(which: LimitKind) -> Bool
     }
 
     effect Signal {
@@ -1557,11 +1560,13 @@ effect Process {
 
 | Operation | Signature | Effect |
 |---|---|---|
-| `process.run` | `process.run(cmd: Str, args: List[Str], *, stdin: Str? = None, env: ChildEnv = ChildEnv.Inherit, cwd: Str? = None) -> Result[ProcessResult, ProcessError]` | `Process.Spawn` |
-| `process.spawn` | `process.spawn(cmd: Str, args: List[Str], *, env: ChildEnv = ChildEnv.Inherit, cwd: Str? = None) -> Result[Child, ProcessError]` | `Process.Spawn` |
+| `process.run` | `process.run(cmd: Str, args: List[Str], *, stdin: Str? = None, env: ChildEnv = ChildEnv.Inherit, cwd: Str? = None, limits: ChildLimits = ChildLimits {}) -> Result[ProcessResult, ProcessError]` | `Process.Spawn` |
+| `process.spawn` | `process.spawn(cmd: Str, args: List[Str], *, env: ChildEnv = ChildEnv.Inherit, cwd: Str? = None, limits: ChildLimits = ChildLimits {}) -> Result[Child, ProcessError]` | `Process.Spawn` |
 | `process.wait` | `process.wait(child: Child) -> Result[ProcessResult, ProcessError]` | `Process.Spawn` |
 | `process.exec` | `process.exec(cmd: Str, args: List[Str], *, env: ChildEnv = ChildEnv.Inherit, cwd: Str? = None) -> Result[Never, ProcessError]` | `Process.Spawn`, `Env.Exit` |
+| `process.can_limit` | `process.can_limit(which: LimitKind) -> Bool` | `Process.Spawn` |
 | `process.signal` | `process.signal(child: Child, sig: Int) -> Result[(), ProcessError]` | `Process.Signal` |
+| `signal_name` | `signal_name(n: Int) -> Str` | none (a function of `std.process`, not an op) |
 
 **`cmd` is a program, not a command line.** `process.run("git", ["status", "--short"])` runs `git` with two arguments. No shell reads the arguments, so a space or a `$` in an argument is not special. Blink has no shell op. To run a shell command line, run the shell:
 
@@ -1580,7 +1585,28 @@ The shell reads `dir` here, so a `dir` from user input can inject commands. Pref
 pub type ProcessResult {
     out: Str          // everything the child wrote to standard output
     err_out: Str      // everything the child wrote to standard error
-    exit_code: Int
+    end: ChildEnd     // how the child ended
+}
+
+@derive(Eq, Debug)
+pub type ChildEnd {
+    Exited(Int)           // the child called exit with this code
+    Signaled(Int)         // a signal ended the child, and the runtime did not send it for a limit
+    Limit(LimitKind)      // the runtime ended the child for this limit
+}
+
+@derive(Eq, Debug)
+pub type LimitKind {
+    Timeout
+    Memory
+    Processes
+}
+
+pub type ChildLimits {
+    timeout: Duration? = None
+    grace: Duration = Duration.seconds(2)
+    memory: Int? = None
+    processes: Int? = None
 }
 
 pub type ProcessOp {
@@ -1600,18 +1626,64 @@ pub type ProcessError {
 pub opaque type Child
 ```
 
-`process.run` and `process.wait` return `Ok` when the child ran to the end, whatever its exit code. `Err` means that the operation itself failed: the program was not found or could not start, the wait failed, or the signal could not be sent. `ProcessError` has the shape of `FsError` (§4.4.5): the operation, the command, and the `Errno`. Its `Display` follows the same convention, `op cmd: message`, for example `run gti: No such file or directory`.
+`process.run` and `process.wait` return `Ok` when the child ran to the end, whatever its exit code, and when a limit ended it (*Child limits*). `Err` means that the operation itself failed: the program was not found or could not start, a limit could not be applied, the wait failed, or the signal could not be sent. `ProcessError` has the shape of `FsError` (§4.4.5): the operation, the command, and the `Errno`. Its `Display` follows the same convention, `op cmd: message`, for example `run gti: No such file or directory`.
+
+**How the child ended.** `ProcessResult` has no exit-code field. It has `end`, and `end` holds exactly one of three facts:
+
+- `Exited(c)`: the child called `exit` (or returned from `main`) with code `c`. `exit(137)` is `Exited(137)`.
+- `Signaled(n)`: a signal `n` that the runtime did not send for a limit ended the child. A child that a user sent SIGKILL to is `Signaled(9)`. It is never `Exited(137)`.
+- `Limit(k)`: the runtime ended the child because it reached limit `k`. The runtime knows which limit it was: it is the runtime's own timer, or the memory or process events of the child's cgroup. The runtime never guesses the limit from a signal number.
+
+A `ChildEnd` has a `Display` that reads well in a log line: `exit 2`, `signal SIGSEGV`, `limit timeout`, `limit memory`, `limit processes`. The signal text comes from `signal_name` (*Signal names*). The type has no non-exhaustive marker. When a later version adds a kind of limit, every exhaustive `match` on `LimitKind` or `ChildEnd` becomes a compile error, so each caller decides what the new case means.
+
+```blink
+fn report(r: ProcessResult) ! IO.Print {
+    io.println("child ended: {r.end}")
+}
+// prints, for example: child ended: exit 2
+//                      child ended: signal SIGSEGV
+//                      child ended: limit timeout
+```
+
+`ProcessResult` has one method, `success() -> Bool`. It is `true` exactly when `r.end == ChildEnd.Exited(0)`. It is `false` for every `Signaled` end and every `Limit` end. This holds for a child that caught SIGTERM at its deadline and exited 0 during the grace period: the end is `Limit(Timeout)`, so `success()` is `false`. There is no `code()` method. A method that returned `Int?` would let `r.code().unwrap_or(0) == 0` compile and read a killed child as a success. To use the code of the child, match on `end`.
 
 ```blink
 import std.process.{ProcessError}
 
 fn build(target: Str) -> Result[Bool, ProcessError] ! Process.Spawn, IO.Print {
     let r = process.run("make", [target])?
-    if r.exit_code != 0 {
+    if !r.success() {
+        io.println("make {target}: {r.end}")
         io.println(r.err_out)
     }
-    Ok(r.exit_code == 0)
+    Ok(r.success())
 }
+```
+
+**Pass the code of a child through.** A wrapper that must exit with the code of its child matches on `end`. `Exited(c)` passes `c` through. A signal or a limit has no code, so the wrapper picks one. A program does not add 128 and the signal number by hand.
+
+```blink
+fn wrap(cmd: Str, args: List[Str]) ! Process.Spawn, Env.Exit, IO.Log {
+    let code = match process.run(cmd, args) {
+        Ok(r) => match r.end {
+            Exited(c) => c
+            Signaled(_) => 1
+            Limit(_) => 124
+        }
+        Err(e) => {
+            io.log("{e}")
+            127
+        }
+    }
+    env.exit(code)
+}
+```
+
+**The old field is a compile error.** A read of `r.exit_code` on a `ProcessResult` is the error `NoSuchField` (E0525). Its help points at the new names:
+
+```
+error[NoSuchField]: `ProcessResult` has no field `exit_code`
+  help: the child's end is `r.end`; use `r.success()` to test for a clean exit, or `match r.end`
 ```
 
 **Standard input.** With `stdin: None`, the default, the child reads its standard input from the null device, so its first read sees end of input. A child never starts with its standard input closed. With `stdin: Some(s)`, the child reads `s` and then end of input. `process.spawn` gives the child the null device as standard input.
@@ -1670,17 +1742,130 @@ fn configure(src: Str) -> Result[ProcessResult, ProcessError] ! Process.Spawn {
 
 **Strings that cannot reach a child.** An empty environment name, a name that holds `=` or NUL, a value that holds NUL, and a NUL in `cmd` or in any element of `args`, give `Err` with `EINVAL`, and no child starts. This holds for `process.run`, `process.spawn` and `process.exec`.
 
-**`Child` is a handle-op value.** `process.spawn` makes a `Child`, so the operations that consume one, `process.wait` and `process.signal`, are `process` handle ops too (§4.4, rule 3). Code with no `Process` effect can hold a `Child` but cannot wait on it or signal it. `Child` is opaque and has no methods. `process.wait` on a child that already exited returns the same `ProcessResult` again. The signal numbers are constants in `std.process` (`SIGHUP`, `SIGINT`, `SIGQUIT`, `SIGKILL`, `SIGTERM`).
+**Child limits.** `limits: ChildLimits` is one keyword on `process.run` and `process.spawn`. The default, `ChildLimits {}`, sets no limit, and the child starts as it did before limits existed. `process.wait` takes no limits and has no timeout: a child's limits are fixed when it starts. `process.exec` takes no limits, because `exec` replaces this program and nobody is left to enforce them. The effect row does not change: a call with limits is `Process.Spawn`, and a deadline adds no `Time` effect, because the runtime keeps the clock and the program does not sleep.
 
 ```blink
-import std.process.{ProcessResult, ProcessError, SIGTERM}
+pub type ChildLimits {
+    /// Wall-clock time from the start of the child. At the deadline the runtime sends SIGTERM,
+    /// and after `grace` it sends SIGKILL. `None`: no deadline.
+    timeout: Duration? = None
+
+    /// The time between SIGTERM and SIGKILL. `Duration.seconds(0)` sends SIGKILL at once, with no SIGTERM.
+    grace: Duration = Duration.seconds(2)
+
+    /// Memory of the whole tree of the child, in bytes. `None`: no limit.
+    memory: Int? = None
+
+    /// The tree of the child ends when it tries to go past this many processes. Threads count
+    /// as well as processes. `None`: no limit.
+    processes: Int? = None
+}
+```
+
+```blink
+import std.process.{ProcessError, ChildLimits}
 import std.time.{Duration}
 
-fn run_with_deadline(cmd: Str, args: List[Str], limit: Duration) -> Result[ProcessResult, ProcessError] ! Process, Time.Sleep {
-    let child = process.spawn(cmd, args)?
-    time.sleep(limit)
-    let _ = process.signal(child, SIGTERM)   // an Err here means the child already exited
-    process.wait(child)
+fn run_tests() -> Result[ProcessResult, ProcessError] ! Process.Spawn {
+    process.run("sh", ["-c", "make test"], limits: ChildLimits { timeout: Some(Duration.seconds(30)) })
+}
+```
+
+If `make test` runs for more than 30 seconds, the runtime sends SIGTERM to the child and everything it started. After 2 seconds (the default `grace`), it sends SIGKILL. `run` then returns `Ok` with the output that `make` wrote so far and `end` equal to `Limit(Timeout)`.
+
+**When a limit ends a child, the result is `Ok`.** A limit is not a failure of the op. `run` and `wait` return `Ok(ProcessResult)` with the output that the runtime read before the child ended, and `end` is `Limit(k)` for the limit `k` that ended it. If two limits are reached, `k` is the first one that ended the child. `run` and `wait` return by `timeout + grace` plus a short delay. They do not wait for end of file on the pipes of the child: a grandchild that still holds a pipe open does not hold `run` back. The output that came later is lost.
+
+```blink
+fn flaky(cmd: Str) -> Result[Str, ProcessError] ! Process.Spawn, IO.Print {
+    let r = process.run(cmd, [], limits: ChildLimits { timeout: Some(Duration.seconds(2)) })?
+    match r.end {
+        Limit(Timeout) => {
+            io.println("timed out; output so far: {r.out}")
+            Ok(r.out)
+        }
+        _ => Ok(r.out)
+    }
+}
+```
+
+A child that catches SIGTERM and exits with code 0 during the grace period ends as `Limit(Timeout)`, not as `Exited(0)`. The limit ended it, whatever the child chose to do.
+
+**Bad values and unsupported limits.** A `timeout` that is zero or negative, a `memory` that is zero or negative, a `processes` that is less than 1, and a negative `grace` give `Err` with `EINVAL`, and no child starts. A `grace` of zero is legal: the runtime sends SIGKILL at the deadline and no SIGTERM. A limit that the host cannot enforce gives `Err(ProcessError { op, cmd, code })` with `code` equal to `ENOTSUP`, and no child starts. A limit is never dropped without notice, and the runtime never uses a weaker mechanism in its place. In particular, `memory` and `processes` do not use `RLIMIT_AS` or `RLIMIT_NPROC`, and the runtime does not poll the memory use of the child.
+
+**Process groups. A terminal Ctrl-C does not reach a limited child.** A child that has any limit starts in its own process group. The runtime sends its signals to that group, or to the cgroup of the child when it has one, so grandchildren end too: `sh -c "make test"` with a timeout ends `make` and all that `make` started. The group is not the foreground group of the terminal, so the interrupt that a user types goes to this program only (see *A limited child does not outlive this program* for what the runtime does then). A child with no limit stays in the process group of this program, as before.
+
+**Memory and process count need a delegated cgroup v2.** `memory` and `processes` work on Linux when this program can use a delegated cgroup v2 (a cgroup that this program may write to, with the memory and pids controllers available to it). Everywhere else they give `ENOTSUP`.
+
+| Limit | Linux, delegated cgroup v2 | Linux, otherwise (a normal terminal session included) | macOS |
+|---|---|---|---|
+| `timeout` (and `grace`) | yes | yes | yes |
+| `memory` | yes | `ENOTSUP` | `ENOTSUP` |
+| `processes` | yes | `ENOTSUP` | `ENOTSUP` |
+
+A program that a user starts in a normal terminal usually falls in the "otherwise" column. Under cgroup v2 a cgroup that has child cgroups holds no processes. This program shares the cgroup of the shell that started it, so the runtime cannot make the cgroups it needs, and `memory` and `processes` give `ENOTSUP`. This is also the usual case in a container and on macOS. These limits work when something has started the program in its own delegated unit, for example with `systemd-run --user --scope -p Delegate=yes`. A target without processes (wasm) has no `process` handle, so no row applies.
+
+When the runtime applies `memory` or `processes` for the first time, this program moves itself into a leaf cgroup below its own cgroup, and each limited child gets a cgroup of its own. You can see the move in `/proc/self/cgroup`. `memory` also sets the swap of the child to 0, so a child cannot go past its limit through swap. When the kernel ends a child for `memory`, the end is `Limit(Memory)`.
+
+The `processes` limit has a meaning that differs from `TasksMax` of systemd, where a fork past the limit only fails. Here the tree ends: when a fork in the tree is refused because of the limit, the runtime ends the whole tree and the end is `Limit(Processes)`. A child that handles the fork failure and carries on is ended too. Threads count as well as processes, so a child with many threads reaches the limit without a fork. Pair `processes` with a `timeout`, so a child in a state that the limit does not cover still ends.
+
+```blink
+fn fork_bomb_guard() -> Result[ProcessResult, ProcessError] ! Process.Spawn {
+    let lim = ChildLimits { processes: Some(200), timeout: Some(Duration.seconds(10)) }
+    process.run("./test_bin", [], limits: lim)
+}
+// a child that forks past 200 processes or threads ends with Limit(Processes)
+```
+
+**Ask which limits the host supports.** `process.can_limit(which)` returns `true` when `run` and `spawn` can apply a limit of that kind on this host. It uses the same check as `run`, made once and kept for the life of the program, so its answer does not change while the program runs. The answer is advice: `run` and `spawn` stay the authority and still give `ENOTSUP` when a limit cannot be applied. The call never creates or changes a cgroup. Support is per kind: a host can give the memory controller without the pids controller, or the reverse. A call with `Timeout` returns `true` on every host that has processes. `process.can_limit` is a `Process.Spawn` operation, so a `handler Process` may answer it (see *Mock handlers*).
+
+The fallback pattern asks first, keeps each limit that the host supports, and keeps the timeout:
+
+```blink
+fn run_capped(cmd: Str, args: List[Str]) -> Result[ProcessResult, ProcessError] ! Process.Spawn {
+    let lim = ChildLimits {
+        timeout: Some(Duration.seconds(60))
+        memory: if process.can_limit(LimitKind.Memory) { Some(512 * 1024 * 1024) } else { None }
+        processes: if process.can_limit(LimitKind.Processes) { Some(500) } else { None }
+    }
+    process.run(cmd, args, limits: lim)
+}
+```
+
+On a host with no cgroup v2 delegation, this call runs the child with the timeout only. A call that sets `memory` directly on such a host gives `Err` with `ENOTSUP` and starts no child:
+
+```blink
+let r = process.run("./t", [], limits: ChildLimits { memory: Some(1024 * 1024 * 1024) })
+// Err(ProcessError { op: Run, cmd: "./t", code: ENOTSUP }), displayed as: run ./t: Operation not supported
+```
+
+**A deadline holds whether or not anyone waits.** A deadline is a property of the child, not of the code that waits for it. A child that `process.spawn` started with a `timeout` ends at its deadline even if this program never calls `process.wait` on it, or calls it much later. The runtime starts one watcher the first time a child with a deadline starts. A program that never sets a limit starts no watcher and pays nothing. The watcher only sends signals. It never reaps a child, so `process.wait` still gets the result of the child, with `end` equal to `Limit(Timeout)`.
+
+**A limited child does not outlive this program.** When this program ends by a normal exit, by a panic, or by a SIGINT or SIGTERM, the runtime first ends the process group (or the cgroup) of each limited child that is still alive, and then the program ends with its exit code. On Linux the direct child also has a parent-death signal, SIGKILL, so it ends when this program ends. There is a gap on macOS: if SIGKILL ends this program, nothing ends the process group of a limited child, and it keeps running. On Linux in that case the direct child ends, and its descendants end only when they are in the cgroup of the child. A child with no limit has no such rule: it stays in the process group of this program, as before.
+
+**Signal names.** `signal_name(n: Int) -> Str` is a pure function of `std.process`. It has no effect row. It gives the name of the signal for the number `n` on the host: `signal_name(SIGSEGV)` is `"SIGSEGV"`. For a number that the host has no name for, including a real-time signal, it gives `"SIG<n>"`, for example `"SIG34"`. This is the rule of §8.10.5 for the `signal` key of a test file, and `Display` of `ChildEnd` calls the same function, so the two never differ. Signal numbers differ between hosts (`SIGBUS` is 7 on Linux and 10 on macOS), so match on the constants and not on the names. `signal_name` is for text:
+
+```blink
+import std.process.{signal_name, SIGSEGV}
+
+fn describe(end: ChildEnd) -> Str {
+    match end {
+        Signaled(n) if n == SIGSEGV => "crashed"
+        Signaled(n) => "killed by {signal_name(n)}"
+        _ => "{end}"
+    }
+}
+```
+
+**`Child` is a handle-op value.** `process.spawn` makes a `Child`, so the operations that consume one, `process.wait` and `process.signal`, are `process` handle ops too (§4.4, rule 3). Code with no `Process` effect can hold a `Child` but cannot wait on it or signal it. `Child` is opaque and has no methods. `process.wait` on a child that already exited returns the same `ProcessResult` again. The signal numbers are constants in `std.process`: `SIGHUP`, `SIGINT`, `SIGQUIT`, `SIGKILL`, `SIGTERM`, `SIGSEGV`, `SIGBUS`, `SIGABRT` and `SIGXCPU`. They are named constants and not literals because their numbers differ between hosts.
+
+A deadline is a limit of the child, so the code that wants one gives the child a `timeout` when it starts the child. It does not sleep and then signal:
+
+```blink
+import std.process.{ProcessResult, ProcessError, ChildLimits}
+import std.time.{Duration}
+
+fn run_with_deadline(cmd: Str, args: List[Str], limit: Duration) -> Result[ProcessResult, ProcessError] ! Process.Spawn {
+    process.run(cmd, args, limits: ChildLimits { timeout: Some(limit) })
 }
 ```
 
@@ -1694,17 +1879,51 @@ fn launch(tool: Str, args: List[Str]) ! Process.Spawn, Env.Exit, IO {
 }
 ```
 
-**Mock handlers.** A `handler Process` replaces every operation, so a test can run code that starts programs without starting any. Operations that the mock leaves out delegate to the enclosing handler (§4.7.1).
+**Mock handlers.** A `handler Process` replaces every operation, so a test can run code that starts programs without starting any. Operations that the mock leaves out delegate to the enclosing handler (§4.7.1 *Completeness and auto-delegation*). A mock gets `limits` as data and enforces nothing: a test returns the end that it wants.
 
 ```blink
 test "build reports a failed make" {
     let mock = handler Process {
-        fn run(cmd: Str, args: List[Str], *, stdin: Str?, env: ChildEnv, cwd: Str?) -> Result[ProcessResult, ProcessError] {
-            Ok(ProcessResult { out: "", err_out: "no rule for target", exit_code: 2 })
+        fn run(cmd: Str, args: List[Str], *, stdin: Str?, env: ChildEnv, cwd: Str?, limits: ChildLimits) -> Result[ProcessResult, ProcessError] {
+            Ok(ProcessResult { out: "", err_out: "no rule for target", end: ChildEnd.Exited(2) })
         }
     }
     with mock {
         assert_eq(build("all"), Ok(false))
+    }
+}
+```
+
+A mock can return a limit end, so a test can check what the code does when a child times out:
+
+```blink
+test "flaky returns the output so far on a timeout" {
+    let mock = handler Process {
+        fn run(cmd: Str, args: List[Str], *, stdin: Str?, env: ChildEnv, cwd: Str?, limits: ChildLimits) -> Result[ProcessResult, ProcessError] {
+            Ok(ProcessResult { out: "half", err_out: "", end: ChildEnd.Limit(LimitKind.Timeout) })
+        }
+    }
+    with mock {
+        assert_eq(flaky("./slow"), Ok("half"))
+    }
+}
+```
+
+A mock that leaves out `can_limit` goes to the enclosing handler, so a new op breaks no handler. A mock that wants to fake the host answers it:
+
+```blink
+test "run_capped drops the memory limit on a host without cgroup v2" {
+    let mock = handler Process {
+        fn can_limit(which: LimitKind) -> Bool {
+            which == LimitKind.Timeout
+        }
+        fn run(cmd: Str, args: List[Str], *, stdin: Str?, env: ChildEnv, cwd: Str?, limits: ChildLimits) -> Result[ProcessResult, ProcessError] {
+            assert_eq(limits.memory, None)
+            Ok(ProcessResult { out: "", err_out: "", end: ChildEnd.Exited(0) })
+        }
+    }
+    with mock {
+        assert(run_capped("./t", []).unwrap().success())
     }
 }
 ```
