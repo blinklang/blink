@@ -15,10 +15,27 @@ fmt_c=$(mktemp "${TMPDIR:-/tmp}/fmt-sem-XXXXXX.c")
 fmt_bin=$(mktemp "${TMPDIR:-/tmp}/fmt-sem-XXXXXX")
 orig_c=$(mktemp "${TMPDIR:-/tmp}/fmt-sem-XXXXXX.c")
 orig_bin=$(mktemp "${TMPDIR:-/tmp}/fmt-sem-XXXXXX")
-cleanup() { rm -f "$fmt_src" "$fmt_c" "$fmt_bin" "$orig_c" "$orig_bin"; }
+# child <command...>: run the command as a capped child (scripts/capped.sh
+# --child). Its stderr, with the line capped.sh prints for a cap it hit, goes
+# to $child_err; check_limit fails the file when such a line is there, so a
+# runaway file fails as itself and names the limit.
+child_err=$(mktemp "${TMPDIR:-/tmp}/fmt-child-XXXXXX")
+child() { "$(dirname "$0")/capped.sh" --child "$@" 2>>"$child_err"; }
+cleanup() { rm -f "$fmt_src" "$fmt_c" "$fmt_bin" "$orig_c" "$orig_bin" "$child_err"; }
+# check_limit: fail the file when a child hit a cap. A step that a cap killed
+# says nothing about the formatter, so no later verdict may stand in for it.
+check_limit() {
+  limit=$(grep '^capped.sh: the child' "$child_err" | tail -1)
+  [ -z "$limit" ] && return
+  [ -n "${scratch:-}" ] && rm -rf "$scratch"
+  cleanup
+  echo "FAIL ($limit) ${name}"
+  exit 1
+}
 # A file the formatter cannot format is a formatter bug; only the skip list
 # may excuse it.
-if ! "$blinkc" "$f" "$fmt_src" --emit blink 2>/dev/null; then
+if ! child "$blinkc" "$f" "$fmt_src" --emit blink; then
+  check_limit
   cleanup
   echo "FAIL (format) ${name}"
   exit 1
@@ -42,23 +59,26 @@ fi
 
 # blinkc_ok <source> <c output>
 if [ "$use_archive" = 1 ]; then
-  blinkc_ok() { "$blinkc" $test_build --link-archive "$archive_h" "$1" "$2" >/dev/null 2>&1; }
+  blinkc_ok() { child "$blinkc" $test_build --link-archive "$archive_h" "$1" "$2" >/dev/null; }
 else
-  blinkc_ok() { "$blinkc" $test_build "$1" "$2" >/dev/null 2>&1; }
+  blinkc_ok() { child "$blinkc" $test_build "$1" "$2" >/dev/null; }
 fi
 # A formatted file that no longer compiles is a formatter bug only when the
 # original compiles; otherwise the compiler cannot build this program yet.
 if ! blinkc_ok "$fmt_src" "$fmt_c"; then
+  check_limit
   if blinkc_ok "$f" "$orig_c"; then
     cleanup
     echo "FAIL (fmt breaks compile) ${name}"
     exit 1
   fi
+  check_limit
   cleanup
   echo "SKIP sem_${name}"
   exit 0
 fi
 if ! blinkc_ok "$f" "$orig_c"; then
+  check_limit
   cleanup
   echo "FAIL (fmt makes a failing compile pass) ${name}"
   exit 1
@@ -70,16 +90,17 @@ if [ "$use_archive" = 1 ]; then
   # paths, so it has undefined refs to sqlite3_*/curl_* whenever a fixture
   # touches those symbols. --gc-sections drops the unreferenced ones; the rest
   # need real libs. Always linking both is cheaper than scanning fixtures.
-  cc_ok() { cc -o "$2" "$1" -Ibuild "$archive_a" -lm -lgc -lsqlite3 -lcurl -pthread -Wl,--gc-sections 2>/dev/null; }
+  cc_ok() { child cc -o "$2" "$1" -Ibuild "$archive_a" -lm -lgc -lsqlite3 -lcurl -pthread -Wl,--gc-sections; }
 else
   cc_ok() {
     link_flags="-lm -lgc"
     grep -q BLINK_USE_CURL "$1" && link_flags="$link_flags -lcurl"
     grep -q BLINK_USE_SQLITE "$1" && link_flags="$link_flags -lsqlite3"
-    cc -o "$2" "$1" -I bootstrap $link_flags 2>/dev/null
+    child cc -o "$2" "$1" -I bootstrap $link_flags
   }
 fi
 if ! cc_ok "$fmt_c" "$fmt_bin" || ! cc_ok "$orig_c" "$orig_bin"; then
+  check_limit
   cleanup
   echo "FAIL (cc) ${name}"
   exit 1
@@ -97,7 +118,7 @@ fi
 scratch=$(mktemp -d "${TMPDIR:-/tmp}/blink-test-XXXXXX")
 outcome() {
   rm -rf "$scratch" && mkdir -m 700 "$scratch"
-  out=$(BLINK_TEST_SCRATCH_DIR="$scratch" BLINK_ROOT="$(pwd)" "$1" 2>/dev/null)
+  out=$(child env BLINK_TEST_SCRATCH_DIR="$scratch" BLINK_ROOT="$(pwd)" "$1")
   rc=$?
   out=$(printf '%s\n' "$out" | sed 's/\x1b\[[0-9;]*m//g')
   if printf '%s\n' "$out" | grep -qE '^test .* \.\.\. '; then
@@ -106,7 +127,9 @@ outcome() {
   printf 'exit %s\n%s\n' "$rc" "$out"
 }
 orig_outcome=$(outcome "$orig_bin")
+check_limit
 fmt_outcome=$(outcome "$fmt_bin")
+check_limit
 rm -rf "$scratch"
 cleanup
 if [ "$orig_outcome" = "$fmt_outcome" ]; then

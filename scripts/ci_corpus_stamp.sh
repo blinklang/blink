@@ -37,6 +37,9 @@ key() {
         cc --version 2>&1
         echo "BLINK_GEN0_SEED=${BLINK_GEN0_SEED-}"
         env | grep '^CORPUS_' | LC_ALL=C sort
+        # A row's caps decide whether it passes. The cgroup path and the mode
+        # capped.sh exports change each run, so only the knobs count.
+        env | grep -E '^BLINK_CHILD_(CAP|MEMORY_MAX|TASKS_MAX|SWAP_MAX|TIMEOUT|KILL_AFTER)=' | LC_ALL=C sort
     } | sha256sum | cut -d' ' -f1
 }
 

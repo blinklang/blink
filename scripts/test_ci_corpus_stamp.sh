@@ -2,7 +2,8 @@
 # Proves scripts/ci_corpus_stamp.sh skips the corpus only when nothing the
 # corpus reads has changed: any tracked or new file edit busts the stamp, an
 # edit under the doc-only paths does not, a stamp never covers a tree edited
-# mid-run, and a rewrite of an output file by another corpus run busts it.
+# mid-run, a rewrite of an output file by another corpus run busts it, and so
+# does a child cap knob.
 # Runs an unmodified copy of the script in a throwaway git repo, so it takes
 # seconds and never touches this checkout's build/.
 set -u
@@ -143,6 +144,19 @@ else
     echo "PASS: CORPUS_FOO=1 -> fails"
 fi
 expect pass "stamp still valid without CORPUS_FOO"
+
+# 10: a child cap knob decides whether a row passes; the run's cgroup path does not.
+fresh
+if BLINK_CHILD_MEMORY_MAX=64M $S check >/dev/null 2>&1; then
+    echo "FAIL: BLINK_CHILD_MEMORY_MAX=64M -> should fail"; fail=1
+else
+    echo "PASS: BLINK_CHILD_MEMORY_MAX=64M -> fails"
+fi
+if BLINK_CHILD_CGROUP=/sys/fs/cgroup/other BLINK_CHILD_CAP_MODE=rlimit $S check >/dev/null 2>&1; then
+    echo "PASS: BLINK_CHILD_CGROUP and BLINK_CHILD_CAP_MODE -> stamp still valid"
+else
+    echo "FAIL: BLINK_CHILD_CGROUP or BLINK_CHILD_CAP_MODE busts the stamp"; fail=1
+fi
 
 # override outputs
 fresh

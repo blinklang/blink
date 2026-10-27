@@ -59,6 +59,11 @@
 # binary, for the same reason: a per-module run whose build fell back to one
 # unit must read false.
 #
+# Each build and run is a child of scripts/capped.sh --child: in a gate run
+# it gets a memory and process cap of its own, and every way gets the time
+# limit. A child that hits a cap fails as its own row, and the line capped.sh
+# prints for the cap is the row's first error, so the row names the limit.
+#
 # Env:
 #   CORPUS_BUILD_TIMEOUT  seconds per compile (default 900)
 #   CORPUS_RUN_TIMEOUT    seconds per run (default 600)
@@ -188,6 +193,25 @@ if grep -qE '^test\.failing\(' "$root/$file"; then has_known=1; fi
 
 json_str() { printf '%s' "$1" | jq -Rs .; }
 
+# child <seconds> <command...>: run the command as a capped child.
+child() {
+    local limit=$1
+    shift
+    "$root/scripts/capped.sh" --child --timeout "$limit" "$@"
+}
+
+# limit_line <log>: the line capped.sh printed for a cap the child hit. The
+# wrapper prints it after the child ends, so the last one is the wrapper's.
+limit_line() {
+    grep '^capped.sh: the child' "$1" | tail -1
+}
+
+# first_line <log> <ERE>: the first line that matches, skipping the notice
+# capped.sh gives when no gate run set the way to cap a child.
+first_line() {
+    grep -vE '^capped.sh: (each child|no timeout)' "$1" | grep -m1 -E "$2"
+}
+
 # Only a test build keeps test blocks, and it runs them, never main. A file with a main and
 # no test block gets a plain build. A file with no main gets a test build even when the grep
 # above finds no test block, so a test the grep misses still runs.
@@ -212,7 +236,7 @@ timed_out() {
     unset BLINK_ROOT BLINK_BIN
     export BLINK_CACHE_DIR=""
     export PATH="$ccdir:$PATH"
-    timeout -k 10 "$build_timeout" "$blink_bin" "$build_cmd" "tests/$base.bl" -o "build/$base" --debug
+    child "$build_timeout" "$blink_bin" "$build_cmd" "tests/$base.bl" -o "build/$base" --debug
 ) > "$build_log" 2>&1
 build_rc=$?
 # The compiler archive's globals init fn: main calls it, so a binary that
@@ -223,13 +247,18 @@ if [ -f "$work/build/$base" ] && nm --defined-only "$work/build/$base" 2>/dev/nu
 fi
 per_module=false
 [ -d "$work/build/$base.units" ] && per_module=true
-if timed_out "$build_rc" "$start" "$build_timeout"; then
+build_limit=$(limit_line "$build_log")
+if [[ "$build_limit" == *"ran past its time limit"* ]]; then
+    status=timeout
+    first_error=$build_limit
+elif [ -z "$build_limit" ] && timed_out "$build_rc" "$start" "$build_timeout"; then
     status=timeout
     first_error="compile exceeded ${build_timeout}s"
 elif [ "$build_rc" -ne 0 ] || [ ! -x "$work/build/$base" ]; then
     status=compile_fail
-    first_error=$(grep -m1 -E 'error\[|^error|ICE|I[0-9]{4}' "$build_log" || true)
-    [ -z "$first_error" ] && first_error=$(grep -m1 -v '^[[:space:]]*$' "$build_log" || true)
+    first_error=$build_limit
+    [ -z "$first_error" ] && first_error=$(first_line "$build_log" 'error\[|^error|ICE|I[0-9]{4}' || true)
+    [ -z "$first_error" ] && first_error=$(first_line "$build_log" '[^[:space:]]' || true)
     [ -z "$first_error" ] && first_error="blink build exited $build_rc with no output"
 else
     run_start=$(date +%s.%N)
@@ -237,17 +266,22 @@ else
         cd "$work" || exit 2
         unset BLINK_ROOT BLINK_BIN
         export BLINK_CACHE_DIR=""
-        timeout -k 10 "$run_timeout" "./build/$base"
+        child "$run_timeout" "./build/$base"
     ) > "$run_log" 2>&1
     run_rc=$?
-    if timed_out "$run_rc" "$run_start" "$run_timeout"; then
+    run_limit=$(limit_line "$run_log")
+    if [[ "$run_limit" == *"ran past its time limit"* ]]; then
+        status=timeout
+        first_error=$run_limit
+    elif [ -z "$run_limit" ] && timed_out "$run_rc" "$run_start" "$run_timeout"; then
         status=timeout
         first_error="run exceeded ${run_timeout}s"
     elif [ "$run_rc" -ne 0 ]; then
         status=run_fail
-        first_error=$(grep -m1 -E '\bFAIL\b|\bPANIC\b|panic|Segmentation|Aborted' "$run_log" || true)
-    [ -z "$first_error" ] && first_error=$(grep -E 'error|assert' "$run_log" | grep -m1 -vE '\.\.\. .*ok' || true)
-        [ -z "$first_error" ] && first_error=$(grep -m1 -v '^[[:space:]]*$' "$run_log" || true)
+        first_error=$run_limit
+        [ -z "$first_error" ] && first_error=$(first_line "$run_log" '\bFAIL\b|\bPANIC\b|panic|Segmentation|Aborted' || true)
+        [ -z "$first_error" ] && first_error=$(grep -vE '^capped.sh: (each child|no timeout)' "$run_log" | grep -E 'error|assert' | grep -m1 -vE '\.\.\. .*ok' || true)
+        [ -z "$first_error" ] && first_error=$(first_line "$run_log" '[^[:space:]]' || true)
         [ -z "$first_error" ] && first_error="test binary exited $run_rc with no output"
     else
         status=pass
@@ -262,7 +296,7 @@ if [ "$status" = pass ]; then
             cd "$work" || exit 2
             unset BLINK_ROOT BLINK_BIN
             export BLINK_CACHE_DIR=""
-            timeout -k 10 "$run_timeout" "./build/$base" --test-json
+            child "$run_timeout" "./build/$base" --test-json
         ) > "$report" 2>/dev/null
         if [ $? -eq 0 ]; then
             known=$(jq -e '[.results[] | select(.expected_fail == true and .status == "passed")] | length' "$report" 2>/dev/null) || known=null

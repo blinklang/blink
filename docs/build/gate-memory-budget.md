@@ -1,8 +1,8 @@
 # Gate memory and process budget
 
 Status: the Taskfile applies the "one gate scope" rows (see "Applied: one gate scope"
-below). The other rows are a proposal: the tickets that add the slice file, the per-child
-caps and the concurrency bound apply them.
+below) and the per-child rows (see "Applied: one cap per child"). The other rows are a
+proposal: the tickets that add the slice file and the concurrency bound apply them.
 
 ## Why
 
@@ -93,9 +93,9 @@ cgroup limit could. The gate scope below replaces it. Also, `scripts/run_fmt_sem
 | `CORPUS_JOBS` | `scripts/corpus.sh` | default `JOBS`: 12 |
 | `BLINK_JOBS` per corpus row | `scripts/corpus.sh` | `nproc / CORPUS_JOBS`: 1 in the slice |
 | `blink test --parallel` | Taskfile `test` | `JOBS`: 12 (CLI default 4) |
-| `BLINK_JOBS` per `blink test` worker | `build_fs.cpu_count()` | `nproc`: 12 in the slice, 24 outside |
+| `BLINK_JOBS` per `blink test` worker | Taskfile `__test` | `nproc / JOBS`, at least 1: 1 in the slice (the CLI alone uses `nproc`) |
 | `parallel -j` in the fmt stage | Taskfile `__fmt-goldens` | `JOBS`: 12 |
-| `GC_MARKERS` | `corpus.sh`, `__fmt-goldens` | 1; `blink test` does not set it, so Boehm starts one marker per CPU |
+| `GC_MARKERS` | `corpus.sh`, `__fmt-goldens`, `__test` | 1 (the CLI alone does not set it, so Boehm starts one marker per CPU) |
 
 The products:
 
@@ -121,7 +121,7 @@ The products:
 | One gate scope `MemorySwapMax` | 2G (applied) | A fresh machine has no slice swap cap, and the plain-scope fallback has no slice. With no swap cap, a runaway gate pages out to a disk swap for minutes before the memory cap kills it, as on 2026-10-25. |
 | Per child (one test binary or one corpus row) `MemoryMax` | 2G | 4 times the largest single process (500 MB). One runaway child dies alone. |
 | Per child `TasksMax` | 256 | Holds a per-module build at `BLINK_JOBS=24` plus GC marker threads. Stops a self-spawn chain at about 115 MB. |
-| Per child run timeout | 600 s | Same as the corpus `CORPUS_RUN_TIMEOUT`. The fmt semantic stage has none today. |
+| Per child run timeout | 600 s | Same as the corpus `CORPUS_RUN_TIMEOUT`. Before the per-child caps, the fmt semantic stage had none. |
 | `BLINK_JOBS` for `blink test --parallel N` workers | `nproc / N`, at least 1 | Holds the `cc` count near the CPU count, as `corpus.sh` does. |
 | `GC_MARKERS` for test binaries | 1 | Same as the corpus and fmt stages. |
 
@@ -192,6 +192,11 @@ Settings:
 `scripts/test_capped.sh`, in `task ci`'s gate self-tests, proves each path with caps of
 64M and 64 tasks.
 
+The scope has `Delegate=yes`, so the run can make cgroups below it for the per-child caps.
+The run moves itself into the leaf `gate/` of the scope, and each capped child gets a
+cgroup in `kids/`. The kernel lets only a cgroup with no processes of its own give its
+controllers to child cgroups, so the run cannot stay in the scope's own cgroup.
+
 The dispatcher re-runs the task with `--force`, `--silent`, `--verbose`, `-- <args>`,
 the vars `BUILD_DIR`, `BLINKC`, `JOBS` and `VERSION` when they differ from their
 `DEFAULT_*`, and the vars `FMT_SEMANTIC`, `CORPUS_LINT` and `CORPUS_PM_SLICE` when they
@@ -207,6 +212,87 @@ command line goes in the dispatcher's list, and a new global var also gets a `DE
 The dispatcher needs Task 3.47 or later, which reads the `if:` of a command. An older Task
 runs both commands; `scripts/capped.sh` then sees a dispatcher inside its own capped run
 and stops with one line, not with a loop of re-runs.
+
+## Applied: one cap per child
+
+`scripts/capped.sh --child [--timeout <seconds>] <command>` runs one child of a gate under
+the per-child caps. These calls use it:
+
+- `scripts/corpus_one.sh`: the build of each row (`CORPUS_BUILD_TIMEOUT`, 900 s) and each
+  run of its test binary (`CORPUS_RUN_TIMEOUT`, 600 s).
+- `scripts/run_fmt_golden.sh`, `run_fmt_idempotent.sh` and `run_fmt_semantic.sh`: each
+  formatter call, each `blinkc` and `cc` call, and each run of a test binary.
+
+A program that a child starts, such as the `blink build` that a test starts through
+`compile_test_helpers`, stays in the child's cgroup and under its caps.
+
+The first way that works caps each child:
+
+| Machine | Cap | Notice |
+|---|---|---|
+| the gate run has a scope with `Delegate=yes` | a cgroup `kids/c-<pid>` with `memory.max=2G` and `pids.max=256`, and the time limit | none |
+| the gate run has no such scope, `prlimit` | address space 2G per process, user processes = running + 256, and the time limit | one line from the gate run |
+| no `prlimit` | `ulimit -v` and `ulimit -u`, the same limits (no `ulimit -v` on Darwin), and the time limit | one line from the gate run |
+| none of these work | the time limit only | one line from the gate run |
+| no `timeout` or `gtimeout` command | no time limit | one more line from the gate run |
+
+A call with no gate run around it, for example `scripts/corpus.sh` run by hand, takes the
+`prlimit` way and gives the notice itself. A `--child` call inside a child runs in place:
+it is already under its parent's caps, and a cgroup of its own would take it out of them.
+
+When the child ends, the script reads its cgroup's `memory.events` and `pids.events`,
+prints one line per cap the child hit, and keeps the child's exit code:
+
+```
+capped.sh: the child hit its memory cap (MemoryMax=2G) and the OOM killer killed 1 of its processes; exit 137
+capped.sh: the child hit its process cap (TasksMax=256): 12 forks failed; exit 1
+capped.sh: the child ran past its time limit (600s) and was killed; exit 124
+```
+
+The time limit sends `SIGTERM`, then `SIGKILL` after `BLINK_CHILD_KILL_AFTER` seconds. Exit
+137 names the time limit only when the time is spent, so an OOM kill or a crash does not
+read as a time limit. A crash with no cap hit gives no line. A child that the OOM killer
+hits below its own cap gets a line that says the gate or the machine ran out, not the
+child. The script then kills each process that the child left in its cgroup and removes
+the cgroup.
+
+The corpus row and the fmt file fail with that line as their reason: the corpus row's
+`first_error_line` is the line, and its status is `timeout` for the time limit. The fmt
+scripts print `FAIL (<line>) <name>`. A cap that kills one step of the fmt semantic check
+fails the file, because the other verdicts of that check are then not valid.
+
+Why a cgroup per child and not a systemd scope per child: a scope is a unit that systemd
+must start and stop, for each of about 2600 corpus rows and several thousand fmt calls per
+gate. A new scope would also sit beside the gate scope in the slice, not in it, so the
+gate's 12G cap would not hold over it. A cgroup below the delegated gate scope costs one `mkdir` and a few writes,
+and the gate's caps still hold over it. `prlimit` alone is weaker: its memory cap is per
+process, not per child, and `RLIMIT_NPROC` counts all processes of the user.
+
+`task test` sets `BLINK_JOBS` and `GC_MARKERS` for its workers. The children that
+`blink test` starts do not go through `scripts/capped.sh`, so they get no per-child caps,
+only the gate's.
+
+Settings:
+
+| Variable | Default | Effect |
+|---|---|---|
+| `BLINK_CHILD_CAP` | `1` | `0` runs each child in place, with no memory or process cap; the time limit stays |
+| `BLINK_CHILD_MEMORY_MAX` | `2G` | the child's `memory.max`, or its address space for `prlimit` and `ulimit` |
+| `BLINK_CHILD_TASKS_MAX` | `256` | the child's `pids.max`, or the user process margin for `prlimit` and `ulimit` |
+| `BLINK_CHILD_SWAP_MAX` | unset | the child's `memory.swap.max`; unset leaves swap to the gate scope (2G) |
+| `BLINK_CHILD_TIMEOUT` | `600` | seconds before the time limit kills the child; `0` turns it off; `--timeout` sets it for one call |
+| `BLINK_CHILD_KILL_AFTER` | `10` | seconds between `SIGTERM` and `SIGKILL` at the time limit |
+
+The corpus stamp (`scripts/ci_corpus_stamp.sh`) includes these variables, so a sweep that
+passed under other caps does not let `task ci` skip the next sweep.
+
+`scripts/test_capped_child.sh`, in the gate self-tests, proves with caps of 64M, 64 tasks
+and 2 s that a memory hog, a fork loop and a sleep each fail with one line that names the
+limit, that a crash and a plain failure name no limit, and that a pass still passes.
+`scripts/test_corpus.sh` and `scripts/test_fmt_semantic.sh` prove that a corpus row and an
+fmt file fail with that line as their reason.
+
+## Benchmarks in the slice
 
 `task bench` and `task ci-profile` run in the slice too, so the slice's CPU quota holds
 over them, and a gate that runs at the same time shifts their timings. Time them while no

@@ -21,7 +21,7 @@ fail=0
 
 R="$WORK/root"
 mkdir -p "$R/scripts" "$R/tests" "$R/build" "$R/fakec/lib/std" "$R/src"
-cp scripts/corpus.sh scripts/corpus_one.sh scripts/default_jobs.sh scripts/corpus_std_pch_key.sh scripts/corpus_sample.sh scripts/corpus_check.sh scripts/corpus_per_module_check.sh scripts/corpus_per_module_slice_entries.sh "$R/scripts/"
+cp scripts/capped.sh scripts/corpus.sh scripts/corpus_one.sh scripts/default_jobs.sh scripts/corpus_std_pch_key.sh scripts/corpus_sample.sh scripts/corpus_check.sh scripts/corpus_per_module_check.sh scripts/corpus_per_module_slice_entries.sh "$R/scripts/"
 : > "$R/build/gc_unity.c"
 # corpus.sh takes the compiler archive roots from the compiler binary's imports.
 printf 'import std.fs\nimport lexer.{Lex}\nimport cg\n\nfn main() {}\n' > "$R/src/blinkc_main.bl"
@@ -52,6 +52,11 @@ done
 if grep -q SELFTEST_COMPILE_FAIL "$src"; then echo "error[E0000]: fake compile failure"; exit 1; fi
 if grep -q SELFTEST_RUN_FAIL "$src"; then
     printf '#!/bin/sh\necho "FAIL: fake run failure"\nexit 1\n' > "$out"
+elif grep -q SELFTEST_RUN_HANGS "$src"; then
+    printf '#!/bin/sh\nexec sleep 30\n' > "$out"
+elif grep -q SELFTEST_RUN_HOG "$src"; then
+    # A command substitution holds its whole output in memory.
+    printf '#!/bin/bash\nx=$(head -c 512M /dev/zero | tr "\\0" a)\necho "${#x}"\n' > "$out"
 elif grep -q SELFTEST_BAD_REPORT "$src"; then
     printf '#!/bin/sh\ncase " $* " in *" --test-json "*) echo "{\\"results\\":[{\\"name\\":\\"a\\"b\\"}]}";; esac\nexit 0\n' > "$out"
 elif n=$(grep -o 'SELFTEST_XFAIL=[0-9]*' "$src" | cut -d= -f2) && [ -n "$n" ]; then
@@ -677,6 +682,46 @@ run_drift; expect "drift-excluded-and-listed" 1 $?
 names "drift-excluded-and-listed-names-file" "tests/test_check_2.bl$"
 rm -f "$WORK/slice.txt"
 run_drift; expect "drift-no-list" 1 $?
+
+# A row that runs past its time limit, or that its child cap kills, fails as
+# that one row, and its first error line names the limit.
+echo '// SELFTEST_RUN_HANGS' > "$R/tests/test_selftest_run_hangs.bl"
+printf 'tests/test_selftest_ok.bl\ntests/test_selftest_run_hangs.bl\n' > "$WORK/hangs.txt"
+start=$EPOCHSECONDS
+(cd "$R" && CORPUS_RUN_TIMEOUT=2 CORPUS_COMPILER=fakec CORPUS_JOBS=2 ./scripts/corpus.sh --only "$WORK/hangs.txt" --no-lint) > "$WORK/out.log" 2>&1
+expect "run-time-limit" 1 $?
+row=$(jq -r '.files[] | select(.file == "tests/test_selftest_run_hangs.bl") | "\(.status)|\(.first_error_line)"' "$R/build/corpus_subset.json" 2>/dev/null)
+case "$row" in
+    "timeout|capped.sh: the child ran past its time limit (2s)"*)
+        if [ $((EPOCHSECONDS - start)) -lt 20 ]; then
+            echo "PASS run-time-limit-row: $row"
+        else
+            echo "FAIL run-time-limit-row: the run took $((EPOCHSECONDS - start))s"
+            fail=1
+        fi
+        ;;
+    *) echo "FAIL run-time-limit-row: got [$row]"; sed 's/^/    /' "$WORK/out.log"; fail=1 ;;
+esac
+rm -f "$R/tests/test_selftest_run_hangs.bl"
+
+# The memory case needs a cgroup per child, so it starts a gate run of its own.
+if command -v systemd-run >/dev/null 2>&1 &&
+    systemd-run --user --scope -q -p Delegate=yes -p MemoryMax=64M -p MemorySwapMax=0 -p TasksMax=64 -p OOMPolicy=continue true >/dev/null 2>&1; then
+    echo '// SELFTEST_RUN_HOG' > "$R/tests/test_selftest_run_hog.bl"
+    printf 'tests/test_selftest_ok.bl\ntests/test_selftest_run_hog.bl\n' > "$WORK/hog.txt"
+    (cd "$R" && env -u BLINK_GATE_SCOPE -u BLINK_GATE_CAP -u BLINK_CHILD_CAP_MODE -u BLINK_CHILD_CGROUP -u BLINK_CHILD_CAPPED \
+        BLINK_CHILD_MEMORY_MAX=64M BLINK_CHILD_SWAP_MAX=0 CORPUS_COMPILER=fakec CORPUS_JOBS=2 \
+        timeout 120 ./scripts/capped.sh ./scripts/corpus.sh --only "$WORK/hog.txt" --no-lint) > "$WORK/out.log" 2>&1
+    expect "run-memory-cap" 1 $?
+    row=$(jq -r '.files[] | select(.file == "tests/test_selftest_run_hog.bl") | "\(.status)|\(.first_error_line)"' "$R/build/corpus_subset.json" 2>/dev/null)
+    case "$row" in
+        "run_fail|capped.sh: the child hit its memory cap (MemoryMax=64M)"*) echo "PASS run-memory-cap-row: $row" ;;
+        *) echo "FAIL run-memory-cap-row: got [$row]"; sed 's/^/    /' "$WORK/out.log"; fail=1 ;;
+    esac
+    rm -f "$R/tests/test_selftest_run_hog.bl"
+else
+    echo "SKIP run-memory-cap: no systemd user scope with delegation on this machine"
+fi
 
 if [ "$fail" -ne 0 ]; then
     echo "test_corpus: FAILED"
