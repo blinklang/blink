@@ -330,11 +330,17 @@ if command -v systemd-run >/dev/null 2>&1 &&
         flunk "Ctrl-C to a loop (out=[$out]: $(cat "$WORK/err"))"
     fi
 
-    # Page cache from a big write fills the gate's cap and makes it reclaim;
+    # Page cache from a big read fills the gate's cap and makes it reclaim;
     # with a child killed at its own cap, that is still no OOM of the gate.
+    # The file is written and synced first: dirty pages from a write in the
+    # gate wait on the disk, and under load the gate can then truly OOM. Its
+    # pages then leave the cache, or the read would charge none to the gate.
+    dd if=/dev/zero of="$WORK/fill" bs=1M count=400 conv=fsync status=none
+    dd if="$WORK/fill" iflag=nocache count=0 status=none
     gate BLINK_GATE_MEMORY_MAX=128M BLINK_GATE_SWAP_MAX=0 BLINK_CHILD_MEMORY_MAX=48M BLINK_CHILD_SWAP_MAX=0 -- \
-        '"$CAPPED" --child bash '"$WORK/hog"' > /dev/null; dd if=/dev/zero of='"$WORK/fill"' bs=1M count=400 status=none; rm -f '"$WORK/fill"
+        '"$CAPPED" --child bash '"$WORK/hog"' > /dev/null; cat '"$WORK/fill"' > /dev/null'
     rc=$?
+    rm -f "$WORK/fill"
     if [ "$rc" = 0 ] && [ "$(child_lines 'hit its memory cap (MemoryMax=48M)')" = 1 ] && [ "$(gate_lines)" = 0 ]; then
         pass "a child OOM while the gate reclaims page cache prints no line about the gate's cap"
     else
