@@ -421,7 +421,7 @@ Without `@trusted`, the same declaration gives `UnauditedFfi` (W0800), which is 
 A record is a TOML table keyed by `K`. It holds exactly two keys:
 
 - `claim` — required, non-empty text. What the author claims and why it holds. Ticket links and authorship go here when a team wants them.
-- `pins` — a table from the pin key of each item that carries `@trusted(audit: K)` to that item's pin. An item is a function, a method or a `test` block. *Pin Keys* below sets the spelling of a key.
+- `pins` — a table from the pin key of each item that carries `@trusted(audit: K)` to that item's pin. An item is a function, a method or a `test` block. *Pin Keys* below sets the spelling of a key. A pin is a TOML string. A pin of another type is a pin that the compiler cannot read (*Audit Record Faults — Layout, Values and Syntax* below).
 
 ```toml
 # audits.toml
@@ -461,7 +461,7 @@ An inline table is one line (TOML 1.0).
 
 The compiler checks this in `blink check`, `blink build` and the LSP. The rule applies to every `@trusted(audit: K)`, whatever diagnostic it is for.
 
-**A missing record is an error.** When `audits.toml` has no record `K`, or record `K` has an empty `claim`, the annotation is rejected:
+**A missing record is an error.** When `audits.toml` has no record `K`, or record `K` has an empty `claim`, the annotation is rejected. A record that exists and has a fault is not this error: *Audit Record Faults — Layout, Values and Syntax* below states that case.
 
 ```
 error[AuditRecordNotFound]: no audit record `DB-003`
@@ -479,7 +479,7 @@ error[AuditRecordNotFound]: no audit record `DB-003`
 
 The skeleton shows a placeholder. The compiler never fills in a claim: the author writes it. An empty `claim` is the same error.
 
-**Every audit diagnostic names the file it read.** `AuditRecordNotFound` (E0829), `AuditRecordUnknownKey` (E0830) and the note on a lapsed pin each name the `audits.toml` that the compiler read, or say that the file is in no package. The path is relative to the package root, not absolute, so the output is the same on every machine.
+**Every audit diagnostic names the file it read.** `AuditRecordNotFound` (E0829), `AuditRecordUnknownKey` (E0830), `AuditRecordBadValue` (E0852), `TomlSyntax` (E1024) and the note on a lapsed pin each name the `audits.toml` that the compiler read, or say that the file is in no package. The path is relative to the package root, not absolute, so the output is the same on every machine.
 
 ```blink
 // pkg/tests/test_pid.bl; pkg/audits.toml has no [TEST-PID] record
@@ -518,7 +518,7 @@ A pin with a hash prefix that this compiler does not write is stale in the same 
   = help: re-read the claim; if it still holds, run `blink audit pin RPT-002 report.fetch_table`
 ```
 
-`blink audit --require-all` treats a lapsed suppression as unaudited, so CI fails on it.
+`blink audit --require-all` treats a lapsed suppression as unaudited, so CI fails on it. A pin that is not a string gets a different note, which names the type found (*Audit Record Faults — Layout, Values and Syntax* below).
 
 **The schema is closed.** A key other than `claim` and `pins` in a record is an error, `AuditRecordUnknownKey`. It names the allowed keys and suggests the nearest one:
 
@@ -533,7 +533,215 @@ error[AuditRecordUnknownKey]: unknown key `claims` in audit record `DB-003`
   = note: put ticket links and authorship in the `claim` text; version control records who wrote it
 ```
 
-**Who writes what.** The author writes `claim` by hand. `blink audit pin` writes pins only, and never a claim. It refuses when `audits.toml` has no record `K`, or when its `claim` is empty. It prints the existing claim before it writes, so the author re-reads what the pin vouches for. It re-pins one record per run, and no autofix writes a claim. A re-pin is therefore always visible in review: the diff shows the item change and, beside it, a pin change under an unchanged claim. *`blink audit pin` — Writing Pins* below states what it does and refuses.
+A record with this error suppresses nothing. This holds in every layout of the record (*Audit Record Faults — Layout, Values and Syntax* below).
+
+**Who writes what.** The author writes `claim` by hand. `blink audit pin` writes pins only, and never a claim. It refuses when `audits.toml` has no record `K`, when its `claim` is empty, and in the other cases that *`blink audit pin` — Writing Pins* below lists. It prints the existing claim before it writes, so the author re-reads what the pin vouches for. It re-pins one record per run, and no autofix writes a claim. A re-pin is therefore always visible in review: the diff shows the item change and, beside it, a pin change under an unchanged claim. *`blink audit pin` — Writing Pins* below states what it does and refuses.
+
+#### Audit Record Faults — Layout, Values and Syntax
+
+The compiler checks the whole `audits.toml` of a package once, in source order, and reports every fault in it. It does this whether or not an annotation names the record that has the fault. The result does not depend on which `.bl` files are in the compile, or on the order the compiler loads them. The diagnostics of `audits.toml` print before the diagnostics of the `.bl` files of the package.
+
+| Fault in `audits.toml` | Diagnostic | Span |
+|------------------------|------------|------|
+| The file is not valid TOML | `TomlSyntax` (E1024, §8.9.8 *TOML Syntax*) | The first syntax error |
+| A table or a key is defined twice | `TomlSyntax` (E1024), in a file that has no other syntax error | The second definition |
+| A key in a record other than `claim` and `pins` | `AuditRecordUnknownKey` (E0830) | The key |
+| `claim` or `pins` has the wrong type | `AuditRecordBadValue` (E0852) | The value |
+| A top-level key whose value is not a table | `AuditRecordBadValue` (E0852) | The key |
+
+There is no separate code for a top-level key. A record with any fault in it suppresses nothing, and the annotation that names it gets no `AuditRecordNotFound` (E0829). That code means that no record `K` exists, or that its `claim` is empty.
+
+**Three layouts of one record.** A record is a top-level key `K` whose value is a table. TOML has three ways to write one, and the reader takes all three. These records are the same data:
+
+```toml
+[A-1]
+claim = "getpid has no side effects"
+```
+
+```toml
+A-1 = { claim = "getpid has no side effects" }
+```
+
+```toml
+A-1.claim = "getpid has no side effects"
+```
+
+The schema is closed in all three layouts. In the next file, `claimz` is not a key of a record, so the file has `AuditRecordUnknownKey` (E0830):
+
+```toml
+A-1.claimz = "getpid has no side effects"
+```
+
+```
+error[AuditRecordUnknownKey]: unknown key `claimz` in audit record `A-1`
+ --> audits.toml:1:5
+  |
+1 | A-1.claimz = "getpid has no side effects"
+  |     ^^^^^^ a record holds only `claim` and `pins`
+  |
+  = help: did you mean `claim`?
+```
+
+**A top-level key that is not a table.** In the next file, line 1 is a key of the file itself, not a key of a record. A record is a table, so the compiler cannot read `claim = "x"` as a record:
+
+```toml
+claim = "x"
+
+[A-1]
+claim = "getpid has no side effects"
+```
+
+```
+error[AuditRecordBadValue]: top-level key `claim` is a string, not an audit record
+ --> audits.toml:1:1
+  |
+1 | claim = "x"
+  | ^^^^^ an audit record is a table
+  |
+  = help: add a `[K]` header above this line, for example `[A-1]`
+```
+
+The message is the same for `pins = "x"` or any other name at the top. `[A-1]` is not changed by the fault in line 1.
+
+**A value of the wrong type.** `claim` must be a string. `pins` must be a table. A wrong type is `AuditRecordBadValue` (E0852). The span is the value. The message names the key, the type it needs and the type found.
+
+```toml
+[A-3]
+claim = 42
+```
+
+```
+error[AuditRecordBadValue]: `claim` in audit record `A-3` must be a string, found an integer
+ --> audits.toml:2:9
+  |
+2 | claim = 42
+  |         ^^ not a string
+  |
+  = help: write the claim as text, for example `claim = "<why this holds>"`
+```
+
+A `pins` that is not a table gets the same code. The help is the one command that writes a new `pins` for the record (*`blink audit pin` — Writing Pins* below):
+
+```toml
+[A-2]
+claim = "reads only"
+pins = "x"
+```
+
+```
+error[AuditRecordBadValue]: `pins` in audit record `A-2` must be a table, found a string
+ --> audits.toml:3:8
+  |
+3 | pins = "x"
+  |        ^^^ not a table
+  |
+  = help: run `blink audit pin A-2`
+```
+
+**A pin that the compiler cannot read.** A value inside a valid `pins` table that is not a string is not an error. It is a pin the compiler cannot read. Only the item with that pin loses its suppression. The gated diagnostic of that item fires again, with a note that names the TOML type found. The note never says "does not match", because the pin is damaged and the code is not changed. The other items of the record keep their suppression.
+
+```toml
+[A-1]
+claim = "getpid has no side effects"
+pins = { "m.f" = 3 }
+```
+
+```
+warning[UnauditedFfi]: unaudited foreign function call
+ --> src/m.bl:3:1
+  |
+  = note: the pin for `m.f` in audit record `A-1` is an integer, not a pin string (audits.toml:3:18, package `pkg`)
+  = help: run `blink audit pin A-1 m.f`
+```
+
+*A stale or missing pin is not an error* above shows the note for a pin that is a string but does not match. The two notes read differently on purpose: one shows a code change, the other shows damage to the file. `blink audit --require-all` treats an unreadable pin as unaudited, so CI fails on it.
+
+**A file that is not valid TOML.** `TomlSyntax` (E1024) is the one code for a syntax error in every TOML file that the toolchain reads: `blink.toml`, `audits.toml` and `blink.lock` (§8.9.8 *TOML Syntax*). A file that does not parse gives no records. The build fails. The `.bl` files are still checked in the same run, and the compiler reports only the first syntax error.
+
+```toml
+[A-1]
+claim = "getpid has no side effects
+```
+
+```
+error[TomlSyntax]: unclosed string in audits.toml
+ --> audits.toml:2:9
+  |
+2 | claim = "getpid has no side effects
+  |         ^ the string starts here and has no closing `"` on this line
+```
+
+A table or a key that the file defines twice is the same code. The compiler never merges two definitions. The span is the second definition, and a note names the first:
+
+```toml
+[A-1]
+claim = "reads only"
+
+[A-1]
+claim = "writes"
+```
+
+```
+error[TomlSyntax]: the table `A-1` is defined twice
+ --> audits.toml:4:1
+  |
+4 | [A-1]
+  | ^^^^^ second definition
+  |
+  = note: first defined at audits.toml:1:1
+```
+
+```toml
+[A-1]
+claim = "reads only"
+claim = "writes"
+```
+
+```
+error[TomlSyntax]: the key `claim` is defined twice in the table `A-1`
+ --> audits.toml:3:1
+  |
+3 | claim = "writes"
+  | ^^^^^ second definition
+  |
+  = note: first defined at audits.toml:2:1
+```
+
+The compiler reports duplicates only when the file has no other syntax error. When the file parses, it reports every duplicate table and every duplicate key, in source order. When the file does not parse, it reports the first syntax error and nothing else. In the next file, line 3 repeats the key `claim` and line 4 is an unclosed string, so the compiler reports line 4 only:
+
+```toml
+[A-1]
+claim = "reads only"
+claim = "writes"
+pins = "x
+```
+
+**A record with a fault suppresses nothing.** A record with `AuditRecordBadValue` (E0852) or `AuditRecordUnknownKey` (E0830) suppresses no diagnostic, for any item. When the file does not parse, no record exists, so no record suppresses anything. The annotation gets no `AuditRecordNotFound`. The gated diagnostic of each item fires again, with one note that points at the fault:
+
+```blink
+// src/db.bl; the record A-2 of the example above has `pins = "x"`
+@ffi("c", "getpid")
+@trusted(audit: "A-2")
+fn getpid() -> Int ! IO
+```
+
+```
+error[AuditRecordBadValue]: `pins` in audit record `A-2` must be a table, found a string
+ --> audits.toml:7:8
+  |
+7 | pins = "x"
+  |        ^^^ not a table
+  |
+  = note: used by @trusted(audit: "A-2") at src/db.bl:3:1
+  = help: run `blink audit pin A-2`
+
+warning[UnauditedFfi]: unaudited foreign function call
+ --> src/db.bl:4:1
+  |
+  = note: audit record `A-2` has an error (audits.toml:7:8); it suppresses nothing
+```
+
+The error of `audits.toml` prints first, then the warnings at the sites. When the file does not parse, the note at each site points at the syntax error in the same way. The note `used by` names each annotation that names the record. When the fault is a syntax error, it names every `@trusted(audit: K)` of the package. A fault in a record that no annotation names has no `used by` note. The terminal text may shorten the list of sites and count the rest (`and 4 more`), as it does for the candidates of an unknown import name (§10.5 *Import Errors*). `--json` lists every site.
 
 #### Pins — What the Hash Covers
 
@@ -774,6 +982,56 @@ error: two items have the key `pg.connect`
   --> src/pg/legacy.bl:9:1
   = help: rename one of them
 ```
+
+**A file with faults.** The command checks the file before it writes. It refuses, with exit 1 and no write, when `audits.toml` has a syntax error, when `K` has a bad or empty `claim`, or when `K` has `AuditRecordUnknownKey` (E0830). A fault in another record does not block it.
+
+When it writes, it replaces the `pins` value of `K` in place, whatever that value is, and never adds a second `pins`. If `K` is a top-level inline table (`K = { claim = "..." }`), it writes `K` again as a `[K]` table with the same claim and a `[K.pins]` sub-table, because a `[K.pins]` header cannot extend an inline table. After the write, the file parses, every record other than `K` reads back as it was, and `K` reads back with the same claim and the new pins. This holds for every layout of `pins`: a `[K.pins]` table, an inline `pins = { ... }`, dotted keys such as `K.pins.x`, and a value that is not a table.
+
+With the example file of *Audit Record Faults — Layout, Values and Syntax* above, `A-1` has a pin that the compiler cannot read, but `A-2` is the record to fix. The command succeeds:
+
+```
+$ blink audit pin A-2
+claim    reads only
+pinned   report.read_rows
+$ echo $?
+0
+```
+
+```toml
+[A-1]
+claim = "getpid has no side effects"
+pins = { "m.f" = 3 }
+
+[A-2]
+claim = "reads only"
+
+[A-2.pins]
+'report.read_rows' = "ast1:5be20c7a91d4"
+```
+
+The command refuses when the fault is in `K` itself. In the next file, `claimz` is an unknown key of `A-3`:
+
+```toml
+[A-3]
+claim = "reads only"
+claimz = "typo"
+```
+
+```
+$ blink audit pin A-3
+error[AuditRecordUnknownKey]: unknown key `claimz` in audit record `A-3`
+ --> audits.toml:3:1
+  |
+3 | claimz = "typo"
+  | ^^^^^^ a record holds only `claim` and `pins`
+  |
+  = help: did you mean `claim`?
+error: audits.toml was not changed
+$ echo $?
+1
+```
+
+The command also refuses on a syntax error in the file, because it cannot find the record to change. It names the syntax error (`TomlSyntax`, E1024) and exits 1.
 
 **A pin copied to another record.** The tool never copies a pin from one record to another, and a pin written for `K1` never matches under `K2` (*Pins — What the Hash Covers* above). To move an item from `K1` to `K2`, change the tag and run `blink audit pin K2 <key>`; a later `blink audit pin K1` drops the old key, or the record `K1` goes if no item carries it any more.
 

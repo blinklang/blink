@@ -644,6 +644,8 @@ Import paths follow the `org/name` structure: `import std.http` maps to the `std
 | A missing key | the `[header]` of the section that lacks it |
 | A missing section (no `[package]`) | line 1, column 1, zero width |
 | A dependency with no source | the token that names the dependency: the key for the inline form, the whole `[header]` for the table form (`[dependencies."local/utils"]`, quoted dotted segments included) |
+| A TOML syntax error | the first token the parser cannot read (an unclosed string: the opening quote) |
+| A table or key defined twice | the second definition, with a `note:` at the first |
 
 There is no fallback position: every manifest diagnostic points at the token at fault, or, when the fault is an absent token, at the position that this table gives.
 
@@ -765,6 +767,39 @@ error[UnsupportedEdition]: this blink does not know edition "2099"
 W1001 and unknown-key diagnostics in the same manifest are still reported. For `UnsupportedEdition` only, each such warning adds a `note:` at the `edition` value. The note states a fact and nothing more: `this manifest names edition 2099, which this blink does not know`. For `InvalidEdition`, the warning has no note.
 
 `blink fmt` still formats a package with an edition error. The language server reports the error and does not type-check that package. `blink migrate --edition <year>` and `blink editions --edition <year>` give the same two errors for a year that names no known edition; the span is the argument (§8.16.3, §8.16.4).
+
+**TOML syntax.** `TomlSyntax` (E1024) is the one code for a TOML file that does not parse. Every TOML file that the toolchain reads uses it: `blink.toml`, `audits.toml` (§9.1) and `blink.lock` (§8.9.6). The message names the file. A file that does not parse gives no data: a `blink.toml` that does not parse stops the load, and an `audits.toml` that does not parse gives no audit records. The build fails. The `.bl` files are still checked in the same run.
+
+The toolchain reports the first syntax error of a file and nothing else about that file. A table or a key that the file defines twice is also `TomlSyntax`, never a merge. The span is the second definition, and a `note:` names the position of the first. The toolchain reports duplicates only when the file has no other syntax error. In a file that parses, it reports every duplicate table and every duplicate key, in source order.
+
+```toml
+[package]
+name = "app"
+name = "app2"
+```
+
+```
+error[TomlSyntax]: the key `name` is defined twice in the table `package`
+ --> blink.toml:3:1
+  |
+3 | name = "app2"
+  | ^^^^ second definition
+  |
+  = note: first defined at blink.toml:2:1
+```
+
+```toml
+[package]
+name = "app
+```
+
+```
+error[TomlSyntax]: unclosed string in blink.toml
+ --> blink.toml:2:8
+  |
+2 | name = "app
+  |        ^ the string starts here and has no closing `"` on this line
+```
 
 **Reporting.** The toolchain checks the whole manifest and reports every manifest error before the load fails. After a manifest error the toolchain prints no further line about the failed load. The toolchain may print one line that gives the count of errors. That line is not a diagnostic: it does not start with `error:` and it names no fault.
 
