@@ -30,7 +30,7 @@ fn sodium_secretbox(
     msg_len: U64,
     nonce: Ptr[U8],
     key: Ptr[U8]
-) -> Int ! Crypto
+) -> Int ! ()
 ```
 
 The `@ffi("library", "symbol")` annotation names the shared library and the symbol to link. The compiler does not type-check the foreign function's body — it does not have one. The signature is the developer's claim about what the foreign function expects and returns.
@@ -57,7 +57,7 @@ Because the compiler cannot analyze foreign code, the author **must** write the 
 fn curl_perform(handle: Ptr[Void]) -> Int ! Net, IO
 ```
 
-**There is no `FFI` effect.** A foreign call is not an effect of its own. The row of an `@ffi` decl names the Blink effects the foreign code has: `Net`, `IO`, `Crypto` and so on (§4.3). Callers see that row by the usual transitivity rule (§4.5), exactly as they see the row of a Blink function. `! FFI` is not a valid row: `FFI` is not a declared effect, so it is rejected with `UnknownEffect` (E0538, §4.3).
+**There is no `FFI` effect.** A foreign call is not an effect of its own. The row of an `@ffi` decl names the Blink effects the foreign code has: `Net`, `IO`, `FS` and so on (§4.3). It names world effects only (*Foreign Rows Inside a Built-in Effect's Handler*). Callers see that row by the usual transitivity rule (§4.5), exactly as they see the row of a Blink function. `! FFI` is not a valid row: `FFI` is not a declared effect, so it is rejected with `UnknownEffect` (E0538, §4.3).
 
 The declared row is an **accounting** claim, not routing. It says which capabilities a caller must hold to reach the foreign code. How it relates to handlers is stated once, in §4.5 *Proven and assumed rows*. When a foreign effect must be replaceable — mocked in a test, sandboxed, swapped — the safe wrapper performs it through a Blink effect operation, and a handler then replaces that operation (§4.7):
 
@@ -305,6 +305,66 @@ fn daemon_setpgid(pid: I32, pgid: I32) -> I32 ! Process.Spawn {}
 
 The `State` row in these decls follows the rule of *Hidden C State — Which Row*: it is the fallback, and it appears only for fds that no built-in effect names. Do not add `State` to a decl out of habit. The compiler cannot check the audit text that lists the makers, so the row is a claim of the author, like every other `@ffi` row (§4.5, *Proven and assumed rows*).
 
+#### Foreign Rows Inside a Built-in Effect's Handler
+
+A handler for a built-in interface effect (`DB`, `Crypto`) can call foreign code. The standard SQLite driver is one example: the handler for `DB` calls `libsqlite3`. The row of such a binding names **what the foreign code touches**. It never names the effect that the handler implements. §4.3 divides the built-in effects into interface effects, which only a handler implements, and world effects, which the host does.
+
+`DB` never appears in a foreign row. A foreign call does not run through a handler (§4.5, *Proven and assumed rows*), so it cannot discharge `DB`. A binding with `! DB` puts `DB` in the clause row of the handler that calls it. The type is then `Handler[DB ! DB]`: a handler that forwards to the outer handler and never discharges `DB`. `! ()` on every binding is also wrong. `libsqlite3` writes the database file, and a later call reads it through no argument (*What `! ()` Claims*).
+
+```blink
+// wrong: `DB` is what the handler implements, not what the C library touches
+@ffi("pq", "PQexec")
+@trusted(audit: "PG-001")
+fn pq_exec(conn: Ptr[Void], sql: Ptr[U8]) -> Ptr[Void] ! DB
+
+// right: libpq talks to a server
+@ffi("pq", "PQexec")
+@trusted(audit: "PG-001")
+fn pq_exec(conn: Ptr[Void], sql: Ptr[U8]) -> Ptr[Void] ! Net.Connect
+```
+
+```
+warning[ForeignRowNamesRoutingEffect]: foreign call `pq_exec` claims `DB`, which only a handler implements
+ --> pg.bl:4:1
+  |
+  = note: a foreign call does not run through a handler; this row is charged to the caller's handler and never discharged by this call (§4.5)
+  = help: name what the C library touches, such as `Net.Connect` or `FS.Read, FS.Write`, or write `! ()`
+```
+
+`ForeignRowNamesRoutingEffect` (W0553) fires at the decl when the row of an `@ffi` binding names `DB`, `Crypto`, a child of either, or a user-declared effect. Rows that name `FS`, `Net`, `IO`, `Env`, `Time`, `Rand`, `Process`, `State` or `Arena` do not fire it. `@allow(ForeignRowNamesRoutingEffect)` suppresses the warning. `@trusted(audit: K)` does not, because a C library can call back into Blink at a point where a `DB` operation runs. For such a binding the row can be true, and the author says so with `@allow`. A pure computation on its arguments, such as a hash that writes its result through a pointer, takes `! ()`, not `! Crypto`.
+
+When a handler that calls such a binding does not fit its declared type, the diagnostic points at the binding. It never offers `Handler[E ! E]` as the fix:
+
+```
+error[UndeclaredEffect]: undeclared effect
+ --> app.bl:9:10
+  |
+9 |     with pg {
+  |          ^^ handler `pg` performs `DB` outside the handler
+  |
+  = note: `DB` comes from `pg.pq_exec`, a foreign call whose row is assumed under audit `PG-001`
+  = help: the row of `pq_exec` names `DB`, which only a handler implements; name what the library touches, such as `Net.Connect` (W0553)
+```
+
+**A user driver.** A libpq driver is `Handler[DB ! Net.Connect]` (§4.7.1, *The clause row*). `with pg_connect(url)? { }` discharges `DB` and charges `Net.Connect` to the enclosing code. An enclosing fn that does not declare `Net.Connect` gets E0500 at the `with`.
+
+**The standard SQLite driver.** `std.db` installs a handler of type `Handler[DB ! (FS.Read, FS.Write, FS.Delete, Time.Read, Time.Sleep, Rand)]`. These are the rows of its bindings:
+
+| Binding | Row |
+|---|---|
+| open (`sqlite_open`), `sqlite_close`, `sqlite_reset`, `sqlite_finalize` | `FS.Read, FS.Write, FS.Delete` |
+| `sqlite_prepare` | `FS.Read, FS.Write, FS.Delete` |
+| `sqlite_exec_raw`, `sqlite_execute_raw`, `sqlite_query_raw`, `sqlite_step` | `FS.Read, FS.Write, FS.Delete, Time.Read, Time.Sleep, Rand` |
+| `bind_*`, `errmsg`, `last_insert_rowid`, `is_closed`, `is_finalized`, `column_*`, `result_*`, `result_free` | `! ()` |
+
+The open call can create or open the database file. A later call on the handle can write that file or delete the journal, so `sqlite_close`, `sqlite_reset` and `sqlite_finalize` take the row of the call that made the handle (*fd-Table and Process-Control Calls — Which Row*). `sqlite_prepare` takes the full `FS` row because taking the schema read lock can roll back a hot journal that a crash in another process left. That writes the database file and deletes the journal. The four SQL-running calls add `Time.Read`, `Time.Sleep` and `Rand`. `PRAGMA busy_timeout = N`, sent through `sqlite_exec_raw`, installs a busy handler, and a locked `sqlite_step` then sleeps. WAL mode also sleeps on contention with no busy handler. SQL text can call `random()` and `randomblob()`.
+
+The rule has an end. The row of a binding that runs SQL covers every behavior that SQL text can reach. A row gets shorter only when the shim provably removes a behavior, for example by replacing `random` and `randomblob`, and the audit record of the binding says so (*Audit Records*).
+
+The pub helpers of `std.db` that call these bindings declare the row. `with db.connect(p)? { }` discharges `DB` and charges the row to the enclosing code. A missing leaf is E0500 at the `with` (§4.7.1). A test under `with mock_db(...)` is charged no `FS`, because a mock handler performs nothing outside the handler. A `Stmt` that a program steps outside the `with` that made it declares the row of `sqlite_step`, and E0500 fires if the enclosing code lacks it. The `Stmt` operations carry no wider `DB` row.
+
+`blink audit` prints the clause row of each handler and the key that assumes its bindings (*`blink audit` — FFI Inventory*).
+
 #### What the Standard Library Routes Through Ops
 
 A handler that a program installs sees every call of the standard library that makes or names a resource. Outside `std.libc` and outside the default body of a built-in effect operation, a standard library function does not call an `@ffi` binding whose row has a source effect (`Time.*`, `Rand`, `Env`, `IO`), `FS` or `Net` directly. It calls an operation of that effect, and the default handler does the foreign call.
@@ -332,6 +392,26 @@ pub fn read_some(fd: I32, buf: Ptr[U8], n: U64) -> I64 ! FS.Read {
 ```
 
 A handler for `FS` replaces `fs.stat` for every std function that stats a path, because std reaches `stat` only through the operation. A handler reaches the real `stat` as `default.stat(p)` (§4.7.1). User code does not call the default body of a built-in effect operation, so it cannot reach the foreign call except through the operation.
+
+**A second exemption: the standard SQLite driver.** `std.db`, `std.db_sqlite` and `std.db_stmt` call the SQLite bindings directly. `libsqlite3` makes its own system calls, so its file I/O cannot go through `fs.*` operations. These calls are **not** under the exemption for an fd that already exists: SQL can open new files (`ATTACH`, `VACUUM INTO`, the journal, temp files for sorts). What a program can rely on:
+
+- The file I/O of the SQLite driver does not go through `fs.*` operations, so a handler for `FS` does not see it.
+- `":memory:"` still charges the row. The row bounds every path of the driver.
+- The `with` still charges the row to the enclosing code (*Foreign Rows Inside a Built-in Effect's Handler*).
+
+```blink
+fn mock_fs() -> Handler[FS] { ... }   // a user handler that serves files from a map
+
+test "an FS mock does not cover the SQLite driver" {
+    with mock_fs() {
+        with db.connect("app.db")? {   // touches the real disk
+            db.exec(t"CREATE TABLE t (x INT)")?
+        }
+    }
+}
+```
+
+To test code that uses `DB` without touching the disk, install a handler for `DB` (`with mock_db(...)`). A handler for `FS` is the wrong tool.
 
 The `std.libc` wrappers are the other place where std calls C directly. They stay one call into C, and no handler intercepts them (§9.1.3.3).
 
@@ -436,7 +516,7 @@ warning[ZeroArgPureForeign]: foreign function `c_fs_stat_size` has no params and
 ```blink
 @ffi("sqlite3", "sqlite3_open")
 @trusted(audit: "DB-003")
-fn sqlite3_open(filename: Ptr[U8], db: Ptr[Ptr[Void]]) -> Int ! IO
+fn sqlite3_open(filename: Ptr[U8], db: Ptr[Ptr[Void]]) -> Int ! FS.Read, FS.Write, FS.Delete
 ```
 
 FFI without `@trusted` compiles but emits a warning:
@@ -584,7 +664,7 @@ type Timespec {
 // Legal
 @ffi("sqlite3", "sqlite3_next_stmt")
 @trusted(audit: "DB-005")
-fn raw_next(db: Sqlite3) -> Option[Sqlite3] ! IO
+fn raw_next(db: Sqlite3) -> Option[Sqlite3] ! ()
 
 @ffi("c", "difftime")
 @trusted(audit: "LIBC-DIFFTIME")
@@ -647,14 +727,14 @@ A handful of diagnostics exist to force a **record**, not to report a mistake. T
 ```blink
 @ffi("sqlite3", "sqlite3_open")
 @trusted(audit: "DB-003")           // OK
-fn sqlite3_open(filename: Ptr[U8], db: Ptr[Ptr[Void]]) -> Int ! IO
+fn sqlite3_open(filename: Ptr[U8], db: Ptr[Ptr[Void]]) -> Int ! FS.Read, FS.Write, FS.Delete
 
 // intentional-error example
 @ffi("sqlite3", "sqlite3_close")
 @trusted                            // error[TrustedRequiresAudit]: `@trusted` requires a non-empty
                                     //   `audit:` identifier
                                     // help: `@trusted(audit: "DB-004")`
-fn sqlite3_close(db: Ptr[Void]) -> Int ! IO
+fn sqlite3_close(db: Ptr[Void]) -> Int ! FS.Read, FS.Write, FS.Delete
 ```
 
 **`@trusted(audit: K)` is the sole channel.** For the diagnostics listed below, it is the only construct that suppresses them. In particular they are **not** reachable from `@allow(Name)` (§4.16.8) and **not** reachable from `[lints]` in `blink.toml`.
@@ -1354,10 +1434,10 @@ FFI functions are **not callable from application code directly**. They must be 
 // The raw FFI binding — private, unsafe, audited
 @ffi("sqlite3", "sqlite3_open")
 @trusted(audit: "DB-003")
-fn raw_sqlite3_open(filename: Ptr[U8], db: Ptr[Ptr[Void]]) -> Int ! IO
+fn raw_sqlite3_open(filename: Ptr[U8], db: Ptr[Ptr[Void]]) -> Int ! FS.Read, FS.Write, FS.Delete
 
 // The safe wrapper — this is what application code calls
-pub fn open_database(path: Str) -> Result[Database, DbError] ! IO {
+pub fn open_database(path: Str) -> Result[Database, DbError] ! FS.Read, FS.Write, FS.Delete {
     let db_ptr = alloc_ptr[Void]()
     let rc = raw_sqlite3_open(path.as_cstr(), db_ptr.addr())
     match rc {
@@ -1405,17 +1485,21 @@ $ blink audit
 FFI Summary: 7 bindings across 3 modules
 
   db/sqlite.bl:
-    sqlite3_open      effects: IO        audit: DB-003   OK
-    sqlite3_exec      effects: IO, DB    audit: DB-004   OK
-    sqlite3_close     effects: IO        audit: DB-005   OK
+    sqlite3_open      effects: FS.Read, FS.Write, FS.Delete    audit: DB-003   OK
+    sqlite3_exec      effects: FS.Read, FS.Write, FS.Delete,
+                               Time.Read, Time.Sleep, Rand         audit: DB-004   OK
+    sqlite3_close     effects: FS.Read, FS.Write, FS.Delete    audit: DB-005   OK
 
   crypto/sodium.bl:
-    crypto_secretbox  effects: Crypto    audit: SEC-042  OK
-    crypto_sign       effects: Crypto    audit: SEC-043  OK
+    crypto_secretbox  effects: ()        audit: SEC-042  OK
+    crypto_sign       effects: ()        audit: SEC-043  OK
 
   net/curl.bl:
     curl_easy_init    effects: Net       audit: NONE     WARNING
     curl_easy_perform effects: Net, IO   audit: NET-007  OK
+
+Handlers whose clause row comes from assumed bindings:
+  std.db.Connection  Handler[DB ! (FS.Read, FS.Write, FS.Delete, Time.Read, Time.Sleep, Rand)]  assumed via STD-DB-SQLITE
 
 Audit coverage: 6/7 (85.7%)
 Unaudited: net/curl.bl:curl_easy_init
@@ -1678,13 +1762,13 @@ import blink.ffi.{Ptr, Void, alloc_ptr}
 
 @ffi("sqlite3", "sqlite3_open")
 @trusted(audit: "DB-003")
-fn raw_sqlite3_open(filename: Ptr[U8], db: Ptr[Ptr[Void]]) -> Int ! IO
+fn raw_sqlite3_open(filename: Ptr[U8], db: Ptr[Ptr[Void]]) -> Int ! FS.Read, FS.Write, FS.Delete
 
 @ffi("sqlite3", "sqlite3_close")
 @trusted(audit: "DB-004")
-fn raw_sqlite3_close(db: Ptr[Void]) -> Int ! IO
+fn raw_sqlite3_close(db: Ptr[Void]) -> Int ! FS.Read, FS.Write, FS.Delete
 
-pub fn open_database(path: Str) -> Result[Database, DbError] ! IO {
+pub fn open_database(path: Str) -> Result[Database, DbError] ! FS.Read, FS.Write, FS.Delete {
     with ffi.scope() as scope {
         let db_ptr = scope.alloc[Ptr[Void]]()   // a Ptr[Ptr[Void]] out-param cell
         let cstr = scope.cstr(path)
@@ -1770,12 +1854,12 @@ pub type Database {
 }
 
 impl Closeable for Database {
-    fn close(self) ! IO {
+    fn close(self) ! FS.Read, FS.Write, FS.Delete {
         raw_sqlite3_close(self.handle)
     }
 }
 
-pub fn open_database(path: Str) -> Result[Database, DbError] ! IO {
+pub fn open_database(path: Str) -> Result[Database, DbError] ! FS.Read, FS.Write, FS.Delete {
     with ffi.scope() as scope {
         let db_ptr = scope.alloc[Ptr[Void]]()   // a Ptr[Ptr[Void]] out-param cell
         let cstr = scope.cstr(path)
@@ -2756,10 +2840,10 @@ A handle value can be produced **only at the FFI boundary**: as the return value
 // raw FFI binding — private, audited
 @ffi("sqlite3", "sqlite3_open")
 @trusted(audit: "DB-003")
-fn raw_sqlite3_open(path: Ptr[U8], out: Ptr[Sqlite3]) -> Int ! IO
+fn raw_sqlite3_open(path: Ptr[U8], out: Ptr[Sqlite3]) -> Int ! FS.Read, FS.Write, FS.Delete
 
 // safe wrapper — mints the opaque handle at the boundary
-pub fn open(path: Str) -> Option[Connection] ! IO {
+pub fn open(path: Str) -> Option[Connection] ! FS.Read, FS.Write, FS.Delete {
     with ffi.scope() as scope {
         let out = scope.alloc[Sqlite3]()          // Ptr[Sqlite3] out-cell — a sqlite3**
         let cstr = scope.cstr(path)

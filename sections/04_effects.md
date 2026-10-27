@@ -331,6 +331,15 @@ error[UnknownEffect]: unknown effect `Log`
   = help: did you mean `lib.Log`?
 ```
 
+**Interface effects and world effects.** A built-in effect is of one of two kinds:
+
+| Kind | Meaning | Built-in effects |
+|---|---|---|
+| Interface effect | Only a handler implements it. No foreign call has it as its effect. | `DB`, `Crypto`, `Async` |
+| World effect | Something outside the program does it: the host, the file system, the network, the clock. | `FS`, `Net`, `IO`, `Env`, `Time`, `Rand`, `Process`, `State`, `Arena` |
+
+A user-declared effect (§4.12) is an interface effect. `Arena` is built in but is not in the reserved list below; §5.2 defines it. The row of an `@ffi` decl names world effects only, because a foreign call does not run through a handler (§4.5, *Proven and assumed rows*). A row that names `DB`, `Crypto`, a child of either, or a user-declared effect gets `ForeignRowNamesRoutingEffect` (W0553, §9.1, *Foreign Rows Inside a Built-in Effect's Handler*).
+
 **Why hierarchical and not flat:**
 
 A flat list of 30+ effects is unusable. Hierarchy provides two things: (1) grouping -- `FS.*` are all filesystem-related, so the handle namespace is coherent; and (2) a short form -- when a function genuinely needs all filesystem operations, `! FS` is one annotation, not four. The hierarchy matches how humans and AI think about capability domains.
@@ -2105,13 +2114,14 @@ The code under test calls `db.query_one(...)` and `io.log(...)` as normal. The h
 Handlers replace traditional DI containers:
 
 ```blink
-fn run_with_postgres(config: DBConfig) ! DB, IO.Log {
+fn run_with_postgres(config: DBConfig) ! Net.Connect, IO.Log {
     with postgres_handler(config) {
         start_server()  // all DB operations inside route to Postgres
     }
 }
 
-fn run_with_sqlite(path: Str) -> Result[(), DBError] ! DB, IO.Log {
+fn run_with_sqlite(path: Str) -> Result[(), DBError]
+    ! FS.Read, FS.Write, FS.Delete, Time.Read, Time.Sleep, Rand, IO.Log {
     with db.connect(path)? {
         start_server()  // same code, SQLite backend
     }
@@ -2130,6 +2140,8 @@ fn main() {
 ```
 
 No interfaces, no factory patterns, no service locators. The handler is the injection point. The code inside the `with` block is agnostic to the concrete implementation.
+
+A `with` discharges `DB`, and it charges the clause row of the handler to the enclosing code (§4.7.1, *The clause row*). `run_with_postgres` therefore declares what the Postgres driver touches, and `run_with_sqlite` declares what the SQLite driver touches. Neither declares `DB`.
 
 #### Sandboxing: restricting capabilities
 
@@ -2486,6 +2498,49 @@ error[UndeclaredEffect]: undeclared effect
    |                 +++++++++
 ```
 
+**The note and the help.** When the effect comes from a foreign call that the handler's operation bodies make, the note traces the missing effect to that binding and the audit key that assumes its row (§4.5, *Proven and assumed rows*). The help for a handler body names the clause row, written as a `Handler` type, and does not name the fn that builds the handler. The fix line prints the whole missing row on one line, ready to paste. On a fn's `!` list the row is bare. Inside a `Handler` type, a row of two or more effects is in parentheses (§4.15.1). The example installs the standard SQLite driver. Its clause row is `Handler[DB ! (FS.Read, FS.Write, FS.Delete, Time.Read, Time.Sleep, Rand)]`, because the driver calls into `libsqlite3`, which opens files, takes locks, waits on a busy lock and may call `random()`:
+
+```blink
+import std.db
+
+fn count_users(conn: db.Connection) -> Result[Int, DBError] ! FS.Read, FS.Write {
+    with conn {                  // error: `conn` performs `FS.Delete, Time.Read, Time.Sleep, Rand`
+        db.query_one(t"SELECT count(*) FROM users")
+    }
+}
+```
+
+```
+error[UndeclaredEffect]: undeclared effect
+ --> users.bl:4:10
+  |
+4 |     with conn {
+  |          ^^^^ handler `std.db.Connection` performs `FS.Delete, Time.Read, Time.Sleep, Rand` outside the handler
+  |
+  = note: `FS.Delete` comes from `std.db_sqlite.sqlite_open`, a foreign call whose row is assumed under audit `STD-DB-SQLITE`
+  = note: function `count_users` declares `FS.Read, FS.Write`
+  = help: the clause row of `std.db.Connection` is `Handler[DB ! (FS.Read, FS.Write, FS.Delete, Time.Read, Time.Sleep, Rand)]`
+  = fix: write the whole row on the fn: `! FS.Read, FS.Write, FS.Delete, Time.Read, Time.Sleep, Rand`
+```
+
+`! FS, Time.Read, Time.Sleep, Rand` is a legal superset and also satisfies the `with`. Std writes the leaves, and the fix line does the same. `with db.connect(p)? { }` is charged the same row. A test under `with mock_db(...)` is charged no `FS`, because the mock handler has an empty clause row.
+
+A handler for another driver follows the same rule. A libpq driver talks to a server, so its clause row is `Net.Connect`:
+
+```blink
+impl Scoped for PgConnection {
+    type Context = Handler[DB ! Net.Connect]
+
+    fn enter(self) -> Handler[DB ! Net.Connect] {
+        pg_handler(self.conn)
+    }
+
+    fn exit(self, ok: Bool) ! Net.Connect {
+        pq_finish(self.conn)
+    }
+}
+```
+
 When the declared return type of a factory is narrower than the row that the handler expression has, the type mismatch carries a fix. The fix writes the inferred row in the declared type:
 
 ```
@@ -2493,10 +2548,10 @@ error[TypeError]: mismatched types
  --> db.bl:1:30
   |
 1 | fn logging_db(label: Str) -> Handler[DB] {
-  |                              ^^^^^^^^^^^ expected `Handler[DB]`, found `Handler[DB ! DB, IO.Log]`
+  |                              ^^^^^^^^^^^ expected `Handler[DB]`, found `Handler[DB ! (DB, IO.Log)]`
   |
   = note: the operations of this handler perform `DB, IO.Log` outside the handler
-  = fix: write the row in the declared type: `Handler[DB ! DB, IO.Log]`
+  = fix: write the row in the declared type: `Handler[DB ! (DB, IO.Log)]`
 ```
 
 #### First-class values
@@ -2582,7 +2637,7 @@ error[InsufficientHandlerCoverage]: insufficient handler coverage
 Handlers may be **partial**: a handler can omit operations of its effect. An operation that has no body in the effect declaration is a **primitive operation**. An operation that has a body in the effect declaration is a **derived operation** (the `Net.Connect` verbs in §4.4.1 are derived operations over the primitive `request`). An omitted primitive operation forwards to the enclosing handler as if `default.op(args)` were written. The forward performs the effect outside the handler, so the effect is in the clause row (*The clause row* above). A handler that forwards, or whose operation bodies call other effects, has that row in its type:
 
 ```blink
-fn logging_db(label: Str) -> Handler[DB ! DB, IO.Log] {
+fn logging_db(label: Str) -> Handler[DB ! (DB, IO.Log)] {
     handler DB {
         fn read(query: Template[DB]) -> Result[List[Row], DBError] {
             io.log("{label}: read {query}")
@@ -2610,7 +2665,7 @@ fn mock_net(responses: Map[Str, Str]) -> Handler[Net.Connect] {
     }
 }
 
-fn logging_get() -> Handler[Net.Connect ! Net.Connect, IO.Log] {
+fn logging_get() -> Handler[Net.Connect ! (Net.Connect, IO.Log)] {
     handler Net.Connect {
         fn get(url: Str) -> Result[Response, NetError] {
             io.log("GET {url}")
@@ -3079,23 +3134,23 @@ pub type Connection {
 }
 
 impl Scoped for Connection {
-    type Context = Handler[DB]
+    type Context = Handler[DB ! (FS.Read, FS.Write, FS.Delete, Time.Read, Time.Sleep, Rand)]
 
-    fn enter(self) -> Handler[DB] {
+    fn enter(self) -> Handler[DB ! (FS.Read, FS.Write, FS.Delete, Time.Read, Time.Sleep, Rand)] {
         sqlite_handler(self.handle)
     }
 
-    fn exit(self, ok: Bool) {
+    fn exit(self, ok: Bool) ! FS.Read, FS.Write, FS.Delete {
         sqlite_close(self.handle)
     }
 }
 
-pub fn connect(path: Str) -> Result[Connection, DBError] {
+pub fn connect(path: Str) -> Result[Connection, DBError] ! FS.Read, FS.Write, FS.Delete {
     let handle = sqlite_open(path)?
     Ok(Connection { handle: handle })
 }
 
-// Usage
+// Usage: the `with` discharges `DB`; the enclosing code declares the clause row
 with db.connect(":memory:")? {
     db.exec(t"CREATE TABLE users (name TEXT)")?
 }
@@ -3128,6 +3183,8 @@ The rule applies only when `T.Context` normalizes to `Handler[E]` with a concret
 **Acquire before the block.** `self` is passed by value, so `enter()` cannot hand new state to `exit()`. A scoped effect handler therefore holds its resource from construction, like a `Closeable`. Build it in the `with` item, as `connect` does above. Entering the same value in two `with` blocks runs `exit()` twice; W0611 (§5.5) warns about it.
 
 A second `exit()` on a value whose resource is already released should do nothing, or should fail with a defined error. The stdlib's native handles do this: after `close`, a call on the handle returns an error such as `Err(ConnectionError("connection is closed"))`, not a use-after-free. This is guidance for user impls, not a rule the compiler checks. `std.testing`'s `Cleanup` runs its action on each `exit()`, so a second entry runs the action a second time.
+
+The clause row of the handler is part of `Context`. `Handler[DB]` here would claim that the driver performs nothing outside the handler, which is false for a driver that opens files. `":memory:"` does not change this: the row is a bound on every path of the driver, not a prediction for one call (§9.1, *Foreign Rows Inside a Built-in Effect's Handler*).
 
 A failed acquisition uses `?` on the item: `with db.connect(p)? { }`. The `?` fires before the scope is entered, so a failed open needs no cleanup.
 

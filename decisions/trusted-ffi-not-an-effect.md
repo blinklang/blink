@@ -305,13 +305,14 @@ An `@ffi` decl states its real row. `FFI` is not an effect. The pure claim is wr
 ```blink
 @ffi("sqlite3", "sqlite3_errmsg")
 @trusted(audit: "DB-003")
-@effects(DB)
-fn sqlite_errmsg_ffi(handle: Sqlite3) -> Str {}
+fn sqlite_errmsg_ffi(handle: Sqlite3) -> Str ! () {}
 
-pub fn last_error(db: Database) -> Str ! DB {
+pub fn last_error(db: Database) -> Str {
     sqlite_errmsg_ffi(db.handle)
 }
 ```
+
+Row updated by the driver-rows ruling: see [ffi-driver-handler-rows](ffi-driver-handler-rows.md).
 
 `audits.toml`, at the package root, next to `blink.toml`. The compiler resolves `"DB-003"` here at `blink check`, `blink build` and in the LSP. A pin maps a fn path to an AST hash of the fn's signature, row and body. The panel voted the schema shape (a non-empty `claim` plus per-fn pins, closed); the spec (§9.1 *Audit Records*) fixes the spelling below.
 
