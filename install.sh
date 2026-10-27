@@ -116,7 +116,7 @@ $sudo_cmd cp "$src/share/blink/libblink_std.a" \
             "$PREFIX/share/blink/"
 # Identity stamp: the installed blink verifies this against its own runtime.h
 # SHA at link time and rejects a stale/mismatched archive instead of silently
-# linking an ABI-skewed (memory-corrupting) binary (br 105z02). Guard for
+# linking an ABI-skewed (memory-corrupting) binary. Guard for
 # absence so an older tarball (pre-stamp) still installs.
 if [ -f "$src/share/blink/.archive-id" ]; then
     $sudo_cmd cp "$src/share/blink/.archive-id" "$PREFIX/share/blink/"

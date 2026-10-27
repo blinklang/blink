@@ -71,7 +71,7 @@ extern char* realpath(const char* __restrict path, char* __restrict resolved);
    allocation — as the original layout did — hides the intra-chunk `next`
    pointer from the scanner, and any collection that fires mid-arena reclaims
    non-head chunks behind the arena's back. Teardown then GC_FREEs
-   already-freed large blocks (k6s1nc). The payload stays atomic so user
+   already-freed large blocks and crashes. The payload stays atomic so user
    bytes don't falsely retain unrelated GC objects. */
 typedef struct blink_arena_chunk {
     struct blink_arena_chunk* next;
@@ -314,7 +314,7 @@ BLINK_RT_FN void __blink_cleanup_warn_push(const char* msg) {
  * (__blink_panic_frame_enter), so the drain branch never steals a panic that
  * the inner assert_panics should catch. Else if armed: capture
  * the message, run in-body cleanup down to the armed frame's mark, then longjmp
- * into assert_panics. Else if a test-hook is installed (zs3w3y): the test
+ * into assert_panics. Else if a test-hook is installed: the test
  * runner registered it to record the failure and longjmp back to its per-test
  * frame so an uncaught panic fails one test instead of killing the whole binary.
  * If none of those: terminate the process exactly as the historic inline panic
@@ -332,7 +332,7 @@ BLINK_RT_FN void __blink_panic_dispatch(const char* msg) {
         longjmp(__blink_panic_jmp, 1);
     }
     if (__builtin_expect(__blink_panic_test_hook != NULL, 0)) {
-        __blink_panic_test_hook(msg);   /* zs3w3y: records failure + longjmps; never returns */
+        __blink_panic_test_hook(msg);   /* records failure + longjmps; never returns */
     }
     fprintf(stderr, "%s\n", msg ? msg : "panic");
     exit(1);
@@ -2126,7 +2126,7 @@ BLINK_RT_FN int64_t blink_bytes_is_empty(const blink_bytes* b) {
 }
 #endif
 
-/* vfgp72: structural equality / ordering for Bytes (spec §3.6 Eq+Ord).
+/* Structural equality / ordering for Bytes (spec §3.6 Eq+Ord).
  * Lexicographic over the byte sequence; the shorter prefix sorts first. */
 BLINK_RT_FN int64_t blink_bytes_eq(const blink_bytes* a, const blink_bytes* b);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
@@ -2983,7 +2983,7 @@ BLINK_RT_FN const char* blink_str_debug(const char* s) {
  * (printable ASCII + all non-ASCII) is emitted as its literal UTF-8 char between
  * the quotes. Sole owner of Char quote/escape logic across every @derive(Debug)
  * site. See decisions/char-debug-form.md. A '\u{N}' form for non-printable
- * scalars with no named escape is deferred (task qvan6m); until then such a
+ * scalars with no named escape is not yet implemented; until then such a
  * scalar is emitted as its raw byte(s). */
 BLINK_RT_FN const char* blink_char_debug(int64_t code);
 #ifndef BLINK_RUNTIME_DECLS_ONLY

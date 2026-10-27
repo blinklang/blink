@@ -10,8 +10,8 @@ program module gets its own `.c` and `.h`, see
 stdlib `.c` → `.o` compiles whose inputs haven't changed since the last
 run.
 
-This decision records the cache that elides that work. Closes
-`br vwvvtg` and folds in `br daqhhj` (clean/info CLI surface).
+This decision records the cache that elides that work: its key, location
+and invalidation rules, plus the clean/info CLI surface.
 
 This is a build-orchestrator decision — no `/deliberate` panel needed.
 

@@ -2,7 +2,7 @@
 
 ## Context
 
-The per-module `.o` migration (project `tc83pp`) splits the program into
+The per-module `.o` migration splits the program into
 one `.o` per module instead of one fat `.c`. Generic monomorphizations
 (`List[Int]`, `Map[K, V]`, user `box_make[T]`, etc.) live in a
 program-global `mono_fns` / `mono_instances` table populated as the
@@ -19,7 +19,7 @@ needed. It documents the policy the existing codegen already implements
 (commit `1da102b` for fns; `BLINK_TD_*` typedef guards predate that for
 struct typedefs) and the test surface that protects it.
 
-> **Audit 2026-06 (br `7akctz`):** the `BLINK_TD_*` typedef guards were
+> **Audit 2026-06:** the `BLINK_TD_*` typedef guards were
 > re-audited under the per-module emit model after stdlib monos moved to
 > the archive monolith and user monos moved to `static inline`. Confirmed
 > **load-bearing and retained** — they dedup the same generic typedef

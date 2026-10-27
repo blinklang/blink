@@ -244,7 +244,7 @@ ICE codes use the `I` prefix. `@allow` and `[lints]` take warning names only, so
 | TraitContractExtraMethod | E0905 | Trait contract: impl declares method not in trait | Trait contract | §3.6 |
 | TraitContractGenericMismatch | E0906 | Trait contract: generic-parameter mismatch | Trait contract | §3.6 |
 | TraitContractSealedBuiltin | E0907 | Sealed built-in trait cannot be redefined or implemented for user types | Trait contract | §3.6 |
-| PolyImplUnsupported | E0908 | Polymorphic impl header parses but is not yet compiled (project b1bdnh) | Trait contract | §3.6 |
+| PolyImplUnsupported | E0908 | Polymorphic impl header parses but is not yet compiled | Trait contract | §3.6 |
 | ImplBinderUnused | E0909 | Impl type-parameter binder unused in the impl header's type positions | Trait contract | §3.6 |
 | TraitContractArgArity | E0910 | Impl supplies the wrong number of trait type arguments | Trait contract | §3.6 |
 | MissingSupertraitImpl | E0911 | An impl of a trait whose supertrait the implementing type does not implement under the impl's own bounds; every impl must satisfy each supertrait of its trait, using only the bounds the impl writes and their supertraits. Primary span on the binder parameter that lacks the bound (not the whole binder list); the headline names the failed impl and the supertrait. When the obligation does not end at a binder (for example `impl Ord for H[F]`, or no impl of the supertrait at all), the primary span is the trait reference. The help that adds a missing bound is machine-applicable | Trait contract | §3.6 |

@@ -2,7 +2,7 @@
 
 ## Context
 
-The stdlib factoring spike (br umbrella `eyr6wf`) compiles stdlib once
+The stdlib factoring spike compiles stdlib once
 into `build/libblink_std.a` and links it into every test binary
 instead of having each test re-emit and re-compile the same ~1850
 lines of stdlib C. Sub-project #17 nails down the symbol/linkage
