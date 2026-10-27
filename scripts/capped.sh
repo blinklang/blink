@@ -169,12 +169,15 @@ size_kib() {
     esac
 }
 
-kib=$(size_kib "$mem")
+os=$(uname -s 2>/dev/null)
+kib=
+# Darwin takes ulimit -v and does not hold a process to it.
+[ "$os" = Darwin ] || kib=$(size_kib "$mem")
 # RLIMIT_NPROC counts every process and thread of the user, not only this run,
 # so the cap is what runs now plus the run's share.
 procs=
 uid=$(id -u)
-if [ -d /proc/self/task ]; then
+if [ "$os" = Linux ]; then
     # Linux counts threads against RLIMIT_NPROC, and ps -L lists them.
     running=$(ps -L -u "$uid" -o lwp= 2>/dev/null | wc -l)
 else

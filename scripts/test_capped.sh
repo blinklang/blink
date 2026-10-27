@@ -29,7 +29,7 @@ own_cgroup=$(cut -d: -f3 /proc/self/cgroup)
 fake_path() {
     dir="$WORK/$1"
     mkdir -p "$dir"
-    for t in bash sh env cat cut ps wc id tr head sleep seq timeout grep; do
+    for t in bash sh env cat cut ps wc id tr head sleep seq timeout grep uname; do
         p=$(command -v "$t") && ln -sf "$p" "$dir/$t"
     done
     if [ "${2:-}" != noprlimit ]; then
@@ -59,6 +59,20 @@ if command -v prlimit >/dev/null 2>&1; then
     fi
 else
     echo "SKIP: no prlimit on this machine"
+fi
+
+# Darwin: ps -L lists keywords, RLIMIT_NPROC counts processes, and ulimit -v
+# does not hold. Stubs stand in for uname and ps: three processes of this user.
+P=$(fake_path darwin noprlimit)
+rm -f "$P/uname" "$P/ps"
+printf '#!/bin/sh\necho Darwin\n' > "$P/uname"
+printf '#!/bin/sh\n[ "$*" = "-ax -o uid=" ] || exit 1\nu=$(id -u)\nprintf "%%s\\n" "$u" 0 "$u" 0 "$u"\n' > "$P/ps"
+chmod +x "$P/uname" "$P/ps"
+out=$(run PATH="$P" BLINK_GATE_TASKS_MAX=100000 "$CAPPED" bash -c 'echo "$(ulimit -u) $(ulimit -v)"' 2> "$WORK/err")
+if [ "$out" = "100003 unlimited" ] && [ "$(notices)" = 1 ]; then
+    pass "Darwin: the process cap counts this user's processes, and no address space cap"
+else
+    flunk "Darwin (out=[$out]: $(cat "$WORK/err"))"
 fi
 
 P=$(fake_path noprlimit noprlimit)

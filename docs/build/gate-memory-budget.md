@@ -151,7 +151,7 @@ The first way that works caps the run:
 | systemd user scope, no `blink-gates.slice` unit | the same scope in the default user slice | one line |
 | systemd user scope, `BLINK_GATE_SLICE` names a unit that cannot hold a scope | the same scope in the default user slice | one line |
 | no systemd user scope, `prlimit` | address space 12G per process, user processes = running + 1024 | one line |
-| no `prlimit` | `ulimit -v` and `ulimit -u`, the same limits | one line |
+| no `prlimit` | `ulimit -v` and `ulimit -u`, the same limits; no `ulimit -v` on Darwin, which does not hold a process to it | one line |
 | none of these work | no cap; the task still runs | one line |
 
 The scope sits in the slice even when the caller already does, for example a run that a
