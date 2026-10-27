@@ -152,6 +152,7 @@ For each bug:
 7. `br close <id>`
 
 When working multiple bugs: use parallel agents with worktrees. Each agent gets one bug.
+Each worker brief says: build probes in `scripts/scratch.sh new <name>`, and run `scripts/scratch.sh clean <name>` when the branch lands.
 
 ### type:friction — Auto-start, parallelizable
 For each friction item:

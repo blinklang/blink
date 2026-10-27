@@ -391,6 +391,10 @@ stop, and that a child OOM while the gate reclaims page cache names no gate cap.
 `scripts/test_corpus.sh` and `scripts/test_fmt_semantic.sh` prove that a corpus row and an
 fmt file fail with that line as their reason.
 
+## Probe dirs
+
+Probe builds go in `scripts/scratch.sh new <name>` and leave by `scripts/scratch.sh clean <name>` when the branch lands; at its end `task ci` runs `scripts/scratch.sh check`, which warns past `BLINK_SCRATCH_WARN` (4G), says when the root is on tmpfs (RAM), and never fails the gate.
+
 ## Benchmarks in the slice
 
 `task bench` and `task ci-profile` run in the slice too, so the slice's CPU quota holds
