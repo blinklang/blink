@@ -21,7 +21,7 @@ fail=0
 
 R="$WORK/root"
 mkdir -p "$R/scripts" "$R/tests" "$R/build" "$R/fakec/lib/std" "$R/src"
-cp scripts/capped.sh scripts/corpus.sh scripts/corpus_one.sh scripts/default_jobs.sh scripts/corpus_std_pch_key.sh scripts/corpus_sample.sh scripts/corpus_check.sh scripts/corpus_per_module_check.sh scripts/corpus_per_module_slice_entries.sh "$R/scripts/"
+cp scripts/capped.sh scripts/corpus.sh scripts/corpus_one.sh scripts/default_jobs.sh scripts/inner_jobs.sh scripts/corpus_std_pch_key.sh scripts/corpus_sample.sh scripts/corpus_check.sh scripts/corpus_per_module_check.sh scripts/corpus_per_module_slice_entries.sh "$R/scripts/"
 : > "$R/build/gc_unity.c"
 # corpus.sh takes the compiler archive roots from the compiler binary's imports.
 printf 'import std.fs\nimport lexer.{Lex}\nimport cg\n\nfn main() {}\n' > "$R/src/blinkc_main.bl"
@@ -97,6 +97,9 @@ elif grep -q SELFTEST_DEBUG_INFO "$src"; then
     printf 'int main(void) { return 0; }\n' > "$out.c"
     cc -pipe -g -O0 -DBLINK_DEBUG -o "$out" "$out.c" || exit 1
     readelf -S "$out" > "$out.sections"
+elif grep -q SELFTEST_ENV "$src"; then
+    # The test binary notes the worker budget it got.
+    printf '#!/bin/sh\necho "${BLINK_JOBS:-unset} ${GC_MARKERS:-unset}" >> "$SELFTEST_ENV_OUT"\nexit 0\n' > "$out"
 else
     printf '#!/bin/sh\nexit 0\n' > "$out"
 fi
@@ -421,6 +424,25 @@ else
     sed 's/^/    /' "$WORK/out.log"
     fail=1
 fi
+# A test binary that runs its own per-module build would start one cc per CPU
+# in each of the sweep's workers, and Boehm one marker per CPU: every row, in
+# each mode, gets its share of the worker budget and one marker.
+echo '// SELFTEST_ENV' > "$R/tests/test_selftest_env.bl"
+printf 'tests/test_selftest_env.bl\n' > "$WORK/env.txt"
+want_jobs=$(cd "$R" && ./scripts/inner_jobs.sh 2)
+for pm in 0 1; do
+    : > "$WORK/env.out"
+    (cd "$R" && env -u BLINK_JOBS -u GC_MARKERS SELFTEST_ENV_OUT="$WORK/env.out" CORPUS_PER_MODULE=$pm \
+        CORPUS_COMPILER=fakec CORPUS_JOBS=2 ./scripts/corpus.sh --only "$WORK/env.txt" --no-lint) > "$WORK/out.log" 2>&1
+    got_env=$(cat "$WORK/env.out")
+    if [ "$got_env" = "$want_jobs 1" ]; then
+        echo "PASS row-gets-worker-budget (CORPUS_PER_MODULE=$pm)"
+    else
+        echo "FAIL row-gets-worker-budget (CORPUS_PER_MODULE=$pm): the test binary saw [$got_env], want [$want_jobs 1]"
+        sed 's/^/    /' "$WORK/out.log"
+        fail=1
+    fi
+done
 (cd "$R" && CORPUS_PER_MODULE=yes CORPUS_COMPILER=fakec ./scripts/corpus.sh --only "$WORK/all_pass.txt" --no-lint) > "$WORK/out.log" 2>&1
 expect "per-module-bad-value" 2 $?
 

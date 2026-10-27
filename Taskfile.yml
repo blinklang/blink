@@ -187,13 +187,12 @@ tasks:
     cmds:
       # Each test binary lands in build/tests/, which has no lib/ beside it, so a
       # test that compiles a program in process finds the prelude through BLINK_ROOT.
-      # Each worker's build may run one cc per CPU, so BLINK_JOBS holds the product
-      # of the workers and their cc processes near the CPU count, as corpus.sh does.
+      # Each worker's build may run one cc per CPU, so BLINK_JOBS gives each
+      # worker its share of the gate's worker budget, as corpus.sh does.
       # Boehm starts one marker thread per CPU in each test binary unless told
       # otherwise.
       - |
-        jobs=$(( $(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 8) / {{.JOBS}} ))
-        [ "$jobs" -lt 1 ] && jobs=1
+        jobs=$(./scripts/inner_jobs.sh {{.JOBS}}) || exit 2
         export BLINK_JOBS="${BLINK_JOBS:-$jobs}" GC_MARKERS="${GC_MARKERS:-1}"
         BLINK_ROOT="$(pwd)" {{.BUILD_DIR}}/blink test tests/ --parallel {{.JOBS}}
 
@@ -301,8 +300,12 @@ tasks:
         trap 'rm -f "$skip_file"' EXIT
         # One marker thread per worker. Boehm sizes its marker pool from the
         # machine, so every fmt worker would otherwise start ~one marker per
-        # core and the fan-out oversubscribes by that factor.
+        # core and the fan-out oversubscribes by that factor. A test binary
+        # that the semantic pass runs may start its own per-module build, which
+        # takes BLINK_JOBS cc at once: give it the worker's share of the budget.
         export GC_MARKERS=1
+        BLINK_JOBS="${BLINK_JOBS:-$(./scripts/inner_jobs.sh {{.JOBS}})}" || exit 2
+        export BLINK_JOBS
         printf '%s\n' test_hof test_lazy_iter test_semver test_toml test_manifest test_lockfile test_http_types test_http_error test_json test_json_builder test_args test_args_cli test_derive_nested test_embed test_combining_iterators test_http_client test_iterators test_match_void_if test_multifile_visibility test_question_ops test_string_iter test_audit test_e2e_gitdep test_e2e_transitive test_e2e_pub_visibility test_async_spawn_types test_tcp_socket test_pub_import test_std_testing test_c_reserved_names test_module_qualified_types test_ue_complex_returns test_effects test_effect_vtable test_sqlite test_builtin_methods test_priv_access test_unused_import test_cross_module_effects test_cross_module_effects_helper test_map_seed_deterministic > "$skip_file"
 
         golden_results=$(parallel -j {{.JOBS}} --halt never ./scripts/run_fmt_golden.sh {} {{.FMT_BLINKC}} ::: tests/fmt/input_*.bl 2>&1 || true)
@@ -919,6 +922,7 @@ tasks:
         ./scripts/test_check_build_warnings.sh
         ./scripts/test_capped.sh
         ./scripts/test_capped_child.sh
+        ./scripts/test_gate_budget.sh
         ./scripts/check_spec_refs.sh
         ./scripts/test_check_spec_refs.sh
         './scripts/corpus_per_module_slice_drift.sh scripts/corpus_per_module_slice.txt'
@@ -1072,7 +1076,9 @@ tasks:
         {{.BLINKC}} --link-archive {{.BUILD_DIR}}/libblink_std.h src/cli.bl {{.BUILD_DIR}}/cli.c 2>/dev/null
         scripts/stamp_cli_version.sh {{.BUILD_DIR}}/cli.c "{{.VERSION}}-dev+$(date +%Y%m%d%H%M%S)"
         cc {{.LINK_OPT}} -o {{.BUILD_DIR}}/blink {{.BUILD_DIR}}/cli.c -I{{.BUILD_DIR}} {{.BUILD_DIR}}/libblink_std.a -lm -lgc -pthread -Wl,--gc-sections
-      - 'BLINK_ROOT="$(pwd)" {{.BUILD_DIR}}/blink test tests/ --no-per-module --parallel {{.JOBS}} --quiet'
+      # Each test binary takes one GC marker, and a per-module build that a
+      # test runs takes its worker's share of the budget, as in `task test`.
+      - 'BLINK_JOBS="${BLINK_JOBS:-$(./scripts/inner_jobs.sh {{.JOBS}})}" GC_MARKERS="${GC_MARKERS:-1}" BLINK_ROOT="$(pwd)" {{.BUILD_DIR}}/blink test tests/ --no-per-module --parallel {{.JOBS}} --quiet'
       - task: test-bootstrap-cold
       - task: test-sqlite-peel
       - task: __fmt-goldens
@@ -1173,15 +1179,17 @@ tasks:
         '
 
         # Phase 5: full test suite (429-ish files).
-        time_phase blink-test "BLINK_ROOT=$(pwd) {{.BUILD_DIR}}/blink test tests/ --no-per-module --parallel {{.JOBS}} --quiet"
+        # The same worker budget and GC markers as ci-monolith and __fmt-goldens.
+        inner_jobs=$(./scripts/inner_jobs.sh {{.JOBS}}) || exit 2
+        time_phase blink-test "BLINK_JOBS=$inner_jobs GC_MARKERS=1 BLINK_ROOT=$(pwd) {{.BUILD_DIR}}/blink test tests/ --no-per-module --parallel {{.JOBS}} --quiet"
 
         # Phase 6: fmt waves — each parallel invocation timed separately and
         # given its own --joblog so per-file timings are available for free.
         printf "%s\n" test_hof test_lazy_iter test_semver test_toml test_manifest test_lockfile test_http_types test_http_error test_json test_json_builder test_args test_args_cli test_derive_nested test_embed test_combining_iterators test_http_client test_iterators test_match_void_if test_multifile_visibility test_question_ops test_string_iter test_audit test_e2e_gitdep test_e2e_transitive test_e2e_pub_visibility test_async_spawn_types test_tcp_socket test_pub_import test_std_testing test_c_reserved_names test_module_qualified_types test_ue_complex_returns test_effects test_effect_vtable test_sqlite test_builtin_methods test_priv_access test_unused_import test_cross_module_effects test_cross_module_effects_helper test_test_compile_errors test_map_seed_deterministic > "$skip_file"
 
-        time_phase fmt-golden "parallel --joblog {{.BUILD_DIR}}/fmt-golden.${MODE}.joblog -j {{.JOBS}} --halt never ./scripts/run_fmt_golden.sh {} {{.BLINKC}} ::: tests/fmt/input_*.bl > /dev/null 2>&1 || true"
-        time_phase fmt-idempotent "parallel --joblog {{.BUILD_DIR}}/fmt-idem.${MODE}.joblog -j {{.JOBS}} --halt never ./scripts/run_fmt_idempotent.sh {} {{.BLINKC}} \"$skip_file\" ::: tests/test_*.bl > /dev/null 2>&1 || true"
-        time_phase fmt-semantic "parallel --joblog {{.BUILD_DIR}}/fmt-sem.${MODE}.joblog -j {{.JOBS}} --halt never ./scripts/run_fmt_semantic.sh {} {{.BLINKC}} \"$skip_file\" ::: tests/test_*.bl > /dev/null 2>&1 || true"
+        time_phase fmt-golden "BLINK_JOBS=$inner_jobs GC_MARKERS=1 parallel --joblog {{.BUILD_DIR}}/fmt-golden.${MODE}.joblog -j {{.JOBS}} --halt never ./scripts/run_fmt_golden.sh {} {{.BLINKC}} ::: tests/fmt/input_*.bl > /dev/null 2>&1 || true"
+        time_phase fmt-idempotent "BLINK_JOBS=$inner_jobs GC_MARKERS=1 parallel --joblog {{.BUILD_DIR}}/fmt-idem.${MODE}.joblog -j {{.JOBS}} --halt never ./scripts/run_fmt_idempotent.sh {} {{.BLINKC}} \"$skip_file\" ::: tests/test_*.bl > /dev/null 2>&1 || true"
+        time_phase fmt-semantic "BLINK_JOBS=$inner_jobs GC_MARKERS=1 parallel --joblog {{.BUILD_DIR}}/fmt-sem.${MODE}.joblog -j {{.JOBS}} --halt never ./scripts/run_fmt_semantic.sh {} {{.BLINKC}} \"$skip_file\" ::: tests/test_*.bl > /dev/null 2>&1 || true"
 
         # Phase 7: per-module .o pipeline + gen1/gen2 byte-equality.
         time_phase ci-per-module-checks 'task ci-per-module-checks > /dev/null'

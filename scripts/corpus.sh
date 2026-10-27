@@ -112,11 +112,6 @@ fi
 if [ "$per_module" = 1 ]; then
     export BLINK_PER_MODULE=1
     run_lint=0
-    # A per-module build runs one cc per unit, up to the CPU count at once, and
-    # each worker runs one build: hold the product to the core count.
-    pm_jobs=$(( $(nproc 2>/dev/null || echo 8) / jobs ))
-    [ "$pm_jobs" -lt 1 ] && pm_jobs=1
-    export BLINK_JOBS="${BLINK_JOBS:-$pm_jobs}"
 else
     # The per-module path is blink's default, so an unset env would not keep this
     # mode on one unit once the compiler archive is off.
@@ -342,9 +337,12 @@ if command -v "$perf_bin" >/dev/null 2>&1 \
     perf_cmd=("$perf_bin" stat -x, -e instructions:u,task-clock -o "$perf_out" --)
 fi
 
-# The same share of the CPUs a per-module run gives each worker.
-pm_row_jobs=$(( $(nproc 2>/dev/null || echo 8) / jobs ))
-[ "$pm_row_jobs" -lt 1 ] && pm_row_jobs=1
+# A per-module build runs one cc per unit, up to BLINK_JOBS at once, and each
+# worker runs one build: each worker gets its share of the gate's worker
+# budget. Every row gets it, not only a per-module row: a test binary that runs
+# its own per-module build would otherwise start one cc per CPU.
+pm_row_jobs=$(./scripts/inner_jobs.sh "$jobs") || exit 2
+export BLINK_JOBS="${BLINK_JOBS:-$pm_row_jobs}"
 export CORPUS_PM_BLINK_JOBS="$pm_row_jobs"
 
 mode_note=""

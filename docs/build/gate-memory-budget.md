@@ -1,8 +1,9 @@
 # Gate memory and process budget
 
 Status: the Taskfile applies the "one gate scope" rows (see "Applied: one gate scope"
-below) and the per-child rows (see "Applied: one cap per child"). The other rows are a
-proposal: the tickets that add the slice file and the concurrency bound apply them.
+below), the per-child rows (see "Applied: one cap per child") and the worker budget (see
+"Knobs and how they multiply"). The slice rows are a proposal: the ticket that adds the
+slice file applies them.
 
 ## Why
 
@@ -88,25 +89,66 @@ ran each test binary with no timeout; the per-child caps below now give it one.
 
 ## Knobs and how they multiply
 
+A gate has one worker budget, B. `scripts/default_jobs.sh` gives it, and it is the only
+gate script that reads the CPU count:
+
+```
+C = CPUs the gate may use: nproc when a quota or an affinity mask holds the gate below
+    nproc --all (as in the slice), else nproc / 2
+M = BLINK_GATE_MEMORY_MAX / BLINK_GATE_WORKER_MEMORY   (12G / 1G = 12)
+B = max(1, min(C, M))
+```
+
+On this machine B is 12 in the slice (C = 12, M = 12) and outside it (C = 24 / 2). On a
+machine with 64 open CPUs, C is 32 and M holds B to 12, so the gate does not run 32
+workers into its 12G cap.
+
+Each fan-out takes its workers from B, and `scripts/inner_jobs.sh <workers>` gives each
+worker max(1, B / workers) for the processes it starts. So workers x inner is at most B,
+or the worker count when a caller sets more workers than B.
+
 | Knob | Where | Value |
 |---|---|---|
-| Taskfile `JOBS` | `scripts/default_jobs.sh` | half the CPUs, or all CPUs that a quota gives: 12 |
-| `CORPUS_JOBS` | `scripts/corpus.sh` | default `JOBS`: 12 |
-| `BLINK_JOBS` per corpus row | `scripts/corpus.sh` | `nproc / CORPUS_JOBS`: 1 in the slice |
-| `blink test --parallel` | Taskfile `test` | `JOBS`: 12 (CLI default 4) |
-| `BLINK_JOBS` per `blink test` worker | Taskfile `__test` | `nproc / JOBS`, at least 1: 1 in the slice (the CLI alone uses `nproc`) |
-| `parallel -j` in the fmt stage | Taskfile `__fmt-goldens` | `JOBS`: 12 |
-| `GC_MARKERS` | `corpus.sh`, `__fmt-goldens`, `__test` | 1 (the CLI alone does not set it, so Boehm starts one marker per CPU) |
+| Taskfile `JOBS` | `scripts/default_jobs.sh` | B: 12 |
+| `CORPUS_JOBS` | `scripts/corpus.sh` | `JOBS`: 12 |
+| `BLINK_JOBS` for every corpus row | `scripts/corpus.sh` | `inner_jobs.sh CORPUS_JOBS`: 1 |
+| `blink test --parallel` | Taskfile `__test`, `__ci-monolith`, `__ci-profile` | `JOBS`: 12 (CLI default 4) |
+| `BLINK_JOBS` for each `blink test` worker | Taskfile `__test`, `__ci-monolith`, `__ci-profile` | `inner_jobs.sh JOBS`: 1 (the CLI alone uses `nproc`) |
+| `parallel -j` in the fmt stage | Taskfile `__fmt-goldens`, `__ci-profile` | `JOBS`: 12 |
+| `BLINK_JOBS` for each fmt worker | Taskfile `__fmt-goldens`, `__ci-profile` | `inner_jobs.sh JOBS`: 1 |
+| `GC_MARKERS` | `corpus.sh`, `__fmt-goldens`, `__test`, `__ci-monolith`, `__ci-profile` | 1 (the CLI alone does not set it, so Boehm starts one marker per CPU) |
+| `cc -flto` jobs for each gen1 link | `scripts/gen1.sh` | B; the two links run at once, 2B for about 10 s |
+| ratchet commit walk | `scripts/lint_codegen.sh` | B subshells |
 
-The products:
+A caller's `BLINK_JOBS`, `GC_MARKERS`, `JOBS` or `CORPUS_JOBS` wins over the default.
 
-- `task ci` runs the corpus (12 workers) at the same time as the fmt goldens (12 workers),
-  the warning gate, the ratchet and the gate self-tests. That is about 25 workers.
-- `blink test --parallel 12` lets each worker run a per-module build with up to `nproc`
-  `cc` processes: 12 x 12 = 144 in the slice, 12 x 24 = 288 outside it.
-- Each test binary that `blink test` runs gets one GC marker thread per CPU.
+Settings:
+
+| Variable | Default | Effect |
+|---|---|---|
+| `BLINK_GATE_WORKER_MEMORY` | `1G` | memory to allow for each worker: 2 times the largest single process (500 MB). `infinity` drops the memory limit from B |
+| `BLINK_GATE_MEMORY_MAX` | `12G` | the gate's cap (see "Applied: one gate scope"); B reads it too |
+
+`BLINK_JOBS` matters for every row, not only a per-module one: many tests run their own
+per-module `blink build`, which starts `BLINK_JOBS` cc at once, or one per CPU when it is
+not set. Before the budget, a corpus sweep or an fmt semantic pass could run 12 workers x
+12 cc in the slice (12 x 24 outside it).
+
+Where stages run at once, their workers add:
+
+- `task ci` runs the corpus (B workers) beside the fmt goldens (B workers), the warning
+  gate, the ratchet and the gate self-tests. That is about 2B + 15 processes while the fmt
+  goldens run.
 - Two gates in two worktrees at the same time double all of this. The slice holds the sum
   only when both run in it.
+
+`scripts/test_gate_budget.sh`, in the gate self-tests, runs `default_jobs.sh` and
+`inner_jobs.sh` with a fake `nproc` of 1, 4, 12 and 64 CPUs, with and without a quota,
+under several memory sizes, and proves that B is min(C, M) and that workers x inner stays
+within the budget. It also fails when another gate script reads the CPU count, and when a
+Taskfile task that runs `parallel -j` or `blink test tests/` sets no `GC_MARKERS` or
+`BLINK_JOBS`. `scripts/test_corpus.sh` proves that a row's test binary gets the share and
+one marker in both corpus modes.
 
 ## Proposed budget
 
@@ -123,8 +165,8 @@ The products:
 | Per child (one test binary or one corpus row) `MemoryMax` | 2G | 4 times the largest single process (500 MB). One runaway child dies alone. |
 | Per child `TasksMax` | 256 | Holds a per-module build at `BLINK_JOBS=24` plus GC marker threads. Stops a self-spawn chain at about 115 MB. |
 | Per child run timeout | 600 s | Same as the corpus `CORPUS_RUN_TIMEOUT`. Before the per-child caps, the fmt semantic stage had none. |
-| `BLINK_JOBS` for `blink test --parallel N` workers | `nproc / N`, at least 1 | Holds the `cc` count near the CPU count, as `corpus.sh` does. |
-| `GC_MARKERS` for test binaries | 1 | Same as the corpus and fmt stages. |
+| `BLINK_JOBS` for `blink test --parallel N` workers | B / N, at least 1 (applied) | Holds the `cc` count to the worker budget, as `corpus.sh` does. |
+| `GC_MARKERS` for test binaries | 1 (applied) | Same as the corpus and fmt stages. |
 
 These numbers come from one machine and one commit. Measure again when a gate adds a
 stage or when its `pids.peak` or anon + shmem doubles.
