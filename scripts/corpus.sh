@@ -341,14 +341,13 @@ fi
 # worker runs one build: each worker gets its share of the gate's worker
 # budget. Every row gets it, not only a per-module row: a test binary that runs
 # its own per-module build would otherwise start one cc per CPU.
-pm_row_jobs=$(./scripts/inner_jobs.sh "$jobs") || exit 2
-export BLINK_JOBS="${BLINK_JOBS:-$pm_row_jobs}"
-export CORPUS_PM_BLINK_JOBS="$pm_row_jobs"
+BLINK_JOBS=$(./scripts/inner_jobs.sh "$jobs") || exit 2
+export BLINK_JOBS
 
 mode_note=""
-[ "$per_module" = 1 ] && mode_note=", per-module, BLINK_JOBS=$BLINK_JOBS"
-[ "$slice_total" -gt 0 ] && mode_note="$mode_note, $slice_total per-module slice rows at BLINK_JOBS=$pm_row_jobs"
-echo "corpus: $total files, compiler $comp, $jobs workers$mode_note"
+[ "$per_module" = 1 ] && mode_note=", per-module"
+[ "$slice_total" -gt 0 ] && mode_note="$mode_note, $slice_total per-module slice rows"
+echo "corpus: $total files, compiler $comp, $jobs workers at BLINK_JOBS=$BLINK_JOBS$mode_note"
 run_rows() {
     f=$1
     shift

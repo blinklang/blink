@@ -120,7 +120,13 @@ or the worker count when a caller sets more workers than B.
 | `cc -flto` jobs for each gen1 link | `scripts/gen1.sh` | B; the two links run at once, 2B for about 10 s |
 | ratchet commit walk | `scripts/lint_codegen.sh` | B subshells |
 
-A caller's `BLINK_JOBS`, `GC_MARKERS`, `JOBS` or `CORPUS_JOBS` wins over the default.
+A caller's `JOBS`, `CORPUS_JOBS` or `GC_MARKERS` wins over the default. A caller's
+`BLINK_JOBS` can make each worker's share smaller but not larger, as a `BLINK_JOBS` left
+in a login shell would otherwise multiply every fan-out again. To give each worker more
+cc, run fewer workers.
+
+`default_jobs.sh` reads sizes in K, M, G or T. systemd also takes a size such as `4.5G`
+or `50%` for the cap; `default_jobs.sh` then says on stderr that B has no memory limit.
 
 Settings:
 
@@ -136,19 +142,23 @@ not set. Before the budget, a corpus sweep or an fmt semantic pass could run 12 
 
 Where stages run at once, their workers add:
 
-- `task ci` runs the corpus (B workers) beside the fmt goldens (B workers), the warning
-  gate, the ratchet and the gate self-tests. That is about 2B + 15 processes while the fmt
-  goldens run.
+- `task ci` first runs gen1 (two links, 2B for about 10 s) beside the ratchet's commit walk
+  (B) and the gate self-tests (about 15 processes): about 3B at the peak.
+- Then it runs the corpus (B workers) beside the fmt goldens (B workers) and the warning
+  gate (two `blink check` processes, each with one Boehm marker per CPU). That is about 2B
+  + 2 processes for the 7 s that the fmt goldens take.
 - Two gates in two worktrees at the same time double all of this. The slice holds the sum
   only when both run in it.
 
 `scripts/test_gate_budget.sh`, in the gate self-tests, runs `default_jobs.sh` and
 `inner_jobs.sh` with a fake `nproc` of 1, 4, 12 and 64 CPUs, with and without a quota,
 under several memory sizes, and proves that B is min(C, M) and that workers x inner stays
-within the budget. It also fails when another gate script reads the CPU count, and when a
-Taskfile task that runs `parallel -j` or `blink test tests/` sets no `GC_MARKERS` or
-`BLINK_JOBS`. `scripts/test_corpus.sh` proves that a row's test binary gets the share and
-one marker in both corpus modes.
+within the budget, that each worker gets exactly max(1, B / workers), and that a caller's
+`BLINK_JOBS` only lowers the share. It also fails when another gate script reads the CPU
+count, and when a fan-out line in a Taskfile task (`parallel -j`, `--parallel`,
+`xargs -P`) sets no `GC_MARKERS` or `BLINK_JOBS`, on the line or by an export earlier in
+the task. `scripts/test_corpus.sh` proves that a row's test binary gets the share and one
+marker in each corpus mode, also when the caller sets a larger `BLINK_JOBS`.
 
 ## Proposed budget
 

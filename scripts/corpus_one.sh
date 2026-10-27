@@ -6,9 +6,9 @@
 #
 # pm builds this row on the per-module path whatever mode the sweep runs in:
 # BLINK_PER_MODULE=1 for the row's build and every build its test starts
-# through the CLI, no compiler archive, and BLINK_JOBS from
-# CORPUS_PM_BLINK_JOBS. Its sandbox, logs and record are keyed <base>.pm, so
-# the same file can also run as an ordinary row of the same sweep.
+# through the CLI, and no compiler archive. Its sandbox, logs and record are
+# keyed <base>.pm, so the same file can also run as an ordinary row of the
+# same sweep.
 #
 # <compiler dir> holds `blink`, `blinkc`, `libblink_std.a`, `libblink_std.h`
 # (build/gen0 has them as symlinks into its installed layout; a flat build/
@@ -74,7 +74,6 @@
 #                         a build that imports the modules it holds links it
 #   BLINK_PER_MODULE      1 in the per-module mode, for the row's build and
 #                         every build its test starts through the CLI
-#   CORPUS_PM_BLINK_JOBS  BLINK_JOBS for a pm row
 set -u
 
 file="$1"
@@ -96,7 +95,6 @@ case "$mode" in
         key="$base.pm"
         export BLINK_PER_MODULE=1
         unset BLINK_COMPILER_ARCHIVE
-        [ -n "${CORPUS_PM_BLINK_JOBS:-}" ] && export BLINK_JOBS="$CORPUS_PM_BLINK_JOBS"
         ;;
     *) echo "corpus_one: unknown mode $mode" >&2; exit 2 ;;
 esac

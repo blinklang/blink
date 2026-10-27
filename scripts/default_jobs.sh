@@ -31,6 +31,9 @@ fi
 kib() {
     num=${1%[KkMmGgTt]}
     case "$num" in '' | *[!0-9]*) return ;; esac
+    # Shell arithmetic reads a leading 0 as octal.
+    num=${num#"${num%%[!0]*}"}
+    num=${num:-0}
     case "$1" in
         *[Kk]) echo "$num" ;;
         *[Mm]) echo $((num * 1024)) ;;
@@ -39,8 +42,17 @@ kib() {
         *) echo $(((num + 1023) / 1024)) ;;
     esac
 }
-gate=$(kib "${BLINK_GATE_MEMORY_MAX:-12G}")
-worker=$(kib "${BLINK_GATE_WORKER_MEMORY:-1G}")
+# size <name> <value>: KiB of the value. systemd also takes sizes such as 4.5G
+# or 50%, which give no number here; say so, as the gate then caps at that
+# size while the workers fill the CPUs.
+size() {
+    s=$(kib "$2")
+    [ -z "$s" ] && [ "$2" != infinity ] &&
+        echo "default_jobs: cannot read $1=$2 (use K, M, G or T); the worker budget has no memory limit" >&2
+    echo "$s"
+}
+gate=$(size BLINK_GATE_MEMORY_MAX "${BLINK_GATE_MEMORY_MAX:-12G}")
+worker=$(size BLINK_GATE_WORKER_MEMORY "${BLINK_GATE_WORKER_MEMORY:-1G}")
 if [ -n "$gate" ] && [ -n "$worker" ] && [ "$worker" -gt 0 ]; then
     m=$((gate / worker))
     [ "$m" -lt "$j" ] && j=$m

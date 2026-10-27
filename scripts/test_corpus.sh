@@ -98,7 +98,6 @@ elif grep -q SELFTEST_DEBUG_INFO "$src"; then
     cc -pipe -g -O0 -DBLINK_DEBUG -o "$out" "$out.c" || exit 1
     readelf -S "$out" > "$out.sections"
 elif grep -q SELFTEST_ENV "$src"; then
-    # The test binary notes the worker budget it got.
     printf '#!/bin/sh\necho "${BLINK_JOBS:-unset} ${GC_MARKERS:-unset}" >> "$SELFTEST_ENV_OUT"\nexit 0\n' > "$out"
 else
     printf '#!/bin/sh\nexit 0\n' > "$out"
@@ -429,16 +428,29 @@ fi
 # each mode, gets its share of the worker budget and one marker.
 echo '// SELFTEST_ENV' > "$R/tests/test_selftest_env.bl"
 printf 'tests/test_selftest_env.bl\n' > "$WORK/env.txt"
-want_jobs=$(cd "$R" && ./scripts/inner_jobs.sh 2)
-for pm in 0 1; do
+# 64 open CPUs and a 12G gate at 2G a worker give a budget of 6, so each of 2
+# workers gets 3; a share taken from the CPUs alone would be 32. A caller's
+# BLINK_JOBS of 24 must not raise it.
+mkdir -p "$WORK/cpus"
+printf '#!/bin/sh\necho 64\n' > "$WORK/cpus/nproc"
+chmod +x "$WORK/cpus/nproc"
+want_jobs=3
+# <name> <CORPUS_PER_MODULE> <want> [corpus.sh args]: the slice run has a
+# plain row and a per-module row of the same file.
+for run in "plain 0 1" "per-module 1 1" "slice 0 2 --per-module-slice $WORK/env.txt"; do
+    set -- $run
+    name=$1 pm=$2 rows=$3
+    shift 3
     : > "$WORK/env.out"
-    (cd "$R" && env -u BLINK_JOBS -u GC_MARKERS SELFTEST_ENV_OUT="$WORK/env.out" CORPUS_PER_MODULE=$pm \
-        CORPUS_COMPILER=fakec CORPUS_JOBS=2 ./scripts/corpus.sh --only "$WORK/env.txt" --no-lint) > "$WORK/out.log" 2>&1
+    (cd "$R" && env -u GC_MARKERS PATH="$WORK/cpus:$PATH" BLINK_JOBS=24 BLINK_GATE_MEMORY_MAX=12G \
+        BLINK_GATE_WORKER_MEMORY=2G SELFTEST_ENV_OUT="$WORK/env.out" CORPUS_PER_MODULE=$pm \
+        CORPUS_COMPILER=fakec CORPUS_JOBS=2 ./scripts/corpus.sh --only "$WORK/env.txt" --no-lint "$@") > "$WORK/out.log" 2>&1
+    want_env=$(for _ in $(seq "$rows"); do echo "$want_jobs 1"; done)
     got_env=$(cat "$WORK/env.out")
-    if [ "$got_env" = "$want_jobs 1" ]; then
-        echo "PASS row-gets-worker-budget (CORPUS_PER_MODULE=$pm)"
+    if [ "$got_env" = "$want_env" ]; then
+        echo "PASS row-gets-worker-budget ($name)"
     else
-        echo "FAIL row-gets-worker-budget (CORPUS_PER_MODULE=$pm): the test binary saw [$got_env], want [$want_jobs 1]"
+        echo "FAIL row-gets-worker-budget ($name): the test binaries saw [$got_env], want [$want_env]"
         sed 's/^/    /' "$WORK/out.log"
         fail=1
     fi
