@@ -132,11 +132,13 @@ stage or when its `pids.peak` or anon + shmem doubles.
 
 `scripts/capped.sh` applies the three "one gate scope" rows. Each heavy Taskfile task
 re-runs itself through it: `bootstrap`, `regen`, `gen0`, `gen1`, `build-cli`, `build`,
-`compile-test`, `test`, `test-fmt`, `test-installed`, `fuzz`, `bench`, `build-binaries`,
-`ci`, `ci-fast`, `ci-release`, `ci-monolith`, `ci-per-module-checks`, `ci-profile`,
-`corpus`, `corpus-per-module`, `corpus-sample`, `corpus-only`, `warning-gate`,
-`typecheck-suite` and `rewrite-suite`. The task `<name>` holds only the re-run; its steps
-are in the internal task `__<name>`.
+`compile-test`, `test`, `test-fmt`, `test-installed`, `test-sqlite-peel`, `fuzz`,
+`bench`, `build-binaries`, `ci`, `ci-fast`, `ci-release`, `ci-monolith`,
+`ci-per-module-checks`, `ci-profile`, `corpus`, `corpus-per-module`, `corpus-sample`,
+`corpus-only`, `warning-gate`, `typecheck-suite` and `rewrite-suite`. The task `<name>`
+holds only the re-run; its steps are in the internal task `__<name>`.
+`test-bootstrap-cold` has no re-run: its one heavy step is its `build-cli` dep, which caps
+itself, and the rest is one `nm`.
 
 The capped run sets `BLINK_GATE_SCOPE`. A task that finds it set calls its body in
 place, so `task ci` gets one scope for the whole gate, and its nested tasks do not stack
@@ -190,11 +192,17 @@ Settings:
 `scripts/test_capped.sh`, in `task ci`'s gate self-tests, proves each path with caps of
 64M and 64 tasks.
 
-The dispatcher re-runs the task with only `--force`, `--silent`, `--verbose` and
-`-- <args>`. Task gives no list of the CLI vars, so `task ci JOBS=4` loses `JOBS=4`, and
-`--dry`, `--summary` and `--status` act on the dispatcher. Put the capped run around the
-call by hand, for example `scripts/capped.sh task ci JOBS=4`; the task then finds
-`BLINK_GATE_SCOPE` set and runs its body with the var.
+The dispatcher re-runs the task with `--force`, `--silent`, `--verbose`, `-- <args>`,
+the vars `BUILD_DIR`, `BLINKC`, `JOBS` and `VERSION` when they differ from their
+`DEFAULT_*`, and the vars `FMT_SEMANTIC`, `CORPUS_LINT` and `CORPUS_PM_SLICE` when they
+are set, so `task test JOBS=2` runs with `JOBS=2`. A value equal to the default is not
+passed on: the body works it out again in the scope, where `JOBS` can differ because
+`scripts/default_jobs.sh` reads the CPUs that the slice gives. Task gives
+no list of the CLI vars, so a var that the dispatcher does not name is lost, and `--dry`,
+`--summary` and `--status` act on the dispatcher. Put the capped run around the call by
+hand, for example `scripts/capped.sh task --dry ci`; the task then finds
+`BLINK_GATE_SCOPE` set and goes straight to its body. A new var that a person sets on the
+command line goes in the dispatcher's list, and a new global var also gets a `DEFAULT_*`.
 
 The dispatcher needs Task 3.47 or later, which reads the `if:` of a command. An older Task
 runs both commands; `scripts/capped.sh` then sees a dispatcher inside its own capped run

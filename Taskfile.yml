@@ -1,12 +1,18 @@
 version: '3'
 
+# A heavy task's capped re-run forwards a var only when it differs from its
+# DEFAULT_*, so a var set on the command line reaches the run.
 vars:
-  BUILD_DIR: build
-  BLINKC: build/blinkc
-  JOBS:
+  DEFAULT_BUILD_DIR: build
+  BUILD_DIR: '{{.DEFAULT_BUILD_DIR}}'
+  DEFAULT_BLINKC: build/blinkc
+  BLINKC: '{{.DEFAULT_BLINKC}}'
+  DEFAULT_JOBS:
     sh: ./scripts/default_jobs.sh
-  VERSION:
+  JOBS: '{{.DEFAULT_JOBS}}'
+  DEFAULT_VERSION:
     sh: cat VERSION | tr -d '\n'
+  VERSION: '{{.DEFAULT_VERSION}}'
 
 tasks:
   bootstrap:
@@ -15,13 +21,26 @@ tasks:
     # run's memory and processes, and the capped run calls its body,
     # __<task>. scripts/capped.sh sets BLINK_GATE_SCOPE in the capped run, so a
     # nested call goes straight to the body and the caps never stack. Each
-    # heavy task reuses this list; a task with vars of its own forwards them.
-    # The re-run gets only --force, --silent, --verbose and `-- <args>`: Task
-    # gives no list of CLI vars (`task ci JOBS=4`), and --dry, --summary and
-    # --status act on this dispatcher. For those, cap the call by hand:
-    # `scripts/capped.sh task ci JOBS=4` runs the body with JOBS=4.
+    # heavy task reuses this list, or its first command, &capped_run.
+    # The re-run gets --force, --silent, --verbose, `-- <args>` and the vars
+    # below. Task gives no list of CLI vars, so a var not named here is lost,
+    # and --dry, --summary and --status act on this dispatcher. For those, cap
+    # the call by hand: `scripts/capped.sh task --dry ci`.
     cmds: &capped
-      - cmd: ./scripts/capped.sh --name {{.TASK}} {{.TASK_EXE}} -x --taskfile "{{.TASKFILE}}" {{.TASK}}{{if .CLI_FORCE}} --force{{end}}{{if .CLI_SILENT}} --silent{{end}}{{if .CLI_VERBOSE}} --verbose{{end}}{{if .CLI_ARGS}} -- {{.CLI_ARGS}}{{end}}
+      - &capped_run
+        cmd: >-
+          ./scripts/capped.sh --name {{.TASK}} {{.TASK_EXE}} -x --taskfile "{{.TASKFILE}}" {{.TASK}}
+          {{- if .CLI_FORCE}} --force{{end}}
+          {{- if .CLI_SILENT}} --silent{{end}}
+          {{- if .CLI_VERBOSE}} --verbose{{end}}
+          {{- if ne .BUILD_DIR .DEFAULT_BUILD_DIR}} BUILD_DIR={{.BUILD_DIR | shellQuote}}{{end}}
+          {{- if ne .BLINKC .DEFAULT_BLINKC}} BLINKC={{.BLINKC | shellQuote}}{{end}}
+          {{- if ne .JOBS .DEFAULT_JOBS}} JOBS={{.JOBS | shellQuote}}{{end}}
+          {{- if ne .VERSION .DEFAULT_VERSION}} VERSION={{.VERSION | shellQuote}}{{end}}
+          {{- if .FMT_SEMANTIC}} FMT_SEMANTIC={{.FMT_SEMANTIC | shellQuote}}{{end}}
+          {{- if .CORPUS_LINT}} CORPUS_LINT={{.CORPUS_LINT | shellQuote}}{{end}}
+          {{- if .CORPUS_PM_SLICE}} CORPUS_PM_SLICE={{.CORPUS_PM_SLICE | shellQuote}}{{end}}
+          {{- if .CLI_ARGS}} -- {{.CLI_ARGS}}{{end}}
         silent: true
         if: '[ -z "$BLINK_GATE_SCOPE" ]'
       - task: '__{{.TASK}}'
@@ -103,6 +122,11 @@ tasks:
       every user link. GREEN after the native-dep registry peels
       owner_module=std/db_sqlite + transitive bodies out of monolith.o
       and codegen emits them per-TU only when the user imports them.
+    cmds: *capped
+
+  __test-sqlite-peel:
+    internal: true
+    label: test-sqlite-peel
     deps: [build-cli]
     silent: true
     cmds:
@@ -671,9 +695,7 @@ tasks:
     desc: Compile+run every tests/test_*.bl under gen1 independently; writes build/corpus.json, then lints
     silent: true
     cmds:
-      - cmd: ./scripts/capped.sh --name {{.TASK}} {{.TASK_EXE}} -x --taskfile "{{.TASKFILE}}" {{.TASK}}{{if .CLI_FORCE}} --force{{end}}{{if .CLI_SILENT}} --silent{{end}}{{if .CLI_VERBOSE}} --verbose{{end}}{{if .CORPUS_LINT}} CORPUS_LINT={{.CORPUS_LINT | shellQuote}}{{end}}{{if .CORPUS_PM_SLICE}} CORPUS_PM_SLICE={{.CORPUS_PM_SLICE | shellQuote}}{{end}}
-        silent: true
-        if: '[ -z "$BLINK_GATE_SCOPE" ]'
+      - *capped_run
       - task: __corpus
         if: '[ -n "$BLINK_GATE_SCOPE" ]'
         # A caller's vars (ci passes CORPUS_LINT=0) do not reach a nested call

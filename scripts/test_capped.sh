@@ -2,8 +2,10 @@
 # Proves scripts/capped.sh caps a run once and only once: a nested call runs in
 # the same cgroup, the exit code passes through, a memory hog and a fork loop
 # die at small caps and each gets a one-line report, BLINK_GATE_CAP=0 runs
-# in place, a slice with no unit still gets a capped scope, and with no
-# systemd-run on PATH the run falls back to prlimit, then to ulimit.
+# in place, a slice with no unit still gets a capped scope, the scope caps swap
+# at 2G unless BLINK_GATE_SWAP_MAX says otherwise, with no systemd-run on PATH
+# the run falls back to prlimit, then to ulimit, and a Taskfile dispatcher
+# hands its body the vars set on the command line.
 # Every hog and fork loop here runs under a cap of 64M or 64 tasks, with a
 # timeout, so this test cannot grow past a few hundred MB.
 set -u
@@ -97,6 +99,37 @@ if [ -z "$missing" ]; then
     pass "each capped Taskfile task has a __<task> body"
 else
     flunk "capped Taskfile tasks with no __<task> body:$missing"
+fi
+
+# The capped re-run gets the vars set on the command line, and only those, and
+# its body sees them. dispatch prints the dispatcher's command; body runs that
+# command with --dry, through capped.sh's opt-out path, and prints the body's
+# `blink test` line.
+dispatch() {
+    env -u BLINK_GATE_SCOPE -u BLINK_GATE_CAP task --dry --verbose "$@" 2>&1 |
+        grep -o 'scripts/capped.sh --name .*'
+}
+body() {
+    (unset BLINK_GATE_SCOPE; export BLINK_GATE_CAP=0; eval "$1 --dry") 2>&1 |
+        grep -o 'blink test tests/ --parallel .*'
+}
+line=$(dispatch test JOBS=3 BUILD_DIR=build FMT_SEMANTIC=0)
+plain=$(dispatch test)
+case "$line" in
+    *" test --verbose JOBS=3 FMT_SEMANTIC=0") forwarded=1 ;;
+    *) forwarded=0 ;;
+esac
+case "$plain" in
+    *" test --verbose") bare=1 ;;
+    *) bare=0 ;;
+esac
+got=$(body "$line")
+got_plain=$(body "$plain")
+want_plain="blink test tests/ --parallel $(./scripts/default_jobs.sh)"
+if [ "$forwarded" = 1 ] && [ "$bare" = 1 ] && [ "$got" = "blink test tests/ --parallel 3" ] && [ "$got_plain" = "$want_plain" ]; then
+    pass "a dispatcher forwards the vars set on the command line, and no others, to its body"
+else
+    flunk "dispatcher vars (with vars: [$line] -> [$got], without: [$plain] -> [$got_plain])"
 fi
 
 # A Task that ignores the cmd-level if: runs the dispatcher inside the capped
