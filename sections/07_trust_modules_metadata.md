@@ -421,44 +421,37 @@ Without `@trusted`, the same declaration gives `UnauditedFfi` (W0800), which is 
 A record is a TOML table keyed by `K`. It holds exactly two keys:
 
 - `claim` — required, non-empty text. What the author claims and why it holds. Ticket links and authorship go here when a team wants them.
-- `pins` — a table from the path of each function that carries `@trusted(audit: K)` to that function's pin.
+- `pins` — a table from the pin key of each item that carries `@trusted(audit: K)` to that item's pin. An item is a function, a method or a `test` block. *Pin Keys* below sets the spelling of a key.
 
 ```toml
 # audits.toml
 [DB-003]
 claim = "Checked against sqlite3.h 3.45: two pointer params, int return, file IO only. The wrapper passes a NUL-terminated path from Str.as_cstr() and a fresh out-cell."
-pins = { "db.sqlite.sqlite3_open" = "ast1:3f9c0a4e1b7d" }
+
+[DB-003.pins]
+'db.sqlite.sqlite3_open' = "ast1:3f9c0a4e1b7d"
 
 [RPT-002]
 claim = "table is checked against REPORT_TABLES in the same function before Raw()."
-pins = { "report.fetch_table" = "ast1:c08e51aa2d90" }
+
+[RPT-002.pins]
+'report.fetch_table' = "ast1:c08e51aa2d90"
+'"tests/db_test.bl".test "opens: 12"' = "ast1:77aa01bc9d10"
 ```
 
-**A pin covers one whole function.** The pin is a hash of the function's syntax tree: its signature, its effect row and its body. It ignores formatting and comments, so `blink fmt` and a comment edit never make a pin stale. An `@ffi` decl has no body, so its pin covers only its signature and row. Pins are opaque: `blink audit pin` writes them, and nobody edits them by hand.
+**The layout of `pins`.** `blink audit pin` always writes `pins` as a `[K.pins]` sub-table with one key per line, sorted by key. A re-pin then shows in review as one changed line beside an unchanged `claim`. The reader accepts both TOML layouts. This record is the same data:
 
-**A function in a file outside `src/` can carry a pin.** A file under `tests/`, `examples/` or `bench/`, and a fixture, has no module name (§10.1). A function or `test` block in it is still pinned. Its pin key is the path of the file relative to the package root, plus the name of the item. The path uses forward slashes and is never absolute. The key never equals a module-path key. The pin-key grammar sets the spelling of this key; it also sets the keys of impl methods, trait impls and inline modules.
-
-```blink
-// pkg/tests/test_pid.bl
-@ffi("c", "getpid")
-@trusted(audit: "TEST-PID")
-fn getpid() -> Int ! IO
+```toml
+[RPT-002]
+claim = "table is checked against REPORT_TABLES in the same function before Raw()."
+pins = { 'report.fetch_table' = "ast1:c08e51aa2d90", '"tests/db_test.bl".test "opens: 12"' = "ast1:77aa01bc9d10" }
 ```
 
-The pin of `getpid` is in the `pins` table of `[TEST-PID]` in `pkg/audits.toml`. Its key holds `tests/test_pid.bl` and `getpid`. The key is the same when `pkg` is in another directory or when the command runs from another cwd.
+An inline table is one line (TOML 1.0).
 
-The pin covers the function's own body and nothing else. A guard in a **caller** is outside every pin: deleting it changes no pin, and the claim can become false with no warning. Keep the guard inside the audited function, and keep that function small:
+**One rule quotes every key.** The writer quotes each key. It writes a TOML literal string (`'...'`) when the key holds no `'`. When the key holds a `'`, it writes a basic string (`"..."`) with `\` as `\\` and `"` as `\"`. A key never holds a raw control character (*Pin Keys* below), so both forms are valid TOML.
 
-```blink
-pub fn fetch_table(table: Str) -> Result[List[Row], DBError] ! DB.Read {
-    if !REPORT_TABLES.contains(table) {
-        return Err(DBError.PermissionDenied("unknown table {table}"))
-    }
-    db.query(t"SELECT * FROM {Raw(table)}")
-}
-```
-
-Give `fetch_table` the annotation `@trusted(audit: "RPT-002")` and the record above. When someone later deletes the `contains` check, the pin no longer matches and `RawBypassesParam` fires again. If the guard were in the caller, the same deletion would leave the pin unchanged.
+**A pin covers one item.** A pin is opaque: `blink audit pin` writes it, and nobody edits it by hand. *Pins — What the Hash Covers* below says what the hash takes in. A pin never covers code outside the item (*What a pin does not cover*).
 
 **How a suppression applies.** `@trusted(audit: K)` on a function `f` suppresses an audit-gated diagnostic in `f` only when all three hold:
 
@@ -503,6 +496,8 @@ error[E0829]: no audit record `TEST-PID`
 
 **A stale or missing pin is not an error.** When record `K` exists but has no pin for `f`, or its pin for `f` does not match, the suppression lapses: the original diagnostic fires again, with a note that names `K` and the reason. No new diagnostic code is involved.
 
+The note prints the claim of the record, so a re-pin starts with a re-read of what the pin vouches for. It also says what the pin covers, because a stale pin after an edit to `@allow` or an import line looks like noise and invites a re-pin by reflex. The key in the help line is shell-quoted and ready to paste (*`blink audit pin` — Writing Pins* below).
+
 ```
 warning[RawBypassesParam]: Raw() bypasses parameterization
  --> report.bl:5:31
@@ -510,9 +505,17 @@ warning[RawBypassesParam]: Raw() bypasses parameterization
 5 |     db.query(t"SELECT * FROM {Raw(table)}")
   |                               ^^^^^^^^^^ concatenated into the query text, not parameterized
   |
-  = note: `report.fetch_table` changed since audit record `RPT-002` was pinned
-  = note: read audit record `RPT-002` from audits.toml (package `report`)
-  = help: re-read the claim in `RPT-002`; if it still holds, run `blink audit pin RPT-002 report.fetch_table`
+  = note: the pin of `report.fetch_table` in audit record `RPT-002` (audits.toml, package `report`) does not match
+  = note: the pin covers the annotations of the item (not its `@trusted` tag), the imports it uses, its signature and its body; one of them changed
+  = note: `RPT-002` claims: "table is checked against REPORT_TABLES in the same function before Raw()."
+  = help: re-read the claim; if it still holds, run `blink audit pin RPT-002 report.fetch_table`
+```
+
+A pin with a hash prefix that this compiler does not write is stale in the same way. It is never an error:
+
+```
+  = note: the pin of `report.fetch_table` in audit record `RPT-002` was written with `ast0`; this compiler writes `ast1`
+  = help: re-read the claim; if it still holds, run `blink audit pin RPT-002 report.fetch_table`
 ```
 
 `blink audit --require-all` treats a lapsed suppression as unaudited, so CI fails on it.
@@ -530,13 +533,249 @@ error[AuditRecordUnknownKey]: unknown key `claims` in audit record `DB-003`
   = note: put ticket links and authorship in the `claim` text; version control records who wrote it
 ```
 
-**Who writes what.** The author writes `claim` by hand. `blink audit pin K [fn]` writes pins only:
+**Who writes what.** The author writes `claim` by hand. `blink audit pin` writes pins only, and never a claim. It refuses when `audits.toml` has no record `K`, or when its `claim` is empty. It prints the existing claim before it writes, so the author re-reads what the pin vouches for. It re-pins one record per run, and no autofix writes a claim. A re-pin is therefore always visible in review: the diff shows the item change and, beside it, a pin change under an unchanged claim. *`blink audit pin` — Writing Pins* below states what it does and refuses.
 
-- It refuses when `audits.toml` has no record `K`, or when its `claim` is empty.
-- With `fn`, it pins that function. Without it, it pins every function that carries `@trusted(audit: K)`.
-- It prints the existing claim before it writes, so the author re-reads what the pin vouches for.
+#### Pins — What the Hash Covers
 
-No command re-pins more than one record at a time, and no autofix writes a claim. A command may list stale pins, but it never re-pins them in bulk. A re-pin is therefore always visible in review: the diff shows the function change and, beside it, a pin change under an unchanged claim.
+A pin is `ast1:` followed by a hash. The hash input is, in this order:
+
+1. the prefix `ast1`;
+2. the record name `K`;
+3. the parse tree of the item: every annotation except the item's own `@trusted(audit: ...)` tag, then its signature, its effect row and its body;
+4. each `import` line of the file that the item uses (*Names the item uses* below).
+
+**Every annotation is in the hash, except the item's own `@trusted` tag.** A new annotation is in the hash from the day it exists. A pin is stale when a change could alter what the item binds, runs or reports.
+
+```blink
+@ffi("sqlite3", "sqlite3_open")      // in the hash: picks the C symbol
+@trusted(audit: "DB-003")            // not in the hash: K goes in instead
+@allow(UnusedParam)                  // in the hash
+fn raw_open(f: Ptr[U8], db: Ptr[Ptr[Void]]) -> Int ! ()
+```
+
+- `"sqlite3_open"` to `"sqlite3_open_v2"` makes the pin stale. So does adding or editing `@allow`, `@requires` or any other annotation.
+- `K` is in the input, so a pin string copied from record `K1` into record `K2` never matches. Take the `raw_open` above with the pin `ast1:3f9c0a4e1b7d` under `[DB-003.pins]`. Change the tag to `@trusted(audit: "DB-004")` and copy that string into `[DB-004.pins]`. The copy is stale: `DB-004` was not part of its input. `blink audit pin DB-004 db.sqlite.raw_open` writes the pin that matches.
+- A function carries at most one `@trusted` tag (§11.1). A second tag is `DuplicateAnnotation`. A tag on another function is not part of this tree: adding `@trusted(audit: "DB-004")` to a second function leaves the pin of `raw_open` as it is.
+
+An edit to `@allow` makes the pin stale, and the next compile shows the original diagnostic with a note (*Audit Records* above). That is the intended price. The `@allow` can silence a warning in the audited body that the claim relies on, and the reviewer must see that change. The note prints the claim and says that the pin covers the annotations, so the re-pin is a re-read.
+
+**Annotation order.** The hash takes annotations in the row order of the §11.1 table. That is the order `blink fmt` writes (§11.1 *Canonical Ordering*). Annotations of one name keep their source order. An annotation that is not in the table comes after the table ones, sorted by name. So `blink fmt` never makes a pin stale.
+
+```blink
+// before blink fmt
+@allow(UnusedParam)
+@trusted(audit: "DB-003")
+@ffi("sqlite3", "sqlite3_open")
+fn raw_open(f: Ptr[U8], db: Ptr[Ptr[Void]]) -> Int ! ()
+
+// after blink fmt: @ffi, @trusted, @allow. Both texts give the same pin.
+```
+
+A change to this order, for example a row of the §11.1 table that moves, changes the hash. That change bumps the prefix to `ast2`.
+
+**What is out of the hash.** Comments and doc comments are out. So is formatting. The `@module` of the file is out: it changes the key (*Pin Keys* below), not the hash. After `@module("db.sqlite")` becomes `@module("db.sql")`, the key `db.sql.raw_open` has no pin, and the suppression lapses.
+
+**The prefix.** `ast1` names the set of hashed parts and their serialization. Any change to either gives a new prefix, `ast2`. A pin with an old or unknown prefix is stale, with a note to re-pin. It is never an error.
+
+**Names the item uses.** The hash takes in each `import` line of the file, as written, that binds a free name of the item. An `import` that the item does not use is out.
+
+```blink
+import db.{query}            // in: binds `query`
+import fmt.{println}         // in: `println` would otherwise be the prelude's
+import time                  // out: the fn never uses `time.`
+
+@trusted(audit: "RPT-002")
+@requires(table.len() > 0)
+pub fn fetch_table(table: Str) -> Result[List[Row], DBError] ! DB.Read {
+    println("fetch {table}")
+    query(table)
+}
+```
+
+- Replace `import db.{query}` with `import cache.{query}`: the pin is stale. The call `query(table)` now runs other code, and the text of the item did not change.
+- Add `exec` to `import db.{query}`: the pin is stale, although `exec` is unused. The line is in the hash as written. Taking in too much only makes a pin stale.
+- "Free names" covers the whole item: the signature, the body, and every expression inside an annotation (`@requires`, `@ensures`, the arguments of `@ffi`). It includes a name that might resolve to the prelude or to the same module. An import that binds `println` or `helper` is in the hash even if a local definition would shadow it.
+- The lookup is syntactic. Blink has no glob imports. A qualifier `a.f` takes in the import whose last segment, or `as` alias, is `a`. A bare name `x` takes in the selective import of `x`, or the import with `as` alias `x`.
+- The hash is a function of the parse tree alone. It needs no name resolution and no typecheck. `blink check`, the LSP and `blink audit pin` compute the same value, and a name error in an unrelated file does not stop a pin.
+- If Blink adds glob imports, this rule must be revisited and the prefix bumped to `ast2`.
+
+**What a pin does not cover.** A pin covers the item and the imports it uses, and nothing else: not the body of a function it calls or of a function that calls it, not the right-hand side of a type alias it names, not the layout of an `@ffi.struct` in its signature, not which impl a method call reaches by the type of its receiver, and not the module that an imported name is re-exported from. A guard in a **caller** is outside every pin: deleting it changes no pin, and the claim can become false with no warning. So is a callee that another file defines. Two files of one module show it:
+
+```blink
+// src/pg/conn.bl
+@module("pg")
+
+@trusted(audit: "PG-001")
+pub fn run(sql: Str) -> Int ! DB {
+    helper(sql)                       // no import binds `helper`: it is defined in util.bl
+}
+```
+
+```blink
+// src/pg/util.bl
+@module("pg")
+
+fn helper(sql: Str) -> Int ! DB {
+    // an edit here leaves the pin of `pg.run` fresh
+    exec_unchecked(sql)
+}
+```
+
+An edit of `helper`, or a move of `helper` to a third file of `pg`, leaves the pin of `pg.run` fresh: the hash does not see a definition in a sibling file. If `conn.bl` instead adds `import extra.{helper}`, the pin is stale, because that import line binds a name the item uses. Keep a guard inside the audited item, and keep that item small:
+
+```blink
+pub fn fetch_table(table: Str) -> Result[List[Row], DBError] ! DB.Read {
+    if !REPORT_TABLES.contains(table) {
+        return Err(DBError.PermissionDenied("unknown table {table}"))
+    }
+    db.query(t"SELECT * FROM {Raw(table)}")
+}
+```
+
+Give `fetch_table` the annotation `@trusted(audit: "RPT-002")` and the record above. When someone later deletes the `contains` check, the pin no longer matches and `RawBypassesParam` fires again. If the guard were in the caller, the same deletion would leave the pin unchanged.
+
+#### Pin Keys
+
+A pin key names one item. `blink audit pin` writes it, and the compiler looks it up. Both build the key from the item with the rules below, so no one derives a key by hand.
+
+| Item | Key form | Example |
+|------|----------|---------|
+| Free function | `<module>.<fn>` | `db.sqlite.raw_open` |
+| Type-scoped function (§2.12.3) | `<module>.<Type>.<fn>` | `report.Thing.make` |
+| Trait-impl method | `<module>.(<Trait> for <Type>).<method>` | `report.(Show for Thing).show` |
+| Generic impl method | impl head as written, normalized as `blink fmt` writes it | `conv.(From[List[T]] for Box[T]).from` |
+| `test` block | `<module>.test "<decoded name>"` | `report.test "fetch rejects unknown table"` |
+| Item in a file with no `@module` | `"<package-relative path>".<item>` | `"tests/db_test.bl".raw_open` |
+| `test` block in such a file | `"<package-relative path>".test "<decoded name>"` | `"tests/db_test.bl".test "opens: 12"` |
+
+- `<module>` is the module name as `import` writes it. A function, a method and a `test` block can all carry a pin.
+- Blink has no inherent methods. A method is a function in a trait impl, so its key holds the impl head.
+- **Names in an impl head.** A name is bare when it is a prelude name, a builtin name, or declared in the module of the key. Any other name is qualified by the module path of the import that binds it, as written in that import. A module alias is never used. With `import x.y.{Show}` in the file, the key of `show` in `impl Show for Conn` of module `pg` is `pg.(x.y.Show for Conn).show`.
+- **Names with escapes.** A `test` name and a file path use the decoded text. One escape set applies: `\"` for a quote, `\\` for a backslash, `\{` for a brace, and `\u{..}` (lowercase hex, no leading zeros) for a control character. Two names that decode to the same text are the same key, as they are the same name (E0851).
+
+```blink
+// src/report.bl, @module("report")
+test "says \"hi\"" {
+    assert_eq(greet(), "hi")
+}
+```
+
+The key of this test is `report.test "says \"hi\""`. In `audits.toml` it is `'report.test "says \"hi\""' = "ast1:..."`. A help line prints it shell-quoted: `blink audit pin RPT-002 'report.test "says \"hi\""'`. A key that holds only letters, digits and `. _ / -` is printed bare. Any other key is wrapped in single quotes, and each `'` in it is written as `'\''`. The `--json` output gives the raw key and no shell quoting.
+
+**A file with no `@module`.** A file under `tests/`, `examples/` or `bench/`, and a loose file in the package, has no module name. Its items use the path of the file, relative to the package root and written as a Blink string literal, then `.` and the item:
+
+```blink
+// tests/db_test.bl (no @module)
+@trusted(audit: "DB-003")
+fn raw_open(f: Ptr[U8]) -> Int ! () { ... }
+
+@trusted(audit: "DB-003")
+test "opens: 12" { ... }
+```
+
+```toml
+[DB-003.pins]
+'"tests/db_test.bl".raw_open' = "ast1:5d02e9b7a410"
+'"tests/db_test.bl".test "opens: 12"' = "ast1:77aa01bc9d10"
+```
+
+The command to pin the test alone is `blink audit pin DB-003 '"tests/db_test.bl".test "opens: 12"'`.
+
+**No two items share a key.** A file key starts with `"`. A module key starts with a letter or `_`. So a file key never equals a module key. Within one scope, two items with one key are a duplicate (*`blink audit pin` — Writing Pins* below).
+
+**A path that is not UTF-8.** A path that is not valid UTF-8 cannot be a Blink `Str`, so it has no key. `blink audit pin` refuses, names the file and says to rename the file:
+
+```
+error: cannot key items in `tests/caf\xe9_test.bl`: the path is not valid UTF-8
+  = help: rename the file
+```
+
+This is the only file path that has no key.
+
+#### `blink audit pin` — Writing Pins
+
+`blink audit pin` writes the pins of one record in `audits.toml`. It never writes a claim, and it never changes another record.
+
+```
+blink audit pin K            # bulk: pin every item that carries K
+blink audit pin K <key>      # pin one item
+```
+
+| Exit | Meaning |
+|------|---------|
+| 0 | It wrote the pins, or nothing needed a change. |
+| 1 | It refused. It wrote nothing. |
+| 2 | Usage error (for example, no `K`). |
+
+A refusal always leaves the file as it was. When no pin changes, the command exits 0 and leaves the file and its modification time alone. `--json` prints one object: `record`, `claim`, `pinned`, `unchanged`, `dropped`, `kept` (lists of raw keys), and `error` on a refusal.
+
+**Bulk pin.** `blink audit pin K` sets the pins of `K` to exactly the items that carry `@trusted(audit: K)` now. A key in `pins` that no scanned item carries is dropped, and the command prints it.
+
+```
+$ blink audit pin RPT-002
+pinned   report.fetch_table
+dropped  report.fetch_old      (no item carries RPT-002)
+kept     "build/fix.bl".raw_open   (kept, not scanned)
+```
+
+The first line is new or changed, the second has no carrier any more, and the third is a key whose file the scan skipped (below). The command keeps that key and its pin.
+
+**One item.** `blink audit pin K <key>` touches only that key. It notes each other key of `K` that no item carries (an orphan) and does not drop it:
+
+```
+$ blink audit pin RPT-002 report.fetch_table
+pinned   report.fetch_table
+note     report.fetch_old has no carrier: run `blink audit pin RPT-002` to drop it
+```
+
+A plain `blink audit` lists the orphan keys of every record too.
+
+**What the scan reads.** Bulk pin reads every `.bl` file in the package tree. It stops at a nested `blink.toml` (that tree is another package with its own `audits.toml`), and it skips `build/` and every directory whose name starts with `.`. So `lib/std`, which has its own `blink.toml` and `audits.toml`, is pinned from inside `lib/std`, and the tool has no special case for it. An item in `build/`, for example a generated fixture, is pinned only by the explicit form with its file key: `blink audit pin K '"build/fix.bl".raw_open'`. Bulk pin keeps the pins of such an item and prints them as "kept, not scanned".
+
+**A file that does not parse.** A scanned file that fails to parse makes bulk pin refuse. It exits 1, names the file and prints the first error. A name error or a type error in a file does not stop a pin, because the hash needs the parse tree only.
+
+```
+$ blink audit pin RPT-002
+error: cannot scan `src/report/export.bl`: 12:5: expected `}` after block
+  = help: fix the syntax error, then run `blink audit pin RPT-002` again
+$ echo $?
+1
+```
+
+**A key that names no item, and an item with another `K`.**
+
+```
+$ blink audit pin RPT-002 report.fetch_tabel
+error: no item has the key `report.fetch_tabel`
+  = help: did you mean `report.fetch_table`? run `blink audit pin RPT-002 report.fetch_table`
+$ blink audit pin RPT-002 db.sqlite.raw_open
+error: `db.sqlite.raw_open` does not carry `@trusted(audit: "RPT-002")`; it carries `DB-003`
+  = help: run `blink audit pin DB-003 db.sqlite.raw_open`, or change the tag
+```
+
+Both refuse with exit 1 and write nothing. If the item carries no `@trusted` tag, the second message omits the "it carries" part.
+
+**No item carries K.** A bulk pin of a record with no carrier refuses. It does not write an empty `pins` table.
+
+```
+$ blink audit pin RPT-009
+error: no item carries `@trusted(audit: "RPT-009")` (scanned 41 files)
+  = help: add the tag to the item, or delete the record `RPT-009` from audits.toml if no one needs it
+```
+
+The exit code is 1.
+
+**A duplicate key.** Two items can have one key. For example, two files of one `@module("pg")` can both define `fn connect`. Pin refuses, exits 1 and lists both sites. It never picks one:
+
+```
+$ blink audit pin PG-001
+error: two items have the key `pg.connect`
+  --> src/pg/conn.bl:4:1
+  --> src/pg/legacy.bl:9:1
+  = help: rename one of them
+```
+
+**A pin copied to another record.** The tool never copies a pin from one record to another, and a pin written for `K1` never matches under `K2` (*Pins — What the Hash Covers* above). To move an item from `K1` to `K2`, change the tag and run `blink audit pin K2 <key>`; a later `blink audit pin K1` drops the old key, or the record `K1` goes if no item carries it any more.
 
 #### Mandatory Safe Wrappers
 
@@ -624,7 +863,9 @@ Raw query audit coverage: 1/2 (50%)
 
 This output is structured JSON when `--json` is passed. CI pipelines can enforce `blink audit --require-all` to block merges with unaudited FFI. Under `--require-all`, a `@trusted` function whose pin is stale or missing counts as unaudited (*Audit Records* above).
 
-`blink audit pin K [fn]` writes the pins of record `K` in `audits.toml`. See *Audit Records* above for what it refuses and why there is no bulk re-pin.
+A plain `blink audit` also lists the orphan keys of each record: pin keys that no item carries now.
+
+`blink audit pin K [key]` writes the pins of record `K` in `audits.toml`. See *`blink audit pin` — Writing Pins* above for what it scans, writes and refuses.
 
 #### CPU Baseline and Accelerated Code
 
@@ -3605,6 +3846,8 @@ pub fn login(email: Str, pwd: Str) -> Result[Session, AuthError] ! DB, Crypto {
 ```
 
 The order is the row order of the table in §11.1: `@module` > `@capabilities` > `@derive` > `@handle_all` > `@src` > `@requires` > `@ensures` > `@where` > `@invariant` > `@pure` > `@perf` > `@ffi` > `@ffi.struct` > `@ffi.opaque` > `@trusted` > `@alt` > `@verify` > `@tags` > `@skip` > `@allow` > `@deprecated` > `@deprecate_override`.
+
+The audit pin hash takes annotations in this order (§9.1 *Pins — What the Hash Covers*), so `blink fmt` never makes a pin stale. A change to this row order changes every hash and bumps the pin prefix.
 
 Rationale: metadata about the container (module, capabilities) comes first. Then provenance (why does this exist?). Then contracts (what must be true?). Then operational concerns (performance, FFI). Then test metadata. Then lifecycle (alternatives, deprecation).
 
