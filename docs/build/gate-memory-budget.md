@@ -1,8 +1,8 @@
 # Gate memory and process budget
 
-Status: the "one gate scope" rows are applied (see "Applied: one gate scope" below). The
-other rows are a proposal: the tickets that add the slice file, the per-child caps and the
-concurrency bound apply them.
+Status: the Taskfile applies the "one gate scope" rows (see "Applied: one gate scope"
+below). The other rows are a proposal: the tickets that add the slice file, the per-child
+caps and the concurrency bound apply them.
 
 ## Why
 
@@ -148,6 +148,7 @@ The first way that works caps the run:
 |---|---|---|
 | systemd user scope, slice has a unit | scope `blink-gate-<task>-<pid>-<time>.scope` in `blink-gates.slice`, `MemoryMax=12G`, `TasksMax=1024` | none |
 | systemd user scope, no `blink-gates.slice` unit | the same scope in the default user slice | one line |
+| systemd user scope, `BLINK_GATE_SLICE` names a unit that cannot hold a scope | the same scope in the default user slice | one line |
 | no systemd user scope, `prlimit` | address space 12G per process, user processes = running + 1024 | one line |
 | no `prlimit` | `ulimit -v` and `ulimit -u`, the same limits | one line |
 | none of these work | no cap; the task still runs | one line |
@@ -160,8 +161,9 @@ still hold over it, and its own caps hold over the gate. The old fmt scope left 
 only because it had no `--slice`.
 
 `prlimit` and `ulimit` are weaker. The address space cap is per process, not per run.
-`RLIMIT_NPROC` counts every process and thread of the user, so the cap is the count at
-the start plus 1024.
+`RLIMIT_NPROC` counts every process and thread of the user (on BSD and macOS, every
+process), so the cap is the count at the start plus 1024. Programs of the same user that
+start during the run use up the same margin, and a fork that fails there gets no report.
 
 When the scope's run ends, the script reads the scope's `memory.events` and
 `pids.events` and prints one line per cap the run hit, for example:
@@ -187,5 +189,19 @@ Settings:
 `scripts/test_capped.sh`, in `task ci`'s gate self-tests, proves each path with caps of
 64M and 64 tasks.
 
-`task bench-edit-loop` is not capped this way: it waits for an empty slice before it
-starts, and a gate scope of its own would keep the slice busy.
+The dispatcher re-runs the task with only `--force`, `--silent`, `--verbose` and
+`-- <args>`. Task gives no list of the CLI vars, so `task ci JOBS=4` loses `JOBS=4`, and
+`--dry`, `--summary` and `--status` act on the dispatcher. Put the capped run around the
+call by hand, for example `scripts/capped.sh task ci JOBS=4`; the task then finds
+`BLINK_GATE_SCOPE` set and runs its body with the var.
+
+The dispatcher needs Task 3.47 or later, which reads the `if:` of a command. An older Task
+runs both commands; `scripts/capped.sh` then sees a dispatcher inside its own capped run
+and stops with one line, not with a loop of re-runs.
+
+`task bench` and `task ci-profile` run in the slice too, so the slice's CPU quota holds
+over them, and a gate that runs at the same time shifts their timings. Time them while no
+other gate runs. The capped run does not cap `task bench-edit-loop`: it waits for an empty
+slice before it starts, and a gate scope of its own would keep the slice busy. With no
+`blink-gates.slice` unit, gate scopes go to the default user slice, and this wait does not
+see them.
