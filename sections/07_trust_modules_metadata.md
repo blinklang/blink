@@ -305,6 +305,77 @@ fn daemon_setpgid(pid: I32, pgid: I32) -> I32 ! Process.Spawn {}
 
 The `State` row in these decls follows the rule of *Hidden C State — Which Row*: it is the fallback, and it appears only for fds that no built-in effect names. Do not add `State` to a decl out of habit. The compiler cannot check the audit text that lists the makers, so the row is a claim of the author, like every other `@ffi` row (§4.5, *Proven and assumed rows*).
 
+#### What the Standard Library Routes Through Ops
+
+A handler that a program installs sees every call of the standard library that makes or names a resource. Outside `std.libc` and outside the default body of a built-in effect operation, a standard library function does not call an `@ffi` binding whose row has a source effect (`Time.*`, `Rand`, `Env`, `IO`), `FS` or `Net` directly. It calls an operation of that effect, and the default handler does the foreign call.
+
+One kind of binding is exempt: a binding that **acts only on an fd that already exists**. `read`, `write`, `recv`, `send`, `poll` and their kin are such bindings. The fd came from a call that a handler could see (`open`, a `tcp_*` call, `pipe`), so the handler has already seen the resource.
+
+```blink
+@ffi("stat", header: "sys/stat.h")
+fn c_fs_stat(p: Str) -> Int ! FS.Read {}
+
+@ffi("read", header: "unistd.h")        // fds from open_read
+fn c_read(fd: I32, buf: Ptr[U8], n: U64) -> I64 ! FS.Read {}
+
+// not allowed in std: a direct foreign call that names a path
+pub fn stat_raw(p: Str) -> Int ! FS.Read {
+    c_fs_stat(p)    // a handler for `FS` cannot see this call
+}
+
+// allowed in std: the call sits in the default body of the `FS.stat` operation
+
+// allowed in std: `c_read` acts only on an fd that already exists
+pub fn read_some(fd: I32, buf: Ptr[U8], n: U64) -> I64 ! FS.Read {
+    c_read(fd, buf, n)
+}
+```
+
+A handler for `FS` replaces `fs.stat` for every std function that stats a path, because std reaches `stat` only through the operation. A handler reaches the real `stat` as `default.stat(p)` (§4.7.1). User code does not call the default body of a built-in effect operation, so it cannot reach the foreign call except through the operation.
+
+The `std.libc` wrappers are the other place where std calls C directly. They stay one call into C, and no handler intercepts them (§9.1.3.3).
+
+**The row names the effect of the resource.** `getentropy` fills a buffer with random bytes, so its binding is `! Rand`, not `! IO`. `stat` reads file metadata, so `c_fs_stat` and the readers of stat data that take no argument are `! FS.Read`.
+
+```blink
+@ffi("getentropy", header: "unistd.h")
+fn c_getentropy(buf: Ptr[U8], buflen: U64) -> I32 ! Rand {}
+```
+
+**Your own `@ffi` calls.** A handler does not intercept your `@ffi` calls. To make a binding mockable, declare your own effect, and call the binding from the body of a handler for it. The test then installs a handler of its own.
+
+```blink
+@trusted(audit: "RAND-1")
+@ffi("random", header: "stdlib.h")
+fn c_random() -> Int ! State {}
+
+effect Token {
+    effect Mint {
+        fn next() -> Int
+    }
+}
+
+fn session() -> Int ! Token.Mint {
+    token.next()
+}
+
+fn main() {
+    with handler Token.Mint {
+        fn next() -> Int { c_random() }
+    } {
+        io.println("{session()}")
+    }
+}
+
+test "session uses a fixed token" {
+    with handler Token.Mint {
+        fn next() -> Int { 7 }
+    } {
+        assert_eq(session(), 7)
+    }
+}
+```
+
 #### Handle Operations and `mut` on an `@ffi` Param
 
 **Handle operations are `! ()`.** The insides of a handle are data that the handle argument reaches, like the cells of a `List`. An op that reads or changes them takes `! ()`, as `List.len` and `List.push` do. Copies of a handle name one object, so a change through one copy shows through the others.
@@ -1524,7 +1595,7 @@ The region is a **purely syntactic**, per-function structural property, decided 
 
 ```blink
 @trusted(audit: "LIBC-WRITE")
-pub fn write_bytes(fd: Int, data: Bytes) -> Result[Int, Errno] ! IO {
+pub fn write_bytes(fd: Int, data: Bytes) -> Result[Int, Errno] ! IO.Print, IO.Log, FS.Write, Net.Connect, Net.Listen, State {
     // the closure inherits the region of the @trusted body
     let rc = data.with_ptr(fn(p) -> I64 { c_write(fd.to_i32(), p, data.len().to_u64()) })
     if rc < 0 {
@@ -2399,7 +2470,7 @@ Here "**language version**" denotes the compiler/spec revision reported by `blin
 | Struct field type in user Blink code | **Error `E0822`** |
 | Generic parameter bound | **Error `E0822`** |
 
-`E0822` fires on user-authored references to the name `Buf` outside `@ffi.fn` signatures. Help text directs the user to `libc.recv_bytes` / `libc.read_bytes` / `libc.getentropy_bytes` (for byte-payload syscalls) or `scope.alloc_n[T]` (for typed regions).
+`E0822` fires on user-authored references to the name `Buf` outside `@ffi.fn` signatures. Help text directs the user to `libc.recv_bytes` / `libc.read_bytes` (for byte-payload syscalls), `rand.bytes(n)` (for random bytes) or `scope.alloc_n[T]` (for typed regions).
 
 **Source-deterministic warning `W0816`.** When a `Buf[T]` appears in an `@ffi.fn` signature for a `T` outside the bridge alphabet, the compiler emits:
 
@@ -2419,7 +2490,7 @@ W0816: Buf[i32] declared in @ffi.fn signature; only Buf[U8] crosses the
 
 ```blink
 let bs = libc.recv_bytes(fd, 4096)?       // recv up to 4096 bytes from a socket
-let entropy = libc.getentropy_bytes(32)?  // 32 CSPRNG bytes, no fd, no Buf, no scope
+let entropy = rand.bytes(32)              // 32 CSPRNG bytes; mock_rand makes it fixed in a test
 let chunk = libc.read_bytes(fd, 8192)?    // read up to 8192 bytes from any fd
 libc.write_bytes(out_fd, chunk)?          // write raw bytes to a file/pipe/socket fd
 ```
@@ -2430,21 +2501,45 @@ These wrappers do **not** use the byte-bridge primitives. They are built on the 
 
 Decided by panel deliberation [`libc-bytes-wrapper-coverage`](../decisions/libc-bytes-wrapper-coverage.md). Resolves the A2 ship gate flagged in §9.1.3.2 — the `libc.*_bytes` family is the primary user-facing surface, so v1 must ship a coherent minimum set or users are stranded at the sealed bridge with no power-user fallback.
 
-**The ratified v1 set is exactly these five wrappers** (the four base-shape direction × domain quadrants — file/socket × read/write — plus the standalone CSPRNG fill):
+**The ratified v1 set is exactly these four wrappers** (the four base-shape direction × domain quadrants — file/socket × read/write):
 
 ```blink
-fn read_bytes(fd: Int, max: Int) -> Result[Bytes, Errno] ! IO
-fn recv_bytes(fd: Int, max: Int, *, flags: MsgFlags = MsgFlags.NONE) -> Result[Bytes, Errno] ! IO
-fn write_bytes(fd: Int, data: Bytes) -> Result[Int, Errno] ! IO
-fn send_bytes(fd: Int, data: Bytes, *, flags: MsgFlags = MsgFlags.NONE) -> Result[Int, Errno] ! IO
-fn getentropy_bytes(n: Int) -> Result[Bytes, Errno] ! IO
+fn read_bytes(fd: Int, max: Int) -> Result[Bytes, Errno] ! IO.Read, FS.Read, Net.Connect, Net.Listen, State
+fn recv_bytes(fd: Int, max: Int, *, flags: MsgFlags = MsgFlags.NONE) -> Result[Bytes, Errno] ! Net.Connect, Net.Listen, State
+fn write_bytes(fd: Int, data: Bytes) -> Result[Int, Errno] ! IO.Print, IO.Log, FS.Write, Net.Connect, Net.Listen, State
+fn send_bytes(fd: Int, data: Bytes, *, flags: MsgFlags = MsgFlags.NONE) -> Result[Int, Errno] ! Net.Connect, Net.Listen, State
 ```
 
 Each member ships at v1; the set **blocks the v1 release**.
 
+**Random bytes are not a `libc` member.** A program that needs random bytes calls `rand.bytes(n)` (§4.4.7). `Rand` is the effect of random bytes, and a `with mock_rand(...)` handler makes the bytes fixed in a test. A `libc` wrapper for `getentropy` would be a second path to the same bytes, and a handler could not see it.
+
+```blink
+let entropy = rand.bytes(32)    // 32 CSPRNG bytes; mock_rand makes it fixed in a test
+```
+
+**The rows.** `read_bytes` and `write_bytes` take any fd, so each takes the union of the rows of the calls that can make its fd (*fd-Table and Process-Control Calls — Which Row*, §9.1). A read can get its fd from standard input (`IO.Read`), from a file (`FS.Read`), from a socket (`Net.Connect`, `Net.Listen`) or from `pipe`, `memfd_create` or `socketpair` (`State`). A write can get its fd from standard output and standard error (`IO.Print`, `IO.Log`), from a file (`FS.Write`), from a socket or from `State`. `recv_bytes` and `send_bytes` take only socket fds, and a socketpair fd is `State`. Each row lists leaves, never the parent `Net`.
+
+```blink
+fn pump(src: Int, dst: Int) -> Result[Int, Errno] ! IO.Read, FS.Read, IO.Print, IO.Log, FS.Write, Net.Connect, Net.Listen, State {
+    let chunk = libc.read_bytes(src, 4096)?
+    libc.write_bytes(dst, chunk)
+}
+
+fn read_config(fd: Int) -> Result[Bytes, Errno] ! FS.Read {
+    libc.read_bytes(fd, 4096)    // E0500: `read_config` does not declare `IO.Read`, `Net.Connect`, `Net.Listen`, `State`
+}
+```
+
+A caller that holds only the row of its own fd kind calls a decl of its own, one decl per fd kind, as the fd-table rule allows. Splitting a binding by maker, for example `c_read_file ! FS.Read` next to `c_read_socket ! Net.Connect, Net.Listen`, stays allowed. It is not required.
+
+The `std.io` function `read_fully` loops over `read_bytes`, so it takes the row of `read_bytes`: `pub fn read_fully(fd: Int, n: Int) -> Result[Bytes, Errno] ! IO.Read, FS.Read, Net.Connect, Net.Listen, State`.
+
+**The wrappers call C directly.** Every `std.libc` wrapper is one call into C. It does not go through an effect operation, and no handler intercepts it (§4.5). A test that wants a path it can mock uses the effect operations: `rand.bytes(n)` for random bytes, `fs.read(path)` for a file, `tcp_read` for a socket.
+
 **Directional return-typing rule (normative).** The actual byte count is always carried *in the return type*, never out-of-band:
 
-- **Bytes-out** (`read_bytes`, `recv_bytes`, `getentropy_bytes`) → `Result[Bytes, Errno]`, where the returned `Bytes.len()` *is* the syscall's reported count (`slice(0, got)`). A short read is success with a shorter `Bytes`; only a `-1`/errno return is `Err`. `getentropy_bytes` is all-or-nothing (`.len() == n` on success, no truncation arm).
+- **Bytes-out** (`read_bytes`, `recv_bytes`) → `Result[Bytes, Errno]`, where the returned `Bytes.len()` *is* the syscall's reported count (`slice(0, got)`). A short read is success with a shorter `Bytes`; only a `-1`/errno return is `Err`.
 - **Bytes-in** (`write_bytes`, `send_bytes`) → `Result[Int, Errno]`, where the `Int` is the count actually written. Short writes are normal and surfaced as `Ok(n < data.len())` — the caller must loop; collapsing this to `Result[(), Errno]` would be unsound for the partial-write contract.
 
 **`recv_bytes` / `send_bytes` take `flags` as a trailing keyword argument** of type `MsgFlags` (§9.1.3.4), with the default `MsgFlags.NONE`. A call that omits `flags` behaves as `flags = 0`, so the examples above do not change. The keyword is part of the v1 signature: labels are call-site sugar, so adding the parameter after v1 would change the function-value type. No separate flagged name (such as `recv_flags_bytes`) exists or will be added.
@@ -2456,10 +2551,10 @@ Each member ships at v1; the set **blocks the v1 release**.
 - **Name** = `libc.<posix_syscall_name>_bytes` (e.g. `recvfrom` → `recvfrom_bytes`, never `recv_from_bytes`).
 - **Arguments** = POSIX C argument order. The `(void* buf, size_t len)` pair is replaced in place by `max: Int` (reads) or `data: Bytes` (writes; length is `data.len()`, never passed explicitly). `flags` is always the trailing keyword `*, flags: MsgFlags = MsgFlags.NONE`, exempt from C order.
 - **Return** = `Result[Bytes, Errno]` (Bytes-out) or `Result[Int, Errno]` (Bytes-in), bound to direction — a write may not be typed `Result[Bytes, Errno]`. A non-buffer out-parameter moves into the success value as a tuple after the `Bytes` or count, in C order. A pointer-typed out-parameter that may be empty is `Option` (e.g. `recvfrom_bytes` → `Result[(Bytes, Option[SockAddr]), Errno]`).
-- **Effect** = `! IO`.
+- **Effect** = the union of the rows of the calls that can make the fd (the fd-table rule, applied to every maker). A wrapper over an fd-generic call takes that union, in leaves.
 - **Mechanism** = `Bytes.with_mut_ptr` (reads) or `Bytes.with_ptr` (writes), never the byte-bridge primitives.
 
-The law governs only the *shape* of a wrapper; it is not a license to auto-add wrappers (see growth governance below). `getentropy_bytes` is the one principled exception to the arg rule (no fd, no `(buf, len)` pair) — it takes `n: Int` and fills exactly `n`. Syscalls that cannot conform — vectored I/O (`readv`/`writev`, which need an `iovec[]` array), `recvmsg`/`sendmsg` (`msghdr`), or any surface requiring a non-`Bytes` buffer shape — are **out of scope of the law** and must not be forced into a `*_bytes` wrapper; they get their own deliberated API.
+The law governs only the *shape* of a wrapper; it is not a license to auto-add wrappers (see growth governance below). Syscalls that cannot conform — vectored I/O (`readv`/`writev`, which need an `iovec[]` array), `recvmsg`/`sendmsg` (`msghdr`), or any surface requiring a non-`Bytes` buffer shape — are **out of scope of the law** and must not be forced into a `*_bytes` wrapper; they get their own deliberated API.
 
 **Deferred, with the reason recorded** (so the line is defensible, not arbitrary):
 
@@ -2490,7 +2585,7 @@ A curated `*_bytes` wrapper **must keep its `@ffi` syscall call inline inside th
 > User code should prefer `libc.*_bytes` helpers; for typed regions, use `scope.alloc_n[T]`.
 > See `blink doc bytes-bridge`.
 
-The `bytes-bridge` doc page (`blink doc bytes-bridge`) is the single canonical explainer for the byte bridge, and the `W0816` and `E0822` diagnostic explain-texts both deep-link it. It answers, in order: (1) most code never names `Buf` — use `libc.recv_bytes` / `read_bytes` / `getentropy_bytes`; (2) `Buf` is bridge-only and `U8`-only, fixed by the compiler version; (3) for a typed region use `scope.alloc_n[T]`.
+The `bytes-bridge` doc page (`blink doc bytes-bridge`) is the single canonical explainer for the byte bridge, and the `W0816` and `E0822` diagnostic explain-texts both deep-link it. It answers, in order: (1) most code never names `Buf` — use `libc.recv_bytes` / `read_bytes`, or `rand.bytes(n)` for random bytes; (2) `Buf` is bridge-only and `U8`-only, fixed by the compiler version; (3) for a typed region use `scope.alloc_n[T]`.
 
 **Machine-queryable alphabet — one constant, three projections.** The bridge alphabet has exactly one normative definition: the set that `W0816` consults. Every reporting surface shows that same set, so the surfaces cannot differ:
 
@@ -2523,8 +2618,8 @@ The `bytes-bridge` doc page (`blink doc bytes-bridge`) is the single canonical e
 Decided by panel deliberation [`udp-gate-sockaddr-flags`](../decisions/udp-gate-sockaddr-flags.md). Resolves the UDP gate that §9.1.3.3 deferred. The `std.net` caller and the `SockAddr` type are specified in §4.4.6.
 
 ```blink
-fn recvfrom_bytes(fd: Int, max: Int, *, flags: MsgFlags = MsgFlags.NONE) -> Result[(Bytes, Option[SockAddr]), Errno] ! IO
-fn sendto_bytes(fd: Int, data: Bytes, dest: SockAddr, *, flags: MsgFlags = MsgFlags.NONE) -> Result[Int, Errno] ! IO
+fn recvfrom_bytes(fd: Int, max: Int, *, flags: MsgFlags = MsgFlags.NONE) -> Result[(Bytes, Option[SockAddr]), Errno] ! Net.Connect, Net.Listen, State
+fn sendto_bytes(fd: Int, data: Bytes, dest: SockAddr, *, flags: MsgFlags = MsgFlags.NONE) -> Result[Int, Errno] ! Net.Connect, Net.Listen, State
 ```
 
 Both follow the naming law of §9.1.3.3: the peer address is a non-buffer out-parameter, so it follows the `Bytes` in the success tuple, and it is `Option` because the kernel may return no address.
@@ -2551,7 +2646,7 @@ libc.recv_bytes(fd, 16, flags: 0x40)                        // error: expected M
 - A datagram larger than `max` is truncated without an error. Code that must detect truncation uses a larger `max`; `recvmsg` stays out of the scope of the naming law.
 - The peer is `None` when the kernel returns no address, or returns an address of a family that `SockAddr` does not model (for example `AF_UNIX`). `None` is not an error.
 - `SockAddr` is not a C struct in any `@ffi` signature. `sendto_bytes` takes a `SockAddr` for `dest`.
-- These wrappers have the effect `! IO`, the same as every `libc.*_bytes` member. They are not subject to `Net` attenuation (§4.3). The `byte-pin` audit category reports them.
+- These wrappers take the row of `recv_bytes` and `send_bytes`: `! Net.Connect, Net.Listen, State`. A UDP socket is a socket, and the fd-table rule gives a `socketpair` fd `State`. A caller must hold those leaves (§4.3). The `byte-pin` audit category reports them.
 
 #### Static layout assertions
 
@@ -2572,9 +2667,17 @@ When `[native-dependencies].headers` is missing, the compiler emits `W0812: @ffi
 
 User code should reach for stdlib first:
 
-- `std.libc.poll(fds: List[Pollfd], timeout_ms: Int) -> Result[List[Pollfd], Str] ! IO`
-- `std.libc.recvfrom_bytes(fd: Int, max: Int, *, flags: MsgFlags = MsgFlags.NONE) -> Result[(Bytes, Option[SockAddr]), Errno] ! IO`
+- `std.libc.poll(fds: List[Pollfd], timeout_ms: Int) -> Result[List[Pollfd], Str] ! IO.Read, IO.Print, IO.Log, FS.Read, FS.Write, Net.Connect, Net.Listen, State, Time.Sleep`
+- `std.libc.recvfrom_bytes(fd: Int, max: Int, *, flags: MsgFlags = MsgFlags.NONE) -> Result[(Bytes, Option[SockAddr]), Errno] ! Net.Connect, Net.Listen, State`
 - `std.libc.sigaction(...)` — etc.
+
+**The row of `poll`.** `poll` takes any fd, so it takes the read union and the write union of the fd-table rule. It also takes `Time.Sleep`, because `poll` blocks for up to `timeout_ms` milliseconds. A `mock_clock` handler (§8.10.3) does not shorten that wait: the wait is in the kernel, and the mock clock does not make `poll` return sooner. `poll` with `timeout_ms: 0` still takes `Time.Sleep`, because the row names what the call can do and not what one call does.
+
+```blink
+fn wait_ready(fds: List[Pollfd]) -> Result[List[Pollfd], Str] ! IO.Read, IO.Print, IO.Log, FS.Read, FS.Write, Net.Connect, Net.Listen, State, Time.Sleep {
+    libc.poll(fds, 250)    // blocks up to 250 ms, with or without a mock clock
+}
+```
 
 `@ffi.struct` is the implementation primitive used inside `std.libc.*`. User-defined `@ffi.struct` outside stdlib is **discouraged but not banned**. `blink audit` reports a `user-defined @ffi.struct count` metric per project. If, within 12 months of v1 ship, the registry shows >50 distinct user-defined `@ffi.struct` types across third-party projects (or 5+ projects vendoring functionally-equivalent `@ffi.struct` declarations for the same syscall family), the panel reconvenes to consider stdlib expansion of `std.libc.*` to absorb them.
 

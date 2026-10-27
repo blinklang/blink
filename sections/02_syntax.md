@@ -2181,6 +2181,58 @@ error[UnhandledEffect]: unhandled effect `Net` in test "fetch data"
 
 This is `UnhandledEffect` (E0539). `main` is the other root, and the same code reports a user-declared effect that `main` does not discharge (§4.6 *Unhandled user effects*).
 
+**An effect that comes only from foreign code.** A `with mock_rand(...)` hint is wrong when no handler can see the call that needs the effect. The hint changes when every supplier of the unhandled effect `E` ends at an `@ffi` decl, and no operation of `E` is on the way. The compiler follows the named calls from the test to find the suppliers. The new hint names the chain that it followed, so a reader can check it.
+
+```blink
+@trusted(audit: "SODIUM-1")
+@ffi("blink_randombytes_fill", header: "blink_sodium_shim.h")
+fn randombytes(mut buf: Bytes) ! Rand {}
+
+fn make_token() -> Bytes ! Rand {
+    let mut out = Bytes.zeroed(16)
+    randombytes(out)
+    out
+}
+
+test "token has 16 bytes" {
+    let t = make_token()
+    assert_eq(t.len(), 16)
+}
+```
+
+```
+error[UnhandledEffect]: unhandled effect `Rand` in test "token has 16 bytes"
+  --> src/token.bl:14:13
+   |
+14 |     let t = make_token()
+   |             ^^^^^^^^^^^^ `make_token` requires `! Rand`
+   |
+   = hint: `Rand` here comes from foreign code (`randombytes` via `make_token`); a handler cannot intercept it. Install the real handler, or call `rand.bytes(n)` so a mock can see it.
+```
+
+A `with mock_rand(...)` block would not help here: the foreign call does not go through an operation of `Rand`, so a mock never sees it. The hint gives two fixes. One installs the real handler. The other calls `rand.bytes(n)` in `make_token`, so that a mock can see the call.
+
+Any operation of `E` on the way keeps the hint above. A closure on the way keeps it, and so does a `! _` row, because the compiler cannot say where the effect comes from. In the next test, the effect comes from an operation, and a mock sees it:
+
+```blink
+test "id has 16 bytes" {
+    let id = rand.bytes(16)
+    assert_eq(id.len(), 16)
+}
+```
+
+```
+error[UnhandledEffect]: unhandled effect `Rand` in test "id has 16 bytes"
+  --> src/token.bl:19:14
+   |
+19 |     let id = rand.bytes(16)
+   |              ^^^^^^^^^^^^^^ `rand.bytes` requires `! Rand`
+   |
+   = hint: wrap in `with mock_rand(...) { ... }` to provide a handler
+```
+
+The spec fixes no limit on the number of calls that the compiler follows. A chain that it cannot follow to the end keeps the hint above.
+
 Pure-by-default enables the compiler to safely parallelize test execution — a test whose row is empty, with no effect handlers and no `State`, is guaranteed side-effect-free.
 
 **Panel vote: 5-0 unanimous** for pure by default. See [DECISIONS.md](../DECISIONS.md).

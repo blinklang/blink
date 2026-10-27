@@ -2013,7 +2013,7 @@ The LSP displays `main`'s actual effect set as an inlay hint, computed from the 
 
 #### Unhandled user effects
 
-A user-declared effect that reaches `main`'s body with no `with` that discharges it is a compile error, `UnhandledEffect` (E0539). The check uses the effect rows of the program (§4.5, §4.15), closures and `! _` rows included, and the same discharge rule as `with` (§4.7, and §4.7.2 *Scoped effect handlers* for a `Scoped` type whose `Context` is `Handler[E]`). Test blocks are the other root, and the same code reports them (§2.20).
+A user-declared effect that reaches `main`'s body with no `with` that discharges it is a compile error, `UnhandledEffect` (E0539). The check uses the effect rows of the program (§4.5, §4.15), closures and `! _` rows included, and the same discharge rule as `with` (§4.7, and §4.7.2 *Scoped effect handlers* for a `Scoped` type whose `Context` is `Handler[E]`). Test blocks are the other root, and the same code reports them (§2.20). In a test, the hint changes when the effect comes only from foreign code (§2.20).
 
 ```blink
 effect Store {
@@ -2727,6 +2727,18 @@ error[DefaultOutsideHandlerOp]: `default` is only valid inside a handler operati
 ```
 
 The second help line shows the call through the effect's handle (§4.4), built from the handle and the operation of the call. When the compiler cannot build it, the line says: "Outside an operation, call the effect operation directly through its handle, or move this call into a handler operation." There is no machine-applicable fix: a call through the handle goes to the innermost handler, so it does not do the same thing as a delegation.
+
+**The default body of a built-in operation is not a function that user code calls.** A built-in effect operation has a default body in the standard library, and that body makes the real foreign call. User code cannot name it or call it, and a use of it is a compile error. A handler reaches the real body in one way: `default.op(args)` in an operation body. So a handler can wrap the real call, and no other code can skip the handler to reach it.
+
+```blink
+fn under_root(root: Str) -> Handler[FS.Read] {
+    handler FS.Read {
+        fn stat(p: Str) -> Result[FileInfo, FsError] {
+            default.stat("{root}/{p}")    // the real stat, from the handler in force outside this one
+        }
+    }
+}
+```
 
 A closure body is not a handler operation body, even when the closure is written inside one. `default` in such a closure is E0544, whether or not the closure outlives the operation. The message names the closure:
 
