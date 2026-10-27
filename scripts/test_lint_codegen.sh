@@ -117,6 +117,7 @@ expect_red br_ids_in_source    cg_b.bl '// tracked as br abc123'
 expect_red br_ids_in_source    cg_b.bl '// q7tzp2: why this is here'
 expect_red br_ids_in_source    cg_b.bl '// see bug jkwqzv for why'
 expect_red br_ids_in_source    cg_b.bl 'let tag = "q7tzp2_run"'
+expect_red br_ids_in_source    cg_b.bl '// audit TEST-JKWQZV-CARRIER'
 # L10 reads all of src/, not only the codegen layer.
 expect_red br_ids_in_source    typecheck.bl '// jkwqzv: why this is here'
 # A six-character word or hex token that is no id is not a hit.
@@ -132,12 +133,33 @@ fi
 dir="$WORK/case_br_ids_no_list"
 write_clean "$dir"
 printf '// tracked as br abc123\n' > "$dir/src/typecheck.bl"
-if env -u BR_IDS_FILE PATH=/usr/bin:/bin LINT_SRC_DIR="$dir" LINT_HEAD1_DIR="$CLEAN" LINT_BASELINE="$BASELINE" \
+if env -u BR_IDS_FILE BR_IDS_BR=no-such-br-command LINT_SRC_DIR="$dir" LINT_HEAD1_DIR="$CLEAN" LINT_BASELINE="$BASELINE" \
         LINT_ALLOWLIST="$ALLOW" ./scripts/lint_codegen.sh > "$dir.out" 2>&1 ||
         ! grep -qE '^L10 +br_ids_in_source .*OVER' "$dir.out" || ! grep -q 'misses a bare id' "$dir.out"; then
     echo "FAIL br_ids_in_source without an id list:"; cat "$dir.out"; fail=1
 else
     echo "ok   br_ids_in_source without an id list warns and still sees the prefixed shape"
+fi
+# The id list holds br's ticket ids and its project ids; br may space its JSON.
+fake_br="$WORK/fake_br"
+cat > "$fake_br" <<'EOF'
+#!/bin/sh
+case "$1" in
+list) echo '[{"id": "q7tzp2", "title": "a ticket"}]' ;;
+project) printf 'jkwqzv  a-project  (1/1)  done\n' ;;
+esac
+EOF
+chmod +x "$fake_br"
+if [ "$(env -u BR_IDS_FILE BR_IDS_BR="$fake_br" ./scripts/br_ids.sh list | tr '\n' ' ')" = "jkwqzv q7tzp2 " ]; then
+    echo "ok   br_ids.sh list gives ticket and project ids"
+else
+    echo "FAIL br_ids.sh list did not give both the ticket and the project id"; fail=1
+fi
+: > "$WORK/empty_ids.txt"
+if BR_IDS_FILE="$WORK/empty_ids.txt" ./scripts/br_ids.sh list > /dev/null 2>&1; then
+    echo "FAIL br_ids.sh list took an empty BR_IDS_FILE as a list"; fail=1
+else
+    echo "ok   br_ids.sh list refuses an empty BR_IDS_FILE"
 fi
 expect_red untested_pub_fns    mono.bl 'pub fn mono_orphan() -> Int { 1 }'
 

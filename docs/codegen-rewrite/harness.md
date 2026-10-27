@@ -257,7 +257,8 @@ groups balanced, and never drop a file to make a branch green.
 `src/mono.bl`, `src/ir.bl`, `src/cg.bl` and `src/cg_*.bl`. The driver
 `cg.bl` is named on its own because `cg_*.bl` does not match it, and a
 driver outside the scope escapes every row. A file that does not exist
-yet counts as empty. Tests and docs are never scanned.
+yet counts as empty. L10 alone reads every `src/*.bl`. Tests and docs
+are never scanned.
 
 | Row | Name | Limit | Catches |
 | --- | --- | --- | --- |
@@ -271,7 +272,7 @@ yet counts as empty. Tests and docs are never scanned.
 | L7 | `single_producer` | 0 | A name producer defined twice anywhere in `src/`, or missing while its owner file exists. The `PRODUCERS` table names the producers of `cname.bl` and `layout.bl` as they are spelled today; a producer of the deleted codegen with no successor is not listed |
 | L8 | `import_dag` | 0 | An import that goes the wrong way in the layer order. The `layout.bl` and `cname.bl` edges come from `scripts/lint_import_dag.sh`, the printer's from `scripts/lint_print_imports.sh` when it exists |
 | L9 | `fn_length` | 0 | A function longer than 80 lines |
-| L10 | `br_ids_in_source` | 0 | A br ticket id in source |
+| L10 | `br_ids_in_source` | 0 | A br ticket or project id in any `src/*.bl`: a token in the list `scripts/br_ids.sh` gives, in any case, or a prefixed shape such as `br <id>` |
 | L11 | `untested_pub_fns` | 0 | A `pub fn` in the reading layer or mono that no test names |
 
 Each row has a threshold, a stored baseline (`scripts/lint_codegen_baseline.txt`)
@@ -289,7 +290,10 @@ lines print under the table.
 The ratchet keeps these rows over the whole compiler in
 `scripts/ratchet.sh`:
 
-- `br_ids_in_source`: zero gate.
+- `br_ids_in_source`: zero gate. A line in `src/*.bl` or `Taskfile.yml`
+  that holds a br id, counted as L10 counts it.
+- `br_ids_in_tests`: zero gate. The same count over every line of
+  `tests/**/*.bl`, in the live tree only.
 - `module_let_mut`: every column-0 `let mut`, pub or not, in `src/`.
 - `typecheck_module_let_mut`: the same count in `typecheck.bl` alone.
 - `layout_decline_unhandled`: zero gate. A `decline_reason` read outside

@@ -206,15 +206,24 @@ check_type_names no-arms fail src/typecheck.bl 's/=> 1/=> 0/'
 # The spec may list a name the compiler lacks: Spec_only is in the base table already.
 check_type_names spec-leads pass sections/07_trust_modules_metadata.md 's/`Spec_only`/`Spec_only`, `Ahead`/'
 
-# A synthetic +1 on each row, in turn, must fail the script.
+# A synthetic +1 on each row, in turn, must fail the script, and fail on that row.
+# ratchet_on DIR [ROW WANT] runs ratchet.sh on DIR, output in DIR.out; with ROW,
+# it also needs ROW's line to hold WANT.
+ratchet_on() {
+  RATCHET_SRC_DIR="$1" RATCHET_BASELINE="$BASELINE" RATCHET_HEAD1_DIR="$BASE" ./scripts/ratchet.sh > "$1.out" 2>&1
+  rc=$?
+  [ $rc -ne 0 ] || return 0
+  [ -z "${2:-}" ] || grep -qE "^$2 .*$3" "$1.out" || return 0
+  return 1
+}
 check_row() {
   row="$1"; file="$2"; extra="$3"
   d="$WORK/row_$row"
   rm -rf "$d"
   cp -r "$BASE" "$d"
   printf '%s\n' "$extra" >> "$d/src/$file"
-  if RATCHET_SRC_DIR="$d" RATCHET_BASELINE="$BASELINE" RATCHET_HEAD1_DIR="$BASE" ./scripts/ratchet.sh > /dev/null 2>&1; then
-    echo "FAIL $row: a +1 on this row did not fail ratchet.sh"
+  if ratchet_on "$d" "$row" 'UP\(head~1\)'; then
+    echo "FAIL $row: a +1 on this row did not fail ratchet.sh on this row:"; cat "$d.out"
     fail=1
   else
     echo "PASS $row: +1 correctly failed ratchet.sh"
@@ -223,16 +232,17 @@ check_row() {
 
 check_row module_let_mut           codegen.bl   'pub let mut other_global2: Int = 0'
 check_row br_ids_in_source         codegen.bl   '// also see br xyz987'
-# A bare id, an all-letter one, and one in a file outside the codegen layer.
+# A bare id, an all-letter one, one in capitals, and one outside the codegen layer.
 check_row br_ids_in_source         codegen.bl   '// q7tzp2: why this is here'
 check_row br_ids_in_source         codegen.bl   'let tag = "jkwqzv_run"'
+check_row br_ids_in_source         codegen.bl   '// audit TEST-Q7TZP2-CARRIER'
 check_row br_ids_in_source         typecheck.bl '// see jkwqzv'
 d="$WORK/row_br_ids_taskfile"
 rm -rf "$d"
 cp -r "$BASE" "$d"
 printf '# the q7tzp2 regression\n' >> "$d/Taskfile.yml"
-if RATCHET_SRC_DIR="$d" RATCHET_BASELINE="$BASELINE" RATCHET_HEAD1_DIR="$BASE" ./scripts/ratchet.sh > /dev/null 2>&1; then
-  echo "FAIL br_ids_in_source: a bare id in Taskfile.yml did not fail ratchet.sh"
+if ratchet_on "$d" br_ids_in_source 'NONZERO'; then
+  echo "FAIL br_ids_in_source: a bare id in Taskfile.yml did not fail ratchet.sh:"; cat "$d.out"
   fail=1
 else
   echo "PASS br_ids_in_source: a bare id in Taskfile.yml failed ratchet.sh"
@@ -248,6 +258,27 @@ else
   echo "FAIL br_ids_in_source counted a token that is not an id:"; cat "$d.out"
   fail=1
 fi
+# Without an id list, from no br or from a BR_IDS_FILE that is not there, the
+# row still sees `br <id>` and says that it misses a bare id.
+d="$WORK/row_br_ids_no_list"
+rm -rf "$d"
+cp -r "$BASE" "$d"
+printf '// also see br xyz987\n' >> "$d/src/codegen.bl"
+for how in no_br no_file; do
+  if [ "$how" = no_br ]; then
+    env -u BR_IDS_FILE BR_IDS_BR=no-such-br-command RATCHET_SRC_DIR="$d" RATCHET_BASELINE="$BASELINE" \
+      RATCHET_HEAD1_DIR="$BASE" ./scripts/ratchet.sh > "$d.out" 2>&1
+  else
+    BR_IDS_FILE="$WORK/no_such_ids.txt" RATCHET_SRC_DIR="$d" RATCHET_BASELINE="$BASELINE" \
+      RATCHET_HEAD1_DIR="$BASE" ./scripts/ratchet.sh > "$d.out" 2>&1
+  fi
+  if [ $? -ne 0 ] && grep -qE '^br_ids_in_source .*NONZERO' "$d.out" && grep -q 'miss a bare id' "$d.out"; then
+    echo "PASS br_ids_in_source ($how): warns and still sees \`br <id>\`"
+  else
+    echo "FAIL br_ids_in_source ($how) without an id list:"; cat "$d.out"
+    fail=1
+  fi
+done
 mkdir -p "$BASE/tests"
 printf '%s\n' 'test "x" { assert(true) }' > "$BASE/tests/test_fixture.bl"
 check_tests_row() {
@@ -255,8 +286,8 @@ check_tests_row() {
   rm -rf "$d"
   cp -r "$BASE" "$d"
   printf '%s\n' "$1" >> "$d/tests/test_fixture.bl"
-  if RATCHET_SRC_DIR="$d" RATCHET_BASELINE="$BASELINE" RATCHET_HEAD1_DIR="$BASE" ./scripts/ratchet.sh > /dev/null 2>&1; then
-    echo "FAIL br_ids_in_tests: +1 ($2) did not fail ratchet.sh"
+  if ratchet_on "$d" br_ids_in_tests 'NONZERO'; then
+    echo "FAIL br_ids_in_tests: +1 ($2) did not fail ratchet.sh on this row:"; cat "$d.out"
     fail=1
   else
     echo "PASS br_ids_in_tests: +1 ($2) correctly failed ratchet.sh"
@@ -266,6 +297,7 @@ check_tests_row '// see br xyz987' 'a br-prefixed id in a comment'
 check_tests_row 'test "q7tzp2 keeps the carrier" { assert(true) }' 'a bare id in a test name'
 check_tests_row '    let r = compile_and_run(src, "jkwqzv_run")' 'an id in a fixture label'
 check_tests_row '@trusted(audit: "q7tzp2-test")' 'an id in an audit key'
+check_tests_row '@trusted(audit: "TEST-JKWQZV-CARRIER")' 'an id in capitals'
 d="$WORK/tests_words"
 rm -rf "$d"
 cp -r "$BASE" "$d"

@@ -9,12 +9,12 @@
 #
 # Rows:
 #   br_ids_in_source         a line in src/*.bl or Taskfile.yml that holds a br
-#                            ticket id: a token br knows as an id (see
+#                            id: a token br knows as a ticket or project id (see
 #                            scripts/br_ids.sh), or `br <id>`, which also
 #                            catches an id br no longer lists; absolute zero
 #                            gate (br is local-only)
 #   br_ids_in_tests          a line in a tests/**/*.bl file that holds a br
-#                            ticket id, counted as br_ids_in_source counts it:
+#                            id, counted as br_ids_in_source counts it:
 #                            test names, fixture labels, scratch paths and audit
 #                            keys too, not only comments; absolute zero gate.
 #                            Counted in the live tree only: a historical ref is
@@ -150,9 +150,9 @@
 #   RATCHET_BASE_REF  the ref the branch walk starts from. Default: main. The
 #                     walk is skipped when RATCHET_HEAD1_DIR is set.
 #   RATCHET_NO_LINT   1 to skip scripts/lint_codegen.sh.
-#   BR_IDS_FILE       the ticket ids br_ids_in_source looks for, one per line.
-#                     Default: ask br through scripts/br_ids.sh, once, and hand
-#                     the list on to scripts/lint_codegen.sh.
+#   BR_IDS_FILE       the ids the br_ids rows look for, one per line.
+#                     Default: ask br through scripts/br_ids.sh, once. Either
+#                     way the list goes on to scripts/lint_codegen.sh.
 set -u
 cd "$(dirname "$0")/.."
 
@@ -241,6 +241,7 @@ lib_substr() {
 
 # Lines that hold an id, so a `br <id>` line br also lists counts once.
 br_id_lines() {
+  [ -n "${1## }" ] || { echo 0; return; }
   # shellcheck disable=SC2086
   { grep -nHoE '\bbr [0-9a-z]{6}\b' $1 2>/dev/null; ./scripts/br_ids.sh scan "$BR_IDS_FILE" $1; } |
     awk -F: '!seen[$1 ":" $2]++' | wc -l | tr -d ' '
@@ -404,15 +405,15 @@ walk_branch() {
 
 check_root "$now_root"
 # Asked once here, not per ref; the lint this script runs last reads it too.
-if [ -z "${BR_IDS_FILE:-}" ]; then
-  BR_IDS_FILE=$(mktemp)
-  br_ids_tmp="$BR_IDS_FILE"
-  trap 'rm -f "$br_ids_tmp"' EXIT
-  if ! ./scripts/br_ids.sh list > "$BR_IDS_FILE"; then
-    : > "$BR_IDS_FILE"
-    echo "ratchet: warning: no ticket id list, so br_ids_in_source sees only \`br <id>\` and misses a bare id" >&2
-  fi
+# A BR_IDS_FILE set by the caller goes through `list` as well, so a missing or
+# empty one warns here and does not pass as a list with no ids.
+br_ids_tmp=$(mktemp)
+trap 'rm -f "$br_ids_tmp"' EXIT
+if ! ./scripts/br_ids.sh list > "$br_ids_tmp"; then
+  : > "$br_ids_tmp"
+  echo "ratchet: warning: no ticket id list, so br_ids_in_source and br_ids_in_tests see only \`br <id>\` and miss a bare id" >&2
 fi
+BR_IDS_FILE="$br_ids_tmp"
 export BR_IDS_FILE
 rows_now=$(compute_rows "$now_root")
 

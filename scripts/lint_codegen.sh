@@ -43,7 +43,7 @@
 #   LINT_HEAD1_REF  git ref to materialize when LINT_HEAD1_DIR is unset
 #   LINT_BASE_REF   the ref the branch walk starts from. Default: main. The walk
 #                   is skipped when LINT_HEAD1_DIR is set
-#   BR_IDS_FILE     the ticket ids L10 looks for, one per line. Default: ask br
+#   BR_IDS_FILE     the ids L10 looks for, one per line. Default: ask br
 #                   through scripts/br_ids.sh
 set -u
 cd "$(dirname "$0")/.." || exit 2
