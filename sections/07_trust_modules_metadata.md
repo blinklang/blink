@@ -371,6 +371,53 @@ fn sqlite3_close(db: Ptr[Void]) -> Int ! IO
 
 `K` in `@trusted(audit: K)` is not free text. It names a record in the package's **`audits.toml`**, a TOML file at the package root, next to `blink.toml`. Every package has its own: the standard library has one, and each dependency ships its own. A package resolves `K` only against its own file.
 
+**Which `audits.toml` a file reads.** The package of a file is the one that §10.5 *Project root discovery* finds from the path of that file. The cwd is not an input. `src/`, `tests/`, `examples/` and `bench/` share the one `audits.toml` at the package root.
+
+```
+pkg/
+  blink.toml              [package].name = "pkg"
+  audits.toml             the one file for the whole package
+  src/db.bl               K resolves against pkg/audits.toml
+  tests/test_pid.bl       K resolves against pkg/audits.toml
+  examples/demo.bl        K resolves against pkg/audits.toml
+  build/probe.bl          K resolves against pkg/audits.toml
+```
+
+A file that a test writes and then compiles has no special rule. A fixture under the package tree is in that package: `pkg/build/probe.bl` is in package `pkg`, because its path walks up to `pkg/blink.toml`. The fixture reads the record of `pkg`.
+
+```blink
+// pkg/tests/test_pid.bl; pkg/audits.toml holds [TEST-PID] with a claim and a pin
+@ffi("c", "getpid")
+@trusted(audit: "TEST-PID")
+fn getpid() -> Int ! IO
+```
+
+The record `TEST-PID` is found, so the annotation is accepted. The result is the same from every cwd.
+
+**A file in no package has no records.** When no `blink.toml` is above a file, the file is in no package. It has no `audits.toml`, so each `@trusted(audit: K)` in it is `AuditRecordNotFound` (E0829). An `audits.toml` beside such a file does not count. Only a `blink.toml` makes a package.
+
+```blink
+// /tmp/hello.bl; /tmp/audits.toml exists with a [PUTS-1] record; no blink.toml in /tmp or above it
+@ffi("c", "puts")
+@trusted(audit: "PUTS-1")        // error[E0829]: no audit record `PUTS-1`
+fn puts(s: Ptr[U8]) -> Int ! IO
+```
+
+```
+error[E0829]: no audit record `PUTS-1`
+ --> hello.bl:2:1
+  |
+2 | @trusted(audit: "PUTS-1")
+  |                 ^^^^^^^^ file is in no package
+  |
+  = note: no blink.toml was found above this file, so it is in no package
+  = note: an audits.toml without a blink.toml does not count
+  = help: remove `@trusted`; W0800 stays a warning and the script runs
+  = help: or add a blink.toml (`blink init`), then add a `[PUTS-1]` record with a `claim` to audits.toml
+```
+
+Without `@trusted`, the same declaration gives `UnauditedFfi` (W0800), which is a warning, and the script runs. `@allow(UnauditedFfi)` cannot replace `@trusted` here: it is `AuditGatedSuppression` (E0837).
+
 A record is a TOML table keyed by `K`. It holds exactly two keys:
 
 - `claim` — required, non-empty text. What the author claims and why it holds. Ticket links and authorship go here when a team wants them.
@@ -388,6 +435,17 @@ pins = { "report.fetch_table" = "ast1:c08e51aa2d90" }
 ```
 
 **A pin covers one whole function.** The pin is a hash of the function's syntax tree: its signature, its effect row and its body. It ignores formatting and comments, so `blink fmt` and a comment edit never make a pin stale. An `@ffi` decl has no body, so its pin covers only its signature and row. Pins are opaque: `blink audit pin` writes them, and nobody edits them by hand.
+
+**A function in a file outside `src/` can carry a pin.** A file under `tests/`, `examples/` or `bench/`, and a fixture, has no module name (§10.1). A function or `test` block in it is still pinned. Its pin key is the path of the file relative to the package root, plus the name of the item. The path uses forward slashes and is never absolute. The key never equals a module-path key. The pin-key grammar sets the spelling of this key; it also sets the keys of impl methods, trait impls and inline modules.
+
+```blink
+// pkg/tests/test_pid.bl
+@ffi("c", "getpid")
+@trusted(audit: "TEST-PID")
+fn getpid() -> Int ! IO
+```
+
+The pin of `getpid` is in the `pins` table of `[TEST-PID]` in `pkg/audits.toml`. Its key holds `tests/test_pid.bl` and `getpid`. The key is the same when `pkg` is in another directory or when the command runs from another cwd.
 
 The pin covers the function's own body and nothing else. A guard in a **caller** is outside every pin: deleting it changes no pin, and the claim can become false with no warning. Keep the guard inside the audited function, and keep that function small:
 
@@ -419,8 +477,28 @@ error[AuditRecordNotFound]: no audit record `DB-003`
 3 | @trusted(audit: "DB-003")
   |                 ^^^^^^^^ no record `DB-003` in audits.toml
   |
-  = help: add a `[DB-003]` table with a non-empty `claim` to audits.toml,
-          then run `blink audit pin DB-003`
+  = note: looked in audits.toml (package `db`)
+  = help: add this table to audits.toml:
+              [DB-003]
+              claim = "<why this holds>"
+          then run `blink audit pin DB-003 sqlite3_open`
+```
+
+The skeleton shows a placeholder. The compiler never fills in a claim: the author writes it. An empty `claim` is the same error.
+
+**Every audit diagnostic names the file it read.** `AuditRecordNotFound` (E0829), `AuditRecordUnknownKey` (E0830) and the note on a lapsed pin each name the `audits.toml` that the compiler read, or say that the file is in no package. The path is relative to the package root, not absolute, so the output is the same on every machine.
+
+```blink
+// pkg/tests/test_pid.bl; pkg/audits.toml has no [TEST-PID] record
+@ffi("c", "getpid")
+@trusted(audit: "TEST-PID")      // error[E0829]
+fn getpid() -> Int ! IO
+```
+
+```
+error[E0829]: no audit record `TEST-PID`
+ --> tests/test_pid.bl:2:1
+  = note: looked in audits.toml (package `pkg`)
 ```
 
 **A stale or missing pin is not an error.** When record `K` exists but has no pin for `f`, or its pin for `f` does not match, the suppression lapses: the original diagnostic fires again, with a note that names `K` and the reason. No new diagnostic code is involved.
@@ -433,6 +511,7 @@ warning[RawBypassesParam]: Raw() bypasses parameterization
   |                               ^^^^^^^^^^ concatenated into the query text, not parameterized
   |
   = note: `report.fetch_table` changed since audit record `RPT-002` was pinned
+  = note: read audit record `RPT-002` from audits.toml (package `report`)
   = help: re-read the claim in `RPT-002`; if it still holds, run `blink audit pin RPT-002 report.fetch_table`
 ```
 
@@ -2066,7 +2145,7 @@ fn peek() -> Int {
 
 In `helper.bl`, `main` binds only the qualifier. The private `fn main` of module `main` is not in the scope of `helper.bl` (§10.2), so `main.shared()` is qualified access. `main.secret()` in `helper.bl` is `PrivateItemAccess` (E1003) on the item `secret` in module `main`. A bare use of a `pub` item of `main` that a selective import of `main` does not list is E1006, and its help offers the qualified form `main.x`, as for any module. If `helper.bl` also declares its own `fn main`, that declaration takes the qualifier's name: E1012 (§10.5 *Imported and Declared Names*).
 
-A file outside `src/`, such as a script or a file under `tests/` or `examples/`, has no module name, and no file can import it. A diagnostic names such a file by its path. The file can still import its own package (§10.5 *Project root discovery*). When an import does not resolve and its path matches a `.bl` file under the package root but outside `src/` (`import util` with only `examples/util.bl`), `ModuleNotFound` adds the help "files outside `src/` are not modules; move the file under `src/`". The help does not appear for any other unresolved import.
+A file outside `src/`, such as a script or a file under `tests/` or `examples/`, has no module name, and no file can import it. A diagnostic names such a file by its path. The file can still import its own package (§10.5 *Project root discovery*). A function in it can still carry a pin (§9.1 *Audit Records*). When an import does not resolve and its path matches a `.bl` file under the package root but outside `src/` (`import util` with only `examples/util.bl`), `ModuleNotFound` adds the help "files outside `src/` are not modules; move the file under `src/`". The help does not appear for any other unresolved import.
 
 ```blink
 // src/myapp.bl; the package also has examples/util.bl and no src/util.bl
@@ -2465,20 +2544,42 @@ import pg.protocol           // resolves to libs/pg/src/protocol.bl
 
 **Package name grammar.** The `[package].name` field must match `[a-z][a-z0-9_]*` (validated as `error[E1011]`). An empty `name`, and a `name` that is not a string, are also E1011. The span follows §8.9.8. Hyphens are forbidden. Dots are forbidden in the bare name (dots are the import sub-path separator and are reserved for registry paths per §8.9.2). The constraint exists so that the four-way invariant — `[package].name` = directory name = entry filename stem = `@module(...)` argument — holds character-for-character with no transformation table.
 
-**Project root discovery.** A source file's package root is the nearest ancestor directory containing a `blink.toml`, walking up from the file being compiled. `src/` beneath the package root is the source root. Files under `tests/`, `examples/`, and `bench/` are *peers* of `src/`, not children: their imports resolve against the same package root that walking up from `src/` would find. This rule applies uniformly to first-party (self-package) and third-party imports — there is no special-case "self-import" branch.
+**Project root discovery.** A source file's package root is the nearest ancestor directory containing a `blink.toml`. The walk starts at the file's own path, made absolute first: a relative path and the absolute path of the same file give the same package root. The cwd is never an input. `src/` beneath the package root is the source root. Files under `tests/`, `examples/`, and `bench/` are *peers* of `src/`, not children: their imports resolve against the same package root that walking up from `src/` would find. This rule applies uniformly to first-party (self-package) and third-party imports — there is no special-case "self-import" branch.
+
+**One package root serves imports and audit records.** The root that this rule finds is the root for import resolution. It is also the root for audit records: `@trusted(audit: K)` resolves `K` only against the `audits.toml` beside that `blink.toml` (§9.1 *Audit Records*). No file has one package for its imports and another for its records.
 
 ```
 libs/pg/
   blink.toml              [package].name = "pg"
+  audits.toml             records for src/, tests/, examples/, bench/
   src/
     pg.bl                 @module("pg") — entry
     protocol.bl           @module("pg") — sibling, merges into pg.*
   tests/
     test_connect.bl       walks up to libs/pg/blink.toml,
                           import pg → libs/pg/src/pg.bl
+  build/
+    probe.bl              a fixture a test writes: in package pg too
 ```
 
-A source file with no enclosing `blink.toml` is not part of any package. Bare external imports from such a file are a compile error (E1010); only stdlib imports (`std.*`) and absolute file paths from the compiler driver are allowed.
+A file that a test writes and compiles has no special rule. It is in the package its path walks up to. `libs/pg/build/probe.bl` is in package `pg`.
+
+A source file with no enclosing `blink.toml` is not part of any package. Bare external imports from such a file are a compile error (E1010); only stdlib imports (`std.*`) and absolute file paths from the compiler driver are allowed. Such a file has no audit records either: each `@trusted(audit: K)` in it is E0829 (§9.1 *Audit Records*). An `audits.toml` beside the file does not make it a package.
+
+The cwd does not change the package of a file:
+
+```blink
+// libs/pg/tests/test_connect.bl
+import pg                  // libs/pg/src/pg.bl, from every cwd
+```
+
+```
+$ cd libs/pg/tests && blink check test_connect.bl       # package pg
+$ cd / && blink check /home/u/libs/pg/tests/test_connect.bl   # package pg
+$ cd libs/pg && blink check /tmp/hello.bl               # no package: hello.bl has no blink.toml above it
+```
+
+The third command checks a file outside `libs/pg/`. The cwd holds `libs/pg/blink.toml`, but the cwd is not an input, so `/tmp/hello.bl` is in no package. `import pg` in it is E1010, and `@trusted(audit: "PUTS-1")` in it is E0829.
 
 **Root package.** The *root package* is the package of the nearest `blink.toml` above the file that the tool starts from. `blink check`, `blink build`, `blink test` and the language server each start from one file, so each has one root package, and they all find the same one. The term does not name a workspace root: Blink has no workspaces. The root package owns its `src/`, `tests/`, `examples/` and `bench/`. A path, git or std dependency is not part of the root package, and how the build reaches a package does not change this (§8.9.1).
 

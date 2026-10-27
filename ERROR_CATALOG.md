@@ -227,7 +227,7 @@ ICE codes use the `I` prefix. `@allow` and `[lints]` take warning names only, so
 | AssertPanicsNestedExpectPanic | E0834 | `assert_panics` nested inside another `assert_panics` | Test runner | §2.20 |
 | XfailMissingReason | E0835 | `test.failing(...)` missing or empty `reason:` | Type checking | §8.10.6 |
 | DuplicateTestName | E0851 | Two `test` or `test.failing` blocks in one module have the same name. Names are the same when their `Str` values are equal after escapes decode. Span on the later name literal, with a label on the first; a note shows the shared value when the spellings differ. One diagnostic for each later copy. No machine-applicable fix. The help is "give each test its own name" | Type checking | §2.20 |
-| AuditRecordNotFound | E0829 | `@trusted(audit: K)` names a `K` that has no record in the package's `audits.toml`, or whose record has an empty `claim` | FFI | §9.1 |
+| AuditRecordNotFound | E0829 | `@trusted(audit: K)` names a `K` that has no record in the package's `audits.toml`, or whose record has an empty `claim`; also each `@trusted(audit: K)` in a file with no `blink.toml` above it, which is in no package. A note names the `audits.toml` read, or says the file is in no package | FFI | §9.1 |
 | AuditRecordUnknownKey | E0830 | A record in `audits.toml` holds a key other than `claim` and `pins`. The message names the allowed keys and the nearest one (see *Conventions*) | FFI | §9.1 |
 | TrustedRequiresAudit | E0836 | `@trusted` written without a non-empty `audit:` identifier | FFI | §9.1 |
 | AuditGatedSuppression | E0837 | An audit-gated diagnostic (`UnauditedFfi`, `RawBypassesParam`) named in `@allow(...)` or under `[lints]` — refused, not ignored, because neither channel records anything | FFI | §9.1 |
