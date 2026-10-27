@@ -540,6 +540,9 @@ std/bench = "0.3"
 required = ["Net.Connect", "Net.DNS"]         # always needed
 optional = ["IO.Log"]                         # only if caller provides handler
 
+[test]                                        # §8.10.7 test runner limits
+timeout = "30m"                               # time limit of each test binary (optional, default "10m")
+
 [native-dependencies]                         # §9.1.2 native C library resolution
 sodium = { type = "system" }                  # links -lsodium, must be on target
 mylib = { type = "vendored", path = "vendor/mylib.c" }  # compiled from source
@@ -660,14 +663,14 @@ W1001 is a warning, so a manifest written for a newer toolchain still builds (§
 
 A misspelled section often causes a second error later: the compiler does not see the dependencies in it. When W1001 fired in the same build, `ModuleNotFound` (E1200) and `PackageNotDeclared` (E1052) each add a `note:` that points at the unknown section.
 
-**Unknown keys.** Some tables have keys that this specification fixes. These tables are *closed*: `[package]`, `[capabilities]`, each dependency entry (the inline table of a key in `[dependencies]` or `[dev-dependencies]`) and each native-dependency entry (§9.1.2). Their keys are the keys that §8.9.3 and §9.1.2 list. The keys of `[dependencies]`, `[dev-dependencies]`, `[native-dependencies]`, `[alternatives]` and `[lints]` are names, and the checks for those names apply (for `[lints]`, §4.16.8 and E0842); the rules below do not apply to them.
+**Unknown keys.** Some tables have keys that this specification fixes. These tables are *closed*: `[package]`, `[capabilities]`, `[test]`, each dependency entry (the inline table of a key in `[dependencies]` or `[dev-dependencies]`) and each native-dependency entry (§9.1.2). Their keys are the keys that §8.9.3 and §9.1.2 list. The keys of `[dependencies]`, `[dev-dependencies]`, `[native-dependencies]`, `[alternatives]` and `[lints]` are names, and the checks for those names apply (for `[lints]`, §4.16.8 and E0842); the rules below do not apply to them.
 
 A field that picks a build input is an error. Other unknown keys are warnings:
 
-- An unknown key in `[package]` or `[capabilities]` is the warning `UnknownManifestKey` (W1002). The toolchain reads the section without the key. `--strict` and a `[lints]` entry can make W1002 an error, as for W1001.
+- An unknown key in `[package]`, `[capabilities]` or `[test]` is the warning `UnknownManifestKey` (W1002). The toolchain reads the section without the key. `--strict` and a `[lints]` entry can make W1002 an error, as for W1001.
 - An unknown field in a dependency entry or a native-dependency entry is the error `UnknownDependencyField` (E1014). No `[lints]` entry changes it. These fields choose what the toolchain fetches, compiles or links, so a field that the toolchain ignores builds a different program. For example, if `tga` stands for `tag`, the toolchain fetches the default branch and `blink.lock` pins it. The message has one `note:` line that gives this reason.
 
-Both diagnostics span the key. The help line offers the nearest key of the same table (ERROR_CATALOG.md, *Conventions*). A key of another table is never a candidate.
+Both diagnostics span the key. The help line offers the nearest key of the same table (ERROR_CATALOG.md, *Conventions*). A key of another table is never a candidate. The exception is a `memory` or `processes` key in `[test]`: its help line names the flag, `--memory <size>` or `--processes <count>` (§8.10.7).
 
 ```toml
 [package]
@@ -982,7 +985,7 @@ A `failed` or `panicked` record of a test that calls `for_each` can also carry `
 total = passed + failed + panicked + skipped
 ```
 
-A test counts once, under the status of its record. A `file` summary covers the `test` lines of that file; the `run` summary covers all `test` lines. The test binary exits non-zero when `failed + panicked > 0`. An unexpected pass counts as `failed` (§8.10.6). A panic has no exit code of its own. `blink test` exits `1` when `failed + panicked + files.build_failed + files.aborted > 0`, and `0` otherwise (§8.10.5).
+A test counts once, under the status of its record. A `file` summary covers the `test` lines of that file; the `run` summary covers all `test` lines. The test binary exits non-zero when `failed + panicked > 0`. An unexpected pass counts as `failed` (§8.10.6). A panic has no exit code of its own. `blink test` exits `1` when `failed + panicked + files.build_failed + files.aborted > 0`, and `0` otherwise. It exits `2` for a usage error, before any file builds (§8.10.5, §8.10.7).
 
 **Human-readable output.** The per-test line for a panicked test uses the word `PANIC`, and the panic message follows it:
 
@@ -1012,7 +1015,7 @@ test rejects bad header ... ok
   warning: E0824 cleanup panicked during unwind: close on released handle
 ```
 
-A signal crash (for example `SIGSEGV`) is not a Blink panic and gives no `test` line. It ends the test binary, and the `file` line reports it with `outcome: "aborted"` (§8.10.5).
+A signal crash (for example `SIGSEGV`) is not a Blink panic and gives no `test` line. It ends the test binary, and the `file` line reports it with `outcome: "aborted"` (§8.10.5). A limit that ends the binary (§8.10.7) gives the same `outcome`.
 
 ```sh
 blink test                       # run all tests
@@ -1020,6 +1023,7 @@ blink test --filter "auth"       # run tests matching pattern
 blink test --prop                # run only property tests
 blink test --doc                 # run only doc-tests
 blink test --coverage            # with coverage report (JSON)
+blink test --timeout 30m         # change the time limit of each test binary (§8.10.7)
 ```
 
 #### 8.10.1 Test Effect Handlers: `capture_log`
@@ -1748,9 +1752,9 @@ Every test file gives exactly one `file` line (§8.10). Its `outcome` is one val
 
 | `outcome` | Meaning | Fields for this outcome |
 |-----------|---------|-------------------------|
-| `"ran"` | The test binary reported the end of its run and was not ended by a signal. | — |
+| `"ran"` | The test binary reported the end of its run and was not ended by a signal or a limit. | — |
 | `"build_failed"` | The file did not build. None of its tests ran. | `diagnostics` |
-| `"aborted"` | The test binary was ended by a signal, or it exited before it reported the end of its run. An exit with code `0` before that point is `aborted` too. | `signal` or `exit_code`; `running` when known |
+| `"aborted"` | The test binary was ended by a signal, or by a limit of the runner (§8.10.7), or it exited before it reported the end of its run. An exit with code `0` before that point is `aborted` too. | `signal`, `exit_code` or `limit` (with its `limit_*` key); `running` when known |
 
 Every `file` line carries the six-key `summary`. For `build_failed`, every count is `0`: the file added no tests. For `aborted`, the counts cover the `test` lines that the file wrote before it ended. Those lines stay in the stream and count in the `run` summary.
 
@@ -1759,7 +1763,8 @@ Every `file` line carries the six-key `summary`. For `build_failed`, every count
 {"record": "file", "file": "tests/test_parse.bl", "outcome": "build_failed", "summary": {"total": 0, "passed": 0, "failed": 0, "panicked": 0, "skipped": 0, "duration_ms": 0},
  "diagnostics": [{"severity": "error", "name": "TypeError", "code": "E0300", "message": "expected Int, found Str", "span": {"file": "tests/test_parse.bl", "line": 14, "col": 22}}]}
 {"record": "file", "file": "tests/test_ffi.bl", "outcome": "aborted", "signal": "SIGSEGV", "running": "reads mapped page", "summary": {"total": 2, "passed": 2, "failed": 0, "panicked": 0, "skipped": 0, "duration_ms": 9}}
-{"record": "run", "summary": {"total": 2, "passed": 2, "failed": 0, "panicked": 0, "skipped": 0, "duration_ms": 10}, "files": {"total": 3, "ran": 1, "build_failed": 1, "aborted": 1}}
+{"record": "file", "file": "tests/test_hang.bl", "outcome": "aborted", "limit": "timeout", "limit_ms": 600000, "running": "hangs", "summary": {"total": 0, "passed": 0, "failed": 0, "panicked": 0, "skipped": 0, "duration_ms": 602004}}
+{"record": "run", "summary": {"total": 2, "passed": 2, "failed": 0, "panicked": 0, "skipped": 0, "duration_ms": 602014}, "files": {"total": 4, "ran": 1, "build_failed": 1, "aborted": 2}}
 ```
 
 The first line is a file that built and holds no tests. Compare it with the second: the counts are the same, and `outcome` tells the two apart.
@@ -1775,7 +1780,8 @@ The first line is a file that built and holds no tests. Compare it with the seco
 
 **`aborted` fields.**
 
-- Exactly one of `signal` and `exit_code` is present. A process that a signal ended has no exit code.
+- Exactly one of `signal`, `exit_code` and `limit` is present. A process that a signal ended has no exit code. A limit end has neither `signal` nor `exit_code`: the runner ended the binary, so the line names the limit and not the signal that the runner sent. A consumer that reads only `signal` and `exit_code` can see a line with neither, and must read `limit` too.
+- `limit` is the name of the limit that ended the binary. It is a closed enum: `"timeout"`, `"memory"` or `"processes"`. A limit end carries one more key, `limit_ms` for `"timeout"`, `limit_bytes` for `"memory"` or `limit_count` for `"processes"`, and never a second `limit_*` key (§8.10.7).
 - `signal` is the signal name as a string, for example `"SIGSEGV"`. When the platform has no name for the signal, the value is `"SIG<n>"`, for example `"SIG34"`. A signal number is not portable (`SIGBUS` is 7 on Linux and 10 on macOS), so the record never carries a bare number.
 - `exit_code` is the code of a process that exited before it reported the end of its run.
 - `running` is the name of the test that was running when the binary ended. It is present only when `blink test` knows it, and it is never a guess or a placeholder. When the binary ended outside any test, `running` is absent.
@@ -1790,7 +1796,7 @@ files.total = files.ran + files.build_failed + files.aborted
 
 When `files.aborted > 0`, the test counts are a lower bound: tests of an aborted file that wrote no `test` line are in no count.
 
-`blink test` exits `1` when `failed + panicked + files.build_failed + files.aborted > 0`, and `0` otherwise. It has no other non-zero exit code.
+`blink test` exits `1` when `failed + panicked + files.build_failed + files.aborted > 0`, and `0` otherwise. It has one other exit code: `2` for a usage error (§8.10.7). A usage error stops the run before any file builds, so it has no `file` line and no `run` line, and the counts above do not apply to it.
 
 **Human-readable output.** A file that does not build prints `BUILD FAILED` and its diagnostics. A file that aborted prints `ABORTED` and how it ended, with the test name when it is known:
 
@@ -1801,12 +1807,18 @@ BUILD FAILED tests/test_parse.bl
 
 ABORTED tests/test_ffi.bl
   signal SIGSEGV in test "reads mapped page"
+
+ABORTED tests/test_hang.bl
+  timed out after 10m in test "hangs"
+  help: raise it with --timeout <duration> or [test] timeout in blink.toml; none turns it off
 ```
+
+A limit end prints the limit, its value and a `help:` line (§8.10.7).
 
 The summary line adds a file clause for each of these counts only when it is above `0`:
 
 ```
-2 passed, 0 failed (of 2); 1 file did not build, 1 file aborted
+2 passed, 0 failed (of 2); 1 file did not build, 2 files aborted
 ```
 
 *Informative.* To test that a compiler rejects a program, or does not yet accept it, write a test that builds: it passes the program's source as a string to a compile step and asserts the result. The project supplies that compile step; the standard library does not.
@@ -1932,6 +1944,199 @@ A four-case decision rule, mechanical enough for AI code generators to apply wit
 **Rule text fixed.** A later panel fixed the suite-failure rule above to match the unexpected-pass example and the runtime. Rule keyed by `status` alone, over all four statuses: **5-1** (Minimalism dissent, for rules keyed by `status` and `expected_fail` together). The "only record" sentence with "a consumer tests the pair": **5-1** after a second round (Systems dissent, for the first sentence only). "`expected_fail` is never true on a `panicked` record", with no sentence on `xfail_observed`: **3-3 → user (BDFL) tiebreak**. No sentence that `expected_fail` is a property of the test: **3-3 → user tiebreak**. The added sentence in §8.10: **5-1** (Minimalism dissent: two copies can drift). See [decisions/xfail-unexpected-pass-rule.md](../decisions/xfail-unexpected-pass-rule.md).
 
 **Skipped records.** A later panel ruled on a skipped `test.failing` test. Both fields on every record of a `test.failing` test, `skipped` included, with the runtime fixed to match: **6-0**. The `xfail_reason` presence rule in its table row: **5-1** (Systems dissent, for one sentence after the table). The `expected_fail` row unchanged: **5-1** (AI/ML dissent, for a row that also says "absent on all other records"). The sentence on a skipped record: **4-2** in the first round, then **6-0** for a reworded sentence, with the wording chosen by plurality and ranked preference (3 first choices of 6). The informative note on human output: **5-1** (Minimalism dissent). The `cases` line: **5-1** (Minimalism dissent, for one clause). See [decisions/xfail-skipped-record.md](../decisions/xfail-skipped-record.md).
+
+---
+
+#### 8.10.7 Test binary limits: `--timeout`, `--memory`, `--processes`
+
+`blink test` runs each test binary as a child with limits (§4.4.8, *Child limits*). A limit covers the whole binary and the programs it starts. It does not cover one test: the runner has no per-test limit. A limit that a binary reaches ends the binary, and the `file` line reports which limit it was (§8.10.5).
+
+**The limits.** One word names each limit in every place: the flag, the `[test]` key, the `limit` value of a `file` line, and the field of `ChildLimits` (§4.4.8). The flag table is the one list of these spellings. The `help:` lines of the human output (below) use exactly the spellings of this table.
+
+| Flag | Value | Default | What it caps |
+|------|-------|---------|--------------|
+| `--timeout <duration>` | a duration, or `none` | `10m` | The wall-clock time of the test binary, from its start to its end. |
+| `--memory <size>` | a size, or `none` | `none` | The memory of the binary and of the programs it starts. |
+| `--processes <count>` | an integer of 1 or more, or `none` | `none` | The number of processes and threads of the binary and of the programs it starts. Threads count as well as processes (§4.4.8). |
+
+The timeout is on by default on every host. `--memory` and `--processes` are off until you give them a value. A plain terminal session has no memory limit and no process limit unless you pass the flag, and a plain terminal session cannot apply them at all (*Hosts that cannot apply a limit*).
+
+```sh
+blink test                                    # timeout 10m; no memory or process limit
+blink test --timeout 30m                      # a longer timeout
+blink test --memory 2G --processes 1024       # also cap memory and process count
+```
+
+The runner has no flag for the grace period. It uses the default of `ChildLimits`, 2 seconds (§4.4.8). At the deadline the runner sends SIGTERM, and 2 seconds later it sends SIGKILL.
+
+**Values.** A duration is an integer and a unit: `ms`, `s`, `m` or `h`. A size is an integer and a unit: `K`, `M` or `G`. Each unit is a power of 1024: `1K` is 1024 bytes, `1M` is 1024 × 1024 bytes and `1G` is 1024 × 1024 × 1024 bytes. This is the unit of the `memory` field of `ChildLimits`, which counts bytes (§4.4.8). A count is an integer with no unit. Every number must be above zero.
+
+| You write | The runner does |
+|-----------|-----------------|
+| `--timeout 90s` | Ends the binary after 90 seconds. |
+| `--timeout 90` | Error: a duration needs a unit. |
+| `--timeout none` | Sets no timeout. |
+| `--timeout 0` | Error: zero is not a limit. Use `none`. |
+| `--memory 512M` | Caps memory at 512 × 1024 × 1024 bytes. |
+| `--memory 2G` | Caps memory at 2 × 1024 × 1024 × 1024 bytes. |
+| `--memory 2048` | Error: a size needs a unit. |
+| `--processes 1024` | Ends the binary when it goes past 1024 processes and threads. |
+| `--processes 0` | Error: zero is not a limit. Use `none`. |
+
+`none` is the only way to turn a limit off. A value of zero in any unit is an error, because `0` for a memory limit reads as "zero bytes", not as "no limit". The error for a value names the flag and says what to do:
+
+```
+error: --timeout 0: zero is not a limit
+  help: use none to turn the limit off
+```
+
+```
+error: --timeout 90: a duration needs a unit
+  help: write 90s, 90m or 90h; units are ms, s, m and h
+```
+
+```
+error: --memory 2048: a size needs a unit
+  help: write 2048K, 2048M or 2048G; units are K, M and G
+```
+
+**The `[test]` table.** `blink.toml` can set the timeout for all callers of `blink test`, so that a bare `blink test` passes in a project whose test files are slow for a good reason. The table takes one key, `timeout`. Its value is a string in the form of the flag value:
+
+```toml
+[test]
+timeout = "30m"       # "none" turns the timeout off
+```
+
+Memory and the process count are flags only. A limit that only some hosts can apply does not belong in a file that every contributor shares. A project that wants these limits in CI passes the flags in its CI script.
+
+`[test]` is a closed table (§8.9.8). A key other than `timeout` is the warning `UnknownManifestKey` (W1002), and the runner reads the table without that key. A `memory` or a `processes` key gets a help line that names the flag:
+
+```toml
+[test]
+memory = "2G"
+```
+
+```
+warning[UnknownManifestKey]: `[test]` has no key `memory`
+ --> blink.toml:2:1
+  |
+2 | memory = "2G"
+  | ^^^^^^
+  = help: memory is a flag only; use --memory <size>
+```
+
+This warning means that no memory limit is in force. `--strict` and a `[lints]` entry can make W1002 an error, as for any manifest key.
+
+A `timeout` value that is not a valid duration, or that is not a string, is a usage error (*Usage errors*). The error span is the value:
+
+```toml
+[test]
+timeout = 1800
+```
+
+```
+error: [test] timeout: a duration needs a unit
+ --> blink.toml:2:11
+  |
+2 | timeout = 1800
+  |           ^^^^
+  = help: write "1800s", "30m" or "1h"; units are ms, s, m and h
+```
+
+**Precedence.** A flag beats `[test]`, and `[test]` beats the default:
+
+```toml
+[test]
+timeout = "30m"
+```
+
+```sh
+blink test                      # timeout 30m
+blink test --timeout 5m         # timeout 5m
+blink test --timeout none       # no timeout
+```
+
+**Limits apply to each binary.** The runner starts the limits again for every test binary. When it runs four files at the same time, each binary has its own limit, so four binaries together can use up to 4 × the `--memory` value and up to 4 × the `--processes` value. A limit does not cover the build of a file (*Build steps*).
+
+```sh
+blink test --memory 2G       # four binaries at once: up to 8G of memory in total
+```
+
+**Hosts that cannot apply a limit.** `--memory` and `--processes` need Linux with a delegated cgroup v2 (§4.4.8, *Memory and process count need a delegated cgroup v2*). The timeout works on every host. The runner calls `process.can_limit` (§4.4.8) once for each limit in force, before it builds any file. It does not check for each file. A limit that someone asked for and that the host cannot apply stops the run. The runner never drops the limit and never uses a weaker one in its place. A limit that is off, or set to `none`, needs no check.
+
+The error names the flag and the fact about the host in one line, and a help line says what to do:
+
+```
+error: --memory needs Linux with a delegated cgroup v2; this session has none
+  help: run under `systemd-run --user --scope -p Delegate=yes blink test ...`, or leave out --memory
+```
+
+```
+error: --processes needs Linux with a delegated cgroup v2; this session has none
+  help: run under `systemd-run --user --scope -p Delegate=yes blink test ...`, or leave out --processes
+```
+
+When both flags fail, the runner prints both errors. The help line shows one way to get a delegated cgroup v2; §4.4.8 says which hosts have one.
+
+**Usage errors.** A usage error stops `blink test` before it builds any file. These are usage errors: a bad value for `--timeout`, `--memory` or `--processes`, a bad value of `[test] timeout`, and a limit that the host cannot apply. The runner prints the error as text on standard error, also with `--json`. It writes no `test`, `file` or `run` line, because no file ran. The exit code is `2`. It differs from the exit code `1` of a run with failures, so a script can tell a bad command from a bad test run. A usage error is not an outcome of a test file (§8.10.5).
+
+**What the report shows.** A limit end is an `aborted` file (§8.10.5). The `file` line has a `limit` key that holds `"timeout"`, `"memory"` or `"processes"`, and one key that holds the value of the limit. The unit is in the name of the key, and a line has exactly one of them, the one that matches `limit`:
+
+| `limit` | Value key | Unit |
+|---------|-----------|------|
+| `"timeout"` | `limit_ms` | milliseconds |
+| `"memory"` | `limit_bytes` | bytes |
+| `"processes"` | `limit_count` | processes and threads |
+
+```json
+{"record": "file", "file": "tests/test_hang.bl", "outcome": "aborted", "limit": "timeout", "limit_ms": 600000, "running": "hangs", "summary": {"total": 0, "passed": 0, "failed": 0, "panicked": 0, "skipped": 0, "duration_ms": 602004}}
+{"record": "file", "file": "tests/test_grow.bl", "outcome": "aborted", "limit": "memory", "limit_bytes": 2147483648, "running": "pushes forever", "summary": {"total": 3, "passed": 3, "failed": 0, "panicked": 0, "skipped": 0, "duration_ms": 4180}}
+{"record": "file", "file": "tests/test_fork.bl", "outcome": "aborted", "limit": "processes", "limit_count": 1024, "running": "forks forever", "summary": {"total": 1, "passed": 1, "failed": 0, "panicked": 0, "skipped": 0, "duration_ms": 880}}
+```
+
+There is no `limit_ms` on a memory end and no fourth `limit_*` key. A limit end has no `signal` key, although the runner ended the binary with SIGTERM or SIGKILL: the signal is the runner's own, and it does not tell the reader the cause. The `run` line does not list the limits that were in force.
+
+A limit end always wins over every other end:
+
+- A binary that exits with code `0` during the grace period is `limit: "timeout"`, not `ran`.
+- A binary that writes its end-of-run report and then hangs until the deadline is `limit: "timeout"`, not `ran`.
+- The `test` lines that the binary wrote before it ended stay in the stream and count, as for any `aborted` file.
+
+The human output prints the cause, the limit and the test. It then prints a `help:` line with the way to change the limit. The line has the spelling of the flag table and uses `none`, never `0`. The `help:` line for the timeout names the flag and the `[test]` key. The lines for memory and the process count name the flag only, because those limits have no `[test]` key.
+
+```
+ABORTED tests/test_hang.bl
+  timed out after 10m in test "hangs"
+  help: raise it with --timeout <duration> or [test] timeout in blink.toml; none turns it off
+
+ABORTED tests/test_grow.bl
+  used more than the 2G memory limit in test "pushes forever"
+  help: raise it with --memory <size>; none turns it off
+
+ABORTED tests/test_fork.bl
+  went past the 1024 process limit in test "forks forever"
+  help: raise it with --processes <count>; none turns it off
+
+4 passed, 0 failed (of 4); 3 files aborted
+```
+
+The limit in these lines is written in the form that the flag accepts, in the largest unit that has no remainder: `10m`, `90s`, `1500ms`, `2G`, `512M`. When the binary ended outside any test, `running` is absent and the line ends after the limit: `timed out after 10m`. The `help:` line is human output only. It is not in the NDJSON.
+
+**The runner stops its children.** A child that has a limit runs in its own process group, so a terminal Ctrl-C does not reach it (§4.4.8, *Process groups*). `blink test` must therefore send SIGTERM to every live child when it receives SIGINT or SIGTERM. This is a requirement. Without it, Ctrl-C would stop the runner and leave the test binaries running.
+
+**A kill from outside is not a limit.** A kill that the runner did not cause stays `signal: "SIGKILL"`. For example, the memory cap of a container or a service unit ends a binary, and no `--memory` flag was in force. The runner cannot know the cause of that kill, and the report does not guess one:
+
+```json
+{"record": "file", "file": "tests/test_big.bl", "outcome": "aborted", "signal": "SIGKILL", "running": "loads the corpus", "summary": {"total": 2, "passed": 2, "failed": 0, "panicked": 0, "skipped": 0, "duration_ms": 31022}}
+```
+
+**Build steps.** The limits apply to the test binary only. The build of a file (the compile and link steps of §8.10.5, *`build_failed` fields*) runs with no limit from these flags.
+
+```sh
+blink test --timeout 30s    # 30 s for each test binary; the build of a file has no limit
+```
+
+**Panel vote: 6-0** for a 10-minute timeout on by default on every host, no runner flag for the grace period, a limit end as `aborted` with exactly one of `signal`, `exit_code`, `limit`, no environment variable, `none` as the only way to turn a limit off, a unit on every duration and size, and one word for each limit in every place. **5-1** for `--memory` and `--processes` in this version (Minimalism dissented: leave them out, and have the repository's own test task route its children through the per-child cap). **5-1** for a `[test]` table with the key `timeout` only (PLT dissented: under this rule a `memory = "2G"` line is a warning, and the run has no cap). **5-1** for one `limit_*` key on a limit `file` line (Minimalism dissented: no value key). **5-1** for no record of the limits in force (PLT dissented: a reader of the NDJSON cannot tell "no memory limit" from "limit set and not reached"). **5-1** for no limits on build steps in this version (Systems dissented: a hung `blinkc` or `cc` blocks the run forever). **6-0** for the `help:` line, after 4-2 in the first vote. See [DECISIONS.md](../DECISIONS.md) and [decisions/test-runner-limits.md](../decisions/test-runner-limits.md).
 
 ---
 
