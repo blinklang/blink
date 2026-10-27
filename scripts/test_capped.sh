@@ -281,6 +281,16 @@ else
     flunk "memory hog (rc=$rc, report lines=$lines: $(cat "$WORK/err"))"
 fi
 
+# The cap's OOM kill can take a second process while the first victim's memory
+# is still charged; it must never pick the script that writes the report.
+out=$(run "$CAPPED" bash -c 'echo "$(cat /proc/self/oom_score_adj) $(cat /proc/$PPID/oom_score_adj)"' 2> "$WORK/err")
+read -r cmd_adj inner_adj <<< "$out"
+if [ -n "${inner_adj:-}" ] && [ "$cmd_adj" -gt "$inner_adj" ]; then
+    pass "the OOM killer picks the run's command before the script that reports"
+else
+    flunk "oom_score_adj (command and reporter: [$out]: $(cat "$WORK/err"))"
+fi
+
 # 200 sleepers against a cap of 64 tasks; bash retries a failed fork, so the
 # loop ends by the timeout or once the sleepers end.
 forks='for i in $(seq 200); do sleep 3 & done 2>/dev/null; wait'

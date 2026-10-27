@@ -184,7 +184,10 @@ child that the run's OOM killed gets its own line. An OOM kill below the run's c
 line that says the slice or the machine ran out.
 
 It then ends the processes still in the scope. The scope has `OOMPolicy=continue`, else
-systemd stops it at the first OOM kill and the report goes with it.
+systemd stops it at the first OOM kill and the report goes with it. The command runs
+with an `oom_score_adj` 500 above the script's (at most 1000). At the cap, the kernel can
+kill a second process before the memory of the first is free; the higher score makes it
+kill a process of the command, not the script that writes the report.
 
 Settings:
 

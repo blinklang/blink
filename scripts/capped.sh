@@ -418,7 +418,15 @@ if [ "${1:-}" = --inner ]; then
             child_notice
         fi
     fi
-    "$@"
+    # At the cap the kernel can kill a second process before the first
+    # victim's memory is freed. A higher score makes that a process of the
+    # command, never this script, which still has to write the report. A step
+    # of 500, not the top score, keeps a run nested in another run (as in the
+    # self-tests) above its own reporter too.
+    adj=0
+    read -r adj < /proc/self/oom_score_adj 2>/dev/null
+    adj=$(( adj + 500 > 1000 ? 1000 : adj + 500 ))
+    "$BASH" -c 'echo "$1" 2>/dev/null > /proc/self/oom_score_adj; shift; exec "$@"' _ "$adj" "$@"
     rc=$?
     # The scope's own limit, not a child's: a child's cap is the child's line.
     # The plain oom_kill also counts each child's kills at its own cap, so

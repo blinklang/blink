@@ -47,6 +47,12 @@ gate() {
 child_lines() { grep -c "^capped.sh: the child $1" "$WORK/err"; }
 any_child_lines() { grep -c '^capped.sh: the child' "$WORK/err"; }
 gate_lines() { grep -c '^capped.sh: the run ' "$WORK/err"; }
+# A killed process can stay a zombie until its new parent reaps it, and
+# kill -0 still finds a zombie.
+alive() {
+    local st
+    st=$(ps -o stat= -p "$1" 2>/dev/null) && [ "${st#Z}" = "$st" ]
+}
 
 # The same caps the gate run asks for, with Delegate=yes: a user manager that
 # cannot delegate gets the prlimit path, which the second half covers.
@@ -158,7 +164,7 @@ if command -v systemd-run >/dev/null 2>&1 &&
     # can go and no stray outlives its row.
     out=$(gate -- '"$CAPPED" --child bash -c "sleep 300 & echo \$!"; d=/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup); ls -d "${d%/*}"/kids/c-* 2>/dev/null | wc -l')
     pid=$(echo "$out" | head -1)
-    if [ "$(echo "$out" | wc -l)" = 2 ] && [ -n "$pid" ] && [ "$(echo "$out" | tail -1)" = 0 ] && ! kill -0 "$pid" 2>/dev/null; then
+    if [ "$(echo "$out" | wc -l)" = 2 ] && [ -n "$pid" ] && [ "$(echo "$out" | tail -1)" = 0 ] && ! alive "$pid"; then
         pass "a child's leftover processes end with it and its cgroup is removed"
     else
         flunk "leftover child processes (out=[$out]: $(cat "$WORK/err"))"
@@ -207,7 +213,7 @@ if command -v systemd-run >/dev/null 2>&1 &&
         rm -f "$WORK/kidpid"
         want=143
         [ "$sig" = INT ] && want=130
-        if [ "$out" = "$(printf 'rc=%s\n0' "$want")" ] && [ "$took" -lt 15 ] && [ -n "$kidpid" ] && ! kill -0 "$kidpid" 2>/dev/null; then
+        if [ "$out" = "$(printf 'rc=%s\n0' "$want")" ] && [ "$took" -lt 15 ] && [ -n "$kidpid" ] && ! alive "$kidpid"; then
             pass "SIG$sig to the wrapper ends the child at once and removes its cgroup"
         else
             flunk "SIG$sig to the wrapper (out=[$out] took=${took}s kid=[$kidpid]: $(cat "$WORK/err"))"
@@ -257,9 +263,15 @@ if command -v systemd-run >/dev/null 2>&1 &&
     fi
 
     # A sibling's fork loop at the gate's cap is not the reason another child
-    # failed: the report stays empty and the child's own error stands.
-    gate BLINK_GATE_TASKS_MAX=64 -- 'bash '"$WORK/gate_forks"' 2>/dev/null &
-        "$CAPPED" --child --report '"$WORK/report"' bash -c "sleep 3; exit 1"; echo "rc=$?"; wait' > "$WORK/out"
+    # failed: the report stays empty and the child's own error stands. The
+    # sibling starts once the child has made its last fork; a fork the cap
+    # refuses at the child's start would fail it for a reason of its own.
+    printf '%s' 'sleep 3 & : > "$1"; wait; exit 1' > "$WORK/child_sleep"
+    rm -f "$WORK/started"
+    gate BLINK_GATE_TASKS_MAX=64 -- '"$CAPPED" --child --report '"$WORK/report"' bash '"$WORK/child_sleep $WORK/started"' & c=$!
+        while [ ! -e '"$WORK/started"' ]; do sleep 0.1; done
+        bash '"$WORK/gate_forks"' 2>/dev/null &
+        wait $c; echo "rc=$?"; wait' > "$WORK/out"
     if [ "$(cat "$WORK/out")" = rc=1 ] && [ ! -s "$WORK/report" ]; then
         pass "a sibling's forks at the gate's cap do not become another child's reason"
     else
