@@ -22,9 +22,15 @@ fail=0
 pass() { echo "PASS: $1"; }
 flunk() { echo "FAIL: $1"; fail=1; }
 
+# A runner that starts this test in the background without job control makes
+# it ignore SIGINT, and a shell cannot trap a signal ignored at its start, so
+# each case starts with SIGINT at its default where env can do that.
+defsig=()
+env --default-signal=INT true 2>/dev/null && defsig=(--default-signal=INT)
+
 # Each case starts as a fresh top-level gate run, as test_capped.sh does.
 run() {
-    env -u BLINK_GATE_SCOPE -u BLINK_GATE_CAP -u BLINK_CHILD_CAP -u BLINK_CHILD_CAP_MODE -u BLINK_CHILD_CGROUP \
+    env ${defsig[@]+"${defsig[@]}"} -u BLINK_GATE_SCOPE -u BLINK_GATE_CAP -u BLINK_CHILD_CAP -u BLINK_CHILD_CAP_MODE -u BLINK_CHILD_CGROUP \
         -u BLINK_CHILD_CAPPED -u BLINK_CHILD_MEMORY_MAX -u BLINK_CHILD_TASKS_MAX -u BLINK_CHILD_SWAP_MAX \
         -u BLINK_CHILD_TIMEOUT -u BLINK_CHILD_KILL_AFTER "$@"
 }
@@ -187,7 +193,10 @@ if command -v systemd-run >/dev/null 2>&1 &&
     # A signal to the wrapper ends the child at once and removes its cgroup.
     # Job control keeps SIGINT at its default in the background wrapper, as a
     # terminal's Ctrl-C would reach a foreground one.
-    for sig in TERM INT; do
+    sigs=TERM
+    [ ${#defsig[@]} -gt 0 ] && sigs="TERM INT"
+    [ ${#defsig[@]} -gt 0 ] || echo "SKIP: env has no --default-signal; the SIGINT cases did not run"
+    for sig in $sigs; do
         start=$EPOCHSECONDS
         out=$(gate -- 'set -m; "$CAPPED" --child bash -c "echo \$\$ > '"$WORK"'/kidpid; exec sleep 300" > /dev/null & w=$!; set +m
             for _ in $(seq 50); do [ -s '"$WORK"'/kidpid ] && break; sleep 0.1; done
@@ -259,9 +268,11 @@ if command -v systemd-run >/dev/null 2>&1 &&
 
     # Ctrl-C ends a loop of children, as it ends a loop of plain commands: the
     # wrapper dies by the signal, so the loop's shell sees it.
-    out=$(gate -- 'set -m; bash -c '\''for i in 1 2 3; do "$CAPPED" --child sleep 3; echo "iter $i"; done'\'' & w=$!; set +m
+    [ ${#defsig[@]} -gt 0 ] && out=$(gate -- 'set -m; bash -c '\''for i in 1 2 3; do "$CAPPED" --child sleep 3; echo "iter $i"; done'\'' & w=$!; set +m
         sleep 1; kill -INT -- "-$w"; wait "$w"; echo "rc=$?"')
-    if [ "$out" = rc=130 ]; then
+    if [ ${#defsig[@]} = 0 ]; then
+        :
+    elif [ "$out" = rc=130 ]; then
         pass "Ctrl-C to a loop of children ends the loop"
     else
         flunk "Ctrl-C to a loop (out=[$out]: $(cat "$WORK/err"))"
