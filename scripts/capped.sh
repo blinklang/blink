@@ -25,13 +25,15 @@
 #   BLINK_GATE_CAP=0                    run in place, uncapped (a machine that caps gates another way)
 #   BLINK_GATE_MEMORY_MAX=12G           memory cap of the run (systemd size: K, M, G, T)
 #   BLINK_GATE_TASKS_MAX=1024           process and thread cap of the run
-#   BLINK_GATE_SWAP_MAX                 swap cap of the run; unset leaves swap to the slice
+#   BLINK_GATE_SWAP_MAX=2G              swap cap of the run
 #   BLINK_GATE_SLICE=blink-gates.slice  user slice that holds the run's scope
 set -u
 
 mem=${BLINK_GATE_MEMORY_MAX:-12G}
 tasks=${BLINK_GATE_TASKS_MAX:-1024}
-swap=${BLINK_GATE_SWAP_MAX:-}
+# A run with no swap cap pages out for minutes before the memory cap kills it,
+# and the plain-scope fallback has no slice to cap its swap.
+swap=${BLINK_GATE_SWAP_MAX:-2G}
 slice=${BLINK_GATE_SLICE:-blink-gates.slice}
 
 notice() { echo "capped.sh: $*" >&2; }
@@ -111,8 +113,7 @@ export BLINK_GATE_MEMORY_MAX=$mem BLINK_GATE_TASKS_MAX=$tasks
 
 # OOMPolicy=continue: systemd would otherwise stop the scope on the first OOM
 # kill, and the report below would die with it.
-props=(-p "MemoryMax=$mem" -p "TasksMax=$tasks" -p OOMPolicy=continue)
-[ -n "$swap" ] && props+=(-p "MemorySwapMax=$swap")
+props=(-p "MemoryMax=$mem" -p "MemorySwapMax=$swap" -p "TasksMax=$tasks" -p OOMPolicy=continue)
 # systemd 254 and later expand $VAR in the command line of a scope; the
 # command must reach the shell as the caller wrote it.
 if command -v systemd-run >/dev/null 2>&1 && systemd-run --help 2>/dev/null | grep -q -- --expand-environment; then

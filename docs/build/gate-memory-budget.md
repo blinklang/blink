@@ -118,6 +118,7 @@ The products:
 | Slice OOM score | `OOMScoreAdjust=500` for the gate processes | The kernel kills gate work before a session (sessions run at 200). |
 | One gate scope `MemoryMax` | 12G | 2.9 times the highest anon + shmem (4.2 GiB). The page cache above this is reclaimed, not killed. Replaces the fmt scope `MemoryMax=50G`. |
 | One gate scope `TasksMax` | 1024 | 3.3 times the highest `pids.peak` (315). |
+| One gate scope `MemorySwapMax` | 2G (applied) | A fresh machine has no slice swap cap, and the plain-scope fallback has no slice. With no swap cap, a runaway gate pages out to a disk swap for minutes before the memory cap kills it, as on 2026-10-25. |
 | Per child (one test binary or one corpus row) `MemoryMax` | 2G | 4 times the largest single process (500 MB). One runaway child dies alone. |
 | Per child `TasksMax` | 256 | Holds a per-module build at `BLINK_JOBS=24` plus GC marker threads. Stops a self-spawn chain at about 115 MB. |
 | Per child run timeout | 600 s | Same as the corpus `CORPUS_RUN_TIMEOUT`. The fmt semantic stage has none today. |
@@ -129,7 +130,7 @@ stage or when its `pids.peak` or anon + shmem doubles.
 
 ## Applied: one gate scope
 
-`scripts/capped.sh` applies the two "one gate scope" rows. Each heavy Taskfile task
+`scripts/capped.sh` applies the three "one gate scope" rows. Each heavy Taskfile task
 re-runs itself through it: `bootstrap`, `regen`, `gen0`, `gen1`, `build-cli`, `build`,
 `compile-test`, `test`, `test-fmt`, `test-installed`, `fuzz`, `bench`, `build-binaries`,
 `ci`, `ci-fast`, `ci-release`, `ci-monolith`, `ci-per-module-checks`, `ci-profile`,
@@ -146,7 +147,7 @@ The first way that works caps the run:
 
 | Machine | Cap | Notice |
 |---|---|---|
-| systemd user scope, slice has a unit | scope `blink-gate-<task>-<pid>-<time>.scope` in `blink-gates.slice`, `MemoryMax=12G`, `TasksMax=1024` | none |
+| systemd user scope, slice has a unit | scope `blink-gate-<task>-<pid>-<time>.scope` in `blink-gates.slice`, `MemoryMax=12G`, `MemorySwapMax=2G`, `TasksMax=1024` | none |
 | systemd user scope, no `blink-gates.slice` unit | the same scope in the default user slice | one line |
 | systemd user scope, `BLINK_GATE_SLICE` names a unit that cannot hold a scope | the same scope in the default user slice | one line |
 | no systemd user scope, `prlimit` | address space 12G per process, user processes = running + 1024 | one line |
@@ -183,7 +184,7 @@ Settings:
 | `BLINK_GATE_CAP` | `1` | `0` runs every task in place, uncapped, with one notice. For a machine that caps gates some other way. |
 | `BLINK_GATE_MEMORY_MAX` | `12G` | the scope's `MemoryMax` |
 | `BLINK_GATE_TASKS_MAX` | `1024` | the scope's `TasksMax` |
-| `BLINK_GATE_SWAP_MAX` | unset | the scope's `MemorySwapMax`; unset leaves swap to the slice |
+| `BLINK_GATE_SWAP_MAX` | `2G` | the scope's `MemorySwapMax`; `infinity` leaves swap to the slice |
 | `BLINK_GATE_SLICE` | `blink-gates.slice` | the slice that holds the scope |
 
 `scripts/test_capped.sh`, in `task ci`'s gate self-tests, proves each path with caps of

@@ -110,7 +110,7 @@ fi
 # The same properties capped.sh asks for: a user manager with no memory or pids
 # controller starts a bare scope but not this one, and capped.sh falls back.
 if ! command -v systemd-run >/dev/null 2>&1 ||
-    ! systemd-run --user --scope -q -p MemoryMax=64M -p TasksMax=64 -p OOMPolicy=continue true >/dev/null 2>&1; then
+    ! systemd-run --user --scope -q -p MemoryMax=64M -p MemorySwapMax=0 -p TasksMax=64 -p OOMPolicy=continue true >/dev/null 2>&1; then
     echo "SKIP: no systemd user scope on this machine; the scope cases did not run"
     [ "$fail" = 0 ] && echo "ok: capped.sh" || echo "FAILED: capped.sh"
     exit "$fail"
@@ -140,11 +140,20 @@ case "$out" in
     *) flunk "--name (cgroup [$out])" ;;
 esac
 
-caps=$(run BLINK_GATE_MEMORY_MAX=64M BLINK_GATE_TASKS_MAX=64 "$CAPPED" bash -c 'd=/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup); echo "$(cat "$d/memory.max") $(cat "$d/pids.max")"')
-if [ "$caps" = "67108864 64" ]; then
-    pass "the scope carries the memory and task caps"
+caps=$(run BLINK_GATE_MEMORY_MAX=64M BLINK_GATE_TASKS_MAX=64 "$CAPPED" bash -c 'd=/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup); echo "$(cat "$d/memory.max") $(cat "$d/memory.swap.max") $(cat "$d/pids.max")"')
+if [ "$caps" = "67108864 2147483648 64" ]; then
+    pass "the scope carries the memory, swap (2G by default) and task caps"
 else
     flunk "scope caps (got [$caps])"
+fi
+
+swap='cat /sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup)/memory.swap.max'
+out=$(run BLINK_GATE_SWAP_MAX=32M "$CAPPED" bash -c "$swap")
+out_inf=$(run BLINK_GATE_SWAP_MAX=infinity "$CAPPED" bash -c "$swap")
+if [ "$out" = 33554432 ] && [ "$out_inf" = max ]; then
+    pass "BLINK_GATE_SWAP_MAX sets the swap cap, and infinity lifts it"
+else
+    flunk "swap override (32M: [$out], infinity: [$out_inf])"
 fi
 
 out=$(run "$CAPPED" bash -c 'x="a b"; echo "$x ${#x}"')
