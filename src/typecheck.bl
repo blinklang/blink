@@ -8354,10 +8354,17 @@ fn tc_check_builtin_clause_sig(root: Str, ns: Str, op: Str, m: Int) ! TypeCheck.
     let sig_idx = builtin_handler_op_sig(root, op)
     if sig_idx == -1 { return }
     let sig = fnsig_pool.get(sig_idx).unwrap()
+    let kw_start = tc_fnsig_kw_start(sig.params_start, sig.params_count, 0)
     let mut want: List[Str] = []
     let mut i = 0
     while i < sig.params_count {
-        want.push(type_to_str(fnsig_param_list.get(sig.params_start + i).unwrap()))
+        let wty = type_to_str(fnsig_param_list.get(sig.params_start + i).unwrap())
+        if i < kw_start {
+            want.push(wty)
+        } else {
+            let mark = if i == kw_start { "-- " } else { "" }
+            want.push("{mark}{fnsig_param_names.get(sig.params_start + i) ?? ""}: {wty}")
+        }
         i = i + 1
     }
     let spec_sig = "fn {op}({want.join(", ")}) -> {type_to_str(sig.ret)}"
@@ -8369,10 +8376,25 @@ fn tc_check_builtin_clause_sig(root: Str, ns: Str, op: Str, m: Int) ! TypeCheck.
     }
     let mut j = 0
     while j < n {
-        let ptid = resolve_param_type(sublist_get(params_sl, j))
+        let p = sublist_get(params_sl, j)
+        let ptid = resolve_param_type(p)
         let wtid = fnsig_param_list.get(sig.params_start + j).unwrap()
         if tc_tid_is_no_info(ptid) == 0 && !tc_tid_same_type(ptid, wtid) {
             tc_error_at("{root} handler clause `{op}` parameter {j + 1} is {type_to_str(ptid)}, but {ns}.{op} takes {type_to_str(wtid)}: `{spec_sig}`", m)
+            return
+        }
+        // A call names a keyword argument by the operation's header, so the clause must
+        // take it as the same keyword (§4.7.1). A positional name is the clause's own.
+        let wname = fnsig_param_names.get(sig.params_start + j) ?? ""
+        if (node_int_val(p) == 1) != (j >= kw_start) || (j >= kw_start && node_name(p) != wname) {
+            let want_form = if j >= kw_start { "keyword `{wname}`" } else { "a positional parameter" }
+            tc_error_at("{root} handler clause `{op}` parameter {j + 1} must be {want_form}, as in {ns}.{op}: `{spec_sig}`", m)
+            return
+        }
+        // The operation's header owns each default; the call has filled it before the
+        // clause runs.
+        if node_value(p) != -1 {
+            tc_error_at("{root} handler clause `{op}` parameter {j + 1} writes a default; {ns}.{op} gives it: `{spec_sig}`", m)
             return
         }
         j = j + 1
