@@ -1,0 +1,196 @@
+// The build-time check of foreign constants (§9.1, ForeignConstInvalid E0855).
+//
+// The front end sees a foreign constant's type and never its value, so `blink check` reads no
+// header. `blink build` asks the build target's C compiler instead, before the program's own
+// compile: one small C file includes each header and holds two fixed lines per constant, one
+// that is an error unless the C name is an integer constant expression, and one that is an
+// error unless its value fits the declared type. Each error line of that compile maps back to
+// one constant, and the build reports it at the declaration, naming the target. The user
+// never sees the raw C error.
+
+import parser.{get_annotation, get_str_named_arg, node_binder_col, node_col, node_kind, node_line, node_name, node_stmts, node_value, sublist_get, sublist_length}
+import ast.{NodeKind}
+import cname.{c_ffi_symbol}
+import typecheck.{TyKind, tc_lookup_node_tid, resolve_alias_tid, type_kind, tk_name}
+import diagnostics.{Diag, diag_error_span_at_notes, FOREIGN_CONST_INVALID}
+
+pub type ForeignConst {
+    decl: Int
+    c_name: Str
+    header: Str
+    // The Blink name of the integer type the value must fit, and C's bounds of it.
+    type_name: Str
+    min: Str
+    max: Str
+}
+
+// What one constant's probe lines said.
+pub type ProbeVerdict {
+    Fine
+    NotConstant
+    NoFit
+    NoHeader
+}
+
+pub type Probe {
+    text: Str
+    // The distinct headers, in the order the probe includes them.
+    headers: List[Str]
+}
+
+// The probe's include lines start here (1-based), after the feature-test macros the runtime
+// sets and <stdint.h>, so a name visible to the program's units is visible to the probe.
+let PROBE_FIRST_INCLUDE_LINE = 5
+
+// The foreign constants among the program's module-level lets, in declaration order. One
+// whose form is wrong has its error from the front end already and is left out.
+pub fn foreign_consts_in(program: Int) -> List[ForeignConst] {
+    let mut out: List[ForeignConst] = []
+    let globals = node_stmts(program)
+    if globals == -1 { return out }
+    let mut i = 0
+    while i < sublist_length(globals) {
+        let d = sublist_get(globals, i)
+        i = i + 1
+        if node_kind(d) != NodeKind.LetBinding || node_value(d) != -1 { continue }
+        let ann = get_annotation(d, "ffi")
+        if ann == -1 { continue }
+        let header = get_str_named_arg(ann, "header")
+        if header == "" { continue }
+        match bounds_of(resolve_alias_tid(tc_lookup_node_tid(d))) {
+            Some(b) => out.push(ForeignConst { decl: d, c_name: c_ffi_symbol(d), header: header, type_name: b.0, min: b.1, max: b.2 })
+            None => {}
+        }
+    }
+    out
+}
+
+fn bounds_of(tid: Int) -> Option[(Str, Str, Str)] {
+    if tid < 0 { return None }
+    let k = type_kind(tid)
+    match k {
+        TyKind.Int => Some(("Int", "INT64_MIN", "INT64_MAX"))
+        TyKind.I8 => Some((tk_name(k), "INT8_MIN", "INT8_MAX"))
+        TyKind.I16 => Some((tk_name(k), "INT16_MIN", "INT16_MAX"))
+        TyKind.I32 => Some((tk_name(k), "INT32_MIN", "INT32_MAX"))
+        TyKind.U8 => Some((tk_name(k), "0", "UINT8_MAX"))
+        TyKind.U16 => Some((tk_name(k), "0", "UINT16_MAX"))
+        TyKind.U32 => Some((tk_name(k), "0", "UINT32_MAX"))
+        TyKind.U64 => Some((tk_name(k), "0", "UINT64_MAX"))
+        _ => None
+    }
+}
+
+pub fn probe_of(fcs: List[ForeignConst]) -> Probe {
+    let mut headers: List[Str] = []
+    for fc in fcs {
+        if !headers.contains(fc.header) { headers.push(fc.header) }
+    }
+    let mut lines = [
+        "#if !defined(_POSIX_C_SOURCE) && !defined(_GNU_SOURCE) && !defined(__APPLE__)",
+        "#define _POSIX_C_SOURCE 200809L",
+        "#endif",
+        "#include <stdint.h>",
+    ]
+    for h in headers { lines.push("#include <{h}>") }
+    let mut i = 0
+    for fc in fcs {
+        let x = "({fc.c_name})"
+        // `| 0` rejects a floating value; the enum rejects any value that is not an integer
+        // constant expression, and the `? 1 : 1` keeps the enumerator in range.
+        lines.push("enum \{ blink_fc_{i} = ({x} | 0) ? 1 : 1 };")
+        lines.push("_Static_assert(({x} < 0) ? ((intmax_t){x} >= (intmax_t)({fc.min})) : ((uintmax_t){x} <= (uintmax_t)({fc.max})), \"fit\");")
+        i = i + 1
+    }
+    Probe { text: lines.join("\n").concat("\n"), headers: headers }
+}
+
+// Reads the C compiler's diagnostics for the probe file named `file_name`: each constant's
+// verdict, in the order of `fcs`. An error line that names no line of the probe, such as one
+// in a header, says nothing about a constant; a constant whose include fails is NoHeader,
+// which cc reports once, at the include.
+pub fn probe_verdicts(fcs: List[ForeignConst], probe: Probe, cc_err: Str, file_name: Str) -> List[ProbeVerdict] {
+    let mut verdicts: List[ProbeVerdict] = []
+    for _ in fcs { verdicts.push(ProbeVerdict.Fine) }
+    let first_const_line = PROBE_FIRST_INCLUDE_LINE + probe.headers.len()
+    let marker = "{file_name}:"
+    for raw in cc_err.split("\n") {
+        if !(raw.contains(": error:") || raw.contains(": fatal error:")) { continue }
+        let at = match raw.byte_index_of(marker, 0) {
+            Some(n) => n + marker.byte_len()
+            None => continue
+        }
+        let rest = raw.byte_slice(at, raw.byte_len())
+        let line = match rest.byte_index_of(":", 0) {
+            Some(n) => rest.byte_slice(0, n).to_int()
+            None => continue
+        }
+        if line >= PROBE_FIRST_INCLUDE_LINE && line < first_const_line {
+            let header = probe.headers.get(line - PROBE_FIRST_INCLUDE_LINE).unwrap()
+            let mut i = 0
+            for fc in fcs {
+                if fc.header == header { verdicts.set(i, ProbeVerdict.NoHeader) }
+                i = i + 1
+            }
+        } else if line >= first_const_line {
+            let idx = (line - first_const_line) / 2
+            if idx < fcs.len() {
+                let found = if (line - first_const_line) % 2 == 0 { ProbeVerdict.NotConstant } else { ProbeVerdict.NoFit }
+                verdicts.set(idx, worse(verdicts.get(idx).unwrap(), found))
+            }
+        }
+    }
+    verdicts
+}
+
+// A name that is not a constant fails its fit line too; the first failure is the cause.
+fn worse(a: ProbeVerdict, b: ProbeVerdict) -> ProbeVerdict {
+    if rank(b) > rank(a) { b } else { a }
+}
+
+fn rank(v: ProbeVerdict) -> Int {
+    match v {
+        ProbeVerdict.Fine => 0
+        ProbeVerdict.NoFit => 1
+        ProbeVerdict.NotConstant => 2
+        ProbeVerdict.NoHeader => 3
+    }
+}
+
+// Reports E0855 at each constant whose verdict is not Fine, and answers how many it reported.
+pub fn report_verdicts(fcs: List[ForeignConst], verdicts: List[ProbeVerdict], triple: Str) -> Int ! Diag.Report {
+    let mut errors = 0
+    let mut i = 0
+    for fc in fcs {
+        let v = verdicts.get(i).unwrap()
+        i = i + 1
+        let d = fc.decl
+        let col = if node_binder_col(d) > 0 { node_binder_col(d) } else { node_col(d) }
+        let end_col = col + node_name(d).byte_len()
+        let (message, help) = match v {
+            ProbeVerdict.Fine => continue
+            ProbeVerdict.NotConstant => ("`{fc.c_name}` is not an integer constant on {triple}",
+                "check the spelling, and that `{fc.header}` defines `{fc.c_name}` on this target")
+            ProbeVerdict.NoFit => ("`{fc.c_name}` does not fit `{fc.type_name}` on {triple}",
+                "declare it with a type that holds its value on this target, such as `Int`")
+            ProbeVerdict.NoHeader => ("`{fc.c_name}` is not an integer constant on {triple}: `{fc.header}` is not found",
+                "check the header name, and that this target has `{fc.header}`")
+        }
+        diag_error_span_at_notes("ForeignConstInvalid", FOREIGN_CONST_INVALID, message, d, node_line(d), col, end_col, help, [])
+        errors = errors + 1
+    }
+    errors
+}
+
+// The target triple a C compiler's `-dumpmachine` names, without the vendor field that
+// says nothing about the headers: x86_64-pc-linux-gnu is x86_64-linux-gnu.
+pub fn triple_of_machine(machine: Str) -> Str {
+    let parts = machine.trim().split("-")
+    if parts.len() == 4 {
+        let vendor = parts.get(1).unwrap()
+        if vendor == "pc" || vendor == "unknown" {
+            return "{parts.get(0).unwrap()}-{parts.get(2).unwrap()}-{parts.get(3).unwrap()}"
+        }
+    }
+    parts.join("-")
+}

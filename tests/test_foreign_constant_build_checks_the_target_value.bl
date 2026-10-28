@@ -1,0 +1,118 @@
+// `blink build` asks the build target's C compiler about each foreign constant before it
+// compiles the program (§9.1). A name that is not an integer constant expression there, or
+// whose value does not fit the declared type, is ForeignConstInvalid (E0855) at the
+// declaration, and the message names the target. The user never sees the raw C error, and
+// `blink check` never reads the headers.
+import compile_test_helpers.{scratch_root, sh}
+
+type Built {
+    ok: Bool
+    text: Str
+}
+
+fn build_of(src: Str, tag: Str, extra: List[Str]) -> Built {
+    let path = "{scratch_root()}/{tag}.bl"
+    write_file(path, src)
+    let mut args = ["build", path, "-o", "{scratch_root()}/{tag}"]
+    for a in extra { args.push(a) }
+    let r = process.run("build/blink", args).unwrap()
+    Built { ok: r.success(), text: "{r.out}{r.err_out}" }
+}
+
+fn check_of(src: Str, tag: Str) -> Built {
+    let path = "{scratch_root()}/{tag}.bl"
+    write_file(path, src)
+    let r = process.run("build/blink", ["check", path]).unwrap()
+    Built { ok: r.success(), text: "{r.out}{r.err_out}" }
+}
+
+// The triple the host's own C compiler names, as a build for no `--target` reports it.
+fn host_triple() -> Str {
+    let parts = sh("cc -dumpmachine").split("-")
+    if parts.len() == 4 && (parts.get(1).unwrap() == "pc" || parts.get(1).unwrap() == "unknown") {
+        return "{parts.get(0).unwrap()}-{parts.get(2).unwrap()}-{parts.get(3).unwrap()}"
+    }
+    parts.join("-")
+}
+
+let MISSPELLED = "@ffi(\"SIGBUZ\", header: \"signal.h\")\npub let SIGBUZ: Int\n\nfn main() \{\n    io.println(\"\{SIGBUZ}\")\n}\n"
+
+test "a misspelled C name is ForeignConstInvalid naming the target, not a C error" {
+    let b = build_of(MISSPELLED, "fcb_misspelled", [])
+    assert(!b.ok, "the build must fail, got: {b.text}")
+    assert(b.text.contains("error[ForeignConstInvalid]"), "got: {b.text}")
+    assert(b.text.contains("`SIGBUZ` is not an integer constant on {host_triple()}"), "got: {b.text}")
+    assert(b.text.contains("check the spelling, and that `signal.h` defines `SIGBUZ` on this target"), "got: {b.text}")
+    assert(b.text.contains(":2:9"), "the error is at the declaration, got: {b.text}")
+    assert(!b.text.contains("undeclared"), "no raw C error reaches the user, got: {b.text}")
+    assert(!b.text.contains("C compilation failed"), "the probe stops the build before cc, got: {b.text}")
+}
+
+test "the JSON report carries the code and the declaration's span" {
+    let b = build_of(MISSPELLED, "fcb_json", ["--json"])
+    assert(!b.ok, "got: {b.text}")
+    assert(b.text.contains("\"code\":\"E0855\""), "got: {b.text}")
+    assert(b.text.contains("\"line\":2,\"col\":9,\"end_line\":2,\"end_col\":15"), "got: {b.text}")
+}
+
+test "the one-unit build checks the value too" {
+    let b = build_of(MISSPELLED, "fcb_one_unit", ["--no-per-module"])
+    assert(!b.ok, "got: {b.text}")
+    assert(b.text.contains("`SIGBUZ` is not an integer constant on {host_triple()}"), "got: {b.text}")
+    assert(!b.text.contains("undeclared"), "got: {b.text}")
+}
+
+test "blink check does not read the headers" {
+    let b = check_of(MISSPELLED, "fcb_check")
+    assert(b.ok, "got: {b.text}")
+    assert(!b.text.contains("E0855"), "got: {b.text}")
+}
+
+test "errno is not an integer constant" {
+    let src = "@ffi(\"errno\", header: \"errno.h\")\npub let LAST_ERR: Int\n\nfn main() \{\n    io.println(\"\{LAST_ERR}\")\n}\n"
+    let b = build_of(src, "fcb_errno", [])
+    assert(!b.ok, "got: {b.text}")
+    assert(b.text.contains("error[ForeignConstInvalid]"), "got: {b.text}")
+    assert(b.text.contains("`errno` is not an integer constant on {host_triple()}"), "got: {b.text}")
+}
+
+test "a value that does not fit the declared type is ForeignConstInvalid" {
+    let src = "@ffi(\"INT_MAX\", header: \"limits.h\")\npub let BIG: I8\n\n@ffi(\"INT_MIN\", header: \"limits.h\")\npub let LOW: U32\n\n@ffi(\"CHAR_BIT\", header: \"limits.h\")\npub let BITS: U8\n\nfn main() \{\n    io.println(\"\{BIG} \{LOW} \{BITS}\")\n}\n"
+    let b = build_of(src, "fcb_fit", [])
+    assert(!b.ok, "got: {b.text}")
+    assert(b.text.contains("`INT_MAX` does not fit `I8` on {host_triple()}"), "got: {b.text}")
+    assert(b.text.contains("`INT_MIN` does not fit `U32` on {host_triple()}"), "got: {b.text}")
+    assert(!b.text.contains("CHAR_BIT"), "a value that fits is not reported, got: {b.text}")
+}
+
+test "a header the target does not have is ForeignConstInvalid for each constant it should define" {
+    let src = "@ffi(\"NOPE_A\", header: \"blink_no_such_header.h\")\npub let A: Int\n\n@ffi(\"NOPE_B\", header: \"blink_no_such_header.h\")\npub let B: Int\n\nfn main() \{\n    io.println(\"\{A} \{B}\")\n}\n"
+    let b = build_of(src, "fcb_header", [])
+    assert(!b.ok, "got: {b.text}")
+    assert(b.text.contains("`NOPE_A` is not an integer constant on {host_triple()}"), "got: {b.text}")
+    assert(b.text.contains("`NOPE_B` is not an integer constant on {host_triple()}"), "got: {b.text}")
+    assert(b.text.contains("`blink_no_such_header.h` is not found"), "got: {b.text}")
+}
+
+test "only the bad constant is reported when good ones sit beside it" {
+    let src = "@ffi(\"EINVAL\", header: \"errno.h\")\npub let EINVAL: Int\n\n@ffi(\"SIGBUZ\", header: \"signal.h\")\npub let SIGBUZ: Int\n\nfn main() \{\n    io.println(\"\{EINVAL} \{SIGBUZ}\")\n}\n"
+    let b = build_of(src, "fcb_mixed", [])
+    assert(!b.ok, "got: {b.text}")
+    assert(b.text.contains("`SIGBUZ` is not an integer constant"), "got: {b.text}")
+    assert(!b.text.contains("`EINVAL`"), "got: {b.text}")
+}
+
+test "a good foreign constant builds" {
+    let src = "@ffi(\"EINVAL\", header: \"errno.h\")\npub let EINVAL: Int\n\nfn main() \{\n    io.println(\"\{EINVAL > 0}\")\n}\n"
+    let b = build_of(src, "fcb_good", [])
+    assert(b.ok, "got: {b.text}")
+    let r = process.run("{scratch_root()}/fcb_good", []).unwrap()
+    assert_eq(r.out, "true\n")
+}
+
+test "a cross build names the cross target" {
+    if sh("command -v zig") == "" { return }
+    let b = build_of(MISSPELLED, "fcb_cross", ["--target", "aarch64-macos"])
+    assert(!b.ok, "got: {b.text}")
+    assert(b.text.contains("`SIGBUZ` is not an integer constant on aarch64-macos"), "got: {b.text}")
+}

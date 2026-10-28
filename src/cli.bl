@@ -68,6 +68,7 @@ import formatter.{Format, format}
 import escape.{ffi_scope_resource_name}
 import check_pipeline.{check_source, run_build_analyses, check_exit_code, check_status_line}
 import fix_edits.{FixEdit, fix_plan, fix_apply, fix_byte_offset}
+import foreign_const_probe.{ForeignConst, foreign_consts_in, probe_of, probe_verdicts, report_verdicts, triple_of_machine}
 import symbol_index.{collect_effects}
 import query.{query_index_source, query_answer}
 import diagnostics.{
@@ -574,7 +575,12 @@ fn checked_front_end(b: DaemonBuild, strict_mode: Int) -> Result[Int, Int] ! Dia
 }
 
 fn do_compile(source_path: Str, c_path: Str, format_flag: Str, debug_mode: Int, strict_mode: Int) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit, Codegen, FS.Read {
-    let result = if format_flag == "blink" { format_to_text(source_path) } else { compile_to_text(source_path, debug_mode, strict_mode, false) }
+    let result = if format_flag == "blink" { format_to_text(source_path) } else {
+        match compile_to_text(source_path, debug_mode, strict_mode, false) {
+            Ok(t) => Ok(t.c)
+            Err(rc) => Err(rc)
+        }
+    }
     match result {
         Ok(text) => {
             write_file(c_path, text)
@@ -609,11 +615,18 @@ fn format_to_text(source_path: Str) -> Result[Str, Int] ! Lex.Tokenize, Parse, P
     Ok(format(program))
 }
 
-fn compile_to_text(source_path: Str, debug_mode: Int, strict_mode: Int, test_build: Bool) -> Result[Str, Int] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit, Codegen, FS.Read {
+// The one C unit of a program, and the foreign constants a build checks before it compiles it.
+type CompiledText {
+    c: Str
+    foreign: List[ForeignConst]
+}
+
+fn compile_to_text(source_path: Str, debug_mode: Int, strict_mode: Int, test_build: Bool) -> Result[CompiledText, Int] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit, Codegen, FS.Read {
     let final_program = match compile_front_end(source_path, strict_mode) {
         Ok(p) => p
         Err(rc) => return Err(rc)
     }
+    let foreign = foreign_consts_in(final_program)
 
     let skip_raw = env.var("BLINK_SKIP_MODULES") ?? ""
     let mut skip_modules: Map[Str, Int] = Map()
@@ -668,7 +681,7 @@ fn compile_to_text(source_path: Str, debug_mode: Int, strict_mode: Int, test_bui
         }
     }
 
-    Ok(c_output)
+    Ok(CompiledText { c: c_output, foreign: foreign })
 }
 
 // Whether the compiler archive's evidence vector has a slot for every effect `program`
@@ -1543,6 +1556,41 @@ fn validate_build_deps(ffi_libs: List[Str], targets: List[Str]) -> Int ! Diag.Re
     0
 }
 
+// §9.1: the value of a foreign constant is the build target's, so `blink build` asks each
+// target's C compiler, before it compiles the program, whether each C name is an integer
+// constant expression that fits its declared type. A failure is E0855 at the declaration:
+// the program's own compile would only say that a name is undeclared, at a line of C. An
+// error the probe cannot map to a constant is left to that compile.
+fn check_foreign_consts(foreign: List[ForeignConst], targets: List[Str], used_deps: List[Str], output_path: Str) -> Int ! Diag.Report, IO, FS.Read, FS.Write, FS.Delete, Process.Spawn {
+    if foreign.is_empty() { return 0 }
+    let mut out_dir = path_dirname(output_path)
+    if out_dir == "" { out_dir = "." }
+    build_fs.reap_dead(out_dir, [".fcprobe"])
+    let dir = build_fs.private_dir(out_dir, ".fcprobe")
+    if dir == "" { return 0 }
+    let probe = probe_of(foreign)
+    write_file("{dir}/fc_probe.c", probe.text)
+    let aliases = if targets.is_empty() { [""] } else { targets }
+    let mut errors = 0
+    for alias in aliases {
+        let target = if alias == "" { "" } else { resolve_target_triple(alias) }
+        let inc_flags = resolve_vendored_includes(used_deps, target)
+        // gcc folds a value such as `errno` into a constant as an extension, and only
+        // -pedantic-errors makes that an error; -w would turn it off again.
+        let cmd = cc_command("-pedantic-errors -c {dir}/fc_probe.c -o {dir}/fc_probe.o {inc_flags}", 0, 0, target)
+        let r = process_run("sh", ["-c", cmd])
+        if r.exit_code == 0 { continue }
+        let triple = if target != "" { target } else { triple_of_machine(process_run("cc", ["-dumpmachine"]).out) }
+        errors = errors + report_verdicts(foreign, probe_verdicts(foreign, probe, r.err_out, "fc_probe.c"), triple)
+    }
+    let _ = build_fs.remove_tree(dir)
+    if errors > 0 {
+        diag_flush()
+        return 1
+    }
+    0
+}
+
 // What a build prints on stdout once it links. `blink test --json` prints none: its stdout is the
 // test binary's record stream, and a status line is not a record.
 let BUILD_STATUS_HUMAN = 0
@@ -1583,10 +1631,11 @@ fn do_build(source_path: Str, output_path: Str, c_path: Str, debug_mode: Int, re
     // The link flags come from this text and the compile reads a private copy of it: another
     // build that writes c_path can rewrite it at any time, and a second read of c_path could
     // link the object of one program with the native deps of another.
-    let c_source = match compile_to_text(source_path, debug_mode, strict_mode, test_build) {
-        Ok(text) => text
+    let compiled = match compile_to_text(source_path, debug_mode, strict_mode, test_build) {
+        Ok(t) => t
         Err(rc) => return rc
     }
+    let c_source = compiled.c
     write_file(c_path, c_source)
 
     if emit_mode == "c" {
@@ -1602,6 +1651,10 @@ fn do_build(source_path: Str, output_path: Str, c_path: Str, debug_mode: Int, re
     let vrc = validate_build_deps(ffi_libs, targets)
     if vrc != 0 {
         return vrc
+    }
+    let frc = check_foreign_consts(compiled.foreign, targets, used_deps, output_path)
+    if frc != 0 {
+        return frc
     }
 
     if targets.len() <= 1 {
@@ -1877,6 +1930,8 @@ type CompiledUnits {
     header_keys: Map[Str, Str]
     // The key of the facts the entry unit read that no source span carries, for the record.
     entry_key: Str
+    // Read from the checked program, so a build that reuses its units checks them too.
+    foreign: List[ForeignConst]
 }
 
 // A build reuses or records units only when the emit would print nothing: no trace but the
@@ -1911,6 +1966,7 @@ fn do_compile_units(source_path: Str, dir: Str, last_dir: Str, debug_mode: Int, 
         Ok(p) => p
         Err(rc) => return Err(rc)
     }
+    let foreign = foreign_consts_in(program)
     let cfg = units_cg_config(debug_mode, test_build)
     let modules = enumerate_program_modules(program)
     let erc = units_bail_on_diag()
@@ -1933,7 +1989,7 @@ fn do_compile_units(source_path: Str, dir: Str, last_dir: Str, debug_mode: Int, 
                 }
                 let wrc = units_flush_warnings(strict_mode)
                 if wrc != 0 { return Err(wrc) }
-                return Ok(CompiledUnits { units: r.units, inputs: inputs, shas: Some(r.shas), recordable: true, order: r.order, header_keys: r.header_keys, entry_key: r.entry_key })
+                return Ok(CompiledUnits { units: r.units, inputs: inputs, shas: Some(r.shas), recordable: true, order: r.order, header_keys: r.header_keys, entry_key: r.entry_key, foreign: foreign })
             }
             None => {}
         }
@@ -2087,7 +2143,7 @@ fn do_compile_units(source_path: Str, dir: Str, last_dir: Str, debug_mode: Int, 
     let recordable = diag_entry_count() == entries_before && diag_ice_count == ice_before
     let wrc = units_flush_warnings(strict_mode)
     if wrc != 0 { return Err(wrc) }
-    Ok(CompiledUnits { units: out, inputs: inputs, shas: shas, recordable: recordable, order: hs.order.join(","), header_keys: hs.keys, entry_key: entry_key })
+    Ok(CompiledUnits { units: out, inputs: inputs, shas: shas, recordable: recordable, order: hs.order.join(","), header_keys: hs.keys, entry_key: entry_key, foreign: foreign })
 }
 
 // BLINK_EMIT_REUSE_VERIFY=1 makes each per-module build emit the whole program again and fail
@@ -2342,7 +2398,7 @@ fn do_build_units(source_path: Str, output_path: Str, debug_mode: Int, release_m
     if shas.is_none() && cg_obj_cache_enabled != 0 && build_objcache.cache_enabled() {
         shas = build_objcache.unit_file_shas(work, resolve_archive_dir())
     }
-    let rc = link_units_all_targets(source_path, output_path, work, units_dir, compiled.units, shas, debug_mode, release_mode, targets, status_mode, unit_jobs)
+    let rc = link_units_all_targets(source_path, output_path, work, units_dir, compiled.units, compiled.foreign, shas, debug_mode, release_mode, targets, status_mode, unit_jobs)
     // Written last, and into the directory that replaces units_dir only after this: a build
     // that stops before here leaves the last record beside the files it describes.
     if rc == 0 && compiled.inputs != "" && compiled.recordable {
@@ -2365,7 +2421,7 @@ fn do_build_units(source_path: Str, output_path: Str, debug_mode: Int, release_m
     rc
 }
 
-fn link_units_all_targets(source_path: Str, output_path: Str, work: Str, units_dir: Str, units: List[emit_record.EmittedUnit], shas: Option[Map[Str, Str]], debug_mode: Int, release_mode: Int, targets: List[Str], status_mode: Int, unit_jobs: Int) -> Int ! Diag.Report, IO, FS.Write, FS.Read, FS.Delete, Process.Spawn {
+fn link_units_all_targets(source_path: Str, output_path: Str, work: Str, units_dir: Str, units: List[emit_record.EmittedUnit], foreign: List[ForeignConst], shas: Option[Map[Str, Str]], debug_mode: Int, release_mode: Int, targets: List[Str], status_mode: Int, unit_jobs: Int) -> Int ! Diag.Report, IO, FS.Write, FS.Read, FS.Delete, Process.Spawn {
     // The scans below read what the one-unit build reads from its single C file: each unit
     // and each header a unit includes, which is all cc compiles. A marker the scans look
     // for starts a line, so each file starts one.
@@ -2389,6 +2445,10 @@ fn link_units_all_targets(source_path: Str, output_path: Str, work: Str, units_d
     let vrc = validate_build_deps(ffi_libs, targets)
     if vrc != 0 {
         return vrc
+    }
+    let frc = check_foreign_consts(foreign, targets, used_deps, output_path)
+    if frc != 0 {
+        return frc
     }
     if targets.len() <= 1 {
         let target = if targets.len() == 1 { resolve_target_triple(targets.get(0).unwrap()) } else { "" }
