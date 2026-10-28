@@ -68,7 +68,7 @@ import formatter.{Format, format}
 import escape.{ffi_scope_resource_name}
 import check_pipeline.{check_source, run_build_analyses, check_exit_code, check_status_line}
 import fix_edits.{FixEdit, fix_plan, fix_apply, fix_byte_offset}
-import foreign_const_probe.{ForeignConst, foreign_const_header, foreign_consts_in, is_runtime_lib, report_undeclared_lib, probe_of, probe_verdicts, report_verdicts, triple_of_machine}
+import foreign_const_probe.{ForeignConst, ProbeVerdict, foreign_const_header, foreign_consts_in, is_runtime_lib, report_undeclared_lib, probe_of, probe_verdicts, report_verdicts, text_verdict, triple_of_machine}
 import symbol_index.{collect_effects}
 import query.{query_index_source, query_answer}
 import diagnostics.{
@@ -1584,20 +1584,37 @@ fn check_foreign_consts(foreign: List[ForeignConst], targets: List[Str], used_de
     build_fs.reap_dead(out_dir, [".fcprobe"])
     let dir = build_fs.private_dir(out_dir, ".fcprobe")
     if dir == "" { return 0 }
-    let probe = probe_of(foreign)
+    // A C name or header that is not one name never goes into C, and does not depend on
+    // the target.
+    let mut bad: List[ForeignConst] = []
+    let mut bad_verdicts: List[ProbeVerdict] = []
+    let mut good: List[ForeignConst] = []
+    for fc in foreign {
+        let v = text_verdict(fc)
+        match v {
+            ProbeVerdict.Fine => good.push(fc)
+            _ => {
+                bad.push(fc)
+                bad_verdicts.push(v)
+            }
+        }
+    }
+    let mut errors = report_verdicts(bad, bad_verdicts, "")
+    let probe = probe_of(good)
     write_file("{dir}/fc_probe.c", probe.text)
     let aliases = if targets.is_empty() { [""] } else { targets }
-    let mut errors = 0
     for alias in aliases {
+        if good.is_empty() { break }
         let target = if alias == "" { "" } else { resolve_target_triple(alias) }
         let inc_flags = resolve_vendored_includes(used_deps, target)
         // gcc folds a value such as `errno` into a constant as an extension, and only
         // -pedantic-errors makes that an error; -w would turn it off again.
         let cmd = cc_command("-pedantic-errors -c {dir}/fc_probe.c -o {dir}/fc_probe.o {inc_flags}", 0, 0, target)
         let r = process_run("sh", ["-c", cmd])
-        if r.exit_code == 0 { continue }
+        // 127: the shell found no C compiler, which the program's compile reports.
+        if r.exit_code == 0 || r.exit_code == 127 { continue }
         let triple = if target != "" { target } else { triple_of_machine(process_run("cc", ["-dumpmachine"]).out) }
-        errors = errors + report_verdicts(foreign, probe_verdicts(foreign, probe, r.err_out, "fc_probe.c"), triple)
+        errors = errors + report_verdicts(good, probe_verdicts(good, probe, r.err_out, "fc_probe.c"), triple)
     }
     let _ = build_fs.remove_tree(dir)
     if errors > 0 {

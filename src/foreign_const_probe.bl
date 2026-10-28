@@ -2,11 +2,11 @@
 //
 // The front end sees a foreign constant's type and never its value, so `blink check` reads no
 // header. `blink build` asks the build target's C compiler instead, before the program's own
-// compile: one small C file includes each header and holds two fixed lines per constant, one
+// compile: one small C file includes each header and holds two lines per constant, one
 // that is an error unless the C name is an integer constant expression, and one that is an
-// error unless its value fits the declared type. Each error line of that compile maps back to
-// one constant, and the build reports it at the declaration, naming the target. The user
-// never sees the raw C error.
+// error unless its value fits the declared type. Each error of that compile maps back to a
+// constant or to a header, and the build reports it at the declaration, naming the target. The
+// user never sees the raw C error.
 
 import parser.{get_annotation, get_str_named_arg, node_args, positional_str_arg, positional_str_arg_count, node_binder_col, node_col, node_kind, node_line, node_name, node_stmts, node_value, sublist_get, sublist_length}
 import ast.{NodeKind}
@@ -33,17 +33,32 @@ pub type ProbeVerdict {
     NotConstant
     NoFit
     NoHeader
+    // The header is there, but compiling it fails.
+    HeaderFails
+    // The compile failed, and no error in it names a constant.
+    Unchecked
+    // The C name is not one C identifier; the probe never sees it.
+    NotAName
+    // The header is not one header name; the probe never sees it.
+    NotAHeader
+}
+
+// What one line of the probe is for: the include of header i, or constant i's value line or
+// fit line.
+type ProbeLine {
+    Other
+    Include(Int)
+    Value(Int)
+    Fit(Int)
 }
 
 pub type Probe {
     text: Str
     // The distinct headers, in the order the probe includes them.
     headers: List[Str]
+    // What each line is for; line n of the file is `lines.get(n - 1)`.
+    lines: List[ProbeLine]
 }
-
-// The probe's include lines start here (1-based), after the feature-test macros the runtime
-// sets and <stdint.h>, so a name visible to the program's units is visible to the probe.
-let PROBE_FIRST_INCLUDE_LINE = 5
 
 // The header a foreign constant's value comes from, or "" when `d` is not a foreign constant.
 // The tools name the header and the C name, never a value: only the build target's C
@@ -113,66 +128,200 @@ fn bounds_of(tid: Int) -> Option[(Str, Str, Str)] {
     }
 }
 
+// Answers NotAName or NotAHeader for a constant whose text the probe cannot hold, else Fine.
+// Its C name and header go into C source as written, so anything other than one identifier
+// and one header name would change what the probe and the program compile.
+pub fn text_verdict(fc: ForeignConst) -> ProbeVerdict {
+    if !is_c_identifier(fc.c_name) { return ProbeVerdict.NotAName }
+    if !is_header_name(fc.header) { return ProbeVerdict.NotAHeader }
+    ProbeVerdict.Fine
+}
+
+fn is_c_identifier(s: Str) -> Bool {
+    if s.byte_len() == 0 { return false }
+    let mut i = 0
+    while i < s.byte_len() {
+        let b = s.byte_at(i).to_int()
+        let letter = (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || b == 95
+        let digit = b >= 48 && b <= 57
+        if !letter && !(digit && i > 0) { return false }
+        i = i + 1
+    }
+    true
+}
+
+// A name that fits between `<` and `>` on one line: printable ASCII with no `<`, `>`, `"` or
+// `\`.
+fn is_header_name(s: Str) -> Bool {
+    if s.trim().byte_len() == 0 { return false }
+    let mut i = 0
+    while i < s.byte_len() {
+        let b = s.byte_at(i).to_int()
+        if b < 32 || b > 126 || b == 60 || b == 62 || b == 34 || b == 92 { return false }
+        i = i + 1
+    }
+    true
+}
+
+// The probe for `fcs`, which all have a Fine `text_verdict`. Each header sits in its own
+// `__has_include` block, so a missing one is an `#error` at that block and the compile goes
+// on to the next header and the constants.
 pub fn probe_of(fcs: List[ForeignConst]) -> Probe {
     let mut headers: List[Str] = []
     for fc in fcs {
         if !headers.contains(fc.header) { headers.push(fc.header) }
     }
-    let mut lines = [
+    let mut text: List[Str] = []
+    let mut lines: List[ProbeLine] = []
+    // The feature-test macros the runtime sets, and <stdint.h>, so a name visible to the
+    // program's units is visible to the probe.
+    for t in [
         "#if !defined(_POSIX_C_SOURCE) && !defined(_GNU_SOURCE) && !defined(__APPLE__)",
         "#define _POSIX_C_SOURCE 200809L",
         "#endif",
         "#include <stdint.h>",
-    ]
-    for h in headers { lines.push("#include <{h}>") }
+    ] {
+        text.push(t)
+        lines.push(ProbeLine.Other)
+    }
+    let mut h = 0
+    for header in headers {
+        for t in ["#if __has_include(<{header}>)", "#include <{header}>", "#else", "#error \"blink: no header\"", "#endif"] {
+            text.push(t)
+            lines.push(ProbeLine.Include(h))
+        }
+        h = h + 1
+    }
     let mut i = 0
     for fc in fcs {
         let x = "({fc.c_name})"
         // `| 0` rejects a floating value; the enum rejects any value that is not an integer
         // constant expression, and the `? 1 : 1` keeps the enumerator in range.
-        lines.push("enum \{ blink_fc_{i} = ({x} | 0) ? 1 : 1 };")
-        lines.push("_Static_assert(({x} < 0) ? ((intmax_t){x} >= (intmax_t)({fc.min})) : ((uintmax_t){x} <= (uintmax_t)({fc.max})), \"fit\");")
+        text.push("enum \{ blink_fc_{i} = ({x} | 0) ? 1 : 1 };")
+        lines.push(ProbeLine.Value(i))
+        text.push("_Static_assert(({x} < 0) ? ((intmax_t){x} >= (intmax_t)({fc.min})) : ((uintmax_t){x} <= (uintmax_t)({fc.max})), \"fit\");")
+        lines.push(ProbeLine.Fit(i))
         i = i + 1
     }
-    Probe { text: lines.join("\n").concat("\n"), headers: headers }
+    Probe { text: text.join("\n").concat("\n"), headers: headers, lines: lines }
+}
+
+// The probe line that a cc diagnostic line names as `<file_name>:<line>:`, or 0.
+fn probe_line_of(raw: Str, marker: Str) -> Int {
+    let at = match raw.byte_index_of(marker, 0) {
+        Some(n) => n + marker.byte_len()
+        None => return 0
+    }
+    let rest = raw.byte_slice(at, raw.byte_len())
+    match rest.byte_index_of(":", 0) {
+        Some(n) => rest.byte_slice(0, n).to_int()
+        None => 0
+    }
 }
 
 // Reads the C compiler's diagnostics for the probe file named `file_name`: each constant's
-// verdict, in the order of `fcs`. An error line that names no line of the probe, such as one
-// in a header, says nothing about a constant; a constant whose include fails is NoHeader,
-// which cc reports once, at the include.
+// verdict, in the order of `fcs`. An error in the probe's own lines names its constant or its
+// header block. An error in a header names the probe line that included it, and with gcc a
+// later note names the probe line where a macro expanded; that line wins, as it names the
+// constant. A compile that failed with no error mapped is Unchecked for every constant, so the
+// build never goes on to a raw C error.
 pub fn probe_verdicts(fcs: List[ForeignConst], probe: Probe, cc_err: Str, file_name: Str) -> List[ProbeVerdict] {
     let mut verdicts: List[ProbeVerdict] = []
     for _ in fcs { verdicts.push(ProbeVerdict.Fine) }
-    let first_const_line = PROBE_FIRST_INCLUDE_LINE + probe.headers.len()
     let marker = "{file_name}:"
+    let mut included_at = 0
+    // The include line of a header error not yet given to a constant, or -1 when there is none.
+    let mut pending = -1
     for raw in cc_err.split("\n") {
-        if !(raw.contains(": error:") || raw.contains(": fatal error:")) { continue }
-        let at = match raw.byte_index_of(marker, 0) {
-            Some(n) => n + marker.byte_len()
-            None => continue
+        if raw.starts_with("In file included from ") {
+            included_at = probe_line_of(raw, marker)
+            continue
         }
-        let rest = raw.byte_slice(at, raw.byte_len())
-        let line = match rest.byte_index_of(":", 0) {
-            Some(n) => rest.byte_slice(0, n).to_int()
-            None => continue
+        if raw.trim().starts_with("from ") {
+            let n = probe_line_of(raw, marker)
+            if n > 0 { included_at = n }
+            continue
         }
-        if line >= PROBE_FIRST_INCLUDE_LINE && line < first_const_line {
-            let header = probe.headers.get(line - PROBE_FIRST_INCLUDE_LINE).unwrap()
-            let mut i = 0
-            for fc in fcs {
-                if fc.header == header { verdicts.set(i, ProbeVerdict.NoHeader) }
-                i = i + 1
+        let is_error = raw.contains(": error:") || raw.contains(": fatal error:")
+        let line = probe_line_of(raw, marker)
+        if raw.contains(": note:") && pending != -1 && line > 0 {
+            match line_of(probe, line) {
+                ProbeLine.Value(i) => {
+                    verdicts = mark(verdicts, i, ProbeVerdict.NotConstant)
+                    pending = -1
+                }
+                ProbeLine.Fit(i) => {
+                    verdicts = mark(verdicts, i, ProbeVerdict.NotConstant)
+                    pending = -1
+                }
+                _ => {}
             }
-        } else if line >= first_const_line {
-            let idx = (line - first_const_line) / 2
-            if idx < fcs.len() {
-                let found = if (line - first_const_line) % 2 == 0 { ProbeVerdict.NotConstant } else { ProbeVerdict.NoFit }
-                verdicts.set(idx, worse(verdicts.get(idx).unwrap(), found))
+            continue
+        }
+        if !is_error { continue }
+        if pending != -1 {
+            verdicts = header_fails(verdicts, fcs, probe, pending)
+            pending = -1
+        }
+        if line == 0 {
+            pending = included_at
+            continue
+        }
+        match line_of(probe, line) {
+            ProbeLine.Include(h) => { verdicts = mark_header(verdicts, fcs, probe.headers.get(h).unwrap(), ProbeVerdict.NoHeader) }
+            ProbeLine.Value(i) => { verdicts = mark(verdicts, i, ProbeVerdict.NotConstant) }
+            ProbeLine.Fit(i) => {
+                // gcc puts a macro's own error in the header; the fit line then fails as not
+                // constant, which is not a value that does not fit.
+                let fails_fit = raw.contains("static assertion failed") || raw.contains("static_assert failed")
+                verdicts = mark(verdicts, i, if fails_fit { ProbeVerdict.NoFit } else { ProbeVerdict.NotConstant })
             }
+            ProbeLine.Other => {}
         }
     }
+    if pending != -1 {
+        verdicts = header_fails(verdicts, fcs, probe, pending)
+    }
+    let mut mapped = false
+    for v in verdicts {
+        if rank(v) > 0 { mapped = true }
+    }
+    if !mapped {
+        let mut all: List[ProbeVerdict] = []
+        for _ in fcs { all.push(ProbeVerdict.Unchecked) }
+        return all
+    }
     verdicts
+}
+
+fn line_of(probe: Probe, line: Int) -> ProbeLine {
+    if line < 1 || line > probe.lines.len() { return ProbeLine.Other }
+    probe.lines.get(line - 1).unwrap()
+}
+
+fn mark(verdicts: List[ProbeVerdict], i: Int, found: ProbeVerdict) -> List[ProbeVerdict] {
+    let mut out = verdicts
+    if i < out.len() { out.set(i, worse(out.get(i).unwrap(), found)) }
+    out
+}
+
+fn mark_header(verdicts: List[ProbeVerdict], fcs: List[ForeignConst], header: Str, found: ProbeVerdict) -> List[ProbeVerdict] {
+    let mut out = verdicts
+    let mut i = 0
+    for fc in fcs {
+        if fc.header == header { out = mark(out, i, found) }
+        i = i + 1
+    }
+    out
+}
+
+// An error inside a header that the probe line `included_at` includes. An error that names no
+// include line still says the compile failed, which the Unchecked fallback reports.
+fn header_fails(verdicts: List[ProbeVerdict], fcs: List[ForeignConst], probe: Probe, included_at: Int) -> List[ProbeVerdict] {
+    match line_of(probe, included_at) {
+        ProbeLine.Include(h) => mark_header(verdicts, fcs, probe.headers.get(h).unwrap(), ProbeVerdict.HeaderFails)
+        _ => verdicts
+    }
 }
 
 // A name that is not a constant fails its fit line too; the first failure is the cause.
@@ -185,7 +334,11 @@ fn rank(v: ProbeVerdict) -> Int {
         ProbeVerdict.Fine => 0
         ProbeVerdict.NoFit => 1
         ProbeVerdict.NotConstant => 2
-        ProbeVerdict.NoHeader => 3
+        ProbeVerdict.Unchecked => 3
+        ProbeVerdict.HeaderFails => 4
+        ProbeVerdict.NoHeader => 5
+        ProbeVerdict.NotAHeader => 6
+        ProbeVerdict.NotAName => 7
     }
 }
 
@@ -199,14 +352,23 @@ pub fn report_verdicts(fcs: List[ForeignConst], verdicts: List[ProbeVerdict], tr
         let d = fc.decl
         let col = name_col(d)
         let end_col = col + node_name(d).byte_len()
+        let wider = if fc.type_name == "Int" { "U64" } else { "Int" }
         let (message, help) = match v {
             ProbeVerdict.Fine => continue
             ProbeVerdict.NotConstant => ("`{fc.c_name}` is not an integer constant on {triple}",
                 "check the spelling, and that `{fc.header}` defines `{fc.c_name}` on this target")
             ProbeVerdict.NoFit => ("`{fc.c_name}` does not fit `{fc.type_name}` on {triple}",
-                "declare it with a type that holds its value on this target, such as `Int`")
+                "declare it with a type that holds its value on this target, such as `{wider}`")
             ProbeVerdict.NoHeader => ("`{fc.c_name}` is not an integer constant on {triple}: `{fc.header}` is not found",
                 "check the header name, and that this target has `{fc.header}`")
+            ProbeVerdict.HeaderFails => ("`{fc.c_name}` is not an integer constant on {triple}: `{fc.header}` does not compile on this target",
+                "check that `{fc.header}` is the header to include for `{fc.c_name}` on this target")
+            ProbeVerdict.Unchecked => ("`{fc.c_name}` is not an integer constant on {triple}: the C compiler for this target fails on its headers",
+                "check that the C compiler for this target works, and that its headers define `{fc.c_name}`")
+            ProbeVerdict.NotAName => ("`{fc.c_name}` is not a C name: a foreign constant names one C identifier",
+                "write the one identifier that `{fc.header}` defines")
+            ProbeVerdict.NotAHeader => ("`{fc.header}` is not a header name: `header:` names one header, as `#include <...>` takes it",
+                "write the header name alone, such as `signal.h`")
         }
         diag_error_span_at_notes("ForeignConstInvalid", FOREIGN_CONST_INVALID, message, d, node_line(d), col, end_col, help, [])
         errors = errors + 1
