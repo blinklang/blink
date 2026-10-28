@@ -1,0 +1,142 @@
+// An import entry that binds a struct of another package under the name of a variant of the
+// importing package, or of a prelude enum, is NameCollision (E0518) at the entry; an alias is
+// the fix (sections/03_types.md §3.4 *Name collisions*). A struct of the same package is
+// reported once, at its declaration, and not again at each entry that imports it.
+
+import compile_test_helpers
+
+fn cleanup(base: Str) {
+    let _ = process.run("rm", ["-rf", base]).unwrap()
+}
+
+fn fail(base: Str, msg: Str) {
+    io.println("FAIL: {msg}")
+    cleanup(base)
+    assert(false)
+}
+
+fn blink_bin() -> Str {
+    let blink_root = process.run("sh", ["-c", "pwd -P"]).unwrap().out.trim_right()
+    "{blink_root}/build/blink"
+}
+
+// A dependency `geo` with a struct `Pt`, and an app whose own enum has a variant `Pt`.
+fn stage(base: Str, main_src: Str) {
+    cleanup(base)
+    let _ = process.run("mkdir", ["-p", "{base}/geo/src", "{base}/app/src"]).unwrap()
+    write_file("{base}/geo/blink.toml", "[package]\nname = \"geo\"\nversion = \"0.1.0\"\n")
+    write_file("{base}/geo/src/geo.bl", "pub type Pt \{ x: Int \}\n")
+    write_file("{base}/app/blink.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[dependencies]\ngeo = \{ path = \"../geo\" \}\n")
+    write_file("{base}/app/src/main.bl", main_src)
+}
+
+fn check(base: Str) -> (Bool, Str) {
+    let chk = process.run("sh", ["-c", "cd {base}/app && {blink_bin()} check src/main.bl 2>&1"]).unwrap()
+    (chk.success(), chk.out)
+}
+
+fn count_of(hay: Str, needle: Str) -> Int {
+    let mut n = 0
+    let mut from = 0
+    while true {
+        match hay.byte_index_of(needle, from) {
+            Some(at) => {
+                n = n + 1
+                from = at + 1
+            }
+            None => break
+        }
+    }
+    n
+}
+
+test "an entry that binds a dependency struct named like a variant of the package is E0518" {
+    let base = "{compile_test_helpers.scratch_root()}/_test_import_entry_collides_package"
+    stage(base, #"import geo.{Pt}
+
+type Mark { Pt(Int), Blank }
+
+fn main() {
+    let p = Pt { x: 1 }
+    let _ = p
+}
+"#)
+    let (ok, out) = check(base)
+    if ok {
+        fail(base, "`import geo.\{Pt\}` beside the variant `Mark.Pt` checked clean")
+        return
+    }
+    if count_of(out, "error[NameCollision]") != 1 {
+        fail(base, "expected one NameCollision, got: {out}")
+        return
+    }
+    if !out.contains("src/main.bl:1:") {
+        fail(base, "expected the error at the import entry on line 1, got: {out}")
+        return
+    }
+    if !out.contains("the conflicting variant `Mark.Pt` is declared at") {
+        fail(base, "expected a note naming `Mark.Pt`, got: {out}")
+        return
+    }
+    if !out.contains("import geo.\{Pt as GeoPt\}") {
+        fail(base, "expected the help to suggest an alias, got: {out}")
+        return
+    }
+    cleanup(base)
+}
+
+test "an alias named like a prelude variant is E0518" {
+    let base = "{compile_test_helpers.scratch_root()}/_test_import_entry_collides_prelude"
+    stage(base, #"import geo.{Pt as Less}
+
+fn main() {
+    let p = Less { x: 1 }
+    let _ = p
+}
+"#)
+    let (ok, out) = check(base)
+    if ok {
+        fail(base, "`import geo.\{Pt as Less\}` checked clean")
+        return
+    }
+    if !out.contains("error[NameCollision]") || !out.contains("the conflicting variant `Ordering.Less` is declared at") {
+        fail(base, "expected a NameCollision naming `Ordering.Less`, got: {out}")
+        return
+    }
+    cleanup(base)
+}
+
+test "an alias that no variant of the package uses compiles and runs" {
+    let base = "{compile_test_helpers.scratch_root()}/_test_import_entry_collides_alias_ok"
+    stage(base, #"import geo.{Pt as GeoPt}
+
+type Mark { Pt(Int), Blank }
+
+fn main() {
+    let p = GeoPt { x: 2 }
+    let m = Mark.Pt(3)
+    let n = match m {
+        Mark.Pt(v) => v
+        Mark.Blank => 0
+    }
+    io.println("alias {p.x} {n}")
+}
+"#)
+    let run = process.run("sh", ["-c", "cd {base}/app && {blink_bin()} run src/main.bl 2>&1"]).unwrap()
+    if !run.success() || !run.out.contains("alias 2 3") {
+        fail(base, "expected `alias 2 3`, got ({run.end}): {run.out}")
+        return
+    }
+    cleanup(base)
+}
+
+test "a struct of the same package is E0518 once, at its declaration and not at the entry" {
+    let helper = "pub type NotFound \{ code: Int }\n"
+    let entry = "import errs.\{NotFound}\n\ntype QueryError \{ NotFound \{ msg: Str } }\n\nfn main() \{ let _ = 1 }\n"
+    let out = compile_test_helpers.compile_xmod_capture(entry, "errs", helper, "import_entry_same_package_struct")
+    compile_test_helpers.expect_error(out, "E0518", "same-package struct imported by an entry")
+    if count_of(out, "\"code\":\"E0518\"") != 1 {
+        io.println("FAIL: expected one E0518, got: {out}")
+        assert(false)
+    }
+}

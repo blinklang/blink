@@ -11959,6 +11959,67 @@ fn tc_check_name_collisions() ! TypeCheck.Register, Diag.Report {
     }
 }
 
+// An import entry that binds a struct of another package under the name of a variant of the
+// importing package or of a prelude enum is E0518 at the entry (sections/03_types.md §3.4).
+// A struct of the same package is reported once, at its declaration, by the pass above.
+fn tc_check_imported_struct_collisions() ! TypeCheck.Register, Diag.Report {
+    let mut variants_named: Map[Str, List[Int]] = Map()
+    let mut i = 0
+    while i < evar_pool.len() {
+        let vname = evar_pool.get(i).unwrap().name
+        let mut idxs = variants_named.get(vname) ?? []
+        idxs.push(i)
+        variants_named.insert(vname, idxs)
+        i = i + 1
+    }
+    for reader in per_module_imports.keys() {
+        let imports = per_module_imports.get(reader) ?? Map()
+        for source_mod in imports.keys() {
+            for imp_node in imports.get(source_mod) ?? [] {
+                if imp_node == -1 { continue }
+                let names_sl = node_args(imp_node)
+                if names_sl == -1 { continue }
+                let mut k = 0
+                while k < sublist_length(names_sl) {
+                    let name_node = sublist_get(names_sl, k)
+                    k = k + 1
+                    let member = node_name(name_node)
+                    let alias = node_str_val(name_node)
+                    let bound = if alias != "" { alias } else { member }
+                    let candidates = variants_named.get(bound) ?? []
+                    if candidates.len() == 0 { continue }
+                    if tc_collision_reported.contains_key(name_node) { continue }
+                    let decl = nr_resolve_decl_in_module(source_mod, member, 0)
+                    if decl == -1 || !tc_struct_decls_named(member).contains(decl) { continue }
+                    if tc_same_package(node_module(decl), reader) { continue }
+                    for vi in candidates {
+                        let enum_decl = evar_pool.get(vi).unwrap().enum_decl
+                        if !tc_is_prelude_enum_decl(enum_decl) && !tc_same_package(node_module(enum_decl), reader) { continue }
+                        tc_collision_reported.insert(name_node, 1)
+                        let vnode = tc_variant_decl_node(vi)
+                        let at = "{diag_file_for_node(vnode)}:{node_line(vnode)}:{node_col(vnode)}"
+                        let qual = tc_qualifier_for_module(source_mod)
+                        diag_error_at_notes("NameCollision", NAME_COLLISION,
+                            "import of struct `{member}` binds `{bound}`, the name of the enum variant `{node_name(enum_decl)}.{bound}`; bare construction would be ambiguous",
+                            name_node, "import the struct under another name, such as `import {qual}.\{{member} as {tc_collision_alias_example(qual, member)}}`",
+                            ["the conflicting variant `{node_name(enum_decl)}.{bound}` is declared at {at}"])
+                        break
+                    }
+                }
+            }
+        }
+    }
+}
+
+// A sample alias for the E0518 help at an import entry: the struct's name after the
+// capitalized last segment of its module's qualifier (`geo` and `Point` give `GeoPoint`).
+fn tc_collision_alias_example(qual: Str, member: Str) -> Str {
+    let parts = qual.split(".")
+    let seg = parts.get(parts.len() - 1) ?? ""
+    if seg == "" { return "Imported{member}" }
+    "{seg.byte_slice(0, 1).to_upper()}{seg.byte_slice(1, seg.byte_len())}{member}"
+}
+
 // Is `enum_decl` a prelude enum, whose variants count as declared in every module for
 // E0518? Option and Result are not here: their variants Some, None, Ok and Err are not in
 // the variant pool, and a type with one of those four names is E1016, not E0518. Weekday
@@ -15037,9 +15098,10 @@ pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report {
     tc_register_type_decls(types_sl)
     tc_drop_unprovided_closeable_impls(program)
 
-    // Kind A: a struct name equal to an enum variant name is a hard error (E0518).
-    // Detected over the whole-program symbol table (catches cross-module collisions).
+    // Kind A: a struct name equal to an enum variant name is a hard error (E0518), within
+    // a package or against a prelude enum, at the struct or at the import entry binding it.
     tc_check_name_collisions()
+    tc_check_imported_struct_collisions()
 
     // @derive(Debug) requires every user-type field to also derive Debug.
     tc_check_derive_debug()
