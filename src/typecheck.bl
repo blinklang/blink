@@ -16559,7 +16559,8 @@ fn nr_unselected_source(name: Str) -> Str ! Diag.Report {
 fn nr_unselected_pub_source(name: Str) -> Str ! Diag.Report {
     let cands = nr_decls_by_name.get(name) ?? []
     for c in cands {
-        let owner = node_module(c)
+        if (nr_privacy.space.get(c) ?? "") == "variant" { continue }
+        let owner = nr_decl_owner(c)
         if owner == "" || nr_decl_private(c) != 0 { continue }
         return owner
     }
@@ -17367,8 +17368,9 @@ fn nr_space_private(mod_name: Str, space: Str, name: Str) -> Int ! Diag.Report {
 }
 
 // The declaration a use of `name` in namespace `space` means in `mod_name`, or -1. An expression
-// `m.X` reads a value first; where `m` declares no value `X` it names the type `X`, and only
-// where it declares neither, the variant (§3.4).
+// `m.X` reads a value first, and where `m` declares no value `X` it names the type `X`. Only
+// where it declares neither does it reach a variant: §3.4 gives no `m.Variant` form, but
+// resolution accepts one today, so it must not open a private enum's variant.
 fn nr_space_decl(mod_name: Str, space: Str, name: Str) -> Int ! Diag.Report {
     if space != "value" { return nr_module_decl_in(mod_name, space, name) }
     let v = nr_module_decl_in(mod_name, "value", name)
@@ -17451,8 +17453,20 @@ fn nr_qualified_target(qualifier: Str) -> Str {
 // facade declares nothing itself, so the re-export it follows answers there.
 fn nr_qualified_use_decl(space: Str, qualifier: Str, name: Str) -> Int ! Diag.Report {
     let target = nr_qualified_target(qualifier)
-    let d = nr_space_decl(target, space, name)
+    let d = nr_qualified_space_decl(target, space, name, 0)
     if d != -1 { d } else { nr_resolve_decl_in_module(target, name, 0) }
+}
+
+// The declaration of `name` in namespace `space` that module `target` declares or re-exports,
+// or -1. A facade declares nothing itself, so its sources answer for it.
+fn nr_qualified_space_decl(target: Str, space: Str, name: Str, depth: Int) -> Int ! Diag.Report {
+    let d = nr_space_decl(target, space, name)
+    if d != -1 || depth >= 8 { return d }
+    for src in nr_reexport_sources(target, name) {
+        let r = nr_qualified_space_decl(src, space, name, depth + 1)
+        if r != -1 { return r }
+    }
+    -1
 }
 
 // How the `pub import` re-exports of `target` reach `member` in namespace `space`: 0 not at
@@ -17518,15 +17532,14 @@ fn nr_private_access_here(space: Str, name: Str) -> Int ! Diag.Report {
     // user variant must not poison the verdict. Mirrors nr_check_selective_access.
     if is_builtin_name(name) != 0 { return 0 }
     let decl = nr_resolve_bare_decl(name, nr_current_module)
-    if decl != -1 && nr_decl_fits(decl, space) {
+    if decl != -1 {
         // A renamed import is checked against its declaration by nr_emit_imported_private_access.
         if node_name(decl) != name { return 0 }
-        return nr_decl_private(decl)
+        return nr_bound_use_private(decl, space, name)
     }
-    // The spelling resolves to no declaration of this namespace: a module records one
-    // declaration per spelling, so a type can stand where its namesake variant was asked for.
-    // The use is private only when every declaration of the namespace it can mean is, the ones
-    // this file's imports reach if there are any, else all of them.
+    // The file binds no declaration of the spelling. The use is private only when every
+    // declaration of the namespace it can mean is, the ones this file's imports reach if there
+    // are any, else all of them.
     let mut seen: List[Int] = []
     let mut reached: List[Int] = []
     let cands = nr_decls_by_name.get(name) ?? []
@@ -17543,6 +17556,23 @@ fn nr_private_access_here(space: Str, name: Str) -> Int ! Diag.Report {
         if nr_decl_private(c) == 0 { return 0 }
     }
     1
+}
+
+// Whether a use in namespace `space` of `name`, which this file binds to `decl`, is private. A
+// module records one declaration per spelling, so a type can stand where its namesake value or
+// variant was asked for. The use means that module's declarations of the namespace if it has
+// any, else `decl` itself, as a type heading a dotted path does, and it is private only when
+// every one it can mean is. Declarations in modules the file does not bind are no reading of it.
+fn nr_bound_use_private(decl: Int, space: Str, name: Str) -> Int ! Diag.Report {
+    if nr_decl_fits(decl, space) { return nr_decl_private(decl) }
+    let owner = nr_decl_owner(decl)
+    let mut fits = false
+    for c in nr_decls_by_name.get(name) ?? [] {
+        if nr_decl_owner(c) != owner || !nr_decl_fits(c, space) { continue }
+        fits = true
+        if nr_decl_private(c) == 0 { return 0 }
+    }
+    if fits { 1 } else { nr_decl_private(decl) }
 }
 
 // Emit E1003 PrivateItemAccess for `name` on `node`, choosing the noun
@@ -21340,11 +21370,15 @@ fn nr_check_qualified_type_ref(name: Str, qualifier: Str, member: Str, at: Int) 
     tc_mark_qualifier_used(qualifier)
     // `mod.Type.Member` is its own report, made where the member is read.
     if member.contains(".") { return }
-    if nr_resolve_decl_in_module(target, member, 0) == -1 {
+    let found = nr_resolve_decl_in_module(target, member, 0)
+    // A type position asks the type namespace, so a function or let of the spelling is no answer.
+    let only_value = found != -1 && (nr_privacy.space.get(found) ?? "") == "value" && nr_qualified_space_decl(target, "type", member, 0) == -1
+    if found == -1 || only_value {
         tc_errors.push("unknown type `{name}`")
         let near = suggest_module_member(target, member)
-        let help = if near != "" { "did you mean `{qualifier}.{near}`?" } else { "" }
-        nr_error("UnknownType", UNKNOWN_TYPE, "unknown type `{name}`: module `{qualifier}` declares no `{member}`", at, help)
+        let help = if near != "" && near != member { "did you mean `{qualifier}.{near}`?" } else { "" }
+        let what = if only_value { "type " } else { "" }
+        nr_error("UnknownType", UNKNOWN_TYPE, "unknown type `{name}`: module `{qualifier}` declares no {what}`{member}`", at, help)
         return
     }
     if nr_qualified_private_access("type", qualifier, member) != 0 {
