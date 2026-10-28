@@ -1,0 +1,43 @@
+// The two-argument form of a foreign constant names a library key of `[native-dependencies]`
+// (§9.1, §9.1.2). A key the manifest does not declare is MissingNativeDep (E0820). A declared
+// key gives the dependency's headers to the build, and no link flag: a foreign constant is a
+// value from a header, not a symbol the program links.
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> ProcessResult {
+    process.run("sh", ["-c", cmd]).unwrap()
+}
+
+let MANIFEST = "[package]\nname = \"fcnd\"\nversion = \"0.1.0\"\n\n[native-dependencies]\nzz_no_such_lib = \{ system = true \}\nfoo = \{ type = \"vendored\", path = \"vendor/foo.c\", headers = [\"foo.h\"] \}\n"
+
+// A project with a vendored dep `foo` whose header defines FOO_MAX, and a system dep that no
+// linker can find. Answers the build's output and the program's.
+fn build_project(main_src: Str) -> (ProcessResult, Str) {
+    let dir = sh("mktemp -d /tmp/blink_fc_nd.XXXXXX").out.trim()
+    let _ = sh("mkdir -p {dir}/src {dir}/vendor")
+    write_file("{dir}/blink.toml", MANIFEST)
+    write_file("{dir}/blink.lock", "[metadata]\nlockfile-version = 1\n")
+    write_file("{dir}/vendor/foo.h", "#define FOO_MAX 42\n")
+    write_file("{dir}/vendor/foo.c", "#include \"foo.h\"\nint foo_max(void) \{ return FOO_MAX; \}\n")
+    write_file("{dir}/src/main.bl", main_src)
+    let r = sh("B=$(pwd)/build/blink; cd {dir} && timeout 120 $B build src/main.bl -o {dir}/out")
+    let ran = if r.success() { sh("{dir}/out").out } else { "" }
+    let _ = sh("rm -rf {dir}")
+    (r, ran)
+}
+
+test "a library key the manifest does not declare is MissingNativeDep" {
+    let src = "@ffi(\"bar\", \"INT_MAX\", header: \"limits.h\")\npub let BIG: Int\n\nfn main() \{\n    io.println(\"\{BIG}\")\n}\n"
+    let (r, _) = build_project(src)
+    let text = "{r.out}{r.err_out}"
+    assert(!r.success(), "got: {text}")
+    assert(text.contains("error[MissingNativeDep]"), "got: {text}")
+    assert(text.contains("undeclared native dependency \"bar\""), "got: {text}")
+}
+
+test "a declared key gives its headers and no link flag" {
+    let src = "@ffi(\"foo\", \"FOO_MAX\", header: \"foo.h\")\npub let FOO_MAX: Int\n\n@ffi(\"zz_no_such_lib\", \"INT_MAX\", header: \"limits.h\")\npub let BIG: Int\n\nfn main() \{\n    io.println(\"\{FOO_MAX} \{BIG}\")\n}\n"
+    let (r, ran) = build_project(src)
+    assert(r.success(), "got: {r.out}{r.err_out}")
+    assert_eq(ran, "42 2147483647\n")
+}
