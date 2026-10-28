@@ -1,0 +1,106 @@
+// A struct with the name of an enum variant is NameCollision (E0518) only when the variant is
+// in the same package or in a prelude enum; a variant of a dependency enum never collides
+// (sections/03_types.md §3.4 *Name collisions*). The standard library is a dependency, so
+// loading std.process (ProcessOp.Run) or std.time (Weekday.Monday) leaves the names free.
+
+import compile_test_helpers
+
+fn cleanup(base: Str) {
+    let _ = process.run("rm", ["-rf", base]).unwrap()
+}
+
+fn fail(base: Str, msg: Str) {
+    io.println("FAIL: {msg}")
+    cleanup(base)
+    assert(false)
+}
+
+test "a struct named like a std.process variant compiles and runs" {
+    let src = "import std.process\n\ntype Run \{ cmd: Str }\n\nfn main() \{\n    let r = Run \{ cmd: \"true\" }\n    let res = process.run(r.cmd, []).unwrap()\n    io.println(\"ran \{r.cmd} \{res.success()}\")\n}\n"
+    let r = compile_test_helpers.compile_and_run(src, "struct_named_like_std_process_variant")
+    compile_test_helpers.expect_contains("{r.out}{r.err_out}", "ran true true", "struct Run beside std.process")
+}
+
+test "a struct named like a std.fs variant gets no E0518" {
+    let src = "import std.fs\n\ntype Write \{ path: Str }\n\nfn main() \{\n    let w = Write \{ path: \"x\" }\n    io.println(w.path)\n}\n"
+    let out = compile_test_helpers.compile_and_capture(src, "struct_named_like_std_fs_variant")
+    compile_test_helpers.expect_compiles_clean(out, "struct Write beside std.fs")
+}
+
+test "a struct named like a Weekday variant gets no E0518" {
+    let src = "type Monday \{ n: Int }\n\nfn main() \{\n    let m = Monday \{ n: 1 }\n    io.println(\"\{m.n}\")\n}\n"
+    let out = compile_test_helpers.compile_and_capture(src, "struct_named_like_weekday_variant")
+    compile_test_helpers.expect_compiles_clean(out, "struct Monday")
+}
+
+test "a struct named like an Ordering variant is E0518 with a note at the variant" {
+    let src = "type Less \{ n: Int }\n\nfn main() \{\n    let l = Less \{ n: 1 }\n    io.println(\"\{l.n}\")\n}\n"
+    let out = compile_test_helpers.compile_and_capture(src, "struct_named_like_ordering_variant")
+    compile_test_helpers.expect_error(out, "E0518", "struct Less")
+    compile_test_helpers.expect_contains(out, "the conflicting variant `Ordering.Less` is declared at", "note names Ordering.Less")
+}
+
+test "a struct named Some gets no E0518" {
+    let src = "type Some \{ n: Int }\n\nfn main() \{\n    let _ = 1\n}\n"
+    let out = compile_test_helpers.compile_and_capture(src, "struct_named_some_no_e0518")
+    assert(!out.contains("E0518"))
+}
+
+test "a struct and a variant in two modules of one package are one E0518 at the struct" {
+    let helper = "pub type QueryError \{ NotFound \{ msg: Str } }\n"
+    let entry = "import errs.\{QueryError}\n\ntype NotFound \{ code: Int }\n\nfn main() \{ let _ = 1 }\n"
+    let out = compile_test_helpers.compile_xmod_capture(entry, "errs", helper, "struct_variant_one_package")
+    compile_test_helpers.expect_error(out, "E0518", "same-package collision")
+    let first = out.byte_index_of("\"code\":\"E0518\"", 0) ?? -1
+    let again = if first < 0 { -1 } else { out.byte_index_of("\"code\":\"E0518\"", first + 1) ?? -1 }
+    if again >= 0 {
+        io.println("FAIL: expected one E0518, got: {out}")
+        assert(false)
+    }
+    compile_test_helpers.expect_contains(out, "the conflicting variant `QueryError.NotFound` is declared at", "note names QueryError.NotFound")
+}
+
+test "a struct and a variant in two packages do not collide, in either direction" {
+    let blink_root = process.run("sh", ["-c", "pwd -P"]).unwrap().out.trim_right()
+    let blink = "{blink_root}/build/blink"
+    let base = "{compile_test_helpers.scratch_root()}/_test_struct_variant_two_packages"
+    cleanup(base)
+    let _ = process.run("mkdir", ["-p", "{base}/geo/src", "{base}/app/src"]).unwrap()
+    write_file("{base}/geo/blink.toml", "[package]\nname = \"geo\"\nversion = \"0.1.0\"\n")
+    write_file("{base}/geo/src/geo.bl", "pub type Shape \{ Point(Int), Empty \}\npub type Pt \{ x: Int \}\npub fn origin() -> Pt \{ Pt \{ x: 0 \} \}\npub fn show(p: Pt) -> Str \{ \"pt \{p.x\}\" \}\n")
+    write_file("{base}/app/blink.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[dependencies]\ngeo = \{ path = \"../geo\" \}\n")
+
+    // The app's struct has the name of the dependency's variant Shape.Point, and the app's
+    // variant Mark.Pt has the name of the dependency's struct Pt.
+    write_file("{base}/app/src/main.bl", #"import geo
+import geo.{Shape}
+
+type Point { x: Int }
+type Mark { Pt(Int), Blank }
+
+fn main() {
+    let p = Point { x: 4 }
+    let s: Shape = Shape.Point(5)
+    let sn = match s {
+        Shape.Point(n) => "shape {n}"
+        Shape.Empty => "empty"
+    }
+    let m = Mark.Pt(6)
+    let mn = match m {
+        Mark.Pt(n) => "mark {n}"
+        Mark.Blank => "blank"
+    }
+    io.println("point {p.x} {sn} {mn} {geo.show(geo.origin())}")
+}
+"#)
+    let run = process.run("sh", ["-c", "cd {base}/app && {blink} run src/main.bl 2>&1"]).unwrap()
+    if !run.success() {
+        fail(base, "a struct and a variant in two packages did not run ({run.end}): {run.out}")
+        return
+    }
+    if !run.out.contains("point 4 shape 5 mark 6 pt 0") {
+        fail(base, "expected `point 4 shape 5 mark 6 pt 0`, got: {run.out}")
+        return
+    }
+    cleanup(base)
+}

@@ -259,13 +259,6 @@ fn tc_first_variant_slot(name: Str) -> Int {
     slots.get(0).unwrap()
 }
 
-// The enum declaration of the first-declared variant named `name`, or -1.
-fn tc_variant_enum_decl_node(name: Str) -> Int {
-    let i = tc_first_variant_slot(name)
-    if i < 0 { return -1 }
-    evar_pool.get(i).unwrap().enum_decl
-}
-
 fn tc_variant_decl_node(var_idx: Int) -> Int {
     if var_idx < 0 || var_idx >= evar_decl_nodes.len() { return -1 }
     evar_decl_nodes.get(var_idx).unwrap()
@@ -826,25 +819,6 @@ fn tc_written_type_nominal(name: Str) -> Str {
     let t = lookup_named_type(name)
     if t == -1 { return name }
     tc_tid_name(t)
-}
-
-// The tid of a STRUCT declared under the bare name `bare` in any module, or -1. A namesake
-// is registered only under its module-qualified key, so each declaring module is tried.
-fn tc_struct_tid_declared_as(bare: Str) -> Int {
-    let mods = match tc_namesake_type_modules.get(bare) {
-        Some(v) => v
-        None => {
-            let t = named_type_map.get(bare) ?? -1
-            if t != -1 && type_kind(t) == TyKind.Struct { return t }
-            return -1
-        }
-    }
-    for m in mods.split("|") {
-        let key = if tc_module_key_is_main(m) != 0 { bare } else { "{m}.{bare}" }
-        let t = named_type_map.get(key) ?? -1
-        if t != -1 && type_kind(t) == TyKind.Struct { return t }
-    }
-    -1
 }
 
 // What the bare type name `bare` means inside module `reader`: the module's own declaration,
@@ -1679,8 +1653,10 @@ let mut depr_type_nodes: Map[Str, Int] = Map()
 // primary span at the struct decl and a secondary span at the enum decl.
 pub let mut tc_struct_decl_nodes: Map[Str, Int] = Map()
 
-// Dedupe so each colliding name is reported once, not per use site.
-let mut tc_collision_reported: Map[Str, Int] = Map()
+// Struct declaration nodes already reported, so a struct that collides with several
+// variants gets one E0518. Keyed by node, not name: namesake structs in two packages are
+// two declarations, and each one's reach is its own package.
+let mut tc_collision_reported: Map[Int, Int] = Map()
 
 // Tids of @ffi.struct types, so Ptr[T] is allowed for them. Keyed by tid, not by name: a
 // declaration has one type but many spellings, and a name key answers only the spelling that
@@ -11936,27 +11912,69 @@ fn tc_check_derive_serialize() ! Diag.Report {
     }
 }
 
-// Kind A collision: a struct type whose name equals an enum variant name. This is the
-// NARROW invariant — two enums sharing a variant name (e.g. `Pending` in JobState and
-// NetState) stays legal and is resolved by the hint, so we only fire when the colliding
-// name is registered as a TyKind.Struct in named_type_map. Whole-program: both tables are
-// merged across all modules at registration, so cross-module collisions are caught.
+// Kind A collision: a struct type whose name equals an enum variant name. Two enums sharing
+// a variant name stay legal. The reach is the struct's own package plus the prelude enums:
+// a dependency's variant never collides, since a dependency's names never decide what a
+// bare name in this package means.
 fn tc_check_name_collisions() ! TypeCheck.Register, Diag.Report {
     let mut i = 0
     while i < evar_pool.len() {
         let vname = evar_pool.get(i).unwrap().name
-        let stid = tc_struct_tid_declared_as(vname)
-        if tc_collision_reported.contains_key(vname) == 0 && stid != -1 {
-            tc_collision_reported.insert(vname, 1)
-            let struct_node = tc_struct_decl_nodes.get(tc_tid_name(stid)) ?? -1
-            let enum_node = tc_variant_enum_decl_node(vname)
-            diag_error_at("NameCollision", NAME_COLLISION, "struct `{vname}` has the same name as an enum variant `{vname}`; bare construction would be ambiguous (note: two different enums MAY share a variant name — only a struct-vs-variant clash is rejected)", struct_node, "rename either the struct or the variant")
-            if enum_node != -1 {
-                diag_error_at("NameCollision", NAME_COLLISION, "the conflicting variant `{vname}` is declared here", enum_node, "rename either the struct or the variant")
+        let enum_decl = evar_pool.get(i).unwrap().enum_decl
+        let emod = node_module(enum_decl)
+        let prelude = tc_is_prelude_enum_decl(enum_decl)
+        for struct_node in tc_struct_decls_named(vname) {
+            let collides = prelude || tc_same_package(node_module(struct_node), emod)
+            if collides && !tc_collision_reported.contains_key(struct_node) {
+                tc_collision_reported.insert(struct_node, 1)
+                let vnode = tc_variant_decl_node(i)
+                let at = "{diag_file_for_node(vnode)}:{node_line(vnode)}:{node_col(vnode)}"
+                diag_error_at_notes("NameCollision", NAME_COLLISION,
+                    "struct `{vname}` has the same name as an enum variant `{vname}`; bare construction would be ambiguous (note: two different enums MAY share a variant name — only a struct-vs-variant clash is rejected)",
+                    struct_node, "rename either the struct or the variant",
+                    ["the conflicting variant `{node_name(enum_decl)}.{vname}` is declared at {at}"])
             }
         }
         i = i + 1
     }
+}
+
+// Is `enum_decl` a prelude enum, whose variants count as declared in every module for
+// E0518? Option and Result are not here: their variants Some, None, Ok and Err are not in
+// the variant pool, and a type with one of those four names is E1016, not E0518. Weekday
+// is in a prelude module but is not a prelude type (§10.6 *Prelude Types*), so it counts
+// as a dependency.
+fn tc_is_prelude_enum_decl(enum_decl: Int) -> Bool {
+    if !tc_prelude_modules.contains_key(node_module(enum_decl)) { return false }
+    match node_name(enum_decl) {
+        "Ordering" => true
+        "ConversionError" => true
+        "TemplateValue" => true
+        _ => false
+    }
+}
+
+// The declaration node of every struct declared under the bare name `bare`, in any module.
+// A namesake is registered only under its module-qualified key, so each declaring module
+// is tried.
+fn tc_struct_decls_named(bare: Str) -> List[Int] {
+    let mut out: List[Int] = []
+    let mut keys: List[Str] = []
+    match tc_namesake_type_modules.get(bare) {
+        Some(mods) => {
+            for m in mods.split("|") {
+                keys.push(if tc_module_key_is_main(m) != 0 { bare } else { "{m}.{bare}" })
+            }
+        }
+        None => keys.push(bare)
+    }
+    for key in keys {
+        let t = named_type_map.get(key) ?? -1
+        if t == -1 || type_kind(t) != TyKind.Struct { continue }
+        let decl = tc_struct_decl_nodes.get(key) ?? -1
+        if decl != -1 && !out.contains(decl) { out.push(decl) }
+    }
+    out
 }
 
 // Is `tp_name` return-only: named by the fn's RETURN annotation and by no parameter
