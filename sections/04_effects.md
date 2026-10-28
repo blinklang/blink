@@ -137,8 +137,8 @@ effect Net {
 }
 
 effect DB {
-    effect Read       // SELECT, read-only queries
-    effect Write      // INSERT, UPDATE, DELETE, CREATE, DROP, ALTER — all mutations
+    effect Read       // SELECT, read-only queries; prepare, bind_*, column_*, reset, finalize on a Stmt (§4.4.10)
+    effect Write      // INSERT, UPDATE, DELETE, CREATE, DROP, ALTER — all mutations; step on a Stmt (§4.4.10)
 }
 
 effect IO {
@@ -189,8 +189,8 @@ effect Async          // spawn and join concurrent tasks (§4.13)
 | `! FS.Read` | `fs.read(...)`, `fs.list_dir(...)`, `fs.stat(...)` -- read-only FS operations |
 | `! FS.Read, FS.Write` | Read and write, but not delete or watch |
 | `! FS` | All FS operations: read, write, delete, watch |
-| `! DB.Read` | Read-only database queries: `db.query(...)`, `db.query_one(...)` |
-| `! DB.Write` | Database mutations: `db.exec(...)`, `db.execute(...)`, `db.begin()`, `db.commit()`, `db.rollback()` |
+| `! DB.Read` | Read-only database queries: `db.query(...)`, `db.query_one(...)`; `db.prepare(...)`, `bind_*`, `column_*`, `reset` and `finalize` on a `Stmt` (§4.4.10) |
+| `! DB.Write` | Database mutations: `db.exec(...)`, `db.execute(...)`, `db.begin()`, `db.commit()`, `db.rollback()`; `step` on a `Stmt` (§4.4.10) |
 | `! DB` | Full database access: read and write |
 
 **An effect name must exist.** Every name in an effect row must be a built-in effect (above) or one the program declares (§4.12). Any other name is rejected with `UnknownEffect` (E0538). There is no `FFI` effect, so `! FFI` is the usual way to meet this error; for that name the diagnostic adds a help line that points to §9.1:
@@ -485,7 +485,7 @@ fn main() ! IO {
 |---|---|---|
 | `IO` / `IO.*` | `io` | `io.print(...)`, `io.println(...)`, `io.log(...)`, `io.eprintln(...)`, `io.eprint(...)`, `io.print_raw(...)`, `io.eprint_raw(...)`, `io.print_raw_bytes(...)`, `io.read_line()`, `io.read_all()`, `io.read_bytes(...)` (§4.4.9) |
 | `FS` / `FS.*` | `fs` | `fs.read(...)`, `fs.write(...)`, `fs.list_dir(...)`, `fs.stat(...)`, `fs.delete(...)`, `fs.watch(...)` (§4.4.5) |
-| `DB` / `DB.*` | `db` | `db.query(...)`, `db.query_one(...)`, `db.exec(...)`, `db.execute(...)`, `db.prepare(...)`, `db.begin()`, `db.commit()`, `db.rollback()` |
+| `DB` / `DB.*` | `db` | `db.query(...)`, `db.query_one(...)`, `db.exec(...)`, `db.execute(...)`, `db.prepare(...)`, `db.begin()`, `db.commit()`, `db.rollback()`; on a `Stmt`: `s.bind_int(...)`, `s.bind_text(...)`, `s.column_int(...)`, `s.column_text(...)`, `s.reset()`, `s.finalize()` (`DB.Read`) and `s.step()` (`DB.Write`) (§4.4.10) |
 | `Net` / `Net.*` | `net` | `net.request(...)`, `net.get(...)`, `net.post(...)`, `net.listen(...)`, `net.dns(...)` |
 | `Env` / `Env.*` | `env` | `env.args()`, `env.var(...)`, `env.vars()`, `env.cwd()`, `env.pid()`, `env.set_var(...)`, `env.remove_var(...)`, `env.exit(...)` (§4.4.3) |
 | `Time` / `Time.*` | `time` | `time.read() -> Instant` (wall clock), `time.monotonic() -> Monotonic`, `time.sleep(Duration)` (§3.2.3) |
@@ -2361,6 +2361,256 @@ test "echo_upper prints each line in capitals" {
     assert_eq(out, ["AB", "", "CD"])
 }
 ```
+
+#### 4.4.10 Prepared Statements (`Stmt`)
+
+`db.prepare(sql)` returns a `Stmt`, a prepared statement. Every operation on a `Stmt` is an operation of `DB`. The handler of `DB` runs it, as it runs `db.query`. The `Stmt` operations are primitive operations (§4.7.1):
+
+```blink
+effect DB {
+    effect Read {
+        // query, query_one
+        fn prepare(sql: Template[DB]) -> Result[Stmt, DBError]
+        fn bind_int(s: Stmt, idx: Int, val: Int) -> Result[Void, DBError]
+        fn bind_text(s: Stmt, idx: Int, val: Str) -> Result[Void, DBError]
+        fn column_int(s: Stmt, idx: Int) -> Int
+        fn column_text(s: Stmt, idx: Int) -> Str
+        fn reset(s: Stmt) -> Result[Void, DBError]
+        fn finalize(s: Stmt) -> Result[Void, DBError]
+    }
+    effect Write {
+        // exec, execute, begin, commit, rollback
+        fn step(s: Stmt) -> Result[Int, DBError]
+    }
+}
+```
+
+`Stmt` has one method for each operation. The method performs the operation, so `s.step()` performs `db.step(s)`. A call of the method charges the row of its operation to the caller:
+
+| Method | Operation | Row |
+|---|---|---|
+| `s.step()` | `step` | `DB.Write` |
+| `s.bind_int(i, v)`, `s.bind_text(i, v)` | `bind_int`, `bind_text` | `DB.Read` |
+| `s.column_int(i)`, `s.column_text(i)` | `column_int`, `column_text` | `DB.Read` |
+| `s.reset()`, `s.finalize()` | `reset`, `finalize` | `DB.Read` |
+
+`step` is `DB.Write` because a prepared statement can write, and the type `Stmt` does not say whether it does. Code that only reads rows uses `db.query` and `db.query_one`, which need only `DB.Read`. `! DB` grants all of the rows above. There is one `Stmt` type.
+
+The row of a foreign call that a driver makes, such as `sqlite_step`, is not charged to the caller of the method. It is part of the clause row of the handler, and the `with` that installs the handler charges it (§4.7.1, *The clause row*; §9.1, *Foreign Rows Inside a Built-in Effect's Handler*). A method call outside the `with` that made the `Stmt` is a `DB` operation like any other. It needs its row in the signature, and it needs a handler of `DB` in scope.
+
+A fn with no `DB` row cannot run SQL through a `Stmt`, also when the caller passes the `Stmt` in:
+
+```blink
+fn sneaky(s: Stmt) ! IO {
+    let _ = s.step()    // E0500: `s.step()` performs the DB operation `step`, which needs `DB.Write`
+}
+```
+
+```
+error[UndeclaredEffect]: undeclared effect
+ --> app.bl:2:13
+  |
+2 |     let _ = s.step()
+  |             ^^^^^^^^ `s.step()` performs the DB operation `step`, which requires `DB.Write`
+  |
+  = note: function `sneaky` declares `IO` but is missing `DB.Write`
+  = fix: add effect to signature:
+  |
+1 | fn sneaky(s: Stmt) ! IO, DB.Write {
+  |                        +++++++++
+```
+
+A fn that declares `DB.Read` still cannot step. The error adds a help line that points to the calls for reads:
+
+```blink
+fn reader(s: Stmt) ! DB.Read {
+    let _ = s.step()    // E0500: `step` needs `DB.Write`; `reader` declares only `DB.Read`
+}
+```
+
+```
+error[UndeclaredEffect]: undeclared effect
+ --> app.bl:2:13
+  |
+2 |     let _ = s.step()
+  |             ^^^^^^^^ `s.step()` performs the DB operation `step`, which requires `DB.Write`
+  |
+  = note: function `reader` declares `DB.Read` but is missing `DB.Write`
+  = help: to read rows, use `db.query` or `db.query_one`, which need only `DB.Read`
+  = fix: add effect to signature:
+  |
+1 | fn reader(s: Stmt) ! DB.Read, DB.Write {
+  |                              +++++++++
+```
+
+The error names the method that the code wrote, and says which operation the method performs. The `help:` line shows when the missing effect is `DB.Write` from `step` and the caller declares `DB.Read`.
+
+The other operations need only `DB.Read`. A fn with `! DB.Read` can bind parameters and read columns. A caller that holds `DB.Write` does the `step` between them:
+
+```blink
+fn bind_user(s: Stmt, id: Int, name: Str) -> Result[Void, DBError] ! DB.Read {
+    s.bind_int(1, id)?
+    s.bind_text(2, name)?
+    Ok(())
+}
+
+fn current_name(s: Stmt) -> Str ! DB.Read {
+    s.column_text(1)
+}
+
+fn insert_user(s: Stmt, id: Int, name: Str) -> Result[Void, DBError] ! DB.Read, DB.Write {
+    bind_user(s, id, name)?
+    s.step()?
+    s.reset()?
+    Ok(())
+}
+```
+
+**A `Stmt` is a token that the handler makes.** A `Stmt` has no field that code can read. The handler of `DB` makes it in `prepare` and keeps the real statement. `Stmt.mock(id)` is a pure function of `std.db`. It has no effect row and takes an `Int` key. "mock" means that a handler made the `Stmt`. It does not mean that the `Stmt` is for tests only. There is no getter that reads the key back. A handler that wraps a real driver can make `Stmt` values too.
+
+An operation on a `Stmt` has three failure cases. An operation that returns a `Result` gives a defined `Err` in each case, and does not panic:
+
+- A handler that did not make the `Stmt` gets it: `Err(ExecError("statement belongs to another connection"))`. The handler may be another connection, a mock, or an outer handler.
+- The handler that made the `Stmt` gets it after its connection closed: `Err(ConnectionError("connection is closed"))`.
+- The `Stmt` was finalized: `Err(ExecError("statement is finalized"))`.
+
+The `column_*` operations return no `Result`. In each of the three cases above, a `column_*` call panics.
+
+The first case is also the result when a program keeps a `Stmt` past its `with` and uses it under the handler of a second connection:
+
+```blink
+fn late(a: Str, b: Str) -> Result[Void, DBError] ! FS, Time, Rand, IO {
+    let mut kept: Option[Stmt] = None
+    with db.connect(a)? {
+        kept = Some(db.prepare("SELECT 1")?)
+    }
+    with db.connect(b)? {
+        match kept {
+            Some(s) => match s.step() {
+                Ok(_) => {}
+                Err(e) => io.println("{e}")    // prints: exec_error: statement belongs to another connection
+            }
+            None => {}
+        }
+    }
+    Ok(())
+}
+```
+
+**Release.** `s.finalize()` frees the statement at once. A second `finalize` does nothing and gives `Ok(())`. `finalize` also clears the record that the handler keeps of the `Stmt`. When the `with` of the connection exits, the handler finalizes every `Stmt` that is still open. That holds when the `with` exits by `?`, by `return`, by `break`, and by panic. The exit does not finalize a `Stmt` again that `finalize` freed.
+
+`Stmt` is `Closeable` (§3.6, §5.5). Its `close` performs the `finalize` operation through the handler. It never calls the driver directly, so `with ... as` works under a mock handler:
+
+```blink
+impl Closeable for Stmt {
+    fn close(self) ! DB.Read {
+        let _ = self.finalize()
+    }
+}
+```
+
+`with db.prepare(sql)? as s { }` finalizes `s` at the end of the block on every exit path. The `with` is charged `DB.Read`, the row of `close` (§5.5). The call of `prepare` needs that row already. The binding `s` follows E0601 and E0602 like any other `Closeable` binding. The `with ... as` close and an explicit `finalize` can both run. The second one does nothing:
+
+```blink
+fn add_all(p: Str, xs: List[Int]) -> Result[Void, DBError] ! FS, Time, Rand {
+    with db.connect(p)? {
+        for x in xs {
+            with db.prepare("INSERT INTO t VALUES ({x})")? as s {
+                s.step()?
+            }    // s is finalized here, before the next pass
+        }
+    }    // the handler finalizes any Stmt still open here
+    Ok(())
+}
+
+fn finalize_twice(p: Str) -> Result[Void, DBError] ! FS, Time, Rand {
+    with db.connect(p)? {
+        with db.prepare("INSERT INTO t VALUES (1)")? as s {
+            s.step()?
+            s.finalize()?
+            s.finalize()?    // does nothing: Ok(())
+        }    // the close does nothing too
+    }
+    Ok(())
+}
+```
+
+**Mock handlers.** A mock `DB` handler makes a `Stmt` in its `prepare` clause with `Stmt.mock`. Its other clauses see every `Stmt` operation:
+
+```blink
+fn scripted_db() -> Handler[DB] {
+    handler DB {
+        fn query(sql: Template[DB]) -> Result[List[Row], DBError] { Ok([]) }
+        fn query_one(sql: Template[DB]) -> Result[Option[Row], DBError] { Ok(None) }
+        fn prepare(sql: Template[DB]) -> Result[Stmt, DBError] { Ok(Stmt.mock(1)) }
+        fn bind_int(s: Stmt, idx: Int, val: Int) -> Result[Void, DBError] { Ok(()) }
+        fn bind_text(s: Stmt, idx: Int, val: Str) -> Result[Void, DBError] { Ok(()) }
+        fn column_int(s: Stmt, idx: Int) -> Int { 7 }
+        fn column_text(s: Stmt, idx: Int) -> Str { "ada" }
+        fn reset(s: Stmt) -> Result[Void, DBError] { Ok(()) }
+        fn finalize(s: Stmt) -> Result[Void, DBError] { Ok(()) }
+        fn exec(sql: Template[DB]) -> Result[Void, DBError] { Ok(()) }
+        fn execute(sql: Template[DB]) -> Result[Int, DBError] { Ok(1) }
+        fn begin() -> Result[Void, DBError] { Ok(()) }
+        fn commit() -> Result[Void, DBError] { Ok(()) }
+        fn rollback() -> Result[Void, DBError] { Ok(()) }
+        fn step(s: Stmt) -> Result[Int, DBError] { Ok(101) }
+    }
+}
+
+test "a mock answers every Stmt op" {
+    with scripted_db() {
+        let s = db.prepare("SELECT name FROM users")?
+        assert_eq(s.step()?, 101)
+        assert_eq(s.column_text(0), "ada")
+    }
+}
+```
+
+The mock has an empty clause row, so the `with` is charged no `FS`, `Time` or `Rand`.
+
+**A handler that omits a `Stmt` operation.** The `Stmt` operations are primitive operations of `DB`. A `DB` handler that leaves one out compiles. This is the forward case of §4.7.1 (*Completeness and auto-delegation*), with no exception. The omitted operation goes to the enclosing handler of `DB`, and the forward performs `DB` outside the handler. So the clause row of the handler has `DB`, and its type is `Handler[DB ! DB]`, not `Handler[DB]`.
+
+The enclosing handler did not make the `Stmt`. It answers with the first Err above. A mock that omits `step`, under a real connection, gives this:
+
+```blink
+fn no_step_db() -> Handler[DB ! DB] {
+    handler DB {
+        fn query(sql: Template[DB]) -> Result[List[Row], DBError] { Ok([]) }
+        fn query_one(sql: Template[DB]) -> Result[Option[Row], DBError] { Ok(None) }
+        fn prepare(sql: Template[DB]) -> Result[Stmt, DBError] { Ok(Stmt.mock(1)) }
+        fn bind_int(s: Stmt, idx: Int, val: Int) -> Result[Void, DBError] { Ok(()) }
+        fn bind_text(s: Stmt, idx: Int, val: Str) -> Result[Void, DBError] { Ok(()) }
+        fn column_int(s: Stmt, idx: Int) -> Int { 7 }
+        fn column_text(s: Stmt, idx: Int) -> Str { "ada" }
+        fn reset(s: Stmt) -> Result[Void, DBError] { Ok(()) }
+        fn finalize(s: Stmt) -> Result[Void, DBError] { Ok(()) }
+        fn exec(sql: Template[DB]) -> Result[Void, DBError] { Ok(()) }
+        fn execute(sql: Template[DB]) -> Result[Int, DBError] { Ok(1) }
+        fn begin() -> Result[Void, DBError] { Ok(()) }
+        fn commit() -> Result[Void, DBError] { Ok(()) }
+        fn rollback() -> Result[Void, DBError] { Ok(()) }
+        // step is omitted: it forwards to the enclosing handler
+    }
+}
+
+fn run() -> Result[Void, DBError] ! FS, Time, Rand, IO {
+    with db.connect("app.db")? {
+        with no_step_db() {
+            let s = db.prepare("SELECT 1")?
+            match s.step() {
+                Ok(_) => io.println("stepped")
+                Err(e) => io.println("{e}")    // prints: exec_error: statement belongs to another connection
+            }
+        }
+    }
+    Ok(())
+}
+```
+
+The text of the Err names the owner check of the enclosing handler. It does not name the omitted operation. For a mock, the cause is the omission. A mock author who sees this Err writes the missing clause. A mock that forwards on purpose writes `default.step(s)`, and the forward is then explicit (§4.7.1). A `Stmt` that the mock made with `Stmt.mock` can never succeed at the forward, because no outer handler made it.
+
+`DB` is not marked `@handle_all`, so an omitted operation of `DB` gives no `PartialHandler` warning (W0545). An effect that is marked gives W0545 that names each omitted operation (§4.7.1). A driver or mock that must stay complete lists all of the operations above.
 
 ---
 

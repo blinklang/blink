@@ -601,15 +601,18 @@ row.get_str("col")              // -> Option[Str] (explicit string)
 row.get_at(idx)                 // -> Option[Str] (positional fallback)
 row.column_names()              // -> List[Str]
 
-// Prepared statements (low-level, for batch operations)
-db.prepare(tpl)                 // -> Result[Stmt, DBError] (Closeable — use with...as)
-stmt.bind_int(idx, val)         // bind integer parameter
-stmt.bind_text(idx, val)        // bind string parameter
-stmt.step()                     // -> Result[StepResult, DBError]
-stmt.column_int(idx)            // -> Int
-stmt.column_text(idx)           // -> Str
-stmt.reset()                    // reset for re-use
-stmt.finalize()                 // free statement
+// Prepared statements (low-level, for batch operations). Each Stmt method performs a DB op the handler runs.
+db.prepare(tpl)                 // -> Result[Stmt, DBError] (DB.Read; Closeable — use with...as)
+stmt.bind_int(idx, val)         // bind integer parameter (DB.Read)
+stmt.bind_text(idx, val)        // bind string parameter (DB.Read)
+stmt.step()                     // -> Result[Int, DBError] (DB.Write; for reads use db.query / db.query_one)
+stmt.column_int(idx)            // -> Int (DB.Read)
+stmt.column_text(idx)           // -> Str (DB.Read)
+stmt.reset()                    // reset for re-use (DB.Read)
+stmt.finalize()                 // free statement (DB.Read); a second finalize does nothing
+// The connection's `with` finalizes every open Stmt when it exits, also on panic.
+// A Stmt used under a handler that did not make it: Err(ExecError("statement belongs to another connection")).
+// A mock DB handler that omits a Stmt op forwards it to the outer handler and gets that Err (§4.4.10).
 
 // Transactions (effect: DB.Write) — via BlockHandler
 with db.transaction() {         // scoped: auto-commit on success, auto-rollback on error

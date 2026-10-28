@@ -469,7 +469,7 @@ The open call can create or open the database file. A later call on the handle c
 
 The rule has an end. The row of a binding that runs SQL covers every behavior that SQL text can reach. A row gets shorter only when the shim provably removes a behavior, for example by replacing `random` and `randomblob`, and the audit record of the binding says so (*Audit Records*).
 
-The pub helpers of `std.db` that call these bindings declare the row. `with db.connect(p)? { }` discharges `DB` and charges the row to the enclosing code. A missing leaf is E0500 at the `with` (§4.7.1). A test under `with mock_db(...)` is charged no `FS`, because a mock handler performs nothing outside the handler. A `Stmt` that a program steps outside the `with` that made it declares the row of `sqlite_step`, and E0500 fires if the enclosing code lacks it. The `Stmt` operations carry no wider `DB` row.
+The pub helpers of `std.db` that call these bindings declare the row. `with db.connect(p)? { }` discharges `DB` and charges the row to the enclosing code. A missing leaf is E0500 at the `with` (§4.7.1). A test under `with mock_db(...)` is charged no `FS`, because a mock handler performs nothing outside the handler. The `Stmt` operations are `DB` operations that the handler runs (§4.4.10), so the clause row covers `sqlite_step` and the other statement bindings, and the `with` charges it.
 
 `blink audit` prints the clause row of each handler and the key that assumes its bindings (*`blink audit` — FFI Inventory*).
 
