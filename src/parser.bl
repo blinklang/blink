@@ -11,7 +11,7 @@ import diagnostics.{
     EMPTY_BRACE_EXPR, UNKNOWN_INTRINSIC, MUT_FIELD_NOT_SUPPORTED,
     INVALID_STRING_BACKED_ENUM, INTERP_PARSE_FAILURE,
     TEST_ANNOTATED_RETURN, ELEMENT_ACCESS_HELP, MIXED_OPERATOR_PRECEDENCE, VARIANT_FIELD_DEFAULT_HELP,
-    INTERP_DOUBLE_BRACE,
+    INTERP_DOUBLE_BRACE, MISSING_INITIALIZER, FOREIGN_CONST_FORM,
 }
 
 effect Parse {
@@ -2495,6 +2495,38 @@ fn attach_pending_annotations(node: Int) ! Parse.Build, Diag.Report {
     }
 }
 
+// `@ffi(...)` with only newlines and comments between it and a `let`. Nothing is consumed.
+fn at_ffi_annotated_let() -> Bool {
+    if !at(TokenKind.At) || peek_kind_at(pos + 1) != TokenKind.Ident { return false }
+    if pos + 1 >= tokens.values.len() || tokens.values.get(pos + 1).unwrap() != "ffi" { return false }
+    let mut p = pos + 2
+    if peek_kind_at(p) == TokenKind.LParen {
+        let mut depth = 0
+        while p < tokens.kinds.len() {
+            let k = peek_kind_at(p)
+            if k == TokenKind.LParen { depth = depth + 1 }
+            if k == TokenKind.RParen {
+                depth = depth - 1
+                if depth == 0 { break }
+            }
+            p = p + 1
+        }
+        p = p + 1
+    }
+    while peek_kind_at(p) == TokenKind.Newline || peek_kind_at(p) == TokenKind.Comment { p = p + 1 }
+    peek_kind_at(p) == TokenKind.Let
+}
+
+// A module-level `let` with no initializer is a foreign constant only under `@ffi`; the C
+// headers then give the value. Without it nothing gives one.
+fn check_let_has_initializer(lb: Int) ! Diag.Report {
+    if node_value(lb) != -1 || has_annotation(lb, "ffi") != 0 { return }
+    let name = node_name(lb)
+    let col = if node_binder_col(lb) > 0 { node_binder_col(lb) } else { node_col(lb) }
+    diag_error_span("MissingInitializer", MISSING_INITIALIZER, "module-level `{name}` has no initializer", node_line(lb), col, node_line(lb), col + name.byte_len(),
+        "write `= <value>`, or add `@ffi(\"NAME\", header: \"...\")` for a constant from a C header")
+}
+
 // Clearing the list keeps a rejected annotation off the next item that attaches pending ones.
 fn reject_pending_annotations(what: Str, help: Str) ! Parse.Build, Diag.Report {
     for ann in annotations.item {
@@ -2988,9 +3020,10 @@ pub fn parse_program() -> Int ! Parse, Diag.Report {
             impl_nodes.push(im)
         } else if at(TokenKind.Let) {
             let plain = annotations.item.len() == 0
-            let lb = parse_let_binding()
+            let lb = parse_let_binding(true)
             if plain { mark_binding_item(item_at, "let", lb) }
             attach_pending_annotations(lb)
+            check_let_has_initializer(lb)
             let_nodes.push(lb)
         } else if at(TokenKind.Const) {
             let plain = annotations.item.len() == 0
@@ -3023,10 +3056,11 @@ pub fn parse_program() -> Int ! Parse, Diag.Report {
                 trait_nodes.push(tr)
             } else if at(TokenKind.Let) {
                 let plain = annotations.item.len() == 0
-                let lb = parse_let_binding()
+                let lb = parse_let_binding(true)
                 if plain { mark_binding_item(item_at, "let", lb) }
                 node_set_is_pub(lb, 1)
                 attach_pending_annotations(lb)
+                check_let_has_initializer(lb)
                 let_nodes.push(lb)
             } else if at(TokenKind.Const) {
                 let plain = annotations.item.len() == 0
@@ -4581,7 +4615,18 @@ fn parse_stmt() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
         return nd
     }
     if at(TokenKind.Let) {
-        let nd = parse_let_binding()
+        let nd = parse_let_binding(false)
+        return nd
+    }
+    if at_ffi_annotated_let() {
+        let ann_line = peek_line()
+        let ann_col = peek_col()
+        let _ = parse_annotation()
+        skip_newlines_and_comments()
+        diag_error_span("ForeignConstForm", FOREIGN_CONST_FORM, "`@ffi` on a `let` inside a function: a foreign constant is a module-level `let`", ann_line, ann_col, ann_line, ann_col + 4,
+            "move the declaration to module level")
+        // Parsed in the module-level form so a bodyless `let` adds no second error.
+        let nd = parse_let_binding(true)
         return nd
     }
     if at(TokenKind.Const) {
@@ -4758,7 +4803,7 @@ fn parse_stmt() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
     nd
 }
 
-fn parse_let_binding() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
+fn parse_let_binding(module_level: Bool) -> Int ! Parse.Advance, Parse.Build, Diag.Report {
     let let_start_line = peek_line()
     let let_start_col = peek_col()
     expect(TokenKind.Let)
@@ -4794,10 +4839,17 @@ fn parse_let_binding() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
         advance()
         type_ann = parse_type_annotation()
     }
-    expect(TokenKind.Equals)
-    skip_newlines_and_comments()
-    let val = parse_expr()
-    maybe_newline()
+    // A module-level `let` may end at its type: that is a foreign constant, or E1140 when it
+    // has no `@ffi`. The caller tells the two apart, since it holds the annotations.
+    let mut val = -1
+    if module_level && pat == -1 && (at(TokenKind.Newline) || at(TokenKind.Comment) || at(TokenKind.EOF)) {
+        maybe_newline()
+    } else {
+        expect(TokenKind.Equals)
+        skip_newlines_and_comments()
+        val = parse_expr()
+        maybe_newline()
+    }
     let mut let_elems = -1
     if pat != -1 {
         let_elems = pat

@@ -1,0 +1,145 @@
+// A foreign constant is a module-level `let` with no initializer under `@ffi(..., header:)`
+// (§9.1): the C headers of the build target give its value, so the front end sees only its
+// type. Each break of that form has one code at the declaration with a help that gives the
+// fix: ForeignConstForm (E0853) for the type, `mut` and an initializer, ForeignConstNoHeader
+// (E0854) for a missing `header:`. A bodyless module `let` with no `@ffi` has nothing to
+// give it a value: MissingInitializer (E1140).
+
+import std.fs
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_reset}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+
+fn form_probe(path: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    init_embedded_stdlib()
+    write_file(path, src)
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+}
+
+// The errors reported in the probe file itself, one per line: code, name, line:col,
+// message and help.
+fn errors_in(path: Str) -> Str {
+    let mut out = ""
+    for d in diag_entries {
+        if d.severity == "error" && d.file == path {
+            out = out.concat("{d.code} {d.name} {d.line}:{d.col}: {d.message} | help: {d.help}\n")
+        }
+    }
+    out
+}
+
+test "a foreign constant checks clean and reads as an Int in a fn body and a guard" {
+    let path = "/tmp/zz_fc_form_ok.bl"
+    let src = "@ffi(\"SIGBUS\", header: \"signal.h\")\npub let SIGBUS: Int\n\nfn is_bus(n: Int) -> Bool \{\n    match n \{\n        x if x == SIGBUS => true\n        _ => n + SIGBUS == 0\n    }\n}\n\nfn main() \{ let _ = is_bus(1) }\n"
+    form_probe(path, src)
+    let got = errors_in(path)
+    assert(got == "", "a bodyless @ffi let is the foreign-constant form, got: {got}")
+}
+
+test "a foreign constant may take a sized integer type or an alias of Int" {
+    let path = "/tmp/zz_fc_form_sized.bl"
+    let src = "type Signo = Int\n@ffi(\"SIGBUS\", header: \"signal.h\")\npub let A: I32\n@ffi(\"SIGBUS\", header: \"signal.h\")\npub let B: U8\n@ffi(\"SIGBUS\", header: \"signal.h\")\npub let C: I64\n@ffi(\"SIGBUS\", header: \"signal.h\")\npub let D: Signo\n\nfn main() \{ let _ = D }\n"
+    form_probe(path, src)
+    let got = errors_in(path)
+    assert(got == "", "Int, a sized integer type and an alias of Int are allowed, got: {got}")
+}
+
+test "a module let with no initializer and no @ffi is MissingInitializer" {
+    let path = "/tmp/zz_fc_missing_init.bl"
+    form_probe(path, "let LIMIT: Int\n\nfn main() \{ let _ = LIMIT }\n")
+    let got = errors_in(path)
+    let want = "E1140 MissingInitializer 1:5: module-level `LIMIT` has no initializer | help: write `= <value>`, or add `@ffi(\"NAME\", header: \"...\")` for a constant from a C header\n"
+    assert(got == want, "want: {want}got: {got}")
+}
+
+test "a pub module let with no initializer is one error and no parse cascade" {
+    let path = "/tmp/zz_fc_missing_init_pub.bl"
+    form_probe(path, "pub let LIMIT: Int\nfn helper() -> Int \{ 1 }\n\nfn main() \{ let _ = helper() }\n")
+    let got = errors_in(path)
+    assert(got.starts_with("E1140 MissingInitializer 1:9: "), "got: {got}")
+    assert(got.split("\n").len() == 2, "exactly one error, got: {got}")
+}
+
+test "a let with no initializer inside a fn is not MissingInitializer" {
+    let path = "/tmp/zz_fc_local_no_init.bl"
+    form_probe(path, "fn main() \{\n    let x: Int\n    let _ = x\n}\n")
+    let got = errors_in(path)
+    assert(got != "", "a bodyless local let is still an error, got nothing")
+    assert(!got.contains("E1140"), "MissingInitializer is for a module-level let only, got: {got}")
+}
+
+test "a foreign constant of a type that is not an integer is ForeignConstForm" {
+    let path = "/tmp/zz_fc_form_str.bl"
+    form_probe(path, "@ffi(\"SIGBUS\", header: \"signal.h\")\npub let SIGBUS: Str\n\nfn main() \{ }\n")
+    let got = errors_in(path)
+    let want = "E0853 ForeignConstForm 2:9: a foreign constant has type `Int` or a sized integer type | help: write `pub let SIGBUS: Int`\n"
+    assert(got == want, "want: {want}got: {got}")
+}
+
+test "a Float or Bool foreign constant is ForeignConstForm" {
+    let path = "/tmp/zz_fc_form_float.bl"
+    form_probe(path, "@ffi(\"HUGE_VAL\", header: \"math.h\")\npub let HUGE: Float\n@ffi(\"X\", header: \"x.h\")\npub let FLAG: Bool\n\nfn main() \{ }\n")
+    let got = errors_in(path)
+    assert(got.contains("E0853 ForeignConstForm 2:9: "), "Float is not an integer type, got: {got}")
+    assert(got.contains("E0853 ForeignConstForm 4:9: "), "Bool is not an integer type, got: {got}")
+}
+
+test "a mut foreign constant is ForeignConstForm" {
+    let path = "/tmp/zz_fc_form_mut.bl"
+    form_probe(path, "@ffi(\"SIGBUS\", header: \"signal.h\")\npub let mut last_sig: Int\n\nfn main() \{ }\n")
+    let got = errors_in(path)
+    assert(got.starts_with("E0853 ForeignConstForm 2:"), "got: {got}")
+    assert(got.contains(": a foreign constant is not `mut` | help: remove `mut`\n"), "got: {got}")
+    assert(got.split("\n").len() == 2, "exactly one error, got: {got}")
+}
+
+test "a foreign constant with an initializer is ForeignConstForm" {
+    let path = "/tmp/zz_fc_form_init.bl"
+    form_probe(path, "@ffi(\"SIGBUS\", header: \"signal.h\")\npub let SIGBUS: Int = 7\n\nfn main() \{ }\n")
+    let got = errors_in(path)
+    let want = "E0853 ForeignConstForm 2:23: a foreign constant has no initializer: the target's C headers set its value | help: remove the initializer: `pub let SIGBUS: Int`\n"
+    assert(got == want, "want: {want}got: {got}")
+}
+
+test "a foreign constant with no type annotation is ForeignConstForm" {
+    let path = "/tmp/zz_fc_form_no_type.bl"
+    form_probe(path, "@ffi(\"SIGBUS\", header: \"signal.h\")\npub let SIGBUS = 7\n\nfn main() \{ }\n")
+    let got = errors_in(path)
+    assert(got.contains("E0853 ForeignConstForm 2:9: a foreign constant needs a type annotation | help: write the type: `pub let SIGBUS: Int`\n"), "got: {got}")
+    assert(!got.contains("E1140"), "an @ffi let is never MissingInitializer, got: {got}")
+}
+
+test "a foreign constant with no header is ForeignConstNoHeader" {
+    let path = "/tmp/zz_fc_no_header.bl"
+    form_probe(path, "@ffi(\"SIGBUS\")\npub let SIGBUS: Int\n\nfn main() \{ }\n")
+    let got = errors_in(path)
+    let want = "E0854 ForeignConstNoHeader 1:1: `SIGBUS` is a C macro, and a macro has no linkage | help: add `header: \"...\"` with the C header that defines `SIGBUS`\n"
+    assert(got == want, "want: {want}got: {got}")
+}
+
+test "ForeignConstNoHeader names the C name of the two-argument form" {
+    let path = "/tmp/zz_fc_no_header_two_arg.bl"
+    form_probe(path, "@ffi(\"curl\", \"CURLE_OPERATION_TIMEDOUT\")\npub let TIMEDOUT: Int\n\nfn main() \{ }\n")
+    let got = errors_in(path)
+    assert(got.contains("E0854 ForeignConstNoHeader 1:1: `CURLE_OPERATION_TIMEDOUT` is a C macro"), "got: {got}")
+}
+
+test "@ffi on a let inside a fn is ForeignConstForm at the annotation" {
+    let path = "/tmp/zz_fc_local_ffi_let.bl"
+    form_probe(path, "fn main() \{\n    @ffi(\"SIGBUS\", header: \"signal.h\")\n    let x: Int\n    let _ = x\n}\n")
+    let got = errors_in(path)
+    let want = "E0853 ForeignConstForm 2:5: `@ffi` on a `let` inside a function: a foreign constant is a module-level `let` | help: move the declaration to module level\n"
+    assert(got == want, "want: {want}got: {got}")
+}
+
+test "@ffi on a let with an initializer inside a fn is one ForeignConstForm" {
+    let path = "/tmp/zz_fc_local_ffi_let_init.bl"
+    form_probe(path, "fn main() \{\n    @ffi(\"SIGBUS\", header: \"signal.h\") let x: Int = 7\n    let _ = x\n}\n")
+    let got = errors_in(path)
+    assert(got.starts_with("E0853 ForeignConstForm 2:5: `@ffi` on a `let` inside a function"), "got: {got}")
+    assert(got.split("\n").len() == 2, "exactly one error, got: {got}")
+}

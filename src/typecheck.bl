@@ -5,10 +5,10 @@ import unparse.{type_ann_text, unparse_expr, unparse_binop_with_lhs}
 import formatter.{effect_op_sig_text}
 import parser.{
     effect_derived_ops, node_load_rank, parser_load_order_moved, parser_live_ranges,
-    ann_str_val, impl_provided_by_closeable, closeable_impl_of, sublist_remove_members, get_annotation, get_str_named_arg, has_annotation, is_literal_string_part,
+    ann_str_val, positional_str_arg, positional_str_arg_count, impl_provided_by_closeable, closeable_impl_of, sublist_remove_members, get_annotation, get_str_named_arg, has_annotation, is_literal_string_part,
     node_args, node_assoc_types, node_arms, node_body, node_captures, node_col, node_condition,
     node_effects, node_elements, node_else_body, node_end, node_fields, node_for_binder, node_guard,
-    node_count, node_handlers, node_index, node_int_val, node_is_compiler_known_type_ann, node_is_mut, node_is_const, node_is_pub, node_iterable, node_kind,
+    node_count, node_binder_col, node_handlers, node_index, node_int_val, node_is_compiler_known_type_ann, node_is_mut, node_is_const, node_is_pub, node_iterable, node_kind,
     int_op_group, node_left, node_line, node_method, node_methods, node_module, node_name, node_obj,
     node_op, node_params, node_pattern, node_return_type, node_right, node_scrutinee,
     node_start, node_stmts, node_str_val, node_target, node_then_body, node_trait_name,
@@ -26,7 +26,7 @@ import diagnostics.{
     diag_push_allows, diag_enter_allows, diag_exit_allows, NON_CONST_EXPR,
     diag_warn_at, diag_warn_at_notes, diag_warn_span_at_notes, PARTIAL_HANDLER, diag_truncate, diag_entry_count, diag_any_errors_since, diag_ice_at, diag_count, diag_emit_in_file, diag_file_for_node,
     diag_is_audit_gated, diag_audit_gated_help, AUDIT_GATED_SUPPRESSION, diag_normalize_path, diag_source_line, diag_errors_in_lines,
-    POSITIONAL_PARAM_DEFAULT, NON_CONST_PARAM_DEFAULT,
+    POSITIONAL_PARAM_DEFAULT, NON_CONST_PARAM_DEFAULT, FOREIGN_CONST_FORM, FOREIGN_CONST_NO_HEADER,
     ICE_SEG_UNSOLVED_TYPEVAR, ICE_SEG_UNHANDLED_KIND, ICE_SEG_TID_OUT_OF_RANGE,
     ICE_SEG_ERASED_SLOT, diag_is_ice_seg,
     NON_EXHAUSTIVE_MATCH, INCONSISTENT_PATTERN_BINDINGS, DUPLICATE_MODULE_BINDING,
@@ -29310,6 +29310,47 @@ fn tc_check_const_decl(node: Int) ! Diag.Report {
         "const values are literals, arithmetic and boolean operators over them, other consts by name, struct literals with const fields, and enum variants; calls of any kind and `let` bindings are not")
 }
 
+// A foreign constant has one form (§9.1): the front end sees its type and never its value,
+// so the type must say what the C headers give, and there is nothing to assign or initialize.
+// The headers are not read here; `blink build` checks the name for each target (E0855).
+fn tc_check_foreign_const_decl(l: Int) ! Diag.Report {
+    let ann = get_annotation(l, "ffi")
+    if ann == -1 { return }
+    let name = node_name(l)
+    let line = node_line(l)
+    let col = if node_binder_col(l) > 0 { node_binder_col(l) } else { node_col(l) }
+    let end_col = col + name.byte_len()
+    if node_elements(l) != -1 {
+        diag_error_at("ForeignConstForm", FOREIGN_CONST_FORM, "a foreign constant binds one name, not a pattern", l,
+            "write one declaration per name: `pub let SIGBUS: Int`")
+        return
+    }
+    if node_is_mut(l) != 0 {
+        diag_error_span_at_notes("ForeignConstForm", FOREIGN_CONST_FORM, "a foreign constant is not `mut`", l, line, col, end_col, "remove `mut`", [])
+    }
+    if node_value(l) != -1 {
+        diag_error_at("ForeignConstForm", FOREIGN_CONST_FORM, "a foreign constant has no initializer: the target's C headers set its value", node_value(l),
+            "remove the initializer: `pub let {name}: Int`")
+    }
+    if node_target(l) == -1 && node_type_name(l) == "" {
+        diag_error_span_at_notes("ForeignConstForm", FOREIGN_CONST_FORM, "a foreign constant needs a type annotation", l, line, col, end_col,
+            "write the type: `pub let {name}: Int`", [])
+    } else {
+        let tid = tc_lookup_node_tid(l)
+        if tc_tid_is_no_info(tid) == 0 && is_integer_type(resolve_alias_tid(tid)) == 0 {
+            diag_error_span_at_notes("ForeignConstForm", FOREIGN_CONST_FORM, "a foreign constant has type `Int` or a sized integer type", l, line, col, end_col,
+                "write `pub let {name}: Int`", [])
+        }
+    }
+    if get_str_named_arg(ann, "header") == "" {
+        let args = node_args(ann)
+        let count = positional_str_arg_count(args)
+        let c_name = if count >= 2 { positional_str_arg(args, 1) } else if count == 1 { positional_str_arg(args, 0) } else { name }
+        diag_error_at("ForeignConstNoHeader", FOREIGN_CONST_NO_HEADER, "`{c_name}` is a C macro, and a macro has no linkage", ann,
+            "add `header: \"...\"` with the C header that defines `{c_name}`")
+    }
+}
+
 // §2.13 allows a default value only on a parameter declared after `--`, and §2.21 requires
 // the value to be const. Both rules are stated as normative and neither could be broken
 // before, because the syntax did not parse.
@@ -33289,6 +33330,7 @@ fn tc_infer_global_initializers(lets_sl: Int) ! TypeCheck.Resolve, TypeCheck.Rep
         // names yet, so a name this check asks about could not be told apart from an
         // undefined one.
         tc_check_const_decl(l)
+        tc_check_foreign_const_decl(l)
         let l_val = node_value(l)
         if l_val != -1 {
             if node_target(l) != -1 || node_type_name(l) != "" {

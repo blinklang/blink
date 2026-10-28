@@ -119,6 +119,9 @@ pub const BYTES_PTR_CAST_FORBIDDEN = "E0817"
 pub const FFI_SCOPE_NOT_WITH_RESOURCE = "E0819"
 pub const MISSING_NATIVE_DEP       = "E0820"
 pub const NATIVE_DEP_UNAVAILABLE_CROSS = "E0821"
+pub const FOREIGN_CONST_FORM       = "E0853"
+pub const FOREIGN_CONST_NO_HEADER  = "E0854"
+pub const FOREIGN_CONST_INVALID    = "E0855"
 pub const BUF_OUTSIDE_FFI_SURFACE   = "E0822"
 pub const VOID_POINTEE_ACCESS      = "E0825"
 pub const FFI_OFFSET_UNKNOWN_STRIDE = "E0838"
@@ -245,6 +248,7 @@ pub const UNTERMINATED_LITERAL    = "E1126"
 pub const MIXED_OPERATOR_PRECEDENCE = "E1127"
 pub const INTERP_DOUBLE_BRACE       = "E1130"
 pub const EFFECTS_ANNOTATION_REMOVED = "E1139"
+pub const MISSING_INITIALIZER       = "E1140"
 
 // E1200+ — module resolution / enum value validation
 pub const MODULE_NOT_FOUND           = "E1200"
@@ -1821,6 +1825,15 @@ pub fn diag_explain(code: Str) -> Str {
     if code == FFI_SCOPE_NOT_WITH_RESOURCE {
         return "E0819 -- FfiScopeNotWithResource\n\nA value of type `FfiScope` may occur only as the resource of a\n`with ... as` block, and nowhere else. It may not be bound by a\n`let`, passed as an argument, returned, stored in a field, or\nwritten as a type argument.\n\nA scope owns a libc malloc/free arena whose extent must be lexical.\nOutside a `with` there is no block to exit, so nothing frees the\narena and every allocation through it leaks for the life of the\nprocess. The rule is stated over the TYPE, not over the\n`ffi.scope()` call, because the hazard belongs to the value:\nhowever the value reached an excluded position, the arena there\noutlives the block that would free it.\n\n  fn leaks() ! IO \{\n      let arena = ffi.scope()          // E0819 -- let-bound\n  \}\n\n  fn takes(s: FfiScope) \{ }            // E0819 -- parameter\n  type Holder \{ s: FfiScope }          // E0819 -- field\n\nFix: bind the scope as a `with` resource.\n\n  with ffi.scope() as arena \{\n      let p: Ptr[Pollfd] = arena.alloc()\n      // p is freed here, at block exit\n  \}\n\nFor one plain allocation with GC cleanup, use `alloc_ptr[T]()`\ninstead of a scope. For a pointer that must outlive the block, take\nit out of the scope first: `arena.take(p)` removes p from the\nscope's cleanup list and transfers its lifetime to the caller."
     }
+    if code == FOREIGN_CONST_FORM {
+        return "E0853 -- ForeignConstForm\n\nAn `@ffi` on a module-level `let` makes a foreign constant: the C\nheaders of the build target give its value. The declaration has one\nform: a type annotation of `Int` or a sized integer type, no `mut`,\nand no initializer.\n\n  @ffi(\"SIGBUS\", header: \"signal.h\")\n  pub let SIGBUS: Str            // E0853 -- not an integer type\n\n  @ffi(\"SIGBUS\", header: \"signal.h\")\n  pub let mut SIGBUS: Int        // E0853 -- a foreign constant is not `mut`\n\n  @ffi(\"SIGBUS\", header: \"signal.h\")\n  pub let SIGBUS: Int = 7        // E0853 -- the headers give the value\n\nFix: write the declaration in its one form.\n\n  @ffi(\"SIGBUS\", header: \"signal.h\")\n  pub let SIGBUS: Int"
+    }
+    if code == FOREIGN_CONST_NO_HEADER {
+        return "E0854 -- ForeignConstNoHeader\n\nA foreign constant has no `header:` argument. A C macro has no\nlinkage and no prototype, so only the header tells the C compiler\nwhere the name comes from.\n\n  @ffi(\"SIGBUS\")\n  pub let SIGBUS: Int            // E0854\n\nFix: name the header that defines it.\n\n  @ffi(\"SIGBUS\", header: \"signal.h\")\n  pub let SIGBUS: Int"
+    }
+    if code == FOREIGN_CONST_INVALID {
+        return "E0855 -- ForeignConstInvalid\n\nFound by `blink build`, never by `blink check`. For the build target,\nthe C name of a foreign constant is not an integer constant\nexpression, the headers do not define it, or its value does not fit\nthe declared type. The message names the target triple.\n\n  @ffi(\"SIGBUZ\", header: \"signal.h\")\n  pub let SIGBUZ: Int\n  // blink build: `SIGBUZ` is not an integer constant on x86_64-linux-gnu\n\nFix: check the spelling, and that the header defines the name on\nthis target."
+    }
     if code == MISSING_NATIVE_DEP {
         return "E0820 -- MissingNativeDep\n\nAn @ffi annotation references a C library that is not declared in\nthe [native-dependencies] section of blink.toml.\n\nFix: add the library to blink.toml:\n\n  [native-dependencies]\n  libname = \{ system = true \}"
     }
@@ -1835,6 +1848,9 @@ pub fn diag_explain(code: Str) -> Str {
     }
     if code == EMPTY_ROW_OUTSIDE_FFI {
         return "E0564 -- EmptyRowOutsideFfi\n\n`! ()` is the empty effect row written out. It means no effects, the\nsame as no row. It is legal only on an `@ffi` decl, where a row is a\nclaim the author must write. On any other function, fn type or trait\nmethod signature the compiler proves purity, so no row already means\nno effects.\n\n  fn add(a: Int, b: Int) -> Int ! () \{   // E0564\n      a + b\n  \}\n\nFix: remove `! ()`.\n\n  fn add(a: Int, b: Int) -> Int \{\n      a + b\n  \}"
+    }
+    if code == MISSING_INITIALIZER {
+        return "E1140 -- MissingInitializer\n\nA module-level `let` has no initializer and no `@ffi`, so nothing\ngives it a value.\n\n  pub let LIMIT: Int             // E1140\n\nFix: write the value, or, for a C constant whose value depends on\nthe target, add `@ffi` to make a foreign constant.\n\n  pub let LIMIT: Int = 64\n\n  @ffi(\"SIGBUS\", header: \"signal.h\")\n  pub let SIGBUS: Int\n\nA `let` inside a function body is not this code."
     }
     if code == EFFECTS_ANNOTATION_REMOVED {
         return "E1139 -- EffectsAnnotationRemoved\n\nThere is no `@effects` annotation. The effect row goes after `!` in\nthe signature, on foreign and Blink functions alike. On an `@ffi`\ndecl with `@effects` and no row this is the one error, not E0802 as\nwell.\n\n  @ffi(\"c\", \"getpid\")\n  @effects(IO)                       // E1139\n  @trusted(audit: \"LIBC-GETPID\")\n  fn c_getpid() -> Int\n\nFix: remove `@effects(...)` and write the row after the return type.\nOn an `@ffi` decl whose foreign code has no effects, write `! ()`.\nNo tool moves the row for you: the row on a foreign function is a\nclaim that only the author can make.\n\n  @ffi(\"c\", \"getpid\")\n  @trusted(audit: \"LIBC-GETPID\")\n  fn c_getpid() -> Int ! IO"
