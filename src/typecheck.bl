@@ -15533,6 +15533,26 @@ pub fn tc_call_user_effect(call_node: Int) -> Int {
 // The builtin Handler tid a `default.op(args)` call performs through, or -1. Name resolution
 // typed the receiver as the handler the enclosing operation belongs to; a user root answers
 // through tc_call_user_effect instead, and a local named `default` is a value.
+// Whether this `ns.f(..)` call reads a module the calling file imports as `ns`. The process
+// handle (section 4.4.8) is no import, so a file that binds `process` to a module of its own
+// calls that module, as any qualified call does; every other file reaches the handle.
+fn tc_ns_call_reads_module(ns: Str) -> Int {
+    if ns != "process" { return 0 }
+    let here = nr_qualifier_module_here(ns)
+    if here == "" || here == builtin_op_module("Process").replace(".", "_") { return 0 }
+    1
+}
+
+// The same answer for codegen, which has no per-file import list to ask. Name resolution
+// records a declaration for a `process.f(..)` call only where the file binds the qualifier,
+// so a declaration outside std.process is the file's own module.
+pub fn tc_namespace_call_reads_module(call: Int) -> Bool {
+    let obj = node_obj(call)
+    if obj < 0 || node_kind(obj) != NodeKind.Ident || node_name(obj) != "process" { return false }
+    let decl = tc_call_decl_node(call)
+    decl >= 0 && node_module(decl) != builtin_op_module("Process").replace(".", "_")
+}
+
 pub fn tc_call_builtin_default(call: Int) -> Int {
     if call < 0 || node_kind(call) != NodeKind.MethodCall { return -1 }
     let obj = node_obj(call)
@@ -27056,7 +27076,7 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
             // intrinsic needs no import (that is what makes it an intrinsic), and
             // is_intrinsic_method already restricts the namespace. nr_is_defined keeps a
             // local that shadows the namespace spelling on its own receiver-typed arm.
-            if nr_is_defined(obj_name) == 0 && is_intrinsic_method(obj_name, method) != 0 {
+            if nr_is_defined(obj_name) == 0 && is_intrinsic_method(obj_name, method) != 0 && tc_ns_call_reads_module(obj_name) == 0 {
                 let nsi = lookup_fnsig("{obj_name}.{method}")
                 if nsi != -1 {
                     let nsi_fs = fnsig_pool.get(nsi).unwrap()
@@ -27101,7 +27121,7 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                     return TYPE_VOID
                 }
             }
-            if is_import_module_name(obj_name) != 0 && nr_is_defined(obj_name) == 0 && is_intrinsic_method(obj_name, method) == 0 {
+            if is_import_module_name(obj_name) != 0 && nr_is_defined(obj_name) == 0 && (is_intrinsic_method(obj_name, method) == 0 || tc_ns_call_reads_module(obj_name) != 0) {
                 if tc_call_is_skip_intrinsic(node) { return tc_check_skip_call(node) }
                 let sig = tc_qualified_call_fnsig(node, method)
                 if sig != -1 { return tc_check_free_call("{obj_name}.{method}", sig, node) }
