@@ -72,8 +72,8 @@ start itself or a loop of children. This repro shows how fast it grows:
 
 ```
 test "a test that runs its own binary as a child" {
-    let r = process_run(env.args().get(0).unwrap(), [])
-    assert_eq(r.exit_code, 0)
+    let r = process.run(env.args().get(0).unwrap(), [])?
+    assert(r.success())
 }
 ```
 
