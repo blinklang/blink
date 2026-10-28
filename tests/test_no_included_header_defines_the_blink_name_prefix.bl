@@ -1,0 +1,45 @@
+// The emitter spells every name a program declares as `b_<name>`, so no C macro can rename a
+// local, a param or a field. That holds only while no header a unit includes defines a
+// `b_` macro: the runtime headers, the system headers they pull in, the headers the stdlib
+// names in an @ffi, and the vendored sqlite3 header. A user's own header is the one place
+// such a macro can still come from.
+
+fn sh(cmd: Str) -> Str {
+    process.run("sh", ["-c", cmd]).unwrap().out.trim()
+}
+
+// The `#define b_...` lines cc sees after it reads `includes`, with the unit's include dirs.
+fn b_macros(includes: Str, extra_flags: Str) -> List[Str] {
+    let dir = sh("mktemp -d /tmp/blink_bprefix.XXXXXX")
+    write_file("{dir}/probe.c", includes)
+    let out = sh("cc -dM -E {extra_flags} -Ilib/native/sqlite3 -Ibootstrap {dir}/probe.c 2>&1 | grep -E '^#define b_|error:' || true")
+    let _ = sh("rm -rf {dir}")
+    if out == "" { [] } else { out.split("\n") }
+}
+
+// Every header the stdlib names in an @ffi, as `#include <h>` lines.
+fn stdlib_ffi_includes() -> Str {
+    let names = sh("grep -rhoE 'header: \"[^\"]+\"' lib/ | sed -E 's/header: \"(.*)\"/\\1/' | sort -u")
+    let mut lines: List[Str] = []
+    for h in names.split("\n") {
+        if h != "" {
+            lines.push("#include <{h}>")
+        }
+    }
+    lines.join("\n")
+}
+
+test "the stdlib names at least one header in an @ffi" {
+    assert(stdlib_ffi_includes().contains("#include <"))
+}
+
+test "no header a unit includes defines a b_ macro" {
+    let src = "#include \"runtime.h\"\n{stdlib_ffi_includes()}\n"
+    assert_eq(b_macros(src, ""), [])
+    assert_eq(b_macros(src, "-DBLINK_RUNTIME_DECLS_ONLY"), [])
+}
+
+test "the check sees a b_ macro when a header defines one" {
+    let found = b_macros("#include \"runtime.h\"\n#define b_count 1\n", "")
+    assert_eq(found, ["#define b_count 1"])
+}

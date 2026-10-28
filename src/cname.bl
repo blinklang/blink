@@ -53,9 +53,10 @@ pub let RUNTIME_HEADER_TYPES: List[RuntimeHeaderType] = [
 let mut transparent_decls: Map[Int, Int] = Map()
 let mut c_mint_seq: Int = 0
 
-// The namespaces this module owns in the emitted C. A user name is moved out of all of them
-// by `c_escape_reserved`, which is what lets an escaped name and a minted name be unique.
-let C_ESCAPE_PREFIX: Str = "_blink_"
+// The namespaces this module owns in the emitted C. Every Blink name this compiler declares
+// in C carries C_BLINK_NAME_PREFIX, and every name it mints starts with an underscore, so the
+// two can never meet.
+let C_BLINK_NAME_PREFIX: Str = "b_"
 let C_MINTED_PREFIX: Str = "_cg_"
 let C_ENSURES_RESULT_STEM: Str = "__ens_rv_"
 let C_OLD_SNAPSHOT_STEM: Str = "__old_"
@@ -404,10 +405,6 @@ pub fn c_variant_discriminant(enum_tid: Int, variant: Int) -> Str {
     if tc_enum_has_payload(enum_tid) { return "{stem}_TAG" }
     stem
 }
-
-// The union member a payload variant fills: `.data.Circle`. The typedef names the member
-// after the variant, so the same namer must spell both the declaration and every literal.
-pub fn c_variant_member_name(variant: Int) -> Str { node_name(variant) }
 
 // The two fixed members of a tagged-enum typedef. The variant name picks one arm of the
 // union; these name the union itself and the discriminant beside it. Every reader of a
@@ -939,9 +936,9 @@ pub fn c_ev_field_name(handler_tid: Int) -> Str {
 pub fn c_effect_default_op_name(handler_tid: Int, op: Str) -> Str {
     let root = effect_root_of(handler_tid)
     if diag_is_ice_seg(root) { return root }
-    if is_compiled_builtin_root(root) { return "blink_{root.to_lower()}_ops_default_{c_field_name(op)}" }
+    if is_compiled_builtin_root(root) { return "blink_{root.to_lower()}_ops_default_{op}" }
     if is_builtin_effect_root(root) { return ICE_SEG_UNHANDLED_KIND }
-    "blink_ue_{root.to_lower()}_default_{c_field_name(op)}"
+    "blink_ue_{root.to_lower()}_default_{op}"
 }
 
 // The slot body of a derived operation of a builtin root whose vtable the runtime declares:
@@ -951,7 +948,7 @@ pub fn c_builtin_derived_op_name(handler_tid: Int, op: Str) -> Str {
     let root = effect_root_of(handler_tid)
     if diag_is_ice_seg(root) { return root }
     if !is_builtin_effect_root(root) || is_compiled_builtin_root(root) { return ICE_SEG_UNHANDLED_KIND }
-    "blink_{root.to_lower()}_derived_{c_field_name(op)}"
+    "blink_{root.to_lower()}_derived_{op}"
 }
 
 // The vtable member one operation of a handler writes, and the member a perform of a user
@@ -959,11 +956,10 @@ pub fn c_builtin_derived_op_name(handler_tid: Int, op: Str) -> Str {
 //
 // Who owns the spelling decides the answer. A builtin root's vtable is a hand-written
 // struct in the runtime header, so the runtime owns every member of it and the operation
-// names its member verbatim: escaping `log` to `_blink_log` names a member
-// `blink_io_vtable` does not declare, and C rejects the assignment. A user effect's vtable
-// is emitted by this compiler, so its members are C names this compiler owns and they take
-// the escaping every other field name takes, as do the members of a builtin vtable this
-// compiler emits.
+// names its member verbatim: `b_log` names a member `blink_io_vtable` does not declare,
+// and C rejects the assignment. A user effect's vtable is emitted by this compiler, so its
+// members are C names this compiler owns and they take the prefix every other member this
+// compiler declares takes, as do the members of a builtin vtable this compiler emits.
 //
 // This is a spelling and not a lookup: it does not ask whether the operation is an
 // operation of the effect. A builtin root that the handler writes an unknown operation for
@@ -972,7 +968,7 @@ pub fn c_effect_vtable_slot_name(handler_tid: Int, op: Str) -> Str {
     let root = effect_root_of(handler_tid)
     if diag_is_ice_seg(root) { return root }
     if is_builtin_effect_root(root) && !is_compiled_builtin_root(root) { return op }
-    c_field_name(op)
+    c_blink_name(op)
 }
 
 // The vtable member beside a slot that holds the operation's closure, the word its body
@@ -1020,15 +1016,22 @@ pub fn c_kops_table_name(key_tid: Int) -> Str {
 
 // ── Names carried over from Blink ────────────────────────────────────────────────
 
-// A Blink local keeps its own spelling in C unless the escape has to move it.
-pub fn c_local_name(name: Str) -> Str { c_escape_reserved(name) }
+// A Blink name that this compiler declares in C: a local, a parameter, a binder, a member
+// of a struct, union or vtable it emits. Each one takes the prefix, so no C macro can
+// reach it. A bare name would sit where the preprocessor reads every token, and any
+// header in the unit may define it: libc's EINVAL, POLLIN, errno and stdin, gcc's linux,
+// a macro in a user's @ffi header. No list of such names can be complete; a prefix that
+// no header defines is. tests/test_no_included_header_defines_the_blink_name_prefix.bl
+// checks that claim against the headers every unit includes.
+fn c_blink_name(name: Str) -> Str { "{C_BLINK_NAME_PREFIX}{name}" }
+
+pub fn c_local_name(name: Str) -> Str { c_blink_name(name) }
 
 // The pointer a shared mutable binding is stored through. It is a name of its own,
 // because the frame declares the pointer while the source name still spells the value.
-// The minted namespace is what keeps it from colliding with a local the program named:
-// `c_escape_reserved` moves a user name out of that namespace, so no Blink source can
-// reach this spelling. It carries no counter, so the frame, the capture word and the
-// thunk's prologue each derive the same name from the same source name.
+// The minted namespace keeps it from colliding with a local the program named, because
+// every such local carries the Blink prefix. It carries no counter, so the frame, the
+// capture word and the thunk's prologue each derive the same name from the same source name.
 pub fn c_cell_name(name: Str) -> Str { "{C_MINTED_PREFIX}cell_{c_local_name(name)}" }
 
 // A temp from c_mint_local. Only the construct that minted it assigns it, and it does so
@@ -1038,10 +1041,41 @@ pub fn c_is_minted_temp(name: Str) -> Bool {
     name.starts_with(C_MINTED_PREFIX) && !name.starts_with("{C_MINTED_PREFIX}cell_")
 }
 
-// A struct field keeps its Blink spelling too. It is a separate producer from the local
-// name because the struct emitter and every field reader must agree on one answer even
-// if the two rules ever diverge.
-pub fn c_field_name(name: Str) -> Str { c_escape_reserved(name) }
+// A member of a struct or enum. Whoever declares the C type spells its members: a type
+// this compiler emits takes the prefix, and a runtime-owned type keeps the spelling the
+// runtime header declares (`blink_Duration.nanos`). The owner is any struct or enum tid,
+// an instance included. A positional payload field is named for its slot (`_0`), as a
+// tuple member is; no macro can be spelled that way, and the runtime header spells it so.
+pub fn c_field_name(owner_tid: Int, name: Str) -> Str {
+    if header_declared(owner_tid) || is_slot_name(name) { return name }
+    c_blink_name(name)
+}
+
+fn is_slot_name(name: Str) -> Bool {
+    if name.byte_len() < 2 || !name.starts_with("_") { return false }
+    let mut i = 1
+    while i < name.byte_len() {
+        let b = name.byte_at(i).to_int()
+        if b < 48 || b > 57 { return false }
+        i = i + 1
+    }
+    true
+}
+
+fn header_declared(owner_tid: Int) -> Bool {
+    let td = tc_tid_decl_node(owner_tid)
+    td >= 0 && runtime_owned_decls.contains_key(td) != 0
+}
+
+// The union member a payload variant fills: `.data.b_Circle`. The typedef names the member
+// after the variant, so the same namer must spell both the declaration and every literal.
+pub fn c_variant_member_name(enum_tid: Int, variant: Str) -> Str { c_field_name(enum_tid, variant) }
+
+// The path from a tagged enum value to one field of one variant's payload:
+// `data.b_Circle.b_radius`.
+pub fn c_variant_field_path(enum_tid: Int, variant: Str, field: Str) -> Str {
+    "{c_enum_payload_member()}.{c_variant_member_name(enum_tid, variant)}.{c_field_name(enum_tid, field)}"
+}
 
 // A local no Blink source named: the temp an expression is materialised into, the holder
 // a destructure binds through, the bound a loop tests against. Every stage mints from
@@ -1051,8 +1085,8 @@ pub fn c_field_name(name: Str) -> Str { c_escape_reserved(name) }
 // temp was for.
 //
 // The prefix does not make a minted name safe on its own, because a program can write
-// the same spelling. It is safe because `c_escape_reserved` reserves the namespace and
-// moves a user name out of it.
+// the same spelling. It is safe because every name a program writes carries the Blink
+// name prefix in C, and no minted name does.
 pub fn c_mint_local(stem: Str) -> Str {
     c_mint_seq = c_mint_seq + 1
     "{C_MINTED_PREFIX}{stem}{c_mint_seq}"
@@ -1060,7 +1094,7 @@ pub fn c_mint_local(stem: Str) -> Str {
 
 // The temp an @ensures check reads the returned value from, and the entry snapshot of one
 // `old(e)`. They keep these spellings, outside the minted namespace, because they are what
-// a reader of the C looks for; c_escape_reserved reserves both stems as it does the minted one.
+// a reader of the C looks for; no Blink name can reach them, as it cannot reach a minted one.
 pub fn c_ensures_result_name() -> Str {
     c_mint_seq = c_mint_seq + 1
     "{C_ENSURES_RESULT_STEM}{c_mint_seq}"
@@ -1069,35 +1103,6 @@ pub fn c_ensures_result_name() -> Str {
 pub fn c_old_snapshot_name() -> Str {
     c_mint_seq = c_mint_seq + 1
     "{C_OLD_SNAPSHOT_STEM}{c_mint_seq}"
-}
-
-// A user name that C or libc already owns cannot keep its spelling, so it gets the
-// `_blink_` prefix. A user name already inside one of the two prefixed namespaces has to
-// move as well, or the escape is not injective: an underscore starts a legal Blink
-// identifier, so a program may write `_blink_int` or `_cg_tmp1`, and left alone the first
-// lands on the answer for `int` and the second on a minted temp. Prefixing those too
-// keeps every answer distinct, because an escaped name always carries the prefix and a
-// name that keeps its spelling never does.
-fn c_escape_reserved(name: Str) -> Str {
-    let owned = c_reserved_words().contains_key(name) != 0
-    let prefixed = name.starts_with(C_ESCAPE_PREFIX) || name.starts_with(C_MINTED_PREFIX) ||
-        name.starts_with(C_ENSURES_RESULT_STEM) || name.starts_with(C_OLD_SNAPSHOT_STEM)
-    if owned || prefixed { return "{C_ESCAPE_PREFIX}{name}" }
-    name
-}
-
-let mut c_reserved_cache: Map[Str, Int] = Map()
-
-fn c_reserved_words() -> Map[Str, Int] {
-    if c_reserved_cache.len() > 0 { return c_reserved_cache }
-    let words = "auto break case char const continue default do double else enum extern float for goto if inline int long register restrict return short signed sizeof static struct switch typedef union unsigned void volatile while asm typeof _Bool _Complex _Imaginary _Alignas _Alignof _Atomic _Generic _Noreturn _Static_assert _Thread_local errno stdin stdout stderr printf fprintf sprintf snprintf scanf malloc calloc realloc free exit abort strlen strcmp strcpy strcat memcpy memset memmove memcmp strncmp strncpy strncat strstr strchr strdup strtok fopen fclose fread fwrite atoi atof strtol strtod getenv system qsort read write open close sleep fork pipe socket bind listen accept connect send recv time clock log round NULL main true false"
-    let parts = words.split(" ")
-    let mut i = 0
-    while i < parts.len() {
-        c_reserved_cache.insert(parts.get(i).unwrap(), 1)
-        i = i + 1
-    }
-    c_reserved_cache
 }
 
 // ── Literal tokens ───────────────────────────────────────────────────────────────

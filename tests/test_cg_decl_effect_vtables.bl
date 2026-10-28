@@ -15,7 +15,7 @@ import std.fs
 import std.io
 import layout.{layout_reset}
 import cg_test_helpers.{cg_probe_compile, cg_probe_compile_but, cg_probe_ices_named, cg_text_occurrences}
-import cname.{c_effect_default_op_name, c_ev_type_name, c_field_name, c_vtable_type_name, td_guard_name}
+import cname.{c_effect_default_op_name, c_effect_vtable_slot_name, c_ev_type_name, c_vtable_type_name, td_guard_name}
 import cg_print.{print_reset, print_take}
 import cg_reg.{cg_reg_reset, cg_reg_build}
 import typecheck.{builtin_op_rows, make_handler_type}
@@ -101,7 +101,7 @@ fn logger_default(op: Str) -> Str { c_effect_default_op_name(make_handler_type("
 // carry one function pointer under that name for every operation the root declares.
 test "one vtable carries the operations of every sub-effect under its root" {
     let text = emitted(two_ops_src(), "cg_decl_effect_two_ops_probe")
-    assert_has(text, "typedef struct \{\n    void (*emit)(void* __self, const char* msg);\n    int64_t (*peek)(void* __self);")
+    assert_has(text, "typedef struct \{\n    void (*b_emit)(void* __self, const char* b_msg);\n    int64_t (*b_peek)(void* __self);")
     assert_has(text, "} {logger_vtable()};")
     assert_eq_int("one vtable, not one per sub-effect",
         cg_text_occurrences(text, "} {logger_vtable()};"), 1)
@@ -113,7 +113,7 @@ test "one vtable carries the operations of every sub-effect under its root" {
 // capture word would let an operation it did not name read the inner handler's data.
 test "the capture words come after every function pointer, one for each operation" {
     let text = emitted(two_ops_src(), "cg_decl_effect_captures_probe")
-    assert_has(text, "    void* __userdata_emit;\n    void* __userdata_peek;\n} {logger_vtable()};")
+    assert_has(text, "    void* __userdata_b_emit;\n    void* __userdata_b_peek;\n} {logger_vtable()};")
 }
 
 // C rejects a struct with no members, so an effect that declares no operation keeps one word.
@@ -127,7 +127,7 @@ test "an effect with no operations keeps one word so the struct is never empty" 
 // program that installs no handler for the effect.
 test "every operation has a default body the default instance names" {
     let text = emitted(two_ops_src(), "cg_decl_effect_defaults_probe")
-    assert_has(text, "static void {logger_default("emit")}(void* __self, const char* msg) \{")
+    assert_has(text, "static void {logger_default("emit")}(void* __self, const char* b_msg) \{")
     assert_has(text, "static int64_t {logger_default("peek")}(void* __self) \{")
     assert_has(text, "static {logger_vtable()} {logger_vtable()}_default = \{\n    {logger_default("emit")},\n    {logger_default("peek")},\n    NULL,\n    NULL,\n};")
 }
@@ -143,7 +143,7 @@ test "a value-returning default body gives back a zero of its own type" {
 // An operation that returns nothing has nothing to give back, so its body is empty.
 test "a default body for an operation that returns nothing is empty" {
     let text = emitted(two_ops_src(), "cg_decl_effect_void_probe")
-    assert_has(text, "static void {logger_default("emit")}(void* __self, const char* msg) \{\n}")
+    assert_has(text, "static void {logger_default("emit")}(void* __self, const char* b_msg) \{\n}")
 }
 
 // An effect with no operations has no body to name, and the instance keeps one null to match
@@ -154,16 +154,16 @@ test "an effect with no operations has no default body and one null" {
     assert_has(text, "static {bare_vtable()} {bare_vtable()}_default = \{\n    NULL,\n};")
 }
 
-// A slot, its capture word and its default body all name the same operation. cname moves a
-// name C owns out of the way, and all three have to move with it or the vtable names a slot
+// A slot, its capture word and its default body all name the same operation. cname prefixes
+// a user operation's name, and all three have to agree or the vtable names a slot
 // that no body fills.
-test "an operation whose name C owns is moved out of the way in every place it is written" {
+test "an operation is spelled the same in every place it is written" {
     let text = emitted(reserved_op_src(), "cg_decl_effect_reserved_probe")
-    let slot = c_field_name("log")
+    let slot = c_effect_vtable_slot_name(make_handler_type("Logger"), "log")
     assert(slot != "log")
-    assert_has(text, "    void (*{slot})(void* __self, const char* msg);")
+    assert_has(text, "    void (*{slot})(void* __self, const char* b_msg);")
     assert_has(text, "    void* __userdata_{slot};")
-    assert_has(text, "static void {logger_default("log")}(void* __self, const char* msg) \{")
+    assert_has(text, "static void {logger_default("log")}(void* __self, const char* b_msg) \{")
     assert_has(text, "    {logger_default("log")},")
 }
 
@@ -257,8 +257,8 @@ fn main() { assert(true) }
 
 test "a slot that answers an Option over a nominal keeps that Option's own carrier" {
     let c = emitted(option_struct_op_src(), "cg_decl_ev_option_probe")
-    assert_has(c, "blink_Option_Zzitem (*zzfind)(void* __self);")
-    assert_lacks(c, "blink_Option_ptr (*zzfind)")
+    assert_has(c, "blink_Option_Zzitem (*b_zzfind)(void* __self);")
+    assert_lacks(c, "blink_Option_ptr (*b_zzfind)")
 }
 
 // Two sub-effects under one root share the one vtable, so two operations of one name would be
@@ -298,7 +298,7 @@ test "a program that loads std.fs_ops lays out every FS operation" {
     if at < 0 { io.println("FAIL: no {fs_vtable()} typedef\n--- output ---\n{text}") }
     assert(at >= 0)
     for row in builtin_op_rows("FS") {
-        let slot = "(*{c_field_name(row.op)})("
+        let slot = "(*{c_effect_vtable_slot_name(make_handler_type("FS"), row.op)})("
         let found = text.byte_index_of(slot, 0) ?? -1
         if found < 0 || found > at { io.println("FAIL: no FS slot '{slot}'\n--- output ---\n{text}") }
         assert(found >= 0 && found < at)
@@ -320,7 +320,7 @@ test "a program that loads std.process lays out every Process operation" {
     if at < 0 { io.println("FAIL: no {process_vtable()} typedef\n--- output ---\n{text}") }
     assert(at >= 0)
     for row in builtin_op_rows("Process") {
-        let slot = "(*{c_field_name(row.op)})("
+        let slot = "(*{c_effect_vtable_slot_name(make_handler_type("Process"), row.op)})("
         let found = text.byte_index_of(slot, 0) ?? -1
         if found < 0 || found > at { io.println("FAIL: no Process slot '{slot}'\n--- output ---\n{text}") }
         assert(found >= 0 && found < at)

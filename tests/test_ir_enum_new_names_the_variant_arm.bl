@@ -7,7 +7,7 @@ import ir.{
 }
 import layout.{SlotForm, layout_reset}
 import typecheck.{tc_type_str, tc_lookup_node_tid, check_types, lookup_named_type, tc_tid_decl_node, TYPE_INT}
-import parser.{node_count, node_fields, sublist_get}
+import parser.{node_count, node_fields, node_name, sublist_get}
 import cname.{c_variant_member_name, c_variant_discriminant}
 import compiler.{compile_to_program}
 
@@ -94,9 +94,9 @@ fn tag(type_name: Str, v: Int) -> Int {
     ir_const(TYPE_INT, 0, "int", c_variant_discriminant(lookup_named_type(type_name), v))
 }
 fn mono_tag(inst_tid: Int, v: Int) -> Int { ir_const(TYPE_INT, 0, "int", c_variant_discriminant(inst_tid, v)) }
-fn member(v: Int) -> Str { c_variant_member_name(v) }
+fn member(enum_tid: Int, v: Int) -> Str { c_variant_member_name(enum_tid, node_name(v)) }
 fn arm(tid: Int, type_name: Str, v: Int, payload: List[Int]) -> Int {
-    ir_enum_new(tid, 0, "blink_{type_name}", v, member(v), tag(type_name, v), payload)
+    ir_enum_new(tid, 0, "blink_{type_name}", v, member(tid, v), tag(type_name, v), payload)
 }
 
 // A variant with a payload is one arm of a tagged union: the tag beside the union member
@@ -109,7 +109,7 @@ test "an enum constructor node carries the variant declaration, the tag and posi
     let circle = variant("Shape", 0)
     let n = arm(shape, "Shape", circle, [int_const("2")])
     assert_eq_str("kind", ir_kind_name(ir_kind(n)), "EnumNew")
-    assert_eq_str("c_name is the union member", ir_c_name(n), "Circle")
+    assert_eq_str("c_name is the union member", ir_c_name(n), "b_Circle")
     assert_eq_str("kid 0 literal is the cname tag macro", ir_c_name(ir_kid(n, 0)), "blink_Shape_Circle_TAG")
     assert_eq_int("tid is the enum", ir_tid(n), shape)
     assert_eq_int("decl is the variant", ir_decl(n), circle)
@@ -130,12 +130,12 @@ test "a generic enum instance accepts its declaration's variants" {
     let m = harvest_type_tids()
     let tree_int = expect_tid(m, "Tree[Int]")
     let leaf = variant("Tree", 0)
-    let n = ir_enum_new(tree_int, 0, "blink_Tree_0Int", leaf, member(leaf), mono_tag(tree_int, leaf), [int_const("1")])
+    let n = ir_enum_new(tree_int, 0, "blink_Tree_0Int", leaf, member(tree_int, leaf), mono_tag(tree_int, leaf), [int_const("1")])
     assert_valid("Tree[Int].Leaf(1)", ir_expr_stmt(0, n))
     let node = variant("Tree", 1)
     let sub = ir_var_ref(tree_int, 0, "blink_Tree_0Int", "l", SlotForm.Inline)
     let boxed = ir_var_ref(tree_int, 0, "int64_t", "r", SlotForm.PointerBoxed)
-    let n2 = ir_enum_new(tree_int, 0, "blink_Tree_0Int", node, member(node), mono_tag(tree_int, node), [sub, boxed])
+    let n2 = ir_enum_new(tree_int, 0, "blink_Tree_0Int", node, member(tree_int, node), mono_tag(tree_int, node), [sub, boxed])
     assert_valid("Tree[Int].Node(l, r) with payload kids already shaped by lowering", ir_expr_stmt(0, n2))
 }
 
@@ -156,12 +156,12 @@ test "the verifier rejects a tid that is not an enum and a variant of another en
     let shape = lookup_named_type("Shape")
     let circle = variant("Shape", 0)
     let point = expect_tid(m, "Point")
-    let not_enum = ir_enum_new(point, 0, "blink_Point", circle, member(circle), tag("Shape", circle), [int_const("1")])
+    let not_enum = ir_enum_new(point, 0, "blink_Point", circle, member(shape, circle), tag("Shape", circle), [int_const("1")])
     assert_rejects("Point tid", ir_expr_stmt(0, not_enum), "tid is not an enum")
-    let int_tid = ir_enum_new(TYPE_INT, 0, "int64_t", circle, member(circle), tag("Shape", circle), [int_const("1")])
+    let int_tid = ir_enum_new(TYPE_INT, 0, "int64_t", circle, member(shape, circle), tag("Shape", circle), [int_const("1")])
     assert_rejects("Int tid", ir_expr_stmt(0, int_tid), "tid is not an enum")
     let leaf = variant("Tree", 0)
-    let foreign = ir_enum_new(shape, 0, "blink_Shape", leaf, member(leaf), tag("Tree", leaf), [int_const("1")])
+    let foreign = ir_enum_new(shape, 0, "blink_Shape", leaf, member(lookup_named_type("Tree"), leaf), tag("Tree", leaf), [int_const("1")])
     assert_rejects("Tree.Leaf on Shape", ir_expr_stmt(0, foreign), "variant `Leaf` is not declared by this enum")
 }
 
@@ -169,14 +169,14 @@ test "the verifier rejects a missing variant declaration and a tag that is not a
     let _m = harvest_type_tids()
     let shape = lookup_named_type("Shape")
     let circle = variant("Shape", 0)
-    let raw = ir_new(IrKind.EnumNew, shape, 0, "blink_Shape", "Circle", SlotForm.Inline, [tag("Shape", circle), int_const("1")])
+    let raw = ir_new(IrKind.EnumNew, shape, 0, "blink_Shape", "b_Circle", SlotForm.Inline, [tag("Shape", circle), int_const("1")])
     assert_rejects("raw node without a variant", ir_expr_stmt(0, raw), "no variant declaration")
-    let stray = ir_enum_new(shape, 0, "blink_Shape", 1000000, "Circle", tag("Shape", circle), [int_const("1")])
+    let stray = ir_enum_new(shape, 0, "blink_Shape", 1000000, "b_Circle", tag("Shape", circle), [int_const("1")])
     assert_rejects("declaration id past the parser arena", ir_expr_stmt(0, stray), "variant declaration 1000000 out of range")
     let bare = ir_new(IrKind.EnumNew, shape, 0, "blink_Shape", "", SlotForm.Inline, [])
     assert_rejects("raw node without a tag", ir_expr_stmt(0, bare), "expects at least 1 kid")
     let v = ir_var_ref(TYPE_INT, 0, "int", "t", SlotForm.InlineWord)
-    let var_tag = ir_enum_new(shape, 0, "blink_Shape", circle, member(circle), v, [int_const("1")])
+    let var_tag = ir_enum_new(shape, 0, "blink_Shape", circle, member(shape, circle), v, [int_const("1")])
     assert_rejects("VarRef tag", ir_expr_stmt(0, var_tag), "tag must be a Const")
 }
 
@@ -197,7 +197,7 @@ test "the variant declaration survives a dump and parse round trip" {
     let _m = harvest_type_tids()
     let shape = lookup_named_type("Shape")
     let circle = variant("Shape", 0)
-    let n = ir_enum_new(shape, 3, "blink_Shape", circle, member(circle), tag("Shape", circle), [int_const("2")])
+    let n = ir_enum_new(shape, 3, "blink_Shape", circle, member(shape, circle), tag("Shape", circle), [int_const("2")])
     let text = ir_dump(n)
     assert_eq_int("dump names the variant declaration", if text.contains(" @{circle}") { 1 } else { 0 }, 1)
     let back = ir_parse(text)

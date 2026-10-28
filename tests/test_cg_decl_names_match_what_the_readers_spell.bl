@@ -6,10 +6,11 @@ import cg_print.{print_reset, print_take}
 import cg_reg.{cg_reg_reset, cg_reg_build}
 import cg_decl.{cg_decl_reset, cg_decl_emit_typedefs, cg_decl_emit_fn_decls}
 import cg_test_helpers.{cg_probe_compile}
+import cname_test_helpers.{harvest_tids, tid_of}
 
-// The names here are chosen to straddle the two reserved-word sets a C name can be
-// measured against: `read` and `time` are libc symbols but not C keywords, `asm` is a C
-// keyword but not a libc symbol, `default` is both, and `radius` is neither.
+// The names here straddle the sets a C name can be measured against: `read` and `time`
+// are libc symbols but not C keywords, `asm` is a C keyword but not a libc symbol,
+// `default` is both, and `radius` is neither. Each takes the same prefix.
 fn probe_src() -> Str {
     #"type Odd { read: Int, time: Int, asm: Int, default: Int, radius: Int }
 type Ev { Tick(read: Int, asm: Int), Tock }
@@ -26,6 +27,9 @@ fn main() {
 }
 "#
 }
+
+// The tid of a type the probe declares, read after emit_text compiled the probe.
+fn probe_tid(name: Str) -> Int { tid_of(harvest_tids(), name) }
 
 fn emit_text(want_fns: Bool) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete {
     let path = "build/cg_decl_reader_names_probe_src.bl"
@@ -59,19 +63,21 @@ fn assert_eq_str(label: Str, got: Str, want: Str) {
 // member declared under one answer and read under another is an undeclared identifier in C.
 test "a struct member is declared under the name a field read spells" {
     let text = emit_text(false)
-    assert_has(text, " {c_field_name(\"read\")};")
-    assert_has(text, " {c_field_name(\"time\")};")
-    assert_has(text, " {c_field_name(\"asm\")};")
-    assert_has(text, " {c_field_name(\"default\")};")
-    assert_has(text, " {c_field_name(\"radius\")};")
+    let odd = probe_tid("Odd")
+    assert_has(text, " {c_field_name(odd, \"read\")};")
+    assert_has(text, " {c_field_name(odd, \"time\")};")
+    assert_has(text, " {c_field_name(odd, \"asm\")};")
+    assert_has(text, " {c_field_name(odd, \"default\")};")
+    assert_has(text, " {c_field_name(odd, \"radius\")};")
 }
 
 // A variant payload is a struct member of the union arm and is read the same way, so the
 // same producer governs it.
 test "a variant payload field is declared under the name a field read spells" {
     let text = emit_text(false)
-    assert_has(text, " {c_field_name(\"read\")};")
-    assert_has(text, " {c_field_name(\"asm\")};")
+    let ev = probe_tid("Ev")
+    assert_has(text, " {c_field_name(ev, \"read\")};")
+    assert_has(text, " {c_field_name(ev, \"asm\")};")
 }
 
 // A parameter is a local inside the body, and the body reads it through c_local_name.
@@ -81,17 +87,19 @@ test "a parameter is declared under the name a local read spells" {
     assert_has(text, " {c_local_name(\"radius\")})")
 }
 
-// The escape has to move every name C itself owns, keyword or library symbol. `asm` and
+// The prefix has to move every name C itself owns, keyword or library symbol. `asm` and
 // `typeof` are keywords GCC and Clang both take, so a declaration that keeps either
 // spelling is not C a compiler accepts.
-test "the escape moves a C keyword the libc list does not name" {
-    assert_eq_str("asm", c_field_name("asm"), "_blink_asm")
-    assert_eq_str("typeof", c_local_name("typeof"), "_blink_typeof")
+test "a C keyword takes the prefix" {
+    let _ = emit_text(false)
+    assert_eq_str("asm", c_field_name(probe_tid("Odd"), "asm"), "b_asm")
+    assert_eq_str("typeof", c_local_name("typeof"), "b_typeof")
 }
 
-// A name C does not own keeps its Blink spelling, which is what makes the emitted C
-// readable next to the source it came from.
-test "the escape leaves a name C already accepts alone" {
-    assert_eq_str("field", c_field_name("radius"), "radius")
-    assert_eq_str("local", c_local_name("radius"), "radius")
+// A name C accepts today can be a macro in the next header a unit includes, so it takes
+// the prefix too; keeping it bare would need a list of every name a header can define.
+test "a name C already accepts takes the prefix too" {
+    let _ = emit_text(false)
+    assert_eq_str("field", c_field_name(probe_tid("Odd"), "radius"), "b_radius")
+    assert_eq_str("local", c_local_name("radius"), "b_radius")
 }

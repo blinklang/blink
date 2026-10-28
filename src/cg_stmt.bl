@@ -35,7 +35,7 @@ import layout.{
 }
 import cname.{
     c_assert_fail_eq_name, c_assert_fail_intro_name, c_assert_fail_name,
-    c_debug_assert_fail_name, c_decl_for_tid, c_enum_payload_member, c_field_name,
+    c_debug_assert_fail_name, c_decl_for_tid, c_enum_payload_member, c_field_name, c_variant_field_path, c_variant_member_name,
     c_global_name, c_local_name, c_mint_local, c_ensures_result_name, c_old_snapshot_name, c_tuple_member, c_variant_discriminant, c_runtime_helper,
     c_str_const, c_int_literal,
 }
@@ -1479,7 +1479,7 @@ fn assign_place(node: Int, place: Int, value: Int, out: List[Int]) -> Bool ! Dia
     let checked = x_layout_checked(mem, place, "UnspellableFieldType",
         "assigned field has no C layout", "monomorphisation must resolve every type codegen reads; this is a compiler bug")
     if x_stopped(checked) { return false }
-    let member = if is_struct { c_field_name(node_name(place)) } else { c_tuple_member(node_name(place).to_int()) }
+    let member = if is_struct { c_field_name(otid, node_name(place)) } else { c_tuple_member(node_name(place).to_int()) }
     let stored = cg_expr_field_stored(ftid, place, checked, value)
     if stored < 0 { return false }
     if !place_crosses_box(obj) {
@@ -3704,10 +3704,15 @@ fn or_alt_binders(pat: Int, names: List[Str], nodes: List[Int]) -> Bool ! Diag.R
 // union member, the same prefix payload_binds' struct-style arm builds for the qualified
 // spelling; a plain struct has no such member and reads its fields off the scrutinee
 // itself.
+// The union member one variant's payload lives in, from the scrutinee: `data.b_Circle`.
+fn payload_member_path(ctx: MatchCtx, vname: Str) -> Str {
+    "{c_enum_payload_member()}.{c_variant_member_name(ctx.tid, vname)}"
+}
+
 fn struct_pattern_binds(ctx: MatchCtx, pat: Int, out: List[Int]) -> Bool ! Diag.Report {
     let sname = node_type_name(pat)
     if is_variant_name(ctx.tid, sname) {
-        return field_pattern_binds(ctx, pat, "{c_enum_payload_member()}.{sname}", out)
+        return field_pattern_binds(ctx, pat, payload_member_path(ctx, sname), out)
     }
     field_pattern_binds(ctx, pat, "", out)
 }
@@ -3767,7 +3772,7 @@ fn payload_binds(ctx: MatchCtx, pat: Int, out: List[Int]) -> Bool ! Diag.Report 
     let vname = pattern_variant_name(pat)
     if tid_is_carrier(ctx.tid) { return carrier_payload_bind(ctx, vname, flds, out) }
     if ctx.rec.is_transparent != 0 { return newtype_payload_bind(ctx, flds, out) }
-    if node_int_val(pat) == 1 { return field_pattern_binds(ctx, pat, "{c_enum_payload_member()}.{vname}", out) }
+    if node_int_val(pat) == 1 { return field_pattern_binds(ctx, pat, payload_member_path(ctx, vname), out) }
     positional_payload_binds(ctx, pat, vname, flds, out)
 }
 
@@ -3840,8 +3845,7 @@ fn positional_payload_binds(ctx: MatchCtx, pat: Int, vname: Str, flds: Int, out:
             if decl_flds == -1 || i >= sublist_length(decl_flds) {
                 return payload_field_count_mismatch(sub, ctx.tid, vname)
             }
-            let member = c_field_name(node_name(sublist_get(decl_flds, i)))
-            let path = "{c_enum_payload_member()}.{vname}.{member}"
+            let path = c_variant_field_path(ctx.tid, vname, node_name(sublist_get(decl_flds, i)))
             let read = variant_field_read(ctx, sub, tid, path)
             if !bind_slot(ctx, sub, read, out) { return false }
         }
@@ -3888,7 +3892,8 @@ fn field_pattern_binds(ctx: MatchCtx, pat: Int, prefix: Str, out: List[Int]) -> 
             if sub < 0 || sub_pattern_declares(sub) { return false }
         } else {
             let held = layout_at(tid, Position.Local, holder)
-            let path = if prefix == "" { node_name(f) } else { "{prefix}.{node_name(f)}" }
+            let member = c_field_name(ctx.tid, node_name(f))
+            let path = if prefix == "" { member } else { "{prefix}.{member}" }
             let read = variant_field_read(ctx, holder, tid, path)
             if sub < 0 {
                 bind_named(holder, node_name(f), tid, held, read, out)
@@ -4040,7 +4045,7 @@ fn payload_test(ctx: MatchCtx, pat: Int, vname: Str) -> Int ! Diag.Report {
     if flds == -1 || sublist_length(flds) == 0 { return -1 }
     if tid_is_carrier(ctx.tid) { return carrier_payload_test(ctx, vname, flds) }
     if ctx.rec.is_transparent != 0 { return newtype_payload_test(ctx, flds) }
-    if node_int_val(pat) == 1 { return field_pattern_test(ctx, pat, "{c_enum_payload_member()}.{vname}") }
+    if node_int_val(pat) == 1 { return field_pattern_test(ctx, pat, payload_member_path(ctx, vname)) }
     positional_payload_test(ctx, vname, flds)
 }
 
@@ -4070,9 +4075,8 @@ fn positional_payload_test(ctx: MatchCtx, vname: Str, flds: Int) -> Int ! Diag.R
         let sub = sublist_get(flds, i)
         let tid = stmt_tid(sub)
         if tid >= 0 && !(decl_flds == -1 || i >= sublist_length(decl_flds)) {
-            let member = c_field_name(node_name(sublist_get(decl_flds, i)))
             let held = layout_at(tid, Position.Local, sub)
-            let path = "{c_enum_payload_member()}.{vname}.{member}"
+            let path = c_variant_field_path(ctx.tid, vname, node_name(sublist_get(decl_flds, i)))
             let read = variant_field_read(ctx, sub, tid, path)
             acc = and_test(sub, acc, slot_test(ctx, sub, tid, held, read))
         }
@@ -4096,7 +4100,8 @@ fn field_pattern_test(ctx: MatchCtx, pat: Int, prefix: Str) -> Int ! Diag.Report
             let tid = stmt_tid(sub)
             if tid >= 0 {
                 let held = layout_at(tid, Position.Local, sub)
-                let path = if prefix == "" { node_name(f) } else { "{prefix}.{node_name(f)}" }
+                let member = c_field_name(ctx.tid, node_name(f))
+                let path = if prefix == "" { member } else { "{prefix}.{member}" }
                 let read = variant_field_read(ctx, sub, tid, path)
                 acc = and_test(sub, acc, slot_test(ctx, sub, tid, held, read))
             }
@@ -4156,7 +4161,7 @@ fn struct_pattern_test(ctx: MatchCtx, pat: Int) -> Int ! Diag.Report {
     if is_variant_name(ctx.tid, sname) {
         let tag_test = ir_binary(TYPE_INT, pat, int_spelling(pat), "==",
             discriminant(ctx, pat), variant_label(ctx, pat, sname))
-        return and_test(pat, tag_test, field_pattern_test(ctx, pat, "{c_enum_payload_member()}.{sname}"))
+        return and_test(pat, tag_test, field_pattern_test(ctx, pat, payload_member_path(ctx, sname)))
     }
     field_pattern_test(ctx, pat, "")
 }

@@ -1,0 +1,91 @@
+// A native dependency's header is the program's own C, and any of its macros can share a
+// name with something the program declares. This header has the shape of glibc's
+// `struct stat`, where `#define st_atime st_atim.tv_sec` names a member path: an
+// @ffi.struct mirror field of that name still matches the C layout, while a local, a
+// field and a param of the same names as the header's macros stay the program's own.
+// The layout asserts still name the C struct's members, so a mirror that drifts from
+// the header still fails to build.
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> ProcessResult {
+    process.run("sh", ["-c", cmd]).unwrap()
+}
+
+let MANIFEST = "[package]\nname = \"wmacro\"\nversion = \"0.1.0\"\n\n[native-dependencies]\nwidget = \{ type = \"vendored\", path = \"vendor/widget.c\", headers = [\"widget.h\"] \}\n"
+
+let HEADER = "#include <stdint.h>\nstruct widget_time \{ int64_t sec; int64_t nsec; };\nstruct widget \{ int64_t count; struct widget_time w_atim; };\n#define w_atime w_atim.sec\n#define w_atimensec w_atim.nsec\n#define widget_count 99\n#define WIDGET_MAX (widget_count + 1)\nint64_t widget_sum(int64_t a, int64_t b);\n"
+
+// Builds main_src in a project with the widget dependency. Answers the build's output and
+// the program's.
+fn build_project(main_src: Str) -> (ProcessResult, Str) {
+    let dir = sh("mktemp -d /tmp/blink_wmacro.XXXXXX").out.trim()
+    let _ = sh("mkdir -p {dir}/src {dir}/vendor")
+    write_file("{dir}/blink.toml", MANIFEST)
+    write_file("{dir}/blink.lock", "[metadata]\nlockfile-version = 1\n")
+    write_file("{dir}/vendor/widget.h", HEADER)
+    write_file("{dir}/vendor/widget.c", "#include \"widget.h\"\nint64_t widget_sum(int64_t a, int64_t b) \{ return a + b; }\n")
+    write_file("{dir}/src/main.bl", main_src)
+    let r = sh("B=$(pwd)/build/blink; cd {dir} && timeout 120 $B build src/main.bl -o {dir}/out")
+    let ran = if r.success() { sh("{dir}/out").out } else { "" }
+    let _ = sh("rm -rf {dir}")
+    (r, ran)
+}
+
+let FFI_DECLS = #"@ffi("widget", "widget_sum", header: "widget.h")
+@trusted(audit: "T1")
+fn widget_sum(a: Int, b: Int) -> Int ! () {}
+"#
+
+test "names spelled like the dependency header's macros stay the program's own" {
+    let src = #"
+@ffi.struct(header: "widget.h", name: "widget")
+type Widget { count: Int, w_atime: Int, w_atimensec: Int }
+
+type Gauge { widget_count: Int, WIDGET_MAX: Int }
+
+fn bump(widget_count: Int) -> Int { widget_count + 1 }
+
+fn main() {
+    let widget_count = 3
+    let WIDGET_MAX = 4
+    let g = Gauge { widget_count: widget_count, WIDGET_MAX: WIDGET_MAX }
+    let w = Widget { count: 0, w_atime: 0, w_atimensec: 0 }
+    io.println("{widget_sum(g.widget_count, bump(g.WIDGET_MAX)) + w.count}")
+}
+"#
+    let (r, ran) = build_project(FFI_DECLS.concat(src))
+    assert(r.success(), "got: {r.out}{r.err_out}")
+    assert_eq(ran, "8\n")
+}
+
+test "a mirror field named like a macro for a member path matches the C layout" {
+    let src = #"
+@ffi.struct(header: "widget.h", name: "widget")
+type Widget { count: Int, w_atime: Int, w_atimensec: Int }
+
+fn main() {
+    let w = Widget { count: 1, w_atime: 20, w_atimensec: 300 }
+    io.println("{widget_sum(w.count, w.w_atime) + w.w_atimensec}")
+}
+"#
+    let (r, ran) = build_project(FFI_DECLS.concat(src))
+    assert(r.success(), "got: {r.out}{r.err_out}")
+    assert_eq(ran, "321\n")
+}
+
+test "a mirror whose fields drift from the header still fails to build" {
+    let src = #"
+@ffi.struct(header: "widget.h", name: "widget")
+type Widget { w_atime: Int, count: Int, w_atimensec: Int }
+
+fn main() {
+    let w = Widget { w_atime: 20, count: 1, w_atimensec: 300 }
+    io.println("{widget_sum(w.count, w.w_atime)}")
+}
+"#
+    let (r, _) = build_project(FFI_DECLS.concat(src))
+    let text = "{r.out}{r.err_out}"
+    assert(!r.success(), "got: {text}")
+    assert(text.contains("offset mismatch"), "got: {text}")
+    assert(text.contains("w_atime"), "the failure names the C member, got: {text}")
+}
