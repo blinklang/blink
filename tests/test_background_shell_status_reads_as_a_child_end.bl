@@ -1,0 +1,50 @@
+// compile_test_helpers.bg_result reads what a command run in the background by a shell ended
+// with. The shell can only write a number, and it writes 128 + n for a child that signal n
+// killed, so the helper must turn that number back into the ChildEnd a direct wait gives.
+import compile_test_helpers
+import std.process.{ChildEnd}
+
+fn bg_dir(name: Str) -> Str {
+    let dir = "{compile_test_helpers.scratch_root()}/bg_status_{name}"
+    let _mk = process.run("mkdir", ["-p", dir]).unwrap()
+    dir
+}
+
+// Runs cmd as blink_bg-style tests do: stdout, stderr, then the status written last.
+fn run_bg(dir: Str, tag: Str, cmd: Str) {
+    let _r = process.run("sh", ["-c", "(sh -c '{cmd}' > {dir}/{tag}.out 2> {dir}/{tag}.err; echo $? > {dir}/{tag}.rc.tmp; mv {dir}/{tag}.rc.tmp {dir}/{tag}.rc) > /dev/null 2>&1 &"]).unwrap()
+}
+
+test "a shell status of 128 or less is an exit with that code" {
+    assert_eq(compile_test_helpers.end_of_shell_status(0), ChildEnd.Exited(0))
+    assert_eq(compile_test_helpers.end_of_shell_status(2), ChildEnd.Exited(2))
+    assert_eq(compile_test_helpers.end_of_shell_status(128), ChildEnd.Exited(128))
+}
+
+test "a shell status above 128 is the signal that killed the child" {
+    assert_eq(compile_test_helpers.end_of_shell_status(137), ChildEnd.Signaled(9))
+    assert_eq(compile_test_helpers.end_of_shell_status(143), ChildEnd.Signaled(15))
+}
+
+test "bg_result gives the output and exit of a background command" {
+    let dir = bg_dir("exit")
+    run_bg(dir, "exit", "echo out; echo err >&2; exit 3")
+    let r = compile_test_helpers.bg_result(dir, "exit")
+    assert_eq(r.out, "out\n")
+    assert_eq(r.err_out, "err\n")
+    assert_eq(r.end, ChildEnd.Exited(3))
+    assert(!r.success())
+}
+
+test "bg_result gives the signal that killed a background command" {
+    let dir = bg_dir("signal")
+    run_bg(dir, "signal", "kill -TERM $$")
+    assert_eq(compile_test_helpers.bg_result(dir, "signal").end, ChildEnd.Signaled(15))
+}
+
+test "bg_result fails the test when the command has not ended in time" {
+    let dir = bg_dir("hang")
+    assert_panics {
+        compile_test_helpers.bg_result_within(dir, "never_started", 1)
+    }
+}
