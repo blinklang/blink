@@ -68,7 +68,7 @@ import formatter.{Format, format}
 import escape.{ffi_scope_resource_name}
 import check_pipeline.{check_source, run_build_analyses, check_exit_code, check_status_line}
 import fix_edits.{FixEdit, fix_plan, fix_apply, fix_byte_offset}
-import foreign_const_probe.{ForeignConst, foreign_const_header, foreign_const_libs, foreign_consts_in, probe_of, probe_verdicts, report_verdicts, triple_of_machine}
+import foreign_const_probe.{ForeignConst, foreign_const_header, foreign_consts_in, is_runtime_lib, report_undeclared_lib, probe_of, probe_verdicts, report_verdicts, triple_of_machine}
 import symbol_index.{collect_effects}
 import query.{query_index_source, query_answer}
 import diagnostics.{
@@ -1535,14 +1535,20 @@ fn stamp_blink_version() ! Diag.Report {
     }
 }
 
-// The libraries the manifest must declare: those of the `@ffi` functions, which the build
-// links, and those of the foreign constants, which it does not.
-fn with_foreign_const_libs(ffi_libs: List[Str], foreign: List[ForeignConst]) -> List[Str] {
-    let mut out: List[Str] = []
-    for lib in ffi_libs.append(foreign_const_libs(foreign)) {
-        if !out.contains(lib) { out.push(lib) }
+// A foreign constant's key is checked whether or not the program has a manifest: with no
+// link flag, nothing later would catch a key that names no dependency.
+fn check_foreign_const_libs(foreign: List[ForeignConst]) -> Int ! Diag.Report {
+    let mut errors = 0
+    for fc in foreign {
+        if fc.lib == "" || is_runtime_lib(fc.lib) || manifest_has_native_dep(fc.lib) != 0 { continue }
+        report_undeclared_lib(fc)
+        errors = errors + 1
     }
-    out
+    if errors > 0 {
+        diag_flush()
+        return 1
+    }
+    0
 }
 
 fn validate_build_deps(ffi_libs: List[Str], targets: List[Str]) -> Int ! Diag.Report {
@@ -1658,9 +1664,13 @@ fn do_build(source_path: Str, output_path: Str, c_path: Str, debug_mode: Int, re
     let ffi_libs = detect_ffi_libs(c_source)
     let compiler_archive = compiler_archive_of_unit(c_source)
 
-    let vrc = validate_build_deps(with_foreign_const_libs(ffi_libs, compiled.foreign), targets)
+    let vrc = validate_build_deps(ffi_libs, targets)
     if vrc != 0 {
         return vrc
+    }
+    let flrc = check_foreign_const_libs(compiled.foreign)
+    if flrc != 0 {
+        return flrc
     }
     let frc = check_foreign_consts(compiled.foreign, targets, used_deps, output_path)
     if frc != 0 {
@@ -2452,9 +2462,13 @@ fn link_units_all_targets(source_path: Str, output_path: Str, work: Str, units_d
     let has_async = detect_async(read_file(source_path))
     let used_deps = detect_native_deps(c_source)
     let ffi_libs = detect_ffi_libs(c_source)
-    let vrc = validate_build_deps(with_foreign_const_libs(ffi_libs, foreign), targets)
+    let vrc = validate_build_deps(ffi_libs, targets)
     if vrc != 0 {
         return vrc
+    }
+    let flrc = check_foreign_const_libs(foreign)
+    if flrc != 0 {
+        return flrc
     }
     let frc = check_foreign_consts(foreign, targets, used_deps, output_path)
     if frc != 0 {

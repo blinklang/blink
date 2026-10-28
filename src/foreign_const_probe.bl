@@ -12,7 +12,7 @@ import parser.{get_annotation, get_str_named_arg, node_args, positional_str_arg,
 import ast.{NodeKind}
 import cname.{c_ffi_symbol}
 import typecheck.{TyKind, tc_lookup_node_tid, resolve_alias_tid, type_kind, tk_name}
-import diagnostics.{Diag, diag_error_span_at_notes, FOREIGN_CONST_INVALID}
+import diagnostics.{Diag, diag_error_span_at_notes, FOREIGN_CONST_INVALID, MISSING_NATIVE_DEP}
 
 pub type ForeignConst {
     decl: Int
@@ -80,14 +80,21 @@ fn lib_of(d: Int) -> Str {
     if positional_str_arg_count(args) >= 2 { positional_str_arg(args, 0) } else { "" }
 }
 
-// The library keys the foreign constants name, each once. The build checks that the
-// manifest declares each one, as it does for an `@ffi` function, and links none of them.
-pub fn foreign_const_libs(fcs: List[ForeignConst]) -> List[Str] {
-    let mut out: List[Str] = []
-    for fc in fcs {
-        if fc.lib != "" && !out.contains(fc.lib) { out.push(fc.lib) }
-    }
-    out
+// A two-argument foreign constant whose key the manifest does not declare is E0820 at the
+// declaration, as for an `@ffi` function (§9.1.2). The runtime's `c` and `m` need no entry, and
+// a program with no manifest may name only those two.
+pub fn report_undeclared_lib(fc: ForeignConst) ! Diag.Report {
+    let d = fc.decl
+    let col = name_col(d)
+    diag_error_span_at_notes("MissingNativeDep", MISSING_NATIVE_DEP, "@ffi references undeclared native dependency \"{fc.lib}\"", d, node_line(d), col, col + node_name(d).byte_len(), "add to blink.toml:\n  [native-dependencies]\n  {fc.lib} = \{ system = true \}", [])
+}
+
+pub fn is_runtime_lib(lib: Str) -> Bool {
+    lib == "c" || lib == "m"
+}
+
+fn name_col(d: Int) -> Int {
+    if node_binder_col(d) > 0 { node_binder_col(d) } else { node_col(d) }
 }
 
 fn bounds_of(tid: Int) -> Option[(Str, Str, Str)] {
@@ -190,7 +197,7 @@ pub fn report_verdicts(fcs: List[ForeignConst], verdicts: List[ProbeVerdict], tr
         let v = verdicts.get(i).unwrap()
         i = i + 1
         let d = fc.decl
-        let col = if node_binder_col(d) > 0 { node_binder_col(d) } else { node_col(d) }
+        let col = name_col(d)
         let end_col = col + node_name(d).byte_len()
         let (message, help) = match v {
             ProbeVerdict.Fine => continue

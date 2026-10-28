@@ -13,10 +13,17 @@ let MANIFEST = "[package]\nname = \"fcnd\"\nversion = \"0.1.0\"\n\n[native-depen
 // A project with a vendored dep `foo` whose header defines FOO_MAX, and a system dep that no
 // linker can find. Answers the build's output and the program's.
 fn build_project(main_src: Str) -> (ProcessResult, Str) {
+    build_in(main_src, true)
+}
+
+// A project with the manifest above, or with no manifest at all.
+fn build_in(main_src: Str, with_manifest: Bool) -> (ProcessResult, Str) {
     let dir = sh("mktemp -d /tmp/blink_fc_nd.XXXXXX").out.trim()
     let _ = sh("mkdir -p {dir}/src {dir}/vendor")
-    write_file("{dir}/blink.toml", MANIFEST)
-    write_file("{dir}/blink.lock", "[metadata]\nlockfile-version = 1\n")
+    if with_manifest {
+        write_file("{dir}/blink.toml", MANIFEST)
+        write_file("{dir}/blink.lock", "[metadata]\nlockfile-version = 1\n")
+    }
     write_file("{dir}/vendor/foo.h", "#define FOO_MAX 42\n")
     write_file("{dir}/vendor/foo.c", "#include \"foo.h\"\nint foo_max(void) \{ return FOO_MAX; \}\n")
     write_file("{dir}/src/main.bl", main_src)
@@ -33,6 +40,23 @@ test "a library key the manifest does not declare is MissingNativeDep" {
     assert(!r.success(), "got: {text}")
     assert(text.contains("error[MissingNativeDep]"), "got: {text}")
     assert(text.contains("undeclared native dependency \"bar\""), "got: {text}")
+    assert(text.contains("src/main.bl:2:9"), "the error is at the declaration, got: {text}")
+}
+
+test "the runtime keys c and m need no manifest entry" {
+    let src = "@ffi(\"c\", \"INT_MAX\", header: \"limits.h\")\npub let BIG: Int\n\n@ffi(\"m\", \"FP_NAN\", header: \"math.h\")\npub let FPN: Int\n\nfn main() \{\n    io.println(\"\{BIG} \{FPN == FPN}\")\n}\n"
+    let (r, ran) = build_project(src)
+    assert(r.success(), "got: {r.out}{r.err_out}")
+    assert_eq(ran, "2147483647 true\n")
+}
+
+test "with no manifest, a key other than c and m is MissingNativeDep" {
+    let src = "@ffi(\"c\", \"INT_MAX\", header: \"limits.h\")\npub let BIG: Int\n\n@ffi(\"bar\", \"INT_MIN\", header: \"limits.h\")\npub let LOW: Int\n\nfn main() \{\n    io.println(\"\{BIG} \{LOW}\")\n}\n"
+    let (r, _) = build_in(src, false)
+    let text = "{r.out}{r.err_out}"
+    assert(!r.success(), "got: {text}")
+    assert(text.contains("undeclared native dependency \"bar\""), "got: {text}")
+    assert(!text.contains("\"c\""), "got: {text}")
 }
 
 test "a declared key gives its headers and no link flag" {
