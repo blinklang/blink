@@ -1,0 +1,180 @@
+// The front end never sees the value of a foreign constant (§9.1), so it may appear only
+// where the compiler needs no number: a function body, a guard, a bare leaf of a module-level
+// `let`, and a keyword default as the bare name. Every place that needs the number reports
+// the foreign constant as the cause, and no help tells the author to make it a `const`,
+// because a `const` cannot hold one: NonConstExpr (E0533) for a `const`, a field default and
+// an expression in a keyword default, NonInitExpr (E1129) for an operator in a module-level
+// `let`, RangeBoundNotConst (E0323) for a range-pattern bound.
+
+import std.fs
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_reset}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+
+const DECLS: Str = "@ffi(\"SIGBUS\", header: \"signal.h\")\npub let SIGBUS: Int\n@ffi(\"SIGSEGV\", header: \"signal.h\")\npub let SIGSEGV: Int\n"
+
+fn use_probe(path: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    init_embedded_stdlib()
+    write_file(path, src)
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+}
+
+// The errors reported in the probe file itself, one per line: code, name, line:col,
+// message and help.
+fn errors_in(path: Str) -> Str {
+    let mut out = ""
+    for d in diag_entries {
+        if d.severity == "error" && d.file == path {
+            out = out.concat("{d.code} {d.name} {d.line}:{d.col}: {d.message} | help: {d.help}\n")
+        }
+    }
+    out
+}
+
+test "a foreign constant as a bare leaf of a module-level let checks clean" {
+    let path = "/tmp/zz_fcu_leaf.bl"
+    let src = "{DECLS}type Watch \{ sig: Int }\nlet ONE = SIGBUS\nlet mut last = SIGSEGV\nlet FATAL = [SIGSEGV, SIGBUS]\nlet PAIR = (SIGBUS, 1)\nlet W = Watch \{ sig: SIGBUS }\nlet MAYBE = Some(SIGBUS)\nlet NEXT = fn() -> Int \{ SIGBUS + 1 }\n\nfn main() \{\n    last = ONE\n    let _ = FATAL\n    let _ = PAIR\n    let _ = W\n    let _ = MAYBE\n    let _ = NEXT()\n}\n"
+    use_probe(path, src)
+    let got = errors_in(path)
+    assert(got == "", "a bare leaf and a fn literal body need no value, got: {got}")
+}
+
+test "an operator over a foreign constant in a module-level let is NonInitExpr" {
+    let path = "/tmp/zz_fcu_op.bl"
+    use_probe(path, "{DECLS}let WANT = SIGBUS | SIGSEGV\n\nfn main() \{ let _ = WANT }\n")
+    let got = errors_in(path)
+    let want = "E1129 NonInitExpr 5:12: `SIGBUS` is a foreign constant: the target's C headers set its value, so an operator cannot fold it | help: compute it in a fn: `fn want() -> Int \{ SIGBUS | SIGSEGV }`\n"
+    assert(got == want, "want: {want}got: {got}")
+}
+
+test "an operator inside a list element of a module-level let is NonInitExpr" {
+    let path = "/tmp/zz_fcu_op_elem.bl"
+    use_probe(path, "{DECLS}let mut sigs = [1, -SIGSEGV]\n\nfn main() \{ sigs = [] }\n")
+    let got = errors_in(path)
+    assert(got.starts_with("E1129 NonInitExpr 5:21: `SIGSEGV` is a foreign constant: the target's C headers set its value, so an operator cannot fold it | help: compute it in a fn: "), "got: {got}")
+    assert(got.split("\n").len() == 2, "exactly one error, got: {got}")
+}
+
+test "a foreign constant in a const initializer is NonConstExpr that names it" {
+    let path = "/tmp/zz_fcu_const.bl"
+    use_probe(path, "{DECLS}const BAD_SIG = SIGBUS\n\nfn main() \{ let _ = BAD_SIG }\n")
+    let got = errors_in(path)
+    let want = "E0533 NonConstExpr 5:17: `SIGBUS` is a foreign constant: the target's C headers set its value | help: use `SIGBUS` in a function body, or in a module-level `let`\n"
+    assert(got == want, "want: {want}got: {got}")
+}
+
+test "a foreign constant under an operator in a const initializer is NonConstExpr at the name" {
+    let path = "/tmp/zz_fcu_const_op.bl"
+    use_probe(path, "{DECLS}const BAD: Int = 1 + SIGSEGV\n\nfn main() \{ let _ = BAD }\n")
+    let got = errors_in(path)
+    let want = "E0533 NonConstExpr 5:22: `SIGSEGV` is a foreign constant: the target's C headers set its value | help: use `SIGSEGV` in a function body, or in a module-level `let`\n"
+    assert(got == want, "want: {want}got: {got}")
+}
+
+// A module qualifier needs a second module, so the package is staged here.
+test "a foreign constant named through its module is the same foreign constant" {
+    let root = "build/fcu_qualified_pkg"
+    let _clean = process.run("rm", ["-rf", root]).unwrap()
+    let _mk = process.run("mkdir", ["-p", "{root}/src"]).unwrap()
+    write_file("{root}/blink.toml", "[package]\nname = \"fcuqualified\"\nversion = \"0.1.0\"\n")
+    write_file("{root}/src/sigs.bl", DECLS)
+    let path = "{root}/src/main.bl"
+    use_probe(path, "import sigs\n\nconst A = sigs.SIGBUS\nlet B = sigs.SIGBUS + 1\nlet C = sigs.SIGBUS\nfn f(-- s: Int = sigs.SIGBUS) -> Int \{ s }\n\nfn main() \{ let _ = A\n let _ = B\n let _ = C\n let _ = f() }\n")
+    let got = errors_in(path)
+    let _rm = process.run("rm", ["-rf", root]).unwrap()
+    assert(got.contains("E0533 NonConstExpr 3:11: `sigs.SIGBUS` is a foreign constant"), "got: {got}")
+    assert(got.contains("E1129 NonInitExpr 4:9: `sigs.SIGBUS` is a foreign constant"), "got: {got}")
+    assert(got.contains("help: compute it in a fn: `fn b() -> Int \{ sigs.SIGBUS + 1 }`"), "got: {got}")
+    assert(got.split("\n").len() == 3, "two errors, got: {got}")
+}
+
+test "a local binding that shadows a foreign constant is not one" {
+    let path = "/tmp/zz_fcu_shadow.bl"
+    use_probe(path, "{DECLS}fn g(n: Int) -> Int \{\n    let SIGBUS = 3\n    const L = SIGBUS\n    n + L\n}\n\nfn main() \{ let _ = g(1) }\n")
+    let got = errors_in(path)
+    assert(got.contains("E0533 NonConstExpr 7:15: the value of const `L` is not a compile-time constant"), "got: {got}")
+    assert(!got.contains("foreign"), "got: {got}")
+}
+
+test "a foreign constant as the bare keyword default checks clean" {
+    let path = "/tmp/zz_fcu_kw_ok.bl"
+    use_probe(path, "{DECLS}fn stop(-- sig: Int = SIGBUS) -> Int \{ sig }\n\nfn main() \{ let _ = stop() }\n")
+    let got = errors_in(path)
+    assert(got == "", "a keyword default is filled at a call and needs no value, got: {got}")
+}
+
+test "an expression over a foreign constant in a keyword default is NonConstExpr" {
+    let path = "/tmp/zz_fcu_kw_op.bl"
+    use_probe(path, "{DECLS}fn bad(-- sig: Int = SIGBUS + 1) -> Int \{ sig }\n\nfn main() \{ let _ = bad() }\n")
+    let got = errors_in(path)
+    let want = "E0533 NonConstExpr 5:22: only the bare name of a foreign constant is allowed in a keyword default | help: `SIGBUS` is a foreign constant: the target's C headers set its value. Write `sig: Int = SIGBUS`, and compute the rest in the body\n"
+    assert(got == want, "want: {want}got: {got}")
+}
+
+test "a list of foreign constants in a keyword default is NonConstExpr" {
+    let path = "/tmp/zz_fcu_kw_list.bl"
+    use_probe(path, "{DECLS}fn bad(-- sigs: List[Int] = [SIGBUS]) -> Int \{ sigs.len() }\n\nfn main() \{ let _ = bad() }\n")
+    let got = errors_in(path)
+    assert(got.starts_with("E0533 NonConstExpr 5:30: only the bare name of a foreign constant is allowed in a keyword default"), "got: {got}")
+}
+
+test "a foreign constant in a struct field default is NonConstExpr with the reason and the fix" {
+    let path = "/tmp/zz_fcu_field.bl"
+    use_probe(path, "{DECLS}type KillOpts \{ sig: Int = SIGBUS }\n\nfn main() \{ let _ = KillOpts \{} }\n")
+    let got = errors_in(path)
+    let want = "E0533 NonConstExpr 5:28: a field default must be const, because `const X = KillOpts \{}` fills it. `SIGBUS` is a foreign constant (the target's C headers set it) | help: use a keyword default on a constructor fn: `fn kill_opts(-- sig: Int = SIGBUS) -> KillOpts`, or make the field `Option[Int]`\n"
+    assert(got == want, "want: {want}got: {got}")
+}
+
+test "a foreign constant as a range-pattern bound is RangeBoundNotConst with a guard help" {
+    let path = "/tmp/zz_fcu_range.bl"
+    use_probe(path, "{DECLS}fn low(n: Int) -> Bool \{\n    match n \{\n        0..=SIGBUS => true\n        _ => false\n    }\n}\n\nfn main() \{ let _ = low(1) }\n")
+    let got = errors_in(path)
+    let want = "E0323 RangeBoundNotConst 7:13: `SIGBUS` is a foreign constant: the target's C headers set its value | help: use a guard: `n if n >= 0 && n <= SIGBUS`\n"
+    assert(got == want, "want: {want}got: {got}")
+}
+
+test "an exclusive range bound gives a guard with a strict comparison" {
+    let path = "/tmp/zz_fcu_range_excl.bl"
+    use_probe(path, "{DECLS}fn low(n: Int) -> Bool \{\n    match n \{\n        1..SIGSEGV => true\n        _ => false\n    }\n}\n\nfn main() \{ let _ = low(1) }\n")
+    let got = errors_in(path)
+    assert(got.contains("E0323 RangeBoundNotConst 7:12: `SIGSEGV` is a foreign constant"), "got: {got}")
+    assert(got.contains("help: use a guard: `n if n >= 1 && n < SIGSEGV`"), "got: {got}")
+}
+
+test "a foreign constant in a guard and a fn body checks clean" {
+    let path = "/tmp/zz_fcu_guard.bl"
+    use_probe(path, "{DECLS}fn bus(n: Int) -> Bool \{\n    match n \{\n        x if x == SIGBUS => true\n        _ => n == SIGSEGV + 0\n    }\n}\n\nfn main() \{ let _ = bus(1) }\n")
+    let got = errors_in(path)
+    assert(got == "", "run-time code reads the value, got: {got}")
+}
+
+test "a lone foreign-constant name in a pattern is never its value" {
+    let path = "/tmp/zz_fcu_lone.bl"
+    use_probe(path, "{DECLS}fn bus(n: Int) -> Bool \{\n    match n \{\n        SIGBUS => true\n        _ => false\n    }\n}\n\nfn main() \{ let _ = bus(1) }\n")
+    let got = errors_in(path)
+    assert(got.contains("EnumPatternNeedsEnumScrutinee"), "an uppercase name on an Int scrutinee is the enum-pattern error, got: {got}")
+    assert(!got.contains("foreign constant"), "the pattern never reads the value, got: {got}")
+}
+
+test "no help for a foreign constant tells the author to make it a const" {
+    let path = "/tmp/zz_fcu_no_const_help.bl"
+    use_probe(path, "{DECLS}const A = SIGBUS\nlet B = SIGBUS + 1\nfn c(-- s: Int = -SIGBUS) -> Int \{ s }\ntype D \{ s: Int = SIGBUS }\n\nfn main() \{ let _ = A\n let _ = B\n let _ = c()\n let _ = D \{} }\n")
+    let got = errors_in(path)
+    assert(got.split("\n").len() == 5, "four errors, got: {got}")
+    assert(!got.contains("make it a"), "got: {got}")
+    assert(!got.contains("`const` binding"), "got: {got}")
+}
+
+test "a non-const name that is not a foreign constant keeps its ordinary diagnostics" {
+    let path = "/tmp/zz_fcu_ordinary.bl"
+    use_probe(path, "let N = 3\nconst C = N\nfn f(-- x: Int = N) -> Int \{ x }\n\nfn main() \{ let _ = C\n let _ = f() }\n")
+    let got = errors_in(path)
+    assert(got.contains("E0533 NonConstExpr 2:11: the value of const `C` is not a compile-time constant"), "got: {got}")
+    assert(got.contains("E0532 NonConstParamDefault 3:18: "), "got: {got}")
+    assert(!got.contains("foreign"), "got: {got}")
+}

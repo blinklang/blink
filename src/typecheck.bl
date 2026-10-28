@@ -26,7 +26,7 @@ import diagnostics.{
     diag_push_allows, diag_enter_allows, diag_exit_allows, NON_CONST_EXPR,
     diag_warn_at, diag_warn_at_notes, diag_warn_span_at_notes, PARTIAL_HANDLER, diag_truncate, diag_entry_count, diag_any_errors_since, diag_ice_at, diag_count, diag_emit_in_file, diag_file_for_node,
     diag_is_audit_gated, diag_audit_gated_help, AUDIT_GATED_SUPPRESSION, diag_normalize_path, diag_source_line, diag_errors_in_lines,
-    POSITIONAL_PARAM_DEFAULT, NON_CONST_PARAM_DEFAULT, FOREIGN_CONST_FORM, FOREIGN_CONST_NO_HEADER,
+    POSITIONAL_PARAM_DEFAULT, NON_CONST_PARAM_DEFAULT, FOREIGN_CONST_FORM, FOREIGN_CONST_NO_HEADER, RANGE_BOUND_NOT_CONST, NON_INIT_EXPR,
     ICE_SEG_UNSOLVED_TYPEVAR, ICE_SEG_UNHANDLED_KIND, ICE_SEG_TID_OUT_OF_RANGE,
     ICE_SEG_ERASED_SLOT, diag_is_ice_seg,
     NON_EXHAUSTIVE_MATCH, INCONSISTENT_PATTERN_BINDINGS, DUPLICATE_MODULE_BINDING,
@@ -29208,11 +29208,11 @@ fn tc_name_is_const_binding(name: Str) -> Int {
     node_is_const(d)
 }
 
-fn tc_args_are_const(args_sl: Int) -> Int {
+fn tc_args_are_const(args_sl: Int, admit_foreign: Bool) -> Int {
     if args_sl == -1 { return 1 }
     let mut i = 0
     while i < sublist_length(args_sl) {
-        if tc_is_const_expr(sublist_get(args_sl, i)) == 0 { return 0 }
+        if tc_is_const_expr_in(sublist_get(args_sl, i), admit_foreign) == 0 { return 0 }
         i = i + 1
     }
     1
@@ -29241,13 +29241,23 @@ fn tc_is_plain_string_literal(node: Int) -> Bool {
 }
 
 fn tc_is_const_expr(e: Int) -> Int {
+    tc_is_const_expr_in(e, false)
+}
+
+// `admit_foreign` counts a foreign constant as const. Only the question "is this const but for
+// its foreign constants?" sets it, so that a help can name the foreign constant as the one
+// cause.
+fn tc_is_const_expr_in(e: Int, admit_foreign: Bool) -> Int {
     if e == -1 { return 0 }
     let k = node_kind(e)
     if k == NodeKind.IntLit { return 1 }
     if k == NodeKind.FloatLit { return 1 }
     if k == NodeKind.BoolLit { return 1 }
     if k == NodeKind.CharLit { return 1 }
-    if k == NodeKind.Ident { return tc_name_is_const_binding(node_name(e)) }
+    if k == NodeKind.Ident {
+        if tc_foreign_const_of(e) != -1 { return if admit_foreign { 1 } else { 0 } }
+        return tc_name_is_const_binding(node_name(e))
+    }
     // A call is outside the set unless it is building a variant. `Map()` is refused here and
     // not by a list of collection names: what rules it out is that it is a call at all.
     // The callee is the left child, not the node's own name, which a Call leaves empty.
@@ -29257,39 +29267,40 @@ fn tc_is_const_expr(e: Int) -> Int {
         let ck = node_kind(callee)
         if ck != NodeKind.Ident && ck != NodeKind.FieldAccess { return 0 }
         if tc_name_is_variant_ctor(node_name(callee)) == 0 { return 0 }
-        return tc_args_are_const(node_args(e))
+        return tc_args_are_const(node_args(e), admit_foreign)
     }
     // `Level.Info` is a payload-free variant, and `mod.NAME` is a const named through its
     // module. Both read as a field access, so anything that is not a variant is as const as
     // the base it reads from.
     if k == NodeKind.FieldAccess {
         if tc_name_is_variant_ctor(node_name(e)) != 0 { return 1 }
-        return tc_is_const_expr(node_obj(e))
+        if tc_foreign_const_of(e) != -1 { return if admit_foreign { 1 } else { 0 } }
+        return tc_is_const_expr_in(node_obj(e), admit_foreign)
     }
     // `Level.Info(1)` parses as a method call on the type, so a method name that is a variant
     // is construction and everything else is the method call §2.21 names.
     if k == NodeKind.MethodCall {
         if tc_name_is_variant_ctor(node_method(e)) == 0 { return 0 }
-        return tc_args_are_const(node_args(e))
+        return tc_args_are_const(node_args(e), admit_foreign)
     }
-    if k == NodeKind.UnaryOp { return tc_is_const_expr(node_left(e)) }
+    if k == NodeKind.UnaryOp { return tc_is_const_expr_in(node_left(e), admit_foreign) }
     if k == NodeKind.BinOp {
-        if tc_is_const_expr(node_left(e)) == 0 { return 0 }
-        return tc_is_const_expr(node_right(e))
+        if tc_is_const_expr_in(node_left(e), admit_foreign) == 0 { return 0 }
+        return tc_is_const_expr_in(node_right(e), admit_foreign)
     }
     if k == NodeKind.InterpString { return if tc_is_plain_string_literal(e) { 1 } else { 0 } }
     // §2.21 enumerates a closed set and is silent on these three. `#embed` is read by the
     // compiler and can be nothing else, and a bracket literal of const elements is written in
     // the tree today, so refusing either would refuse correct code the section never rules out.
     if k == NodeKind.EmbedExpr { return 1 }
-    if k == NodeKind.ListLit { return tc_args_are_const(node_elements(e)) }
-    if k == NodeKind.TupleLit { return tc_args_are_const(node_elements(e)) }
+    if k == NodeKind.ListLit { return tc_args_are_const(node_elements(e), admit_foreign) }
+    if k == NodeKind.TupleLit { return tc_args_are_const(node_elements(e), admit_foreign) }
     if k == NodeKind.StructLit {
         let flds = node_fields(e)
         if flds == -1 { return 1 }
         let mut i = 0
         while i < sublist_length(flds) {
-            if tc_is_const_expr(node_value(sublist_get(flds, i))) == 0 { return 0 }
+            if tc_is_const_expr_in(node_value(sublist_get(flds, i)), admit_foreign) == 0 { return 0 }
             i = i + 1
         }
         return 1
@@ -29305,9 +29316,175 @@ fn tc_check_const_decl(node: Int) ! Diag.Report {
     let v = node_value(node)
     if v == -1 { return }
     if tc_is_const_expr(v) != 0 { return }
+    let fc = tc_foreign_const_blocking_const(v)
+    if fc != -1 {
+        let nm = tc_foreign_const_spelling(fc)
+        diag_error_at("NonConstExpr", NON_CONST_EXPR, "`{nm}` is a foreign constant: the target's C headers set its value", fc,
+            "use `{nm}` in a function body, or in a module-level `let`")
+        return
+    }
     diag_error_at("NonConstExpr", NON_CONST_EXPR,
         "the value of const `{node_name(node)}` is not a compile-time constant", v,
         "const values are literals, arithmetic and boolean operators over them, other consts by name, struct literals with const fields, and enum variants; calls of any kind and `let` bindings are not")
+}
+
+// The foreign-constant declaration `e` names, or -1. `e` is a bare name or a name qualified by
+// a module, read in nr_current_module; a local binding that shadows the name is not one.
+fn tc_foreign_const_of(e: Int) -> Int {
+    if e == -1 { return -1 }
+    let k = node_kind(e)
+    let mut d = -1
+    if k == NodeKind.Ident {
+        let name = node_name(e)
+        if nr_has_binding(name) != 0 && nr_top_binding_is_global(name) == 0 { return -1 }
+        d = nr_resolve_bare_decl(name, nr_current_module)
+    } else if k == NodeKind.FieldAccess {
+        let obj = node_obj(e)
+        if obj == -1 || node_kind(obj) != NodeKind.Ident { return -1 }
+        let q = node_name(obj)
+        if nr_has_binding(q) != 0 { return -1 }
+        if nr_qualifier_module_here(q) == "" && !tc_qualifier_to_module.contains_key(q) { return -1 }
+        d = nr_resolve_qualified_decl(q, node_name(e))
+    } else {
+        return -1
+    }
+    if d == -1 || node_kind(d) != NodeKind.LetBinding { return -1 }
+    if get_annotation(d, "ffi") == -1 { return -1 }
+    d
+}
+
+// The name as the author wrote it: `SIGBUS`, or `process.SIGBUS`.
+fn tc_foreign_const_spelling(e: Int) -> Str {
+    if node_kind(e) == NodeKind.FieldAccess { return "{node_name(node_obj(e))}.{node_name(e)}" }
+    node_name(e)
+}
+
+// The first name in `e` that is a foreign constant, or -1. A closure body is run-time code,
+// so a foreign constant in it needs no value here and is not looked at.
+fn tc_first_foreign_const_in(e: Int) -> Int {
+    if e == -1 { return -1 }
+    let k = node_kind(e)
+    if k == NodeKind.Ident || k == NodeKind.FieldAccess {
+        if tc_foreign_const_of(e) != -1 { return e }
+        if k == NodeKind.FieldAccess { return tc_first_foreign_const_in(node_obj(e)) }
+        return -1
+    }
+    if k == NodeKind.UnaryOp { return tc_first_foreign_const_in(node_left(e)) }
+    if k == NodeKind.BinOp {
+        let l = tc_first_foreign_const_in(node_left(e))
+        if l != -1 { return l }
+        return tc_first_foreign_const_in(node_right(e))
+    }
+    if k == NodeKind.Call {
+        let c = tc_first_foreign_const_in(node_left(e))
+        if c != -1 { return c }
+        return tc_first_foreign_const_in_list(node_args(e))
+    }
+    if k == NodeKind.MethodCall {
+        let o = tc_first_foreign_const_in(node_obj(e))
+        if o != -1 { return o }
+        return tc_first_foreign_const_in_list(node_args(e))
+    }
+    if k == NodeKind.ListLit || k == NodeKind.TupleLit { return tc_first_foreign_const_in_list(node_elements(e)) }
+    if k == NodeKind.StructLit {
+        let flds = node_fields(e)
+        if flds == -1 { return -1 }
+        let mut i = 0
+        while i < sublist_length(flds) {
+            let f = tc_first_foreign_const_in(node_value(sublist_get(flds, i)))
+            if f != -1 { return f }
+            i = i + 1
+        }
+    }
+    -1
+}
+
+fn tc_first_foreign_const_in_list(sl: Int) -> Int {
+    if sl == -1 { return -1 }
+    let mut i = 0
+    while i < sublist_length(sl) {
+        let f = tc_first_foreign_const_in(sublist_get(sl, i))
+        if f != -1 { return f }
+        i = i + 1
+    }
+    -1
+}
+
+// The foreign constant that alone keeps `e` from being const, or -1 when `e` has none or is
+// not const for another reason too. Only then is the foreign constant the cause to name.
+fn tc_foreign_const_blocking_const(e: Int) -> Int {
+    let fc = tc_first_foreign_const_in(e)
+    if fc == -1 { return -1 }
+    if tc_is_const_expr_in(e, true) == 0 { return -1 }
+    fc
+}
+
+// §2.12.1: a module-level `let` is initialized statically, and a foreign constant is static
+// only as a bare leaf, because the compiler cannot fold an operator over a value the C headers
+// set. A literal and a variant construction hold leaves; an operator over a foreign constant
+// is NonInitExpr.
+fn tc_check_module_let_foreign_ops(l: Int, e: Int) ! Diag.Report {
+    if e == -1 { return }
+    let k = node_kind(e)
+    if k == NodeKind.UnaryOp || k == NodeKind.BinOp {
+        let fc = tc_first_foreign_const_in(e)
+        if fc == -1 { return }
+        diag_error_at("NonInitExpr", NON_INIT_EXPR,
+            "`{tc_foreign_const_spelling(fc)}` is a foreign constant: the target's C headers set its value, so an operator cannot fold it", fc,
+            "compute it in a fn: `{tc_module_let_as_fn(l)}`")
+        return
+    }
+    if k == NodeKind.ListLit || k == NodeKind.TupleLit {
+        tc_check_module_let_foreign_ops_list(l, node_elements(e))
+    } else if k == NodeKind.StructLit {
+        let flds = node_fields(e)
+        if flds == -1 { return }
+        let mut i = 0
+        while i < sublist_length(flds) {
+            tc_check_module_let_foreign_ops(l, node_value(sublist_get(flds, i)))
+            i = i + 1
+        }
+    } else if k == NodeKind.Call {
+        let callee = node_left(e)
+        if callee != -1 && tc_name_is_variant_ctor(node_name(callee)) != 0 { tc_check_module_let_foreign_ops_list(l, node_args(e)) }
+    } else if k == NodeKind.MethodCall {
+        if tc_name_is_variant_ctor(node_method(e)) != 0 { tc_check_module_let_foreign_ops_list(l, node_args(e)) }
+    }
+}
+
+fn tc_check_module_let_foreign_ops_list(l: Int, sl: Int) ! Diag.Report {
+    if sl == -1 { return }
+    let mut i = 0
+    while i < sublist_length(sl) {
+        tc_check_module_let_foreign_ops(l, sublist_get(sl, i))
+        i = i + 1
+    }
+}
+
+// `let WANT = A | B` written as the function the NonInitExpr help offers:
+// `fn want() -> Int { A | B }`.
+fn tc_module_let_as_fn(l: Int) -> Str {
+    let fname = node_name(l).to_lower()
+    let tid = tc_lookup_node_tid(l)
+    let ret = if tc_tid_is_no_info(tid) != 0 { "" } else { " -> {type_to_str(tid)}" }
+    let rhs = tc_module_let_rhs_source(l)
+    let body = if rhs == "" { "..." } else { rhs }
+    "fn {fname}(){ret} \{ {body} }"
+}
+
+// The source after the `=` of a one-line module-level `let`, or "".
+fn tc_module_let_rhs_source(l: Int) -> Str {
+    let text = diag_source_line(diag_file_for_node(l), node_line(l))
+    let at = node_binder_col(l) - 1
+    if at < 0 || at > text.byte_len() { return "" }
+    let rest = text.byte_slice(at, text.byte_len())
+    match rest.byte_index_of("=", 0) {
+        Some(i) => {
+            let rhs = rest.byte_slice(i + 1, rest.byte_len()).trim()
+            if rhs.byte_len() == 0 { "" } else { rhs }
+        }
+        None => ""
+    }
 }
 
 // A foreign constant has one form (§9.1): the front end sees its type and never its value,
@@ -29368,9 +29545,20 @@ fn tc_check_param_defaults(fn_node: Int) ! Diag.Report {
                     "`{nm}` is a positional parameter and cannot carry a default value", pn,
                     "move it after the `--` separator, which also makes it keyword-required")
             } else if tc_is_const_expr(dflt) == 0 {
-                diag_error_at("NonConstParamDefault", NON_CONST_PARAM_DEFAULT,
-                    "the default for `{nm}` is not a const expression", dflt,
-                    "use a literal, a `const` binding, or arithmetic over those")
+                // A keyword default is filled at each call, so a foreign constant's bare name
+                // there needs no value now (§9.1). Anything built over one does.
+                let fc = tc_foreign_const_blocking_const(dflt)
+                if fc != -1 && fc != dflt {
+                    let fcn = tc_foreign_const_spelling(fc)
+                    let ty = if node_type_name(pn) == "" { "" } else { ": {node_type_name(pn)}" }
+                    diag_error_at("NonConstExpr", NON_CONST_EXPR,
+                        "only the bare name of a foreign constant is allowed in a keyword default", fc,
+                        "`{fcn}` is a foreign constant: the target's C headers set its value. Write `{nm}{ty} = {fcn}`, and compute the rest in the body")
+                } else if fc == -1 {
+                    diag_error_at("NonConstParamDefault", NON_CONST_PARAM_DEFAULT,
+                        "the default for `{nm}` is not a const expression", dflt,
+                        "use a literal, a `const` binding, or arithmetic over those")
+                }
             }
         }
         i = i + 1
@@ -31201,6 +31389,19 @@ fn tc_check_int_pattern_range(pat: Int, hint: Int) ! Diag.Report {
     if node_kind(pat) == NodeKind.RangePattern { tc_check_int_pattern_bound(pat, node_int_val(pat), node_name(pat), t) }
 }
 
+// A range bound is read at type check to check the arms (§3.2), and a foreign constant has no
+// value until the C compiler of the target reads its header. A guard reads it at run time.
+fn tc_check_range_bound_foreign(pat: Int) ! Diag.Report {
+    let hi = node_name(pat)
+    if hi == "" || nr_has_binding(hi) != 0 && nr_top_binding_is_global(hi) == 0 { return }
+    let d = nr_resolve_bare_decl(hi, nr_current_module)
+    if d == -1 || node_kind(d) != NodeKind.LetBinding || get_annotation(d, "ffi") == -1 { return }
+    let col = node_int_val(pat)
+    let op = if node_inclusive(pat) != 0 { "<=" } else { "<" }
+    diag_error_span_at_notes("RangeBoundNotConst", RANGE_BOUND_NOT_CONST, "`{hi}` is a foreign constant: the target's C headers set its value", pat,
+        node_line(pat), col, col + hi.byte_len(), "use a guard: `n if n >= {node_str_val(pat)} && n {op} {hi}`", [])
+}
+
 // One bound of `pat`, spelled `b`, at column `col` of the pattern's line.
 fn tc_check_int_pattern_bound(pat: Int, col: Int, b: Str, t: Int) ! Diag.Report {
     if !tc_is_decimal_digits(b) { return }
@@ -32621,6 +32822,7 @@ fn tc_check_pattern_types(node: Int, subject: Str, poisoned: Bool, refutable: Bo
     // one of them for its type found no answer at all.
     if tc_pattern_binding_type >= 0 { tc_publish_node_tid(node, tc_pattern_binding_type) }
     if kind == NodeKind.IntPattern || kind == NodeKind.RangePattern { tc_check_int_pattern_range(node, tc_pattern_binding_type) }
+    if kind == NodeKind.RangePattern { tc_check_range_bound_foreign(node) }
     // An uppercase name in a refutable pattern is a variant: it is judged below like `Red(x)`.
     // A nullary variant (`None`) and `_` bind nothing, but they still MATCH a value, so they
     // keep the tid published above; only the scope entry is conditional.
@@ -33329,6 +33531,7 @@ fn tc_infer_global_initializers(lets_sl: Int) ! TypeCheck.Resolve, TypeCheck.Rep
         // Here and not in the first pass: the first pass has not registered the function
         // names yet, so a name this check asks about could not be told apart from an
         // undefined one.
+        nr_current_module = node_module(l)
         tc_check_const_decl(l)
         tc_check_foreign_const_decl(l)
         let l_val = node_value(l)
@@ -33352,6 +33555,7 @@ fn tc_infer_global_initializers(lets_sl: Int) ! TypeCheck.Resolve, TypeCheck.Rep
                     }
                 }
             }
+            if node_is_const(l) == 0 && get_annotation(l, "ffi") == -1 { tc_check_module_let_foreign_ops(l, l_val) }
         }
         i = i + 1
     }
@@ -34544,6 +34748,7 @@ fn tc_stamp_type_field_defaults(td: Int, seen: List[Int]) ! TypeCheck.Resolve, T
         if node_kind(f) == NodeKind.TypeField {
             let dflt = node_condition(f)
             if dflt != -1 {
+                tc_check_field_default_foreign(td, f, dflt, get_struct_field_tid(struct_tid, node_name(f)))
                 tc_stamp_field_default(dflt, get_struct_field_tid(struct_tid, node_name(f)))
                 // The surrounding walk recovers the default's nodes BEFORE it reaches this
                 // declaration, so a node that reads its type from a child — a closure body's
@@ -34562,6 +34767,35 @@ fn tc_stamp_type_field_defaults(td: Int, seen: List[Int]) ! TypeCheck.Resolve, T
     tc_boundary_check_active = saved_boundary
     nr_current_module = saved_module
     tc_pop_tparam_scope(tparams)
+}
+
+// §2.21: a field default is const, because a `const` struct literal that leaves the field out
+// takes it. A foreign constant has no value at type check, so it cannot be one; a keyword
+// default on a constructor fn can, since a call fills it.
+fn tc_check_field_default_foreign(td: Int, f: Int, dflt: Int, field_tid: Int) ! Diag.Report {
+    let fc = tc_first_foreign_const_in(dflt)
+    if fc == -1 { return }
+    let tname = node_name(td)
+    let fname = node_name(f)
+    let fty = type_to_str(field_tid)
+    let fcn = tc_foreign_const_spelling(fc)
+    diag_error_at("NonConstExpr", NON_CONST_EXPR,
+        "a field default must be const, because `const X = {tname} \{}` fills it. `{fcn}` is a foreign constant (the target's C headers set it)", fc,
+        "use a keyword default on a constructor fn: `fn {tc_snake_case(tname)}(-- {fname}: {fty} = {fcn}) -> {tname}`, or make the field `Option[{fty}]`")
+}
+
+// `KillOpts` -> `kill_opts`.
+fn tc_snake_case(name: Str) -> Str {
+    let mut out = ""
+    let mut i = 0
+    while i < name.byte_len() {
+        let c = name.byte_slice(i, i + 1)
+        let lower = c.to_lower()
+        if lower != c && i > 0 { out = out.concat("_") }
+        out = out.concat(lower)
+        i = i + 1
+    }
+    out
 }
 
 // The default's value against the field's declared type: the same pair of walks a let
