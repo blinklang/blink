@@ -3972,6 +3972,17 @@ fn tc_head_constructible_struct(stid: Int) -> Int {
     1
 }
 
+// Whether the struct `stid` that the head `sname` names is in the module's scope: declared
+// there, or bound by one of its import entries (an alias among them). A prelude struct is in
+// every module's scope. A struct that only some other module of the program can see is not.
+fn tc_struct_head_in_scope(sname: Str, stid: Int) -> Bool {
+    if tc_type_declared_in_scope(sname) != 0 { return true }
+    let cur = nr_current_module
+    if cur != "" && nr_resolve_imported_decl(sname, cur) != -1 { return true }
+    let decl = tc_tid_decl_node(stid)
+    decl >= 0 && tc_prelude_modules.contains_key(node_module(decl))
+}
+
 // Takes the head's tid beside its spelling, because the spelling alone cannot say whether the
 // head is a handle: a rename introduces a name no declaration carries, and the literal was
 // accepted, minting a handle outside the FFI boundary. A builtin head has no tid, so -1 says
@@ -8736,6 +8747,15 @@ fn tc_report_declared_mismatch(msg: Str, at: Int, val: Int, declared: Int, got: 
 // qualified variant the site likely meant. "" when the hint's enum has no variant of the name.
 fn tc_hidden_variant_help(val: Int, declared: Int) -> Str {
     if val < 0 { return "" }
+    // A struct literal hides the variant the same way: its head reads the type namespace.
+    if node_kind(val) == NodeKind.StructLit {
+        let head = node_type_name(val)
+        if head == "" || head.contains(".") { return "" }
+        return match tc_bare_variant_from_type(head, None, declared) {
+            BareVariantPick.Declared(_, var_idx) => "write `{node_name(evar_pool.get(var_idx).unwrap().enum_decl)}.{head} \{ ... }` for the variant"
+            _ => ""
+        }
+    }
     let named = if node_kind(val) == NodeKind.Call { node_left(val) } else { val }
     if named < 0 || node_kind(named) != NodeKind.Ident { return "" }
     let name = node_name(named)
@@ -25113,8 +25133,16 @@ fn tc_infer_struct_lit_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Rep
                 }
             }
             None => {
-                // 1) hint FIRST (monotonicity: a distant enum decl must never retroactively
-                //    rebind a locally-determined site).
+                // 0) A struct the module declares or imports is the literal, whatever the hint
+                //    names (sections/03_types.md §3.4). The hint's enum may come from another
+                //    package, where a variant of the same name is legal (E0518 reach).
+                let in_scope_tid = lookup_named_type(sname)
+                if in_scope_tid != -1 && tc_head_constructible_struct(in_scope_tid) != 0 && tc_struct_head_in_scope(sname, in_scope_tid) {
+                    check_deprecated_type(sname, node)
+                    return tc_struct_lit_instance_tid(in_scope_tid, node)
+                }
+                // 1) hint before the program-wide search (monotonicity: a distant enum decl
+                //    must never retroactively rebind a locally-determined site).
                 let site_t = tc_bare_variant_site_type(sname, node, None)
                 match tc_bare_variant_from_type(sname, None, site_t) {
                     BareVariantPick.Declared(_, hint_var_idx) => {

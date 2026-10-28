@@ -1,0 +1,107 @@
+// `Name { ... }` reads the type namespace: it is a struct literal when a struct of that name
+// is declared in the module or bound by one of its import entries, and an expected type
+// never changes that (sections/03_types.md §3.4). A struct that the module neither declares
+// nor imports is not in scope there, even when another module of the program declares it.
+
+import compile_test_helpers
+
+fn cleanup(base: Str) {
+    let _ = process.run("rm", ["-rf", base]).unwrap()
+}
+
+fn fail(base: Str, msg: Str) {
+    io.println("FAIL: {msg}")
+    cleanup(base)
+    assert(false)
+}
+
+fn stage(base: Str) {
+    cleanup(base)
+    let _ = process.run("mkdir", ["-p", "{base}/geo/src", "{base}/app/src"]).unwrap()
+    write_file("{base}/geo/blink.toml", "[package]\nname = \"geo\"\nversion = \"0.1.0\"\n")
+    write_file("{base}/geo/src/geo.bl", "pub type Shape \{ Point \{ x: Int \}, Empty \}\npub type Pt \{ x: Int \}\npub fn describe(s: Shape) -> Str \{\n    match s \{\n        Shape.Point \{ x \} => \"shape point \{x\}\"\n        Shape.Empty => \"empty\"\n    \}\n\}\n")
+    write_file("{base}/app/blink.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[dependencies]\ngeo = \{ path = \"../geo\" \}\n")
+}
+
+fn blink_bin() -> Str {
+    let blink_root = process.run("sh", ["-c", "pwd -P"]).unwrap().out.trim_right()
+    "{blink_root}/build/blink"
+}
+
+test "a struct in the module is the literal, with or without an enum variant hint" {
+    let blink = blink_bin()
+    let base = "{compile_test_helpers.scratch_root()}/_test_struct_literal_head_in_scope_run"
+    stage(base)
+    write_file("{base}/app/src/main.bl", #"import geo
+import geo.{Shape, Pt}
+import geo.{Pt as GeoPt}
+
+type Point { x: Int }
+
+fn main() {
+    let p = Point { x: 1 }
+    let q = Pt { x: 2 }
+    let r = GeoPt { x: 3 }
+    let s: Shape = Shape.Point { x: 4 }
+    io.println("struct {p.x} {q.x} {r.x} {geo.describe(s)}")
+}
+"#)
+    let run = process.run("sh", ["-c", "cd {base}/app && {blink} run src/main.bl 2>&1"]).unwrap()
+    if !run.success() {
+        fail(base, "the program did not run ({run.end}): {run.out}")
+        return
+    }
+    if !run.out.contains("struct 1 2 3 shape point 4") {
+        fail(base, "expected `struct 1 2 3 shape point 4`, got: {run.out}")
+        return
+    }
+    cleanup(base)
+}
+
+test "a hint that names an enum does not turn a struct literal into its variant" {
+    let blink = blink_bin()
+    let base = "{compile_test_helpers.scratch_root()}/_test_struct_literal_head_in_scope_hint"
+    stage(base)
+    write_file("{base}/app/src/main.bl", #"import geo.{Shape}
+
+type Point { x: Int }
+
+fn main() {
+    let s: Shape = Point { x: 1 }
+    let _ = s
+}
+"#)
+    let chk = process.run("sh", ["-c", "cd {base}/app && {blink} check src/main.bl 2>&1"]).unwrap()
+    if chk.success() {
+        fail(base, "`let s: Shape = Point \{ x: 1 \}` with a struct Point in the module checked clean")
+        return
+    }
+    if !chk.out.contains("TypeError") || !chk.out.contains("write `Shape.Point \{ ... \}` for the variant") {
+        fail(base, "expected a TypeError whose help names `Shape.Point \{ ... \}`, got: {chk.out}")
+        return
+    }
+    cleanup(base)
+}
+
+test "a struct the module does not import is not a struct literal head there" {
+    let blink = blink_bin()
+    let base = "{compile_test_helpers.scratch_root()}/_test_struct_literal_head_in_scope_unimported"
+    stage(base)
+    write_file("{base}/app/src/main.bl", #"import geo
+
+fn main() {
+    let q = Pt { x: 2 }
+    io.println("{q.x}")
+}
+"#)
+    let chk = process.run("sh", ["-c", "cd {base}/app && {blink} check src/main.bl 2>&1"]).unwrap()
+    if chk.success() {
+        fail(base, "`Pt \{ x: 2 \}` checked clean in a module that imports only the qualifier `geo`")
+        return
+    }
+    if !chk.out.contains("Pt") {
+        fail(base, "expected an error naming `Pt`, got: {chk.out}")
+        return
+    }
+    cleanup(base)
+}
