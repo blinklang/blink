@@ -50,7 +50,7 @@ import compiler.{
 }
 import cg.{Codegen, CgConfig, HeaderPreamble, ProgramFacts, generate, generate_archive_header, generate_types_header, generate_module_headers_from, generate_module_headers_with, header_preamble, generate_module_object_with, generate_module_chunks_with, program_facts, enumerate_program_modules, archive_unit_modules, module_instance_names, entry_unit_facts}
 import build_unit_headers.{HeaderIndex, index_headers, unit_declarations, splice_declarations}
-import cname.{c_module_header_name, c_module_private_header_name, c_program_types_header_name}
+import cname.{c_ffi_symbol, c_module_header_name, c_module_private_header_name, c_program_types_header_name}
 import ir.{ir_track_sources, ir_sources_read}
 import build_compiler_archive.{build_compiler_archive, compiler_archive_env, compiler_archive_link_args, compiler_archive_of_unit, compiler_archive_skip_keys}
 import build_stdlib.{build_stdlib_archive, build_stdlib_archive_in, list_stdlib_module_keys, resolve_runtime_h, stdlib_rebuild_forced}
@@ -68,7 +68,7 @@ import formatter.{Format, format}
 import escape.{ffi_scope_resource_name}
 import check_pipeline.{check_source, run_build_analyses, check_exit_code, check_status_line}
 import fix_edits.{FixEdit, fix_plan, fix_apply, fix_byte_offset}
-import foreign_const_probe.{ForeignConst, foreign_consts_in, probe_of, probe_verdicts, report_verdicts, triple_of_machine}
+import foreign_const_probe.{ForeignConst, foreign_const_header, foreign_consts_in, probe_of, probe_verdicts, report_verdicts, triple_of_machine}
 import symbol_index.{collect_effects}
 import query.{query_index_source, query_answer}
 import diagnostics.{
@@ -3681,13 +3681,57 @@ fn walk_ffi_audit(node: Int, file: Str, in_region: Int, fn_name: Str, ptr_env: M
     }
 }
 
+// A foreign constant, as the audit lists it: a value a header gives, not a symbol the
+// program links, so it has no lib, no effect row and no audit status (§9.1).
+type HeaderValue {
+    name: Str
+    c_name: Str
+    header: Str
+    file: Str
+    line: Int
+}
+
+fn collect_header_values(program: Int) -> List[HeaderValue] {
+    let mut out: List[HeaderValue] = []
+    let lets_sl = node_stmts(program)
+    if lets_sl == -1 { return out }
+    let mut i = 0
+    while i < sublist_length(lets_sl) {
+        let d = sublist_get(lets_sl, i)
+        i = i + 1
+        let header = foreign_const_header(d)
+        if header == "" { continue }
+        out.push(HeaderValue { name: node_name(d), c_name: c_ffi_symbol(d), header: header, file: diag_file_for_node(d), line: node_line(d) })
+    }
+    out
+}
+
+fn header_values_json(hv: List[HeaderValue]) -> Str {
+    let mut parts: List[Str] = []
+    for v in hv {
+        parts.push("\{\"name\":\"{v.name}\",\"c_name\":\"{json_escape(v.c_name)}\",\"header\":\"{json_escape(v.header)}\",\"file\":\"{json_escape(v.file)}\",\"line\":{v.line}}")
+    }
+    "\"header_values\":[{parts.join(",")}]"
+}
+
+fn print_header_values(hv: List[HeaderValue]) {
+    io.println("header values")
+    io.println("=============")
+    for v in hv {
+        io.println("  {v.name}: {v.c_name} from <{v.header}>  {v.file}:{v.line}")
+    }
+}
+
 fn do_ffi_audit(program: Int, json_output: Int) {
+    let hv = collect_header_values(program)
     let fns_sl = node_params(program)
     if fns_sl == -1 {
         if json_output != 0 {
-            io.println("\{\"ffi_functions\":[],\"bytes_bridge\":\{\"byte-pin\":[]},\"summary\":\{\"total\":0,\"audited\":0,\"unaudited\":0,\"ptr_params\":0,\"ptr_returns\":0,\"byte_pin\":0,\"opaque_handle\":0}}")
-        } else {
+            io.println("\{\"ffi_functions\":[],{header_values_json(hv)},\"bytes_bridge\":\{\"byte-pin\":[]},\"summary\":\{\"total\":0,\"audited\":0,\"unaudited\":0,\"ptr_params\":0,\"ptr_returns\":0,\"byte_pin\":0,\"opaque_handle\":0}}")
+        } else if hv.is_empty() {
             io.println("No FFI functions found.")
+        } else {
+            print_header_values(hv)
         }
         return
     }
@@ -3964,7 +4008,7 @@ fn do_ffi_audit(program: Int, json_output: Int) {
             out = out.concat(",\"file\":\"{file}\",\"line\":{line}}")
             k = k + 1
         }
-        out = out.concat("],\"bytes_bridge\":\{\"byte-pin\":[")
+        out = out.concat("],{header_values_json(hv)},\"bytes_bridge\":\{\"byte-pin\":[")
         let mut bpj = 0
         while bpj < byte_pin_lines.len() {
             if bpj > 0 {
@@ -3993,7 +4037,11 @@ fn do_ffi_audit(program: Int, json_output: Int) {
         io.println(out)
     } else {
         if total == 0 {
-            io.println("No FFI functions found.")
+            if hv.is_empty() {
+                io.println("No FFI functions found.")
+            } else {
+                print_header_values(hv)
+            }
             return
         }
         io.println("FFI Audit Report")
@@ -4053,6 +4101,10 @@ fn do_ffi_audit(program: Int, json_output: Int) {
                 io.println("  {occ.direction}: {occ.fname} ({slot}: {occ.handle})  {occ.file}:{occ.line}")
                 och = och + 1
             }
+        }
+        if !hv.is_empty() {
+            io.println("")
+            print_header_values(hv)
         }
     }
 }

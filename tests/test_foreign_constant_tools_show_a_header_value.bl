@@ -1,0 +1,72 @@
+// The tools treat a foreign constant as a value from a header, not as a linked symbol (§9.1,
+// "What tools show"): `blink audit` lists it under header values and never as an FFI
+// function, and `blink doc` and hover name the C name and header. No tool shows the value:
+// that needs the build target's C compiler.
+import compile_test_helpers.{audit_ffi_via_cli, scratch_root}
+import std.process.{ProcessResult, ChildEnd}
+
+let SRC = "@ffi(\"SIGBUS\", header: \"signal.h\")\npub let SIGBUS: Int\n\n@ffi(\"EINVAL\", header: \"errno.h\")\npub let BAD_ARG: I32\n\nfn main() \{\n    let s = SIGBUS\n    io.println(\"\{s} \{BAD_ARG}\")\n}\n"
+
+test "blink audit --json lists a foreign constant as a header value" {
+    let out = audit_ffi_via_cli(SRC, "fc_tools_json", 1)
+    assert(out.contains("\"header_values\":["), "got: {out}")
+    assert(out.contains("\{\"name\":\"SIGBUS\",\"c_name\":\"SIGBUS\",\"header\":\"signal.h\","), "got: {out}")
+    assert(out.contains("\{\"name\":\"BAD_ARG\",\"c_name\":\"EINVAL\",\"header\":\"errno.h\","), "got: {out}")
+    assert(!out.contains("\"name\":\"SIGBUS\",\"lib\""), "not an FFI function, got: {out}")
+    assert(!out.contains("\"name\":\"BAD_ARG\",\"lib\""), "not an FFI function, got: {out}")
+}
+
+test "blink audit lists a foreign constant under header values" {
+    let out = audit_ffi_via_cli(SRC, "fc_tools_text", 0)
+    assert(out.contains("header values\n============="), "got: {out}")
+    assert(out.contains("  SIGBUS: SIGBUS from <signal.h>"), "got: {out}")
+    assert(out.contains("  BAD_ARG: EINVAL from <errno.h>"), "got: {out}")
+    assert(!out.contains("  SIGBUS ["), "not an FFI function, got: {out}")
+}
+
+fn sh(cmd: Str) -> ProcessResult {
+    process.run("sh", ["-c", cmd]).unwrap()
+}
+
+test "blink doc names the C name and header, not a value" {
+    let dir = sh("mktemp -d /tmp/blink_doc_fc.XXXXXX").out.trim()
+    let _ = sh("mkdir -p {dir}/src")
+    write_file("{dir}/src/sigs.bl", "@ffi(\"SIGBUS\", header: \"signal.h\")\npub let SIGBUS: Int\n")
+    let r = sh("B=$(pwd)/build/blink; cd {dir} && timeout 120 $B doc sigs")
+    let _ = sh("rm -rf {dir}")
+    assert_eq(r.end, ChildEnd.Exited(0))
+    assert(r.out.contains("    let SIGBUS: Int\n        // foreign constant: SIGBUS from <signal.h>\n"), "got: {r.out}{r.err_out}")
+}
+
+test "blink doc --json names the C name and header, not a value" {
+    let dir = sh("mktemp -d /tmp/blink_doc_fc.XXXXXX").out.trim()
+    let _ = sh("mkdir -p {dir}/src")
+    write_file("{dir}/src/sigs.bl", "@ffi(\"SIGBUS\", header: \"signal.h\")\npub let SIGBUS: Int\n")
+    let r = sh("B=$(pwd)/build/blink; cd {dir} && timeout 120 $B doc --json sigs")
+    let _ = sh("rm -rf {dir}")
+    assert_eq(r.end, ChildEnd.Exited(0))
+    assert(r.out.contains("\{\"name\":\"SIGBUS\",\"type\":\"Int\",\"c_name\":\"SIGBUS\",\"header\":\"signal.h\"\}"), "got: {r.out}{r.err_out}")
+    assert(!r.out.contains("\"value\""), "got: {r.out}")
+}
+
+fn lsp_msg(body: Str) -> Str {
+    "Content-Length: {body.byte_len()}\r\n\r\n{body}"
+}
+
+test "hover on a foreign constant names the C name and header" {
+    let path = "{scratch_root()}/fc_tools_hover.bl"
+    write_file(path, SRC)
+    let input = [
+        lsp_msg("\{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":\{\"capabilities\":\{\}\}\}"),
+        lsp_msg("\{\"jsonrpc\":\"2.0\",\"method\":\"initialized\",\"params\":\{\}\}"),
+        lsp_msg("\{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":\{\"textDocument\":\{\"uri\":\"file://{path}\",\"languageId\":\"blink\",\"version\":1,\"text\":\"\"\}\}\}"),
+        lsp_msg("\{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"textDocument/hover\",\"params\":\{\"textDocument\":\{\"uri\":\"file://{path}\"\},\"position\":\{\"line\":7,\"character\":13\}\}\}"),
+        lsp_msg("\{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"shutdown\",\"params\":null\}"),
+        lsp_msg("\{\"jsonrpc\":\"2.0\",\"method\":\"exit\",\"params\":\{\}\}"),
+    ].join("")
+    write_file("{scratch_root()}/fc_tools_hover.in", input)
+    let r = sh("timeout 5 build/blink lsp < {scratch_root()}/fc_tools_hover.in")
+    assert(r.out.contains("\"id\":3"), "got: {r.out}")
+    assert(r.out.contains("let SIGBUS: Int"), "got: {r.out}")
+    assert(r.out.contains("foreign constant: `SIGBUS` from `<signal.h>`"), "got: {r.out}")
+}
