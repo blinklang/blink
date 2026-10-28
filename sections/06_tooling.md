@@ -1104,7 +1104,9 @@ with capture_log(logs), capture_print(prints) {
 }
 ```
 
-`capture_print` follows the same pattern and is also provided by `std.testing`. Users can write custom capture handlers for any effect using the standard handler syntax (see §4.7).
+`capture_print` follows the same pattern and is also provided by `std.testing`.
+
+**`capture_eprint` handles only `IO.Eprint`.** Its type is `fn capture_eprint(messages: List[Str]) -> Handler[IO.Eprint]`. It appends the text of each `io.eprintln`, `io.eprint` and `io.eprint_raw` call, with no newline. It sees no text from `io.log`, and `capture_log` sees no text from `io.eprintln`. A panic message does not land in its list, because a panic is a runtime write and not an `IO.Eprint` operation (§4.4). Users can write custom capture handlers for any effect using the standard handler syntax (see §4.7). Users can write custom capture handlers for any effect using the standard handler syntax (see §4.7).
 
 **Standard input: `stdin_from`.** `std.testing` also gives a handler that supplies standard input:
 

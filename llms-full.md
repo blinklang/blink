@@ -516,8 +516,8 @@ The `tcp_*` functions are not builtins. They live in `std.net`: `import std.net`
 // IO (effect: IO)
 io.println("text")              // print + newline to stdout
 io.print("text")                // print without newline
-io.eprintln("error")            // print to stderr + newline
-io.eprint("error")              // print to stderr, no newline
+io.eprintln("error")            // print to stderr + newline (effect IO.Eprint; `! IO` grants it)
+io.eprint("error")              // print to stderr, no newline (IO.Eprint)
 io.log("debug info")            // stderr with [LOG] prefix
 io.read_line()                  // -> Option[Str]: next stdin line without \n or \r\n; Some("") blank, None at end
 io.read_all()                   // -> Str: the rest of stdin
@@ -525,7 +525,7 @@ io.read_bytes(n)                // -> Bytes: exactly n bytes, fewer only at end 
 io.write(s)                     // write string to stdout (no newline)
 io.write_bytes(b)               // write Bytes to stdout
 io.print_raw("text")            // raw printf (bypasses vtable)
-io.eprint_raw("error")          // raw fprintf stderr (bypasses vtable)
+io.eprint_raw("error")          // stderr, no newline, flushed (IO.Eprint op: rowed, handler-dispatched)
 
 // Filesystem (effect: FS) — the signed surface returns Result[T, FsError];
 // `import std.fs` to name FsError/FsOp in a caller that handles the error.
@@ -1423,7 +1423,7 @@ show(42)          // "42"
 | `std.path` | Path utilities: `path_join(a, b)`, `path_dirname(path)`, `path_basename(path)`, `path_parent(path)` (POSIX `dirname(1)` semantics — strips trailing slashes before walking up) | `import std.path` |
 | `std.process` | Process spawning: `spawn(cmd, args) -> Pid`, `Pid.wait() -> ProcessResult`, `Pid.kill(sig)` (0 means `SIGKILL`), `Pid.send_signal(sig)`. `ProcessResult.end: ChildEnd`, `ProcessResult.success() -> Bool`, `ChildEnd`, `LimitKind`, `signal_name(n)`. Signal constants (foreign constants: the target's C headers set each number): `SIGHUP`, `SIGINT`, `SIGQUIT`, `SIGABRT`, `SIGBUS`, `SIGKILL`, `SIGSEGV`, `SIGTERM`, `SIGXCPU` | `import std.process` |
 | `std.semver` | Semantic version parsing and constraints | `import std.semver` |
-| `std.testing` | Test helpers: `capture_log`, `capture_print`, `capture_eprint` (handler factories that intercept IO for assertions); `assert_close(a, b, tol)`, `assert_close_rel(a, b, rel)` (float assertions, panic on NaN / negative tol); `for_each[T](cases: List[(Str, T)], body: fn(T))` (table-driven test helper); `skip(reason: Str)` (skip a test from its body; rejected outside tests as `E0827`); `cleanup(fn: fn())` (register a teardown to run at end of test) | `import std.testing` |
+| `std.testing` | Test helpers: `capture_log`, `capture_print`, `capture_eprint` (handler factories that intercept IO for assertions; `capture_eprint` has type `Handler[IO.Eprint]`, and a panic message does not land in its list); `assert_close(a, b, tol)`, `assert_close_rel(a, b, rel)` (float assertions, panic on NaN / negative tol); `for_each[T](cases: List[(Str, T)], body: fn(T))` (table-driven test helper); `skip(reason: Str)` (skip a test from its body; rejected outside tests as `E0827`); `cleanup(fn: fn())` (register a teardown to run at end of test) | `import std.testing` |
 | `std.term` | Terminal styling and control: ANSI colors (`red`, `green`, `blue`, etc.), text styles (`bold`, `dim`, `italic`, `underline`, `strikethrough`), background colors, TTY detection (`is_tty`, `terminal_width`, `terminal_height`), cursor control (`move_up`, `clear_screen`, `hide_cursor`, etc.) | `import std.term` |
 | `std.toml` | TOML parser. `toml_parse_doc(s)` returns a `TomlDoc`: each entry's path segments (`TomlSeg`), value and spans (`TomlEntry`), and each header (`TomlHeader`) | `import std.toml` |
 

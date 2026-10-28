@@ -143,6 +143,7 @@ effect DB {
 
 effect IO {
     effect Print      // stdout
+    effect Eprint     // stderr, except io.log
     effect Log        // structured logging subsystem
     @handle_all
     effect Read       // read standard input (operations in §4.4.9)
@@ -371,15 +372,15 @@ fn example() ! IO.Print, FS.Read, DB.Read, Net.Connect, Crypto.Hash {
 | `io.read_line()` | — | next stdin line, `None` at end of input (§4.4.9) | Yes (`IO.Read`) | Yes | Yes |
 | `io.read_all()` | — | all stdin that is left (§4.4.9) | Yes (`IO.Read`) | Yes | Yes |
 | `io.read_bytes(n)` | `Int` | exactly `n` stdin bytes, fewer only at end of input (§4.4.9) | Yes (`IO.Read`) | Yes | Yes |
-| `io.eprintln(x)` | `T: Display` | stderr, with newline | No | No | Yes |
-| `io.eprint(x)` | `T: Display` | stderr, no newline | No | No | Yes |
+| `io.eprintln(x)` | `T: Display` | stderr, with newline | Yes (`IO.Eprint`) | Yes | Yes |
+| `io.eprint(x)` | `T: Display` | stderr, no newline | Yes (`IO.Eprint`) | Yes | Yes |
 | `io.print_raw(s)` | `Str` | raw stdout, no newline | Yes (`IO.Print`) | Yes | Yes |
-| `io.eprint_raw(s)` | `Str` | raw stderr, no newline | No | No | Yes |
+| `io.eprint_raw(s)` | `Str` | raw stderr, no newline | Yes (`IO.Eprint`) | Yes | Yes |
 | `io.print_raw_bytes(b)` | `Bytes` | raw stdout, the bytes as they are | Yes (`IO.Print`) | Yes | Yes |
 
-`io.print_raw` and `io.print_raw_bytes` are operations of `IO.Print`. The innermost `IO.Print` handler receives them, a handler can intercept them, and they emit trace records. `io.eprint_raw` has the same dispatch as `io.eprint`. Use the `_raw` operations when you need exact output with no newline added and an immediate flush (for example, streaming JSON fragments or progress indicators). Prefer `io.print`/`io.println` for application code; reserve `_raw` for low-level tooling.
+`io.print_raw` and `io.print_raw_bytes` are operations of `IO.Print`. The innermost `IO.Print` handler receives them, a handler can intercept them, and they emit trace records. `io.eprint_raw` is an operation of `IO.Eprint`, as `io.print_raw` is an operation of `IO.Print`. Use the `_raw` operations when you need exact output with no newline added and an immediate flush (for example, streaming JSON fragments or progress indicators). Prefer `io.print`/`io.println` for application code; reserve `_raw` for low-level tooling.
 
-**`_raw` writes.** The default (root) `IO.Print` handler keeps the byte contract of the `_raw` operations: it writes every byte of the argument, and it flushes them before the operation returns. `io.print_raw_bytes(b)` writes NUL bytes and bytes that are not UTF-8 as they are, for binary output such as an image or a protocol frame. Under the default `IO.Print` handler, output from `io.print`, `io.println` and the stdout `_raw` operations appears on stdout in call order. A handler that intercepts these operations decides where its output goes, so the byte contract and the order rule do not apply to it.
+**`_raw` writes.** The default (root) `IO.Print` handler keeps the byte contract of the `_raw` operations: it writes every byte of the argument, and it flushes them before the operation returns. The default `IO.Eprint` handler keeps the same contract for `io.eprint_raw`. `io.print_raw_bytes(b)` writes NUL bytes and bytes that are not UTF-8 as they are, for binary output such as an image or a protocol frame. Under the default `IO.Print` handler, output from `io.print`, `io.println` and the stdout `_raw` operations appears on stdout in call order. A handler that intercepts these operations decides where its output goes, so the byte contract and the order rule do not apply to it.
 
 A handler that omits `print_raw_bytes` forwards the call to the enclosing handler (§4.7.1 *Completeness and auto-delegation*). `IO.Print` is not marked `@handle_all`, so the omission gives no `PartialHandler` warning (W0545). A handler that omits `print_raw` runs the default body, which calls `print_no_nl`, so the handler receives the text as a `print_no_nl` call. The default handler implements both `_raw` operations itself, so it keeps the byte contract.
 
@@ -392,7 +393,7 @@ fn progress(done: Int, total: Int) ! IO.Print {
 }
 ```
 
-**Argument types.** Each non-`_raw` operation takes any `Display` value, as `sb.write` and `"{x}"` do (§3.6 *Display Format Protocol*). So `io.println(42)`, `io.println(p)` and `io.println("n = {n}")` all compile, and a value with no `Display` impl is `error[E0523]` at the argument. `io.print_raw` and `io.eprint_raw` take `Str` only, and `io.print_raw_bytes` takes `Bytes`. The split follows the `_raw` name, not the dispatch mode: `io.eprint` is not interceptable and still takes `Display`. A non-`Str` argument to a `_raw` operation is a type mismatch:
+**Argument types.** Each non-`_raw` operation takes any `Display` value, as `sb.write` and `"{x}"` do (§3.6 *Display Format Protocol*). So `io.println(42)`, `io.println(p)` and `io.println("n = {n}")` all compile, and a value with no `Display` impl is `error[E0523]` at the argument. `io.print_raw` and `io.eprint_raw` take `Str` only, and `io.print_raw_bytes` takes `Bytes`. The split follows the `_raw` name: `io.eprint` and `io.eprintln` take `Display`, and `io.eprint_raw` takes `Str`. A non-`Str` argument to a `_raw` operation is a type mismatch:
 
 ```
 error[TypeError]: mismatched types
@@ -404,7 +405,7 @@ error[TypeError]: mismatched types
   = help: render it first: `io.print_raw("{done}")`
 ```
 
-**Print and log handler operations take `Str`.** The generic surface is a stdlib wrapper, not a generic effect operation. `io.println(x)` renders `x` via `x.display()`, then performs the handler operation with the result; `io.print` and `io.log` do the same. `io.eprint` and `io.eprintln` render the same way, then write the `Str` to stderr. The handler operations are:
+**Print, eprint and log handler operations take `Str`.** The generic surface is a stdlib wrapper, not a generic effect operation. `io.println(x)` renders `x` via `x.display()`, then performs the handler operation with the result; `io.print`, `io.eprint`, `io.eprintln` and `io.log` do the same. The handler operations are:
 
 | Effect | Operation | Called by |
 |---|---|---|
@@ -412,12 +413,71 @@ error[TypeError]: mismatched types
 | `IO.Print` | `fn print_no_nl(msg: Str)` | `io.print(x)` |
 | `IO.Print` | `fn print_raw(s: Str)` | `io.print_raw(s)`; derived: the default body calls `print_no_nl(s)` |
 | `IO.Print` | `fn print_raw_bytes(b: Bytes)` | `io.print_raw_bytes(b)`; primitive |
+| `IO.Eprint` | `fn eprint(msg: Str)` | `io.eprintln(x)`; the default handler writes `msg` and a newline to stderr |
+| `IO.Eprint` | `fn eprint_no_nl(msg: Str)` | `io.eprint(x)` |
+| `IO.Eprint` | `fn eprint_raw(s: Str)` | `io.eprint_raw(s)`; derived: the default body calls `eprint_no_nl(s)` |
 | `IO.Log` | `fn log(msg: Str)` | `io.log(x)` |
 | `IO.Read` | `fn read_bytes(n: Int) -> Bytes` | `io.read_bytes(n)`; primitive |
 | `IO.Read` | `fn read_line() -> Option[Str]` | `io.read_line()`; derived (§4.4.9) |
 | `IO.Read` | `fn read_all() -> Str` | `io.read_all()`; derived (§4.4.9) |
 
 The `IO.Read` operations take and return other types (§4.4.9). The wrapper selects the operation; it does not add the newline to `msg`. A handler therefore sees the same `msg` for `io.println(42)` and `io.println("42")`: the text `42`, with no newline.
+
+**`IO.Eprint` is the stderr effect.** `io.eprintln`, `io.eprint` and `io.eprint_raw` are operations of `IO.Eprint`. They have a row, a handler can intercept them, and they emit trace records, as the `IO.Print` operations do. `! IO` grants `IO.Eprint`. The sub-effects of `IO` are independent: `! IO.Print` and `! IO.Log` do not grant `IO.Eprint`. `IO.Eprint` is not marked `@handle_all`. A handler that omits `eprint` or `eprint_no_nl` forwards the call to the enclosing handler (§4.7.1 *Completeness and auto-delegation*), and the omission gives no `PartialHandler` warning (W0545). A handler that omits `eprint_raw` runs the default body, so the handler receives the text as an `eprint_no_nl` call. `IO.Log` and `IO.Eprint` do not share operations: `capture_log` sees no text from `io.eprintln`, and `capture_eprint` sees no text from `io.log` (§8.10.1).
+
+```blink
+import std.testing.{capture_eprint}
+
+fn warn(msg: Str) ! IO.Eprint {
+    io.eprintln("warn: {msg}")
+}
+
+fn silent() {
+    io.eprintln("x")      // error[UndeclaredEffect] E0500: `io.eprintln` requires `IO.Eprint`
+}
+
+fn quiet() ! IO.Print {
+    warn("x")             // error[UndeclaredEffect] E0500: `warn` requires `IO.Eprint`
+}
+
+fn main() ! IO {
+    let got: List[Str] = []
+    with capture_eprint(got) { warn("a") }
+    io.println("captured {got.len()}")   // stdout: captured 1
+    warn("b")                            // stderr: warn: b
+}
+```
+
+A handler for `IO.Eprint` sees `msg` with no newline, as a handler for `IO.Print` does. The operation is the same for the `Display` form and the `_raw` form:
+
+```blink
+import std.testing.{capture_eprint}
+
+fn main() ! IO {
+    let got: List[Str] = []
+    with capture_eprint(got) {
+        io.eprintln("warn: a")       // the handler gets "warn: a"
+        io.eprint_raw("warn: a")     // the handler gets "warn: a"
+    }
+    for line in got {
+        io.println(line)             // stdout: warn: a, twice
+    }
+}
+```
+
+**Runtime writes are not operations.** Only four kinds of write to stderr are not `IO.Eprint` operations: the panic and abort messages, the assert-failure messages, the test runner report, and the trace output (§8.15). The runtime makes these writes. They have no row, and no handler receives them. This list is closed. Blink code that writes to stderr calls `io.eprintln`, `io.eprint` or `io.eprint_raw`, and those calls are `IO.Eprint` operations. That holds for stdlib code and for the test runner's own Blink code too: such a call is an ordinary operation. It escapes the handler of a user's `with` only when it runs outside the dynamic scope of that `with`. A panic inside `with capture_eprint(got) { ... }` still reaches the terminal, and its text does not land in `got`:
+
+```blink
+import std.testing.{capture_eprint}
+
+fn main() ! IO {
+    let got: List[Str] = []
+    with capture_eprint(got) {
+        io.eprintln("before")        // got is ["before"]
+        panic("boom")                // the message reaches the terminal; got does not change
+    }
+}
+```
 
 **Handle naming is deterministic:**
 
@@ -2373,7 +2433,7 @@ This is standard capability attenuation: you can always pass a more-powerful cap
 
 **Proven and assumed rows.** Every effect row in Blink is either compiler-proven (including discharge by handler or `with`) or is the declared row of an @ffi decl, assumed under audit key K. An assumed row is an upper bound on the foreign call's behaviour; handlers do not intercept foreign calls. FFI regions change Ptr rules only, never rows.
 
-No Blink operation skips a handler that its row names; only an `@ffi` call does.
+No Blink operation skips a handler that its row names; only an `@ffi` call does. The runtime's own writes to stderr are not Blink operations (§4.4 *`IO.Eprint` is the stderr effect*).
 
 This is the one normative statement of these rules. §9.1 (*The Effect Row*, *`@trusted`*) and §4.7 refer to it. An `@ffi` decl's row enters the program at the decl and from there propagates by the rules above, with no special case. `@trusted` does not discharge or narrow a row: a wrapper that calls an `@ffi` decl with row `! Net.Connect` must itself declare `Net.Connect` or discharge it in the usual way. The FFI regions of §9.1.1 (an `@ffi` or `@trusted` body, `with ffi.scope()`) decide where a `Ptr[T]` may appear; they do not change what any row says.
 
