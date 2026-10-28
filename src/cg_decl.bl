@@ -1057,6 +1057,12 @@ pub fn cg_decl_emit_globals(is_extern: Bool, globals: List[Int], inits: Map[Int,
         flush_member_typedefs(tid)
         let spelling = cg_decl_require_spelling(tid, Position.Local)
         let name = c_global_name(g)
+        // A foreign constant is `const` in every unit, so the one definition and each
+        // declaration agree on its type. Only the defining unit reads the header.
+        if get_annotation(g, "ffi") != -1 {
+            print_global_decl("const {spelling}", name, true)
+            continue
+        }
         if is_extern {
             print_global_decl(spelling, name, true)
             continue
@@ -1077,6 +1083,39 @@ pub fn cg_decl_emit_globals(is_extern: Bool, globals: List[Int], inits: Map[Int,
         }
     }
     deferred
+}
+
+// The definitions of the foreign constants among a unit's own globals. They go at the end of
+// the unit, after the headers that give their values, so a header's macros reach no other
+// line of the unit. E0855 has already checked that each name is an integer constant that
+// fits its type on the build target.
+pub fn cg_decl_emit_foreign_const_defs(own_globals: List[Int]) ! Diag.Report {
+    let mut foreign_const_defs: List[Int] = []
+    for g in own_globals {
+        if get_annotation(g, "ffi") != -1 { foreign_const_defs.push(g) }
+    }
+    if foreign_const_defs.is_empty() { return }
+    let mut headers: List[Str] = []
+    let mut gates: List[Str] = []
+    let mut at: Map[Str, Int] = Map()
+    for g in foreign_const_defs {
+        let header = get_str_named_arg(get_annotation(g, "ffi"), "header")
+        let dep = stdlib_native_dep_owned_by_source_module(cg_reg_module_of(g))
+        let gate = if dep == "" { "" } else { stdlib_native_dep_gate_macro(dep) }
+        let i = at.get(header) ?? -1
+        if i < 0 {
+            at.insert(header, headers.len())
+            headers.push(header)
+            gates.push(gate)
+        } else if (gates.get(i) ?? "") != gate {
+            gates.set(i, "")
+        }
+    }
+    print_foreign_includes(headers, gates)
+    for g in foreign_const_defs {
+        let spelling = cg_decl_require_spelling(tid_of_node(g), Position.Local)
+        print_global_init("const {spelling}", c_global_name(g), "({c_ffi_symbol(g)})")
+    }
 }
 
 // A pure check the header pass can use to decide whether a module needs its init
