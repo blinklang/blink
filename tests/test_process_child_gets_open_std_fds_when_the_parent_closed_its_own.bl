@@ -1,0 +1,57 @@
+// A child of the process ops starts with fds 0, 1 and 2 open, and with no fd on the null
+// device beyond fd 0, even when the parent runs with its own stdin or stdout closed
+// (sections/04_effects.md §4.4.8: a child never starts with its standard input closed). A
+// parent with fd 0 closed gets fd 0 back for its next pipe, so the child's pipe already sits
+// on the fd it must have at exec.
+
+import std.process.{ProcessResult}
+import compile_test_helpers
+
+fn probe(redirect: Str) -> ProcessResult {
+    let exe = compile_test_helpers.main_binary_of("tests/test_process_child_gets_open_std_fds_when_the_parent_closed_its_own.bl")
+    process_run("sh", ["-c", "PROCESS_FD_PROBE=1 {exe} {redirect}"])
+}
+
+let WANT: Str = "cat [fed in] exit 0\necho [hi\n]\nrun null fds [1]\nspawn null fds [1]\n"
+
+test "a child gets its pipes and one null device fd when the parent has all three open" {
+    let r = probe("</dev/null")
+    assert_eq(r.err_out, WANT)
+}
+
+test "a child gets its stdin pipe when the parent runs with stdin closed" {
+    let r = probe("<&-")
+    assert_eq(r.err_out, WANT)
+}
+
+test "a child gets its stdin and stdout pipes when the parent runs with both closed" {
+    let r = probe("<&- >&-")
+    assert_eq(r.err_out, WANT)
+}
+
+// The probe writes to stderr only, since a run of it can have stdout closed.
+fn main() ! IO, Process {
+    if (env.var("PROCESS_FD_PROBE") ?? "") == "" { return }
+    match process.run("cat", [], stdin: Some("fed in")) {
+        Ok(r) => io.eprintln("cat [{r.out}] {r.end}")
+        Err(e) => io.eprintln("cat err {e}")
+    }
+    match process.run("sh", ["-c", "echo hi"]) {
+        Ok(r) => io.eprintln("echo [{r.out}]")
+        Err(e) => io.eprintln("echo err {e}")
+    }
+    // ls runs as a child of sh, so it lists the fds of sh and not its own. A count of the
+    // null device fds, not a list of every fd, since sh also holds what its parent leaked to it.
+    let list = "ls -l /proc/$$/fd | grep -c /dev/null | tr -d '\\n'"
+    match process.run("sh", ["-c", list]) {
+        Ok(r) => io.eprintln("run null fds [{r.out}]")
+        Err(e) => io.eprintln("run fds err {e}")
+    }
+    match process.spawn("sh", ["-c", list]) {
+        Ok(c) => match process.wait(c) {
+            Ok(r) => io.eprintln("spawn null fds [{r.out}]")
+            Err(e) => io.eprintln("spawn fds err {e}")
+        }
+        Err(e) => io.eprintln("spawn fds err {e}")
+    }
+}

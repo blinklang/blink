@@ -580,7 +580,8 @@ int pipe2(int pipefd[2], int flags);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 /* Every pipe of a child op is close-on-exec, so a child that another thread forks at the
  * same time does not keep this child's pipes open: a read end then sees EOF only when its
- * own child closes it. dup2 onto 0/1/2 clears the flag on the copy the child keeps. */
+ * own child closes it. The child moves each one onto 0/1/2 with blink_child_move_fd, which
+ * clears the flag on the copy it keeps. */
 static int blink_child_pipe(int fds[2]) {
 #if defined(__linux__)
     return pipe2(fds, O_CLOEXEC);
@@ -622,6 +623,13 @@ static int blink_child_strings_ok(const char* cmd, const blink_list* args) {
     return 1;
 }
 
+/* dup2 onto the same fd does nothing, so it would leave a close-on-exec pipe that a parent
+ * with fd 0 or 1 closed got back on that fd to close at exec. */
+static int blink_child_move_fd(int from, int to) {
+    if (from == to) return fcntl(to, F_SETFD, 0);
+    return dup2(from, to) < 0 ? -1 : 0;
+}
+
 /* Runs in the forked child, so it only calls async-signal-safe functions: the argv was
  * built before the fork. stdin_fd < 0 means the null device. If the exec fails, the errno
  * goes to the parent through err_fd and the child exits without running atexit hooks. */
@@ -632,9 +640,10 @@ static void blink_child_exec_or_report(char** argv, int stdin_fd, int out_fd, in
         in = open("/dev/null", O_RDONLY);
         if (in < 0) e = errno;
     }
-    if (e == 0 && dup2(in, STDIN_FILENO) < 0) e = errno;
-    if (e == 0 && dup2(out_fd, STDOUT_FILENO) < 0) e = errno;
-    if (e == 0 && dup2(err_fd, STDERR_FILENO) < 0) e = errno;
+    if (e == 0 && blink_child_move_fd(in, STDIN_FILENO) < 0) e = errno;
+    if (stdin_fd < 0 && in > STDERR_FILENO) close(in);
+    if (e == 0 && blink_child_move_fd(out_fd, STDOUT_FILENO) < 0) e = errno;
+    if (e == 0 && blink_child_move_fd(err_fd, STDERR_FILENO) < 0) e = errno;
     if (e == 0) {
         execvp(argv[0], argv);
         e = errno;
@@ -645,18 +654,25 @@ static void blink_child_exec_or_report(char** argv, int stdin_fd, int out_fd, in
 }
 
 /* The parent's side of the report pipe: 0 once the child's exec succeeded (its copy of
- * the close-on-exec write end closed with no bytes), else the errno the child sent. */
+ * the close-on-exec write end closed with no bytes), else the errno the child sent. A read
+ * that fails or stops part way leaves the exec unknown, so it counts as a failure and the
+ * caller reaps the child. */
 static int blink_child_read_report(int report_fd) {
     int e = 0;
+    int read_err = 0;
     ssize_t got = 0;
     while (got < (ssize_t)sizeof(e)) {
         ssize_t n = read(report_fd, (char*)&e + got, sizeof(e) - (size_t)got);
         if (n < 0 && errno == EINTR) continue;
+        if (n < 0) read_err = errno;
         if (n <= 0) break;
         got += n;
     }
     close(report_fd);
-    return got == (ssize_t)sizeof(e) ? (e != 0 ? e : EIO) : 0;
+    if (read_err != 0) return read_err;
+    if (got == 0) return 0;
+    if (got < (ssize_t)sizeof(e)) return EIO;
+    return e != 0 ? e : EIO;
 }
 
 /* Forks a child on the given pipes and returns 0 with *pid_out set once it has exec'd,
@@ -677,6 +693,9 @@ static int blink_child_fork_exec(char** argv, int stdin_fd, int out_fd, int err_
     close(report[1]);
     int e = blink_child_read_report(report[0]);
     if (e != 0) {
+        /* A child whose report could not be read may have exec'd and run on; the op
+         * reports Err, so it must not leave that program running. */
+        kill(pid, SIGKILL);
         int status;
         while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
         return e;
