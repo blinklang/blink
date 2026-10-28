@@ -1856,7 +1856,7 @@ fn describe(end: ChildEnd) -> Str {
 }
 ```
 
-**`Child` is a handle-op value.** `process.spawn` makes a `Child`, so the operations that consume one, `process.wait` and `process.signal`, are `process` handle ops too (§4.4, rule 3). Code with no `Process` effect can hold a `Child` but cannot wait on it or signal it. `Child` is opaque and has no methods. `process.wait` on a child that already exited returns the same `ProcessResult` again. The signal numbers are constants in `std.process`: `SIGHUP`, `SIGINT`, `SIGQUIT`, `SIGKILL`, `SIGTERM`, `SIGSEGV`, `SIGBUS`, `SIGABRT` and `SIGXCPU`. They are named constants and not literals because their numbers differ between hosts.
+**`Child` is a handle-op value.** `process.spawn` makes a `Child`, so the operations that consume one, `process.wait` and `process.signal`, are `process` handle ops too (§4.4, rule 3). Code with no `Process` effect can hold a `Child` but cannot wait on it or signal it. `Child` is opaque and has no methods. `process.wait` on a child that already exited returns the same `ProcessResult` again. The signal numbers are constants in `std.process`: `SIGHUP`, `SIGINT`, `SIGQUIT`, `SIGKILL`, `SIGTERM`, `SIGSEGV`, `SIGBUS`, `SIGABRT` and `SIGXCPU`. They are foreign constants and not literals, because their numbers differ between hosts: the C headers of the build target set each value (§9.1, *`@ffi let` — Foreign Constants*).
 
 A deadline is a limit of the child, so the code that wants one gives the child a `timeout` when it starts the child. It does not sleep and then signal:
 

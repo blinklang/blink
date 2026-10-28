@@ -47,6 +47,114 @@ fn c_cos(x: Float) -> Float ! ()
 
 Prefer the two-argument form. It names the library that supplies the symbol, so a reader and `blink audit` can see where the symbol comes from. The one-argument form does not make a third-party symbol legal: a symbol that is not in `c` or `m` must use the two-argument form with a declared library. The one-argument form binds only `c` and `m` symbols. It does not bind a `blink_*` runtime symbol; `lib/std` binds those with `@runtime` (*`@runtime` — The Runtime Bridge*). Every `@ffi` declaration, in either form, follows the rules of *Signature Types*.
 
+#### `@ffi let` — Foreign Constants
+
+Some integer constants have a different value on each host. `SIGBUS` is 7 on Linux and 10 on macOS. `ENOTSUP` is 95 on Linux and 45 on macOS. No Blink source can write the right number for every target, and Blink has no conditional compilation. A **foreign constant** is a module-level `let` with no initializer. The C compiler of the build target sets its value from the target's C headers.
+
+```blink
+@ffi("SIGBUS", header: "signal.h")
+pub let SIGBUS: Int
+
+@ffi("curl", "CURLE_OPERATION_TIMEDOUT", header: "curl/curl.h")
+pub let CURLE_OPERATION_TIMEDOUT: Int
+```
+
+The arguments are those of `@ffi` on a function. The one-argument form names a C macro or constant of the runtime libraries `c` and `m`. The two-argument form names a library key of `[native-dependencies]`, with the native-dependency rules of §9.1.2: a missing entry is `MissingNativeDep` (E0820). The type annotation is required.
+
+**Rules.**
+
+- **The type is `Int` or a sized integer type** (`I8`, `U8`, `I32`, `U64` and so on). No other type is allowed.
+- **A foreign constant is immutable.** `let mut` with `@ffi` is an error.
+- **`header:` is required.** A C macro has no linkage and no prototype, so nothing else can tell the C compiler where the name comes from. `header:` has the meaning that it has on an `@ffi` function.
+- **The declaration has no initializer.** `@ffi` with an initializer is an error.
+- **The front end sees the type and never the value.** `blink check` gives the same result on every target. The C compiler of the build target sets the value (see *Where the value is checked*, below).
+- **No `@trusted` is needed.** The compiler checks the declaration for each build target, so a foreign constant is not an escape hatch and adds no entry to the closed list of this section.
+
+A wrong type, `mut` and an initializer are `ForeignConstForm` (E0853). A missing `header:` is `ForeignConstNoHeader` (E0854). The help of each one gives the fix:
+
+```blink
+@ffi("SIGBUS", header: "signal.h")
+pub let SIGBUS: Str                     // error[ForeignConstForm]: a foreign constant has type `Int` or a sized integer type
+                                        // help: write `pub let SIGBUS: Int`
+
+@ffi("SIGBUS", header: "signal.h")
+pub let mut last_sig: Int               // error[ForeignConstForm]: a foreign constant is not `mut`
+                                        // help: remove `mut`
+
+@ffi("SIGBUS")
+pub let SIGBUS: Int                     // error[ForeignConstNoHeader]: `SIGBUS` is a C macro, and a macro has no linkage
+                                        // help: add `header: "signal.h"`
+```
+
+A `let` with no initializer and no `@ffi` is `MissingInitializer` (E1140). The message says the initializer is missing and names the two repairs: write `= value`, or add `@ffi(...)` to make a foreign constant.
+
+```blink
+let LIMIT: Int                          // error[MissingInitializer]: module-level `LIMIT` has no initializer
+                                        // help: write `= <value>`, or add `@ffi("NAME", header: "...")` for a constant from a C header
+```
+
+**Where a foreign constant is allowed.** The front end does not know the value, so the foreign constant can appear only where the compiler never needs the number.
+
+| Place | Result |
+|-------|--------|
+| Function body, guard | Allowed. It is an ordinary `Int` value. |
+| Module-level `let` or `let mut` | Allowed only as a bare leaf: the name alone, or an element of a list, tuple, struct or variant literal (§2.12.1). An operator over it is `NonInitExpr` (E1129). |
+| Keyword default | Allowed only as a bare leaf (§2.13). |
+| `const` initializer | `NonConstExpr` (§2.21). |
+| Range-pattern bound | `RangeBoundNotConst` (E0323, §3.5 *Range Patterns*). |
+| Struct field default | `NonConstExpr` (§2.14). |
+| Lone name in a pattern | Never a value. The name is a binder, or an error for an uppercase name on a non-enum type, as for every other name (§3.5 *Bare names: variant or binding*). |
+
+```blink
+const BAD_SIG = SIGBUS                       // error[NonConstExpr]: `SIGBUS` is a foreign constant: the target's C headers set its value
+                                             // help: use `SIGBUS` in a function body, or in a module-level `let`
+
+fn describe(end: ExitKind) -> Str {
+    match end {
+        Signaled(SIGBUS..=SIGSEGV) => "range"    // error[RangeBoundNotConst]: `SIGBUS` is a foreign constant: the target's C headers set its value
+                                                 // help: use a guard: `Signaled(n) if n >= SIGBUS && n <= SIGSEGV`
+        Signaled(n) if n == SIGBUS => "bus"      // OK: a guard is run-time code
+        Signaled(SIGSEGV) => "segv"              // error[EnumPatternNeedsEnumScrutinee]: a lone name in a pattern is never a value. `Int` is not an enum.
+        _ => "other"
+    }
+}
+
+let FATAL = [SIGSEGV, SIGBUS]                // OK: a list of bare leaves
+let WANT = POLL_EVT_IN | POLL_EVT_OUT        // error[NonInitExpr]: `POLL_EVT_IN` is a foreign constant: the target's C headers set its value, so an operator cannot fold it
+                                             // help: compute it in a fn: `fn want() -> Int { POLL_EVT_IN | POLL_EVT_OUT }`
+let ALIAS = FATAL                            // error[NonInitExpr]: read of module `let` `FATAL` (as for any module `let`)
+```
+
+The help of `NonConstExpr`, `RangeBoundNotConst` and `NonInitExpr` names the foreign constant as the cause. The help for an ordinary non-constant, "make it a `const`", never appears for a foreign constant, because a `const` cannot hold one.
+
+**A keyword default is allowed. A struct field default is not.** A keyword default is filled only at a call, and a call is never a const expression. So no const context can read it. A struct field default is different. A `const` struct literal that omits a field takes the field default (§2.21), so a field default must stay a const expression.
+
+```blink
+fn stop(c: Child, *, sig: Int = SIGTERM) -> Result[(), ProcessError] ! Process {   // OK
+    process.signal(c, sig)
+}
+
+type KillOpts { sig: Int = SIGTERM }         // error[NonConstExpr]: a field default must be const, because `const X = KillOpts {}` fills it.
+                                             //   `SIGTERM` is a foreign constant (the target's C headers set it).
+                                             // help: use a keyword default on a constructor fn: `fn kill_opts(*, sig: Int = SIGTERM) -> KillOpts`, or make the field `Option[Int]`
+
+fn bad(*, sig: Int = SIGTERM + 1) {}         // error[NonConstExpr]: only the bare name is allowed in a keyword default
+```
+
+**Where the value is checked.** `blink check` does not look at the C headers. It checks the declaration (E0853, E0854) and the places where the name appears. `blink build` checks the declaration again for the build target. For that target, the C name must be an integer constant expression, and its value must fit the declared type. A name that fails is `ForeignConstInvalid` (E0855) at the declaration. It is never a raw C compiler error. A misspelled C name, a name that the headers of the target do not define, a name that is not constant (such as `errno`, or `SIGRTMIN` on glibc), and a value that does not fit all show up at `blink build`, not at `blink check`.
+
+```blink
+@ffi("SIGBUZ", header: "signal.h")
+pub let SIGBUZ: Int
+// blink check: no error
+// blink build: error[ForeignConstInvalid]: `SIGBUZ` is not an integer constant on x86_64-linux-gnu
+//   help: check the spelling, and that `signal.h` defines `SIGBUZ` on this target
+```
+
+This error differs from `ForeignConstNoHeader` (E0854). E0854 says the declaration has no `header:` and names the fix. E0855 says the header is there, and the target's C compiler does not give an integer constant.
+
+**What tools show.** Hover and `blink doc` may show the value for the current target, for display only. The front end never uses it. `blink audit` and the link tooling treat an `@ffi let` as a value from a header and not as a linked symbol: it has no address to link and no effect row to audit.
+
 #### The Effect Row — Declared by the Author
 
 Because the compiler cannot analyze foreign code, the author **must** write the effect row of an `@ffi` function. It uses the same `!` syntax as every other function (§4.2). The compiler assumes this row — it cannot verify it. This is the one place in Blink where an effect row is not compiler-proven (§4.5, *Proven and assumed rows*).

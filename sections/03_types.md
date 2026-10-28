@@ -4531,7 +4531,20 @@ A bound is one of these, and nothing else:
 - An integer literal, with an optional `-` (`-128`). A `Char` literal (`'a'`).
 - The name of a `const` item (§2.21), bare (`MAX`) or qualified by its module (`limits.MAX`). The `const` has type `Int`, a sized integer or `Char`. The compiler resolves the name in the normal way (§3.4 *Resolution order*), and a local binding of the same name does not change the result. The compiler evaluates the `const` at type check, so the `const` must have a value that it can compute. The value of the bound must fit the type of the scrutinee, as a literal bound does, so `E0318` applies to it.
 
+A foreign constant (§9.1, *`@ffi let` — Foreign Constants*) is not a `const` item. The target's C compiler sets its value, so the compiler cannot read it at type check. A foreign constant as a bound is `RangeBoundNotConst` (E0323), and the help names the foreign constant as the cause and offers a guard.
+
 A bound is never an expression. `0..=K + 1` is `RangeBoundNotConst` (E0323). So is a name that is not a `const` item of those types, and so is a `const` that depends on itself. It is one error for all of these, and its help names a guard.
+
+```blink
+fn describe(end: ExitKind) -> Str {
+    match end {
+        Signaled(SIGBUS..=SIGSEGV) => "range"    // error[RangeBoundNotConst]: `SIGBUS` is a foreign constant: the target's C headers set its value
+                                                 // help: use a guard: `Signaled(n) if n >= SIGBUS && n <= SIGSEGV`
+        Signaled(n) if n == SIGBUS => "bus"      // OK: a guard is run-time code
+        _ => "other"
+    }
+}
+```
 
 A `const` name is a bound only next to `..` or `..=`. A lone `K =>` is still `EnumPatternNeedsEnumScrutinee` (*Bare names: variant or binding*, above).
 

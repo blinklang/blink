@@ -1134,6 +1134,7 @@ pub let mut shared_counter = 0  // error[PubLetMutForbidden]: `pub let mut` is f
 - An enum variant whose payloads are static.
 - An empty-collection constructor with no arguments: `[]`, `Map.new()`, `Set.new()`, `Map.new[K, V]()`, `Set.new[T]()` (§3.2.2 *Construction and Mutability*).
 - A function literal. Its body does not run at initialization. The compiler checks the body as it checks any function body, and the body's effects go in the literal's type, not in the initializer. A body that reads a `let mut` gives the literal `State` in its row (§4.16).
+- A foreign constant (§9.1, *`@ffi let` — Foreign Constants*), as a bare leaf only: the name alone, or the name as an element of a list literal, tuple literal, struct literal or variant literal. The target's C compiler sets its value, so the front end cannot fold it. An operator over it is not static.
 
 Nothing else is static. In particular, these are not:
 
@@ -1147,6 +1148,18 @@ Nothing else is static. In particular, these are not:
 The rule is the same for `let`, `let mut` and `pub let`. Because no initializer reads another module binding or runs a function, no initializer can see another one. The spec does not define the order in which module bindings are initialized, and the order cannot change any value. A cycle between initializers cannot occur.
 
 A const expression in an initializer that would panic is error E0546 (§2.21).
+
+A foreign constant is the one read of a name that this rule admits, and only as a bare leaf. It has no initializer, so it has no order and no cycle. `let mut` takes it too: `let mut last = SIGTERM` follows the same static rule.
+
+```blink
+let FATAL = [SIGSEGV, SIGBUS]                // OK: a list of bare leaves
+let mut last = SIGTERM                       // OK: a bare leaf
+let NEXT = SIGTERM + 1                       // error[NonInitExpr]: `SIGTERM` is a foreign constant: the target's C headers set its value, so an operator cannot fold it
+                                             // help: compute it in a fn: `fn next_sig() -> Int { SIGTERM + 1 }`
+let WANT = POLL_EVT_IN | POLL_EVT_OUT        // error[NonInitExpr]: `POLL_EVT_IN` is a foreign constant: the target's C headers set its value, so an operator cannot fold it
+                                             // help: compute it in a fn: `fn want() -> Int { POLL_EVT_IN | POLL_EVT_OUT }`
+let ALIAS = FATAL                            // error[NonInitExpr]: read of module `let` `FATAL`
+```
 
 ```blink
 let a = 10 / 0                  // error[ConstEvalPanic]: division by zero
@@ -1455,7 +1468,7 @@ fn connect(
 - Params before `*` are **positional**: order matters, no labels at call site
 - Params after `*` are **keyword-required**: labels required, order-independent at call site. Arguments evaluate in written order, not declaration order, and bind to their parameters after all of them are evaluated (§2.22)
 - Default values only allowed on keyword params (after `*`)
-- Default values must be const expressions (see [2.21](#221-const-declarations))
+- Default values must be const expressions (see [2.21](#221-const-declarations)), with one exception: a bare foreign constant (§9.1, *`@ffi let` — Foreign Constants*). A default is filled only at a call, and a call is never a const expression, so no const context can read a keyword default. The compiler needs no value for the name, because the target's C compiler sets it. Only the bare name is allowed: `sig: Int = SIGTERM` is legal, `sig: Int = SIGTERM + 1` is `NonConstExpr`. A struct field default has no such exception (§2.14)
 - Labels are **call-site sugar** — the function type is `fn(Int, Account, Account)` regardless of `*`. Closures, higher-order functions, and the function type of a trait impl method are unaffected. An impl repeats its trait method's marker and keyword names (§3.6). See [3.3](#33-type-inference).
 - A default does not change the function type either: the type has full arity. A direct call fills each omitted keyword parameter with its const default after all written arguments evaluate, and a fn value takes every argument. Each fill builds a new value: a call that omits a `List` parameter with default `[]` gets a new empty list
 - **A default fits every instance.** The compiler checks a default once, at its declaration, against the declared parameter type. Each type parameter of the function stays abstract in that check, so a default is legal only if it has the declared type for every choice of the type parameters. An omitted argument adds no constraint to inference: a type parameter comes from the written arguments, from the expected type, or from an explicit `[...]` (§3.4 *Explicit Type Application*). A default never supplies a type parameter (§3 *No erasure*). A call that leaves a type parameter with no source is `error[CannotInferType]` (E0301) at the call (§3.4 *Under-Determined Types*). A default that does not fit is `TypeError` (E0300), reported at the default and never at a call
@@ -1467,6 +1480,11 @@ fn g[T](*, x: Option[T] = None) -> Option[T] { x }    // ok: `None` has type `Op
 fn k[T](*, xs: List[T] = []) -> Int { xs.len() }      // ok: `[]` has type `List[T]` for every `T`
 
 fn h2[T](a: T, *, b: Option[T] = None) -> T { b ?? a }
+
+fn stop(c: Child, *, sig: Int = SIGTERM) -> Result[(), ProcessError] ! Process {   // ok: a bare foreign constant
+    process.signal(c, sig)
+}
+fn bad(*, sig: Int = SIGTERM + 1) {}    // error[NonConstExpr]: only the bare name is allowed in a keyword default
 
 fn main() {
     let a = h2(1)               // `T` is Int from `a`; `b` fills with `None`
@@ -1574,12 +1592,20 @@ let config = ServerConfig { port: 3000, debug: true }
 
 #### Rules
 
-- Default values must be const expressions (see [2.21](#221-const-declarations))
+- Default values must be const expressions (see [2.21](#221-const-declarations)). A foreign constant (§9.1, *`@ffi let` — Foreign Constants*) is not one, and a field default may not name it, even as a bare name. A `const` struct literal that omits a field takes the field default (§2.21), so a field default must stay a const expression. A keyword default may name a foreign constant (§2.13)
 - A field default on a generic type follows the rule of §2.13 *A default fits every instance*, with the type's own type parameters abstract. A default whose type nests a type parameter, such as `Option[T]`, follows it too: `type Box[T] { x: T = 3 }` is the same error, and `x: Option[T] = None` fits
 - Each construction that omits a field with a default builds a new value for that field
 - Fields without defaults are always required at construction
 - An omitted field takes its default value
 - Struct field defaults do not interact with the type system: `ServerConfig` is the same type regardless of which fields were explicitly provided
+
+```blink
+type KillOpts { sig: Int = SIGTERM }    // error[NonConstExpr]: a field default must be const, because `const X = KillOpts {}` fills it.
+                                        //   `SIGTERM` is a foreign constant (the target's C headers set it).
+                                        // help: use a keyword default on a constructor fn: `fn kill_opts(*, sig: Int = SIGTERM) -> KillOpts`, or make the field `Option[Int]`
+
+fn kill_opts(*, sig: Int = SIGTERM) -> KillOpts { KillOpts { sig: sig } }    // ok
+```
 
 #### Checking a Literal's Fields
 
@@ -3087,6 +3113,7 @@ What is **not** a const expression:
 - `let` bindings: referencing a `let` variable is not const
 - Collection constructors: `Map.new()`, `Set.new()`, `List.with_capacity(n)` — these allocate
 - Mutable state: anything involving `let mut`
+- A foreign constant (§9.1, *`@ffi let` — Foreign Constants*), alone or in an expression: `const BAD_SIG = SIGBUS` is `NonConstExpr`. The target's C compiler sets its value, so the compiler cannot evaluate it. The help names the foreign constant as the cause and does not tell the author to make it a `const`.
 - An operator on a user type: `MsgFlags.PEEK | MsgFlags.WAITALL`. The operator is a call to a trait impl (§3.6), so §2.21 does not admit it. To use a combination as a default, declare it as its own constant.
 
 ```blink
@@ -3149,6 +3176,8 @@ Const expressions are evaluated in five contexts:
 3. **Keyword argument defaults** — `fn f(*, x: Int = <const>)`
 4. **Range pattern bounds** — `match n { 1..=MAX => ... }`. A bound is a literal or the name of a `const`, not an expression (§3.5 *Range Patterns*).
 5. **Module-level `let` initializers** — each const expression in a static expression (§2.12.1)
+
+A foreign constant (§9.1, *`@ffi let` — Foreign Constants*) is not a const expression in any of these contexts. It is allowed as a bare leaf in contexts 3 and 5, because the compiler needs no value there: a keyword default is filled only at a call, and a module-level `let` initializer is static, not const. It is an error in contexts 1, 2 and 4: `NonConstExpr` for a `const` and for a struct field default, and `RangeBoundNotConst` (E0323) for a range pattern bound.
 
 ```blink
 // Struct field defaults — const expressions
@@ -3269,6 +3298,18 @@ error[NonConstExpr]: expression is not a compile-time constant
    |
    = help: const expressions allow: literals, arithmetic, boolean ops, comparisons,
            references to other `const` bindings, struct literals, and enum variants
+```
+
+A foreign constant gets the same code with a help that names the cause:
+
+```
+error[NonConstExpr]: expression is not a compile-time constant
+  --> signals.bl:4:17
+   |
+ 4 | const BAD_SIG = SIGBUS
+   |                 ^^^^^^ `SIGBUS` is a foreign constant: the target's C headers set its value
+   |
+   = help: use `SIGBUS` in a function body, or in a module-level `let`
 ```
 
 **Panel vote:** Const expression scope (literals + arithmetic) 5-0 unanimous. `const` keyword required 3-2 (PLT/DevOps/AI for `const`; Sys/Web for inferred `let`). Struct literals with const fields 3-1-1 (PLT/DevOps/AI for struct literals; Web for nested structs; Sys for scalars-only). Compiler-evaluated emit literals 5-0 unanimous. See [DECISIONS.md](../DECISIONS.md).
