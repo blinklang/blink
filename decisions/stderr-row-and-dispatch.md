@@ -157,4 +157,4 @@ fn main() ! IO {
 - typecheck: add `Eprint` to the `IO` sub-effect table. A `handler IO.Print { fn eprint ... }` must then be rejected.
 - Add a test that panics inside `with capture_eprint` and checks the terminal output.
 - Keep the E0500 note that a builtin namespace call is not yet checked: it is still true of the compiler.
-- The libc fd rule in §9.1 says that fd 2 counts as made by `IO.Log`. It needs a follow-up edit to say `IO.Eprint`.
+- §9.1 now counts fd 2 as made by `IO.Log, IO.Eprint`, because `io.log` and the `io.eprint` operations both write it. When the libc decls narrow from `! IO` to leaf rows, each call that can write or copy fd 2 takes both.
