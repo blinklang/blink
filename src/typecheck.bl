@@ -17388,8 +17388,8 @@ fn nr_private_access_here(name: Str) -> Int {
 // (variant / type / trait / function) the same way the bare-Ident handler does,
 // so a qualified access (mod.Name) is labelled identically to a bare one.
 // Caller must have already checked is_private_access(name) != 0.
-fn nr_emit_private_access(name: Str, node: Int) ! Diag.Report {
-    if nr_emit_default_body_access(name, node) { return }
+fn nr_emit_private_access(name: Str, decl: Int, node: Int) ! Diag.Report {
+    if nr_emit_default_body_access(name, decl, node) { return }
     if is_variant_name(name) != 0 {
         tc_errors.push("cannot access private variant `{name}`")
         diag_error_at("PrivateItemAccess", PRIVATE_ITEM_ACCESS, "cannot access private variant `{name}` from another module", node, "mark the enum as `pub` in its module")
@@ -17405,36 +17405,36 @@ fn nr_emit_private_access(name: Str, node: Int) ! Diag.Report {
     }
 }
 
-// The handle and operation whose default body is the private function `name`, as
-// ("fs", "write"), or None. A default body is private so that user code cannot skip the
-// handler in force and reach the foreign call (sections/04_effects.md §4.7.1). The usual
-// E1003 help, to make it `pub`, is the one fix that must not be taken.
-fn nr_default_body_op(name: Str) -> Option[(Str, Str, Str)] {
-    let mods = nr_private_imports.get(name) ?? ""
-    if mods == "" { return None }
+// The handle and operation whose default body is the declaration `decl` that the use of
+// `name` resolves to, as ("fs", "write"), or None. A default body is private so that user
+// code cannot skip the handler in force and reach the foreign call (sections/04_effects.md
+// §4.7.1). The usual E1003 help, to make it `pub`, is the one fix that must not be taken.
+// The match is on the declaration, not the spelling: a user module's own private
+// `read_line` is not a default body and keeps the usual help.
+fn nr_default_body_op(name: Str, decl: Int) -> Option[(Str, Str)] {
+    if decl == -1 { return None }
     for root in builtin_op_roots() {
         let mod_key = builtin_op_module(root).replace(".", "_")
-        if !mods.contains("|{mod_key}|") { continue }
+        if nr_module_decl(mod_key, name) != decl { continue }
         for row in builtin_op_rows(root) {
-            if row.default_fn == name { return Some((root.to_lower(), row.op, mod_key)) }
+            if row.default_fn == name { return Some((root.to_lower(), row.op)) }
         }
     }
     let io_key = io_read_module().replace(".", "_")
-    if mods.contains("|{io_key}|") && is_io_read_derived_op(name) { return Some(("io", name, io_key)) }
+    if is_io_read_derived_op(name) && nr_module_decl(io_key, name) == decl { return Some(("io", name)) }
     None
 }
 
-// E1003 for a use of a default body, or false when `name` is no default body. The help
+// E1003 for a use of a default body, or false when `decl` is no default body. The help
 // spells the positional parameters of the body; a keyword parameter has a default, so the
 // shortest call leaves it out.
-fn nr_emit_default_body_access(name: Str, node: Int) -> Bool ! Diag.Report {
-    let (handle, op, mod_key) = match nr_default_body_op(name) {
+fn nr_emit_default_body_access(name: Str, decl: Int, node: Int) -> Bool ! Diag.Report {
+    let (handle, op) = match nr_default_body_op(name, decl) {
         Some(t) => t
         None => return false
     }
     let mut args: List[Str] = []
-    let decl = nr_module_decl(mod_key, name)
-    let params = if decl == -1 { -1 } else { node_params(decl) }
+    let params = node_params(decl)
     if params != -1 {
         let mut i = 0
         while i < sublist_length(params) {
@@ -21215,7 +21215,7 @@ fn nr_check_qualified_type_ref(name: Str, qualifier: Str, member: Str, at: Int) 
         return
     }
     if nr_qualified_private_access(qualifier, member) != 0 {
-        nr_emit_private_access(member, at)
+        nr_emit_private_access(member, nr_resolve_decl_in_module(target, member, 0), at)
         return
     }
     tc_mark_symbol_used(member)
@@ -21716,7 +21716,7 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
             nr_note_local_binder_at(node, top)
             let global = nr_index_is_global(top) != 0
             if global && is_private_access(name) != 0 {
-                if nr_emit_default_body_access(name, node) { return }
+                if nr_emit_default_body_access(name, nr_resolve_bare_decl(name, nr_current_module), node) { return }
                 tc_errors.push("cannot access private item `{name}`")
                 diag_error_at("PrivateItemAccess", PRIVATE_ITEM_ACCESS, "cannot access private item `{name}` from another module", node, "mark the item as `pub` in its module")
                 return
@@ -21832,7 +21832,7 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                     if defined { nr_mark_read_at(top) }
                     let global = defined && nr_index_is_global(top) != 0
                     if global && is_private_access(fn_name) != 0 {
-                        if !nr_emit_default_body_access(fn_name, node) {
+                        if !nr_emit_default_body_access(fn_name, nr_resolve_bare_call_decl(fn_name, nr_current_module), node) {
                             tc_errors.push("cannot access private function `{fn_name}`")
                             diag_error_at("PrivateItemAccess", PRIVATE_ITEM_ACCESS, "cannot access private function `{fn_name}` from another module", node, "mark the function as `pub` in its module")
                         }
@@ -21890,7 +21890,7 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                 is_module_qual = 1
                 let mq_method = node_method(node)
                 if nr_qualified_private_access(obj_name, mq_method) != 0 {
-                    nr_emit_private_access(mq_method, node)
+                    nr_emit_private_access(mq_method, nr_resolve_qualified_decl(obj_name, mq_method), node)
                 } else {
                     tc_mark_symbol_used(mq_method)
                 }
@@ -22002,7 +22002,7 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                     is_mod_fa = 1
                     let fa_field = node_name(node)
                     if nr_qualified_private_access(fa_obj_name, fa_field) != 0 {
-                        nr_emit_private_access(fa_field, node)
+                        nr_emit_private_access(fa_field, nr_resolve_qualified_decl(fa_obj_name, fa_field), node)
                     } else {
                         tc_mark_symbol_used(fa_field)
                     }
