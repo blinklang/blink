@@ -38,7 +38,7 @@ import cg_print.{
     print_typedef_blocks,
 }
 import cg_reg.{
-    cg_reg_effect_decls, cg_reg_effect_ops, cg_reg_entry_point, cg_reg_fs_op_decl, cg_reg_fs_ops, cg_reg_fn_decls, cg_reg_global_decls,
+    cg_reg_effect_decls, cg_reg_effect_ops, cg_reg_entry_point, cg_reg_builtin_op_decl, cg_reg_builtin_ops, cg_reg_fn_decls, cg_reg_global_decls,
     cg_reg_io_derived_decl,
     cg_reg_impl_methods, cg_reg_impl_of, cg_reg_module_of, cg_reg_modules, cg_reg_tid_for_decl,
     cg_reg_type_decls,
@@ -53,7 +53,7 @@ import typecheck.{
     TyKind, tc_enum_has_payload, tc_enum_variant_slots, tc_evar_field_slots,
     tc_evar_name, tc_evfield_name,
     tc_evfield_tid, tc_resolve, tc_sfield_name, tc_sfield_tid, tc_struct_field_slots,
-    make_handler_type, tc_member_tid_at_instance, tc_impl_trait_id,
+    make_handler_type, tc_member_tid_at_instance, tc_impl_trait_id, builtin_op_module, builtin_op_roots,
     tc_tid_child, tc_tid_child_count, tc_tid_decl_node, tc_tid_kind,
     tc_lookup_node_tid, tc_type_str, tc_void_tid, DECL_NODE_AMBIGUOUS, TYPE_STR, io_read_ops, is_io_read_derived_op,
 }
@@ -358,16 +358,18 @@ fn handler_dep_of(tid: Int) -> Int {
 // that writes the evidence vector. The vector comes after every typedef, which is too late
 // for a struct that names the vtable in a field.
 //
-// A builtin root other than FS has no declaration here and no typedef to write: runtime.h
-// owns both, which is why a Handler[IO] field has always worked.
+// A builtin root other than FS or Process has no declaration here and no typedef to write:
+// runtime.h owns both, which is why a Handler[IO] field has always worked.
 fn emit_handler_dep(handler_tid: Int) ! Diag.Report {
     if handler_tid < 0 { return }
     let vtable = c_vtable_type_name(handler_tid)
     if diag_is_ice_seg(vtable) { return }
     if mark_of(vtable_state, vtable) != 0 { return }
-    if vtable == c_vtable_type_name(fs_handler_tid()) {
-        let _ = emit_fs_vtable(false)
-        return
+    for root in builtin_op_roots() {
+        if vtable == c_vtable_type_name(make_handler_type(root)) {
+            let _ = emit_builtin_vtable(root, false)
+            return
+        }
     }
     let decl = effect_decl_for_vtable(vtable)
     if decl < 0 { return }
@@ -1187,7 +1189,9 @@ pub fn cg_decl_emit_ev(ev_storage: Str) ! Diag.Report {
     let slots = emit_ev_vtables(defines_default)
     if !slots.ok { return }
     print_ev(td_guard_name(c_ev_type_name()), slots.vtables, slots.fields, ev_storage)
-    if defines_default { emit_fs_default_bodies(false) }
+    if defines_default {
+        for root in builtin_op_roots() { emit_builtin_default_bodies(root, false) }
+    }
     emit_io_derived_bodies(false)
 }
 
@@ -1196,13 +1200,13 @@ pub fn cg_decl_emit_ev(ev_storage: Str) ! Diag.Report {
 // the archive is the one place the vector is spelled: its header carries the typedef and
 // the default for the program to use as they are.
 //
-// The archive's std.fs_ops functions are its own private copies, so the default FS bodies
-// declare them that way.
+// The archive's std.fs_ops and std.process functions are its own private copies, so the
+// default FS and Process bodies declare them that way.
 pub fn cg_decl_emit_ev_owned_by_archive() ! Diag.Report {
     let slots = emit_ev_vtables(true)
     if !slots.ok { return }
     print_ev_with_external_default(td_guard_name(c_ev_type_name()), slots.vtables, slots.fields)
-    emit_fs_default_bodies(true)
+    for root in builtin_op_roots() { emit_builtin_default_bodies(root, true) }
     emit_io_derived_bodies(true)
 }
 
@@ -1212,8 +1216,8 @@ type EvSlots {
     ok: Bool
 }
 
-// The builtin fields, in the order the stdlib archive was compiled against. Only FS's vtable is
-// this compiler's to write; the others are the runtime header's.
+// The builtin fields, in the order the stdlib archive was compiled against. Only the FS and
+// Process vtables are this compiler's to write; the others are the runtime header's.
 fn builtin_ev_slots() -> EvSlots {
     let mut vtables: List[Str] = []
     let mut fields: List[Str] = []
@@ -1229,7 +1233,9 @@ fn emit_ev_vtables(defines_default: Bool) -> EvSlots ! Diag.Report {
     let builtins = builtin_ev_slots()
     let mut vtables = builtins.vtables
     let mut fields = builtins.fields
-    if !emit_fs_vtable(defines_default) { return EvSlots { vtables: vtables, fields: fields, ok: false } }
+    for root in builtin_op_roots() {
+        if !emit_builtin_vtable(root, defines_default) { return EvSlots { vtables: vtables, fields: fields, ok: false } }
+    }
     for e in cg_reg_effect_decls() {
         let slot_tid = make_handler_type(node_name(e))
         let vtable = c_vtable_type_name(slot_tid)
@@ -1251,7 +1257,9 @@ pub fn cg_decl_emit_ev_typedef() ! Diag.Report {
     let builtins = builtin_ev_slots()
     let mut vtables = builtins.vtables
     let mut fields = builtins.fields
-    if !emit_fs_vtable(false) { return }
+    for root in builtin_op_roots() {
+        if !emit_builtin_vtable(root, false) { return }
+    }
     for e in cg_reg_effect_decls() {
         let slot_tid = make_handler_type(node_name(e))
         let vtable = c_vtable_type_name(slot_tid)
@@ -1280,24 +1288,23 @@ fn ev_slot_nameable(effect_decl: Int, vtable: Str, field: Str) -> Bool ! Diag.Re
     true
 }
 
-fn fs_handler_tid() -> Int { make_handler_type("FS") }
-
-// FS's vtable, laid out from the std.fs_ops functions that are its operations' defaults: an
-// FS operation answers a Result of std.fs types, which only a unit that reads std.fs can
-// spell. A program that never loads std.fs_ops gets a vtable of no slots, and one that does
-// gets every slot. The vector is one ABI across the units of a program, so an archive that
-// defines its default for other units always loads std.fs_ops (build_compiler_archive).
+// A compiled builtin root's vtable, laid out from the std functions that are its
+// operations' defaults (std.fs_ops for FS, std.process for Process): an operation answers a
+// Result of std types, which only a unit that reads that module can spell. A program that
+// never loads the module gets a vtable of no slots, and one that does gets every slot. The
+// vector is one ABI across the units of a program, so an archive that defines its default
+// for other units always loads each such module (build_compiler_archive).
 //
 // The unit that defines the vector's default also declares each default body and the
 // default instance here, ahead of the vector that takes its address. The bodies call the
-// std.fs_ops functions with the vector, so they come after it, from emit_fs_default_bodies.
+// std functions with the vector, so they come after it, from emit_builtin_default_bodies.
 //
 // Answers false when a name this stage cannot spell stopped it, as emit_effect_vtable does.
-fn emit_fs_vtable(defines_default: Bool) -> Bool ! Diag.Report {
-    let slot_tid = fs_handler_tid()
+fn emit_builtin_vtable(root: Str, defines_default: Bool) -> Bool ! Diag.Report {
+    let slot_tid = make_handler_type(root)
     let vtable = c_vtable_type_name(slot_tid)
     if mark_of(vtable_state, vtable) == 1 { return false }
-    let sig = fs_vtable_sig(slot_tid)
+    let sig = builtin_vtable_sig(root, slot_tid)
     if !sig.ok {
         vtable_state.own.insert(vtable, 1)
         return false
@@ -1313,15 +1320,15 @@ fn emit_fs_vtable(defines_default: Bool) -> Bool ! Diag.Report {
     true
 }
 
-// Each FS default body hands its arguments and the program's one vector to the std.fs_ops
-// function the operation names. `private` says the unit holds those functions as internal
-// copies, so the prototypes here agree with the definitions on linkage.
-fn emit_fs_default_bodies(private: Bool) ! Diag.Report {
-    let slot_tid = fs_handler_tid()
+// Each default body of a compiled builtin root hands its arguments and the program's one
+// vector to the std function the operation names. `private` says the unit holds those
+// functions as internal copies, so the prototypes here agree with the definitions on linkage.
+fn emit_builtin_default_bodies(root: Str, private: Bool) ! Diag.Report {
+    let slot_tid = make_handler_type(root)
     if mark_of(vtable_state, c_vtable_type_name(slot_tid)) == 1 { return }
-    let sig = fs_vtable_sig(slot_tid)
+    let sig = builtin_vtable_sig(root, slot_tid)
     if !sig.ok { return }
-    let decls = fs_op_decls()
+    let decls = builtin_op_decls(root)
     for d in decls { cg_decl_emit_fn_decl(d, private) }
     let track = ir_sources_pause()
     let mut i = 0
@@ -1374,26 +1381,26 @@ fn emit_io_derived_bodies(private: Bool) ! Diag.Report {
     ir_sources_resume(track)
 }
 
-fn fs_op_decls() -> List[Int] {
+fn builtin_op_decls(root: Str) -> List[Int] {
     let mut out: List[Int] = []
-    for op in cg_reg_fs_ops() { out.push(cg_reg_fs_op_decl(op)) }
+    for op in cg_reg_builtin_ops(root) { out.push(cg_reg_builtin_op_decl(root, op)) }
     out
 }
 
-fn fs_vtable_sig(slot_tid: Int) -> VtableSig ! Diag.Report {
-    let ops = cg_reg_fs_ops()
-    let decls = fs_op_decls()
+fn builtin_vtable_sig(root: Str, slot_tid: Int) -> VtableSig ! Diag.Report {
+    let ops = cg_reg_builtin_ops(root)
+    let decls = builtin_op_decls(root)
     let mut i = 0
     while i < decls.len() {
         if decls.get(i).unwrap() < 0 {
-            diag_ice("FsDefaultBodyNotLoaded", UNSOLVED_TYPEVAR_AT_CODEGEN,
-                "no std.fs_ops default body for FS operation `{ops.get(i).unwrap()}`", 0, 0,
-                "a program that loads std.fs_ops holds every FS default, so a missing one is a compiler bug")
+            diag_ice("BuiltinDefaultBodyNotLoaded", UNSOLVED_TYPEVAR_AT_CODEGEN,
+                "no {builtin_op_module(root)} default body for {root} operation `{ops.get(i).unwrap()}`", 0, 0,
+                "a program that loads {builtin_op_module(root)} holds every {root} default, so a missing one is a compiler bug")
             return VtableSig { slots: [], rets: [], params: [], defaults: [], ok: false }
         }
         i = i + 1
     }
-    vtable_sig_over("FS", slot_tid, ops, decls)
+    vtable_sig_over(root, slot_tid, ops, decls)
 }
 
 // A slot function's body: its arguments and the program's one vector, handed to the std
@@ -1535,7 +1542,7 @@ fn vtable_sig(effect_decl: Int, slot_tid: Int) -> VtableSig ! Diag.Report {
 }
 
 // The signature of operation `names[i]` is read off the function `sigs[i]`: the operation's
-// own declaration for a user effect, the std.fs_ops default for FS.
+// own declaration for a user effect, the std default for FS or Process.
 fn vtable_sig_over(effect_name: Str, slot_tid: Int, names: List[Str], sigs: List[Int]) -> VtableSig ! Diag.Report {
     let mut slots: List[Str] = []
     let mut rets: List[Str] = []

@@ -1632,7 +1632,6 @@ fn ev_field_of(handler_tid: Int, node: Int) -> Str ! Diag.Report {
 let NS_IO = "io"
 let NS_ENV = "env"
 let NS_TIME = "time"
-let NS_FS = "fs"
 let ENV_VAR = "var"
 let TIME_READ = "read"
 
@@ -1665,7 +1664,7 @@ fn slot_read(node: Int, handler_tid: Int) -> Int ! Diag.Report {
 }
 
 // The builtin roots whose namespace performs through the evidence vector.
-fn vector_performing_roots() -> List[Str] { ["IO", "FS", "Time", "Env"] }
+fn vector_performing_roots() -> List[Str] { ["IO", "FS", "Process", "Time", "Env"] }
 
 // The root effect behind a builtin namespace. A namespace is the name of its root's field,
 // so the match is on cname's field producer, and the namespace a caller writes and the field
@@ -1677,7 +1676,7 @@ fn builtin_handler_tid(ns: Str, node: Int) -> Int ! Diag.Report {
     }
     diag_ice_at("BuiltinNamespaceNotAnEffect", UNSOLVED_TYPEVAR_AT_CODEGEN,
         "namespace `{ns}` owns no field of the evidence vector", node,
-        "only the io, fs, env and time namespaces perform through the vector; this is a compiler bug")
+        "only the io, fs, process, env and time namespaces perform through the vector; this is a compiler bug")
     -1
 }
 
@@ -1744,12 +1743,12 @@ pub fn cg_eff_lower_builtin_default_perform(node: Int, handler_tid: Int) -> Int 
     perform_op(node, handler_tid, node_method(node))
 }
 
-// An operation of the fs namespace, reached through FS's vtable. Typecheck held the call to
-// the operation's signature, which is the slot's, so the arguments pass as they are.
-pub fn cg_eff_lower_fs_perform(node: Int, method: Str) -> Int ! Diag.Report {
-    let handler_tid = builtin_handler_tid(NS_FS, node)
-    if handler_tid < 0 { return -1 }
-    perform_op(node, handler_tid, method)
+// An operation of a compiled builtin root (FS or Process), reached through the root's vtable
+// with operands the caller lowered in the order the operation's default declares them.
+// Typecheck held the call to that default's signature, which is the slot's, and filled each
+// keyword argument the call left out, so a keyword or a fill has its slot by then.
+pub fn cg_eff_lower_builtin_op_perform(node: Int, root: Str, op: Str, operands: List[Int]) -> Int ! Diag.Report {
+    perform_lowered(node, make_handler_type(root), op, operands)
 }
 
 // An operation of IO.Read, reached through the IO vtable's slot of the same name. The count
@@ -1769,6 +1768,13 @@ fn io_read_checked_count(node: Int, count: Int) -> Int ! Diag.Report {
 }
 
 fn perform_op(node: Int, handler_tid: Int, op: Str) -> Int ! Diag.Report {
+    match lower_args(node) {
+        None => -1
+        Some(lowered) => perform_lowered(node, handler_tid, op, lowered)
+    }
+}
+
+fn perform_lowered(node: Int, handler_tid: Int, op: Str, lowered: List[Int]) -> Int ! Diag.Report {
     let slot = c_effect_vtable_slot_name(handler_tid, op)
     if diag_is_ice_seg(slot) {
         diag_ice_at("HandlerOpNotNameable", UNSOLVED_TYPEVAR_AT_CODEGEN,
@@ -1780,19 +1786,14 @@ fn perform_op(node: Int, handler_tid: Int, op: Str) -> Int ! Diag.Report {
     if tid < 0 { return -1 }
     let rec = perform_layout(tid, Position.Local, node)
     if rec.c_spelling == "" { return -1 }
-    match lower_args(node) {
-        None => -1
-        Some(lowered) => {
-            let read = slot_read(node, handler_tid)
-            if read < 0 { return -1 }
-            if c_ev_field_name(handler_tid) != NS_IO || op != IO_READ_PRIMITIVE || lowered.len() != 1 {
-                return ir_effect_perform(tid, node, rec.c_spelling, slot, rec.slot_form, read, lowered)
-            }
-            let count = io_read_checked_count(node, lowered.get(0).unwrap())
-            if count < 0 { return -1 }
-            ir_effect_perform(tid, node, rec.c_spelling, slot, rec.slot_form, read, [count])
-        }
+    let read = slot_read(node, handler_tid)
+    if read < 0 { return -1 }
+    if c_ev_field_name(handler_tid) != NS_IO || op != IO_READ_PRIMITIVE || lowered.len() != 1 {
+        return ir_effect_perform(tid, node, rec.c_spelling, slot, rec.slot_form, read, lowered)
     }
+    let count = io_read_checked_count(node, lowered.get(0).unwrap())
+    if count < 0 { return -1 }
+    ir_effect_perform(tid, node, rec.c_spelling, slot, rec.slot_form, read, [count])
 }
 
 // time.read and time.sleep, reached through the same vtable-slot road as

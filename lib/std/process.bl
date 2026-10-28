@@ -9,6 +9,7 @@
 // test orchestrator that wants Ctrl-C to clean up its workers) or when
 // you need to overlap a long-running child with other work in the
 // parent. For one-shot capture-and-block, `process_run` is simpler.
+import std.errno.{Errno}
 
 /// Captured outputs from a finished child process. runtime.h defines the
 /// C struct (bootstrap/runtime_process.h), so these fields must match it.
@@ -88,6 +89,158 @@ fn c_signal_name(n: Int) -> Str ! () {}
 /// host has no name for.
 pub fn signal_name(n: Int) -> Str {
     c_signal_name(n)
+}
+
+/// The operation a `ProcessError` comes from.
+pub type ProcessOp {
+    Run
+    Spawn
+    Wait
+    Exec
+    Signal
+}
+
+/// A failed `process.*` operation: the program was not found or could not start, the
+/// wait failed, or the signal could not be sent. An exit code is never an error.
+pub type ProcessError {
+    op: ProcessOp
+    cmd: Str
+    code: Errno
+}
+
+@ffi("blink_strerror")
+@trusted(audit: "Wraps strerror_r(3) through the blink_strerror shim, which renders the message into a local buffer and returns an owned GC copy. Pure lookup, thread-safe, no side effects, no memory shared back to C.")
+fn c_process_strerror(code: Int) -> Str ! () {}
+
+// A ProcessError renders as `op cmd: message` (sections/04_effects.md §4.4.8), the
+// convention FsError uses, e.g. `run gti: No such file or directory`.
+impl Display for ProcessError {
+    fn fmt(self, sb: StringBuilder) {
+        let op = match self.op {
+            ProcessOp.Run => "run"
+            ProcessOp.Spawn => "spawn"
+            ProcessOp.Wait => "wait"
+            ProcessOp.Exec => "exec"
+            ProcessOp.Signal => "signal"
+        }
+        let code = match self.code {
+            Errno(c) => c
+        }
+        sb.write("{op} {self.cmd}: {c_process_strerror(code)}")
+    }
+}
+
+/// A child that `process.spawn` started. It has no methods: `process.wait` and
+/// `process.signal` take it. Every copy is the same child, so a second wait returns the
+/// result of the first.
+// A pointer to the runtime's child box (bootstrap/runtime_process.h), which keeps the
+// result of the first wait for every copy.
+@ffi.opaque(name: "blink_child_box")
+pub type Child
+
+@ffi("blink_child_run")
+@trusted(audit: "STD-PROCESS")
+fn c_child_run(cmd: Str, args: List[Str], has_stdin: Int, stdin: Str) -> Child ! Process.Spawn {}
+
+@ffi("blink_child_spawn")
+@trusted(audit: "STD-PROCESS")
+fn c_child_spawn(cmd: Str, args: List[Str]) -> Child ! Process.Spawn {}
+
+@ffi("blink_child_wait")
+@trusted(audit: "STD-PROCESS")
+fn c_child_wait(child: Child) -> Int ! Process.Spawn {}
+
+@ffi("blink_child_signal")
+@trusted(audit: "STD-PROCESS")
+fn c_child_signal(child: Child, sig: Int) -> Int ! Process.Signal {}
+
+@ffi("blink_child_exec")
+@trusted(audit: "STD-PROCESS")
+fn c_child_exec(cmd: Str, args: List[Str]) -> Int ! Process.Spawn, Env.Exit {}
+
+@ffi("blink_child_box_err")
+@trusted(audit: "STD-PROCESS")
+fn c_child_err(child: Child) -> Int ! () {}
+
+@ffi("blink_child_box_cmd")
+@trusted(audit: "STD-PROCESS")
+fn c_child_cmd(child: Child) -> Str ! () {}
+
+@ffi("blink_child_box_out")
+@trusted(audit: "STD-PROCESS")
+fn c_child_out(child: Child) -> Str ! () {}
+
+@ffi("blink_child_box_err_out")
+@trusted(audit: "STD-PROCESS")
+fn c_child_err_out(child: Child) -> Str ! () {}
+
+@ffi("blink_child_box_exit_code")
+@trusted(audit: "STD-PROCESS")
+fn c_child_exit_code(child: Child) -> Int ! () {}
+
+@ffi("blink_child_box_end_tag")
+@trusted(audit: "STD-PROCESS")
+fn c_child_end_tag(child: Child) -> Int ! () {}
+
+@ffi("blink_child_box_end_value")
+@trusted(audit: "STD-PROCESS")
+fn c_child_end_value(child: Child) -> Int ! () {}
+
+// The box holds the result once its run or wait succeeded. The tags are the ChildEnd
+// tags of runtime_process.h; no Limit end exists until child limits do.
+fn child_result(child: Child) -> ProcessResult {
+    let tag = c_child_end_tag(child)
+    let value = c_child_end_value(child)
+    let end = if tag == 1 { ChildEnd.Signaled(value) } else { ChildEnd.Exited(value) }
+    ProcessResult { out: c_child_out(child), err_out: c_child_err_out(child), exit_code: c_child_exit_code(child), end: end }
+}
+
+/// The default `process.run`: runs `cmd` to its end and returns its output and end.
+pub fn process_do_run(cmd: Str, args: List[Str], -- stdin: Str? = None) -> Result[ProcessResult, ProcessError] ! Process.Spawn {
+    let child = match stdin {
+        Some(input) => c_child_run(cmd, args, 1, input)
+        None => c_child_run(cmd, args, 0, "")
+    }
+    let code = c_child_err(child)
+    if code != 0 {
+        return Err(ProcessError { op: ProcessOp.Run, cmd: cmd, code: Errno(code) })
+    }
+    Ok(child_result(child))
+}
+
+/// The default `process.spawn`: starts `cmd` and returns at once.
+pub fn process_do_spawn(cmd: Str, args: List[Str]) -> Result[Child, ProcessError] ! Process.Spawn {
+    let child = c_child_spawn(cmd, args)
+    let code = c_child_err(child)
+    if code != 0 {
+        return Err(ProcessError { op: ProcessOp.Spawn, cmd: cmd, code: Errno(code) })
+    }
+    Ok(child)
+}
+
+/// The default `process.wait`: waits for the child to end, or returns its result again.
+pub fn process_do_wait(child: Child) -> Result[ProcessResult, ProcessError] ! Process.Spawn {
+    let code = c_child_wait(child)
+    if code != 0 {
+        return Err(ProcessError { op: ProcessOp.Wait, cmd: c_child_cmd(child), code: Errno(code) })
+    }
+    Ok(child_result(child))
+}
+
+/// The default `process.signal`: sends `sig` to a child that has not been waited on.
+pub fn process_do_signal(child: Child, sig: Int) -> Result[(), ProcessError] ! Process.Signal {
+    let code = c_child_signal(child, sig)
+    if code != 0 {
+        return Err(ProcessError { op: ProcessOp.Signal, cmd: c_child_cmd(child), code: Errno(code) })
+    }
+    Ok(())
+}
+
+/// The default `process.exec`: replaces this program with `cmd`, so it returns only
+/// when that failed.
+pub fn process_do_exec(cmd: Str, args: List[Str]) -> Result[Never, ProcessError] ! Process.Spawn, Env.Exit {
+    let code = c_child_exec(cmd, args)
+    Err(ProcessError { op: ProcessOp.Exec, cmd: cmd, code: Errno(code) })
 }
 
 /// Opaque handle to a spawned child process. Wraps a runtime-side slot

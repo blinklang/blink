@@ -390,6 +390,31 @@ static blink_pid_slot* blink_pid_table_get_locked(int64_t h) {
     if (slot->gen != h / BLINK_PID_TABLE_CAP) return NULL;
     return slot;
 }
+
+/* Caller holds blink_pid_table_mu. Frees a reaped slot for reuse and keeps its result
+ * until the kept-bytes bound drops it. A second free of one slot does nothing. */
+static void blink_pid_slot_free_locked(blink_pid_slot* slot) {
+    if (slot->free) return;
+    slot->free = 1;
+    int64_t tail = (blink_pid_waited_head + blink_pid_waited_len) % BLINK_PID_TABLE_CAP;
+    blink_pid_waited[tail] = slot - blink_pid_table;
+    blink_pid_waited_len++;
+    slot->kept_bytes = blink_str_len(slot->cached.out) + blink_str_len(slot->cached.err_out);
+    blink_pid_kept_bytes += slot->kept_bytes;
+    /* Kept results stay reachable from this static table, so without a bound a
+     * program that spawns many children with large output keeps them all. */
+    while (blink_pid_kept_bytes > BLINK_PID_KEPT_BYTES
+           && blink_pid_waited_len - blink_pid_waited_dropped > 1) {
+        int64_t at = (blink_pid_waited_head + blink_pid_waited_dropped) % BLINK_PID_TABLE_CAP;
+        blink_pid_slot* old = &blink_pid_table[blink_pid_waited[at]];
+        blink_pid_kept_bytes -= old->kept_bytes;
+        old->kept_bytes = 0;
+        old->cached.out = BLINK_STR_EMPTY;
+        old->cached.err_out = BLINK_STR_EMPTY;
+        old->gen++;
+        blink_pid_waited_dropped++;
+    }
+}
 #endif
 
 BLINK_RT_FN int64_t blink_process_spawn(const char* cmd, const blink_list* args);
@@ -494,27 +519,7 @@ BLINK_RT_FN blink_ProcessResult blink_process_pid_wait(int64_t handle) {
         return blink_process_result_none(blink_str_from_cstr_gc("invalid pid handle"));
     }
     blink_ProcessResult result = slot->cached;
-    if (!slot->free) {
-        slot->free = 1;
-        int64_t tail = (blink_pid_waited_head + blink_pid_waited_len) % BLINK_PID_TABLE_CAP;
-        blink_pid_waited[tail] = slot - blink_pid_table;
-        blink_pid_waited_len++;
-        slot->kept_bytes = blink_str_len(slot->cached.out) + blink_str_len(slot->cached.err_out);
-        blink_pid_kept_bytes += slot->kept_bytes;
-        /* Kept results stay reachable from this static table, so without a bound a
-         * program that spawns many children with large output keeps them all. */
-        while (blink_pid_kept_bytes > BLINK_PID_KEPT_BYTES
-               && blink_pid_waited_len - blink_pid_waited_dropped > 1) {
-            int64_t at = (blink_pid_waited_head + blink_pid_waited_dropped) % BLINK_PID_TABLE_CAP;
-            blink_pid_slot* old = &blink_pid_table[blink_pid_waited[at]];
-            blink_pid_kept_bytes -= old->kept_bytes;
-            old->kept_bytes = 0;
-            old->cached.out = BLINK_STR_EMPTY;
-            old->cached.err_out = BLINK_STR_EMPTY;
-            old->gen++;
-            blink_pid_waited_dropped++;
-        }
-    }
+    blink_pid_slot_free_locked(slot);
     pthread_mutex_unlock(&blink_pid_table_mu);
     return result;
 }
@@ -545,6 +550,426 @@ BLINK_RT_FN int64_t blink_process_pid_send_signal(int64_t handle, int64_t sig);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN int64_t blink_process_pid_send_signal(int64_t handle, int64_t sig) {
     return blink_pid_dispatch_signal(handle, (int)sig);
+}
+#endif
+
+/* ── Child box: the Result surface of std.process ─────────────────────
+ * process.run/spawn/wait/signal/exec (sections/04_effects.md §4.4.8) report each failure
+ * as an errno, which lib/std/process.bl turns into Err(ProcessError). The entry points
+ * above keep their sentinel results for the free fns until those are removed.
+ *
+ * A Child is a pointer to one of these boxes, so every copy of a Child sees the one
+ * wait: the box keeps the result of the first wait, and a later wait returns it again.
+ * cmd is the program the box was made for, so an error on a later op can name it.
+ * err is the errno of the op that made or last used the box, 0 when it succeeded.
+ * handle is the pid table handle of a spawned child, -1 for a run. */
+typedef struct {
+    pthread_mutex_t mu;
+    const char* cmd;
+    int64_t handle;
+    int64_t err;
+    int64_t waited;
+    blink_ProcessResult result;
+} blink_child_box;
+
+#if defined(__linux__)
+/* glibc declares pipe2 only past _GNU_SOURCE, which runtime_core.h does not set. */
+int pipe2(int pipefd[2], int flags);
+#endif
+
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+/* Every pipe of a child op is close-on-exec, so a child that another thread forks at the
+ * same time does not keep this child's pipes open: a read end then sees EOF only when its
+ * own child closes it. dup2 onto 0/1/2 clears the flag on the copy the child keeps. */
+static int blink_child_pipe(int fds[2]) {
+#if defined(__linux__)
+    return pipe2(fds, O_CLOEXEC);
+#else
+    if (pipe(fds) < 0) return -1;
+    fcntl(fds[0], F_SETFD, FD_CLOEXEC);
+    fcntl(fds[1], F_SETFD, FD_CLOEXEC);
+    return 0;
+#endif
+}
+
+static void blink_child_close_pair(int fds[2]) {
+    if (fds[0] >= 0) close(fds[0]);
+    if (fds[1] >= 0) close(fds[1]);
+    fds[0] = -1;
+    fds[1] = -1;
+}
+
+static blink_child_box* blink_child_box_new(const char* cmd) {
+    blink_child_box* b = (blink_child_box*)blink_alloc(sizeof(blink_child_box));
+    pthread_mutex_init(&b->mu, NULL);
+    b->cmd = cmd;
+    b->handle = -1;
+    b->err = 0;
+    b->waited = 0;
+    b->result = blink_process_result_none(BLINK_STR_EMPTY);
+    return b;
+}
+
+/* A C string stops at its first NUL, so a NUL inside cmd or an arg would reach the child
+ * as a shorter string than the caller wrote. */
+static int blink_child_strings_ok(const char* cmd, const blink_list* args) {
+    if (memchr(cmd, 0, (size_t)blink_str_len(cmd)) != NULL) return 0;
+    int64_t n = args ? args->len : 0;
+    for (int64_t i = 0; i < n; i++) {
+        const char* a = (const char*)args->items[i];
+        if (memchr(a, 0, (size_t)blink_str_len(a)) != NULL) return 0;
+    }
+    return 1;
+}
+
+/* Runs in the forked child, so it only calls async-signal-safe functions: the argv was
+ * built before the fork. stdin_fd < 0 means the null device. If the exec fails, the errno
+ * goes to the parent through err_fd and the child exits without running atexit hooks. */
+static void blink_child_exec_or_report(char** argv, int stdin_fd, int out_fd, int err_fd, int report_fd) {
+    int e = 0;
+    int in = stdin_fd;
+    if (in < 0) {
+        in = open("/dev/null", O_RDONLY);
+        if (in < 0) e = errno;
+    }
+    if (e == 0 && dup2(in, STDIN_FILENO) < 0) e = errno;
+    if (e == 0 && dup2(out_fd, STDOUT_FILENO) < 0) e = errno;
+    if (e == 0 && dup2(err_fd, STDERR_FILENO) < 0) e = errno;
+    if (e == 0) {
+        execvp(argv[0], argv);
+        e = errno;
+    }
+    ssize_t w;
+    do { w = write(report_fd, &e, sizeof(e)); } while (w < 0 && errno == EINTR);
+    _exit(127);
+}
+
+/* The parent's side of the report pipe: 0 once the child's exec succeeded (its copy of
+ * the close-on-exec write end closed with no bytes), else the errno the child sent. */
+static int blink_child_read_report(int report_fd) {
+    int e = 0;
+    ssize_t got = 0;
+    while (got < (ssize_t)sizeof(e)) {
+        ssize_t n = read(report_fd, (char*)&e + got, sizeof(e) - (size_t)got);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) break;
+        got += n;
+    }
+    close(report_fd);
+    return got == (ssize_t)sizeof(e) ? (e != 0 ? e : EIO) : 0;
+}
+
+/* Forks a child on the given pipes and returns 0 with *pid_out set once it has exec'd,
+ * or the errno of the fork or the exec. A child whose exec failed is reaped here. */
+static int blink_child_fork_exec(char** argv, int stdin_fd, int out_fd, int err_fd, pid_t* pid_out) {
+    int report[2] = {-1, -1};
+    if (blink_child_pipe(report) < 0) return errno;
+    pid_t pid = fork();
+    if (pid < 0) {
+        int e = errno;
+        blink_child_close_pair(report);
+        return e;
+    }
+    if (pid == 0) {
+        close(report[0]);
+        blink_child_exec_or_report(argv, stdin_fd, out_fd, err_fd, report[1]);
+    }
+    close(report[1]);
+    int e = blink_child_read_report(report[0]);
+    if (e != 0) {
+        int status;
+        while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+        return e;
+    }
+    *pid_out = pid;
+    return 0;
+}
+
+/* Writes in_data to in_fd while it drains out_fd and err_fd, all in one poll loop, so a
+ * child that writes before it has read all its input cannot block the parent, nor the
+ * parent the child. in_fd is closed once all is written or the child closed its end; a
+ * child that exits without reading its input is not an error. SIGPIPE is blocked in this
+ * thread for the loop and a SIGPIPE the loop raised is taken back, so no other thread's
+ * signal disposition changes. */
+static void blink_child_pump(int in_fd, const char* in_data, int64_t in_len,
+                             int out_fd, int err_fd, char** out, char** err) {
+    sigset_t pipe_set, old_mask, pending;
+    sigemptyset(&pipe_set);
+    sigaddset(&pipe_set, SIGPIPE);
+    pthread_sigmask(SIG_BLOCK, &pipe_set, &old_mask);
+    sigpending(&pending);
+    int pipe_was_pending = sigismember(&pending, SIGPIPE);
+    int raised_pipe = 0;
+
+    int open_in = in_fd >= 0, open_out = out_fd >= 0, open_err = err_fd >= 0;
+    int64_t written = 0;
+    if (open_in && in_len == 0) { close(in_fd); open_in = 0; }
+    if (open_in) {
+        int fl = fcntl(in_fd, F_GETFL);
+        if (fl >= 0) fcntl(in_fd, F_SETFL, fl | O_NONBLOCK);
+    }
+    int64_t cap_o = 4096, len_o = 0, cap_e = 4096, len_e = 0;
+    char* buf_o = (char*)blink_alloc_atomic(cap_o);
+    char* buf_e = (char*)blink_alloc_atomic(cap_e);
+    while (open_in || open_out || open_err) {
+        struct pollfd pfds[3];
+        int n = 0;
+        struct pollfd* p_in = NULL;
+        struct pollfd* p_out = NULL;
+        struct pollfd* p_err = NULL;
+        if (open_in) { pfds[n].fd = in_fd; pfds[n].events = POLLOUT; pfds[n].revents = 0; p_in = &pfds[n]; n++; }
+        if (open_out) { pfds[n].fd = out_fd; pfds[n].events = POLLIN; pfds[n].revents = 0; p_out = &pfds[n]; n++; }
+        if (open_err) { pfds[n].fd = err_fd; pfds[n].events = POLLIN; pfds[n].revents = 0; p_err = &pfds[n]; n++; }
+        int pr = poll(pfds, (nfds_t)n, -1);
+        if (pr < 0) { if (errno == EINTR) continue; break; }
+        if (p_in && (p_in->revents & (POLLOUT | POLLERR | POLLHUP))) {
+            ssize_t w = write(in_fd, in_data + written, (size_t)(in_len - written));
+            if (w > 0) written += w;
+            if (w < 0 && errno == EPIPE) raised_pipe = 1;
+            if ((w < 0 && errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK)
+                || written >= in_len) {
+                close(in_fd);
+                open_in = 0;
+            }
+        }
+        blink_pump_fd(out_fd, &open_out, p_out, &buf_o, &cap_o, &len_o);
+        blink_pump_fd(err_fd, &open_err, p_err, &buf_e, &cap_e, &len_e);
+    }
+    if (open_in) close(in_fd);
+    if (open_out) close(out_fd);
+    if (open_err) close(err_fd);
+    *out = (char*)blink_str_from_bytes(buf_o, len_o);
+    *err = (char*)blink_str_from_bytes(buf_e, len_e);
+
+    if (raised_pipe && !pipe_was_pending) {
+        sigpending(&pending);
+        if (sigismember(&pending, SIGPIPE)) {
+            int got;
+            sigwait(&pipe_set, &got);
+        }
+    }
+    pthread_sigmask(SIG_SETMASK, &old_mask, NULL);
+}
+
+/* waitpid that retries on EINTR. Returns 0 and the status, or the errno. */
+static int blink_child_waitpid(pid_t pid, int* status) {
+    while (waitpid(pid, status, 0) < 0) {
+        if (errno != EINTR) return errno;
+    }
+    return 0;
+}
+#endif
+
+/* process.run: the box holds the result, or err when no result came. has_stdin 0 gives
+ * the child the null device for its input. */
+BLINK_RT_FN blink_child_box* blink_child_run(const char* cmd, const blink_list* args, int64_t has_stdin, const char* stdin_data);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN blink_child_box* blink_child_run(const char* cmd, const blink_list* args, int64_t has_stdin, const char* stdin_data) {
+    blink_child_box* box = blink_child_box_new(cmd);
+    if (!blink_child_strings_ok(cmd, args)) { box->err = EINVAL; return box; }
+    char** argv = blink_process_build_argv(cmd, args);
+    int in_pipe[2] = {-1, -1}, out_pipe[2] = {-1, -1}, err_pipe[2] = {-1, -1};
+    if ((has_stdin && blink_child_pipe(in_pipe) < 0) || blink_child_pipe(out_pipe) < 0
+        || blink_child_pipe(err_pipe) < 0) {
+        box->err = errno;
+        blink_child_close_pair(in_pipe);
+        blink_child_close_pair(out_pipe);
+        blink_child_close_pair(err_pipe);
+        return box;
+    }
+    pid_t pid = -1;
+    int e = blink_child_fork_exec(argv, in_pipe[0], out_pipe[1], err_pipe[1], &pid);
+    if (in_pipe[0] >= 0) close(in_pipe[0]);
+    close(out_pipe[1]);
+    close(err_pipe[1]);
+    if (e != 0) {
+        if (in_pipe[1] >= 0) close(in_pipe[1]);
+        close(out_pipe[0]);
+        close(err_pipe[0]);
+        box->err = e;
+        return box;
+    }
+    char* out = (char*)"";
+    char* err = (char*)"";
+    blink_child_pump(in_pipe[1], stdin_data, has_stdin ? blink_str_len(stdin_data) : 0,
+                     out_pipe[0], err_pipe[0], &out, &err);
+    /* As blink_process_run_with_stdin: a Ctrl-C while the child runs reaches it, and the
+     * parent takes it once the child is reaped. */
+    blink_child_pid = pid;
+    blink_got_sigint = 0;
+    struct sigaction sa_int_old, sa_int_new;
+    memset(&sa_int_new, 0, sizeof(sa_int_new));
+    sa_int_new.sa_handler = blink_sigint_handler;
+    sa_int_new.sa_flags = SA_RESTART;
+    sigaction(SIGINT, &sa_int_new, &sa_int_old);
+    int status = 0;
+    int we = blink_child_waitpid(pid, &status);
+    sigaction(SIGINT, &sa_int_old, NULL);
+    blink_child_pid = 0;
+    if (we != 0) {
+        box->err = we;
+    } else {
+        box->result.out = out;
+        box->result.err_out = err;
+        blink_process_result_set_status(&box->result, status);
+        box->waited = 1;
+    }
+    if (blink_got_sigint) raise(SIGINT);
+    return box;
+}
+#endif
+
+/* process.spawn: err is EAGAIN when the pid table has no free slot, else the errno of the
+ * pipe, fork or exec. A slot is taken only for a child that exec'd. */
+BLINK_RT_FN blink_child_box* blink_child_spawn(const char* cmd, const blink_list* args);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN blink_child_box* blink_child_spawn(const char* cmd, const blink_list* args) {
+    blink_child_box* box = blink_child_box_new(cmd);
+    if (!blink_child_strings_ok(cmd, args)) { box->err = EINVAL; return box; }
+    char** argv = blink_process_build_argv(cmd, args);
+    int64_t h = blink_pid_table_alloc();
+    if (h < 0) { box->err = EAGAIN; return box; }
+    blink_pid_slot* slot = &blink_pid_table[h % BLINK_PID_TABLE_CAP];
+    int out_pipe[2] = {-1, -1}, err_pipe[2] = {-1, -1};
+    int e = 0;
+    pid_t pid = -1;
+    if (blink_child_pipe(out_pipe) < 0 || blink_child_pipe(err_pipe) < 0) {
+        e = errno;
+        blink_child_close_pair(out_pipe);
+        blink_child_close_pair(err_pipe);
+    } else {
+        e = blink_child_fork_exec(argv, -1, out_pipe[1], err_pipe[1], &pid);
+        close(out_pipe[1]);
+        close(err_pipe[1]);
+        if (e != 0) {
+            close(out_pipe[0]);
+            close(err_pipe[0]);
+        }
+    }
+    if (e != 0) {
+        pthread_mutex_lock(&blink_pid_table_mu);
+        slot->reaped = 1;
+        blink_pid_slot_free_locked(slot);
+        pthread_mutex_unlock(&blink_pid_table_mu);
+        box->err = e;
+        return box;
+    }
+    pthread_mutex_lock(&blink_pid_table_mu);
+    slot->pid = pid;
+    slot->out_fd = out_pipe[0];
+    slot->err_fd = err_pipe[0];
+    pthread_mutex_unlock(&blink_pid_table_mu);
+    box->handle = h;
+    return box;
+}
+#endif
+
+/* process.wait: 0 once the box holds the result, else the errno; ECHILD when the box
+ * names no child the table still has. Waits on one box run one at a time, so the second
+ * returns the first's result. The child is reaped under the table lock, after a wait that
+ * leaves it a zombie: until then its pid stays its own, so a signal sent before the reap
+ * cannot reach a later process that the OS gave the same pid. */
+BLINK_RT_FN int64_t blink_child_wait(blink_child_box* box);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN int64_t blink_child_wait(blink_child_box* box) {
+    pthread_mutex_lock(&box->mu);
+    if (box->waited) {
+        pthread_mutex_unlock(&box->mu);
+        return 0;
+    }
+    pthread_mutex_lock(&blink_pid_table_mu);
+    blink_pid_slot* slot = box->handle >= 0 ? blink_pid_table_get_locked(box->handle) : NULL;
+    if (slot && (slot->free || slot->reaped || slot->pid <= 0)) slot = NULL;
+    pthread_mutex_unlock(&blink_pid_table_mu);
+    if (!slot) {
+        pthread_mutex_unlock(&box->mu);
+        return ECHILD;
+    }
+    /* Only this box owns the slot, and the slot stays claimed until the free below, so its
+     * fds and pid are read without the table lock. */
+    char* out = (char*)"";
+    char* err = (char*)"";
+    blink_child_pump(-1, NULL, 0, slot->out_fd, slot->err_fd, &out, &err);
+    slot->out_fd = -1;
+    slot->err_fd = -1;
+    int e = 0;
+    siginfo_t info;
+    while (waitid(P_PID, (id_t)slot->pid, &info, WEXITED | WNOWAIT) < 0) {
+        if (errno != EINTR) { e = errno; break; }
+    }
+    int status = 0;
+    pthread_mutex_lock(&blink_pid_table_mu);
+    if (e == 0) e = blink_child_waitpid(slot->pid, &status);
+    slot->reaped = 1;
+    slot->cached = blink_process_result_none(BLINK_STR_EMPTY);
+    blink_pid_slot_free_locked(slot);
+    pthread_mutex_unlock(&blink_pid_table_mu);
+    if (e == 0) {
+        box->result.out = out;
+        box->result.err_out = err;
+        blink_process_result_set_status(&box->result, status);
+        box->waited = 1;
+    }
+    /* The slot is free either way, so a later wait on this box gives ECHILD. */
+    __atomic_store_n(&box->handle, (int64_t)-1, __ATOMIC_RELEASE);
+    box->err = e;
+    pthread_mutex_unlock(&box->mu);
+    return e;
+}
+#endif
+
+/* process.signal: 0 or the errno of kill(2); ESRCH once the child was waited or reaped,
+ * checked under the table lock, so the pid cannot have passed to another process. */
+BLINK_RT_FN int64_t blink_child_signal(blink_child_box* box, int64_t sig);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN int64_t blink_child_signal(blink_child_box* box, int64_t sig) {
+    if (sig < 0 || sig != (int64_t)(int)sig) return EINVAL;
+    int64_t e = ESRCH;
+    pthread_mutex_lock(&blink_pid_table_mu);
+    int64_t h = __atomic_load_n(&box->handle, __ATOMIC_ACQUIRE);
+    blink_pid_slot* slot = h >= 0 ? blink_pid_table_get_locked(h) : NULL;
+    if (slot && !slot->free && !slot->reaped && slot->pid > 0) {
+        e = kill(slot->pid, (int)sig) == 0 ? 0 : errno;
+    }
+    pthread_mutex_unlock(&blink_pid_table_mu);
+    return e;
+}
+#endif
+
+/* process.exec: returns only when the exec failed, with its errno. Buffered output is
+ * flushed first, as the new program replaces this one's buffers. */
+BLINK_RT_FN int64_t blink_child_exec(const char* cmd, const blink_list* args);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN int64_t blink_child_exec(const char* cmd, const blink_list* args) {
+    if (!blink_child_strings_ok(cmd, args)) return EINVAL;
+    char** argv = blink_process_build_argv(cmd, args);
+    fflush(stdout);
+    fflush(stderr);
+    execvp(cmd, argv);
+    return errno;
+}
+#endif
+
+BLINK_RT_FN int64_t blink_child_box_err(blink_child_box* box);
+BLINK_RT_FN const char* blink_child_box_cmd(blink_child_box* box);
+BLINK_RT_FN const char* blink_child_box_out(blink_child_box* box);
+BLINK_RT_FN const char* blink_child_box_err_out(blink_child_box* box);
+BLINK_RT_FN int64_t blink_child_box_exit_code(blink_child_box* box);
+BLINK_RT_FN int64_t blink_child_box_end_tag(blink_child_box* box);
+BLINK_RT_FN int64_t blink_child_box_end_value(blink_child_box* box);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN int64_t blink_child_box_err(blink_child_box* box) { return box->err; }
+BLINK_RT_FN const char* blink_child_box_cmd(blink_child_box* box) { return box->cmd; }
+BLINK_RT_FN const char* blink_child_box_out(blink_child_box* box) { return box->result.out; }
+BLINK_RT_FN const char* blink_child_box_err_out(blink_child_box* box) { return box->result.err_out; }
+BLINK_RT_FN int64_t blink_child_box_exit_code(blink_child_box* box) { return box->result.exit_code; }
+BLINK_RT_FN int64_t blink_child_box_end_tag(blink_child_box* box) { return (int64_t)box->result.end.tag; }
+BLINK_RT_FN int64_t blink_child_box_end_value(blink_child_box* box) {
+    switch (box->result.end.tag) {
+    case blink_ChildEnd_Exited_TAG: return box->result.end.data.Exited._0;
+    case blink_ChildEnd_Signaled_TAG: return box->result.end.data.Signaled._0;
+    default: return 0;
+    }
 }
 #endif
 

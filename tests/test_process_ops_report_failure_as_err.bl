@@ -1,0 +1,142 @@
+// The process.* operations of sections/04_effects.md §4.4.8 answer a failure of the
+// operation itself with Err(ProcessError), never with an exit code. An exit code, even a
+// nonzero one, is an Ok result.
+
+import std.process.{ProcessError, ProcessOp, ChildEnd, SIGTERM}
+import std.errno.{Errno}
+import compile_test_helpers.{compile_and_run}
+
+fn op_name(e: ProcessError) -> Str {
+    match e.op {
+        ProcessOp.Run => "run"
+        ProcessOp.Spawn => "spawn"
+        ProcessOp.Wait => "wait"
+        ProcessOp.Exec => "exec"
+        ProcessOp.Signal => "signal"
+    }
+}
+
+test "run returns the output and end of a child that ran" {
+    let r = process.run("sh", ["-c", "echo out; echo err >&2; exit 3"]).unwrap()
+    assert_eq(r.out, "out\n")
+    assert_eq(r.err_out, "err\n")
+    assert(r.end == ChildEnd.Exited(3), "end was {r.end}")
+}
+
+test "run passes the stdin keyword to the child" {
+    let r = process.run("cat", [], stdin: Some("fed in")).unwrap()
+    assert_eq(r.out, "fed in")
+    assert(r.end == ChildEnd.Exited(0), "end was {r.end}")
+}
+
+test "run of a program that does not exist is Err ENOENT, not an exit code" {
+    match process.run("blink-no-such-program-xyz", []) {
+        Ok(r) => assert(false, "expected Err, got Ok with end {r.end}")
+        Err(e) => {
+            assert_eq(op_name(e), "run")
+            assert_eq(e.cmd, "blink-no-such-program-xyz")
+            assert_eq("{e}", "run blink-no-such-program-xyz: No such file or directory")
+        }
+    }
+}
+
+test "spawn of a program that does not exist is Err ENOENT" {
+    match process.spawn("blink-no-such-program-xyz", []) {
+        Ok(_) => assert(false, "expected Err, got Ok")
+        Err(e) => assert_eq("{e}", "spawn blink-no-such-program-xyz: No such file or directory")
+    }
+}
+
+test "spawn then wait returns the result of the child" {
+    let child = process.spawn("sh", ["-c", "echo spawned; exit 4"]).unwrap()
+    let r = process.wait(child).unwrap()
+    assert_eq(r.out, "spawned\n")
+    assert(r.end == ChildEnd.Exited(4), "end was {r.end}")
+}
+
+test "a second wait, also through a copy of the Child, returns the same result" {
+    let child = process.spawn("sh", ["-c", "echo once"]).unwrap()
+    let copy = child
+    let first = process.wait(child).unwrap()
+    let second = process.wait(copy).unwrap()
+    let third = process.wait(child).unwrap()
+    assert_eq(first.out, "once\n")
+    assert_eq(second.out, "once\n")
+    assert_eq(third.out, "once\n")
+    assert(second.end == first.end, "second end was {second.end}")
+}
+
+test "signal ends a live child, and wait reports the signal" {
+    let child = process.spawn("sleep", ["30"]).unwrap()
+    process.signal(child, SIGTERM).unwrap()
+    let r = process.wait(child).unwrap()
+    assert(r.end == ChildEnd.Signaled(SIGTERM), "end was {r.end}")
+}
+
+test "signal on a child that was waited on is Err ESRCH" {
+    let child = process.spawn("true", []).unwrap()
+    let _ = process.wait(child).unwrap()
+    match process.signal(child, SIGTERM) {
+        Ok(_) => assert(false, "expected Err, got Ok")
+        Err(e) => {
+            assert_eq(op_name(e), "signal")
+            assert_eq("{e}", "signal true: No such process")
+        }
+    }
+}
+
+test "signal with a number that is no signal is Err EINVAL" {
+    let child = process.spawn("sleep", ["30"]).unwrap()
+    match process.signal(child, 100000) {
+        Ok(_) => assert(false, "expected Err, got Ok")
+        Err(e) => assert_eq("{e}", "signal sleep: Invalid argument")
+    }
+    process.signal(child, SIGTERM).unwrap()
+    let _ = process.wait(child)
+}
+
+test "ProcessError renders as op cmd: message" {
+    let e = ProcessError { op: ProcessOp.Exec, cmd: "gti", code: Errno(2) }
+    assert_eq("{e}", "exec gti: No such file or directory")
+}
+
+test "exec of a program that does not exist returns Err ENOENT and the program goes on" {
+    let src = #"
+fn main() ! IO, Process.Spawn, Env.Exit {
+    match process.exec("blink-no-such-program-xyz", ["a"]) {
+        Err(e) => io.println("{e}")
+    }
+    io.println("still here")
+}
+"#
+    let r = compile_and_run(src, "_process_exec_enoent")
+    assert(r.exit_code == 0, "compile or run failed: {r.out}{r.err_out}")
+    assert_eq(r.out, "exec blink-no-such-program-xyz: No such file or directory\nstill here\n")
+}
+
+test "exec that succeeds replaces the program, so the code after it never runs" {
+    let src = #"
+fn main() ! IO, Process.Spawn, Env.Exit {
+    io.println("before")
+    let _ = process.exec("sh", ["-c", "echo replaced; exit 7"])
+    io.println("after")
+}
+"#
+    let r = compile_and_run(src, "_process_exec_replaces")
+    assert_eq(r.out, "before\nreplaced\n")
+    assert(r.exit_code == 7, "exit was {r.exit_code}: {r.err_out}")
+}
+
+test "process.run needs no import" {
+    let src = #"
+fn main() ! IO, Process.Spawn {
+    match process.run("sh", ["-c", "echo hi"]) {
+        Ok(r) => io.print(r.out)
+        Err(e) => io.println("err {e}")
+    }
+}
+"#
+    let r = compile_and_run(src, "_process_run_no_import")
+    assert(r.exit_code == 0, "compile or run failed: {r.out}{r.err_out}")
+    assert_eq(r.out, "hi\n")
+}

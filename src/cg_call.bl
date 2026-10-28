@@ -34,7 +34,7 @@ import typecheck.{
     tc_enum_variant_slots, tc_evar_name, tc_tid_child_count, tc_tid_child,
     tc_evar_field_slots, tc_evfield_name, tc_evfield_tid, tc_member_tid_at_instance,
     tc_struct_field_slots, tc_sfield_name, get_struct_field_tid,
-    tc_names_a_type, tc_is_sealed_list_hof, tc_is_list_generic_adapter, tc_map_generic_adapter, tc_map_generic_adapter_module, tc_call_user_effect, tc_call_builtin_default,
+    tc_names_a_type, tc_is_sealed_list_hof, tc_is_list_generic_adapter, tc_map_generic_adapter, tc_map_generic_adapter_module, tc_call_user_effect, tc_call_builtin_default, tc_handler_effect_root, tc_tid_handler_effect, builtin_op_roots,
     tc_lookup_node_tid, tc_unclaimed_call_tid, tc_list_rename_help, tc_tid_iter_elem,
     tc_call_decl_node, tc_call_decl_is_fn, tc_call_is_skip_intrinsic, tc_tid_name, tc_mc_obj_is_value,
     tc_impl_is_poly_user, tc_poly_user_impl_decl, tc_impl_trait_id, tc_call_trait, tc_impl_is_of_call_trait, tc_qualified_call_trait, tc_names_a_trait, tc_conversion_impl_for, tc_conversion_target_of, tc_conversion_trait_of, tc_is_into_method, CONVERSION_IS_IDENTITY,
@@ -52,7 +52,7 @@ import layout.{
     async_scope_handles_spelling, list_slots_hold_no_pointer,
 }
 import mono.{instances, instance_for_call, instance_of_poly_method, iterator_route_name, iterator_route_module, mark_instance_named}
-import cg_reg.{cg_reg_fn_decls, cg_reg_fns_named, cg_reg_fs_op_decl, cg_reg_impl_decls, cg_reg_impl_of, cg_reg_tid_for_decl}
+import cg_reg.{cg_reg_fn_decls, cg_reg_builtin_op_decl, cg_reg_fns_named, cg_reg_impl_decls, cg_reg_impl_of, cg_reg_tid_for_decl}
 import cname.{
     c_fn_decl_name, c_impl_method_name, c_impl_method_name_q,
     c_display_dispatch_name, c_derive_method_name, c_derived_method_symbol,
@@ -78,7 +78,7 @@ import cg_expr.{
 import cg_stmt.{enum_tag_word, lower_block_into}
 import cg_eff.{
     cg_eff_ev_argument, cg_eff_lower_builtin_perform, cg_eff_lower_time_perform, cg_eff_lower_user_perform,
-    cg_eff_lower_builtin_default_perform, cg_eff_lower_fs_perform,
+    cg_eff_lower_builtin_default_perform, cg_eff_lower_builtin_op_perform,
     cg_eff_lower_spawn_closure, cg_eff_spawn_value_task, cg_eff_pending_thunks, cg_eff_thunk_task_symbol, cg_eff_lower_fn_value,
     cg_eff_lower_io_read_perform,
 }
@@ -2065,6 +2065,7 @@ let ns_ffi = "ffi"
 let ns_net = "net"
 let ns_term = "term"
 let ns_fs = "fs"
+let ns_process = "process"
 let ns_async = "async"
 
 // The io names a handler can replace, and the env names it can. Both lists are written
@@ -2092,6 +2093,7 @@ fn lower_namespace_call(node: Int, obj: Int) -> Int ! Diag.Report {
     if ns == ns_net { return lower_net_call(node, method) }
     if ns == ns_term { return lower_term_call(node, method) }
     if ns == ns_fs { return lower_fs_call(node, method) }
+    if ns == ns_process { return lower_builtin_op_call(node, "Process", method) }
     if ns == ns_async { return lower_async_call(node, method) }
     cc_ns_not_built(node, ns, method)
 }
@@ -2211,8 +2213,38 @@ fn lower_fs_call(node: Int, method: Str) -> Int ! Diag.Report {
     if method == "errno" {
         return cc_build_call(node, c_runtime_helper("fs_errno_get"), NO_RECEIVER, CallForm.Runtime, false)
     }
-    if cg_reg_fs_op_decl(method) < 0 { return cc_ns_not_built(node, ns_fs, method) }
-    cg_eff_lower_fs_perform(node, method)
+    lower_builtin_op_call(node, "FS", method)
+}
+
+// An operation of a compiled builtin root, FS (§4.4.5) or Process (§4.4.8), performed
+// through the root's slot of the vector, so the handler in force answers it. The default
+// that slot starts with is the std function the root's operation table names, and that
+// function's parameters say where each argument goes: a keyword binds by label, and one the
+// call left out takes the default typecheck filled in.
+fn lower_builtin_op_call(node: Int, root: Str, method: Str) -> Int ! Diag.Report {
+    let decl = cg_reg_builtin_op_decl(root, method)
+    if decl < 0 { return cc_ns_not_built(node, root.to_lower(), method) }
+    match cc_args_in_param_order(node, decl, 0) {
+        None => -1
+        Some(operands) => {
+            let lowered = cc_lower_call_operands(node, NO_RECEIVER, operands)
+            for a in lowered {
+                if a < 0 { return -1 }
+            }
+            cg_eff_lower_builtin_op_perform(node, root, method, lowered)
+        }
+    }
+}
+
+// `default.op(args)` in a handler operation. An FS or Process operation binds its arguments
+// as a call of the op's std default does, so it takes the same road as `fs.op` and
+// `process.op`; the other builtin roots pass their written arguments as they are.
+fn lower_builtin_default_call(node: Int) -> Int ! Diag.Report {
+    let handler_tid = tc_call_builtin_default(node)
+    if handler_tid < 0 { return -1 }
+    let root = tc_handler_effect_root(tc_tid_handler_effect(handler_tid))
+    if builtin_op_roots().contains(root) { return lower_builtin_op_call(node, root, node_method(node)) }
+    cg_eff_lower_builtin_default_perform(node, handler_tid)
 }
 
 // Every net method the runtime publishes a call for, keyed to the op name
@@ -3668,7 +3700,7 @@ fn lower_method_call(node: Int) -> Int ! Diag.Report {
     if role == Receiver.TypeOwner { return lower_static_call(node, obj) }
     if role == Receiver.TraitOwner { return lower_trait_qualified_call(node, obj) }
     if role == Receiver.EffectHandle { return cg_eff_lower_user_perform(node) }
-    if role == Receiver.BuiltinDefault { return cg_eff_lower_builtin_default_perform(node, tc_call_builtin_default(node)) }
+    if role == Receiver.BuiltinDefault { return lower_builtin_default_call(node) }
     let mname = node_method(node)
     if cc_is_ptr_field_place(obj, mname) { return cc_lower_ptr_field(node, obj, mname) }
     let recv_tid = tid_of_node(obj)

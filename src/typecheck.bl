@@ -2282,8 +2282,8 @@ fn tc_handler_op_names(eff: Str) -> List[Str] {
     let root = tc_handler_effect_root(eff)
     let sub = if root == eff { "" } else { eff.byte_slice(root.byte_len() + 1, eff.byte_len()) }
     let mut out: List[Str] = []
-    if root == "FS" {
-        for row in fs_op_rows() {
+    if builtin_op_roots().contains(root) {
+        for row in builtin_op_rows(root) {
             if sub == "" || row.sub_effect == sub { out.push(row.op) }
         }
         return out
@@ -7361,6 +7361,22 @@ fn register_ns_intrinsic_sigs() {
     // read, always an Int.
     register_intrinsic_fn_sig("fs.errno", [], TYPE_INT)
 
+    // process.* takes the signature its std.process default declares, keyword and default
+    // included, so the call, a handler clause and the default body cannot differ. The loader
+    // loads std.process for any program that names the handle; one that does not has no
+    // process.* signature to need.
+    match nr_module_names.get(builtin_op_module("Process").replace(".", "_")) {
+        Some(names) => {
+            for row in builtin_op_rows("Process") {
+                match names.sigs.get(row.default_fn) {
+                    Some(sig) => fnsig_map.insert("process.{row.op}", sig)
+                    None => {}
+                }
+            }
+        }
+        None => {}
+    }
+
     register_intrinsic_fn_sig("term.isatty", [TYPE_INT], TYPE_INT)
     register_intrinsic_fn_sig("term.width", [], TYPE_INT)
     register_intrinsic_fn_sig("term.height", [], TYPE_INT)
@@ -8304,14 +8320,14 @@ fn tc_check_builtin_handler_clause(eff_name: Str, m: Int) ! TypeCheck.Resolve, T
     if m == -1 || node_kind(m) != NodeKind.FnDef { return }
     let root = tc_handler_effect_root(eff_name)
     let op = node_name(m)
-    if root == "FS" {
-        let sub = fs_op_sub_effect(op)
-        if sub == "" || (eff_name != "FS" && eff_name != "FS.{sub}") {
+    if builtin_op_roots().contains(root) {
+        let sub = builtin_op_sub_effect(root, op)
+        if sub == "" || (eff_name != root && eff_name != "{root}.{sub}") {
             diag_error_at("UnresolvedMethod", UNRESOLVED_METHOD, "effect `{eff_name}` has no operation `{op}`", m,
-                "the FS operations are read, write, list_dir, stat and delete (§4.4.5)")
+                builtin_op_list_hint(root))
             return
         }
-        tc_check_builtin_clause_sig("FS", "fs", op, m)
+        tc_check_builtin_clause_sig(root, str_to_lower(root), op, m)
         return
     }
     if root != "IO" { return }
@@ -15577,35 +15593,69 @@ fn tc_infer_default_perform(call: Int, root: Str, method: Str) -> Int ! TypeChec
 // operations of §4.4.5. Env's names differ between the spec and the runtime, so it has none
 // here until that is settled; the other builtin roots name none.
 fn builtin_root_has_handler_ops(root: Str) -> Bool {
-    root == "IO" || root == "Time" || root == "FS"
+    root == "IO" || root == "Time" || builtin_op_roots().contains(root)
 }
 
-// The FS operations of §4.4.5, in the order the FS vtable lays out its slots. Each row names
-// the sub-effect that performs the operation (list_dir and stat are reads; there is no FS.List
-// or FS.Stat) and the std.fs_ops function that is its default body. Typecheck reads the rows
-// for the clauses a handler may write and codegen for the vtable, so the two cannot drift.
-pub type FsOpRow {
+// The operations of the builtin roots whose vtable this compiler lays out from std defaults:
+// FS's of §4.4.5 and Process's of §4.4.8, each in the order its vtable lays out its slots.
+// Each row names the sub-effect that performs the operation (list_dir and stat are reads;
+// there is no FS.List or FS.Stat) and the std function that is its default body. Typecheck
+// reads the rows for the clauses a handler may write and codegen for the vtable, so the two
+// cannot drift.
+pub type BuiltinOpRow {
     op: Str
     sub_effect: Str
     default_fn: Str
 }
 
-pub fn fs_op_rows() -> List[FsOpRow] {
-    [
-        FsOpRow { op: "read", sub_effect: "Read", default_fn: "fs_do_read" },
-        FsOpRow { op: "write", sub_effect: "Write", default_fn: "fs_do_write" },
-        FsOpRow { op: "list_dir", sub_effect: "Read", default_fn: "fs_do_list_dir" },
-        FsOpRow { op: "stat", sub_effect: "Read", default_fn: "fs_do_stat" },
-        FsOpRow { op: "delete", sub_effect: "Delete", default_fn: "fs_do_delete" },
-    ]
+pub fn builtin_op_roots() -> List[Str] { ["FS", "Process"] }
+
+pub fn builtin_op_rows(root: Str) -> List[BuiltinOpRow] {
+    match root {
+        "FS" => [
+            BuiltinOpRow { op: "read", sub_effect: "Read", default_fn: "fs_do_read" },
+            BuiltinOpRow { op: "write", sub_effect: "Write", default_fn: "fs_do_write" },
+            BuiltinOpRow { op: "list_dir", sub_effect: "Read", default_fn: "fs_do_list_dir" },
+            BuiltinOpRow { op: "stat", sub_effect: "Read", default_fn: "fs_do_stat" },
+            BuiltinOpRow { op: "delete", sub_effect: "Delete", default_fn: "fs_do_delete" },
+        ]
+        "Process" => [
+            BuiltinOpRow { op: "run", sub_effect: "Spawn", default_fn: "process_do_run" },
+            BuiltinOpRow { op: "spawn", sub_effect: "Spawn", default_fn: "process_do_spawn" },
+            BuiltinOpRow { op: "wait", sub_effect: "Spawn", default_fn: "process_do_wait" },
+            BuiltinOpRow { op: "exec", sub_effect: "Spawn", default_fn: "process_do_exec" },
+            BuiltinOpRow { op: "signal", sub_effect: "Signal", default_fn: "process_do_signal" },
+        ]
+        _ => []
+    }
 }
 
-// The sub-effect that performs an FS operation, or "" for a name that is no FS operation.
-pub fn fs_op_sub_effect(op: Str) -> Str {
-    for row in fs_op_rows() {
+// The module that holds a root's default bodies, as the loader names it.
+pub fn builtin_op_module(root: Str) -> Str {
+    match root {
+        "FS" => "std.fs_ops"
+        "Process" => "std.process"
+        _ => ""
+    }
+}
+
+// The sub-effect that performs an operation of `root`, or "" for a name that is no
+// operation of it.
+pub fn builtin_op_sub_effect(root: Str, op: Str) -> Str {
+    for row in builtin_op_rows(root) {
         if row.op == op { return row.sub_effect }
     }
     ""
+}
+
+// What an unknown clause name is told: the root's operations and where the spec lists them.
+fn builtin_op_list_hint(root: Str) -> Str {
+    let mut ops: List[Str] = []
+    for row in builtin_op_rows(root) { ops.push(row.op) }
+    let last = ops.len() - 1
+    let head = ops.slice(0, last).join(", ")
+    let section = if root == "FS" { "§4.4.5" } else { "§4.4.8" }
+    "the {root} operations are {head} and {ops.get(last).unwrap()} ({section})"
 }
 
 // The IO handler operations of the §4.4 table, each with the sub-effect that performs it.
@@ -15688,9 +15738,9 @@ fn builtin_handler_op_sig(root: Str, op: Str) -> Int {
         register_intrinsic_fn_sig(key, [], runtime_instant_tid())
     } else if root == "Time" && op == "sleep" {
         register_named_intrinsic_fn_sig(key, [runtime_duration_tid()], ["d"], TYPE_VOID)
-    } else if root == "FS" && fs_op_sub_effect(op) != "" {
+    } else if builtin_op_sub_effect(root, op) != "" {
         // The handle call's own signature, so a clause and the call it answers cannot differ.
-        return lookup_fnsig("fs.{op}")
+        return lookup_fnsig("{str_to_lower(root)}.{op}")
     } else if io_sub == "Read" {
         return lookup_fnsig("io.{op}")
     } else {
@@ -16289,6 +16339,7 @@ pub fn is_import_module_name(name: Str) -> Int {
 pub fn is_builtin_namespace(name: Str) -> Int {
     if name == "io" { return 1 }
     if name == "fs" { return 1 }
+    if name == "process" { return 1 }
     if name == "net" { return 1 }
     if name == "env" { return 1 }
     if name == "time" { return 1 }
@@ -34920,7 +34971,12 @@ pub fn is_intrinsic_method(namespace: Str, method: Str) -> Int {
         }
     }
     if namespace == "fs" {
-        if fs_op_sub_effect(method) != "" || method == "errno" {
+        if builtin_op_sub_effect("FS", method) != "" || method == "errno" {
+            return 1
+        }
+    }
+    if namespace == "process" {
+        if builtin_op_sub_effect("Process", method) != "" {
             return 1
         }
     }

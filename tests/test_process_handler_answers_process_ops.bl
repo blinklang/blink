@@ -1,0 +1,145 @@
+// A `handler Process` answers the process.* operations made in its body (sections/04_effects.md
+// §4.4.8 Mock handlers), and an op it leaves out goes to the enclosing handler (§4.7.1). Each
+// row asserts on output a real child cannot produce, so a call that skipped the handler fails.
+
+import compile_test_helpers
+import compile_test_helpers.{compile_and_run}
+
+test "a mock Process handler answers run without starting a program" {
+    let src = #"
+import std.process.{ProcessError, ProcessOp, ProcessResult, ChildEnd}
+import std.errno.{Errno}
+
+fn mock_process() -> Handler[Process] {
+    handler Process {
+        fn run(cmd: Str, args: List[Str], -- stdin: Str?) -> Result[ProcessResult, ProcessError] {
+            if cmd == "fail" {
+                return Err(ProcessError { op: ProcessOp.Run, cmd: "[mock] {cmd}", code: Errno(2) })
+            }
+            let fed = match stdin {
+                Some(s) => s
+                None => "-"
+            }
+            Ok(ProcessResult { out: "[mock] {cmd} {args.len()} {fed}", err_out: "", exit_code: 9, end: ChildEnd.Exited(9) })
+        }
+    }
+}
+
+fn main() ! IO, Process {
+    with mock_process() {
+        let r = process.run("blink-no-such-program-xyz", ["a", "b"]).unwrap()
+        io.println("{r.out} {r.end}")
+        let s = process.run("blink-no-such-program-xyz", [], stdin: Some("in")).unwrap()
+        io.println(s.out)
+        match process.run("fail", []) {
+            Ok(_) => io.println("ok")
+            Err(e) => io.println("{e.cmd}")
+        }
+    }
+}
+"#
+    let r = compile_and_run(src, "_process_handler_mock_run")
+    assert(r.exit_code == 0, "compile or run failed: {r.out}{r.err_out}")
+    assert_eq(r.out, "[mock] blink-no-such-program-xyz 2 - exit 9\n[mock] blink-no-such-program-xyz 0 in\n[mock] fail\n")
+}
+
+// The mock gives only run, so spawn and wait reach the real runtime outside it.
+test "a partial Process handler sends the ops it omits to the enclosing handler" {
+    let src = #"
+import std.process.{ProcessError, ProcessResult, ChildEnd}
+
+fn main() ! IO, Process {
+    with handler Process {
+        fn run(cmd: Str, _args: List[Str], -- _stdin: Str?) -> Result[ProcessResult, ProcessError] {
+            Ok(ProcessResult { out: "[mock] {cmd}", err_out: "", exit_code: 0, end: ChildEnd.Exited(0) })
+        }
+    } {
+        io.println(process.run("sh", []).unwrap().out)
+        let child = process.spawn("sh", ["-c", "echo real"]).unwrap()
+        io.print(process.wait(child).unwrap().out)
+    }
+}
+"#
+    let r = compile_and_run(src, "_process_handler_partial")
+    assert(r.exit_code == 0, "compile or run failed: {r.out}{r.err_out}")
+    assert_eq(r.out, "[mock] sh\nreal\n")
+}
+
+// wait, signal and exec take a real Child or replace the program; their clauses can still
+// answer for the real op and call `default` for the rest.
+test "Process wait, signal and exec clauses answer their ops" {
+    let src = #"
+import std.process.{ProcessError, ProcessOp, ProcessResult, Child, ChildEnd, SIGTERM}
+import std.errno.{Errno}
+
+fn main() ! IO, Process, Env.Exit {
+    with handler Process {
+        fn wait(child: Child) -> Result[ProcessResult, ProcessError] {
+            let r = default.wait(child)?
+            Ok(ProcessResult { out: "[mock wait] {r.out}", err_out: "", exit_code: 0, end: r.end })
+        }
+        fn signal(_child: Child, sig: Int) -> Result[(), ProcessError] {
+            Err(ProcessError { op: ProcessOp.Signal, cmd: "[mock] {sig}", code: Errno(1) })
+        }
+        fn exec(cmd: Str, _args: List[Str]) -> Result[Never, ProcessError] {
+            Err(ProcessError { op: ProcessOp.Exec, cmd: "[mock] {cmd}", code: Errno(1) })
+        }
+    } {
+        let child = process.spawn("sh", ["-c", "echo w"]).unwrap()
+        match process.signal(child, SIGTERM) {
+            Ok(_) => io.println("signal ok")
+            Err(e) => io.println(e.cmd)
+        }
+        io.print(process.wait(child).unwrap().out)
+        match process.exec("sh", ["-c", "echo replaced"]) {
+            Err(e) => io.println(e.cmd)
+        }
+    }
+}
+"#
+    let r = compile_and_run(src, "_process_handler_wait_signal_exec")
+    assert(r.exit_code == 0, "compile or run failed: {r.out}{r.err_out}")
+    assert_eq(r.out, "[mock] 15\n[mock wait] w\n[mock] sh\n")
+}
+
+fn process_handler(clauses: Str) -> Str {
+    "import std.process.\{ProcessError, ProcessResult, Child}\nfn main() ! IO, Process \{\n    with handler Process \{\n{clauses}\n    } \{\n        let _ = process.run(\"x\", [])\n    }\n}\n"
+}
+
+test "a Process run clause that answers ProcessResult instead of a Result is rejected" {
+    let src = process_handler("        fn run(cmd: Str, args: List[Str], -- stdin: Str?) -> ProcessResult \{ default.run(cmd, args).unwrap() }")
+    compile_test_helpers.expect_compile_error(src, "_process_clause_wrong_ret", "E0300")
+}
+
+test "a Process run clause without the stdin parameter is rejected" {
+    let src = process_handler("        fn run(cmd: Str, args: List[Str]) -> Result[ProcessResult, ProcessError] \{ default.run(cmd, args) }")
+    compile_test_helpers.expect_compile_error(src, "_process_clause_missing_param", "E0300")
+}
+
+test "a Process wait clause with a parameter of the wrong type is rejected" {
+    let src = process_handler("        fn wait(child: Int) -> Result[ProcessResult, ProcessError] \{ panic(\"x\") }")
+    compile_test_helpers.expect_compile_error(src, "_process_clause_wrong_param", "E0300")
+}
+
+test "a Process clause naming no Process operation is rejected" {
+    let src = process_handler("        fn kill(child: Child, sig: Int) -> Result[(), ProcessError] \{ Ok(()) }")
+    compile_test_helpers.expect_compile_error(src, "_process_clause_unknown_op", "E0505")
+}
+
+test "a Process.Signal handler clause for the Process.Spawn run operation is rejected" {
+    let src = "import std.process.\{ProcessError, ProcessResult}\nfn main() ! IO, Process \{\n    with handler Process.Signal \{\n        fn run(cmd: Str, args: List[Str], -- stdin: Str?) -> Result[ProcessResult, ProcessError] \{ default.run(cmd, args) }\n    } \{\n        let _ = process.run(\"x\", [])\n    }\n}\n"
+    compile_test_helpers.expect_compile_error(src, "_process_clause_wrong_sub_effect", "E0505")
+}
+
+test "Process clauses with the spec signatures compile clean" {
+    let src = process_handler("        fn run(cmd: Str, args: List[Str], -- stdin: Str?) -> Result[ProcessResult, ProcessError] \{ default.run(cmd, args, stdin: stdin) }\n        fn spawn(cmd: Str, args: List[Str]) -> Result[Child, ProcessError] \{ default.spawn(cmd, args) }\n        fn wait(child: Child) -> Result[ProcessResult, ProcessError] \{ default.wait(child) }\n        fn signal(child: Child, sig: Int) -> Result[(), ProcessError] \{ default.signal(child, sig) }\n        fn exec(cmd: Str, args: List[Str]) -> Result[Never, ProcessError] \{ default.exec(cmd, args) }")
+    let out = compile_test_helpers.compile_and_capture(src, "_process_clause_spec_shape")
+    compile_test_helpers.expect_compiles_clean(out, "spec-shaped Process handler")
+}
+
+// process.run loads std.process without an import, but loading a module does not import it,
+// so its names stay out of this file's scope as any module's do when another one loaded it.
+test "ProcessError cannot be named without an import of std.process" {
+    let src = "fn f(_e: ProcessError) -> Int \{ 0 }\nfn main() ! IO, Process \{\n    let _ = process.run(\"true\", [])\n}\n"
+    compile_test_helpers.expect_compile_error(src, "_process_error_needs_import", "E1006")
+}
