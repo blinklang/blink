@@ -262,11 +262,11 @@ fn shape_refusal(decl: Int, tid: Int, derive: Str) -> Str {
 // Eq names one field twice, once on each side of the comparison: asked twice it would
 // record the same refusal twice, and a count of refusals could no longer tell one gap from
 // two.
-fn field_refused(frec: LayoutRecord, path: Str, span: Int) -> Bool ! Diag.Report {
+fn field_refused(frec: LayoutRecord, label: Str, span: Int) -> Bool ! Diag.Report {
     let reason = frec.decline_reason
     if reason != "" {
         diag_ice_at("DeriveBodyNotBuildable", UNSOLVED_TYPEVAR_AT_CODEGEN,
-            "no C spelling for field `{path}`: {reason}", span,
+            "no C spelling for field `{label}`: {reason}", span,
             "every type that reaches code generation must be concrete and nameable; this is a compiler bug")
         return true
     }
@@ -274,9 +274,9 @@ fn field_refused(frec: LayoutRecord, path: Str, span: Int) -> Bool ! Diag.Report
 }
 
 // The value of one field of `self` or `other`, or -1 after a refusal.
-fn field_value(owner_tid: Int, ftid: Int, path: Str, holder: Str, span: Int) -> Int ! Diag.Report {
+fn field_value(owner_tid: Int, ftid: Int, path: Str, label: Str, holder: Str, span: Int) -> Int ! Diag.Report {
     let frec = field_layout_of(owner_tid, ftid)
-    if field_refused(frec, path, span) { return -1 }
+    if field_refused(frec, label, span) { return -1 }
     field_ref(owner_tid, holder, Position.Param, ftid, frec, path, span)
 }
 
@@ -374,7 +374,8 @@ fn eq_body(decl: Int, tid: Int, span: Int) -> Int ! Diag.Report {
 fn eq_struct_body(tid: Int, span: Int) -> Int ! Diag.Report {
     let mut stmts: List[Int] = []
     for slot in tc_struct_field_slots(tid) {
-        let guard = eq_guard(tid, tc_member_tid_at_instance(tc_sfield_tid(slot), tid), c_field_name(tid, tc_sfield_name(slot)), span)
+        let name = tc_sfield_name(slot)
+        let guard = eq_guard(tid, tc_member_tid_at_instance(tc_sfield_tid(slot), tid), c_field_name(tid, name), name, span)
         if guard < 0 { return -1 }
         stmts.push(guard)
     }
@@ -420,8 +421,9 @@ fn eq_variant_block(tid: Int, slot: Int, span: Int) -> Int ! Diag.Report {
     let vname = tc_evar_name(slot)
     let mut stmts: List[Int] = []
     for f in tc_evar_field_slots(slot) {
-        let path = c_variant_field_path(tid, vname, tc_evfield_name(f))
-        let guard = eq_guard(tid, tc_member_tid_at_instance(tc_evfield_tid(f), tid), path, span)
+        let fname = tc_evfield_name(f)
+        let path = c_variant_field_path(tid, vname, fname)
+        let guard = eq_guard(tid, tc_member_tid_at_instance(tc_evfield_tid(f), tid), path, "{vname}.{fname}", span)
         if guard < 0 { return -1 }
         stmts.push(guard)
     }
@@ -455,19 +457,20 @@ fn eq_false_block(span: Int) -> Int ! Diag.Report {
     ir_block(span, [answer])
 }
 
-fn eq_guard(owner_tid: Int, ftid: Int, path: Str, span: Int) -> Int ! Diag.Report {
+// `path` reads the member off each side, and `label` names it in a refusal.
+fn eq_guard(owner_tid: Int, ftid: Int, path: Str, label: Str, span: Int) -> Int ! Diag.Report {
     if member_is_unit(ftid) { return ir_block(span, []) }
-    let differs = eq_differs(owner_tid, ftid, path, span)
+    let differs = eq_differs(owner_tid, ftid, path, label, span)
     let answer = eq_false_block(span)
     if differs < 0 || answer < 0 { return -1 }
     ir_if(span, differs, answer, -1)
 }
 
-fn eq_differs(owner_tid: Int, ftid: Int, path: Str, span: Int) -> Int ! Diag.Report {
+fn eq_differs(owner_tid: Int, ftid: Int, path: Str, label: Str, span: Int) -> Int ! Diag.Report {
     let bools = bool_spelling(span)
     if bools == "" { return -1 }
     let frec = field_layout_of(owner_tid, ftid)
-    if field_refused(frec, path, span) { return -1 }
+    if field_refused(frec, label, span) { return -1 }
     let lhs = field_ref(owner_tid, "self", Position.Param, ftid, frec, path, span)
     let rhs = field_ref(owner_tid, "other", Position.Param, ftid, frec, path, span)
     if lhs < 0 || rhs < 0 { return -1 }
@@ -479,7 +482,7 @@ fn eq_differs(owner_tid: Int, ftid: Int, path: Str, span: Int) -> Int ! Diag.Rep
     if k == TyKind.Bytes { return eq_helper_differs("bytes_eq", lhs, rhs, bools, span) }
     if eq_is_scalar(k) { return ir_binary(TYPE_BOOL, span, bools, "!=", lhs, rhs) }
     if k == TyKind.Struct || k == TyKind.Enum {
-        return eq_nested_differs(ftid, lhs, rhs, bools, path, span)
+        return eq_nested_differs(ftid, lhs, rhs, bools, label, span)
     }
     // A container, carrier or tuple field compares by Container Equality, through the
     // function `==` on two of them calls, so the derive and the operator never disagree.
@@ -488,13 +491,13 @@ fn eq_differs(owner_tid: Int, ftid: Int, path: Str, span: Int) -> Int ! Diag.Rep
         if symbol == "" { return -1 }
         return eq_call_differs(symbol, lhs, rhs, bools, span)
     }
-    not_built(span, "@derive(Eq) on the {tk_name(k)} field `{path}`")
+    not_built(span, "@derive(Eq) on the {tk_name(k)} field `{label}`")
     -1
 }
 
 // A nested type is compared by its own derived method, so the comparison stays one
 // call deep however far the nesting goes.
-fn eq_nested_differs(ftid: Int, lhs: Int, rhs: Int, bools: Str, path: Str, span: Int) -> Int ! Diag.Report {
+fn eq_nested_differs(ftid: Int, lhs: Int, rhs: Int, bools: Str, label: Str, span: Int) -> Int ! Diag.Report {
     let fdecl = tc_tid_decl_node(ftid)
     if fdecl < 0 || fdecl == DECL_NODE_AMBIGUOUS {
         derive_ice(span, "field type {ftid} has no unambiguous declaration to compare through")
@@ -509,7 +512,7 @@ fn eq_nested_differs(ftid: Int, lhs: Int, rhs: Int, bools: Str, path: Str, span:
     }
     let refusal = shape_refusal(fdecl, ftid, derive_eq)
     if refusal != "" {
-        not_built(span, "{refusal}, which the field `{path}` would have to call")
+        not_built(span, "{refusal}, which the field `{label}` would have to call")
         return -1
     }
     eq_call_differs(c_derived_method_symbol(ftid, "eq"), lhs, rhs, bools, span)
@@ -703,7 +706,8 @@ fn cmp_word_guard(tid: Int, op: Str, answer: Str, span: Int) -> Int ! Diag.Repor
 fn cmp_struct_body(tid: Int, span: Int) -> Int ! Diag.Report {
     let mut stmts: List[Int] = []
     for slot in tc_struct_field_slots(tid) {
-        let part = cmp_field(tid, tc_member_tid_at_instance(tc_sfield_tid(slot), tid), c_field_name(tid, tc_sfield_name(slot)), span)
+        let name = tc_sfield_name(slot)
+        let part = cmp_field(tid, tc_member_tid_at_instance(tc_sfield_tid(slot), tid), c_field_name(tid, name), name, span)
         if part.len() == 0 { return -1 }
         for s in part { stmts.push(s) }
     }
@@ -749,8 +753,9 @@ fn cmp_variant_block(tid: Int, slot: Int, span: Int) -> Int ! Diag.Report {
     let vname = tc_evar_name(slot)
     let mut stmts: List[Int] = []
     for f in tc_evar_field_slots(slot) {
-        let path = c_variant_field_path(tid, vname, tc_evfield_name(f))
-        let part = cmp_field(tid, tc_member_tid_at_instance(tc_evfield_tid(f), tid), path, span)
+        let fname = tc_evfield_name(f)
+        let path = c_variant_field_path(tid, vname, fname)
+        let part = cmp_field(tid, tc_member_tid_at_instance(tc_evfield_tid(f), tid), path, "{vname}.{fname}", span)
         if part.len() == 0 { return -1 }
         for s in part { stmts.push(s) }
     }
@@ -764,17 +769,17 @@ fn cmp_variant_block(tid: Int, slot: Int, span: Int) -> Int ! Diag.Report {
 // ordered contributes at least one statement, so an empty answer means a refusal was
 // recorded. A field this stage drops instead would make two values that differ answer
 // Equal, which sorts wrongly and compiles cleanly.
-fn cmp_field(owner_tid: Int, ftid: Int, path: Str, span: Int) -> List[Int] ! Diag.Report {
+fn cmp_field(owner_tid: Int, ftid: Int, path: Str, label: Str, span: Int) -> List[Int] ! Diag.Report {
     let frec = field_layout_of(owner_tid, ftid)
-    if field_refused(frec, path, span) { return [] }
+    if field_refused(frec, label, span) { return [] }
     let k = tc_tid_kind(tc_resolve(ftid))
     let helper = cg_call_order_sign_helper(k)
     if helper != "" { return cmp_sign_field(helper, owner_tid, ftid, frec, path, span) }
     if cmp_is_scalar(k) { return cmp_scalar_field(owner_tid, ftid, frec, path, span) }
     if k == TyKind.Struct || k == TyKind.Enum {
-        return cmp_nested_field(owner_tid, ftid, frec, path, span)
+        return cmp_nested_field(owner_tid, ftid, frec, path, label, span)
     }
-    not_built(span, "@derive(Ord) on the {tk_name(k)} field `{path}`")
+    not_built(span, "@derive(Ord) on the {tk_name(k)} field `{label}`")
     []
 }
 
@@ -822,7 +827,7 @@ fn cmp_sign_guard(name: Str, ints: Str, op: Str, answer: Str, span: Int) -> Int 
 // A nested type is ordered by its own derived method, so the comparison stays one call
 // deep however far the nesting goes. A local holds the answer because the guard tests it
 // and then returns that same answer.
-fn cmp_nested_field(owner_tid: Int, ftid: Int, frec: LayoutRecord, path: Str, span: Int) -> List[Int] ! Diag.Report {
+fn cmp_nested_field(owner_tid: Int, ftid: Int, frec: LayoutRecord, path: Str, label: Str, span: Int) -> List[Int] ! Diag.Report {
     let fdecl = tc_tid_decl_node(ftid)
     if fdecl < 0 || fdecl == DECL_NODE_AMBIGUOUS {
         derive_ice(span, "field type {ftid} has no unambiguous declaration to order through")
@@ -834,7 +839,7 @@ fn cmp_nested_field(owner_tid: Int, ftid: Int, frec: LayoutRecord, path: Str, sp
     }
     let refusal = shape_refusal(fdecl, ftid, derive_ord)
     if refusal != "" {
-        not_built(span, "{refusal}, which the field `{path}` would have to call")
+        not_built(span, "{refusal}, which the field `{label}` would have to call")
         return []
     }
     let otid = ordering_tid(span)
@@ -981,7 +986,7 @@ fn debug_struct_body(decl: Int, tid: Int, span: Int) -> Int ! Diag.Report {
     for slot in tc_struct_field_slots(tid) {
         let ftid = tc_member_tid_at_instance(tc_sfield_tid(slot), tid)
         let name = tc_sfield_name(slot)
-        let value = field_value(tid, ftid, c_field_name(tid, name), "self", span)
+        let value = field_value(tid, ftid, c_field_name(tid, name), name, "self", span)
         if value < 0 { return -1 }
         let part = debug_part(ftid, value, name, span)
         if !part.ok { return -1 }
@@ -1018,10 +1023,8 @@ fn debug_variant_block(tid: Int, slot: Int, span: Int) -> Int ! Diag.Report {
         let ftid = tc_member_tid_at_instance(tc_evfield_tid(f), tid)
         let fname = tc_evfield_name(f)
         let path = c_variant_field_path(tid, vname, fname)
-        let value = field_value(tid, ftid, path, "self", span)
+        let value = field_value(tid, ftid, path, "{vname}.{fname}", "self", span)
         if value < 0 { return -1 }
-        // The C member path is what an internal error about the emitted access should
-        // name, but a refusal a user can meet names the field they wrote.
         let part = debug_part(ftid, value, "{vname}.{fname}", span)
         if !part.ok { return -1 }
         parts.push(part)
@@ -1519,7 +1522,8 @@ fn tuple_eq_body(tid: Int, span: Int) -> Int ! Diag.Report {
     let mut stmts: List[Int] = []
     let mut i = 0
     while i < tc_tid_child_count(tid) {
-        let guard = eq_guard(tid, tc_tid_child(tid, i), c_tuple_member(i), span)
+        let path = c_tuple_member(i)
+        let guard = eq_guard(tid, tc_tid_child(tid, i), path, path, span)
         if guard < 0 { return -1 }
         stmts.push(guard)
         i = i + 1
@@ -1591,7 +1595,7 @@ fn hash_struct_body(tid: Int, span: Int) -> Int ! Diag.Report {
 // `label` names it in a refusal. The unit type has one value, so a unit member is not read.
 fn hash_member(acc: Str, owner_tid: Int, ftid: Int, path: Str, label: Str, span: Int) -> Int ! Diag.Report {
     if member_is_unit(ftid) { return ir_block(span, []) }
-    let value = field_value(owner_tid, ftid, path, "self", span)
+    let value = field_value(owner_tid, ftid, path, label, "self", span)
     if value < 0 { return -1 }
     hash_fold(acc, ftid, value, label, span)
 }
@@ -1859,7 +1863,7 @@ fn ser_struct_body(tid: Int, span: Int) -> Int ! Diag.Report {
     for slot in tc_struct_field_slots(tid) {
         let ftid = tc_member_tid_at_instance(tc_sfield_tid(slot), tid)
         let name = tc_sfield_name(slot)
-        let value = field_value(tid, ftid, c_field_name(tid, name), "self", span)
+        let value = field_value(tid, ftid, c_field_name(tid, name), name, "self", span)
         if value < 0 { return -1 }
         let part = ser_part(ftid, value, name, span)
         if !part.ok { return -1 }
@@ -1913,7 +1917,7 @@ fn ser_variant_block(tid: Int, slot: Int, span: Int) -> Int ! Diag.Report {
         let ftid = tc_member_tid_at_instance(tc_evfield_tid(f), tid)
         let fname = tc_evfield_name(f)
         let path = c_variant_field_path(tid, vname, fname)
-        let value = field_value(tid, ftid, path, "self", span)
+        let value = field_value(tid, ftid, path, "{vname}.{fname}", "self", span)
         if value < 0 { return -1 }
         let part = ser_part(ftid, value, "{vname}.{fname}", span)
         if !part.ok { return -1 }
