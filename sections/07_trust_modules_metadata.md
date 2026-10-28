@@ -327,7 +327,7 @@ This is guidance. The compiler cannot check a foreign body, so it cannot reject 
 
 An `I32` file descriptor is an index into a table that the process holds. No argument reaches the object that the index names. So a call such as `close`, `dup2` or `flock` is never `! ()` (§9.1 *What `! ()` Claims on an `@ffi` Decl*). The row of the call comes from the call or calls that made the fd. This is the rule that sockets already follow, where `close` takes the row of the socket (§4.4.6). It now holds for every fd.
 
-1. **An op on an existing fd takes the row of the call that made the fd.** An fd from `open` on a path for reading is `FS.Read`. An fd from a call that opens for writing is `FS.Read, FS.Write` or `FS.Write`, as that decl states. A socket fd is `Net.*`. The fds 0, 1 and 2 count as made by `IO.Read`, `IO.Print` and `IO.Log`.
+1. **An op on an existing fd takes the row of the call that made the fd.** An fd from `open` on a path for reading is `FS.Read`. An fd from a call that opens for writing is `FS.Read, FS.Write` or `FS.Write`, as that decl states. A socket fd is `Net.*`. Fd 0 counts as made by `IO.Read` and fd 1 by `IO.Print`. Fd 2 counts as made by `IO.Log, IO.Eprint`, because `io.log` and the `io.eprint` operations both write it.
 2. **A decl whose audit lists several makers takes the union of their rows.** The author may also split the decl, one decl per fd kind. Splitting is better: each caller then holds only the row of the fd that it passes.
 3. **`pipe`, `memfd_create` and `socketpair` are `! State`, not `! ()`.** They take no path and no address, so no built-in effect names what they make. A later `open` sees the fd numbers that they take.
 4. **A built-in effect that names the resource of the fd replaces `State`.** `State` appears only where the fd came from `pipe`, `memfd_create` or `socketpair`.
@@ -360,10 +360,10 @@ fn release_read(fd: I32) -> I32 ! FS.Read {
 
 ```blink
 @ffi("dup2", header: "unistd.h")        // from: open_write fds; to: 1 or 2
-fn bfs_dup2(from: I32, to: I32) -> I32 ! FS.Read, FS.Write, IO.Print, IO.Log {}
+fn bfs_dup2(from: I32, to: I32) -> I32 ! FS.Read, FS.Write, IO.Print, IO.Log, IO.Eprint {}
 
 @ffi("dup2", header: "unistd.h")        // old_fd: open or dup fds; new_fd: 1 or 2
-fn daemon_dup2(old_fd: I32, new_fd: I32) -> I32 ! FS.Read, FS.Write, IO.Print, IO.Log {}
+fn daemon_dup2(old_fd: I32, new_fd: I32) -> I32 ! FS.Read, FS.Write, IO.Print, IO.Log, IO.Eprint {}
 
 @ffi("dup2", header: "unistd.h")        // a memfd onto fd 0
 fn t_dup2(from: I32, to: I32) -> I32 ! State, IO.Read {}
@@ -375,7 +375,7 @@ The same row holds for a `bfs_dup2` call in a forked child before `exec`. The `F
 
 ```blink
 @ffi("dup", header: "unistd.h")         // fd is 1 or 2
-fn daemon_dup(fd: I32) -> I32 ! IO.Print, IO.Log {}
+fn daemon_dup(fd: I32) -> I32 ! IO.Print, IO.Log, IO.Eprint {}
 
 @ffi("fcntl", header: "fcntl.h")        // F_SETFD on fds from bfs_pipe or open_read
 fn bfs_fcntl(fd: I32, cmd: I32, arg: I32) -> I32 ! FS.Read, State {}
@@ -1787,7 +1787,7 @@ The region is a **purely syntactic**, per-function structural property, decided 
 
 ```blink
 @trusted(audit: "LIBC-WRITE")
-pub fn write_bytes(fd: Int, data: Bytes) -> Result[Int, Errno] ! IO.Print, IO.Log, FS.Write, Net.Connect, Net.Listen, State {
+pub fn write_bytes(fd: Int, data: Bytes) -> Result[Int, Errno] ! IO.Print, IO.Log, IO.Eprint, FS.Write, Net.Connect, Net.Listen, State {
     // the closure inherits the region of the @trusted body
     let rc = data.with_ptr(fn(p) -> I64 { c_write(fd.to_i32(), p, data.len().to_u64()) })
     if rc < 0 {
@@ -2698,7 +2698,7 @@ Decided by panel deliberation [`libc-bytes-wrapper-coverage`](../decisions/libc-
 ```blink
 fn read_bytes(fd: Int, max: Int) -> Result[Bytes, Errno] ! IO.Read, FS.Read, Net.Connect, Net.Listen, State
 fn recv_bytes(fd: Int, max: Int, *, flags: MsgFlags = MsgFlags.NONE) -> Result[Bytes, Errno] ! Net.Connect, Net.Listen, State
-fn write_bytes(fd: Int, data: Bytes) -> Result[Int, Errno] ! IO.Print, IO.Log, FS.Write, Net.Connect, Net.Listen, State
+fn write_bytes(fd: Int, data: Bytes) -> Result[Int, Errno] ! IO.Print, IO.Log, IO.Eprint, FS.Write, Net.Connect, Net.Listen, State
 fn send_bytes(fd: Int, data: Bytes, *, flags: MsgFlags = MsgFlags.NONE) -> Result[Int, Errno] ! Net.Connect, Net.Listen, State
 ```
 
@@ -2710,10 +2710,10 @@ Each member ships at v1; the set **blocks the v1 release**.
 let entropy = rand.bytes(32)    // 32 CSPRNG bytes; mock_rand makes it fixed in a test
 ```
 
-**The rows.** `read_bytes` and `write_bytes` take any fd, so each takes the union of the rows of the calls that can make its fd (*fd-Table and Process-Control Calls — Which Row*, §9.1). A read can get its fd from standard input (`IO.Read`), from a file (`FS.Read`), from a socket (`Net.Connect`, `Net.Listen`) or from `pipe`, `memfd_create` or `socketpair` (`State`). A write can get its fd from standard output and standard error (`IO.Print`, `IO.Log`), from a file (`FS.Write`), from a socket or from `State`. `recv_bytes` and `send_bytes` take only socket fds, and a socketpair fd is `State`. Each row lists leaves, never the parent `Net`.
+**The rows.** `read_bytes` and `write_bytes` take any fd, so each takes the union of the rows of the calls that can make its fd (*fd-Table and Process-Control Calls — Which Row*, §9.1). A read can get its fd from standard input (`IO.Read`), from a file (`FS.Read`), from a socket (`Net.Connect`, `Net.Listen`) or from `pipe`, `memfd_create` or `socketpair` (`State`). A write can get its fd from standard output and standard error (`IO.Print`, `IO.Log`, `IO.Eprint`), from a file (`FS.Write`), from a socket or from `State`. `recv_bytes` and `send_bytes` take only socket fds, and a socketpair fd is `State`. Each row lists leaves, never the parent `Net`.
 
 ```blink
-fn pump(src: Int, dst: Int) -> Result[Int, Errno] ! IO.Read, FS.Read, IO.Print, IO.Log, FS.Write, Net.Connect, Net.Listen, State {
+fn pump(src: Int, dst: Int) -> Result[Int, Errno] ! IO.Read, FS.Read, IO.Print, IO.Log, IO.Eprint, FS.Write, Net.Connect, Net.Listen, State {
     let chunk = libc.read_bytes(src, 4096)?
     libc.write_bytes(dst, chunk)
 }
@@ -2859,14 +2859,14 @@ When `[native-dependencies].headers` is missing, the compiler emits `W0812: @ffi
 
 User code should reach for stdlib first:
 
-- `std.libc.poll(fds: List[Pollfd], timeout_ms: Int) -> Result[List[Pollfd], Str] ! IO.Read, IO.Print, IO.Log, FS.Read, FS.Write, Net.Connect, Net.Listen, State, Time.Sleep`
+- `std.libc.poll(fds: List[Pollfd], timeout_ms: Int) -> Result[List[Pollfd], Str] ! IO.Read, IO.Print, IO.Log, IO.Eprint, FS.Read, FS.Write, Net.Connect, Net.Listen, State, Time.Sleep`
 - `std.libc.recvfrom_bytes(fd: Int, max: Int, *, flags: MsgFlags = MsgFlags.NONE) -> Result[(Bytes, Option[SockAddr]), Errno] ! Net.Connect, Net.Listen, State`
 - `std.libc.sigaction(...)` — etc.
 
 **The row of `poll`.** `poll` takes any fd, so it takes the read union and the write union of the fd-table rule. It also takes `Time.Sleep`, because `poll` blocks for up to `timeout_ms` milliseconds. A `mock_clock` handler (§8.10.3) does not shorten that wait: the wait is in the kernel, and the mock clock does not make `poll` return sooner. `poll` with `timeout_ms: 0` still takes `Time.Sleep`, because the row names what the call can do and not what one call does.
 
 ```blink
-fn wait_ready(fds: List[Pollfd]) -> Result[List[Pollfd], Str] ! IO.Read, IO.Print, IO.Log, FS.Read, FS.Write, Net.Connect, Net.Listen, State, Time.Sleep {
+fn wait_ready(fds: List[Pollfd]) -> Result[List[Pollfd], Str] ! IO.Read, IO.Print, IO.Log, IO.Eprint, FS.Read, FS.Write, Net.Connect, Net.Listen, State, Time.Sleep {
     libc.poll(fds, 250)    // blocks up to 250 ms, with or without a mock clock
 }
 ```
