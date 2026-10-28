@@ -91,6 +91,7 @@ ICE codes use the `I` prefix. `@allow` and `[lints]` take warning names only, so
 | ParserInternalLimit | I0012 | The parser's node pool or sublist stack met a state it can not hold — a limit of its layout, or a call out of order or out of bounds; the compiler stops |
 | TypedefQueuedNotWritten | I0013 | The shared types header of a per-module build ended with a typedef queued and never written |
 | TwoDeclarationsOneCSymbol | I0014 | Two declarations reached code generation under one C symbol; the compiler stops before cc sees the unit |
+| VariantWithoutEnum | I0015 | Name resolution met an enum variant with no enum recorded for it, so it can not tell whether the variant is private |
 
 ---
 
