@@ -1083,45 +1083,4 @@ BLINK_RT_FN const char* blink_process_signal_name(int64_t n) {
 }
 #endif
 
-/*
- * Undefine POSIX signal macros after the runtime body is parsed so
- * Blink code further down (e.g. `pub let SIGTERM = 15` from
- * lib/std/process.bl) can declare these names without the preprocessor
- * expanding the LHS to a numeric literal. The runtime functions above
- * have already been compiled with the real macro values.
- */
-#undef SIGHUP
-#undef SIGINT
-#undef SIGQUIT
-#undef SIGILL
-#undef SIGTRAP
-#undef SIGABRT
-#undef SIGBUS
-#undef SIGFPE
-#undef SIGKILL
-#undef SIGUSR1
-#undef SIGSEGV
-#undef SIGUSR2
-#undef SIGPIPE
-#undef SIGALRM
-#undef SIGTERM
-#undef SIGCHLD
-#undef SIGCONT
-#undef SIGSTOP
-#undef SIGTSTP
-#undef SIGTTIN
-#undef SIGTTOU
-#undef SIGURG
-#undef SIGXCPU
-#undef SIGXFSZ
-#undef SIGVTALRM
-#undef SIGPROF
-#undef SIGWINCH
-#undef SIGIO
-#undef SIGSYS
-#undef SIGSTKFLT
-#undef SIGPWR
-#undef SIGEMT
-#undef SIGINFO
-
 #endif
