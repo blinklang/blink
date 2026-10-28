@@ -17389,6 +17389,7 @@ fn nr_private_access_here(name: Str) -> Int {
 // so a qualified access (mod.Name) is labelled identically to a bare one.
 // Caller must have already checked is_private_access(name) != 0.
 fn nr_emit_private_access(name: Str, node: Int) ! Diag.Report {
+    if nr_emit_default_body_access(name, node) { return }
     if is_variant_name(name) != 0 {
         tc_errors.push("cannot access private variant `{name}`")
         diag_error_at("PrivateItemAccess", PRIVATE_ITEM_ACCESS, "cannot access private variant `{name}` from another module", node, "mark the enum as `pub` in its module")
@@ -17402,6 +17403,53 @@ fn nr_emit_private_access(name: Str, node: Int) ! Diag.Report {
         tc_errors.push("cannot access private function `{name}`")
         diag_error_at("PrivateItemAccess", PRIVATE_ITEM_ACCESS, "cannot access private function `{name}` from another module", node, "mark the function as `pub` in its module")
     }
+}
+
+// The handle and operation whose default body is the private function `name`, as
+// ("fs", "write"), or None. A default body is private so that user code cannot skip the
+// handler in force and reach the foreign call (sections/04_effects.md §4.7.1). The usual
+// E1003 help, to make it `pub`, is the one fix that must not be taken.
+fn nr_default_body_op(name: Str) -> Option[(Str, Str, Str)] {
+    let mods = nr_private_imports.get(name) ?? ""
+    if mods == "" { return None }
+    for root in builtin_op_roots() {
+        let mod_key = builtin_op_module(root).replace(".", "_")
+        if !mods.contains("|{mod_key}|") { continue }
+        for row in builtin_op_rows(root) {
+            if row.default_fn == name { return Some((root.to_lower(), row.op, mod_key)) }
+        }
+    }
+    let io_key = io_read_module().replace(".", "_")
+    if mods.contains("|{io_key}|") && is_io_read_derived_op(name) { return Some(("io", name, io_key)) }
+    None
+}
+
+// E1003 for a use of a default body, or false when `name` is no default body. The help
+// spells the positional parameters of the body; a keyword parameter has a default, so the
+// shortest call leaves it out.
+fn nr_emit_default_body_access(name: Str, node: Int) -> Bool ! Diag.Report {
+    let (handle, op, mod_key) = match nr_default_body_op(name) {
+        Some(t) => t
+        None => return false
+    }
+    let mut args: List[Str] = []
+    let decl = nr_module_decl(mod_key, name)
+    let params = if decl == -1 { -1 } else { node_params(decl) }
+    if params != -1 {
+        let mut i = 0
+        while i < sublist_length(params) {
+            let p = sublist_get(params, i)
+            if node_int_val(p) != 1 { args.push(node_name(p)) }
+            i = i + 1
+        }
+    }
+    let arg_list = args.join(", ")
+    tc_errors.push("cannot access private function `{name}`")
+    diag_error_at_notes("PrivateItemAccess", PRIVATE_ITEM_ACCESS,
+        "`{name}` is the default body of `{handle}.{op}`; user code cannot call it", node,
+        "call the operation through its handle: `{handle}.{op}({arg_list})`",
+        ["inside a handler operation, `default.{op}({arg_list})` reaches the real body"])
+    true
 }
 
 fn nr_register_private(name: Str, mod_name: Str) {
@@ -21668,6 +21716,7 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
             nr_note_local_binder_at(node, top)
             let global = nr_index_is_global(top) != 0
             if global && is_private_access(name) != 0 {
+                if nr_emit_default_body_access(name, node) { return }
                 tc_errors.push("cannot access private item `{name}`")
                 diag_error_at("PrivateItemAccess", PRIVATE_ITEM_ACCESS, "cannot access private item `{name}` from another module", node, "mark the item as `pub` in its module")
                 return
@@ -21783,8 +21832,10 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                     if defined { nr_mark_read_at(top) }
                     let global = defined && nr_index_is_global(top) != 0
                     if global && is_private_access(fn_name) != 0 {
-                        tc_errors.push("cannot access private function `{fn_name}`")
-                        diag_error_at("PrivateItemAccess", PRIVATE_ITEM_ACCESS, "cannot access private function `{fn_name}` from another module", node, "mark the function as `pub` in its module")
+                        if !nr_emit_default_body_access(fn_name, node) {
+                            tc_errors.push("cannot access private function `{fn_name}`")
+                            diag_error_at("PrivateItemAccess", PRIVATE_ITEM_ACCESS, "cannot access private function `{fn_name}` from another module", node, "mark the function as `pub` in its module")
+                        }
                     } else if !defined && is_variant_name(fn_name) != 0 && is_private_access(fn_name) != 0 {
                         tc_errors.push("cannot access private variant `{fn_name}`")
                         diag_error_at("PrivateItemAccess", PRIVATE_ITEM_ACCESS, "cannot access private variant `{fn_name}` from another module", node, "mark the enum as `pub` in its module")

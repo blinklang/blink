@@ -1,0 +1,128 @@
+// The default body of a built-in effect operation is not a function that user code calls
+// (sections/04_effects.md §4.7.1, sections/07_trust_modules_metadata.md "What the Standard
+// Library Routes Through Ops"). If user code could name fs_do_write, it could skip any
+// Handler[FS] and reach the real filesystem. Each body is a private item of its std module,
+// so every way to name one is E1003; the operation and `default.op` in a handler still reach it.
+
+import compile_test_helpers
+
+fn deny_writes_src(body: Str, imports: Str) -> Str {
+    let template = #"
+import std.fs.{FsError, FsOp}
+import std.errno.{Errno}
+IMPORTS
+
+fn deny_writes() -> Handler[FS] {
+    handler FS {
+        fn write(path: Str, _c: Str) -> Result[(), FsError] {
+            Err(FsError { op: FsOp.Write, path: path, code: Errno(13) })
+        }
+    }
+}
+
+fn main() ! IO, FS {
+    with deny_writes() {
+BODY
+    }
+}
+"#
+    template.replace("IMPORTS", imports).replace("BODY", body)
+}
+
+test "a selectively imported fs_do_write called under a deny handler is E1003" {
+    let src = deny_writes_src("        let _ = fs_do_write(\"x.txt\", \"escaped\")", "import std.fs_ops.\{fs_do_write}")
+    let out = compile_test_helpers.compile_and_capture(src, "default_body_fs_select")
+    compile_test_helpers.expect_error(out, "E1003", "selective import + call")
+    compile_test_helpers.expect_contains(out, "`fs_do_write` is the default body of `fs.write`", "names the operation")
+    compile_test_helpers.expect_contains(out, "call the operation through its handle: `fs.write(path, content)`", "help: the handle call")
+    compile_test_helpers.expect_contains(out, "inside a handler operation, `default.write(path, content)` reaches the real body", "note: default.op")
+}
+
+test "a qualified call of fs_do_write is E1003" {
+    let src = deny_writes_src("        let _ = fs_ops.fs_do_write(\"x.txt\", \"escaped\")", "import std.fs_ops")
+    let out = compile_test_helpers.compile_and_capture(src, "default_body_fs_qual")
+    compile_test_helpers.expect_error(out, "E1003", "qualified call")
+    compile_test_helpers.expect_contains(out, "`fs_do_write` is the default body of `fs.write`", "qualified names the operation")
+}
+
+test "fs_do_read reached through the std.fs re-export is E1003" {
+    let src = "import std.fs.\{fs_do_read}\nfn main() ! IO, FS \{\n    let _ = fs_do_read(\"x.txt\")\n}\n"
+    let out = compile_test_helpers.compile_and_capture(src, "default_body_fs_reexport")
+    compile_test_helpers.expect_error(out, "E1003", "re-export")
+    compile_test_helpers.expect_contains(out, "`fs_do_read` is the default body of `fs.read`", "re-export names the operation")
+}
+
+test "fs_do_write taken as a function value is E1003" {
+    let src = deny_writes_src("        let f = fs_do_write\n        let _ = f(\"x.txt\", \"escaped\")", "import std.fs_ops.\{fs_do_write}")
+    let out = compile_test_helpers.compile_and_capture(src, "default_body_fs_value")
+    compile_test_helpers.expect_error(out, "E1003", "fn value")
+    compile_test_helpers.expect_contains(out, "`fs_do_write` is the default body of `fs.write`", "fn value names the operation")
+}
+
+test "a call of process_do_run is E1003 and points at process.run" {
+    let src = "import std.process.\{process_do_run}\nfn main() ! IO, Process \{\n    let _ = process_do_run(\"echo\", [\"hi\"])\n}\n"
+    let out = compile_test_helpers.compile_and_capture(src, "default_body_process_run")
+    compile_test_helpers.expect_error(out, "E1003", "process_do_run")
+    compile_test_helpers.expect_contains(out, "`process_do_run` is the default body of `process.run`", "names process.run")
+    compile_test_helpers.expect_contains(out, "`process.run(cmd, args)`", "help: the handle call")
+    compile_test_helpers.expect_contains(out, "`default.run(cmd, args)`", "note: default.run")
+}
+
+test "a qualified call of process_do_signal is E1003" {
+    let src = "import std.process\nfn stop(c: process.Child) ! Process \{\n    let _ = process.process_do_signal(c, 9)\n}\nfn main() \{}\n"
+    let out = compile_test_helpers.compile_and_capture(src, "default_body_process_qual")
+    compile_test_helpers.expect_error(out, "E1003", "qualified process_do_signal")
+}
+
+test "a call of the derived io.read_all body is E1003" {
+    let src = "import std.io_read.\{read_all}\nfn main() ! IO \{\n    io.println(read_all())\n}\n"
+    let out = compile_test_helpers.compile_and_capture(src, "default_body_io_read_all")
+    compile_test_helpers.expect_error(out, "E1003", "io_read read_all")
+    compile_test_helpers.expect_contains(out, "`read_all` is the default body of `io.read_all`", "names io.read_all")
+}
+
+fn ops_still_work_src() -> Str {
+    #"
+import std.fs.{FsError}
+import std.process.{ProcessError, ProcessResult}
+
+fn logged() -> Handler[FS] {
+    handler FS {
+        fn write(path: Str, content: Str) -> Result[(), FsError] {
+            io.println("log write")
+            default.write(path, "[{content}]")
+        }
+    }
+}
+
+fn noisy() -> Handler[Process] {
+    handler Process {
+        fn run(cmd: Str, args: List[Str], -- stdin: Str?) -> Result[ProcessResult, ProcessError] {
+            io.println("log run")
+            default.run(cmd, args, stdin: stdin)
+        }
+    }
+}
+
+fn main() ! IO, FS, Process {
+    let p = "build/default_body_ops_still_work.txt"
+    match fs.write(p, "plain") { Ok(_) => io.println("plain wrote") Err(_) => io.println("plain err") }
+    with logged() {
+        match fs.write(p, "handled") { Ok(_) => io.println("handled wrote") Err(_) => io.println("handled err") }
+    }
+    match fs.read(p) { Ok(s) => io.println("read {s}") Err(_) => io.println("read err") }
+    let _ = fs.delete(p)
+    match process.run("echo", ["a"]) { Ok(r) => io.print("run {r.out}") Err(_) => io.println("run err") }
+    with noisy() {
+        match process.run("echo", ["b"]) { Ok(r) => io.print("run {r.out}") Err(_) => io.println("run err") }
+    }
+}
+"#
+}
+
+test "the ops and default.op in a handler still reach the private default bodies" {
+    let r = compile_test_helpers.compile_and_run(ops_still_work_src(), "default_body_ops_still_work")
+    assert_eq(r.err_out, "")
+    assert_eq(r.exit_code, 0)
+    assert_eq(r.out, "plain wrote\nlog write\nhandled wrote\nread [handled]\nrun a\nlog run\nrun b\n")
+}
