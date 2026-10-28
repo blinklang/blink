@@ -3972,15 +3972,14 @@ fn tc_head_constructible_struct(stid: Int) -> Int {
     1
 }
 
-// Whether the struct `stid` that the head `sname` names is in the module's scope: declared
-// there, or bound by one of its import entries (an alias among them). A prelude struct is in
-// every module's scope. A struct that only some other module of the program can see is not.
-fn tc_struct_head_in_scope(sname: Str, stid: Int) -> Bool {
+// Whether a struct the head `sname` names is in the module's scope: declared there, or bound
+// by one of its import entries (an alias among them). A struct that only some other module of
+// the program can see is not, and neither is one of a prelude module such as std.time's
+// Duration: no prelude type is a struct (§10.6 *Prelude Types*).
+fn tc_struct_head_in_scope(sname: Str) -> Bool {
     if tc_type_declared_in_scope(sname) != 0 { return true }
     let cur = nr_current_module
-    if cur != "" && nr_resolve_imported_decl(sname, cur) != -1 { return true }
-    let decl = tc_tid_decl_node(stid)
-    decl >= 0 && tc_prelude_modules.contains_key(node_module(decl))
+    cur != "" && nr_resolve_imported_decl(sname, cur) != -1
 }
 
 // Takes the head's tid beside its spelling, because the spelling alone cannot say whether the
@@ -8752,7 +8751,7 @@ fn tc_hidden_variant_help(val: Int, declared: Int) -> Str {
         let head = node_type_name(val)
         if head == "" || head.contains(".") { return "" }
         return match tc_bare_variant_from_type(head, None, declared) {
-            BareVariantPick.Declared(_, var_idx) => "write `{node_name(evar_pool.get(var_idx).unwrap().enum_decl)}.{head} \{ ... }` for the variant"
+            BareVariantPick.Declared(_, var_idx) => "write `{tc_variant_construction_example(var_idx)}` for the variant"
             _ => ""
         }
     }
@@ -8763,6 +8762,19 @@ fn tc_hidden_variant_help(val: Int, declared: Int) -> Str {
         BareVariantPick.Declared(_, var_idx) => "write `{node_name(evar_pool.get(var_idx).unwrap().enum_decl)}.{name}` for the variant"
         _ => ""
     }
+}
+
+// The qualified construction of a variant in its declared form: `E.V`, `E.V(...)` or
+// `E.V { ... }`. The declared form decides which payload form a construction takes (§3.4).
+fn tc_variant_construction_example(var_idx: Int) -> Str {
+    let entry = evar_pool.get(var_idx).unwrap()
+    let qualified = "{node_name(entry.enum_decl)}.{entry.name}"
+    if variant_field_count(var_idx) == 0 { return qualified }
+    let named = match tc_variant_literal_owner(var_idx) {
+        Some(owner) => owner.rows.len() > 0
+        None => false
+    }
+    if named { "{qualified} \{ ... }" } else { "{qualified}(...)" }
 }
 
 fn tc_recv_option_help(val: Int, declared: Int, got: Int) -> Str ! TypeCheck.Resolve {
@@ -11949,9 +11961,11 @@ fn tc_check_name_collisions() ! TypeCheck.Register, Diag.Report {
                 tc_collision_reported.insert(struct_node, 1)
                 let vnode = tc_variant_decl_node(i)
                 let at = "{diag_file_for_node(vnode)}:{node_line(vnode)}:{node_col(vnode)}"
+                // A prelude variant is not the user's to rename.
+                let help = if prelude { "rename the struct; `{node_name(enum_decl)}.{vname}` is a prelude variant" } else { "rename either the struct or the variant" }
                 diag_error_at_notes("NameCollision", NAME_COLLISION,
                     "struct `{vname}` has the same name as an enum variant `{vname}`; bare construction would be ambiguous (note: two different enums MAY share a variant name — only a struct-vs-variant clash is rejected)",
-                    struct_node, "rename either the struct or the variant",
+                    struct_node, help,
                     ["the conflicting variant `{node_name(enum_decl)}.{vname}` is declared at {at}"])
             }
         }
@@ -11959,9 +11973,10 @@ fn tc_check_name_collisions() ! TypeCheck.Register, Diag.Report {
     }
 }
 
-// An import entry that binds a struct of another package under the name of a variant of the
-// importing package or of a prelude enum is E0518 at the entry (sections/03_types.md §3.4).
-// A struct of the same package is reported once, at its declaration, by the pass above.
+// An import entry that binds a struct under the name of a variant of the importing package or
+// of a prelude enum is E0518 at the entry (sections/03_types.md §3.4). An entry that binds a
+// struct of the same package under its own name is skipped: the pass above reports that pair
+// once, at the declaration.
 fn tc_check_imported_struct_collisions() ! TypeCheck.Register, Diag.Report {
     let mut variants_named: Map[Str, List[Int]] = Map()
     let mut i = 0
@@ -11991,17 +12006,18 @@ fn tc_check_imported_struct_collisions() ! TypeCheck.Register, Diag.Report {
                     if tc_collision_reported.contains_key(name_node) { continue }
                     let decl = nr_resolve_decl_in_module(source_mod, member, 0)
                     if decl == -1 || !tc_struct_decls_named(member).contains(decl) { continue }
-                    if tc_same_package(node_module(decl), reader) { continue }
+                    if bound == member && tc_same_package(node_module(decl), reader) { continue }
                     for vi in candidates {
                         let enum_decl = evar_pool.get(vi).unwrap().enum_decl
                         if !tc_is_prelude_enum_decl(enum_decl) && !tc_same_package(node_module(enum_decl), reader) { continue }
                         tc_collision_reported.insert(name_node, 1)
                         let vnode = tc_variant_decl_node(vi)
                         let at = "{diag_file_for_node(vnode)}:{node_line(vnode)}:{node_col(vnode)}"
-                        let qual = tc_qualifier_for_module(source_mod)
+                        let path = node_str_val(imp_node)
+                        let keyword = if node_is_pub(imp_node) != 0 { "pub import" } else { "import" }
                         diag_error_at_notes("NameCollision", NAME_COLLISION,
                             "import of struct `{member}` binds `{bound}`, the name of the enum variant `{node_name(enum_decl)}.{bound}`; bare construction would be ambiguous",
-                            name_node, "import the struct under another name, such as `import {qual}.\{{member} as {tc_collision_alias_example(qual, member)}}`",
+                            name_node, "import the struct under another name, such as `{keyword} {path}.\{{member} as {tc_collision_alias_example(path, member)}}`",
                             ["the conflicting variant `{node_name(enum_decl)}.{bound}` is declared at {at}"])
                         break
                     }
@@ -12012,9 +12028,9 @@ fn tc_check_imported_struct_collisions() ! TypeCheck.Register, Diag.Report {
 }
 
 // A sample alias for the E0518 help at an import entry: the struct's name after the
-// capitalized last segment of its module's qualifier (`geo` and `Point` give `GeoPoint`).
-fn tc_collision_alias_example(qual: Str, member: Str) -> Str {
-    let parts = qual.split(".")
+// capitalized last segment of its module path (`geo` and `Point` give `GeoPoint`).
+fn tc_collision_alias_example(path: Str, member: Str) -> Str {
+    let parts = path.split(".")
     let seg = parts.get(parts.len() - 1) ?? ""
     if seg == "" { return "Imported{member}" }
     "{seg.byte_slice(0, 1).to_upper()}{seg.byte_slice(1, seg.byte_len())}{member}"
@@ -12024,7 +12040,8 @@ fn tc_collision_alias_example(qual: Str, member: Str) -> Str {
 // E0518? Option and Result are not here: their variants Some, None, Ok and Err are not in
 // the variant pool, and a type with one of those four names is E1016, not E0518. Weekday
 // is in a prelude module but is not a prelude type (§10.6 *Prelude Types*), so it counts
-// as a dependency.
+// as a dependency. The list follows §10.6: today ConversionError is a struct and
+// TemplateValue has no declaration, so those two names match no variant until they do.
 fn tc_is_prelude_enum_decl(enum_decl: Int) -> Bool {
     if !tc_prelude_modules.contains_key(node_module(enum_decl)) { return false }
     match node_name(enum_decl) {
@@ -16769,11 +16786,14 @@ fn tc_same_package(a: Str, b: Str) -> Bool {
 }
 
 fn tc_module_package(m: Str) -> Str {
-    if m.starts_with("std_") { return "std" }
-    match nr_module_names.get(m) {
+    let recorded = match nr_module_names.get(m) {
         Some(r) => r.package
         None => ""
     }
+    if recorded != "" { return recorded }
+    // A prelude module loaded with no import records no package. A user module may also take
+    // a std_ name, so the prefix is only a fallback.
+    if m.starts_with("std_") { "std" } else { "" }
 }
 
 // The declaration `mod_name` itself makes under `name`, or -1.
@@ -25199,7 +25219,7 @@ fn tc_infer_struct_lit_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Rep
                 //    names (sections/03_types.md §3.4). The hint's enum may come from another
                 //    package, where a variant of the same name is legal (E0518 reach).
                 let in_scope_tid = lookup_named_type(sname)
-                if in_scope_tid != -1 && tc_head_constructible_struct(in_scope_tid) != 0 && tc_struct_head_in_scope(sname, in_scope_tid) {
+                if in_scope_tid != -1 && tc_head_constructible_struct(in_scope_tid) != 0 && tc_struct_head_in_scope(sname) {
                     check_deprecated_type(sname, node)
                     return tc_struct_lit_instance_tid(in_scope_tid, node)
                 }
