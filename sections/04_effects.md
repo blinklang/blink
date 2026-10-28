@@ -467,7 +467,7 @@ Handles also enable the handler mechanism (section 4.7). Because all effect oper
 
 1. No compiler-known free function performs a side effect.
 2. Every stdlib function and method declares a row that is a sound upper bound on its observable effects. An empty row means that the function is pure, or that it diverges with result type `Never`.
-3. An operation that consumes a value that a handle op made is a handle op of the same effect. The handler that made the value answers the operation. Under a mock `Process` handler, `process.spawn` returns a mock `Child`, and `process.wait(child)` goes to the same mock, never to the real runtime (§4.4.8).
+3. An operation that consumes a value that a handle op made is a handle op of the same effect. The handler that made the value answers the operation. Under a mock `Process` handler, `process.spawn` returns a `Child` that the handler makes with `Child.mock`, and `process.wait(child)` goes to the same mock, never to the real runtime (§4.4.8).
 
 Rule 2 permits a second tier: a std function or method that has a row but is not a handle op, such as `udp_bind` and `unix_listen` (§4.4.6). Rule 3 permits this only when no handle op made the value that the function consumes. The effect row gates a second-tier function as it gates a handle op, but no handler can intercept it (§4.10).
 
@@ -1623,7 +1623,11 @@ pub type ProcessError {
     code: Errno
 }
 
+/// Opaque. Has no methods. Implements Eq, Hash and Debug.
 pub opaque type Child
+
+/// Make a Child in a handler. "mock" means "made by a handler", not "used only in tests".
+pub fn Child.mock(id: Int) -> Child
 ```
 
 `process.run` and `process.wait` return `Ok` when the child ran to the end, whatever its exit code, and when a limit ended it (*Child limits*). `Err` means that the operation itself failed: the program was not found or could not start, a limit could not be applied, the wait failed, or the signal could not be sent. `ProcessError` has the shape of `FsError` (§4.4.5): the operation, the command, and the `Errno`. Its `Display` follows the same convention, `op cmd: message`, for example `run gti: No such file or directory`.
@@ -1856,7 +1860,66 @@ fn describe(end: ChildEnd) -> Str {
 }
 ```
 
-**`Child` is a handle-op value.** `process.spawn` makes a `Child`, so the operations that consume one, `process.wait` and `process.signal`, are `process` handle ops too (§4.4, rule 3). Code with no `Process` effect can hold a `Child` but cannot wait on it or signal it. `Child` is opaque and has no methods. `process.wait` on a child that already exited returns the same `ProcessResult` again. The signal numbers are constants in `std.process`: `SIGHUP`, `SIGINT`, `SIGQUIT`, `SIGKILL`, `SIGTERM`, `SIGSEGV`, `SIGBUS`, `SIGABRT` and `SIGXCPU`. They are foreign constants and not literals, because their numbers differ between hosts: the C headers of the build target set each value (§9.1, *`@ffi let` — Foreign Constants*).
+**`Child` is a handle-op value.** `process.spawn` makes a `Child`, so the operations that consume one, `process.wait` and `process.signal`, are `process` handle ops too (§4.4, rule 3). Code with no `Process` effect can hold a `Child` but cannot wait on it or signal it. `Child` is opaque and has no methods. It implements `Eq`, `Hash` and `Debug`. The signal numbers are constants in `std.process`: `SIGHUP`, `SIGINT`, `SIGQUIT`, `SIGKILL`, `SIGTERM`, `SIGSEGV`, `SIGBUS`, `SIGABRT` and `SIGXCPU`. They are foreign constants and not literals, because their numbers differ between hosts: the C headers of the build target set each value (§9.1, *`@ffi let` — Foreign Constants*).
+
+**Making a `Child` in a handler.** `Child.mock(id)` is a pure function of `std.process`. It has no effect row and it takes an `Int` key. "mock" means that a handler made the `Child`. It does not mean that the `Child` is for tests only: a handler that wraps the real runtime can make `Child` values too. A handler clause for `spawn` returns `Ok(Child.mock(1))`, and the clauses for `wait` and `signal` answer for that `Child`. There is no getter that reads the key back.
+
+**`Eq` and `Hash`.** Copies of one `Child` are equal. `Child.mock(n) == Child.mock(m)` exactly when `n == m`. A `Child` that `process.spawn` made under the built-in handler never equals a `Child` that `Child.mock` made. Two spawns under the built-in handler never give equal values. A `Hash` of a `Child` is stable for the life of that `Child`, so a `Child` is a good key for a `Map`.
+
+```blink
+fn eq_rules() {
+    let a = Child.mock(1)
+    let b = Child.mock(1)
+    let c = Child.mock(2)
+    assert(a == b)      // same key
+    assert(a != c)      // different key
+    assert(a == a)      // a copy of a Child is equal to it
+}
+```
+
+**`Debug` shows the `Child`.** A made `Child` shows its key. A real `Child` shows its pid. After a wait reaps the child, the text adds `, ended`:
+
+```blink
+// Child.mock(3)             a Child that Child.mock made
+// Child(pid 4211)           a real Child that is not reaped yet
+// Child(pid 4211, ended)    the same Child after a wait reaped it
+```
+
+"ended" means that the runtime reaped the child through a wait. It does not mean that the child exited. A child that has exited but that no wait has reaped prints as `Child(pid 4211)`, without "ended". The pid in the text changes from run to run. The text of a real `Child` is not a format: code must not parse it or compare it. Use `==` to compare two `Child` values. A spec example or a golden test never prints a real `Child`, and it uses `Child.mock` when it needs a text. There is no function that gives the pid of a `Child` today.
+
+**A `Child` that the built-in handler did not make.** `Child.mock` makes such a `Child`. So does a handler that forwards a `Child` to the built-in handler with `default.wait(child)`, when the `Child` came from `Child.mock`. The built-in handler has no child behind it, so no operating-system call goes out and no process is touched. `process.wait` gives `Err` with `op: Wait` and `ECHILD`, and `process.signal` gives `Err` with `op: Signal` and `ESRCH`. Neither call panics. The `cmd` field of this `Err` holds the `Debug` text of the `Child`. It holds that text only in this case, and it is never a program name. There is no lint for such a call.
+
+```blink
+test "the built-in handler does not know a made Child" {
+    let r = process.wait(Child.mock(1))
+    assert_eq("{r.unwrap_err()}", "wait Child.mock(1): No child processes")
+    let s = process.signal(Child.mock(1), SIGTERM)
+    assert_eq("{s.unwrap_err()}", "signal Child.mock(1): No such process")
+}
+```
+
+**A second wait.** The runtime keeps the result of a `Child` for as long as the `Child` is reachable, and it never drops it. Under the built-in handler, a second `process.wait` on the same `Child` returns the same result as the first wait. This holds for an `Ok` and for an `Err`: after a failed first wait, the second wait gives an `Err` with the same `op`, `cmd` and `code`. The rule binds the built-in handler only. A user handler decides for itself what a second wait gives.
+
+```blink
+fn wait_twice(child: Child) -> Result[Bool, ProcessError] ! Process.Spawn {
+    let first = process.wait(child)?
+    let second = process.wait(child)?
+    Ok(first == second)             // true under the built-in handler
+}
+```
+
+**A signal to a child that ended.** `process.signal` on a child that has ended gives `Ok(())`. It makes no difference whether the child only exited or a wait has reaped it as well. Once the runtime has reaped the child, no signal goes out, so a signal never reaches a process that took the pid later. The reap and the check of the signal are one step: no signal goes out between them. `EINVAL` (a signal number that is not valid) and `EPERM` stay errors. `ESRCH` comes only for a `Child` that the built-in handler did not make. A caller cannot use `process.signal` to learn if a child is alive. To learn how a child ended, call `process.wait`.
+
+```blink
+fn stop(child: Child) -> Result[(), ProcessError] ! Process.Spawn, Process.Signal {
+    process.signal(child, SIGTERM)?     // Ok even if the child exited first
+    process.wait(child)?
+    process.signal(child, SIGTERM)?     // Ok after the wait too: the child ended
+    Ok(())
+}
+```
+
+**The runtime may reap an unreachable child.** The runtime may reap a child once no copy of its `Child` is reachable, and code must not depend on when or whether that happens: only `process.wait` is certain to reap.
 
 A deadline is a limit of the child, so the code that wants one gives the child a `timeout` when it starts the child. It does not sleep and then signal:
 
@@ -1866,6 +1929,24 @@ import std.time.{Duration}
 
 fn run_with_deadline(cmd: Str, args: List[Str], limit: Duration) -> Result[ProcessResult, ProcessError] ! Process.Spawn {
     process.run(cmd, args, limits: ChildLimits { timeout: Some(limit) })
+}
+```
+
+**Spawn can fail for a full table.** The runtime keeps its own cap on the children that were spawned and not yet waited. The spec gives no number for it, and the cap is not the first limit that a program meets: the limits of the operating system, such as the count of open files, come first on a usual host. When the cap is full, `process.spawn` gives `Err` with `EAGAIN`, and no child starts. There is no new error variant. When the operating system fails a step of the start, the `Err` holds the errno of that step: `EAGAIN` from the process limit of the user, `EMFILE` or `ENFILE` from the pipes of the child, or `ENOMEM`. The text of the `Err` may say that there are too many children not yet waited. A program that spawns many children waits on every `Child` it spawns, so the table empties. `process.run` does not count against the cap, and children that were spawned and not waited do not make `process.run` fail.
+
+```blink
+fn start_all(cmds: List[Str]) -> Result[List[Child], ProcessError] ! Process.Spawn {
+    let mut kids = List.new[Child]()
+    for cmd in cmds {
+        kids.push(process.spawn(cmd, [])?)      // Err EAGAIN when the cap is full
+    }
+    Ok(kids)
+}
+
+fn run_after_leak() -> Result[Bool, ProcessError] ! Process.Spawn {
+    let _leaked = process.spawn("sleep", ["60"])?
+    let r = process.run("true", [])?            // not stopped by the child that no wait reaped
+    Ok(r.success())
 }
 ```
 
@@ -1924,6 +2005,93 @@ test "run_capped drops the memory limit on a host without cgroup v2" {
     }
     with mock {
         assert(run_capped("./t", []).unwrap().success())
+    }
+}
+```
+
+A mock makes a `Child` with `Child.mock`. This mock starts one child and ends it at once. The clauses for `wait` and `signal` answer for the `Child` that `spawn` made:
+
+```blink
+test "a mock spawn, wait and signal" {
+    let mock = handler Process {
+        fn spawn(cmd: Str, args: List[Str], *, env: ChildEnv, cwd: Str?, limits: ChildLimits) -> Result[Child, ProcessError] {
+            Ok(Child.mock(1))
+        }
+        fn wait(child: Child) -> Result[ProcessResult, ProcessError] {
+            Ok(ProcessResult { out: "done", err_out: "", end: ChildEnd.Exited(0) })
+        }
+        fn signal(child: Child, sig: Int) -> Result[(), ProcessError] {
+            Ok(())
+        }
+    }
+    with mock {
+        let child = process.spawn("worker", []).unwrap()
+        assert_eq(child, Child.mock(1))
+        assert(process.signal(child, SIGTERM).is_ok())
+        assert_eq(process.wait(child).unwrap().out, "done")
+    }
+}
+```
+
+A mock that starts two children keeps one result for each `Child`. `Eq` and `Hash` make `Child` a key of a `Map`:
+
+```blink
+test "a mock with two children" {
+    let mut next = 0
+    let mut ends = Map.new[Child, ProcessResult]()
+    let mock = handler Process {
+        fn spawn(cmd: Str, args: List[Str], *, env: ChildEnv, cwd: Str?, limits: ChildLimits) -> Result[Child, ProcessError] {
+            next = next + 1
+            let child = Child.mock(next)
+            let code = if cmd == "bad" { 1 } else { 0 }
+            ends.insert(child, ProcessResult { out: cmd, err_out: "", end: ChildEnd.Exited(code) })
+            Ok(child)
+        }
+        fn wait(child: Child) -> Result[ProcessResult, ProcessError] {
+            Ok(ends.get(child).unwrap())
+        }
+        fn signal(child: Child, sig: Int) -> Result[(), ProcessError] {
+            Ok(())
+        }
+    }
+    with mock {
+        let good = process.spawn("good", []).unwrap()
+        let bad = process.spawn("bad", []).unwrap()
+        assert(good != bad)
+        assert(process.wait(good).unwrap().success())
+        assert(!process.wait(bad).unwrap().success())
+    }
+}
+```
+
+A mock can answer for the `Child` values it made and send every other `Child` to the enclosing handler. The `Child` that the enclosing built-in handler did not make then gets the `Err` of *A `Child` that the built-in handler did not make*:
+
+```blink
+test "a mock answers for its own Child only" {
+    let server = Child.mock(7)
+    let mock = handler Process {
+        fn wait(child: Child) -> Result[ProcessResult, ProcessError] {
+            if child != server {
+                return default.wait(child)
+            }
+            Ok(ProcessResult { out: "", err_out: "", end: ChildEnd.Exited(0) })
+        }
+    }
+    with mock {
+        assert(process.wait(server).is_ok())
+        assert(process.wait(Child.mock(8)).is_err())
+    }
+}
+```
+
+A mock can fail a spawn, so a test can check what the code does at the cap. The `Err` holds the `Errno` that the test gives:
+
+```blink
+fn full_table(code: Errno) -> Handler[Process ! Process] {
+    handler Process {
+        fn spawn(cmd: Str, args: List[Str], *, env: ChildEnv, cwd: Str?, limits: ChildLimits) -> Result[Child, ProcessError] {
+            Err(ProcessError { op: ProcessOp.Spawn, cmd: cmd, code: code })
+        }
     }
 }
 ```

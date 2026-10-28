@@ -933,6 +933,43 @@ With `import std.process`, `result.end` says how the child ended: `Exited(code)`
 `signal_name(n)` gives the host's name for a signal (`"SIGSEGV"`), or `"SIG<n>"`. An end
 displays as `exit 3`, `signal SIGSEGV` or `limit timeout`.
 
+## Process Child
+
+`Child` is opaque, has no methods, and implements `Eq`, `Hash` and `Debug`. A handler
+makes one with `Child.mock(id)` ("made by a handler", not "test only"). No getter reads
+the key or the pid. A real `Child` prints as `Child(pid 4211)`, and `Child(pid 4211, ended)`
+after a wait reaped it. That text changes from run to run: never parse or compare it.
+
+```blink
+test "two children in a mock" {
+    let mut next = 0
+    let mut ends = Map.new[Child, ProcessResult]()
+    let mock = handler Process {
+        fn spawn(cmd: Str, args: List[Str], *, env: ChildEnv, cwd: Str?, limits: ChildLimits) -> Result[Child, ProcessError] {
+            next = next + 1
+            let child = Child.mock(next)
+            ends.insert(child, ProcessResult { out: cmd, err_out: "", end: ChildEnd.Exited(0) })
+            Ok(child)
+        }
+        fn wait(child: Child) -> Result[ProcessResult, ProcessError] {
+            Ok(ends.get(child).unwrap())
+        }
+    }
+    with mock {
+        let a = process.spawn("a", []).unwrap()
+        let b = process.spawn("b", []).unwrap()
+        assert(a != b)
+        assert_eq(process.wait(b).unwrap().out, "b")
+    }
+}
+```
+
+- `process.wait(child)` twice gives the same result, `Ok` or `Err`, under the built-in handler.
+- `process.signal` on a child that ended gives `Ok(())`, waited or not.
+- A `Child` that the built-in handler did not make: `wait` gives `Err` ECHILD, `signal` gives
+  `Err` ESRCH, and `cmd` holds the `Debug` text (`wait Child.mock(1): No child processes`).
+- `process.spawn` gives `Err` EAGAIN when the runtime cap on children not yet waited is full.
+
 ## Duration Methods
 
 | Method | Returns | Purpose |
@@ -1412,6 +1449,7 @@ Run `blink doc --list` to list available modules.
 - `file_exists()` returns `Int` (0/1), not `Bool` — use `== 1` or `== 0`
 - `is_dir()` also returns `Int`, not `Bool`
 - `shell_exec()` returns exit code (Int), not stdout — use `process_run()` for output capture
+- `process.spawn` gives `Err` EAGAIN when too many children are not yet waited: wait on every `Child` you spawn. EMFILE comes at about 510 children at `ulimit -n 1024`: raise `ulimit -n`
 - No `return` needed for last expression in function body
 - `match` must be exhaustive — cover all variants or use `_ =>` wildcard
 - An arm that the unguarded arms above it already cover is warning `UnreachableArm` (W0710): an arm after `_`, or a repeated variant, `true`, `false` or literal. Remove it or move it above. It never reports a live arm and may miss a dead one
