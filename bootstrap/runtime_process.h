@@ -601,8 +601,8 @@ BLINK_RT_FN void blink_process_install_signal_forwarding(void) {
 #endif
 
 /* The host's name for signal n, or "SIG<n>" when the host has none (a real-time signal
- * included). A table and not a switch: some hosts give two names one number (SIGIOT is
- * SIGABRT), and the first row wins. */
+ * included). A table and not a switch: some hosts give two names one number (SIGPWR is
+ * SIGINFO on some), and the first row wins. */
 BLINK_RT_FN const char* blink_process_signal_name(int64_t n);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN const char* blink_process_signal_name(int64_t n) {
@@ -675,5 +675,9 @@ BLINK_RT_FN const char* blink_process_signal_name(int64_t n) {
 #undef SIGWINCH
 #undef SIGIO
 #undef SIGSYS
+#undef SIGSTKFLT
+#undef SIGPWR
+#undef SIGEMT
+#undef SIGINFO
 
 #endif
