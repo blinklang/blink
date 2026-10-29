@@ -1,0 +1,279 @@
+// memory and processes limits through a delegated cgroup v2 (sections/04_effects.md §4.4.8
+// Memory and process count need a delegated cgroup v2). Each case runs a helper program in a
+// transient systemd scope with Delegate=yes, so the helper has a cgroup of its own to write
+// to. The case skips where no such scope can start (no user systemd, no cgroup v2).
+//
+// The helper is built standalone (blinkc to C that includes runtime.h), as the program must
+// be the only process in its cgroup, and a test binary is not.
+
+import compile_test_helpers
+import std.process.{ChildEnd, ChildLimits}
+import std.time.{Duration}
+
+// args: mode. Each mode prints lines that the test compares.
+fn helper_program() -> Str {
+    [
+        #"import std.process.{ChildLimits, LimitKind, ProcessError, ProcessResult, SIGTERM}"#,
+        #"import std.errno.{Errno}"#,
+        #"import std.time.{Duration}"#,
+        #""#,
+        #"fn my_cg() -> Str {"#,
+        #"    process.run("sh", ["-c", "cut -d: -f3- /proc/$PPID/cgroup"]).unwrap().out.trim()"#,
+        #"}"#,
+        #""#,
+        #"fn child_dirs(d: Str) -> Str {"#,
+        #"    process.run("sh", ["-c", "cd /sys/fs/cgroup$0 && for x in blink.child.*; do [ -d \"$x\" ] && printf '%s ' \"$x\"; done; true", d]).unwrap().out.trim()"#,
+        #"}"#,
+        #""#,
+        #"fn gone_within(d: Str, ms: Int) -> Bool {"#,
+        #"    let start = time.read()"#,
+        #"    while start.elapsed().to_ms() < ms {"#,
+        #"        if child_dirs(d) == "" {"#,
+        #"            return true"#,
+        #"        }"#,
+        #"        time.sleep(Duration.ms(50))"#,
+        #"    }"#,
+        #"    false"#,
+        #"}"#,
+        #""#,
+        #"fn mb(n: Int) -> Int {"#,
+        #"    n * 1024 * 1024"#,
+        #"}"#,
+        #""#,
+        #"fn show(name: Str, r: Result[ProcessResult, ProcessError]) {"#,
+        #"    match r {"#,
+        #"        Ok(p) => io.println("{name} end {p.end}")"#,
+        #"        Err(e) => {"#,
+        #"            let code = match e.code {"#,
+        #"                Errno(c) => c"#,
+        #"            }"#,
+        #"            io.println("{name} errno {code}")"#,
+        #"        }"#,
+        #"    }"#,
+        #"}"#,
+        #""#,
+        #"fn main() {"#,
+        #"    let a = env.args()"#,
+        #"    let me = a.get(0).unwrap()"#,
+        #"    let d = my_cg()"#,
+        #"    match a.get(1).unwrap() {"#,
+        #"        "can" => {"#,
+        #"            io.println("can {process.can_limit(LimitKind.Memory)} {process.can_limit(LimitKind.Processes)}")"#,
+        #"            io.println("moved {my_cg() != d}")"#,
+        #"            io.println("dirs [{child_dirs(d)}]")"#,
+        #"        }"#,
+        #"        "where" => {"#,
+        #"            let script = "p=$(cut -d: -f3- /proc/self/cgroup); echo cg $p; cd /sys/fs/cgroup$p && echo files $(cat memory.max memory.swap.max memory.oom.group pids.max)""#,
+        #"            let r = process.run("sh", ["-c", script], limits: ChildLimits { memory: Some(mb(64)), processes: Some(9) }).unwrap()"#,
+        #"            io.print(r.out)"#,
+        #"            io.println("end {r.end}")"#,
+        #"            let m = process.run("sh", ["-c", script], limits: ChildLimits { memory: Some(mb(32)) }).unwrap()"#,
+        #"            io.print(m.out)"#,
+        #"            io.println("d {d}")"#,
+        #"            io.println("self {my_cg()}")"#,
+        #"        }"#,
+        #"        "hog" => {"#,
+        #"            let mut xs: List[Int] = []"#,
+        #"            while true {"#,
+        #"                xs.push(xs.len())"#,
+        #"            }"#,
+        #"        }"#,
+        #"        "forker" => {"#,
+        #"            while true {"#,
+        #"                let _ = process.spawn("sleep", ["30"])"#,
+        #"            }"#,
+        #"        }"#,
+        #"        "memory" => {"#,
+        #"            show("memory", process.run(me, ["hog"], limits: ChildLimits { memory: Some(mb(64)), timeout: Some(Duration.seconds(60)) }))"#,
+        #"            io.println("gone {gone_within(d, 5000)}")"#,
+        #"        }"#,
+        #"        "processes" => {"#,
+        #"            show("processes", process.run(me, ["forker"], limits: ChildLimits { processes: Some(8), timeout: Some(Duration.seconds(60)) }))"#,
+        #"            io.println("gone {gone_within(d, 5000)}")"#,
+        #"        }"#,
+        #"        "under" => {"#,
+        #"            let both = ChildLimits { memory: Some(mb(64)), processes: Some(16) }"#,
+        #"            show("exit3", process.run("sh", ["-c", "exit 3"], limits: both))"#,
+        #"            show("true", process.run("true", [], limits: both))"#,
+        #"        }"#,
+        #"        "removed" => {"#,
+        #"            let lim = ChildLimits { memory: Some(mb(64)) }"#,
+        #"            show("true", process.run("true", [], limits: lim))"#,
+        #"            io.println("gone {gone_within(d, 5000)}")"#,
+        #"            show("left", process.run("sh", ["-c", "sleep 3 </dev/null >/dev/null 2>&1 &"], limits: lim))"#,
+        #"            io.println("held [{child_dirs(d)}]")"#,
+        #"            io.println("gone {gone_within(d, 15000)}")"#,
+        #"        }"#,
+        #"        "unlimited" => {"#,
+        #"            let kid = process.spawn("sleep", ["30"]).unwrap()"#,
+        #"            show("true", process.run("true", [], limits: ChildLimits { memory: Some(mb(64)) }))"#,
+        #"            let pid = process.run("pgrep", ["-x", "-P", "{getpid()}", "sleep"]).unwrap().out.trim()"#,
+        #"            let kid_cg = process.run("cut", ["-d:", "-f3-", "/proc/{pid}/cgroup"]).unwrap().out.trim()"#,
+        #"            io.println("kid {kid_cg == "{d}/blink.self"}")"#,
+        #"            io.println("self {my_cg() == "{d}/blink.self"}")"#,
+        #"            let _ = process.signal(kid, SIGTERM)"#,
+        #"            let _ = process.wait(kid)"#,
+        #"        }"#,
+        #"        "busy" => {"#,
+        #"            io.println("can {process.can_limit(LimitKind.Memory)}")"#,
+        #"            let o = process.run("sh", ["-c", "sleep 30 </dev/null >/dev/null 2>&1 & echo $!"]).unwrap()"#,
+        #"            let orphan = o.out.trim()"#,
+        #"            io.println("orphan {orphan}")"#,
+        #"            show("first", process.run("true", [], limits: ChildLimits { memory: Some(mb(64)) }))"#,
+        #"            show("second", process.run("true", [], limits: ChildLimits { processes: Some(4) }))"#,
+        #"            show("timeout", process.run("true", [], limits: ChildLimits { timeout: Some(Duration.seconds(10)) }))"#,
+        #"            let _ = process.run("kill", [orphan])"#,
+        #"        }"#,
+        #"        _ => io.println("unknown mode")"#,
+        #"    }"#,
+        #"}"#,
+        #""#,
+    ].join("\n")
+}
+
+fn work_dir() -> Str {
+    "{compile_test_helpers.scratch_root()}/_cgroup_limits"
+}
+
+// Built once per test binary; each later case finds it.
+fn helper_bin() -> Str {
+    let dir = work_dir()
+    let bin = "{dir}/cgroup_limits_helper"
+    if process.run("test", ["-x", bin]).unwrap().success() {
+        return bin
+    }
+    shell_exec("mkdir -p {dir}")
+    let src = "{dir}/cgroup_limits_helper.bl"
+    let c_path = "{dir}/cgroup_limits_helper.c"
+    write_file(src, helper_program())
+    let emit = process.run("build/blinkc", [src, c_path]).unwrap()
+    assert_eq(emit.end, ChildEnd.Exited(0), "blinkc failed:\n{emit.out}{emit.err_out}")
+    let cc = process.run("cc", ["-O1", "-w", "-Ibootstrap", "-o", bin, c_path, "-lm", "-lgc", "-pthread"]).unwrap()
+    assert_eq(cc.end, ChildEnd.Exited(0), "cc failed:\n{cc.out}{cc.err_out}")
+    bin
+}
+
+fn scope_args(unit: Str) -> List[Str] {
+    ["--user", "--scope", "--quiet", "--collect", "-p", "Delegate=yes", "-p", "MemoryMax=512M", "-p", "TasksMax=256", "--slice=blink-gates.slice", "--unit", unit]
+}
+
+// The reason a delegated scope cannot start here, or "" when one can.
+fn scope_problem() -> Str {
+    match process.run("systemd-run", scope_args("blink-cgtest-{getpid()}-probe").append(["true"]), limits: ChildLimits { timeout: Some(Duration.seconds(60)) }) {
+        Ok(r) => if r.success() { "" } else { "systemd-run cannot start a delegated scope here ({r.end}): {r.err_out.trim()}" }
+        Err(e) => "systemd-run cannot run here: {e}"
+    }
+}
+
+// Ends whatever the scope still holds, so that a failed case leaves no process behind.
+fn end_scope(unit: Str) {
+    let _ = process.run("sh", ["-c", "cg=$(systemctl --user show -P ControlGroup \"$0\" 2>/dev/null); [ -n \"$cg\" ] && [ -e \"/sys/fs/cgroup$cg/cgroup.kill\" ] && echo 1 > \"/sys/fs/cgroup$cg/cgroup.kill\"; true", "{unit}.scope"])
+}
+
+// Runs the helper in a delegated scope of its own and gives its output lines. `wrap` runs it
+// through `sh -c` that stays in the scope, so the scope holds a process the helper did not start.
+fn run_in_scope(mode: Str, wrap: Bool) -> List[Str] {
+    let bin = helper_bin()
+    let unit = "blink-cgtest-{getpid()}-{mode}"
+    let cmd = if wrap { ["sh", "-c", "\"$0\" \"$1\"; true", bin, mode] } else { [bin, mode] }
+    // A case that hung would hang the test; the timeout turns that into a failure.
+    let r = process.run("systemd-run", scope_args(unit).append(cmd), limits: ChildLimits { timeout: Some(Duration.seconds(120)) })
+    end_scope(unit)
+    let res = r.unwrap()
+    assert_eq(res.end, ChildEnd.Exited(0), "helper {mode} failed:\n{res.out}{res.err_out}")
+    res.out.trim().split("\n")
+}
+
+test "can_limit is true for memory and processes in a delegated cgroup, and moves nothing" {
+    let why = scope_problem()
+    if why != "" {
+        skip(why)
+    }
+    assert_eq(run_in_scope("can", false), ["can true true", "moved false", "dirs []"])
+}
+
+test "can_limit is false when the cgroup holds a process that this program did not start" {
+    let why = scope_problem()
+    if why != "" {
+        skip(why)
+    }
+    assert_eq(run_in_scope("can", true), ["can false false", "moved false", "dirs []"])
+}
+
+test "a memory or processes child runs in a cgroup of its own, and this program moves to a leaf" {
+    let why = scope_problem()
+    if why != "" {
+        skip(why)
+    }
+    let lines = run_in_scope("where", false)
+    assert_eq(lines.len(), 7, lines.join("\n"))
+    let d = lines.get(5).unwrap().replace("d ", "")
+    assert(lines.get(0).unwrap().starts_with("cg {d}/blink.child."), lines.join("\n"))
+    // memory.max, memory.swap.max, memory.oom.group, pids.max
+    assert_eq(lines.get(1).unwrap(), "files 67108864 0 1 9")
+    assert_eq(lines.get(2).unwrap(), "end exit 0")
+    assert(lines.get(3).unwrap().starts_with("cg {d}/blink.child."), lines.join("\n"))
+    assert(lines.get(3).unwrap() != lines.get(0).unwrap(), "two children shared one cgroup")
+    assert_eq(lines.get(4).unwrap(), "files 33554432 0 1 max")
+    assert_eq(lines.get(6).unwrap(), "self {d}/blink.self")
+}
+
+test "a child past its memory limit ends as Limit(Memory) and its cgroup goes" {
+    let why = scope_problem()
+    if why != "" {
+        skip(why)
+    }
+    assert_eq(run_in_scope("memory", false), ["memory end limit memory", "gone true"])
+}
+
+test "a child that keeps forking past its processes limit ends as Limit(Processes) and its cgroup goes" {
+    let why = scope_problem()
+    if why != "" {
+        skip(why)
+    }
+    assert_eq(run_in_scope("processes", false), ["processes end limit processes", "gone true"])
+}
+
+test "a child under its memory and processes limits ends with its own exit code" {
+    let why = scope_problem()
+    if why != "" {
+        skip(why)
+    }
+    assert_eq(run_in_scope("under", false), ["exit3 end exit 3", "true end exit 0"])
+}
+
+test "the cgroup of a child goes after its reap, or when a grandchild that holds it ends" {
+    let why = scope_problem()
+    if why != "" {
+        skip(why)
+    }
+    let lines = run_in_scope("removed", false)
+    assert_eq(lines.len(), 5, lines.join("\n"))
+    assert_eq(lines.get(0).unwrap(), "true end exit 0")
+    assert_eq(lines.get(1).unwrap(), "gone true")
+    assert_eq(lines.get(2).unwrap(), "left end exit 0")
+    assert(lines.get(3).unwrap().starts_with("held [blink.child."), "the grandchild did not hold the cgroup: {lines.get(3).unwrap()}")
+    assert_eq(lines.get(4).unwrap(), "gone true")
+}
+
+test "an unlimited child that runs at the move goes into the leaf with this program" {
+    let why = scope_problem()
+    if why != "" {
+        skip(why)
+    }
+    assert_eq(run_in_scope("unlimited", false), ["true end exit 0", "kid true", "self true"])
+}
+
+// EBUSY is 16 on Linux, the only host where a delegated scope starts.
+test "a move that a process of another program blocks gives its errno, and each later run the same" {
+    let why = scope_problem()
+    if why != "" {
+        skip(why)
+    }
+    let lines = run_in_scope("busy", false)
+    assert_eq(lines.len(), 5, lines.join("\n"))
+    assert_eq(lines.get(0).unwrap(), "can true")
+    assert_eq(lines.get(2).unwrap(), "first errno 16")
+    assert_eq(lines.get(3).unwrap(), "second errno 16")
+    assert_eq(lines.get(4).unwrap(), "timeout end exit 0")
+}

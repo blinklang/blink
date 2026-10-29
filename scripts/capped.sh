@@ -267,16 +267,20 @@ launch() {
 }
 
 # end_kid: kill what is left in the child's cgroup and remove it. A process
-# the child left behind would hold the cgroup open.
+# the child left behind would hold the cgroup open. The child may have made
+# cgroups below its own (a Blink memory or processes limit does), and rmdir
+# takes only a cgroup with none below it, so they go from the deepest up.
 end_kid() {
     [ -n "$kid" ] || return
     if [ -w "$kid/cgroup.kill" ]; then
         echo 1 > "$kid/cgroup.kill"
     else
-        end_procs "$kid"
+        local d
+        while read -r d; do end_procs "$d"; done < <(find "$kid" -depth -type d 2>/dev/null)
     fi
     for _ in 1 2 3 4 5 6 7 8 9 10; do
-        rmdir "$kid" 2>/dev/null && break
+        find "$kid" -depth -type d -exec rmdir {} + 2>/dev/null
+        [ -d "$kid" ] || break
         sleep 0.05 2>/dev/null || sleep 1
     done
 }

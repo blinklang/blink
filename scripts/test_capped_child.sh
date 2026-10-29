@@ -97,6 +97,24 @@ if command -v systemd-run >/dev/null 2>&1 &&
         flunk "child cgroups left behind (got [$left]: $(cat "$WORK/err"))"
     fi
 
+    # A child may make cgroups below its own, as a Blink program does for a
+    # memory or processes limit, and leave a process in one. rmdir takes only
+    # an empty cgroup with no cgroup below it, so the gate must end and remove
+    # them from the deepest up. The check runs inside the gate: the end of the
+    # gate's scope removes the whole tree anyway.
+    printf '%s' 'd=/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup); mkdir "$d/sub" && mkdir "$d/sub/leaf" && { sleep 30 > /dev/null 2>&1 & echo $! > "$d/sub/leaf/cgroup.procs" && echo "$d $!"; }' > "$WORK/sub_cg"
+    nested=$(gate -- '"$CAPPED" --child bash '"$WORK/sub_cg"' > "'"$WORK"'/sub_out"
+        read -r d p < "'"$WORK"'/sub_out"
+        [ -n "$d" ] || { echo "no cgroup"; exit 0; }
+        if [ -d "$d" ]; then echo "kept"; else echo "gone"; fi
+        st=$(ps -o stat= -p "$p") && [ "${st#Z}" = "$st" ] && { echo "alive"; kill -9 "$p"; }
+        true')
+    if [ "$nested" = gone ]; then
+        pass "a child's own sub-cgroups and the process left in them go when the child ends"
+    else
+        flunk "nested child cgroups (got [$(echo $nested)]: $(cat "$WORK/err"))"
+    fi
+
     # A slice with no unit gives the gate a plain user scope, which must still
     # hand each child a cgroup of its own.
     where=$(gate BLINK_GATE_SLICE=blink-no-such-unit-test.slice -- '"$CAPPED" --child cut -d: -f3 /proc/self/cgroup')

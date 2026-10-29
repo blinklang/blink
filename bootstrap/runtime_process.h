@@ -8,6 +8,9 @@
 #endif
 #if defined(__linux__)
 #include <sys/prctl.h>
+#include <sys/inotify.h>
+#include <sys/statfs.h>
+#include <sys/syscall.h>
 #endif
 
 /* LimitKind and ChildEnd as lib/std/process.bl declares them. They are runtime-owned
@@ -901,6 +904,8 @@ static int blink_child_waitpid(pid_t pid, int* status) {
 
 enum { BLINK_LIMIT_WAITING, BLINK_LIMIT_TERMED, BLINK_LIMIT_KILLED };
 
+#define BLINK_LIMIT_NONE (-1)
+
 typedef struct blink_limit_rec {
     struct blink_limit_rec* next;
     pthread_mutex_t mu;
@@ -909,7 +914,11 @@ typedef struct blink_limit_rec {
     int64_t grace;      /* likewise */
     int64_t kill_at;
     int stage;
-    int limit_hit;      /* the deadline came while the leader still ran */
+    int limit;          /* the blink_LimitKind that ended the child, or BLINK_LIMIT_NONE; the first wins */
+    char* cg;           /* the child's own cgroup (malloc), NULL when it has none */
+    int cg_memory;      /* the cgroup holds a memory limit */
+    int cg_pids;        /* the cgroup holds a processes limit */
+    int cg_killed;      /* cgroup.kill was written: the tree ends */
     int reaped;
     int released;       /* its run or wait is done with it, so the thread frees it */
     int reaped_at_exit; /* the program-exit path reaped it; status is the leader's */
@@ -927,6 +936,7 @@ typedef struct blink_limit_req {
     int stdin_fd, out_fd, err_fd, report_fd;
     sigset_t mask;
     int64_t timeout, grace;
+    int64_t memory, processes;  /* -1: no limit */
     blink_limit_rec* rec;
     int err;
     int done;
@@ -955,6 +965,397 @@ typedef struct {
 static blink_limits_state blink_limits = BLINK_LIMITS_STATE_INIT;
 #endif
 
+/* ── Child cgroups (§4.4.8 Memory and process count need a delegated cgroup v2) ──────────
+ * memory and processes need a cgroup v2 that this program owns: its own cgroup D, which it
+ * may write, with no process in it that is not this program or one of its descendants. At
+ * the first such limit this program moves itself, and every descendant still in D, to the
+ * leaf D/blink.self, and turns on the memory and pids controllers for the children of D.
+ * Each child with memory or processes then starts in a cgroup of its own,
+ * D/blink.child.<pid>.<n>. A child with only a timeout gets no cgroup.
+ *
+ * Only the limits thread, under blink_limits.mu, moves this program and makes or removes a
+ * child cgroup. The check of support runs once, on whichever thread asks first, and never
+ * creates or changes a cgroup. */
+#if defined(__linux__)
+#define BLINK_CG_ROOT "/sys/fs/cgroup"
+#define BLINK_CG_PATH 4096
+#define BLINK_CG2_SUPER_MAGIC 0x63677270
+/* PID_MAX_LIMIT + 1: pids.max takes no number from here up, and no tree can reach it. */
+#define BLINK_CG_PIDS_MAX 4194305LL
+
+typedef struct blink_cg_left {
+    struct blink_cg_left* next;
+    char* path;
+} blink_cg_left;
+
+typedef struct {
+    pthread_once_t once;
+    int memory_ok;
+    int pids_ok;
+    int move;           /* 0: not moved yet; 1: moved; else the errno of the move, kept */
+    int ino_fd;         /* inotify on the event files of each child cgroup; -1 until the first */
+    int64_t seq;
+    blink_cg_left* left; /* child cgroups that still held a process when their record went */
+    char dir[BLINK_CG_PATH];
+} blink_cg_state;
+
+#define BLINK_CG_STATE_INIT { PTHREAD_ONCE_INIT, 0, 0, 0, -1, 0, NULL, {0} }
+
+#ifdef BLINK_USE_EXTERN_RUNTIME_STORAGE
+  #ifdef BLINK_RUNTIME_STORAGE_DEFINE
+    blink_cg_state blink_cg = BLINK_CG_STATE_INIT;
+  #else
+    extern blink_cg_state blink_cg;
+  #endif
+#else
+static blink_cg_state blink_cg = BLINK_CG_STATE_INIT;
+#endif
+
+/* glibc and musl declare syscall only past _GNU_SOURCE or _DEFAULT_SOURCE. */
+long syscall(long number, ...);
+
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+/* Reads a whole file into a malloc'd NUL-terminated buffer; NULL with errno set. */
+static char* blink_cg_slurp(const char* path) {
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return NULL;
+    size_t cap = 4096, len = 0;
+    char* buf = (char*)malloc(cap);
+    while (buf != NULL) {
+        if (len + 1 >= cap) {
+            char* grown = (char*)realloc(buf, cap * 2);
+            if (grown == NULL) { free(buf); buf = NULL; errno = ENOMEM; break; }
+            buf = grown;
+            cap *= 2;
+        }
+        ssize_t n = read(fd, buf + len, cap - 1 - len);
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0) { int e = errno; free(buf); buf = NULL; errno = e; break; }
+        if (n == 0) { buf[len] = 0; break; }
+        len += (size_t)n;
+    }
+    int e = errno;
+    close(fd);
+    errno = e;
+    return buf;
+}
+
+/* 0, or the errno of the open or the write. */
+static int blink_cg_write(const char* path, const char* text) {
+    int fd = open(path, O_WRONLY | O_CLOEXEC);
+    if (fd < 0) return errno;
+    size_t len = strlen(text);
+    ssize_t w;
+    do { w = write(fd, text, len); } while (w < 0 && errno == EINTR);
+    int e = w < 0 ? errno : ((size_t)w == len ? 0 : EIO);
+    close(fd);
+    return e;
+}
+
+/* The number on the line "<key> <n>" of a flat-keyed cgroup file; -1 when there is none. */
+static int64_t blink_cg_count(const char* cg, const char* file, const char* key) {
+    char path[BLINK_CG_PATH];
+    if (snprintf(path, sizeof(path), "%s/%s", cg, file) >= (int)sizeof(path)) return -1;
+    char* text = blink_cg_slurp(path);
+    if (text == NULL) return -1;
+    int64_t n = -1;
+    size_t klen = strlen(key);
+    for (char* line = text; *line != 0;) {
+        if (strncmp(line, key, klen) == 0 && line[klen] == ' ') {
+            n = (int64_t)strtoll(line + klen + 1, NULL, 10);
+            break;
+        }
+        char* nl = strchr(line, '\n');
+        if (nl == NULL) break;
+        line = nl + 1;
+    }
+    free(text);
+    return n;
+}
+
+static int blink_cg_has_word(const char* text, const char* word) {
+    size_t wlen = strlen(word);
+    for (const char* p = text; (p = strstr(p, word)) != NULL; p += wlen) {
+        int starts = p == text || p[-1] == ' ' || p[-1] == '\n';
+        int ends = p[wlen] == 0 || p[wlen] == ' ' || p[wlen] == '\n';
+        if (starts && ends) return 1;
+    }
+    return 0;
+}
+
+static int blink_cg_exists(const char* dir, const char* file, int mode) {
+    char path[BLINK_CG_PATH];
+    if (snprintf(path, sizeof(path), "%s/%s", dir, file) >= (int)sizeof(path)) return 0;
+    return access(path, mode) == 0;
+}
+
+/* 1 when pid is this program or one of its descendants, 0 when it is not, -1 when it is
+ * gone. A process whose parent ended has a new parent, so only a chain that reaches self
+ * counts. */
+static int blink_cg_is_ours(pid_t pid, pid_t self) {
+    for (int depth = 0; depth < 4096; depth++) {
+        if (pid == self) return 1;
+        if (pid <= 1) return 0;
+        char path[64];
+        snprintf(path, sizeof(path), "/proc/%d/stat", (int)pid);
+        char* stat = blink_cg_slurp(path);
+        if (stat == NULL) return depth == 0 ? -1 : 0;
+        /* The name in parentheses may hold any byte, so the fields start after the last ')'. */
+        char* rp = strrchr(stat, ')');
+        char state = 0;
+        int ppid = 0;
+        int got = rp != NULL ? sscanf(rp + 1, " %c %d", &state, &ppid) : 0;
+        free(stat);
+        if (got != 2) return 0;
+        pid = (pid_t)ppid;
+    }
+    return 0;
+}
+
+/* 1 when every process in cgroup.procs of dir is ours (or gone), else 0. */
+static int blink_cg_all_ours(const char* dir) {
+    char path[BLINK_CG_PATH];
+    if (snprintf(path, sizeof(path), "%s/cgroup.procs", dir) >= (int)sizeof(path)) return 0;
+    char* procs = blink_cg_slurp(path);
+    if (procs == NULL) return 0;
+    pid_t self = getpid();
+    int ok = 1;
+    for (char* p = procs; ok && *p != 0;) {
+        char* end = NULL;
+        long pid = strtol(p, &end, 10);
+        if (end == p) break;
+        if (blink_cg_is_ours((pid_t)pid, self) == 0) ok = 0;
+        p = end;
+        while (*p == '\n') p++;
+    }
+    free(procs);
+    return ok;
+}
+
+/* The one check of support, made once (pthread_once). It only reads. */
+static void blink_cg_check(void) {
+    char* self_cg = blink_cg_slurp("/proc/self/cgroup");
+    if (self_cg == NULL) return;
+    /* A cgroup v2 only host gives the one line "0::<path>". */
+    char* nl = strchr(self_cg, '\n');
+    int one_line = strncmp(self_cg, "0::/", 4) == 0 && nl != NULL && nl[1] == 0;
+    if (one_line) *nl = 0;
+    char dir[BLINK_CG_PATH];
+    /* The root cgroup belongs to the host, never to one program. */
+    int fits = one_line && strcmp(self_cg + 3, "/") != 0
+        && snprintf(dir, sizeof(dir), "%s%s", BLINK_CG_ROOT, self_cg + 3) < (int)sizeof(dir);
+    free(self_cg);
+    if (!fits) return;
+    struct statfs fs;
+    if (statfs(BLINK_CG_ROOT, &fs) != 0 || (unsigned long)fs.f_type != BLINK_CG2_SUPER_MAGIC) return;
+    char path[BLINK_CG_PATH];
+    snprintf(path, sizeof(path), "%s/cgroup.type", dir);
+    char* type = blink_cg_slurp(path);
+    int domain = type != NULL && strcmp(type, "domain\n") == 0;
+    free(type);
+    if (!domain) return;
+    if (access(dir, W_OK) != 0 || !blink_cg_exists(dir, "cgroup.procs", W_OK)
+        || !blink_cg_exists(dir, "cgroup.subtree_control", W_OK)
+        || !blink_cg_exists(dir, "cgroup.kill", F_OK) || !blink_cg_exists(dir, "cgroup.freeze", F_OK)) {
+        return;
+    }
+    if (!blink_cg_all_ours(dir)) return;
+    snprintf(path, sizeof(path), "%s/cgroup.controllers", dir);
+    char* ctl = blink_cg_slurp(path);
+    if (ctl == NULL) return;
+    /* memory.swap.max: the kernel counts swap, so the child cannot pass its limit through it.
+     * pids.events.local: the kernel tells this cgroup's own refused forks apart. */
+    blink_cg.memory_ok = blink_cg_has_word(ctl, "memory") && blink_cg_exists(dir, "memory.swap.max", F_OK);
+    blink_cg.pids_ok = blink_cg_has_word(ctl, "pids") && blink_cg_exists(dir, "pids.events.local", F_OK);
+    free(ctl);
+    memcpy(blink_cg.dir, dir, sizeof(dir));
+}
+
+static int blink_cg_supported(int kind) {
+    pthread_once(&blink_cg.once, blink_cg_check);
+    if (kind == blink_LimitKind_Memory) return blink_cg.memory_ok;
+    if (kind == blink_LimitKind_Processes) return blink_cg.pids_ok;
+    return 0;
+}
+
+/* Moves every process in D to the leaf and turns on the controllers. A fork that lands in D
+ * meanwhile makes the controller write fail with EBUSY, so it tries again a bounded number
+ * of times. */
+static int blink_cg_move_now(void) {
+    char leaf[BLINK_CG_PATH], leaf_procs[BLINK_CG_PATH], d_procs[BLINK_CG_PATH], subtree[BLINK_CG_PATH];
+    snprintf(leaf, sizeof(leaf), "%s/blink.self", blink_cg.dir);
+    snprintf(leaf_procs, sizeof(leaf_procs), "%s/cgroup.procs", leaf);
+    snprintf(d_procs, sizeof(d_procs), "%s/cgroup.procs", blink_cg.dir);
+    snprintf(subtree, sizeof(subtree), "%s/cgroup.subtree_control", blink_cg.dir);
+    if (mkdir(leaf, 0755) != 0 && errno != EEXIST) return errno;
+    const char* enable = blink_cg.memory_ok && blink_cg.pids_ok ? "+memory +pids"
+        : (blink_cg.memory_ok ? "+memory" : "+pids");
+    pid_t self = getpid();
+    for (int round = 0; round < 100; round++) {
+        char* procs = blink_cg_slurp(d_procs);
+        if (procs == NULL) return errno;
+        int moved = 0;
+        for (char* p = procs; *p != 0;) {
+            char* end = NULL;
+            long pid = strtol(p, &end, 10);
+            if (end == p) break;
+            p = end;
+            while (*p == '\n') p++;
+            /* Checked again right before the write, as the pid may have passed to a process
+             * that is not ours since the check of support. */
+            int ours = blink_cg_is_ours((pid_t)pid, self);
+            if (ours < 0) continue;
+            if (ours == 0) { free(procs); return EBUSY; }
+            char num[32];
+            snprintf(num, sizeof(num), "%ld", pid);
+            int e = blink_cg_write(leaf_procs, num);
+            if (e != 0 && e != ESRCH) { free(procs); return e; }
+            moved = 1;
+        }
+        free(procs);
+        if (moved) continue;
+        int e = blink_cg_write(subtree, enable);
+        if (e != EBUSY) return e;
+    }
+    return EBUSY;
+}
+
+/* The move happens once. A failed move is kept, so each later memory or processes limit
+ * gives the same errno and the program is not moved half way twice. Caller holds
+ * blink_limits.mu. */
+static int blink_cg_move_locked(void) {
+    if (blink_cg.move == 0) {
+        int e = blink_cg_move_now();
+        blink_cg.move = e == 0 ? 1 : e;
+    }
+    return blink_cg.move == 1 ? 0 : blink_cg.move;
+}
+
+static int blink_cg_watch(const char* cg, const char* file) {
+    char path[BLINK_CG_PATH];
+    snprintf(path, sizeof(path), "%s/%s", cg, file);
+    return inotify_add_watch(blink_cg.ino_fd, path, IN_MODIFY) < 0 ? errno : 0;
+}
+
+/* Makes the cgroup of one child, with its limits set, and opens what the fork needs: the
+ * cgroup itself for clone3, and its cgroup.procs for a host with no clone3. -1 is no
+ * limit. 0, else the errno, and then no cgroup is left. Caller holds blink_limits.mu. */
+static int blink_cg_child_make(int64_t memory, int64_t processes, char** cg_out, int* dir_fd, int* procs_fd) {
+    int e = blink_cg_move_locked();
+    if (e != 0) return e;
+    if (blink_cg.ino_fd < 0) {
+        blink_cg.ino_fd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+        if (blink_cg.ino_fd < 0) return errno;
+    }
+    char cg[BLINK_CG_PATH];
+    blink_cg.seq++;
+    if (snprintf(cg, sizeof(cg), "%s/blink.child.%d.%lld", blink_cg.dir, (int)getpid(),
+                 (long long)blink_cg.seq) >= (int)sizeof(cg)) {
+        return ENAMETOOLONG;
+    }
+    if (mkdir(cg, 0755) != 0) return errno;
+    char path[BLINK_CG_PATH], num[32];
+    if (memory >= 0) {
+        snprintf(num, sizeof(num), "%lld", (long long)memory);
+        snprintf(path, sizeof(path), "%s/memory.max", cg);
+        e = blink_cg_write(path, num);
+        snprintf(path, sizeof(path), "%s/memory.swap.max", cg);
+        if (e == 0) e = blink_cg_write(path, "0");
+        /* The kernel ends the whole tree at the limit, not one process in it. */
+        snprintf(path, sizeof(path), "%s/memory.oom.group", cg);
+        if (e == 0) e = blink_cg_write(path, "1");
+        if (e == 0) e = blink_cg_watch(cg, "memory.events");
+    }
+    if (e == 0 && processes >= 0) {
+        if (processes >= BLINK_CG_PIDS_MAX) snprintf(num, sizeof(num), "max");
+        else snprintf(num, sizeof(num), "%lld", (long long)processes);
+        snprintf(path, sizeof(path), "%s/pids.max", cg);
+        e = blink_cg_write(path, num);
+        if (e == 0) e = blink_cg_watch(cg, "pids.events.local");
+    }
+    if (e == 0) e = blink_cg_watch(cg, "cgroup.events");
+    if (e == 0) {
+        *dir_fd = open(cg, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (*dir_fd < 0) e = errno;
+    }
+    if (e == 0) {
+        snprintf(path, sizeof(path), "%s/cgroup.procs", cg);
+        *procs_fd = open(path, O_WRONLY | O_CLOEXEC);
+        if (*procs_fd < 0) {
+            e = errno;
+            close(*dir_fd);
+            *dir_fd = -1;
+        }
+    }
+    char* copy = e == 0 ? (char*)malloc(strlen(cg) + 1) : NULL;
+    if (e == 0 && copy == NULL) {
+        e = ENOMEM;
+        close(*dir_fd);
+        close(*procs_fd);
+        *dir_fd = *procs_fd = -1;
+    }
+    if (e != 0) {
+        rmdir(cg);
+        return e;
+    }
+    strcpy(copy, cg);
+    *cg_out = copy;
+    return 0;
+}
+
+/* Ends every process in the cgroup of a child. */
+static void blink_cg_kill(blink_limit_rec* rec) {
+    char path[BLINK_CG_PATH];
+    snprintf(path, sizeof(path), "%s/cgroup.kill", rec->cg);
+    blink_cg_write(path, "1");
+    rec->cg_killed = 1;
+}
+
+/* The kernel ended a process of this cgroup at its memory limit. oom alone counts each time
+ * the limit was reached; oom_kill alone also counts a kill for the memory of the whole host. */
+static int blink_cg_memory_hit(const blink_limit_rec* rec) {
+    return rec->cg_memory && blink_cg_count(rec->cg, "memory.events", "oom") > 0
+        && blink_cg_count(rec->cg, "memory.events", "oom_kill") > 0;
+}
+
+/* A record whose run or wait is done: its cgroup goes too, or waits in the left list while
+ * a process that the cgroup.kill has not ended yet still holds it. Caller holds
+ * blink_limits.mu. */
+static void blink_cg_release_locked(blink_limit_rec* rec) {
+    if (rec->cg == NULL) return;
+    if (rmdir(rec->cg) == 0 || errno == ENOENT) {
+        free(rec->cg);
+    } else {
+        blink_cg_left* left = (blink_cg_left*)malloc(sizeof(blink_cg_left));
+        if (left == NULL) {
+            free(rec->cg);
+        } else {
+            left->path = rec->cg;
+            left->next = blink_cg.left;
+            blink_cg.left = left;
+        }
+    }
+    rec->cg = NULL;
+}
+
+/* Tries the removal of each left cgroup again; the inotify on its cgroup.events wakes the
+ * thread when its last process ends. Caller holds blink_limits.mu. */
+static void blink_cg_left_locked(void) {
+    blink_cg_left** at = &blink_cg.left;
+    while (*at != NULL) {
+        blink_cg_left* left = *at;
+        if (rmdir(left->path) == 0 || errno == ENOENT) {
+            *at = left->next;
+            free(left->path);
+            free(left);
+        } else {
+            at = &left->next;
+        }
+    }
+}
+#endif
+#endif
+
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 static int64_t blink_limits_add(int64_t a, int64_t b) {
     if (b > 0 && a > BLINK_LIMIT_NEVER - b) return BLINK_LIMIT_NEVER;
@@ -981,6 +1382,15 @@ static void blink_limits_wake(void) {
     errno = saved;
 }
 
+/* 1 while the leader of rec runs, else 0 with info set to how it ended. Caller holds
+ * rec->mu, and the leader is not reaped. */
+static int blink_limits_leader_runs(blink_limit_rec* rec, siginfo_t* info) {
+    memset(info, 0, sizeof(*info));
+    int r;
+    do { r = waitid(P_PID, (id_t)rec->pid, info, WEXITED | WNOHANG | WNOWAIT); } while (r < 0 && errno == EINTR);
+    return !(r == 0 && info->si_pid == rec->pid);
+}
+
 /* The deadline of a child came. Interim choice, the one place for it: the group gets the
  * signal whenever the leader is not reaped, even when the leader has exited, since the
  * children it started may run on; the limit ended the child only if the leader still ran.
@@ -988,10 +1398,9 @@ static void blink_limits_wake(void) {
  * leader is not reaped. */
 static void blink_limits_deadline_locked(blink_limit_rec* rec, int64_t now) {
     siginfo_t info;
-    memset(&info, 0, sizeof(info));
-    int r;
-    do { r = waitid(P_PID, (id_t)rec->pid, &info, WEXITED | WNOHANG | WNOWAIT); } while (r < 0 && errno == EINTR);
-    if (!(r == 0 && info.si_pid == rec->pid)) rec->limit_hit = 1;
+    if (blink_limits_leader_runs(rec, &info) && rec->limit == BLINK_LIMIT_NONE) {
+        rec->limit = blink_LimitKind_Timeout;
+    }
     if (rec->grace == 0) {
         kill(-rec->pid, SIGKILL);
         rec->stage = BLINK_LIMIT_KILLED;
@@ -1001,6 +1410,31 @@ static void blink_limits_deadline_locked(blink_limit_rec* rec, int64_t now) {
         rec->stage = BLINK_LIMIT_TERMED;
     }
 }
+
+#if defined(__linux__)
+/* Reads the events of the cgroup of a child. Interim choices, the one place for them: a
+ * refused fork ends the tree at once with cgroup.kill, and is Limit(Processes) only while the
+ * leader still ran, since a leader that exited on its own was not ended. A memory kill is
+ * Limit(Memory) while the leader ran or when that kill ended it; the kernel already ended
+ * the tree, and cgroup.kill ends what it spared. When both are seen at once, memory wins.
+ * Caller holds rec->mu, and the leader is not reaped. */
+static void blink_cg_events_locked(blink_limit_rec* rec) {
+    if (rec->cg == NULL || rec->cg_killed) return;
+    int memory = blink_cg_memory_hit(rec);
+    int processes = !memory && rec->cg_pids && blink_cg_count(rec->cg, "pids.events.local", "max") > 0;
+    if (!memory && !processes) return;
+    siginfo_t info;
+    int runs = blink_limits_leader_runs(rec, &info);
+    if (rec->limit == BLINK_LIMIT_NONE) {
+        if (memory && (runs || (info.si_code == CLD_KILLED && info.si_status == SIGKILL))) {
+            rec->limit = blink_LimitKind_Memory;
+        } else if (processes && runs) {
+            rec->limit = blink_LimitKind_Processes;
+        }
+    }
+    blink_cg_kill(rec);
+}
+#endif
 
 /* One pass of the thread over every record: signals what is due, frees what run or wait
  * released, and returns the time of the next thing due. Caller holds blink_limits.mu. */
@@ -1012,12 +1446,18 @@ static int64_t blink_limits_tick_locked(int64_t now) {
         pthread_mutex_lock(&rec->mu);
         if (rec->released) {
             *at = rec->next;
+#if defined(__linux__)
+            blink_cg_release_locked(rec);
+#endif
             pthread_mutex_unlock(&rec->mu);
             pthread_mutex_destroy(&rec->mu);
             free(rec);
             continue;
         }
         if (!rec->reaped) {
+#if defined(__linux__)
+            blink_cg_events_locked(rec);
+#endif
             if (rec->stage == BLINK_LIMIT_WAITING && now >= rec->deadline) {
                 blink_limits_deadline_locked(rec, now);
             }
@@ -1031,26 +1471,103 @@ static int64_t blink_limits_tick_locked(int64_t now) {
         pthread_mutex_unlock(&rec->mu);
         at = &rec->next;
     }
+#if defined(__linux__)
+    blink_cg_left_locked();
+#endif
     return next;
+}
+
+#if defined(__linux__)
+/* struct clone_args of linux/sched.h, version 2 (with cgroup), spelled out so no kernel
+ * header is needed. */
+struct blink_clone_args {
+    uint64_t flags, pidfd, child_tid, parent_tid, exit_signal, stack, stack_size, tls;
+    uint64_t set_tid, set_tid_size, cgroup;
+};
+#define BLINK_CLONE_INTO_CGROUP 0x200000000ULL
+#ifdef SYS_clone3
+#define BLINK_SYS_CLONE3 SYS_clone3
+#else
+#define BLINK_SYS_CLONE3 435
+#endif
+#endif
+
+/* fork, or on Linux with cg_fd >= 0 a clone3 that starts the child in that cgroup, so not
+ * one instruction of it runs outside. A kernel with no clone3 gets a plain fork, and the
+ * child moves itself before it does anything else (see blink_limits_fork_locked). */
+static pid_t blink_limits_fork(int cg_fd) {
+#if defined(__linux__)
+    if (cg_fd >= 0) {
+        struct blink_clone_args args;
+        memset(&args, 0, sizeof(args));
+        args.flags = BLINK_CLONE_INTO_CGROUP;
+        args.exit_signal = SIGCHLD;
+        args.cgroup = (uint64_t)cg_fd;
+        long r = syscall(BLINK_SYS_CLONE3, &args, sizeof(args));
+        if (r >= 0 || errno != ENOSYS) return (pid_t)r;
+    }
+#else
+    (void)cg_fd;
+#endif
+    return fork();
 }
 
 /* Runs on the limits thread with blink_limits.mu held. The child leads a new process group
  * and, on Linux, gets SIGKILL when this thread ends, which is when the program ends. It gets
  * back the signal mask of the thread that asked, since the limits thread blocks signals of
- * its own. */
+ * its own. A child with memory or processes starts in a cgroup of its own. */
 static void blink_limits_fork_locked(blink_limit_req* req) {
     blink_limit_rec* rec = (blink_limit_rec*)calloc(1, sizeof(blink_limit_rec));
     if (rec == NULL) { req->err = ENOMEM; return; }
     pthread_mutex_init(&rec->mu, NULL);
+    rec->limit = BLINK_LIMIT_NONE;
+    int cg_fd = -1, procs_fd = -1;
+#if defined(__linux__)
+    if (req->memory >= 0 || req->processes >= 0) {
+        int e = blink_cg_child_make(req->memory, req->processes, &rec->cg, &cg_fd, &procs_fd);
+        if (e != 0) {
+            req->err = e;
+            pthread_mutex_destroy(&rec->mu);
+            free(rec);
+            return;
+        }
+        rec->cg_memory = req->memory >= 0;
+        rec->cg_pids = req->processes >= 0;
+    }
+#else
+    if (req->memory >= 0 || req->processes >= 0) {
+        req->err = ENOTSUP;
+        pthread_mutex_destroy(&rec->mu);
+        free(rec);
+        return;
+    }
+#endif
     pid_t parent = getpid();
-    pid_t pid = fork();
+    pid_t pid = blink_limits_fork(cg_fd);
     if (pid < 0) {
         req->err = errno;
+        if (cg_fd >= 0) close(cg_fd);
+        if (procs_fd >= 0) close(procs_fd);
+        if (rec->cg != NULL) {
+            rmdir(rec->cg);
+            free(rec->cg);
+        }
         pthread_mutex_destroy(&rec->mu);
         free(rec);
         return;
     }
     if (pid == 0) {
+        /* After a clone3 the child is in its cgroup already and this write moves nothing;
+         * after the fork of a kernel with no clone3 it is the move. */
+        if (procs_fd >= 0) {
+            ssize_t w;
+            do { w = write(procs_fd, "0", 1); } while (w < 0 && errno == EINTR);
+            if (w != 1) {
+                int e = w < 0 ? errno : EIO;
+                do { w = write(req->report_fd, &e, sizeof(e)); } while (w < 0 && errno == EINTR);
+                _exit(127);
+            }
+        }
         setpgid(0, 0);
 #if defined(__linux__)
         prctl(PR_SET_PDEATHSIG, SIGKILL);
@@ -1067,11 +1584,13 @@ static void blink_limits_fork_locked(blink_limit_req* req) {
         pthread_sigmask(SIG_SETMASK, &req->mask, NULL);
         blink_child_exec_or_report(req->argv, req->stdin_fd, req->out_fd, req->err_fd, req->report_fd);
     }
+    if (cg_fd >= 0) close(cg_fd);
+    if (procs_fd >= 0) close(procs_fd);
     /* Both sides set the group, so it is set before either goes on. EACCES once the child
      * has exec'd is fine: the child set it first. */
     setpgid(pid, pid);
     rec->pid = pid;
-    rec->deadline = blink_limits_add(blink_limits_now(), req->timeout);
+    rec->deadline = req->timeout < 0 ? BLINK_LIMIT_NEVER : blink_limits_add(blink_limits_now(), req->timeout);
     rec->grace = req->grace;
     rec->kill_at = BLINK_LIMIT_NEVER;
     rec->stage = BLINK_LIMIT_WAITING;
@@ -1216,17 +1735,28 @@ static void* blink_limits_main(void* arg) {
         }
         if (served) pthread_cond_broadcast(&blink_limits.served);
         int64_t next = blink_limits_tick_locked(blink_limits_now());
-        int wake_rd = blink_limits.wake_rd;
+        struct pollfd pfds[2];
+        nfds_t nfds = 1;
+        pfds[0].fd = blink_limits.wake_rd;
+        pfds[0].events = POLLIN;
+        pfds[0].revents = 0;
+#if defined(__linux__)
+        /* An event of a child cgroup: the next pass reads the event files of each. */
+        if (blink_cg.ino_fd >= 0) {
+            pfds[1].fd = blink_cg.ino_fd;
+            pfds[1].events = POLLIN;
+            pfds[1].revents = 0;
+            nfds = 2;
+        }
+#endif
         pthread_mutex_unlock(&blink_limits.mu);
-        struct pollfd pfd;
-        pfd.fd = wake_rd;
-        pfd.events = POLLIN;
-        pfd.revents = 0;
         /* EINTR (the collector stops this thread with a signal) or an early wake just
          * means one more pass. */
-        poll(&pfd, 1, blink_limits_poll_ms(next == BLINK_LIMIT_NEVER ? -1 : next));
-        char drain[64];
-        while (read(wake_rd, drain, sizeof(drain)) > 0) {}
+        poll(pfds, nfds, blink_limits_poll_ms(next == BLINK_LIMIT_NEVER ? -1 : next));
+        char drain[4096];
+        for (nfds_t i = 0; i < nfds; i++) {
+            while (read(pfds[i].fd, drain, sizeof(drain)) > 0) {}
+        }
         pthread_mutex_lock(&blink_limits.mu);
     }
     return NULL;
@@ -1284,8 +1814,8 @@ static int blink_limits_start_locked(void) {
 /* Forks a limited child on the given pipes through the limits thread. 0 with *rec_out set
  * once the child has exec'd, else the errno of the thread start, the fork or the exec; a
  * child whose exec failed is reaped here. */
-static int blink_limits_fork_exec(char** argv, int stdin_fd, int out_fd, int err_fd,
-                                  int64_t timeout, int64_t grace, blink_limit_rec** rec_out) {
+static int blink_limits_fork_exec(char** argv, int stdin_fd, int out_fd, int err_fd, int64_t timeout,
+                                  int64_t grace, int64_t memory, int64_t processes, blink_limit_rec** rec_out) {
     int report[2] = {-1, -1};
     if (blink_child_pipe(report) < 0) return errno;
     blink_limit_req req;
@@ -1297,6 +1827,8 @@ static int blink_limits_fork_exec(char** argv, int stdin_fd, int out_fd, int err
     req.report_fd = report[1];
     req.timeout = timeout;
     req.grace = grace;
+    req.memory = memory;
+    req.processes = processes;
     pthread_sigmask(SIG_SETMASK, NULL, &req.mask);
     pthread_mutex_lock(&blink_limits.mu);
     int e = blink_limits_start_locked();
@@ -1336,9 +1868,10 @@ static int blink_limits_fork_exec(char** argv, int stdin_fd, int out_fd, int err
 }
 
 /* Reaps a limited child that a wait has left a zombie, and gives the errno of the reap,
- * its status, and whether the limit ended it. The record is released: the caller does not
- * use it again. Caller holds no limits lock; wait_err is the errno of that wait. */
-static int blink_limits_reap(blink_limit_rec* rec, int wait_err, int* status, int* limit_hit) {
+ * its status, and the limit that ended it (BLINK_LIMIT_NONE for none). The record is
+ * released: the caller does not use it again. Caller holds no limits lock; wait_err is the
+ * errno of that wait. */
+static int blink_limits_reap(blink_limit_rec* rec, int wait_err, int* status, int* limit) {
     pthread_mutex_lock(&rec->mu);
     int e = wait_err;
     if (rec->reaped_at_exit) {
@@ -1347,8 +1880,16 @@ static int blink_limits_reap(blink_limit_rec* rec, int wait_err, int* status, in
     } else if (e == 0) {
         e = blink_child_waitpid(rec->pid, status);
     }
+#if defined(__linux__)
+    /* The limits thread may not have read the memory events yet when the kill reaches the
+     * leader first. */
+    if (e == 0 && rec->limit == BLINK_LIMIT_NONE && rec->cg != NULL && WIFSIGNALED(*status)
+        && WTERMSIG(*status) == SIGKILL && blink_cg_memory_hit(rec)) {
+        rec->limit = blink_LimitKind_Memory;
+    }
+#endif
     rec->reaped = 1;
-    *limit_hit = rec->limit_hit;
+    *limit = rec->limit;
     rec->released = 1;
     pthread_mutex_unlock(&rec->mu);
     blink_limits_wake();
@@ -1366,9 +1907,9 @@ static int blink_limits_wait_exit(pid_t pid) {
     return 0;
 }
 
-static void blink_child_box_set_end(blink_child_box* box, int status, int limit_hit) {
-    if (limit_hit) {
-        box->result.end = blink_child_end_limit(blink_LimitKind_Timeout);
+static void blink_child_box_set_end(blink_child_box* box, int status, int limit) {
+    if (limit != BLINK_LIMIT_NONE) {
+        box->result.end = blink_child_end_limit((blink_LimitKind)limit);
     } else {
         blink_process_result_set_status(&box->result, status);
     }
@@ -1475,17 +2016,19 @@ BLINK_RT_FN blink_child_box* blink_child_spawn(const char* cmd, const blink_list
 }
 #endif
 
-/* process.run with limits: timeout_ns < 0 is no timeout, and then it is blink_child_run.
- * The limits thread forks the child, which leads its own process group. Until the deadline
- * the run waits for end of file as blink_child_run does; from then on it reads the pipes
- * until timeout + grace + a short delay at most. A Ctrl-C does not reach the child's group
- * from the terminal; the program-exit rule ends it. */
-BLINK_RT_FN blink_child_box* blink_child_run_limited(const char* cmd, const blink_list* args, int64_t has_stdin,
-                                                     const char* stdin_data, int64_t timeout_ns, int64_t grace_ns);
+/* process.run with limits: timeout_ns, memory and processes < 0 are no such limit, and
+ * with none it is blink_child_run. The limits thread forks the child, which leads its own
+ * process group. Until the deadline the run waits for end of file as blink_child_run does;
+ * from then on it reads the pipes until timeout + grace + a short delay at most. A Ctrl-C
+ * does not reach the child's group from the terminal; the program-exit rule ends it. */
+BLINK_RT_FN blink_child_box* blink_child_run_limited2(const char* cmd, const blink_list* args, int64_t has_stdin,
+                                                      const char* stdin_data, int64_t timeout_ns, int64_t grace_ns,
+                                                      int64_t memory, int64_t processes);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN blink_child_box* blink_child_run_limited(const char* cmd, const blink_list* args, int64_t has_stdin,
-                                                     const char* stdin_data, int64_t timeout_ns, int64_t grace_ns) {
-    if (timeout_ns < 0) return blink_child_run(cmd, args, has_stdin, stdin_data);
+BLINK_RT_FN blink_child_box* blink_child_run_limited2(const char* cmd, const blink_list* args, int64_t has_stdin,
+                                                      const char* stdin_data, int64_t timeout_ns, int64_t grace_ns,
+                                                      int64_t memory, int64_t processes) {
+    if (timeout_ns < 0 && memory < 0 && processes < 0) return blink_child_run(cmd, args, has_stdin, stdin_data);
     blink_child_box* box = blink_child_box_new(cmd);
     if (!blink_child_strings_ok(cmd, args)) { box->err = EINVAL; return box; }
     char** argv = blink_process_build_argv(cmd, args);
@@ -1499,7 +2042,8 @@ BLINK_RT_FN blink_child_box* blink_child_run_limited(const char* cmd, const blin
         return box;
     }
     blink_limit_rec* rec = NULL;
-    int e = blink_limits_fork_exec(argv, in_pipe[0], out_pipe[1], err_pipe[1], timeout_ns, grace_ns, &rec);
+    int e = blink_limits_fork_exec(argv, in_pipe[0], out_pipe[1], err_pipe[1], timeout_ns, grace_ns, memory,
+                                   processes, &rec);
     if (in_pipe[0] >= 0) close(in_pipe[0]);
     close(out_pipe[1]);
     close(err_pipe[1]);
@@ -1515,29 +2059,29 @@ BLINK_RT_FN blink_child_box* blink_child_run_limited(const char* cmd, const blin
     blink_child_pump(in_pipe[1], stdin_data, has_stdin ? blink_str_len(stdin_data) : 0,
                      out_pipe[0], err_pipe[0], &out, &err, blink_limits_stop_at(rec));
     int status = 0;
-    int limit_hit = 0;
-    int we = blink_limits_reap(rec, blink_limits_wait_exit(rec->pid), &status, &limit_hit);
+    int limit = BLINK_LIMIT_NONE;
+    int we = blink_limits_reap(rec, blink_limits_wait_exit(rec->pid), &status, &limit);
     if (we != 0) {
         box->err = we;
     } else {
         box->result.out = out;
         box->result.err_out = err;
-        blink_child_box_set_end(box, status, limit_hit);
+        blink_child_box_set_end(box, status, limit);
         box->waited = 1;
     }
     return box;
 }
 #endif
 
-/* process.spawn with limits: timeout_ns < 0 is no timeout, and then it is
- * blink_child_spawn. As blink_child_run_limited, the limits thread forks the child; the
- * box keeps its limit record for the wait. */
-BLINK_RT_FN blink_child_box* blink_child_spawn_limited(const char* cmd, const blink_list* args, int64_t timeout_ns,
-                                                       int64_t grace_ns);
+/* process.spawn with limits: < 0 is no such limit, and with none it is blink_child_spawn.
+ * As blink_child_run_limited2, the limits thread forks the child; the box keeps its limit
+ * record for the wait. */
+BLINK_RT_FN blink_child_box* blink_child_spawn_limited2(const char* cmd, const blink_list* args, int64_t timeout_ns,
+                                                        int64_t grace_ns, int64_t memory, int64_t processes);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN blink_child_box* blink_child_spawn_limited(const char* cmd, const blink_list* args, int64_t timeout_ns,
-                                                       int64_t grace_ns) {
-    if (timeout_ns < 0) return blink_child_spawn(cmd, args);
+BLINK_RT_FN blink_child_box* blink_child_spawn_limited2(const char* cmd, const blink_list* args, int64_t timeout_ns,
+                                                        int64_t grace_ns, int64_t memory, int64_t processes) {
+    if (timeout_ns < 0 && memory < 0 && processes < 0) return blink_child_spawn(cmd, args);
     blink_child_box* box = blink_child_box_new(cmd);
     if (!blink_child_strings_ok(cmd, args)) { box->err = EINVAL; return box; }
     char** argv = blink_process_build_argv(cmd, args);
@@ -1552,7 +2096,7 @@ BLINK_RT_FN blink_child_box* blink_child_spawn_limited(const char* cmd, const bl
         blink_child_close_pair(out_pipe);
         blink_child_close_pair(err_pipe);
     } else {
-        e = blink_limits_fork_exec(argv, -1, out_pipe[1], err_pipe[1], timeout_ns, grace_ns, &rec);
+        e = blink_limits_fork_exec(argv, -1, out_pipe[1], err_pipe[1], timeout_ns, grace_ns, memory, processes, &rec);
         close(out_pipe[1]);
         close(err_pipe[1]);
         if (e != 0) {
@@ -1577,6 +2121,23 @@ BLINK_RT_FN blink_child_box* blink_child_spawn_limited(const char* cmd, const bl
     box->lim = rec;
     box->handle = h;
     return box;
+}
+#endif
+
+/* The timeout-only entry points, which a std built before memory and processes calls. */
+BLINK_RT_FN blink_child_box* blink_child_run_limited(const char* cmd, const blink_list* args, int64_t has_stdin,
+                                                     const char* stdin_data, int64_t timeout_ns, int64_t grace_ns);
+BLINK_RT_FN blink_child_box* blink_child_spawn_limited(const char* cmd, const blink_list* args, int64_t timeout_ns,
+                                                       int64_t grace_ns);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN blink_child_box* blink_child_run_limited(const char* cmd, const blink_list* args, int64_t has_stdin,
+                                                     const char* stdin_data, int64_t timeout_ns, int64_t grace_ns) {
+    return blink_child_run_limited2(cmd, args, has_stdin, stdin_data, timeout_ns, grace_ns, -1, -1);
+}
+
+BLINK_RT_FN blink_child_box* blink_child_spawn_limited(const char* cmd, const blink_list* args, int64_t timeout_ns,
+                                                       int64_t grace_ns) {
+    return blink_child_spawn_limited2(cmd, args, timeout_ns, grace_ns, -1, -1);
 }
 #endif
 
@@ -1614,10 +2175,10 @@ BLINK_RT_FN int64_t blink_child_wait(blink_child_box* box) {
         if (errno != EINTR) { e = errno; break; }
     }
     int status = 0;
-    int limit_hit = 0;
+    int limit = BLINK_LIMIT_NONE;
     pthread_mutex_lock(&blink_pid_table_mu);
     if (box->lim != NULL) {
-        e = blink_limits_reap(box->lim, e, &status, &limit_hit);
+        e = blink_limits_reap(box->lim, e, &status, &limit);
         box->lim = NULL;
     } else if (e == 0) {
         e = blink_child_waitpid(slot->pid, &status);
@@ -1629,7 +2190,7 @@ BLINK_RT_FN int64_t blink_child_wait(blink_child_box* box) {
     if (e == 0) {
         box->result.out = out;
         box->result.err_out = err;
-        blink_child_box_set_end(box, status, limit_hit);
+        blink_child_box_set_end(box, status, limit);
         box->waited = 1;
     }
     /* The slot is free either way, so a later wait on this box gives ECHILD. */
@@ -1798,13 +2359,17 @@ BLINK_RT_FN const char* blink_process_signal_name(int64_t n) {
 
 /* The one answer to "can run and spawn apply a limit of this kind here" (blink_LimitKind
  * numbering). process.can_limit and the ENOTSUP check of run and spawn both ask it, so the
- * two never disagree. memory and processes need a delegated cgroup v2, which this runtime
- * does not use yet, so they are never supported. The timeout needs only the limits thread,
- * which a POSIX host can always start; when it cannot, run and spawn give that errno. */
+ * two never disagree. memory and processes need a delegated cgroup v2 (blink_cg_check),
+ * checked once. The timeout needs only the limits thread, which a POSIX host can always
+ * start; when it cannot, run and spawn give that errno. */
 BLINK_RT_FN int64_t blink_child_limit_supported(int64_t kind);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN int64_t blink_child_limit_supported(int64_t kind) {
-    return kind == blink_LimitKind_Timeout ? 1 : 0;
+    if (kind == blink_LimitKind_Timeout) return 1;
+#if defined(__linux__)
+    if (kind == blink_LimitKind_Memory || kind == blink_LimitKind_Processes) return blink_cg_supported((int)kind);
+#endif
+    return 0;
 }
 #endif
 
