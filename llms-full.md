@@ -933,8 +933,8 @@ result.end          // ChildEnd — how the child ended
 result.success()    // Bool — true exactly for Exited(0)
 ```
 
-`result.end` says how the child ended: `Exited(code)` or
-`Signaled(n)`, never `Exited(128 + n)`. There is no `exit_code` field; reading one is E0525. `result.success()` is true exactly for `Exited(0)`.
+`result.end` says how the child ended: `Exited(code)`,
+`Signaled(n)` or `Limit(kind)`, never `Exited(128 + n)`. There is no `exit_code` field; reading one is E0525. `result.success()` is true exactly for `Exited(0)`.
 `signal_name(n)` gives the host's name for a signal (`"SIGSEGV"`), or `"SIG<n>"`. An end
 displays as `exit 3`, `signal SIGSEGV` or `limit timeout`.
 
