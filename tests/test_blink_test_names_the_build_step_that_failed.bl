@@ -11,14 +11,14 @@ import std.json.{json_clear, json_parse, json_get, json_as_str, json_len, json_a
 
 let PACKAGE = "[package]\nname = \"app\"\nversion = \"0.1.0\"\n"
 
-// The C a build makes for this file calls a function that nothing declares, so it does not
-// compile.
-let UNDECLARED = #"@ffi("c", "blink_test_fn_that_no_header_declares")
+// The C a build makes for this file calls abs, which stdlib.h declares with one argument, with
+// none, so no C compiler accepts it.
+let WRONG_ARITY = #"@ffi("c", "abs", header: "stdlib.h")
 @trusted(audit: "test")
-fn undeclared() -> Int ! ()
+fn no_args_abs() -> Int ! ()
 
 test "calls it" {
-    assert(undeclared() == 1)
+    assert(no_args_abs() == 1)
 }
 "#
 
@@ -65,14 +65,17 @@ fn project(files: List[(Str, Str)], mylib_c: Str) -> Str {
     dir
 }
 
-// The corpus exports BLINK_COMPILER_ARCHIVE and module filters, which make each build one
-// unit, so every run here drops them: --per-module must reach the per-module path.
+// Runs `B=<the blink under test>; cd <dir> && env <vars> <cmd>`, with a native cache of the
+// project's own. The corpus exports BLINK_COMPILER_ARCHIVE and module filters, which make each
+// build one unit, so every run here drops them: --per-module must reach the per-module path.
+fn sh_in(dir: Str, vars: Str, cmd: Str) -> ProcessResult {
+    sh("B=$(pwd)/build/blink; cd {dir} && env -u BLINK_PER_MODULE -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE BLINK_CACHE_DIR={dir}/cache {vars} {cmd}")
+}
 
-// Runs `blink test <args>` in dir with the workers worker, or the blink under test for "", and
-// a native cache of the project's own.
+// Runs `blink test <args>` in dir with the workers worker, or the blink under test for "".
 fn blink_test_in(dir: Str, worker: Str, args: Str) -> ProcessResult {
     let w = if worker != "" { worker } else { "$B" }
-    sh("B=$(pwd)/build/blink; cd {dir} && env -u BLINK_PER_MODULE -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE BLINK_CACHE_DIR={dir}/cache BLINK_BIN={w} $B test {args}")
+    sh_in(dir, "BLINK_BIN={w}", "$B test {args}")
 }
 
 // Runs `blink test <args>` in a fresh project, then removes it.
@@ -130,11 +133,16 @@ fn assert_one_step_diagnostic(r: ProcessResult, name: Str, severity: Str, diag_n
 
 test "generated C that does not compile is one ice diagnostic, on both build paths" {
     for path in ["--per-module", "--no-per-module"] {
-        let r = blink_test([("test_undeclared", UNDECLARED), ("test_good", GOOD)], "", "--json {path} tests")
+        // The file's name holds "error", which the C compiler's output repeats in lines that
+        // are not errors: the message must still quote the error line.
+        let r = blink_test([("test_error_arity", WRONG_ARITY), ("test_good", GOOD)], "", "--json {path} tests")
         assert_eq(r.end, ChildEnd.Exited(1), diag(r))
-        assert_one_step_diagnostic(r, "test_undeclared", "ice", "GeneratedCDidNotCompile", "I0017", "compiling the generated C", "blink_test_fn_that_no_header_declares")
-        let line = file_line(r.out, "tests/test_undeclared.bl")
-        assert(line.contains("failed: "), line)
+        assert_one_step_diagnostic(r, "test_error_arity", "ice", "GeneratedCDidNotCompile", "I0017", "compiling the generated C", "abs")
+        let line = file_line(r.out, "tests/test_error_arity.bl")
+        json_clear()
+        let message = json_as_str(json_get(json_at(json_get(json_parse(line), "diagnostics"), 0), "message"))
+        assert(message.contains(": error: "), line)
+        assert(message.contains("abs"), line)
         assert(file_line(r.out, "tests/test_good.bl").contains("\"outcome\":\"ran\""), diag(r))
     }
 }
@@ -172,9 +180,9 @@ test "a long tool output is cut, and the last note says so" {
 }
 
 test "the human output prints the step diagnostic under BUILD FAILED" {
-    let r = blink_test([("test_undeclared", UNDECLARED)], "", "tests")
+    let r = blink_test([("test_arity", WRONG_ARITY)], "", "tests")
     assert_eq(r.end, ChildEnd.Exited(1), diag(r))
-    assert(r.out.contains("BUILD FAILED tests/test_undeclared.bl\n"), diag(r))
+    assert(r.out.contains("BUILD FAILED tests/test_arity.bl\n"), diag(r))
     assert(r.out.contains("internal compiler error[GeneratedCDidNotCompile]: compiling the generated C"), diag(r))
     assert(r.out.contains("  note: This is a compiler bug."), diag(r))
     assert(!r.out.contains("TestBuildEndedWithoutDiagnostic"), diag(r))
@@ -205,23 +213,23 @@ test "blink build prints a C compile failure as it did before, on both build pat
     let _ = sh("mkdir -p {dir}/src")
     write_file("{dir}/blink.toml", PACKAGE)
     write_file("{dir}/blink.lock", "[metadata]\nlockfile-version = 1\n")
-    write_file("{dir}/src/main.bl", #"@ffi("c", "blink_test_fn_that_no_header_declares")
+    write_file("{dir}/src/main.bl", #"@ffi("c", "abs", header: "stdlib.h")
 @trusted(audit: "test")
-fn undeclared() -> Int ! ()
+fn no_args_abs() -> Int ! ()
 
 fn main() {
-    io.println("{undeclared()}")
+    io.println("{no_args_abs()}")
 }
 "#)
-    let pm = sh("B=$(pwd)/build/blink; cd {dir} && env -u BLINK_PER_MODULE -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE BLINK_CACHE_DIR={dir}/cache $B build --per-module src/main.bl")
-    let one = sh("B=$(pwd)/build/blink; cd {dir} && env -u BLINK_PER_MODULE -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE BLINK_CACHE_DIR={dir}/cache $B build --no-per-module src/main.bl")
+    let pm = sh_in(dir, "", "$B build --per-module src/main.bl")
+    let one = sh_in(dir, "", "$B build --no-per-module src/main.bl")
     let _ = sh("rm -rf {dir}")
     assert_eq(pm.end, ChildEnd.Exited(1), diag(pm))
     assert(pm.out.contains("error: C compilation failed in unit "), diag(pm))
-    assert(pm.err_out.contains("blink_test_fn_that_no_header_declares"), diag(pm))
+    assert(pm.err_out.contains("abs"), diag(pm))
     assert(one.end != ChildEnd.Exited(0), diag(one))
     assert(one.out.contains("error: C compilation failed\n"), diag(one))
-    assert(one.err_out.contains("blink_test_fn_that_no_header_declares"), diag(one))
+    assert(one.err_out.contains("abs"), diag(one))
     for r in [pm, one] {
         assert(!"{r.out}{r.err_out}".contains("GeneratedCDidNotCompile"), diag(r))
     }
@@ -238,9 +246,9 @@ fn main() {
     io.println("{missing()}")
 }
 "#)
-        let link = sh("B=$(pwd)/build/blink; cd {dir} && env -u BLINK_PER_MODULE -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE BLINK_CACHE_DIR={dir}/cache $B build {path} src/main.bl")
+        let link = sh_in(dir, "", "$B build {path} src/main.bl")
         write_file("{dir}/native/mylib.c", "int mylib_missing(void) \{ return blink_no_such_name; \}\n")
-        let dep = sh("B=$(pwd)/build/blink; cd {dir} && env -u BLINK_PER_MODULE -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE BLINK_CACHE_DIR={dir}/cache $B build {path} src/main.bl")
+        let dep = sh_in(dir, "", "$B build {path} src/main.bl")
         let _ = sh("rm -rf {dir}")
         assert(link.end != ChildEnd.Exited(0), diag(link))
         assert(link.out.contains("error: C compilation failed"), diag(link))
