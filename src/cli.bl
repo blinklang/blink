@@ -4,7 +4,7 @@ import std.args.{
     argparser_new, set_version, add_flag, add_command,
     command_add_flag, command_add_option, command_add_positional,
     argparse, parse_argv, args_has, args_get, args_get_all,
-    args_command, args_command_path, args_positional, args_rest, args_error,
+    args_command, args_command_path, args_positional, args_positional_count, args_rest, args_error,
     generate_help, generate_command_help,
 }
 import std.json.{
@@ -13,6 +13,7 @@ import std.json.{
     json_new_array, json_push,
 }
 import std.path.{path_join, path_dirname, path_basename}
+import std.fs.{FileKind}
 import std.process.{ChildEnd, ChildLimits, LimitKind}
 import std.time.{Duration}
 import pkg.audit.{audit_load_baseline, audit_check, audit_report}
@@ -458,6 +459,47 @@ fn collect_test_files(dir: Str, results: List[Str]) {
         }
         i = i + 1
     }
+}
+
+// The test files that the paths select, each once in first-seen order, and the usage error of
+// each bad path (§8.10, §8.10.7 *Paths that select no test file*). A directory is searched and
+// one that holds no test file is a bad path, even beside a good path; a named file is taken as
+// given. Two spellings of one file, such as a.bl and ./a.bl or a.bl and its directory, are one
+// file: it runs under the first spelling.
+fn test_select_files(paths: List[Str]) -> (List[Str], List[Str]) ! FS.Read {
+    let mut files: List[Str] = []
+    let mut errors: List[Str] = []
+    let mut seen: Set[Str] = Set.new()
+    for path in paths {
+        let mut found: List[Str] = []
+        if file_exists(path) == 0 {
+            errors.push("error: path not found: {path}\n")
+            continue
+        }
+        if is_dir(path) == 1 {
+            collect_test_files(path, found)
+            if found.len() == 0 {
+                errors.push("error: no test files in {path} (a test file is a .bl file with a test block)\n")
+                continue
+            }
+        } else {
+            let is_file = match fs.stat(path) {
+                Ok(info) => info.kind == FileKind.File
+                Err(_) => false
+            }
+            if !is_file {
+                errors.push("error: not a file or directory: {path}\n")
+                continue
+            }
+            found.push(path)
+        }
+        for f in found {
+            if seen.insert(build_fs.real_path(f) ?? f) {
+                files.push(f)
+            }
+        }
+    }
+    (files, errors)
 }
 
 fn resolve_manifest_path() -> Str {
@@ -4947,9 +4989,8 @@ fn test_limit_flag(text: Str, kind: LimitKind) -> Result[Int?, Str] {
 
 // The limits that `blink test` runs each test binary with (§8.10.7): a flag beats [test] in
 // blink.toml, which beats the default timeout. It reads blink.toml once, before any build. A bad
-// value, or a limit the host cannot apply, is a usage error: the text goes to stderr, also with
-// --json, nothing goes to stdout, and the command exits 2.
-fn test_run_limits(a: Args, test_path: Str) -> ChildLimits ! IO, FS.Read, Process.Spawn, Env.Exit {
+// value, or a limit the host cannot apply, is a usage error: Err holds the text of each.
+fn test_run_limits(a: Args, test_path: Str) -> Result[ChildLimits, List[Str]] ! IO, FS.Read, Process.Spawn {
     let mut errors: List[Str] = []
     let mut timeout: Option[Int] = Some(DEFAULT_TEST_TIMEOUT_MS)
     let mut memory: Option[Int] = None
@@ -5009,10 +5050,7 @@ fn test_run_limits(a: Args, test_path: Str) -> ChildLimits ! IO, FS.Read, Proces
         }
     }
     if errors.len() > 0 {
-        for text in errors {
-            io.eprint_raw(text)
-        }
-        env.exit(2)
+        return Err(errors)
     }
 
     // A timeout needs no host check: every host has one.
@@ -5023,16 +5061,13 @@ fn test_run_limits(a: Args, test_path: Str) -> ChildLimits ! IO, FS.Read, Proces
         errors.push(test_unsupported_limit_text(LimitKind.Processes))
     }
     if errors.len() > 0 {
-        for text in errors {
-            io.eprint_raw(text)
-        }
-        env.exit(2)
+        return Err(errors)
     }
     let mut t: Option[Duration] = Option.None
     if timeout.is_some() {
         t = Some(Duration.ms(timeout.unwrap()))
     }
-    ChildLimits { timeout: t, memory: memory, processes: processes }
+    Ok(ChildLimits { timeout: t, memory: memory, processes: processes })
 }
 
 fn test_unsupported_limit_text(kind: LimitKind) -> Str {
@@ -5077,7 +5112,15 @@ fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
         io.eprintln(bad_format)
         env.exit(1)
     }
-    let source_path = args_positional(a, 0)
+    let mut paths: List[Str] = []
+    let mut ai = 0
+    while ai < args_positional_count(a) {
+        paths.push(args_positional(a, ai))
+        ai = ai + 1
+    }
+    if paths.len() == 0 {
+        paths.push(".")
+    }
     apply_cache_flag(a)
     let json = json_requested(a)
     let verbose = args_has(a, "verbose")
@@ -5095,7 +5138,27 @@ fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
         num_workers = 1
     }
     let unit_jobs = unit_jobs_from_args(a)
-    let limits = test_run_limits(a, source_path)
+    // Every usage error is found before any file builds, and all of them print (§8.10.7).
+    let mut usage_errors: List[Str] = []
+    let limits = match test_run_limits(a, if args_positional_count(a) == 0 { "" } else { paths.get(0).unwrap() }) {
+        Ok(l) => l
+        Err(texts) => {
+            for text in texts {
+                usage_errors.push(text)
+            }
+            ChildLimits {}
+        }
+    }
+    let (test_files, path_errors) = test_select_files(paths)
+    for text in path_errors {
+        usage_errors.push(text)
+    }
+    if usage_errors.len() > 0 {
+        for text in usage_errors {
+            io.eprint_raw(text)
+        }
+        env.exit(2)
+    }
 
     ensure_deps_resolved()
     // A forced rebuild compiles the stdlib in process ahead of the program. It lands in
@@ -5111,24 +5174,11 @@ fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
     if dev_rc != 0 {
         env.exit(dev_rc)
     }
-    if source_path != "" {
-        check_file_exists(source_path)
-    }
 
     // A run of one file is a run of a list of one, so it writes the same lines as a run of its
     // directory (§8.10). Only the place of its binary differs: build/<name>.
-    let one_file = source_path != "" && is_dir(source_path) == 0
-    let mut test_files: List[Str] = []
-    if one_file {
-        test_files.push(source_path)
-    } else {
-        collect_test_files(if source_path == "" { "." } else { source_path }, test_files)
-    }
+    let one_file = paths.len() == 1 && is_dir(paths.get(0).unwrap()) == 0
     let file_count = test_files.len()
-    if file_count == 0 {
-        io.eprintln("error: no files with test blocks found")
-        env.exit(2)
-    }
 
     // Typecheck each file in process before the parallel builds start. A file that fails is
     // build_failed with its own diagnostics and is not built; the others still run. Each compile
@@ -7095,7 +7145,7 @@ fn cli_parser() -> ArgParser {
     p = command_add_flag(p, "ast", "--imports", "-i", "Resolve imports and show merged AST")
     p = command_add_option(p, "ast", "--node", "-n", "Dump subtree for specific node ID")
     p = command_add_positional(p, "fmt", "file", "Source file or directory (default: all source files)")
-    p = command_add_positional(p, "test", "file", "Test file or directory (default: discover all)")
+    p = command_add_positional(p, "test", "path", "Test files or directories (default: the current directory)")
     p = command_add_positional(p, "doc", "module", "Module name (e.g. std.args)")
     p = command_add_positional(p, "init", "name", "Project name (default: current directory name)")
     p = command_add_positional(p, "add", "name", "Dependency name")

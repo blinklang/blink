@@ -1,0 +1,71 @@
+// `blink test` checks every path before it builds any file (sections/06_tooling.md §8.10.7,
+// *Paths that select no test file*). A path that does not exist, a path that is neither a file
+// nor a directory, and a directory that holds no test file are usage errors: the runner names
+// every bad path on stderr, writes nothing to stdout (also with --json), and exits 2. One bad
+// path among good ones still stops the run, so a typo in a CI path never goes green.
+
+import std.process.{ChildEnd, ChildLimits, ProcessResult}
+import std.time.{Duration}
+
+let PASSING = "test \"ok\" \{\n    assert_eq(1, 1)\n}\n"
+
+let NOT_A_TEST_FILE_HELP = "(a test file is a .bl file with a test block)"
+
+fn sh(cmd: Str) -> ProcessResult {
+    process.run("sh", ["-c", cmd], limits: ChildLimits { timeout: Some(Duration.seconds(300)) }).unwrap()
+}
+
+// Runs `blink test <args>` in a fresh project: good/ holds a test file, empty/ holds only a
+// file with no test block.
+fn blink_test(args: Str) -> ProcessResult {
+    let dir = sh("mktemp -d /tmp/blink_test_bad_paths.XXXXXX").out.trim()
+    let _ = sh("mkdir -p {dir}/good {dir}/empty")
+    write_file("{dir}/blink.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\n")
+    write_file("{dir}/blink.lock", "[metadata]\nlockfile-version = 1\n")
+    write_file("{dir}/good/test_good.bl", PASSING)
+    write_file("{dir}/empty/helper.bl", "fn helper() -> Int \{\n    1\n}\n")
+    let r = sh("B=$(pwd)/build/blink; cd {dir} && env -u BLINK_PER_MODULE BLINK_BIN=$B $B test {args}; rc=$?; ls build 2>/dev/null | sed 's/^/built: /' >&2; exit $rc")
+    let _ = sh("rm -rf {dir}")
+    r
+}
+
+fn assert_usage_error(args: Str, expected: List[Str]) {
+    for mode in ["", "--json "] {
+        let r = blink_test("{mode}{args}")
+        let diag = "blink test {mode}{args}\nstdout:\n{r.out}\nstderr:\n{r.err_out}"
+        assert_eq(r.end, ChildEnd.Exited(2), diag)
+        assert_eq(r.out, "", diag)
+        for line in expected {
+            assert(r.err_out.contains("{line}\n"), "expected `{line}`; {diag}")
+        }
+        assert(!r.err_out.contains("built: "), "a usage error must build nothing; {diag}")
+    }
+}
+
+test "a path that does not exist is a usage error" {
+    assert_usage_error("missing/", ["error: path not found: missing/"])
+}
+
+test "a path that is neither a file nor a directory is a usage error" {
+    assert_usage_error("/dev/null", ["error: not a file or directory: /dev/null"])
+}
+
+test "a directory with no test file is a usage error that says what a test file is" {
+    assert_usage_error("empty/", ["error: no test files in empty/ {NOT_A_TEST_FILE_HELP}"])
+}
+
+test "one missing path beside a good one stops the run and every bad path is named" {
+    assert_usage_error("good/ missing/ also_missing/", ["error: path not found: missing/", "error: path not found: also_missing/"])
+}
+
+test "a directory with no test file beside a good one is named with the other bad paths" {
+    assert_usage_error("good/ empty/ missing/", ["error: no test files in empty/ {NOT_A_TEST_FILE_HELP}", "error: path not found: missing/"])
+}
+
+test "a bad limit and a bad path are both reported in one run" {
+    let r = blink_test("--timeout soon missing/")
+    let diag = "stdout:\n{r.out}\nstderr:\n{r.err_out}"
+    assert_eq(r.end, ChildEnd.Exited(2), diag)
+    assert(r.err_out.contains("--timeout"), "expected the limit error; {diag}")
+    assert(r.err_out.contains("error: path not found: missing/\n"), "expected the path error; {diag}")
+}

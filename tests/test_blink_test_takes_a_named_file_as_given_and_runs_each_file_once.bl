@@ -1,0 +1,60 @@
+// `blink test` searches a directory for test files and takes a file that you name as given
+// (sections/06_tooling.md §8.10, *Which files `blink test <path>` runs*). A named file with no
+// test block runs: one `ran` file line with total 0, and exit 0. A file that two paths name runs
+// once. `blink test` with no path searches the current directory, so a project with no test file
+// is a usage error.
+
+import std.process.{ChildEnd, ChildLimits, ProcessResult}
+import std.time.{Duration}
+
+let PASSING = "test \"ok\" \{\n    assert_eq(1, 1)\n}\n"
+
+fn sh(cmd: Str) -> ProcessResult {
+    process.run("sh", ["-c", cmd], limits: ChildLimits { timeout: Some(Duration.seconds(300)) }).unwrap()
+}
+
+// Runs `blink test <args>` in a fresh project: lib.bl has no test block, t/ holds two test files.
+fn blink_test(with_tests: Bool, args: Str) -> ProcessResult {
+    let dir = sh("mktemp -d /tmp/blink_test_named.XXXXXX").out.trim()
+    write_file("{dir}/blink.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\n")
+    write_file("{dir}/blink.lock", "[metadata]\nlockfile-version = 1\n")
+    write_file("{dir}/lib.bl", "fn helper() -> Int \{\n    1\n}\n")
+    if with_tests {
+        let _ = sh("mkdir -p {dir}/t")
+        write_file("{dir}/t/test_named_a.bl", PASSING)
+        write_file("{dir}/t/test_named_b.bl", PASSING)
+    }
+    let r = sh("B=$(pwd)/build/blink; cd {dir} && env -u BLINK_PER_MODULE BLINK_BIN=$B $B test {args}")
+    let _ = sh("rm -rf {dir}")
+    r
+}
+
+fn count_of(text: Str, part: Str) -> Int {
+    text.split(part).len() - 1
+}
+
+test "a named file with no test block runs with total 0 and exits 0" {
+    let r = blink_test(false, "--json lib.bl")
+    let diag = "stdout:\n{r.out}\nstderr:\n{r.err_out}"
+    assert_eq(r.end, ChildEnd.Exited(0), diag)
+    assert(r.out.contains("\{\"record\":\"file\",\"file\":\"lib.bl\",\"outcome\":\"ran\",\"summary\":\{\"total\":0,"), diag)
+    assert(r.out.contains("\"files\":\{\"total\":1,\"ran\":1,\"build_failed\":0,\"aborted\":0}"), diag)
+}
+
+test "a file that two paths name runs once" {
+    let r = blink_test(true, "--json t/test_named_a.bl t/ ./t/test_named_a.bl")
+    let diag = "stdout:\n{r.out}\nstderr:\n{r.err_out}"
+    assert_eq(r.end, ChildEnd.Exited(0), diag)
+    assert_eq(count_of(r.out, "\"record\":\"file\""), 2, diag)
+    assert_eq(count_of(r.out, "test_named_a.bl\",\"outcome\""), 1, diag)
+    assert(r.out.contains("\{\"record\":\"file\",\"file\":\"t/test_named_a.bl\","), "the first spelling names the file; {diag}")
+    assert(r.out.contains("\"files\":\{\"total\":2,\"ran\":2,\"build_failed\":0,\"aborted\":0}"), diag)
+}
+
+test "blink test with no path in a project with no test file is a usage error" {
+    let r = blink_test(false, "--json")
+    let diag = "stdout:\n{r.out}\nstderr:\n{r.err_out}"
+    assert_eq(r.end, ChildEnd.Exited(2), diag)
+    assert_eq(r.out, "", diag)
+    assert(r.err_out.contains("error: no test files in . (a test file is a .bl file with a test block)\n"), diag)
+}
