@@ -1,0 +1,85 @@
+// When `blink test` cannot start a test binary, or cannot wait for it to end, the file is
+// `aborted` (sections/06_tooling.md §8.10.5). Its file line carries `diagnostics`, a list of exactly
+// one E0856 TestBinaryDidNotRun diagnostic with severity error and no span, and none of `signal`,
+// `exit_code` and `limit`. The test lines that the binary wrote before the fault stay in the stream
+// and count in the file and run summaries. The file counts in files.aborted, so the run exits 1.
+//
+// BLINK_DEV_TEST_FAULT=<mode>:<file> forces a fault on one file: `start` spawns a program that does
+// not exist, `wait` lets the binary run to its end and then takes the wait as failed.
+
+import std.process.{ChildEnd, ChildLimits, ProcessResult}
+import std.time.{Duration}
+
+let TWO_TESTS = "test \"first\" \{\n    assert_eq(1, 1)\n}\n\ntest \"second\" \{\n    assert_eq(2, 2)\n}\n"
+
+fn sh(cmd: Str) -> ProcessResult {
+    process.run("sh", ["-c", cmd], limits: ChildLimits { timeout: Some(Duration.seconds(300)) }).unwrap()
+}
+
+// Runs `blink test <args> t/` in a fresh project where t/ holds two test files of two tests each,
+// with the fault forced on t/test_fault_victim.bl.
+fn blink_test(mode: Str, args: Str) -> ProcessResult {
+    let dir = sh("mktemp -d /tmp/blink_test_fault.XXXXXX").out.trim()
+    let _ = sh("mkdir -p {dir}/t")
+    write_file("{dir}/blink.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\n")
+    write_file("{dir}/blink.lock", "[metadata]\nlockfile-version = 1\n")
+    write_file("{dir}/t/test_fault_victim.bl", TWO_TESTS)
+    write_file("{dir}/t/test_fault_bystander.bl", TWO_TESTS)
+    let r = sh("B=$(pwd)/build/blink; cd {dir} && env -u BLINK_PER_MODULE BLINK_BIN=$B BLINK_DEV_TEST_FAULT={mode}:t/test_fault_victim.bl $B test {args} t/")
+    let _ = sh("rm -rf {dir}")
+    r
+}
+
+// The stdout line that starts with `head`, or "" when there is none.
+fn line_with(out: Str, head: Str) -> Str {
+    for line in out.split("\n") {
+        if line.starts_with(head) {
+            return line
+        }
+    }
+    ""
+}
+
+let VICTIM_HEAD = "\{\"record\":\"file\",\"file\":\"t/test_fault_victim.bl\","
+
+test "a binary that cannot start is aborted with one E0856 and no test line" {
+    let r = blink_test("start", "--json")
+    let diag = "stdout:\n{r.out}\nstderr:\n{r.err_out}"
+    assert_eq(r.end, ChildEnd.Exited(1), diag)
+    let line = line_with(r.out, VICTIM_HEAD)
+    assert(line.starts_with("{VICTIM_HEAD}\"outcome\":\"aborted\",\"diagnostics\":[\{\"severity\":\"error\",\"name\":\"TestBinaryDidNotRun\",\"code\":\"E0856\",\"message\":\"could not start the test binary: "), diag)
+    assert(line.contains("}],\"summary\":\{\"total\":0,\"passed\":0,"), diag)
+    for key in ["\"span\"", "\"signal\"", "\"exit_code\"", "\"limit\"", "\"running\""] {
+        assert(!line.contains(key), "{key} must be absent; {diag}")
+    }
+    assert(!r.out.contains("\"record\":\"test\",\"file\":\"t/test_fault_victim.bl\""), diag)
+    assert(r.out.contains("\"files\":\{\"total\":2,\"ran\":1,\"build_failed\":0,\"aborted\":1}"), diag)
+    assert(r.out.contains("\{\"record\":\"run\",\"summary\":\{\"total\":2,\"passed\":2,"), diag)
+}
+
+test "a binary that cannot be waited for is aborted with one E0856 and its test lines count" {
+    let r = blink_test("wait", "--json")
+    let diag = "stdout:\n{r.out}\nstderr:\n{r.err_out}"
+    assert_eq(r.end, ChildEnd.Exited(1), diag)
+    let line = line_with(r.out, VICTIM_HEAD)
+    assert(line.starts_with("{VICTIM_HEAD}\"outcome\":\"aborted\",\"diagnostics\":[\{\"severity\":\"error\",\"name\":\"TestBinaryDidNotRun\",\"code\":\"E0856\",\"message\":\"could not wait for the test binary: "), diag)
+    assert(line.contains("}],\"summary\":\{\"total\":2,\"passed\":2,"), diag)
+    for key in ["\"span\"", "\"signal\"", "\"exit_code\"", "\"limit\""] {
+        assert(!line.contains(key), "{key} must be absent; {diag}")
+    }
+    assert(r.out.contains("\{\"record\":\"test\",\"file\":\"t/test_fault_victim.bl\",\"name\":\"second\""), diag)
+    assert(r.out.contains("\"files\":\{\"total\":2,\"ran\":1,\"build_failed\":0,\"aborted\":1}"), diag)
+    assert(r.out.contains("\{\"record\":\"run\",\"summary\":\{\"total\":4,\"passed\":4,"), diag)
+}
+
+test "the human run prints ABORTED and the E0856 diagnostic" {
+    for mode in ["start", "wait"] {
+        let r = blink_test(mode, "--quiet")
+        let diag = "{mode}\nstdout:\n{r.out}\nstderr:\n{r.err_out}"
+        assert_eq(r.end, ChildEnd.Exited(1), diag)
+        let verb = if mode == "start" { "start" } else { "wait for" }
+        assert(r.out.contains("ABORTED t/test_fault_victim.bl\n  error[E0856]: could not {verb} the test binary: "), diag)
+        assert(!r.out.contains("BUILD FAILED"), diag)
+        assert(r.out.contains("; 1 file aborted\n"), diag)
+    }
+}

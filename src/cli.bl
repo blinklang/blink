@@ -14,7 +14,8 @@ import std.json.{
 }
 import std.path.{path_join, path_dirname, path_basename}
 import std.fs.{FileKind}
-import std.process.{ChildEnd, ChildLimits, LimitKind}
+import std.errno.{Errno}
+import std.process.{ChildEnd, ChildLimits, LimitKind, ProcessError, ProcessOp}
 import std.time.{Duration}
 import pkg.audit.{audit_load_baseline, audit_check, audit_report}
 import pkg.lockfile.{lockfile_load}
@@ -4618,8 +4619,11 @@ type TestFileResult {
     // The diagnostics of a file that did not build, each as the run prints it: a JSON object
     // with --json, else text. Empty when the binary ran.
     diagnostics: List[Str]
-    // How the binary ended; None when it did not run.
+    // How the binary ended; None when it did not run or the runner could not wait for it.
     end: ChildEnd?
+    // The one diagnostic of a runner fault, as the run prints it: the runner could not start the
+    // binary or wait for it (§8.10.5). It makes the file aborted, apart from build diagnostics.
+    fault: Str?
     // The wall time of the binary.
     duration_ms: Int
     out: Str
@@ -4811,6 +4815,22 @@ fn test_runner_diag(json: Bool, severity: Str, name: Str, code: Str, message: St
     text
 }
 
+// The diagnostic of a runner fault, as the run prints it under ABORTED: the code in brackets,
+// and for an ice a note that the fault is a bug in blink test (§8.10.5).
+fn test_runner_fault(json: Bool, severity: Str, name: Str, code: Str, message: Str, notes: List[Str]) -> Str {
+    if json {
+        return test_runner_diag(json, severity, name, code, message, notes)
+    }
+    let mut text = "{severity}[{code}]: {message}\n"
+    for note in notes {
+        text = "{text}note: {note}\n"
+    }
+    if severity == "ice" {
+        text = "{text}note: this is a bug in blink test; please report it\n"
+    }
+    text
+}
+
 // The diagnostics of a test build that failed, from what its worker printed. With json the
 // worker prints each diagnostic as a JSON line. A build fails on an error, so a worker that
 // printed no error or ice diagnostic ended in a way no step reported: it gets one that holds
@@ -4874,16 +4894,26 @@ fn test_indent(text: Str) -> Str {
 }
 
 // The outcome of one test file (§8.10.5): its name, its file line and its human block.
-fn test_file_outcome(file: Str, r: TestFileResult, t: TestReportTally, limits: ChildLimits, verbose: Bool) -> (Str, Str, Str) {
+fn test_file_outcome(file: Str, r: TestFileResult, t: TestReportTally, limits: ChildLimits, verbose: Bool, json: Bool) -> (Str, Str, Str) {
     let head = "\{\"record\":\"file\",\"file\":\"{json_escape(file)}\","
-    if r.diagnostics.len() > 0 || r.end.is_none() {
+    if r.diagnostics.len() > 0 {
         let mut block = "BUILD FAILED {file}\n"
         for d in r.diagnostics {
             block = block.concat(test_indent(d))
         }
         return ("build_failed", "{head}\"outcome\":\"build_failed\",\"summary\":{test_summary_json(test_tally_new(), 0)},\"diagnostics\":[{r.diagnostics.join(",")}]}", block)
     }
+    let running = match t.running {
+        Some(name) => "\"running\":\"{json_escape(name)}\","
+        None => ""
+    }
     let output = test_output_text(r.out, r.err_out)
+    if r.end.is_none() {
+        // A runner fault: the one diagnostic is the cause key, and the test lines that the
+        // binary wrote before it count.
+        let fault = r.fault ?? test_result_lost_diag(json)
+        return ("aborted", "{head}\"outcome\":\"aborted\",{running}\"diagnostics\":[{fault}],\"summary\":{test_summary_json(t, r.duration_ms)}}", "ABORTED {file}\n{test_indent(fault)}")
+    }
     let mut how_key = ""
     let mut how = ""
     let mut help = ""
@@ -4918,10 +4948,6 @@ fn test_file_outcome(file: Str, r: TestFileResult, t: TestReportTally, limits: C
             block = "--- {file} ---\n{output}"
         }
         return ("ran", "{head}\"outcome\":\"ran\",\"summary\":{summary}}", block)
-    }
-    let running = match t.running {
-        Some(name) => "\"running\":\"{json_escape(name)}\","
-        None => ""
     }
     let mut block = ""
     if output != "" {
@@ -5092,7 +5118,7 @@ fn test_limit_value(limits: ChildLimits, kind: LimitKind) -> Int {
 // The diagnostic of a test binary that could not start, or could not be waited for. The host's
 // state causes it, not a compiler bug, so it is an error, not an ice. verb is start or wait.
 fn test_binary_did_not_run(json: Bool, verb: Str, detail: Str) -> Str {
-    test_runner_diag(json, "error", "TestBinaryDidNotRun", TEST_BINARY_DID_NOT_RUN, "could not {verb} the test binary: {detail}", [])
+    test_runner_fault(json, "error", "TestBinaryDidNotRun", TEST_BINARY_DID_NOT_RUN, "could not {verb} the test binary: {detail}", [])
 }
 
 // Whether a report holds the end line: a binary that exits 0 before it is an abort (§8.10.5).
@@ -5302,9 +5328,14 @@ fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
     // problem.
     process_install_signal_forwarding()
 
-    // Dev knob: BLINK_DEV_TEST_DROP_RESULT=<test file> ends that file's task without its
-    // result, so a test can check how the runner reports a result it never got.
-    let drop_result = env.var("BLINK_DEV_TEST_DROP_RESULT") ?? ""
+    // Dev knob: BLINK_DEV_TEST_FAULT=<mode>:<test file> forces a runner fault on that file, so a
+    // test can check how the runner reports it without racing the host. start spawns a program
+    // that does not exist; wait runs the binary, then takes its wait as failed; lost runs the
+    // binary, then ends the task without its result.
+    let fault_knob = env.var("BLINK_DEV_TEST_FAULT") ?? ""
+    let fault_colon = fault_knob.byte_index_of(":", 0) ?? -1
+    let fault_mode = if fault_colon < 0 { "" } else { fault_knob.byte_slice(0, fault_colon) }
+    let fault_file = if fault_colon < 0 { "" } else { fault_knob.byte_slice(fault_colon + 1, fault_knob.byte_len()) }
 
     let mut tallies: List[TestReportTally] = []
     let mut results_by: List[TestFileResult?] = []
@@ -5339,14 +5370,9 @@ fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
             let bin_path = output_bins.get(si).unwrap()
             let report = "{run_dir}/{si}.report"
             let done_mark = "{run_dir}/{si}.done"
-            let drop_this = test_files.get(si).unwrap() == drop_result
+            let forced = if test_files.get(si).unwrap() == fault_file { fault_mode } else { "" }
             async.spawn(fn() {
                 sem.recv()
-                if drop_this {
-                    sem.send(1)
-                    write_test_mark("{run_dir}/{idx}.lost")
-                    return 0
-                }
                 let built = match process.spawn("/usr/bin/env", bcmd) {
                     Ok(child) => process.wait(child)
                     Err(e) => Err(e)
@@ -5371,7 +5397,7 @@ fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
                     }
                 }
                 if build_diags.len() > 0 {
-                    results.send(TestFileResult { idx: idx, diagnostics: build_diags, end: None, duration_ms: 0, out: "", err_out: "" })
+                    results.send(TestFileResult { idx: idx, diagnostics: build_diags, end: None, fault: None, duration_ms: 0, out: "", err_out: "" })
                     if dots {
                         test_progress_mark(dot_ch, "{esc}[31mE{esc}[0m")
                     }
@@ -5387,23 +5413,33 @@ fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
                 let mut targv = ["-c", "BLINK_TEST_SCRATCH_DIR=\"$1\"; export BLINK_TEST_SCRATCH_DIR; shift; exec \"$0\" \"$@\" < /dev/null", bin_path, scratch]
                 for arg in rcmd { targv.push(arg) }
                 let t0 = time.read().to_unix_ms()
-                let mut result = TestFileResult { idx: idx, diagnostics: [], end: None, duration_ms: 0, out: "", err_out: "" }
-                match process.spawn("/bin/sh", targv, limits: limits) {
+                let mut result = TestFileResult { idx: idx, diagnostics: [], end: None, fault: None, duration_ms: 0, out: "", err_out: "" }
+                let program = if forced == "start" { "{run_dir}/{idx}.no-such-program" } else { "/bin/sh" }
+                match process.spawn(program, targv, limits: limits) {
                     Ok(child) => {
-                        match process.wait(child) {
+                        let waited = match process.wait(child) {
+                            Ok(rr) => if forced == "wait" { Err(ProcessError { op: ProcessOp.Wait, cmd: program, code: Errno(10) }) } else { Ok(rr) }
+                            Err(e) => Err(e)
+                        }
+                        match waited {
                             Ok(rr) => {
                                 result = TestFileResult { end: Some(rr.end), duration_ms: time.read().to_unix_ms() - t0, out: rr.out, err_out: rr.err_out, ..result }
                             }
                             Err(e) => {
-                                result = TestFileResult { diagnostics: [test_binary_did_not_run(json, "wait for", "{e}")], ..result }
+                                result = TestFileResult { fault: Some(test_binary_did_not_run(json, "wait for", "{e}")), duration_ms: time.read().to_unix_ms() - t0, ..result }
                             }
                         }
                     }
                     Err(e) => {
-                        result = TestFileResult { diagnostics: [test_binary_did_not_run(json, "start", "{e}")], ..result }
+                        result = TestFileResult { fault: Some(test_binary_did_not_run(json, "start", "{e}")), duration_ms: time.read().to_unix_ms() - t0, ..result }
                     }
                 }
                 remove_test_scratch(scratch)
+                if forced == "lost" {
+                    sem.send(1)
+                    write_test_mark("{run_dir}/{idx}.lost")
+                    return 0
+                }
                 let ok = match result.end {
                     Some(ChildEnd.Exited(0)) => test_report_ended(report)
                     _ => false
@@ -5468,7 +5504,7 @@ fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
                     }
                     r = results_by.get(n).unwrap() ?? lost
                 }
-                let (outcome, line, block) = test_file_outcome(file, r, tallies.get(n).unwrap(), limits, verbose)
+                let (outcome, line, block) = test_file_outcome(file, r, tallies.get(n).unwrap(), limits, verbose, json)
                 if json {
                     // What the binary printed goes to stderr, so stdout holds only the stream.
                     io.eprint_raw(r.out)
@@ -5529,8 +5565,11 @@ fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
 
 // The result of a file whose task ended with no result: a bug of blink test, so an ice.
 fn test_file_lost(idx: Int, json: Bool) -> TestFileResult {
-    let d = test_runner_diag(json, "ice", "TestResultLost", TEST_RESULT_LOST, "blink test lost the file's result", [])
-    TestFileResult { idx: idx, diagnostics: [d], end: None, duration_ms: 0, out: "", err_out: "" }
+    TestFileResult { idx: idx, diagnostics: [], end: None, fault: Some(test_result_lost_diag(json)), duration_ms: 0, out: "", err_out: "" }
+}
+
+fn test_result_lost_diag(json: Bool) -> Str {
+    test_runner_fault(json, "ice", "TestResultLost", TEST_RESULT_LOST, "blink test lost the result of this file", [])
 }
 
 fn cmd_check(p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, IO, FS.Read, Env.Read, FS.Write, Process.Spawn, FS.Delete, Net.Connect, Env.Exit {
