@@ -1,0 +1,101 @@
+// [test] in blink.toml is a closed table with the one key `timeout` (sections/06_tooling.md
+// §8.10.7). Any other key is the warning UnknownManifestKey (W1002) on the key, and the runner
+// reads the table without it. A `memory` or `processes` key gets a help line that names the
+// flag; another key gets the closest key of the table. --strict and [lints] can make it an
+// error. The fixture lives under a fresh temporary directory, since the test tree itself sits
+// inside a project.
+
+import std.process.{ChildEnd, ChildLimits, ProcessResult}
+import std.time.{Duration}
+import std.json.{json_clear, json_parse, json_get, json_as_str, json_as_int}
+
+let PACKAGE = "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n"
+
+// A runner bug that hangs fails this test instead of the gate.
+fn sh(cmd: Str) -> ProcessResult {
+    process.run("sh", ["-c", cmd], limits: ChildLimits { timeout: Some(Duration.seconds(120)) }).unwrap()
+}
+
+fn count(text: Str, part: Str) -> Int {
+    text.split(part).len() - 1
+}
+
+// Runs `blink <command>` in a fresh project with this blink.toml and one passing test file.
+fn blink(toml: Str, command: Str) -> ProcessResult {
+    let dir = sh("mktemp -d /tmp/blink_test_key_w1002.XXXXXX").out.trim()
+    let _ = sh("mkdir -p {dir}/src {dir}/tests")
+    write_file("{dir}/blink.toml", toml)
+    // A lock no older than blink.toml keeps dependency resolution out of the command.
+    write_file("{dir}/blink.lock", "[metadata]\nlockfile-version = 1\n")
+    write_file("{dir}/src/main.bl", "fn main() \{\n    io.println(\"hi\")\n}\n")
+    write_file("{dir}/tests/test_x.bl", "test \"x\" \{\n    assert(1 == 1)\n}\n")
+    // BLINK_BIN makes the build workers the compiler under test, not the blink on PATH.
+    let r = sh("B=$(pwd)/build/blink; cd {dir} && env -u BLINK_PER_MODULE BLINK_BIN=$B $B {command}")
+    let _ = sh("rm -rf {dir}")
+    r
+}
+
+test "a memory key is W1002 on the key with the flag as help" {
+    let r = blink("{PACKAGE}[test]\nmemory = \"2G\"\n", "check src/main.bl")
+    assert_eq(r.end, ChildEnd.Exited(0), r.err_out)
+    assert(r.err_out.contains("warning[UnknownManifestKey]: `[test]` has no key `memory`\n  --> blink.toml:6:1\n"), r.err_out)
+    assert(r.err_out.contains("6 | memory = \"2G\"\n  | ^^^^^^\n"), r.err_out)
+    assert(r.err_out.contains("  help: memory is a flag only; use --memory <size>\n"), r.err_out)
+}
+
+test "a processes key is W1002 with the flag as help" {
+    let r = blink("{PACKAGE}[test]\nprocesses = \"64\"\n", "check src/main.bl")
+    assert_eq(r.end, ChildEnd.Exited(0), r.err_out)
+    assert(r.err_out.contains("warning[UnknownManifestKey]: `[test]` has no key `processes`\n"), r.err_out)
+    assert(r.err_out.contains("  help: processes is a flag only; use --processes <count>\n"), r.err_out)
+}
+
+test "a misspelled key is W1002 with the closest key as help" {
+    let r = blink("{PACKAGE}[test]\ntimeuot = \"30m\"\n", "check src/main.bl")
+    assert_eq(r.end, ChildEnd.Exited(0), r.err_out)
+    assert(r.err_out.contains("warning[UnknownManifestKey]: `[test]` has no key `timeuot`\n"), r.err_out)
+    assert(r.err_out.contains("  help: did you mean `timeout`?\n"), r.err_out)
+}
+
+test "check --json gives one W1002 row with the key span" {
+    let r = blink("{PACKAGE}[test]\nmemory = \"2G\"\n", "check --json src/main.bl")
+    assert_eq(r.end, ChildEnd.Exited(0), r.err_out)
+    let lines = r.err_out.trim().split("\n")
+    assert_eq(lines.len(), 1, r.err_out)
+    json_clear()
+    let row = json_parse(lines.get(0).unwrap())
+    assert_eq(json_as_str(json_get(row, "code")), "W1002")
+    assert_eq(json_as_str(json_get(row, "name")), "UnknownManifestKey")
+    assert_eq(json_as_str(json_get(row, "severity")), "warning")
+    let span = json_get(row, "span")
+    assert_eq(json_as_int(json_get(span, "line")), 6)
+    assert_eq(json_as_int(json_get(span, "col")), 1)
+    assert_eq(json_as_int(json_get(span, "end_col")), 7)
+    assert_eq(json_as_str(json_get(row, "help")), "memory is a flag only; use --memory <size>")
+}
+
+test "a [lints] entry makes W1002 an error" {
+    let r = blink("{PACKAGE}[test]\nmemory = \"2G\"\n\n[lints]\nW1002 = \"error\"\n", "check src/main.bl")
+    assert_eq(r.end, ChildEnd.Exited(1), r.err_out)
+    assert(r.err_out.contains("error[UnknownManifestKey]: `[test]` has no key `memory`\n"), r.err_out)
+}
+
+test "--strict fails a check on W1002" {
+    let r = blink("{PACKAGE}[test]\nmemory = \"2G\"\n", "check --strict src/main.bl")
+    assert_eq(r.end, ChildEnd.Exited(1), r.err_out)
+    assert(r.err_out.contains("warning[UnknownManifestKey]: `[test]` has no key `memory`\n"), r.err_out)
+    assert("{r.out}{r.err_out}".contains("warnings treated as errors in --strict mode"), "stdout:\n{r.out}\nstderr:\n{r.err_out}")
+}
+
+test "blink test warns once for a memory key and runs with no memory limit" {
+    // A memory limit in force would need a host check, which a plain session fails.
+    let r = blink("{PACKAGE}[test]\nmemory = \"2G\"\n", "test tests")
+    assert_eq(r.end, ChildEnd.Exited(0), "stdout:\n{r.out}\nstderr:\n{r.err_out}")
+    assert_eq(count(r.err_out, "warning[UnknownManifestKey]: `[test]` has no key `memory`"), 1, r.err_out)
+}
+
+test "blink test reads the table without an unknown key" {
+    let r = blink("{PACKAGE}[test]\ntimeuot = \"1ms\"\n", "test tests")
+    assert_eq(r.end, ChildEnd.Exited(0), "stdout:\n{r.out}\nstderr:\n{r.err_out}")
+    assert_eq(count(r.err_out, "warning[UnknownManifestKey]: `[test]` has no key `timeuot`"), 1, r.err_out)
+}
