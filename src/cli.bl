@@ -13,6 +13,7 @@ import std.json.{
     json_new_array, json_push,
 }
 import std.path.{path_join, path_dirname, path_basename}
+import std.process.{ChildEnd}
 import pkg.audit.{audit_load_baseline, audit_check, audit_report}
 import pkg.lockfile.{lockfile_load}
 import pkg.manifest.{
@@ -294,11 +295,10 @@ fn detect_ffi_libs(c_source: Str) -> List[Str] {
 }
 
 fn try_pkg_config(lib: Str) -> Option[Str] {
-    let result = process_run("pkg-config", ["--libs", lib])
-    if result.exit_code == 0 {
-        return Some(result.out.trim())
+    match process.run("pkg-config", ["--libs", lib]) {
+        Ok(result) => if result.success() { Some(result.out.trim()) } else { None }
+        Err(_) => None
     }
-    return None
 }
 
 fn resolve_ffi_link_flags(lib: Str, target: Str) -> Str {
@@ -759,8 +759,10 @@ fn resolve_target_triple(alias: Str) -> Str {
         return "x86_64-macos"
     }
     if alias == "macos" {
-        let result = process_run("uname", ["-m"])
-        let arch = result.out.trim()
+        let arch = match process.run("uname", ["-m"]) {
+            Ok(result) => result.out.trim()
+            Err(_) => ""
+        }
         return "{arch}-macos"
     }
     return alias
@@ -918,7 +920,10 @@ fn cc_takes_macro_prefix_map(target: Str) -> Bool ! IO, FS.Read {
     let id = process_cc_id(target)
     if !cached_macro_prefix_map.starts_with("{id}\n") {
         let cmd = cc_command("-fmacro-prefix-map=/blink-probe/=probe/ -E -x c /dev/null -o /dev/null", 0, 0, target)
-        let ok = process_run("sh", ["-c", "{cmd} 2>/dev/null"]).exit_code == 0
+        let ok = match process.run("sh", ["-c", "{cmd} 2>/dev/null"]) {
+            Ok(r) => r.success()
+            Err(_) => false
+        }
         cached_macro_prefix_map = "{id}\n{if ok { 1 } else { 0 }}"
     }
     cached_macro_prefix_map.ends_with("\n1")
@@ -1148,12 +1153,16 @@ fn process_cc_id(target: Str) -> Str ! IO {
         if target == "" {
             // The first line `cc --version 2>&1 | head -1` gave, which every cached key holds:
             // the version goes to stdout, and only a cc that fails to give one writes stderr.
-            let r = process_run("cc", ["--version"])
-            let text = if r.out != "" { r.out } else { r.err_out }
+            let text = match process.run("cc", ["--version"]) {
+                Ok(r) => if r.out != "" { r.out } else { r.err_out }
+                Err(_) => ""
+            }
             cached_cc_id = text.split("\n").get(0).unwrap().trim()
         } else {
-            let r = process_run("sh", ["-c", "zig version && zig cc -target {target} --version 2>&1 | head -1"])
-            cached_cc_id = if r.exit_code == 0 { r.out.trim().replace("\n", " ") } else { "" }
+            cached_cc_id = match process.run("sh", ["-c", "zig version && zig cc -target {target} --version 2>&1 | head -1"]) {
+                Ok(r) => if r.success() { r.out.trim().replace("\n", " ") } else { "" }
+                Err(_) => ""
+            }
         }
         cached_cc_id_for = "{target}\n"
     }
@@ -1382,12 +1391,20 @@ fn ensure_target_archive(arc_dir: Str, target: Str) -> Str ! IO, FS.Write, FS.Re
         io.eprintln("error: zig cc failed building the stdlib archive for {target} (rc={rc})")
         return ""
     }
-    let ar = process_run("zig", ["ar", "rcs", "{stage}/libblink_std.a", "{stage}/monolith.o"])
-    if ar.exit_code != 0 {
-        let _ = build_fs.remove_tree(stage)
-        io.eprint(ar.err_out)
-        io.eprintln("error: zig ar failed building the stdlib archive for {target} (rc={ar.exit_code})")
-        return ""
+    match process.run("zig", ["ar", "rcs", "{stage}/libblink_std.a", "{stage}/monolith.o"]) {
+        Ok(ar) => {
+            if !ar.success() {
+                let _ = build_fs.remove_tree(stage)
+                io.eprint(ar.err_out)
+                io.eprintln("error: zig ar failed building the stdlib archive for {target} ({ar.end})")
+                return ""
+            }
+        }
+        Err(e) => {
+            let _ = build_fs.remove_tree(stage)
+            io.eprintln("error: zig ar failed building the stdlib archive for {target}: {e}")
+            return ""
+        }
     }
     fs_remove("{stage}/monolith.o")
     // A concurrent build that published first wins; its archive is as good.
@@ -1628,10 +1645,20 @@ fn check_foreign_consts(foreign: List[ForeignConst], targets: List[Str], used_de
             if flag.starts_with("-I") { inc_flags.push("-isystem {flag.byte_slice(2, flag.byte_len())}") } else { inc_flags.push(flag) }
         }
         let cmd = cc_command("-pedantic-errors -c {dir}/fc_probe.c -o {dir}/fc_probe.o {inc_flags.join(" ")}", 0, 0, target)
-        let r = process_run("sh", ["-c", cmd])
-        // 127: the shell found no C compiler, which the program's compile reports.
-        if r.exit_code == 0 || r.exit_code == 127 { continue }
-        let triple = if target != "" { target } else { triple_of_machine(process_run("cc", ["-dumpmachine"]).out) }
+        // No shell, or 127: the shell found no C compiler. The program's compile reports both.
+        let r = match process.run("sh", ["-c", cmd]) {
+            Ok(r) => r
+            Err(_) => { continue }
+        }
+        match r.end {
+            ChildEnd.Exited(0) | ChildEnd.Exited(127) => { continue }
+            _ => {}
+        }
+        let machine = match process.run("cc", ["-dumpmachine"]) {
+            Ok(m) => m.out
+            Err(_) => ""
+        }
+        let triple = if target != "" { target } else { triple_of_machine(machine) }
         errors = errors + report_verdicts(good, probe_verdicts(good, probe, r.err_out, "fc_probe.c"), triple)
     }
     let _ = build_fs.remove_tree(dir)
@@ -4383,7 +4410,9 @@ fn run_built(a: Args, output_path: Str) {
         // program's first byte: io.write flushes.
         io.write("")
     }
-    process_exec(output_path, rest)
+    let e = process.exec(output_path, rest).unwrap_err()
+    io.eprintln("{e}")
+    env.exit(127)
 }
 
 // What one test file's task hands back. A spawned task may not capture a `let mut`
@@ -4391,7 +4420,7 @@ fn run_built(a: Args, output_path: Str) {
 type TestFileResult {
     idx: Int
     built: Bool
-    exit_code: Int
+    passed: Bool
     out: Str
     err_out: Str
 }
@@ -4412,7 +4441,7 @@ fn report_manifest_diagnostics(manifest: Str) ! Diag.Report {
 
 // A test binary's scratch files live in the directory the runner names in
 // BLINK_TEST_SCRATCH_DIR (compile_test_helpers.scratch_root makes it). The runner
-// cannot learn the binary's process id, since process_spawn returns a handle, so it picks the
+// cannot learn the binary's process id, since process.spawn returns a handle, so it picks the
 // name itself: its own process id keeps two runners apart, the file index keeps two binaries
 // of one run apart. No other code removes the directory, so the runner does once the binary
 // has ended. A dir left by a killed runner with the same pid is removed before use.
@@ -4422,9 +4451,10 @@ fn test_scratch_dir(idx: Int) -> Str {
     "{base}/blink-test-{getpid()}-{idx}"
 }
 
-fn remove_test_scratch(dir: Str) {
+// A dir that cannot go is reported, not fatal: the test result stands without it.
+fn remove_test_scratch(dir: Str) ! IO, FS.Delete {
     if file_exists(dir) == 1 {
-        let _ = process_run("rm", ["-rf", dir])
+        let _ = build_fs.remove_tree_or_report(dir)
     }
 }
 
@@ -4618,13 +4648,13 @@ fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
     }
 
     let mut states: List[Int] = []
-    let mut exit_codes: List[Int] = []
+    let mut passes: List[Bool] = []
     let mut outputs: List[Str] = []
     let mut errors: List[Str] = []
     let mut pi = 0
     while pi < file_count {
         states.push(TEST_FILE_PENDING)
-        exit_codes.push(0)
+        passes.push(false)
         outputs.push("")
         errors.push("")
         pi = pi + 1
@@ -4666,11 +4696,16 @@ fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
                     sem.send(1)
                     return 0
                 }
-                let bpid = process_spawn("/usr/bin/env", bcmd)
-                let br = process_pid_wait(bpid)
-                if br.exit_code != 0 || !file_exists(bin_path) {
-                    let mut err_text = br.out
-                    let build_err = br.err_out
+                let built = match process.spawn("/usr/bin/env", bcmd) {
+                    Ok(child) => process.wait(child)
+                    Err(e) => Err(e)
+                }
+                let (build_ok, build_out, build_err) = match built {
+                    Ok(r) => (r.success(), r.out, r.err_out)
+                    Err(e) => (false, "", "{e}")
+                }
+                if !build_ok || !file_exists(bin_path) {
+                    let mut err_text = build_out
                     if build_err != "" {
                         if err_text != "" {
                             err_text = "{err_text}\n{build_err}"
@@ -4678,7 +4713,7 @@ fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
                             err_text = build_err
                         }
                     }
-                    results.send(TestFileResult { idx: idx, built: false, exit_code: br.exit_code, out: "", err_out: err_text })
+                    results.send(TestFileResult { idx: idx, built: false, passed: false, out: "", err_out: err_text })
                     if dots != 0 {
                         // One recv through a loop that stops after it: that spelling reads the
                         // same whether the pinned compiler types recv as the element or as an
@@ -4704,13 +4739,20 @@ fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
                 remove_test_scratch(scratch)
                 let mut targv = ["-c", "BLINK_TEST_SCRATCH_DIR=\"$1\"; export BLINK_TEST_SCRATCH_DIR; shift; exec \"$0\" \"$@\" < /dev/null", bin_path, scratch]
                 for arg in rcmd { targv.push(arg) }
-                let rpid = process_spawn("/bin/sh", targv)
-                let rr = process_pid_wait(rpid)
+                let ran = match process.spawn("/bin/sh", targv) {
+                    Ok(child) => process.wait(child)
+                    Err(e) => Err(e)
+                }
                 remove_test_scratch(scratch)
-                results.send(TestFileResult { idx: idx, built: true, exit_code: rr.exit_code, out: rr.out, err_out: rr.err_out })
+                // A binary that could not start or be waited for failed, and the error says why.
+                let (run_ok, run_out, run_err) = match ran {
+                    Ok(rr) => (rr.success(), rr.out, rr.err_out)
+                    Err(e) => (false, "", "{e}")
+                }
+                results.send(TestFileResult { idx: idx, built: true, passed: run_ok, out: run_out, err_out: run_err })
                 if dots != 0 {
                     for col in dot_ch {
-                        if rr.exit_code != 0 {
+                        if !run_ok {
                             io.eprint_raw("{esc}[31mF{esc}[0m")
                         } else {
                             io.eprint_raw("{esc}[32m.{esc}[0m")
@@ -4735,7 +4777,7 @@ fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
     results.close()
     for r in results {
         states.set(r.idx, if r.built { TEST_FILE_RAN } else { TEST_FILE_BUILD_FAILED })
-        exit_codes.set(r.idx, r.exit_code)
+        passes.set(r.idx, r.passed)
         outputs.set(r.idx, r.out)
         errors.set(r.idx, r.err_out)
     }
@@ -4758,7 +4800,7 @@ fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
     while ri < file_count {
         let tf = test_files.get(ri).unwrap()
         let state = states.get(ri).unwrap()
-        let ec = exit_codes.get(ri).unwrap()
+        let passed = passes.get(ri).unwrap()
         if state == TEST_FILE_PENDING {
             total_lost = total_lost + 1
             if json_output != 0 {
@@ -4792,7 +4834,7 @@ fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
         } else {
             if json_output == 0 {
                 let out = outputs.get(ri).unwrap()
-                if verbose != 0 || ec != 0 {
+                if verbose != 0 || !passed {
                     io.println("--- {tf} ---")
                     if out != "" {
                         io.println(out)
@@ -4822,7 +4864,7 @@ fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
                 let out = outputs.get(ri).unwrap().trim()
                 io.println("\{\"file\":\"{json_escape(tf)}\",\"results\":{out}}")
             }
-            if ec != 0 {
+            if !passed {
                 total_failed = total_failed + 1
             } else {
                 total_passed = total_passed + 1
@@ -5696,9 +5738,17 @@ fn migrate_blink_marketplace() ! FS.Write, IO, FS.Delete {
         }
     }
 
-    let pwd = process_run("pwd", []).out.trim()
+    let pwd = working_dir()
     setup_marketplace(pwd)
     io.println("  migrated: .claude/pact-marketplace → .claude/blink-marketplace")
+}
+
+// What `pwd` prints, or "" when it cannot run.
+fn working_dir() -> Str {
+    match process.run("pwd", []) {
+        Ok(r) => r.out.trim()
+        Err(_) => ""
+    }
 }
 
 fn json_ensure_object(parent: Int, key: Str) -> Int {
@@ -5716,8 +5766,7 @@ fn cmd_init(_p: ArgParser, a: Args) ! Env.Exit, FS.Write, IO, Process.Spawn, FS.
     let project_name = if source_path != "" {
         source_path
     } else {
-        let pwd_result = process_run("pwd", [])
-        path_basename(pwd_result.out.trim())
+        path_basename(working_dir())
     }
 
     let already_initialized = if resolve_manifest_path() != "" { 1 } else { 0 }
@@ -5736,8 +5785,12 @@ fn cmd_init(_p: ArgParser, a: Args) ! Env.Exit, FS.Write, IO, Process.Spawn, FS.
             io.println("  created src/main.bl")
         }
 
-        let git_check = process_run("git", ["rev-parse", "--git-dir"])
-        if git_check.exit_code != 0 {
+        // No git at all reads as no repository, so git init runs and says it failed.
+        let in_repo = match process.run("git", ["rev-parse", "--git-dir"]) {
+            Ok(r) => r.success()
+            Err(_) => false
+        }
+        if !in_repo {
             if build_fs.run_program("git", ["init"]) == 0 {
                 io.println("  initialized git repository")
             } else {
@@ -5787,7 +5840,7 @@ fn cmd_init(_p: ArgParser, a: Args) ! Env.Exit, FS.Write, IO, Process.Spawn, FS.
 
     // Set up Claude Code plugin (LSP + skills)
     migrate_blink_marketplace()
-    let pwd = process_run("pwd", []).out.trim()
+    let pwd = working_dir()
     setup_marketplace(pwd)
     io.println("  configured Claude Code plugin (LSP + skills)")
     io.println("\n  To activate the Blink plugin in Claude Code:")
