@@ -1531,6 +1531,17 @@ build/blink check src/main.bl --format json
 # its message). summary has total, passed, failed, panicked, skipped, duration_ms.
 build/blink test --json
 
+# blink test runs each test binary with limits (§8.10.7). A flag beats [test] in blink.toml,
+# which beats the default. Only the timeout is on by default (10m); none turns a limit off.
+# Every value needs a unit (ms s m h; K M G); 0 is not a limit. A bad value, or a memory or
+# process limit with no delegated cgroup v2, is a usage error: exit 2 before any build.
+# A binary past a limit prints ABORTED, the limit and a help: line, and the run exits 1.
+# The build steps run with no limit.
+build/blink test --timeout 30m --memory 2G --processes 1024
+#   blink.toml:  [test]
+#                timeout = "30m"
+# [test] takes timeout only. Any other key (memory = "2G" too) is W1002 and sets no limit.
+
 # Default builds (no mode flag) compile the C at -O1
 build/blink build src/main.bl
 

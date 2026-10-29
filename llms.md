@@ -42,6 +42,7 @@ Key facts:
 - `Float` and `F32` have built-in math methods (`x.sqrt()`, `x.ln()`, `y.atan2(x)`) and constants (`Float.PI`, `Float.INF`); there is no `math.sqrt(x)` and no `.log()`
 - `@trusted(audit: "ID")` needs an audit id. `@ffi.opaque(header, name)` declares a C handle type
 - `blink build`, `run` and `test` compile one C unit per module. `--no-per-module` or `BLINK_PER_MODULE=0` builds one C unit, to bisect a per-module bug
+- `blink test` ends each test binary after a 10m timeout. `--timeout`, `--memory` and `--processes` set the limits (`30m`, `2G`, `1024`; `none` turns one off); `[test] timeout = "30m"` in blink.toml sets the timeout. A bad value exits 2 before any build
 
 ## Standard Library
 
