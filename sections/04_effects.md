@@ -1690,7 +1690,7 @@ pub opaque type Child
 pub fn Child.mock(id: Int) -> Child
 ```
 
-`process.run` and `process.wait` return `Ok` when the child ran to the end, whatever its exit code, and when a limit ended it (*Child limits*). `Err` means that the operation itself failed: the program was not found or could not start, a limit could not be applied, the wait failed, or the signal could not be sent. `ProcessError` has the shape of `FsError` (§4.4.5): the operation, the command, and the `Errno`. Its `Display` follows the same convention, `op cmd: message`, for example `run gti: No such file or directory`.
+`process.run` and `process.wait` return `Ok` when the child ran to the end, whatever its exit code, and when a limit ended it (*Child limits*). `Err` means that the operation itself failed: the program was not found or could not start, a limit could not be applied, the wait failed, or the signal could not be sent. One `Err` is not a start failure: `EPERM` from `run` or `wait` on a limited child means that the runtime could not enforce the limit, and the child may still be alive (*The runtime cannot signal the child*). `ProcessError` has the shape of `FsError` (§4.4.5): the operation, the command, and the `Errno`. Its `Display` follows the same convention, `op cmd: message`, for example `run gti: No such file or directory`.
 
 **How the child ended.** `ProcessResult` has no exit-code field. It has `end`, and `end` holds exactly one of three facts:
 
@@ -1808,13 +1808,25 @@ fn configure(src: Str) -> Result[ProcessResult, ProcessError] ! Process.Spawn {
 
 **Child limits.** `limits: ChildLimits` is one keyword on `process.run` and `process.spawn`. The default, `ChildLimits {}`, sets no limit, and the child starts as it did before limits existed. `process.wait` takes no limits and has no timeout: a child's limits are fixed when it starts. `process.exec` takes no limits, because `exec` replaces this program and nobody is left to enforce them. The effect row does not change: a call with limits is `Process.Spawn`, and a deadline adds no `Time` effect, because the runtime keeps the clock and the program does not sleep.
 
+A child is *limited* exactly when `timeout`, `memory` or `processes` is `Some`. A `ChildLimits` that sets only `grace` limits nothing: it behaves exactly like `ChildLimits {}`, with no process group of its own and no watcher (*A deadline holds whether or not anyone waits*). `grace` is not an error without a limit, because code that builds a `ChildLimits` field by field can leave `timeout` as `None` on one path.
+
+```blink
+// not limited: both calls start the child the same way
+process.run("make", [], limits: ChildLimits { grace: Duration.seconds(10) })?
+process.run("make", [], limits: ChildLimits {})?
+```
+
 ```blink
 pub type ChildLimits {
-    /// Wall-clock time from the start of the child. At the deadline the runtime sends SIGTERM,
-    /// and after `grace` it sends SIGKILL. `None`: no deadline.
+    /// Time from the start of the child, on a monotonic clock: time that the system spends
+    /// suspended does not count. At the deadline the runtime sends SIGTERM, and after `grace`
+    /// it sends SIGKILL. `None`: no deadline.
     timeout: Duration? = None
 
-    /// The time between SIGTERM and SIGKILL. `Duration.seconds(0)` sends SIGKILL at once, with no SIGTERM.
+    /// The time between SIGTERM and SIGKILL, for an end that the runtime starts: the deadline,
+    /// the leftovers of a child whose leader has exited, and program exit. `memory` and
+    /// `processes` end the tree at once. `Duration.seconds(0)` sends SIGKILL at once, with no
+    /// SIGTERM. It has no effect when none of `timeout`, `memory` and `processes` is set.
     grace: Duration = Duration.seconds(2)
 
     /// Memory of the whole tree of the child, in bytes. `None`: no limit.
@@ -1837,7 +1849,15 @@ fn run_tests() -> Result[ProcessResult, ProcessError] ! Process.Spawn {
 
 If `make test` runs for more than 30 seconds, the runtime sends SIGTERM to the child and everything it started. After 2 seconds (the default `grace`), it sends SIGKILL. `run` then returns `Ok` with the output that `make` wrote so far and `end` equal to `Limit(Timeout)`.
 
-**When a limit ends a child, the result is `Ok`.** A limit is not a failure of the op. `run` and `wait` return `Ok(ProcessResult)` with the output that the runtime read before the child ended, and `end` is `Limit(k)` for the limit `k` that ended it. If two limits are reached, `k` is the first one that ended the child. `run` and `wait` return by `timeout + grace` plus a short delay. They do not wait for end of file on the pipes of the child: a grandchild that still holds a pipe open does not hold `run` back. The output that came later is lost.
+The deadline clock is monotonic: time that the system spends suspended does not count. A system that sleeps for an hour does not end a build with a 30 second `timeout` at wake-up.
+
+```blink
+let lim = ChildLimits { timeout: Some(Duration.seconds(30)) }
+process.run("sh", ["-c", "make test"], limits: lim)
+// the system suspends for 1 h after 10 s of run time: at wake-up the deadline is 20 s of run time away
+```
+
+**When a limit ends a child, the result is `Ok`.** A limit is not a failure of the op. `run` and `wait` return `Ok(ProcessResult)` with the output that the runtime read before the child ended, and `end` is `Limit(k)` for the limit `k` that ended it. If two limits are reached, `k` is the first one that ended the child. `run` and `wait` return by `timeout + grace` plus a short delay (written `timeout + grace + δ` below). This is the one upper bound for every limited call. They do not wait for end of file on the pipes of the child: a grandchild that still holds a pipe open does not hold `run` back. The output that came later is lost. One case returns earlier, with an `Err` (*The runtime cannot signal the child*).
 
 ```blink
 fn flaky(cmd: Str) -> Result[Str, ProcessError] ! Process.Spawn, IO.Print {
@@ -1854,9 +1874,32 @@ fn flaky(cmd: Str) -> Result[Str, ProcessError] ! Process.Spawn, IO.Print {
 
 A child that catches SIGTERM and exits with code 0 during the grace period ends as `Limit(Timeout)`, not as `Exited(0)`. The limit ended it, whatever the child chose to do.
 
-**Bad values and unsupported limits.** A `timeout` that is zero or negative, a `memory` that is zero or negative, a `processes` that is less than 1, and a negative `grace` give `Err` with `EINVAL`, and no child starts. A `grace` of zero is legal: the runtime sends SIGKILL at the deadline and no SIGTERM. A limit that the host cannot enforce gives `Err(ProcessError { op, cmd, code })` with `code` equal to `ENOTSUP`, and no child starts. A limit is never dropped without notice, and the runtime never uses a weaker mechanism in its place. In particular, `memory` and `processes` do not use `RLIMIT_AS` or `RLIMIT_NPROC`, and the runtime does not poll the memory use of the child.
+**Bad values and unsupported limits.** A `timeout` that is zero or negative, a `memory` that is zero or negative, a `processes` that is less than 1, and a negative `grace` give `Err` with `EINVAL`, and no child starts. A `grace` of zero is legal: the runtime sends SIGKILL at the deadline and no SIGTERM. A limit that the host cannot enforce gives `Err(ProcessError { op, cmd, code })` with `code` equal to `ENOTSUP`, and no child starts. `ENOTSUP` means exactly that `process.can_limit` is `false` for a kind that the call asks for. When the host supports a limit but applying it fails (for example `EACCES`, `EBUSY`, `ENOSPC` or `EMFILE` from the cgroup), the call gives the real errno of the failed step, not `ENOTSUP`, and no child starts. A caller can retry a failure that may pass, and a fallback that drops a limit on `ENOTSUP` never drops a limit that the host supports. The check of the values comes first: a call with both a bad value and a limit that the host cannot enforce gives `EINVAL`, so a bad call fails the same way on every host. A limit is never dropped without notice, and the runtime never uses a weaker mechanism in its place. In particular, `memory` and `processes` do not use `RLIMIT_AS` or `RLIMIT_NPROC`, and the runtime does not poll the memory use of the child.
 
 **Process groups. A terminal Ctrl-C does not reach a limited child.** A child that has any limit starts in its own process group. The runtime sends its signals to that group, or to the cgroup of the child when it has one, so grandchildren end too: `sh -c "make test"` with a timeout ends `make` and all that `make` started. The group is not the foreground group of the terminal, so the interrupt that a user types goes to this program only (see *A limited child does not outlive this program* for what the runtime does then). A child with no limit stays in the process group of this program, as before.
+
+**The leader exits first.** A limited child is a unit: its tree ends with its leader. When `run` or `wait` sees the leader exit, the runtime ends the rest of the leader's process group (or cgroup): SIGTERM, then SIGKILL after `grace`. It then reads the pipes to end of file and returns. `end` is the end of the leader, so ending only the leftovers never changes `end`. Output that a leftover writes after the leader exits is lost. A process outside the group, such as one that called `setsid`, can still hold a pipe. `run` does not wait for that process: it closes the pipe at the bound, as Go's `WaitDelay` does. The bound is the exit of the leader plus `grace` plus δ, and never later than `timeout + grace + δ`.
+
+```blink
+let r = process.run("sh", ["-c", "sleep 30 & exit 0"],
+    limits: ChildLimits { timeout: Some(Duration.seconds(5)) })?
+// returns at about 0 s, not at 5 s: Ok, r.end == Exited(0), and no `sleep 30` is alive
+
+let t = process.run("sh", ["-c", "trap '' TERM; sleep 30 & exit 0"],
+    limits: ChildLimits { timeout: Some(Duration.seconds(5)) })?
+// the leftover ignores SIGTERM: returns at about 2 s (the default grace), then SIGKILL ends it
+// t.end == Exited(0)
+```
+
+A deadline that fires when the leader has exited but the runtime has not yet reaped it signals the group in the same way, and `end` stays `Exited(c)`.
+
+A refused fork changes the rule for `end`. When the `processes` limit refused a fork in the tree before the runtime first sees the leader exit, `end` is `Limit(Processes)`, even if the leader then exits on its own. This is the rule that a limit names the end whatever the child chose to do (see *Child limits*, a child that catches SIGTERM). A refusal by a leftover after the leader has ended does not count.
+
+```blink
+let r = process.run("./t", [], limits: ChildLimits { processes: Some(5) })?
+// ./t: a fork fails, ./t prints a message and exits 1
+// r.end == Limit(Processes) on every run, not Exited(1)
+```
 
 **Memory and process count need a delegated cgroup v2.** `memory` and `processes` work on Linux when this program can use a delegated cgroup v2 (a cgroup that this program may write to, with the memory and pids controllers available to it). Everywhere else they give `ENOTSUP`.
 
@@ -1868,9 +1911,18 @@ A child that catches SIGTERM and exits with code 0 during the grace period ends 
 
 A program that a user starts in a normal terminal usually falls in the "otherwise" column. Under cgroup v2 a cgroup that has child cgroups holds no processes. This program shares the cgroup of the shell that started it, so the runtime cannot make the cgroups it needs, and `memory` and `processes` give `ENOTSUP`. This is also the usual case in a container and on macOS. These limits work when something has started the program in its own delegated unit, for example with `systemd-run --user --scope -p Delegate=yes`. A target without processes (wasm) has no `process` handle, so no row applies.
 
+The runtime never moves a process that it did not start into a cgroup. The cgroup check is true only when every process in the cgroup of this program is this program or one of its descendants. A wrapper shell that stays alive fails this check, because the shell shares the cgroup. `memory` and `processes` then give `ENOTSUP`, and `process.can_limit` is `false` for both kinds. A shell that replaces itself with the program passes:
+
+```
+$ systemd-run --user --scope -p Delegate=yes sh -c './prog; echo done'
+# sh stays in the cgroup of ./prog: memory and processes give ENOTSUP
+$ systemd-run --user --scope -p Delegate=yes sh -c 'exec ./prog'
+# exec replaces sh with ./prog: memory and processes work
+```
+
 When the runtime applies `memory` or `processes` for the first time, this program moves itself into a leaf cgroup below its own cgroup, and each limited child gets a cgroup of its own. You can see the move in `/proc/self/cgroup`. `memory` also sets the swap of the child to 0, so a child cannot go past its limit through swap. When the kernel ends a child for `memory`, the end is `Limit(Memory)`.
 
-The `processes` limit has a meaning that differs from `TasksMax` of systemd, where a fork past the limit only fails. Here the tree ends: when a fork in the tree is refused because of the limit, the runtime ends the whole tree and the end is `Limit(Processes)`. A child that handles the fork failure and carries on is ended too. Threads count as well as processes, so a child with many threads reaches the limit without a fork. Pair `processes` with a `timeout`, so a child in a state that the limit does not cover still ends.
+The `processes` limit has a meaning that differs from `TasksMax` of systemd, where a fork past the limit only fails. Here the tree ends: when a fork in the tree is refused because of the limit, the runtime ends the whole tree and the end is `Limit(Processes)`. A child that handles the fork failure and carries on is ended too. The end is at once, with no `grace`: a tree at its limit cannot fork, so a grace period gains nothing, and the kernel ends a child for `memory` with no grace as well. Threads count as well as processes, so a child with many threads reaches the limit without a fork. Pair `processes` with a `timeout`, so a child in a state that the limit does not cover still ends.
 
 ```blink
 fn fork_bomb_guard() -> Result[ProcessResult, ProcessError] ! Process.Spawn {
@@ -1880,7 +1932,7 @@ fn fork_bomb_guard() -> Result[ProcessResult, ProcessError] ! Process.Spawn {
 // a child that forks past 200 processes or threads ends with Limit(Processes)
 ```
 
-**Ask which limits the host supports.** `process.can_limit(which)` returns `true` when `run` and `spawn` can apply a limit of that kind on this host. It uses the same check as `run`, made once and kept for the life of the program, so its answer does not change while the program runs. The answer is advice: `run` and `spawn` stay the authority and still give `ENOTSUP` when a limit cannot be applied. The call never creates or changes a cgroup. Support is per kind: a host can give the memory controller without the pids controller, or the reverse. A call with `Timeout` returns `true` on every host that has processes. `process.can_limit` is a `Process.Spawn` operation, so a `handler Process` may answer it (see *Mock handlers*).
+**Ask which limits the host supports.** `process.can_limit(which)` returns `true` when `run` and `spawn` can apply a limit of that kind on this host. It uses the same check as `run`, made once and kept for the life of the program, so its answer does not change while the program runs. The answer is advice: `run` and `spawn` stay the authority. They give `ENOTSUP` exactly when `can_limit` is `false` for a kind that the call asks for. When the host supports the kind and applying it fails, they give the real errno of the failed step. The call never creates or changes a cgroup. Support is per kind: a host can give the memory controller without the pids controller, or the reverse. A call with `Timeout` returns `true` on every host that has processes. `process.can_limit` is a `Process.Spawn` operation, so a `handler Process` may answer it (see *Mock handlers*).
 
 The fallback pattern asks first, keeps each limit that the host supports, and keeps the timeout:
 
@@ -1900,11 +1952,61 @@ On a host with no cgroup v2 delegation, this call runs the child with the timeou
 ```blink
 let r = process.run("./t", [], limits: ChildLimits { memory: Some(1024 * 1024 * 1024) })
 // Err(ProcessError { op: Run, cmd: "./t", code: ENOTSUP }), displayed as: run ./t: Operation not supported
+
+let bad = process.run("./t", [], limits: ChildLimits { memory: Some(0) })
+// Err with code EINVAL on every host, even where memory is not supported: the check of the values comes first
 ```
 
-**A deadline holds whether or not anyone waits.** A deadline is a property of the child, not of the code that waits for it. A child that `process.spawn` started with a `timeout` ends at its deadline even if this program never calls `process.wait` on it, or calls it much later. The runtime starts one watcher the first time a child with a deadline starts. A program that never sets a limit starts no watcher and pays nothing. The watcher only sends signals. It never reaps a child, so `process.wait` still gets the result of the child, with `end` equal to `Limit(Timeout)`.
+If the host supports `memory` and the runtime fails to write the cgroup (for example, `EACCES` from the write), the call gives `Err` with `EACCES`, and no child starts. It does not give `ENOTSUP`.
 
-**A limited child does not outlive this program.** When this program ends by a normal exit, by a panic, or by a SIGINT or SIGTERM, the runtime first ends the process group (or the cgroup) of each limited child that is still alive, and then the program ends with its exit code. On Linux the direct child also has a parent-death signal, SIGKILL, so it ends when this program ends. There is a gap on macOS: if SIGKILL ends this program, nothing ends the process group of a limited child, and it keeps running. On Linux in that case the direct child ends, and its descendants end only when they are in the cgroup of the child. A child with no limit has no such rule: it stays in the process group of this program, as before.
+**A deadline holds whether or not anyone waits.** A deadline is a property of the child, not of the code that waits for it. A child that `process.spawn` started with a `timeout` ends at its deadline even if this program never calls `process.wait` on it, or calls it much later. The same is true of the leader's exit: the tree of a limited child ends at the first of the exit of its leader and its deadline, then SIGTERM, `grace`, SIGKILL. This holds on every path (`run`, `spawn` with no `wait`, with an early `wait`, with a late `wait`) and for a child that has only `memory` or only `processes`. The runtime starts one watcher the first time a limited child starts. A program that never starts a limited child starts no watcher and pays nothing. The watcher only sends signals. It never reaps a child, so `process.wait` still gets the result of the child, with `end` equal to `Limit(Timeout)` or to the real end of the leader.
+
+```blink
+let c = process.spawn("sh", ["-c", "sleep 600 & exit 0"],
+    limits: ChildLimits { memory: Some(256 * 1024 * 1024) })?
+// nobody waits: the sleep still ends right after sh exits (plus grace)
+// a wait at any time later gives Exited(0)
+```
+
+**The runtime cannot signal the child.** A child can leave the reach of a signal, for example when it runs a program that raises its user ID, such as `pkexec`. At the deadline the runtime signals the leader by its own pid, as well as the group. When the signal to the leader itself fails with `EPERM`, `run` and `wait` give `Err` with `code` equal to `EPERM`, and not `Ok` with `Limit(Timeout)`. `Limit(Timeout)` would say that the limit ended the child, and the child may still be alive. So `EPERM` from `run` or `wait` on a limited child means that the limit could not be enforced, and the child may still be alive. It does not mean that the child failed to start. The test is the signal to the leader, not the call to the group: a group call that reaches another member succeeds, and it proves nothing about the leader. `Err(EPERM)` if and only if the signal to the leader itself fails. There is no check at start: a call for a set-user-ID program starts it, because the mode of a file does not tell whether the runtime can signal the process that results (`sudo` is set-user-ID, and the runtime can signal it).
+
+```blink
+let r = process.run("pkexec", ["sleep", "600"],
+    limits: ChildLimits { timeout: Some(Duration.seconds(1)) })
+// default grace 2 s: Err(ProcessError { op: Run, cmd: "pkexec", code: EPERM }) at about 1 s
+// displayed as: run pkexec: Operation not permitted
+// the child may still be alive; this is not a start failure
+```
+
+The `Err` returns as soon as the runtime knows that it cannot signal the leader, which in practice is at the deadline, because SIGKILL needs the same permission as SIGTERM. Note: this is not a second timing rule. `timeout + grace + δ` stays the one upper bound for every limited call, and this return is only earlier than it. The rest of the group still gets SIGKILL after `grace`, in the background, after the `Err` has returned.
+
+After the `Err`, a later `process.wait` on that child blocks with no bound, as for a child with no limit, and returns the real end of the child. For `run`, the runtime reaps the child in the background when it ends, so no zombie stays. The program may end while the child is alive (*A limited child does not outlive this program*).
+
+**A limited child does not outlive this program.** When this program ends by a return from `main`, by `exit`, by a panic, or by SIGINT, SIGTERM or SIGHUP, the runtime first ends each limited process group (or cgroup) that is still alive: SIGTERM, then SIGKILL after the `grace` of that child. Then the program ends with its exit code. Every limited group or cgroup that is still populated at that point is ended. Under *The leader exits first* it is almost always empty. A child with no limit has no such rule: it stays in the process group of this program, as before.
+
+- A second SIGINT or SIGTERM during this exit grace sends SIGKILL to every limited group at once. A child with a `grace` of 30 seconds does not hold the program for 30 seconds after a user types Ctrl-C twice.
+- SIGHUP starts the exit path only when its action would end the program anyway, that is, when it has its default disposition. If SIGHUP is ignored when the program starts (as under `nohup`), the runtime keeps it ignored. The same holds for SIGINT and SIGTERM.
+- A limited `run` or `spawn` that races the exit, after the exit path has started, blocks until the program ends. It does not return and it does not start a child.
+- During the exit grace, other threads keep running user code: they can print, write files and start children with no limit.
+- A group that the runtime cannot signal (`EPERM` or `EACCES`) counts as done, so the exit never hangs on it. That child can outlive the program.
+
+```blink
+fn main() ! Process.Spawn, IO.Print {
+    let c = process.spawn("sh", ["-c", "trap '' TERM; sleep 600"],
+        limits: ChildLimits { timeout: Some(Duration.minutes(10)), grace: Duration.seconds(5) })?
+    io.println("started")
+}
+// main returns: SIGTERM to the group of c; sleep ignores it; SIGKILL at 5 s; the program ends after about 5 s
+```
+
+```
+$ ./runner            # one limited child, grace 30 s
+^C                    # SIGTERM to the group; SIGKILL follows in 30 s
+^C                    # second SIGINT: SIGKILL to every limited group at once, the program ends
+$ nohup ./runner &    # SIGHUP is ignored at start: the runtime keeps it ignored
+```
+
+If SIGKILL ends this program, the runtime cannot act, and nothing ends the descendants of a limited child, on any OS, with or without a cgroup. On Linux the direct child gets SIGKILL from its parent-death signal, except after it runs a set-user-ID, set-group-ID or file-capability program (Linux clears the signal then). Its descendants keep running. A cgroup of the child stays while it holds processes, and its `memory` and `processes` limits still hold on them, but no deadline applies. On macOS the whole group keeps running. To make sure that the tree ends, run the program under a unit that ends all of its processes when it stops, such as a systemd service or scope, or a container.
 
 **Signal names.** `signal_name(n: Int) -> Str` is a pure function of `std.process`. It has no effect row. It gives the name of the signal for the number `n` on the host: `signal_name(SIGSEGV)` is `"SIGSEGV"`. For a number that the host has no name for, including a real-time signal, it gives `"SIG<n>"`, for example `"SIG34"`. This is the rule of §8.10.5 for the `signal` key of a test file, and `Display` of `ChildEnd` calls the same function, so the two never differ. Signal numbers differ between hosts (`SIGBUS` is 7 on Linux and 10 on macOS), so match on the constants and not on the names. `signal_name` is for text:
 

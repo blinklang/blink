@@ -990,28 +990,43 @@ match r.end {
 ```
 
 - `limits:` is a keyword on `process.run` and `process.spawn` only. `ChildLimits {}` sets no limit.
+  A `ChildLimits` that sets only `grace` sets no limit either: it behaves as `ChildLimits {}`.
+  The deadline clock is monotonic: time the system spends suspended does not count.
 - At the deadline the runtime sends SIGTERM to the child's process group (to its cgroup when
   it has one), and SIGKILL after `grace`. A `grace` of zero sends SIGKILL at once. The end is
   `Limit(Timeout)`, even when the child caught SIGTERM and exited 0, so `success()` is false.
 - A limit that ends a child gives `Ok`, not `Err`. From the deadline on, `run` and `wait`
   return by timeout + grace + a short delay; a grandchild that holds a pipe does not hold them.
+- When the leader of a limited child exits first, the runtime ends the rest of its group (or
+  cgroup) with SIGTERM and SIGKILL after `grace`, then reads the pipes and returns. So
+  `sh -c "sleep 30 & exit 0"` with a 5 s timeout returns at about 0 s with `Exited(0)` and no
+  `sleep` alive. This holds for `spawn` too, whoever calls `wait` and when. A refused fork
+  before the leader's exit is seen gives `Limit(Processes)`, even if the leader exits on its own.
 - A zero or negative `timeout` or a negative `grace` gives `Err` EINVAL and starts no child.
-  So do a `memory` of zero or less and a `processes` under 1.
+  So do a `memory` of zero or less and a `processes` under 1. EINVAL comes before ENOTSUP.
+- If the deadline signal to the leader itself fails with EPERM (a set-user-ID child such as
+  `pkexec`), `run` and `wait` give `Err` EPERM, not `Ok(Limit(Timeout))`: the limit was not
+  enforced and the child may still be alive. It returns at the deadline, and never later than
+  timeout + grace + a short delay.
 - `memory` (bytes) and `processes` work only on Linux when this program has a delegated cgroup v2
   of its own, as under `systemd-run --user --scope -p Delegate=yes prog` (not `sh -c prog`,
   as the cgroup then holds a process that the program did not start). Everywhere else (a
   normal terminal, most containers, macOS) they give `Err` ENOTSUP and start no child. On first
   use the program moves itself into a leaf below its cgroup, and each such child gets a cgroup
   of its own, with swap 0. A child that the kernel ends for memory ends as `Limit(Memory)`; a
-  fork refused at the `processes` cap while the child still runs ends the whole tree as
-  `Limit(Processes)`. Another error of the cgroup (such as EBUSY or EACCES) comes back as
-  that errno.
+  fork refused at the `processes` cap while the child still runs ends the whole tree at once,
+  with no grace, as `Limit(Processes)`. ENOTSUP means exactly that `process.can_limit` is false;
+  another error of the cgroup (such as EBUSY or EACCES) comes back as that errno. The runtime
+  never moves a process it did not start into a cgroup, so `systemd-run --scope sh -c prog`
+  gives ENOTSUP for `memory` and `processes`, and `systemd-run --scope sh -c 'exec prog'` works.
 - `process.can_limit(which)` says which kinds the host supports; `Timeout` is supported
   wherever processes are.
 - A limited child leads its own process group, so a terminal Ctrl-C reaches this program only.
-  When this program ends (return, `env.exit`, panic, SIGINT, SIGTERM), the runtime first ends
-  each limited child that is still alive (and each process in its cgroup), with SIGTERM and its
-  grace, then ends as it would have.
+  When this program ends (return, `env.exit`, panic, SIGINT, SIGTERM, SIGHUP), the runtime first
+  ends each limited child that is still alive (and each process in its cgroup), with SIGTERM and
+  its grace, then ends as it would have. A second SIGINT or SIGTERM in that time sends SIGKILL
+  at once. A SIGKILL to this program leaves the descendants of a limited child running, on
+  every OS.
 
 ## Duration Methods
 
