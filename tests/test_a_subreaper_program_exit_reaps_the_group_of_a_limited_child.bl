@@ -1,0 +1,60 @@
+// At program exit the runtime ends the group of each limited child and waits until the group
+// is gone (sections/04_effects.md §4.4.8 A limited child does not outlive this program). When
+// this program is PID 1 of a container or a subreaper, the members of the group that the
+// leader leaves become children of this program, and each one that ended stays a zombie,
+// which keeps the group alive, until this program reaps it. So the exit must reap them, or it
+// waits for ever.
+//
+// The harness is C, as no Blink surface makes a program a subreaper: it calls
+// prctl(PR_SET_CHILD_SUBREAPER), forks a limited shell with two grandchildren through the
+// runtime, and returns from main once they run. Linux only, as prctl is.
+
+import compile_test_helpers
+import std.process.{ChildEnd, ChildLimits}
+import std.time.{Duration}
+
+fn harness() -> Str {
+    [
+        "#include \"runtime.h\"",
+        "#include <sys/prctl.h>",
+        "int main(void) \{",
+        "    if (prctl(PR_SET_CHILD_SUBREAPER, 1) != 0) \{ printf(\"no subreaper\\n\"); return 2; }",
+        "    int out[2];",
+        "    if (pipe(out) < 0) return 3;",
+        "    static char* argv[] = \{\"sh\", \"-c\", \"sleep 30 & sleep 30 & echo ready; wait\", NULL};",
+        "    int nul = open(\"/dev/null\", O_RDWR);",
+        "    blink_limit_rec* rec = NULL;",
+        "    int e = blink_limits_fork_exec(argv, nul, out[1], nul, 60000000000LL, 200000000LL, &rec);",
+        "    close(out[1]);",
+        "    if (e != 0) \{ printf(\"fork err %d\\n\", e); return 4; }",
+        "    char buf[8] = \{0};",
+        "    if (read(out[0], buf, 6) != 6) return 5;",
+        "    printf(\"%s\", buf);",
+        "    return 0;",
+        "}",
+        "",
+    ].join("\n")
+}
+
+test "a subreaper's exit reaps the ended members of a limited child's group" {
+    if process.run("uname", []).unwrap().out.trim() != "Linux" {
+        return
+    }
+    let dir = "{compile_test_helpers.scratch_root()}/_subreaper_exit"
+    shell_exec("rm -rf {dir}")
+    shell_exec("mkdir -p {dir}")
+    let c_path = "{dir}/subreaper_exit.c"
+    let bin = "{dir}/subreaper_exit"
+    write_file(c_path, harness())
+    let cc = process.run("cc", ["-O1", "-w", "-Ibootstrap", "-o", bin, c_path, "-lm", "-lgc", "-pthread"]).unwrap()
+    assert_eq(cc.end, ChildEnd.Exited(0), "cc failed:\n{cc.out}{cc.err_out}")
+
+    // A hung exit is the bug, so the harness has its own deadline.
+    let start = time.read()
+    let run = process.run(bin, [], limits: ChildLimits { timeout: Some(Duration.seconds(20)), grace: Duration.nanos(0) }).unwrap()
+    let ms = start.elapsed().to_ms()
+    assert_eq(run.end, ChildEnd.Exited(0), "{run.out}{run.err_out}")
+    assert_eq(run.out, "ready\n")
+    assert(ms < 15000, "the exit took {ms} ms")
+    shell_exec("rm -rf {dir}")
+}

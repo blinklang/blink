@@ -1126,6 +1126,17 @@ static void blink_limits_end_locked(void) {
                         rec->status = st;
                     }
                 }
+                if (rec->reaped_at_exit) {
+                    /* When this program is PID 1 or a subreaper, the members that the leader
+                     * left are its children, and each zombie keeps the group alive until it
+                     * is reaped. Only after the leader's reap, so its status is not lost. */
+                    int zst = 0;
+                    for (;;) {
+                        pid_t zr = waitpid(-rec->pid, &zst, WNOHANG);
+                        if (zr > 0 || (zr < 0 && errno == EINTR)) continue;
+                        break;
+                    }
+                }
                 if (rec->reaped_at_exit && kill(-rec->pid, 0) < 0 && errno == ESRCH) {
                     rec->exit_live = 0;
                 } else if (rec->reaped && !rec->reaped_at_exit) {
