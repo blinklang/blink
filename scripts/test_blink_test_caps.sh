@@ -77,8 +77,9 @@ cd "$WORK"
 # file_line <file> <json lines>: the record:file line of one fixture.
 file_line() { grep '"record":"file"' <<< "$2" | grep -F "\"file\":\"$1\""; }
 
+# The same scope properties the gate run asks for, as test_capped_child.sh probes.
 if command -v systemd-run >/dev/null 2>&1 &&
-    systemd-run --user --scope -q -p Delegate=yes -p MemoryMax=256M -p TasksMax=256 true >/dev/null 2>&1; then
+    systemd-run --user --scope -q -p Delegate=yes -p MemoryMax=64M -p MemorySwapMax=0 -p TasksMax=64 -p OOMPolicy=continue true >/dev/null 2>&1; then
 
     out=$(run BLINK_TEST_MEMORY=64M BLINK_TEST_PROCESSES=32 timeout 300 "$CAPPED" \
         "$RUNNER" "$BLINK" test caps/ --json --timeout 60s 2> "$WORK/err")
