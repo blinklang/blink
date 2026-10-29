@@ -44,7 +44,6 @@ typedef struct blink_ChildEnd {
 typedef struct {
     const char* out;
     const char* err_out;
-    int64_t exit_code;
     blink_ChildEnd end;
 } blink_ProcessResult;
 
@@ -65,28 +64,24 @@ static inline blink_ChildEnd blink_child_end_signaled(int64_t sig) {
 }
 
 /* The end of a result that names no child that ended: a spawn that failed, a wait that
- * failed, or a handle whose result is gone. It mirrors exit_code -1 only until run and
- * spawn return a Result; the spec makes each of these paths an Err, not an end. */
+ * failed, or a handle whose result is gone. The old free functions still answer these
+ * paths with a result; the spec makes each of them an Err, not an end. */
 static inline blink_ChildEnd blink_child_end_none(void) {
     return blink_child_end_exited(-1);
 }
 
-/* exit_code and end from one wait status, so the two never disagree. */
 static inline void blink_process_result_set_status(blink_ProcessResult* r, int status) {
     if (WIFEXITED(status)) {
-        r->exit_code = (int64_t)WEXITSTATUS(status);
         r->end = blink_child_end_exited((int64_t)WEXITSTATUS(status));
     } else if (WIFSIGNALED(status)) {
-        r->exit_code = 128 + (int64_t)WTERMSIG(status);
         r->end = blink_child_end_signaled((int64_t)WTERMSIG(status));
     } else {
-        r->exit_code = -1;
         r->end = blink_child_end_none();
     }
 }
 
 static inline blink_ProcessResult blink_process_result_none(const char* err_out) {
-    blink_ProcessResult r = { BLINK_STR_EMPTY, err_out, -1, blink_child_end_none() };
+    blink_ProcessResult r = { BLINK_STR_EMPTY, err_out, blink_child_end_none() };
     return r;
 }
 
@@ -371,7 +366,6 @@ static int64_t blink_pid_table_alloc(void) {
         slot->reaped = 0;
         slot->cached.out = BLINK_STR_EMPTY;
         slot->cached.err_out = BLINK_STR_EMPTY;
-        slot->cached.exit_code = -1;
         slot->cached.end = blink_child_end_none();
         slot->kept_bytes = 0;
         h = slot->gen * BLINK_PID_TABLE_CAP + i;
@@ -973,7 +967,6 @@ BLINK_RT_FN int64_t blink_child_box_err(blink_child_box* box);
 BLINK_RT_FN const char* blink_child_box_cmd(blink_child_box* box);
 BLINK_RT_FN const char* blink_child_box_out(blink_child_box* box);
 BLINK_RT_FN const char* blink_child_box_err_out(blink_child_box* box);
-BLINK_RT_FN int64_t blink_child_box_exit_code(blink_child_box* box);
 BLINK_RT_FN int64_t blink_child_box_end_tag(blink_child_box* box);
 BLINK_RT_FN int64_t blink_child_box_end_value(blink_child_box* box);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
@@ -981,7 +974,6 @@ BLINK_RT_FN int64_t blink_child_box_err(blink_child_box* box) { return box->err;
 BLINK_RT_FN const char* blink_child_box_cmd(blink_child_box* box) { return box->cmd; }
 BLINK_RT_FN const char* blink_child_box_out(blink_child_box* box) { return box->result.out; }
 BLINK_RT_FN const char* blink_child_box_err_out(blink_child_box* box) { return box->result.err_out; }
-BLINK_RT_FN int64_t blink_child_box_exit_code(blink_child_box* box) { return box->result.exit_code; }
 BLINK_RT_FN int64_t blink_child_box_end_tag(blink_child_box* box) { return (int64_t)box->result.end.tag; }
 BLINK_RT_FN int64_t blink_child_box_end_value(blink_child_box* box) {
     switch (box->result.end.tag) {

@@ -484,7 +484,7 @@ let text = #"{{x}}"#                    // a lone { is text: "{{x}}"
 | `file_mtime(path)` | Int | Modification time (ms) |
 | ~~`get_env(name)`~~ | — | **Removed in v0.35** — use `env.var(name)` |
 | `shell_exec(cmd)` | Int | Run shell command, return exit code |
-| `process_run(cmd, args)` | ProcessResult | Run command with args (`List[Str]`), capture stdout/stderr/exit_code |
+| `process_run(cmd, args)` | ProcessResult | Run command with args (`List[Str]`), capture stdout, stderr and how the child ended |
 | `process_run_with_stdin(cmd, args, input)` | ProcessResult | Like `process_run` but pipes `input` (Str) to child's stdin |
 | `process_exec(cmd, args)` | () | Exec binary directly (replaces process). `args` is `List[Str]` |
 | `process_spawn(cmd, args)` | Int | Fork + exec a child process; returns raw pid handle. Idiomatic API: `std.process.spawn` |
@@ -925,14 +925,16 @@ These methods enable writing database drivers entirely in Blink without C FFI he
 ## ProcessResult Fields
 
 ```blink
-let result = process_run("ls", ["-la"])
+import std.process
+let result = process.run("ls", ["-la"])?
 result.out          // Str — stdout
 result.err_out      // Str — stderr
-result.exit_code    // Int — exit code (128 + n for signal n)
+result.end          // ChildEnd — how the child ended
+result.success()    // Bool — true exactly for Exited(0)
 ```
 
-With `import std.process`, `result.end` says how the child ended: `Exited(code)` or
-`Signaled(n)`, never `Exited(128 + n)`. `result.success()` is true exactly for `Exited(0)`.
+`result.end` says how the child ended: `Exited(code)` or
+`Signaled(n)`, never `Exited(128 + n)`. There is no `exit_code` field; reading one is E0525. `result.success()` is true exactly for `Exited(0)`.
 `signal_name(n)` gives the host's name for a signal (`"SIGSEGV"`), or `"SIG<n>"`. An end
 displays as `exit 3`, `signal SIGSEGV` or `limit timeout`.
 
@@ -1222,8 +1224,8 @@ match scores.get("alice") {
 }
 
 // Process execution
-let result = process_run("git", ["rev-parse", "HEAD"])
-if result.exit_code == 0 {
+let result = process.run("git", ["rev-parse", "HEAD"])?
+if result.success() {
     io.println("Commit: {result.out.trim()}")
 }
 ```
