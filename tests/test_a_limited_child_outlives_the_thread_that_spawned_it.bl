@@ -1,0 +1,64 @@
+// On Linux the parent-death signal of a child fires when the thread that forked it ends, not
+// when the program does. The runtime forks each limited child on its one long-lived limits
+// thread, so a child spawned from a thread that has since ended runs on to its own end
+// (sections/04_effects.md §4.4.8 A deadline holds whether or not anyone waits). No Blink
+// surface ends a thread before the program ends, so the harness is C: it asks the runtime for
+// a limited child from a raw pthread, joins that thread, and then waits on the child. A fork on
+// the calling thread fails here: the child gets SIGKILL when the thread ends.
+
+import compile_test_helpers
+import std.process.{ChildEnd}
+
+fn harness() -> Str {
+    [
+        "#include \"runtime.h\"",
+        "#include <sys/wait.h>",
+        "static blink_limit_rec* g_rec;",
+        "static int g_err;",
+        "static int g_out[2];",
+        "static void* forker(void* a) \{",
+        "    (void)a;",
+        "    static char* argv[] = \{\"sh\", \"-c\", \"sleep 1; echo alive\", NULL};",
+        "    int nul = open(\"/dev/null\", O_RDWR);",
+        "    g_err = blink_limits_fork_exec(argv, nul, g_out[1], nul, 60000000000LL, 0, &g_rec);",
+        "    return NULL;",
+        "}",
+        "int main(void) \{",
+        "    if (pipe(g_out) < 0) return 2;",
+        "    pthread_t t;",
+        "    pthread_create(&t, NULL, forker, NULL);",
+        "    pthread_join(t, NULL);",
+        "    close(g_out[1]);",
+        "    if (g_err != 0) \{ printf(\"fork err %d\\n\", g_err); return 3; }",
+        "    char buf[64] = \{0};",
+        "    ssize_t n = read(g_out[0], buf, sizeof(buf) - 1);",
+        "    int st = 0, hit = 0;",
+        "    int we = blink_limits_wait_exit(g_rec->pid);",
+        "    int re = blink_limits_reap(g_rec, we, &st, &hit);",
+        "    printf(\"we=%d re=%d hit=%d out=[%.*s] exited=%d code=%d signaled=%d sig=%d\\n\", we, re, hit,",
+        "           (int)(n > 0 ? n : 0), buf, WIFEXITED(st), WEXITSTATUS(st), WIFSIGNALED(st),",
+        "           WIFSIGNALED(st) ? WTERMSIG(st) : 0);",
+        "    return 0;",
+        "}",
+        "",
+    ].join("\n")
+}
+
+test "a limited child spawned from a thread that has ended runs to its own end" {
+    if process.run("uname", []).unwrap().out.trim() != "Linux" {
+        return
+    }
+    let dir = "{compile_test_helpers.scratch_root()}/_ended_thread"
+    shell_exec("rm -rf {dir}")
+    shell_exec("mkdir -p {dir}")
+    let c_path = "{dir}/ended_thread.c"
+    let bin = "{dir}/ended_thread"
+    write_file(c_path, harness())
+    let cc = process.run("cc", ["-O1", "-w", "-Ibootstrap", "-o", bin, c_path, "-lm", "-lgc", "-pthread"]).unwrap()
+    assert_eq(cc.end, ChildEnd.Exited(0), "cc failed:\n{cc.out}{cc.err_out}")
+
+    let run = process.run(bin, []).unwrap()
+    assert_eq(run.end, ChildEnd.Exited(0), "{run.out}{run.err_out}")
+    assert_eq(run.out, "we=0 re=0 hit=0 out=[alive\n] exited=1 code=0 signaled=0 sig=0\n")
+    shell_exec("rm -rf {dir}")
+}
