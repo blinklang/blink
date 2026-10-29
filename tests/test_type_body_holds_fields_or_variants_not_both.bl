@@ -1,15 +1,18 @@
 // A `type` body is a product (fields) or a sum (variants), never both (§3.4). Every pass
-// after the parser tells the two apart by the first member, so a body that mixes them once
-// crashed the compiler (a struct read the field type of a variant) or, with the variant first,
-// compiled without an error. The parser now reports the first member whose kind differs
-// from the first member, once, and drops every such member.
+// after the parser tells the two apart by the first member, so the parser reports the first
+// member of the other kind once and drops each such member.
 //
 // A member the parser cannot read must not leave junk behind it either: the rest of that
-// member's line is skipped, so `name:7 Str` does not turn `Str` into a variant.
+// member's line is skipped, so `name:7 Str` does not turn `Str` into a variant. The skip must
+// stop at the member's own line, so the next member is kept.
 import compile_test_helpers
 
 fn errors_in(output: Str) -> Int {
     output.split("\"severity\":\"error\"").len() - 1
+}
+
+fn parse_errors_in(output: Str) -> Int {
+    output.split("\"code\":\"E1100\"").len() - 1
 }
 
 fn mixed_count(output: Str) -> Int {
@@ -125,6 +128,7 @@ fn main() {}
     assert_no_ice(output)
     assert(output.contains("expected IDENT, got INT"), output)
     assert_eq(mixed_count(output), 0)
+    assert_eq(parse_errors_in(output), 1)
 }
 
 test "a named parameter in a fn-typed field is a parse error, not a crash" {
@@ -136,6 +140,7 @@ fn main() {}
     assert_no_ice(output)
     assert(output.contains("expected ), got :"), output)
     assert_eq(mixed_count(output), 0)
+    assert_eq(parse_errors_in(output), 1)
 }
 
 test "a member that does not start with a name is one error and declares nothing" {
@@ -154,6 +159,68 @@ fn main() {
     assert_no_ice(output)
     assert_eq(mixed_count(output), 0)
     assert_eq(errors_in(output), 1)
+}
+
+test "a field with no type keeps the field on the next line" {
+    let src = #"
+type A {
+    x:
+    y: Int
+}
+fn main() {
+    let a = A { x: 1, y: 2 }
+    let _s = a.y
+}
+"#
+    let output = compile_test_helpers.compile_and_capture(src, "_type_body_field_without_type")
+    assert_no_ice(output)
+    assert(!output.contains("has no field `y`"), output)
+}
+
+test "a doubled comma between fields keeps the field after it" {
+    let src = #"
+type A {
+    x: Int,, y: Int
+}
+fn main() {
+    let a = A { x: 1, y: 2 }
+    let _s = a.x + a.y
+}
+"#
+    let output = compile_test_helpers.compile_and_capture(src, "_type_body_doubled_comma")
+    assert_no_ice(output)
+    assert_eq(errors_in(output), 1)
+}
+
+test "a stray block in a type body does not end the body" {
+    let src = #"
+type A {
+    x: Int
+    { junk }
+    y: Int
+}
+fn main() {
+    let a = A { x: 1, y: 2 }
+    let _s = a.x + a.y
+}
+"#
+    let output = compile_test_helpers.compile_and_capture(src, "_type_body_stray_block")
+    assert_no_ice(output)
+    assert_eq(errors_in(output), 1)
+}
+
+test "a lone mut before the closing brace does not swallow the next item" {
+    let src = #"
+type A { x: Int, mut }
+fn main() {
+    let a = A { x: 1 }
+    let _s = a.x
+}
+"#
+    let output = compile_test_helpers.compile_and_capture(src, "_type_body_lone_mut_at_close")
+    assert_no_ice(output)
+    assert_eq(errors_in(output), 2)
+    assert(!output.contains("is a keyword"), output)
 }
 
 test "a struct body and an enum body each compile clean" {
