@@ -8,7 +8,9 @@
 # gate's cap, "infinity", a signal to the wrapper, and that a child OOM while
 # the gate reclaims page cache names no gate cap. With no systemd-run, each
 # child gets prlimit caps and a time limit, and the gate prints the one notice
-# for that, not each child.
+# for that, not each child. `--own-cgroup` gives a command a cgroup with only
+# that command in it inside a delegated gate run, and runs it in place, with a
+# line that says why, anywhere else.
 # Every hog and fork loop here runs under a cap of 64M or 64 tasks, with a
 # timeout, so this test cannot grow past a few hundred MB.
 set -u
@@ -370,6 +372,64 @@ if command -v systemd-run >/dev/null 2>&1 &&
         */gate) pass "BLINK_CHILD_CAP=0 runs a child in place, with no cgroup of its own" ;;
         *) flunk "BLINK_CHILD_CAP=0 (cgroup [$out]: $(cat "$WORK/err"))" ;;
     esac
+
+    # --own-cgroup gives a command a cgroup with no process in it but the
+    # command, so a Blink program there can apply memory and processes limits
+    # to its own children (it needs to own its whole cgroup). The cgroup has
+    # no caps of its own: the gate's caps hold over it. Builtins only, so no
+    # helper process sits in the cgroup while it is read.
+    printf '%s' 'd=/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup); exec bash -c '\''d=$1; mapfile -t p < "$d/cgroup.procs"; read -r ctl < "$d/cgroup.controllers"; read -r m < "$d/memory.max"; read -r t < "$d/pids.max"; printf "%s %s [%s] %s %s %s\n" "${d##*/}" "${#p[@]}" "$ctl" "$m" "$t" "${BLINK_OWN_CGROUP:-unset}"'\'' _ "$d"' > "$WORK/own_probe"
+    own=$(gate -- '"$CAPPED" --own-cgroup bash '"$WORK/own_probe")
+    case "$own" in
+        "o-"*" 1 [memory pids] max max 1")
+            if [ ! -s "$WORK/err" ]; then
+                pass "--own-cgroup runs the command alone in a cgroup with no caps of its own and sets BLINK_OWN_CGROUP=1"
+            else
+                flunk "--own-cgroup printed a notice: $(cat "$WORK/err")"
+            fi
+            ;;
+        *) flunk "--own-cgroup (got [$own]: $(cat "$WORK/err"))" ;;
+    esac
+
+    # The cgroup goes when the command ends, with the cgroups a Blink program
+    # made below it and a process left in one, and the exit code passes through.
+    printf '%s' 'd=/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup); mkdir "$d/blink.self" && { sleep 30 > /dev/null 2>&1 & echo $! > "$d/blink.self/cgroup.procs"; }; exit 5' > "$WORK/own_left"
+    out=$(gate -- '"$CAPPED" --own-cgroup bash '"$WORK/own_left"'; echo "rc=$?"
+        d=/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup); ls "${d%/*}/kids" | grep -c "^o-"')
+    if [ "$out" = "$(printf 'rc=5\n0')" ]; then
+        pass "--own-cgroup keeps the exit code and removes its cgroup tree when the command ends"
+    else
+        flunk "--own-cgroup cleanup (out=[$out]: $(cat "$WORK/err"))"
+    fi
+
+    # The ways that give no cgroup run the command in place, without
+    # BLINK_OWN_CGROUP even when the caller's env has it, and print why.
+    own_where='"$CAPPED" --own-cgroup bash -c '\''echo "$(cut -d: -f3 /proc/self/cgroup) ${BLINK_OWN_CGROUP:-unset}"'\'''
+    out=$(gate BLINK_CHILD_CAP=0 BLINK_OWN_CGROUP=1 -- "$own_where")
+    case "$out" in
+        */gate" unset")
+            if grep -q '^capped.sh: .* gets no cgroup of its own: BLINK_CHILD_CAP=0' "$WORK/err"; then
+                pass "BLINK_CHILD_CAP=0 runs an --own-cgroup command in place and says why"
+            else
+                flunk "BLINK_CHILD_CAP=0 --own-cgroup notice: $(cat "$WORK/err")"
+            fi
+            ;;
+        *) flunk "BLINK_CHILD_CAP=0 --own-cgroup (got [$out]: $(cat "$WORK/err"))" ;;
+    esac
+
+    # Inside a child, a cgroup of its own would take the command out of the
+    # child's caps.
+    out=$(gate -- '"$CAPPED" --child '"$own_where")
+    case "$out" in
+        */c-*" unset")
+            if grep -q '^capped.sh: .* gets no cgroup of its own: it runs inside a child' "$WORK/err"; then
+                pass "--own-cgroup inside a child stays in the child's cgroup and says why"
+            else
+                flunk "--own-cgroup in a child notice: $(cat "$WORK/err")"
+            fi
+            ;;
+        *) flunk "--own-cgroup in a child (got [$out]: $(cat "$WORK/err"))" ;;
+    esac
 else
     echo "SKIP: no systemd user scope with delegation on this machine; the cgroup cases did not run"
 fi
@@ -386,6 +446,25 @@ if command -v script >/dev/null 2>&1; then
 else
     echo "SKIP: no script command; the terminal case did not run"
 fi
+
+# --- --own-cgroup with no delegated gate scope ----------------------------------
+
+# own_in_place <label> <run args...>: the command runs, without
+# BLINK_OWN_CGROUP even when the caller's env has it, keeps its exit code, and
+# one line says that it gets no cgroup of its own.
+own_in_place() {
+    local label=$1 out rc
+    shift
+    out=$(run BLINK_OWN_CGROUP=1 "$@" "$CAPPED" --own-cgroup bash -c 'echo "${BLINK_OWN_CGROUP:-unset}"; exit 4' 2> "$WORK/err")
+    rc=$?
+    if [ "$out" = unset ] && [ "$rc" = 4 ] && [ "$(grep -c '^capped.sh: .* gets no cgroup of its own: ' "$WORK/err")" = 1 ]; then
+        pass "$label: an --own-cgroup command runs in place and one line says why"
+    else
+        flunk "$label: --own-cgroup (out=[$out] rc=$rc: $(cat "$WORK/err"))"
+    fi
+}
+own_in_place "outside a gate run"
+own_in_place "BLINK_GATE_CAP=0" BLINK_GATE_CAP=0 CAPPED="$CAPPED" timeout 60 "$CAPPED" bash -c '"$@"' _
 
 # --- No systemd-run: prlimit caps each child ----------------------------------
 
@@ -428,6 +507,8 @@ if command -v prlimit >/dev/null 2>&1; then
     else
         flunk "no systemd-run: tasks infinity (rc=$rc: $(cat "$WORK/err"))"
     fi
+
+    own_in_place "no systemd-run" PATH="$P" CAPPED="$CAPPED" timeout 60 "$CAPPED" bash -c '"$@"' _
 else
     echo "SKIP: no prlimit on this machine; the prlimit child cases did not run"
 fi

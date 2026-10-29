@@ -6,6 +6,7 @@
 #
 #   scripts/capped.sh [--name <name>] <command> [<arg> ...]
 #   scripts/capped.sh --child [--timeout <seconds>] [--report <file>] <command> [<arg> ...]
+#   scripts/capped.sh --own-cgroup <command> [<arg> ...]
 #
 # --name names the scope unit, blink-gate-<name>-<pid>-<time>.scope; without
 # it the command's own name does. Only a Taskfile dispatcher passes --name.
@@ -16,6 +17,12 @@
 # the child's time limit for this call. --report <file> gets the line of the
 # cap that ended a failed child, and is empty after any other run, so a caller
 # reads the reason without parsing the child's output.
+#
+# --own-cgroup runs a command alone in a cgroup with no caps of its own, below
+# a delegated gate scope, and exports BLINK_OWN_CGROUP=1 to it. There
+# `blink test --memory/--processes` can cap each test binary itself. Where the
+# gate has no such scope, or with BLINK_CHILD_CAP=0, the command runs in place
+# without BLINK_OWN_CGROUP, and a line on stderr says why.
 #
 # Each heavy Taskfile task re-runs itself through this script. The capped run
 # exports BLINK_GATE_SCOPE, and a call that finds it set runs the command in
@@ -403,6 +410,60 @@ run_child() {
 if [ "${1:-}" = --child ]; then
     shift
     run_child "$@"
+fi
+
+# --- A command in a cgroup of its own ---------------------------------------------
+
+# A Blink program can apply a memory or processes limit to its own children
+# only from a cgroup that holds no process but itself and its descendants
+# (§4.4.8). The gate's leaf also holds the gate's shells, so this call moves
+# the command alone into kids/o-<pid>. That cgroup has no caps of its own;
+# the gate's caps hold over it.
+run_own() {
+    local cg why=
+    [ $# -gt 0 ] || { echo "usage: capped.sh --own-cgroup <command> [<arg> ...]" >&2; exit 2; }
+    unset BLINK_OWN_CGROUP
+    dir=${BLINK_CHILD_CGROUP:-}
+    IFS=: read -r _ _ cg < /proc/self/cgroup 2>/dev/null
+    if [ "${BLINK_CHILD_CAP:-1}" = 0 ]; then
+        why="BLINK_CHILD_CAP=0"
+    elif [ -n "${BLINK_CHILD_CAPPED:-}" ]; then
+        # Out of the child's cgroup, the command would leave the child's caps.
+        why="it runs inside a child, under the child's caps"
+    elif [ "${BLINK_CHILD_CAP_MODE:-}" != cgroup ] || [ -z "$dir" ]; then
+        why="no gate run with a delegated systemd scope holds it"
+    elif [ "/sys/fs/cgroup$cg" != "$dir/gate" ]; then
+        why="it does not run in the gate's own cgroup"
+    fi
+    pid=
+    kid=
+    if [ -z "$why" ]; then
+        kid=$dir/kids/o-$$
+        mkdir "$kid" 2>/dev/null || { why="could not make $kid"; kid=; }
+    fi
+    if [ -n "$why" ]; then
+        notice "${1##*/} gets no cgroup of its own: $why"
+        exec "$@"
+    fi
+    trap 'stop_child HUP' HUP
+    trap 'stop_child INT' INT
+    trap 'stop_child TERM' TERM
+    # The subshell moves itself, then execs, so nothing but the command is in
+    # the cgroup; this script stays in the gate's cgroup.
+    launch "$BASH" -c 'if echo 0 2>/dev/null > "$1/cgroup.procs"; then
+            export BLINK_OWN_CGROUP=1
+        else
+            echo "capped.sh: ${2##*/} gets no cgroup of its own: could not move it into $1" >&2
+        fi
+        shift; exec "$@"' _ "$kid" "$@"
+    trap - HUP INT TERM
+    end_kid
+    exit "$rc"
+}
+
+if [ "${1:-}" = --own-cgroup ]; then
+    shift
+    run_own "$@"
 fi
 
 # --- The gate run ---------------------------------------------------------------

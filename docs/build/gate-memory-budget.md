@@ -409,6 +409,42 @@ stop, and that a child OOM while the gate reclaims page cache names no gate cap.
 `scripts/test_corpus.sh` and `scripts/test_fmt_semantic.sh` prove that a corpus row and an
 fmt file fail with that line as their reason.
 
+## Applied: a command in a cgroup of its own
+
+`blink test --memory <size> --processes <count>` caps each test binary in a cgroup of its
+own (sections/06_tooling.md §8.10.7). The Blink runtime can do that only from a cgroup that
+holds no process but the program and its descendants (§4.4.8). In a gate run, the leaf
+`gate/` also holds the gate's shells and `task`, the ancestors of `blink`, so
+`process.can_limit` is false there for both limits, and `blink test` stops with exit 2 when
+it gets those flags.
+
+`scripts/capped.sh --own-cgroup <command>` solves that. Inside a gate run with a delegated
+scope, it makes `kids/o-<pid>`, moves the command into it alone, and exports
+`BLINK_OWN_CGROUP=1` to it. The cgroup has no caps of its own, so the gate's caps hold over
+it. When the command ends, the script kills what is left and removes the cgroup and the
+cgroups that the command made below it. The exit code passes through, and a signal to the
+script ends the command as it does for `--child`. No `timeout` wraps the command: a wrapper
+process would sit in the cgroup too.
+
+Where it cannot give that cgroup, the command runs in place without `BLINK_OWN_CGROUP`
+(also when the caller's env has it), and one line on stderr says why:
+
+| Case | Line |
+|---|---|
+| `BLINK_CHILD_CAP=0` | `capped.sh: <cmd> gets no cgroup of its own: BLINK_CHILD_CAP=0` |
+| a call inside a `--child` | `...: it runs inside a child, under the child's caps` |
+| no gate run, `BLINK_GATE_CAP=0`, no delegated scope (`prlimit`, `ulimit`, Darwin) | `...: no gate run with a delegated systemd scope holds it` |
+| a call that is not in the gate's leaf | `...: it does not run in the gate's own cgroup` |
+| the `mkdir` or the move fails | `...: could not make <dir>` or `...: could not move it into <dir>` |
+
+`BLINK_CHILD_CAP=0` turns `--own-cgroup` off too, as it turns off every per-child cap:
+then `blink test` gets no memory or process cap for its test binaries, only its timeout.
+
+`scripts/test_capped_child.sh` proves that the command is alone in a cgroup with the
+`memory` and `pids` controllers and no caps of its own, that the cgroup tree goes when the
+command ends, that the exit code passes through, and each in-place case above but the
+last two.
+
 ## Applied: the slice
 
 `scripts/systemd/blink-gates.slice` is the unit, and `scripts/install-gate-slice.sh`
