@@ -1,0 +1,178 @@
+// A `type` body is a product (fields) or a sum (variants), never both (§3.4). Every pass
+// after the parser tells the two apart by the first member, so a body that mixes them once
+// crashed the compiler (a struct read the field type of a variant) or, with the variant first,
+// compiled without an error. The parser now reports the first member whose kind differs
+// from the first member, once, and drops every such member.
+//
+// A member the parser cannot read must not leave junk behind it either: the rest of that
+// member's line is skipped, so `name:7 Str` does not turn `Str` into a variant.
+import compile_test_helpers
+
+fn errors_in(output: Str) -> Int {
+    output.split("\"severity\":\"error\"").len() - 1
+}
+
+fn mixed_count(output: Str) -> Int {
+    output.split("a type body holds fields or variants, not both").len() - 1
+}
+
+fn assert_no_ice(output: Str) {
+    assert(!output.contains("\"severity\":\"ice\""), "internal compiler error: {output}")
+}
+
+test "a unit variant after a field is one error, not a crash" {
+    let src = #"
+type A {
+    name: Int
+    Str
+}
+fn main() {}
+"#
+    let output = compile_test_helpers.compile_and_capture(src, "_type_body_field_then_unit_variant")
+    assert_no_ice(output)
+    assert_eq(mixed_count(output), 1)
+    assert(output.contains("\"code\":\"E1100\""), output)
+    assert_eq(errors_in(output), 1)
+}
+
+test "a paren variant after a field is one error, not a crash" {
+    let src = #"
+type A {
+    name: Int
+    B(Int)
+}
+fn main() {}
+"#
+    let output = compile_test_helpers.compile_and_capture(src, "_type_body_field_then_paren_variant")
+    assert_no_ice(output)
+    assert_eq(mixed_count(output), 1)
+    assert_eq(errors_in(output), 1)
+}
+
+test "a brace variant after a field is one error, not a crash" {
+    let src = #"
+type A {
+    name: Int
+    B { x: Int }
+}
+fn main() {}
+"#
+    let output = compile_test_helpers.compile_and_capture(src, "_type_body_field_then_brace_variant")
+    assert_no_ice(output)
+    assert_eq(mixed_count(output), 1)
+    assert_eq(errors_in(output), 1)
+}
+
+test "a field after a variant is an error, not a silent compile" {
+    let src = #"
+type A {
+    Str
+    name: Int
+}
+fn main() {
+    let _a = A.Str
+}
+"#
+    let output = compile_test_helpers.compile_and_capture(src, "_type_body_variant_then_field")
+    assert_no_ice(output)
+    assert_eq(mixed_count(output), 1)
+    assert_eq(errors_in(output), 1)
+}
+
+test "the mixed-body error is reported once, at the first member of the other kind" {
+    let src = #"
+type A {
+    name: Int
+    B
+    age: Int
+    C(Int)
+}
+fn main() {}
+"#
+    let output = compile_test_helpers.compile_and_capture(src, "_type_body_many_mixed_members")
+    assert_no_ice(output)
+    assert_eq(mixed_count(output), 1)
+    assert(output.contains("\"line\":4,\"col\":5"), output)
+    assert_eq(errors_in(output), 1)
+}
+
+test "the struct keeps its fields when a variant is dropped from its body" {
+    let src = #"
+type A {
+    name: Int
+    B
+    age: Int
+}
+fn main() {
+    let a = A { name: 1, age: 2 }
+    let _n = a.name + a.age
+}
+"#
+    let output = compile_test_helpers.compile_and_capture(src, "_type_body_struct_keeps_fields")
+    assert_no_ice(output)
+    assert_eq(mixed_count(output), 1)
+    assert_eq(errors_in(output), 1)
+}
+
+test "an int literal before a field type is a parse error and leaves no variant behind" {
+    let src = #"
+type A {
+    name:7 Str
+}
+fn main() {}
+"#
+    let output = compile_test_helpers.compile_and_capture(src, "_type_body_int_before_field_type")
+    assert_no_ice(output)
+    assert(output.contains("expected IDENT, got INT"), output)
+    assert_eq(mixed_count(output), 0)
+}
+
+test "a named parameter in a fn-typed field is a parse error, not a crash" {
+    let src = #"
+type H { f: fn(x: Int) -> Int }
+fn main() {}
+"#
+    let output = compile_test_helpers.compile_and_capture(src, "_type_body_fn_field_named_param")
+    assert_no_ice(output)
+    assert(output.contains("expected ), got :"), output)
+    assert_eq(mixed_count(output), 0)
+}
+
+test "a member that does not start with a name is one error and declares nothing" {
+    let src = #"
+type A {
+    x: Int
+    ) -> 3
+    y: Int
+}
+fn main() {
+    let a = A { x: 1, y: 2 }
+    let _s = a.x + a.y
+}
+"#
+    let output = compile_test_helpers.compile_and_capture(src, "_type_body_member_without_name")
+    assert_no_ice(output)
+    assert_eq(mixed_count(output), 0)
+    assert_eq(errors_in(output), 1)
+}
+
+test "a struct body and an enum body each compile clean" {
+    let src = #"
+type P {
+    x: Int
+    y: Int
+}
+type S {
+    Circle(Float)
+    Rect { w: Float, h: Float }
+    Point
+}
+fn main() {
+    let p = P { x: 1, y: 2 }
+    let _s = S.Point
+    let _n = p.x + p.y
+}
+"#
+    let output = compile_test_helpers.compile_and_capture(src, "_type_body_struct_and_enum_clean")
+    compile_test_helpers.expect_compiles_clean(output, "struct and enum bodies compile clean")
+}
