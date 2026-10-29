@@ -56,17 +56,29 @@ pub fn sanitize_url(url: Str) -> Str {
 fn ensure_bare_clone(url: Str, cache_dir: Str) -> Int {
     let repo_dir = path_join(cache_dir, "repo.git")
     if is_dir(repo_dir) == 1 {
-        shell_exec("git -C {repo_dir} fetch --tags --quiet 2>/dev/null")
-    } else {
-        shell_exec("git clone --bare --quiet {url} {repo_dir} 2>/dev/null")
+        // A fetch that fails (offline, say) leaves the clone as it was, and resolve_commit
+        // still finds a ref the clone already holds.
+        let _ = process.run("git", ["-C", repo_dir, "fetch", "--tags", "--quiet"])
+        return 0
     }
-    0
+    if git_ok(["clone", "--bare", "--quiet", url, repo_dir]) { 0 } else { 1 }
+}
+
+// Whether git ran with args and exited 0. git's own messages are captured and dropped,
+// as the old 2>/dev/null did: the caller says which dependency failed.
+fn git_ok(args: List[Str]) -> Bool {
+    match process.run("git", args) {
+        Ok(r) => r.success()
+        Err(_) => false
+    }
 }
 
 fn resolve_commit(cache_dir: Str, ref: Str) -> Int {
     let repo_dir = path_join(cache_dir, "repo.git")
-    let result = process_run("sh", ["-c", "git -C {repo_dir} rev-list -1 {ref} 2>/dev/null | head -c 40"])
-    last_commit = str_trim_right(result.out)
+    last_commit = match process.run("sh", ["-c", "git -C {repo_dir} rev-list -1 {ref} 2>/dev/null | head -c 40"]) {
+        Ok(result) => str_trim_right(result.out)
+        Err(_) => ""
+    }
     if last_commit.len() == 0 {
         return 1
     }
@@ -80,16 +92,23 @@ fn ensure_checkout(cache_dir: Str, commit: Str) -> Int {
         return 0
     }
     let repo_dir = path_join(cache_dir, "repo.git")
-    shell_exec("git clone --shared --quiet {repo_dir} {checkout_dir} 2>/dev/null")
-    shell_exec("git -C {checkout_dir} checkout --quiet {commit} 2>/dev/null")
+    // A half-made checkout dir would pass the is_dir check above on the next fetch.
+    if !git_ok(["clone", "--shared", "--quiet", repo_dir, checkout_dir]) || !git_ok(["-C", checkout_dir, "checkout", "--quiet", commit]) {
+        let _ = process.run("rm", ["-rf", checkout_dir])
+        return 1
+    }
     last_checkout_path = checkout_dir
     0
 }
 
 fn compute_content_hash(dir: Str) -> Int {
-    let result = process_run("sh", ["-c", "find {dir} -name '*.bl' -type f | sort | xargs cat | sha256sum | cut -c1-64"])
-    last_content_hash = str_trim_right(result.out)
-    0
+    match process.run("sh", ["-c", "find {dir} -name '*.bl' -type f | sort | xargs cat | sha256sum | cut -c1-64"]) {
+        Ok(result) => {
+            last_content_hash = str_trim_right(result.out)
+            0
+        }
+        Err(_) => 1
+    }
 }
 
 // ── Main fetch function ─────────────────────────────────────────
@@ -102,7 +121,18 @@ pub fn git_fetch(url: Str, tag: Str) -> Int {
     let cache_dir = path_join(path_join(path_join(home, ".blink"), "cache"), "git")
     let dep_dir = path_join(cache_dir, sanitized)
 
-    shell_exec("mkdir -p {dep_dir}")
+    match process.run("mkdir", ["-p", dep_dir]) {
+        Ok(r) => {
+            if !r.success() {
+                io.eprint(r.err_out)
+                return 1
+            }
+        }
+        Err(e) => {
+            io.eprintln("{e}")
+            return 1
+        }
+    }
 
     let clone_rc = ensure_bare_clone(url, dep_dir)
     if clone_rc != 0 {
