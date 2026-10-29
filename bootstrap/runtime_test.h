@@ -560,11 +560,44 @@ BLINK_UNUSED static void __blink_test_rec_printf(const char* fmt, ...) {
  * (a test name, a tag, a message, a path) reaches the report through this: one quote,
  * backslash or byte below 0x20 written raw makes the whole document unparseable. It
  * never cuts a string; a string copied into a fixed-size record buffer before it
- * reaches here can still be cut. */
+ * reaches here can still be cut, even inside a multi-byte char. A reader refuses a line
+ * that is not strict UTF-8, so a byte that does not start a whole, valid UTF-8 char
+ * goes out as U+FFFD. */
+BLINK_UNUSED static size_t __blink_test_utf8_char_len(const unsigned char* p) {
+    unsigned char c = p[0];
+    size_t n;
+    unsigned char lo = 0x80, hi = 0xBF;
+    if (c >= 0xC2 && c <= 0xDF) n = 2;
+    else if (c >= 0xE0 && c <= 0xEF) {
+        n = 3;
+        if (c == 0xE0) lo = 0xA0;
+        if (c == 0xED) hi = 0x9F;
+    } else if (c >= 0xF0 && c <= 0xF4) {
+        n = 4;
+        if (c == 0xF0) lo = 0x90;
+        if (c == 0xF4) hi = 0x8F;
+    } else return 0;
+    if (p[1] < lo || p[1] > hi) return 0;
+    for (size_t i = 2; i < n; i++) {
+        if (p[i] < 0x80 || p[i] > 0xBF) return 0;
+    }
+    return n;
+}
+
 BLINK_UNUSED static void __blink_test_print_json_str(const char* s) {
     __blink_test_rec_putc('"');
     for (const unsigned char* p = (const unsigned char*)(s ? s : ""); *p; p++) {
         unsigned char c = *p;
+        if (c >= 0x80) {
+            size_t n = __blink_test_utf8_char_len(p);
+            if (n == 0) {
+                __blink_test_rec_puts("\\ufffd");
+                continue;
+            }
+            for (size_t i = 0; i < n; i++) __blink_test_rec_putc((char)p[i]);
+            p += n - 1;
+            continue;
+        }
         if (c == '"' || c == '\\') { __blink_test_rec_putc('\\'); __blink_test_rec_putc((char)c); }
         else if (c == '\n') __blink_test_rec_puts("\\n");
         else if (c == '\r') __blink_test_rec_puts("\\r");
