@@ -1,0 +1,94 @@
+// A test binary that `blink test` runs with a limit is in its own process group, so a signal to
+// the runner's group does not reach it. The runner must send SIGTERM to every live binary when
+// it gets SIGINT or SIGTERM (sections/06_tooling.md §8.10.7, The runner stops its children).
+// A kill that the runner did not cause is not a limit end (A kill from outside is not a limit).
+//
+// The fixture binary writes its process id to a marker file and then waits forever. The test
+// waits for the marker with a bound, as the runner first builds the file.
+
+import std.process.{Child, ChildEnd, ChildLimits, ProcessResult, SIGTERM}
+import std.time.{Duration}
+
+let PACKAGE = "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n"
+
+// $PPID of the shell is the test binary. The rename makes the marker appear whole.
+let WAIT = "import std.time.\{Duration}\n\ntest \"waits\" \{\n    let m = env.var(\"BLINK_TEST_MARK\") ?? \"\"\n    let _ = process.run(\"sh\", [\"-c\", \"echo $PPID > \\\"$0.tmp\\\" && mv \\\"$0.tmp\\\" \\\"$0\\\"\", m])\n    while true \{\n        time.sleep(Duration.ms(50))\n    }\n}\n"
+
+fn sh(cmd: Str) -> ProcessResult {
+    process.run("sh", ["-c", cmd], limits: ChildLimits { timeout: Some(Duration.seconds(60)) }).unwrap()
+}
+
+fn project() -> Str {
+    let dir = sh("mktemp -d /tmp/blink_test_sigterm.XXXXXX").out.trim()
+    let _ = sh("mkdir -p {dir}/src {dir}/tests")
+    write_file("{dir}/blink.toml", PACKAGE)
+    // A lock no older than blink.toml keeps dependency resolution out of the command.
+    write_file("{dir}/blink.lock", "[metadata]\nlockfile-version = 1\n")
+    write_file("{dir}/tests/test_wait.bl", WAIT)
+    dir
+}
+
+// The process id in the marker, once the binary wrote it; -1 when it did not within ms.
+fn marked_pid(path: Str, ms: Int) -> Int {
+    let start = time.read()
+    while start.elapsed().to_ms() < ms {
+        if file_exists(path) == 1 {
+            return read_file(path).trim().to_int()
+        }
+        time.sleep(Duration.ms(50))
+    }
+    -1
+}
+
+fn alive(pid: Int) -> Bool {
+    sh("kill -0 {pid} 2>/dev/null").end == ChildEnd.Exited(0)
+}
+
+fn gone_within(pid: Int, ms: Int) -> Bool {
+    let start = time.read()
+    while start.elapsed().to_ms() < ms {
+        if !alive(pid) { return true }
+        time.sleep(Duration.ms(50))
+    }
+    false
+}
+
+// Starts `blink test --timeout 5m tests` in the project, so the binary waits on no limit of
+// this test. The timeout of the spawn ends a runner that never stops.
+fn start_runner(dir: Str, mark: Str) -> Child {
+    let cmd = "B=$(pwd)/build/blink; cd {dir} && exec env -u BLINK_PER_MODULE BLINK_BIN=$B BLINK_TEST_MARK={mark} $B test --verbose --timeout 5m tests"
+    process.spawn("sh", ["-c", cmd], limits: ChildLimits { timeout: Some(Duration.seconds(180)) }).unwrap()
+}
+
+test "SIGTERM to the runner ends the test binary it runs" {
+    let dir = project()
+    let mark = "{dir}/pid"
+    let runner = start_runner(dir, mark)
+    let pid = marked_pid(mark, 150000)
+    assert(pid > 0, "the test binary wrote no pid")
+    assert(alive(pid))
+    let _ = process.signal(runner, SIGTERM)
+    let r = process.wait(runner).unwrap()
+    let gone = gone_within(pid, 10000)
+    if !gone {
+        let _ = sh("kill -9 {pid}")
+    }
+    let _ = sh("rm -rf {dir}")
+    assert(gone, "the test binary outlived the runner")
+    assert_eq(r.end, ChildEnd.Signaled(SIGTERM), "stdout:\n{r.out}\nstderr:\n{r.err_out}")
+}
+
+test "a SIGKILL from outside is not a limit end" {
+    let dir = project()
+    let mark = "{dir}/pid"
+    let runner = start_runner(dir, mark)
+    let pid = marked_pid(mark, 150000)
+    assert(pid > 0, "the test binary wrote no pid")
+    let _ = sh("kill -9 {pid}")
+    let r = process.wait(runner).unwrap()
+    let _ = sh("rm -rf {dir}")
+    assert_eq(r.end, ChildEnd.Exited(1), "stdout:\n{r.out}\nstderr:\n{r.err_out}")
+    assert(!r.out.contains("ABORTED"), r.out)
+    assert(!r.out.contains("timed out"), r.out)
+    assert(r.out.contains("1 test files: 0 passed, 1 failed, 0 build errors"), r.out)
+}

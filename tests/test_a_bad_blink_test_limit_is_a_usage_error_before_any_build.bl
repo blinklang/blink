@@ -1,0 +1,103 @@
+// A bad value of --timeout, --memory, --processes or of [test] timeout in blink.toml is a usage
+// error (sections/06_tooling.md §8.10.7, Usage errors): `blink test` prints it on stderr, also
+// with --json, writes nothing on stdout, builds no file and exits 2. So is a memory or process
+// limit that the host cannot apply. The fixture lives under a fresh temporary directory, since
+// the test tree itself sits inside a project, and a missing build/ there shows that no build ran.
+
+import std.process.{ChildEnd, ChildLimits, LimitKind, ProcessResult}
+import std.time.{Duration}
+
+let PACKAGE = "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n"
+
+// A runner bug that hangs fails this test instead of the gate.
+fn sh(cmd: Str) -> ProcessResult {
+    process.run("sh", ["-c", cmd], limits: ChildLimits { timeout: Some(Duration.seconds(120)) }).unwrap()
+}
+
+fn project(toml: Str) -> Str {
+    let dir = sh("mktemp -d /tmp/blink_test_limit_usage.XXXXXX").out.trim()
+    let _ = sh("mkdir -p {dir}/src {dir}/tests")
+    write_file("{dir}/blink.toml", toml)
+    // A lock no older than blink.toml keeps dependency resolution out of the command.
+    write_file("{dir}/blink.lock", "[metadata]\nlockfile-version = 1\n")
+    write_file("{dir}/tests/test_x.bl", "test \"x\" \{\n    assert(1 == 1)\n}\n")
+    dir
+}
+
+// Runs `blink test <args>` in a fresh project and reports whether it left a build/ behind.
+fn blink_test(toml: Str, args: Str) -> (ProcessResult, Bool) {
+    let dir = project(toml)
+    // BLINK_BIN makes the build workers the compiler under test, not the blink on PATH.
+    let r = sh("B=$(pwd)/build/blink; cd {dir} && env -u BLINK_PER_MODULE BLINK_BIN=$B $B test {args}")
+    let built = sh("test -e {dir}/build").end == ChildEnd.Exited(0)
+    let _ = sh("rm -rf {dir}")
+    (r, built)
+}
+
+fn assert_usage_error(toml: Str, args: Str, stderr: Str) {
+    let (r, built) = blink_test(toml, args)
+    assert_eq(r.end, ChildEnd.Exited(2), "stdout:\n{r.out}\nstderr:\n{r.err_out}")
+    assert_eq(r.err_out, stderr)
+    assert_eq(r.out, "")
+    assert(!built, "a usage error built a file")
+}
+
+test "--timeout 0 is not a limit and names none as the way to turn it off" {
+    assert_usage_error(PACKAGE, "--timeout 0 tests", "error: --timeout 0: zero is not a limit\n  help: use none to turn the limit off\n")
+}
+
+test "--timeout 90 needs a unit" {
+    assert_usage_error(PACKAGE, "--timeout 90 tests", "error: --timeout 90: a duration needs a unit\n  help: write 90s, 90m or 90h; units are ms, s, m and h\n")
+}
+
+test "--memory 2048 needs a unit" {
+    assert_usage_error(PACKAGE, "--memory 2048 tests", "error: --memory 2048: a size needs a unit\n  help: write 2048K, 2048M or 2048G; units are K, M and G\n")
+}
+
+test "--processes 0 is not a limit" {
+    assert_usage_error(PACKAGE, "--processes 0 tests", "error: --processes 0: zero is not a limit\n  help: use none to turn the limit off\n")
+}
+
+test "each bad flag value gets its own error" {
+    assert_usage_error(PACKAGE, "--timeout 0 --processes x tests",
+        "error: --timeout 0: zero is not a limit\n  help: use none to turn the limit off\nerror: --processes x: not a count\n  help: write a whole number of 1 or more, such as 1024, or none to turn the limit off\n")
+}
+
+test "a usage error is text on stderr also with --json" {
+    assert_usage_error(PACKAGE, "--json --timeout 0 tests", "error: --timeout 0: zero is not a limit\n  help: use none to turn the limit off\n")
+}
+
+test "a usage error stops a run of one file before its build" {
+    assert_usage_error(PACKAGE, "--timeout 90 tests/test_x.bl", "error: --timeout 90: a duration needs a unit\n  help: write 90s, 90m or 90h; units are ms, s, m and h\n")
+}
+
+test "a [test] timeout that is not a string is an error at the value" {
+    assert_usage_error("{PACKAGE}[test]\ntimeout = 1800\n", "tests",
+        "error: [test] timeout: a duration needs a unit\n  --> blink.toml:6:11\n  |\n6 | timeout = 1800\n  |           ^^^^\n  help: write \"1800s\", \"30m\" or \"1h\"; units are ms, s, m and h\n")
+}
+
+test "a [test] timeout of zero is an error at the string" {
+    assert_usage_error("{PACKAGE}[test]\ntimeout = \"0s\"\n", "tests",
+        "error: [test] timeout: zero is not a limit\n  --> blink.toml:6:11\n  |\n6 | timeout = \"0s\"\n  |           ^^^^\n  help: use none to turn the limit off\n")
+}
+
+test "a bad [test] timeout is an error also when a flag sets the timeout" {
+    assert_usage_error("{PACKAGE}[test]\ntimeout = \"0s\"\n", "--timeout 5m tests",
+        "error: [test] timeout: zero is not a limit\n  --> blink.toml:6:11\n  |\n6 | timeout = \"0s\"\n  |           ^^^^\n  help: use none to turn the limit off\n")
+}
+
+test "a memory and a process limit that the host cannot apply are two usage errors" {
+    // The command runs in the cgroup of this test binary, so it gets the answer this binary gets.
+    if process.can_limit(LimitKind.Memory) || process.can_limit(LimitKind.Processes) {
+        io.println("skip: this session has a delegated cgroup v2, so the limits apply")
+        return
+    }
+    assert_usage_error(PACKAGE, "--memory 1G --processes 64 tests",
+        "error: --memory needs Linux with a delegated cgroup v2; this session has none\n  help: run under `systemd-run --user --scope -p Delegate=yes blink test ...`, or leave out --memory\nerror: --processes needs Linux with a delegated cgroup v2; this session has none\n  help: run under `systemd-run --user --scope -p Delegate=yes blink test ...`, or leave out --processes\n")
+}
+
+test "a limit set to none needs no host check and the run goes on" {
+    let (r, built) = blink_test(PACKAGE, "--memory none --processes none --timeout none tests")
+    assert_eq(r.end, ChildEnd.Exited(0), "stdout:\n{r.out}\nstderr:\n{r.err_out}")
+    assert(built)
+}

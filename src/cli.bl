@@ -13,12 +13,13 @@ import std.json.{
     json_new_array, json_push,
 }
 import std.path.{path_join, path_dirname, path_basename}
-import std.process.{ChildEnd}
+import std.process.{ChildEnd, ChildLimits, LimitKind}
+import std.time.{Duration}
 import pkg.audit.{audit_load_baseline, audit_check, audit_report}
 import pkg.lockfile.{lockfile_load}
 import pkg.manifest.{
     manifest_clear, manifest_load, manifest_has_dep, manifest_blink_version,
-    manifest_name,
+    manifest_name, manifest_print_warnings, manifest_test_timeout,
     manifest_native_dep_type, manifest_native_dep_link, manifest_native_dep_count,
     manifest_native_dep_name_at, manifest_native_dep_path, manifest_has_native_dep,
     validate_package_name,
@@ -72,11 +73,15 @@ import fix_edits.{FixEdit, fix_plan, fix_apply, fix_byte_offset}
 import foreign_const_probe.{ForeignConst, ProbeVerdict, foreign_const_header, foreign_consts_in, is_runtime_lib, report_undeclared_lib, probe_of, probe_verdicts, report_verdicts, text_verdict, triple_of_machine}
 import symbol_index.{collect_effects}
 import query.{query_index_source, query_answer}
+import limit_values.{
+    parse_limit_value, parse_key_limit_value, limit_flag_error, limit_key_error, limit_value_help,
+    limit_name, limit_end_line, limit_end_help, limit_unsupported_error, limit_unsupported_help,
+}
 import diagnostics.{
     Diag, DiagEntry, diag_entries, diag_prepend,
     diag_count, diag_warn_count, diag_ice_count, diag_flush, diag_mark_flushed, diag_reset, diag_entry_count,
     diag_source_file, diag_file_for_node, diag_error_no_loc, diag_format, diag_explain, diag_set_abort_status_line,
-    embedded_inner_key, diag_entry_text, diag_normalize_path, json_escape,
+    embedded_inner_key, diag_entry_text, diag_normalize_path, diag_usage_error_text, json_escape,
     MISSING_NATIVE_DEP, NATIVE_DEP_UNAVAILABLE_CROSS, INCOMPATIBLE_STDLIB_ARCHIVE,
 }
 import daemon.{Daemon, DaemonBuild, daemon_start, daemon_socket_path, daemon_send, daemon_proc_identity}
@@ -4423,6 +4428,8 @@ type TestFileResult {
     idx: Int
     built: Bool
     passed: Bool
+    // The limit that ended the binary, if one did.
+    limit: LimitKind?
     out: Str
     err_out: Str
 }
@@ -4460,6 +4467,148 @@ fn remove_test_scratch(dir: Str) ! IO, FS.Delete {
     }
 }
 
+// The timeout of a test binary when no flag and no [test] key sets one (§8.10.7).
+let DEFAULT_TEST_TIMEOUT_MS = 600000
+
+// The blink.toml of the project that holds the test path: the nearest one in the path or a
+// dir above it, else the one in the working directory. "" when there is none.
+fn test_manifest_path(test_path: Str) -> Str ! FS.Read {
+    let mut dir = "."
+    if test_path != "" {
+        dir = if is_dir(test_path) == 1 { test_path } else { path_dirname(test_path) }
+    }
+    while dir != "" && dir != "." && dir != "/" {
+        let m = path_join(dir, "blink.toml")
+        if file_exists(m) == 1 {
+            return m
+        }
+        dir = path_dirname(dir)
+    }
+    if file_exists("blink.toml") == 1 { "blink.toml" } else { "" }
+}
+
+// The value of a limit flag, in the base unit of its kind; None when the flag turns the limit
+// off. Err holds the usage error to print.
+fn test_limit_flag(text: Str, kind: LimitKind) -> Result[Int?, Str] {
+    match parse_limit_value(kind, text) {
+        Ok(v) => Ok(v)
+        Err(e) => Err("error: {limit_flag_error(kind, text, e)}\n  help: {limit_value_help(kind, e, false)}\n")
+    }
+}
+
+// The limits that `blink test` runs each test binary with (§8.10.7): a flag beats [test] in
+// blink.toml, which beats the default timeout. It reads blink.toml once, before any build. A bad
+// value, or a limit the host cannot apply, is a usage error: the text goes to stderr, also with
+// --json, nothing goes to stdout, and the command exits 2.
+fn test_run_limits(a: Args, test_path: Str) -> ChildLimits ! IO, FS.Read, Process.Spawn, Env.Exit {
+    let mut errors: List[Str] = []
+    let mut timeout: Option[Int] = Some(DEFAULT_TEST_TIMEOUT_MS)
+    let mut memory: Option[Int] = None
+    let mut processes: Option[Int] = None
+    let timeout_flag = args_get(a, "timeout")
+    let memory_flag = args_get(a, "memory")
+    let processes_flag = args_get(a, "processes")
+    if timeout_flag != "" {
+        match test_limit_flag(timeout_flag, LimitKind.Timeout) {
+            Ok(v) => { timeout = v }
+            Err(text) => errors.push(text)
+        }
+    }
+    if memory_flag != "" {
+        match test_limit_flag(memory_flag, LimitKind.Memory) {
+            Ok(v) => { memory = v }
+            Err(text) => errors.push(text)
+        }
+    }
+    if processes_flag != "" {
+        match test_limit_flag(processes_flag, LimitKind.Processes) {
+            Ok(v) => { processes = v }
+            Err(text) => errors.push(text)
+        }
+    }
+
+    // The key is checked also when the flag overrides it: a bad value in blink.toml is an error
+    // of the project, not of this run.
+    let manifest = test_manifest_path(test_path)
+    if manifest != "" {
+        manifest_clear()
+        let print_was = manifest_print_warnings
+        manifest_print_warnings = false
+        let load_rc = manifest_load(manifest)
+        manifest_print_warnings = print_was
+        let key = manifest_test_timeout
+        manifest_clear()
+        if load_rc == 0 {
+            match key {
+                Some(v) => {
+                    match parse_key_limit_value(LimitKind.Timeout, v.text, v.is_string) {
+                        Ok(ms) => {
+                            if timeout_flag == "" {
+                                timeout = ms
+                            }
+                        }
+                        Err(e) => {
+                            let s = v.span
+                            errors.push(diag_usage_error_text(limit_key_error(LimitKind.Timeout, e), manifest, s.line, s.col, s.end_line, s.end_col, limit_value_help(LimitKind.Timeout, e, true)))
+                        }
+                    }
+                }
+                None => {}
+            }
+        }
+    }
+    if errors.len() > 0 {
+        for text in errors {
+            io.eprint_raw(text)
+        }
+        env.exit(2)
+    }
+
+    // A timeout needs no host check: every host has one.
+    if memory.is_some() && !process.can_limit(LimitKind.Memory) {
+        errors.push(test_unsupported_limit_text(LimitKind.Memory))
+    }
+    if processes.is_some() && !process.can_limit(LimitKind.Processes) {
+        errors.push(test_unsupported_limit_text(LimitKind.Processes))
+    }
+    if errors.len() > 0 {
+        for text in errors {
+            io.eprint_raw(text)
+        }
+        env.exit(2)
+    }
+    let mut t: Option[Duration] = Option.None
+    if timeout.is_some() {
+        t = Some(Duration.ms(timeout.unwrap()))
+    }
+    ChildLimits { timeout: t, memory: memory, processes: processes }
+}
+
+fn test_unsupported_limit_text(kind: LimitKind) -> Str {
+    "error: {limit_unsupported_error(kind)}\n  help: {limit_unsupported_help(kind)}\n"
+}
+
+// The value of the limit of this kind in force, in the base unit of the kind, for the line that
+// reports a limit end. A limit that ended a binary was in force.
+fn test_limit_value(limits: ChildLimits, kind: LimitKind) -> Int {
+    match kind {
+        LimitKind.Timeout => {
+            match limits.timeout {
+                Some(d) => d.to_ms()
+                _ => 0
+            }
+        }
+        LimitKind.Memory => limits.memory ?? 0
+        LimitKind.Processes => limits.processes ?? 0
+    }
+}
+
+// The human block for a binary that a limit ended (§8.10.7). The runner does not know the test
+// that ran, so the line ends after the limit.
+fn test_aborted_text(file: Str, kind: LimitKind, limits: ChildLimits) -> Str {
+    "ABORTED {file}\n  {limit_end_line(kind, test_limit_value(limits, kind), None)}\n  help: {limit_end_help(kind)}"
+}
+
 fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit, Codegen, IO, FS.Read, FS.Write, Process.Spawn, FS.Delete, Env.Exit {
     let bad_format = build_format_usage_error(a)
     if bad_format != "" {
@@ -4485,6 +4634,7 @@ fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
     }
     let targets = args_get_all(a, "target")
     let unit_jobs = unit_jobs_from_args(a)
+    let limits = test_run_limits(a, source_path)
 
     ensure_deps_resolved()
     // A forced rebuild compiles the stdlib in process ahead of the program. It lands in
@@ -4519,23 +4669,62 @@ fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
         if rc != 0 {
             env.exit(1)
         }
-        let mut run_cmd = output_path
-        if filter_pattern != "" {
-            run_cmd = "{run_cmd} --test-filter \"{filter_pattern}\""
-        }
-        if json_output != 0 {
-            run_cmd = "{run_cmd} --test-json"
-        }
-        if tags_filter != "" {
-            run_cmd = "{run_cmd} --test-tags \"{tags_filter}\""
-        }
         // A test reads the null device, never the terminal that started the runner (spec: blink test).
         let scratch = test_scratch_dir(0)
         remove_test_scratch(scratch)
-        let quoted = scratch.replace("'", "'\\''")
-        let test_rc = build_fs.run_shell("BLINK_TEST_SCRATCH_DIR='{quoted}' {run_cmd} < /dev/null")
+        let mut targv = ["-c", "BLINK_TEST_SCRATCH_DIR=\"$1\"; export BLINK_TEST_SCRATCH_DIR; shift; exec \"$0\" \"$@\" < /dev/null", output_path, scratch]
+        if filter_pattern != "" {
+            targv.push("--test-filter")
+            targv.push(filter_pattern)
+        }
+        if json_output != 0 {
+            targv.push("--test-json")
+        }
+        if tags_filter != "" {
+            targv.push("--test-tags")
+            targv.push(tags_filter)
+        }
+        // A child with a limit runs in its own process group, out of reach of a terminal
+        // Ctrl-C, so the runner must pass SIGINT and SIGTERM on to it.
+        process_install_signal_forwarding()
+        let ran = match process.spawn("/bin/sh", targv, limits: limits) {
+            Ok(child) => process.wait(child)
+            Err(e) => Err(e)
+        }
         remove_test_scratch(scratch)
-        env.exit(test_rc)
+        match ran {
+            Ok(r) => {
+                match r.end {
+                    ChildEnd.Limit(kind) => {
+                        // A binary that a limit ended wrote part of its report, which is no
+                        // valid JSON, so --json gets the error of the file instead.
+                        if json_output != 0 {
+                            io.eprint_raw(r.err_out)
+                            io.println("\{\"file\":\"{json_escape(source_path)}\",\"error\":\"{json_escape(limit_end_line(kind, test_limit_value(limits, kind), None))}\"}")
+                        } else {
+                            io.print_raw(r.out)
+                            io.eprint_raw(r.err_out)
+                            io.println(test_aborted_text(source_path, kind, limits))
+                        }
+                        env.exit(1)
+                    }
+                    ChildEnd.Exited(code) => {
+                        io.print_raw(r.out)
+                        io.eprint_raw(r.err_out)
+                        env.exit(code)
+                    }
+                    ChildEnd.Signaled(sig) => {
+                        io.print_raw(r.out)
+                        io.eprint_raw(r.err_out)
+                        env.exit(128 + sig)
+                    }
+                }
+            }
+            Err(e) => {
+                io.eprintln("error: {e}")
+                env.exit(1)
+            }
+        }
     }
 
     let mut test_dir = "."
@@ -4653,10 +4842,12 @@ fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
     let mut passes: List[Bool] = []
     let mut outputs: List[Str] = []
     let mut errors: List[Str] = []
+    let mut limit_ends: List[LimitKind?] = []
     let mut pi = 0
     while pi < file_count {
         states.push(TEST_FILE_PENDING)
         passes.push(false)
+        limit_ends.push(None)
         outputs.push("")
         errors.push("")
         pi = pi + 1
@@ -4715,7 +4906,7 @@ fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
                             err_text = build_err
                         }
                     }
-                    results.send(TestFileResult { idx: idx, built: false, passed: false, out: "", err_out: err_text })
+                    results.send(TestFileResult { idx: idx, built: false, passed: false, limit: None, out: "", err_out: err_text })
                     if dots != 0 {
                         // One recv through a loop that stops after it: that spelling reads the
                         // same whether the pinned compiler types recv as the element or as an
@@ -4741,17 +4932,23 @@ fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
                 remove_test_scratch(scratch)
                 let mut targv = ["-c", "BLINK_TEST_SCRATCH_DIR=\"$1\"; export BLINK_TEST_SCRATCH_DIR; shift; exec \"$0\" \"$@\" < /dev/null", bin_path, scratch]
                 for arg in rcmd { targv.push(arg) }
-                let ran = match process.spawn("/bin/sh", targv) {
+                let ran = match process.spawn("/bin/sh", targv, limits: limits) {
                     Ok(child) => process.wait(child)
                     Err(e) => Err(e)
                 }
                 remove_test_scratch(scratch)
                 // A binary that could not start or be waited for failed, and the error says why.
-                let (run_ok, run_out, run_err) = match ran {
-                    Ok(rr) => (rr.success(), rr.out, rr.err_out)
-                    Err(e) => (false, "", "{e}")
+                let (run_ok, run_limit, run_out, run_err) = match ran {
+                    Ok(rr) => {
+                        let lim = match rr.end {
+                            ChildEnd.Limit(kind) => Some(kind)
+                            _ => Option.None
+                        }
+                        (rr.success() && lim.is_none(), lim, rr.out, rr.err_out)
+                    }
+                    Err(e) => (false, Option.None, "", "{e}")
                 }
-                results.send(TestFileResult { idx: idx, built: true, passed: run_ok, out: run_out, err_out: run_err })
+                results.send(TestFileResult { idx: idx, built: true, passed: run_ok, limit: run_limit, out: run_out, err_out: run_err })
                 if dots != 0 {
                     for col in dot_ch {
                         if !run_ok {
@@ -4780,6 +4977,7 @@ fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
     for r in results {
         states.set(r.idx, if r.built { TEST_FILE_RAN } else { TEST_FILE_BUILD_FAILED })
         passes.set(r.idx, r.passed)
+        limit_ends.set(r.idx, r.limit)
         outputs.set(r.idx, r.out)
         errors.set(r.idx, r.err_out)
     }
@@ -4792,6 +4990,7 @@ fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
     let mut total_failed = 0
     let mut total_errors = 0
     let mut total_lost = 0
+    let mut total_aborted = 0
 
     if json_output != 0 {
         io.println("\{\"files\":[")
@@ -4830,6 +5029,27 @@ fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
                 let err_msg = errors.get(ri).unwrap()
                 if err_msg != "" {
                     io.println(err_msg)
+                }
+                io.println("")
+            }
+        } else if limit_ends.get(ri).unwrap().is_some() {
+            let kind = limit_ends.get(ri).unwrap().unwrap()
+            total_aborted = total_aborted + 1
+            if json_output != 0 {
+                if json_first == 0 {
+                    io.println(",")
+                }
+                json_first = 0
+                io.println("\{\"file\":\"{json_escape(tf)}\",\"error\":\"{json_escape(limit_end_line(kind, test_limit_value(limits, kind), None))}\"}")
+            } else {
+                io.println(test_aborted_text(tf, kind, limits))
+                let out = outputs.get(ri).unwrap()
+                if out != "" {
+                    io.println(out)
+                }
+                let err_out = errors.get(ri).unwrap()
+                if err_out != "" {
+                    io.println(err_out)
                 }
                 io.println("")
             }
@@ -4876,7 +5096,8 @@ fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
     }
 
     if json_output != 0 {
-        io.println("],\"summary\":\{\"files\":{file_count},\"files_passed\":{total_passed},\"files_failed\":{total_failed},\"build_errors\":{total_errors}}}")
+        // This JSON has no aborted count, so a file that a limit ended counts as failed.
+        io.println("],\"summary\":\{\"files\":{file_count},\"files_passed\":{total_passed},\"files_failed\":{total_failed + total_aborted},\"build_errors\":{total_errors}}}")
     } else {
         if quiet == 0 && dots == 0 {
             io.println("========================================")
@@ -4887,10 +5108,11 @@ fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
         } else if total_lost > 1 {
             lost_clause = ", {total_lost} internal errors"
         }
-        io.println("{file_count} test files: {total_passed} passed, {total_failed} failed, {total_errors} build errors{lost_clause}")
+        let aborted_clause = if total_aborted > 0 { ", {total_aborted} aborted" } else { "" }
+        io.println("{file_count} test files: {total_passed} passed, {total_failed} failed, {total_errors} build errors{aborted_clause}{lost_clause}")
     }
 
-    if total_failed > 0 || total_errors > 0 || total_lost > 0 {
+    if total_failed > 0 || total_errors > 0 || total_lost > 0 || total_aborted > 0 {
         env.exit(1)
     }
 }
@@ -6594,6 +6816,9 @@ fn cli_parser() -> ArgParser {
     p = command_add_option(p, "test", "--filter", "", "Test filter pattern")
     p = command_add_option(p, "test", "--tags", "", "Test tags filter")
     p = command_add_option(p, "test", "--parallel", "-P", "Parallel workers (default: 4)")
+    p = command_add_option(p, "test", "--timeout", "", "Time limit for each test binary, such as 90s or 30m; none turns it off (default: 10m, or [test] timeout in blink.toml)")
+    p = command_add_option(p, "test", "--memory", "", "Memory limit for each test binary, such as 512M or 2G; none turns it off (default: none)")
+    p = command_add_option(p, "test", "--processes", "", "Process limit for each test binary, such as 1024; none turns it off (default: none)")
 
     p = command_add_option(p, "audit", "--baseline", "", "Audit baseline path")
     p = command_add_flag(p, "audit", "--json", "-j", "JSON output")
