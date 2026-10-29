@@ -791,6 +791,11 @@ static int blink_limits_poll_ms(int64_t stop_at) {
  * thread for the loop and a SIGPIPE the loop raised is taken back, so no other thread's
  * signal disposition changes. At stop_at (blink_limits_now time; < 0 for never) the loop
  * stops without end of file and keeps what it read. */
+/* Past stop_at the loop still takes all that is in the pipes, up to this many bytes, so a
+ * wait that comes late keeps what the child wrote before it ended. Two full pipes at the
+ * Linux maximum size fit; a grandchild that writes on and on stops the loop here. */
+#define BLINK_PUMP_DRAIN_BYTES (2 * 1024 * 1024LL)
+
 static void blink_child_pump(int in_fd, const char* in_data, int64_t in_len,
                              int out_fd, int err_fd, char** out, char** err, int64_t stop_at) {
     sigset_t pipe_set, old_mask, pending;
@@ -811,6 +816,8 @@ static void blink_child_pump(int in_fd, const char* in_data, int64_t in_len,
     int64_t cap_o = 4096, len_o = 0, cap_e = 4096, len_e = 0;
     char* buf_o = (char*)blink_alloc_atomic(cap_o);
     char* buf_e = (char*)blink_alloc_atomic(cap_e);
+    int last = 0;
+    int64_t drain_end = 0;
     while (open_in || open_out || open_err) {
         struct pollfd pfds[3];
         int n = 0;
@@ -820,10 +827,11 @@ static void blink_child_pump(int in_fd, const char* in_data, int64_t in_len,
         if (open_in) { pfds[n].fd = in_fd; pfds[n].events = POLLOUT; pfds[n].revents = 0; p_in = &pfds[n]; n++; }
         if (open_out) { pfds[n].fd = out_fd; pfds[n].events = POLLIN; pfds[n].revents = 0; p_out = &pfds[n]; n++; }
         if (open_err) { pfds[n].fd = err_fd; pfds[n].events = POLLIN; pfds[n].revents = 0; p_err = &pfds[n]; n++; }
-        /* Past stop_at one last pass takes what is ready, so a grandchild that writes on
-         * and on cannot keep the loop going. */
-        int poll_ms = blink_limits_poll_ms(stop_at);
-        int last = poll_ms == 0;
+        int poll_ms = last ? 0 : blink_limits_poll_ms(stop_at);
+        if (poll_ms == 0 && !last) {
+            last = 1;
+            drain_end = len_o + len_e + BLINK_PUMP_DRAIN_BYTES;
+        }
         int pr = poll(pfds, (nfds_t)n, poll_ms);
         if (pr < 0) { if (errno == EINTR) continue; break; }
         if (pr == 0) break;
@@ -839,7 +847,7 @@ static void blink_child_pump(int in_fd, const char* in_data, int64_t in_len,
         }
         blink_pump_fd(out_fd, &open_out, p_out, &buf_o, &cap_o, &len_o);
         blink_pump_fd(err_fd, &open_err, p_err, &buf_e, &cap_e, &len_e);
-        if (last) break;
+        if (last && len_o + len_e >= drain_end) break;
     }
     if (open_in) close(in_fd);
     if (open_out) close(out_fd);

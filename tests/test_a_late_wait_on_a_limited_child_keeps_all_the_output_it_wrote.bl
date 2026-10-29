@@ -1,0 +1,64 @@
+// From the deadline on, wait takes one last look at the pipes and returns, so a grandchild
+// that writes on and on cannot hold it. That look must still take all that the child wrote
+// before it ended: the pipe holds it, and a wait that comes late must not change the result
+// (sections/04_effects.md §4.4.8 A deadline holds whether or not anyone waits). Each child
+// writes 50000 bytes, more than one read takes, and the wait comes after timeout + grace.
+
+import compile_test_helpers
+import std.process.{ChildEnd, ChildLimits, LimitKind}
+import std.time.{Duration}
+
+fn lim() -> ChildLimits {
+    ChildLimits { timeout: Some(Duration.ms(200)), grace: Duration.nanos(0) }
+}
+
+fn big_write() -> Str {
+    "head -c 50000 /dev/zero | tr '\\0' x"
+}
+
+test "a late wait on a child that exited before its deadline keeps all its output" {
+    let child = process.spawn("sh", ["-c", big_write()], limits: lim()).unwrap()
+    let _ = process.run("sleep", ["1.5"]).unwrap()
+    let r = process.wait(child).unwrap()
+    assert_eq(r.end, ChildEnd.Exited(0))
+    assert_eq(r.out.len(), 50000)
+}
+
+test "a late wait on a child that its deadline ended keeps all it wrote before" {
+    let child = process.spawn("sh", ["-c", "{big_write()}; sleep 30"], limits: lim()).unwrap()
+    let _ = process.run("sleep", ["1.5"]).unwrap()
+    let r = process.wait(child).unwrap()
+    assert_eq(r.end, ChildEnd.Limit(LimitKind.Timeout))
+    assert_eq(r.out.len(), 50000)
+}
+
+test "a late wait keeps all a child wrote to stderr" {
+    let child = process.spawn("sh", ["-c", "{big_write()} >&2"], limits: lim()).unwrap()
+    let _ = process.run("sleep", ["1.5"]).unwrap()
+    let r = process.wait(child).unwrap()
+    assert_eq(r.end, ChildEnd.Exited(0))
+    assert_eq(r.err_out.len(), 50000)
+}
+
+// setsid puts the writer out of reach of the group signal, and it writes without end. The
+// last look takes a bounded amount, so the wait still returns.
+test "a grandchild that writes without end does not hold a late wait" {
+    if !process.run("sh", ["-c", "command -v setsid"]).unwrap().success() {
+        return
+    }
+    let dir = "{compile_test_helpers.scratch_root()}/_late_wait_writer"
+    shell_exec("rm -rf {dir}")
+    shell_exec("mkdir -p {dir}")
+    let pid_file = "{dir}/pid"
+    let script = "setsid sh -c 'echo $$ > \"$0\"; exec yes' \"$0\" & exit 0"
+    let child = process.spawn("sh", ["-c", script, pid_file], limits: lim()).unwrap()
+    let _ = process.run("sleep", ["1.5"]).unwrap()
+    let start = time.read()
+    let r = process.wait(child).unwrap()
+    let ms = start.elapsed().to_ms()
+    let _ = process.run("sh", ["-c", "kill -9 $(cat \"$0\")", pid_file])
+    shell_exec("rm -rf {dir}")
+    assert_eq(r.end, ChildEnd.Exited(0))
+    assert(r.out.len() > 0, "the wait read nothing")
+    assert(ms < 10000, "the wait took {ms} ms")
+}
