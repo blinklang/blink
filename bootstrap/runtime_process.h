@@ -1164,8 +1164,10 @@ static void blink_cg_check(void) {
     char* ctl = blink_cg_slurp(path);
     if (ctl == NULL) return;
     /* memory.swap.max: the kernel counts swap, so the child cannot pass its limit through it.
+     * memory.events.local: the kernel tells this cgroup's own limit apart from one below it.
      * pids.events.local: the kernel tells this cgroup's own refused forks apart. */
-    blink_cg.memory_ok = blink_cg_has_word(ctl, "memory") && blink_cg_exists(dir, "memory.swap.max", F_OK);
+    blink_cg.memory_ok = blink_cg_has_word(ctl, "memory") && blink_cg_exists(dir, "memory.swap.max", F_OK)
+        && blink_cg_exists(dir, "memory.events.local", F_OK);
     blink_cg.pids_ok = blink_cg_has_word(ctl, "pids") && blink_cg_exists(dir, "pids.events.local", F_OK);
     free(ctl);
     memcpy(blink_cg.dir, dir, sizeof(dir));
@@ -1192,6 +1194,9 @@ static int blink_cg_move_now(void) {
         : (blink_cg.memory_ok ? "+memory" : "+pids");
     pid_t self = getpid();
     for (int round = 0; round < 100; round++) {
+        /* All or nothing: a process that is not ours, found half way, would leave this
+         * program in the leaf with the controllers off. */
+        if (!blink_cg_all_ours(blink_cg.dir)) return EBUSY;
         char* procs = blink_cg_slurp(d_procs);
         if (procs == NULL) return errno;
         int moved = 0;
@@ -1241,6 +1246,10 @@ static int blink_cg_watch(const char* cg, const char* file) {
  * cgroup itself for clone3, and its cgroup.procs for a host with no clone3. -1 is no
  * limit. 0, else the errno, and then no cgroup is left. Caller holds blink_limits.mu. */
 static int blink_cg_child_make(int64_t memory, int64_t processes, char** cg_out, int* dir_fd, int* procs_fd) {
+    if ((memory >= 0 && !blink_cg_supported(blink_LimitKind_Memory))
+        || (processes >= 0 && !blink_cg_supported(blink_LimitKind_Processes))) {
+        return ENOTSUP;
+    }
     int e = blink_cg_move_locked();
     if (e != 0) return e;
     if (blink_cg.ino_fd < 0) {
@@ -1312,10 +1321,33 @@ static void blink_cg_kill(blink_limit_rec* rec) {
 }
 
 /* The kernel ended a process of this cgroup at its memory limit. oom alone counts each time
- * the limit was reached; oom_kill alone also counts a kill for the memory of the whole host. */
+ * the limit was reached; oom_kill alone also counts a kill for the memory of the whole host.
+ * The oom is the local one, as memory.events also counts the limit of a cgroup below this
+ * one (a limited child that is a Blink program makes its own); the kill is not, as with
+ * memory.oom.group the victims may sit in such a cgroup. */
 static int blink_cg_memory_hit(const blink_limit_rec* rec) {
-    return rec->cg_memory && blink_cg_count(rec->cg, "memory.events", "oom") > 0
+    return rec->cg_memory && blink_cg_count(rec->cg, "memory.events.local", "oom") > 0
         && blink_cg_count(rec->cg, "memory.events", "oom_kill") > 0;
+}
+
+/* Removes cg, and first each cgroup below it: a child may make its own, as a limited child
+ * that is a Blink program does. 0, else the errno of cg, which stays while a process holds
+ * it or a cgroup below it. */
+static int blink_cg_remove_tree(const char* cg, int depth) {
+    DIR* dir = depth < 64 ? opendir(cg) : NULL;
+    if (dir != NULL) {
+        char path[BLINK_CG_PATH];
+        struct dirent* ent;
+        while ((ent = readdir(dir)) != NULL) {
+            if (ent->d_name[0] == '.') continue;
+            struct stat st;
+            if (fstatat(dirfd(dir), ent->d_name, &st, 0) != 0 || !S_ISDIR(st.st_mode)) continue;
+            if (snprintf(path, sizeof(path), "%s/%s", cg, ent->d_name) >= (int)sizeof(path)) continue;
+            blink_cg_remove_tree(path, depth + 1);
+        }
+        closedir(dir);
+    }
+    return rmdir(cg) == 0 || errno == ENOENT ? 0 : errno;
 }
 
 /* A record whose run or wait is done: its cgroup goes too, or waits in the left list while
@@ -1323,7 +1355,7 @@ static int blink_cg_memory_hit(const blink_limit_rec* rec) {
  * blink_limits.mu. */
 static void blink_cg_release_locked(blink_limit_rec* rec) {
     if (rec->cg == NULL) return;
-    if (rmdir(rec->cg) == 0 || errno == ENOENT) {
+    if (blink_cg_remove_tree(rec->cg, 0) == 0) {
         free(rec->cg);
     } else {
         blink_cg_left* left = (blink_cg_left*)malloc(sizeof(blink_cg_left));
@@ -1344,7 +1376,7 @@ static void blink_cg_left_locked(void) {
     blink_cg_left** at = &blink_cg.left;
     while (*at != NULL) {
         blink_cg_left* left = *at;
-        if (rmdir(left->path) == 0 || errno == ENOENT) {
+        if (blink_cg_remove_tree(left->path, 0) == 0) {
             *at = left->next;
             free(left->path);
             free(left);
@@ -1557,8 +1589,9 @@ struct blink_clone_args {
 #endif
 
 /* fork, or on Linux with cg_fd >= 0 a clone3 that starts the child in that cgroup, so not
- * one instruction of it runs outside. A kernel with no clone3 gets a plain fork, and the
- * child moves itself before it does anything else (see blink_limits_fork_locked). */
+ * one instruction of it runs outside. A kernel with no clone3, or a seccomp filter that
+ * refuses it with EPERM (some container runtimes), gets a plain fork, and the child moves
+ * itself before it does anything else (see blink_limits_fork_locked). */
 static pid_t blink_limits_fork(int cg_fd) {
 #if defined(__linux__)
     if (cg_fd >= 0) {
@@ -1568,7 +1601,7 @@ static pid_t blink_limits_fork(int cg_fd) {
         args.exit_signal = SIGCHLD;
         args.cgroup = (uint64_t)cg_fd;
         long r = syscall(BLINK_SYS_CLONE3, &args, sizeof(args));
-        if (r >= 0 || errno != ENOSYS) return (pid_t)r;
+        if (r >= 0 || (errno != ENOSYS && errno != EPERM)) return (pid_t)r;
     }
 #else
     (void)cg_fd;
@@ -1781,6 +1814,16 @@ static void blink_limits_reraise(int sig) {
 static void blink_limits_at_exit(void) {
     pthread_mutex_lock(&blink_limits.mu);
     blink_limits_end_locked();
+#if defined(__linux__)
+    /* The tick that removes the cgroup of a released record, or of a left one, may not come
+     * before the program ends. The record stays: no thread frees it from here on. */
+    for (blink_limit_rec* rec = blink_limits.recs; rec != NULL; rec = rec->next) {
+        pthread_mutex_lock(&rec->mu);
+        if (rec->released) blink_cg_release_locked(rec);
+        pthread_mutex_unlock(&rec->mu);
+    }
+    blink_cg_left_locked();
+#endif
     int sig = blink_limits.pending_sig;
     if (sig != 0) blink_limits_reraise(sig);
     pthread_mutex_unlock(&blink_limits.mu);

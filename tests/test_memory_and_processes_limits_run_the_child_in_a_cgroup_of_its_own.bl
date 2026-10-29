@@ -135,6 +135,23 @@ fn helper_program() -> Str {
         #"            show("timeout", process.run("true", [], limits: ChildLimits { timeout: Some(Duration.seconds(10)) }))"#,
         #"            let _ = process.run("kill", [orphan])"#,
         #"        }"#,
+        #"        "inner" => {"#,
+        #"            show("inner", process.run(me, ["hog"], limits: ChildLimits { memory: Some(mb(64)), timeout: Some(Duration.seconds(60)) }))"#,
+        #"            // Runs on a while, so the outer program reads the events of its child's cgroup"#,
+        #"            // before this one ends."#,
+        #"            time.sleep(Duration.ms(500))"#,
+        #"        }"#,
+        #"        "nested" => {"#,
+        #"            // A limited child that is itself a program with a memory limit of its own."#,
+        #"            let r = process.run(me, ["inner"], limits: ChildLimits { memory: Some(mb(400)), timeout: Some(Duration.seconds(60)) }).unwrap()"#,
+        #"            io.println("nested end {r.end}")"#,
+        #"            io.print(r.out)"#,
+        #"            io.println("gone {gone_within(d, 5000)}")"#,
+        #"        }"#,
+        #"        "quick" => {"#,
+        #"            show("true", process.run("true", [], limits: ChildLimits { memory: Some(mb(64)) }))"#,
+        #"            io.println("d {d}")"#,
+        #"        }"#,
         #"        "first" => {"#,
         #"            // The child ignores the SIGTERM of its deadline, then passes its memory limit."#,
         #"            let script = "trap '' TERM; sleep 1; x=$(head -c 512M /dev/zero | tr '\\000' a); echo done""#,
@@ -194,10 +211,25 @@ fn scope_args(unit: Str) -> List[Str] {
     ["--user", "--scope", "--quiet", "--collect", "-p", "Delegate=yes", "-p", "MemoryMax=512M", "-p", "TasksMax=256", "--slice=blink-gates.slice", "--unit", unit]
 }
 
-// The reason a delegated scope cannot start here, or "" when one can.
-fn scope_problem() -> Str {
-    match process.run("systemd-run", scope_args("blink-cgtest-{getpid()}-probe").append(["true"]), limits: ChildLimits { timeout: Some(Duration.seconds(60)) }) {
-        Ok(r) => if r.success() { "" } else { "systemd-run cannot start a delegated scope here ({r.end}): {r.err_out.trim()}" }
+// The reason this host cannot give a test a delegated cgroup v2 with the memory and pids
+// controllers, or "" when it can. Any other failure of the probe scope fails the test.
+fn scope_problem(tag: Str) -> Str {
+    let unit = "blink-cgtest-{getpid()}-{tag}-probe"
+    let script = "cat \"/sys/fs/cgroup$(cut -d: -f3- /proc/self/cgroup)/cgroup.controllers\""
+    let r = scope_run(unit, ["sh", "-c", script])
+    end_scope(unit)
+    match r {
+        Ok(p) => {
+            if p.err_out.contains("Failed to connect") {
+                return "no user systemd manager here: {p.err_out.trim()}"
+            }
+            assert_eq(p.end, ChildEnd.Exited(0), "systemd-run cannot start a delegated scope: {p.err_out.trim()}")
+            let words = p.out.trim().split(" ")
+            if !words.contains("memory") || !words.contains("pids") {
+                return "a delegated scope here has no memory and pids controllers: [{p.out.trim()}]"
+            }
+            ""
+        }
         Err(e) => "systemd-run cannot run here: {e}"
     }
 }
@@ -223,7 +255,9 @@ fn helper_lines(mode: Str, r: Result[ProcessResult, ProcessError]) -> List[Str] 
 // through `sh -c` that stays in the scope, so the scope holds a process the helper did not start.
 fn run_in_scope(mode: Str, wrap: Bool) -> List[Str] {
     let bin = helper_bin()
-    let unit = "blink-cgtest-{getpid()}-{mode}"
+    // Each scope in one test process has a name of its own, as systemd keeps a stopped
+    // unit loaded for a short time and refuses its name meanwhile.
+    let unit = if wrap { "blink-cgtest-{getpid()}-{mode}-wrap" } else { "blink-cgtest-{getpid()}-{mode}" }
     let cmd = if wrap { ["sh", "-c", "\"$0\" \"$1\"; true", bin, mode] } else { [bin, mode] }
     let r = scope_run(unit, cmd)
     end_scope(unit)
@@ -238,7 +272,7 @@ fn mark_file(mode: Str) -> Str {
 }
 
 test "can_limit is true for memory and processes in a delegated cgroup, and moves nothing" {
-    let why = scope_problem()
+    let why = scope_problem("can")
     if why != "" {
         skip(why)
     }
@@ -246,7 +280,7 @@ test "can_limit is true for memory and processes in a delegated cgroup, and move
 }
 
 test "can_limit is false when the cgroup holds a process that this program did not start" {
-    let why = scope_problem()
+    let why = scope_problem("can-wrap")
     if why != "" {
         skip(why)
     }
@@ -254,7 +288,7 @@ test "can_limit is false when the cgroup holds a process that this program did n
 }
 
 test "a memory or processes child runs in a cgroup of its own, and this program moves to a leaf" {
-    let why = scope_problem()
+    let why = scope_problem("where")
     if why != "" {
         skip(why)
     }
@@ -272,7 +306,7 @@ test "a memory or processes child runs in a cgroup of its own, and this program 
 }
 
 test "a child past its memory limit ends as Limit(Memory) and its cgroup goes" {
-    let why = scope_problem()
+    let why = scope_problem("memory")
     if why != "" {
         skip(why)
     }
@@ -280,7 +314,7 @@ test "a child past its memory limit ends as Limit(Memory) and its cgroup goes" {
 }
 
 test "a child that keeps forking past its processes limit ends as Limit(Processes) and its cgroup goes" {
-    let why = scope_problem()
+    let why = scope_problem("processes")
     if why != "" {
         skip(why)
     }
@@ -288,7 +322,7 @@ test "a child that keeps forking past its processes limit ends as Limit(Processe
 }
 
 test "a child under its memory and processes limits ends with its own exit code" {
-    let why = scope_problem()
+    let why = scope_problem("under")
     if why != "" {
         skip(why)
     }
@@ -296,7 +330,7 @@ test "a child under its memory and processes limits ends with its own exit code"
 }
 
 test "the cgroup of a child goes after its reap, or when a grandchild that holds it ends" {
-    let why = scope_problem()
+    let why = scope_problem("removed")
     if why != "" {
         skip(why)
     }
@@ -310,7 +344,7 @@ test "the cgroup of a child goes after its reap, or when a grandchild that holds
 }
 
 test "an unlimited child that runs at the move goes into the leaf with this program" {
-    let why = scope_problem()
+    let why = scope_problem("unlimited")
     if why != "" {
         skip(why)
     }
@@ -319,7 +353,7 @@ test "an unlimited child that runs at the move goes into the leaf with this prog
 
 // EBUSY is 16 on Linux, the only host where a delegated scope starts.
 test "a move that a process of another program blocks gives its errno, and each later run the same" {
-    let why = scope_problem()
+    let why = scope_problem("busy")
     if why != "" {
         skip(why)
     }
@@ -332,7 +366,7 @@ test "a move that a process of another program blocks gives its errno, and each 
 }
 
 test "the first limit that a child passes is its end, also when it passes another before its reap" {
-    let why = scope_problem()
+    let why = scope_problem("first")
     if why != "" {
         skip(why)
     }
@@ -342,7 +376,7 @@ test "the first limit that a child passes is its end, also when it passes anothe
 }
 
 test "the SIGTERM of a deadline reaches a grandchild that left the process group of the child" {
-    let why = scope_problem()
+    let why = scope_problem("signal")
     if why != "" {
         skip(why)
     }
@@ -355,7 +389,7 @@ test "the SIGTERM of a deadline reaches a grandchild that left the process group
 }
 
 test "at program exit a grandchild that left the process group of a limited child ends too" {
-    let why = scope_problem()
+    let why = scope_problem("exit")
     if why != "" {
         skip(why)
     }
@@ -369,4 +403,29 @@ test "at program exit a grandchild that left the process group of a limited chil
     end_scope(unit)
     assert_eq(helper_lines("exit", r), ["pid {pid}"])
     assert(state == "" || state.starts_with("Z"), "grandchild {pid} outlived the program: state {state}")
+}
+
+test "a memory limit that a limited child sets on its own child is not the limit of the outer child" {
+    let why = scope_problem("nested")
+    if why != "" {
+        skip(why)
+    }
+    assert_eq(run_in_scope("nested", false), ["nested end exit 0", "inner end limit memory", "gone true"])
+}
+
+test "the cgroup of a reaped child does not outlive this program" {
+    let why = scope_problem("quick")
+    if why != "" {
+        skip(why)
+    }
+    let bin = helper_bin()
+    let unit = "blink-cgtest-{getpid()}-quick"
+    let r = scope_run(unit, [bin, "quick"])
+    let lines = helper_lines("quick", r)
+    let d = if lines.len() == 2 { lines.get(1).unwrap().replace("d ", "") } else { "" }
+    // Read before end_scope, which ends what the scope holds but leaves its dirs.
+    let left = process.run("sh", ["-c", "cd \"/sys/fs/cgroup$0\" && for x in blink.child.*; do [ -d \"$x\" ] && printf '%s ' \"$x\"; done; true", d]).unwrap().out.trim()
+    end_scope(unit)
+    assert_eq(lines, ["true end exit 0", "d {d}"])
+    assert_eq(left, "")
 }
