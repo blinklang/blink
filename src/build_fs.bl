@@ -428,11 +428,19 @@ let mut bfs_cpu_count: Int = 0
 pub fn cpu_count() -> Int ! IO, FS.Read {
     if bfs_cpu_count <= 0 {
         let mut n = 0
-        if find_program("nproc") != "" { n = process_run("nproc", []).out.trim().to_int() }
-        if n <= 0 && find_program("getconf") != "" { n = process_run("getconf", ["_NPROCESSORS_ONLN"]).out.trim().to_int() }
+        if find_program("nproc") != "" { n = run_out("nproc", []).trim().to_int() }
+        if n <= 0 && find_program("getconf") != "" { n = run_out("getconf", ["_NPROCESSORS_ONLN"]).trim().to_int() }
         bfs_cpu_count = if n > 0 { n } else { 1 }
     }
     bfs_cpu_count
+}
+
+// What program printed to stdout, or "" when it could not run; the count above then falls back.
+fn run_out(program: Str, args: List[Str]) -> Str {
+    match process.run(program, args) {
+        Ok(r) => r.out
+        Err(_) => ""
+    }
 }
 
 // The bytes sh reads as more than a part of a word: quotes and escapes, globs, expansions,
@@ -455,11 +463,14 @@ pub fn plain_words(cmd: Str) -> List[Str] {
 
 // Runs program with args as sh runs a command: on this process's stdin, stdout and stderr,
 // which a captured run would turn into pipes and so take a compiler's colors away. Its exit
-// code, or -1 when a signal ended it or it could not start, as shell_exec gives.
-pub fn run_program(program: Str, args: List[Str]) -> Int ! IO, Process.Spawn {
+// code, 127 when it could not start, as sh gives, or -1 when a signal ended it or no child
+// could be made.
+pub fn run_program(program: Str, args: List[Str]) -> Int ! IO, Process.Spawn, Env.Exit {
+    // The child inherits what stdout holds unflushed, and exec flushes it there.
+    io.write("")
     let pid = bfs_fork().to_int()
     if pid == 0 {
-        process_exec(program, args)
+        exec_in_child(program, args)
     }
     if pid < 0 { return -1 }
     let mut status = -1
@@ -479,6 +490,21 @@ pub fn run_program(program: Str, args: List[Str]) -> Int ! IO, Process.Spawn {
     (status >> 8) & 255
 }
 
+// The line cmd as sh -c runs it, through run_program: on this process's stdin, stdout and
+// stderr, its exit code, or -1 when a signal ended it.
+pub fn run_shell(cmd: Str) -> Int ! IO, Process.Spawn, Env.Exit {
+    run_program("sh", ["-c", cmd])
+}
+
+// In a child bfs_fork made: becomes program, or ends with 127 and the reason on stderr, as sh
+// does for a program it cannot run. _exit, not env.exit, as the child holds a copy of this
+// process's state and must run none of its exit work.
+fn exec_in_child(program: Str, args: List[Str]) -> Never ! IO, Process.Spawn, Env.Exit {
+    let e = process.exec(program, args).unwrap_err()
+    io.eprintln("{e}")
+    bfs_exit_now(127.to_i32())
+}
+
 // A child spawn_to_files started. live is the read end of a pipe whose write end only the
 // child and the processes it starts hold, so the pipe hangs up once they have all ended, as
 // the pipes of a captured run reach their end; -1 once it has. status is the wait status
@@ -495,7 +521,7 @@ pub type FileChild {
 // Starts program with args, its stdout and stderr written to out_path and err_path and its
 // stdin this process's own. Files, not pipes: a pipe this process does not drain while it
 // waits for another child fills, and its child stops.
-pub fn spawn_to_files(program: Str, args: List[Str], out_path: Str, err_path: Str) -> FileChild ! IO, FS.Read, FS.Write, Process.Spawn {
+pub fn spawn_to_files(program: Str, args: List[Str], out_path: Str, err_path: Str) -> FileChild ! IO, FS.Read, FS.Write, Process.Spawn, Env.Exit {
     // open() here never creates.
     write_file(out_path, "")
     write_file(err_path, "")
@@ -522,6 +548,8 @@ pub fn spawn_to_files(program: Str, args: List[Str], out_path: Str, err_path: St
     }
     let mut pid = -1
     if out_fd >= 0 && err_fd >= 0 && live >= 0 {
+        // The child inherits what stdout holds unflushed, and exec flushes it into out_path.
+        io.write("")
         pid = bfs_fork().to_int()
         if pid == 0 {
             let _ = bfs_dup2(out_fd.to_i32(), 1.to_i32())
@@ -530,7 +558,7 @@ pub fn spawn_to_files(program: Str, args: List[Str], out_path: Str, err_path: St
             if out_fd > 2 { let _ = bfs_close(out_fd.to_i32()) }
             if err_fd > 2 { let _ = bfs_close(err_fd.to_i32()) }
             let _ = bfs_close(live.to_i32())
-            process_exec(program, args)
+            exec_in_child(program, args)
         }
     }
     // Before the next spawn: a later child that inherits live_w would hold this pipe open.
@@ -713,6 +741,10 @@ pub fn reap_to_files(child: FileChild) -> ReapedChild ! IO, Process.Spawn {
 }
 
 // An @ffi function's C name has no module part, so these carry the module in their own names.
+@ffi("_exit", header: "unistd.h")
+@trusted(audit: "Wraps _exit(2) in a forked child that could not exec. Takes an int, returns never, touches no memory.")
+fn bfs_exit_now(code: I32) -> Never ! Env.Exit {}
+
 @ffi("mkdir", header: "sys/stat.h")
 @trusted(audit: "Wraps mkdir(2). path is a NUL-terminated copy from ffi.scope(); mode is 0777 or 0700.")
 fn bfs_mkdir(path: Ptr[U8], mode: U32) -> I32 ! FS.Write {}
