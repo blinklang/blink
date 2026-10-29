@@ -1,0 +1,37 @@
+// A forced stdlib archive rebuild removes the old entry before it publishes the new one. When
+// that remove fails, publish keeps the old entry, so the build must fail and not report the
+// stale archive as rebuilt.
+
+import compile_test_helpers
+
+fn sh(cmd: Str) -> Str {
+    process.run("sh", ["-c", cmd]).unwrap().out.trim()
+}
+
+test "a forced archive rebuild fails when it cannot remove the old entry" {
+    let root = sh("pwd -P")
+    let tree = "{compile_test_helpers.scratch_root()}/_forced_std_rebuild_{getpid()}"
+    shell_exec("rm -rf {tree}")
+    shell_exec("mkdir -p {tree}/build")
+    // A copy, not a link: the install root comes from realpath(argv[0]).
+    shell_exec("cp {sh("readlink -f build/blink")} {tree}/build/blink")
+    shell_exec("ln -s {root}/lib {tree}/lib")
+    shell_exec("ln -s {root}/lib {tree}/build/lib")
+    shell_exec("cp -L {root}/build/runtime.h {tree}/build/runtime.h")
+    let env_of = "env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE BLINK_FORCE_STDLIB_REBUILD=1"
+
+    // The first build in a fresh tree keys its entry apart from the builds after it, so the
+    // entry to lock is the one the second build links.
+    let _ = process.run("sh", ["-c", "cd {tree} && {env_of} build/blink __build-stdlib-archive"])?
+    let first = process.run("sh", ["-c", "cd {tree} && {env_of} build/blink __build-stdlib-archive"])?
+    let entry = "{tree}/build/{sh("dirname $(readlink {tree}/build/libblink_std.a)")}"
+    // With no write bit on entry, no file in it can be unlinked, so libblink_std.a stays and
+    // publish would take the old entry for the new one.
+    shell_exec("chmod 555 {entry}")
+    let forced = process.run("sh", ["-c", "cd {tree} && {env_of} build/blink __build-stdlib-archive"])?
+    shell_exec("chmod -R u+w {tree} 2>/dev/null; rm -rf {tree}")
+    assert(first.success(), "the first archive build failed: {first.out}{first.err_out}")
+    assert(entry != "", "the first archive build left no entry")
+    assert(!forced.success(), "the forced rebuild passed with the old entry in place")
+    assert(forced.err_out.contains("error: cannot remove"), "no remove error: {forced.err_out}")
+}
