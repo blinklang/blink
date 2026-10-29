@@ -990,17 +990,27 @@ match r.end {
 ```
 
 - `limits:` is a keyword on `process.run` and `process.spawn` only. `ChildLimits {}` sets no limit.
-- At the deadline the runtime sends SIGTERM to the child's process group, and SIGKILL after
-  `grace`. A `grace` of zero sends SIGKILL at once. The end is `Limit(Timeout)`, even when the
-  child caught SIGTERM and exited 0, so `success()` is false.
+- At the deadline the runtime sends SIGTERM to the child's process group (to its cgroup when
+  it has one), and SIGKILL after `grace`. A `grace` of zero sends SIGKILL at once. The end is
+  `Limit(Timeout)`, even when the child caught SIGTERM and exited 0, so `success()` is false.
 - A limit that ends a child gives `Ok`, not `Err`. From the deadline on, `run` and `wait`
   return by timeout + grace + a short delay; a grandchild that holds a pipe does not hold them.
 - A zero or negative `timeout` or a negative `grace` gives `Err` EINVAL and starts no child.
-  `memory` and `processes` give `Err` ENOTSUP on this build. `process.can_limit(which)` says
-  which kinds the host supports; `Timeout` is supported wherever processes are.
+  So do a `memory` of zero or less and a `processes` under 1.
+- `memory` (bytes) and `processes` work only on Linux when this program has a delegated cgroup v2
+  of its own, as under `systemd-run --user --scope -p Delegate=yes prog` (not `sh -c prog`,
+  as the cgroup then holds a process that the program did not start). Everywhere else (a
+  normal terminal, most containers, macOS) they give `Err` ENOTSUP and start no child. On first
+  use the program moves itself into a leaf below its cgroup, and each such child gets a cgroup
+  of its own, with swap 0. A child that the kernel ends for memory ends as `Limit(Memory)`; a
+  fork refused at the `processes` cap ends the whole tree as `Limit(Processes)`. Another
+  error of the cgroup (such as EBUSY or EACCES) comes back as that errno.
+- `process.can_limit(which)` says which kinds the host supports; `Timeout` is supported
+  wherever processes are.
 - A limited child leads its own process group, so a terminal Ctrl-C reaches this program only.
   When this program ends (return, `env.exit`, panic, SIGINT, SIGTERM), the runtime first ends
-  each limited child that is still alive, with SIGTERM and its grace, then ends as it would have.
+  each limited child that is still alive (and each process in its cgroup), with SIGTERM and its
+  grace, then ends as it would have.
 
 ## Duration Methods
 
