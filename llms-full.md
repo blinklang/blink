@@ -1003,8 +1003,9 @@ match r.end {
   normal terminal, most containers, macOS) they give `Err` ENOTSUP and start no child. On first
   use the program moves itself into a leaf below its cgroup, and each such child gets a cgroup
   of its own, with swap 0. A child that the kernel ends for memory ends as `Limit(Memory)`; a
-  fork refused at the `processes` cap ends the whole tree as `Limit(Processes)`. Another
-  error of the cgroup (such as EBUSY or EACCES) comes back as that errno.
+  fork refused at the `processes` cap while the child still runs ends the whole tree as
+  `Limit(Processes)`. Another error of the cgroup (such as EBUSY or EACCES) comes back as
+  that errno.
 - `process.can_limit(which)` says which kinds the host supports; `Timeout` is supported
   wherever processes are.
 - A limited child leads its own process group, so a terminal Ctrl-C reaches this program only.
