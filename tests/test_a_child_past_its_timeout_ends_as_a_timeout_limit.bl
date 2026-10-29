@@ -1,0 +1,79 @@
+// A child that runs past its timeout ends as Limit(Timeout), and run and wait return Ok with
+// the output read so far (sections/04_effects.md §4.4.8 Child limits; When a limit ends a
+// child, the result is Ok). Each child would run for 30 s, and each check of the time is an
+// upper bound far below that, so a loaded host cannot make a case fail; only a child that
+// the limit did not end can.
+
+import std.process.{ChildEnd, ChildLimits, LimitKind}
+import std.time.{Duration}
+
+fn timeout_ms(ms: Int, grace_ms: Int) -> ChildLimits {
+    ChildLimits { timeout: Some(Duration.ms(ms)), grace: Duration.ms(grace_ms) }
+}
+
+test "run of a child past its timeout returns Ok with end Limit(Timeout)" {
+    let start = time.read()
+    let r = process.run("sleep", ["30"], limits: timeout_ms(200, 0)).unwrap()
+    assert_eq(r.end, ChildEnd.Limit(LimitKind.Timeout))
+    assert(start.elapsed().to_ms() < 10000, "run waited {start.elapsed().to_ms()} ms")
+}
+
+test "wait on a spawned child past its timeout returns Ok with end Limit(Timeout)" {
+    let start = time.read()
+    let child = process.spawn("sleep", ["30"], limits: timeout_ms(200, 0)).unwrap()
+    let r = process.wait(child).unwrap()
+    assert_eq(r.end, ChildEnd.Limit(LimitKind.Timeout))
+    assert(start.elapsed().to_ms() < 10000, "wait took {start.elapsed().to_ms()} ms")
+}
+
+test "the output a child wrote before its deadline is in the result" {
+    let r = process.run("sh", ["-c", "echo before; echo err >&2; sleep 30"], limits: timeout_ms(300, 0)).unwrap()
+    assert_eq(r.end, ChildEnd.Limit(LimitKind.Timeout))
+    assert_eq(r.out, "before\n")
+    assert_eq(r.err_out, "err\n")
+}
+
+test "a timeout end is not a success and displays as limit timeout" {
+    let r = process.run("sleep", ["30"], limits: timeout_ms(100, 0)).unwrap()
+    assert(!r.success(), "a Limit end counted as a success")
+    assert_eq("{r.end}", "limit timeout")
+}
+
+test "a child that ends before its timeout keeps its own end and output" {
+    let r = process.run("sh", ["-c", "echo done; exit 3"], limits: timeout_ms(60000, 2000)).unwrap()
+    assert_eq(r.end, ChildEnd.Exited(3))
+    assert_eq(r.out, "done\n")
+    let child = process.spawn("sh", ["-c", "echo spawned"], limits: timeout_ms(60000, 2000)).unwrap()
+    let w = process.wait(child).unwrap()
+    assert_eq(w.end, ChildEnd.Exited(0))
+    assert_eq(w.out, "spawned\n")
+}
+
+test "a limited run still feeds the child its stdin" {
+    let r = process.run("cat", [], stdin: Some("fed\n"), limits: timeout_ms(60000, 2000)).unwrap()
+    assert_eq(r.end, ChildEnd.Exited(0))
+    assert_eq(r.out, "fed\n")
+}
+
+test "a second wait on a timed-out child returns the same end" {
+    let child = process.spawn("sleep", ["30"], limits: timeout_ms(100, 0)).unwrap()
+    let a = process.wait(child).unwrap()
+    let b = process.wait(child).unwrap()
+    assert_eq(a.end, ChildEnd.Limit(LimitKind.Timeout))
+    assert_eq(b.end, ChildEnd.Limit(LimitKind.Timeout))
+}
+
+test "a limited program that is not found is Err, as without limits" {
+    match process.run("blink-no-such-program", [], limits: timeout_ms(60000, 2000)) {
+        Ok(r) => assert(false, "expected Err, got end {r.end}")
+        Err(e) => assert_eq("{e}", "run blink-no-such-program: No such file or directory")
+    }
+    match process.spawn("blink-no-such-program", [], limits: timeout_ms(60000, 2000)) {
+        Ok(_) => assert(false, "expected Err")
+        Err(e) => assert_eq("{e}", "spawn blink-no-such-program: No such file or directory")
+    }
+}
+
+test "the host can apply a timeout" {
+    assert(process.can_limit(LimitKind.Timeout))
+}

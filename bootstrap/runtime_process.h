@@ -6,6 +6,9 @@
 #include <signal.h>
 #include <poll.h>
 #endif
+#if defined(__linux__)
+#include <sys/prctl.h>
+#endif
 
 /* LimitKind and ChildEnd as lib/std/process.bl declares them. They are runtime-owned
  * (src/layout.bl), so codegen spells them as these names and skips its own typedefs; the
@@ -60,6 +63,14 @@ static inline blink_ChildEnd blink_child_end_signaled(int64_t sig) {
     memset(&e, 0, sizeof(e));
     e.tag = blink_ChildEnd_Signaled_TAG;
     e.data.Signaled._0 = sig;
+    return e;
+}
+
+static inline blink_ChildEnd blink_child_end_limit(blink_LimitKind kind) {
+    blink_ChildEnd e;
+    memset(&e, 0, sizeof(e));
+    e.tag = blink_ChildEnd_Limit_TAG;
+    e.data.Limit._0 = kind;
     return e;
 }
 
@@ -557,6 +568,8 @@ BLINK_RT_FN int64_t blink_process_pid_send_signal(int64_t handle, int64_t sig) {
  * cmd is the program the box was made for, so an error on a later op can name it.
  * err is the errno of the op that made or last used the box, 0 when it succeeded.
  * handle is the pid table handle of a spawned child, -1 for a run. */
+struct blink_limit_rec;
+
 typedef struct {
     pthread_mutex_t mu;
     const char* cmd;
@@ -564,6 +577,7 @@ typedef struct {
     int64_t err;
     int64_t waited;
     blink_ProcessResult result;
+    struct blink_limit_rec* lim;
 } blink_child_box;
 
 #if defined(__linux__)
@@ -602,6 +616,7 @@ static blink_child_box* blink_child_box_new(const char* cmd) {
     b->err = 0;
     b->waited = 0;
     b->result = blink_process_result_none(BLINK_STR_EMPTY);
+    b->lim = NULL;
     return b;
 }
 
@@ -698,14 +713,38 @@ static int blink_child_fork_exec(char** argv, int stdin_fd, int out_fd, int err_
     return 0;
 }
 
+/* The clock of every child deadline, in nanoseconds. Interim choice, the one place for it: a
+ * clock that stops while the host is suspended, since a suspended child does not run. On
+ * Linux CLOCK_MONOTONIC stops; on macOS it does not, and CLOCK_UPTIME_RAW does. */
+static int64_t blink_limits_now(void) {
+    struct timespec ts;
+#if defined(__APPLE__)
+    clock_gettime(CLOCK_UPTIME_RAW, &ts);
+#else
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+#endif
+    return (int64_t)ts.tv_sec * 1000000000 + (int64_t)ts.tv_nsec;
+}
+
+/* The poll timeout in ms that ends at stop_at (blink_limits_now time), rounded up so the
+ * poll does not wake before it; -1, no end, for a stop_at < 0. */
+static int blink_limits_poll_ms(int64_t stop_at) {
+    if (stop_at < 0) return -1;
+    int64_t left = stop_at - blink_limits_now();
+    if (left <= 0) return 0;
+    int64_t ms = (left + 999999) / 1000000;
+    return ms > (1 << 30) ? (1 << 30) : (int)ms;
+}
+
 /* Writes in_data to in_fd while it drains out_fd and err_fd, all in one poll loop, so a
  * child that writes before it has read all its input cannot block the parent, nor the
  * parent the child. in_fd is closed once all is written or the child closed its end; a
  * child that exits without reading its input is not an error. SIGPIPE is blocked in this
  * thread for the loop and a SIGPIPE the loop raised is taken back, so no other thread's
- * signal disposition changes. */
+ * signal disposition changes. At stop_at (blink_limits_now time; < 0 for never) the loop
+ * stops without end of file and keeps what it read. */
 static void blink_child_pump(int in_fd, const char* in_data, int64_t in_len,
-                             int out_fd, int err_fd, char** out, char** err) {
+                             int out_fd, int err_fd, char** out, char** err, int64_t stop_at) {
     sigset_t pipe_set, old_mask, pending;
     sigemptyset(&pipe_set);
     sigaddset(&pipe_set, SIGPIPE);
@@ -733,8 +772,13 @@ static void blink_child_pump(int in_fd, const char* in_data, int64_t in_len,
         if (open_in) { pfds[n].fd = in_fd; pfds[n].events = POLLOUT; pfds[n].revents = 0; p_in = &pfds[n]; n++; }
         if (open_out) { pfds[n].fd = out_fd; pfds[n].events = POLLIN; pfds[n].revents = 0; p_out = &pfds[n]; n++; }
         if (open_err) { pfds[n].fd = err_fd; pfds[n].events = POLLIN; pfds[n].revents = 0; p_err = &pfds[n]; n++; }
-        int pr = poll(pfds, (nfds_t)n, -1);
+        /* Past stop_at one last pass takes what is ready, so a grandchild that writes on
+         * and on cannot keep the loop going. */
+        int poll_ms = blink_limits_poll_ms(stop_at);
+        int last = poll_ms == 0;
+        int pr = poll(pfds, (nfds_t)n, poll_ms);
         if (pr < 0) { if (errno == EINTR) continue; break; }
+        if (pr == 0) break;
         if (p_in && (p_in->revents & (POLLOUT | POLLERR | POLLHUP))) {
             ssize_t w = write(in_fd, in_data + written, (size_t)(in_len - written));
             if (w > 0) written += w;
@@ -747,6 +791,7 @@ static void blink_child_pump(int in_fd, const char* in_data, int64_t in_len,
         }
         blink_pump_fd(out_fd, &open_out, p_out, &buf_o, &cap_o, &len_o);
         blink_pump_fd(err_fd, &open_err, p_err, &buf_e, &cap_e, &len_e);
+        if (last) break;
     }
     if (open_in) close(in_fd);
     if (open_out) close(out_fd);
@@ -770,6 +815,365 @@ static int blink_child_waitpid(pid_t pid, int* status) {
         if (errno != EINTR) return errno;
     }
     return 0;
+}
+#endif
+
+/* ── Child limits (sections/04_effects.md §4.4.8 Child limits) ────────
+ * A child with a limit is forked by one long-lived limits thread, which the first such child
+ * starts and which never ends. Linux sends the parent-death signal when the thread that
+ * forked a child ends, not the process, so a child that a short-lived async task forked
+ * itself would get SIGKILL when the task ended. The same thread keeps every deadline: it
+ * polls its wake pipe for the time to the next one, signals the group of the child at the
+ * deadline, and again after the grace. It never reaps: run and wait do, as for any child.
+ *
+ * Each limited child has a record. rec->mu orders a group signal against the reap: the
+ * thread signals only while the leader is not reaped, so its pid, which is the pgid, is
+ * still this child's. Lock order: blink_limits.mu, then rec->mu; blink_pid_table_mu, then
+ * rec->mu. Nothing that can exit the program runs under either lock.
+ *
+ * The spec does not settle every choice here yet. Each such interim choice sits in one
+ * place, named as one, so a later answer is a small edit. */
+
+#define BLINK_LIMIT_NEVER INT64_MAX
+
+/* Interim choice: how long past timeout + grace run and wait still read the pipes of a
+ * child, so the output that the last signals flushed is kept. */
+#define BLINK_LIMIT_EOF_DELAY_NS (200 * 1000000LL)
+
+enum { BLINK_LIMIT_WAITING, BLINK_LIMIT_TERMED, BLINK_LIMIT_KILLED };
+
+typedef struct blink_limit_rec {
+    struct blink_limit_rec* next;
+    pthread_mutex_t mu;
+    pid_t pid;          /* also the pgid */
+    int64_t deadline;   /* set before the record is shared, then never changed */
+    int64_t grace;      /* likewise */
+    int64_t kill_at;
+    int stage;
+    int limit_hit;      /* the deadline came while the leader still ran */
+    int reaped;
+    int released;       /* its run or wait is done with it, so the thread frees it */
+} blink_limit_rec;
+
+/* A fork that a run or spawn asks of the limits thread. It lives on the stack of the
+ * asking thread, which waits until done is set. */
+typedef struct blink_limit_req {
+    struct blink_limit_req* next;
+    char** argv;
+    int stdin_fd, out_fd, err_fd, report_fd;
+    sigset_t mask;
+    int64_t timeout, grace;
+    blink_limit_rec* rec;
+    int err;
+    int done;
+} blink_limit_req;
+
+typedef struct {
+    pthread_mutex_t mu;
+    pthread_cond_t served;
+    int started;
+    int wake_rd, wake_wr;
+    blink_limit_rec* recs;
+    blink_limit_req* reqs;
+} blink_limits_state;
+
+#define BLINK_LIMITS_STATE_INIT { PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, 0, -1, -1, NULL, NULL }
+
+#ifdef BLINK_USE_EXTERN_RUNTIME_STORAGE
+  #ifdef BLINK_RUNTIME_STORAGE_DEFINE
+    blink_limits_state blink_limits = BLINK_LIMITS_STATE_INIT;
+  #else
+    extern blink_limits_state blink_limits;
+  #endif
+#else
+static blink_limits_state blink_limits = BLINK_LIMITS_STATE_INIT;
+#endif
+
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+static int64_t blink_limits_add(int64_t a, int64_t b) {
+    if (b > 0 && a > BLINK_LIMIT_NEVER - b) return BLINK_LIMIT_NEVER;
+    return a + b;
+}
+
+/* When run or wait stop reading the pipes of a limited child: timeout + grace + a short
+ * delay. Before that they wait for end of file, as for a child with no limit. -1 (never)
+ * for a box with no limit. */
+static int64_t blink_limits_stop_at(const struct blink_limit_rec* rec) {
+    if (rec == NULL) return -1;
+    int64_t at = blink_limits_add(blink_limits_add(rec->deadline, rec->grace), BLINK_LIMIT_EOF_DELAY_NS);
+    return at == BLINK_LIMIT_NEVER ? -1 : at;
+}
+
+/* Async-signal-safe. A full pipe already holds a wake, so EAGAIN loses nothing. */
+static void blink_limits_wake(void) {
+    int fd = blink_limits.wake_wr;
+    if (fd < 0) return;
+    int saved = errno;
+    char c = 1;
+    ssize_t w;
+    do { w = write(fd, &c, 1); } while (w < 0 && errno == EINTR);
+    errno = saved;
+}
+
+/* The deadline of a child came. Interim choice, the one place for it: the group gets the
+ * signal whenever the leader is not reaped, even when the leader has exited, since the
+ * children it started may run on; the limit ended the child only if the leader still ran.
+ * A grace of zero is SIGKILL at once, as the spec says. Caller holds rec->mu, and the
+ * leader is not reaped. */
+static void blink_limits_deadline_locked(blink_limit_rec* rec, int64_t now) {
+    siginfo_t info;
+    memset(&info, 0, sizeof(info));
+    int r;
+    do { r = waitid(P_PID, (id_t)rec->pid, &info, WEXITED | WNOHANG | WNOWAIT); } while (r < 0 && errno == EINTR);
+    if (!(r == 0 && info.si_pid == rec->pid)) rec->limit_hit = 1;
+    if (rec->grace == 0) {
+        kill(-rec->pid, SIGKILL);
+        rec->stage = BLINK_LIMIT_KILLED;
+    } else {
+        kill(-rec->pid, SIGTERM);
+        rec->kill_at = blink_limits_add(now, rec->grace);
+        rec->stage = BLINK_LIMIT_TERMED;
+    }
+}
+
+/* One pass of the thread over every record: signals what is due, frees what run or wait
+ * released, and returns the time of the next thing due. Caller holds blink_limits.mu. */
+static int64_t blink_limits_tick_locked(int64_t now) {
+    int64_t next = BLINK_LIMIT_NEVER;
+    blink_limit_rec** at = &blink_limits.recs;
+    while (*at != NULL) {
+        blink_limit_rec* rec = *at;
+        pthread_mutex_lock(&rec->mu);
+        if (rec->released) {
+            *at = rec->next;
+            pthread_mutex_unlock(&rec->mu);
+            pthread_mutex_destroy(&rec->mu);
+            free(rec);
+            continue;
+        }
+        if (!rec->reaped) {
+            if (rec->stage == BLINK_LIMIT_WAITING && now >= rec->deadline) {
+                blink_limits_deadline_locked(rec, now);
+            }
+            if (rec->stage == BLINK_LIMIT_TERMED && now >= rec->kill_at) {
+                kill(-rec->pid, SIGKILL);
+                rec->stage = BLINK_LIMIT_KILLED;
+            }
+            if (rec->stage == BLINK_LIMIT_WAITING && rec->deadline < next) next = rec->deadline;
+            if (rec->stage == BLINK_LIMIT_TERMED && rec->kill_at < next) next = rec->kill_at;
+        }
+        pthread_mutex_unlock(&rec->mu);
+        at = &rec->next;
+    }
+    return next;
+}
+
+/* Runs on the limits thread with blink_limits.mu held. The child leads a new process group
+ * and, on Linux, gets SIGKILL when this thread ends, which is when the program ends. It gets
+ * back the signal mask of the thread that asked, since the limits thread blocks signals of
+ * its own. */
+static void blink_limits_fork_locked(blink_limit_req* req) {
+    blink_limit_rec* rec = (blink_limit_rec*)calloc(1, sizeof(blink_limit_rec));
+    if (rec == NULL) { req->err = ENOMEM; return; }
+    pthread_mutex_init(&rec->mu, NULL);
+    pid_t parent = getpid();
+    pid_t pid = fork();
+    if (pid < 0) {
+        req->err = errno;
+        pthread_mutex_destroy(&rec->mu);
+        free(rec);
+        return;
+    }
+    if (pid == 0) {
+        setpgid(0, 0);
+#if defined(__linux__)
+        prctl(PR_SET_PDEATHSIG, SIGKILL);
+        /* The program ended before the prctl took hold, so no death signal will come. */
+        if (getppid() != parent) {
+            int e = ESRCH;
+            ssize_t w;
+            do { w = write(req->report_fd, &e, sizeof(e)); } while (w < 0 && errno == EINTR);
+            _exit(127);
+        }
+#else
+        (void)parent;
+#endif
+        pthread_sigmask(SIG_SETMASK, &req->mask, NULL);
+        blink_child_exec_or_report(req->argv, req->stdin_fd, req->out_fd, req->err_fd, req->report_fd);
+    }
+    /* Both sides set the group, so it is set before either goes on. EACCES once the child
+     * has exec'd is fine: the child set it first. */
+    setpgid(pid, pid);
+    rec->pid = pid;
+    rec->deadline = blink_limits_add(blink_limits_now(), req->timeout);
+    rec->grace = req->grace;
+    rec->kill_at = BLINK_LIMIT_NEVER;
+    rec->stage = BLINK_LIMIT_WAITING;
+    rec->next = blink_limits.recs;
+    blink_limits.recs = rec;
+    req->rec = rec;
+}
+
+static void* blink_limits_main(void* arg) {
+    (void)arg;
+    pthread_mutex_lock(&blink_limits.mu);
+    for (;;) {
+        int served = 0;
+        while (blink_limits.reqs != NULL) {
+            blink_limit_req* req = blink_limits.reqs;
+            blink_limits.reqs = req->next;
+            blink_limits_fork_locked(req);
+            req->done = 1;
+            served = 1;
+        }
+        if (served) pthread_cond_broadcast(&blink_limits.served);
+        int64_t next = blink_limits_tick_locked(blink_limits_now());
+        int wake_rd = blink_limits.wake_rd;
+        pthread_mutex_unlock(&blink_limits.mu);
+        struct pollfd pfd;
+        pfd.fd = wake_rd;
+        pfd.events = POLLIN;
+        pfd.revents = 0;
+        /* EINTR (the collector stops this thread with a signal) or an early wake just
+         * means one more pass. */
+        poll(&pfd, 1, blink_limits_poll_ms(next == BLINK_LIMIT_NEVER ? -1 : next));
+        char drain[64];
+        while (read(wake_rd, drain, sizeof(drain)) > 0) {}
+        pthread_mutex_lock(&blink_limits.mu);
+    }
+    return NULL;
+}
+
+/* Caller holds blink_limits.mu. 0 once the thread runs, else the errno that kept it from
+ * starting; a later limited run or spawn tries again. The thread blocks the signals that
+ * the program means for its main thread, so that this thread never runs their handlers. */
+static int blink_limits_start_locked(void) {
+    if (blink_limits.started) return 0;
+    int wake[2] = {-1, -1};
+    if (blink_child_pipe(wake) < 0) return errno;
+    for (int i = 0; i < 2; i++) {
+        int fl = fcntl(wake[i], F_GETFL);
+        if (fl >= 0) fcntl(wake[i], F_SETFL, fl | O_NONBLOCK);
+    }
+    blink_limits.wake_rd = wake[0];
+    blink_limits.wake_wr = wake[1];
+#ifdef BLINK_DEV_LIMITS_THREAD_FAIL
+    /* Dev knob: cc -DBLINK_DEV_LIMITS_THREAD_FAIL fails every start of the thread as a full
+     * thread table would, so a test can see run and spawn report it. */
+    int e = EAGAIN;
+#else
+    sigset_t block, old;
+    sigemptyset(&block);
+    sigaddset(&block, SIGINT);
+    sigaddset(&block, SIGTERM);
+    sigaddset(&block, SIGHUP);
+    sigaddset(&block, SIGPIPE);
+    sigaddset(&block, SIGCHLD);
+    pthread_sigmask(SIG_BLOCK, &block, &old);
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    pthread_t t;
+    int e = pthread_create(&t, &attr, blink_limits_main, NULL);
+    pthread_attr_destroy(&attr);
+    pthread_sigmask(SIG_SETMASK, &old, NULL);
+#endif
+    if (e != 0) {
+        blink_limits.wake_rd = -1;
+        blink_limits.wake_wr = -1;
+        blink_child_close_pair(wake);
+        return e;
+    }
+    blink_limits.started = 1;
+    return 0;
+}
+
+/* Forks a limited child on the given pipes through the limits thread. 0 with *rec_out set
+ * once the child has exec'd, else the errno of the thread start, the fork or the exec; a
+ * child whose exec failed is reaped here. */
+static int blink_limits_fork_exec(char** argv, int stdin_fd, int out_fd, int err_fd,
+                                  int64_t timeout, int64_t grace, blink_limit_rec** rec_out) {
+    int report[2] = {-1, -1};
+    if (blink_child_pipe(report) < 0) return errno;
+    blink_limit_req req;
+    memset(&req, 0, sizeof(req));
+    req.argv = argv;
+    req.stdin_fd = stdin_fd;
+    req.out_fd = out_fd;
+    req.err_fd = err_fd;
+    req.report_fd = report[1];
+    req.timeout = timeout;
+    req.grace = grace;
+    pthread_sigmask(SIG_SETMASK, NULL, &req.mask);
+    pthread_mutex_lock(&blink_limits.mu);
+    int e = blink_limits_start_locked();
+    if (e != 0) {
+        pthread_mutex_unlock(&blink_limits.mu);
+        blink_child_close_pair(report);
+        return e;
+    }
+    blink_limit_req** tail = &blink_limits.reqs;
+    while (*tail != NULL) tail = &(*tail)->next;
+    *tail = &req;
+    blink_limits_wake();
+    while (!req.done) pthread_cond_wait(&blink_limits.served, &blink_limits.mu);
+    pthread_mutex_unlock(&blink_limits.mu);
+    close(report[1]);
+    if (req.err != 0) {
+        close(report[0]);
+        return req.err;
+    }
+    blink_limit_rec* rec = req.rec;
+    e = blink_child_read_report(report[0]);
+    if (e != 0) {
+        /* As in blink_child_fork_exec: the op reports Err, so whatever did exec must not
+         * run on. */
+        pthread_mutex_lock(&rec->mu);
+        kill(-rec->pid, SIGKILL);
+        int status;
+        while (waitpid(rec->pid, &status, 0) < 0 && errno == EINTR) {}
+        rec->reaped = 1;
+        rec->released = 1;
+        pthread_mutex_unlock(&rec->mu);
+        blink_limits_wake();
+        return e;
+    }
+    *rec_out = rec;
+    return 0;
+}
+
+/* Reaps a limited child that a wait has left a zombie, and gives the errno of the reap,
+ * its status, and whether the limit ended it. The record is released: the caller does not
+ * use it again. Caller holds no limits lock; wait_err is the errno of that wait. */
+static int blink_limits_reap(blink_limit_rec* rec, int wait_err, int* status, int* limit_hit) {
+    pthread_mutex_lock(&rec->mu);
+    int e = wait_err;
+    if (e == 0) e = blink_child_waitpid(rec->pid, status);
+    rec->reaped = 1;
+    *limit_hit = rec->limit_hit;
+    rec->released = 1;
+    pthread_mutex_unlock(&rec->mu);
+    blink_limits_wake();
+    return e;
+}
+
+/* Waits until the leader of a limited child has exited and leaves it a zombie. The reap
+ * then comes under rec->mu; a wait that blocked there would keep the thread from sending
+ * the signal it waits for. */
+static int blink_limits_wait_exit(pid_t pid) {
+    siginfo_t info;
+    while (waitid(P_PID, (id_t)pid, &info, WEXITED | WNOWAIT) < 0) {
+        if (errno != EINTR) return errno;
+    }
+    return 0;
+}
+
+static void blink_child_box_set_end(blink_child_box* box, int status, int limit_hit) {
+    if (limit_hit) {
+        box->result.end = blink_child_end_limit(blink_LimitKind_Timeout);
+    } else {
+        blink_process_result_set_status(&box->result, status);
+    }
 }
 #endif
 
@@ -805,7 +1209,7 @@ BLINK_RT_FN blink_child_box* blink_child_run(const char* cmd, const blink_list* 
     char* out = (char*)"";
     char* err = (char*)"";
     blink_child_pump(in_pipe[1], stdin_data, has_stdin ? blink_str_len(stdin_data) : 0,
-                     out_pipe[0], err_pipe[0], &out, &err);
+                     out_pipe[0], err_pipe[0], &out, &err, -1);
     /* As blink_process_run_with_stdin: a Ctrl-C while the child runs reaches it, and the
      * parent takes it once the child is reaped. */
     blink_child_pid = pid;
@@ -877,6 +1281,110 @@ BLINK_RT_FN blink_child_box* blink_child_spawn(const char* cmd, const blink_list
 }
 #endif
 
+/* process.run with limits: timeout_ns < 0 is no timeout, and then it is blink_child_run.
+ * The limits thread forks the child, which leads its own process group. Until the deadline
+ * the run waits for end of file as blink_child_run does; from then on it reads the pipes
+ * until timeout + grace + a short delay at most. A Ctrl-C does not reach the child's group
+ * from the terminal; the program-exit rule ends it. */
+BLINK_RT_FN blink_child_box* blink_child_run_limited(const char* cmd, const blink_list* args, int64_t has_stdin,
+                                                     const char* stdin_data, int64_t timeout_ns, int64_t grace_ns);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN blink_child_box* blink_child_run_limited(const char* cmd, const blink_list* args, int64_t has_stdin,
+                                                     const char* stdin_data, int64_t timeout_ns, int64_t grace_ns) {
+    if (timeout_ns < 0) return blink_child_run(cmd, args, has_stdin, stdin_data);
+    blink_child_box* box = blink_child_box_new(cmd);
+    if (!blink_child_strings_ok(cmd, args)) { box->err = EINVAL; return box; }
+    char** argv = blink_process_build_argv(cmd, args);
+    int in_pipe[2] = {-1, -1}, out_pipe[2] = {-1, -1}, err_pipe[2] = {-1, -1};
+    if ((has_stdin && blink_child_pipe(in_pipe) < 0) || blink_child_pipe(out_pipe) < 0
+        || blink_child_pipe(err_pipe) < 0) {
+        box->err = errno;
+        blink_child_close_pair(in_pipe);
+        blink_child_close_pair(out_pipe);
+        blink_child_close_pair(err_pipe);
+        return box;
+    }
+    blink_limit_rec* rec = NULL;
+    int e = blink_limits_fork_exec(argv, in_pipe[0], out_pipe[1], err_pipe[1], timeout_ns, grace_ns, &rec);
+    if (in_pipe[0] >= 0) close(in_pipe[0]);
+    close(out_pipe[1]);
+    close(err_pipe[1]);
+    if (e != 0) {
+        if (in_pipe[1] >= 0) close(in_pipe[1]);
+        close(out_pipe[0]);
+        close(err_pipe[0]);
+        box->err = e;
+        return box;
+    }
+    char* out = (char*)"";
+    char* err = (char*)"";
+    blink_child_pump(in_pipe[1], stdin_data, has_stdin ? blink_str_len(stdin_data) : 0,
+                     out_pipe[0], err_pipe[0], &out, &err, blink_limits_stop_at(rec));
+    int status = 0;
+    int limit_hit = 0;
+    int we = blink_limits_reap(rec, blink_limits_wait_exit(rec->pid), &status, &limit_hit);
+    if (we != 0) {
+        box->err = we;
+    } else {
+        box->result.out = out;
+        box->result.err_out = err;
+        blink_child_box_set_end(box, status, limit_hit);
+        box->waited = 1;
+    }
+    return box;
+}
+#endif
+
+/* process.spawn with limits: timeout_ns < 0 is no timeout, and then it is
+ * blink_child_spawn. As blink_child_run_limited, the limits thread forks the child; the
+ * box keeps its limit record for the wait. */
+BLINK_RT_FN blink_child_box* blink_child_spawn_limited(const char* cmd, const blink_list* args, int64_t timeout_ns,
+                                                       int64_t grace_ns);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN blink_child_box* blink_child_spawn_limited(const char* cmd, const blink_list* args, int64_t timeout_ns,
+                                                       int64_t grace_ns) {
+    if (timeout_ns < 0) return blink_child_spawn(cmd, args);
+    blink_child_box* box = blink_child_box_new(cmd);
+    if (!blink_child_strings_ok(cmd, args)) { box->err = EINVAL; return box; }
+    char** argv = blink_process_build_argv(cmd, args);
+    int64_t h = blink_pid_table_alloc();
+    if (h < 0) { box->err = EAGAIN; return box; }
+    blink_pid_slot* slot = &blink_pid_table[h % BLINK_PID_TABLE_CAP];
+    int out_pipe[2] = {-1, -1}, err_pipe[2] = {-1, -1};
+    int e = 0;
+    blink_limit_rec* rec = NULL;
+    if (blink_child_pipe(out_pipe) < 0 || blink_child_pipe(err_pipe) < 0) {
+        e = errno;
+        blink_child_close_pair(out_pipe);
+        blink_child_close_pair(err_pipe);
+    } else {
+        e = blink_limits_fork_exec(argv, -1, out_pipe[1], err_pipe[1], timeout_ns, grace_ns, &rec);
+        close(out_pipe[1]);
+        close(err_pipe[1]);
+        if (e != 0) {
+            close(out_pipe[0]);
+            close(err_pipe[0]);
+        }
+    }
+    if (e != 0) {
+        pthread_mutex_lock(&blink_pid_table_mu);
+        slot->reaped = 1;
+        blink_pid_slot_free_locked(slot);
+        pthread_mutex_unlock(&blink_pid_table_mu);
+        box->err = e;
+        return box;
+    }
+    pthread_mutex_lock(&blink_pid_table_mu);
+    slot->pid = rec->pid;
+    slot->out_fd = out_pipe[0];
+    slot->err_fd = err_pipe[0];
+    pthread_mutex_unlock(&blink_pid_table_mu);
+    box->lim = rec;
+    box->handle = h;
+    return box;
+}
+#endif
+
 /* process.wait: 0 once the box holds the result, else the errno; ECHILD when the box
  * names no child the table still has. Waits on one box run one at a time, so the second
  * returns the first's result. The child is reaped under the table lock, after a wait that
@@ -902,7 +1410,7 @@ BLINK_RT_FN int64_t blink_child_wait(blink_child_box* box) {
      * fds and pid are read without the table lock. */
     char* out = (char*)"";
     char* err = (char*)"";
-    blink_child_pump(-1, NULL, 0, slot->out_fd, slot->err_fd, &out, &err);
+    blink_child_pump(-1, NULL, 0, slot->out_fd, slot->err_fd, &out, &err, blink_limits_stop_at(box->lim));
     slot->out_fd = -1;
     slot->err_fd = -1;
     int e = 0;
@@ -911,8 +1419,14 @@ BLINK_RT_FN int64_t blink_child_wait(blink_child_box* box) {
         if (errno != EINTR) { e = errno; break; }
     }
     int status = 0;
+    int limit_hit = 0;
     pthread_mutex_lock(&blink_pid_table_mu);
-    if (e == 0) e = blink_child_waitpid(slot->pid, &status);
+    if (box->lim != NULL) {
+        e = blink_limits_reap(box->lim, e, &status, &limit_hit);
+        box->lim = NULL;
+    } else if (e == 0) {
+        e = blink_child_waitpid(slot->pid, &status);
+    }
     slot->reaped = 1;
     slot->cached = blink_process_result_none(BLINK_STR_EMPTY);
     blink_pid_slot_free_locked(slot);
@@ -920,7 +1434,7 @@ BLINK_RT_FN int64_t blink_child_wait(blink_child_box* box) {
     if (e == 0) {
         box->result.out = out;
         box->result.err_out = err;
-        blink_process_result_set_status(&box->result, status);
+        blink_child_box_set_end(box, status, limit_hit);
         box->waited = 1;
     }
     /* The slot is free either way, so a later wait on this box gives ECHILD. */
@@ -979,6 +1493,7 @@ BLINK_RT_FN int64_t blink_child_box_end_value(blink_child_box* box) {
     switch (box->result.end.tag) {
     case blink_ChildEnd_Exited_TAG: return box->result.end.data.Exited._0;
     case blink_ChildEnd_Signaled_TAG: return box->result.end.data.Signaled._0;
+    case blink_ChildEnd_Limit_TAG: return (int64_t)box->result.end.data.Limit._0;
     default: return 0;
     }
 }
@@ -1078,12 +1593,12 @@ BLINK_RT_FN const char* blink_process_signal_name(int64_t n) {
 /* The one answer to "can run and spawn apply a limit of this kind here" (blink_LimitKind
  * numbering). process.can_limit and the ENOTSUP check of run and spawn both ask it, so the
  * two never disagree. memory and processes need a delegated cgroup v2, which this runtime
- * does not use yet, so they are never supported; the timeout needs the limits thread. */
+ * does not use yet, so they are never supported. The timeout needs only the limits thread,
+ * which a POSIX host can always start; when it cannot, run and spawn give that errno. */
 BLINK_RT_FN int64_t blink_child_limit_supported(int64_t kind);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN int64_t blink_child_limit_supported(int64_t kind) {
-    (void)kind;
-    return 0;
+    return kind == blink_LimitKind_Timeout ? 1 : 0;
 }
 #endif
 

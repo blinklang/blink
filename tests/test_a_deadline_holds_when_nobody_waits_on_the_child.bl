@@ -1,0 +1,40 @@
+// A deadline is a property of the child: a spawned child with a timeout ends at its deadline
+// even when this program does not wait on it until later, and the late wait still gets
+// Limit(Timeout) (sections/04_effects.md §4.4.8 A deadline holds whether or not anyone
+// waits). The child would touch a marker 2 s in; the program waits 3 s before it looks, so
+// only a deadline that did not fire leaves the marker.
+
+import std.process.{ChildEnd, ChildLimits, LimitKind}
+import std.time.{Duration}
+
+fn fresh_dir() -> Str {
+    process.run("mktemp", ["-d"]).unwrap().out.trim()
+}
+
+fn exists(path: Str) -> Bool {
+    process.run("test", ["-e", path]).unwrap().success()
+}
+
+test "a spawned child ends at its deadline before anyone waits on it" {
+    let dir = fresh_dir()
+    let marker = "{dir}/m"
+    let lim = ChildLimits { timeout: Some(Duration.ms(200)), grace: Duration.nanos(0) }
+    let child = process.spawn("sh", ["-c", "echo up; sleep 2; touch \"$0\"", marker], limits: lim).unwrap()
+    let _ = process.run("sleep", ["3"]).unwrap()
+    assert(!exists(marker), "the child ran past its deadline")
+    let r = process.wait(child).unwrap()
+    assert_eq(r.end, ChildEnd.Limit(LimitKind.Timeout))
+    assert_eq(r.out, "up\n")
+    let _ = process.run("rm", ["-rf", dir])
+}
+
+// The child exits at once, and its deadline passes while it waits to be reaped. The limit did
+// not end it, so its end is its own exit.
+test "a child that ended before its deadline keeps its own end when the wait comes later" {
+    let lim = ChildLimits { timeout: Some(Duration.ms(300)), grace: Duration.nanos(0) }
+    let child = process.spawn("sh", ["-c", "echo quick; exit 4"], limits: lim).unwrap()
+    let _ = process.run("sleep", ["1"]).unwrap()
+    let r = process.wait(child).unwrap()
+    assert_eq(r.end, ChildEnd.Exited(4))
+    assert_eq(r.out, "quick\n")
+}

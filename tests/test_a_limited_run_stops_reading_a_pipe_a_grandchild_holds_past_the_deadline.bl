@@ -1,0 +1,53 @@
+// A limited child that ends on its own before its deadline waits for end of file on its
+// pipes, as a child with no limit does. From the deadline on, run and wait do not wait for
+// end of file: they return by timeout + grace + a short delay, so a grandchild that holds a
+// pipe open does not hold them back (sections/04_effects.md §4.4.8 When a limit ends a
+// child, the result is Ok). In each case the child itself exits 0 at once, and the limit did
+// not end it, so its end is Exited(0).
+
+import std.process.{ChildEnd, ChildLimits}
+import std.time.{Duration}
+
+fn limits_ms(timeout: Int, grace: Int) -> ChildLimits {
+    ChildLimits { timeout: Some(Duration.ms(timeout)), grace: Duration.ms(grace) }
+}
+
+// The grandchild is in the child's group, so the deadline's SIGTERM ends it and the pipe
+// closes: run returns at the deadline, not after the grace.
+test "a grandchild in the group holds run until the deadline and no longer" {
+    let start = time.read()
+    let r = process.run("sh", ["-c", "sleep 30 & exit 0"], limits: limits_ms(1000, 20000)).unwrap()
+    let ms = start.elapsed().to_ms()
+    assert_eq(r.end, ChildEnd.Exited(0))
+    assert(ms >= 900, "run did not wait for end of file before the deadline: {ms} ms")
+    assert(ms < 15000, "run waited for the grace: {ms} ms")
+}
+
+// setsid puts the grandchild in a new session, out of reach of the group signal, and it
+// keeps the pipe open for 30 s. run returns by timeout + grace + a short delay anyway.
+test "a grandchild outside the group does not hold run past timeout + grace" {
+    if !process.run("sh", ["-c", "command -v setsid"]).unwrap().success() {
+        return
+    }
+    let start = time.read()
+    let r = process.run("sh", ["-c", "setsid sleep 30 & echo $!; exit 0"], limits: limits_ms(300, 300)).unwrap()
+    let ms = start.elapsed().to_ms()
+    let pid = r.out.trim()
+    let _ = process.run("kill", ["-9", pid])
+    assert_eq(r.end, ChildEnd.Exited(0))
+    assert(ms >= 550, "run returned before timeout + grace: {ms} ms")
+    assert(ms < 15000, "run waited for end of file: {ms} ms")
+}
+
+test "a grandchild outside the group does not hold a wait past timeout + grace" {
+    if !process.run("sh", ["-c", "command -v setsid"]).unwrap().success() {
+        return
+    }
+    let start = time.read()
+    let child = process.spawn("sh", ["-c", "setsid sleep 30 & echo $!; exit 0"], limits: limits_ms(300, 300)).unwrap()
+    let r = process.wait(child).unwrap()
+    let ms = start.elapsed().to_ms()
+    let _ = process.run("kill", ["-9", r.out.trim()])
+    assert_eq(r.end, ChildEnd.Exited(0))
+    assert(ms < 15000, "wait waited for end of file: {ms} ms")
+}

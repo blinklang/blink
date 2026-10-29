@@ -165,13 +165,14 @@ impl Display for ProcessError {
 @ffi.opaque(name: "blink_child_box")
 pub type Child
 
-@ffi("blink_child_run")
+// timeout_ns < 0 is no timeout.
+@ffi("blink_child_run_limited")
 @trusted(audit: "STD-PROCESS")
-fn c_child_run(cmd: Str, args: List[Str], has_stdin: Int, stdin: Str) -> Child ! Process.Spawn {}
+fn c_child_run(cmd: Str, args: List[Str], has_stdin: Int, stdin: Str, timeout_ns: Int, grace_ns: Int) -> Child ! Process.Spawn {}
 
-@ffi("blink_child_spawn")
+@ffi("blink_child_spawn_limited")
 @trusted(audit: "STD-PROCESS")
-fn c_child_spawn(cmd: Str, args: List[Str]) -> Child ! Process.Spawn {}
+fn c_child_spawn(cmd: Str, args: List[Str], timeout_ns: Int, grace_ns: Int) -> Child ! Process.Spawn {}
 
 @ffi("blink_child_wait")
 @trusted(audit: "STD-PROCESS")
@@ -210,11 +211,15 @@ fn c_child_end_tag(child: Child) -> Int ! () {}
 fn c_child_end_value(child: Child) -> Int ! () {}
 
 // The box holds the result once its run or wait succeeded. The tags are the ChildEnd
-// tags of runtime_process.h; no Limit end exists until child limits do.
+// tags of runtime_process.h, and a Limit value is its blink_LimitKind number.
 fn child_result(child: Child) -> ProcessResult {
     let tag = c_child_end_tag(child)
     let value = c_child_end_value(child)
-    let end = if tag == 1 { ChildEnd.Signaled(value) } else { ChildEnd.Exited(value) }
+    let end = match tag {
+        1 => ChildEnd.Signaled(value)
+        2 => ChildEnd.Limit(limit_kind_of(value))
+        _ => ChildEnd.Exited(value)
+    }
     ProcessResult { out: c_child_out(child), err_out: c_child_err_out(child), end: end }
 }
 
@@ -228,6 +233,22 @@ fn limit_kind_number(which: LimitKind) -> Int {
         LimitKind.Timeout => 0
         LimitKind.Memory => 1
         LimitKind.Processes => 2
+    }
+}
+
+fn limit_kind_of(n: Int) -> LimitKind {
+    match n {
+        1 => LimitKind.Memory
+        2 => LimitKind.Processes
+        _ => LimitKind.Timeout
+    }
+}
+
+// The timeout in nanoseconds for the runtime, which takes -1 as no timeout.
+fn timeout_nanos(limits: ChildLimits) -> Int {
+    match limits.timeout {
+        Some(d) => d.to_nanos()
+        None => -1
     }
 }
 
@@ -277,8 +298,8 @@ fn process_do_run(cmd: Str, args: List[Str], -- stdin: Str? = None, limits: Chil
         return Err(ProcessError { op: ProcessOp.Run, cmd: cmd, code: Errno(bad) })
     }
     let child = match stdin {
-        Some(input) => c_child_run(cmd, args, 1, input)
-        None => c_child_run(cmd, args, 0, "")
+        Some(input) => c_child_run(cmd, args, 1, input, timeout_nanos(limits), limits.grace.to_nanos())
+        None => c_child_run(cmd, args, 0, "", timeout_nanos(limits), limits.grace.to_nanos())
     }
     let code = c_child_err(child)
     if code != 0 {
@@ -293,7 +314,7 @@ fn process_do_spawn(cmd: Str, args: List[Str], -- limits: ChildLimits = ChildLim
     if bad != 0 {
         return Err(ProcessError { op: ProcessOp.Spawn, cmd: cmd, code: Errno(bad) })
     }
-    let child = c_child_spawn(cmd, args)
+    let child = c_child_spawn(cmd, args, timeout_nanos(limits), limits.grace.to_nanos())
     let code = c_child_err(child)
     if code != 0 {
         return Err(ProcessError { op: ProcessOp.Spawn, cmd: cmd, code: Errno(code) })

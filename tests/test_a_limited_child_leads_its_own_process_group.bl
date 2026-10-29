@@ -1,0 +1,65 @@
+// A child that has a limit starts in its own process group, and the runtime signals that
+// group, so the children it started end too; a child with no limit stays in this program's
+// group (sections/04_effects.md §4.4.8 Process groups).
+
+import std.process.{ChildEnd, ChildLimits, LimitKind}
+import std.time.{Duration}
+
+fn with_timeout(ms: Int) -> ChildLimits {
+    ChildLimits { timeout: Some(Duration.ms(ms)), grace: Duration.nanos(0) }
+}
+
+// The child's pid, its pgid and its parent's pgid, one to a line.
+fn group_script() -> Str {
+    "echo $$; ps -o pgid= -p $$; ps -o pgid= -p $PPID"
+}
+
+fn lines_of(out: Str) -> List[Str] {
+    out.trim().split("\n").map(fn(l: Str) -> Str { l.trim() })
+}
+
+test "a limited child is the leader of a new process group" {
+    let r = process.run("sh", ["-c", group_script()], limits: with_timeout(60000)).unwrap()
+    assert_eq(r.end, ChildEnd.Exited(0), "{r.err_out}")
+    let l = lines_of(r.out)
+    assert_eq(l.get(1).unwrap(), l.get(0).unwrap(), "the pgid is not the child's pid: {r.out}")
+    assert(l.get(1).unwrap() != l.get(2).unwrap(), "the child shares this program's group: {r.out}")
+}
+
+test "a spawned limited child is the leader of a new process group" {
+    let child = process.spawn("sh", ["-c", group_script()], limits: with_timeout(60000)).unwrap()
+    let r = process.wait(child).unwrap()
+    let l = lines_of(r.out)
+    assert_eq(l.get(1).unwrap(), l.get(0).unwrap(), "the pgid is not the child's pid: {r.out}")
+}
+
+test "a child with no limit stays in this program's process group" {
+    let r = process.run("sh", ["-c", group_script()]).unwrap()
+    let l = lines_of(r.out)
+    assert_eq(l.get(1).unwrap(), l.get(2).unwrap(), "an unlimited child left the group: {r.out}")
+}
+
+// A grandchild that the deadline killed may stay a zombie until its new parent reaps it,
+// so a "Z" state counts as ended.
+fn ended_within(pid: Str, ms: Int) -> Bool {
+    let start = time.read()
+    while start.elapsed().to_ms() < ms {
+        let st = process.run("ps", ["-o", "stat=", "-p", pid]).unwrap().out.trim()
+        if st == "" || st.starts_with("Z") {
+            return true
+        }
+        time.sleep(Duration.ms(50))
+    }
+    false
+}
+
+test "the deadline ends the children that the child started" {
+    let r = process.run("sh", ["-c", "sleep 30 & echo $!; wait"], limits: with_timeout(300)).unwrap()
+    assert_eq(r.end, ChildEnd.Limit(LimitKind.Timeout))
+    let pid = r.out.trim()
+    let gone = ended_within(pid, 10000)
+    if !gone {
+        let _ = process.run("kill", ["-9", pid])
+    }
+    assert(gone, "grandchild {pid} outlived the deadline")
+}
