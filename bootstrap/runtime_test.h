@@ -714,6 +714,10 @@ BLINK_RT_FN void blink_test_run(const blink_test_entry* tests, int count, int ar
     const char* filter = NULL;
     const char* tags_filter = NULL;
     int json_output = 0;
+    /* --test-quiet: the runner prints nothing of its own, so what the binary writes is what
+     * its tests print. blink test --json reads the results from the report and passes the
+     * rest on. */
+    int quiet = 0;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--test-filter") == 0 && i + 1 < argc) {
             filter = argv[++i];
@@ -721,6 +725,8 @@ BLINK_RT_FN void blink_test_run(const blink_test_entry* tests, int count, int ar
             tags_filter = argv[++i];
         } else if (strcmp(argv[i], "--test-json") == 0) {
             json_output = 1;
+        } else if (strcmp(argv[i], "--test-quiet") == 0) {
+            quiet = 1;
         } else if (strcmp(argv[i], "--test-report") == 0 && i + 1 < argc) {
             const char* report_path = argv[++i];
             __blink_test_report_fd = open(report_path, O_WRONLY | O_CREAT | O_TRUNC | O_APPEND | O_CLOEXEC, 0600);
@@ -735,6 +741,7 @@ BLINK_RT_FN void blink_test_run(const blink_test_entry* tests, int count, int ar
      * newline and survives a later C-level crash (SIGSEGV / _exit / forwarded
      * SIGTERM) that bypasses the atexit flush. Must precede every printf here. */
     setvbuf(stdout, NULL, _IOLBF, 0);
+    int human = !json_output && !quiet;
 
     __blink_panic_test_hook = __blink_test_panic_handler;
     if (__blink_test_case_records == NULL) {
@@ -761,7 +768,7 @@ BLINK_RT_FN void blink_test_run(const blink_test_entry* tests, int count, int ar
                 __blink_test_rec_printf("}");
                 __blink_test_emit_record(json_output, total);
             }
-            if (!json_output) {
+            if (human) {
                 printf("test %s ... \033[33mskipped\033[0m\n", tests[i].name);
             }
             continue;
@@ -855,7 +862,7 @@ BLINK_RT_FN void blink_test_run(const blink_test_entry* tests, int count, int ar
                 __blink_test_rec_printf("}");
                 __blink_test_emit_record(json_output, total);
             }
-            if (!json_output) {
+            if (human) {
                 if (__blink_test_skip_reason[0]) {
                     printf("test %s ... \033[33mskipped\033[0m (%s)\n", tests[i].name, __blink_test_skip_reason);
                 } else {
@@ -882,7 +889,7 @@ BLINK_RT_FN void blink_test_run(const blink_test_entry* tests, int count, int ar
                 __blink_test_rec_printf("}");
                 __blink_test_emit_record(json_output, total);
             }
-            if (!json_output) {
+            if (human) {
                 if (__blink_test_case_label[0]) {
                     printf("test %s::case[%s] ... \033[31mPANIC\033[0m\n", tests[i].name, __blink_test_case_label);
                 } else {
@@ -937,7 +944,7 @@ BLINK_RT_FN void blink_test_run(const blink_test_entry* tests, int count, int ar
                 __blink_test_rec_printf("}");
                 __blink_test_emit_record(json_output, total);
             }
-            if (!json_output) {
+            if (human) {
                 if (__blink_test_case_label[0]) {
                     printf("test %s::case[%s] ... \033[31mFAIL\033[0m\n", tests[i].name, __blink_test_case_label);
                 } else {
@@ -988,7 +995,7 @@ BLINK_RT_FN void blink_test_run(const blink_test_entry* tests, int count, int ar
                 __blink_test_rec_printf("}");
                 __blink_test_emit_record(json_output, total);
             }
-            if (!json_output) {
+            if (human) {
                 printf("test %s ... \033[32mok\033[0m\n", tests[i].name);
                 __blink_test_print_cleanup_warnings_human();
             }
@@ -998,7 +1005,7 @@ BLINK_RT_FN void blink_test_run(const blink_test_entry* tests, int count, int ar
     if (json_output) {
         printf("],\"summary\":{\"total\":%d,\"passed\":%d,\"failed\":%d,\"panicked\":%d,\"skipped\":%d,\"duration_ms\":%g}}\n",
                total, pass, fail, panicked, skip, total_ms);
-    } else {
+    } else if (human) {
         printf("\n%d passed, %d failed", pass, fail);
         if (panicked > 0) printf(", %d panicked", panicked);
         if (skip > 0) printf(", %d skipped", skip);
