@@ -975,6 +975,33 @@ test "two children in a mock" {
   `Err` ESRCH, and `cmd` holds the `Debug` text (`wait Child.mock(1): No child processes`).
 - `process.spawn` gives `Err` EAGAIN when the runtime cap on children not yet waited is full.
 
+## Process Limits
+
+```blink
+import std.process.{ChildEnd, ChildLimits, LimitKind}
+import std.time.{Duration}
+
+let lim = ChildLimits { timeout: Some(Duration.seconds(30)), grace: Duration.seconds(2) }
+let r = process.run("sh", ["-c", "make test"], limits: lim)?
+match r.end {
+    ChildEnd.Limit(LimitKind.Timeout) => io.println("timed out; output so far: {r.out}")
+    _ => {}
+}
+```
+
+- `limits:` is a keyword on `process.run` and `process.spawn` only. `ChildLimits {}` sets no limit.
+- At the deadline the runtime sends SIGTERM to the child's process group, and SIGKILL after
+  `grace`. A `grace` of zero sends SIGKILL at once. The end is `Limit(Timeout)`, even when the
+  child caught SIGTERM and exited 0, so `success()` is false.
+- A limit that ends a child gives `Ok`, not `Err`. From the deadline on, `run` and `wait`
+  return by timeout + grace + a short delay; a grandchild that holds a pipe does not hold them.
+- A zero or negative `timeout` or a negative `grace` gives `Err` EINVAL and starts no child.
+  `memory` and `processes` give `Err` ENOTSUP on this build. `process.can_limit(which)` says
+  which kinds the host supports; `Timeout` is supported wherever processes are.
+- A limited child leads its own process group, so a terminal Ctrl-C reaches this program only.
+  When this program ends (return, `env.exit`, panic, SIGINT, SIGTERM), the runtime first ends
+  each limited child that is still alive, with SIGTERM and its grace, then ends as it would have.
+
 ## Duration Methods
 
 | Method | Returns | Purpose |
