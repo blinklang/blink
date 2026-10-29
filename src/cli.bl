@@ -4672,18 +4672,20 @@ fn test_tally_total(t: TestReportTally) -> Int {
 fn test_tally_add(t: TestReportTally, line: Str) -> TestReportTally {
     json_clear()
     let root = json_parse(line)
-    let kind = test_report_str(root, "record")
+    let kind = test_report_str(root, "record") ?? ""
+    let name = test_report_str(root, "name")
     if kind == "start" {
-        let name = test_report_str(root, "name")
-        if name != "" {
-            return TestReportTally { running: Some(name), ..t }
+        // A test name may be empty, so only a missing name makes the line bad.
+        match name {
+            Some(n) => return TestReportTally { running: Some(n), ..t }
+            None => {}
         }
     } else if kind == "end" {
         return TestReportTally { ended: true, ..t }
-    } else if kind == "test" && test_report_str(root, "name") != "" && line.starts_with(TEST_LINE_PREFIX) {
+    } else if kind == "test" && name.is_some() && line.starts_with(TEST_LINE_PREFIX) {
         // The prefix check keeps each counted line one that test_report_tail can forward.
         let n = TestReportTally { running: None, ..t }
-        match test_report_str(root, "status") {
+        match test_report_str(root, "status") ?? "" {
             "passed" => return TestReportTally { passed: n.passed + 1, ..n }
             "failed" => return TestReportTally { failed: n.failed + 1, ..n }
             "panicked" => return TestReportTally { panicked: n.panicked + 1, ..n }
@@ -4691,36 +4693,38 @@ fn test_tally_add(t: TestReportTally, line: Str) -> TestReportTally {
             _ => {}
         }
     }
-    test_tally_bad(t, line)
+    test_tally_bad(t, Bytes.from_str(line))
 }
 
-// The string at key of a report line's object, or "" when the line is no object or the key holds
-// no string.
-fn test_report_str(root: Int, key: Str) -> Str {
+// The string at key of a report line's object, or None when the line is no object or the key
+// holds no string.
+fn test_report_str(root: Int, key: Str) -> Str? {
     let at = json_get(root, key)
     if json_type(at) != JSON_STRING {
-        return ""
+        return None
     }
-    json_as_str(at)
+    Some(json_as_str(at))
 }
 
-fn test_tally_bad(t: TestReportTally, line: Str) -> TestReportTally {
+// Only the kept lines are spelled out, so a binary that writes many bad lines costs a count each.
+fn test_tally_bad(t: TestReportTally, line: Bytes) -> TestReportTally {
     let mut kept = t.bad_lines
     if kept.len() < TEST_BUILD_NOTE_CAP {
-        kept.push(line)
+        kept.push(test_report_bytes_text(line))
     }
     TestReportTally { bad_lines: kept, bad_count: t.bad_count + 1, ..t }
 }
 
-// A report line that is not UTF-8, as text that keeps every byte: a byte that is not part of a
-// UTF-8 character reads \xNN, and a backslash reads \\, so the two never read the same.
+// A bad report line as note text that keeps every byte and never moves a terminal: a backslash
+// reads \\, and a control byte or a byte that is not part of a UTF-8 character reads \xNN. Every
+// bad line takes this form, so two lines never read the same.
 fn test_report_bytes_text(line: Bytes) -> Str {
     let digits = "0123456789abcdef"
     let mut text = ""
     let mut i = 0
     while i < line.len() {
         let b = line.get(i) ?? 0
-        let width = if b < 128 { 1 } else if b >= 194 && b < 224 { 2 } else if b >= 224 && b < 240 { 3 } else if b >= 240 && b < 245 { 4 } else { 0 }
+        let width = if b < 32 || b == 127 { 0 } else if b < 128 { 1 } else if b >= 194 && b < 224 { 2 } else if b >= 224 && b < 240 { 3 } else if b >= 240 && b < 245 { 4 } else { 0 }
         let ch = if width > 0 && i + width <= line.len() {
             match line.slice(i, i + width).to_str() {
                 Ok(c) => c
@@ -4799,7 +4803,7 @@ fn test_report_tail(t: TestReportTally, report: Str, file: Str, json: Bool) -> T
         let line = match raw.to_str() {
             Ok(s) => s
             Err(_) => {
-                n = test_tally_bad(n, test_report_bytes_text(raw))
+                n = test_tally_bad(n, raw)
                 continue
             }
         }
@@ -4959,12 +4963,6 @@ fn test_file_outcome(file: Str, r: TestFileResult, t: TestReportTally, limits: C
         None => ""
     }
     let output = test_output_text(r.out, r.err_out)
-    if r.end.is_none() {
-        // A runner fault: the one diagnostic is the cause key, and the test lines that the
-        // binary wrote before it count.
-        let fault = r.fault ?? test_result_lost_diag(json)
-        return ("aborted", "{head}\"outcome\":\"aborted\",{running}\"diagnostics\":[{fault}],\"summary\":{test_summary_json(t, r.duration_ms)}}", "ABORTED {file}\n{test_indent(fault)}")
-    }
     let mut how_key = ""
     let mut how = ""
     let mut help = ""
@@ -4972,40 +4970,47 @@ fn test_file_outcome(file: Str, r: TestFileResult, t: TestReportTally, limits: C
         Some(name) => " in test \"{name}\""
         None => ""
     }
-    match r.end.unwrap() {
-        ChildEnd.Limit(kind) => {
+    match r.end {
+        Some(ChildEnd.Limit(kind)) => {
             let value = test_limit_value(limits, kind)
             how_key = "\"limit\":\"{limit_name(kind)}\",\"{limit_report_key(kind)}\":{value},"
             how = limit_end_line(kind, value, t.running)
             help = "  help: {limit_end_help(kind)}\n"
         }
-        ChildEnd.Signaled(n) => {
+        Some(ChildEnd.Signaled(n)) => {
             let name = process.signal_name(n)
             how_key = "\"signal\":\"{name}\","
             how = "signal {name}{in_test}"
         }
-        ChildEnd.Exited(code) => {
+        Some(ChildEnd.Exited(code)) => {
             // An exit before the end line is an abort, an exit with code 0 too.
             if !t.ended {
                 how_key = "\"exit_code\":{code},"
                 how = "exit code {code}{in_test}"
             }
         }
+        None => {}
     }
     let summary = test_summary_json(t, r.duration_ms)
-    if how_key == "" && t.bad_count > 0 {
-        // A bad report line is a lost result. A signal, a limit or an exit code is the cause key
-        // instead when the binary also ended that way.
-        let mut notes = t.bad_lines
-        if t.bad_count > notes.len() {
-            notes.push(test_note_cut(t.bad_count - notes.len()))
+    // A runner fault, or a bad report line, which is a lost result: the one diagnostic is the
+    // cause key, and the test lines that the binary wrote before it count. A signal, a limit or
+    // an exit code is the cause key instead when the binary also ended that way.
+    let fault: Str? = if r.end.is_none() {
+        Some(r.fault ?? test_result_lost_diag(json, t))
+    } else if how_key == "" && t.bad_count > 0 {
+        Some(test_result_lost_diag(json, t))
+    } else {
+        None
+    }
+    match fault {
+        Some(d) => {
+            let mut block = ""
+            if output != "" {
+                block = "--- {file} ---\n{output}\n"
+            }
+            return ("aborted", "{head}\"outcome\":\"aborted\",{running}\"diagnostics\":[{d}],\"summary\":{summary}}", "{block}ABORTED {file}\n{test_indent(d)}")
         }
-        let d = test_runner_fault(json, "ice", "TestResultLost", TEST_RESULT_LOST, TEST_RESULT_LOST_MESSAGE, notes)
-        let mut block = ""
-        if output != "" {
-            block = "--- {file} ---\n{output}\n"
-        }
-        return ("aborted", "{head}\"outcome\":\"aborted\",{running}\"diagnostics\":[{d}],\"summary\":{summary}}", "{block}ABORTED {file}\n{test_indent(d)}")
+        None => {}
     }
     if how_key == "" {
         let mut block = ""
@@ -5186,12 +5191,6 @@ fn test_binary_did_not_run(json: Bool, verb: Str, detail: Str) -> Str {
     test_runner_fault(json, "error", "TestBinaryDidNotRun", TEST_BINARY_DID_NOT_RUN, "could not {verb} the test binary: {detail}", [])
 }
 
-// Whether a report holds the end line: a binary that exits 0 before it is an abort (§8.10.5).
-fn test_report_ended(report: Str) -> Bool ! FS.Read {
-    let text = read_file(report)
-    text.starts_with("\{\"record\":\"end\"") || text.contains("\n\{\"record\":\"end\"")
-}
-
 fn test_tally_sum(a: TestReportTally, b: TestReportTally) -> TestReportTally {
     TestReportTally { passed: a.passed + b.passed, failed: a.failed + b.failed, panicked: a.panicked + b.panicked, skipped: a.skipped + b.skipped, ..a }
 }
@@ -5234,16 +5233,12 @@ fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
     let limits = match test_run_limits(a, if args_positional_count(a) == 0 { "" } else { paths.get(0).unwrap() }) {
         Ok(l) => l
         Err(texts) => {
-            for text in texts {
-                usage_errors.push(text)
-            }
+            usage_errors = usage_errors.append(texts)
             ChildLimits {}
         }
     }
     let (test_files, path_errors) = test_select_files(paths)
-    for text in path_errors {
-        usage_errors.push(text)
-    }
+    usage_errors = usage_errors.append(path_errors)
     if usage_errors.len() > 0 {
         for text in usage_errors {
             io.eprint_raw(text)
@@ -5433,7 +5428,6 @@ fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
             let bcmd = build_args.get(si).unwrap()
             let rcmd = run_args.get(si).unwrap()
             let bin_path = output_bins.get(si).unwrap()
-            let report = "{run_dir}/{si}.report"
             let done_mark = "{run_dir}/{si}.done"
             let forced = if test_files.get(si).unwrap() == fault_file { fault_mode } else { "" }
             async.spawn(fn() {
@@ -5505,14 +5499,7 @@ fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
                     write_test_mark("{run_dir}/{idx}.lost")
                     return 0
                 }
-                let ok = match result.end {
-                    Some(ChildEnd.Exited(0)) => test_report_ended(report)
-                    _ => false
-                }
                 results.send(result)
-                if dots {
-                    test_progress_mark(dot_ch, if ok { "{esc}[32m.{esc}[0m" } else { "{esc}[31mF{esc}[0m" })
-                }
                 sem.send(1)
                 // The last act of the task: once the mark is there, the result is in the channel.
                 write_test_mark(done_mark)
@@ -5552,7 +5539,7 @@ fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
                 if file_exists(report) == 1 {
                     tallies.set(n, test_report_tail(tallies.get(n).unwrap(), report, file, json))
                 }
-                let lost = test_file_lost(n, json)
+                let lost = test_file_lost(n)
                 let mut r = lost
                 if prepass.get(n).unwrap().len() > 0 {
                     r = TestFileResult { diagnostics: prepass.get(n).unwrap(), ..lost }
@@ -5569,7 +5556,13 @@ fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
                     }
                     r = results_by.get(n).unwrap() ?? lost
                 }
-                let (outcome, line, block) = test_file_outcome(file, r, tallies.get(n).unwrap(), limits, verbose, json)
+                let t = tallies.get(n).unwrap()
+                let (outcome, line, block) = test_file_outcome(file, r, t, limits, verbose, json)
+                // A build failure got its mark from its task. The mark of a file that ran waits for
+                // its outcome, because only the whole report shows a bad line or a lost result.
+                if dots && outcome != "build_failed" {
+                    test_progress_mark(dot_ch, if outcome == "ran" && t.failed + t.panicked == 0 { "{esc}[32m.{esc}[0m" } else { "{esc}[31mF{esc}[0m" })
+                }
                 if json {
                     // What the binary printed goes to stderr, so stdout holds only the stream.
                     io.eprint_raw(r.out)
@@ -5629,14 +5622,20 @@ fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
 }
 
 // The result of a file whose task ended with no result: a bug of blink test, so an ice.
-fn test_file_lost(idx: Int, json: Bool) -> TestFileResult {
-    TestFileResult { idx: idx, diagnostics: [], end: None, fault: Some(test_result_lost_diag(json)), duration_ms: 0, out: "", err_out: "" }
+// It has no fault: the file's outcome makes the I0016, so that the bad report lines become its notes.
+fn test_file_lost(idx: Int) -> TestFileResult {
+    TestFileResult { idx: idx, diagnostics: [], end: None, fault: None, duration_ms: 0, out: "", err_out: "" }
 }
 
 let TEST_RESULT_LOST_MESSAGE = "blink test lost the result of this file"
 
-fn test_result_lost_diag(json: Bool) -> Str {
-    test_runner_fault(json, "ice", "TestResultLost", TEST_RESULT_LOST, TEST_RESULT_LOST_MESSAGE, [])
+// The I0016 of a lost result. Its notes are the report lines that the runner could not read.
+fn test_result_lost_diag(json: Bool, t: TestReportTally) -> Str {
+    let mut notes = t.bad_lines
+    if t.bad_count > notes.len() {
+        notes.push(test_note_cut(t.bad_count - notes.len()))
+    }
+    test_runner_fault(json, "ice", "TestResultLost", TEST_RESULT_LOST, TEST_RESULT_LOST_MESSAGE, notes)
 }
 
 fn cmd_check(p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, IO, FS.Read, Env.Read, FS.Write, Process.Spawn, FS.Delete, Net.Connect, Env.Exit {
