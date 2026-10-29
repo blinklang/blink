@@ -985,7 +985,7 @@ A `failed` or `panicked` record of a test that calls `for_each` can also carry `
 total = passed + failed + panicked + skipped
 ```
 
-A test counts once, under the status of its record. A `file` summary covers the `test` lines of that file; the `run` summary covers all `test` lines. The test binary exits non-zero when `failed + panicked > 0`. An unexpected pass counts as `failed` (§8.10.6). A panic has no exit code of its own. `blink test` exits `1` when `failed + panicked + files.build_failed + files.aborted > 0`, and `0` otherwise. It exits `2` for a usage error, before any file builds (§8.10.5, §8.10.7).
+A test counts once, under the status of its record. A `file` summary covers the `test` lines of that file; the `run` summary covers all `test` lines. The test binary exits non-zero when `failed + panicked > 0`. An unexpected pass counts as `failed` (§8.10.6). A panic has no exit code of its own. `blink test` exits `1` when `failed + panicked + files.build_failed + files.aborted > 0`, and `0` otherwise. It exits `2` for a usage error, before any file builds. A path that does not exist and a directory with no test file are usage errors (§8.10.5, §8.10.7).
 
 **Human-readable output.** The per-test line for a panicked test uses the word `PANIC`, and the panic message follows it:
 
@@ -1024,6 +1024,34 @@ blink test --prop                # run only property tests
 blink test --doc                 # run only doc-tests
 blink test --coverage            # with coverage report (JSON)
 blink test --timeout 30m         # change the time limit of each test binary (§8.10.7)
+```
+
+**Which files `blink test <path>` runs.** A path on the command line names a directory or a file. A path that names neither (for example `/dev/null` or a FIFO) is a usage error (§8.10.7). `blink test` searches a directory for test files. It takes a file that you name as given.
+
+- A *test file* is a `.bl` file with a top-level `test` declaration. This is a fact about the syntax of the file. A `test.failing` declaration (§8.10.6) counts as a `test` declaration, so a file whose only test is a `test.failing` is a test file. The word `test` in a string or in a comment does not make a test file.
+- A directory walk goes into every subdirectory. It skips two things. It skips a file or directory whose name starts with `.`. It skips the `build/` directory at the project root, where the tool writes its output. These skips apply only to entries that the walk finds. A path that you name is always taken: `blink test .ci/` walks `.ci/`, and `blink test build/` at the project root walks that `build/`. The project root is the package root that §10.5 *Project root discovery* finds for the path. A directory named `build` at any other place is walked like any other directory. When no `blink.toml` is above the path, there is no package root, and the walk skips only the names that start with `.`.
+- A file that you name is not searched. It runs even if it has no `test` declaration. It gives one `file` line with `outcome: "ran"` and total `0` (§8.10.5), and the exit code is `0`.
+
+```
+app/
+  blink.toml
+  .git/               skipped: the name starts with "."
+  build/              skipped: the build directory at the project root
+  src/
+    build/            walked: it is not at the project root
+      test_gen.bl
+    test_main.bl
+
+notests/
+  lib.bl              has no test declaration
+```
+
+```sh
+blink test app/               # runs src/build/test_gen.bl and src/test_main.bl
+blink test app/.ci/           # walks .ci/: a named path is always taken
+blink test app/build/         # walks the build/ at the project root: a named path is always taken
+blink test notests/lib.bl     # exit 0: one file line "ran" with total 0, then the run line
+blink test notests/           # exit 2: the directory holds no test file (§8.10.7)
 ```
 
 #### 8.10.1 Test Effect Handlers: `capture_log`
@@ -1756,9 +1784,9 @@ Every test file gives exactly one `file` line (§8.10). Its `outcome` is one val
 |-----------|---------|-------------------------|
 | `"ran"` | The test binary reported the end of its run and was not ended by a signal or a limit. | — |
 | `"build_failed"` | The file did not build. None of its tests ran. | `diagnostics` |
-| `"aborted"` | The test binary was ended by a signal, or by a limit of the runner (§8.10.7), or it exited before it reported the end of its run. An exit with code `0` before that point is `aborted` too. | `signal`, `exit_code` or `limit` (with its `limit_*` key); `running` when known |
+| `"aborted"` | The runner saw no report that the file's run ended. The test binary was ended by a signal, or by a limit of the runner (§8.10.7), or it exited before it reported the end of its run. An exit with code `0` before that point is `aborted` too. The runner itself can also fail: it could not start the test binary, it could not wait for it, or it lost the result of the file. | `signal`, `exit_code`, `limit` (with its `limit_*` key) or `diagnostics`; `running` when known |
 
-Every `file` line carries the six-key `summary`. For `build_failed`, every count is `0`: the file added no tests. For `aborted`, the counts cover the `test` lines that the file wrote before it ended. Those lines stay in the stream and count in the `run` summary.
+Every `file` line carries the six-key `summary`. For `build_failed`, every count is `0`: the file added no tests. For `aborted`, the counts cover the `test` lines that the file wrote before it ended or before the runner failed. Those lines stay in the stream and count in the `run` summary.
 
 ```json
 {"record": "file", "file": "tests/test_codec.bl", "outcome": "ran", "summary": {"total": 0, "passed": 0, "failed": 0, "panicked": 0, "skipped": 0, "duration_ms": 1}}
@@ -1766,10 +1794,21 @@ Every `file` line carries the six-key `summary`. For `build_failed`, every count
  "diagnostics": [{"severity": "error", "name": "TypeError", "code": "E0300", "message": "expected Int, found Str", "span": {"file": "tests/test_parse.bl", "line": 14, "col": 22}}]}
 {"record": "file", "file": "tests/test_ffi.bl", "outcome": "aborted", "signal": "SIGSEGV", "running": "reads mapped page", "summary": {"total": 2, "passed": 2, "failed": 0, "panicked": 0, "skipped": 0, "duration_ms": 9}}
 {"record": "file", "file": "tests/test_hang.bl", "outcome": "aborted", "limit": "timeout", "limit_ms": 600000, "running": "hangs", "summary": {"total": 0, "passed": 0, "failed": 0, "panicked": 0, "skipped": 0, "duration_ms": 602004}}
-{"record": "run", "summary": {"total": 2, "passed": 2, "failed": 0, "panicked": 0, "skipped": 0, "duration_ms": 602014}, "files": {"total": 4, "ran": 1, "build_failed": 1, "aborted": 2}}
+{"record": "file", "file": "tests/test_net.bl", "outcome": "aborted",
+ "diagnostics": [{"severity": "error", "name": "TestBinaryDidNotRun", "code": "E0856", "message": "could not start the test binary: EAGAIN"}],
+ "summary": {"total": 0, "passed": 0, "failed": 0, "panicked": 0, "skipped": 0, "duration_ms": 1}}
+{"record": "file", "file": "tests/test_pipe.bl", "outcome": "aborted", "running": "reads socket",
+ "diagnostics": [{"severity": "error", "name": "TestBinaryDidNotRun", "code": "E0856", "message": "could not wait for the test binary: ECHILD"}],
+ "summary": {"total": 2, "passed": 1, "failed": 1, "panicked": 0, "skipped": 0, "duration_ms": 35}}
+{"record": "file", "file": "tests/test_lost.bl", "outcome": "aborted",
+ "diagnostics": [{"severity": "ice", "name": "TestResultLost", "code": "I0016", "message": "blink test lost the result of this file"}],
+ "summary": {"total": 0, "passed": 0, "failed": 0, "panicked": 0, "skipped": 0, "duration_ms": 0}}
+{"record": "run", "summary": {"total": 4, "passed": 3, "failed": 1, "panicked": 0, "skipped": 0, "duration_ms": 602014}, "files": {"total": 7, "ran": 1, "build_failed": 1, "aborted": 5}}
 ```
 
 The first line is a file that built and holds no tests. Compare it with the second: the counts are the same, and `outcome` tells the two apart.
+
+The last three `file` lines are runner faults. The first one is a spawn failure: the file built, the runner could not start the test binary, and no `test` line exists, so every count is `0`. The second one is a wait failure: the binary wrote two `test` lines, and then the runner could not wait for it. Those two lines stay in the stream and count in the `file` summary and in the `run` summary. `running` names the test that had no `test` line yet. The third one is a lost result: the runner has no data about the file, so it reports `ice`. All three files count in `files.aborted`, so the run exits `1`. The `run` line above counts `files.aborted` as `5`: the signal, the limit and the three faults.
 
 **`build_failed` fields.**
 
@@ -1782,11 +1821,16 @@ The first line is a file that built and holds no tests. Compare it with the seco
 
 **`aborted` fields.**
 
-- Exactly one of `signal`, `exit_code` and `limit` is present. A process that a signal ended has no exit code. A limit end has neither `signal` nor `exit_code`: the runner ended the binary, so the line names the limit and not the signal that the runner sent. A consumer that reads only `signal` and `exit_code` can see a line with neither, and must read `limit` too.
+- Exactly one of `signal`, `exit_code`, `limit` and `diagnostics` is present. The set of these four cause keys is closed. A process that a signal ended has no exit code. A limit end has neither `signal` nor `exit_code`: the runner ended the binary, so the line names the limit and not the signal that the runner sent. A runner fault has none of the three. A consumer that reads only `signal` and `exit_code` can see a line with neither, and must read `limit` and `diagnostics` too.
 - `limit` is the name of the limit that ended the binary. It is a closed enum: `"timeout"`, `"memory"` or `"processes"`. A limit end carries one more key, `limit_ms` for `"timeout"`, `limit_bytes` for `"memory"` or `limit_count` for `"processes"`, and never a second `limit_*` key (§8.10.7).
 - `signal` is the signal name as a string, for example `"SIGSEGV"`. When the platform has no name for the signal, the value is `"SIG<n>"`, for example `"SIG34"`. A signal number is not portable (`SIGBUS` is 7 on Linux and 10 on macOS), so the record never carries a bare number.
 - `exit_code` is the code of a process that exited before it reported the end of its run.
-- `running` is the name of the test that was running when the binary ended. It is present only when `blink test` knows it, and it is never a guess or a placeholder. When the binary ended outside any test, `running` is absent.
+- `diagnostics` marks a runner fault: the runner failed, and the test binary did not report how it ended. It is a list in the shape of §8.6, with the same key and the same element shape as for `build_failed`. On an `aborted` line it always holds exactly one diagnostic, and that diagnostic has no `span`. Two codes occur:
+  - E0856 `TestBinaryDidNotRun`, `severity: "error"`: the runner could not start the test binary, or could not wait for it to end. The state of the host causes this, for example no free process slot or no memory. `message` is `could not start the test binary: ...` or `could not wait for the test binary: ...` and ends with the system error.
+  - I0016 `TestResultLost`, `severity: "ice"`: the runner lost the result of the file. This is a bug in `blink test`, not a fault of the host or of the test file.
+- A consumer tells outcomes apart by `outcome`, not by whether `diagnostics` is present. Both `build_failed` and `aborted` can carry it. On `build_failed` it is a list of any length that is not `0`. On `aborted` it holds one element.
+- The `test` lines that the file wrote before the fault stay in the stream and count. A spawn failure has none. `blink test` may retry a start that failed, for example after `EAGAIN`. The stream does not show a retry. It shows only the final result.
+- `running` is the name of the test that was running when the binary ended. It is present only when `blink test` knows it, and it is never a guess or a placeholder. When the binary ended outside any test, `running` is absent. A line with `diagnostics` can carry it too.
 
 *Informative.* `blink test` can learn `running` because the test lines are written as each test ends: the running test is the first test, in the file's run order under the same filter, that has no `test` line.
 
@@ -1798,7 +1842,7 @@ files.total = files.ran + files.build_failed + files.aborted
 
 When `files.aborted > 0`, the test counts are a lower bound: tests of an aborted file that wrote no `test` line are in no count.
 
-`blink test` exits `1` when `failed + panicked + files.build_failed + files.aborted > 0`, and `0` otherwise. It has one other exit code: `2` for a usage error (§8.10.7). A usage error stops the run before any file builds, so it has no `file` line and no `run` line, and the counts above do not apply to it.
+`blink test` exits `1` when `failed + panicked + files.build_failed + files.aborted > 0`, and `0` otherwise. It has one other exit code: `2` for a usage error (§8.10.7). A usage error stops the run before any file builds, so it has no `file` line and no `run` line, and the counts above do not apply to it. A runner fault on one file is not a usage error. It is an `aborted` file, so the run exits `1`.
 
 **Human-readable output.** A file that does not build prints `BUILD FAILED` and its diagnostics. A file that aborted prints `ABORTED` and how it ended, with the test name when it is known:
 
@@ -1813,9 +1857,16 @@ ABORTED tests/test_ffi.bl
 ABORTED tests/test_hang.bl
   timed out after 10m in test "hangs"
   help: raise it with --timeout <duration> or [test] timeout in blink.toml; none turns it off
+
+ABORTED tests/test_net.bl
+  error[E0856]: could not start the test binary: EAGAIN
+
+ABORTED tests/test_lost.bl
+  ice[I0016]: blink test lost the result of this file
+  note: this is a bug in blink test; please report it
 ```
 
-A limit end prints the limit, its value and a `help:` line (§8.10.7).
+A runner fault prints the diagnostic in its usual form. For I0016 the output says that the fault is a bug in `blink test` and asks the user to report it. A limit end prints the limit, its value and a `help:` line (§8.10.7).
 
 The summary line adds a file clause for each of these counts only when it is above `0`:
 
@@ -2080,7 +2131,77 @@ error: --processes needs Linux with a delegated cgroup v2; this session has none
 
 When both flags fail, the runner prints both errors. The help line shows one way to get a delegated cgroup v2; §4.4.8 says which hosts have one.
 
-**Usage errors.** A usage error stops `blink test` before it builds any file. These are usage errors: a bad value for `--timeout`, `--memory` or `--processes`, a bad value of `[test] timeout`, and a limit that the host cannot apply. The runner prints the error as text on standard error, also with `--json`. It writes no `test`, `file` or `run` line, because no file ran. The exit code is `2`. It differs from the exit code `1` of a run with failures, so a script can tell a bad command from a bad test run. A usage error is not an outcome of a test file (§8.10.5).
+**Usage errors.** A usage error stops `blink test` before it builds any file. These are usage errors: a bad value for `--timeout`, `--memory` or `--processes`, a bad value of `[test] timeout`, a limit that the host cannot apply, a path that does not exist, a path that is neither a file nor a directory, and a selection that holds no test file (*Paths that select no test file*). The runner prints the error as text on standard error, also with `--json`. It writes no `test`, `file` or `run` line, because no file ran. The exit code is `2`. It differs from the exit code `1` of a run with failures, so a script can tell a bad command from a bad test run. A usage error is not an outcome of a test file (§8.10.5).
+
+**Paths that select no test file.** The runner checks every path before it builds any file (§8.10, *Which files `blink test <path>` runs*).
+
+- A path that does not exist is a usage error.
+- A path that exists and is neither a file nor a directory (for example `/dev/null` or a FIFO) is a usage error.
+- A directory that holds no test file is a usage error. The skips of §8.10 apply to what the walk finds, never to a path that you name.
+- A file that you name is never an empty selection. A named file with no `test` declaration is not a usage error: it runs and gives a `file` line with `outcome: "ran"` and total `0`, and the exit code is `0`.
+- With several paths, any path that does not exist gives exit `2`, even when the other paths are fine. When all paths together give no test file, the exit code is `2`. Otherwise the runner runs the files that it found and exits by the formula in §8.10.5.
+- The runner names every bad path in one run, not only the first. The message for a directory with no test file says what a test file is.
+
+The rule has one plain statement: a directory is searched for test files, and a named file is taken as given.
+
+```sh
+blink test empty/               # exit 2, nothing on stdout
+blink test empty/ --json        # the same: exit 2, nothing on stdout
+```
+
+```
+error: no test files in empty/ (a test file is a .bl file with a test block)
+```
+
+```sh
+blink test missing/             # exit 2
+```
+
+```
+error: path not found: missing/
+```
+
+```sh
+blink test /dev/null            # exit 2
+```
+
+```
+error: not a file or directory: /dev/null
+```
+
+The directory `a/` holds tests. The command below builds nothing, because one path does not exist:
+
+```sh
+blink test a/ missing/          # exit 2
+```
+
+```
+error: path not found: missing/
+```
+
+Both bad paths appear in one run:
+
+```sh
+blink test src/ tset/ tsets/    # exit 2, even though src/ holds tests
+```
+
+```
+error: path not found: tset/
+error: path not found: tsets/
+```
+
+A named file and the directory that holds only that file give different results:
+
+```sh
+blink test notests/lib.bl       # exit 0: "ran", total 0
+blink test notests/             # exit 2
+```
+
+```
+error: no test files in notests/ (a test file is a .bl file with a test block)
+```
+
+With `--json`, the standard output of each usage error above stays empty.
 
 **What the report shows.** A limit end is an `aborted` file (§8.10.5). The `file` line has a `limit` key that holds `"timeout"`, `"memory"` or `"processes"`, and one key that holds the value of the limit. The unit is in the name of the key, and a line has exactly one of them, the one that matches `limit`:
 

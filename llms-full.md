@@ -1530,9 +1530,9 @@ build/blink check src/main.bl --format json
 # it ends), "file" (one per file) or "run" (last). Ignore a record value you do not know.
 # Test status: passed | failed | panicked | skipped. A summary has total, passed, failed,
 # panicked, skipped, duration_ms. File outcome: ran | build_failed (with diagnostics, all-zero
-# summary) | aborted (one of signal, exit_code, limit + its limit_* key; running when known).
+# summary) | aborted (one of signal, exit_code, limit + its limit_* key, or diagnostics: one diagnostic for a runner fault, E0856 or I0016; running when known).
 # The run line adds files: total, ran, build_failed, aborted. Exit 1 when failed + panicked +
-# build_failed + aborted > 0; exit 2 on a usage error (such as no test files), with no lines.
+# build_failed + aborted > 0; exit 2 on a usage error, with no lines. A directory with no test file (a .bl file with a test block) and a path that does not exist are usage errors; a file you name is taken as given.
 # A file the front end accepts can fail a later step; it then has one diagnostic for the step:
 # I0017 the generated C did not compile (ice), E0857 the link failed, E0858 a native dependency
 # did not build. Its notes hold the tool's output (cut at 200 lines, the last note says so).
