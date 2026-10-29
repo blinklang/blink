@@ -1,0 +1,162 @@
+// A test file that does not build gives one `file` line with `outcome: "build_failed"`, its own
+// diagnostics and an all-zero summary, and the other files still run (sections/06_tooling.md
+// §8.10.5). The run counts it in `files.build_failed` and exits 1. A file that built and ran no
+// test has the same counts but `outcome: "ran"`.
+
+import std.process.{ChildEnd, ChildLimits, ProcessResult}
+import std.time.{Duration}
+import std.json.{json_clear, json_parse, json_get, json_as_str, json_as_int, json_len, json_at}
+
+let PACKAGE = "[package]\nname = \"app\"\nversion = \"0.1.0\"\n"
+
+let GOOD = #"test "good" {
+    assert_eq(1, 1)
+}
+"#
+
+let BAD_A = #"test "bad a" {
+    let x: Int = "a"
+    assert_eq(x, 1)
+}
+"#
+
+let BAD_B = #"fn helper() -> Int {
+    "b"
+}
+
+test "bad b" {
+    assert_eq(helper(), 1)
+}
+"#
+
+// Passes the front end and fails only at link time.
+let LINK = #"@ffi("c", "blink_test_symbol_that_no_library_defines")
+@trusted(audit: "test")
+fn missing() -> Int ! ()
+
+test "links" {
+    assert(missing() == 1)
+}
+"#
+
+// A runner bug that hangs fails this test instead of the gate.
+fn sh(cmd: Str) -> ProcessResult {
+    process.run("sh", ["-c", cmd], limits: ChildLimits { timeout: Some(Duration.seconds(300)) }).unwrap()
+}
+
+// Runs `blink test <args>` in a fresh project with the files tests/<name>.bl.
+fn blink_test(files: List[(Str, Str)], args: Str) -> ProcessResult {
+    let dir = sh("mktemp -d /tmp/blink_test_build_failed.XXXXXX").out.trim()
+    let _ = sh("mkdir -p {dir}/src {dir}/tests")
+    write_file("{dir}/blink.toml", PACKAGE)
+    // A lock no older than blink.toml keeps dependency resolution out of the command.
+    write_file("{dir}/blink.lock", "[metadata]\nlockfile-version = 1\n")
+    for f in files {
+        let (name, source) = f
+        write_file("{dir}/tests/{name}.bl", source)
+    }
+    // BLINK_BIN makes the build workers the compiler under test, not the blink on PATH.
+    let r = sh("B=$(pwd)/build/blink; cd {dir} && env -u BLINK_PER_MODULE BLINK_BIN=$B $B test {args}")
+    let _ = sh("rm -rf {dir}")
+    r
+}
+
+// The file line of `file`, or "".
+fn file_line(out: Str, file: Str) -> Str {
+    for line in out.split("\n") {
+        if line.starts_with("\{\"record\":\"file\",\"file\":\"{file}\"") {
+            return line
+        }
+    }
+    ""
+}
+
+fn run_line(out: Str) -> Str {
+    for line in out.split("\n") {
+        if line.starts_with("\{\"record\":\"run\"") {
+            return line
+        }
+    }
+    ""
+}
+
+fn int_at(line: Str, outer: Str, key: Str) -> Int {
+    json_clear()
+    json_as_int(json_get(json_get(json_parse(line), outer), key))
+}
+
+fn diag(r: ProcessResult) -> Str {
+    "exit {r.end}\nstdout:\n{r.out}\nstderr:\n{r.err_out}"
+}
+
+// Every key of the summary is 0, duration_ms included.
+fn all_zero(line: Str) -> Bool {
+    let mut zero = true
+    for key in ["total", "passed", "failed", "panicked", "skipped", "duration_ms"] {
+        if int_at(line, "summary", key) != 0 {
+            zero = false
+        }
+    }
+    zero
+}
+
+test "each file that does not build gets its own diagnostics, and the other files run" {
+    let r = blink_test([("test_bad_a", BAD_A), ("test_bad_b", BAD_B), ("test_good", GOOD)], "--json tests")
+    assert_eq(r.end, ChildEnd.Exited(1), diag(r))
+    for name in ["test_bad_a", "test_bad_b"] {
+        let file = "tests/{name}.bl"
+        let line = file_line(r.out, file)
+        json_clear()
+        let root = json_parse(line)
+        assert_eq(json_as_str(json_get(root, "outcome")), "build_failed", diag(r))
+        let diags = json_get(root, "diagnostics")
+        assert(json_len(diags) > 0, line)
+        let first = json_at(diags, 0)
+        assert_eq(json_as_str(json_get(first, "severity")), "error", line)
+        assert_eq(json_as_str(json_get(json_get(first, "span"), "file")), file, line)
+        assert(all_zero(line), line)
+    }
+    assert(file_line(r.out, "tests/test_good.bl").contains("\"outcome\":\"ran\""), diag(r))
+    let run = run_line(r.out)
+    assert_eq(int_at(run, "files", "total"), 3, run)
+    assert_eq(int_at(run, "files", "ran"), 1, run)
+    assert_eq(int_at(run, "files", "build_failed"), 2, run)
+    assert_eq(int_at(run, "files", "aborted"), 0, run)
+    assert_eq(int_at(run, "summary", "passed"), 1, run)
+    // The diagnostics ride the file line, so they are not printed on stderr too.
+    assert(!r.err_out.contains("\"TypeError\""), diag(r))
+}
+
+test "a file that ran no test beside a file that did not build" {
+    let r = blink_test([("test_zero", GOOD), ("test_broken", BAD_A)], "--json --filter nomatch tests")
+    assert_eq(r.end, ChildEnd.Exited(1), diag(r))
+    let zero = file_line(r.out, "tests/test_zero.bl")
+    assert(zero.contains("\"outcome\":\"ran\""), diag(r))
+    assert_eq(int_at(zero, "summary", "total"), 0, zero)
+    let broken = file_line(r.out, "tests/test_broken.bl")
+    assert(broken.contains("\"outcome\":\"build_failed\""), diag(r))
+    assert(all_zero(broken), broken)
+    let run = run_line(r.out)
+    assert_eq(int_at(run, "files", "ran"), 1, run)
+    assert_eq(int_at(run, "files", "build_failed"), 1, run)
+    assert_eq(int_at(run, "summary", "total"), 0, run)
+}
+
+test "a file that fails at link time is build_failed with a diagnostic" {
+    let r = blink_test([("test_link", LINK), ("test_good", GOOD)], "--json tests")
+    assert_eq(r.end, ChildEnd.Exited(1), diag(r))
+    let line = file_line(r.out, "tests/test_link.bl")
+    json_clear()
+    let root = json_parse(line)
+    assert_eq(json_as_str(json_get(root, "outcome")), "build_failed", diag(r))
+    assert(json_len(json_get(root, "diagnostics")) > 0, line)
+    assert(file_line(r.out, "tests/test_good.bl").contains("\"outcome\":\"ran\""), diag(r))
+}
+
+test "the human output prints BUILD FAILED with the diagnostics and a file clause in the summary" {
+    let r = blink_test([("test_bad_a", BAD_A), ("test_good", GOOD)], "tests")
+    assert_eq(r.end, ChildEnd.Exited(1), diag(r))
+    assert(r.out.contains("BUILD FAILED tests/test_bad_a.bl\n"), diag(r))
+    assert(r.out.contains("TypeError"), diag(r))
+    assert(r.out.contains("1 passed, 0 failed (of 1); 1 file did not build\n"), diag(r))
+}

@@ -1,0 +1,43 @@
+// A file whose task hands back no result is the runner's own fault. Its file line reads
+// build_failed (no test in it ran) with one internal error diagnostic, TestResultLost, so it
+// never reads as a compile error of the user's code, and it still fails the run (§8.10.5).
+//
+// BLINK_DEV_TEST_DROP_RESULT=<file> makes the task for that file end without its result.
+// Fixture basenames must be unique per worker: `blink test` writes each binary to build/<basename>.
+
+import compile_test_helpers
+
+fn run_dropping(scratch: Str, dropped: Str, flag: Str) -> Str {
+    let r = process.run("sh", ["-c", "BLINK_DEV_TEST_DROP_RESULT={dropped} build/blink test {flag} {scratch} 2>&1; echo \"exit=$?\""]).unwrap()
+    r.out
+}
+
+test "a file with no result gets one internal error diagnostic" {
+    let scratch = "{compile_test_helpers.scratch_root()}/_test_no_result_{getpid()}"
+    shell_exec("rm -rf {scratch}")
+    shell_exec("mkdir -p {scratch}")
+    let mut gi = 0
+    while gi < 3 {
+        write_file("{scratch}/no_result_good_{gi}_{getpid()}.bl", "test \"good_{gi}\" \{\n    assert(1 + 1 == 2)\n}\n")
+        gi = gi + 1
+    }
+    let dropped = "{scratch}/no_result_good_1_{getpid()}.bl"
+
+    let json = run_dropping(scratch, dropped, "--json")
+    let jdiag = "captured:\n{json}"
+    let lost = "\{\"record\":\"file\",\"file\":\"{dropped}\",\"outcome\":\"build_failed\",\"summary\":\{\"total\":0,\"passed\":0,\"failed\":0,\"panicked\":0,\"skipped\":0,\"duration_ms\":0},\"diagnostics\":[\{\"severity\":\"ice\",\"name\":\"TestResultLost\",\"code\":\"I0016\",\"message\":\"blink test lost the file's result\"}]}"
+    assert(json.contains(lost), "expected an ice TestResultLost on the dropped file; {jdiag}")
+    assert(!json.contains("\"severity\":\"error\""), "a file with no result must not read as a compile error; {jdiag}")
+    assert(json.contains("\"files\":\{\"total\":3,\"ran\":2,\"build_failed\":1,\"aborted\":0}"), "expected the other two files to run; {jdiag}")
+    assert(json.contains("\"summary\":\{\"total\":2,\"passed\":2,"), "expected the other two files to pass; {jdiag}")
+    assert(json.contains("exit=1"), "a file with no result must fail the run; {jdiag}")
+
+    let text = run_dropping(scratch, dropped, "--quiet")
+    let tdiag = "captured:\n{text}"
+    assert(text.contains("BUILD FAILED {dropped}\n  internal compiler error[TestResultLost]: blink test lost the file's result\n"), "expected the internal error under the dropped file; {tdiag}")
+    assert(!text.contains("error[E"), "a file with no result must not read as a compile error; {tdiag}")
+    assert(text.contains("2 passed, 0 failed (of 2); 1 file did not build"), "expected the summary to count the lost file; {tdiag}")
+    assert(text.contains("exit=1"), "a file with no result must fail the run; {tdiag}")
+
+    shell_exec("rm -rf {scratch}")
+}

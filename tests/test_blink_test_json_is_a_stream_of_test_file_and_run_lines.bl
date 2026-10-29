@@ -1,0 +1,181 @@
+// `blink test --json` writes NDJSON (sections/06_tooling.md §8.10): one `test` line per test with
+// its `file`, one `file` line per file after that file's test lines, and one `run` line last. The
+// summaries carry all six keys and partition the test lines they cover. A run of one file writes
+// the same lines as a run of its directory. What the test binary prints goes to stderr, so stdout
+// holds only the stream. The run exits 1 only when a test failed or panicked, or a file did not
+// build or aborted.
+
+import std.process.{ChildEnd, ChildLimits, ProcessResult}
+import std.time.{Duration}
+import std.json.{json_clear, json_parse, json_get, json_as_str, json_as_int}
+
+let PACKAGE = "[package]\nname = \"app\"\nversion = \"0.1.0\"\n"
+
+let MIXED = #"test "passes" {
+    io.println("printed by a test")
+    assert_eq(1, 1)
+}
+
+test "fails" {
+    assert_eq(1, 2)
+}
+
+test "panics" {
+    let xs: List[Int] = []
+    let _ = xs.get(3).unwrap()
+}
+
+test "skips" {
+    skip("later")
+}
+"#
+
+let GREEN = #"test "one" {
+    assert_eq(1, 1)
+}
+
+test "two" {
+    skip("later")
+}
+"#
+
+// A runner bug that hangs fails this test instead of the gate.
+fn sh(cmd: Str) -> ProcessResult {
+    process.run("sh", ["-c", cmd], limits: ChildLimits { timeout: Some(Duration.seconds(300)) }).unwrap()
+}
+
+// Runs `blink test <args>` in a fresh project with the files tests/<name>.bl.
+fn blink_test(files: List[(Str, Str)], args: Str) -> ProcessResult {
+    let dir = sh("mktemp -d /tmp/blink_test_stream.XXXXXX").out.trim()
+    let _ = sh("mkdir -p {dir}/src {dir}/tests")
+    write_file("{dir}/blink.toml", PACKAGE)
+    // A lock no older than blink.toml keeps dependency resolution out of the command.
+    write_file("{dir}/blink.lock", "[metadata]\nlockfile-version = 1\n")
+    for f in files {
+        let (name, source) = f
+        write_file("{dir}/tests/{name}.bl", source)
+    }
+    // BLINK_BIN makes the build workers the compiler under test, not the blink on PATH.
+    let r = sh("B=$(pwd)/build/blink; cd {dir} && env -u BLINK_PER_MODULE BLINK_BIN=$B $B test {args}")
+    let _ = sh("rm -rf {dir}")
+    r
+}
+
+fn lines(text: Str) -> List[Str] {
+    let mut out: List[Str] = []
+    for line in text.split("\n") {
+        if line != "" {
+            out.push(line)
+        }
+    }
+    out
+}
+
+fn diag(r: ProcessResult) -> Str {
+    "exit {r.end}\nstdout:\n{r.out}\nstderr:\n{r.err_out}"
+}
+
+// Each duration as 0, since two runs differ only there.
+fn untimed(text: Str) -> Str {
+    let key = "\"duration_ms\":"
+    let parts = text.split(key)
+    let mut out = parts.get(0).unwrap()
+    let mut i = 1
+    while i < parts.len() {
+        let part = parts.get(i).unwrap()
+        let mut at = 0
+        while at < part.byte_len() && "0123456789.e-+".contains(part.byte_slice(at, at + 1)) {
+            at = at + 1
+        }
+        out = "{out}{key}0{part.byte_slice(at, part.byte_len())}"
+        i = i + 1
+    }
+    out
+}
+
+let SUMMARY_KEYS = ["total", "passed", "failed", "panicked", "skipped", "duration_ms"]
+
+test "test lines carry their file, each file line follows its test lines, and one run line comes last" {
+    let r = blink_test([("test_mixed", MIXED), ("test_green", GREEN)], "--json tests")
+    assert_eq(r.end, ChildEnd.Exited(1), diag(r))
+    let ls = lines(r.out)
+    let mut tests_of: Map[Str, Int] = Map()
+    let mut files_seen: List[Str] = []
+    let mut run_count = 0
+    let mut i = 0
+    while i < ls.len() {
+        let line = ls.get(i).unwrap()
+        json_clear()
+        let root = json_parse(line)
+        assert(root >= 0, "not a JSON line: {line}")
+        let record = json_as_str(json_get(root, "record"))
+        let file = json_as_str(json_get(root, "file"))
+        if record == "test" {
+            assert(!files_seen.contains(file), "a test line after the file line of {file}:\n{r.out}")
+            tests_of.insert(file, (tests_of.get(file) ?? 0) + 1)
+        } else if record == "file" {
+            let summary = json_get(root, "summary")
+            for key in SUMMARY_KEYS {
+                assert(json_get(summary, key) >= 0, "no {key}: {line}")
+            }
+            assert_eq(json_as_int(json_get(summary, "total")), tests_of.get(file) ?? 0, line)
+            assert_eq(json_as_str(json_get(root, "outcome")), "ran", line)
+            files_seen.push(file)
+        } else if record == "run" {
+            assert_eq(i, ls.len() - 1, "the run line is not last:\n{r.out}")
+            run_count = run_count + 1
+            let summary = json_get(root, "summary")
+            for key in SUMMARY_KEYS {
+                assert(json_get(summary, key) >= 0, "no {key}: {line}")
+            }
+            assert_eq(json_as_int(json_get(summary, "total")), 6, line)
+            assert_eq(json_as_int(json_get(summary, "passed")), 2, line)
+            assert_eq(json_as_int(json_get(summary, "failed")), 1, line)
+            assert_eq(json_as_int(json_get(summary, "panicked")), 1, line)
+            assert_eq(json_as_int(json_get(summary, "skipped")), 2, line)
+            let files = json_get(root, "files")
+            assert_eq(json_as_int(json_get(files, "total")), 2, line)
+            assert_eq(json_as_int(json_get(files, "ran")), 2, line)
+            assert_eq(json_as_int(json_get(files, "build_failed")), 0, line)
+            assert_eq(json_as_int(json_get(files, "aborted")), 0, line)
+        } else {
+            assert(false, "unknown record {record}: {line}")
+        }
+        i = i + 1
+    }
+    assert_eq(run_count, 1, r.out)
+    assert_eq(files_seen.len(), 2, r.out)
+    assert_eq(tests_of.get("tests/test_mixed.bl") ?? 0, 4, r.out)
+}
+
+test "what a test prints goes to stderr, never into the stream" {
+    let r = blink_test([("test_mixed", MIXED)], "--json tests")
+    assert(!r.out.contains("printed by a test"), diag(r))
+    assert(r.err_out.contains("printed by a test"), diag(r))
+}
+
+test "a run of one file writes the same lines as a run of its directory" {
+    let one = blink_test([("test_mixed", MIXED)], "--json tests/test_mixed.bl")
+    let dir = blink_test([("test_mixed", MIXED)], "--json tests")
+    assert_eq(one.end, dir.end)
+    assert_eq(untimed(one.out), untimed(dir.out))
+    let h_one = blink_test([("test_mixed", MIXED)], "tests/test_mixed.bl")
+    // The test binary prints a summary of its own, so the run's line must be the last.
+    assert(h_one.out.ends_with("\n1 passed, 1 failed, 1 panicked, 1 skipped (of 4)\n"), diag(h_one))
+    assert(!h_one.out.contains("test files:"), diag(h_one))
+}
+
+test "the run exits 0 when every file ran and no test failed or panicked" {
+    let r = blink_test([("test_green", GREEN)], "--json tests")
+    assert_eq(r.end, ChildEnd.Exited(0), diag(r))
+    let h = blink_test([("test_green", GREEN)], "tests")
+    assert_eq(h.end, ChildEnd.Exited(0), diag(h))
+    assert(h.out.ends_with("1 passed, 0 failed, 1 skipped (of 2)\n"), diag(h))
+    assert(!h.out.contains("test files:"), diag(h))
+}
+
+test "the human summary line counts every file's tests" {
+    let h = blink_test([("test_mixed", MIXED), ("test_green", GREEN)], "tests")
+    assert_eq(h.end, ChildEnd.Exited(1), diag(h))
+    assert(h.out.contains("2 passed, 1 failed, 1 panicked, 2 skipped (of 6)\n"), diag(h))
+}

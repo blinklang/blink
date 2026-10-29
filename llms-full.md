@@ -1526,10 +1526,17 @@ build/blink update                  # update deps + blink-version in blink.toml
 # the first machine-applicable fix of a diagnostic. E0319 lists `..` first, then `f: _` (a suggestion).
 build/blink check src/main.bl --format json
 
-# blink test --json: per test file, {"results": [...], "summary": {...}}.
-# Each result status is passed | failed | panicked | skipped (a panic carries
-# its message). summary has total, passed, failed, panicked, skipped, duration_ms.
+# blink test --json: one JSON object per line (§8.10.5). "record" is "test" (one per test, as
+# it ends), "file" (one per file) or "run" (last). Ignore a record value you do not know.
+# Test status: passed | failed | panicked | skipped. A summary has total, passed, failed,
+# panicked, skipped, duration_ms. File outcome: ran | build_failed (with diagnostics, all-zero
+# summary) | aborted (one of signal, exit_code, limit + its limit_* key; running when known).
+# The run line adds files: total, ran, build_failed, aborted. Exit 1 when failed + panicked +
+# build_failed + aborted > 0; exit 2 on a usage error (such as no test files), with no lines.
 build/blink test --json
+# Human output: dots, then BUILD FAILED <file> and its diagnostics, ABORTED <file> and how it
+# ended, and the output of a failed file (of every file with --verbose). The summary line:
+#   2 passed, 0 failed (of 2); 1 file did not build, 2 files aborted
 
 # blink test runs each test binary with limits (§8.10.7). A flag beats [test] in blink.toml,
 # which beats the default. Only the timeout is on by default (10m); none turns a limit off.

@@ -1,0 +1,113 @@
+// Test files run in parallel, so their lines interleave (sections/06_tooling.md §8.10). Each line
+// stays one whole JSON object, even a line longer than a pipe writes at once, and each `file`
+// line counts the test lines of its own file, whichever file ends first.
+
+import std.process.{ChildEnd, ChildLimits, ProcessResult}
+import std.time.{Duration}
+import std.json.{json_clear, json_parse, json_get, json_as_str, json_as_int}
+
+let PACKAGE = "[package]\nname = \"app\"\nversion = \"0.1.0\"\n"
+
+// A runner bug that hangs fails this test instead of the gate.
+fn sh(cmd: Str) -> ProcessResult {
+    process.run("sh", ["-c", cmd], limits: ChildLimits { timeout: Some(Duration.seconds(400)) }).unwrap()
+}
+
+fn project(files: List[(Str, Str)]) -> Str {
+    let dir = sh("mktemp -d /tmp/blink_test_parallel.XXXXXX").out.trim()
+    let _ = sh("mkdir -p {dir}/src {dir}/tests")
+    write_file("{dir}/blink.toml", PACKAGE)
+    // A lock no older than blink.toml keeps dependency resolution out of the command.
+    write_file("{dir}/blink.lock", "[metadata]\nlockfile-version = 1\n")
+    for f in files {
+        let (name, source) = f
+        write_file("{dir}/tests/{name}.bl", source)
+    }
+    dir
+}
+
+// BLINK_BIN makes the build workers the compiler under test, not the blink on PATH.
+fn blink_test(dir: Str, args: Str) -> ProcessResult {
+    sh("B=$(pwd)/build/blink; cd {dir} && env -u BLINK_PER_MODULE BLINK_BIN=$B $B test {args}")
+}
+
+fn diag(r: ProcessResult) -> Str {
+    "exit {r.end}\nstdout:\n{r.out}\nstderr:\n{r.err_out}"
+}
+
+test "lines longer than a pipe write stay whole when eight files run at once" {
+    // Each name is about 6000 bytes, past PIPE_BUF (4096 on Linux), and starts with its file.
+    let mut pad = ""
+    while pad.byte_len() < 6000 {
+        pad = pad.concat("xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx")
+    }
+    let mut files: List[(Str, Str)] = []
+    let mut fi = 0
+    while fi < 8 {
+        let mut src = ""
+        let mut ti = 0
+        while ti < 20 {
+            src = src.concat("test \"f{fi} t{ti} {pad}\" \{\n    assert_eq(1, 1)\n}\n\n")
+            ti = ti + 1
+        }
+        files.push(("test_wide_{fi}", src))
+        fi = fi + 1
+    }
+    let dir = project(files)
+    let r = blink_test(dir, "--json --parallel 8 tests")
+    let _ = sh("rm -rf {dir}")
+    assert_eq(r.end, ChildEnd.Exited(0), "exit {r.end}\nstderr:\n{r.err_out}")
+    let mut tests = 0
+    let mut file_lines = 0
+    for line in r.out.split("\n") {
+        if line == "" { continue }
+        json_clear()
+        let root = json_parse(line)
+        assert(root >= 0, "a line is not whole JSON: {line.byte_slice(0, 200)}")
+        let record = json_as_str(json_get(root, "record"))
+        if record == "test" {
+            let file = json_as_str(json_get(root, "file"))
+            let name = json_as_str(json_get(root, "name"))
+            let fi_text = file.replace("tests/test_wide_", "").replace(".bl", "")
+            assert(name.starts_with("f{fi_text} t"), "a test line names the wrong file: {file}")
+            assert(name.ends_with(pad), file)
+            tests = tests + 1
+        } else if record == "file" {
+            assert_eq(json_as_int(json_get(json_get(root, "summary"), "total")), 20, line.byte_slice(0, 200))
+            file_lines = file_lines + 1
+        }
+    }
+    assert_eq(tests, 160)
+    assert_eq(file_lines, 8)
+}
+
+test "a file that ends first gets its own file line, with its own counts" {
+    let dir = project([])
+    // The slow file waits until the fast file's test has run, then a while longer, so the
+    // files end in the order fast, slow, whatever order they start in.
+    let mark = "{dir}/fast_ran"
+    let slow = "import std.time.\{Duration}\n\ntest \"slow one\" \{\n    while file_exists(\"{mark}\") == 0 \{\n        time.sleep(Duration.ms(20))\n    }\n    time.sleep(Duration.ms(1500))\n    assert_eq(1, 1)\n}\n\ntest \"slow two\" \{\n    assert_eq(1, 1)\n}\n"
+    let fast = "test \"fast\" \{\n    write_file(\"{mark}\", \"\")\n    assert_eq(1, 2)\n}\n"
+    write_file("{dir}/tests/test_a_slow.bl", slow)
+    write_file("{dir}/tests/test_b_fast.bl", fast)
+    let r = blink_test(dir, "--json --parallel 2 tests")
+    let _ = sh("rm -rf {dir}")
+    assert_eq(r.end, ChildEnd.Exited(1), diag(r))
+    let mut order: List[Str] = []
+    for line in r.out.split("\n") {
+        if !line.starts_with("\{\"record\":\"file\"") { continue }
+        json_clear()
+        let root = json_parse(line)
+        let file = json_as_str(json_get(root, "file"))
+        let summary = json_get(root, "summary")
+        order.push(file)
+        if file == "tests/test_a_slow.bl" {
+            assert_eq(json_as_int(json_get(summary, "total")), 2, line)
+            assert_eq(json_as_int(json_get(summary, "passed")), 2, line)
+        } else {
+            assert_eq(json_as_int(json_get(summary, "total")), 1, line)
+            assert_eq(json_as_int(json_get(summary, "failed")), 1, line)
+        }
+    }
+    assert_eq(order.join(" "), "tests/test_b_fast.bl tests/test_a_slow.bl", diag(r))
+}

@@ -76,6 +76,7 @@ import query.{query_index_source, query_answer}
 import limit_values.{
     parse_limit_value, parse_key_limit_value, limit_flag_error, limit_key_error, limit_value_help,
     limit_name, limit_end_line, limit_end_help, limit_unsupported_error, limit_unsupported_help,
+    limit_report_key,
 }
 import diagnostics.{
     Diag, DiagEntry, diag_entries, diag_prepend,
@@ -83,6 +84,7 @@ import diagnostics.{
     diag_source_file, diag_file_for_node, diag_error_no_loc, diag_format, diag_explain, diag_set_abort_status_line,
     embedded_inner_key, diag_entry_text, diag_normalize_path, diag_usage_error_text, json_escape,
     MISSING_NATIVE_DEP, NATIVE_DEP_UNAVAILABLE_CROSS, INCOMPATIBLE_STDLIB_ARCHIVE,
+    TEST_RESULT_LOST, TEST_BINARY_DID_NOT_RUN, TEST_BUILD_ENDED_WITHOUT_DIAGNOSTIC,
 }
 import daemon.{Daemon, DaemonBuild, daemon_start, daemon_socket_path, daemon_send, daemon_proc_identity}
 import docgen.{generate_doc}
@@ -4423,22 +4425,278 @@ fn run_built(a: Args, output_path: Str) {
 }
 
 // What one test file's task hands back. A spawned task may not capture a `let mut`
-// (E0650), so the tasks send their results and the caller files them by index.
+// (E0650), so the tasks send their results and the main task files them by index.
 type TestFileResult {
     idx: Int
-    built: Bool
-    passed: Bool
-    // The limit that ended the binary, if one did.
-    limit: LimitKind?
+    // The diagnostics of a file that did not build, each as the run prints it: a JSON object
+    // with --json, else text. Empty when the binary ran.
+    diagnostics: List[Str]
+    // How the binary ended; None when it did not run.
+    end: ChildEnd?
+    // The wall time of the binary.
+    duration_ms: Int
     out: Str
     err_out: Str
 }
 
-// Where one test file stands after the run. A file starts pending, so a task that never
-// handed back a result can not be mistaken for a build that failed.
-let TEST_FILE_PENDING = 0
-let TEST_FILE_BUILD_FAILED = 1
-let TEST_FILE_RAN = 2
+// What the main task has read of one test binary's report (sections/06_tooling.md §8.10.5).
+// It reads whole lines only: offset is the byte after the last newline it read, so the half
+// line that a binary leaves when it ends mid-write is never read.
+type TestReportTally {
+    offset: Int
+    passed: Int
+    failed: Int
+    panicked: Int
+    skipped: Int
+    // The test whose start line has no test line after it.
+    running: Str?
+    // Whether the binary reported the end of its run.
+    ended: Bool
+}
+
+let TEST_LINE_PREFIX = "\{\"record\":\"test\","
+
+fn test_tally_new() -> TestReportTally {
+    TestReportTally { offset: 0, passed: 0, failed: 0, panicked: 0, skipped: 0, running: None, ended: false }
+}
+
+fn test_tally_total(t: TestReportTally) -> Int {
+    t.passed + t.failed + t.panicked + t.skipped
+}
+
+// The tally after one whole report line. A start line names the running test, a test line
+// ends it and counts its status, and an end line marks the run as reported.
+fn test_tally_add(t: TestReportTally, line: Str) -> TestReportTally {
+    json_clear()
+    let root = json_parse(line)
+    if root < 0 {
+        return t
+    }
+    let record = json_get(root, "record")
+    if record < 0 {
+        return t
+    }
+    let kind = json_as_str(record)
+    if kind == "start" {
+        let name = json_get(root, "name")
+        if name < 0 {
+            return t
+        }
+        return TestReportTally { running: Some(json_as_str(name)), ..t }
+    }
+    if kind == "end" {
+        return TestReportTally { ended: true, ..t }
+    }
+    if kind != "test" {
+        return t
+    }
+    let status_at = json_get(root, "status")
+    let status = if status_at < 0 { "" } else { json_as_str(status_at) }
+    let n = TestReportTally { running: None, ..t }
+    match status {
+        "passed" => TestReportTally { passed: n.passed + 1, ..n }
+        "failed" => TestReportTally { failed: n.failed + 1, ..n }
+        "panicked" => TestReportTally { panicked: n.panicked + 1, ..n }
+        "skipped" => TestReportTally { skipped: n.skipped + 1, ..n }
+        _ => n
+    }
+}
+
+// Reads the whole lines that the binary added to its report since the last read and adds each
+// to the tally. With json it writes each test line to stdout with the file in it: only the
+// main task calls this, so no other line can tear it.
+fn test_report_tail(t: TestReportTally, report: Str, file: Str, json: Bool) -> TestReportTally ! IO, FS.Read {
+    let fresh = build_fs.read_from(report, t.offset)
+    let mut end = fresh.len()
+    while end > 0 && (fresh.get(end - 1) ?? 0) != 10 {
+        end = end - 1
+    }
+    if end == 0 {
+        return t
+    }
+    let text = match fresh.slice(0, end).to_str() {
+        Ok(s) => s
+        Err(_) => ""
+    }
+    let mut n = TestReportTally { offset: t.offset + end, ..t }
+    let head = "{TEST_LINE_PREFIX}\"file\":\"{json_escape(file)}\","
+    for line in text.split("\n") {
+        if line == "" {
+            continue
+        }
+        n = test_tally_add(n, line)
+        if json && line.starts_with(TEST_LINE_PREFIX) {
+            io.println("{head}{line.byte_slice(TEST_LINE_PREFIX.byte_len(), line.byte_len())}")
+        }
+    }
+    n
+}
+
+// The six-key summary of a file line or the run line (§8.10).
+fn test_summary_json(t: TestReportTally, duration_ms: Int) -> Str {
+    "\{\"total\":{test_tally_total(t)},\"passed\":{t.passed},\"failed\":{t.failed},\"panicked\":{t.panicked},\"skipped\":{t.skipped},\"duration_ms\":{duration_ms}}"
+}
+
+// The last line of a human run: the test counts, then a clause for each file count above 0
+// (§8.10, §8.10.5).
+fn test_summary_line(t: TestReportTally, build_failed: Int, aborted: Int) -> Str {
+    let mut line = "{t.passed} passed, {t.failed} failed"
+    if t.panicked > 0 {
+        line = "{line}, {t.panicked} panicked"
+    }
+    if t.skipped > 0 {
+        line = "{line}, {t.skipped} skipped"
+    }
+    line = "{line} (of {test_tally_total(t)})"
+    let mut clauses: List[Str] = []
+    if build_failed > 0 {
+        clauses.push(if build_failed == 1 { "1 file did not build" } else { "{build_failed} files did not build" })
+    }
+    if aborted > 0 {
+        clauses.push(if aborted == 1 { "1 file aborted" } else { "{aborted} files aborted" })
+    }
+    if clauses.len() > 0 {
+        line = "{line}; {clauses.join(", ")}"
+    }
+    line
+}
+
+// A diagnostic that blink test makes itself, as the run prints it. It has no source location,
+// so it has no span (§8.10.5).
+fn test_runner_diag(json: Bool, severity: Str, name: Str, code: Str, message: Str, notes: List[Str]) -> Str {
+    if json {
+        let mut row = "\{\"severity\":\"{severity}\",\"name\":\"{name}\",\"code\":\"{code}\",\"message\":\"{json_escape(message)}\""
+        if notes.len() > 0 {
+            let mut parts: List[Str] = []
+            for note in notes {
+                parts.push("\"{json_escape(note)}\"")
+            }
+            row = "{row},\"notes\":[{parts.join(",")}]"
+        }
+        return "{row}}"
+    }
+    let shown = if severity == "ice" { "internal compiler error" } else { severity }
+    let mut text = "{shown}[{name}]: {message}\n"
+    for note in notes {
+        text = "{text}  note: {note}\n"
+    }
+    if severity == "ice" {
+        text = "{text}  note: This is a compiler bug. Please report it at https://github.com/blinklang/blink/issues\n"
+    }
+    text
+}
+
+// The diagnostics of a test build that failed, from what its worker printed. With json the
+// worker prints each diagnostic as a JSON line. A worker that printed none still gives one, so
+// the list is never empty (§8.10.5).
+fn test_build_diagnostics(json: Bool, out: Str, err_out: Str) -> List[Str] {
+    let text = test_output_text(out, err_out)
+    let mut lines: List[Str] = []
+    for line in text.split("\n") {
+        if line.trim() != "" {
+            lines.push(line)
+        }
+    }
+    if json {
+        let mut rows: List[Str] = []
+        for line in lines {
+            if line.starts_with("\{\"severity\":") {
+                rows.push(line)
+            }
+        }
+        if rows.len() > 0 {
+            return rows
+        }
+    } else if lines.len() > 0 {
+        return [text]
+    }
+    let first = if lines.len() > 0 { lines.get(0).unwrap() } else { "it printed nothing" }
+    [test_runner_diag(json, "ice", "TestBuildEndedWithoutDiagnostic", TEST_BUILD_ENDED_WITHOUT_DIAGNOSTIC, "the test build ended with no diagnostic: {first}", lines)]
+}
+
+// The output of a process as the human run prints it: stdout then stderr, each ending in a
+// newline.
+fn test_output_text(out: Str, err_out: Str) -> Str {
+    let mut text = ""
+    for part in [out, err_out] {
+        if part != "" {
+            text = text.concat(part)
+            if !part.ends_with("\n") {
+                text = text.concat("\n")
+            }
+        }
+    }
+    text
+}
+
+// Each line of text, indented under a BUILD FAILED head.
+fn test_indent(text: Str) -> Str {
+    let mut out = ""
+    for line in text.split("\n") {
+        if line != "" {
+            out = "{out}  {line}\n"
+        }
+    }
+    out
+}
+
+// The outcome of one test file (§8.10.5): its name, its file line and its human block.
+fn test_file_outcome(file: Str, r: TestFileResult, t: TestReportTally, limits: ChildLimits, verbose: Bool) -> (Str, Str, Str) {
+    let head = "\{\"record\":\"file\",\"file\":\"{json_escape(file)}\","
+    if r.diagnostics.len() > 0 || r.end.is_none() {
+        let mut block = "BUILD FAILED {file}\n"
+        for d in r.diagnostics {
+            block = block.concat(test_indent(d))
+        }
+        return ("build_failed", "{head}\"outcome\":\"build_failed\",\"summary\":{test_summary_json(test_tally_new(), 0)},\"diagnostics\":[{r.diagnostics.join(",")}]}", block)
+    }
+    let output = test_output_text(r.out, r.err_out)
+    let mut how_key = ""
+    let mut how = ""
+    let mut help = ""
+    let in_test = match t.running {
+        Some(name) => " in test \"{name}\""
+        None => ""
+    }
+    match r.end.unwrap() {
+        ChildEnd.Limit(kind) => {
+            let value = test_limit_value(limits, kind)
+            how_key = "\"limit\":\"{limit_name(kind)}\",\"{limit_report_key(kind)}\":{value},"
+            how = limit_end_line(kind, value, t.running)
+            help = "  help: {limit_end_help(kind)}\n"
+        }
+        ChildEnd.Signaled(n) => {
+            let name = process.signal_name(n)
+            how_key = "\"signal\":\"{name}\","
+            how = "signal {name}{in_test}"
+        }
+        ChildEnd.Exited(code) => {
+            // An exit before the end line is an abort, an exit with code 0 too.
+            if !t.ended {
+                how_key = "\"exit_code\":{code},"
+                how = "exit code {code}{in_test}"
+            }
+        }
+    }
+    let summary = test_summary_json(t, r.duration_ms)
+    if how_key == "" {
+        let mut block = ""
+        if verbose || t.failed + t.panicked > 0 {
+            block = "--- {file} ---\n{output}"
+        }
+        return ("ran", "{head}\"outcome\":\"ran\",\"summary\":{summary}}", block)
+    }
+    let running = match t.running {
+        Some(name) => "\"running\":\"{json_escape(name)}\","
+        None => ""
+    }
+    let mut block = ""
+    if output != "" {
+        block = "--- {file} ---\n{output}\n"
+    }
+    block = "{block}ABORTED {file}\n  {how}\n{help}"
+    ("aborted", "{head}\"outcome\":\"aborted\",{how_key}{running}\"summary\":{summary}}", block)
+}
 
 // add, remove, update and shim init load blink.toml without a compile, so they report its
 // issues here as a compile would. Each goes on after: an issue there stops the next compile.
@@ -4605,13 +4863,24 @@ fn test_limit_value(limits: ChildLimits, kind: LimitKind) -> Int {
     }
 }
 
-// The human block for a binary that a limit ended (§8.10.7). The runner does not know the test
-// that ran, so the line ends after the limit.
-fn test_aborted_text(file: Str, kind: LimitKind, limits: ChildLimits) -> Str {
-    "ABORTED {file}\n  {limit_end_line(kind, test_limit_value(limits, kind), None)}\n  help: {limit_end_help(kind)}"
+// The diagnostic of a test binary that could not start, or could not be waited for. The host's
+// state causes it, not a compiler bug, so it is an error, not an ice. verb is start or wait.
+fn test_binary_did_not_run(json: Bool, verb: Str, detail: Str) -> Str {
+    test_runner_diag(json, "error", "TestBinaryDidNotRun", TEST_BINARY_DID_NOT_RUN, "could not {verb} the test binary: {detail}", [])
 }
 
-fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit, Codegen, IO, FS.Read, FS.Write, Process.Spawn, FS.Delete, Env.Exit {
+// Whether a report holds the end line: a binary that exits 0 before it is an abort (§8.10.5).
+fn test_report_ended(report: Str) -> Bool ! FS.Read {
+    let text = read_file(report)
+    text.starts_with("\{\"record\":\"end\"") || text.contains("\n\{\"record\":\"end\"")
+}
+
+fn test_tally_sum(a: TestReportTally, b: TestReportTally) -> TestReportTally {
+    TestReportTally { passed: a.passed + b.passed, failed: a.failed + b.failed, panicked: a.panicked + b.panicked, skipped: a.skipped + b.skipped, ..a }
+}
+
+fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit, Codegen, IO, FS.Read, FS.Write, Process.Spawn, FS.Delete, Env.Exit, Time {
+    let started_ms = time.read().to_unix_ms()
     let bad_format = build_format_usage_error(a)
     if bad_format != "" {
         io.eprintln(bad_format)
@@ -4619,10 +4888,10 @@ fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
     }
     let source_path = args_positional(a, 0)
     apply_cache_flag(a)
-    let json_output = if json_requested(a) { 1 } else { 0 }
-    let verbose = if args_has(a, "verbose") { 1 } else { 0 }
-    let quiet = if args_has(a, "quiet") { 1 } else { 0 }
-    let dots = if verbose == 0 && quiet == 0 && json_output == 0 { 1 } else { 0 }
+    let json = json_requested(a)
+    let verbose = args_has(a, "verbose")
+    let quiet = args_has(a, "quiet")
+    let dots = !verbose && !quiet && !json
     let esc = str_from_code_point(27)
     let filter_pattern = args_get(a, "filter")
     let tags_filter = args_get(a, "tags")
@@ -4655,135 +4924,65 @@ fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
     if source_path != "" {
         check_file_exists(source_path)
     }
-    if source_path != "" && is_dir(source_path) == 0 {
-        let basename = path_basename(source_path)
-        let name = strip_extension(basename)
-        if !build_fs.mkdir_p_or_report("build") {
-            env.exit(1)
-        }
-        let c_path = "build/{name}.c"
-        let output_path = "build/{name}"
-        if json_output != 0 {
-            diag_format = 1
-        }
-        let status_mode = if json_output != 0 { BUILD_STATUS_NONE } else { BUILD_STATUS_HUMAN }
-        let rc = do_build(source_path, output_path, c_path, 1, 0, true, "", targets, status_mode, 0, unit_jobs, args_has(a, "per-module"), None)
-        if rc != 0 {
-            env.exit(1)
-        }
-        // A test reads the null device, never the terminal that started the runner (spec: blink test).
-        let scratch = test_scratch_dir(0)
-        remove_test_scratch(scratch)
-        let mut targv = ["-c", "BLINK_TEST_SCRATCH_DIR=\"$1\"; export BLINK_TEST_SCRATCH_DIR; shift; exec \"$0\" \"$@\" < /dev/null", output_path, scratch]
-        if filter_pattern != "" {
-            targv.push("--test-filter")
-            targv.push(filter_pattern)
-        }
-        if json_output != 0 {
-            targv.push("--test-json")
-        }
-        if tags_filter != "" {
-            targv.push("--test-tags")
-            targv.push(tags_filter)
-        }
-        // A child with a limit runs in its own process group, out of reach of a terminal
-        // Ctrl-C, so the runner must pass SIGINT and SIGTERM on to it.
-        process_install_signal_forwarding()
-        let ran = match process.spawn("/bin/sh", targv, limits: limits) {
-            Ok(child) => process.wait(child)
-            Err(e) => Err(e)
-        }
-        remove_test_scratch(scratch)
-        match ran {
-            Ok(r) => {
-                match r.end {
-                    ChildEnd.Limit(kind) => {
-                        // A binary that a limit ended wrote part of its report, which is no
-                        // valid JSON, so --json gets the error of the file instead.
-                        if json_output != 0 {
-                            io.eprint_raw(r.err_out)
-                            io.println("\{\"file\":\"{json_escape(source_path)}\",\"error\":\"{json_escape(limit_end_line(kind, test_limit_value(limits, kind), None))}\"}")
-                        } else {
-                            io.write(r.out)
-                            io.eprint_raw(r.err_out)
-                            io.println(test_aborted_text(source_path, kind, limits))
-                        }
-                        env.exit(1)
-                    }
-                    ChildEnd.Exited(code) => {
-                        io.write(r.out)
-                        io.eprint_raw(r.err_out)
-                        env.exit(code)
-                    }
-                    ChildEnd.Signaled(sig) => {
-                        io.write(r.out)
-                        io.eprint_raw(r.err_out)
-                        env.exit(128 + sig)
-                    }
-                }
-            }
-            Err(e) => {
-                io.eprintln("error: {e}")
-                env.exit(1)
-            }
-        }
-    }
 
-    let mut test_dir = "."
-    if source_path != "" {
-        test_dir = source_path
-    }
+    // A run of one file is a run of a list of one, so it writes the same lines as a run of its
+    // directory (§8.10). Only the place of its binary differs: build/<name>.
+    let one_file = source_path != "" && is_dir(source_path) == 0
     let mut test_files: List[Str] = []
-    collect_test_files(test_dir, test_files)
+    if one_file {
+        test_files.push(source_path)
+    } else {
+        collect_test_files(if source_path == "" { "." } else { source_path }, test_files)
+    }
     let file_count = test_files.len()
-
     if file_count == 0 {
-        if json_output != 0 {
-            io.println("\{\"files\":[],\"summary\":\{\"files\":0,\"files_passed\":0,\"files_failed\":0,\"build_errors\":0}}")
-        } else {
-            io.println("error: no files with test blocks found")
-        }
-        env.exit(1)
+        io.eprintln("error: no files with test blocks found")
+        env.exit(2)
     }
 
-    // Fail-fast: typecheck in-process before spawning parallel build workers.
-    // Without this, broken-but-large fixtures can deadlock async.scope
-    // coordination — single-threaded ~25ms/file is cheap insurance.
-    if json_output != 0 {
+    // Typecheck each file in process before the parallel builds start. A file that fails is
+    // build_failed with its own diagnostics and is not built; the others still run. Each compile
+    // resets the sink, so the command keeps what the good files reported and prints it once,
+    // blink.toml issues included: the files may belong to two projects.
+    if json {
         diag_format = 1
     }
-    let mut tc_failed_files = 0
-    // Each compile resets the sink, so the command keeps what every file reported and prints
-    // it once at the end. That covers blink.toml too: each compile loads the manifest of its
-    // file, and the files may belong to two projects.
+    let diag_text_format = if json { 1 } else { 0 }
     let mut reported: List[DiagEntry] = []
-    let mut tci = 0
-    while tci < file_count {
-        let tcf = test_files.get(tci).unwrap()
+    let mut prepass: List[List[Str]] = []
+    for tcf in test_files {
         let prog = compile_to_program(tcf, 1)
         check_types(prog)
         check_unused_imports()
+        let mut mine: List[Str] = []
         if diag_ice_count > 0 || diag_count > 0 {
-            tc_failed_files = tc_failed_files + 1
-        }
-        for d in diag_entries {
-            reported.push(d)
-        }
-        tci = tci + 1
-    }
-    diag_prepend(reported)
-    if tc_failed_files > 0 {
-        diag_flush()
-        if json_output != 0 {
-            io.println("\{\"status\":\"error\",\"build_errors\":{tc_failed_files}}")
+            let mut di = 0
+            while di < diag_entries.len() {
+                mine.push(if json { diag_entry_text(di, diag_text_format).trim() } else { diag_entry_text(di, diag_text_format) })
+                di = di + 1
+            }
         } else {
-            io.eprintln("error: {tc_failed_files} test file(s) failed to compile")
+            for d in diag_entries {
+                reported.push(d)
+            }
         }
-        env.exit(1)
+        prepass.push(mine)
     }
+    diag_reset()
+    diag_prepend(reported)
     diag_flush()
 
     let blink_bin = resolve_blink_bin()
+    let tmp = env.var("TMPDIR") ?? ""
+    let tmp_base = if tmp == "" { "/tmp" } else { tmp }
+    build_fs.reap_dead(tmp_base, ["blink-test-run"])
+    // Each binary writes its report to <run_dir>/<idx>.report, and its task marks the end of the
+    // file with <idx>.done once it has sent the result.
+    let run_dir = build_fs.private_dir(tmp_base, "blink-test-run")
+    if run_dir == "" {
+        io.eprintln("error: cannot make a run directory in {tmp_base}")
+        env.exit(1)
+    }
 
     let mut build_args: List[List[Str]] = []
     let mut run_args: List[List[Str]] = []
@@ -4794,7 +4993,7 @@ fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
         let tf_dir = path_dirname(tf)
         let tf_base = strip_extension(path_basename(tf))
         let mut build_dir = "build"
-        if tf_dir != "." && tf_dir != "" {
+        if !one_file && tf_dir != "." && tf_dir != "" {
             build_dir = "build/{tf_dir}"
         }
         if !build_fs.mkdir_p_or_report(build_dir) {
@@ -4809,6 +5008,14 @@ fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
         // command runs do not. The absolute path keeps a PATH with no `env` from breaking
         // the command.
         let mut ba: List[Str] = ["BLINK_MANIFEST_REPORTED=1", blink_bin, "__test-build", tf, "-o", tf_out, "--debug"]
+        if json {
+            ba.push("--format")
+            ba.push("json")
+        }
+        for target in targets {
+            ba.push("--target")
+            ba.push(target)
+        }
         // Without --jobs the child reads BLINK_JOBS itself, and without a path flag it reads
         // BLINK_PER_MODULE, from the same environment.
         if args_has(a, "per-module") {
@@ -4824,35 +5031,21 @@ fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
         }
         build_args.push(ba)
 
-        let mut ra: List[Str] = []
+        let mut ra: List[Str] = ["--test-report", "{run_dir}/{fi}.report"]
         if filter_pattern != "" {
             ra.push("--test-filter")
             ra.push(filter_pattern)
-        }
-        if json_output != 0 {
-            ra.push("--test-json")
         }
         if tags_filter != "" {
             ra.push("--test-tags")
             ra.push(tags_filter)
         }
+        // With --json the stream says what the binary's human lines would.
+        if json {
+            ra.push("--test-quiet")
+        }
         run_args.push(ra)
         fi = fi + 1
-    }
-
-    let mut states: List[Int] = []
-    let mut passes: List[Bool] = []
-    let mut outputs: List[Str] = []
-    let mut errors: List[Str] = []
-    let mut limit_ends: List[LimitKind?] = []
-    let mut pi = 0
-    while pi < file_count {
-        states.push(TEST_FILE_PENDING)
-        passes.push(false)
-        limit_ends.push(None)
-        outputs.push("")
-        errors.push("")
-        pi = pi + 1
     }
 
     let sem = channel.new[Int](buffer: num_workers)
@@ -4865,7 +5058,7 @@ fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
     let dot_ch = channel.new[Int](buffer: 1)
     dot_ch.send(0)
 
-    // One slot per file, so no task blocks on its send while the scope waits for it.
+    // One slot per file, so no task blocks on its send.
     let results = channel.new[TestFileResult](buffer: file_count)
 
     // SIGINT/SIGTERM on cmd_test forwards SIGTERM to every live spawned
@@ -4877,39 +5070,69 @@ fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
     // result, so a test can check how the runner reports a result it never got.
     let drop_result = env.var("BLINK_DEV_TEST_DROP_RESULT") ?? ""
 
+    let mut tallies: List[TestReportTally] = []
+    let mut results_by: List[TestFileResult?] = []
+    let mut finished_flags: List[Bool] = []
+    let mut outcomes: List[Str] = []
+    let mut blocks: List[Str] = []
+    let mut pi = 0
+    while pi < file_count {
+        tallies.push(test_tally_new())
+        results_by.push(None)
+        finished_flags.push(false)
+        outcomes.push("")
+        blocks.push("")
+        pi = pi + 1
+    }
+    let mut finished = 0
+
     async.scope {
         let mut si = 0
         while si < file_count {
+            if prepass.get(si).unwrap().len() > 0 {
+                si = si + 1
+                continue
+            }
             let idx = si
             let bcmd = build_args.get(si).unwrap()
             let rcmd = run_args.get(si).unwrap()
             let bin_path = output_bins.get(si).unwrap()
+            let report = "{run_dir}/{si}.report"
+            let done_mark = "{run_dir}/{si}.done"
             let drop_this = test_files.get(si).unwrap() == drop_result
             async.spawn(fn() {
                 sem.recv()
                 if drop_this {
                     sem.send(1)
+                    write_file("{run_dir}/{idx}.lost", "")
                     return 0
                 }
                 let built = match process.spawn("/usr/bin/env", bcmd) {
                     Ok(child) => process.wait(child)
                     Err(e) => Err(e)
                 }
-                let (build_ok, build_out, build_err) = match built {
-                    Ok(r) => (r.success(), r.out, r.err_out)
-                    Err(e) => (false, "", "{e}")
-                }
-                if !build_ok || !file_exists(bin_path) {
-                    let mut err_text = build_out
-                    if build_err != "" {
-                        if err_text != "" {
-                            err_text = "{err_text}\n{build_err}"
+                let mut build_diags: List[Str] = []
+                match built {
+                    Ok(r) => {
+                        if !r.success() || file_exists(bin_path) == 0 {
+                            build_diags = test_build_diagnostics(json, r.out, r.err_out)
                         } else {
-                            err_text = build_err
+                            // The pre-pass printed the warnings of a built file, so of the
+                            // worker's stderr only the trace lines that the run asked for go on.
+                            for line in r.err_out.split("\n") {
+                                if line.starts_with("[dbg:") {
+                                    io.eprintln(line)
+                                }
+                            }
                         }
                     }
-                    results.send(TestFileResult { idx: idx, built: false, passed: false, limit: None, out: "", err_out: err_text })
-                    if dots != 0 {
+                    Err(e) => {
+                        build_diags = test_build_diagnostics(json, "", "could not start the test build: {e}")
+                    }
+                }
+                if build_diags.len() > 0 {
+                    results.send(TestFileResult { idx: idx, diagnostics: build_diags, end: None, duration_ms: 0, out: "", err_out: "" })
+                    if dots {
                         // One recv through a loop that stops after it: that spelling reads the
                         // same whether the pinned compiler types recv as the element or as an
                         // Option of it.
@@ -4925,6 +5148,7 @@ fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
                         }
                     }
                     sem.send(1)
+                    write_file(done_mark, "")
                     return 0
                 }
                 // A test reads the null device, never the terminal that started the runner
@@ -4934,26 +5158,32 @@ fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
                 remove_test_scratch(scratch)
                 let mut targv = ["-c", "BLINK_TEST_SCRATCH_DIR=\"$1\"; export BLINK_TEST_SCRATCH_DIR; shift; exec \"$0\" \"$@\" < /dev/null", bin_path, scratch]
                 for arg in rcmd { targv.push(arg) }
-                let ran = match process.spawn("/bin/sh", targv, limits: limits) {
-                    Ok(child) => process.wait(child)
-                    Err(e) => Err(e)
+                let t0 = time.read().to_unix_ms()
+                let mut result = TestFileResult { idx: idx, diagnostics: [], end: None, duration_ms: 0, out: "", err_out: "" }
+                match process.spawn("/bin/sh", targv, limits: limits) {
+                    Ok(child) => {
+                        match process.wait(child) {
+                            Ok(rr) => {
+                                result = TestFileResult { end: Some(rr.end), duration_ms: time.read().to_unix_ms() - t0, out: rr.out, err_out: rr.err_out, ..result }
+                            }
+                            Err(e) => {
+                                result = TestFileResult { diagnostics: [test_binary_did_not_run(json, "wait for", "{e}")], ..result }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        result = TestFileResult { diagnostics: [test_binary_did_not_run(json, "start", "{e}")], ..result }
+                    }
                 }
                 remove_test_scratch(scratch)
-                // A binary that could not start or be waited for failed, and the error says why.
-                let (run_ok, run_limit, run_out, run_err) = match ran {
-                    Ok(rr) => {
-                        let lim = match rr.end {
-                            ChildEnd.Limit(kind) => Some(kind)
-                            _ => Option.None
-                        }
-                        (rr.success() && lim.is_none(), lim, rr.out, rr.err_out)
-                    }
-                    Err(e) => (false, Option.None, "", "{e}")
+                let ok = match result.end {
+                    Some(ChildEnd.Exited(0)) => test_report_ended(report)
+                    _ => false
                 }
-                results.send(TestFileResult { idx: idx, built: true, passed: run_ok, limit: run_limit, out: run_out, err_out: run_err })
-                if dots != 0 {
+                results.send(result)
+                if dots {
                     for col in dot_ch {
-                        if !run_ok {
+                        if !ok {
                             io.eprint_raw("{esc}[31mF{esc}[0m")
                         } else {
                             io.eprint_raw("{esc}[32m.{esc}[0m")
@@ -4968,155 +5198,124 @@ fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
                     }
                 }
                 sem.send(1)
+                // The last act of the task: once the mark is there, the result is in the channel.
+                write_file(done_mark, "")
                 0
             })
             si = si + 1
         }
+
+        // Only this task writes stdout, so no two lines can tear. It tails each report as the
+        // binary writes it and writes each file's lines once its task is done, in the order the
+        // files end.
+        while finished < file_count {
+            let mut ends: List[Int] = []
+            let mut fj = 0
+            while fj < file_count {
+                if !finished_flags.get(fj).unwrap() && prepass.get(fj).unwrap().len() > 0 {
+                    ends.push(fj)
+                }
+                fj = fj + 1
+            }
+            for name in list_dir(run_dir) {
+                let dot = name.byte_index_of(".", 0) ?? -1
+                if dot <= 0 { continue }
+                let n = name.byte_slice(0, dot).to_int()
+                let kind = name.byte_slice(dot + 1, name.byte_len())
+                if n < 0 || n >= file_count || finished_flags.get(n).unwrap() { continue }
+                if kind == "report" {
+                    tallies.set(n, test_report_tail(tallies.get(n).unwrap(), "{run_dir}/{n}.report", test_files.get(n).unwrap(), json))
+                } else if kind == "done" || kind == "lost" {
+                    ends.push(n)
+                }
+            }
+            for n in ends {
+                if finished_flags.get(n).unwrap() { continue }
+                let file = test_files.get(n).unwrap()
+                let report = "{run_dir}/{n}.report"
+                if file_exists(report) == 1 {
+                    tallies.set(n, test_report_tail(tallies.get(n).unwrap(), report, file, json))
+                }
+                let lost = test_file_lost(n, json)
+                let mut r = lost
+                if prepass.get(n).unwrap().len() > 0 {
+                    r = TestFileResult { diagnostics: prepass.get(n).unwrap(), ..lost }
+                } else if file_exists("{run_dir}/{n}.done") == 1 {
+                    // Results from several files share the channel, so each goes to its own file.
+                    while results_by.get(n).unwrap().is_none() {
+                        let mut got = false
+                        for res in results {
+                            results_by.set(res.idx, Some(res))
+                            got = true
+                            break
+                        }
+                        if !got { break }
+                    }
+                    r = results_by.get(n).unwrap() ?? lost
+                }
+                let (outcome, line, block) = test_file_outcome(file, r, tallies.get(n).unwrap(), limits, verbose)
+                if json {
+                    // What the binary printed goes to stderr, so stdout holds only the stream.
+                    io.eprint_raw(r.out)
+                    io.eprint_raw(r.err_out)
+                    io.println(line)
+                }
+                outcomes.set(n, outcome)
+                blocks.set(n, block)
+                finished_flags.set(n, true)
+                finished = finished + 1
+                for suffix in ["report", "done", "lost"] {
+                    fs_remove("{run_dir}/{n}.{suffix}")
+                }
+            }
+            if ends.len() == 0 {
+                time.sleep(Duration.ms(10))
+            }
+        }
     }
 
-    // Every task has ended once the scope does, so whatever was sent is buffered.
-    results.close()
-    for r in results {
-        states.set(r.idx, if r.built { TEST_FILE_RAN } else { TEST_FILE_BUILD_FAILED })
-        passes.set(r.idx, r.passed)
-        limit_ends.set(r.idx, r.limit)
-        outputs.set(r.idx, r.out)
-        errors.set(r.idx, r.err_out)
-    }
-
-    if dots != 0 {
+    build_fs.unmark(run_dir)
+    let _ = build_fs.remove_tree_or_report(run_dir)
+    if dots {
         io.eprintln("")
     }
 
-    let mut total_passed = 0
-    let mut total_failed = 0
-    let mut total_errors = 0
-    let mut total_lost = 0
-    let mut total_aborted = 0
-
-    if json_output != 0 {
-        io.println("\{\"files\":[")
+    let mut total = test_tally_new()
+    for t in tallies {
+        total = test_tally_sum(total, t)
     }
-
-    let mut ri = 0
-    let mut json_first = 1
-    while ri < file_count {
-        let tf = test_files.get(ri).unwrap()
-        let state = states.get(ri).unwrap()
-        let passed = passes.get(ri).unwrap()
-        if state == TEST_FILE_PENDING {
-            total_lost = total_lost + 1
-            if json_output != 0 {
-                if json_first == 0 {
-                    io.println(",")
-                }
-                json_first = 0
-                io.println("\{\"file\":\"{json_escape(tf)}\",\"error\":\"internal error: blink test got no result for this file\"}")
-            } else {
-                io.println("--- {tf} ---")
-                io.println("  INTERNAL ERROR: blink test got no result for this file")
-                io.println("")
-            }
-        } else if state == TEST_FILE_BUILD_FAILED {
-            total_errors = total_errors + 1
-            if json_output != 0 {
-                if json_first == 0 {
-                    io.println(",")
-                }
-                json_first = 0
-                io.println("\{\"file\":\"{json_escape(tf)}\",\"error\":\"build failed\"}")
-            } else {
-                io.println("--- {tf} ---")
-                io.println("  BUILD FAILED")
-                let err_msg = errors.get(ri).unwrap()
-                if err_msg != "" {
-                    io.println(err_msg)
-                }
-                io.println("")
-            }
-        } else if limit_ends.get(ri).unwrap().is_some() {
-            let kind = limit_ends.get(ri).unwrap().unwrap()
-            total_aborted = total_aborted + 1
-            if json_output != 0 {
-                if json_first == 0 {
-                    io.println(",")
-                }
-                json_first = 0
-                io.println("\{\"file\":\"{json_escape(tf)}\",\"error\":\"{json_escape(limit_end_line(kind, test_limit_value(limits, kind), None))}\"}")
-            } else {
-                io.println(test_aborted_text(tf, kind, limits))
-                let out = outputs.get(ri).unwrap()
-                if out != "" {
-                    io.println(out)
-                }
-                let err_out = errors.get(ri).unwrap()
-                if err_out != "" {
-                    io.println(err_out)
-                }
-                io.println("")
-            }
+    let mut ran = 0
+    let mut build_failed = 0
+    let mut aborted = 0
+    for outcome in outcomes {
+        if outcome == "ran" {
+            ran = ran + 1
+        } else if outcome == "aborted" {
+            aborted = aborted + 1
         } else {
-            if json_output == 0 {
-                let out = outputs.get(ri).unwrap()
-                if verbose != 0 || !passed {
-                    io.println("--- {tf} ---")
-                    if out != "" {
-                        io.println(out)
-                    }
-                    let err_out = errors.get(ri).unwrap()
-                    if err_out != "" {
-                        io.println(err_out)
-                    }
-                } else if dots == 0 && quiet == 0 {
-                    let mut summary = ""
-                    let lines = out.trim().split("\n")
-                    let lc = lines.len()
-                    if lc > 0 {
-                        summary = lines.get(lc - 1).unwrap().trim()
-                    }
-                    if summary != "" {
-                        io.println("PASS {tf} ({summary})")
-                    } else {
-                        io.println("PASS {tf}")
-                    }
-                }
-            } else {
-                if json_first == 0 {
-                    io.println(",")
-                }
-                json_first = 0
-                let out = outputs.get(ri).unwrap().trim()
-                io.println("\{\"file\":\"{json_escape(tf)}\",\"results\":{out}}")
-            }
-            if !passed {
-                total_failed = total_failed + 1
-            } else {
-                total_passed = total_passed + 1
-            }
+            build_failed = build_failed + 1
         }
-        ri = ri + 1
     }
-
-    if json_output != 0 {
-        // This JSON has no aborted count, so a file that a limit ended counts as failed.
-        io.println("],\"summary\":\{\"files\":{file_count},\"files_passed\":{total_passed},\"files_failed\":{total_failed + total_aborted},\"build_errors\":{total_errors}}}")
+    if json {
+        io.println("\{\"record\":\"run\",\"summary\":{test_summary_json(total, time.read().to_unix_ms() - started_ms)},\"files\":\{\"total\":{file_count},\"ran\":{ran},\"build_failed\":{build_failed},\"aborted\":{aborted}}}")
     } else {
-        if quiet == 0 && dots == 0 {
-            io.println("========================================")
+        for block in blocks {
+            if block != "" {
+                io.write(block)
+                io.println("")
+            }
         }
-        let mut lost_clause = ""
-        if total_lost == 1 {
-            lost_clause = ", 1 internal error"
-        } else if total_lost > 1 {
-            lost_clause = ", {total_lost} internal errors"
-        }
-        let aborted_clause = if total_aborted > 0 { ", {total_aborted} aborted" } else { "" }
-        io.println("{file_count} test files: {total_passed} passed, {total_failed} failed, {total_errors} build errors{aborted_clause}{lost_clause}")
+        io.println(test_summary_line(total, build_failed, aborted))
     }
-
-    if total_failed > 0 || total_errors > 0 || total_lost > 0 || total_aborted > 0 {
+    if total.failed + total.panicked + build_failed + aborted > 0 {
         env.exit(1)
     }
+}
+
+// The result of a file whose task ended with no result: a bug of blink test, so an ice.
+fn test_file_lost(idx: Int, json: Bool) -> TestFileResult {
+    let d = test_runner_diag(json, "ice", "TestResultLost", TEST_RESULT_LOST, "blink test lost the file's result", [])
+    TestFileResult { idx: idx, diagnostics: [d], end: None, duration_ms: 0, out: "", err_out: "" }
 }
 
 fn cmd_check(p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, IO, FS.Read, Env.Read, FS.Write, Process.Spawn, FS.Delete, Net.Connect, Env.Exit {

@@ -1,0 +1,221 @@
+// A test binary that a signal or a limit ends, or that exits before it reports the end of its
+// run, gives its file `outcome: "aborted"` (sections/06_tooling.md §8.10.5). The file line
+// carries exactly one of `signal`, `exit_code` and `limit`, names the test that was running when
+// blink test knows it, and counts the test lines the binary wrote before it ended. The run exits 1.
+
+import std.process.{ChildEnd, ChildLimits, ProcessResult}
+import std.time.{Duration}
+import std.json.{json_clear, json_parse, json_get, json_as_str, json_as_int}
+
+let PACKAGE = "[package]\nname = \"app\"\nversion = \"0.1.0\"\n"
+
+let HEAD = #"@ffi("c", "raise")
+fn c_raise(sig: I32) -> I32 ! IO
+
+@ffi("c", "exit")
+fn c_exit(code: I32) ! IO
+
+"#
+
+let CRASH = #"import std.process
+
+test "first" {
+    assert_eq(1, 1)
+}
+
+test "second" {
+    let _ = c_raise(process.SIGSEGV.to_i32())
+}
+
+test "third" {
+    assert_eq(1, 1)
+}
+"#
+
+let EXIT_ZERO = #"test "first" {
+    assert_eq(1, 1)
+}
+
+test "second" {
+    c_exit(0)
+}
+
+test "third" {
+    assert_eq(1, 1)
+}
+"#
+
+let BUS = #"import std.process
+
+test "bus" {
+    let _ = c_raise(process.SIGBUS.to_i32())
+}
+"#
+
+let ONE = #"test "only" {
+    assert_eq(1, 1)
+}
+"#
+
+let HANG = #"import std.time.{Duration}
+
+test "first" {
+    assert_eq(1, 1)
+}
+
+test "hangs" {
+    while true {
+        time.sleep(Duration.ms(50))
+    }
+}
+"#
+
+// The test appends half a start line to the report, with no newline, then crashes. blink test
+// must drop the half line: it is no line, so it names no running test.
+let FRAGMENT = #"import std.process
+
+test "writes half a line" {
+    let args = env.args()
+    let mut path = ""
+    let mut i = 0
+    while i + 1 < args.len() {
+        if args.get(i).unwrap() == "--test-report" {
+            path = args.get(i + 1).unwrap()
+        }
+        i = i + 1
+    }
+    let _ = process.run("sh", ["-c", "printf '%s' '\{\"record\":\"start\",\"name\":\"ghost\"' >> \"$0\"", path])
+    let _ = c_raise(process.SIGSEGV.to_i32())
+}
+"#
+
+// A runner bug that hangs fails this test instead of the gate.
+fn sh(cmd: Str) -> ProcessResult {
+    process.run("sh", ["-c", cmd], limits: ChildLimits { timeout: Some(Duration.seconds(300)) }).unwrap()
+}
+
+// Runs `blink test <args>` in a fresh project whose tests/<name>.bl is HEAD + source.
+fn blink_test(name: Str, source: Str, env_vars: Str, args: Str) -> ProcessResult {
+    let dir = sh("mktemp -d /tmp/blink_test_aborted.XXXXXX").out.trim()
+    let _ = sh("mkdir -p {dir}/src {dir}/tests")
+    write_file("{dir}/blink.toml", PACKAGE)
+    // A lock no older than blink.toml keeps dependency resolution out of the command.
+    write_file("{dir}/blink.lock", "[metadata]\nlockfile-version = 1\n")
+    write_file("{dir}/tests/{name}.bl", HEAD.concat(source))
+    // BLINK_BIN makes the build workers the compiler under test, not the blink on PATH.
+    let r = sh("B=$(pwd)/build/blink; cd {dir} && env -u BLINK_PER_MODULE BLINK_BIN=$B {env_vars} $B test {args}")
+    let _ = sh("rm -rf {dir}")
+    r
+}
+
+// The stdout line whose record is `record`, or "" when there is none.
+fn line_of(out: Str, record: Str) -> Str {
+    for line in out.split("\n") {
+        if line.contains("\{\"record\":\"{record}\"") {
+            return line
+        }
+    }
+    ""
+}
+
+fn str_key(line: Str, key: Str) -> Str {
+    json_clear()
+    json_as_str(json_get(json_parse(line), key))
+}
+
+fn has_key(line: Str, key: Str) -> Bool {
+    json_clear()
+    json_get(json_parse(line), key) >= 0
+}
+
+fn summary_key(line: Str, key: Str) -> Int {
+    json_clear()
+    json_as_int(json_get(json_get(json_parse(line), "summary"), key))
+}
+
+fn diag(r: ProcessResult) -> Str {
+    "exit {r.end}\nstdout:\n{r.out}\nstderr:\n{r.err_out}"
+}
+
+test "a crash in the second of three tests is aborted with its signal, the running test and the first test's line" {
+    let r = blink_test("test_crash", CRASH, "", "--json tests")
+    assert_eq(r.end, ChildEnd.Exited(1), diag(r))
+    let file = line_of(r.out, "file")
+    assert_eq(str_key(file, "outcome"), "aborted", diag(r))
+    assert_eq(str_key(file, "signal"), "SIGSEGV", diag(r))
+    assert_eq(str_key(file, "running"), "second", diag(r))
+    assert(!has_key(file, "exit_code") && !has_key(file, "limit"), file)
+    assert_eq(summary_key(file, "total"), 1, file)
+    assert_eq(summary_key(file, "passed"), 1, file)
+    let test_line = line_of(r.out, "test")
+    assert_eq(str_key(test_line, "name"), "first", diag(r))
+    assert_eq(str_key(test_line, "file"), "tests/test_crash.bl", diag(r))
+    assert_eq(summary_key(line_of(r.out, "run"), "total"), 1, diag(r))
+
+    let h = blink_test("test_crash", CRASH, "", "tests")
+    assert_eq(h.end, ChildEnd.Exited(1), diag(h))
+    assert(h.out.contains("ABORTED tests/test_crash.bl\n  signal SIGSEGV in test \"second\"\n"), diag(h))
+    assert(h.out.contains("1 passed, 0 failed (of 1); 1 file aborted"), diag(h))
+}
+
+test "a binary that exits with code 0 before its end report is aborted with exit_code 0" {
+    let r = blink_test("test_exit", EXIT_ZERO, "", "--json tests")
+    assert_eq(r.end, ChildEnd.Exited(1), diag(r))
+    let file = line_of(r.out, "file")
+    assert_eq(str_key(file, "outcome"), "aborted", diag(r))
+    assert(has_key(file, "exit_code"), file)
+    json_clear()
+    assert_eq(json_as_int(json_get(json_parse(file), "exit_code")), 0, file)
+    assert_eq(str_key(file, "running"), "second", diag(r))
+    assert(!has_key(file, "signal") && !has_key(file, "limit"), file)
+
+    let h = blink_test("test_exit", EXIT_ZERO, "", "tests")
+    assert(h.out.contains("ABORTED tests/test_exit.bl\n  exit code 0 in test \"second\"\n"), diag(h))
+}
+
+test "a signal after the end report is aborted with no running test" {
+    let r = blink_test("test_teardown", ONE, "BLINK_DEV_TEST_RAISE_AFTER_REPORT={process.SIGSEGV}", "--json tests")
+    assert_eq(r.end, ChildEnd.Exited(1), diag(r))
+    let file = line_of(r.out, "file")
+    assert_eq(str_key(file, "outcome"), "aborted", diag(r))
+    assert_eq(str_key(file, "signal"), "SIGSEGV", diag(r))
+    assert(!has_key(file, "running"), file)
+    assert_eq(summary_key(file, "passed"), 1, file)
+
+    let h = blink_test("test_teardown", ONE, "BLINK_DEV_TEST_RAISE_AFTER_REPORT={process.SIGSEGV}", "tests")
+    assert(h.out.contains("ABORTED tests/test_teardown.bl\n  signal SIGSEGV\n"), diag(h))
+}
+
+test "SIGBUS is named, never a number" {
+    let r = blink_test("test_bus", BUS, "", "--json tests")
+    let file = line_of(r.out, "file")
+    assert_eq(str_key(file, "signal"), "SIGBUS", diag(r))
+    assert_eq(str_key(file, "running"), "bus", diag(r))
+}
+
+test "a limit end carries limit and limit_ms and the running test, and no signal" {
+    let r = blink_test("test_hang", HANG, "", "--json --timeout 300ms tests")
+    assert_eq(r.end, ChildEnd.Exited(1), diag(r))
+    let file = line_of(r.out, "file")
+    assert_eq(str_key(file, "outcome"), "aborted", diag(r))
+    assert_eq(str_key(file, "limit"), "timeout", diag(r))
+    json_clear()
+    assert_eq(json_as_int(json_get(json_parse(file), "limit_ms")), 300, file)
+    assert_eq(str_key(file, "running"), "hangs", diag(r))
+    assert(!has_key(file, "signal") && !has_key(file, "exit_code"), file)
+    assert(!has_key(file, "limit_bytes") && !has_key(file, "limit_count"), file)
+    assert_eq(summary_key(file, "passed"), 1, file)
+}
+
+test "half a line in the report is dropped and names no running test" {
+    let r = blink_test("test_fragment", FRAGMENT, "", "--json tests")
+    assert_eq(r.end, ChildEnd.Exited(1), diag(r))
+    assert(!r.out.contains("ghost"), diag(r))
+    let file = line_of(r.out, "file")
+    assert_eq(str_key(file, "running"), "writes half a line", diag(r))
+    for line in r.out.split("\n") {
+        if line == "" { continue }
+        json_clear()
+        assert(json_parse(line) >= 0, "not a JSON line: {line}")
+    }
+}
