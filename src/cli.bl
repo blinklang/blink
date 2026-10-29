@@ -4647,6 +4647,34 @@ fn test_tally_add(t: TestReportTally, line: Str) -> TestReportTally {
     }
 }
 
+// Writes the mark that tells the main task a file's task is done. The main task waits for
+// it, so a mark that cannot be written (a full disk, a removed run dir) would hang the run:
+// the run stops with an error instead.
+fn write_test_mark(path: Str) ! IO, FS.Write, FS.Read, Env.Exit {
+    write_file(path, "")
+    if file_exists(path) != 1 {
+        io.eprintln("error: blink test cannot write {path}")
+        env.exit(1)
+    }
+}
+
+// Prints one file's progress mark. The column rides the channel, so tasks that end at once
+// never print into the same column, and a line wraps after 80 marks. One recv through a loop
+// that stops after it: that spelling reads the same whether the pinned compiler types recv as
+// the element or as an Option of it.
+fn test_progress_mark(dot_ch: Channel[Int], mark: Str) ! IO {
+    for col in dot_ch {
+        io.eprint_raw(mark)
+        if col + 1 >= 80 {
+            io.eprint_raw("\n")
+            dot_ch.send(0)
+        } else {
+            dot_ch.send(col + 1)
+        }
+        break
+    }
+}
+
 // Reads the whole lines that the binary added to its report since the last read and adds each
 // to the tally. With json it writes each test line to stdout with the file in it: only the
 // main task calls this, so no other line can tear it.
@@ -5066,7 +5094,6 @@ fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
     if num_workers < 1 {
         num_workers = 1
     }
-    let targets = args_get_all(a, "target")
     let unit_jobs = unit_jobs_from_args(a)
     let limits = test_run_limits(a, source_path)
 
@@ -5175,10 +5202,6 @@ fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
             ba.push("--format")
             ba.push("json")
         }
-        for target in targets {
-            ba.push("--target")
-            ba.push(target)
-        }
         // Without --jobs the child reads BLINK_JOBS itself, and without a path flag it reads
         // BLINK_PER_MODULE, from the same environment.
         if args_has(a, "per-module") {
@@ -5253,6 +5276,10 @@ fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
         let mut si = 0
         while si < file_count {
             if prepass.get(si).unwrap().len() > 0 {
+                // A file the front end rejects did not build, so it gets the mark of one.
+                if dots {
+                    test_progress_mark(dot_ch, "{esc}[31mE{esc}[0m")
+                }
                 si = si + 1
                 continue
             }
@@ -5267,7 +5294,7 @@ fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
                 sem.recv()
                 if drop_this {
                     sem.send(1)
-                    write_file("{run_dir}/{idx}.lost", "")
+                    write_test_mark("{run_dir}/{idx}.lost")
                     return 0
                 }
                 let built = match process.spawn("/usr/bin/env", bcmd) {
@@ -5296,22 +5323,10 @@ fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
                 if build_diags.len() > 0 {
                     results.send(TestFileResult { idx: idx, diagnostics: build_diags, end: None, duration_ms: 0, out: "", err_out: "" })
                     if dots {
-                        // One recv through a loop that stops after it: that spelling reads the
-                        // same whether the pinned compiler types recv as the element or as an
-                        // Option of it.
-                        for col in dot_ch {
-                            io.eprint_raw("{esc}[31mE{esc}[0m")
-                            if col + 1 >= 80 {
-                                io.eprint_raw("\n")
-                                dot_ch.send(0)
-                            } else {
-                                dot_ch.send(col + 1)
-                            }
-                            break
-                        }
+                        test_progress_mark(dot_ch, "{esc}[31mE{esc}[0m")
                     }
                     sem.send(1)
-                    write_file(done_mark, "")
+                    write_test_mark(done_mark)
                     return 0
                 }
                 // A test reads the null device, never the terminal that started the runner
@@ -5345,24 +5360,11 @@ fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
                 }
                 results.send(result)
                 if dots {
-                    for col in dot_ch {
-                        if !ok {
-                            io.eprint_raw("{esc}[31mF{esc}[0m")
-                        } else {
-                            io.eprint_raw("{esc}[32m.{esc}[0m")
-                        }
-                        if col + 1 >= 80 {
-                            io.eprint_raw("\n")
-                            dot_ch.send(0)
-                        } else {
-                            dot_ch.send(col + 1)
-                        }
-                        break
-                    }
+                    test_progress_mark(dot_ch, if ok { "{esc}[32m.{esc}[0m" } else { "{esc}[31mF{esc}[0m" })
                 }
                 sem.send(1)
                 // The last act of the task: once the mark is there, the result is in the channel.
-                write_file(done_mark, "")
+                write_test_mark(done_mark)
                 0
             })
             si = si + 1
