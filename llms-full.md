@@ -1533,6 +1533,9 @@ build/blink check src/main.bl --format json
 # summary) | aborted (one of signal, exit_code, limit + its limit_* key; running when known).
 # The run line adds files: total, ran, build_failed, aborted. Exit 1 when failed + panicked +
 # build_failed + aborted > 0; exit 2 on a usage error (such as no test files), with no lines.
+# A file the front end accepts can fail a later step; it then has one diagnostic for the step:
+# I0017 the generated C did not compile (ice), E0857 the link failed, E0858 a native dependency
+# did not build. Its notes hold the tool's output (cut at 200 lines, the last note says so).
 build/blink test --json
 # Human output: dots, then BUILD FAILED <file> and its diagnostics, ABORTED <file> and how it
 # ended, and the output of a failed file (of every file with --verbose). The summary line:

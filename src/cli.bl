@@ -84,7 +84,8 @@ import diagnostics.{
     diag_source_file, diag_file_for_node, diag_error_no_loc, diag_format, diag_explain, diag_set_abort_status_line,
     embedded_inner_key, diag_entry_text, diag_normalize_path, diag_usage_error_text, json_escape,
     MISSING_NATIVE_DEP, NATIVE_DEP_UNAVAILABLE_CROSS, INCOMPATIBLE_STDLIB_ARCHIVE,
-    TEST_RESULT_LOST, TEST_BINARY_DID_NOT_RUN, TEST_BUILD_ENDED_WITHOUT_DIAGNOSTIC,
+    TEST_RESULT_LOST, TEST_BINARY_DID_NOT_RUN, TEST_BUILD_ENDED_WITHOUT_DIAGNOSTIC, GENERATED_C_DID_NOT_COMPILE,
+    LINK_FAILED, NATIVE_DEPENDENCY_BUILD_FAILED,
 }
 import daemon.{Daemon, DaemonBuild, daemon_start, daemon_socket_path, daemon_send, daemon_proc_identity}
 import docgen.{generate_doc}
@@ -786,6 +787,81 @@ pub fn run_cc(args: Str, debug_mode: Int, release_mode: Int, target: Str) -> Int
     run_command(cc_command(args, debug_mode, release_mode, target))
 }
 
+// The most notes a failed step's diagnostic holds before it cuts the tool's output.
+let TEST_BUILD_NOTE_CAP = 200
+
+type CcRun {
+    rc: Int
+    output: Str
+}
+
+// Runs what run_cc runs, and keeps its stdout and stderr in place of printing them.
+fn run_cc_kept(args: Str, debug_mode: Int, release_mode: Int, target: Str) -> CcRun ! IO, Process.Spawn, FS.Read {
+    let cmd = cc_command(args, debug_mode, release_mode, target)
+    let words = build_fs.plain_words(cmd)
+    let ran = if words.len() > 0 && build_fs.find_program(words.get(0).unwrap()) != "" {
+        process.run(words.get(0).unwrap(), words_after_first(words))
+    } else {
+        process.run("sh", ["-c", cmd])
+    }
+    match ran {
+        Ok(r) => CcRun { rc: if r.success() { 0 } else { 1 }, output: test_output_text(r.out, r.err_out) }
+        Err(e) => CcRun { rc: 127, output: "{e}\n" }
+    }
+}
+
+// Runs what run_cc runs. A test build keeps the output, and a step that fails prints one
+// diagnostic for the step (§8.10.5); any other build lets cc print as it runs, and has no
+// output here.
+fn run_cc_step(args: Str, debug_mode: Int, release_mode: Int, target: Str, test_build: Bool) -> CcRun ! IO, Process.Spawn, FS.Read, Env.Exit {
+    if test_build {
+        return run_cc_kept(args, debug_mode, release_mode, target)
+    }
+    CcRun { rc: run_cc(args, debug_mode, release_mode, target), output: "" }
+}
+
+// The line of a tool's output that a step's message quotes: the first that reports an
+// error, else the first line.
+fn cc_first_error_line(lines: List[Str]) -> Str {
+    for line in lines {
+        if line.contains("error") || line.contains("undefined reference") || line.contains("cannot find") {
+            return line
+        }
+    }
+    lines.get(0) ?? ""
+}
+
+// Prints the one diagnostic of a test build step that failed: the step, the tool's first
+// error line, and its output as notes, cut at TEST_BUILD_NOTE_CAP lines. The build stops at
+// that step, so no later step reports.
+fn test_build_step_failed(severity: Str, name: Str, code: Str, step: Str, output: Str) ! IO {
+    let mut lines: List[Str] = []
+    for line in output.split("\n") {
+        if line.trim() != "" {
+            lines.push(line)
+        }
+    }
+    let first = cc_first_error_line(lines)
+    let message = if first != "" { "{step} failed: {first.trim()}" } else { "{step} failed" }
+    let mut notes: List[Str] = []
+    for line in lines {
+        if notes.len() == TEST_BUILD_NOTE_CAP {
+            break
+        }
+        notes.push(line)
+    }
+    if lines.len() > TEST_BUILD_NOTE_CAP {
+        notes.push("... output cut: {lines.len() - TEST_BUILD_NOTE_CAP} more lines")
+    }
+    let json = diag_format == 1
+    let d = test_runner_diag(json, severity, name, code, message, notes)
+    if json {
+        io.eprintln(d)
+    } else {
+        io.eprint(d)
+    }
+}
+
 // Starts what run_cc runs without waiting for it; build_fs.reap_to_files answers its end.
 pub fn spawn_cc(args: Str, debug_mode: Int, release_mode: Int, target: Str, dir: Str, name: Str) -> build_fs.FileChild ! IO, FS.Read, FS.Write, Process.Spawn, Env.Exit {
     spawn_unit(cc_command(args, debug_mode, release_mode, target), dir, name)
@@ -943,18 +1019,22 @@ fn unit_key_flags(debug_mode: Int, release_mode: Int) -> List[Str] {
     flags
 }
 
-fn compile_vendored_source(c_path: Str, o_path: Str, debug_mode: Int, release_mode: Int, target: Str) -> Int ! IO, Process.Spawn, FS.Read, Env.Exit, FS.Delete, FS.Write {
+fn compile_vendored_source(name: Str, c_path: Str, o_path: Str, debug_mode: Int, release_mode: Int, target: Str, test_build: Bool) -> Int ! IO, Process.Spawn, FS.Read, Env.Exit, FS.Delete, FS.Write {
     let src_mt = file_mtime(c_path)
     let obj_mt = file_mtime(o_path)
     if obj_mt >= src_mt && src_mt != -1 {
         return 0
     }
     let tmp_path = "{o_path}.{getpid()}.tmp"
-    let rc = run_cc("-c -o {tmp_path} {c_path}", debug_mode, release_mode, target)
-    if rc != 0 {
+    let ran = run_cc_step("-c -o {tmp_path} {c_path}", debug_mode, release_mode, target, test_build)
+    if ran.rc != 0 {
         let _ = build_fs.remove_tree_or_report(tmp_path)
-        io.println("error: compiling vendored source {c_path} failed")
-        return rc
+        if test_build {
+            test_build_step_failed("error", "NativeDependencyBuildFailed", NATIVE_DEPENDENCY_BUILD_FAILED, "building native dependency {name}", ran.output)
+        } else {
+            io.println("error: compiling vendored source {c_path} failed")
+        }
+        return ran.rc
     }
     if !build_fs.rename(tmp_path, o_path) {
         io.eprintln("error: cannot rename {tmp_path} to {o_path}")
@@ -1003,7 +1083,10 @@ fn vendored_object_path(name: Str, target: Str) -> Str {
     if target == "" { "{native_cache_dir()}/{name}.o" } else { "{native_cache_dir()}/{name}-{target}.o" }
 }
 
-fn resolve_vendored_objects(used_deps: List[Str], debug_mode: Int, release_mode: Int, target: Str) -> List[Str] ! IO, FS.Write, FS.Read, Process.Spawn, FS.Delete, Env.Exit {
+// The objects of the native deps a build links. None when a dep did not compile in a test
+// build: that build stops at the step, whose diagnostic is printed. Any other build links
+// the objects that did compile.
+fn resolve_vendored_objects(used_deps: List[Str], debug_mode: Int, release_mode: Int, target: Str, test_build: Bool) -> Option[List[Str]] ! IO, FS.Write, FS.Read, Process.Spawn, FS.Delete, Env.Exit {
     let mut objects: List[Str] = []
 
     if target != "" {
@@ -1023,16 +1106,20 @@ fn resolve_vendored_objects(used_deps: List[Str], debug_mode: Int, release_mode:
                         gc_extra_flags = "-I{stubs} -DNO_MPROTECT_VDB"
                     }
                 }
-                let rc = run_cc("-c -o {tmp_path} {gc_extra_flags} -I{gc_inc} -DGC_THREADS -DGC_BUILTIN_ATOMIC -DUSE_MMAP -DUSE_MUNMAP {gc_src}", debug_mode, release_mode, target)
-                if rc != 0 {
+                let ran = run_cc_step("-c -o {tmp_path} {gc_extra_flags} -I{gc_inc} -DGC_THREADS -DGC_BUILTIN_ATOMIC -DUSE_MMAP -DUSE_MUNMAP {gc_src}", debug_mode, release_mode, target, test_build)
+                if ran.rc != 0 {
                     let _ = build_fs.remove_tree_or_report(tmp_path)
+                    if test_build {
+                        test_build_step_failed("error", "NativeDependencyBuildFailed", NATIVE_DEPENDENCY_BUILD_FAILED, "building native dependency gc", ran.output)
+                        return None
+                    }
                     io.println("error: compiling vendored gc failed")
-                    return objects
+                    return Some(objects)
                 }
                 if !build_fs.rename(tmp_path, o_path) {
                     io.eprintln("error: cannot rename {tmp_path} to {o_path}")
                     let _ = build_fs.remove_tree_or_report(tmp_path)
-                    return objects
+                    return Some(objects)
                 }
             }
             objects.push(o_path)
@@ -1046,9 +1133,9 @@ fn resolve_vendored_objects(used_deps: List[Str], debug_mode: Int, release_mode:
         if src != "" {
             let _ = build_fs.mkdir_p(native_cache_dir())
             let o_path = vendored_object_path(name, target)
-            let rc = compile_vendored_source(src, o_path, debug_mode, release_mode, target)
+            let rc = compile_vendored_source(name, src, o_path, debug_mode, release_mode, target, test_build)
             if rc != 0 {
-                return objects
+                return if test_build { None } else { Some(objects) }
             }
             objects.push(o_path)
         }
@@ -1068,14 +1155,14 @@ fn resolve_vendored_objects(used_deps: List[Str], debug_mode: Int, release_mode:
         if dep_path == "" { continue }
         let _ = build_fs.mkdir_p(native_cache_dir())
         let o_path = vendored_object_path(name, target)
-        let rc = compile_vendored_source(dep_path, o_path, debug_mode, release_mode, target)
+        let rc = compile_vendored_source(name, dep_path, o_path, debug_mode, release_mode, target, test_build)
         if rc != 0 {
-            return objects
+            return if test_build { None } else { Some(objects) }
         }
         objects.push(o_path)
     }
 
-    objects
+    Some(objects)
 }
 
 // The -I flags a zig compile for target needs to find gc.h, which the host's cc finds
@@ -1184,7 +1271,7 @@ let mut cache_did_store: Int = 0
 // The object answered sits in snap_dir, which the caller removes after its link: the GC of
 // another build can remove the cache entry before then. The key and the compile both read
 // snap, the private copy of the C the build emitted.
-fn cache_compile_snapshot(out: Str, snap: Str, c_path: Str, snap_dir: Str, debug_mode: Int, release_mode: Int, target: Str, arc_dir: Str, include_flags: Str) -> Str ! IO, FS.Read, FS.Write, Process.Spawn, FS.Delete, Env.Exit {
+fn cache_compile_snapshot(out: Str, snap: Str, c_path: Str, snap_dir: Str, debug_mode: Int, release_mode: Int, target: Str, arc_dir: Str, include_flags: Str, test_build: Bool) -> Str ! IO, FS.Read, FS.Write, Process.Spawn, FS.Delete, Env.Exit {
     let vendored_dirs = vendored_dirs_in(include_flags)
     let flags = cc_opt_flags(debug_mode, release_mode)
     let paths = match recorded_paths(debug_mode, path_dirname(c_path), arc_dir) {
@@ -1208,8 +1295,10 @@ fn cache_compile_snapshot(out: Str, snap: Str, c_path: Str, snap_dir: Str, debug
     let includes = if include_flags != "" { "-I{arc_dir} {include_flags}{vendored_map_flags(debug_mode, vendored_dirs, target)}" } else { "-I{arc_dir}" }
     let scope = build_objcache.read_scope(vendored_dirs, key_walk_skip([out, c_path, snap_dir]), [snap_dir], arc_dir)
     // The map gives the object the __FILE__ and debug paths a compile of c_path gives.
-    let rc = run_cc("-c {snap} -o {staging} -MMD -MF {depfile} -ffile-prefix-map={snap_dir}={path_dirname(c_path)} {includes}", debug_mode, release_mode, target)
-    if rc != 0 {
+    // A test build drops this compile's output: on a miss the link compiles the same C, and
+    // its failure reports the step.
+    let ran = run_cc_step("-c {snap} -o {staging} -MMD -MF {depfile} -ffile-prefix-map={snap_dir}={path_dirname(c_path)} {includes}", debug_mode, release_mode, target, test_build)
+    if ran.rc != 0 {
         return ""
     }
     let reads = build_objcache.compile_reads(depfile, scope)
@@ -1422,7 +1511,7 @@ fn ensure_target_archive(arc_dir: Str, target: Str) -> Str ! IO, FS.Write, FS.Re
     archive
 }
 
-fn do_link_target(out: Str, c_path: Str, c_source: Str, link_flags: Str, obj_files: List[Str], include_flags: Str, debug_mode: Int, release_mode: Int, target: Str, compiler_archive: Str) -> Int ! Diag.Report, IO, FS.Read, FS.Write, FS.Delete, Process.Spawn, Env.Exit {
+fn do_link_target(out: Str, c_path: Str, c_source: Str, link_flags: Str, obj_files: List[Str], include_flags: Str, debug_mode: Int, release_mode: Int, target: Str, compiler_archive: Str, test_build: Bool) -> Int ! Diag.Report, IO, FS.Read, FS.Write, FS.Delete, Process.Spawn, Env.Exit {
     let mut objs = ""
     if obj_files.len() > 0 {
         objs = " {obj_files.join(" ")}"
@@ -1479,22 +1568,41 @@ fn do_link_target(out: Str, c_path: Str, c_source: Str, link_flags: Str, obj_fil
     }
     let snap = "{snap_dir}/{path_basename(c_path)}"
     write_file(snap, c_source)
-    let cached_o = if cache_dir != "" { cache_compile_snapshot(out, snap, c_path, snap_dir, debug_mode, release_mode, target, arc_dir, include_flags) } else { "" }
+    let cached_o = if cache_dir != "" { cache_compile_snapshot(out, snap, c_path, snap_dir, debug_mode, release_mode, target, arc_dir, include_flags, test_build) } else { "" }
     // The map gives the binary the __FILE__ and debug paths a compile of c_path gives.
     let compile_input = if cached_o != "" { cached_o } else { "{snap} -ffile-prefix-map={snap_dir}={path_dirname(c_path)}" }
     if build_objcache.dev_evict_at("link") {
         dbg_trace("build.units", "dev evict link")
     }
-    let rc = run_cc("-o {out} {compile_input}{objs}{includes}{archive} {effective_link_flags}", debug_mode, release_mode, target)
+    let ran = run_cc_step("-o {out} {compile_input}{objs}{includes}{archive} {effective_link_flags}", debug_mode, release_mode, target, test_build)
+    if ran.rc != 0 && test_build {
+        report_link_target_failure(ran.output, cached_o, snap, includes, archive, debug_mode, release_mode, target)
+    }
     let _ = build_fs.remove_tree(snap_dir)
-    if rc != 0 {
-        io.println("error: C compilation failed")
-        return rc
+    if ran.rc != 0 {
+        if !test_build {
+            io.println("error: C compilation failed")
+        }
+        return ran.rc
     }
     if cache_did_store == 1 {
         build_objcache.maybe_gc()
     }
     return 0
+}
+
+// Reports a failed one-unit link of a test build as the step that failed. The link also
+// compiles the generated C when the cache did not, so a compile-only run of that C tells
+// the two apart: the C did not compile (a compiler bug), or the link did not resolve.
+fn report_link_target_failure(link_output: Str, cached_o: Str, snap: Str, includes: Str, archive: Str, debug_mode: Int, release_mode: Int, target: Str) ! IO, Process.Spawn, FS.Read {
+    if cached_o == "" {
+        let compiled = run_cc_kept("-fsyntax-only {snap}{includes}{archive}", debug_mode, release_mode, target)
+        if compiled.rc != 0 {
+            test_build_step_failed("ice", "GeneratedCDidNotCompile", GENERATED_C_DID_NOT_COMPILE, "compiling the generated C", compiled.output)
+            return
+        }
+    }
+    test_build_step_failed("error", "LinkFailed", LINK_FAILED, "linking", link_output)
 }
 
 fn validate_ffi_native_deps(ffi_libs: List[Str]) -> Int ! Diag.Report {
@@ -1752,9 +1860,12 @@ fn do_build(source_path: Str, output_path: Str, c_path: Str, debug_mode: Int, re
             target = resolve_target_triple(targets.get(0).unwrap())
         }
         let link_flags = build_link_flags(target, has_async, used_deps, ffi_libs)
-        let obj_files = resolve_vendored_objects(used_deps, debug_mode, release_mode, target)
+        let obj_files = match resolve_vendored_objects(used_deps, debug_mode, release_mode, target, test_build) {
+            Some(o) => o
+            None => return 1
+        }
         let inc_flags = resolve_vendored_includes(used_deps, target)
-        let lrc = do_link_target(output_path, c_path, c_source, link_flags, obj_files, inc_flags, debug_mode, release_mode, target, compiler_archive)
+        let lrc = do_link_target(output_path, c_path, c_source, link_flags, obj_files, inc_flags, debug_mode, release_mode, target, compiler_archive, test_build)
         if lrc != 0 {
             return lrc
         }
@@ -1776,10 +1887,13 @@ fn do_build(source_path: Str, output_path: Str, c_path: Str, debug_mode: Int, re
         let alias = targets.get(i).unwrap()
         let triple = resolve_target_triple(alias)
         let link_flags = build_link_flags(triple, has_async, used_deps, ffi_libs)
-        let obj_files = resolve_vendored_objects(used_deps, debug_mode, release_mode, triple)
+        let obj_files = match resolve_vendored_objects(used_deps, debug_mode, release_mode, triple, test_build) {
+            Some(o) => o
+            None => return 1
+        }
         let out = "{output_path}-{alias}"
         fs_remove(out)
-        let lrc = do_link_target(out, c_path, c_source, link_flags, obj_files, inc_flags, debug_mode, release_mode, triple, compiler_archive)
+        let lrc = do_link_target(out, c_path, c_source, link_flags, obj_files, inc_flags, debug_mode, release_mode, triple, compiler_archive, test_build)
         if lrc != 0 {
             return lrc
         }
@@ -2489,7 +2603,7 @@ fn do_build_units(source_path: Str, output_path: Str, debug_mode: Int, release_m
     if shas.is_none() && cg_obj_cache_enabled != 0 && build_objcache.cache_enabled() {
         shas = build_objcache.unit_file_shas(work, resolve_archive_dir())
     }
-    let rc = link_units_all_targets(source_path, output_path, work, units_dir, compiled.units, compiled.foreign, shas, debug_mode, release_mode, targets, status_mode, unit_jobs)
+    let rc = link_units_all_targets(source_path, output_path, work, units_dir, compiled.units, compiled.foreign, shas, debug_mode, release_mode, targets, status_mode, unit_jobs, test_build)
     // Written last, and into the directory that replaces units_dir only after this: a build
     // that stops before here leaves the last record beside the files it describes.
     if rc == 0 && compiled.inputs != "" && compiled.recordable {
@@ -2512,7 +2626,7 @@ fn do_build_units(source_path: Str, output_path: Str, debug_mode: Int, release_m
     rc
 }
 
-fn link_units_all_targets(source_path: Str, output_path: Str, work: Str, units_dir: Str, units: List[emit_record.EmittedUnit], foreign: List[ForeignConst], shas: Option[Map[Str, Str]], debug_mode: Int, release_mode: Int, targets: List[Str], status_mode: Int, unit_jobs: Int) -> Int ! Diag.Report, IO, FS.Write, FS.Read, FS.Delete, Process.Spawn, Env.Exit {
+fn link_units_all_targets(source_path: Str, output_path: Str, work: Str, units_dir: Str, units: List[emit_record.EmittedUnit], foreign: List[ForeignConst], shas: Option[Map[Str, Str]], debug_mode: Int, release_mode: Int, targets: List[Str], status_mode: Int, unit_jobs: Int, test_build: Bool) -> Int ! Diag.Report, IO, FS.Write, FS.Read, FS.Delete, Process.Spawn, Env.Exit {
     // The scans below read what the one-unit build reads from its single C file: each unit
     // and each header a unit includes, which is all cc compiles. A marker the scans look
     // for starts a line, so each file starts one.
@@ -2548,9 +2662,12 @@ fn link_units_all_targets(source_path: Str, output_path: Str, work: Str, units_d
     if targets.len() <= 1 {
         let target = if targets.len() == 1 { resolve_target_triple(targets.get(0).unwrap()) } else { "" }
         let link_flags = build_link_flags(target, has_async, used_deps, ffi_libs)
-        let obj_files = resolve_vendored_objects(used_deps, debug_mode, release_mode, target)
+        let obj_files = match resolve_vendored_objects(used_deps, debug_mode, release_mode, target, test_build) {
+            Some(o) => o
+            None => return 1
+        }
         let inc_flags = resolve_vendored_includes(used_deps, target)
-        let lrc = link_units(output_path, work, units_dir, units, shas, link_flags, obj_files, inc_flags, debug_mode, release_mode, target, unit_jobs)
+        let lrc = link_units(output_path, work, units_dir, units, shas, link_flags, obj_files, inc_flags, debug_mode, release_mode, target, unit_jobs, test_build)
         if lrc != 0 {
             return lrc
         }
@@ -2571,10 +2688,13 @@ fn link_units_all_targets(source_path: Str, output_path: Str, work: Str, units_d
         let alias = targets.get(i).unwrap()
         let triple = resolve_target_triple(alias)
         let link_flags = build_link_flags(triple, has_async, used_deps, ffi_libs)
-        let obj_files = resolve_vendored_objects(used_deps, debug_mode, release_mode, triple)
+        let obj_files = match resolve_vendored_objects(used_deps, debug_mode, release_mode, triple, test_build) {
+            Some(o) => o
+            None => return 1
+        }
         let out = "{output_path}-{alias}"
         fs_remove(out)
-        let lrc = link_units(out, work, units_dir, units, shas, link_flags, obj_files, inc_flags, debug_mode, release_mode, triple, unit_jobs)
+        let lrc = link_units(out, work, units_dir, units, shas, link_flags, obj_files, inc_flags, debug_mode, release_mode, triple, unit_jobs, test_build)
         if lrc != 0 {
             return lrc
         }
@@ -2829,7 +2949,7 @@ fn cc_is_clang() -> Bool ! IO {
 
 // Compiles the units the cache cannot answer, largest first, then links every unit's object
 // against the archive.
-fn link_units(out: Str, work: Str, units_dir: Str, units: List[emit_record.EmittedUnit], shas: Option[Map[Str, Str]], link_flags: Str, obj_files: List[Str], include_flags: Str, debug_mode: Int, release_mode: Int, target: Str, unit_jobs: Int) -> Int ! Diag.Report, IO, FS.Write, FS.Read, FS.Delete, Process.Spawn, Env.Exit {
+fn link_units(out: Str, work: Str, units_dir: Str, units: List[emit_record.EmittedUnit], shas: Option[Map[Str, Str]], link_flags: Str, obj_files: List[Str], include_flags: Str, debug_mode: Int, release_mode: Int, target: Str, unit_jobs: Int, test_build: Bool) -> Int ! Diag.Report, IO, FS.Write, FS.Read, FS.Delete, Process.Spawn, Env.Exit {
     let arc_dir = resolve_archive_dir()
     let vrc = verify_installed_archive(arc_dir)
     if vrc != 0 {
@@ -3035,6 +3155,8 @@ fn link_units(out: Str, work: Str, units_dir: Str, units: List[emit_record.Emitt
         results.set(idx, UnitCompile { idx: idx, exit_code: a.exit_code, out: a.out, err_out: a.err_out, used_pch: false })
     }
     let mut failed = 0
+    let mut failed_units: List[Str] = []
+    let mut failed_output = ""
     let mut store_keys: List[Str] = []
     let mut store_paths: List[Str] = []
     let mut store_modules: List[Str] = []
@@ -3053,9 +3175,14 @@ fn link_units(out: Str, work: Str, units_dir: Str, units: List[emit_record.Emitt
             dbg_trace("build.units", "pch use {m}")
         }
         if r.exit_code != 0 {
-            io.eprint_raw(r.err_out)
-            io.print_raw(r.out)
-            io.println("error: C compilation failed in unit {m}")
+            if test_build {
+                failed_units.push(m)
+                failed_output = "{failed_output}{test_output_text(r.out, r.err_out)}"
+            } else {
+                io.eprint_raw(r.err_out)
+                io.print_raw(r.out)
+                io.println("error: C compilation failed in unit {m}")
+            }
             failed = failed + 1
             continue
         }
@@ -3076,6 +3203,10 @@ fn link_units(out: Str, work: Str, units_dir: Str, units: List[emit_record.Emitt
         if ok { stored = true }
     }
     if failed > 0 {
+        if test_build {
+            let unit_word = if failed_units.len() == 1 { "unit" } else { "units" }
+            test_build_step_failed("ice", "GeneratedCDidNotCompile", GENERATED_C_DID_NOT_COMPILE, "compiling the generated C of {unit_word} {failed_units.join(", ")}", failed_output)
+        }
         let _ = finish_pch(run)
         drop_link_holds(hold, store_paths, installed)
         return 1
@@ -3092,14 +3223,18 @@ fn link_units(out: Str, work: Str, units_dir: Str, units: List[emit_record.Emitt
     if build_objcache.dev_evict_at("link") {
         dbg_trace("build.units", "dev evict link")
     }
-    let rc = run_cc("-o {out} {link_objs.join(" ")}{incl} -I{arc_dir} {std_archive} -Wl,--gc-sections {effective_link_flags}", debug_mode, release_mode, target)
+    let ran = run_cc_step("-o {out} {link_objs.join(" ")}{incl} -I{arc_dir} {std_archive} -Wl,--gc-sections {effective_link_flags}", debug_mode, release_mode, target, test_build)
     if finish_pch(run) {
         stored = true
     }
     drop_link_holds(hold, store_paths, installed)
-    if rc != 0 {
-        io.println("error: C compilation failed while linking {out}")
-        return rc
+    if ran.rc != 0 {
+        if test_build {
+            test_build_step_failed("error", "LinkFailed", LINK_FAILED, "linking", ran.output)
+        } else {
+            io.println("error: C compilation failed while linking {out}")
+        }
+        return ran.rc
     }
     if stored {
         build_objcache.maybe_gc()
@@ -4587,8 +4722,9 @@ fn test_runner_diag(json: Bool, severity: Str, name: Str, code: Str, message: St
 }
 
 // The diagnostics of a test build that failed, from what its worker printed. With json the
-// worker prints each diagnostic as a JSON line. A worker that printed none still gives one, so
-// the list is never empty (§8.10.5).
+// worker prints each diagnostic as a JSON line. A build fails on an error, so a worker that
+// printed no error or ice diagnostic ended in a way no step reported: it gets one that holds
+// the worker's other output, and the list is never empty (§8.10.5).
 fn test_build_diagnostics(json: Bool, out: Str, err_out: Str) -> List[Str] {
     let text = test_output_text(out, err_out)
     let mut lines: List[Str] = []
@@ -4597,21 +4733,28 @@ fn test_build_diagnostics(json: Bool, out: Str, err_out: Str) -> List[Str] {
             lines.push(line)
         }
     }
-    if json {
-        let mut rows: List[Str] = []
-        for line in lines {
-            if line.starts_with("\{\"severity\":") {
-                rows.push(line)
+    let mut rows: List[Str] = []
+    let mut others: List[Str] = []
+    let mut failed = false
+    for line in lines {
+        if json && line.starts_with("\{\"severity\":") {
+            rows.push(line)
+            if line.starts_with("\{\"severity\":\"error\"") || line.starts_with("\{\"severity\":\"ice\"") {
+                failed = true
+            }
+        } else {
+            others.push(line)
+            if !json && (line.starts_with("error[") || line.starts_with("internal compiler error[")) {
+                failed = true
             }
         }
-        if rows.len() > 0 {
-            return rows
-        }
-    } else if lines.len() > 0 {
-        return [text]
     }
-    let first = if lines.len() > 0 { lines.get(0).unwrap() } else { "it printed nothing" }
-    [test_runner_diag(json, "ice", "TestBuildEndedWithoutDiagnostic", TEST_BUILD_ENDED_WITHOUT_DIAGNOSTIC, "the test build ended with no diagnostic: {first}", lines)]
+    if failed {
+        return if json { rows } else { [text] }
+    }
+    let first = if others.len() > 0 { others.get(0).unwrap() } else { "it printed nothing" }
+    rows.push(test_runner_diag(json, "ice", "TestBuildEndedWithoutDiagnostic", TEST_BUILD_ENDED_WITHOUT_DIAGNOSTIC, "the test build ended with no diagnostic: {first}", others))
+    rows
 }
 
 // The output of a process as the human run prints it: stdout then stderr, each ending in a

@@ -54,7 +54,7 @@ error[NonExhaustiveMatch]: non-exhaustive match
 | W061x | Resource scope lints |
 | W070x | Linting |
 | E07xx | Method resolution / arena / coherence |
-| E08xx | FFI; foreign constants (E0853-E0855); test blocks (E0827, E0831-E0835, E0851, E0852); the test runner (E0856) |
+| E08xx | FFI; foreign constants (E0853-E0855); test blocks (E0827, E0831-E0835, E0851, E0852); the test runner (E0856-E0858) |
 | E09xx | Module capabilities / trait contracts |
 | E10xx | Module resolution / imports |
 | W10xx | Modules / manifest |
@@ -93,7 +93,8 @@ ICE codes use the `I` prefix. `@allow` and `[lints]` take warning names only, so
 | TwoDeclarationsOneCSymbol | I0014 | Two declarations reached code generation under one C symbol; the compiler stops before cc sees the unit |
 | VariantWithoutEnum | I0015 | Name resolution met an enum variant with no enum recorded for it, so it can not tell whether the variant is private |
 | TestResultLost | I0016 | `blink test` lost the result of a test file: the file's task ended and sent none. The file is `build_failed` with this one diagnostic, which has no span (§8.10.5) |
-| TestBuildEndedWithoutDiagnostic | I0018 | `blink test` built a test file, the build failed, and it printed no diagnostic. The file is `build_failed` with this one diagnostic; its `notes` hold what the build printed (§8.10.5) |
+| GeneratedCDidNotCompile | I0017 | `blink test` generated the C of a test file, and the C did not compile. The file is `build_failed` with this one diagnostic, which has no span; `notes` holds the C compiler's output, and its last entry says when `blink test` cut it. A header that an `@ffi` declaration names reaches this code too (§8.10.5) |
+| TestBuildEndedWithoutDiagnostic | I0018 | `blink test` built a test file, the build failed, and it printed no error or ice diagnostic. A failed C compile, link or native-dependency step has its own code (I0017, E0857, E0858), so this code means the build ended in some other way. The file is `build_failed` with this diagnostic after any warnings the build printed; its `notes` hold the rest of what the build printed (§8.10.5) |
 
 ---
 
@@ -237,6 +238,8 @@ ICE codes use the `I` prefix. `@allow` and `[lints]` take warning names only, so
 | ForeignConstNoHeader | E0854 | A foreign constant has no `header:` argument (`@ffi("SIGBUS") pub let SIGBUS: Int`). A C macro has no linkage and no prototype, so the header is required. The help names the fix with the header: `add header: "signal.h"`. This is not E0855: here the declaration is incomplete, and the target is not yet asked | FFI | §9.1 |
 | ForeignConstInvalid | E0855 | Found by `blink build`, never by `blink check`. For the build target, the C name of a foreign constant is not an integer constant expression, is not defined by the headers, or has a value that does not fit the declared type. The message names the target triple: `` `SIGBUZ` is not an integer constant on x86_64-linux-gnu ```. The help says to check the spelling and that the header defines the name on this target. It is a Blink diagnostic at the declaration, never a raw C compiler error | FFI | §9.1 |
 | TestBinaryDidNotRun | E0856 | `blink test` could not start a test binary, or could not wait for it to end. The host's state causes this (such as no free process slot or no memory), not the test code and not the compiler. The file is `build_failed` with this one diagnostic, which has no span. The message names the step and the system error: `could not start the test binary: ...` or `could not wait for the test binary: ...`. Only `blink test` reports it | Test runner | §8.10.5 |
+| LinkFailed | E0857 | `blink test` compiled the C of a test file, but the link step failed: the project's setup is wrong, for example a native library is missing or does not define a symbol. The file is `build_failed` with this one diagnostic, which has no span. The message is `linking failed: ` and the linker's first error line; `notes` holds the linker's output, one line per entry, and its last entry says when `blink test` cut it. Only `blink test` reports it | Test runner | §8.10.5 |
+| NativeDependencyBuildFailed | E0858 | `blink test` could not compile the C source of a vendored native dependency. The file is `build_failed` with this one diagnostic, which has no span. The message is `building native dependency <name> failed: ` and the compiler's first error line; `notes` holds the compiler's output, one line per entry, and its last entry says when `blink test` cut it. Only `blink test` reports it | Test runner | §8.10.5 |
 | TrustedRequiresAudit | E0836 | `@trusted` written without a non-empty `audit:` identifier | FFI | §9.1 |
 | AuditGatedSuppression | E0837 | An audit-gated diagnostic (`UnauditedFfi`, `RawBypassesParam`) named in `@allow(...)` or under `[lints]` — refused, not ignored, because neither channel records anything | FFI | §9.1 |
 | UnknownDiagnosticName | E0842 | An `@allow` argument or `[lints]` key that does not identify a live diagnostic: a misspelled name, a retired name or code, or a code given to `@allow`. Refused, not ignored. No `@allow` or `[lints]` entry suppresses it. The `help:` line removes a retired entry, names the diagnostic for a code, or suggests the one nearest live name (see *Conventions*) | Linting | §4.16.8 |

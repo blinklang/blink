@@ -1,0 +1,252 @@
+// A test file the front end accepts can still fail a later build step. Its `file` line holds one
+// diagnostic for that step (sections/06_tooling.md §8.10.5): the generated C that does not
+// compile is an ice, a link or a native dependency that fails is an error. The message names
+// the step and the tool's first error line, and the notes hold the tool's output, cut with a
+// last note that says so. Only a build that ends in no way a step reports gets the diagnostic
+// that says the build ended with none. `blink build` prints these failures as before.
+
+import std.process.{ChildEnd, ChildLimits, ProcessResult}
+import std.time.{Duration}
+import std.json.{json_clear, json_parse, json_get, json_as_str, json_len, json_at}
+
+let PACKAGE = "[package]\nname = \"app\"\nversion = \"0.1.0\"\n"
+
+// The C a build makes for this file calls a function that nothing declares, so it does not
+// compile.
+let UNDECLARED = #"@ffi("c", "blink_test_fn_that_no_header_declares")
+@trusted(audit: "test")
+fn undeclared() -> Int ! ()
+
+test "calls it" {
+    assert(undeclared() == 1)
+}
+"#
+
+// mylib.h declares the function and mylib.c does not define it, so only the link fails.
+let UNDEFINED = #"@ffi("mylib", "mylib_missing", header: "mylib.h")
+@trusted(audit: "test")
+fn missing() -> Int ! ()
+
+test "links" {
+    assert(missing() == 1)
+}
+"#
+
+let GOOD = #"test "good" {
+    assert_eq(1, 1)
+}
+"#
+
+let MYLIB_H = "#ifndef MYLIB_H\n#define MYLIB_H\nint mylib_missing(void);\n#endif\n"
+
+// A runner bug that hangs fails this test instead of the gate.
+fn sh(cmd: Str) -> ProcessResult {
+    process.run("sh", ["-c", cmd], limits: ChildLimits { timeout: Some(Duration.seconds(300)) }).unwrap()
+}
+
+// A fresh project with the files tests/<name>.bl. With mylib_c, the manifest names a vendored
+// native dependency mylib whose source is that C.
+fn project(files: List[(Str, Str)], mylib_c: Str) -> Str {
+    let dir = sh("mktemp -d /tmp/blink_test_build_step.XXXXXX").out.trim()
+    let _ = sh("mkdir -p {dir}/src {dir}/tests {dir}/native")
+    let mut manifest = PACKAGE
+    if mylib_c != "" {
+        write_file("{dir}/native/mylib.h", MYLIB_H)
+        write_file("{dir}/native/mylib.c", mylib_c)
+        manifest = "{manifest}\n[native-dependencies]\nmylib = \{ type = \"vendored\", path = \"{dir}/native/mylib.c\", headers = [\"mylib.h\"] \}\n"
+    }
+    write_file("{dir}/blink.toml", manifest)
+    // A lock no older than blink.toml keeps dependency resolution out of the command.
+    write_file("{dir}/blink.lock", "[metadata]\nlockfile-version = 1\n")
+    for f in files {
+        let (name, source) = f
+        write_file("{dir}/tests/{name}.bl", source)
+    }
+    dir
+}
+
+// Runs `blink test <args>` in dir with the workers worker, or the blink under test for "", and
+// a native cache of the project's own.
+fn blink_test_in(dir: Str, worker: Str, args: Str) -> ProcessResult {
+    let w = if worker != "" { worker } else { "$B" }
+    sh("B=$(pwd)/build/blink; cd {dir} && env -u BLINK_PER_MODULE BLINK_CACHE_DIR={dir}/cache BLINK_BIN={w} $B test {args}")
+}
+
+// Runs `blink test <args>` in a fresh project, then removes it.
+fn blink_test(files: List[(Str, Str)], mylib_c: Str, args: Str) -> ProcessResult {
+    let dir = project(files, mylib_c)
+    let r = blink_test_in(dir, "", args)
+    let _ = sh("rm -rf {dir}")
+    r
+}
+
+// The file line of `file`, or "".
+fn file_line(out: Str, file: Str) -> Str {
+    for line in out.split("\n") {
+        if line.starts_with("\{\"record\":\"file\",\"file\":\"{file}\"") {
+            return line
+        }
+    }
+    ""
+}
+
+fn diag(r: ProcessResult) -> Str {
+    "exit {r.end}\nstdout:\n{r.out}\nstderr:\n{r.err_out}"
+}
+
+// The notes of a diagnostic as one string, a line per note.
+fn notes_text(d: Int) -> Str {
+    let notes = json_get(d, "notes")
+    let mut parts: List[Str] = []
+    let mut i = 0
+    while i < json_len(notes) {
+        parts.push(json_as_str(json_at(notes, i)))
+        i = i + 1
+    }
+    parts.join("\n")
+}
+
+// Checks that the file line of tests/<name>.bl is build_failed with exactly one diagnostic, of
+// the severity, name and code given, whose message starts with message and whose notes hold
+// note.
+fn assert_one_step_diagnostic(r: ProcessResult, name: Str, severity: Str, diag_name: Str, code: Str, message: Str, note: Str) {
+    let line = file_line(r.out, "tests/{name}.bl")
+    json_clear()
+    let root = json_parse(line)
+    assert_eq(json_as_str(json_get(root, "outcome")), "build_failed", diag(r))
+    let diags = json_get(root, "diagnostics")
+    assert_eq(json_len(diags), 1, line)
+    let d = json_at(diags, 0)
+    assert_eq(json_as_str(json_get(d, "severity")), severity, line)
+    assert_eq(json_as_str(json_get(d, "name")), diag_name, line)
+    assert_eq(json_as_str(json_get(d, "code")), code, line)
+    assert(json_as_str(json_get(d, "message")).starts_with(message), line)
+    assert(notes_text(d).contains(note), line)
+    assert(!line.contains("\"span\""), line)
+}
+
+test "generated C that does not compile is one ice diagnostic, on both build paths" {
+    for path in ["--per-module", "--no-per-module"] {
+        let r = blink_test([("test_undeclared", UNDECLARED), ("test_good", GOOD)], "", "--json {path} tests")
+        assert_eq(r.end, ChildEnd.Exited(1), diag(r))
+        assert_one_step_diagnostic(r, "test_undeclared", "ice", "GeneratedCDidNotCompile", "I0017", "compiling the generated C", "blink_test_fn_that_no_header_declares")
+        let line = file_line(r.out, "tests/test_undeclared.bl")
+        assert(line.contains("failed: "), line)
+        assert(file_line(r.out, "tests/test_good.bl").contains("\"outcome\":\"ran\""), diag(r))
+    }
+}
+
+test "a link that fails is one error diagnostic, on both build paths" {
+    for path in ["--per-module", "--no-per-module"] {
+        let r = blink_test([("test_undefined", UNDEFINED)], "int mylib_other(void) \{ return 0; \}\n", "--json {path} tests")
+        assert_eq(r.end, ChildEnd.Exited(1), diag(r))
+        assert_one_step_diagnostic(r, "test_undefined", "error", "LinkFailed", "E0857", "linking failed: ", "mylib_missing")
+    }
+}
+
+test "a native dependency that does not build is one error diagnostic, on both build paths" {
+    for path in ["--per-module", "--no-per-module"] {
+        let r = blink_test([("test_good", GOOD)], "int mylib_missing(void) \{ return blink_no_such_name; \}\n", "--json {path} tests")
+        assert_eq(r.end, ChildEnd.Exited(1), diag(r))
+        assert_one_step_diagnostic(r, "test_good", "error", "NativeDependencyBuildFailed", "E0858", "building native dependency mylib failed: ", "blink_no_such_name")
+    }
+}
+
+test "a long tool output is cut, and the last note says so" {
+    let mut lines: List[Str] = []
+    let mut i = 0
+    while i < 300 {
+        lines.push("int f{i}(void) \{ return blink_undeclared_{i}; \}")
+        i = i + 1
+    }
+    let r = blink_test([("test_good", GOOD)], "{lines.join("\n")}\n", "--json tests")
+    let line = file_line(r.out, "tests/test_good.bl")
+    json_clear()
+    let notes = json_get(json_at(json_get(json_parse(line), "diagnostics"), 0), "notes")
+    assert_eq(json_len(notes), 201, line)
+    assert(json_as_str(json_at(notes, 200)).starts_with("... output cut: "), line)
+    assert(json_as_str(json_at(notes, 200)).ends_with(" more lines"), line)
+}
+
+test "the human output prints the step diagnostic under BUILD FAILED" {
+    let r = blink_test([("test_undeclared", UNDECLARED)], "", "tests")
+    assert_eq(r.end, ChildEnd.Exited(1), diag(r))
+    assert(r.out.contains("BUILD FAILED tests/test_undeclared.bl\n"), diag(r))
+    assert(r.out.contains("internal compiler error[GeneratedCDidNotCompile]: compiling the generated C"), diag(r))
+    assert(r.out.contains("  note: This is a compiler bug."), diag(r))
+    assert(!r.out.contains("TestBuildEndedWithoutDiagnostic"), diag(r))
+    assert(!r.out.contains("error: C compilation failed"), diag(r))
+}
+
+test "only a build that ends with no error diagnostic says it ended without one" {
+    let dir = project([("test_good", GOOD)], "")
+    write_file("{dir}/junk-worker", "#!/bin/sh\necho 'something went wrong'\nexit 1\n")
+    write_file("{dir}/warning-worker", "#!/bin/sh\necho '\{\"severity\":\"warning\",\"name\":\"W\",\"code\":\"W0001\",\"message\":\"only a warning\"\}'\nexit 1\n")
+    let _ = sh("chmod +x {dir}/junk-worker {dir}/warning-worker")
+    let junk = blink_test_in(dir, "{dir}/junk-worker", "--json tests")
+    let warned = blink_test_in(dir, "{dir}/warning-worker", "--json tests")
+    let human = blink_test_in(dir, "{dir}/junk-worker", "tests")
+    let _ = sh("rm -rf {dir}")
+    assert_one_step_diagnostic(junk, "test_good", "ice", "TestBuildEndedWithoutDiagnostic", "I0018", "the test build ended with no diagnostic: something went wrong", "something went wrong")
+    let line = file_line(warned.out, "tests/test_good.bl")
+    json_clear()
+    let diags = json_get(json_parse(line), "diagnostics")
+    assert_eq(json_len(diags), 2, line)
+    assert_eq(json_as_str(json_get(json_at(diags, 0), "severity")), "warning", line)
+    assert_eq(json_as_str(json_get(json_at(diags, 1), "code")), "I0018", line)
+    assert(human.out.contains("internal compiler error[TestBuildEndedWithoutDiagnostic]: the test build ended with no diagnostic: something went wrong"), diag(human))
+}
+
+test "blink build prints a C compile failure as it did before, on both build paths" {
+    let dir = sh("mktemp -d /tmp/blink_build_step.XXXXXX").out.trim()
+    let _ = sh("mkdir -p {dir}/src")
+    write_file("{dir}/blink.toml", PACKAGE)
+    write_file("{dir}/blink.lock", "[metadata]\nlockfile-version = 1\n")
+    write_file("{dir}/src/main.bl", #"@ffi("c", "blink_test_fn_that_no_header_declares")
+@trusted(audit: "test")
+fn undeclared() -> Int ! ()
+
+fn main() {
+    io.println("{undeclared()}")
+}
+"#)
+    let pm = sh("B=$(pwd)/build/blink; cd {dir} && env -u BLINK_PER_MODULE BLINK_CACHE_DIR={dir}/cache $B build --per-module src/main.bl")
+    let one = sh("B=$(pwd)/build/blink; cd {dir} && env -u BLINK_PER_MODULE BLINK_CACHE_DIR={dir}/cache $B build --no-per-module src/main.bl")
+    let _ = sh("rm -rf {dir}")
+    assert_eq(pm.end, ChildEnd.Exited(1), diag(pm))
+    assert(pm.out.contains("error: C compilation failed in unit "), diag(pm))
+    assert(pm.err_out.contains("blink_test_fn_that_no_header_declares"), diag(pm))
+    assert(one.end != ChildEnd.Exited(0), diag(one))
+    assert(one.out.contains("error: C compilation failed\n"), diag(one))
+    assert(one.err_out.contains("blink_test_fn_that_no_header_declares"), diag(one))
+    for r in [pm, one] {
+        assert(!"{r.out}{r.err_out}".contains("GeneratedCDidNotCompile"), diag(r))
+    }
+}
+
+test "blink build prints a link or native dependency failure as it did before, on both build paths" {
+    for path in ["--per-module", "--no-per-module"] {
+        let dir = project([], "int mylib_other(void) \{ return 0; \}\n")
+        write_file("{dir}/src/main.bl", #"@ffi("mylib", "mylib_missing", header: "mylib.h")
+@trusted(audit: "test")
+fn missing() -> Int ! ()
+
+fn main() {
+    io.println("{missing()}")
+}
+"#)
+        let link = sh("B=$(pwd)/build/blink; cd {dir} && env -u BLINK_PER_MODULE BLINK_CACHE_DIR={dir}/cache $B build {path} src/main.bl")
+        write_file("{dir}/native/mylib.c", "int mylib_missing(void) \{ return blink_no_such_name; \}\n")
+        let dep = sh("B=$(pwd)/build/blink; cd {dir} && env -u BLINK_PER_MODULE BLINK_CACHE_DIR={dir}/cache $B build {path} src/main.bl")
+        let _ = sh("rm -rf {dir}")
+        assert(link.end != ChildEnd.Exited(0), diag(link))
+        assert(link.out.contains("error: C compilation failed"), diag(link))
+        assert(link.err_out.contains("mylib_missing"), diag(link))
+        assert(dep.out.contains("error: compiling vendored source "), diag(dep))
+        assert(dep.err_out.contains("blink_no_such_name"), diag(dep))
+        for r in [link, dep] {
+            assert(!"{r.out}{r.err_out}".contains("LinkFailed"), diag(r))
+            assert(!"{r.out}{r.err_out}".contains("NativeDependencyBuildFailed"), diag(r))
+        }
+    }
+}
