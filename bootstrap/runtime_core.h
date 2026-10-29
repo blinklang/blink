@@ -4512,49 +4512,6 @@ BLINK_UNUSED static blink_env_vtable blink_env_vtable_default = {
     blink_env_default_exit
 };
 
-/* ── Process ────────────────────────────────────────────────────────── */
-typedef struct {
-    int64_t (*spawn)(void* __self, const char* command);
-    int     (*signal)(void* __self, int64_t pid, int sig);
-    /* per-op handler captures — see blink_io_vtable */
-    void* __userdata_spawn;
-    void* __userdata_signal;
-} blink_process_vtable;
-
-BLINK_RT_FN blink_process_vtable* blink_process_vtable_promote(blink_promote_ctx* ctx, blink_process_vtable* v);
-#ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN blink_process_vtable* blink_process_vtable_promote(blink_promote_ctx* ctx, blink_process_vtable* v) {
-    blink_process_vtable* out = (blink_process_vtable*)blink_promote_cell(ctx, v, sizeof(*v), NULL);
-    if (out == v) return out;
-    out->__userdata_spawn = blink_closure_promote(ctx, (blink_closure*)out->__userdata_spawn);
-    out->__userdata_signal = blink_closure_promote(ctx, (blink_closure*)out->__userdata_signal);
-    return out;
-}
-#endif
-
-BLINK_RT_FN int64_t blink_process_default_spawn(void* __self, const char* command);
-#ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN int64_t blink_process_default_spawn(void* __self, const char* command) {
-    (void)command;
-    fprintf(stderr, "blink: process.spawn not implemented\n");
-    return -1;
-}
-#endif
-
-BLINK_RT_FN int blink_process_default_signal(void* __self, int64_t pid, int sig);
-#ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN int blink_process_default_signal(void* __self, int64_t pid, int sig) {
-    (void)pid; (void)sig;
-    fprintf(stderr, "blink: process.signal not implemented\n");
-    return -1;
-}
-#endif
-
-BLINK_UNUSED static blink_process_vtable blink_process_vtable_default = {
-    blink_process_default_spawn,
-    blink_process_default_signal
-};
-
 /* ── Debug assert ───────────────────────────────────────────────────── */
 
 BLINK_RT_FN void __blink_debug_assert_fail(const char* file, int line, const char* fn, const char* cond, const char* msg);
