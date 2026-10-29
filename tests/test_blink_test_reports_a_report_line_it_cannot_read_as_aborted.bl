@@ -1,0 +1,159 @@
+// A test binary writes its results to a report that `blink test` reads line by line. A line the
+// runner cannot read is a lost result (sections/06_tooling.md §8.10.5): the file is `aborted`
+// with one I0016 TestResultLost ice diagnostic whose notes hold each such line, cut short after
+// 200, and the run exits 1. Before, the runner skipped such a line, so a lost failed test line
+// could let the run exit 0. A bad line never reaches stdout, and counts in no summary.
+//
+// A bad line is one that is not a JSON object, has no `record`, a `record` that is not start,
+// test or end, a start line with no name, a test line with no name or with an unknown status,
+// or a line that is not UTF-8. In a note, each byte that is not UTF-8 reads \xNN and a backslash
+// reads \\, so the note keeps every byte. When the binary also ended with a signal, a limit or an
+// exit code, that end is the cause key and the bad lines add no diagnostic.
+//
+// Each fixture test appends the bad lines to its own report: the runtime opens the report with
+// O_APPEND, so the runner's reader sees them between the runtime's own lines.
+
+import std.process.{ChildEnd, ChildLimits, ProcessResult}
+import std.time.{Duration}
+
+// Runs `sh -c <script> <report path>` from inside a test, so the script appends to the report.
+let PRELUDE = #"import std.process
+
+fn append_to_report(script: Str) {
+    let args = env.args()
+    let mut path = ""
+    let mut i = 0
+    while i + 1 < args.len() {
+        if args.get(i).unwrap() == "--test-report" {
+            path = args.get(i + 1).unwrap()
+        }
+        i = i + 1
+    }
+    let _ = process.run("sh", ["-c", script, path])
+}
+
+"#
+
+let UNKNOWN_STATUS = #"test "passes" {
+    append_to_report("printf '%s\\n' '\{\"record\":\"test\",\"name\":\"ghost\",\"status\":\"maybe\"}' >> \"$0\"")
+    assert_eq(1, 1)
+}
+"#
+
+let SEVERAL_BAD = #"test "passes" {
+    append_to_report("printf '%s\\n' 'not json' '\{\"record\":\"bogus\"}' '\{\"record\":5}' '\{\"record\":\"start\"}' '\{\"record\":\"test\",\"status\":\"passed\"}' '' >> \"$0\"")
+    assert_eq(1, 1)
+}
+"#
+
+let NOT_UTF8 = #"test "passes" {
+    append_to_report("printf 'ok\\\\\\377\\n' >> \"$0\"")
+    assert_eq(1, 1)
+}
+"#
+
+let MANY_BAD = #"test "passes" {
+    append_to_report("for i in $(seq 1 205); do echo junk$i; done >> \"$0\"")
+    assert_eq(1, 1)
+}
+"#
+
+let BAD_THEN_EXIT = #"test "exits" {
+    append_to_report("printf '%s\\n' 'not json' >> \"$0\"")
+    env.exit(3)
+}
+"#
+
+fn sh(cmd: Str) -> ProcessResult {
+    process.run("sh", ["-c", cmd], limits: ChildLimits { timeout: Some(Duration.seconds(300)) }).unwrap()
+}
+
+// Runs `blink test <args> tests` in a fresh project whose one test file is PRELUDE + body.
+fn blink_test(body: Str, args: Str) -> ProcessResult {
+    let dir = sh("mktemp -d /tmp/blink_test_bad_report_line.XXXXXX").out.trim()
+    let _ = sh("mkdir -p {dir}/tests")
+    write_file("{dir}/blink.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\n")
+    write_file("{dir}/blink.lock", "[metadata]\nlockfile-version = 1\n")
+    write_file("{dir}/tests/test_bad_report_line.bl", "{PRELUDE}{body}")
+    let r = sh("B=$(pwd)/build/blink; cd {dir} && env -u BLINK_PER_MODULE BLINK_BIN=$B $B test {args} tests")
+    let _ = sh("rm -rf {dir}")
+    r
+}
+
+let FILE_HEAD = "\{\"record\":\"file\",\"file\":\"tests/test_bad_report_line.bl\","
+
+let LOST_HEAD = "\"outcome\":\"aborted\",\"diagnostics\":[\{\"severity\":\"ice\",\"name\":\"TestResultLost\",\"code\":\"I0016\",\"message\":\"blink test lost the result of this file\",\"notes\":["
+
+let ONE_PASSED = "}],\"summary\":\{\"total\":1,\"passed\":1,\"failed\":0,\"panicked\":0,\"skipped\":0,"
+
+// The stdout line that starts with `head`, or "" when there is none.
+fn line_with(out: Str, head: Str) -> Str {
+    for line in out.split("\n") {
+        if line.starts_with(head) {
+            return line
+        }
+    }
+    ""
+}
+
+fn assert_lost_with_notes(body: Str, notes: Str) {
+    let r = blink_test(body, "--json")
+    let diag = "stdout:\n{r.out}\nstderr:\n{r.err_out}"
+    assert_eq(r.end, ChildEnd.Exited(1), diag)
+    assert(line_with(r.out, FILE_HEAD).starts_with("{FILE_HEAD}{LOST_HEAD}{notes}]{ONE_PASSED}"), diag)
+    assert(r.out.contains("\"files\":\{\"total\":1,\"ran\":0,\"build_failed\":0,\"aborted\":1}"), diag)
+    assert(r.out.contains("\{\"record\":\"run\",\"summary\":\{\"total\":1,\"passed\":1,"), diag)
+    for line in r.out.split("\n") {
+        if line.starts_with("\{\"record\":\"test\",") {
+            assert(line.contains("\"name\":\"passes\""), "a bad line must not reach stdout: {line}; {diag}")
+        }
+    }
+}
+
+test "a test line with an unknown status makes a run where every test passed exit 1" {
+    assert_lost_with_notes(UNKNOWN_STATUS, "\"\{\\\"record\\\":\\\"test\\\",\\\"name\\\":\\\"ghost\\\",\\\"status\\\":\\\"maybe\\\"}\"")
+}
+
+test "every line the runner cannot read is one note of one diagnostic, in report order" {
+    let notes = [
+        "\"not json\"",
+        "\"\{\\\"record\\\":\\\"bogus\\\"}\"",
+        "\"\{\\\"record\\\":5}\"",
+        "\"\{\\\"record\\\":\\\"start\\\"}\"",
+        "\"\{\\\"record\\\":\\\"test\\\",\\\"status\\\":\\\"passed\\\"}\"",
+        "\"\"",
+    ]
+    assert_lost_with_notes(SEVERAL_BAD, notes.join(","))
+}
+
+test "a line that is not UTF-8 keeps every byte in its note" {
+    assert_lost_with_notes(NOT_UTF8, "\"ok\\\\\\\\\\\\xff\"")
+}
+
+test "the notes are cut after 200 lines and the last note says so" {
+    let mut notes: List[Str] = []
+    let mut i = 1
+    while i <= 200 {
+        notes.push("\"junk{i}\"")
+        i = i + 1
+    }
+    notes.push("\"... output cut: 5 more lines\"")
+    assert_lost_with_notes(MANY_BAD, notes.join(","))
+}
+
+test "an exit code is the cause key when the binary also wrote a bad line" {
+    let r = blink_test(BAD_THEN_EXIT, "--json")
+    let diag = "stdout:\n{r.out}\nstderr:\n{r.err_out}"
+    assert_eq(r.end, ChildEnd.Exited(1), diag)
+    let line = line_with(r.out, FILE_HEAD)
+    assert(line.starts_with("{FILE_HEAD}\"outcome\":\"aborted\",\"exit_code\":3,"), diag)
+    assert(!line.contains("\"diagnostics\""), diag)
+}
+
+test "the human run prints ABORTED, the ice and each bad line as a note" {
+    let r = blink_test(UNKNOWN_STATUS, "--quiet")
+    let diag = "stdout:\n{r.out}\nstderr:\n{r.err_out}"
+    assert_eq(r.end, ChildEnd.Exited(1), diag)
+    assert(r.out.contains("ABORTED tests/test_bad_report_line.bl\n  ice[I0016]: blink test lost the result of this file\n  note: \{\"record\":\"test\",\"name\":\"ghost\",\"status\":\"maybe\"}\n  note: this is a bug in blink test; please report it\n"), diag)
+    assert(r.out.contains("1 passed, 0 failed (of 1); 1 file aborted\n"), diag)
+}
