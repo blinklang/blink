@@ -1,0 +1,162 @@
+// A test binary run with `--test-report <path>` writes one whole line to that file as each
+// test starts and as it ends, and an `end` line with the summary once every test ran. blink
+// test reads the file while the binary runs (sections/06_tooling.md §8.10: a test line is
+// written when a test ends), and a report with no `end` line is a run the binary did not
+// finish (§8.10.5). The binary's own `--test-json` stdout stays one document.
+
+import std.process.{ChildEnd, ChildLimits, ProcessResult}
+import std.time.{Duration}
+
+fn sh(cmd: Str) -> ProcessResult {
+    process.run("sh", ["-c", cmd], limits: ChildLimits { timeout: Some(Duration.seconds(120)) }).unwrap()
+}
+
+let HEAD = #"@ffi("c", "raise")
+fn c_raise(sig: I32) -> I32 ! IO
+
+@ffi("c", "exit")
+fn c_exit(code: I32) ! IO
+
+"#
+
+// Builds `source` as a test binary in a fresh directory and returns the directory.
+fn build_fixture(source: Str) -> Str {
+    let dir = sh("mktemp -d /tmp/blink_test_report.XXXXXX").out.trim()
+    write_file("{dir}/fx.bl", HEAD.concat(source))
+    let r = sh("B=$(pwd)/build/blink; cd {dir} && $B __test-build fx.bl -o {dir}/fx")
+    assert(r.success(), "fixture did not build: {r.out}{r.err_out}")
+    dir
+}
+
+fn run_fixture(dir: Str, env: Str) -> ProcessResult {
+    sh("{env} exec {dir}/fx --test-report {dir}/report")
+}
+
+fn at(xs: List[Str], i: Int) -> Str {
+    xs.get(i).unwrap()
+}
+
+fn report_lines(dir: Str) -> List[Str] {
+    let text = read_file("{dir}/report")
+    assert(text.ends_with("\n"), "the report ends in a partial line: {text}")
+    let mut lines: List[Str] = []
+    for line in text.split("\n") {
+        if line != "" {
+            lines.push(line)
+        }
+    }
+    lines
+}
+
+let THREE = #"test "first" {
+    assert_eq(1, 1)
+}
+
+test "second \"quoted\"" {
+    assert_eq(1, 2)
+}
+
+test "third" {
+    skip("later")
+}
+"#
+
+test "each test writes a start line and a test line, and the run ends with an end line" {
+    let dir = build_fixture(THREE)
+    let r = run_fixture(dir, "")
+    assert_eq(r.end, ChildEnd.Exited(1))
+    let lines = report_lines(dir)
+    assert_eq(lines.len(), 7)
+    assert_eq(at(lines, 0), "\{\"record\":\"start\",\"name\":\"first\"}")
+    assert(at(lines, 1).starts_with("\{\"record\":\"test\",\"name\":\"first\",\"status\":\"passed\","), at(lines, 1))
+    assert_eq(at(lines, 2), "\{\"record\":\"start\",\"name\":\"second \\\"quoted\\\"\"}")
+    assert(at(lines, 3).starts_with("\{\"record\":\"test\",\"name\":\"second \\\"quoted\\\"\",\"status\":\"failed\",\"line\":"), at(lines, 3))
+    assert_eq(at(lines, 4), "\{\"record\":\"start\",\"name\":\"third\"}")
+    assert(at(lines, 5).contains("\"status\":\"skipped\",\"reason\":\"later\""), at(lines, 5))
+    assert(at(lines, 6).starts_with("\{\"record\":\"end\",\"summary\":\{\"total\":3,\"passed\":1,\"failed\":1,\"panicked\":0,\"skipped\":1,\"duration_ms\":"), at(lines, 6))
+    let _ = sh("rm -rf {dir}")
+}
+
+test "a report test line holds the same record as the binary's --test-json" {
+    let dir = build_fixture(THREE)
+    let _ = run_fixture(dir, "")
+    let lines = report_lines(dir)
+    let json = sh("{dir}/fx --test-json").out
+    // Each record up to its duration, which differs between two runs.
+    for line in [at(lines, 1), at(lines, 3), at(lines, 5)] {
+        let body = line.replace("\{\"record\":\"test\",", "\{")
+        let head = at(body.split("\"duration_ms\":"), 0)
+        assert(json.contains(head), "--test-json lacks {head}:\n{json}")
+    }
+    let _ = sh("rm -rf {dir}")
+}
+
+test "a crash in the second of three tests keeps the lines before it and writes no end line" {
+    let dir = build_fixture(#"import std.process
+
+test "first" {
+    assert_eq(1, 1)
+}
+
+test "second" {
+    let _ = c_raise(process.SIGSEGV.to_i32())
+}
+
+test "third" {
+    assert_eq(1, 1)
+}
+"#)
+    let r = run_fixture(dir, "")
+    assert_eq(r.end, ChildEnd.Signaled(process.SIGSEGV))
+    let lines = report_lines(dir)
+    assert_eq(lines.len(), 3)
+    assert(at(lines, 1).contains("\"name\":\"first\",\"status\":\"passed\""), at(lines, 1))
+    assert_eq(at(lines, 2), "\{\"record\":\"start\",\"name\":\"second\"}")
+    let _ = sh("rm -rf {dir}")
+}
+
+test "a test that exits the binary with code 0 leaves the report with no end line" {
+    let dir = build_fixture(#"test "first" {
+    assert_eq(1, 1)
+}
+
+test "second" {
+    c_exit(0)
+}
+
+test "third" {
+    assert_eq(1, 1)
+}
+"#)
+    let r = run_fixture(dir, "")
+    assert_eq(r.end, ChildEnd.Exited(0))
+    let lines = report_lines(dir)
+    assert_eq(lines.len(), 3)
+    assert_eq(at(lines, 2), "\{\"record\":\"start\",\"name\":\"second\"}")
+    let _ = sh("rm -rf {dir}")
+}
+
+test "the dev knob raises its signal after the end line" {
+    let dir = build_fixture(#"test "only" {
+    assert_eq(1, 1)
+}
+"#)
+    let r = run_fixture(dir, "BLINK_DEV_TEST_RAISE_AFTER_REPORT={process.SIGSEGV}")
+    assert_eq(r.end, ChildEnd.Signaled(process.SIGSEGV))
+    let lines = report_lines(dir)
+    assert_eq(lines.len(), 3)
+    assert(at(lines, 2).starts_with("\{\"record\":\"end\","), at(lines, 2))
+    let _ = sh("rm -rf {dir}")
+}
+
+test "a report path the binary cannot open is a usage error" {
+    let dir = build_fixture(#"test "only" {
+    assert_eq(1, 1)
+}
+"#)
+    let r = sh("{dir}/fx --test-report {dir}/no/such/dir/report")
+    assert_eq(r.end, ChildEnd.Exited(2))
+    assert(r.err_out.contains("cannot open test report"), r.err_out)
+    assert(!r.out.contains("ok"), r.out)
+    let _ = sh("rm -rf {dir}")
+}

@@ -3,6 +3,7 @@
 
 #include <setjmp.h>
 #include <time.h>
+#include <signal.h>
 
 typedef struct {
     const char* name;
@@ -506,23 +507,121 @@ BLINK_RT_FN void blink_test_run_case(const char* label, const char* duplicate, b
     }
 }
 
-/* Write `s` to stdout as one JSON string, quotes included. Every string a user wrote
+/* One test record as JSON text. The runner builds each record here once, then writes
+ * it to the --test-json document on stdout and as a line of the --test-report file, so
+ * the two never differ. It grows as needed, so it never cuts a record. */
+BLINK_UNUSED static char* __blink_test_rec = NULL;
+BLINK_UNUSED static size_t __blink_test_rec_len = 0;
+BLINK_UNUSED static size_t __blink_test_rec_cap = 0;
+
+BLINK_UNUSED static void __blink_test_rec_reserve(size_t more) {
+    if (__blink_test_rec_len + more + 1 <= __blink_test_rec_cap) return;
+    size_t cap = __blink_test_rec_cap ? __blink_test_rec_cap : 1024;
+    while (cap < __blink_test_rec_len + more + 1) cap *= 2;
+    char* grown = (char*)realloc(__blink_test_rec, cap);
+    if (grown == NULL) { fprintf(stderr, "blink: out of memory\n"); exit(1); }
+    __blink_test_rec = grown;
+    __blink_test_rec_cap = cap;
+}
+
+BLINK_UNUSED static void __blink_test_rec_reset(void) {
+    __blink_test_rec_reserve(0);
+    __blink_test_rec_len = 0;
+    __blink_test_rec[0] = '\0';
+}
+
+BLINK_UNUSED static void __blink_test_rec_putc(char c) {
+    __blink_test_rec_reserve(1);
+    __blink_test_rec[__blink_test_rec_len++] = c;
+    __blink_test_rec[__blink_test_rec_len] = '\0';
+}
+
+BLINK_UNUSED static void __blink_test_rec_puts(const char* s) {
+    size_t n = strlen(s);
+    __blink_test_rec_reserve(n);
+    memcpy(__blink_test_rec + __blink_test_rec_len, s, n + 1);
+    __blink_test_rec_len += n;
+}
+
+BLINK_UNUSED static void __blink_test_rec_printf(const char* fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(NULL, 0, fmt, ap);
+    va_end(ap);
+    if (n <= 0) return;
+    __blink_test_rec_reserve((size_t)n);
+    va_start(ap, fmt);
+    vsnprintf(__blink_test_rec + __blink_test_rec_len, (size_t)n + 1, fmt, ap);
+    va_end(ap);
+    __blink_test_rec_len += (size_t)n;
+}
+
+/* Write `s` to the record as one JSON string, quotes included. Every string a user wrote
  * (a test name, a tag, a message, a path) reaches the report through this: one quote,
  * backslash or byte below 0x20 written raw makes the whole document unparseable. It
- * keeps no buffer of its own, so it never cuts a string; a string copied into a
- * fixed-size record buffer before it reaches here can still be cut. */
+ * never cuts a string; a string copied into a fixed-size record buffer before it
+ * reaches here can still be cut. */
 BLINK_UNUSED static void __blink_test_print_json_str(const char* s) {
-    putchar('"');
+    __blink_test_rec_putc('"');
     for (const unsigned char* p = (const unsigned char*)(s ? s : ""); *p; p++) {
         unsigned char c = *p;
-        if (c == '"' || c == '\\') { putchar('\\'); putchar(c); }
-        else if (c == '\n') fputs("\\n", stdout);
-        else if (c == '\r') fputs("\\r", stdout);
-        else if (c == '\t') fputs("\\t", stdout);
-        else if (c < 0x20) printf("\\u%04x", c);
-        else putchar(c);
+        if (c == '"' || c == '\\') { __blink_test_rec_putc('\\'); __blink_test_rec_putc((char)c); }
+        else if (c == '\n') __blink_test_rec_puts("\\n");
+        else if (c == '\r') __blink_test_rec_puts("\\r");
+        else if (c == '\t') __blink_test_rec_puts("\\t");
+        else if (c < 0x20) __blink_test_rec_printf("\\u%04x", c);
+        else __blink_test_rec_putc((char)c);
     }
-    putchar('"');
+    __blink_test_rec_putc('"');
+}
+
+/* The --test-report file: blink test reads it while the binary runs and after it ends.
+ * Each line goes out in one write(2), so a reader sees whole lines once it sees the
+ * newline. Lines: `start` as a test begins, `test` (the record) as it ends, and `end`
+ * with the summary once every test ran. A file with no `end` line is a run the binary
+ * did not finish. O_CLOEXEC keeps a program that a test starts from writing to it. */
+BLINK_UNUSED static int __blink_test_report_fd = -1;
+
+BLINK_UNUSED static void __blink_test_report_write(const char* data, size_t len) {
+    if (__blink_test_report_fd < 0) return;
+    while (len > 0) {
+        ssize_t w = write(__blink_test_report_fd, data, len);
+        if (w < 0) {
+            if (errno == EINTR) continue;
+            return;
+        }
+        data += w;
+        len -= (size_t)w;
+    }
+}
+
+/* Writes the record buffer, which holds `{...}`, as a report line of kind `kind`. */
+BLINK_UNUSED static void __blink_test_report_record(const char* kind) {
+    if (__blink_test_report_fd < 0) return;
+    size_t klen = strlen(kind);
+    size_t body = __blink_test_rec_len > 0 ? __blink_test_rec_len - 1 : 0;
+    char* line = (char*)malloc(klen + body + 16);
+    if (line == NULL) { fprintf(stderr, "blink: out of memory\n"); exit(1); }
+    size_t n = 0;
+    memcpy(line + n, "{\"record\":\"", 11); n += 11;
+    memcpy(line + n, kind, klen); n += klen;
+    line[n++] = '"';
+    if (body > 1) line[n++] = ',';
+    if (body > 1) { memcpy(line + n, __blink_test_rec + 1, body - 1); n += body - 1; }
+    line[n++] = '}';
+    line[n++] = '\n';
+    __blink_test_report_write(line, n);
+    free(line);
+}
+
+/* A test record goes to the --test-json document and to the report. `index` counts the
+ * records written so far, for the comma between the document's records. */
+BLINK_UNUSED static void __blink_test_emit_record(int json_output, int index) {
+    if (json_output) {
+        if (index > 1) putchar(',');
+        fputs(__blink_test_rec, stdout);
+    }
+    __blink_test_report_record("test");
 }
 
 BLINK_UNUSED static int __blink_test_has_tag(const blink_test_entry* test, const char* tag) {
@@ -533,12 +632,12 @@ BLINK_UNUSED static int __blink_test_has_tag(const blink_test_entry* test, const
 }
 
 BLINK_UNUSED static void __blink_test_print_tags_json(const blink_test_entry* test) {
-    printf(",\"tags\":[");
+    __blink_test_rec_printf(",\"tags\":[");
     for (int t = 0; t < test->tag_count; t++) {
-        if (t > 0) printf(",");
+        if (t > 0) __blink_test_rec_printf(",");
         __blink_test_print_json_str(test->tags[t]);
     }
-    printf("]");
+    __blink_test_rec_printf("]");
 }
 
 /* E0824: emit the secondary cleanup-panic warnings captured during
@@ -551,18 +650,18 @@ BLINK_UNUSED static void __blink_test_print_cleanup_warnings_json(void) {
     if (__blink_cleanup_warning_count <= 0) { return; }
     int n = __blink_cleanup_warning_count;
     int shown = n < BLINK_CLEANUP_WARN_MAX ? n : BLINK_CLEANUP_WARN_MAX;
-    printf(",\"cleanup_warnings\":[");
+    __blink_test_rec_printf(",\"cleanup_warnings\":[");
     for (int w = 0; w < shown; w++) {
-        if (w > 0) printf(",");
-        printf("{\"code\":\"E0824\",\"message\":");
+        if (w > 0) __blink_test_rec_printf(",");
+        __blink_test_rec_printf("{\"code\":\"E0824\",\"message\":");
         __blink_test_print_json_str(__blink_cleanup_warnings[w]);
-        printf("}");
+        __blink_test_rec_printf("}");
     }
     if (n > BLINK_CLEANUP_WARN_MAX) {
-        printf(",{\"code\":\"E0824\",\"message\":\"... %d more cleanup panic(s) dropped (buffer cap %d)\"}",
+        __blink_test_rec_printf(",{\"code\":\"E0824\",\"message\":\"... %d more cleanup panic(s) dropped (buffer cap %d)\"}",
                n - BLINK_CLEANUP_WARN_MAX, BLINK_CLEANUP_WARN_MAX);
     }
-    printf("]");
+    __blink_test_rec_printf("]");
 }
 
 /* Human-readable counterpart: one `warning: E0824 ...` line per captured
@@ -586,28 +685,28 @@ BLINK_UNUSED static void __blink_test_print_cleanup_warnings_human(void) {
  * active. Early-return when no cases ran (plain tests emit no field). */
 BLINK_UNUSED static void __blink_test_print_case_records_json(void) {
     if (__blink_test_case_record_count <= 0) { return; }
-    printf(",\"cases\":[");
+    __blink_test_rec_printf(",\"cases\":[");
     for (int w = 0; w < __blink_test_case_record_count; w++) {
         const blink_test_case_record* r = &__blink_test_case_records[w];
-        if (w > 0) printf(",");
+        if (w > 0) __blink_test_rec_printf(",");
         const char* st = r->status == BLINK_TEST_CASE_FAILED ? "failed"
                        : r->status == BLINK_TEST_CASE_SKIPPED ? "skipped"
                        : r->status == BLINK_TEST_CASE_PANICKED ? "panicked"
                        : "passed";
-        printf("{\"label\":"); __blink_test_print_json_str(r->label);
-        printf(",\"status\":\"%s\"", st);
-        if (r->message) { printf(",\"message\":"); __blink_test_print_json_str(r->message); }
-        printf("}");
+        __blink_test_rec_printf("{\"label\":"); __blink_test_print_json_str(r->label);
+        __blink_test_rec_printf(",\"status\":\"%s\"", st);
+        if (r->message) { __blink_test_rec_printf(",\"message\":"); __blink_test_print_json_str(r->message); }
+        __blink_test_rec_printf("}");
     }
-    printf("]");
+    __blink_test_rec_printf("]");
 }
 
 /* The test.failing fields of a record of any status (spec §8.10.6). */
 BLINK_UNUSED static void __blink_test_print_xfail_json(const blink_test_entry* t) {
     if (!t->expected_fail) return;
-    printf(",\"expected_fail\":true");
+    __blink_test_rec_printf(",\"expected_fail\":true");
     if (t->xfail_reason) {
-        printf(",\"xfail_reason\":"); __blink_test_print_json_str(t->xfail_reason);
+        __blink_test_rec_printf(",\"xfail_reason\":"); __blink_test_print_json_str(t->xfail_reason);
     }
 }
 
@@ -622,6 +721,13 @@ BLINK_RT_FN void blink_test_run(const blink_test_entry* tests, int count, int ar
             tags_filter = argv[++i];
         } else if (strcmp(argv[i], "--test-json") == 0) {
             json_output = 1;
+        } else if (strcmp(argv[i], "--test-report") == 0 && i + 1 < argc) {
+            const char* report_path = argv[++i];
+            __blink_test_report_fd = open(report_path, O_WRONLY | O_CREAT | O_TRUNC | O_APPEND | O_CLOEXEC, 0600);
+            if (__blink_test_report_fd < 0) {
+                fprintf(stderr, "error: cannot open test report '%s': %s\n", report_path, strerror(errno));
+                exit(2);
+            }
         }
     }
 
@@ -645,15 +751,17 @@ BLINK_RT_FN void blink_test_run(const blink_test_entry* tests, int count, int ar
         if (filter && !strstr(tests[i].name, filter)) continue;
         if (tags_filter && !__blink_test_has_tag(&tests[i], tags_filter)) continue;
         if (tests[i].skip) { skip++; total++;
-            if (json_output) {
-                if (total > 1) printf(",");
-                printf("{\"name\":"); __blink_test_print_json_str(tests[i].name);
-                printf(",\"status\":\"skipped\"");
-                printf(",\"duration_ms\":%g", 0.0);
+            {
+                __blink_test_rec_reset();
+                __blink_test_rec_printf("{\"name\":"); __blink_test_print_json_str(tests[i].name);
+                __blink_test_rec_printf(",\"status\":\"skipped\"");
+                __blink_test_rec_printf(",\"duration_ms\":%g", 0.0);
                 __blink_test_print_tags_json(&tests[i]);
                 __blink_test_print_xfail_json(&tests[i]);
-                printf("}");
-            } else {
+                __blink_test_rec_printf("}");
+                __blink_test_emit_record(json_output, total);
+            }
+            if (!json_output) {
                 printf("test %s ... \033[33mskipped\033[0m\n", tests[i].name);
             }
             continue;
@@ -690,6 +798,10 @@ BLINK_RT_FN void blink_test_run(const blink_test_entry* tests, int count, int ar
         __blink_cleanup_warning_count = 0;
         struct timespec __t0, __t1;
         clock_gettime(CLOCK_MONOTONIC, &__t0);
+        __blink_test_rec_reset();
+        __blink_test_rec_printf("{\"name\":"); __blink_test_print_json_str(tests[i].name);
+        __blink_test_rec_printf("}");
+        __blink_test_report_record("start");
         if (setjmp(__blink_test_jmp) == 0) {
             tests[i].fn();
         }
@@ -728,20 +840,22 @@ BLINK_RT_FN void blink_test_run(const blink_test_entry* tests, int count, int ar
         }
         if (__blink_test_skipped) {
             skip++;
-            if (json_output) {
-                if (total > 1) printf(",");
-                printf("{\"name\":"); __blink_test_print_json_str(tests[i].name);
-                printf(",\"status\":\"skipped\"");
+            {
+                __blink_test_rec_reset();
+                __blink_test_rec_printf("{\"name\":"); __blink_test_print_json_str(tests[i].name);
+                __blink_test_rec_printf(",\"status\":\"skipped\"");
                 if (__blink_test_skip_reason[0]) {
-                    printf(",\"reason\":"); __blink_test_print_json_str(__blink_test_skip_reason);
+                    __blink_test_rec_printf(",\"reason\":"); __blink_test_print_json_str(__blink_test_skip_reason);
                 }
-                printf(",\"duration_ms\":%g", dur_ms);
+                __blink_test_rec_printf(",\"duration_ms\":%g", dur_ms);
                 __blink_test_print_tags_json(&tests[i]);
                 __blink_test_print_cleanup_warnings_json();
                 __blink_test_print_case_records_json();
                 __blink_test_print_xfail_json(&tests[i]);
-                printf("}");
-            } else {
+                __blink_test_rec_printf("}");
+                __blink_test_emit_record(json_output, total);
+            }
+            if (!json_output) {
                 if (__blink_test_skip_reason[0]) {
                     printf("test %s ... \033[33mskipped\033[0m (%s)\n", tests[i].name, __blink_test_skip_reason);
                 } else {
@@ -753,20 +867,22 @@ BLINK_RT_FN void blink_test_run(const blink_test_entry* tests, int count, int ar
         }
         if (__blink_test_is_panicked()) {
             panicked++;
-            if (json_output) {
-                if (total > 1) printf(",");
-                printf("{\"name\":"); __blink_test_print_json_str(tests[i].name);
-                printf(",\"status\":\"panicked\"");
+            {
+                __blink_test_rec_reset();
+                __blink_test_rec_printf("{\"name\":"); __blink_test_print_json_str(tests[i].name);
+                __blink_test_rec_printf(",\"status\":\"panicked\"");
                 if (__blink_test_case_label[0]) {
-                    printf(",\"case\":"); __blink_test_print_json_str(__blink_test_case_label);
+                    __blink_test_rec_printf(",\"case\":"); __blink_test_print_json_str(__blink_test_case_label);
                 }
-                printf(",\"message\":"); __blink_test_print_json_str(__blink_test_fail_msg);
-                printf(",\"duration_ms\":%g", dur_ms);
+                __blink_test_rec_printf(",\"message\":"); __blink_test_print_json_str(__blink_test_fail_msg);
+                __blink_test_rec_printf(",\"duration_ms\":%g", dur_ms);
                 __blink_test_print_tags_json(&tests[i]);
                 __blink_test_print_cleanup_warnings_json();
                 __blink_test_print_case_records_json();
-                printf("}");
-            } else {
+                __blink_test_rec_printf("}");
+                __blink_test_emit_record(json_output, total);
+            }
+            if (!json_output) {
                 if (__blink_test_case_label[0]) {
                     printf("test %s::case[%s] ... \033[31mPANIC\033[0m\n", tests[i].name, __blink_test_case_label);
                 } else {
@@ -777,49 +893,51 @@ BLINK_RT_FN void blink_test_run(const blink_test_entry* tests, int count, int ar
             }
         } else if (__blink_test_failed) {
             fail++;
-            if (json_output) {
-                if (total > 1) printf(",");
-                printf("{\"name\":"); __blink_test_print_json_str(tests[i].name);
-                printf(",\"status\":\"failed\",\"line\":%d", __blink_test_fail_line);
-                printf(",\"cause\":\"%s\"", __blink_test_fail_cause);
+            {
+                __blink_test_rec_reset();
+                __blink_test_rec_printf("{\"name\":"); __blink_test_print_json_str(tests[i].name);
+                __blink_test_rec_printf(",\"status\":\"failed\",\"line\":%d", __blink_test_fail_line);
+                __blink_test_rec_printf(",\"cause\":\"%s\"", __blink_test_fail_cause);
                 if (__blink_test_case_label[0]) {
-                    printf(",\"case\":"); __blink_test_print_json_str(__blink_test_case_label);
+                    __blink_test_rec_printf(",\"case\":"); __blink_test_print_json_str(__blink_test_case_label);
                 }
-                printf(",\"message\":"); __blink_test_print_json_str(__blink_test_fail_msg);
+                __blink_test_rec_printf(",\"message\":"); __blink_test_print_json_str(__blink_test_fail_msg);
                 if (__blink_test_fail_assertion[0]) {
-                    printf(",\"assertion\":"); __blink_test_print_json_str(__blink_test_fail_assertion);
+                    __blink_test_rec_printf(",\"assertion\":"); __blink_test_print_json_str(__blink_test_fail_assertion);
                 }
                 if (__blink_test_fail_expected[0]) {
-                    printf(",\"expected\":"); __blink_test_print_json_str(__blink_test_fail_expected);
+                    __blink_test_rec_printf(",\"expected\":"); __blink_test_print_json_str(__blink_test_fail_expected);
                 }
                 if (__blink_test_fail_actual[0]) {
-                    printf(",\"actual\":"); __blink_test_print_json_str(__blink_test_fail_actual);
+                    __blink_test_rec_printf(",\"actual\":"); __blink_test_print_json_str(__blink_test_fail_actual);
                 }
                 if (__blink_test_fail_intro[0]) {
-                    printf(",\"introspection\":"); __blink_test_print_json_str(__blink_test_fail_intro);
+                    __blink_test_rec_printf(",\"introspection\":"); __blink_test_print_json_str(__blink_test_fail_intro);
                 }
                 if (__blink_test_fail_user_msg[0]) {
-                    printf(",\"user_message\":"); __blink_test_print_json_str(__blink_test_fail_user_msg);
+                    __blink_test_rec_printf(",\"user_message\":"); __blink_test_print_json_str(__blink_test_fail_user_msg);
                 }
                 if (__blink_test_fail_error_type[0] || __blink_test_fail_error_message[0]) {
-                    printf(",\"error\":{\"message\":");
+                    __blink_test_rec_printf(",\"error\":{\"message\":");
                     __blink_test_print_json_str(__blink_test_fail_error_message);
-                    printf(",\"error_type\":");
+                    __blink_test_rec_printf(",\"error_type\":");
                     __blink_test_print_json_str(__blink_test_fail_error_type);
-                    printf("}");
+                    __blink_test_rec_printf("}");
                 }
                 if (__blink_test_fail_file[0]) {
-                    printf(",\"span\":{\"file\":");
+                    __blink_test_rec_printf(",\"span\":{\"file\":");
                     __blink_test_print_json_str(__blink_test_fail_file);
-                    printf(",\"line\":%d,\"col\":%d}", __blink_test_fail_line, __blink_test_fail_col);
+                    __blink_test_rec_printf(",\"line\":%d,\"col\":%d}", __blink_test_fail_line, __blink_test_fail_col);
                 }
-                printf(",\"duration_ms\":%g", dur_ms);
+                __blink_test_rec_printf(",\"duration_ms\":%g", dur_ms);
                 __blink_test_print_tags_json(&tests[i]);
                 __blink_test_print_cleanup_warnings_json();
                 __blink_test_print_case_records_json();
                 __blink_test_print_xfail_json(&tests[i]);
-                printf("}");
-            } else {
+                __blink_test_rec_printf("}");
+                __blink_test_emit_record(json_output, total);
+            }
+            if (!json_output) {
                 if (__blink_test_case_label[0]) {
                     printf("test %s::case[%s] ... \033[31mFAIL\033[0m\n", tests[i].name, __blink_test_case_label);
                 } else {
@@ -852,23 +970,25 @@ BLINK_RT_FN void blink_test_run(const blink_test_entry* tests, int count, int ar
             }
         } else {
             pass++;
-            if (json_output) {
-                if (total > 1) printf(",");
-                printf("{\"name\":"); __blink_test_print_json_str(tests[i].name);
-                printf(",\"status\":\"passed\"");
-                printf(",\"duration_ms\":%g", dur_ms);
+            {
+                __blink_test_rec_reset();
+                __blink_test_rec_printf("{\"name\":"); __blink_test_print_json_str(tests[i].name);
+                __blink_test_rec_printf(",\"status\":\"passed\"");
+                __blink_test_rec_printf(",\"duration_ms\":%g", dur_ms);
                 __blink_test_print_tags_json(&tests[i]);
                 __blink_test_print_cleanup_warnings_json();
                 __blink_test_print_case_records_json();
                 __blink_test_print_xfail_json(&tests[i]);
                 if (xfail_observed) {
-                    printf(",\"xfail_observed\":\"%s\"", xfail_observed);
+                    __blink_test_rec_printf(",\"xfail_observed\":\"%s\"", xfail_observed);
                     if (strcmp(xfail_observed, "panicked") == 0) {
-                        printf(",\"message\":"); __blink_test_print_json_str(__blink_test_fail_msg);
+                        __blink_test_rec_printf(",\"message\":"); __blink_test_print_json_str(__blink_test_fail_msg);
                     }
                 }
-                printf("}");
-            } else {
+                __blink_test_rec_printf("}");
+                __blink_test_emit_record(json_output, total);
+            }
+            if (!json_output) {
                 printf("test %s ... \033[32mok\033[0m\n", tests[i].name);
                 __blink_test_print_cleanup_warnings_human();
             }
@@ -883,6 +1003,17 @@ BLINK_RT_FN void blink_test_run(const blink_test_entry* tests, int count, int ar
         if (panicked > 0) printf(", %d panicked", panicked);
         if (skip > 0) printf(", %d skipped", skip);
         printf(" (of %d)\n", total);
+    }
+    __blink_test_rec_reset();
+    __blink_test_rec_printf("{\"summary\":{\"total\":%d,\"passed\":%d,\"failed\":%d,\"panicked\":%d,\"skipped\":%d,\"duration_ms\":%g}}",
+                            total, pass, fail, panicked, skip, total_ms);
+    __blink_test_report_record("end");
+    /* Dev knob: a signal after the end line, so a test can prove that blink test calls a
+     * binary that ends by a signal aborted even when its report is whole. */
+    const char* raise_after = getenv("BLINK_DEV_TEST_RAISE_AFTER_REPORT");
+    if (raise_after != NULL && raise_after[0] != '\0') {
+        fflush(stdout);
+        raise(atoi(raise_after));
     }
     if (fail + panicked > 0) exit(1);
 }
