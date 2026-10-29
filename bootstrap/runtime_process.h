@@ -853,6 +853,10 @@ typedef struct blink_limit_rec {
     int limit_hit;      /* the deadline came while the leader still ran */
     int reaped;
     int released;       /* its run or wait is done with it, so the thread frees it */
+    int reaped_at_exit; /* the program-exit path reaped it; status is the leader's */
+    int status;
+    int exit_live;      /* the program-exit path still waits for its group */
+    int64_t exit_kill_at;
 } blink_limit_rec;
 
 /* A fork that a run or spawn asks of the limits thread. It lives on the stack of the
@@ -872,12 +876,14 @@ typedef struct {
     pthread_mutex_t mu;
     pthread_cond_t served;
     int started;
+    int ending;         /* the program-exit path has begun: no fork is served from then on */
+    volatile sig_atomic_t pending_sig;
     int wake_rd, wake_wr;
     blink_limit_rec* recs;
     blink_limit_req* reqs;
 } blink_limits_state;
 
-#define BLINK_LIMITS_STATE_INIT { PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, 0, -1, -1, NULL, NULL }
+#define BLINK_LIMITS_STATE_INIT { PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, 0, 0, 0, -1, -1, NULL, NULL }
 
 #ifdef BLINK_USE_EXTERN_RUNTIME_STORAGE
   #ifdef BLINK_RUNTIME_STORAGE_DEFINE
@@ -1014,12 +1020,115 @@ static void blink_limits_fork_locked(blink_limit_req* req) {
     req->rec = rec;
 }
 
+/* The program-exit rule (§4.4.8 A limited child does not outlive this program): each limited
+ * child whose leader is not reaped gets the signals of its deadline now, and the exit waits
+ * until its group is gone. Interim choice, the one place for it: SIGTERM, then SIGKILL after
+ * the child's own grace (at once for a grace of zero, and no later than a SIGKILL that its
+ * deadline already set); all groups at once, so the exit waits at most the longest grace. A
+ * zombie leader still counts as a member of its group, so the exit reaps it, keeps its
+ * status for a run or wait that comes later, and then waits until no process is left with
+ * that pgid; a pgid with a live member cannot pass to another process. A child that a run or
+ * wait reaped gets nothing, as after the reap its pid may name another process.
+ *
+ * Caller holds blink_limits.mu, and holds it to the end, so no fork starts while the exit
+ * runs and a second caller waits here until the first is done. This never waits on a fork
+ * request: a run or spawn that asks for one after ending was set waits forever, which the
+ * exit makes moot, and its wait released blink_limits.mu. Each rec->mu holder only reaps a
+ * leader that has exited or got SIGKILL, so each lock below is short. */
+static void blink_limits_end_locked(void) {
+    if (blink_limits.ending) return;
+    blink_limits.ending = 1;
+    int64_t now = blink_limits_now();
+    for (blink_limit_rec* rec = blink_limits.recs; rec != NULL; rec = rec->next) {
+        pthread_mutex_lock(&rec->mu);
+        if (!rec->reaped) {
+            rec->exit_live = 1;
+            if (rec->grace == 0 || rec->stage == BLINK_LIMIT_KILLED) {
+                kill(-rec->pid, SIGKILL);
+                rec->exit_kill_at = BLINK_LIMIT_NEVER;
+            } else {
+                if (rec->stage != BLINK_LIMIT_TERMED) kill(-rec->pid, SIGTERM);
+                rec->exit_kill_at = blink_limits_add(now, rec->grace);
+                if (rec->stage == BLINK_LIMIT_TERMED && rec->kill_at < rec->exit_kill_at) {
+                    rec->exit_kill_at = rec->kill_at;
+                }
+            }
+        }
+        pthread_mutex_unlock(&rec->mu);
+    }
+    for (;;) {
+        int live = 0;
+        now = blink_limits_now();
+        for (blink_limit_rec* rec = blink_limits.recs; rec != NULL; rec = rec->next) {
+            pthread_mutex_lock(&rec->mu);
+            if (rec->exit_live) {
+                if (!rec->reaped) {
+                    int st = 0;
+                    if (waitpid(rec->pid, &st, WNOHANG) == rec->pid) {
+                        rec->reaped = 1;
+                        rec->reaped_at_exit = 1;
+                        rec->status = st;
+                    }
+                }
+                if (rec->reaped_at_exit && kill(-rec->pid, 0) < 0 && errno == ESRCH) {
+                    rec->exit_live = 0;
+                } else if (rec->reaped && !rec->reaped_at_exit) {
+                    /* A run or wait reaped it meanwhile. */
+                    rec->exit_live = 0;
+                } else if (now >= rec->exit_kill_at) {
+                    kill(-rec->pid, SIGKILL);
+                    rec->exit_kill_at = BLINK_LIMIT_NEVER;
+                }
+                live |= rec->exit_live;
+            }
+            pthread_mutex_unlock(&rec->mu);
+        }
+        if (!live) return;
+        struct timespec ts = { 0, 10 * 1000000L };
+        nanosleep(&ts, NULL);
+    }
+}
+
+/* A SIGINT or SIGTERM came while the limits thread ran: the limited children are ended, so
+ * the program now ends by that signal, as it would have with no handler. */
+static void blink_limits_reraise(int sig) {
+    struct sigaction dfl;
+    memset(&dfl, 0, sizeof(dfl));
+    dfl.sa_handler = SIG_DFL;
+    sigaction(sig, &dfl, NULL);
+    sigset_t one;
+    sigemptyset(&one);
+    sigaddset(&one, sig);
+    pthread_sigmask(SIG_UNBLOCK, &one, NULL);
+    raise(sig);
+    _exit(128 + sig);
+}
+
+static void blink_limits_at_exit(void) {
+    pthread_mutex_lock(&blink_limits.mu);
+    blink_limits_end_locked();
+    int sig = blink_limits.pending_sig;
+    if (sig != 0) blink_limits_reraise(sig);
+    pthread_mutex_unlock(&blink_limits.mu);
+}
+
+/* Async-signal-safe: the limits thread does the work, as the handler can take no lock. */
+static void blink_limits_on_signal(int sig) {
+    blink_limits.pending_sig = sig;
+    blink_limits_wake();
+}
+
 static void* blink_limits_main(void* arg) {
     (void)arg;
     pthread_mutex_lock(&blink_limits.mu);
     for (;;) {
+        int sig = blink_limits.pending_sig;
+        if (sig != 0) {
+            blink_limits_end_locked();
+            blink_limits_reraise(sig);
+        }
         int served = 0;
-        while (blink_limits.reqs != NULL) {
+        while (!blink_limits.ending && blink_limits.reqs != NULL) {
             blink_limit_req* req = blink_limits.reqs;
             blink_limits.reqs = req->next;
             blink_limits_fork_locked(req);
@@ -1085,6 +1194,20 @@ static int blink_limits_start_locked(void) {
         return e;
     }
     blink_limits.started = 1;
+    atexit(blink_limits_at_exit);
+    /* A program that set its own action for a signal keeps it. blink_process_forward_signal
+     * hands the signal on to this thread itself. */
+    int sigs[2] = { SIGINT, SIGTERM };
+    for (int i = 0; i < 2; i++) {
+        struct sigaction cur;
+        if (sigaction(sigs[i], NULL, &cur) == 0 && !(cur.sa_flags & SA_SIGINFO) && cur.sa_handler == SIG_DFL) {
+            struct sigaction sa;
+            memset(&sa, 0, sizeof(sa));
+            sa.sa_handler = blink_limits_on_signal;
+            sa.sa_flags = SA_RESTART;
+            sigaction(sigs[i], &sa, NULL);
+        }
+    }
     return 0;
 }
 
@@ -1148,7 +1271,12 @@ static int blink_limits_fork_exec(char** argv, int stdin_fd, int out_fd, int err
 static int blink_limits_reap(blink_limit_rec* rec, int wait_err, int* status, int* limit_hit) {
     pthread_mutex_lock(&rec->mu);
     int e = wait_err;
-    if (e == 0) e = blink_child_waitpid(rec->pid, status);
+    if (rec->reaped_at_exit) {
+        e = 0;
+        *status = rec->status;
+    } else if (e == 0) {
+        e = blink_child_waitpid(rec->pid, status);
+    }
     rec->reaped = 1;
     *limit_hit = rec->limit_hit;
     rec->released = 1;
@@ -1527,6 +1655,11 @@ static void blink_process_forward_signal(int sig) {
         if (!slot->reaped && slot->pid > 0) {
             kill(slot->pid, SIGTERM);
         }
+    }
+    /* With limited children the limits thread ends them first and then re-raises. */
+    if (blink_limits.started) {
+        blink_limits_on_signal(sig);
+        return;
     }
     /* Re-raise via default handler so the parent dies. */
     struct sigaction dfl;
