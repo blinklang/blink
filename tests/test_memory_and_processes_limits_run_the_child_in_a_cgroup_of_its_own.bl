@@ -7,10 +7,10 @@
 // be the only process in its cgroup, and a test binary is not.
 
 import compile_test_helpers
-import std.process.{ChildEnd, ChildLimits}
+import std.process.{ChildEnd, ChildLimits, ProcessError, ProcessResult}
 import std.time.{Duration}
 
-// args: mode. Each mode prints lines that the test compares.
+// args: mode, and for some modes a file path. Each mode prints lines that the test compares.
 fn helper_program() -> Str {
     [
         #"import std.process.{ChildLimits, LimitKind, ProcessError, ProcessResult, SIGTERM}"#,
@@ -32,6 +32,17 @@ fn helper_program() -> Str {
         #"            return true"#,
         #"        }"#,
         #"        time.sleep(Duration.ms(50))"#,
+        #"    }"#,
+        #"    false"#,
+        #"}"#,
+        #""#,
+        #"fn exists_within(path: Str, ms: Int) -> Bool {"#,
+        #"    let start = time.read()"#,
+        #"    while start.elapsed().to_ms() < ms {"#,
+        #"        if process.run("test", ["-s", path]).unwrap().success() {"#,
+        #"            return true"#,
+        #"        }"#,
+        #"        time.sleep(Duration.ms(20))"#,
         #"    }"#,
         #"    false"#,
         #"}"#,
@@ -124,6 +135,32 @@ fn helper_program() -> Str {
         #"            show("timeout", process.run("true", [], limits: ChildLimits { timeout: Some(Duration.seconds(10)) }))"#,
         #"            let _ = process.run("kill", [orphan])"#,
         #"        }"#,
+        #"        "first" => {"#,
+        #"            // The child ignores the SIGTERM of its deadline, then passes its memory limit."#,
+        #"            let script = "trap '' TERM; sleep 1; x=$(head -c 512M /dev/zero | tr '\\000' a); echo done""#,
+        #"            let start = time.read()"#,
+        #"            show("first", process.run("sh", ["-c", script], limits: ChildLimits { memory: Some(mb(64)), timeout: Some(Duration.ms(300)), grace: Duration.seconds(10) }))"#,
+        #"            io.println("quick {start.elapsed().to_ms() < 5000}")"#,
+        #"        }"#,
+        #"        "signal" => {"#,
+        #"            // The grandchild leaves the process group of the child, and notes its SIGTERM."#,
+        #"            let f = a.get(2).unwrap()"#,
+        #"            let script = "setsid sh -c 'trap \"echo t > $0.term; exit 0\" TERM; echo $$ > $0.pid; while :; do sleep 0.05; done' \"$0\" </dev/null >/dev/null 2>&1 & while [ ! -s \"$0.pid\" ]; do sleep 0.01; done; sleep 30""#,
+        #"            show("signal", process.run("sh", ["-c", script, f], limits: ChildLimits { memory: Some(mb(64)), timeout: Some(Duration.seconds(2)), grace: Duration.seconds(5) }))"#,
+        #"            io.println("term {exists_within("{f}.term", 5000)}")"#,
+        #"            io.println("gone {gone_within(d, 5000)}")"#,
+        #"        }"#,
+        #"        "exit" => {"#,
+        #"            // The program returns while a grandchild that left the process group still runs."#,
+        #"            let f = a.get(2).unwrap()"#,
+        #"            let script = "setsid sh -c 'echo $$ > $0.pid; exec sleep 30' \"$0\" </dev/null >/dev/null 2>&1 & sleep 30""#,
+        #"            let _kid = process.spawn("sh", ["-c", script, f], limits: ChildLimits { memory: Some(mb(64)) }).unwrap()"#,
+        #"            if exists_within("{f}.pid", 10000) {"#,
+        #"                io.println("pid {process.run("cat", ["{f}.pid"]).unwrap().out.trim()}")"#,
+        #"            } else {"#,
+        #"                io.println("no pid file")"#,
+        #"            }"#,
+        #"        }"#,
         #"        _ => io.println("unknown mode")"#,
         #"    }"#,
         #"}"#,
@@ -170,18 +207,34 @@ fn end_scope(unit: Str) {
     let _ = process.run("sh", ["-c", "cg=$(systemctl --user show -P ControlGroup \"$0\" 2>/dev/null); [ -n \"$cg\" ] && [ -e \"/sys/fs/cgroup$cg/cgroup.kill\" ] && echo 1 > \"/sys/fs/cgroup$cg/cgroup.kill\"; true", "{unit}.scope"])
 }
 
+// Runs cmd in the delegated scope `unit`. The caller ends the scope.
+fn scope_run(unit: Str, cmd: List[Str]) -> Result[ProcessResult, ProcessError] {
+    // A case that hung would hang the test; the timeout turns that into a failure.
+    process.run("systemd-run", scope_args(unit).append(cmd), limits: ChildLimits { timeout: Some(Duration.seconds(120)) })
+}
+
+fn helper_lines(mode: Str, r: Result[ProcessResult, ProcessError]) -> List[Str] {
+    let res = r.unwrap()
+    assert_eq(res.end, ChildEnd.Exited(0), "helper {mode} failed:\n{res.out}{res.err_out}")
+    res.out.trim().split("\n")
+}
+
 // Runs the helper in a delegated scope of its own and gives its output lines. `wrap` runs it
 // through `sh -c` that stays in the scope, so the scope holds a process the helper did not start.
 fn run_in_scope(mode: Str, wrap: Bool) -> List[Str] {
     let bin = helper_bin()
     let unit = "blink-cgtest-{getpid()}-{mode}"
     let cmd = if wrap { ["sh", "-c", "\"$0\" \"$1\"; true", bin, mode] } else { [bin, mode] }
-    // A case that hung would hang the test; the timeout turns that into a failure.
-    let r = process.run("systemd-run", scope_args(unit).append(cmd), limits: ChildLimits { timeout: Some(Duration.seconds(120)) })
+    let r = scope_run(unit, cmd)
     end_scope(unit)
-    let res = r.unwrap()
-    assert_eq(res.end, ChildEnd.Exited(0), "helper {mode} failed:\n{res.out}{res.err_out}")
-    res.out.trim().split("\n")
+    helper_lines(mode, r)
+}
+
+// The path the helper's processes write their pid and marker files next to.
+fn mark_file(mode: Str) -> Str {
+    let f = "{work_dir()}/{mode}-{getpid()}"
+    shell_exec("rm -f {f}.pid {f}.term")
+    f
 }
 
 test "can_limit is true for memory and processes in a delegated cgroup, and moves nothing" {
@@ -276,4 +329,44 @@ test "a move that a process of another program blocks gives its errno, and each 
     assert_eq(lines.get(2).unwrap(), "first errno 16")
     assert_eq(lines.get(3).unwrap(), "second errno 16")
     assert_eq(lines.get(4).unwrap(), "timeout end exit 0")
+}
+
+test "the first limit that a child passes is its end, also when it passes another before its reap" {
+    let why = scope_problem()
+    if why != "" {
+        skip(why)
+    }
+    // The child ignores the SIGTERM of its timeout, then passes its memory limit long before
+    // the grace of 10 s ends.
+    assert_eq(run_in_scope("first", false), ["first end limit timeout", "quick true"])
+}
+
+test "the SIGTERM of a deadline reaches a grandchild that left the process group of the child" {
+    let why = scope_problem()
+    if why != "" {
+        skip(why)
+    }
+    let bin = helper_bin()
+    let unit = "blink-cgtest-{getpid()}-signal"
+    let f = mark_file("signal")
+    let r = scope_run(unit, [bin, "signal", f])
+    end_scope(unit)
+    assert_eq(helper_lines("signal", r), ["signal end limit timeout", "term true", "gone true"])
+}
+
+test "at program exit a grandchild that left the process group of a limited child ends too" {
+    let why = scope_problem()
+    if why != "" {
+        skip(why)
+    }
+    let bin = helper_bin()
+    let unit = "blink-cgtest-{getpid()}-exit"
+    let f = mark_file("exit")
+    let r = scope_run(unit, [bin, "exit", f])
+    // Read before end_scope, which would end the grandchild in any case.
+    let pid = process.run("cat", ["{f}.pid"]).unwrap().out.trim()
+    let state = if pid == "" { "" } else { process.run("ps", ["-o", "stat=", "-p", pid]).unwrap().out.trim() }
+    end_scope(unit)
+    assert_eq(helper_lines("exit", r), ["pid {pid}"])
+    assert(state == "" || state.starts_with("Z"), "grandchild {pid} outlived the program: state {state}")
 }

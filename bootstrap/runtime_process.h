@@ -1353,6 +1353,60 @@ static void blink_cg_left_locked(void) {
         }
     }
 }
+
+/* Sends sig to each process of cg and of each cgroup below it. The caller has frozen the
+ * tree, so no listed process ends and passes its pid on before its kill. */
+static void blink_cg_signal_tree(const char* cg, int sig, int depth) {
+    char path[BLINK_CG_PATH];
+    if (snprintf(path, sizeof(path), "%s/cgroup.procs", cg) >= (int)sizeof(path)) return;
+    char* procs = blink_cg_slurp(path);
+    if (procs != NULL) {
+        for (char* p = procs; *p != 0;) {
+            char* end = NULL;
+            long pid = strtol(p, &end, 10);
+            if (end == p) break;
+            if (pid > 0) kill((pid_t)pid, sig);
+            p = end;
+            while (*p == '\n') p++;
+        }
+        free(procs);
+    }
+    if (depth >= 64) return;
+    DIR* dir = opendir(cg);
+    if (dir == NULL) return;
+    struct dirent* ent;
+    while ((ent = readdir(dir)) != NULL) {
+        if (ent->d_name[0] == '.') continue;
+        struct stat st;
+        if (fstatat(dirfd(dir), ent->d_name, &st, 0) != 0 || !S_ISDIR(st.st_mode)) continue;
+        if (snprintf(path, sizeof(path), "%s/%s", cg, ent->d_name) >= (int)sizeof(path)) continue;
+        blink_cg_signal_tree(path, sig, depth + 1);
+    }
+    closedir(dir);
+}
+
+/* Sends sig to every process in the cgroup of a child, the ones that left its process group
+ * (setsid) too. SIGKILL is cgroup.kill. Another signal goes to each process while the tree is
+ * frozen; 0 when the tree did not freeze in time, and then the caller signals the group only,
+ * as a pid read from an unfrozen cgroup may name another process by the time of its kill.
+ * Caller holds rec->mu. */
+static int blink_cg_send(blink_limit_rec* rec, int sig) {
+    if (sig == SIGKILL) {
+        blink_cg_kill(rec);
+        return 1;
+    }
+    char path[BLINK_CG_PATH];
+    snprintf(path, sizeof(path), "%s/cgroup.freeze", rec->cg);
+    if (blink_cg_write(path, "1") != 0) return 0;
+    int frozen = 0;
+    for (int i = 0; i < 200 && !(frozen = blink_cg_count(rec->cg, "cgroup.events", "frozen") == 1); i++) {
+        struct timespec ts = { 0, 1000000L };
+        nanosleep(&ts, NULL);
+    }
+    if (frozen) blink_cg_signal_tree(rec->cg, sig, 0);
+    blink_cg_write(path, "0");
+    return frozen;
+}
 #endif
 #endif
 
@@ -1391,6 +1445,16 @@ static int blink_limits_leader_runs(blink_limit_rec* rec, siginfo_t* info) {
     return !(r == 0 && info->si_pid == rec->pid);
 }
 
+/* Sends sig to a limited child: to its cgroup when it has one, so a process that left the
+ * process group gets it too, else to its process group. SIGKILL goes to both. Caller holds
+ * rec->mu, and the leader is not reaped or its group still has a member. */
+static void blink_limits_signal_locked(blink_limit_rec* rec, int sig) {
+#if defined(__linux__)
+    if (rec->cg != NULL && blink_cg_send(rec, sig) && sig != SIGKILL) return;
+#endif
+    kill(-rec->pid, sig);
+}
+
 /* The deadline of a child came. Interim choice, the one place for it: the group gets the
  * signal whenever the leader is not reaped, even when the leader has exited, since the
  * children it started may run on; the limit ended the child only if the leader still ran.
@@ -1402,10 +1466,10 @@ static void blink_limits_deadline_locked(blink_limit_rec* rec, int64_t now) {
         rec->limit = blink_LimitKind_Timeout;
     }
     if (rec->grace == 0) {
-        kill(-rec->pid, SIGKILL);
+        blink_limits_signal_locked(rec, SIGKILL);
         rec->stage = BLINK_LIMIT_KILLED;
     } else {
-        kill(-rec->pid, SIGTERM);
+        blink_limits_signal_locked(rec, SIGTERM);
         rec->kill_at = blink_limits_add(now, rec->grace);
         rec->stage = BLINK_LIMIT_TERMED;
     }
@@ -1462,7 +1526,7 @@ static int64_t blink_limits_tick_locked(int64_t now) {
                 blink_limits_deadline_locked(rec, now);
             }
             if (rec->stage == BLINK_LIMIT_TERMED && now >= rec->kill_at) {
-                kill(-rec->pid, SIGKILL);
+                blink_limits_signal_locked(rec, SIGKILL);
                 rec->stage = BLINK_LIMIT_KILLED;
             }
             if (rec->stage == BLINK_LIMIT_WAITING && rec->deadline < next) next = rec->deadline;
@@ -1601,9 +1665,10 @@ static void blink_limits_fork_locked(blink_limit_req* req) {
 
 /* The program-exit rule (§4.4.8 A limited child does not outlive this program): each limited
  * child whose leader is not reaped gets the signals of its deadline now, and the exit waits
- * until its group is gone. Interim choice, the one place for it: SIGTERM, then SIGKILL after
- * the child's own grace (at once for a grace of zero, and no later than a SIGKILL that its
- * deadline already set); all groups at once, so the exit waits at most the longest grace. A
+ * until its group, and its cgroup when it has one, is gone. Interim choice, the one place
+ * for it: SIGTERM, then SIGKILL after the child's own grace (at once for a grace of zero,
+ * and no later than a SIGKILL that its deadline already set); all groups at once, so the
+ * exit waits at most the longest grace. A
  * zombie leader still counts as a member of its group, so the exit reaps it, keeps its
  * status for a run or wait that comes later, and then waits until no process is left with
  * that pgid; a pgid with a live member cannot pass to another process. A child that a run or
@@ -1623,10 +1688,10 @@ static void blink_limits_end_locked(void) {
         if (!rec->reaped) {
             rec->exit_live = 1;
             if (rec->grace == 0 || rec->stage == BLINK_LIMIT_KILLED) {
-                kill(-rec->pid, SIGKILL);
+                blink_limits_signal_locked(rec, SIGKILL);
                 rec->exit_kill_at = BLINK_LIMIT_NEVER;
             } else {
-                if (rec->stage != BLINK_LIMIT_TERMED) kill(-rec->pid, SIGTERM);
+                if (rec->stage != BLINK_LIMIT_TERMED) blink_limits_signal_locked(rec, SIGTERM);
                 rec->exit_kill_at = blink_limits_add(now, rec->grace);
                 if (rec->stage == BLINK_LIMIT_TERMED && rec->kill_at < rec->exit_kill_at) {
                     rec->exit_kill_at = rec->kill_at;
@@ -1665,13 +1730,24 @@ static void blink_limits_end_locked(void) {
                         break;
                     }
                 }
-                if ((rec->reaped_at_exit || rec->exit_gone) && kill(-rec->pid, 0) < 0 && errno == ESRCH) {
+                int group_gone = (rec->reaped_at_exit || rec->exit_gone) && kill(-rec->pid, 0) < 0 && errno == ESRCH;
+                int gone = group_gone;
+#if defined(__linux__)
+                /* A process that left the group (setsid) is still in the cgroup. A cgroup
+                 * that cannot be read counts as empty, so the exit cannot hang on it. */
+                if (gone && rec->cg != NULL) gone = blink_cg_count(rec->cg, "cgroup.events", "populated") != 1;
+#endif
+                if (gone) {
                     rec->exit_live = 0;
                 } else if (rec->reaped && !rec->reaped_at_exit) {
                     /* A run or wait reaped it meanwhile. */
                     rec->exit_live = 0;
                 } else if (now >= rec->exit_kill_at) {
-                    kill(-rec->pid, SIGKILL);
+#if defined(__linux__)
+                    if (rec->cg != NULL) blink_cg_kill(rec);
+#endif
+                    /* A group with no member left may pass its pgid to another process. */
+                    if (!group_gone) kill(-rec->pid, SIGKILL);
                     rec->exit_kill_at = BLINK_LIMIT_NEVER;
                 }
                 live |= rec->exit_live;
