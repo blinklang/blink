@@ -172,13 +172,15 @@ fn build_manifest(compiler: Str, std_dir: Str, modules: List[Str], rt_path: Str,
 // Every dev run and build gets here, often several at once, so a link that already
 // points at the cache dir is left alone, and one that does not is replaced by a
 // rename: a concurrent link never finds it missing.
-fn relink_archive(build_dir: Str, cache_dir_rel: Str) {
+fn relink_archive(build_dir: Str, cache_dir_rel: Str) ! Env.Exit, IO, Process.Spawn {
     let mut cmd = StringBuilder.new()
     cmd.write("for f in libblink_std.a libblink_std.h skip_modules.txt .archive-id monolith.c; do ")
     cmd.write("t=\"{cache_dir_rel}/$f\"; l=\"{build_dir}/$f\"; ")
     cmd.write("[ \"$(readlink \"$l\")\" = \"$t\" ] || \{ ln -sfn \"$t\" \"$l.$$\" && mv -f \"$l.$$\" \"$l\"; \}; ")
     cmd.write("done")
-    shell_exec(cmd.to_str())
+    // ln and mv print their own errors, and a build/ link left stale only costs the next run
+    // a relink.
+    let _ = build_fs.run_shell(cmd.to_str())
 }
 
 fn write_skip_modules_file(path: Str, keys: List[Str]) {
@@ -320,11 +322,15 @@ pub fn build_stdlib_archive_in(build_dir: Str, peeled: List[Str], force_rebuild:
         return if test_res.exit_code > 0 { test_res.exit_code } else { 1 }
     }
 
-    shell_exec("ar rcs {cache_dir}/libblink_std.a {cache_dir}/monolith.o {cache_dir}/runtime_test.o")
+    let ar_rc = build_fs.run_program("ar", ["rcs", "{cache_dir}/libblink_std.a", "{cache_dir}/monolith.o", "{cache_dir}/runtime_test.o"])
+    if ar_rc != 0 {
+        io.eprintln("error: ar failed building the stdlib archive (rc={ar_rc})")
+        return if ar_rc > 0 { ar_rc } else { 1 }
+    }
     write_skip_modules_file("{cache_dir}/skip_modules.txt", list_stdlib_module_keys())
     write_archive_id("{cache_dir}/.archive-id", rt_path_final, "{cache_dir}/libblink_std.h", "{cache_dir}/monolith.c")
     write_file("{cache_dir}/.stamp", "")
-    if force_rebuild { shell_exec("rm -rf {final_dir}") }
+    if force_rebuild { let _ = build_fs.remove_tree_or_report(final_dir) }
     // A concurrent build of the same key that published first wins; its entry is as good.
     if !build_fs.publish_dir(cache_dir, final_dir, "libblink_std.a") {
         io.eprintln("error: cannot write the stdlib archive to {final_dir}")

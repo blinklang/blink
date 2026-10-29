@@ -1373,7 +1373,7 @@ fn daemon_ask_worker(name: Str, request: Str) -> Str {
 // worker, the router's own connections are closed. The worker's directory
 // is named for the router's pid too: a worker of a daemon killed before ends only once it sees
 // its router is gone, and then removes its directory, which must not be this daemon's.
-fn daemon_spawn(route: DaemonRoute, key: Str, cwd: Str, path: Str, home: Bool, client_fd: Int) -> (DaemonRoute, Option[DaemonSpawn], Str) ! IO, Process.Spawn, FS.Write {
+fn daemon_spawn(route: DaemonRoute, key: Str, cwd: Str, path: Str, home: Bool, client_fd: Int) -> (DaemonRoute, Option[DaemonSpawn], Str) ! IO, Process.Spawn, FS.Write, FS.Delete {
     let mut r = route
     let router = getpid()
     let name = "w{router}-{r.next}"
@@ -1386,7 +1386,7 @@ fn daemon_spawn(route: DaemonRoute, key: Str, cwd: Str, path: Str, home: Bool, c
     let chan = if fd >= 0 { unix_socket_connect(path_join(dir, "daemon.sock")) } else { -1 }
     if chan < 0 {
         if fd >= 0 { unix_socket_close(fd) }
-        shell_exec("rm -rf {dir}")
+        let _ = build_fs.remove_tree_or_report(dir)
         return (r, None, "the daemon could not make a socket for {path}")
     }
     // The worker inherits what stdout holds unflushed, and would print it again.
@@ -1395,7 +1395,7 @@ fn daemon_spawn(route: DaemonRoute, key: Str, cwd: Str, path: Str, home: Bool, c
     if pid < 0 {
         unix_socket_close(fd)
         unix_socket_close(chan)
-        shell_exec("rm -rf {dir}")
+        let _ = build_fs.remove_tree_or_report(dir)
         return (r, None, "the daemon could not fork a worker for {path}")
     }
     // The worker leads a process group of its own, which its build children and each process
@@ -1492,7 +1492,7 @@ fn daemon_make_room(route: DaemonRoute) -> DaemonRoute ! IO {
 // Sends a check, build or query to the worker of its entry, forked first for a check or build
 // if none serves it. A query never forks one: a worker's first check costs more than the cold
 // query the client runs when no worker serves the file.
-fn daemon_route_request(route: DaemonRoute, req_type: Str, request: Str, client_fd: Int) -> (DaemonRoute, RouteTurn) ! IO, Process.Spawn, FS.Read, FS.Write {
+fn daemon_route_request(route: DaemonRoute, req_type: Str, request: Str, client_fd: Int) -> (DaemonRoute, RouteTurn) ! IO, Process.Spawn, FS.Read, FS.Write, FS.Delete {
     let mut r = route
     json_clear()
     let root = json_parse(request)
@@ -1588,7 +1588,7 @@ fn daemon_route_status(r: DaemonRoute) -> Str {
 // Until then it holds the build turn if it held it: a build child of a dead worker may still
 // write the files the next build of its entry writes. A worker that ended waits for the turn
 // no more.
-fn daemon_reap_workers(route: DaemonRoute) -> DaemonRoute ! IO, Process.Spawn, Process.Signal {
+fn daemon_reap_workers(route: DaemonRoute) -> DaemonRoute ! IO, Process.Spawn, Process.Signal, FS.Delete {
     let mut r = route
     let mut gone: List[Str] = []
     let mut ending: List[DaemonEntry] = []
@@ -1638,14 +1638,14 @@ fn daemon_group_gone(e: DaemonEntry) -> Bool ! IO, Process.Spawn, Process.Signal
     daemon_kill((0 - e.pid).to_i32(), 0.to_i32()).to_int() != 0 || time_ms() - e.killed >= 10000
 }
 
-fn daemon_forget_worker(e: DaemonEntry) ! IO {
+fn daemon_forget_worker(e: DaemonEntry) ! IO, FS.Delete {
     if e.stop_fd >= 0 {
         unix_socket_close(e.stop_fd)
     }
     if e.chan >= 0 {
         unix_socket_close(e.chan)
     }
-    shell_exec("rm -rf {path_join(daemon_dir(), e.name)}")
+    let _ = build_fs.remove_tree_or_report(path_join(daemon_dir(), e.name))
 }
 
 // Gives the free build turn to the worker that asked first. A worker the grant does not reach
@@ -1808,7 +1808,7 @@ fn daemon_stop_workers(route: DaemonRoute) -> DaemonRoute {
 // the build turn as soon as it is free. While a stop waits on its workers, or a worker it
 // ended has yet to be reaped, the wait is 1 ms at most, so the stop ends as soon as the last
 // of them does.
-fn daemon_route(max: Int) -> Option[DaemonSpawn] ! IO, Process.Spawn, FS.Read, FS.Write, Process.Signal, Env.Read, Net.Listen {
+fn daemon_route(max: Int) -> Option[DaemonSpawn] ! IO, Process.Spawn, FS.Read, FS.Write, Process.Signal, Env.Read, Net.Listen, FS.Delete {
     let mut r = DaemonRoute { entries: [], ended: [], next: 1, seq: 0, max: max, home_cwd: daemon_origin.cwd, home_path: daemon_source_path, root: daemon_entry_key(env.cwd(), path_dirname(daemon_dir())), retired_checks: 0, retired_builds: 0, retired_queries: 0, retired_reused: 0, stops: [], held: [], turn: "", waiting: [], told: [] }
     // The home worker checks the entry at once, so the first request finds it checked.
     let home_key = daemon_entry_key(r.home_cwd, r.home_path)
@@ -1868,7 +1868,7 @@ fn daemon_route(max: Int) -> Option[DaemonSpawn] ! IO, Process.Spawn, FS.Read, F
 
 // Serves the entry a worker was forked for until a stop, then removes its files and ends the
 // worker. In a child forked for a build it returns the build instead.
-fn daemon_serve(s: DaemonSpawn) -> Option[DaemonBuild] ! Daemon.Serve, IO, Lex.Tokenize, Parse, Parse.Build, TypeCheck, Diag.Report, Env.Write, Env.Read, Process.Spawn, FS.Read, FS.Write, Net.Listen {
+fn daemon_serve(s: DaemonSpawn) -> Option[DaemonBuild] ! Daemon.Serve, IO, Lex.Tokenize, Parse, Parse.Build, TypeCheck, Diag.Report, Env.Write, Env.Read, Process.Spawn, FS.Read, FS.Write, Net.Listen, FS.Delete {
     daemon_socket_fd = s.fd
     daemon_origin = DaemonOrigin { router: s.router, files: s.files, chan: s.chan, ..daemon_origin }
     // The router's files are the router's to remove.
@@ -1887,7 +1887,7 @@ fn daemon_serve(s: DaemonSpawn) -> Option[DaemonBuild] ! Daemon.Serve, IO, Lex.T
         return build
     }
     daemon_stop()
-    shell_exec("rm -rf {daemon_origin.files}")
+    let _ = build_fs.remove_tree_or_report(daemon_origin.files)
     // The end of main joins the threads of the process's pool, which the router started and
     // the fork did not copy, so a return from main would wait on them forever.
     env.exit(0)
@@ -1896,16 +1896,16 @@ fn daemon_serve(s: DaemonSpawn) -> Option[DaemonBuild] ! Daemon.Serve, IO, Lex.T
 
 // ── Shutdown ────────────────────────────────────────────────────────
 
-fn daemon_stop() ! Daemon.Serve {
+fn daemon_stop() ! Daemon.Serve, FS.Delete, IO {
     if daemon_socket_fd >= 0 {
         unix_socket_close(daemon_socket_fd)
         daemon_socket_fd = -1
     }
     if daemon_pid_path != "" {
-        shell_exec("rm -f {daemon_pid_path}")
+        let _ = build_fs.remove_tree_or_report(daemon_pid_path)
     }
     if daemon_sock_path != "" {
-        shell_exec("rm -f {daemon_sock_path}")
+        let _ = build_fs.remove_tree_or_report(daemon_sock_path)
     }
     si_reset()
     checked_inputs_reset()
@@ -1986,7 +1986,7 @@ fn daemon_worker_of(reply: Str) -> Str {
 // instead, for the caller to run. identity names the compiler and the environment, and
 // settings what the front end reads, which a client must share for the daemon to build for it.
 // max_entries is how many entry files the daemon keeps checked at once, each in a worker.
-pub fn daemon_start(source: Str, identity: Str, settings: Str, interface_text: Bool, max_entries: Int) -> Option[DaemonBuild] ! Daemon.Serve, IO, Lex.Tokenize, Parse, Parse.Build, TypeCheck, Diag.Report, FS.Write, Process.Spawn, Env.Write, Env.Read, FS.Read, Process.Signal, Net.Listen {
+pub fn daemon_start(source: Str, identity: Str, settings: Str, interface_text: Bool, max_entries: Int) -> Option[DaemonBuild] ! Daemon.Serve, IO, Lex.Tokenize, Parse, Parse.Build, TypeCheck, Diag.Report, FS.Write, Process.Spawn, Env.Write, Env.Read, FS.Read, Process.Signal, Net.Listen, FS.Delete {
     daemon_source_path = source
     daemon_origin = DaemonOrigin { cwd: env.cwd(), identity: identity, settings: settings, interface_text: interface_text, builds: 0, queries: 0, checks: 0, reused: 0, router: 0, files: "", chan: -1 }
     daemon_start_time = time_ms()

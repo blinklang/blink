@@ -1169,7 +1169,7 @@ fn install_at(dir: Str, stage: Str, key: Str, obj_path: Str, meta: Str) -> Bool 
 // obj at obj_tmp_path; we rename it (so the temp path is consumed).
 // Returns true iff a new entry was installed (signal for maybe_gc); on
 // false the caller must not link <key>.o.
-pub fn store(key: Str, obj_tmp_path: Str, module_key: Str, src_sha: Str) -> Bool ! IO, FS.Write {
+pub fn store(key: Str, obj_tmp_path: Str, module_key: Str, src_sha: Str) -> Bool ! IO, FS.Write, Env.Exit, Process.Spawn {
     if !cache_enabled() {
         return false
     }
@@ -1185,13 +1185,13 @@ pub fn store(key: Str, obj_tmp_path: Str, module_key: Str, src_sha: Str) -> Bool
 }
 
 // mv -f: rename(2), and mv where that fails, as it copies across filesystems.
-fn move_obj(from: Str, to: Str) -> Bool ! IO, FS.Write {
-    build_fs.rename(from, to) || shell_exec("mv -f '{from}' '{to}'") == 0
+fn move_obj(from: Str, to: Str) -> Bool ! IO, FS.Write, Env.Exit, Process.Spawn {
+    build_fs.rename(from, to) || build_fs.run_program("mv", ["-f", from, to]) == 0
 }
 
 // store for each (key, obj_tmp_path, module_key), in order. The answer for each entry is what
 // store would answer for it.
-pub fn store_objs(keys: List[Str], obj_tmp_paths: List[Str], module_keys: List[Str]) -> List[Bool] ! IO, FS.Write {
+pub fn store_objs(keys: List[Str], obj_tmp_paths: List[Str], module_keys: List[Str]) -> List[Bool] ! IO, FS.Write, Env.Exit, Process.Spawn {
     let mut out: List[Bool] = []
     for _k in keys {
         out.push(false)
@@ -1417,7 +1417,7 @@ pub fn maybe_gc() ! IO, FS.Read, FS.Delete {
 // when the build reaches point ("compile": after its lookups, before its units compile;
 // "link": before its link). It stands in for another build's GC at that moment, so a test
 // can make that race happen every time. Answers whether it emptied the cache.
-pub fn dev_evict_at(point: Str) -> Bool ! IO {
+pub fn dev_evict_at(point: Str) -> Bool ! IO, FS.Delete {
     if !cache_enabled() || (env.var("BLINK_DEV_OBJCACHE_EVICT") ?? "") != point {
         return false
     }
@@ -1438,14 +1438,21 @@ pub fn cmd_info() -> Int ! IO, FS.Read {
     0
 }
 
-pub fn cmd_clean(older_than: Str) -> Int {
+pub fn cmd_clean(older_than: Str) -> Int ! FS.Delete, IO {
     let dir = obj_cache_dir()
     if file_exists(dir) == 0 {
         return 0
     }
     if older_than == "" {
-        shell_exec("rm -rf {dir}/*.o {dir}/*.pch {dir}/*.reads {dir}/*.meta 2>/dev/null")
-        return 0
+        let mut failed = false
+        for name in list_dir(dir) {
+            // sh globs skip a name that starts with a dot.
+            if name.starts_with(".") { continue }
+            if name.ends_with(".o") || name.ends_with(".pch") || name.ends_with(".reads") || name.ends_with(".meta") {
+                if !build_fs.remove_tree_or_report("{dir}/{name}") { failed = true }
+            }
+        }
+        return if failed { 1 } else { 0 }
     }
     // older_than format: "Nd" / "Nh" / "Nm". Convert to find -mtime / -mmin.
     // The unit is checked as an ASCII byte first, so the cut that drops it never lands
@@ -1466,6 +1473,7 @@ pub fn cmd_clean(older_than: Str) -> Int {
     let prune = "find {dir} -maxdepth 1 -name '*.meta' {find_arg} -print"
     let listing = process_run("sh", ["-c", prune])
     let lines = listing.out.split("\n")
+    let mut failed = false
     let mut i = 0
     while i < lines.len() {
         let meta = lines.get(i).unwrap().trim()
@@ -1473,11 +1481,13 @@ pub fn cmd_clean(older_than: Str) -> Int {
             let obj = meta.replace(".meta", ".o")
             let pch = meta.replace(".meta", ".pch")
             let reads = meta.replace(".meta", ".reads")
-            shell_exec("rm -rf {meta} {obj} {pch} {reads}")
+            for path in [meta, obj, pch, reads] {
+                if !build_fs.remove_tree_or_report(path) { failed = true }
+            }
         }
         i = i + 1
     }
-    0
+    if failed { 1 } else { 0 }
 }
 
 // Hidden sub-subcommands used by tests to drive the cache directly.
@@ -1491,7 +1501,7 @@ pub fn cmd_internal_lookup(key: Str) -> Int ! IO, FS.Read, FS.Write {
     0
 }
 
-pub fn cmd_internal_store(key: Str, src_obj: Str, module_key: Str, src_sha: Str) -> Int ! IO, FS.Read, FS.Write, FS.Delete {
+pub fn cmd_internal_store(key: Str, src_obj: Str, module_key: Str, src_sha: Str) -> Int ! IO, FS.Read, FS.Write, FS.Delete, Env.Exit, Process.Spawn {
     if file_exists(src_obj) == 0 {
         io.eprintln("error: source obj does not exist: {src_obj}")
         return 1
@@ -1502,7 +1512,11 @@ pub fn cmd_internal_store(key: Str, src_obj: Str, module_key: Str, src_sha: Str)
         return 1
     }
     let staging = "{stage}/{key}.o"
-    shell_exec("cp {src_obj} {staging}")
+    if !build_fs.copy_file(src_obj, staging) {
+        io.eprintln("error: cannot copy {src_obj} to {staging}")
+        let _ = build_fs.remove_tree(stage)
+        return 1
+    }
     store(key, staging, module_key, src_sha)
     let _ = build_fs.remove_tree(stage)
     0

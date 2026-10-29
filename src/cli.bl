@@ -150,7 +150,12 @@ fn extract_embedded_gc() -> Str ! IO, FS.Write, FS.Read, FS.Delete {
         io.eprintln("error: cannot make a staging directory in {cache}")
         return ""
     }
-    shell_exec("mkdir -p {base}/include/private {base}/include/zig-stubs/mach {base}/include/zig-stubs/mach-o")
+    for sub in ["include/private", "include/zig-stubs/mach", "include/zig-stubs/mach-o"] {
+        if !build_fs.mkdir_p_or_report("{base}/{sub}") {
+            let _ = build_fs.remove_tree(base)
+            return ""
+        }
+    }
     write_file("{base}/gc_unity.c", embedded_gc_unity_c)
     write_file("{base}/include/cord.h", embedded_gc_h_cord)
     write_file("{base}/include/cord_pos.h", embedded_gc_h_cord_pos)
@@ -777,17 +782,17 @@ pub fn spawn_cc(args: Str, debug_mode: Int, release_mode: Int, target: Str, dir:
     spawn_unit(cc_command(args, debug_mode, release_mode, target), dir, name)
 }
 
-// Runs cmd as shell_exec does, but without a shell when sh would only split it into words:
+// Runs cmd as sh -c runs it, but without a shell when sh would only split it into words:
 // a build runs cc once per unit and once to link, and each sh costs as much as a small unit.
 fn run_command(cmd: Str) -> Int ! IO, Process.Spawn, FS.Read, Env.Exit {
     let words = build_fs.plain_words(cmd)
     if words.len() > 0 && build_fs.find_program(words.get(0).unwrap()) != "" {
         return build_fs.run_program(words.get(0).unwrap(), words_after_first(words))
     }
-    shell_exec(cmd)
+    build_fs.run_shell(cmd)
 }
 
-// Starts cmd as process_spawn("sh", ["-c", cmd]) does, without the shell when run_command
+// Starts cmd as sh -c runs it, without the shell when run_command
 // would run it without one, its output written to files in dir named for name.
 fn spawn_unit(cmd: Str, dir: Str, name: Str) -> build_fs.FileChild ! IO, FS.Read, FS.Write, Process.Spawn, Env.Exit {
     let out_path = "{dir}/{name}.cc-out"
@@ -926,7 +931,7 @@ fn unit_key_flags(debug_mode: Int, release_mode: Int) -> List[Str] {
     flags
 }
 
-fn compile_vendored_source(c_path: Str, o_path: Str, debug_mode: Int, release_mode: Int, target: Str) -> Int ! IO, Process.Spawn, FS.Read, Env.Exit {
+fn compile_vendored_source(c_path: Str, o_path: Str, debug_mode: Int, release_mode: Int, target: Str) -> Int ! IO, Process.Spawn, FS.Read, Env.Exit, FS.Delete, FS.Write {
     let src_mt = file_mtime(c_path)
     let obj_mt = file_mtime(o_path)
     if obj_mt >= src_mt && src_mt != -1 {
@@ -935,11 +940,15 @@ fn compile_vendored_source(c_path: Str, o_path: Str, debug_mode: Int, release_mo
     let tmp_path = "{o_path}.{getpid()}.tmp"
     let rc = run_cc("-c -o {tmp_path} {c_path}", debug_mode, release_mode, target)
     if rc != 0 {
-        shell_exec("rm -f {tmp_path}")
+        let _ = build_fs.remove_tree_or_report(tmp_path)
         io.println("error: compiling vendored source {c_path} failed")
         return rc
     }
-    shell_exec("mv {tmp_path} {o_path}")
+    if !build_fs.rename(tmp_path, o_path) {
+        io.eprintln("error: cannot rename {tmp_path} to {o_path}")
+        let _ = build_fs.remove_tree_or_report(tmp_path)
+        return 1
+    }
     return 0
 }
 
@@ -1004,11 +1013,15 @@ fn resolve_vendored_objects(used_deps: List[Str], debug_mode: Int, release_mode:
                 }
                 let rc = run_cc("-c -o {tmp_path} {gc_extra_flags} -I{gc_inc} -DGC_THREADS -DGC_BUILTIN_ATOMIC -DUSE_MMAP -DUSE_MUNMAP {gc_src}", debug_mode, release_mode, target)
                 if rc != 0 {
-                    shell_exec("rm -f {tmp_path}")
+                    let _ = build_fs.remove_tree_or_report(tmp_path)
                     io.println("error: compiling vendored gc failed")
                     return objects
                 }
-                shell_exec("mv {tmp_path} {o_path}")
+                if !build_fs.rename(tmp_path, o_path) {
+                    io.eprintln("error: cannot rename {tmp_path} to {o_path}")
+                    let _ = build_fs.remove_tree_or_report(tmp_path)
+                    return objects
+                }
             }
             objects.push(o_path)
         }
@@ -2201,11 +2214,13 @@ fn emit_reuse_verify() -> Bool {
 // not only the units taken: main, a header or a unit lowered beside a taken unit can read what
 // the taken unit's lowering would have set. The files taken are links to the last build's, so
 // nothing is written beside them.
-fn verify_against_cold_emit(program: Int, modules: List[Str], cfg: CgConfig, units: List[emit_record.EmittedUnit], dir: Str, chunk_decls: Int) -> Int ! Diag.Report, Codegen, IO, FS.Write {
+fn verify_against_cold_emit(program: Int, modules: List[Str], cfg: CgConfig, units: List[emit_record.EmittedUnit], dir: Str, chunk_decls: Int) -> Int ! Diag.Report, Codegen, IO, FS.Write, FS.Delete {
     let vdir = "{dir}/.verify"
-    shell_exec("rm -rf \"{vdir}\" && mkdir -p \"{vdir}\"")
+    if !build_fs.remove_tree_or_report(vdir) || !build_fs.mkdir_p_or_report(vdir) {
+        return 1
+    }
     let rc = verify_cold_files(program, modules, cfg, units, dir, vdir, chunk_decls)
-    shell_exec("rm -rf \"{vdir}\"")
+    let _ = build_fs.remove_tree_or_report(vdir)
     rc
 }
 
@@ -4459,7 +4474,9 @@ fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
     if source_path != "" && is_dir(source_path) == 0 {
         let basename = path_basename(source_path)
         let name = strip_extension(basename)
-        shell_exec("mkdir -p build")
+        if !build_fs.mkdir_p_or_report("build") {
+            env.exit(1)
+        }
         let c_path = "build/{name}.c"
         let output_path = "build/{name}"
         if json_output != 0 {
@@ -4484,7 +4501,7 @@ fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
         let scratch = test_scratch_dir(0)
         remove_test_scratch(scratch)
         let quoted = scratch.replace("'", "'\\''")
-        let test_rc = shell_exec("BLINK_TEST_SCRATCH_DIR='{quoted}' {run_cmd} < /dev/null")
+        let test_rc = build_fs.run_shell("BLINK_TEST_SCRATCH_DIR='{quoted}' {run_cmd} < /dev/null")
         remove_test_scratch(scratch)
         env.exit(test_rc)
     }
@@ -4557,7 +4574,9 @@ fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
         if tf_dir != "." && tf_dir != "" {
             build_dir = "build/{tf_dir}"
         }
-        shell_exec("mkdir -p {build_dir}")
+        if !build_fs.mkdir_p_or_report(build_dir) {
+            env.exit(1)
+        }
         let tf_out = "{build_dir}/{tf_base}"
         output_bins.push(tf_out)
 
@@ -5350,7 +5369,9 @@ fn cmd_emit_per_module(args_list: List[Str]) ! Lex.Tokenize, Parse, Parse.Build,
     }
     let source_path = args_list.get(0).unwrap()
     let out_dir = args_list.get(1).unwrap()
-    shell_exec("mkdir -p {out_dir}")
+    if !build_fs.mkdir_p_or_report(out_dir) {
+        env.exit(1)
+    }
 
     let final_program = compile_to_program(source_path, 1)
     let _tc_err_count = check_types(final_program)
@@ -5607,11 +5628,14 @@ fn cmd_fmt(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Repo
     }
 }
 
-fn setup_marketplace(pwd: Str) {
+fn setup_marketplace(pwd: Str) ! FS.Delete, FS.Write, IO {
     let base = ".claude/blink-marketplace"
     let plugin_dir = "{base}/plugins/blink"
-    shell_exec("rm -rf {plugin_dir}/skills/upgrade {plugin_dir}/skills/init")
-    shell_exec("mkdir -p {base}/.claude-plugin {plugin_dir}/.claude-plugin {plugin_dir}/skills/blink:upgrade {plugin_dir}/skills/blink:init")
+    let _ = build_fs.remove_tree_or_report("{plugin_dir}/skills/upgrade")
+    let _ = build_fs.remove_tree_or_report("{plugin_dir}/skills/init")
+    for d in ["{base}/.claude-plugin", "{plugin_dir}/.claude-plugin", "{plugin_dir}/skills/blink:upgrade", "{plugin_dir}/skills/blink:init"] {
+        if !build_fs.mkdir_p_or_report(d) { return }
+    }
 
     write_file("{base}/.claude-plugin/marketplace.json", "\{\"name\":\"blink-plugins\",\"owner\":\{\"name\":\"Blink\"},\"plugins\":[\{\"name\":\"blink\",\"source\":\"./plugins/blink\",\"description\":\"Blink language support: LSP, skills, and tools\"}]}")
     write_file("{plugin_dir}/.claude-plugin/plugin.json", "\{\"name\":\"blink\",\"description\":\"Blink language support: LSP, skills, and tools\",\"version\":\"1.0.0\"}")
@@ -5645,13 +5669,16 @@ fn setup_marketplace(pwd: Str) {
     write_file(settings_path, json_encode(root))
 }
 
-fn migrate_blink_marketplace() {
+fn migrate_blink_marketplace() ! FS.Write, IO, FS.Delete {
     let old_dir = ".claude/pact-marketplace"
     let new_dir = ".claude/blink-marketplace"
     if is_dir(old_dir) == 0 || is_dir(new_dir) == 1 {
         return
     }
-    shell_exec("mv {old_dir} {new_dir}")
+    if !build_fs.rename(old_dir, new_dir) {
+        io.eprintln("error: cannot rename {old_dir} to {new_dir}")
+        return
+    }
 
     let settings_path = ".claude/settings.json"
     if file_exists(settings_path) == 1 {
@@ -5684,7 +5711,7 @@ fn json_ensure_object(parent: Int, key: Str) -> Int {
     obj
 }
 
-fn cmd_init(_p: ArgParser, a: Args) {
+fn cmd_init(_p: ArgParser, a: Args) ! Env.Exit, FS.Write, IO, Process.Spawn, FS.Delete {
     let source_path = args_positional(a, 0)
     let project_name = if source_path != "" {
         source_path
@@ -5700,8 +5727,8 @@ fn cmd_init(_p: ArgParser, a: Args) {
         write_file("blink.toml", toml_content)
         io.println("  created blink.toml")
 
-        if file_exists("src") == 0 {
-            shell_exec("mkdir -p src")
+        if file_exists("src") == 0 && !build_fs.mkdir_p_or_report("src") {
+            env.exit(1)
         }
         if file_exists("src/main.bl") == 0 {
             let main_content = "fn main() \{\n    io.println(\"Hello from {project_name}!\")\n\}\n"
@@ -5711,8 +5738,11 @@ fn cmd_init(_p: ArgParser, a: Args) {
 
         let git_check = process_run("git", ["rev-parse", "--git-dir"])
         if git_check.exit_code != 0 {
-            shell_exec("git init")
-            io.println("  initialized git repository")
+            if build_fs.run_program("git", ["init"]) == 0 {
+                io.println("  initialized git repository")
+            } else {
+                io.eprintln("error: git init failed")
+            }
         }
 
         if file_exists(".gitignore") == 0 {
@@ -6111,7 +6141,7 @@ fn cmd_remove(_p: ArgParser, a: Args) ! Diag.Report {
     }
 }
 
-fn cmd_update(_p: ArgParser, a: Args) ! Diag.Report {
+fn cmd_update(_p: ArgParser, a: Args) ! Diag.Report, FS.Write, IO, FS.Delete {
     let source_path = args_positional(a, 0)
     let manifest = resolve_manifest_path()
     if manifest == "" {
@@ -6313,7 +6343,7 @@ fn shim_wrapper_template(name: Str) -> Str {
     "// @trusted wrapper for the `{name}` shim. Spec: §9.1.3 γ-doctrine.\n// The raw @ffi binding is private; only the safe wrapper is `pub`.\n// `! ()` claims the C stub has no effects; write the real row once the C side has any.\n// TODO: review the binding and replace audit:\"TODO\" with a real audit ID.\n\n@ffi(\"{name}\", \"blink_{name}_hello\")\n@trusted(audit: \"TODO\")\nfn raw_{name}_hello() -> Int ! ()\n\n// TODO: replace this stub with a real safe wrapper.\npub fn {name}_hello() -> Int \{\n    raw_{name}_hello()\n\}\n"
 }
 
-fn cmd_shim_init(_p: ArgParser, a: Args) ! Diag.Report {
+fn cmd_shim_init(_p: ArgParser, a: Args) ! Diag.Report, FS.Write, IO {
     let name = args_positional(a, 0)
     if name == "" {
         io.eprintln("error: blink shim init requires a name")
@@ -6351,11 +6381,11 @@ fn cmd_shim_init(_p: ArgParser, a: Args) ! Diag.Report {
         env.exit(1)
     }
 
-    if file_exists("vendor") == 0 {
-        shell_exec("mkdir -p vendor")
+    if file_exists("vendor") == 0 && !build_fs.mkdir_p_or_report("vendor") {
+        env.exit(1)
     }
-    if file_exists("src") == 0 {
-        shell_exec("mkdir -p src")
+    if file_exists("src") == 0 && !build_fs.mkdir_p_or_report("src") {
+        env.exit(1)
     }
 
     write_file(c_path, shim_c_template(name))
