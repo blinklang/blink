@@ -1,0 +1,129 @@
+// The values of `blink test --timeout`, `--memory` and `--processes`, and of `[test] timeout`
+// (spec §8.10.7, *Values*). A duration and a size need a unit, a count has none, `none` turns
+// a limit off, and zero in any unit is an error. Each error has one reason and one help line.
+
+import std.process.{LimitKind}
+import limit_values.{LimitValueError, parse_limit_value, parse_key_limit_value, limit_flag_error, limit_key_error, limit_value_help}
+
+fn ok(kind: LimitKind, text: Str) -> Int {
+    parse_limit_value(kind, text).unwrap().unwrap()
+}
+
+fn err(kind: LimitKind, text: Str) -> LimitValueError {
+    match parse_limit_value(kind, text) {
+        Ok(_) => {
+            assert(false)
+            LimitValueError.TooLarge
+        }
+        Err(e) => e
+    }
+}
+
+// The two lines a bad flag value prints, as the spec writes them.
+fn flag_lines(kind: LimitKind, text: Str) -> Str {
+    let e = err(kind, text)
+    "{limit_flag_error(kind, text, e)}\n{limit_value_help(kind, e, false)}"
+}
+
+test "each duration unit converts to milliseconds" {
+    assert_eq(ok(LimitKind.Timeout, "1500ms"), 1500)
+    assert_eq(ok(LimitKind.Timeout, "90s"), 90000)
+    assert_eq(ok(LimitKind.Timeout, "10m"), 600000)
+    assert_eq(ok(LimitKind.Timeout, "2h"), 7200000)
+}
+
+test "each size unit is a power of 1024 bytes" {
+    assert_eq(ok(LimitKind.Memory, "1K"), 1024)
+    assert_eq(ok(LimitKind.Memory, "512M"), 512 * 1024 * 1024)
+    assert_eq(ok(LimitKind.Memory, "2G"), 2 * 1024 * 1024 * 1024)
+}
+
+test "a count has no unit" {
+    assert_eq(ok(LimitKind.Processes, "1024"), 1024)
+    assert_eq(ok(LimitKind.Processes, "1"), 1)
+}
+
+test "none turns each limit off" {
+    assert(parse_limit_value(LimitKind.Timeout, "none").unwrap().is_none())
+    assert(parse_limit_value(LimitKind.Memory, "none").unwrap().is_none())
+    assert(parse_limit_value(LimitKind.Processes, "none").unwrap().is_none())
+}
+
+test "zero is an error in any unit and for a count" {
+    assert(err(LimitKind.Timeout, "0") == LimitValueError.Zero)
+    assert(err(LimitKind.Timeout, "0s") == LimitValueError.Zero)
+    assert(err(LimitKind.Timeout, "000ms") == LimitValueError.Zero)
+    assert(err(LimitKind.Memory, "0G") == LimitValueError.Zero)
+    assert(err(LimitKind.Processes, "0") == LimitValueError.Zero)
+}
+
+test "a duration or a size with no unit is an error that keeps the number" {
+    assert(err(LimitKind.Timeout, "90") == LimitValueError.NeedsUnit("90"))
+    assert(err(LimitKind.Memory, "2048") == LimitValueError.NeedsUnit("2048"))
+}
+
+test "a unit of the wrong case or of the other kind is an unknown unit" {
+    assert(err(LimitKind.Timeout, "90x") == LimitValueError.UnknownUnit("x"))
+    assert(err(LimitKind.Timeout, "1H") == LimitValueError.UnknownUnit("H"))
+    assert(err(LimitKind.Timeout, "2G") == LimitValueError.UnknownUnit("G"))
+    assert(err(LimitKind.Memory, "512m") == LimitValueError.UnknownUnit("m"))
+    assert(err(LimitKind.Memory, "512MB") == LimitValueError.UnknownUnit("MB"))
+}
+
+test "text that is not a whole number and a unit is not a value" {
+    for text in ["", "abc", "None", "-5s", "+5s", "1.5h", " 5s", "5s ", "5 s"] {
+        assert(err(LimitKind.Timeout, text) == LimitValueError.NotANumber)
+    }
+    assert(err(LimitKind.Memory, "1.5G") == LimitValueError.NotANumber)
+    assert(err(LimitKind.Processes, "10K") == LimitValueError.NotANumber)
+    assert(err(LimitKind.Processes, "-1") == LimitValueError.NotANumber)
+}
+
+test "a value past the range of the runtime is too large, not a wrapped number" {
+    assert(err(LimitKind.Memory, "99999999999G") == LimitValueError.TooLarge)
+    assert(err(LimitKind.Memory, "99999999999999999999K") == LimitValueError.TooLarge)
+    assert(err(LimitKind.Processes, "99999999999999999999") == LimitValueError.TooLarge)
+    // The runtime holds a timeout in nanoseconds.
+    assert(err(LimitKind.Timeout, "9223372036855s") == LimitValueError.TooLarge)
+    assert_eq(ok(LimitKind.Timeout, "9223372036854ms"), 9223372036854)
+    assert_eq(ok(LimitKind.Memory, "8589934591G"), 8589934591 * 1024 * 1024 * 1024)
+}
+
+test "the flag errors the spec shows have its text" {
+    assert_eq(flag_lines(LimitKind.Timeout, "0"), "--timeout 0: zero is not a limit\nuse none to turn the limit off")
+    assert_eq(flag_lines(LimitKind.Timeout, "90"), "--timeout 90: a duration needs a unit\nwrite 90s, 90m or 90h; units are ms, s, m and h")
+    assert_eq(flag_lines(LimitKind.Memory, "2048"), "--memory 2048: a size needs a unit\nwrite 2048K, 2048M or 2048G; units are K, M and G")
+}
+
+test "the other flag errors name the flag, the value and the fix" {
+    assert_eq(flag_lines(LimitKind.Timeout, "90x"), "--timeout 90x: unknown unit `x`\nunits are ms, s, m and h")
+    assert_eq(flag_lines(LimitKind.Memory, "512m"), "--memory 512m: unknown unit `m`\nunits are K, M and G")
+    assert_eq(flag_lines(LimitKind.Timeout, "abc"), "--timeout abc: not a duration\nwrite a whole number and a unit, such as 90s, or none to turn the limit off")
+    assert_eq(flag_lines(LimitKind.Memory, "1.5G"), "--memory 1.5G: not a size\nwrite a whole number and a unit, such as 512M, or none to turn the limit off")
+    assert_eq(flag_lines(LimitKind.Processes, "10K"), "--processes 10K: not a count\nwrite a whole number of 1 or more, such as 1024, or none to turn the limit off")
+    assert_eq(flag_lines(LimitKind.Memory, "99999999999G"), "--memory 99999999999G: too large\nwrite a smaller value, or none to turn the limit off")
+    assert_eq(flag_lines(LimitKind.Processes, "0"), "--processes 0: zero is not a limit\nuse none to turn the limit off")
+}
+
+test "a bad [test] timeout names the key, not the value, and its help quotes a string" {
+    let e = err(LimitKind.Timeout, "1800")
+    assert_eq(limit_key_error(LimitKind.Timeout, e), "[test] timeout: a duration needs a unit")
+    assert_eq(limit_value_help(LimitKind.Timeout, e, true), "write \"1800s\", \"30m\" or \"1h\"; units are ms, s, m and h")
+    assert_eq(limit_key_error(LimitKind.Timeout, err(LimitKind.Timeout, "0s")), "[test] timeout: zero is not a limit")
+}
+
+test "a [test] timeout string reads as the flag value does" {
+    assert_eq(parse_key_limit_value(LimitKind.Timeout, "30m", true).unwrap().unwrap(), 1800000)
+    assert(parse_key_limit_value(LimitKind.Timeout, "none", true).unwrap().is_none())
+    assert(parse_key_limit_value(LimitKind.Timeout, "30", true).unwrap_err() == LimitValueError.NeedsUnit("30"))
+}
+
+test "a [test] timeout that is not a string is an error even when its text would read" {
+    // An integer token gets the reason its text gets, so `timeout = 1800` reads as the spec shows.
+    assert(parse_key_limit_value(LimitKind.Timeout, "1800", false).unwrap_err() == LimitValueError.NeedsUnit("1800"))
+    assert(parse_key_limit_value(LimitKind.Timeout, "0", false).unwrap_err() == LimitValueError.Zero)
+    assert(parse_key_limit_value(LimitKind.Timeout, "none", false).unwrap_err() == LimitValueError.NotANumber)
+    assert(parse_key_limit_value(LimitKind.Timeout, "30m", false).unwrap_err() == LimitValueError.NotANumber)
+    assert(parse_key_limit_value(LimitKind.Timeout, "true", false).unwrap_err() == LimitValueError.NotANumber)
+    assert(parse_key_limit_value(LimitKind.Timeout, "[\"30m\"]", false).unwrap_err() == LimitValueError.NotANumber)
+}

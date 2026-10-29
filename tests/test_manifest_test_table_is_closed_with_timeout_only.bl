@@ -1,0 +1,137 @@
+// `[test]` is a defined section of blink.toml with one key, `timeout` (spec §8.9.3, §8.10.7).
+// manifest_load records the timeout as written, with its span, and leaves the check of the
+// value to `blink test`. Any other key of `[test]` is an UnknownManifestKey issue on the key
+// (§8.9.8); the compiler maps the issue to W1002, and this test reads the record only.
+
+import pkg.manifest.{manifest_load, manifest_print_warnings, manifest_warnings, manifest_issues, manifest_test_timeout, ManifestIssue, ManifestIssueKind}
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> ProcessResult {
+    process.run("sh", ["-c", cmd]).unwrap()
+}
+
+let PACKAGE: Str = "[package]\nname = \"probe\"\nversion = \"0.1.0\"\n"
+
+fn load(toml: Str) -> Int {
+    manifest_print_warnings = false
+    let dir = sh("mktemp -d /tmp/blink_manifest_test_table.XXXXXX").out.trim()
+    write_file("{dir}/blink.toml", toml)
+    let rc = manifest_load("{dir}/blink.toml")
+    let _ = sh("rm -rf {dir}")
+    rc
+}
+
+fn only_issue() -> ManifestIssue {
+    assert_eq(manifest_issues.len(), 1)
+    manifest_issues.get(0).unwrap()
+}
+
+test "[test] with a timeout is a defined section and gives no issue" {
+    assert_eq(load("{PACKAGE}[test]\ntimeout = \"30m\"\n"), 0)
+    assert_eq(manifest_issues.len(), 0)
+    assert_eq(manifest_warnings.len(), 0)
+}
+
+test "the timeout string is recorded as written with the span of its value token" {
+    assert_eq(load("{PACKAGE}[test]\ntimeout = \"30m\"\n"), 0)
+    let t = manifest_test_timeout.unwrap()
+    assert_eq(t.text, "30m")
+    assert(t.is_string)
+    assert_eq(t.span.line, 5)
+    assert_eq(t.span.col, 11)
+    assert_eq(t.span.end_col, 16)
+}
+
+test "a timeout that is not a string is recorded as its token, not as a string" {
+    assert_eq(load("{PACKAGE}[test]\ntimeout = 1800\n"), 0)
+    let t = manifest_test_timeout.unwrap()
+    assert_eq(t.text, "1800")
+    assert(!t.is_string)
+    assert_eq(t.span.line, 5)
+    assert_eq(t.span.col, 11)
+    assert_eq(t.span.end_col, 15)
+}
+
+test "an inline-table timeout is recorded as its source text" {
+    assert_eq(load("{PACKAGE}[test]\ntimeout = \{ s = 1 \}\n"), 0)
+    assert_eq(manifest_issues.len(), 0)
+    let t = manifest_test_timeout.unwrap()
+    assert_eq(t.text, "\{ s = 1 \}")
+    assert(!t.is_string)
+}
+
+test "a [test.timeout] sub-table is a timeout that is not a string, at its header" {
+    assert_eq(load("{PACKAGE}[test.timeout]\ns = 1\n"), 0)
+    assert_eq(manifest_issues.len(), 0)
+    let t = manifest_test_timeout.unwrap()
+    assert(!t.is_string)
+    assert_eq(t.span.line, 4)
+    assert_eq(t.span.col, 1)
+}
+
+test "a manifest with no [test] table has no timeout" {
+    assert_eq(load("{PACKAGE}"), 0)
+    assert(manifest_test_timeout.is_none())
+}
+
+test "a load forgets the timeout of the manifest it loaded before" {
+    assert_eq(load("{PACKAGE}[test]\ntimeout = \"30m\"\n"), 0)
+    assert_eq(load("{PACKAGE}"), 0)
+    assert(manifest_test_timeout.is_none())
+}
+
+test "a memory key in [test] is an unknown key on the key with no suggestion" {
+    assert_eq(load("{PACKAGE}[test]\nmemory = \"2G\"\n"), 0)
+    let issue = only_issue()
+    assert(issue.kind == ManifestIssueKind.UnknownManifestKey)
+    assert_eq(issue.section, "test")
+    assert_eq(issue.key, "memory")
+    assert_eq(issue.suggestion, None)
+    assert_eq(issue.line, 5)
+    assert_eq(issue.col, 1)
+    assert_eq(issue.end_col, 7)
+    assert(manifest_test_timeout.is_none())
+}
+
+test "a processes key in [test] is an unknown key and the timeout beside it still loads" {
+    assert_eq(load("{PACKAGE}[test]\nprocesses = \"64\"\ntimeout = \"5m\"\n"), 0)
+    let issue = only_issue()
+    assert(issue.kind == ManifestIssueKind.UnknownManifestKey)
+    assert_eq(issue.key, "processes")
+    assert_eq(manifest_test_timeout.unwrap().text, "5m")
+}
+
+test "a misspelled timeout suggests timeout" {
+    assert_eq(load("{PACKAGE}[test]\ntimeuot = \"5m\"\n"), 0)
+    let issue = only_issue()
+    assert(issue.kind == ManifestIssueKind.UnknownManifestKey)
+    assert_eq(issue.key, "timeuot")
+    assert_eq(issue.suggestion, Some("timeout"))
+    assert(manifest_test_timeout.is_none())
+}
+
+test "unknown keys of [test] are each an issue, in source order" {
+    assert_eq(load("{PACKAGE}[test]\nretries = 3\ntimeout = \"5m\"\nmemory = \"2G\"\n"), 0)
+    assert_eq(manifest_issues.len(), 2)
+    assert_eq(manifest_issues.get(0).unwrap().key, "retries")
+    assert_eq(manifest_issues.get(0).unwrap().line, 5)
+    assert_eq(manifest_issues.get(1).unwrap().key, "memory")
+    assert_eq(manifest_issues.get(1).unwrap().line, 7)
+}
+
+test "a sub-table of [test] is one unknown key at its header" {
+    assert_eq(load("{PACKAGE}[test.extra]\na = 1\nb = 2\n"), 0)
+    let issue = only_issue()
+    assert(issue.kind == ManifestIssueKind.UnknownManifestKey)
+    assert_eq(issue.key, "extra")
+    assert_eq(issue.line, 4)
+    assert_eq(issue.col, 1)
+}
+
+test "a misspelled [test] header names [test]" {
+    assert_eq(load("{PACKAGE}[tests]\ntimeout = \"5m\"\n"), 0)
+    let issue = only_issue()
+    assert(issue.kind == ManifestIssueKind.UnknownManifestSection)
+    assert_eq(issue.suggestion, Some("test"))
+    assert(manifest_test_timeout.is_none())
+}

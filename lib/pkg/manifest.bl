@@ -47,16 +47,19 @@ pub let mut manifest_print_warnings = true
 pub type ManifestIssueKind {
     InvalidLintLevel
     UnknownManifestSection
+    UnknownManifestKey
 }
 
 pub type ManifestIssue {
     kind: ManifestIssueKind
     section: Str
-    // The lint name, for InvalidLintLevel; "" otherwise.
+    // The lint name, for InvalidLintLevel; the key as written below the section, for
+    // UnknownManifestKey; "" otherwise.
     key: Str
     // The level as written: the string for a string value, else the value token.
     level: Str
-    // The closest defined section, for UnknownManifestSection.
+    // The closest defined section, for UnknownManifestSection; the closest key of the same
+    // table, for UnknownManifestKey.
     suggestion: Option[Str]
     line: Int
     col: Int
@@ -65,6 +68,18 @@ pub type ManifestIssue {
 }
 
 pub let mut manifest_issues: List[ManifestIssue] = []
+
+// ── [test] ───────────────────────────────────────────────────────
+// A value as written, for a caller that checks it and reports a bad one at its span.
+pub type ManifestValue {
+    // The string for a string value, else the source text of the value.
+    text: Str
+    is_string: Bool
+    span: TomlSpan
+}
+
+// [test] timeout, unchecked: `blink test` parses it and owns its errors (§8.10.7).
+pub let mut manifest_test_timeout: Option[ManifestValue] = None
 
 // ── Native dependencies: parallel arrays ────────────────────────
 pub let mut native_dep_names: List[Str] = []
@@ -76,7 +91,13 @@ pub let mut native_dep_headers: List[List[Str]] = []
 let mut declared_headers_set: Map[Str, Int] = Map()
 
 // ── Known top-level sections ─────────────────────────────────────
-let known_sections: List[Str] = ["package", "dependencies", "dev-dependencies", "capabilities", "alternatives", "lints", "native-dependencies"]
+let known_sections: List[Str] = ["package", "dependencies", "dev-dependencies", "capabilities", "alternatives", "lints", "native-dependencies", "test"]
+
+// The keys of each closed table (§8.9.8). A table not listed here takes any key.
+fn closed_table_keys(section: Str) -> Option[List[Str]] {
+    if section == "test" { return Some(["timeout"]) }
+    None
+}
 
 // ── Clear all manifest state ─────────────────────────────────────
 
@@ -102,6 +123,7 @@ pub fn manifest_clear() {
     lint_levels = []
     manifest_warnings = []
     manifest_issues = []
+    manifest_test_timeout = None
     native_dep_names = []
     native_dep_types = []
     native_dep_paths = []
@@ -679,11 +701,11 @@ fn edit_distance(a: Str, b: Str) -> Int {
 }
 
 // The threshold of the compiler's other did-you-mean helps, max(1, len / 3) edits: a typo
-// gets a suggestion and an unrelated name does not. A tie goes to the first defined section.
-fn closest_section(name: Str) -> Option[Str] {
+// gets a suggestion and an unrelated name does not. A tie goes to the first name in the list.
+fn closest_name(name: Str, keys: List[Str]) -> Option[Str] {
     let mut best_dist = -1
     let mut best = ""
-    for known in known_sections {
+    for known in keys {
         let d = edit_distance(name, known)
         if best_dist == -1 || d < best_dist {
             best_dist = d
@@ -694,6 +716,10 @@ fn closest_section(name: Str) -> Option[Str] {
     if threshold < 1 { threshold = 1 }
     if best_dist == -1 || best_dist > threshold { return None }
     Some(best)
+}
+
+fn closest_section(name: Str) -> Option[Str] {
+    closest_name(name, known_sections)
 }
 
 // One issue per unknown section, at its first [header]. A section that only a top-level key
@@ -720,6 +746,65 @@ fn collect_section_issues() {
     }
 }
 
+// One issue per unknown key of a closed table. A key that a [section.key] header opens points
+// at its first header; any other key points at the entry of that exact key, or at the first
+// entry below it (a dotted key or an array item).
+fn collect_key_issues(section: Str, keys: List[Str]) {
+    let prefix = "{section}."
+    let mut seen: List[Str] = []
+    let mut h = 0
+    while h < toml_headers.len() {
+        let name = toml_headers.get(h).unwrap()
+        if name.starts_with(prefix) {
+            let key = top_segment(name.byte_slice(prefix.byte_len(), name.byte_len()))
+            if !keys.contains(key) && !seen.contains(key) {
+                seen.push(key)
+                manifest_issues.push(make_issue(ManifestIssueKind.UnknownManifestKey, section, key, "", closest_name(key, keys), toml_header_spans.get(h).unwrap()))
+            }
+        }
+        h = h + 1
+    }
+    let mut i = 0
+    while i < toml_keys.len() {
+        let full = toml_keys.get(i).unwrap()
+        if full.starts_with(prefix) {
+            let key = top_segment(full.byte_slice(prefix.byte_len(), full.byte_len()))
+            if !keys.contains(key) && !seen.contains(key) {
+                seen.push(key)
+                let exact = toml_keys.index_of("{prefix}{key}") ?? i
+                manifest_issues.push(make_issue(ManifestIssueKind.UnknownManifestKey, section, key, "", closest_name(key, keys), toml_key_spans.get(exact).unwrap()))
+            }
+        }
+        i = i + 1
+    }
+}
+
+fn collect_closed_table_issues() {
+    for section in known_sections {
+        match closed_table_keys(section) {
+            Some(keys) => collect_key_issues(section, keys)
+            None => {}
+        }
+    }
+}
+
+fn load_test_table(content: Str) {
+    let i = toml_keys.index_of("test.timeout") ?? -1
+    if i >= 0 {
+        let span = toml_value_spans.get(i).unwrap()
+        let is_string = toml_types.get(i).unwrap() == TOML_STRING
+        let text = if is_string { toml_values.get(i).unwrap() } else { content.byte_slice(span.start_byte, span.end_byte) }
+        manifest_test_timeout = Some(ManifestValue { text: text, is_string: is_string, span: span })
+        return
+    }
+    // A [test.timeout] sub-table is a timeout that is not a string.
+    let h = toml_headers.index_of("test.timeout") ?? -1
+    if h >= 0 {
+        let span = toml_header_spans.get(h).unwrap()
+        manifest_test_timeout = Some(ManifestValue { text: content.byte_slice(span.start_byte, span.end_byte), is_string: false, span: span })
+    }
+}
+
 fn issue_before(a: ManifestIssue, b: ManifestIssue) -> Bool {
     a.line < b.line || (a.line == b.line && a.col < b.col)
 }
@@ -741,6 +826,7 @@ fn sort_issues() {
 fn collect_manifest_issues(content: Str) {
     collect_lint_issues(content)
     collect_section_issues()
+    collect_closed_table_issues()
     sort_issues()
 }
 
@@ -781,6 +867,7 @@ pub fn manifest_load(path: Str) -> Int {
     load_alternatives()
     load_lints()
     load_native_deps()
+    load_test_table(content)
     check_unknown_sections()
     collect_manifest_issues(content)
 

@@ -1,0 +1,225 @@
+// The values and the text of the `blink test` limits (sections/06_tooling.md §8.10.7): the
+// `--timeout`, `--memory` and `--processes` flags and the `[test] timeout` key. Every message
+// about a limit value lives here, so a change to one is a change in one place.
+
+import std.process.{LimitKind}
+
+// Why a limit value does not read. NeedsUnit keeps the number, which the help repeats.
+@derive(Eq, Debug)
+pub type LimitValueError {
+    Zero
+    NeedsUnit(Str)
+    UnknownUnit(Str)
+    NotANumber
+    TooLarge
+}
+
+let MAX_INT = 9223372036854775807
+let NS_PER_MS = 1000000
+
+// The name of the flag, of the [test] key and of the ChildLimits field.
+pub fn limit_name(kind: LimitKind) -> Str {
+    match kind {
+        LimitKind.Timeout => "timeout"
+        LimitKind.Memory => "memory"
+        LimitKind.Processes => "processes"
+    }
+}
+
+// What the flag takes, as the help lines write it.
+fn limit_placeholder(kind: LimitKind) -> Str {
+    match kind {
+        LimitKind.Timeout => "<duration>"
+        LimitKind.Memory => "<size>"
+        LimitKind.Processes => "<count>"
+    }
+}
+
+fn value_noun(kind: LimitKind) -> Str {
+    match kind {
+        LimitKind.Timeout => "duration"
+        LimitKind.Memory => "size"
+        LimitKind.Processes => "count"
+    }
+}
+
+// The units of a kind, largest first, each with its size in the base unit: milliseconds for a
+// duration, bytes for a size. A count has no unit.
+fn units(kind: LimitKind) -> List[(Str, Int)] {
+    match kind {
+        LimitKind.Timeout => [("h", 3600000), ("m", 60000), ("s", 1000), ("ms", 1)]
+        LimitKind.Memory => [("G", 1073741824), ("M", 1048576), ("K", 1024)]
+        LimitKind.Processes => []
+    }
+}
+
+fn units_list(kind: LimitKind) -> Str {
+    match kind {
+        LimitKind.Timeout => "ms, s, m and h"
+        LimitKind.Memory => "K, M and G"
+        LimitKind.Processes => ""
+    }
+}
+
+// The largest value a kind holds in its base unit. The runtime keeps a timeout in nanoseconds.
+fn max_value(kind: LimitKind) -> Int {
+    match kind {
+        LimitKind.Timeout => MAX_INT / NS_PER_MS
+        LimitKind.Memory => MAX_INT
+        LimitKind.Processes => MAX_INT
+    }
+}
+
+fn is_digit(c: Int) -> Bool {
+    c >= 48 && c <= 57 // '0'..'9'
+}
+
+fn is_letter(c: Int) -> Bool {
+    (c >= 97 && c <= 122) || (c >= 65 && c <= 90) // 'a'..'z' 'A'..'Z'
+}
+
+/// Reads a limit value as `blink test` takes it: `none`, or a whole number above zero with the
+/// unit of its kind. Ok(None) is `none`. Ok(Some(n)) is in the base unit of the kind:
+/// milliseconds, bytes or a count.
+pub fn parse_limit_value(kind: LimitKind, text: Str) -> Result[Int?, LimitValueError] {
+    if text == "none" { return Ok(None) }
+    let mut end = 0
+    while end < text.byte_len() && is_digit(text.byte_at(end).to_int()) {
+        end = end + 1
+    }
+    if end == 0 { return Err(LimitValueError.NotANumber) }
+    let digits = text.byte_slice(0, end)
+    let unit = text.byte_slice(end, text.byte_len())
+    let mut k = 0
+    while k < unit.byte_len() {
+        if !is_letter(unit.byte_at(k).to_int()) { return Err(LimitValueError.NotANumber) }
+        k = k + 1
+    }
+    if kind == LimitKind.Processes && unit.byte_len() > 0 { return Err(LimitValueError.NotANumber) }
+    let mut first = 0
+    while first < end && text.byte_at(first).to_int() == 48 { // '0'
+        first = first + 1
+    }
+    if first == end { return Err(LimitValueError.Zero) }
+    if kind != LimitKind.Processes && unit.byte_len() == 0 { return Err(LimitValueError.NeedsUnit(digits)) }
+    let mut factor = 1
+    if kind != LimitKind.Processes {
+        let mut found = false
+        for pair in units(kind) {
+            let (name, size) = pair
+            if name == unit {
+                factor = size
+                found = true
+            }
+        }
+        if !found { return Err(LimitValueError.UnknownUnit(unit)) }
+    }
+    let n = match digits.parse_int() {
+        Ok(v) => v
+        Err(_) => return Err(LimitValueError.TooLarge)
+    }
+    if n > max_value(kind) / factor { return Err(LimitValueError.TooLarge) }
+    Ok(Some(n * factor))
+}
+
+/// Reads `[test] timeout` from the manifest record. A value that is not a TOML string is an
+/// error even when its text reads; an integer token gets the reason its text gets, so that
+/// `timeout = 1800` says that a duration needs a unit.
+pub fn parse_key_limit_value(kind: LimitKind, text: Str, is_string: Bool) -> Result[Int?, LimitValueError] {
+    let r = parse_limit_value(kind, text)
+    if is_string { return r }
+    match r {
+        Ok(_) => Err(LimitValueError.NotANumber)
+        Err(e) => Err(e)
+    }
+}
+
+fn reason(kind: LimitKind, e: LimitValueError) -> Str {
+    match e {
+        LimitValueError.Zero => "zero is not a limit"
+        LimitValueError.NeedsUnit(_) => "a {value_noun(kind)} needs a unit"
+        LimitValueError.UnknownUnit(u) => "unknown unit `{u}`"
+        LimitValueError.NotANumber => "not a {value_noun(kind)}"
+        LimitValueError.TooLarge => "too large"
+    }
+}
+
+/// The error line for a bad flag value, without the `error: ` prefix.
+pub fn limit_flag_error(kind: LimitKind, text: Str, e: LimitValueError) -> Str {
+    "--{limit_name(kind)} {text}: {reason(kind, e)}"
+}
+
+/// The error line for a bad `[test]` value, without the `error: ` prefix. The span shows the value.
+pub fn limit_key_error(kind: LimitKind, e: LimitValueError) -> Str {
+    "[test] {limit_name(kind)}: {reason(kind, e)}"
+}
+
+/// The help line for a bad value, without the `help: ` prefix. in_key: the value is from
+/// `[test]`, where a value is a TOML string.
+pub fn limit_value_help(kind: LimitKind, e: LimitValueError, in_key: Bool) -> Str {
+    match e {
+        LimitValueError.Zero => "use none to turn the limit off"
+        LimitValueError.NeedsUnit(n) => {
+            if in_key {
+                "write \"1800s\", \"30m\" or \"1h\"; units are {units_list(kind)}"
+            } else if kind == LimitKind.Timeout {
+                "write {n}s, {n}m or {n}h; units are {units_list(kind)}"
+            } else {
+                "write {n}K, {n}M or {n}G; units are {units_list(kind)}"
+            }
+        }
+        LimitValueError.UnknownUnit(_) => "units are {units_list(kind)}"
+        LimitValueError.NotANumber => {
+            match kind {
+                LimitKind.Timeout => "write a whole number and a unit, such as 90s, or none to turn the limit off"
+                LimitKind.Memory => "write a whole number and a unit, such as 512M, or none to turn the limit off"
+                LimitKind.Processes => "write a whole number of 1 or more, such as 1024, or none to turn the limit off"
+            }
+        }
+        LimitValueError.TooLarge => "write a smaller value, or none to turn the limit off"
+    }
+}
+
+/// A limit in the form the flag takes, in the largest unit with no remainder: `10m`, `1500ms`,
+/// `2G`, `512M`. value is in the base unit of the kind. A size that no unit divides is not a
+/// value the flag takes, so it shows as a plain number of bytes.
+pub fn limit_text(kind: LimitKind, value: Int) -> Str {
+    for pair in units(kind) {
+        let (name, size) = pair
+        if value % size == 0 { return "{value / size}{name}" }
+    }
+    "{value}"
+}
+
+/// The line under ABORTED for a binary that a limit ended. running: the test that ran when the
+/// binary ended, if it is known.
+pub fn limit_end_line(kind: LimitKind, value: Int, running: Str?) -> Str {
+    let cause = match kind {
+        LimitKind.Timeout => "timed out after {limit_text(kind, value)}"
+        LimitKind.Memory => "used more than the {limit_text(kind, value)} memory limit"
+        LimitKind.Processes => "went past the {limit_text(kind, value)} process limit"
+    }
+    match running {
+        Some(name) => "{cause} in test \"{name}\""
+        None => cause
+    }
+}
+
+/// The help line under a limit end, without the `help: ` prefix. Only the timeout has a
+/// `[test]` key.
+pub fn limit_end_help(kind: LimitKind) -> Str {
+    let flag = "--{limit_name(kind)} {limit_placeholder(kind)}"
+    if kind == LimitKind.Timeout {
+        return "raise it with {flag} or [test] timeout in blink.toml; none turns it off"
+    }
+    "raise it with {flag}; none turns it off"
+}
+
+/// The error line for a limit that this host cannot apply, without the `error: ` prefix.
+pub fn limit_unsupported_error(kind: LimitKind) -> Str {
+    "--{limit_name(kind)} needs Linux with a delegated cgroup v2; this session has none"
+}
+
+pub fn limit_unsupported_help(kind: LimitKind) -> Str {
+    "run under `systemd-run --user --scope -p Delegate=yes blink test ...`, or leave out --{limit_name(kind)}"
+}
