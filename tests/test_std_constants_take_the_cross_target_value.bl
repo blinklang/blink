@@ -1,0 +1,129 @@
+// A std constant whose number differs between hosts takes the build target's value, not the
+// build host's (§4.4.8, §9.1): SIGBUS is 10 on macOS and 7 on Linux, ENOTSUP 45 and 95,
+// ENOTEMPTY 66 and 39. A cross build cannot run, so each test reads the constant's 8 bytes
+// out of the linked binary, under its mangled C name (`_` is spelled `_1`). Skipped when zig
+// (the cross compiler) or llvm-objdump is absent. std.fs_error's private ERR_NOENT is not read
+// here: the linker drops it once the compiler folds it, and ENOENT is 2 on both targets.
+import compile_test_helpers.{scratch_root, sh}
+
+let PROGRAM = #"import std.process.{SIGBUS}
+import std.libc.{ERR_INVAL, ERR_NOTSUP, ERR_EXIST, ERR_NOTEMPTY, POLL_EVT_NVAL}
+
+fn main() {
+    io.println("{SIGBUS} {ERR_INVAL} {ERR_NOTSUP} {ERR_EXIST} {ERR_NOTEMPTY} {POLL_EVT_NVAL}")
+}
+"#
+
+fn tools_present() -> Bool {
+    sh("command -v zig") != "" && sh("command -v llvm-objdump") != ""
+}
+
+fn cross_build(target: Str) -> Str {
+    let path = "{scratch_root()}/std_consts_cross.bl"
+    write_file(path, PROGRAM)
+    let bin = "{scratch_root()}/std_consts_cross_{target}"
+    let r = process.run("build/blink", ["build", path, "-o", bin, "--target", target]).unwrap()
+    assert(r.success(), "the cross build for {target} failed: {r.out}{r.err_out}")
+    bin
+}
+
+fn hex_value(s: Str) -> Int {
+    let mut n = 0
+    let mut i = 0
+    while i < s.len() {
+        let c = s.byte_at(i).to_int()
+        let d = if c >= 97 { c - 87 } else if c >= 65 { c - 55 } else { c - 48 }
+        n = n * 16 + d
+        i = i + 1
+    }
+    n
+}
+
+fn is_hex_group(w: Str) -> Bool {
+    if w.len() != 8 { return false }
+    let mut i = 0
+    while i < w.len() {
+        let c = w.byte_at(i).to_int()
+        if !((c >= 48 && c <= 57) || (c >= 97 && c <= 102)) { return false }
+        i = i + 1
+    }
+    true
+}
+
+fn words(line: Str) -> List[Str] {
+    let mut out: List[Str] = []
+    for w in line.replace("\t", " ").split(" ") {
+        if w != "" { out.push(w) }
+    }
+    out
+}
+
+// The value of the 8-byte data symbol `sym` in `bin`. Mach-O spells the symbol with a leading
+// underscore and names the section `__TEXT,__const`, which -j takes as `__const`.
+fn const_value(bin: Str, sym: Str) -> Int {
+    let mut addr = -1
+    let mut section = ""
+    for line in sh("llvm-objdump -t {bin}").split("\n") {
+        let ws = words(line)
+        if ws.len() < 3 { continue }
+        let name = ws.get(ws.len() - 1).unwrap()
+        if name != sym && name != "_{sym}" { continue }
+        let mut i = 0
+        while i < ws.len() - 1 {
+            if ws.get(i).unwrap() == "O" {
+                addr = hex_value(ws.get(0).unwrap())
+                let sec = ws.get(i + 1).unwrap()
+                let parts = sec.split(",")
+                section = parts.get(parts.len() - 1).unwrap()
+            }
+            i = i + 1
+        }
+    }
+    assert(addr >= 0, "{bin} defines no data symbol {sym}")
+    let dump = sh("llvm-objdump -s -j {section} --start-address={addr} --stop-address={addr + 8} {bin}")
+    let mut first = -1
+    let mut bytes = StringBuilder.new()
+    for line in dump.split("\n") {
+        let ws = words(line)
+        if ws.len() < 2 || !line.starts_with(" ") { continue }
+        if first < 0 { first = hex_value(ws.get(0).unwrap()) }
+        let mut i = 1
+        while i < ws.len() && i <= 4 && is_hex_group(ws.get(i).unwrap()) {
+            bytes.write(ws.get(i).unwrap())
+            i = i + 1
+        }
+    }
+    let hex = bytes.to_str()
+    let at = (addr - first) * 2
+    assert(first >= 0 && at + 16 <= hex.len(), "no bytes for {sym} at {addr} in: {dump}")
+    // Both targets are little-endian.
+    let mut value = 0
+    let mut k = 7
+    while k >= 0 {
+        value = value * 256 + hex_value(hex.byte_slice(at + k * 2, at + k * 2 + 2))
+        k = k - 1
+    }
+    value
+}
+
+test "a build for aarch64-macos reads the macOS numbers" {
+    if !tools_present() { return }
+    let bin = cross_build("aarch64-macos")
+    assert_eq(const_value(bin, "blink_std_process_SIGBUS"), 10)
+    assert_eq(const_value(bin, "blink_std_libc_ERR_1INVAL"), 22)
+    assert_eq(const_value(bin, "blink_std_libc_ERR_1NOTSUP"), 45)
+    assert_eq(const_value(bin, "blink_std_libc_ERR_1EXIST"), 17)
+    assert_eq(const_value(bin, "blink_std_libc_ERR_1NOTEMPTY"), 66)
+    assert_eq(const_value(bin, "blink_std_libc_POLL_1EVT_1NVAL"), 32)
+}
+
+test "a build for x86_64-linux-gnu reads the Linux numbers" {
+    if !tools_present() { return }
+    let bin = cross_build("x86_64-linux-gnu")
+    assert_eq(const_value(bin, "blink_std_process_SIGBUS"), 7)
+    assert_eq(const_value(bin, "blink_std_libc_ERR_1INVAL"), 22)
+    assert_eq(const_value(bin, "blink_std_libc_ERR_1NOTSUP"), 95)
+    assert_eq(const_value(bin, "blink_std_libc_ERR_1EXIST"), 17)
+    assert_eq(const_value(bin, "blink_std_libc_ERR_1NOTEMPTY"), 39)
+    assert_eq(const_value(bin, "blink_std_libc_POLL_1EVT_1NVAL"), 32)
+}
