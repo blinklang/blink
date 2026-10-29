@@ -346,6 +346,8 @@ typedef struct {
     int err_fd;
     int reaped;
     int free;
+    /* The limits code reaps a limited child at program exit without this slot's reaped. */
+    int limited;
     int64_t gen;
     int64_t kept_bytes;
     blink_ProcessResult cached;
@@ -423,6 +425,7 @@ static int64_t blink_pid_table_alloc(void) {
         slot->out_fd = -1;
         slot->err_fd = -1;
         slot->reaped = 0;
+        slot->limited = 0;
         slot->cached.out = BLINK_STR_EMPTY;
         slot->cached.err_out = BLINK_STR_EMPTY;
         slot->cached.end = blink_child_end_none();
@@ -1159,6 +1162,9 @@ static void blink_limits_end_locked(void) {
 /* A SIGINT or SIGTERM came while the limits thread ran: the limited children are ended, so
  * the program now ends by that signal, as it would have with no handler. */
 static void blink_limits_reraise(int sig) {
+    /* Never let go: a run that starts or ends meanwhile would set a handler again, and the
+     * raise would then return and end the program with an exit code, not by the signal. */
+    pthread_mutex_lock(&blink_sigint_mu);
     struct sigaction dfl;
     memset(&dfl, 0, sizeof(dfl));
     dfl.sa_handler = SIG_DFL;
@@ -1558,6 +1564,7 @@ BLINK_RT_FN blink_child_box* blink_child_spawn_limited(const char* cmd, const bl
     }
     pthread_mutex_lock(&blink_pid_table_mu);
     slot->pid = rec->pid;
+    slot->limited = 1;
     slot->out_fd = out_pipe[0];
     slot->err_fd = err_pipe[0];
     pthread_mutex_unlock(&blink_pid_table_mu);
@@ -1638,7 +1645,11 @@ BLINK_RT_FN int64_t blink_child_signal(blink_child_box* box, int64_t sig) {
     int64_t h = __atomic_load_n(&box->handle, __ATOMIC_ACQUIRE);
     blink_pid_slot* slot = h >= 0 ? blink_pid_table_get_locked(h) : NULL;
     if (slot && !slot->free && !slot->reaped && slot->pid > 0) {
-        e = kill(slot->pid, (int)sig) == 0 ? 0 : errno;
+        /* The exit path reaps a limited leader under rec->mu alone. */
+        blink_limit_rec* rec = box->lim;
+        if (rec != NULL) pthread_mutex_lock(&rec->mu);
+        if (rec == NULL || !rec->reaped) e = kill(slot->pid, (int)sig) == 0 ? 0 : errno;
+        if (rec != NULL) pthread_mutex_unlock(&rec->mu);
     }
     pthread_mutex_unlock(&blink_pid_table_mu);
     return e;
@@ -1706,7 +1717,9 @@ static void blink_process_forward_signal(int sig) {
     int64_t n = blink_pid_table_len;
     for (int64_t i = 0; i < n; i++) {
         blink_pid_slot* slot = &blink_pid_table[i];
-        if (!slot->reaped && slot->pid > 0) {
+        /* The limits thread ends a limited child's group, and the exit path may have reaped
+         * its leader already, so the pid could name another process. */
+        if (!slot->reaped && !slot->limited && slot->pid > 0) {
             kill(slot->pid, SIGTERM);
         }
     }
