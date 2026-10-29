@@ -10,7 +10,7 @@
 # child gets prlimit caps and a time limit, and the gate prints the one notice
 # for that, not each child. `--own-cgroup` gives a command a cgroup with only
 # that command in it inside a delegated gate run, and runs it in place, with a
-# line that says why, anywhere else.
+# line that says why, anywhere else, and it names an OOM kill in that cgroup.
 # Every hog and fork loop here runs under a cap of 64M or 64 tasks, with a
 # timeout, so this test cannot grow past a few hundred MB.
 set -u
@@ -393,13 +393,51 @@ if command -v systemd-run >/dev/null 2>&1 &&
 
     # The cgroup goes when the command ends, with the cgroups a Blink program
     # made below it and a process left in one, and the exit code passes through.
-    printf '%s' 'd=/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup); mkdir "$d/blink.self" && { sleep 30 > /dev/null 2>&1 & echo $! > "$d/blink.self/cgroup.procs"; }; exit 5' > "$WORK/own_left"
+    # The command names its cgroup, so a run in place cannot pass as one in o-.
+    printf '%s' 'd=/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup); echo "${d##*/}"; mkdir "$d/blink.self" && { sleep 30 > /dev/null 2>&1 & echo $! > "$d/blink.self/cgroup.procs"; }; exit 5' > "$WORK/own_left"
     out=$(gate -- '"$CAPPED" --own-cgroup bash '"$WORK/own_left"'; echo "rc=$?"
         d=/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup); ls "${d%/*}/kids" | grep -c "^o-"')
-    if [ "$out" = "$(printf 'rc=5\n0')" ]; then
-        pass "--own-cgroup keeps the exit code and removes its cgroup tree when the command ends"
+    case "$out" in
+        "o-"*"$(printf '\nrc=5\n0')")
+            if [ ! -s "$WORK/err" ]; then
+                pass "--own-cgroup keeps the exit code and removes its cgroup tree when the command ends"
+            else
+                flunk "--own-cgroup cleanup printed a notice: $(cat "$WORK/err")"
+            fi
+            ;;
+        *) flunk "--own-cgroup cleanup (out=[$out]: $(cat "$WORK/err"))" ;;
+    esac
+
+    # A signal to the script ends the command and removes its cgroup tree.
+    out=$(gate -- '"$CAPPED" --own-cgroup sleep 30 & p=$!; sleep 1; kill -TERM "$p"; wait "$p"; echo "rc=$?"
+        d=/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup); ls "${d%/*}/kids" | grep -c "^o-"')
+    if [ "$out" = "$(printf 'rc=143\n0')" ]; then
+        pass "a signal to --own-cgroup ends the command and removes its cgroup"
     else
-        flunk "--own-cgroup cleanup (out=[$out]: $(cat "$WORK/err"))"
+        flunk "--own-cgroup signal (out=[$out]: $(cat "$WORK/err"))"
+    fi
+
+    # The command is out of the gate's leaf, so the run's report cannot count
+    # a kill at the run's memory cap there; --own-cgroup says it itself.
+    printf '%s' "$hog" > "$WORK/hog"
+    gate BLINK_GATE_MEMORY_MAX=64M BLINK_GATE_SWAP_MAX=0 -- '"$CAPPED" --own-cgroup bash '"$WORK/hog" > /dev/null
+    rc=$?
+    if [ "$rc" = 137 ] && grep -q "^capped.sh: the run's memory cap fired while bash ran in its own cgroup, and the OOM killer killed [1-9][0-9]* of its processes; exit 137\$" "$WORK/err"; then
+        pass "a kill at the run's memory cap in an --own-cgroup command gets a line of its own"
+    else
+        flunk "--own-cgroup at the run's memory cap (rc=$rc: $(cat "$WORK/err"))"
+    fi
+
+    # A kill at a cap the command set below its cgroup, as blink test does for
+    # each test binary, is the command's to report. The command moves itself
+    # out first, as the Blink runtime does: a cgroup with processes in it
+    # cannot pass controllers down.
+    printf '%s' 'd=/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup); mkdir "$d/self" "$d/sub" && echo 0 > "$d/self/cgroup.procs" && echo "+memory +pids" > "$d/cgroup.subtree_control" && echo 32M > "$d/sub/memory.max" && echo 0 > "$d/sub/memory.swap.max" && bash -c '\''echo 0 > "$1/cgroup.procs" && exec bash "$2"'\'' _ "$d/sub" '"$WORK/hog"'; echo "sub rc=$?"' > "$WORK/own_sub"
+    out=$(gate -- '"$CAPPED" --own-cgroup bash '"$WORK/own_sub")
+    if [ "$out" = "sub rc=137" ] && ! grep -q '^capped.sh:' "$WORK/err"; then
+        pass "a kill at a cap below an --own-cgroup command gives no line"
+    else
+        flunk "--own-cgroup with its own cap (out=[$out]: $(cat "$WORK/err"))"
     fi
 
     # The ways that give no cgroup run the command in place, without

@@ -420,11 +420,12 @@ fi
 # the command alone into kids/o-<pid>. That cgroup has no caps of its own;
 # the gate's caps hold over it.
 run_own() {
-    local cg why=
+    local cg= why= events run_oom0 run_oom kills cap_ooms
     [ $# -gt 0 ] || { echo "usage: capped.sh --own-cgroup <command> [<arg> ...]" >&2; exit 2; }
     unset BLINK_OWN_CGROUP
     dir=${BLINK_CHILD_CGROUP:-}
-    IFS=: read -r _ _ cg < /proc/self/cgroup 2>/dev/null
+    # A redirection that fails reports before a 2>/dev/null after it applies.
+    { IFS=: read -r _ _ cg < /proc/self/cgroup; } 2>/dev/null
     if [ "${BLINK_CHILD_CAP:-1}" = 0 ]; then
         why="BLINK_CHILD_CAP=0"
     elif [ -n "${BLINK_CHILD_CAPPED:-}" ]; then
@@ -445,6 +446,8 @@ run_own() {
         notice "${1##*/} gets no cgroup of its own: $why"
         exec "$@"
     fi
+    own_events events "$dir" memory.events
+    read_event run_oom0 "$events" oom
     trap 'stop_child HUP' HUP
     trap 'stop_child INT' INT
     trap 'stop_child TERM' TERM
@@ -457,6 +460,22 @@ run_own() {
         fi
         shift; exec "$@"' _ "$kid" "$@"
     trap - HUP INT TERM
+    # The run's report counts kills in the gate's leaf only, so a kill in
+    # this cgroup needs a line from here. The plain memory.events counts the
+    # cgroups below too: its oom counts the command's own caps firing, which
+    # the command reports, and its oom_kill counts their kills as well.
+    read_event run_oom "$events" oom
+    read_event kills "$kid/memory.events" oom_kill
+    read_event cap_ooms "$kid/memory.events" oom
+    if [ "$kills" != 0 ] && [ "$run_oom" != "$run_oom0" ]; then
+        if [ "$cap_ooms" = 0 ]; then
+            notice "the run's memory cap fired while ${1##*/} ran in its own cgroup, and the OOM killer killed $kills of its processes; exit $rc"
+        else
+            notice "the run's memory cap fired while ${1##*/} ran in its own cgroup, and the OOM killer killed up to $kills of its processes, with those its own caps killed; exit $rc"
+        fi
+    elif [ "$kills" != 0 ] && [ "$cap_ooms" = 0 ]; then
+        notice "the OOM killer killed $kills of ${1##*/}'s processes below the run's memory cap, so the slice or the machine ran out; exit $rc"
+    fi
     end_kid
     exit "$rc"
 }

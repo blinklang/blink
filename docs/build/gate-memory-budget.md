@@ -437,13 +437,26 @@ Where it cannot give that cgroup, the command runs in place without `BLINK_OWN_C
 | a call that is not in the gate's leaf | `...: it does not run in the gate's own cgroup` |
 | the `mkdir` or the move fails | `...: could not make <dir>` or `...: could not move it into <dir>` |
 
+The run's report counts OOM kills in the gate's leaf only, and the command is not there, so
+`--own-cgroup` prints a line of its own when the OOM killer killed one of the command's
+processes. Its `memory.events` counts the kills in the cgroups below it too, so it tells the
+kills at the run's memory cap from the kills at caps the command set itself, as `blink test`
+does for each test binary:
+
+| Case | Line |
+|---|---|
+| the run's memory cap fired | `capped.sh: the run's memory cap fired while <cmd> ran in its own cgroup, and the OOM killer killed <n> of its processes; exit <rc>` |
+| the same, and a cap of the command's own also fired | `...: killed up to <n> of its processes, with those its own caps killed; exit <rc>` |
+| no cap fired | `capped.sh: the OOM killer killed <n> of <cmd>'s processes below the run's memory cap, so the slice or the machine ran out; exit <rc>` |
+| only a cap of the command's own fired | none: the command reports it, as `blink test` does with `limit` `memory` |
+
 `BLINK_CHILD_CAP=0` turns `--own-cgroup` off too, as it turns off every per-child cap:
 then `blink test` gets no memory or process cap for its test binaries, only its timeout.
 
 `scripts/test_capped_child.sh` proves that the command is alone in a cgroup with the
 `memory` and `pids` controllers and no caps of its own, that the cgroup tree goes when the
-command ends, that the exit code passes through, and each in-place case above but the
-last two.
+command ends or the script gets a signal, that the exit code passes through, the first and
+last OOM rows, and each in-place case in the first table but the last two.
 
 ### `blink test` in the gate
 
@@ -452,8 +465,8 @@ last two.
 `BLINK_OWN_CGROUP=1` it adds `--memory` and `--processes` to the `blink test` command;
 each test binary then gets those caps and the 10 min timeout of `blink test`. A test binary
 over a cap ends as `aborted` with its `limit` key, and the other files still run.
-Without the cgroup it adds no flag, so `blink test` runs with no usage error, and one line
-on stderr says so:
+Without the cgroup it adds no flag, so `blink test` runs with no usage error. Then two lines
+on stderr say so: the `capped.sh` line from the table above, which says why, and
 `blink_test_capped.sh: each test binary gets its time limit only, no memory or process cap`.
 
 | Variable | Default | Effect |
@@ -467,7 +480,7 @@ On 2026-10-29 a full `task test` with `--processes 128` ended no file at the cap
 sampler that read `pids.peak` of each test binary's cgroup every 0.2 s (1202 of them) saw
 41 at most, in `test_blink_test_json_lines_stay_whole_and_keyed_by_file_under_parallel_files`.
 
-`scripts/test_blink_test_caps.sh <blink>` proves it in `task ci`, after gen1 (the gen0
+`scripts/test_blink_test_caps.sh <blink>` proves it in `task ci` and `task ci-fast`, after gen1 (the gen0
 `blink` has no `--memory`). In a fresh gate run with caps of 64M and 32 processes, a test
 binary that keeps 128M ends as `aborted` with `limit` `memory`, one that starts 64 sleepers
 ends as `aborted` with `limit` `processes`, a plain test still runs, and the run exits 1.
