@@ -1,8 +1,8 @@
 // A limit that the host cannot enforce is Err ENOTSUP from run and spawn, no child starts,
 // and process.can_limit gives the same answer, because both use one check
 // (sections/04_effects.md §4.4.8 Bad values and unsupported limits; Ask which limits the
-// host supports). Each case asks can_limit first, so the file holds on a host where a
-// limit is supported too.
+// host supports). Each case runs the child and checks that can_limit agrees with the
+// result both ways, so the file holds on a host where a limit is supported too.
 
 import std.process.{ProcessError, ProcessOp, ChildLimits, LimitKind}
 import std.libc.{ERR_NOTSUP}
@@ -45,30 +45,40 @@ fn limits_of(which: LimitKind) -> ChildLimits {
     }
 }
 
+fn remove_dir(dir: Str) {
+    let _ = process.run("rm", ["-rf", dir])
+}
+
+// The limit values are large enough that `touch` succeeds under them on a host that
+// enforces them.
 fn check_kind(which: LimitKind) ! Process.Spawn {
-    if process.can_limit(which) {
-        return
-    }
+    let supported = process.can_limit(which)
     let dir = fresh_dir()
     let marker = "{dir}/m"
     match process.run("sh", ["-c", "touch \"$0\"", marker], limits: limits_of(which)) {
-        Ok(r) => assert(false, "{kind_name(which)}: expected Err, got Ok with end {r.end}")
+        Ok(r) => {
+            assert(supported, "{kind_name(which)}: can_limit is false, but run gave Ok with end {r.end}")
+            assert(r.success(), "{kind_name(which)}: end was {r.end}")
+        }
         Err(e) => {
+            assert(!supported, "{kind_name(which)}: can_limit is true, but run gave {e}")
             assert_eq(code_of(e), ERR_NOTSUP)
             assert_eq(op_name(e), "run")
         }
     }
     match process.spawn("sh", ["-c", "touch \"$0\"", marker], limits: limits_of(which)) {
         Ok(child) => {
-            let _ = process.wait(child)
-            assert(false, "{kind_name(which)}: expected Err, got Ok")
+            let end = process.wait(child).unwrap().end
+            assert(supported, "{kind_name(which)}: can_limit is false, but spawn gave Ok with end {end}")
         }
         Err(e) => {
+            assert(!supported, "{kind_name(which)}: can_limit is true, but spawn gave {e}")
             assert_eq(code_of(e), ERR_NOTSUP)
             assert_eq(op_name(e), "spawn")
         }
     }
-    assert(!exists(marker), "{kind_name(which)}: a child started")
+    assert_eq(exists(marker), supported)
+    remove_dir(dir)
 }
 
 test "memory gives ENOTSUP exactly when can_limit says the host cannot enforce it" {

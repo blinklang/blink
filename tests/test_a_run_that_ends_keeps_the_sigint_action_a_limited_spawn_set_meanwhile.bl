@@ -6,17 +6,17 @@
 // the program and left the group of the limited child alive.
 //
 // Task A runs a child that closes its pipes at once, so A soon waits in its reap, with its
-// SIGINT action set, until a marker exists. Task B waits for that child to be ready, then
-// spawns the limited child and makes the marker. Then the program sends itself SIGINT. The
-// grandchild of the limited child is in that child's group, so only the runtime's group signal
-// ends it. If B were to spawn before A set its action, this test could pass without the fix,
-// but it cannot fail with it.
+// SIGINT action set, until a marker exists. Task B waits until /proc shows that this program
+// catches SIGINT, which only A's run makes true, then spawns the limited child and makes the
+// marker. Then the program sends itself SIGINT. The grandchild of the limited child is in that
+// child's group, so only the runtime's group signal ends it. Without /proc, B sleeps instead,
+// and a loaded host can then let the test pass without the fix, but never fail with it.
 //
 // The helper is built standalone (blinkc to C that includes runtime.h), as the signal path is
 // the runtime's and not this test binary's.
 
 import compile_test_helpers
-import std.process.{ChildEnd, SIGINT}
+import std.process.{ChildEnd, ChildLimits, SIGINT}
 import std.time.{Duration}
 
 fn helper_program() -> Str {
@@ -30,8 +30,16 @@ fn helper_program() -> Str {
         #"    }"#,
         #"}"#,
         #""#,
+        #"fn sigint_caught() -> Bool {"#,
+        #"    process.run("sh", ["-c", "grep -q '^SigCgt:.*[2367abef]$' /proc/$0/status", "{getpid()}"]).unwrap().success()"#,
+        #"}"#,
+        #""#,
         #"fn main() {"#,
         #"    let dir = env.args().get(1).unwrap()"#,
+        #"    let has_proc = process.run("test", ["-e", "/proc/{getpid()}/status"]).unwrap().success()"#,
+        #"    if has_proc && sigint_caught() {"#,
+        #"        panic("SIGINT was caught before any run")"#,
+        #"    }"#,
         #"    let lim = ChildLimits { timeout: Some(Duration.seconds(60)), grace: Duration.ms(300) }"#,
         #"    async.scope {"#,
         #"        let a = async.spawn(fn() -> Int {"#,
@@ -41,7 +49,13 @@ fn helper_program() -> Str {
         #"        })"#,
         #"        let b = async.spawn(fn() -> Int {"#,
         #"            wait_for("{dir}/ready")"#,
-        #"            time.sleep(Duration.ms(300))"#,
+        #"            if has_proc {"#,
+        #"                while !sigint_caught() {"#,
+        #"                    time.sleep(Duration.ms(20))"#,
+        #"                }"#,
+        #"            } else {"#,
+        #"                time.sleep(Duration.ms(300))"#,
+        #"            }"#,
         #"            let tree = "sleep 30 & echo $$ $! > \"$0/pids.tmp\"; mv \"$0/pids.tmp\" \"$0/pids\"; wait""#,
         #"            let _c = process.spawn("sh", ["-c", tree, dir], limits: lim).unwrap()"#,
         #"            wait_for("{dir}/pids")"#,
@@ -86,7 +100,8 @@ test "a SIGINT after a run ended still ends the group of a limited child spawned
     let cc = process.run("cc", ["-O1", "-w", "-Ibootstrap", "-o", bin, c_path, "-lm", "-lgc", "-pthread"])?
     assert_eq(cc.end, ChildEnd.Exited(0), "cc failed:\n{cc.out}{cc.err_out}")
 
-    let run = process.run(bin, ["{dir}/work"])?
+    // A program exit that blocked would hang the test; the timeout turns that into a failure.
+    let run = process.run(bin, ["{dir}/work"], limits: ChildLimits { timeout: Some(Duration.seconds(60)) })?
     assert_eq(run.end, ChildEnd.Signaled(SIGINT), "{run.out}{run.err_out}")
     let pids = process.run("cat", ["{dir}/work/pids"])?.out.trim().split(" ")
     assert_eq(pids.len(), 2)
