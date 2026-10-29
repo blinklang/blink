@@ -10,6 +10,8 @@
 // you need to overlap a long-running child with other work in the
 // parent. For one-shot capture-and-block, `process_run` is simpler.
 import std.errno.{Errno}
+import std.libc.{ERR_INVAL, ERR_NOTSUP}
+import std.time.{Duration}
 
 /// Captured outputs from a finished child process. runtime.h defines the
 /// C struct (bootstrap/runtime_process.h), so these fields must match it.
@@ -34,6 +36,23 @@ pub type LimitKind {
     Timeout
     Memory
     Processes
+}
+
+/// The limits of one child (sections/04_effects.md §4.4.8). The default sets no limit.
+pub type ChildLimits {
+    /// Wall-clock time from the start of the child. At the deadline the runtime sends SIGTERM,
+    /// and after `grace` it sends SIGKILL. `None`: no deadline.
+    timeout: Duration? = None
+
+    /// The time between SIGTERM and SIGKILL. `Duration.seconds(0)` sends SIGKILL at once, with no SIGTERM.
+    grace: Duration = Duration.seconds(2)
+
+    /// Memory of the whole tree of the child, in bytes. `None`: no limit.
+    memory: Int? = None
+
+    /// The tree of the child ends when it tries to go past this many processes. Threads count
+    /// as well as processes. `None`: no limit.
+    processes: Int? = None
 }
 
 // An end renders as `exit N`, `signal <name>` or `limit <kind>` (sections/04_effects.md
@@ -199,11 +218,64 @@ fn child_result(child: Child) -> ProcessResult {
     ProcessResult { out: c_child_out(child), err_out: c_child_err_out(child), end: end }
 }
 
+@ffi("blink_child_limit_supported")
+@trusted(audit: "STD-PROCESS")
+fn c_limit_supported(kind: Int) -> Int ! () {}
+
+// The kind numbers are the blink_LimitKind enum of runtime_process.h.
+fn limit_kind_number(which: LimitKind) -> Int {
+    match which {
+        LimitKind.Timeout => 0
+        LimitKind.Memory => 1
+        LimitKind.Processes => 2
+    }
+}
+
+// The one check that both can_limit and run/spawn ask, so the two never disagree. The
+// runtime makes it once and keeps the answer for the life of the program.
+fn limit_supported(which: LimitKind) -> Bool {
+    c_limit_supported(limit_kind_number(which)) != 0
+}
+
+// 0 when the limits may start a child, else the errno: EINVAL for a bad value comes before
+// ENOTSUP for a limit the host cannot enforce, because a bad value is a bug on every host.
+fn check_limits(limits: ChildLimits) -> Int {
+    let bad_timeout = match limits.timeout {
+        Some(d) => d.to_nanos() <= 0
+        None => false
+    }
+    let bad_memory = match limits.memory {
+        Some(n) => n <= 0
+        None => false
+    }
+    let bad_processes = match limits.processes {
+        Some(n) => n < 1
+        None => false
+    }
+    if bad_timeout || bad_memory || bad_processes || limits.grace.to_nanos() < 0 {
+        return ERR_INVAL
+    }
+    if limits.timeout.is_some() && !limit_supported(LimitKind.Timeout) {
+        return ERR_NOTSUP
+    }
+    if limits.memory.is_some() && !limit_supported(LimitKind.Memory) {
+        return ERR_NOTSUP
+    }
+    if limits.processes.is_some() && !limit_supported(LimitKind.Processes) {
+        return ERR_NOTSUP
+    }
+    0
+}
+
 // The process_do_* default bodies are private: a user call of one would skip every
 // Handler[Process] (§4.7.1). The compiler reaches them as the default slots of the vtable.
 
 /// The default `process.run`: runs `cmd` to its end and returns its output and end.
-fn process_do_run(cmd: Str, args: List[Str], -- stdin: Str? = None) -> Result[ProcessResult, ProcessError] ! Process.Spawn {
+fn process_do_run(cmd: Str, args: List[Str], -- stdin: Str? = None, limits: ChildLimits = ChildLimits {}) -> Result[ProcessResult, ProcessError] ! Process.Spawn {
+    let bad = check_limits(limits)
+    if bad != 0 {
+        return Err(ProcessError { op: ProcessOp.Run, cmd: cmd, code: Errno(bad) })
+    }
     let child = match stdin {
         Some(input) => c_child_run(cmd, args, 1, input)
         None => c_child_run(cmd, args, 0, "")
@@ -216,7 +288,11 @@ fn process_do_run(cmd: Str, args: List[Str], -- stdin: Str? = None) -> Result[Pr
 }
 
 /// The default `process.spawn`: starts `cmd` and returns at once.
-fn process_do_spawn(cmd: Str, args: List[Str]) -> Result[Child, ProcessError] ! Process.Spawn {
+fn process_do_spawn(cmd: Str, args: List[Str], -- limits: ChildLimits = ChildLimits {}) -> Result[Child, ProcessError] ! Process.Spawn {
+    let bad = check_limits(limits)
+    if bad != 0 {
+        return Err(ProcessError { op: ProcessOp.Spawn, cmd: cmd, code: Errno(bad) })
+    }
     let child = c_child_spawn(cmd, args)
     let code = c_child_err(child)
     if code != 0 {
@@ -241,6 +317,12 @@ fn process_do_signal(child: Child, sig: Int) -> Result[(), ProcessError] ! Proce
         return Err(ProcessError { op: ProcessOp.Signal, cmd: c_child_cmd(child), code: Errno(code) })
     }
     Ok(())
+}
+
+/// The default `process.can_limit`: whether run and spawn can apply a limit of this kind
+/// on this host.
+fn process_do_can_limit(which: LimitKind) -> Bool ! Process.Spawn {
+    limit_supported(which)
 }
 
 /// The default `process.exec`: replaces this program with `cmd`, so it returns only

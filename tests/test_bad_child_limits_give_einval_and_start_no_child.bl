@@ -1,0 +1,104 @@
+// A bad value in ChildLimits is Err EINVAL from run and spawn, and no child starts
+// (sections/04_effects.md §4.4.8 Bad values and unsupported limits). Each child would touch
+// a marker file, so a child that started anyway shows up as the marker.
+
+import std.process.{ProcessError, ProcessOp, ChildLimits}
+import std.libc.{ERR_INVAL}
+import std.time.{Duration}
+
+fn fresh_dir() -> Str {
+    process.run("mktemp", ["-d"]).unwrap().out.trim()
+}
+
+fn exists(path: Str) -> Bool {
+    process.run("test", ["-e", path]).unwrap().success()
+}
+
+fn code_of(e: ProcessError) -> Int {
+    match e.code {
+        Errno(c) => c
+    }
+}
+
+fn op_name(e: ProcessError) -> Str {
+    match e.op {
+        ProcessOp.Run => "run"
+        ProcessOp.Spawn => "spawn"
+        _ => "other"
+    }
+}
+
+fn bad_limits() -> List[(Str, ChildLimits)] {
+    [
+        ("timeout 0", ChildLimits { timeout: Some(Duration.nanos(0)) }),
+        ("timeout -1ns", ChildLimits { timeout: Some(Duration.nanos(-1)) }),
+        ("timeout -1s", ChildLimits { timeout: Some(Duration.seconds(-1)) }),
+        ("grace -1ns", ChildLimits { grace: Duration.nanos(-1) }),
+        ("grace -1ns with a timeout", ChildLimits { timeout: Some(Duration.seconds(5)), grace: Duration.nanos(-1) }),
+        ("memory 0", ChildLimits { memory: Some(0) }),
+        ("memory -1", ChildLimits { memory: Some(-1) }),
+        ("processes 0", ChildLimits { processes: Some(0) }),
+        ("processes -1", ChildLimits { processes: Some(-1) }),
+    ]
+}
+
+test "run with a bad limit is Err EINVAL and starts no child" {
+    let dir = fresh_dir()
+    for (name, lim) in bad_limits() {
+        let marker = "{dir}/run"
+        match process.run("sh", ["-c", "touch \"$0\"", marker], limits: lim) {
+            Ok(r) => assert(false, "{name}: expected Err, got Ok with end {r.end}")
+            Err(e) => {
+                assert_eq(code_of(e), ERR_INVAL)
+                assert_eq(op_name(e), "run")
+                assert_eq(e.cmd, "sh")
+            }
+        }
+        assert(!exists(marker), "{name}: a child started")
+    }
+}
+
+test "spawn with a bad limit is Err EINVAL and starts no child" {
+    let dir = fresh_dir()
+    for (name, lim) in bad_limits() {
+        let marker = "{dir}/spawn"
+        match process.spawn("sh", ["-c", "touch \"$0\"", marker], limits: lim) {
+            Ok(child) => {
+                let _ = process.wait(child)
+                assert(false, "{name}: expected Err, got Ok")
+            }
+            Err(e) => {
+                assert_eq(code_of(e), ERR_INVAL)
+                assert_eq(op_name(e), "spawn")
+            }
+        }
+        assert(!exists(marker), "{name}: a child started")
+    }
+}
+
+// A bad value is a bug on every host, so EINVAL comes before the host is asked whether it
+// can enforce the limit at all.
+test "a bad value beats an unsupported limit" {
+    let lim = ChildLimits { memory: Some(0), processes: Some(0) }
+    match process.run("true", [], limits: lim) {
+        Ok(_) => assert(false, "expected Err")
+        Err(e) => assert_eq(code_of(e), ERR_INVAL)
+    }
+}
+
+// A grace of zero is legal: it means SIGKILL at the deadline, with no SIGTERM.
+test "a grace of zero with no timeout runs the child" {
+    let r = process.run("sh", ["-c", "echo ran"], limits: ChildLimits { grace: Duration.nanos(0) }).unwrap()
+    assert_eq(r.out, "ran\n")
+    assert(r.success(), "end was {r.end}")
+}
+
+test "the default ChildLimits sets no limit" {
+    let lim = ChildLimits {}
+    assert(lim.timeout.is_none())
+    assert_eq(lim.grace.to_nanos(), Duration.seconds(2).to_nanos())
+    assert(lim.memory.is_none())
+    assert(lim.processes.is_none())
+    let r = process.run("sh", ["-c", "echo ran"], limits: lim).unwrap()
+    assert_eq(r.out, "ran\n")
+}

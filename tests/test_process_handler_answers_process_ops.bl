@@ -7,12 +7,13 @@ import compile_test_helpers.{compile_and_run}
 
 test "a mock Process handler answers run without starting a program" {
     let src = #"
-import std.process.{ProcessError, ProcessOp, ProcessResult, ChildEnd}
+import std.process.{ProcessError, ProcessOp, ProcessResult, ChildEnd, ChildLimits}
 import std.errno.{Errno}
 
 fn mock_process() -> Handler[Process] {
     handler Process {
-        fn run(cmd: Str, args: List[Str], -- stdin: Str?) -> Result[ProcessResult, ProcessError] {
+        fn run(cmd: Str, args: List[Str], -- stdin: Str?, limits: ChildLimits) -> Result[ProcessResult, ProcessError] {
+            let _ = limits
             if cmd == "fail" {
                 return Err(ProcessError { op: ProcessOp.Run, cmd: "[mock] {cmd}", code: Errno(2) })
             }
@@ -46,12 +47,13 @@ fn main() ! IO, Process {
 // The mock gives only run, so spawn and wait reach the real runtime outside it.
 test "a partial Process handler sends the ops it omits to the enclosing handler" {
     let src = #"
-import std.process.{ProcessError, ProcessResult, ChildEnd}
+import std.process.{ProcessError, ProcessResult, ChildEnd, ChildLimits}
 
 fn main() ! IO, Process {
     with handler Process {
-        fn run(cmd: Str, _args: List[Str], -- stdin: Str?) -> Result[ProcessResult, ProcessError] {
+        fn run(cmd: Str, _args: List[Str], -- stdin: Str?, limits: ChildLimits) -> Result[ProcessResult, ProcessError] {
             let _ = stdin
+            let _ = limits
             Ok(ProcessResult { out: "[mock] {cmd}", err_out: "", end: ChildEnd.Exited(0) })
         }
     } {
@@ -104,11 +106,11 @@ fn main() ! IO, Process, Env.Exit {
 }
 
 fn process_handler(clauses: Str) -> Str {
-    "import std.process.\{ProcessError, ProcessResult, Child}\nfn main() ! IO, Process \{\n    with handler Process \{\n{clauses}\n    } \{\n        let _ = process.run(\"x\", [])\n    }\n}\n"
+    "import std.process.\{ProcessError, ProcessResult, Child, ChildLimits, LimitKind}\nfn main() ! IO, Process \{\n    with handler Process \{\n{clauses}\n    } \{\n        let _ = process.run(\"x\", [])\n    }\n}\n"
 }
 
 test "a Process run clause that answers ProcessResult instead of a Result is rejected" {
-    let src = process_handler("        fn run(cmd: Str, args: List[Str], -- stdin: Str?) -> ProcessResult \{ default.run(cmd, args).unwrap() }")
+    let src = process_handler("        fn run(cmd: Str, args: List[Str], -- stdin: Str?, limits: ChildLimits) -> ProcessResult \{ default.run(cmd, args).unwrap() }")
     compile_test_helpers.expect_compile_error(src, "_process_clause_wrong_ret", "E0300")
 }
 
@@ -120,17 +122,17 @@ test "a Process run clause without the stdin parameter is rejected" {
 // A clause has the shape of its operation's header (§4.7.1): the same `--` split and the
 // same keyword names. A positional parameter may take any name.
 test "a Process run clause that takes stdin as a positional parameter is rejected" {
-    let src = process_handler("        fn run(cmd: Str, args: List[Str], stdin: Str?) -> Result[ProcessResult, ProcessError] \{ default.run(cmd, args, stdin: stdin) }")
+    let src = process_handler("        fn run(cmd: Str, args: List[Str], stdin: Str?, -- limits: ChildLimits) -> Result[ProcessResult, ProcessError] \{ default.run(cmd, args, stdin: stdin, limits: limits) }")
     compile_test_helpers.expect_compile_error(src, "_process_clause_no_kw_split", "E0300")
 }
 
 test "a Process run clause that renames the stdin keyword is rejected" {
-    let src = process_handler("        fn run(cmd: Str, args: List[Str], -- input: Str?) -> Result[ProcessResult, ProcessError] \{ default.run(cmd, args, stdin: input) }")
+    let src = process_handler("        fn run(cmd: Str, args: List[Str], -- input: Str?, limits: ChildLimits) -> Result[ProcessResult, ProcessError] \{ default.run(cmd, args, stdin: input, limits: limits) }")
     compile_test_helpers.expect_compile_error(src, "_process_clause_kw_renamed", "E0300")
 }
 
 test "a Process run clause that writes a default on stdin is rejected" {
-    let src = process_handler("        fn run(cmd: Str, args: List[Str], -- stdin: Str? = None) -> Result[ProcessResult, ProcessError] \{ default.run(cmd, args, stdin: stdin) }")
+    let src = process_handler("        fn run(cmd: Str, args: List[Str], -- stdin: Str? = None, limits: ChildLimits) -> Result[ProcessResult, ProcessError] \{ default.run(cmd, args, stdin: stdin, limits: limits) }")
     compile_test_helpers.expect_compile_error(src, "_process_clause_kw_default", "E0300")
 }
 
@@ -145,14 +147,89 @@ test "a Process clause naming no Process operation is rejected" {
 }
 
 test "a Process.Signal handler clause for the Process.Spawn run operation is rejected" {
-    let src = "import std.process.\{ProcessError, ProcessResult}\nfn main() ! IO, Process \{\n    with handler Process.Signal \{\n        fn run(cmd: Str, args: List[Str], -- stdin: Str?) -> Result[ProcessResult, ProcessError] \{ default.run(cmd, args) }\n    } \{\n        let _ = process.run(\"x\", [])\n    }\n}\n"
+    let src = "import std.process.\{ProcessError, ProcessResult, ChildLimits}\nfn main() ! IO, Process \{\n    with handler Process.Signal \{\n        fn run(cmd: Str, args: List[Str], -- stdin: Str?, limits: ChildLimits) -> Result[ProcessResult, ProcessError] \{ default.run(cmd, args) }\n    } \{\n        let _ = process.run(\"x\", [])\n    }\n}\n"
     compile_test_helpers.expect_compile_error(src, "_process_clause_wrong_sub_effect", "E0505")
 }
 
 test "Process clauses with the spec signatures compile clean" {
-    let src = process_handler("        fn run(cmd: Str, args: List[Str], -- stdin: Str?) -> Result[ProcessResult, ProcessError] \{ default.run(cmd, args, stdin: stdin) }\n        fn spawn(cmd: Str, args: List[Str]) -> Result[Child, ProcessError] \{ default.spawn(cmd, args) }\n        fn wait(child: Child) -> Result[ProcessResult, ProcessError] \{ default.wait(child) }\n        fn signal(child: Child, sig: Int) -> Result[(), ProcessError] \{ default.signal(child, sig) }\n        fn exec(cmd: Str, args: List[Str]) -> Result[Never, ProcessError] \{ default.exec(cmd, args) }")
+    let src = process_handler("        fn run(cmd: Str, args: List[Str], -- stdin: Str?, limits: ChildLimits) -> Result[ProcessResult, ProcessError] \{ default.run(cmd, args, stdin: stdin, limits: limits) }\n        fn spawn(cmd: Str, args: List[Str], -- limits: ChildLimits) -> Result[Child, ProcessError] \{ default.spawn(cmd, args, limits: limits) }\n        fn wait(child: Child) -> Result[ProcessResult, ProcessError] \{ default.wait(child) }\n        fn signal(child: Child, sig: Int) -> Result[(), ProcessError] \{ default.signal(child, sig) }\n        fn exec(cmd: Str, args: List[Str]) -> Result[Never, ProcessError] \{ default.exec(cmd, args) }\n        fn can_limit(which: LimitKind) -> Bool \{ default.can_limit(which) }")
     let out = compile_test_helpers.compile_and_capture(src, "_process_clause_spec_shape")
     compile_test_helpers.expect_compiles_clean(out, "spec-shaped Process handler")
+}
+
+// can_limit is a Process.Spawn operation (§4.4.8), so a mock fakes the host by answering it,
+// and the limits reach the run clause as data.
+test "a mock Process handler answers can_limit and sees the limits run was given" {
+    let src = #"
+import std.process.{ProcessError, ProcessResult, ChildEnd, ChildLimits, LimitKind}
+import std.time.{Duration}
+
+fn capped() -> ChildLimits ! Process.Spawn {
+    ChildLimits {
+        timeout: Some(Duration.seconds(60))
+        memory: if process.can_limit(LimitKind.Memory) { Some(512) } else { None }
+        processes: if process.can_limit(LimitKind.Processes) { Some(500) } else { None }
+    }
+}
+
+fn main() ! IO, Process {
+    with handler Process {
+        fn can_limit(which: LimitKind) -> Bool {
+            which != LimitKind.Processes
+        }
+        fn run(cmd: Str, _args: List[Str], -- stdin: Str?, limits: ChildLimits) -> Result[ProcessResult, ProcessError] {
+            let _ = stdin
+            let t = match limits.timeout {
+                Some(d) => "{d.to_seconds()}"
+                None => "-"
+            }
+            let m = match limits.memory {
+                Some(n) => "{n}"
+                None => "-"
+            }
+            let p = match limits.processes {
+                Some(n) => "{n}"
+                None => "-"
+            }
+            Ok(ProcessResult { out: "[mock] {cmd} {t} {m} {p} {limits.grace.to_seconds()}", err_out: "", end: ChildEnd.Exited(0) })
+        }
+    } {
+        io.println(process.run("t", [], limits: capped()).unwrap().out)
+    }
+}
+"#
+    let r = compile_and_run(src, "_process_handler_mock_can_limit")
+    assert(r.exit_code == 0, "compile or run failed: {r.out}{r.err_out}")
+    assert_eq(r.out, "[mock] t 60 512 - 2\n")
+}
+
+// A mock that leaves out can_limit goes to the enclosing handler, so the new op breaks no
+// handler written before it.
+test "a Process handler without a can_limit clause sends can_limit to the enclosing handler" {
+    let src = #"
+import std.process.{ProcessError, ProcessResult, ChildEnd, ChildLimits, LimitKind}
+
+fn main() ! IO, Process {
+    let outside = process.can_limit(LimitKind.Memory)
+    with handler Process {
+        fn run(cmd: Str, _args: List[Str], -- stdin: Str?, limits: ChildLimits) -> Result[ProcessResult, ProcessError] {
+            let _ = stdin
+            let _ = limits
+            Ok(ProcessResult { out: cmd, err_out: "", end: ChildEnd.Exited(0) })
+        }
+    } {
+        io.println("{process.can_limit(LimitKind.Memory) == outside}")
+    }
+}
+"#
+    let r = compile_and_run(src, "_process_handler_can_limit_delegates")
+    assert(r.exit_code == 0, "compile or run failed: {r.out}{r.err_out}")
+    assert_eq(r.out, "true\n")
+}
+
+test "a Process can_limit clause that answers Int is rejected" {
+    let src = process_handler("        fn can_limit(which: LimitKind) -> Int \{ 0 }")
+    compile_test_helpers.expect_compile_error(src, "_process_clause_can_limit_ret", "E0300")
 }
 
 // process.run loads std.process without an import, but loading a module does not import it,

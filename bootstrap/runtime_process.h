@@ -1075,4 +1075,16 @@ BLINK_RT_FN const char* blink_process_signal_name(int64_t n) {
 }
 #endif
 
+/* The one answer to "can run and spawn apply a limit of this kind here" (blink_LimitKind
+ * numbering). process.can_limit and the ENOTSUP check of run and spawn both ask it, so the
+ * two never disagree. memory and processes need a delegated cgroup v2, which this runtime
+ * does not use yet, so they are never supported; the timeout needs the limits thread. */
+BLINK_RT_FN int64_t blink_child_limit_supported(int64_t kind);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN int64_t blink_child_limit_supported(int64_t kind) {
+    (void)kind;
+    return 0;
+}
+#endif
+
 #endif
