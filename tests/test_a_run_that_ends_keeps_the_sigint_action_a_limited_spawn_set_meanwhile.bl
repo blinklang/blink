@@ -1,0 +1,101 @@
+// While a run with no limit waits for its child, a Ctrl-C goes to that child, so the run sets
+// its own SIGINT action and puts the old one back when the child ends. The first limited child
+// sets the SIGINT action that ends limited children before the program ends (sections/
+// 04_effects.md §4.4.8 A limited child does not outlive this program). When that came while a
+// run waited, the run put back the action it had saved, from before, and a later SIGINT ended
+// the program and left the group of the limited child alive.
+//
+// Task A runs a child that closes its pipes at once, so A soon waits in its reap, with its
+// SIGINT action set, until a marker exists. Task B waits for that child to be ready, then
+// spawns the limited child and makes the marker. Then the program sends itself SIGINT. The
+// grandchild of the limited child is in that child's group, so only the runtime's group signal
+// ends it. If B were to spawn before A set its action, this test could pass without the fix,
+// but it cannot fail with it.
+//
+// The helper is built standalone (blinkc to C that includes runtime.h), as the signal path is
+// the runtime's and not this test binary's.
+
+import compile_test_helpers
+import std.process.{ChildEnd, SIGINT}
+import std.time.{Duration}
+
+fn helper_program() -> Str {
+    [
+        #"import std.process.{ChildLimits}"#,
+        #"import std.time.{Duration}"#,
+        #""#,
+        #"fn wait_for(path: Str) {"#,
+        #"    while !process.run("test", ["-e", path]).unwrap().success() {"#,
+        #"        time.sleep(Duration.ms(20))"#,
+        #"    }"#,
+        #"}"#,
+        #""#,
+        #"fn main() {"#,
+        #"    let dir = env.args().get(1).unwrap()"#,
+        #"    let lim = ChildLimits { timeout: Some(Duration.seconds(60)), grace: Duration.ms(300) }"#,
+        #"    async.scope {"#,
+        #"        let a = async.spawn(fn() -> Int {"#,
+        #"            let script = "exec >/dev/null 2>&1; touch \"$0/ready\"; while [ ! -e \"$0/marker\" ]; do sleep 0.02; done""#,
+        #"            let _ = process.run("sh", ["-c", script, dir]).unwrap()"#,
+        #"            0"#,
+        #"        })"#,
+        #"        let b = async.spawn(fn() -> Int {"#,
+        #"            wait_for("{dir}/ready")"#,
+        #"            time.sleep(Duration.ms(300))"#,
+        #"            let tree = "sleep 30 & echo $$ $! > \"$0/pids.tmp\"; mv \"$0/pids.tmp\" \"$0/pids\"; wait""#,
+        #"            let _c = process.spawn("sh", ["-c", tree, dir], limits: lim).unwrap()"#,
+        #"            wait_for("{dir}/pids")"#,
+        #"            let _ = process.run("touch", ["{dir}/marker"]).unwrap()"#,
+        #"            0"#,
+        #"        })"#,
+        #"        let _ = a.await"#,
+        #"        let _ = b.await"#,
+        #"    }"#,
+        #"    let _ = process.run("kill", ["-INT", "{getpid()}"])"#,
+        #"    time.sleep(Duration.seconds(30))"#,
+        #"}"#,
+        #""#,
+    ].join("\n")
+}
+
+// A process that the group signal ended may stay a zombie until its new parent reaps it, so
+// a "Z" state counts as ended.
+fn ended_within(pid: Str, ms: Int) -> Bool {
+    let start = time.read()
+    while start.elapsed().to_ms() < ms {
+        let st = process.run("ps", ["-o", "stat=", "-p", pid]).unwrap().out.trim()
+        if st == "" || st.starts_with("Z") {
+            return true
+        }
+        time.sleep(Duration.ms(50))
+    }
+    false
+}
+
+test "a SIGINT after a run ended still ends the group of a limited child spawned during it" {
+    let dir = "{compile_test_helpers.scratch_root()}/_sigint_restore"
+    shell_exec("rm -rf {dir}")
+    shell_exec("mkdir -p {dir}/work")
+    let src = "{dir}/sigint_restore.bl"
+    let c_path = "{dir}/sigint_restore.c"
+    let bin = "{dir}/sigint_restore"
+    write_file(src, helper_program())
+
+    let emit = process.run("build/blinkc", [src, c_path])?
+    assert_eq(emit.end, ChildEnd.Exited(0), "blinkc failed:\n{emit.out}{emit.err_out}")
+    let cc = process.run("cc", ["-O1", "-w", "-Ibootstrap", "-o", bin, c_path, "-lm", "-lgc", "-pthread"])?
+    assert_eq(cc.end, ChildEnd.Exited(0), "cc failed:\n{cc.out}{cc.err_out}")
+
+    let run = process.run(bin, ["{dir}/work"])?
+    assert_eq(run.end, ChildEnd.Signaled(SIGINT), "{run.out}{run.err_out}")
+    let pids = process.run("cat", ["{dir}/work/pids"])?.out.trim().split(" ")
+    assert_eq(pids.len(), 2)
+    for pid in pids {
+        let gone = ended_within(pid, 5000)
+        if !gone {
+            let _ = process.run("kill", ["-9", pid])
+        }
+        assert(gone, "process {pid} outlived the program")
+    }
+    shell_exec("rm -rf {dir}")
+}

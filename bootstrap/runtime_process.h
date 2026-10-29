@@ -100,13 +100,22 @@ static inline blink_ProcessResult blink_process_result_none(const char* err_out)
   #ifdef BLINK_RUNTIME_STORAGE_DEFINE
     volatile pid_t blink_child_pid = 0;
     volatile sig_atomic_t blink_got_sigint = 0;
+    pthread_mutex_t blink_sigint_mu = PTHREAD_MUTEX_INITIALIZER;
+    int blink_sigint_users = 0;
+    struct sigaction blink_sigint_saved;
   #else
     extern volatile pid_t blink_child_pid;
     extern volatile sig_atomic_t blink_got_sigint;
+    extern pthread_mutex_t blink_sigint_mu;
+    extern int blink_sigint_users;
+    extern struct sigaction blink_sigint_saved;
   #endif
 #else
 static volatile pid_t blink_child_pid = 0;
 static volatile sig_atomic_t blink_got_sigint = 0;
+static pthread_mutex_t blink_sigint_mu = PTHREAD_MUTEX_INITIALIZER;
+static int blink_sigint_users = 0;
+static struct sigaction blink_sigint_saved;
 #endif
 
 #ifndef BLINK_RUNTIME_DECLS_ONLY
@@ -115,6 +124,49 @@ static void blink_sigint_handler(int sig) {
     blink_got_sigint = 1;
     pid_t p = blink_child_pid;
     if (p > 0) kill(p, SIGINT);
+}
+
+/* Runs that wait for a child at the same time share one SIGINT action: the first sets
+ * blink_sigint_handler and the last puts back the action from before. With a save and a
+ * put-back per run, a run put back a stale action when another run overlapped it, or when
+ * the limits thread set its own action meanwhile. */
+static void blink_sigint_enter(void) {
+    pthread_mutex_lock(&blink_sigint_mu);
+    if (blink_sigint_users++ == 0) {
+        struct sigaction sa;
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_handler = blink_sigint_handler;
+        sa.sa_flags = SA_RESTART;
+        sigaction(SIGINT, &sa, &blink_sigint_saved);
+    }
+    pthread_mutex_unlock(&blink_sigint_mu);
+}
+
+static void blink_sigint_leave(void) {
+    pthread_mutex_lock(&blink_sigint_mu);
+    if (--blink_sigint_users == 0) sigaction(SIGINT, &blink_sigint_saved, NULL);
+    pthread_mutex_unlock(&blink_sigint_mu);
+}
+
+static int blink_sigaction_is_default(const struct sigaction* sa) {
+    return !(sa->sa_flags & SA_SIGINFO) && sa->sa_handler == SIG_DFL;
+}
+
+/* Sets handler as the action for sig when the program has left it the default one. For
+ * SIGINT while a run waits, that is the action the run puts back. */
+static void blink_signal_set_if_default(int sig, void (*handler)(int)) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = handler;
+    sa.sa_flags = SA_RESTART;
+    pthread_mutex_lock(&blink_sigint_mu);
+    if (sig == SIGINT && blink_sigint_users > 0) {
+        if (blink_sigaction_is_default(&blink_sigint_saved)) blink_sigint_saved = sa;
+    } else {
+        struct sigaction cur;
+        if (sigaction(sig, NULL, &cur) == 0 && blink_sigaction_is_default(&cur)) sigaction(sig, &sa, NULL);
+    }
+    pthread_mutex_unlock(&blink_sigint_mu);
 }
 
 static char** blink_process_build_argv(const char* cmd, const blink_list* args) {
@@ -246,17 +298,13 @@ BLINK_RT_FN blink_ProcessResult blink_process_run_with_stdin(const char* cmd, co
     result.err_out = run_err;
     blink_child_pid = pid;
     blink_got_sigint = 0;
-    struct sigaction sa_int_old, sa_int_new;
-    memset(&sa_int_new, 0, sizeof(sa_int_new));
-    sa_int_new.sa_handler = blink_sigint_handler;
-    sa_int_new.sa_flags = SA_RESTART;
-    sigaction(SIGINT, &sa_int_new, &sa_int_old);
+    blink_sigint_enter();
     int status = 0;
     int wrc;
     while ((wrc = waitpid(pid, &status, 0)) < 0) {
         if (errno != EINTR) break;
     }
-    sigaction(SIGINT, &sa_int_old, NULL);
+    blink_sigint_leave();
     blink_child_pid = 0;
     if (wrc >= 0) blink_process_result_set_status(&result, status);
     if (blink_got_sigint) {
@@ -1197,17 +1245,8 @@ static int blink_limits_start_locked(void) {
     atexit(blink_limits_at_exit);
     /* A program that set its own action for a signal keeps it. blink_process_forward_signal
      * hands the signal on to this thread itself. */
-    int sigs[2] = { SIGINT, SIGTERM };
-    for (int i = 0; i < 2; i++) {
-        struct sigaction cur;
-        if (sigaction(sigs[i], NULL, &cur) == 0 && !(cur.sa_flags & SA_SIGINFO) && cur.sa_handler == SIG_DFL) {
-            struct sigaction sa;
-            memset(&sa, 0, sizeof(sa));
-            sa.sa_handler = blink_limits_on_signal;
-            sa.sa_flags = SA_RESTART;
-            sigaction(sigs[i], &sa, NULL);
-        }
-    }
+    blink_signal_set_if_default(SIGINT, blink_limits_on_signal);
+    blink_signal_set_if_default(SIGTERM, blink_limits_on_signal);
     return 0;
 }
 
@@ -1342,14 +1381,10 @@ BLINK_RT_FN blink_child_box* blink_child_run(const char* cmd, const blink_list* 
      * parent takes it once the child is reaped. */
     blink_child_pid = pid;
     blink_got_sigint = 0;
-    struct sigaction sa_int_old, sa_int_new;
-    memset(&sa_int_new, 0, sizeof(sa_int_new));
-    sa_int_new.sa_handler = blink_sigint_handler;
-    sa_int_new.sa_flags = SA_RESTART;
-    sigaction(SIGINT, &sa_int_new, &sa_int_old);
+    blink_sigint_enter();
     int status = 0;
     int we = blink_child_waitpid(pid, &status);
-    sigaction(SIGINT, &sa_int_old, NULL);
+    blink_sigint_leave();
     blink_child_pid = 0;
     if (we != 0) {
         box->err = we;
