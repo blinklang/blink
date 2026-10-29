@@ -378,9 +378,9 @@ gate's 12G cap would not hold over it. A cgroup below the delegated gate scope c
 `mkdir` and a few writes, and the gate's caps still hold over it. `prlimit` alone is weaker: its memory cap is per
 process, not per child, and `RLIMIT_NPROC` counts all processes of the user.
 
-`task test` sets `BLINK_JOBS` and `GC_MARKERS` for its workers. The children that
-`blink test` starts do not go through `scripts/capped.sh`, so they have only the gate's
-cap until `blink test` caps its own children.
+`task test` sets `BLINK_JOBS` and `GC_MARKERS` for its workers. The test binaries that
+`blink test` starts do not go through `--child`: `blink test` caps each one itself, see
+"Applied: a command in a cgroup of its own".
 
 Settings:
 
@@ -444,6 +444,36 @@ then `blink test` gets no memory or process cap for its test binaries, only its 
 `memory` and `pids` controllers and no caps of its own, that the cgroup tree goes when the
 command ends, that the exit code passes through, and each in-place case above but the
 last two.
+
+### `blink test` in the gate
+
+`task test`, `task ci-monolith` and `task ci-profile` run `blink test` through
+`scripts/blink_test_capped.sh`, which calls `capped.sh --own-cgroup`. With
+`BLINK_OWN_CGROUP=1` it adds `--memory` and `--processes` to the `blink test` command;
+each test binary then gets those caps and the 10 min timeout of `blink test`. A test binary
+over a cap ends as `aborted` with its `limit` key, and the other files still run.
+Without the cgroup it adds no flag, so `blink test` runs with no usage error, and one line
+on stderr says so:
+`blink_test_capped.sh: each test binary gets its time limit only, no memory or process cap`.
+
+| Variable | Default | Effect |
+|---|---|---|
+| `BLINK_TEST_MEMORY` | `2G` | `--memory` for each test binary |
+| `BLINK_TEST_PROCESSES` | `256` | `--processes` for each test binary |
+
+The process cap is 256, not the gate's `TasksMax` of 1024: a cap equal to the gate's never
+ends a fork loop before the gate's cap does, so it would guard nothing.
+On 2026-10-29 a full `task test` with `--processes 128` ended no file at the cap, and a
+sampler that read `pids.peak` of each test binary's cgroup every 0.2 s (1202 of them) saw
+41 at most, in `test_blink_test_json_lines_stay_whole_and_keyed_by_file_under_parallel_files`.
+
+`scripts/test_blink_test_caps.sh <blink>` proves it in `task ci`, after gen1 (the gen0
+`blink` has no `--memory`). In a fresh gate run with caps of 64M and 32 processes, a test
+binary that keeps 128M ends as `aborted` with `limit` `memory`, one that starts 64 sleepers
+ends as `aborted` with `limit` `processes`, a plain test still runs, and the run exits 1.
+It also proves the default flags, and that with `BLINK_GATE_CAP=0` the script adds no flag,
+prints its line and `blink test` still runs. On a machine with no delegated systemd user
+scope it skips the cap cases and prints why.
 
 ## Applied: the slice
 
