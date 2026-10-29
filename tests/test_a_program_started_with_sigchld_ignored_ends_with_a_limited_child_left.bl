@@ -1,0 +1,51 @@
+// A parent may start this program with SIGCHLD ignored, and exec keeps that, so the kernel
+// reaps each child at once and no wait finds it. The program-exit path must still end when a
+// limited child that nobody waited on is gone (sections/04_effects.md §4.4.8 A limited child
+// does not outlive this program). It waited for a reap that could not come, and the program
+// never ended, not even on SIGTERM.
+//
+// The helper is built standalone (blinkc to C that includes runtime.h), as the exit path is
+// the runtime's and not this test binary's.
+
+import compile_test_helpers
+import std.process.{ChildEnd, ChildLimits}
+import std.time.{Duration}
+
+fn helper_program() -> Str {
+    [
+        #"import std.process.{ChildLimits}"#,
+        #"import std.time.{Duration}"#,
+        #""#,
+        #"fn main() {"#,
+        #"    let lim = ChildLimits { timeout: Some(Duration.seconds(60)) }"#,
+        #"    let _c = process.spawn("sleep", ["1"], limits: lim).unwrap()"#,
+        #"    io.println("spawned")"#,
+        #"}"#,
+        #""#,
+    ].join("\n")
+}
+
+test "a program started with SIGCHLD ignored ends with a limited child it did not wait on" {
+    let dir = "{compile_test_helpers.scratch_root()}/_sigchld_ignored"
+    shell_exec("rm -rf {dir}")
+    shell_exec("mkdir -p {dir}")
+    let src = "{dir}/sigchld_ignored.bl"
+    let c_path = "{dir}/sigchld_ignored.c"
+    let bin = "{dir}/sigchld_ignored"
+    write_file(src, helper_program())
+
+    let emit = process.run("build/blinkc", [src, c_path]).unwrap()
+    assert_eq(emit.end, ChildEnd.Exited(0), "blinkc failed:\n{emit.out}{emit.err_out}")
+    let cc = process.run("cc", ["-O1", "-w", "-Ibootstrap", "-o", bin, c_path, "-lm", "-lgc", "-pthread"]).unwrap()
+    assert_eq(cc.end, ChildEnd.Exited(0), "cc failed:\n{cc.out}{cc.err_out}")
+
+    // A SIGTERM goes to the same exit path, so only SIGKILL ends a helper that hangs.
+    let lim = ChildLimits { timeout: Some(Duration.seconds(20)), grace: Duration.nanos(0) }
+    let start = time.read()
+    let r = process.run("sh", ["-c", "trap '' CHLD; exec \"$0\"", bin], limits: lim).unwrap()
+    let ms = start.elapsed().to_ms()
+    assert_eq(r.end, ChildEnd.Exited(0), "the program did not end: {r.out}{r.err_out}")
+    assert_eq(r.out, "spawned\n")
+    assert(ms < 15000, "the program took {ms} ms to end")
+    shell_exec("rm -rf {dir}")
+}

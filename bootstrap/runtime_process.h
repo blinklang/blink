@@ -913,6 +913,7 @@ typedef struct blink_limit_rec {
     int reaped;
     int released;       /* its run or wait is done with it, so the thread frees it */
     int reaped_at_exit; /* the program-exit path reaped it; status is the leader's */
+    int exit_gone;      /* the kernel reaped it (SIGCHLD ignored), so no wait finds it */
     int status;
     int exit_live;      /* the program-exit path still waits for its group */
     int64_t exit_kill_at;
@@ -1121,12 +1122,17 @@ static void blink_limits_end_locked(void) {
         for (blink_limit_rec* rec = blink_limits.recs; rec != NULL; rec = rec->next) {
             pthread_mutex_lock(&rec->mu);
             if (rec->exit_live) {
-                if (!rec->reaped) {
+                if (!rec->reaped && !rec->exit_gone) {
                     int st = 0;
-                    if (waitpid(rec->pid, &st, WNOHANG) == rec->pid) {
+                    pid_t wr = waitpid(rec->pid, &st, WNOHANG);
+                    if (wr == rec->pid) {
                         rec->reaped = 1;
                         rec->reaped_at_exit = 1;
                         rec->status = st;
+                    } else if (wr < 0 && errno == ECHILD) {
+                        /* A parent can start this program with SIGCHLD ignored; then the
+                         * leader's reap never comes, and only its group is left to end. */
+                        rec->exit_gone = 1;
                     }
                 }
                 if (rec->reaped_at_exit) {
@@ -1140,7 +1146,7 @@ static void blink_limits_end_locked(void) {
                         break;
                     }
                 }
-                if (rec->reaped_at_exit && kill(-rec->pid, 0) < 0 && errno == ESRCH) {
+                if ((rec->reaped_at_exit || rec->exit_gone) && kill(-rec->pid, 0) < 0 && errno == ESRCH) {
                     rec->exit_live = 0;
                 } else if (rec->reaped && !rec->reaped_at_exit) {
                     /* A run or wait reaped it meanwhile. */
