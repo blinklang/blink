@@ -204,32 +204,45 @@ fn main() ! IO, Process {
 }
 
 // A mock that leaves out can_limit goes to the enclosing handler, so the new op breaks no
-// handler written before it.
+// handler written before it. The outer mock answers the opposite of the host for both kinds,
+// so a missing clause that fell to the runtime or to a zeroed answer prints something else.
 test "a Process handler without a can_limit clause sends can_limit to the enclosing handler" {
     let src = #"
 import std.process.{ProcessError, ProcessResult, ChildEnd, ChildLimits, LimitKind}
 
 fn main() ! IO, Process {
-    let outside = process.can_limit(LimitKind.Memory)
     with handler Process {
-        fn run(cmd: Str, _args: List[Str], -- stdin: Str?, limits: ChildLimits) -> Result[ProcessResult, ProcessError] {
-            let _ = stdin
-            let _ = limits
-            Ok(ProcessResult { out: cmd, err_out: "", end: ChildEnd.Exited(0) })
+        fn can_limit(which: LimitKind) -> Bool {
+            which == LimitKind.Memory
         }
     } {
-        io.println("{process.can_limit(LimitKind.Memory) == outside}")
+        with handler Process {
+            fn run(cmd: Str, _args: List[Str], -- stdin: Str?, limits: ChildLimits) -> Result[ProcessResult, ProcessError] {
+                let _ = stdin
+                let _ = limits
+                Ok(ProcessResult { out: cmd, err_out: "", end: ChildEnd.Exited(0) })
+            }
+        } {
+            io.println("{process.can_limit(LimitKind.Memory)} {process.can_limit(LimitKind.Timeout)}")
+        }
     }
 }
 "#
     let r = compile_and_run(src, "_process_handler_can_limit_delegates")
     assert(r.exit_code == 0, "compile or run failed: {r.out}{r.err_out}")
-    assert_eq(r.out, "true\n")
+    assert_eq(r.out, "true false\n")
 }
 
 test "a Process can_limit clause that answers Int is rejected" {
     let src = process_handler("        fn can_limit(which: LimitKind) -> Int \{ 0 }")
     compile_test_helpers.expect_compile_error(src, "_process_clause_can_limit_ret", "E0300")
+}
+
+// A run clause written before `limits` existed differs from the op in that one keyword
+// only, and the clause must still match the op's full signature (§4.7.1).
+test "a Process run clause that leaves out only the limits keyword is rejected" {
+    let src = process_handler("        fn run(cmd: Str, args: List[Str], -- stdin: Str?) -> Result[ProcessResult, ProcessError] \{ default.run(cmd, args, stdin: stdin) }")
+    compile_test_helpers.expect_compile_error(src, "_process_clause_run_no_limits", "E0300")
 }
 
 // process.run loads std.process without an import, but loading a module does not import it,
