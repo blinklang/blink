@@ -3574,21 +3574,6 @@ BLINK_RT_FN void blink_exit(int64_t code);
 BLINK_RT_FN void blink_exit(int64_t code) { exit((int)code); }
 #endif
 
-BLINK_RT_FN int64_t blink_shell_exec(const char* command);
-#ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN int64_t blink_shell_exec(const char* command) {
-    int status = system(command);
-#ifdef _WIN32
-    return (int64_t)status;
-#else
-    if (WIFEXITED(status)) {
-        return (int64_t)WEXITSTATUS(status);
-    }
-    return -1;
-#endif
-}
-#endif
-
 /* ── Type helpers ───────────────────────────────────────────────────── */
 
 typedef struct {
