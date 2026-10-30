@@ -4279,51 +4279,253 @@ BLINK_RT_FN blink_rand_vtable* blink_rand_vtable_promote(blink_promote_ctx* ctx,
 }
 #endif
 
-#ifdef BLINK_USE_EXTERN_RUNTIME_STORAGE
-  #ifdef BLINK_RUNTIME_STORAGE_DEFINE
-    int blink_rand_seeded = 0;
-  #else
-    extern int blink_rand_seeded;
-  #endif
+/* The default Rand handler: a ChaCha20 keystream per thread, keyed from OS entropy, with
+ * fast key erasure (each 512-byte refill makes the next key from its first 32 bytes, and
+ * every byte is zeroed once served), so earlier output cannot be rebuilt from the state.
+ * A fork child reseeds before its next draw: the pthread_atfork child handler moves the
+ * fork generation on, and a state seeded under an older generation is stale. A raw
+ * syscall(SYS_fork) skips that handler; no Blink surface makes one. */
+#include <pthread.h>
+#if defined(__APPLE__)
+/* arc4random_buf comes from <stdlib.h>, never fails and has no length cap. */
+#elif defined(__linux__)
+/* Declared here, not through <sys/random.h>: that header also declares getentropy, and a
+ * std @ffi binding of getentropy spells its own prototype with other parameter types. */
+ssize_t getrandom(void* buf, size_t buflen, unsigned int flags);
 #else
-BLINK_UNUSED static int blink_rand_seeded = 0;
+#error "blink: the default Rand handler has no OS entropy source for this target"
 #endif
 
-BLINK_RT_FN void blink_rand_ensure_seed(void);
+typedef struct {
+    uint32_t key[8];
+    uint8_t buf[512];
+    uint32_t pos;
+    /* blink_rand_fork_gen when this state was seeded; 0 means never seeded. */
+    uint64_t gen;
+} blink_rand_state;
+
+#ifdef BLINK_USE_EXTERN_RUNTIME_STORAGE
+  #ifdef BLINK_RUNTIME_STORAGE_DEFINE
+    __thread blink_rand_state blink_rand_tls;
+    uint64_t blink_rand_fork_gen = 1;
+    pthread_once_t blink_rand_atfork_once = PTHREAD_ONCE_INIT;
+  #else
+    extern __thread blink_rand_state blink_rand_tls;
+    extern uint64_t blink_rand_fork_gen;
+    extern pthread_once_t blink_rand_atfork_once;
+  #endif
+#else
+BLINK_UNUSED static __thread blink_rand_state blink_rand_tls;
+BLINK_UNUSED static uint64_t blink_rand_fork_gen = 1;
+BLINK_UNUSED static pthread_once_t blink_rand_atfork_once = PTHREAD_ONCE_INIT;
+#endif
+
+#define BLINK_ROTL32(v, n) (((v) << (n)) | ((v) >> (32 - (n))))
+#define BLINK_CHACHA_QR(a, b, c, d) \
+    a += b; d ^= a; d = BLINK_ROTL32(d, 16); \
+    c += d; b ^= c; b = BLINK_ROTL32(b, 12); \
+    a += b; d ^= a; d = BLINK_ROTL32(d, 8);  \
+    c += d; b ^= c; b = BLINK_ROTL32(b, 7)
+
+BLINK_RT_FN void blink_chacha20_block(const uint32_t key[8], uint32_t counter, uint8_t out[64]);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN void blink_rand_ensure_seed(void) {
-    if (!blink_rand_seeded) {
-        srand((unsigned)42);
-        blink_rand_seeded = 1;
+BLINK_RT_FN void blink_chacha20_block(const uint32_t key[8], uint32_t counter, uint8_t out[64]) {
+    uint32_t in[16] = {0x61707865u, 0x3320646eu, 0x79622d32u, 0x6b206574u,
+                       key[0], key[1], key[2], key[3], key[4], key[5], key[6], key[7],
+                       counter, 0, 0, 0};
+    uint32_t x[16];
+    memcpy(x, in, sizeof(x));
+    for (int i = 0; i < 10; i++) {
+        BLINK_CHACHA_QR(x[0], x[4], x[8],  x[12]);
+        BLINK_CHACHA_QR(x[1], x[5], x[9],  x[13]);
+        BLINK_CHACHA_QR(x[2], x[6], x[10], x[14]);
+        BLINK_CHACHA_QR(x[3], x[7], x[11], x[15]);
+        BLINK_CHACHA_QR(x[0], x[5], x[10], x[15]);
+        BLINK_CHACHA_QR(x[1], x[6], x[11], x[12]);
+        BLINK_CHACHA_QR(x[2], x[7], x[8],  x[13]);
+        BLINK_CHACHA_QR(x[3], x[4], x[9],  x[14]);
     }
+    for (int i = 0; i < 16; i++) {
+        uint32_t v = x[i] + in[i];
+        out[4 * i]     = (uint8_t)v;
+        out[4 * i + 1] = (uint8_t)(v >> 8);
+        out[4 * i + 2] = (uint8_t)(v >> 16);
+        out[4 * i + 3] = (uint8_t)(v >> 24);
+    }
+}
+#endif
+
+BLINK_RT_FN void blink_rand_os_entropy(uint8_t* out, size_t n);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void blink_rand_os_entropy(uint8_t* out, size_t n) {
+#if defined(__APPLE__)
+    arc4random_buf(out, n);
+#else
+    size_t got = 0;
+    while (got < n) {
+        ssize_t r = getrandom(out + got, n - got, 0);
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            /* A program must not go on with a weak stream, and a panic can be caught. */
+            fprintf(stderr, "blink: fatal: the default Rand handler cannot read OS entropy (getrandom: %s)\n",
+                    strerror(errno));
+            exit(1);
+        }
+        got += (size_t)r;
+    }
+#endif
+}
+#endif
+
+BLINK_RT_FN void blink_rand_atfork_child(void);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void blink_rand_atfork_child(void) { blink_rand_fork_gen++; }
+#endif
+
+BLINK_RT_FN void blink_rand_register_atfork(void);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void blink_rand_register_atfork(void) {
+    if (pthread_atfork(NULL, NULL, blink_rand_atfork_child) != 0) {
+        fprintf(stderr, "blink: fatal: the default Rand handler cannot register its fork handler\n");
+        exit(1);
+    }
+}
+#endif
+
+BLINK_RT_FN void blink_rand_refill(blink_rand_state* s);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void blink_rand_refill(blink_rand_state* s) {
+    for (uint32_t i = 0; i < 8; i++) blink_chacha20_block(s->key, i, s->buf + 64 * i);
+    for (int k = 0; k < 8; k++) {
+        const uint8_t* p = s->buf + 4 * k;
+        s->key[k] = (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+    }
+    memset(s->buf, 0, 32);
+    s->pos = 32;
+}
+#endif
+
+BLINK_RT_FN blink_rand_state* blink_rand_ready(void);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN blink_rand_state* blink_rand_ready(void) {
+    blink_rand_state* s = &blink_rand_tls;
+    if (s->gen != blink_rand_fork_gen) {
+        /* Registered before the first seed, so no seeded state can miss a fork. */
+        pthread_once(&blink_rand_atfork_once, blink_rand_register_atfork);
+        uint8_t seed[32];
+        blink_rand_os_entropy(seed, sizeof(seed));
+        for (int k = 0; k < 8; k++) {
+            const uint8_t* p = seed + 4 * k;
+            s->key[k] = (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+        }
+        memset(seed, 0, sizeof(seed));
+        memset(s->buf, 0, sizeof(s->buf));
+        s->pos = sizeof(s->buf);
+        s->gen = blink_rand_fork_gen;
+    }
+    return s;
+}
+#endif
+
+BLINK_RT_FN void blink_rand_fill(uint8_t* out, size_t n);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void blink_rand_fill(uint8_t* out, size_t n) {
+    blink_rand_state* s = blink_rand_ready();
+    while (n > 0) {
+        if (s->pos == sizeof(s->buf)) blink_rand_refill(s);
+        size_t take = sizeof(s->buf) - s->pos;
+        if (take > n) take = n;
+        memcpy(out, s->buf + s->pos, take);
+        memset(s->buf + s->pos, 0, take);
+        s->pos += (uint32_t)take;
+        out += take;
+        n -= take;
+    }
+}
+#endif
+
+BLINK_RT_FN uint64_t blink_rand_u64(void* ctx);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN uint64_t blink_rand_u64(void* ctx) {
+    (void)ctx;
+    uint64_t w;
+    blink_rand_fill((uint8_t*)&w, sizeof(w));
+    return w;
+}
+#endif
+
+/* A uniform value in [0, span) for span > 0, with no modulo bias: Lemire's multiply, which
+ * redraws a word whose product lands in the 2^64 mod span low values that would favour
+ * some results. The word source is a parameter so a test can script the words. */
+BLINK_RT_FN uint64_t blink_rand_bounded(uint64_t (*next)(void*), void* ctx, uint64_t span);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN uint64_t blink_rand_bounded(uint64_t (*next)(void*), void* ctx, uint64_t span) {
+    unsigned __int128 m = (unsigned __int128)next(ctx) * span;
+    uint64_t low = (uint64_t)m;
+    if (low < span) {
+        uint64_t threshold = (0 - span) % span;
+        while (low < threshold) {
+            m = (unsigned __int128)next(ctx) * span;
+            low = (uint64_t)m;
+        }
+    }
+    return (uint64_t)(m >> 64);
+}
+#endif
+
+/* The default int(lo, hi) op: inclusive on both ends. */
+BLINK_RT_FN int64_t blink_rand_int(int64_t lo, int64_t hi);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN int64_t blink_rand_int(int64_t lo, int64_t hi) {
+    if (lo > hi) {
+        __blink_panic_dispatchf("Rand default handler: int(%lld, %lld) has lo above hi",
+                                (long long)lo, (long long)hi);
+    }
+    uint64_t span = (uint64_t)hi - (uint64_t)lo + 1u;
+    /* Only MIN..=MAX wraps to 0, and then every word is a valid result. */
+    if (span == 0) return (int64_t)blink_rand_u64(NULL);
+    return (int64_t)((uint64_t)lo + blink_rand_bounded(blink_rand_u64, NULL, span));
+}
+#endif
+
+BLINK_RT_FN double blink_rand_float(void);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN double blink_rand_float(void) {
+    return (double)(blink_rand_u64(NULL) >> 11) * 0x1.0p-53;
+}
+#endif
+
+BLINK_RT_FN blink_bytes* blink_rand_bytes(int64_t n);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN blink_bytes* blink_rand_bytes(int64_t n) {
+    if (n < 0) __blink_panic_dispatchf("Rand default handler: bytes(%lld) has a negative count", (long long)n);
+    blink_bytes* b = blink_bytes_zeroed(n);
+    blink_rand_fill(b->data, (size_t)n);
+    return b;
 }
 #endif
 
 BLINK_RT_FN int64_t blink_rand_default_int(void* __self, int64_t min, int64_t max);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN int64_t blink_rand_default_int(void* __self, int64_t min, int64_t max) {
-    blink_rand_ensure_seed();
-    if (min >= max) return min;
-    return min + (int64_t)(rand() % (int)(max - min));
+    (void)__self;
+    return blink_rand_int(min, max);
 }
 #endif
 
 BLINK_RT_FN double blink_rand_default_float(void* __self);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN double blink_rand_default_float(void* __self) {
-    blink_rand_ensure_seed();
-    return (double)rand() / (double)RAND_MAX;
+    (void)__self;
+    return blink_rand_float();
 }
 #endif
 
 BLINK_RT_FN void blink_rand_default_bytes(void* __self, void* buf, int64_t len);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN void blink_rand_default_bytes(void* __self, void* buf, int64_t len) {
-    blink_rand_ensure_seed();
-    unsigned char* p = (unsigned char*)buf;
-    for (int64_t i = 0; i < len; i++) {
-        p[i] = (unsigned char)(rand() & 0xFF);
-    }
+    (void)__self;
+    if (len > 0) blink_rand_fill((uint8_t*)buf, (size_t)len);
 }
 #endif
 

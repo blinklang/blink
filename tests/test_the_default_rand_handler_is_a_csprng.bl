@@ -1,0 +1,184 @@
+// The default Rand handler is a cryptographically secure generator (sections/04_effects.md
+// §4.4.7 The default handler): seeded from OS entropy, one stream per thread, a forked child
+// does not repeat its parent, int has no modulo bias, float is uniform in [0.0, 1.0). Fork,
+// raw threads and a failing entropy source have no Blink surface, so the harness is C and
+// calls the runtime entry points that the std default bodies bind.
+
+import compile_test_helpers
+import std.process.{ChildEnd, ProcessResult}
+
+fn harness() -> Str {
+    [
+        "#include \"runtime.h\"",
+        "#include <sys/wait.h>",
+        "#ifdef FAIL_ENTROPY",
+        "ssize_t getrandom(void* buf, size_t len, unsigned int flags) \{",
+        "    (void)buf; (void)len; (void)flags;",
+        "    errno = ENOSYS;",
+        "    return -1;",
+        "}",
+        "#endif",
+        "#define NTHREADS 8",
+        "#define PER 10000",
+        "static uint64_t g_words[NTHREADS * PER];",
+        "static void* drawer(void* a) \{",
+        "    uint64_t* out = g_words + (intptr_t)a * PER;",
+        "    for (int i = 0; i < PER; i++) out[i] = (uint64_t)blink_rand_int(INT64_MIN, INT64_MAX);",
+        "    return NULL;",
+        "}",
+        "static int cmp_u64(const void* a, const void* b) \{",
+        "    uint64_t x = *(const uint64_t*)a, y = *(const uint64_t*)b;",
+        "    return x < y ? -1 : x > y;",
+        "}",
+        "static const uint64_t* g_script;",
+        "static int g_used;",
+        "static uint64_t scripted(void* ctx) \{ (void)ctx; return g_script[g_used++]; }",
+        "int main(int argc, char** argv) \{",
+        "    const char* mode = argc > 1 ? argv[1] : \"\";",
+        "    if (!strcmp(mode, \"fork\")) \{",
+        "        (void)blink_rand_float();",
+        "        int p[2];",
+        "        if (pipe(p) < 0) return 2;",
+        "        pid_t pid = fork();",
+        "        if (pid == 0) \{",
+        "            blink_bytes* c = blink_rand_bytes(64);",
+        "            ssize_t w = write(p[1], c->data, 64);",
+        "            _exit(w == 64 ? 0 : 1);",
+        "        }",
+        "        close(p[1]);",
+        "        blink_bytes* mine = blink_rand_bytes(64);",
+        "        uint8_t theirs[64];",
+        "        size_t got = 0;",
+        "        while (got < 64) \{",
+        "            ssize_t n = read(p[0], theirs + got, 64 - got);",
+        "            if (n <= 0) break;",
+        "            got += (size_t)n;",
+        "        }",
+        "        waitpid(pid, NULL, 0);",
+        "        printf(\"got=%zu same=%d\\n\", got, memcmp(mine->data, theirs, 64) == 0);",
+        "    } else if (!strcmp(mode, \"threads\")) \{",
+        "        pthread_t t[NTHREADS];",
+        "        for (intptr_t i = 0; i < NTHREADS; i++) pthread_create(&t[i], NULL, drawer, (void*)i);",
+        "        for (int i = 0; i < NTHREADS; i++) pthread_join(t[i], NULL);",
+        "        qsort(g_words, NTHREADS * PER, sizeof(uint64_t), cmp_u64);",
+        "        int dups = 0;",
+        "        for (int i = 1; i < NTHREADS * PER; i++) dups += g_words[i] == g_words[i - 1];",
+        "        printf(\"dups=%d\\n\", dups);",
+        "    } else if (!strcmp(mode, \"bias\")) \{",
+        "        static const uint64_t reject_first[] = \{0, 1ULL << 63};",
+        "        g_script = reject_first; g_used = 0;",
+        "        uint64_t r1 = blink_rand_bounded(scripted, NULL, 3);",
+        "        int used1 = g_used;",
+        "        static const uint64_t accept_first[] = \{1ULL << 63};",
+        "        g_script = accept_first; g_used = 0;",
+        "        uint64_t r2 = blink_rand_bounded(scripted, NULL, 3);",
+        "        printf(\"r1=%llu used1=%d r2=%llu used2=%d\\n\", (unsigned long long)r1, used1,",
+        "               (unsigned long long)r2, g_used);",
+        "    } else if (!strcmp(mode, \"int\")) \{",
+        "        int seen[7] = \{0}, out = 0, kinds = 0;",
+        "        for (int i = 0; i < 70000; i++) \{",
+        "            int64_t v = blink_rand_int(-3, 3);",
+        "            if (v < -3 || v > 3) out++; else seen[v + 3] = 1;",
+        "        }",
+        "        for (int i = 0; i < 7; i++) kinds += seen[i];",
+        "        printf(\"out=%d kinds=%d single=%lld\\n\", out, kinds, (long long)blink_rand_int(5, 5));",
+        "    } else if (!strcmp(mode, \"float\")) \{",
+        "        int bad = 0, low = 0;",
+        "        for (int i = 0; i < 100000; i++) \{",
+        "            double x = blink_rand_float();",
+        "            double s = x * 0x1.0p53;",
+        "            if (x < 0.0 || x >= 1.0 || s != (double)(uint64_t)s) \{ bad++; continue; }",
+        "            low += (int)((uint64_t)s & 1);",
+        "        }",
+        "        printf(\"bad=%d low_ok=%d\\n\", bad, low > 40000 && low < 60000);",
+        "    } else if (!strcmp(mode, \"vector\")) \{",
+        "        static const uint8_t want[64] = \{",
+        "            0x76,0xb8,0xe0,0xad,0xa0,0xf1,0x3d,0x90,0x40,0x5d,0x6a,0xe5,0x53,0x86,0xbd,0x28,",
+        "            0xbd,0xd2,0x19,0xb8,0xa0,0x8d,0xed,0x1a,0xa8,0x36,0xef,0xcc,0x8b,0x77,0x0d,0xc7,",
+        "            0xda,0x41,0x59,0x7c,0x51,0x57,0x48,0x8d,0x77,0x24,0xe0,0x3f,0xb8,0xd8,0x4a,0x37,",
+        "            0x6a,0x43,0xb8,0xf4,0x15,0x18,0xa1,0x1c,0xc3,0x87,0xb6,0x69,0xb2,0xee,0x65,0x86};",
+        "        uint32_t key[8] = \{0};",
+        "        uint8_t got[64];",
+        "        blink_chacha20_block(key, 0, got);",
+        "        printf(\"match=%d\\n\", memcmp(got, want, 64) == 0);",
+        "    } else if (!strcmp(mode, \"draw\")) \{",
+        "        printf(\"drew %f\\n\", blink_rand_float());",
+        "    } else if (!strcmp(mode, \"inverted\")) \{",
+        "        printf(\"drew %lld\\n\", (long long)blink_rand_int(5, 2));",
+        "    }",
+        "    return 0;",
+        "}",
+        "",
+    ].join("\n")
+}
+
+fn run_case(name: Str, mode: Str, cflags: List[Str]) -> ProcessResult {
+    let dir = "{compile_test_helpers.scratch_root()}/_rand_csprng_{name}"
+    process.run("sh", ["-c", "rm -rf {dir}"]).unwrap()
+    process.run("sh", ["-c", "mkdir -p {dir}"]).unwrap()
+    let c_path = "{dir}/rand_csprng.c"
+    let bin = "{dir}/rand_csprng"
+    write_file(c_path, harness())
+    let mut args = ["-O1", "-w", "-Ibootstrap"]
+    for f in cflags {
+        args.push(f)
+    }
+    for a in ["-o", bin, c_path, "-lm", "-lgc", "-pthread"] {
+        args.push(a)
+    }
+    let cc = process.run("cc", args).unwrap()
+    assert_eq(cc.end, ChildEnd.Exited(0), "cc failed:\n{cc.out}{cc.err_out}")
+    let run = process.run(bin, [mode]).unwrap()
+    process.run("sh", ["-c", "rm -rf {dir}"]).unwrap()
+    run
+}
+
+fn run_ok(name: Str, mode: Str) -> Str {
+    let run = run_case(name, mode, [])
+    assert_eq(run.end, ChildEnd.Exited(0), "{run.out}{run.err_out}")
+    run.out
+}
+
+test "a forked child does not repeat the parent's random stream" {
+    assert_eq(run_ok("fork", "fork"), "got=64 same=0\n")
+}
+
+test "no two threads draw the same random words" {
+    // 80k 64-bit words from one honest generator repeat with p < 1e-9.
+    assert_eq(run_ok("threads", "threads"), "dups=0\n")
+}
+
+test "a bounded draw skips a word in the biased zone" {
+    // For span 3, 2^64 mod 3 = 1: a word whose product has low half 0 is in the biased zone.
+    // Word 0 is such a word; word 2^63 maps to 1.
+    assert_eq(run_ok("bias", "bias"), "r1=1 used1=2 r2=1 used2=1\n")
+}
+
+test "an inclusive int draw stays in range and reaches every value" {
+    assert_eq(run_ok("int", "int"), "out=0 kinds=7 single=5\n")
+}
+
+test "a float draw is in [0, 1) and uses all 53 mantissa bits" {
+    assert_eq(run_ok("float", "float"), "bad=0 low_ok=1\n")
+}
+
+test "the keystream block matches the ChaCha20 test vector" {
+    assert_eq(run_ok("vector", "vector"), "match=1\n")
+}
+
+test "the default int op panics when lo is above hi" {
+    let run = run_case("inverted", "inverted", [])
+    assert_eq(run.end, ChildEnd.Exited(1), "{run.out}{run.err_out}")
+    assert_eq(run.out, "")
+    assert(run.err_out.contains("int(5, 2)"), run.err_out)
+}
+
+test "the default handler stops the program when OS entropy fails" {
+    if process.run("uname", []).unwrap().out.trim() != "Linux" {
+        return
+    }
+    let run = run_case("entropy", "draw", ["-DFAIL_ENTROPY"])
+    assert_eq(run.end, ChildEnd.Exited(1), "{run.out}{run.err_out}")
+    assert_eq(run.out, "")
+    assert(run.err_out.contains("cannot read OS entropy"), run.err_out)
+}
