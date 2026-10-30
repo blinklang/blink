@@ -378,6 +378,10 @@ pub const TEST_BUILD_ENDED_WITHOUT_DIAGNOSTIC = "I0018"
 // I0019: a type that the runtime returns has no declaration, because the prelude module that
 // declares it did not load. The checker uses the unknown type for it from then on.
 pub const PRELUDE_TYPE_NOT_LOADED = "I0019"
+// I0020: an `#embed` reached code generation with no text from the loader. The loader reads
+// every embed and reports a file that is not there, so a miss means a caller lowered a
+// program the loader did not load.
+pub const EMBED_TEXT_NOT_LOADED = "I0020"
 
 // ── I0001 mangler sentinels ──────────────────────────────
 //
@@ -539,7 +543,10 @@ type DiagFilter {
 
 pub let mut diag_entries: List[DiagEntry] = []
 let mut file_ranges: List[FileRange] = []
-let mut source_lines_cache: Map[Str, List[Str]] = Map()
+// The text of each file a diagnostic may quote, as the loader read it. A snippet quotes these
+// and never the disk, which may have changed since the load or may never have held the text
+// (an editor buffer).
+let mut loaded_source_lines: Map[Str, List[Str]] = Map()
 let mut diag_filter: DiagFilter = DiagFilter { seen: Map(), lex_cutoffs: [], flushed: 0 }
 
 // ── Configuration ────────────────────────────────────────────────────
@@ -1385,30 +1392,29 @@ fn diag_json_line(idx: Int) -> Str {
     json.concat("}\n")
 }
 
-// One line of a source file as written, or "" when it cannot be read, so a help can quote the
-// user's own code.
+// One line of a source file as the loader read it, or "" when it was not read, so a help can
+// quote the user's own code.
 pub fn diag_source_line(file: Str, line: Int) -> Str {
     source_get_line(file, line)
 }
 
-// Every line of a source file as written, or [] when it cannot be read.
+// Every line of a source file as the loader read it, or [] when it was not read.
 pub fn diag_source_lines(file: Str) -> List[Str] {
-    // Reading any line loads the file into the cache.
-    let _ = source_get_line(file, 1)
-    source_lines_cache.get(file) ?? []
+    loaded_source_lines.get(file) ?? []
+}
+
+// Record the text the loader read for file, so a diagnostic at file can quote it. A
+// diagnostic names a module by its normalized path, so the text is filed under both.
+pub fn diag_register_source(file: Str, text: Str) {
+    if file == "" { return }
+    let lines = text.split("\n")
+    loaded_source_lines.insert(file, lines)
+    let shown = diag_normalize_path(file)
+    if shown != file { loaded_source_lines.insert(shown, lines) }
 }
 
 fn source_get_line(file: Str, line: Int) -> Str {
-    if file == "" {
-        return ""
-    }
-    if source_lines_cache.contains_key(file) == false {
-        if file_exists(file) == 0 {
-            return ""
-        }
-        source_lines_cache.insert(file, read_file(file).split("\n"))
-    }
-    let lines = source_lines_cache.get(file).unwrap()
+    let lines = loaded_source_lines.get(file) ?? []
     let idx = line - 1
     if idx < 0 || idx >= lines.len() {
         return ""
@@ -1560,7 +1566,7 @@ pub fn diag_reset() {
     lint_overrides.clear()
     diag_allow_set.clear()
     diag_allow_stack.clear()
-    source_lines_cache.clear()
+    loaded_source_lines.clear()
     diag_filter = DiagFilter { seen: Map(), lex_cutoffs: [], flushed: 0 }
 }
 
@@ -1959,6 +1965,9 @@ pub fn diag_explain(code: Str) -> Str {
     }
     if code == TEST_BUILD_ENDED_WITHOUT_DIAGNOSTIC {
         return "I0018 -- TestBuildEndedWithoutDiagnostic\n\nAn internal error of `blink test`: the build of one test file failed,\nand the build printed no error that says why. A failed C compile, link\nor native dependency step has its own code (I0017, E0857, E0858), so\nthis one means the build ended in some other way. The file counts as\none that did not build; this diagnostic follows any warnings the build\nprinted. Its notes hold the rest of what the build printed. It is a bug\nin the compiler or in `blink test`, not in the test code. Please report\nit with the notes."
+    }
+    if code == EMBED_TEXT_NOT_LOADED {
+        return "I0020 -- EmbedTextNotLoaded\n\nAn internal error of code generation: an `#embed` has no text from\nthe loader. The loader reads the file of every `#embed` and reports one\nthat is not there, so this is a compiler bug, not an error in the\nprogram. Please report it with the message, which names the path."
     }
     if code == PRELUDE_TYPE_NOT_LOADED {
         return "I0019 -- PreludeTypeNotLoaded\n\nAn internal error of the type checker: a builtin returns a type that the\nprelude declares, such as `std_time.Instant` or\n`std_traits.ConversionError`, and that declaration is not loaded. The\nprelude always loads, so this is a compiler bug, not an error in the\nprogram. Please report it with the message, which names the missing\ndeclaration."

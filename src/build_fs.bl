@@ -6,6 +6,50 @@
 // pointer to a C struct, so utimes(2) cannot be bound.
 
 import std.libc.{getentropy_bytes, read_bytes, write_bytes, poll, Pollfd, POLL_EVT_IN}
+import std.fs.{FileKind, FsErrorExt}
+
+// Whether there is anything at path. Only a stat that says there is none answers false: a
+// path that stat cannot reach for another reason, as for a denied search, may still be there,
+// so the read or write that follows reports the real error.
+pub fn path_exists(path: Str) -> Bool ! FS.Read {
+    match fs.stat(path) {
+        Ok(_) => true
+        Err(e) => !e.not_found()
+    }
+}
+
+// Whether path is a directory, through any links.
+pub fn path_is_dir(path: Str) -> Bool ! FS.Read {
+    match fs.stat(path) {
+        Ok(info) => info.kind == FileKind.Dir
+        Err(_) => false
+    }
+}
+
+// The mtime of path in ms since the epoch, or -1 when it has none to give.
+pub fn mtime_ms(path: Str) -> Int ! FS.Read {
+    match fs.stat(path) {
+        Ok(info) => info.mtime.to_unix_ms()
+        Err(_) => -1
+    }
+}
+
+// The text at path, or "" when it cannot be read. Only for a file whose loss costs a redo,
+// such as a cache entry or a marker: a file the user relies on reports its error.
+pub fn read_or_empty(path: Str) -> Str ! FS.Read {
+    match fs.read(path) {
+        Ok(text) => text
+        Err(_) => ""
+    }
+}
+
+// The names in dir, or none when it cannot be read, with read_or_empty's limit.
+pub fn list_or_empty(dir: Str) -> List[Str] ! FS.Read {
+    match fs.list_dir(dir) {
+        Ok(names) => names
+        Err(_) => []
+    }
+}
 
 // The errno values the calls below test, the same on Linux and macOS but ENOTEMPTY.
 let BFS_ENOENT = 2
@@ -15,25 +59,25 @@ let BFS_ENOTEMPTY_MACOS = 66
 
 // mkdir -p: each missing directory of path, made with mode 0777 less the umask. True when path
 // is a directory at the end, which a directory another process made first also gives.
-pub fn mkdir_p(path: Str) -> Bool ! IO, FS.Write {
+pub fn mkdir_p(path: Str) -> Bool ! IO, FS.Write, FS.Read {
     if path == "" { return false }
-    if is_dir(path) == 1 { return true }
+    if path_is_dir(path) { return true }
     let mut prefix = if path.starts_with("/") { "/" } else { "" }
     for part in path.split("/") {
         if part == "" { continue }
         prefix = if prefix == "" || prefix == "/" { "{prefix}{part}" } else { "{prefix}/{part}" }
-        if is_dir(prefix) == 1 { continue }
+        if path_is_dir(prefix) { continue }
         with ffi.scope() as scope {
             // 511 is 0777.
             let _ = bfs_mkdir(scope.cstr(prefix), 511.to_u32())
         }
     }
-    is_dir(path) == 1
+    path_is_dir(path)
 }
 
 // rm -rf: path and all under it. A link is removed, never followed. True when path is gone.
 // A private dir this process holds live is unlocked once it is gone.
-pub fn remove_tree(path: Str) -> Bool ! IO, FS.Delete {
+pub fn remove_tree(path: Str) -> Bool ! IO, FS.Delete, FS.Read {
     if path == "" { return false }
     if live_locks.contains_key(path) {
         let gone = remove_entries(path)
@@ -43,7 +87,7 @@ pub fn remove_tree(path: Str) -> Bool ! IO, FS.Delete {
     remove_entries(path)
 }
 
-fn remove_entries(path: Str) -> Bool ! IO, FS.Delete {
+fn remove_entries(path: Str) -> Bool ! IO, FS.Delete, FS.Read {
     let mut rc = 0
     let mut err = 0
     with ffi.scope() as scope {
@@ -56,7 +100,7 @@ fn remove_entries(path: Str) -> Bool ! IO, FS.Delete {
     // Only a directory with entries fails rmdir with these, so the walk below never reads
     // through a link.
     if e != BFS_ENOTEMPTY_LINUX && e != BFS_ENOTEMPTY_MACOS && e != BFS_EEXIST { return false }
-    for name in list_dir(path) {
+    for name in list_or_empty(path) {
         let _ = remove_entries("{path}/{name}")
     }
     let again = rmdir_errno(path)
@@ -76,7 +120,7 @@ fn rmdir_errno(path: Str) -> Int ! IO, FS.Delete {
 }
 
 // mkdir_p, and on failure a line on stderr that names path, as mkdir -p would print.
-pub fn mkdir_p_or_report(path: Str) -> Bool ! IO, FS.Write {
+pub fn mkdir_p_or_report(path: Str) -> Bool ! IO, FS.Write, FS.Read {
     if mkdir_p(path) { return true }
     io.eprintln("error: cannot make the directory {path}")
     false
@@ -84,7 +128,7 @@ pub fn mkdir_p_or_report(path: Str) -> Bool ! IO, FS.Write {
 
 // remove_tree, and on failure a line on stderr that names path, as rm -rf would print. A
 // missing path is no failure, as for rm -rf.
-pub fn remove_tree_or_report(path: Str) -> Bool ! IO, FS.Delete {
+pub fn remove_tree_or_report(path: Str) -> Bool ! IO, FS.Delete, FS.Read {
     if remove_tree(path) { return true }
     io.eprintln("error: cannot remove {path}")
     false
@@ -106,9 +150,9 @@ pub fn rename(from: Str, to: Str) -> Bool ! IO, FS.Write {
 // a check-then-mv would put stage inside it. A dir there without key is no dir any build
 // published, and goes first. It is tested for before key, so a dir another build renames in
 // between is never taken for one without key.
-pub fn publish_dir(stage: Str, dir: Str, key: Str) -> Bool ! IO, FS.Write, FS.Delete {
+pub fn publish_dir(stage: Str, dir: Str, key: Str) -> Bool ! IO, FS.Write, FS.Delete, FS.Read {
     unmark(stage)
-    if file_exists(dir) == 1 && file_exists("{dir}/{key}") == 0 {
+    if path_exists(dir) && !path_exists("{dir}/{key}") {
         let _ = remove_tree(dir)
     }
     let mut opened = false
@@ -119,7 +163,7 @@ pub fn publish_dir(stage: Str, dir: Str, key: Str) -> Bool ! IO, FS.Write, FS.De
     if !opened || !rename(stage, dir) {
         let _ = remove_tree(stage)
     }
-    file_exists("{dir}/{key}") == 1
+    path_exists("{dir}/{key}")
 }
 
 let BFS_NAME_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
@@ -178,7 +222,7 @@ pub fn is_live_mark(name: Str) -> Bool {
 // Locks the new dir at path, then marks it. The mark comes only after the lock, so no reaper
 // can take a marked dir for dead between the two. Where the lock cannot be taken the dir
 // stays unmarked, and no reaper ever removes it.
-fn hold_live(path: Str) ! IO, FS.Read {
+fn hold_live(path: Str) ! IO, FS.Read, FS.Write {
     let mut fd = -1
     with ffi.scope() as scope {
         fd = bfs_open_read(scope.cstr(path), 0.to_i32()).to_int()
@@ -189,16 +233,16 @@ fn hold_live(path: Str) ! IO, FS.Read {
         let _ = bfs_close(fd.to_i32())
         return
     }
-    write_file("{path}/{LIVE_MARK}", "")
+    let _ = fs.write("{path}/{LIVE_MARK}", "")
     live_locks.insert(path, fd)
 }
 
 // Drops the mark and the lock of a private dir this process holds live, before it renames
 // the dir to a name no reaper looks at. The dir stays.
-pub fn unmark(path: Str) ! IO {
+pub fn unmark(path: Str) ! IO, FS.Delete {
     match live_locks.get(path) {
         Some(fd) => {
-            fs_remove("{path}/{LIVE_MARK}")
+            let _ = fs.delete("{path}/{LIVE_MARK}")
             let _ = bfs_close(fd.to_i32())
             live_locks.remove(path)
         }
@@ -220,14 +264,14 @@ fn drop_lock(path: Str) ! IO {
 // one that holds the mark and whose lock this process takes. It holds the lock while it
 // removes the dir.
 pub fn reap_dead(parent: Str, prefixes: List[Str]) ! IO, FS.Read, FS.Delete {
-    for name in list_dir(parent) {
+    for name in list_or_empty(parent) {
         let mut ours = false
         for prefix in prefixes {
             if name.starts_with("{prefix}.") { ours = true }
         }
         if !ours { continue }
         let path = "{parent}/{name}"
-        if live_locks.contains_key(path) || file_exists("{path}/{LIVE_MARK}") == 0 { continue }
+        if live_locks.contains_key(path) || !path_exists("{path}/{LIVE_MARK}") { continue }
         let mut fd = -1
         with ffi.scope() as scope {
             fd = bfs_open_read(scope.cstr(path), 0.to_i32()).to_int()
@@ -235,7 +279,7 @@ pub fn reap_dead(parent: Str, prefixes: List[Str]) ! IO, FS.Read, FS.Delete {
         if fd < 0 { continue }
         // The mark is checked again under the lock: a reaper that removed the dir first
         // leaves none.
-        if bfs_flock(fd.to_i32(), BFS_LOCK_EX_NB.to_i32()).to_int() == 0 && file_exists("{path}/{LIVE_MARK}") == 1 {
+        if bfs_flock(fd.to_i32(), BFS_LOCK_EX_NB.to_i32()).to_int() == 0 && path_exists("{path}/{LIVE_MARK}") {
             let _ = remove_tree(path)
         }
         let _ = bfs_close(fd.to_i32())
@@ -255,8 +299,8 @@ pub fn touch(path: Str) -> Bool ! IO, FS.Read, FS.Write {
     }
     if fd < 0 {
         if err != BFS_ENOENT { return false }
-        write_file(path, "")
-        return file_exists(path) == 1
+        let _ = fs.write(path, "")
+        return path_exists(path)
     }
     let mut ok = false
     let mut empty = false
@@ -276,7 +320,7 @@ pub fn touch(path: Str) -> Bool ! IO, FS.Read, FS.Write {
     let _ = bfs_close(fd.to_i32())
     if empty {
         // There is no byte to write back; truncating an empty file moves its mtime.
-        write_file(path, "")
+        let _ = fs.write(path, "")
         ok = true
     }
     ok
@@ -297,7 +341,7 @@ pub fn copy_file(from: Str, to: Str) -> Bool ! IO, FS.Read, FS.Write, FS.Delete 
         src = bfs_open_read(scope.cstr(from), 0.to_i32()).to_int()
     }
     if src < 0 { return false }
-    write_file(to, "")
+    let _ = fs.write(to, "")
     let mut dst = -1
     with ffi.scope() as scope {
         // 1 is O_WRONLY on Linux and macOS.
@@ -453,7 +497,7 @@ pub fn find_program(name: Str) -> Str ! IO, FS.Read {
 }
 
 fn is_executable(path: Str) -> Bool ! IO, FS.Read {
-    if is_dir(path) == 1 { return false }
+    if path_is_dir(path) { return false }
     let mut rc = -1
     with ffi.scope() as scope {
         // 1 is X_OK on Linux and macOS.
@@ -565,8 +609,8 @@ pub type FileChild {
 // waits for another child fills, and its child stops.
 pub fn spawn_to_files(program: Str, args: List[Str], out_path: Str, err_path: Str) -> FileChild ! IO, FS.Read, FS.Write, Process.Spawn, Env.Exit {
     // open() here never creates.
-    write_file(out_path, "")
-    write_file(err_path, "")
+    let _ = fs.write(out_path, "")
+    let _ = fs.write(err_path, "")
     let mut out_fd = -1
     let mut err_fd = -1
     let mut live = -1
@@ -757,7 +801,7 @@ pub type ReapedChild {
 // Waits for child to end, unless wait_children saw it end, and answers its exit code (128
 // plus the signal that ended it, as a captured run gives) and its output, then removes its
 // output files.
-pub fn reap_to_files(child: FileChild) -> ReapedChild ! IO, Process.Spawn {
+pub fn reap_to_files(child: FileChild) -> ReapedChild ! IO, Process.Spawn, FS.Delete, FS.Read {
     if child.live >= 0 {
         let _ = bfs_close(child.live.to_i32())
     }
@@ -775,10 +819,10 @@ pub fn reap_to_files(child: FileChild) -> ReapedChild ! IO, Process.Spawn {
     } else {
         err_note = "fork() failed"
     }
-    let out = read_file(child.out_path)
-    let err_out = read_file(child.err_path)
-    fs_remove(child.out_path)
-    fs_remove(child.err_path)
+    let out = read_or_empty(child.out_path)
+    let err_out = read_or_empty(child.err_path)
+    let _ = fs.delete(child.out_path)
+    let _ = fs.delete(child.err_path)
     ReapedChild { out: out, err_out: "{err_out}{err_note}", exit_code: exit_code }
 }
 

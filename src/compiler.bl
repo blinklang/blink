@@ -3,7 +3,7 @@ import lexer.{Lex, lex}
 import parser.{Parse, parser_reset, parse_program, new_node, new_sublist, sublist_push, finalize_sublist, sublist_get, sublist_length, pos, node_count, node_kind, node_name, node_obj, node_method, node_args, node_elements, node_handlers, node_params, node_fields, node_stmts, node_arms, node_methods, node_module, node_captures, node_str_val, node_is_pub, node_set_module, node_set_is_pub, node_set_name, node_set_handlers, node_set_params, node_set_fields, node_set_stmts, node_set_arms, node_set_methods, node_set_args, node_set_captures, record_source_module, embed_path_of, parsed_interface_text, parsed_interface_parts, interface_text_of, parser_interface_text_deferred, parser_interface_text_wanted, parser_keeps_parsed, parser_has_parsed_end, parser_parsed_end, parser_mark_parsed, parser_rewind, parser_keep_parsed, parser_keep_load_order_only, parser_program_annotations, parser_set_program_annotations, parser_set_load_order, parser_live_ranges}
 import typecheck.{builtin_op_module, builtin_op_root_of_handle, clear_module_imports, handles_io_read, io_read_module, is_intrinsic_method, tc_handler_effect_root, record_module_import, tc_import_modules, tc_import_qualifiers, tc_import_nodes, tc_reexport_source, tc_reexport_modules, tc_is_module_used, tc_main_module_has_duplicates, tc_get_symbol_module, tc_set_prelude_modules, tc_record_module_package, nearest_name}
 import diagnostics.{
-    Diag, diag_register_file_range, lint_set_override, diag_normalize_path,
+    Diag, diag_register_file_range, diag_register_source, lint_set_override, diag_normalize_path,
     diag_set_last_fix, diag_error_no_loc, diag_warn_at, diag_reset,
     diag_source_file, diag_module_files, embedded_inner_key,
     diag_error_at, diag_file_for_node, diag_warn_in_file_notes, SHADOWED_DEPENDENCY,
@@ -20,6 +20,7 @@ import std.toml.{toml_read_value}
 import comment_attach.{attach_comments_pass}
 import limit_values.{limit_kind_named, limit_key_help}
 import audit_records.{audit_records_parse, audit_records_empty, AuditRecords}
+import build_fs
 
 // compiler.bl — Self-hosting Blink compiler driver
 //
@@ -134,7 +135,7 @@ pub fn set_strict_struct_layout(flag: Int) {
 // callers of manifest_load() (resolver, pathdeps, cli) repopulate
 // lint_names/lint_levels with a different manifest's contents, so a cache
 // keyed on this file's mtime could re-apply stale overrides.
-pub fn load_lint_overrides(src_root: Str) ! Diag.Report {
+pub fn load_lint_overrides(src_root: Str) ! Diag.Report, FS.Read, IO {
     let manifest_path = manifest_path_for_src_root(src_root)
     if probe_file(manifest_path) {
         manifest_clear()
@@ -235,7 +236,7 @@ fn unknown_key_help(section: Str, key: Str, suggestion: Str?) -> Str {
 // belongs to. The standard library and the toolchain packages resolve K only against their
 // own records, never against the audits.toml of the program that imports them. A file with
 // no blink.toml over it is in no package, so it has no records.
-pub fn note_audit_dir(file_path: Str) {
+pub fn note_audit_dir(file_path: Str) ! Env.Read, FS.Read {
     if is_toolchain_file(file_path) { return }
     let root = find_src_root(file_path)
     if root == "" { return }
@@ -247,9 +248,10 @@ pub fn note_audit_dir(file_path: Str) {
 
 // Whether resolve_module_path found a file in the toolchain's own lib/std or lib/pkg. A local
 // src/pkg/x.bl that an import `pkg.x` loads is the program's file, and so is not one.
-fn is_toolchain_file(file_path: Str) -> Bool {
+fn is_toolchain_file(file_path: Str) -> Bool ! Env.Read {
+    let argv = env.args()
     if file_path.starts_with("<embedded:") { return true }
-    let compiler_dir = path_dirname(get_arg(0))
+    let compiler_dir = path_dirname(argv.get(0).unwrap())
     if under_toolchain_lib(file_path, compiler_dir) { return true }
     let blink_root = env.var("BLINK_ROOT") ?? ""
     blink_root != "" && under_toolchain_lib(file_path, blink_root)
@@ -262,7 +264,7 @@ fn under_toolchain_lib(file_path: Str, root: Str) -> Bool {
 // Reads the audits.toml at each package root a loaded file belongs to, once per root, and
 // reports each record key the schema does not allow. A root with no audits.toml has no
 // records, which is not an error: only a `@trusted(audit: K)` that names a missing K is.
-pub fn load_audit_records() ! Diag.Report {
+pub fn load_audit_records() ! Diag.Report, FS.Read {
     for f in loaded_inputs.files {
         let dir = loaded_inputs.audit_dirs.get(f) ?? ""
         if dir == "" || loaded_inputs.audit_records.contains_key(dir) { continue }
@@ -271,7 +273,7 @@ pub fn load_audit_records() ! Diag.Report {
             loaded_inputs.audit_records.insert(dir, audit_records_empty())
             continue
         }
-        let recs = audit_records_parse(note_config_text(path, read_file(path)))
+        let recs = audit_records_parse(note_config_text(path, build_fs.read_or_empty(path)))
         loaded_inputs.audit_records.insert(dir, recs)
         report_audit_record_issues(path, recs)
     }
@@ -297,8 +299,8 @@ fn display_config_path(path: Str) -> Str {
 
 // Whether a file is at path, noted in loaded_inputs. A probe that resolution acts on goes
 // through here, so the probes list every path whose answer could change the program loaded.
-fn probe_file(path: Str) -> Bool {
-    let found = file_exists(path) == 1
+fn probe_file(path: Str) -> Bool ! FS.Read {
+    let found = build_fs.path_exists(path)
     if !loaded_inputs.probe_found.contains_key(path) {
         loaded_inputs.probe_paths.push(path)
         loaded_inputs.probe_found.insert(path, found)
@@ -306,8 +308,8 @@ fn probe_file(path: Str) -> Bool {
     found
 }
 
-pub fn check_file_exists(path: Str) {
-    if !file_exists(path) {
+pub fn check_file_exists(path: Str) ! IO, Env.Exit, FS.Read {
+    if !build_fs.path_exists(path) {
         io.eprintln("error: file not found: {path}")
         env.exit(1)
     }
@@ -317,7 +319,7 @@ pub fn check_file_exists(path: Str) {
 // done. The path is read relative to the file that holds the `#embed`, so each node answers
 // for its own file. The expression stage embeds the bytes read here. A `blink check` stops
 // before that stage, so without this a check answered ok on a program no build could produce.
-fn check_embed_targets() ! Diag.Report {
+pub fn check_embed_targets() ! Diag.Report, FS.Read {
     // In load order, which a recheck that kept nodes does not hold to in node id order, so
     // the errors and embed_paths read as a cold check's.
     let ranges = parser_live_ranges()
@@ -332,7 +334,7 @@ fn check_embed_targets() ! Diag.Report {
                         "the path is read relative to the file that holds the #embed, not the directory the compiler runs in")
                 } else if !loaded_inputs.embed_texts.contains_key(path) {
                     loaded_inputs.embed_paths.push(path)
-                    loaded_inputs.embed_texts.insert(path, read_file(path))
+                    loaded_inputs.embed_texts.insert(path, build_fs.read_or_empty(path))
                 }
             }
             id = id + 1
@@ -341,14 +343,14 @@ fn check_embed_targets() ! Diag.Report {
     }
 }
 
-pub fn compile_to_program(file_path: Str, use_prelude: Int) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report {
+pub fn compile_to_program(file_path: Str, use_prelude: Int) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, FS.Read, Env.Exit, Env.Read, IO {
     compile_entry_to_program(file_path, use_prelude, true)
 }
 
 // `package_root` is false for an entry file the toolchain writes, such as the stdlib archive's
 // synthesized main: it sits in a build dir, so the package found above it is not its package
 // and that package's audits.toml is not its records.
-pub fn compile_entry_to_program(file_path: Str, use_prelude: Int, package_root: Bool) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report {
+pub fn compile_entry_to_program(file_path: Str, use_prelude: Int, package_root: Bool) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, FS.Read, Env.Exit, Env.Read, IO {
     check_file_exists(file_path)
     reset_compiler_state()
     diag_reset()
@@ -356,9 +358,10 @@ pub fn compile_entry_to_program(file_path: Str, use_prelude: Int, package_root: 
     load_lint_overrides(src_root)
     diag_source_file = file_path
 
-    let source = read_file(file_path)
+    let source = build_fs.read_or_empty(file_path)
     loaded_inputs.source_paths.push(file_path)
     loaded_inputs.source_texts.push(source)
+    diag_register_source(file_path, source)
     let mut program = 0
     let mut imported_programs: List[Int] = []
     with load_phase() {
@@ -494,7 +497,7 @@ fn dots_to_underscores(s: Str) -> Str {
     s.replace(".", "_")
 }
 
-pub fn find_src_root(source_path: Str) -> Str {
+pub fn find_src_root(source_path: Str) -> Str ! FS.Read {
     match source_path.byte_index_of("/src/", 0) {
         Some(at) => { return source_path.byte_slice(0, at + 5) }
         None => {}
@@ -518,11 +521,11 @@ pub fn find_src_root(source_path: Str) -> Str {
     ""
 }
 
-fn read_pkg_name_from_toml(path: Str) -> Str {
+fn read_pkg_name_from_toml(path: Str) -> Str ! FS.Read {
     if !probe_file(path) {
         return ""
     }
-    let content = note_config_text(path, read_file(path))
+    let content = note_config_text(path, build_fs.read_or_empty(path))
     toml_read_value(content, "package", "name") ?? ""
 }
 
@@ -530,14 +533,18 @@ fn read_pkg_name_from_toml(path: Str) -> Str {
 // these bytes are a second read, and the units a build records do not rest on them: a
 // manifest or lockfile changes the emit only through which file an import loads, which the
 // loaded files show, and through [lints], which the lint levels in force show.
-fn note_config_file(path: Str) {
-    let _ = note_config_text(path, read_file(path))
+fn note_config_file(path: Str) ! FS.Read {
+    let _ = note_config_text(path, build_fs.read_or_empty(path))
 }
 
 // A config file the loader read, with the bytes it read; returns those bytes.
 fn note_config_text(path: Str, text: Str) -> Str {
     loaded_inputs.config_paths.push(path)
     loaded_inputs.config_texts.push(text)
+    diag_register_source(path, text)
+    // A config diagnostic names the file by its shown path.
+    let shown = display_config_path(path)
+    if shown != path { diag_register_source(shown, text) }
     text
 }
 
@@ -564,7 +571,7 @@ fn manifest_path_for_src_root(src_root: Str) -> Str {
 
 // Given a src_root like "examples/with_deps/mathlib/src/", return the
 // package name from the sibling blink.toml. Returns "" if no manifest.
-fn entry_pkg_for_src_root(src_root: Str) -> Str {
+fn entry_pkg_for_src_root(src_root: Str) -> Str ! FS.Read {
     if src_root == "" {
         return ""
     }
@@ -593,7 +600,7 @@ fn validate_lockfile_versions() ! Diag.Report {
 
 let mut lockfile_loaded: Int = 0
 
-fn ensure_lockfile_loaded(src_root: Str) ! Diag.Report {
+fn ensure_lockfile_loaded(src_root: Str) ! Diag.Report, FS.Read, IO {
     if lockfile_loaded == 1 {
         return
     }
@@ -653,7 +660,7 @@ fn compiler_get_home() -> Str {
     env.var("HOME") ?? ""
 }
 
-fn resolve_from_lockfile(dotted_path: Str, _src_root: Str) -> Option[Str] ! Diag.Report {
+fn resolve_from_lockfile(dotted_path: Str, _src_root: Str) -> Option[Str] ! Diag.Report, FS.Read {
     if lockfile_pkg_count() == 0 {
         return None
     }
@@ -834,7 +841,8 @@ fn is_blink_pseudo_module(dotted_path: Str) -> Int {
     0
 }
 
-pub fn resolve_module_path(dotted_path: Str, src_root: Str) -> Str ! Diag.Report {
+pub fn resolve_module_path(dotted_path: Str, src_root: Str) -> Str ! Diag.Report, Env.Read, FS.Read, IO {
+    let argv = env.args()
     let is_std_ns = dotted_path.starts_with("std.")
     let is_pkg_ns = dotted_path.starts_with("pkg.")
 
@@ -888,7 +896,7 @@ pub fn resolve_module_path(dotted_path: Str, src_root: Str) -> Str ! Diag.Report
 
     // Step 3: Check pkg. prefix (bundled package-manager modules)
     if dotted_path.starts_with("pkg.") {
-        let compiler_dir = path_dirname(get_arg(0))
+        let compiler_dir = path_dirname(argv.get(0).unwrap())
         let pkg_rel = dots_to_slashes(dotted_path.byte_slice(4, dotted_path.byte_len()))
         let pkg_full_bl = path_join(compiler_dir, path_join("lib/pkg", pkg_rel.concat(".bl")))
         if probe_file(pkg_full_bl) {
@@ -917,7 +925,7 @@ pub fn resolve_module_path(dotted_path: Str, src_root: Str) -> Str ! Diag.Report
 
     // Step 4: Check std. prefix (bundled stdlib)
     if dotted_path.starts_with("std.") {
-        let compiler_dir = path_dirname(get_arg(0))
+        let compiler_dir = path_dirname(argv.get(0).unwrap())
         let std_rel = dots_to_slashes(dotted_path.byte_slice(4, dotted_path.byte_len()))
         let std_key = "std/".concat(dots_to_underscores(dotted_path.byte_slice(4, dotted_path.byte_len())))
         let mut std_resolved = ""
@@ -982,7 +990,7 @@ fn should_import_item(item: Int, import_node: Int) -> Int {
     0
 }
 
-pub fn merge_programs(main_prog: Int, imported: List[Int], _import_nodes_list: List[Int]) -> Int ! Parse.Build {
+pub fn merge_programs(main_prog: Int, imported: List[Int], _import_nodes_list: List[Int]) -> Int ! Parse.Build, FS.Read {
     let mut all_fns: List[Int] = []
     let mut all_types: List[Int] = []
     let mut all_lets: List[Int] = []
@@ -1659,7 +1667,7 @@ fn is_file_loaded(path: Str) -> Int {
 }
 
 @allow(UnrestoredMutation, IncompleteStateRestore)
-fn load_module(dotted_path: Str, file_path: Str, src_root: Str, all_programs: List[Int], imp_node: Int, label: Str) ! Lex.Tokenize, Parse, Diag.Report {
+fn load_module(dotted_path: Str, file_path: Str, src_root: Str, all_programs: List[Int], imp_node: Int, label: Str) ! Lex.Tokenize, Parse, Diag.Report, FS.Read, Env.Read, IO {
     loaded_inputs.files.push(file_path)
     note_audit_dir(file_path)
     if trace_mode != "" { trace("parse", "{label} {dotted_path} -> {file_path}") }
@@ -1668,10 +1676,11 @@ fn load_module(dotted_path: Str, file_path: Str, src_root: Str, all_programs: Li
         let key = embedded_inner_key(file_path)
         source = embedded_get_source(key)
     } else {
-        source = read_file(file_path)
+        source = build_fs.read_or_empty(file_path)
     }
     loaded_inputs.source_paths.push(file_path)
     loaded_inputs.source_texts.push(source)
+    diag_register_source(file_path, source)
     load_phase_check(node_count())
     // Lexer and parser diagnostics take their file from diag_source_file, which names the
     // entry file until this module's text is the one being read.
@@ -1748,7 +1757,7 @@ fn load_module(dotted_path: Str, file_path: Str, src_root: Str, all_programs: Li
 
 // The package a loaded file belongs to: the bundled stdlib, one bundled package, or the
 // source root of a package on disk. A file under no source root is a package of its own.
-fn module_package_id(dotted_path: Str, file_path: Str) -> Str {
+fn module_package_id(dotted_path: Str, file_path: Str) -> Str ! FS.Read {
     if dotted_path.starts_with("std.") { return "std" }
     if dotted_path.starts_with("pkg.") {
         let rest = dotted_path.byte_slice(4, dotted_path.byte_len())
@@ -1762,7 +1771,7 @@ fn module_package_id(dotted_path: Str, file_path: Str) -> Str {
     if root != "" { root } else { file_path }
 }
 
-pub fn collect_imports(program: Int, src_root: Str, all_programs: List[Int]) ! Lex.Tokenize, Parse, Diag.Report {
+pub fn collect_imports(program: Int, src_root: Str, all_programs: List[Int]) ! Lex.Tokenize, Parse, Diag.Report, Env.Read, FS.Read, IO {
     let imports_sl = node_elements(program)
     if imports_sl == -1 {
         return
@@ -1962,7 +1971,7 @@ pub fn is_prelude_module(mod_name: Str) -> Int {
     0
 }
 
-pub fn inject_prelude(src_root: Str, all_programs: List[Int]) ! Lex.Tokenize, Parse, Diag.Report {
+pub fn inject_prelude(src_root: Str, all_programs: List[Int]) ! Lex.Tokenize, Parse, Diag.Report, Env.Read, FS.Read, IO {
     let prelude_modules = prelude_module_list()
     // Tell the typechecker which modules are prelude modules (underscore form,
     // matching node_module / tc_symbol_module) so it can keep their

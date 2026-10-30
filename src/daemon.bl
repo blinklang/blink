@@ -165,7 +165,7 @@ fn daemon_extract_type(request: Str) -> Option[Str] {
 
 // Each check sees the whole program: mono and the mutation passes judge across functions,
 // so a recheck of only the changed functions could miss what an edit broke elsewhere.
-fn daemon_check_program() -> DaemonCheck ! IO, Lex.Tokenize, Parse, Parse.Build, TypeCheck, Diag.Report, FS.Read, FS.Write {
+fn daemon_check_program() -> DaemonCheck ! IO, Lex.Tokenize, Parse, Parse.Build, TypeCheck, Diag.Report, FS.Read, FS.Write, Env.Exit, Env.Read {
     daemon_settle_check(daemon_run_check(0))
 }
 
@@ -173,7 +173,7 @@ fn daemon_check_program() -> DaemonCheck ! IO, Lex.Tokenize, Parse, Parse.Build,
 // reads: the other format, the interface texts, the stats and the forced collection. A check
 // request is answered from it, and daemon_settle_check adds the rest once the reply is sent,
 // before the worker serves anything else.
-fn daemon_run_check(format: Int) -> DaemonCheck ! IO, Lex.Tokenize, Parse, Parse.Build, TypeCheck, Diag.Report, FS.Read, FS.Write {
+fn daemon_run_check(format: Int) -> DaemonCheck ! IO, Lex.Tokenize, Parse, Parse.Build, TypeCheck, Diag.Report, FS.Read, FS.Write, Env.Exit, Env.Read {
     let query = daemon_index_entry()
     let out_path = path_join(daemon_origin.files, "check.out")
     let err_path = path_join(daemon_origin.files, "check.err")
@@ -194,8 +194,8 @@ fn daemon_run_check(format: Int) -> DaemonCheck ! IO, Lex.Tokenize, Parse, Parse
     let reused = loader_reused_sources()
     daemon_origin = DaemonOrigin { reused: daemon_origin.reused + reused, ..daemon_origin }
     let captured = restore_output(saved)
-    let out = if captured { read_file(out_path) } else { "" }
-    let err = if captured { read_file(err_path) } else { "" }
+    let out = if captured { build_fs.read_or_empty(out_path) } else { "" }
+    let err = if captured { build_fs.read_or_empty(err_path) } else { "" }
     DaemonCheck {
         human: if format == 0 { diag_render(0) } else { "" },
         json: if format == 1 { diag_render(1) } else { "" },
@@ -265,7 +265,7 @@ fn daemon_settle_last() ! IO, FS.Read {
 fn daemon_index_entry() -> Option[DaemonQueryIndex] ! IO, Lex.Tokenize, Parse, Diag.Report, FS.Read, FS.Write {
     reset_compiler_state()
     diag_reset()
-    let text = read_file(daemon_source_path)
+    let text = build_fs.read_or_empty(daemon_source_path)
     let out_path = path_join(daemon_origin.files, "query.out")
     let err_path = path_join(daemon_origin.files, "query.err")
     let saved = capture_output(out_path, err_path)
@@ -275,7 +275,7 @@ fn daemon_index_entry() -> Option[DaemonQueryIndex] ! IO, Lex.Tokenize, Parse, D
         si_reset()
         return None
     }
-    Some(DaemonQueryIndex { cwd: daemon_origin.cwd, path: daemon_source_path, text: text, out: read_file(out_path), err: read_file(err_path) })
+    Some(DaemonQueryIndex { cwd: daemon_origin.cwd, path: daemon_source_path, text: text, out: build_fs.read_or_empty(out_path), err: build_fs.read_or_empty(err_path) })
 }
 
 // The mtime and size of each file the last check read, -1 for one it can not stat or open.
@@ -284,7 +284,7 @@ fn daemon_index_entry() -> Option[DaemonQueryIndex] ! IO, Lex.Tokenize, Parse, D
 fn daemon_input_stats() -> List[Int] ! IO, FS.Read {
     let mut stats: List[Int] = []
     for p in checked_input_files() {
-        stats.push(file_mtime(p))
+        stats.push(build_fs.mtime_ms(p))
         stats.push(daemon_file_size(p))
     }
     stats
@@ -441,7 +441,7 @@ pub fn daemon_proc_identity(compiler: Str) -> Option[Str] ! IO, FS.Read, Net.Con
         i = i + 1
     }
     let mut sb = StringBuilder.new()
-    sb.write("{image} {daemon_file_size("/proc/self/exe")} {file_mtime("/proc/self/exe")}\n")
+    sb.write("{image} {daemon_file_size("/proc/self/exe")} {build_fs.mtime_ms("/proc/self/exe")}\n")
     for v in sorted_strs(vars) {
         sb.write("{v.byte_len()}\n{v}\n")
     }
@@ -564,7 +564,7 @@ fn daemon_enter(cwd: Str, path: Str) -> Bool ! IO, Env.Write {
 // it would exit with, so the client prints the bytes and needs no rendering of its own.
 // With no input changed, the last answer still holds, so the daemon gives it again rather
 // than an empty list that would read as clean.
-fn daemon_handle_check(request: Str) -> Str ! Daemon.Serve, IO, Lex.Tokenize, Parse, Parse.Build, TypeCheck, Diag.Report, Env.Write, FS.Read, FS.Write {
+fn daemon_handle_check(request: Str) -> Str ! Daemon.Serve, IO, Lex.Tokenize, Parse, Parse.Build, TypeCheck, Diag.Report, Env.Write, FS.Read, FS.Write, Env.Exit, Env.Read {
     json_clear()
     let root = json_parse(request)
     let cwd = json_as_str(json_get(root, "cwd"))
@@ -580,7 +580,7 @@ fn daemon_handle_check(request: Str) -> Str ! Daemon.Serve, IO, Lex.Tokenize, Pa
         return daemon_not_served("the daemon could not change to {cwd}")
     }
     // The loader exits on a missing entry file, which would take the daemon down with it.
-    if file_exists(daemon_source_path) != 1 {
+    if !build_fs.path_exists(daemon_source_path) {
         daemon_last = None
         return daemon_not_served("source file not found: {daemon_source_path}")
     }
@@ -720,7 +720,7 @@ type BuildTurn {
 // Points fd at an empty file at path, or false when it cannot. write_file makes the file, so
 // open needs only O_WRONLY, which is 1 on every host, where O_CREAT and O_TRUNC differ.
 fn redirect_to(path: Str, fd: Int) -> Bool ! IO, FS.Read, FS.Write {
-    write_file(path, "")
+    let _ = fs.write(path, "")
     let mut ok = false
     with ffi.scope() as scope {
         let file = daemon_open_write(scope.cstr(path), 1.to_i32()).to_int()
@@ -815,7 +815,7 @@ fn daemon_reply(client_fd: Int, text: Str) {
 // client's directory with the client's PWD, which the identity leaves out, as each directory
 // of a project has its own. Anything else is not served, and the client builds cold. The daemon serves on while the child runs
 // and replies to the client once the child ends (daemon_end_child).
-fn daemon_handle_build(request: Str, client_fd: Int, builds: DaemonBuilds) -> BuildTurn ! Daemon.Serve, IO, Lex.Tokenize, Parse, Parse.Build, TypeCheck, Diag.Report, Process.Spawn, Env.Write, FS.Read, FS.Write {
+fn daemon_handle_build(request: Str, client_fd: Int, builds: DaemonBuilds) -> BuildTurn ! Daemon.Serve, IO, Lex.Tokenize, Parse, Parse.Build, TypeCheck, Diag.Report, Process.Spawn, Env.Write, FS.Read, FS.Write, FS.Delete, Env.Exit, Env.Read {
     json_clear()
     let root = json_parse(request)
     let cwd = json_as_str(json_get(root, "cwd"))
@@ -840,7 +840,7 @@ fn daemon_handle_build(request: Str, client_fd: Int, builds: DaemonBuilds) -> Bu
         return BuildTurn.Reply(daemon_not_served("the daemon could not change to {cwd}"))
     }
     // The loader exits on a missing entry file, which would take the daemon down with it.
-    if file_exists(daemon_source_path) != 1 {
+    if !build_fs.path_exists(daemon_source_path) {
         daemon_last = None
         return BuildTurn.Reply(daemon_not_served("source file not found: {daemon_source_path}"))
     }
@@ -865,7 +865,7 @@ fn daemon_handle_build(request: Str, client_fd: Int, builds: DaemonBuilds) -> Bu
     let out_path = path_join(daemon_origin.files, "build-{builds.seq}.out")
     let err_path = path_join(daemon_origin.files, "build-{builds.seq}.err")
     let declined = path_join(daemon_origin.files, "build-{builds.seq}.declined")
-    fs_remove(declined)
+    let _ = fs.delete(declined)
     // Asked here, so each child inherits the count and starts no program to learn it.
     let _ = build_fs.cpu_count()
     // The child inherits what stdout holds unflushed, and would print it again.
@@ -895,7 +895,7 @@ fn daemon_handle_build(request: Str, client_fd: Int, builds: DaemonBuilds) -> Bu
         daemon_origin = DaemonOrigin { chan: -1, ..daemon_origin }
         daemon_running = 0
         if !redirect_to(out_path, 1) || !redirect_to(err_path, 2) {
-            write_file(declined, "")
+            let _ = fs.write(declined, "")
             env.exit(1)
         }
         if pwd_set { env.set_var("PWD", pwd) } else { env.remove_var("PWD") }
@@ -909,12 +909,12 @@ fn daemon_handle_build(request: Str, client_fd: Int, builds: DaemonBuilds) -> Bu
 
 // Replies to the client of the build child that ended with status, and removes the child's
 // files, whether it built, declined or died.
-fn daemon_end_child(child: DaemonChild, status: Int) ! IO {
+fn daemon_end_child(child: DaemonChild, status: Int) ! IO, FS.Delete, FS.Read {
     if child.wake >= 0 { unix_socket_close(child.wake) }
-    let out = read_file(child.out)
-    let err = read_file(child.err)
-    let declined = file_exists(child.declined) == 1
-    for f in [child.out, child.err, child.declined] { fs_remove(f) }
+    let out = build_fs.read_or_empty(child.out)
+    let err = build_fs.read_or_empty(child.err)
+    let declined = build_fs.path_exists(child.declined)
+    for f in [child.out, child.err, child.declined] { let _ = fs.delete(f) }
     if status < 0 || declined {
         daemon_reply(child.client_fd, daemon_not_served("the daemon's build did not run"))
         return
@@ -932,7 +932,7 @@ fn daemon_end_child(child: DaemonChild, status: Int) ! IO {
 
 // Runs a build request with the next number for its files, and leaves a child it forked in
 // builds. Returns the reply to send, or in the child the build to run.
-fn daemon_start_build(builds: DaemonBuilds, request: Str, client_fd: Int) -> (DaemonBuilds, Option[Str], Option[DaemonBuild]) ! Daemon.Serve, IO, Lex.Tokenize, Parse, Parse.Build, TypeCheck, Diag.Report, Process.Spawn, Env.Write, FS.Read, FS.Write {
+fn daemon_start_build(builds: DaemonBuilds, request: Str, client_fd: Int) -> (DaemonBuilds, Option[Str], Option[DaemonBuild]) ! Daemon.Serve, IO, Lex.Tokenize, Parse, Parse.Build, TypeCheck, Diag.Report, Process.Spawn, Env.Write, FS.Read, FS.Write, FS.Delete, Env.Exit, Env.Read {
     let mut next = DaemonBuilds { seq: builds.seq + 1, ..builds }
     match daemon_handle_build(request, client_fd, next) {
         Reply(text) => (next, Some(text), None)
@@ -981,7 +981,7 @@ fn daemon_end_turn(builds: DaemonBuilds) -> DaemonBuilds {
 // The router gave the worker the turn: the oldest held build runs. A build the worker answers
 // at once does not hold the turn, so the next one runs, and the turn goes back once none is
 // left. Returns the build to run in a child forked for one.
-fn daemon_take_turn(builds: DaemonBuilds) -> (DaemonBuilds, Option[DaemonBuild]) ! Daemon.Serve, IO, Lex.Tokenize, Parse, Parse.Build, TypeCheck, Diag.Report, Process.Spawn, Env.Write, FS.Read, FS.Write {
+fn daemon_take_turn(builds: DaemonBuilds) -> (DaemonBuilds, Option[DaemonBuild]) ! Daemon.Serve, IO, Lex.Tokenize, Parse, Parse.Build, TypeCheck, Diag.Report, Process.Spawn, Env.Write, FS.Read, FS.Write, FS.Delete, Env.Exit, Env.Read {
     let mut b = DaemonBuilds { turn: 2, ..builds }
     while b.child.is_none() && b.queue.len() > 0 {
         let h = b.queue.get(0).unwrap()
@@ -1027,7 +1027,7 @@ fn daemon_after_child(builds: DaemonBuilds) -> DaemonBuilds {
 // client's spelling of it from the client's directory; it neither rechecks nor changes its
 // spelling for a query, since a cold query costs less than a check. The poll rechecks an
 // edited entry, which builds the index again.
-fn daemon_handle_query(request: Str) -> Str ! IO {
+fn daemon_handle_query(request: Str) -> Str ! IO, FS.Read {
     json_clear()
     let root = json_parse(request)
     let differs = daemon_client_differs(root)
@@ -1047,7 +1047,7 @@ fn daemon_handle_query(request: Str) -> Str ! IO {
     if q.cwd != cwd || q.path != path {
         return daemon_not_served("the daemon indexed {q.path} from {q.cwd}")
     }
-    if file_exists(path) != 1 || read_file(path) != q.text {
+    if !build_fs.path_exists(path) || build_fs.read_or_empty(path) != q.text {
         // An edit that moved no stat would leave the poll blind to it, and every query cold.
         daemon_last = Some(DaemonCheck { stats: [], ..c })
         return daemon_not_served("{path} changed since the daemon indexed it")
@@ -1095,20 +1095,20 @@ fn daemon_handle_stop() -> Str {
 // program costs a stat of each input and each probed path; only a moved stat or probe costs
 // a byte compare. A missed edit costs a recheck at the next request, never a stale answer:
 // a check or build compares bytes before it uses the last check.
-fn daemon_recheck_if_changed() ! IO, Lex.Tokenize, Parse, Parse.Build, TypeCheck, Diag.Report, FS.Read, FS.Write {
+fn daemon_recheck_if_changed() ! IO, Lex.Tokenize, Parse, Parse.Build, TypeCheck, Diag.Report, FS.Read, FS.Write, Env.Exit, Env.Read {
     // Dev knob: BLINK_DEV_DAEMON_IDLE_HOLD=<path> skips the poll while that file exists, so a
     // test that edits and then asks knows its request, not the poll, checks the edit, however
     // long the gap between them. Unset, it costs one getenv per idle wait.
     match env.var("BLINK_DEV_DAEMON_IDLE_HOLD") {
         Some(hold) => {
-            if file_exists(hold) == 1 {
+            if build_fs.path_exists(hold) {
                 return
             }
         }
         None => {}
     }
     // The loader exits on a missing entry file, which would take the daemon down with it.
-    if daemon_last.is_none() || file_exists(daemon_source_path) != 1 {
+    if daemon_last.is_none() || !build_fs.path_exists(daemon_source_path) {
         return
     }
     let mut c = daemon_last.unwrap()
@@ -1169,7 +1169,7 @@ fn daemon_accept_during_build(child: DaemonChild) -> (DaemonChild, Int) ! IO, En
 // (daemon_accept_during_build), reaps the child each time it wakes, and serves other requests
 // meanwhile; its build client waits for the one request being served then, past the child's
 // end.
-fn daemon_loop() -> Option[DaemonBuild] ! Daemon.Serve, IO, Lex.Tokenize, Parse, Parse.Build, TypeCheck, Diag.Report, Env.Read, Process.Spawn, Env.Write, FS.Read, FS.Write, Net.Listen {
+fn daemon_loop() -> Option[DaemonBuild] ! Daemon.Serve, IO, Lex.Tokenize, Parse, Parse.Build, TypeCheck, Diag.Report, Env.Read, Process.Spawn, Env.Write, FS.Read, FS.Write, Net.Listen, FS.Delete, Env.Exit {
     let mut builds = DaemonBuilds { child: None, queue: [], stops: [], seq: 0, turn: 0 }
     while daemon_running == 1 {
         // A worker whose router is gone serves no one, as no client finds its socket: it ends
@@ -1352,7 +1352,7 @@ fn daemon_entry_key(cwd: Str, path: Str) -> Str ! FS.Read {
 }
 
 // Sends request to the worker named name and returns its reply, or "" when none came.
-fn daemon_ask_worker(name: Str, request: Str) -> Str {
+fn daemon_ask_worker(name: Str, request: Str) -> Str ! Env.Read, FS.Read {
     let fd = unix_socket_connect(path_join(daemon_dir(), "{name}/daemon.sock"))
     if fd < 0 {
         return ""
@@ -1373,7 +1373,7 @@ fn daemon_ask_worker(name: Str, request: Str) -> Str {
 // worker, the router's own connections are closed. The worker's directory
 // is named for the router's pid too: a worker of a daemon killed before ends only once it sees
 // its router is gone, and then removes its directory, which must not be this daemon's.
-fn daemon_spawn(route: DaemonRoute, key: Str, cwd: Str, path: Str, home: Bool, client_fd: Int) -> (DaemonRoute, Option[DaemonSpawn], Str) ! IO, Process.Spawn, FS.Write, FS.Delete {
+fn daemon_spawn(route: DaemonRoute, key: Str, cwd: Str, path: Str, home: Bool, client_fd: Int) -> (DaemonRoute, Option[DaemonSpawn], Str) ! IO, Process.Spawn, FS.Write, FS.Delete, Env.Read, FS.Read {
     let mut r = route
     let router = getpid()
     let name = "w{router}-{r.next}"
@@ -1448,7 +1448,7 @@ fn daemon_redirect(name: Str) -> Str {
 // so the new one makes no more than max. A worker that builds, or holds builds, is passed
 // over: its clients wait on it. With none left to end, the router serves one entry more
 // than max until one is.
-fn daemon_make_room(route: DaemonRoute) -> DaemonRoute ! IO {
+fn daemon_make_room(route: DaemonRoute) -> DaemonRoute ! IO, Env.Read, FS.Read {
     let mut r = route
     let mut passed: List[Str] = []
     while r.entries.len() >= r.max {
@@ -1492,7 +1492,7 @@ fn daemon_make_room(route: DaemonRoute) -> DaemonRoute ! IO {
 // Sends a check, build or query to the worker of its entry, forked first for a check or build
 // if none serves it. A query never forks one: a worker's first check costs more than the cold
 // query the client runs when no worker serves the file.
-fn daemon_route_request(route: DaemonRoute, req_type: Str, request: Str, client_fd: Int) -> (DaemonRoute, RouteTurn) ! IO, Process.Spawn, FS.Read, FS.Write, FS.Delete {
+fn daemon_route_request(route: DaemonRoute, req_type: Str, request: Str, client_fd: Int) -> (DaemonRoute, RouteTurn) ! IO, Process.Spawn, FS.Read, FS.Write, FS.Delete, Env.Read {
     let mut r = route
     json_clear()
     let root = json_parse(request)
@@ -1531,7 +1531,7 @@ fn daemon_route_request(route: DaemonRoute, req_type: Str, request: Str, client_
         return (r, RouteTurn.Answer(daemon_not_served("no worker of the daemon checks {path}")))
     }
     // The loader exits on a missing entry file, which would end the worker on its first check.
-    if file_exists(key) != 1 {
+    if !build_fs.path_exists(key) {
         return (r, RouteTurn.Answer(daemon_not_served("source file not found: {path}")))
     }
     if !home {
@@ -1552,7 +1552,7 @@ fn daemon_route_request(route: DaemonRoute, req_type: Str, request: Str, client_
 // The daemon's status: the router's own fields, and the sum of its workers' counts, with the
 // symbols and files of the home worker's query index. entries counts the workers that
 // serve.
-fn daemon_route_status(r: DaemonRoute) -> Str {
+fn daemon_route_status(r: DaemonRoute) -> Str ! Env.Read, FS.Read {
     let uptime = time_ms() - daemon_start_time
     let mut symbols = 0
     let mut files = 0
@@ -1588,7 +1588,7 @@ fn daemon_route_status(r: DaemonRoute) -> Str {
 // Until then it holds the build turn if it held it: a build child of a dead worker may still
 // write the files the next build of its entry writes. A worker that ended waits for the turn
 // no more.
-fn daemon_reap_workers(route: DaemonRoute) -> DaemonRoute ! IO, Process.Spawn, Process.Signal, FS.Delete {
+fn daemon_reap_workers(route: DaemonRoute) -> DaemonRoute ! IO, Process.Spawn, Process.Signal, FS.Delete, Env.Read, FS.Read {
     let mut r = route
     let mut gone: List[Str] = []
     let mut ending: List[DaemonEntry] = []
@@ -1638,7 +1638,7 @@ fn daemon_group_gone(e: DaemonEntry) -> Bool ! IO, Process.Spawn, Process.Signal
     daemon_kill((0 - e.pid).to_i32(), 0.to_i32()).to_int() != 0 || time_ms() - e.killed >= 10000
 }
 
-fn daemon_forget_worker(e: DaemonEntry) ! IO, FS.Delete {
+fn daemon_forget_worker(e: DaemonEntry) ! IO, FS.Delete, Env.Read, FS.Read {
     if e.stop_fd >= 0 {
         unix_socket_close(e.stop_fd)
     }
@@ -1651,7 +1651,7 @@ fn daemon_forget_worker(e: DaemonEntry) ! IO, FS.Delete {
 // Gives the free build turn to the worker that asked first. A worker the grant does not reach
 // is gone, and the next one gets it. While a stop waits, no build starts, and once the turn
 // is free the stop goes to every worker.
-fn daemon_grant_turn(route: DaemonRoute) -> DaemonRoute {
+fn daemon_grant_turn(route: DaemonRoute) -> DaemonRoute ! Env.Read, FS.Read {
     let mut r = route
     if r.turn != "" {
         return r
@@ -1676,7 +1676,7 @@ fn daemon_grant_turn(route: DaemonRoute) -> DaemonRoute {
 
 // A line a worker sent on its connection to the router: it asks for the build turn, or gives
 // it back, with more 1 when it has more builds to run.
-fn daemon_route_turn(route: DaemonRoute, name: Str, line: Str) -> DaemonRoute {
+fn daemon_route_turn(route: DaemonRoute, name: Str, line: Str) -> DaemonRoute ! Env.Read, FS.Read {
     let mut r = route
     json_clear()
     let root = json_parse(line)
@@ -1697,7 +1697,7 @@ fn daemon_route_turn(route: DaemonRoute, name: Str, line: Str) -> DaemonRoute {
 // Reads what each worker sent on its connection to the router, as polled. A worker that closed
 // it is gone or going: the router ends its group, serves its entry from a new worker, and
 // frees what it held once its reap does.
-fn daemon_read_chans(route: DaemonRoute, ready: List[Int]) -> DaemonRoute ! Process.Signal {
+fn daemon_read_chans(route: DaemonRoute, ready: List[Int]) -> DaemonRoute ! Process.Signal, Env.Read, FS.Read {
     let mut r = route
     let mut names: List[Str] = []
     let mut lines: List[Str] = []
@@ -1743,7 +1743,7 @@ fn daemon_read_chans(route: DaemonRoute, ready: List[Int]) -> DaemonRoute ! Proc
 
 // Waits up to wait ms for a client or a line from a worker, reads the lines, and returns the
 // client's connection, or -1.
-fn daemon_route_wait(route: DaemonRoute, wait: Int) -> (DaemonRoute, Int) ! IO, Process.Signal, Env.Read, Net.Listen {
+fn daemon_route_wait(route: DaemonRoute, wait: Int) -> (DaemonRoute, Int) ! IO, Process.Signal, Env.Read, Net.Listen, FS.Read {
     let mut fds: List[Pollfd] = [Pollfd { fd: daemon_socket_fd.to_i32(), events: 1.to_i16(), revents: 0.to_i16() }]
     for e in route.entries {
         if e.chan >= 0 { fds.push(Pollfd { fd: e.chan.to_i32(), events: 1.to_i16(), revents: 0.to_i16() }) }
@@ -1772,7 +1772,7 @@ fn daemon_route_wait(route: DaemonRoute, wait: Int) -> (DaemonRoute, Int) ! IO, 
 
 // Holds the stop and sends it to the workers. The router replies to it once it has reaped
 // them all.
-fn daemon_route_stop(route: DaemonRoute, client_fd: Int) -> DaemonRoute {
+fn daemon_route_stop(route: DaemonRoute, client_fd: Int) -> DaemonRoute ! Env.Read, FS.Read {
     let mut r = route
     r.stops.push(client_fd)
     daemon_stop_workers(r)
@@ -1782,7 +1782,7 @@ fn daemon_route_stop(route: DaemonRoute, client_fd: Int) -> DaemonRoute {
 // child does. A worker sends the builds it holds to build cold as it stops, which must not
 // happen beside a build, so while one worker holds the build turn the stop goes to it alone,
 // and to the rest once it gives the turn back or ends.
-fn daemon_stop_workers(route: DaemonRoute) -> DaemonRoute {
+fn daemon_stop_workers(route: DaemonRoute) -> DaemonRoute ! Env.Read, FS.Read {
     let mut r = route
     let mut sent: List[DaemonEntry] = []
     for e in r.entries {
@@ -1868,7 +1868,7 @@ fn daemon_route(max: Int) -> Option[DaemonSpawn] ! IO, Process.Spawn, FS.Read, F
 
 // Serves the entry a worker was forked for until a stop, then removes its files and ends the
 // worker. In a child forked for a build it returns the build instead.
-fn daemon_serve(s: DaemonSpawn) -> Option[DaemonBuild] ! Daemon.Serve, IO, Lex.Tokenize, Parse, Parse.Build, TypeCheck, Diag.Report, Env.Write, Env.Read, Process.Spawn, FS.Read, FS.Write, Net.Listen, FS.Delete {
+fn daemon_serve(s: DaemonSpawn) -> Option[DaemonBuild] ! Daemon.Serve, IO, Lex.Tokenize, Parse, Parse.Build, TypeCheck, Diag.Report, Env.Write, Env.Read, Process.Spawn, FS.Read, FS.Write, Net.Listen, FS.Delete, Env.Exit {
     daemon_socket_fd = s.fd
     daemon_origin = DaemonOrigin { router: s.router, files: s.files, chan: s.chan, ..daemon_origin }
     // The router's files are the router's to remove.
@@ -1878,7 +1878,7 @@ fn daemon_serve(s: DaemonSpawn) -> Option[DaemonBuild] ! Daemon.Serve, IO, Lex.T
     // whose bytes did not change. Dev knob: BLINK_DEV_DAEMON_KEEP_SOURCES=0 loads each check
     // cold, to measure what the kept parses save.
     loader_keep_sources((env.var("BLINK_DEV_DAEMON_KEEP_SOURCES") ?? "") != "0")
-    if daemon_enter(s.cwd, s.path) && file_exists(daemon_source_path) == 1 {
+    if daemon_enter(s.cwd, s.path) && build_fs.path_exists(daemon_source_path) {
         daemon_last = Some(daemon_check_program())
     }
     daemon_running = 1
@@ -1896,7 +1896,7 @@ fn daemon_serve(s: DaemonSpawn) -> Option[DaemonBuild] ! Daemon.Serve, IO, Lex.T
 
 // ── Shutdown ────────────────────────────────────────────────────────
 
-fn daemon_stop() ! Daemon.Serve, FS.Delete, IO {
+fn daemon_stop() ! Daemon.Serve, FS.Delete, IO, FS.Read {
     if daemon_socket_fd >= 0 {
         unix_socket_close(daemon_socket_fd)
         daemon_socket_fd = -1
@@ -1919,10 +1919,10 @@ fn daemon_stop() ! Daemon.Serve, FS.Delete, IO {
 // the nearest directory at or above the cwd that holds blink.toml, else the cwd. Every daemon
 // subcommand and client asks this one function, so they agree on whether a daemon runs. The
 // path stays relative to the cwd, since bind refuses a socket path over 107 bytes.
-fn daemon_dir() -> Str {
+fn daemon_dir() -> Str ! Env.Read, FS.Read {
     let mut abs = env.cwd()
     let mut rel = ""
-    while file_exists(path_join(rel, "blink.toml")) != 1 {
+    while !build_fs.path_exists(path_join(rel, "blink.toml")) {
         let up = path_dirname(abs)
         if up == abs {
             return ".blink"
@@ -1933,7 +1933,7 @@ fn daemon_dir() -> Str {
     path_join(rel, ".blink")
 }
 
-pub fn daemon_socket_path() -> Str {
+pub fn daemon_socket_path() -> Str ! Env.Read, FS.Read {
     path_join(daemon_dir(), "daemon.sock")
 }
 
@@ -1942,7 +1942,7 @@ pub fn daemon_socket_path() -> Str {
 // worker that serves its entry, and the request goes there once. A socket another user
 // listens on, a worker that is gone by then, or a second redirect gives "", and the client
 // runs cold.
-pub fn daemon_send(fd: Int, request: Str) -> Str ! IO, Env.Read, Net.Connect {
+pub fn daemon_send(fd: Int, request: Str) -> Str ! IO, Env.Read, Net.Connect, FS.Read {
     let line = request.concat("\n")
     // A request carries the client's environment, so a socket another user listens on gets none.
     if !daemon_stream_peer_allowed(fd) || socket_write(fd, line) < 0 {
@@ -1986,7 +1986,7 @@ fn daemon_worker_of(reply: Str) -> Str {
 // instead, for the caller to run. identity names the compiler and the environment, and
 // settings what the front end reads, which a client must share for the daemon to build for it.
 // max_entries is how many entry files the daemon keeps checked at once, each in a worker.
-pub fn daemon_start(source: Str, identity: Str, settings: Str, interface_text: Bool, max_entries: Int) -> Option[DaemonBuild] ! Daemon.Serve, IO, Lex.Tokenize, Parse, Parse.Build, TypeCheck, Diag.Report, FS.Write, Process.Spawn, Env.Write, Env.Read, FS.Read, Process.Signal, Net.Listen, FS.Delete {
+pub fn daemon_start(source: Str, identity: Str, settings: Str, interface_text: Bool, max_entries: Int) -> Option[DaemonBuild] ! Daemon.Serve, IO, Lex.Tokenize, Parse, Parse.Build, TypeCheck, Diag.Report, FS.Write, Process.Spawn, Env.Write, Env.Read, FS.Read, Process.Signal, Net.Listen, FS.Delete, Env.Exit {
     daemon_source_path = source
     daemon_origin = DaemonOrigin { cwd: env.cwd(), identity: identity, settings: settings, interface_text: interface_text, builds: 0, queries: 0, checks: 0, reused: 0, router: 0, files: "", chan: -1 }
     daemon_start_time = time_ms()
@@ -2000,7 +2000,7 @@ pub fn daemon_start(source: Str, identity: Str, settings: Str, interface_text: B
     // Write PID file
     daemon_pid_path = path_join(blink_dir, "daemon.pid")
     let pid = getpid()
-    write_file(daemon_pid_path, "{pid}")
+    let _ = fs.write(daemon_pid_path, "{pid}")
 
     // Create Unix socket
     daemon_sock_path = daemon_socket_path()

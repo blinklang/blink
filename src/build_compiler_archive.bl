@@ -47,8 +47,8 @@ fn bail_on_diag() -> Int ! Diag.Report {
 
 fn std_archive_id() -> Str ! FS.Read {
     let p = path_join(resolve_archive_dir(), ".archive-id")
-    if file_exists(p) == 0 { return "" }
-    read_file(p)
+    if !build_fs.path_exists(p) { return "" }
+    build_fs.read_or_empty(p)
 }
 
 fn std_keys() -> Map[Str, Int] ! FS.Read {
@@ -65,7 +65,7 @@ fn is_std_key(key: Str) -> Bool ! FS.Read {
     false
 }
 
-pub fn build_compiler_archive(dir: Str, roots: List[Str]) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Codegen, IO, FS.Read, Process.Spawn, Env.Exit, FS.Delete, FS.Write {
+pub fn build_compiler_archive(dir: Str, roots: List[Str]) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Codegen, IO, FS.Read, Process.Spawn, Env.Exit, FS.Delete, FS.Write, Env.Read {
     let std_dir = resolve_archive_dir()
     let std_id = std_archive_id()
     if std_id == "" {
@@ -82,7 +82,7 @@ pub fn build_compiler_archive(dir: Str, roots: List[Str]) -> Int ! Lex.Tokenize,
     for m in cg_reg_effect_default_modules() { sb.write("import {m}\n") }
     sb.write("\nfn main() \{\}\n")
     let entry_bl = path_join(dir, "__archive_main.bl")
-    write_file(entry_bl, sb.to_str())
+    let _ = fs.write(entry_bl, sb.to_str())
 
     let program = compile_entry_to_program(entry_bl, 1, false)
     let _tc_err = check_types(program)
@@ -108,11 +108,11 @@ pub fn build_compiler_archive(dir: Str, roots: List[Str]) -> Int ! Lex.Tokenize,
     }
     for key in layer {
         let src = diag_module_files.get(key) ?? ""
-        if src == "" || file_exists(src) == 0 {
+        if src == "" || !build_fs.path_exists(src) {
             io.eprintln("error: no source file recorded for module {key}")
             return 1
         }
-        write_file(source_copy_path(dir, key), read_file(src))
+        let _ = fs.write(source_copy_path(dir, key), build_fs.read_or_empty(src))
     }
 
     // debug_mode 1: the corpus builds with --debug, and a release archive would drop the
@@ -123,13 +123,13 @@ pub fn build_compiler_archive(dir: Str, roots: List[Str]) -> Int ! Lex.Tokenize,
     let header = generate_archive_header(program, cfg)
     let hdr_rc = bail_on_diag()
     if hdr_rc != 0 { return hdr_rc }
-    write_file(path_join(dir, c_layer_archive_header_name()), header)
+    let _ = fs.write(path_join(dir, c_layer_archive_header_name()), header)
     let monolith_c = generate(program, cfg)
     let mono_rc = bail_on_diag()
     if mono_rc != 0 { return mono_rc }
     let c_path = path_join(dir, "monolith.c")
     let o_path = path_join(dir, "monolith.o")
-    write_file(c_path, monolith_c)
+    let _ = fs.write(c_path, monolith_c)
     let rc = run_cc("-c -ffunction-sections -fdata-sections -o {o_path} {c_path} -I{dir} -I{std_dir}", 1, 0, "")
     if rc != 0 {
         io.eprintln("error: cc failed building the compiler archive (rc={rc})")
@@ -140,16 +140,16 @@ pub fn build_compiler_archive(dir: Str, roots: List[Str]) -> Int ! Lex.Tokenize,
         io.eprintln("error: ar failed building the compiler archive (rc={ar_rc})")
         return ar_rc
     }
-    write_file(path_join(dir, "skip_modules.txt"), "{layer.join("\n")}\n")
-    write_file(path_join(dir, std_id_name()), std_id)
+    let _ = fs.write(path_join(dir, "skip_modules.txt"), "{layer.join("\n")}\n")
+    let _ = fs.write(path_join(dir, std_id_name()), std_id)
     0
 }
 
-fn read_layer_keys(dir: Str) -> List[Str] {
+fn read_layer_keys(dir: Str) -> List[Str] ! FS.Read {
     let mut out: List[Str] = []
     let p = path_join(dir, "skip_modules.txt")
-    if file_exists(p) == 0 { return out }
-    for k in read_file(p).split("\n") {
+    if !build_fs.path_exists(p) { return out }
+    for k in build_fs.read_or_empty(p).split("\n") {
         if k != "" { out.push(k) }
     }
     out
@@ -171,7 +171,7 @@ pub fn compiler_archive_skip_keys(dir: Str) -> List[Str] ! Diag.Report, FS.Read 
     for key in keys {
         let src = diag_module_files.get(key) ?? ""
         if src == "" { continue }
-        if read_file(src) == read_file(source_copy_path(dir, key)) {
+        if build_fs.read_or_empty(src) == build_fs.read_or_empty(source_copy_path(dir, key)) {
             held.push(key)
         } else {
             differs.push(key)
@@ -182,7 +182,7 @@ pub fn compiler_archive_skip_keys(dir: Str) -> List[Str] ! Diag.Report, FS.Read 
         io.eprintln("error: the compiler archive at {dir} is stale: {differs.join(", ")} changed since it was built; rebuild the compiler archive")
         env.exit(1)
     }
-    if read_file(path_join(dir, std_id_name())) != std_archive_id() {
+    if build_fs.read_or_empty(path_join(dir, std_id_name())) != std_archive_id() {
         io.eprintln("error: the compiler archive at {dir} was built against another stdlib archive than {resolve_archive_dir()}; rebuild the compiler archive")
         env.exit(1)
     }

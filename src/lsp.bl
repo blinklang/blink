@@ -12,6 +12,7 @@ import mutation_analysis.{ma_state_len}
 import check_pipeline.{check_source, checked_inputs_changed, checked_inputs_reset}
 import formatter.{Format, format}
 import parser.{node_count}
+import build_fs
 
 let mut lsp_running: Int = 0
 let mut lsp_initialized: Int = 0
@@ -124,7 +125,7 @@ fn lsp_publish_diagnostics(uri: Str) ! IO {
 }
 
 // The check `blink check` and the daemon run, so the editor shows what the build refuses.
-fn lsp_run_check(file_path: Str) ! IO, Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+fn lsp_run_check(file_path: Str) ! IO, Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Read, Env.Exit, Env.Read {
     let final_program = check_source(file_path)
     lsp_checked_diags = []
     for d in diag_entries {
@@ -134,7 +135,7 @@ fn lsp_run_check(file_path: Str) ! IO, Lex.Tokenize, Parse, Parse.Build, Diag.Re
     si_build(final_program, file_path, "main")
 }
 
-fn lsp_full_check(uri: Str, file_path: Str) ! IO, Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+fn lsp_full_check(uri: Str, file_path: Str) ! IO, Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Read, Env.Exit, Env.Read {
     io.eprintln("blink-lsp: full check {file_path}")
     lsp_run_check(file_path)
     lsp_initialized = 1
@@ -144,7 +145,7 @@ fn lsp_full_check(uri: Str, file_path: Str) ! IO, Lex.Tokenize, Parse, Parse.Bui
 
 // Mono and the mutation passes judge across functions, so a recheck runs on the whole
 // program; it is skipped only when no input the last check read has changed.
-fn lsp_incremental_check(uri: Str, file_path: Str) ! IO, Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+fn lsp_incremental_check(uri: Str, file_path: Str) ! IO, Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Read, Env.Exit, Env.Read {
     if !checked_inputs_changed(file_path) {
         io.eprintln("blink-lsp: incremental check: no input changed, republishing")
         lsp_publish_diagnostics(uri)
@@ -155,7 +156,7 @@ fn lsp_incremental_check(uri: Str, file_path: Str) ! IO, Lex.Tokenize, Parse, Pa
     lsp_publish_diagnostics(uri)
 }
 
-fn lsp_check_and_publish(uri: Str, file_path: Str) ! IO, Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+fn lsp_check_and_publish(uri: Str, file_path: Str) ! IO, Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Read, Env.Exit, Env.Read {
     if lsp_initialized == 0 {
         lsp_full_check(uri, file_path)
     } else {
@@ -179,7 +180,7 @@ fn lsp_extract_document_uri(root: Int) -> Str {
     json_as_str(uri_node)
 }
 
-fn lsp_handle_did_open_or_save(root: Int) ! IO, Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+fn lsp_handle_did_open_or_save(root: Int) ! IO, Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Read, Env.Exit, Env.Read {
     let uri = lsp_extract_document_uri(root)
     if uri == "" {
         return
@@ -309,7 +310,7 @@ let mut lsp_lookup_file: Str = ""
 let mut lsp_lookup_tok_idx: Int = -1
 let mut lsp_lookup_sym_idx: Int = -1
 
-fn lsp_resolve_symbol_at_cursor(root: Int) -> Int ! IO, Lex.Tokenize, Diag.Report {
+fn lsp_resolve_symbol_at_cursor(root: Int) -> Int ! IO, Lex.Tokenize, Diag.Report, FS.Read {
     lsp_lookup_uri = lsp_extract_document_uri(root)
     if lsp_lookup_uri == "" {
         return -1
@@ -321,7 +322,7 @@ fn lsp_resolve_symbol_at_cursor(root: Int) -> Int ! IO, Lex.Tokenize, Diag.Repor
         return -1
     }
     lsp_lookup_file = lsp_uri_to_path(lsp_lookup_uri)
-    let source = read_file(lsp_lookup_file)
+    let source = build_fs.read_or_empty(lsp_lookup_file)
     lex(source)
     let line = lsp_line + 1
     let col = lsp_col + 1
@@ -338,7 +339,7 @@ fn lsp_resolve_symbol_at_cursor(root: Int) -> Int ! IO, Lex.Tokenize, Diag.Repor
     lsp_lookup_sym_idx
 }
 
-fn lsp_handle_hover(id: Int, root: Int) ! IO, Lex.Tokenize, Diag.Report {
+fn lsp_handle_hover(id: Int, root: Int) ! IO, Lex.Tokenize, Diag.Report, FS.Read {
     let sym_idx = lsp_resolve_symbol_at_cursor(root)
     if sym_idx < 0 {
         lsp_send_response_int(id, "null")
@@ -356,7 +357,7 @@ fn lsp_handle_hover(id: Int, root: Int) ! IO, Lex.Tokenize, Diag.Report {
     lsp_send_response_int(id, result)
 }
 
-fn lsp_handle_definition(id: Int, root: Int) ! IO, Lex.Tokenize, Diag.Report {
+fn lsp_handle_definition(id: Int, root: Int) ! IO, Lex.Tokenize, Diag.Report, FS.Read {
     let sym_idx = lsp_resolve_symbol_at_cursor(root)
     if sym_idx < 0 {
         lsp_send_response_int(id, "null")
@@ -388,7 +389,7 @@ fn lsp_handle_definition(id: Int, root: Int) ! IO, Lex.Tokenize, Diag.Report {
     lsp_send_response_int(id, result)
 }
 
-fn lsp_handle_references(id: Int, root: Int) ! IO, Lex.Tokenize, Diag.Report {
+fn lsp_handle_references(id: Int, root: Int) ! IO, Lex.Tokenize, Diag.Report, FS.Read {
     let sym_idx = lsp_resolve_symbol_at_cursor(root)
     if sym_idx < 0 {
         lsp_send_response_int(id, "[]")
@@ -450,7 +451,7 @@ fn lsp_handle_references(id: Int, root: Int) ! IO, Lex.Tokenize, Diag.Report {
     lsp_send_response_int(id, sb.to_str())
 }
 
-fn lsp_handle_rename(id: Int, root: Int) ! IO, Lex.Tokenize, Diag.Report {
+fn lsp_handle_rename(id: Int, root: Int) ! IO, Lex.Tokenize, Diag.Report, FS.Read {
     let sym_idx = lsp_resolve_symbol_at_cursor(root)
     if sym_idx < 0 {
         lsp_send_error_int(id, -32602, "No symbol at cursor")
@@ -586,14 +587,14 @@ fn lsp_is_sym_in_file(sym_idx: Int) -> Int {
     0
 }
 
-fn lsp_handle_document_symbol(id: Int, root: Int) ! IO, Lex.Tokenize, Diag.Report {
+fn lsp_handle_document_symbol(id: Int, root: Int) ! IO, Lex.Tokenize, Diag.Report, FS.Read {
     let uri = lsp_extract_document_uri(root)
     if uri == "" {
         lsp_send_response_int(id, "[]")
         return
     }
     let path = lsp_uri_to_path(uri)
-    let source = read_file(path)
+    let source = build_fs.read_or_empty(path)
     lex(source)
     let syms = si_file_symbols(path)
     let mut sb = StringBuilder.new()
@@ -663,7 +664,7 @@ fn lsp_handle_workspace_symbol(id: Int, root: Int) ! IO {
     lsp_send_response_int(id, sb.to_str())
 }
 
-fn lsp_handle_formatting(id: Int, root: Int) ! IO, Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit {
+fn lsp_handle_formatting(id: Int, root: Int) ! IO, Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit, FS.Read, Env.Exit, Env.Read {
     let uri = lsp_extract_document_uri(root)
     if uri == "" {
         lsp_send_response_int(id, "[]")
@@ -674,9 +675,9 @@ fn lsp_handle_formatting(id: Int, root: Int) ! IO, Lex.Tokenize, Parse, Parse.Bu
     diag_set_abort_lsp("", None)
 }
 
-fn lsp_format_document(id: Int, uri: Str) ! IO, Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit {
+fn lsp_format_document(id: Int, uri: Str) ! IO, Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit, FS.Read, Env.Exit, Env.Read {
     let path = lsp_uri_to_path(uri)
-    let source = read_file(path)
+    let source = build_fs.read_or_empty(path)
     if source == "" {
         lsp_send_response_int(id, "[]")
         return
@@ -699,7 +700,7 @@ fn lsp_format_document(id: Int, uri: Str) ! IO, Lex.Tokenize, Parse, Parse.Build
     lsp_check_and_publish(uri, path)
 }
 
-fn lsp_handle_inlay_hint(id: Int, root: Int) ! IO, Lex.Tokenize, Diag.Report {
+fn lsp_handle_inlay_hint(id: Int, root: Int) ! IO, Lex.Tokenize, Diag.Report, FS.Read {
     let uri = lsp_extract_document_uri(root)
     if uri == "" || lsp_initialized == 0 {
         lsp_send_response_int(id, "[]")
@@ -721,7 +722,7 @@ fn lsp_handle_inlay_hint(id: Int, root: Int) ! IO, Lex.Tokenize, Diag.Report {
     }
 
     let file_path = lsp_uri_to_path(uri)
-    let source = read_file(file_path)
+    let source = build_fs.read_or_empty(file_path)
     lex(source)
 
     let mut sb = StringBuilder.new()
@@ -908,7 +909,7 @@ fn lsp_handle_member_items(source: Str, line: Int, col: Int, prefix: Str) -> Opt
     Some(items.join(","))
 }
 
-fn lsp_handle_completion(id: Int, root: Int) ! IO, Lex.Tokenize, Diag.Report {
+fn lsp_handle_completion(id: Int, root: Int) ! IO, Lex.Tokenize, Diag.Report, FS.Read {
     let uri = lsp_extract_document_uri(root)
     if uri == "" {
         lsp_send_response_int(id, "[]")
@@ -922,7 +923,7 @@ fn lsp_handle_completion(id: Int, root: Int) ! IO, Lex.Tokenize, Diag.Report {
         return
     }
     let file_path = lsp_uri_to_path(uri)
-    let source = read_file(file_path)
+    let source = build_fs.read_or_empty(file_path)
     lex(source)
     let line = lsp_line + 1
     let col = lsp_col + 1
@@ -1019,7 +1020,7 @@ fn lsp_find_enclosing_call(line: Int, col: Int) -> List[Int] {
     [-1, -1]
 }
 
-fn lsp_handle_signature_help(id: Int, root: Int) ! IO, Lex.Tokenize, Diag.Report {
+fn lsp_handle_signature_help(id: Int, root: Int) ! IO, Lex.Tokenize, Diag.Report, FS.Read {
     let uri = lsp_extract_document_uri(root)
     if uri == "" {
         lsp_send_response_int(id, "null")
@@ -1033,7 +1034,7 @@ fn lsp_handle_signature_help(id: Int, root: Int) ! IO, Lex.Tokenize, Diag.Report
         return
     }
     let file_path = lsp_uri_to_path(uri)
-    let source = read_file(file_path)
+    let source = build_fs.read_or_empty(file_path)
     lex(source)
     let line = lsp_line + 1
     let col = lsp_col + 1
@@ -1182,7 +1183,7 @@ fn lsp_handle_code_action(id: Int, root: Int) ! IO {
     lsp_send_response_int(id, sb.to_str())
 }
 
-fn lsp_dispatch(method: Str, id_int: Int, id_is_present: Int, root: Int) ! IO, Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit {
+fn lsp_dispatch(method: Str, id_int: Int, id_is_present: Int, root: Int) ! IO, Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit, FS.Read, Env.Exit, Env.Read {
     if method == "initialize" {
         let result = lsp_handle_initialize()
         if id_is_present != 0 {
@@ -1265,7 +1266,7 @@ fn lsp_log_memory_stats(method: Str) ! IO {
     io.eprintln("blink-lsp: mem [{method}] np={np} diag={diag} si={si} ma={ma}")
 }
 
-pub fn lsp_start() ! IO, Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit {
+pub fn lsp_start() ! IO, Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit, FS.Read, Env.Exit, Env.Read {
     lsp_running = 1
     io.eprintln("blink-lsp: starting")
     while lsp_running == 1 {

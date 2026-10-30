@@ -4,6 +4,7 @@
 // transitive deps and cycle detection. Uses pkg.manifest for loading.
 
 import std.path.{path_join}
+import std.fs.{FileKind, FsErrorExt}
 import pkg.manifest.{manifest_load, manifest_name, manifest_version, cap_required, manifest_dep_count, manifest_get_dep_name, dep_paths, manifest_get_dep_source}
 
 // ── Resolved path deps: parallel arrays ────────────────────────
@@ -68,20 +69,36 @@ fn compute_dir_hash(dir: Str) -> Str {
 
 // ── Resolve a single path dependency ───────────────────────────
 
-fn resolve_one(name: Str, rel_path: Str, base_dir: Str) -> Int {
+fn resolve_one(name: Str, rel_path: Str, base_dir: Str) -> Int ! FS.Read, IO {
     let full_path = path_join(base_dir, rel_path)
 
-    // Validate directory exists
-    if is_dir(full_path) == 0 {
-        io.eprintln("error: path dependency '{name}' directory not found: {full_path}")
-        return 1
+    match fs.stat(full_path) {
+        Ok(info) => {
+            if info.kind != FileKind.Dir {
+                io.eprintln("error: path dependency '{name}' directory not found: {full_path}")
+                return 1
+            }
+        }
+        Err(e) => {
+            if e.not_found() {
+                io.eprintln("error: path dependency '{name}' directory not found: {full_path}")
+            } else {
+                io.eprintln("error: path dependency '{name}': {e}")
+            }
+            return 1
+        }
     }
 
-    // Validate manifest exists
+    // Any other stat error falls through to manifest_load, which reports it.
     let manifest_path = path_join(full_path, "blink.toml")
-    if file_exists(manifest_path) == 0 {
-        io.eprintln("error: path dependency '{name}' missing manifest in: {full_path}")
-        return 1
+    match fs.stat(manifest_path) {
+        Ok(_) => {}
+        Err(e) => {
+            if e.not_found() {
+                io.eprintln("error: path dependency '{name}' missing manifest in: {full_path}")
+                return 1
+            }
+        }
     }
 
     // Cycle check: scan visit_stack up to stack_depth
@@ -163,7 +180,7 @@ fn resolve_one(name: Str, rel_path: Str, base_dir: Str) -> Int {
 
 // ── Main entry point ───────────────────────────────────────────
 
-pub fn resolve_path_deps(project_root: Str) -> Int {
+pub fn resolve_path_deps(project_root: Str) -> Int ! IO, FS.Read {
     let root_manifest = path_join(project_root, "blink.toml")
     let load_rc = manifest_load(root_manifest)
     if load_rc != 0 {

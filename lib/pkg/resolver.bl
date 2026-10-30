@@ -7,6 +7,7 @@
 import std.path.{path_join}
 import std.str.{str_trim_right}
 import std.list.{list_any}
+import std.fs.{FileKind, FsErrorExt}
 import pkg.manifest.{manifest_load, manifest_name, manifest_version, cap_required, manifest_dep_count, manifest_get_dep_name, dep_paths, dep_git_urls, dep_git_tags, manifest_get_dep_source}
 import pkg.lockfile.{lockfile_clear, lockfile_set_metadata, lockfile_add_pkg, lockfile_write}
 import pkg.gitdeps.{git_fetch, git_get_checkout_path, git_get_commit, git_get_content_hash}
@@ -96,7 +97,7 @@ fn canonicalize_path(p: Str) -> Str {
 // pkg_name/pkg_version copy manifest_load's results; nothing is saved or
 // restored, but the analyzer reads a `let local = global` copy as a save.
 @allow(IncompleteStateRestore)
-fn process_path_dep(name: Str, dep_path: Str, base_dir: Str) -> Int {
+fn process_path_dep(name: Str, dep_path: Str, base_dir: Str) -> Int ! FS.Read, IO, Process.Spawn {
     let full_path = path_join(base_dir, dep_path)
     let canon_path = canonicalize_path(full_path)
 
@@ -105,15 +106,33 @@ fn process_path_dep(name: Str, dep_path: Str, base_dir: Str) -> Int {
     }
     path_visited.push(canon_path)
 
-    if is_dir(full_path) == 0 {
-        io.eprintln("error: path dependency '{name}' not found: {full_path}")
-        return 1
+    match fs.stat(full_path) {
+        Ok(info) => {
+            if info.kind != FileKind.Dir {
+                io.eprintln("error: path dependency '{name}' not found: {full_path}")
+                return 1
+            }
+        }
+        Err(e) => {
+            if e.not_found() {
+                io.eprintln("error: path dependency '{name}' not found: {full_path}")
+            } else {
+                io.eprintln("error: path dependency '{name}': {e}")
+            }
+            return 1
+        }
     }
 
+    // Any other stat error falls through to manifest_load, which reports it.
     let manifest_path = path_join(full_path, "blink.toml")
-    if file_exists(manifest_path) == 0 {
-        io.eprintln("error: path dependency '{name}' missing manifest: {full_path}")
-        return 1
+    match fs.stat(manifest_path) {
+        Ok(_) => {}
+        Err(e) => {
+            if e.not_found() {
+                io.eprintln("error: path dependency '{name}' missing manifest: {full_path}")
+                return 1
+            }
+        }
     }
 
     let load_rc = manifest_load(manifest_path)
@@ -176,7 +195,7 @@ fn process_path_dep(name: Str, dep_path: Str, base_dir: Str) -> Int {
 // pkg_name/pkg_version copy manifest_load's results; nothing is saved or
 // restored, but the analyzer reads a `let local = global` copy as a save.
 @allow(IncompleteStateRestore)
-fn process_git_dep(name: Str, url: Str, tag: Str) -> Int {
+fn process_git_dep(name: Str, url: Str, tag: Str) -> Int ! IO, FS.Read, Process.Spawn {
     let mut effective_tag = tag
     if effective_tag == "" {
         effective_tag = "HEAD"
@@ -199,9 +218,14 @@ fn process_git_dep(name: Str, url: Str, tag: Str) -> Int {
     let content_hash = git_get_content_hash()
 
     let manifest_path = path_join(checkout_path, "blink.toml")
-    if file_exists(manifest_path) == 0 {
-        io.eprintln("error: git dependency '{name}' missing manifest")
-        return 1
+    match fs.stat(manifest_path) {
+        Ok(_) => {}
+        Err(e) => {
+            if e.not_found() {
+                io.eprintln("error: git dependency '{name}' missing manifest")
+                return 1
+            }
+        }
     }
 
     let load_rc = manifest_load(manifest_path)
@@ -260,7 +284,7 @@ fn process_git_dep(name: Str, url: Str, tag: Str) -> Int {
 
 // ── Main resolver entry point ───────────────────────────────────
 
-pub fn resolve(project_root: Str) -> Int {
+pub fn resolve(project_root: Str) -> Int ! IO, FS.Read, Process.Spawn {
     let root_manifest = path_join(project_root, "blink.toml")
     let load_rc = manifest_load(root_manifest)
     if load_rc != 0 {
@@ -308,7 +332,7 @@ pub fn resolve(project_root: Str) -> Int {
 
 // ── Resolve + write lockfile ────────────────────────────────────
 
-pub fn resolve_and_lock(project_root: Str, blink_version: Str) -> Int {
+pub fn resolve_and_lock(project_root: Str, blink_version: Str) -> Int ! Time, FS.Read, IO, FS.Write, Process.Spawn {
     resolver_clear()
     let rc = resolve(project_root)
     if rc != 0 {

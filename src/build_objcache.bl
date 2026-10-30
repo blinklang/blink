@@ -21,6 +21,7 @@
 // key both compile and both rename — content is byte-identical.
 
 import build_fs
+import std.fs.{FileKind}
 import std.path.{path_basename, path_dirname}
 import sha256.{sha256_hex, sha256_file_hex}
 import std_cache_key.{sha256_of_manifest, sha256_of_file_first, sorted_strs, cc_identity}
@@ -47,7 +48,7 @@ fn cache_size_cap_mb() -> Int {
     v.to_int()
 }
 
-pub fn ensure_dir() ! IO, FS.Write {
+pub fn ensure_dir() ! IO, FS.Write, FS.Read {
     let _ = build_fs.mkdir_p("{obj_cache_dir()}/tmp")
 }
 
@@ -217,23 +218,30 @@ fn files_under(root: Str, rel: Str, ancestors: List[Str], skip: List[Str]) -> Op
     let mut chain: List[Str] = []
     for a in ancestors { chain.push(a) }
     chain.push(real)
-    let names = list_dir(dir)
-    if fs.errno() != 0 {
-        return None
+    let names = match fs.list_dir(dir) {
+        Ok(n) => n
+        Err(_) => return None
     }
     let mut out: List[Str] = []
     for name in names {
         if name.starts_with(".") || skip.contains("{without_trailing_slash(real)}/{name}") { continue }
         let sub = if rel == "" { name } else { "{rel}/{name}" }
-        if is_dir("{root}/{sub}") == 1 {
-            match files_under(root, sub, chain, skip) {
-                Some(inner) => {
-                    for f in inner { out.push(f) }
+        match fs.stat("{root}/{sub}") {
+            Ok(info) => {
+                if info.kind == FileKind.Dir {
+                    match files_under(root, sub, chain, skip) {
+                        Some(inner) => {
+                            for f in inner { out.push(f) }
+                        }
+                        None => return None
+                    }
+                } else {
+                    out.push(sub)
                 }
-                None => return None
             }
-        } else if file_exists("{root}/{sub}") == 1 {
-            out.push(sub)
+            // A name that resolves to no file, as a dangling link or a pair of links that
+            // name each other, is no file cc can read either.
+            Err(_) => {}
         }
     }
     Some(out)
@@ -382,7 +390,7 @@ pub fn user_unit_key_with_headers(
     }
     let mut headers = ["libblink_std.h={archive_header_sha}"]
     let pch = "{arc_dir}/libblink_std.h.gch"
-    if file_exists(pch) == 1 {
+    if build_fs.path_exists(pch) {
         let pch_sha = sha256_of_file_first(pch)
         if pch_sha == "" {
             return ""
@@ -450,23 +458,23 @@ pub fn unit_file_shas(dir: Str, arc_dir: Str) -> Option[Map[Str, Str]] ! IO, FS.
 
 // unit_file_shas, and the sha of each file in dir that extra names, by that name.
 pub fn unit_file_shas_with(dir: Str, arc_dir: Str, extra: List[Str]) -> Option[Map[Str, Str]] ! IO, FS.Read {
-    if is_dir(dir) != 1 {
+    if !build_fs.path_is_dir(dir) {
         return None
     }
     let mut paths: List[Str] = []
     for f in ["{arc_dir}/runtime.h", "{arc_dir}/libblink_std.h", "{arc_dir}/libblink_std.h.gch"] {
-        if file_exists(f) == 1 { paths.push(f) }
+        if build_fs.path_exists(f) { paths.push(f) }
     }
     let arc_count = paths.len()
     let mut names: List[Str] = []
-    for name in list_dir(dir) {
+    for name in build_fs.list_or_empty(dir) {
         // What the glob *.h *.c names: no dotfile.
         if name.starts_with(".") || !(name.ends_with(".h") || name.ends_with(".c")) { continue }
         names.push(name)
     }
     for name in extra { names.push(name) }
     for name in names {
-        if file_exists("{dir}/{name}") == 1 { paths.push("{dir}/{name}") }
+        if build_fs.path_exists("{dir}/{name}") { paths.push("{dir}/{name}") }
     }
     let shas = hash_files(paths)
     let mut m: Map[Str, Str] = Map()
@@ -489,7 +497,7 @@ pub fn unit_file_shas_with(dir: Str, arc_dir: Str, extra: List[Str]) -> Option[M
 // is absent.
 pub fn file_shas(dir: Str, names: List[Str]) -> Map[Str, Str] ! IO, FS.Read {
     let mut m: Map[Str, Str] = Map()
-    if is_dir(dir) != 1 {
+    if !build_fs.path_is_dir(dir) {
         return m
     }
     let mut paths: List[Str] = []
@@ -535,7 +543,7 @@ pub fn unit_keys_with_headers(
     flags: List[Str],
     target: Str,
     recorded_paths: List[Str],
-) -> Map[Str, Str] ! IO {
+) -> Map[Str, Str] ! IO, FS.Read {
     let mut keys: Map[Str, Str] = Map()
     if blinkc_sha == "" || cc_id == "" || modules.len() == 0 {
         return keys
@@ -549,7 +557,7 @@ pub fn unit_keys_with_headers(
         return keys
     }
     let mut headers = ["libblink_std.h={archive_sha}"]
-    if file_exists(pch) == 1 {
+    if build_fs.path_exists(pch) {
         let pch_sha = shas.get(pch) ?? ""
         if pch_sha == "" {
             return keys
@@ -661,7 +669,7 @@ pub fn lookup_obj(key: Str) -> Str ! IO, FS.Read, FS.Write {
     }
     let dir = obj_cache_dir()
     let obj = "{dir}/{key}.o"
-    if file_exists(obj) == 0 {
+    if !build_fs.path_exists(obj) {
         return ""
     }
     let _ = build_fs.touch("{dir}/{key}.meta")
@@ -680,7 +688,7 @@ pub fn lookup_objs(keys: List[Str]) -> List[Str] ! IO, FS.Read, FS.Write {
     let dir = obj_cache_dir()
     for key in keys {
         let obj = "{dir}/{key}.o"
-        if key == "" || file_exists(obj) == 0 {
+        if key == "" || !build_fs.path_exists(obj) {
             out.push("")
             continue
         }
@@ -729,7 +737,7 @@ pub fn hold_objs(keys: List[Str], hold: Str, dirs: List[Str]) -> List[Str] ! IO,
             continue
         }
         if !hold_file("{dir}/{key}.o", held) {
-            if file_exists("{dir}/{key}.reads") == 1 {
+            if build_fs.path_exists("{dir}/{key}.reads") {
                 read_keys.push(out.len())
             }
             out.push("")
@@ -843,10 +851,10 @@ pub fn read_scope(dirs: List[Str], skip: List[Str], own: List[Str], arc_dir: Str
 // and each once. None when the depfile cannot be read or a file it names can no longer be
 // hashed: the object must not be stored, since a hit could not check that file.
 pub fn compile_reads(depfile: Str, scope: ReadScope) -> Option[List[Str]] ! IO, FS.Read {
-    if file_exists(depfile) == 0 {
+    if !build_fs.path_exists(depfile) {
         return None
     }
-    let named = match depfile_paths(read_file(depfile)) {
+    let named = match depfile_paths(build_fs.read_or_empty(depfile)) {
         Some(p) => p
         None => return None
     }
@@ -869,7 +877,7 @@ pub fn compile_reads(depfile: Str, scope: ReadScope) -> Option[List[Str]] ! IO, 
         }
         // Checked after the hash: a write cc saw but the hash missed has an mtime at or past
         // the start, and a write after this check changes the hash the next hit compares.
-        let mt = file_mtime(p)
+        let mt = build_fs.mtime_ms(p)
         if mt < 0 || mt >= scope.since_ms - READ_MTIME_SLACK_MS {
             return None
         }
@@ -967,9 +975,9 @@ pub fn reads_key(key: Str, lines: List[Str]) -> Str {
 }
 
 // The lines of a .reads file; none when it cannot be read.
-fn read_lines_file(path: Str) -> List[Str] ! IO {
+fn read_lines_file(path: Str) -> List[Str] ! IO, FS.Read {
     let mut out: List[Str] = []
-    for line in read_file(path).split("\n") {
+    for line in build_fs.read_or_empty(path).split("\n") {
         if line != "" {
             out.push(line)
         }
@@ -1067,7 +1075,7 @@ fn unique_strs(xs: List[Str]) -> List[Str] {
 // line. Its lines when it may (none without a reads file); None when it may not.
 pub fn held_pch_reads(hold: Str, dirs: List[Str]) -> Option[List[Str]] ! IO, FS.Read {
     let path = "{hold}/{PCH_READS}"
-    if file_exists(path) == 0 {
+    if !build_fs.path_exists(path) {
         return Some([])
     }
     let lines = read_lines_file(path)
@@ -1139,13 +1147,13 @@ fn install_reads(dir: Str, stage: Str, key: Str, obj_path: Str, meta: Str, reads
         return false
     }
     let staging = "{stage}/{key}.reads"
-    write_file(staging, "{lines.join("\n")}\n")
+    let _ = fs.write(staging, "{lines.join("\n")}\n")
     if !build_fs.rename(staging, "{dir}/{key}.reads") {
-        fs_remove(staging)
+        let _ = fs.delete(staging)
         return false
     }
     // The LRU entry of the lines: the GC removes them with it.
-    write_file("{dir}/{key}.meta", meta)
+    let _ = fs.write("{dir}/{key}.meta", meta)
     true
 }
 
@@ -1157,10 +1165,10 @@ fn install_at(dir: Str, stage: Str, key: Str, obj_path: Str, meta: Str) -> Bool 
     }
     let staging = "{stage}/{key}.o"
     if hold_file(obj_path, staging) && build_fs.rename(staging, "{dir}/{key}.o") {
-        write_file("{dir}/{key}.meta", meta)
+        let _ = fs.write("{dir}/{key}.meta", meta)
         return true
     }
-    fs_remove(staging)
+    let _ = fs.delete(staging)
     false
 }
 
@@ -1169,7 +1177,7 @@ fn install_at(dir: Str, stage: Str, key: Str, obj_path: Str, meta: Str) -> Bool 
 // obj at obj_tmp_path; we rename it (so the temp path is consumed).
 // Returns true iff a new entry was installed (signal for maybe_gc); on
 // false the caller must not link <key>.o.
-pub fn store(key: Str, obj_tmp_path: Str, module_key: Str, src_sha: Str) -> Bool ! IO, FS.Write, Env.Exit, Process.Spawn {
+pub fn store(key: Str, obj_tmp_path: Str, module_key: Str, src_sha: Str) -> Bool ! IO, FS.Write, Env.Exit, Process.Spawn, FS.Read {
     if !cache_enabled() {
         return false
     }
@@ -1180,7 +1188,7 @@ pub fn store(key: Str, obj_tmp_path: Str, module_key: Str, src_sha: Str) -> Bool
     }
     let now = time.read().to_unix_secs()
     let meta_path = "{dir}/{key}.meta"
-    write_file(meta_path, "{now} {module_key} {src_sha}\n")
+    let _ = fs.write(meta_path, "{now} {module_key} {src_sha}\n")
     true
 }
 
@@ -1191,7 +1199,7 @@ fn move_obj(from: Str, to: Str) -> Bool ! IO, FS.Write, Env.Exit, Process.Spawn 
 
 // store for each (key, obj_tmp_path, module_key), in order. The answer for each entry is what
 // store would answer for it.
-pub fn store_objs(keys: List[Str], obj_tmp_paths: List[Str], module_keys: List[Str]) -> List[Bool] ! IO, FS.Write, Env.Exit, Process.Spawn {
+pub fn store_objs(keys: List[Str], obj_tmp_paths: List[Str], module_keys: List[Str]) -> List[Bool] ! IO, FS.Write, Env.Exit, Process.Spawn, FS.Read {
     let mut out: List[Bool] = []
     for _k in keys {
         out.push(false)
@@ -1205,7 +1213,7 @@ pub fn store_objs(keys: List[Str], obj_tmp_paths: List[Str], module_keys: List[S
     let mut i = 0
     while i < keys.len() {
         if move_obj(obj_tmp_paths.get(i).unwrap(), "{dir}/{keys.get(i).unwrap()}.o") {
-            write_file("{dir}/{keys.get(i).unwrap()}.meta", "{now} {module_keys.get(i).unwrap()} \n")
+            let _ = fs.write("{dir}/{keys.get(i).unwrap()}.meta", "{now} {module_keys.get(i).unwrap()} \n")
             out.set(i, true)
         }
         i = i + 1
@@ -1266,7 +1274,7 @@ pub fn lookup_pch_file(key: Str, name: Str) -> Str ! IO, FS.Read, FS.Write {
         return ""
     }
     let dir = pch_dir(key)
-    if file_exists("{dir}/{name}") == 0 {
+    if !build_fs.path_exists("{dir}/{name}") {
         return ""
     }
     let _ = build_fs.touch("{obj_cache_dir()}/{key}.meta")
@@ -1304,7 +1312,7 @@ pub fn stage_pch(arc_dir: Str, archive_sha: Str, runtime_sha: Str) -> Str ! IO, 
     }
     for pair in [("libblink_std.h", archive_sha), ("runtime.h", runtime_sha)] {
         let (name, sha) = pair
-        write_file("{dir}/{name}", read_file("{arc_dir}/{name}"))
+        let _ = fs.write("{dir}/{name}", build_fs.read_or_empty("{arc_dir}/{name}"))
         if (sha256_file_hex("{dir}/{name}") ?? "") != sha {
             let _ = build_fs.remove_tree(dir)
             return ""
@@ -1322,12 +1330,12 @@ pub fn pch_headers_unchanged(arc_dir: Str, archive_sha: Str, runtime_sha: Str) -
 
 // Installs the staged dir as the PCH for key. False when another build installed it first, or
 // the rename failed; the staged dir is gone either way.
-pub fn store_pch(key: Str, staged: Str) -> Bool ! IO, FS.Write, FS.Delete {
+pub fn store_pch(key: Str, staged: Str) -> Bool ! IO, FS.Write, FS.Delete, FS.Read {
     let dir = pch_dir(key)
     // Under its key the dir is no longer one a reaper may take.
     build_fs.unmark(staged)
     if build_fs.rename(staged, dir) {
-        write_file("{obj_cache_dir()}/{key}.meta", "{time.read().to_unix_secs()} pch \n")
+        let _ = fs.write("{obj_cache_dir()}/{key}.meta", "{time.read().to_unix_secs()} pch \n")
         return true
     }
     let _ = build_fs.remove_tree(staged)
@@ -1335,9 +1343,9 @@ pub fn store_pch(key: Str, staged: Str) -> Bool ! IO, FS.Write, FS.Delete {
 }
 
 // Drops the PCH for key, as when a unit that read it failed and compiled without it.
-pub fn drop_pch(key: Str) ! IO, FS.Delete {
+pub fn drop_pch(key: Str) ! IO, FS.Delete, FS.Read {
     let _ = build_fs.remove_tree(pch_dir(key))
-    fs_remove("{obj_cache_dir()}/{key}.meta")
+    let _ = fs.delete("{obj_cache_dir()}/{key}.meta")
 }
 
 // The apparent bytes of the files under dir. du would count the blocks they take, which can
@@ -1352,7 +1360,7 @@ fn cache_total_bytes(dir: Str) -> Int ! IO, FS.Read {
 let CACHE_WALK_DEPTH: Int = 4
 
 fn tree_bytes(path: Str, depth: Int) -> Int ! IO, FS.Read {
-    if is_dir(path) != 1 {
+    if !build_fs.path_is_dir(path) {
         let n = build_fs.file_size(path)
         return if n < 0 { 0 } else { n }
     }
@@ -1360,14 +1368,14 @@ fn tree_bytes(path: Str, depth: Int) -> Int ! IO, FS.Read {
         return 0
     }
     let mut total = 0
-    for name in list_dir(path) {
+    for name in build_fs.list_or_empty(path) {
         total = total + tree_bytes("{path}/{name}", depth + 1)
     }
     total
 }
 
-fn cache_entry_count(dir: Str) -> Int {
-    if file_exists(dir) == 0 {
+fn cache_entry_count(dir: Str) -> Int ! Process.Spawn, FS.Read {
+    if !build_fs.path_exists(dir) {
         return 0
     }
     // Only count 16-hex-named .o files — those are real cache entries.
@@ -1410,10 +1418,10 @@ pub fn maybe_gc() ! IO, FS.Read, FS.Delete {
             let pch_path = meta_path.replace(".meta", ".pch")
             let reads_path = meta_path.replace(".meta", ".reads")
             let freed = tree_bytes(obj_path, 0) + tree_bytes(meta_path, 0) + tree_bytes(pch_path, 0) + tree_bytes(reads_path, 0)
-            fs_remove(obj_path)
-            fs_remove(reads_path)
+            let _ = fs.delete(obj_path)
+            let _ = fs.delete(reads_path)
             let _ = build_fs.remove_tree(pch_path)
-            fs_remove(meta_path)
+            let _ = fs.delete(meta_path)
             total = total - freed
         }
         idx = idx + 1
@@ -1424,7 +1432,7 @@ pub fn maybe_gc() ! IO, FS.Read, FS.Delete {
 // when the build reaches point ("compile": after its lookups, before its units compile;
 // "link": before its link). It stands in for another build's GC at that moment, so a test
 // can make that race happen every time. Answers whether it emptied the cache.
-pub fn dev_evict_at(point: Str) -> Bool ! IO, FS.Delete {
+pub fn dev_evict_at(point: Str) -> Bool ! IO, FS.Delete, FS.Read {
     if !cache_enabled() || (env.var("BLINK_DEV_OBJCACHE_EVICT") ?? "") != point {
         return false
     }
@@ -1432,7 +1440,7 @@ pub fn dev_evict_at(point: Str) -> Bool ! IO, FS.Delete {
     true
 }
 
-pub fn cmd_info() -> Int ! IO, FS.Read {
+pub fn cmd_info() -> Int ! IO, FS.Read, Process.Spawn {
     let dir = obj_cache_dir()
     let count = cache_entry_count(dir)
     let total_kb = cache_total_bytes(dir) / 1024
@@ -1445,14 +1453,14 @@ pub fn cmd_info() -> Int ! IO, FS.Read {
     0
 }
 
-pub fn cmd_clean(older_than: Str) -> Int ! FS.Delete, IO {
+pub fn cmd_clean(older_than: Str) -> Int ! FS.Delete, IO, FS.Read {
     let dir = obj_cache_dir()
-    if file_exists(dir) == 0 {
+    if !build_fs.path_exists(dir) {
         return 0
     }
     if older_than == "" {
         let mut failed = false
-        for name in list_dir(dir) {
+        for name in build_fs.list_or_empty(dir) {
             // sh globs skip a name that starts with a dot.
             if name.starts_with(".") { continue }
             if name.ends_with(".o") || name.ends_with(".pch") || name.ends_with(".reads") || name.ends_with(".meta") {
@@ -1515,7 +1523,7 @@ pub fn cmd_internal_lookup(key: Str) -> Int ! IO, FS.Read, FS.Write {
 }
 
 pub fn cmd_internal_store(key: Str, src_obj: Str, module_key: Str, src_sha: Str) -> Int ! IO, FS.Read, FS.Write, FS.Delete, Env.Exit, Process.Spawn {
-    if file_exists(src_obj) == 0 {
+    if !build_fs.path_exists(src_obj) {
         io.eprintln("error: source obj does not exist: {src_obj}")
         return 1
     }

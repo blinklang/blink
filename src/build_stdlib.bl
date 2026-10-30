@@ -27,21 +27,21 @@ pub fn resolve_runtime_h() -> Str ! FS.Read {
     let blink_root = env.var("BLINK_ROOT") ?? ""
     if blink_root != "" {
         let p_build = path_join(blink_root, "build/runtime.h")
-        if file_exists(p_build) == 1 { return p_build }
+        if build_fs.path_exists(p_build) { return p_build }
         let p_boot = path_join(blink_root, "bootstrap/runtime.h")
-        if file_exists(p_boot) == 1 { return p_boot }
+        if build_fs.path_exists(p_boot) { return p_boot }
     }
     let install_root = resolve_install_root()
     if install_root != "" {
         // A dev tree's own build/ first, chosen as resolve_archive_dir chooses it: an
         // archive rebuilt there must not take the runtime.h of the directory blink runs in.
         let p_dev = path_join(install_root, "build/runtime.h")
-        if file_exists(path_join(install_root, "build/libblink_std.a")) == 1 && file_exists(p_dev) == 1 { return p_dev }
+        if build_fs.path_exists(path_join(install_root, "build/libblink_std.a")) && build_fs.path_exists(p_dev) { return p_dev }
         let p_install = path_join(install_root, "share/blink/runtime.h")
-        if file_exists(p_install) == 1 { return p_install }
+        if build_fs.path_exists(p_install) { return p_install }
     }
-    if file_exists("build/runtime.h") == 1 { return "build/runtime.h" }
-    if file_exists("bootstrap/runtime.h") == 1 { return "bootstrap/runtime.h" }
+    if build_fs.path_exists("build/runtime.h") { return "build/runtime.h" }
+    if build_fs.path_exists("bootstrap/runtime.h") { return "bootstrap/runtime.h" }
     ""
 }
 
@@ -49,11 +49,11 @@ fn resolve_stdlib_dir() -> Str ! FS.Read {
     let root = resolve_install_root()
     if root != "" {
         let candidate = path_join(root, "lib/std")
-        if file_exists(candidate) == 1 {
+        if build_fs.path_exists(candidate) {
             return candidate
         }
     }
-    if file_exists("lib/std") == 1 {
+    if build_fs.path_exists("lib/std") {
         return "lib/std"
     }
     ""
@@ -63,7 +63,7 @@ pub fn list_stdlib_modules() -> List[Str] ! FS.Read {
     let std_dir = resolve_stdlib_dir()
     let mut out: List[Str] = []
     if std_dir != "" {
-        let entries = list_dir(std_dir)
+        let entries = build_fs.list_or_empty(std_dir)
         let mut i = 0
         while i < entries.len() {
             let entry = entries.get(i).unwrap()
@@ -183,7 +183,7 @@ fn relink_archive(build_dir: Str, cache_dir_rel: Str) ! Env.Exit, IO, Process.Sp
     let _ = build_fs.run_shell(cmd.to_str())
 }
 
-fn write_skip_modules_file(path: Str, keys: List[Str]) {
+fn write_skip_modules_file(path: Str, keys: List[Str]) ! FS.Write {
     let mut sb = StringBuilder.new()
     let mut i = 0
     while i < keys.len() {
@@ -191,7 +191,7 @@ fn write_skip_modules_file(path: Str, keys: List[Str]) {
         sb.write("\n")
         i = i + 1
     }
-    write_file(path, sb.to_str())
+    let _ = fs.write(path, sb.to_str())
 }
 
 fn bail_on_diag() -> Int ! Diag.Report {
@@ -210,13 +210,13 @@ pub fn stdlib_rebuild_forced() -> Bool {
     (env.var("BLINK_FORCE_STDLIB_REBUILD") ?? "") != ""
 }
 
-pub fn build_stdlib_archive(peeled: List[Str]) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Codegen, IO, FS.Read, FS.Write, Process.Spawn, FS.Delete, Env.Exit {
+pub fn build_stdlib_archive(peeled: List[Str]) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Codegen, IO, FS.Read, FS.Write, Process.Spawn, FS.Delete, Env.Exit, Env.Read {
     build_stdlib_archive_in("build", peeled, stdlib_rebuild_forced())
 }
 
 // Builds the archive under build_dir/std-cache/<key> unless that entry exists, and
 // points build_dir's archive links at it.
-pub fn build_stdlib_archive_in(build_dir: Str, peeled: List[Str], force_rebuild: Bool) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Codegen, IO, FS.Read, FS.Write, Process.Spawn, FS.Delete, Env.Exit {
+pub fn build_stdlib_archive_in(build_dir: Str, peeled: List[Str], force_rebuild: Bool) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Codegen, IO, FS.Read, FS.Write, Process.Spawn, FS.Delete, Env.Exit, Env.Read {
     let compiler = archive_compiler_path()
     if compiler == "" {
         io.eprintln("error: cannot locate the running compiler binary, which the stdlib-archive cache key must hash")
@@ -249,10 +249,10 @@ pub fn build_stdlib_archive_in(build_dir: Str, peeled: List[Str], force_rebuild:
         return 1
     }
     let final_dir = "{build_dir}/std-cache/{hash}"
-    if file_exists("{final_dir}/.stamp") == 1 && !force_rebuild {
+    if build_fs.path_exists("{final_dir}/.stamp") && !force_rebuild {
         // Backfill the identity stamp for caches built before .archive-id
         // existed, so relink_archive's symlink never dangles.
-        if file_exists("{final_dir}/.archive-id") == 0 {
+        if !build_fs.path_exists("{final_dir}/.archive-id") {
             write_archive_id("{final_dir}/.archive-id", rt_path_final, "{final_dir}/libblink_std.h", "{final_dir}/monolith.c")
         }
         relink_archive(build_dir, "std-cache/{hash}")
@@ -270,7 +270,7 @@ pub fn build_stdlib_archive_in(build_dir: Str, peeled: List[Str], force_rebuild:
     }
 
     let entry_bl = "{cache_dir}/__archive_main.bl"
-    write_file(entry_bl, synthesize_entry_source(modules))
+    let _ = fs.write(entry_bl, synthesize_entry_source(modules))
     let program = compile_entry_to_program(entry_bl, 1, false)
     let _tc_err = check_types(program)
     check_unused_imports()
@@ -287,8 +287,8 @@ pub fn build_stdlib_archive_in(build_dir: Str, peeled: List[Str], force_rebuild:
     let header = generate_archive_header(program, hdr_cfg)
     let hdr_rc = bail_on_diag()
     if hdr_rc != 0 { return hdr_rc }
-    write_file("{cache_dir}/libblink_std.h", header)
-    write_file("{cache_dir}/runtime.h", read_file(rt_path_final))
+    let _ = fs.write("{cache_dir}/libblink_std.h", header)
+    let _ = fs.write("{cache_dir}/runtime.h", build_fs.read_or_empty(rt_path_final))
 
     let mono_cfg = CgConfig { debug_mode: 0, trace_codegen: 0, deterministic: 0,
         emit_only_module: "", skip_modules: Map(), user_tu_mode: 0,
@@ -296,7 +296,7 @@ pub fn build_stdlib_archive_in(build_dir: Str, peeled: List[Str], force_rebuild:
     let monolith_c = generate(program, mono_cfg)
     let mono_rc = bail_on_diag()
     if mono_rc != 0 { return mono_rc }
-    write_file("{cache_dir}/monolith.c", monolith_c)
+    let _ = fs.write("{cache_dir}/monolith.c", monolith_c)
     // Peeled modules (e.g. std/db_sqlite) are excluded from monolith.c
     // entirely, so no BLINK_USE_<dep> macros are needed for the archive.
     // The user TU defines those macros itself when codegen emits a peeled
@@ -306,7 +306,7 @@ pub fn build_stdlib_archive_in(build_dir: Str, peeled: List[Str], force_rebuild:
     // compiles, so they add nothing to the archive build's wall time. The monolith drops
     // them by a flag on its cc line, not by a line in monolith.c, so a compile of
     // monolith.c alone still holds every body.
-    write_file("{cache_dir}/runtime_test.c", "#define BLINK_USE_EXTERN_RUNTIME_STORAGE 1\n#define BLINK_RUNTIME_TEST_BODIES_UNIT 1\n#include \"runtime.h\"\n")
+    let _ = fs.write("{cache_dir}/runtime_test.c", "#define BLINK_USE_EXTERN_RUNTIME_STORAGE 1\n#define BLINK_RUNTIME_TEST_BODIES_UNIT 1\n#include \"runtime.h\"\n")
     let test_child = spawn_cc("-c -ffunction-sections -fdata-sections -o {cache_dir}/runtime_test.o {cache_dir}/runtime_test.c -I{cache_dir}", 0, 1, "", cache_dir, "runtime_test")
     let cc_args = "-c -ffunction-sections -fdata-sections -DBLINK_RUNTIME_TEST_BODIES_APART=1 -o {cache_dir}/monolith.o {cache_dir}/monolith.c -I{cache_dir}"
     let rc = run_cc(cc_args, 0, 1, "")
@@ -329,7 +329,7 @@ pub fn build_stdlib_archive_in(build_dir: Str, peeled: List[Str], force_rebuild:
     }
     write_skip_modules_file("{cache_dir}/skip_modules.txt", list_stdlib_module_keys())
     write_archive_id("{cache_dir}/.archive-id", rt_path_final, "{cache_dir}/libblink_std.h", "{cache_dir}/monolith.c")
-    write_file("{cache_dir}/.stamp", "")
+    let _ = fs.write("{cache_dir}/.stamp", "")
     // publish keeps an entry that is already there, so one left here would stay as the archive.
     if force_rebuild && !build_fs.remove_tree_or_report(final_dir) {
         return 1
@@ -368,6 +368,6 @@ fn archive_id_string(rt_path: Str, hdr_path: Str, mono_path: Str) -> Str ! IO, F
     "{rt_sha}|{hdr_sha}|{bc_sha}|{blink_cli_version}|{mono_sha}"
 }
 
-fn write_archive_id(path: Str, rt_path: Str, hdr_path: Str, mono_path: Str) ! IO, FS.Read {
-    write_file(path, "{archive_id_string(rt_path, hdr_path, mono_path)}\n")
+fn write_archive_id(path: Str, rt_path: Str, hdr_path: Str, mono_path: Str) ! IO, FS.Read, FS.Write {
+    let _ = fs.write(path, "{archive_id_string(rt_path, hdr_path, mono_path)}\n")
 }

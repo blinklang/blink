@@ -6,6 +6,7 @@ import mutation_analysis.{analyze_mutations, analyze_save_restore}
 import escape.{analyze_escapes}
 import mono.{run_mono}
 import diagnostics.{Diag, diag_count, diag_warn_count, diag_ice_count, diag_render, diag_entry_count, json_escape}
+import build_fs
 
 // check_pipeline.bl — the one check every path answers with
 //
@@ -62,13 +63,13 @@ pub type FrontEndReport {
 // A check sees the whole program, so it loads the imports and the prelude as the build
 // does. Escape analysis needs no well-typed program, so it still runs when the front end
 // has errors and reports what it finds next to them.
-pub fn check_source(source_path: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+pub fn check_source(source_path: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Read, Env.Exit, Env.Read, IO {
     let (program, _) = check_source_reporting(source_path)
     program
 }
 
 // check_source, and what its front end reported.
-pub fn check_source_reporting(source_path: Str) -> (Int, FrontEndReport) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+pub fn check_source_reporting(source_path: Str) -> (Int, FrontEndReport) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Read, Env.Exit, Env.Read, IO {
     // The load after one that must run again parses every source, so it keeps none and
     // never asks to run again.
     match check_source_once(source_path) {
@@ -80,7 +81,7 @@ pub fn check_source_reporting(source_path: Str) -> (Int, FrontEndReport) ! Lex.T
 // check_source_reporting, or None when the load kept sources and must run again with none
 // kept. It stops before typecheck then, and a caller that captured what the check printed
 // drops what the load printed, as the load that runs again prints it once more.
-pub fn check_source_once(source_path: Str) -> Option[(Int, FrontEndReport)] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+pub fn check_source_once(source_path: Str) -> Option[(Int, FrontEndReport)] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Read, Env.Exit, Env.Read, IO {
     // A loader that keeps parsed sources keeps them only while the sources alone changed: the
     // entry, a config, an #embed file or a probe answer may change what a parse or the load
     // does around it.
@@ -137,7 +138,7 @@ fn record_checked_inputs(source_path: Str) {
 // the process runs: its env, argv0 and cwd stay as they were. Compares bytes, not mtimes: an
 // edit inside one mtime tick still counts. The probes catch a file the last check did not
 // read: a new module an import needed, or one that now shadows the file an import found.
-pub fn checked_inputs_changed(source_path: Str) -> Bool {
+pub fn checked_inputs_changed(source_path: Str) -> Bool ! FS.Read {
     if checked.source == "" || checked.source != source_path { return true }
     if checked_probes_changed() { return true }
     let mut i = 0
@@ -145,8 +146,8 @@ pub fn checked_inputs_changed(source_path: Str) -> Bool {
         let p = checked.paths.get(i).unwrap()
         // The compiler carries the embedded stdlib, so no edit can change it.
         if !p.starts_with("<embedded:") {
-            if file_exists(p) != 1 { return true }
-            if read_file(p) != checked.texts.get(i).unwrap() { return true }
+            if !build_fs.path_exists(p) { return true }
+            if build_fs.read_or_empty(p) != checked.texts.get(i).unwrap() { return true }
         }
         i = i + 1
     }
@@ -155,14 +156,14 @@ pub fn checked_inputs_changed(source_path: Str) -> Bool {
 
 // Whether anything but the bytes of a source changed since the last check: its entry, a
 // config or #embed file, or a probe answer.
-pub fn checked_non_source_inputs_changed(source_path: Str) -> Bool {
+pub fn checked_non_source_inputs_changed(source_path: Str) -> Bool ! FS.Read {
     if checked.source == "" || checked.source != source_path { return true }
     if checked_probes_changed() { return true }
     let mut i = checked.sources
     while i < checked.paths.len() {
         let p = checked.paths.get(i).unwrap()
-        if file_exists(p) != 1 { return true }
-        if read_file(p) != checked.texts.get(i).unwrap() { return true }
+        if !build_fs.path_exists(p) { return true }
+        if build_fs.read_or_empty(p) != checked.texts.get(i).unwrap() { return true }
         i = i + 1
     }
     false
@@ -170,10 +171,10 @@ pub fn checked_non_source_inputs_changed(source_path: Str) -> Bool {
 
 // Whether a path the loader probed in the last check now finds a file where it found none, or
 // none where it found one.
-pub fn checked_probes_changed() -> Bool {
+pub fn checked_probes_changed() -> Bool ! FS.Read {
     let mut i = 0
     while i < checked.probe_paths.len() {
-        let found = file_exists(checked.probe_paths.get(i).unwrap()) == 1
+        let found = build_fs.path_exists(checked.probe_paths.get(i).unwrap())
         if found != checked.probe_found.get(i).unwrap() { return true }
         i = i + 1
     }

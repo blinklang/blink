@@ -250,10 +250,10 @@ fn parse_inputs(text: Str) -> Option[InputFields] {
 // text beside it. A build that reused units, or hashed the text, already holds it in dir.
 // False when the record was not written whole, and then no record is left in dir. A short
 // inputs text is never taken, since a build compares all of it.
-pub fn write_record(dir: Str, inputs: Str, units: List[EmittedUnit], shas: Map[Str, Str], order: Str, header_keys: Map[Str, Str], entry_key: Str) -> Bool ! FS.Delete, IO {
+pub fn write_record(dir: Str, inputs: Str, units: List[EmittedUnit], shas: Map[Str, Str], order: Str, header_keys: Map[Str, Str], entry_key: Str) -> Bool ! FS.Delete, IO, FS.Write, FS.Read {
     let inputs_path = "{dir}/{INPUTS_NAME}"
-    if file_exists(inputs_path) != 1 {
-        write_file(inputs_path, inputs)
+    if !build_fs.path_exists(inputs_path) {
+        let _ = fs.write(inputs_path, inputs)
     }
     let sb = StringBuilder.new()
     sb.write("{RECORD_SCHEMA}\ninputs {inputs.byte_len()} {shas.get(INPUTS_NAME) ?? "-"}\n")
@@ -300,8 +300,8 @@ pub fn write_record(dir: Str, inputs: Str, units: List[EmittedUnit], shas: Map[S
     if files == 0 {
         return false
     }
-    write_file(path, text)
-    if file_exists(path) == 1 && read_file(path) == text {
+    let _ = fs.write(path, text)
+    if build_fs.path_exists(path) && build_fs.read_or_empty(path) == text {
         return true
     }
     let _ = build_fs.remove_tree_or_report(path)
@@ -324,12 +324,12 @@ pub type EmitRecord {
 
 // The record in dir when it is whole. Only the inputs text beside it can show which inputs
 // it records.
-fn read_record(dir: Str) -> Option[EmitRecord] {
+fn read_record(dir: Str) -> Option[EmitRecord] ! FS.Read {
     let path = "{dir}/{RECORD_NAME}"
-    if file_exists(path) != 1 {
+    if !build_fs.path_exists(path) {
         return None
     }
-    let lines = read_file(path).split("\n")
+    let lines = build_fs.read_or_empty(path).split("\n")
     if lines.len() < 4 || lines.get(0).unwrap() != RECORD_SCHEMA {
         return None
     }
@@ -417,7 +417,7 @@ fn read_record(dir: Str) -> Option[EmitRecord] {
 
 // Puts each of names from from_dir into to_dir, by a hard link or else by a copy. False when
 // it could do neither.
-fn link_or_copy(from_dir: Str, to_dir: Str, names: List[Str]) -> Bool ! IO, FS.Write {
+fn link_or_copy(from_dir: Str, to_dir: Str, names: List[Str]) -> Bool ! IO, FS.Write, FS.Delete, FS.Read {
     // A build never writes a file in a units directory once it replaced the last one, so
     // a hard link shares bytes that no longer change.
     let mut linked = true
@@ -431,13 +431,13 @@ fn link_or_copy(from_dir: Str, to_dir: Str, names: List[Str]) -> Bool ! IO, FS.W
     // The copy is for a filesystem without hard links; it removes any link made first, since
     // a write would go through it. The files are C text, which holds no NUL byte, and the
     // caller hashes each where it lands.
-    for n in names { fs_remove("{to_dir}/{n}") }
+    for n in names { let _ = fs.delete("{to_dir}/{n}") }
     for n in names {
         let src = "{from_dir}/{n}"
         let dst = "{to_dir}/{n}"
-        if file_exists(src) != 1 { return false }
-        write_file(dst, read_file(src))
-        if file_exists(dst) != 1 { return false }
+        if !build_fs.path_exists(src) { return false }
+        let _ = fs.write(dst, build_fs.read_or_empty(src))
+        if !build_fs.path_exists(dst) { return false }
     }
     true
 }
@@ -447,7 +447,7 @@ fn link_or_copy(from_dir: Str, to_dir: Str, names: List[Str]) -> Bool ! IO, FS.W
 // must hash as the record says, and the inputs text is compared where it lands, so a file
 // edited or replaced since the record was written is never taken. None, with to_dir left
 // empty, when there is no such record or a file differs.
-pub fn reuse(from_dir: Str, to_dir: Str, inputs: Str, arc_dir: Str) -> Option[ReusedUnits] ! IO, FS.Write, FS.Read {
+pub fn reuse(from_dir: Str, to_dir: Str, inputs: Str, arc_dir: Str) -> Option[ReusedUnits] ! IO, FS.Write, FS.Read, FS.Delete {
     let rec = match read_record(from_dir) {
         Some(r) => r
         None => return None
@@ -458,7 +458,7 @@ pub fn reuse(from_dir: Str, to_dir: Str, inputs: Str, arc_dir: Str) -> Option[Re
     // Many edits keep the inputs as long as the last ones, and linking and hashing every file
     // only to find the text differs costs more than reading it.
     let last_inputs = "{from_dir}/{INPUTS_NAME}"
-    if file_exists(last_inputs) != 1 || read_file(last_inputs) != inputs {
+    if !build_fs.path_exists(last_inputs) || build_fs.read_or_empty(last_inputs) != inputs {
         return None
     }
     let mut names: List[Str] = []
@@ -481,10 +481,10 @@ pub fn reuse(from_dir: Str, to_dir: Str, inputs: Str, arc_dir: Str) -> Option[Re
     // Another build can replace from_dir between the read above and the link.
     if ok {
         let path = "{to_dir}/{INPUTS_NAME}"
-        ok = file_exists(path) == 1 && read_file(path) == inputs
+        ok = build_fs.path_exists(path) && build_fs.read_or_empty(path) == inputs
     }
     if !ok {
-        for n in names { fs_remove("{to_dir}/{n}") }
+        for n in names { let _ = fs.delete("{to_dir}/{n}") }
         return None
     }
     Some(ReusedUnits { units: rec.units, shas: shas, order: rec.order, header_keys: rec.header_keys, entry_key: rec.entry_key })
@@ -528,7 +528,7 @@ pub fn without_unit(taken: TakenUnits, m: Str) -> TakenUnits {
 }
 
 // Puts the files of the units taken into the units directory. False when it could not.
-pub fn place_taken(taken: TakenUnits) -> Bool ! IO, FS.Write {
+pub fn place_taken(taken: TakenUnits) -> Bool ! IO, FS.Write, FS.Delete, FS.Read {
     link_or_copy(taken.from_dir, taken.to_dir, taken.c_names)
 }
 
@@ -560,15 +560,15 @@ pub type LastBuild {
 // builtin_traits are the trait names the compiler reads without a source writing them.
 // None when there is no whole record, it names no sha of its inputs, or the inputs differ
 // anywhere else.
-pub fn last_build(from_dir: Str, inputs: Str, own: Map[Str, Bool], builtin_traits: List[Str]) -> Option[LastBuild] {
+pub fn last_build(from_dir: Str, inputs: Str, own: Map[Str, Bool], builtin_traits: List[Str]) -> Option[LastBuild] ! FS.Read {
     let rec = match read_record(from_dir) {
         Some(r) => r
         None => return None
     }
     if rec.inputs_sha == "-" { return None }
     let last_inputs = "{from_dir}/{INPUTS_NAME}"
-    if file_exists(last_inputs) != 1 { return None }
-    let last_text = read_file(last_inputs)
+    if !build_fs.path_exists(last_inputs) { return None }
+    let last_text = build_fs.read_or_empty(last_inputs)
     let delta = match inputs_delta(last_text, inputs, own, builtin_traits) {
         Some(d) => d
         None => {
@@ -851,7 +851,7 @@ let LAST_HEADER_PREFIX: Str = ".emit-last-"
 // so all a build compares is of one record. Nothing goes into to_dir before a unit is
 // chosen, so a unit the build emits is never written through a link. None, with nothing
 // written, when no unit can be taken.
-pub fn take_units(lb: LastBuild, to_dir: Str, candidates: List[Str], names: List[Str], texts: List[Str], order: List[Str], same: Map[Str, Bool]) -> Option[TakenUnits] {
+pub fn take_units(lb: LastBuild, to_dir: Str, candidates: List[Str], names: List[Str], texts: List[Str], order: List[Str], same: Map[Str, Bool]) -> Option[TakenUnits] ! FS.Write, FS.Read {
     let rec = lb.rec
     let from_dir = lb.from_dir
     let mut want: Map[Str, Bool] = Map()
@@ -885,8 +885,8 @@ pub fn take_units(lb: LastBuild, to_dir: Str, candidates: List[Str], names: List
         if !rec.shas.contains_key(name) { return None }
         if same.contains_key(name) { continue }
         let path = "{from_dir}/{name}"
-        if file_exists(path) != 1 { return None }
-        let old = read_file(path)
+        if !build_fs.path_exists(path) { return None }
+        let old = build_fs.read_or_empty(path)
         let text = texts.get(i - 1).unwrap()
         if old == text { continue }
         if name == types {
@@ -934,7 +934,7 @@ pub fn take_units(lb: LastBuild, to_dir: Str, candidates: List[Str], names: List
     if taken.len() == 0 { return None }
     // Written, not linked: these are the bytes the build compared, whatever from_dir holds by
     // the time it hashes them.
-    write_file("{to_dir}/{LAST_INPUTS_NAME}", lb.last_text)
+    let _ = fs.write("{to_dir}/{LAST_INPUTS_NAME}", lb.last_text)
     let mut extras = [LAST_INPUTS_NAME]
     let mut shas: Map[Str, Str] = Map()
     for c in c_names { shas.insert(c, rec.shas.get(c) ?? "-") }
@@ -945,7 +945,7 @@ pub fn take_units(lb: LastBuild, to_dir: Str, candidates: List[Str], names: List
     while j < changed_names.len() {
         let name = changed_names.get(j).unwrap()
         let copy = "{LAST_HEADER_PREFIX}{name}"
-        write_file("{to_dir}/{copy}", old_texts.get(j).unwrap())
+        let _ = fs.write("{to_dir}/{copy}", old_texts.get(j).unwrap())
         extras.push(copy)
         shas.insert(copy, rec.shas.get(name) ?? "-")
         j = j + 1
@@ -979,9 +979,9 @@ fn unit_kept_from(lb: LastBuild, u: EmittedUnit, changed: Map[Str, Bool]) -> Str
 }
 
 // Whether a file of unit u in dir names one of symbols.
-fn unit_names_any(dir: Str, u: EmittedUnit, symbols: List[Str]) -> Bool {
+fn unit_names_any(dir: Str, u: EmittedUnit, symbols: List[Str]) -> Bool ! FS.Read {
     for f in unit_files(u) {
-        if names_any(read_file("{dir}/{f.stem}.c"), symbols) { return true }
+        if names_any(build_fs.read_or_empty("{dir}/{f.stem}.c"), symbols) { return true }
     }
     false
 }
@@ -1008,31 +1008,31 @@ pub fn headers_unchanged(lb: LastBuild, m: Str, key: Str) -> Bool {
 // of them left in to_dir, when the record holds no sha for one or a link fails. The caller
 // checks each against the record's sha when it hashes the whole directory, so no header is
 // hashed twice.
-pub fn link_last_files(lb: LastBuild, to_dir: Str, names: List[Str]) -> Option[List[Str]] ! IO, FS.Write {
+pub fn link_last_files(lb: LastBuild, to_dir: Str, names: List[Str]) -> Option[List[Str]] ! IO, FS.Write, FS.Delete, FS.Read {
     for n in names {
         if !lb.rec.shas.contains_key(n) { return None }
     }
     if !link_or_copy(lb.from_dir, to_dir, names) {
-        for n in names { fs_remove("{to_dir}/{n}") }
+        for n in names { let _ = fs.delete("{to_dir}/{n}") }
         return None
     }
     let mut texts: List[Str] = []
-    for n in names { texts.push(read_file("{to_dir}/{n}")) }
+    for n in names { texts.push(build_fs.read_or_empty("{to_dir}/{n}")) }
     Some(texts)
 }
 
 // Puts text into to_dir as name: a link to the file of the last units directory when that
 // holds the same bytes, so a header whose text did not change keeps the last build's file,
 // and else a file of its own.
-pub fn keep_or_write(from_dir: Str, to_dir: Str, name: Str, text: Str) ! IO, FS.Write {
+pub fn keep_or_write(from_dir: Str, to_dir: Str, name: Str, text: Str) ! IO, FS.Write, FS.Delete, FS.Read {
     let old = "{from_dir}/{name}"
     let path = "{to_dir}/{name}"
-    if from_dir != "" && file_exists(old) == 1 && read_file(old) == text && build_fs.hard_link(old, path) {
+    if from_dir != "" && build_fs.path_exists(old) && build_fs.read_or_empty(old) == text && build_fs.hard_link(old, path) {
         // Another build can replace from_dir between the read and the link.
-        if read_file(path) == text { return }
-        fs_remove(path)
+        if build_fs.read_or_empty(path) == text { return }
+        let _ = fs.delete(path)
     }
-    write_file(path, text)
+    let _ = fs.write(path, text)
 }
 
 // Whether each header in kept hashes, in shas, as the last build's record says.

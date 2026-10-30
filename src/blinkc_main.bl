@@ -1,15 +1,16 @@
-import compiler.{load_phase_begin, load_phase_end, collect_root_imports, collect_imports, inject_prelude, build_reexport_map, merge_programs, find_src_root, check_unused_imports, resolve_root_import_qualifiers, loaded_inputs, import_map_nodes, import_map_modules, import_map_qualifiers, reject_empty_module_annotation, load_lint_overrides, check_file_exists, tune_compiler_gc, quiet_manifest_lib, note_audit_dir, load_audit_records}
+import compiler.{load_phase_begin, load_phase_end, collect_root_imports, collect_imports, inject_prelude, build_reexport_map, merge_programs, find_src_root, check_unused_imports, resolve_root_import_qualifiers, loaded_inputs, import_map_nodes, import_map_modules, import_map_qualifiers, reject_empty_module_annotation, load_lint_overrides, check_file_exists, tune_compiler_gc, quiet_manifest_lib, note_audit_dir, load_audit_records, check_embed_targets}
 import comment_attach.{attach_comments_pass}
 import lexer.{Lex, lex}
 import parser.{Parse, parse_program, pos, node_count, parse_desugar_enabled}
 import typecheck.{TypeCheck, check_types, tc_import_modules, tc_import_qualifiers, tc_import_nodes}
 import cg.{Codegen, CgConfig, generate}
 import formatter.{Format, format}
-import diagnostics.{Diag, diag_flush, diag_format, diag_source_file, diag_count, diag_warn_count, diag_ice_count}
+import diagnostics.{Diag, diag_flush, diag_format, diag_source_file, diag_count, diag_warn_count, diag_ice_count, diag_register_source}
 import check_pipeline.{run_build_analyses}
 import std.path.{path_dirname, path_join}
 import ast_dump.{ast_to_json}
 import ast.{dbg_channels, trace_mode}
+import build_fs
 
 fn print_usage() {
     io.println("Usage: blinkc <source.bl> [output.c] [--format json|human] [--json] [--emit blink] [--stats] [--debug] [--test-build] [--dump-ast] [--blink-trace <phase>] [--link-archive <header-path>]")
@@ -17,6 +18,7 @@ fn print_usage() {
 }
 
 fn main() {
+    let argv = env.args()
     tune_compiler_gc(env.var("GC_FREE_SPACE_DIVISOR"))
 
     // Fine-grained internal trace channels (ast.dbg_trace), mirroring src/cli.bl's own
@@ -27,7 +29,7 @@ fn main() {
     dbg_channels = env.var("BLINK_TRACE_CHANNELS") ?? ""
     quiet_manifest_lib()
 
-    if arg_count() < 2 {
+    if argv.len() < 2 {
         print_usage()
         return
     }
@@ -47,19 +49,19 @@ fn main() {
     let mut format_flag = ""
     let mut json_flag = false
     let mut i = 1
-    while i < arg_count() {
-        let arg = get_arg(i)
+    while i < argv.len() {
+        let arg = argv.get(i).unwrap()
         if arg == "--format" {
-            if i + 1 < arg_count() {
+            if i + 1 < argv.len() {
                 i = i + 1
-                format_flag = get_arg(i)
+                format_flag = argv.get(i).unwrap()
             }
         } else if arg == "--json" {
             json_flag = true
         } else if arg == "--emit" {
-            if i + 1 < arg_count() {
+            if i + 1 < argv.len() {
                 i = i + 1
-                emit_mode = get_arg(i)
+                emit_mode = argv.get(i).unwrap()
             }
         } else if arg == "--debug" {
             cg_debug_mode = 1
@@ -72,14 +74,14 @@ fn main() {
         } else if arg == "--dump-ast" {
             dump_ast = 1
         } else if arg == "--blink-trace" || arg == "--pact-trace" {
-            if i + 1 < arg_count() {
+            if i + 1 < argv.len() {
                 i = i + 1
-                blink_trace_flag = get_arg(i)
+                blink_trace_flag = argv.get(i).unwrap()
             }
         } else if arg == "--link-archive" {
-            if i + 1 < arg_count() {
+            if i + 1 < argv.len() {
                 i = i + 1
-                link_archive_header = get_arg(i)
+                link_archive_header = argv.get(i).unwrap()
             }
         } else if source_path == "" {
             source_path = arg
@@ -112,7 +114,8 @@ fn main() {
     trace_mode = blink_trace_flag
     let src_root = find_src_root(source_path)
     load_lint_overrides(src_root)
-    let source = read_file(source_path)
+    let source = build_fs.read_or_empty(source_path)
+    diag_register_source(source_path, source)
 
     let t_lex_start = time_ms()
     load_phase_begin()
@@ -146,7 +149,7 @@ fn main() {
         }
         let fmt_output = format(program_node)
         if out_path != "" {
-            write_file(out_path, fmt_output)
+            let _ = fs.write(out_path, fmt_output)
         } else {
             io.println(fmt_output)
         }
@@ -162,6 +165,7 @@ fn main() {
     collect_imports(program_node, src_root, imported_programs)
     inject_prelude(src_root, imported_programs)
     load_phase_end()
+    check_embed_targets()
     load_audit_records()
     build_reexport_map(imported_programs)
 
@@ -224,7 +228,7 @@ fn main() {
     if link_archive_header != "" {
         let header_dir = path_dirname(link_archive_header)
         let skip_path = path_join(header_dir, "skip_modules.txt")
-        let skip_src = read_file(skip_path)
+        let skip_src = build_fs.read_or_empty(skip_path)
         let skip_lines = skip_src.split("\n")
         let mut sl = 0
         while sl < skip_lines.len() {
@@ -258,7 +262,7 @@ fn main() {
     }
 
     if out_path != "" {
-        write_file(out_path, c_output)
+        let _ = fs.write(out_path, c_output)
     } else {
         io.println(c_output)
     }
