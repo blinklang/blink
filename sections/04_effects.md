@@ -1494,6 +1494,14 @@ fn token() -> Bytes ! Rand {
 }
 ```
 
+A bound of the range is any expression (§2.19 *Range Operands*), so a variable start is legal. The bounds evaluate once, the start first, before `rand.int` runs (§2.22):
+
+```blink
+fn pick(lo: Int, hi: Int) -> Int ! Rand {
+    rand.int(lo..hi)           // panics when lo >= hi: the range is empty
+}
+```
+
 User code calls only the wrappers. `rand.int(lo, hi)` with two `Int` arguments does not compile. The two-`Int` form is the operation that a `handler Rand { ... }` implements, and that a handler calls as `default.int(lo, hi)` (§4.7.1).
 
 ```blink

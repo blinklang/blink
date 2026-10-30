@@ -471,6 +471,7 @@ What this means in practice:
   fn a() -> (fn(Int) -> Int ! (IO.Log)) ! FS.Read { ... }   // before
   fn a() -> (fn(Int) -> Int ! IO.Log) ! FS.Read { ... }     // after
   ```
+- **Parentheses follow the precedence table.** `blink fmt` rebuilds parentheses from operator precedence and keeps no record of those the author wrote. It drops a parenthesis that does not change the parse (`(lo)..3` becomes `lo..3`, `0..(n + 1)` becomes `0..n + 1`) and keeps one that does (`0..(lim ?? 5)`). It adds parentheses around a bitwise or shift operand of a comparison, equality or range operator, and around a range that is an operand of a comparison or equality operator: `0..n | 1` becomes `0..(n | 1)`, and `r == 0..3` becomes `r == (0..3)` (§2.19)
 - **Deterministic output.** Given any syntactically valid Blink program, `blink fmt` produces exactly one output. Two developers formatting the same code always get identical results.
 - **Variant order is meaning.** `blink fmt` never reorders the variants of an enum, and no auto-fix or refactor tool does so without a request from the user. Variant order sets `to_int()`, the comparison with `Int` and the enum's `Ord` (§3.4 *Tag Operations*, §3.6 *Enum Ord*).
 

@@ -280,6 +280,10 @@ match p {
 // Control flow
 if x > 0 { "positive" } else { "non-positive" }  // expression
 for item in list { io.println(item) }
+for i in 0..n { }                     // 0 to n-1: `..` excludes the end
+for i in 1..=n { }                    // 1 to n: `..=` includes the end (Kotlin's `1..n` does too)
+for i in 0..n + 1 { }                 // 0..(n + 1): a bound is any expression that binds tighter than `..`
+for i in lo..hi { }                   // names and calls work as bounds: `xs.len()..4`, `rand.int(lo..hi)`
 for c in "héy" { io.println("{c}") }      // over a Str: each Unicode scalar value, as a Char
 for x in some_set { io.println("{x}") }   // over a Set
 for (k, v) in some_map { io.println("{k}={v}") }   // over a Map
@@ -464,6 +468,7 @@ let text = #"{{x}}"#                    // a lone { is text: "{{x}}"
 | `+` `-` `*` `/` `%` | Int, Float | Arithmetic (NO `+` on Str, E0521). A `Bool` operand is rejected (`E0300`) — Blink has no truthiness, so count with `if c { 1 } else { 0 }`. |
 | `==` `!=` `<` `>` `<=` `>=` | Int, Float, Str, `Instant`/`Duration`, `Bytes`, and any struct/enum with `@derive(Eq)` (for `==`/`!=`) or `@derive(Ord)` (for ordering) | Comparison. Operands are type-checked (`E0300` on mismatched/unordered types); struct/enum comparisons desugar to derived `eq`/`cmp`. |
 | `&&` `\|\|` `!` | Bool | Logical |
+| `..` `..=` | Int, sized ints, any `Ord` type | Range, `Range[T]`. Binds looser than `+ - * / % << >> & ^ \|` and tighter than comparison, equality, `??`, `\|>`, `&&`, `\|\|`: `0..n + 1` is `0..(n + 1)`, `opt ?? 0..n` is `opt ?? (0..n)`, `0..(lim ?? 5)` needs parentheses. No chain (`a..b..c` is `E1141 ChainedRange`) and no open-ended form (`0..`, `..b` are `UnexpectedToken` with help; there is no slice syntax: use `xs.slice(a, b)` or `s.byte_slice(a, b)`). `0..<n` and `0...n` are `UnexpectedToken` with help. A bare range next to `==` or `<` is legal and groups by the row: `r == 0..3` is `r == (0..3)`, and `x == 0..3` with `x: Int` is a `TypeError`: write `x >= 0 && x < 3`. Bounds run once, start first, when the range is made. `a..b` with `a >= b` is empty (zero loop turns); `lo..=hi` with `hi` at the type max ends after `hi`, with no overflow. `blink fmt` prints `0..(n \| 1)` and `r == (0..3)` with parentheses and `0..n + 1` without |
 | `?` | Result[T,E] | Propagate error — enclosing fn must return Result |
 | `??` | Option[T] | Unwrap or default |
 | `\|>` | Any | Pipe: `x \|> f()` = `f(x)` |

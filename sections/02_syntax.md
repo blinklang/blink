@@ -836,18 +836,72 @@ for (name, mut score) in scores {
 }
 ```
 
-**Ranges:**
+#### Ranges
 
 ```blink
-for i in 0..100 { }      // exclusive: 0 to 99
-for n in 1..=100 { }     // inclusive: 1 to 100
+for i in 0..100 { }       // exclusive: 0 to 99
+for n in 1..=100 { }      // inclusive: 1 to 100
+for i in lo..hi { }       // a bound is any expression
+for i in 0..n + 1 { }     // 0..(n + 1): arithmetic binds tighter than `..`
+for i in 0..xs.len() { }  // 0..(xs.len())
 ```
 
-`..` is exclusive upper bound, `..=` is inclusive. Ranges are lazy iterables of type `Range[T: Ord]` which implements `IntoIterator`.
+`..` excludes the end. `..=` includes it. Take care if you know Kotlin: there `1..n` includes `n`, and in Blink you write `1..=n`. A range is a value: `let r = lo..hi` makes one, and `rand.int(lo..hi)` takes one (§4.4.7). Ranges are lazy iterables of type `Range[T: Ord]` which implements `IntoIterator`.
+
+Each bound is an expression that binds tighter than `..`: a name, a call, a field, a parenthesized expression, a unary expression, or an arithmetic, shift or bitwise expression. `..` has its own row in the precedence table, and the row has no associativity (§2.19 *Range Operands*).
+
+**Empty ranges.** `a..b` with `a >= b` is empty. `a..=b` with `a > b` is empty. A `for` loop over an empty range runs zero times. `rand.int` still panics on an empty range (§4.4.7).
+
+```blink
+for i in 5..5 { }     // runs 0 times
+for i in 5..3 { }     // runs 0 times
+for i in 5..=5 { }    // runs once, with i = 5
+for i in 5..=4 { }    // runs 0 times
+```
+
+**An inclusive range up to the largest value of its type.** `lo..=hi` yields `hi` last and stops, also when `hi` is the largest value of its type. It does not overflow, does not panic and does not wrap.
+
+```blink
+let top: U8 = 255
+for i in 250..=top { }    // runs 6 times: 250 to 255, then stops
+```
+
+**Evaluation.** Each bound evaluates once, the start before the end, when the range value is created. This is the general rule for operands (§2.22), not a rule for ranges alone. It holds for every range value, not only in a `for` header. A change to a collection inside the loop does not change the bounds:
+
+```blink
+fn main() {
+    let mut xs = [1, 2, 3]
+    for i in 0..xs.len() {    // xs.len() is 3, read once
+        xs.push(i)            // the loop still runs 3 times
+    }
+    io.println("{xs.len()}")  // 6
+}
+```
+
+**No open-ended range.** A range has a start and an end. `a..`, `..b` and a bare `..` are not range expressions. A missing end or start is `error[UnexpectedToken]` with a help line that says what to write:
+
+```blink
+let r = 0..          // error[UnexpectedToken]: a range needs an end
+for i in a.. { }     // same error, at the `{`
+// help: write `lo..hi` or `lo..=hi`; Blink has no open-ended range
+```
+
+Inside `xs[...]` the help also says that Blink has no slice syntax. It names the methods: `xs.slice(a, b)` for a `List` or `Bytes`, and `s.byte_slice(a, b)` for a `Str` (§3.2).
+
+A prefix `..` keeps its other meanings: the rest in a pattern, and the spread in a list literal or a struct copy-update (§2.16). Anywhere else, a prefix `..` is the missing-start case above, and its message reads "a range needs a start".
+
+**Spellings from other languages.** Two spellings get a help line. Both stay `error[UnexpectedToken]`:
+
+```blink
+let a = 0..<n    // help: write `0..n`; in Blink, `..` excludes the end (machine-applicable fix: `0..n`)
+let b = 0...n    // help: write `0..n` (end excluded) or `0..=n` (end included); no machine-applicable fix
+```
+
+`..<` has one meaning in every language that has it, so the fix is safe. `...` excludes the end in Ruby and includes it in Swift, so the compiler cannot know which one the author meant.
 
 No comprehensions in v1 — `for` loops and method chaining (`.map()`, `.filter()`, `.collect()`) cover the same use cases. See §3c.1 for the full iterator protocol.
 
-**Panel vote: 5-0 ratified.** See [OPEN_QUESTIONS.md](../OPEN_QUESTIONS.md) 2.3, 2.4.
+**Panel vote: 5-0 ratified.** See [OPEN_QUESTIONS.md](../OPEN_QUESTIONS.md) 2.3, 2.4. The range row of the precedence table, the empty and end-of-type cases and the help lines: [rationale](../decisions/range-precedence.md).
 
 ### 2.11 While/Loop
 
@@ -1714,9 +1768,11 @@ A shorthand literal follows the same field rules as the full form (§2.14 *Check
 | List pattern rest | `[first, ..]` | Match remaining elements |
 | Struct copy-update | `Account { balance: new_val, ..acct }` | Copy remaining fields from source |
 | List literal spread | `[..list1, extra, ..list2]` | Expand elements into list |
-| Range (infix) | `0..100`, `1..=100` | Exclusive/inclusive range |
+| Range (infix) | `0..100`, `1..=100` | Exclusive/inclusive range (§2.10 *Ranges*, §2.19 *Range Operands*) |
 
 Pattern rest and construction spread are duals: patterns discard "the rest," construction copies "the rest" from a source.
+
+A `..` with an expression before it is a range. A prefix `..` is never a range: it is spread or rest only, in the positions of the table. Blink has no open-ended range (`a..`, `..b`, `..`).
 
 #### Struct Copy-Update
 
@@ -1943,10 +1999,11 @@ From lowest to highest binding:
 | 4 | `&&` | left | logical and (short-circuit) |
 | 5 | `==` `!=` | left | equality |
 | 6 | `<` `>` `<=` `>=` | left | comparison |
-| 7 | `+` `-` `*` `/` `%` `<<` `>>` `&` `^` `\|` | left | integer operator groups (see below) |
-| 8 | `-` `!` `~` | right | unary prefix |
-| 9 | `?` | left | postfix unwrap |
-| 10 (highest) | `.` `()` | left | member access, call |
+| 7 | `..` `..=` | none | range (see *Range Operands*) |
+| 8 | `+` `-` `*` `/` `%` `<<` `>>` `&` `^` `\|` | left | integer operator groups (see below) |
+| 9 | `-` `!` `~` | right | unary prefix |
+| 10 | `?` | left | postfix unwrap |
+| 11 (highest) | `.` `()` | left | member access, call |
 
 **Non-chaining comparisons.** `a < b < c` is a compile error. The compiler suggests `a < b && b < c`. Chained comparisons introduce context-sensitive operator semantics that contradict Blink's unambiguous-parsing priority. (Vote: 4-1)
 
@@ -1960,7 +2017,7 @@ The last two have help only, with no machine-applicable fix: the compiler cannot
 
 #### Integer Operator Groups
 
-Level 7 is a partial order, not one level. It holds five groups:
+Level 8 is a partial order, not one level. It holds five groups:
 
 | Group | Operators | Inside the group |
 |-------|-----------|------------------|
@@ -1970,7 +2027,7 @@ Level 7 is a partial order, not one level. It holds five groups:
 | bitwise xor | `^` | chains left |
 | bitwise or | `\|` | chains left |
 
-Each group binds tighter than comparison and equality (levels 5 and 6), and looser than unary prefix (level 8). The five groups have no order among them. An operand of an operator in one group cannot be a bare operator expression of a different group. Write parentheses. If you do not, the compiler gives the parse error `MixedOperatorPrecedence` (E1127):
+Each group binds tighter than the range, comparison and equality operators (levels 5 to 7), and looser than unary prefix (level 9). The five groups have no order among them. An operand of an operator in one group cannot be a bare operator expression of a different group. Write parentheses. If you do not, the compiler gives the parse error `MixedOperatorPrecedence` (E1127):
 
 ```blink
 fn pack(hi: U32, lo: U32) -> U32 {
@@ -1998,9 +2055,68 @@ let fits = x << 1 < limit          // (x << 1) < limit
 let same = a + b == c              // (a + b) == c
 ```
 
-`blink fmt` (§8.8) prints parentheses around a bitwise or shift operand of a comparison or equality operator. Thus `flags & 0x0F == 0` and `(flags & 0x0F) == 0` both format to `(flags & 0x0F) == 0`. The formatter does not add parentheses around an arithmetic operand.
+`blink fmt` (§8.8) prints parentheses around a bitwise or shift operand of a comparison, equality or range operator. It adds none around an arithmetic operand. Thus `flags & 0x0F == 0` and `(flags & 0x0F) == 0` both format to `(flags & 0x0F) == 0`, and `0..n | 1` formats to `0..(n | 1)`. One more case follows from *Range Operands* below: `blink fmt` prints parentheses around a range that is an operand of a comparison or equality operator.
 
-**Why a partial order.** Languages do not agree on these levels. C and Rust put shifts below `+`. Go puts `<<` and `&` on the level of `*`, so `a & b << c` is `(a & b) << c` in Go and `a & (b << c)` in C and Rust. All operands are integers, so a reader who expects the wrong order gets a wrong value and no error. A parse error removes each mix where two languages give different values. The comparison edge stays ordered because the other grouping never type-checks: in `flags & 0x0F == 0`, the C grouping `flags & (0x0F == 0)` applies `&` to a `Bool`. (Votes: shift with arithmetic 6-0; two bitwise operators 6-0; bitwise with arithmetic 6-0; shift with bitwise 6-0 R2, was 4-2; bitwise above comparison 6-0 R2, was 3-2-1; shift as a bare comparison operand 5-1; formatter parentheses 5-1; diagnostic 5-1; unary `~` 6-0.)
+**Why a partial order.** Languages do not agree on these levels. C and Rust put shifts below `+`. Go puts `<<` and `&` on the level of `*`, so `a & b << c` is `(a & b) << c` in Go and `a & (b << c)` in C and Rust. All operands are integers, so a reader who expects the wrong order gets a wrong value and no error. A parse error removes each mix where two languages give different values. The comparison edge stays ordered because the other grouping never type-checks: in `flags & 0x0F == 0`, the C grouping `flags & (0x0F == 0)` applies `&` to a `Bool`. The range edges follow the same test: in `x == 0..3`, the other grouping `(x == 0)..3` needs a `Bool` bound, and `Bool` is not `Ord`; in `0..n | 1`, the grouping `(0..n) | 1` applies `|` to a `Range`. So the range row is ordered against comparison and the integer groups, and these mixes are no parse error. (Votes: shift with arithmetic 6-0; two bitwise operators 6-0; bitwise with arithmetic 6-0; shift with bitwise 6-0 R2, was 4-2; bitwise above comparison 6-0 R2, was 3-2-1; shift as a bare comparison operand 5-1; formatter parentheses 5-1; diagnostic 5-1; unary `~` 6-0; range row 6-0; range operand of a comparison or equality 5-1; formatter parentheses for a range operand 6-0 after a second round.)
+
+#### Range Operands
+
+`..` and `..=` sit in level 7, between comparison and the integer operator groups. They have no associativity. Each operand is any expression at level 8 or higher: a name, a call, a field, a parenthesized expression, a unary expression, a `?` expression, or an arithmetic, shift or bitwise expression. Because the integer groups bind tighter, a bare arithmetic bound needs no parentheses:
+
+```blink
+for i in 0..n + 1 { }            // 0..(n + 1), not (0..n) + 1
+for i in 0..xs.len() { }         // 0..(xs.len()), not (0..xs).len()
+for i in xs.len()..4 { }         // the start is a call
+let a = -2..3                    // (-2)..3: unary binds tighter
+let b = (lo)..3                  // the parentheses are redundant; fmt prints lo..3
+let c = 0..n | 1                 // 0..(n | 1); fmt prints 0..(n | 1)
+let d = 0..(lim ?? 5)            // `??` is looser than `..`, so this needs parentheses
+let r = rand.int(lo..hi)         // lo and hi are names: a start need not be a literal
+```
+
+**One range, no chain.** The operator has no associativity. A bound that is itself a bare range is the parse error `ChainedRange` (E1141). It has no machine-applicable fix, because the compiler cannot know which bounds the author meant:
+
+```blink
+let p = 0..1..2          // error[ChainedRange]
+let q = 0..=1..2         // error[ChainedRange]
+let s = (0..1)..2        // parses: a parenthesized range is a primary operand
+                         // error[TypeError]: the bounds are a Range[Int] and an Int
+```
+
+**Looser operators take a whole range as one operand.** The pipe, `??`, `||` and `&&` bind looser than `..`, so each takes the range as one operand:
+
+```blink
+let t = 0..n |> sum              // (0..n) |> sum
+let u = opt ?? 0..n              // opt ?? (0..n)
+```
+
+The second line is a type error when `opt` is an `Int?` and the author meant `(opt ?? 0)..n`. The help line says so: "did you mean `(opt ?? 0)..n`?". `||` and `&&` need `Bool` operands, so a range there is a type error.
+
+**A range next to a comparison or equality operator.** The row groups it: `..` binds tighter than `==` `!=` `<` `>` `<=` `>=`, and a bare range is a legal operand of each. There is no parse error for it. The other grouping never type-checks (`Bool` is not `Ord`), so no program gets a different value (*Why a partial order*, above).
+
+```blink
+fn main() {
+    let x = 2
+    let r = 0..3
+    let ok = r == 0..3     // r == (0..3): both sides are a Range[Int]; fmt prints r == (0..3)
+    let bad = x == 0..3    // error[TypeError]: an Int is compared with a Range[Int]
+}
+```
+
+The `TypeError` for the `bad` line has a required help line. The line is keyed on the syntax of the operand, a bare range next to a comparison or equality operator, and not on the type mismatch. It reads: "to test that `x` is in the range, write `x >= 0 && x < 3`".
+
+**What `blink fmt` prints.** The output comes from the precedence table, as for every operator. It keeps a parenthesis that changes the parse and drops one that does not:
+
+```blink
+for i in 0..(n + 1) { }          // fmt prints: for i in 0..n + 1 { }
+let b = (lo)..3                  // fmt prints: let b = lo..3
+let c = 0..n | 1                 // fmt prints: let c = 0..(n | 1)
+let d = 0..(lim ?? 5)            // kept: the parentheses change the parse
+let e = (0..n).into_iter()       // kept: the parentheses change the parse
+let f = r == 0..3                // fmt prints: let f = r == (0..3)
+```
+
+One rule gives the first four lines: a bitwise or shift operand of a comparison, equality or range operator gets parentheses, and an arithmetic operand gets none. The last line is the range case of the same idea: a range that is an operand of a comparison or equality operator gets parentheses.
 
 #### Operator Desugaring
 
@@ -3335,6 +3451,7 @@ These follow from the rule. They are not extra rules.
 
 - **Call:** the callee, when it is an expression, then the receiver of a method call, then the arguments as written. Keyword arguments run in written order, not declaration order, and bind to their parameters after all of them are evaluated. Omitted keyword arguments take const defaults (§2.21), so their placement cannot be observed.
 - **Operator:** left operand, then right operand, then the trait method. `x + y` is `Add.add(x, y)` (§2.19), so the call rule covers it.
+- **Range:** `lo..hi` and `lo..=hi` are operators, so the rule covers them. The start runs, then the end, once each, when the range value is created. A `for` loop does not run them again on each turn, and a range passed as an argument runs them before the call (§2.10 *Ranges*).
 - **Literal:** list elements and spreads (§2.16), tuple elements, struct-literal fields and variant payloads, as written. Struct-literal fields run in written order, not declaration order.
 - **Interpolation:** holes left to right. Each hole's value is appended before the next hole starts. In a template literal `t"..."` (§2.4.3) the values list is built in the same order.
 - **`with` items:** left to right, as §4.7 *Disambiguation rules* states.
@@ -3352,6 +3469,7 @@ fn main() {
     let _ = f(b: tick(2), a: tick(1))   // prints 2, then 1: written order
     let _ = tick(3) + tick(4)           // prints 3, then 4
     io.println("{tick(5)} {tick(6)}")   // prints 5, 6, then "5 6"
+    for i in tick(7)..tick(9) { }      // prints 7, then 9, once; the loop runs twice
 
     let mut n = 0
     let bump = fn() -> Int {
