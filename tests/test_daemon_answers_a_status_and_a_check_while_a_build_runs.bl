@@ -7,7 +7,7 @@ import std.testing.{cleanup}
 import compile_test_helpers
 import compile_test_helpers.{sh, appears, bg_result}
 
-fn dev_tree(root: Str, tree: Str, name: Str) {
+fn dev_tree(root: Str, tree: Str, name: Str) ! Process.Spawn, FS.Write {
     process.run("sh", ["-c", "rm -rf {tree}"]).unwrap()
     process.run("sh", ["-c", "mkdir -p {tree}/build {tree}/app/src"]).unwrap()
     // A copy, not a link: the install root comes from realpath(argv[0]).
@@ -19,24 +19,24 @@ fn dev_tree(root: Str, tree: Str, name: Str) {
     // A dev build/ can hold runtime.h only beside the archive it links to.
     process.run("sh", ["-c", "[ -e {tree}/build/runtime.h ] || cp -L $(dirname $(readlink -f {root}/build/libblink_std.h))/runtime.h {tree}/build/runtime.h"]).unwrap()
     // The daemon listens at the project root, so each tree is a project of its own.
-    write_file("{tree}/app/blink.toml", "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\n")
+    fs.write("{tree}/app/blink.toml", "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\n").unwrap()
     // A lock no older than blink.toml keeps "resolving dependencies..." out of every build.
-    write_file("{tree}/app/blink.lock", "[metadata]\nlockfile-version = 1\n")
-    write_file("{tree}/app/src/base.bl", [
+    fs.write("{tree}/app/blink.lock", "[metadata]\nlockfile-version = 1\n").unwrap()
+    fs.write("{tree}/app/src/base.bl", [
         #"pub fn tag(s: Str) -> Str {"#,
         #"    "[{s}]""#,
         #"}"#,
         #""#,
-    ].join("\n"))
-    write_file("{tree}/app/src/leaf.bl", [
+    ].join("\n")).unwrap()
+    fs.write("{tree}/app/src/leaf.bl", [
         #"import base.{tag}"#,
         #""#,
         #"pub fn leaf_value() -> Str {"#,
         #"    tag("leaf")"#,
         #"}"#,
         #""#,
-    ].join("\n"))
-    write_file("{tree}/app/src/main.bl", [
+    ].join("\n")).unwrap()
+    fs.write("{tree}/app/src/main.bl", [
         #"import base.{tag}"#,
         #"import leaf.{leaf_value}"#,
         #""#,
@@ -44,7 +44,7 @@ fn dev_tree(root: Str, tree: Str, name: Str) {
         #"    io.println("{tag("main")} {leaf_value()}")"#,
         #"}"#,
         #""#,
-    ].join("\n"))
+    ].join("\n")).unwrap()
 }
 
 // The corpus exports BLINK_COMPILER_ARCHIVE and may export BLINK_PER_MODULE; the first makes
@@ -58,10 +58,10 @@ fn env_of(tree: Str) -> Str {
 // A cc that tells the test it started and then waits while cc.hold exists, then runs the
 // real cc. A build whose cc is held can not end, so whatever the test sees meanwhile it sees
 // while that build runs.
-fn hold_cc(tree: Str) {
+fn hold_cc(tree: Str) ! Process.Spawn, FS.Write {
     let real = sh("command -v cc")
     process.run("sh", ["-c", "mkdir -p {tree}/ccwrap"]).unwrap()
-    write_file("{tree}/ccwrap/cc", "#!/bin/sh\nif [ -e {tree}/cc.hold ]; then\n    touch {tree}/cc.started\n    while [ -e {tree}/cc.hold ]; do sleep 0.05; done\nfi\nexec {real} \"$@\"\n")
+    fs.write("{tree}/ccwrap/cc", "#!/bin/sh\nif [ -e {tree}/cc.hold ]; then\n    touch {tree}/cc.started\n    while [ -e {tree}/cc.hold ]; do sleep 0.05; done\nfi\nexec {real} \"$@\"\n").unwrap()
     process.run("sh", ["-c", "chmod +x {tree}/ccwrap/cc"]).unwrap()
 }
 
@@ -182,11 +182,11 @@ fn output_differ(a_tree: Str, b_tree: Str) -> Str {
     sh("cd {b_tree}/app/out/app.units && for f in *.c *.h; do cmp -s $f {a_tree}/app/out/app.units/$f || echo $f; done; cd {a_tree}/app/out/app.units && for f in *.c *.h; do [ -e {b_tree}/app/out/app.units/$f ] || echo extra:$f; done; cmp -s {a_tree}/app/out/app {b_tree}/app/out/app || echo program").split("\n").join(" ")
 }
 
-fn edit(tree: Str, file: Str, sed: Str) {
+fn edit(tree: Str, file: Str, sed: Str) ! FS.Read, Process.Spawn {
     let path = "{tree}/app/src/{file}"
-    let before = read_file(path)
+    let before = fs.read(path).unwrap()
     process.run("sh", ["-c", "sed -i '{sed}' {path}"]).unwrap()
-    assert(read_file(path) != before, "the edit `{sed}` did not change {file}")
+    assert(fs.read(path).unwrap() != before, "the edit `{sed}` did not change {file}")
 }
 
 fn build(tree: Str) -> ProcessResult {
@@ -210,7 +210,7 @@ test "a status and a check sent while a build runs reply before the build ends" 
         process.run("sh", ["-c", "rm -f {warm}/cc.hold"]).unwrap()
         stop_daemon(pid)
     }) {
-        assert(pid > 0, "the daemon did not start: {read_file("{warm}/daemon.log")}")
+        assert(pid > 0, "the daemon did not start: {fs.read("{warm}/daemon.log").unwrap()}")
         first = build(warm)
         // An edit, so the next build compiles a unit and its cc runs.
         edit(warm, "leaf.bl", #"s/"leaf"/"lea2"/"#)
@@ -222,7 +222,7 @@ test "a status and a check sent while a build runs reply before the build ends" 
         check = blink_bounded(warm, "check src/main.bl")
         took = time_ms() - t0
         // The build's cc is still held, so both replies came while the build ran.
-        running = file_exists("{warm}/b1.rc") != 1
+        running = !compile_test_helpers.path_exists("{warm}/b1.rc")
         process.run("sh", ["-c", "rm -f {warm}/cc.hold"])?
         b1 = bg_result(warm, "b1")
     }

@@ -14,7 +14,7 @@ fn sh(cmd: Str) -> Str {
 // compile writes its arguments and its -H output to a file of its own, so a unit that read
 // the PCH shows -include-pch and no line for the archive header. While the file swap exists,
 // the next PCH build first writes runtime.h.swapped over the archive dir's runtime.h.
-fn dev_tree(root: Str, tree: Str) {
+fn dev_tree(root: Str, tree: Str) ! Process.Spawn, FS.Write {
     process.run("sh", ["-c", "rm -rf {tree}"]).unwrap()
     process.run("sh", ["-c", "mkdir -p {tree}/build {tree}/app/src {tree}/bin"]).unwrap()
     // A copy, not a link: the install root comes from realpath(argv[0]).
@@ -27,10 +27,10 @@ fn dev_tree(root: Str, tree: Str) {
     // A dev build/ can hold runtime.h only beside the archive it links to.
     process.run("sh", ["-c", "[ -e {tree}/build/runtime.h ] || cp -L $(dirname $(readlink -f {root}/build/libblink_std.h))/runtime.h {tree}/build/runtime.h"]).unwrap()
     let clang = sh("command -v clang")
-    write_file("{tree}/bin/cc", "#!/bin/sh\ncase \" $* \" in *\" c-header \"*) if [ -e {tree}/swap ]; then rm -f {tree}/swap; cat {tree}/runtime.h.swapped > {tree}/build/runtime.h; fi; exec {clang} \"$@\" ;; *\" -c \"*) f=$(mktemp {tree}/cc_h/XXXXXX); echo \"ARGS $*\" > \"$f\"; exec {clang} \"$@\" -H 2>>\"$f\" ;; esac\nexec {clang} \"$@\"\n")
+    fs.write("{tree}/bin/cc", "#!/bin/sh\ncase \" $* \" in *\" c-header \"*) if [ -e {tree}/swap ]; then rm -f {tree}/swap; cat {tree}/runtime.h.swapped > {tree}/build/runtime.h; fi; exec {clang} \"$@\" ;; *\" -c \"*) f=$(mktemp {tree}/cc_h/XXXXXX); echo \"ARGS $*\" > \"$f\"; exec {clang} \"$@\" -H 2>>\"$f\" ;; esac\nexec {clang} \"$@\"\n").unwrap()
     process.run("sh", ["-c", "chmod +x {tree}/bin/cc"]).unwrap()
-    write_file("{tree}/app/blink.toml", "[package]\nname = \"pch_app\"\nversion = \"0.1.0\"\n")
-    write_file("{tree}/app/src/part.bl", "pub fn value() -> Int \{\n    41\n\}\n")
+    fs.write("{tree}/app/blink.toml", "[package]\nname = \"pch_app\"\nversion = \"0.1.0\"\n").unwrap()
+    fs.write("{tree}/app/src/part.bl", "pub fn value() -> Int \{\n    41\n\}\n").unwrap()
     // A program's first build makes no PCH, so the tree starts with one build behind it.
     let _ = build_at(tree, "", 0)
 }
@@ -39,8 +39,8 @@ fn dev_tree(root: Str, tree: Str) {
 // clang cc, the unit trace and the variables in envs set, answering what the build printed.
 // The corpus exports BLINK_COMPILER_ARCHIVE and module filters, which make the build one
 // unit, so the run drops them.
-fn build_at(tree: Str, envs: Str, n: Int) -> Str {
-    write_file("{tree}/app/src/main.bl", "import part.\{value\}\n\nfn main() \{\n    let total = value() + {n}\n    io.println(\"sum \{total\}\")\n\}\n")
+fn build_at(tree: Str, envs: Str, n: Int) -> Str ! FS.Write, Process.Spawn {
+    fs.write("{tree}/app/src/main.bl", "import part.\{value\}\n\nfn main() \{\n    let total = value() + {n}\n    io.println(\"sum \{total\}\")\n\}\n").unwrap()
     process.run("sh", ["-c", "rm -rf {tree}/cc_h && mkdir {tree}/cc_h"]).unwrap()
     let r = process.run("sh", ["-c", "cd {tree} && env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE PATH={tree}/bin:$PATH BLINK_CACHE_DIR={tree}/objcache BLINK_TRACE_CHANNELS=build.units {envs} build/blink build app/src/main.bl -o {tree}/out/app --per-module --debug"]).unwrap()
     assert(r.success(), "build failed: {r.out}{r.err_out}")
@@ -58,7 +58,7 @@ fn pch_dirs(tree: Str) -> List[Str] {
 }
 
 // The objects a build compiles with no cached object, as "<sha>  <key>.o" lines.
-fn objects_built(tree: Str, envs: Str, n: Int) -> (Str, Int) {
+fn objects_built(tree: Str, envs: Str, n: Int) -> (Str, Int) ! Process.Spawn, FS.Write {
     process.run("sh", ["-c", "rm -f {tree}/objcache/*.o {tree}/objcache/*.meta"]).unwrap()
     let _ = build_at(tree, envs, n)
     (sh("cd {tree}/objcache && sha256sum *.o"), pch_reads(tree))

@@ -12,7 +12,7 @@ fn sh(cmd: Str) -> Str {
     process.run("sh", ["-c", cmd]).unwrap().out.trim()
 }
 
-fn dev_tree(root: Str, tree: Str) {
+fn dev_tree(root: Str, tree: Str) ! Process.Spawn, FS.Write {
     process.run("sh", ["-c", "rm -rf {tree}"]).unwrap()
     process.run("sh", ["-c", "mkdir -p {tree}/build {tree}/ccwrap {tree}/app/out"]).unwrap()
     // A copy, not a link: the install root comes from realpath(argv[0]).
@@ -26,10 +26,10 @@ fn dev_tree(root: Str, tree: Str) {
     process.run("sh", ["-c", "[ -e {tree}/build/runtime.h ] || cp -L $(dirname $(readlink -f {root}/build/libblink_std.h))/runtime.h {tree}/build/runtime.h"]).unwrap()
     let real = sh("command -v cc")
     // Only the link of out/held_app is held, so B, which links out/other, never waits.
-    write_file("{tree}/ccwrap/cc", "#!/bin/sh\ncase \" $* \" in\n    *\" -c \"*) ;;\n    *\" -o out/held_app \"*libblink_std.a*) if [ -e {tree}/hold_link ]; then touch {tree}/held; while [ ! -e {tree}/release ]; do sleep 0.05; done; fi ;;\nesac\nexec {real} \"$@\"\n")
+    fs.write("{tree}/ccwrap/cc", "#!/bin/sh\ncase \" $* \" in\n    *\" -c \"*) ;;\n    *\" -o out/held_app \"*libblink_std.a*) if [ -e {tree}/hold_link ]; then touch {tree}/held; while [ ! -e {tree}/release ]; do sleep 0.05; done; fi ;;\nesac\nexec {real} \"$@\"\n").unwrap()
     process.run("sh", ["-c", "chmod +x {tree}/ccwrap/cc"]).unwrap()
-    write_file("{tree}/app/held.bl", "fn main() \{\n    io.println(\"held\")\n\}\n")
-    write_file("{tree}/app/other.bl", "fn main() \{\n    io.println(\"other\")\n\}\n")
+    fs.write("{tree}/app/held.bl", "fn main() \{\n    io.println(\"held\")\n\}\n").unwrap()
+    fs.write("{tree}/app/other.bl", "fn main() \{\n    io.println(\"other\")\n\}\n").unwrap()
 }
 
 // The corpus exports BLINK_COMPILER_ARCHIVE and may export BLINK_PER_MODULE, so the run drops
@@ -59,12 +59,12 @@ type PairRun {
 
 // Holds a build of held.bl at its link, runs a build of other.bl to its end, then lets the
 // held build go and waits for it.
-fn run_pair(tree: Str, cache: Str, args: Str) -> PairRun {
+fn run_pair(tree: Str, cache: Str, args: Str) -> PairRun ! Process.Spawn, FS.Read {
     plant_unmarked(tree)
     process.run("sh", ["-c", "rm -f {tree}/held {tree}/release {tree}/held_rc && touch {tree}/hold_link"]).unwrap()
     process.run("sh", ["-c", "cd {tree}/app && \{ sh -c '{env_of(tree, cache)} ../build/blink build held.bl -o out/held_app {args} > {tree}/held.log 2>&1; echo $? > {tree}/held_rc' > /dev/null 2>&1 & \}"]).unwrap()
     let reached = process.run("sh", ["-c", "for i in $(seq 1 2400); do [ -e {tree}/held ] && exit 0; [ -e {tree}/held_rc ] && exit 1; sleep 0.05; done; exit 1"]).unwrap().success()
-    let before = if reached { private_dirs(tree) } else { "never reached the link: {read_file("{tree}/held.log")}" }
+    let before = if reached { private_dirs(tree) } else { "never reached the link: {fs.read("{tree}/held.log").unwrap()}" }
     let other = process.run("sh", ["-c", "cd {tree}/app && {env_of(tree, cache)} ../build/blink build other.bl -o out/other {args}"]).unwrap()
     let after = private_dirs(tree)
     process.run("sh", ["-c", "rm -f {tree}/hold_link && touch {tree}/release"]).unwrap()

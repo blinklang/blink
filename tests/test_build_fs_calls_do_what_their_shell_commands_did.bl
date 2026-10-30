@@ -4,6 +4,19 @@
 
 import build_fs
 import std.testing.{capture_eprint}
+import std.fs.{FsErrorExt, FileKind}
+
+fn mtime_of(path: Str) -> Int ! FS.Read {
+    fs.stat(path).unwrap().mtime.to_unix_ms()
+}
+
+// A stat that fails for another reason than a missing entry counts as there.
+fn path_exists(path: Str) -> Bool ! FS.Read {
+    match fs.stat(path) {
+        Ok(_) => true
+        Err(e) => !e.not_found()
+    }
+}
 
 let DIR = "build/build_fs_calls_probe"
 
@@ -18,9 +31,9 @@ fn mode_of(path: Str) -> Str {
 test "mkdir_p makes each missing directory, and is true for one already there" {
     fresh()
     assert(build_fs.mkdir_p("{DIR}/a/b/c"), "mkdir_p failed")
-    assert_eq(is_dir("{DIR}/a/b/c"), 1)
+    assert(fs.stat("{DIR}/a/b/c").unwrap().kind == FileKind.Dir)
     assert(build_fs.mkdir_p("{DIR}/a/b"), "mkdir_p of an existing directory failed")
-    write_file("{DIR}/file", "x")
+    fs.write("{DIR}/file", "x").unwrap()
     assert(!build_fs.mkdir_p("{DIR}/file/sub"), "mkdir_p under a file gave true")
     assert(!build_fs.mkdir_p(""), "mkdir_p of an empty path gave true")
 }
@@ -29,12 +42,12 @@ test "remove_tree removes a tree but never follows a link out of it" {
     fresh()
     process.run("sh", ["-c", "mkdir -p {DIR}/t/d/e {DIR}/keep && echo k > {DIR}/keep/k && echo x > {DIR}/t/d/e/x && echo .h > {DIR}/t/.hidden && ln -s ../keep {DIR}/t/link"])?
     assert(build_fs.remove_tree("{DIR}/t"), "remove_tree failed")
-    assert_eq(file_exists("{DIR}/t"), 0)
-    assert_eq(read_file("{DIR}/keep/k"), "k\n")
+    assert(!path_exists("{DIR}/t"))
+    assert_eq(fs.read("{DIR}/keep/k").unwrap(), "k\n")
     assert(build_fs.remove_tree("{DIR}/missing"), "remove_tree of a missing path gave false")
-    write_file("{DIR}/one", "1")
+    fs.write("{DIR}/one", "1").unwrap()
     assert(build_fs.remove_tree("{DIR}/one"), "remove_tree of a file failed")
-    assert_eq(file_exists("{DIR}/one"), 0)
+    assert(!path_exists("{DIR}/one"))
 }
 
 test "rename moves a directory onto a missing name and fails onto a full one" {
@@ -42,8 +55,8 @@ test "rename moves a directory onto a missing name and fails onto a full one" {
     process.run("sh", ["-c", "mkdir -p {DIR}/from {DIR}/full && echo a > {DIR}/from/a && echo b > {DIR}/full/b"])?
     assert(!build_fs.rename("{DIR}/from", "{DIR}/full"), "rename onto a directory with entries gave true")
     assert(build_fs.rename("{DIR}/from", "{DIR}/to"), "rename failed")
-    assert_eq(read_file("{DIR}/to/a"), "a\n")
-    assert_eq(file_exists("{DIR}/from"), 0)
+    assert_eq(fs.read("{DIR}/to/a").unwrap(), "a\n")
+    assert(!path_exists("{DIR}/from"))
 }
 
 test "private_dir makes a new directory only its user may enter" {
@@ -53,24 +66,24 @@ test "private_dir makes a new directory only its user may enter" {
     assert(a.starts_with("{DIR}/.units."), "private_dir named it {a}")
     assert_eq(a.byte_len(), "{DIR}/.units.".byte_len() + 6)
     assert(a != b, "private_dir gave one name twice")
-    assert_eq(is_dir(a), 1)
+    assert(fs.stat(a).unwrap().kind == FileKind.Dir)
     assert_eq(mode_of(a), "700")
     assert_eq(build_fs.private_dir("{DIR}/missing", "x"), "")
 }
 
 test "touch moves the mtime and keeps the bytes" {
     fresh()
-    write_file("{DIR}/meta", "123 mod \n")
+    fs.write("{DIR}/meta", "123 mod \n").unwrap()
     process.run("sh", ["-c", "touch -d '2001-01-01' {DIR}/meta {DIR}/empty_old 2>/dev/null || touch -t 200101010000 {DIR}/meta {DIR}/empty_old"])?
-    let before = file_mtime("{DIR}/meta")
+    let before = mtime_of("{DIR}/meta")
     assert(build_fs.touch("{DIR}/meta"), "touch failed")
-    assert(file_mtime("{DIR}/meta") > before, "touch left the mtime")
-    assert_eq(read_file("{DIR}/meta"), "123 mod \n")
-    let empty_before = file_mtime("{DIR}/empty_old")
+    assert(mtime_of("{DIR}/meta") > before, "touch left the mtime")
+    assert_eq(fs.read("{DIR}/meta").unwrap(), "123 mod \n")
+    let empty_before = mtime_of("{DIR}/empty_old")
     assert(build_fs.touch("{DIR}/empty_old"), "touch of an empty file failed")
-    assert(file_mtime("{DIR}/empty_old") > empty_before, "touch left an empty file's mtime")
+    assert(mtime_of("{DIR}/empty_old") > empty_before, "touch left an empty file's mtime")
     assert(build_fs.touch("{DIR}/new"), "touch of a missing file failed")
-    assert_eq(file_exists("{DIR}/new"), 1)
+    assert(path_exists("{DIR}/new"))
     assert_eq(build_fs.file_size("{DIR}/meta"), 9)
     assert_eq(build_fs.file_size("{DIR}/none"), -1)
 }
@@ -123,7 +136,7 @@ test "run_shell gives the exit code of the line sh runs, and -1 for a signal" {
 
 test "the _or_report calls name the path they could not make or remove" {
     fresh()
-    write_file("{DIR}/file", "x")
+    fs.write("{DIR}/file", "x").unwrap()
     let got: List[Str] = []
     with capture_eprint(got) {
         assert(!build_fs.mkdir_p_or_report("{DIR}/file/sub"), "mkdir_p_or_report under a file gave true")

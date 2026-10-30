@@ -15,7 +15,7 @@ fn sh(cmd: Str) -> Str {
     process.run("sh", ["-c", cmd]).unwrap().out.trim()
 }
 
-fn dev_tree(root: Str, tree: Str) {
+fn dev_tree(root: Str, tree: Str) ! Process.Spawn, FS.Write {
     process.run("sh", ["-c", "rm -rf {tree}"]).unwrap()
     process.run("sh", ["-c", "mkdir -p {tree}/build {tree}/app/src"]).unwrap()
     // A copy, not a link: the install root comes from realpath(argv[0]).
@@ -26,15 +26,15 @@ fn dev_tree(root: Str, tree: Str) {
     }
     // A dev build/ can hold runtime.h only beside the archive it links to.
     process.run("sh", ["-c", "[ -e {tree}/build/runtime.h ] || cp -L $(dirname $(readlink -f {root}/build/libblink_std.h))/runtime.h {tree}/build/runtime.h"]).unwrap()
-    write_file("{tree}/app/blink.toml", "[package]\nname = \"daemon_ptr_field_edit_app\"\nversion = \"0.1.0\"\n")
+    fs.write("{tree}/app/blink.toml", "[package]\nname = \"daemon_ptr_field_edit_app\"\nversion = \"0.1.0\"\n").unwrap()
     // A lock no older than blink.toml keeps "resolving dependencies..." out of every check.
-    write_file("{tree}/app/blink.lock", "[metadata]\nlockfile-version = 1\n")
+    fs.write("{tree}/app/blink.lock", "[metadata]\nlockfile-version = 1\n").unwrap()
     // The edits below turn W.n, or Inner.v that W holds, into a Ptr and back.
-    write_file("{tree}/app/src/shapes.bl", "pub type Inner \{\n    v: Int\n\}\n\npub type W \{\n    i: Inner\n    n: Int\n\}\n")
-    write_file("{tree}/app/src/main.bl", "import shapes.\{W\}\n\n@ffi(\"c\", \"mk_w\")\n@trusted(audit: \"PTR-FIELD-EDIT\")\nfn mk_w(p: Ptr[U8]) -> W ! () \{ \}\n\nfn main() \{\n    let _ = with ffi.scope() as s \{\n        let p = s.alloc[U8]()\n        mk_w(p)\n    \}\n\}\n")
+    fs.write("{tree}/app/src/shapes.bl", "pub type Inner \{\n    v: Int\n\}\n\npub type W \{\n    i: Inner\n    n: Int\n\}\n").unwrap()
+    fs.write("{tree}/app/src/main.bl", "import shapes.\{W\}\n\n@ffi(\"c\", \"mk_w\")\n@trusted(audit: \"PTR-FIELD-EDIT\")\nfn mk_w(p: Ptr[U8]) -> W ! () \{ \}\n\nfn main() \{\n    let _ = with ffi.scope() as s \{\n        let p = s.alloc[U8]()\n        mk_w(p)\n    \}\n\}\n").unwrap()
     // The idle poll would check an edit cold and keep no source, if the request after the
     // edit came later than its wait; the hold keeps it off, so each warm check is a request's.
-    write_file("{tree}/hold", "")
+    fs.write("{tree}/hold", "").unwrap()
 }
 
 // The knob setting of the run under way: "" keeps sources, "BLINK_DEV_DAEMON_KEEP_SOURCES=0"
@@ -133,18 +133,18 @@ fn printed(step: Str, needle: Str, want: Bool) -> Str {
 }
 
 // Replaces `old`, which must occur once, with `new` in src/<file> of both trees.
-fn edit_both(warm: Str, cold: Str, file: Str, old: Str, new: Str) {
+fn edit_both(warm: Str, cold: Str, file: Str, old: Str, new: Str) ! FS.Read, FS.Write {
     for t in [warm, cold] {
         let path = "{t}/app/src/{file}"
-        let before = read_file(path)
+        let before = fs.read(path).unwrap()
         assert_eq(before.split(old).len(), 2)
-        write_file(path, before.replace(old, new))
+        fs.write(path, before.replace(old, new)).unwrap()
     }
 }
 
 // Runs the edits under `with_knob` and asserts that each warm check printed what the cold
 // check printed, and the verdict each edit calls for.
-fn run_edits(tag: Str, with_knob: Str) {
+fn run_edits(tag: Str, with_knob: Str) ! FS.Read, Process.Spawn, FS.Write {
     knob = with_knob
     last_warm = ""
     warm_checks = 0
@@ -157,7 +157,7 @@ fn run_edits(tag: Str, with_knob: Str) {
     let mut problems: List[Str] = []
     let mut checks = -1
     with cleanup(fn() { stop_daemon(pid) }) {
-        assert(pid > 0, "the daemon did not start: {read_file("{warm}/daemon.log")}")
+        assert(pid > 0, "the daemon did not start: {fs.read("{warm}/daemon.log").unwrap()}")
         let escape = "PtrEscapesFfiScope"
         problems.push(compare(warm, cold, "the first check"))
         problems.push(printed("the first check", escape, false))

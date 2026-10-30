@@ -7,7 +7,7 @@ import std.testing.{cleanup}
 import compile_test_helpers
 import compile_test_helpers.{sh, appears, bg_result}
 
-fn dev_tree(root: Str, tree: Str, name: Str) {
+fn dev_tree(root: Str, tree: Str, name: Str) ! Process.Spawn, FS.Write {
     process.run("sh", ["-c", "rm -rf {tree}"]).unwrap()
     process.run("sh", ["-c", "mkdir -p {tree}/build {tree}/app/src"]).unwrap()
     // A copy, not a link: the install root comes from realpath(argv[0]).
@@ -19,25 +19,25 @@ fn dev_tree(root: Str, tree: Str, name: Str) {
     // A dev build/ can hold runtime.h only beside the archive it links to.
     process.run("sh", ["-c", "[ -e {tree}/build/runtime.h ] || cp -L $(dirname $(readlink -f {root}/build/libblink_std.h))/runtime.h {tree}/build/runtime.h"]).unwrap()
     // The daemon listens at the project root, so each tree is a project of its own.
-    write_file("{tree}/app/blink.toml", "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\n")
+    fs.write("{tree}/app/blink.toml", "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\n").unwrap()
     // A lock no older than blink.toml keeps "resolving dependencies..." out of every build.
-    write_file("{tree}/app/blink.lock", "[metadata]\nlockfile-version = 1\n")
-    write_file("{tree}/app/src/base.bl", [
+    fs.write("{tree}/app/blink.lock", "[metadata]\nlockfile-version = 1\n").unwrap()
+    fs.write("{tree}/app/src/base.bl", [
         #"pub fn tag(s: Str) -> Str {"#,
         #"    "[{s}]""#,
         #"}"#,
         #""#,
-    ].join("\n"))
-    write_file("{tree}/app/src/leaf.bl", [
+    ].join("\n")).unwrap()
+    fs.write("{tree}/app/src/leaf.bl", [
         #"import base.{tag}"#,
         #""#,
         #"pub fn leaf_value() -> Str {"#,
         #"    tag("leaf")"#,
         #"}"#,
         #""#,
-    ].join("\n"))
+    ].join("\n")).unwrap()
     for name in ["main", "second"] {
-        write_file("{tree}/app/src/{name}.bl", [
+        fs.write("{tree}/app/src/{name}.bl", [
             #"import base.{tag}"#,
             #"import leaf.{leaf_value}"#,
             #""#,
@@ -45,7 +45,7 @@ fn dev_tree(root: Str, tree: Str, name: Str) {
             "    io.println(\"\{tag(\"{name}\")\} \{leaf_value()\}\")",
             #"}"#,
             #""#,
-        ].join("\n"))
+        ].join("\n")).unwrap()
     }
 }
 
@@ -60,10 +60,10 @@ fn env_of(tree: Str) -> Str {
 // A cc that tells the test it started and then waits while cc.hold exists, then runs the
 // real cc. A build whose cc is held can not end, so whatever the test sees meanwhile it sees
 // while that build runs.
-fn hold_cc(tree: Str) {
+fn hold_cc(tree: Str) ! Process.Spawn, FS.Write {
     let real = sh("command -v cc")
     process.run("sh", ["-c", "mkdir -p {tree}/ccwrap"]).unwrap()
-    write_file("{tree}/ccwrap/cc", "#!/bin/sh\nif [ -e {tree}/cc.hold ]; then\n    touch {tree}/cc.started\n    while [ -e {tree}/cc.hold ]; do sleep 0.05; done\nfi\nexec {real} \"$@\"\n")
+    fs.write("{tree}/ccwrap/cc", "#!/bin/sh\nif [ -e {tree}/cc.hold ]; then\n    touch {tree}/cc.started\n    while [ -e {tree}/cc.hold ]; do sleep 0.05; done\nfi\nexec {real} \"$@\"\n").unwrap()
     process.run("sh", ["-c", "chmod +x {tree}/ccwrap/cc"]).unwrap()
 }
 
@@ -154,11 +154,11 @@ fn output_differ(a_tree: Str, b_tree: Str, out: Str) -> Str {
     sh("cd {b}.units && for f in *.c *.h; do cmp -s $f {a}.units/$f || echo $f; done; cd {a}.units && for f in *.c *.h; do [ -e {b}.units/$f ] || echo extra:$f; done; cmp -s {a} {b} || echo program").split("\n").join(" ")
 }
 
-fn edit(tree: Str, file: Str, sed: Str) {
+fn edit(tree: Str, file: Str, sed: Str) ! FS.Read, Process.Spawn {
     let path = "{tree}/app/src/{file}"
-    let before = read_file(path)
+    let before = fs.read(path).unwrap()
     process.run("sh", ["-c", "sed -i '{sed}' {path}"]).unwrap()
-    assert(read_file(path) != before, "the edit `{sed}` did not change {file}")
+    assert(fs.read(path).unwrap() != before, "the edit `{sed}` did not change {file}")
 }
 
 // Whether one status reply shows one build running and one waiting, within secs seconds.
@@ -198,7 +198,7 @@ test "a build of a second entry sent while a build of the first runs waits its t
         process.run("sh", ["-c", "rm -f {warm}/cc.hold"]).unwrap()
         stop_daemon(pid)
     }) {
-        assert(pid > 0, "the daemon did not start: {read_file("{warm}/daemon.log")}")
+        assert(pid > 0, "the daemon did not start: {fs.read("{warm}/daemon.log").unwrap()}")
         // Each entry warm first, so the edit below makes each build compile its own leaf.
         let _w0 = blink_bounded(warm, "build src/second.bl -o out/second")
         let _w1 = blink_bounded(warm, "build src/main.bl -o out/app")
@@ -208,7 +208,7 @@ test "a build of a second entry sent while a build of the first runs waits its t
         held = appears("{warm}/cc.started", 120)
         blink_bg(warm, "build src/second.bl -o out/second", "b2")
         waited = one_builds_one_waits(warm, 60)
-        running = file_exists("{warm}/b1.rc") != 1 && file_exists("{warm}/b2.rc") != 1
+        running = !compile_test_helpers.path_exists("{warm}/b1.rc") && !compile_test_helpers.path_exists("{warm}/b2.rc")
         process.run("sh", ["-c", "rm -f {warm}/cc.hold"])?
         b1 = bg_result(warm, "b1")
         b2 = bg_result(warm, "b2")
@@ -264,7 +264,7 @@ test "a stop sent while one entry builds and another waits sends the waiting bui
         process.run("sh", ["-c", "rm -f {warm}/cc.hold"]).unwrap()
         stop_daemon(pid)
     }) {
-        assert(pid > 0, "the daemon did not start: {read_file("{warm}/daemon.log")}")
+        assert(pid > 0, "the daemon did not start: {fs.read("{warm}/daemon.log").unwrap()}")
         let _w0 = blink_bounded(warm, "build src/second.bl -o out/second")
         let _w1 = blink_bounded(warm, "build src/main.bl -o out/app")
         edit(warm, "leaf.bl", #"s/"leaf"/"lea2"/"#)
@@ -279,7 +279,7 @@ test "a stop sent while one entry builds and another waits sends the waiting bui
         // holds its build a while after the stop came.
         process.run("sh", ["-c", "sleep 0.5"])?
         let st = blink_bounded(warm, "daemon status").out
-        still_waits = "building={field_of(st, "building")} queued={field_of(st, "queued")} b2_ended={file_exists("{warm}/b2.rc")}"
+        still_waits = "building={field_of(st, "building")} queued={field_of(st, "queued")} b2_ended={compile_test_helpers.path_exists("{warm}/b2.rc")}"
         process.run("sh", ["-c", "rm -f {warm}/cc.hold"])?
         b1 = bg_result(warm, "b1")
         b2 = bg_result(warm, "b2")
@@ -296,7 +296,7 @@ test "a stop sent while one entry builds and another waits sends the waiting bui
     process.run("sh", ["-c", "rm -rf {warm} {cold}"])?
     assert(waited, "no status showed one build running and one waiting")
     assert(stop_seen, "no status showed the stop under way")
-    assert_eq(still_waits, "building=1 queued=1 b2_ended=0")
+    assert_eq(still_waits, "building=1 queued=1 b2_ended=false")
     assert_eq(s.end, ChildEnd.Exited(0))
     assert_eq(differ(warm, b1, cold, c1), "")
     assert_eq(differ(warm, b2, cold, c2), "")

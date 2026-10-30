@@ -11,7 +11,7 @@ fn sh(cmd: Str) -> Str {
     process.run("sh", ["-c", cmd]).unwrap().out.trim()
 }
 
-fn dev_tree(root: Str, tree: Str) {
+fn dev_tree(root: Str, tree: Str) ! Process.Spawn, FS.Write {
     process.run("sh", ["-c", "rm -rf {tree}"]).unwrap()
     process.run("sh", ["-c", "mkdir -p {tree}/build {tree}/app/src"]).unwrap()
     // A copy, not a link: the install root comes from realpath(argv[0]).
@@ -23,10 +23,10 @@ fn dev_tree(root: Str, tree: Str) {
     // A dev build/ can hold runtime.h only beside the archive it links to.
     process.run("sh", ["-c", "[ -e {tree}/build/runtime.h ] || cp -L $(dirname $(readlink -f {root}/build/libblink_std.h))/runtime.h {tree}/build/runtime.h"]).unwrap()
     // The daemon listens at the project root, so each tree is a project of its own.
-    write_file("{tree}/app/blink.toml", "[package]\nname = \"daemon_pub_fn_app\"\nversion = \"0.1.0\"\n")
+    fs.write("{tree}/app/blink.toml", "[package]\nname = \"daemon_pub_fn_app\"\nversion = \"0.1.0\"\n").unwrap()
     // A lock no older than blink.toml keeps "resolving dependencies..." out of every build.
-    write_file("{tree}/app/blink.lock", "[metadata]\nlockfile-version = 1\n")
-    write_file("{tree}/app/src/lib.bl", [
+    fs.write("{tree}/app/blink.lock", "[metadata]\nlockfile-version = 1\n").unwrap()
+    fs.write("{tree}/app/src/lib.bl", [
         #"pub fn used_fn(n: Int) -> Int {"#,
         #"    n * 2"#,
         #"}"#,
@@ -35,16 +35,16 @@ fn dev_tree(root: Str, tree: Str) {
         #"    5"#,
         #"}"#,
         #""#,
-    ].join("\n"))
-    write_file("{tree}/app/src/user.bl", [
+    ].join("\n")).unwrap()
+    fs.write("{tree}/app/src/user.bl", [
         #"import lib.{used_fn}"#,
         #""#,
         #"pub fn user_value() -> Int {"#,
         #"    used_fn(2)"#,
         #"}"#,
         #""#,
-    ].join("\n"))
-    write_file("{tree}/app/src/main.bl", [
+    ].join("\n")).unwrap()
+    fs.write("{tree}/app/src/main.bl", [
         #"import lib.{other_fn}"#,
         #"import user.{user_value}"#,
         #""#,
@@ -52,7 +52,7 @@ fn dev_tree(root: Str, tree: Str) {
         #"    io.println("values {user_value()} {other_fn()}")"#,
         #"}"#,
         #""#,
-    ].join("\n"))
+    ].join("\n")).unwrap()
 }
 
 // The corpus exports BLINK_COMPILER_ARCHIVE and may export BLINK_PER_MODULE; the first makes
@@ -133,14 +133,14 @@ fn differ(a_tree: Str, a: ProcessResult, b_tree: Str, b: ProcessResult) -> Str {
 
 // What a file in a tree's out/ holds, with the tree's path spelled the same in every tree.
 // The record names the inputs text by its sha, which the path is part of, so that line goes.
-fn out_file(tree: Str, name: Str) -> Str {
-    let text = read_file("{tree}/app/out/{name}").replace(tree, "TREE")
+fn out_file(tree: Str, name: Str) -> Str ! FS.Read {
+    let text = fs.read("{tree}/app/out/{name}").unwrap().replace(tree, "TREE")
     if !name.ends_with("/.emit-record") { return text }
     text.split("\n").filter(fn(l) { !l.starts_with("inputs ") }).join("\n")
 }
 
 // The files each tree's out/ holds, by name and then content, that the other's does not.
-fn files_differ(a_tree: Str, b_tree: Str) -> Str {
+fn files_differ(a_tree: Str, b_tree: Str) -> Str ! FS.Read {
     let list = "find . -type f | LC_ALL=C sort"
     let a = sh("mkdir -p {a_tree}/app/out && cd {a_tree}/app/out && {list}")
     let b = sh("mkdir -p {b_tree}/app/out && cd {b_tree}/app/out && {list}")
@@ -152,11 +152,11 @@ fn files_differ(a_tree: Str, b_tree: Str) -> Str {
     different.join(" ")
 }
 
-fn edit_lib(tree: Str, from: Str, to: Str) {
+fn edit_lib(tree: Str, from: Str, to: Str) ! FS.Read, FS.Write {
     let path = "{tree}/app/src/lib.bl"
-    let before = read_file(path)
-    write_file(path, before.replace(from, to))
-    assert(read_file(path) != before, "the edit to {from} did not change lib.bl")
+    let before = fs.read(path).unwrap()
+    fs.write(path, before.replace(from, to)).unwrap()
+    assert(fs.read(path).unwrap() != before, "the edit to {from} did not change lib.bl")
 }
 
 test "a daemon build after a pub fn is added or its signature changes matches a cold one" {
@@ -170,7 +170,7 @@ test "a daemon build after a pub fn is added or its signature changes matches a 
     let mut builds = -1
     let pid = start_daemon(warm)
     with cleanup(fn() { stop_daemon(pid) }) {
-        assert(pid > 0, "the daemon did not start: {read_file("{warm}/daemon.log")}")
+        assert(pid > 0, "the daemon did not start: {fs.read("{warm}/daemon.log").unwrap()}")
         let edits = [
             ("", ""),
             ("pub fn other_fn", "pub fn added_fn() -> Int \{\n    7\n}\n\npub fn other_fn"),

@@ -13,15 +13,15 @@ fn sh(cmd: Str) -> ProcessResult {
     process.run("sh", ["-c", cmd], limits: ChildLimits { timeout: Some(Duration.seconds(400)) }).unwrap()
 }
 
-fn project(files: List[(Str, Str)]) -> Str {
+fn project(files: List[(Str, Str)]) -> Str ! FS.Write {
     let dir = sh("mktemp -d /tmp/blink_test_parallel.XXXXXX").out.trim()
     let _ = sh("mkdir -p {dir}/src {dir}/tests")
-    write_file("{dir}/blink.toml", PACKAGE)
+    fs.write("{dir}/blink.toml", PACKAGE).unwrap()
     // A lock no older than blink.toml keeps dependency resolution out of the command.
-    write_file("{dir}/blink.lock", "[metadata]\nlockfile-version = 1\n")
+    fs.write("{dir}/blink.lock", "[metadata]\nlockfile-version = 1\n").unwrap()
     for f in files {
         let (name, source) = f
-        write_file("{dir}/tests/{name}.bl", source)
+        fs.write("{dir}/tests/{name}.bl", source).unwrap()
     }
     dir
 }
@@ -86,10 +86,10 @@ test "a file that ends first gets its own file line, with its own counts" {
     // The slow file waits until the fast file's test has run, then a while longer, so the
     // files end in the order fast, slow, whatever order they start in.
     let mark = "{dir}/fast_ran"
-    let slow = "import std.time.\{Duration}\n\ntest \"slow one\" \{\n    while file_exists(\"{mark}\") == 0 \{\n        time.sleep(Duration.ms(20))\n    }\n    time.sleep(Duration.ms(1500))\n    assert_eq(1, 1)\n}\n\ntest \"slow two\" \{\n    assert_eq(1, 1)\n}\n"
-    let fast = "test \"fast\" \{\n    write_file(\"{mark}\", \"\")\n    assert_eq(1, 2)\n}\n"
-    write_file("{dir}/tests/test_a_slow.bl", slow)
-    write_file("{dir}/tests/test_b_fast.bl", fast)
+    let slow = "import std.time.\{Duration}\nimport std.fs.\{FsErrorExt}\n\nfn path_exists(path: Str) -> Bool ! FS.Read \{\n    match fs.stat(path) \{\n        Ok(_) => true\n        Err(e) => !e.not_found()\n    }\n}\n\ntest \"slow one\" \{\n    while !path_exists(\"{mark}\") \{\n        time.sleep(Duration.ms(20))\n    }\n    time.sleep(Duration.ms(1500))\n    assert_eq(1, 1)\n}\n\ntest \"slow two\" \{\n    assert_eq(1, 1)\n}\n"
+    let fast = "test \"fast\" \{\n    fs.write(\"{mark}\", \"\").unwrap()\n    assert_eq(1, 2)\n}\n"
+    fs.write("{dir}/tests/test_a_slow.bl", slow).unwrap()
+    fs.write("{dir}/tests/test_b_fast.bl", fast).unwrap()
     let r = blink_test(dir, "--json --parallel 2 tests")
     let _ = sh("rm -rf {dir}")
     assert_eq(r.end, ChildEnd.Exited(1), diag(r))

@@ -15,7 +15,7 @@ fn sh(cmd: Str) -> Str {
     process.run("sh", ["-c", cmd]).unwrap().out.trim()
 }
 
-fn dev_tree(root: Str, tree: Str) {
+fn dev_tree(root: Str, tree: Str) ! Process.Spawn, FS.Write {
     process.run("sh", ["-c", "rm -rf {tree}"]).unwrap()
     process.run("sh", ["-c", "mkdir -p {tree}/build {tree}/app/src"]).unwrap()
     // A copy, not a link: the install root comes from realpath(argv[0]).
@@ -27,8 +27,8 @@ fn dev_tree(root: Str, tree: Str) {
     }
     // A dev build/ can hold runtime.h only beside the archive it links to.
     process.run("sh", ["-c", "[ -e {tree}/build/runtime.h ] || cp -L $(dirname $(readlink -f {root}/build/libblink_std.h))/runtime.h {tree}/build/runtime.h"]).unwrap()
-    write_file("{tree}/app/blink.toml", "[package]\nname = \"test_block_reuse_app\"\nversion = \"0.1.0\"\n")
-    write_file("{tree}/app/src/base.bl", [
+    fs.write("{tree}/app/blink.toml", "[package]\nname = \"test_block_reuse_app\"\nversion = \"0.1.0\"\n").unwrap()
+    fs.write("{tree}/app/src/base.bl", [
         #"pub fn tag(s: Str) -> Str {"#,
         #"    "[{s}]""#,
         #"}"#,
@@ -37,8 +37,8 @@ fn dev_tree(root: Str, tree: Str) {
         #"    a"#,
         #"}"#,
         #""#,
-    ].join("\n"))
-    write_file("{tree}/app/src/mid.bl", [
+    ].join("\n")).unwrap()
+    fs.write("{tree}/app/src/mid.bl", [
         #"import base.{tag}"#,
         #""#,
         #"pub fn mid_value() -> Str {"#,
@@ -49,16 +49,16 @@ fn dev_tree(root: Str, tree: Str) {
         #"    n * 2"#,
         #"}"#,
         #""#,
-    ].join("\n"))
-    write_file("{tree}/app/src/leaf.bl", [
+    ].join("\n")).unwrap()
+    fs.write("{tree}/app/src/leaf.bl", [
         #"import base.{pair_left, tag}"#,
         #""#,
         #"pub fn leaf_value() -> Str {"#,
         #"    tag(pair_left(["leaf"].get(0).unwrap(), "x"))"#,
         #"}"#,
         #""#,
-    ].join("\n"))
-    write_file("{tree}/app/src/main.bl", [
+    ].join("\n")).unwrap()
+    fs.write("{tree}/app/src/main.bl", [
         #"import base.{tag}"#,
         #"import mid.{mid_value}"#,
         #"import leaf.{leaf_value}"#,
@@ -67,7 +67,7 @@ fn dev_tree(root: Str, tree: Str) {
         #"    io.println("{tag("main")} {mid_value()} {leaf_value()}")"#,
         #"}"#,
         #""#,
-    ].join("\n"))
+    ].join("\n")).unwrap()
 }
 
 // The corpus exports BLINK_COMPILER_ARCHIVE and may export BLINK_PER_MODULE; the first makes
@@ -113,9 +113,9 @@ fn warm_and_cold(tree: Str, what: Str) -> Str {
     "{what}: took {reused_units(warm).join(",")}; differ [{differ.split("\n").join(" ")}]; prints {warm_out}, same as cold {same_out}"
 }
 
-fn append(tree: Str, file: Str, text: Str) {
+fn append(tree: Str, file: Str, text: Str) ! FS.Write, FS.Read {
     let path = "{tree}/app/src/{file}"
-    write_file(path, "{read_file(path)}{text}")
+    fs.write(path, "{fs.read(path).unwrap()}{text}").unwrap()
 }
 
 test "a test block added to or removed from an imported module emits only that module's unit" {
@@ -123,29 +123,29 @@ test "a test block added to or removed from an imported module emits only that m
     let tree = "{compile_test_helpers.scratch_root()}/_test_block_unit_reuse_{getpid()}"
     dev_tree(root, tree)
     let _first = build_into(tree, "out")
-    let leaf_before = read_file("{tree}/app/src/leaf.bl")
-    let base_before = read_file("{tree}/app/src/base.bl")
+    let leaf_before = fs.read("{tree}/app/src/leaf.bl").unwrap()
+    let base_before = fs.read("{tree}/app/src/base.bl").unwrap()
     let probe = "\ntest \"pair\" \{\n    let inc = fn(x: Int) -> Int \{ x + 1 }\n    assert_eq(pair_left(inc(1), 3), 2)\n    assert_eq(pair_left(\"a\", \"b\"), \"a\")\n}\n"
     let mut seen: List[Str] = []
     append(tree, "leaf.bl", probe)
     seen.push(warm_and_cold(tree, "test added to leaf"))
-    write_file("{tree}/app/src/leaf.bl", leaf_before)
+    fs.write("{tree}/app/src/leaf.bl", leaf_before).unwrap()
     seen.push(warm_and_cold(tree, "test removed from leaf"))
     // Above leaf_value, the test moves the line its unwrap panic names, so leaf's C changes.
-    write_file("{tree}/app/src/leaf.bl", leaf_before.replace("import base.\{pair_left, tag}\n", "import base.\{pair_left, tag}\n{probe}"))
+    fs.write("{tree}/app/src/leaf.bl", leaf_before.replace("import base.\{pair_left, tag}\n", "import base.\{pair_left, tag}\n{probe}")).unwrap()
     seen.push(warm_and_cold(tree, "test added above the code of leaf"))
-    write_file("{tree}/app/src/leaf.bl", leaf_before)
+    fs.write("{tree}/app/src/leaf.bl", leaf_before).unwrap()
     seen.push(warm_and_cold(tree, "test removed from above the code of leaf"))
     // The test is the only user of mid_twice, so no build of the program lowers it.
-    let mid_before = read_file("{tree}/app/src/mid.bl")
+    let mid_before = fs.read("{tree}/app/src/mid.bl").unwrap()
     append(tree, "mid.bl", "\ntest \"twice\" \{\n    assert_eq(mid_twice(2), 4)\n}\n")
     seen.push(warm_and_cold(tree, "test that alone calls a private fn added to mid"))
-    write_file("{tree}/app/src/mid.bl", mid_before)
+    fs.write("{tree}/app/src/mid.bl", mid_before).unwrap()
     seen.push(warm_and_cold(tree, "test that alone calls a private fn removed from mid"))
     // base is imported by every module.
     append(tree, "base.bl", probe)
     seen.push(warm_and_cold(tree, "test added to base"))
-    write_file("{tree}/app/src/base.bl", base_before)
+    fs.write("{tree}/app/src/base.bl", base_before).unwrap()
     seen.push(warm_and_cold(tree, "test removed from base"))
     process.run("sh", ["-c", "rm -rf {tree}"])?
     assert_eq(seen.join("\n"), [

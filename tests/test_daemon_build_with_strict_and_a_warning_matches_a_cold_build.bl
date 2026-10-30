@@ -11,7 +11,7 @@ fn sh(cmd: Str) -> Str {
     process.run("sh", ["-c", cmd]).unwrap().out.trim()
 }
 
-fn dev_tree(root: Str, tree: Str) {
+fn dev_tree(root: Str, tree: Str) ! Process.Spawn, FS.Write {
     process.run("sh", ["-c", "rm -rf {tree}"]).unwrap()
     process.run("sh", ["-c", "mkdir -p {tree}/build {tree}/app/src"]).unwrap()
     // A copy, not a link: the install root comes from realpath(argv[0]).
@@ -23,17 +23,17 @@ fn dev_tree(root: Str, tree: Str) {
     // A dev build/ can hold runtime.h only beside the archive it links to.
     process.run("sh", ["-c", "[ -e {tree}/build/runtime.h ] || cp -L $(dirname $(readlink -f {root}/build/libblink_std.h))/runtime.h {tree}/build/runtime.h"]).unwrap()
     // The daemon listens at the project root, so each tree is a project of its own.
-    write_file("{tree}/app/blink.toml", "[package]\nname = \"daemon_strict_app\"\nversion = \"0.1.0\"\n")
+    fs.write("{tree}/app/blink.toml", "[package]\nname = \"daemon_strict_app\"\nversion = \"0.1.0\"\n").unwrap()
     // A lock no older than blink.toml keeps "resolving dependencies..." out of every build.
-    write_file("{tree}/app/blink.lock", "[metadata]\nlockfile-version = 1\n")
-    write_file("{tree}/app/src/main.bl", [
+    fs.write("{tree}/app/blink.lock", "[metadata]\nlockfile-version = 1\n").unwrap()
+    fs.write("{tree}/app/src/main.bl", [
         #"import leaf.{leaf_value}"#,
         #""#,
         #"fn main() {"#,
         #"    io.println(leaf_value())"#,
         #"}"#,
         #""#,
-    ].join("\n"))
+    ].join("\n")).unwrap()
 }
 
 // An unused local: a warning from the front end.
@@ -149,14 +149,14 @@ fn differ(a_tree: Str, a: ProcessResult, b_tree: Str, b: ProcessResult) -> Str {
 
 // What a file in a tree's out/ holds, with the tree's path spelled the same in every tree.
 // The record names the inputs text by its sha, which the path is part of, so that line goes.
-fn out_file(tree: Str, name: Str) -> Str {
-    let text = read_file("{tree}/app/out/{name}").replace(tree, "TREE")
+fn out_file(tree: Str, name: Str) -> Str ! FS.Read {
+    let text = fs.read("{tree}/app/out/{name}").unwrap().replace(tree, "TREE")
     if !name.ends_with("/.emit-record") { return text }
     text.split("\n").filter(fn(l) { !l.starts_with("inputs ") }).join("\n")
 }
 
 // The files each tree's out/ holds, by name and then content, that the other's does not.
-fn files_differ(a_tree: Str, b_tree: Str) -> Str {
+fn files_differ(a_tree: Str, b_tree: Str) -> Str ! FS.Read {
     let list = "find . -type f | LC_ALL=C sort"
     let a = sh("mkdir -p {a_tree}/app/out && cd {a_tree}/app/out && {list}")
     let b = sh("mkdir -p {b_tree}/app/out && cd {b_tree}/app/out && {list}")
@@ -178,12 +178,12 @@ test "a build with --strict and a warning through the daemon matches a cold one"
     let mut exits: List[Str] = []
     let mut builds: List[Str] = []
     // The daemon refuses to start on an entry it can not find.
-    for t in [warm, cold] { write_file("{t}/app/src/leaf.bl", front_end_warning()) }
+    for t in [warm, cold] { fs.write("{t}/app/src/leaf.bl", front_end_warning()).unwrap() }
     let pid = start_daemon(warm)
     with cleanup(fn() { stop_daemon(pid) }) {
-        assert(pid > 0, "the daemon did not start: {read_file("{warm}/daemon.log")}")
+        assert(pid > 0, "the daemon did not start: {fs.read("{warm}/daemon.log").unwrap()}")
         for (label, text) in [("front-end warning", front_end_warning()), ("analysis warning", analysis_warning())] {
-            for t in [warm, cold] { write_file("{t}/app/src/leaf.bl", text) }
+            for t in [warm, cold] { fs.write("{t}/app/src/leaf.bl", text).unwrap() }
             for flags in ["--strict ", ""] {
                 for t in [warm, cold] { process.run("sh", ["-c", "rm -rf {t}/app/out"])? }
                 let args = "build {flags}src/main.bl -o out/app"
