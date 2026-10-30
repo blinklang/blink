@@ -95,6 +95,7 @@ ICE codes use the `I` prefix. `@allow` and `[lints]` take warning names only, so
 | TestResultLost | I0016 | `blink test` lost the result of a test file: the file's task ended and sent none. The file is `aborted`. Its `diagnostics` list holds this one diagnostic, with severity `ice` (a bug in `blink test`) and no span. The `test` lines that the file wrote before the fault stay in the stream and count (§8.10.5) |
 | GeneratedCDidNotCompile | I0017 | `blink test` generated the C of a test file, and the C did not compile. The file is `build_failed` with this one diagnostic, which has no span; `notes` holds the C compiler's output, and its last entry says when `blink test` cut it. A header that an `@ffi` declaration names reaches this code too (§8.10.5) |
 | TestBuildEndedWithoutDiagnostic | I0018 | `blink test` built a test file, the build failed, and it printed no error or ice diagnostic. A failed C compile, link or native-dependency step has its own code (I0017, E0857, E0858), so this code means the build ended in some other way. The file is `build_failed` with this diagnostic after any warnings the build printed; its `notes` hold the rest of what the build printed (§8.10.5) |
+| PreludeTypeNotLoaded | I0019 | A builtin returns a type that the prelude declares (such as `std_time.Instant`), and that declaration is not loaded. The prelude always loads, so it is a compiler bug |
 
 ---
 

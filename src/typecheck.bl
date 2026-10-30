@@ -14,7 +14,7 @@ import parser.{
     node_start, node_stmts, node_str_val, node_target, node_then_body, node_trait_name,
     node_type_ann, node_type_name, node_type_params, node_value, node_var_name,
     node_impl_binders, node_recv_type_args, node_impl_where_bounds, node_source_module,
-    node_set_module, node_set_name, node_supertraits, node_empty_row_line, node_empty_row_col, node_empty_row_end_col, synth_struct_decl, node_end_line, node_end_col, node_inclusive, BINDER_MUT_RECOVERED,
+    node_set_module, node_set_name, node_supertraits, node_empty_row_line, node_empty_row_col, node_empty_row_end_col, node_end_line, node_end_col, node_inclusive, BINDER_MUT_RECOVERED,
     synth_named_arg, sublist_append, sublist_of, node_set_obj, node_set_args,
     node_set_params, node_set_stmts, node_set_fields, node_set_arms,
     node_xfail_reason, node_value_child_ids, node_push_value_child_ids, node_spell_child_ids,
@@ -24,7 +24,7 @@ import diagnostics.{
     Diag, diag_clear_allows, diag_error_at, diag_error_at_notes, diag_error_span_at_notes, diag_error_no_loc,
     diag_set_last_fix, diag_set_last_fix_at, UNDECLARED_EFFECT,
     diag_push_allows, diag_enter_allows, diag_exit_allows, NON_CONST_EXPR,
-    diag_warn_at, diag_warn_at_notes, diag_warn_span_at_notes, PARTIAL_HANDLER, diag_truncate, diag_entry_count, diag_any_errors_since, diag_ice_at, diag_count, diag_emit_in_file, diag_file_for_node,
+    diag_warn_at, diag_warn_at_notes, diag_warn_span_at_notes, PARTIAL_HANDLER, diag_truncate, diag_entry_count, diag_any_errors_since, diag_ice_at, diag_ice, PRELUDE_TYPE_NOT_LOADED, diag_count, diag_emit_in_file, diag_file_for_node,
     diag_is_audit_gated, diag_audit_gated_help, AUDIT_GATED_SUPPRESSION, diag_normalize_path, diag_source_line, diag_errors_in_lines,
     POSITIONAL_PARAM_DEFAULT, NON_CONST_PARAM_DEFAULT, FOREIGN_CONST_FORM, FOREIGN_CONST_NO_HEADER, RANGE_BOUND_NOT_CONST, NON_INIT_EXPR,
     ICE_SEG_UNSOLVED_TYPEVAR, ICE_SEG_UNHANDLED_KIND, ICE_SEG_TID_OUT_OF_RANGE,
@@ -3757,57 +3757,39 @@ pub fn lookup_named_type(name: Str) -> Int {
     -1
 }
 
-// ConversionError is a runtime/prelude builtin, normally already registered — but
-// lookup_named_type returns -1 if it is not, which would intern Result[T, -1], a -1
-// escaping as the carrier's err arm. Mint-or-return so the err arm is a concrete Struct
-// tid by construction.
-fn tc_conversion_error_type() -> Int {
+// ConversionError is the prelude's, so the err arm of a parse is its Struct tid. A miss is
+// an ICE that returns TYPE_UNKNOWN, never -1: a -1 would intern Result[T, -1] and escape as
+// the carrier's err arm.
+fn tc_conversion_error_type() -> Int ! Diag.Report {
     // By identity: a module's own `type ConversionError` is not what a parse fails with.
     let known = tc_compiler_known_tid("ConversionError")
     if known != -1 { return known }
-    ensure_runtime_struct_type("std_traits", "ConversionError", ["message", "source_type", "target_type"], [TYPE_STR, TYPE_STR, TYPE_STR], [])
+    ensure_runtime_struct_type("std_traits", "ConversionError")
 }
 
-// A type the runtime defines, minted on demand for a builtin's return. The declaration
-// comes from lib/std when the program imports it; otherwise there is none to find and one
-// is synthesized here, because layout reads a struct's shape and cname its symbol through
-// a declaration node, and a tid without one has no C answer at all. The early return keeps
-// a real declaration the sole answer for its name -- registering a second would make the
-// name ambiguous and lose the one the program wrote. `derives` must match that lib/std
-// declaration's @derive, or the type's traits would depend on whether it was loaded.
-// `module` is the C module key of that lib/std declaration.
-fn ensure_runtime_struct_type(module: Str, name: Str, fnames: List[Str], ftids: List[Int], derives: List[Str]) -> Int {
+// A type the runtime defines, as the prelude declares it. `module` is the C module key of
+// that declaration. The prelude always loads, so a miss here is a compiler bug, not a user
+// error: a stand-in type would hide it and give layout and cname no declaration to read.
+fn ensure_runtime_struct_type(module: Str, name: Str) -> Int ! Diag.Report {
     let existing = lookup_named_type(name)
     if existing != -1 { return existing }
-    let tid = new_type(TyKind.Struct, name)
-    named_type_names.push(name)
-    named_type_ids.push(tid)
-    named_type_map.insert(name, tid)
-    let mut ftypes: List[Str] = []
-    let mut i = 0
-    while i < fnames.len() {
-        let ftid = ftids.get(i).unwrap()
-        sfield_pool.push(TcStructField { struct_id: tid, name: fnames.get(i).unwrap(), type_id: ftid })
-        ftypes.push(tc_tid_name(ftid))
-        i = i + 1
-    }
-    let td = synth_struct_decl(name, fnames, ftypes, derives)
-    tc_register_type_decl_node(name, name, tid, td)
-    // Also under the key of the module that declares it, so layout marks this stand-in
-    // runtime-owned as it would that declaration, and cname spells it as runtime.h does.
-    // Only the key: the node itself names no module, since no module wrote it.
-    tc_type_decl_nodes.insert("{module}.{name}", td)
-    tc_struct_decl_nodes.insert(name, td)
-    tid
+    diag_ice(
+        "PreludeTypeNotLoaded",
+        PRELUDE_TYPE_NOT_LOADED,
+        "the prelude declaration `{module}.{name}` is not loaded",
+        0,
+        0,
+        "this is a compiler bug; please report it",
+    )
+    TYPE_UNKNOWN
 }
 
-// Instant and Duration as lib/std/time.bl declares them, `derives` included.
-fn runtime_instant_tid() -> Int {
-    ensure_runtime_struct_type("std_time", "Instant", ["nanos"], [TYPE_INT], ["Eq", "Ord", "Hash", "Clone", "Debug"])
+fn runtime_instant_tid() -> Int ! Diag.Report {
+    ensure_runtime_struct_type("std_time", "Instant")
 }
 
-fn runtime_duration_tid() -> Int {
-    ensure_runtime_struct_type("std_time", "Duration", ["nanos"], [TYPE_INT], ["Eq", "Ord", "Clone", "Debug"])
+fn runtime_duration_tid() -> Int ! Diag.Report {
+    ensure_runtime_struct_type("std_time", "Duration")
 }
 
 // The help for a read of the field that ProcessResult no longer has (§4.4.8), or "" for any
@@ -3915,10 +3897,8 @@ pub fn get_struct_field_tid(struct_tid: Int, fname: Str) -> Int {
 // such field"; only a resolvable declaration that omits the field proves
 // absence.
 // Prove absence from sfield_pool, the same shape source get_struct_field_tid uses for
-// EXISTENCE. A runtime-minted struct (Duration, Instant, FsError via
-// ensure_runtime_struct_type) has only the decl node the mint synthesizes out of this pool,
-// so the pool is where its shape is first known. Absence and existence must agree from this
-// one source or a bad field access on such a type escapes E0525. A base tid with NO sfield
+// EXISTENCE. Absence and existence must agree from this one source or a bad field access
+// escapes E0525. A base tid with NO sfield
 // entries is an under-resolved handle (an inferred element), not a known-empty shape —
 // return 0 (cannot prove).
 fn tc_sfield_shape_provably_absent(obj_t: Int, fname: Str) -> Int {
@@ -4093,10 +4073,8 @@ pub fn tc_field_tid_at_instance(recv_tid: Int, fname: Str) -> Int {
 // ── Declared shape, by slot ───────────────────────────────────────────────
 //
 // sfield_pool / evar_pool / evfield_pool are the one place a nominal type's declared
-// shape is registered, including the runtime-minted structs (Instant, FsError)
-// that have no declaration node at all. A reader that walked the AST annotations
-// instead would be a second shape authority and would miss those types entirely, so
-// codegen asks here. A slot is an index into the pool, handed back so a caller reads
+// shape is registered. A reader that walked the AST annotations instead would be a
+// second shape authority, so codegen asks here. A slot is an index into the pool, handed back so a caller reads
 // each entry once instead of rescanning the pool per field.
 
 pub fn tc_struct_field_slots(struct_tid: Int) -> List[Int] {
@@ -15875,9 +15853,9 @@ fn builtin_handler_op_key(root: Str, op: Str) -> Str {
 
 // The signature of a handler operation of a builtin root, or -1 for a name the spec does not
 // give that root. io.eprint is not interceptable, so eprint is no operation, and a caller
-// name such as println is not one either. Registered on first use, so Instant and Duration are
-// minted only for a program that delegates a Time operation or omits one from a Time handler.
-fn builtin_handler_op_sig(root: Str, op: Str) -> Int {
+// name such as println is not one either. Registered on first use, so only a program that
+// delegates a Time operation or omits one from a Time handler looks up Instant and Duration.
+fn builtin_handler_op_sig(root: Str, op: Str) -> Int ! Diag.Report {
     let key = builtin_handler_op_key(root, op)
     let found = lookup_fnsig(key)
     if found != -1 { return found }
@@ -16248,8 +16226,9 @@ fn builtin_partial_handler_stub(he: Int, root: Str, op: Str) -> HandlerStub ! Di
 }
 
 // Whether the current module spells `t` by its name. The types a builtin signature names are
-// declared in lib/std, and ensure_runtime_struct_type returns a namesake that a user module
-// declares, so a declaration from outside lib/std means the name is not the runtime's type.
+// declared in lib/std, and ensure_runtime_struct_type looks them up by bare name, so it can
+// return a namesake that a user module declares. A declaration from outside lib/std means the
+// name is not the runtime's type.
 fn builtin_stub_type_spellable(t: Int) -> Bool ! TypeCheck.Resolve, Diag.Report {
     // `()` names no declaration, so no module can take its spelling.
     if type_kind(t) == TyKind.Void { return true }
@@ -27320,10 +27299,8 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                     tc_error_at("method `Instant.{method}` expects 0 argument(s), got {inst_got}", node)
                 }
                 if method == "to_rfc3339" { return TYPE_STR }
-                // The Duration tid, minted only if lib/std/time.bl is absent from the program —
-                // lookup runs first inside ensure_runtime_struct_type, so the declared tid wins
-                // and `.to_ms()` on the result still resolves through `Duration_to_ms`. Same
-                // idempotent-mint reasoning as the Instant tid at the time.read() arm.
+                // The declared Duration tid, so `.to_ms()` on the result resolves through
+                // `Duration_to_ms`.
                 return runtime_duration_tid()
             }
             // The synthesized sealed Display.display() has no user-written fnsig; it
@@ -28446,7 +28423,7 @@ fn tc_collect_foreign_typevars(tid0: Int, fresh: Map[Str, Int]) {
 
 // What `Type.from(x)` answers before its impl is known: the target, or the Result
 // `Type.try_from(x)` carries it in.
-fn tc_static_conversion_answer(trait_name: Str, target: Int) -> Int {
+fn tc_static_conversion_answer(trait_name: Str, target: Int) -> Int ! Diag.Report {
     if trait_name == "TryFrom" { return make_result_type(target, tc_conversion_error_type()) }
     target
 }
