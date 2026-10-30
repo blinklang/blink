@@ -2763,7 +2763,7 @@ fn tc_method_call_unanswered(node: Int, method: Str, obj_t: Int, args_sl: Int) -
     if tc_recv_type_is_determined(obj_k, obj_t) != 0 && tc_method_unavailable_on_receiver(obj_k, method) != 0 {
         let tname = type_to_str(obj_t)
         tc_unresolved_method_hard.insert(node, 1)
-        tc_error_naming_types("UnresolvedMethod", UNRESOLVED_METHOD, "unresolved method `.{method}` on type {tname}", node, tc_unresolved_method_help(obj_k, tname, method), [obj_t])
+        tc_error_naming_types("UnresolvedMethod", UNRESOLVED_METHOD, "unresolved method `.{method}` on type {tname}", node, tc_unresolved_method_help(obj_k, tname, method, node), [obj_t])
         return tc_error_recovery_tid()
     }
     // Nothing claimed this node, so nothing has typed it — an absence. Codegen's backstop is
@@ -18469,6 +18469,27 @@ pub fn tc_str_removed_method_help(method: Str) -> Str {
     ""
 }
 
+// sections/04_effects.md, rows for methods of `Child`: a signal goes through
+// `process.signal(child, sig)`. The released `kill` read the signal 0 as SIGKILL, so only
+// a literal argument says which signal the call sends; any other argument may be 0.
+fn tc_child_removed_method_help(method: Str, node: Int) -> Str {
+    if method != "kill" && method != "send_signal" { return "" }
+    let args = node_args(node)
+    let arg = if args != -1 && sublist_length(args) == 1 { sublist_get(args, 0) } else { -1 }
+    let head = "`{method}` was removed; call `process.signal(child, "
+    if method == "send_signal" {
+        return "{head}sig)`"
+    }
+    if arg != -1 && node_kind(arg) == NodeKind.IntLit {
+        let digits = int_lit_decimal(node_str_val(arg))
+        if digits == "0" {
+            return "{head}SIGKILL)`, because the signal 0 meant SIGKILL"
+        }
+        return "{head}{digits})`"
+    }
+    "{head}sig)`, and pass SIGKILL where the argument can be 0, because the signal 0 meant SIGKILL"
+}
+
 fn is_builtin_method(name: Str) -> Int {
     // Display: synthesized display() and builtin scalar fmt()/display()
     // (Int/Float/Bool/Str/Char)
@@ -20692,7 +20713,7 @@ fn tc_refuse_list_scan(node: Int, obj_t: Int, need: List[Int], method: Str) -> I
 
 // The help line for an unresolved method: the rename note the resolver already carries for
 // a renamed List operation, else the near-miss suggestion, else nothing.
-fn tc_unresolved_method_help(obj_k: TyKind, tname: Str, method: Str) -> Str {
+fn tc_unresolved_method_help(obj_k: TyKind, tname: Str, method: Str, node: Int) -> Str {
     if method == "display" {
         return "add an `impl Display for {tname}` (with `fn fmt(self, sb: StringBuilder)`)"
     }
@@ -20702,6 +20723,10 @@ fn tc_unresolved_method_help(obj_k: TyKind, tname: Str, method: Str) -> Str {
     }
     if obj_k == TyKind.Str {
         let removed = tc_str_removed_method_help(method)
+        if removed != "" { return removed }
+    }
+    if tname == "Child" && tc_type_decl_module(tname) == "std_process" {
+        let removed = tc_child_removed_method_help(method, node)
         if removed != "" { return removed }
     }
     // A Map is the one receiver where the near-miss neighbour of `set` is `get`, which reads
@@ -27386,7 +27411,7 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
             // actionable help; blinkc_main aborts on diag_count > 0 before codegen, so
             // the backstop never re-fires.
             if tc_method_resolvable_on_type(obj_k, tname, method) == 0 {
-                let help = tc_unresolved_method_help(obj_k, tname, method)
+                let help = tc_unresolved_method_help(obj_k, tname, method, node)
                 tc_unresolved_method_hard.insert(node, 1)
                 tc_error_naming_types("UnresolvedMethod", UNRESOLVED_METHOD, "unresolved method `.{method}` on type {tname}", node, help, [obj_t])
                 return tc_error_recovery_tid()
@@ -35235,7 +35260,7 @@ fn tc_report_unclaimed_calls(order: List[Int], mods: List[Str]) ! Diag.Report {
         if tc_unclaimed_receiver_is_named(recv) != 0 {
             let tname = tc_type_str(recv)
             tc_error_naming_types("UnresolvedMethod", UNRESOLVED_METHOD, "unresolved method `.{mname}` on type {tname}",
-                uc, tc_unresolved_method_help(type_kind(recv), tname, mname), [recv])
+                uc, tc_unresolved_method_help(type_kind(recv), tname, mname, uc), [recv])
         } else if node_kind(obj) == NodeKind.Ident {
             let q = node_name(obj)
             if q == "default" {
