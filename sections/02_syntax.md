@@ -859,6 +859,22 @@ for i in 5..=5 { }    // runs once, with i = 5
 for i in 5..=4 { }    // runs 0 times
 ```
 
+**Comparing ranges.** `==` on two ranges compares the start, the end and the kind (`..` or `..=`), and nothing else. It does not compare the elements. Every `Range[T]` is `Eq`, and `Debug` when `T` is `Debug`. It is not `Hash`, not `Ord` and not `Display` (§3.6 *Container Equality*).
+
+```blink
+let a = (0..3) == (0..3)       // true
+let b = (0..3) == (0..=2)      // false: different kind, although both hold 0, 1 and 2
+let c = (5..3) == (0..0)       // false: both are empty, but the bounds differ
+```
+
+To compare the elements, collect both sides into lists and compare the lists:
+
+```blink
+let xs: List[Int] = (0..3).into_iter().collect()
+let ys: List[Int] = (0..=2).into_iter().collect()
+let same = xs == ys            // true
+```
+
 **An inclusive range up to the largest value of its type.** `lo..=hi` yields `hi` last and stops, also when `hi` is the largest value of its type. It does not overflow, does not panic and does not wrap.
 
 ```blink

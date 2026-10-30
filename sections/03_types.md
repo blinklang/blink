@@ -5062,7 +5062,7 @@ A `Map` or `Set` made from other values is built by inserts in this order:
 
 **Float keys.** `F32`/`F64` do not implement `Hash`, and a `Float` (or any type transitively containing one) used as a `Map`/`Set` key is rejected at type-check as `E1400 MapKeyNotHashable`. This is a permanent contract, not a missing impl: float equality cannot satisfy the `Eq`/`Hash` coherence law — `-0.0 == 0.0` holds while the two have distinct bit patterns, so a bitwise hash would give equal values different hashes. Round to an integer key instead.
 
-**Non-hashable keys and elements in general.** Only builtin scalars (`Int`, sized ints, `Bool`, `Char`, `Str`), `Never` (§3.2), a tuple whose elements are all hashable, and a user `struct`/`enum` that implements `Hash` and `Eq` implement `Hash`. `Never` is the only type outside these groups on the list; it gives no container a way in. A user type gets the two impls from `@derive(Hash, Eq)` or from a written `impl` (§3.6, *Trait Coherence*). A fieldless enum is `Eq` already (*Container Equality*), so it needs only `@derive(Hash)` or an `impl Hash`. Every other type — every container (`List`, `Map`, `Set`, `Option`, `Result`), `Bytes`, `StringBuilder`, and any `fn`/closure type — has no `Hash` impl and cannot gain one, so using one as a `Map` key or `Set` element is rejected at type-check as `E1400 MapKeyNotHashable`, the same code as the Float case above. A tuple is hashable **if and only if** every one of its elements is; `(Int, Option[Int])` is rejected because its second element is not, even though `(Int, Str)` is accepted.
+**Non-hashable keys and elements in general.** Only builtin scalars (`Int`, sized ints, `Bool`, `Char`, `Str`), `Never` (§3.2), a tuple whose elements are all hashable, and a user `struct`/`enum` that implements `Hash` and `Eq` implement `Hash`. `Never` is the only type outside these groups on the list; it gives no container a way in. A user type gets the two impls from `@derive(Hash, Eq)` or from a written `impl` (§3.6, *Trait Coherence*). A fieldless enum is `Eq` already (*Container Equality*), so it needs only `@derive(Hash)` or an `impl Hash`. Every other type — every container (`List`, `Map`, `Set`, `Option`, `Result`), `Range`, `Bytes`, `StringBuilder`, and any `fn`/closure type — has no `Hash` impl and cannot gain one, so using one as a `Map` key or `Set` element is rejected at type-check as `E1400 MapKeyNotHashable`, the same code as the Float case above. A tuple is hashable **if and only if** every one of its elements is; `(Int, Option[Int])` is rejected because its second element is not, even though `(Int, Str)` is accepted.
 
 #### The `final` Modifier
 
@@ -5804,7 +5804,7 @@ Suppress the warning on a function with `@allow(FloatSelfComparison)`, or set it
 
 Y* = total ordering semantics. Unsigned types don't impl `Neg`. `Float` doesn't impl `Hash`. `Bytes` equality is byte-wise; `Bytes` has no `Ord`. `Never` has no values, so no method of its impls can run (§3.2).
 
-`Option`, `Result`, `List`, `Set`, `Map` and tuples implement `Eq` when their parts do — see *Container Equality* below.
+`Option`, `Result`, `List`, `Set`, `Map` and tuples implement `Eq` when their parts do — see *Container Equality* below. `Range[T]` is always `Eq`; the same section gives its rule.
 
 **`Option` and `Result` instances.** `Option[T]` and `Result[T, E]` have the instances that `@derive` gives a user sum type with the same variants, for `Eq`, `Ord`, `Clone` and `Debug`. The bounds are the ones that *Generic Type Bound Inference* (§3.6.1) infers: `Option[T]` has the instance when `T` does, and `Result[T, E]` has it when `T` and `E` both do. *Container Equality*, *Ord for `Option` and `Result`* (below), *Clone Semantics* (§3.6.1) and *Debug vs Display* (§3.6.1) state each instance. `Hash` is not one of them: no container has a `Hash` impl (*Hash Contract and Seeding*). This rule does not cover JSON. The JSON instances of `Option` and `Result` are in *Option and Result in JSON* (§3.6.2).
 
@@ -5820,6 +5820,7 @@ The built-in containers implement `Eq` **conditionally**: a container is `Eq` wh
 | `Set[T]` | always (`Set` requires `T: Hash`, and `Hash: Eq`) | the sizes are equal and each element of `a` is a member of `b` |
 | `Map[K, V]` | `V: Eq` (`K: Hash` gives `K: Eq`) | the key sets are equal and, for each key, the values are `==` |
 | `Bytes` | always | the lengths are equal and the bytes are equal |
+| `Range[T]` | always (`Range` requires `T: Ord`, and `Ord: Eq`) | the starts are `==`, the ends are `==`, and both are `..` or both are `..=` |
 | tuple | every element is `Eq` | element-wise `==` (§3.8 *Auto-Derived Trait Implementations*) |
 
 `Option` and `Result` are `Eq` as `@derive(Eq)` makes a user sum type with the same variants: the variants must match, and then the payloads must be `==`.
@@ -5860,6 +5861,66 @@ fn main() {
 **Values, never identity.** `==` never compares identity. Two lists with equal elements are `==` when they are different cells, and wrapping a value in `Option` or `Result` does not change what `==` compares. `Set` and `Map` compare by membership: iteration order is not part of the value (*Hash Contract and Seeding*).
 
 **Generic code.** `==` on a container of a type parameter needs the bound that the table gives. `fn same[T](a: Option[T], b: Option[T]) -> Bool { a == b }` is an error. Write `fn same[T: Eq](a: Option[T], b: Option[T]) -> Bool { a == b }`.
+
+**Range equality.** `==` on two ranges compares the start, the end and the kind (`..` or `..=`). It compares nothing else: it does not walk the elements and it does not test for an empty range. It costs the same for every length of range, and its rule is the same for every `T`, `Float` included. Each bound is compared with the `==` of `T`.
+
+```blink
+fn main() {
+    let r = 0..3
+    let a = r == 0..3                 // true: same start, same end, same kind
+    let b = (0..3) == (0..=2)         // false: different kind
+    let c = (5..3) == (0..0)          // false: both are empty, but the bounds differ
+    let d = (5..5) == (5..5)          // true
+    let e = (5..=5) == (5..6)         // false: both hold only 5, but the kind differs
+    let f = 0.0..1.0
+    let g = f == 0.0..=1.0            // false: different kind, as for every `T`
+}
+```
+
+**`==` on ranges is not equality of elements.** A reader from Python or Kotlin may expect `(0..3) == (0..=2)` to be `true`, because both ranges hold 0, 1 and 2. In Blink it is `false`: `==` compares the kind. To compare the elements, collect both sides into lists and compare the lists:
+
+```blink
+fn main() {
+    let a: List[Int] = (0..3).into_iter().collect()
+    let b: List[Int] = (0..=2).into_iter().collect()
+    let same_elements = a == b        // true: [0, 1, 2] == [0, 1, 2]
+    let same_range = (0..3) == (0..=2)    // false
+}
+```
+
+The reason is *Debug agrees with Eq* (§3.6.1): two ranges that are `==` print the same text, and `debug()` prints the range as it was written (*Debug vs Display*, §3.6.1). A `==` that equates `5..3` and `0..0` would force `debug()` to hide what the author wrote. Element equality is not part of `==`. If the language needs it, it comes as a separate method. A later change of `==` to compare elements would change the result of programs that run today, so it is a breaking change.
+
+**Traits of `Range[T]`.** Every `Range[T]` is `Eq`. `Range[T: Ord]` and `Ord: Eq`, so generic code needs no bound beyond `Ord`. The other traits are:
+
+| Trait | `Range[T]` has it | Else |
+|-------|-------------------|------|
+| `Eq` | always | |
+| `Debug` | when `T: Debug`; prints the source form (`0..3`, `1..=4`) | |
+| `Clone` | when `T: Clone` | |
+| `Hash` | never | a range as a `Map` key or a `Set` element is `E1400 MapKeyNotHashable` |
+| `Ord` | never | `r < 1..3` is an error: `Range[Int]` does not implement `Ord` |
+| `Display` | never | `"{r}"` is `E0523 MissingDisplayImpl` |
+
+```blink
+@derive(Eq, Clone, Debug)
+type Window { span: Range[Int] }
+
+fn same[T: Ord](a: Range[T], b: Range[T]) -> Bool {
+    a == b                            // compiles: T: Ord gives T: Eq
+}
+
+fn main() {
+    let r = 0..3
+    io.println(r.debug())             // 0..3
+    io.println((1..=4).debug())       // 1..=4
+    assert_eq(r, 0..=2)               // panics: the message shows 0..3 and 0..=2
+    let m: Map[Range[Int], Str] = Map.new()   // error[MapKeyNotHashable] (E1400)
+    let lt = r < 1..3                 // error[TypeError]: `Range[Int]` does not implement `Ord`
+    io.println("{r}")                 // error[MissingDisplayImpl] (E0523)
+}
+```
+
+(Vote: 6-0; see [Range Equality rationale](../decisions/range-equality.md).)
 
 **Enums.** A **fieldless enum** (§3.4 *Tag Operations*: no variant has a payload, as the declaration is written) is `Eq` with no derive and no impl. Two of its values are `==` when they are the same variant. An enum with at least one payload is `Eq` only through `@derive(Eq)` or a written `impl Eq`, the same as a struct (vote: 6-0; see [Enum Equality rationale](../decisions/enum-equality.md)). The payload types alone never make an enum `Eq`. So `Option[Color]` is `Eq` for a fieldless `Color`, and `Option[Shape]` is not `Eq` until `Shape` has `@derive(Eq)` or an `impl Eq`.
 
@@ -6579,6 +6640,7 @@ For reference, the seven derivable traits and their required methods:
 - **Value types** (`Int`, `Float`, `Bool`, `Char`, `Str`): a copy of the value. A `Str` cannot change, so no program can see whether a copy shares its bytes.
 - **`Bytes`**: a copy of the value. A write through the clone does not show in the original.
 - **`List`, `Map`, `Set` and other shared cells** (§3.6 *Shared cells*): the clone refers to the same cell. A change made through the clone **does** show in the original — the same as JS spread (`{...obj}`) or Python `copy.copy()`.
+- **`Range`**: `Range[T]` is `Clone` when `T: Clone`. The clone has the same start, end and kind, and each bound is copied by the `clone` of `T`. A `@derive(Clone)` struct can hold a `Range[Int]` field.
 - **`Option` and `Result`**: `Option[T]` is `Clone` when `T: Clone`, and `Result[T, E]` is `Clone` when `T: Clone` and `E: Clone`. The clone has the same variant as the original, and the payload is copied by the `clone` of its own type, so a written `impl Clone` on the payload type runs. When the payload's `clone` gives the same value as `let y = x` (every built-in type and every derived `Clone`), so does the clone of the `Option` or `Result`: a shared cell inside stays shared (the bullet above). It is not a deep copy.
 - **User structs and enums**: `x.clone()` gives the same value as `let y = x`. Each field is copied by its declared type, using the rules above. A field whose declared type is a struct or enum is a value, and its copy is a value too (for example, a payload of the enum's own type, §3.4 *Recursive Types*).
 
@@ -6628,13 +6690,14 @@ Key differences:
 | `Set[T]` (iff `T: Debug`) | `"{1, 2}"` | — |
 | `Result[T,E]` (iff `T: Debug`, `E: Debug`) | `"Ok(42)"` / `"Err(\"io\")"` | — |
 | tuple (iff every element is `Debug`) | `"(1, \"a\")"` | `"(1, a)"` |
+| `Range[T]` (iff `T: Debug`) | `"0..3"` / `"1..=4"` | — |
 
 String interpolation (`"{value}"`) invokes `Display`. Explicit `value.debug()` is required for the structural form.
 
-`List`, `Option`, `Map`, `Set`, `Result` and tuples implement `Debug` **conditionally** — a
+`List`, `Option`, `Map`, `Set`, `Result`, `Range` and tuples implement `Debug` **conditionally** — a
 `List[T]`, `Option[T]` or `Set[T]` is `Debug` iff `T` is `Debug`; a `Map[K,V]` iff **both** `K` and
 `V` are `Debug`; a `Result[T,E]` iff **both** `T` and `E` are `Debug`; a tuple iff every element is
-`Debug`. These are the only conditional (constrained) built-in `Debug` instances. They cover the same
+`Debug`; a `Range[T]` iff `T` is `Debug`. These are the only conditional (constrained) built-in `Debug` instances. They cover the same
 types as the conditional `Eq` instances (*Container Equality*), so a value that can be compared can
 also be shown, which the assertion built-ins need (§2.20 *Built-in Assertions*). Their element-wise
 rendering and the one remaining exclusion (container map keys) are specified in *Container Debug
@@ -6661,6 +6724,11 @@ impl Eq for Tag {
 // Tag { name: "Bob" } == Tag { name: "bob" } is true,
 // but their debug() texts differ
 ```
+
+`Range[T]` obeys the law because its `Eq` compares the start, the end and the kind, and its `debug()`
+prints exactly those three (*Container Debug Rendering*). `(0..3) == (0..=2)` is `false`, and the two
+print different text, `0..3` and `0..=2`. `(5..3)` and `(0..0)` are empty, are not `==`, and print
+`5..3` and `0..0`.
 
 The `Set` and `Map` debug order (*Container Debug Rendering*) depends on this law: when it holds for
 the elements, keys and values, equal containers render the same text. Every built-in type obeys the
@@ -7121,7 +7189,7 @@ Per-trait sum type rules:
 ##### Container Debug Rendering
 
 A field of a `@derive(Debug)` type may be a container — `List[T]`, `Option[T]`, `Map[K,V]`,
-`Set[T]`, `Result[T,E]` or a tuple. The
+`Set[T]`, `Result[T,E]`, `Range[T]` or a tuple. The
 uniform per-field model (each field renders via `{field.debug()}`) holds: the container's own
 `debug()` renders its contents, with every element, key, and value rendered in **debug-form** (so a
 `Str` element is quoted and escaped, matching `Str.debug()`). The compiler provides these `debug()`
@@ -7139,6 +7207,7 @@ between a map key and its value; there is no inner padding.
 | `Set[T]` | `"{" + elems.join(", ") + "}"`, each elem via its own `.debug()`, in sorted order (below) | `"{}"` |
 | `Result[T,E]` | `"Ok(" + value.debug() + ")"` or `"Err(" + error.debug() + ")"` | — |
 | tuple | `"(" + elems.join(", ") + ")"`, each elem via its own `.debug()` | — |
+| `Range[T]` | `start.debug() + ".." + end.debug()`, or `start.debug() + "..=" + end.debug()` for an inclusive range | — |
 
 **Set and Map order.** `Set[T].debug()` sorts the rendered element strings by their UTF-8 bytes
 before it joins them. `Map[K,V].debug()` sorts its entries by the UTF-8 bytes of `key.debug()`; when
