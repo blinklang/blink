@@ -148,6 +148,8 @@ pub fn load_lint_overrides(src_root: Str) ! Diag.Report, FS.Read, IO {
         manifest_print_warnings = print_was
         if load_rc == 0 {
             apply_manifest_lints(manifest_path)
+        } else {
+            report_config_unloaded(manifest_path)
         }
     }
     if compiler_strict_struct_layout != 0 {
@@ -158,6 +160,18 @@ pub fn load_lint_overrides(src_root: Str) ! Diag.Report, FS.Read, IO {
 // Each command reports blink.toml issues through diag, on stderr. The lib would print them as
 // well, on stdout, which carries the `check --json` status line and the LSP frames, so each
 // binary turns that print off at its start.
+// A blink.toml or blink.lock that is there but does not load is not an empty one: the compile
+// goes on without its [lints] or its dependencies. The lib prints the cause, so this names
+// the file only.
+fn report_config_unloaded(path: Str) ! Diag.Report {
+    if loaded_inputs.unloaded_configs.contains_key(path) { return }
+    loaded_inputs.unloaded_configs.insert(path, true)
+    diag_error_no_loc("ModuleNotFound", MODULE_NOT_FOUND, "cannot load {path}", "")
+    if loaded_inputs.input_read_error == "" {
+        loaded_inputs.input_read_error = "cannot load {path}"
+    }
+}
+
 pub fn quiet_manifest_lib() {
     manifest_print_warnings = false
 }
@@ -273,9 +287,18 @@ pub fn load_audit_records() ! Diag.Report, FS.Read {
             loaded_inputs.audit_records.insert(dir, audit_records_empty())
             continue
         }
-        let recs = audit_records_parse(note_config_text(path, build_fs.read_or_empty(path)))
-        loaded_inputs.audit_records.insert(dir, recs)
-        report_audit_record_issues(path, recs)
+        // Records that cannot be read are not an empty set: no record would be checked.
+        match fs.read(path) {
+            Ok(text) => {
+                let recs = audit_records_parse(note_config_text(path, text))
+                loaded_inputs.audit_records.insert(dir, recs)
+                report_audit_record_issues(path, recs)
+            }
+            Err(e) => {
+                diag_error_no_loc("FileNotFound", FILE_NOT_FOUND, "{e}", "")
+                loaded_inputs.audit_records.insert(dir, audit_records_empty())
+            }
+        }
     }
 }
 
@@ -315,14 +338,34 @@ pub fn check_file_exists(path: Str) ! IO, Env.Exit, FS.Read {
     }
 }
 
-// A CLI command ends here when the entry file it loaded is there but could not be read. It
-// prints the path and the OS error as for a missing entry file, not the E1200 diagnostic that
-// the LSP and the daemon send.
-pub fn exit_if_entry_unread() ! IO, Env.Exit {
-    if loaded_inputs.entry_read_error != "" {
-        io.eprintln("error: {loaded_inputs.entry_read_error}")
+// The text of a source file a CLI command reads itself. A file that is there but cannot be
+// read is not an empty program, so the process ends with the path and the OS error.
+pub fn read_entry_or_exit(path: Str) -> Str ! IO, Env.Exit, FS.Read {
+    match fs.read(path) {
+        Ok(text) => text
+        Err(e) => {
+            io.eprintln("error: {e}")
+            env.exit(1)
+        }
+    }
+}
+
+// A CLI command ends here when the entry file, blink.toml or blink.lock it loaded is there but
+// could not be loaded. It prints the path and the cause as for a missing entry file, not the
+// E1200 diagnostic that the LSP and the daemon send.
+pub fn exit_if_input_unread() ! IO, Env.Exit {
+    if report_input_unread() {
         env.exit(1)
     }
+}
+
+// For a caller that must print more before it exits, such as a JSON status line.
+pub fn report_input_unread() -> Bool ! IO {
+    if loaded_inputs.input_read_error == "" {
+        return false
+    }
+    io.eprintln("error: {loaded_inputs.input_read_error}")
+    true
 }
 
 // Every `#embed` of every file this program loaded, checked and read once the loading is
@@ -343,8 +386,14 @@ pub fn check_embed_targets() ! Diag.Report, FS.Read {
                     diag_error_at("FileNotFound", FILE_NOT_FOUND, "#embed file not found: {path}", id,
                         "the path is read relative to the file that holds the #embed, not the directory the compiler runs in")
                 } else if !loaded_inputs.embed_texts.contains_key(path) {
-                    loaded_inputs.embed_paths.push(path)
-                    loaded_inputs.embed_texts.insert(path, build_fs.read_or_empty(path))
+                    // A target that is there but cannot be read is not an empty payload.
+                    match fs.read(path) {
+                        Ok(text) => {
+                            loaded_inputs.embed_paths.push(path)
+                            loaded_inputs.embed_texts.insert(path, text)
+                        }
+                        Err(e) => diag_error_at("FileNotFound", FILE_NOT_FOUND, "#embed {e}", id, "")
+                    }
                 }
             }
             id = id + 1
@@ -369,12 +418,12 @@ pub fn compile_entry_to_program(file_path: Str, use_prelude: Int, package_root: 
     diag_source_file = file_path
 
     // A file that is there but cannot be read is not an empty program. This fn never exits:
-    // its caller tells the read error apart by entry_read_error.
+    // its caller tells the read error apart by input_read_error.
     let source = match fs.read(file_path) {
         Ok(text) => text
         Err(e) => {
             diag_error_no_loc("ModuleNotFound", MODULE_NOT_FOUND, "{e}", "")
-            loaded_inputs.entry_read_error = "{e}"
+            loaded_inputs.input_read_error = "{e}"
             ""
         }
     }
@@ -540,11 +589,17 @@ pub fn find_src_root(source_path: Str) -> Str ! FS.Read {
     ""
 }
 
-fn read_pkg_name_from_toml(path: Str) -> Str ! FS.Read {
+fn read_pkg_name_from_toml(path: Str) -> Str ! FS.Read, Diag.Report {
     if !probe_file(path) {
         return ""
     }
-    let content = note_config_text(path, build_fs.read_or_empty(path))
+    let content = match fs.read(path) {
+        Ok(text) => note_config_text(path, text)
+        Err(_) => {
+            report_config_unloaded(path)
+            return ""
+        }
+    }
     toml_read_value(content, "package", "name") ?? ""
 }
 
@@ -552,8 +607,12 @@ fn read_pkg_name_from_toml(path: Str) -> Str ! FS.Read {
 // these bytes are a second read, and the units a build records do not rest on them: a
 // manifest or lockfile changes the emit only through which file an import loads, which the
 // loaded files show, and through [lints], which the lint levels in force show.
+// The load that follows reads the file again and reports a read that fails.
 fn note_config_file(path: Str) ! FS.Read {
-    let _ = note_config_text(path, build_fs.read_or_empty(path))
+    match fs.read(path) {
+        Ok(text) => { let _ = note_config_text(path, text) }
+        Err(_) => {}
+    }
 }
 
 // A config file the loader read, with the bytes it read; returns those bytes.
@@ -590,7 +649,7 @@ fn manifest_path_for_src_root(src_root: Str) -> Str {
 
 // Given a src_root like "examples/with_deps/mathlib/src/", return the
 // package name from the sibling blink.toml. Returns "" if no manifest.
-fn entry_pkg_for_src_root(src_root: Str) -> Str ! FS.Read {
+fn entry_pkg_for_src_root(src_root: Str) -> Str ! FS.Read, Diag.Report {
     if src_root == "" {
         return ""
     }
@@ -619,6 +678,14 @@ fn validate_lockfile_versions() ! Diag.Report {
 
 let mut lockfile_loaded: Int = 0
 
+fn load_lockfile_or_report(path: Str) ! Diag.Report, FS.Read, IO {
+    if lockfile_load(path) != 0 {
+        report_config_unloaded(path)
+        return
+    }
+    validate_lockfile_versions()
+}
+
 fn ensure_lockfile_loaded(src_root: Str) ! Diag.Report, FS.Read, IO {
     if lockfile_loaded == 1 {
         return
@@ -634,15 +701,13 @@ fn ensure_lockfile_loaded(src_root: Str) ! Diag.Report, FS.Read, IO {
     let lock_path_new = path_join(project_root, "blink.lock")
     if probe_file(lock_path_new) {
         note_config_file(lock_path_new)
-        lockfile_load(lock_path_new)
-        validate_lockfile_versions()
+        load_lockfile_or_report(lock_path_new)
         return
     }
     let lock_path = path_join(project_root, "pact.lock")
     if probe_file(lock_path) {
         note_config_file(lock_path)
-        lockfile_load(lock_path)
-        validate_lockfile_versions()
+        load_lockfile_or_report(lock_path)
         return
     }
     // Walk up from src_root looking for blink.lock / pact.lock
@@ -659,15 +724,13 @@ fn ensure_lockfile_loaded(src_root: Str) ! Diag.Report, FS.Read, IO {
         let candidate_new = path_join(parent, "blink.lock")
         if probe_file(candidate_new) {
             note_config_file(candidate_new)
-            lockfile_load(candidate_new)
-            validate_lockfile_versions()
+            load_lockfile_or_report(candidate_new)
             return
         }
         let candidate = path_join(parent, "pact.lock")
         if probe_file(candidate) {
             note_config_file(candidate)
-            lockfile_load(candidate)
-            validate_lockfile_versions()
+            load_lockfile_or_report(candidate)
             return
         }
         dir = parent
@@ -1261,12 +1324,15 @@ pub type LoadedInputs {
     // standard library or of a toolchain package has no root here.
     audit_dirs: Map[Str, Str]
     audit_records: Map[Str, AuditRecords]
-    // The OS error of an entry file that is there but cannot be read, or "".
-    entry_read_error: Str
+    // The first error of an entry file that is there but cannot be read, or of a blink.toml or
+    // blink.lock that is there but does not load, or "".
+    input_read_error: Str
+    // Each blink.toml and blink.lock that is there but did not load, so each is reported once.
+    unloaded_configs: Map[Str, Bool]
 }
 
 fn loaded_inputs_empty() -> LoadedInputs {
-    LoadedInputs { files: [], source_paths: [], source_texts: [], source_modules: [], source_first_nodes: [], source_end_nodes: [], source_interfaces: [], interface_parts: [], config_paths: [], config_texts: [], embed_paths: [], embed_texts: Map(), probe_paths: [], probe_found: Map(), audit_dirs: Map(), audit_records: Map(), entry_read_error: "" }
+    LoadedInputs { files: [], source_paths: [], source_texts: [], source_modules: [], source_first_nodes: [], source_end_nodes: [], source_interfaces: [], interface_parts: [], config_paths: [], config_texts: [], embed_paths: [], embed_texts: Map(), probe_paths: [], probe_found: Map(), audit_dirs: Map(), audit_records: Map(), input_read_error: "", unloaded_configs: Map() }
 }
 
 pub let mut loaded_inputs: LoadedInputs = loaded_inputs_empty()

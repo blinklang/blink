@@ -1,0 +1,100 @@
+// `blink init` adds lines to files the user owns: .gitignore, CLAUDE.md and
+// .claude/settings.json. One it cannot read is not an empty file. Init says which path and
+// why, exits nonzero, and leaves the file as it was. A file it cannot write is a failed init,
+// not a "created" line.
+
+import compile_test_helpers
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> ProcessResult {
+    process.run("sh", ["-c", cmd]).unwrap()
+}
+
+fn as_root() -> Bool {
+    sh("id -u").out.trim() == "0"
+}
+
+fn init_in(dir: Str) -> ProcessResult {
+    let blink = sh("readlink -f build/blink").out.trim()
+    sh("cd {dir} && env -u BLINK_ROOT {blink} init demo < /dev/null")
+}
+
+fn fresh(name: Str) -> Str {
+    let d = "{compile_test_helpers.scratch_root()}/_init_unreadable_{name}_{getpid()}"
+    sh("rm -rf {d} && mkdir -p {d}")
+    d
+}
+
+fn assert_names_the_error(r: ProcessResult, what: Str) {
+    let text = "{r.out}{r.err_out}"
+    assert(!r.success(), "init answered success:\n{text}")
+    assert(text.contains("{what}: Permission denied"), "the error does not name the path and the cause:\n{text}")
+}
+
+// Mode 200 lets init write the file but not read it, so a read error read as "" would
+// replace the user's text.
+test "blink init leaves a gitignore it cannot read as it was" {
+    if as_root() { skip("root can read and write every file") }
+    let d = fresh("gitignore")
+    fs.write("{d}/.gitignore", "node_modules/\n")?
+    sh("chmod 200 {d}/.gitignore")
+    let r = init_in(d)
+    sh("chmod 644 {d}/.gitignore")
+    let after = fs.read("{d}/.gitignore")?
+    sh("rm -rf {d}")
+    assert_names_the_error(r, "read .gitignore")
+    assert_eq(after, "node_modules/\n")
+}
+
+test "blink init leaves a CLAUDE.md it cannot read as it was" {
+    if as_root() { skip("root can read and write every file") }
+    let d = fresh("claudemd")
+    fs.write("{d}/CLAUDE.md", "# mine\n")?
+    sh("chmod 200 {d}/CLAUDE.md")
+    let r = init_in(d)
+    sh("chmod 644 {d}/CLAUDE.md")
+    let after = fs.read("{d}/CLAUDE.md")?
+    sh("rm -rf {d}")
+    assert_names_the_error(r, "read CLAUDE.md")
+    assert_eq(after, "# mine\n")
+}
+
+test "blink init leaves a settings.json it cannot read as it was" {
+    if as_root() { skip("root can read and write every file") }
+    let d = fresh("settings")
+    let mine = "\{\"permissions\":\{\"allow\":[\"x\"]}}"
+    sh("mkdir -p {d}/.claude")
+    fs.write("{d}/.claude/settings.json", mine)?
+    sh("chmod 200 {d}/.claude/settings.json")
+    let r = init_in(d)
+    sh("chmod 644 {d}/.claude/settings.json")
+    let after = fs.read("{d}/.claude/settings.json")?
+    sh("rm -rf {d}")
+    assert_names_the_error(r, "read .claude/settings.json")
+    assert_eq(after, mine)
+}
+
+test "blink init leaves a settings.json that is not JSON as it was" {
+    let d = fresh("badjson")
+    sh("mkdir -p {d}/.claude")
+    fs.write("{d}/.claude/settings.json", "\{oops")?
+    let r = init_in(d)
+    let after = fs.read("{d}/.claude/settings.json")?
+    sh("rm -rf {d}")
+    let text = "{r.out}{r.err_out}"
+    assert(!r.success(), "init answered success:\n{text}")
+    assert(text.contains(".claude/settings.json"), "the error does not name the file:\n{text}")
+    assert_eq(after, "\{oops")
+}
+
+test "blink init that cannot write a file exits nonzero and names the path" {
+    if as_root() { skip("root can read and write every file") }
+    let d = fresh("readonly")
+    sh("chmod 555 {d}")
+    let r = init_in(d)
+    sh("chmod 755 {d}")
+    let text = "{r.out}{r.err_out}"
+    sh("rm -rf {d}")
+    assert_names_the_error(r, "write blink.toml")
+    assert(!text.contains("created blink.toml"), "init says it made a file it could not write:\n{text}")
+}

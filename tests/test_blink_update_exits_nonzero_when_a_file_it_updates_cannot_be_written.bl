@@ -1,0 +1,60 @@
+// `blink update` rewrites the blink-version in blink.toml and the plugin skill files. A file
+// it cannot write is not updated: update says which path and why, does not print "updated"
+// for it, and exits nonzero.
+
+import compile_test_helpers
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> ProcessResult {
+    process.run("sh", ["-c", cmd]).unwrap()
+}
+
+fn as_root() -> Bool {
+    sh("id -u").out.trim() == "0"
+}
+
+fn update_in(dir: Str) -> ProcessResult {
+    let blink = sh("readlink -f build/blink").out.trim()
+    sh("cd {dir} && env -u BLINK_ROOT {blink} update < /dev/null")
+}
+
+fn project(name: Str, blink_version: Str) -> Str {
+    let d = "{compile_test_helpers.scratch_root()}/_update_cannot_write_{name}_{getpid()}"
+    sh("rm -rf {d} && mkdir -p {d}/src")
+    fs.write("{d}/blink.toml", "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nblink-version = \"{blink_version}\"\n\n[dependencies]\n").unwrap()
+    d
+}
+
+fn running_version() -> Str {
+    sh("build/blink --version").out.trim().replace("blink ", "")
+}
+
+test "blink update of a blink.toml it cannot write exits nonzero and names the path" {
+    if as_root() { skip("root can write every file") }
+    let d = project("toml", "0.0.1")
+    sh("chmod 444 {d}/blink.toml")
+    let r = update_in(d)
+    sh("chmod 644 {d}/blink.toml")
+    let after = fs.read("{d}/blink.toml")?
+    sh("rm -rf {d}")
+    let text = "{r.out}{r.err_out}"
+    assert(!r.success(), "update answered success:\n{text}")
+    assert(text.contains("blink.toml: Permission denied"), "the error does not name the path and the cause:\n{text}")
+    assert(after.contains("blink-version = \"0.0.1\""), "the manifest changed:\n{after}")
+}
+
+test "blink update of a skill file it cannot write exits nonzero and names the path" {
+    if as_root() { skip("root can write every file") }
+    let d = project("skill", running_version())
+    let skill_dir = "{d}/.claude/blink-marketplace/plugins/blink/skills/blink:upgrade"
+    sh("mkdir -p '{skill_dir}'")
+    fs.write("{skill_dir}/SKILL.md", "old skill\n")?
+    sh("chmod 444 '{skill_dir}/SKILL.md'")
+    let r = update_in(d)
+    sh("chmod 644 '{skill_dir}/SKILL.md'")
+    sh("rm -rf {d}")
+    let text = "{r.out}{r.err_out}"
+    assert(!r.success(), "update answered success:\n{text}")
+    assert(text.contains("blink:upgrade/SKILL.md: Permission denied"), "the error does not name the path and the cause:\n{text}")
+    assert(!text.contains("updated: blink plugin upgrade skill"), "update says it wrote a file it could not write:\n{text}")
+}

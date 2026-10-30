@@ -47,7 +47,7 @@ import typecheck.{TypeCheck, check_types, strip_module_qualifier, tc_builtin_tra
 import sha256.{sha256_hex, read_file_bytes}
 import compiler.{
     compile_to_program, reset_compiler_state, resolve_module_path,
-    find_src_root, check_unused_imports, check_file_exists, exit_if_entry_unread,
+    find_src_root, check_unused_imports, check_file_exists, exit_if_input_unread, report_input_unread, read_entry_or_exit,
     loaded_inputs, import_map_nodes, embedded_get_source,
     collect_imports, collect_root_imports, inject_prelude, merge_programs,
     set_strict_struct_layout, tune_compiler_gc, apply_manifest_lints, quiet_manifest_lib,
@@ -428,8 +428,16 @@ fn has_test_blocks(source: Str) -> Int {
     return 0
 }
 
-fn collect_source_files(dir: Str, results: List[Str]) ! FS.Read {
-    let entries = build_fs.list_or_empty(dir)
+// A directory it cannot list stops the command: fmt that skips it would say every file is
+// formatted.
+fn collect_source_files(dir: Str, results: List[Str]) ! IO, FS.Read, Env.Exit {
+    let entries = match fs.list_dir(dir) {
+        Ok(names) => names
+        Err(e) => {
+            io.eprintln("error: {e}")
+            env.exit(1)
+        }
+    }
     let mut i = 0
     while i < entries.len() {
         let entry = entries.get(i).unwrap()
@@ -571,7 +579,7 @@ fn deps_resolved() -> Bool ! IO, FS.Read, FS.Write, Process.Spawn, Time {
 // exit code the build stops with.
 fn compile_front_end(source_path: Str, strict_mode: Int) -> Result[Int, Int] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Codegen, FS.Read, Env.Exit, Env.Read, IO {
     let final_program = compile_to_program(source_path, 1)
-    exit_if_entry_unread()
+    exit_if_input_unread()
 
     let _tc_err_count = check_types(final_program)
 
@@ -1753,10 +1761,10 @@ fn validate_cross_target_deps(target: Str) -> Int ! Diag.Report {
     0
 }
 
-// The text of a manifest a command edits. A read that fails stops the command: the edit of
-// "" would write back a manifest that holds only the edit.
-fn read_manifest_to_edit(manifest: Str) -> Str ! FS.Read, IO, Env.Exit {
-    match fs.read(manifest) {
+// The text of a file a command edits. A read that fails stops the command: the edit of ""
+// would write back a file that holds only the edit.
+fn read_to_edit(path: Str) -> Str ! FS.Read, IO, Env.Exit {
+    match fs.read(path) {
         Ok(text) => text
         Err(e) => {
             io.eprintln("error: {e}")
@@ -1765,11 +1773,11 @@ fn read_manifest_to_edit(manifest: Str) -> Str ! FS.Read, IO, Env.Exit {
     }
 }
 
-fn write_edited_manifest(manifest: Str, text: Str) ! FS.Write, IO, Env.Exit {
-    if !build_fs.write_or_report(manifest, text) { env.exit(1) }
+fn write_edited(path: Str, text: Str) ! FS.Write, IO, Env.Exit {
+    if !build_fs.write_or_report(path, text) { env.exit(1) }
 }
 
-fn stamp_blink_version() ! Diag.Report, FS.Write, FS.Read, IO {
+fn stamp_blink_version() ! Diag.Report, FS.Write, FS.Read, IO, Env.Exit {
     let manifest = resolve_manifest_path()
     if manifest == "" {
         return
@@ -1783,11 +1791,7 @@ fn stamp_blink_version() ! Diag.Report, FS.Write, FS.Read, IO {
     if manifest_blink_version == blink_cli_version {
         return
     }
-    // The stamp is a courtesy; a build does not fail for want of it.
-    let content = match fs.read(manifest) {
-        Ok(text) => text
-        Err(_) => return
-    }
+    let content = read_to_edit(manifest)
     if manifest_blink_version == "" {
         let insertion = "blink-version = \"{blink_cli_version}\"\n"
         let pkg_header = "[package]\n"
@@ -1795,7 +1799,7 @@ fn stamp_blink_version() ! Diag.Report, FS.Write, FS.Read, IO {
             Some(idx) => {
                 let after = idx + pkg_header.byte_len()
                 let updated = content.byte_slice(0, after).concat(insertion).concat(content.byte_slice(after, content.byte_len()))
-                let _ = fs.write(manifest, updated)
+                write_edited(manifest, updated)
             }
             None => {}
         }
@@ -1804,7 +1808,7 @@ fn stamp_blink_version() ! Diag.Report, FS.Write, FS.Read, IO {
         let new_line = "blink-version = \"{blink_cli_version}\""
         let updated = content.replace(old_line, new_line)
         if updated != content {
-            let _ = fs.write(manifest, updated)
+            write_edited(manifest, updated)
         }
     }
 }
@@ -5386,7 +5390,7 @@ fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
     let mut prepass: List[List[Str]] = []
     for tcf in test_files {
         let prog = compile_to_program(tcf, 1)
-        exit_if_entry_unread()
+        exit_if_input_unread()
         check_types(prog)
         check_unused_imports()
         let mut mine: List[Str] = []
@@ -5780,7 +5784,9 @@ fn cmd_check(p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
     }
     diag_set_abort_status_line(check_status_line(source_path, json_output, strict_flag, 1, 0, 0))
     let _ = check_source(source_path)
-    exit_if_entry_unread()
+    if report_input_unread() {
+        check_failed_exit(source_path, json_output)
+    }
     diag_flush()
     io.println(check_status_line(source_path, json_output, strict_flag, diag_ice_count, diag_count, diag_warn_count))
     let code = check_exit_code(strict_flag, diag_ice_count, diag_count, diag_warn_count)
@@ -5810,7 +5816,7 @@ fn cmd_fix(p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Repor
     }
     diag_set_abort_status_line(check_status_line(source_path, 0, 0, 1, 0, 0))
     let _ = check_source(source_path)
-    exit_if_entry_unread()
+    exit_if_input_unread()
 
     let editable = fix_editable_sources(source_path)
     let mut edits: List[FixEdit] = []
@@ -6244,7 +6250,7 @@ fn cmd_emit_archive_header(args_list: List[Str]) ! Lex.Tokenize, Parse, Parse.Bu
     let out_path = args_list.get(1).unwrap()
 
     let final_program = compile_to_program(source_path, 1)
-    exit_if_entry_unread()
+    exit_if_input_unread()
     let _tc_err_count = check_types(final_program)
     check_unused_imports()
     if diag_ice_count > 0 {
@@ -6309,7 +6315,7 @@ fn cmd_emit_per_module(args_list: List[Str]) ! Lex.Tokenize, Parse, Parse.Build,
     }
 
     let final_program = compile_to_program(source_path, 1)
-    exit_if_entry_unread()
+    exit_if_input_unread()
     let _tc_err_count = check_types(final_program)
     check_unused_imports()
     if diag_ice_count > 0 {
@@ -6393,7 +6399,7 @@ fn cmd_audit(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Re
         let audit_path = if source_path != "" { source_path } else { "src/main.bl" }
         check_file_exists(audit_path)
         let final_program = compile_to_program(audit_path, 1)
-        exit_if_entry_unread()
+        exit_if_input_unread()
 
         do_ffi_audit(final_program, json_output)
         if diag_ice_count > 0 {
@@ -6451,7 +6457,7 @@ fn cmd_fmt(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Repo
             let fname = files.get(fi).unwrap()
             match format_to_text(fname) {
                 Ok(formatted) => {
-                    if build_fs.read_or_empty(fname) != formatted {
+                    if read_to_edit(fname) != formatted {
                         needs_format.push(fname)
                         if json_output == 0 {
                             io.println("would reformat: {fname}")
@@ -6568,33 +6574,26 @@ fn cmd_fmt(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Repo
     }
 }
 
-fn setup_marketplace(pwd: Str) ! FS.Delete, FS.Write, IO, FS.Read {
+fn setup_marketplace(pwd: Str) ! FS.Delete, FS.Write, IO, FS.Read, Env.Exit {
     let base = ".claude/blink-marketplace"
     let plugin_dir = "{base}/plugins/blink"
     let _ = build_fs.remove_tree_or_report("{plugin_dir}/skills/upgrade")
     let _ = build_fs.remove_tree_or_report("{plugin_dir}/skills/init")
     for d in ["{base}/.claude-plugin", "{plugin_dir}/.claude-plugin", "{plugin_dir}/skills/blink:upgrade", "{plugin_dir}/skills/blink:init"] {
-        if !build_fs.mkdir_p_or_report(d) { return }
+        if !build_fs.mkdir_p_or_report(d) { env.exit(1) }
     }
 
-    let _ = fs.write("{base}/.claude-plugin/marketplace.json", "\{\"name\":\"blink-plugins\",\"owner\":\{\"name\":\"Blink\"},\"plugins\":[\{\"name\":\"blink\",\"source\":\"./plugins/blink\",\"description\":\"Blink language support: LSP, skills, and tools\"}]}")
-    let _ = fs.write("{plugin_dir}/.claude-plugin/plugin.json", "\{\"name\":\"blink\",\"description\":\"Blink language support: LSP, skills, and tools\",\"version\":\"1.0.0\"}")
-    let _ = fs.write("{plugin_dir}/.lsp.json", "\{\"blink\":\{\"command\":\"blink\",\"args\":[\"lsp\"],\"extensionToLanguage\":\{\".pact\":\"blink\",\".bl\":\"blink\"}}}")
-    let _ = fs.write("{plugin_dir}/skills/blink:upgrade/SKILL.md", embedded_upgrade_cmd)
-    let _ = fs.write("{plugin_dir}/skills/blink:init/SKILL.md", embedded_init_cmd)
+    write_edited("{base}/.claude-plugin/marketplace.json", "\{\"name\":\"blink-plugins\",\"owner\":\{\"name\":\"Blink\"},\"plugins\":[\{\"name\":\"blink\",\"source\":\"./plugins/blink\",\"description\":\"Blink language support: LSP, skills, and tools\"}]}")
+    write_edited("{plugin_dir}/.claude-plugin/plugin.json", "\{\"name\":\"blink\",\"description\":\"Blink language support: LSP, skills, and tools\",\"version\":\"1.0.0\"}")
+    write_edited("{plugin_dir}/.lsp.json", "\{\"blink\":\{\"command\":\"blink\",\"args\":[\"lsp\"],\"extensionToLanguage\":\{\".pact\":\"blink\",\".bl\":\"blink\"}}}")
+    write_edited("{plugin_dir}/skills/blink:upgrade/SKILL.md", embedded_upgrade_cmd)
+    write_edited("{plugin_dir}/skills/blink:init/SKILL.md", embedded_init_cmd)
 
     let settings_path = ".claude/settings.json"
     json_clear()
-    let root = if build_fs.path_exists(settings_path) {
-        let parsed = json_parse(build_fs.read_or_empty(settings_path))
-        if parsed < 0 {
-            json_clear()
-            json_new_object()
-        } else {
-            parsed
-        }
-    } else {
-        json_new_object()
+    let root = match build_fs.read_to_edit_if_there(settings_path) {
+        Some(text) => settings_root(settings_path, text)
+        None => json_new_object()
     }
 
     let source_obj = json_new_object()
@@ -6606,10 +6605,21 @@ fn setup_marketplace(pwd: Str) ! FS.Delete, FS.Write, IO, FS.Read {
     json_set(mkts, "blink-plugins", entry)
     let plugins = json_ensure_object(root, "enabledPlugins")
     json_set(plugins, "blink@blink-plugins", json_new_bool(1))
-    let _ = fs.write(settings_path, json_encode(root))
+    write_edited(settings_path, json_encode(root))
 }
 
-fn migrate_blink_marketplace() ! FS.Write, IO, FS.Delete, FS.Read {
+// The parsed settings a command edits. Settings that do not parse stop the command: an edit
+// of a new object would write back only the Blink keys.
+fn settings_root(path: Str, text: Str) -> Int ! IO, Env.Exit {
+    let root = json_parse(text)
+    if root < 0 {
+        io.eprintln("error: {path} is not valid JSON; it was left as it was")
+        env.exit(1)
+    }
+    root
+}
+
+fn migrate_blink_marketplace() ! FS.Write, IO, FS.Delete, FS.Read, Env.Exit {
     let old_dir = ".claude/pact-marketplace"
     let new_dir = ".claude/blink-marketplace"
     if !build_fs.path_is_dir(old_dir) || build_fs.path_is_dir(new_dir) {
@@ -6617,14 +6627,14 @@ fn migrate_blink_marketplace() ! FS.Write, IO, FS.Delete, FS.Read {
     }
     if !build_fs.rename(old_dir, new_dir) {
         io.eprintln("error: cannot rename {old_dir} to {new_dir}")
-        return
+        env.exit(1)
     }
 
     let settings_path = ".claude/settings.json"
-    if build_fs.path_exists(settings_path) {
-        json_clear()
-        let root = json_parse(build_fs.read_or_empty(settings_path))
-        if root >= 0 {
+    match build_fs.read_to_edit_if_there(settings_path) {
+        Some(text) => {
+            json_clear()
+            let root = settings_root(settings_path, text)
             let mkts = json_get(root, "extraKnownMarketplaces")
             if mkts >= 0 { json_remove(mkts, "pact-plugins") }
             let plugins = json_get(root, "enabledPlugins")
@@ -6632,8 +6642,9 @@ fn migrate_blink_marketplace() ! FS.Write, IO, FS.Delete, FS.Read {
                 json_remove(plugins, "pact@pact-plugins")
                 json_remove(plugins, "blink@pact-plugins")
             }
-            let _ = fs.write(settings_path, json_encode(root))
+            write_edited(settings_path, json_encode(root))
         }
+        None => {}
     }
 
     let pwd = working_dir()
@@ -6671,7 +6682,7 @@ fn cmd_init(_p: ArgParser, a: Args) ! Env.Exit, FS.Write, IO, Process.Spawn, FS.
 
     if already_initialized == 0 {
         let toml_content = "[package]\nname = \"{project_name}\"\nversion = \"0.1.0\"\nblink-version = \"{blink_cli_version}\"\n\n[dependencies]\n"
-        let _ = fs.write("blink.toml", toml_content)
+        write_edited("blink.toml", toml_content)
         io.println("  created blink.toml")
 
         if !build_fs.path_exists("src") && !build_fs.mkdir_p_or_report("src") {
@@ -6679,7 +6690,7 @@ fn cmd_init(_p: ArgParser, a: Args) ! Env.Exit, FS.Write, IO, Process.Spawn, FS.
         }
         if !build_fs.path_exists("src/main.bl") {
             let main_content = "fn main() \{\n    io.println(\"Hello from {project_name}!\")\n\}\n"
-            let _ = fs.write("src/main.bl", main_content)
+            write_edited("src/main.bl", main_content)
             io.println("  created src/main.bl")
         }
 
@@ -6696,23 +6707,23 @@ fn cmd_init(_p: ArgParser, a: Args) ! Env.Exit, FS.Write, IO, Process.Spawn, FS.
             }
         }
 
-        if !build_fs.path_exists(".gitignore") {
-            let gitignore = "build/\n.blink/\n"
-            let _ = fs.write(".gitignore", gitignore)
-            io.println("  created .gitignore")
-        } else {
-            let existing = build_fs.read_or_empty(".gitignore")
-            let mut additions = ""
-            if !existing.contains("build/") {
-                additions = additions.concat("build/\n")
+        match build_fs.read_to_edit_if_there(".gitignore") {
+            None => {
+                write_edited(".gitignore", "build/\n.blink/\n")
+                io.println("  created .gitignore")
             }
-            if !existing.contains(".blink/") {
-                additions = additions.concat(".blink/\n")
-            }
-            if additions != "" {
-                let updated = existing.concat("\n# Blink\n").concat(additions)
-                let _ = fs.write(".gitignore", updated)
-                io.println("  updated .gitignore")
+            Some(existing) => {
+                let mut additions = ""
+                if !existing.contains("build/") {
+                    additions = additions.concat("build/\n")
+                }
+                if !existing.contains(".blink/") {
+                    additions = additions.concat(".blink/\n")
+                }
+                if additions != "" {
+                    write_edited(".gitignore", existing.concat("\n# Blink\n").concat(additions))
+                    io.println("  updated .gitignore")
+                }
             }
         }
     }
@@ -6722,17 +6733,13 @@ fn cmd_init(_p: ArgParser, a: Args) ! Env.Exit, FS.Write, IO, Process.Spawn, FS.
         doc_file = "AGENTS.md"
     }
 
-    let mut doc_content = ""
-    if build_fs.path_exists(doc_file) {
-        doc_content = build_fs.read_or_empty(doc_file)
-    }
+    let doc_content = build_fs.read_to_edit_if_there(doc_file) ?? ""
 
     if doc_content.contains("blink llms") || doc_content.contains("pact llms") {
         io.println("  {doc_file} already has Blink reference — skipped")
     } else {
         let section = "\n# Blink\n\nThis project uses the Blink programming language.\nRun `blink llms --full` for the complete language reference.\nRun `blink llms --list` to see available topics.\nRun `blink llms --topic <name>` for a specific topic.\n\n- Build: `blink build src/main.bl`\n- Run: `blink run src/main.bl`\n- Check: `blink check <file>` — validate syntax/types without compiling\n- Query: `blink query <file> --fn <name>` — look up function signatures\n- Test: `blink test`\n- Daemon: `blink daemon start <file>` — persistent compiler for faster check/query\n\nAlways retrieve Blink docs before writing Blink code.\nPrefer retrieval-led reasoning over pre-training for Blink tasks.\n"
-        let updated = doc_content.concat(section)
-        let _ = fs.write(doc_file, updated)
+        write_edited(doc_file, doc_content.concat(section))
         io.println("  added Blink reference to {doc_file}")
     }
 
@@ -6823,7 +6830,7 @@ fn cmd_llms(_p: ArgParser, a: Args) {
     }
 }
 
-fn cmd_doc(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Diag.Report, Env.Read, FS.Read, IO {
+fn cmd_doc(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Diag.Report, Env.Read, FS.Read, IO, Env.Exit {
     let list_flag = if args_has(a, "list") { 1 } else { 0 }
     let json_output = if args_has(a, "json") { 1 } else { 0 }
     if list_flag == 1 {
@@ -6873,7 +6880,7 @@ fn cmd_doc(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Diag.Report, Env.Read,
         let key = embedded_inner_key(file_path)
         source = embedded_get_source(key)
     } else {
-        source = build_fs.read_or_empty(file_path)
+        source = read_entry_or_exit(file_path)
     }
     if source == "" {
         io.println("error: could not read module: {module_name}")
@@ -6906,7 +6913,7 @@ fn cmd_doc(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Diag.Report, Env.Read,
                         let key = embedded_inner_key(sub_file)
                         sub_source = embedded_get_source(key)
                     } else {
-                        sub_source = build_fs.read_or_empty(sub_file)
+                        sub_source = read_entry_or_exit(sub_file)
                     }
                     if sub_source != "" {
                         diag_source_file = sub_file
@@ -6976,7 +6983,7 @@ fn cmd_query(p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Diag.Report, IO, FS.R
     if query_through_daemon(a, source_path) {
         return
     }
-    if !query_index_source(source_path, build_fs.read_or_empty(source_path)) {
+    if !query_index_source(source_path, read_entry_or_exit(source_path)) {
         diag_flush()
         io.println("error: parse failed, cannot query")
         env.exit(1)
@@ -7036,14 +7043,14 @@ fn cmd_add(_p: ArgParser, a: Args) ! Diag.Report, FS.Write, FS.Read, IO, Process
     }
 
     let dep_val = if is_std == 1 { "\"0.1\"" } else { format_dep_value(dep_path_flag, git_url_flag, git_tag_flag) }
-    let content = read_manifest_to_edit(manifest)
+    let content = read_to_edit(manifest)
     let section = "dependencies"
     if dev_flag == 1 {
         let updated = insert_dep_line(content, "dev-dependencies", pkg_name, dep_val)
-        write_edited_manifest(manifest, updated)
+        write_edited(manifest, updated)
     } else {
         let updated = insert_dep_line(content, section, pkg_name, dep_val)
-        write_edited_manifest(manifest, updated)
+        write_edited(manifest, updated)
     }
 
     let resolve_rc = resolve_and_lock(".", blink_cli_version)
@@ -7082,9 +7089,9 @@ fn cmd_remove(_p: ArgParser, a: Args) ! Diag.Report, FS.Write, FS.Read, IO, Proc
         return
     }
 
-    let content = read_manifest_to_edit(manifest)
+    let content = read_to_edit(manifest)
     let updated = remove_dep_line(content, pkg_name)
-    write_edited_manifest(manifest, updated)
+    write_edited(manifest, updated)
 
     let resolve_rc = resolve_and_lock(".", blink_cli_version)
     if resolve_rc == 0 {
@@ -7095,7 +7102,7 @@ fn cmd_remove(_p: ArgParser, a: Args) ! Diag.Report, FS.Write, FS.Read, IO, Proc
     }
 }
 
-fn cmd_update(_p: ArgParser, a: Args) ! Diag.Report, FS.Write, IO, FS.Delete, FS.Read, Process.Spawn, Time {
+fn cmd_update(_p: ArgParser, a: Args) ! Diag.Report, FS.Write, IO, FS.Delete, FS.Read, Process.Spawn, Time, Env.Exit {
     let source_path = args_positional(a, 0)
     let manifest = resolve_manifest_path()
     if manifest == "" {
@@ -7106,20 +7113,24 @@ fn cmd_update(_p: ArgParser, a: Args) ! Diag.Report, FS.Write, IO, FS.Delete, FS
     stamp_blink_version()
     migrate_blink_marketplace()
     let upgrade_skill = ".claude/blink-marketplace/plugins/blink/skills/blink:upgrade/SKILL.md"
-    if build_fs.path_exists(upgrade_skill) {
-        let existing = build_fs.read_or_empty(upgrade_skill)
-        if existing != embedded_upgrade_cmd {
-            let _ = fs.write(upgrade_skill, embedded_upgrade_cmd)
-            io.println("updated: blink plugin upgrade skill")
+    match build_fs.read_to_edit_if_there(upgrade_skill) {
+        Some(existing) => {
+            if existing != embedded_upgrade_cmd {
+                write_edited(upgrade_skill, embedded_upgrade_cmd)
+                io.println("updated: blink plugin upgrade skill")
+            }
         }
+        None => {}
     }
     let init_skill = ".claude/blink-marketplace/plugins/blink/skills/blink:init/SKILL.md"
-    if build_fs.path_exists(init_skill) {
-        let existing_init = build_fs.read_or_empty(init_skill)
-        if existing_init != embedded_init_cmd {
-            let _ = fs.write(init_skill, embedded_init_cmd)
-            io.println("updated: blink plugin init skill")
+    match build_fs.read_to_edit_if_there(init_skill) {
+        Some(existing_init) => {
+            if existing_init != embedded_init_cmd {
+                write_edited(init_skill, embedded_init_cmd)
+                io.println("updated: blink plugin init skill")
+            }
         }
+        None => {}
     }
     let resolve_rc = resolve_and_lock(".", blink_cli_version)
     if resolve_rc == 0 {
@@ -7163,7 +7174,7 @@ fn cmd_ast(p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Repor
     check_file_exists(source_path)
     reset_compiler_state()
     diag_reset()
-    let source = build_fs.read_or_empty(source_path)
+    let source = read_entry_or_exit(source_path)
     diag_source_file = source_path
     diag_register_source(source_path, source)
     lex(source)
@@ -7351,9 +7362,9 @@ fn cmd_shim_init(_p: ArgParser, a: Args) ! Diag.Report, FS.Write, IO, FS.Read, E
     io.println("  created {wrapper_path}")
 
     let dep_value = "\{ type = \"vendored\", path = \"".concat(c_path).concat("\" \}")
-    let content = read_manifest_to_edit(manifest)
+    let content = read_to_edit(manifest)
     let updated = insert_dep_line(content, "native-dependencies", name, dep_value)
-    write_edited_manifest(manifest, updated)
+    write_edited(manifest, updated)
     io.println("  registered [native-dependencies].{name} in {manifest}")
 
     io.println("\nShim '{name}' scaffolded.")

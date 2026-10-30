@@ -1,0 +1,65 @@
+// A blink.toml, blink.lock or audits.toml that is there but cannot be read is not an empty
+// one: the check would go on without its lints, its dependencies or its audit records. The
+// command names the path and exits nonzero.
+
+import compile_test_helpers
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> ProcessResult {
+    process.run("sh", ["-c", cmd]).unwrap()
+}
+
+fn as_root() -> Bool {
+    sh("id -u").out.trim() == "0"
+}
+
+let MAIN: Str = "import std.path.\{path_basename}\n\nfn main() \{\n    io.println(path_basename(\"a/b\"))\n\}\n"
+
+// A package whose file `locked` no one may read.
+fn package_with_locked(name: Str, locked: Str) -> Str ! FS.Write {
+    let d = "{compile_test_helpers.scratch_root()}/_configread_{name}_{getpid()}"
+    sh("rm -rf {d} && mkdir -p {d}/src")
+    fs.write("{d}/blink.toml", "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n\n[dependencies]\n").unwrap()
+    fs.write("{d}/blink.lock", "[metadata]\nlockfile-version = 1\n").unwrap()
+    fs.write("{d}/audits.toml", "[DB-1]\nclaim = \"x\"\n").unwrap()
+    fs.write("{d}/src/main.bl", MAIN).unwrap()
+    sh("chmod 000 {d}/{locked}")
+    d
+}
+
+// The manifest and lock loaders do not hand back the OS error yet, so for those two files the
+// message names only the path.
+fn run_in(d: Str, locked: Str, cmd: Str, want: Str) -> Str {
+    let r = sh("B=$(pwd)/build; cd {d} && env -u BLINK_ROOT {cmd} < /dev/null")
+    sh("chmod 644 {d}/{locked}")
+    sh("rm -rf {d}")
+    let text = "{r.out}{r.err_out}"
+    assert(!r.success(), "the command answered success:\n{text}")
+    assert(text.contains(want), "the error does not name the path:\n{text}")
+    assert(!text.contains("internal compiler error"), "a read error is not a compiler bug:\n{text}")
+    text
+}
+
+test "blink check with a blink.toml it cannot read exits nonzero and names the path" {
+    if as_root() { skip("root can read every file") }
+    let d = package_with_locked("toml", "blink.toml")
+    let _ = run_in(d, "blink.toml", "$B/blink check src/main.bl", "cannot load ./blink.toml")
+}
+
+test "blinkc with a blink.toml it cannot read exits nonzero and names the path" {
+    if as_root() { skip("root can read every file") }
+    let d = package_with_locked("toml_blinkc", "blink.toml")
+    let _ = run_in(d, "blink.toml", "$B/blinkc src/main.bl main.c", "cannot load ./blink.toml")
+}
+
+test "blink check with a blink.lock it cannot read exits nonzero and names the path" {
+    if as_root() { skip("root can read every file") }
+    let d = package_with_locked("lock", "blink.lock")
+    let _ = run_in(d, "blink.lock", "$B/blink check src/main.bl", "cannot load ./blink.lock")
+}
+
+test "blink check with an audits.toml it cannot read exits nonzero and names the path" {
+    if as_root() { skip("root can read every file") }
+    let d = package_with_locked("audits", "audits.toml")
+    let _ = run_in(d, "audits.toml", "$B/blink check src/main.bl", "audits.toml: Permission denied")
+}
