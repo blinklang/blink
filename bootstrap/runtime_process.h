@@ -1762,8 +1762,8 @@ BLINK_RT_FN blink_child_box* blink_child_run(const char* cmd, const blink_list* 
     char* err = (char*)"";
     blink_child_pump(in_pipe[1], stdin_data, has_stdin ? blink_str_len(stdin_data) : 0,
                      out_pipe[0], err_pipe[0], &out, &err, -1);
-    /* As blink_process_run_with_stdin: a Ctrl-C while the child runs reaches it, and the
-     * parent takes it once the child is reaped. */
+    /* A Ctrl-C while the child runs reaches it, and the parent takes it once the child is
+     * reaped. */
     blink_child_pid = pid;
     blink_got_sigint = 0;
     blink_sigint_enter();
