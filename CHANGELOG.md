@@ -36,6 +36,11 @@ Single source of truth for release history. `blink llms` and `blink llms --full`
 - **E0318 for a literal at an unsolved type variable gives the default type and a fix.** `let y = id(9223372036854775808)` names the default `Int`, and the help is `let y = id[U64](9223372036854775808)`. A push to `let mut xs = []` gets `help: let mut xs: List[U64] = []`. A help prints only when the fixed code compiles.
 - **`blink shim init` writes `! ()` on the scaffolded binding, not `! FFI`.**
 - **Build products stay out of the project.** The native cache is `build/native-cache`; the compiler no longer writes `.tmp` into the project. `blink fmt --check` runs in memory.
+- **Random values come from the `rand` handle.** `rand.int(r)` takes a `Range[Int]` (`rand.int(1..=6)`) and panics on an empty range. `rand.float()` is in `[0.0, 1.0)`, and `rand.bytes(n)` gives `n` bytes. Each call goes through the `Rand` handler, so `with` a `handler Rand { ... }` gives a fixed stream in a test. The wrapper checks each result of a handler and panics on a value outside the contract.
+- **The default `Rand` handler is a CSPRNG.** It is seeded from operating-system entropy, each thread has its own stream, and a forked child does not repeat its parent. Its output is safe for keys and tokens.
+- **`std.random` has `shuffle` and `choice`.** `shuffle(xs)` returns a new list in random order; `choice(xs)` returns one element, or `None` for an empty list.
+- **Python-style random calls get a fix.** `rand.int(0, 10)` and `rand.int(10)` do not compile, and the fix is `rand.int(0..10)`. `rand.shuffle(deck)` is E0505, and its fix calls `shuffle(deck)` and adds `import std.random.{shuffle}`. `blink fix`, `blink check --json` and the LSP code action now apply every edit of a fix, or none.
+- **The LSP completes `rand.`** with the operations of `Rand` and the `std.random` helpers. A helper adds its import when you pick it.
 - **Compile time of wide nested types is lower.** A program with 800 non-recursive types compiles in 0.06 s; before, it took 3.8 s.
 
 ## Fixes (v0.59.0)

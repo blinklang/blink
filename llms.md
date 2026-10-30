@@ -41,13 +41,14 @@ Key facts:
 - `Map.remove` returns `Option[V]`. `m[k] = v` is an error; use `m.insert(k, v)`. `channel.new[T](buffer: n)`; `ch.recv()` returns `Option[T]`
 - `Float` has a total order (`NaN == NaN`, `-0.0 == 0.0`); use `x.ieee_eq(y)` for IEEE equality. `x == -0.0` is also true for `0.0` and warns (W0706); test the sign with `x.is_sign_negative()`; test for NaN with `x.is_nan()` and for a finite value with `x.is_finite()` (`x.is_infinite()` for `Float.INF` or `-Float.INF`)
 - `Float` and `F32` have built-in math methods (`x.sqrt()`, `x.ln()`, `y.atan2(x)`) and constants (`Float.PI`, `Float.INF`); there is no `math.sqrt(x)` and no `.log()`
+- Random values: `rand.int(1..=6)` (a Range, never `rand.int(0, 10)`), `rand.float()` in `[0.0, 1.0)`, `rand.bytes(n)`; effect `Rand`. The default is a CSPRNG. `shuffle` and `choice` come from `import std.random.{shuffle, choice}`; `rand.shuffle(xs)` is E0505
 - `@trusted(audit: "ID")` needs an audit id. `@ffi.opaque(header, name)` declares a C handle type
 - `blink build`, `run` and `test` compile one C unit per module. `--no-per-module` or `BLINK_PER_MODULE=0` builds one C unit, to bisect a per-module bug
 - `blink test` ends each test binary after a 10m timeout. `--timeout`, `--memory` and `--processes` set the limits (`30m`, `2G`, `1024`; `none` turns one off); `[test] timeout = "30m"` in blink.toml sets the timeout. A bad value exits 2 before any build
 
 ## Standard Library
 
-`std.args` (CLI parsing), `std.db` (SQLite database with effect-based API), `std.http` (HTTP client/server), `std.json` (JSON), `std.net` (TCP networking), `std.path` (path utilities), `std.semver` (versions), `std.toml` (TOML).
+`std.args` (CLI parsing), `std.db` (SQLite database with effect-based API), `std.http` (HTTP client/server), `std.json` (JSON), `std.net` (TCP networking), `std.path` (path utilities), `std.random` (`shuffle`, `choice`), `std.semver` (versions), `std.toml` (TOML).
 Prelude (auto-imported): `std.str` (string ops), `std.list` (list HOFs), `std.map` (map HOFs), `std.num`, `std.sb`, `std.bytes`, `std.time`, `std.traits` (core traits).
 Run `blink doc --list` to list modules, `blink doc <module>` for details.
 

@@ -554,6 +554,18 @@ env.exit(code)                  // terminate process (effect: Env.Exit)
 time.read()                     // -> Instant
 time.sleep(duration)            // sleep for Duration
 
+// Rand (effect: Rand). The default handler is a CSPRNG seeded from the OS
+rand.int(1..=6)                 // -> Int: uniform in the range; an empty range (5..5) panics
+rand.int(0..n)                  // for now write a literal start and a literal or name end:
+                                // `rand.int(lo..hi)` and `rand.int(0..xs.len())` fail; bind `let n = xs.len()` first
+rand.float()                    // -> Float: uniform in [0.0, 1.0)
+rand.bytes(32)                  // -> Bytes of length n; n < 0 panics
+// rand.int(0, 10) and rand.int(10) do not compile; the fix is rand.int(0..10)
+// rand.shuffle(xs) is E0505: shuffle and choice are functions in std.random
+import std.random.{shuffle, choice}
+shuffle(xs)                     // -> List[T]: a new list; xs does not change
+choice(xs)                      // -> Option[T]: None for an empty list
+
 // Async (effect: Async)
 async.scope { ... }             // synchronous scope for spawned tasks
 async.spawn(fn() { ... })       // spawn task, returns Handle
@@ -638,6 +650,21 @@ net.close(fd)                   // -> ()
 net.connect(host, port)         // -> Int (connection fd)
 net.set_timeout(fd, ms)         // -> () (set read timeout)
 ```
+
+`rand.float()` is in `[0.0, 1.0)`, but `lo + rand.float() * (hi - lo)` can round up to `hi`. For a
+value in `[lo, hi)`, draw again while the result is `hi`:
+
+```blink
+fn uniform(lo: Float, hi: Float) -> Float ! Rand {
+    let mut x = lo + rand.float() * (hi - lo)
+    while x == hi { x = lo + rand.float() * (hi - lo) }
+    x
+}
+```
+
+For a fixed stream in a test, install a handler: `handler Rand { fn int(lo: Int, hi: Int) -> Int { lo } ... }`
+implements the operations `int(lo, hi)` (closed range), `float()` and `bytes(n)`. `rand.int`
+checks each result of a handler and panics with `Rand handler contract violated` on a value out of range.
 
 ## String Methods
 
@@ -1484,6 +1511,7 @@ show(42)          // "42"
 | `std.net` | TCP networking: `TcpSocket`, `TcpListener`, `NetError` (`Timeout`, `ConnectionRefused`, `DnsFailure`, `TlsError`, `InvalidUrl`, `BindError`, `ProtocolError`, `IoError`), `tcp_listen`, `tcp_connect`, `tcp_accept`, `tcp_read`, `tcp_write`, `tcp_read_bytes`, `tcp_write_bytes` | `import std.net` |
 | `std.path` | Path utilities: `path_join(a, b)`, `path_dirname(path)`, `path_basename(path)`, `path_parent(path)` (POSIX `dirname(1)` semantics — strips trailing slashes before walking up) | `import std.path` |
 | `std.process` | Process types: `Child`, which `process.spawn(cmd, args)` returns; `process.wait(child)` returns its `ProcessResult` and `process.signal(child, sig)` signals it. `ProcessResult.end: ChildEnd`, `ProcessResult.success() -> Bool`, `ChildEnd`, `LimitKind`, `signal_name(n)`. Signal constants (foreign constants: the target's C headers set each number): `SIGHUP`, `SIGINT`, `SIGQUIT`, `SIGABRT`, `SIGBUS`, `SIGKILL`, `SIGSEGV`, `SIGTERM`, `SIGXCPU` | `import std.process` |
+| `std.random` | Random helpers over the `Rand` effect: `shuffle[T](xs) -> List[T]` (Fisher-Yates, a new list) and `choice[T](xs) -> Option[T]` (`None` for an empty list). Call them by their bare names; `rand.shuffle(xs)` is E0505, and its fix adds the import | `import std.random.{shuffle, choice}` |
 | `std.semver` | Semantic version parsing and constraints | `import std.semver` |
 | `std.testing` | Test helpers: `capture_log`, `capture_print`, `capture_eprint` (handler factories that intercept IO for assertions; `capture_eprint` has type `Handler[IO.Eprint]`, and a panic message does not land in its list); `assert_close(a, b, tol)`, `assert_close_rel(a, b, rel)` (float assertions, panic on NaN / negative tol); `for_each[T](cases: List[(Str, T)], body: fn(T))` (table-driven test helper); `skip(reason: Str)` (skip a test from its body; rejected outside tests as `E0827`); `cleanup(fn: fn())` (register a teardown to run at end of test) | `import std.testing` |
 | `std.term` | Terminal styling and control: ANSI colors (`red`, `green`, `blue`, etc.), text styles (`bold`, `dim`, `italic`, `underline`, `strikethrough`), background colors, TTY detection (`is_tty`, `terminal_width`, `terminal_height`), cursor control (`move_up`, `clear_screen`, `hide_cursor`, etc.) | `import std.term` |
