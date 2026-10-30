@@ -3,8 +3,8 @@
 // exiting — and turns a nonzero errno into Err(FsError{op, path, code}), the same
 // way http_do_request turns a raw socket failure into Err(NetError). The public
 // fs.read/write/list_dir/stat/delete surface redirects codegen here; the wrappers call
-// the raw free-fn layer (read_file/write_file/list_dir/fs_remove) so the redirect
-// does not recurse back through the signed methods.
+// the runtime through the private @ffi bindings below, so the redirect does not recurse
+// back through the signed methods.
 // The wrappers are private: a user call of one would skip every Handler[FS] (§4.7.1).
 // The compiler reaches them as the default slots of the FS vtable.
 import std.fs_error.{FsError, FsOp}
@@ -43,8 +43,26 @@ fn c_fs_stat_size() -> Int ! FFI {}
 @trusted(audit: "Reads st_mtim of the thread's last blink_fs_stat as nanoseconds since the epoch. Pure read of a thread-local.")
 fn c_fs_stat_mtime_ns() -> Int ! FFI {}
 
+// The raw reads and writes. Each records errno for fs.errno() (0 = success) and answers
+// an empty value on failure; the wrappers below turn that errno into an FsError.
+@ffi("blink_read_file")
+@trusted(audit: "Reads a whole file into a fresh GC string through fopen/fread; a NUL byte ends the string. Sets the thread's fs errno; returns the empty string on failure.")
+fn c_read_file(path: Str) -> Str ! FS.Read {}
+
+@ffi("blink_write_file")
+@trusted(audit: "Writes the bytes of a GC string to a file through fopen/fwrite/fclose, replacing what was there. Sets the thread's fs errno; keeps no pointer to the arguments.")
+fn c_write_file(path: Str, content: Str) ! FS.Write {}
+
+@ffi("blink_list_dir")
+@trusted(audit: "Reads a directory with opendir/readdir into a fresh GC list of GC strings, without . and ... Sets the thread's fs errno; returns an empty list on failure.")
+fn c_list_dir(path: Str) -> List[Str] ! FS.Read {}
+
+@ffi("blink_fs_remove")
+@trusted(audit: "Removes one directory entry with unlink(2). Sets the thread's fs errno; keeps no pointer to the argument.")
+fn c_fs_remove(path: Str) ! FS.Delete {}
+
 fn fs_do_read(path: Str) -> Result[Str, FsError] ! FS.Read {
-    let content = read_file(path)
+    let content = c_read_file(path)
     let code = fs.errno()
     if code != 0 {
         return Err(FsError { op: FsOp.Read, path: path, code: Errno(code) })
@@ -53,7 +71,7 @@ fn fs_do_read(path: Str) -> Result[Str, FsError] ! FS.Read {
 }
 
 fn fs_do_write(path: Str, content: Str) -> Result[Void, FsError] ! FS.Write {
-    write_file(path, content)
+    c_write_file(path, content)
     let code = fs.errno()
     if code != 0 {
         return Err(FsError { op: FsOp.Write, path: path, code: Errno(code) })
@@ -62,7 +80,7 @@ fn fs_do_write(path: Str, content: Str) -> Result[Void, FsError] ! FS.Write {
 }
 
 fn fs_do_list_dir(path: Str) -> Result[List[Str], FsError] ! FS.Read {
-    let entries = list_dir(path)
+    let entries = c_list_dir(path)
     let code = fs.errno()
     if code != 0 {
         return Err(FsError { op: FsOp.ListDir, path: path, code: Errno(code) })
@@ -71,7 +89,7 @@ fn fs_do_list_dir(path: Str) -> Result[List[Str], FsError] ! FS.Read {
 }
 
 fn fs_do_delete(path: Str) -> Result[Void, FsError] ! FS.Delete {
-    fs_remove(path)
+    c_fs_remove(path)
     let code = fs.errno()
     if code != 0 {
         return Err(FsError { op: FsOp.Delete, path: path, code: Errno(code) })
