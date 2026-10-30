@@ -652,7 +652,8 @@ net.set_timeout(fd, ms)         // -> () (set read timeout)
 ```
 
 `rand.float()` is in `[0.0, 1.0)`, but `lo + rand.float() * (hi - lo)` can round up to `hi`. For a
-value in `[lo, hi)`, draw again while the result is `hi`:
+value in `[lo, hi)`, draw again while the result is `hi`. This needs a finite `hi - lo`; a wider
+span, such as `-Float.MAX` to `Float.MAX`, gives `inf` or NaN:
 
 ```blink
 fn uniform(lo: Float, hi: Float) -> Float ! Rand {
