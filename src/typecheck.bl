@@ -25,7 +25,7 @@ import diagnostics.{
     Diag, diag_clear_allows, diag_error_at, diag_error_at_notes, diag_error_span_at_notes, diag_error_no_loc,
     diag_set_last_fix, diag_set_last_fix_at, diag_add_last_fix_edit, diag_source_lines, diag_entries, UNDECLARED_EFFECT,
     diag_push_allows, diag_enter_allows, diag_exit_allows, NON_CONST_EXPR,
-    diag_warn_at, diag_warn_at_notes, diag_warn_span_at_notes, PARTIAL_HANDLER, diag_truncate, diag_entry_count, diag_any_errors_since, diag_ice_at, diag_ice, PRELUDE_TYPE_NOT_LOADED, diag_count, diag_emit_in_file, diag_file_for_node,
+    diag_warn_at, diag_warn_at_notes, diag_warn_span_at_notes, PARTIAL_HANDLER, diag_truncate, diag_entry_count, diag_any_errors_since, diag_ice_at, diag_ice, PRELUDE_TYPE_NOT_LOADED, diag_count, diag_emit_in_file, diag_file_for_node, diag_file_node_range,
     diag_is_audit_gated, diag_audit_gated_help, AUDIT_GATED_SUPPRESSION, diag_normalize_path, diag_source_line, diag_errors_in_lines,
     POSITIONAL_PARAM_DEFAULT, NON_CONST_PARAM_DEFAULT, FOREIGN_CONST_FORM, FOREIGN_CONST_NO_HEADER, RANGE_BOUND_NOT_CONST, NON_INIT_EXPR,
     ICE_SEG_UNSOLVED_TYPEVAR, ICE_SEG_UNHANDLED_KIND, ICE_SEG_TID_OUT_OF_RANGE,
@@ -15833,10 +15833,19 @@ fn tc_helper_call_fix(node: Int, module: Str, name: Str) {
     let mut import_text = ""
     let mut import_at = ImportEdit { line: 0, col: 0, end_line: 0, end_col: 0, text: "" }
     if decl == -1 {
-        match import_need(lines, module, name) {
-            ImportNeed.Add(e) => {
-                import_text = "add `import {module}.\{{name}}` and "
-                import_at = e
+        match import_need(lines, module, [name]) {
+            ImportNeed.Add(one) => {
+                let names = tc_helpers_to_import(node, module, lines)
+                let mut list = name
+                import_at = one
+                match import_need(lines, module, names) {
+                    ImportNeed.Add(all) => {
+                        list = names.join(", ")
+                        import_at = all
+                    }
+                    _ => {}
+                }
+                import_text = "add `import {module}.\{{list}}` and "
             }
             ImportNeed.Present => {}
             ImportNeed.Blocked => return
@@ -15853,6 +15862,34 @@ fn tc_helper_call_fix(node: Int, module: Str, name: Str) {
     if import_at.line > 0 {
         diag_add_last_fix_edit(import_at.line, import_at.col, import_at.end_line, import_at.end_col, import_at.text)
     }
+}
+
+// The helpers of `module` that the file of `node` calls through the same handle and needs to
+// import, sorted. Each of their fixes imports them all, so the fixes carry one import edit,
+// which `blink fix` applies once instead of seeing two inserts at one place as a conflict.
+fn tc_helpers_to_import(node: Int, module: Str, lines: List[Str]) -> List[Str] {
+    let handle = node_name(node_obj(node))
+    let root = builtin_op_root_of_handle(handle)
+    let site = tc_site_module(node)
+    let mut names: List[Str] = []
+    let file = diag_file_for_node(node)
+    let (start, end) = diag_file_node_range(node, node_count())
+    let mut n = start
+    while n < end {
+        if node_kind(n) == NodeKind.MethodCall && diag_file_for_node(n) == file {
+            let m = node_method(n)
+            let obj = node_obj(n)
+            let calls_helper = builtin_op_helper_module(root, m) == module && obj >= 0 && node_kind(obj) == NodeKind.Ident && node_name(obj) == handle
+            if calls_helper && !names.contains(m) && nr_resolve_bare_decl(m, site) == -1 {
+                match import_need(lines, module, [m]) {
+                    ImportNeed.Add(_) => names.push(m)
+                    _ => {}
+                }
+            }
+        }
+        n = n + 1
+    }
+    names.sort()
 }
 
 pub fn tc_call_builtin_default(call: Int) -> Int {

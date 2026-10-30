@@ -16,7 +16,7 @@ pub type ImportEdit {
 }
 
 pub type ImportNeed {
-    // The file already imports the name by its bare spelling.
+    // The file already imports each name by its bare spelling.
     Present
     Add(ImportEdit)
     // The file imports the item under another spelling, or binds the name to another item, with
@@ -81,33 +81,44 @@ fn import_stmts(lines: List[Str], module: Str) -> List[ImportDecl] {
     out
 }
 
-// How `lines` comes to import `name` from `module` by its bare name. A one-line
-// `import module.{...}` gets the name added to its list; a `pub import` does not, as the fix
-// must not export the name. Otherwise a new import line goes after
-// the last import, or, in a file with none, before the first line that is not a plain comment
-// or blank, so that a doc comment stays with the item it documents.
-pub fn import_need(lines: List[Str], module: Str, name: Str) -> ImportNeed {
+// How `lines` comes to import each of `names` from `module` by its bare name: Present when it
+// imports them all, Blocked when it binds one of them with `as`, else one edit that imports the
+// ones it lacks. Two fixes in one file that each need an import of the same names then carry the
+// same edit, which `blink fix` applies once. A one-line `import module.{...}` gets the names
+// added to its list; a `pub import` does not, as the fix must not export them. Otherwise a new
+// import line goes after the last import, or, in a file with none, before the first line that
+// is not a plain comment or blank, so that a doc comment stays with the item it documents.
+pub fn import_need(lines: List[Str], module: Str, names: List[Str]) -> ImportNeed {
     let stmts = import_stmts(lines, module)
     let mut merge = -1
+    let mut present: List[Str] = []
     for s in stmts {
         if !s.of_module { continue }
         for raw in s.items.split(",") {
             let item = raw.trim()
-            if item == name { return ImportNeed.Present }
-            if item.starts_with("{name} ") || item.ends_with(" {name}") { return ImportNeed.Blocked }
+            for name in names {
+                if item == name { present.push(name) }
+                if item.starts_with("{name} ") || item.ends_with(" {name}") { return ImportNeed.Blocked }
+            }
         }
         if merge == -1 && s.first == s.last && !s.is_pub { merge = s.first }
     }
+    let mut missing: List[Str] = []
+    for name in names {
+        if !present.contains(name) { missing.push(name) }
+    }
+    if missing.len() == 0 { return ImportNeed.Present }
+    let list = missing.join(", ")
     if merge != -1 {
         let line = code_of(lines.get(merge).unwrap())
         let open = line.byte_index_of("\{", 0).unwrap()
         let close = line.byte_index_of("}", open).unwrap()
         let before = line.byte_slice(open + 1, close).trim_right()
         let at = open + 1 + before.byte_len()
-        let text = if before.trim() == "" { name } else if before.ends_with(",") { " {name}" } else { ", {name}" }
+        let text = if before.trim() == "" { list } else if before.ends_with(",") { " {list}" } else { ", {list}" }
         return ImportNeed.Add(ImportEdit { line: merge + 1, col: at + 1, end_line: merge + 1, end_col: at + 1, text: text })
     }
-    let new_line = "import {module}.\{{name}}"
+    let new_line = "import {module}.\{{list}}"
     if stmts.len() > 0 {
         let last = stmts.get(stmts.len() - 1).unwrap().last
         let end = lines.get(last).unwrap().byte_len() + 1
