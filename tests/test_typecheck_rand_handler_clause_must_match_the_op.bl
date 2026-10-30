@@ -1,0 +1,124 @@
+// A `handler Rand` clause implements an operation of Rand: int(lo: Int, hi: Int) -> Int,
+// float() -> Float, bytes(n: Int) -> Bytes (sections/04_effects.md §4.4.7). The wrapper's
+// Range form is not an operation, so a clause written with it is refused, and so is a clause
+// for a name Rand does not have. User code calls the wrapper; the two-Int form does not compile.
+
+import std.fs
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_reset}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+import std.io
+
+fn typecheck_probe(path: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    init_embedded_stdlib()
+    write_file(path, src)
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+}
+
+fn error_messages() -> List[Str] {
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" { out.push("{d.name}: {d.message}") }
+    }
+    out
+}
+
+fn errors_of(src: Str) -> List[Str] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    typecheck_probe("build/test_typecheck_rand_handler_clause_probe.bl", src)
+    let errs = error_messages()
+    for e in errs { io.println("  diag: {e}") }
+    errs
+}
+
+test "clauses with the op signatures are clean" {
+    let src = #"
+fn main() ! IO, Rand {
+    with handler Rand {
+        fn int(lo: Int, hi: Int) -> Int { default.int(lo, hi) }
+        fn float() -> Float { default.float() }
+        fn bytes(n: Int) -> Bytes { default.bytes(n) }
+    } {
+        io.println("{rand.int(1..=6)} {rand.float()} {rand.bytes(2).len()}")
+    }
+}
+"#
+    assert_eq(errors_of(src).len(), 0)
+}
+
+test "an int clause that takes a range is refused" {
+    let src = #"
+fn main() ! IO, Rand {
+    with handler Rand {
+        fn int(r: Range[Int]) -> Int { 0 }
+    } {
+        io.println("{rand.int(1..=6)}")
+    }
+}
+"#
+    let errs = errors_of(src)
+    assert(errs.len() >= 1)
+    assert(errs.get(0).unwrap().contains("int"), errs.join("; "))
+}
+
+test "a float clause with the wrong return type is refused" {
+    let src = #"
+fn main() ! IO, Rand {
+    with handler Rand {
+        fn float() -> Int { 0 }
+    } {
+        io.println("{rand.float()}")
+    }
+}
+"#
+    assert(errors_of(src).len() >= 1)
+}
+
+test "a clause for a name Rand does not have is refused" {
+    let src = #"
+fn main() ! IO, Rand {
+    with handler Rand {
+        fn shuffle(xs: List[Int]) -> List[Int] { xs }
+    } {
+        io.println("{rand.int(1..=6)}")
+    }
+}
+"#
+    let errs = errors_of(src)
+    assert(errs.len() >= 1)
+    assert(errs.get(0).unwrap().contains("shuffle"), errs.join("; "))
+}
+
+test "user code cannot perform the two-Int op" {
+    let src = #"
+fn main() ! IO, Rand {
+    io.println("{rand.int(0, 10)}")
+}
+"#
+    assert(errors_of(src).len() >= 1)
+}
+
+test "the rand wrappers type as the spec says" {
+    let src = #"
+fn roll() -> Int ! Rand { rand.int(1..=6) }
+fn unit() -> Float ! Rand { rand.float() }
+fn token() -> Bytes ! Rand { rand.bytes(32) }
+fn main() ! IO, Rand {
+    io.println("{roll()} {unit()} {token().len()}")
+}
+"#
+    assert_eq(errors_of(src).len(), 0)
+}
+
+test "a rand call outside a Rand row is an effect error" {
+    let src = #"
+fn roll() -> Int { rand.int(1..=6) }
+fn main() ! IO {
+    io.println("{roll()}")
+}
+"#
+    assert(errors_of(src).len() >= 1)
+}

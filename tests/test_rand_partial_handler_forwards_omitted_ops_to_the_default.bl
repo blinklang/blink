@@ -1,0 +1,93 @@
+// A Rand handler answers the ops it writes; an op it leaves out, and an op it forwards with
+// `default.op(...)`, goes to the enclosing handler (sections/04_effects.md §4.4.7, §4.7.1).
+// Each wrapper performs exactly one op call.
+
+import compile_test_helpers
+import compile_test_helpers.{compile_and_run}
+
+test "a handler that writes only int leaves float and bytes to the default" {
+    with handler Rand {
+        fn int(lo: Int, _hi: Int) -> Int { lo }
+    } {
+        assert_eq(rand.int(4..9), 4)
+        let x = rand.float()
+        assert(x >= 0.0 && x < 1.0)
+        assert_eq(rand.bytes(16).len(), 16)
+    }
+}
+
+test "a handler forwards with default and the wrapper still checks the answer" {
+    with handler Rand {
+        fn int(lo: Int, hi: Int) -> Int { default.int(lo, hi) }
+        fn float() -> Float { default.float() }
+        fn bytes(n: Int) -> Bytes { default.bytes(n) }
+    } {
+        for _ in 0..200 {
+            let v = rand.int(10..=12)
+            assert(v >= 10 && v <= 12)
+        }
+        assert_eq(rand.bytes(5).len(), 5)
+    }
+}
+
+test "an inner handler shadows an outer one" {
+    with handler Rand {
+        fn int(lo: Int, _hi: Int) -> Int { lo }
+    } {
+        with handler Rand {
+            fn int(_lo: Int, hi: Int) -> Int { hi }
+        } {
+            assert_eq(rand.int(0..=9), 9)
+        }
+        assert_eq(rand.int(0..=9), 0)
+    }
+}
+
+test "each wrapper makes exactly one op call" {
+    let src = #"
+fn main() ! IO, Rand {
+    with handler Rand {
+        fn int(lo: Int, _hi: Int) -> Int {
+            io.println("int")
+            lo
+        }
+        fn float() -> Float {
+            io.println("float")
+            0.5
+        }
+        fn bytes(n: Int) -> Bytes {
+            io.println("bytes")
+            Bytes.zeroed(n)
+        }
+    } {
+        let a = rand.int(1..=6)
+        let b = rand.float()
+        let c = rand.bytes(3)
+        io.println("{a} {b} {c.len()}")
+    }
+}
+"#
+    let r = compile_and_run(src, "_rand_one_op_call_per_wrapper")
+    assert(r.exit_code == 0, "compile or run failed: {r.out}{r.err_out}")
+    assert_eq(r.out, "int\nfloat\nbytes\n1 0.5 3\n")
+}
+
+test "an empty range makes no op call" {
+    let src = #"
+fn main() ! IO, Rand {
+    with handler Rand {
+        fn int(lo: Int, _hi: Int) -> Int {
+            io.println("int")
+            lo
+        }
+    } {
+        io.println("start")
+        let _ = rand.int(5..5)
+    }
+}
+"#
+    let r = compile_and_run(src, "_rand_empty_range_no_op_call")
+    assert(r.exit_code != 0, "an empty range ran: {r.out}")
+    assert_eq(r.out, "start\n")
+    assert(r.err_out.contains("rand.int: empty range 5..5"), r.err_out)
+}

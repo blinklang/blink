@@ -1,0 +1,82 @@
+// The Rand effect (sections/04_effects.md §4.4.7): the default bodies of its three operations
+// and the wrappers that `rand.int`, `rand.float` and `rand.bytes` call.
+//
+// The default bodies are the slots the Rand vtable starts with. They are private: a user call
+// of one would skip every Handler[Rand] (§4.7.1). The wrappers are private too: the compiler
+// reaches them from the `rand` handle, which user code cannot spell as a module. Inside this
+// module, `rand.int(lo, hi)` is the raw operation, performed through the handler in force.
+//
+// Each wrapper makes exactly one operation call and checks the answer in every build mode,
+// so code that uses a result, such as an index into a list, can trust it.
+
+// The runtime's cryptographically secure generator (bootstrap/runtime_core.h): seeded from OS
+// entropy, one stream per thread, reseeded in a forked child.
+@ffi("blink_rand_int")
+@trusted(audit: "Draws a uniform Int in [lo, hi] from the thread's ChaCha20 stream with no modulo bias. Panics when lo is above hi. Keeps no pointer to Blink memory.")
+fn c_rand_int(lo: Int, hi: Int) -> Int ! Rand {}
+
+@ffi("blink_rand_float")
+@trusted(audit: "Draws a uniform Float in [0.0, 1.0) with 53 random bits from the thread's ChaCha20 stream. Keeps no pointer to Blink memory.")
+fn c_rand_float() -> Float ! Rand {}
+
+@ffi("blink_rand_bytes")
+@trusted(audit: "Fills a fresh GC Bytes of length n from the thread's ChaCha20 stream. Panics when n is negative. Keeps no pointer to Blink memory.")
+fn c_rand_bytes(n: Int) -> Bytes ! Rand {}
+
+// The default int(lo, hi): a uniform Int in the closed interval [lo, hi].
+fn rand_do_int(lo: Int, hi: Int) -> Int ! Rand {
+    c_rand_int(lo, hi)
+}
+
+// The default float(): a uniform Float in the half-open interval [0.0, 1.0).
+fn rand_do_float() -> Float ! Rand {
+    c_rand_float()
+}
+
+// The default bytes(n): n uniform bytes.
+fn rand_do_bytes(n: Int) -> Bytes ! Rand {
+    c_rand_bytes(n)
+}
+
+// `rand.int(r)`: a uniform Int in the range r. `a..b` asks for int(a, b - 1) and `a..=b`
+// for int(a, b). An empty range panics before the operation is called. The emptiness test
+// for `a..b` comes before `b - 1`, so an end of the lowest Int cannot wrap.
+fn rand_int(r: Range[Int]) -> Int ! Rand {
+    let (lo, end, inclusive) = range_bounds(r)
+    let hi = if inclusive {
+        if lo > end { panic("rand.int: empty range {lo}..={end}") }
+        end
+    } else {
+        if lo >= end { panic("rand.int: empty range {lo}..{end}") }
+        end - 1
+    }
+    let x = rand.int(lo, hi)
+    if x < lo || x > hi { panic("Rand handler contract violated: int({lo}, {hi}) returned {x}") }
+    x
+}
+
+// `rand.float()`: a uniform Float in [0.0, 1.0).
+//
+// For a uniform Float in [lo, hi), `lo + rand.float() * (hi - lo)` can round up to hi. Draw
+// again while the result equals hi:
+//
+//     fn uniform(lo: Float, hi: Float) -> Float ! Rand {
+//         let mut x = lo + rand.float() * (hi - lo)
+//         while x == hi { x = lo + rand.float() * (hi - lo) }
+//         x
+//     }
+fn rand_float() -> Float ! Rand {
+    let x = rand.float()
+    // A NaN orders above every number, so `x < 1.0` refuses it.
+    if !(x >= 0.0 && x < 1.0) { panic("Rand handler contract violated: float() returned {x}") }
+    x
+}
+
+// `rand.bytes(n)`: n uniform bytes. A negative n panics before the operation is called.
+fn rand_bytes(n: Int) -> Bytes ! Rand {
+    if n < 0 { panic("rand.bytes: negative count {n}") }
+    let b = rand.bytes(n)
+    let got = b.len()
+    if got != n { panic("Rand handler contract violated: bytes({n}) returned {got} bytes") }
+    b
+}
