@@ -1,0 +1,115 @@
+// import_edit.bl — the edit that lets a file call a name from a module by its bare name
+//
+// A fix that rewrites `rand.shuffle(deck)` to `shuffle(deck)` must also import `shuffle`, or
+// the fixed file does not compile. The edit works on the text of one file, so a fix and an
+// editor completion can share it.
+
+// Replace line:col..end_line:end_col with `text`. Lines and columns are 1-based, columns count
+// bytes, and the end is exclusive, as in a diagnostic's fix span.
+@derive(Eq, Debug)
+pub type ImportEdit {
+    line: Int
+    col: Int
+    end_line: Int
+    end_col: Int
+    text: Str
+}
+
+pub type ImportNeed {
+    // The file already imports the name by its bare spelling.
+    Present
+    Add(ImportEdit)
+    // The file imports the name under another spelling (`as`), so no edit gives the bare name
+    // without a second binding of the same item.
+    Blocked
+}
+
+// An import statement of the file: lines first..last (0-based), and for an import of
+// `module.{...}` the text between the braces.
+type ImportDecl {
+    first: Int
+    last: Int
+    of_module: Bool
+    items: Str
+}
+
+fn is_import_line(line: Str) -> Bool {
+    line.starts_with("import ") || line.starts_with("pub import ")
+}
+
+// The import statements of `lines`. An import starts at the start of a line, and a brace list
+// may run over more than one line.
+fn import_stmts(lines: List[Str], module: Str) -> List[ImportDecl] {
+    let head = "import {module}.\{"
+    let mut out: List[ImportDecl] = []
+    let mut i = 0
+    while i < lines.len() {
+        let line = lines.get(i).unwrap()
+        if !is_import_line(line) {
+            i = i + 1
+            continue
+        }
+        let first = i
+        let mut text = line
+        if line.byte_index_of("\{", 0) != None {
+            while text.byte_index_of("}", 0) == None && i + 1 < lines.len() {
+                i = i + 1
+                text = text.concat("\n").concat(lines.get(i).unwrap())
+            }
+        }
+        let bare = if text.starts_with("pub ") { text.byte_slice(4, text.byte_len()) } else { text }
+        let of_module = bare.starts_with(head)
+        let mut items = ""
+        if of_module {
+            let open = head.byte_len()
+            let close = bare.byte_index_of("}", open) ?? bare.byte_len()
+            items = bare.byte_slice(open, close)
+        }
+        out.push(ImportDecl { first: first, last: i, of_module: of_module, items: items })
+        i = i + 1
+    }
+    out
+}
+
+// How `lines` comes to import `name` from `module` by its bare name. A one-line
+// `import module.{...}` gets the name added to its list. Otherwise a new import line goes after
+// the last import, or, in a file with none, before the first line that is not a plain comment
+// or blank, so that a doc comment stays with the item it documents.
+pub fn import_need(lines: List[Str], module: Str, name: Str) -> ImportNeed {
+    let stmts = import_stmts(lines, module)
+    let mut merge = -1
+    for s in stmts {
+        if !s.of_module { continue }
+        for raw in s.items.split(",") {
+            let item = raw.trim()
+            if item == name { return ImportNeed.Present }
+            if item.starts_with("{name} ") { return ImportNeed.Blocked }
+        }
+        if merge == -1 && s.first == s.last { merge = s.first }
+    }
+    if merge != -1 {
+        let line = lines.get(merge).unwrap()
+        let open = line.byte_index_of("\{", 0).unwrap()
+        let close = line.byte_index_of("}", open).unwrap()
+        let before = line.byte_slice(open + 1, close).trim_right()
+        let at = open + 1 + before.byte_len()
+        let text = if before.trim() == "" { name } else if before.ends_with(",") { " {name}" } else { ", {name}" }
+        return ImportNeed.Add(ImportEdit { line: merge + 1, col: at + 1, end_line: merge + 1, end_col: at + 1, text: text })
+    }
+    let new_line = "import {module}.\{{name}}"
+    if stmts.len() > 0 {
+        let last = stmts.get(stmts.len() - 1).unwrap().last
+        let end = lines.get(last).unwrap().byte_len() + 1
+        return ImportNeed.Add(ImportEdit { line: last + 1, col: end, end_line: last + 1, end_col: end, text: "\n{new_line}" })
+    }
+    let mut i = 0
+    while i < lines.len() {
+        let t = lines.get(i).unwrap().trim()
+        let plain_comment = t.starts_with("//") && !t.starts_with("///")
+        if t != "" && !plain_comment {
+            return ImportNeed.Add(ImportEdit { line: i + 1, col: 1, end_line: i + 1, end_col: 1, text: "{new_line}\n\n" })
+        }
+        i = i + 1
+    }
+    ImportNeed.Add(ImportEdit { line: 1, col: 1, end_line: 1, end_col: 1, text: "{new_line}\n" })
+}

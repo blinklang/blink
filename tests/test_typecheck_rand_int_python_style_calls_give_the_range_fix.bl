@@ -1,0 +1,67 @@
+// `rand.int` takes one Range. The Python-style calls `rand.int(0, 10)` and `rand.int(10)` do
+// not compile, and each diagnostic gives the fix as a range: `rand.int(0..10)`. The two-argument
+// form also notes that `0..=10` includes 10, as Python's randint does
+// (sections/04_effects.md §4.4.7).
+//
+// The fix is offered only where both ends are an Int literal or a name and the start is a
+// literal that is not negative: those are the ranges that parse as written.
+import lower_test_helpers.{probe_but}
+import diagnostics.{diag_entries}
+
+fn rows(stem: Str, call: Str) -> List[Str] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    let src = "fn roll(n: Int) -> Int ! Rand \{\n    {call}\n}\n\nfn main() \{}\n"
+    let program = probe_but(stem, src, "TypeError")
+    assert(program >= 0)
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity != "error" { continue }
+        let mut row = "{d.name} {d.line}:{d.col}: {d.message} | notes: {d.notes.join(\"; \")}"
+        if d.fix_action != "" {
+            row = row.concat(" | fix: {d.fix_action} `{d.fix_text}` at {d.fix_line}:{d.fix_col}-{d.fix_end_line}:{d.fix_end_col}")
+        }
+        out.push(row)
+    }
+    out
+}
+
+let TAKES_TWO = "TypeError 2:5: `rand.int` takes 1 argument (a Range), found 2"
+
+test "rand.int(0, 10) takes one Range, with the half-open fix and a note on the closed range" {
+    assert_eq(rows("ri_two_literals", "rand.int(0, 10)"), [
+        "{TAKES_TWO} | notes: use `0..=10` to include 10 (Python's randint includes the upper bound) | fix: replace with `rand.int(0..10)` at 2:5-2:20",
+    ])
+}
+
+test "an end that is a name gets the fix too" {
+    assert_eq(rows("ri_two_name_end", "rand.int(1, n)"), [
+        "{TAKES_TWO} | notes: use `1..=n` to include n (Python's randint includes the upper bound) | fix: replace with `rand.int(1..n)` at 2:5-2:19",
+    ])
+}
+
+test "a start that is not a literal at or above zero gets the error alone" {
+    assert_eq(rows("ri_two_name_start", "rand.int(n, 10)"), ["{TAKES_TWO} | notes: "])
+    assert_eq(rows("ri_two_negative_start", "rand.int(-5, 5)"), ["{TAKES_TWO} | notes: "])
+    assert_eq(rows("ri_two_expr_end", "rand.int(0, n + 1)"), ["{TAKES_TWO} | notes: "])
+}
+
+test "a count other than one or two gets the error alone" {
+    assert_eq(rows("ri_three", "rand.int(0, 1, 2)"), ["TypeError 2:5: `rand.int` takes 1 argument (a Range), found 3 | notes: "])
+    assert_eq(rows("ri_none", "rand.int()"), ["TypeError 2:5: `rand.int` takes 1 argument (a Range), found 0 | notes: "])
+}
+
+test "rand.int(10) is mismatched types, with the range from zero as the fix" {
+    assert_eq(rows("ri_one_literal", "rand.int(10)"), [
+        "TypeError 2:14: mismatched types | notes: expected `Range[Int]`, found `Int` | fix: replace with `rand.int(0..10)` at 2:5-2:17",
+    ])
+    assert_eq(rows("ri_one_name", "rand.int(n)"), [
+        "TypeError 2:14: mismatched types | notes: expected `Range[Int]`, found `Int` | fix: replace with `rand.int(0..n)` at 2:5-2:16",
+    ])
+}
+
+test "an Int expression that is not a literal or a name gets the note but no fix" {
+    assert_eq(rows("ri_one_expr", "rand.int(n * 2)"), ["TypeError 2:16: mismatched types | notes: expected `Range[Int]`, found `Int`"])
+}
+
+test "an argument of another type keeps the argument error" {
+    assert_eq(rows("ri_one_str", "rand.int(\"x\")"), ["TypeError 2:14: argument 1 of `rand.int` expects Range[Int], got Str | notes: "])
+}

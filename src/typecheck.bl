@@ -3,6 +3,7 @@ import std.str.{str_to_lower}
 import pkg.manifest.{manifest_name, manifest_header_is_declared}
 import unparse.{type_ann_text, unparse_expr, unparse_binop_with_lhs}
 import formatter.{effect_op_sig_text}
+import import_edit.{ImportEdit, ImportNeed, import_need}
 import parser.{
     effect_derived_ops, node_load_rank, parser_load_order_moved, parser_live_ranges,
     ann_str_val, positional_str_arg, positional_str_arg_count, impl_provided_by_closeable, closeable_impl_of, sublist_remove_members, get_annotation, get_str_named_arg, has_annotation, is_literal_string_part,
@@ -22,7 +23,7 @@ import parser.{
 }
 import diagnostics.{
     Diag, diag_clear_allows, diag_error_at, diag_error_at_notes, diag_error_span_at_notes, diag_error_no_loc,
-    diag_set_last_fix, diag_set_last_fix_at, UNDECLARED_EFFECT,
+    diag_set_last_fix, diag_set_last_fix_at, diag_add_last_fix_edit, diag_source_lines, diag_entries, UNDECLARED_EFFECT,
     diag_push_allows, diag_enter_allows, diag_exit_allows, NON_CONST_EXPR,
     diag_warn_at, diag_warn_at_notes, diag_warn_span_at_notes, PARTIAL_HANDLER, diag_truncate, diag_entry_count, diag_any_errors_since, diag_ice_at, diag_ice, PRELUDE_TYPE_NOT_LOADED, diag_count, diag_emit_in_file, diag_file_for_node,
     diag_is_audit_gated, diag_audit_gated_help, AUDIT_GATED_SUPPRESSION, diag_normalize_path, diag_source_line, diag_errors_in_lines,
@@ -8711,6 +8712,11 @@ fn tc_arg_mismatch(callee: Str, pos: Int, node: Int, want: Int, got: Int) ! Type
     let (want_s, got_s) = tc_type_pair_strs(want, got)
     let msg = "argument {pos} of `{callee}` expects {want_s}, got {got_s}{tc_fn_mismatch_suffix(want, got)}"
     if tc_read_line_used_as_str(node, want) { return tc_value_mismatch_at(msg, node, node, want) }
+    // `rand.int(10)`, as Python writes it (§4.4.7). The call adds the range fix.
+    if callee == "rand.int" && resolve_alias_tid(tc_resolve(got)) == TYPE_INT && resolve_alias_tid(tc_resolve(want)) == make_range_type(TYPE_INT) {
+        tc_errors.push("mismatched types")
+        return diag_error_at_notes("TypeError", TYPE_ERROR, "mismatched types", node, "", ["expected `{want_s}`, found `{got_s}`"])
+    }
     tc_type_error_naming(msg, node, "", [want, got])
 }
 
@@ -15732,8 +15738,120 @@ fn tc_infer_builtin_surface_call(node: Int, root: Str, handle: Str, method: Str)
     if sig == -1 { return -1 }
     let fs = fnsig_pool.get(sig).unwrap()
     if !raw { nr_note_call_decl(node, fs.decl) }
+    if !raw && root == "Rand" && method == "int" { return tc_infer_rand_int_call(node, sig, fs.ret) }
     let _ = check_arg_shapes("{handle}.{method}", sig, node_args(node), 0, node)
     fs.ret
+}
+
+// `rand.int` takes one Range. The Python-style calls `rand.int(0, 10)` and `rand.int(10)` get
+// the range as their fix (§4.4.7).
+fn tc_infer_rand_int_call(node: Int, sig: Int, ret: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    let args = node_args(node)
+    let n = if args == -1 { 0 } else { sublist_length(args) }
+    let before = diag_entry_count()
+    if n == 1 {
+        // The mismatch itself is tc_arg_mismatch's; only the call knows the span to replace.
+        let tids = check_arg_shapes("rand.int", sig, args, 0, node)
+        let end = tc_rand_range_end_text(sublist_get(args, 0), tids.get(0) ?? -1)
+        if end != "" && diag_entry_count() == before + 1 && diag_entries.get(before).unwrap().message == "mismatched types" {
+            tc_index_fix(node, before, "replace with", "rand.int(0..{end})")
+        }
+        return ret
+    }
+    let mut tids: List[Int] = []
+    let mut i = 0
+    while i < n {
+        tids.push(tc_infer_unhinted(sublist_get(args, i)))
+        i = i + 1
+    }
+    let msg = "`rand.int` takes 1 argument (a Range), found {n}"
+    if n == 2 {
+        let lo = tc_rand_range_start_text(sublist_get(args, 0), tids.get(0).unwrap())
+        let hi = tc_rand_range_end_text(sublist_get(args, 1), tids.get(1).unwrap())
+        if lo != "" && hi != "" {
+            tc_errors.push(msg)
+            diag_error_at_notes("TypeError", TYPE_ERROR, msg, node, "", ["use `{lo}..={hi}` to include {hi} (Python's randint includes the upper bound)"])
+            tc_index_fix(node, before, "replace with", "rand.int({lo}..{hi})")
+            return ret
+        }
+    }
+    tc_error_at(msg, node)
+    ret
+}
+
+// The text of an Int argument that a range fix can write as its end: a literal or a name, which
+// no operator next to `..` can split. "" for any other argument.
+fn tc_rand_range_end_text(arg: Int, tid: Int) -> Str ! Diag.Report {
+    let k = node_kind(arg)
+    if k != NodeKind.IntLit && k != NodeKind.Ident { return "" }
+    if tid < 0 || resolve_alias_tid(tc_resolve(tid)) != TYPE_INT { return "" }
+    tc_index_text(arg)
+}
+
+// The same for a start, which must be a literal that is not negative: the only start a range
+// takes as written.
+fn tc_rand_range_start_text(arg: Int, tid: Int) -> Str ! Diag.Report {
+    if node_kind(arg) != NodeKind.IntLit { return "" }
+    tc_rand_range_end_text(arg, tid)
+}
+
+// `{handle}.{name}(args)` where `name` is no operation of `root`. A std helper of that name gets
+// a help that names its module, and a fix that calls it by its bare name and imports it.
+fn tc_report_not_a_handle_op(node: Int, root: Str, name: Str) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    let args = node_args(node)
+    let mut i = 0
+    while args != -1 && i < sublist_length(args) {
+        let _ = tc_infer_unhinted(sublist_get(args, i))
+        i = i + 1
+    }
+    let mut ops: List[Str] = []
+    for row in builtin_op_rows(root) { ops.push("`{row.op}`") }
+    let module = builtin_op_helper_module(root, name)
+    let help = if module == "" { "" } else { "`{name}` is a function in `{module}`" }
+    tc_unresolved_method_hard.insert(node, 1)
+    diag_error_at_notes("UnresolvedMethod", UNRESOLVED_METHOD, "`{name}` is not an operation of effect `{root}`", node, help, ["`{root}` operations are {ops.join(\", \")}"])
+    if module != "" { tc_helper_call_fix(node, module, name) }
+    tc_error_recovery_tid()
+}
+
+// The fix for a helper called through its handle: the call without the handle, plus the import
+// of the helper where the file lacks it. No fix where the bare name would mean something else
+// here, or where the file imports the helper under another name.
+fn tc_helper_call_fix(node: Int, module: Str, name: Str) {
+    let top = nr_top_index(name)
+    if top >= 0 && nr_index_is_global(top) == 0 { return }
+    let decl = nr_resolve_bare_decl(name, tc_site_module(node))
+    if decl != -1 && node_module(decl) != module.replace(".", "_") { return }
+    let lines = diag_source_lines(diag_file_for_node(node))
+    let line = node_line(node)
+    let col = node_col(node)
+    let src = lines.get(line - 1) ?? ""
+    let callee = "{node_name(node_obj(node))}.{name}"
+    let callee_end = col - 1 + callee.byte_len()
+    if col < 1 || callee_end > src.byte_len() || src.byte_slice(col - 1, callee_end) != callee { return }
+    let mut import_text = ""
+    let mut import_at = ImportEdit { line: 0, col: 0, end_line: 0, end_col: 0, text: "" }
+    if decl == -1 {
+        match import_need(lines, module, name) {
+            ImportNeed.Add(e) => {
+                import_text = "add `import {module}.\{{name}}` and "
+                import_at = e
+            }
+            ImportNeed.Present => {}
+            ImportNeed.Blocked => return
+        }
+    }
+    let action = "{import_text}call"
+    let end_col = node_end_col(node)
+    if node_end_line(node) == line && end_col > callee_end && end_col - 1 <= src.byte_len() {
+        let bare_start = col - 1 + callee.byte_len() - name.byte_len()
+        diag_set_last_fix_at(action, src.byte_slice(bare_start, end_col - 1), line, col, line, end_col)
+    } else {
+        diag_set_last_fix_at(action, name, line, col, line, callee_end + 1)
+    }
+    if import_at.line > 0 {
+        diag_add_last_fix_edit(import_at.line, import_at.col, import_at.end_line, import_at.end_col, import_at.text)
+    }
 }
 
 pub fn tc_call_builtin_default(call: Int) -> Int {
@@ -15856,6 +15974,13 @@ pub fn builtin_op_exists(root: Str, op: Str) -> Bool {
         if row.op == op { return true }
     }
     false
+}
+
+// The std module that has `name` as a free function for the values of `root`, or "". A program
+// that calls one through the handle, as in `rand.shuffle(xs)`, is told where it is (§4.4.7).
+pub fn builtin_op_helper_module(root: Str, name: Str) -> Str {
+    if root == "Rand" && (name == "shuffle" || name == "choice") { return "std.random" }
+    ""
 }
 
 // The sub-effect that performs an operation of `root`: "" for an operation of a leaf root
@@ -27567,6 +27692,11 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                     let _ = check_arg_shapes("{obj_name}.{method}", ue_sig, node_args(node), 0, node)
                     return fnsig_pool.get(ue_sig).unwrap().ret
                 }
+            }
+            // `rand.<name>` always means the handle, so a name that is no operation of `Rand` is
+            // E0505 here, before the unclaimed-call report can read `rand` as a module (§4.4.7).
+            if nr_is_defined(obj_name) == 0 && tc_ns_call_reads_module(obj_name) == 0 && builtin_op_root_of_handle(obj_name) == "Rand" && !builtin_op_exists("Rand", method) {
+                return tc_report_not_a_handle_op(node, "Rand", method)
             }
             // Intrinsic time.* methods type even without `import std.time` (they emit as
             // codegen intrinsics like io.println). Typing read() as Instant lets the

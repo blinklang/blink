@@ -1,0 +1,108 @@
+// `rand.<name>` always means the `rand` handle, so a call of a std.random helper through it,
+// such as `rand.shuffle(deck)`, is E0505. The diagnostic lists the operations of `Rand`, names
+// the module that has the helper, and gives a fix of two edits: the call without `rand.`, and
+// the import it needs. A file where that import would clash with its own binding of the name
+// gets no fix (sections/04_effects.md §4.4.7).
+import lower_test_helpers.{probe_but}
+import diagnostics.{diag_entries}
+
+let OPS_NOTE = "`Rand` operations are `int`, `float`, `bytes`"
+
+// One row per error, and per UnknownMethod warning, which a resolved E0505 must not repeat.
+fn rows(stem: Str, src: Str) -> List[Str] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck {
+    let program = probe_but(stem, src, "UnresolvedMethod")
+    assert(program >= 0)
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity != "error" && d.name != "UnknownMethod" { continue }
+        let mut row = "{d.name} {d.code} {d.line}:{d.col}: {d.message} | help: {d.help} | notes: {d.notes.join(\"; \")}"
+        if d.fix_action != "" {
+            row = row.concat(" | fix: {d.fix_action} `{d.fix_text}` at {d.fix_line}:{d.fix_col}-{d.fix_end_line}:{d.fix_end_col}")
+        }
+        for m in d.fix_more {
+            row = row.concat(" | and: `{m.text}` at {m.line}:{m.col}-{m.end_line}:{m.end_col}")
+        }
+        out.push(row)
+    }
+    out
+}
+
+fn head(name: Str) -> Str {
+    "UnresolvedMethod E0505 2:5: `{name}` is not an operation of effect `Rand` | help: `{name}` is a function in `std.random` | notes: {OPS_NOTE}"
+}
+
+test "rand.shuffle is E0505 with a fix that drops rand. and adds the import above the code" {
+    let src = #"fn deal(deck: List[Int]) -> List[Int] ! Rand {
+    rand.shuffle(deck)
+}
+
+fn main() {}
+"#
+    assert_eq(rows("rs_shuffle_no_imports", src), [
+        head("shuffle").concat(" | fix: add `import std.random.\{shuffle}` and call `shuffle(deck)` at 2:5-2:23 | and: `import std.random.\{shuffle}\n\n` at 1:1-1:1"),
+    ])
+}
+
+test "the import goes after the last import of the file" {
+    let src = #"fn deal(deck: List[Int]) -> List[Int] ! Rand {
+    let top = rand.choice(deck)
+    deck
+}
+"#
+    let with_import = "import std.fs\n\n".concat(src).concat("\nfn main() \{}\n")
+    let got = rows("rs_choice_after_import", with_import)
+    assert_eq(got.len(), 1)
+    assert(got.get(0).unwrap().contains("| fix: add `import std.random.\{choice}` and call `choice(deck)` at 4:15-4:32 | and: `\nimport std.random.\{choice}` at 1:14-1:14"))
+}
+
+test "a call that runs over lines gets the callee rewritten and keeps its arguments as written" {
+    let src = #"fn deal(deck: List[Int]) -> List[Int] ! Rand {
+    rand.shuffle(
+        deck,
+    )
+}
+
+fn main() {}
+"#
+    assert_eq(rows("rs_shuffle_multiline", src), [
+        head("shuffle").concat(" | fix: add `import std.random.\{shuffle}` and call `shuffle` at 2:5-2:17 | and: `import std.random.\{shuffle}\n\n` at 1:1-1:1"),
+    ])
+}
+
+test "a name that is no helper lists the operations and gets no help or fix" {
+    let src = #"fn deal(deck: List[Int]) -> List[Int] ! Rand {
+    rand.mix(deck)
+}
+
+fn main() {}
+"#
+    assert_eq(rows("rs_not_a_helper", src), [
+        "UnresolvedMethod E0505 2:5: `mix` is not an operation of effect `Rand` | help:  | notes: {OPS_NOTE}",
+    ])
+}
+
+test "a file with its own function of the helper's name gets no fix, since the import would clash" {
+    let src = #"fn deal(deck: List[Int]) -> List[Int] ! Rand {
+    rand.shuffle(deck)
+}
+
+fn shuffle(xs: List[Int]) -> List[Int] {
+    xs
+}
+
+fn main() {}
+"#
+    assert_eq(rows("rs_own_shuffle_fn", src), [head("shuffle")])
+}
+
+test "a local of the helper's name gets no fix, since the bare call would read the local" {
+    let src = #"fn deal(deck: List[Int]) -> List[Int] ! Rand {
+    let shuffle = 3
+    rand.shuffle(deck)
+}
+
+fn main() {}
+"#
+    let got = rows("rs_local_shuffle", src)
+    assert_eq(got, ["UnresolvedMethod E0505 3:5: `shuffle` is not an operation of effect `Rand` | help: `shuffle` is a function in `std.random` | notes: {OPS_NOTE}"])
+}

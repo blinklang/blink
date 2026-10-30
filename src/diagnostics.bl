@@ -464,6 +464,15 @@ pub const VARIANT_FIELD_DEFAULT_HELP = "remove `=` and the value; a variant lite
 
 // ── Diagnostic struct ────────────────────────────────────────────────
 
+// One more edit of a fix, in the diagnostic's file. A fix applies all its edits or none.
+pub type DiagFixEdit {
+    line: Int
+    col: Int
+    end_line: Int
+    end_col: Int
+    text: Str
+}
+
 pub type DiagEntry {
     severity: Str
     name: Str
@@ -483,6 +492,9 @@ pub type DiagEntry {
     fix_col: Int
     fix_end_line: Int
     fix_end_col: Int
+    // The edits of the fix after the one above, such as the import that a rewritten call
+    // needs. Only a fix with its own span has them.
+    fix_more: List[DiagFixEdit] = []
     notes: List[Str]
     // A repair a person applies by hand, such as fields to fill in: it inserts text at one
     // point. The language server offers it under a kind that "fix all" never applies, and
@@ -748,10 +760,30 @@ pub fn diag_set_last_fix_at(action: Str, text: Str, line: Int, col: Int, end_lin
         let d = diag_entries.get(idx).unwrap()
         diag_entries.set(idx, DiagEntry {
             fix_action: action, fix_text: text,
-            fix_line: line, fix_col: col, fix_end_line: end_line, fix_end_col: end_col,
+            fix_line: line, fix_col: col, fix_end_line: end_line, fix_end_col: end_col, fix_more: [],
             ..d
         })
     }
+}
+
+// Adds an edit to the fix of the last diagnostic, which must have a span of its own.
+pub fn diag_add_last_fix_edit(line: Int, col: Int, end_line: Int, end_col: Int, text: Str) {
+    let idx = diag_entries.len() - 1
+    if idx < 0 { return }
+    let d = diag_entries.get(idx).unwrap()
+    if d.fix_action == "" || d.fix_line == 0 { return }
+    let mut more = d.fix_more
+    more.push(DiagFixEdit { line: line, col: col, end_line: end_line, end_col: end_col, text: text })
+    diag_entries.set(idx, DiagEntry { fix_more: more, ..d })
+}
+
+// Every edit of the fix of `d`, the one with the fix's own span first; [] for a fix with no
+// span of its own.
+pub fn diag_fix_edits(d: DiagEntry) -> List[DiagFixEdit] {
+    if d.fix_action == "" || d.fix_line == 0 { return [] }
+    let mut out = [DiagFixEdit { line: d.fix_line, col: d.fix_col, end_line: d.fix_end_line, end_col: d.fix_end_col, text: d.fix_text }]
+    for m in d.fix_more { out.push(m) }
+    out
 }
 
 pub fn diag_set_last_assist_at(action: Str, text: Str, line: Int, col: Int) {
@@ -794,7 +826,7 @@ pub fn diag_drop_fix_over_others(idx: Int, action: Str) {
         let after_start = e.line > d.fix_line || (e.line == d.fix_line && e.col >= d.fix_col)
         let before_end = e.line < d.fix_end_line || (e.line == d.fix_end_line && e.col < d.fix_end_col)
         if i != idx && counts && e.file == d.file && after_start && before_end {
-            diag_entries.set(idx, DiagEntry { fix_action: "", fix_text: "", fix_line: 0, fix_col: 0, fix_end_line: 0, fix_end_col: 0, ..d })
+            diag_entries.set(idx, DiagEntry { fix_action: "", fix_text: "", fix_line: 0, fix_col: 0, fix_end_line: 0, fix_end_col: 0, fix_more: [], ..d })
             return
         }
         i = i + 1
@@ -1322,7 +1354,13 @@ fn diag_json_line(idx: Int) -> Str {
         if d.fix_line > 0 {
             fix_span = ",\"span\":\{\"file\":\"{file}\",\"line\":{d.fix_line},\"col\":{d.fix_col},\"end_line\":{d.fix_end_line},\"end_col\":{d.fix_end_col}}"
         }
-        json = json.concat(",\"fix\":\{\"action\":\"{fix_act}\",\"text\":\"{fix_txt}\"{fix_span}}")
+        let mut more = ""
+        for m in d.fix_more {
+            let sep = if more == "" { "" } else { "," }
+            more = more.concat("{sep}\{\"span\":\{\"file\":\"{file}\",\"line\":{m.line},\"col\":{m.col},\"end_line\":{m.end_line},\"end_col\":{m.end_col}},\"text\":\"{json_escape(m.text)}\"}")
+        }
+        if more != "" { more = ",\"more_edits\":[{more}]" }
+        json = json.concat(",\"fix\":\{\"action\":\"{fix_act}\",\"text\":\"{fix_txt}\"{fix_span}{more}}")
     }
     // An assist is a repair a person must finish or choose, so it never shares the `fix` key
     // that `blink fix` applies.
@@ -1337,6 +1375,13 @@ fn diag_json_line(idx: Int) -> Str {
 // user's own code.
 pub fn diag_source_line(file: Str, line: Int) -> Str {
     source_get_line(file, line)
+}
+
+// Every line of a source file as written, or [] when it cannot be read.
+pub fn diag_source_lines(file: Str) -> List[Str] {
+    // Reading any line loads the file into the cache.
+    let _ = source_get_line(file, 1)
+    source_lines_cache.get(file) ?? []
 }
 
 fn source_get_line(file: Str, line: Int) -> Str {

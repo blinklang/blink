@@ -1,0 +1,68 @@
+// The fix for `rand.shuffle(deck)` has two edits: the call without `rand.`, and the import of
+// `shuffle` (sections/04_effects.md §4.4.7). `blink fix` applies both, the JSON output carries
+// both, and the LSP code action carries both in one change (§8.6).
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> ProcessResult {
+    process.run("sh", ["-c", cmd]).unwrap()
+}
+
+fn blink_in(dir: Str, args: Str) -> ProcessResult {
+    sh("B=$(pwd)/build/blink; cd {dir} && timeout 120 $B {args}")
+}
+
+fn deal_src() -> Str {
+    "fn deal(deck: List[Int]) -> List[Int] ! Rand \{\n    rand.shuffle(deck)\n}\n\nfn main() \{}\n"
+}
+
+test "blink fix rewrites the call and adds the import in one fix" {
+    let dir = sh("mktemp -d /tmp/blink_fix_helper.XXXXXX").out.trim()
+    write_file("{dir}/deal.bl", deal_src())
+    let r = blink_in(dir, "fix deal.bl")
+    let got = read_file("{dir}/deal.bl")
+    let want = "import std.random.\{shuffle}\n\nfn deal(deck: List[Int]) -> List[Int] ! Rand \{\n    shuffle(deck)\n}\n\nfn main() \{}\n"
+    if got != want { io.eprintln("got file:\n{got}\nstdout:\n{r.out}\nstderr:\n{r.err_out}") }
+    assert(got == want)
+    assert(r.out.contains("deal.bl:2:5: E0505 add `import std.random.\{shuffle}` and call"))
+    assert(r.out.contains("1 fix(es) applied"))
+    let _ = sh("rm -rf {dir}")
+}
+
+test "the JSON diagnostic carries the import as a second edit of the fix" {
+    let dir = sh("mktemp -d /tmp/blink_json_helper.XXXXXX").out.trim()
+    write_file("{dir}/deal.bl", deal_src())
+    let r = blink_in(dir, "check --json deal.bl")
+    let all = r.out.concat(r.err_out)
+    let want = #","more_edits":[{"span":{"file":"deal.bl","line":1,"col":1,"end_line":1,"end_col":1},"text":"import std.random.{shuffle}\n\n"}]"#
+    if !all.contains(want) { io.eprintln(all) }
+    assert(all.contains(want))
+    let _ = sh("rm -rf {dir}")
+}
+
+fn lsp_msg(body: Str) -> Str {
+    "Content-Length: {body.byte_len()}\r\n\r\n{body}"
+}
+
+test "the LSP code action carries both edits in one change" {
+    let dir = sh("mktemp -d /tmp/blink_lsp_helper.XXXXXX").out.trim()
+    write_file("{dir}/deal.bl", deal_src())
+    let uri = "file://{dir}/deal.bl"
+    let td = "\"textDocument\":\{\"uri\":\"{uri}\"}"
+    let input = [
+        lsp_msg(#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{}}}"#),
+        lsp_msg(#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#),
+        lsp_msg("\{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":\{{td}}}"),
+        lsp_msg("\{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"textDocument/codeAction\",\"params\":\{{td},\"range\":\{\"start\":\{\"line\":1,\"character\":4},\"end\":\{\"line\":1,\"character\":4}},\"context\":\{\"diagnostics\":[]}}}"),
+        lsp_msg(#"{"jsonrpc":"2.0","id":3,"method":"shutdown","params":null}"#),
+        lsp_msg(#"{"jsonrpc":"2.0","method":"exit","params":{}}"#),
+    ].join("")
+    write_file("{dir}/input.bin", input)
+    let r = sh("B=$(pwd)/build/blink; cd {dir} && timeout 60 $B lsp < input.bin")
+    let call_edit = #"{"range":{"start":{"line":1,"character":4},"end":{"line":1,"character":22}},"newText":"shuffle(deck)"}"#
+    let import_edit = #"{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":0}},"newText":"import std.random.{shuffle}\n\n"}"#
+    let want = "\"title\":\"add `import std.random.\{shuffle}` and call\",\"kind\":\"quickfix\",\"edit\":\{\"changes\":\{\"{uri}\":[{call_edit},{import_edit}]}}}"
+    if !r.out.contains(want) { io.eprintln("want: {want}\nstdout:\n{r.out}\nstderr:\n{r.err_out}") }
+    assert(r.out.contains(want))
+    let _ = sh("rm -rf {dir}")
+}

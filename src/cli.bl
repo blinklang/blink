@@ -81,7 +81,7 @@ import limit_values.{
     limit_report_key,
 }
 import diagnostics.{
-    Diag, DiagEntry, diag_entries, diag_prepend,
+    Diag, DiagEntry, diag_entries, diag_prepend, diag_fix_edits,
     diag_count, diag_warn_count, diag_ice_count, diag_flush, diag_mark_flushed, diag_reset, diag_entry_count,
     diag_source_file, diag_file_for_node, diag_error_no_loc, diag_format, diag_explain, diag_set_abort_status_line,
     embedded_inner_key, diag_entry_text, diag_normalize_path, diag_usage_error_text, json_escape,
@@ -5716,10 +5716,18 @@ fn cmd_fix(p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Repor
             match editable.get(d.file) {
                 Some(src_idx) => {
                     let text = loaded_inputs.source_texts.get(src_idx).unwrap()
-                    let start = fix_byte_offset(text, d.fix_line, d.fix_col)
-                    let end = fix_byte_offset(text, d.fix_end_line, d.fix_end_col)
-                    if start >= 0 && end >= start {
-                        edits.push(FixEdit { file: d.file, start: start, end: end, text: d.fix_text, diag: i })
+                    // A fix applies whole or not at all, so an edit that names no place in the
+                    // text drops every edit of the fix.
+                    let mut fix: List[FixEdit] = []
+                    let mut whole = true
+                    for m in diag_fix_edits(d) {
+                        let start = fix_byte_offset(text, m.line, m.col)
+                        let end = fix_byte_offset(text, m.end_line, m.end_col)
+                        if start < 0 || end < start { whole = false }
+                        fix.push(FixEdit { file: d.file, start: start, end: end, text: m.text, diag: i })
+                    }
+                    if whole {
+                        for e in fix { edits.push(e) }
                     }
                 }
                 None => {}
@@ -5774,7 +5782,11 @@ fn cmd_fix(p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Repor
         }
         let file_edits = plan.applied.filter(fn(e) { e.file == f })
         write_file(path, fix_apply(text, file_edits))
+        // A fix with more than one edit gets one line.
+        let mut listed: List[Int] = []
         for e in file_edits {
+            if listed.contains(e.diag) { continue }
+            listed.push(e.diag)
             let d = diag_entries.get(e.diag).unwrap()
             applied_lines.push("{d.file}:{d.fix_line}:{d.fix_col}: {d.code} {d.fix_action}")
         }
