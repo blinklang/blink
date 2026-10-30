@@ -537,11 +537,11 @@ check_repo_tmp test-var-prefixed tests/test_scratch_user.bl 'let p = "{dir}/.tmp
 check_repo_tmp script-mktemp scripts/some_gate.sh 'f=$(mktemp .tmp/gate-XXXXXX)' fail
 check_repo_tmp test-root-prefixed tests/test_scratch_user.bl 'let p = "{root}/.tmp/probe.bl"' fail
 check_repo_tmp test-suffix-name-not-counted tests/test_scratch_user.bl 'let p = "{dir}/plain.tmp/x"' pass
-check_repo_tmp test-private-tree tests/test_scratch_user.bl 'shell_exec("mkdir -p {tree}/.tmp")
+check_repo_tmp test-private-tree tests/test_scratch_user.bl 'process.run("mkdir", ["-p", "{tree}/.tmp"])
 write_file("{tree}/.tmp/x.o", "")' fail
 check_repo_tmp script-private-tree scripts/some_gate.sh 'mkdir -p "$work/.tmp/"' fail
 check_repo_tmp taskfile-scratch Taskfile.yml '      - mkdir -p .tmp/x' fail
-check_repo_tmp test-object-read tests/test_scratch_user.bl 'shell_exec("cp .tmp/*.o {dir}/")' fail
+check_repo_tmp test-object-read tests/test_scratch_user.bl 'process.run("sh", ["-c", "cp .tmp/*.o {dir}/"])' fail
 check_pool_write parser-column-field src/parser.bl 'fn scratch() { columns.child_slots = [] }'
 check_pool_write parser-column-whole src/parser.bl 'fn scratch() { columns = NodeColumns { kinds: [], child_at: [], child_slots: [] } }'
 

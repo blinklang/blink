@@ -1,0 +1,159 @@
+// The process free functions and `shell_exec` are removed free functions (sections/04_effects.md
+// *Removed free functions*): a call to one is the usual undefined-function error, E0504, with a
+// fix that names the handle operation and its effect. They must not reach the runtime, because a
+// runtime call skips any installed `Process` handler. The compiler looks in the table only when
+// name lookup fails, so a program's own fn with one of these names still compiles and is called.
+
+import typecheck.{check_types}
+import compiler.{compile_to_program}
+import diagnostics.{diag_entries, diag_reset, DiagEntry}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+import compile_test_helpers
+import std.fs
+import std.io
+
+fn probe(path: Str, src: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    init_embedded_stdlib()
+    write_file(path, src)
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+    program
+}
+
+fn probe_src() -> Str {
+    #"fn calls(pid: Int) ! Process, Env {
+    let _ = shell_exec("echo hi")  // E_SHELL_EXEC
+    let _ = process_run("sh", ["-c", "true"])  // E_PROCESS_RUN
+    let _ = process_run_with_stdin("cat", [], "in")  // E_PROCESS_RUN_WITH_STDIN
+    let _ = process_spawn("sleep", ["1"])  // E_PROCESS_SPAWN
+    let _ = process_pid_wait(pid)  // E_PROCESS_PID_WAIT
+    let _ = process_pid_kill(pid, 15)  // E_PROCESS_PID_KILL
+    let _ = process_pid_send_signal(pid, 15)  // E_PROCESS_PID_SEND_SIGNAL
+    let _ = process_exec("true", [])  // E_PROCESS_EXEC
+    exit(1)  // E_EXIT
+    process_install_signal_forwarding()  // E_SIGNAL_FORWARDING
+}
+
+fn main() {}
+"#
+}
+
+// The 1-based line of the one source line that holds `marker`.
+fn line_of(src: Str, marker: Str) -> Int {
+    let lines = src.split("\n")
+    let mut i = 0
+    while i < lines.len() {
+        if lines.get(i).unwrap().contains(marker) { return i + 1 }
+        i = i + 1
+    }
+    io.println("FAIL: probe has no line marked '{marker}'")
+    assert(false)
+    -1
+}
+
+fn all_errors() -> Str {
+    let mut out = ""
+    for d in diag_entries {
+        if d.severity == "error" { out = out.concat("{d.line}:{d.col}: {d.code} {d.message} | help: {d.help} | notes: {d.notes.join(" ; ")}\n") }
+    }
+    out
+}
+
+// The one error on the marked line: E0504 for `name`, at the callee in column `col`.
+fn removed_error(src: Str, marker: Str, name: Str, col: Int) -> DiagEntry {
+    let line = line_of(src, marker)
+    let mut errs: List[DiagEntry] = []
+    for d in diag_entries {
+        if d.severity == "error" && d.line == line { errs.push(d) }
+    }
+    if errs.len() != 1 { io.println("FAIL: want one error on the {marker} line; errors were:\n{all_errors()}") }
+    assert_eq(errs.len(), 1)
+    let d = errs.get(0).unwrap()
+    assert_eq(d.code, "E0504")
+    assert_eq(d.message, "undefined function `{name}`")
+    assert_eq(d.col, col)
+    d
+}
+
+// A row whose replacement takes the same arguments: the fix rewrites the callee.
+fn assert_machine_row(marker: Str, name: Str, col: Int, phrase: Str, callee: Str, help: Str) {
+    let d = removed_error(probe_src(), marker, name, col)
+    assert_eq(d.notes, ["`{name}` is not a built-in function; {phrase}"])
+    assert_eq(d.help, help)
+    assert_eq(d.fix_action, "replace with")
+    assert_eq(d.fix_text, callee)
+    assert_eq(d.fix_line, d.line)
+    assert_eq(d.fix_col, col)
+    assert_eq(d.fix_end_col, col + name.byte_len())
+}
+
+// A row whose replacement changes the arguments: the call is a suggestion, never an edit.
+fn assert_suggestion_row(marker: Str, name: Str, col: Int, phrase: Str, call: Str, help: Str) {
+    let d = removed_error(probe_src(), marker, name, col)
+    assert_eq(d.notes, ["`{name}` is not a built-in function; {phrase}", "call `{call}` in its place"])
+    assert_eq(d.help, help)
+    assert_eq(d.fix_action, "")
+    assert_eq(d.fix_text, "")
+    assert_eq(d.assist_action, "")
+}
+
+let SPAWNS = "child processes go through the `process` handle"
+let SIGNALS = "signals go through the `process` handle"
+let RUN_HELP = "needs `Process.Spawn` in the effect row and returns `Result[ProcessResult, ProcessError]`"
+
+test "each removed process free fn is E0504 with the fix its spec row gives" {
+    let _p = probe("build/tc_removed_process_free_fns_src.bl", probe_src())
+    assert_suggestion_row("E_SHELL_EXEC", "shell_exec", 13, SPAWNS, "process.run(\"sh\", [\"-c\", cmd])", "`process.run` {RUN_HELP}")
+    assert_machine_row("E_PROCESS_RUN", "process_run", 13, SPAWNS, "process.run", "`process.run` {RUN_HELP}")
+    assert_suggestion_row("E_PROCESS_RUN_WITH_STDIN", "process_run_with_stdin", 13, SPAWNS, "process.run(cmd, args, stdin: Some(input))", "`process.run` {RUN_HELP}")
+    assert_machine_row("E_PROCESS_SPAWN", "process_spawn", 13, SPAWNS, "process.spawn", "`process.spawn` needs `Process.Spawn` in the effect row and returns `Result[Child, ProcessError]`")
+    assert_suggestion_row("E_PROCESS_PID_WAIT", "process_pid_wait", 13, SPAWNS, "process.wait(child)", "`process.wait` {RUN_HELP}")
+    let signal_help = "`process.signal` needs `Process.Signal` in the effect row and returns `Result[(), ProcessError]`"
+    assert_suggestion_row("E_PROCESS_PID_KILL", "process_pid_kill", 13, SIGNALS, "process.signal(child, sig)", signal_help)
+    assert_suggestion_row("E_PROCESS_PID_SEND_SIGNAL", "process_pid_send_signal", 13, SIGNALS, "process.signal(child, sig)", signal_help)
+    assert_machine_row("E_PROCESS_EXEC", "process_exec", 13, SPAWNS, "process.exec", "`process.exec` needs `Process.Spawn` and `Env.Exit` in the effect row and returns `Result[Never, ProcessError]`")
+    assert_machine_row("E_EXIT", "exit", 5, "the program ends through the `env` handle", "env.exit", "`env.exit` needs `Env.Exit` in the effect row")
+}
+
+// The CLI's signal forwarding was never a language API: it has no row, so the error is plain.
+test "a call to process_install_signal_forwarding is a plain undefined function" {
+    let _p = probe("build/tc_removed_process_free_fns_src.bl", probe_src())
+    let d = removed_error(probe_src(), "E_SIGNAL_FORWARDING", "process_install_signal_forwarding", 5)
+    assert_eq(d.notes.len(), 0)
+    assert_eq(d.help, "")
+    assert_eq(d.fix_action, "")
+}
+
+// The bug this table closes: the removed call reached the runtime and ran a real child under a
+// handler that answers every Process op.
+test "process_run under a Process handler is E0504 and runs no child" {
+    let src = #"
+import std.process.{ProcessError, ProcessResult, ChildEnd, ChildLimits}
+
+fn main() ! IO, Process {
+    with handler Process {
+        fn run(cmd: Str, _args: List[Str], -- stdin: Str?, limits: ChildLimits) -> Result[ProcessResult, ProcessError] {
+            let _ = stdin
+            let _ = limits
+            Ok(ProcessResult { out: "[mock] {cmd}", err_out: "", end: ChildEnd.Exited(0) })
+        }
+    } {
+        let r = process_run("sh", ["-c", "echo escaped"])
+        io.println("{r}")
+    }
+}
+"#
+    let r = compile_test_helpers.compile_and_run(src, "removed_process_run_under_handler")
+    assert(r.exit_code != 0, "the removed call compiled: {r.out}")
+    compile_test_helpers.expect_contains("{r.out}{r.err_out}", "error[UndefinedFunction]: undefined function `process_run`", "the removed call is an undefined function")
+    assert(!r.out.contains("escaped"), "a real child ran: {r.out}")
+}
+
+test "a program's own fn process_run and fn shell_exec still compile and are called" {
+    let src = "fn process_run(cmd: Str, args: List[Str]) -> Str \{\n    \"own \{cmd} \{args.len()}\"\n}\nfn shell_exec(cmd: Str) -> Str \{\n    \"own \{cmd}\"\n}\nfn main() ! IO \{\n    io.println(process_run(\"sh\", [\"a\"]))\n    io.println(shell_exec(\"ls\"))\n}\n"
+    let r = compile_test_helpers.compile_and_run(src, "removed_process_free_fns_own_fn")
+    assert_eq(r.exit_code, 0)
+    assert_eq(r.out, "own sh 1\nown ls\n")
+}

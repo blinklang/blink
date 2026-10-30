@@ -3768,19 +3768,6 @@ fn tc_conversion_error_type() -> Int {
     ensure_runtime_struct_type("std_traits", "ConversionError", ["message", "source_type", "target_type"], [TYPE_STR, TYPE_STR, TYPE_STR], [])
 }
 
-// Mint a declaration for a RUNTIME-BACKED compiler-known type on demand.
-//
-// ProcessResult's C struct lives in bootstrap/runtime_process.h and codegen names it with
-// no Blink declaration at all (src/codegen.bl:634 reg_fn_struct_ret, :650-652 the fields).
-// So `let r = process_pid_wait(pid)` compiles and RUNS correctly in a file that never
-// writes `import std.process` — src/cli.bl:2187 is exactly that. Without this, typecheck
-// answers TYPE_VOID there: a fail-OPEN erasure that also swallows every downstream `r.out`.
-//
-// The type is known, so typecheck says so. Minting is idempotent and always defers to a
-// real declaration, because lookup runs first: if lib/std/process.bl is in the program its
-// register_struct_type has already inserted the name (registration precedes inference), and
-// this returns that tid. Fields are registered here too — a fieldless mint would turn a
-// silent erasure into a spurious "no field" error, which is worse.
 // A type the runtime defines, minted on demand for a builtin's return. The declaration
 // comes from lib/std when the program imports it; otherwise there is none to find and one
 // is synthesized here, because layout reads a struct's shape and cname its symbol through
@@ -3823,27 +3810,14 @@ fn runtime_duration_tid() -> Int {
     ensure_runtime_struct_type("std_time", "Duration", ["nanos"], [TYPE_INT], ["Eq", "Ord", "Clone", "Debug"])
 }
 
-// One field short of lib/std/process.bl: `end` is a ChildEnd, an enum this mint cannot
-// build, so a file that reads `end` needs `import std.process`. The runtime struct still
-// holds `end`, and C never sees this shape, since the type is runtime-owned.
-fn runtime_process_result_tid() -> Int {
-    ensure_runtime_struct_type("std_process", "ProcessResult", ["out", "err_out"], [TYPE_STR, TYPE_STR], [])
-}
-
 // The help for a read of the field that ProcessResult no longer has (§4.4.8), or "" for any
-// other read. The std type is the one keyed under its module, by lib/std or by the mint, so
-// a user struct of the same name gets the common help.
+// other read. The std type is the one keyed under its module, so a user struct of the same
+// name gets the common help.
 fn tc_removed_process_result_field_help(obj_t: Int, fname: Str) -> Str {
     if fname != "exit_code" { return "" }
     let td = tc_tid_decl_node(obj_t)
     if td < 0 || td != (tc_type_decl_nodes.get("std_process.ProcessResult") ?? -1) { return "" }
     "the child's end is `r.end`; use `r.success()` to test for a clean exit, or `match r.end`"
-}
-
-// The mint has no `end` field and no `success()`, so a file that did not import std.process
-// cannot follow that help until it does.
-fn tc_process_result_is_minted(obj_t: Int) -> Bool {
-    node_source_module(tc_tid_decl_node(obj_t)) == ""
 }
 
 // The err type of the public fs.* surface. When std.fs is imported its `struct FsError`
@@ -3941,7 +3915,7 @@ pub fn get_struct_field_tid(struct_tid: Int, fname: Str) -> Int {
 // such field"; only a resolvable declaration that omits the field proves
 // absence.
 // Prove absence from sfield_pool, the same shape source get_struct_field_tid uses for
-// EXISTENCE. A runtime-minted struct (ProcessResult, Duration, Instant, FsError via
+// EXISTENCE. A runtime-minted struct (Duration, Instant, FsError via
 // ensure_runtime_struct_type) has only the decl node the mint synthesizes out of this pool,
 // so the pool is where its shape is first known. Absence and existence must agree from this
 // one source or a bad field access on such a type escapes E0525. A base tid with NO sfield
@@ -4119,7 +4093,7 @@ pub fn tc_field_tid_at_instance(recv_tid: Int, fname: Str) -> Int {
 // ── Declared shape, by slot ───────────────────────────────────────────────
 //
 // sfield_pool / evar_pool / evfield_pool are the one place a nominal type's declared
-// shape is registered, including the runtime-minted structs (ProcessResult, FsError)
+// shape is registered, including the runtime-minted structs (Instant, FsError)
 // that have no declaration node at all. A reader that walked the AST annotations
 // instead would be a second shape authority and would miss those types entirely, so
 // codegen asks here. A slot is an index into the pool, handed back so a caller reads
@@ -18384,31 +18358,25 @@ pub fn is_builtin_fn(name: Str) -> Int {
         }
         10 => match name {
             "write_file" => 1
-            "shell_exec" => 1
             "file_mtime" => 1
             _ => 0
         }
         11 => match name {
             "file_exists" => 1
-            "process_run" => 1
             "unreachable" => 1
             _ => 0
         }
         12 => match name {
             "debug_assert" => 1
             "socket_write" => 1
-            "process_exec" => 1
             _ => 0
         }
         13 => match name {
             "StringBuilder" => 1
-            "process_spawn" => 1
             _ => 0
         }
         16 => match name {
             "socket_read_line" => 1
-            "process_pid_wait" => 1
-            "process_pid_kill" => 1
             _ => 0
         }
         17 => match name {
@@ -18424,20 +18392,8 @@ pub fn is_builtin_fn(name: Str) -> Int {
             "unix_socket_connect" => 1
             _ => 0
         }
-        22 => match name {
-            "process_run_with_stdin" => 1
-            _ => 0
-        }
-        23 => match name {
-            "process_pid_send_signal" => 1
-            _ => 0
-        }
         26 => match name {
             "unix_socket_accept_timeout" => 1
-            _ => 0
-        }
-        33 => match name {
-            "process_install_signal_forwarding" => 1
             _ => 0
         }
         _ => 0
@@ -18757,28 +18713,53 @@ fn is_builtin_method_on_receiver(obj_k: TyKind, name: Str) -> Int {
     1
 }
 
-// sections/04_effects.md *Removed free functions*: each name as (replacement call, replacement
-// callee, effect). Only a call that name lookup could not resolve reaches the table, so a
-// program's own fn of the same name still compiles.
-fn tc_removed_free_fn(name: Str) -> Option[(Str, Str, Str)] {
+// A row of sections/04_effects.md *Removed free functions*. `suggestion` is the replacement
+// call when its arguments differ from the removed call's, and "" when the fix can rewrite the
+// callee alone. `returns` is "" when the result does not change.
+type RemovedFreeFn {
+    callee: Str
+    suggestion: Str
+    effects: Str
+    handle: Str
+    returns: Str
+}
+
+// Only a call that name lookup could not resolve reaches the table, so a program's own fn of
+// the same name still compiles.
+fn tc_removed_free_fn(name: Str) -> Option[RemovedFreeFn] {
+    let spawns = "child processes go through the `process` handle"
+    let run_ret = "Result[ProcessResult, ProcessError]"
+    let signal = RemovedFreeFn { callee: "process.signal", suggestion: "process.signal(child, sig)", effects: "`Process.Signal`", handle: "signals go through the `process` handle", returns: "Result[(), ProcessError]" }
     match name {
-        "exit" => Some(("env.exit(code)", "env.exit", "Env.Exit"))
+        "exit" => Some(RemovedFreeFn { callee: "env.exit", suggestion: "", effects: "`Env.Exit`", handle: "the program ends through the `env` handle", returns: "" })
+        "shell_exec" => Some(RemovedFreeFn { callee: "process.run", suggestion: "process.run(\"sh\", [\"-c\", cmd])", effects: "`Process.Spawn`", handle: spawns, returns: run_ret })
+        "process_run" => Some(RemovedFreeFn { callee: "process.run", suggestion: "", effects: "`Process.Spawn`", handle: spawns, returns: run_ret })
+        "process_run_with_stdin" => Some(RemovedFreeFn { callee: "process.run", suggestion: "process.run(cmd, args, stdin: Some(input))", effects: "`Process.Spawn`", handle: spawns, returns: run_ret })
+        "process_spawn" => Some(RemovedFreeFn { callee: "process.spawn", suggestion: "", effects: "`Process.Spawn`", handle: spawns, returns: "Result[Child, ProcessError]" })
+        "process_pid_wait" => Some(RemovedFreeFn { callee: "process.wait", suggestion: "process.wait(child)", effects: "`Process.Spawn`", handle: spawns, returns: run_ret })
+        "process_pid_kill" => Some(signal)
+        "process_pid_send_signal" => Some(signal)
+        "process_exec" => Some(RemovedFreeFn { callee: "process.exec", suggestion: "", effects: "`Process.Spawn` and `Env.Exit`", handle: spawns, returns: "Result[Never, ProcessError]" })
         _ => None
     }
 }
 
-// E0504 for a call whose bare callee resolves to nothing. A removed free function also gets
-// the fix that rewrites the callee to its replacement.
+// E0504 for a call whose bare callee resolves to nothing. A removed free function also says
+// which handle replaces it, and gets the fix that rewrites the callee when the arguments stay.
 fn tc_report_undefined_fn(fn_name: Str, node: Int, callee: Int) ! Diag.Report {
     match tc_removed_free_fn(fn_name) {
-        Some((call, replacement, row)) => {
+        Some(row) => {
+            let mut notes = ["`{fn_name}` is not a built-in function; {row.handle}"]
+            if row.suggestion != "" { notes.push("call `{row.suggestion}` in its place") }
+            let returns = if row.returns == "" { "" } else { " and returns `{row.returns}`" }
+            let help = "`{row.callee}` needs {row.effects} in the effect row{returns}"
             let before = diag_entry_count()
-            diag_error_at_notes("UndefinedFunction", UNDEFINED_FUNCTION, "undefined function `{fn_name}`", node, "`{fn_name}` was removed; call `{call}`", ["`{fn_name}` is an operation of `{row}`"])
+            diag_error_at_notes("UndefinedFunction", UNDEFINED_FUNCTION, "undefined function `{fn_name}`", node, help, notes)
             // An allowed or deduplicated error records no entry, and the fix must not land on the one before it.
-            if diag_entry_count() > before {
+            if row.suggestion == "" && diag_entry_count() > before {
                 let line = node_line(callee)
                 let col = node_col(callee)
-                diag_set_last_fix_at("replace with", replacement, line, col, line, col + fn_name.byte_len())
+                diag_set_last_fix_at("replace with", row.callee, line, col, line, col + fn_name.byte_len())
             }
         }
         None => diag_error_at("UndefinedFunction", UNDEFINED_FUNCTION, "undefined function `{fn_name}`", node, "")
@@ -18922,7 +18903,6 @@ fn get_builtin_fn_ret(name: Str) -> Int {
     if name == "list_dir" { return make_list_type(TYPE_STR) }
     if name == "fs_remove" { return TYPE_VOID }
     if name == "file_exists" { return TYPE_INT }
-    if name == "shell_exec" { return TYPE_INT }
     let bsig = fnsig_map.get(tc_builtin_sig_key(name)) ?? -1
     if bsig != -1 { return fnsig_pool.get(bsig).unwrap().ret }
     if name == "is_dir" { return TYPE_INT }
@@ -18940,14 +18920,6 @@ fn get_builtin_fn_ret(name: Str) -> Int {
     if name == "socket_write" { return TYPE_INT }
     if name == "file_mtime" { return TYPE_INT }
     if name == "getpid" { return TYPE_INT }
-    if name == "process_run" { return runtime_process_result_tid() }
-    if name == "process_run_with_stdin" { return runtime_process_result_tid() }
-    if name == "process_exec" { return TYPE_VOID }
-    if name == "process_spawn" { return TYPE_INT }
-    if name == "process_pid_wait" { return runtime_process_result_tid() }
-    if name == "process_pid_kill" { return TYPE_INT }
-    if name == "process_pid_send_signal" { return TYPE_INT }
-    if name == "process_install_signal_forwarding" { return TYPE_VOID }
     // Both Ptr constructors are codegen intrinsics whose element comes from the context — the
     // annotation on the binding. A metavar is that context's slot; leaving them absent left the
     // call itself with no type at all.
@@ -27936,8 +27908,6 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                 let removed = tc_removed_process_result_field_help(obj_t, fname)
                 if removed == "" {
                     tc_error_naming_types("NoSuchField", NO_SUCH_FIELD, msg, node, "use a declared field, or add the field to the type", [obj_t])
-                } else if tc_process_result_is_minted(obj_t) {
-                    diag_error_at_notes("NoSuchField", NO_SUCH_FIELD, msg, node, removed, ["`end` and `success()` need `import std.process`"])
                 } else {
                     tc_error_naming_types("NoSuchField", NO_SUCH_FIELD, msg, node, removed, [obj_t])
                 }

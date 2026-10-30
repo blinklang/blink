@@ -1,17 +1,16 @@
-// A type the runtime defines but no module in this program declares still reaches
-// codegen. `process_run` answers ProcessResult whether or not the file writes
-// `import std.process`, and typecheck mints that tid on the spot. Every reader past
-// typecheck -- layout for the shape, cname for the symbol -- reaches a struct through
-// its declaration node, so a tid minted without one has no C answer and the backend
+// A std type the runtime backs still reaches codegen through its declaration.
+// `process.run` answers ProcessResult whether or not the file writes `import std.process`.
+// Every reader past typecheck -- layout for the shape, cname for the symbol -- reaches a
+// struct through its declaration node, so a tid with none has no C answer and the backend
 // reports an internal error against the call site.
 //
-// The rows walk both states of the same type: minted because nothing declared it, and
-// found because lib/std declared it. The second row is what keeps the fix honest -- a
-// synthesized declaration that also fires where a real one exists would make the name
-// ambiguous and lose the real one.
+// The rows walk both states of the file: no import, and an import of the module that
+// declares the type. In both, the one declaration lib/std writes must answer alone; a second
+// declaration would make the name ambiguous and lose the real one.
 
 import typecheck.{check_types, lookup_named_type, tc_tid_decl_node, DECL_NODE_AMBIGUOUS}
 import compiler.{compile_to_program}
+import parser.{node_source_module}
 import diagnostics.{diag_reset}
 import cname.{c_mono_type_c_name}
 import std.io
@@ -42,6 +41,14 @@ fn assert_has_decl(label: Str, tname: Str) {
     assert(decl >= 0)
 }
 
+fn assert_decl_module(label: Str, tname: Str, want: Str) {
+    let got = node_source_module(tc_tid_decl_node(lookup_named_type(tname)))
+    if got != want {
+        io.println("FAIL: {label}: '{tname}' is declared in '{got}', want '{want}'")
+    }
+    assert(got == want)
+}
+
 // Which blink_ name cname picks depends on a marking pass layout runs later, so the claim
 // here is only that cname has an answer at all: an identifier, not a refusal segment.
 fn assert_c_name_is_an_identifier(label: Str, tname: Str) {
@@ -54,14 +61,15 @@ fn assert_c_name_is_an_identifier(label: Str, tname: Str) {
     assert(got.starts_with("blink_"))
 }
 
-test "a runtime-backed type minted for a builtin return carries a declaration" {
-    compile_only("rt_backed_minted", "fn main() \{\n    let r = process_run(\"echo\", [\"hi\"])\n    io.println(\"\{r.out}\")\n}\n")
-    assert_has_decl("process_run return", "ProcessResult")
-    assert_c_name_is_an_identifier("process_run return", "ProcessResult")
+test "a runtime-backed std type a handle op answers with no import carries its declaration" {
+    compile_only("rt_backed_unimported", "fn main() ! IO, Process.Spawn \{\n    let r = process.run(\"echo\", [\"hi\"]).unwrap()\n    io.println(\"\{r.out}\")\n}\n")
+    assert_has_decl("process.run return", "ProcessResult")
+    assert_decl_module("process.run return", "ProcessResult", "std_process")
+    assert_c_name_is_an_identifier("process.run return", "ProcessResult")
 }
 
 test "the declaration lib/std writes still answers alone when the module is imported" {
-    compile_only("rt_backed_declared", "import std.process\n\nfn main() \{\n    let r = process_run(\"echo\", [\"hi\"])\n    io.println(\"\{r.out}\")\n}\n")
+    compile_only("rt_backed_declared", "import std.process\n\nfn main() ! IO, Process.Spawn \{\n    let r = process.run(\"echo\", [\"hi\"]).unwrap()\n    io.println(\"\{r.out}\")\n}\n")
     assert_has_decl("imported ProcessResult", "ProcessResult")
     assert_c_name_is_an_identifier("imported ProcessResult", "ProcessResult")
 }

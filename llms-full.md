@@ -483,14 +483,13 @@ let text = #"{{x}}"#                    // a lone { is text: "{{x}}"
 | `path_basename(path)` | Str | Filename part of path — **moved to `std.path`** |
 | `file_mtime(path)` | Int | Modification time (ms) |
 | ~~`get_env(name)`~~ | — | **Removed in v0.35** — use `env.var(name)` |
-| `shell_exec(cmd)` | Int | Run shell command, return exit code |
-| `process_run(cmd, args)` | ProcessResult | Run command with args (`List[Str]`), capture stdout, stderr and how the child ended |
-| `process_run_with_stdin(cmd, args, input)` | ProcessResult | Like `process_run` but pipes `input` (Str) to child's stdin |
-| `process_exec(cmd, args)` | () | Exec binary directly (replaces process). `args` is `List[Str]` |
-| `process_spawn(cmd, args)` | Int | Fork + exec a child process; returns raw pid handle. Idiomatic API: `process.spawn` |
-| `process_pid_wait(pid)` | ProcessResult | Block until child exits; returns its `ProcessResult` |
-| `process_pid_kill(pid, sig)` | Int | Send signal to child by pid; returns 0 on success |
-| `process_pid_send_signal(pid, sig)` | Int | Alias of `process_pid_kill` |
+| ~~`shell_exec(cmd)`~~ | — | **Removed** — use `process.run("sh", ["-c", cmd])` (effect `Process.Spawn`); a bare call is E0504 |
+| ~~`process_run(cmd, args)`~~ | — | **Removed** — use `process.run(cmd, args)` (effect `Process.Spawn`); a bare call is E0504 |
+| ~~`process_run_with_stdin(cmd, args, input)`~~ | — | **Removed** — use `process.run(cmd, args, stdin: Some(input))`; a bare call is E0504 |
+| ~~`process_exec(cmd, args)`~~ | — | **Removed** — use `process.exec(cmd, args)` (effects `Process.Spawn`, `Env.Exit`); a bare call is E0504 |
+| ~~`process_spawn(cmd, args)`~~ | — | **Removed** — use `process.spawn(cmd, args)`, which returns a `Child`; a bare call is E0504 |
+| ~~`process_pid_wait(pid)`~~ | — | **Removed** — use `process.wait(child)`; a bare call is E0504 |
+| ~~`process_pid_kill(pid, sig)`~~, ~~`process_pid_send_signal(pid, sig)`~~ | — | **Removed** — use `process.signal(child, sig)` (effect `Process.Signal`); a bare call is E0504 |
 | ~~`exit(code)`~~ | — | **Removed** — use `env.exit(code)` (effect `Env.Exit`); a bare `exit(code)` is E0504 |
 | `panic(msg)` | Never | Abort with `msg`; never returns |
 | `todo()` | Never | Mark unfinished code; panics; warns `W0703` |
@@ -1506,7 +1505,7 @@ Run `blink doc --list` to list available modules.
 - `{}` is NOT an empty map — use `Map.new()`. `{}` in expression position is a compile error. Similarly, use `Set.new()` for empty sets.
 - `file_exists()` returns `Int` (0/1), not `Bool` — use `== 1` or `== 0`
 - `is_dir()` also returns `Int`, not `Bool`
-- `shell_exec()` returns exit code (Int), not stdout — use `process_run()` for output capture
+- `process.run(cmd, args)` returns `Result[ProcessResult, ProcessError]`; `r.out` is stdout and `r.success()` tests for a clean exit
 - `process.spawn` gives `Err` EAGAIN when too many children are not yet waited: wait on every `Child` you spawn. EMFILE comes at about 510 children at `ulimit -n 1024`: raise `ulimit -n`
 - No `return` needed for last expression in function body
 - `match` must be exhaustive — cover all variants or use `_ =>` wildcard

@@ -1,28 +1,16 @@
 // Typecheck must not fail OPEN to Void for runtime-backed compiler-known types.
 //
-// `ProcessResult` and `Instant` are compiler-known types whose C struct lives in the
-// runtime (bootstrap/runtime_process.h:10, and CT_INSTANT in codegen_types.bl:246), and
-// codegen names them without any Blink declaration: src/codegen.bl:634 wires
-// reg_fn_struct_ret("process_pid_wait", "ProcessResult") and :650-652 registers the three
-// fields. So `let r = process_pid_wait(pid)` compiles and runs correctly even in a file
-// that never writes `import std.process` — src/cli.bl:2187 is exactly that shape.
-//
-// Typecheck, however, only knew these types if a declaration happened to be registered,
-// i.e. only if lib/std/process.bl (or lib/std/time.bl) was in the program. On a miss it
-// returned TYPE_VOID (src/typecheck.bl:5810/5815/5822 and the Instant fall-through at
-// :8797) — a fail-OPEN erasure, not an error. That is the single largest divergence cell
-// in the Stage 2 tid-collapse map: 3124 occurrences of `tid=Void flat=ProcessResult`,
-// plus the whole downstream cascade (`let err_text = br.out` gets no tid at all).
-//
-// The type is KNOWN, so typecheck must say so. This file asserts typecheck's own tid,
-// not runtime behaviour: the wrong answer is invisible at runtime precisely because
-// codegen's flat path still has the type right. Harness mirrors
-// tests/test_typecheck_ty_pool_interns_compounds.bl.
+// `ProcessResult` and `Instant` are std types whose C struct lives in the runtime
+// (bootstrap/runtime_process.h, runtime_core.h). A handle operation answers them even in a
+// file that never writes `import std.process` or `import std.time`, so typecheck must give
+// that call and its binding the std type, never Void. A Void here is invisible at runtime,
+// because codegen still names the C struct, so this file asserts typecheck's own tid, not
+// runtime behaviour. Harness mirrors tests/test_typecheck_ty_pool_interns_compounds.bl.
 
 import std.fs
 import compiler.{compile_to_program}
-import typecheck.{check_types, tc_lookup_node_tid, tc_type_str, tc_tid_kind, TyKind}
-import parser.{node_count, nodes}
+import typecheck.{check_types, tc_lookup_node_tid, tc_type_str, tc_tid_kind, tc_tid_decl_node, TyKind}
+import parser.{node_count, nodes, node_source_module}
 import std.io
 
 fn assert_eq_int(got: Int, want: Int, label: Str) {
@@ -50,7 +38,7 @@ fn find_tid_by_str(want: Str) -> Int {
 
 // Count DISTINCT tid values among every node whose type-string matches `want`. A plain
 // linear scan, not a Map insert — a Map keyed by type-string would dedup on its own and
-// could never observe a mint-vs-declaration collision (Half B).
+// could never observe two tids for one name (Half B).
 fn count_distinct_tids_by_str(want: Str) -> Int {
     let mut distinct: List[Int] = []
     let mut idx = 0
@@ -103,7 +91,7 @@ fn stdlib_loadable() -> Bool ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, Ty
     find_tid_by_str("Duration") >= 0
 }
 
-// ── Half A — the three process builtins, with NO `import std.process` ───────────────
+// ── Half A — the process handle operations, with NO `import std.process` ────────────
 //
 // The field reads are load-bearing, not decoration: they are how this test asserts the
 // fields are registered too. A ProcessResult tid whose sfield_pool entries are missing
@@ -111,14 +99,14 @@ fn stdlib_loadable() -> Bool ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, Ty
 // of returning — so a fields-less "fix" fails here rather than passing quietly.
 
 fn process_probe_src() -> Str {
-    #"fn main() {
-    let pid = process_spawn("echo", ["hi"])
-    let waited = process_pid_wait(pid)
+    #"fn main() ! Process.Spawn {
+    let child = process.spawn("echo", ["hi"]).unwrap()
+    let waited = process.wait(child).unwrap()
     let w_out: Str = waited.out
     let w_err: Str = waited.err_out
-    let ran = process_run("echo", ["hi"])
+    let ran = process.run("echo", ["hi"]).unwrap()
     let r_err: Str = ran.err_out
-    let piped = process_run_with_stdin("cat", [], "hi")
+    let piped = process.run("cat", [], stdin: Some("hi")).unwrap()
     let p_out: Str = piped.out
     assert(w_out.len() >= 0)
     assert(w_err.len() >= 0)
@@ -128,7 +116,7 @@ fn process_probe_src() -> Str {
 "#
 }
 
-test "process builtins type as ProcessResult without import std.process" {
+test "process handle operations type as ProcessResult without import std.process" {
     let path = "build/runtime_backed_type_fail_open_process_probe.bl"
     write_file(path, process_probe_src())
     let program = compile_to_program(path, 1)
@@ -138,24 +126,26 @@ test "process builtins type as ProcessResult without import std.process" {
     let tid = find_tid_by_str("ProcessResult")
     assert_true(tid >= 0, "process: a ProcessResult tid is observed — typecheck must not erase a runtime-backed type to Void")
     assert_true(tc_tid_kind(tid) == TyKind.Struct, "process: the ProcessResult tid is a Struct kind")
-    assert_eq_int(count_distinct_tids_by_str("ProcessResult"), 1, "process: all three builtins share ONE ProcessResult tid")
-    // Six nodes must carry it: the three calls and the three lets bound to them. A fix that
-    // typed only the call expression and left the let erased would satisfy the checks above.
-    assert_true(count_nodes_by_str("ProcessResult") >= 6, "process: both the call and its let binding carry the type, for all three builtins")
+    assert_eq_int(count_distinct_tids_by_str("ProcessResult"), 1, "process: all three operations share ONE ProcessResult tid")
+    let decl = tc_tid_decl_node(tid)
+    assert_true(decl >= 0 && node_source_module(decl) == "std_process", "process: the tid is the one lib/std/process.bl declares")
+    // Six nodes must carry it: the three unwrapped calls and the three lets bound to them. A
+    // fix that typed only the call expression and left the let erased would satisfy the
+    // checks above.
+    assert_true(count_nodes_by_str("ProcessResult") >= 6, "process: both the call and its let binding carry the type, for all three operations")
 }
 
-// ── Half B — a real declaration must win, with no second mint ───────────────────────
+// ── Half B — an imported declaration and the handle op share one tid ────────────────
 //
-// Minting on demand must not race the declaration: when lib/std/process.bl IS in the
-// program there must still be exactly ONE ProcessResult tid. Two would mean an intrinsic
-// call minted its own before/after registration, and nominal type identity would then
-// depend on which tid a given node happened to memoize.
+// When the file imports std.process there must still be exactly ONE ProcessResult tid.
+// Two would mean a handle call typed its result apart from the declaration, and nominal
+// type identity would then depend on which tid a given node happened to memoize.
 
 fn declared_probe_src() -> Str {
     #"import std.process
 
-fn main() {
-    let ran = process_run("echo", ["hi"])
+fn main() ! Process.Spawn {
+    let ran = process.run("echo", ["hi"]).unwrap()
     let out: Str = ran.out
     let child = process.spawn("echo", ["hi"]).unwrap()
     let waited = process.wait(child).unwrap()
@@ -166,7 +156,7 @@ fn main() {
 "#
 }
 
-test "a declared ProcessResult and the builtin return type are ONE tid" {
+test "an imported ProcessResult and the handle op return type are ONE tid" {
     if !stdlib_loadable() {
         skip("harness cannot load std.* from this binary's directory — the declaration half needs a real lib/std/process.bl")
     }
@@ -178,7 +168,7 @@ test "a declared ProcessResult and the builtin return type are ONE tid" {
 
     let tid = find_tid_by_str("ProcessResult")
     assert_true(tid >= 0, "declared: a ProcessResult tid is observed")
-    assert_eq_int(count_distinct_tids_by_str("ProcessResult"), 1, "declared: the declaration and the intrinsic return share ONE tid — no duplicate mint")
+    assert_eq_int(count_distinct_tids_by_str("ProcessResult"), 1, "declared: the declaration and the handle op return share ONE tid")
 }
 
 // ── Half C — the Instant twin, with NO `import std.time` ────────────────────────────
