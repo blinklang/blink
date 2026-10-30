@@ -183,7 +183,7 @@ fn relink_archive(build_dir: Str, cache_dir_rel: Str) ! Env.Exit, IO, Process.Sp
     let _ = build_fs.run_shell(cmd.to_str())
 }
 
-fn write_skip_modules_file(path: Str, keys: List[Str]) ! FS.Write {
+fn write_skip_modules_file(path: Str, keys: List[Str]) -> Bool ! IO, FS.Write {
     let mut sb = StringBuilder.new()
     let mut i = 0
     while i < keys.len() {
@@ -191,7 +191,7 @@ fn write_skip_modules_file(path: Str, keys: List[Str]) ! FS.Write {
         sb.write("\n")
         i = i + 1
     }
-    let _ = fs.write(path, sb.to_str())
+    build_fs.write_or_report(path, sb.to_str())
 }
 
 fn bail_on_diag() -> Int ! Diag.Report {
@@ -253,7 +253,7 @@ pub fn build_stdlib_archive_in(build_dir: Str, peeled: List[Str], force_rebuild:
         // Backfill the identity stamp for caches built before .archive-id
         // existed, so relink_archive's symlink never dangles.
         if !build_fs.path_exists("{final_dir}/.archive-id") {
-            write_archive_id("{final_dir}/.archive-id", rt_path_final, "{final_dir}/libblink_std.h", "{final_dir}/monolith.c")
+            if !write_archive_id("{final_dir}/.archive-id", rt_path_final, "{final_dir}/libblink_std.h", "{final_dir}/monolith.c") { return 1 }
         }
         relink_archive(build_dir, "std-cache/{hash}")
         return 0
@@ -270,7 +270,7 @@ pub fn build_stdlib_archive_in(build_dir: Str, peeled: List[Str], force_rebuild:
     }
 
     let entry_bl = "{cache_dir}/__archive_main.bl"
-    let _ = fs.write(entry_bl, synthesize_entry_source(modules))
+    if !build_fs.write_or_report(entry_bl, synthesize_entry_source(modules)) { return 1 }
     let program = compile_entry_to_program(entry_bl, 1, false)
     let _tc_err = check_types(program)
     check_unused_imports()
@@ -287,8 +287,8 @@ pub fn build_stdlib_archive_in(build_dir: Str, peeled: List[Str], force_rebuild:
     let header = generate_archive_header(program, hdr_cfg)
     let hdr_rc = bail_on_diag()
     if hdr_rc != 0 { return hdr_rc }
-    let _ = fs.write("{cache_dir}/libblink_std.h", header)
-    let _ = fs.write("{cache_dir}/runtime.h", build_fs.read_or_empty(rt_path_final))
+    if !build_fs.write_or_report("{cache_dir}/libblink_std.h", header) { return 1 }
+    if !build_fs.write_or_report("{cache_dir}/runtime.h", build_fs.read_or_empty(rt_path_final)) { return 1 }
 
     let mono_cfg = CgConfig { debug_mode: 0, trace_codegen: 0, deterministic: 0,
         emit_only_module: "", skip_modules: Map(), user_tu_mode: 0,
@@ -296,7 +296,7 @@ pub fn build_stdlib_archive_in(build_dir: Str, peeled: List[Str], force_rebuild:
     let monolith_c = generate(program, mono_cfg)
     let mono_rc = bail_on_diag()
     if mono_rc != 0 { return mono_rc }
-    let _ = fs.write("{cache_dir}/monolith.c", monolith_c)
+    if !build_fs.write_or_report("{cache_dir}/monolith.c", monolith_c) { return 1 }
     // Peeled modules (e.g. std/db_sqlite) are excluded from monolith.c
     // entirely, so no BLINK_USE_<dep> macros are needed for the archive.
     // The user TU defines those macros itself when codegen emits a peeled
@@ -306,7 +306,7 @@ pub fn build_stdlib_archive_in(build_dir: Str, peeled: List[Str], force_rebuild:
     // compiles, so they add nothing to the archive build's wall time. The monolith drops
     // them by a flag on its cc line, not by a line in monolith.c, so a compile of
     // monolith.c alone still holds every body.
-    let _ = fs.write("{cache_dir}/runtime_test.c", "#define BLINK_USE_EXTERN_RUNTIME_STORAGE 1\n#define BLINK_RUNTIME_TEST_BODIES_UNIT 1\n#include \"runtime.h\"\n")
+    if !build_fs.write_or_report("{cache_dir}/runtime_test.c", "#define BLINK_USE_EXTERN_RUNTIME_STORAGE 1\n#define BLINK_RUNTIME_TEST_BODIES_UNIT 1\n#include \"runtime.h\"\n") { return 1 }
     let test_child = spawn_cc("-c -ffunction-sections -fdata-sections -o {cache_dir}/runtime_test.o {cache_dir}/runtime_test.c -I{cache_dir}", 0, 1, "", cache_dir, "runtime_test")
     let cc_args = "-c -ffunction-sections -fdata-sections -DBLINK_RUNTIME_TEST_BODIES_APART=1 -o {cache_dir}/monolith.o {cache_dir}/monolith.c -I{cache_dir}"
     let rc = run_cc(cc_args, 0, 1, "")
@@ -327,9 +327,9 @@ pub fn build_stdlib_archive_in(build_dir: Str, peeled: List[Str], force_rebuild:
         io.eprintln("error: ar failed building the stdlib archive (rc={ar_rc})")
         return if ar_rc > 0 { ar_rc } else { 1 }
     }
-    write_skip_modules_file("{cache_dir}/skip_modules.txt", list_stdlib_module_keys())
-    write_archive_id("{cache_dir}/.archive-id", rt_path_final, "{cache_dir}/libblink_std.h", "{cache_dir}/monolith.c")
-    let _ = fs.write("{cache_dir}/.stamp", "")
+    if !write_skip_modules_file("{cache_dir}/skip_modules.txt", list_stdlib_module_keys()) { return 1 }
+    if !write_archive_id("{cache_dir}/.archive-id", rt_path_final, "{cache_dir}/libblink_std.h", "{cache_dir}/monolith.c") { return 1 }
+    if !build_fs.write_or_report("{cache_dir}/.stamp", "") { return 1 }
     // publish keeps an entry that is already there, so one left here would stay as the archive.
     if force_rebuild && !build_fs.remove_tree_or_report(final_dir) {
         return 1
@@ -368,6 +368,6 @@ fn archive_id_string(rt_path: Str, hdr_path: Str, mono_path: Str) -> Str ! IO, F
     "{rt_sha}|{hdr_sha}|{bc_sha}|{blink_cli_version}|{mono_sha}"
 }
 
-fn write_archive_id(path: Str, rt_path: Str, hdr_path: Str, mono_path: Str) ! IO, FS.Read, FS.Write {
-    let _ = fs.write(path, "{archive_id_string(rt_path, hdr_path, mono_path)}\n")
+fn write_archive_id(path: Str, rt_path: Str, hdr_path: Str, mono_path: Str) -> Bool ! IO, FS.Read, FS.Write {
+    build_fs.write_or_report(path, "{archive_id_string(rt_path, hdr_path, mono_path)}\n")
 }

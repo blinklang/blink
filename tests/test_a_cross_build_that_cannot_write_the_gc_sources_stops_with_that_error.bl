@@ -1,0 +1,29 @@
+// A cross build writes the embedded gc sources into build/native-cache when no vendored gc is
+// found. A build that cannot write them all stops with that error and exits nonzero. It
+// keeps no cut-short tree in the cache and does not go on to a C compile without gc.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> ProcessResult {
+    process.run("sh", ["-c", cmd]).unwrap()
+}
+
+test "a cross build that cannot write the gc sources stops with that error" {
+    let d = sh("mktemp -d /tmp/blink_gc_sources_cannot_write.XXXXXX").out.trim()
+    fs.write("{d}/main.bl", "fn main() \{\n    io.println(\"hi\")\n}\n")?
+    let blink = sh("readlink -f build/blink").out.trim()
+    // A 115 KB file size limit: gc_unity.c and gc.h are larger, the program's own files are
+    // smaller with --no-cache. It holds for root too.
+    let r = sh("cd {d} && env -u BLINK_ROOT timeout 600 sh -c 'trap \"\" XFSZ; ulimit -f 230; exec \"$0\" build --no-cache --target linux-arm64 main.bl' {blink} < /dev/null")
+    let published = fs.stat("{d}/build/native-cache/gc")
+    sh("rm -rf {d}")
+    let text = "{r.out}{r.err_out}"
+    assert(!r.success(), "the build answered success:\n{text}")
+    assert(text.contains("write build/native-cache/gc-tmp"), "the error does not name the gc source it could not write:\n{text}")
+    assert(!text.contains("zig cc failed"), "the build went on to a C compile without gc:\n{text}")
+    assert(!text.contains("C compilation failed"), "the build went on to a C compile without gc:\n{text}")
+    match published {
+        Ok(_) => assert(false, "a cut-short gc tree went into the cache")
+        Err(e) => assert(e.not_found(), "stat of the gc cache dir: {e}")
+    }
+}

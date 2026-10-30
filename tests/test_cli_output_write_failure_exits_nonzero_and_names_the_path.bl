@@ -1,0 +1,61 @@
+// A command whose output file it cannot write has not done its job. It says which path
+// and why, and it exits nonzero, so a script or a build that runs it does not go on as if
+// the file were there.
+
+import compile_test_helpers
+
+fn sh(cmd: Str) -> Str {
+    process.run("sh", ["-c", cmd]).unwrap().out.trim()
+}
+
+fn as_root() -> Bool {
+    sh("id -u") == "0"
+}
+
+// A dir that holds main.bl and a dir out/ that no one may write.
+fn locked_dir(name: Str) -> Str {
+    let d = "{compile_test_helpers.scratch_root()}/_outwrite_{name}_{getpid()}"
+    sh("rm -rf {d} && mkdir -p {d}/out")
+    fs.write("{d}/main.bl", "fn main() \{\n    io.println(\"hi\")\n\}\n").unwrap()
+    sh("chmod 555 {d}/out")
+    d
+}
+
+fn unlock(d: Str) {
+    sh("chmod 755 {d}/out && rm -rf {d}")
+}
+
+test "blink build --emit c into a dir it cannot write exits nonzero and names the C file" {
+    if as_root() { return }
+    let d = locked_dir("emitc")
+    let r = process.run("build/blink", ["build", "--emit", "c", "-o", "{d}/out/main", "{d}/main.bl"]).unwrap()
+    unlock(d)
+    let text = "{r.out}{r.err_out}"
+    assert(!r.success(), "the build answered success:\n{text}")
+    assert(text.contains("{d}/out/main.c"), "the error does not name the C file:\n{text}")
+}
+
+test "blinkc with an output path it cannot write exits nonzero and names the path" {
+    if as_root() { return }
+    let d = locked_dir("blinkc")
+    let r = process.run("build/blinkc", ["{d}/main.bl", "{d}/out/main.c"]).unwrap()
+    unlock(d)
+    let text = "{r.out}{r.err_out}"
+    assert(!r.success(), "blinkc answered success:\n{text}")
+    assert(text.contains("{d}/out/main.c"), "the error does not name the output path:\n{text}")
+}
+
+test "blink fmt of a file it cannot write exits nonzero and names the file" {
+    if as_root() { return }
+    let d = locked_dir("fmt")
+    // Formatting changes this text, so fmt has a file to write.
+    fs.write("{d}/main.bl", "fn main() \{\nio.println(\"hi\")\n\}\n").unwrap()
+    sh("chmod 444 {d}/main.bl")
+    let r = process.run("build/blink", ["fmt", "{d}/main.bl"]).unwrap()
+    let after = fs.read("{d}/main.bl").unwrap()
+    unlock(d)
+    let text = "{r.out}{r.err_out}"
+    assert(!r.success(), "fmt answered success:\n{text}")
+    assert(text.contains("{d}/main.bl"), "the error does not name the file:\n{text}")
+    assert_eq(after, "fn main() \{\nio.println(\"hi\")\n\}\n")
+}
