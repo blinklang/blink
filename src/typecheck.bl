@@ -97,7 +97,7 @@ pub type TyKind {
     Typevar, Unknown, Iterator, Handle, Channel, Ptr, Handler,
     Tuple, Map, Bytes, Set, StringBuilder, Template, FfiScope, Raw,
     I8, I16, I32, U8, U16, U32, U64, Char,
-    Never
+    Never, Range
 }
 
 // Stable spelling of a kind, for the ty_intern key. A match, not Display: it is
@@ -122,6 +122,7 @@ pub fn tk_name(k: TyKind) -> Str {
         TyKind.Handle => "Handle"
         TyKind.Handler => "Handler"
         TyKind.Channel => "Channel"
+        TyKind.Range => "Range"
         TyKind.Ptr => "Ptr"
         TyKind.Tuple => "Tuple"
         TyKind.Map => "Map"
@@ -2160,6 +2161,20 @@ pub fn make_iterator_type(elem_type: Int) -> Int {
     ty_intern_simple(TyKind.Iterator, "Iterator", elem_type, -1)
 }
 
+// `Range[T]` (sections/02_syntax.md §2.10): the value a `..` or `..=` literal builds. One inner,
+// the bound type, shaped like make_iterator_type. It has no public field and no public method.
+pub fn make_range_type(bound_type: Int) -> Int {
+    ty_intern_simple(TyKind.Range, "Range", bound_type, -1)
+}
+
+// The tuple codegen holds a `Range[T]` as: (start, end, inclusive). The one place the shape is
+// written, so layout, C names and the arena walk cannot disagree on it. The type checker never
+// uses it: a Range is not a tuple to user code.
+pub fn range_repr_tid(range_tid: Int) -> Int {
+    let bound = tc_tid_child(range_tid, 0)
+    make_tuple_type([bound, bound, TYPE_BOOL])
+}
+
 // The case the audit above missed, because `Handler` was not an unconstructed
 // TyKind: it was not a TyKind AT ALL. `Handler[E]` fell through resolve_type_parts to
 // `make_typevar("Handler")`, and the Fn arm three screens down names what that costs in one line
@@ -2438,7 +2453,7 @@ fn tc_occurs_in(needle: Int, hay0: Int) -> Int {
     let e = ty_pool.get(hay).unwrap()
     let k = e.kind
     // Every kind tc_unify descends, or a bind through one of them could close a cycle.
-    if k == TyKind.List || k == TyKind.Option || k == TyKind.Set || k == TyKind.Channel || k == TyKind.Iterator {
+    if k == TyKind.List || k == TyKind.Option || k == TyKind.Set || k == TyKind.Channel || k == TyKind.Iterator || k == TyKind.Range {
         return tc_occurs_in(needle, e.inner1)
     }
     if k == TyKind.Ptr || k == TyKind.Handle || k == TyKind.Template || k == TyKind.Raw {
@@ -2498,7 +2513,7 @@ fn tc_tid_has_unbound_metavar(tid0: Int) -> Int {
     // not E0301, but that spelling lowers to TYPE_UNKNOWN — not a metavar — so it
     // does not reach this arm.
     // Ptr too: null_ptr()/alloc_ptr() return Ptr[α], and an unpinned binding of one is E0301.
-    if k == TyKind.List || k == TyKind.Option || k == TyKind.Set || k == TyKind.Channel || k == TyKind.Iterator || k == TyKind.Handle || k == TyKind.Ptr {
+    if k == TyKind.List || k == TyKind.Option || k == TyKind.Set || k == TyKind.Channel || k == TyKind.Iterator || k == TyKind.Handle || k == TyKind.Ptr || k == TyKind.Range {
         return tc_tid_has_unbound_metavar(e.inner1)
     }
     if k == TyKind.Result || k == TyKind.Map {
@@ -2535,7 +2550,7 @@ pub fn tc_tid_has_unknown(tid0: Int) -> Int {
     if tc_tid_is_no_info(tid) != 0 { return 1 }
     let e = ty_pool.get(tid).unwrap()
     let k = e.kind
-    if k == TyKind.List || k == TyKind.Option || k == TyKind.Set || k == TyKind.Channel || k == TyKind.Iterator || k == TyKind.Handle {
+    if k == TyKind.List || k == TyKind.Option || k == TyKind.Set || k == TyKind.Channel || k == TyKind.Iterator || k == TyKind.Handle || k == TyKind.Range {
         return tc_tid_has_unknown(e.inner1)
     }
     if k == TyKind.Result || k == TyKind.Map {
@@ -2590,6 +2605,7 @@ fn tc_tid_fill_unknowns(base0: Int, src0: Int) -> Int {
     if eb.kind == TyKind.Set { return make_set_type(tc_tid_fill_unknowns(eb.inner1, es.inner1)) }
     if eb.kind == TyKind.Channel { return make_channel_type(tc_tid_fill_unknowns(eb.inner1, es.inner1)) }
     if eb.kind == TyKind.Iterator { return make_iterator_type(tc_tid_fill_unknowns(eb.inner1, es.inner1)) }
+    if eb.kind == TyKind.Range { return make_range_type(tc_tid_fill_unknowns(eb.inner1, es.inner1)) }
     if eb.kind == TyKind.Handle { return make_handle_type(tc_tid_fill_unknowns(eb.inner1, es.inner1)) }
     if eb.kind == TyKind.Result {
         return make_result_type(tc_tid_fill_unknowns(eb.inner1, es.inner1), tc_tid_fill_unknowns(eb.inner2, es.inner2))
@@ -2639,7 +2655,7 @@ fn tc_tid_has_typevar_among(tid0: Int, foreign_only: Int) -> Int {
         if foreign_only != 0 && tc_typevar_binds_here(tid) != 0 { return 0 }
         return 1
     }
-    if k == TyKind.List || k == TyKind.Option || k == TyKind.Set || k == TyKind.Channel || k == TyKind.Iterator {
+    if k == TyKind.List || k == TyKind.Option || k == TyKind.Set || k == TyKind.Channel || k == TyKind.Iterator || k == TyKind.Range {
         return tc_tid_has_typevar_among(e.inner1, foreign_only)
     }
     if k == TyKind.Result || k == TyKind.Map {
@@ -2672,6 +2688,7 @@ fn tc_infer_annotation_hint(tid0: Int) -> Str {
     if k == TyKind.Set { return ": Set[T]" }
     if k == TyKind.Channel { return ": Channel[T]" }
     if k == TyKind.Iterator { return ": Iterator[T]" }
+    if k == TyKind.Range { return ": Range[T]" }
     if k == TyKind.Handle { return ": Handle[T]" }
     if k == TyKind.Ptr { return ": Ptr[T]" }
     if k == TyKind.Map { return ": Map[K, V]" }
@@ -2828,7 +2845,7 @@ fn tc_ud_metavar_roots(tid0: Int) -> List[Int] {
     }
     let e = ty_pool.get(tid).unwrap()
     let k = e.kind
-    if k == TyKind.List || k == TyKind.Option || k == TyKind.Set || k == TyKind.Channel || k == TyKind.Iterator || k == TyKind.Handle || k == TyKind.Ptr {
+    if k == TyKind.List || k == TyKind.Option || k == TyKind.Set || k == TyKind.Channel || k == TyKind.Iterator || k == TyKind.Handle || k == TyKind.Ptr || k == TyKind.Range {
         return tc_ud_metavar_roots(e.inner1)
     }
     if k == TyKind.Result || k == TyKind.Map {
@@ -3671,7 +3688,7 @@ pub fn tc_unify(a0: Int, b0: Int) -> Int {
         // Each of these answered above, before the kinds were compared; the arms repeat that answer.
         TyKind.Unknown | TyKind.Typevar => 1
         // One type argument, in inner1.
-        TyKind.List | TyKind.Option | TyKind.Set | TyKind.Channel | TyKind.Iterator | TyKind.Raw | TyKind.Ptr | TyKind.Handle | TyKind.Template => tc_unify(ta.inner1, tb.inner1)
+        TyKind.List | TyKind.Option | TyKind.Set | TyKind.Channel | TyKind.Iterator | TyKind.Raw | TyKind.Ptr | TyKind.Handle | TyKind.Template | TyKind.Range => tc_unify(ta.inner1, tb.inner1)
         // The effect is in the name slot, not in a child.
         TyKind.Handler => if tc_handler_effects_agree(ta.name, tb.name) { 1 } else { 0 }
         TyKind.Result | TyKind.Map => {
@@ -4376,6 +4393,11 @@ pub fn substitute_typevar_tid(t0: Int, binds: Map[Str, Int]) -> Int {
         if inner == e.inner1 { return t }
         return make_iterator_type(inner)
     }
+    if k == TyKind.Range {
+        let inner = substitute_typevar_tid(e.inner1, binds)
+        if inner == e.inner1 { return t }
+        return make_range_type(inner)
+    }
     if k == TyKind.Ptr {
         let inner = substitute_typevar_tid(e.inner1, binds)
         if inner == e.inner1 { return t }
@@ -4600,7 +4622,7 @@ fn unify_typevar_binds(ptid: Int, atid: Int, binds: Map[Str, Int]) {
         unify_typevar_binds(pe.inner1, ae.inner1, binds)
         return
     }
-    if pk == TyKind.Channel || pk == TyKind.Ptr || pk == TyKind.Template {
+    if pk == TyKind.Channel || pk == TyKind.Ptr || pk == TyKind.Template || pk == TyKind.Range {
         unify_typevar_binds(pe.inner1, ae.inner1, binds)
         return
     }
@@ -9412,7 +9434,6 @@ fn tc_compiler_known_ctor_arity(core: Str) -> Int {
         return if tps == -1 { 0 } else { sublist_length(tps) }
     }
     match core {
-        "Range" => 1
         "Buf" => 1
         "TemplateValue" => 0
         _ => -1
@@ -9423,7 +9444,7 @@ fn tc_compiler_known_ctor_arity(core: Str) -> Int {
 fn tc_builtin_ctor_arity(n: Str) -> Int {
     // A bare `Ptr` names no pointee, and the resolve arm would hand back Ptr over the give-up
     // type, which no later pass can spell.
-    if n == "List" || n == "Option" || n == "Set" || n == "Channel" || n == "Handle" || n == "Iterator" || n == "Ptr" {
+    if n == "List" || n == "Option" || n == "Set" || n == "Channel" || n == "Handle" || n == "Iterator" || n == "Ptr" || n == "Range" {
         return 1
     }
     if n == "Map" || n == "Result" {
@@ -9608,6 +9629,14 @@ fn tc_resolve_compiler_known_type(name: Str, elems_sl: Int, ann_node: Int) -> In
         }
         return make_iterator_type(TYPE_UNKNOWN)
     }
+    // The value a `..` or `..=` literal builds (§2.10). Ahead of resolve_type_name for the reason
+    // Iterator is: is_primitive_type claims the name.
+    if name == "Range" {
+        if elems_sl != -1 && sublist_length(elems_sl) >= 1 {
+            return make_range_type(resolve_type_ann(sublist_get(elems_sl, 0)))
+        }
+        return make_range_type(TYPE_UNKNOWN)
+    }
     // The fourth carrier for the same reason. `Ptr` is claimed by
     // is_primitive_type (:6486) so no user type could have taken the name, and falling through
     // to make_typevar("Ptr") is what let `let r: Ptr[Int] = buf` (buf: Ptr[Pollfd]) reach the C
@@ -9693,8 +9722,8 @@ fn tc_compiler_known_type_tid(core: Str, elems_sl: Int, ann_node: Int) -> Int ! 
 }
 
 // What `written`, an import alias of the compiler-known `core`, resolves to when `core` has no
-// arm in tc_resolve_compiler_known_type. A type no declaration gives (Range, Buf,
-// TemplateValue) has no tid to answer, so the alias is reported rather than left a free type
+// arm in tc_resolve_compiler_known_type. A type no declaration gives (Buf, TemplateValue)
+// has no tid to answer, so the alias is reported rather than left a free type
 // variable named for the alias, which no back end can spell.
 fn tc_aliased_compiler_known_type(written: Str, core: Str, ann_node: Int) -> Int ! Diag.Report {
     let known = tc_compiler_known_tid(core)
@@ -20308,6 +20337,7 @@ fn is_primitive_type(name: Str) -> Int {
             "Bytes" => 1
             "Tuple" => 1
             "Never" => 1
+            "Range" => 1
             _ => 0
         }
         6 => match name {
@@ -23011,7 +23041,7 @@ fn types_compatible(a0: Int, b0: Int) -> Int {
         TyKind.Typevar => tc_typevar_pair_compatible(a, b)
         // One type argument in inner1, compared as is: there is no subtyping (§3.6 *Traits*),
         // so Channel[Int] is not a Channel[Str] and Handle[Int] is not a Handle[Str].
-        TyKind.List | TyKind.Option | TyKind.Iterator | TyKind.Set | TyKind.Channel | TyKind.Handle | TyKind.Raw => tc_type_part_compatible(ta.inner1, tb.inner1)
+        TyKind.List | TyKind.Option | TyKind.Iterator | TyKind.Set | TyKind.Channel | TyKind.Handle | TyKind.Raw | TyKind.Range => tc_type_part_compatible(ta.inner1, tb.inner1)
         // A pointer is compatible only with a pointer to the same thing. Same
         // one-inner recursion as the arm above, spelled separately because the reason differs:
         // for List/Option/Set the payload is a Blink value, here it is a C memory layout, and
@@ -23868,6 +23898,8 @@ fn tc_kind_takes_eq_need(k: TyKind) -> Bool {
     // A Raw[Str] is a marker with no `Eq` (§3b.5): its one use is a template hole.
     if k == TyKind.Raw { return true }
     if k == TyKind.Option || k == TyKind.Result || k == TyKind.List || k == TyKind.Set { return true }
+    // §2.10 gives a Range no `Eq`; it is walked, not compared.
+    if k == TyKind.Range { return true }
     k == TyKind.Map || k == TyKind.Tuple || k == TyKind.Enum || k == TyKind.Struct
 }
 
@@ -28207,11 +28239,13 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
     }
 
     if kind == NodeKind.RangeLit {
-        // The bounds are ordinary expressions and the only things that can be wrong here, but
-        // the answer (a list of Int) never depended on them, so nothing used to look.
-        infer_type(node_start(node))
-        infer_type(node_end(node))
-        return make_list_type(TYPE_INT)
+        // `a..b` is a `Range[T]` (§2.10), T the type both bounds share.
+        let lo_t = tc_infer_unhinted(node_start(node))
+        let hi_t = tc_infer_unhinted(node_end(node))
+        if types_compatible(lo_t, hi_t) == 0 {
+            tc_error_at("range bounds must have one type, got {type_to_str(lo_t)} and {type_to_str(hi_t)}", node_end(node))
+        }
+        return make_range_type(lo_t)
     }
 
     // `async.scope { ... }` evaluates to its block's tail, exactly like the bare block
@@ -31920,7 +31954,12 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
         // metavar — must not be diagnosed here: only E0301's region boundary decides whether an
         // under-determined type is an error. Testing the element instead of the kind would put a
         // NotIterable on a list, which is the one thing this arm must never say.
-        let has_elem_rule = iter_tk == TyKind.List || iter_tk == TyKind.Set || iter_tk == TyKind.Map
+        let has_elem_rule = iter_tk == TyKind.List || iter_tk == TyKind.Set || iter_tk == TyKind.Map || iter_tk == TyKind.Range
+        // §2.10 does not say how a `for` steps a Range whose bound is not Int, and the loop
+        // lowering counts in Int, so any other bound is refused here rather than miscompiled.
+        if iter_tk == TyKind.Range && type_kind(tc_resolve(elem_t)) != TyKind.Int && type_kind(tc_resolve(elem_t)) != TyKind.Unknown {
+            diag_error_at("NotIterable", NOT_ITERABLE, "cannot iterate over type `{type_to_str(iter_t)}` with a `for` loop -- only a range of Int can be walked", node_iterable(node), "iterate a `Range[Int]` instead")
+        }
         if has_elem_rule == 0 {
             // TyKind.Unknown here means iter_t is still an unbound metavar (e.g. a lazy-adapter
             // chain like `.enumerate()`/`.zip()` not yet pinned at this point in checking) --
@@ -34002,6 +34041,7 @@ fn type_to_str(tid0: Int) -> Str {
         // type 'Channel' -- only ... Channel ... implement iteration": one line contradicting
         // itself.
         TyKind.Iterator => return "Iterator[{type_to_str(t.inner1)}]"
+        TyKind.Range => return "Range[{type_to_str(t.inner1)}]"
         TyKind.Handle => return "Handle[{type_to_str(t.inner1)}]"
         // The effect lives in the name slot, not in a child (make_handler_type), so this renders
         // it directly instead of recursing. `Handler[IO]`, `Handler[IO.Print]`, `Handler[Metrics]`
@@ -34181,6 +34221,7 @@ pub fn tc_tid_child_count(tid: Int) -> Int {
         // the sealed opaque carrier of §3c.1:38, produced only by `.into_iter()` and the lazy
         // iterator-receiver adapters; its element is inner1, read below.
         TyKind.Iterator => 1
+        TyKind.Range => 1
         TyKind.Handle => 1
         TyKind.Channel => 1
         // The pointee. `Ptr[Void]` and `Ptr[Ptr[T]]` are both spec-legal pointees
@@ -34250,6 +34291,7 @@ pub fn tc_tid_child(tid: Int, i: Int) -> Int {
         TyKind.Typevar => -1
         TyKind.Unknown => -1
         TyKind.Iterator => if i == 0 { t.inner1 } else { -1 }
+        TyKind.Range => if i == 0 { t.inner1 } else { -1 }
         TyKind.Handle => if i == 0 { t.inner1 } else { -1 }
         TyKind.Channel => if i == 0 { t.inner1 } else { -1 }
         TyKind.Ptr => if i == 0 { t.inner1 } else { -1 }
@@ -34321,7 +34363,7 @@ pub fn tc_tid_struct(tid: Int) -> Str {
 // flat field is in fact right and only the tid is absent.
 pub fn tc_tid_iter_elem(iter_t: Int) -> Int {
     let tk = type_kind(iter_t)
-    if tk == TyKind.List || tk == TyKind.Set || tk == TyKind.Iterator { return ty_pool.get(iter_t).unwrap().inner1 }
+    if tk == TyKind.List || tk == TyKind.Set || tk == TyKind.Iterator || tk == TyKind.Range { return ty_pool.get(iter_t).unwrap().inner1 }
     if tk == TyKind.Map {
         // A Map's iteration element is the (K, V) pair. make_tuple_type interns, so this is the
         // same tid the pair tuple already has everywhere else — including at codegen, where the
@@ -34432,7 +34474,7 @@ fn tc_tid_same_type_at(a0: Int, b0: Int, open: Bool, holes: Map[Int, Int]) -> Bo
         // The name is a spelling of the kind or of its children, which the slots below compare.
         TyKind.Int | TyKind.Bool | TyKind.Float | TyKind.Str | TyKind.Void | TyKind.Bytes | TyKind.StringBuilder | TyKind.FfiScope | TyKind.Char | TyKind.Never => true
         TyKind.I8 | TyKind.I16 | TyKind.I32 | TyKind.U8 | TyKind.U16 | TyKind.U32 | TyKind.U64 => true
-        TyKind.List | TyKind.Option | TyKind.Set | TyKind.Channel | TyKind.Iterator | TyKind.Raw | TyKind.Ptr | TyKind.Handle | TyKind.Template => true
+        TyKind.List | TyKind.Option | TyKind.Set | TyKind.Channel | TyKind.Iterator | TyKind.Raw | TyKind.Ptr | TyKind.Handle | TyKind.Template | TyKind.Range => true
         TyKind.Result | TyKind.Map | TyKind.Tuple | TyKind.Fn | TyKind.Unknown => true
     }
     if !names_agree { return false }

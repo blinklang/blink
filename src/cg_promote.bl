@@ -50,7 +50,7 @@ import ir.{
 }
 import typecheck.{
     TYPE_BOOL, TYPE_INT, TYPE_STR, TYPE_VOID, TyKind, tc_enum_variant_slots, tc_evar_field_slots,
-    tc_evar_name, tc_evfield_name, tc_evfield_tid, tc_member_tid_at_instance, tc_resolve,
+    tc_evar_name, tc_evfield_name, tc_evfield_tid, tc_member_tid_at_instance, tc_resolve, range_repr_tid,
     tc_sfield_name, tc_sfield_tid, tc_struct_field_slots, tc_tid_child_count,
     tc_tid_decl_node, tc_tid_handler_effect, tc_tid_kind, tc_tid_reaches_itself, tc_type_str,
 }
@@ -148,7 +148,7 @@ pub fn cg_promote_trace_begin(fn_name: Str, span: Int) -> Int ! Diag.Report {
 // The end event, after the scope has made the target current again. -2 when tracing is off.
 pub fn cg_promote_trace_end(fn_name: Str, tid: Int, span: Int) -> Int ! Diag.Report {
     if !promote_trace { return -2 }
-    let desc = if tid < 0 { "" } else { tc_type_str(tc_resolve(tid)) }
+    let desc = if tid < 0 { "" } else { tc_type_str(promote_res(tid)) }
     trace_call(span, "trace_arena_promote_end", fn_name, [text_arg(span, desc)])
 }
 
@@ -301,6 +301,8 @@ fn kind_class(k: TyKind) -> WalkClass {
         TyKind.Option => WalkClass.Carrier
         TyKind.Result => WalkClass.Carrier
         TyKind.Tuple => WalkClass.Tuple
+        // promote_res hands every Range over as its repr tuple, so none reaches this match.
+        TyKind.Range => WalkClass.Tuple
         TyKind.Handler => WalkClass.Vtable
         TyKind.Template => WalkClass.TemplateCopy
         // A Raw[Str] is held as its string, so it moves out of an arena as one.
@@ -317,8 +319,15 @@ fn kind_class(k: TyKind) -> WalkClass {
 // A struct, enum or carrier that layout holds in one word is a transparent newtype, an
 // opaque handle, a payload-less enum or an Option over a handle: nothing in it is arena
 // memory the walk could reach.
-fn walk_class(tid: Int) -> WalkClass {
+// The tid the walk answers for: a Range is walked as the repr tuple it is held as.
+fn promote_res(tid: Int) -> Int {
     let r = tc_resolve(tid)
+    if r >= 0 && tc_tid_kind(r) == TyKind.Range { return tc_resolve(range_repr_tid(r)) }
+    r
+}
+
+fn walk_class(tid: Int) -> WalkClass {
+    let r = promote_res(tid)
     let c = kind_class(tc_tid_kind(r))
     if c == WalkClass.Record || c == WalkClass.Tagged || c == WalkClass.Carrier {
         if tid_is_opaque_handle(r) { return WalkClass.Leaf }
@@ -330,7 +339,7 @@ fn walk_class(tid: Int) -> WalkClass {
 // Whether a value of this type can hold arena memory. A type still being answered is a
 // recursive one, which the walker refuses when it meets it, so it answers yes here.
 pub fn cg_promote_needs_walk(tid: Int) -> Bool {
-    let r = tc_resolve(tid)
+    let r = promote_res(tid)
     match walk_memo.get(r) {
         Some(v) => return v != 0
         None => {}
@@ -416,7 +425,7 @@ fn layout_declined(rec: LayoutRecord, tid: Int, span: Int) -> Bool ! Diag.Report
     let reason = rec.decline_reason
     if reason == "" { return false }
     diag_ice_at("PromoteTypeUnspellable", UNSOLVED_TYPEVAR_AT_CODEGEN,
-        "no C layout for {tc_type_str(tc_resolve(tid))} at an arena boundary: {reason}", span,
+        "no C layout for {tc_type_str(promote_res(tid))} at an arena boundary: {reason}", span,
         "every type that reaches code generation must be concrete and nameable; this is a compiler bug")
     true
 }
@@ -492,14 +501,14 @@ fn walker_for(tid: Int, span: Int) -> Str ! Diag.Report {
     let symbol = if walk_class(tid) == WalkClass.Closure { c_promote_closure_walker_name(tid) } else { c_promote_walker_name(tid) }
     if diag_is_ice_seg(symbol) {
         diag_ice_at("PromoteWalkerUnnamed", UNSOLVED_TYPEVAR_AT_CODEGEN,
-            "no walker name for {tc_type_str(tc_resolve(tid))}: {symbol}", span,
+            "no walker name for {tc_type_str(promote_res(tid))}: {symbol}", span,
             "every type that crosses an arena boundary must be concrete and nameable; this is a compiler bug")
         return ""
     }
     match walker_names.get(symbol) {
         Some(state) => {
             if state == 1 { return symbol }
-            invariant(span, "the arena walker for {tc_type_str(tc_resolve(tid))} reached its own type, and a recursive type is refused before any walker is built")
+            invariant(span, "the arena walker for {tc_type_str(promote_res(tid))} reached its own type, and a recursive type is refused before any walker is built")
             return ""
         }
         None => {}
@@ -539,7 +548,7 @@ fn walk_fixes(w: Walk) -> List[Int] ! Diag.Report {
         WalkClass.ListShell => list_fixes(w)
         WalkClass.MapShell => keyed_fixes(w, true)
         WalkClass.SetShell => keyed_fixes(w, false)
-        WalkClass.FlatShell => [shell_copy(w, if tc_tid_kind(tc_resolve(w.tid)) == TyKind.Bytes { "bytes_copy_shell" } else { "sb_copy_shell" })]
+        WalkClass.FlatShell => [shell_copy(w, if tc_tid_kind(promote_res(w.tid)) == TyKind.Bytes { "bytes_copy_shell" } else { "sb_copy_shell" })]
         WalkClass.Record => record_fixes(w)
         WalkClass.Tagged => tagged_fixes(w)
         WalkClass.Carrier => carrier_fixes(w)
@@ -549,7 +558,7 @@ fn walk_fixes(w: Walk) -> List[Int] ! Diag.Report {
         WalkClass.Vtable => vtable_fixes(w)
         WalkClass.Unsolved => refuse_unsolved(w)
         _ => {
-            invariant(w.span, "a {tc_type_str(tc_resolve(w.tid))} reached the walker builder, which copies no such kind")
+            invariant(w.span, "a {tc_type_str(promote_res(w.tid))} reached the walker builder, which copies no such kind")
             [-1]
         }
     }
@@ -557,7 +566,7 @@ fn walk_fixes(w: Walk) -> List[Int] ! Diag.Report {
 
 fn refuse_unsolved(w: Walk) -> List[Int] ! Diag.Report {
     diag_ice_at("PromoteTypeUnsolved", UNSOLVED_TYPEVAR_AT_CODEGEN,
-        "a value of unsolved type {tc_type_str(tc_resolve(w.tid))} crosses an arena boundary", w.span,
+        "a value of unsolved type {tc_type_str(promote_res(w.tid))} crosses an arena boundary", w.span,
         "every type that reaches code generation must be concrete; this is a compiler bug")
     [-1]
 }
@@ -614,7 +623,7 @@ fn slot_fix(w: Walk, etid: Int, get_helper: Str, set_helper: Str, i: Str) -> Int
 }
 
 fn list_fixes(w: Walk) -> List[Int] ! Diag.Report {
-    let etid = child_tid(tc_resolve(w.tid), Slot.Inner1)
+    let etid = child_tid(promote_res(w.tid), Slot.Inner1)
     let shell = if list_slots_hold_no_pointer(w.tid) { "list_copy_shell_atomic" } else { "list_copy_shell" }
     let mut out: List[Int] = [shell_copy(w, shell)]
     if !slot_walks(etid) { return out }
@@ -628,7 +637,7 @@ fn list_fixes(w: Walk) -> List[Int] ! Diag.Report {
 // A map's keys and values, or a set's items. The shell copy keeps the slot order and the
 // key-operations table, so a promoted key hashes where it sat and nothing rehashes.
 fn keyed_fixes(w: Walk, is_map: Bool) -> List[Int] ! Diag.Report {
-    let r = tc_resolve(w.tid)
+    let r = promote_res(w.tid)
     let prefix = if is_map { "map" } else { "set" }
     let key = child_tid(r, Slot.Inner1)
     let mut out: List[Int] = [shell_copy(w, "{prefix}_copy_shell")]
@@ -678,9 +687,9 @@ fn member_fix(w: Walk, mtid: Int, mrec: LayoutRecord, path: Str) -> Int ! Diag.R
 // A member boxed because it embeds its owner is a recursive type, which E0701 refuses.
 // `path` reads the member, and `label` names it the way the program wrote it.
 fn owned_member_fix(w: Walk, mtid: Int, path: Str, label: Str) -> Int ! Diag.Report {
-    let frec = field_layout_of(tc_resolve(w.tid), mtid)
+    let frec = field_layout_of(promote_res(w.tid), mtid)
     if frec.slot_form == SlotForm.PointerBoxed {
-        invariant(w.span, "field `{label}` of {tc_type_str(tc_resolve(w.tid))} embeds its owner, and a recursive type is refused before any walker is built")
+        invariant(w.span, "field `{label}` of {tc_type_str(promote_res(w.tid))} embeds its owner, and a recursive type is refused before any walker is built")
         return -1
     }
     if !cg_promote_needs_walk(mtid) { return -2 }
@@ -688,7 +697,7 @@ fn owned_member_fix(w: Walk, mtid: Int, path: Str, label: Str) -> Int ! Diag.Rep
 }
 
 fn record_fixes(w: Walk) -> List[Int] ! Diag.Report {
-    let r = tc_resolve(w.tid)
+    let r = promote_res(w.tid)
     let mut out: List[Int] = [value_copy(w)]
     for slot in tc_struct_field_slots(r) {
         let ftid = tc_member_tid_at_instance(tc_sfield_tid(slot), r)
@@ -705,12 +714,12 @@ fn record_fixes(w: Walk) -> List[Int] ! Diag.Report {
 // sub-effect's: the literal copied the rest from the handler it was built over.
 fn vtable_fixes(w: Walk) -> List[Int] ! Diag.Report {
     let span = w.span
-    let r = tc_resolve(w.tid)
+    let r = promote_res(w.tid)
     let promoter = c_vtable_promoter_name(r)
     if !diag_is_ice_seg(promoter) { return [runtime_vtable_copy(w, promoter)] }
     let members = vtable_capture_members(r)
     if members.len() == 0 {
-        invariant(span, "{tc_type_str(tc_resolve(w.tid))} reached the walker builder with no declared operations")
+        invariant(span, "{tc_type_str(promote_res(w.tid))} reached the walker builder with no declared operations")
         return [-1]
     }
     let slot = container_slot_spelling()
@@ -761,7 +770,7 @@ fn vtable_capture_members(r: Int) -> List[Str] {
 }
 
 fn tuple_fixes(w: Walk) -> List[Int] ! Diag.Report {
-    let r = tc_resolve(w.tid)
+    let r = promote_res(w.tid)
     let mut out: List[Int] = [value_copy(w)]
     let mut i = 0
     while i < tc_tid_child_count(r) {
@@ -779,7 +788,7 @@ fn tuple_fixes(w: Walk) -> List[Int] ! Diag.Report {
 // One case per variant whose payload holds arena memory; every other variant is its own
 // copy already.
 fn tagged_fixes(w: Walk) -> List[Int] ! Diag.Report {
-    let r = tc_resolve(w.tid)
+    let r = promote_res(w.tid)
     let decl = tc_tid_decl_node(r)
     if decl < 0 {
         invariant(w.span, "enum {tc_type_str(r)} reached the walker with no declaration")
@@ -818,7 +827,7 @@ fn tagged_fixes(w: Walk) -> List[Int] ! Diag.Report {
 }
 
 fn carrier_fixes(w: Walk) -> List[Int] ! Diag.Report {
-    let r = tc_resolve(w.tid)
+    let r = promote_res(w.tid)
     let mut out: List[Int] = [value_copy(w)]
     let is_option = tc_tid_kind(r) == TyKind.Option
     let tag = if is_option { PROMOTE_TAG_SOME } else { PROMOTE_TAG_OK }
@@ -838,9 +847,9 @@ fn carrier_fixes(w: Walk) -> List[Int] ! Diag.Report {
 // fresh box around its promoted value. -2 when the arm needs nothing.
 fn arm_fix(w: Walk, slot: Slot, tag_text: Str, member: Str) -> Int ! Diag.Report {
     let span = w.span
-    let inner = child_tid(tc_resolve(w.tid), slot)
+    let inner = child_tid(promote_res(w.tid), slot)
     if inner < 0 { return -2 }
-    let mrec = carrier_member_layout(tc_resolve(w.tid), slot)
+    let mrec = carrier_member_layout(promote_res(w.tid), slot)
     let boxed = mrec.slot_form == SlotForm.PointerBoxed
     if !boxed && !cg_promote_needs_walk(inner) { return -2 }
     let fix = if boxed { boxed_member_fix(w, inner, mrec, member) } else { member_fix(w, inner, mrec, member) }
@@ -887,7 +896,7 @@ pub fn cg_promote_capture_table(closure_symbol: Str, names: List[Str], tids: Lis
         if buildable == BUILD_NO && ea_closure_is_promoted(span) {
             let name = names.get(i).unwrap()
             if !ea_refuse_recursive_crossing(span, tid) {
-                invariant(span, "a promoted closure captures `{name}` of {tc_type_str(tc_resolve(tid))}, which has no walker, and no check refused it")
+                invariant(span, "a promoted closure captures `{name}` of {tc_type_str(promote_res(tid))}, which has no walker, and no check refused it")
             }
             return ""
         }
@@ -933,7 +942,7 @@ const BUILD_YES = 1
 
 fn walker_buildable(tid: Int, span: Int) -> Int ! Diag.Report {
     if tid < 0 { return BUILD_NO }
-    let r = tc_resolve(tid)
+    let r = promote_res(tid)
     match buildable_memo.get(r) {
         Some(v) => return v
         None => {}
@@ -1018,7 +1027,7 @@ fn elems_buildable(r: Int, span: Int) -> Int ! Diag.Report {
 fn capture_walker_for(tid: Int, span: Int, is_cell: Bool) -> Str ! Diag.Report {
     let symbol = if is_cell { c_capture_cell_fill_name(tid) } else { c_capture_word_walker_name(tid) }
     if diag_is_ice_seg(symbol) {
-        invariant(span, "a capture of {tc_type_str(tc_resolve(tid))} has a walker but no descriptor entry name: {symbol}")
+        invariant(span, "a capture of {tc_type_str(promote_res(tid))} has a walker but no descriptor entry name: {symbol}")
         return ""
     }
     match walker_names.get(symbol) {

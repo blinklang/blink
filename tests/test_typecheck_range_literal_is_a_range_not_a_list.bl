@@ -1,0 +1,68 @@
+// A range literal has type `Range[T]`, not `List[Int]` and not a tuple. List methods,
+// a `List[Int]` annotation and `==` are refused with the range named in the message;
+// a user type named `Range` does not change what a range literal is.
+
+import std.fs
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_reset}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+import std.io
+
+fn typecheck_probe(path: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    init_embedded_stdlib()
+    write_file(path, src)
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+}
+
+fn error_messages() -> List[Str] {
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" { out.push("{d.name}: {d.message}") }
+    }
+    out
+}
+
+fn errors_of(src: Str) -> List[Str] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS {
+    typecheck_probe("build/test_typecheck_range_literal_probe.bl", src)
+    let errs = error_messages()
+    for e in errs { io.println("  diag: {e}") }
+    errs
+}
+
+fn one_error_saying(errs: List[Str], part: Str) -> Bool {
+    errs.len() == 1 && errs.get(0).unwrap().contains(part)
+}
+
+test "an annotated range let is clean" {
+    let errs = errors_of("fn main() \{\n    let r: Range[Int] = 0..3\n    for i in r \{ io.println(\"\{i}\") }\n}\n")
+    assert_eq(errs.len(), 0)
+}
+
+test "a list method on a range is refused" {
+    let errs = errors_of("fn main() \{\n    let r = 0..3\n    io.println(\"\{r.len()}\")\n}\n")
+    assert(one_error_saying(errs, "Range[Int]"))
+}
+
+test "a range does not fit a List[Int] annotation" {
+    let errs = errors_of("fn main() \{\n    let r: List[Int] = 0..3\n    io.println(\"\{r.len()}\")\n}\n")
+    assert(one_error_saying(errs, "Range[Int]"))
+}
+
+test "a range has no ==" {
+    let errs = errors_of("fn main() \{\n    let e = (0..3) == (0..3)\n    io.println(\"\{e}\")\n}\n")
+    assert(one_error_saying(errs, "Eq"))
+}
+
+test "a user type named Range leaves the range literal a range" {
+    let errs = errors_of("type Range \{ n: Int }\nfn main() \{\n    let r = 0..3\n    io.println(\"\{r.len()}\")\n    let u = Range \{ n: 1 }\n    io.println(\"\{u.n}\")\n}\n")
+    assert(one_error_saying(errs, "`.len` on type Range[Int]"))
+}
+
+test "range bounds of two types are refused" {
+    let errs = errors_of("fn main() \{\n    let r = 0..\"a\"\n    for i in r \{ io.println(\"\{i}\") }\n}\n")
+    assert(one_error_saying(errs, "range bounds must have one type, got Int and Str"))
+}

@@ -20,7 +20,7 @@ import parser.{
     get_annotation, get_str_named_arg, node_value_child_ids, node_type_params,
 }
 import typecheck.{
-    TyKind, TYPE_BOOL, TYPE_CHAR, TYPE_FLOAT, TYPE_INT, TYPE_NEVER, TYPE_STR, TYPE_VOID,
+    TyKind, range_repr_tid, TYPE_BOOL, TYPE_CHAR, TYPE_FLOAT, TYPE_INT, TYPE_NEVER, TYPE_STR, TYPE_VOID,
     tc_call_declared_name, tc_enum_has_payload, tc_global_decl_node, tc_let_binder_is_discard,
     tc_lookup_node_tid, tc_resolve, tc_tid_kind, make_list_type,
     tc_alias_decl_of_ann, tc_ensures_preds_of, tc_is_old_snapshot, tc_requires_preds_of,
@@ -2267,6 +2267,7 @@ fn lower_for_in(node: Int) -> Int ! Diag.Report {
     if node_kind(iter) == NodeKind.RangeLit { return lower_for_range(node, iter) }
     let container = tid_of_node(iter)
     if container < 0 { return ir_block(node, []) }
+    if tc_tid_kind(container) == TyKind.Range { return lower_for_range_value(node, iter, container) }
     let walk = for_in_iteration_of(container, node)
     // The producer reports the iterables it has no entry points for, and answers a shape
     // with no element. Reporting again here would name one gap twice.
@@ -2579,11 +2580,46 @@ fn lower_for_range(node: Int, iter: Int) -> Int ! Diag.Report {
         return -1
     }
     let rec = layout_at(tid, Position.Local, binder)
+    lower_counted(node, iter, tid, rec, lower_value(node_start(iter)), lower_value(node_end(iter)), [], None)
+}
+
+// `for i in r { b }` over a Range value: the value is read once into a local, and the loop
+// counts from its start to its end exactly as a literal range does. Whether the end is in the
+// range is known only at run time, so the stop test reads the stored flag.
+fn lower_for_range_value(node: Int, iter: Int, range_tid: Int) -> Int ! Diag.Report {
+    let _ = open_scope()
+    let binder = node_for_binder(node)
+    let tid = stmt_tid(binder)
+    if tid < 0 {
+        close_scope()
+        return -1
+    }
+    let rec = layout_at(tid, Position.Local, binder)
+    let repr = range_repr_tid(range_tid)
+    let rrec = layout_at(repr, Position.Local, iter)
+    let flag_rec = layout_at(TYPE_BOOL, Position.Local, iter)
+    let range_name = c_mint_local("range")
+    let flag_name = c_mint_local("inclusive")
+    let range_let = ir_let(repr, iter, rrec.c_spelling, range_name, rrec.slot_form, lower_value(iter))
+    let flag_let = ir_let(TYPE_BOOL, iter, flag_rec.c_spelling, flag_name, flag_rec.slot_form,
+        ir_field_get(TYPE_BOOL, iter, flag_rec.c_spelling, tuple_member(2), flag_rec.slot_form,
+            ir_var_ref(repr, iter, rrec.c_spelling, range_name, rrec.slot_form)))
+    let lo = ir_field_get(tid, iter, rec.c_spelling, tuple_member(0), rec.slot_form,
+        ir_var_ref(repr, iter, rrec.c_spelling, range_name, rrec.slot_form))
+    let hi = ir_field_get(tid, iter, rec.c_spelling, tuple_member(1), rec.slot_form,
+        ir_var_ref(repr, iter, rrec.c_spelling, range_name, rrec.slot_form))
+    lower_counted(node, iter, tid, rec, lo, hi, [range_let, flag_let], Some(flag_name))
+}
+
+// The counted loop both range forms share. `flag` is None for a literal range, whose
+// `..` or `..=` is known here, and otherwise names the local holding a range value's flag.
+fn lower_counted(node: Int, iter: Int, tid: Int, rec: LayoutRecord, lo: Int, hi: Int, pre: List[Int], flag: Option[Str]) -> Int ! Diag.Report {
+    let binder = node_for_binder(node)
     let binder_mut = node_is_mut(binder) == 1
     let name = if binder_mut { c_mint_local("counter") } else { cg_local_c_name(node_name(binder)) }
-    let init = ir_let(tid, node, rec.c_spelling, name, rec.slot_form, lower_value(node_start(iter)))
+    let init = ir_let(tid, node, rec.c_spelling, name, rec.slot_form, lo)
     let end_name = c_mint_local("end")
-    let end_let = ir_let(tid, iter, rec.c_spelling, end_name, rec.slot_form, lower_value(node_end(iter)))
+    let end_let = ir_let(tid, iter, rec.c_spelling, end_name, rec.slot_form, hi)
     let first = c_mint_local("first")
     let first_let = ir_let(TYPE_INT, node, int_spelling(node), first, int_form(node), int_const(node, "1"))
     let mut turn: List[Int] = []
@@ -2594,13 +2630,27 @@ fn lower_for_range(node: Int, iter: Int) -> Int ! Diag.Report {
             ir_binary(tid, node, rec.c_spelling, "+",
                 ir_var_ref(tid, node, rec.c_spelling, name, rec.slot_form),
                 ir_const(tid, node, rec.c_spelling, "1")))]))
-    let stop = if node_inclusive(iter) == 1 { ">" } else { ">=" }
+    let stop = if flag.is_some() || node_inclusive(iter) == 1 { ">" } else { ">=" }
     let cond = ir_binary(TYPE_INT, iter, int_spelling(iter), stop,
         ir_var_ref(tid, iter, rec.c_spelling, name, rec.slot_form),
         ir_var_ref(tid, iter, rec.c_spelling, end_name, rec.slot_form))
     let guard = ir_if(iter, cond, ir_block(iter, [ir_break(iter)]), -1)
     turn.push(step)
     turn.push(guard)
+    // A range value stops at its end too unless its flag says the end is in the range.
+    match flag {
+        Some(flag_local) => {
+            let flag_rec = layout_at(TYPE_BOOL, Position.Local, iter)
+            let at_end = ir_binary(TYPE_INT, iter, int_spelling(iter), "==",
+                ir_var_ref(tid, iter, rec.c_spelling, name, rec.slot_form),
+                ir_var_ref(tid, iter, rec.c_spelling, end_name, rec.slot_form))
+            let open_end = ir_unary(TYPE_BOOL, iter, flag_rec.c_spelling, "!",
+                ir_var_ref(TYPE_BOOL, iter, flag_rec.c_spelling, flag_local, flag_rec.slot_form))
+            let end_cond = ir_binary(TYPE_INT, iter, int_spelling(iter), "&&", at_end, open_end)
+            turn.push(ir_if(iter, end_cond, ir_block(iter, [ir_break(iter)]), -1))
+        }
+        None => {}
+    }
     if binder_mut {
         bind_pattern_binder(node, binder, node_name(binder), tid, rec,
             ir_var_ref(tid, node, rec.c_spelling, name, rec.slot_form), turn, true)
@@ -2609,7 +2659,12 @@ fn lower_for_range(node: Int, iter: Int) -> Int ! Diag.Report {
     close_scope()
     if body < 0 { return -1 }
     turn.push(body)
-    ir_block(node, [init, end_let, first_let, ir_loop(node, ir_block(node, turn))])
+    let mut stmts = pre
+    stmts.push(init)
+    stmts.push(end_let)
+    stmts.push(first_let)
+    stmts.push(ir_loop(node, ir_block(node, turn)))
+    ir_block(node, stmts)
 }
 
 // A read of a compiler-minted integer local: a range's first-turn flag, or a walk's index
