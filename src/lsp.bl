@@ -4,7 +4,8 @@ import diagnostics.{Diag, DiagEntry, diag_entries, diag_count, json_escape, diag
 import lsp_protocol.{lsp_frame, lsp_to_zero_based, lsp_end_line, lsp_end_col, lsp_build_diagnostics_json}
 import compiler.{compile_to_program}
 import lexer.{Lex, lex, token_count, token_at, tokens}
-import typecheck.{TypeCheck, tc_hints, HintEntry}
+import typecheck.{TypeCheck, tc_hints, HintEntry, builtin_op_root_of_handle, builtin_op_rows, builtin_op_helpers, builtin_op_helper_module}
+import import_edit.{ImportNeed, import_need}
 import symbol_index.{si_reset, si_build, si_find_sym, si_file_symbols, si_get_ref_locations, si_sym_count, si_sym_name, si_sym_kind, si_sym_sig, si_sym_effects, si_sym_doc, si_sym_requires, si_sym_ensures, si_sym_file, si_sym_line, si_sym_col, si_sym_end_line, si_sym_end_col, si_sym_module, si_sym_param_types, si_dep_from, si_dep_line, si_dep_col, si_dep_name_len, SK_FN, SK_STRUCT, SK_ENUM, SK_TRAIT, SK_LET, sym_kind_name}
 import tokens.{TokenKind}
 import mutation_analysis.{ma_state_len}
@@ -806,6 +807,94 @@ fn lsp_get_prefix_at(line: Int, col: Int) -> Str {
     ""
 }
 
+// The token index of the dot in `{recv}.{prefix}` at the cursor, and the 1-based column where
+// the member ends, or (-1, 0) when the cursor is not after a dot.
+fn lsp_member_dot_at(line: Int, col: Int, prefix: Str) -> (Int, Int) {
+    let mut i = 1
+    while i < token_count() {
+        let t = token_at(i)
+        if t.line == line {
+            let at_member = prefix != "" && t.kind == TokenKind.Ident && t.col + prefix.byte_len() == col && t.value.starts_with(prefix)
+            if at_member && token_at(i - 1).kind == TokenKind.Dot && token_at(i - 1).end_col == t.col {
+                return (i - 1, t.end_col)
+            }
+            if prefix == "" && t.kind == TokenKind.Dot && t.end_col == col { return (i, col) }
+        }
+        i = i + 1
+    }
+    (-1, 0)
+}
+
+// Whether the file binds `name` other than by an import from `module`: a `fn` or `let` of that
+// name, or an import of another module that lists it. An import of the helper would clash.
+fn lsp_file_binds(name: Str, module: Str) -> Bool {
+    let n = token_count()
+    let mut i = 0
+    while i + 1 < n {
+        let k = token_at(i).kind
+        if k == TokenKind.Fn || k == TokenKind.Let {
+            let mut j = i + 1
+            if token_at(j).kind == TokenKind.Mut { j = j + 1 }
+            if j < n && token_at(j).kind == TokenKind.Ident && token_at(j).value == name { return true }
+        }
+        if k == TokenKind.Import {
+            let mut path = ""
+            let mut j = i + 1
+            while j < n && token_at(j).kind == TokenKind.Ident {
+                path = if path == "" { token_at(j).value } else { "{path}.{token_at(j).value}" }
+                j = j + 1
+                if j < n && token_at(j).kind == TokenKind.Dot { j = j + 1 }
+            }
+            if path != module {
+                while j < n && token_at(j).kind != TokenKind.Newline && token_at(j).kind != TokenKind.EOF {
+                    if token_at(j).kind == TokenKind.Ident && token_at(j).value == name { return true }
+                    j = j + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    false
+}
+
+// Completion of `{handle}.{prefix}` for the handle of a builtin effect, such as `rand.sh`: the
+// operations of its root, then each std helper of the root. Accepting a helper calls it by its
+// bare name and imports it, since `rand.<name>` always means the handle (§4.4.7). None when the
+// cursor is not after a handle and a dot.
+fn lsp_handle_member_items(source: Str, line: Int, col: Int, prefix: Str) -> Option[Str] {
+    let (dot, member_end) = lsp_member_dot_at(line, col, prefix)
+    if dot < 1 { return None }
+    let recv = token_at(dot - 1)
+    if recv.kind != TokenKind.Ident || recv.line != line || recv.end_col != token_at(dot).col { return None }
+    if dot >= 2 && token_at(dot - 2).kind == TokenKind.Dot { return None }
+    let root = builtin_op_root_of_handle(recv.value)
+    if root == "" { return None }
+    let mut items: List[Str] = []
+    for row in builtin_op_rows(root) {
+        if row.op.starts_with(prefix) {
+            items.push("\{\"label\":\"{row.op}\",\"kind\":2,\"detail\":\"operation of {root}\"\}")
+        }
+    }
+    let lines = source.split("\n")
+    for name in builtin_op_helpers(root) {
+        let module = builtin_op_helper_module(root, name)
+        if !name.starts_with(prefix) || lsp_file_binds(name, module) { continue }
+        let call = lsp_text_edit_json(line - 1, recv.col - 1, line - 1, member_end - 1, name)
+        let mut detail = "from {module}"
+        let mut more = ""
+        match import_need(lines, module, name) {
+            ImportNeed.Blocked => continue
+            ImportNeed.Present => {}
+            ImportNeed.Add(e) => {
+                detail = "auto-import from {module}"
+                more = ",\"additionalTextEdits\":[{lsp_text_edit_json(e.line - 1, e.col - 1, e.end_line - 1, e.end_col - 1, e.text)}]"
+            }
+        }
+        items.push("\{\"label\":\"{name}\",\"kind\":3,\"detail\":\"{detail}\",\"textEdit\":{call}{more}\}")
+    }
+    Some(items.join(","))
+}
+
 fn lsp_handle_completion(id: Int, root: Int) ! IO, Lex.Tokenize, Diag.Report {
     let uri = lsp_extract_document_uri(root)
     if uri == "" {
@@ -825,6 +914,13 @@ fn lsp_handle_completion(id: Int, root: Int) ! IO, Lex.Tokenize, Diag.Report {
     let line = lsp_line + 1
     let col = lsp_col + 1
     let prefix = lsp_get_prefix_at(line, col)
+    match lsp_handle_member_items(source, line, col, prefix) {
+        Some(items) => {
+            lsp_send_response_int(id, "[{items}]")
+            return
+        }
+        None => {}
+    }
 
     let mut sb = StringBuilder.new()
     sb.write("[")

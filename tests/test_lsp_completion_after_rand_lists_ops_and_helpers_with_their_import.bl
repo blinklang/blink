@@ -1,0 +1,95 @@
+// Completion after `rand.` lists the operations of Rand and the std.random helpers. Accepting
+// a helper rewrites `rand.<name>` to the bare name and adds the import the call needs, merged
+// into an `import std.random.{..}` the file has. A helper whose import would clash with a
+// function of the file is not listed (sections/04_effects.md §4.4.7).
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> ProcessResult {
+    process.run("sh", ["-c", cmd]).unwrap()
+}
+
+fn lsp_msg(body: Str) -> Str {
+    "Content-Length: {body.byte_len()}\r\n\r\n{body}"
+}
+
+// The completion reply for `src` at 0-based line:character.
+fn complete(src: Str, line: Int, character: Int) -> Str {
+    let dir = sh("mktemp -d /tmp/blink_lsp_rand_complete.XXXXXX").out.trim()
+    write_file("{dir}/deal.bl", src)
+    let td = "\"textDocument\":\{\"uri\":\"file://{dir}/deal.bl\"}"
+    let input = [
+        lsp_msg(#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{}}}"#),
+        lsp_msg(#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#),
+        lsp_msg("\{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":\{{td}}}"),
+        lsp_msg("\{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"textDocument/completion\",\"params\":\{{td},\"position\":\{\"line\":{line},\"character\":{character}}}}"),
+        lsp_msg(#"{"jsonrpc":"2.0","id":3,"method":"shutdown","params":null}"#),
+        lsp_msg(#"{"jsonrpc":"2.0","method":"exit","params":{}}"#),
+    ].join("")
+    write_file("{dir}/input.bin", input)
+    let r = sh("B=$(pwd)/build/blink; cd {dir} && timeout 60 $B lsp < input.bin")
+    let _ = sh("rm -rf {dir}")
+    let at = r.out.byte_index_of("\"id\":2", 0) ?? 0
+    r.out.byte_slice(at, r.out.byte_len())
+}
+
+fn deal_src(call: Str) -> Str {
+    "fn deal(deck: List[Int]) -> List[Int] ! Rand \{\n    {call}\n}\n"
+}
+
+fn edit(line: Int, start: Int, end: Int, text: Str) -> Str {
+    "\{\"range\":\{\"start\":\{\"line\":{line},\"character\":{start}},\"end\":\{\"line\":{line},\"character\":{end}}},\"newText\":\"{text}\"}"
+}
+
+fn op(name: Str) -> Str {
+    "\{\"label\":\"{name}\",\"kind\":2,\"detail\":\"operation of Rand\"}"
+}
+
+// A helper item. One that needs its import says so in its detail.
+fn helper(name: Str, call_edit: Str, more: Str) -> Str {
+    let extra = if more == "" { "" } else { ",\"additionalTextEdits\":[{more}]" }
+    let detail = if more == "" { "from std.random" } else { "auto-import from std.random" }
+    "\{\"label\":\"{name}\",\"kind\":3,\"detail\":\"{detail}\",\"textEdit\":{call_edit}{extra}}"
+}
+
+fn check(got: Str, want: Str) {
+    if !got.contains(want) { io.eprintln("want: {want}\ngot: {got}") }
+    assert(got.contains(want))
+}
+
+test "rand. lists the three operations, then each helper with its import" {
+    let got = complete(deal_src("rand."), 1, 9)
+    let import_shuffle = edit(0, 0, 0, "import std.random.\{shuffle}\\n\\n")
+    let import_choice = edit(0, 0, 0, "import std.random.\{choice}\\n\\n")
+    check(got, "\"result\":[{op("int")},{op("float")},{op("bytes")},{helper("shuffle", edit(1, 4, 9, "shuffle"), import_shuffle)},{helper("choice", edit(1, 4, 9, "choice"), import_choice)}]")
+}
+
+test "a typed prefix keeps the items that start with it and rewrites through the cursor" {
+    let got = complete(deal_src("rand.sh"), 1, 11)
+    check(got, "\"result\":[{helper("shuffle", edit(1, 4, 11, "shuffle"), edit(0, 0, 0, "import std.random.\{shuffle}\\n\\n"))}]")
+}
+
+test "an import of std.random gets the helper merged in, and an imported helper needs no edit" {
+    let src = "import std.random.\{choice}\n\n".concat(deal_src("rand."))
+    let got = complete(src, 3, 9)
+    check(got, helper("shuffle", edit(3, 4, 9, "shuffle"), edit(0, 25, 25, ", shuffle")))
+    check(got, helper("choice", edit(3, 4, 9, "choice"), ""))
+}
+
+test "a helper named like a function of the file is not listed" {
+    let src = deal_src("rand.").concat("\nfn shuffle(xs: List[Int]) -> List[Int] \{\n    xs\n}\n")
+    let got = complete(src, 1, 9)
+    check(got, "{op("bytes")},{helper("choice", edit(1, 4, 9, "choice"), edit(0, 0, 0, "import std.random.\{choice}\\n\\n"))}]")
+    assert(!got.contains("\"label\":\"shuffle\""))
+}
+
+test "a member of a value that is not the handle gets no Rand items" {
+    let got = complete(deal_src("deck."), 1, 9)
+    assert(!got.contains("operation of Rand"))
+    assert(!got.contains("auto-import"))
+}
+
+test "rand after a dot is a field, not the handle" {
+    let got = complete(deal_src("deck.rand."), 1, 14)
+    assert(!got.contains("operation of Rand"))
+}
