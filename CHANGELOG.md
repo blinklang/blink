@@ -23,7 +23,7 @@ Single source of truth for release history. `blink llms` and `blink llms --full`
   - A scope pointer passed beside an argument that can hold pointers, or stored through a field path or tuple field of an outer `let mut`, is E0601.
   - An open variant that no binding fixes (`let x = Box.Vacant`) is E0301. A variant that declares both unnamed and named fields is E0320.
   - A paren payload is checked by position and label (E0315, E0316, E0527).
-- **A range literal is a `Range[T]` value, not a `List[Int]`.** `let r = 0..3` has type `Range[Int]`. You can pass it to a function, return it, keep it in a list and walk it with `for`. List methods on a range, such as `r.len()`, are errors, and so is a `List[Int]` annotation on a range literal. A range has no `==`. Both bounds must have one type.
+- **A range literal is a `Range[T]` value, not a `List[Int]`.** `let r = 0..3` has type `Range[Int]`. You can pass it to a function, return it, keep it in a list and walk it with `for`. List methods on a range, such as `r.len()`, are errors, and so is a `List[Int]` annotation on a range literal. Two ranges compare with `==` by start, end and inclusive flag, so `0..3 == 0..3` and `0..3 != 0..=2`. A range has no `<` and no `Hash`. Both bounds must have one type.
 - **Unary `-` over a literal tree at an unsigned type is an error.** `-(2 * 3)` is a call to `Neg`, which unsigned types do not have, so `u + -(2 * 3)` with `u: U8` is a type error.
 
 ## What's New (v0.59.0)
