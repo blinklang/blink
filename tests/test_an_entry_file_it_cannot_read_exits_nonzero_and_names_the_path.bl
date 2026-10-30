@@ -1,0 +1,97 @@
+// A source file that is there but cannot be read is not an empty program. The command says
+// which path and why, and it exits nonzero instead of compiling or formatting nothing. The
+// LSP sends the error to the client and goes on.
+
+import compile_test_helpers
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> Str {
+    process.run("sh", ["-c", cmd]).unwrap().out.trim()
+}
+
+fn as_root() -> Bool {
+    sh("id -u") == "0"
+}
+
+let MAIN: Str = "fn main() \{\nio.println(\"hi\")\n\}\n"
+
+// A dir that holds a main.bl that no one may read.
+fn locked_main(name: Str) -> Str ! FS.Write {
+    let d = "{compile_test_helpers.scratch_root()}/_entryread_{name}_{getpid()}"
+    sh("rm -rf {d} && mkdir -p {d}")
+    fs.write("{d}/main.bl", MAIN).unwrap()
+    sh("chmod 000 {d}/main.bl")
+    d
+}
+
+fn unlock(d: Str) -> Str ! FS.Read {
+    sh("chmod 644 {d}/main.bl")
+    let text = fs.read("{d}/main.bl").unwrap()
+    sh("rm -rf {d}")
+    text
+}
+
+fn assert_names_the_read_error(r: ProcessResult, path: Str) {
+    let text = "{r.out}{r.err_out}"
+    assert(!r.success(), "the command answered success:\n{text}")
+    assert(text.contains("read {path}: Permission denied"), "the error does not name the path and the cause:\n{text}")
+    assert(!text.contains("internal compiler error"), "a read error is not a compiler bug:\n{text}")
+}
+
+test "blinkc of an entry file it cannot read exits nonzero and names the path" {
+    if as_root() { return }
+    let d = locked_main("blinkc")
+    let r = process.run("build/blinkc", ["{d}/main.bl", "{d}/main.c"]).unwrap()
+    let _ = unlock(d)
+    assert_names_the_read_error(r, "{d}/main.bl")
+}
+
+test "blink check of an entry file it cannot read exits nonzero and names the path" {
+    if as_root() { return }
+    let d = locked_main("check")
+    let r = process.run("build/blink", ["check", "{d}/main.bl"]).unwrap()
+    let _ = unlock(d)
+    assert_names_the_read_error(r, "{d}/main.bl")
+}
+
+test "blink fmt of a file it cannot read exits nonzero and leaves the file" {
+    if as_root() { return }
+    let d = locked_main("fmt")
+    let r = process.run("build/blink", ["fmt", "{d}/main.bl"]).unwrap()
+    let after = unlock(d)
+    assert_names_the_read_error(r, "{d}/main.bl")
+    assert_eq(after, MAIN)
+}
+
+test "blink build of an entry file it cannot read exits nonzero and names the path" {
+    if as_root() { return }
+    let d = locked_main("build")
+    let r = process.run("build/blink", ["build", "-o", "{d}/main", "{d}/main.bl"]).unwrap()
+    let _ = unlock(d)
+    assert_names_the_read_error(r, "{d}/main.bl")
+    assert(!"{r.out}{r.err_out}".contains("ModuleNotFound"), "a CLI command prints the plain error line:\n{r.out}{r.err_out}")
+}
+
+fn lsp_msg(body: Str) -> Str {
+    "Content-Length: {body.byte_len()}\r\n\r\n{body}"
+}
+
+test "the lsp sends an entry file it cannot read to the client and goes on" {
+    if as_root() { return }
+    let d = locked_main("lsp")
+    let uri = "file://{d}/main.bl"
+    let init = lsp_msg("\{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":\{\"capabilities\":\{\}\}\}")
+    let open = lsp_msg("\{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":\{\"textDocument\":\{\"uri\":\"{uri}\",\"languageId\":\"blink\",\"version\":1,\"text\":\"\"\}\}\}")
+    let shutdown = lsp_msg("\{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"shutdown\",\"params\":null\}")
+    let exit_msg = lsp_msg("\{\"jsonrpc\":\"2.0\",\"method\":\"exit\",\"params\":\{\}\}")
+    fs.write("{d}/open.bin", init.concat(open)).unwrap()
+    fs.write("{d}/end.bin", shutdown.concat(exit_msg)).unwrap()
+    let _ = sh("B=$(pwd)/build/blink; cd {d} && ( cat open.bin; for i in $(seq 1 400); do grep -q published lsp.err 2>/dev/null && break; sleep 0.05; done; cat end.bin ) | timeout 60 $B lsp > lsp.out 2> lsp.err")
+    let out = fs.read("{d}/lsp.out").unwrap()
+    let _ = unlock(d)
+    assert(out.contains("textDocument/publishDiagnostics"), out)
+    assert(out.contains("\"code\":\"E1200\""), out)
+    assert(out.contains("read {d}/main.bl: Permission denied"), out)
+    // The answer to shutdown: the server did not exit on the read error.
+    assert(out.contains("\"id\":2"), out)
+}
