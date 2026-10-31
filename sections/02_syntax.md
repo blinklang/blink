@@ -229,7 +229,24 @@ Rules:
 - No interpolation, no escape processing on file contents
 - Type is `Str`. Works everywhere `Str` works
 - Compile error E1108 if file not found
+- Compile error E1025 (`FileReadFailed`) if the file is there but cannot be read: no permission, a directory, a read error. The span is the argument. The message and the rule that splits E1025 from E1108 are in §10.5 *Files That Exist but Cannot Be Read*. An E1025 on an `#embed` file gets no help line
 - Argument must be a string literal (no variables, no interpolation)
+
+If `sql/schema.sql` is there but cannot be read (mode `000`):
+
+```blink
+const SCHEMA: Str = #embed("sql/schema.sql")
+```
+
+```
+error[FileReadFailed]: read src/sql/schema.sql: Permission denied
+  --> src/main.bl:1:28
+  |
+1 | const SCHEMA: Str = #embed("sql/schema.sql")
+  |                            ^^^^^^^^^^^^^^^^
+```
+
+If there is no `sql/schema.sql`, the error is E1108.
 
 When to use `#embed` vs inline strings:
 - **Inline**: short strings, strings needing interpolation

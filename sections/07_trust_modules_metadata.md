@@ -3536,7 +3536,7 @@ External packages are namespaced by their registry org/name (§8.9.2, §8.9.7). 
 2. Check dependencies declared in `blink.toml` (resolved via `blink.lock`)
 3. No match → compile error
 
-Local modules shadow dependencies with the same name. This is intentional — it allows wrapping a dependency without changing consumer imports. The compiler emits a warning when shadowing occurs:
+Local modules shadow dependencies with the same name. This is intentional — it allows wrapping a dependency without changing consumer imports. A local file that is there but cannot be read still shadows the dependency: the result is E1025, and the dependency is not loaded (*Files That Exist but Cannot Be Read* below). The compiler emits a warning when shadowing occurs:
 
 ```
 warning[W1000]: local module shadows dependency
@@ -3547,6 +3547,96 @@ warning[W1000]: local module shadows dependency
   |
   = help: this is allowed but may confuse consumers expecting the library
 ```
+
+#### Files That Exist but Cannot Be Read
+
+A file can be there and still not be readable: the host can refuse the read, the path can name a directory, or the disk can fail. The toolchain gives this fault its own code, `FileReadFailed` (E1025). It is not `ModuleNotFound` (E1200). The fix for E1200 is a change to an import or to the dependencies. The fix for E1025 is a change to the file, to its directory or to the disk. One code covers every file that the toolchain reads: an imported `.bl` file, the entry file, `blink.toml`, `blink.lock`, `audits.toml` and an `#embed` file (§2.4.1).
+
+**Where the line falls between E1200 and E1025.** The result of opening the path decides. The toolchain opens each candidate path once. It does not test the path first and open it later.
+
+- The host says that no file has this path (ENOENT), or that a part of the path before the last part is a file and not a directory (ENOTDIR). The file is not here. The search goes on with the next candidate in the order of *Resolution Algorithm*. When no candidate is left, the result is E1200 (E1108 for an `#embed` file).
+- The host gives any other error when the path is opened or read (for example EACCES, EISDIR, EIO or ELOOP). The file is there. The search stops, and the result is E1025. The toolchain does not try the next candidate. A local `src/m.bl` that cannot be read does not let a dependency named `m` load. Which module a name means depends on which files exist, not on whether the host lets the toolchain read them.
+- A signal that interrupts the call (EINTR) is not an error: the toolchain repeats the call. A read that returns fewer bytes than the file holds is not an error: the toolchain reads on to the end of the file.
+- A link is followed. A link whose target does not exist gives ENOENT, so the file is not here. A link that leads back to itself gives ELOOP, so the result is E1025.
+
+A port to a host with other error numbers maps each error of that host onto this rule: "no file has this path" and "a part of the path is a file" are not here, and every other error stops the search.
+
+**Where E1025 is reported.**
+
+| File | Span |
+|------|------|
+| An imported `.bl` file | The module path of the import (`m` in `import m`) |
+| An `#embed` file | The argument of `#embed` |
+| The entry file, `blink.toml`, `blink.lock`, `audits.toml` | None. The diagnostic names the file that cannot be read |
+
+The message starts `read <path>: <text from the host>`. The path has no backticks. The text from the host changes with the host and the locale, so a tool matches on the name or the code and never on that text. The diagnostic is always in structured output (`--json`), and the exit code is `1`.
+
+**Help.** A help line is given only for an error that has one sure repair. EISDIR on an import has one: the path names a directory, and a module is one `.bl` file. The help is "a module is one `.bl` file, not a directory". It does not appear for ENOTDIR or ELOOP, and it does not appear for an `#embed` file or a TOML file. EACCES has no one repair: the cause can be the mode of the file, a directory above it that cannot be searched, or a security policy of the host. EIO has no repair. These errors, and all others, get the head line only.
+
+An imported module that exists but cannot be read (`src/m.bl` has mode `000`):
+
+```blink
+import m
+
+fn main() {
+    m.greet()
+}
+```
+
+```
+error[FileReadFailed]: read src/m.bl: Permission denied
+  --> src/main.bl:1:8
+  |
+1 | import m
+  |        ^
+```
+
+The exit code is `1`. This is the only diagnostic: `UnusedImport` (W0602) does not fire, and `m.greet()` gets none (*After a failed import* below).
+
+An imported module whose path is a directory (`src/m.bl` is a directory):
+
+```
+error[FileReadFailed]: read src/m.bl: Is a directory
+  --> src/main.bl:1:8
+  |
+1 | import m
+  |        ^
+  = help: a module is one `.bl` file, not a directory
+```
+
+A local file that cannot be read, with a dependency of the same name. `blink.toml` has `m = { path = "../m" }` in `[dependencies]`, and `src/m.bl` has mode `000`. The result is the same E1025 as the first example. The dependency `m` is not loaded. If `src/m.bl` were not there, `import m` would load the dependency.
+
+**The entry file.** The entry file is the file that a command names, or the file that the language server opens. An entry file that is there but cannot be read gives E1025 with no span, in the command line tools, in the language server and in the daemon. The command line tools exit with code `1`. The language server and the daemon do not exit.
+
+```
+$ blink check src/main.bl        # src/main.bl has mode 000
+error[FileReadFailed]: read src/main.bl: Permission denied
+```
+
+A command that names an entry file that does not exist has a usage error. The tool prints the error as text on standard error, with no code, and nothing goes to the `--json` stream. The exit code is `2`, as for a path that does not exist in `blink test` (§8.10.7).
+
+```
+$ blink check src/nope.bl
+error: file not found: src/nope.bl
+$ echo $?
+2
+```
+
+**After a failed import.** An import that fails, with E1200 or with E1025, binds its module name to a poison module (§6.3.5). `UnusedImport` (W0602) does not fire on the import, and a use of `m.x` gives no diagnostic.
+
+```blink
+import zz                 // no src/zz.bl, and no dependency zz
+
+fn main() {
+    zz.greet()
+}
+```
+
+```
+error[ModuleNotFound]: module not found: zz
+```
+
+The output holds this one error (the head is shown, and the message may say more) and no other: not W0602 on `import zz`, and nothing at `zz.greet()`. An import that fails with E1025 gives the same result.
 
 #### Package Entry Resolution
 

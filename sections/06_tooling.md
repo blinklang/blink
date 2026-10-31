@@ -774,6 +774,13 @@ W1001 and unknown-key diagnostics in the same manifest are still reported. For `
 
 **TOML syntax.** `TomlSyntax` (E1024) is the one code for a TOML file that does not parse. Every TOML file that the toolchain reads uses it: `blink.toml`, `audits.toml` (§9.1) and `blink.lock` (§8.9.6). The message names the file. A file that does not parse gives no data: a `blink.toml` that does not parse stops the load, and an `audits.toml` that does not parse gives no audit records. The build fails. The `.bl` files are still checked in the same run.
 
+A TOML file that is there but cannot be read is a different fault: it is `FileReadFailed` (E1025), for the same three files (§10.5 *Files That Exist but Cannot Be Read*). The diagnostic has no span, and its message names the file. A file that is not there is not E1025.
+
+```
+$ chmod 000 blink.toml && blink check src/main.bl
+error[FileReadFailed]: read blink.toml: Permission denied
+```
+
 The toolchain reports the first syntax error of a file and nothing else about that file. A table or a key that the file defines twice is also `TomlSyntax`, never a merge. The span is the second definition, and a `note:` names the position of the first. The toolchain reports duplicates only when the file has no other syntax error. In a file that parses, it reports every duplicate table and every duplicate key, in source order.
 
 ```toml

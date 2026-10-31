@@ -527,7 +527,7 @@ error[UndefinedFunction]: undefined function `List`
   = help: an empty list is `[]`; the annotation or a later use gives the element type
 ```
 
-When a missing import causes cascading errors (one unresolved name triggers many downstream failures), the compiler applies cascade suppression: downstream references to a poison symbol suppress their own diagnostics. A pattern or a construction that names a variant its enum does not declare (`NoSuchVariant`, §3.5 *Pattern Forms*) also makes poison: each binder under the pattern, and each binding of the construction's value, has the poison type. An error count cap (~20 errors) prevents terminal flooding.
+When a missing import causes cascading errors (one unresolved name triggers many downstream failures), the compiler applies cascade suppression: downstream references to a poison symbol suppress their own diagnostics. A pattern or a construction that names a variant its enum does not declare (`NoSuchVariant`, §3.5 *Pattern Forms*) also makes poison: each binder under the pattern, and each binding of the construction's value, has the poison type. An import that fails, with `ModuleNotFound` (E1200) or `FileReadFailed` (E1025), also makes poison: the module name binds a poison module, a use of `m.x` has the poison type, and the import gets no `UnusedImport` (W0602). An error count cap (~20 errors) prevents terminal flooding.
 
 ### 6.4 Compiler-as-Service Daemon Architecture
 
