@@ -1,0 +1,138 @@
+// At a call whose callee row has `_`, the caller is charged, for each type parameter of the
+// callee, the impl rows of the type argument for each method with a `_` row in the
+// parameter's bound, supertraits included (sections/04_effects.md §4.15.3). The charge reads
+// the signature only. A type argument whose own impl has a `_` row brings the rows of its
+// own type arguments, as `Guard[T]` does.
+
+import compile_test_helpers
+
+fn base_src() -> Str {
+    #"effect Note { effect Say { fn say(s: Str) } }
+type R { n: Int }
+impl Closeable for R {
+    fn close(self) ! Note.Say { note.say("close {self.n}") }
+}
+type P { n: Int }
+impl Closeable for P {
+    fn close(self) { }
+}
+type Guard[T] { inner: T }
+impl[T: Closeable] Closeable for Guard[T] {
+    fn close(self) ! _ { self.inner.close() }
+}
+fn shut[T: Closeable](t: T) ! _ { t.close() }
+"#
+}
+
+fn with_base(body: Str) -> Str {
+    "{base_src()}{body}"
+}
+
+fn count(text: Str, part: Str) -> Int {
+    text.split(part).len() - 1
+}
+
+test "a call with a concrete type argument is charged that impl's close row" {
+    let src = with_base(#"fn pure() { shut(R { n: 1 }) }
+fn main() { }
+"#)
+    let out = compile_test_helpers.compile_and_capture(src, "wild_call_concrete_missing")
+    compile_test_helpers.expect_error(out, "E0500", "shut(R) needs Note.Say")
+    compile_test_helpers.expect_contains(out, "call to `shut` needs effect `Note.Say`, which `pure` does not declare", "the charge is R's row")
+    compile_test_helpers.expect_contains(out, "\"line\":15,\"col\":13", "the diagnostic points at the call")
+    assert_eq(count(out, "needs effect `_`"), 0)
+    assert_eq(count(out, "\"code\":\"E0500\""), 1)
+}
+
+test "a caller that declares the type argument's row compiles clean" {
+    let src = with_base(#"fn logs() ! Note.Say { shut(R { n: 1 }) }
+fn parent() ! Note { shut(R { n: 2 }) }
+fn main() { }
+"#)
+    let out = compile_test_helpers.compile_and_capture(src, "wild_call_concrete_held")
+    compile_test_helpers.expect_compiles_clean(out, "the row holds R's close row")
+}
+
+test "a type argument whose close has no row charges nothing" {
+    let src = with_base(#"fn pure() { shut(P { n: 1 }) }
+fn pure_guard() { shut(Guard { inner: P { n: 1 } }) }
+fn main() { }
+"#)
+    let out = compile_test_helpers.compile_and_capture(src, "wild_call_pure_arg")
+    compile_test_helpers.expect_compiles_clean(out, "P's close is pure")
+}
+
+test "a type argument with a _ impl row brings its own type argument's row" {
+    let src = with_base(#"fn by_call() { shut(Guard { inner: R { n: 1 } }) }
+fn by_item() {
+    with Guard { inner: R { n: 1 } } as _g { let _ = 0 }
+}
+fn by_method() {
+    let g = Guard { inner: R { n: 1 } }
+    g.close()
+}
+fn main() { }
+"#)
+    let out = compile_test_helpers.compile_and_capture(src, "wild_call_guard_forwards")
+    compile_test_helpers.expect_contains(out, "which `by_call` does not declare", "the call through shut is charged R's row")
+    compile_test_helpers.expect_contains(out, "which `by_item` does not declare", "the with item is charged R's row")
+    compile_test_helpers.expect_contains(out, "which `by_method` does not declare", "the direct close is charged R's row")
+    assert_eq(count(out, "needs effect `Note.Say`"), 3)
+    assert_eq(count(out, "\"code\":\"E0500\""), 3)
+    assert_eq(count(out, "effect `_`"), 0)
+}
+
+test "a bound reaches close through a supertrait" {
+    let src = with_base(#"trait Named: Closeable { fn name(self) -> Str }
+impl Named for R { fn name(self) -> Str { "r" } }
+fn shut_named[T: Named](t: T) ! _ { t.close() }
+fn pure() { shut_named(R { n: 1 }) }
+fn main() { }
+"#)
+    let out = compile_test_helpers.compile_and_capture(src, "wild_call_supertrait")
+    compile_test_helpers.expect_contains(out, "call to `shut_named` needs effect `Note.Say`", "Named brings Closeable's close")
+    assert_eq(count(out, "\"code\":\"E0500\""), 1)
+}
+
+test "a callee with no _ in its row charges no type argument's row" {
+    let src = with_base(#"fn keep[T: Closeable](_t: T) -> Int { 1 }
+fn pure() -> Int { keep(R { n: 1 }) }
+fn main() { }
+"#)
+    let out = compile_test_helpers.compile_and_capture(src, "wild_call_no_wild_in_callee")
+    compile_test_helpers.expect_compiles_clean(out, "keep has no _, so R's row is not charged")
+}
+
+test "a generic caller passing its own type parameter needs ! _" {
+    let src = with_base(#"fn outer[T: Closeable](t: T) { shut(t) }
+fn outer_ok[T: Closeable](t: T) ! _ { shut(t) }
+fn main() { }
+"#)
+    let out = compile_test_helpers.compile_and_capture(src, "wild_call_generic_caller")
+    compile_test_helpers.expect_contains(out, "call to `shut` needs effect `_`, which `outer` does not declare", "T stands for any impl")
+    assert_eq(count(out, "\"code\":\"E0500\""), 1)
+}
+
+test "a ! _ generic fn runs the close of the impl it is called with" {
+    let src = #"type R { n: Int }
+impl Closeable for R {
+    fn close(self) ! IO.Print { io.println("close {self.n}") }
+}
+type Guard[T] { inner: T }
+impl[T: Closeable] Closeable for Guard[T] {
+    fn close(self) ! _ { self.inner.close() }
+}
+fn shut[T: Closeable](t: T) ! _ { t.close() }
+fn hold[T: Closeable](t: T) ! _ {
+    with t as _x { io.println("body") }
+}
+fn main() ! IO.Print {
+    shut(R { n: 1 })
+    hold(R { n: 2 })
+    shut(Guard { inner: R { n: 3 } })
+}
+"#
+    let r = compile_test_helpers.compile_and_run(src, "wild_call_runs")
+    assert_eq(r.exit_code, 0)
+    assert_eq(r.out, "close 1\nbody\nclose 2\nclose 3\n")
+}

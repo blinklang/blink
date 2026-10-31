@@ -1406,7 +1406,23 @@ with open_resource("a") as a, open_resource("b") as b {
 }
 ```
 
-A type parameter is a scoped value only when a bound makes it one: `fn hold[T: Closeable](t: T) { with t { ... } }` is accepted, and `fn hold[T](t: T) { with t { ... } }` is E0839. In a generic body the Context is abstract, so a `with t` there installs no handler.
+A type parameter is a scoped value only when a bound makes it one: `fn hold[T: Closeable](t: T) ! _ { with t { ... } }` is accepted, and `fn hold[T](t: T) { with t { ... } }` is E0839. In a generic body the Context is abstract, so a `with t` there installs no handler.
+
+`close`, `enter` and `exit` have the impl-chosen row `! _`: each impl names the effects it performs. A `with` item of a concrete type is charged the row of its impl. A `with t`, or a `t.close()`, through a type parameter can run any impl, so the fn must declare `! _` (E0500 with the help "add `! _`" if it does not). A call of such a fn is charged the impl rows of its type arguments:
+
+```blink
+type Log { name: Str }
+
+impl Closeable for Log {
+    fn close(self) ! IO.Print { io.println("closed {self.name}") }
+}
+
+fn shut[T: Closeable](t: T) ! _ { t.close() }
+
+fn main() ! IO.Print {
+    shut(Log { name: "a" })  // charged Log.close's row: IO.Print
+}
+```
 
 ## BlockHandler Trait & Scoped Blocks
 
@@ -1415,8 +1431,8 @@ Types that implement `BlockHandler` (from `std.traits`) provide scoped enter/exi
 ```blink
 pub trait BlockHandler {
     type Context
-    fn enter(self) -> Self.Context
-    fn exit(self, ok: Bool)
+    fn enter(self) -> Self.Context ! _
+    fn exit(self, ok: Bool) ! _
 }
 
 // Example: database transactions
@@ -1454,8 +1470,8 @@ Traits can declare associated type members with `type Name`. Implementers must d
 ```blink
 trait BlockHandler {
     type Context                    // associated type declaration
-    fn enter(self) -> Self.Context  // used in method signatures
-    fn exit(self, ok: Bool)
+    fn enter(self) -> Self.Context ! _  // used in method signatures
+    fn exit(self, ok: Bool) ! _
 }
 
 impl BlockHandler for Transaction {

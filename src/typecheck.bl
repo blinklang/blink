@@ -36221,15 +36221,40 @@ fn tc_er_op_effect(ed: Int, op: Int) -> Str {
     node_name(ed)
 }
 
-fn tc_er_require(program: Int, site: Int, held: List[Str], owner: Str, callee: Str, req: Str) ! Diag.Report {
+// The fn whose body the effect-row walk is in, as diagnostics name it.
+type ErOwner {
+    name: Str
+    // A trait method's default body, whose `_` holds nothing (see tc_er_walk_fn).
+    default_body: Bool
+}
+
+// The `_` of a default body holds nothing (see tc_er_walk_fn), so no `! _` can help it.
+fn tc_er_default_body_help(owner: Str) -> Str {
+    "a default body runs for each impl that does not override `{owner}`, and a call through that impl is charged no row for it; perform impl-chosen effects in each impl's own `{owner}`"
+}
+
+fn tc_er_require(program: Int, site: Int, held: List[Str], owner: ErOwner, callee: Str, req: Str) ! Diag.Report {
     if tc_er_satisfied(program, held, req) { return }
+    if req == "_" && owner.default_body {
+        diag_error_at("UndeclaredEffect", UNDECLARED_EFFECT,
+            "call to `{callee}` needs effect `_`, which the default body of `{owner.name}` may not perform", site,
+            tc_er_default_body_help(owner.name))
+        return
+    }
+    if req == "_" {
+        diag_error_at("UndeclaredEffect", UNDECLARED_EFFECT,
+            "call to `{callee}` needs effect `_`, which `{owner.name}` does not declare", site,
+            "add `! _` to `{owner.name}`: `{callee}` has an impl-chosen row, so the call runs the row of whichever impl the type parameter stands for")
+        diag_set_last_fix("add effect", req)
+        return
+    }
     diag_error_at("UndeclaredEffect", UNDECLARED_EFFECT,
-        "call to `{callee}` needs effect `{req}`, which `{owner}` does not declare", site,
-        "add `{req}` to the `!` list of `{owner}`, or make the call inside a `with` block that provides it")
+        "call to `{callee}` needs effect `{req}`, which `{owner.name}` does not declare", site,
+        "add `{req}` to the `!` list of `{owner.name}`, or make the call inside a `with` block that provides it")
     diag_set_last_fix("add effect", req)
 }
 
-fn tc_er_check_call(program: Int, node: Int, held: List[Str], owner: Str) ! Diag.Report {
+fn tc_er_check_call(program: Int, node: Int, held: List[Str], owner: ErOwner) ! TypeCheck.Resolve, Diag.Report {
     let decl = tc_call_decl_node(node)
     if decl < 0 { return }
     match tc_ue_op_root.get(decl) {
@@ -36239,6 +36264,23 @@ fn tc_er_check_call(program: Int, node: Int, held: List[Str], owner: Str) ! Diag
         }
         None => {}
     }
+    // A call through a bound reaches the trait's own declaration, which registers no row in
+    // its signature, so the row is read off the declaration. `_` there is opaque: the type
+    // parameter stands for every impl (§4.15.3).
+    let block = tc_method_block.get(decl) ?? -1
+    if block != -1 && node_kind(block) == NodeKind.TraitDef {
+        // `Closeable.close(r)` names the trait but runs the impl of a concrete `r`.
+        let recv = tc_er_call_receiver(node)
+        if recv >= 0 && tc_tid_kind(recv) != TyKind.Typevar {
+            for req in tc_er_impl_row(recv, decl, 0) { tc_er_require(program, node, held, owner, node_name(decl), req) }
+            return
+        }
+        let shown = "{tc_er_receiver_shown(node, block)}.{node_name(decl)}"
+        for req in tc_er_fn_row(decl) {
+            if req != "FFI" && !req.starts_with("FFI.") { tc_er_require(program, node, held, owner, shown, req) }
+        }
+        return
+    }
     let idx = fnsig_by_decl.get(decl) ?? -1
     if idx < 0 { return }
     let fs = fnsig_pool.get(idx).unwrap()
@@ -36247,11 +36289,234 @@ fn tc_er_check_call(program: Int, node: Int, held: List[Str], owner: Str) ! Diag
         let req = fnsig_effect_names.get(fs.effects_start + i).unwrap()
         // FFI is left out until the owner rules on whether @trusted discharges it; reporting
         // it now, or making the lib wrappers declare it, would settle that question here.
-        if req != "FFI" && !req.starts_with("FFI.") {
+        if req == "_" {
+            for w in tc_er_wild_row(decl, tc_er_call_binds(node, decl), 0) {
+                tc_er_require(program, node, held, owner, node_name(decl), w)
+            }
+        } else if req != "FFI" && !req.starts_with("FFI.") {
             tc_er_require(program, node, held, owner, node_name(decl), req)
         }
         i = i + 1
     }
+}
+
+// The receiver of a call through a bound as the source names it: `T` for `t.close()`.
+fn tc_er_receiver_shown(node: Int, trait_node: Int) -> Str ! TypeCheck.Resolve {
+    let t = tc_er_call_receiver(node)
+    if t >= 0 { type_to_str(t) } else { node_name(trait_node) }
+}
+
+// The type of a method call's receiver: the object of `r.m()`, or the first argument of a
+// call that names the trait, `Tr.m(r)`. -1 when neither has a type.
+fn tc_er_call_receiver(node: Int) -> Int ! TypeCheck.Resolve {
+    if node_kind(node) == NodeKind.MethodCall {
+        let t = resolve_alias_tid(tc_resolve(tc_lookup_node_tid(node_obj(node))))
+        if t >= 0 && tc_tid_is_no_info(t) == 0 { return t }
+    }
+    let args = node_args(node)
+    if args == -1 || sublist_length(args) == 0 { return -1 }
+    let t = resolve_alias_tid(tc_resolve(tc_lookup_node_tid(sublist_get(args, 0))))
+    if t >= 0 && tc_tid_is_no_info(t) == 0 { t } else { -1 }
+}
+
+// The type parameters of a declaration that can source a `_` in its row: its own, and the
+// binders of the impl it is in, each with the traits its bounds guarantee (§4.15.2).
+type ErWildParam {
+    binder: Int
+    name: Str
+    traits: Str
+}
+
+fn tc_er_wild_params(decl: Int) -> List[ErWildParam] {
+    let mut out: List[ErWildParam] = []
+    tc_er_push_wild_params(out, node_type_params(decl))
+    let block = tc_method_block.get(decl) ?? -1
+    if block != -1 && node_kind(block) == NodeKind.ImplBlock {
+        let binders = node_impl_binders(block)
+        tc_er_push_wild_params(out, binders)
+        // A `where T: Bound` adds to the bounds of an impl binder of the same name.
+        let wb = node_impl_where_bounds(block)
+        if wb != -1 && binders != -1 {
+            let mut i = 0
+            while i < sublist_length(wb) {
+                let wc = sublist_get(wb, i)
+                let mut j = 0
+                while j < sublist_length(binders) {
+                    let b = sublist_get(binders, j)
+                    if node_name(b) == node_name(wc) {
+                        out.push(ErWildParam { binder: b, name: node_name(b), traits: tparam_node_bound_traits(wc) })
+                    }
+                    j = j + 1
+                }
+                i = i + 1
+            }
+        }
+    }
+    out
+}
+
+fn tc_er_push_wild_params(out: List[ErWildParam], sl: Int) {
+    if sl == -1 { return }
+    let mut i = 0
+    while i < sublist_length(sl) {
+        let tp = sublist_get(sl, i)
+        let traits = tparam_node_bound_traits(tp)
+        if tc_er_wild_methods(traits).len() > 0 { out.push(ErWildParam { binder: tp, name: node_name(tp), traits: traits }) }
+        i = i + 1
+    }
+}
+
+// The trait-method declarations with `_` in their row that a guarantee set holds. No
+// fn-type or handler parameter can carry a row today, so each such `_` is impl-chosen.
+fn tc_er_wild_methods(traits: Str) -> List[Int] {
+    let mut out: List[Int] = []
+    for t in traits.split("|") {
+        if t.is_empty() { continue }
+        let tr = tc_trait_node_idx.get(t) ?? -1
+        if tr == -1 { continue }
+        let ms = node_methods(tr)
+        if ms == -1 { continue }
+        let mut i = 0
+        while i < sublist_length(ms) {
+            let m = sublist_get(ms, i)
+            if tc_er_fn_row(m).contains("_") { out.push(m) }
+            i = i + 1
+        }
+    }
+    out
+}
+
+// The type each type parameter of the callee takes at this call, solved from the settled
+// types of the receiver, the arguments and the result, as mono solves them, so the charge
+// is for the instance that runs. An impl's binders come from the receiver.
+fn tc_er_call_binds(node: Int, decl: Int) -> Map[Str, Int] ! TypeCheck.Resolve, Diag.Report {
+    let mut binds: Map[Str, Int] = Map()
+    let idx = fnsig_by_decl.get(decl) ?? -1
+    if idx < 0 { return binds }
+    let fs = fnsig_pool.get(idx).unwrap()
+    let params_sl = node_params(decl)
+    let mut lead: List[Int] = []
+    if node_kind(node) == NodeKind.MethodCall && params_sl != -1 && sublist_length(params_sl) > 0 && node_name(sublist_get(params_sl, 0)) == "self" {
+        let t = tc_lookup_node_tid(node_obj(node))
+        if t >= 0 && tc_tid_is_no_info(resolve_alias_tid(tc_resolve(t))) == 0 { lead.push(t) }
+    }
+    let mut li = 0
+    while li < lead.len() {
+        if li < fs.params_count { unify_typevar_binds(fnsig_param_list.get(fs.params_start + li).unwrap(), tc_resolve(lead.get(li).unwrap()), binds) }
+        li = li + 1
+    }
+    let args = node_args(node)
+    let mut first_arg = -1
+    if args != -1 {
+        let mut i = 0
+        while i < sublist_length(args) {
+            let mut arg = sublist_get(args, i)
+            let mut pidx = i + lead.len()
+            // A default carries the callee's own parameter types, so it solves nothing.
+            if tc_is_default_fill(arg) { pidx = -1 }
+            if node_kind(arg) == NodeKind.NamedArg {
+                if pidx >= 0 { pidx = tc_er_param_index(params_sl, node_name(arg)) }
+                arg = node_value(arg)
+            }
+            let a = tc_lookup_node_tid(arg)
+            if i == 0 { first_arg = a }
+            if pidx >= 0 && pidx < fs.params_count && a >= 0 {
+                unify_typevar_binds(fnsig_param_list.get(fs.params_start + pidx).unwrap(), tc_resolve(a), binds)
+            }
+            i = i + 1
+        }
+    }
+    let ret = tc_lookup_node_tid(node)
+    if fs.ret >= 0 && ret >= 0 { unify_typevar_binds(fs.ret, tc_resolve(ret), binds) }
+    let block = tc_method_block.get(decl) ?? -1
+    if block != -1 && node_kind(block) == NodeKind.ImplBlock {
+        let recv = if lead.len() > 0 { lead.get(0).unwrap() } else { first_arg }
+        if recv >= 0 {
+            for (k, v) in tc_impl_binds_for_instance(block, resolve_alias_tid(tc_resolve(recv))) { binds.insert(k, v) }
+        }
+    }
+    binds
+}
+
+fn tc_er_param_index(params_sl: Int, name: Str) -> Int {
+    if params_sl == -1 { return -1 }
+    let mut i = 0
+    while i < sublist_length(params_sl) {
+        if node_name(sublist_get(params_sl, i)) == name { return i }
+        i = i + 1
+    }
+    -1
+}
+
+// What `_` in the row of `decl` stands for under these binds: for each type parameter that
+// sources it, the impl row of its type for each `_` method of its bounds (§4.15.3). Only the
+// signature is read, so a caller pays for every such method, called in the body or not.
+fn tc_er_wild_row(decl: Int, binds: Map[Str, Int], depth: Int) -> List[Str] ! TypeCheck.Resolve, Diag.Report {
+    let mut out: List[Str] = []
+    for p in tc_er_wild_params(decl) {
+        let a = binds.get(tc_binder_key(p.binder, p.name)) ?? (binds.get(p.name) ?? -1)
+        if a < 0 { continue }
+        for tm in tc_er_wild_methods(p.traits) {
+            for e in tc_er_impl_row(a, tm, depth) {
+                if !out.contains(e) { out.push(e) }
+            }
+        }
+    }
+    out
+}
+
+// The row that type `a0` runs for trait method `tm`. A type parameter of the caller stands
+// for every impl, so it is `_`. A Closeable type runs close for BlockHandler's enter and exit
+// as well, through the impl the parser writes for it (§4.7.2).
+fn tc_er_impl_row(a0: Int, tm: Int, depth: Int) -> List[Str] ! TypeCheck.Resolve, Diag.Report {
+    let mut out: List[Str] = []
+    let a = resolve_alias_tid(tc_resolve(a0))
+    if a < 0 || tc_tid_is_no_info(a) != 0 { return out }
+    if tc_tid_kind(a) == TyKind.Typevar {
+        out.push("_")
+        return out
+    }
+    let tkey = tc_trait_key_of(tc_method_block.get(tm) ?? -1)
+    let mname = node_name(tm)
+    let mut decl = -1
+    if tkey == "BlockHandler" || tkey == "Closeable" {
+        let im = tc_er_scoped_impl(a)
+        if im >= 0 { decl = tc_er_impl_method(im, if tc_impl_trait_id(im) == "Closeable" { "close" } else { mname }) }
+    } else {
+        let k = tc_tid_kind(a)
+        let tname = if k == TyKind.Struct || k == TyKind.Enum { ty_pool.get(a).unwrap().name } else { tc_builtin_receiver_name(a) }
+        let sig = if tname != "" { lookup_fnsig(tc_impl_method_stem(tname, tkey, mname)) } else { -1 }
+        if sig >= 0 { decl = fnsig_pool.get(sig).unwrap().decl }
+    }
+    if decl < 0 { return out }
+    for e in tc_er_fn_row(decl) {
+        if e == "_" {
+            // An impl that forwards its own binders' rows, as `Guard[T]` does, reads them off
+            // this instance. The depth cap stops a type that holds itself.
+            if depth < 8 {
+                let block = tc_method_block.get(decl) ?? -1
+                let ib = if block != -1 && node_kind(block) == NodeKind.ImplBlock { tc_impl_binds_for_instance(block, a) } else { tc_no_binds }
+                for w in tc_er_wild_row(decl, ib, depth + 1) {
+                    if !out.contains(w) { out.push(w) }
+                }
+            }
+        } else if e != "FFI" && !e.starts_with("FFI.") && !out.contains(e) {
+            out.push(e)
+        }
+    }
+    out
+}
+
+fn tc_er_impl_method(im: Int, name: Str) -> Int {
+    let ms = node_methods(im)
+    if ms == -1 { return -1 }
+    let mut i = 0
+    while i < sublist_length(ms) {
+        let m = sublist_get(ms, i)
+        if node_name(m) == name { return m }
+        i = i + 1
+    }
+    -1
 }
 
 fn tc_er_row_with(held: List[Str], extra: Str) -> List[Str] {
@@ -36297,10 +36562,30 @@ fn tc_er_scoped_impl(tid: Int) -> Int ! Diag.Report {
 // is the site that is charged their rows (§4.7.2, §5.5). They run outside the handler the
 // item itself installs, so `held` is the row before this item joins it. A type parameter
 // item is left to the generic half of the rule: its bound's rows are not declared yet.
-fn tc_er_check_with_item(program: Int, item: Int, tid0: Int, held: List[Str], owner: Str) ! Diag.Report {
+fn tc_er_check_with_item(program: Int, item: Int, tid0: Int, held: List[Str], owner: ErOwner) ! TypeCheck.Resolve, Diag.Report {
     if tid0 < 0 { return }
     let tid = tc_resolve(tid0)
-    if tc_tid_is_no_info(tid) != 0 || tc_tid_kind(tid) == TyKind.Typevar { return }
+    if tc_tid_is_no_info(tid) != 0 { return }
+    if tc_tid_kind(tid) == TyKind.Typevar {
+        // The item stands for every impl of its bound, so it runs the bound's `_`.
+        let binder = tc_tid_binder(tid)
+        if binder < 0 || tc_er_satisfied(program, held, "_") { return }
+        let traits = tparam_node_bound_traits(binder)
+        let tname = type_to_str(tid)
+        let mn = if tc_pipe_has(traits, "BlockHandler") != 0 { "enter` and `{tname}.exit" } else if tc_pipe_has(traits, "Closeable") != 0 { "close" } else { "" }
+        if mn == "" { return }
+        if owner.default_body {
+            diag_error_at("UndeclaredEffect", UNDECLARED_EFFECT,
+                "with item of type `{tname}` runs `{tname}.{mn}`, which the default body of `{owner.name}` may not perform", item,
+                tc_er_default_body_help(owner.name))
+            return
+        }
+        diag_error_at("UndeclaredEffect", UNDECLARED_EFFECT,
+            "with item of type `{tname}` runs `{tname}.{mn}`, which has an impl-chosen row `_` that `{owner.name}` does not declare", item,
+            "add `! _` to `{owner.name}`, so each call is charged the row of the impl `{tname}` stands for")
+        diag_set_last_fix("add effect", "_")
+        return
+    }
     let im = tc_er_scoped_impl(tid)
     if im < 0 { return }
     let ms = node_methods(im)
@@ -36320,9 +36605,21 @@ fn tc_er_check_with_item(program: Int, item: Int, tid0: Int, held: List[Str], ow
         let idx = if runs { fnsig_by_decl.get(m) ?? -1 } else { -1 }
         if idx >= 0 {
             let fs = fnsig_pool.get(idx).unwrap()
+            // A `_` in the impl's own row is what its binders' impls run for this instance.
+            let mut row: List[Str] = []
             let mut j = 0
             while j < fs.effects_count {
-                let req = fnsig_effect_names.get(fs.effects_start + j).unwrap()
+                let e = fnsig_effect_names.get(fs.effects_start + j).unwrap()
+                if e == "_" {
+                    for w in tc_er_wild_row(m, tc_impl_binds_for_instance(im, tid), 0) { row.push(w) }
+                } else {
+                    row.push(e)
+                }
+                j = j + 1
+            }
+            j = 0
+            while j < row.len() {
+                let req = row.get(j).unwrap()
                 // FFI is left out here for the reason tc_er_check_call gives.
                 if req != "FFI" && !req.starts_with("FFI.") && !tc_er_satisfied(program, held, req) {
                     let named = "`{tname}.{mn}`"
@@ -36346,8 +36643,8 @@ fn tc_er_check_with_item(program: Int, item: Int, tid0: Int, held: List[Str], ow
         let ms_text = methods.get(k).unwrap()
         let verb = if ms_text.contains(" and ") { "need" } else { "needs" }
         diag_error_at("UndeclaredEffect", UNDECLARED_EFFECT,
-            "with item of type `{tname}` runs {ms_text}, which {verb} effect `{req}`, which `{owner}` does not declare", item,
-            "add `{req}` to the `!` list of `{owner}`, or put the `with` inside a `with` block that provides it")
+            "with item of type `{tname}` runs {ms_text}, which {verb} effect `{req}`, which `{owner.name}` does not declare", item,
+            "add `{req}` to the `!` list of `{owner.name}`, or put the `with` inside a `with` block that provides it")
         diag_set_last_fix("add effect", req)
         k = k + 1
     }
@@ -36355,7 +36652,7 @@ fn tc_er_check_with_item(program: Int, item: Int, tid0: Int, held: List[Str], ow
 
 // Items nest left to right, so each item's expression runs under the effects the items
 // before it installed (§4.7.2).
-fn tc_er_with_row(program: Int, node: Int, held: List[Str], owner: Str, kids: List[Int]) -> List[Str] ! TypeCheck.Resolve, Diag.Report {
+fn tc_er_with_row(program: Int, node: Int, held: List[Str], owner: ErOwner, kids: List[Int]) -> List[Str] ! TypeCheck.Resolve, Diag.Report {
     let mut row = tc_er_row_with(held, "")
     let items = node_handlers(node)
     if items == -1 { return row }
@@ -36379,7 +36676,7 @@ fn tc_er_with_row(program: Int, node: Int, held: List[Str], owner: Str, kids: Li
     row
 }
 
-fn tc_er_walk(program: Int, node: Int, held: List[Str], owner: Str, kids: List[Int]) ! TypeCheck.Resolve, Diag.Report {
+fn tc_er_walk(program: Int, node: Int, held: List[Str], owner: ErOwner, kids: List[Int]) ! TypeCheck.Resolve, Diag.Report {
     if node < 0 { return }
     let k = node_kind(node)
     if k == NodeKind.FnDef {
@@ -36425,7 +36722,16 @@ fn tc_er_walk(program: Int, node: Int, held: List[Str], owner: Str, kids: List[I
 fn tc_er_walk_fn(program: Int, fn_node: Int, kids: List[Int]) ! TypeCheck.Resolve, Diag.Report {
     // `main` holds every effect (§4.6).
     if node_name(fn_node) == "main" && node_source_module(fn_node) == "__main__" { return }
-    tc_er_walk(program, node_body(fn_node), tc_er_fn_row(fn_node), node_name(fn_node), kids)
+    let block = tc_method_block.get(fn_node) ?? -1
+    // A default body also runs for an impl that does not override it, and a call through
+    // such an impl is charged nothing, so the body may not perform impl-chosen effects: its
+    // `_` holds nothing. The panel may widen this rule.
+    let default_body = block != -1 && node_kind(block) == NodeKind.TraitDef
+    let mut held: List[Str] = []
+    for e in tc_er_fn_row(fn_node) {
+        if !(default_body && e == "_") { held.push(e) }
+    }
+    tc_er_walk(program, node_body(fn_node), held, ErOwner { name: node_name(fn_node), default_body: default_body }, kids)
 }
 
 // `owners` is a list of impl or trait nodes; each one's methods are walked.
@@ -36463,7 +36769,7 @@ fn tc_check_effect_rows(program: Int) ! TypeCheck.Resolve, Diag.Report {
     // the operation, so the body holds that effect and nothing more.
     for op in effect_derived_ops(program) {
         match tc_ue_op_root.get(op) {
-            Some(ed) => tc_er_walk(program, node_body(op), [tc_er_op_effect(ed, op)], "{node_name(ed)}.{node_name(op)}", kids)
+            Some(ed) => tc_er_walk(program, node_body(op), [tc_er_op_effect(ed, op)], ErOwner { name: "{node_name(ed)}.{node_name(op)}", default_body: false }, kids)
             None => {}
         }
     }

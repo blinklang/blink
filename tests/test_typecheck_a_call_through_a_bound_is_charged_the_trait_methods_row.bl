@@ -1,0 +1,142 @@
+// A call through a type parameter runs whichever impl the parameter stands for, so it is
+// charged the row the trait method declares (sections/04_effects.md §4.15.2, §4.15.3).
+// `Closeable.close` and `BlockHandler.enter`/`exit` have the impl-chosen row `_`, so a fn
+// that calls them through a bound, or holds a type-parameter item in a `with`, must declare
+// `! _` (§4.7.2). A trait default body reads its own `_` as empty.
+
+import compile_test_helpers
+
+fn base_src() -> Str {
+    #"effect Note { effect Say { fn say(s: Str) } }
+type R { n: Int }
+impl Closeable for R {
+    fn close(self) ! Note.Say { note.say("close {self.n}") }
+}
+trait Logs { fn log(self) ! Note.Say }
+impl Logs for R {
+    fn log(self) ! Note.Say { note.say("log {self.n}") }
+}
+"#
+}
+
+fn with_base(body: Str) -> Str {
+    "{base_src()}{body}"
+}
+
+fn count(text: Str, part: Str) -> Int {
+    text.split(part).len() - 1
+}
+
+test "a call through a bound with a fixed row is charged that row" {
+    let src = with_base(#"fn log_all[T: Logs](t: T) { t.log() }
+fn main() { }
+"#)
+    let out = compile_test_helpers.compile_and_capture(src, "bound_row_fixed_missing")
+    compile_test_helpers.expect_error(out, "E0500", "T.log needs Note.Say")
+    compile_test_helpers.expect_contains(out, "`T.log`", "the diagnostic names the call through the bound")
+    compile_test_helpers.expect_contains(out, "`Note.Say`", "the diagnostic names the effect")
+    compile_test_helpers.expect_contains(out, "`log_all`", "the diagnostic names the fn")
+    assert_eq(count(out, "\"code\":\"E0500\""), 1)
+}
+
+test "a call through a bound with a fixed row compiles when the fn declares it" {
+    let src = with_base(#"fn log_all[T: Logs](t: T) ! Note.Say { t.log() }
+fn main() { }
+"#)
+    let out = compile_test_helpers.compile_and_capture(src, "bound_row_fixed_held")
+    compile_test_helpers.expect_compiles_clean(out, "the row holds what T.log declares")
+}
+
+test "a call of close through a bound needs ! _" {
+    let src = with_base(#"fn shut[T: Closeable](t: T) { t.close() }
+fn main() { }
+"#)
+    let out = compile_test_helpers.compile_and_capture(src, "bound_row_close_missing")
+    compile_test_helpers.expect_error(out, "E0500", "T.close needs _")
+    compile_test_helpers.expect_contains(out, "call to `T.close` needs effect `_`, which `shut` does not declare", "the message names the call and the fn")
+    compile_test_helpers.expect_contains(out, "add `! _` to `shut`", "the help says to add ! _")
+    compile_test_helpers.expect_contains(out, "\"fix\":\{\"action\":\"add effect\",\"text\":\"_\"}", "the fix adds _")
+    assert_eq(count(out, "\"code\":\"E0500\""), 1)
+}
+
+test "a Closeable item of a type parameter needs ! _" {
+    let src = with_base(#"fn hold[T: Closeable](t: T) {
+    with t as _x { let _ = 0 }
+}
+fn main() { }
+"#)
+    let out = compile_test_helpers.compile_and_capture(src, "bound_row_closeable_item")
+    compile_test_helpers.expect_error(out, "E0500", "the item runs T.close")
+    compile_test_helpers.expect_contains(out, "with item of type `T` runs `T.close`", "the message names close")
+    compile_test_helpers.expect_contains(out, "\"line\":11,\"col\":10", "the diagnostic points at the item")
+    compile_test_helpers.expect_contains(out, "\"fix\":\{\"action\":\"add effect\",\"text\":\"_\"}", "the fix adds _")
+    assert_eq(count(out, "\"code\":\"E0500\""), 1)
+}
+
+test "a BlockHandler item of a type parameter needs ! _" {
+    let src = with_base(#"fn run[T: BlockHandler](t: T) {
+    with t { let _ = 0 }
+}
+fn main() { }
+"#)
+    let out = compile_test_helpers.compile_and_capture(src, "bound_row_block_handler_item")
+    compile_test_helpers.expect_error(out, "E0500", "the item runs T.enter and T.exit")
+    compile_test_helpers.expect_contains(out, "runs `T.enter` and `T.exit`", "the message names enter and exit")
+    assert_eq(count(out, "\"code\":\"E0500\""), 1)
+}
+
+test "a generic fn with ! _ may close, hold and call through its bound" {
+    let src = with_base(#"fn shut[T: Closeable](t: T) ! _ { t.close() }
+fn hold[T: Closeable](t: T) ! _ {
+    with t as _x { let _ = 0 }
+}
+fn run[T: BlockHandler](t: T) ! _ {
+    with t { let _ = 0 }
+}
+fn main() { }
+"#)
+    let out = compile_test_helpers.compile_and_capture(src, "bound_row_wild_declared")
+    compile_test_helpers.expect_compiles_clean(out, "! _ holds the impl-chosen rows")
+}
+
+test "close named through the trait on a concrete value is charged that impl's row" {
+    let src = with_base(#"fn shut_r(r: R) { Closeable.close(r) }
+fn main() { }
+"#)
+    let out = compile_test_helpers.compile_and_capture(src, "bound_row_concrete_trait_call")
+    compile_test_helpers.expect_error(out, "E0500", "R.close needs Note.Say")
+    compile_test_helpers.expect_contains(out, "needs effect `Note.Say`", "the charge is R's row, not _")
+    assert_eq(count(out, "needs effect `_`"), 0)
+}
+
+test "a trait default body may not perform the effects its _ stands for" {
+    let src = with_base(#"trait Greets {
+    fn other(self) ! _
+    fn calls(self) ! _ { self.other() }
+    fn holds[C: Closeable](self, c: C) ! _ {
+        with c { let _ = 0 }
+    }
+}
+fn main() { }
+"#)
+    let out = compile_test_helpers.compile_and_capture(src, "bound_row_default_body_wild")
+    compile_test_helpers.expect_contains(out, "call to `Self.other` needs effect `_`, which the default body of `calls` may not perform", "a call of a _ method in a default body")
+    compile_test_helpers.expect_contains(out, "with item of type `C` runs `C.close`, which the default body of `holds` may not perform", "a type-parameter item in a default body")
+    assert_eq(count(out, "\"code\":\"E0500\""), 2)
+    assert_eq(count(out, "add `! _`"), 0)
+}
+
+test "a trait default body with ! _ may perform the fixed effects of its row" {
+    let src = with_base(#"trait Greets {
+    fn greet(self) ! Note.Say, _ { note.say("hi") }
+}
+trait Bare {
+    fn greet(self) ! _ { note.say("hi") }
+}
+fn main() { }
+"#)
+    let out = compile_test_helpers.compile_and_capture(src, "bound_row_default_body_fixed")
+    compile_test_helpers.expect_error(out, "E0500", "the body of Bare.greet performs Note.Say")
+    compile_test_helpers.expect_contains(out, "which `greet` does not declare", "the fixed effect must be in the row")
+    assert_eq(count(out, "\"code\":\"E0500\""), 1)
+}

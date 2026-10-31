@@ -34,6 +34,7 @@ Single source of truth for release history. `blink llms` and `blink llms --full`
 - **`std.args` parse functions declare the effects they use.** `parse_argv` writes the help and version text, so it is now `! IO.Print`. `argparse` is now `! Env.Read, IO.Print`. A caller needs `IO.Print` (or `IO`) in its row.
 - **`std.net_tcp.tcp_listen` declares `! Net.Listen`.** It binds a port. A caller needs `Net.Listen` (or `Net`) in its row.
 - **`pkg` functions declare the effects they use.** `pkg.audit.audit_report` is now `! IO.Print`, `pkg.manifest.load_lints` is `! IO.Print`, `load_package` and `load_deps` are `! IO`, `pkg.gitdeps.git_fetch` adds `Env.Read`, `pkg.pathdeps.resolve_path_deps` adds `Process.Spawn`, and `pkg.resolver.resolve` and `resolve_and_lock` add `Env.Read`. A caller needs the same effects in its row.
+- **A call through a type parameter is charged the row of the trait method.** `close`, `enter` and `exit` now have the impl-chosen row `! _`, so a generic fn that calls `t.close()` or holds a `with t` item through a `Closeable` or `BlockHandler` bound must declare `! _` (E0500, with the help "add `! _`"). A call of a fn with `_` in its row is charged the impl rows of its type arguments: `shut(Log { ... })` needs the effects of `Log.close`. A trait default body may not perform the effects its `_` stands for. Before, these calls were charged nothing, so a generic fn could run effects that no row named (§4.15.2, §4.15.3).
 
 ## What's New (v0.59.0)
 
