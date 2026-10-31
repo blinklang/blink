@@ -505,6 +505,32 @@ fi
 
 # Runs inside the new scope: run the command, then read the scope's own event
 # counters while the scope still exists, so a kill by the cap reads as one.
+# enable_scope: hands the memory and pids controllers to the scope's children.
+# The kernel refuses that (EBUSY) while the scope counts a process. A process
+# that this script forked and reaped in the scope (the mkdir) can count for a
+# short time after it is gone, mostly on a busy host, so EBUSY gets a short
+# retry. No other error changes with time, so it falls back at once.
+enable_scope() {
+    local err procs tries=40
+    while :; do
+        err=$(LC_ALL=C; echo "+memory +pids" 2>&1 > "$dir/cgroup.subtree_control") && return 0
+        case "$err" in
+            *"Device or resource busy"*) ;;
+            *)
+                echo "$err" >&2
+                return 1
+                ;;
+        esac
+        tries=$((tries - 1))
+        if [ "$tries" -le 0 ]; then
+            mapfile -t procs < "$dir/cgroup.procs" 2>/dev/null
+            notice "the scope stayed busy (EBUSY) for the whole retry budget of about 2 s (processes in it: [${procs[*]}])"
+            return 1
+        fi
+        sleep 0.05 2>/dev/null || sleep 1
+    done
+}
+
 if [ "${1:-}" = --inner ]; then
     shift
     IFS=: read -r _ _ cg < /proc/self/cgroup
@@ -516,7 +542,7 @@ if [ "${1:-}" = --inner ]; then
     if [ "${BLINK_CHILD_CAP_MODE:-}" = cgroup ]; then
         if mkdir -p "$dir/gate" "$dir/kids" &&
             echo 0 > "$dir/gate/cgroup.procs" &&
-            echo "+memory +pids" > "$dir/cgroup.subtree_control" &&
+            enable_scope &&
             echo "+memory +pids" > "$dir/kids/cgroup.subtree_control"; then
             leaf=$dir/gate
             export BLINK_CHILD_CGROUP=$dir
