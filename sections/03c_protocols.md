@@ -933,6 +933,8 @@ error[EffectHandleShadowed]: cannot shadow effect handle
 
 Effect handle operations are syntactically identical to method calls (`io.println(msg)`, `db.read(query)`), but they are resolved through the effect system, not through trait lookup. The compiler knows which identifiers are effect handles from the function's `!` declaration, so there is never ambiguity between `io.println()` (effect operation) and a hypothetical trait method `println` on some type — `io` is not a value of any type, it is a capability handle. A handle op has one call form, through its handle: a value is never the receiver of a handle op, and `v.op(...)` is trait lookup only (§4.4).
 
+In a function that declares the effect, a handle hides a module qualifier of the same spelling. With `import util.log` and `! Audit.Log`, `log.format("x")` is a handle call, so it is E0505 when `Audit.Log` has no operation `format`. The fix for that error follows the candidate walk in §4.4.7 *Helpers in `std.random`*.
+
 **Why reserved.** Effect handles are capability proofs (§4.4). Allowing `let io = something_else` would break the guarantee that `io.println()` always routes through the effect handler chain. The reserved namespace ensures go-to-definition on any effect operation always reaches the effect declaration, and LSP always shows effect operations in autocomplete.
 
 #### No Inherent Methods

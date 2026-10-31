@@ -4006,12 +4006,24 @@ import a.x.{R}                // OK: binds `R`; `x` names `a.x` again
 import a.x                    // warning[W0602]: `x` already imports this module
 ```
 
+The order matters. A whole-module import before a selective import of the same module is legal:
+
+```blink
+import util.log
+import util.log.{format}      // OK: `util.log` came first; `log` names `util.log` again
+```
+
 ```blink
 import b.x as bx
 import b.x.{Q}                // OK: `bx` and `x` both name `b.x`
 ```
 
 There `import b.x.{Q}` binds `x` too. To bind `Q` and `bx` but not `x`, write `import b.x as bx.{Q}`.
+
+```blink
+import util.log
+import util.log as logging    // OK, no warning: `logging` does not name its module yet
+```
 
 **Fix.** Which import should keep the name is the author's choice, so the fix is a suggestion only: rename one import with `as`, or drop the name and use the qualified path. The help should print a concrete name that is not already bound in the file. For a qualifier, the help names the import to rename and keeps that import's bare names: `import b.x as bx.{Q}` for a selective import, `import a.x as ax` for a whole-module import. On the colliding entry, E1005 replaces W0602: one mistake gives one diagnostic. When a declaration also takes the name, every import entry that collides with it gets E1012 (*Imported and Declared Names*), and E1005 applies only between import entries that have no E1012.
 
@@ -4364,6 +4376,7 @@ warning[W1011]: `Ok` hides the prelude variant `Result.Ok`
    - A diagnostic at `q.y` whose cause is that `y` does not resolve on the local `q` adds a `note:` that gives the location of the local binding and names the hidden module and its import. The note appears only when the hidden module has a `pub` item named `y`.
    - The W0602 that the import gets because every `q.y` in the file resolves to a local adds a `note:` that gives the location of the first hiding binding in source order.
    - When a `q.y` diagnostic with the note from the first point fires, the import gets no W0602: one mistake gives one diagnostic.
+5. When a reserved effect handle hides a module qualifier (§3c.4 *Effect Handle Operations*), the W0602 that the import gets because every `q.y` in the file resolves to a handle adds a `note:` that names the handle, its effect, and the position of the `!` row that declares the effect. An E0505 at `q.y` through the handle does not remove that W0602. The warning is in the file before the fix, so the fix for E0505 (§4.4.7) does not add it.
 
 ```blink
 type Handler {

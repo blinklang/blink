@@ -1944,16 +1944,21 @@ The fix uses the qualified call. It does not mean that the qualified call is the
 **The fix for a module function called through a handle.** The rule below is not special to `shuffle`. It holds for `choice`, for every function that `std.random` adds later, and for each E0505 whose help says that a name is a function in a module. A fix is machine-applicable (§8.6) only if, after the edit:
 
 1. the callee resolves at the call site to the function of the module (`std.random.shuffle`), and
-2. the edit adds no new diagnostic: no `AmbiguousImport` (E1005), no `DuplicateSymbol` (E1012), and no new warning.
+2. the edit adds no new diagnostic: no `AmbiguousImport` (E1005), no `DuplicateSymbol` (E1012), and no new warning. A warning that the file had before the edit is not new.
 
 The fix is the first of these four candidates, in this order, that meets both conditions. The list is fixed: candidate 3 is the one fallback after candidate 2, and no other candidate exists.
 
-1. **Reuse a binding that exists.** If the bare name `shuffle` already resolves to `std.random.shuffle` at the call, the fix is `shuffle(deck)`, with no import edit. Otherwise, if the file already imports `std.random` (whole, with a list, or with `as r`) and its qualifier resolves at the call, the fix is a call through that qualifier, `random.shuffle(deck)` or `r.shuffle(deck)`, with no import edit. A file that has `import std.random.{shuffle}` gets no rewrite to the qualified form.
+1. **Reuse a binding that exists.** If the bare name `shuffle` already resolves to `std.random.shuffle` at the call, the fix is `shuffle(deck)`, with no import edit. Otherwise, if the file already imports `std.random` (whole, with a list, or with `as r`) and its qualifier resolves at the call, the fix is a call through that qualifier, `random.shuffle(deck)` or `r.shuffle(deck)`, with no import edit. A file that has `import std.random.{shuffle}` gets no rewrite to the qualified form. A qualifier that a local binding or a reserved handle hides at the call does not resolve at the call, so this candidate fails then.
 2. **Qualified call.** Add `import std.random` and call `random.shuffle(deck)`.
-3. **Selective import.** Add `import std.random.{shuffle}` and call `shuffle(deck)`.
-4. **No fix.** No candidate meets both conditions. There is no `fix:` line. The help shows an alias import (see below).
+3. **Selective import.** Add `import std.random.{shuffle}` and call `shuffle(deck)`. The new line goes after every import of `std.random` that the file already has, and the edit changes no existing import line. A whole-module import that comes after a selective import of the same module gets W0602 (§10.5 *Imported Names*), so a new line above it would add a warning and fail condition 2.
+4. **No fix.** No candidate meets both conditions. There is no `fix:` line. The help shows an alias import (see below). The alias import is a new line. It does not rename an import that the file has, because other functions in the file can use the existing qualifier as the module.
 
-A selective import binds `random` as well as `shuffle`. So a `random` that the file binds at module level (a function, a `let`, a type, or the qualifier of another import) makes candidates 2 and 3 fail. Only a local binding named `random` at the call, which hides the qualifier for its scope (§10.1 *Qualified Access*) and gets no warning, lets candidate 3 meet the conditions.
+A selective import binds `random` as well as `shuffle`. So a `random` that the file binds at module level to something other than `std.random` (a function, a `let`, a type, or the qualifier of an import of another module) makes candidates 2 and 3 fail. A qualifier that the file already binds to `std.random` does not make candidate 3 fail: a qualifier bound again to the same module gets no diagnostic (§10.5 *Imported Names*).
+
+Only a binding that hides the qualifier at the call lets candidate 3 meet the conditions. Two kinds of binding do this, and the rule is the same for both:
+
+- a local binding named like the qualifier, which hides it for its scope (§10.1 *Qualified Access*) and gets no warning;
+- a reserved handle of the same spelling, in a function that declares the effect (§3c.4 *Effect Handle Operations*). This happens when the handle and the module have one name, as `log` for the effect `Audit.Log` and the module `util.log`. The `rand` handle and the `random` qualifier differ in spelling, so `rand` never hides `random`.
 
 If the call with the new callee would not type-check (for example, it has the wrong number of arguments), the fix is help only, whatever candidate was found. When the help says why no fix exists, it names the binding that blocks the fix and its position (`` `random` is the local at 3:9 ``). The tool never makes up an alias name, because the name is the choice of the author. The help in candidate 4 shows an alias import with a concrete example name that is not bound in the file, `rng` when it is free (`import std.random as rng`), and the call that uses it (`rng.shuffle(deck)`).
 
@@ -2034,6 +2039,115 @@ error[E0505]: `shuffle` is not an operation of effect `Rand`
 ```
 
 The same two `help` lines appear when a local `random` and a local `shuffle` are both in scope at the call: candidate 2 fails on `random`, and candidate 3 fails on `shuffle`. The first help line gives the position of each blocking binding.
+
+**A reserved handle hides the qualifier.** The rule above holds with no exception when the handle and the module qualifier have one spelling. The effect `Audit.Log` has the handle `log`, and the file can import the module `util.log`, whose qualifier is `log`. In a function that declares `! Audit.Log`, the handle hides the qualifier (§3c.4 *Effect Handle Operations*), so `log.format("x")` is a call on the handle. The walk gives the same answer as for a local `random`:
+
+```blink
+import util.log
+
+effect Audit {
+    effect Log {
+        fn record(msg: Str)
+    }
+}
+
+fn f() -> Str ! Audit.Log {
+    log.format("x")
+}
+```
+
+```
+error[E0505]: `format` is not an operation of effect `Audit.Log`
+  = note: `Audit.Log` operations are `record`
+  = help: `format` is a function in module `util.log`; `log` is the handle of `Audit.Log` here (from `! Audit.Log` at 9:17), and the handle hides the module qualifier `log`
+  = fix: add `import util.log.{format}` and call `format("x")`
+```
+
+Candidate 1 fails, because the handle hides `log` at the call. Candidate 2 fails condition 1, because `log.format` is still a call on the handle. Candidate 3 passes. The name `format` is free, and the new import binds `log` to `util.log` again, which gives no E1005 and no W0602 (§10.5 *Imported Names*). The new line goes after the line `import util.log`. The rule is the same for each module function that a handle of the same spelling hides.
+
+When the handle and the qualifier have one spelling, the help says that the handle hides the qualifier. It gives the position of the effect in the `!` row. It does not say "`log` is the handle" and "`log` is the module" in one sentence, because that reads as a contradiction. When the two spellings differ (`rand` and `random`), the help names both, as in the cases above.
+
+After the fix, the file is this one. The edit adds no diagnostic:
+
+```blink
+import util.log
+import util.log.{format}
+
+effect Audit {
+    effect Log {
+        fn record(msg: Str)
+    }
+}
+
+fn f() -> Str ! Audit.Log {
+    format("x")
+}
+```
+
+The call that the fix moved was the only use of `import util.log`. So that import was unused before the fix, and it keeps its W0602 after the fix. The fix does not add this warning, and a warning that the file had before the edit is not new. The W0602 has a `note:` that says the handle hides the qualifier (§10.6 *Diagnostics that involve a shadowing name*). Its fix, to delete the line, is machine-applicable (§10.5 *Unused Imports*) and does not change what the file means. When another use of `log` as the module remains, in a function that does not declare `Audit.Log`, the import is used and the file has no warning:
+
+```blink
+fn g() -> Str {
+    log.parse("y")      // the module call: `g` does not declare `Audit.Log`
+}
+```
+
+A real operation of the handle in the same body is not touched. Only the call that fails gets the fix, and `log.record` stays a call on the handle:
+
+```blink
+fn h() -> Str ! Audit.Log {
+    log.record("y")
+    log.format("x")      // E0505, with the same help and the same fix
+}
+```
+
+After the fix, the body has `log.record("y")` and `format("x")`.
+
+The file has `pub import util.log`. The fix does not change that line, because a `pub import` that gained a list would also re-export `format`, and the fix for such an edit is a suggestion only (§10.5 *Imported and Declared Names*). It adds a private line after it. The public API of the file does not change, and a `pub import` never gets W0602:
+
+```blink
+pub import util.log
+```
+
+```
+  = fix: add `import util.log.{format}` and call `format("x")`
+```
+
+```blink
+pub import util.log
+import util.log.{format}
+
+fn f() -> Str ! Audit.Log {
+    format("x")
+}
+```
+
+The name `format` is already bound: by a `fn format` in the file, by `import other.{format}`, or by a local `format`. Candidate 3 fails (E1012, E1005, or a callee that resolves to the local). Candidate 4 applies. There is no `fix:` line. The help names the binding that blocks the fix and its position, and shows the alias import on a new line. The name `logging` is an example of a name that the file does not bind. The author chooses the real name:
+
+```blink
+import util.log
+
+effect Audit {
+    effect Log {
+        fn record(msg: Str)
+    }
+}
+
+fn format(s: Str) -> Str { s }
+
+fn f() -> Str ! Audit.Log {
+    log.format("x")
+}
+```
+
+```
+error[E0505]: `format` is not an operation of effect `Audit.Log`
+  = note: `Audit.Log` operations are `record`
+  = help: `format` is a function in module `util.log`; `log` is the handle of `Audit.Log` here (from `! Audit.Log` at 11:17), and the handle hides the module qualifier `log`. `format` is the function at 9:4, so `import util.log.{format}` would bind it twice
+  = help: import the module again under another name and call through that name: `import util.log as logging`, then `logging.format("x")`
+```
+
+With the alias line, the file has `import util.log` and `import util.log as logging`. This is legal and gets no warning from the pair (§10.5 *Imported Names*). Other functions keep `log.x` as the module call.
 
 The file already imports `std.random`. Candidate 1 gives a fix with no import edit. The qualifier is `random` for a whole import and for an import with a list, and it is the alias for an import with `as`:
 
@@ -4888,7 +5002,7 @@ error[EffectHandleCollision]: effects `a.Log` and `b.Log` have the same handle `
   = help: put each use in its own function, or rename one of the effects
 ```
 
-**A handle wins over a module qualifier.** In an expression, a reserved handle wins over a module qualifier of the same spelling (§3c.4 *Effect Handle Operations*). Suppose a function declares `! Log` and the file has `import util.log`. Then `log.format(...)` is a call on the handle `log`, not a call into the module. The diagnostic that follows names the fix: give the import an alias, `import util.log as logging`. The same name outside a function that declares the effect is the module qualifier.
+**A handle wins over a module qualifier.** In an expression, a reserved handle wins over a module qualifier of the same spelling (§3c.4 *Effect Handle Operations*). Suppose a function declares `! Log` and the file has `import util.log`. Then `log.format(...)` is a call on the handle `log`, not a call into the module. So the handle hides the qualifier in that function, and a call of a function of `util.log` through it is E0505. The help says that the handle hides the qualifier, and the fix follows the walk in §4.4.7 *The fix for a module function called through a handle*. When the function name is free, the fix is `import util.log.{format}` and `format("x")`. The alias import, `import util.log as logging`, is only the help, for the case where no candidate gives a fix. The same name outside a function that declares the effect is the module qualifier.
 
 **Defining effect operations:**
 
