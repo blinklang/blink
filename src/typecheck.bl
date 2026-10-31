@@ -1,7 +1,7 @@
 import ast.{NodeKind, node_kind_name, is_block_bearing, dbg_trace, dbg_channel_on, nk_is_typed, trace, trace_mode}
 import std.str.{str_to_lower}
 import pkg.manifest.{manifest_name, manifest_header_is_declared}
-import unparse.{type_ann_text, unparse_expr, unparse_binop_with_lhs}
+import unparse.{type_ann_text, unparse_expr, unparse_binop_with_lhs, unparse_range_membership, unparse_coalesce_start}
 import formatter.{effect_op_sig_text}
 import import_edit.{ImportEdit, ImportNeed, import_need}
 import parser.{
@@ -24912,7 +24912,10 @@ fn tc_check_comparison_operands(node: Int, op: Str, lt: Int, rt: Int) ! TypeChec
                         tc_error_at("binary `{op}` needs Ord, and {type_to_str(unordered)} does not implement Ord", node)
                     } else {
                         let cmp_msg = "binary `{op}`: incompatible types {type_to_str(lt)} and {type_to_str(rt)}"
-                        if tc_is_read_line_value(node_right(node)) {
+                        let range_help = tc_range_operand_help(node)
+                        if range_help != "" {
+                            tc_error_at_code(cmp_msg, node, "TypeError", TYPE_ERROR, range_help)
+                        } else if tc_is_read_line_value(node_right(node)) {
                             tc_value_mismatch_at(cmp_msg, node, node_right(node), lt)
                         } else {
                             tc_value_mismatch_at(cmp_msg, node, node_left(node), rt)
@@ -24925,6 +24928,20 @@ fn tc_check_comparison_operands(node: Int, op: Str, lt: Int, rt: Int) ! TypeChec
             tc_warn_negative_zero_pair(node_left(node), node_right(node), tc_negative_zero_family(op))
         }
     }
+}
+
+// A bare range beside a comparison or equality operator (§2.19) asks for the two bound
+// tests. The help reads the syntax, not the types, and no node keeps a pair of parentheses,
+// so `x == (0..3)` gets it too; the advice still holds there.
+fn tc_range_operand_help(node: Int) -> Str ! Diag.Report {
+    let l_range = node_kind(node_left(node)) == NodeKind.RangeLit
+    if l_range == (node_kind(node_right(node)) == NodeKind.RangeLit) { return "" }
+    let (x, range) = if l_range { (node_right(node), node_left(node)) } else { (node_left(node), node_right(node)) }
+    if !tc_index_renders(x) || !tc_index_renders(node_start(range)) || !tc_index_renders(node_end(range)) {
+        let end_op = if node_inclusive(range) == 1 { "<=" } else { "<" }
+        return "to test that a value `v` is in the range, write `v >= lo && v {end_op} hi`"
+    }
+    "to test that `{unparse_expr(x)}` is in the range, write `{unparse_range_membership(x, range)}`"
 }
 
 // W0706 (sections/03_types.md §3.6) fires only where the comparison resolves to the Float
@@ -25131,11 +25148,27 @@ fn tc_infer_coalesce(node: Int, lt: Int) -> Int ! TypeCheck.Resolve, TypeCheck.R
     if tc_tid_has_unbound_metavar(inner) != 0 {
         if tc_unify(inner, rt) != 0 { tc_pin_declared_into_value(tc_resolve(inner), node_right(node), rt) }
     } else if tc_branch_values_agree(-1, inner, node_right(node), rt) == 0 {
-        tc_error_at("`??` default type {type_to_str(rt)} does not match the Option's value type {type_to_str(inner)}", node_right(node))
+        tc_error_at_code("`??` default type {type_to_str(rt)} does not match the Option's value type {type_to_str(inner)}", node_right(node),
+            "TypeError", TYPE_ERROR, tc_coalesce_range_help(node, inner))
     } else {
         tc_pin_declared_into_value(tc_resolve(inner), node_right(node), rt)
     }
     tc_resolve(inner)
+}
+
+// `opt ?? 0..n` takes the whole range as its default (§2.19). When the start fits the
+// Option's value type, the author meant the start as the default.
+fn tc_coalesce_range_help(node: Int, inner: Int) -> Str ! TypeCheck.Resolve, Diag.Report {
+    let range = node_right(node)
+    if node_kind(range) != NodeKind.RangeLit { return "" }
+    let want = resolve_alias_tid(tc_resolve(inner))
+    let start_t = tc_lookup_node_tid(node_start(range))
+    let fits = (start_t >= 0 && resolve_alias_tid(tc_resolve(start_t)) == want) || (is_int_literal_node(node_start(range)) != 0 && is_integer_type(want) != 0)
+    if !fits { return "" }
+    if !tc_index_renders(node_left(node)) || !tc_index_renders(node_start(range)) || !tc_index_renders(node_end(range)) {
+        return "did you mean `(opt ?? lo)..hi`?"
+    }
+    "did you mean `{unparse_coalesce_start(node_left(node), range)}`?"
 }
 
 // The element type an empty KEYED container takes from its context, or a fresh metavariable
