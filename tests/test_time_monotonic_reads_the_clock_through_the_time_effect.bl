@@ -1,0 +1,94 @@
+// `time.monotonic() -> Monotonic` is a primitive operation of `Time.Read` (sections/04_effects.md
+// §4.4, sections/03_types.md §3.2.3). The real handler reads a clock that never goes back, and a
+// user `Time` handler answers the op from its own state through `Monotonic.from_offset`. A
+// handler that omits it delegates to the enclosing handler, as for any op of a builtin effect.
+// Each program runs as `main`, so the real clock is the one the program reads.
+
+import compile_test_helpers
+
+fn clock_src() -> Str {
+    #"
+import std.time.{Duration, Instant, Monotonic}
+
+fn fixed_at(offset: Duration) -> Handler[Time] {
+    handler Time {
+        fn read() -> Instant { Instant.from_epoch_secs(0) }
+        fn monotonic() -> Monotonic { Monotonic.from_offset(offset) }
+        fn sleep(_d: Duration) { }
+    }
+}
+
+@allow(PartialHandler)
+fn wall_only() -> Handler[Time] {
+    handler Time {
+        fn read() -> Instant { Instant.from_epoch_secs(9) }
+        fn sleep(_d: Duration) { }
+    }
+}
+
+fn forwarding() -> Handler[Time.Read] {
+    handler Time.Read {
+        fn read() -> Instant { default.read() }
+        fn monotonic() -> Monotonic { default.monotonic() }
+    }
+}
+
+fn reading() -> Monotonic ! Time.Read {
+    time.monotonic()
+}
+
+fn main() {
+    let a = time.monotonic()
+    let b = time.monotonic()
+    io.println("real: two reads never go back: {b.since(a) >= Duration.nanos(0)}")
+    let c = time.monotonic()
+    time.sleep(Duration.ms(5))
+    io.println("real: a sleep is counted: {time.monotonic().since(c) >= Duration.ms(5)}")
+    with fixed_at(Duration.ms(3)) {
+        let origin = time.monotonic()
+        with fixed_at(Duration.ms(10)) {
+            io.println("handler: {time.monotonic().since(origin)}")
+            with wall_only() {
+                io.println("omitted: {time.monotonic().since(origin)}")
+            }
+            with forwarding() {
+                io.println("forwarded: {time.monotonic().since(origin)}")
+            }
+            io.println("through a fn: {reading().since(origin)}")
+        }
+    }
+}
+"#
+}
+
+fn expect_clock_output(out: Str) {
+    assert(out.contains("real: two reads never go back: true\n"))
+    assert(out.contains("real: a sleep is counted: true\n"))
+    assert(out.contains("handler: 7ms\n"))
+    assert(out.contains("omitted: 7ms\n"))
+    assert(out.contains("forwarded: 7ms\n"))
+    assert(out.contains("through a fn: 7ms\n"))
+}
+
+test "time.monotonic reads the real clock and the installed Time handler" {
+    let r = compile_test_helpers.compile_and_run(clock_src(), "time_monotonic_clock")
+    if r.exit_code != 0 { io.eprintln(r.err_out) }
+    assert_eq(r.exit_code, 0)
+    expect_clock_output(r.out)
+}
+
+test "time.monotonic gives the same answers under --per-module" {
+    let r = compile_test_helpers.run_via_cli(clock_src(), "time_monotonic_per_module", "--per-module")
+    if r.exit_code != 0 { io.eprintln(r.err_out) }
+    assert_eq(r.exit_code, 0)
+    expect_clock_output(r.out)
+}
+
+test "a time.monotonic reading is not an Instant" {
+    let out = compile_test_helpers.compile_and_capture(#"
+fn main() {
+    let i: Instant = time.monotonic()
+}
+"#, "time_monotonic_not_instant")
+    compile_test_helpers.expect_contains(out, "declared type Instant but got Monotonic", "monotonic is not an Instant")
+}

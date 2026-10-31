@@ -4488,12 +4488,13 @@ BLINK_UNUSED static blink_rand_vtable blink_rand_vtable_default = {
 };
 
 /* ── Duration / Instant runtime helpers ─────────────────────────────── */
-/* blink_Duration / blink_Instant are declared by Blink (lib/std/time.bl) as
+/* blink_Duration / blink_Instant / blink_Monotonic are declared by Blink (lib/std/time.bl) as
    runtime-owned types (LO_FACT_RUNTIME_OWNED in src/layout.bl): codegen skips
    emitting its own typedef for them and relies on the ones below. */
 
 typedef struct { int64_t nanos; } blink_Duration;
 typedef struct { int64_t nanos; } blink_Instant;
+typedef struct { int64_t nanos; } blink_Monotonic;
 
 BLINK_RT_FN const char* blink_Instant_to_rfc3339(blink_Instant i);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
@@ -4525,9 +4526,11 @@ BLINK_RT_FN blink_Duration blink_Instant_elapsed(blink_Instant then) {
 typedef struct {
     blink_Instant (*read)(void* __self);
     void                (*sleep)(void* __self, blink_Duration d);
+    blink_Monotonic     (*monotonic)(void* __self);
     /* per-op handler captures — see blink_io_vtable */
     void* __userdata_read;
     void* __userdata_sleep;
+    void* __userdata_monotonic;
 } blink_time_vtable;
 
 BLINK_RT_FN blink_time_vtable* blink_time_vtable_promote(blink_promote_ctx* ctx, blink_time_vtable* v);
@@ -4537,6 +4540,7 @@ BLINK_RT_FN blink_time_vtable* blink_time_vtable_promote(blink_promote_ctx* ctx,
     if (out == v) return out;
     out->__userdata_read = blink_closure_promote(ctx, (blink_closure*)out->__userdata_read);
     out->__userdata_sleep = blink_closure_promote(ctx, (blink_closure*)out->__userdata_sleep);
+    out->__userdata_monotonic = blink_closure_promote(ctx, (blink_closure*)out->__userdata_monotonic);
     return out;
 }
 #endif
@@ -4561,9 +4565,19 @@ BLINK_RT_FN void blink_time_default_sleep(void* __self, blink_Duration d) {
 }
 #endif
 
+BLINK_RT_FN blink_Monotonic blink_time_default_monotonic(void* __self);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN blink_Monotonic blink_time_default_monotonic(void* __self) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (blink_Monotonic){.nanos = (int64_t)ts.tv_sec * 1000000000LL + (int64_t)ts.tv_nsec};
+}
+#endif
+
 BLINK_UNUSED static blink_time_vtable blink_time_vtable_default = {
     blink_time_default_read,
-    blink_time_default_sleep
+    blink_time_default_sleep,
+    blink_time_default_monotonic
 };
 
 BLINK_RT_FN int64_t blink_time_ms(void);
