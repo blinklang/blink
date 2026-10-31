@@ -1573,6 +1573,7 @@ Run `blink doc --list` to list available modules.
 - `match` must be exhaustive — cover all variants or use `_ =>` wildcard
 - An arm that the unguarded arms above it already cover is warning `UnreachableArm` (W0710): an arm after `_`, or a repeated variant, `true`, `false` or literal. Remove it or move it above. It never reports a live arm and may miss a dead one
 - List patterns in `match` ALWAYS need a wildcard `_` or rest `...` arm — finite patterns can't cover unbounded lists
+- `(0..3) == (0..=2)` is `false`: `==` on ranges compares start, end and kind (`..` or `..=`), not the elements. Collect both sides to compare elements: `let a: List[Int] = (0..3).into_iter().collect()`. `Range[T]` is `Eq` for every `T`, and `Debug` and `Clone` when `T` is. It has no `Hash` (E1400 as a `Map` key or `Set` element), no `Ord` and no `Display` (E0523).
 - `let mut` required for any variable you want to reassign. In a pattern, `mut` goes on each name: `let (mut x, y) = pair`, not `let mut (x, y) = pair`
 - Function args separated by commas in calls, but by newlines in multi-line definitions
 - `assert`, `assert_eq`, `assert_ne` only available inside `test` blocks and debug mode
