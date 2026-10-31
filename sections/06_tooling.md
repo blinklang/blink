@@ -986,7 +986,7 @@ A `failed` or `panicked` record of a test that calls `for_each` can also carry `
 total = passed + failed + panicked + skipped
 ```
 
-A test counts once, under the status of its record. A `file` summary covers the `test` lines of that file; the `run` summary covers all `test` lines. The test binary exits non-zero when `failed + panicked > 0`. An unexpected pass counts as `failed` (§8.10.6). A panic has no exit code of its own. `blink test` exits `1` when `failed + panicked + files.build_failed + files.aborted > 0`, and `0` otherwise. It exits `2` for a usage error, before any file builds. A path that does not exist and a directory with no test file are usage errors (§8.10.5, §8.10.7).
+A test counts once, under the status of its record. A `file` summary covers the `test` lines of that file; the `run` summary covers all `test` lines. The test binary exits non-zero when `failed + panicked > 0`. An unexpected pass counts as `failed` (§8.10.6). A panic has no exit code of its own: the runner frame takes the panic (§4.7.2), so the exit code 101 of an uncaught panic (§2.20) does not apply, and no panic hook runs. `blink test` exits `1` when `failed + panicked + files.build_failed + files.aborted > 0`, and `0` otherwise. It exits `2` for a usage error, before any file builds. A path that does not exist and a directory with no test file are usage errors (§8.10.5, §8.10.7).
 
 **Human-readable output.** The per-test line for a panicked test uses the word `PANIC`, and the panic message follows it:
 
@@ -2487,7 +2487,7 @@ cat trace.ndjson | jq 'select(.event == "state" and .var == "pending_comments")'
 
 #### 8.15.2 Event Types
 
-Four event types form a complete and orthogonal basis for execution observation:
+Four event types form a complete and orthogonal basis for observation of the execution of a program. A fifth type, `note`, does not observe the program. It carries a message that the program wrote with `trace.log` (§8.15.7):
 
 | Event | Observes | Description |
 |-------|----------|-------------|
@@ -2495,6 +2495,7 @@ Four event types form a complete and orthogonal basis for execution observation:
 | `exit` | Function return | Return value and wall-time duration |
 | `state` | Store transitions | Mutation of `let mut` bindings |
 | `effect` | Effect operations | Algebraic effect invocations (IO, FS, DB, etc.) |
+| `note` | A program message | A message from a `trace.log` call (§8.15.7). It is not an effect operation |
 
 Program termination events (`panic`, assertion failures) are not trace events — they produce structured diagnostics through the existing error reporting pipeline (§8.6).
 
@@ -2505,7 +2506,7 @@ All events share common fields:
 | Field | Type | Present | Description |
 |-------|------|---------|-------------|
 | `ts_us` | Int | all | Monotonic microseconds since trace start |
-| `event` | Str | all | `"enter"` \| `"exit"` \| `"state"` \| `"effect"` |
+| `event` | Str | all | `"enter"` \| `"exit"` \| `"state"` \| `"effect"` \| `"note"` |
 | `fn` | Str | all | Fully-qualified function name (`module.function`) |
 | `module` | Str | all | Module name |
 | `depth` | Int | all | Call stack depth (0 = top-level) |
@@ -2524,6 +2525,8 @@ Per-event fields:
 | `effect` | Str | `effect` | Effect type (e.g. `"IO.Print"`, `"FS.Write"`) |
 | `op` | Str | `effect` | Operation name (e.g. `"io.println"`) |
 | `args` | `{name: str}` | `effect` | Operation arguments as Display strings |
+| `channel` | Str | `note` | The channel name that the `trace.log` call gave |
+| `msg` | Str | `note` | The message text. Values longer than 200 characters are truncated, with `"truncated":true` appended |
 
 Design notes:
 - **`span` appears only on `enter`** — source location is static per function.
@@ -2551,7 +2554,7 @@ Filters use colon-syntax: `--trace=key:value`. Multiple filters compose with AND
 | `fn:<name>` | Match function name (short or fully-qualified) |
 | `module:<name>` | Match module name |
 | `depth:<n>` | Events at call depth <= N |
-| `event:<type>` | Only emit specified event types |
+| `event:<type>` | Only emit specified event types (`event:note` selects `note` events) |
 | `effect:<name>` | Match effect type (e.g. `FS.Write`) |
 | `state:<var>` | Match state variable name |
 
@@ -2563,11 +2566,80 @@ blink run app.bl --trace=fn:skip_newlines+parse_block   # two functions (OR)
 blink run app.bl --trace=event:state,module:parser      # state events in parser only
 ```
 
-Bare `--trace` with no value traces all events. The `BLINK_TRACE` environment variable accepts the same filter syntax.
+Bare `--trace` with no value traces all events. The `BLINK_TRACE` environment variable accepts the same filter syntax. The `fn:`, `module:` and `depth:` filters apply to a `note` event. A `note` event has no effect type and no state variable, so an `effect:` or `state:` filter does not select it.
 
 #### 8.15.6 Timestamp Semantics
 
 `ts_us` is a monotonic microsecond counter relative to trace start (not wall-clock time). Microsecond resolution matches the instrumentation overhead — sub-microsecond precision would measure the tracer, not the program.
+
+#### 8.15.7 Trace Notes: `trace.log`
+
+A program can leave development notes in the trace output. `trace.log(channel: Str, msg: Str)` is a built-in call. It has no row, so a fn that calls it needs no declaration for it, and no handler receives the call. It is trace output (§4.4, *Runtime writes are not operations*), not an `IO.Eprint` operation.
+
+```blink
+fn lower(id: Int) -> Int {
+    trace.log("mono", "lower {id}")
+    id + 1
+}
+```
+
+`lower` has no row.
+
+**The gate.** The env var `BLINK_TRACE_CHANNELS` turns channels on. Its value is `all`, or a comma-separated list of channel names. The program reads the var once, when it starts. A later `env.set_var` does not change it. It is separate from `BLINK_TRACE` (§8.15.5). No call asks whether a channel is on. With `BLINK_TRACE_CHANNELS=mono`, `lower(4)` writes `[trace:mono] lower 4` to stderr. If the var is unset, or does not name `mono`, `lower(4)` writes nothing.
+
+**The form.** By default a call writes one text line, `[trace:<channel>] <msg>`, to stderr. When `--trace` is on (§8.15.1), the same call writes a `note` event to the NDJSON stream, in place of the text line, so that each stderr line is valid JSON:
+
+```json
+{"ts_us":40,"event":"note","fn":"main.lower","module":"main","depth":1,"channel":"mono","msg":"lower 4"}
+```
+
+The `BLINK_TRACE_CHANNELS` gate applies in both forms. The `event:note` filter selects the `note` events.
+
+**`msg` is lazy.** The program does not evaluate `msg` when the channel is off. For this reason `msg` may only read state: it may read a module-level `let` or `let mut` binding directly, and call fns with an empty row. It adds no `State` to the row of the enclosing fn. A write to state, a call of a fn that has a row, and any handler operation (even a read through a handler, such as `env.cwd()`) in `msg` is `TraceMessageEffect` (E0566):
+
+```blink
+let mut depth = 0
+
+fn walk(n: Int) -> Int {
+    trace.log("walk", "depth={depth}")           // accepted: a direct read of a module binding
+    trace.log("walk", "dir={env.cwd()}")         // error[TraceMessageEffect] E0566: `msg` calls `env.cwd`, a handler operation
+    trace.log("walk", "next={next_id()}")        // error[TraceMessageEffect] E0566: `msg` calls `next_id`, which has a row
+    trace.log("walk", "d={bump()}")              // error[TraceMessageEffect] E0566: `msg` calls `bump`, which writes `depth`
+    n
+}
+```
+
+**Known limit.** A `msg` that panics does so only when its channel is on, in the same way as a `debug_assert` that is off hides the panic of its condition. A program that is correct with the channel off can panic with it on. Keep `msg` simple.
+
+**A trace call does not keep code alive.** A `trace.log` call is not an observable effect of the program. If the compiler drops a call to a fn that has an empty row and whose result no code uses, the `trace.log` lines in that fn do not appear. A call that does run writes its line once. The program does not reorder or merge the lines of one thread.
+
+```blink
+fn cost(n: Int) -> Int {
+    trace.log("c", "cost {n}")
+    n * 2
+}
+
+fn main() ! IO {
+    let _ = cost(3)
+    io.println("done")
+}
+```
+
+With `BLINK_TRACE_CHANNELS=c`, stdout is `done`. stderr is `[trace:c] cost 3`, or empty if the compiler dropped the call to `cost`. With the var unset, stderr is empty. stdout is `done` in all cases.
+
+**Order.** The lines of a thread come in program order with the other stderr writes of the same thread (`io.eprintln` and the like). The order against stdout is not specified. A capturing handler (`capture_eprint`) does not see trace lines, so its list is outside this rule:
+
+```blink
+fn main() ! IO {
+    io.eprintln("a")
+    trace.log("t", "b")
+    io.eprintln("c")
+}
+```
+
+With `BLINK_TRACE_CHANNELS=t`, stderr is `a`, `[trace:t] b`, `c`, in this order.
+
+**Panel vote:** **5-1** for a rowless built-in tracer (Minimalism dissented: no tracer). **5-1** for a lazy `msg` (Minimalism dissented: reject any state read). **5-1** that a trace call does not keep code alive (AI/ML dissented: the call keeps code alive). **6-0** for program order. **5-1** for a text line by default and a `note` event under `--trace` (Minimalism dissented: always a text line). See [decisions/panic-hook-and-dev-trace.md](../decisions/panic-hook-and-dev-trace.md).
 
 ---
 

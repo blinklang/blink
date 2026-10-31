@@ -440,6 +440,11 @@ fn quiet() ! IO.Print {
     warn("x")             // error[UndeclaredEffect] E0500: `warn` requires `IO.Eprint`
 }
 
+fn fail_hard(msg: Str) ! Env.Exit {
+    io.eprintln("fatal: {msg}")   // error[UndeclaredEffect] E0500: `io.eprintln` requires `IO.Eprint`
+    env.exit(2)                   // help: for an internal error, call panic(...) and install on_panic in main
+}
+
 fn main() ! IO {
     let got: List[Str] = []
     with capture_eprint(got) { warn("a") }
@@ -465,7 +470,7 @@ fn main() ! IO {
 }
 ```
 
-**Runtime writes are not operations.** Only four kinds of write to stderr are not `IO.Eprint` operations: the panic and abort messages, the assert-failure messages, the test runner report, and the trace output (§8.15). The runtime makes these writes. They have no row, and no handler receives them. This list is closed. Blink code that writes to stderr calls `io.eprintln`, `io.eprint` or `io.eprint_raw`, and those calls are `IO.Eprint` operations. That holds for stdlib code and for the test runner's own Blink code too: such a call is an ordinary operation. It escapes the handler of a user's `with` only when it runs outside the dynamic scope of that `with`. A panic inside `with capture_eprint(got) { ... }` still reaches the terminal, and its text does not land in `got`:
+**Runtime writes are not operations.** Only four kinds of write to stderr are not `IO.Eprint` operations: the panic and abort messages, the assert-failure messages, the test runner report, and the trace output (§8.15). The runtime makes these writes. They have no row, and no handler receives them. This list is closed. A `trace.log` call (§8.15.7) writes trace output, so it is on the list and adds no kind to it. A panic hook (§2.20) adds nothing to the list: the hook is Blink code, and each write in it is an ordinary operation. `main` pays the row of the hook, at the `with` that installs it (§4.7.1). Blink code that writes to stderr calls `io.eprintln`, `io.eprint` or `io.eprint_raw`, and those calls are `IO.Eprint` operations. That holds for stdlib code and for the test runner's own Blink code too: such a call is an ordinary operation. It escapes the handler of a user's `with` only when it runs outside the dynamic scope of that `with`. A panic inside `with capture_eprint(got) { ... }` still reaches the terminal, and its text does not land in `got`:
 
 ```blink
 import std.testing.{capture_eprint}
@@ -1103,7 +1108,7 @@ fn run_cli() ! Env.Read, Env.Exit, IO {
 
 **Why `env.exit()` is an effect operation, not standalone:**
 
-`panic()` is untracked divergence — it represents a program error (invariant violation). `exit()` is intentional control flow with an observable result (the exit code). Making it an effect operation means:
+`panic()` is untracked divergence — it represents a program error (invariant violation). `exit()` is intentional control flow with an observable result (the exit code). A panic hook (§2.20) is not a catch and does not change this: the hook runs at the panic point, and the process still ends. Making `exit()` an effect operation means:
 
 1. Handlers can intercept it for testing — a mock `Env` handler captures exit codes instead of terminating the test runner
 2. The capability system tracks which code can terminate the process
@@ -2974,6 +2979,8 @@ fn main() ! IO.Print, FS.Read, DB.Read {
 
 The LSP displays `main`'s actual effect set as an inlay hint, computed from the transitive closure of everything `main` calls. If `main` only calls pure functions and one `io.print`, the hint shows `! IO.Print` -- not "all effects." This is documentation, not enforcement.
 
+`main` is also the only place for a panic hook (§2.20). The hook is a `with` item of `main`, and the row of the hook is charged to `main`, which holds the built-in effects. A user-declared effect in the row of the hook needs a handler that encloses the `with` (E0539).
+
 **Why implicit on `main`:** Requiring `main` to declare effects is pure ceremony. `main` is the program. Its effect set is "whatever the program does." An explicit annotation on `main` would just be a worse version of what the compiler already computes. Every other public function must declare effects explicitly -- `main` is the single exception.
 
 #### Unhandled user effects
@@ -3281,7 +3288,7 @@ The type of a `with` item decides what the item does. A `with` item has one of t
 | `Handler[E]` or `Handler[E ! R]` | Install the handler for `E`, run the body, uninstall the handler. The enclosing code must hold `R` (§4.7.1, *The clause row*). |
 | A scoped value: `T` where `T: Scoped`, which includes every `Closeable` type (§4.7.2) | Call `enter()`. If `T.Context` is `Handler[E]` with a concrete `E`, install the handler that `enter()` returned. Run the body. Uninstall that handler. Call `exit(ok)`. |
 
-`arena` is a keyword item with its own typing rule (§5.2). A `handler E { ... }` expression has type `Handler[E]`, so it takes the first rule.
+`arena` is a keyword item with its own typing rule (§5.2). `on_panic(f)` is a built-in item with its own typing rule (§2.20): it takes a fn of type `fn(PanicInfo) -> Never` and installs a panic hook. It is not a `Handler` or a scoped value, and E0839 does not apply to it. It is allowed only in the body of `main` (E0565). A `handler E { ... }` expression has type `Handler[E]`, so it takes the first rule.
 
 An item of any other type is a compile error (E0839). If the type is a `Result` or an `Option`, the help text says to add `?`.
 
@@ -3934,6 +3941,8 @@ A failed assertion in the cleanup that runs on any of these paths can change the
 A **fatal runtime error** is a fault the runtime cannot recover from: OOM, stack overflow, or foreign code that ends the process. The runtime ends the process at once. Nothing unwinds, and no `exit()` or `close()` runs.
 
 The runtime catch frames are the test runner's per-test boundary, the `?`/`return` desugar, and — within a test only — the boundary armed by an `assert_panics` block (§2.20) and the frame that the test runner puts around each case of `std.testing.for_each` (§8.10.2). The case frame records a panic in its case as `panicked` and the loop goes on. An enclosing `assert_panics` block does not see that panic. The case frame belongs to the test runner, and user code cannot create a frame of its own. The set of runtime catch boundaries is **exhaustively defined by this spec and cannot be extended by user code**. Introducing user-level panic recovery (e.g., `recover`, `catch_panic`) would require a separate spec amendment that re-evaluates `exit()`/`close()` semantics under the new boundary set.
+
+**A panic hook is not a catch boundary.** A hook installed with `on_panic` (§2.20) runs at the panic point. It cannot return, no frame unwinds, and no `exit()` or `close()` runs. So the last row of the table above holds with a hook, too: the hook only replaces the default report and the exit code (101).
 
 **Amendment — `assert_panics` extends the catchable-unwind set (compiler-managed, not user-extensible).** Be precise about what changed: outside a test, a real `panic()` does *not* unwind to any in-process catch frame — it terminates the process and bypasses `exit()`/`close()` (the last row above). `assert_panics` (§2.20) genuinely *adds* a new catch boundary: within the dynamic extent of its block, a panic is caught and converted to a test pass/fail rather than terminating the process. This boundary is **compiler-managed and test-only** — only an `assert_panics` block arms it, is rejected outside a test (E0833), is not nestable (E0834), and exposes **no user-nameable symbol** (there is no `recover`/`catch_panic` a user can call). It therefore does not extend the set of catch boundaries reachable by *user code*; the user-extensible set remains empty, and the fence above holds.
 

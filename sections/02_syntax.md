@@ -2541,7 +2541,7 @@ Assertion failure panics — unwinding to the test runner, which marks the test 
 
 #### `panic()` Function
 
-`panic(msg: Str) -> Never` is a built-in available in all code — not just tests. It triggers an unwind with the given message. In test blocks, the test runner catches the unwind and marks the test as failed. In production code, panic terminates the process with a stack trace.
+`panic(msg: Str) -> Never` is a built-in available in all code — not just tests. It triggers an unwind with the given message. In test blocks, the test runner catches the unwind and marks the test as failed. In production code, panic terminates the process with a stack trace, and the exit code is 101. A program may install a panic hook in `main` (*Panic Hook*, below). With a hook, a panic calls the hook, and the hook ends the process.
 
 ```blink
 fn divide(a: Int, b: Int) -> Int {
@@ -2550,7 +2550,7 @@ fn divide(a: Int, b: Int) -> Int {
 }
 ```
 
-`panic` returns `Never` (§3.2), the bottom type. `Never` has no values and is a subtype of every type, so a call to `panic` fits in any expression position. Panic is *not* an algebraic effect — it is untracked divergence, like integer division by zero or array bounds violations. It cannot be caught or handled in normal code (only the test runner catches it).
+`panic` returns `Never` (§3.2), the bottom type. `Never` has no values and is a subtype of every type, so a call to `panic` fits in any expression position. Panic is *not* an algebraic effect — it is untracked divergence, like integer division by zero or array bounds violations. It cannot be caught or handled in normal code (only the test runner catches it). A panic hook is not a catch: it runs at the panic point, it cannot return, and the process still ends.
 
 **Use `Result[T, E]` for recoverable errors.** `panic` is reserved for programmer errors, violated invariants, and genuinely unreachable states. In a library package, `PanicInLibrary` (W0705, below) warns on each `panic`. It does not fire on `todo()` or `unreachable()`.
 
@@ -2567,7 +2567,7 @@ unreachable() -> Never
 unreachable(msg: Str) -> Never
 ```
 
-Both are available in all code. At run time each one is a `panic` (above): untracked divergence, caught by the test runner in a test block, process termination in production code. Neither is an effect, and neither adds a typing rule: each call has type `Never`, so it diverges by the rule in §3.3 *Divergence and Body Completeness*.
+Both are available in all code. At run time each one is a `panic` (above): untracked divergence, caught by the test runner in a test block, process termination in production code (with exit code 101, or through the panic hook when `main` installs one). Neither is an effect, and neither adds a typing rule: each call has type `Never`, so it diverges by the rule in §3.3 *Divergence and Body Completeness*.
 
 The two forms are a property of these built-ins only. A user function has one signature, and a positional parameter cannot have a default value (§2.13). Writing `msg: Str = ""` for these built-ins would show a signature that no user can write, so the spec lists both forms.
 
@@ -2678,6 +2678,139 @@ The output never proposes changing `panic` to `unreachable` as the repair by its
 
 **`blink explain W0705`.** The explain text names the repairs in this order. First, return `Result`. Second, for a condition that each caller must meet, state it with `@requires(...)` (§3b.2) and remove the check, so that no `panic` remains. Third, `unreachable()` for a path that can never run. Fourth, `@allow(PanicInLibrary)`. It says that adding `@requires` and changing the `panic` to `unreachable` is not a repair.
 
+#### Panic Hook: `on_panic`
+
+A program can run its own code when a panic ends it. That code is a **panic hook**. A hook lets a tool write its own report (a status line on stdout, a JSON error frame for an editor) and choose its exit code. A hook is not a catch. The fns that can panic keep their rows: they carry no row for the hook.
+
+`on_panic(f)` is a built-in `with` item (§4.7). Its argument `f` has type `fn(PanicInfo) -> Never`, with whatever row `f` declares. `PanicInfo` is a built-in type:
+
+```blink
+type PanicInfo {
+    message: Str
+    file: Str
+    line: Int?
+}
+```
+
+`message` is the text that `panic` got. `line` is `None` when the line is not known. It is never `0`.
+
+```blink
+fn report(p: PanicInfo) -> Never ! IO.Eprint, Env.Exit {
+    let at = match p.line {
+        Some(n) => "{p.file}:{n}"
+        None => p.file
+    }
+    io.eprintln("fatal: {p.message} at {at}")
+    env.exit(70)
+}
+
+fn deep(n: Int) -> Int {
+    if n > 3 { panic("n out of range: {n}") }
+    n
+}
+
+fn main() ! IO, Env {
+    with on_panic(report) {
+        io.println("{deep(9)}")
+    }
+}
+```
+
+stdout is empty. stderr is `fatal: n out of range: 9 at app.bl:12`. The exit code is 70. `deep` has no row.
+
+**Where the hook runs.** The hook runs at the panic point, on the thread that panicked. Nothing unwinds: no `exit()` of a `with` item and no `close()` runs (§4.7.2). The hook cannot return, because its type is `-> Never`. A hook body that can fall through is the error of §3.3 *Divergence and Body Completeness*. The process ends when the hook calls `env.exit`.
+
+**What the hook gets.** It gets each panic that no runtime catch frame takes (§4.7.2): `panic()`, `todo()`, `unreachable()`, a failed contract, an overflow, an index out of bounds. A fatal runtime error (out of memory, stack overflow) is not a panic. The hook does not run for it.
+
+**The row of the hook.** The row of the hook is charged at the `with`, in `main`, in the way that the row of a handler clause is charged (§4.7.1). `main` holds every built-in effect (§4.6), so the hook may use them with no declaration. A user-declared effect in the row of the hook needs a handler that encloses the `with` (E0539). Each operation in the hook goes to the handlers that are in scope at the `with`. It does not go to the handlers in scope at the panic point:
+
+```blink
+import std.testing.{capture_eprint}
+
+fn main() ! IO, Env {
+    let got: List[Str] = []
+    with on_panic(report) {
+        with capture_eprint(got) {
+            let _ = deep(9)     // `report` runs here
+        }
+    }
+    // not reached: `report` ended the process. The stderr text went to the
+    // terminal. `got` was never in scope at the `with on_panic`.
+}
+```
+
+**One hook, in `main`.** A program has at most one hook. It stands in the body of `main`, as an item of a `with` that `main` itself holds. A hook in any other place is `PanicHookPlacement` (E0565), and so is a second hook in `main`. A library cannot take the crash report of the program that uses it. The places that fail are a fn other than `main`, a closure or nested fn in `main`, a `test` block, any other use of `on_panic` (it is only a `with` item), and a second `on_panic`:
+
+```blink
+fn serve() ! IO {
+    with on_panic(report) {              // error[PanicHookPlacement] E0565: `on_panic` outside `main`
+        run()
+    }
+}
+
+fn main() ! IO, Env {
+    with on_panic(report) { run() }
+    with on_panic(report) { run() }      // error[PanicHookPlacement] E0565: a second `on_panic` in `main`
+}
+
+test "no hook in a test" {
+    with on_panic(report) { run() }      // error[PanicHookPlacement] E0565: `on_panic` in a `test` block
+}
+```
+
+**A panic in the hook.** A panic inside the hook writes the default report and exits with code 101. The runtime does not call the hook a second time. A hook runs after the panic says that program data may be broken. A hook that walks that data can panic again, and then the default report is all that the program writes.
+
+**The hook in tests.** `main` does not run under the test runner, so no hook is installed. The runner frame (or an `assert_panics` block) takes every panic (§4.7.2). A test checks the hook by calling it as a plain fn. `mock_env` makes `env.exit` panic, and `assert_panics` takes that panic (§8.10.3):
+
+```blink
+import std.testing.{capture_print, mock_env}
+
+test "report writes the status line and exits 101" {
+    let out: List[Str] = []
+    assert_panics(matching: "env.exit(101)") {
+        with capture_print(out), mock_env(Map.new()).as_handler() {
+            report(PanicInfo { message: "ice", file: "a.bl", line: Some(3) })
+        }
+    }
+    assert(out.get(0).unwrap().contains("ice"))
+}
+```
+
+This example uses a `report` that writes with `io.println` and ends with `env.exit(101)`.
+
+**State for the report.** A hook that must name the current request reads it from module state. The program writes that state before it handles each request:
+
+```blink
+let mut cur_uri = ""
+let mut cur_id = 0
+
+fn report(p: PanicInfo) -> Never ! IO.Print, Env.Exit, State {
+    io.println("error id={cur_id} uri={cur_uri}: {p.message}")
+    env.exit(101)
+}
+
+fn serve() ! IO, State {
+    loop {
+        let req = next_request()
+        cur_uri = req.uri
+        cur_id = req.id
+        handle(req)
+    }
+}
+
+fn main() ! IO, Env {
+    with on_panic(report) {
+        serve()
+    }
+}
+```
+
+A module `let mut` is one cell for all threads, and the language has no per-thread state (§4.16). If several threads handle requests at the same time, the cell holds the request of the thread that wrote last, and the report can name the wrong request. This section does not say whether the hook calls of two threads that panic at the same time overlap.
+
+**No hook.** With no hook, a panic writes its report to stderr (the lead-in `panic: ` and the suffix ` at file:line` are not normative) and the process exits with code 101. The code differs from `env.exit(1)`, so a caller can tell a crash from a reported failure. The test runner keeps its own rule: a panic has no exit code of its own there (§8.10).
+
+**Panel vote:** **5-1** for a panic hook (Minimalism dissented: report through a root that holds the rows, or through a parent process). **5-1** for one hook, in `main` only (PLT dissented: any `with`, so a closure can hold per-request state). **6-0** for exit code 101 with no hook. See [DECISIONS.md](../DECISIONS.md) and [decisions/panic-hook-and-dev-trace.md](../decisions/panic-hook-and-dev-trace.md).
+
 #### `assert_panics` — Asserting Expected Panics
 
 `assert_panics` verifies that a block of code panics. It is the fifth test assertion, in the same family as `assert_matches`: a **compiler-recognized block**, not a function and not a closure value.
@@ -2699,7 +2832,7 @@ test "unwrap on empty list panics with the expected message" {
 
 The literal `10 / 0` in the first test gives no warning: `DivisionByLiteralZero` (W0704, §3.6 *Integer Division*) and `LiteralArithmeticOverflow` (W0708, §3.6 *Literal arithmetic overflow*) do not fire inside an `assert_panics` body.
 
-**Form.** The body is a `{ ... }` block, *not* a `fn() { }` closure. It can appear only as the operand of `assert_panics` — it cannot be bound to a variable, passed as a higher-order argument, returned, or stored. This is the same syntactic discipline as the pattern argument of `assert_matches`: the construct is operand-only, so no first-class panic-catching handle ever exists. `assert_panics` itself yields no value (its type is `()`); you cannot write `let x = assert_panics { ... }`. There is no `PanicInfo` binding, no `Result`, no `Bool` — the only observable outcome is whether the surrounding test passes or fails.
+**Form.** The body is a `{ ... }` block, *not* a `fn() { }` closure. It can appear only as the operand of `assert_panics` — it cannot be bound to a variable, passed as a higher-order argument, returned, or stored. This is the same syntactic discipline as the pattern argument of `assert_matches`: the construct is operand-only, so no first-class panic-catching handle ever exists. `assert_panics` itself yields no value (its type is `()`); you cannot write `let x = assert_panics { ... }`. There is no `PanicInfo` binding (that type belongs to the panic hook), no `Result`, no `Bool` — the only observable outcome is whether the surrounding test passes or fails.
 
 **Optional `matching:`.** The optional `matching:` keyword argument takes a `Str` and is a **literal substring test**, not a pattern or regular-expression language. The assertion passes only if the panic message *contains* that substring. Substring (rather than exact) matching is deliberate: panic messages carry a volatile ` at file:line` suffix, and a substring matches the stable part (`"unwrap called on None"`, §7.5) while ignoring the location. There is no anchoring, glob, or regex syntax — `matching:` is a plain substring and will not grow metacharacter semantics. String interpolation in the `matching:` argument follows the standard rules.
 
@@ -2726,7 +2859,7 @@ test "rolls back on the expected panic" {
 }
 ```
 
-This is the one place in the language where a `panic` unwind runs cleanup. An *unexpected* panic (outside any `assert_panics` body) still terminates the process and bypasses cleanup, exactly as before. See §4.7.2 for the catchable-unwind set and the fence amendment.
+This is the one place in the language where a `panic` unwind runs cleanup. An *unexpected* panic (outside any `assert_panics` body) still terminates the process and bypasses cleanup, exactly as before. With a panic hook in `main`, the hook runs at the panic point and cleanup is still bypassed. See §4.7.2 for the catchable-unwind set and the fence amendment.
 
 **Why a block, not a closure.** A closure (`fn() { ... }`) is a first-class value: a user could bind it (`let g = ...`) and hold a value whose invocation is panic-catchable, leaking panic recovery into ordinary code. The only guarantee the compiler enforces is about where a catch frame is **created**: a catch frame can only be created by code written lexically inside a `test { ... }` block (**E0833**). A recognized block is never a value, so no expression in the language has a panic-catching type, and `panic: Never` stays sound in the narrow sense that no signature can promise recovery. A closure written inside a test may still *contain* an `assert_panics` block. Nothing confines the resulting function value after that. It may be passed to ordinary code, stored in module-level mutable state, and invoked later from a plain `fn` with no test on the call stack. The block form also keeps the surface familiar: like `pytest.raises(...)` / Rust `#[should_panic(expected = "...")]`, you wrap the region and optionally assert the message.
 
@@ -2818,7 +2951,7 @@ test "deposit then withdraw" {
 
 `with` handlers run their `exit(false)` on assertion failure (§4.7.2 / `Scoped` catchable-unwind), so transactional rollback, log capture, and temp-path cleanup all behave correctly across the unwind.
 
-**Why no `subtest` primitive.** Adding `subtest` as either a stdlib HOF or a compiler-recognized block was deliberated and rejected. The shapes that go beyond `for_each` + flat `test` blocks all require either (a) a second catch-site for `panic` inside `test` (so siblings could continue after one fails), which would contradict §2.20's "panic is untracked divergence; only the test runner catches it" and §4.7.2's deferral of recoverable panics, or (b) sugar that adds language surface without expressivity gain. Future evidence-driven re-evaluation may reopen the question; the current evidence (no shipped feature missing it, `for_each` covers parametric, helper `fn` covers heterogeneous) is that the gap is documentation-shaped, not syntax-shaped.
+**Why no `subtest` primitive.** Adding `subtest` as either a stdlib HOF or a compiler-recognized block was deliberated and rejected. The shapes that go beyond `for_each` + flat `test` blocks all require either (a) a second catch-site for `panic` inside `test` (so siblings could continue after one fails), which would contradict §2.20's "panic is untracked divergence; only the test runner catches it" (a panic hook is not a catch) and §4.7.2's deferral of recoverable panics, or (b) sugar that adds language surface without expressivity gain. Future evidence-driven re-evaluation may reopen the question; the current evidence (no shipped feature missing it, `for_each` covers parametric, helper `fn` covers heterogeneous) is that the gap is documentation-shaped, not syntax-shaped.
 
 **Panel vote: 5-1** (sys dissent for compiler builtin with static enumerability). See [DECISIONS.md](../DECISIONS.md) and [decisions/sub-tests.md](../decisions/sub-tests.md).
 
@@ -3198,7 +3331,7 @@ Doc-tests verify that documentation stays in sync with implementation. They are 
 - `assert_matches` takes a pattern (not an expression) as its second argument
 - `assert_panics { ... }` (optional `matching: Str` substring) asserts the block panics — a compiler-recognized block, test-only, valueless, non-nestable
 - Assertion failure panics (unwind to test runner, expression introspection on failure)
-- `panic(msg: Str) -> Never` available everywhere — untracked divergence, not an effect
+- `panic(msg: Str) -> Never` available everywhere — untracked divergence, not an effect. An uncaught panic exits with code 101, or calls the hook that `main` installs with `with on_panic(f)` (one hook, in `main` only)
 - Test runner distinguishes assertion failures from unexpected panics in JSON output
 - `prop_check` built-in for property-based testing
 - Tests in a file see all items (pub and private) in that file's module
