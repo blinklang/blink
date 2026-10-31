@@ -5488,8 +5488,8 @@ type ExpectedPart {
 
 // The positions of `val` that its own expected type reaches, each with the type expected
 // there (sections/03_types.md *Expected type at a site*): each tail of a block, an if or a
-// match; each element of a list or tuple literal; both arms of `??`; the payload of
-// `Some`/`Ok`/`Err`. Read from the syntax alone, so the walk before inference
+// match; each element of a list or tuple literal; each bound of a range; both arms of `??`;
+// the payload of `Some`/`Ok`/`Err`. Read from the syntax alone, so the walk before inference
 // (tc_seed_expected_into_value) and the walk after it (tc_pin_declared_into_value) descend
 // the same positions. Empty when `val` has none.
 fn tc_expected_parts(val: Int, expected: Int) -> List[ExpectedPart] {
@@ -5544,6 +5544,17 @@ fn tc_expected_parts(val: Int, expected: Int) -> List[ExpectedPart] {
             }
             i = i + 1
         }
+        return parts
+    }
+    // Each bound of a range meets the element type. A literal bound beside a bound that is not
+    // one takes that bound's type instead (tc_literal_takes_operand), so it is not a part.
+    if k == NodeKind.RangeLit {
+        if tc_tid_kind(d) != TyKind.Range { return parts }
+        let et = tc_tid_child(d, 0)
+        let lo = node_start(val)
+        let hi = node_end(val)
+        if !tc_lone_literal_beside(lo, hi) { parts.push(ExpectedPart { value: lo, expected: et }) }
+        if !tc_lone_literal_beside(hi, lo) { parts.push(ExpectedPart { value: hi, expected: et }) }
         return parts
     }
     // `a ?? b` is a match on `a` whose `Some` arm yields a's value and whose `None` arm is `b`
@@ -28562,6 +28573,10 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
             if tc_tid_is_no_info(hi_t) != 0 { return tc_error_recovery_tid() }
             return make_range_type(hi_t)
         }
+        // A literal bound beside a bound that is not one takes that bound's integer type, as
+        // an operand of an integer operator does: `250..=top` with `top: U8` is a Range[U8].
+        if tc_literal_takes_operand(node_start(node), node_end(node), hi_t) { return make_range_type(hi_t) }
+        if tc_literal_takes_operand(node_end(node), node_start(node), lo_t) { return make_range_type(lo_t) }
         if tc_tid_is_no_info(hi_t) == 0 && types_compatible(lo_t, hi_t) == 0 {
             tc_error_at("range bounds must have one type, got {type_to_str(lo_t)} and {type_to_str(hi_t)}", node_end(node))
         }
@@ -32280,10 +32295,11 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
         // under-determined type is an error. Testing the element instead of the kind would put a
         // NotIterable on a list, which is the one thing this arm must never say.
         let has_elem_rule = iter_tk == TyKind.List || iter_tk == TyKind.Set || iter_tk == TyKind.Map || iter_tk == TyKind.Range
-        // §2.10 does not say how a `for` steps a Range whose bound is not Int, and the loop
-        // lowering counts in Int, so any other bound is refused here rather than miscompiled.
-        if iter_tk == TyKind.Range && type_kind(tc_resolve(elem_t)) != TyKind.Int && type_kind(tc_resolve(elem_t)) != TyKind.Unknown {
-            diag_error_at("NotIterable", NOT_ITERABLE, "cannot iterate over type `{type_to_str(iter_t)}` with a `for` loop -- only a range of Int can be walked", node_iterable(node), "iterate a `Range[Int]` instead")
+        // §2.10 walks a range of an integer type (its `U8` example) and does not say how to step
+        // any other element type, so any other bound is refused here rather than miscompiled.
+        let elem_k = type_kind(resolve_alias_tid(tc_resolve(elem_t)))
+        if iter_tk == TyKind.Range && is_integer_type(resolve_alias_tid(tc_resolve(elem_t))) == 0 && elem_k != TyKind.Unknown {
+            diag_error_at("NotIterable", NOT_ITERABLE, "cannot iterate over type `{type_to_str(iter_t)}` with a `for` loop -- only a range of an integer type can be walked", node_iterable(node), "iterate a range of an integer type instead")
         }
         if has_elem_rule == 0 {
             // TyKind.Unknown here means iter_t is still an unbound metavar (e.g. a lazy-adapter
