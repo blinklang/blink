@@ -262,8 +262,10 @@ BLINK_RT_FN int64_t blink_unix_listen_fd(int64_t fd) {
 }
 #endif
 
-/* A connect that a signal interrupts goes on in the kernel, so EINTR is not retried here:
-   a second connect would fail with EALREADY. */
+/* EINTR is not retried here, and the caller gets Os("connect", EINTR). On Linux an
+   interrupted AF_UNIX connect leaves the socket unconnected, but POSIX lets the connect go
+   on in the kernel, and there a second connect fails with EALREADY. The runtime's own
+   signal handlers set SA_RESTART, so only a handler without it can cause EINTR here. */
 BLINK_RT_FN int64_t blink_unix_connect_fd(int64_t fd, const char* path);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN int64_t blink_unix_connect_fd(int64_t fd, const char* path) {
