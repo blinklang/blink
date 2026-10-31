@@ -52,6 +52,7 @@ Single source of truth for release history. `blink llms` and `blink llms --full`
 - **`std.random` has `shuffle` and `choice`.** `shuffle(xs)` returns a new list in random order; `choice(xs)` returns one element, or `None` for an empty list.
 - **Python-style random calls get a fix.** `rand.int(0, 10)` and `rand.int(10)` do not compile, and the fix is `rand.int(0..10)`. `rand.shuffle(deck)` is E0505, and its fix calls `shuffle(deck)` and adds `import std.random.{shuffle}`. `blink fix`, `blink check --json` and the LSP code action now apply every edit of a fix, or none.
 - **The LSP completes `rand.`** with the operations of `Rand` and the `std.random` helpers. A helper adds its import when you pick it.
+- **A range parse error says what to write.** A range with no end (`0..`, `for i in a.. { }`) or no start (`..5`) is E1100 with the help "write `lo..hi` or `lo..=hi`; Blink has no open-ended range"; inside `xs[...]` the help also names `xs.slice(a, b)` and `s.byte_slice(a, b)`. `0..<n` gets the help "write `0..n`" and a fix that removes the `<`, and `0...n` names both `0..n` and `0..=n`. A bound that is a bare range (`0..1..2`) is E1141 ChainedRange.
 - **Compile time of wide nested types is lower.** A program with 800 non-recursive types compiles in 0.06 s; before, it took 3.8 s.
 - **`fs.*` needs no import.** `fs.read`, `fs.write`, `fs.stat` and the other `fs` operations compile and run without `import std.fs`. Import `std.fs` only to name `FsError`, `FsOp`, `FileInfo` or `FileKind`.
 

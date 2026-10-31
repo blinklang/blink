@@ -1,0 +1,158 @@
+// A range has a start and an end, and `..` has no associativity (sections/02_syntax.md §2.10
+// "No open-ended range" and "Spellings from other languages", §2.19 "Range Operands"). A
+// missing end or start is UnexpectedToken (E1100) with a help that says what to write, and inside
+// `xs[...]` the help also names the slice methods. `..<` and `...` get a help when they touch;
+// only `..<` has a machine fix. A bound that is a bare range is ChainedRange (E1141), with no fix.
+// Each case is one parser row: a second row would mean the parser lost its place.
+
+import std.process.{ProcessResult, ChildEnd}
+import compile_test_helpers
+
+let DIR = "{compile_test_helpers.scratch_root()}/range_parse_errors_say_what_to_write"
+
+let OPEN_HELP = "write `lo..hi` or `lo..=hi`; Blink has no open-ended range"
+let SLICE_HELP = "Blink has no slice syntax: write `xs.slice(a, b)` for a List or Bytes, or `s.byte_slice(a, b)` for a Str"
+
+fn sh(cmd: Str) -> ProcessResult ! Process.Spawn {
+    process.run("sh", ["-c", cmd]).unwrap()
+}
+
+// The body goes on line 5, after `fn main() {` and three lets.
+fn check_json(name: Str, body: Str) -> ProcessResult ! FS.Write, Process.Spawn {
+    let _ = sh("mkdir -p {DIR}")
+    fs.write("{DIR}/{name}.bl", "fn main() \{\n    let n = 5\n    let a = 1\n    let xs = [1, 2, 3]\n{body}\n}\n").unwrap()
+    sh("B=$(pwd)/build/blink; cd {DIR} && $B check --json {name}.bl")
+}
+
+// Typecheck still runs on the tree the parser built for recovery, so only parser rows count.
+fn parser_rows(out: Str) -> List[Str] {
+    let mut rows: List[Str] = []
+    for row in out.trim().split("\n") {
+        if row.contains("\"code\":\"E11") { rows.push(row) }
+    }
+    rows
+}
+
+// The one parser row of `body`, or a text that names what is wrong.
+fn one_row(name: Str, body: Str) -> Str ! FS.Write, Process.Spawn {
+    let r = check_json(name, body)
+    let rows = parser_rows(r.err_out)
+    if rows.len() != 1 { return "want 1 parser row, got {rows.len()}:\n{r.err_out}" }
+    rows.get(0).unwrap()
+}
+
+fn has(row: Str, part: Str) -> Str {
+    if row.contains(part) { "" } else { "want {part} in {row}\n" }
+}
+
+fn lacks(row: Str, part: Str) -> Str {
+    if row.contains(part) { "do not want {part} in {row}\n" } else { "" }
+}
+
+test "a range with no end before a newline is E1100 that asks for an end" {
+    let row = one_row("end_newline", "    let _r = 0..")
+    let p = has(row, "\"code\":\"E1100\"").concat(has(row, "\"message\":\"a range needs an end\"")).concat(has(row, "\"help\":\"{OPEN_HELP}\"")).concat(has(row, "\"line\":5,")).concat(lacks(row, "\"fix\""))
+    assert_eq(p, "")
+}
+
+test "a for header with no range end is E1100 at the body brace" {
+    let row = one_row("end_for", "    for _i in a.. \{ }")
+    let p = has(row, "\"message\":\"a range needs an end\"").concat(has(row, "\"line\":5,\"col\":19")).concat(has(row, "\"help\":\"{OPEN_HELP}\""))
+    assert_eq(p, "")
+}
+
+test "a range with no end before a closing paren or comma asks for an end" {
+    let row = one_row("end_paren", "    let _r = (0..)")
+    assert_eq(has(row, "\"message\":\"a range needs an end\"").concat(has(row, "\"col\":18")), "")
+    let row2 = one_row("end_comma", "    let _t = (0.., 1)")
+    assert_eq(has(row2, "\"message\":\"a range needs an end\"").concat(has(row2, "\"col\":18")), "")
+}
+
+test "a block after `..` outside a for header is the end, not an error" {
+    let r = check_json("end_block", "    let _r = 0..\{ 3 }\n    for _i in 0..n \{\n        let _ = 1\n    }")
+    assert_eq(parser_rows(r.err_out).len(), 0)
+}
+
+test "a range with no end inside an index names the slice methods" {
+    let row = one_row("end_index", "    let _s = xs[1..]")
+    let p = has(row, "\"message\":\"a range needs an end\"").concat(has(row, "\"help\":\"{OPEN_HELP}; {SLICE_HELP}\""))
+    assert_eq(p, "")
+}
+
+test "a range nested in a call inside an index does not name the slice methods" {
+    let row = one_row("end_index_call", "    let _s = xs[n.max(1..)]")
+    let p = has(row, "\"message\":\"a range needs an end\"").concat(has(row, "\"help\":\"{OPEN_HELP}\""))
+    assert_eq(p, "")
+}
+
+test "a prefix `..` outside a pattern or spread asks for a start" {
+    let row = one_row("start_let", "    let _r = ..5")
+    let p = has(row, "\"code\":\"E1100\"").concat(has(row, "\"message\":\"a range needs a start\"")).concat(has(row, "\"help\":\"{OPEN_HELP}\"")).concat(has(row, "\"col\":14"))
+    assert_eq(p, "")
+    let row2 = one_row("start_inclusive", "    let _r = ..=5")
+    assert_eq(has(row2, "\"message\":\"a range needs a start\""), "")
+}
+
+test "a prefix `..` inside an index names the slice methods" {
+    let row = one_row("start_index", "    let _s = xs[..2]")
+    assert_eq(has(row, "\"message\":\"a range needs a start\"").concat(has(row, "\"help\":\"{OPEN_HELP}; {SLICE_HELP}\"")), "")
+    let row2 = one_row("start_index_bare", "    let _s = xs[..]")
+    assert_eq(has(row2, "\"message\":\"a range needs a start\"").concat(has(row2, "\"help\":\"{OPEN_HELP}; {SLICE_HELP}\"")), "")
+}
+
+test "a prefix `..` keeps its meaning in a spread, a copy-update and a pattern" {
+    let body = "    let _ys = [0, ..xs]\n    match xs \{\n        [_h, ..] => \{}\n        _ => \{}\n    }"
+    let r = check_json("start_spread", body)
+    assert_eq(parser_rows(r.err_out).len(), 0)
+    let _ = sh("mkdir -p {DIR}")
+    fs.write("{DIR}/start_update.bl", "type P \{\n    x: Int\n    y: Int\n}\n\nfn main() \{\n    let p = P \{ x: 1, y: 2 }\n    let _q = P \{ x: 3, ..p }\n}\n").unwrap()
+    let u = sh("B=$(pwd)/build/blink; cd {DIR} && $B check --json start_update.bl")
+    assert_eq(parser_rows(u.err_out).len(), 0)
+    assert_eq(u.end, ChildEnd.Exited(0))
+}
+
+test "`..<` that touches is E1100 with a machine fix that removes the `<`" {
+    let row = one_row("half_open", "    let _r = 0..<n")
+    let p = has(row, "\"code\":\"E1100\"").concat(has(row, "\"help\":\"write `0..n`; in Blink, `..` excludes the end\"")).concat(has(row, "\"fix\":\{\"action\":\"remove `<`\",\"text\":\"\",\"span\":\{\"file\":\"half_open.bl\",\"line\":5,\"col\":17,\"end_line\":5,\"end_col\":18}}"))
+    assert_eq(p, "")
+}
+
+test "`..<` with a wider end shows the bounds as written" {
+    let row = one_row("half_open_wide", "    let _r = a * 2..<xs.len() + 1")
+    assert_eq(has(row, "\"help\":\"write `a * 2..xs.len() + 1`; in Blink, `..` excludes the end\""), "")
+}
+
+test "a `<` apart from `..` is a missing end, with no fix" {
+    let row = one_row("half_open_spaced", "    let _r = 0.. < n")
+    let p = has(row, "\"message\":\"a range needs an end\"").concat(has(row, "\"help\":\"{OPEN_HELP}\"")).concat(lacks(row, "\"fix\""))
+    assert_eq(p, "")
+}
+
+test "`...` that touches is E1100 that names both ranges, with no fix" {
+    let row = one_row("three_dots", "    let _r = 0...n")
+    let p = has(row, "\"code\":\"E1100\"").concat(has(row, "\"help\":\"write `0..n` (end excluded) or `0..=n` (end included)\"")).concat(lacks(row, "\"fix\""))
+    assert_eq(p, "")
+}
+
+test "a range bound that is a bare range is E1141 with no fix" {
+    let row = one_row("chain", "    let _p = 0..1..2")
+    let p = has(row, "\"name\":\"ChainedRange\"").concat(has(row, "\"code\":\"E1141\"")).concat(has(row, "\"col\":18")).concat(lacks(row, "\"fix\""))
+    assert_eq(p, "")
+    let row2 = one_row("chain_inclusive", "    let _q = 0..=1..2")
+    assert_eq(has(row2, "\"code\":\"E1141\""), "")
+    let row3 = one_row("chain_long", "    let _q = 0..1..2..3")
+    assert_eq(has(row3, "\"code\":\"E1141\""), "")
+}
+
+test "a parenthesized range as a bound is no parse error" {
+    let r = check_json("chain_paren", "    let _s = (0..1)..2")
+    assert_eq(parser_rows(r.err_out).len(), 0)
+}
+
+test "blink explain E1141 names the parenthesized forms" {
+    let r = sh("build/blink explain E1141")
+    assert_eq(r.end, ChildEnd.Exited(0))
+    assert(r.out.contains("E1141 -- ChainedRange"))
+    assert(r.out.contains("(0..1)..2"))
+    let _ = sh("rm -rf {DIR}")
+}

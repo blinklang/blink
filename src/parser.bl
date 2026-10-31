@@ -11,7 +11,7 @@ import diagnostics.{
     EMPTY_BRACE_EXPR, UNKNOWN_INTRINSIC, MUT_FIELD_NOT_SUPPORTED,
     INVALID_STRING_BACKED_ENUM, INTERP_PARSE_FAILURE,
     TEST_ANNOTATED_RETURN, ELEMENT_ACCESS_HELP, MIXED_OPERATOR_PRECEDENCE, VARIANT_FIELD_DEFAULT_HELP,
-    INTERP_DOUBLE_BRACE, MISSING_INITIALIZER, FOREIGN_CONST_FORM,
+    INTERP_DOUBLE_BRACE, MISSING_INITIALIZER, FOREIGN_CONST_FORM, CHAINED_RANGE,
 }
 
 effect Parse {
@@ -5143,17 +5143,122 @@ fn parse_comparison() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
 // Each bound is a level-8 expression, so `0..n + 1` is `0..(n + 1)` and `-2..3` is `(-2)..3`.
 // The node sits at the start's first token: a BinOp start sits at its operator.
 
+// Where a missing range end or start sits, for its help: in a `for` header a `{` opens the
+// body and so cannot be the end, and inside `xs[...]` the help names the slice methods. Each
+// holds only at the site's own level: inside a nested delimiter a range is a plain one.
+const RANGE_SITE_PLAIN = 0
+const RANGE_SITE_FOR = 1
+const RANGE_SITE_INDEX = 2
+
+const RANGE_OPEN_HELP = "write `lo..hi` or `lo..=hi`; Blink has no open-ended range"
+const RANGE_SLICE_HELP = "Blink has no slice syntax: write `xs.slice(a, b)` for a List or Bytes, or `s.byte_slice(a, b)` for a Str"
+
+// The site of the current token, read back from the tokens: the delimiter that encloses it, or
+// the `in` of a for header at its own level. Only an error path and a `{` after `..` ask, so
+// the scan costs nothing on a well-formed range.
+fn range_site_here() -> Int {
+    let mut depth = 0
+    let mut t = pos - 1
+    while t >= 0 {
+        let k = tokens.kinds.get(t).unwrap()
+        if k == TokenKind.RParen || k == TokenKind.RBracket || k == TokenKind.RBrace || k == TokenKind.InterpEnd {
+            depth = depth + 1
+        } else if k == TokenKind.LParen || k == TokenKind.LBracket || k == TokenKind.LBrace || k == TokenKind.InterpStart {
+            if depth == 0 {
+                if k == TokenKind.LBracket && t > 0 && ends_operand(tokens.kinds.get(t - 1).unwrap()) { return RANGE_SITE_INDEX }
+                return RANGE_SITE_PLAIN
+            }
+            depth = depth - 1
+        } else if depth == 0 && k == TokenKind.In {
+            return RANGE_SITE_FOR
+        } else if depth == 0 && k == TokenKind.Newline {
+            return RANGE_SITE_PLAIN
+        }
+        t = t - 1
+    }
+    RANGE_SITE_PLAIN
+}
+
+// Whether a token of `kind` can end an operand, so that a `[` right after it is an index, as
+// the postfix loop reads it.
+fn ends_operand(kind: TokenKind) -> Bool {
+    if kind == TokenKind.Ident || kind == TokenKind.Self || kind == TokenKind.Question || kind == TokenKind.StringEnd { return true }
+    if kind == TokenKind.Int || kind == TokenKind.Float || kind == TokenKind.CharLit { return true }
+    kind == TokenKind.RParen || kind == TokenKind.RBracket || kind == TokenKind.RBrace
+}
+
+fn range_open_help() -> Str {
+    if range_site_here() == RANGE_SITE_INDEX { "{RANGE_OPEN_HELP}; {RANGE_SLICE_HELP}" } else { RANGE_OPEN_HELP }
+}
+
+// Whether `kind` can begin a level-8 operand. A keyword counts, so that a keyword after `..`
+// keeps its own error.
+fn starts_operand(kind: TokenKind) -> Bool {
+    if kind == TokenKind.Int || kind == TokenKind.Float || kind == TokenKind.CharLit || kind == TokenKind.StringStart { return true }
+    if kind == TokenKind.Ident || kind == TokenKind.LParen || kind == TokenKind.LBracket || kind == TokenKind.LBrace { return true }
+    if kind == TokenKind.Hash || kind == TokenKind.Minus || kind == TokenKind.Bang || kind == TokenKind.Tilde { return true }
+    is_keyword(kind) != 0
+}
+
+// Whether token `t` starts where token `t - 1` ends, with no space between them.
+fn token_touches_previous(t: Int) -> Bool {
+    if t <= 0 || t >= tokens.kinds.len() { return false }
+    tokens.lines.get(t).unwrap() == tokens.lines.get(t - 1).unwrap() && tokens.cols.get(t).unwrap() == tokens.end_cols.get(t - 1).unwrap()
+}
+
 fn parse_range() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
     let r_line = peek_line()
     let r_col = peek_col()
+    let first = pos
     let start = parse_int_ops()
     if !at(TokenKind.DotDot) && !at(TokenKind.DotDoteq) { return start }
+    let op_tok = pos
     let inclusive = if at(TokenKind.DotDoteq) { 1 } else { 0 }
     advance()
-    let end_nd = parse_int_ops()
+    let end_nd = parse_range_end(first, op_tok, inclusive)
     let nd = node_count()
     node_push(AstNode { kind: NodeKind.RangeLit, start: start, end: end_nd, inclusive: inclusive, line: r_line, col: r_col })
+    while at(TokenKind.DotDot) || at(TokenKind.DotDoteq) {
+        diag_error_range("ChainedRange", CHAINED_RANGE, "a bound of a range cannot be a bare range", peek_line(), peek_col(), peek_end_col(), "a range has one start and one end")
+        advance()
+        if starts_operand(peek_kind()) { let _ = parse_int_ops() }
+    }
     nd
+}
+
+// The end of a range whose start is tokens first..op_tok - 1 and whose operator, at op_tok, is
+// already read. `..<` and `...` are other languages' ranges, read for recovery as `..`.
+fn parse_range_end(first: Int, op_tok: Int, inclusive: Int) -> Int ! Parse.Advance, Parse.Build, Diag.Report {
+    if inclusive == 0 && (at(TokenKind.Less) || at(TokenKind.Dot)) && token_touches_previous(pos) {
+        let foreign = pos
+        advance()
+        let end_first = pos
+        let end_nd = if starts_operand(peek_kind()) { parse_int_ops() } else { new_node(NodeKind.IntLit) }
+        let lo = operand_text(first, op_tok - 1)
+        let hi = operand_text(end_first, pos - 1)
+        let (line, col, end_col) = (tokens.lines.get(foreign).unwrap(), tokens.cols.get(foreign).unwrap(), tokens.end_cols.get(foreign).unwrap())
+        if tokens.kinds.get(foreign).unwrap() == TokenKind.Less {
+            let before = diag_entry_count()
+            diag_error_range("UnexpectedToken", UNEXPECTED_TOKEN, "`..<` is not a Blink range operator", line, col, end_col, "write `{lo}..{hi}`; in Blink, `..` excludes the end")
+            if diag_entry_count() > before { diag_set_last_fix_at("remove `<`", "", line, col, line, end_col) }
+        } else {
+            diag_error_range("UnexpectedToken", UNEXPECTED_TOKEN, "`...` is not a Blink range operator", line, col, end_col, "write `{lo}..{hi}` (end excluded) or `{lo}..={hi}` (end included)")
+        }
+        return end_nd
+    }
+    if !starts_operand(peek_kind()) || (at(TokenKind.LBrace) && range_site_here() == RANGE_SITE_FOR) {
+        diag_error_range("UnexpectedToken", UNEXPECTED_TOKEN, "a range needs an end", peek_line(), peek_col(), peek_end_col(), range_open_help())
+        return new_node(NodeKind.IntLit)
+    }
+    parse_int_ops()
+}
+
+// A prefix `..` or `..=` outside a pattern or spread: a range with no start.
+fn parse_range_missing_start() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
+    diag_error_range("UnexpectedToken", UNEXPECTED_TOKEN, "a range needs a start", peek_line(), peek_col(), peek_end_col(), range_open_help())
+    advance()
+    if starts_operand(peek_kind()) && !(at(TokenKind.LBrace) && range_site_here() == RANGE_SITE_FOR) { let _ = parse_int_ops() }
+    new_node(NodeKind.IntLit)
 }
 
 // ── Integer operator groups (§2.19 level 8) ─────────────────────────
@@ -5942,6 +6047,10 @@ fn parse_primary() -> Int ! Diag.Report, Parse.Advance, Parse.Build {
         let nd = node_count()
         node_push(AstNode { kind: NodeKind.Ident, name: kw_name, line: pm_line, col: pm_col })
         return nd
+    }
+
+    if at(TokenKind.DotDot) || at(TokenKind.DotDoteq) {
+        return parse_range_missing_start()
     }
 
     diag_error_range("UnexpectedToken", UNEXPECTED_TOKEN, "unexpected token {token_kind_name(peek_kind())}", peek_line(), peek_col(), peek_end_col(), "")
