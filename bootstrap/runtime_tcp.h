@@ -6,9 +6,11 @@
 #include <arpa/inet.h>
 #include <netdb.h>
 
-/* TcpSocket and TcpListener hold a pointer to one of these boxes, never the bare fd. Close
- * takes the fd out and leaves the GC-owned box alive, so every copy of a handle sees the
- * closed state and no later op reaches an fd number the OS has given to a new socket. */
+/* TcpSocket, TcpListener and the std.net Unix sockets hold a pointer to one of these boxes,
+ * never the bare fd. Close takes the fd out and leaves the GC-owned box alive, so every copy
+ * of a handle sees the closed state and a second close cannot reach an fd number the OS has
+ * given to a new socket. The box is never in an arena: promotion copies the handle out of a
+ * `with arena` block but cannot copy an opaque box, so an arena box would die at the `}`. */
 typedef struct {
     int64_t fd;            /* -1 once closed */
 } blink_tcp_handle;
@@ -16,7 +18,7 @@ typedef struct {
 BLINK_RT_FN blink_tcp_handle* blink_tcp_handle_new(int64_t fd);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN blink_tcp_handle* blink_tcp_handle_new(int64_t fd) {
-    blink_tcp_handle* h = (blink_tcp_handle*)blink_alloc_atomic(sizeof(blink_tcp_handle));
+    blink_tcp_handle* h = (blink_tcp_handle*)blink_alloc_atomic_in(NULL, sizeof(blink_tcp_handle));
     h->fd = fd < 0 ? -1 : fd;
     return h;
 }

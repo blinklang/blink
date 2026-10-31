@@ -1,0 +1,41 @@
+// A socket made inside `with arena` stays usable after the block (sections/05_memory_compile_errors.md
+// §5.2, Promotion: the copy out of the arena includes what the value refers to). The value
+// refers to a runtime box that holds the fd, so a later arena must not reuse that box's memory.
+import std.net.{TcpListener, unix_listen, unix_connect, tcp_listen}
+import compile_test_helpers
+
+// Fills a new arena, so memory that a closed arena gave back now holds other data.
+fn churn() -> Int {
+    with arena {
+        let mut xs: List[Int] = []
+        for _ in 0..2000 {
+            xs.push(123456789)
+        }
+        xs.len()
+    }
+}
+
+test "a UnixListener made in an arena accepts a client after the block" {
+    let d = "{compile_test_helpers.scratch_root()}/socket_in_arena"
+    let _ = process.run("sh", ["-c", "rm -rf {d}; mkdir -p {d}"]).unwrap()
+    let path = "{d}/s.sock"
+    let listener = with arena { unix_listen(path).unwrap() }
+    assert_eq(churn(), 2000)
+    let stream = unix_connect(path).unwrap()
+    let conn = listener.accept().unwrap()
+    assert(stream.write("hi\n").is_ok())
+    assert_eq(conn.read_line().unwrap(), Some("hi"))
+    conn.close()
+    stream.close()
+    listener.close()
+}
+
+test "a TcpListener made in an arena keeps its fd after the block" {
+    let listener: TcpListener = with arena { tcp_listen("127.0.0.1", 0).unwrap() }
+    let fd = listener.fd()
+    assert(fd >= 0)
+    assert_eq(churn(), 2000)
+    assert_eq(listener.fd(), fd)
+    listener.close()
+    assert_eq(listener.fd(), -1)
+}

@@ -69,6 +69,7 @@ Single source of truth for release history. `blink llms` and `blink llms --full`
 
 ## Fixes (v0.59.0)
 
+- **A `TcpSocket` or `TcpListener` made inside `with arena` stays usable after the block.** Before, the next arena could reuse the memory that held its fd, so a later call used a wrong fd number.
 - **A type you name `Instant`, `Monotonic` or `Duration` no longer changes the `Time` operations.** `time.read()`, `time.monotonic()` and `time.sleep(d)` use the types of `std.time`. Before, a program that declared its own `Monotonic` and called `time.monotonic()` failed in the C compiler, and one that declared its own `Duration` could not pass `Duration.ms(1)` to `time.sleep`.
 - **A call of a `Time` operation is checked against its signature.** `time.read(1)`, `time.monotonic(1)`, `time.sleep()` and `time.sleep(5)` are type errors that name the operation. A wrong argument count also gives its signature, such as `fn sleep(d: Duration)`; a wrong argument type names the type the operation expects. Before, `time.sleep()` passed `blink check` and then caused an internal error, and an extra argument was dropped.
 - **Two builds no longer break a shared cache dir.** A cache dir is now published by rename, so a race between two builds cannot leave an empty or damaged dir.
