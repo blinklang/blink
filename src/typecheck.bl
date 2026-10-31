@@ -24461,6 +24461,15 @@ fn tc_sort_fix(lead: Str, recv: Int, elem: Int) -> Str ! Diag.Report {
     "{lead}, or pass a comparator that returns `Ordering` to `{unparse_expr(recv)}.sort_by`"
 }
 
+// A range is a `Range[T: Ord]` (§2.10). §2.19 lets `..` sit beside a comparison with no parse
+// error because the other grouping, `(x == 0)..3`, needs a `Bool` bound, and this is the check
+// that refuses it.
+fn tc_ordered_range(elem: Int, node: Int) -> Int ! TypeCheck.Report, Diag.Report {
+    let path = tc_ord_need(elem, [])
+    if path.len() > 0 { tc_report_trait_need(path, "Ord", node) }
+    make_range_type(elem)
+}
+
 // `sort` needs `T: Ord` on the list's element. Refuses an element with no `Ord` as an unmet
 // bound, naming the innermost type without it, and an element whose order the compiler
 // cannot build yet as a TypeError that says so. Returns 1 when it reported.
@@ -25167,15 +25176,20 @@ fn tc_infer_coalesce(node: Int, lt: Int) -> Int ! TypeCheck.Resolve, TypeCheck.R
     tc_resolve(inner)
 }
 
-// `opt ?? 0..n` takes the whole range as its default (§2.19). When the start fits the
+// Whether range bound `b` has type `want`, or is an int literal that takes it.
+fn tc_bound_fits(b: Int, want: Int) -> Bool {
+    let t = tc_lookup_node_tid(b)
+    (t >= 0 && resolve_alias_tid(tc_resolve(t)) == want) || (is_int_literal_node(b) != 0 && is_integer_type(want) != 0)
+}
+
+// `opt ?? 0..n` takes the whole range as its default (§2.19). When both bounds fit the
 // Option's value type, the author meant the start as the default.
 fn tc_coalesce_range_help(node: Int, inner: Int) -> Str ! TypeCheck.Resolve, Diag.Report {
     let range = node_right(node)
     if node_kind(range) != NodeKind.RangeLit { return "" }
     let want = resolve_alias_tid(tc_resolve(inner))
-    let start_t = tc_lookup_node_tid(node_start(range))
-    let fits = (start_t >= 0 && resolve_alias_tid(tc_resolve(start_t)) == want) || (is_int_literal_node(node_start(range)) != 0 && is_integer_type(want) != 0)
-    if !fits { return "" }
+    // The end must fit too, or the grouping the help offers is a range of two types.
+    if !tc_bound_fits(node_start(range), want) || !tc_bound_fits(node_end(range), want) { return "" }
     if !tc_index_renders(node_left(node)) || !tc_index_renders(node_start(range)) || !tc_index_renders(node_end(range)) {
         return "did you mean `(opt ?? lo)..hi`?"
     }
@@ -28571,7 +28585,7 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
         // walk registered reads as none until the typing walk reaches it.
         if tc_tid_is_no_info(lo_t) != 0 {
             if tc_tid_is_no_info(hi_t) != 0 { return tc_error_recovery_tid() }
-            return make_range_type(hi_t)
+            return tc_ordered_range(hi_t, node)
         }
         // A literal bound beside a bound that is not one takes that bound's integer type, as
         // an operand of an integer operator does: `250..=top` with `top: U8` is a Range[U8].
@@ -28579,8 +28593,9 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
         if tc_literal_takes_operand(node_end(node), node_start(node), lo_t) { return make_range_type(lo_t) }
         if tc_tid_is_no_info(hi_t) == 0 && types_compatible(lo_t, hi_t) == 0 {
             tc_error_at("range bounds must have one type, got {type_to_str(lo_t)} and {type_to_str(hi_t)}", node_end(node))
+            return make_range_type(lo_t)
         }
-        return make_range_type(lo_t)
+        return tc_ordered_range(lo_t, node)
     }
 
     // `async.scope { ... }` evaluates to its block's tail, exactly like the bare block
