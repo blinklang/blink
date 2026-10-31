@@ -36224,6 +36224,9 @@ fn tc_er_op_effect(ed: Int, op: Int) -> Str {
 // The fn whose body the effect-row walk is in, as diagnostics name it.
 type ErOwner {
     name: Str
+    // The fn node, whose block gives the `where` bounds of an impl binder and the trait
+    // that bounds `Self`; -1 for an op of a derived handler.
+    decl: Int
     // A trait method's default body, whose `_` holds nothing (see tc_er_walk_fn).
     default_body: Bool
 }
@@ -36329,41 +36332,51 @@ type ErWildParam {
 
 fn tc_er_wild_params(decl: Int) -> List[ErWildParam] {
     let mut out: List[ErWildParam] = []
-    tc_er_push_wild_params(out, node_type_params(decl))
+    tc_er_push_wild_params(out, decl, node_type_params(decl))
     let block = tc_method_block.get(decl) ?? -1
-    if block != -1 && node_kind(block) == NodeKind.ImplBlock {
-        let binders = node_impl_binders(block)
-        tc_er_push_wild_params(out, binders)
-        // A `where T: Bound` adds to the bounds of an impl binder of the same name.
-        let wb = node_impl_where_bounds(block)
-        if wb != -1 && binders != -1 {
-            let mut i = 0
-            while i < sublist_length(wb) {
-                let wc = sublist_get(wb, i)
-                let mut j = 0
-                while j < sublist_length(binders) {
-                    let b = sublist_get(binders, j)
-                    if node_name(b) == node_name(wc) {
-                        out.push(ErWildParam { binder: b, name: node_name(b), traits: tparam_node_bound_traits(wc) })
-                    }
-                    j = j + 1
-                }
-                i = i + 1
-            }
-        }
-    }
+    if block != -1 && node_kind(block) == NodeKind.ImplBlock { tc_er_push_wild_params(out, decl, node_impl_binders(block)) }
     out
 }
 
-fn tc_er_push_wild_params(out: List[ErWildParam], sl: Int) {
+fn tc_er_push_wild_params(out: List[ErWildParam], decl: Int, sl: Int) {
     if sl == -1 { return }
     let mut i = 0
     while i < sublist_length(sl) {
         let tp = sublist_get(sl, i)
-        let traits = tparam_node_bound_traits(tp)
+        let traits = tc_er_binder_traits(decl, tp)
         if tc_er_wild_methods(traits).len() > 0 { out.push(ErWildParam { binder: tp, name: node_name(tp), traits: traits }) }
         i = i + 1
     }
+}
+
+// The bounds of a type parameter in scope in `decl`: its own, and for an impl binder those
+// of each `where` clause that names it. `Self` in a trait body has the trait's bounds.
+fn tc_er_binder_traits(decl: Int, binder: Int) -> Str {
+    let block = if decl >= 0 { tc_method_block.get(decl) ?? -1 } else { -1 }
+    if binder == SELF_BINDER_NODE {
+        if block != -1 && node_kind(block) == NodeKind.TraitDef { return tc_trait_guarantee_set(tc_trait_key_of(block)) }
+        return "|"
+    }
+    if binder < 0 { return "|" }
+    let mut traits = tparam_node_bound_traits(binder)
+    if block == -1 || node_kind(block) != NodeKind.ImplBlock { return traits }
+    let binders = node_impl_binders(block)
+    let wb = node_impl_where_bounds(block)
+    if binders == -1 || wb == -1 { return traits }
+    let mut own = false
+    let mut j = 0
+    while j < sublist_length(binders) {
+        if sublist_get(binders, j) == binder { own = true }
+        j = j + 1
+    }
+    if !own { return traits }
+    let mut i = 0
+    while i < sublist_length(wb) {
+        let wc = sublist_get(wb, i)
+        if node_name(wc) == node_name(binder) { traits = tc_pipe_merge(traits, tparam_node_bound_traits(wc)) }
+        i = i + 1
+    }
+    traits
 }
 
 // The trait-method declarations with `_` in their row that a guarantee set holds. No
@@ -36428,6 +36441,22 @@ fn tc_er_call_binds(node: Int, decl: Int) -> Map[Str, Int] ! TypeCheck.Resolve, 
     }
     let ret = tc_lookup_node_tid(node)
     if fs.ret >= 0 && ret >= 0 { unify_typevar_binds(fs.ret, tc_resolve(ret), binds) }
+    // A binder no argument reaches, such as one given only in brackets, takes the type
+    // typecheck minted for it at this call, as mono's binder_args reads it.
+    let tps = node_type_params(decl)
+    if tps != -1 {
+        let n = sublist_length(tps)
+        let mut pi = 0
+        while pi < n {
+            let b = sublist_get(tps, pi)
+            let key = tc_binder_key(b, node_name(b))
+            if (binds.get(key) ?? (binds.get(node_name(b)) ?? -1)) < 0 {
+                let minted = tc_ret_mint_at(node, n, pi)
+                if minted >= 0 { binds.insert(key, minted) }
+            }
+            pi = pi + 1
+        }
+    }
     let block = tc_method_block.get(decl) ?? -1
     if block != -1 && node_kind(block) == NodeKind.ImplBlock {
         let recv = if lead.len() > 0 { lead.get(0).unwrap() } else { first_arg }
@@ -36492,13 +36521,17 @@ fn tc_er_impl_row(a0: Int, tm: Int, depth: Int) -> List[Str] ! TypeCheck.Resolve
     for e in tc_er_fn_row(decl) {
         if e == "_" {
             // An impl that forwards its own binders' rows, as `Guard[T]` does, reads them off
-            // this instance. The depth cap stops a type that holds itself.
-            if depth < 8 {
+            // this instance. Each level reads a type argument of the one before, so the walk
+            // ends; past the cap the row is `_`, which no fixed row holds, so nothing goes
+            // uncharged.
+            if depth < 64 {
                 let block = tc_method_block.get(decl) ?? -1
                 let ib = if block != -1 && node_kind(block) == NodeKind.ImplBlock { tc_impl_binds_for_instance(block, a) } else { tc_no_binds }
                 for w in tc_er_wild_row(decl, ib, depth + 1) {
                     if !out.contains(w) { out.push(w) }
                 }
+            } else if !out.contains("_") {
+                out.push("_")
             }
         } else if e != "FFI" && !e.starts_with("FFI.") && !out.contains(e) {
             out.push(e)
@@ -36560,17 +36593,15 @@ fn tc_er_scoped_impl(tid: Int) -> Int ! Diag.Report {
 
 // A with item calls enter and exit, or close, with no call node in the source, so the item
 // is the site that is charged their rows (§4.7.2, §5.5). They run outside the handler the
-// item itself installs, so `held` is the row before this item joins it. A type parameter
-// item is left to the generic half of the rule: its bound's rows are not declared yet.
+// item itself installs, so `held` is the row before this item joins it.
 fn tc_er_check_with_item(program: Int, item: Int, tid0: Int, held: List[Str], owner: ErOwner) ! TypeCheck.Resolve, Diag.Report {
     if tid0 < 0 { return }
     let tid = tc_resolve(tid0)
     if tc_tid_is_no_info(tid) != 0 { return }
     if tc_tid_kind(tid) == TyKind.Typevar {
         // The item stands for every impl of its bound, so it runs the bound's `_`.
-        let binder = tc_tid_binder(tid)
-        if binder < 0 || tc_er_satisfied(program, held, "_") { return }
-        let traits = tparam_node_bound_traits(binder)
+        if tc_er_satisfied(program, held, "_") { return }
+        let traits = tc_er_binder_traits(owner.decl, tc_tid_binder(tid))
         let tname = type_to_str(tid)
         let mn = if tc_pipe_has(traits, "BlockHandler") != 0 { "enter` and `{tname}.exit" } else if tc_pipe_has(traits, "Closeable") != 0 { "close" } else { "" }
         if mn == "" { return }
@@ -36642,10 +36673,21 @@ fn tc_er_check_with_item(program: Int, item: Int, tid0: Int, held: List[Str], ow
         let req = missing.get(k).unwrap()
         let ms_text = methods.get(k).unwrap()
         let verb = if ms_text.contains(" and ") { "need" } else { "needs" }
-        diag_error_at("UndeclaredEffect", UNDECLARED_EFFECT,
-            "with item of type `{tname}` runs {ms_text}, which {verb} effect `{req}`, which `{owner.name}` does not declare", item,
-            "add `{req}` to the `!` list of `{owner.name}`, or put the `with` inside a `with` block that provides it")
-        diag_set_last_fix("add effect", req)
+        if req == "_" && owner.default_body {
+            diag_error_at("UndeclaredEffect", UNDECLARED_EFFECT,
+                "with item of type `{tname}` runs {ms_text}, which the default body of `{owner.name}` may not perform", item,
+                tc_er_default_body_help(owner.name))
+        } else if req == "_" {
+            diag_error_at("UndeclaredEffect", UNDECLARED_EFFECT,
+                "with item of type `{tname}` runs {ms_text}, which {verb} effect `_`, which `{owner.name}` does not declare", item,
+                "add `! _` to `{owner.name}`, so each call is charged the row of the impls the type parameters of `{tname}` stand for")
+            diag_set_last_fix("add effect", "_")
+        } else {
+            diag_error_at("UndeclaredEffect", UNDECLARED_EFFECT,
+                "with item of type `{tname}` runs {ms_text}, which {verb} effect `{req}`, which `{owner.name}` does not declare", item,
+                "add `{req}` to the `!` list of `{owner.name}`, or put the `with` inside a `with` block that provides it")
+            diag_set_last_fix("add effect", req)
+        }
         k = k + 1
     }
 }
@@ -36732,7 +36774,7 @@ fn tc_er_walk_fn(program: Int, fn_node: Int, kids: List[Int]) ! TypeCheck.Resolv
     for e in tc_er_fn_row(fn_node) {
         if !(default_body && e == "_") { held.push(e) }
     }
-    tc_er_walk(program, node_body(fn_node), held, ErOwner { name: node_name(fn_node), default_body: default_body }, kids)
+    tc_er_walk(program, node_body(fn_node), held, ErOwner { name: node_name(fn_node), decl: fn_node, default_body: default_body }, kids)
 }
 
 // An impl method's row may narrow its trait method's row but not widen it, so a bound
@@ -36785,9 +36827,12 @@ fn tc_er_check_impl_row(program: Int, m: Int, tm: Int, trait_name: Str) ! Diag.R
         if node_name(e) != "_" { named.push(node_name(e)) }
     }
     let mut helps: List[Str] = []
-    if named.len() == 1 {
+    if named.len() == 1 && sublist_length(effs) == 1 {
         let en = named.get(0).unwrap()
         helps.push("remove `! {en}` and do the {en} at the call site, or add `{en}` to `{tshown}` in the trait")
+    } else if named.len() == 1 {
+        let en = named.get(0).unwrap()
+        helps.push("remove `{en}` from the row and do it at the call site, or add `{en}` to `{tshown}` in the trait")
     } else if named.len() > 1 {
         let list = "`{named.join("`, `")}`"
         helps.push("remove {list} from the row and do them at the call site, or add {list} to `{tshown}` in the trait")
@@ -36873,7 +36918,7 @@ fn tc_check_effect_rows(program: Int) ! TypeCheck.Resolve, Diag.Report {
     // the operation, so the body holds that effect and nothing more.
     for op in effect_derived_ops(program) {
         match tc_ue_op_root.get(op) {
-            Some(ed) => tc_er_walk(program, node_body(op), [tc_er_op_effect(ed, op)], ErOwner { name: "{node_name(ed)}.{node_name(op)}", default_body: false }, kids)
+            Some(ed) => tc_er_walk(program, node_body(op), [tc_er_op_effect(ed, op)], ErOwner { name: "{node_name(ed)}.{node_name(op)}", decl: -1, default_body: false }, kids)
             None => {}
         }
     }

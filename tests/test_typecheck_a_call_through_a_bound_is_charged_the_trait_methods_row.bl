@@ -140,3 +140,54 @@ fn main() { }
     compile_test_helpers.expect_contains(out, "which `greet` does not declare", "the fixed effect must be in the row")
     assert_eq(count(out, "\"code\":\"E0500\""), 1)
 }
+
+test "a with item whose bound comes from a where clause needs ! _" {
+    let src = with_base(#"trait Shut { fn shut(self) ! _ }
+type Guard[T] { inner: T }
+impl[T] Shut for Guard[T] where T: Closeable {
+    fn shut(self) ! _ { with self.inner as _x { let _ = 0 } }
+}
+type Bare[T] { inner: T }
+impl[T] Closeable for Bare[T] where T: Closeable {
+    fn close(self) { with self.inner as _x { let _ = 0 } }
+}
+fn main() { }
+"#)
+    let out = compile_test_helpers.compile_and_capture(src, "bound_row_where_item")
+    compile_test_helpers.expect_contains(out, "with item of type `T` runs `T.close`, which has an impl-chosen row `_` that `close` does not declare", "the where bound is read")
+    assert_eq(count(out, "\"code\":\"E0500\""), 1)
+}
+
+test "a with item of Self in a default body may not run close" {
+    let src = with_base(#"trait Sess: Closeable {
+    fn hold(self) { with self as _s { let _ = 0 } }
+    fn shut(self) { self.close() }
+}
+fn main() { }
+"#)
+    let out = compile_test_helpers.compile_and_capture(src, "bound_row_self_item")
+    compile_test_helpers.expect_contains(out, "with item of type `Self` runs `Self.close`, which the default body of `hold` may not perform", "Self is charged as the call form is")
+    compile_test_helpers.expect_contains(out, "which the default body of `shut` may not perform", "the call form")
+    assert_eq(count(out, "\"code\":\"E0500\""), 2)
+}
+
+test "a concrete item that runs a type parameter's close asks for ! _" {
+    let src = with_base(#"type Guard[T] { inner: T }
+impl[T: Closeable] Closeable for Guard[T] {
+    fn close(self) ! _ { self.inner.close() }
+}
+fn hold[T: Closeable](t: T) {
+    with Guard { inner: t } as _g { let _ = 0 }
+}
+trait Sess: Closeable {
+    fn keep(self) { with Guard { inner: self } as _g { let _ = 0 } }
+}
+fn main() { }
+"#)
+    let out = compile_test_helpers.compile_and_capture(src, "bound_row_concrete_item_wild")
+    compile_test_helpers.expect_contains(out, "with item of type `Guard[T]` runs `Guard[T].close`, which needs effect `_`, which `hold` does not declare", "the item runs T's close")
+    compile_test_helpers.expect_contains(out, "add `! _` to `hold`", "the help asks for ! _")
+    compile_test_helpers.expect_contains(out, "runs `Guard[Self].close`, which the default body of `keep` may not perform", "a default body is told it may not")
+    assert_eq(count(out, "\"code\":\"E0500\""), 2)
+    assert_eq(count(out, "add `_` to the `!` list"), 0)
+}
