@@ -1,0 +1,75 @@
+// UnixConn and UnixStream have the same methods and differ only in the call that makes them,
+// so a type mismatch between them has a note that names each type and its maker
+// (sections/04_effects.md §4.4.6). A type the user declares with one of these names is not
+// std's and gets no note.
+
+import compile_test_helpers
+
+fn conn_first() -> Str {
+    "`UnixConn` is made by `UnixListener.accept`; `UnixStream` is made by `unix_connect`"
+}
+
+fn stream_first() -> Str {
+    "`UnixStream` is made by `unix_connect`; `UnixConn` is made by `UnixListener.accept`"
+}
+
+fn count(text: Str, part: Str) -> Int {
+    text.split(part).len() - 1
+}
+
+fn mismatches(body: Str, tag: Str) -> Str ! FS.Delete, FS.Write, Process.Spawn, FS.Read, Env.Read, IO.Print {
+    let src = "import std.net.\{NetError, UnixConn, UnixStream, UnixListener}\n{body}\nfn main() \{ }\n"
+    let out = compile_test_helpers.compile_and_capture(src, tag)
+    compile_test_helpers.expect_error(out, "E0300", "{tag} is a type mismatch")
+    out
+}
+
+test "a UnixStream given for a UnixConn argument names both makers" {
+    let out = mismatches(#"fn handle(c: UnixConn) { }
+fn relay(s: UnixStream) {
+    handle(s)
+}"#, "unix_maker_arg")
+    compile_test_helpers.expect_contains(out, stream_first(), "the note names the found type first")
+    assert_eq(count(out, "is made by `unix_connect`"), 1)
+}
+
+test "a UnixConn given for a UnixStream names the found type first" {
+    let out = mismatches(#"fn handle(s: UnixStream) { }
+fn relay(c: UnixConn) {
+    handle(c)
+}"#, "unix_maker_arg_back")
+    compile_test_helpers.expect_contains(out, conn_first(), "the note names UnixConn first")
+}
+
+test "a let, a return, an assignment and a field each carry the note" {
+    let out = mismatches(#"type Box { c: UnixConn }
+fn bind(s: UnixStream) {
+    let _c: UnixConn = s
+}
+fn tail(s: UnixStream) -> UnixConn { s }
+fn early(s: UnixStream) -> UnixConn { return s }
+fn store(s: UnixStream, c: UnixConn) {
+    let mut x = c
+    x = s
+    let _ = x
+}
+fn wrap(s: UnixStream) -> Box { Box { c: s } }
+fn accepted(l: UnixListener) -> UnixStream ! Net.Listen { l.accept().unwrap() }"#, "unix_maker_sites")
+    assert_eq(count(out, "\"code\":\"E0300\""), 6)
+    assert_eq(count(out, stream_first()), 5)
+    assert_eq(count(out, conn_first()), 1)
+}
+
+test "a mismatch with a user type named UnixConn has no maker note" {
+    let src = #"import std.net.{UnixStream}
+type UnixConn { n: Int }
+fn handle(c: UnixConn) { }
+fn relay(s: UnixStream) {
+    handle(s)
+}
+fn main() { }
+"#
+    let out = compile_test_helpers.compile_and_capture(src, "unix_maker_user_type")
+    compile_test_helpers.expect_error(out, "E0300", "the user type does not take a UnixStream")
+    assert_eq(count(out, "is made by"), 0)
+}

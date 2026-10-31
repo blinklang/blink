@@ -5962,7 +5962,7 @@ fn tc_check_returned_value(val_t: Int, at_node: Int) ! TypeCheck.Resolve, TypeCh
         if mr_kind != "" {
             tc_report_missing_return(mr_kind, at_node)
         } else {
-            if !tc_closure_checked_against(at_node, tc_current_fn_ret) { tc_value_mismatch_at("return value type {type_to_str(val_t)} does not match function `{tc_current_fn_name}` return type {type_to_str(tc_current_fn_ret)}{tc_fn_mismatch_suffix(tc_current_fn_ret, val_t)}", at_node, at_node, tc_current_fn_ret) }
+            if !tc_closure_checked_against(at_node, tc_current_fn_ret) { tc_value_mismatch_at("return value type {type_to_str(val_t)} does not match function `{tc_current_fn_name}` return type {type_to_str(tc_current_fn_ret)}{tc_fn_mismatch_suffix(tc_current_fn_ret, val_t)}", at_node, at_node, tc_current_fn_ret, val_t) }
         }
     } else {
         // A `return`-wrapped value carries the returned node one level down; an
@@ -8226,7 +8226,7 @@ fn tc_settle_closure_ret(cls: Int, slot: Int) ! TypeCheck.Resolve, TypeCheck.Rep
         ret = found
         let _ = bind_metavar(slot, ret)
     } else if tc_tid_is_no_info(tail_t) == 0 && tc_tid_is_no_info(ret) == 0 && ret != TYPE_VOID && (types_compatible(ret, tail_t) == 0 || tc_value_misses_never_slot(ret, tail_t) != 0) {
-        tc_error_at("return value type {type_to_str(tail_t)} does not match function `closure` return type {type_to_str(ret)}", cls)
+        tc_mismatch_at("return value type {type_to_str(tail_t)} does not match function `closure` return type {type_to_str(ret)}", cls, ret, tail_t)
     } else if tc_tid_is_no_info(tail_t) == 0 {
         // The bound return fixes an open slot of the tail, as a written `-> R` would.
         tc_join_agreeing_values(ret, tail_t)
@@ -8236,7 +8236,7 @@ fn tc_settle_closure_ret(cls: Int, slot: Int) ! TypeCheck.Resolve, TypeCheck.Rep
     for r in returns {
         let vt = tc_lookup_node_tid(node_value(r))
         if tc_tid_is_no_info(vt) == 0 && (types_compatible(ret, vt) == 0 || tc_value_misses_never_slot(ret, vt) != 0) {
-            tc_error_at("return value type {type_to_str(vt)} does not match function `closure` return type {type_to_str(ret)}", r)
+            tc_mismatch_at("return value type {type_to_str(vt)} does not match function `closure` return type {type_to_str(ret)}", r, ret, vt)
         } else {
             tc_join_agreeing_values(ret, vt)
         }
@@ -8749,12 +8749,41 @@ fn tc_error_at_code(msg: Str, node_id: Int, name: Str, code: Str, help: Str) ! T
 // mismatch on its value says what changed and shows the match that replaces the old use. The
 // help never shows `?? ""`: that form brings the old confusion back (sections/04_effects.md
 // §4.4.9, "Migration").
-fn tc_value_mismatch_at(msg: Str, at: Int, val: Int, want: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
-    if !tc_read_line_used_as_str(val, want) { return tc_error_at(msg, at) }
+fn tc_value_mismatch_at(msg: Str, at: Int, val: Int, want: Int, got: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    if !tc_read_line_used_as_str(val, want) { return tc_mismatch_at(msg, at, want, got) }
     tc_errors.push(msg)
     diag_error_at_notes("TypeError", TYPE_ERROR, msg, at,
         "match on it: `match io.read_line() \{ Some(line) => ..., None => break }`",
         ["`io.read_line()` returns `None` at end of input and `Some(\"\")` for a blank line"])
+}
+
+// A type mismatch at `at` between `want` and `got`, with the note tc_maker_notes gives the pair.
+fn tc_mismatch_at(msg: Str, at: Int, want: Int, got: Int) ! TypeCheck.Report, Diag.Report {
+    let notes = tc_maker_notes(want, got)
+    if notes.len() == 0 { return tc_error_at(msg, at) }
+    tc_errors.push(msg)
+    diag_error_at_notes("TypeError", TYPE_ERROR, msg, at, "", notes)
+}
+
+// UnixConn and UnixStream have the same methods and differ only in the call that makes them,
+// so a mismatch between them names those calls (sections/04_effects.md §4.4.6). A type the
+// user declares with one of these names is not std's and gets no note.
+fn tc_maker_notes(want: Int, got: Int) -> List[Str] {
+    let w = tc_std_net_unix_stream_name(want)
+    let g = tc_std_net_unix_stream_name(got)
+    if w == "" || g == "" || w == g { return [] }
+    ["`{g}` is made by `{tc_unix_stream_maker(g)}`; `{w}` is made by `{tc_unix_stream_maker(w)}`"]
+}
+
+fn tc_std_net_unix_stream_name(tid: Int) -> Str {
+    let d = tc_tid_decl_node(resolve_alias_tid(tc_resolve(tid)))
+    if d < 0 || tc_module_display_name(node_module(d)) != "std.net_unix" { return "" }
+    let name = node_name(d)
+    if name == "UnixConn" || name == "UnixStream" { name } else { "" }
+}
+
+fn tc_unix_stream_maker(name: Str) -> Str {
+    if name == "UnixConn" { "UnixListener.accept" } else { "unix_connect" }
 }
 
 // One report for an argument that does not fit its parameter, unless the closure check
@@ -8763,7 +8792,7 @@ fn tc_arg_mismatch(callee: Str, pos: Int, node: Int, want: Int, got: Int) ! Type
     if tc_closure_checked_against(node, want) { return }
     let (want_s, got_s) = tc_type_pair_strs(want, got)
     let msg = "argument {pos} of `{callee}` expects {want_s}, got {got_s}{tc_fn_mismatch_suffix(want, got)}"
-    if tc_read_line_used_as_str(node, want) { return tc_value_mismatch_at(msg, node, node, want) }
+    if tc_read_line_used_as_str(node, want) { return tc_value_mismatch_at(msg, node, node, want, got) }
     // `rand.int(10)`, as Python writes it (§4.4.7). The call adds the range fix.
     if callee == "rand.int" && resolve_alias_tid(tc_resolve(got)) == TYPE_INT && resolve_alias_tid(tc_resolve(want)) == make_range_type(TYPE_INT) {
         tc_errors.push("mismatched types")
@@ -8803,7 +8832,7 @@ fn tc_is_read_line_call(val: Int) -> Bool {
 fn tc_report_declared_mismatch(msg: Str, at: Int, val: Int, declared: Int, got: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     if tc_handler_short_of(declared, got) { return tc_report_handler_coverage(val, declared, got) }
     let recv_help = tc_recv_option_help(val, declared, got)
-    if recv_help == "" && tc_read_line_used_as_str(val, declared) { return tc_value_mismatch_at(msg, at, val, declared) }
+    if recv_help == "" && tc_read_line_used_as_str(val, declared) { return tc_value_mismatch_at(msg, at, val, declared, got) }
     let help = if recv_help != "" { recv_help } else { tc_hidden_variant_help(val, declared) }
     tc_type_error_naming(msg, at, help, [declared, got])
 }
@@ -9257,6 +9286,11 @@ fn tc_name_means_decl_here(name: Str, d: Int) -> Bool {
 // involve a shadowing name, rule 2). The help is for the module being checked, which may
 // import the shadowing type from the module that declares it.
 fn tc_error_naming_types(name: Str, code: Str, msg: Str, at: Int, help: Str, tids: List[Int]) ! Diag.Report {
+    tc_error_naming_types_noted(name, code, msg, at, help, tids, [])
+}
+
+// tc_error_naming_types with `extra` notes after the ones it adds.
+fn tc_error_naming_types_noted(name: Str, code: Str, msg: Str, at: Int, help: Str, tids: List[Int], extra: List[Str]) ! Diag.Report {
     let mut notes: List[Str] = []
     let mut helps: List[Str] = if help == "" { [] } else { [help] }
     let mut seen: List[Int] = []
@@ -9274,15 +9308,17 @@ fn tc_error_naming_types(name: Str, code: Str, msg: Str, at: Int, help: Str, tid
         let h = tc_shadowed_type_help(tname, home, nr_current_module)
         if !helps.contains(h) { helps.push(h) }
     }
+    for n in extra { notes.push(n) }
     if notes.len() == 0 { return diag_error_at(name, code, msg, at, help) }
     diag_error_at_notes(name, code, msg, at, helps.join("\n"), notes)
 }
 
 // A type mismatch under TYPE_ERROR, counted as tc_error_at counts one, with the notes
-// tc_error_naming_types adds for `tids`.
+// tc_error_naming_types adds for `tids`. Each caller gives the pair as [want, got].
 fn tc_type_error_naming(msg: Str, at: Int, help: Str, tids: List[Int]) ! TypeCheck.Report, Diag.Report {
     tc_errors.push(msg)
-    tc_error_naming_types("TypeError", TYPE_ERROR, msg, at, help, tids)
+    let extra = if tids.len() == 2 { tc_maker_notes(tids.get(0).unwrap(), tids.get(1).unwrap()) } else { [] }
+    tc_error_naming_types_noted("TypeError", TYPE_ERROR, msg, at, help, tids, extra)
 }
 
 // Two types an error names side by side. When both spell the same name and are different
@@ -24993,9 +25029,9 @@ fn tc_check_comparison_operands(node: Int, op: Str, lt: Int, rt: Int) ! TypeChec
                         if range_help != "" {
                             tc_error_at_code(cmp_msg, node, "TypeError", TYPE_ERROR, range_help)
                         } else if tc_is_read_line_value(node_right(node)) {
-                            tc_value_mismatch_at(cmp_msg, node, node_right(node), lt)
+                            tc_value_mismatch_at(cmp_msg, node, node_right(node), lt, rt)
                         } else {
-                            tc_value_mismatch_at(cmp_msg, node, node_left(node), rt)
+                            tc_value_mismatch_at(cmp_msg, node, node_left(node), rt, lt)
                         }
                     }
                 }
@@ -32041,7 +32077,7 @@ fn tc_assigned_type_fits(node: Int, val: Int, target_t: Int, val_t: Int) -> Bool
         tc_report_handler_coverage(val, target_t, val_t)
         return false
     }
-    if !tc_closure_checked_against(val, target_t) { tc_value_mismatch_at("assignment: cannot assign {type_to_str(val_t)} to {type_to_str(target_t)}{tc_fn_mismatch_suffix(target_t, val_t)}", node, val, target_t) }
+    if !tc_closure_checked_against(val, target_t) { tc_value_mismatch_at("assignment: cannot assign {type_to_str(val_t)} to {type_to_str(target_t)}{tc_fn_mismatch_suffix(target_t, val_t)}", node, val, target_t, val_t) }
     false
 }
 
