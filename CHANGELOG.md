@@ -41,6 +41,8 @@ Single source of truth for release history. `blink llms` and `blink llms --full`
 
 ## What's New (v0.59.0)
 
+- **`std.net` has Unix-domain stream sockets.** `unix_listen(path)` returns a `UnixListener` and needs `Net.Listen`; its `accept()` returns a `UnixConn`. `unix_connect(path)` returns a `UnixStream` and needs `Net.Connect`. Each socket takes the row of the call that made it. `read_line()` returns the next line without its `"\n"` or `"\r\n"`, or `None` at end of stream, and `write(data)` sends all of `data`. An OS failure is `NetError.Os(op, code)`: a path that exists gives `Os("bind", EADDRINUSE)` and the file stays, and a call on a closed socket gives `Os(op, EBADF)`. A write to a peer that has closed gives `Os("send", EPIPE)` and does not stop the process.
+
 - **`env.pid()` reads the process ID through the `Env` effect.** It is an operation of `Env.Read` and returns an `Int`. A `handler Env` can answer it with `fn pid() -> Int`, and a handler that omits it forwards the call to the enclosing handler. `getpid()` still works and still skips any `Env` handler; it will become a removed name in a later release.
 
 - **`time.monotonic()` reads a clock that never goes back.** It returns a `Monotonic`, an operation of `Time.Read`. `b.since(a)` gives the `Duration` between two readings. A `Time` handler answers the op with `Monotonic.from_offset(d)`, which panics on a negative offset. A `handler Time` or `handler Time.Read` that omits `monotonic` gets W0545; the fix is `fn monotonic() -> Monotonic { default.monotonic() }`.

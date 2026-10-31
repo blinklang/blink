@@ -230,4 +230,152 @@ BLINK_RT_FN int64_t blink_socket_write(int64_t fd, const char* data) {
 }
 #endif
 
+/* The std.net Unix socket API (sections/04_effects.md §4.4.6). Each call returns -errno on
+   failure, so lib/std/net_unix.bl can build NetError.Os(op, code) with the call that
+   failed. None prints, and none removes a file: a path that exists fails bind with
+   EADDRINUSE. */
+BLINK_RT_FN int64_t blink_unix_stream_socket(void);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN int64_t blink_unix_stream_socket(void) {
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return -(int64_t)errno;
+    blink_unix_socket_nosigpipe(fd);
+    return (int64_t)fd;
+}
+#endif
+
+BLINK_RT_FN int64_t blink_unix_bind(int64_t fd, const char* path);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN int64_t blink_unix_bind(int64_t fd, const char* path) {
+    struct sockaddr_un addr;
+    if (blink_unix_socket_addr(&addr, path) < 0) return -(int64_t)ENAMETOOLONG;
+    if (bind((int)fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) return -(int64_t)errno;
+    return 0;
+}
+#endif
+
+BLINK_RT_FN int64_t blink_unix_listen_fd(int64_t fd);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN int64_t blink_unix_listen_fd(int64_t fd) {
+    if (listen((int)fd, SOMAXCONN) < 0) return -(int64_t)errno;
+    return 0;
+}
+#endif
+
+/* A connect that a signal interrupts goes on in the kernel, so EINTR is not retried here:
+   a second connect would fail with EALREADY. */
+BLINK_RT_FN int64_t blink_unix_connect_fd(int64_t fd, const char* path);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN int64_t blink_unix_connect_fd(int64_t fd, const char* path) {
+    struct sockaddr_un addr;
+    if (blink_unix_socket_addr(&addr, path) < 0) return -(int64_t)ENAMETOOLONG;
+    if (connect((int)fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) return -(int64_t)errno;
+    return 0;
+}
+#endif
+
+BLINK_RT_FN int64_t blink_unix_accept_fd(int64_t fd);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN int64_t blink_unix_accept_fd(int64_t fd) {
+    for (;;) {
+        int client = accept((int)fd, NULL, NULL);
+        if (client >= 0) {
+            blink_unix_socket_nosigpipe(client);
+            return (int64_t)client;
+        }
+        if (errno != EINTR) return -(int64_t)errno;
+    }
+}
+#endif
+
+/* close(2) may report EINTR or EIO, but the fd is gone either way, and the spec gives
+   close no Result. */
+BLINK_RT_FN void blink_unix_close_fd(int64_t fd);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void blink_unix_close_fd(int64_t fd) {
+    close((int)fd);
+}
+#endif
+
+/* One line without its "\n" or "\r\n". The status of the last call on this thread is
+   0 for a line, -1 for end of stream with no bytes left, or the errno. Bytes are peeked
+   and only those up to the newline consumed, so what follows the line stays for the next
+   call. A last line with no newline is a line; the call after it gives end of stream. */
+BLINK_RT_FN const char* blink_unix_read_line(int64_t fd);
+BLINK_RT_FN int64_t blink_unix_read_line_status(void);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_UNUSED static __thread int64_t blink_unix_read_line_last;
+BLINK_RT_FN const char* blink_unix_read_line(int64_t fd) {
+    size_t cap = 8192;
+    size_t len = 0;
+    char* buf = (char*)malloc(cap);
+    if (!buf) {
+        blink_unix_read_line_last = ENOMEM;
+        return blink_str_from_cstr_gc("");
+    }
+    int64_t status = 0;
+    int ended = 0;
+    for (;;) {
+        if (cap - len < 4096) {
+            char* grown = (char*)realloc(buf, cap * 2);
+            if (!grown) { status = ENOMEM; break; }
+            buf = grown;
+            cap *= 2;
+        }
+        ssize_t n = recv((int)fd, buf + len, cap - len - 1, MSG_PEEK);
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0) { status = errno; break; }
+        if (n == 0) break;
+        char* nl = (char*)memchr(buf + len, '\n', (size_t)n);
+        size_t take = nl ? (size_t)(nl - (buf + len)) + 1 : (size_t)n;
+        size_t got = 0;
+        while (got < take) {
+            ssize_t r = recv((int)fd, buf + len + got, take - got, 0);
+            if (r < 0 && errno == EINTR) continue;
+            if (r < 0) { status = errno; break; }
+            if (r == 0) break;
+            got += (size_t)r;
+        }
+        len += got;
+        if (status != 0) break;
+        if (got < take) break;
+        if (nl) { ended = 1; break; }
+    }
+    if (status == 0 && !ended && len == 0) status = -1;
+    if (ended) {
+        len--;
+        if (len > 0 && buf[len - 1] == '\r') len--;
+    }
+    blink_unix_read_line_last = status;
+    const char* s = blink_str_from_bytes_gc(buf, (int64_t)len);
+    free(buf);
+    return s;
+}
+BLINK_RT_FN int64_t blink_unix_read_line_status(void) {
+    return blink_unix_read_line_last;
+}
+#endif
+
+/* Sends all of `data`, looping over partial sends. A peer that has closed gives -EPIPE,
+   not SIGPIPE. Returns 0 or -errno. */
+BLINK_RT_FN int64_t blink_unix_write(int64_t fd, const char* data);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN int64_t blink_unix_write(int64_t fd, const char* data) {
+#ifdef MSG_NOSIGNAL
+    int flags = MSG_NOSIGNAL;
+#else
+    int flags = 0;
+#endif
+    size_t len = (size_t)blink_str_len(data);
+    size_t written = 0;
+    while (written < len) {
+        ssize_t n = send((int)fd, data + written, len - written, flags);
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0) return -(int64_t)errno;
+        written += (size_t)n;
+    }
+    return 0;
+}
+#endif
+
 #endif

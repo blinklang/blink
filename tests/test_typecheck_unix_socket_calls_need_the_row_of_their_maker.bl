@@ -1,0 +1,81 @@
+// A Unix socket call needs the row of the call that made the socket (sections/04_effects.md
+// §4.4.6 *Rows of socket methods*): unix_listen, UnixListener and UnixConn need Net.Listen,
+// and unix_connect and UnixStream need Net.Connect. These are second-tier calls with no
+// handler, so the row is the only gate, and a fn without it is E0500 at the call.
+
+import compile_test_helpers
+
+fn prelude() -> Str {
+    "import std.net.\{NetError, UnixListener, UnixConn, UnixStream, unix_listen, unix_connect}\n"
+}
+
+fn count(text: Str, part: Str) -> Int {
+    text.split(part).len() - 1
+}
+
+fn expect_missing(body: Str, tag: Str, needed: Str, calls: Int) ! FS.Delete, FS.Write, Process.Spawn, FS.Read, Env.Read, IO.Print {
+    let out = compile_test_helpers.compile_and_capture("{prelude()}{body}\nfn main() \{ }\n", tag)
+    compile_test_helpers.expect_error(out, "E0500", "{tag} lacks {needed}")
+    compile_test_helpers.expect_contains(out, "`{needed}`", "{tag} names {needed}")
+    assert_eq(count(out, "\"code\":\"E0500\""), calls)
+}
+
+test "unix_listen under Net.Connect alone is E0500 naming Net.Listen" {
+    expect_missing(#"fn f(p: Str) ! Net.Connect {
+    let _ = unix_listen(p)
+}"#, "unix_row_listen", "Net.Listen", 1)
+}
+
+test "unix_connect under Net.Listen alone is E0500 naming Net.Connect" {
+    expect_missing(#"fn f(p: Str) ! Net.Listen {
+    let _ = unix_connect(p)
+}"#, "unix_row_connect", "Net.Connect", 1)
+}
+
+test "each UnixListener method under Net.Connect alone is E0500 naming Net.Listen" {
+    expect_missing(#"fn f(l: UnixListener) ! Net.Connect {
+    let _ = l.accept()
+    l.close()
+}"#, "unix_row_listener", "Net.Listen", 2)
+}
+
+test "each UnixConn method under Net.Connect alone is E0500 naming Net.Listen" {
+    expect_missing(#"fn f(c: UnixConn) ! Net.Connect {
+    let _ = c.read_line()
+    let _ = c.write("x\n")
+    c.close()
+}"#, "unix_row_conn", "Net.Listen", 3)
+}
+
+test "each UnixStream method under Net.Listen alone is E0500 naming Net.Connect" {
+    expect_missing(#"fn f(s: UnixStream) ! Net.Listen {
+    let _ = s.read_line()
+    let _ = s.write("x\n")
+    s.close()
+}"#, "unix_row_stream", "Net.Connect", 3)
+}
+
+test "the server and the client of the spec compile with one row each" {
+    let src = #"fn serve_once(path: Str) -> Result[(), NetError] ! Net.Listen {
+    let listener = unix_listen(path)?
+    let conn = listener.accept()?
+    match conn.read_line()? {
+        Some(line) => conn.write("echo: {line}\n")?
+        None => ()
+    }
+    conn.close()
+    listener.close()
+    Ok(())
+}
+
+fn ask(path: Str, question: Str) -> Result[Str?, NetError] ! Net.Connect {
+    let conn = unix_connect(path)?
+    conn.write("{question}\n")?
+    let reply = conn.read_line()?
+    conn.close()
+    Ok(reply)
+}
+"#
+    let out = compile_test_helpers.compile_and_capture("{prelude()}{src}\nfn main() \{ }\n", "unix_row_clean")
+    assert_eq(count(out, "\"severity\":\"error\""), 0)
+}

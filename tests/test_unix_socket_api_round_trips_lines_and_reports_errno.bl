@@ -1,0 +1,150 @@
+// The std.net Unix socket API (sections/04_effects.md §4.4.6): a server made by unix_listen
+// and accept talks to a client made by unix_connect, lines end at "\n" or "\r\n" and end
+// of stream is None (§4.4.9), and an OS failure is NetError.Os with the call and its errno.
+// A connect completes into the listen backlog, so one thread can play both ends.
+import std.net.{NetError, UnixListener, UnixConn, UnixStream, unix_listen, unix_connect}
+import std.libc.{ERR_NOENT, ERR_ADDRINUSE, ERR_NAMETOOLONG, ERR_BADF, ERR_PIPE}
+import compile_test_helpers
+
+fn dir(name: Str) -> Str ! Env.Read, Process.Spawn {
+    let d = "{compile_test_helpers.scratch_root()}/unix_socket_api/{name}"
+    let _ = process.run("sh", ["-c", "rm -rf {d}; mkdir -p {d}"]).unwrap()
+    d
+}
+
+fn repeat(s: Str, n: Int) -> Str {
+    let sb = StringBuilder.new()
+    for _ in 0..n {
+        sb.write(s)
+    }
+    sb.to_str()
+}
+
+fn is_os(e: NetError, want_op: Str, want_code: Int) -> Bool {
+    match e {
+        NetError.Os(op, code) => match code {
+            Errno(c) => op == want_op && c == want_code
+        }
+        _ => false
+    }
+}
+
+fn expect_os[T](r: Result[T, NetError], op: Str, code: Int) {
+    match r {
+        Err(e) => assert(is_os(e, op, code))
+        Ok(_) => assert(false)
+    }
+}
+
+fn line_of(r: Result[Str?, NetError]) -> Str? {
+    match r {
+        Ok(v) => v
+        Err(_) => {
+            assert(false)
+            None
+        }
+    }
+}
+
+// A listener, the client stream and the server conn of one connection.
+fn connected(name: Str) -> (UnixListener, UnixStream, UnixConn) ! Env.Read, Process.Spawn, Net.Listen, Net.Connect {
+    let path = "{dir(name)}/s.sock"
+    let listener = unix_listen(path).unwrap()
+    let stream = unix_connect(path).unwrap()
+    let conn = listener.accept().unwrap()
+    (listener, stream, conn)
+}
+
+test "a line goes from the client to the server and a reply comes back" {
+    let (listener, stream, conn) = connected("round_trip")
+    assert(stream.write("ping\n").is_ok())
+    assert_eq(line_of(conn.read_line()), Some("ping"))
+    assert(conn.write("echo: ping\n").is_ok())
+    assert_eq(line_of(stream.read_line()), Some("echo: ping"))
+    conn.close()
+    stream.close()
+    listener.close()
+}
+
+test "read_line splits on both terminators and keeps a blank line apart from the end" {
+    let (listener, stream, conn) = connected("lines")
+    assert(stream.write("a\r\n\nb\r\nlast").is_ok())
+    stream.close()
+    assert_eq(line_of(conn.read_line()), Some("a"))
+    assert_eq(line_of(conn.read_line()), Some(""))
+    assert_eq(line_of(conn.read_line()), Some("b"))
+    assert_eq(line_of(conn.read_line()), Some("last"))
+    assert_eq(line_of(conn.read_line()), None)
+    assert_eq(line_of(conn.read_line()), None)
+    conn.close()
+    listener.close()
+}
+
+test "a line longer than the read buffer comes back whole" {
+    let (listener, stream, conn) = connected("long_line")
+    let long = repeat("x", 20000)
+    assert(stream.write("{long}\nafter\n").is_ok())
+    assert_eq(line_of(conn.read_line()), Some(long))
+    assert_eq(line_of(conn.read_line()), Some("after"))
+    conn.close()
+    stream.close()
+    listener.close()
+}
+
+test "a connect to a path with no socket is Os connect ENOENT" {
+    expect_os(unix_connect("{dir("missing")}/none.sock"), "connect", ERR_NOENT)
+}
+
+test "a listen on a path that exists is Os bind EADDRINUSE and keeps the file" {
+    let path = "{dir("exists")}/s.sock"
+    fs.write(path, "keep").unwrap()
+    expect_os(unix_listen(path), "bind", ERR_ADDRINUSE)
+    assert_eq(fs.read(path).unwrap(), "keep")
+}
+
+test "a second listen on a live socket path is Os bind EADDRINUSE" {
+    let path = "{dir("live")}/s.sock"
+    let listener = unix_listen(path).unwrap()
+    expect_os(unix_listen(path), "bind", ERR_ADDRINUSE)
+    listener.close()
+}
+
+test "a path longer than sun_path is Os ENAMETOOLONG for listen and connect" {
+    let path = "{dir("long_path")}/{repeat("p", 200)}.sock"
+    expect_os(unix_listen(path), "bind", ERR_NAMETOOLONG)
+    expect_os(unix_connect(path), "connect", ERR_NAMETOOLONG)
+}
+
+test "a write to a peer that closed is Os send EPIPE and the process lives" {
+    let (listener, stream, conn) = connected("epipe")
+    stream.close()
+    // The first send may land in the buffer before the kernel sees the reset.
+    let _ = conn.write("one\n")
+    expect_os(conn.write("two\n"), "send", ERR_PIPE)
+    conn.close()
+    listener.close()
+}
+
+test "an op on a closed socket is Os EBADF and a second close does nothing" {
+    let (listener, stream, conn) = connected("closed")
+    conn.close()
+    conn.close()
+    expect_os(conn.read_line(), "recv", ERR_BADF)
+    expect_os(conn.write("x\n"), "send", ERR_BADF)
+    stream.close()
+    stream.close()
+    expect_os(stream.read_line(), "recv", ERR_BADF)
+    expect_os(stream.write("x\n"), "send", ERR_BADF)
+    listener.close()
+    listener.close()
+    expect_os(listener.accept(), "accept", ERR_BADF)
+}
+
+test "a copy of a socket sees the close of the original" {
+    let (listener, stream, conn) = connected("copy")
+    let copy = stream
+    stream.close()
+    expect_os(copy.write("x\n"), "send", ERR_BADF)
+    conn.close()
+    listener.close()
+}

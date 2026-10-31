@@ -1,0 +1,257 @@
+// Unix-domain stream sockets (sections/04_effects.md §4.4.6). These are second-tier:
+// std functions and methods with rows, not `net` handle ops, so a sandbox denies them
+// by its rows and no handler can intercept them.
+//
+// Each socket type has one maker and takes that maker's row: UnixListener and UnixConn
+// carry Net.Listen, UnixStream carries Net.Connect. The runtime calls are declared once
+// per row they serve, so that no binding claims a row its caller lacks.
+import std.net_error.{NetError}
+import std.errno.{Errno}
+
+// The same runtime fd box as TcpHandle (bootstrap/runtime_tcp.h). Close takes the fd out
+// of the box, so every copy of a socket sees the close, and a second close cannot reach
+// an fd number the OS has reused.
+@ffi.opaque(name: "blink_tcp_handle")
+pub type UnixHandle
+
+@ffi("blink_tcp_handle_new")
+@trusted(audit: "STD-NET-UNIX")
+fn unix_handle_new(fd: Int) -> UnixHandle ! () {}
+
+@ffi("blink_tcp_handle_fd")
+@trusted(audit: "STD-NET-UNIX")
+/// The fd, or -1 once any copy of the handle was closed.
+fn unix_handle_fd(h: UnixHandle) -> Int ! () {}
+
+@ffi("blink_tcp_handle_take")
+@trusted(audit: "STD-NET-UNIX")
+/// Clears the handle and returns the fd it held, or -1 if it was closed.
+fn unix_handle_take(h: UnixHandle) -> Int ! () {}
+
+// Each call below returns -errno on failure (bootstrap/runtime_unix_socket.h).
+@ffi("blink_unix_stream_socket")
+@trusted(audit: "STD-NET-UNIX")
+fn c_listen_socket() -> Int ! Net.Listen {}
+
+@ffi("blink_unix_stream_socket")
+@trusted(audit: "STD-NET-UNIX")
+fn c_connect_socket() -> Int ! Net.Connect {}
+
+@ffi("blink_unix_bind")
+@trusted(audit: "STD-NET-UNIX")
+fn c_bind(fd: Int, path: Str) -> Int ! Net.Listen {}
+
+@ffi("blink_unix_listen_fd")
+@trusted(audit: "STD-NET-UNIX")
+fn c_listen(fd: Int) -> Int ! Net.Listen {}
+
+@ffi("blink_unix_connect_fd")
+@trusted(audit: "STD-NET-UNIX")
+fn c_connect(fd: Int, path: Str) -> Int ! Net.Connect {}
+
+@ffi("blink_unix_accept_fd")
+@trusted(audit: "STD-NET-UNIX")
+fn c_accept(fd: Int) -> Int ! Net.Listen {}
+
+@ffi("blink_unix_close_fd")
+@trusted(audit: "STD-NET-UNIX")
+fn c_listen_close(fd: Int) ! Net.Listen {}
+
+@ffi("blink_unix_close_fd")
+@trusted(audit: "STD-NET-UNIX")
+fn c_connect_close(fd: Int) ! Net.Connect {}
+
+@ffi("blink_unix_read_line")
+@trusted(audit: "STD-NET-UNIX")
+fn c_listen_read_line(fd: Int) -> Str ! Net.Listen {}
+
+@ffi("blink_unix_read_line")
+@trusted(audit: "STD-NET-UNIX")
+fn c_connect_read_line(fd: Int) -> Str ! Net.Connect {}
+
+@ffi("blink_unix_read_line_status")
+@trusted(audit: "STD-NET-UNIX")
+/// 0 for a line, -1 for end of stream, else the errno of this thread's last read_line.
+fn c_read_line_status() -> Int ! () {}
+
+@ffi("blink_unix_write")
+@trusted(audit: "STD-NET-UNIX")
+fn c_listen_write(fd: Int, data: Str) -> Int ! Net.Listen {}
+
+@ffi("blink_unix_write")
+@trusted(audit: "STD-NET-UNIX")
+fn c_connect_write(fd: Int, data: Str) -> Int ! Net.Connect {}
+
+@ffi("EBADF", header: "errno.h")
+let ERR_BADF: Int
+
+fn os_error(op: Str, code: Int) -> NetError {
+    NetError.Os(op: op, code: Errno(code))
+}
+
+fn closed(op: Str) -> NetError {
+    os_error(op, ERR_BADF)
+}
+
+fn read_line_result(line: Str) -> Result[Str?, NetError] {
+    let status = c_read_line_status()
+    if status == 0 {
+        return Ok(Some(line))
+    }
+    if status < 0 {
+        return Ok(None)
+    }
+    Err(os_error("recv", status))
+}
+
+fn write_result(rc: Int) -> Result[(), NetError] {
+    if rc < 0 {
+        return Err(os_error("send", -rc))
+    }
+    Ok(())
+}
+
+/// A socket that `unix_listen` made. `accept` waits for a client.
+pub type UnixListener {
+    handle: UnixHandle
+}
+
+/// The server end of a connection, made by `UnixListener.accept`.
+pub type UnixConn {
+    handle: UnixHandle
+}
+
+/// The client end of a connection, made by `unix_connect`.
+pub type UnixStream {
+    handle: UnixHandle
+}
+
+pub trait UnixListenerOps {
+    fn accept(self) -> Result[UnixConn, NetError] ! Net.Listen
+    fn close(self) ! Net.Listen
+}
+
+pub trait UnixConnOps {
+    fn read_line(self) -> Result[Str?, NetError] ! Net.Listen
+    fn write(self, data: Str) -> Result[(), NetError] ! Net.Listen
+    fn close(self) ! Net.Listen
+}
+
+pub trait UnixStreamOps {
+    fn read_line(self) -> Result[Str?, NetError] ! Net.Connect
+    fn write(self, data: Str) -> Result[(), NetError] ! Net.Connect
+    fn close(self) ! Net.Connect
+}
+
+/// Create a socket node at `path` and listen on it. A path that exists is not removed:
+/// the call returns `Err(NetError.Os(op: "bind", ...))` with `EADDRINUSE`.
+pub fn unix_listen(path: Str) -> Result[UnixListener, NetError] ! Net.Listen {
+    let fd = c_listen_socket()
+    if fd < 0 {
+        return Err(os_error("socket", -fd))
+    }
+    let bound = c_bind(fd, path)
+    if bound < 0 {
+        c_listen_close(fd)
+        return Err(os_error("bind", -bound))
+    }
+    let listening = c_listen(fd)
+    if listening < 0 {
+        c_listen_close(fd)
+        return Err(os_error("listen", -listening))
+    }
+    Ok(UnixListener { handle: unix_handle_new(fd) })
+}
+
+/// Connect to the socket node at `path`.
+pub fn unix_connect(path: Str) -> Result[UnixStream, NetError] ! Net.Connect {
+    let fd = c_connect_socket()
+    if fd < 0 {
+        return Err(os_error("socket", -fd))
+    }
+    let rc = c_connect(fd, path)
+    if rc < 0 {
+        c_connect_close(fd)
+        return Err(os_error("connect", -rc))
+    }
+    Ok(UnixStream { handle: unix_handle_new(fd) })
+}
+
+impl UnixListenerOps for UnixListener {
+    /// Blocks until a client connects. On a closed listener, `Os(op: "accept")` with `EBADF`.
+    fn accept(self) -> Result[UnixConn, NetError] ! Net.Listen {
+        let fd = unix_handle_fd(self.handle)
+        if fd < 0 {
+            return Err(closed("accept"))
+        }
+        let conn = c_accept(fd)
+        if conn < 0 {
+            return Err(os_error("accept", -conn))
+        }
+        Ok(UnixConn { handle: unix_handle_new(conn) })
+    }
+
+    /// Closing a closed listener does nothing. The socket node stays on disk.
+    fn close(self) ! Net.Listen {
+        let fd = unix_handle_take(self.handle)
+        if fd >= 0 {
+            c_listen_close(fd)
+        }
+    }
+}
+
+impl UnixConnOps for UnixConn {
+    /// The next line without its "\n" or "\r\n", or `None` at end of stream.
+    fn read_line(self) -> Result[Str?, NetError] ! Net.Listen {
+        let fd = unix_handle_fd(self.handle)
+        if fd < 0 {
+            return Err(closed("recv"))
+        }
+        read_line_result(c_listen_read_line(fd))
+    }
+
+    /// Sends all of `data`. A peer that has closed gives `Os(op: "send")` with `EPIPE`.
+    fn write(self, data: Str) -> Result[(), NetError] ! Net.Listen {
+        let fd = unix_handle_fd(self.handle)
+        if fd < 0 {
+            return Err(closed("send"))
+        }
+        write_result(c_listen_write(fd, data))
+    }
+
+    /// Closing a closed connection does nothing.
+    fn close(self) ! Net.Listen {
+        let fd = unix_handle_take(self.handle)
+        if fd >= 0 {
+            c_listen_close(fd)
+        }
+    }
+}
+
+impl UnixStreamOps for UnixStream {
+    /// The next line without its "\n" or "\r\n", or `None` at end of stream.
+    fn read_line(self) -> Result[Str?, NetError] ! Net.Connect {
+        let fd = unix_handle_fd(self.handle)
+        if fd < 0 {
+            return Err(closed("recv"))
+        }
+        read_line_result(c_connect_read_line(fd))
+    }
+
+    /// Sends all of `data`. A peer that has closed gives `Os(op: "send")` with `EPIPE`.
+    fn write(self, data: Str) -> Result[(), NetError] ! Net.Connect {
+        let fd = unix_handle_fd(self.handle)
+        if fd < 0 {
+            return Err(closed("send"))
+        }
+        write_result(c_connect_write(fd, data))
+    }
+
+    /// Closing a closed stream does nothing.
+    fn close(self) ! Net.Connect {
+        let fd = unix_handle_take(self.handle)
+        if fd >= 0 {
+            c_connect_close(fd)
+        }
+    }
+}
