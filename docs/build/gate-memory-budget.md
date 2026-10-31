@@ -260,8 +260,10 @@ kill a second process before the memory of the first is free; the higher score m
 kill a process of the command, not the script that writes the report. `--own-cgroup` and
 `--child` do the same for their commands, as they also write a report line. Half way, not a
 fixed step, keeps each level above its reporter: a session at 200 runs a gate at 600, and
-an `--own-cgroup` or `--child` command in it at 800. A fixed step of 500 gave 1000 to both
-the reporter and the command at the third level, so the kernel could kill the reporter.
+an `--own-cgroup` or `--child` command in it at 800. Before, `--own-cgroup` and `--child`
+did not raise the score, so the reporter and its command had the same score, and the kernel
+could kill the reporter. The gate used a fixed step of 500, which gives 1000 at the second
+level, so a level below that has no room left.
 
 Settings:
 
@@ -280,6 +282,12 @@ The scope has `Delegate=yes`, so the run can make cgroups below it for the per-c
 The run moves itself into the leaf `gate/` of the scope, and each capped child gets a
 cgroup in `kids/`. The kernel lets only a cgroup with no processes of its own give its
 controllers to child cgroups, so the run cannot stay in the scope's own cgroup.
+
+The kernel can still refuse that step (EBUSY) for a short time after the move, while the
+scope counts a process that has gone (the `mkdir` that made `gate/`). This happens mostly
+on a busy machine. The run tries again for about 2 s, and only on EBUSY. If the scope stays
+busy for all of that time, one line says so and names the processes still in it, and the
+children get address space caps in place of cgroups.
 
 The dispatcher re-runs the task with `--force`, `--silent`, `--verbose`, `-- <args>`,
 the vars `BUILD_DIR`, `BLINKC`, `JOBS` and `VERSION` when they differ from their

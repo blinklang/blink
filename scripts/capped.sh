@@ -72,7 +72,7 @@ child_kill_after=${BLINK_CHILD_KILL_AFTER:-10}
 
 notice() { echo "capped.sh: $*" >&2; }
 
-# score_up: sets up to a prefix that runs a command with an oom_score_adj
+# score_up: sets the array up to a prefix that runs a command with an oom_score_adj
 # half way from this script's to 1000. At a memory cap the kernel can kill a
 # second process before the first victim's memory is free; the higher score
 # makes that a process of the command, never the script that still has to
@@ -82,8 +82,8 @@ score_up() {
     local adj
     up=()
     { read -r adj < /proc/self/oom_score_adj; } 2>/dev/null || return 0
-    case "$adj" in '' | *[!0-9-]*) return 0 ;; esac
-    up=("$BASH" -c 'echo "$1" 2>/dev/null > /proc/self/oom_score_adj; shift; exec "$@"' _ $(((adj + 1001) / 2)))
+    case "$adj" in '' | - | *[!0-9-]* | ?*-*) return 0 ;; esac
+    up=("$BASH" -c 'echo "$1" 2>/dev/null > /proc/self/oom_score_adj; shift; exec -- "$@"' _ $(((adj + 1001) / 2)))
 }
 
 # Only builtins below, and each sets a variable, not a $( ): after the task
@@ -503,8 +503,6 @@ fi
 
 # --- The gate run ---------------------------------------------------------------
 
-# Runs inside the new scope: run the command, then read the scope's own event
-# counters while the scope still exists, so a kill by the cap reads as one.
 # enable_scope: hands the memory and pids controllers to the scope's children.
 # The kernel refuses that (EBUSY) while the scope counts a process. A process
 # that this script forked and reaped in the scope (the mkdir) can count for a
@@ -523,7 +521,7 @@ enable_scope() {
         esac
         tries=$((tries - 1))
         if [ "$tries" -le 0 ]; then
-            mapfile -t procs < "$dir/cgroup.procs" 2>/dev/null
+            { mapfile -t procs < "$dir/cgroup.procs"; } 2>/dev/null
             notice "the scope stayed busy (EBUSY) for the whole retry budget of about 2 s (processes in it: [${procs[*]}])"
             return 1
         fi
@@ -531,6 +529,8 @@ enable_scope() {
     done
 }
 
+# Runs inside the new scope: run the command, then read the scope's own event
+# counters while the scope still exists, so a kill by the cap reads as one.
 if [ "${1:-}" = --inner ]; then
     shift
     IFS=: read -r _ _ cg < /proc/self/cgroup

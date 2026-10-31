@@ -456,7 +456,7 @@ if command -v systemd-run >/dev/null 2>&1 &&
     printf '%s' 'read -r r < /proc/$PPID/oom_score_adj
         echo "$r $("$CAPPED" --own-cgroup bash "$1") $("$CAPPED" --child bash "$1")"' > "$WORK/adj_inner"
     out=$(gate -- 'read -r r < /proc/$PPID/oom_score_adj
-        echo "$r $(env -u BLINK_GATE_SCOPE -u BLINK_CHILD_CAP_MODE -u BLINK_CHILD_CGROUP -u BLINK_CHILD_CAPPED "$CAPPED" bash '"$WORK/adj_inner $WORK/adj_probe"')"')
+        echo "$r $(env -u BLINK_GATE_SCOPE "$CAPPED" bash '"$WORK/adj_inner $WORK/adj_probe"')"')
     read -r outer inner own_rep own_cmd kid_rep kid_cmd <<< "$out"
     if [ -n "${kid_cmd:-}" ] && [ "$outer" -lt "$inner" ] && [ "$inner" -lt "$own_rep" ] && [ "$own_rep" -lt "$own_cmd" ] &&
         [ "$inner" -lt "$kid_rep" ] && [ "$kid_rep" -lt "$kid_cmd" ]; then
