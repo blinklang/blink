@@ -1,0 +1,228 @@
+// A BlockHandler exit and a Closeable close may perform effects (sections/04_effects.md
+// §4.7.2: both methods have an impl-chosen row). The exit runs from the with item's guard
+// on every way out of the body, so it must see the handlers live at the with item: the
+// ones around it, and not one the item installs for its body only.
+
+import std.testing.{capture_log}
+
+effect Note {
+    effect Say {
+        fn say(s: Str)
+    }
+}
+
+fn recorder(log: List[Str]) -> Handler[Note] {
+    handler Note {
+        fn say(s: Str) { log.push(s) }
+    }
+}
+
+type Tag {
+    name: Str
+}
+
+fn tag(name: Str) -> Tag {
+    Tag { name: name }
+}
+
+impl BlockHandler for Tag {
+    type Context = ()
+    fn enter(self) -> () ! Note.Say { note.say("enter {self.name}") }
+    fn exit(self, ok: Bool) ! Note.Say { note.say("exit {self.name}:{ok}") }
+}
+
+type Res {
+    name: Str
+}
+
+fn res(name: Str) -> Res {
+    Res { name: name }
+}
+
+impl Closeable for Res {
+    fn close(self) ! Note.Say { note.say("close {self.name}") }
+}
+
+// The §4.7.2 example.
+type Timer {
+    label: Str
+    start: Instant
+}
+
+fn timer(label: Str) -> Timer ! Time.Read {
+    Timer { label: label, start: time.read() }
+}
+
+impl BlockHandler for Timer {
+    type Context = ()
+    fn enter(_self) -> () {}
+    fn exit(self, ok: Bool) ! Time.Read, IO.Log {
+        let elapsed = self.start.elapsed()
+        io.log("{self.label}: {elapsed.to_nanos() >= 0} (ok={ok})")
+    }
+}
+
+fn fails() -> Result[Int, Str] {
+    Err("no")
+}
+
+fn question_mark_out() -> Result[Int, Str] ! Note.Say {
+    with tag("q") {
+        let _v = fails()?
+    }
+    Ok(0)
+}
+
+fn return_out() ! Note.Say {
+    with tag("r") {
+        return
+    }
+}
+
+fn closeable_question_mark_item() -> Result[Int, Str] ! Note.Say {
+    let item: Result[Res, Str] = Ok(res("f"))
+    with item? as a {
+        note.say("body {a.name}")
+    }
+    Ok(0)
+}
+
+fn generic_with[T: BlockHandler](t: T) ! _ {
+    with t as _c { }
+}
+
+// The Context is the handler the body sees. exit runs after it is uninstalled.
+type Scope {
+    name: Str
+}
+
+fn scope(name: Str) -> Scope {
+    Scope { name: name }
+}
+
+impl BlockHandler for Scope {
+    type Context = Handler[Note]
+    fn enter(self) -> Handler[Note] {
+        let n = self.name
+        handler Note {
+            fn say(_s: Str) { inner_log.push("inner {n}") }
+        }
+    }
+    fn exit(self, _ok: Bool) ! Note.Say { note.say("exit {self.name}") }
+}
+
+let mut inner_log: List[Str] = []
+
+test "the Timer example logs from exit" {
+    let msgs: List[Str] = []
+    with capture_log(msgs) {
+        with timer("db_query") { }
+    }
+    assert_eq(msgs.join(","), "db_query: true (ok=true)")
+}
+
+test "an exit performs through the handler around the with" {
+    let log: List[Str] = []
+    with recorder(log) {
+        with tag("a") {
+            note.say("body")
+        }
+    }
+    assert_eq(log.join(","), "enter a,body,exit a:true")
+}
+
+test "a close performs through the handler around the with" {
+    let log: List[Str] = []
+    with recorder(log) {
+        with res("c") as c {
+            note.say("body {c.name}")
+        }
+    }
+    assert_eq(log.join(","), "body c,close c")
+}
+
+test "a close runs after a with item that uses ?" {
+    let log: List[Str] = []
+    with recorder(log) {
+        let r = closeable_question_mark_item()
+        assert(r.is_ok())
+    }
+    assert_eq(log.join(","), "body f,close f")
+}
+
+test "exit performs on the way out through ?" {
+    let log: List[Str] = []
+    with recorder(log) {
+        let r = question_mark_out()
+        assert(r.is_err())
+    }
+    assert_eq(log.join(","), "enter q,exit q:false")
+}
+
+test "exit performs on an early return" {
+    let log: List[Str] = []
+    with recorder(log) {
+        return_out()
+    }
+    assert_eq(log.join(","), "enter r,exit r:false")
+}
+
+// The ok value on break and continue is not pinned: the spec's table does not list them.
+test "exit performs on break and continue" {
+    let log: List[Str] = []
+    with recorder(log) {
+        for i in 0..3 {
+            with tag("l{i}") {
+                if i == 0 { continue }
+                if i == 1 { break }
+            }
+        }
+    }
+    assert_eq(log.len(), 4)
+    assert_eq(log.get(0).unwrap(), "enter l0")
+    assert(log.get(1).unwrap().starts_with("exit l0:"))
+    assert_eq(log.get(2).unwrap(), "enter l1")
+    assert(log.get(3).unwrap().starts_with("exit l1:"))
+}
+
+test "exit performs when assert_panics catches the panic" {
+    let log: List[Str] = []
+    with recorder(log) {
+        assert_panics(matching: "boom") {
+            with tag("p") {
+                panic("boom")
+            }
+        }
+    }
+    assert_eq(log.join(","), "enter p,exit p:false")
+}
+
+test "nested exits and closes perform in LIFO order" {
+    let log: List[Str] = []
+    with recorder(log) {
+        with tag("a"), res("b") as _b {
+            with tag("c") { }
+        }
+    }
+    assert_eq(log.join(","), "enter a,enter c,exit c:true,close b,exit a:true")
+}
+
+test "an exit performs through the outer handler, not the one its item installs" {
+    let log: List[Str] = []
+    inner_log = []
+    with recorder(log) {
+        with scope("s") {
+            note.say("body")
+        }
+    }
+    assert_eq(inner_log.join(","), "inner s")
+    assert_eq(log.join(","), "exit s")
+}
+
+test "an exit performs from a generic with" {
+    let log: List[Str] = []
+    with recorder(log) {
+        generic_with(tag("g"))
+    }
+    assert_eq(log.join(","), "enter g,exit g:true")
+}

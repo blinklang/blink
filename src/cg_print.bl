@@ -37,9 +37,15 @@ import diagnostics.{diag_ice, MISPLACED_IR_KIND_AT_PRINT}
 // A materialised node's temporary, so a second reach prints the same name.
 let mut materialized: Map[Int, Str] = Map()
 
-// The exit symbols whose guard support this TU already defines, each with the resource
-// spelling its state struct was built for.
-let mut guard_support_done: Map[Str, Str] = Map()
+// What the guard support of one exit symbol was built for: the resource spelling of its
+// state struct, and whether its runner passes the effect vector.
+type GuardSupport {
+    spelling: Str
+    passes_ev: Bool
+}
+
+// The exit symbols whose guard support this TU already defines.
+let mut guard_support_done: Map[Str, GuardSupport] = Map()
 
 // What a tagged union's two members are called. The printer may not ask a type question,
 // so the node that prints one of the designators carries the word and this module only
@@ -605,7 +611,8 @@ fn guard_is_printable(id: Int, res: Int) -> Bool ! Diag.Report {
                 "call print_resource_guard_support for the exit symbol before printing the function that uses it")
             false
         }
-        Some(spelling) => {
+        Some(prev) => {
+            let spelling = prev.spelling
             if spelling == ir_c_spelling(res) { return true }
             diag_ice("ResourceGuardSpellingMismatch", MISPLACED_IR_KIND_AT_PRINT,
                 "WithScope node {id} (span {ir_span(id)}) holds a {ir_c_spelling(res)} but the guard support for {exit_symbol} stores a {spelling}", 0, 0,
@@ -935,21 +942,26 @@ pub fn print_scope_restore_support() { em_scope_restore_support() }
 // also what the scope's WithScope node carries as its c_name. resource_spelling is the
 // resource's C type as that method takes it and as the scope's resource value is spelled,
 // so the guard holds the value by that spelling and passes it through unchanged. passes_ok
-// says the method takes the ok flag after the resource. The support is defined once per TU
-// whatever the call count; a second request that disagrees with the first is an ICE, since
-// one exit symbol has one self parameter.
-pub fn print_resource_guard_support(exit_symbol: Str, resource_spelling: Str, passes_ok: Bool) ! Diag.Report {
+// says the method takes the ok flag after the resource, and passes_ev that it takes the
+// effect vector last. The support is defined once per TU whatever the call count; a second
+// request that disagrees with the first is an ICE, since one exit symbol has one signature.
+pub fn print_resource_guard_support(exit_symbol: Str, resource_spelling: Str, passes_ok: Bool, passes_ev: Bool) ! Diag.Report {
     match guard_support_done.get(exit_symbol) {
         Some(prev) => {
-            if prev != resource_spelling {
+            if prev.spelling != resource_spelling {
                 diag_ice("ResourceGuardSupportConflict", MISPLACED_IR_KIND_AT_PRINT,
-                    "guard support for {exit_symbol} was defined for a {prev} and is now requested for a {resource_spelling}", 0, 0,
+                    "guard support for {exit_symbol} was defined for a {prev.spelling} and is now requested for a {resource_spelling}", 0, 0,
                     "one exit method takes its resource in one spelling; the caller's layout query is inconsistent")
+            }
+            if prev.passes_ev != passes_ev {
+                diag_ice("ResourceGuardSupportConflict", MISPLACED_IR_KIND_AT_PRINT,
+                    "guard support for {exit_symbol} was defined with passes_ev {prev.passes_ev} and is now requested with {passes_ev}", 0, 0,
+                    "one exit method has one signature; the callers disagree on whether it takes the effect vector")
             }
         }
         None => {
-            guard_support_done.insert(exit_symbol, resource_spelling)
-            em_resource_guard_support(exit_symbol, resource_spelling, passes_ok)
+            guard_support_done.insert(exit_symbol, GuardSupport { spelling: resource_spelling, passes_ev: passes_ev })
+            em_resource_guard_support(exit_symbol, resource_spelling, passes_ok, passes_ev)
         }
     }
 }
