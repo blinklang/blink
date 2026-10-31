@@ -552,8 +552,9 @@ env.remove_var(name)            // remove env var (effect: Env.Write)
 env.exit(code)                  // terminate process (effect: Env.Exit)
 
 // Time
-time.read()                     // -> Instant
-time.sleep(duration)            // sleep for Duration
+time.read()                     // -> Instant (wall clock, effect: Time.Read)
+time.monotonic()                // -> Monotonic (a clock that never goes back, effect: Time.Read)
+time.sleep(duration)            // sleep for Duration (effect: Time.Sleep)
 
 // Rand (effect: Rand). The default handler is a CSPRNG seeded from the OS
 rand.int(1..=6)                 // -> Int: uniform in the range; an empty range (5..5) panics
@@ -1096,10 +1097,21 @@ match r.end {
 The std.time range is 1677-09-22T00:00:00Z ..= 2262-04-11T23:47:16.854775807Z. The calendar
 fields round down: 500 ms before the epoch is `1969-12-31`, hour 23, second 59.
 
+## Monotonic Methods
+
+`import std.time.{Monotonic}` to name the type. Use it, not `Instant`, to measure elapsed
+time: the wall clock can step.
+
+| Method | Returns | Purpose |
+|--------|---------|---------|
+| `time.monotonic()` | Monotonic | Current reading (needs `! Time.Read`) |
+| `.since(other)` | Duration | Time between two readings (`later.since(earlier)`) |
+| `Monotonic.from_offset(d)` | Monotonic | A reading for a `Time` handler to answer; panics on a negative offset |
+
 ```blink
-let start = time.read()
+let start = time.monotonic()
 // ... work ...
-let elapsed = time.read().since(start)
+let elapsed = time.monotonic().since(start)
 io.println("Took {elapsed.to_ms()} ms")
 io.println("Took {elapsed}")          // Display: "1.234s"
 
