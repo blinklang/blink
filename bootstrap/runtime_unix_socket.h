@@ -244,11 +244,24 @@ BLINK_RT_FN int64_t blink_unix_stream_socket(void) {
 }
 #endif
 
+/* The sockaddr for a std.net path, or -errno. An empty path names no file: Linux would read
+   the zeroed sun_path as an abstract name that any process could share, so it fails with
+   ENOENT, as it does on macOS. */
+BLINK_RT_FN int64_t blink_unix_path_addr(struct sockaddr_un* addr, const char* path);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN int64_t blink_unix_path_addr(struct sockaddr_un* addr, const char* path) {
+    if (path[0] == '\0') return -(int64_t)ENOENT;
+    if (blink_unix_socket_addr(addr, path) < 0) return -(int64_t)ENAMETOOLONG;
+    return 0;
+}
+#endif
+
 BLINK_RT_FN int64_t blink_unix_bind(int64_t fd, const char* path);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN int64_t blink_unix_bind(int64_t fd, const char* path) {
     struct sockaddr_un addr;
-    if (blink_unix_socket_addr(&addr, path) < 0) return -(int64_t)ENAMETOOLONG;
+    int64_t rc = blink_unix_path_addr(&addr, path);
+    if (rc < 0) return rc;
     if (bind((int)fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) return -(int64_t)errno;
     return 0;
 }
@@ -270,7 +283,8 @@ BLINK_RT_FN int64_t blink_unix_connect_fd(int64_t fd, const char* path);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN int64_t blink_unix_connect_fd(int64_t fd, const char* path) {
     struct sockaddr_un addr;
-    if (blink_unix_socket_addr(&addr, path) < 0) return -(int64_t)ENAMETOOLONG;
+    int64_t rc = blink_unix_path_addr(&addr, path);
+    if (rc < 0) return rc;
     if (connect((int)fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) return -(int64_t)errno;
     return 0;
 }
