@@ -433,6 +433,7 @@ The self-hosting compiler (`src/codegen_types.bl`, `src/codegen_expr.bl`) curren
 | E0501 | CapabilityBudgetExceeded | `typecheck.bl` — `@capabilities` budget check |
 | E0502 | QuestionMarkInvalidOperand | `codegen_expr.bl` — `?` operator type check (to move to typecheck phase) |
 | E0513 | CoalesceRequiresOption | `codegen_expr.bl` — `??` operator type check |
+| E0551 | UnsourcedEffectWildcard | `typecheck.bl` — `tc_er_check_wild_source`, from the effect-row walk, on the first `_` in the row of each fn and impl method, `main` included, that has no type parameter whose bound has a `_` method. Skips trait-method declarations and the `exit` the compiler writes for a `Closeable`. Not yet checked: a `! _` callback or handler parameter, which no fn type or `Handler` type can write yet |
 | E0827 | SkipOutsideTest | `typecheck.bl` — rejects `skip()` outside a test body (via the §2.20 test-only symbol fence) |
 | E0835 | XfailMissingReason | `typecheck.bl` — rejects `test.failing(...)` with a missing or empty `reason:` |
 | E0508 | QuestionMarkResultInNonResult | `codegen_expr.bl` — `?` on Result in non-Result function |
