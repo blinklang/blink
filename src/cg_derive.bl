@@ -21,7 +21,7 @@ import cname.{
     c_field_name, c_mint_local, c_runtime_helper, c_str_const,
     c_tid_derive_method_name, c_tuple_member, c_derived_method_symbol,
     c_variant_discriminant, c_enum_tag_member, c_variant_field_path,
-    c_global_name, c_variant_member_name, c_local_name, c_range_debug_name,
+    c_global_name, c_variant_member_name, c_local_name, c_range_debug_name, c_range_clone_name,
 }
 import cg_print.{print_fn, print_fn_decl, print_kops_table, print_kops_table_decl, print_typedef_blocks}
 import cg_reg.{cg_reg_tid_for_decl, cg_reg_global_decls, cg_reg_module_of}
@@ -40,6 +40,7 @@ import ir.{
     ir_field_get, ir_if, ir_let, ir_panic, ir_return, ir_switch, ir_unary, ir_var_ref,
     ir_loop, ir_break, ir_expr_stmt, ir_struct_new, ir_enum_new, ir_carrier_wrap,
     ir_carrier_unwrap, ir_carrier_tag, ir_global_ref, ir_select, ir_unbox, ir_verify_in_frame,
+    ir_tuple_new,
 }
 import typecheck.{
     DECL_NODE_AMBIGUOUS, TYPE_BOOL, TYPE_CHAR, TYPE_INT, TYPE_STR, TYPE_U64, TyKind, tc_compiler_known_tid,
@@ -1384,6 +1385,67 @@ fn range_debug_build(r: Int, symbol: Str, span: Int) -> Bool ! Diag.Report {
         return false
     }
     cg_promote_on_demand_queue(symbol, strs, ["{pspelling} {param}"], body)
+    true
+}
+
+// The function that clones one range type whose bound has a written `clone` (§3.6.1 *Clone
+// Semantics*: each bound is copied by the `clone` of `T`). `bound_clone` is that method's
+// symbol. "" is a refusal already reported, the first time if this is a later ask.
+pub fn cg_derive_range_clone_fn(tid: Int, bound_clone: Str, span: Int) -> Str ! Diag.Report {
+    let r = tc_resolve(tid)
+    let symbol = c_range_clone_name(r)
+    if diag_is_ice_seg(symbol) {
+        derive_ice(span, "no clone function name for {tc_type_str(r)}: {symbol}")
+        return ""
+    }
+    let state = cg_promote_on_demand_state(symbol)
+    if state == ON_DEMAND_WRITTEN || state == ON_DEMAND_BUILDING { return symbol }
+    if state == ON_DEMAND_REFUSED { return "" }
+    cg_promote_on_demand_mark(symbol, ON_DEMAND_BUILDING)
+    if !range_clone_build(r, symbol, bound_clone, span) {
+        cg_promote_on_demand_mark(symbol, ON_DEMAND_REFUSED)
+        return ""
+    }
+    symbol
+}
+
+fn range_clone_build(r: Int, symbol: Str, bound_clone: Str, span: Int) -> Bool ! Diag.Report {
+    let bound = tc_tid_child(r, 0)
+    if bound < 0 {
+        derive_ice(span, "the range type {tc_type_str(r)} has no bound type")
+        return false
+    }
+    let repr = range_repr_tid(r)
+    let _td = ensure_typedef_for(repr)
+    let prec = layout_of(repr, Position.Param)
+    let rrec = layout_of(repr, Position.Return)
+    let brec = layout_of(bound, Position.TupleElem)
+    let crec = layout_of(bound, Position.Local)
+    let frec = layout_of(TYPE_BOOL, Position.TupleElem)
+    let pspelling = spelling_or_ice(prec, "the range {tc_type_str(r)}", span)
+    let rspelling = spelling_or_ice(rrec, "the range {tc_type_str(r)}", span)
+    let bspelling = spelling_or_ice(brec, "the bound of the range {tc_type_str(r)}", span)
+    let cspelling = spelling_or_ice(crec, "the bound of the range {tc_type_str(r)}", span)
+    let fspelling = spelling_or_ice(frec, "the kind of the range {tc_type_str(r)}", span)
+    if pspelling == "" || rspelling == "" || bspelling == "" || cspelling == "" || fspelling == "" { return false }
+    let param = c_local_name("range")
+    let mut parts: List[Int] = []
+    let mut i = 0
+    while i < 2 {
+        let part = ir_field_get(bound, span, bspelling, c_tuple_member(i), brec.slot_form,
+            ir_var_ref(repr, span, pspelling, param, prec.slot_form))
+        parts.push(ir_call_direct(bound, span, cspelling, bound_clone, crec.slot_form, [part]))
+        i = i + 1
+    }
+    parts.push(ir_field_get(TYPE_BOOL, span, fspelling, c_tuple_member(2), frec.slot_form,
+        ir_var_ref(repr, span, pspelling, param, prec.slot_form)))
+    let body = ir_block(span, [ir_return(span, ir_tuple_new(repr, span, rspelling, parts))])
+    let problems = ir_verify_in_frame(body, [param])
+    if problems.len() > 0 {
+        derive_ice(span, "the clone function {symbol} does not verify: {problems.get(0).unwrap()}")
+        return false
+    }
+    cg_promote_on_demand_queue(symbol, rspelling, ["{pspelling} {param}"], body)
     true
 }
 

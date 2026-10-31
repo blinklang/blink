@@ -88,7 +88,7 @@ import cg_promote.{
     ON_DEMAND_WRITTEN, ON_DEMAND_BUILDING, ON_DEMAND_REFUSED,
 }
 import cg_decl.{BodySite, cg_decl_body_site, cg_decl_takes_ev}
-import cg_derive.{cg_derive_range_debug_fn}
+import cg_derive.{cg_derive_range_debug_fn, cg_derive_range_clone_fn}
 import diagnostics.{
     Diag, diag_ice_at, diag_ice_stage_not_built, diag_error_at, diag_file_for_node, diag_source_file,
     diag_is_ice_seg,
@@ -112,6 +112,8 @@ let ordering_less = "Less"
 let ordering_greater = "Greater"
 let method_get = "get"
 let trait_from = "From"
+let trait_clone = "Clone"
+let method_clone = "clone"
 
 // What the impl selector answers when more than one impl is written over the receiver and
 // the refusal is already recorded. It has to stay apart from the -1 that means no impl is
@@ -3757,6 +3759,7 @@ fn lower_method_call(node: Int) -> Int ! Diag.Report {
     if kind == TyKind.Ptr { return cc_lower_ptr_method(node, obj, mname) }
     if kind == TyKind.Enum && cc_is_enum_to_str(mname) { return cc_lower_enum_to_str(node, obj) }
     if kind == TyKind.Range && cc_is_range_debug(mname) { return cc_range_debug(node, obj, recv_tid) }
+    if kind == TyKind.Range && cc_is_range_clone(mname) { return cc_range_clone(node, obj, recv_tid) }
     let im = cc_impl_with_method(node, recv_tid, mname)
     if im == IMPL_REFUSED { return -1 }
     if im < 0 {
@@ -3801,6 +3804,61 @@ fn cc_range_debug(node: Int, obj: Int, recv_tid: Int) -> Int ! Diag.Report {
     let symbol = cg_derive_range_debug_fn(recv_tid, node)
     if symbol == "" { return -1 }
     cc_build_call(node, symbol, obj, CallForm.Declared, false)
+}
+
+fn cc_is_range_clone(method: Str) -> Bool {
+    let mut table: Map[Str, Bool] = Map()
+    table.insert("clone", true)
+    table.get(method) ?? false
+}
+
+// A range's clone copies each bound by the `clone` of the bound type (§3.6.1 *Clone
+// Semantics*). That clone is the value itself unless the type has a written `clone`, and then
+// the range's clone is the value too.
+fn cc_range_clone(node: Int, obj: Int, recv_tid: Int) -> Int ! Diag.Report {
+    let r = tc_resolve(recv_tid)
+    let bound = tc_resolve(tc_tid_child(r, 0))
+    let copy = cc_clone_is_copy(node, bound)
+    if copy == CLONE_REFUSED { return -1 }
+    if copy == CLONE_COPIES { return lower_expr(obj) }
+    if copy == CLONE_NOT_BUILT {
+        diag_ice_stage_not_built("cg_call methods: the clone of a {tc_type_str(r)}, whose bound holds a type with a written `clone`", node)
+        return -1
+    }
+    let im = cc_impl_for(node, bound, trait_clone)
+    if im < 0 { return -1 }
+    let bound_clone = cc_impl_operator_symbol(node, im, method_clone, bound)
+    if bound_clone == "" { return -1 }
+    let symbol = cg_derive_range_clone_fn(r, bound_clone, node)
+    if symbol == "" { return -1 }
+    cc_build_call(node, symbol, obj, CallForm.Declared, false)
+}
+
+// How the `clone` of a value of `tid` copies it. A derived `clone` and the clone of every
+// built-in type is the value itself; a shared cell stays shared. A carrier or tuple copies
+// each part by the part's own `clone`, so it is the value itself when each of its parts is.
+let CLONE_COPIES = 0
+let CLONE_CALLS = 1
+let CLONE_NOT_BUILT = 2
+let CLONE_REFUSED = 3
+
+fn cc_clone_is_copy(node: Int, tid: Int) -> Int ! Diag.Report {
+    let k = cc_kind(tid)
+    if k == TyKind.Struct || k == TyKind.Enum {
+        let im = cc_impl_for(node, tid, trait_clone)
+        if im == IMPL_REFUSED { return CLONE_REFUSED }
+        return if im >= 0 { CLONE_CALLS } else { CLONE_COPIES }
+    }
+    if k == TyKind.Option || k == TyKind.Result || k == TyKind.Tuple || k == TyKind.Range {
+        let mut i = 0
+        while i < tc_tid_child_count(tid) {
+            let part = cc_clone_is_copy(node, tc_resolve(tc_tid_child(tid, i)))
+            if part == CLONE_REFUSED { return CLONE_REFUSED }
+            if part != CLONE_COPIES { return CLONE_NOT_BUILT }
+            i = i + 1
+        }
+    }
+    CLONE_COPIES
 }
 
 // The built-in methods on a scalar receiver: a cast, wrapping arithmetic, a comparison and

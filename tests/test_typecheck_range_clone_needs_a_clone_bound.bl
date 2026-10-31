@@ -1,0 +1,65 @@
+// `Range[T]` is `Clone` only when `T` is (sections/03_types.md §3.6.1 *Clone Semantics*), so a
+// clone() of a range of a type with no `Clone` is a type error that names the bound. A type
+// parameter gives a range of it no bound of its own (*No implied bounds*).
+
+import std.fs
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_reset}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+import std.io
+
+fn typecheck_probe(path: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    init_embedded_stdlib()
+    fs.write(path, src).unwrap()
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+}
+
+// Each error as "name: message | note | note", then its help.
+fn errors_of(src: Str) -> List[Str] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    typecheck_probe("build/test_typecheck_range_clone_probe.bl", src)
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" {
+            let mut line = "{d.name}: {d.message}"
+            for n in d.notes { line = "{line} | {n}" }
+            out.push("{line} | help: {d.help}")
+        }
+    }
+    for e in out { io.println("  diag: {e}") }
+    out
+}
+
+let NO_CLONE = "@derive(Eq, Ord)\ntype RangeNoClone \{\n    a: Int\n}\n"
+
+test "clone of a range of a type with no Clone names the bound" {
+    let src = "{NO_CLONE}fn main() \{\n    let r = RangeNoClone \{ a: 1 }..RangeNoClone \{ a: 2 }\n    let _ = r.clone()\n}\n"
+    let errs = errors_of(src)
+    assert_eq(errs.len(), 1)
+    let e = errs.get(0).unwrap()
+    assert(e.contains("TypeError"), e)
+    assert(e.contains("`Range[RangeNoClone]` does not implement `Clone`"), e)
+    assert(e.contains("`Range[RangeNoClone]` is `Clone` only if `RangeNoClone` is `Clone`"), e)
+    assert(e.contains("@derive(Clone"), e)
+}
+
+test "clone of a range of a type parameter needs a Clone bound" {
+    let src = "fn copied[T](r: Range[T]) -> Range[T] \{\n    r.clone()\n}\nfn main() \{\n    let _ = copied(0..3)\n}\n"
+    let errs = errors_of(src)
+    assert_eq(errs.len(), 1)
+    let e = errs.get(0).unwrap()
+    assert(e.contains("`Range[T]` does not implement `Clone`"), e)
+}
+
+test "clone of a range of a type parameter with a Clone bound is accepted" {
+    let src = "fn copied[T: Clone](r: Range[T]) -> Range[T] \{\n    r.clone()\n}\nfn main() \{\n    let _ = copied(0..3)\n}\n"
+    assert_eq(errors_of(src).len(), 0)
+}
+
+test "clone of a range of Int is accepted" {
+    let src = "fn main() \{\n    let r = 0..3\n    let _ = r.clone()\n}\n"
+    assert_eq(errors_of(src).len(), 0)
+}

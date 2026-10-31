@@ -7057,7 +7057,7 @@ fn tc_builtin_method_arity(obj_k: TyKind, method: Str) -> Int {
         if method == "display" { return 0 }
         if method == "fmt" { return 1 }
     }
-    if obj_k == TyKind.Range && method == "debug" { return 0 }
+    if obj_k == TyKind.Range && (method == "debug" || method == "clone") { return 0 }
     if method == "into_iter" {
         if obj_k == TyKind.List || obj_k == TyKind.Set || obj_k == TyKind.Str || obj_k == TyKind.Iterator { return 0 }
     }
@@ -24209,6 +24209,39 @@ fn tc_range_debug_need(tid: Int) -> List[Int] {
     path
 }
 
+// What a clone of `tid` needs that it lacks, for a range and its parts: `Range[T]` is `Clone` when `T` is,
+// and each bound is copied by the `clone` of `T` (§3.6.1 *Clone Semantics*). The chain goes
+// through the carriers and tuples whose clone copies each part by its own `clone`; a shared
+// cell is `Clone` whatever it holds. A type parameter needs `Clone` among its own bounds.
+fn tc_clone_need(tid0: Int) -> List[Int] {
+    let tid = resolve_alias_tid(tc_resolve(tid0))
+    let k = type_kind(tid)
+    if k == TyKind.Typevar {
+        let traits = tc_tparam_bound_traits(type_to_str(tid))
+        if traits != "" && tc_pipe_has(traits, "Clone") == 0 { return [tid] }
+        return []
+    }
+    if k == TyKind.Struct || k == TyKind.Enum {
+        let base = if k == TyKind.Struct { tc_struct_base_tid(tid) } else { tc_enum_base_tid(tid) }
+        let bname = strip_module_qualifier(tc_type_name(base))
+        if tc_type_name_derives(bname, "Clone") != 0 || tc_type_writes_trait_method(bname, "clone", "Clone") { return [] }
+        return [tid]
+    }
+    if k == TyKind.Range || k == TyKind.Option || k == TyKind.Result || k == TyKind.Tuple {
+        let mut i = 0
+        while i < tc_tid_child_count(tid) {
+            let inner = tc_clone_need(tc_tid_child(tid, i))
+            if inner.len() > 0 {
+                let mut path = [tid]
+                for t in inner { path.push(t) }
+                return path
+            }
+            i = i + 1
+        }
+    }
+    []
+}
+
 // Whether the instance `tid` has `tr`, by the rule the type checker judged it with. Pure,
 // so codegen emits a derived body only at an instance where the derive holds.
 pub fn tc_instance_has_trait(tid: Int, tr: Str) -> Bool {
@@ -24391,6 +24424,7 @@ fn tc_trait_method(tr: Str) -> Str {
         "Ord" => "cmp"
         "Hash" => "hash"
         "Debug" => "debug"
+        "Clone" => "clone"
         _ => ""
     }
 }
@@ -26781,11 +26815,17 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
             if method == "fmt" { return TYPE_VOID }
         }
 
-        // `Range[T]` is `Debug` when `T` is (§3.6 *Traits of Range[T]*).
+        // `Range[T]` is `Debug` and `Clone` when `T` is (§3.6 *Traits of Range[T]*).
         if obj_k == TyKind.Range && method == "debug" {
             let need = tc_range_debug_need(resolve_alias_tid(tc_resolve(obj_t)))
             if need.len() == 0 { return TYPE_STR }
             tc_report_trait_need(need, "Debug", node)
+            return tc_error_recovery_tid()
+        }
+        if obj_k == TyKind.Range && method == "clone" {
+            let need = tc_clone_need(obj_t)
+            if need.len() == 0 { return obj_t }
+            tc_report_trait_need(need, "Clone", node)
             return tc_error_recovery_tid()
         }
 
