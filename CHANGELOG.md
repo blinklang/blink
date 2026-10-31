@@ -40,7 +40,7 @@ Single source of truth for release history. `blink llms` and `blink llms --full`
 
 ## What's New (v0.59.0)
 
-- **`time.monotonic()` reads a clock that never goes back.** It returns a `Monotonic`, an operation of `Time.Read`. `b.since(a)` gives the `Duration` between two readings, and it is the only way to observe a reading. A `Time` handler answers the op with `Monotonic.from_offset(d)`, which panics on a negative offset. A `handler Time` or `handler Time.Read` that omits `monotonic` gets W0545; the fix is `fn monotonic() -> Monotonic { default.monotonic() }`.
+- **`time.monotonic()` reads a clock that never goes back.** It returns a `Monotonic`, an operation of `Time.Read`. `b.since(a)` gives the `Duration` between two readings. A `Time` handler answers the op with `Monotonic.from_offset(d)`, which panics on a negative offset. A `handler Time` or `handler Time.Read` that omits `monotonic` gets W0545; the fix is `fn monotonic() -> Monotonic { default.monotonic() }`.
 
 - **`IO.Eprint` is a known effect.** A row can name it: `fn warn(msg: Str) ! IO.Eprint`. `! IO` grants it, and `! IO.Print` and `! IO.Log` do not. A row that holds every child of `IO` (`IO.Print, IO.Eprint, IO.Log, IO.Read`) grants `IO`, and the same holds for each built-in effect. A `handler IO` can forward to stderr with `default.eprint(msg)`, and the compiler checks the type of an `eprint` or `eprint_no_nl` clause.
 
@@ -65,7 +65,7 @@ Single source of truth for release history. `blink llms` and `blink llms --full`
 ## Fixes (v0.59.0)
 
 - **A type you name `Instant`, `Monotonic` or `Duration` no longer changes the `Time` operations.** `time.read()`, `time.monotonic()` and `time.sleep(d)` use the types of `std.time`. Before, a program that declared its own `Monotonic` and called `time.monotonic()` failed in the C compiler, and one that declared its own `Duration` could not pass `Duration.ms(1)` to `time.sleep`.
-- **A call of a `Time` operation is checked against its signature.** `time.read(1)`, `time.monotonic(1)`, `time.sleep()` and `time.sleep(5)` are type errors that name the operation and give its signature, such as `fn sleep(d: Duration)`. Before, `time.sleep()` passed `blink check` and then caused an internal error, and an extra argument was dropped.
+- **A call of a `Time` operation is checked against its signature.** `time.read(1)`, `time.monotonic(1)`, `time.sleep()` and `time.sleep(5)` are type errors that name the operation. A wrong argument count also gives its signature, such as `fn sleep(d: Duration)`; a wrong argument type names the type the operation expects. Before, `time.sleep()` passed `blink check` and then caused an internal error, and an extra argument was dropped.
 - **Two builds no longer break a shared cache dir.** A cache dir is now published by rename, so a race between two builds cannot leave an empty or damaged dir.
 - **`blink fix` edits the right place.** It keeps hoisted names distinct when the `let` names its type, and it no longer edits the wrong place when E0504 is merged or under `@allow`.
 - **Alias cycles do not overflow the stack.** Two tuple aliases that name each other are now E1400.
