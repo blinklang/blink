@@ -480,13 +480,14 @@ let text = #"{{x}}"#                    // a lone { is text: "{{x}}"
 
 | Function | Returns | Purpose |
 |----------|---------|---------|
-| `write_file(path, content)` | () | Write string to file |
-| `file_exists(path)` | Int | 1 if exists, 0 if not |
-| `is_dir(path)` | Int | 1 if directory |
+| ~~`read_file(path)`~~ | — | **Removed** — use `fs.read(path)` (effect `FS.Read`), which returns `Result[Str, FsError]`; a bare call is E0504 |
+| ~~`write_file(path, content)`~~ | — | **Removed** — use `fs.write(path, content)` (effect `FS.Write`); a bare call is E0504 |
+| ~~`list_dir(path)`~~ | — | **Removed** — use `fs.list_dir(path)` (effect `FS.Read`); a bare call is E0504 |
+| ~~`fs_remove(path)`~~ | — | **Removed** — use `fs.delete(path)` (effect `FS.Delete`); a bare call is E0504 |
+| ~~`file_exists(path)`~~, ~~`is_dir(path)`~~, ~~`file_mtime(path)`~~ | — | **Removed** — use `fs.stat(path)` (effect `FS.Read`), which returns `Result[FileInfo, FsError]`; a bare call is E0504 |
 | `path_join(a, b)` | Str | Join path components — **moved to `std.path`**, use `import std.path` |
 | `path_dirname(path)` | Str | Directory part of path — **moved to `std.path`** |
 | `path_basename(path)` | Str | Filename part of path — **moved to `std.path`** |
-| `file_mtime(path)` | Int | Modification time (ms) |
 | ~~`get_env(name)`~~ | — | **Removed in v0.35** — use `env.var(name)` |
 | ~~`shell_exec(cmd)`~~ | — | **Removed** — use `process.run("sh", ["-c", cmd])` (effect `Process.Spawn`); a bare call is E0504 |
 | ~~`process_run(cmd, args)`~~ | — | **Removed** — use `process.run(cmd, args)` (effect `Process.Spawn`); a bare call is E0504 |
@@ -499,8 +500,7 @@ let text = #"{{x}}"#                    // a lone { is text: "{{x}}"
 | `panic(msg)` | Never | Abort with `msg`; never returns |
 | `todo()` | Never | Mark unfinished code; panics; warns `W0703` |
 | `unreachable()` | Never | Mark code that must not run; panics |
-| `arg_count()` | Int | CLI argument count |
-| `get_arg(idx)` | Str | CLI argument by index |
+| ~~`arg_count()`~~, ~~`get_arg(idx)`~~ | — | **Removed** — use `env.args()` (effect `Env.Read`), which returns `List[Str]`; a bare call is E0504 |
 | `time_ms()` | Int | Current time in milliseconds |
 | `getpid()` | Int | Process ID |
 | `str_from_code_point(n)` | Str | Convert char code to 1-char string (was `str_from_char_code`) |
@@ -1298,7 +1298,7 @@ let mut parts: List[Str] = []
 parts.push("header")
 parts.push("body")
 let output = parts.join("\n")
-write_file("out.txt", output)
+fs.write("out.txt", output).unwrap()
 
 // Map usage
 let mut scores: Map[Str, Int] = Map.new()
@@ -1537,8 +1537,7 @@ Run `blink doc --list` to list available modules.
 ## Gotchas
 
 - `{}` is NOT an empty map — use `Map.new()`. `{}` in expression position is a compile error. Similarly, use `Set.new()` for empty sets.
-- `file_exists()` returns `Int` (0/1), not `Bool` — use `== 1` or `== 0`
-- `is_dir()` also returns `Int`, not `Bool`
+- `fs.read`, `fs.write`, `fs.list_dir`, `fs.stat` and `fs.delete` return a `Result` — add `?` or match on it
 - `process.run(cmd, args)` returns `Result[ProcessResult, ProcessError]`; `r.out` is stdout and `r.success()` tests for a clean exit
 - `process.spawn` gives `Err` EAGAIN when too many children are not yet waited: wait on every `Child` you spawn. EMFILE comes at about 510 children at `ulimit -n 1024`: raise `ulimit -n`
 - No `return` needed for last expression in function body

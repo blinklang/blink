@@ -1,0 +1,178 @@
+// The fs and args free functions are removed free functions (sections/04_effects.md *Removed
+// free functions*): a call to one is the usual undefined-function error, E0504, with a fix that
+// names the handle operation and its effect. They must not reach the runtime, because a runtime
+// call skips any installed `FS` handler. The compiler looks in the table only when name lookup
+// fails, so a program's own fn with one of these names still compiles and is called.
+
+import typecheck.{check_types}
+import compiler.{compile_to_program}
+import diagnostics.{diag_entries, diag_reset, DiagEntry}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+import compile_test_helpers
+import std.fs
+import std.io
+
+fn probe(path: Str, src: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    init_embedded_stdlib()
+    fs.write(path, src).unwrap()
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+    program
+}
+
+fn probe_src() -> Str {
+    #"fn calls(p: Str) ! FS, Env {
+    let _ = read_file(p)  // E_READ_FILE
+    write_file(p, "x")  // E_WRITE_FILE
+    let _ = list_dir(p)  // E_LIST_DIR
+    fs_remove(p)  // E_FS_REMOVE
+    let _ = file_exists(p)  // E_FILE_EXISTS
+    let _ = is_dir(p)  // E_IS_DIR
+    let _ = file_mtime(p)  // E_FILE_MTIME
+    let _ = arg_count()  // E_ARG_COUNT
+    let _ = get_arg(0)  // E_GET_ARG
+}
+
+fn main() {}
+"#
+}
+
+// The 1-based line of the one source line that holds `marker`.
+fn line_of(src: Str, marker: Str) -> Int ! IO.Print {
+    let lines = src.split("\n")
+    let mut i = 0
+    while i < lines.len() {
+        if lines.get(i).unwrap().contains(marker) { return i + 1 }
+        i = i + 1
+    }
+    io.println("FAIL: probe has no line marked '{marker}'")
+    assert(false)
+    -1
+}
+
+fn all_errors() -> Str {
+    let mut out = ""
+    for d in diag_entries {
+        if d.severity == "error" { out = out.concat("{d.line}:{d.col}: {d.code} {d.message} | help: {d.help} | notes: {d.notes.join(" ; ")}\n") }
+    }
+    out
+}
+
+// The one error on the marked line: E0504 for `name`, at the callee in column `col`.
+fn removed_error(src: Str, marker: Str, name: Str, col: Int) -> DiagEntry ! IO.Print {
+    let line = line_of(src, marker)
+    let mut errs: List[DiagEntry] = []
+    for d in diag_entries {
+        if d.severity == "error" && d.line == line { errs.push(d) }
+    }
+    if errs.len() != 1 { io.println("FAIL: want one error on the {marker} line; errors were:\n{all_errors()}") }
+    assert_eq(errs.len(), 1)
+    let d = errs.get(0).unwrap()
+    assert_eq(d.code, "E0504")
+    assert_eq(d.message, "undefined function `{name}`")
+    assert_eq(d.col, col)
+    d
+}
+
+// A row whose replacement takes the same arguments: the fix rewrites the callee.
+fn assert_machine_row(marker: Str, name: Str, col: Int, phrase: Str, callee: Str, help: Str) ! IO.Print {
+    let d = removed_error(probe_src(), marker, name, col)
+    assert_eq(d.notes, ["`{name}` is not a built-in function; {phrase}"])
+    assert_eq(d.help, help)
+    assert_eq(d.fix_action, "replace with")
+    assert_eq(d.fix_text, callee)
+    assert_eq(d.fix_line, d.line)
+    assert_eq(d.fix_col, col)
+    assert_eq(d.fix_end_col, col + name.byte_len())
+}
+
+// A row whose replacement changes the shape of the code: the call is a suggestion, never an edit.
+fn assert_suggestion_row(marker: Str, name: Str, col: Int, phrase: Str, call: Str, help: Str) ! IO.Print {
+    let d = removed_error(probe_src(), marker, name, col)
+    assert_eq(d.notes, ["`{name}` is not a built-in function; {phrase}", "call `{call}` in its place"])
+    assert_eq(d.help, help)
+    assert_eq(d.fix_action, "")
+    assert_eq(d.fix_text, "")
+    assert_eq(d.assist_action, "")
+}
+
+let READS = "file reads go through the `fs` handle"
+let ARGS = "the program's arguments come from the `env` handle"
+let STAT_HELP = "`fs.stat` needs `FS.Read` in the effect row and returns `Result[FileInfo, FsError]`"
+let ARGS_HELP = "`env.args` needs `Env.Read` in the effect row and returns `List[Str]`"
+
+test "each removed fs free fn whose replacement takes the same arguments is E0504 with a callee fix" {
+    let _p = probe("build/tc_removed_fs_free_fns_src.bl", probe_src())
+    assert_machine_row("E_READ_FILE", "read_file", 13, READS, "fs.read", "`fs.read` needs `FS.Read` in the effect row and returns `Result[Str, FsError]`")
+    assert_machine_row("E_WRITE_FILE", "write_file", 5, "file writes go through the `fs` handle", "fs.write", "`fs.write` needs `FS.Write` in the effect row and returns `Result[(), FsError]`")
+    assert_machine_row("E_LIST_DIR", "list_dir", 13, READS, "fs.list_dir", "`fs.list_dir` needs `FS.Read` in the effect row and returns `Result[List[Str], FsError]`")
+    assert_machine_row("E_FS_REMOVE", "fs_remove", 5, "file deletes go through the `fs` handle", "fs.delete", "`fs.delete` needs `FS.Delete` in the effect row and returns `Result[(), FsError]`")
+}
+
+test "file_exists, is_dir and file_mtime are E0504 with fs.stat as a suggestion" {
+    let _p = probe("build/tc_removed_fs_free_fns_src.bl", probe_src())
+    assert_suggestion_row("E_FILE_EXISTS", "file_exists", 13, READS, "fs.stat(p)", STAT_HELP)
+    assert_suggestion_row("E_IS_DIR", "is_dir", 13, READS, "fs.stat(p)", STAT_HELP)
+    assert_suggestion_row("E_FILE_MTIME", "file_mtime", 13, READS, "fs.stat(p)", STAT_HELP)
+}
+
+test "arg_count and get_arg are E0504 with env.args() as a suggestion" {
+    let _p = probe("build/tc_removed_fs_free_fns_src.bl", probe_src())
+    assert_suggestion_row("E_ARG_COUNT", "arg_count", 13, ARGS, "env.args()", ARGS_HELP)
+    assert_suggestion_row("E_GET_ARG", "get_arg", 13, ARGS, "env.args()", ARGS_HELP)
+}
+
+// The bug this table closes: the removed call reached the runtime and wrote the file under a
+// handler that denies every write.
+test "write_file under an FS handler that denies writes is E0504 and writes no file" {
+    let target = "{compile_test_helpers.scratch_root()}/removed_write_file_under_handler.txt"
+    let _ = fs.delete(target)
+    let src = #"
+import std.fs.{FsError, FsOp}
+import std.errno.{Errno}
+
+fn deny_writes() -> Handler[FS] {
+    handler FS {
+        fn write(path: Str, _c: Str) -> Result[(), FsError] { Err(FsError { op: FsOp.Write, path: path, code: Errno(13) }) }
+    }
+}
+
+fn main() ! IO, FS {
+    with deny_writes() { write_file("TARGET", "escaped") }
+}
+"#.replace("TARGET", target)
+    let r = compile_test_helpers.compile_and_run(src, "removed_write_file_under_handler")
+    assert(r.exit_code != 0, "the removed call compiled: {r.out}")
+    compile_test_helpers.expect_contains("{r.out}{r.err_out}", "error[UndefinedFunction]: undefined function `write_file`", "the removed call is an undefined function")
+    assert(fs.stat(target).is_err(), "the removed call wrote {target}")
+}
+
+test "a program's own fn read_file, write_file and get_arg still compile and are called" {
+    let src = "fn read_file(path: Str) -> Str \{\n    \"own read \{path}\"\n}\nfn write_file(path: Str, s: Str) -> Int \{\n    path.len() + s.len()\n}\nfn get_arg(i: Int) -> Int \{\n    i * 2\n}\nfn main() ! IO \{\n    io.println(read_file(\"a\"))\n    io.println(\"\{write_file(\"ab\", \"c\")}\")\n    io.println(\"\{get_arg(4)}\")\n}\n"
+    let r = compile_test_helpers.compile_and_run(src, "removed_fs_free_fns_own_fn")
+    assert_eq(r.exit_code, 0)
+    assert_eq(r.out, "own read a\n3\n8\n")
+}
+
+// A program's own read_file must stay in its own module: std.fs reaches the runtime through
+// its private bindings, so fs.read in the same program still reads the file.
+test "a program's own fn read_file does not replace the read behind fs.read" {
+    let target = "{compile_test_helpers.scratch_root()}/own_read_file_beside_fs_read.txt"
+    fs.write(target, "from disk").unwrap()
+    let src = #"
+import std.fs
+
+fn read_file(path: Str) -> Int { path.len() }
+
+fn main() ! IO, FS {
+    io.println("{read_file("abc")}")
+    io.println(fs.read("TARGET").unwrap())
+}
+"#.replace("TARGET", target)
+    let r = compile_test_helpers.compile_and_run(src, "own_read_file_beside_fs_read")
+    let _ = fs.delete(target)
+    assert_eq(r.exit_code, 0)
+    assert_eq(r.out, "3\nfrom disk\n")
+}
