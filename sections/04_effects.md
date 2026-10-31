@@ -1561,13 +1561,162 @@ fn pick_server(servers: List[Str]) -> Option[Str] ! Rand {
 }
 ```
 
-**`rand.<name>` always means the handle.** `rand` is a reserved handle name (§3c.4 *Effect Handle Operations*), so `rand.shuffle(xs)` does not find the free function. It is `UnresolvedMethod` (E0505). The diagnostic lists the operations of `Rand` and gives the import:
+**`rand.<name>` always means the handle.** `rand` is a reserved handle name (§3c.4 *Effect Handle Operations*), so `rand.shuffle(xs)` does not find the free function. It is `UnresolvedMethod` (E0505). The diagnostic lists the operations of `Rand`, names both spellings (`rand` is the handle, `random` is the module) and gives the fix:
 
 ```
 error[E0505]: `shuffle` is not an operation of effect `Rand`
   = note: `Rand` operations are `int`, `float`, `bytes`
-  = help: `shuffle` is a function in `std.random`
+  = help: `shuffle` is a function in module `std.random`; `rand` is the handle of `Rand` and `random` is the module
+  = fix: add `import std.random` and call `random.shuffle(deck)`
+```
+
+The fix uses the qualified call. It does not mean that the qualified call is the one right style. Both forms are valid code: the example above imports `shuffle` and `choice` by name, and `import std.random` with `random.shuffle(deck)` does the same job. The fix prints the qualified call because it needs only one name to be free in the file, `random`. The selective form needs `shuffle` and `random`, because a selective import binds its qualifier too (§10.1 *Qualified Access*).
+
+**The fix for a module function called through a handle.** The rule below is not special to `shuffle`. It holds for `choice`, for every function that `std.random` adds later, and for each E0505 whose help says that a name is a function in a module. A fix is machine-applicable (§8.6) only if, after the edit:
+
+1. the callee resolves at the call site to the function of the module (`std.random.shuffle`), and
+2. the edit adds no new diagnostic: no `AmbiguousImport` (E1005), no `DuplicateSymbol` (E1012), and no new warning.
+
+The fix is the first of these four candidates, in this order, that meets both conditions. The list is fixed: candidate 3 is the one fallback after candidate 2, and no other candidate exists.
+
+1. **Reuse a binding that exists.** If the bare name `shuffle` already resolves to `std.random.shuffle` at the call, the fix is `shuffle(deck)`, with no import edit. Otherwise, if the file already imports `std.random` (whole, with a list, or with `as r`) and its qualifier resolves at the call, the fix is a call through that qualifier, `random.shuffle(deck)` or `r.shuffle(deck)`, with no import edit. A file that has `import std.random.{shuffle}` gets no rewrite to the qualified form.
+2. **Qualified call.** Add `import std.random` and call `random.shuffle(deck)`.
+3. **Selective import.** Add `import std.random.{shuffle}` and call `shuffle(deck)`.
+4. **No fix.** No candidate meets both conditions. There is no `fix:` line. The help shows an alias import (see below).
+
+A selective import binds `random` as well as `shuffle`. So a `random` that the file binds at module level (a function, a `let`, a type, or the qualifier of another import) makes candidates 2 and 3 fail. Only a local binding named `random` at the call, which hides the qualifier for its scope (§10.1 *Qualified Access*) and gets no warning, lets candidate 3 meet the conditions.
+
+If the call with the new callee would not type-check (for example, it has the wrong number of arguments), the fix is help only, whatever candidate was found. When the help says why no fix exists, it names the binding that blocks the fix and its position (`` `random` is the local at 3:9 ``). The tool never makes up an alias name, because the name is the choice of the author. The help in candidate 4 shows an alias import with a concrete example name that is not bound in the file, `rng` when it is free (`import std.random as rng`), and the call that uses it (`rng.shuffle(deck)`).
+
+The cases below show the `help` and `fix` lines. The `error` line and the `note` line are the same as in the first diagnostic above.
+
+Nothing is bound. Candidate 2:
+
+```blink
+fn deal(deck: List[Card]) -> List[Card] ! Rand {
+    rand.shuffle(deck)
+}
+```
+
+```
+  = help: `shuffle` is a function in module `std.random`; `rand` is the handle of `Rand` and `random` is the module
+  = fix: add `import std.random` and call `random.shuffle(deck)`
+```
+
+The name `shuffle` is bound as a function of the file, as a local, or by another import. Candidate 2 still passes, because `import std.random` binds `random` only. The fix is the same text in all three cases, and it adds no E1005 or E1012:
+
+```blink
+fn shuffle(xs: List[Int]) -> List[Int] { xs }
+
+fn deal(deck: List[Card]) -> List[Card] ! Rand {
+    rand.shuffle(deck)
+}
+```
+
+```blink
+fn deal(deck: List[Card]) -> List[Card] ! Rand {
+    let shuffle = 3
+    rand.shuffle(deck)
+}
+```
+
+```blink
+import cards.{shuffle}
+
+fn deal(deck: List[Card]) -> List[Card] ! Rand {
+    rand.shuffle(deck)
+}
+```
+
+```
+  = help: `shuffle` is a function in module `std.random`; `rand` is the handle of `Rand` and `random` is the module
+  = fix: add `import std.random` and call `random.shuffle(deck)`
+```
+
+A local named `random` hides the qualifier at the call, and `shuffle` is free. Candidate 2 fails, because `random.shuffle` would be a method call on the `Int`. Candidate 3 passes. The new import binds `random` at module level, and the local hides it for its scope with no warning:
+
+```blink
+fn deal(deck: List[Card]) -> List[Card] ! Rand {
+    let random = 7
+    rand.shuffle(deck)
+}
+```
+
+```
+  = help: `shuffle` is a function in module `std.random`; `rand` is the handle of `Rand` and `random` is the module. `random` is the local at 2:9, so `random.shuffle` is not available here
   = fix: add `import std.random.{shuffle}` and call `shuffle(deck)`
+```
+
+A name that the file binds at module level is `random`. Candidates 2 and 3 both fail, because each adds an import that binds `random` (E1005 here; E1012 when the file declares `fn random`). There is no `fix:` line. This holds whether `shuffle` is free or bound:
+
+```blink
+import game.random
+
+fn deal(deck: List[Card]) -> List[Card] ! Rand {
+    rand.shuffle(deck)
+}
+```
+
+```
+error[E0505]: `shuffle` is not an operation of effect `Rand`
+  = note: `Rand` operations are `int`, `float`, `bytes`
+  = help: `shuffle` is a function in module `std.random`; `rand` is the handle of `Rand` and `random` is the module. `random` is the import at 1:8, so `import std.random` would bind it twice
+  = help: import it under another name and call through that name: `import std.random as rng`, then `rng.shuffle(deck)`
+```
+
+The same two `help` lines appear when a local `random` and a local `shuffle` are both in scope at the call: candidate 2 fails on `random`, and candidate 3 fails on `shuffle`. The first help line gives the position of each blocking binding.
+
+The file already imports `std.random`. Candidate 1 gives a fix with no import edit. The qualifier is `random` for a whole import and for an import with a list, and it is the alias for an import with `as`:
+
+```blink
+import std.random
+
+fn deal(deck: List[Card]) -> List[Card] ! Rand {
+    rand.shuffle(deck)
+}
+```
+
+```
+  = fix: call `random.shuffle(deck)`
+```
+
+```blink
+import std.random.{shuffle}
+
+fn deal(deck: List[Card]) -> List[Card] ! Rand {
+    rand.shuffle(deck)
+}
+```
+
+```
+  = fix: call `shuffle(deck)`
+```
+
+```blink
+import std.random as r
+
+fn deal(deck: List[Card]) -> List[Card] ! Rand {
+    rand.shuffle(deck)
+}
+```
+
+```
+  = fix: call `r.shuffle(deck)`
+```
+
+The call has the wrong number of arguments. The rewritten call would not type-check, so there is no `fix:` line:
+
+```blink
+fn deal(deck: List[Card]) -> List[Card] ! Rand {
+    rand.shuffle(deck, 3)
+}
+```
+
+```
+error[E0505]: `shuffle` is not an operation of effect `Rand`
+  = note: `Rand` operations are `int`, `float`, `bytes`
+  = help: `shuffle` is a function in module `std.random`; `rand` is the handle of `Rand` and `random` is the module
+  = help: `random.shuffle` takes 1 argument, found 2
 ```
 
 **Python-style integer calls.** `rand.int(0, 10)` and `rand.int(10)` do not compile. Each diagnostic gives the fix as a range:
