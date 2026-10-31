@@ -33,6 +33,15 @@ fn parser_rows(out: Str) -> List[Str] {
     rows
 }
 
+// Every error row, from the parser and from typecheck: recovery must not leave a second error.
+fn error_rows(out: Str) -> List[Str] {
+    let mut rows: List[Str] = []
+    for row in out.trim().split("\n") {
+        if row.contains("\"severity\":\"error\"") { rows.push(row) }
+    }
+    rows
+}
+
 // The one parser row of `body`, or a text that names what is wrong.
 fn one_row(name: Str, body: Str) -> Str ! FS.Write, Process.Spawn {
     let r = check_json(name, body)
@@ -132,6 +141,32 @@ test "`...` that touches is E1100 that names both ranges, with no fix" {
     let row = one_row("three_dots", "    let _r = 0...n")
     let p = has(row, "\"code\":\"E1100\"").concat(has(row, "\"help\":\"write `0..n` (end excluded) or `0..=n` (end included)\"")).concat(lacks(row, "\"fix\""))
     assert_eq(p, "")
+}
+
+test "`..<` or `...` with no end names the operator and a placeholder end, with no fix" {
+    let row = one_row("half_open_no_end", "    let _r = 0..<")
+    let p = has(row, "\"message\":\"`..<` is not a Blink range operator\"").concat(has(row, "\"help\":\"write `0..hi`; in Blink, `..` excludes the end\"")).concat(lacks(row, "\"fix\""))
+    assert_eq(p, "")
+    let row2 = one_row("three_dots_no_end", "    let _r = 0...")
+    assert_eq(has(row2, "\"help\":\"write `0..hi` (end excluded) or `0..=hi` (end included)\""), "")
+}
+
+test "a for header keeps its body after `..<`, `...` or a chained range" {
+    for (name, header) in [("for_half_open", "0..<"), ("for_three_dots", "0..."), ("for_chain", "0..1..")] {
+        let r = check_json(name, "    for _i in {header} \{\n        let _ = 1\n    }")
+        let rows = error_rows(r.err_out)
+        assert_eq(rows.len(), 1)
+        assert_eq(lacks(rows.get(0).unwrap(), "let _"), "")
+    }
+}
+
+test "a for header with no range start is one error, not a range of Int" {
+    for (name, header) in [("for_no_start", "..5"), ("for_no_bounds", "..")] {
+        let r = check_json(name, "    for _i in {header} \{\n        let _ = 1\n    }")
+        let rows = error_rows(r.err_out)
+        assert_eq(rows.len(), 1)
+        assert_eq(has(rows.get(0).unwrap(), "\"message\":\"a range needs a start\""), "")
+    }
 }
 
 test "a range bound that is a bare range is E1141 with no fix" {

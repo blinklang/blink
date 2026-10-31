@@ -5200,6 +5200,12 @@ fn starts_operand(kind: TokenKind) -> Bool {
     is_keyword(kind) != 0
 }
 
+// Whether the current token begins a range bound. The `{` of a for body does not, so a
+// missing bound there leaves the body to the for.
+fn starts_range_bound() -> Bool {
+    starts_operand(peek_kind()) && !(at(TokenKind.LBrace) && range_site_here() == RANGE_SITE_FOR)
+}
+
 // Whether token `t` starts where token `t - 1` ends, with no space between them.
 fn token_touches_previous(t: Int) -> Bool {
     if t <= 0 || t >= tokens.kinds.len() { return false }
@@ -5221,7 +5227,7 @@ fn parse_range() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
     while at(TokenKind.DotDot) || at(TokenKind.DotDoteq) {
         diag_error_range("ChainedRange", CHAINED_RANGE, "a bound of a range cannot be a bare range", peek_line(), peek_col(), peek_end_col(), "a range has one start and one end")
         advance()
-        if starts_operand(peek_kind()) { let _ = parse_int_ops() }
+        if starts_range_bound() { let _ = parse_int_ops() }
     }
     nd
 }
@@ -5233,32 +5239,42 @@ fn parse_range_end(first: Int, op_tok: Int, inclusive: Int) -> Int ! Parse.Advan
         let foreign = pos
         advance()
         let end_first = pos
-        let end_nd = if starts_operand(peek_kind()) { parse_int_ops() } else { new_node(NodeKind.IntLit) }
+        let has_end = starts_range_bound()
+        let end_nd = if has_end { parse_int_ops() } else { new_node(NodeKind.IntLit) }
         let lo = operand_text(first, op_tok - 1)
-        let hi = operand_text(end_first, pos - 1)
+        // With no end, removing the `<` leaves an open range, so the help names a placeholder
+        // end and gives no fix.
+        let hi = if has_end { operand_text(end_first, pos - 1) } else { "hi" }
         let (line, col, end_col) = (tokens.lines.get(foreign).unwrap(), tokens.cols.get(foreign).unwrap(), tokens.end_cols.get(foreign).unwrap())
         if tokens.kinds.get(foreign).unwrap() == TokenKind.Less {
             let before = diag_entry_count()
             diag_error_range("UnexpectedToken", UNEXPECTED_TOKEN, "`..<` is not a Blink range operator", line, col, end_col, "write `{lo}..{hi}`; in Blink, `..` excludes the end")
-            if diag_entry_count() > before { diag_set_last_fix_at("remove `<`", "", line, col, line, end_col) }
+            if has_end && diag_entry_count() > before { diag_set_last_fix_at("remove `<`", "", line, col, line, end_col) }
         } else {
             diag_error_range("UnexpectedToken", UNEXPECTED_TOKEN, "`...` is not a Blink range operator", line, col, end_col, "write `{lo}..{hi}` (end excluded) or `{lo}..={hi}` (end included)")
         }
         return end_nd
     }
-    if !starts_operand(peek_kind()) || (at(TokenKind.LBrace) && range_site_here() == RANGE_SITE_FOR) {
+    if !starts_range_bound() {
         diag_error_range("UnexpectedToken", UNEXPECTED_TOKEN, "a range needs an end", peek_line(), peek_col(), peek_end_col(), range_open_help())
         return new_node(NodeKind.IntLit)
     }
     parse_int_ops()
 }
 
-// A prefix `..` or `..=` outside a pattern or spread: a range with no start.
+// A prefix `..` or `..=` outside a pattern or spread: a range with no start. It is still a
+// range, so a `for` over it reports nothing more.
 fn parse_range_missing_start() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
-    diag_error_range("UnexpectedToken", UNEXPECTED_TOKEN, "a range needs a start", peek_line(), peek_col(), peek_end_col(), range_open_help())
+    let r_line = peek_line()
+    let r_col = peek_col()
+    diag_error_range("UnexpectedToken", UNEXPECTED_TOKEN, "a range needs a start", r_line, r_col, peek_end_col(), range_open_help())
+    let inclusive = if at(TokenKind.DotDoteq) { 1 } else { 0 }
     advance()
-    if starts_operand(peek_kind()) && !(at(TokenKind.LBrace) && range_site_here() == RANGE_SITE_FOR) { let _ = parse_int_ops() }
-    new_node(NodeKind.IntLit)
+    let start = new_node(NodeKind.IntLit)
+    let end_nd = if starts_range_bound() { parse_int_ops() } else { new_node(NodeKind.IntLit) }
+    let nd = node_count()
+    node_push(AstNode { kind: NodeKind.RangeLit, start: start, end: end_nd, inclusive: inclusive, line: r_line, col: r_col })
+    nd
 }
 
 // ── Integer operator groups (§2.19 level 8) ─────────────────────────
