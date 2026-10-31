@@ -4854,7 +4854,7 @@ fn tc_check_one_bound(name: Str, bounds: Str, concrete: Int, node: Int) -> Int !
         let tr = traits.get(i).unwrap()
         if tc_pipe_has(bounds, tr) != 0 && tc_type_satisfies_bound(concrete, tr) == -1 {
             let path = tc_trait_need(concrete, tr, [])
-            let fixes = if path.len() > 0 { tc_trait_need_fixes(path.get(path.len() - 1).unwrap(), tr) } else { [] }
+            let fixes = if path.len() > 0 { tc_trait_need_fixes(path.get(path.len() - 1).unwrap(), tc_need_fix_trait(path, tr)) } else { [] }
             let help = if fixes.len() > 0 { fixes.join("\n") } else {
                 "pass an argument whose type implements {tr}, or derive/implement {tr} for it; the arithmetic traits (Add/Sub/Mul/Div/Rem/Neg) are sealed to the built-in numeric types"
             }
@@ -24372,7 +24372,7 @@ fn tc_is_none_lit(node: Int) -> Bool {
     node != -1 && node_kind(node) == NodeKind.Ident && node_name(node) == "None"
 }
 
-fn tc_eq_need_help(leaf: Int, op: Str, node: Int) -> Str {
+fn tc_eq_need_help(path: List[Int], op: Str, node: Int) -> Str {
     let mut lines: List[Str] = []
     let lhs = node_left(node)
     let rhs = node_right(node)
@@ -24385,13 +24385,25 @@ fn tc_eq_need_help(leaf: Int, op: Str, node: Int) -> Str {
             lines.push("to test for `None`, call `.{call}()`")
         }
     }
-    for line in tc_eq_need_fixes(leaf) { lines.push(line) }
+    for line in tc_eq_need_fixes(path) { lines.push(line) }
     lines.join("\n")
 }
 
 // The fix for the innermost type with no `Eq`, the same for `==` and for assert_eq.
-fn tc_eq_need_fixes(leaf: Int) -> List[Str] {
-    tc_trait_need_fixes(leaf, "Eq")
+fn tc_eq_need_fixes(path: List[Int]) -> List[Str] {
+    tc_trait_need_fixes(path.get(path.len() - 1).unwrap(), tc_need_fix_trait(path, "Eq"))
+}
+
+// The trait the fix for the innermost type of `path` names. A range is written over an `Ord`
+// type (§3.6 *Traits of Range[T]*) and `Ord` gives `Eq`, so a type parameter a range holds
+// asks for `Ord`, the bound its range is written with.
+fn tc_need_fix_trait(path: List[Int], tr: Str) -> Str {
+    if path.len() < 2 { return tr }
+    if tc_range_needs_ord(path.get(path.len() - 2).unwrap(), path.get(path.len() - 1).unwrap(), tr) { "Ord" } else { tr }
+}
+
+fn tc_range_needs_ord(outer: Int, inner: Int, tr: Str) -> Bool {
+    tr == "Eq" && type_kind(resolve_alias_tid(outer)) == TyKind.Range && type_kind(resolve_alias_tid(inner)) == TyKind.Typevar
 }
 
 // The fix for the innermost type without `tr`. A type that already has an impl of `tr` that
@@ -24452,7 +24464,7 @@ fn tc_refuse_derived_method_at(recv: Int, method: Str, node: Int) ! Diag.Report 
 
 fn tc_report_trait_need(path: List[Int], tr: Str, node: Int) ! Diag.Report {
     diag_error_at_notes("TypeError", TYPE_ERROR, "`{type_to_str(path.get(0).unwrap())}` does not implement `{tc_core_trait_shown(tr)}`", node,
-        tc_trait_need_fixes(path.get(path.len() - 1).unwrap(), tr).join("\n"), tc_trait_need_notes(path, tr))
+        tc_trait_need_fixes(path.get(path.len() - 1).unwrap(), tc_need_fix_trait(path, tr)).join("\n"), tc_trait_need_notes(path, tr))
 }
 
 // Each step of the chain from the compared type to the innermost type with no `Eq`.
@@ -24471,6 +24483,7 @@ fn tc_trait_need_notes(path: List[Int], tr: Str) -> List[Str] {
 }
 
 fn tc_trait_need_step(outer: Int, inner: Int, tr: Str) -> Str {
+    if tc_range_needs_ord(outer, inner, tr) { return "`{type_to_str(outer)}` needs `{type_to_str(inner)}: Ord`, and `Ord` gives `Eq`" }
     "`{type_to_str(outer)}` is `{tr}` only if `{type_to_str(inner)}` is `{tr}`"
 }
 
@@ -24491,7 +24504,7 @@ fn reject_eq_less_operands(op: Str, lt: Int, rt: Int, node: Int) -> Int ! TypeCh
     if path.len() == 0 { path = tc_eq_need(b, []) }
     if path.len() > 0 {
         diag_error_at_notes("TypeError", TYPE_ERROR, "`{type_to_str(path.get(0).unwrap())}` does not implement `{tc_core_trait_shown("Eq")}`", node,
-            tc_eq_need_help(path.get(path.len() - 1).unwrap(), op, node), tc_eq_need_notes(path))
+            tc_eq_need_help(path, op, node), tc_eq_need_notes(path))
         return 1
     }
     0
@@ -24528,7 +24541,7 @@ fn reject_eq_less_assert_args(lt: Int, rt: Int, node: Int) ! TypeCheck.Report, D
     if path.len() == 0 { return }
     diag_error_at_notes("TraitBoundNotSatisfied", TRAIT_BOUND_NOT_SATISFIED,
         "`{type_to_str(path.get(0).unwrap())}` does not implement `{tc_core_trait_shown("Eq")}`", node,
-        tc_eq_need_fixes(path.get(path.len() - 1).unwrap()).join("\n"), tc_eq_need_notes(path))
+        tc_eq_need_fixes(path).join("\n"), tc_eq_need_notes(path))
 }
 
 fn tc_tuple_elem_tids(tid: Int) -> List[Int] {

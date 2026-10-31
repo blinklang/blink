@@ -1,0 +1,70 @@
+// `Range[T: Ord]` and `Ord: Eq`, so generic code that compares ranges needs no bound beyond
+// `Ord` (sections/03_types.md §3.6 *Traits of Range[T]*). The compiler adds no bound the
+// user did not write (*No implied bounds*), so `==` on a `Range[T]` of an unbounded `T` is
+// still refused, and the help names the `Ord` bound a range of `T` is written with.
+
+import std.fs
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_reset}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+import std.io
+
+fn typecheck_probe(path: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    init_embedded_stdlib()
+    fs.write(path, src).unwrap()
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+}
+
+// Each error as "name: message | note | note | help: help".
+fn errors_of(src: Str) -> List[Str] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    typecheck_probe("build/test_typecheck_range_eq_ord_probe.bl", src)
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" {
+            let mut line = "{d.name}: {d.message}"
+            for n in d.notes { line = "{line} | {n}" }
+            out.push("{line} | help: {d.help}")
+        }
+    }
+    for e in out { io.println("  diag: {e}") }
+    out
+}
+
+test "== on a range of an unbounded type parameter asks for T: Ord" {
+    let src = "fn same[T](a: Range[T], b: Range[T]) -> Bool \{\n    a == b\n}\nfn main() \{\n    let _ = same(0..3, 0..3)\n}\n"
+    let errs = errors_of(src)
+    assert_eq(errs.len(), 1)
+    let e = errs.get(0).unwrap()
+    assert(e.contains("TypeError: `Range[T]` does not implement `Eq`"), e)
+    assert(e.contains("`Range[T]` needs `T: Ord`, and `Ord` gives `Eq`"), e)
+    assert(e.contains("help: add the bound `[T: Ord]`"), e)
+    assert(!e.contains("only if `T` is `Eq`"), e)
+}
+
+test "assert_eq on a range of an unbounded type parameter asks for T: Ord" {
+    let src = "fn check_same[T](a: Range[T]) \{\n    assert_eq(a, a)\n}\nfn main() \{\n    check_same(0..3)\n}\n"
+    let errs = errors_of(src)
+    assert_eq(errs.len(), 1)
+    let e = errs.get(0).unwrap()
+    assert(e.contains("`Range[T]` needs `T: Ord`, and `Ord` gives `Eq`"), e)
+    assert(e.contains("help: add the bound `[T: Ord]`"), e)
+}
+
+test "a range inside an Option asks for T: Ord at the range" {
+    let src = "fn same[T](a: Option[Range[T]], b: Option[Range[T]]) -> Bool \{\n    a == b\n}\nfn main() \{\n    let _ = same(Some(0..3), None)\n}\n"
+    let errs = errors_of(src)
+    assert_eq(errs.len(), 1)
+    let e = errs.get(0).unwrap()
+    assert(e.contains("`Option[Range[T]]` is `Eq` only if `Range[T]` is `Eq`"), e)
+    assert(e.contains("`Range[T]` needs `T: Ord`, and `Ord` gives `Eq`"), e)
+    assert(e.contains("help: add the bound `[T: Ord]`"), e)
+}
+
+test "== on a range of a type parameter with an Ord or Eq bound is accepted" {
+    let src = "fn same[T: Ord](a: Range[T], b: Range[T]) -> Bool \{\n    a == b\n}\nfn same_eq[T: Eq](a: Range[T], b: Range[T]) -> Bool \{\n    a == b\n}\nfn main() \{\n    let _ = same(0..3, 0..=2)\n    let _ = same_eq(\"a\"..\"b\", \"a\"..\"b\")\n}\n"
+    assert_eq(errors_of(src).len(), 0)
+}
