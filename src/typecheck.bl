@@ -36274,6 +36274,80 @@ fn tc_er_fn_row(fn_node: Int) -> List[Str] {
     out
 }
 
+// The impl whose enter and exit, or close, a with item of this type runs, or -1. The
+// BlockHandler impl the parser writes for a Closeable copies the row of close, so the
+// Closeable impl stands in for it and the diagnostic names the method the source wrote.
+fn tc_er_scoped_impl(tid: Int) -> Int ! Diag.Report {
+    let decl = tc_tid_decl_node(tid)
+    if decl < 0 { return -1 }
+    let mut found = -1
+    for im in tc_impl_recv_tids.keys() {
+        let t = tc_impl_trait_id(im)
+        if (t == "BlockHandler" || t == "Closeable") && tc_tid_decl_node(tc_impl_recv_tid(im)) == decl {
+            if t == "BlockHandler" && !impl_provided_by_closeable(im) { return im }
+            if t == "Closeable" { found = im }
+        }
+    }
+    found
+}
+
+// A with item calls enter and exit, or close, with no call node in the source, so the item
+// is the site that is charged their rows (§4.7.2, §5.5). They run outside the handler the
+// item itself installs, so `held` is the row before this item joins it. A type parameter
+// item is left to the generic half of the rule: its bound's rows are not declared yet.
+fn tc_er_check_with_item(program: Int, item: Int, tid0: Int, held: List[Str], owner: Str) ! Diag.Report {
+    if tid0 < 0 { return }
+    let tid = tc_resolve(tid0)
+    if tc_tid_is_no_info(tid) != 0 || tc_tid_kind(tid) == TyKind.Typevar { return }
+    let im = tc_er_scoped_impl(tid)
+    if im < 0 { return }
+    let ms = node_methods(im)
+    if ms == -1 { return }
+    // Missing effect -> the methods that need it, in impl order, so enter and exit that
+    // need one effect give one error.
+    let mut missing: List[Str] = []
+    let mut methods: List[Str] = []
+    let tname = type_to_str(tid)
+    let mut i = 0
+    while i < sublist_length(ms) {
+        let m = sublist_get(ms, i)
+        let mn = node_name(m)
+        let idx = if mn == "enter" || mn == "exit" || mn == "close" { fnsig_by_decl.get(m) ?? -1 } else { -1 }
+        if idx >= 0 {
+            let fs = fnsig_pool.get(idx).unwrap()
+            let mut j = 0
+            while j < fs.effects_count {
+                let req = fnsig_effect_names.get(fs.effects_start + j).unwrap()
+                // FFI is left out here for the reason tc_er_check_call gives.
+                if req != "FFI" && !req.starts_with("FFI.") && !tc_er_satisfied(program, held, req) {
+                    let named = "`{tname}.{mn}`"
+                    let mut k = 0
+                    while k < missing.len() && missing.get(k).unwrap() != req { k = k + 1 }
+                    if k == missing.len() {
+                        missing.push(req)
+                        methods.push(named)
+                    } else if !methods.get(k).unwrap().contains(named) {
+                        methods.set(k, "{methods.get(k).unwrap()} and {named}")
+                    }
+                }
+                j = j + 1
+            }
+        }
+        i = i + 1
+    }
+    let mut k = 0
+    while k < missing.len() {
+        let req = missing.get(k).unwrap()
+        let ms_text = methods.get(k).unwrap()
+        let verb = if ms_text.contains(" and ") { "need" } else { "needs" }
+        diag_error_at("UndeclaredEffect", UNDECLARED_EFFECT,
+            "with item of type `{tname}` runs {ms_text}, which {verb} effect `{req}`, which `{owner}` does not declare", item,
+            "add `{req}` to the `!` list of `{owner}`, or put the `with` inside a `with` block that provides it")
+        diag_set_last_fix("add effect", req)
+        k = k + 1
+    }
+}
+
 // Items nest left to right, so each item's expression runs under the effects the items
 // before it installed (§4.7.2).
 fn tc_er_with_row(program: Int, node: Int, held: List[Str], owner: Str, kids: List[Int]) -> List[Str] ! TypeCheck.Resolve, Diag.Report {
@@ -36290,6 +36364,7 @@ fn tc_er_with_row(program: Int, node: Int, held: List[Str], owner: Str, kids: Li
             let vn = if ik == NodeKind.WithResource { node_value(it) } else { it }
             tc_er_walk(program, vn, row, owner, kids)
             let vt = resolve_alias_tid(tc_lookup_node_tid(vn))
+            tc_er_check_with_item(program, vn, vt, row, owner)
             let mut e = tc_tid_handler_effect(vt)
             if e == "" && vt >= 0 { e = tc_tid_handler_effect(resolve_alias_tid(tc_with_binder_tid(vt))) }
             row = tc_er_row_with(row, e)

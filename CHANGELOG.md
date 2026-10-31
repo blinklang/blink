@@ -74,6 +74,7 @@ Single source of truth for release history. `blink llms` and `blink llms --full`
 - **An inclusive range that ends at the largest `Int` stops.** `for i in lo..=hi` and a loop over an inclusive `Range` value yield `hi` last and stop when `hi` is the largest `Int`. Before, the loop stepped past the end, wrapped and never ended.
 - **A `for` walks a range of any integer type.** `for i in 250..=top` with `top: U8` runs 6 times and stops at 255; before, it was E0302. An int literal bound takes the type of the other bound, so `lo..3` with `lo: I16` is a `Range[I16]`, and `let r: Range[U8] = 0..10` checks. A range of `Float` or `Char` is still E0302.
 - **A `BlockHandler` exit or a `Closeable` close may perform effects.** The §4.7.2 `Timer` example, whose exit reads the clock and logs, now builds and runs. The exit performs through the handlers around the `with`, on each way out of the body: normal end, `?`, `return`, `break`, `continue` and a panic that `assert_panics` catches. Before, an exit or close with a row was an internal compiler error.
+- **A `with` item is charged the rows of its `enter` and `exit`, or of its `close`.** A fn whose row does not hold an effect that those methods perform is now E0500 at the item, as for any call (§4.7.2, §5.5). An item runs outside the handler it installs, and inside the handlers of the items before it. Before, `blink check` passed such a fn.
 
 ## Breaking Changes (v0.58.0)
 

@@ -1,0 +1,188 @@
+// A with item calls enter() and exit(), or close() for a Closeable, and those calls are
+// checked against the row around the with, as any call is (sections/04_effects.md §4.7.2,
+// §4.15.3; §5.5: the exit of a Closeable has the row of close). The calls have no call node
+// in the source, so the item itself is the site of the error.
+
+import compile_test_helpers
+
+fn res_src() -> Str {
+    #"effect Note { effect Say { fn say(s: Str) } }
+type T { n: Int }
+impl BlockHandler for T {
+    type Context = ()
+    fn enter(self) -> () ! Note.Say { note.say("enter {self.n}") }
+    fn exit(self, _ok: Bool) ! Note.Say { note.say("exit {self.n}") }
+}
+type F { n: Int }
+impl Closeable for F {
+    fn close(self) ! Note.Say { note.say("close {self.n}") }
+}
+"#
+}
+
+fn with_res(body: Str) -> Str {
+    "{res_src()}{body}"
+}
+
+fn count(text: Str, part: Str) -> Int {
+    text.split(part).len() - 1
+}
+
+test "a BlockHandler item in a fn with no row is E0500 at the item" {
+    let src = with_res(#"fn missing() {
+    with T { n: 1 } { let _ = 0 }
+}
+fn main() { }
+"#)
+    let out = compile_test_helpers.compile_and_capture(src, "with_row_block_handler")
+    compile_test_helpers.expect_error(out, "E0500", "enter and exit need Note.Say")
+    compile_test_helpers.expect_contains(out, "`T.enter` and `T.exit`", "the diagnostic names both methods")
+    compile_test_helpers.expect_contains(out, "`Note.Say`", "the diagnostic names the effect")
+    compile_test_helpers.expect_contains(out, "`missing`", "the diagnostic names the fn")
+    compile_test_helpers.expect_contains(out, "\"line\":13,\"col\":10", "the diagnostic points at the item")
+    compile_test_helpers.expect_contains(out, "\"fix\":\{\"action\":\"add effect\",\"text\":\"Note.Say\"}", "the fix adds the effect")
+    assert_eq(count(out, "\"code\":\"E0500\""), 1)
+}
+
+test "a Closeable item bound with as in a fn with no row is E0500 naming close" {
+    let src = with_res(#"fn missing() {
+    with F { n: 1 } as _f { let _ = 0 }
+}
+fn main() { }
+"#)
+    let out = compile_test_helpers.compile_and_capture(src, "with_row_closeable")
+    compile_test_helpers.expect_error(out, "E0500", "close needs Note.Say")
+    compile_test_helpers.expect_contains(out, "`F.close`", "the diagnostic names close")
+    assert_eq(count(out, "\"code\":\"E0500\""), 1)
+}
+
+test "a fn whose row holds the effect or its parent compiles clean" {
+    let src = with_res(#"fn leaf() ! Note.Say {
+    with T { n: 1 } { let _ = 0 }
+}
+fn parent() ! Note {
+    with F { n: 1 } as _f { let _ = 0 }
+}
+fn main() { }
+"#)
+    let out = compile_test_helpers.compile_and_capture(src, "with_row_held")
+    compile_test_helpers.expect_compiles_clean(out, "the row holds what enter, exit and close need")
+}
+
+test "an item after a handler item runs under that handler" {
+    let src = with_res(#"fn handled() {
+    let h = handler Note.Say { fn say(_s: Str) { } }
+    with h, T { n: 1 }, F { n: 2 } as _f { let _ = 0 }
+}
+fn main() { }
+"#)
+    let out = compile_test_helpers.compile_and_capture(src, "with_row_handled_by_earlier_item")
+    compile_test_helpers.expect_compiles_clean(out, "the earlier item provides Note.Say")
+}
+
+test "an item before a handler item runs outside that handler" {
+    let src = with_res(#"fn too_early() {
+    let h = handler Note.Say { fn say(_s: Str) { } }
+    with F { n: 1 } as _f, h { let _ = 0 }
+}
+fn main() { }
+"#)
+    let out = compile_test_helpers.compile_and_capture(src, "with_row_item_before_handler")
+    compile_test_helpers.expect_error(out, "E0500", "F.close runs outside h")
+    compile_test_helpers.expect_contains(out, "`too_early`", "the diagnostic names the fn")
+}
+
+test "a nested item is checked against the handlers around it" {
+    let ok_src = with_res(#"fn inner() {
+    let h = handler Note.Say { fn say(_s: Str) { } }
+    with h {
+        with T { n: 1 } { let _ = 0 }
+    }
+}
+fn main() { }
+"#)
+    let ok_out = compile_test_helpers.compile_and_capture(ok_src, "with_row_nested_handled")
+    compile_test_helpers.expect_compiles_clean(ok_out, "an outer with provides Note.Say")
+    let bad_src = with_res(#"fn outer() {
+    let h = handler Note.Say { fn say(_s: Str) { } }
+    with T { n: 1 } {
+        with h { let _ = 0 }
+    }
+}
+fn main() { }
+"#)
+    let bad_out = compile_test_helpers.compile_and_capture(bad_src, "with_row_nested_outside")
+    compile_test_helpers.expect_error(bad_out, "E0500", "the outer item runs outside the inner handler")
+}
+
+test "a closure body holding an item is charged to the fn around it" {
+    let src = with_res(#"fn outer() {
+    let f = fn() { with T { n: 1 } { let _ = 0 } }
+    f()
+}
+fn main() { }
+"#)
+    let out = compile_test_helpers.compile_and_capture(src, "with_row_closure")
+    compile_test_helpers.expect_error(out, "E0500", "the closure takes the row of outer")
+    compile_test_helpers.expect_contains(out, "`outer`", "the diagnostic names the fn")
+}
+
+test "a wildcard row does not hold the row of a concrete item" {
+    let src = with_res(#"fn wild[X: Closeable](x: X) ! _ {
+    with T { n: 1 } { let _ = x }
+}
+fn main() { }
+"#)
+    let out = compile_test_helpers.compile_and_capture(src, "with_row_wildcard")
+    compile_test_helpers.expect_error(out, "E0500", "_ comes from the bound of X, not from T")
+    compile_test_helpers.expect_contains(out, "`T.enter` and `T.exit`", "the diagnostic names the methods")
+}
+
+test "an instance of a generic Closeable type is charged the row of close" {
+    let src = #"effect Note { effect Say { fn say(s: Str) } }
+type B[X] { v: X }
+impl[X] Closeable for B[X] {
+    fn close(self) ! Note.Say { note.say("close") }
+}
+fn missing() {
+    with B { v: 1 } as _b { let _ = 0 }
+}
+fn main() { }
+"#
+    let out = compile_test_helpers.compile_and_capture(src, "with_row_generic_receiver")
+    compile_test_helpers.expect_error(out, "E0500", "B[Int].close needs Note.Say")
+    compile_test_helpers.expect_contains(out, ".close`", "the diagnostic names close")
+}
+
+test "an item whose impl is in another module is charged that impl's row" {
+    let helper = #"pub effect Note { effect Say { fn say(s: Str) } }
+pub type R { n: Int }
+impl Closeable for R {
+    fn close(self) ! Note.Say { note.say("close {self.n}") }
+}
+"#
+    let entry = #"import with_row_res.{R}
+fn missing() {
+    with R { n: 1 } as _r { let _ = 0 }
+}
+fn main() { }
+"#
+    let out = compile_test_helpers.compile_xmod_capture(entry, "with_row_res", helper, "with_row_xmod")
+    compile_test_helpers.expect_error(out, "E0500", "the imported close needs Note.Say")
+    compile_test_helpers.expect_contains(out, "`R.close`", "the diagnostic names close")
+}
+
+test "a program whose rows hold the item effects runs enter, exit and close" {
+    let src = with_res(#"fn run() ! Note.Say {
+    with T { n: 1 }, F { n: 2 } as _f { note.say("body") }
+}
+fn main() {
+    with handler Note.Say { fn say(s: Str) { io.println(s) } } {
+        run()
+    }
+}
+"#)
+    let r = compile_test_helpers.compile_and_run(src, "with_row_runs")
+    assert_eq(r.exit_code, 0)
+    assert_eq(r.out, "enter 1\nbody\nclose 2\nexit 1\n")
+}
