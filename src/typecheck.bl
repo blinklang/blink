@@ -7993,7 +7993,7 @@ fn tc_check_closure_ann_against_declared(cls: Int, declared_fn: Int) ! TypeCheck
                 let got = resolve_param_type(p)
                 if tc_tid_is_no_info(want) == 0 && tc_tid_is_no_info(got) == 0 && types_compatible(want, got) == 0 {
                     let ppos = i + 1
-                    tc_error_at("closure parameter {ppos} `{node_name(p)}`: declared type {type_to_str(want)} but written {type_to_str(got)}", p)
+                    tc_mismatch_at("closure parameter {ppos} `{node_name(p)}`: declared type {type_to_str(want)} but written {type_to_str(got)}", p, want, got)
                 }
             }
             i = i + 1
@@ -8006,7 +8006,7 @@ fn tc_check_closure_ann_against_declared(cls: Int, declared_fn: Int) ! TypeCheck
     let got_ret = tc_closure_declared_ret(cls)
     if tc_tid_is_no_info(want_ret) != 0 || tc_tid_is_no_info(got_ret) != 0 { return }
     if types_compatible(want_ret, got_ret) != 0 { return }
-    tc_error_at("closure return type: declared type {type_to_str(want_ret)} but written {type_to_str(got_ret)}", cls)
+    tc_mismatch_at("closure return type: declared type {type_to_str(want_ret)} but written {type_to_str(got_ret)}", cls, want_ret, got_ret)
 }
 
 // Carry a declared type along the path the VALUE takes to reach the position that declared
@@ -8759,20 +8759,50 @@ fn tc_value_mismatch_at(msg: Str, at: Int, val: Int, want: Int, got: Int) ! Type
 
 // A type mismatch at `at` between `want` and `got`, with the note tc_maker_notes gives the pair.
 fn tc_mismatch_at(msg: Str, at: Int, want: Int, got: Int) ! TypeCheck.Report, Diag.Report {
-    let notes = tc_maker_notes(want, got)
-    if notes.len() == 0 { return tc_error_at(msg, at) }
+    tc_mismatch_at_help(msg, at, "", want, got)
+}
+
+fn tc_mismatch_at_help(msg: Str, at: Int, help: Str, want: Int, got: Int) ! TypeCheck.Report, Diag.Report {
     tc_errors.push(msg)
-    diag_error_at_notes("TypeError", TYPE_ERROR, msg, at, "", notes)
+    let notes = tc_maker_notes(want, got)
+    if notes.len() == 0 { return diag_error_at("TypeError", TYPE_ERROR, msg, at, help) }
+    diag_error_at_notes("TypeError", TYPE_ERROR, msg, at, help, notes)
 }
 
 // UnixConn and UnixStream have the same methods and differ only in the call that makes them,
 // so a mismatch between them names those calls (sections/04_effects.md §4.4.6). A type the
-// user declares with one of these names is not std's and gets no note.
+// user declares with one of these names is not std's and gets no note. The pair can be inside
+// the types, as in `Ok(s)` given for a Result[UnixConn, NetError].
 fn tc_maker_notes(want: Int, got: Int) -> List[Str] {
-    let w = tc_std_net_unix_stream_name(want)
-    let g = tc_std_net_unix_stream_name(got)
-    if w == "" || g == "" || w == g { return [] }
+    let (w, g) = tc_unix_stream_pair(want, got, 0)
+    if w == "" { return [] }
     ["`{g}` is made by `{tc_unix_stream_maker(g)}`; `{w}` is made by `{tc_unix_stream_maker(w)}`"]
+}
+
+// The names of the first UnixConn/UnixStream pair that differ at one position in `want` and
+// `got`, or ("", "") when there is none.
+fn tc_unix_stream_pair(want0: Int, got0: Int, depth: Int) -> (Str, Str) {
+    let w = tc_std_net_unix_stream_name(want0)
+    let g = tc_std_net_unix_stream_name(got0)
+    if w != "" && g != "" && w != g { return (w, g) }
+    let want = tc_resolve(resolve_alias_tid(want0))
+    let got = tc_resolve(resolve_alias_tid(got0))
+    if depth >= 8 || want < 0 || got < 0 || tc_tid_kind(want) != tc_tid_kind(got) { return ("", "") }
+    let n = tc_tid_child_count(want)
+    if n == 0 || n != tc_tid_child_count(got) { return ("", "") }
+    // The children of two different declarations are not at the same positions.
+    let k = tc_tid_kind(want)
+    if (k == TyKind.Struct || k == TyKind.Enum) && tc_tid_decl_node(want) != tc_tid_decl_node(got) { return ("", "") }
+    let mut i = 0
+    while i < n {
+        let cw = tc_tid_child(want, i)
+        let cg = tc_tid_child(got, i)
+        if cw >= 0 && cg >= 0 && tc_type_part_compatible(cw, cg) == 0 {
+            return tc_unix_stream_pair(cw, cg, depth + 1)
+        }
+        i = i + 1
+    }
+    ("", "")
 }
 
 fn tc_std_net_unix_stream_name(tid: Int) -> Str {
@@ -23614,7 +23644,7 @@ fn tc_report_match_arm_mismatch(nodes: List[Int], types: List[Int]) ! TypeCheck.
             } else {
                 let first_t = types.get(first).unwrap()
                 if tc_branch_values_agree(nodes.get(first).unwrap(), first_t, nodes.get(i).unwrap(), t) == 0 {
-                    tc_error_at("match arms have incompatible types: {type_to_str(first_t)} vs {type_to_str(t)}", tc_value_report_node(nodes.get(i).unwrap()))
+                    tc_mismatch_at("match arms have incompatible types: {type_to_str(first_t)} vs {type_to_str(t)}", tc_value_report_node(nodes.get(i).unwrap()), first_t, t)
                     return
                 }
                 tc_join_agreeing_values(first_t, t)
@@ -25261,8 +25291,8 @@ fn tc_infer_coalesce(node: Int, lt: Int) -> Int ! TypeCheck.Resolve, TypeCheck.R
     if tc_tid_has_unbound_metavar(inner) != 0 {
         if tc_unify(inner, rt) != 0 { tc_pin_declared_into_value(tc_resolve(inner), node_right(node), rt) }
     } else if tc_branch_values_agree(-1, inner, node_right(node), rt) == 0 {
-        tc_error_at_code("`??` default type {type_to_str(rt)} does not match the Option's value type {type_to_str(inner)}", node_right(node),
-            "TypeError", TYPE_ERROR, tc_coalesce_range_help(node, inner))
+        tc_mismatch_at_help("`??` default type {type_to_str(rt)} does not match the Option's value type {type_to_str(inner)}", node_right(node),
+            tc_coalesce_range_help(node, inner), inner, rt)
     } else {
         tc_pin_declared_into_value(tc_resolve(inner), node_right(node), rt)
     }
@@ -28519,7 +28549,7 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
             // mismatch with `Option[?]`, it is the same branch not yet typed. The compare
             // runs again on the typecheck pass, where both sides are settled.
             if tc_branch_values_agree(node_then_body(node), then_t, else_node, else_t) == 0 {
-                tc_error_at("if branches have incompatible types: {type_to_str(then_t)} vs {type_to_str(else_t)}", node)
+                tc_mismatch_at("if branches have incompatible types: {type_to_str(then_t)} vs {type_to_str(else_t)}", node, then_t, else_t)
             } else {
                 tc_join_agreeing_values(then_t, else_t)
             }
@@ -29757,7 +29787,7 @@ fn tc_report_if_branch_mismatch(node: Int) ! Diag.Report, TypeCheck.Report {
         tc_join_agreeing_values(then_t, else_t)
         return
     }
-    tc_error_at("if branches have incompatible types: {type_to_str(then_t)} vs {type_to_str(else_t)}", node)
+    tc_mismatch_at("if branches have incompatible types: {type_to_str(then_t)} vs {type_to_str(else_t)}", node, then_t, else_t)
 }
 
 // The value node of a match arm body, or -1 when the body diverges and therefore contributes
