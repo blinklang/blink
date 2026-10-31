@@ -393,6 +393,22 @@ fn progress(done: Int, total: Int) ! IO.Print {
 }
 ```
 
+**The `io` handle has no other operations.** The operations in the table above and in §4.4.9 are all of them. There is no `io.debug`. A call `io.debug(x)` is E0505. The §4.4 removed-names table has no row for it, because it holds only names that a released version accepted (§3.2 *Removed methods*), and no released version accepted `io.debug`. So the error has no fix line.
+
+```blink
+fn trace(n: Int) ! IO.Print {
+    io.debug(n)
+}
+```
+
+```
+error[UnresolvedMethod]: no member `debug` on module `io`
+ --> trace.bl:2:8
+  |
+2 |     io.debug(n)
+  |        ^^^^^ `io` has no operation `debug`
+```
+
 **Argument types.** Each non-`_raw` operation takes any `Display` value, as `sb.write` and `"{x}"` do (§3.6 *Display Format Protocol*). So `io.println(42)`, `io.println(p)` and `io.println("n = {n}")` all compile, and a value with no `Display` impl is `error[E0523]` at the argument. `io.print_raw` and `io.eprint_raw` take `Str` only, and `io.print_raw_bytes` takes `Bytes`. The split follows the `_raw` name: `io.eprint` and `io.eprintln` take `Display`, and `io.eprint_raw` takes `Str`. A non-`Str` argument to a `_raw` operation is a type mismatch:
 
 ```
@@ -534,7 +550,9 @@ Handles also enable the handler mechanism (section 4.7). Because all effect oper
 2. Every stdlib function and method declares a row that is a sound upper bound on its observable effects. An empty row means that the function is pure, or that it diverges with result type `Never`.
 3. An operation that consumes a value that a handle op made is a handle op of the same effect. The handler that made the value answers the operation. Under a mock `Process` handler, `process.spawn` returns a `Child` that the handler makes with `Child.mock`, and `process.wait(child)` goes to the same mock, never to the real runtime (§4.4.8).
 
-Rule 2 permits a second tier: a std function or method that has a row but is not a handle op, such as `udp_bind` and `unix_listen` (§4.4.6). Rule 3 permits this only when no handle op made the value that the function consumes. The effect row gates a second-tier function as it gates a handle op, but no handler can intercept it (§4.10).
+Rule 2 permits a second tier: a std function or method that has a row but is not a handle op, such as `udp_bind`, `unix_listen` and `tcp_connect` (§4.4.6), and `terminal_width` (§4.4.11). Rule 3 permits this only when no handle op made the value that the function consumes. The effect row gates a second-tier function as it gates a handle op, but no handler can intercept it (§4.10).
+
+**Every handle op is in a declaration.** Each op of a built-in handle (`io`, `fs`, `net`, `env`, `time`, `process`, `rand`, `crypto` and the others of §4.3) is an operation of an effect declared in §4.4. There is no other handle op, and no list of exceptions. A call `h.name(...)` where the effect of `h` declares no op `name` is E0505, whatever the runtime can do. State that has no declared op reaches a program only through a std function that has a row: the width of the terminal, a raw file descriptor, and the error code of the last call are such state. Std binds the runtime for that function with a foreign declaration (§9.1), and the row of the function is the row of that declaration. The function is second tier. So every handle op has a row that a program can name, also in the clause row of a handler (§4.7.1).
 
 **A handle op has one call form.** A program calls a handle op through its handle: `handle.op(value, ...)`, as in `process.wait(child)` and `net.serve(server)`. A value that a handle op made is an argument. It is never the receiver. `v.op(...)` is a method call: it searches traits only (§3c.4 *Trait Method Lookup*) and never reaches a handler, also when `v` holds a value that a handle op made. So `child.wait()` is E0505 (UnresolvedMethod). This rule does not apply to `.await` (§4.13).
 
@@ -585,8 +603,15 @@ In the structured output (§6.5), this fix carries two edits: the call rewrite a
 | `unix_socket_accept_timeout(l, ms)` | `listener.accept_timeout(Duration.ms(ms))` in `std.net` (§4.4.6) | `Net.Listen` | yes: `Int` becomes `Result[UnixConn?, NetError]`; `-1` after the wait ran out becomes `Ok(None)`, and `-1` for a failure becomes `Err` |
 | `unix_socket_connect(p)` | `unix_connect(p)` in `std.net` (§4.4.6) | `Net.Connect` | yes: `Int` becomes `Result[UnixStream, NetError]` |
 | `socket_read_line(s)`, `socket_write(s, x)`, `unix_socket_close(s)` | `stream.read_line()`, `stream.write(x)`, `stream.close()` on `UnixStream`; `conn.read_line()`, `conn.write(x)`, `conn.close()` on `UnixConn` (§4.4.6) | `Net.Connect` on `UnixStream`, `Net.Listen` on `UnixConn` | yes: reads and writes return a `Result` |
+| `net.connect(h, p)` | `tcp_connect(h, p)` in `std.net` (§4.4.6) | `Net.Connect` | yes: `Int` becomes `Result[TcpStream, NetError]` |
+| `tcp_accept(l)`, `listener_accept(l)` | `listener.accept()` in `std.net` (§4.4.6) | `Net.Listen` | yes: the result is `Result[TcpConn, NetError]`, and the receiver is a `TcpListener` where `tcp_accept` took an `Int` |
+| `tcp_read(s, n)`, `tcp_read_all(s)`, `tcp_read_bytes(s, n)`, `tcp_write(s, x)`, `tcp_write_bytes(s, b)`, `tcp_set_timeout(s, ms)`, `tcp_close(s)` | `stream.read(n)`, `stream.read_all()`, `stream.read_bytes(n)`, `stream.write(x)`, `stream.write_bytes(b)`, `stream.set_timeout(ms)`, `stream.close()` on `TcpStream`; the same methods on `TcpConn` (§4.4.6) | `Net.Connect` on `TcpStream`, `Net.Listen` on `TcpConn` | yes: the `Int` file descriptor becomes the receiver, a `TcpStream` or a `TcpConn` |
 | `io.write(s)` | `io.print_raw(s)` | `IO.Print` | no |
 | `io.write_bytes(b)` | `io.print_raw_bytes(b)` | `IO.Print` | no |
+| `term.width()`, `term.height()` | `terminal_width()`, `terminal_height()` in `std.term` (§4.4.11) | `IO.Print` | no |
+| `term.isatty(1)` | `is_tty()` in `std.term` (§4.4.11) | `IO.Print` | yes: `Int` becomes `Bool` |
+| `term.isatty(2)` | `is_stderr_tty()` in `std.term` (§4.4.11) | `IO.Log` | yes: `Int` becomes `Bool` |
+| `fs.errno()` | no call: read `e.errno.code` in the `Err(e)` of the `fs` op that failed (§4.4.5) | none | yes: the code is a field of the error, not a call |
 | `db_connect(path)`, `sqlite_connect(path)` in `std.db_sqlite` | `with db.connect(path)? { }` (§4.7.2 *Scoped effect handlers*) | `DB` | yes: the result becomes `Result[Connection, DBError]` |
 | `sqlite_handler(handle)` in `std.db_sqlite` | `with db.connect(path)? { }` | `DB` | yes: the argument is a path, and the result becomes `Result[Connection, DBError]` |
 
@@ -602,7 +627,113 @@ error[UndefinedFunction]: undefined function `read_file`
   = help: `fs.read` needs `FS.Read` in the effect row and returns `Result[Str, FsError]`
 ```
 
-In the structured output (§6.5), the fix carries two edits: the call rewrite and the addition of the effect to the enclosing row. Both are machine-applicable when the replacement takes the same arguments. The rewrites for `time_ms`, `file_exists`, `is_dir`, `file_mtime`, `arg_count`, `get_arg`, `sqlite_handler` and `unix_socket_accept_timeout` change the shape of the code, so for these names the fix is a suggestion and only the row edit is machine-applicable. (Panel vote on the `io`, `std.db_sqlite` and handle-operation rows and the fourth column: 6-0. See [Duplicate APIs rationale](../decisions/duplicate-apis.md).) For `unix_socket_accept_timeout`, the `Int` file descriptor becomes the `UnixListener` that is the receiver, and a check of the result for `-1` becomes a `match` on `Ok(None)`. The help of that fix says so: `-1` after the wait ran out is now `Ok(None)`, so that case needs no `Err` arm.
+In the structured output (§6.5), the fix carries two edits: the call rewrite and the addition of the effect to the enclosing row. Both are machine-applicable when the replacement takes the same arguments. The rewrites for `time_ms`, `file_exists`, `is_dir`, `file_mtime`, `arg_count`, `get_arg`, `sqlite_handler`, `unix_socket_accept_timeout`, `net.connect`, `term.isatty`, `tcp_accept`, `listener_accept` and the `tcp_` functions that take an `Int` file descriptor change the shape of the code, so for these names the fix is a suggestion and only the row edit is machine-applicable. (Panel vote on the `io`, `std.db_sqlite` and handle-operation rows and the fourth column: 6-0. See [Duplicate APIs rationale](../decisions/duplicate-apis.md).) For `unix_socket_accept_timeout`, the `Int` file descriptor becomes the `UnixListener` that is the receiver, and a check of the result for `-1` becomes a `match` on `Ok(None)`. The help of that fix says so: `-1` after the wait ran out is now `Ok(None)`, so that case needs no `Err` arm.
+
+**Names under `term`, `fs` and `net`.** `term` is not a handle. `std.term` is a module (§4.4.11). A call `term.width()` fails in one of two ways, and the table applies to both. If the file has `import std.term`, then `term` is a module with no `width`, and the error is E0505. If the file has no such import, then `term` is not in scope, and the error is E0506. The compiler looks in the table when either lookup fails, so both errors carry the same fix line. If the file does not already bring in the replacement, the fix adds its import. A file that declares its own `term` still compiles and calls that name. The `term.isatty` rows are keyed on the literal argument: `term.isatty(1)` and `term.isatty(2)` have the rows above, and any other argument, such as `term.isatty(0)`, has no row and no fix. The `term.width()` and `term.height()` fixes are machine-applicable: they rewrite the call, add the import when it is missing, and add `IO.Print` to the row. The `term.isatty` fix is a suggestion, because `Int` becomes `Bool`, and a test such as `== 1` must change.
+
+The `fs.errno()` row gives a note and a help line, and never a fix. No call replaces it: the code is in the `Err` of the `fs` operation that failed, and code that called a raw operation and then `fs.errno()` has no `Result` to read. The `net.connect(h, p)` row is a suggestion, because `Int` becomes a `Result` and a test for `-1` becomes a `match`. The other operations of the old raw `net` handle (`net.read`, `net.write`, `net.accept`, `net.close` and the rest) have no row: a call is E0505 and has no fix. The methods of `TcpStream` and `TcpConn` do the work that they did. `net.listen(host, port)` is the `Net.Listen` operation of §4.4.2 and returns a `Server`.
+
+Each case below has its own diagnostic. A call to `term.width()` in a file with `import std.term`:
+
+```blink
+import std.term
+
+fn banner() ! IO.Print {
+    io.println("-".repeat(term.width()))
+}
+```
+
+```
+error[UnresolvedMethod]: no member `width` on module `term`
+ --> banner.bl:4:30
+  |
+4 |     io.println("-".repeat(term.width()))
+  |                                ^^^^^ `term` has no member `width`
+  |
+  = fix: terminal_width()
+  = help: `terminal_width` is in `std.term` and needs `IO.Print` in the effect row
+```
+
+The same call in a file with no `import std.term` gives the same fix under E0506:
+
+```
+error[UndefinedVariable]: undefined variable `term`
+ --> banner.bl:3:30
+  |
+3 |     io.println("-".repeat(term.width()))
+  |                           ^^^^ not found in this scope
+  |
+  = fix: terminal_width()
+  = help: `terminal_width` is in `std.term` and needs `IO.Print` in the effect row; add `import std.term.{terminal_width}`
+```
+
+The two `term.isatty` rows give a suggestion. The fix names the Bool function, and the help says that the result changed:
+
+```blink
+import std.term
+
+fn color_out() -> Bool ! IO.Print {
+    term.isatty(1) == 1
+}
+
+fn color_log() -> Bool ! IO.Log {
+    term.isatty(2) == 1
+}
+```
+
+```
+error[UnresolvedMethod]: no member `isatty` on module `term`
+ --> color.bl:4:10
+  |
+4 |     term.isatty(1) == 1
+  |          ^^^^^^ `term` has no member `isatty`
+  |
+  = fix: is_tty()
+  = help: `is_tty` returns `Bool` and needs `IO.Print`; remove the test `== 1`
+```
+
+For `term.isatty(2)` the fix is `is_stderr_tty()` and the row is `IO.Log`.
+
+A call to `fs.errno()` has a note and a help line, and no fix:
+
+```blink
+fn last_code() -> Int ! FS.Read {
+    fs.errno()
+}
+```
+
+```
+error[UnresolvedMethod]: no member `errno` on module `fs`
+ --> codes.bl:2:8
+  |
+2 |     fs.errno()
+  |        ^^^^^ `fs` has no operation `errno`
+  |
+  = note: the error code is in the `Err` of the `fs` operation that failed
+  = help: `Err(e) => e.errno.code`
+```
+
+A call to `io.debug(n)` has no row, so the error has no fix (§4.4 *The `io` handle has no other operations*). A call to `net.connect` has a suggestion, and a call to a raw TCP function has a fix to the method:
+
+```blink
+import std.net.{tcp_read}
+
+fn grab(fd: Int) -> Str ! Net.Connect {
+    tcp_read(fd, 10)
+}
+```
+
+```
+error[UndefinedFunction]: undefined function `tcp_read`
+ --> grab.bl:4:5
+  |
+4 |     tcp_read(fd, 10)
+  |     ^^^^^^^^ not found in this scope
+  |
+  = note: a socket is a value, not a file descriptor number: `tcp_connect` gives a `TcpStream`, and `TcpListener.accept` gives a `TcpConn`
+  = fix: stream.read(10)
+  = help: `TcpStream.read` needs `Net.Connect`; `TcpConn.read` needs `Net.Listen` (§4.4.6)
+```
 
 **Rows for methods of `Child`.** The E0505 help for a handle op finds `child.wait()` by its name, so no row lists it. The help cannot find `child.kill(sig)` or `child.send_signal(sig)`, because the op is named `signal`. Rows keyed by the receiver type `Child` cover them (§3.2 *Removed methods*). The released `kill` method used the signal `0` to mean `SIGKILL`. A literal `0` argument to `kill` becomes `SIGKILL`, and a literal argument other than `0` stays as it is. A `kill` argument that is not a literal gets a suggestion, not a machine-applicable fix, because the argument can be `0`. (Panel vote: 6-0. See [One Call Form for Handle Operations rationale](../decisions/handle-op-call-form.md).)
 
@@ -796,6 +927,8 @@ fn start_server(config: ServerConfig) ! Net.Listen, IO {
 ```
 
 Route registration builds the `Server` value and is not a `Net.Listen` operation; `net.serve(server)` is the operation that a handler answers.
+
+No operation of the `net` handle takes a raw file descriptor or gives one. A program that needs a TCP socket uses `tcp_connect` or `TcpListener.accept` (§4.4.6), which give a value, not a number. A call such as `net.connect(host, port)` or `net.read(fd, n)` is E0505 (see the removed-names table in §4.4).
 
 **Convenience verb methods** mirror `Net.Connect`'s pattern — sugar over `.route()`:
 
@@ -1311,9 +1444,20 @@ Do not use `fs.stat(p).is_ok()` as an existence test. It reads every error as "a
 
 `FsError`, `FsOp`, `FileInfo` and `FileKind` live in `std.fs` and are named with `import std.fs` — the same way `net.request`'s `NetError` is named with `import std.net`. The `fs` operation handle needs no import (it comes from the `! FS` effect on the signature), but the error *type* a caller matches on does.
 
+**No `errno` operation.** The `fs` handle has no `errno` operation. The error code of a failed `fs` operation is in the `Err` that the operation returns: `Err(e)` has `e.errno`, and the number is `e.errno.code`. A call `fs.errno()` is E0505. It has a note and a help line that point to the `Err`, and no machine fix, because no call can replace it (see the removed-names table in §4.4).
+
+```blink
+fn open_code(path: Str) -> Int ! FS.Read {
+    match fs.read(path) {
+        Ok(_) => 0
+        Err(e) => e.errno.code      // the code of this failure
+    }
+}
+```
+
 **No file handles in v1.** The `fs` surface is exactly the five path-taking operations above. There is no `fs.open`, no `fs.create`, and no handle-taking read — a read is `fs.read(path)`, never `fs.read(handle)`. Streaming and incremental access are a post-v1 addition and will arrive as `fs` handle ops that take a file handle (rule 3 of §4.4), not as overloads of `fs.read` — Blink has no function overloading. Examples in §4.7 (*Scoped resources: `with...as`*) that open a `Closeable` file handle with `with ... as` illustrate the scoped-resource mechanism against that planned handle API; they are marked there as post-v1.
 
-#### 4.4.6 Sockets in `std.net`: UDP and Unix-Domain
+#### 4.4.6 Sockets in `std.net`: UDP, TCP and Unix-Domain
 
 Decided by panel deliberation [`udp-gate-sockaddr-flags`](../decisions/udp-gate-sockaddr-flags.md). `std.net` gives UDP a socket type built on `libc.recvfrom_bytes` and `libc.sendto_bytes` (§9.1.3.4).
 
@@ -1571,6 +1715,117 @@ fn accept_own(l: UnixListener, wait: Duration, own: Int) -> Result[UnixConn?, Ne
 ```
 
 A client reads the uid of the server in the same way, with `stream.peer_uid()` on a `UnixStream`. It needs `Net.Connect` alone.
+
+##### TCP stream sockets
+
+TCP stream sockets have the same second-tier shape and the same split as the Unix pair. A socket that a client makes and a socket that a server accepts are two types, each with one maker row (see *Rows of socket methods* above).
+
+```blink
+pub fn tcp_connect(host: Str, port: Int) -> Result[TcpStream, NetError] ! Net.Connect
+pub fn tcp_listen(host: Str, port: Int) -> Result[TcpListener, NetError] ! Net.Listen
+
+pub trait TcpListenerOps {
+    fn accept(self) -> Result[TcpConn, NetError] ! Net.Listen
+    fn close(self) ! Net.Listen
+}
+
+pub trait TcpConnOps {
+    fn read(self, n: Int) -> Str ! Net.Listen
+    fn read_all(self) -> Str ! Net.Listen
+    fn read_bytes(self, n: Int) -> Result[Bytes, NetError] ! Net.Listen
+    fn write(self, data: Str) ! Net.Listen
+    fn write_bytes(self, data: Bytes) -> Result[(), NetError] ! Net.Listen
+    fn set_timeout(self, ms: Int) ! Net.Listen
+    fn close(self) ! Net.Listen
+}
+
+pub trait TcpStreamOps {
+    fn read(self, n: Int) -> Str ! Net.Connect
+    fn read_all(self) -> Str ! Net.Connect
+    fn read_bytes(self, n: Int) -> Result[Bytes, NetError] ! Net.Connect
+    fn write(self, data: Str) ! Net.Connect
+    fn write_bytes(self, data: Bytes) -> Result[(), NetError] ! Net.Connect
+    fn set_timeout(self, ms: Int) ! Net.Connect
+    fn close(self) ! Net.Connect
+}
+```
+
+| Type | Made by | Method | Row |
+|---|---|---|---|
+| `TcpListener` | `tcp_listen` | `accept`, `close` | `Net.Listen` |
+| `TcpConn` | `TcpListener.accept` | `read`, `read_all`, `read_bytes`, `write`, `write_bytes`, `set_timeout`, `close` | `Net.Listen` |
+| `TcpStream` | `tcp_connect` | `read`, `read_all`, `read_bytes`, `write`, `write_bytes`, `set_timeout`, `close` | `Net.Connect` |
+
+- This rule fixes the names of the methods and the rows. It does not fix their result types. A result type that differs from the lines above does not change a row.
+- No type in this section has a method `fd`. No function in `std.net` takes a socket as an `Int`, or gives one back. The type `TcpSocket` does not exist: a program that names it gets E0507, and the help names `TcpStream` for a client and `TcpConn` for a server.
+- A handler does not intercept a TCP method or function. They are second-tier (§4.4 rule 2, §4.10).
+
+A client that uses `tcp_connect` needs `Net.Connect` alone. Its row has no `Net.Listen`:
+
+```blink
+import std.net.{tcp_connect}
+
+fn go() -> Bool ! Net.Connect {
+    match tcp_connect("localhost", 1) {
+        Ok(_) => true
+        Err(_) => false
+    }
+}
+```
+
+If the row is missing (here, `fn go() -> Bool {`), the call fails as any call to a function with an effect fails:
+
+```
+error[UndeclaredEffect]: `tcp_connect` requires effect `Net.Connect`, which `go` does not declare
+ --> client.bl:4:11
+  |
+4 |     match tcp_connect("localhost", 1) {
+  |           ^^^^^^^^^^^ requires `Net.Connect`
+  |
+  = help: add `! Net.Connect` to the signature of `go`
+```
+
+A server gets a `TcpConn` from `accept`, with `Net.Listen`:
+
+```blink
+import std.net.{NetError, tcp_listen}
+
+fn serve_once(port: Int) -> Result[(), NetError] ! Net.Listen {
+    let listener = tcp_listen("127.0.0.1", port)?
+    let conn = listener.accept()?     // a TcpConn
+    let request = conn.read(1024)
+    conn.write("echo: {request}")
+    conn.close()
+    listener.close()
+    Ok(())
+}
+```
+
+When a `TcpConn` is given where a `TcpStream` is expected, or the other way, the type-mismatch error names the other type and the function that makes it:
+
+```blink
+import std.net.{TcpStream, tcp_listen}
+
+fn send_hello(s: TcpStream) ! Net.Connect {
+    s.write("hello")
+}
+
+fn relay(port: Int) ! Net.Listen {
+    let listener = tcp_listen("127.0.0.1", port).unwrap()
+    let conn = listener.accept().unwrap()
+    send_hello(conn)
+}
+```
+
+```
+error[TypeError]: mismatched types
+ --> relay.bl:11:16
+   |
+11 |     send_hello(conn)
+   |                ^^^^ expected `TcpStream`, found `TcpConn`
+   |
+   = note: `TcpStream` is made by `tcp_connect`; `TcpConn` is made by `TcpListener.accept`
+```
 
 #### 4.4.7 Rand Operations
 
@@ -2984,6 +3239,64 @@ fn run() -> Result[Void, DBError] ! FS, Time, Rand, IO {
 The text of the Err names the owner check of the enclosing handler. It does not name the omitted operation. For a mock, the cause is the omission. A mock author who sees this Err writes the missing clause. A mock that forwards on purpose writes `default.step(s)`, and the forward is then explicit (§4.7.1). A `Stmt` that the mock made with `Stmt.mock` can never succeed at the forward, because no outer handler made it.
 
 `DB` is not marked `@handle_all`, so an omitted operation of `DB` gives no `PartialHandler` warning (W0545). An effect that is marked gives W0545 that names each omitted operation (§4.7.1). A driver or mock that must stay complete lists all of the operations above.
+
+#### 4.4.11 Terminal Queries in `std.term`
+
+`std.term` gives a program four questions about the terminal. They are second-tier std functions with a row (§4.4 rule 2). They are not handle ops, and `term` is not a handle.
+
+```blink
+pub fn is_tty() -> Bool ! IO.Print
+pub fn is_stderr_tty() -> Bool ! IO.Log
+pub fn terminal_width() -> Int ! IO.Print
+pub fn terminal_height() -> Int ! IO.Print
+```
+
+- The row follows the fd table in §9.1 *fd-Table and Process-Control Calls — Which Row*. `is_tty`, `terminal_width` and `terminal_height` ask about file descriptor 1, which `IO.Print` makes. `is_stderr_tty` asks about file descriptor 2, which `IO.Log` makes.
+- `is_tty()` is `true` when the standard output is a terminal. `is_stderr_tty()` is `true` when the standard error is a terminal.
+- When there is no terminal, `terminal_width()` is 80 and `terminal_height()` is 24. The result is an `Int` in all cases. A program cannot tell from the result whether the number came from a terminal.
+- `std.term` has no function that takes a file descriptor.
+
+**No handler answers these functions.** A handler of `IO.Print` or `IO.Log` does not intercept `is_tty`, `is_stderr_tty`, `terminal_width` or `terminal_height`. Under a `capture_print` handler, `is_tty()` still answers for the real terminal, not for the capture. The row gates the call, so a function that asks needs the effect, but no handler gives a different answer (§4.10).
+
+```blink
+import std.term.{is_tty}
+import std.testing.{capture_print}
+
+test "is_tty ignores a capture handler" {
+    let real = is_tty()
+    let out: List[Str] = []
+    with capture_print(out) {
+        assert_eq(is_tty(), real)     // the real terminal, not the capture
+    }
+}
+```
+
+A function with `@pure` cannot ask, because the row is not empty (§4.16.3):
+
+```blink
+import std.term.{terminal_width}
+
+@pure
+fn w() -> Int { terminal_width() }
+```
+
+```
+error[ImpureBodyForPureAnnotation]: `@pure` function `w` has the effect `IO.Print`
+ --> w.bl:4:17
+  |
+4 | fn w() -> Int { terminal_width() }
+  |                 ^^^^^^^^^^^^^^ `terminal_width` needs `IO.Print`
+  |
+  = help: remove `@pure`, or pass the width in as an argument
+```
+
+The function with the row compiles:
+
+```blink
+import std.term.{terminal_width}
+
+fn w() -> Int ! IO.Print { terminal_width() }
+```
 
 ---
 
