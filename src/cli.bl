@@ -243,7 +243,7 @@ fn strip_extension(filename: Str) -> Str {
 // The blink a child build runs. It must be the running one: another blink can build with a
 // compiler and stdlib other than the ones that typechecked the file, and a build/blink in a
 // user project can be any program. BLINK_BIN stays as an explicit override.
-fn resolve_blink_bin() -> Str ! FS.Read {
+fn resolve_blink_bin() -> Str ! FS.Read, Env.Read {
     let blink_bin = env.var("BLINK_BIN") ?? ""
     if blink_bin != "" { return blink_bin }
     let exe_path = archive_compiler_path()
@@ -313,14 +313,14 @@ fn detect_ffi_libs(c_source: Str) -> List[Str] {
     libs
 }
 
-fn try_pkg_config(lib: Str) -> Option[Str] {
+fn try_pkg_config(lib: Str) -> Option[Str] ! Process.Spawn {
     match process.run("pkg-config", ["--libs", lib]) {
         Ok(result) => if result.success() { Some(result.out.trim()) } else { None }
         Err(_) => None
     }
 }
 
-fn resolve_ffi_link_flags(lib: Str, target: Str) -> Str {
+fn resolve_ffi_link_flags(lib: Str, target: Str) -> Str ! Process.Spawn {
     let dep_type = manifest_native_dep_type(lib)
 
     if dep_type == "vendored" {
@@ -343,7 +343,7 @@ fn resolve_ffi_link_flags(lib: Str, target: Str) -> Str {
 }
 
 // None when the embedded gc sources cannot be written; the error is printed.
-fn resolve_gc_source() -> Option[Str] ! IO, FS.Write, FS.Read, FS.Delete {
+fn resolve_gc_source() -> Option[Str] ! IO, FS.Write, FS.Read, FS.Delete, Env.Read {
     let blink_root = env.var("BLINK_ROOT") ?? ""
     if blink_root != "" {
         let path = "{blink_root}/bootstrap/vendor/gc/extra/gc.c"
@@ -360,7 +360,7 @@ fn resolve_gc_source() -> Option[Str] ! IO, FS.Write, FS.Read, FS.Delete {
 }
 
 // None when the embedded gc sources cannot be written; the error is printed.
-fn resolve_gc_include() -> Option[Str] ! IO, FS.Write, FS.Read, FS.Delete {
+fn resolve_gc_include() -> Option[Str] ! IO, FS.Write, FS.Read, FS.Delete, Env.Read {
     let blink_root = env.var("BLINK_ROOT") ?? ""
     if blink_root != "" {
         let path = "{blink_root}/bootstrap/vendor/gc/include"
@@ -376,7 +376,7 @@ fn resolve_gc_include() -> Option[Str] ! IO, FS.Write, FS.Read, FS.Delete {
     Some("{base}/include")
 }
 
-fn build_link_flags(target: Str, has_async: Int, used_deps: List[Str], ffi_libs: List[Str]) -> Str ! FS.Read {
+fn build_link_flags(target: Str, has_async: Int, used_deps: List[Str], ffi_libs: List[Str]) -> Str ! FS.Read, Env.Read, Process.Spawn {
     let mut flags = "-lm"
     if target == "" {
         flags = "{flags} -lgc"
@@ -552,7 +552,7 @@ fn deps_unresolved() -> Bool ! FS.Read {
     lock_mt == -1 || toml_mt > lock_mt
 }
 
-fn ensure_deps_resolved() ! Env.Exit, FS.Read, IO, FS.Write, Process.Spawn, Time {
+fn ensure_deps_resolved() ! Env.Exit, FS.Read, IO, FS.Write, Process.Spawn, Time, Env.Read {
     if !deps_resolved() {
         env.exit(1)
     }
@@ -560,7 +560,7 @@ fn ensure_deps_resolved() ! Env.Exit, FS.Read, IO, FS.Write, Process.Spawn, Time
 
 // Resolves the dependencies when blink.toml is newer than the lock. False when the resolve
 // failed, with the errors printed on stderr.
-fn deps_resolved() -> Bool ! IO, FS.Read, FS.Write, Process.Spawn, Time {
+fn deps_resolved() -> Bool ! IO, FS.Read, FS.Write, Process.Spawn, Time, Env.Read {
     if deps_unresolved() {
         io.eprintln("resolving dependencies...")
         // The compile that follows loads blink.toml again and reports its issues once. Those
@@ -615,7 +615,7 @@ fn compile_front_end(source_path: Str, strict_mode: Int) -> Result[Int, Int] ! L
 // What compile_front_end returns for the program the daemon checked, printing what it would
 // print: the check ran the same stages on the same inputs, and front holds what they reported
 // where compile_front_end stops on an error.
-fn checked_front_end(b: DaemonBuild, strict_mode: Int) -> Result[Int, Int] ! Diag.Report {
+fn checked_front_end(b: DaemonBuild, strict_mode: Int) -> Result[Int, Int] ! Diag.Report, IO {
     io.print(b.out)
     io.eprint(b.err)
     let f = b.front
@@ -792,7 +792,7 @@ fn compiler_archive_holds_effects(program: Int, held: List[Str]) -> Bool {
 // walked up two dirs (build/blink → repo root, or <prefix>/bin/blink →
 // <prefix>). "" if neither resolves — callers then fall back to
 // cwd-relative paths.
-pub fn resolve_install_root() -> Str ! FS.Read {
+pub fn resolve_install_root() -> Str ! FS.Read, Env.Read {
     if install_root_cached != "<unset>" {
         return install_root_cached
     }
@@ -811,7 +811,7 @@ pub fn resolve_install_root() -> Str ! FS.Read {
     install_root_cached
 }
 
-pub fn resolve_archive_dir() -> Str ! FS.Read {
+pub fn resolve_archive_dir() -> Str ! FS.Read, Env.Read {
     let root = resolve_install_root()
     if root != "" {
         let dev_archive = path_join(root, "build/libblink_std.a")
@@ -826,7 +826,7 @@ pub fn resolve_archive_dir() -> Str ! FS.Read {
     "build"
 }
 
-fn resolve_target_triple(alias: Str) -> Str {
+fn resolve_target_triple(alias: Str) -> Str ! Process.Spawn {
     if alias == "linux" || alias == "linux-amd64" {
         return "x86_64-linux-gnu"
     }
@@ -849,14 +849,14 @@ fn resolve_target_triple(alias: Str) -> Str {
     return alias
 }
 
-fn has_ccache() -> Int ! IO, FS.Read {
+fn has_ccache() -> Int ! IO, FS.Read, Env.Read {
     if ccache_state < 0 {
         ccache_state = if build_fs.find_program("ccache") != "" { 1 } else { 0 }
     }
     ccache_state
 }
 
-pub fn run_cc(args: Str, debug_mode: Int, release_mode: Int, target: Str) -> Int ! IO, Process.Spawn, FS.Read, Env.Exit {
+pub fn run_cc(args: Str, debug_mode: Int, release_mode: Int, target: Str) -> Int ! IO, Process.Spawn, FS.Read, Env.Exit, Env.Read {
     run_command(cc_command(args, debug_mode, release_mode, target))
 }
 
@@ -875,7 +875,7 @@ type CcRun {
 }
 
 // Runs what run_cc runs, and keeps its stdout and stderr in place of printing them.
-fn run_cc_kept(args: Str, debug_mode: Int, release_mode: Int, target: Str) -> CcRun ! IO, Process.Spawn, FS.Read {
+fn run_cc_kept(args: Str, debug_mode: Int, release_mode: Int, target: Str) -> CcRun ! IO, Process.Spawn, FS.Read, Env.Read {
     let cmd = cc_command(args, debug_mode, release_mode, target)
     let words = build_fs.plain_words(cmd)
     let ran = if words.len() > 0 && build_fs.find_program(words.get(0).unwrap()) != "" {
@@ -892,7 +892,7 @@ fn run_cc_kept(args: Str, debug_mode: Int, release_mode: Int, target: Str) -> Cc
 // Runs what run_cc runs. A test build keeps the output, and a step that fails prints one
 // diagnostic for the step (§8.10.5); any other build lets cc print as it runs, and has no
 // output here.
-fn run_cc_step(args: Str, debug_mode: Int, release_mode: Int, target: Str, test_build: Bool) -> CcRun ! IO, Process.Spawn, FS.Read, Env.Exit {
+fn run_cc_step(args: Str, debug_mode: Int, release_mode: Int, target: Str, test_build: Bool) -> CcRun ! IO, Process.Spawn, FS.Read, Env.Exit, Env.Read {
     if test_build {
         return run_cc_kept(args, debug_mode, release_mode, target)
     }
@@ -943,13 +943,13 @@ fn test_build_step_failed(severity: Str, name: Str, code: Str, step: Str, output
 }
 
 // Starts what run_cc runs without waiting for it; build_fs.reap_to_files answers its end.
-pub fn spawn_cc(args: Str, debug_mode: Int, release_mode: Int, target: Str, dir: Str, name: Str) -> build_fs.FileChild ! IO, FS.Read, FS.Write, Process.Spawn, Env.Exit {
+pub fn spawn_cc(args: Str, debug_mode: Int, release_mode: Int, target: Str, dir: Str, name: Str) -> build_fs.FileChild ! IO, FS.Read, FS.Write, Process.Spawn, Env.Exit, Env.Read {
     spawn_unit(cc_command(args, debug_mode, release_mode, target), dir, name)
 }
 
 // Runs cmd as sh -c runs it, but without a shell when sh would only split it into words:
 // a build runs cc once per unit and once to link, and each sh costs as much as a small unit.
-fn run_command(cmd: Str) -> Int ! IO, Process.Spawn, FS.Read, Env.Exit {
+fn run_command(cmd: Str) -> Int ! IO, Process.Spawn, FS.Read, Env.Exit, Env.Read {
     let words = build_fs.plain_words(cmd)
     if words.len() > 0 && build_fs.find_program(words.get(0).unwrap()) != "" {
         return build_fs.run_program(words.get(0).unwrap(), words_after_first(words))
@@ -959,7 +959,7 @@ fn run_command(cmd: Str) -> Int ! IO, Process.Spawn, FS.Read, Env.Exit {
 
 // Starts cmd as sh -c runs it, without the shell when run_command
 // would run it without one, its output written to files in dir named for name.
-fn spawn_unit(cmd: Str, dir: Str, name: Str) -> build_fs.FileChild ! IO, FS.Read, FS.Write, Process.Spawn, Env.Exit {
+fn spawn_unit(cmd: Str, dir: Str, name: Str) -> build_fs.FileChild ! IO, FS.Read, FS.Write, Process.Spawn, Env.Exit, Env.Read {
     let out_path = "{dir}/{name}.cc-out"
     let err_path = "{dir}/{name}.cc-err"
     let words = build_fs.plain_words(cmd)
@@ -979,7 +979,7 @@ fn words_after_first(words: List[Str]) -> List[Str] {
     rest
 }
 
-fn cc_command(args: Str, debug_mode: Int, release_mode: Int, target: Str) -> Str ! IO, FS.Read {
+fn cc_command(args: Str, debug_mode: Int, release_mode: Int, target: Str) -> Str ! IO, FS.Read, Env.Read {
     let mut compiler = "cc"
     let mut pipe = "-pipe "
     if target != "" {
@@ -1016,7 +1016,7 @@ fn unit_cc_flags() -> List[Str] {
 // is named under, and the archive dir its headers come from, each of which a debug object's
 // debug info names. An object at another level records none of them, so it serves any tree.
 // None when the compile dir cannot be read.
-fn recorded_paths(debug_mode: Int, c_dir: Str, arc_dir: Str) -> Option[List[Str]] ! IO, FS.Read {
+fn recorded_paths(debug_mode: Int, c_dir: Str, arc_dir: Str) -> Option[List[Str]] ! IO, FS.Read, Env.Read {
     if debug_mode == 0 {
         return Some([])
     }
@@ -1041,7 +1041,7 @@ fn vendored_dirs_in(include_flags: Str) -> List[Str] {
 // Whether a unit compile maps the vendored dirs to their names: below --debug, when one has a
 // name, and when cc takes the map. A debug object's debug info names each dir by its path
 // anyway. A cc that rejects the map compiles without it, and its object then records the path.
-fn vendored_dirs_by_name(debug_mode: Int, dirs: List[Str], target: Str) -> Bool ! IO, FS.Read {
+fn vendored_dirs_by_name(debug_mode: Int, dirs: List[Str], target: Str) -> Bool ! IO, FS.Read, Process.Spawn, Env.Read {
     debug_mode == 0 && build_objcache.vendored_dir_maps(dirs).len() > 0 && cc_takes_macro_prefix_map(target)
 }
 
@@ -1049,12 +1049,12 @@ fn vendored_dirs_by_name(debug_mode: Int, dirs: List[Str], target: Str) -> Bool 
 // it (vendored_map_flags). written names what this build writes. A vendored dir can hold the
 // project, as -I. does, and what the build writes there is no input of it: in the key, each
 // build would miss the objects the last one stored.
-fn vendored_header_lines(debug_mode: Int, dirs: List[Str], target: Str, written: List[Str]) -> Option[List[Str]] ! IO, FS.Read {
+fn vendored_header_lines(debug_mode: Int, dirs: List[Str], target: Str, written: List[Str]) -> Option[List[Str]] ! IO, FS.Read, Process.Spawn, Env.Read {
     build_objcache.vendored_key_lines(dirs, vendored_dirs_by_name(debug_mode, dirs, target), key_walk_skip(written))
 }
 
 // What the walk of a unit's vendored dirs passes over: the caches and what the build writes.
-fn key_walk_skip(written: List[Str]) -> List[Str] {
+fn key_walk_skip(written: List[Str]) -> List[Str] ! Env.Read {
     let mut skip: List[Str] = [build_objcache.obj_cache_dir(), native_cache_dir()]
     for w in written { skip.push(w) }
     skip
@@ -1062,7 +1062,7 @@ fn key_walk_skip(written: List[Str]) -> List[Str] {
 
 // " <flags>" a unit compile adds so its object names a vendored dir only as its key does
 // (vendored_header_lines).
-fn vendored_map_flags(debug_mode: Int, dirs: List[Str], target: Str) -> Str ! IO, FS.Read {
+fn vendored_map_flags(debug_mode: Int, dirs: List[Str], target: Str) -> Str ! IO, FS.Read, Process.Spawn, Env.Read {
     if !vendored_dirs_by_name(debug_mode, dirs, target) {
         return ""
     }
@@ -1079,7 +1079,7 @@ let mut cached_macro_prefix_map: Str = ""
 
 // Whether the cc run_cc runs for target takes -fmacro-prefix-map (gcc 8 and clang 10 on).
 // Probed once per cc id, and only for a build with an absolute vendored dir.
-fn cc_takes_macro_prefix_map(target: Str) -> Bool ! IO, FS.Read {
+fn cc_takes_macro_prefix_map(target: Str) -> Bool ! IO, FS.Read, Process.Spawn, Env.Read {
     let id = process_cc_id(target)
     if !cached_macro_prefix_map.starts_with("{id}\n") {
         let cmd = cc_command("-fmacro-prefix-map=/blink-probe/=probe/ -E -x c /dev/null -o /dev/null", 0, 0, target)
@@ -1099,7 +1099,7 @@ fn unit_key_flags(debug_mode: Int, release_mode: Int) -> List[Str] {
     flags
 }
 
-fn compile_vendored_source(name: Str, c_path: Str, o_path: Str, debug_mode: Int, release_mode: Int, target: Str, test_build: Bool) -> Int ! IO, Process.Spawn, FS.Read, Env.Exit, FS.Delete, FS.Write {
+fn compile_vendored_source(name: Str, c_path: Str, o_path: Str, debug_mode: Int, release_mode: Int, target: Str, test_build: Bool) -> Int ! IO, Process.Spawn, FS.Read, Env.Exit, FS.Delete, FS.Write, Env.Read {
     let src_mt = build_fs.mtime_ms(c_path)
     let obj_mt = build_fs.mtime_ms(o_path)
     if obj_mt >= src_mt && src_mt != -1 {
@@ -1133,7 +1133,7 @@ fn compile_vendored_source(name: Str, c_path: Str, o_path: Str, debug_mode: Int,
 // custom build), (2) installed sidecar at `<install_root>/share/blink/native/<name>/`,
 // (3) dev-tree `lib/native/<name>/`. Returns "" if no source can be
 // located, leaving the caller to error out.
-fn resolve_native_dep_source(name: Str) -> Str ! FS.Read {
+fn resolve_native_dep_source(name: Str) -> Str ! FS.Read, Env.Read {
     let dep_type = manifest_native_dep_type(name)
     let dep_path = manifest_native_dep_path(name)
     if dep_type == "vendored" && dep_path != "" {
@@ -1170,7 +1170,7 @@ fn vendored_object_path(name: Str, target: Str) -> Str {
 // The objects of the native deps a build links. None when the build stops, with the error
 // printed: in a test build, when a dep did not compile; in any build, when the gc sources
 // cannot be written. Any other build links the objects that did compile.
-fn resolve_vendored_objects(used_deps: List[Str], debug_mode: Int, release_mode: Int, target: Str, test_build: Bool) -> Option[List[Str]] ! IO, FS.Write, FS.Read, Process.Spawn, FS.Delete, Env.Exit {
+fn resolve_vendored_objects(used_deps: List[Str], debug_mode: Int, release_mode: Int, target: Str, test_build: Bool) -> Option[List[Str]] ! IO, FS.Write, FS.Read, Process.Spawn, FS.Delete, Env.Exit, Env.Read {
     let mut objects: List[Str] = []
 
     if target != "" {
@@ -1269,7 +1269,7 @@ fn gc_unavailable(test_build: Bool) -> Option[List[Str]] ! IO {
 // The -I flags a zig compile for target needs to find gc.h, which the host's cc finds
 // installed; none for a host build. None when the gc sources cannot be written; the error is
 // printed.
-fn cross_gc_includes(target: Str) -> Option[List[Str]] ! IO, FS.Write, FS.Read, FS.Delete {
+fn cross_gc_includes(target: Str) -> Option[List[Str]] ! IO, FS.Write, FS.Read, FS.Delete, Env.Read {
     let mut includes: List[Str] = []
     if target != "" {
         let gc_inc = match resolve_gc_include() {
@@ -1288,7 +1288,7 @@ fn cross_gc_includes(target: Str) -> Option[List[Str]] ! IO, FS.Write, FS.Read, 
 }
 
 // None when the gc sources cannot be written; the error is printed.
-fn resolve_vendored_includes(used_deps: List[Str], target: Str) -> Option[Str] ! IO, FS.Read, FS.Write, FS.Delete {
+fn resolve_vendored_includes(used_deps: List[Str], target: Str) -> Option[Str] ! IO, FS.Read, FS.Write, FS.Delete, Env.Read {
     let mut includes = match cross_gc_includes(target) {
         Some(i) => i
         None => return None
@@ -1349,7 +1349,7 @@ pub fn process_compiler_sha() -> Str ! IO, FS.Read {
 
 // The compiler run_cc runs for target: a cross build runs zig, whose clang line does not
 // move with every zig release, so the zig version is part of it.
-fn process_cc_id(target: Str) -> Str ! IO {
+fn process_cc_id(target: Str) -> Str ! IO, Process.Spawn {
     if cached_cc_id_for != "{target}\n" {
         if target == "" {
             // The first line `cc --version 2>&1 | head -1` gave, which every cached key holds:
@@ -1378,7 +1378,7 @@ let mut cache_did_store: Int = 0
 // The object answered sits in snap_dir, which the caller removes after its link: the GC of
 // another build can remove the cache entry before then. The key and the compile both read
 // snap, the private copy of the C the build emitted.
-fn cache_compile_snapshot(out: Str, snap: Str, c_path: Str, snap_dir: Str, debug_mode: Int, release_mode: Int, target: Str, arc_dir: Str, include_flags: Str, test_build: Bool) -> Str ! IO, FS.Read, FS.Write, Process.Spawn, FS.Delete, Env.Exit {
+fn cache_compile_snapshot(out: Str, snap: Str, c_path: Str, snap_dir: Str, debug_mode: Int, release_mode: Int, target: Str, arc_dir: Str, include_flags: Str, test_build: Bool) -> Str ! IO, FS.Read, FS.Write, Process.Spawn, FS.Delete, Env.Exit, Time.Read, Env.Read {
     let vendored_dirs = vendored_dirs_in(include_flags)
     let flags = cc_opt_flags(debug_mode, release_mode)
     let paths = match recorded_paths(debug_mode, path_dirname(c_path), arc_dir) {
@@ -1440,7 +1440,7 @@ fn ensure_dev_archive() -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, 
 }
 
 // Whether ensure_dev_archive would leave the archive as it is.
-fn dev_archive_current() -> Bool ! IO, FS.Read {
+fn dev_archive_current() -> Bool ! IO, FS.Read, Env.Read {
     let arc_dir = resolve_archive_dir()
     if arc_dir.ends_with("share/blink") {
         return true
@@ -1462,7 +1462,7 @@ fn dev_archive_current() -> Bool ! IO, FS.Read {
 // std-cache entry keeps a copy of the runtime.h its archive compiled, and reading both is
 // cheaper than hashing one: the sha costs about 2 ms, and this runs on each build. An archive
 // with no such copy apart from the live header is checked by its stamp's runtime.h sha.
-fn dev_archive_runtime_h_current(arc_dir: Str, stamp_rt_sha: Str) -> Bool ! IO, FS.Read {
+fn dev_archive_runtime_h_current(arc_dir: Str, stamp_rt_sha: Str) -> Bool ! IO, FS.Read, Env.Read {
     let rt = resolve_runtime_h()
     match build_fs.real_path(path_join(arc_dir, "libblink_std.a")) {
         Some(archive) => {
@@ -1503,7 +1503,7 @@ fn dev_archive_runtime_h_current(arc_dir: Str, stamp_rt_sha: Str) -> Bool ! IO, 
 // Returns 0 when the link may proceed (dev archive, or matching installed
 // stamp), 1 when an installed archive is incompatible or unstamped (a
 // diagnostic is emitted and the caller must not produce a binary).
-fn verify_installed_archive(arc_dir: Str) -> Int ! Diag.Report, IO, FS.Read {
+fn verify_installed_archive(arc_dir: Str) -> Int ! Diag.Report, IO, FS.Read, Env.Read {
     if !arc_dir.ends_with("share/blink") {
         return 0
     }
@@ -1548,7 +1548,7 @@ fn verify_installed_archive(arc_dir: Str) -> Int ! Diag.Report, IO, FS.Read {
 // arc_dir holds host-arch objects, built against the host's libc, whose symbols zig's libc
 // for the same arch can lack. It is cached under build/ beside the cross-built gc, since
 // share/blink may be read-only. "" after an error is printed.
-fn ensure_target_archive(arc_dir: Str, target: Str) -> Str ! IO, FS.Write, FS.Read, FS.Delete, Process.Spawn, Env.Exit {
+fn ensure_target_archive(arc_dir: Str, target: Str) -> Str ! IO, FS.Write, FS.Read, FS.Delete, Process.Spawn, Env.Exit, Env.Read {
     if target == "" {
         return "{arc_dir}/libblink_std.a"
     }
@@ -1622,7 +1622,7 @@ fn ensure_target_archive(arc_dir: Str, target: Str) -> Str ! IO, FS.Write, FS.Re
     archive
 }
 
-fn do_link_target(out: Str, c_path: Str, c_source: Str, link_flags: Str, obj_files: List[Str], include_flags: Str, debug_mode: Int, release_mode: Int, target: Str, compiler_archive: Str, test_build: Bool) -> Int ! Diag.Report, IO, FS.Read, FS.Write, FS.Delete, Process.Spawn, Env.Exit {
+fn do_link_target(out: Str, c_path: Str, c_source: Str, link_flags: Str, obj_files: List[Str], include_flags: Str, debug_mode: Int, release_mode: Int, target: Str, compiler_archive: Str, test_build: Bool) -> Int ! Diag.Report, IO, FS.Read, FS.Write, FS.Delete, Process.Spawn, Env.Exit, Env.Read, Time.Read {
     let mut objs = ""
     if obj_files.len() > 0 {
         objs = " {obj_files.join(" ")}"
@@ -1711,7 +1711,7 @@ fn do_link_target(out: Str, c_path: Str, c_source: Str, link_flags: Str, obj_fil
 // Reports a failed one-unit link of a test build as the step that failed. The link also
 // compiles the generated C when the cache did not, so a compile-only run of that C tells
 // the two apart: the C did not compile (a compiler bug), or the link did not resolve.
-fn report_link_target_failure(link_output: Str, cached_o: Str, snap: Str, includes: Str, archive: Str, debug_mode: Int, release_mode: Int, target: Str) ! IO, Process.Spawn, FS.Read {
+fn report_link_target_failure(link_output: Str, cached_o: Str, snap: Str, includes: Str, archive: Str, debug_mode: Int, release_mode: Int, target: Str) ! IO, Process.Spawn, FS.Read, Env.Read {
     if cached_o == "" {
         let compiled = run_cc_kept("-fsyntax-only {snap}{includes}{archive}", debug_mode, release_mode, target)
         if compiled.rc != 0 {
@@ -1722,7 +1722,7 @@ fn report_link_target_failure(link_output: Str, cached_o: Str, snap: Str, includ
     test_build_step_failed("error", "LinkFailed", LINK_FAILED, "linking", link_output)
 }
 
-fn validate_ffi_native_deps(ffi_libs: List[Str]) -> Int ! Diag.Report {
+fn validate_ffi_native_deps(ffi_libs: List[Str]) -> Int ! Diag.Report, IO {
     let mut errors = 0
     let mut i = 0
     while i < ffi_libs.len() {
@@ -1740,7 +1740,7 @@ fn validate_ffi_native_deps(ffi_libs: List[Str]) -> Int ! Diag.Report {
     0
 }
 
-fn validate_cross_target_deps(target: Str) -> Int ! Diag.Report {
+fn validate_cross_target_deps(target: Str) -> Int ! Diag.Report, IO {
     let mut errors = 0
     let count = manifest_native_dep_count()
     let mut i = 0
@@ -1777,7 +1777,7 @@ fn write_edited(path: Str, text: Str) ! FS.Write, IO, Env.Exit {
     if !build_fs.write_or_report(path, text) { env.exit(1) }
 }
 
-fn stamp_blink_version() ! Diag.Report, FS.Write, FS.Read, IO, Env.Exit {
+fn stamp_blink_version() ! Diag.Report, FS.Write, FS.Read, IO, Env.Exit, Env.Read {
     let manifest = resolve_manifest_path()
     if manifest == "" {
         return
@@ -1815,7 +1815,7 @@ fn stamp_blink_version() ! Diag.Report, FS.Write, FS.Read, IO, Env.Exit {
 
 // A foreign constant's key is checked whether or not the program has a manifest: with no
 // link flag, nothing later would catch a key that names no dependency.
-fn check_foreign_const_libs(foreign: List[ForeignConst]) -> Int ! Diag.Report {
+fn check_foreign_const_libs(foreign: List[ForeignConst]) -> Int ! Diag.Report, IO {
     let mut errors = 0
     for fc in foreign {
         if fc.lib == "" || is_runtime_lib(fc.lib) || manifest_has_native_dep(fc.lib) != 0 { continue }
@@ -1829,7 +1829,7 @@ fn check_foreign_const_libs(foreign: List[ForeignConst]) -> Int ! Diag.Report {
     0
 }
 
-fn validate_build_deps(ffi_libs: List[Str], targets: List[Str]) -> Int ! Diag.Report, FS.Read {
+fn validate_build_deps(ffi_libs: List[Str], targets: List[Str]) -> Int ! Diag.Report, FS.Read, Process.Spawn, IO {
     let has_toml = if resolve_manifest_path() != "" { 1 } else { 0 }
     if has_toml == 1 && ffi_libs.len() > 0 {
         let vrc = validate_ffi_native_deps(ffi_libs)
@@ -1855,7 +1855,7 @@ fn validate_build_deps(ffi_libs: List[Str], targets: List[Str]) -> Int ! Diag.Re
 // constant expression that fits its declared type. A failure is E0855 at the declaration:
 // the program's own compile would only say that a name is undeclared, at a line of C. An
 // error the probe cannot map to a constant is left to that compile.
-fn check_foreign_consts(foreign: List[ForeignConst], targets: List[Str], used_deps: List[Str], output_path: Str) -> Int ! Diag.Report, IO, FS.Read, FS.Write, FS.Delete, Process.Spawn {
+fn check_foreign_consts(foreign: List[ForeignConst], targets: List[Str], used_deps: List[Str], output_path: Str) -> Int ! Diag.Report, IO, FS.Read, FS.Write, FS.Delete, Process.Spawn, Env.Read {
     if foreign.is_empty() { return 0 }
     let mut out_dir = path_dirname(output_path)
     if out_dir == "" { out_dir = "." }
@@ -1933,7 +1933,7 @@ let BUILD_STATUS_HUMAN = 0
 let BUILD_STATUS_JSON = 1
 let BUILD_STATUS_NONE = 2
 
-fn do_build(source_path: Str, output_path: Str, c_path: Str, debug_mode: Int, release_mode: Int, test_build: Bool, emit_mode: Str, targets: List[Str], status_mode: Int, strict_mode: Int, unit_jobs: Int, per_module_flag: Bool, checked: Option[DaemonBuild]) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit, Codegen, IO, FS.Read, FS.Write, FS.Delete, Process.Spawn, Env.Exit, Env.Read {
+fn do_build(source_path: Str, output_path: Str, c_path: Str, debug_mode: Int, release_mode: Int, test_build: Bool, emit_mode: Str, targets: List[Str], status_mode: Int, strict_mode: Int, unit_jobs: Int, per_module_flag: Bool, checked: Option[DaemonBuild]) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit, Codegen, IO, FS.Read, FS.Write, FS.Delete, Process.Spawn, Env.Exit, Env.Read, Time.Read {
     let _ = fs.delete(output_path)
     // Before the compile: it checks a compiler archive against the stdlib archive's
     // stamp, which a rebuild here would change.
@@ -2080,7 +2080,7 @@ fn do_build(source_path: Str, output_path: Str, c_path: Str, debug_mode: Int, re
 // --jobs, BLINK_JOBS or -1 for the CPU count. A job count that is not a positive integer is an
 // error rather than a silent fallback, so a typo cannot quietly serialise a build. Only a
 // per-module build reads the count, so only it can fail on one.
-fn unit_jobs_from_args(a: Args) -> Int {
+fn unit_jobs_from_args(a: Args) -> Int ! Env.Read, IO, Env.Exit {
     if !per_module_selected(a) { return 0 }
     let flag = args_get(a, "jobs")
     let env_val = env.var("BLINK_JOBS") ?? ""
@@ -2100,7 +2100,7 @@ fn unit_jobs_from_args(a: Args) -> Int {
 // Whether a build, run or test takes the per-module path. A flag on the command beats
 // BLINK_PER_MODULE, which beats the default. --no-per-module keeps the one-unit build
 // reachable, so a per-module bug can be bisected against it.
-fn per_module_selected(a: Args) -> Bool {
+fn per_module_selected(a: Args) -> Bool ! IO, Env.Exit, Env.Read {
     // Read even under a flag, so a bad value fails here and not in a build this one starts.
     let by_env = per_module_from_env()
     let on = args_has(a, "per-module")
@@ -2117,7 +2117,7 @@ fn per_module_selected(a: Args) -> Bool {
 // BLINK_PER_MODULE sets the path for every build, run and test that passes neither flag, so
 // the builds a program starts through the CLI take the same path as the caller. Any value but
 // 0 or 1 is an error, for the same reason as a bad job count.
-fn per_module_from_env() -> Bool {
+fn per_module_from_env() -> Bool ! Env.Read, IO, Env.Exit {
     let raw = env.var("BLINK_PER_MODULE") ?? ""
     if raw == "" || raw == "1" { return true }
     if raw == "0" { return false }
@@ -2127,7 +2127,7 @@ fn per_module_from_env() -> Bool {
 }
 
 // Why a --per-module build falls back to one unit, or "" when it does not.
-fn per_module_fallback_reason(emit_mode: Str) -> Str {
+fn per_module_fallback_reason(emit_mode: Str) -> Str ! Env.Read {
     if emit_mode == "c" { return "--emit c writes one C file" }
     if (env.var("BLINK_SKIP_MODULES") ?? "") != "" { return "BLINK_SKIP_MODULES is set" }
     if (env.var("BLINK_ONLY_MODULE") ?? "") != "" { return "BLINK_ONLY_MODULE is set" }
@@ -2248,7 +2248,7 @@ fn unit_with_includes(c: Str, m: Str, hs: UnitHeaders) -> (Str, List[Str]) {
     }
 }
 
-fn units_bail_on_diag() -> Int ! Diag.Report {
+fn units_bail_on_diag() -> Int ! Diag.Report, IO {
     if diag_ice_count > 0 {
         diag_flush()
         return 101
@@ -2261,7 +2261,7 @@ fn units_bail_on_diag() -> Int ! Diag.Report {
 }
 
 // The std modules the archive holds are declared, not compiled, as in the one-unit build.
-fn units_cg_config(debug_mode: Int, test_build: Bool) -> CgConfig ! FS.Read {
+fn units_cg_config(debug_mode: Int, test_build: Bool) -> CgConfig ! FS.Read, Env.Read {
     let mut skip: Map[Str, Int] = Map()
     for k in list_stdlib_module_keys() {
         skip.insert(k, 1)
@@ -2294,7 +2294,7 @@ type CompiledUnits {
 
 // A build reuses or records units only when the emit would print nothing: no trace but the
 // build's own channels. --no-cache asks for every step again.
-fn emit_reuse_allowed() -> Bool {
+fn emit_reuse_allowed() -> Bool ! Env.Read {
     if trace_mode != "" || cli_trace_codegen != 0 { return false }
     if cg_obj_cache_enabled == 0 || !build_objcache.cache_enabled() { return false }
     if dbg_channels != "" {
@@ -2509,7 +2509,7 @@ fn do_compile_units(source_path: Str, dir: Str, last_dir: Str, debug_mode: Int, 
 // unless every file is byte-equal. Also a build that takes nothing: it writes its headers from
 // one shared preamble, which the cold emit does not. It proves the reuse key in tests; it never
 // changes the C.
-fn emit_reuse_verify() -> Bool {
+fn emit_reuse_verify() -> Bool ! Env.Read {
     (env.var("BLINK_EMIT_REUSE_VERIFY") ?? "") == "1"
 }
 
@@ -2692,7 +2692,7 @@ fn entry_unit_key(program: Int, cfg: CgConfig, facts: ProgramFacts) -> Str ! Dia
 // The mean number of decls in each file a large module's unit is cut into, or 0 to cut
 // none: BLINK_UNIT_CHUNK_DECLS, which tests set low so that a small module is cut, or 32. A
 // release build cuts nothing, so cc sees each module whole, to inline across its functions.
-fn unit_chunk_decls(release_mode: Int) -> Int {
+fn unit_chunk_decls(release_mode: Int) -> Int ! Env.Read {
     if release_mode != 0 { return 0 }
     let v = env.var("BLINK_UNIT_CHUNK_DECLS") ?? ""
     let n = v.to_int()
@@ -2722,7 +2722,7 @@ fn unit_uses(m: Str, sources: UnitSources) -> List[Str] {
     out
 }
 
-fn units_flush_warnings(strict_mode: Int) -> Int ! Diag.Report {
+fn units_flush_warnings(strict_mode: Int) -> Int ! Diag.Report, IO {
     if diag_warn_count > 0 {
         diag_flush()
         if strict_mode != 0 {
@@ -2732,7 +2732,7 @@ fn units_flush_warnings(strict_mode: Int) -> Int ! Diag.Report {
     0
 }
 
-fn do_build_units(source_path: Str, output_path: Str, debug_mode: Int, release_mode: Int, test_build: Bool, targets: List[Str], status_mode: Int, strict_mode: Int, unit_jobs: Int, checked: Option[DaemonBuild]) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Codegen, IO, FS.Read, FS.Write, FS.Delete, Process.Spawn, Env.Exit, Env.Read {
+fn do_build_units(source_path: Str, output_path: Str, debug_mode: Int, release_mode: Int, test_build: Bool, targets: List[Str], status_mode: Int, strict_mode: Int, unit_jobs: Int, checked: Option[DaemonBuild]) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Codegen, IO, FS.Read, FS.Write, FS.Delete, Process.Spawn, Env.Exit, Env.Read, Time.Read {
     let mut out_dir = path_dirname(output_path)
     if out_dir == "" {
         out_dir = "."
@@ -2782,7 +2782,7 @@ fn do_build_units(source_path: Str, output_path: Str, debug_mode: Int, release_m
     rc
 }
 
-fn link_units_all_targets(source_path: Str, output_path: Str, work: Str, units_dir: Str, units: List[emit_record.EmittedUnit], foreign: List[ForeignConst], shas: Option[Map[Str, Str]], debug_mode: Int, release_mode: Int, targets: List[Str], status_mode: Int, unit_jobs: Int, test_build: Bool) -> Int ! Diag.Report, IO, FS.Write, FS.Read, FS.Delete, Process.Spawn, Env.Exit {
+fn link_units_all_targets(source_path: Str, output_path: Str, work: Str, units_dir: Str, units: List[emit_record.EmittedUnit], foreign: List[ForeignConst], shas: Option[Map[Str, Str]], debug_mode: Int, release_mode: Int, targets: List[Str], status_mode: Int, unit_jobs: Int, test_build: Bool) -> Int ! Diag.Report, IO, FS.Write, FS.Read, FS.Delete, Process.Spawn, Env.Exit, Env.Read, Time.Read {
     // The scans below read what the one-unit build reads from its single C file: each unit
     // and each header a unit includes, which is all cc compiles. A marker the scans look
     // for starts a line, so each file starts one.
@@ -2924,7 +2924,7 @@ fn no_child() -> build_fs.FileChild {
 
 // Waits for the PCH build run left running and installs its PCH. Answers whether this or run
 // installed one.
-fn finish_pch(run: UnitRun) -> Bool ! IO, Process.Spawn, FS.Write, FS.Delete, FS.Read {
+fn finish_pch(run: UnitRun) -> Bool ! IO, Process.Spawn, FS.Write, FS.Delete, FS.Read, Time.Read, Env.Read {
     if run.pch_child.pid < 0 {
         return run.pch_stored
     }
@@ -2978,7 +2978,7 @@ fn pch_inputs_unchanged(pch: PchJob) -> Bool ! IO, FS.Read {
 // can a pipe.
 // Only the units are waited on by pid, so no child another part of this process started is
 // reaped here.
-fn run_unit_compiles(plain: List[Str], with_pch: List[Str], pch_ready: Bool, pch: PchJob, unit_jobs: Int, io_dir: Str) -> UnitRun ! IO, FS.Read, FS.Write, Process.Spawn, FS.Delete, Env.Exit {
+fn run_unit_compiles(plain: List[Str], with_pch: List[Str], pch_ready: Bool, pch: PchJob, unit_jobs: Int, io_dir: Str) -> UnitRun ! IO, FS.Read, FS.Write, Process.Spawn, FS.Delete, Env.Exit, Time.Read, Env.Read {
     let n = plain.len()
     let mut by_idx: List[UnitCompile] = []
     if n == 0 { return UnitRun { results: by_idx, pch_stored: false, pch: no_pch_job(), pch_child: no_child(), pch_reads: [] } }
@@ -3094,7 +3094,7 @@ fn archive_header_prefix(c_path: Str) -> Option[List[Str]] ! IO, FS.Read {
 // beside the archive header already serves every gcc unit; clang reads no .gch.
 // BLINK_ARCHIVE_PCH=0 turns it off, so a test can build the same objects with no PCH in the
 // cache.
-fn archive_pch_eligible(target: Str, arc_dir: Str) -> Bool ! IO, FS.Read {
+fn archive_pch_eligible(target: Str, arc_dir: Str) -> Bool ! IO, FS.Read, Env.Read, Process.Spawn {
     if (env.var("BLINK_ARCHIVE_PCH") ?? "") == "0" {
         return false
     }
@@ -3105,13 +3105,13 @@ fn archive_pch_eligible(target: Str, arc_dir: Str) -> Bool ! IO, FS.Read {
 }
 
 // Whether the native cc is clang, which reads a PCH only through -include-pch.
-fn cc_is_clang() -> Bool ! IO {
+fn cc_is_clang() -> Bool ! IO, Process.Spawn {
     process_cc_id("").contains("clang")
 }
 
 // Compiles the units the cache cannot answer, largest first, then links every unit's object
 // against the archive.
-fn link_units(out: Str, work: Str, units_dir: Str, units: List[emit_record.EmittedUnit], shas: Option[Map[Str, Str]], link_flags: Str, obj_files: List[Str], include_flags: Str, debug_mode: Int, release_mode: Int, target: Str, unit_jobs: Int, test_build: Bool) -> Int ! Diag.Report, IO, FS.Write, FS.Read, FS.Delete, Process.Spawn, Env.Exit {
+fn link_units(out: Str, work: Str, units_dir: Str, units: List[emit_record.EmittedUnit], shas: Option[Map[Str, Str]], link_flags: Str, obj_files: List[Str], include_flags: Str, debug_mode: Int, release_mode: Int, target: Str, unit_jobs: Int, test_build: Bool) -> Int ! Diag.Report, IO, FS.Write, FS.Read, FS.Delete, Process.Spawn, Env.Exit, Env.Read, Time.Read {
     let arc_dir = resolve_archive_dir()
     let vrc = verify_installed_archive(arc_dir)
     if vrc != 0 {
@@ -4106,7 +4106,7 @@ fn header_values_json(hv: List[HeaderValue]) -> Str {
     "\"header_values\":[{parts.join(",")}]"
 }
 
-fn print_header_values(hv: List[HeaderValue]) {
+fn print_header_values(hv: List[HeaderValue]) ! IO.Print {
     io.println("header values")
     io.println("=============")
     for v in hv {
@@ -4114,7 +4114,7 @@ fn print_header_values(hv: List[HeaderValue]) {
     }
 }
 
-fn do_ffi_audit(program: Int, json_output: Int) {
+fn do_ffi_audit(program: Int, json_output: Int) ! IO.Print {
     let hv = collect_header_values(program)
     let fns_sl = node_params(program)
     if fns_sl == -1 {
@@ -4692,12 +4692,12 @@ fn run_build_here(p: ArgParser, a: Args, checked: Option[DaemonBuild]) -> Str ! 
 }
 
 // Whether `blink run` builds its program to trace the calls it makes.
-fn run_traces(a: Args) -> Bool {
+fn run_traces(a: Args) -> Bool ! Env.Read {
     args_get(a, "trace") != "" || (env.var("BLINK_TRACE") ?? "") != ""
 }
 
 // Runs the program `blink run` built, with the arguments meant for it.
-fn run_built(a: Args, output_path: Str) {
+fn run_built(a: Args, output_path: Str) ! Process.Spawn, Env.Exit, IO {
     let trace_val = args_get(a, "trace")
     let mut rest = args_rest(a)
     if trace_val != "" {
@@ -5132,7 +5132,7 @@ fn test_file_outcome(file: Str, r: TestFileResult, t: TestReportTally, limits: C
 
 // add, remove, update and shim init load blink.toml without a compile, so they report its
 // issues here as a compile would. Each goes on after: an issue there stops the next compile.
-fn report_manifest_diagnostics(manifest: Str) ! Diag.Report {
+fn report_manifest_diagnostics(manifest: Str) ! Diag.Report, Env.Read, IO {
     diag_reset()
     apply_manifest_lints(manifest)
     diag_flush()
@@ -5144,7 +5144,7 @@ fn report_manifest_diagnostics(manifest: Str) ! Diag.Report {
 // name itself: its own process id keeps two runners apart, the file index keeps two binaries
 // of one run apart. No other code removes the directory, so the runner does once the binary
 // has ended. A dir left by a killed runner with the same pid is removed before use.
-fn test_scratch_dir(idx: Int) -> Str {
+fn test_scratch_dir(idx: Int) -> Str ! Env.Read {
     let tmp = env.var("TMPDIR") ?? ""
     let base = if tmp == "" { "/tmp" } else { tmp }
     "{base}/blink-test-{getpid()}-{idx}"
@@ -5307,7 +5307,7 @@ fn test_tally_sum(a: TestReportTally, b: TestReportTally) -> TestReportTally {
 @trusted(audit: "Installs the runtime's SIGINT and SIGTERM handlers once. The handler only calls kill(2) on the runtime's own child table, then re-raises the signal; it takes no argument and returns nothing.")
 fn install_child_signal_forwarding() ! Process.Spawn {}
 
-fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit, Codegen, IO, FS.Read, FS.Write, Process.Spawn, FS.Delete, Env.Exit, Time, Env.Read {
+fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit, Codegen, IO, FS.Read, FS.Write, Process.Spawn, FS.Delete, Env.Exit, Time, Env.Read, Async {
     let started_ms = time.read().to_unix_ms()
     let bad_format = build_format_usage_error(a)
     if bad_format != "" {
@@ -5965,7 +5965,7 @@ fn fix_editable_sources(source_path: Str) -> Map[Str, Int] ! FS.Read {
 
 // A check that fails before it checks anything exits 1; under --json it first prints the
 // status line, so a tool that parses stdout still gets a result.
-fn check_failed_exit(source_path: Str, json_status: Int) {
+fn check_failed_exit(source_path: Str, json_status: Int) ! IO.Print, Env.Exit {
     if json_status != 0 {
         io.println(check_failed_status_line(source_path))
     }
@@ -6115,7 +6115,7 @@ fn daemon_identity() -> Str ! IO, FS.Read, FS.Write, Process.Spawn, FS.Delete, N
 }
 
 // The hex of each sep-ended record that `env args` prints, or None when env fails.
-fn env_records(args: List[Str], sep: Int) -> Option[List[Str]] ! IO, FS.Write, FS.Read, Process.Spawn, FS.Delete, Env.Exit {
+fn env_records(args: List[Str], sep: Int) -> Option[List[Str]] ! IO, FS.Write, FS.Read, Process.Spawn, FS.Delete, Env.Exit, Env.Read {
     let tmp = env.var("TMPDIR") ?? "/tmp"
     let dir = build_fs.private_dir(if tmp == "" { "/tmp" } else { tmp }, "blink-env")
     if dir == "" { return None }
@@ -6144,7 +6144,7 @@ fn env_records(args: List[Str], sep: Int) -> Option[List[Str]] ! IO, FS.Write, F
 // cold build's front end only for a client that sets each the same: the struct-layout lint
 // level, the front-end trace, and whether the parse keeps the interface texts that unit reuse
 // compares. Called once the command's flags are applied.
-fn front_settings(strict_struct_layout: Bool) -> Str {
+fn front_settings(strict_struct_layout: Bool) -> Str ! Env.Read {
     "strict_struct_layout={strict_struct_layout}\nblink_trace={trace_mode}\ninterface_text={emit_reuse_allowed()}"
 }
 
@@ -6619,7 +6619,7 @@ fn settings_root(path: Str, text: Str) -> Int ! IO, Env.Exit {
     root
 }
 
-fn migrate_blink_marketplace() ! FS.Write, IO, FS.Delete, FS.Read, Env.Exit {
+fn migrate_blink_marketplace() ! FS.Write, IO, FS.Delete, FS.Read, Env.Exit, Process.Spawn {
     let old_dir = ".claude/pact-marketplace"
     let new_dir = ".claude/blink-marketplace"
     if !build_fs.path_is_dir(old_dir) || build_fs.path_is_dir(new_dir) {
@@ -6653,7 +6653,7 @@ fn migrate_blink_marketplace() ! FS.Write, IO, FS.Delete, FS.Read, Env.Exit {
 }
 
 // What `pwd` prints, or "" when it cannot run.
-fn working_dir() -> Str {
+fn working_dir() -> Str ! Process.Spawn {
     match process.run("pwd", []) {
         Ok(r) => r.out.trim()
         Err(_) => ""
@@ -6758,7 +6758,7 @@ fn cmd_init(_p: ArgParser, a: Args) ! Env.Exit, FS.Write, IO, Process.Spawn, FS.
     }
 }
 
-fn print_section_titles(doc: Str) {
+fn print_section_titles(doc: Str) ! IO.Print {
     let sections = doc.split("\n## ")
     let mut i = 1
     while i < sections.len() {
@@ -6775,7 +6775,7 @@ fn print_section_titles(doc: Str) {
     }
 }
 
-fn print_sections_matching(doc: Str, search: Str) -> Int {
+fn print_sections_matching(doc: Str, search: Str) -> Int ! IO.Print {
     let sections = doc.split("\n## ")
     let mut found = 0
     let mut i = 1
@@ -6799,7 +6799,7 @@ fn print_sections_matching(doc: Str, search: Str) -> Int {
     found
 }
 
-fn cmd_llms(_p: ArgParser, a: Args) {
+fn cmd_llms(_p: ArgParser, a: Args) ! IO {
     let full_flag = if args_has(a, "full") { 1 } else { 0 }
     let list_flag = if args_has(a, "list") { 1 } else { 0 }
     let topic_flag = args_get(a, "topic")
@@ -6998,7 +6998,7 @@ fn is_std_add_pkg(name: Str) -> Int {
     0
 }
 
-fn cmd_add(_p: ArgParser, a: Args) ! Diag.Report, FS.Write, FS.Read, IO, Process.Spawn, Time, Env.Exit {
+fn cmd_add(_p: ArgParser, a: Args) ! Diag.Report, FS.Write, FS.Read, IO, Process.Spawn, Time, Env.Exit, Env.Read {
     let source_path = args_positional(a, 0)
     if source_path == "" {
         io.eprintln("error: blink add requires a package name")
@@ -7062,7 +7062,7 @@ fn cmd_add(_p: ArgParser, a: Args) ! Diag.Report, FS.Write, FS.Read, IO, Process
     }
 }
 
-fn cmd_remove(_p: ArgParser, a: Args) ! Diag.Report, FS.Write, FS.Read, IO, Process.Spawn, Time, Env.Exit {
+fn cmd_remove(_p: ArgParser, a: Args) ! Diag.Report, FS.Write, FS.Read, IO, Process.Spawn, Time, Env.Exit, Env.Read {
     let source_path = args_positional(a, 0)
     if source_path == "" {
         io.eprintln("error: blink remove requires a package name")
@@ -7102,7 +7102,7 @@ fn cmd_remove(_p: ArgParser, a: Args) ! Diag.Report, FS.Write, FS.Read, IO, Proc
     }
 }
 
-fn cmd_update(_p: ArgParser, a: Args) ! Diag.Report, FS.Write, IO, FS.Delete, FS.Read, Process.Spawn, Time, Env.Exit {
+fn cmd_update(_p: ArgParser, a: Args) ! Diag.Report, FS.Write, IO, FS.Delete, FS.Read, Process.Spawn, Time, Env.Exit, Env.Read {
     let source_path = args_positional(a, 0)
     let manifest = resolve_manifest_path()
     if manifest == "" {
@@ -7149,7 +7149,7 @@ fn cmd_lsp(_p: ArgParser, _a: Args) ! IO, Lex.Tokenize, Parse, Parse.Build, Diag
     lsp_start()
 }
 
-fn cmd_explain(_p: ArgParser, a: Args) {
+fn cmd_explain(_p: ArgParser, a: Args) ! IO, Env.Exit {
     let code = args_positional(a, 0)
     if code == "" {
         io.eprintln("usage: blink explain <code>")
@@ -7290,7 +7290,7 @@ fn cmd_daemon_stop(_p: ArgParser, _a: Args) ! IO, Env.Exit, FS.Read, Env.Read {
     io.println("Daemon stopped")
 }
 
-fn cmd_daemon_bare(p: ArgParser, _a: Args) {
+fn cmd_daemon_bare(p: ArgParser, _a: Args) ! IO, Env.Exit {
     io.eprintln("error: daemon requires a subcommand: start, status, or stop")
     io.eprintln(generate_command_help(p, "daemon"))
     env.exit(1)
@@ -7309,7 +7309,7 @@ fn shim_wrapper_template(name: Str) -> Str {
     "// @trusted wrapper for the `{name}` shim. Spec: §9.1.3 γ-doctrine.\n// The raw @ffi binding is private; only the safe wrapper is `pub`.\n// `! ()` claims the C stub has no effects; write the real row once the C side has any.\n// TODO: review the binding and replace audit:\"TODO\" with a real audit ID.\n\n@ffi(\"{name}\", \"blink_{name}_hello\")\n@trusted(audit: \"TODO\")\nfn raw_{name}_hello() -> Int ! ()\n\n// TODO: replace this stub with a real safe wrapper.\npub fn {name}_hello() -> Int \{\n    raw_{name}_hello()\n\}\n"
 }
 
-fn cmd_shim_init(_p: ArgParser, a: Args) ! Diag.Report, FS.Write, IO, FS.Read, Env.Exit {
+fn cmd_shim_init(_p: ArgParser, a: Args) ! Diag.Report, FS.Write, IO, FS.Read, Env.Exit, Env.Read {
     let name = args_positional(a, 0)
     if name == "" {
         io.eprintln("error: blink shim init requires a name")
@@ -7374,7 +7374,7 @@ fn cmd_shim_init(_p: ArgParser, a: Args) ! Diag.Report, FS.Write, IO, FS.Read, E
     io.println("  3. Use {name}_hello() (or your renamed wrapper) from application code.")
 }
 
-fn cmd_shim_bare(p: ArgParser, _a: Args) {
+fn cmd_shim_bare(p: ArgParser, _a: Args) ! IO, Env.Exit {
     io.eprintln("error: shim requires a subcommand: init")
     io.eprintln(generate_command_help(p, "shim"))
     env.exit(1)

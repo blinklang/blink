@@ -165,7 +165,7 @@ fn daemon_extract_type(request: Str) -> Option[Str] {
 
 // Each check sees the whole program: mono and the mutation passes judge across functions,
 // so a recheck of only the changed functions could miss what an edit broke elsewhere.
-fn daemon_check_program() -> DaemonCheck ! IO, Lex.Tokenize, Parse, Parse.Build, TypeCheck, Diag.Report, FS.Read, FS.Write, Env.Exit, Env.Read {
+fn daemon_check_program() -> DaemonCheck ! IO, Lex.Tokenize, Parse, Parse.Build, TypeCheck, Diag.Report, FS.Read, FS.Write, Env.Exit, Env.Read, Process.Spawn {
     daemon_settle_check(daemon_run_check(0))
 }
 
@@ -217,7 +217,7 @@ fn daemon_run_check(format: Int) -> DaemonCheck ! IO, Lex.Tokenize, Parse, Parse
 
 // The check daemon_run_check gave, with what it put off. It must come before the next check,
 // which drops the diagnostics and the loaded inputs.
-fn daemon_settle_check(c: DaemonCheck) -> DaemonCheck ! IO, FS.Read {
+fn daemon_settle_check(c: DaemonCheck) -> DaemonCheck ! IO, FS.Read, Env.Read, Process.Spawn {
     fill_source_interfaces()
     // Dev knob: BLINK_DEV_TEST_SETTLE_HOOK=<sh command> runs here, after the loader read the
     // inputs and before the stats, so a test can edit a file in that window. Unset, it costs
@@ -245,7 +245,7 @@ fn daemon_settle_check(c: DaemonCheck) -> DaemonCheck ! IO, FS.Read {
 }
 
 // Settles the check a check request left unsettled, once its reply is sent.
-fn daemon_settle_last() ! IO, FS.Read {
+fn daemon_settle_last() ! IO, FS.Read, Env.Read, Process.Spawn {
     match daemon_last {
         Some(c) => {
             if c.unrendered >= 0 {
@@ -799,7 +799,7 @@ fn reap(pid: Int) -> Int ! IO, Process.Spawn {
 
 // Sends text and closes the connection. A client that went away takes only its own
 // connection with it; the daemon serves on.
-fn daemon_reply(client_fd: Int, text: Str) {
+fn daemon_reply(client_fd: Int, text: Str) ! IO {
     if socket_write(client_fd, text.concat("\n")) < 0 {
         io.eprintln("daemon: could not send the reply, so it dropped the connection")
     }
@@ -950,7 +950,7 @@ fn daemon_tell_router(text: Str) -> Bool {
 }
 
 // Sends each held build to build cold, with why.
-fn daemon_send_cold(builds: DaemonBuilds, why: Str) -> DaemonBuilds {
+fn daemon_send_cold(builds: DaemonBuilds, why: Str) -> DaemonBuilds ! IO {
     for h in builds.queue {
         daemon_reply(h.client_fd, daemon_not_served(why))
     }
@@ -959,7 +959,7 @@ fn daemon_send_cold(builds: DaemonBuilds, why: Str) -> DaemonBuilds {
 
 // Asks the router for the build turn for the held builds, unless the worker holds it, has
 // asked, or has a child whose end gives it back.
-fn daemon_ask_turn(builds: DaemonBuilds) -> DaemonBuilds {
+fn daemon_ask_turn(builds: DaemonBuilds) -> DaemonBuilds ! IO {
     if builds.turn != 0 || builds.child.is_some() || builds.queue.len() == 0 {
         return builds
     }
@@ -970,7 +970,7 @@ fn daemon_ask_turn(builds: DaemonBuilds) -> DaemonBuilds {
 }
 
 // Gives the turn back, and asks again when builds still wait.
-fn daemon_end_turn(builds: DaemonBuilds) -> DaemonBuilds {
+fn daemon_end_turn(builds: DaemonBuilds) -> DaemonBuilds ! IO {
     let more = if builds.queue.len() > 0 { 1 } else { 0 }
     if !daemon_tell_router("\{\"type\":\"done\",\"more\":{more}}") {
         return daemon_send_cold(DaemonBuilds { turn: 0, ..builds }, "the daemon could not ask its router for the build turn")
@@ -1005,7 +1005,7 @@ fn daemon_take_turn(builds: DaemonBuilds) -> (DaemonBuilds, Option[DaemonBuild])
 // Once the build child ends: a stop that came meanwhile sends each held build to build cold,
 // now that nothing else writes its files, answers the stop and ends the loop; else the turn
 // goes back to the router, which gives it to the entry that asked first.
-fn daemon_after_child(builds: DaemonBuilds) -> DaemonBuilds {
+fn daemon_after_child(builds: DaemonBuilds) -> DaemonBuilds ! IO {
     let mut b = builds
     if b.stops.len() > 0 {
         b = daemon_send_cold(b, "the daemon is stopping")
@@ -1095,7 +1095,7 @@ fn daemon_handle_stop() -> Str {
 // program costs a stat of each input and each probed path; only a moved stat or probe costs
 // a byte compare. A missed edit costs a recheck at the next request, never a stale answer:
 // a check or build compares bytes before it uses the last check.
-fn daemon_recheck_if_changed() ! IO, Lex.Tokenize, Parse, Parse.Build, TypeCheck, Diag.Report, FS.Read, FS.Write, Env.Exit, Env.Read {
+fn daemon_recheck_if_changed() ! IO, Lex.Tokenize, Parse, Parse.Build, TypeCheck, Diag.Report, FS.Read, FS.Write, Env.Exit, Env.Read, Process.Spawn {
     // Dev knob: BLINK_DEV_DAEMON_IDLE_HOLD=<path> skips the poll while that file exists, so a
     // test that edits and then asks knows its request, not the poll, checks the edit, however
     // long the gap between them. Unset, it costs one getenv per idle wait.

@@ -23,11 +23,11 @@ fn read_if_there(path: Str) -> Str ! FS.Read {
     }
 }
 
-fn resolve_blink_root() -> Str {
+fn resolve_blink_root() -> Str ! Env.Read {
     env.var("BLINK_ROOT") ?? ""
 }
 
-fn blinkc_path() -> Str ! FS.Read {
+fn blinkc_path() -> Str ! FS.Read, Env.Read {
     let root = resolve_blink_root()
     if root != "" {
         let p = path_join(root, "build/blinkc")
@@ -38,7 +38,7 @@ fn blinkc_path() -> Str ! FS.Read {
     "build/blinkc"
 }
 
-fn archive_dir() -> Str ! FS.Read {
+fn archive_dir() -> Str ! FS.Read, Env.Read {
     let root = resolve_blink_root()
     if root != "" {
         let candidate = path_join(root, "build/libblink_std.a")
@@ -56,7 +56,7 @@ fn archive_dir() -> Str ! FS.Read {
 // id is unique among live processes, so parallel test binaries, a corpus sweep and a gate in
 // another worktree never share a directory. Same process, same path, so no state is kept
 // between calls.
-pub fn scratch_root() -> Str {
+pub fn scratch_root() -> Str ! Env.Read, Process.Spawn {
     let named = env.var("BLINK_TEST_SCRATCH_DIR") ?? ""
     let dir = if named != "" {
         named
@@ -72,12 +72,12 @@ pub fn scratch_root() -> Str {
 // Copies, mtime kept, the objects in the native cache of the tree at root into the one of the
 // tree at dir. A build skips compiling a native dep such as sqlite3 when its cache holds an
 // object no older than the source, so a seeded tree spares that compile.
-pub fn seed_native_cache(root: Str, dir: Str) {
+pub fn seed_native_cache(root: Str, dir: Str) ! Process.Spawn {
     let _mk = process.run("mkdir", ["-p", "{dir}/build/native-cache"]).unwrap()
     let _cp = process.run("sh", ["-c", "for o in {root}/build/native-cache/*.o; do [ -f \"$o\" ] && cp -p \"$o\" {dir}/build/native-cache/; done; true"]).unwrap()
 }
 
-fn run_compile(path: Str, src: Str) -> Str ! FS.Write, Process.Spawn, FS.Delete, FS.Read {
+fn run_compile(path: Str, src: Str) -> Str ! FS.Write, Process.Spawn, FS.Delete, FS.Read, Env.Read {
     fs.write(path, src).unwrap()
     let args = [path, "/dev/null", "--format", "json"]
     let result = process.run(blinkc_path(), args).unwrap()
@@ -99,7 +99,7 @@ fn run_compile(path: Str, src: Str) -> Str ! FS.Write, Process.Spawn, FS.Delete,
 //
 // The one sentinel spelling that legitimately appears here is BLINK_I0001_*: the
 // UnsolvedTypeVarAtCodegen diagnostic embeds the erased mono name in its message text.
-pub fn compile_and_capture(source: Str, tag: Str) -> Str ! FS.Delete, FS.Write, Process.Spawn, FS.Read {
+pub fn compile_and_capture(source: Str, tag: Str) -> Str ! FS.Delete, FS.Write, Process.Spawn, FS.Read, Env.Read {
     run_compile("{scratch_root()}/{tag}.bl", source)
 }
 
@@ -107,7 +107,7 @@ pub fn compile_and_capture(source: Str, tag: Str) -> Str ! FS.Delete, FS.Write, 
 // the assertion message alone cannot, since every row funnels through the same line here.
 // They must assert: `blink test` does not scan stdout, so a print-only helper makes every row
 // built on it pass whatever the compiler does.
-pub fn expect_error(output: Str, code: Str, label: Str) {
+pub fn expect_error(output: Str, code: Str, label: Str) ! IO.Print {
     let ok = output.contains(code)
     if ok {
         io.println("PASS: {label}")
@@ -117,7 +117,7 @@ pub fn expect_error(output: Str, code: Str, label: Str) {
     assert(ok)
 }
 
-pub fn expect_contains(output: Str, needle: Str, label: Str) {
+pub fn expect_contains(output: Str, needle: Str, label: Str) ! IO.Print {
     let ok = output.contains(needle)
     if ok {
         io.println("PASS: {label}")
@@ -127,7 +127,7 @@ pub fn expect_contains(output: Str, needle: Str, label: Str) {
     assert(ok)
 }
 
-pub fn expect_warning(output: Str, code: Str, label: Str) {
+pub fn expect_warning(output: Str, code: Str, label: Str) ! IO.Print {
     let ok = output.contains(code) && output.contains("\"severity\":\"warning\"")
     if ok {
         io.println("PASS: {label}")
@@ -137,7 +137,7 @@ pub fn expect_warning(output: Str, code: Str, label: Str) {
     assert(ok)
 }
 
-pub fn expect_clean(output: Str, label: Str) {
+pub fn expect_clean(output: Str, label: Str) ! IO.Print {
     let dirty = output.contains("E0900") || output.contains("E0901") || output.contains("E0902") || output.contains("E0903") || output.contains("E0905")
     if dirty {
         io.println("FAIL: {label} — unexpected trait contract error in output")
@@ -151,7 +151,7 @@ pub fn expect_clean(output: Str, label: Str) {
 // purpose — it names the five trait-contract codes — so a row that means "this program
 // must compile" cannot use it: any other error, a parse error included, would leave the
 // row green and the claim unproven.
-pub fn expect_compiles_clean(output: Str, label: Str) {
+pub fn expect_compiles_clean(output: Str, label: Str) ! IO.Print {
     let dirty = output.contains("\"severity\":\"error\"")
     if dirty {
         io.println("FAIL: {label} — expected a clean compile, got an error")
@@ -161,12 +161,12 @@ pub fn expect_compiles_clean(output: Str, label: Str) {
     assert(!dirty)
 }
 
-pub fn expect_compile_error(src: Str, tag: Str, error_code: Str) ! FS.Delete, FS.Write, Process.Spawn, FS.Read {
+pub fn expect_compile_error(src: Str, tag: Str, error_code: Str) ! FS.Delete, FS.Write, Process.Spawn, FS.Read, Env.Read {
     let output = run_compile("{scratch_root()}/_test_{tag}.bl", src)
     assert(output.contains(error_code))
 }
 
-pub fn expect_no_error(src: Str, tag: Str, error_code: Str) ! FS.Delete, FS.Write, Process.Spawn, FS.Read {
+pub fn expect_no_error(src: Str, tag: Str, error_code: Str) ! FS.Delete, FS.Write, Process.Spawn, FS.Read, Env.Read {
     let output = run_compile("{scratch_root()}/_test_{tag}.bl", src)
     assert(!output.contains(error_code))
 }
@@ -174,7 +174,7 @@ pub fn expect_no_error(src: Str, tag: Str, error_code: Str) ! FS.Delete, FS.Writ
 // Stage a two-file package under <scratch>/<tag>/ (with a blink.toml so imports resolve),
 // compile the entry, and assert the diagnostic `error_code` appears. Used for
 // whole-program / cross-module checks that a single-file compile cannot exercise.
-pub fn expect_compile_error_xmod(entry_src: Str, helper_name: Str, helper_src: Str, tag: Str, error_code: Str) ! Process.Spawn, FS.Write, FS.Read {
+pub fn expect_compile_error_xmod(entry_src: Str, helper_name: Str, helper_src: Str, tag: Str, error_code: Str) ! Process.Spawn, FS.Write, FS.Read, Env.Read {
     let root = "{scratch_root()}/{tag}"
     let src_dir = "{root}/src"
     let _mk = process.run("mkdir", ["-p", src_dir]).unwrap()
@@ -192,7 +192,7 @@ pub fn expect_compile_error_xmod(entry_src: Str, helper_name: Str, helper_src: S
 // The compile-clean check (no "severity":"error") prevents a false green where an
 // UNRELATED error makes the code-absence assertion pass vacuously. Used to lock
 // no-false-positive guarantees (e.g. a pub item reached via a qualified form).
-pub fn expect_no_error_xmod(entry_src: Str, helper_name: Str, helper_src: Str, tag: Str, error_code: Str) ! Process.Spawn, FS.Write, FS.Read {
+pub fn expect_no_error_xmod(entry_src: Str, helper_name: Str, helper_src: Str, tag: Str, error_code: Str) ! Process.Spawn, FS.Write, FS.Read, Env.Read {
     let root = "{scratch_root()}/{tag}"
     let src_dir = "{root}/src"
     let _mk = process.run("mkdir", ["-p", src_dir]).unwrap()
@@ -208,7 +208,7 @@ pub fn expect_no_error_xmod(entry_src: Str, helper_name: Str, helper_src: Str, t
 
 // Stage a two-file package under <scratch>/<tag>/ and return the diagnostic JSON, so a
 // caller can assert on message text (not just the presence of a code).
-pub fn compile_xmod_capture(entry_src: Str, helper_name: Str, helper_src: Str, tag: Str) -> Str ! Process.Spawn, FS.Write, FS.Read {
+pub fn compile_xmod_capture(entry_src: Str, helper_name: Str, helper_src: Str, tag: Str) -> Str ! Process.Spawn, FS.Write, FS.Read, Env.Read {
     let root = "{scratch_root()}/{tag}"
     let src_dir = "{root}/src"
     let _mk = process.run("mkdir", ["-p", src_dir]).unwrap()
@@ -224,7 +224,7 @@ pub fn compile_xmod_capture(entry_src: Str, helper_name: Str, helper_src: Str, t
 // [lints] section, compile the entry with cwd at the repo root (so the
 // manifest must be resolved from the package root of the compiled file,
 // not the cwd), and return the diagnostic JSON.
-pub fn compile_pkg_and_capture(src: Str, lints: Str, tag: Str) -> Str ! Process.Spawn, FS.Write, FS.Read {
+pub fn compile_pkg_and_capture(src: Str, lints: Str, tag: Str) -> Str ! Process.Spawn, FS.Write, FS.Read, Env.Read {
     let root = "{scratch_root()}/{tag}"
     let src_dir = "{root}/src"
     let _mk = process.run("mkdir", ["-p", src_dir]).unwrap()
@@ -242,7 +242,7 @@ pub fn compile_pkg_and_capture(src: Str, lints: Str, tag: Str) -> Str ! Process.
 // observe, since blinkc only emits C and never invokes the C compiler.
 // `helper_dir` is the package subdir (e.g. "om") so the file lands at
 // src/<helper_dir>/<helper_base>.bl, mirroring the import path `helper_dir.helper_base`.
-pub fn run_xmod(entry_src: Str, helper_dir: Str, helper_base: Str, helper_src: Str, tag: Str) -> RunResult ! Process.Spawn, FS.Write {
+pub fn run_xmod(entry_src: Str, helper_dir: Str, helper_base: Str, helper_src: Str, tag: Str) -> RunResult ! Process.Spawn, FS.Write, Env.Read {
     let root = "{scratch_root()}/{tag}"
     let src_dir = "{root}/src"
     let _mk = process.run("mkdir", ["-p", "{src_dir}/{helper_dir}"]).unwrap()
@@ -262,7 +262,7 @@ pub fn run_xmod(entry_src: Str, helper_dir: Str, helper_base: Str, helper_src: S
 // imported modules via compile_to_program) instead of executing the program — so
 // a cross-module qualified type reference reaches the audit exactly as a real
 // multi-module build would present it.
-pub fn audit_ffi_xmod(entry_src: Str, helper_dir: Str, helper_base: Str, helper_src: Str, tag: Str, json: Int) -> Str ! Process.Spawn, FS.Write {
+pub fn audit_ffi_xmod(entry_src: Str, helper_dir: Str, helper_base: Str, helper_src: Str, tag: Str, json: Int) -> Str ! Process.Spawn, FS.Write, Env.Read {
     let root = "{scratch_root()}/{tag}"
     let src_dir = "{root}/src"
     let _mk = process.run("mkdir", ["-p", "{src_dir}/{helper_dir}"]).unwrap()
@@ -275,7 +275,7 @@ pub fn audit_ffi_xmod(entry_src: Str, helper_dir: Str, helper_base: Str, helper_
     "{result.out}{result.err_out}"
 }
 
-pub fn check_via_cli(src: Str, tag: Str) -> Str ! FS.Write, Process.Spawn, FS.Delete {
+pub fn check_via_cli(src: Str, tag: Str) -> Str ! FS.Write, Process.Spawn, FS.Delete, Env.Read {
     let path = "{scratch_root()}/_chk_{tag}.bl"
     fs.write(path, src).unwrap()
     let result = process.run("build/blink", ["check", path, "--format", "json"]).unwrap()
@@ -287,7 +287,7 @@ pub fn check_via_cli(src: Str, tag: Str) -> Str ! FS.Write, Process.Spawn, FS.De
 // Drive `blink audit --ffi [--json] <path>` over `src` and return its stdout.
 // Used to exercise the FFI audit report (e.g. the bytes-bridge / byte-pin
 // subcategory) end to end through the real CLI.
-pub fn audit_ffi_via_cli(src: Str, tag: Str, json: Int) -> Str ! FS.Write, Process.Spawn, FS.Delete {
+pub fn audit_ffi_via_cli(src: Str, tag: Str, json: Int) -> Str ! FS.Write, Process.Spawn, FS.Delete, Env.Read {
     let path = "{scratch_root()}/_audit_{tag}.bl"
     fs.write(path, src).unwrap()
     let args = if json != 0 { ["audit", "--ffi", "--json", path] } else { ["audit", "--ffi", path] }
@@ -297,7 +297,7 @@ pub fn audit_ffi_via_cli(src: Str, tag: Str, json: Int) -> Str ! FS.Write, Proce
     output
 }
 
-pub fn verify_catalog_entry(code: Str, short_name: Str) {
+pub fn verify_catalog_entry(code: Str, short_name: Str) ! Process.Spawn {
     let res = process.run("build/blink", ["explain", code]).unwrap()
     assert_eq(res.end, ChildEnd.Exited(0))
     assert(res.out.contains(code))
@@ -506,16 +506,16 @@ pub fn has_poly_impl_fn_instance(c: Str, base: Str) -> Int {
 // Compile `src` to a real .c file and return the emitted C source. Used
 // to inspect what codegen produced for a given construct without running
 // the compiled binary.
-pub fn compile_and_emit_c(src: Str, tag: Str) -> Str ! FS.Delete, FS.Write, Process.Spawn, FS.Read {
+pub fn compile_and_emit_c(src: Str, tag: Str) -> Str ! FS.Delete, FS.Write, Process.Spawn, FS.Read, Env.Read {
     emit_c_with(src, tag, [])
 }
 
 // The same for the build `blink test` makes, the only build that writes the test bodies.
-pub fn compile_and_emit_test_c(src: Str, tag: Str) -> Str ! FS.Delete, FS.Write, Process.Spawn, FS.Read {
+pub fn compile_and_emit_test_c(src: Str, tag: Str) -> Str ! FS.Delete, FS.Write, Process.Spawn, FS.Read, Env.Read {
     emit_c_with(src, tag, ["--test-build"])
 }
 
-fn emit_c_with(src: Str, tag: Str, flags: List[Str]) -> Str ! FS.Write, Process.Spawn, FS.Delete, FS.Read {
+fn emit_c_with(src: Str, tag: Str, flags: List[Str]) -> Str ! FS.Write, Process.Spawn, FS.Delete, FS.Read, Env.Read {
     let bl_path = "{scratch_root()}/{tag}.bl"
     let c_path = "{scratch_root()}/{tag}.c"
     fs.write(bl_path, src).unwrap()
@@ -546,13 +546,13 @@ fn run_code(end: ChildEnd) -> Int {
     }
 }
 
-pub fn compile_and_run(src: Str, tag: Str) -> RunResult ! FS.Delete, FS.Write, Process.Spawn, FS.Read {
+pub fn compile_and_run(src: Str, tag: Str) -> RunResult ! FS.Delete, FS.Write, Process.Spawn, FS.Read, Env.Read {
     compile_and_run_opt(src, tag, "")
 }
 
 // The same, with the C compiler at optimisation level `opt` ("" for its default), as a
 // release build compiles it.
-pub fn compile_and_run_opt(src: Str, tag: Str, opt: Str) -> RunResult ! FS.Write, Process.Spawn, FS.Delete, FS.Read {
+pub fn compile_and_run_opt(src: Str, tag: Str, opt: Str) -> RunResult ! FS.Write, Process.Spawn, FS.Delete, FS.Read, Env.Read {
     let bl_path = "{scratch_root()}/{tag}.bl"
     let c_path = "{scratch_root()}/{tag}.c"
     let bin_path = "{scratch_root()}/{tag}_bin"
@@ -588,14 +588,14 @@ pub fn compile_and_run_opt(src: Str, tag: Str, opt: Str) -> RunResult ! FS.Write
 // behavior (E0831/E0832, pass-consumes-panic) by asserting on the runner's
 // own JSON, since a failing assert_panics cannot be observed from a passing
 // test in the same run.
-pub fn compile_and_run_test_json(src: Str, tag: Str) -> RunResult ! FS.Delete, FS.Write, Process.Spawn, FS.Read {
+pub fn compile_and_run_test_json(src: Str, tag: Str) -> RunResult ! FS.Delete, FS.Write, Process.Spawn, FS.Read, Env.Read {
     compile_and_run_test_json_opt(src, tag, "")
 }
 
 // The same, with the C compiler at optimisation level `opt` ("" for its default). A
 // miscompile that only shows once locals live in registers, such as a local changed
 // between setjmp and longjmp, passes at -O0 and needs this to be seen.
-pub fn compile_and_run_test_json_opt(src: Str, tag: Str, opt: Str) -> RunResult ! FS.Write, Process.Spawn, FS.Delete, FS.Read {
+pub fn compile_and_run_test_json_opt(src: Str, tag: Str, opt: Str) -> RunResult ! FS.Write, Process.Spawn, FS.Delete, FS.Read, Env.Read {
     let bl_path = "{scratch_root()}/{tag}.bl"
     let c_path = "{scratch_root()}/{tag}.c"
     let bin_path = "{scratch_root()}/{tag}_bin"
@@ -629,7 +629,7 @@ pub fn compile_and_run_test_json_opt(src: Str, tag: Str, opt: Str) -> RunResult 
 // Compile and run `src` through the real CLI, so a flag is exercised end to end on the
 // path a user actually runs — argument parsing included, not just the codegen global the
 // flag eventually sets.
-pub fn run_via_cli(src: Str, tag: Str, flag: Str) -> RunResult ! FS.Write, Process.Spawn, FS.Delete {
+pub fn run_via_cli(src: Str, tag: Str, flag: Str) -> RunResult ! FS.Write, Process.Spawn, FS.Delete, Env.Read {
     let path = "{scratch_root()}/_runcli_{tag}.bl"
     fs.write(path, src).unwrap()
     let args = if flag != "" { ["run", flag, path] } else { ["run", path] }
@@ -641,7 +641,7 @@ pub fn run_via_cli(src: Str, tag: Str, flag: Str) -> RunResult ! FS.Write, Proce
 // The binary of a plain build of the test file at `path`, which runs its main. A test that runs
 // its own program as a child needs this build: the binary of a test build runs the tests and
 // never main, so it would only run the tests again. Built once per process.
-pub fn main_binary_of(path: Str) -> Str ! Process.Spawn, IO, FS.Read {
+pub fn main_binary_of(path: Str) -> Str ! Process.Spawn, IO, FS.Read, Env.Read {
     let out = "{scratch_root()}/_main_of_{path_basename(path)}"
     if path_exists(out) { return out }
     let r = process.run("build/blink", ["build", path, "-o", out]).unwrap()
@@ -656,7 +656,7 @@ pub fn main_binary_of(path: Str) -> Str ! Process.Spawn, IO, FS.Read {
 // to build/<basename>.c, so the tag must stay unique across the suite. Answers "" when
 // the compile never reached codegen, so a caller asserting on a needle fails on the
 // assertion rather than aborting the whole test binary on a missing file.
-pub fn emit_c_via_cli(src: Str, tag: Str, flag: Str) -> Str ! FS.Write, Process.Spawn, FS.Delete, FS.Read {
+pub fn emit_c_via_cli(src: Str, tag: Str, flag: Str) -> Str ! FS.Write, Process.Spawn, FS.Delete, FS.Read, Env.Read {
     let path = "{scratch_root()}/_emitc_{tag}.bl"
     fs.write(path, src).unwrap()
     let args = if flag != "" { ["build", "--emit", "c", flag, path] } else { ["build", "--emit", "c", path] }
@@ -669,12 +669,12 @@ pub fn emit_c_via_cli(src: Str, tag: Str, flag: Str) -> Str ! FS.Write, Process.
 }
 
 // The trimmed stdout of `sh -c cmd`.
-pub fn sh(cmd: Str) -> Str {
+pub fn sh(cmd: Str) -> Str ! Process.Spawn {
     process.run("sh", ["-c", cmd]).unwrap().out.trim()
 }
 
 // Whether path exists within secs seconds.
-pub fn appears(path: Str, secs: Int) -> Bool {
+pub fn appears(path: Str, secs: Int) -> Bool ! Process.Spawn {
     process.run("sh", ["-c", "for i in $(seq 1 {secs * 20}); do [ -e {path} ] && exit 0; sleep 0.05; done; exit 1"]).unwrap().success()
 }
 
@@ -687,12 +687,12 @@ pub fn end_of_shell_status(rc: Int) -> ChildEnd {
 // What a command run in the background by a shell ended with. The shell writes the command's
 // stdout to {tree}/{tag}.out, its stderr to {tag}.err and, last, its status to {tag}.rc. A
 // command that has not ended in 300 s fails the test here, so a hang does not read as an exit.
-pub fn bg_result(tree: Str, tag: Str) -> ProcessResult ! FS.Read {
+pub fn bg_result(tree: Str, tag: Str) -> ProcessResult ! FS.Read, Process.Spawn {
     bg_result_within(tree, tag, 300)
 }
 
 // The same, waiting at most secs seconds.
-pub fn bg_result_within(tree: Str, tag: Str, secs: Int) -> ProcessResult ! FS.Read {
+pub fn bg_result_within(tree: Str, tag: Str, secs: Int) -> ProcessResult ! FS.Read, Process.Spawn {
     if !appears("{tree}/{tag}.rc", secs) {
         panic("the background command {tree}/{tag} has not ended in {secs} s")
     }

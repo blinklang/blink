@@ -26,7 +26,7 @@ import std.path.{path_basename, path_dirname}
 import sha256.{sha256_hex, sha256_file_hex}
 import std_cache_key.{sha256_of_manifest, sha256_of_file_first, sorted_strs, cc_identity}
 
-pub fn obj_cache_dir() -> Str {
+pub fn obj_cache_dir() -> Str ! Env.Read {
     let override_val = env.var("BLINK_CACHE_DIR") ?? ""
     if override_val == "" {
         return "build/obj-cache"
@@ -34,13 +34,13 @@ pub fn obj_cache_dir() -> Str {
     override_val
 }
 
-pub fn cache_enabled() -> Bool {
+pub fn cache_enabled() -> Bool ! Env.Read {
     // Empty BLINK_CACHE_DIR explicitly disables the cache (used by the
     // bootstrap loop). Unset uses the default `build/obj-cache`.
     (env.var("BLINK_CACHE_DIR") ?? "x") != ""
 }
 
-fn cache_size_cap_mb() -> Int {
+fn cache_size_cap_mb() -> Int ! Env.Read {
     let v = env.var("BLINK_CACHE_SIZE_MB") ?? ""
     if v == "" {
         return 2048
@@ -48,21 +48,21 @@ fn cache_size_cap_mb() -> Int {
     v.to_int()
 }
 
-pub fn ensure_dir() ! IO, FS.Write, FS.Read {
+pub fn ensure_dir() ! IO, FS.Write, FS.Read, Env.Read {
     let _ = build_fs.mkdir_p("{obj_cache_dir()}/tmp")
 }
 
 // A dir of prefix no other build writes, under tmp/ so a rename out of it stays on one
 // filesystem. A pid and a counter are not enough: two pid namespaces can share a cache
 // dir. "" when it cannot be made.
-fn make_tmp_dir(prefix: Str) -> Str ! IO, FS.Read, FS.Write, FS.Delete {
+fn make_tmp_dir(prefix: Str) -> Str ! IO, FS.Read, FS.Write, FS.Delete, Env.Read {
     ensure_dir()
     let tmp = "{obj_cache_dir()}/tmp"
     build_fs.reap_dead(tmp, ["unit", "hold", "stage"])
     build_fs.private_dir(tmp, prefix)
 }
 
-pub fn make_private_dir() -> Str ! IO, FS.Read, FS.Write, FS.Delete {
+pub fn make_private_dir() -> Str ! IO, FS.Read, FS.Write, FS.Delete, Env.Read {
     make_tmp_dir("unit")
 }
 
@@ -335,7 +335,7 @@ fn nested(inner: Str, outer: Str) -> Bool {
 // so cc reads the same answer. gcc and clang compare by inode, so a stale PWD that names the
 // cwd through another mount of it is recorded where this answers the cwd; both name the same
 // dir. "" when the cwd cannot be read.
-pub fn compile_dir() -> Str ! IO, FS.Read {
+pub fn compile_dir() -> Str ! IO, FS.Read, Env.Read {
     let cwd = env.cwd()
     if cwd == "" {
         return ""
@@ -663,7 +663,7 @@ pub fn key_from_text(text: Str) -> Str {
 
 // Look up by key. On hit, touches .meta mtime and returns the .o path.
 // On miss, returns "".
-pub fn lookup_obj(key: Str) -> Str ! IO, FS.Read, FS.Write {
+pub fn lookup_obj(key: Str) -> Str ! IO, FS.Read, FS.Write, Env.Read {
     if !cache_enabled() {
         return ""
     }
@@ -677,7 +677,7 @@ pub fn lookup_obj(key: Str) -> Str ! IO, FS.Read, FS.Write {
 }
 
 // lookup_obj for each key, in order. "" for an empty key.
-pub fn lookup_objs(keys: List[Str]) -> List[Str] ! IO, FS.Read, FS.Write {
+pub fn lookup_objs(keys: List[Str]) -> List[Str] ! IO, FS.Read, FS.Write, Env.Read {
     let mut out: List[Str] = []
     if !cache_enabled() {
         for _k in keys {
@@ -702,13 +702,13 @@ pub fn lookup_objs(keys: List[Str]) -> List[Str] ! IO, FS.Read, FS.Write {
 // build can remove the entry in between. So the build links a name of its own for the bytes,
 // in a dir under tmp/ that no GC removes, and removes that dir after its link. "" when none
 // can be made.
-pub fn make_hold_dir() -> Str ! IO, FS.Read, FS.Write, FS.Delete {
+pub fn make_hold_dir() -> Str ! IO, FS.Read, FS.Write, FS.Delete, Env.Read {
     make_tmp_dir("hold")
 }
 
 // A hard link at to for the file at from, or a copy where the filesystem makes no link. False
 // when from is gone or cannot be copied.
-fn hold_file(from: Str, to: Str) -> Bool ! IO, FS.Write, FS.Read, FS.Delete {
+fn hold_file(from: Str, to: Str) -> Bool ! IO, FS.Write, FS.Read, FS.Delete, Env.Read {
     // Dev knob: BLINK_DEV_OBJCACHE_HOLD=copy fails each link, as a filesystem with no hard
     // links does; =none fails each copy too. A test makes either path happen every time.
     let knob = env.var("BLINK_DEV_OBJCACHE_HOLD") ?? ""
@@ -726,7 +726,7 @@ fn hold_file(from: Str, to: Str) -> Bool ! IO, FS.Write, FS.Read, FS.Delete {
 // compile read files the key does not hold (<key>.reads) hits only when each of them, found
 // through dirs, the vendored include dirs of this build, still has the bytes it had. "" for an
 // empty key, a miss, or no hold dir.
-pub fn hold_objs(keys: List[Str], hold: Str, dirs: List[Str]) -> List[Str] ! IO, FS.Read, FS.Write, FS.Delete {
+pub fn hold_objs(keys: List[Str], hold: Str, dirs: List[Str]) -> List[Str] ! IO, FS.Read, FS.Write, FS.Delete, Env.Read {
     let mut out: List[Str] = []
     let dir = obj_cache_dir()
     let mut read_keys: List[Int] = []
@@ -819,7 +819,7 @@ let READ_MTIME_SLACK_MS: Int = 2000
 // The ReadScope of a compile with vendored include dirs dirs, whose key walk skips skip, that
 // reads its own C and headers under own and the archive headers in arc_dir. A dir that does not
 // exist holds nothing a compile reads. Made before the compile starts.
-pub fn read_scope(dirs: List[Str], skip: List[Str], own: List[Str], arc_dir: Str) -> ReadScope ! IO, FS.Read {
+pub fn read_scope(dirs: List[Str], skip: List[Str], own: List[Str], arc_dir: Str) -> ReadScope ! IO, FS.Read, Time.Read, Env.Read {
     let since_ms = time.read().to_unix_ms()
     let mut real_dirs: List[Str] = []
     for d in dirs {
@@ -1099,7 +1099,7 @@ pub let PCH_READS: Str = "reads"
 // now in the cache.
 // reads holds what the compile read that the key does not (compile_reads); None stores
 // nothing.
-pub fn install(key: Str, obj_path: Str, module_key: Str, src_sha: Str, reads: Option[List[Str]]) -> Bool ! IO, FS.Read, FS.Write, FS.Delete {
+pub fn install(key: Str, obj_path: Str, module_key: Str, src_sha: Str, reads: Option[List[Str]]) -> Bool ! IO, FS.Read, FS.Write, FS.Delete, Time.Read, Env.Read {
     if !cache_enabled() {
         return false
     }
@@ -1110,7 +1110,7 @@ pub fn install(key: Str, obj_path: Str, module_key: Str, src_sha: Str, reads: Op
 }
 
 // install for each (key, obj_path, module_key, reads), in order.
-pub fn install_objs(keys: List[Str], obj_paths: List[Str], module_keys: List[Str], reads: List[Option[List[Str]]]) -> List[Bool] ! IO, FS.Read, FS.Write, FS.Delete {
+pub fn install_objs(keys: List[Str], obj_paths: List[Str], module_keys: List[Str], reads: List[Option[List[Str]]]) -> List[Bool] ! IO, FS.Read, FS.Write, FS.Delete, Time.Read, Env.Read {
     let mut out: List[Bool] = []
     for _k in keys {
         out.push(false)
@@ -1134,7 +1134,7 @@ pub fn install_objs(keys: List[Str], obj_paths: List[Str], module_keys: List[Str
 // install_at under the key reads names, then <key>.reads, so a build that finds the lines
 // finds the object too. An object whose compile read nothing the key does not hold goes
 // under key.
-fn install_reads(dir: Str, stage: Str, key: Str, obj_path: Str, meta: Str, reads: Option[List[Str]]) -> Bool ! IO, FS.Write, FS.Read, FS.Delete {
+fn install_reads(dir: Str, stage: Str, key: Str, obj_path: Str, meta: Str, reads: Option[List[Str]]) -> Bool ! IO, FS.Write, FS.Read, FS.Delete, Env.Read {
     let lines = match reads {
         Some(l) => l
         None => return false
@@ -1159,7 +1159,7 @@ fn install_reads(dir: Str, stage: Str, key: Str, obj_path: Str, meta: Str, reads
 
 // A staged name in stage, so no build links a part-made copy under the key. False with no
 // stage dir.
-fn install_at(dir: Str, stage: Str, key: Str, obj_path: Str, meta: Str) -> Bool ! IO, FS.Write, FS.Read, FS.Delete {
+fn install_at(dir: Str, stage: Str, key: Str, obj_path: Str, meta: Str) -> Bool ! IO, FS.Write, FS.Read, FS.Delete, Env.Read {
     if stage == "" {
         return false
     }
@@ -1177,7 +1177,7 @@ fn install_at(dir: Str, stage: Str, key: Str, obj_path: Str, meta: Str) -> Bool 
 // obj at obj_tmp_path; we rename it (so the temp path is consumed).
 // Returns true iff a new entry was installed (signal for maybe_gc); on
 // false the caller must not link <key>.o.
-pub fn store(key: Str, obj_tmp_path: Str, module_key: Str, src_sha: Str) -> Bool ! IO, FS.Write, Env.Exit, Process.Spawn, FS.Read {
+pub fn store(key: Str, obj_tmp_path: Str, module_key: Str, src_sha: Str) -> Bool ! IO, FS.Write, Env.Exit, Process.Spawn, FS.Read, Time.Read, Env.Read {
     if !cache_enabled() {
         return false
     }
@@ -1199,7 +1199,7 @@ fn move_obj(from: Str, to: Str) -> Bool ! IO, FS.Write, Env.Exit, Process.Spawn 
 
 // store for each (key, obj_tmp_path, module_key), in order. The answer for each entry is what
 // store would answer for it.
-pub fn store_objs(keys: List[Str], obj_tmp_paths: List[Str], module_keys: List[Str]) -> List[Bool] ! IO, FS.Write, Env.Exit, Process.Spawn, FS.Read {
+pub fn store_objs(keys: List[Str], obj_tmp_paths: List[Str], module_keys: List[Str]) -> List[Bool] ! IO, FS.Write, Env.Exit, Process.Spawn, FS.Read, Time.Read, Env.Read {
     let mut out: List[Bool] = []
     for _k in keys {
         out.push(false)
@@ -1254,7 +1254,7 @@ pub fn pch_key(archive_sha: Str, runtime_sha: Str, cc_id: Str, arc_dir: Str, fla
     digest_of_lines(lines)
 }
 
-pub fn pch_dir(key: Str) -> Str {
+pub fn pch_dir(key: Str) -> Str ! Env.Read {
     "{obj_cache_dir()}/{key}.pch"
 }
 
@@ -1264,12 +1264,12 @@ pub fn clang_pch_name() -> Str {
 }
 
 // The PCH dir for key when its .gch is in place, and its entry marked as used; "" when not.
-pub fn lookup_pch(key: Str) -> Str ! IO, FS.Read, FS.Write {
+pub fn lookup_pch(key: Str) -> Str ! IO, FS.Read, FS.Write, Env.Read {
     lookup_pch_file(key, "libblink_std.h.gch")
 }
 
 // lookup_pch for the PCH file name a compiler reads.
-pub fn lookup_pch_file(key: Str, name: Str) -> Str ! IO, FS.Read, FS.Write {
+pub fn lookup_pch_file(key: Str, name: Str) -> Str ! IO, FS.Read, FS.Write, Env.Read {
     if !cache_enabled() || key == "" {
         return ""
     }
@@ -1284,12 +1284,12 @@ pub fn lookup_pch_file(key: Str, name: Str) -> Str ! IO, FS.Read, FS.Write {
 // Holds the PCH in dir for a build's units: a link or a copy of each of its files in hold,
 // which the units read in place of dir, so the GC of another build can remove the entry while
 // they compile. False, with nothing left in hold, when one cannot be held.
-pub fn hold_pch(dir: Str, hold: Str) -> Bool ! IO, FS.Write, FS.Read, FS.Delete {
+pub fn hold_pch(dir: Str, hold: Str) -> Bool ! IO, FS.Write, FS.Read, FS.Delete, Env.Read {
     hold_pch_files(dir, hold, ["libblink_std.h", "runtime.h", "libblink_std.h.gch"])
 }
 
 // hold_pch for the files a PCH dir holds for a compiler.
-pub fn hold_pch_files(dir: Str, hold: Str, names: List[Str]) -> Bool ! IO, FS.Write, FS.Read, FS.Delete {
+pub fn hold_pch_files(dir: Str, hold: Str, names: List[Str]) -> Bool ! IO, FS.Write, FS.Read, FS.Delete, Env.Read {
     if dir == "" || hold == "" || !build_fs.mkdir_p(hold) {
         return false
     }
@@ -1305,7 +1305,7 @@ pub fn hold_pch_files(dir: Str, hold: Str, names: List[Str]) -> Bool ! IO, FS.Wr
 // A private dir that holds copies of the archive's libblink_std.h and runtime.h, for a PCH
 // build to write its .gch beside; "" when the copies do not hash to the shas the key was
 // made from, as when the archive changed after the build hashed it.
-pub fn stage_pch(arc_dir: Str, archive_sha: Str, runtime_sha: Str) -> Str ! IO, FS.Read, FS.Delete, FS.Write {
+pub fn stage_pch(arc_dir: Str, archive_sha: Str, runtime_sha: Str) -> Str ! IO, FS.Read, FS.Delete, FS.Write, Env.Read {
     let dir = make_private_dir()
     if dir == "" {
         return ""
@@ -1330,7 +1330,7 @@ pub fn pch_headers_unchanged(arc_dir: Str, archive_sha: Str, runtime_sha: Str) -
 
 // Installs the staged dir as the PCH for key. False when another build installed it first, or
 // the rename failed; the staged dir is gone either way.
-pub fn store_pch(key: Str, staged: Str) -> Bool ! IO, FS.Write, FS.Delete, FS.Read {
+pub fn store_pch(key: Str, staged: Str) -> Bool ! IO, FS.Write, FS.Delete, FS.Read, Time.Read, Env.Read {
     let dir = pch_dir(key)
     // Under its key the dir is no longer one a reaper may take.
     build_fs.unmark(staged)
@@ -1343,7 +1343,7 @@ pub fn store_pch(key: Str, staged: Str) -> Bool ! IO, FS.Write, FS.Delete, FS.Re
 }
 
 // Drops the PCH for key, as when a unit that read it failed and compiled without it.
-pub fn drop_pch(key: Str) ! IO, FS.Delete, FS.Read {
+pub fn drop_pch(key: Str) ! IO, FS.Delete, FS.Read, Env.Read {
     let _ = build_fs.remove_tree(pch_dir(key))
     let _ = fs.delete("{obj_cache_dir()}/{key}.meta")
 }
@@ -1392,7 +1392,7 @@ fn cache_entry_count(dir: Str) -> Int ! Process.Spawn, FS.Read {
 
 // Opportunistic LRU eviction by .meta mtime until total <= cap_mb.
 // Caller invokes this once at end of a build that stored anything.
-pub fn maybe_gc() ! IO, FS.Read, FS.Delete {
+pub fn maybe_gc() ! IO, FS.Read, FS.Delete, Process.Spawn, Env.Read {
     if !cache_enabled() {
         return
     }
@@ -1432,7 +1432,7 @@ pub fn maybe_gc() ! IO, FS.Read, FS.Delete {
 // when the build reaches point ("compile": after its lookups, before its units compile;
 // "link": before its link). It stands in for another build's GC at that moment, so a test
 // can make that race happen every time. Answers whether it emptied the cache.
-pub fn dev_evict_at(point: Str) -> Bool ! IO, FS.Delete, FS.Read {
+pub fn dev_evict_at(point: Str) -> Bool ! IO, FS.Delete, FS.Read, Env.Read, Process.Spawn {
     if !cache_enabled() || (env.var("BLINK_DEV_OBJCACHE_EVICT") ?? "") != point {
         return false
     }
@@ -1440,7 +1440,7 @@ pub fn dev_evict_at(point: Str) -> Bool ! IO, FS.Delete, FS.Read {
     true
 }
 
-pub fn cmd_info() -> Int ! IO, FS.Read, Process.Spawn {
+pub fn cmd_info() -> Int ! IO, FS.Read, Process.Spawn, Env.Read {
     let dir = obj_cache_dir()
     let count = cache_entry_count(dir)
     let total_kb = cache_total_bytes(dir) / 1024
@@ -1453,7 +1453,7 @@ pub fn cmd_info() -> Int ! IO, FS.Read, Process.Spawn {
     0
 }
 
-pub fn cmd_clean(older_than: Str) -> Int ! FS.Delete, IO, FS.Read {
+pub fn cmd_clean(older_than: Str) -> Int ! FS.Delete, IO, FS.Read, Process.Spawn, Env.Read {
     let dir = obj_cache_dir()
     if !build_fs.path_exists(dir) {
         return 0
@@ -1520,7 +1520,7 @@ pub fn cmd_clean(older_than: Str) -> Int ! FS.Delete, IO, FS.Read {
 
 // Hidden sub-subcommands used by tests to drive the cache directly.
 // Return 0/1 so the test can assert exit codes.
-pub fn cmd_internal_lookup(key: Str) -> Int ! IO, FS.Read, FS.Write {
+pub fn cmd_internal_lookup(key: Str) -> Int ! IO, FS.Read, FS.Write, Env.Read {
     let p = lookup_obj(key)
     if p == "" {
         return 1
@@ -1529,7 +1529,7 @@ pub fn cmd_internal_lookup(key: Str) -> Int ! IO, FS.Read, FS.Write {
     0
 }
 
-pub fn cmd_internal_store(key: Str, src_obj: Str, module_key: Str, src_sha: Str) -> Int ! IO, FS.Read, FS.Write, FS.Delete, Env.Exit, Process.Spawn {
+pub fn cmd_internal_store(key: Str, src_obj: Str, module_key: Str, src_sha: Str) -> Int ! IO, FS.Read, FS.Write, FS.Delete, Env.Exit, Process.Spawn, Env.Read, Time.Read {
     if !build_fs.path_exists(src_obj) {
         io.eprintln("error: source obj does not exist: {src_obj}")
         return 1
@@ -1550,12 +1550,12 @@ pub fn cmd_internal_store(key: Str, src_obj: Str, module_key: Str, src_sha: Str)
     0
 }
 
-pub fn cmd_internal_gc() -> Int ! IO, FS.Read, FS.Delete {
+pub fn cmd_internal_gc() -> Int ! IO, FS.Read, FS.Delete, Process.Spawn, Env.Read {
     maybe_gc()
     0
 }
 
-pub fn cmd_key(text: Str) -> Int {
+pub fn cmd_key(text: Str) -> Int ! IO.Print {
     let k = key_from_text(text)
     io.println(k)
     0

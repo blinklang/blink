@@ -64,26 +64,26 @@ fn hold_cc(tree: Str) ! Process.Spawn, FS.Write {
     process.run("sh", ["-c", "chmod +x {tree}/ccwrap/cc"]).unwrap()
 }
 
-fn blink_in(tree: Str, args: Str) -> ProcessResult {
+fn blink_in(tree: Str, args: Str) -> ProcessResult ! Process.Spawn {
     process.run("sh", ["-c", "cd {tree}/app && {env_of(tree)} ../build/blink {args}"]).unwrap()
 }
 
 // The command in tree, with a bound, so a daemon that never answers fails the test instead of
 // hanging it.
-fn blink_bounded(tree: Str, args: Str) -> ProcessResult {
+fn blink_bounded(tree: Str, args: Str) -> ProcessResult ! Process.Spawn {
     process.run("sh", ["-c", "cd {tree}/app && {env_of(tree)} timeout 20 ../build/blink {args}"]).unwrap()
 }
 
 // Starts the command in tree in the background. Its stdout, stderr and exit code land in
 // tree/<tag>.out, .err and .rc, and the pid of the blink process in tree/<tag>.pid: the shell
 // that writes it execs env, which execs blink.
-fn blink_bg(tree: Str, args: Str, tag: Str) {
+fn blink_bg(tree: Str, args: Str, tag: Str) ! Process.Spawn {
     process.run("sh", ["-c", "(cd {tree}/app && (sh -c 'echo $$ > {tree}/{tag}.pid; exec {env_of(tree)} ../build/blink {args}' > {tree}/{tag}.out 2> {tree}/{tag}.err; echo $? > {tree}/{tag}.rc.tmp; mv {tree}/{tag}.rc.tmp {tree}/{tag}.rc)) > /dev/null 2>&1 &"]).unwrap()
 }
 
 // The pid of the daemon serving src/main.bl in tree, or -1. The timeout ends a daemon that
 // nothing stopped.
-fn start_daemon(tree: Str) -> Int {
+fn start_daemon(tree: Str) -> Int ! Process.Spawn {
     process.run("sh", ["-c", "cd {tree}/app && ({env_of(tree)} timeout 300 ../build/blink daemon start src/main.bl > {tree}/daemon.log 2>&1 &)"]).unwrap()
     let up = process.run("sh", ["-c", "for i in $(seq 1 600); do [ -S {tree}/app/.blink/daemon.sock ] && exit 0; sleep 0.05; done; exit 1"]).unwrap()
     let pid = sh("cat {tree}/app/.blink/daemon.pid 2>/dev/null").to_int()
@@ -94,23 +94,23 @@ fn start_daemon(tree: Str) -> Int {
     pid
 }
 
-fn stop_daemon(pid: Int) {
+fn stop_daemon(pid: Int) ! Process.Spawn {
     if pid <= 0 { return }
     process.run("sh", ["-c", "kill {pid} 2>/dev/null; for i in $(seq 1 100); do kill -0 {pid} 2>/dev/null || exit 0; sleep 0.05; done; kill -9 {pid}"]).unwrap()
 }
 
-fn alive(pid: Int) -> Bool {
+fn alive(pid: Int) -> Bool ! Process.Spawn {
     process.run("sh", ["-c", "kill -0 {pid} 2>/dev/null"]).unwrap().success()
 }
 
 // The children of pid, space-separated, or "".
-fn children(pid: Int) -> Str {
+fn children(pid: Int) -> Str ! Process.Spawn {
     sh("ps -o pid= --ppid {pid} | tr -s ' \\n' ' '")
 }
 
 // Whether no build runs under the daemon pid within secs seconds. The daemon's children are
 // the workers that serve its entries, and a build runs in a child of a worker.
-fn childless(pid: Int, secs: Int) -> Bool {
+fn childless(pid: Int, secs: Int) -> Bool ! Process.Spawn {
     process.run("sh", ["-c", "for i in $(seq 1 {secs * 20}); do b=''; for w in $(ps -o pid= --ppid {pid}); do b=\"$b$(ps -o pid= --ppid $w)\"; done; [ -z \"$b\" ] && exit 0; sleep 0.05; done; exit 1"]).unwrap().success()
 }
 
@@ -131,12 +131,12 @@ fn field_of(out: Str, field: Str) -> Int {
     }
 }
 
-fn served(tree: Str, field: Str) -> Int {
+fn served(tree: Str, field: Str) -> Int ! Process.Spawn {
     field_of(blink_bounded(tree, "daemon status").out, field)
 }
 
 // Whether the status field reaches want within secs seconds.
-fn reaches(tree: Str, field: Str, want: Int, secs: Int) -> Bool {
+fn reaches(tree: Str, field: Str, want: Int, secs: Int) -> Bool ! Process.Spawn {
     let deadline = time_ms() + secs * 1000
     while time_ms() < deadline {
         if served(tree, field) == want { return true }
@@ -147,7 +147,7 @@ fn reaches(tree: Str, field: Str, want: Int, secs: Int) -> Bool {
 
 // What the daemon leaves in .blink/ and its workers' directories there for builds; "" once
 // each build's files are gone.
-fn build_files(tree: Str) -> Str {
+fn build_files(tree: Str) -> Str ! Process.Spawn {
     sh("cd {tree}/app/.blink 2>/dev/null && find . -maxdepth 2 -name 'build*' | sort | tr '\\n' ' '")
 }
 
@@ -179,7 +179,7 @@ fn differ(a_tree: Str, a: ProcessResult, b_tree: Str, b: ProcessResult) -> Str {
 }
 
 // What two trees' last builds left that differs: a C file of the units, or the program.
-fn output_differ(a_tree: Str, b_tree: Str) -> Str {
+fn output_differ(a_tree: Str, b_tree: Str) -> Str ! Process.Spawn {
     sh("cd {b_tree}/app/out/app.units && for f in *.c *.h; do cmp -s $f {a_tree}/app/out/app.units/$f || echo $f; done; cd {a_tree}/app/out/app.units && for f in *.c *.h; do [ -e {b_tree}/app/out/app.units/$f ] || echo extra:$f; done; cmp -s {a_tree}/app/out/app {b_tree}/app/out/app || echo program").split("\n").join(" ")
 }
 
@@ -190,7 +190,7 @@ fn edit(tree: Str, file: Str, sed: Str) ! FS.Read, Process.Spawn {
     assert(fs.read(path).unwrap() != before, "the edit `{sed}` did not change {file}")
 }
 
-fn build(tree: Str) -> ProcessResult {
+fn build(tree: Str) -> ProcessResult ! Process.Spawn {
     blink_in(tree, "build src/main.bl -o out/app")
 }
 

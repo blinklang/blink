@@ -8,7 +8,7 @@ import std.process.{ProcessResult, ChildEnd}
 import std.testing.{cleanup}
 import compile_test_helpers
 
-fn sh(cmd: Str) -> Str {
+fn sh(cmd: Str) -> Str ! Process.Spawn {
     process.run("sh", ["-c", cmd]).unwrap().out.trim()
 }
 
@@ -37,7 +37,7 @@ fn dev_tree(root: Str, tree: Str, cc_path: Str) ! Process.Spawn, FS.Write {
 // Runs blink in the tree with the shared object cache, the tree's cc and the unit trace. The
 // corpus exports BLINK_COMPILER_ARCHIVE and module filters, which make the build one unit, so
 // the run drops them.
-fn blink_in(tree: Str, cache: Str, args: Str) -> ProcessResult {
+fn blink_in(tree: Str, cache: Str, args: Str) -> ProcessResult ! Process.Spawn {
     process.run("sh", ["-c", "cd {tree} && env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE PATH={tree}/bin:$PATH BLINK_CACHE_DIR={cache} BLINK_TRACE_CHANNELS=build.units build/blink {args}"]).unwrap()
 }
 
@@ -51,37 +51,37 @@ fn compiles(r: ProcessResult) -> Int {
 
 // How many of the cache's objects have debug info that names text. readelf reads the debug
 // sections gcc compresses, where grep -a finds nothing.
-fn objects_naming(cache: Str, text: Str) -> Int {
+fn objects_naming(cache: Str, text: Str) -> Int ! Process.Spawn {
     sh("for o in {cache}/*.o; do readelf --debug-dump=info,line \"$o\" 2>/dev/null | grep -q -F '{text}' && echo \"$o\"; done | wc -l").to_int()
 }
 
 // How many of the cache's objects have debug info that names both texts.
-fn objects_naming_both(cache: Str, first: Str, second: Str) -> Int {
+fn objects_naming_both(cache: Str, first: Str, second: Str) -> Int ! Process.Spawn {
     sh("for o in {cache}/*.o; do d=$(readelf --debug-dump=info,line \"$o\" 2>/dev/null); echo \"$d\" | grep -q -F '{first}' && echo \"$d\" | grep -q -F '{second}' && echo \"$o\"; done | wc -l").to_int()
 }
 
 // How many of the cache's objects hold text in their bytes once the debug sections gcc
 // compresses are decompressed.
-fn objects_holding(cache: Str, text: Str) -> Int {
+fn objects_holding(cache: Str, text: Str) -> Int ! Process.Spawn {
     sh("for o in {cache}/*.o; do objcopy --decompress-debug-sections \"$o\" {cache}/plain.tmp && grep -q -a -F '{text}' {cache}/plain.tmp && echo \"$o\"; rm -f {cache}/plain.tmp; done | wc -l").to_int()
 }
 
 // How many of the cache's objects record dir as their compile dir.
-fn objects_compiled_in(cache: Str, dir: Str) -> Int {
+fn objects_compiled_in(cache: Str, dir: Str) -> Int ! Process.Spawn {
     sh("for o in {cache}/*.o; do readelf --debug-dump=info \"$o\" 2>/dev/null | sed -n 's/.*DW_AT_comp_dir.*: //p' | head -1 | grep -q -x -F '{dir}' && echo \"$o\"; done | wc -l").to_int()
 }
 
-fn object_count(cache: Str) -> Int {
+fn object_count(cache: Str) -> Int ! Process.Spawn {
     sh("ls {cache}/*.o 2>/dev/null | wc -l").to_int()
 }
 
 // How many times the debug info of the binary at path names text.
-fn binary_names(path: Str, text: Str) -> Int {
+fn binary_names(path: Str, text: Str) -> Int ! Process.Spawn {
     sh("readelf --debug-dump=info,line {path} 2>/dev/null | grep -c -F '{text}'").to_int()
 }
 
 // The two trees, under cc: per-module and one-unit debug builds, then default builds.
-fn check_two_trees(cc_name: Str) ! IO, Process.Spawn, DB, FS.Write {
+fn check_two_trees(cc_name: Str) ! IO, Process.Spawn, DB, FS.Write, Env.Read {
     let cc_path = sh("command -v {cc_name}")
     if cc_path == "" {
         io.println("skip {cc_name}: no {cc_name} on PATH")
@@ -167,7 +167,7 @@ fn env_of(tree: Str, cache: Str) -> Str {
 
 // The pid of the daemon serving app/src/main.bl in tree, started in {tree}/app, or -1. The
 // timeout ends a daemon that nothing stopped.
-fn start_daemon(tree: Str, cache: Str) -> Int {
+fn start_daemon(tree: Str, cache: Str) -> Int ! Process.Spawn {
     process.run("sh", ["-c", "cd {tree}/app && ({env_of(tree, cache)} timeout 300 {tree}/build/blink daemon start src/main.bl > {tree}/daemon.log 2>&1 &)"]).unwrap()
     let up = process.run("sh", ["-c", "for i in $(seq 1 600); do [ -S {tree}/app/.blink/daemon.sock ] && exit 0; sleep 0.05; done; exit 1"]).unwrap()
     let pid = sh("cat {tree}/app/.blink/daemon.pid 2>/dev/null").to_int()
@@ -178,7 +178,7 @@ fn start_daemon(tree: Str, cache: Str) -> Int {
     pid
 }
 
-fn stop_daemon(pid: Int) {
+fn stop_daemon(pid: Int) ! Process.Spawn {
     if pid <= 0 { return }
     process.run("sh", ["-c", "kill {pid} 2>/dev/null; for i in $(seq 1 100); do kill -0 {pid} 2>/dev/null || exit 0; sleep 0.05; done; kill -9 {pid}"]).unwrap()
 }
@@ -186,12 +186,12 @@ fn stop_daemon(pid: Int) {
 // A debug build sent to the daemon from dir, which cd enters by the path given, so PWD names
 // dir even where dir is a link. Each build of a tree writes the same output, so the client's
 // dir is the one input its builds differ in.
-fn daemon_build(tree: Str, cache: Str, dir: Str) -> ProcessResult {
+fn daemon_build(tree: Str, cache: Str, dir: Str) -> ProcessResult ! Process.Spawn {
     process.run("sh", ["-c", "cd {dir} && {env_of(tree, cache)} {tree}/build/blink build {tree}/app/src/main.bl -o {tree}/out/app --per-module --debug"]).unwrap()
 }
 
 // The builds the daemon of tree served, or -1.
-fn served_builds(tree: Str, cache: Str) -> Int {
+fn served_builds(tree: Str, cache: Str) -> Int ! Process.Spawn {
     let out = process.run("sh", ["-c", "cd {tree}/app && {env_of(tree, cache)} {tree}/build/blink daemon status"]).unwrap().out
     let key = "\"builds\":"
     match out.byte_index_of(key, 0) {
@@ -217,7 +217,7 @@ type DaemonTree {
 
 // Two debug builds of tree through its own daemon, which runs in {tree}/app: one from
 // {tree}/app/src and one from {tree}/link, a link to it.
-fn daemon_tree(tree: Str, cache: Str) -> DaemonTree {
+fn daemon_tree(tree: Str, cache: Str) -> DaemonTree ! Process.Spawn {
     process.run("sh", ["-c", "ln -s {tree}/app/src {tree}/link"]).unwrap()
     let pid = start_daemon(tree, cache)
     let none = ProcessResult { out: "", err_out: "", end: ChildEnd.Exited(-1) }
@@ -235,7 +235,7 @@ fn daemon_tree(tree: Str, cache: Str) -> DaemonTree {
 // Two trees, each with a daemon, on one cache: each debug object names only the tree of the
 // client that asked for it, and records the client's dir as its compile dir, never the
 // daemon's.
-fn check_two_trees_through_daemons(cc_name: Str) ! IO, Process.Spawn, FS.Read, FS.Write {
+fn check_two_trees_through_daemons(cc_name: Str) ! IO, Process.Spawn, FS.Read, FS.Write, Env.Read {
     let cc_path = sh("command -v {cc_name}")
     if cc_path == "" {
         io.println("skip {cc_name}: no {cc_name} on PATH")
