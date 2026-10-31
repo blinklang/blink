@@ -94,6 +94,7 @@ Single source of truth for release history. `blink llms` and `blink llms --full`
 - **A range compared with a range of another type gets no membership help.** `r == 0..3` with `r: Range[U8]` is still a TypeError (`Range[U8]` and `Range[Int]`), but its help no longer tells you to test that `r` is in the range.
 - **`==` on a `Range[T]` of an unbounded `T` asks for `T: Ord`.** A range is written over an `Ord` type and `Ord` gives `Eq`, so the help is `add the bound [T: Ord]` and the note says `Range[T]` needs `T: Ord`. Before, it asked for `T: Eq`. The compiler still adds no bound you did not write.
 - **E1400 names only the `Hash` a container or range lacks.** A `List`, a `Range` and the other built-in types that cannot be a `Map` key or `Set` element have no `Hash`; the message no longer says they have no `Eq` either, and it lists ranges.
+- **A call through a closure builds on the per-module path when its result is an `Option` of a sized integer type.** `xs.into_iter().count()` with `xs: List[U8]` failed in the C compiler on `blink_Option_u8`, because the unit never declared that type. Each call now declares the types of its arguments and result.
 
 ## Breaking Changes (v0.58.0)
 
