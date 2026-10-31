@@ -5156,7 +5156,7 @@ error[SubtraitMethodRedeclaration]: cannot seal inherited open default `greet`
 
 `E0733` fires at the subtrait's redeclaration site, not at any call site, and applies to two cases: redeclaring a method a supertrait already provides as an open default, and redeclaring any supertrait method to add or change its contract (§3b.2 *Contracts on Trait Methods*). A normal `impl`-block override of that open default (without `final`) is unaffected — that is the ordinary replace-only override of §3.6 *The `final` Modifier*.
 
-**Effect-row subtype for trait impls.** Every method an `impl` provides for a trait, whether it implements a required method or overrides an open default, must declare an effect row `R_i` with `R_i ⊆ R_t`, where `R_t` is the row the trait declares for that method. An impl may *narrow* the row (drop effects it does not use) but may not *widen* it (add effects the trait does not declare). A trait method with no `!` has the empty row, so every impl of it must also have no `!`. For a method whose row has no `_`, this rule is what lets a bound `T: Trait` stand as an upper bound on the effects of a call through it: a generic function with no `!` that calls `x.m()` for `x: T` performs no effects for any `T`. The rule covers fixed and empty rows. A trait method whose row has `_` and no callback source lets each impl choose its row (§4.15.2): only a row with no `_` bounds the impls, and effects beside that `_` limit no impl. A widening impl is rejected at the impl method with `error[TraitContractEffectMismatch]` (E0904). The check uses the impl method's effective row, so an impl that touches module state widens a row that lacks `State` (§4.16.1). See §4.5 *Effect Composition Rules* for the subtyping lattice. `final` defaults have no override site, so their row is fixed at the declaration.
+**Effect-row subtype for trait impls.** Every method an `impl` provides for a trait, whether it implements a required method or overrides an open default, must declare an effect row `R_i` with `R_i ⊆ R_t`, where `R_t` is the row the trait declares for that method. An impl may *narrow* the row (drop effects it does not use) but may not *widen* it (add effects the trait does not declare). A trait method with no `!` has the empty row, so every impl of it must also have no `!`. For a method whose row has no `_`, this rule is what lets a bound `T: Trait` stand as an upper bound on the effects of a call through it: a generic function with no `!` that calls `x.m()` for `x: T` performs no effects for any `T`. The rule covers fixed and empty rows. A trait method whose row has `_` and no callback source lets each impl choose its row (§4.15.2): only a row with no `_` bounds the impls, and effects beside that `_` limit no impl. A widening impl is rejected at the impl method with `error[TraitContractEffectMismatch]` (E0904). The check uses the impl method's effective row, so an impl that touches module state widens a row that lacks `State` (§4.16.1). See §4.5 *Effect Composition Rules* for the subtyping lattice. `final` defaults have no override site, so their row is fixed at the declaration. An open default whose method has an impl-chosen `_` keeps the same meaning for a type that does not override it: that type's row for the method is the fixed part of the trait row, and the default body may perform no more than the fixed part (§4.15.2, *Default bodies under an impl-chosen `_`*). A `final` method may not have a `_` with no source (E0551).
 
 Contracts on trait methods follow the same narrow-only shape: an impl inherits the trait method's `@requires` and `@ensures`, may add `@ensures`, and may not add `@requires` (E0912). See §3b.2 *Contracts on Trait Methods*.
 
@@ -5487,6 +5487,18 @@ error[UnlicensedSelfOperation]: `<` on `Self` is not licensed by `Ranked`
           on `Self` is licensed only when the trait declares the backing trait as a supertrait
   = help: declare the supertrait so every implementor provides `<`:
               trait Ranked: Ord { ... }
+```
+
+**Effects in a default body.** A default body is also checked against the effect row of its method. `Self` is not a source of `_` there, so a default body may perform only the effects written in the row beside `_`, and a call of a `_` method on `self` is E0500 (§4.15.2, *Default bodies under an impl-chosen `_`*). Write a default that forwards to a `_` method as a free function with its own type parameter.
+
+```blink
+trait Res {
+    fn close(self) ! _
+    fn flush(self) ! _ { }                  // OK: an empty default, charged nothing
+    fn shut(self) ! _ {
+        self.close()                        // ERROR E0500: `_` holds no effect in a default body
+    }
+}
 ```
 
 **Arithmetic on `Self`.** The arithmetic traits (`Add`, `Sub`, `Mul`, `Div`, `Rem`,

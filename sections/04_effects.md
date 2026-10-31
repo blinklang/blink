@@ -5610,11 +5610,11 @@ fn bad_nightly() ! IO.Log {
 
 **Impl-chosen rows.** A trait method with no `! _` callback or handler parameter may still write `! _`. Then `_` means that each impl declares its own row for that method, and E0904 does not bound that row. A trait method that has a `! _` callback or handler parameter keeps the meaning above: `_` stands for the rows of the arguments. So the meaning of `_` in a trait method depends on whether the method has such a parameter.
 
-Only a row with no `_` bounds the impls of a trait method. Effects beside an impl-chosen `_` add to the charge at a call through a type parameter and limit no impl. For example, `! IO.Log, _` is legal on such a method, and every impl may still choose a row without `IO.Log`.
+Only a row with no `_` bounds the impls of a trait method. Effects beside an impl-chosen `_` add to the charge at a call through a type parameter and limit no impl. They are also the row of a type that keeps the default body of the method (see *Default bodies under an impl-chosen `_`* below). For example, `! IO.Log, _` is legal on such a method, and every impl may still choose a row without `IO.Log`.
 
 The empty row stays the default contract of a trait method. Write `! _` on a method without a callback only when its impls must do effects that the trait cannot name ahead, as cleanup does. `Closeable` (§3.6) and `Scoped` (§4.7.2) are the traits of this specification that do.
 
-**Source of `_`.** A `_` in the row of a function or of an impl method needs a source: a `! _` callback or handler parameter, or a type parameter whose bound has a method with a `_` row. A `_` in the declaration of a trait method has no such need, because it is the impl-chosen contract above. An impl method that forwards the row of a type parameter has a source:
+**Source of `_`.** A `_` in the row of a function or of an impl method needs a source: a `! _` callback or handler parameter, or a type parameter whose bound has a method with a `_` row. A `_` in the declaration of a trait method has no such need, because it is the impl-chosen contract above. A `final` trait method is the one exception (see *Default bodies under an impl-chosen `_`* below). An impl method that forwards the row of a type parameter has a source:
 
 ```blink
 type Guard[T] {
@@ -5650,6 +5650,195 @@ error[UnsourcedEffectWildcard]: `_` in the row of `Res.close` has no source
    = help: name the effects `close` performs
 ```
 
+**Default bodies under an impl-chosen `_`.** A trait method with an impl-chosen `_` may have a default body (§3.6). In that body `_` is empty: `Self` is not a source of `_`. The body may perform only the effects written beside `_`, which are the fixed part of the row. An effect that the body performs and the fixed part does not hold is E0500 at the operation. A call of a method of `Self` that has a `_` row, `m` itself included, is E0500 too, because that call is charged `_`.
+
+The empty default is the intended use of a `! _` default: an optional hook that most types leave alone and a few override with effects.
+
+```blink
+trait Hook {
+    fn before(self) ! _ { }                  // OK: the default does nothing
+    fn run(self) ! _
+}
+
+trait Banner {
+    fn show(self) ! IO.Print, _ {            // OK: the body performs only the fixed part
+        io.println("banner")
+    }
+}
+```
+
+An effect with no source in a default body is an error. The first `help:` names the effect to write beside `_`, and the second names the other repairs. No `fix:` is given, because the first repair widens the charge of every call through `T: Tr` and of every type that keeps the default. The default of this trait performs `IO.Print` and the fixed part does not hold it:
+
+```blink
+trait Tr {
+    fn m(self) ! _ {
+        io.println("x")             // ERROR E0500: the default body may not perform `IO.Print`
+    }
+}
+
+type A { }
+impl Tr for A { }
+
+fn g[T: Tr](t: T) ! _ {
+    t.m()
+}
+
+fn main() {
+    g(A { })                        // main is charged nothing: the fixed part of `Tr.m` is empty
+}
+```
+
+```
+error[UndeclaredEffect]: `io.println` needs `IO.Print`, which the default body of `Tr.m` may not perform
+  --> tr.bl:3:9
+   |
+ 3 |         io.println("x")
+   |         ^^^^^^^^^^^^^^^ `_` holds no effect in a default body
+   |
+   = help: name `IO.Print` beside `_`: `! IO.Print, _`
+   = help: or override `m` in each impl, or remove the default body
+```
+
+A call of a `_` method on `self` in a default body gets a `help:` that points to the free-function form. The free function has a source for `_`, because its type parameter has a bound with a `_` method:
+
+```blink
+trait Res {
+    fn close(self) ! _
+    fn shut(self) ! _ {
+        self.close()                // ERROR E0500: `_` holds no effect in a default body
+    }
+}
+
+fn shut[T: Res](t: T) ! _ {         // OK: write the code as a free function
+    t.close()
+}
+```
+
+```
+error[UndeclaredEffect]: call to `Self.close` needs `_`, which a default body may not use
+  --> res.bl:4:9
+   |
+ 4 |         self.close()
+   |         ^^^^^^^^^^^^ `Self` is not a source of `_`
+   |
+   = help: write it as a free function: `fn shut[T: Res](t: T) ! _ { t.close() }`
+```
+
+A type whose impl does not override the method keeps the default, and its row for the method is the fixed part of the trait row. The body is not read, and the rows of the other methods of the type do not join it. A concrete call is charged that row. A call through a type parameter is charged the fixed part and `_`. At a call of a function whose row has `_`, the type-argument rule of §4.15.3 adds that row. An impl that overrides the method has the row that it writes, as before.
+
+```blink
+trait Tr {
+    fn m(self) ! IO.Print, _ {
+        io.println("x")
+    }
+}
+
+type A { }
+impl Tr for A { }                   // A keeps the default: the row of A.m is IO.Print
+
+type B { }
+impl Tr for B {
+    fn m(self) { }                  // B overrides: the row of B.m is empty
+}
+
+fn g[T: Tr](t: T) ! _ {
+    t.m()
+}
+
+fn quiet() {
+    B { }.m()                       // OK: charged the row of B.m
+    A { }.m()                       // ERROR E0500: missing IO.Print
+    g(B { })                        // OK: _ = (nothing)
+}
+
+fn loud() ! IO.Log {
+    g(A { })                        // ERROR E0500: missing IO.Print
+}
+
+fn main() ! IO.Print {
+    g(A { })                        // OK: _ = IO.Print; prints "x"
+}
+```
+
+At a caller that lacks the effect, the E0500 for a type that keeps a default carries a `note:` that names the default:
+
+```
+error[UndeclaredEffect]: call to `A.m` needs `IO.Print`
+  --> app.bl:19:5
+   |
+19 |     A { }.m()
+   |     ^^^^^^^^^ missing `IO.Print`
+   |
+   = note: `A.m` uses the default of `Tr.m`, whose row is `IO.Print`
+```
+
+The row of a type that keeps a default does not depend on the other methods of the trait. An empty default charges nothing, and the row that a type chooses for one `_` method never joins the row of another:
+
+```blink
+type Loud { }
+impl Hook for Loud {
+    fn run(self) ! IO.Log { io.log("run") }
+}
+
+fn quiet() {
+    Loud { }.before()               // OK: charged nothing. The row of Loud.run does not join it
+}
+```
+
+A default that forwards to another `_` method of `Self` is not expressible as a trait default. Write it as a free function, as above.
+
+A supertrait default has the same rule. A subtrait cannot redeclare the method (E0733). At a call through `T: Sub`, the type-argument rule reaches the supertrait method (§4.15.3), and a type that keeps the default adds its fixed part:
+
+```blink
+trait Base {
+    fn m(self) ! IO.Log, _ {
+        io.log("base")
+    }
+}
+
+trait Sub: Base {
+    fn n(self)
+}
+
+type X { }
+impl Base for X { }
+impl Sub for X {
+    fn n(self) { }
+}
+
+fn go[T: Sub](t: T) ! _ {
+    t.m()
+}
+
+fn main() ! IO.Log {
+    go(X { })                       // OK: _ = IO.Log, the fixed part of Base.m
+}
+```
+
+A `final` trait method has no impl that chooses its row, so the reason for the exemption above does not hold. Its `_` needs a source like the `_` of a function, and `Self` is not one. A `final` method that has neither a `! _` callback or handler parameter nor a type parameter with a bound that has a `_` method has a `_` with no source: E0551. The message says that `final` means no impl chooses the row.
+
+```blink
+trait Tr {
+    final fn m(self) ! IO.Print, _ {    // ERROR E0551
+        io.println("x")
+    }
+}
+```
+
+```
+error[UnsourcedEffectWildcard]: `_` in the row of final `Tr.m` has no source
+  --> tr.bl:2:36
+   |
+ 2 |     final fn m(self) ! IO.Print, _ {
+   |                                  ^ `final` means no impl chooses the row, so this `_` has no source
+   |
+   = help: name the effects: `! IO.Print`
+   = help: remove `_` and keep `final`. A generic caller whose only source of `_` was `Tr.m` must then name its effects
+```
+
+The repair is to remove `_`. It is a `help:` and not a `fix:`: a generic caller, in this package or in another, whose only source of `_` was `Tr.m` has no source left and gets E0551 until its author names the effects. Removing `final` is not the repair: it makes the default open and leaves `_` impl-chosen.
+
+
 #### 4.15.3 Call-Site Resolution
 
 - **Concrete effect function types** (`fn(T) -> U ! IO.Log`): The caller must hold the required effects at the call site.
@@ -5658,7 +5847,7 @@ error[UnsourcedEffectWildcard]: `_` in the row of `Res.close` has no source
 
 - **Pure callbacks in wildcard positions**: When a pure callback is passed to a `! _` function, `_` resolves to the empty effect set. The function is pure at that call site.
 
-- **Call of an impl-chosen method on a concrete type** (§4.15.2, *Impl-chosen rows*): The call is charged the row of that impl. This includes the calls that a `with` item makes (§4.7.2, §5.5).
+- **Call of an impl-chosen method on a concrete type** (§4.15.2, *Impl-chosen rows*): The call is charged the row of that impl. A type whose impl does not override a default method has, as its row for that method, the fixed part of the trait row (§4.15.2, *Default bodies under an impl-chosen `_`*). This includes the calls that a `with` item makes (§4.7.2, §5.5).
 
 - **Call of an impl-chosen method through a type parameter**: The call is charged `_`, and inside the callee `_` is opaque. The enclosing function must have `_` in its row. If it does not, E0500 fires at the call, with the help "add `! _`".
 
@@ -5672,7 +5861,7 @@ error[UnsourcedEffectWildcard]: `_` in the row of `Res.close` has no source
   }
   ```
 
-- **Type arguments**: At each call of a function whose row has `_`, the row of each type argument's impl joins `_`. For each type parameter of the callee, and for each method with a `_` row in the bounds of that parameter (supertraits included, so `T: Closeable` brings `Scoped.enter` and `Scoped.exit` through the bridge of §4.7.2), the impl row of the type argument is added. This union comes in addition to the callback and handler sources above. It uses the signature of the callee only: the body is not read, so the caller pays for each `_` method of the bound, not only for the ones the body calls. If the row of the callee has no `_`, its type arguments add nothing.
+- **Type arguments**: At each call of a function whose row has `_`, the row of each type argument's impl joins `_`. For each type parameter of the callee, and for each method with a `_` row in the bounds of that parameter (supertraits included, so `T: Closeable` brings `Scoped.enter` and `Scoped.exit` through the bridge of §4.7.2), the impl row of the type argument is added. This union comes in addition to the callback and handler sources above. For a type argument whose impl keeps a default, the impl row is the fixed part of the trait row. It uses the signature of the callee only: the body is not read, so the caller pays for each `_` method of the bound, not only for the ones the body calls. If the row of the callee has no `_`, its type arguments add nothing.
 
   ```blink
   fn main() ! FS {

@@ -392,7 +392,7 @@ error[V0003]: contract unverifiable
   = help: add `@verify(fallback: "runtime")` to this impl method to check the contract at runtime
 ```
 
-**Default methods.** A trait default body is verified once against the trait's contract, generically over `Self` (the default body is parametric in `Self`, §3.6 *Operations on `Self` in a Default Body*). Its monomorphized copies use that result. An open default's override inherits the same contract and must discharge it in its own body. A `final` default fixes both its body and its contract.
+**Default methods.** A trait default body is verified once against the trait's contract, generically over `Self` (the default body is parametric in `Self`, §3.6 *Operations on `Self` in a Default Body*). Its monomorphized copies use that result. An open default's override inherits the same contract and must discharge it in its own body. A `final` default fixes both its body and its contract. The effect row of a default body is checked in the same way: under an impl-chosen `_` the body may perform only the fixed part of the row (§4.15.2, *Default bodies under an impl-chosen `_`*).
 
 **Predicate scope.** A trait-method predicate may use the method's parameters, `self`, `result` (in `@ensures`), `old(...)`, and methods of the trait, of its supertraits, and of the bounds on its type parameters. The purity rules are the same as for function contracts (E1301, E1302).
 
