@@ -2538,7 +2538,7 @@ A function that enters, mutates state, performs an effect, and exits:
 ```json
 {"ts_us":18042,"event":"enter","fn":"parser.write_output","module":"parser","depth":3,"span":{"file":"src/parser.bl","line":142,"col":1},"args":{"path":"out.c"}}
 {"ts_us":18044,"event":"state","fn":"parser.write_output","module":"parser","depth":3,"var":"files_written","op":"assign","value":"1"}
-{"ts_us":18045,"event":"effect","fn":"parser.write_output","module":"parser","depth":3,"effect":"FS.Write","op":"fs.write_file","args":{"path":"out.c"}}
+{"ts_us":18045,"event":"effect","fn":"parser.write_output","module":"parser","depth":3,"effect":"FS.Write","op":"fs.write","args":{"path":"out.c"}}
 {"ts_us":18048,"event":"exit","fn":"parser.write_output","module":"parser","depth":3,"duration_us":6,"return":"()"}
 ```
 
