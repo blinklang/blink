@@ -4,23 +4,8 @@
 // runtime call skips any installed `Process` handler. The compiler looks in the table only when
 // name lookup fails, so a program's own fn with one of these names still compiles and is called.
 
-import typecheck.{check_types}
-import compiler.{compile_to_program}
-import diagnostics.{diag_entries, diag_reset, DiagEntry}
-import embedded_stdlib_registry.{init_embedded_stdlib}
+import removed_fn_test_helpers.{probe, removed_error, assert_machine_row, assert_suggestion_row}
 import compile_test_helpers
-import std.fs
-import std.io
-
-fn probe(path: Str, src: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
-    init_embedded_stdlib()
-    fs.write(path, src).unwrap()
-    diag_reset()
-    let program = compile_to_program(path, 1)
-    check_types(program)
-    let _ = fs.delete(path)
-    program
-}
 
 fn probe_src() -> Str {
     #"fn calls(pid: Int) ! Process, Env {
@@ -40,81 +25,22 @@ fn main() {}
 "#
 }
 
-// The 1-based line of the one source line that holds `marker`.
-fn line_of(src: Str, marker: Str) -> Int ! IO.Print {
-    let lines = src.split("\n")
-    let mut i = 0
-    while i < lines.len() {
-        if lines.get(i).unwrap().contains(marker) { return i + 1 }
-        i = i + 1
-    }
-    io.println("FAIL: probe has no line marked '{marker}'")
-    assert(false)
-    -1
-}
-
-fn all_errors() -> Str {
-    let mut out = ""
-    for d in diag_entries {
-        if d.severity == "error" { out = out.concat("{d.line}:{d.col}: {d.code} {d.message} | help: {d.help} | notes: {d.notes.join(" ; ")}\n") }
-    }
-    out
-}
-
-// The one error on the marked line: E0504 for `name`, at the callee in column `col`.
-fn removed_error(src: Str, marker: Str, name: Str, col: Int) -> DiagEntry ! IO.Print {
-    let line = line_of(src, marker)
-    let mut errs: List[DiagEntry] = []
-    for d in diag_entries {
-        if d.severity == "error" && d.line == line { errs.push(d) }
-    }
-    if errs.len() != 1 { io.println("FAIL: want one error on the {marker} line; errors were:\n{all_errors()}") }
-    assert_eq(errs.len(), 1)
-    let d = errs.get(0).unwrap()
-    assert_eq(d.code, "E0504")
-    assert_eq(d.message, "undefined function `{name}`")
-    assert_eq(d.col, col)
-    d
-}
-
-// A row whose replacement takes the same arguments: the fix rewrites the callee.
-fn assert_machine_row(marker: Str, name: Str, col: Int, phrase: Str, callee: Str, help: Str) ! IO.Print {
-    let d = removed_error(probe_src(), marker, name, col)
-    assert_eq(d.notes, ["`{name}` is not a built-in function; {phrase}"])
-    assert_eq(d.help, help)
-    assert_eq(d.fix_action, "replace with")
-    assert_eq(d.fix_text, callee)
-    assert_eq(d.fix_line, d.line)
-    assert_eq(d.fix_col, col)
-    assert_eq(d.fix_end_col, col + name.byte_len())
-}
-
-// A row whose replacement changes the arguments: the call is a suggestion, never an edit.
-fn assert_suggestion_row(marker: Str, name: Str, col: Int, phrase: Str, call: Str, help: Str) ! IO.Print {
-    let d = removed_error(probe_src(), marker, name, col)
-    assert_eq(d.notes, ["`{name}` is not a built-in function; {phrase}", "call `{call}` in its place"])
-    assert_eq(d.help, help)
-    assert_eq(d.fix_action, "")
-    assert_eq(d.fix_text, "")
-    assert_eq(d.assist_action, "")
-}
-
 let SPAWNS = "child processes go through the `process` handle"
 let SIGNALS = "signals go through the `process` handle"
 let RUN_HELP = "needs `Process.Spawn` in the effect row and returns `Result[ProcessResult, ProcessError]`"
 
 test "each removed process free fn is E0504 with the fix its spec row gives" {
     let _p = probe("build/tc_removed_process_free_fns_src.bl", probe_src())
-    assert_suggestion_row("E_SHELL_EXEC", "shell_exec", 13, SPAWNS, "process.run(\"sh\", [\"-c\", cmd])", "`process.run` {RUN_HELP}")
-    assert_machine_row("E_PROCESS_RUN", "process_run", 13, SPAWNS, "process.run", "`process.run` {RUN_HELP}")
-    assert_suggestion_row("E_PROCESS_RUN_WITH_STDIN", "process_run_with_stdin", 13, SPAWNS, "process.run(cmd, args, stdin: Some(input))", "`process.run` {RUN_HELP}")
-    assert_machine_row("E_PROCESS_SPAWN", "process_spawn", 13, SPAWNS, "process.spawn", "`process.spawn` needs `Process.Spawn` in the effect row and returns `Result[Child, ProcessError]`")
-    assert_suggestion_row("E_PROCESS_PID_WAIT", "process_pid_wait", 13, SPAWNS, "process.wait(child)", "`process.wait` {RUN_HELP}")
+    assert_suggestion_row(probe_src(), "E_SHELL_EXEC", "shell_exec", 13, SPAWNS, "process.run(\"sh\", [\"-c\", cmd])", "`process.run` {RUN_HELP}")
+    assert_machine_row(probe_src(), "E_PROCESS_RUN", "process_run", 13, SPAWNS, "process.run", "`process.run` {RUN_HELP}")
+    assert_suggestion_row(probe_src(), "E_PROCESS_RUN_WITH_STDIN", "process_run_with_stdin", 13, SPAWNS, "process.run(cmd, args, stdin: Some(input))", "`process.run` {RUN_HELP}")
+    assert_machine_row(probe_src(), "E_PROCESS_SPAWN", "process_spawn", 13, SPAWNS, "process.spawn", "`process.spawn` needs `Process.Spawn` in the effect row and returns `Result[Child, ProcessError]`")
+    assert_suggestion_row(probe_src(), "E_PROCESS_PID_WAIT", "process_pid_wait", 13, SPAWNS, "process.wait(child)", "`process.wait` {RUN_HELP}")
     let signal_help = "`process.signal` needs `Process.Signal` in the effect row and returns `Result[(), ProcessError]`"
-    assert_suggestion_row("E_PROCESS_PID_KILL", "process_pid_kill", 13, SIGNALS, "process.signal(child, sig)", signal_help)
-    assert_suggestion_row("E_PROCESS_PID_SEND_SIGNAL", "process_pid_send_signal", 13, SIGNALS, "process.signal(child, sig)", signal_help)
-    assert_machine_row("E_PROCESS_EXEC", "process_exec", 13, SPAWNS, "process.exec", "`process.exec` needs `Process.Spawn` and `Env.Exit` in the effect row and returns `Result[Never, ProcessError]`")
-    assert_machine_row("E_EXIT", "exit", 5, "the program ends through the `env` handle", "env.exit", "`env.exit` needs `Env.Exit` in the effect row")
+    assert_suggestion_row(probe_src(), "E_PROCESS_PID_KILL", "process_pid_kill", 13, SIGNALS, "process.signal(child, sig)", signal_help)
+    assert_suggestion_row(probe_src(), "E_PROCESS_PID_SEND_SIGNAL", "process_pid_send_signal", 13, SIGNALS, "process.signal(child, sig)", signal_help)
+    assert_machine_row(probe_src(), "E_PROCESS_EXEC", "process_exec", 13, SPAWNS, "process.exec", "`process.exec` needs `Process.Spawn` and `Env.Exit` in the effect row and returns `Result[Never, ProcessError]`")
+    assert_machine_row(probe_src(), "E_EXIT", "exit", 5, "the program ends through the `env` handle", "env.exit", "`env.exit` needs `Env.Exit` in the effect row")
 }
 
 // The CLI's signal forwarding was never a language API: it has no row, so the error is plain.

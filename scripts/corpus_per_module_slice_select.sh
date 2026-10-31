@@ -17,17 +17,18 @@
 #       its name says per_module, objcache or obj_cache.
 # "Part of the compiler" is the import closure of src/blinkc_main.bl and
 # src/cli.bl, plus the test helpers that drive it (compile_test_helpers and
-# the cg, lower and cname test helpers). std and the blink.* pseudo-modules
-# count the same, as no second module is built for them. A file that imports
-# only those is one program over the compiler, which the full per-module
-# corpus in ci-release covers; in units it costs several seconds a file.
+# the cg, lower, cname and removed-fn test helpers). std and the blink.*
+# pseudo-modules count the same, as no second module is built for them. A
+# file that imports only those is one program over the compiler, which the
+# full per-module corpus in ci-release covers; in units it costs several
+# seconds a file.
 set -u
 cd "$(dirname "$0")/.." || exit 2
 
 imports_of() { sed -n 's/^import \([a-z_][a-z_0-9]*\).*/\1/p' "$1" | sort -u; }
 
 compiler=$(mktemp)
-queue="blinkc_main cli compile_test_helpers cg_test_helpers lower_test_helpers cname_test_helpers"
+queue="blinkc_main cli compile_test_helpers cg_test_helpers lower_test_helpers cname_test_helpers removed_fn_test_helpers"
 while [ -n "$queue" ]; do
     set -- $queue
     m=$1; shift; queue="$*"
