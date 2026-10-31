@@ -582,6 +582,7 @@ In the structured output (§6.5), this fix carries two edits: the call rewrite a
 | `child.send_signal(sig)` on `Child` | `process.signal(child, sig)` | `Process.Signal` | yes: `Int` becomes `Result[(), ProcessError]` |
 | `process_exec(cmd, args)` | `process.exec(cmd, args)` | `Process.Spawn`, `Env.Exit` | yes: the result becomes `Result[Never, ProcessError]` |
 | `unix_socket_listen(p)`, `unix_socket_accept(l)` | `unix_listen(p)`, `listener.accept()` in `std.net` (§4.4.6) | `Net.Listen` | yes: `Int` becomes a `Result` |
+| `unix_socket_accept_timeout(l, ms)` | `listener.accept_timeout(Duration.ms(ms))` in `std.net` (§4.4.6) | `Net.Listen` | yes: `Int` becomes `Result[UnixConn?, NetError]`; `-1` after the wait ran out becomes `Ok(None)`, and `-1` for a failure becomes `Err` |
 | `unix_socket_connect(p)` | `unix_connect(p)` in `std.net` (§4.4.6) | `Net.Connect` | yes: `Int` becomes `Result[UnixStream, NetError]` |
 | `socket_read_line(s)`, `socket_write(s, x)`, `unix_socket_close(s)` | `stream.read_line()`, `stream.write(x)`, `stream.close()` on `UnixStream`; `conn.read_line()`, `conn.write(x)`, `conn.close()` on `UnixConn` (§4.4.6) | `Net.Connect` on `UnixStream`, `Net.Listen` on `UnixConn` | yes: reads and writes return a `Result` |
 | `io.write(s)` | `io.print_raw(s)` | `IO.Print` | no |
@@ -601,7 +602,7 @@ error[UndefinedFunction]: undefined function `read_file`
   = help: `fs.read` needs `FS.Read` in the effect row and returns `Result[Str, FsError]`
 ```
 
-In the structured output (§6.5), the fix carries two edits: the call rewrite and the addition of the effect to the enclosing row. Both are machine-applicable when the replacement takes the same arguments. The rewrites for `time_ms`, `file_exists`, `is_dir`, `file_mtime`, `arg_count`, `get_arg` and `sqlite_handler` change the shape of the code, so for these names the fix is a suggestion and only the row edit is machine-applicable. (Panel vote on the `io`, `std.db_sqlite` and handle-operation rows and the fourth column: 6-0. See [Duplicate APIs rationale](../decisions/duplicate-apis.md).)
+In the structured output (§6.5), the fix carries two edits: the call rewrite and the addition of the effect to the enclosing row. Both are machine-applicable when the replacement takes the same arguments. The rewrites for `time_ms`, `file_exists`, `is_dir`, `file_mtime`, `arg_count`, `get_arg`, `sqlite_handler` and `unix_socket_accept_timeout` change the shape of the code, so for these names the fix is a suggestion and only the row edit is machine-applicable. (Panel vote on the `io`, `std.db_sqlite` and handle-operation rows and the fourth column: 6-0. See [Duplicate APIs rationale](../decisions/duplicate-apis.md).) For `unix_socket_accept_timeout`, the `Int` file descriptor becomes the `UnixListener` that is the receiver, and a check of the result for `-1` becomes a `match` on `Ok(None)`. The help of that fix says so: `-1` after the wait ran out is now `Ok(None)`, so that case needs no `Err` arm.
 
 **Rows for methods of `Child`.** The E0505 help for a handle op finds `child.wait()` by its name, so no row lists it. The help cannot find `child.kill(sig)` or `child.send_signal(sig)`, because the op is named `signal`. Rows keyed by the receiver type `Child` cover them (§3.2 *Removed methods*). The released `kill` method used the signal `0` to mean `SIGKILL`. A literal `0` argument to `kill` becomes `SIGKILL`, and a literal argument other than `0` stays as it is. A `kill` argument that is not a literal gets a suggestion, not a machine-applicable fix, because the argument can be `0`. (Panel vote: 6-0. See [One Call Form for Handle Operations rationale](../decisions/handle-op-call-form.md).)
 
@@ -746,6 +747,7 @@ type NetError {
 - `Os(op, code)` reports an OS error from a socket call. `op` names the call (for example `"recvfrom"`), and `code` is the `Errno` (§9.1.3.3), so a caller can match on the errno value. `IoError` is not used for errno failures.
 - `InvalidAddr(input)` reports a string that `SockAddr.parse` (§4.4.6) cannot read. `input` is the string as given.
 - An `EAGAIN` or `EWOULDBLOCK` after a socket timeout (`set_timeout`) is `Timeout`, not `Os`.
+- A wait that one call takes as an argument (`UnixListener.accept_timeout`, §4.4.6) ends in `Ok(None)`, not in `Timeout`.
 
 HTTP error status codes (4xx, 5xx) are **not** `NetError` variants — they are successful responses with non-2xx status codes. The application decides what constitutes an error via pattern matching on `response.status`.
 
@@ -1376,20 +1378,25 @@ fn echo_once() -> Result[(), NetError] ! Net.Listen, Net.Connect {
 pub fn unix_listen(path: Str) -> Result[UnixListener, NetError] ! Net.Listen
 pub fn unix_connect(path: Str) -> Result[UnixStream, NetError] ! Net.Connect
 
+pub fn unix_peer_uid_supported() -> Bool
+
 pub trait UnixListenerOps {
     fn accept(self) -> Result[UnixConn, NetError] ! Net.Listen
+    fn accept_timeout(self, wait: Duration) -> Result[UnixConn?, NetError] ! Net.Listen
     fn close(self) ! Net.Listen
 }
 
 pub trait UnixConnOps {
     fn read_line(self) -> Result[Str?, NetError] ! Net.Listen
     fn write(self, data: Str) -> Result[(), NetError] ! Net.Listen
+    fn peer_uid(self) -> Result[Int, NetError] ! Net.Listen
     fn close(self) ! Net.Listen
 }
 
 pub trait UnixStreamOps {
     fn read_line(self) -> Result[Str?, NetError] ! Net.Connect
     fn write(self, data: Str) -> Result[(), NetError] ! Net.Connect
+    fn peer_uid(self) -> Result[Int, NetError] ! Net.Connect
     fn close(self) ! Net.Connect
 }
 ```
@@ -1399,6 +1406,7 @@ pub trait UnixStreamOps {
 - `accept` blocks until a client connects, then returns the connection to that client. `accept` returns a `UnixConn`; `unix_connect` returns a `UnixStream`. The two types have the same methods and different rows (see below).
 - `read_line` returns the next line without its line terminator, or `None` at end of stream.
 - `write` sends all of `data` or returns an error.
+- `accept_timeout` is `accept` with a limit on the wait (see *Accept with a wait*). `peer_uid` and `unix_peer_uid_supported` give the user id of the peer (see *The peer user id*). A `UnixListener` has no `peer_uid`: a listener has no peer.
 
 **Rows of socket methods.** Rule 2 (§4.4) requires a row on every method of an open socket. The row of a method on an open socket follows this rule (panel deliberation [`open-socket-rows`](../decisions/open-socket-rows.md)):
 
@@ -1415,9 +1423,9 @@ The second sentence is why `accept` and `unix_connect` return different types. A
 | `UdpSocket` | `udp_bind` | `recv_from` | `Net.Listen` |
 | `UdpSocket` | `udp_bind` | `send_to` | `Net.Connect` (the peer address is an argument) |
 | `UdpSocket` | `udp_bind` | `local_addr`, `set_timeout`, `close` | `Net.Listen` |
-| `UnixListener` | `unix_listen` | `accept`, `close` | `Net.Listen` |
-| `UnixConn` | `UnixListener.accept` | `read_line`, `write`, `close` | `Net.Listen` |
-| `UnixStream` | `unix_connect` | `read_line`, `write`, `close` | `Net.Connect` |
+| `UnixListener` | `unix_listen` | `accept`, `accept_timeout`, `close` | `Net.Listen` |
+| `UnixConn` | `UnixListener.accept`, `UnixListener.accept_timeout` | `read_line`, `write`, `peer_uid`, `close` | `Net.Listen` |
+| `UnixStream` | `unix_connect` | `read_line`, `write`, `peer_uid`, `close` | `Net.Connect` |
 
 The `close` rows follow one rule for every fd: an op on an existing fd takes the row of the call that made it (§9.1 *fd-Table and Process-Control Calls — Which Row*). A raw `close` on a file fd takes `FS.Read` or `FS.Write`, not `! ()`.
 
@@ -1462,6 +1470,107 @@ fn ask(path: Str, question: Str) -> Result[Str?, NetError] ! Net.Connect {
     Ok(reply)
 }
 ```
+
+**Accept with a wait.** Decided by panel deliberation [`unix-accept-timeout-and-peer-uid`](../decisions/unix-accept-timeout-and-peer-uid.md). `accept_timeout(wait)` is `accept` with a limit on the time it waits. `wait` is a `Duration` (§3.2.3), so `accept_timeout(500)` is a type error and not 500 of an unknown unit.
+
+- A client connects before `wait` ends: `Ok(Some(conn))`. `conn` is a `UnixConn`.
+- No client connects before `wait` ends: `Ok(None)`. `Ok(None)` means "no client came in this time", and it means nothing else. Every fault is an `Err`.
+- `Duration.ms(0)` checks once and does not wait. It is the only wait that does not wait. A wait that is more than zero and less than 1 ms is 1 ms, so a call never waits less than it was asked to.
+- A negative `wait` gives `Err(NetError.Os(op: "accept", code: EINVAL))`. To wait with no limit, call `accept`.
+- A signal that interrupts the wait (`EINTR`) does not end it. The call waits again for the time that is left.
+- A closed listener gives `Err(NetError.Os(op: "accept", code: EBADF))`, as `accept` does.
+- The call does not block after `wait` ends.
+- `UnixListener` has no `set_timeout`. `accept_timeout` is the only way to limit an accept.
+
+```blink
+import std.net.{NetError, UnixListener}
+import std.time.{Duration}
+
+fn poll_once(l: UnixListener) -> Result[(), NetError] ! Net.Listen {
+    let a = l.accept_timeout(Duration.ms(500))     // Ok(Some(conn)) if a client comes in 500 ms, else Ok(None)
+    let b = l.accept_timeout(Duration.ms(0))       // one check: Ok(Some(conn)) if a client waits now, else Ok(None)
+    let c = l.accept_timeout(Duration.nanos(1))    // waits 1 ms, not 0
+    let d = l.accept_timeout(Duration.ms(-5))      // Err(NetError.Os(op: "accept", code: EINVAL))
+    l.close()
+    let e = l.accept_timeout(Duration.ms(500))     // Err(NetError.Os(op: "accept", code: EBADF))
+    Ok(())
+}
+```
+
+A caller must deal with the `None` case before it can use the connection. The `match` form does this:
+
+```blink
+import std.net.{NetError, UnixConn, UnixListener}
+import std.time.{Duration}
+
+fn next_client(l: UnixListener) -> Result[UnixConn?, NetError] ! Net.Listen {
+    match l.accept_timeout(Duration.ms(500))? {
+        Some(conn) => Ok(Some(conn))
+        None => Ok(None)              // no client in 500 ms: not an error
+    }
+}
+```
+
+The result is `UnixConn?` and not `UnixConn`, so the `?` operator cannot pass an idle tick up as an error. A call that skips the `None` case does not compile. The help line of the type error says what `None` means:
+
+```
+error[TypeError]: mismatched types
+ --> daemon.bl:9:11
+   |
+ 8 |     let c = l.accept_timeout(wait)?
+ 9 |     serve(c)
+   |           ^ expected `UnixConn`, found `UnixConn?`
+   |
+   = help: `accept_timeout` gives `None` when the time runs out; match on it
+```
+
+**`Ok(None)` and `Timeout`.** A wait that one call takes as an argument ends in `Ok(None)`. The caller asked for "a client or nothing", so "nothing" is an answer, as `None` from `read_line` is an answer. A time limit that `set_timeout` puts on a socket stays on the socket and changes every later call. An `EAGAIN` or `EWOULDBLOCK` after that limit is `Err(NetError.Timeout)` (§4.4.1), as that section says. A Unix-domain socket has no `set_timeout`, so no method in this section gives `Timeout`.
+
+**The peer user id.** `peer_uid` returns the user id that the OS reports for the process at the other end of the connection. The id is not negative.
+
+- Success: `Ok(uid)`.
+- The OS call fails: `Err(NetError.Os(op: "peer_uid", code))`, with the errno of the failure. A closed socket gives `EBADF`.
+- The host has no call that gives the peer uid: `Err(NetError.Os(op: "peer_uid", code: ENOTSUP))`.
+- `op` is `"peer_uid"` on every host. A match on `op` does not depend on the host.
+
+`unix_peer_uid_supported()` returns `true` when the host has a call that gives the peer uid, and `false` when it has none. It is a fact about the host. It has no row, it needs no socket, and its answer does not change while the program runs. `peer_uid` gives `ENOTSUP` if and only if `unix_peer_uid_supported()` is `false`. So on a host where it is `false`, every `peer_uid` call gives `ENOTSUP`, also on a closed socket. `true` says only that the host can name the peer. It does not say that the peer is allowed.
+
+```blink
+import std.net.{unix_peer_uid_supported}
+
+fn main() ! IO.Print {
+    io.println("peer check: {unix_peer_uid_supported()}")    // peer check: true, on a host with a peer-uid call
+}
+```
+
+The result of `peer_uid` is `Result[Int, NetError]` and not `Result[Int?, NetError]`. A host with no call gives an `Err`, so the short forms refuse the peer there: `conn.peer_uid()?` passes the error up, and `Err(_) => false` refuses. To let a peer in on such a host, a caller must write that out, and the probe is the way to ask:
+
+```blink
+import std.net.{NetError, UnixConn, UnixListener, unix_peer_uid_supported}
+import std.time.{Duration}
+
+/// A client of the user `own` that comes in `wait`, or `None`. A client of another user is closed unread.
+fn accept_own(l: UnixListener, wait: Duration, own: Int) -> Result[UnixConn?, NetError] ! Net.Listen {
+    let conn = match l.accept_timeout(wait)? {
+        Some(c) => c
+        None => return Ok(None)       // no client in `wait`
+    }
+    if !unix_peer_uid_supported() {
+        return Ok(Some(conn))         // this host cannot name the peer: the caller guards in another way
+    }
+    let allowed = match conn.peer_uid() {
+        Ok(uid) => uid == own
+        Err(_) => false               // the check failed: refuse the peer
+    }
+    if !allowed {
+        conn.close()
+        return Ok(None)
+    }
+    Ok(Some(conn))
+}
+```
+
+A client reads the uid of the server in the same way, with `stream.peer_uid()` on a `UnixStream`. It needs `Net.Connect` alone.
 
 #### 4.4.7 Rand Operations
 
