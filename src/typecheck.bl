@@ -2269,7 +2269,7 @@ fn tc_report_handler_coverage(at: Int, want: Int, got: Int) ! TypeCheck.Report, 
 
 // The operations a handler of `eff` handles, in the order they are declared: a user effect's
 // from its declaration, and FS's, IO's and Time's from their tables. [] for an effect whose
-// operations are in no table (Env, IO.Eprint), so the report then names none.
+// operations are in no table (Env), so the report then names none.
 fn tc_handler_op_names(eff: Str) -> List[Str] {
     let root = tc_handler_effect_root(eff)
     let sub = if root == eff { "" } else { eff.byte_slice(root.byte_len() + 1, eff.byte_len()) }
@@ -8333,8 +8333,8 @@ fn tc_check_builtin_handler_clause(eff_name: Str, m: Int) ! TypeCheck.Resolve, T
             "the IO.Read operations are {io_read_ops().join(", ")} (§4.4.9)")
         return
     }
-    // A name in no row (eprint, eprint_no_nl, and any other) stays unchecked until the spec
-    // gives eprint a sub-effect.
+    // A name in no row (print_raw, eprint_raw, and any other) stays unchecked: no handler can
+    // write the raw operations yet.
     if sub == "" { return }
     if eff_name != "IO" && eff_name != "IO.{sub}" {
         diag_error_at("UnresolvedMethod", UNRESOLVED_METHOD, "effect `{eff_name}` has no operation `{op}`", m,
@@ -16075,8 +16075,8 @@ fn builtin_op_list_hint(root: Str) -> Str {
 // IO.Read rows are in the order the IO vtable lays out their slots. read_bytes is the primitive
 // and the one operation whose count the perform checks. read_line and read_all are derived:
 // std.io_read holds the spec's body of each under the operation's own name, and it runs over
-// the read_bytes of the handler that omits it. The rows leave out print_raw and print_raw_bytes,
-// which no handler can write yet, and eprint and eprint_no_nl, which IO.Eprint handles.
+// the read_bytes of the handler that omits it. The rows leave out print_raw, print_raw_bytes
+// and eprint_raw, which no handler can write yet.
 pub type IoOpRow {
     op: Str
     sub_effect: Str
@@ -16087,6 +16087,8 @@ pub fn io_op_rows() -> List[IoOpRow] {
     [
         IoOpRow { op: "print", sub_effect: "Print", primitive: true },
         IoOpRow { op: "print_no_nl", sub_effect: "Print", primitive: true },
+        IoOpRow { op: "eprint", sub_effect: "Eprint", primitive: true },
+        IoOpRow { op: "eprint_no_nl", sub_effect: "Eprint", primitive: true },
         IoOpRow { op: "log", sub_effect: "Log", primitive: true },
         IoOpRow { op: IO_READ_PRIMITIVE, sub_effect: "Read", primitive: true },
         IoOpRow { op: "read_line", sub_effect: "Read", primitive: false },
@@ -16135,15 +16137,14 @@ fn builtin_handler_op_key(root: Str, op: Str) -> Str {
 }
 
 // The signature of a handler operation of a builtin root, or -1 for a name the spec does not
-// give that root. io.eprint is not interceptable, so eprint is no operation, and a caller
-// name such as println is not one either. Registered on first use, so only a program that
+// give that root. A caller name such as println is no operation. Registered on first use, so only a program that
 // delegates a Time operation or omits one from a Time handler looks up Instant and Duration.
 fn builtin_handler_op_sig(root: Str, op: Str) -> Int ! Diag.Report {
     let key = builtin_handler_op_key(root, op)
     let found = lookup_fnsig(key)
     if found != -1 { return found }
     let io_sub = if root == "IO" { io_op_sub_effect(op) } else { "" }
-    if io_sub == "Print" || io_sub == "Log" {
+    if io_sub == "Print" || io_sub == "Eprint" || io_sub == "Log" {
         register_intrinsic_fn_sig(key, [TYPE_STR], TYPE_VOID)
     } else if root == "Time" && op == "read" {
         register_intrinsic_fn_sig(key, [], runtime_instant_tid())
@@ -21813,7 +21814,7 @@ fn builtin_effect_children(root: Str) -> Option[List[Str]] {
         "FS" => Some(["Read", "Write", "Delete", "Watch"])
         "Net" => Some(["Connect", "Listen", "DNS"])
         "DB" => Some(["Read", "Write"])
-        "IO" => Some(["Print", "Log", "Read"])
+        "IO" => Some(["Print", "Eprint", "Log", "Read"])
         "Env" => Some(["Read", "Write", "Exit"])
         "Time" => Some(["Read", "Sleep"])
         "Rand" => Some([])
@@ -36105,9 +36106,7 @@ pub fn impl_is_element_agnostic(im: Int) -> Int {
 // `with` block by the effect each item installs. A closure or a handler-literal op body runs
 // with the row of the fn that encloses it.
 
-// Only a user effect's children are known here, from its declaration. A builtin parent must
-// be held as written: the children the runtime routes through a builtin parent (IO.Eprint)
-// are not the §4.3 list in builtin_effect_children, and a copy of either would drift.
+// A user effect's children, from its declaration.
 fn tc_er_user_children(program: Int, root: Str) -> List[Str] {
     let mut out: List[Str] = []
     let eds = node_args(program)
@@ -36135,7 +36134,10 @@ fn tc_er_satisfied(program: Int, held: List[Str], req: Str) -> Bool {
         if h == req || req.starts_with("{h}.") { return true }
     }
     if req.contains(".") { return false }
-    let kids = tc_er_user_children(program, req)
+    let kids = match builtin_effect_children(req) {
+        Some(names) => names
+        None => tc_er_user_children(program, req)
+    }
     if kids.len() == 0 { return false }
     for kid in kids {
         if !tc_er_satisfied(program, held, "{req}.{kid}") { return false }

@@ -1,0 +1,120 @@
+// `IO.Eprint` is the stderr sub-effect of `IO` (sections/04_effects.md §4.3, §4.4 *`IO.Eprint`
+// is the stderr effect*). A row may name it, `! IO` grants it, and its siblings do not. Holding
+// every child of `IO` grants `IO`. A handler of `IO.Eprint` writes `eprint` and `eprint_no_nl`,
+// and a handler of another sub-effect may not.
+
+import compile_test_helpers
+import std.testing.{capture_eprint}
+
+fn warn(msg: Str) ! IO.Eprint {
+    io.eprintln(msg)
+}
+
+fn warn_twice(msg: Str) ! IO {
+    warn(msg)
+    io.eprint(msg)
+}
+
+test "a row may name IO.Eprint, and an IO.Eprint handler receives the call" {
+    let got: List[Str] = []
+    with capture_eprint(got) {
+        warn_twice("x")
+    }
+    assert_eq(got, ["x", "x"])
+}
+
+test "a row that names IO.Eprint compiles clean" {
+    let src = #"fn warn(msg: Str) ! IO.Eprint {
+    io.eprintln(msg)
+}
+fn main() {
+    warn("x")
+}
+"#
+    let out = compile_test_helpers.compile_and_capture(src, "io_eprint_row_known")
+    compile_test_helpers.expect_compiles_clean(out, "IO.Eprint is a known sub-effect")
+}
+
+test "IO.Print and IO.Log do not grant IO.Eprint" {
+    let src = #"fn warn(msg: Str) ! IO.Eprint {
+    io.eprintln(msg)
+}
+fn quiet() ! IO.Print, IO.Log {
+    warn("x")
+}
+fn main() {
+    quiet()
+}
+"#
+    let out = compile_test_helpers.compile_and_capture(src, "io_eprint_sibling_no_grant")
+    compile_test_helpers.expect_error(out, "E0500", "a sibling sub-effect does not grant IO.Eprint")
+    compile_test_helpers.expect_contains(out, "needs effect `IO.Eprint`, which `quiet` does not declare", "the diagnostic names IO.Eprint")
+}
+
+test "IO grants IO.Eprint" {
+    let src = #"fn warn(msg: Str) ! IO.Eprint {
+    io.eprintln(msg)
+}
+fn loud() ! IO {
+    warn("x")
+}
+fn main() {
+    loud()
+}
+"#
+    let out = compile_test_helpers.compile_and_capture(src, "io_eprint_parent_grants")
+    compile_test_helpers.expect_compiles_clean(out, "the parent grants IO.Eprint")
+}
+
+test "holding every child of IO, IO.Eprint among them, grants IO" {
+    let src = #"fn all_io() ! IO {
+    io.println("x")
+}
+fn each_child() ! IO.Print, IO.Eprint, IO.Log, IO.Read {
+    all_io()
+}
+fn missing_eprint() ! IO.Print, IO.Log, IO.Read {
+    all_io()
+}
+fn main() {
+    each_child()
+    missing_eprint()
+}
+"#
+    let out = compile_test_helpers.compile_and_capture(src, "io_eprint_children_grant_parent")
+    compile_test_helpers.expect_error(out, "E0500", "three of the four children do not grant IO")
+    compile_test_helpers.expect_contains(out, "which `missing_eprint` does not declare", "the row with no IO.Eprint fails")
+    if out.contains("which `each_child` does not declare") {
+        io.println("FAIL: every child of IO did not grant IO: {out}")
+        assert(false)
+    }
+}
+
+test "an IO.Print handler may not write eprint" {
+    let src = #"fn main() {
+    let _h = handler IO.Print { fn eprint(_msg: Str) {} }
+}
+"#
+    let out = compile_test_helpers.compile_and_capture(src, "io_eprint_clause_in_print_handler")
+    compile_test_helpers.expect_error(out, "E0505", "eprint is no operation of IO.Print")
+    compile_test_helpers.expect_contains(out, "`eprint` is an operation of IO.Eprint", "the help names IO.Eprint")
+}
+
+test "an IO.Eprint handler may not write print" {
+    let src = #"fn main() {
+    let _h = handler IO.Eprint { fn print(_msg: Str) {} }
+}
+"#
+    let out = compile_test_helpers.compile_and_capture(src, "io_eprint_handler_print_clause")
+    compile_test_helpers.expect_error(out, "E0505", "print is no operation of IO.Eprint")
+    compile_test_helpers.expect_contains(out, "effect `IO.Eprint` has no operation `print`", "the message names the clause")
+}
+
+test "an eprint clause has the signature of io.eprint" {
+    let src = #"fn main() {
+    let _h = handler IO.Eprint { fn eprint_no_nl(_msg: Int) {} }
+}
+"#
+    let out = compile_test_helpers.compile_and_capture(src, "io_eprint_clause_signature")
+    compile_test_helpers.expect_contains(out, "IO handler clause `eprint_no_nl` parameter 1 is Int", "the clause takes Str")
+}
