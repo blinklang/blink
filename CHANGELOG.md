@@ -97,6 +97,7 @@ Single source of truth for release history. `blink llms` and `blink llms --full`
 - **A `pub fn range_bounds` of your own no longer breaks `rand.int(0..3)`.** The std modules read a range through an intrinsic of that name, and a pub user fn of the same name was reported there as not imported.
 - **`@derive(Hash)` or `@derive(Ord)` over a `Range` field is now `NonDerivableTrait` (E1401).** A range is never Hash or Ord, and the derive got through the check and stopped the build with an ICE.
 - **A call through a closure builds on the per-module path when its result is an `Option` of a sized integer type.** `xs.into_iter().count()` with `xs: List[U8]` failed in the C compiler on `blink_Option_u8`, because the unit never declared that type. Each call now declares the types of its arguments and result.
+- **C from `blinkc` that includes `bootstrap/runtime.h` links when a closure leaves `with arena`.** The promotion reports each capture to the trace runtime, which `runtime.h` did not include, so `cc -Ibootstrap` failed with an undefined `blink_trace_arena_capture`. `blink build` and `blink run` were not affected.
 
 ## Breaking Changes (v0.58.0)
 

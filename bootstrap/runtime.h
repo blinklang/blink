@@ -14,5 +14,6 @@
 #include "runtime_sqlite.h"
 #include "runtime_stdio.h"
 #include "runtime_term.h"
+#include "runtime_trace.h"
 
 #endif /* BLINK_RUNTIME_H */
