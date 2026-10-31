@@ -464,6 +464,37 @@ if command -v systemd-run >/dev/null 2>&1 &&
     else
         flunk "oom_score_adj chain (run, nested run, --own-cgroup reporter and command, --child reporter and command: [$out]: $(cat "$WORK/err"))"
     fi
+    out=$(gate -- 'for m in BLINK_CHILD_CAP_MODE=prlimit BLINK_CHILD_CAP_MODE=ulimit BLINK_CHILD_CAP=0; do
+            env "$m" "$CAPPED" --child bash '"$WORK/adj_probe"'
+        done')
+    n=0
+    while read -r rep cmd; do
+        [ -n "${cmd:-}" ] && [ "$rep" -lt "$cmd" ] && n=$((n + 1))
+    done <<< "$out"
+    if [ "$n" = 3 ]; then
+        pass "a --child with no cgroup of its own (prlimit, ulimit, BLINK_CHILD_CAP=0) scores its command above the script that reports"
+    else
+        flunk "--child reporter and command scores, prlimit, ulimit, BLINK_CHILD_CAP=0: [$(echo $out)]: $(cat "$WORK/err")"
+    fi
+
+    # A scope that stays busy through the retry budget falls back with a line
+    # that says so. The script is in gate/ by then, so the cleanup after a cap
+    # must end what is left there, not in the empty scope root.
+    printf '%s' 'sleep 300 > /dev/null 2>&1 & echo "$!"
+        x=$(head -c 512M /dev/zero | tr "\0" a)' > "$WORK/busy_body"
+    out=$(run timeout 60 systemd-run --user --scope -q --collect --expand-environment=no -p Delegate=yes -p MemoryMax=64M \
+        -p MemorySwapMax=0 -p TasksMax=64 -p OOMPolicy=continue env BLINK_CHILD_CAP_MODE=cgroup \
+        bash -c 'sleep 3 > /dev/null 2>&1 & exec "$1" --inner bash "$2"' _ "$CAPPED" "$WORK/busy_body" 2> "$WORK/err")
+    rc=$?
+    left=${out%%$'\n'*}
+    if [ -n "$left" ] && alive "$left"; then
+        flunk "a busy scope's fallback left a process of the gate alive after the run's cap (rc=$rc out=[$out]: $(cat "$WORK/err"))"
+        kill "$left" 2>/dev/null
+    elif [ "$rc" = 137 ] && [ -n "$left" ] && grep -q '^capped.sh: the scope stayed busy (EBUSY) for the whole retry budget' "$WORK/err"; then
+        pass "a scope busy through the retry budget falls back with one line, and a cap still ends the gate's leftover processes"
+    else
+        flunk "a busy scope at setup (rc=$rc out=[$out]: $(cat "$WORK/err"))"
+    fi
 
     # The ways that give no cgroup run the command in place, without
     # BLINK_OWN_CGROUP even when the caller's env has it, and print why.

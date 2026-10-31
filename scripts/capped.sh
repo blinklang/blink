@@ -536,12 +536,16 @@ if [ "${1:-}" = --inner ]; then
     IFS=: read -r _ _ cg < /proc/self/cgroup
     dir=/sys/fs/cgroup$cg
     leaf=$dir
+    # Where the gate's own processes are. It is not always the leaf: after the
+    # move, a fallback keeps no child cgroups but the processes stay in gate/.
+    home=$dir
     # A delegated scope holds the gate in its leaf gate/ and each child in a
     # cgroup of its own under kids/. A cgroup that hands controllers to its
     # children may hold no process, so this script moves into gate/ first.
     if [ "${BLINK_CHILD_CAP_MODE:-}" = cgroup ]; then
         if mkdir -p "$dir/gate" "$dir/kids" &&
             echo 0 > "$dir/gate/cgroup.procs" &&
+            home=$dir/gate &&
             enable_scope &&
             echo "+memory +pids" > "$dir/kids/cgroup.subtree_control"; then
             leaf=$dir/gate
@@ -565,8 +569,8 @@ if [ "${1:-}" = --inner ]; then
     own_events events "$dir" pids.events
     read_event forks "$events" max
     # Before Linux 6.13, pids.events counts a refused fork in the forker's
-    # cgroup, and the gate's processes are in its leaf.
-    [ -r "$dir/pids.events.local" ] || read_event forks "$leaf/pids.events" max
+    # cgroup, the one that holds the gate's processes.
+    [ -r "$dir/pids.events.local" ] || read_event forks "$home/pids.events" max
     if [ "$own_oom" != 0 ] && [ "$leaf" = "$dir" ]; then
         notice "the run hit its memory cap (MemoryMax=$mem) and the OOM killer killed $oom of its processes; exit $rc"
     elif [ "$own_oom" != 0 ]; then
@@ -579,7 +583,7 @@ if [ "${1:-}" = --inner ]; then
     fi
     # A runaway leaves children that would hold the scope open; end them.
     if [ "$own_oom" != 0 ] || [ "$gate_oom" != 0 ] || [ "$forks" != 0 ]; then
-        end_procs "$leaf" "$$"
+        end_procs "$home" "$$"
         [ -w "$dir/kids/cgroup.kill" ] && echo 1 > "$dir/kids/cgroup.kill"
     fi
     exit "$rc"
