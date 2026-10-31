@@ -440,6 +440,31 @@ if command -v systemd-run >/dev/null 2>&1 &&
         flunk "--own-cgroup with its own cap (out=[$out]: $(cat "$WORK/err"))"
     fi
 
+    # At a cap the kernel can kill a second process before the first victim's
+    # memory is free, so each script that reports must score below what it
+    # runs. task ci runs these cases in a gate run of its own, so the check
+    # holds at that depth: a run in a run, then --own-cgroup and --child in it.
+    # The probe reads the score of the capped.sh that reports, past the
+    # timeout that --child puts between it and the command.
+    printf '%s' 'p=$PPID
+        read -r c < /proc/$p/comm
+        while [ "$c" = timeout ]; do
+            read -r st < /proc/$p/stat; set -- ${st##*) }; p=$2
+            read -r c < /proc/$p/comm
+        done
+        read -r a < /proc/$p/oom_score_adj; read -r b < /proc/self/oom_score_adj; echo "$a $b"' > "$WORK/adj_probe"
+    printf '%s' 'read -r r < /proc/$PPID/oom_score_adj
+        echo "$r $("$CAPPED" --own-cgroup bash "$1") $("$CAPPED" --child bash "$1")"' > "$WORK/adj_inner"
+    out=$(gate -- 'read -r r < /proc/$PPID/oom_score_adj
+        echo "$r $(env -u BLINK_GATE_SCOPE -u BLINK_CHILD_CAP_MODE -u BLINK_CHILD_CGROUP -u BLINK_CHILD_CAPPED "$CAPPED" bash '"$WORK/adj_inner $WORK/adj_probe"')"')
+    read -r outer inner own_rep own_cmd kid_rep kid_cmd <<< "$out"
+    if [ -n "${kid_cmd:-}" ] && [ "$outer" -lt "$inner" ] && [ "$inner" -lt "$own_rep" ] && [ "$own_rep" -lt "$own_cmd" ] &&
+        [ "$inner" -lt "$kid_rep" ] && [ "$kid_rep" -lt "$kid_cmd" ]; then
+        pass "in a run in a run, --own-cgroup and --child each score their command above the script that reports"
+    else
+        flunk "oom_score_adj chain (run, nested run, --own-cgroup reporter and command, --child reporter and command: [$out]: $(cat "$WORK/err"))"
+    fi
+
     # The ways that give no cgroup run the command in place, without
     # BLINK_OWN_CGROUP even when the caller's env has it, and print why.
     own_where='"$CAPPED" --own-cgroup bash -c '\''echo "$(cut -d: -f3 /proc/self/cgroup) ${BLINK_OWN_CGROUP:-unset}"'\'''

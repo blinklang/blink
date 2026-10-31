@@ -72,6 +72,20 @@ child_kill_after=${BLINK_CHILD_KILL_AFTER:-10}
 
 notice() { echo "capped.sh: $*" >&2; }
 
+# score_up: sets up to a prefix that runs a command with an oom_score_adj
+# half way from this script's to 1000. At a memory cap the kernel can kill a
+# second process before the first victim's memory is free; the higher score
+# makes that a process of the command, never the script that still has to
+# write the report. Half way, not a fixed step, keeps every nested level (a
+# run in a run, then --own-cgroup or --child in it) above its own reporter.
+score_up() {
+    local adj
+    up=()
+    { read -r adj < /proc/self/oom_score_adj; } 2>/dev/null || return 0
+    case "$adj" in '' | *[!0-9-]*) return 0 ;; esac
+    up=("$BASH" -c 'echo "$1" 2>/dev/null > /proc/self/oom_score_adj; shift; exec "$@"' _ $(((adj + 1001) / 2)))
+}
+
 # Only builtins below, and each sets a variable, not a $( ): after the task
 # cap fills, a fork can fail, and bash then ends the script with no report.
 read_event() {
@@ -356,6 +370,7 @@ run_child() {
         mode=$BLINK_CHILD_CAP_MODE
     fi
     export BLINK_CHILD_CAPPED=1
+    score_up
 
     pid=
     kid=
@@ -377,28 +392,28 @@ run_child() {
                 read_event gate_forks "$dir/pids.events.local" max
                 # The subshell moves itself, then execs; this script stays in
                 # the gate's cgroup, so the cap's OOM kill never picks it.
-                launch "$BASH" -c 'echo 0 2>/dev/null > "$1/cgroup.procs" ||
+                launch ${up[@]+"${up[@]}"} "$BASH" -c 'echo 0 2>/dev/null > "$1/cgroup.procs" ||
                     echo "capped.sh: could not move this child into its cgroup, so it runs uncapped" >&2
                     shift; exec "$@"' _ "$kid" ${tl[@]+"${tl[@]}"} "$@"
             else
                 notice "could not make a cgroup for this child in $dir/kids, so it runs uncapped"
                 rmdir "$kid" 2>/dev/null
                 kid=
-                launch ${tl[@]+"${tl[@]}"} "$@"
+                launch ${up[@]+"${up[@]}"} ${tl[@]+"${tl[@]}"} "$@"
             fi
             ;;
         prlimit | ulimit)
             kib=$(size_kib "$child_mem")
             if [ -z "$kib" ]; then
-                launch ${tl[@]+"${tl[@]}"} "$@"
+                launch ${up[@]+"${up[@]}"} ${tl[@]+"${tl[@]}"} "$@"
             elif [ "$mode" = prlimit ]; then
-                launch prlimit --as=$((kib * 1024)) -- ${tl[@]+"${tl[@]}"} "$@"
+                launch ${up[@]+"${up[@]}"} prlimit --as=$((kib * 1024)) -- ${tl[@]+"${tl[@]}"} "$@"
             else
-                launch "$BASH" -c 'ulimit -v "$1" 2>/dev/null; shift; exec "$@"' _ "$kib" ${tl[@]+"${tl[@]}"} "$@"
+                launch ${up[@]+"${up[@]}"} "$BASH" -c 'ulimit -v "$1" 2>/dev/null; shift; exec "$@"' _ "$kib" ${tl[@]+"${tl[@]}"} "$@"
             fi
             ;;
         *)
-            launch ${tl[@]+"${tl[@]}"} "$@"
+            launch ${up[@]+"${up[@]}"} ${tl[@]+"${tl[@]}"} "$@"
             ;;
     esac
     trap - HUP INT TERM
@@ -448,12 +463,13 @@ run_own() {
     fi
     own_events events "$dir" memory.events
     read_event run_oom0 "$events" oom
+    score_up
     trap 'stop_child HUP' HUP
     trap 'stop_child INT' INT
     trap 'stop_child TERM' TERM
     # The subshell moves itself, then execs, so nothing but the command is in
     # the cgroup; this script stays in the gate's cgroup.
-    launch "$BASH" -c 'if echo 0 2>/dev/null > "$1/cgroup.procs"; then
+    launch ${up[@]+"${up[@]}"} "$BASH" -c 'if echo 0 2>/dev/null > "$1/cgroup.procs"; then
             export BLINK_OWN_CGROUP=1
         else
             echo "capped.sh: ${2##*/} gets no cgroup of its own: could not move it into $1" >&2
@@ -510,15 +526,8 @@ if [ "${1:-}" = --inner ]; then
             child_notice
         fi
     fi
-    # At the cap the kernel can kill a second process before the first
-    # victim's memory is freed. A higher score makes that a process of the
-    # command, never this script, which still has to write the report. A step
-    # of 500, not the top score, keeps a run nested in another run (as in the
-    # self-tests) above its own reporter too.
-    adj=0
-    read -r adj < /proc/self/oom_score_adj 2>/dev/null
-    adj=$(( adj + 500 > 1000 ? 1000 : adj + 500 ))
-    "$BASH" -c 'echo "$1" 2>/dev/null > /proc/self/oom_score_adj; shift; exec "$@"' _ "$adj" "$@"
+    score_up
+    ${up[@]+"${up[@]}"} "$@"
     rc=$?
     # The scope's own limit, not a child's: a child's cap is the child's line.
     # The plain oom_kill also counts each child's kills at its own cap, so

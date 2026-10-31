@@ -186,7 +186,7 @@ rule that sizes them for another machine. A machine has these values only after 
 | Slice `MemorySwapMax` | 2G | On 2026-10-25 the swap was full. Gate work that does not fit must fail, not push the sessions to swap. |
 | Slice `TasksMax` | 4096 | Highest `pids.peak` for one gate was 315. 4096 holds about four gates at three times that. A self-spawn chain stops at about 1.8 GiB. |
 | Slice `ManagedOOMMemoryPressure`, `ManagedOOMSwap` | `kill` | When `systemd-oomd` runs, it kills a gate scope under memory pressure or when the swap fills, before the kernel's OOM killer starts. |
-| OOM score of the gate processes | 500 above the caller's (at most 1000), set by `scripts/capped.sh` | The kernel's OOM killer picks gate work before a session (sessions run at 200, so their gates run at 700). |
+| OOM score of the gate processes | half way from the caller's to 1000, set by `scripts/capped.sh` | The kernel's OOM killer picks gate work before a session (sessions run at 200, so their gates run at 600). |
 | One gate scope `MemoryMax` | 12G | 2.9 times the highest anon + shmem (4.2 GiB). The page cache above this is reclaimed, not killed. Replaces the fmt scope `MemoryMax=50G`. |
 | One gate scope `TasksMax` | 1024 | 3.3 times the highest `pids.peak` (315). |
 | One gate scope `MemorySwapMax` | 2G (applied) | A fresh machine has no slice swap cap, and the plain-scope fallback has no slice. With no swap cap, a runaway gate pages out to a disk swap for minutes before the memory cap kills it, as on 2026-10-25. |
@@ -255,9 +255,13 @@ line that says the slice or the machine ran out.
 
 It then ends the processes still in the scope. The scope has `OOMPolicy=continue`, else
 systemd stops it at the first OOM kill and the report goes with it. The command runs
-with an `oom_score_adj` 500 above the script's (at most 1000). At the cap, the kernel can
+with an `oom_score_adj` half way from the script's to 1000. At the cap, the kernel can
 kill a second process before the memory of the first is free; the higher score makes it
-kill a process of the command, not the script that writes the report.
+kill a process of the command, not the script that writes the report. `--own-cgroup` and
+`--child` do the same for their commands, as they also write a report line. Half way, not a
+fixed step, keeps each level above its reporter: a session at 200 runs a gate at 600, and
+an `--own-cgroup` or `--child` command in it at 800. A fixed step of 500 gave 1000 to both
+the reporter and the command at the third level, so the kernel could kill the reporter.
 
 Settings:
 
