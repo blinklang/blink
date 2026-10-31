@@ -1,0 +1,68 @@
+// A range yields its elements by stepping from the start, and §2.10 steps only an integer
+// type, so `.into_iter()` on a range of any other bound is refused the way a `for` loop over
+// it is (sections/03c_protocols.md §3c.1 *IntoIterator*).
+
+import std.fs
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_reset}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+import std.io
+
+fn typecheck_probe(path: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    init_embedded_stdlib()
+    fs.write(path, src).unwrap()
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+}
+
+// Each error as "name: message | note | note".
+fn errors_of(src: Str) -> List[Str] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    typecheck_probe("build/test_typecheck_range_into_iter_probe.bl", src)
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" {
+            let mut line = "{d.name}: {d.message}"
+            for n in d.notes { line = "{line} | {n}" }
+            out.push(line)
+        }
+    }
+    for e in out { io.println("  diag: {e}") }
+    out
+}
+
+test "into_iter on a range of an integer type is accepted" {
+    let src = "fn main() \{\n    let lo: U8 = 1\n    let xs: List[U8] = (lo..=4).into_iter().collect()\n    let ys: List[Int] = (0..3).into_iter().collect()\n    let _ = xs\n    let _ = ys\n}\n"
+    assert_eq(errors_of(src).len(), 0)
+}
+
+test "into_iter on a range of Float is not iterable" {
+    let src = "fn main() \{\n    let _ = (0.0..1.0).into_iter()\n}\n"
+    let errs = errors_of(src)
+    assert_eq(errs.len(), 1)
+    let e = errs.get(0).unwrap()
+    assert(e.contains("NotIterable"), e)
+    assert(e.contains("`Range[Float]`"), e)
+    assert(e.contains("only a range of an integer type can be walked"), e)
+}
+
+test "into_iter on a range of Str or Char is not iterable" {
+    let src = "fn main() \{\n    let _ = (\"a\"..\"c\").into_iter()\n    let _ = ('a'..='c').into_iter()\n}\n"
+    let errs = errors_of(src)
+    assert_eq(errs.len(), 2)
+    for e in errs { assert(e.contains("NotIterable"), e) }
+}
+
+test "into_iter on a range of a type parameter is not iterable" {
+    let src = "fn walk[T: Ord](r: Range[T]) -> Int \{\n    r.into_iter().count()\n}\nfn main() \{\n    let _ = walk(0..3)\n}\n"
+    let errs = errors_of(src)
+    assert_eq(errs.len(), 1)
+    assert(errs.get(0).unwrap().contains("NotIterable"), errs.get(0).unwrap())
+}
+
+test "into_iter on a range takes no argument" {
+    let src = "fn main() \{\n    let _ = (0..3).into_iter(1)\n}\n"
+    assert_eq(errors_of(src).len(), 1)
+}
