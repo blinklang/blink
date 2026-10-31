@@ -1395,6 +1395,8 @@ fn tc_derive_only_fact(tid: Int, tr: Str) -> Int {
     let k = type_kind(tid)
     if k == TyKind.Unknown || k == TyKind.Typevar { return 0 }
     if k == TyKind.Int || k == TyKind.Float || k == TyKind.Bool || k == TyKind.Char || k == TyKind.Str || is_sized_int(k) != 0 { return 1 }
+    // A range is Debug when its bound type is (§3.6 *Traits of Range[T]*).
+    if k == TyKind.Range && tr == "Debug" { return tc_derive_only_fact(resolve_alias_tid(tc_resolve(tc_tid_child(tid, 0))), tr) }
     tc_tid_derive_fact(tid, tr)
 }
 
@@ -2163,7 +2165,8 @@ pub fn make_iterator_type(elem_type: Int) -> Int {
 }
 
 // `Range[T]` (sections/02_syntax.md §2.10): the value a `..` or `..=` literal builds. One inner,
-// the bound type, shaped like make_iterator_type. It has no public field and no public method.
+// the bound type, shaped like make_iterator_type. It has no public field; its methods are the
+// ones its traits give it (§3.6 *Traits of Range[T]*).
 pub fn make_range_type(bound_type: Int) -> Int {
     ty_intern_simple(TyKind.Range, "Range", bound_type, -1)
 }
@@ -7054,6 +7057,7 @@ fn tc_builtin_method_arity(obj_k: TyKind, method: Str) -> Int {
         if method == "display" { return 0 }
         if method == "fmt" { return 1 }
     }
+    if obj_k == TyKind.Range && method == "debug" { return 0 }
     if method == "into_iter" {
         if obj_k == TyKind.List || obj_k == TyKind.Set || obj_k == TyKind.Str || obj_k == TyKind.Iterator { return 0 }
     }
@@ -11569,6 +11573,13 @@ fn tc_is_container_name(n: Str) -> Int {
     0
 }
 
+// The annotations the Debug field check reads through to their parts. A range renders
+// through its bound type (§3.6 *Traits of Range[T]*), as a List renders through its element.
+fn tc_debug_peels(core: Str) -> Int {
+    if core == "Range" { return 1 }
+    tc_is_container_name(core)
+}
+
 // Leaf type names that reach the Debug field check but are NOT Debug-renderable in v1 and
 // can never be made so by adding a derive:
 //   fn(...) -> T  → "Fn" (parser.bl:1437); (A, B) → "Tuple" (parser.bl:1408;
@@ -11630,9 +11641,9 @@ fn tc_check_debug_element(elem_ann: Int, f: Int, tname: Str) ! Diag.Report {
         diag_error_at("DeriveDebugFieldNoDebug", DERIVE_DEBUG_FIELD_NO_DEBUG, "@derive(Debug) on `{tname}`: field `{node_name(f)}` has element type `{elem_name}` which is not Debug-renderable in v1", f, "implement Debug manually for this field's type")
         return
     }
-    if tc_is_container_name(core) != 0 {
+    if tc_debug_peels(core) != 0 {
         // Nested container: Set/Result are still rejected at every level; the
-        // renderable containers (List/Option/Map) recurse.
+        // renderable containers (List/Option/Map/Range) recurse.
         if core == "Set" || core == "Result" {
             diag_error_at("DeriveDebugFieldNoDebug", DERIVE_DEBUG_FIELD_NO_DEBUG, "@derive(Debug) on `{tname}`: field `{node_name(f)}` has element type `{elem_name}` which is not Debug-renderable (only List/Option/Map containers render)", f, "implement Debug manually for this field's type")
             return
@@ -11645,10 +11656,10 @@ fn tc_check_debug_element(elem_ann: Int, f: Int, tname: Str) ! Diag.Report {
     }
 }
 
-// Peel a List/Option/Map container annotation `ann` and check its element (or
+// Peel a List/Option/Map/Range annotation `ann` and check its element (or
 // key + value) types. Shared between the top-level field check and the nested
 // recursion in tc_check_debug_element, so nesting is pure composition. The
-// caller guarantees `ann` names List / Option / Map (Set/Result rejected first).
+// caller guarantees `ann` names List / Option / Map / Range (Set/Result rejected first).
 fn tc_check_container_elems(ann: Int, core: Str, f: Int, tname: Str) ! Diag.Report {
     let elems_sl = node_elements(ann)
     if core == "Map" {
@@ -11673,7 +11684,7 @@ fn tc_check_container_elems(ann: Int, core: Str, f: Int, tname: Str) ! Diag.Repo
         return
     }
 
-    // List / Option: peel element 0.
+    // List / Option / Range: peel element 0.
     if elems_sl != -1 && sublist_length(elems_sl) >= 1 {
         tc_check_debug_element(sublist_get(elems_sl, 0), f, tname)
     }
@@ -11694,7 +11705,7 @@ fn tc_check_one_debug_field(f: Int, tname: Str, _is_variant_field: Int) ! Diag.R
         return
     }
 
-    if tc_is_container_name(core) == 0 {
+    if tc_debug_peels(core) == 0 {
         if tc_debug_leaf_ok(ftype_name, core) == 0 {
             diag_error_at("DeriveDebugFieldNoDebug", DERIVE_DEBUG_FIELD_NO_DEBUG, "@derive(Debug) on `{tname}`: field `{node_name(f)}` has type `{ftype_name}` which does not derive Debug", f, "{tc_derive_fix_imports(["Debug"], ftype_name)}add @derive({tc_derive_arg_for("Debug", ftype_name)}) to `{ftype_name}`")
         }
@@ -24175,8 +24186,27 @@ fn tc_trait_need(tid: Int, tr: Str, visiting: List[Int]) -> List[Int] {
 
 fn tc_derive_only_need(tid0: Int, tr: Str) -> List[Int] {
     let tid = resolve_alias_tid(tc_resolve(tid0))
+    if tr == "Debug" && type_kind(tid) == TyKind.Range { return tc_range_debug_need(tid) }
     if tc_derive_only_fact(tid, tr) == -1 { return [tid] }
     []
+}
+
+// A range is Debug when its bound type is, so the chain goes on to the bound. A bound that
+// is a type parameter needs `Debug` among its own bounds, since the compiler adds no bound
+// the user did not write (sections/03_types.md *No implied bounds*).
+fn tc_range_debug_need(tid: Int) -> List[Int] {
+    let bound = resolve_alias_tid(tc_resolve(tc_tid_child(tid, 0)))
+    let mut inner: List[Int] = []
+    if type_kind(bound) == TyKind.Typevar {
+        let traits = tc_tparam_bound_traits(type_to_str(bound))
+        if traits != "" && tc_pipe_has(traits, "Debug") == 0 { inner = [bound] }
+    } else {
+        inner = tc_derive_only_need(bound, "Debug")
+    }
+    if inner.len() == 0 { return [] }
+    let mut path = [tid]
+    for t in inner { path.push(t) }
+    path
 }
 
 // Whether the instance `tid` has `tr`, by the rule the type checker judged it with. Pure,
@@ -26749,6 +26779,14 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
         if obj_k == TyKind.Int || obj_k == TyKind.Float || obj_k == TyKind.Bool || obj_k == TyKind.Str || obj_k == TyKind.Char {
             if method == "display" { return TYPE_STR }
             if method == "fmt" { return TYPE_VOID }
+        }
+
+        // `Range[T]` is `Debug` when `T` is (§3.6 *Traits of Range[T]*).
+        if obj_k == TyKind.Range && method == "debug" {
+            let need = tc_range_debug_need(resolve_alias_tid(tc_resolve(obj_t)))
+            if need.len() == 0 { return TYPE_STR }
+            tc_report_trait_need(need, "Debug", node)
+            return tc_error_recovery_tid()
         }
 
         // `.into_iter()` is the crossing door into the lazy world (§3c.1:11-18, IntoIterator

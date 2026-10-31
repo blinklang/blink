@@ -41,7 +41,7 @@ import cname.{
 }
 import ir.{
     ir_line_text, ir_note_source, ir_line, ir_col, IrKind, ir_assign, ir_binary, ir_block, ir_break, ir_call_runtime, ir_carrier_tag,
-    ir_cast, ir_cell_let, ir_cell_ref, ir_c_name, ir_c_spelling, ir_const, ir_continue,
+    ir_call_direct, ir_cast, ir_cell_let, ir_cell_ref, ir_c_name, ir_c_spelling, ir_const, ir_continue,
     ir_expr_stmt, ir_field_get, ir_global_ref, ir_if, ir_kid, ir_kid_count, ir_kids, ir_kind, ir_let,
     ir_loop, ir_mark_materialize, ir_new, ir_return, ir_slot_form, ir_span, ir_switch, ir_tid,
     ir_tuple_new, ir_unary, ir_unreachable, ir_var_ref, ir_with_scope,
@@ -74,6 +74,7 @@ import cg_call.{
     cg_call_channel_take, cg_call_cursor_walk, cg_call_str_step, for_in_iteration_of, lower_spread_copy,
 }
 import unparse.{unparse_expr}
+import cg_derive.{cg_derive_range_debug_fn}
 import cg_promote.{
     cg_promote_arena_enter, cg_promote_arena_exit, cg_promote_body_enter, cg_promote_body_exit,
     cg_promote_innermost_ctx, cg_promote_needs_walk, cg_promote_on_exit, cg_promote_trace_begin,
@@ -1007,7 +1008,7 @@ fn eq_is_float(tid: Int) -> Bool ! Diag.Report { tc_tid_kind(tid) == TyKind.Floa
 // The kinds whose `==` is not C's: their parts, their tag or their bytes decide it.
 fn eq_is_aggregate(tid: Int) -> Bool ! Diag.Report {
     let k = tc_tid_kind(tid)
-    if k == TyKind.Struct || k == TyKind.Enum || k == TyKind.Result || k == TyKind.Option { return true }
+    if k == TyKind.Struct || k == TyKind.Enum || k == TyKind.Result || k == TyKind.Option || k == TyKind.Range { return true }
     k == TyKind.List || k == TyKind.Set || k == TyKind.Map || k == TyKind.Tuple || k == TyKind.Bytes
 }
 
@@ -1024,18 +1025,28 @@ pub fn enum_tag_word(tid: Int, base: Int, span: Int, ints: Str) -> Int {
 //
 // An assertion compares with the type's own `==` (02_syntax.md, test assertions), so it
 // lowers through the same cc_values_equal that `==` lowers through: a struct, an enum, a
-// carrier, a List, Set, Map or tuple, and a Bytes value are equal exactly when `==` says
-// they are. Typecheck has already refused a type with no `Eq`.
+// carrier, a List, Set, Map, tuple or range, and a Bytes value are equal exactly when `==`
+// says they are. Typecheck has already refused a type with no `Eq`.
 
 // The failure message's rendering of one side. A Result or an Option has no Display of
-// its own in this compiler, so it renders by which arm it holds. Every other kind renders
-// through Display when the type has one and a "<TypeName>" placeholder when it does not:
-// unlike an interpolation hole, assert_eq's operand has no typecheck gate guaranteeing
-// Display exists.
+// its own in this compiler, so it renders by which arm it holds, and a range renders in its
+// debug form. Every other kind renders through Display when the type has one and a
+// "<TypeName>" placeholder when it does not: unlike an interpolation hole, assert_eq's
+// operand has no typecheck gate guaranteeing Display exists.
 fn agg_render_side(node: Int, tid: Int, value_ref: Int, pre: List[Int]) -> Int ! Diag.Report {
     let k = tc_tid_kind(tid)
     if k == TyKind.Option || k == TyKind.Result { return agg_tag_label(node, tid, value_ref, pre) }
+    if k == TyKind.Range { return agg_range_text(node, tid, value_ref) }
     cc_display_or_placeholder(node, tid, value_ref)
+}
+
+// A range has no Display, and two ranges that differ only in kind would share a placeholder,
+// so a range shows its debug form: `0..3 != 0..=2`.
+fn agg_range_text(node: Int, tid: Int, value_ref: Int) -> Int ! Diag.Report {
+    let symbol = cg_derive_range_debug_fn(tid, node)
+    if symbol == "" { return -1 }
+    let str_rec = layout_at(TYPE_STR, Position.Local, node)
+    ir_call_direct(TYPE_STR, node, str_rec.c_spelling, symbol, str_rec.slot_form, [value_ref])
 }
 
 // A carrier's active arm, named rather than shown: "Some(..)"/"None" or "Ok(..)"/"Err(..)".

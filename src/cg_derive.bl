@@ -10,7 +10,7 @@
 // answer equal: a wrong answer that compiles cleanly.
 
 import diagnostics.{
-    Diag, diag_ice_at, diag_ice_stage_not_built, UNSOLVED_TYPEVAR_AT_CODEGEN,
+    Diag, diag_ice_at, diag_ice_stage_not_built, diag_is_ice_seg, UNSOLVED_TYPEVAR_AT_CODEGEN,
 }
 import layout.{
     LayoutRecord, Position, SlotForm, decl_derive_args, ensure_typedef_for, field_layout_of,
@@ -21,7 +21,7 @@ import cname.{
     c_field_name, c_mint_local, c_runtime_helper, c_str_const,
     c_tid_derive_method_name, c_tuple_member, c_derived_method_symbol,
     c_variant_discriminant, c_enum_tag_member, c_variant_field_path,
-    c_global_name, c_variant_member_name, c_local_name,
+    c_global_name, c_variant_member_name, c_local_name, c_range_debug_name,
 }
 import cg_print.{print_fn, print_fn_decl, print_kops_table, print_kops_table_decl, print_typedef_blocks}
 import cg_reg.{cg_reg_tid_for_decl, cg_reg_global_decls, cg_reg_module_of}
@@ -30,13 +30,16 @@ import cg_call.{
     cg_call_element_from_runtime, cg_call_element_to_slot, cg_call_stdlib_declares,
     cg_call_stdlib_symbol, cg_call_equality_fn, cg_call_container_ctor, cg_call_order_sign_helper,
 }
-import cg_promote.{cg_promote_has_pending, cg_promote_print_walkers}
+import cg_promote.{
+    cg_promote_has_pending, cg_promote_print_walkers, cg_promote_on_demand_state, cg_promote_on_demand_mark,
+    cg_promote_on_demand_queue, ON_DEMAND_WRITTEN, ON_DEMAND_BUILDING, ON_DEMAND_REFUSED,
+}
 import cg_expr.{cg_expr_field_value, cg_expr_field_stored}
 import ir.{
     ir_assign, ir_binary, ir_block, ir_call_direct, ir_call_runtime, ir_cast, ir_const,
     ir_field_get, ir_if, ir_let, ir_panic, ir_return, ir_switch, ir_unary, ir_var_ref,
     ir_loop, ir_break, ir_expr_stmt, ir_struct_new, ir_enum_new, ir_carrier_wrap,
-    ir_carrier_unwrap, ir_carrier_tag, ir_global_ref, ir_select, ir_unbox,
+    ir_carrier_unwrap, ir_carrier_tag, ir_global_ref, ir_select, ir_unbox, ir_verify_in_frame,
 }
 import typecheck.{
     DECL_NODE_AMBIGUOUS, TYPE_BOOL, TYPE_CHAR, TYPE_INT, TYPE_STR, TYPE_U64, TyKind, tc_compiler_known_tid,
@@ -45,7 +48,7 @@ import typecheck.{
     tc_evar_field_slots, tc_evar_name, tc_evfield_name, tc_evfield_tid, tc_resolve,
     tc_lookup_node_tid, tc_sfield_name, tc_sfield_tid, tc_struct_field_slots,
     tc_tid_child, tc_tid_child_count, tc_tid_decl_node, tc_tid_kind, tc_tid_resolved,
-    tc_type_str, tk_name, tc_member_tid_at_instance, tc_instance_has_trait,
+    tc_type_str, tk_name, tc_member_tid_at_instance, tc_instance_has_trait, range_repr_tid,
 }
 import parser.{
     parser_live_ranges, node_name, node_fields, node_source_module, node_type_params, sublist_get,
@@ -353,8 +356,8 @@ fn eq_method(decl: Int, tid: Int, arg: Int, bodies: Bool) ! Diag.Report {
     print_fn(false, ret, symbol, params, false, body)
 }
 
-// A field compared through a function built on demand calls a name the unit has not
-// printed yet, and an eq body prints after the unit's last walker flush.
+// A field compared or rendered through a function built on demand calls a name the unit
+// has not printed yet, and an eq or debug body prints after the unit's last walker flush.
 fn print_pending_walkers() ! Diag.Report {
     if cg_promote_has_pending() {
         print_typedef_blocks(layout_take_typedefs())
@@ -909,6 +912,7 @@ fn debug_method(decl: Int, tid: Int, arg: Int, bodies: Bool) ! Diag.Report {
     if !bodies { return print_fn_decl(false, ret, symbol, params, false) }
     let body = debug_body(decl, tid, arg)
     if body < 0 { return }
+    print_pending_walkers()
     print_fn(false, ret, symbol, params, false, body)
 }
 
@@ -1115,6 +1119,7 @@ fn debug_part(ftid: Int, value: Int, path: Str, span: Int) -> DebugPart ! Diag.R
     if k == TyKind.List { return list_join_part(ftid, value, path, true, span) }
     if k == TyKind.Map { return debug_map_part(ftid, value, path, span) }
     if k == TyKind.Option { return debug_option_part(ftid, value, path, span) }
+    if k == TyKind.Range { return debug_range_part(ftid, value, path, span) }
     let spec = format_spec_of(ftid)
     if spec == "" {
         not_built(span, "@derive(Debug) on the {tk_name(k)} field `{path}`")
@@ -1296,6 +1301,90 @@ fn debug_option_part(ftid: Int, value: Int, path: Str, span: Int) -> DebugPart !
         ir_let(TYPE_STR, span, strs, d, str_form(), ir_const(TYPE_STR, span, strs, c_str_const("None"))),
         ir_if(span, some, ir_block(span, fill), -1)]
     DebugPart { spec: format_spec_of(TYPE_STR), arg: ir_var_ref(TYPE_STR, span, strs, d, str_form()), pre: pre, ok: true }
+}
+
+// A range prints as it was written (§3.6 *Traits of Range[T]*): its start, `..` or `..=`,
+// then its end, each bound in the debug form of its own type. The rendering is one function
+// per range type, so a field, a method call and an assertion message all call the same body.
+fn debug_range_part(ftid: Int, value: Int, path: Str, span: Int) -> DebugPart ! Diag.Report {
+    let rec = layout_of(TYPE_STR, Position.Local)
+    let spelling = spelling_or_ice(rec, "Str", span)
+    if spelling == "" { return debug_refused() }
+    let symbol = cg_derive_range_debug_fn(ftid, span)
+    if symbol == "" {
+        not_built(span, "@derive(Debug) on the range field `{path}`")
+        return debug_refused()
+    }
+    let arg = ir_call_direct(TYPE_STR, span, spelling, symbol, rec.slot_form, [value])
+    DebugPart { spec: format_spec_of(TYPE_STR), arg: arg, pre: [], ok: true }
+}
+
+// The function that renders one range type, built the first time a range of that type is
+// rendered. "" is a refusal already reported, the first time if this is a later ask.
+pub fn cg_derive_range_debug_fn(tid: Int, span: Int) -> Str ! Diag.Report {
+    let r = tc_resolve(tid)
+    let symbol = c_range_debug_name(r)
+    if diag_is_ice_seg(symbol) {
+        derive_ice(span, "no debug function name for {tc_type_str(r)}: {symbol}")
+        return ""
+    }
+    let state = cg_promote_on_demand_state(symbol)
+    if state == ON_DEMAND_WRITTEN || state == ON_DEMAND_BUILDING { return symbol }
+    if state == ON_DEMAND_REFUSED { return "" }
+    cg_promote_on_demand_mark(symbol, ON_DEMAND_BUILDING)
+    if !range_debug_build(r, symbol, span) {
+        cg_promote_on_demand_mark(symbol, ON_DEMAND_REFUSED)
+        return ""
+    }
+    symbol
+}
+
+fn range_debug_build(r: Int, symbol: Str, span: Int) -> Bool ! Diag.Report {
+    let bound = tc_tid_child(r, 0)
+    if bound < 0 {
+        derive_ice(span, "the range type {tc_type_str(r)} has no bound type")
+        return false
+    }
+    let repr = range_repr_tid(r)
+    let _td = ensure_typedef_for(repr)
+    let prec = layout_of(repr, Position.Param)
+    let brec = layout_of(bound, Position.TupleElem)
+    let frec = layout_of(TYPE_BOOL, Position.TupleElem)
+    let pspelling = spelling_or_ice(prec, "the range {tc_type_str(r)}", span)
+    let bspelling = spelling_or_ice(brec, "the bound of the range {tc_type_str(r)}", span)
+    let fspelling = spelling_or_ice(frec, "the kind of the range {tc_type_str(r)}", span)
+    let strs = str_spelling(span)
+    if pspelling == "" || bspelling == "" || fspelling == "" || strs == "" { return false }
+    let param = c_local_name("range")
+    let start = ir_field_get(bound, span, bspelling, c_tuple_member(0), brec.slot_form,
+        ir_var_ref(repr, span, pspelling, param, prec.slot_form))
+    let end = ir_field_get(bound, span, bspelling, c_tuple_member(1), brec.slot_form,
+        ir_var_ref(repr, span, pspelling, param, prec.slot_form))
+    let inclusive = ir_field_get(TYPE_BOOL, span, fspelling, c_tuple_member(2), frec.slot_form,
+        ir_var_ref(repr, span, pspelling, param, prec.slot_form))
+    let spart = debug_part(bound, start, "the start of a {tc_type_str(r)}", span)
+    if !spart.ok { return false }
+    let epart = debug_part(bound, end, "the end of a {tc_type_str(r)}", span)
+    if !epart.ok { return false }
+    let sep = c_mint_local("d")
+    let mut stmts: List[Int] = []
+    for st in spart.pre { stmts.push(st) }
+    for st in epart.pre { stmts.push(st) }
+    stmts.push(ir_let(TYPE_STR, span, strs, sep, str_form(), ir_const(TYPE_STR, span, strs, c_str_const(".."))))
+    let closed = ir_assign(span, ir_var_ref(TYPE_STR, span, strs, sep, str_form()),
+        ir_const(TYPE_STR, span, strs, c_str_const("..=")))
+    stmts.push(ir_if(span, inclusive, ir_block(span, [closed]), -1))
+    let fmt = ir_const(TYPE_STR, span, strs, c_str_const("{spart.spec}%s{epart.spec}"))
+    stmts.push(ir_return(span, ir_call_runtime(TYPE_STR, span, strs, c_runtime_helper("str_format"),
+        str_form(), [fmt, spart.arg, ir_var_ref(TYPE_STR, span, strs, sep, str_form()), epart.arg])))
+    let body = ir_block(span, stmts)
+    let problems = ir_verify_in_frame(body, [param])
+    if problems.len() > 0 {
+        derive_ice(span, "the debug function {symbol} does not verify: {problems.get(0).unwrap()}")
+        return false
+    }
+    cg_promote_on_demand_queue(symbol, strs, ["{pspelling} {param}"], body)
+    true
 }
 
 // ── Hash ─────────────────────────────────────────────────────────────────

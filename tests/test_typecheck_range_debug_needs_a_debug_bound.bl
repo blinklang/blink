@@ -1,0 +1,74 @@
+// `Range[T]` is `Debug` only when `T` is (sections/03_types.md §3.6 *Traits of Range[T]*), so
+// a debug() of a range of a type that is not Debug is a type error that names the bound, and a
+// derived Debug rejects a range field the same way it rejects a List field. A type parameter
+// gives a range of it no bound of its own (*No implied bounds*).
+
+import std.fs
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_reset}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+import std.io
+
+fn typecheck_probe(path: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    init_embedded_stdlib()
+    fs.write(path, src).unwrap()
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+}
+
+// Each error as "name: message | note | note".
+fn errors_of(src: Str) -> List[Str] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    typecheck_probe("build/test_typecheck_range_debug_probe.bl", src)
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" {
+            let mut line = "{d.name}: {d.message}"
+            for n in d.notes { line = "{line} | {n}" }
+            out.push(line)
+        }
+    }
+    for e in out { io.println("  diag: {e}") }
+    out
+}
+
+let NO_DEBUG = "type RangeNoDebug \{\n    a: Int\n}\n@derive(Eq, Ord)\ntype RangeOrdOnly \{\n    a: Int\n}\n"
+
+test "debug of a range of a type that is not Debug names the bound" {
+    let src = "{NO_DEBUG}fn main() \{\n    let r = RangeOrdOnly \{ a: 1 }..RangeOrdOnly \{ a: 2 }\n    let _ = r.debug()\n}\n"
+    let errs = errors_of(src)
+    assert_eq(errs.len(), 1)
+    let e = errs.get(0).unwrap()
+    assert(e.contains("TypeError"), e)
+    assert(e.contains("`Range[RangeOrdOnly]` does not implement `Debug`"), e)
+    assert(e.contains("`Range[RangeOrdOnly]` is `Debug` only if `RangeOrdOnly` is `Debug`"), e)
+}
+
+test "debug of a range of a type parameter needs a Debug bound" {
+    let src = "fn shown[T](r: Range[T]) -> Str \{\n    r.debug()\n}\nfn main() \{\n    let _ = shown(0..3)\n}\n"
+    let errs = errors_of(src)
+    assert_eq(errs.len(), 1)
+    let e = errs.get(0).unwrap()
+    assert(e.contains("does not implement `Debug`"), e)
+}
+
+test "debug of a range of a type parameter with a Debug bound is accepted" {
+    let src = "fn shown[T: Debug](r: Range[T]) -> Str \{\n    r.debug()\n}\nfn main() \{\n    let _ = shown(0..3)\n}\n"
+    assert_eq(errors_of(src).len(), 0)
+}
+
+test "a derived Debug rejects a range field whose bound is not Debug" {
+    let src = "{NO_DEBUG}@derive(Debug)\ntype RangeHolder \{\n    span: Range[RangeNoDebug]\n}\nfn main() \{\n}\n"
+    let errs = errors_of(src)
+    assert_eq(errs.len(), 1)
+    let e = errs.get(0).unwrap()
+    assert(e.contains("DeriveDebugFieldNoDebug"), e)
+    assert(e.contains("RangeNoDebug"), e)
+}
+
+test "a derived Debug accepts a range field whose bound is Debug" {
+    let src = "@derive(Debug)\ntype RangeHolder \{\n    span: Range[Int]\n    spans: List[Range[Str]]\n}\nfn main() \{\n}\n"
+    assert_eq(errors_of(src).len(), 0)
+}
