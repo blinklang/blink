@@ -4596,12 +4596,14 @@ typedef struct {
     int         (*remove)(void* __self, const char* name);
     const char* (*cwd)(void* __self);
     void        (*exit_fn)(void* __self, int code);
+    int64_t     (*pid)(void* __self);
     /* per-op handler captures — see blink_io_vtable */
     void* __userdata_read;
     void* __userdata_write;
     void* __userdata_remove;
     void* __userdata_cwd;
     void* __userdata_exit_fn;
+    void* __userdata_pid;
 } blink_env_vtable;
 
 BLINK_RT_FN blink_env_vtable* blink_env_vtable_promote(blink_promote_ctx* ctx, blink_env_vtable* v);
@@ -4614,6 +4616,7 @@ BLINK_RT_FN blink_env_vtable* blink_env_vtable_promote(blink_promote_ctx* ctx, b
     out->__userdata_remove = blink_closure_promote(ctx, (blink_closure*)out->__userdata_remove);
     out->__userdata_cwd = blink_closure_promote(ctx, (blink_closure*)out->__userdata_cwd);
     out->__userdata_exit_fn = blink_closure_promote(ctx, (blink_closure*)out->__userdata_exit_fn);
+    out->__userdata_pid = blink_closure_promote(ctx, (blink_closure*)out->__userdata_pid);
     return out;
 }
 #endif
@@ -4657,12 +4660,20 @@ BLINK_RT_FN void blink_env_default_exit(void* __self, int code) {
 }
 #endif
 
+BLINK_RT_FN int64_t blink_env_default_pid(void* __self);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN int64_t blink_env_default_pid(void* __self) {
+    return (int64_t)getpid();
+}
+#endif
+
 BLINK_UNUSED static blink_env_vtable blink_env_vtable_default = {
     blink_env_default_read,
     blink_env_default_write,
     blink_env_default_remove,
     blink_env_default_cwd,
-    blink_env_default_exit
+    blink_env_default_exit,
+    blink_env_default_pid
 };
 
 /* ── Debug assert ───────────────────────────────────────────────────── */

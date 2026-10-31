@@ -40,6 +40,8 @@ Single source of truth for release history. `blink llms` and `blink llms --full`
 
 ## What's New (v0.59.0)
 
+- **`env.pid()` reads the process ID through the `Env` effect.** It is an operation of `Env.Read` and returns an `Int`. A `handler Env` can answer it with `fn pid() -> Int`, and a handler that omits it forwards the call to the enclosing handler. `getpid()` still works and still skips any `Env` handler; it will become a removed name in a later release.
+
 - **`time.monotonic()` reads a clock that never goes back.** It returns a `Monotonic`, an operation of `Time.Read`. `b.since(a)` gives the `Duration` between two readings. A `Time` handler answers the op with `Monotonic.from_offset(d)`, which panics on a negative offset. A `handler Time` or `handler Time.Read` that omits `monotonic` gets W0545; the fix is `fn monotonic() -> Monotonic { default.monotonic() }`.
 
 - **`IO.Eprint` is a known effect.** A row can name it: `fn warn(msg: Str) ! IO.Eprint`. `! IO` grants it, and `! IO.Print` and `! IO.Log` do not. A row that holds every child of `IO` (`IO.Print, IO.Eprint, IO.Log, IO.Read`) grants `IO`, and the same holds for each built-in effect. A `handler IO` can forward to stderr with `default.eprint(msg)`, and the compiler checks the type of an `eprint` or `eprint_no_nl` clause.

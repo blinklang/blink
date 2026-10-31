@@ -546,6 +546,7 @@ err.not_found()                 // -> Bool: true only when the failure was ENOEN
 env.args()                      // -> List[Str] (all CLI args)
 env.var(name)                   // -> Option[Str] (read env var, effect: Env.Read)
 env.cwd()                       // -> Str (current working directory, effect: Env.Read)
+env.pid()                       // -> Int (operating-system process ID, effect: Env.Read)
 env.set_var(name, value)        // set env var (effect: Env.Write)
 env.remove_var(name)            // remove env var (effect: Env.Write)
 env.exit(code)                  // terminate process (effect: Env.Exit)
