@@ -272,16 +272,21 @@ fn format_pattern(node: Int) -> Str {
 // ── Expression formatting ───────────────────────────────────────────
 
 // Mirrors the parser's levels. The integer operators of §2.19 share one level, except that
-// `* / %` binds tighter than `+ -`; int_operand_needs_parens covers the groups. Every level is
-// left-associative, so a right operand at the same level needs parens.
+// `* / %` binds tighter than `+ -`; int_operand_needs_parens covers the groups. Every binary
+// level is left-associative, so a right operand at the same level needs parens. The range level
+// has no associativity, so a range operand of a range always needs them.
+const PREC_EQUALITY = 4
+const PREC_RANGE = 6
+
 fn op_precedence(op: Str) -> Int {
     if op == "??" { return 1 }
     if op == "||" { return 2 }
     if op == "&&" { return 3 }
-    if op == "==" || op == "!=" { return 4 }
+    if op == "==" || op == "!=" { return PREC_EQUALITY }
     if op == "<" || op == ">" || op == "<=" || op == ">=" { return 5 }
-    if op == "*" || op == "/" || op == "%" { return 7 }
-    if int_op_group(op) != 0 { return 6 }
+    if op == ".." || op == "..=" { return PREC_RANGE }
+    if op == "*" || op == "/" || op == "%" { return 8 }
+    if int_op_group(op) != 0 { return 7 }
     0
 }
 
@@ -323,6 +328,11 @@ fn format_binop_side(s: Str, child: Int, parent_op: Str, is_right: Int) -> Str {
 
 fn needs_parens(child: Int, parent_op: Str, is_right: Int) -> Int {
     let kind = node_kind(child)
+    // A range beside a comparison or equality operator parses bare, but fmt writes the pair so
+    // the reader does not have to know `..` binds tighter (§2.19).
+    if kind == NodeKind.RangeLit {
+        return if op_precedence(parent_op) >= PREC_EQUALITY { 1 } else { 0 }
+    }
     if kind != NodeKind.BinOp {
         return 0
     }
@@ -412,7 +422,7 @@ pub fn format_expr(node: Int) -> Str {
         let inner_kind = node_kind(operand)
         // `--` lexes as one token, so `-(-x)` keeps its parens.
         let double_minus = op == "-" && inner_kind == NodeKind.UnaryOp && node_op(operand) == "-"
-        if inner_kind == NodeKind.BinOp || double_minus || (inner_kind == NodeKind.IntLit && node_inclusive(node) != 0) {
+        if inner_kind == NodeKind.BinOp || inner_kind == NodeKind.RangeLit || double_minus || (inner_kind == NodeKind.IntLit && node_inclusive(node) != 0) {
             return "{op}(".concat(inner).concat(")")
         }
         return op.concat(inner)
@@ -508,12 +518,12 @@ pub fn format_expr(node: Int) -> Str {
     }
 
     if kind == NodeKind.RangeLit {
+        let op = if node_inclusive(node) != 0 { "..=" } else { ".." }
         let start = node_start(node)
         let end = node_end(node)
-        if node_inclusive(node) != 0 {
-            return "{left_spine_text(start)}..={format_expr(end)}"
-        }
-        return "{left_spine_text(start)}..{format_expr(end)}"
+        let start_str = format_binop_side(format_expr(start), start, op, 0)
+        let end_str = format_binop_side(format_expr(end), end, op, 1)
+        return "{start_str}{op}{end_str}"
     }
 
     if kind == NodeKind.Closure {
