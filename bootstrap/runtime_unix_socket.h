@@ -4,6 +4,7 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <poll.h>
+#include <fcntl.h>
 
 /* sun_path holds about 107 bytes. A longer path must fail here: copied short, it would
    bind or connect at some other path while the caller names this one. */
@@ -234,11 +235,25 @@ BLINK_RT_FN int64_t blink_socket_write(int64_t fd, const char* data) {
    failure, so lib/std/net_unix.bl can build NetError.Os(op, code) with the call that
    failed. None prints, and none removes a file: a path that exists fails bind with
    EADDRINUSE. */
+#if defined(__linux__)
+/* glibc declares accept4 only past _GNU_SOURCE, which runtime_core.h does not set. */
+int accept4(int sockfd, struct sockaddr* addr, socklen_t* addrlen, int flags);
+#endif
+
+/* Each fd of this API is close-on-exec, so a child that process.spawn starts does not keep
+   a copy: the peer then sees end of stream when this process closes the socket. Linux sets
+   the flag in the call that makes the fd; elsewhere fcntl sets it after the call. */
 BLINK_RT_FN int64_t blink_unix_stream_socket(void);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN int64_t blink_unix_stream_socket(void) {
+#if defined(__linux__)
+    int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) return -(int64_t)errno;
+#else
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) return -(int64_t)errno;
+    fcntl(fd, F_SETFD, FD_CLOEXEC);
+#endif
     blink_unix_socket_nosigpipe(fd);
     return (int64_t)fd;
 }
@@ -294,7 +309,12 @@ BLINK_RT_FN int64_t blink_unix_accept_fd(int64_t fd);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN int64_t blink_unix_accept_fd(int64_t fd) {
     for (;;) {
+#if defined(__linux__)
+        int client = accept4((int)fd, NULL, NULL, SOCK_CLOEXEC);
+#else
         int client = accept((int)fd, NULL, NULL);
+        if (client >= 0) fcntl(client, F_SETFD, FD_CLOEXEC);
+#endif
         if (client >= 0) {
             blink_unix_socket_nosigpipe(client);
             return (int64_t)client;
@@ -316,7 +336,9 @@ BLINK_RT_FN void blink_unix_close_fd(int64_t fd) {
 /* One line without its "\n" or "\r\n". The status of the last call on this thread is
    0 for a line, -1 for end of stream with no bytes left, or the errno. Bytes are peeked
    and only those up to the newline consumed, so what follows the line stays for the next
-   call. A last line with no newline is a line; the call after it gives end of stream. */
+   call. A last line with no newline is a line; the call after it gives end of stream.
+   Out of memory stops the process, as it does for io.read_line: an Err would have to drop
+   the bytes already taken from the socket. */
 BLINK_RT_FN const char* blink_unix_read_line(int64_t fd);
 BLINK_RT_FN int64_t blink_unix_read_line_status(void);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
@@ -325,16 +347,13 @@ BLINK_RT_FN const char* blink_unix_read_line(int64_t fd) {
     size_t cap = 8192;
     size_t len = 0;
     char* buf = (char*)malloc(cap);
-    if (!buf) {
-        blink_unix_read_line_last = ENOMEM;
-        return blink_str_from_cstr_gc("");
-    }
+    if (!buf) { fprintf(stderr, "blink: out of memory\n"); exit(1); }
     int64_t status = 0;
     int ended = 0;
     for (;;) {
         if (cap - len < 4096) {
             char* grown = (char*)realloc(buf, cap * 2);
-            if (!grown) { status = ENOMEM; break; }
+            if (!grown) { fprintf(stderr, "blink: out of memory\n"); exit(1); }
             buf = grown;
             cap *= 2;
         }
