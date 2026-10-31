@@ -98,6 +98,7 @@ Single source of truth for release history. `blink llms` and `blink llms --full`
 - **`@derive(Hash)` or `@derive(Ord)` over a `Range` field is now `NonDerivableTrait` (E1401).** A range is never Hash or Ord, and the derive got through the check and stopped the build with an ICE.
 - **A call through a closure builds on the per-module path when its result is an `Option` of a sized integer type.** `xs.into_iter().count()` with `xs: List[U8]` failed in the C compiler on `blink_Option_u8`, because the unit never declared that type. Each call now declares the types of its arguments and result.
 - **C from `blinkc` that includes `bootstrap/runtime.h` links when a closure leaves `with arena`.** The promotion reports each capture to the trace runtime, which `runtime.h` did not include, so `cc -Ibootstrap` failed with an undefined `blink_trace_arena_capture`. `blink build` and `blink run` were not affected.
+- **An alias that shadows a compiler-known name stays in its own module.** With `type Option = Int` in a program, a std body that reads `Option[T]` got `Int`, so a call as plain as `xs.len()` failed in `lib/std/iter.bl`. Now only the module that declares the alias, and each module that imports it, read the name as the alias (sections/07 §10.6). In that module a range literal is still a `Range`: `let n: Bool = 1..4` beside `type Range = Int` is a type error, where before it passed.
 
 ## Breaking Changes (v0.58.0)
 
