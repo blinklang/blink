@@ -3414,23 +3414,6 @@ BLINK_UNUSED static int blink_g_argc = 0;
 BLINK_UNUSED static const char** blink_g_argv = NULL;
 #endif
 
-BLINK_RT_FN int64_t blink_arg_count(void);
-#ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN int64_t blink_arg_count(void) {
-    return (int64_t)blink_g_argc;
-}
-#endif
-
-BLINK_RT_FN const char* blink_get_arg(int64_t index);
-#ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN const char* blink_get_arg(int64_t index) {
-    if (index < 0 || index >= blink_g_argc) {
-        __blink_panic_dispatchf("blink: arg index out of bounds: %lld", (long long)index);
-    }
-    return blink_str_from_cstr_gc(blink_g_argv[index]);
-}
-#endif
-
 BLINK_RT_FN blink_list* blink_env_args(void);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN blink_list* blink_env_args(void) {
@@ -3439,22 +3422,6 @@ BLINK_RT_FN blink_list* blink_env_args(void) {
         blink_list_push(args, (void*)blink_str_from_cstr_gc(blink_g_argv[i]));
     }
     return args;
-}
-#endif
-
-BLINK_RT_FN int64_t blink_file_exists(const char* path);
-#ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN int64_t blink_file_exists(const char* path) {
-    return access(path, F_OK) == 0 ? 1 : 0;
-}
-#endif
-
-BLINK_RT_FN int64_t blink_is_dir(const char* path);
-#ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN int64_t blink_is_dir(const char* path) {
-    struct stat st;
-    if (stat(path, &st) != 0) return 0;
-    return S_ISDIR(st.st_mode) ? 1 : 0;
 }
 #endif
 
@@ -3476,21 +3443,6 @@ BLINK_RT_FN blink_list* blink_list_dir(const char* path) {
     }
     closedir(d);
     return result;
-}
-#endif
-
-BLINK_RT_FN int64_t blink_file_mtime(const char* path);
-#ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN int64_t blink_file_mtime(const char* path) {
-    struct stat st;
-    if (stat(path, &st) != 0) return -1;
-#ifdef __APPLE__
-    return (int64_t)st.st_mtimespec.tv_sec * 1000 +
-           (int64_t)(st.st_mtimespec.tv_nsec / 1000000);
-#else
-    return (int64_t)st.st_mtim.tv_sec * 1000 +
-           (int64_t)(st.st_mtim.tv_nsec / 1000000);
-#endif
 }
 #endif
 
