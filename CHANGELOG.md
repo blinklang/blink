@@ -25,6 +25,8 @@ Single source of truth for release history. `blink llms` and `blink llms --full`
   - A paren payload is checked by position and label (E0315, E0316, E0527).
 - **A range literal is a `Range[T]` value, not a `List[Int]`.** `let r = 0..3` has type `Range[Int]`. You can pass it to a function, return it, keep it in a list and walk it with `for`. List methods on a range, such as `r.len()`, are errors, and so is a `List[Int]` annotation on a range literal. Two ranges compare with `==` by start, end and inclusive flag, so `0..3 == 0..3` and `0..3 != 0..=2`. A range has no `<` and no `Hash`. Both bounds must have one type.
 - **Unary `-` over a literal tree at an unsigned type is an error.** `-(2 * 3)` is a call to `Neg`, which unsigned types do not have, so `u + -(2 * 3)` with `u: U8` is a type error.
+- **A `blink.toml` or `blink.lock` that does not load stops the command.** Before, `blink check` printed the error, went on without the `[lints]` or the locked versions, and exited 0. It now exits 1. A manifest needs `[package]` with `name` and `version`; add a `version` if yours has none.
+- **A file the toolchain cannot read or write is an error that names the path.** Before, a read that failed gave empty text and a write that failed was ignored. An entry file it cannot read exits 1. An imported module it cannot read is E1200 at the import. An `#embed` target it cannot read is E1108. `blink ast`, `query` and `doc` report the read error and do not print empty output. `blink init` and `blink update` no longer replace a file they cannot read. A `blink fix` or build output that cannot be written exits 1. `blink check --json` prints the failed status line for an input it cannot read.
 
 ## What's New (v0.59.0)
 
@@ -42,6 +44,7 @@ Single source of truth for release history. `blink llms` and `blink llms --full`
 - **Python-style random calls get a fix.** `rand.int(0, 10)` and `rand.int(10)` do not compile, and the fix is `rand.int(0..10)`. `rand.shuffle(deck)` is E0505, and its fix calls `shuffle(deck)` and adds `import std.random.{shuffle}`. `blink fix`, `blink check --json` and the LSP code action now apply every edit of a fix, or none.
 - **The LSP completes `rand.`** with the operations of `Rand` and the `std.random` helpers. A helper adds its import when you pick it.
 - **Compile time of wide nested types is lower.** A program with 800 non-recursive types compiles in 0.06 s; before, it took 3.8 s.
+- **`fs.*` needs no import.** `fs.read`, `fs.write`, `fs.stat` and the other `fs` operations compile and run without `import std.fs`. Import `std.fs` only to name `FsError`, `FsOp`, `FileInfo` or `FileKind`.
 
 ## Fixes (v0.59.0)
 
