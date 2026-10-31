@@ -5143,25 +5143,30 @@ fn parse_comparison() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
 // Each bound is a level-8 expression, so `0..n + 1` is `0..(n + 1)` and `-2..3` is `(-2)..3`.
 // The node sits at the start's first token: a BinOp start sits at its operator.
 
-// Where a missing range end or start sits, for its help: in a `for` header a `{` opens the
-// body and so cannot be the end, and inside `xs[...]` the help names the slice methods. Each
-// holds only at the site's own level: inside a nested delimiter a range is a plain one.
+// Where a missing range end or start sits, for its help: in a `for`, `if`, `while` or `match`
+// header a `{` opens the body and so cannot be the end, and inside `xs[...]` the help names the
+// slice methods. Each holds only at the site's own level: inside a nested delimiter a range is a
+// plain one.
 const RANGE_SITE_PLAIN = 0
-const RANGE_SITE_FOR = 1
+const RANGE_SITE_HEADER = 1
 const RANGE_SITE_INDEX = 2
 
 const RANGE_OPEN_HELP = "write `lo..hi` or `lo..=hi`; Blink has no open-ended range"
 const RANGE_SLICE_HELP = "Blink has no slice syntax: write `xs.slice(a, b)` for a List or Bytes, or `s.byte_slice(a, b)` for a Str"
 
 // The site of the current token, read back from the tokens: the delimiter that encloses it, or
-// the `in` of a for header at its own level. Only an error path and a `{` after `..` ask, so
-// the scan costs nothing on a well-formed range.
+// the `in` of a for header or the keyword of an if, while or match header at its own level.
+// Only an error path and a `{` after `..` ask, so the scan costs nothing on a well-formed range.
+// A header site rejects a `{` end, so each doubt reads as plain: a block closed at this level
+// ends any header before it, and an `if` right after an operand is a match arm guard.
 fn range_site_here() -> Int {
     let mut depth = 0
+    let mut past_block = false
     let mut t = pos - 1
     while t >= 0 {
         let k = tokens.kinds.get(t).unwrap()
         if k == TokenKind.RParen || k == TokenKind.RBracket || k == TokenKind.RBrace || k == TokenKind.InterpEnd {
+            if depth == 0 && k == TokenKind.RBrace { past_block = true }
             depth = depth + 1
         } else if k == TokenKind.LParen || k == TokenKind.LBracket || k == TokenKind.LBrace || k == TokenKind.InterpStart {
             if depth == 0 {
@@ -5169,8 +5174,11 @@ fn range_site_here() -> Int {
                 return RANGE_SITE_PLAIN
             }
             depth = depth - 1
-        } else if depth == 0 && k == TokenKind.In {
-            return RANGE_SITE_FOR
+        } else if depth == 0 && (k == TokenKind.In || k == TokenKind.While || k == TokenKind.Match) {
+            return if past_block { RANGE_SITE_PLAIN } else { RANGE_SITE_HEADER }
+        } else if depth == 0 && k == TokenKind.If {
+            if past_block || (t > 0 && ends_operand(tokens.kinds.get(t - 1).unwrap())) { return RANGE_SITE_PLAIN }
+            return RANGE_SITE_HEADER
         } else if depth == 0 && k == TokenKind.Newline {
             return RANGE_SITE_PLAIN
         }
@@ -5200,10 +5208,10 @@ fn starts_operand(kind: TokenKind) -> Bool {
     is_keyword(kind) != 0
 }
 
-// Whether the current token begins a range bound. The `{` of a for body does not, so a
-// missing bound there leaves the body to the for.
+// Whether the current token begins a range bound. The `{` of a header's body does not, so a
+// missing bound there leaves the body to the header.
 fn starts_range_bound() -> Bool {
-    starts_operand(peek_kind()) && !(at(TokenKind.LBrace) && range_site_here() == RANGE_SITE_FOR)
+    starts_operand(peek_kind()) && !(at(TokenKind.LBrace) && range_site_here() == RANGE_SITE_HEADER)
 }
 
 // Whether token `t` starts where token `t - 1` ends, with no space between them.
