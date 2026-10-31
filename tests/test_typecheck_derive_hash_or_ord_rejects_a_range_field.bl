@@ -1,0 +1,64 @@
+// A range is never `Hash` and never `Ord` (sections/03_types.md §3.6 *Traits of Range[T]*), so
+// a derived Hash or Ord over a range field is NonDerivableTrait, the same answer a List field
+// gets, and a derived Eq over one is accepted.
+
+import std.fs
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_reset}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+import std.io
+
+fn typecheck_probe(path: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    init_embedded_stdlib()
+    fs.write(path, src).unwrap()
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+}
+
+// Each error as "name: message | note | note".
+fn errors_of(src: Str) -> List[Str] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    typecheck_probe("build/test_typecheck_derive_range_field_probe.bl", src)
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" {
+            let mut line = "{d.name}: {d.message}"
+            for n in d.notes { line = "{line} | {n}" }
+            out.push(line)
+        }
+    }
+    for e in out { io.println("  diag: {e}") }
+    out
+}
+
+test "a derived Hash rejects a range field" {
+    let src = "@derive(Eq, Hash)\ntype RangeHashHolder \{\n    span: Range[Int]\n}\nfn main() \{\n}\n"
+    let errs = errors_of(src)
+    assert_eq(errs.len(), 1)
+    let e = errs.get(0).unwrap()
+    assert(e.contains("NonDerivableTrait"), e)
+    assert(e.contains("field `span` has type `Range` which does not implement Hash"), e)
+}
+
+test "a derived Ord rejects a range field" {
+    let src = "@derive(Eq, Ord)\ntype RangeOrdHolder \{\n    span: Range[Int]\n}\nfn main() \{\n}\n"
+    let errs = errors_of(src)
+    assert_eq(errs.len(), 1)
+    let e = errs.get(0).unwrap()
+    assert(e.contains("NonDerivableTrait"), e)
+    assert(e.contains("field `span` has type `Range` which does not implement Ord"), e)
+}
+
+test "a derived Hash rejects a range in an enum variant" {
+    let src = "@derive(Eq, Hash)\ntype RangeHashChoice \{\n    Span(Range[Int])\n    Empty\n}\nfn main() \{\n}\n"
+    let errs = errors_of(src)
+    assert_eq(errs.len(), 1)
+    assert(errs.get(0).unwrap().contains("NonDerivableTrait"), errs.get(0).unwrap())
+}
+
+test "a derived Eq accepts a range field" {
+    let src = "@derive(Eq)\ntype RangeEqHolder \{\n    span: Range[Int]\n}\nfn main() \{\n}\n"
+    assert_eq(errors_of(src).len(), 0)
+}

@@ -95,6 +95,7 @@ Single source of truth for release history. `blink llms` and `blink llms --full`
 - **`==` on a `Range[T]` of an unbounded `T` asks for `T: Ord`.** A range is written over an `Ord` type and `Ord` gives `Eq`, so the help is `add the bound [T: Ord]` and the note says `Range[T]` needs `T: Ord`. Before, it asked for `T: Eq`. The compiler still adds no bound you did not write.
 - **E1400 names only the `Hash` a container or range lacks.** A `List`, a `Range` and the other built-in types that cannot be a `Map` key or `Set` element have no `Hash`; the message no longer says they have no `Eq` either, and it lists ranges.
 - **A `pub fn range_bounds` of your own no longer breaks `rand.int(0..3)`.** The std modules read a range through an intrinsic of that name, and a pub user fn of the same name was reported there as not imported.
+- **`@derive(Hash)` or `@derive(Ord)` over a `Range` field is now `NonDerivableTrait` (E1401).** A range is never Hash or Ord, and the derive got through the check and stopped the build with an ICE.
 - **A call through a closure builds on the per-module path when its result is an `Option` of a sized integer type.** `xs.into_iter().count()` with `xs: List[U8]` failed in the C compiler on `blink_Option_u8`, because the unit never declared that type. Each call now declares the types of its arguments and result.
 
 ## Breaking Changes (v0.58.0)
