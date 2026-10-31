@@ -3788,8 +3788,11 @@ fn tc_conversion_error_type() -> Int ! Diag.Report {
 // A type the runtime defines, as the prelude declares it. `module` is the C module key of
 // that declaration. The prelude always loads, so a miss here is a compiler bug, not a user
 // error: a stand-in type would hide it and give layout and cname no declaration to read.
+// By the declaration's module and not by spelling: a module's own `type Duration` is not what
+// `time.sleep` takes, and the bare name in scope would be that one.
 fn ensure_runtime_struct_type(module: Str, name: Str) -> Int ! Diag.Report {
-    let existing = lookup_named_type(name)
+    let td = tc_type_decl_nodes.get("{module}.{name}") ?? -1
+    let existing = if td == -1 { -1 } else { tc_decl_tid(td) }
     if existing != -1 { return existing }
     diag_ice(
         "PreludeTypeNotLoaded",
@@ -6979,6 +6982,39 @@ fn check_builtin_arity(container_label: Str, method: Str, want: Int, args_sl: In
     if got == want { return 1 }
     tc_error_at("method `{container_label}.{method}` expects {want} argument(s), got {got}", node)
     0
+}
+
+// A `Time` operation has no fnsig under `time.{op}`, so its call is held to the signature a
+// handler clause answers it with. Without the count, codegen reads an argument that is not
+// there. One report per call: a wrong keyword shape has had its mistake named already.
+fn tc_check_time_op_args(node: Int, op: Str) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    let sig = builtin_handler_op_sig("Time", op)
+    if sig == -1 {
+        diag_ice_at("BuiltinHandlerOpUnsigned", UNSOLVED_TYPEVAR_AT_CODEGEN,
+            "builtin operation `Time.{op}` has no handler signature", node,
+            "every intrinsic `time` method needs a signature in builtin_handler_op_sig")
+        return
+    }
+    let fn_name = "time.{op}"
+    let args_sl = node_args(node)
+    if tc_check_keyword_args(fn_name, sig, args_sl, 0, node) == 0 {
+        let entry = fnsig_pool.get(sig).unwrap()
+        let got = if args_sl != -1 { sublist_length(args_sl) } else { 0 }
+        if got != entry.params_count {
+            let mut params: List[Str] = []
+            let mut i = 0
+            while i < entry.params_count {
+                let pname = fnsig_param_names.get(entry.params_start + i) ?? ""
+                params.push("{pname}: {builtin_sig_type_spelling(fnsig_param_list.get(entry.params_start + i) ?? -1)}")
+                i = i + 1
+            }
+            let ret = if entry.ret != TYPE_VOID { " -> {builtin_sig_type_spelling(entry.ret)}" } else { "" }
+            tc_error_at_code("operation `{fn_name}` expects {entry.params_count} argument(s), got {got}", node, "TypeError", TYPE_ERROR,
+                "`{fn_name}` is `fn {op}({params.join(", ")}){ret}`")
+            return
+        }
+    }
+    let _ = tc_check_arg_types_with_binds(fn_name, sig, args_sl, 0, tc_no_binds)
 }
 
 // The receiver name the arity report spells. tk_name is the stable spelling everywhere
@@ -16513,27 +16549,40 @@ fn builtin_partial_handler_stub(he: Int, root: Str, op: Str) -> HandlerStub ! Di
             while taken.contains(name) { name = name.concat("_") }
         }
         if name == "" || !builtin_stub_type_spellable(t) { fixable = false }
-        params.push("{name}: {type_to_str(t)}")
+        params.push("{name}: {builtin_sig_type_spelling(t)}")
         args.push(name)
         i = i + 1
     }
     let mut ret = ""
     if entry.ret != TYPE_VOID {
         if !builtin_stub_type_spellable(entry.ret) { fixable = false }
-        ret = " -> {type_to_str(entry.ret)}"
+        ret = " -> {builtin_sig_type_spelling(entry.ret)}"
     }
     let text = "fn {op}({params.join(", ")}){ret} \{ default.{op}({args.join(", ")}) }"
     HandlerStub { text: text, fixable: fixable }
 }
 
+// How source writes `t`. type_to_str qualifies a namesake with its C module key, which no
+// source spells.
+fn builtin_sig_type_spelling(t: Int) -> Str {
+    let shown = type_to_str(t)
+    let d = tc_tid_decl_node(t)
+    if d < 0 { return shown }
+    let args = match shown.byte_index_of("[", 0) {
+        Some(i) => shown.byte_slice(i, shown.byte_len())
+        None => ""
+    }
+    "{node_name(d)}{args}"
+}
+
 // Whether the current module spells `t` by its name. The types a builtin signature names are
-// declared in lib/std, and ensure_runtime_struct_type looks them up by bare name, so it can
-// return a namesake that a user module declares. A declaration from outside lib/std means the
-// name is not the runtime's type.
+// declared in lib/std, and a namesake that the module declares or imports takes the bare name,
+// so a clause that spells it would name that type instead. A declaration from outside lib/std
+// means the name is not the runtime's type.
 fn builtin_stub_type_spellable(t: Int) -> Bool ! TypeCheck.Resolve, Diag.Report {
     // `()` names no declaration, so no module can take its spelling.
     if type_kind(t) == TyKind.Void { return true }
-    let named = resolve_type_name(type_to_str(t))
+    let named = resolve_type_name(builtin_sig_type_spelling(t))
     // Each mention of Bytes gets its own tid, so Bytes is spellable when no declaration takes
     // the name.
     if type_kind(t) == TyKind.Bytes { return named >= 0 && type_kind(named) == TyKind.Bytes }
@@ -27806,6 +27855,7 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
             // comparison check (Stage 4) catch `time.read() > 0` at `blink check` instead
             // of leaking an Instant into invalid C.
             if is_import_module_name(obj_name) != 0 && nr_is_defined(obj_name) == 0 && is_intrinsic_method(obj_name, method) != 0 {
+                if obj_name == "time" { tc_check_time_op_args(node, method) }
                 if obj_name == "time" && method == "read" {
                     // std.time is a prelude module (compiler.bl:1357), so the declaration
                     // is normally present — but a silent fall-through when it is not would

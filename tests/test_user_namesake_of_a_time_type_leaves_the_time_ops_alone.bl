@@ -1,0 +1,111 @@
+// `time.read() -> Instant`, `time.monotonic() -> Monotonic` and `time.sleep(d: Duration)` name
+// the types std.time declares (sections/03_types.md §3.2.3, sections/04_effects.md §4.3). A
+// module that declares its own type of the same name has a different type: it does not change
+// what the operation returns or takes, so a valid program compiles and a wrong one is a type
+// error, never a C compile error. Each program only binds the reading: a method call on it
+// with a namesake in scope is a separate bug in method lookup.
+
+import compile_test_helpers
+
+fn expect_runs(label: Str, r: compile_test_helpers.RunResult, want: Str) ! IO.Print, IO.Eprint {
+    if r.exit_code != 0 || r.out != want {
+        io.eprintln("FAIL: {label}: exit {r.exit_code}\nout: {r.out}\nerr: {r.err_out}")
+    }
+    assert_eq(r.exit_code, 0)
+    assert_eq(r.out, want)
+}
+
+test "a program that declares Duration still sleeps for a std Duration" {
+    let r = compile_test_helpers.compile_and_run(#"
+type Duration {
+    nanos: Int
+}
+
+fn main() {
+    let mine = Duration { nanos: 5 }
+    time.sleep(Duration.ms(1))
+    io.println("mine {mine.nanos}")
+}
+"#, "namesake_duration_sleep")
+    expect_runs("user Duration + sleep", r, "mine 5\n")
+}
+
+test "a program that declares Monotonic still reads the std Monotonic" {
+    let r = compile_test_helpers.compile_and_run(#"
+type Monotonic {
+    a: Str
+    b: Int
+}
+
+fn main() {
+    let m = Monotonic { a: "hi", b: 3 }
+    let _t = time.monotonic()
+    io.println("{m.a} {m.b}")
+}
+"#, "namesake_monotonic_read")
+    expect_runs("user Monotonic + monotonic", r, "hi 3\n")
+}
+
+test "a program that declares Instant still reads the std Instant" {
+    let r = compile_test_helpers.compile_and_run(#"
+type Instant {
+    s: Str
+}
+
+fn main() {
+    let mine = Instant { s: "x" }
+    let _w = time.read()
+    io.println("{mine.s}")
+}
+"#, "namesake_instant_read")
+    expect_runs("user Instant + read", r, "x\n")
+}
+
+test "a user Monotonic is not what time.monotonic returns" {
+    let out = compile_test_helpers.compile_and_capture(#"
+type Monotonic {
+    nanos: Int
+}
+
+fn main() {
+    let a: Monotonic = time.monotonic()
+    io.println("{a.nanos}")
+}
+"#, "namesake_monotonic_annotated")
+    compile_test_helpers.expect_contains(out, "variable `a`: declared type Monotonic (main) but got Monotonic", "user Monotonic annotation")
+    assert(!out.contains("C compilation failed"))
+}
+
+test "a user Duration is not what time.sleep takes" {
+    let out = compile_test_helpers.compile_and_capture(#"
+type Duration {
+    nanos: Int
+}
+
+fn main() {
+    time.sleep(Duration { nanos: 1 })
+}
+"#, "namesake_duration_argument")
+    compile_test_helpers.expect_contains(out, "argument 1 of `time.sleep` expects Duration", "user Duration argument")
+    assert(!out.contains("C compilation failed"))
+}
+
+test "an imported module that declares Monotonic leaves time.monotonic alone" {
+    let r = compile_test_helpers.run_xmod(#"
+import clock.mono
+
+fn main() {
+    let _a = time.monotonic()
+    io.println("{mono.own().nanos}")
+}
+"#, "clock", "mono", #"
+pub type Monotonic {
+    nanos: Int
+}
+
+pub fn own() -> Monotonic {
+    Monotonic { nanos: 4 }
+}
+"#, "namesake_monotonic_imported")
+    expect_runs("imported Monotonic", r, "4\n")
+}

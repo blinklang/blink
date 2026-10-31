@@ -1,0 +1,91 @@
+// A call of a `Time` operation (sections/04_effects.md §4.3: `time.read() -> Instant`,
+// `time.monotonic() -> Monotonic`, `time.sleep(d: Duration)`) is held to the signature a
+// handler clause answers it with: its argument count and each argument's type. A wrong call
+// is a type error that names the operation and its signature, not a call codegen reads an
+// argument from that is not there.
+
+import std.fs
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries}
+import compile_test_helpers
+import std.io
+
+fn probe(name: Str, body: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    let path = "build/time_op_args_{name}.bl"
+    fs.write(path, "fn main() \{\n    {body}\n}\n").unwrap()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+}
+
+fn errors() -> List[Str] {
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" { out.push("{d.name} {d.line}:{d.col} {d.message} | {d.help}") }
+    }
+    out
+}
+
+fn expect_one_error(label: Str, want: Str) ! IO.Eprint {
+    let errs = errors()
+    if errs.len() != 1 || errs.get(0).unwrap() != want {
+        io.eprintln("FAIL: {label}: want the one error\n  {want}\ngot {errs.len()}:")
+        for e in errs { io.eprintln("  {e}") }
+    }
+    assert(errs.len() == 1)
+    assert_eq(errs.get(0).unwrap(), want)
+}
+
+fn expect_no_error(label: Str) ! IO.Eprint {
+    let errs = errors()
+    if errs.len() != 0 {
+        io.eprintln("FAIL: {label}: want no error, got:")
+        for e in errs { io.eprintln("  {e}") }
+    }
+    assert(errs.len() == 0)
+}
+
+test "time.read with an argument is an error that gives its signature" {
+    probe("read_extra", "let _ = time.read(1)")
+    expect_one_error("read(1)", "TypeError 2:13 operation `time.read` expects 0 argument(s), got 1 | `time.read` is `fn read() -> Instant`")
+}
+
+test "time.monotonic with an argument is an error that gives its signature" {
+    probe("monotonic_extra", "let _ = time.monotonic(1)")
+    expect_one_error("monotonic(1)", "TypeError 2:13 operation `time.monotonic` expects 0 argument(s), got 1 | `time.monotonic` is `fn monotonic() -> Monotonic`")
+}
+
+test "time.sleep with no argument is an error that gives its signature" {
+    probe("sleep_none", "time.sleep()")
+    expect_one_error("sleep()", "TypeError 2:5 operation `time.sleep` expects 1 argument(s), got 0 | `time.sleep` is `fn sleep(d: Duration)`")
+}
+
+test "time.sleep with two arguments is an error that gives its signature" {
+    probe("sleep_two", "time.sleep(Duration.ms(1), Duration.ms(2))")
+    expect_one_error("sleep(a, b)", "TypeError 2:5 operation `time.sleep` expects 1 argument(s), got 2 | `time.sleep` is `fn sleep(d: Duration)`")
+}
+
+test "time.sleep with an Int is an error that names the Duration it expects" {
+    probe("sleep_int", "time.sleep(5)")
+    expect_one_error("sleep(5)", "TypeError 2:16 argument 1 of `time.sleep` expects Duration, got Int | ")
+}
+
+test "well-formed Time operation calls have no error" {
+    probe("well_formed", #"time.sleep(Duration.ms(1))
+    let a = time.monotonic()
+    let w = time.read()
+    io.println("{a.since(a)} {w.to_unix_secs()}")"#)
+    expect_no_error("well formed")
+}
+
+test "blink build reports a time.sleep with no argument and does not reach codegen" {
+    let out = compile_test_helpers.compile_and_capture(#"
+fn main() {
+    time.sleep()
+}
+"#, "time_sleep_no_argument")
+    compile_test_helpers.expect_contains(out, "operation `time.sleep` expects 1 argument(s), got 0", "sleep() is a type error")
+    assert(!out.contains("internal compiler error"))
+    assert(!out.contains("ICE"))
+}
