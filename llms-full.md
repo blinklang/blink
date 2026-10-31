@@ -1084,7 +1084,7 @@ match r.end {
 
 | Method | Returns | Purpose |
 |--------|---------|---------|
-| `time.read()` | Instant | Current time |
+| `time.read()` | Instant | Current wall-clock time |
 | `Instant.from_epoch_secs(n)` | Instant | From unix timestamp; panics outside the std.time range |
 | `Instant.parse(s)` | Result[Instant, ConversionError] | RFC 3339 text, offset applied to give UTC |
 | `.since(other)` | Duration | Difference between instants (`later.since(earlier)`) |
@@ -1460,14 +1460,14 @@ with db.transaction() {
 
 ```blink
 pub fn timer(label: Str) -> Timer ! Time.Read {
-    Timer { label: label, start: time.read() }
+    Timer { label: label, start: time.monotonic() }
 }
 
 impl BlockHandler for Timer {
     type Context = ()
     fn enter(self) -> () {}
     fn exit(self, ok: Bool) ! Time.Read, IO.Log {
-        io.log("{self.label}: {self.start.elapsed()}")
+        io.log("{self.label}: {time.monotonic().since(self.start)}")
     }
 }
 
