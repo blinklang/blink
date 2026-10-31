@@ -1,0 +1,149 @@
+// An impl method's row may narrow the row of its trait method but not widen it, so a bound
+// `T: Trait` bounds what a call through it does (sections/03_types.md §3.6). A trait method
+// whose row has `_` lets each impl choose its own row and bounds nothing (§4.15.2). An impl
+// `_` with no source is E0551 alone.
+
+import std.fs
+import compile_test_helpers
+
+fn base_src() -> Str {
+    #"effect Note { effect Say { fn say(s: Str) } effect Yell { fn yell(s: Str) } }
+type R { n: Int }
+"#
+}
+
+fn with_base(body: Str) -> Str {
+    "{base_src()}{body}"
+}
+
+fn count(text: Str, part: Str) -> Int {
+    text.split(part).len() - 1
+}
+
+fn run_human(path: Str, src: Str) -> Str ! FS.Delete, FS.Write, Process.Spawn {
+    fs.write(path, src).unwrap()
+    let result = process.run("build/blinkc", [path, "/dev/null"]).unwrap()
+    let output = "{result.out}{result.err_out}"
+    let _ = fs.delete(path)
+    output
+}
+
+test "an impl that adds one effect to an empty trait row is E0904" {
+    let src = with_base(#"trait Logs { fn log(self) }
+impl Logs for R {
+    fn log(self) ! Note.Say { note.say("log {self.n}") }
+}
+fn main() { }
+"#)
+    let out = compile_test_helpers.compile_and_capture(src, "impl_row_one_wide")
+    compile_test_helpers.expect_error(out, "E0904", "R.log adds Note.Say")
+    compile_test_helpers.expect_contains(out, "`log` declares effects its trait method does not", "the message names the method")
+    compile_test_helpers.expect_contains(out, "`Note.Say` is not in the row of `Logs.log`, which is empty", "the label names the effect and the trait row")
+    compile_test_helpers.expect_contains(out, "remove `! Note.Say` and do the Note.Say at the call site, or add `Note.Say` to `Logs.log` in the trait", "the help gives both fixes")
+    compile_test_helpers.expect_contains(out, "\"line\":5,\"col\":20", "the diagnostic points at the effect")
+    assert_eq(count(out, "\"code\":\"E0904\""), 1)
+}
+
+test "an impl that adds two effects is one E0904 with a label for each" {
+    let src = with_base(#"trait Logs { fn log(self) ! Note.Say }
+impl Logs for R {
+    fn log(self) ! Note.Say, IO.Print, Env.Read { note.say("log {self.n}") }
+}
+fn main() { }
+"#)
+    let out = compile_test_helpers.compile_and_capture(src, "impl_row_two_wide")
+    compile_test_helpers.expect_error(out, "E0904", "R.log adds IO.Print and Env.Read")
+    compile_test_helpers.expect_contains(out, "`IO.Print` is not in the row of `Logs.log`, which is `Note.Say`", "a label for IO.Print")
+    compile_test_helpers.expect_contains(out, "`Env.Read` is not in the row of `Logs.log`, which is `Note.Say`", "a label for Env.Read")
+    compile_test_helpers.expect_contains(out, "remove `IO.Print`, `Env.Read` from the row and do them at the call site, or add `IO.Print`, `Env.Read` to `Logs.log` in the trait", "one help names both")
+    compile_test_helpers.expect_contains(out, "\"line\":5,\"col\":40,\"end_line\":5,\"end_col\":48}", "the second label has its own span")
+    assert_eq(count(out, "\"code\":\"E0904\""), 1)
+    assert_eq(count(out, "Note.Say` is not in the row"), 0)
+}
+
+test "the human text shows a caret line for each label" {
+    let src = with_base(#"trait Logs { fn log(self) }
+impl Logs for R {
+    fn log(self) ! IO.Print, Env.Read { }
+}
+fn main() { }
+"#)
+    let out = run_human("{compile_test_helpers.scratch_root()}/_impl_row_human.bl", src)
+    assert(out.contains("\n5 |     fn log(self) ! IO.Print, Env.Read \{ }\n  |                    ^^^^^^^^ `IO.Print` is not in the row of `Logs.log`, which is empty\n  |                              ^^^^^^^^ `Env.Read` is not in the row of `Logs.log`, which is empty\n"))
+}
+
+test "a parent effect is wider than its child in the trait row" {
+    let src = with_base(#"trait Logs { fn log(self) ! Note.Say }
+impl Logs for R {
+    fn log(self) ! Note { note.say("log {self.n}") }
+}
+fn main() { }
+"#)
+    let out = compile_test_helpers.compile_and_capture(src, "impl_row_parent_wide")
+    compile_test_helpers.expect_error(out, "E0904", "Note is wider than Note.Say")
+    compile_test_helpers.expect_contains(out, "`Note` is not in the row of `Logs.log`, which is `Note.Say`", "the label names Note")
+    assert_eq(count(out, "\"code\":\"E0904\""), 1)
+}
+
+test "an impl that narrows or keeps its trait row compiles clean" {
+    let src = with_base(#"trait Logs { fn log(self) ! Note }
+impl Logs for R {
+    fn log(self) ! Note.Say { note.say("log {self.n}") }
+}
+type P { n: Int }
+impl Logs for P {
+    fn log(self) { }
+}
+trait Keeps { fn keep(self) ! Note.Say, IO.Print }
+impl Keeps for R {
+    fn keep(self) ! IO.Print, Note.Say { note.say("keep {self.n}")
+        io.println("kept") }
+}
+fn main() { }
+"#)
+    let out = compile_test_helpers.compile_and_capture(src, "impl_row_narrow")
+    compile_test_helpers.expect_compiles_clean(out, "a narrower or equal row fits the trait row")
+}
+
+test "a trait row with _ bounds no impl row" {
+    let src = with_base(#"trait Acts { fn act(self) ! _ }
+impl Acts for R {
+    fn act(self) ! Note.Say, IO.Print { note.say("act {self.n}") }
+}
+fn main() { }
+"#)
+    let out = compile_test_helpers.compile_and_capture(src, "impl_row_trait_wild")
+    compile_test_helpers.expect_compiles_clean(out, "each impl chooses its row")
+}
+
+test "a sourced _ in an impl of a fixed trait row is E0904" {
+    let src = with_base(#"impl Closeable for R {
+    fn close(self) ! Note.Say { note.say("close {self.n}") }
+}
+trait Shuts { fn shut(self) ! Note.Say }
+type Guard[T] { inner: T }
+impl[T: Closeable] Shuts for Guard[T] {
+    fn shut(self) ! _ { self.inner.close() }
+}
+fn main() { }
+"#)
+    let out = compile_test_helpers.compile_and_capture(src, "impl_row_sourced_wild")
+    compile_test_helpers.expect_error(out, "E0904", "Guard.shut has _ under a fixed row")
+    compile_test_helpers.expect_contains(out, "`_` can stand for any effect, and the row of `Shuts.shut` is `Note.Say`", "the label says what _ can be")
+    compile_test_helpers.expect_contains(out, "name the effects this impl performs, or give `Shuts.shut` the row `! _` in the trait", "the help gives both fixes")
+    assert_eq(count(out, "\"code\":\"E0904\""), 1)
+    assert_eq(count(out, "\"code\":\"E0551\""), 0)
+}
+
+test "an unsourced _ in an impl of a fixed trait row is E0551 and not E0904" {
+    let src = with_base(#"trait Logs { fn log(self) ! Note.Say }
+impl Logs for R {
+    fn log(self) ! _ { note.say("log {self.n}") }
+}
+fn main() { }
+"#)
+    let out = compile_test_helpers.compile_and_capture(src, "impl_row_unsourced_wild")
+    compile_test_helpers.expect_error(out, "E0551", "the _ has no source")
+    assert_eq(count(out, "\"code\":\"E0551\""), 1)
+    assert_eq(count(out, "\"code\":\"E0904\""), 0)
+}

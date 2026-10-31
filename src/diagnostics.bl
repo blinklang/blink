@@ -512,6 +512,16 @@ pub type DiagEntry {
     // Printed after the carets: what the marked text does, where the message says what is
     // wrong with it.
     label: Str = ""
+    // Further spans of the same fault, such as the second of two effects an impl adds, each
+    // with its own label. All lie in the entry's file.
+    more_labels: List[DiagLabel] = []
+}
+
+pub type DiagLabel {
+    line: Int
+    col: Int
+    end_col: Int
+    message: Str
 }
 
 type FileRange {
@@ -1072,6 +1082,17 @@ pub fn diag_error_span_label_at_notes(name: Str, code: Str, message: Str, node_i
     diag_label_last_since(before, label)
 }
 
+// Adds a labeled span to the newest entry, under the rule diag_label_last_since gives.
+pub fn diag_add_label_since(before: Int, line: Int, col: Int, end_col: Int, label: Str) ! Diag.Report {
+    if diag_entries.len() <= before { return }
+    let idx = diag_entries.len() - 1
+    let d = diag_entries.get(idx).unwrap()
+    let mut more: List[DiagLabel] = []
+    for ml in d.more_labels { more.push(ml) }
+    more.push(DiagLabel { line: line, col: col, end_col: end_col, message: label })
+    diag_entries.set(idx, DiagEntry { more_labels: more, ..d })
+}
+
 // Puts `label` on the newest entry only when one was recorded after `before`: an `off` level
 // or a repeat records nothing, and the last entry then belongs to another diagnostic.
 fn diag_label_last_since(before: Int, label: Str) ! Diag.Report {
@@ -1355,7 +1376,11 @@ fn diag_json_line(idx: Int) -> Str {
     // The schema of sections/06_tooling.md §8.6 lists labels with their own spans; the one
     // label an entry holds marks its primary span.
     if located && d.label != "" {
-        json = json.concat(",\"labels\":[\{\"span\":\{{pos}},\"message\":\"").concat(json_escape(d.label)).concat("\"}]")
+        json = json.concat(",\"labels\":[\{\"span\":\{{pos}},\"message\":\"").concat(json_escape(d.label)).concat("\"}")
+        for ml in d.more_labels {
+            json = json.concat(",\{\"span\":\{\"line\":{ml.line},\"col\":{ml.col},\"end_line\":{ml.line},\"end_col\":{ml.end_col}},\"message\":\"").concat(json_escape(ml.message)).concat("\"}")
+        }
+        json = json.concat("]")
     }
     if help != "" {
         json = json.concat(",\"help\":\"").concat(json_escape(help)).concat("\"")
@@ -1480,6 +1505,17 @@ fn diag_snippet_text(file: Str, line: Int, col: Int, end_col: Int, label: Str) -
     sb.to_str()
 }
 
+// A label on the primary line gets a caret line of its own under that line; a label on
+// another line gets its own snippet.
+fn diag_more_label_text(file: Str, primary_line: Int, ml: DiagLabel) -> Str {
+    if ml.line != primary_line { return diag_snippet_text(file, ml.line, ml.col, ml.end_col, ml.message) }
+    if source_get_line(file, ml.line) == "" { return "" }
+    let gutter_pad = str_repeat(" ", int_digit_count(ml.line) + 1)
+    let caret_len = if ml.end_col > ml.col { ml.end_col - ml.col } else { 1 }
+    let caret_pad = str_repeat(" ", if ml.col > 1 { ml.col - 1 } else { 0 })
+    "{gutter_pad}| {caret_pad}{str_repeat("^", caret_len)} {ml.message}\n"
+}
+
 /// A command usage error at a span of a config file, in the form of a diagnostic but with no
 /// code: it stops the command before any compile, so no lint level or --json row governs it.
 /// end_col is on line; a span over more lines shows carets to the end of its first line.
@@ -1502,6 +1538,9 @@ fn diag_human_text(idx: Int) -> Str {
     sb.write("{display_severity}[{d.name}]: {d.message}\n")
     if d.line > 0 {
         sb.write(diag_snippet_text(d.file, d.line, d.col, d.end_col, d.label))
+        for ml in d.more_labels {
+            sb.write(diag_more_label_text(d.file, d.line, ml))
+        }
     }
     let mut ni = 0
     while ni < d.notes.len() {
@@ -2155,7 +2194,7 @@ pub fn diag_explain(code: Str) -> Str {
         return "E0903 -- TraitContractReturnMismatch\n\nAn impl method's return type does not match the trait's declared\nreturn type.\n\nA trait method written with no arrow declares that it returns\nnothing, and that is part of the contract. An impl of it must also\nbe written with no arrow.\n\nFix: align the impl return type with the trait; where the trait has\nno arrow, remove the impl's arrow rather than writing a type."
     }
     if code == TRAIT_CONTRACT_904 {
-        return "E0904 -- TraitContractEffectMismatch\n\nAn impl method declares effects that differ from the trait. Impls\nmay declare a subset of the trait's effects but not a superset.\n\nFix: remove the extra effects from the impl, or widen the trait\nsignature if the new effects are intentional."
+        return "E0904 -- TraitContractEffectMismatch\n\nAn impl method declares effects that its trait method does not. An\nimpl may narrow the row of its trait method but not widen it, so a\nbound `T: Trait` bounds what a call through it does. A trait method\nwith no `!` has the empty row. A trait row with `_` lets each impl\nchoose its own row and bounds none. A `_` in the impl row can stand\nfor any effect, so it does not fit a row without `_`.\n\n  trait Logs \{ fn log(self) }\n  impl Logs for R \{ fn log(self) ! IO.Print \{ ... } }  // E0904\n  trait Acts \{ fn act(self) ! _ }\n  impl Acts for R \{ fn act(self) ! IO.Print \{ ... } }  // OK\n\nFix: remove the extra effects and do them at the call site, or add\nthem to the trait method's row."
     }
     if code == TRAIT_CONTRACT_905 {
         return "E0905 -- TraitContractExtraMethod\n\nAn `impl Trait for Type` declares a method that is not part of the\ntrait. Impl blocks may only contain methods named by the trait.\n\nFix: move the extra method to a free `impl Type` block (inherent\nimpl), or add it to the trait declaration."

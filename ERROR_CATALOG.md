@@ -253,7 +253,7 @@ ICE codes use the `I` prefix. `@allow` and `[lints]` take warning names only, so
 | TraitContractWrongArity | E0901 | Trait contract: method has wrong argument arity | Trait contract | §3.6 |
 | TraitContractParamMismatch | E0902 | Trait contract: method parameter type mismatch | Trait contract | §3.6 |
 | TraitContractReturnMismatch | E0903 | Trait contract: method return type mismatch | Trait contract | §3.6 |
-| TraitContractEffectMismatch | E0904 | Trait contract: method effect mismatch. Only a trait-method row with no `_` limits its impls; an impl-chosen `_` (no callback source) limits none (§4.15.2) | Trait contract | §3.6 |
+| TraitContractEffectMismatch | E0904 | Trait contract: an impl method's row is wider than the row of its trait method. Only a trait-method row with no `_` limits its impls; a row with `_` limits none (§4.15.2). One error per method, with a label on each effect the impl adds. A `_` in the impl row can stand for any effect, so it is wider than a row with no `_`; its label is "`_` can stand for any effect, and the row of `Tr.m` is `<row>`". The `help:` line names every added effect: remove them and do them at the call site, or add them to the trait method's row; for `_`, "name the effects this impl performs, or give `Tr.m` the row `! _` in the trait". An unsourced `_` is E0551 instead | Trait contract | §3.6 |
 | TraitContractExtraMethod | E0905 | Trait contract: impl declares method not in trait | Trait contract | §3.6 |
 | TraitContractGenericMismatch | E0906 | Trait contract: generic-parameter mismatch | Trait contract | §3.6 |
 | TraitContractSealedBuiltin | E0907 | Sealed built-in trait cannot be redefined or implemented for user types | Trait contract | §3.6 |
@@ -434,6 +434,7 @@ The self-hosting compiler (`src/codegen_types.bl`, `src/codegen_expr.bl`) curren
 | E0502 | QuestionMarkInvalidOperand | `codegen_expr.bl` — `?` operator type check (to move to typecheck phase) |
 | E0513 | CoalesceRequiresOption | `codegen_expr.bl` — `??` operator type check |
 | E0551 | UnsourcedEffectWildcard | `typecheck.bl` — `tc_er_check_wild_source`, from the effect-row walk, on the first `_` in the row of each fn and impl method, `main` included, that has no type parameter whose bound has a `_` method. Skips trait-method declarations and the `exit` the compiler writes for a `Closeable`. Not yet checked: a `! _` callback or handler parameter, which no fn type or `Handler` type can write yet |
+| E0904 | TraitContractEffectMismatch | `typecheck.bl` — `tc_er_check_impl_rows`, after the effect-row walk, on each method of a trait impl whose trait method row has no `_`, at each effect of the impl row that the trait row does not hold (FFI aside). Skips the impl the parser writes for a Closeable and an impl `_` with no source |
 | E0827 | SkipOutsideTest | `typecheck.bl` — rejects `skip()` outside a test body (via the §2.20 test-only symbol fence) |
 | E0835 | XfailMissingReason | `typecheck.bl` — rejects `test.failing(...)` with a missing or empty `reason:` |
 | E0508 | QuestionMarkResultInNonResult | `codegen_expr.bl` — `?` on Result in non-Result function |

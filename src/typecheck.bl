@@ -23,7 +23,7 @@ import parser.{
 }
 import diagnostics.{
     Diag, diag_clear_allows, diag_error_at, diag_error_at_notes, diag_error_span_at_notes, diag_error_no_loc,
-    diag_set_last_fix, diag_set_last_fix_at, diag_add_last_fix_edit, diag_source_lines, diag_entries, UNDECLARED_EFFECT, UNSOURCED_EFFECT_WILDCARD,
+    diag_set_last_fix, diag_set_last_fix_at, diag_add_label_since, diag_add_last_fix_edit, diag_source_lines, diag_entries, UNDECLARED_EFFECT, UNSOURCED_EFFECT_WILDCARD,
     diag_push_allows, diag_enter_allows, diag_exit_allows, NON_CONST_EXPR,
     diag_warn_at, diag_warn_at_notes, diag_warn_span_at_notes, PARTIAL_HANDLER, diag_truncate, diag_entry_count, diag_any_errors_since, diag_ice_at, diag_ice, PRELUDE_TYPE_NOT_LOADED, diag_count, diag_emit_in_file, diag_file_for_node, diag_file_node_range,
     diag_is_audit_gated, diag_audit_gated_help, AUDIT_GATED_SUPPRESSION, diag_normalize_path, diag_source_line, diag_errors_in_lines,
@@ -36735,6 +36735,84 @@ fn tc_er_walk_fn(program: Int, fn_node: Int, kids: List[Int]) ! TypeCheck.Resolv
     tc_er_walk(program, node_body(fn_node), held, ErOwner { name: node_name(fn_node), default_body: default_body }, kids)
 }
 
+// An impl method's row may narrow its trait method's row but not widen it, so a bound
+// `T: Trait` bounds the effects of a call through it (§3.6). A trait row with `_` lets each
+// impl choose its own, so it bounds nothing. An unsourced `_` is E0551 alone.
+fn tc_er_check_impl_rows(program: Int) ! Diag.Report {
+    let impls = node_methods(program)
+    if impls == -1 { return }
+    let mut i = 0
+    while i < sublist_length(impls) {
+        let im = sublist_get(impls, i)
+        let tr = tc_trait_node_idx.get(tc_impl_trait_id(im)) ?? -1
+        let ms = node_methods(im)
+        if tr != -1 && ms != -1 && !impl_provided_by_closeable(im) {
+            let mut j = 0
+            while j < sublist_length(ms) {
+                let m = sublist_get(ms, j)
+                let tm = tc_er_impl_method(tr, node_name(m))
+                if tm != -1 { tc_er_check_impl_row(program, m, tm, node_name(tr)) }
+                j = j + 1
+            }
+        }
+        i = i + 1
+    }
+}
+
+fn tc_er_check_impl_row(program: Int, m: Int, tm: Int, trait_name: Str) ! Diag.Report {
+    let rt = tc_er_fn_row(tm)
+    if rt.contains("_") { return }
+    let effs = node_effects(m)
+    if effs == -1 { return }
+    let ri = tc_er_fn_row(m)
+    if ri.contains("_") && tc_er_wild_params(m).len() == 0 { return }
+    // A sourced `_` can stand for any row, so it never fits inside a fixed one.
+    let mut wide: List[Int] = []
+    let mut k = 0
+    while k < sublist_length(effs) {
+        let e = sublist_get(effs, k)
+        let en = node_name(e)
+        // FFI is left out here for the reason tc_er_check_call gives.
+        let ffi = en == "FFI" || en.starts_with("FFI.")
+        if !ffi && (en == "_" || !tc_er_satisfied(program, rt, en)) { wide.push(e) }
+        k = k + 1
+    }
+    if wide.len() == 0 { return }
+    let tshown = "{trait_name}.{node_name(tm)}"
+    let row_shown = if rt.len() == 0 { "empty" } else { "`{rt.join(", ")}`" }
+    let mut named: List[Str] = []
+    for e in wide {
+        if node_name(e) != "_" { named.push(node_name(e)) }
+    }
+    let mut helps: List[Str] = []
+    if named.len() == 1 {
+        let en = named.get(0).unwrap()
+        helps.push("remove `! {en}` and do the {en} at the call site, or add `{en}` to `{tshown}` in the trait")
+    } else if named.len() > 1 {
+        let list = "`{named.join("`, `")}`"
+        helps.push("remove {list} from the row and do them at the call site, or add {list} to `{tshown}` in the trait")
+    }
+    if named.len() < wide.len() {
+        helps.push("name the effects this impl performs, or give `{tshown}` the row `! _` in the trait")
+    }
+    let before = diag_entry_count()
+    let mut i = 0
+    while i < wide.len() {
+        let e = wide.get(i).unwrap()
+        let en = node_name(e)
+        let label = if en == "_" { "`_` can stand for any effect, and the row of `{tshown}` is {row_shown}" } else { "`{en}` is not in the row of `{tshown}`, which is {row_shown}" }
+        let end_col = node_col(e) + en.byte_len()
+        if i == 0 {
+            diag_error_span_label_at_notes("TraitContractEffectMismatch", TRAIT_CONTRACT_904,
+                "`{node_name(m)}` declares effects its trait method does not", e,
+                node_line(e), node_col(e), end_col, label, helps.join("; "), [])
+        } else {
+            diag_add_label_since(before, node_line(e), node_col(e), end_col, label)
+        }
+        i = i + 1
+    }
+}
+
 // A `_` in the row of a fn or impl method stands for what some parameter brings, so it needs
 // one (§4.15.2). A trait method's `_` is the impl-chosen contract and needs none. The exit the
 // parser writes for a Closeable copies the row of close, which is checked in its place.
@@ -36790,6 +36868,7 @@ fn tc_check_effect_rows(program: Int) ! TypeCheck.Resolve, Diag.Report {
     }
     tc_er_walk_methods(program, node_methods(program), kids)
     tc_er_walk_methods(program, node_arms(program), kids)
+    tc_er_check_impl_rows(program)
     // A derived body runs at the call site, and that call needs only the effect that declares
     // the operation, so the body holds that effect and nothing more.
     for op in effect_derived_ops(program) {
