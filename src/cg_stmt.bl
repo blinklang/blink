@@ -2567,9 +2567,12 @@ fn container_ref(span: Int, tid: Int, rec: LayoutRecord, name: Str) -> Int {
 // `for i in lo..hi { b }` becomes
 //   T i = lo; T end = hi; int first = 1;
 //   while (1) { if (first) { first = 0; } else { i = i + 1; } if (i >= end) break; b }
+// and `for i in lo..=hi { b }` becomes
+//   while (1) { if (first) { first = 0; if (i > end) break; } else { if (i == end) break; i = i + 1; } b }
 // The step runs at the top of the loop, so a `continue` in the body cannot skip it, and
-// the end of the range is read once rather than on every turn. An inclusive range
-// compares with `>` so the last value runs. A `mut i` gets a counter of its own and binds a
+// the end of the range is read once rather than on every turn. An inclusive range stops
+// on the turn after `end` instead of stepping past it, because `end` may be the largest
+// value of T and the step would overflow. A `mut i` gets a counter of its own and binds a
 // copy of it at the top of each turn, so a write to `i` lasts only for that turn.
 fn lower_for_range(node: Int, iter: Int) -> Int ! Diag.Report {
     let _ = open_scope()
@@ -2624,26 +2627,26 @@ fn lower_counted(node: Int, iter: Int, tid: Int, rec: LayoutRecord, lo: Int, hi:
     let first_let = ir_let(TYPE_INT, node, int_spelling(node), first, int_form(node), int_const(node, "1"))
     let mut turn: List[Int] = []
     if !binder_mut { bind_binder_mut(cur_scope(), node_name(binder), tid, false) }
-    let step = ir_if(node, flag_ref(node, first),
-        ir_block(node, [ir_assign(node, flag_ref(node, first), int_const(node, "0"))]),
-        ir_block(node, [ir_assign(node, ir_var_ref(tid, node, rec.c_spelling, name, rec.slot_form),
-            ir_binary(tid, node, rec.c_spelling, "+",
-                ir_var_ref(tid, node, rec.c_spelling, name, rec.slot_form),
-                ir_const(tid, node, rec.c_spelling, "1")))]))
-    let stop = if flag.is_some() || node_inclusive(iter) == 1 { ">" } else { ">=" }
-    let cond = ir_binary(TYPE_INT, iter, int_spelling(iter), stop,
-        ir_var_ref(tid, iter, rec.c_spelling, name, rec.slot_form),
-        ir_var_ref(tid, iter, rec.c_spelling, end_name, rec.slot_form))
-    let guard = ir_if(iter, cond, ir_block(iter, [ir_break(iter)]), -1)
-    turn.push(step)
-    turn.push(guard)
+    let advance = ir_assign(node, ir_var_ref(tid, node, rec.c_spelling, name, rec.slot_form),
+        ir_binary(tid, node, rec.c_spelling, "+",
+            ir_var_ref(tid, node, rec.c_spelling, name, rec.slot_form),
+            ir_const(tid, node, rec.c_spelling, "1")))
+    let clear_first = ir_assign(node, flag_ref(node, first), int_const(node, "0"))
+    // A range value may include its end, so it takes the inclusive shape and its flag
+    // stops it one turn sooner when the end is left out.
+    if flag.is_some() || node_inclusive(iter) == 1 {
+        let empty = ir_if(iter, counter_cmp(iter, tid, rec, name, end_name, ">"), ir_block(iter, [ir_break(iter)]), -1)
+        let at_end = ir_if(iter, counter_cmp(iter, tid, rec, name, end_name, "=="), ir_block(iter, [ir_break(iter)]), -1)
+        turn.push(ir_if(node, flag_ref(node, first), ir_block(node, [clear_first, empty]), ir_block(node, [at_end, advance])))
+    } else {
+        turn.push(ir_if(node, flag_ref(node, first), ir_block(node, [clear_first]), ir_block(node, [advance])))
+        turn.push(ir_if(iter, counter_cmp(iter, tid, rec, name, end_name, ">="), ir_block(iter, [ir_break(iter)]), -1))
+    }
     // A range value stops at its end too unless its flag says the end is in the range.
     match flag {
         Some(flag_local) => {
             let flag_rec = layout_at(TYPE_BOOL, Position.Local, iter)
-            let at_end = ir_binary(TYPE_INT, iter, int_spelling(iter), "==",
-                ir_var_ref(tid, iter, rec.c_spelling, name, rec.slot_form),
-                ir_var_ref(tid, iter, rec.c_spelling, end_name, rec.slot_form))
+            let at_end = counter_cmp(iter, tid, rec, name, end_name, "==")
             let open_end = ir_unary(TYPE_BOOL, iter, flag_rec.c_spelling, "!",
                 ir_var_ref(TYPE_BOOL, iter, flag_rec.c_spelling, flag_local, flag_rec.slot_form))
             let end_cond = ir_binary(TYPE_INT, iter, int_spelling(iter), "&&", at_end, open_end)
@@ -2665,6 +2668,13 @@ fn lower_counted(node: Int, iter: Int, tid: Int, rec: LayoutRecord, lo: Int, hi:
     stmts.push(first_let)
     stmts.push(ir_loop(node, ir_block(node, turn)))
     ir_block(node, stmts)
+}
+
+// `counter op end` for a counted loop, with reads of their own for the verifier.
+fn counter_cmp(span: Int, tid: Int, rec: LayoutRecord, name: Str, end_name: Str, op: Str) -> Int ! Diag.Report {
+    ir_binary(TYPE_INT, span, int_spelling(span), op,
+        ir_var_ref(tid, span, rec.c_spelling, name, rec.slot_form),
+        ir_var_ref(tid, span, rec.c_spelling, end_name, rec.slot_form))
 }
 
 // A read of a compiler-minted integer local: a range's first-turn flag, or a walk's index

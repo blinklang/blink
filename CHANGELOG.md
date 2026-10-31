@@ -68,6 +68,7 @@ Single source of truth for release history. `blink llms` and `blink llms --full`
 - **A long literal sum under an annotation no longer takes seconds to check.**
 - **A mixed variant used as a function value reports only at its declaration.**
 - **A daemon recheck does not report errors from a dead parse.** A cut-off function declaration stays a parse error.
+- **An inclusive range that ends at the largest `Int` stops.** `for i in lo..=hi` and a loop over an inclusive `Range` value yield `hi` last and stop when `hi` is the largest `Int`. Before, the loop stepped past the end, wrapped and never ended.
 
 ## Breaking Changes (v0.58.0)
 
