@@ -106,7 +106,7 @@ static uint64_t blink_map_seed = 0;
  *
  * `assert_panics { ... }` arms a thread-local catch frame. Inside an armed
  * frame, panic sites longjmp to the frame's setjmp landing pad instead of
- * `fprintf; exit(1)`. The state is per-test / thread-local (normative): an
+ * `fprintf; exit(101)`. The state is per-test / thread-local (normative): an
  * armed assert_panics in one task must never catch a sibling task's panic.
  *
  * Cleanup-on-caught-panic: C `__attribute__((cleanup))` does NOT run on
@@ -317,8 +317,7 @@ BLINK_RT_FN void __blink_cleanup_warn_push(const char* msg) {
  * into assert_panics. Else if a test-hook is installed: the test
  * runner registered it to record the failure and longjmp back to its per-test
  * frame so an uncaught panic fails one test instead of killing the whole binary.
- * If none of those: terminate the process exactly as the historic inline panic
- * did. */
+ * If none of those: the panic is uncaught, so report it and exit 101 (spec §2.20). */
 BLINK_RT_FN void __blink_panic_dispatch(const char* msg);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN void __blink_panic_dispatch(const char* msg) {
@@ -335,7 +334,7 @@ BLINK_RT_FN void __blink_panic_dispatch(const char* msg) {
         __blink_panic_test_hook(msg);   /* records failure + longjmps; never returns */
     }
     fprintf(stderr, "%s\n", msg ? msg : "panic");
-    exit(1);
+    exit(101);
 }
 #endif
 

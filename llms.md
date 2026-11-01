@@ -45,6 +45,7 @@ Key facts:
 - Random values: `rand.int(1..=6)` (a Range, never `rand.int(0, 10)`), `rand.float()` in `[0.0, 1.0)`, `rand.bytes(n)`; effect `Rand`. The default is a CSPRNG. `shuffle` and `choice` come from `import std.random.{shuffle, choice}`; `rand.shuffle(xs)` is E0505
 - `@trusted(audit: "ID")` needs an audit id. `@ffi.opaque(header, name)` declares a C handle type
 - `blink build`, `run` and `test` compile one C unit per module. `--no-per-module` or `BLINK_PER_MODULE=0` builds one C unit, to bisect a per-module bug
+- An uncaught panic exits with code 101. That covers `panic`, `todo`, `unreachable`, a failed `assert` outside a test, and a panic the runtime raises (an index out of bounds, an overflow). Under `blink test` the runner records the panic as a failed test, and `blink test` exits 1
 - `blink test` ends each test binary after a 10m timeout. `--timeout`, `--memory` and `--processes` set the limits (`30m`, `2G`, `1024`; `none` turns one off); `[test] timeout = "30m"` in blink.toml sets the timeout. A bad value exits 2 before any build
 
 ## Standard Library

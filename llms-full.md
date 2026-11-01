@@ -497,7 +497,7 @@ let text = #"{{x}}"#                    // a lone { is text: "{{x}}"
 | ~~`process_pid_wait(pid)`~~ | — | **Removed** — use `process.wait(child)`; a bare call is E0504 |
 | ~~`process_pid_kill(pid, sig)`~~, ~~`process_pid_send_signal(pid, sig)`~~ | — | **Removed** — use `process.signal(child, sig)` (effect `Process.Signal`); a bare call is E0504 |
 | ~~`exit(code)`~~ | — | **Removed** — use `env.exit(code)` (effect `Env.Exit`); a bare `exit(code)` is E0504 |
-| `panic(msg)` | Never | Abort with `msg`; never returns |
+| `panic(msg)` | Never | Abort with `msg`; never returns. An uncaught panic exits with code 101 |
 | `todo()` | Never | Mark unfinished code; panics; warns `W0703` |
 | `unreachable()` | Never | Mark code that must not run; panics |
 | ~~`arg_count()`~~, ~~`get_arg(idx)`~~ | — | **Removed** — use `env.args()` (effect `Env.Read`), which returns `List[Str]`; a bare call is E0504 |
