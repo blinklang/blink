@@ -43,6 +43,47 @@ fn main() \{
 }
 "
 
+// Each close() runs as its function returns, so the call it makes is one level deeper.
+let WITH_SRC = #"type R { name: Str }
+impl Closeable for R {
+    fn close(self) { note(self.name) }
+}
+fn note(tag: Str) { io.println("close {tag}") }
+fn tail() -> Int {
+    with R { name: "t" } { 5 }
+}
+fn early(x: Int) -> Int {
+    with R { name: "e" } {
+        if x > 0 { return 7 }
+        8
+    }
+}
+fn early_void(x: Int) {
+    with R { name: "v" } {
+        if x > 0 { return }
+        io.println("no")
+    }
+}
+fn main() {
+    io.println(tail())
+    io.println(early(1))
+    early_void(1)
+}
+"#
+
+let TEXT_SRC = #"fn echo(s: Str) -> Str { s }
+fn main() {
+    let mut wide = ""
+    let mut i = 0
+    while i < 210 {
+        wide = wide.concat("é")
+        i = i + 1
+    }
+    let _ = echo(wide)
+    let _ = echo("q\"b\\c\t\r\n\u{1}")
+}
+"#
+
 let STDOUT = "6\nat P(1,2)\n300\n"
 
 // One trace event. `value` is the return of an exit, or the args of an enter as
@@ -67,8 +108,13 @@ fn build_traced(src: Str, stem: Str) -> Str ! FS.Write, Process.Spawn, Env.Read 
     let r = process.run("build/blink", ["build", "--trace", path, "-o", bin]).unwrap()
     assert_eq(r.err_out, "")
     assert(r.success())
-    compile_test_helpers.sh("rm -f {path} {bin}.c")
+    compile_test_helpers.sh("rm -f {path}")
     bin
+}
+
+// A build also writes the directory `<bin>.units`.
+fn clean(bin: Str) ! Process.Spawn {
+    compile_test_helpers.sh("rm -rf {bin} {bin}.units")
 }
 
 fn run_bin(bin: Str, args: List[Str]) -> ProcessResult ! Process.Spawn {
@@ -84,7 +130,7 @@ fn args_text(obj: Int) -> Str {
     let args = json_get(obj, "args")
     if args < 0 { return "" }
     let mut parts: List[Str] = []
-    for key in ["n", "label", "p", "s"] {
+    for key in ["n", "label", "p", "s", "tag", "x"] {
         let v = json_get(args, key)
         if v >= 0 { parts.push("{key}={json_as_str(v)}") }
     }
@@ -166,7 +212,7 @@ test "each traced call writes an enter and an exit event at its depth" {
     assert_eq(evs.get(7).unwrap().value, "label=at p=P(1,2)")
     assert_eq(evs.get(8).unwrap().value, "()")
     assert_eq(evs.get(11).unwrap().value, "()")
-    compile_test_helpers.sh("rm -f {bin}")
+    clean(bin)
 }
 
 test "a value longer than 200 characters is cut and the event says so" {
@@ -181,7 +227,7 @@ test "a value longer than 200 characters is cut and the event says so" {
     assert(evs.get(1).unwrap().truncated)
     let short = traced_with(bin, "fn:fact")
     for e in short { assert(!e.truncated) }
-    compile_test_helpers.sh("rm -f {bin}")
+    clean(bin)
 }
 
 test "the filters select events by function, module, depth and event type" {
@@ -207,7 +253,7 @@ test "the filters select events by function, module, depth and event type" {
     assert_eq(exits.len(), 6)
     for e in exits { assert_eq(e.event, "exit") }
     assert_eq(traced_with(bin, "event:enter,fn:main").len(), 1)
-    compile_test_helpers.sh("rm -f {bin}")
+    clean(bin)
 }
 
 test "BLINK_TRACE takes the filter syntax of --trace" {
@@ -216,7 +262,7 @@ test "BLINK_TRACE takes the filter syntax of --trace" {
     assert_eq(r.out, STDOUT)
     assert(r.success())
     assert_eq(shape(events(r.err_out)), "enter trace_fn_ev_env.show 1\nexit trace_fn_ev_env.show 1")
-    compile_test_helpers.sh("rm -f {bin}")
+    clean(bin)
 }
 
 test "a traced build run without --trace writes no events" {
@@ -225,7 +271,7 @@ test "a traced build run without --trace writes no events" {
     assert_eq(r.out, STDOUT)
     assert_eq(r.err_out, "")
     assert(r.success())
-    compile_test_helpers.sh("rm -f {bin}")
+    clean(bin)
 }
 
 test "a panic in a traced function keeps every event line whole" {
@@ -237,7 +283,7 @@ test "a panic in a traced function keeps every event line whole" {
     let evs = events(r.err_out)
     assert(evs.len() >= 4)
     assert_eq(evs.get(evs.len() - 1).unwrap().value, "n=3")
-    compile_test_helpers.sh("rm -f {bin}")
+    clean(bin)
 }
 
 test "a build without --trace has no trace calls" {
@@ -246,7 +292,48 @@ test "a build without --trace has no trace calls" {
     assert(!plain.contains("blink_trace_"))
     let traced = compile_test_helpers.emit_c_via_cli(TRACE_SRC, "trace_fn_ev_traced", "--trace")
     assert(traced.contains("blink_trace_fn_enter("))
-    assert(traced.contains("blink_trace_fn_leave()"))
+    assert(traced.contains("blink_trace_fn_close"))
+}
+
+test "a call made as a with block ends is inside the traced call" {
+    let bin = build_traced(WITH_SRC, "trace_fn_ev_with")
+    let r = run_bin(bin, ["--trace"])
+    assert_eq(r.out, "close t\n5\nclose e\n7\nclose v\n")
+    assert(r.success())
+    let m = "trace_fn_ev_with"
+    let mut want = ["enter {m}.main 0"]
+    for f in ["tail", "early", "early_void"] {
+        want.push("enter {m}.{f} 1")
+        want.push("enter {m}.note 2")
+        want.push("exit {m}.note 2")
+        want.push("exit {m}.{f} 1")
+    }
+    want.push("exit {m}.main 0")
+    assert_eq(shape(events(r.err_out)), want.join("\n"))
+    clean(bin)
+}
+
+test "a value is cut at 200 characters, not bytes, and its escapes decode back" {
+    let bin = build_traced(TEXT_SRC, "trace_fn_ev_text")
+    let r = run_bin(bin, ["--trace=fn:echo"])
+    assert(r.success())
+    let evs = events(r.err_out)
+    assert_eq(evs.len(), 4)
+    let mut wide = ""
+    let mut i = 0
+    while i < 200 {
+        wide = wide.concat("é")
+        i = i + 1
+    }
+    assert_eq(evs.get(0).unwrap().value, "s={wide}")
+    assert(evs.get(0).unwrap().truncated)
+    assert_eq(evs.get(1).unwrap().value, wide)
+    assert(evs.get(1).unwrap().truncated)
+    let esc = "q\"b\\c\t\r\n\u{1}"
+    assert_eq(evs.get(2).unwrap().value, "s={esc}")
+    assert(!evs.get(2).unwrap().truncated)
+    assert_eq(evs.get(3).unwrap().value, esc)
+    clean(bin)
 }
 
 test "blink run hands the filters of --trace=<filters> to the program" {

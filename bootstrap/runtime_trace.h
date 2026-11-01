@@ -37,10 +37,16 @@ static blink_trace_state __blink_trace = {0};
 
 /* One traced call on this thread's stack: when it began, and whether the filters chose its
    enter and exit events. The exit reads both, so the two events of one call always pair.
-   Depth is the call stack depth of a thread, so the stack is per thread. */
+   Depth is the call stack depth of a thread, so the stack is per thread. The exit event
+   prints when the call is popped, after the cleanups of its scopes, so it keeps the names
+   and the return text until then. */
 typedef struct {
     int64_t enter_ts;
     int matched;
+    const char* fn;
+    const char* module;
+    char* exit_value;
+    int exit_kept;
 } blink_trace_frame;
 
 #ifdef BLINK_USE_EXTERN_RUNTIME_STORAGE
@@ -423,9 +429,9 @@ BLINK_RT_FN void blink_trace_arena_promote_end(const char* fn, const char* modul
 }
 #endif
 
-/* The events of a traced function. Codegen calls blink_trace_fn_enter first in the body and
-   blink_trace_fn_leave at each exit, so the stack moves for each traced call, whether or not
-   its events print. Each gate answers whether its event prints, and codegen renders the
+/* The events of a traced function. Codegen calls blink_trace_fn_enter first in the body, and
+   a cleanup local of the body calls blink_trace_fn_close as the body returns, so the stack
+   moves for each traced call, whether or not its events print. Each gate answers whether its event prints, and codegen renders the
    values of an event only then. */
 
 /* Whether one event passes the filters. An event with no effect type answers no to an
@@ -527,16 +533,24 @@ BLINK_RT_FN int blink_trace_fn_enter(const char* fn, const char* module) {
     int64_t depth = __blink_trace_frame_top++;
     if (depth >= __blink_trace_frame_cap) {
         int64_t cap = __blink_trace_frame_cap ? __blink_trace_frame_cap * 2 : 64;
+        while (cap <= depth) cap *= 2;
         blink_trace_frame* grown = (blink_trace_frame*)realloc(__blink_trace_frames,
             (size_t)cap * sizeof(blink_trace_frame));
         /* With no room the call still counts for depth; it prints no enter and no exit. */
         if (!grown) return 0;
+        /* A call pushed while the stack had no room left its slot unset; the pop reads it. */
+        memset(grown + __blink_trace_frame_cap, 0,
+            (size_t)(cap - __blink_trace_frame_cap) * sizeof(blink_trace_frame));
         __blink_trace_frames = grown;
         __blink_trace_frame_cap = cap;
     }
     int matched = blink_trace_match_event(fn, module, depth, NULL, NULL);
     __blink_trace_frames[depth].matched = matched;
     __blink_trace_frames[depth].enter_ts = blink_trace_ts_us();
+    __blink_trace_frames[depth].fn = fn;
+    __blink_trace_frames[depth].module = module;
+    __blink_trace_frames[depth].exit_value = NULL;
+    __blink_trace_frames[depth].exit_kept = 0;
     return matched && __blink_trace.event_enter && blink_trace_under_limit();
 }
 #endif
@@ -629,11 +643,44 @@ BLINK_RT_FN void blink_trace_state_emit(const char* fn, const char* module, cons
 }
 #endif
 
-/* Pops the call, at each exit of a traced function. */
-BLINK_RT_FN void blink_trace_fn_leave(void);
+/* Keeps the return text of the innermost traced call, after its exit gate, for the exit
+   event. The caller's text may be gone by the time the call is popped, so this copies it. A
+   NULL value is the exit of a function with no result. */
+BLINK_RT_FN void blink_trace_exit_keep(const char* value);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN void blink_trace_fn_leave(void) {
-    if (__blink_trace.active && __blink_trace_frame_top > 0) __blink_trace_frame_top--;
+BLINK_RT_FN void blink_trace_exit_keep(const char* value) {
+    int64_t depth = __blink_trace_frame_top - 1;
+    if (depth < 0 || depth >= __blink_trace_frame_cap) return;
+    blink_trace_frame* f = &__blink_trace_frames[depth];
+    free(f->exit_value);
+    f->exit_value = NULL;
+    if (value) {
+        size_t n = strlen(value) + 1;
+        f->exit_value = (char*)malloc(n);
+        /* With no room the exit prints no event rather than a wrong value. */
+        if (!f->exit_value) return;
+        memcpy(f->exit_value, value, n);
+    }
+    f->exit_kept = 1;
+}
+#endif
+
+/* The cleanup of a traced body: it runs after the cleanups of the body's inner scopes, so a
+   call they make is inside this call. Prints the kept exit event and pops the call. */
+BLINK_RT_FN void blink_trace_fn_close(int* unused);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void blink_trace_fn_close(int* unused) {
+    (void)unused;
+    if (!__blink_trace.active || __blink_trace_frame_top <= 0) return;
+    int64_t depth = __blink_trace_frame_top - 1;
+    if (depth < __blink_trace_frame_cap) {
+        blink_trace_frame* f = &__blink_trace_frames[depth];
+        if (f->exit_kept) blink_trace_exit_event(f->fn, f->module, f->exit_value);
+        free(f->exit_value);
+        f->exit_value = NULL;
+        f->exit_kept = 0;
+    }
+    __blink_trace_frame_top--;
 }
 #endif
 

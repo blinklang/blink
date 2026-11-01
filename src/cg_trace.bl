@@ -2,9 +2,11 @@
 //
 // A unit built with --trace calls the runtime tracer at the start of each traced body and at
 // each of its exits. A unit built without it holds no trace code at all, so a plain build
-// pays nothing at run time. The runtime keeps the call stack, so a body declares no locals
-// for it: blink_trace_fn_enter pushes the call and blink_trace_fn_leave pops it, whether or
-// not the filters print the events.
+// pays nothing at run time. The runtime keeps the call stack: blink_trace_fn_enter pushes
+// the call, whether or not the filters print the events, and the cleanup of one local of the
+// body pops it. A `with` scope in the body ends with its own C cleanup, after the body's
+// return statement, so the pop and the exit event wait for those cleanups: a call they make
+// is inside the traced call. Each exit keeps its return text for the pop to print.
 //
 // Each event renders its values only after the runtime says the event prints, so a call the
 // filters leave out pays for no Display call.
@@ -23,7 +25,7 @@ import parser.{node_kind, node_module, node_name, node_params, node_type_ann, su
 import typecheck.{TyKind, TYPE_BOOL, TYPE_INT, TYPE_STR, TYPE_VOID, tc_module_in_entry_package, tc_resolve, tc_tid_kind}
 import layout.{LayoutRecord, Position, layout_of, tid_of_node}
 import cname.{c_local_name, c_runtime_helper, c_str_const}
-import ir.{ir_block, ir_call_runtime, ir_col, ir_const, ir_expr_stmt, ir_if, ir_line_text, ir_var_ref}
+import ir.{ir_block, ir_call_runtime, ir_col, ir_const, ir_expr_stmt, ir_if, ir_line_text, ir_trace_frame, ir_var_ref}
 import diagnostics.{Diag, diag_file_for_node}
 import cg_reg.{cg_reg_impl_of}
 import cg_expr.{cg_expr_can_display, cg_expr_display_text, cg_expr_pending_count, cg_expr_take_pending, x_layout_checked, x_stopped}
@@ -82,7 +84,7 @@ pub fn cg_trace_body_enter(fn_node: Int) -> List[Int] ! Diag.Report {
     event.push(tr_call(fn_node, TYPE_VOID, "trace_enter_event", args))
     let gate = tr_call_value(fn_node, TYPE_BOOL, "trace_fn_enter", [tr_text(fn_node, fn_name), tr_text(fn_node, module)])
     tr_unit = TraceUnit { on: true, traced: true, fn_name: fn_name, module: module }
-    [ir_if(fn_node, gate, ir_block(fn_node, event), -1)]
+    [ir_if(fn_node, gate, ir_block(fn_node, event), -1), ir_trace_frame(fn_node)]
 }
 
 // The body has lowered: nothing after it is the traced body.
@@ -125,9 +127,9 @@ pub fn cg_trace_state(node: Int, var: Str, tid: Int, value: Int) -> List[Int] ! 
 
 fn tr_exit(node: Int, render: List[Int], text: Int) -> List[Int] ! Diag.Report {
     let mut event = render
-    event.push(tr_call(node, TYPE_VOID, "trace_exit_event", [tr_text(node, tr_unit.fn_name), tr_text(node, tr_unit.module), text]))
+    event.push(tr_call(node, TYPE_VOID, "trace_exit_keep", [text]))
     let gate = tr_call_value(node, TYPE_BOOL, "trace_on_exit", [])
-    [ir_if(node, gate, ir_block(node, event), -1), tr_call(node, TYPE_VOID, "trace_fn_leave", [])]
+    [ir_if(node, gate, ir_block(node, event), -1)]
 }
 
 // A body whose events would show a value with no Display rendering is not traced: the text
