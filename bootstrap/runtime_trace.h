@@ -78,13 +78,15 @@ BLINK_RT_FN int64_t blink_trace_ts_us(void) {
 }
 #endif
 
-/* A bad BLINK_TRACE value is a usage error: the program writes no event and does not start. */
-BLINK_RT_FN void blink_trace_bad_filter(const char* why, const char* what, const char* item, size_t n);
+/* A bad BLINK_TRACE value is a usage error: the program writes no event and does not start.
+   `blink run` gives the same words for the same value (trace_filter_error in src/cli.bl). */
+BLINK_RT_FN void blink_trace_bad_filter(const char* why, const char* what, const char* item);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN void blink_trace_bad_filter(const char* why, const char* what, const char* item, size_t n) {
+BLINK_RT_FN void blink_trace_bad_filter(const char* why, const char* what, const char* item) {
     fprintf(stderr, "error: bad BLINK_TRACE value: %s", why);
     if (what) fprintf(stderr, " `%s`", what);
-    fprintf(stderr, " in `%.*s`\n", (int)n, item);
+    if (item) fprintf(stderr, " in `%s`", item);
+    fputs("\n", stderr);
     exit(2);
 }
 #endif
@@ -113,10 +115,13 @@ BLINK_RT_FN int blink_trace_is_event_type(const char* v) {
 }
 #endif
 
-/* Whether v is a whole decimal number, as a depth: value must be. */
+/* Whether v is a whole decimal number, as a depth: value must be: an optional `-`, then
+   digits, with no overflow. */
 BLINK_RT_FN int blink_trace_is_number(const char* v);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN int blink_trace_is_number(const char* v) {
+    const char* d = (*v == '-') ? v + 1 : v;
+    if (*d < '0' || *d > '9') return 0;
     char* end = NULL;
     errno = 0;
     (void)strtol(v, &end, 10);
@@ -128,11 +133,10 @@ BLINK_RT_FN int blink_trace_is_number(const char* v) {
 BLINK_RT_FN void blink_trace_parse_item(const char* item);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN void blink_trace_parse_item(const char* item) {
-    size_t len = strlen(item);
     /* `all` beside other filters adds no filter, so it never hides one. */
     if (strcmp(item, "all") == 0) return;
     const char* colon = strchr(item, ':');
-    if (!colon) blink_trace_bad_filter("a filter needs `key:value`, not", NULL, item, len);
+    if (!colon) blink_trace_bad_filter("a filter is `key:value`, not", item, NULL);
     size_t klen = (size_t)(colon - item);
     char* key = (char*)malloc(klen + 1);
     if (!key) { fputs("error: out of memory reading BLINK_TRACE\n", stderr); exit(2); }
@@ -140,7 +144,7 @@ BLINK_RT_FN void blink_trace_parse_item(const char* item) {
     key[klen] = '\0';
     if (strcmp(key, "fn") != 0 && strcmp(key, "module") != 0 && strcmp(key, "depth") != 0
         && strcmp(key, "event") != 0 && strcmp(key, "effect") != 0 && strcmp(key, "state") != 0) {
-        blink_trace_bad_filter("unknown key", key, item, len);
+        blink_trace_bad_filter("unknown key", key, item);
     }
     blink_trace_filter f = { key, NULL, 0 };
     int cap = 0;
@@ -151,10 +155,10 @@ BLINK_RT_FN void blink_trace_parse_item(const char* item) {
         char* v = blink_trace_trim_dup(p, n);
         if (v) {
             if (strcmp(key, "depth") == 0 && !blink_trace_is_number(v)) {
-                blink_trace_bad_filter("depth is not a number:", v, item, len);
+                blink_trace_bad_filter("depth is not a number:", v, item);
             }
             if (strcmp(key, "event") == 0 && !blink_trace_is_event_type(v)) {
-                blink_trace_bad_filter("unknown event type", v, item, len);
+                blink_trace_bad_filter("unknown event type", v, item);
             }
             if (f.count == cap) {
                 cap = cap ? cap * 2 : 4;
@@ -166,7 +170,7 @@ BLINK_RT_FN void blink_trace_parse_item(const char* item) {
         if (!end) break;
         p = end + 1;
     }
-    if (f.count == 0) blink_trace_bad_filter("empty value", NULL, item, len);
+    if (f.count == 0) blink_trace_bad_filter("empty value", NULL, item);
     if (strcmp(key, "event") == 0) {
         __blink_trace.event_enter = 0;
         __blink_trace.event_exit = 0;

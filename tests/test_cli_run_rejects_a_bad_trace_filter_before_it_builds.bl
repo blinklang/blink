@@ -1,0 +1,120 @@
+// `blink run` finds a bad trace filter before it builds the program (§8.15.12). It is a usage
+// error: text on stderr, nothing on stdout, exit code 2, and no binary. `--trace=` and an
+// inherited `BLINK_TRACE` have the same rule, and the flag replaces a value that the shell had
+// set (§8.15.13). The check of `blink run` and the check of the traced binary must agree on
+// each value, so a value that `blink run` lets through never stops the program it starts.
+
+import compile_test_helpers
+import std.process.{ProcessResult, ChildEnd}
+
+let SRC = #"fn add(a: Int, b: Int) -> Int { a + b }
+fn main() {
+    let mut total = 0
+    total = add(1, 2)
+    io.println(total)
+}
+"#
+
+let BAD = [
+    "nope:1", "fn:", "fn: + ", "depth:x", "depth:2x", "depth:", "event:stat",
+    "event:enter+stat", "1", "fn", "depth : 2", "Fn:add", "fn:add,bogus",
+]
+
+let GOOD = [
+    "all", "fn:add", " fn:add , depth:2 ", "fn:add+main", "fn:add,,", "event:enter+exit",
+    "event:state", "event:effect", "event:note", "effect:IO", "state:total", "depth:0",
+]
+
+fn write_src(stem: Str) -> Str ! FS.Write, Process.Spawn, Env.Read {
+    let path = "{compile_test_helpers.scratch_root()}/{stem}.bl"
+    fs.write(path, SRC).unwrap()
+    path
+}
+
+fn bin_of(stem: Str) -> Str ! Process.Spawn, Env.Read {
+    "{compile_test_helpers.scratch_root()}/{stem}_bin"
+}
+
+// A build also writes `<bin>.c` and the directory `<bin>.units`.
+fn clean(path: Str, bin: Str) ! Process.Spawn {
+    compile_test_helpers.sh("rm -rf {path} {bin} {bin}.c {bin}.units")
+}
+
+fn exists(path: Str) -> Bool ! Process.Spawn {
+    compile_test_helpers.sh("test -e {path} && echo yes") == "yes"
+}
+
+// What is wrong with the result of a run that a bad filter stopped, or "".
+fn usage_error_for(r: ProcessResult, bin: Str, prefix: Str) -> Str ! Process.Spawn {
+    if r.end != ChildEnd.Exited(2) { return "ended with {r.end}, not 2:\n{r.err_out}" }
+    if r.out != "" { return "printed on stdout:\n{r.out}" }
+    if !r.err_out.starts_with(prefix) { return "stderr does not start with `{prefix}`:\n{r.err_out}" }
+    if exists(bin) { return "built {bin}" }
+    ""
+}
+
+test "run stops on a bad --trace filter before it builds" {
+    let stem = "trace_run_bad_flag"
+    let path = write_src(stem)
+    let bin = bin_of(stem)
+    for value in BAD {
+        let r = process.run("build/blink", ["run", "--trace={value}", path, "-o", bin]).unwrap()
+        assert_eq("`{value}`: {usage_error_for(r, bin, "error: bad --trace value: ")}", "`{value}`: ")
+    }
+    clean(path, bin)
+}
+
+test "run stops on a bad inherited BLINK_TRACE before it builds" {
+    let stem = "trace_run_bad_env"
+    let path = write_src(stem)
+    let bin = bin_of(stem)
+    for value in BAD {
+        let r = process.run("env", ["BLINK_TRACE={value}", "build/blink", "run", path, "-o", bin]).unwrap()
+        assert_eq("`{value}`: {usage_error_for(r, bin, "error: bad BLINK_TRACE value: ")}", "`{value}`: ")
+    }
+    clean(path, bin)
+}
+
+test "run --trace replaces a bad BLINK_TRACE, so the shell value is not checked" {
+    let stem = "trace_run_bad_env_replaced"
+    let path = write_src(stem)
+    let bin = bin_of(stem)
+    let r = process.run("env", ["BLINK_TRACE=event:stat", "build/blink", "run", "--trace=fn:add", path, "-o", bin]).unwrap()
+    assert_eq(r.out, "3\n")
+    assert(r.success())
+    assert(r.err_out.contains("\"event\":\"enter\",\"fn\":\"{stem}.add\""))
+    clean(path, bin)
+}
+
+test "run and the traced binary give the same reason for each bad filter" {
+    let stem = "trace_run_bad_same"
+    let path = write_src(stem)
+    let bin = bin_of(stem)
+    let built = process.run("build/blink", ["build", "--trace", path, "-o", bin]).unwrap()
+    assert(built.success())
+    let other = bin_of("trace_run_bad_same_run")
+    for value in BAD {
+        let ran = process.run("env", ["BLINK_TRACE={value}", bin]).unwrap()
+        assert_eq(ran.end, ChildEnd.Exited(2))
+        let run = process.run("build/blink", ["run", "--trace={value}", path, "-o", other]).unwrap()
+        assert_eq(run.end, ChildEnd.Exited(2))
+        let binary_why = ran.err_out.replace("error: bad BLINK_TRACE value: ", "")
+        let run_why = run.err_out.replace("error: bad --trace value: ", "")
+        assert_eq(run_why, binary_why)
+    }
+    clean(path, bin)
+    clean(path, other)
+}
+
+test "run lets each good filter through, as the traced binary does" {
+    let stem = "trace_run_good"
+    let path = write_src(stem)
+    let bin = bin_of(stem)
+    for value in GOOD {
+        let r = process.run("build/blink", ["run", "--trace={value}", path, "-o", bin]).unwrap()
+        assert_eq("`{value}`: {r.end == ChildEnd.Exited(0)} {r.out}", "`{value}`: true 3\n")
+        let again = process.run("env", ["BLINK_TRACE={value}", bin]).unwrap()
+        assert_eq("`{value}`: {again.end == ChildEnd.Exited(0)} {again.out}", "`{value}`: true 3\n")
+    }
+    clean(path, bin)
+}

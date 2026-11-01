@@ -4504,7 +4504,7 @@ fn do_ffi_audit(program: Int, json_output: Int) ! IO.Print {
 fn cmd_build(p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit, Codegen, IO, FS.Write, FS.Read, Env.Read, Process.Spawn, FS.Delete, Net.Connect, Env.Exit, Time {
     // The built program reads its filters when it runs, so a filter here would do nothing.
     if args_get(a, TRACE_FILTER_KEY) != "" {
-        io.eprintln("error: `blink build --trace` takes no filters; pass --trace=<filters> to the built program when it runs")
+        io.eprintln("error: `blink build --trace` takes no filters; set BLINK_TRACE=<filters> when the built program runs")
         env.exit(1)
     }
     if build_through_daemon(a, "build") {
@@ -4623,6 +4623,13 @@ fn cmd_run(p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Repor
         io.eprintln(bad_format)
         env.exit(1)
     }
+    // A bad trace filter would stop the program before main, so it stops the run before the
+    // build (§8.15.12).
+    let bad_trace = run_trace_usage_error(a)
+    if bad_trace != "" {
+        io.eprintln(bad_trace)
+        env.exit(2)
+    }
     if build_through_daemon(a, "run") {
         run_built(a, run_output_path(a))
         return
@@ -4698,6 +4705,58 @@ fn run_build_here(p: ArgParser, a: Args, checked: Option[DaemonBuild]) -> Str ! 
 // Whether `blink run` builds its program to trace the calls it makes.
 fn run_traces(a: Args) -> Bool ! Env.Read {
     args_has(a, "trace") || (env.var("BLINK_TRACE") ?? "") != ""
+}
+
+// The usage error of the trace filters that the program of `blink run` would read, or "". The
+// flag replaces a BLINK_TRACE that the shell set, so only the value that the program gets is
+// checked.
+fn run_trace_usage_error(a: Args) -> Str ! Env.Read {
+    if args_has(a, "trace") {
+        let why = trace_filter_error(args_get(a, TRACE_FILTER_KEY))
+        return if why == "" { "" } else { "error: bad --trace value: {why}" }
+    }
+    let why = trace_filter_error(env.var("BLINK_TRACE") ?? "")
+    if why == "" { "" } else { "error: bad BLINK_TRACE value: {why}" }
+}
+
+let TRACE_FILTER_KEYS = ["fn", "module", "depth", "event", "effect", "state"]
+let TRACE_EVENT_TYPES = ["enter", "exit", "state", "effect", "note"]
+
+// Why a value of BLINK_TRACE is a bad filter (§8.15.12), or "". It has the rules and the words
+// of blink_trace_parse_item in bootstrap/runtime_trace.h, so `blink run` lets through only a
+// value that the traced program takes.
+fn trace_filter_error(value: Str) -> Str {
+    for raw in value.split(",") {
+        let item = trim_space_tab(raw)
+        if item == "" || item == "all" { continue }
+        let colon = item.byte_index_of(":", 0) ?? -1
+        if colon < 0 { return "a filter is `key:value`, not `{item}`" }
+        let key = item.byte_slice(0, colon)
+        if !TRACE_FILTER_KEYS.contains(key) { return "unknown key `{key}` in `{item}`" }
+        let mut count = 0
+        for raw_value in item.byte_slice(colon + 1, item.byte_len()).split("+") {
+            let v = trim_space_tab(raw_value)
+            if v == "" { continue }
+            if key == "depth" && v.parse_int().is_err() { return "depth is not a number: `{v}` in `{item}`" }
+            if key == "event" && !TRACE_EVENT_TYPES.contains(v) { return "unknown event type `{v}` in `{item}`" }
+            count = count + 1
+        }
+        if count == 0 { return "empty value in `{item}`" }
+    }
+    ""
+}
+
+// s without the spaces and tabs at its ends: the trim of a trace filter, which keeps the other
+// whitespace that Str.trim cuts.
+fn trim_space_tab(s: Str) -> Str {
+    let mut t = s
+    while t.starts_with(" ") || t.starts_with("\t") {
+        t = t.byte_slice(1, t.byte_len())
+    }
+    while t.ends_with(" ") || t.ends_with("\t") {
+        t = t.byte_slice(0, t.byte_len() - 1)
+    }
+    t
 }
 
 // The filters of a `--trace=<filters>` token, which `blink run` hands on to the program it
