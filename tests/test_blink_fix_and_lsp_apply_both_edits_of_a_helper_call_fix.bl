@@ -1,6 +1,7 @@
-// The fix for `rand.shuffle(deck)` has two edits: the call without `rand.`, and the import of
-// `shuffle` (sections/04_effects.md §4.4.7). `blink fix` applies both, the JSON output carries
-// both, and the LSP code action carries both in one change (§8.6). The fixed file compiles.
+// The fix for `rand.shuffle(deck)` in a file that binds no `random` has two edits: the call
+// through the module, `random.shuffle(deck)`, and `import std.random` (sections/04_effects.md
+// §4.4.7). `blink fix` applies both, the JSON output carries both, and the LSP code action
+// carries both in one change (§8.6). The fixed file compiles.
 
 import std.process.{ProcessResult}
 
@@ -21,10 +22,10 @@ test "blink fix rewrites the call and adds the import in one fix" {
     fs.write("{dir}/deal.bl", deal_src()).unwrap()
     let r = blink_in(dir, "fix deal.bl")
     let got = fs.read("{dir}/deal.bl").unwrap()
-    let want = "import std.random.\{shuffle}\n\nfn deal(deck: List[Int]) -> List[Int] ! Rand \{\n    shuffle(deck)\n}\n\nfn main() \{}\n"
+    let want = "import std.random\n\nfn deal(deck: List[Int]) -> List[Int] ! Rand \{\n    random.shuffle(deck)\n}\n\nfn main() \{}\n"
     if got != want { io.eprintln("got file:\n{got}\nstdout:\n{r.out}\nstderr:\n{r.err_out}") }
     assert(got == want)
-    assert(r.out.contains("deal.bl:2:5: E0505 add `import std.random.\{shuffle}` and call"))
+    assert(r.out.contains("deal.bl:2:5: E0505 add `import std.random` and call"))
     assert(r.out.contains("1 fix(es) applied"))
     let _ = sh("rm -rf {dir}")
 }
@@ -34,7 +35,7 @@ test "the JSON diagnostic carries the import as a second edit of the fix" {
     fs.write("{dir}/deal.bl", deal_src()).unwrap()
     let r = blink_in(dir, "check --json deal.bl")
     let all = r.out.concat(r.err_out)
-    let want = #","more_edits":[{"span":{"file":"deal.bl","line":1,"col":1,"end_line":1,"end_col":1},"text":"import std.random.{shuffle}\n\n"}]"#
+    let want = #","more_edits":[{"span":{"file":"deal.bl","line":1,"col":1,"end_line":1,"end_col":1},"text":"import std.random\n\n"}]"#
     if !all.contains(want) { io.eprintln(all) }
     assert(all.contains(want))
     let _ = sh("rm -rf {dir}")
@@ -67,8 +68,10 @@ test "blink fix applies the fixes of two helpers in one file and the file runs" 
     fs.write("{dir}/deal.bl", "fn top(deck: List[Int]) -> Int ! Rand \{\n    let d = rand.shuffle(deck)\n    rand.choice(d).unwrap()\n}\n\nfn main() \{\n    io.println(\"\{top([7])}\")\n}\n").unwrap()
     let r = blink_in(dir, "fix deal.bl")
     let got = fs.read("{dir}/deal.bl").unwrap()
-    if !got.starts_with("import std.random.\{choice, shuffle}\n\n") { io.eprintln("got file:\n{got}\nstdout:\n{r.out}") }
-    assert(got.starts_with("import std.random.\{choice, shuffle}\n\n"))
+    // Both fixes add the same line, which `blink fix` writes once.
+    let want = "import std.random\n\nfn top(deck: List[Int]) -> Int ! Rand \{\n    let d = random.shuffle(deck)\n    random.choice(d).unwrap()\n}"
+    if !got.starts_with(want) { io.eprintln("got file:\n{got}\nstdout:\n{r.out}") }
+    assert(got.starts_with(want))
     assert(r.out.contains("2 fix(es) applied"))
     let run = blink_in(dir, "run deal.bl")
     assert_eq(run.out.trim(), "7")
@@ -94,10 +97,23 @@ test "the LSP code action carries both edits in one change" {
     ].join("")
     fs.write("{dir}/input.bin", input).unwrap()
     let r = sh("B=$(pwd)/build/blink; cd {dir} && timeout 60 $B lsp < input.bin")
-    let call_edit = #"{"range":{"start":{"line":1,"character":4},"end":{"line":1,"character":22}},"newText":"shuffle(deck)"}"#
-    let import_edit = #"{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":0}},"newText":"import std.random.{shuffle}\n\n"}"#
-    let want = "\"title\":\"add `import std.random.\{shuffle}` and call\",\"kind\":\"quickfix\",\"edit\":\{\"changes\":\{\"{uri}\":[{call_edit},{import_edit}]}}}"
+    let call_edit = #"{"range":{"start":{"line":1,"character":4},"end":{"line":1,"character":22}},"newText":"random.shuffle(deck)"}"#
+    let import_edit = #"{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":0}},"newText":"import std.random\n\n"}"#
+    let want = "\"title\":\"add `import std.random` and call\",\"kind\":\"quickfix\",\"edit\":\{\"changes\":\{\"{uri}\":[{call_edit},{import_edit}]}}}"
     if !r.out.contains(want) { io.eprintln("want: {want}\nstdout:\n{r.out}\nstderr:\n{r.err_out}") }
     assert(r.out.contains(want))
+    let _ = sh("rm -rf {dir}")
+}
+
+// The fix loads std.random to check the call, and that binds nothing: a bare call of a helper
+// in a file that never imports std.random is still an error.
+test "a bare call of the helper in a file that does not import std.random is still an error" {
+    let dir = sh("mktemp -d /tmp/blink_fix_helper_bare.XXXXXX").out.trim()
+    fs.write("{dir}/deal.bl", "fn deal(deck: List[Int]) -> List[Int] ! Rand \{\n    rand.shuffle(deck)\n}\n\nfn top(deck: List[Int]) -> List[Int] \{\n    shuffle(deck)\n}\n\nfn main() \{}\n").unwrap()
+    let r = blink_in(dir, "check deal.bl")
+    let all = r.out.concat(r.err_out)
+    let good = !r.success() && all.contains("2 error(s) found") && all.contains("deal.bl:6:5")
+    if !good { io.eprintln(all) }
+    assert(good)
     let _ = sh("rm -rf {dir}")
 }

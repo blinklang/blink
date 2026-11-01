@@ -1,8 +1,9 @@
 // `rand.<name>` always means the `rand` handle, so a call of a std.random helper through it,
 // such as `rand.shuffle(deck)`, is E0505. The diagnostic lists the operations of `Rand`, names
-// the module that has the helper, and gives a fix of two edits: the call without `rand.`, and
-// the import it needs. A file where that import would clash with its own binding of the name
-// gets no fix (sections/04_effects.md §4.4.7).
+// both spellings (`rand` is the handle, the qualifier is the module) and gives the first fix of
+// the candidate walk that resolves the callee to the helper and adds no diagnostic: reuse a
+// binding the file has, else add `import std.random` and call through `random`. A call that
+// would not type-check with the new callee gets help only (sections/04_effects.md §4.4.7).
 import lower_test_helpers.{probe_but}
 import diagnostics.{diag_entries}
 
@@ -27,11 +28,17 @@ fn rows(stem: Str, src: Str) -> List[Str] ! Lex.Tokenize, Parse, Parse.Build, Di
     out
 }
 
-fn head(name: Str) -> Str {
-    "UnresolvedMethod E0505 2:5: `{name}` is not an operation of effect `Rand` | help: `{name}` is a function in `std.random` | notes: {OPS_NOTE}"
+fn help(name: Str, qualifier: Str) -> Str {
+    "`{name}` is a function in module `std.random`; `rand` is the handle of `Rand` and `{qualifier}` is the module"
 }
 
-test "rand.shuffle is E0505 with a fix that drops rand. and adds the import above the code" {
+fn head(name: Str) -> Str {
+    "UnresolvedMethod E0505 2:5: `{name}` is not an operation of effect `Rand` | help: {help(name, \"random\")} | notes: {OPS_NOTE}"
+}
+
+let ADD_IMPORT = "add `import std.random` and call"
+
+test "rand.shuffle is E0505 with a fix that adds import std.random and calls random.shuffle" {
     let src = #"fn deal(deck: List[Int]) -> List[Int] ! Rand {
     rand.shuffle(deck)
 }
@@ -39,7 +46,7 @@ test "rand.shuffle is E0505 with a fix that drops rand. and adds the import abov
 fn main() {}
 "#
     assert_eq(rows("rs_shuffle_no_imports", src), [
-        head("shuffle").concat(" | fix: add `import std.random.\{shuffle}` and call `shuffle(deck)` at 2:5-2:23 | and: `import std.random.\{shuffle}\n\n` at 1:1-1:1"),
+        head("shuffle").concat(" | fix: {ADD_IMPORT} `random.shuffle(deck)` at 2:5-2:23 | and: `import std.random\n\n` at 1:1-1:1"),
     ])
 }
 
@@ -52,7 +59,7 @@ test "the import goes after the last import of the file" {
     let with_import = "import std.fs\n\n".concat(src).concat("\nfn main() \{}\n")
     let got = rows("rs_choice_after_import", with_import)
     assert_eq(got.len(), 1)
-    assert(got.get(0).unwrap().contains("| fix: add `import std.random.\{choice}` and call `choice(deck)` at 4:15-4:32 | and: `\nimport std.random.\{choice}` at 1:14-1:14"))
+    assert(got.get(0).unwrap().contains("| fix: {ADD_IMPORT} `random.choice(deck)` at 4:15-4:32 | and: `\nimport std.random` at 1:14-1:14"))
 }
 
 test "a call that runs over lines gets the callee rewritten and keeps its arguments as written" {
@@ -65,7 +72,7 @@ test "a call that runs over lines gets the callee rewritten and keeps its argume
 fn main() {}
 "#
     assert_eq(rows("rs_shuffle_multiline", src), [
-        head("shuffle").concat(" | fix: add `import std.random.\{shuffle}` and call `shuffle` at 2:5-2:17 | and: `import std.random.\{shuffle}\n\n` at 1:1-1:1"),
+        head("shuffle").concat(" | fix: {ADD_IMPORT} `random.shuffle` at 2:5-2:17 | and: `import std.random\n\n` at 1:1-1:1"),
     ])
 }
 
@@ -81,7 +88,7 @@ fn main() {}
     ])
 }
 
-test "a file with its own function of the helper's name gets no fix, since the import would clash" {
+test "a file with its own function of the helper's name still gets the qualified call" {
     let src = #"fn deal(deck: List[Int]) -> List[Int] ! Rand {
     rand.shuffle(deck)
 }
@@ -92,10 +99,12 @@ fn shuffle(xs: List[Int]) -> List[Int] {
 
 fn main() {}
 "#
-    assert_eq(rows("rs_own_shuffle_fn", src), [head("shuffle")])
+    assert_eq(rows("rs_own_shuffle_fn", src), [
+        head("shuffle").concat(" | fix: {ADD_IMPORT} `random.shuffle(deck)` at 2:5-2:23 | and: `import std.random\n\n` at 1:1-1:1"),
+    ])
 }
 
-test "a local of the helper's name gets no fix, since the bare call would read the local" {
+test "a local of the helper's name still gets the qualified call" {
     let src = #"fn deal(deck: List[Int]) -> List[Int] ! Rand {
     let shuffle = 3
     rand.shuffle(deck)
@@ -103,11 +112,12 @@ test "a local of the helper's name gets no fix, since the bare call would read t
 
 fn main() {}
 "#
-    let got = rows("rs_local_shuffle", src)
-    assert_eq(got, ["UnresolvedMethod E0505 3:5: `shuffle` is not an operation of effect `Rand` | help: `shuffle` is a function in `std.random` | notes: {OPS_NOTE}"])
+    assert_eq(rows("rs_local_shuffle", src), [
+        "UnresolvedMethod E0505 3:5: `shuffle` is not an operation of effect `Rand` | help: {help(\"shuffle\", \"random\")} | notes: {OPS_NOTE} | fix: {ADD_IMPORT} `random.shuffle(deck)` at 3:5-3:23 | and: `import std.random\n\n` at 1:1-1:1",
+    ])
 }
 
-test "an import that binds the name to another helper gets no fix, since the bare call would call that helper" {
+test "an import that binds the name to another helper gets a call through the qualifier it binds" {
     let src = #"import std.random.{choice as shuffle}
 
 fn deal(deck: List[Int]) -> Int ! Rand {
@@ -117,11 +127,12 @@ fn deal(deck: List[Int]) -> Int ! Rand {
 
 fn main() {}
 "#
-    let got = rows("rs_alias_target_shuffle", src)
-    assert_eq(got, ["UnresolvedMethod E0505 4:13: `shuffle` is not an operation of effect `Rand` | help: `shuffle` is a function in `std.random` | notes: {OPS_NOTE}"])
+    assert_eq(rows("rs_alias_target_shuffle", src), [
+        "UnresolvedMethod E0505 4:13: `shuffle` is not an operation of effect `Rand` | help: {help(\"shuffle\", \"random\")} | notes: {OPS_NOTE} | fix: call `random.shuffle(deck)` at 4:13-4:31",
+    ])
 }
 
-test "two helpers called through the handle share one import edit, so blink fix can apply both" {
+test "two helpers called through the handle carry the same import edit, so blink fix can apply both" {
     let src = #"fn deal(deck: List[Int]) -> Option[Int] ! Rand {
     let d = rand.shuffle(deck)
     rand.choice(d)
@@ -129,10 +140,80 @@ test "two helpers called through the handle share one import edit, so blink fix 
 
 fn main() {}
 "#
-    let add = "add `import std.random.\{choice, shuffle}` and call"
-    let edit = "| and: `import std.random.\{choice, shuffle}\n\n` at 1:1-1:1"
+    let edit = "| and: `import std.random\n\n` at 1:1-1:1"
     assert_eq(rows("rs_shuffle_and_choice", src), [
-        "UnresolvedMethod E0505 2:13: `shuffle` is not an operation of effect `Rand` | help: `shuffle` is a function in `std.random` | notes: {OPS_NOTE} | fix: {add} `shuffle(deck)` at 2:13-2:31 {edit}",
-        "UnresolvedMethod E0505 3:5: `choice` is not an operation of effect `Rand` | help: `choice` is a function in `std.random` | notes: {OPS_NOTE} | fix: {add} `choice(d)` at 3:5-3:19 {edit}",
+        "UnresolvedMethod E0505 2:13: `shuffle` is not an operation of effect `Rand` | help: {help(\"shuffle\", \"random\")} | notes: {OPS_NOTE} | fix: {ADD_IMPORT} `random.shuffle(deck)` at 2:13-2:31 {edit}",
+        "UnresolvedMethod E0505 3:5: `choice` is not an operation of effect `Rand` | help: {help(\"choice\", \"random\")} | notes: {OPS_NOTE} | fix: {ADD_IMPORT} `random.choice(d)` at 3:5-3:19 {edit}",
     ])
+}
+
+// Line 4 of a file whose first line imports std.random.
+fn reuse_row(qualifier: Str, rest: Str) -> Str {
+    "UnresolvedMethod E0505 4:5: `shuffle` is not an operation of effect `Rand` | help: {help(\"shuffle\", qualifier)} | notes: {OPS_NOTE}{rest}"
+}
+
+fn deal_after(import_line: Str) -> Str {
+    import_line.concat("\n\nfn deal(deck: List[Int]) -> List[Int] ! Rand \{\n    rand.shuffle(deck)\n}\n\nfn main() \{}\n")
+}
+
+test "a whole import of std.random gets a call through random and no import edit" {
+    assert_eq(rows("rs_reuse_whole", deal_after("import std.random")), [
+        reuse_row("random", " | fix: call `random.shuffle(deck)` at 4:5-4:23"),
+    ])
+}
+
+test "a selective import of the helper gets the bare call and no rewrite to the qualified form" {
+    assert_eq(rows("rs_reuse_selected", deal_after("import std.random.\{shuffle}")), [
+        reuse_row("random", " | fix: call `shuffle(deck)` at 4:5-4:23"),
+    ])
+}
+
+test "a selective import of another helper gets a call through random and no merge into its list" {
+    assert_eq(rows("rs_reuse_other_selected", deal_after("import std.random.\{choice}")), [
+        reuse_row("random", " | fix: call `random.shuffle(deck)` at 4:5-4:23"),
+    ])
+}
+
+test "an import of std.random under an alias gets a call through the alias, which the help names" {
+    assert_eq(rows("rs_reuse_alias", deal_after("import std.random as r")), [
+        reuse_row("r", " | fix: call `r.shuffle(deck)` at 4:5-4:23"),
+    ])
+}
+
+test "a call with the wrong number of arguments gets help only, with the count" {
+    let src = #"fn deal(deck: List[Int]) -> List[Int] ! Rand {
+    rand.shuffle(deck, 3)
+}
+
+fn main() {}
+"#
+    assert_eq(rows("rs_shuffle_arity", src), [
+        "UnresolvedMethod E0505 2:5: `shuffle` is not an operation of effect `Rand` | help: {help(\"shuffle\", \"random\")}\n`random.shuffle` takes 1 argument, found 2 | notes: {OPS_NOTE}",
+    ])
+}
+
+test "a call whose argument does not fit the helper gets help only, with the mismatch" {
+    let src = #"fn deal(n: Int) -> List[Int] ! Rand {
+    rand.shuffle(n)
+}
+
+fn main() {}
+"#
+    assert_eq(rows("rs_shuffle_arg_type", src), [
+        "UnresolvedMethod E0505 2:5: `shuffle` is not an operation of effect `Rand` | help: {help(\"shuffle\", \"random\")}\nargument 1 of `random.shuffle` expects List[T], got Int | notes: {OPS_NOTE}",
+    ])
+}
+
+test "a file that does not import std.random gets the one error and nothing from std.random" {
+    let src = #"fn deal(deck: List[Int]) -> List[Int] ! Rand {
+    rand.shuffle(deck)
+}
+
+fn main() {}
+"#
+    let program = probe_but("rs_no_import_exact", src, "UnresolvedMethod")
+    assert(program >= 0)
+    let mut got: List[Str] = []
+    for d in diag_entries { got.push("{d.severity} {d.name} {d.file}:{d.line}:{d.col}") }
+    assert_eq(got, ["error UnresolvedMethod build/rs_no_import_exact_probe.bl:2:5"])
 }

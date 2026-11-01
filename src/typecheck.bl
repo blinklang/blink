@@ -3,7 +3,7 @@ import std.str.{str_to_lower}
 import pkg.manifest.{manifest_name, manifest_header_is_declared}
 import unparse.{type_ann_text, unparse_expr, unparse_binop_with_lhs, unparse_range_membership, unparse_coalesce_start}
 import formatter.{effect_op_sig_text}
-import import_edit.{ImportEdit, ImportNeed, import_need}
+import import_edit.{ImportEdit, import_module_edit}
 import parser.{
     effect_derived_ops, node_load_rank, parser_load_order_moved, parser_live_ranges,
     ann_str_val, positional_str_arg, positional_str_arg_count, impl_provided_by_closeable, closeable_impl_of, sublist_remove_members, get_annotation, get_str_named_arg, has_annotation, is_literal_string_part,
@@ -16006,100 +16006,218 @@ fn tc_rand_range_start_text(arg: Int, tid: Int) -> Str ! Diag.Report {
 }
 
 // `{handle}.{name}(args)` where `name` is no operation of `root`. A std helper of that name gets
-// a help that names its module, and a fix that calls it by its bare name and imports it.
+// a help that names its module and both spellings, and the fix tc_helper_call_plan finds.
 fn tc_report_not_a_handle_op(node: Int, root: Str, name: Str) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     let args = node_args(node)
+    let mut arg_tids: List[Int] = []
     let mut i = 0
     while args != -1 && i < sublist_length(args) {
-        let _ = tc_infer_unhinted(sublist_get(args, i))
+        arg_tids.push(tc_infer_unhinted(sublist_get(args, i)))
         i = i + 1
     }
     let mut ops: List[Str] = []
     for row in builtin_op_rows(root) { ops.push("`{row.op}`") }
     let module = builtin_op_helper_module(root, name)
-    let help = if module == "" { "" } else { "`{name}` is a function in `{module}`" }
+    let plan = if module == "" { HelperCallPlan { help: "", callee: "", action: "", import_at: tc_no_import_edit() } } else { tc_helper_call_plan(node, root, module, name, arg_tids) }
     tc_unresolved_method_hard.insert(node, 1)
-    diag_error_at_notes("UnresolvedMethod", UNRESOLVED_METHOD, "`{name}` is not an operation of effect `{root}`", node, help, ["`{root}` operations are {ops.join(\", \")}"])
-    if module != "" { tc_helper_call_fix(node, module, name) }
+    diag_error_at_notes("UnresolvedMethod", UNRESOLVED_METHOD, "`{name}` is not an operation of effect `{root}`", node, plan.help, ["`{root}` operations are {ops.join(\", \")}"])
+    if plan.callee != "" { tc_set_helper_call_fix(node, plan) }
     tc_error_recovery_tid()
 }
 
-// The fix for a helper called through its handle: the call without the handle, plus the import
-// of the helper where the file lacks it. No fix where the bare name would mean something else
-// here, such as another helper imported `as` the name, or where the file imports the helper
-// under another name.
-fn tc_helper_call_fix(node: Int, module: Str, name: Str) {
-    let top = nr_top_index(name)
-    if top >= 0 && nr_index_is_global(top) == 0 { return }
-    let decl = nr_resolve_bare_decl(name, tc_site_module(node))
-    if decl != -1 && (node_module(decl) != module.replace(".", "_") || node_name(decl) != name) { return }
-    let lines = diag_source_lines(diag_file_for_node(node))
-    let line = node_line(node)
-    let col = node_col(node)
-    let src = lines.get(line - 1) ?? ""
-    let callee = "{node_name(node_obj(node))}.{name}"
-    let callee_end = col - 1 + callee.byte_len()
-    if col < 1 || callee_end > src.byte_len() || src.byte_slice(col - 1, callee_end) != callee { return }
-    let mut import_text = ""
-    let mut import_at = ImportEdit { line: 0, col: 0, end_line: 0, end_col: 0, text: "" }
-    if decl == -1 {
-        match import_need(lines, module, [name]) {
-            ImportNeed.Add(one) => {
-                let names = tc_helpers_to_import(node, module, lines)
-                let mut list = name
-                import_at = one
-                match import_need(lines, module, names) {
-                    ImportNeed.Add(all) => {
-                        list = names.join(", ")
-                        import_at = all
-                    }
-                    _ => {}
-                }
-                import_text = "add `import {module}.\{{list}}` and "
-            }
-            ImportNeed.Present => {}
-            ImportNeed.Blocked => return
-        }
-    }
-    let action = "{import_text}call"
-    let end_col = node_end_col(node)
-    if node_end_line(node) == line && end_col > callee_end && end_col - 1 <= src.byte_len() {
-        let bare_start = col - 1 + callee.byte_len() - name.byte_len()
-        diag_set_last_fix_at(action, src.byte_slice(bare_start, end_col - 1), line, col, line, end_col)
-    } else {
-        diag_set_last_fix_at(action, name, line, col, line, callee_end + 1)
-    }
-    if import_at.line > 0 {
-        diag_add_last_fix_edit(import_at.line, import_at.col, import_at.end_line, import_at.end_col, import_at.text)
-    }
+// The help and fix for a module function called through a handle. The fix is the first of
+// these that makes the callee the module's function and adds no diagnostic (§4.4.7): the bare
+// name or a qualifier the file already binds to the module, then a new `import module` and a
+// call through its qualifier. `callee` is "" when none does, or when the call with the new
+// callee would not type-check.
+type HelperCallPlan {
+    help: Str
+    callee: Str
+    action: Str
+    import_at: ImportEdit
 }
 
-// The helpers of `module` that the file of `node` calls through the same handle and needs to
-// import, sorted. Each of their fixes imports them all, so the fixes carry one import edit,
-// which `blink fix` applies once instead of seeing two inserts at one place as a conflict.
-fn tc_helpers_to_import(node: Int, module: Str, lines: List[Str]) -> List[Str] {
-    let handle = node_name(node_obj(node))
-    let root = builtin_op_root_of_handle(handle)
+fn tc_no_import_edit() -> ImportEdit {
+    ImportEdit { line: 0, col: 0, end_line: 0, end_col: 0, text: "" }
+}
+
+fn tc_helper_call_plan(node: Int, root: Str, module: Str, name: Str, arg_tids: List[Int]) -> HelperCallPlan ! Diag.Report {
     let site = tc_site_module(node)
-    let mut names: List[Str] = []
+    let mod_key = module.replace(".", "_")
+    let leaf = tc_module_leaf(module)
+    let mut qualifier = leaf
+    let mut callee = ""
+    let mut action = "call"
+    let mut import_at = tc_no_import_edit()
+    let decl = nr_resolve_bare_decl(name, site)
+    let bare_reaches = decl != -1 && node_module(decl) == mod_key && node_name(decl) == name
+    if bare_reaches && tc_helper_name_blocker(node, name, module, name).kind == "" {
+        callee = name
+    } else {
+        let reused = tc_helper_reusable_qualifier(node, module)
+        if reused != "" {
+            qualifier = reused
+            callee = "{reused}.{name}"
+        } else if tc_helper_name_blocker(node, leaf, module, "").kind == "" {
+            callee = "{leaf}.{name}"
+            action = "add `import {module}` and call"
+            import_at = import_module_edit(diag_source_lines(diag_file_for_node(node)), module)
+        }
+    }
+    let mut help = "`{name}` is a function in module `{module}`; `{node_name(node_obj(node))}` is the handle of `{root}` and `{qualifier}` is the module"
+    let sig = nr_module_names_of(mod_key).sigs.get(name) ?? -1
+    let mismatch = if sig == -1 { "" } else { tc_helper_call_mismatch(if callee != "" { callee } else { "{leaf}.{name}" }, sig, node_args(node), arg_tids) }
+    if mismatch != "" || sig == -1 { callee = "" }
+    if mismatch != "" { help = help.concat("\n{mismatch}") }
+    HelperCallPlan { help: help, callee: callee, action: action, import_at: import_at }
+}
+
+// The last segment of a dotted module path: the qualifier a whole import of it binds.
+fn tc_module_leaf(module: Str) -> Str {
+    let parts = module.split(".")
+    parts.get(parts.len() - 1) ?? module
+}
+
+// A binding of `name` where `node` reads it: its kind as the help names it, and the place
+// where it binds the name. `kind` is "" when nothing binds it.
+type HelperBlocker {
+    kind: Str
+    line: Int
+    col: Int
+}
+
+// What binds `name` where `node` reads it, other than an import of `module` that binds the
+// name as its qualifier or, when `member` is the name, as that member of the module: a local,
+// a declaration of the file's module, or another import.
+fn tc_helper_name_blocker(node: Int, name: Str, module: Str, member: Str) -> HelperBlocker ! Diag.Report {
+    let idx = nr_top_index(name)
+    if idx >= 0 && nr_index_is_global(idx) == 0 {
+        let binder = nr_scope_nodes.get(idx) ?? -1
+        if binder >= 0 { return HelperBlocker { kind: "local", line: node_line(binder), col: node_col(binder) } }
+        return HelperBlocker { kind: "local", line: 0, col: 0 }
+    }
+    let decl = nr_module_decl(tc_site_module(node), name)
+    if decl != -1 {
+        let (line, col) = nr_decl_name_at(ModuleDeclName { namespace: "value", name: name, decl: decl, binder: -1 })
+        return HelperBlocker { kind: tc_decl_kind_word(decl), line: line, col: col }
+    }
     let file = diag_file_for_node(node)
     let (start, end) = diag_file_node_range(node, node_count())
     let mut n = start
     while n < end {
-        if node_kind(n) == NodeKind.MethodCall && diag_file_for_node(n) == file {
-            let m = node_method(n)
-            let obj = node_obj(n)
-            let calls_helper = builtin_op_helper_module(root, m) == module && obj >= 0 && node_kind(obj) == NodeKind.Ident && node_name(obj) == handle
-            if calls_helper && !names.contains(m) && nr_resolve_bare_decl(m, site) == -1 {
-                match import_need(lines, module, [m]) {
-                    ImportNeed.Add(_) => names.push(m)
-                    _ => {}
+        if node_kind(n) == NodeKind.ImportStmt && diag_file_for_node(n) == file {
+            let path = node_str_val(n)
+            let qual = if node_name(n) != "" { node_name(n) } else { tc_module_leaf(path) }
+            if qual == name && path != module {
+                let (line, col) = tc_import_path_at(n)
+                return HelperBlocker { kind: "import", line: line, col: col }
+            }
+            let names_sl = node_args(n)
+            let mut i = 0
+            while names_sl != -1 && i < sublist_length(names_sl) {
+                let item = sublist_get(names_sl, i)
+                let bound = if node_str_val(item) != "" { node_str_val(item) } else { node_name(item) }
+                if bound == name && !(path == module && node_name(item) == member) {
+                    return HelperBlocker { kind: "import", line: node_line(item), col: node_col(item) }
                 }
+                i = i + 1
             }
         }
         n = n + 1
     }
-    names.sort()
+    HelperBlocker { kind: "", line: 0, col: 0 }
+}
+
+fn tc_decl_kind_word(decl: Int) -> Str {
+    match node_kind(decl) {
+        NodeKind.FnDef => "function"
+        NodeKind.LetBinding => "`let`"
+        NodeKind.TypeDef => "type"
+        NodeKind.TraitDef => "trait"
+        NodeKind.EffectDecl => "effect"
+        _ => "declaration"
+    }
+}
+
+// Where an import statement writes its module path: after `import`, and `pub` before it.
+fn tc_import_path_at(imp: Int) -> (Int, Int) {
+    let line = node_line(imp)
+    let text = diag_source_line(diag_file_for_node(imp), line)
+    let mut at = if node_col(imp) > 0 { node_col(imp) - 1 } else { 0 }
+    for word in ["pub", "import"] {
+        let end = at + word.byte_len()
+        if end <= text.byte_len() && text.byte_slice(at, end) == word {
+            at = end
+            while at < text.byte_len() && text.byte_at(at).to_int() == 32 { at = at + 1 }
+        }
+    }
+    (line, at + 1)
+}
+
+// The qualifier of the first import of `module` in the file of `node` that nothing else binds
+// where `node` reads it, or "".
+fn tc_helper_reusable_qualifier(node: Int, module: Str) -> Str ! Diag.Report {
+    let file = diag_file_for_node(node)
+    let (start, end) = diag_file_node_range(node, node_count())
+    let mut n = start
+    while n < end {
+        if node_kind(n) == NodeKind.ImportStmt && diag_file_for_node(n) == file && node_str_val(n) == module {
+            let qual = if node_name(n) != "" { node_name(n) } else { tc_module_leaf(module) }
+            if tc_helper_name_blocker(node, qual, module, "").kind == "" { return qual }
+        }
+        n = n + 1
+    }
+    ""
+}
+
+// Why `callee(args)` would not type-check against the signature `sig`, or "". The arguments
+// were inferred once, to `arg_tids`; one whose type is not known yet is not judged.
+fn tc_helper_call_mismatch(callee: Str, sig: Int, args: Int, arg_tids: List[Int]) -> Str {
+    let fs = fnsig_pool.get(sig).unwrap()
+    let got = if args == -1 { 0 } else { sublist_length(args) }
+    if got != fs.params_count {
+        let noun = if fs.params_count == 1 { "argument" } else { "arguments" }
+        return "`{callee}` takes {fs.params_count} {noun}, found {got}"
+    }
+    let mut binds: Map[Str, Int] = Map()
+    let mut i = 0
+    while i < got {
+        let arg = sublist_get(args, i)
+        let mut pidx = i
+        if node_kind(arg) == NodeKind.NamedArg {
+            pidx = tc_fnsig_param_index_by_name(fs.params_start, fs.params_count, 0, node_name(arg))
+            if pidx < 0 { return "`{callee}` has no parameter `{node_name(arg)}`" }
+        }
+        let arg_t = arg_tids.get(i) ?? -1
+        if tc_tid_is_no_info(arg_t) == 0 && tc_tid_has_unknown(arg_t) == 0 {
+            let formal = fnsig_param_list.get(fs.params_start + pidx).unwrap()
+            unify_typevar_binds(formal, arg_t, binds)
+            if types_compatible(substitute_typevar_tid(formal, binds), arg_t) == 0 {
+                return "argument {i + 1} of `{callee}` expects {tc_type_str(formal)}, got {tc_type_str(arg_t)}"
+            }
+        }
+        i = i + 1
+    }
+    ""
+}
+
+// The fix of `plan` on the call `node`: its callee rewritten, and the import it adds.
+fn tc_set_helper_call_fix(node: Int, plan: HelperCallPlan) {
+    let lines = diag_source_lines(diag_file_for_node(node))
+    let line = node_line(node)
+    let col = node_col(node)
+    let src = lines.get(line - 1) ?? ""
+    let callee = "{node_name(node_obj(node))}.{node_method(node)}"
+    let callee_end = col - 1 + callee.byte_len()
+    if col < 1 || callee_end > src.byte_len() || src.byte_slice(col - 1, callee_end) != callee { return }
+    let end_col = node_end_col(node)
+    if node_end_line(node) == line && end_col > callee_end && end_col - 1 <= src.byte_len() {
+        diag_set_last_fix_at(plan.action, plan.callee.concat(src.byte_slice(callee_end, end_col - 1)), line, col, line, end_col)
+    } else {
+        diag_set_last_fix_at(plan.action, plan.callee, line, col, line, callee_end + 1)
+    }
+    let at = plan.import_at
+    if at.line > 0 { diag_add_last_fix_edit(at.line, at.col, at.end_line, at.end_col, at.text) }
 }
 
 pub fn tc_call_builtin_default(call: Int) -> Int {

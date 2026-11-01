@@ -1,7 +1,7 @@
 import ast.{NodeKind, trace, trace_mode}
 import lexer.{Lex, lex}
 import parser.{Parse, parser_reset, parse_program, new_node, new_sublist, sublist_push, finalize_sublist, sublist_get, sublist_length, pos, node_count, node_kind, node_name, node_obj, node_method, node_args, node_elements, node_handlers, node_params, node_fields, node_stmts, node_arms, node_methods, node_module, node_captures, node_str_val, node_is_pub, node_set_module, node_set_is_pub, node_set_name, node_set_handlers, node_set_params, node_set_fields, node_set_stmts, node_set_arms, node_set_methods, node_set_args, node_set_captures, record_source_module, embed_path_of, parsed_interface_text, parsed_interface_parts, interface_text_of, parser_interface_text_deferred, parser_interface_text_wanted, parser_keeps_parsed, parser_has_parsed_end, parser_parsed_end, parser_mark_parsed, parser_rewind, parser_keep_parsed, parser_keep_load_order_only, parser_program_annotations, parser_set_program_annotations, parser_set_load_order, parser_live_ranges}
-import typecheck.{builtin_op_module, builtin_op_root_of_handle, clear_module_imports, handles_io_read, io_read_module, is_intrinsic_method, tc_handler_effect_root, record_module_import, tc_import_modules, tc_import_qualifiers, tc_import_nodes, tc_reexport_source, tc_reexport_modules, tc_is_module_used, tc_main_module_has_duplicates, tc_get_symbol_module, tc_set_prelude_modules, tc_record_module_package, nearest_name}
+import typecheck.{builtin_op_helper_module, builtin_op_module, builtin_op_root_of_handle, clear_module_imports, handles_io_read, io_read_module, is_intrinsic_method, tc_handler_effect_root, record_module_import, tc_import_modules, tc_import_qualifiers, tc_import_nodes, tc_reexport_source, tc_reexport_modules, tc_is_module_used, tc_main_module_has_duplicates, tc_get_symbol_module, tc_set_prelude_modules, tc_record_module_package, nearest_name}
 import diagnostics.{
     Diag, diag_register_file_range, diag_register_source, lint_set_override, diag_normalize_path,
     diag_set_last_fix, diag_error_no_loc, diag_warn_at, diag_reset,
@@ -2058,6 +2058,23 @@ fn program_names_op_handle(root: Str, handle: Str) -> Bool {
     false
 }
 
+// The std module of a helper that the program calls through the handle of `root`, as in
+// `rand.shuffle(xs)`, or "". That call is E0505, and its fix checks the call with the helper's
+// signature (sections/04_effects.md §4.4.7), so the program loads the module, which binds no
+// name in any file.
+fn program_calls_op_helper(root: Str, handle: Str) -> Str {
+    let mut i = 0
+    while i < node_count() {
+        if node_kind(i) == NodeKind.MethodCall {
+            let obj = node_obj(i)
+            let module = builtin_op_helper_module(root, node_method(i))
+            if module != "" && obj >= 0 && node_kind(obj) == NodeKind.Ident && node_name(obj) == handle { return module }
+        }
+        i = i + 1
+    }
+    ""
+}
+
 // Accepts either the dotted form ("std.traits") or the mangled module key
 // ("std_traits") that tc_symbol_module stores.
 pub fn is_prelude_module(mod_name: Str) -> Int {
@@ -2102,6 +2119,17 @@ pub fn inject_prelude(src_root: Str, all_programs: List[Int]) ! Lex.Tokenize, Pa
         let file_path = resolve_module_path(io_read_module(), src_root)
         if file_path != "" && is_file_loaded(file_path) == 0 {
             load_module(io_read_module(), file_path, src_root, all_programs, -1, "prelude")
+        }
+    }
+    // Before the operation modules: the helper module performs operations of its root.
+    for handle in ["fs", "process", "rand"] {
+        let root = builtin_op_root_of_handle(handle)
+        let helper_module = program_calls_op_helper(root, handle)
+        if helper_module != "" {
+            let file_path = resolve_module_path(helper_module, src_root)
+            if file_path != "" && is_file_loaded(file_path) == 0 {
+                load_module(helper_module, file_path, src_root, all_programs, -1, "prelude")
+            }
         }
     }
     for handle in ["fs", "process", "rand"] {
