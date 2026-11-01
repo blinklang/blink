@@ -34,7 +34,7 @@ import diagnostics.{
     UNSOLVED_TYPEVAR_AT_CODEGEN, SEALED_OPS_REWRITE_INVARIANT, VARIANT_WITHOUT_ENUM,
     NO_SUCH_VARIANT, TYPE_ERROR, TEMPLATE_MISMATCH, UNEXPECTED_ANNOTATION, MISSING_RETURN, NO_CONVERSION_IMPL, CANNOT_INFER_TYPE, NOT_ITERABLE, MISSING_ELSE, UNLICENSED_SELF_OP, TRAIT_BOUND_NOT_SATISFIED, CAPABILITY_BUDGET, QM_INVALID_OPERAND, UNDEFINED_FUNCTION,
     UNRESOLVED_METHOD, AMBIGUOUS_METHOD_CALL, MISSING_DISPLAY_IMPL,
-    MUTATION_REQUIRES_MUT, MUT_ON_PATTERN, NOT_A_PLACE, PARAM_ASSIGN, diag_error_label_at_notes, diag_error_span_label_at_notes, diag_warn_label_at_notes, EMPTY_ROW_OUTSIDE_FFI, EFFECTS_ANNOTATION_REMOVED, UNKNOWN_EFFECT, diag_fix_before_starts_with, diag_drop_fix_over_others,
+    MUTATION_REQUIRES_MUT, MUT_ON_PATTERN, NOT_A_PLACE, PARAM_ASSIGN, diag_error_label_at_notes, diag_error_span_label_at_notes, diag_warn_label_at_notes, EMPTY_ROW_OUTSIDE_FFI, EFFECTS_ANNOTATION_REMOVED, UNKNOWN_EFFECT, diag_fix_before_starts_with, diag_drop_fix_over_others, diag_drop_fix_at,
     UNDEFINED_VARIABLE, UNKNOWN_TYPE, QM_RESULT_IN_NON_RESULT,
     QM_OPTION_IN_NON_OPTION, QM_ERROR_MISMATCH,
     QM_TEST_DISPLAY_REQUIRED, TEST_ANNOTATED_RETURN, SKIP_OUTSIDE_TEST,
@@ -15152,7 +15152,7 @@ fn init_types() ! TypeCheck.Register {
     ty_param_list.clear()
     // The method-call facts span all three phases of one check_types, so they are cleared
     // here rather than in resolve_names with the registries that feed them.
-    tc_method_calls = MethodCallFacts { unresolved: [], hard: Map(), seeded_expected: Map(), dropped: Map() }
+    tc_method_calls = MethodCallFacts { unresolved: [], hard: Map(), seeded_expected: Map(), dropped: Map(), helper_fixes: Map() }
     // Load-bearing for the daemon/LSP (long-lived processes, daemon.bl / lsp.bl): a
     // surviving intern map would hand out tids keyed against the PREVIOUS, since-cleared
     // pool on the next check_types() call — out-of-bounds unwrap panic or a silently
@@ -16080,13 +16080,16 @@ fn tc_report_not_a_handle_op(node: Int, root: Str, name: Str) -> Int ! TypeCheck
     let mut ops: List[Str] = []
     for row in builtin_op_rows(root) { ops.push("`{row.op}`") }
     let module = builtin_op_helper_module(root, name)
-    let plan = if module == "" { HelperCallPlan { help: "", callee: "", action: "", import_at: tc_no_import_edit() } } else { tc_helper_call_plan(node, root, module, name, arg_tids) }
+    let plan = if module == "" { HelperCallPlan { help: "", callee: "", action: "", import_at: tc_no_import_edit(), sig: -1 } } else { tc_helper_call_plan(node, root, module, name, arg_tids) }
     tc_method_calls.hard.insert(node, 1)
     // A call the typecheck visits again reports nothing new, and the newest error is then
     // another call's.
     let before = diag_entry_count()
     diag_error_at_notes("UnresolvedMethod", UNRESOLVED_METHOD, "`{name}` is not an operation of effect `{root}`", node, plan.help, ["`{root}` operations are {ops.join(\", \")}"])
-    if plan.callee != "" && diag_entry_count() > before { tc_set_helper_call_fix(node, plan) }
+    if plan.callee != "" && diag_entry_count() > before {
+        tc_set_helper_call_fix(node, plan)
+        tc_method_calls.helper_fixes.insert(node, HelperFix { diag: diag_entry_count() - 1, sig: plan.sig })
+    }
     tc_error_recovery_tid()
 }
 
@@ -16100,6 +16103,8 @@ type HelperCallPlan {
     callee: Str
     action: Str
     import_at: ImportEdit
+    // The helper's signature, or -1 when the module declares no such function.
+    sig: Int
 }
 
 fn tc_no_import_edit() -> ImportEdit {
@@ -16167,7 +16172,7 @@ fn tc_helper_call_plan(node: Int, root: Str, module: Str, name: Str, arg_tids: L
     let check = if sig == -1 { HelperCallCheck { mismatch: "", proven: false } } else { tc_helper_call_check(shown, sig, node_args(node), arg_tids, tc_helper_call_want(node), tc_method_calls.dropped.contains(node)) }
     if !check.proven { callee = "" }
     if check.mismatch != "" { help = help.concat("\n{check.mismatch}") }
-    HelperCallPlan { help: help, callee: callee, action: action, import_at: import_at }
+    HelperCallPlan { help: help, callee: callee, action: action, import_at: import_at, sig: sig }
 }
 
 // `name` and the binding `b` of it, as the help names a binding that blocks a fix.
@@ -21314,9 +21319,17 @@ type MethodCallFacts {
     // than the tail of a block that gives its value, the tail of a fn with no result type,
     // and the value of `let _` with no type. Marked before the statement is checked.
     dropped: Map[Int, Int]
+    // The helper calls given a fix, by the call's node. Only the effect-row pass knows the row
+    // the call runs under, and it drops the fix where that row lacks an effect of the helper.
+    helper_fixes: Map[Int, HelperFix]
 }
 
-let mut tc_method_calls: MethodCallFacts = MethodCallFacts { unresolved: [], hard: Map(), seeded_expected: Map(), dropped: Map() }
+type HelperFix {
+    diag: Int
+    sig: Int
+}
+
+let mut tc_method_calls: MethodCallFacts = MethodCallFacts { unresolved: [], hard: Map(), seeded_expected: Map(), dropped: Map(), helper_fixes: Map() }
 
 // Mark a method call the inference pass could not type and did not report on: the name
 // resolves somewhere in the program, so name resolution let it pass, but no arm here claims
@@ -37477,6 +37490,27 @@ fn tc_er_with_row(program: Int, node: Int, held: List[Str], owner: ErOwner, kids
     row
 }
 
+// The E0505 of a helper call hides the call's effect check, so its fix would add an
+// UndeclaredEffect where the row the call runs under lacks an effect of the helper (§4.4.7).
+// FFI is left out, as tc_er_check_call leaves it out.
+fn tc_er_check_helper_fix(program: Int, node: Int, held: List[Str]) {
+    let fix = match tc_method_calls.helper_fixes.get(node) {
+        Some(f) => f
+        None => return
+    }
+    if fix.sig < 0 { return }
+    let fs = fnsig_pool.get(fix.sig).unwrap()
+    let mut i = 0
+    while i < fs.effects_count {
+        let req = fnsig_effect_names.get(fs.effects_start + i).unwrap()
+        if req != "FFI" && !req.starts_with("FFI.") && !tc_er_satisfied(program, held, req) {
+            diag_drop_fix_at(fix.diag, "UnresolvedMethod", node_line(node), node_col(node))
+            return
+        }
+        i = i + 1
+    }
+}
+
 fn tc_er_walk(program: Int, node: Int, held: List[Str], owner: ErOwner, kids: List[Int]) ! TypeCheck.Resolve, Diag.Report {
     if node < 0 { return }
     let k = node_kind(node)
@@ -37502,6 +37536,7 @@ fn tc_er_walk(program: Int, node: Int, held: List[Str], owner: ErOwner, kids: Li
         }
     }
     if k == NodeKind.Call || k == NodeKind.MethodCall { tc_er_check_call(program, node, held, owner) }
+    if k == NodeKind.MethodCall { tc_er_check_helper_fix(program, node, held) }
     // One child buffer serves the whole descent: each node appends its children, walks them,
     // and gives the slots back, so a body is walked without a list per node.
     let base = kids.len()
