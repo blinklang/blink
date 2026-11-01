@@ -2829,7 +2829,7 @@ fn tc_method_call_unanswered(node: Int, method: Str, obj_t: Int, args_sl: Int) -
     let obj_k = type_kind(obj_t)
     if tc_recv_type_is_determined(obj_k, obj_t) != 0 && tc_method_unavailable_on_receiver(obj_k, method) != 0 {
         let tname = type_to_str(obj_t)
-        tc_unresolved_method_hard.insert(node, 1)
+        tc_method_calls.hard.insert(node, 1)
         tc_error_naming_types("UnresolvedMethod", UNRESOLVED_METHOD, "unresolved method `.{method}` on type {tname}", node, tc_unresolved_method_help(obj_k, tname, method, node), [obj_t])
         return tc_error_recovery_tid()
     }
@@ -8082,6 +8082,7 @@ fn tc_seed_expected_into_value(val: Int, expected: Int) ! TypeCheck.Resolve, Typ
     let mut v = val
     if node_kind(v) == NodeKind.NamedArg { v = node_value(v) }
     if v == -1 { return }
+    if node_kind(v) == NodeKind.MethodCall { tc_method_calls.seeded_expected.insert(v, expected) }
     // A literal tree is typed whole by tc_literal_takes; descending into it as well would walk
     // each subtree again from every level above it.
     if is_literal_tree_node(v) { return tc_literal_takes(v, expected) }
@@ -15088,10 +15089,9 @@ fn init_types() ! TypeCheck.Register {
     tc_ptr_bearing_memo.clear()
     tc_arg_binds_free.clear()
     ty_param_list.clear()
-    // The unresolved-method handoff spans all three phases of one check_types, so it is
-    // cleared here rather than in resolve_names with the registries that feed it.
-    nr_unresolved_method_nodes = []
-    tc_unresolved_method_hard = Map()
+    // The method-call facts span all three phases of one check_types, so they are cleared
+    // here rather than in resolve_names with the registries that feed them.
+    tc_method_calls = MethodCallFacts { unresolved: [], hard: Map(), seeded_expected: Map() }
     // Load-bearing for the daemon/LSP (long-lived processes, daemon.bl / lsp.bl): a
     // surviving intern map would hand out tids keyed against the PREVIOUS, since-cleared
     // pool on the next check_types() call — out-of-bounds unwrap panic or a silently
@@ -15756,9 +15756,9 @@ pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report {
 // method name that no impl lists, so Phase 1 records it, but the name does resolve.
 fn tc_flush_unresolved_method_warnings() ! Diag.Report {
     let mut i = 0
-    while i < nr_unresolved_method_nodes.len() {
-        let n = nr_unresolved_method_nodes.get(i).unwrap()
-        if tc_unresolved_method_hard.contains_key(n) == 0 && tc_call_decl.contains_key(n) == 0 {
+    while i < tc_method_calls.unresolved.len() {
+        let n = tc_method_calls.unresolved.get(i).unwrap()
+        if tc_method_calls.hard.contains_key(n) == 0 && tc_call_decl.contains_key(n) == 0 {
             let m = node_method(n)
             diag_warn_at("UnknownMethod", UNKNOWN_METHOD, "method `{m}` resolves to nothing, and the receiver's type is not known here", n, "annotate the receiver so the method can be resolved, or correct the method name")
         }
@@ -16020,7 +16020,7 @@ fn tc_report_not_a_handle_op(node: Int, root: Str, name: Str) -> Int ! TypeCheck
     for row in builtin_op_rows(root) { ops.push("`{row.op}`") }
     let module = builtin_op_helper_module(root, name)
     let plan = if module == "" { HelperCallPlan { help: "", callee: "", action: "", import_at: tc_no_import_edit() } } else { tc_helper_call_plan(node, root, module, name, arg_tids) }
-    tc_unresolved_method_hard.insert(node, 1)
+    tc_method_calls.hard.insert(node, 1)
     // A call the typecheck visits again reports nothing new, and the newest error is then
     // another call's.
     let before = diag_entry_count()
@@ -16102,7 +16102,7 @@ fn tc_helper_call_plan(node: Int, root: Str, module: Str, name: Str, arg_tids: L
         help = help.concat("\nimport it under another name and call through that name: `import {module} as {alias}`, then `{shown}{tc_helper_call_args_text(node, lines)}`")
     }
     let sig = nr_module_names_of(mod_key).sigs.get(name) ?? -1
-    let mismatch = if sig == -1 { "" } else { tc_helper_call_mismatch(shown, sig, node_args(node), arg_tids) }
+    let mismatch = if sig == -1 { "" } else { tc_helper_call_mismatch(shown, sig, node_args(node), arg_tids, tc_helper_call_want(node)) }
     if mismatch != "" || sig == -1 { callee = "" }
     if mismatch != "" { help = help.concat("\n{mismatch}") }
     HelperCallPlan { help: help, callee: callee, action: action, import_at: import_at }
@@ -16288,10 +16288,17 @@ fn tc_helper_reusable_qualifier(node: Int, module: Str) -> Str ! Diag.Report {
     ""
 }
 
+// The type the place of the call `node` expects, or -1 when the place sets none.
+fn tc_helper_call_want(node: Int) -> Int {
+    tc_method_calls.seeded_expected.get(node) ?? -1
+}
+
 // Why `callee(args)` would not type-check against the signature `sig`, or "". The arguments
-// were inferred once, to `arg_tids`; one whose type is not known yet is not judged.
-fn tc_helper_call_mismatch(callee: Str, sig: Int, args: Int, arg_tids: List[Int]) -> Str {
+// were inferred once, to `arg_tids`; one whose type is not known yet is not judged. `want` is
+// the type the call's place expects, or -1 when the place sets none.
+fn tc_helper_call_mismatch(callee: Str, sig: Int, args: Int, arg_tids: List[Int], want: Int) -> Str {
     let fs = fnsig_pool.get(sig).unwrap()
+    let kw_start = tc_fnsig_kw_start(fs.params_start, fs.params_count, 0)
     let got = if args == -1 { 0 } else { sublist_length(args) }
     if got != fs.params_count {
         let noun = if fs.params_count == 1 { "argument" } else { "arguments" }
@@ -16305,6 +16312,7 @@ fn tc_helper_call_mismatch(callee: Str, sig: Int, args: Int, arg_tids: List[Int]
         if node_kind(arg) == NodeKind.NamedArg {
             pidx = tc_fnsig_param_index_by_name(fs.params_start, fs.params_count, 0, node_name(arg))
             if pidx < 0 { return "`{callee}` has no parameter `{node_name(arg)}`" }
+            if pidx < kw_start { return "`{node_name(arg)}` is a positional parameter of `{callee}`" }
         }
         let arg_t = arg_tids.get(i) ?? -1
         if tc_tid_is_no_info(arg_t) == 0 && tc_tid_has_unknown(arg_t) == 0 {
@@ -16315,6 +16323,11 @@ fn tc_helper_call_mismatch(callee: Str, sig: Int, args: Int, arg_tids: List[Int]
             }
         }
         i = i + 1
+    }
+    let ret = substitute_typevar_tid(fs.ret, binds)
+    let known = tc_tid_is_no_info(want) == 0 && tc_tid_has_unknown(want) == 0 && tc_tid_has_bare_typevar(ret) == 0
+    if want >= 0 && known && types_compatible(want, ret) == 0 {
+        return "`{callee}` returns {tc_type_str(ret)}, and {tc_type_str(want)} is expected here"
     }
     ""
 }
@@ -21175,13 +21188,23 @@ let mut nr_impl_type_names: List[Str] = []
 let mut nr_impl_method_names: List[Str] = []
 let mut nr_callable_field_names: List[Str] = []
 
-// Method calls whose NAME resolves nowhere, found in Phase 1. Phase 1 cannot decide the
-// severity: it has no receiver type, and W0501-vs-E0505 turns on exactly that. So it
-// records the node and Phase 2 decides — the nodes it reports as E0505 land in
-// tc_unresolved_method_hard, and whatever is left over is flushed as W0501 once inference
-// is done, which is where the receiver types stop changing.
-let mut nr_unresolved_method_nodes: List[Int] = []
-let mut tc_unresolved_method_hard: Map[Int, Int] = Map()
+// What one check_types records of method calls for the reports on them.
+type MethodCallFacts {
+    // Method calls whose NAME resolves nowhere, found in Phase 1. Phase 1 cannot decide the
+    // severity: it has no receiver type, and W0501-vs-E0505 turns on exactly that. So it
+    // records the node and Phase 2 decides — the nodes it reports as E0505 land in `hard`,
+    // and whatever is left over is flushed as W0501 once inference is done, which is where
+    // the receiver types stop changing.
+    unresolved: List[Int]
+    hard: Map[Int, Int]
+    // The type a declared place expects of a method call, by the call's node, as
+    // tc_seed_expected_into_value reaches it: a `let` annotation, a return type, a parameter.
+    // The construction hint is no stand-in, since a call's receiver and the operands of `??`
+    // inherit the hint of the expression around them.
+    seeded_expected: Map[Int, Int]
+}
+
+let mut tc_method_calls: MethodCallFacts = MethodCallFacts { unresolved: [], hard: Map(), seeded_expected: Map() }
 
 // Mark a method call the inference pass could not type and did not report on: the name
 // resolves somewhere in the program, so name resolution let it pass, but no arm here claims
@@ -21429,7 +21452,7 @@ fn tc_list_scan_elem_need(elem: Int) -> List[Int] {
 // rather than absent, so a declared Bool over the call unifies with the recovery tid instead
 // of drawing a second error about a type the program never had.
 fn tc_refuse_list_scan(node: Int, obj_t: Int, need: List[Int], method: Str) -> Int ! Diag.Report {
-    tc_unresolved_method_hard.insert(node, 1)
+    tc_method_calls.hard.insert(node, 1)
     let leaf = need.get(need.len() - 1).unwrap()
     let mut help = "`.{method}` compares elements with `==`, and `{type_to_str(leaf)}` does not implement `{tc_core_trait_shown("Eq")}`"
     let k = type_kind(leaf)
@@ -23031,7 +23054,7 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                     // Recorded, not reported. Phase 2 knows the receiver type and turns
                     // this into E0505 wherever the type is known; the leftovers are
                     // flushed as W0501 after inference.
-                    nr_unresolved_method_nodes.push(node)
+                    tc_method_calls.unresolved.push(node)
                 }
             }
         }
@@ -27101,7 +27124,7 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                 if tc_report_bad_variant_value(node, cname, method, 1) {
                     let _ = tc_infer_arg_tids(node_args(node))
                     // Reported here, so the method-resolution flush adds no UnknownMethod.
-                    tc_unresolved_method_hard.insert(node, 1)
+                    tc_method_calls.hard.insert(node, 1)
                     return tc_error_recovery_tid()
                 }
             }
@@ -28129,7 +28152,7 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                 // refused here, in the generic body, not at each instance. Only a guarantee
                 // set whose method lists are all known can say a method is absent.
                 if tc_guarantee_lists_all_methods(tv_traits) && tc_pipe_has(tc_guarantee_methods(tv_traits), method) == 0 {
-                    tc_unresolved_method_hard.insert(node, 1)
+                    tc_method_calls.hard.insert(node, 1)
                     diag_error_at("UnresolvedMethod", UNRESOLVED_METHOD, "type parameter `{tv_name}` is bounded by {tc_traits_shown(tc_pipe_joined(tv_traits))}, and none of them declares method `{method}`", node, "correct the method name, or add a bound whose trait declares `{method}`")
                     return tc_error_recovery_tid()
                 }
@@ -28327,7 +28350,7 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
             // the backstop never re-fires.
             if tc_method_resolvable_on_type(obj_k, tname, method) == 0 {
                 let help = tc_unresolved_method_help(obj_k, tname, method, node)
-                tc_unresolved_method_hard.insert(node, 1)
+                tc_method_calls.hard.insert(node, 1)
                 tc_error_naming_types("UnresolvedMethod", UNRESOLVED_METHOD, "unresolved method `.{method}` on type {tname}", node, help, [obj_t])
                 return tc_error_recovery_tid()
             }
@@ -28550,11 +28573,11 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                         // whichever OTHER trait defines the name and return that trait's
                         // answer, silently ignoring the qualifier the author wrote.
                         if tc_trait_declares_method(qt_trait, method) == 0 {
-                            tc_unresolved_method_hard.insert(node, 1)
+                            tc_method_calls.hard.insert(node, 1)
                             diag_error_at("UnresolvedMethod", UNRESOLVED_METHOD, "trait `{obj_name}` does not define method `{method}`", node, "")
                             return tc_error_recovery_tid()
                         }
-                        tc_unresolved_method_hard.insert(node, 1)
+                        tc_method_calls.hard.insert(node, 1)
                         diag_error_at("TraitBoundNotSatisfied", TRAIT_BOUND_NOT_SATISFIED, "type parameter `{qt_tp}` is not bound by trait `{obj_name}`, so `{obj_name}.{method}` is not available on it", node, "add the bound: `{qt_tp}: {obj_name}`")
                         return tc_error_recovery_tid()
                     }
@@ -28640,7 +28663,7 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                     if tc_trait_declares_method(qt_trait, method) == 0 {
                         let qt_owner = tc_traits_shown(tc_method_trait_names(qt_tname, method))
                         let qt_help = if qt_owner != "" { "`{method}` on {qt_tname} is defined by {qt_owner}" } else { "" }
-                        tc_unresolved_method_hard.insert(node, 1)
+                        tc_method_calls.hard.insert(node, 1)
                         diag_error_at("UnresolvedMethod", UNRESOLVED_METHOD, "trait `{obj_name}` does not define method `{method}`", node, qt_help)
                         return tc_error_recovery_tid()
                     }
