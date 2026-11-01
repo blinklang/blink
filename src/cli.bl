@@ -3,7 +3,7 @@ import std.args.{
     ArgParser, Args,
     argparser_new, set_version, add_flag, add_command,
     command_add_flag, command_add_option, command_add_positional,
-    argparse, parse_argv, args_has, args_get, args_get_all,
+    parse_argv, args_has, args_get, args_get_all,
     args_command, args_command_path, args_positional, args_positional_count, args_rest, args_error,
     generate_help, generate_command_help,
 }
@@ -4502,6 +4502,11 @@ fn do_ffi_audit(program: Int, json_output: Int) ! IO.Print {
 }
 
 fn cmd_build(p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit, Codegen, IO, FS.Write, FS.Read, Env.Read, Process.Spawn, FS.Delete, Net.Connect, Env.Exit, Time {
+    // The built program reads its filters when it runs, so a filter here would do nothing.
+    if args_get(a, TRACE_FILTER_KEY) != "" {
+        io.eprintln("error: `blink build --trace` takes no filters; pass --trace=<filters> to the built program when it runs")
+        env.exit(1)
+    }
     if build_through_daemon(a, "build") {
         return
     }
@@ -4576,8 +4581,7 @@ fn build_here(p: ArgParser, a: Args, checked: Option[DaemonBuild], test_build: B
         env.exit(1)
     }
     trace_mode = args_get(a, "blink-trace")
-    let build_trace_val = args_get(a, "trace")
-    if build_trace_val != "" {
+    if args_has(a, "trace") {
         cli_trace_codegen = 1
     }
     cli_deterministic = if args_has(a, "deterministic") { 1 } else { 0 }
@@ -4693,19 +4697,42 @@ fn run_build_here(p: ArgParser, a: Args, checked: Option[DaemonBuild]) -> Str ! 
 
 // Whether `blink run` builds its program to trace the calls it makes.
 fn run_traces(a: Args) -> Bool ! Env.Read {
-    args_get(a, "trace") != "" || (env.var("BLINK_TRACE") ?? "") != ""
+    args_has(a, "trace") || (env.var("BLINK_TRACE") ?? "") != ""
+}
+
+// The filters of a `--trace=<filters>` token, which `blink run` hands on to the program it
+// runs. No option of the parser has this name, so only parse_cli_argv sets it.
+let TRACE_FILTER_KEY = "trace-filter"
+
+// The spec forms are a bare `--trace` and `--trace=<filters>`, but args knows only a flag
+// with no value or an option that takes the next token, which would take the source file
+// from `--trace app.bl`. So each `--trace=<filters>` token becomes the bare flag before the
+// parse, and its filters come back under TRACE_FILTER_KEY. The tokens after `--` belong to
+// the program.
+fn parse_cli_argv(p: ArgParser, argv: List[Str]) -> Args ! IO.Print {
+    let mut toks: List[Str] = []
+    let mut filter = ""
+    let mut own = true
+    for tok in argv {
+        if tok == "--" { own = false }
+        if own && tok.starts_with("--trace=") {
+            filter = tok.byte_slice(8, tok.byte_len())
+            toks.push("--trace")
+        } else {
+            toks.push(tok)
+        }
+    }
+    let a = parse_argv(p, toks)
+    if filter == "" { return a }
+    Args { option_keys: [..a.option_keys, TRACE_FILTER_KEY], option_vals: [..a.option_vals, filter], ..a }
 }
 
 // Runs the program `blink run` built, with the arguments meant for it.
 fn run_built(a: Args, output_path: Str) ! Process.Spawn, Env.Exit, IO {
-    let trace_val = args_get(a, "trace")
     let mut rest = args_rest(a)
-    if trace_val != "" {
-        if trace_val == "all" {
-            rest.push("--trace")
-        } else {
-            rest.push("--trace={trace_val}")
-        }
+    if args_has(a, "trace") {
+        let filter = args_get(a, TRACE_FILTER_KEY)
+        rest.push(if filter == "" { "--trace" } else { "--trace={filter}" })
     }
     let trace_limit_val = args_get(a, "trace-limit")
     if trace_limit_val != "" {
@@ -6179,7 +6206,7 @@ fn build_through_daemon(a: Args, command: Str) -> Bool ! IO, FS.Read, Env.Read, 
     // The settings the cold build would apply, which it applies again if the daemon declines.
     apply_cache_flag(a)
     trace_mode = args_get(a, "blink-trace")
-    if (command == "build" && args_get(a, "trace") != "") || (command == "run" && run_traces(a)) {
+    if (command == "build" && args_has(a, "trace")) || (command == "run" && run_traces(a)) {
         cli_trace_codegen = 1
     }
     let settings = front_settings(args_has(a, "strict-struct-layout"))
@@ -6227,7 +6254,7 @@ fn build_through_daemon(a: Args, command: Str) -> Bool ! IO, FS.Read, Env.Read, 
 // the checked program.
 fn build_in_daemon_child(b: DaemonBuild) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit, Codegen, IO, FS.Write, FS.Read, FS.Delete, Process.Spawn, Env.Exit, Env.Read, Time {
     let p = cli_parser()
-    let a = parse_argv(p, b.argv)
+    let a = parse_cli_argv(p, b.argv)
     let command = args_command(a)
     if args_error(a) != "" || (command != "build" && command != "run") || !daemon_may_build(a) || deps_unresolved() || !dev_archive_current() {
         let _ = fs.write(b.declined, "")
@@ -7473,8 +7500,8 @@ fn cli_parser() -> ArgParser {
     p = command_add_option(p, "build", "--blink-trace", "", "Trace compiler phase (lex, parse, typecheck, mono, all)")
     p = command_add_option(p, "run", "--blink-trace", "", "Trace compiler phase (lex, parse, typecheck, mono, all)")
     p = command_add_option(p, "check", "--blink-trace", "", "Trace compiler phase (lex, parse, typecheck, mono, all)")
-    p = command_add_option(p, "run", "--trace", "", "Runtime execution trace (NDJSON to stderr). Use --trace all or --trace fn:name,module:mod,depth:N")
-    p = command_add_option(p, "build", "--trace", "", "Compile with trace instrumentation. Binary accepts --trace[=filter] at runtime")
+    p = command_add_flag(p, "run", "--trace", "", "Runtime execution trace (NDJSON to stderr). Bare --trace traces all; --trace=fn:name,module:mod,depth:N filters")
+    p = command_add_flag(p, "build", "--trace", "", "Compile with trace instrumentation. The binary accepts --trace[=filters] when it runs")
     p = command_add_option(p, "run", "--trace-limit", "", "Cap trace output to N events")
 
     p = command_add_flag(p, "llms", "--list", "", "List available topics")
@@ -7668,7 +7695,7 @@ fn main() {
 
     let p = cli_parser()
 
-    let a = argparse(p)
+    let a = parse_cli_argv(p, argv)
 
     let err = args_error(a)
     if err == "help" || err == "version" {

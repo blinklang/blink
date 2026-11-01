@@ -192,22 +192,22 @@ Trace runtime execution with structured NDJSON output to stderr:
 
 ```sh
 # Trace all function calls, effects, and state mutations
-build/blink run hello.bl --trace all
+build/blink run hello.bl --trace
 
 # Filter by function or module
-build/blink run hello.bl --trace "fn:main"
-build/blink run hello.bl --trace "module:parser,depth:2"
+build/blink run hello.bl --trace=fn:main
+build/blink run hello.bl --trace=module:parser,depth:2
 
 # Trace only specific event types
-build/blink run hello.bl --trace "event:effect"       # IO/FS/DB operations
-build/blink run hello.bl --trace "event:state"        # variable mutations
+build/blink run hello.bl --trace=event:effect       # IO/FS/DB operations
+build/blink run hello.bl --trace=event:state        # variable mutations
 
 # Filter by effect type or variable name
-build/blink run hello.bl --trace "effect:FS.Write"
-build/blink run hello.bl --trace "state:count"
+build/blink run hello.bl --trace=effect:FS.Write
+build/blink run hello.bl --trace=state:count
 
 # Cap output to avoid runaway traces
-build/blink run hello.bl --trace all --trace-limit 100
+build/blink run hello.bl --trace --trace-limit 100
 ```
 
 Trace can also be enabled via environment variables: `BLINK_TRACE=all` and `BLINK_TRACE_LIMIT=100`.

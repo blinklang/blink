@@ -62,7 +62,7 @@ Fine-grained trace: `BLINK_TRACE_CHANNELS=<ch>[,<ch>...|all] build/blink build -
 be built from `src/cli.bl` (not `src/blinkc_main.bl`); `build/blinkc` ignores this env var. Channels are
 defined via `dbg_trace(channel, msg)` calls (`grep dbg_trace\( src/`) — read the call site for what a
 channel means.
-Runtime trace: `build/blink run --trace all <file.bl>` (NDJSON to stderr, filter: `fn:name`, `module:mod`, `depth:N`)
+Runtime trace: `build/blink run --trace <file.bl>` (NDJSON to stderr; filter with `--trace=fn:name,module:mod,depth:N`)
 Debug build: `build/blink run --debug <file.bl>` — enables debug_assert, compiles with `-g -O0`
 
 ## Self-Hosting Bootstrap Protocol

@@ -1,0 +1,74 @@
+// `--trace` has two forms (§8.14, §8.15.1): a bare `--trace`, and `--trace=<filters>`.
+// A bare `--trace` takes no value, so it never takes the source file that comes after it.
+// The `with arena` promotion writes a trace event, which shows that the trace reached the
+// built program.
+
+import compile_test_helpers
+import std.process.{ProcessResult}
+
+let ARENA_SRC = "fn main() \{\n    let n = with arena \{ 1 + 2 \}\n    io.println(n)\n\}\n"
+
+fn src_path(tag: Str) -> Str ! FS.Write, Process.Spawn, Env.Read {
+    let path = "{compile_test_helpers.scratch_root()}/_trace_form_{tag}.bl"
+    fs.write(path, ARENA_SRC).unwrap()
+    path
+}
+
+fn cli(args: List[Str]) -> ProcessResult ! Process.Spawn {
+    process.run("build/blink", args).unwrap()
+}
+
+test "build takes a bare --trace that comes before the source" {
+    let path = src_path("build_bare")
+    let bin = "{compile_test_helpers.scratch_root()}/_trace_form_build_bare_bin"
+    let r = cli(["build", "--trace", path, "-o", bin])
+    assert_eq(r.err_out, "")
+    assert(r.success())
+    let ran = process.run(bin, ["--trace"]).unwrap()
+    assert_eq(ran.out, "3\n")
+    assert(ran.err_out.contains("\"event\":\"arena.promote\""))
+    compile_test_helpers.sh("rm -f {path} {bin} {bin}.c")
+}
+
+test "build refuses filters, which only the built program reads" {
+    let path = src_path("build_filter")
+    let bin = "{compile_test_helpers.scratch_root()}/_trace_form_build_filter_bin"
+    let r = cli(["build", "--trace=fn:main", path, "-o", bin])
+    assert(!r.success())
+    assert(r.err_out.contains("takes no filters"))
+    compile_test_helpers.sh("rm -f {path} {bin} {bin}.c")
+}
+
+test "run takes a bare --trace after the source" {
+    let path = src_path("run_after")
+    let r = cli(["run", path, "--trace"])
+    assert(r.success())
+    assert_eq(r.out, "3\n")
+    assert(r.err_out.contains("\"event\":\"arena.promote\""))
+    compile_test_helpers.sh("rm -f {path}")
+}
+
+test "run takes a bare --trace before the source" {
+    let path = src_path("run_before")
+    let r = cli(["run", "--trace", path])
+    assert(r.success())
+    assert_eq(r.out, "3\n")
+    assert(r.err_out.contains("\"event\":\"arena.promote\""))
+    compile_test_helpers.sh("rm -f {path}")
+}
+
+test "run takes --trace=<filters> before the source" {
+    let path = src_path("run_filter")
+    let r = cli(["run", "--trace=fn:main", path])
+    assert(r.success())
+    assert_eq(r.out, "3\n")
+    compile_test_helpers.sh("rm -f {path}")
+}
+
+test "a traced build calls the trace runtime and a plain build does not" {
+    let traced = compile_test_helpers.emit_c_via_cli(ARENA_SRC, "trace_form_traced", "--trace")
+    assert(traced.contains("blink_trace_init(argc, argv);"))
+    let plain = compile_test_helpers.emit_c_via_cli(ARENA_SRC, "trace_form_plain", "")
+    assert(plain != "")
+    assert(!plain.contains("blink_trace_"))
+}

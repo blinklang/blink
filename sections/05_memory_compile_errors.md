@@ -109,7 +109,7 @@ An allocation site inside an `! Arena` function is classified as either **promot
 
 `with arena { body }` is a keyword item with its own typing rule for promotion and escape (this section). It runs in order like a scoped value (§4.7.2) whose `Context` is `()`. `arena` is a keyword form, not a value that a program can store and enter again. On entry, it makes a new arena the active arena. On exit, it makes the previous arena active again and destroys the new arena. Commit and rollback exits behave the same way: the life of the arena does not depend on `ok`.
 
-Arena enter and exit events appear in `--blink-trace` and `--trace all` output, as for every other block-scoped construct. `! Arena` on a function signature is a *marker* effect. The escape check uses it. It does not select a handler.
+Arena enter and exit events appear in `--blink-trace` and `--trace` output, as for every other block-scoped construct. `! Arena` on a function signature is a *marker* effect. The escape check uses it. It does not select a handler.
 
 ##### Nesting
 

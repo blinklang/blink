@@ -1742,24 +1742,24 @@ Emits structured NDJSON to stderr with function enter/exit, state mutations, and
 
 ```sh
 # Trace everything
-build/blink run app.bl --trace all
+build/blink run app.bl --trace
 
 # Filter by function, module, or depth
-build/blink run app.bl --trace "fn:parse_expr"
-build/blink run app.bl --trace "module:parser,depth:2"
-build/blink run app.bl --trace "fn:skip_ws+parse_block"   # OR with +
+build/blink run app.bl --trace=fn:parse_expr
+build/blink run app.bl --trace=module:parser,depth:2
+build/blink run app.bl --trace=fn:skip_ws+parse_block   # OR with +
 
 # Filter by event type
-build/blink run app.bl --trace "event:enter+exit"          # only enter/exit
-build/blink run app.bl --trace "event:effect"              # only effect invocations
-build/blink run app.bl --trace "event:state"               # only state mutations
+build/blink run app.bl --trace=event:enter+exit          # only enter/exit
+build/blink run app.bl --trace=event:effect              # only effect invocations
+build/blink run app.bl --trace=event:state               # only state mutations
 
 # Filter by effect or state variable
-build/blink run app.bl --trace "effect:FS.Write"
-build/blink run app.bl --trace "state:count"
+build/blink run app.bl --trace=effect:FS.Write
+build/blink run app.bl --trace=state:count
 
 # Cap output to N events
-build/blink run app.bl --trace all --trace-limit 100
+build/blink run app.bl --trace --trace-limit 100
 
 # Environment variable (same filter syntax)
 BLINK_TRACE=all build/blink run app.bl
