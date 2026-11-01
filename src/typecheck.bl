@@ -1789,10 +1789,30 @@ fn nr_names_only_a_helper_load(name: Str) -> Bool {
     let cands = nr_decls_by_name.get(name) ?? []
     if cands.len() == 0 { return false }
     for c in cands {
-        let owner = nr_privacy.variant_owner.get(c) ?? node_module(c)
-        if owner == nr_current_module || !nr_is_helper_load(owner) { return false }
+        if !nr_decl_is_a_helper_load(c) { return false }
     }
     true
+}
+
+// The module of a declaration of `name` that no helper load holds, or "" when there is none.
+fn nr_owner_outside_helper_loads(name: Str) -> Str {
+    for c in nr_decls_by_name.get(name) ?? [] {
+        if !nr_decl_is_a_helper_load(c) { return nr_privacy.variant_owner.get(c) ?? node_module(c) }
+    }
+    ""
+}
+
+// Whether `sig` is the signature of a declaration of `name` that a helper load holds.
+fn nr_sig_of_a_helper_load(name: Str, sig: Int) -> Bool {
+    for c in nr_decls_by_name.get(name) ?? [] {
+        if (fnsig_by_decl.get(c) ?? -1) == sig { return nr_decl_is_a_helper_load(c) }
+    }
+    false
+}
+
+fn nr_decl_is_a_helper_load(decl: Int) -> Bool {
+    let owner = nr_privacy.variant_owner.get(decl) ?? node_module(decl)
+    owner != nr_current_module && nr_is_helper_load(owner)
 }
 
 fn nr_is_helper_load(module: Str) -> Bool {
@@ -17467,12 +17487,16 @@ fn nr_unselected_source(name: Str) -> Str ! Diag.Report {
     // A namesake type is in scope when this module's import list selects one declaration of
     // it; the last-writer symbol table below knows only one module for the name.
     if tc_nominal_type_name_in(name, nr_current_module) != name { return "" }
-    let source_mod = match tc_symbol_module.get(name) {
+    let recorded = match tc_symbol_module.get(name) {
         Some(v) => v
         // The main file's declarations are never recorded there, yet they reach another
         // module only through its import list, as any module's do.
         None => if nr_module_declares("__main__", name) != 0 { "__main__" } else { return "" }
     }
+    // A helper load binds no name, so when it was recorded last, the namesake of another
+    // module is the one the file did not select.
+    let source_mod = if nr_is_helper_load(recorded) { nr_owner_outside_helper_loads(name) } else { recorded }
+    if source_mod == "" { return "" }
     // The same last-writer limit as the namesake-type check above: `source_mod` is whichever
     // module was recorded last for the spelling, not the one this file's import list picked.
     if nr_bare_name_in_scope_here(name, nr_current_module) != 0 { return "" }
@@ -17928,7 +17952,10 @@ fn tc_bare_callee_sig(written: Str) -> Int {
             None => {}
         }
     }
-    lookup_fnsig(written)
+    // A helper load binds no name, so its function gives the spelling no signature here.
+    let sig = lookup_fnsig(written)
+    if sig >= 0 && nr_sig_of_a_helper_load(written, sig) { return -1 }
+    sig
 }
 
 // The return type a declaration's signature carries, or -1 for a node that registered none.
