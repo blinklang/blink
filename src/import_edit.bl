@@ -25,17 +25,40 @@ pub type ImportNeed {
 }
 
 // An import statement of the file: lines first..last (0-based), and for an import of
-// `module.{...}` the text between the braces, without comments.
+// `module.{...}` or `module as q.{...}` the items of its list. `odd` says an item of that list
+// reads as neither `name` nor `name as alias`.
 type ImportDecl {
     first: Int
     last: Int
     of_module: Bool
     is_pub: Bool
-    items: Str
+    items: List[ImportItem]
+    odd: Bool
 }
 
-fn is_import_line(line: Str) -> Bool {
-    line.starts_with("import ") || line.starts_with("pub import ")
+// An item of an import list: the name it imports from the module, and the name it binds.
+type ImportItem {
+    orig: Str
+    bound: Str
+}
+
+// The words of import text: each run of name characters, and each `.`, `{`, `}` and `,` on its
+// own. Blanks only part the words, so a tab or a run of spaces reads as one space.
+fn import_words(text: Str) -> List[Str] {
+    let mut out: List[Str] = []
+    let mut word = ""
+    for c in text {
+        let punct = c == '.' || c == '{' || c == '}' || c == ','
+        if punct || c == ' ' || c == '\t' || c == '\r' || c == '\n' {
+            if word != "" { out.push(word) }
+            word = ""
+            if punct { out.push(c.to_str()) }
+        } else {
+            word = word.concat(c.to_str())
+        }
+    }
+    if word != "" { out.push(word) }
+    out
 }
 
 // `line` up to a `//` comment. An import holds no string, so `//` always starts a comment.
@@ -50,58 +73,78 @@ fn code_of(line: Str) -> Str {
 // the caller takes from the lexer or the parser: a line of a string literal can read as an
 // import too. A brace list may run over more than one line.
 fn import_stmts(lines: List[Str], starts: List[Int], module: Str) -> List[ImportDecl] {
-    let head = "import {module}.\{"
     let mut out: List[ImportDecl] = []
     for start in starts {
         let mut i = start
-        let line = lines.get(i) ?? ""
-        if !is_import_line(line) { continue }
         let first = i
-        let mut text = code_of(line)
+        let mut text = code_of(lines.get(i) ?? "")
         if text.byte_index_of("\{", 0) != None {
             while text.byte_index_of("}", 0) == None && i + 1 < lines.len() {
                 i = i + 1
                 text = text.concat("\n").concat(code_of(lines.get(i).unwrap()))
             }
         }
-        let is_pub = text.starts_with("pub ")
-        let bare = if is_pub { text.byte_slice(4, text.byte_len()) } else { text }
-        let of_module = bare.starts_with(head)
-        let mut items = ""
-        if of_module {
-            let open = head.byte_len()
-            let close = bare.byte_index_of("}", open) ?? bare.byte_len()
-            items = bare.byte_slice(open, close)
+        let words = import_words(text)
+        let is_pub = (words.get(0) ?? "") == "pub"
+        let mut w = if is_pub { 1 } else { 0 }
+        if (words.get(w) ?? "") != "import" { continue }
+        let mut path = words.get(w + 1) ?? ""
+        w = w + 2
+        while (words.get(w) ?? "") == "." && (words.get(w + 1) ?? "\{") != "\{" {
+            path = "{path}.{words.get(w + 1).unwrap()}"
+            w = w + 2
         }
-        out.push(ImportDecl { first: first, last: i, of_module: of_module, is_pub: is_pub, items: items })
+        if (words.get(w) ?? "") == "as" { w = w + 2 }
+        let of_module = path == module && (words.get(w) ?? "") == "." && (words.get(w + 1) ?? "") == "\{"
+        let mut items: List[ImportItem] = []
+        let mut odd = false
+        if of_module {
+            let mut item: List[Str] = []
+            w = w + 2
+            while w < words.len() {
+                let word = words.get(w).unwrap()
+                if word == "," || word == "}" {
+                    if item.len() == 1 {
+                        items.push(ImportItem { orig: item.get(0).unwrap(), bound: item.get(0).unwrap() })
+                    } else if item.len() == 3 && item.get(1).unwrap() == "as" {
+                        items.push(ImportItem { orig: item.get(0).unwrap(), bound: item.get(2).unwrap() })
+                    } else if item.len() > 0 {
+                        odd = true
+                    }
+                    item = []
+                    if word == "}" { break }
+                } else {
+                    item.push(word)
+                }
+                w = w + 1
+            }
+        }
+        out.push(ImportDecl { first: first, last: i, of_module: of_module, is_pub: is_pub, items: items, odd: odd })
     }
     out
 }
 
 // How `lines`, with import statements on the lines `starts`, comes to import each of `names`
-// from `module` by its bare name: Present when it
-// imports them all, Blocked when `as` binds one of them to another item, else one edit that
-// imports the ones it lacks. An item imported only under an alias still lacks its bare name, and
-// one item may be imported under two names. Two fixes in one file that each need an import of the same names then carry the
-// same edit, which `blink fix` applies once. A one-line `import module.{...}` gets the names
-// added to its list; a `pub import` does not, as the fix must not export them. Otherwise a new
-// import line goes after the last import, or, in a file with none, before the first line that
-// is not a plain comment or blank, so that a doc comment stays with the item it documents.
+// from `module` by its bare name: Present when it imports them all, Blocked when `as` binds one
+// of them to another item, else one edit that imports the ones it lacks. An item imported only
+// under an alias still lacks its bare name, and one item may be imported under two names. Two
+// fixes in one file that each need an import of the same names then carry the same edit, which
+// `blink fix` applies once. A one-line `import module.{...}`, or `import module as q.{...}`, gets
+// the names added to its list; a `pub import` does not, as the fix must not export them.
+// Otherwise a new import line goes after the last import, or, in a file with none, before the
+// first line that is not a plain comment or blank, so that a doc comment stays with the item it
+// documents.
 pub fn import_need(lines: List[Str], starts: List[Int], module: Str, names: List[Str]) -> ImportNeed {
     let stmts = import_stmts(lines, starts, module)
     let mut merge = -1
     let mut present: List[Str] = []
     for s in stmts {
         if !s.of_module { continue }
-        for raw in s.items.split(",") {
-            let item = raw.trim()
-            let (orig, bound) = match item.byte_index_of(" as ", 0) {
-                Some(at) => (item.byte_slice(0, at).trim(), item.byte_slice(at + 4, item.byte_len()).trim())
-                None => (item, item)
-            }
+        if s.odd { return ImportNeed.Blocked }
+        for item in s.items {
             for name in names {
-                if bound != name { continue }
-                if orig != name { return ImportNeed.Blocked }
+                if item.bound != name { continue }
+                if item.orig != name { return ImportNeed.Blocked }
                 present.push(name)
             }
         }
