@@ -1,9 +1,9 @@
 // UnixListener.accept_timeout and peer_uid (sections/04_effects.md §4.4.6): a wait that runs
 // out is Ok(None) and every fault is an Err, a zero wait checks once, a wait under 1 ms waits
-// 1 ms, and peer_uid names the user at the other end. A connect completes into the listen
+// 1 ms, a signal does not end or restart a wait, and peer_uid names the user at the other end. A connect completes into the listen
 // backlog, so one thread can play both ends; a spawned task plays a peer that comes late.
 import std.net.{NetError, UnixListener, UnixConn, UnixStream, unix_listen, unix_connect, unix_peer_uid_supported}
-import std.libc.{ERR_BADF, ERR_INVAL}
+import std.libc.{ERR_BADF, ERR_INVAL, ERR_NOTSUP}
 import std.time.{Duration}
 import compile_test_helpers
 
@@ -45,6 +45,32 @@ fn is_none(r: Result[UnixConn?, NetError]) -> Bool {
         Ok(None) => true
         _ => false
     }
+}
+
+fn took(r: Result[UnixConn?, NetError]) -> Int ! Net.Listen {
+    match r {
+        Ok(Some(conn)) => {
+            conn.close()
+            1
+        }
+        Ok(None) => 0
+        Err(_) => panic("accept_timeout gave an error")
+    }
+}
+
+// Allocates for ms. On Linux each collection stops the other threads with a signal, so
+// a poll in another thread returns EINTR many times in a 300 ms wait.
+fn churn(ms: Int) -> Int {
+    let t0 = time.monotonic()
+    let mut n = 0
+    while time.monotonic().since(t0).to_ms() < ms {
+        let mut xs: List[Str] = []
+        for i in 0..2000 {
+            xs.push("item {i} {n}")
+        }
+        n = n + xs.len()
+    }
+    n
 }
 
 test "no client in the wait is Ok(None) after the whole wait" {
@@ -117,6 +143,67 @@ test "a client that connects during the wait is taken before the wait ends" {
     listener.close()
 }
 
+// An accepter that blocks after its wait catches the client only when both wake before
+// the winner takes it, so a regression fails most runs, not every run.
+test "two accepters and one client: one takes it and the other stops at the end of its wait" {
+    let path = "{dir("two_accepters")}/s.sock"
+    let listener = unix_listen(path).unwrap()
+    async.scope {
+        let a = async.spawn(fn() { took(listener.accept_timeout(Duration.ms(500))) })
+        let b = async.spawn(fn() { took(listener.accept_timeout(Duration.ms(500))) })
+        // The late client frees an accepter that blocks after its wait, so a regression
+        // fails the asserts below and does not hang until the test timeout.
+        let late = async.spawn(fn() {
+            time.sleep(Duration.ms(3000))
+            unix_connect(path).unwrap()
+        })
+        time.sleep(Duration.ms(100))
+        let first = unix_connect(path).unwrap()
+        let t0 = time.monotonic()
+        let taken = a.await + b.await
+        let ms = time.monotonic().since(t0).to_ms()
+        assert_eq(taken, 1)
+        assert(ms < 2500)
+        first.close()
+        late.await.close()
+    }
+    listener.close()
+}
+
+test "a wait that signals interrupt waits its whole time and no longer" {
+    let listener = unix_listen("{dir("eintr")}/s.sock").unwrap()
+    async.scope {
+        let h = async.spawn(fn() { churn(1500) })
+        let t0 = time.monotonic()
+        assert(is_none(listener.accept_timeout(Duration.ms(300))))
+        let ms = time.monotonic().since(t0).to_ms()
+        // Under 300: an EINTR ended the wait. Not under 1500: an EINTR restarted it.
+        assert(ms >= 300)
+        assert(ms < 1500)
+        let n = h.await
+        assert(n > 0)
+    }
+    listener.close()
+}
+
+test "the longest wait does not wrap and still takes a client that comes late" {
+    let path = "{dir("huge")}/s.sock"
+    let listener = unix_listen(path).unwrap()
+    async.scope {
+        let h = async.spawn(fn() {
+            time.sleep(Duration.ms(200))
+            unix_connect(path).unwrap()
+        })
+        let t0 = time.monotonic()
+        // The client comes after the first accept, so the deadline is read: a wrapped one would give Ok(None) at once.
+        let conn = some_conn(listener.accept_timeout(Duration.nanos(9223372036854775807)))
+        assert(time.monotonic().since(t0).to_ms() < 15000)
+        conn.close()
+        h.await.close()
+    }
+    listener.close()
+}
+
 test "accept still blocks until a client connects and the conn it gives blocks on read" {
     let path = "{dir("blocking")}/s.sock"
     let listener = unix_listen(path).unwrap()
@@ -157,28 +244,40 @@ test "an accept_timeout conn blocks on read until its line comes" {
     listener.close()
 }
 
-test "peer_uid on both ends names this user" {
-    assert(unix_peer_uid_supported())
+test "the hosts with a peer-uid call say so" {
+    let os = process.run("uname", ["-s"]).unwrap().out.trim()
+    if ["Linux", "Darwin", "FreeBSD", "OpenBSD", "NetBSD", "DragonFly"].contains(os) {
+        assert(unix_peer_uid_supported())
+    }
+}
+
+test "peer_uid on both ends names this user, or is ENOTSUP where the probe is false" {
     let path = "{dir("uid")}/s.sock"
     let listener = unix_listen(path).unwrap()
     let stream = unix_connect(path).unwrap()
     let conn = some_conn(listener.accept_timeout(Duration.ms(1000)))
-    let me = own_uid()
-    assert_eq(conn.peer_uid().unwrap(), me)
-    assert_eq(stream.peer_uid().unwrap(), me)
+    if unix_peer_uid_supported() {
+        let me = own_uid()
+        assert_eq(conn.peer_uid().unwrap(), me)
+        assert_eq(stream.peer_uid().unwrap(), me)
+    } else {
+        expect_os(conn.peer_uid(), "peer_uid", ERR_NOTSUP)
+        expect_os(stream.peer_uid(), "peer_uid", ERR_NOTSUP)
+    }
     conn.close()
     stream.close()
     listener.close()
 }
 
-test "peer_uid on a closed conn or stream is Os peer_uid EBADF" {
+test "peer_uid on a closed conn or stream is Os peer_uid EBADF, or ENOTSUP where the probe is false" {
     let path = "{dir("uid_closed")}/s.sock"
     let listener = unix_listen(path).unwrap()
     let stream: UnixStream = unix_connect(path).unwrap()
     let conn = some_conn(listener.accept_timeout(Duration.ms(1000)))
     conn.close()
     stream.close()
-    expect_os(conn.peer_uid(), "peer_uid", ERR_BADF)
-    expect_os(stream.peer_uid(), "peer_uid", ERR_BADF)
+    let code = if unix_peer_uid_supported() { ERR_BADF } else { ERR_NOTSUP }
+    expect_os(conn.peer_uid(), "peer_uid", code)
+    expect_os(stream.peer_uid(), "peer_uid", code)
     listener.close()
 }
