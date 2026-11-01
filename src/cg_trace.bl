@@ -9,25 +9,27 @@
 // is inside the traced call. Each exit keeps its return text for the pop to print.
 //
 // Each event renders its values only after the runtime says the event prints, so a call the
-// filters leave out pays for no Display call.
+// filters leave out pays for no Display call. A value shows its Display text, else its Debug
+// text, else the name of its type, and is never left out (§8.15.9). The render runs with the
+// tracer muted, so a traced call that a Display or Debug impl makes writes no event.
 //
 // A write to a whole `let mut` binding, local or module-level, in a traced body writes a
-// state event with the binding's Display text after the write.
+// state event with the binding's value after the write.
 //
-// A body is traced when it is a top-level fn of the program's own package, and when each
-// value its events show has a Display rendering. The driver arms a body before it lowers
-// it, and lower_fn takes the arm, so the closures a body queued, which lower after it,
-// carry no trace calls of that body.
+// A body is traced when it is a top-level fn of the program's own package. The driver arms
+// a body before it lowers it, and lower_fn takes the arm, so the closures a body queued,
+// which lower after it, carry no trace calls of that body.
 
 import std.path.{path_stem}
 import ast.{NodeKind}
-import parser.{node_kind, node_module, node_name, node_params, node_type_ann, sublist_get, sublist_length}
-import typecheck.{TyKind, TYPE_BOOL, TYPE_INT, TYPE_STR, TYPE_VOID, tc_module_in_entry_package, tc_resolve, tc_tid_kind}
+import parser.{node_kind, node_module, node_name, node_params, sublist_get, sublist_length}
+import typecheck.{TYPE_BOOL, TYPE_INT, TYPE_STR, TYPE_VOID, tc_module_in_entry_package, tc_type_str}
 import layout.{LayoutRecord, Position, layout_of, tid_of_node}
-import cname.{c_local_name, c_runtime_helper, c_str_const}
-import ir.{ir_block, ir_call_runtime, ir_col, ir_const, ir_expr_stmt, ir_if, ir_line_text, ir_trace_frame, ir_var_ref}
+import cname.{c_local_name, c_mint_local, c_runtime_helper, c_str_const}
+import ir.{ir_block, ir_call_runtime, ir_col, ir_const, ir_expr_stmt, ir_if, ir_let, ir_line_text, ir_trace_frame, ir_var_ref}
 import diagnostics.{Diag, diag_file_for_node}
 import cg_reg.{cg_reg_impl_of}
+import cg_call.{cg_call_has_debug, lower_debug_of_value}
 import cg_expr.{cg_expr_can_display, cg_expr_display_text, cg_expr_pending_count, cg_expr_take_pending, x_layout_checked, x_stopped}
 
 // on: the unit is built with --trace. armed: the declaration the driver will lower next, or
@@ -58,29 +60,30 @@ pub fn cg_trace_arm(decl: Int) {
 pub fn cg_trace_body_enter(fn_node: Int) -> List[Int] ! Diag.Report {
     let armed = tr_unit.armed == fn_node
     tr_unit = TraceUnit { on: tr_unit.on }
-    if !armed || !tr_traceable(fn_node) { return [] }
+    if !armed || !tc_module_in_entry_package(node_module(fn_node)) { return [] }
     let module = tr_module_name(fn_node)
     let fn_name = "{module}.{node_name(fn_node)}"
     let mut args = [tr_text(fn_node, fn_name), tr_text(fn_node, module),
         tr_text(fn_node, diag_file_for_node(fn_node)), tr_int(fn_node, ir_line_text(fn_node)),
         tr_int(fn_node, "{ir_col(fn_node)}")]
-    let mark = cg_expr_pending_count()
     let params = node_params(fn_node)
     let n = if params == -1 { 0 } else { sublist_length(params) }
     args.push(tr_int(fn_node, "{n}"))
+    let render: List[Int] = []
     let mut i = 0
     while i < n {
         let p = sublist_get(params, i)
         let tid = tid_of_node(p)
+        if tid < 0 { return [] }
         let rec = tr_local(tid, p)
         if x_stopped(rec) { return [] }
-        let text = cg_expr_display_text(p, tid, ir_var_ref(tid, p, rec.c_spelling, c_local_name(node_name(p)), rec.slot_form))
+        let text = tr_value(p, tid, ir_var_ref(tid, p, rec.c_spelling, c_local_name(node_name(p)), rec.slot_form), render)
         if text < 0 { return [] }
         args.push(tr_text(p, node_name(p)))
         args.push(text)
         i = i + 1
     }
-    let mut event = cg_expr_take_pending(mark)
+    let mut event = tr_muted(fn_node, render)
     event.push(tr_call(fn_node, TYPE_VOID, "trace_enter_event", args))
     let gate = tr_call_value(fn_node, TYPE_BOOL, "trace_fn_enter", [tr_text(fn_node, fn_name), tr_text(fn_node, module)])
     tr_unit = TraceUnit { on: true, traced: true, fn_name: fn_name, module: module }
@@ -97,10 +100,10 @@ pub fn cg_trace_body_traced() -> Bool { tr_unit.traced }
 // not traced.
 pub fn cg_trace_exit_value(node: Int, tid: Int, value: Int) -> List[Int] ! Diag.Report {
     if !cg_trace_body_traced() { return [] }
-    let mark = cg_expr_pending_count()
-    let text = cg_expr_display_text(node, tid, value)
+    let render: List[Int] = []
+    let text = tr_value(node, tid, value, render)
     if text < 0 { return [] }
-    tr_exit(node, cg_expr_take_pending(mark), text)
+    tr_exit(node, tr_muted(node, render), text)
 }
 
 // The statements before an exit with no value. None when the body is not traced.
@@ -110,14 +113,13 @@ pub fn cg_trace_exit_void(node: Int) -> List[Int] ! Diag.Report {
 }
 
 // The statements after a write to the whole `let mut` binding `var`, which `value` reads
-// once the write is done. None when the body is not traced or the binding has no Display
-// rendering.
+// once the write is done. None when the body is not traced.
 pub fn cg_trace_state(node: Int, var: Str, tid: Int, value: Int) -> List[Int] ! Diag.Report {
-    if !cg_trace_body_traced() || tid < 0 || !cg_expr_can_display(node, tid) { return [] }
-    let mark = cg_expr_pending_count()
-    let text = cg_expr_display_text(node, tid, value)
+    if !cg_trace_body_traced() || tid < 0 { return [] }
+    let render: List[Int] = []
+    let text = tr_value(node, tid, value, render)
     if text < 0 { return [] }
-    let mut event = cg_expr_take_pending(mark)
+    let mut event = tr_muted(node, render)
     let fn_name = tr_text(node, tr_unit.fn_name)
     let module = tr_text(node, tr_unit.module)
     event.push(tr_call(node, TYPE_VOID, "trace_state_emit", [fn_name, module, tr_text(node, var), tr_text(node, "assign"), text]))
@@ -132,24 +134,32 @@ fn tr_exit(node: Int, render: List[Int], text: Int) -> List[Int] ! Diag.Report {
     [ir_if(node, gate, ir_block(node, event), -1)]
 }
 
-// A body whose events would show a value with no Display rendering is not traced: the text
-// such a value shows is not settled yet.
-fn tr_traceable(fn_node: Int) -> Bool ! Diag.Report {
-    if !tc_module_in_entry_package(node_module(fn_node)) { return false }
-    let params = node_params(fn_node)
-    let mut i = 0
-    while params != -1 && i < sublist_length(params) {
-        let p = sublist_get(params, i)
-        let tid = tid_of_node(p)
-        if tid < 0 || !cg_expr_can_display(p, tid) { return false }
-        i = i + 1
-    }
-    let ann = node_type_ann(fn_node)
-    if ann < 0 { return true }
-    let rt = tid_of_node(ann)
-    if rt < 0 { return false }
-    let k = tc_tid_kind(tc_resolve(rt))
-    k == TyKind.Void || k == TyKind.Never || cg_expr_can_display(ann, rt)
+// The value string of a value (§8.15.9). The statements that build it go into `render`, and
+// the last of them holds the text in a temp, so the render is over before the event is
+// written. -1 when the render stopped.
+fn tr_value(node: Int, tid: Int, value: Int, render: List[Int]) -> Int ! Diag.Report {
+    let mark = cg_expr_pending_count()
+    let text = tr_value_text(node, tid, value)
+    if text < 0 { return -1 }
+    for s in cg_expr_take_pending(mark) { render.push(s) }
+    let rec = layout_of(TYPE_STR, Position.Local)
+    let held = c_mint_local("trace_value")
+    render.push(ir_let(TYPE_STR, node, rec.c_spelling, held, rec.slot_form, text))
+    ir_var_ref(TYPE_STR, node, rec.c_spelling, held, rec.slot_form)
+}
+
+fn tr_value_text(node: Int, tid: Int, value: Int) -> Int ! Diag.Report {
+    if cg_expr_can_display(node, tid) { return cg_expr_display_text(node, tid, value) }
+    if cg_call_has_debug(node, tid) { return lower_debug_of_value(node, tid, value) }
+    tr_text(node, "<{tc_type_str(tid)}>")
+}
+
+// The render statements with the tracer muted around them.
+fn tr_muted(span: Int, render: List[Int]) -> List[Int] {
+    let mut out = [tr_call(span, TYPE_VOID, "trace_mute", [])]
+    for s in render { out.push(s) }
+    out.push(tr_call(span, TYPE_VOID, "trace_unmute", []))
+    out
 }
 
 // The module an event names. The entry file's module is the package, which takes the name

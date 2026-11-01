@@ -1,0 +1,111 @@
+// A traced value is never left out of an event (§8.15.9). Its value string is the Display
+// text when the type has Display, else the Debug text when the type has Debug, else
+// `<TypeName>`. A derived Debug and a written Debug impl both count, and Display wins over
+// Debug. The chain holds for `args`, for `return` and for the `value` of a state event. A
+// Display or Debug call that the tracer makes writes no event, so a traced function that a
+// Display impl calls shows up only when the program itself renders the value.
+
+import compile_test_helpers
+import std.json.{json_clear, json_parse, json_get, json_as_str, json_as_int, json_len, json_key_at, json_obj_child_at}
+
+let SRC = #"@derive(Debug)
+type P { x: Int, y: Int }
+type H { v: Int }
+impl Debug for H {
+    fn debug(self) -> Str { "H:{self.v}" }
+}
+type B { v: Int }
+impl Display for B {
+    fn fmt(self, sb: StringBuilder) { sb.write("B={self.v}") }
+}
+impl Debug for B {
+    fn debug(self) -> Str { "not shown" }
+}
+type N { v: Int }
+@derive(Debug)
+type G[T] { item: T }
+type K[T] { item: T }
+impl[T] Debug for K[T] {
+    fn debug(self) -> Str { "K!" }
+}
+@derive(Debug)
+type E { A, Bv(Int) }
+type W { v: Int }
+impl Display for W {
+    fn fmt(self, sb: StringBuilder) { sb.write(helper(self.v)) }
+}
+fn helper(v: Int) -> Str { "W{v}" }
+fn take(p: P, h: H, b: B, n: N, g: G[Int], k: K[Str], e: E, r: Range[Int]) -> N { n }
+fn swap(n: N) -> P { P { x: n.v, y: 0 } }
+fn show(w: W) -> W { w }
+fn main() {
+    let n = take(P { x: 1, y: 2 }, H { v: 3 }, B { v: 4 }, N { v: 5 }, G { item: 6 }, K { item: "k" }, E.Bv(7), 0..3)
+    let mut p = swap(n)
+    p = P { x: 8, y: 9 }
+    let mut q = N { v: 1 }
+    q = N { v: 2 }
+    let w = show(W { v: 1 })
+    io.println("{p.x} {q.v} {w}")
+}
+"#
+
+let STDOUT = "8 2 W1\n"
+
+// One event as `event fn depth`, then `args`, `return` or `var=value`.
+fn line_of(obj: Int) -> Str {
+    let event = json_as_str(json_get(obj, "event"))
+    let head = "{event} {json_as_str(json_get(obj, "fn"))} {json_as_int(json_get(obj, "depth"))}"
+    if event == "exit" { return "{head} -> {json_as_str(json_get(obj, "return"))}" }
+    if event == "state" { return "{head} {json_as_str(json_get(obj, "var"))}={json_as_str(json_get(obj, "value"))}" }
+    let args = json_get(obj, "args")
+    if args < 0 { return head }
+    let mut parts: List[Str] = []
+    let mut i = 0
+    while i < json_len(args) {
+        parts.push("{json_key_at(args, i)}={json_as_str(json_obj_child_at(args, i))}")
+        i = i + 1
+    }
+    "{head} {parts.join(" ")}"
+}
+
+fn events() -> List[Str] ! FS.Write, Process.Spawn, Env.Read {
+    let dir = "{compile_test_helpers.scratch_root()}/trace_value_strings"
+    let stem = "trace_values"
+    compile_test_helpers.sh("mkdir -p {dir}")
+    let path = "{dir}/{stem}.bl"
+    let bin = "{dir}/{stem}_bin"
+    fs.write(path, SRC).unwrap()
+    let b = process.run("build/blink", ["build", "--trace", path, "-o", bin]).unwrap()
+    assert(b.success())
+    let r = process.run("env", ["BLINK_TRACE=all", bin]).unwrap()
+    assert_eq(r.out, STDOUT)
+    assert(r.success())
+    compile_test_helpers.sh("rm -rf {dir}")
+    let mut out: List[Str] = []
+    for line in r.err_out.split("\n") {
+        if !line.starts_with("\{") { continue }
+        json_clear()
+        let obj = json_parse(line)
+        assert(obj >= 0)
+        out.push(line_of(obj))
+    }
+    out
+}
+
+test "each value takes Display, else Debug, else its type name, and none is left out" {
+    let m = "trace_values"
+    assert_eq(events().join("\n"), [
+        "enter {m}.main 0",
+        "enter {m}.take 1 p=P \{ x: 1, y: 2 } h=H:3 b=B=4 n=<N> g=G \{ item: 6 } k=K! e=Bv(7) r=0..3",
+        "exit {m}.take 1 -> <N>",
+        "enter {m}.swap 1 n=<N>",
+        "exit {m}.swap 1 -> P \{ x: 5, y: 0 }",
+        "state {m}.main 0 p=P \{ x: 8, y: 9 }",
+        "state {m}.main 0 q=<N>",
+        "enter {m}.show 1 w=W1",
+        "exit {m}.show 1 -> W1",
+        "enter {m}.helper 1 v=1",
+        "exit {m}.helper 1 -> W1",
+        "exit {m}.main 0 -> ()",
+    ].join("\n"))
+}

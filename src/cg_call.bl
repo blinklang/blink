@@ -27,7 +27,7 @@ import parser.{
 import ast.{NodeKind, node_kind_name}
 import typecheck.{
     TyKind, tk_name, tc_resolve, tc_tid_kind, tc_tid_decl_node, tc_impl_owner_decl, tc_impl_recv_spelling, tc_static_qualifier, lookup_named_type, tc_compiler_known_tid, is_io_read_op,
-    tc_scalar_has_eq, tc_scalar_has_ord, tc_is_default_fill, tc_is_float_from_bits,
+    tc_scalar_has_eq, tc_scalar_has_ord, tc_instance_has_trait, tc_written_impl_holds, tc_is_default_fill, tc_is_float_from_bits,
     DECL_NODE_AMBIGUOUS,
     is_import_module_name, is_builtin_namespace, is_builtin_fn, is_intrinsic_method, tc_call_declared_name,
     tc_type_str, tc_ptr_offset_stride_known,
@@ -111,6 +111,8 @@ let method_get = "get"
 let trait_from = "From"
 let trait_clone = "Clone"
 let method_clone = "clone"
+let trait_debug = "Debug"
+let method_debug = "debug"
 
 // What the impl selector answers when more than one impl is written over the receiver and
 // the refusal is already recorded. It has to stay apart from the -1 that means no impl is
@@ -809,6 +811,38 @@ pub fn lower_display_of_value(node: Int, tid: Int, value: Int) -> Int ! Diag.Rep
     let im = cc_display_impl(node, tid)
     if im < 0 { return -1 }
     cc_display_call(node, im, value)
+}
+
+// Whether a value of this type has a Debug text for a reader that takes it when the type
+// has no Display: the trace (§8.15.9). A written impl counts where its bounds hold at this
+// instance, and a derive where each field has Debug. A range has Debug when its bound has a
+// derived Debug, since the range render builds each bound through the derive. No other kind
+// has Debug in this compiler yet.
+pub fn cg_call_has_debug(node: Int, tid: Int) -> Bool ! Diag.Report {
+    let k = cc_kind(tid)
+    if k == TyKind.Range { return tc_instance_has_trait(tid, trait_debug) }
+    if k != TyKind.Struct && k != TyKind.Enum { return false }
+    if cc_impl_for(node, tid, trait_debug) != -1 { return tc_written_impl_holds(tid, trait_debug, method_debug) }
+    tc_instance_has_trait(tid, trait_debug)
+}
+
+// The Debug text of a value this stage built, for a type cg_call_has_debug answers. A
+// written impl wins over a derive, as it does for a `.debug()` call. -1 when the call
+// stopped.
+pub fn lower_debug_of_value(node: Int, tid: Int, value: Int) -> Int ! Diag.Report {
+    let symbol = cc_debug_symbol(node, tid)
+    if symbol == "" { return -1 }
+    let rec = cc_local(TYPE_STR, node)
+    if cc_stopped(rec) { return -1 }
+    ir_call_direct(TYPE_STR, node, rec.c_spelling, symbol, rec.slot_form, [value])
+}
+
+fn cc_debug_symbol(node: Int, tid: Int) -> Str ! Diag.Report {
+    if cc_kind(tid) == TyKind.Range { return cg_derive_range_debug_fn(tid, node) }
+    let im = cc_impl_for(node, tid, trait_debug)
+    if im == IMPL_REFUSED { return "" }
+    if im >= 0 { return cc_impl_operator_symbol(node, im, method_debug, tid) }
+    c_derived_method_symbol(tid, method_debug)
 }
 
 // Asked by a renderer before it lowers the value, so a type that cannot be shown is

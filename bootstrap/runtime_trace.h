@@ -52,15 +52,18 @@ typedef struct {
     __thread blink_trace_frame* __blink_trace_frames = NULL;
     __thread int64_t __blink_trace_frame_cap = 0;
     __thread int64_t __blink_trace_frame_top = 0;
+    __thread int64_t __blink_trace_mute_count = 0;
   #else
     extern __thread blink_trace_frame* __blink_trace_frames;
     extern __thread int64_t __blink_trace_frame_cap;
     extern __thread int64_t __blink_trace_frame_top;
+    extern __thread int64_t __blink_trace_mute_count;
   #endif
 #else
 BLINK_UNUSED static __thread blink_trace_frame* __blink_trace_frames = NULL;
 BLINK_UNUSED static __thread int64_t __blink_trace_frame_cap = 0;
 BLINK_UNUSED static __thread int64_t __blink_trace_frame_top = 0;
+BLINK_UNUSED static __thread int64_t __blink_trace_mute_count = 0;
 #endif
 
 BLINK_RT_FN int64_t blink_trace_ts_us(void);
@@ -504,6 +507,7 @@ BLINK_RT_FN int blink_trace_match_event(const char* fn, const char* module, int6
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN int blink_trace_match_event(const char* fn, const char* module, int64_t depth,
     const char* effect, const char* var) {
+    if (__blink_trace_mute_count > 0) return 0;
     if (!blink_trace_match(fn, module, (int)depth)) return 0;
     for (int i = 0; i < __blink_trace.filter_count; i++) {
         blink_trace_filter* f = &__blink_trace.filters[i];
@@ -578,6 +582,19 @@ BLINK_RT_FN int64_t blink_trace_frame_depth(void);
 BLINK_RT_FN int64_t blink_trace_frame_depth(void) {
     return __blink_trace_frame_top > 0 ? __blink_trace_frame_top - 1 : 0;
 }
+#endif
+
+/* A Display or Debug call that the tracer makes to render a value writes no event (§8.15.9).
+   Codegen mutes the thread around each render; a traced call inside it still pushes its
+   frame, so the depth of the events after it stays right. */
+BLINK_RT_FN void blink_trace_mute(void);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void blink_trace_mute(void) { __blink_trace_mute_count++; }
+#endif
+
+BLINK_RT_FN void blink_trace_unmute(void);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void blink_trace_unmute(void) { __blink_trace_mute_count--; }
 #endif
 
 /* Pushes the call and answers whether its enter event prints. */
