@@ -8763,7 +8763,8 @@ fn tc_check_call_against_fn_tid(fn_tid: Int, args_sl: Int, label: Str, node: Int
                 tc_report_handler_coverage(sublist_get(args_sl, li), ptid, arg_tid)
             } else if tc_tid_is_no_info(arg_tid) == 0 && tc_tid_is_no_info(ptid) == 0 && !tc_value_fits_expected(ptid, arg_tid) {
                 let (want_s, got_s) = tc_type_pair_strs(ptid, arg_tid)
-                tc_type_error_naming("{label} argument {li} expects {want_s}, got {got_s}{tc_fn_mismatch_suffix(ptid, arg_tid)}", node, "", [ptid, arg_tid])
+                tc_type_error_naming("{label} argument {li} expects {want_s}, got {got_s}{tc_fn_mismatch_suffix(ptid, arg_tid)}", node,
+                    tc_accept_timeout_help(sublist_get(args_sl, li), ptid, arg_tid), [ptid, arg_tid])
             }
         }
         li = li + 1
@@ -8796,7 +8797,7 @@ fn tc_error_at_code(msg: Str, node_id: Int, name: Str, code: Str, help: Str) ! T
 // help never shows `?? ""`: that form brings the old confusion back (sections/04_effects.md
 // §4.4.9, "Migration").
 fn tc_value_mismatch_at(msg: Str, at: Int, val: Int, want: Int, got: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
-    if !tc_read_line_used_as_str(val, want) { return tc_mismatch_at_help(msg, at, tc_accept_timeout_help(val, want), want, got) }
+    if !tc_read_line_used_as_str(val, want) { return tc_mismatch_at_help(msg, at, tc_accept_timeout_help(val, want, got), want, got) }
     tc_errors.push(msg)
     diag_error_at_notes("TypeError", TYPE_ERROR, msg, at,
         "match on it: `match io.read_line() \{ Some(line) => ..., None => break }`",
@@ -8874,7 +8875,7 @@ fn tc_arg_mismatch(callee: Str, pos: Int, node: Int, want: Int, got: Int) ! Type
         tc_errors.push("mismatched types")
         return diag_error_at_notes("TypeError", TYPE_ERROR, "mismatched types", node, "", ["expected `{want_s}`, found `{got_s}`"])
     }
-    tc_type_error_naming(msg, node, tc_accept_timeout_help(node, want), [want, got])
+    tc_type_error_naming(msg, node, tc_accept_timeout_help(node, want, got), [want, got])
 }
 
 fn tc_read_line_used_as_str(val: Int, want: Int) -> Bool ! TypeCheck.Resolve {
@@ -8887,9 +8888,12 @@ fn tc_is_read_line_value(val: Int) -> Bool {
 
 // accept_timeout answers UnixConn? where accept answers UnixConn, so its value used as a
 // UnixConn gets a help that says what None means (sections/04_effects.md §4.4.6). The value
-// can come through the `?` or the `.unwrap()` that takes off the Result.
-fn tc_accept_timeout_help(val: Int, want: Int) -> Str {
+// can come through the `?` or the `.unwrap()` that takes off the Result. A whole Result
+// gets none: its Err needs handling before its None does.
+fn tc_accept_timeout_help(val: Int, want: Int, got: Int) -> Str {
     if tc_std_net_unix_stream_name(want) != "UnixConn" { return "" }
+    let g = resolve_alias_tid(tc_resolve(got))
+    if type_kind(g) != TyKind.Option || tc_std_net_unix_stream_name(ty_pool.get(g).unwrap().inner1) != "UnixConn" { return "" }
     let mut v = tc_let_bound_value(val)
     if v >= 0 && node_kind(v) == NodeKind.UnaryOp && node_op(v) == "?" { v = node_left(v) }
     if v >= 0 && node_kind(v) == NodeKind.MethodCall && node_method(v) == "unwrap" { v = node_obj(v) }
@@ -8925,7 +8929,7 @@ fn tc_report_declared_mismatch(msg: Str, at: Int, val: Int, declared: Int, got: 
     if tc_handler_short_of(declared, got) { return tc_report_handler_coverage(val, declared, got) }
     let recv_help = tc_recv_option_help(val, declared, got)
     if recv_help == "" && tc_read_line_used_as_str(val, declared) { return tc_value_mismatch_at(msg, at, val, declared, got) }
-    let accept_help = tc_accept_timeout_help(val, declared)
+    let accept_help = tc_accept_timeout_help(val, declared, got)
     let help = if recv_help != "" { recv_help } else if accept_help != "" { accept_help } else { tc_hidden_variant_help(val, declared) }
     tc_type_error_naming(msg, at, help, [declared, got])
 }
@@ -25470,11 +25474,16 @@ fn tc_infer_coalesce(node: Int, lt: Int) -> Int ! TypeCheck.Resolve, TypeCheck.R
         if tc_unify(inner, rt) != 0 { tc_pin_declared_into_value(tc_resolve(inner), node_right(node), rt) }
     } else if tc_branch_values_agree(-1, inner, node_right(node), rt) == 0 {
         tc_mismatch_at_help("`??` default type {type_to_str(rt)} does not match the Option's value type {type_to_str(inner)}", node_right(node),
-            tc_coalesce_range_help(node, inner), inner, rt)
+            tc_coalesce_default_help(node, inner, rt), inner, rt)
     } else {
         tc_pin_declared_into_value(tc_resolve(inner), node_right(node), rt)
     }
     tc_resolve(inner)
+}
+
+fn tc_coalesce_default_help(node: Int, inner: Int, rt: Int) -> Str ! TypeCheck.Resolve, Diag.Report {
+    let range_help = tc_coalesce_range_help(node, inner)
+    if range_help != "" { range_help } else { tc_accept_timeout_help(node_right(node), inner, rt) }
 }
 
 // Whether range bound `b` has type `want`, or is an int literal that takes it.
