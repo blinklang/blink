@@ -1,0 +1,117 @@
+// An `as` after the module path renames the qualifier (sections/07_trust_modules_metadata.md
+// §10.5, "Import Aliases"): `import legacy.auth as legacy_auth` binds `legacy_auth` only, and
+// `import db.conn as dbc.{Connection}` binds `Connection` and `dbc`. The alias is local to the
+// file that writes it. Check, the one-unit build and the per-module build agree.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> ProcessResult ! Process.Spawn {
+    process.run("sh", ["-c", cmd]).unwrap()
+}
+
+fn blink_in(dir: Str, args: Str) -> ProcessResult ! Process.Spawn {
+    sh("B=$(pwd)/build/blink; cd {dir} && timeout 120 $B {args} src/main.bl < /dev/null 2>&1")
+}
+
+// A package of the given files, each `path=source`; a path may name a subdirectory.
+fn new_package(files: List[(Str, Str)]) -> Str ! FS.Write, Process.Spawn {
+    let dir = sh("mktemp -d /tmp/blink_module_alias.XXXXXX").out.trim()
+    fs.write("{dir}/blink.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\n").unwrap()
+    for f in files {
+        let _ = sh("mkdir -p $(dirname {dir}/src/{f.0}.bl)")
+        fs.write("{dir}/src/{f.0}.bl", f.1).unwrap()
+    }
+    dir
+}
+
+fn cleanup(dir: Str) ! Process.Spawn {
+    let _ = sh("rm -rf {dir}")
+}
+
+fn expect_runs(files: List[(Str, Str)], want: Str) ! IO, FS.Write, Process.Spawn {
+    let dir = new_package(files)
+    let mut ok = true
+    for args in ["check", "run --no-per-module", "run --per-module"] {
+        let r = blink_in(dir, args)
+        // An alias the file uses is no reason for any warning, an unused import least of all.
+        let good = r.success() && !r.out.contains("warning[") && (args == "check" || r.out.trim().ends_with(want))
+        if !good {
+            io.eprintln("blink {args}: {r.end}\n{r.out}")
+            ok = false
+        }
+    }
+    cleanup(dir)
+    assert(ok)
+}
+
+// Check and the per-module build both fail; each output holds `want`.
+fn expect_refused(files: List[(Str, Str)], want: Str) ! IO, FS.Write, Process.Spawn {
+    let dir = new_package(files)
+    let mut ok = true
+    for args in ["check", "build --per-module"] {
+        let r = blink_in(dir, args)
+        let good = !r.success() && r.out.contains(want)
+        if !good {
+            io.eprintln("blink {args}: {r.end}\n{r.out}")
+            ok = false
+        }
+    }
+    cleanup(dir)
+    assert(ok)
+}
+
+let beta = ("beta", "pub let limit = 7\npub type Box \{\n    n: Int\n}\npub fn twice(x: Int) -> Int \{ x * 2 }\n")
+let alpha = ("alpha", "pub fn twice(x: Int) -> Int \{ x * 3 }\n")
+
+test "a call through a module alias runs the module's function" {
+    expect_runs([beta, ("main", "import beta as b\nfn main() \{ io.println(\"\{b.twice(21)}\") }\n")], "42")
+}
+
+test "a module alias before a list binds the alias and the listed names" {
+    expect_runs([beta, ("main", "import beta as b.\{twice}\nfn main() \{ io.println(\"\{twice(1) + b.twice(20)}\") }\n")], "42")
+}
+
+test "a module alias before a list keeps the item aliases" {
+    expect_runs([beta, ("main", "import beta as b.\{twice as dbl}\nfn main() \{ io.println(\"\{dbl(1) + b.twice(20)}\") }\n")], "42")
+}
+
+test "a module alias of a dotted path names the whole path" {
+    expect_runs([("lib/beta", "pub fn twice(x: Int) -> Int \{ x * 2 }\n"),
+        ("main", "import lib.beta as lb\nfn main() \{ io.println(\"\{lb.twice(4)}\") }\n")], "8")
+}
+
+test "a module alias reads the module's bindings and names its types" {
+    expect_runs([beta, ("main", "import beta as b\nfn show(x: b.Box) -> Int \{ x.n }\nfn main() \{ io.println(\"\{b.limit} \{show(b.Box \{ n: 3 })}\") }\n")], "7 3")
+}
+
+test "two files may bind one module alias to different modules" {
+    expect_runs([alpha, beta,
+        ("user", "import alpha as m\npub fn use_m() -> Int \{ m.twice(1) }\n"),
+        ("main", "import beta as m\nimport user.\{use_m}\nfn main() \{ io.println(\"\{use_m()} \{m.twice(1)}\") }\n")], "3 2")
+}
+
+test "a module alias does not bind the module's own qualifier" {
+    expect_refused([beta, ("main", "import beta as b\nfn main() \{ io.println(\"\{b.twice(1)} \{beta.twice(1)}\") }\n")], "`beta`")
+}
+
+test "a module alias another file writes is not bound here" {
+    expect_refused([beta,
+        ("user", "import beta as b\npub fn use_b() -> Int \{ b.twice(1) }\n"),
+        ("main", "import user.\{use_b}\nfn main() \{ io.println(\"\{use_b()} \{b.twice(1)}\") }\n")], "`b`")
+}
+
+test "a module alias the file never uses is an unused import" {
+    let dir = new_package([beta, ("main", "import beta as b\nfn main() \{ io.println(\"x\") }\n")])
+    let r = blink_in(dir, "check")
+    cleanup(dir)
+    if !r.out.contains("UnusedImport") { io.eprintln(r.out) }
+    assert(r.out.contains("UnusedImport"))
+}
+
+test "a file may import one module both plainly and under an alias" {
+    expect_runs([beta, ("main", "import beta\nimport beta as b\nfn main() \{ io.println(\"\{beta.twice(1)} \{b.twice(2)}\") }\n")], "2 4")
+}
+
+test "a standard library module may be imported under an alias" {
+    expect_runs([("main", "import std.path as p\nimport std.random as rng\nfn main() \{ io.println(\"\{p.path_join(\"a\", \"b\")} \{rng.shuffle([5]).len()}\") }\n")], "a/b 1")
+}

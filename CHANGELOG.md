@@ -71,6 +71,7 @@ Single source of truth for release history. `blink llms` and `blink llms --full`
 - **A range has `into_iter()`.** `(0..3).into_iter()` is an `Iterator` that yields each element of the range in order, as a `for` loop over it does, and makes each one only when it is pulled, so `(0..9223372036854775807).into_iter().take(3)` is quick. It works on a range of every integer type, and yields that type. A range of any other bound is NotIterable (E0302), the same as in a `for` loop. To compare the elements of two ranges, collect both: `let a: List[Int] = (0..3).into_iter().collect()`.
 - **Compile time of wide nested types is lower.** A program with 800 non-recursive types compiles in 0.06 s; before, it took 3.8 s.
 - **`fs.*` needs no import.** `fs.read`, `fs.write`, `fs.stat` and the other `fs` operations compile and run without `import std.fs`. Import `std.fs` only to name `FsError`, `FsOp`, `FileInfo` or `FileKind`.
+- **An import can rename the module qualifier.** `import legacy.auth as la` binds `la` and not `auth`, and `import db.conn as dbc.{Connection}` binds `dbc` and `Connection`. The alias is local to the file that writes it. Before, an `as` after the module path was a parse error.
 
 ## Fixes (v0.59.0)
 

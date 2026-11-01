@@ -1834,6 +1834,10 @@ fn tc_mark_qualifier_used(qualifier: Str) {
     if nr_current_module != "" && nr_current_module != "__main__" { return }
     if tc_mark_alias_used(qualifier) { return }
     tc_used_modules.insert(qualifier, 1)
+    // A qualifier alias is bound only by the file's own import, so only that import knows its
+    // module.
+    let here = nr_qualifier_module_here(qualifier)
+    if here != "" { tc_used_modules.insert(here, 1) }
     match tc_qualifier_to_module.get(qualifier) {
         Some(mod_name) => tc_used_modules.insert(mod_name, 1)
         None => {}
@@ -16839,9 +16843,13 @@ fn nr_module_imports_built(consuming_mod: Str) -> ModuleNames {
     match per_module_imports.get(consuming_mod) {
         Some(imports) => {
             for source_mod in imports.keys() {
-                // A selective import binds the module's qualifier as a whole-module one does.
-                quals.insert(tc_qualifier_for_module(source_mod), source_mod)
                 for imp_node in imports.get(source_mod) ?? [] {
+                    // A selective import binds the module's qualifier as a whole-module one
+                    // does, under the alias when the import renames it (sections/07, the
+                    // alias rules).
+                    let renamed = if imp_node == -1 { "" } else { node_name(imp_node) }
+                    let qual = if renamed != "" { renamed } else { tc_qualifier_for_module(source_mod) }
+                    quals.insert(qual, source_mod)
                     if imp_node == -1 { continue }
                     // Every selection of the module adds to one spelling set, so a second
                     // import of it never takes away what the first binds.
@@ -16951,6 +16959,18 @@ fn tc_build_import_map() {
         }
         i = i + 1
     }
+    // A qualifier alias names a module somewhere in the program. Which module, and whether the
+    // alias is bound at all, is the reading file's answer (nr_qualifier_module_in).
+    for reader in per_module_imports.keys() {
+        let imports = per_module_imports.get(reader) ?? Map()
+        for source_mod in imports.keys() {
+            for imp_node in imports.get(source_mod) ?? [] {
+                if imp_node != -1 && node_name(imp_node) != "" {
+                    tc_import_qualifiers_set.insert(node_name(imp_node), 1)
+                }
+            }
+        }
+    }
 }
 
 // Whether some selective import of `source_mod` in `consuming_mod` binds `name`: the alias of
@@ -17038,7 +17058,9 @@ fn nr_is_unimported_prelude_free_fn(name: Str) -> Int {
     // The current module's own declaration is the binding; the prelude fn is not in scope.
     if nr_module_declares(nr_current_module, name) != 0 { return 0 }
     // An explicit import (bare or selective-including-name) makes it visible.
-    if module_imports_of(nr_current_module, source_mod).contains(-1) { return 0 }
+    for imp_node in module_imports_of(nr_current_module, source_mod) {
+        if imp_node == -1 || node_args(imp_node) == -1 { return 0 }
+    }
     if is_selected_import(name, nr_current_module, source_mod) != 0 { return 0 }
     1
 }
@@ -17655,6 +17677,7 @@ let mut tc_global_read_decl: Map[Int, Int] = Map()
 // The module-scope `let` this ident read resolved to, or -1 when the ident is not a read of
 // a global: a local, a parameter, a function name, a builtin.
 pub fn tc_global_decl_node(ident_node: Int) -> Int {
+    if node_kind(ident_node) != NodeKind.Ident { return -1 }
     let decl = tc_global_read_decl.get(ident_node) ?? -1
     if decl < 0 || node_kind(decl) != NodeKind.LetBinding { return -1 }
     decl
@@ -17664,6 +17687,13 @@ fn nr_note_global_decl(ident_node: Int, decl_node: Int) {
     if decl_node < 0 { return }
     if node_kind(decl_node) != NodeKind.LetBinding { return }
     tc_global_read_decl.insert(ident_node, decl_node)
+}
+
+// The module-scope `let` a `module.name` field access reads. It shares the ident record:
+// the two key kinds never meet, since an access node is never an ident.
+pub fn tc_module_global_decl(access_node: Int) -> Option[Int] {
+    if node_kind(access_node) != NodeKind.FieldAccess { return None }
+    tc_global_read_decl.get(access_node)
 }
 
 // The function declaration this ident read names as a value, or -1.
@@ -18089,6 +18119,13 @@ fn nr_reexport_reach(space: Str, target: Str, member: Str, depth: Int) -> Int ! 
 // The module the reading module's own imports bind `qualifier` to, or "" when none does
 // (section 10.1). A module's own qualifier names it too. A reader with no module recorded has
 // no import list to ask, so any module the program imports answers for it.
+// The module `qualifier` names where `site` reads it. Only the file's own imports bind an
+// alias, so they answer first.
+fn tc_qualifier_module_at(qualifier: Str, site: Int) -> Str {
+    let here = nr_qualifier_module_in(qualifier, tc_site_module(site))
+    if here != "" { here } else { tc_qualifier_to_module_or_self(qualifier) }
+}
+
 fn nr_qualifier_module_here(qualifier: Str) -> Str {
     nr_qualifier_module_in(qualifier, nr_current_module)
 }
@@ -28499,8 +28536,10 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
             // an unregistered key falls through to the existing behaviour rather
             // than guessing a type.
             if is_import_module_name(obj_name) != 0 && nr_is_defined(obj_name) == 0 {
-                let qual_mod = tc_qualifier_to_module_or_self(obj_name)
+                let qual_mod = tc_qualifier_module_at(obj_name, node)
                 let qual_decl = tc_module_let_decl_node(qual_mod, fname)
+                // Codegen has no file import list to ask which module an alias names.
+                nr_note_global_decl(node, qual_decl)
                 if qual_decl != -1 {
                     let let_tid = tc_lookup_node_tid(qual_decl)
                     if let_tid >= 0 { return let_tid }
