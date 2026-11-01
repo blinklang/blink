@@ -8796,7 +8796,7 @@ fn tc_error_at_code(msg: Str, node_id: Int, name: Str, code: Str, help: Str) ! T
 // help never shows `?? ""`: that form brings the old confusion back (sections/04_effects.md
 // §4.4.9, "Migration").
 fn tc_value_mismatch_at(msg: Str, at: Int, val: Int, want: Int, got: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
-    if !tc_read_line_used_as_str(val, want) { return tc_mismatch_at(msg, at, want, got) }
+    if !tc_read_line_used_as_str(val, want) { return tc_mismatch_at_help(msg, at, tc_accept_timeout_help(val, want), want, got) }
     tc_errors.push(msg)
     diag_error_at_notes("TypeError", TYPE_ERROR, msg, at,
         "match on it: `match io.read_line() \{ Some(line) => ..., None => break }`",
@@ -8874,25 +8874,41 @@ fn tc_arg_mismatch(callee: Str, pos: Int, node: Int, want: Int, got: Int) ! Type
         tc_errors.push("mismatched types")
         return diag_error_at_notes("TypeError", TYPE_ERROR, "mismatched types", node, "", ["expected `{want_s}`, found `{got_s}`"])
     }
-    tc_type_error_naming(msg, node, "", [want, got])
+    tc_type_error_naming(msg, node, tc_accept_timeout_help(node, want), [want, got])
 }
 
 fn tc_read_line_used_as_str(val: Int, want: Int) -> Bool ! TypeCheck.Resolve {
     tc_is_read_line_value(val) && resolve_alias_tid(tc_resolve(want)) == TYPE_STR
 }
 
-// A `return` and a labelled argument report at their own node, and a local reads as the
-// value its `let` bound.
 fn tc_is_read_line_value(val: Int) -> Bool {
-    if val < 0 { return false }
+    tc_is_read_line_call(tc_let_bound_value(val))
+}
+
+// accept_timeout answers UnixConn? where accept answers UnixConn, so its value used as a
+// UnixConn gets a help that says what None means (sections/04_effects.md §4.4.6). The value
+// can come through the `?` or the `.unwrap()` that takes off the Result.
+fn tc_accept_timeout_help(val: Int, want: Int) -> Str {
+    if tc_std_net_unix_stream_name(want) != "UnixConn" { return "" }
+    let mut v = tc_let_bound_value(val)
+    if v >= 0 && node_kind(v) == NodeKind.UnaryOp && node_op(v) == "?" { v = node_left(v) }
+    if v >= 0 && node_kind(v) == NodeKind.MethodCall && node_method(v) == "unwrap" { v = node_obj(v) }
+    if v < 0 || node_kind(v) != NodeKind.MethodCall || node_method(v) != "accept_timeout" { return "" }
+    let d = tc_tid_decl_node(resolve_alias_tid(tc_resolve(tc_lookup_node_tid(node_obj(v)))))
+    if d < 0 || node_name(d) != "UnixListener" || tc_module_display_name(node_module(d)) != "std.net_unix" { return "" }
+    "`accept_timeout` gives `None` when the time runs out; match on it"
+}
+
+// A `return` and a labelled argument report at their own node, and a local reads as the
+// value its `let` bound; -1 for a local that no `let` bound.
+fn tc_let_bound_value(val: Int) -> Int {
+    if val < 0 { return val }
     let k = node_kind(val)
-    if k == NodeKind.Return || k == NodeKind.NamedArg { return tc_is_read_line_value(node_value(val)) }
-    if k == NodeKind.Ident {
-        let binder = tc_ident_binder_node(val)
-        if binder < 0 || node_kind(binder) != NodeKind.LetBinding { return false }
-        return tc_is_read_line_call(node_value(binder))
-    }
-    tc_is_read_line_call(val)
+    if k == NodeKind.Return || k == NodeKind.NamedArg { return tc_let_bound_value(node_value(val)) }
+    if k != NodeKind.Ident { return val }
+    let binder = tc_ident_binder_node(val)
+    if binder < 0 || node_kind(binder) != NodeKind.LetBinding { return -1 }
+    node_value(binder)
 }
 
 // The receiver test is the one the intrinsic arm makes: a binding named `io`, local or
@@ -8909,7 +8925,8 @@ fn tc_report_declared_mismatch(msg: Str, at: Int, val: Int, declared: Int, got: 
     if tc_handler_short_of(declared, got) { return tc_report_handler_coverage(val, declared, got) }
     let recv_help = tc_recv_option_help(val, declared, got)
     if recv_help == "" && tc_read_line_used_as_str(val, declared) { return tc_value_mismatch_at(msg, at, val, declared, got) }
-    let help = if recv_help != "" { recv_help } else { tc_hidden_variant_help(val, declared) }
+    let accept_help = tc_accept_timeout_help(val, declared)
+    let help = if recv_help != "" { recv_help } else if accept_help != "" { accept_help } else { tc_hidden_variant_help(val, declared) }
     tc_type_error_naming(msg, at, help, [declared, got])
 }
 

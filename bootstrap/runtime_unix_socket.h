@@ -5,6 +5,7 @@
 #include <sys/un.h>
 #include <poll.h>
 #include <fcntl.h>
+#include <limits.h>
 
 /* sun_path holds about 107 bytes. A longer path must fail here: copied short, it would
    bind or connect at some other path while the caller names this one. */
@@ -284,8 +285,13 @@ BLINK_RT_FN int64_t blink_unix_bind(int64_t fd, const char* path) {
 
 BLINK_RT_FN int64_t blink_unix_listen_fd(int64_t fd);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
+/* A listener is non-blocking for its whole life, so no accept blocks past the poll that saw
+   a client: another thread or process may take that client first, and a blocking accept
+   would then wait for the next client, past the wait of accept_timeout. */
 BLINK_RT_FN int64_t blink_unix_listen_fd(int64_t fd) {
     if (listen((int)fd, SOMAXCONN) < 0) return -(int64_t)errno;
+    int flags = fcntl((int)fd, F_GETFL);
+    if (flags < 0 || fcntl((int)fd, F_SETFL, flags | O_NONBLOCK) < 0) return -(int64_t)errno;
     return 0;
 }
 #endif
@@ -305,22 +311,125 @@ BLINK_RT_FN int64_t blink_unix_connect_fd(int64_t fd, const char* path) {
 }
 #endif
 
-BLINK_RT_FN int64_t blink_unix_accept_fd(int64_t fd);
+/* One accept on a non-blocking listener: the client fd, or -errno. -EAGAIN means no client
+   waits now. The client fd blocks, whatever the listener is: macOS and the BSDs pass
+   O_NONBLOCK on from the listener, and Linux does not. */
+BLINK_RT_FN int64_t blink_unix_accept_once(int fd);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN int64_t blink_unix_accept_fd(int64_t fd) {
+BLINK_RT_FN int64_t blink_unix_accept_once(int fd) {
     for (;;) {
 #if defined(__linux__)
-        int client = accept4((int)fd, NULL, NULL, SOCK_CLOEXEC);
+        int client = accept4(fd, NULL, NULL, SOCK_CLOEXEC);
 #else
-        int client = accept((int)fd, NULL, NULL);
-        if (client >= 0) fcntl(client, F_SETFD, FD_CLOEXEC);
+        int client = accept(fd, NULL, NULL);
+        if (client >= 0) {
+            fcntl(client, F_SETFD, FD_CLOEXEC);
+            int flags = fcntl(client, F_GETFL);
+            if (flags >= 0) fcntl(client, F_SETFL, flags & ~O_NONBLOCK);
+        }
 #endif
         if (client >= 0) {
             blink_unix_socket_nosigpipe(client);
             return (int64_t)client;
         }
-        if (errno != EINTR) return -(int64_t)errno;
+        if (errno == EINTR) continue;
+        /* A client that hung up before the accept is no fault of the listener. */
+        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == ECONNABORTED) return -(int64_t)EAGAIN;
+        return -(int64_t)errno;
     }
+}
+#endif
+
+BLINK_RT_FN int64_t blink_unix_monotonic_ns(void);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN int64_t blink_unix_monotonic_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000000000 + (int64_t)ts.tv_nsec;
+}
+#endif
+
+/* Accept a client within wait_ns, or wait with no limit when wait_ns is -1. Returns the client
+   fd, -EAGAIN when no client came in time, or -errno. A wait of 0 tries once and does not
+   poll. The wait is rounded up to whole ms, so a wait under 1 ms waits 1 ms and the call never
+   waits less than it was asked to. The deadline is on the monotonic clock, so a signal
+   (EINTR) makes the poll wait again for the time left, not for all of it. */
+BLINK_RT_FN int64_t blink_unix_accept_wait(int64_t fd, int64_t wait_ns);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN int64_t blink_unix_accept_wait(int64_t fd, int64_t wait_ns) {
+    if (wait_ns < -1) return -(int64_t)EINVAL;
+    int64_t start = blink_unix_monotonic_ns();
+    int64_t deadline = INT64_MAX;
+    if (wait_ns >= 0) {
+        int64_t ms = wait_ns / 1000000 + (wait_ns % 1000000 != 0);
+        if (ms <= (INT64_MAX - start) / 1000000) deadline = start + ms * 1000000;
+    }
+    for (;;) {
+        int64_t client = blink_unix_accept_once((int)fd);
+        if (client != -(int64_t)EAGAIN) return client;
+        int timeout_ms = -1;
+        if (wait_ns >= 0) {
+            int64_t left = deadline - blink_unix_monotonic_ns();
+            if (left <= 0) return -(int64_t)EAGAIN;
+            int64_t ms = left / 1000000 + (left % 1000000 != 0);
+            timeout_ms = ms > INT_MAX ? INT_MAX : (int)ms;
+        }
+        struct pollfd pfd;
+        pfd.fd = (int)fd;
+        pfd.events = POLLIN;
+        pfd.revents = 0;
+        int rc = poll(&pfd, 1, timeout_ms);
+        if (rc < 0) {
+            if (errno == EINTR) continue;
+            return -(int64_t)errno;
+        }
+        if (pfd.revents & POLLNVAL) return -(int64_t)EBADF;
+        if (pfd.revents & POLLERR) {
+            int err = 0;
+            socklen_t len = sizeof(err);
+            if (getsockopt((int)fd, SOL_SOCKET, SO_ERROR, &err, &len) < 0) return -(int64_t)errno;
+            return -(int64_t)(err != 0 ? err : EIO);
+        }
+    }
+}
+#endif
+
+BLINK_RT_FN int64_t blink_unix_accept_fd(int64_t fd);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN int64_t blink_unix_accept_fd(int64_t fd) {
+    return blink_unix_accept_wait(fd, -1);
+}
+#endif
+
+/* The uid of the peer of fd, or -errno. On a host with no call for it, -ENOTSUP before fd is
+   looked at, so a closed socket gives ENOTSUP there too, as blink_unix_peer_uid_supported
+   says. The calls are chosen as for blink_unix_socket_peer_uid above. */
+BLINK_RT_FN int64_t blink_unix_peer_uid_supported(void);
+BLINK_RT_FN int64_t blink_unix_peer_uid(int64_t fd);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN int64_t blink_unix_peer_uid_supported(void) {
+#if defined(__linux__) || defined(BLINK_PEER_UID_GETPEEREID)
+    return 1;
+#else
+    return 0;
+#endif
+}
+BLINK_RT_FN int64_t blink_unix_peer_uid(int64_t fd) {
+#if defined(__linux__)
+    struct { pid_t pid; uid_t uid; gid_t gid; } cred;
+    socklen_t len = sizeof(cred);
+    if (getsockopt((int)fd, SOL_SOCKET, SO_PEERCRED, &cred, &len) != 0) return -(int64_t)errno;
+    if (len != sizeof(cred)) return -(int64_t)EINVAL;
+    return (int64_t)cred.uid;
+#elif defined(BLINK_PEER_UID_GETPEEREID)
+    uid_t uid;
+    gid_t gid;
+    if (getpeereid((int)fd, &uid, &gid) != 0) return -(int64_t)errno;
+    return (int64_t)uid;
+#else
+    (void)fd;
+    return -(int64_t)ENOTSUP;
+#endif
 }
 #endif
 

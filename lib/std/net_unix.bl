@@ -7,6 +7,7 @@
 // per row they serve, so that no binding claims a row its caller lacks.
 import std.net_error.{NetError}
 import std.errno.{Errno}
+import std.time.{Duration}
 
 // The same runtime fd box as TcpHandle (bootstrap/runtime_tcp.h). Close takes the fd out
 // of the box, so every copy of a socket sees the close, and a second close cannot reach
@@ -53,6 +54,24 @@ fn c_connect(fd: Int, path: Str) -> Int ! Net.Connect {}
 @trusted(audit: "STD-NET-UNIX")
 fn c_accept(fd: Int) -> Int ! Net.Listen {}
 
+@ffi("blink_unix_accept_wait")
+@trusted(audit: "STD-NET-UNIX")
+/// The client fd, -EAGAIN when no client came within `wait_ns`, or -errno.
+fn c_accept_wait(fd: Int, wait_ns: Int) -> Int ! Net.Listen {}
+
+@ffi("blink_unix_peer_uid")
+@trusted(audit: "STD-NET-UNIX")
+fn c_listen_peer_uid(fd: Int) -> Int ! Net.Listen {}
+
+@ffi("blink_unix_peer_uid")
+@trusted(audit: "STD-NET-UNIX")
+fn c_connect_peer_uid(fd: Int) -> Int ! Net.Connect {}
+
+@ffi("blink_unix_peer_uid_supported")
+@trusted(audit: "STD-NET-UNIX")
+/// 1 when the host has a call that gives the peer uid, else 0. A constant of the build.
+fn c_peer_uid_supported() -> Int ! () {}
+
 @ffi("blink_unix_close_fd")
 @trusted(audit: "STD-NET-UNIX")
 fn c_listen_close(fd: Int) ! Net.Listen {}
@@ -85,6 +104,15 @@ fn c_connect_write(fd: Int, data: Str) -> Int ! Net.Connect {}
 @ffi("EBADF", header: "errno.h")
 let ERR_BADF: Int
 
+@ffi("EAGAIN", header: "errno.h")
+let ERR_AGAIN: Int
+
+@ffi("EINVAL", header: "errno.h")
+let ERR_INVAL: Int
+
+@ffi("ENOTSUP", header: "errno.h")
+let ERR_NOTSUP: Int
+
 fn os_error(op: Str, code: Int) -> NetError {
     NetError.Os(op: op, code: Errno(code))
 }
@@ -102,6 +130,13 @@ fn read_line_result(line: Str) -> Result[Str?, NetError] {
         return Ok(None)
     }
     Err(os_error("recv", status))
+}
+
+fn peer_uid_of(rc: Int) -> Result[Int, NetError] {
+    if rc < 0 {
+        return Err(os_error("peer_uid", -rc))
+    }
+    Ok(rc)
 }
 
 fn write_result(rc: Int) -> Result[(), NetError] {
@@ -128,18 +163,21 @@ pub type UnixStream {
 
 pub trait UnixListenerOps {
     fn accept(self) -> Result[UnixConn, NetError] ! Net.Listen
+    fn accept_timeout(self, wait: Duration) -> Result[UnixConn?, NetError] ! Net.Listen
     fn close(self) ! Net.Listen
 }
 
 pub trait UnixConnOps {
     fn read_line(self) -> Result[Str?, NetError] ! Net.Listen
     fn write(self, data: Str) -> Result[(), NetError] ! Net.Listen
+    fn peer_uid(self) -> Result[Int, NetError] ! Net.Listen
     fn close(self) ! Net.Listen
 }
 
 pub trait UnixStreamOps {
     fn read_line(self) -> Result[Str?, NetError] ! Net.Connect
     fn write(self, data: Str) -> Result[(), NetError] ! Net.Connect
+    fn peer_uid(self) -> Result[Int, NetError] ! Net.Connect
     fn close(self) ! Net.Connect
 }
 
@@ -177,6 +215,13 @@ pub fn unix_connect(path: Str) -> Result[UnixStream, NetError] ! Net.Connect {
     Ok(UnixStream { handle: unix_handle_new(fd) })
 }
 
+/// Whether this host has a call that gives the uid of a Unix socket's peer. `peer_uid` gives
+/// `Os(op: "peer_uid")` with `ENOTSUP` if and only if this is false. True does not mean a
+/// peer is allowed: compare its uid.
+pub fn unix_peer_uid_supported() -> Bool {
+    c_peer_uid_supported() != 0
+}
+
 impl UnixListenerOps for UnixListener {
     /// Blocks until a client connects. On a closed listener, `Os(op: "accept")` with `EBADF`.
     fn accept(self) -> Result[UnixConn, NetError] ! Net.Listen {
@@ -189,6 +234,28 @@ impl UnixListenerOps for UnixListener {
             return Err(os_error("accept", -conn))
         }
         Ok(UnixConn { handle: unix_handle_new(conn) })
+    }
+
+    /// `Some(conn)` for a client that connects before `wait` ends, `None` for no client in
+    /// that time. `Duration.ms(0)` checks once; a wait under 1 ms waits 1 ms. A negative
+    /// wait gives `Os(op: "accept")` with `EINVAL`, a closed listener `EBADF`.
+    fn accept_timeout(self, wait: Duration) -> Result[UnixConn?, NetError] ! Net.Listen {
+        let ns = wait.to_nanos()
+        if ns < 0 {
+            return Err(os_error("accept", ERR_INVAL))
+        }
+        let fd = unix_handle_fd(self.handle)
+        if fd < 0 {
+            return Err(closed("accept"))
+        }
+        let conn = c_accept_wait(fd, ns)
+        if conn == -ERR_AGAIN {
+            return Ok(None)
+        }
+        if conn < 0 {
+            return Err(os_error("accept", -conn))
+        }
+        Ok(Some(UnixConn { handle: unix_handle_new(conn) }))
     }
 
     /// Closing a closed listener does nothing. The socket node stays on disk.
@@ -219,6 +286,20 @@ impl UnixConnOps for UnixConn {
         write_result(c_listen_write(fd, data))
     }
 
+    /// The uid of the client process. `Os(op: "peer_uid")` with `ENOTSUP` on a host with no
+    /// call for it (see `unix_peer_uid_supported`), with `EBADF` on a closed connection.
+    fn peer_uid(self) -> Result[Int, NetError] ! Net.Listen {
+        // Before the closed check, so that ENOTSUP shows if and only if the probe is false.
+        if !unix_peer_uid_supported() {
+            return Err(os_error("peer_uid", ERR_NOTSUP))
+        }
+        let fd = unix_handle_fd(self.handle)
+        if fd < 0 {
+            return Err(closed("peer_uid"))
+        }
+        peer_uid_of(c_listen_peer_uid(fd))
+    }
+
     /// Closing a closed connection does nothing.
     fn close(self) ! Net.Listen {
         let fd = unix_handle_take(self.handle)
@@ -245,6 +326,20 @@ impl UnixStreamOps for UnixStream {
             return Err(closed("send"))
         }
         write_result(c_connect_write(fd, data))
+    }
+
+    /// The uid of the server process. `Os(op: "peer_uid")` with `ENOTSUP` on a host with no
+    /// call for it (see `unix_peer_uid_supported`), with `EBADF` on a closed stream.
+    fn peer_uid(self) -> Result[Int, NetError] ! Net.Connect {
+        // Before the closed check, so that ENOTSUP shows if and only if the probe is false.
+        if !unix_peer_uid_supported() {
+            return Err(os_error("peer_uid", ERR_NOTSUP))
+        }
+        let fd = unix_handle_fd(self.handle)
+        if fd < 0 {
+            return Err(closed("peer_uid"))
+        }
+        peer_uid_of(c_connect_peer_uid(fd))
     }
 
     /// Closing a closed stream does nothing.

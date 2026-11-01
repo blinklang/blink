@@ -1,0 +1,184 @@
+// UnixListener.accept_timeout and peer_uid (sections/04_effects.md §4.4.6): a wait that runs
+// out is Ok(None) and every fault is an Err, a zero wait checks once, a wait under 1 ms waits
+// 1 ms, and peer_uid names the user at the other end. A connect completes into the listen
+// backlog, so one thread can play both ends; a spawned task plays a peer that comes late.
+import std.net.{NetError, UnixListener, UnixConn, UnixStream, unix_listen, unix_connect, unix_peer_uid_supported}
+import std.libc.{ERR_BADF, ERR_INVAL}
+import std.time.{Duration}
+import compile_test_helpers
+
+fn dir(name: Str) -> Str ! Env.Read, Process.Spawn {
+    let d = "{compile_test_helpers.scratch_root()}/unix_accept_timeout/{name}"
+    let _ = process.run("sh", ["-c", "rm -rf {d}; mkdir -p {d}"]).unwrap()
+    d
+}
+
+fn own_uid() -> Int ! Process.Spawn {
+    process.run("id", ["-u"]).unwrap().out.trim().to_int()
+}
+
+fn is_os(e: NetError, want_op: Str, want_code: Int) -> Bool {
+    match e {
+        NetError.Os(op, code) => match code {
+            Errno(c) => op == want_op && c == want_code
+        }
+        _ => false
+    }
+}
+
+fn expect_os[T](r: Result[T, NetError], op: Str, code: Int) {
+    match r {
+        Err(e) => assert(is_os(e, op, code))
+        Ok(_) => assert(false)
+    }
+}
+
+fn some_conn(r: Result[UnixConn?, NetError]) -> UnixConn {
+    match r {
+        Ok(Some(conn)) => conn
+        _ => panic("accept_timeout gave no connection")
+    }
+}
+
+fn is_none(r: Result[UnixConn?, NetError]) -> Bool {
+    match r {
+        Ok(None) => true
+        _ => false
+    }
+}
+
+test "no client in the wait is Ok(None) after the whole wait" {
+    let listener = unix_listen("{dir("none")}/s.sock").unwrap()
+    let t0 = time.monotonic()
+    assert(is_none(listener.accept_timeout(Duration.ms(100))))
+    assert(time.monotonic().since(t0).to_ms() >= 100)
+    listener.close()
+}
+
+test "a client that waits is Ok(Some(conn)) and a line goes over it" {
+    let path = "{dir("some")}/s.sock"
+    let listener = unix_listen(path).unwrap()
+    let stream = unix_connect(path).unwrap()
+    let conn = some_conn(listener.accept_timeout(Duration.ms(1000)))
+    assert(stream.write("ping\n").is_ok())
+    assert_eq(conn.read_line().unwrap(), Some("ping"))
+    conn.close()
+    stream.close()
+    listener.close()
+}
+
+test "a zero wait checks once: None with no client, Some with one" {
+    let path = "{dir("zero")}/s.sock"
+    let listener = unix_listen(path).unwrap()
+    let t0 = time.monotonic()
+    assert(is_none(listener.accept_timeout(Duration.ms(0))))
+    assert(time.monotonic().since(t0).to_ms() < 1000)
+    let stream = unix_connect(path).unwrap()
+    let conn = some_conn(listener.accept_timeout(Duration.ms(0)))
+    assert(is_none(listener.accept_timeout(Duration.ms(0))))
+    conn.close()
+    stream.close()
+    listener.close()
+}
+
+test "a wait under 1 ms waits 1 ms" {
+    let listener = unix_listen("{dir("nanos")}/s.sock").unwrap()
+    let t0 = time.monotonic()
+    assert(is_none(listener.accept_timeout(Duration.nanos(1))))
+    assert(time.monotonic().since(t0).to_nanos() >= 1000000)
+    listener.close()
+}
+
+test "a negative wait is Os accept EINVAL and a closed listener is Os accept EBADF" {
+    let listener = unix_listen("{dir("errors")}/s.sock").unwrap()
+    expect_os(listener.accept_timeout(Duration.ms(-5)), "accept", ERR_INVAL)
+    expect_os(listener.accept_timeout(Duration.nanos(-1)), "accept", ERR_INVAL)
+    listener.close()
+    expect_os(listener.accept_timeout(Duration.ms(500)), "accept", ERR_BADF)
+}
+
+test "a client that connects during the wait is taken before the wait ends" {
+    let path = "{dir("late")}/s.sock"
+    let listener = unix_listen(path).unwrap()
+    async.scope {
+        let h = async.spawn(fn() {
+            time.sleep(Duration.ms(200))
+            let s = unix_connect(path).unwrap()
+            let _ = s.write("late\n")
+            s
+        })
+        let t0 = time.monotonic()
+        let conn = some_conn(listener.accept_timeout(Duration.ms(20000)))
+        assert(time.monotonic().since(t0).to_ms() < 15000)
+        assert_eq(conn.read_line().unwrap(), Some("late"))
+        conn.close()
+        h.await.close()
+    }
+    listener.close()
+}
+
+test "accept still blocks until a client connects and the conn it gives blocks on read" {
+    let path = "{dir("blocking")}/s.sock"
+    let listener = unix_listen(path).unwrap()
+    async.scope {
+        let h = async.spawn(fn() {
+            time.sleep(Duration.ms(200))
+            let s = unix_connect(path).unwrap()
+            time.sleep(Duration.ms(200))
+            let _ = s.write("after a pause\n")
+            s
+        })
+        let t0 = time.monotonic()
+        let conn = listener.accept().unwrap()
+        assert(time.monotonic().since(t0).to_ms() >= 150)
+        // A non-blocking conn would give Os(recv, EAGAIN) here, before the line comes.
+        assert_eq(conn.read_line().unwrap(), Some("after a pause"))
+        conn.close()
+        h.await.close()
+    }
+    listener.close()
+}
+
+test "an accept_timeout conn blocks on read until its line comes" {
+    let path = "{dir("timeout_blocking")}/s.sock"
+    let listener = unix_listen(path).unwrap()
+    async.scope {
+        let h = async.spawn(fn() {
+            let s = unix_connect(path).unwrap()
+            time.sleep(Duration.ms(200))
+            let _ = s.write("after a pause\n")
+            s
+        })
+        let conn = some_conn(listener.accept_timeout(Duration.ms(20000)))
+        assert_eq(conn.read_line().unwrap(), Some("after a pause"))
+        conn.close()
+        h.await.close()
+    }
+    listener.close()
+}
+
+test "peer_uid on both ends names this user" {
+    assert(unix_peer_uid_supported())
+    let path = "{dir("uid")}/s.sock"
+    let listener = unix_listen(path).unwrap()
+    let stream = unix_connect(path).unwrap()
+    let conn = some_conn(listener.accept_timeout(Duration.ms(1000)))
+    let me = own_uid()
+    assert_eq(conn.peer_uid().unwrap(), me)
+    assert_eq(stream.peer_uid().unwrap(), me)
+    conn.close()
+    stream.close()
+    listener.close()
+}
+
+test "peer_uid on a closed conn or stream is Os peer_uid EBADF" {
+    let path = "{dir("uid_closed")}/s.sock"
+    let listener = unix_listen(path).unwrap()
+    let stream: UnixStream = unix_connect(path).unwrap()
+    let conn = some_conn(listener.accept_timeout(Duration.ms(1000)))
+    conn.close()
+    stream.close()
+    expect_os(conn.peer_uid(), "peer_uid", ERR_BADF)
+    expect_os(stream.peer_uid(), "peer_uid", ERR_BADF)
+    listener.close()
+}

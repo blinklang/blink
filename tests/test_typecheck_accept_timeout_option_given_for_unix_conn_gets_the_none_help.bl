@@ -1,0 +1,82 @@
+// accept_timeout gives Result[UnixConn?, NetError], so code that uses its `?` value as a UnixConn
+// gets a TypeError whose help says what None means (sections/04_effects.md §4.4.6, "Accept
+// with a wait"). Only a value that comes from accept_timeout gets the help: a UnixConn? from
+// elsewhere, or an accept_timeout method on a user type, gets none.
+
+import compile_test_helpers
+
+fn none_help() -> Str {
+    "\"help\":\"`accept_timeout` gives `None` when the time runs out; match on it\""
+}
+
+fn mismatch(body: Str, tag: Str) -> Str ! FS.Delete, FS.Write, Process.Spawn, FS.Read, Env.Read, IO.Print {
+    let src = "import std.net.\{NetError, UnixConn, UnixListener}\nimport std.time.\{Duration}\n{body}\nfn main() \{ }\n"
+    let out = compile_test_helpers.compile_and_capture(src, tag)
+    compile_test_helpers.expect_error(out, "E0300", "{tag} is a type mismatch")
+    out
+}
+
+test "a let-bound accept_timeout value passed for a UnixConn gets the None help" {
+    let out = mismatch(#"fn serve(c: UnixConn) { }
+fn tick(l: UnixListener, wait: Duration) -> Result[(), NetError] ! Net.Listen {
+    let c = l.accept_timeout(wait)?
+    serve(c)
+    Ok(())
+}"#, "accept_timeout_help_arg")
+    compile_test_helpers.expect_contains(out, none_help(), "the help says what None means")
+}
+
+test "an accept_timeout value passed straight for a UnixConn gets the None help" {
+    let out = mismatch(#"fn serve(c: UnixConn) { }
+fn tick(l: UnixListener) -> Result[(), NetError] ! Net.Listen {
+    serve(l.accept_timeout(Duration.ms(500))?)
+    Ok(())
+}"#, "accept_timeout_help_direct")
+    compile_test_helpers.expect_contains(out, none_help(), "the help says what None means")
+}
+
+test "an accept_timeout value declared as UnixConn gets the None help" {
+    let out = mismatch(#"fn tick(l: UnixListener) -> Result[(), NetError] ! Net.Listen {
+    let c: UnixConn = l.accept_timeout(Duration.ms(500))?
+    Ok(())
+}"#, "accept_timeout_help_declared")
+    compile_test_helpers.expect_contains(out, none_help(), "the help says what None means")
+}
+
+test "an unwrapped accept_timeout value returned as UnixConn gets the None help" {
+    let out = mismatch(#"fn first(l: UnixListener) -> UnixConn ! Net.Listen {
+    return l.accept_timeout(Duration.ms(500)).unwrap()
+}"#, "accept_timeout_help_return")
+    compile_test_helpers.expect_contains(out, none_help(), "the help says what None means")
+}
+
+test "a UnixConn option from elsewhere gets no None help" {
+    let out = mismatch(#"fn serve(c: UnixConn) { }
+fn find(l: UnixListener) -> UnixConn? { None }
+fn tick(l: UnixListener) {
+    let c = find(l)
+    serve(c)
+}"#, "accept_timeout_help_other_option")
+    assert(!out.contains("time runs out"))
+}
+
+test "an accept_timeout method on a user type gets no None help" {
+    let src = #"type UnixConn { n: Int }
+type UnixListener { n: Int }
+trait Accepts {
+    fn accept_timeout(self, ms: Int) -> UnixConn?
+}
+impl Accepts for UnixListener {
+    fn accept_timeout(self, ms: Int) -> UnixConn? { None }
+}
+fn serve(c: UnixConn) { }
+fn main() {
+    let l = UnixListener { n: 1 }
+    let c = l.accept_timeout(5)
+    serve(c)
+}
+"#
+    let out = compile_test_helpers.compile_and_capture(src, "accept_timeout_help_user_type")
+    compile_test_helpers.expect_error(out, "E0300", "a user accept_timeout value is a type mismatch")
+    assert(!out.contains("time runs out"))
+}
