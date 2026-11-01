@@ -598,6 +598,37 @@ BLINK_RT_FN void blink_trace_exit_event(const char* fn, const char* module, cons
 }
 #endif
 
+/* Whether a state event of the innermost traced call prints. */
+BLINK_RT_FN int blink_trace_on_state(const char* fn, const char* module, const char* var);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN int blink_trace_on_state(const char* fn, const char* module, const char* var) {
+    if (!__blink_trace.active || !__blink_trace.event_state || __blink_trace_frame_top <= 0) return 0;
+    return blink_trace_under_limit()
+        && blink_trace_match_event(fn, module, blink_trace_frame_depth(), NULL, var);
+}
+#endif
+
+/* The state event, after its gate. `value` is the Display text of the whole binding after
+   the write. */
+BLINK_RT_FN void blink_trace_state_emit(const char* fn, const char* module, const char* var,
+    const char* op, const char* value);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void blink_trace_state_emit(const char* fn, const char* module, const char* var,
+    const char* op, const char* value) {
+    flockfile(stderr);
+    blink_trace_put_head("state", fn, module, blink_trace_frame_depth());
+    fputs(",\"var\":\"", stderr);
+    blink_trace_put_json(stderr, var, -1);
+    fputs("\",\"op\":\"", stderr);
+    blink_trace_put_json(stderr, op, -1);
+    fputs("\",\"value\":\"", stderr);
+    int truncated = blink_trace_put_json(stderr, value, BLINK_TRACE_MAX_VALUE_LEN);
+    fputs("\"", stderr);
+    blink_trace_put_tail(truncated);
+    funlockfile(stderr);
+}
+#endif
+
 /* Pops the call, at each exit of a traced function. */
 BLINK_RT_FN void blink_trace_fn_leave(void);
 #ifndef BLINK_RUNTIME_DECLS_ONLY

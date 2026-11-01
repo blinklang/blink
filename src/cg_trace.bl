@@ -1,4 +1,4 @@
-// cg_trace.bl: the enter and exit events of a traced function (§8.15).
+// cg_trace.bl: the enter, exit and state events of a traced function (§8.15).
 //
 // A unit built with --trace calls the runtime tracer at the start of each traced body and at
 // each of its exits. A unit built without it holds no trace code at all, so a plain build
@@ -8,6 +8,9 @@
 //
 // Each event renders its values only after the runtime says the event prints, so a call the
 // filters leave out pays for no Display call.
+//
+// A write to a whole `let mut` binding, local or module-level, in a traced body writes a
+// state event with the binding's Display text after the write.
 //
 // A body is traced when it is a top-level fn of the program's own package, and when each
 // value its events show has a Display rendering. The driver arms a body before it lowers
@@ -102,6 +105,22 @@ pub fn cg_trace_exit_value(node: Int, tid: Int, value: Int) -> List[Int] ! Diag.
 pub fn cg_trace_exit_void(node: Int) -> List[Int] ! Diag.Report {
     if !cg_trace_body_traced() { return [] }
     tr_exit(node, [], tr_text(node, "()"))
+}
+
+// The statements after a write to the whole `let mut` binding `var`, which `value` reads
+// once the write is done. None when the body is not traced or the binding has no Display
+// rendering.
+pub fn cg_trace_state(node: Int, var: Str, tid: Int, value: Int) -> List[Int] ! Diag.Report {
+    if !cg_trace_body_traced() || tid < 0 || !cg_expr_can_display(node, tid) { return [] }
+    let mark = cg_expr_pending_count()
+    let text = cg_expr_display_text(node, tid, value)
+    if text < 0 { return [] }
+    let mut event = cg_expr_take_pending(mark)
+    let fn_name = tr_text(node, tr_unit.fn_name)
+    let module = tr_text(node, tr_unit.module)
+    event.push(tr_call(node, TYPE_VOID, "trace_state_emit", [fn_name, module, tr_text(node, var), tr_text(node, "assign"), text]))
+    let gate = tr_call_value(node, TYPE_BOOL, "trace_on_state", [tr_text(node, tr_unit.fn_name), tr_text(node, tr_unit.module), tr_text(node, var)])
+    [ir_if(node, gate, ir_block(node, event), -1)]
 }
 
 fn tr_exit(node: Int, render: List[Int], text: Int) -> List[Int] ! Diag.Report {

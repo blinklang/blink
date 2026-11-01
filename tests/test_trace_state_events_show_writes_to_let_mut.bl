@@ -1,0 +1,117 @@
+// A write to a whole `let mut` binding in a traced function writes a `state` event (§8.15.2).
+// The event names the function and its depth, and `value` is the Display text of the whole
+// binding after the write (§8.15.3). A compound assignment is an `assign`, and a write to a
+// module-level `let mut` is an event too. The `state:` filter selects the events of one
+// variable, and an event with no variable does not match it (§8.15.5).
+
+import compile_test_helpers
+import std.json.{json_clear, json_parse, json_get, json_as_str, json_as_int, json_as_bool}
+
+let STATE_SRC = "type P \{ x: Int, y: Int }
+impl Display for P \{
+    fn fmt(self, sb: StringBuilder) \{ sb.write(\"P(\{self.x},\{self.y})\") }
+}
+let mut files_written = 0
+fn write_output(path: Str) \{
+    files_written = files_written + 1
+    io.println(path)
+}
+fn main() \{
+    let mut s = \"a\"
+    s = s.concat(\"\\\"\\n\")
+    let mut p = P \{ x: 1, y: 2 }
+    p = P \{ x: 3, y: 4 }
+    let mut n = 0
+    while n < 2 \{ n += 1 }
+    write_output(\"out.c\")
+    let mut big = \"\"
+    while big.len() < 300 \{ big = big.concat(\"b\") }
+    io.println(\"\{s.len()} \{p} \{n} \{files_written} \{big.len()}\")
+}
+"
+
+let STDOUT = "out.c\n3 P(3,4) 2 1 300\n"
+
+// One event as `event fn depth var op value`, or `event fn depth` for one with no var.
+fn line_of(obj: Int) -> Str {
+    let head = "{json_as_str(json_get(obj, "event"))} {json_as_str(json_get(obj, "fn"))} {json_as_int(json_get(obj, "depth"))}"
+    let var = json_get(obj, "var")
+    if var < 0 { return head }
+    "{head} {json_as_str(var)} {json_as_str(json_get(obj, "op"))} {json_as_str(json_get(obj, "value"))}"
+}
+
+// The events on stderr. Each line that starts with `{` must parse as one JSON object. A
+// truncated event ends with ` [cut]`.
+fn events(text: Str) -> List[Str] {
+    let mut out: List[Str] = []
+    for line in text.split("\n") {
+        if !line.starts_with("\{") { continue }
+        json_clear()
+        let obj = json_parse(line)
+        assert(obj >= 0)
+        let t = json_get(obj, "truncated")
+        let cut = t >= 0 && json_as_bool(t) == 1
+        out.push(if cut { "{line_of(obj)} [cut]" } else { line_of(obj) })
+    }
+    out
+}
+
+fn traced(tag: Str, filter: Str) -> List[Str] ! FS.Write, Process.Spawn, Env.Read {
+    let dir = "{compile_test_helpers.scratch_root()}/trace_state_ev_{tag}"
+    let stem = "trace_state_ev"
+    compile_test_helpers.sh("mkdir -p {dir}")
+    let path = "{dir}/{stem}.bl"
+    let bin = "{dir}/{stem}_bin"
+    fs.write(path, STATE_SRC).unwrap()
+    let b = process.run("build/blink", ["build", "--trace", path, "-o", bin]).unwrap()
+    assert(b.success())
+    let flag = if filter == "" { "--trace" } else { "--trace={filter}" }
+    let r = process.run(bin, [flag]).unwrap()
+    assert_eq(r.out, STDOUT)
+    assert(r.success())
+    compile_test_helpers.sh("rm -rf {dir}")
+    events(r.err_out)
+}
+
+fn cut_value() -> Str {
+    let mut v = ""
+    while v.len() < 200 { v = v.concat("b") }
+    v
+}
+
+test "each write to a let mut binding writes its value after the write" {
+    let m = "trace_state_ev"
+    assert_eq(traced("all", "event:state,fn:main+write_output,depth:1").filter(fn(e) { !e.contains(" big ") }).join("\n"), [
+        "state {m}.main 0 s assign a\"\n",
+        "state {m}.main 0 p assign P(3,4)",
+        "state {m}.main 0 n assign 1",
+        "state {m}.main 0 n assign 2",
+        "state {m}.write_output 1 files_written assign 1",
+    ].join("\n"))
+}
+
+test "the state events come between the enter and exit of their function" {
+    let m = "trace_state_ev"
+    assert_eq(traced("order", "fn:write_output").join("\n"), [
+        "enter {m}.write_output 1",
+        "state {m}.write_output 1 files_written assign 1",
+        "exit {m}.write_output 1",
+    ].join("\n"))
+}
+
+test "a state filter selects the events of one variable only" {
+    let m = "trace_state_ev"
+    assert_eq(traced("n", "state:n").join("\n"), "state {m}.main 0 n assign 1\nstate {m}.main 0 n assign 2")
+    assert_eq(traced("pair", "state:files_written+p").join("\n"), [
+        "state {m}.main 0 p assign P(3,4)",
+        "state {m}.write_output 1 files_written assign 1",
+    ].join("\n"))
+}
+
+test "a state value longer than 200 characters is cut and the event says so" {
+    let bigs = traced("big", "state:big")
+    assert_eq(bigs.len(), 300)
+    assert_eq(bigs.get(0).unwrap(), "state trace_state_ev.main 0 big assign b")
+    assert_eq(bigs.get(199).unwrap(), "state trace_state_ev.main 0 big assign {cut_value()}")
+    assert_eq(bigs.get(200).unwrap(), "state trace_state_ev.main 0 big assign {cut_value()} [cut]")
+}
