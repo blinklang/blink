@@ -1690,10 +1690,32 @@ fn tc_alias_underlying_of(name: Str) -> Int {
     }
     // An alias that shadows a compiler-known name shadows it only where it is declared or
     // imported (sections/07 §10.6), so every other module, std's included, reads the builtin.
-    if tc_shadowable_type_home(bare) != "" && tc_declaration_shadows_builtin(bare) == 0 { return -1 }
+    // Written through its module's qualifier (`sim.Range`), the name means the declaration.
+    if tc_shadowable_type_home(bare) != "" && tc_declaration_shadows_builtin(bare) == 0 && !tc_qualified_by_declaring_module(name, bare) { return -1 }
+    tc_alias_underlying_by_name(name)
+}
+
+fn tc_qualified_by_declaring_module(name: Str, bare: Str) -> Bool {
+    if name == bare { return false }
+    let td = tc_type_decl_nodes.get(bare) ?? -1
+    if td == -1 { return false }
+    let qual = name.byte_slice(0, name.byte_len() - bare.byte_len() - 1)
+    tc_qualifier_to_module_or_self(qual) == node_module(td)
+}
+
+// The underlying tid of the alias a struct/enum tid named `name` stands for, or -1. A
+// declaration's tid names that declaration however the reader spelled it (`sim.Range`,
+// `Range as R`), so it takes no scope test; that test is for a written bare name, which may
+// mean the builtin.
+fn tc_alias_underlying_of_decl(name: Str) -> Int {
+    if tc_shadowable_type_home(name) == "" || tc_is_namesake_type_name(name) != 0 { return tc_alias_underlying_of(name) }
+    tc_alias_underlying_by_name(name)
+}
+
+fn tc_alias_underlying_by_name(name: Str) -> Int {
     let u = tc_alias_underlying.get(name) ?? -1
     if u != -1 { return u }
-    tc_alias_underlying.get(bare) ?? -1
+    tc_alias_underlying.get(strip_module_qualifier(name)) ?? -1
 }
 
 // ── Inferred type hints (for LSP inlayHint) ─────────────────────────
@@ -23361,7 +23383,7 @@ pub fn resolve_alias_tid(tid: Int) -> Int {
     // The builtin's own tid has the compiler-known name too, but it is not the alias that
     // shadows that name; only a declaration's tid is.
     if tc_shadowable_type_home(name) != "" && entry.kind != TyKind.Struct && entry.kind != TyKind.Enum { return tid }
-    let u = tc_alias_underlying_of(name)
+    let u = tc_alias_underlying_of_decl(name)
     if u == -1 { tid } else { u }
 }
 
@@ -23379,13 +23401,23 @@ pub fn resolve_alias_tid(tid: Int) -> Int {
 // sentinel as if it were a genuine resolution, baking it into a real C identifier instead
 // of refusing to treat the alias as resolved. Returns -1 when `name` names no alias, or
 // when the chain would return anything other than a genuine, encodable target.
-pub fn tc_resolve_transparent_alias_name(name: Str) -> Int {
+fn tc_resolve_transparent_alias_name(name: Str) -> Int {
+    tc_transparent_alias_chain(name, true)
+}
+
+// The same walk from the name of a struct/enum tid, which is a declaration's own name.
+pub fn tc_resolve_transparent_alias_of_decl(name: Str) -> Int {
+    tc_transparent_alias_chain(name, false)
+}
+
+fn tc_transparent_alias_chain(name: Str, written: Bool) -> Int {
     if tc_alias_underlying.len() == 0 { return -1 }
     let mut cur_name = name
     let mut result = -1
     let mut hops = 0
     while hops < 8 {
-        let next = tc_alias_underlying_of(cur_name)
+        // Past the first hop the name is a tid's, so it names a declaration.
+        let next = if written && hops == 0 { tc_alias_underlying_of(cur_name) } else { tc_alias_underlying_of_decl(cur_name) }
         if next == -1 { return result }
         let nr = tc_resolve(next)
         if nr < 0 || nr >= ty_pool.len() { return result }
