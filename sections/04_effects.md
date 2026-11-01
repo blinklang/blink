@@ -437,6 +437,8 @@ error[TypeError]: mismatched types
 | `IO.Read` | `fn read_line() -> Option[Str]` | `io.read_line()`; derived (§4.4.9) |
 | `IO.Read` | `fn read_all() -> Str` | `io.read_all()`; derived (§4.4.9) |
 
+A trace `effect` event for one of these calls has the call as its `op` (`io.println`) and the declared parameter names as its `args` keys (`msg`) (§8.15.10).
+
 The `IO.Read` operations take and return other types (§4.4.9). The wrapper selects the operation; it does not add the newline to `msg`. A handler therefore sees the same `msg` for `io.println(42)` and `io.println("42")`: the text `42`, with no newline.
 
 **`IO.Eprint` is the stderr effect.** `io.eprintln`, `io.eprint` and `io.eprint_raw` are operations of `IO.Eprint`. They have a row, a handler can intercept them, and they emit trace records, as the `IO.Print` operations do. `! IO` grants `IO.Eprint`. The sub-effects of `IO` are independent: `! IO.Print` and `! IO.Log` do not grant `IO.Eprint`. `IO.Eprint` is not marked `@handle_all`. A handler that omits `eprint` or `eprint_no_nl` forwards the call to the enclosing handler (§4.7.1 *Completeness and auto-delegation*), and the omission gives no `PartialHandler` warning (W0545). A handler that omits `eprint_raw` runs the default body, so the handler receives the text as an `eprint_no_nl` call. `IO.Log` and `IO.Eprint` do not share operations: `capture_log` sees no text from `io.eprintln`, and `capture_eprint` sees no text from `io.log` (§8.10.1).

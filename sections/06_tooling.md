@@ -2479,6 +2479,8 @@ The `--trace` flag enables structured runtime tracing of compiled Blink programs
 ```sh
 blink run app.bl --trace                              # trace everything
 blink run app.bl --trace=fn:skip_newlines             # single function
+blink run app.bl --trace=fn:Point.norm                # one method
+blink run app.bl --trace=fn:main.main.fn@11:25        # one closure (§8.15.8)
 blink run app.bl --trace=module:parser,depth:3        # AND composition
 blink run app.bl --trace=fn:skip_newlines+parse_block # OR within key
 blink run app.bl --trace=effect:FS.Write              # specific effect type
@@ -2514,24 +2516,24 @@ All events share common fields:
 |-------|------|---------|-------------|
 | `ts_us` | Int | all | Monotonic microseconds since trace start |
 | `event` | Str | all | `"enter"` \| `"exit"` \| `"state"` \| `"effect"` \| `"note"` |
-| `fn` | Str | all | Fully-qualified function name (`module.function`) |
+| `fn` | Str | all | Name of the frame (§8.15.8): `module.function`, `module.Type.method`, or the name of a closure, a handler body, a default body or a test block |
 | `module` | Str | all | Module name |
-| `depth` | Int | all | Call stack depth (0 = top-level) |
+| `depth` | Int | all | Number of traced frames above this one on the same thread (0 = none). A std fn adds no step (§8.15.8). It is not the depth of the C stack |
 
 Per-event fields:
 
 | Field | Type | Event | Description |
 |-------|------|-------|-------------|
 | `span` | `{file, line, col}` | `enter` | Source location (same shape as diagnostic spans, §8.6) |
-| `args` | `{name: str}` | `enter` | Function arguments as Display strings. Omitted if no args |
+| `args` | `{name: str}` | `enter` | Function arguments as value strings (§8.15.9). Omitted if no args |
 | `duration_us` | Int | `exit` | Wall time in function (microseconds) |
-| `return` | Str | `exit` | Return value as Display string |
+| `return` | Str | `exit` | Return value as a value string |
 | `var` | Str | `state` | Variable name |
-| `op` | Str | `state` | `"assign"` \| `"push"` \| `"pop"` \| `"insert"` \| `"remove"` |
-| `value` | Str | `state` | New value as Display string (post-mutation) |
-| `effect` | Str | `effect` | Effect type (e.g. `"IO.Print"`, `"FS.Write"`) |
-| `op` | Str | `effect` | Operation name (e.g. `"io.println"`) |
-| `args` | `{name: str}` | `effect` | Operation arguments as Display strings |
+| `op` | Str | `state` | `"assign"`, or the name of the mutating method (§8.15.11) |
+| `value` | Str | `state` | New value of the whole binding as a value string (post-mutation) |
+| `effect` | Str | `effect` | Effect type. A built-in effect has no module: `"IO.Print"`, `"FS.Write"`. A user effect has its module: `"main.Log"` (§8.15.10) |
+| `op` | Str | `effect` | The call as the program writes it (e.g. `"io.println"`, `"log.emit"`) (§8.15.10) |
+| `args` | `{name: str}` | `effect` | Every parameter of the operation, by its declared name, as value strings. Omitted if the operation has no parameters |
 | `channel` | Str | `note` | The channel name that the `trace.log` call gave |
 | `msg` | Str | `note` | The message text. Values longer than 200 characters are truncated, with `"truncated":true` appended |
 
@@ -2539,16 +2541,16 @@ Design notes:
 - **`span` appears only on `enter`** — source location is static per function.
 - **`module` is a separate field** despite being derivable from `fn` — enables O(1) module-level filtering without string splitting.
 - **`duration_us` on `exit`** — computed by the emitter rather than requiring consumers to maintain an enter-timestamp stack.
-- **All values are Display strings** — bounded serialization cost; values longer than 200 characters are truncated with a `"truncated":true` field appended.
+- **All values are value strings** (§8.15.9) — bounded serialization cost; values longer than 200 characters are truncated with a `"truncated":true` field appended.
 
 #### 8.15.4 Example
 
-A function that enters, mutates state, performs an effect, and exits:
+A function that enters, mutates state, performs an effect, and exits. The effect `FS.Write` has the call `fs.write(path: Str, content: Str)`, so its event has one `args` key for each parameter:
 
 ```json
 {"ts_us":18042,"event":"enter","fn":"parser.write_output","module":"parser","depth":3,"span":{"file":"src/parser.bl","line":142,"col":1},"args":{"path":"out.c"}}
 {"ts_us":18044,"event":"state","fn":"parser.write_output","module":"parser","depth":3,"var":"files_written","op":"assign","value":"1"}
-{"ts_us":18045,"event":"effect","fn":"parser.write_output","module":"parser","depth":3,"effect":"FS.Write","op":"fs.write","args":{"path":"out.c"}}
+{"ts_us":18045,"event":"effect","fn":"parser.write_output","module":"parser","depth":3,"effect":"FS.Write","op":"fs.write","args":{"path":"out.c","content":"int main(void) {}"}}
 {"ts_us":18048,"event":"exit","fn":"parser.write_output","module":"parser","depth":3,"duration_us":6,"return":"()"}
 ```
 
@@ -2558,11 +2560,11 @@ Filters use colon-syntax: `--trace=key:value`. Multiple filters compose with AND
 
 | Filter | Meaning |
 |--------|---------|
-| `fn:<name>` | Match function name (short or fully-qualified) |
+| `fn:<name>` | Match the frame name (§8.15.8) by whole dot segments, from the end |
 | `module:<name>` | Match module name |
 | `depth:<n>` | Events at call depth <= N |
 | `event:<type>` | Only emit specified event types (`event:note` selects `note` events) |
-| `effect:<name>` | Match effect type (e.g. `FS.Write`) |
+| `effect:<name>` | Match effect type (e.g. `FS.Write`) by whole dot segments |
 | `state:<var>` | Match state variable name |
 
 Examples:
@@ -2585,7 +2587,15 @@ blink run app.bl --trace=event:state,module:parser      # state events in parser
 | `fn:a++b` | `fn` is `a` or `b` |
 | `depth : 2` | not the filter `depth:2`: the key is `depth ` (a space inside the item stays) |
 
-Bare `--trace` with no value traces all events. The `BLINK_TRACE` environment variable accepts the same filter syntax. The `fn:`, `module:` and `depth:` filters apply to a `note` event. A `note` event has no effect type and no state variable, so an `effect:` or `state:` filter does not select it.
+**The key and the value.** The key ends at the first `:` of the item. A later `:` is part of the value, because the name of a closure holds `@` and `:` (§8.15.8).
+
+**`fn:`.** The value matches a frame when the frame name equals the value, or ends with `.` and the value. The match uses whole dot segments. `fn:norm`, `fn:Point.norm` and `fn:main.Point.norm` match the frame `main.Point.norm`. `fn:oint.norm` and `fn:um` do not.
+
+**`effect:`.** The value selects an effect when it names the effect, or a parent of the effect, by whole dot segments. The effect can have its module or not. `effect:FS` selects `FS`, `FS.Write` and `FS.Read`. `effect:F` selects nothing. `effect:FS.Write` does not select `FS.Read`. For the user effect `Log` of the module `p`, both `effect:Log` and `effect:p.Log` select it. `effect:p` alone selects nothing.
+
+**`module:` and `state:`** match the whole text of the module name and of the binding name.
+
+Bare `--trace` with no value traces all events. The `BLINK_TRACE` environment variable accepts the same filter syntax. A bad filter is an error (§8.15.12). The `fn:`, `module:` and `depth:` filters apply to a `note` event. A `note` event has no effect type and no state variable, so an `effect:` or `state:` filter does not select it.
 
 #### 8.15.6 Timestamp Semantics
 
@@ -2713,6 +2723,197 @@ fn main() ! IO {
 With `BLINK_TRACE_CHANNELS=t`, stderr is `a`, `[trace:t] b`, `c`, in this order.
 
 **Panel vote:** **5-1** for a rowless built-in tracer (Minimalism dissented: no tracer). **5-1** for a lazy `msg` (Minimalism dissented: reject any state read). **5-1** that a trace call does not keep code alive (AI/ML dissented: the call keeps code alive). **6-0** for program order. **5-1** for a text line by default and a `note` event under `--trace` (Minimalism dissented: always a text line). See [decisions/panic-hook-and-dev-trace.md](../decisions/panic-hook-and-dev-trace.md).
+
+#### 8.15.8 Frames and Names
+
+A **frame** is a piece of code that writes an `enter` event when it starts and an `exit` event when it ends. The `fn` field of an event holds the name of the innermost frame. These pieces of code are frames:
+
+| Code | Frame? | Name |
+|------|--------|------|
+| A fn of the program or of a package | yes | `module.function` |
+| A method | yes | `module.Type.method` |
+| A closure | yes | `<enclosing frame>.fn@L:C` |
+| The body of an operation in a `with handler` block | yes | `<enclosing frame>.handler@L:C.<EffectPath>.<op>` |
+| The default body of an operation of a user effect | yes | `module.<EffectPath>.<op>` |
+| A `test` block that runs traced | yes | `module.test@L:C` |
+| A fn of the std library | no | none |
+| A method that `@derive` makes | no | none |
+
+**The grammar of a name.** This is the one place that defines the names of frames:
+
+```
+name         = function | method | closure | handler-body | default-body | test
+function     = module "." ident
+method       = module "." Type "." ident
+closure      = name "." "fn" "@" position
+handler-body = name "." "handler" "@" position "." EffectPath "." ident
+default-body = module "." EffectPath "." ident
+test         = module "." "test" "@" position
+position     = line ":" column
+EffectPath   = Effect | Effect "." Sub
+```
+
+- `module` is the module that holds the code.
+- In `closure` and `handler-body`, the leading `name` is the name of the frame that holds the closure or the `with handler` block.
+- `line` and `column` count from 1. They give the place of the keyword (`fn`, `handler` or `test`) in the source file. The `enter` event of such a frame has the same place in its `span`.
+- `EffectPath` is the effect that declares the operation, written with its parent, as in `Log` or `Metrics.Emit`. For a built-in effect, it is `IO.Print`, `FS.Write` and so on.
+- A name holds no `<`, `>`, space or quote character. A shell needs no quotes for `--trace=fn:main.main.fn@11:25`.
+- A type and an effect cannot have the same name in one module (§2.12.1). For this reason `main.Log.emit` names one thing.
+
+Example (the line numbers are in the left column):
+
+```blink
+ 1  effect Log {
+ 2      fn write(s: Str)
+ 3      fn emit(s: Str) { log.write(s) }
+ 4  }
+ 5
+ 6  fn run() ! Log {
+ 7      log.emit("a")
+ 8  }
+ 9
+10  fn main() ! IO {
+11      let ys = [1, 2].map(fn(x: Int) -> Int { x + 1 })
+12      with handler Log {
+13          fn write(s: Str) { }
+14      } {
+15          run()
+16      }
+17  }
+```
+
+| Frame | Name |
+|-------|------|
+| `main` | `main.main` |
+| the closure on line 11 | `main.main.fn@11:25` |
+| `run` | `main.run` |
+| the default body of `emit` (line 3) | `main.Log.emit` |
+| the body of `write` in the handler (line 13) | `main.main.handler@12:10.Log.write` |
+
+A `test` block on line 12, column 1 of the file `main.bl` has the name `main.test@12:1`.
+
+**Test blocks.** A `test` block is a frame at depth 0 when it runs traced. The spec does not say how a test run turns tracing on.
+
+**Depth.** `depth` counts the traced frames above the frame on the same thread. A std fn is not a frame, so a call of a std fn adds no step, and a closure that a std fn calls (such as the closure that `map` calls) has the depth of the frame that called `map`, plus one. A frame of a package is a traced frame. The filter `module:` cuts it out of the output.
+
+#### 8.15.9 Value Strings
+
+The program writes a value as a string in `args`, `return`, `value` and the `args` of an `effect` event. The string is:
+
+1. the `Display` text of the value, if the type has `Display`;
+2. else the `Debug` text, if the type has `Debug`;
+3. else `<TypeName>`, with the name of the type.
+
+A value is never left out. A type that has a derived `Debug` takes the same chain, also when the type is opaque. `Bytes` takes the same chain with its own `Debug`. A call to `Display` or `Debug` that the tracer makes writes no event.
+
+The program cuts a string that is longer than 200 characters and appends `"truncated":true` to the event. The cut is on the text, so a hand-written `Display` or `Debug` impl runs to its end before the cut. The cost of such an impl is the cost of the impl.
+
+**Known limits.**
+
+- A `state` event holds the whole binding. If two changes of a long value differ only after the cut, the two events can look the same.
+- A `Display` or `Debug` impl that panics panics only when the program runs traced, as a `msg` that panics does under `trace.log` (§8.15.7). A program that is correct without `--trace` can panic with it.
+
+**Secrets.** A trace shows `Debug` text, and people paste traces into tickets. `@derive(Debug)` on an opaque type shows its hidden fields (§2.12.2). To keep a field out of a trace, write the `Debug` impl by hand. The program does not filter the `args` of an `effect` event: the text that `env.var` returns, and the `content` of `fs.write`, reach stderr.
+
+#### 8.15.10 Effect Events
+
+A call of an effect operation writes one `effect` event. This holds for an operation in any code, also in std code. The program credits the event to the innermost traced frame.
+
+An operation that a handler serves or that falls to a default body writes one event for each dispatch. A default body that calls another operation of the effect is a second dispatch and writes a second event.
+
+| Field | Value |
+|-------|-------|
+| `effect` | A built-in effect has no module: `IO.Print`. A user effect has its module: `p.Log`. |
+| `op` | The call as the program writes it: `io.println`, `io.print`, `io.print_raw`, or `log.emit` for the operation `emit` of the effect `Log`. |
+| `args` | Every parameter of the operation, by the declared name. Omitted if the operation has no parameters. |
+
+The `op` string of a user effect is the lowercase handle of the effect, then `.`, then the operation. For the built-in IO operations, the "Called by" column of the table in §4.4 gives the call, and the declared parameter name gives the `args` key: `io.println(x)` has the key `msg`, and `io.print_raw(s)` has the key `s`.
+
+Example. With a handler of `IO.Print` that has no `print_raw`, the call `io.print_raw("c")` is one dispatch of `print_raw`. The default body of `print_raw` then calls `print_no_nl`, which is a second dispatch. Each dispatch writes one event:
+
+```blink
+fn main() ! IO {
+    with handler IO.Print {
+        fn print_no_nl(_msg: Str) { }
+    } {
+        io.print_raw("c")
+    }
+}
+```
+
+```json
+{"ts_us":9,"event":"effect","fn":"main.main","module":"main","depth":0,"effect":"IO.Print","op":"io.print_raw","args":{"s":"c"}}
+{"ts_us":11,"event":"effect","fn":"main.main","module":"main","depth":0,"effect":"IO.Print","op":"io.print","args":{"msg":"c"}}
+```
+
+The default handler of `IO.Print` serves `print_raw` itself (§4.4). With the default handler, `io.print_raw("c")` writes the first event only.
+
+The `effect:` filter selects an event by the `effect` field (§8.15.5).
+
+#### 8.15.11 State Events
+
+A `state` event reports a change of a `let mut` binding. The binding is the one that the `var` field names.
+
+| Change | `op` |
+|--------|------|
+| `x = v`, `x += v` and the other compound forms | `assign` |
+| A call of a mutating method on the binding, or on a part of it | The name of the method: `push`, `pop`, `insert`, `remove`, `set`, `clear` and so on |
+| A write to a field: `p.x = 1` | `assign` |
+
+- A **mutating method** is a method with a `mut self` receiver. The set of names is open: a method that a library adds has its own name as `op`. A consumer that switches on `op` needs a default arm.
+- A write to a part of a binding (a field, as in `p.x = 1`) writes one event. `var` is the root binding and `value` is the whole binding after the change. There is no field that names the part.
+- A call of a mutating method writes one event, also when it changes nothing (`pop` on an empty list).
+- The first `let mut` binding of a value is not a change and writes no event.
+
+```blink
+@derive(Debug)
+type Point { x: Int, y: Int }
+
+fn main() {
+    let mut xs = [3, 1, 2]
+    xs.push(4)
+    xs.set(0, 9)
+    let mut p = Point { x: 0, y: 0 }
+    p.x = 1
+}
+```
+
+```json
+{"ts_us":5,"event":"state","fn":"main.main","module":"main","depth":0,"var":"xs","op":"push","value":"[3, 1, 2, 4]"}
+{"ts_us":6,"event":"state","fn":"main.main","module":"main","depth":0,"var":"xs","op":"set","value":"[9, 1, 2, 4]"}
+{"ts_us":7,"event":"state","fn":"main.main","module":"main","depth":0,"var":"p","op":"assign","value":"Point { x: 1, y: 0 }"}
+```
+
+#### 8.15.12 Errors in a Filter
+
+A bad trace filter is a usage error (*Usage errors*, §8.10.7): the program prints text on stderr, writes no trace event, and exits with code `2` before `main` starts. These are bad filters: a key that is not in §8.15.5, an empty value, a `depth:` value that is not a number, and an `event:` value that is not an event type. `BLINK_TRACE` and `--trace=` have the same rule. `blink run` finds the error before it builds the program.
+
+Example output. The words are an example; the spec does not require them:
+
+```
+error: bad --trace value: unknown event type `stat` in `event:stat`; did you mean `state`?
+```
+
+**Names that no code declares.** Under `blink run`, the check goes one step further. After the typecheck and before the program starts, `blink run` checks each `fn:`, `module:`, `effect:` and `state:` value. A value that matches no declaration is the same usage error, with exit code `2`:
+
+```
+error: bad --trace value: no function named `skip_newlinez`; did you mean `skip_newlines`?
+```
+
+- The check matches with the rule of §8.15.5, over every name in the program: frames (with the names of §8.15.8), modules, effects and the names of `let mut` bindings.
+- A name that the build drops is still a declaration. A name of code that never runs is not an error.
+- Std fns are not frames, so `fn:` with the name of a std fn is an error.
+- A binary that a person starts by hand does not run this check. A name that matches nothing there gives an empty trace. An empty trace means that the filter matched nothing.
+
+#### 8.15.13 The Traced Binary
+
+A traced binary reads `BLINK_TRACE` and nothing else. Its argv and `env.args()` are never changed by tracing. `blink run --trace[=filter]` sets `BLINK_TRACE` for the child process. A bare `--trace` sets `all`. The flag replaces a value that the shell had set. A binary with `BLINK_TRACE` unset traces everything. `BLINK_TRACE=1` is not a value: the word `all` is.
+
+There is no limit on the number of events. The flag `--trace-limit` and the variable `BLINK_TRACE_LIMIT` do not exist.
+
+If the stream of the trace closes (for example, a reader of the pipe exits), the program stops writing trace events and runs to its end with its own exit code. Only the trace writes stop. A write by the program to its own stdout or stderr keeps the behavior of that stream, also when `2>&1` puts both in one pipe.
+
+**Panel vote:** **5-1** that a `test` block is a frame (Minimalism dissented: no rule until `blink test --trace` is in the spec). **5-1** that the `op` of an `effect` event is the call (Programming Language Theory dissented: the handler operation). **5-1** that a user effect has its module in `effect` (Minimalism dissented: no module). **5-1** for the check of filter names under `blink run` (Minimalism dissented: no check). **6-0** for the names of closures, handler bodies, default bodies and tests, for one event for each dispatch, for `assign` or the method name in `op`, for no `path` field, for the value chain, for the stream rules and for the removal of `--trace-limit`. See [decisions/runtime-trace-open-points.md](../decisions/runtime-trace-open-points.md) and [decisions/trace-ndjson-format.md](../decisions/trace-ndjson-format.md).
 
 ---
 
