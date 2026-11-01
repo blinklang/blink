@@ -969,7 +969,7 @@ The AI reads structured test failures the same way it reads structured compiler 
 
 | `cause` value | Meaning |
 |--------------|---------|
-| `"assertion"` | An `assert*` built-in failed. The record carries `assertion`, `expected`/`actual`, `introspection` and `omitted` fields (§2.20 Assertion Failure Output, *Sub-expression Values*). On the record for a failed `assert*` call, `introspection` and `omitted` are always present, `[]` when empty. |
+| `"assertion"` | An `assert*` built-in failed, or a `debug_assert` failed in a debug build (§2.20 `debug_assert`). The record carries `assertion`, `expected`/`actual`, `introspection` and `omitted` fields (§2.20 Assertion Failure Output, *Sub-expression Values*). On the record for a failed `assert*` call, `introspection` and `omitted` are always present, `[]` when empty. |
 | `"propagated_error"` | The test body — **or a `prop_check` property closure** (§2.20 Error Propagation, Property-Based Testing) — returned `Err(TestError { ... })` via `?` propagation. The record carries an `error` object with `message` (the `Display`-rendered error string) and `error_type` (the static name of the source error type at the `?` site). When the failure comes from a property closure, the record *additionally* carries the property failure fields (`seed`, `shrunk_input`, `reproduce`); the `cause` axis (assertion vs propagated error) is orthogonal to whether the test is a property, so no new `cause` value is added. |
 
 `"status": "panicked"` and `"status": "skipped"` records have no `cause` field — the status itself identifies the path. The four top-level statuses (`passed | failed | panicked | skipped`) remain unchanged.
@@ -2573,6 +2573,18 @@ blink run app.bl --trace=fn:skip_newlines+parse_block   # two functions (OR)
 blink run app.bl --trace=event:state,module:parser      # state events in parser only
 ```
 
+**Items (changed rule).** The value of `--trace=` and of `BLINK_TRACE` is a list of filters separated by `,`. The value of a filter is a list separated by `+`. The program reads each `,` item and each `+` item with the item rule of `BLINK_TRACE_CHANNELS` (§8.15.7): it trims ASCII space and tab from the two ends of the item, and it skips an item that is empty after the trim. A space inside an item stays, so a space next to the `:` is part of the key or of the value. A runtime that reads each item as exact text, with no trim, does not conform. No valid key and no valid value has a space at an end of the item, so the trim changes the reading only of a value that has a space at an end of an item, or an empty item.
+
+| Value | Filters |
+|-------|---------|
+| `fn:a,depth:2` | `fn:a` and `depth:2` |
+| `fn:a, depth:2` | `fn:a` and `depth:2` |
+| `fn:a,,depth:2` | `fn:a` and `depth:2` |
+| `fn:a,depth:2,` | `fn:a` and `depth:2` |
+| `fn:a + b` | `fn` is `a` or `b` |
+| `fn:a++b` | `fn` is `a` or `b` |
+| `depth : 2` | not the filter `depth:2`: the key is `depth ` (a space inside the item stays) |
+
 Bare `--trace` with no value traces all events. The `BLINK_TRACE` environment variable accepts the same filter syntax. The `fn:`, `module:` and `depth:` filters apply to a `note` event. A `note` event has no effect type and no state variable, so an `effect:` or `state:` filter does not select it.
 
 #### 8.15.6 Timestamp Semantics
@@ -2592,7 +2604,61 @@ fn lower(id: Int) -> Int {
 
 `lower` has no row.
 
-**The gate.** The env var `BLINK_TRACE_CHANNELS` turns channels on. Its value is `all`, or a comma-separated list of channel names. The program reads the var once, when it starts. A later `env.set_var` does not change it. It is separate from `BLINK_TRACE` (§8.15.5). No call asks whether a channel is on. With `BLINK_TRACE_CHANNELS=mono`, `lower(4)` writes `[trace:mono] lower 4` to stderr. If the var is unset, or does not name `mono`, `lower(4)` writes nothing.
+**The gate.** The env var `BLINK_TRACE_CHANNELS` turns channels on. Its value is a list of items separated by `,`. The program reads the var once, when it starts. A later `env.set_var` does not change it. It is separate from `BLINK_TRACE` (§8.15.5). No call asks whether a channel is on. With `BLINK_TRACE_CHANNELS=mono`, `lower(4)` writes `[trace:mono] lower 4` to stderr. If the var is unset, or does not name `mono`, `lower(4)` writes nothing.
+
+**The items (changed rule).** The program reads the value in four steps. It splits the value on `,`. It trims ASCII space and tab from the two ends of each item; a space inside an item stays. It skips each item that is empty after the trim. It matches each other item against a channel name by exact text, and case counts. The item `all`, in any place in the list, turns on every channel. There is no warning for any value. A runtime that matches the items with no trim, or that reads `all` only as the whole value, does not conform.
+
+| Value | Channels on |
+|-------|-------------|
+| `mono` | `mono` |
+| `mono, walk` | `mono` and `walk` |
+| `mono,,walk,` | `mono` and `walk` |
+| `" , "` | none |
+| `mono,all` | every channel |
+| `all` | every channel |
+| `Mono` | none: the channel `mono` stays off (case counts) |
+| `mo no` | only the channel `mo no` (a space inside an item stays) |
+
+The quotes in the row `" , "` mark the end spaces; they are not part of the value. With `BLINK_TRACE_CHANNELS="walk, mono"`, `lower(4)` writes `[trace:mono] lower 4` to stderr.
+
+**A binding named `trace`.** `trace` is not an effect handle, and the name is not reserved. A binding named `trace` hides the built-in `trace.log` by lexical scope, as a local named `io` or `env` hides that handle in a fn that does not declare its effect (§3c.4 *Effect Handle Operations*). The binding can be a module-level fn, a parameter or a local. In the scope of that binding, `trace.log` is a method call on the binding. If the binding has no method `log`, the call is `UnresolvedMethod` (E0505):
+
+```blink
+fn trace(phase: Str, msg: Str) { }
+
+fn f() {
+    trace.log("c", "x")
+}
+```
+
+The compiler reports:
+
+```
+error[UnresolvedMethod]: unresolved method `.log` on type Fn(Str, Str) -> ()
+  help: `trace` here is the fn at line 1, which hides the built-in `trace.log`; rename the fn to use it
+```
+
+The `help` line is example output. It shows the hint that a compiler gives; the spec does not require its words. A local `let trace = 5` gives the same error for the type `Int`.
+
+A module-level `trace` hides the built-in only in the module that declares it. In another module, `trace.log` is the built-in:
+
+```blink
+// a.bl
+pub fn trace(phase: Str, msg: Str) { }
+
+pub fn run() {
+    trace.log("c", "x")     // error[UnresolvedMethod]: `trace` here is the fn of this module
+}
+```
+
+```blink
+// b.bl
+import a
+
+fn g() {
+    trace.log("c", "x")     // accepted: the built-in. `a.trace` does not hide it in `b`
+}
+```
 
 **The form.** By default a call writes one text line, `[trace:<channel>] <msg>`, to stderr. When `--trace` is on (§8.15.1), the same call writes a `note` event to the NDJSON stream, in place of the text line, so that each stderr line is valid JSON:
 

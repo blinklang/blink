@@ -2558,7 +2558,7 @@ Assertion failure panics — unwinding to the test runner, which marks the test 
 
 #### `panic()` Function
 
-`panic(msg: Str) -> Never` is a built-in available in all code — not just tests. It triggers an unwind with the given message. In test blocks, the test runner catches the unwind and marks the test as failed. In production code, panic terminates the process with a stack trace, and the exit code is 101. A program may install a panic hook in `main` (*Panic Hook*, below). With a hook, a panic calls the hook, and the hook ends the process.
+`panic(msg: Str) -> Never` is a built-in available in all code — not just tests. It triggers an unwind with the given message. In test blocks, the test runner catches the unwind and marks the test as failed. In production code, panic ends the process with exit code 101 and writes a report to stderr (*Panic Hook*, below, says what the report holds). The spec does not require a stack trace in the report. A `--debug` build may add a backtrace. A program may install a panic hook in `main` (*Panic Hook*, below). With a hook, a panic calls the hook, and the hook ends the process.
 
 ```blink
 fn divide(a: Int, b: Int) -> Int {
@@ -2737,7 +2737,49 @@ stdout is empty. stderr is `fatal: n out of range: 9 at app.bl:12`. The exit cod
 
 **Where the hook runs.** The hook runs at the panic point, on the thread that panicked. Nothing unwinds: no `exit()` of a `with` item and no `close()` runs (§4.7.2). The hook cannot return, because its type is `-> Never`. A hook body that can fall through is the error of §3.3 *Divergence and Body Completeness*. The process ends when the hook calls `env.exit`.
 
-**What the hook gets.** It gets each panic that no runtime catch frame takes (§4.7.2): `panic()`, `todo()`, `unreachable()`, a failed contract, an overflow, an index out of bounds. A fatal runtime error (out of memory, stack overflow) is not a panic. The hook does not run for it.
+**What the hook gets.** It gets each panic that no runtime catch frame takes (§4.7.2): `panic()`, `todo()`, `unreachable()`, a failed contract, a failed `debug_assert` (*`debug_assert`*, below), an overflow, an index out of bounds. A fatal runtime error (out of memory, stack overflow) is not a panic. The hook does not run for it.
+
+**A fault that the runtime raises.** A fault that Blink code can cause is a panic, and it has a site in that code. The faults of this kind are an index out of bounds, a `set` or `pop` that is out of range, a `Str` index that is out of range, and an overflow. For such a fault:
+
+- `message` is the text of the fault and nothing more. It has no lead-in such as `blink: `, so a hook sees one message form for `panic("...")` and for a fault.
+- `file` and `line` name the call in Blink code that caused the fault. `file` is never `""`.
+- The wording of the fault text is not normative. The text names the index and the length.
+
+```blink
+fn report(p: PanicInfo) -> Never ! IO.Eprint, Env.Exit {
+    let at = match p.line {
+        Some(n) => "{p.file}:{n}"
+        None => p.file
+    }
+    io.eprintln("fatal: {p.message} at {at}")
+    env.exit(70)
+}
+
+fn main() ! IO, Env {
+    with on_panic(report) {
+        let mut xs = [1]
+        let i = xs.len() + 3
+        xs.set(i, 2)
+    }
+}
+```
+
+stderr is `fatal: list set index out of bounds: 4, length 1 at app.bl:14`. The exit code is 70. The message has no `blink: ` and `at` names line 14 of `app.bl`, the line of `xs.set(i, 2)`.
+
+A fault that has no site in Blink code is a fatal runtime error (§4.7.2), not a panic. The hook does not run for it. The runtime writes its own report. An example is a fault in a check inside the runtime, caused by foreign code that breaks a rule of the runtime:
+
+```blink
+@ffi("c", "bad_name")
+fn bad_name() -> Str ! ()      // the C side breaks the layout rule of `Str`
+
+fn main() ! IO, Env {
+    with on_panic(report) {
+        io.println("{bad_name().len()}")
+    }
+}
+```
+
+`report` does not run, because the fault is in the runtime and not at a call that Blink code can name. The runtime writes its own report. This section does not give the form or the exit code of that report.
 
 **The row of the hook.** The row of the hook is charged at the `with`, in `main`, in the way that the row of a handler clause is charged (§4.7.1). `main` holds every built-in effect (§4.6), so the hook may use them with no declaration. A user-declared effect in the row of the hook needs a handler that encloses the `with` (E0539). Each operation in the hook goes to the handlers that are in scope at the `with`. It does not go to the handlers in scope at the panic point:
 
@@ -2824,7 +2866,32 @@ fn main() ! IO, Env {
 
 A module `let mut` is one cell for all threads, and the language has no per-thread state (§4.16). If several threads handle requests at the same time, the cell holds the request of the thread that wrote last, and the report can name the wrong request. This section does not say whether the hook calls of two threads that panic at the same time overlap.
 
-**No hook.** With no hook, a panic writes its report to stderr (the lead-in `panic: ` and the suffix ` at file:line` are not normative) and the process exits with code 101. The code differs from `env.exit(1)`, so a caller can tell a crash from a reported failure. The test runner keeps its own rule: a panic has no exit code of its own there (§8.10).
+**No hook.** With no hook, a panic writes a report to stderr and the process exits with code 101. The report holds the panic message, and `file:line` when the line is known. The form and the layout of the report are not normative: the lead-in `panic: `, the suffix ` at file:line` and the order of the parts are free. A message can hold a newline, and then the message and the location can be on different lines. The report need not hold a stack trace. A `--debug` build may add a backtrace. The code differs from `env.exit(1)`, so a caller can tell a crash from a reported failure. The test runner keeps its own rule: a panic has no exit code of its own there (§8.10).
+
+```blink
+fn main() {
+    panic("bad\nstate")
+}
+```
+
+The exit code is 101. The report holds `bad`, `state` and `app.bl:2`. One runtime writes:
+
+```
+panic: bad
+state at app.bl:2
+```
+
+Another layout is as correct. A fault that the runtime raises has the same rule:
+
+```blink
+fn main() ! IO {
+    let mut xs = [1]
+    let i = xs.len() + 3
+    xs.set(i, 2)
+}
+```
+
+The exit code is 101. The report holds `list set index out of bounds: 4, length 1` and `app.bl:4`. One runtime writes `panic: list set index out of bounds: 4, length 1 at app.bl:4`. The fault wording is not normative, so another runtime can write other words for the same fault.
 
 **Panel vote:** **5-1** for a panic hook (Minimalism dissented: report through a root that holds the rows, or through a parent process). **5-1** for one hook, in `main` only (PLT dissented: any `with`, so a closure can hold per-request state). **6-0** for exit code 101 with no hook. See [DECISIONS.md](../DECISIONS.md) and [decisions/panic-hook-and-dev-trace.md](../decisions/panic-hook-and-dev-trace.md).
 
@@ -2971,6 +3038,75 @@ test "deposit then withdraw" {
 **Why no `subtest` primitive.** Adding `subtest` as either a stdlib HOF or a compiler-recognized block was deliberated and rejected. The shapes that go beyond `for_each` + flat `test` blocks all require either (a) a second catch-site for `panic` inside `test` (so siblings could continue after one fails), which would contradict §2.20's "panic is untracked divergence; only the test runner catches it" (a panic hook is not a catch) and §4.7.2's deferral of recoverable panics, or (b) sugar that adds language surface without expressivity gain. Future evidence-driven re-evaluation may reopen the question; the current evidence (no shipped feature missing it, `for_each` covers parametric, helper `fn` covers heterogeneous) is that the gap is documentation-shaped, not syntax-shaped.
 
 **Panel vote: 5-1** (sys dissent for compiler builtin with static enumerability). See [DECISIONS.md](../DECISIONS.md) and [decisions/sub-tests.md](../decisions/sub-tests.md).
+
+#### `debug_assert`
+
+`debug_assert(cond: Bool, msg: Str = "")` is a compiler built-in. Unlike the four assertions of *Built-in Assertions*, it is available in all code, not only in `test` blocks. It is an `assert` that a debug build checks and a release build leaves out.
+
+A build is a **debug build** when it is made with `--debug` (`blink build --debug`, `blink run --debug`), and every build that `blink test` makes is a debug build.
+
+**Debug on.** In a debug build, `debug_assert(c, m)` is `assert(c, m)`, in every context. It has the same failure path, the same report and the same test record as `assert`. The failure message is `assertion failed: debug_assert(<cond>)`, where `<cond>` is the source text of `c`. When `m` is given, the message also holds `m`. The text `debug_assert(` in the message is stable, so a tool can tell this failure from the failure of an `assert`.
+
+**Debug off.** In a build that is not a debug build, `c` is still checked by the typechecker: its types, its names and its effect rows count as they do in a debug build. The program does not evaluate `c` or `m`. The call is `()`.
+
+```blink
+fn check(n: Int) -> Bool {
+    n > 0
+}
+
+fn main() ! IO {
+    debug_assert(check(-1))
+    io.println("done")
+}
+```
+
+In a debug build, the report goes to stderr, `done` is not written, and the exit code is 101. In a build that is not a debug build, `check(-1)` does not run, stdout is `done` and the exit code is 0. `debug_assert(check)` does not compile in either build, because `check` is not a `Bool`.
+
+**Outside a test.** A failed `debug_assert` ends the process with exit code 101, as a panic does (*No hook*, above), and `on_panic` gets it. The report is the report of a failed `assert`:
+
+```blink
+fn main() ! IO {
+    let n = 3
+    debug_assert(n > 5, "n is small")
+    io.println("after")
+}
+```
+
+With `--debug`, `after` is not written and the exit code is 101. stderr is:
+
+```
+assertion failed: debug_assert(n > 5)
+  message: n is small
+  n = 3
+  --> app.bl:3:5
+```
+
+With a hook, the hook runs at that call, and `p.message` holds `assertion failed: debug_assert(n > 5)`. Without `--debug`, stdout is `after`.
+
+**In a test.** A failed `debug_assert` is an assertion failure. The test runner marks the test as failed and runs the next test. The record is `"status": "failed"` with `"cause": "assertion"`, and it has the operand lines of an `assert` (*Sub-expression Values*, below):
+
+```blink
+test "u" {
+    let n = 3
+    debug_assert(n > 5)
+}
+```
+
+```json
+{"record": "test", "file": "app.bl", "name": "u", "status": "failed", "cause": "assertion", "assertion": "debug_assert(n > 5)", "introspection": [{"expr": "n", "value": "3"}], "omitted": [], "span": {"file": "app.bl", "line": 3, "col": 5}}
+```
+
+The record is not `"status": "panicked"`. A failed `debug_assert` is a test check, as a failed `assert` is.
+
+**What it gets in each place.** A failed `debug_assert` in a debug build gets what a failed `assert` gets in the same place:
+
+| Place | `assert(1 == 2)` | `debug_assert(1 == 2)` with `--debug` |
+|-------|------------------|---------------------------------------|
+| test body | `failed`, `cause: "assertion"` | `failed`, `cause: "assertion"` |
+| `main`, no hook | report, exit code 101 | report, exit code 101 |
+| `main`, with a hook | the hook runs | the hook runs |
+
+Inside an `assert_panics` body, a failed `debug_assert` gets what a failed `assert` gets there. This section does not state that rule. If the rule for `assert` changes, the rule for `debug_assert` changes with it.
 
 #### Assertion Failure Output
 
