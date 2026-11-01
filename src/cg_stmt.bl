@@ -80,6 +80,7 @@ import cg_promote.{
     cg_promote_innermost_ctx, cg_promote_needs_walk, cg_promote_on_exit, cg_promote_trace_begin,
     cg_promote_trace_end, cg_promote_value,
 }
+import cg_trace.{cg_trace_body_enter, cg_trace_body_leave, cg_trace_body_traced, cg_trace_exit_value, cg_trace_exit_void}
 
 // A carrier holds its discriminant in `tag`, its Option payload in `value` and its
 // Result arms in `ok` and `err`. These are member names in a struct layout.bl emits,
@@ -318,17 +319,24 @@ pub fn lower_fn(fn_node: Int) -> Int ! Diag.Report {
     // and comes back off after, leaving nothing for the next function to read.
     let ann = node_type_ann(fn_node)
     cg_expr_set_return_type(if ann < 0 { -1 } else { stmt_tid(ann) })
+    // The enter event comes before the entry checks, so a call that fails its @requires
+    // shows in the trace.
+    let enter = if bound { cg_trace_body_enter(fn_node) } else { [] }
     let (entry, block, falls_off) = lower_fn_body_as_current(fn_node, bound, tail, body)
+    let leave = if block >= 0 && tail != TAIL_RETURN { cg_trace_exit_void(fn_node) } else { [] }
+    cg_trace_body_leave()
     cg_expr_clear_old_snapshots()
     cg_expr_set_return_type(-1)
     close_scope()
     // A stopped body, a parameter with no type and a declaration with no body all leave
     // nothing worth printing, and the seam still answers a node.
     if block < 0 { return ir_block(fn_node, []) }
-    let mut stmts = entry
-    if stmts.len() == 0 && falls_off.len() == 0 { return block }
+    let mut stmts = enter
+    for s in entry { stmts.push(s) }
+    if stmts.len() == 0 && falls_off.len() == 0 && leave.len() == 0 { return block }
     stmts.push(block)
     for check in falls_off { stmts.push(check) }
+    for s in leave { stmts.push(s) }
     ir_block(fn_node, stmts)
 }
 
@@ -502,7 +510,8 @@ fn ensures_failure() -> Str {
 // @ensures and as `self` by each @where on the return type, then returned.
 pub fn cg_stmt_return_value(node: Int, value: Int) -> Int ! Diag.Report {
     let rt = cg_expr_return_type()
-    if cs_exit_ensures.len() == 0 && cs_exit_where.len() == 0 {
+    let traced = cg_trace_body_traced()
+    if cs_exit_ensures.len() == 0 && cs_exit_where.len() == 0 && !traced {
         let out = cg_promote_on_exit(rt, value, node)
         if out < 0 { return -1 }
         return ir_return(node, out)
@@ -516,6 +525,7 @@ pub fn cg_stmt_return_value(node: Int, value: Int) -> Int ! Diag.Report {
     for td in cs_exit_where {
         stmts.push(contract_check(node_condition(td), where_failure(td), "self", rt, rv))
     }
+    for s in cg_trace_exit_value(node, rt, ir_var_ref(rt, node, rec.c_spelling, rv, rec.slot_form)) { stmts.push(s) }
     let out = cg_promote_on_exit(rt, ir_var_ref(rt, node, rec.c_spelling, rv, rec.slot_form), node)
     if out < 0 { return -1 }
     stmts.push(ir_return(node, out))
@@ -524,9 +534,9 @@ pub fn cg_stmt_return_value(node: Int, value: Int) -> Int ! Diag.Report {
 
 // A return with no value.
 fn return_void(node: Int) -> Int ! Diag.Report {
-    let checks = contract_void_exit()
-    if checks.len() == 0 { return ir_return(node, -1) }
-    let mut stmts = checks
+    let mut stmts = contract_void_exit()
+    for s in cg_trace_exit_void(node) { stmts.push(s) }
+    if stmts.len() == 0 { return ir_return(node, -1) }
     stmts.push(ir_return(node, -1))
     ir_block(node, stmts)
 }
@@ -1682,7 +1692,10 @@ fn lower_tail_block_into(node: Int, tail: Int, dest: Str, dest_tid: Int) -> Int 
         }
         i = i + 1
     }
-    if n == 0 && tail == TAIL_RETURN { out.push(ir_return(node, -1)) }
+    if n == 0 && tail == TAIL_RETURN {
+        for s in cg_trace_exit_void(node) { out.push(s) }
+        out.push(ir_return(node, -1))
+    }
     close_scope()
     ir_block(node, out)
 }

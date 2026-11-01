@@ -35,6 +35,30 @@ typedef struct {
 static blink_trace_state __blink_trace = {0};
 #endif
 
+/* One traced call on this thread's stack: when it began, and whether the filters chose its
+   enter and exit events. The exit reads both, so the two events of one call always pair.
+   Depth is the call stack depth of a thread, so the stack is per thread. */
+typedef struct {
+    int64_t enter_ts;
+    int matched;
+} blink_trace_frame;
+
+#ifdef BLINK_USE_EXTERN_RUNTIME_STORAGE
+  #ifdef BLINK_RUNTIME_STORAGE_DEFINE
+    __thread blink_trace_frame* __blink_trace_frames = NULL;
+    __thread int64_t __blink_trace_frame_cap = 0;
+    __thread int64_t __blink_trace_frame_top = 0;
+  #else
+    extern __thread blink_trace_frame* __blink_trace_frames;
+    extern __thread int64_t __blink_trace_frame_cap;
+    extern __thread int64_t __blink_trace_frame_top;
+  #endif
+#else
+BLINK_UNUSED static __thread blink_trace_frame* __blink_trace_frames = NULL;
+BLINK_UNUSED static __thread int64_t __blink_trace_frame_cap = 0;
+BLINK_UNUSED static __thread int64_t __blink_trace_frame_top = 0;
+#endif
+
 BLINK_RT_FN int64_t blink_trace_ts_us(void);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN int64_t blink_trace_ts_us(void) {
@@ -155,16 +179,12 @@ BLINK_RT_FN int blink_trace_match(const char* fn, const char* module, int depth)
     for (int i = 0; i < __blink_trace.filter_count; i++) {
         blink_trace_filter* f = &__blink_trace.filters[i];
         if (strcmp(f->key, "fn") == 0) {
+            const char* dot = strrchr(fn, '.');
+            const char* short_name = dot ? dot + 1 : fn;
             int matched = 0;
             for (int j = 0; j < f->count; j++) {
-                if (strcmp(fn, f->values[j]) == 0 || strcmp(fn + strlen(fn) - strlen(f->values[j]),
-                    f->values[j]) == 0) {
-                    const char* short_name = fn;
-                    const char* dot = strrchr(fn, '.');
-                    if (dot) short_name = dot + 1;
-                    if (strcmp(short_name, f->values[j]) == 0 || strcmp(fn, f->values[j]) == 0) {
-                        matched = 1; break;
-                    }
+                if (strcmp(fn, f->values[j]) == 0 || strcmp(short_name, f->values[j]) == 0) {
+                    matched = 1; break;
                 }
             }
             if (!matched) return 0;
@@ -400,6 +420,189 @@ BLINK_RT_FN void blink_trace_arena_promote_end(const char* fn, const char* modul
     const char* desc, const char* file, int64_t line, int64_t col) {
     blink_trace_arena_promote(fn, module, __blink_trace.depth, "end",
         __blink_current_arena ? "outer arena" : "GC heap", desc, file, (int)line, (int)col);
+}
+#endif
+
+/* The events of a traced function. Codegen calls blink_trace_fn_enter first in the body and
+   blink_trace_fn_leave at each exit, so the stack moves for each traced call, whether or not
+   its events print. Each gate answers whether its event prints, and codegen renders the
+   values of an event only then. */
+
+/* Whether one event passes the filters. An event with no effect type answers no to an
+   `effect:` filter, and one with no variable answers no to a `state:` filter. */
+BLINK_RT_FN int blink_trace_match_event(const char* fn, const char* module, int64_t depth,
+    const char* effect, const char* var);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN int blink_trace_match_event(const char* fn, const char* module, int64_t depth,
+    const char* effect, const char* var) {
+    if (!blink_trace_match(fn, module, (int)depth)) return 0;
+    for (int i = 0; i < __blink_trace.filter_count; i++) {
+        blink_trace_filter* f = &__blink_trace.filters[i];
+        const char* have = NULL;
+        if (strcmp(f->key, "effect") == 0) have = effect;
+        else if (strcmp(f->key, "state") == 0) have = var;
+        else continue;
+        if (!have) return 0;
+        int matched = 0;
+        for (int j = 0; j < f->count; j++) {
+            if (strcmp(have, f->values[j]) == 0) { matched = 1; break; }
+        }
+        if (!matched) return 0;
+    }
+    return 1;
+}
+#endif
+
+BLINK_RT_FN int blink_trace_under_limit(void);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN int blink_trace_under_limit(void) {
+    return __blink_trace.event_limit <= 0 || __blink_trace.event_count < __blink_trace.event_limit;
+}
+#endif
+
+/* Writes s as the inside of a JSON string. With max_chars >= 0 it writes at most that many
+   characters and answers whether s had more. */
+BLINK_RT_FN int blink_trace_put_json(FILE* out, const char* s, int64_t max_chars);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN int blink_trace_put_json(FILE* out, const char* s, int64_t max_chars) {
+    int64_t chars = 0;
+    for (const unsigned char* p = (const unsigned char*)(s ? s : ""); *p; p++) {
+        /* A UTF-8 continuation byte is part of the character before it. */
+        if ((*p & 0xC0) != 0x80) {
+            if (max_chars >= 0 && chars == max_chars) return 1;
+            chars++;
+        }
+        switch (*p) {
+            case '"':  fputs("\\\"", out); break;
+            case '\\': fputs("\\\\", out); break;
+            case '\n': fputs("\\n", out); break;
+            case '\r': fputs("\\r", out); break;
+            case '\t': fputs("\\t", out); break;
+            default:
+                if (*p < 0x20) fprintf(out, "\\u%04x", *p);
+                else fputc(*p, out);
+        }
+    }
+    return 0;
+}
+#endif
+
+/* The fields every event starts with. The caller holds the stderr lock. */
+BLINK_RT_FN void blink_trace_put_head(const char* event, const char* fn, const char* module,
+    int64_t depth);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void blink_trace_put_head(const char* event, const char* fn, const char* module,
+    int64_t depth) {
+    __blink_trace.event_count++;
+    fprintf(stderr, "{\"ts_us\":%lld,\"event\":\"%s\",\"fn\":\"", (long long)blink_trace_ts_us(), event);
+    blink_trace_put_json(stderr, fn, -1);
+    fputs("\",\"module\":\"", stderr);
+    blink_trace_put_json(stderr, module, -1);
+    fprintf(stderr, "\",\"depth\":%lld", (long long)depth);
+}
+#endif
+
+BLINK_RT_FN void blink_trace_put_tail(int truncated);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void blink_trace_put_tail(int truncated) {
+    if (truncated) fputs(",\"truncated\":true", stderr);
+    fputs("}\n", stderr);
+    fflush(stderr);
+}
+#endif
+
+/* The depth of the innermost traced call of this thread. */
+BLINK_RT_FN int64_t blink_trace_frame_depth(void);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN int64_t blink_trace_frame_depth(void) {
+    return __blink_trace_frame_top > 0 ? __blink_trace_frame_top - 1 : 0;
+}
+#endif
+
+/* Pushes the call and answers whether its enter event prints. */
+BLINK_RT_FN int blink_trace_fn_enter(const char* fn, const char* module);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN int blink_trace_fn_enter(const char* fn, const char* module) {
+    if (!__blink_trace.active) return 0;
+    int64_t depth = __blink_trace_frame_top++;
+    if (depth >= __blink_trace_frame_cap) {
+        int64_t cap = __blink_trace_frame_cap ? __blink_trace_frame_cap * 2 : 64;
+        blink_trace_frame* grown = (blink_trace_frame*)realloc(__blink_trace_frames,
+            (size_t)cap * sizeof(blink_trace_frame));
+        /* With no room the call still counts for depth; it prints no enter and no exit. */
+        if (!grown) return 0;
+        __blink_trace_frames = grown;
+        __blink_trace_frame_cap = cap;
+    }
+    int matched = blink_trace_match_event(fn, module, depth, NULL, NULL);
+    __blink_trace_frames[depth].matched = matched;
+    __blink_trace_frames[depth].enter_ts = blink_trace_ts_us();
+    return matched && __blink_trace.event_enter && blink_trace_under_limit();
+}
+#endif
+
+/* The enter event, after its gate. The variadic part is n pairs of (name, value) C strings. */
+BLINK_RT_FN void blink_trace_enter_event(const char* fn, const char* module, const char* file,
+    int64_t line, int64_t col, int64_t n, ...);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void blink_trace_enter_event(const char* fn, const char* module, const char* file,
+    int64_t line, int64_t col, int64_t n, ...) {
+    flockfile(stderr);
+    blink_trace_put_head("enter", fn, module, blink_trace_frame_depth());
+    fputs(",\"span\":{\"file\":\"", stderr);
+    blink_trace_put_json(stderr, file, -1);
+    fprintf(stderr, "\",\"line\":%lld,\"col\":%lld}", (long long)line, (long long)col);
+    int truncated = 0;
+    va_list ap;
+    va_start(ap, n);
+    for (int64_t i = 0; i < n; i++) {
+        const char* name = va_arg(ap, const char*);
+        const char* value = va_arg(ap, const char*);
+        fputs(i == 0 ? ",\"args\":{\"" : ",\"", stderr);
+        blink_trace_put_json(stderr, name, -1);
+        fputs("\":\"", stderr);
+        truncated |= blink_trace_put_json(stderr, value, BLINK_TRACE_MAX_VALUE_LEN);
+        fputs("\"", stderr);
+    }
+    va_end(ap);
+    if (n > 0) fputs("}", stderr);
+    blink_trace_put_tail(truncated);
+    funlockfile(stderr);
+}
+#endif
+
+/* Whether the exit event of the innermost traced call prints. */
+BLINK_RT_FN int blink_trace_on_exit(void);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN int blink_trace_on_exit(void) {
+    if (!__blink_trace.active || !__blink_trace.event_exit) return 0;
+    int64_t depth = __blink_trace_frame_top - 1;
+    if (depth < 0 || depth >= __blink_trace_frame_cap) return 0;
+    return __blink_trace_frames[depth].matched && blink_trace_under_limit();
+}
+#endif
+
+/* The exit event, after its gate. A NULL value is the exit of a function with no result. */
+BLINK_RT_FN void blink_trace_exit_event(const char* fn, const char* module, const char* value);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void blink_trace_exit_event(const char* fn, const char* module, const char* value) {
+    int64_t depth = blink_trace_frame_depth();
+    int64_t duration = blink_trace_ts_us() - __blink_trace_frames[depth].enter_ts;
+    flockfile(stderr);
+    blink_trace_put_head("exit", fn, module, depth);
+    fprintf(stderr, ",\"duration_us\":%lld,\"return\":\"", (long long)duration);
+    int truncated = blink_trace_put_json(stderr, value ? value : "()", BLINK_TRACE_MAX_VALUE_LEN);
+    fputs("\"", stderr);
+    blink_trace_put_tail(truncated);
+    funlockfile(stderr);
+}
+#endif
+
+/* Pops the call, at each exit of a traced function. */
+BLINK_RT_FN void blink_trace_fn_leave(void);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void blink_trace_fn_leave(void) {
+    if (__blink_trace.active && __blink_trace_frame_top > 0) __blink_trace_frame_top--;
 }
 #endif
 

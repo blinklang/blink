@@ -1,0 +1,161 @@
+// cg_trace.bl: the enter and exit events of a traced function (§8.15).
+//
+// A unit built with --trace calls the runtime tracer at the start of each traced body and at
+// each of its exits. A unit built without it holds no trace code at all, so a plain build
+// pays nothing at run time. The runtime keeps the call stack, so a body declares no locals
+// for it: blink_trace_fn_enter pushes the call and blink_trace_fn_leave pops it, whether or
+// not the filters print the events.
+//
+// Each event renders its values only after the runtime says the event prints, so a call the
+// filters leave out pays for no Display call.
+//
+// A body is traced when it is a top-level fn of the program's own package, and when each
+// value its events show has a Display rendering. The driver arms a body before it lowers
+// it, and lower_fn takes the arm, so the closures a body queued, which lower after it,
+// carry no trace calls of that body.
+
+import std.path.{path_stem}
+import ast.{NodeKind}
+import parser.{node_kind, node_module, node_name, node_params, node_type_ann, sublist_get, sublist_length}
+import typecheck.{TyKind, TYPE_BOOL, TYPE_INT, TYPE_STR, TYPE_VOID, tc_module_in_entry_package, tc_resolve, tc_tid_kind}
+import layout.{LayoutRecord, Position, layout_of, tid_of_node}
+import cname.{c_local_name, c_runtime_helper, c_str_const}
+import ir.{ir_block, ir_call_runtime, ir_col, ir_const, ir_expr_stmt, ir_if, ir_line_text, ir_var_ref}
+import diagnostics.{Diag, diag_file_for_node}
+import cg_reg.{cg_reg_impl_of}
+import cg_expr.{cg_expr_can_display, cg_expr_display_text, cg_expr_pending_count, cg_expr_take_pending, x_layout_checked, x_stopped}
+
+// on: the unit is built with --trace. armed: the declaration the driver will lower next, or
+// -1. traced: the body being lowered is traced, and fn_name and module name its events.
+type TraceUnit {
+    on: Bool = false
+    armed: Int = -1
+    traced: Bool = false
+    fn_name: Str = ""
+    module: Str = ""
+}
+
+let mut tr_unit = TraceUnit {}
+
+pub fn cg_trace_set(on: Bool) { tr_unit = TraceUnit { on: on } }
+
+pub fn cg_trace_on() -> Bool { tr_unit.on }
+
+// The driver arms each top-level fn before it lowers the body. A method, a test block and a
+// derived operation are never armed.
+pub fn cg_trace_arm(decl: Int) {
+    if !tr_unit.on || cg_reg_impl_of(decl) >= 0 || node_kind(decl) != NodeKind.FnDef { return }
+    tr_unit = TraceUnit { on: true, armed: decl }
+}
+
+// Takes the arm when it names this body, and answers the statements that open the body:
+// the push, and the enter event when it prints. None when the body is not traced.
+pub fn cg_trace_body_enter(fn_node: Int) -> List[Int] ! Diag.Report {
+    let armed = tr_unit.armed == fn_node
+    tr_unit = TraceUnit { on: tr_unit.on }
+    if !armed || !tr_traceable(fn_node) { return [] }
+    let module = tr_module_name(fn_node)
+    let fn_name = "{module}.{node_name(fn_node)}"
+    let mut args = [tr_text(fn_node, fn_name), tr_text(fn_node, module),
+        tr_text(fn_node, diag_file_for_node(fn_node)), tr_int(fn_node, ir_line_text(fn_node)),
+        tr_int(fn_node, "{ir_col(fn_node)}")]
+    let mark = cg_expr_pending_count()
+    let params = node_params(fn_node)
+    let n = if params == -1 { 0 } else { sublist_length(params) }
+    args.push(tr_int(fn_node, "{n}"))
+    let mut i = 0
+    while i < n {
+        let p = sublist_get(params, i)
+        let tid = tid_of_node(p)
+        let rec = tr_local(tid, p)
+        if x_stopped(rec) { return [] }
+        let text = cg_expr_display_text(p, tid, ir_var_ref(tid, p, rec.c_spelling, c_local_name(node_name(p)), rec.slot_form))
+        if text < 0 { return [] }
+        args.push(tr_text(p, node_name(p)))
+        args.push(text)
+        i = i + 1
+    }
+    let mut event = cg_expr_take_pending(mark)
+    event.push(tr_call(fn_node, TYPE_VOID, "trace_enter_event", args))
+    let gate = tr_call_value(fn_node, TYPE_BOOL, "trace_fn_enter", [tr_text(fn_node, fn_name), tr_text(fn_node, module)])
+    tr_unit = TraceUnit { on: true, traced: true, fn_name: fn_name, module: module }
+    [ir_if(fn_node, gate, ir_block(fn_node, event), -1)]
+}
+
+// The body has lowered: nothing after it is the traced body.
+pub fn cg_trace_body_leave() { tr_unit = TraceUnit { on: tr_unit.on } }
+
+// Whether the body being lowered is traced.
+pub fn cg_trace_body_traced() -> Bool { tr_unit.traced }
+
+// The statements before an exit with a value, which `value` reads. None when the body is
+// not traced.
+pub fn cg_trace_exit_value(node: Int, tid: Int, value: Int) -> List[Int] ! Diag.Report {
+    if !cg_trace_body_traced() { return [] }
+    let mark = cg_expr_pending_count()
+    let text = cg_expr_display_text(node, tid, value)
+    if text < 0 { return [] }
+    tr_exit(node, cg_expr_take_pending(mark), text)
+}
+
+// The statements before an exit with no value. None when the body is not traced.
+pub fn cg_trace_exit_void(node: Int) -> List[Int] ! Diag.Report {
+    if !cg_trace_body_traced() { return [] }
+    tr_exit(node, [], tr_text(node, "()"))
+}
+
+fn tr_exit(node: Int, render: List[Int], text: Int) -> List[Int] ! Diag.Report {
+    let mut event = render
+    event.push(tr_call(node, TYPE_VOID, "trace_exit_event", [tr_text(node, tr_unit.fn_name), tr_text(node, tr_unit.module), text]))
+    let gate = tr_call_value(node, TYPE_BOOL, "trace_on_exit", [])
+    [ir_if(node, gate, ir_block(node, event), -1), tr_call(node, TYPE_VOID, "trace_fn_leave", [])]
+}
+
+// A body whose events would show a value with no Display rendering is not traced: the text
+// such a value shows is not settled yet.
+fn tr_traceable(fn_node: Int) -> Bool ! Diag.Report {
+    if !tc_module_in_entry_package(node_module(fn_node)) { return false }
+    let params = node_params(fn_node)
+    let mut i = 0
+    while params != -1 && i < sublist_length(params) {
+        let p = sublist_get(params, i)
+        let tid = tid_of_node(p)
+        if tid < 0 || !cg_expr_can_display(p, tid) { return false }
+        i = i + 1
+    }
+    let ann = node_type_ann(fn_node)
+    if ann < 0 { return true }
+    let rt = tid_of_node(ann)
+    if rt < 0 { return false }
+    let k = tc_tid_kind(tc_resolve(rt))
+    k == TyKind.Void || k == TyKind.Never || cg_expr_can_display(ann, rt)
+}
+
+// The module an event names. The entry file's module is the package, which takes the name
+// of the file (§8.15.7 names a fn of main.bl `main.lower`).
+fn tr_module_name(fn_node: Int) -> Str {
+    let m = node_module(fn_node)
+    if m == "" || m == "__main__" { path_stem(diag_file_for_node(fn_node)) } else { m }
+}
+
+fn tr_local(tid: Int, node: Int) -> LayoutRecord ! Diag.Report {
+    x_layout_checked(layout_of(tid, Position.Local), node, "UnspellableTracedValue",
+        "a traced value has no C layout", "monomorphisation must resolve every type codegen reads; this is a compiler bug")
+}
+
+fn tr_text(span: Int, text: Str) -> Int {
+    ir_const(TYPE_STR, span, layout_of(TYPE_STR, Position.Local).c_spelling, c_str_const(text))
+}
+
+fn tr_int(span: Int, literal: Str) -> Int {
+    ir_const(TYPE_INT, span, layout_of(TYPE_INT, Position.Local).c_spelling, literal)
+}
+
+fn tr_call_value(span: Int, tid: Int, helper: Str, args: List[Int]) -> Int {
+    let rec = layout_of(tid, Position.Return)
+    ir_call_runtime(tid, span, rec.c_spelling, c_runtime_helper(helper), rec.slot_form, args)
+}
+
+fn tr_call(span: Int, tid: Int, helper: Str, args: List[Int]) -> Int {
+    ir_expr_stmt(span, tr_call_value(span, tid, helper, args))
+}

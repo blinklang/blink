@@ -1,0 +1,258 @@
+// A program built with --trace writes an `enter` and an `exit` event for each call of a traced
+// function, as NDJSON on stderr (§8.15). Depth 0 is the top level, so `main` is at depth 0 and
+// each call it makes is at depth 1. The filters of §8.15.5 select the events, a value longer
+// than 200 characters is cut with `"truncated":true`, and the program's stdout does not
+// change. A build without --trace holds no trace code.
+
+import compile_test_helpers
+import std.process.{ProcessResult, ChildEnd}
+import std.json.{json_clear, json_parse, json_get, json_as_str, json_as_int, json_as_bool, json_len}
+
+let TRACE_SRC = "type P \{ x: Int, y: Int }
+impl Display for P \{
+    fn fmt(self, sb: StringBuilder) \{ sb.write(\"P(\{self.x},\{self.y})\") }
+}
+fn fact(n: Int) -> Int \{
+    if n <= 1 \{ return 1 }
+    n * fact(n - 1)
+}
+fn show(label: Str, p: P) \{
+    io.println(\"\{label} \{p}\")
+}
+fn echo(s: Str) -> Str \{ s }
+fn main() \{
+    io.println(fact(3))
+    show(\"at\", P \{ x: 1, y: 2 })
+    let mut big = \"\"
+    let mut i = 0
+    while i < 300 \{
+        big = big.concat(\"a\")
+        i = i + 1
+    }
+    io.println(echo(big).len())
+}
+"
+
+let PANIC_SRC = "fn check(n: Int) -> Int \{
+    if n > 2 \{ panic(\"too big\") }
+    n
+}
+fn main() \{
+    io.println(check(1))
+    io.println(check(3))
+}
+"
+
+let STDOUT = "6\nat P(1,2)\n300\n"
+
+// One trace event. `value` is the return of an exit, or the args of an enter as
+// `name=value` pairs joined by a space.
+type Ev {
+    event: Str
+    fn_name: Str
+    module: Str
+    depth: Int
+    ts: Int
+    value: Str
+    truncated: Bool
+    has_span: Bool
+    has_duration: Bool
+}
+
+fn build_traced(src: Str, stem: Str) -> Str ! FS.Write, Process.Spawn, Env.Read {
+    let dir = compile_test_helpers.scratch_root()
+    let path = "{dir}/{stem}.bl"
+    let bin = "{dir}/{stem}_bin"
+    fs.write(path, src).unwrap()
+    let r = process.run("build/blink", ["build", "--trace", path, "-o", bin]).unwrap()
+    assert_eq(r.err_out, "")
+    assert(r.success())
+    compile_test_helpers.sh("rm -f {path} {bin}.c")
+    bin
+}
+
+fn run_bin(bin: Str, args: List[Str]) -> ProcessResult ! Process.Spawn {
+    process.run(bin, args).unwrap()
+}
+
+fn str_field(obj: Int, key: Str) -> Str {
+    let n = json_get(obj, key)
+    if n < 0 { "" } else { json_as_str(n) }
+}
+
+fn args_text(obj: Int) -> Str {
+    let args = json_get(obj, "args")
+    if args < 0 { return "" }
+    let mut parts: List[Str] = []
+    for key in ["n", "label", "p", "s"] {
+        let v = json_get(args, key)
+        if v >= 0 { parts.push("{key}={json_as_str(v)}") }
+    }
+    assert_eq(parts.len(), json_len(args))
+    parts.join(" ")
+}
+
+// The events on stderr. Each line that starts with `{` must parse as one JSON object.
+fn events(text: Str) -> List[Ev] {
+    let mut out: List[Ev] = []
+    for line in text.split("\n") {
+        if !line.starts_with("\{") { continue }
+        json_clear()
+        let obj = json_parse(line)
+        assert(obj >= 0)
+        let event = str_field(obj, "event")
+        let value = if event == "exit" { str_field(obj, "return") } else { args_text(obj) }
+        let t = json_get(obj, "truncated")
+        out.push(Ev {
+            event: event,
+            fn_name: str_field(obj, "fn"),
+            module: str_field(obj, "module"),
+            depth: json_as_int(json_get(obj, "depth")),
+            ts: json_as_int(json_get(obj, "ts_us")),
+            value: value,
+            truncated: t >= 0 && json_as_bool(t) == 1,
+            has_span: json_get(obj, "span") >= 0,
+            has_duration: json_get(obj, "duration_us") >= 0,
+        })
+    }
+    out
+}
+
+// Each event as `event fn depth`, one per line.
+fn shape(evs: List[Ev]) -> Str {
+    let mut lines: List[Str] = []
+    for e in evs { lines.push("{e.event} {e.fn_name} {e.depth}") }
+    lines.join("\n")
+}
+
+fn traced_with(bin: Str, filter: Str) -> List[Ev] ! Process.Spawn {
+    let r = run_bin(bin, ["--trace={filter}"])
+    assert_eq(r.out, STDOUT)
+    assert(r.success())
+    events(r.err_out)
+}
+
+test "each traced call writes an enter and an exit event at its depth" {
+    let bin = build_traced(TRACE_SRC, "trace_fn_ev_all")
+    let r = run_bin(bin, ["--trace"])
+    assert_eq(r.out, STDOUT)
+    assert(r.success())
+    let evs = events(r.err_out)
+    let m = "trace_fn_ev_all"
+    assert_eq(shape(evs), [
+        "enter {m}.main 0",
+        "enter {m}.fact 1", "enter {m}.fact 2", "enter {m}.fact 3",
+        "exit {m}.fact 3", "exit {m}.fact 2", "exit {m}.fact 1",
+        "enter {m}.show 1", "exit {m}.show 1",
+        "enter {m}.echo 1", "exit {m}.echo 1",
+        "exit {m}.main 0",
+    ].join("\n"))
+    let mut last = 0
+    for e in evs {
+        assert_eq(e.module, m)
+        assert(e.ts >= last)
+        last = e.ts
+        assert_eq(e.has_span, e.event == "enter")
+        assert_eq(e.has_duration, e.event == "exit")
+    }
+    assert_eq(evs.get(0).unwrap().value, "")
+    assert_eq(evs.get(1).unwrap().value, "n=3")
+    assert_eq(evs.get(3).unwrap().value, "n=1")
+    assert_eq(evs.get(4).unwrap().value, "1")
+    assert_eq(evs.get(6).unwrap().value, "6")
+    assert_eq(evs.get(7).unwrap().value, "label=at p=P(1,2)")
+    assert_eq(evs.get(8).unwrap().value, "()")
+    assert_eq(evs.get(11).unwrap().value, "()")
+    compile_test_helpers.sh("rm -f {bin}")
+}
+
+test "a value longer than 200 characters is cut and the event says so" {
+    let bin = build_traced(TRACE_SRC, "trace_fn_ev_cut")
+    let evs = traced_with(bin, "fn:echo")
+    assert_eq(evs.len(), 2)
+    let mut cut = ""
+    while cut.len() < 200 { cut = cut.concat("a") }
+    assert_eq(evs.get(0).unwrap().value, "s={cut}")
+    assert(evs.get(0).unwrap().truncated)
+    assert_eq(evs.get(1).unwrap().value, cut)
+    assert(evs.get(1).unwrap().truncated)
+    let short = traced_with(bin, "fn:fact")
+    for e in short { assert(!e.truncated) }
+    compile_test_helpers.sh("rm -f {bin}")
+}
+
+test "the filters select events by function, module, depth and event type" {
+    let bin = build_traced(TRACE_SRC, "trace_fn_ev_filter")
+    let m = "trace_fn_ev_filter"
+    let facts = shape(traced_with(bin, "fn:fact"))
+    assert_eq(facts, [
+        "enter {m}.fact 1", "enter {m}.fact 2", "enter {m}.fact 3",
+        "exit {m}.fact 3", "exit {m}.fact 2", "exit {m}.fact 1",
+    ].join("\n"))
+    assert_eq(shape(traced_with(bin, "fn:{m}.fact")), facts)
+    assert_eq(shape(traced_with(bin, "fn:show+echo")), [
+        "enter {m}.show 1", "exit {m}.show 1", "enter {m}.echo 1", "exit {m}.echo 1",
+    ].join("\n"))
+    assert_eq(traced_with(bin, "module:{m}").len(), 12)
+    assert_eq(traced_with(bin, "module:elsewhere").len(), 0)
+    for e in traced_with(bin, "depth:1") { assert(e.depth <= 1) }
+    assert_eq(traced_with(bin, "depth:1").len(), 8)
+    assert_eq(shape(traced_with(bin, "fn:fact,depth:2")), [
+        "enter {m}.fact 1", "enter {m}.fact 2", "exit {m}.fact 2", "exit {m}.fact 1",
+    ].join("\n"))
+    let exits = traced_with(bin, "event:exit")
+    assert_eq(exits.len(), 6)
+    for e in exits { assert_eq(e.event, "exit") }
+    assert_eq(traced_with(bin, "event:enter,fn:main").len(), 1)
+    compile_test_helpers.sh("rm -f {bin}")
+}
+
+test "BLINK_TRACE takes the filter syntax of --trace" {
+    let bin = build_traced(TRACE_SRC, "trace_fn_ev_env")
+    let r: ProcessResult = process.run("env", ["BLINK_TRACE=fn:show", bin]).unwrap()
+    assert_eq(r.out, STDOUT)
+    assert(r.success())
+    assert_eq(shape(events(r.err_out)), "enter trace_fn_ev_env.show 1\nexit trace_fn_ev_env.show 1")
+    compile_test_helpers.sh("rm -f {bin}")
+}
+
+test "a traced build run without --trace writes no events" {
+    let bin = build_traced(TRACE_SRC, "trace_fn_ev_quiet")
+    let r = run_bin(bin, [])
+    assert_eq(r.out, STDOUT)
+    assert_eq(r.err_out, "")
+    assert(r.success())
+    compile_test_helpers.sh("rm -f {bin}")
+}
+
+test "a panic in a traced function keeps every event line whole" {
+    let bin = build_traced(PANIC_SRC, "trace_fn_ev_panic")
+    let r = run_bin(bin, ["--trace"])
+    assert_eq(r.end, ChildEnd.Exited(101))
+    assert_eq(r.out, "1\n")
+    assert(r.err_out.contains("too big"))
+    let evs = events(r.err_out)
+    assert(evs.len() >= 4)
+    assert_eq(evs.get(evs.len() - 1).unwrap().value, "n=3")
+    compile_test_helpers.sh("rm -f {bin}")
+}
+
+test "a build without --trace has no trace calls" {
+    let plain = compile_test_helpers.emit_c_via_cli(TRACE_SRC, "trace_fn_ev_plain", "")
+    assert(plain != "")
+    assert(!plain.contains("blink_trace_"))
+    let traced = compile_test_helpers.emit_c_via_cli(TRACE_SRC, "trace_fn_ev_traced", "--trace")
+    assert(traced.contains("blink_trace_fn_enter("))
+    assert(traced.contains("blink_trace_fn_leave()"))
+}
+
+test "blink run hands the filters of --trace=<filters> to the program" {
+    let dir = compile_test_helpers.scratch_root()
+    let path = "{dir}/trace_fn_ev_run.bl"
+    fs.write(path, TRACE_SRC).unwrap()
+    let r = process.run("build/blink", ["run", path, "--trace=fn:show"]).unwrap()
+    assert_eq(r.out, STDOUT)
+    assert(r.success())
+    assert_eq(shape(events(r.err_out)), "enter trace_fn_ev_run.show 1\nexit trace_fn_ev_run.show 1")
+    compile_test_helpers.sh("rm -f {path}")
+}
