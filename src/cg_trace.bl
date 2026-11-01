@@ -16,14 +16,16 @@
 // A write to a whole `let mut` binding, local or module-level, in a traced body writes a
 // state event with the binding's value after the write.
 //
-// A body is traced when it is a top-level fn of the program's own package. The driver arms
-// a body before it lowers it, and lower_fn takes the arm, so the closures a body queued,
-// which lower after it, carry no trace calls of that body.
+// A body is traced when it is a fn or a method of the program or of a package it uses, and
+// not of the std library (§8.15.8). A method that the compiler writes, such as the enter and
+// exit of the BlockHandler impl that an `impl Closeable` gets, is no frame: no source text
+// spells it. The driver arms a body before it lowers it, and lower_fn takes the arm, so the
+// closures a body queued, which lower after it, carry no trace calls of that body.
 
 import std.path.{path_stem}
 import ast.{NodeKind}
-import parser.{node_kind, node_module, node_name, node_params, sublist_get, sublist_length}
-import typecheck.{TYPE_BOOL, TYPE_INT, TYPE_STR, TYPE_VOID, tc_module_in_entry_package, tc_type_str}
+import parser.{impl_provided_by_closeable, node_kind, node_module, node_name, node_params, sublist_get, sublist_length}
+import typecheck.{TYPE_BOOL, TYPE_INT, TYPE_STR, TYPE_VOID, tc_module_in_std, tc_type_str}
 import layout.{LayoutRecord, Position, layout_of, tid_of_node}
 import cname.{c_local_name, c_mint_local, c_runtime_helper, c_str_const}
 import ir.{ir_block, ir_call_runtime, ir_col, ir_const, ir_expr_stmt, ir_if, ir_let, ir_line_text, ir_trace_frame, ir_var_ref}
@@ -48,10 +50,10 @@ pub fn cg_trace_set(on: Bool) { tr_unit = TraceUnit { on: on } }
 
 pub fn cg_trace_on() -> Bool { tr_unit.on }
 
-// The driver arms each top-level fn before it lowers the body. A method, a test block and a
+// The driver arms each fn and each impl method before it lowers the body. A test block and a
 // derived operation are never armed.
 pub fn cg_trace_arm(decl: Int) {
-    if !tr_unit.on || cg_reg_impl_of(decl) >= 0 || node_kind(decl) != NodeKind.FnDef { return }
+    if !tr_unit.on || node_kind(decl) != NodeKind.FnDef { return }
     tr_unit = TraceUnit { on: true, armed: decl }
 }
 
@@ -60,9 +62,9 @@ pub fn cg_trace_arm(decl: Int) {
 pub fn cg_trace_body_enter(fn_node: Int) -> List[Int] ! Diag.Report {
     let armed = tr_unit.armed == fn_node
     tr_unit = TraceUnit { on: tr_unit.on }
-    if !armed || !tc_module_in_entry_package(node_module(fn_node)) { return [] }
+    if !armed || tc_module_in_std(node_module(fn_node)) || tr_compiler_written(fn_node) { return [] }
     let module = tr_module_name(fn_node)
-    let fn_name = "{module}.{node_name(fn_node)}"
+    let fn_name = tr_frame_name(fn_node, module)
     let mut args = [tr_text(fn_node, fn_name), tr_text(fn_node, module),
         tr_text(fn_node, diag_file_for_node(fn_node)), tr_int(fn_node, ir_line_text(fn_node)),
         tr_int(fn_node, "{ir_col(fn_node)}")]
@@ -167,6 +169,24 @@ fn tr_muted(span: Int, render: List[Int]) -> List[Int] {
 fn tr_module_name(fn_node: Int) -> Str {
     let m = node_module(fn_node)
     if m == "" || m == "__main__" { path_stem(diag_file_for_node(fn_node)) } else { m }
+}
+
+// `module.function`, or `module.Type.method` for a method (§8.15.8). The type is its bare
+// name, as a name holds no bracket and the module already says where the code is.
+fn tr_compiler_written(fn_node: Int) -> Bool {
+    let im = cg_reg_impl_of(fn_node)
+    im >= 0 && impl_provided_by_closeable(im)
+}
+
+// The impl may write its receiver qualified or with type args, and the frame names the type
+// by its bare name (§8.15.8).
+fn tr_frame_name(fn_node: Int, module: Str) -> Str {
+    let im = cg_reg_impl_of(fn_node)
+    if im < 0 { return "{module}.{node_name(fn_node)}" }
+    let written = node_name(im)
+    let head = written.split("[").get(0) ?? written
+    let parts = head.split(".")
+    "{module}.{parts.get(parts.len() - 1) ?? head}.{node_name(fn_node)}"
 }
 
 fn tr_local(tid: Int, node: Int) -> LayoutRecord ! Diag.Report {

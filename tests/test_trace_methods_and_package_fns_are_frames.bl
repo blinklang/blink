@@ -1,0 +1,91 @@
+// A method is a frame named `module.Type.method`, and a fn of a package the program uses is a
+// frame named `module.function`, at one more depth than its caller (§8.15.8). A method that
+// `@derive` makes is not a frame, and neither is a fn of the std library. A `fn:` filter
+// matches a method by its last segments, so `fn:Point.norm` selects `main.Point.norm`.
+
+import compile_test_helpers
+import std.json.{json_clear, json_parse, json_get, json_as_str, json_as_int}
+
+let PAL = #"pub fn dbl(n: Int) -> Int { twice(n) }
+fn twice(n: Int) -> Int { n + n }
+"#
+
+let MAIN = #"import pal
+
+@derive(Eq)
+type Point { x: Int, y: Int }
+trait Shape {
+    fn norm(self) -> Int
+    fn area(self) -> Int
+}
+impl Shape for Point {
+    fn norm(self) -> Int { self.x * self.x + self.y * self.y }
+    fn area(self) -> Int { self.x * self.y }
+}
+fn main() {
+    let p = Point { x: 3, y: 4 }
+    let same = p == Point { x: 0, y: 0 }
+    io.println("{p.norm()} {p.area()} {pal.dbl(2)} {same} {"ab".len()}")
+}
+"#
+
+let STDOUT = "25 12 4 false 2\n"
+
+// Each enter and exit event as `event fn depth`.
+fn lines_of(err_out: Str) -> List[Str] {
+    let mut out: List[Str] = []
+    for line in err_out.split("\n") {
+        if !line.starts_with("\{") { continue }
+        json_clear()
+        let obj = json_parse(line)
+        assert(obj >= 0)
+        let event = json_as_str(json_get(obj, "event"))
+        if event != "enter" && event != "exit" { continue }
+        out.push("{event} {json_as_str(json_get(obj, "fn"))} {json_as_int(json_get(obj, "depth"))}")
+    }
+    out
+}
+
+fn app(base: Str) -> Str ! FS.Write, Process.Spawn {
+    compile_test_helpers.sh("rm -rf {base} && mkdir -p {base}/pal/src {base}/app/src")
+    fs.write("{base}/pal/blink.toml", "[package]\nname = \"pal\"\nversion = \"0.1.0\"\n").unwrap()
+    fs.write("{base}/pal/src/pal.bl", PAL).unwrap()
+    fs.write("{base}/app/blink.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[dependencies]\npal = \{ path = \"../pal\" \}\n").unwrap()
+    fs.write("{base}/app/src/main.bl", MAIN).unwrap()
+    "{base}/app"
+}
+
+fn traced(dir: Str, filter: Str) -> List[Str] ! Process.Spawn {
+    let r = process.run("sh", ["-c", "cd {dir} && BLINK_TRACE={filter} ./main_bin"]).unwrap()
+    assert_eq(r.out, STDOUT)
+    assert(r.success())
+    lines_of(r.err_out)
+}
+
+test "methods and package fns write enter and exit events under their frame names" {
+    let blink_root = compile_test_helpers.sh("pwd -P")
+    let base = "{compile_test_helpers.scratch_root()}/trace_method_frames"
+    let dir = app(base)
+    let b = process.run("sh", ["-c", "cd {dir} && {blink_root}/build/blink build --trace src/main.bl -o main_bin 2>&1"]).unwrap()
+    assert_eq("{b.success()} {b.out}", "true {b.out}")
+    assert_eq(traced(dir, "all").join("\n"), [
+        "enter main.main 0",
+        "enter main.Point.norm 1",
+        "exit main.Point.norm 1",
+        "enter main.Point.area 1",
+        "exit main.Point.area 1",
+        "enter pal.dbl 1",
+        "enter pal.twice 2",
+        "exit pal.twice 2",
+        "exit pal.dbl 1",
+        "exit main.main 0",
+    ].join("\n"))
+    assert_eq(traced(dir, "fn:Point.norm").join("\n"), "enter main.Point.norm 1\nexit main.Point.norm 1")
+    assert_eq(traced(dir, "module:pal").join("\n"), [
+        "enter pal.dbl 1",
+        "enter pal.twice 2",
+        "exit pal.twice 2",
+        "exit pal.dbl 1",
+    ].join("\n"))
+    compile_test_helpers.sh("rm -rf {base}")
+}
