@@ -3094,6 +3094,20 @@ BLINK_RT_FN const char* blink_str_format(const char* fmt, ...) {
 }
 #endif
 
+/* The panic the compiler raises: its message, its file and its line, kept apart up to here so
+   the runtime is what joins them. No source line is 0 or less, so such a line names a node the
+   compiler built. The joined sentence is sized to fit, so the uncaught report prints a long
+   message whole; an armed assert_panics and the test runner keep only what fits their buffers. */
+BLINK_RT_FN void __blink_panic_dispatch_at(const char* what, const char* file, int64_t line);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void __blink_panic_dispatch_at(const char* what, const char* file, int64_t line) {
+    if (line <= 0) {
+        __blink_panic_dispatch(blink_str_format("panic: %s at %s:<synthesized>", what, file));
+    }
+    __blink_panic_dispatch(blink_str_format("panic: %s at %s:%lld", what, file, (long long)line));
+}
+#endif
+
 BLINK_RT_FN int blink_str_eq(const char* a, const char* b);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN int blink_str_eq(const char* a, const char* b) {

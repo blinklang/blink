@@ -64,7 +64,7 @@ fn check_of(name: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, T
     let check = pre.get(1).unwrap()
     assert_kind("{name}: check", check, IrKind.If)
     assert_eq_str("{name}: check", shape(check),
-        "If(CallRuntime(VarRef, VarRef, Unary(VarRef)), Block(Panic(CallRuntime(Const, Cast(VarRef), Cast(VarRef)))))")
+        "If(CallRuntime(VarRef, VarRef, Unary(VarRef)), Block(Panic(CallRuntime(Const, Cast(VarRef), Cast(VarRef)), Const, Const)))")
     assert_verifies("{name}: check verifies", check)
     check
 }
@@ -85,9 +85,22 @@ fn builtin_of(check: Int) -> Str {
     ir_c_name(ir_kid(check, 0))
 }
 
-// What the panic says, before its arguments are substituted.
-fn said_of(check: Int) -> Str {
-    ir_c_name(ir_kid(ir_kid(ir_kid(ir_kid(check, 1), 0), 0), 0))
+// The panic a guard raises: the guard's then block holds it.
+fn panic_of(guard: Int) -> Int {
+    ir_kid(ir_kid(guard, 1), 0)
+}
+
+// What the panic says, before its arguments are substituted. A message with nothing to
+// substitute is the constant itself.
+fn said_of(guard: Int) -> Str {
+    let what = ir_kid(panic_of(guard), 0)
+    if ir_kind(what) == IrKind.CallRuntime { return ir_c_name(ir_kid(what, 0)) }
+    ir_c_name(what)
+}
+
+// The line the panic names, which travels apart from what it says.
+fn line_of(guard: Int) -> Str {
+    ir_c_name(ir_kid(panic_of(guard), 2))
 }
 
 test "an addition declares its result, checks it, and reads it back" {
@@ -134,11 +147,11 @@ test "the range checked is the range of the declared result, so a narrow type is
 test "the panic names the type, the operation and both operands" {
     let said = said_of(check_of("plus"))
     // A Str constant is its length header and then its text, so the text starts mid-token.
-    let opens_panic = said.starts_with("(\"") && said.contains("\" \"panic: ")
-    if !opens_panic { io.println("FAIL: panic says '{said}'") }
-    assert(opens_panic)
-    if !said.contains(".bl:4") { io.println("FAIL: panic names no line: '{said}'") }
-    assert(said.contains(".bl:4"))
+    // The runtime joins the words with the file and the line, so the words hold neither.
+    let words_only = said.starts_with("(\"") && !said.contains("panic: ") && !said.contains(".bl")
+    if !words_only { io.println("FAIL: panic says '{said}'") }
+    assert(words_only)
+    assert_eq_str("the panic names its line", line_of(check_of("plus")), "4")
     if !said.contains("Int") { io.println("FAIL: panic says '{said}'") }
     assert(said.contains("Int"))
     if !said.contains("overflow") { io.println("FAIL: panic says '{said}'") }
@@ -172,10 +185,10 @@ test "a signed division tests the divisor for zero and then the minimum over -1"
     if pre.len() != 2 { io.println("FAIL: signed division hoisted {pre.len()} statements, want 2") }
     assert_eq(pre.len(), 2)
     assert_eq_str("the divisor is tested for zero", shape(pre.get(0).unwrap()),
-        "If(Binary(VarRef, Const), Block(Panic(CallRuntime(Const))))")
+        "If(Binary(VarRef, Const), Block(Panic(Const, Const, Const)))")
     let pair = pre.get(1).unwrap()
     assert_eq_str("the pair is tested for the minimum over -1", shape(pair),
-        "If(Binary(Binary(VarRef, Const), Binary(VarRef, Const)), Block(Panic(CallRuntime(Const, Cast(VarRef), Cast(VarRef)))))")
+        "If(Binary(Binary(VarRef, Const), Binary(VarRef, Const)), Block(Panic(CallRuntime(Const, Cast(VarRef), Cast(VarRef)), Const, Const)))")
     assert_eq_str("the minimum is the type's own", ir_c_name(ir_kid(ir_kid(ir_kid(pair, 0), 0), 1)), "INT64_MIN")
     assert_eq_str("the divisor", ir_c_name(ir_kid(ir_kid(ir_kid(pair, 0), 1), 1)), "-1")
     let said = said_of(pair)
@@ -195,7 +208,7 @@ test "a division by a literal -1 needs only the minimum test" {
     assert_eq(pre.len(), 2)
     assert_eq_str("the literal is held once", shape(pre.get(0).unwrap()), "Let(Const)")
     assert_eq_str("only the pair is tested", shape(pre.get(1).unwrap()),
-        "If(Binary(Binary(VarRef, Const), Binary(VarRef, Const)), Block(Panic(CallRuntime(Const, Cast(VarRef), Cast(VarRef)))))")
+        "If(Binary(Binary(VarRef, Const), Binary(VarRef, Const)), Block(Panic(CallRuntime(Const, Cast(VarRef), Cast(VarRef)), Const, Const)))")
     assert_shape("the operator still divides", quot, "Binary(VarRef, VarRef)")
 }
 
@@ -206,7 +219,7 @@ test "an unsigned division has no minimum to pass, so only the divisor is tested
     let pre = cg_expr_take_pending(mark)
     assert_eq(pre.len(), 1)
     assert_eq_str("the divisor is tested for zero", shape(pre.get(0).unwrap()),
-        "If(Binary(VarRef, Const), Block(Panic(CallRuntime(Const))))")
+        "If(Binary(VarRef, Const), Block(Panic(Const, Const, Const)))")
     let said = said_of(pre.get(0).unwrap())
     if !said.contains("U8 division by zero") { io.println("FAIL: division panic says '{said}'") }
     assert(said.contains("U8 division by zero"))
@@ -222,7 +235,7 @@ test "a negation checks zero minus the operand into a declared result" {
     assert_eq_str("the result is declared", shape(pre.get(0).unwrap()), "Let")
     let check = pre.get(1).unwrap()
     assert_eq_str("the check", shape(check),
-        "If(CallRuntime(Const, VarRef, Unary(VarRef)), Block(Panic(CallRuntime(Const, Cast(VarRef)))))")
+        "If(CallRuntime(Const, VarRef, Unary(VarRef)), Block(Panic(CallRuntime(Const, Cast(VarRef)), Const, Const)))")
     assert_eq_str("subtraction from zero", builtin_of(check), "__builtin_sub_overflow")
     let said = said_of(check)
     if !said.contains("Int overflow in negation") { io.println("FAIL: negation panic says '{said}'") }

@@ -114,7 +114,7 @@ row names the helper in `cg_emit.bl` or the kind in `cg_print.bl` that writes it
 | Container spread | `extend(c, source);` in the place of the append for that kid, where `extend` is the kid's c_name (`blink_list_extend`) and `c` is the container under construction; a `ContainerSpread` anywhere else is the misplaced-kind ICE | `ContainerSpread` under `ContainerNew` |
 | Match | `if (s == a) { } else if (s == b) { } else { }`; a non-name scrutinee binds first | `Switch` |
 | Loop | `while (1) { }` | `Loop` |
-| Panic | `__blink_panic_dispatch(msg); __builtin_unreachable();` | `Panic` |
+| Panic | three kids (message, file, line): `__blink_panic_dispatch_at(what, file, line); __builtin_unreachable();`; one kid (a sentence that names no source place, such as the derive corrupt-tag panic): `__blink_panic_dispatch(msg); __builtin_unreachable();` | `Panic` |
 | main | `GC_INIT`, `blink_map_init_seed`, argc and argv globals, `__blink_ev = blink_ev_default()`, `blink_trace_init` when the driver asks, stdlib globals in a user TU, then `blink_main(&__blink_ev)` | `em_main_shim` |
 
 A match prints as an if chain, not a C `switch`. A `Break` or `Continue` inside an

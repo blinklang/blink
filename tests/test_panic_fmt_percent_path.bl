@@ -1,15 +1,13 @@
-// A source file path containing a literal `%` must be percent-escaped (`%%`)
-// before it is embedded into a printf/vsnprintf FORMAT string for a runtime
-// panic (div/mod/shift/overflow guards). Otherwise the `%` becomes an
-// unmatched conversion spec with no vararg -> UB / garbage / crash.
-// The path arguments passed verbatim to runtime helpers stay raw;
-// only the panic FORMAT strings get the doubling.
+// A source file path containing a literal `%` must never reach a printf/vsnprintf
+// FORMAT string for a panic (div/mod/shift/overflow guards). Otherwise the `%`
+// becomes an unmatched conversion spec with no vararg -> UB / garbage / crash.
+// The panic passes the path to the runtime as a value of its own, and the
+// runtime prints it through `%s`, so the path stays raw and is never escaped.
 // C-emission check (deterministic): a div-by-zero fixture at a `%`-containing
-// path must emit the DOUBLED path into the panic format string, never the raw
-// single-`%` form.
+// path must pass the raw path to the panic entry, and no format holds it.
 import compile_test_helpers
 
-test "panic file path with percent is doubled in emitted C" {
+test "a panic file path with a percent goes to the runtime as a value, not in a format" {
     let dir = "{compile_test_helpers.scratch_root()}/pct%dir_{getpid()}"
     process.run("sh", ["-c", "rm -rf '{dir}'"])?
     process.run("sh", ["-c", "mkdir -p '{dir}'"])?
@@ -27,9 +25,16 @@ test "panic file path with percent is doubled in emitted C" {
     let after = output.byte_slice(idx + marker.byte_len(), output.byte_len())
     let c_path = after.trim_right()
     let c_src = fs.read(c_path).unwrap()
-    // The escaped path lands inside the panic format string as `pct%%dir`.
-    assert(c_src.contains("pct%%dir"))
-    // And the raw single-`%` form must NOT appear in a panic location string.
+    // The panic entry is given the raw path as its file argument.
+    let mut passed_raw = false
+    for line in c_src.split("\n") {
+        if line.contains("__blink_panic_dispatch_at(") && line.contains("/pctfmt_{getpid()}.bl\" + 16)") {
+            passed_raw = line.contains("pct%dir")
+        }
+    }
+    assert(passed_raw)
+    // No string escapes the path for a format, and no panic sentence is built with it.
+    assert(!c_src.contains("pct%%dir"))
     assert(!c_src.contains("at {compile_test_helpers.scratch_root()}/pct%dir"))
     process.run("sh", ["-c", "rm -rf '{dir}'"])?
     process.run("sh", ["-c", "rm -f '{c_path}'"])?

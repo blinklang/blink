@@ -304,8 +304,20 @@ BLINK_RT_FN int blink_channel_send_open(blink_channel* ch, const void* value) {
 }
 #endif
 
-/* A send on a closed channel is a bug in the program, so it panics with the text codegen
-   wrote at the call site, which names the send's source location. */
+/* A send on a closed channel is a bug in the program, so it panics. The compiler hands the
+   panic's message, the send's file and its line apart, and the dispatcher joins them, so a
+   send that succeeds builds no sentence. */
+BLINK_RT_FN void blink_channel_send_value_parts(blink_channel* ch, const void* value, const char* what,
+                                                const char* file, int64_t line);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void blink_channel_send_value_parts(blink_channel* ch, const void* value, const char* what,
+                                                const char* file, int64_t line) {
+    if (!blink_channel_send_open(ch, value)) __blink_panic_dispatch_at(what, file, line);
+}
+#endif
+
+/* The two entries below are for code built by a compiler from before the parts entry above:
+   one takes the whole sentence, the other a format it fills with the file and line. */
 BLINK_RT_FN void blink_channel_send_value(blink_channel* ch, const void* value, const char* closed_panic);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN void blink_channel_send_value(blink_channel* ch, const void* value, const char* closed_panic) {
@@ -313,9 +325,6 @@ BLINK_RT_FN void blink_channel_send_value(blink_channel* ch, const void* value, 
 }
 #endif
 
-/* The same send where the line is known only when the program runs, read from the table of
-   a split unit. The sentence is built only when the send panics, so a send that succeeds
-   does not pay for it. */
 BLINK_RT_FN void blink_channel_send_value_at(blink_channel* ch, const void* value, const char* closed_format,
                                              const char* file, int64_t line);
 #ifndef BLINK_RUNTIME_DECLS_ONLY

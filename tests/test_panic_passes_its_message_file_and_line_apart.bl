@@ -1,0 +1,170 @@
+// A panic the compiler raises hands the runtime its message, its file and its line as three
+// values, so the runtime can give each one to whatever reads the panic. The runtime joins them
+// into the one sentence a reader sees, "panic: <message> at <file>:<line>", and a line of 0 or
+// less, which no source line has, reads "<synthesized>". The sentence a panic says, and what a
+// test that catches it reads, stay as they were.
+
+import compile_test_helpers.{compile_and_emit_c, compile_and_run, compile_and_run_test_json, scratch_root}
+
+// The C line that holds needle and names the fixture's own file, or "" when none does. The
+// stdlib bodies the program calls are in the same C, with panics of their own.
+fn line_holding(c: Str, needle: Str) -> Str {
+    for line in c.split("\n") {
+        if line.contains(needle) && line.contains("_panic_at_sites.bl\"") { return line }
+    }
+    ""
+}
+
+fn sites_source() -> Str {
+    [
+        "@requires(n > 0)",
+        "@verify(fallback: \"runtime\")",
+        "fn positive(n: Int) -> Int \{ n }",
+        "",
+        "fn main() ! IO \{",
+        "    let xs = [1]",
+        "    let zero = xs.len() - 1",
+        "    let big = 9223372036854775807",
+        "    let r: Result[Int, Str] = Err(\"bad\")",
+        "    let o: Option[Int] = None",
+        "    io.println(\"\{10 / zero}\")",
+        "    io.println(\"\{big + xs.len()}\")",
+        "    io.println(\"\{-(big - zero - 9223372036854775807 - 1)}\")",
+        "    io.println(\"\{1 << (zero + 70).to_u32()}\")",
+        "    io.println(\"\{positive(zero)}\")",
+        "    io.println(\"\{r.unwrap()}\")",
+        "    io.println(\"\{o.unwrap()}\")",
+        "    if zero > 5 \{ todo() }",
+        "    if zero > 6 \{ todo(\"later on\") }",
+        "    if zero > 7 \{ unreachable() }",
+        "    panic(\"boom site\")",
+        "}",
+        "",
+    ].join("\n")
+}
+
+test "each panic the compiler raises calls the runtime with its message, file and line apart" {
+    let c = compile_and_emit_c(sites_source(), "_panic_at_sites")
+    assert(c.len() > 0, "the fixture did not compile")
+    // A @requires names the line of the annotation.
+    for site in [
+        ("\"Int division by zero\"", 11),
+        ("\"Int overflow in addition (%lld + %lld)\"", 12),
+        ("\"Int overflow in negation (-(%lld))\"", 13),
+        ("\"shift amount out of range for Int (must be 0..63)\"", 14),
+        ("\"precondition failed: @requires in positive\"", 1),
+        ("\"unwrap called on Err: %s\"", 16),
+        ("\"unwrap called on None\"", 17),
+        ("\"not yet implemented\"", 18),
+        ("\"not yet implemented: %s\"", 19),
+        ("\"entered unreachable code\"", 20),
+        ("\"boom site\"", 21),
+    ] {
+        let (needle, n) = site
+        let line = line_holding(c, needle)
+        assert(line != "", "no C line holds {needle} and the fixture's file as its own value")
+        assert(line.contains("__blink_panic_dispatch_at("), "{needle} is not raised through the dispatcher that takes the parts: {line}")
+        assert(!line.contains("panic: "), "{needle} still builds the sentence in the compiled program: {line}")
+        assert(line.contains("_panic_at_sites.bl\" + 16), {n});"), "{needle} names the wrong line: {line}")
+    }
+}
+
+fn send_source() -> Str {
+    "fn main() \{\n    let ch = channel.new[Int](buffer: 4)\n    ch.close()\n    ch.send(1)\n}\n"
+}
+
+test "a send on a closed channel hands the runtime its message, file and line apart" {
+    let c = compile_and_emit_c(send_source(), "_panic_at_sites_send")
+    assert(c.len() > 0, "the fixture did not compile")
+    let mut line = ""
+    for l in c.split("\n") {
+        if l.contains("\"send on a closed channel\"") && l.contains("_panic_at_sites_send.bl\"") { line = l }
+    }
+    assert(line != "", "no C line holds the send's message and the fixture's file as its own value")
+    assert(line.contains("blink_channel_send_value_parts("), "the send does not hand the runtime its parts: {line}")
+    assert(!line.contains("panic: "), "the send still builds the sentence in the compiled program: {line}")
+    assert(line.contains("_panic_at_sites_send.bl\" + 16), 4)"), "the send names the wrong line: {line}")
+}
+
+// The report each kind of panic gives, whole, with the line it was raised on.
+fn reported(src: Str, tag: Str) -> Str ! FS.Delete, FS.Write, Process.Spawn, FS.Read, Env.Read {
+    let r = compile_and_run(src, tag)
+    assert_eq(r.exit_code, 101, "exit {r.exit_code}: {r.out}{r.err_out}")
+    r.err_out.trim()
+}
+
+test "the report of each panic is the sentence it said before" {
+    let rows = [
+        ("_panic_at_div", "fn main() ! IO \{\n    let z = [1].len() - 1\n    io.println(\"\{10 / z}\")\n}\n", "Int division by zero", 3),
+        ("_panic_at_add", "fn main() ! IO \{\n    let big = 9223372036854775807\n    io.println(\"\{big + [1].len()}\")\n}\n", "Int overflow in addition (9223372036854775807 + 1)", 3),
+        ("_panic_at_none", "fn main() ! IO \{\n    let o: Option[Int] = None\n    io.println(\"\{o.unwrap()}\")\n}\n", "unwrap called on None", 3),
+        ("_panic_at_err", "fn main() ! IO \{\n    let r: Result[Int, Str] = Err(\"bad\")\n    io.println(\"\{r.unwrap()}\")\n}\n", "unwrap called on Err: bad", 3),
+        ("_panic_at_todo", "fn main() \{\n    todo(\"later on\")\n}\n", "not yet implemented: later on", 2),
+        ("_panic_at_unreachable", "fn main() \{\n    unreachable()\n}\n", "entered unreachable code", 2),
+        ("_panic_at_builtin", "fn main() \{\n    panic(\"boom\")\n}\n", "boom", 2),
+        ("_panic_at_requires", "@requires(n > 0)\n@verify(fallback: \"runtime\")\nfn positive(n: Int) -> Int \{ n }\n\nfn main() ! IO \{\n    io.println(\"\{positive([1].len() - 1)}\")\n}\n", "precondition failed: @requires in positive", 1),
+        ("_panic_at_rem", "fn main() ! IO \{\n    let z = [1].len() - 1\n    io.println(\"\{10 % z}\")\n}\n", "Int division by zero", 3),
+        ("_panic_at_min", "fn main() ! IO \{\n    let big = -9223372036854775807 - 1\n    let m = [1].len() - 2\n    io.println(\"\{big / m}\")\n}\n", "Int overflow in division (-9223372036854775808 / -1)", 4),
+        ("_panic_at_i32", "fn main() ! IO \{\n    let a: I32 = 2147483647\n    let b: I32 = [1].len().to_i32()\n    io.println(\"\{a + b}\")\n}\n", "I32 overflow in addition (2147483647 + 1)", 4),
+        ("_panic_at_ensures", "@ensures(result > 100)\n@verify(fallback: \"runtime\")\nfn en(x: Int) -> Int \{ x }\n\nfn main() ! IO \{\n    io.println(\"\{en([1].len())}\")\n}\n", "postcondition failed: @ensures in en", 1),
+        ("_panic_at_where", "type Pct = Int @where(self >= 0 && self <= 100)\n\nfn use_pct(p: Pct) -> Int \{ p }\n\nfn main() ! IO \{\n    io.println(\"\{use_pct([1].len() + 100)}\")\n}\n", "refinement violated: @where on Pct", 1),
+        ("_panic_at_send", send_source(), "send on a closed channel", 4),
+    ]
+    for row in rows {
+        let (tag, src, what, line) = row
+        assert_eq(reported(src, tag), "panic: {what} at {scratch_root()}/{tag}.bl:{line}")
+    }
+}
+
+test "a percent sign in the message or in the file name is printed as written" {
+    let tag = "_panic_at_100%d_pct"
+    let src = "fn main() ! IO \{\n    let big = 9223372036854775807\n    if [1].len() > 5 \{ panic(\"100%s done\") }\n    io.println(\"\{big + [1].len()}\")\n}\n"
+    assert_eq(reported(src, tag), "panic: Int overflow in addition (9223372036854775807 + 1) at {scratch_root()}/{tag}.bl:4")
+    let said = "fn main() \{\n    panic(\"100%s done, %d left\")\n}\n"
+    assert_eq(reported(said, "_panic_at_pct_said"), "panic: 100%s done, %d left at {scratch_root()}/_panic_at_pct_said.bl:2")
+}
+
+test "a panic message longer than any fixed buffer is reported whole" {
+    let mut parts: List[Str] = []
+    for _ in 0..300 { parts.push("0123456789") }
+    let long = parts.join("")
+    let src = "fn main() \{\n    panic(\"{long}\")\n}\n"
+    let got = reported(src, "_panic_at_long")
+    assert_eq(got, "panic: {long} at {scratch_root()}/_panic_at_long.bl:2")
+}
+
+// No Blink source line is 0, so the runtime entry is called here directly.
+test "the runtime reports a line of 0 or less as <synthesized>" {
+    let src = [
+        "@ffi(\"__blink_panic_dispatch_at\")",
+        "@trusted(audit: \"The runtime panic entry: it reads two NUL-terminated Strs and never returns.\")",
+        "fn dispatch_at(what: Str, file: Str, line: Int) ! () \{}",
+        "",
+        "fn main() \{",
+        "    dispatch_at(\"made up\", \"gen.bl\", [1].len() - 1)",
+        "}",
+        "",
+    ].join("\n")
+    assert_eq(reported(src, "_panic_at_synth"), "panic: made up at gen.bl:<synthesized>")
+}
+
+test "a test reads the same panic message, and assert_panics(matching:) still matches it" {
+    let src = [
+        "test \"panics\" \{",
+        "    let z = [1].len() - 1",
+        "    let _ = 10 / z",
+        "}",
+        "",
+        "test \"caught\" \{",
+        "    assert_panics(matching: \"Int division by zero at \") \{",
+        "        let z = [1].len() - 1",
+        "        let _ = 10 / z",
+        "    }",
+        "}",
+        "",
+    ].join("\n")
+    let r = compile_and_run_test_json(src, "_panic_at_runner")
+    let diag = "exit {r.exit_code}: {r.out}{r.err_out}"
+    assert(r.out.contains("panic: Int division by zero at {scratch_root()}/_panic_at_runner.bl:3"), diag)
+    assert(r.out.contains("\"passed\":1"), diag)
+}

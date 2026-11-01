@@ -43,7 +43,7 @@ import cname.{
     c_overflow_builtin, c_int_min_macro, c_int_literal, c_test_propagate_name,
 }
 import ir.{
-    ir_line_text, ir_line_tabled, ir_line, ir_col, IrKind, ir_kind, ir_kind_is_name, ir_kid, ir_kid_count, ir_c_name, ir_panic, ir_tid, ir_span,
+    ir_line_text, ir_line, ir_col, IrKind, ir_kind, ir_kind_is_name, ir_kid, ir_kid_count, ir_c_name, ir_panic_at, ir_tid, ir_span,
     ir_c_spelling, ir_slot_form,
     ir_const, ir_var_ref, ir_cell_ref, ir_global_ref, ir_unary, ir_binary, ir_cast, ir_field_get,
     ir_struct_new, ir_tuple_new, ir_container_new, ir_box, ir_unbox, ir_carrier_wrap,
@@ -55,7 +55,7 @@ import cg_stmt.{cg_stmt_return_value, cg_stmt_materialise_where_run}
 import cg_call.{
     lower_call, lower_operator_method, lower_display_of_value, cg_call_display_resolves,
     lower_spread, lower_element_store, cc_enum_variant_construct,
-    lower_await_expr, lower_fn_value, lower_channel_new, cc_panic_line, cg_call_container_ctor,
+    lower_await_expr, lower_fn_value, lower_channel_new, cg_call_container_ctor,
     cg_call_spread_copy,
 }
 import cg_eff.{cg_eff_lower_closure, cg_eff_lower_handler_expr}
@@ -956,9 +956,9 @@ fn x_guarded_binary(site: ArithSite, rec: LayoutRecord, lhs_tid: Int, lhs: Int, 
     let right_held = x_hold(rhs)
     if zero_test {
         let tripped = x_operand_test(site.node, site.op, lhs_tid, rhs_tid, right_held)
-        let said = x_guard_message(site.node, site.op, lhs_tid)
-        if tripped < 0 || said < 0 { return -1 }
-        x_hoist(ir_if(site.node, tripped, ir_block(site.node, [ir_panic(site.node, said)]), -1))
+        let raised = x_panic_at(site.node, x_guard_message(site.node, site.op, lhs_tid))
+        if tripped < 0 || raised < 0 { return -1 }
+        x_hoist(ir_if(site.node, tripped, ir_block(site.node, [raised]), -1))
     }
     if min_test && !x_hoist_min_guard(site, lhs_tid, rhs_tid, left_held, right_held) { return -1 }
     let left = x_reread(left_held)
@@ -981,9 +981,9 @@ fn x_hoist_min_guard(site: ArithSite, lhs_tid: Int, rhs_tid: Int, left: Int, rig
     let by_minus_one = ir_binary(TYPE_BOOL, site.node, bool_rec.c_spelling, "==", r,
         ir_const(rhs_tid, site.node, rhs_rec.c_spelling, "-1"))
     let tripped = ir_binary(TYPE_BOOL, site.node, bool_rec.c_spelling, "&&", at_min, by_minus_one)
-    let said = x_operands_message(site, lhs_tid, rhs_tid, left, right)
-    if said < 0 { return false }
-    x_hoist(ir_if(site.node, tripped, ir_block(site.node, [ir_panic(site.node, said)]), -1))
+    let raised = x_panic_at(site.node, x_operands_message(site, lhs_tid, rhs_tid, left, right))
+    if raised < 0 { return false }
+    x_hoist(ir_if(site.node, tripped, ir_block(site.node, [raised]), -1))
     true
 }
 
@@ -1125,7 +1125,7 @@ fn x_guard_message(node: Int, op: Str, lhs_tid: Int) -> Int ! Diag.Report {
     if op == "<<" || op == ">>" {
         text = "shift amount out of range for {ty} (must be 0..{type_bit_width(lhs_tid) - 1})"
     }
-    x_panic_message(node, x_pct_escape(text), [])
+    x_panic_what(node, text, [])
 }
 
 // Addition, subtraction and multiplication can leave the range of their own operands.
@@ -1164,7 +1164,9 @@ fn x_checked_into(node: Int, op: Str, tid: Int, rec: LayoutRecord, l: Int, r: In
     let into = ir_unary(tid, node, pointer_spelling(rec.c_spelling), "&", target)
     let overflowed = ir_call_runtime(TYPE_BOOL, node, bool_rec.c_spelling, c_overflow_builtin(op),
         bool_rec.slot_form, [l, r, into])
-    x_hoist(ir_if(node, overflowed, ir_block(node, [ir_panic(node, said)]), -1))
+    let raised = x_panic_at(node, said)
+    if raised < 0 { return -1 }
+    x_hoist(ir_if(node, overflowed, ir_block(node, [raised]), -1))
     x_ref(tid, node, out)
 }
 
@@ -1179,7 +1181,7 @@ fn x_operands_message(site: ArithSite, lhs_tid: Int, rhs_tid: Int, left: Int, ri
     let r = x_reread(right)
     if l < 0 || r < 0 { return -1 }
     let what = "{tk_name(x_kind(site.tid))} overflow in {x_operation_word(site.op)} ({lspec} {site.op} {rspec})"
-    x_panic_message(site.node, what, [
+    x_panic_what(site.node, what, [
         x_promote_for_varargs(site.lhs_node, lhs_tid, l),
         x_promote_for_varargs(site.rhs_node, rhs_tid, r),
     ])
@@ -1208,25 +1210,31 @@ fn x_operation_word(op: Str) -> Str {
     }
 }
 
-// A panic sentence formatted when the program panics. `what` is a format: every value
-// the run supplies is one of its conversions, in the order of `args`. It names the
-// operator's own place, as a carrier panic does, so a caught panic reads the same.
-pub fn x_panic_message(node: Int, what: Str, args: List[Int]) -> Int ! Diag.Report {
+// What a panic says, before the runtime adds where it was raised. With no args, `what` is the
+// text itself. With args, `what` is a format: every value the run supplies is one of its
+// conversions, in the order of `args`, so the text is built only on the path that panics.
+pub fn x_panic_what(node: Int, what: Str, args: List[Int]) -> Int ! Diag.Report {
     let rec = x_local(TYPE_STR, node)
     if x_stopped(rec) { return -1 }
+    let text = ir_const(TYPE_STR, node, rec.c_spelling, c_str_const(what))
+    if args.len() == 0 { return text }
+    let mut parts = [text]
+    for a in args { parts.push(a) }
+    ir_call_runtime(TYPE_STR, node, rec.c_spelling, c_runtime_helper("str_format"), rec.slot_form, parts)
+}
+
+// The panic statement for node's own place. The file and the line go to the runtime as
+// values of their own, apart from the message, so a path holding the character a conversion
+// starts with is never read as one. A split unit reads the line from its table.
+pub fn x_panic_at(node: Int, said: Int) -> Int ! Diag.Report {
+    if said < 0 { return -1 }
+    let str_rec = x_local(TYPE_STR, node)
+    let int_rec = x_local(TYPE_INT, node)
+    if x_stopped(str_rec) || x_stopped(int_rec) { return -1 }
     let mut file = diag_file_for_node(node)
     if file == "" { file = diag_source_file }
-    let tabled = ir_line_tabled(node)
-    let line = if tabled { format_spec_of(TYPE_INT) } else { cc_panic_line(node) }
-    let sentence = "panic: {what} at {x_pct_escape(file)}:{line}"
-    let mut parts = [ir_const(TYPE_STR, node, rec.c_spelling, c_str_const(sentence))]
-    for a in args { parts.push(a) }
-    if tabled {
-        let int_rec = x_local(TYPE_INT, node)
-        if x_stopped(int_rec) { return -1 }
-        parts.push(ir_const(TYPE_INT, node, int_rec.c_spelling, ir_line_text(node)))
-    }
-    ir_call_runtime(TYPE_STR, node, rec.c_spelling, c_runtime_helper("str_format"), rec.slot_form, parts)
+    ir_panic_at(node, said, ir_const(TYPE_STR, node, str_rec.c_spelling, c_str_const(file)),
+        ir_const(TYPE_INT, node, int_rec.c_spelling, ir_line_text(node)))
 }
 
 // Kinds C's own operators compare and arithmetic correctly: the scalars and the ordinal
@@ -1472,7 +1480,7 @@ fn x_checked_negation(node: Int, tid: Int, rec: LayoutRecord, operand: Int) -> I
     let spec = x_operand_spec(tid, src)
     let shown = x_reread(held)
     if spec == "" || shown < 0 { return -1 }
-    let said = x_panic_message(node, "{tk_name(x_kind(tid))} overflow in negation (-({spec}))",
+    let said = x_panic_what(node, "{tk_name(x_kind(tid))} overflow in negation (-({spec}))",
         [x_promote_for_varargs(src, tid, shown)])
     let zero = ir_const(tid, node, rec.c_spelling, "0")
     x_checked_into(node, "-", tid, rec, zero, x_reread(held), said)

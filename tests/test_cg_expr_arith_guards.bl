@@ -19,7 +19,7 @@
 
 import std.io
 import lower_test_helpers.{probe, rhs_of, shape, assert_kind, assert_eq_str, assert_shape, assert_verifies}
-import ir.{IrKind, ir_c_name, ir_kid}
+import ir.{IrKind, ir_c_name, ir_kid, ir_kind}
 import cg_expr.{lower_expr, cg_expr_pending_count, cg_expr_take_pending}
 import compiler.{compile_to_program}
 
@@ -52,7 +52,7 @@ fn main() {
 }
 
 fn min_guard_shape() -> Str {
-    "If(Binary(Binary(VarRef, Const), Binary(VarRef, Const)), Block(Panic(CallRuntime(Const, Cast(VarRef), Cast(VarRef)))))"
+    "If(Binary(Binary(VarRef, Const), Binary(VarRef, Const)), Block(Panic(CallRuntime(Const, Cast(VarRef), Cast(VarRef)), Const, Const)))"
 }
 
 // The statements a guarded operator over two names hoists, `want` of them: the operand
@@ -70,7 +70,7 @@ fn guard_of(name: Str, want: Int) -> Int ! Lex.Tokenize, Parse, Parse.Build, Dia
     assert_eq(pre.len(), want)
     let guard = pre.get(0).unwrap()
     assert_kind("{name}: guard", guard, IrKind.If)
-    assert_eq_str("{name}: guard", shape(guard), "If(Binary(VarRef, Const), Block(Panic(CallRuntime(Const))))")
+    assert_eq_str("{name}: guard", shape(guard), "If(Binary(VarRef, Const), Block(Panic(Const, Const, Const)))")
     assert_verifies("{name}: guard verifies", guard)
     if want == 2 { assert_min_guard(name, pre.get(1).unwrap()) }
     guard
@@ -90,9 +90,22 @@ fn bound_of(guard: Int) -> Str {
     ir_c_name(ir_kid(ir_kid(guard, 0), 1))
 }
 
-// What the panic says: the format the panic's message call is given.
+// The panic a guard raises: the guard's then block holds it.
+fn panic_of(guard: Int) -> Int {
+    ir_kid(ir_kid(guard, 1), 0)
+}
+
+// What the panic says, before its arguments are substituted. A message with nothing to
+// substitute is the constant itself.
 fn said_of(guard: Int) -> Str {
-    ir_c_name(ir_kid(ir_kid(ir_kid(ir_kid(guard, 1), 0), 0), 0))
+    let what = ir_kid(panic_of(guard), 0)
+    if ir_kind(what) == IrKind.CallRuntime { return ir_c_name(ir_kid(what, 0)) }
+    ir_c_name(what)
+}
+
+// The line the panic names, which travels apart from what it says.
+fn line_of(guard: Int) -> Str {
+    ir_c_name(ir_kid(panic_of(guard), 2))
 }
 
 test "a division by a value tests the divisor before dividing" {
@@ -122,17 +135,15 @@ test "the width in a shift test is the left operand's own, not always 64" {
 
 test "the panic names the operation, so the message is not a bare abort" {
     let said = said_of(guard_of("q", 2))
-    if !said.contains("Int division by zero at ") { io.println("FAIL: divide panic says '{said}'") }
-    assert(said.contains("Int division by zero at "))
-    if !said.contains(".bl:6") { io.println("FAIL: divide panic names no line: '{said}'") }
-    assert(said.contains(".bl:6"))
+    if !said.contains("Int division by zero") { io.println("FAIL: divide panic says '{said}'") }
+    assert(said.contains("Int division by zero"))
+    assert_eq_str("the divide panic names its line", line_of(guard_of("q", 2)), "6")
     let shift_said = said_of(guard_of("left", 1))
     if !shift_said.contains("shift amount") { io.println("FAIL: shift panic says '{shift_said}'") }
     assert(shift_said.contains("shift amount"))
     if !shift_said.contains("0..63") { io.println("FAIL: shift panic says '{shift_said}'") }
     assert(shift_said.contains("0..63"))
-    if !shift_said.contains(".bl:14") { io.println("FAIL: shift panic names no line: '{shift_said}'") }
-    assert(shift_said.contains(".bl:14"))
+    assert_eq_str("the shift panic names its line", line_of(guard_of("left", 1)), "14")
 }
 
 test "an operand that is not a name is bound before the guard runs" {

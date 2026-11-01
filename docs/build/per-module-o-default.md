@@ -1193,8 +1193,8 @@ in `src/cg.bl`):
   added above a function moves the numbers in the table, not the text of
   the chunk, so the edit compiles the edited chunk and `pos.c`, which
   holds only numbers. A column does not need a table: a line added above
-  does not move it. A send on a closed channel formats its message at run
-  time, only when it panics (`blink_channel_send_value_at`). The build
+  does not move it. A panic hands the runtime its message, file and line
+  apart, and the runtime joins them only when it panics. The build
   writes no `#line`, so `--debug` adds no other line to the text.
 
 What the cut costs and saves:
