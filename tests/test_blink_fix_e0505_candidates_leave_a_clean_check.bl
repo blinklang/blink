@@ -1,0 +1,203 @@
+// The fix of E0505 for a module function called through a handle (sections/04_effects.md
+// §4.4.7) is the first candidate that adds no diagnostic. For each candidate, `blink fix`
+// writes the file this test expects, and `blink check` of that file then reports nothing. When
+// no candidate fits, the error has help and no fix, and `blink fix` leaves the file as it is.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> ProcessResult ! Process.Spawn {
+    process.run("sh", ["-c", cmd]).unwrap()
+}
+
+fn blink_in(dir: Str, args: Str) -> ProcessResult ! Process.Spawn {
+    sh("B=$(pwd)/build/blink; cd {dir} && timeout 120 $B {args}")
+}
+
+// A package in a new directory with `src` as src/deal.bl and each (path, text) of `extra` under
+// src/, as a file that imports a module of its own needs.
+fn package(stem: Str, src: Str, extra: List[(Str, Str)]) -> Str ! Process.Spawn, IO {
+    let dir = sh("mktemp -d /tmp/blink_e0505_{stem}.XXXXXX").out.trim()
+    fs.write("{dir}/blink.toml", "[package]\nname = \"deal\"\nversion = \"0.1.0\"\n").unwrap()
+    for (path, text) in extra {
+        let _ = sh("mkdir -p $(dirname {dir}/src/{path})")
+        fs.write("{dir}/src/{path}", text).unwrap()
+    }
+    let _ = sh("mkdir -p {dir}/src")
+    fs.write("{dir}/src/deal.bl", src).unwrap()
+    dir
+}
+
+// Runs `blink fix` on `src` and then `blink check` on the file it leaves, which must report
+// nothing.
+fn fix_then_check(stem: Str, src: Str, extra: List[(Str, Str)], want: Str, fixes: Int) ! Process.Spawn, IO {
+    let dir = package(stem, src, extra)
+    let fix = blink_in(dir, "fix src/deal.bl")
+    let fixed = fix.out.concat(fix.err_out)
+    let got = fs.read("{dir}/src/deal.bl").unwrap()
+    let check = blink_in(dir, "check src/deal.bl")
+    let checked = check.out.concat(check.err_out)
+    let good = got == want && fixed.contains("{fixes} fix(es) applied") && check.success() && checked.trim() == "ok: src/deal.bl"
+    if !good { io.eprintln("got file:\n{got}\nfix:\n{fixed}\ncheck:\n{checked}") }
+    assert(good)
+    let _ = sh("rm -rf {dir}")
+}
+
+// Runs `blink fix` on `src`, which has an E0505 with help and no fix, and checks that the file
+// is left as it is and that the help is there.
+fn no_fix(stem: Str, src: Str, extra: List[(Str, Str)], help: Str) ! Process.Spawn, IO {
+    let dir = package(stem, src, extra)
+    let fix = blink_in(dir, "fix src/deal.bl")
+    let fixed = fix.out.concat(fix.err_out)
+    let got = fs.read("{dir}/src/deal.bl").unwrap()
+    let check = blink_in(dir, "check src/deal.bl")
+    let checked = check.out.concat(check.err_out)
+    let good = got == src && fixed.contains("0 fix(es) applied") && checked.contains(help) && !checked.contains("  fix: ")
+    if !good { io.eprintln("got file:\n{got}\nfix:\n{fixed}\ncheck:\n{checked}") }
+    assert(good)
+    let _ = sh("rm -rf {dir}")
+}
+
+let CALL = "fn deal(deck: List[Int]) -> List[Int] ! Rand \{\n    rand.shuffle(deck)\n}\n"
+let FIXED_CALL = "fn deal(deck: List[Int]) -> List[Int] ! Rand \{\n    random.shuffle(deck)\n}\n"
+let MAIN = "\nfn main() \{}\n"
+
+test "a file that binds no random gets import std.random and a call through it" {
+    fix_then_check("plain", "{CALL}{MAIN}", [], "import std.random\n\n{FIXED_CALL}{MAIN}", 1)
+}
+
+test.failing(
+    "a function named shuffle does not stop the call through random",
+    reason: "the fixed file has its own fn shuffle and a whole import of std.random, and the call shuffle(1) of its own fn stops with ICE MonoUnsolvedTypeParam on the T of std.random's generic shuffle",
+) {
+    let own = "fn shuffle(n: Int) -> Int \{\n    n\n}\n\n"
+    let use_it = "\nfn main() \{\n    let _ = shuffle(1)\n}\n"
+    fix_then_check("fn_shuffle", "{own}{CALL}{use_it}", [], "import std.random\n\n{own}{FIXED_CALL}{use_it}", 1)
+}
+
+test "a local named shuffle does not stop the call through random" {
+    let src = "fn deal(deck: List[Int]) -> List[Int] ! Rand \{\n    let shuffle = 3\n    if shuffle > 9 \{ return deck }\n    rand.shuffle(deck)\n}\n{MAIN}"
+    let want = "import std.random\n\nfn deal(deck: List[Int]) -> List[Int] ! Rand \{\n    let shuffle = 3\n    if shuffle > 9 \{ return deck }\n    random.shuffle(deck)\n}\n{MAIN}"
+    fix_then_check("local_shuffle", src, [], want, 1)
+}
+
+test.failing(
+    "an import of another module's shuffle does not stop the call through random",
+    reason: "the fixed file selects shuffle from cards and imports std.random whole, and the bare call shuffle(1) reaches std.random's generic shuffle, a TypeError, not the selected cards.shuffle",
+) {
+    let cards = ("cards.bl", "pub fn shuffle(n: Int) -> Int \{\n    n\n}\n")
+    let use_it = "\nfn main() \{\n    let _ = shuffle(1)\n}\n"
+    fix_then_check("other_shuffle", "import cards.\{shuffle}\n\n{CALL}{use_it}", [cards], "import cards.\{shuffle}\nimport std.random\n\n{FIXED_CALL}{use_it}", 1)
+}
+
+test "a whole import of std.random gets the call through it and no new import" {
+    let src = "import std.random\n\n{CALL}{MAIN}"
+    fix_then_check("whole", src, [], "import std.random\n\n{FIXED_CALL}{MAIN}", 1)
+}
+
+test "an import of std.random under an alias gets the call through the alias" {
+    let src = "import std.random as r\n\n{CALL}{MAIN}"
+    fix_then_check("alias", src, [], "import std.random as r\n\nfn deal(deck: List[Int]) -> List[Int] ! Rand \{\n    r.shuffle(deck)\n}\n{MAIN}", 1)
+}
+
+test "a selective import of std.random gets the bare call" {
+    let src = "import std.random.\{shuffle}\n\n{CALL}{MAIN}"
+    fix_then_check("selective", src, [], "import std.random.\{shuffle}\n\nfn deal(deck: List[Int]) -> List[Int] ! Rand \{\n    shuffle(deck)\n}\n{MAIN}", 1)
+}
+
+test "rand.choice gets the call through random too" {
+    let src = "fn top(deck: List[Int]) -> Option[Int] ! Rand \{\n    rand.choice(deck)\n}\n{MAIN}"
+    fix_then_check("choice", src, [], "import std.random\n\nfn top(deck: List[Int]) -> Option[Int] ! Rand \{\n    random.choice(deck)\n}\n{MAIN}", 1)
+}
+
+let LOCAL_RANDOM = "fn deal(deck: List[Int]) -> List[Int] ! Rand \{\n    let random = 7\n    if random > 9 \{ return deck }\n    rand.shuffle(deck)\n}\n"
+let LOCAL_RANDOM_FIXED = "fn deal(deck: List[Int]) -> List[Int] ! Rand \{\n    let random = 7\n    if random > 9 \{ return deck }\n    shuffle(deck)\n}\n"
+
+test "a local random gets the helper imported by name and the bare call" {
+    fix_then_check("local_random", "{LOCAL_RANDOM}{MAIN}", [], "import std.random.\{shuffle}\n\n{LOCAL_RANDOM_FIXED}{MAIN}", 1)
+}
+
+test "a local random and a whole import of std.random that nothing else uses" {
+    let src = "import std.random\n\n{LOCAL_RANDOM}{MAIN}"
+    fix_then_check("whole_unused", src, [], "import std.random\nimport std.random.\{shuffle}\n\n{LOCAL_RANDOM_FIXED}{MAIN}", 1)
+}
+
+test "a local random and a whole import of std.random that another function uses" {
+    let top = "fn top(deck: List[Int]) -> Option[Int] ! Rand \{\n    random.choice(deck)\n}\n\n"
+    let src = "import std.random\n\n{top}{LOCAL_RANDOM}{MAIN}"
+    fix_then_check("whole_used", src, [], "import std.random\nimport std.random.\{shuffle}\n\n{top}{LOCAL_RANDOM_FIXED}{MAIN}", 1)
+}
+
+test "two helpers that a local random hides get one import of both names" {
+    let src = "fn top(deck: List[Int]) -> Option[Int] ! Rand \{\n    let random = 7\n    if random > 9 \{ return None }\n    let cards = rand.shuffle(deck)\n    rand.choice(cards)\n}\n{MAIN}"
+    let want = "import std.random.\{choice, shuffle}\n\nfn top(deck: List[Int]) -> Option[Int] ! Rand \{\n    let random = 7\n    if random > 9 \{ return None }\n    let cards = shuffle(deck)\n    choice(cards)\n}\n{MAIN}"
+    fix_then_check("two_by_name", src, [], want, 2)
+}
+
+test "an import of another module as random gets help and no fix" {
+    let game = ("game/random.bl", "pub fn roll() -> Int \{\n    4\n}\n")
+    let src = "import game.random\n\n{CALL}\nfn main() \{\n    let _ = random.roll()\n}\n"
+    no_fix("game_random", src, [game], "`random` is the import at 1:8, so `import std.random` would bind it twice")
+}
+
+test "a function named random gets help with an alias and no fix" {
+    let src = "fn random() -> Int \{\n    4\n}\n\n{CALL}\nfn main() \{\n    let _ = random()\n}\n"
+    no_fix("fn_random", src, [], "then `rng.shuffle(deck)`")
+}
+
+let MIXED = "fn top(deck: List[Int]) -> Option[Int] ! Rand \{\n    rand.choice(deck)\n}\n\n{LOCAL_RANDOM}{MAIN}"
+
+// One fix adds `import std.random` and the other `import std.random.{shuffle}`, both at the top
+// of the file. `blink fix` applies neither of two different edits at one place.
+test "blink fix applies neither fix when one adds the whole import and one imports by name" {
+    let dir = package("mixed", MIXED, [])
+    let fix = blink_in(dir, "fix src/deal.bl")
+    let fixed = fix.out.concat(fix.err_out)
+    let got = fs.read("{dir}/src/deal.bl").unwrap()
+    let good = got == MIXED && fixed.contains("0 fix(es) applied, 2 diagnostic(s) left") && fixed.contains("its fix overlaps the different fix of the error at src/deal.bl:8:5") && fixed.contains("its fix overlaps the different fix of the error at src/deal.bl:2:5")
+    if !good { io.eprintln("got file:\n{got}\nfix:\n{fixed}") }
+    assert(good)
+    let _ = sh("rm -rf {dir}")
+}
+
+fn lsp_msg(body: Str) -> Str {
+    "Content-Length: {body.byte_len()}\r\n\r\n{body}"
+}
+
+fn code_action(id: Int, td: Str, line: Int) -> Str {
+    lsp_msg("\{\"jsonrpc\":\"2.0\",\"id\":{id},\"method\":\"textDocument/codeAction\",\"params\":\{{td},\"range\":\{\"start\":\{\"line\":{line},\"character\":4},\"end\":\{\"line\":{line},\"character\":4}},\"context\":\{\"diagnostics\":[]}}}")
+}
+
+test "the LSP offers each fix of the two alone" {
+    let dir = sh("mktemp -d /tmp/blink_e0505_mixed_lsp.XXXXXX").out.trim()
+    fs.write("{dir}/deal.bl", MIXED).unwrap()
+    let uri = "file://{dir}/deal.bl"
+    let td = "\"textDocument\":\{\"uri\":\"{uri}\"}"
+    let input = [
+        lsp_msg(#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{}}}"#),
+        lsp_msg(#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#),
+        lsp_msg("\{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":\{{td}}}"),
+        code_action(2, td, 1),
+        code_action(3, td, 7),
+        lsp_msg(#"{"jsonrpc":"2.0","id":4,"method":"shutdown","params":null}"#),
+        lsp_msg(#"{"jsonrpc":"2.0","method":"exit","params":{}}"#),
+    ].join("")
+    fs.write("{dir}/input.bin", input).unwrap()
+    let r = sh("B=$(pwd)/build/blink; cd {dir} && timeout 60 $B lsp < input.bin")
+    let top = "\"title\":\"add `import std.random` and call\",\"kind\":\"quickfix\",\"edit\":\{\"changes\":\{\"{uri}\":[".concat(#"{"range":{"start":{"line":1,"character":4},"end":{"line":1,"character":21}},"newText":"random.choice(deck)"},{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":0}},"newText":"import std.random\n\n"}]}}}"#)
+    let deal = "\"title\":\"add `import std.random.\{shuffle}` and call\",\"kind\":\"quickfix\",\"edit\":\{\"changes\":\{\"{uri}\":[".concat(#"{"range":{"start":{"line":7,"character":4},"end":{"line":7,"character":22}},"newText":"shuffle(deck)"},{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":0}},"newText":"import std.random.{shuffle}\n\n"}]}}}"#)
+    let good = r.out.contains(top) && r.out.contains(deal)
+    if !good { io.eprintln("want:\n{top}\n{deal}\nstdout:\n{r.out}\nstderr:\n{r.err_out}") }
+    assert(good)
+    let _ = sh("rm -rf {dir}")
+}
+
+test "the JSON diagnostic of a local random carries the import by name as a second edit" {
+    let dir = sh("mktemp -d /tmp/blink_e0505_json.XXXXXX").out.trim()
+    fs.write("{dir}/deal.bl", "{LOCAL_RANDOM}{MAIN}").unwrap()
+    let r = blink_in(dir, "check --json deal.bl")
+    let all = r.out.concat(r.err_out)
+    let want = #""fix":{"action":"add `import std.random.{shuffle}` and call","text":"shuffle(deck)","span":{"file":"deal.bl","line":4,"col":5,"end_line":4,"end_col":23},"more_edits":[{"span":{"file":"deal.bl","line":1,"col":1,"end_line":1,"end_col":1},"text":"import std.random.{shuffle}\n\n"}]}"#
+    if !all.contains(want) { io.eprintln(all) }
+    assert(all.contains(want))
+    let _ = sh("rm -rf {dir}")
+}

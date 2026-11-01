@@ -217,3 +217,184 @@ fn main() {}
     for d in diag_entries { got.push("{d.severity} {d.name} {d.file}:{d.line}:{d.col}") }
     assert_eq(got, ["error UnresolvedMethod build/rs_no_import_exact_probe.bl:2:5"])
 }
+
+let ALIAS_HELP = "import it under another name and call through that name: `import std.random as rng`, then `rng.shuffle(deck)`"
+
+test "a local random hides the qualifier, so the fix imports the helper by name and says why" {
+    let src = #"fn deal(deck: List[Int]) -> List[Int] ! Rand {
+    let random = 7
+    rand.shuffle(deck)
+}
+
+fn main() {}
+"#
+    assert_eq(rows("rs_local_random", src), [
+        "UnresolvedMethod E0505 3:5: `shuffle` is not an operation of effect `Rand` | help: {help(\"shuffle\", \"random\")}. `random` is the local at 2:9, so `random.shuffle` is not available here | notes: {OPS_NOTE} | fix: add `import std.random.\{shuffle}` and call `shuffle(deck)` at 3:5-3:23 | and: `import std.random.\{shuffle}\n\n` at 1:1-1:1",
+    ])
+}
+
+test "a function named random blocks both imports, so the help names it and shows an alias" {
+    let src = #"fn random() -> Int {
+    4
+}
+
+fn deal(deck: List[Int]) -> List[Int] ! Rand {
+    rand.shuffle(deck)
+}
+
+fn main() {}
+"#
+    assert_eq(rows("rs_fn_random", src), [
+        "UnresolvedMethod E0505 6:5: `shuffle` is not an operation of effect `Rand` | help: {help(\"shuffle\", \"random\")}. `random` is the function at 1:4, so `import std.random` would bind it twice\n{ALIAS_HELP} | notes: {OPS_NOTE}",
+    ])
+}
+
+test "a module let named random blocks both imports whether or not shuffle is free" {
+    let src = #"let random = 4
+
+fn shuffle(xs: List[Int]) -> List[Int] {
+    xs
+}
+
+fn deal(deck: List[Int]) -> List[Int] ! Rand {
+    rand.shuffle(deck)
+}
+
+fn main() {}
+"#
+    assert_eq(rows("rs_let_random", src), [
+        "UnresolvedMethod E0505 8:5: `shuffle` is not an operation of effect `Rand` | help: {help(\"shuffle\", \"random\")}. `random` is the `let` at 1:5, so `import std.random` would bind it twice\n{ALIAS_HELP} | notes: {OPS_NOTE}",
+    ])
+}
+
+test "an item of another import named random blocks both imports and the help gives its place" {
+    let src = #"import std.path.{path_join as random}
+
+fn deal(deck: List[Int]) -> List[Int] ! Rand {
+    rand.shuffle(deck)
+}
+
+fn main() {}
+"#
+    assert_eq(rows("rs_item_random", src), [
+        "UnresolvedMethod E0505 4:5: `shuffle` is not an operation of effect `Rand` | help: {help(\"shuffle\", \"random\")}. `random` is the import at 1:18, so `import std.random` would bind it twice\n{ALIAS_HELP} | notes: {OPS_NOTE}",
+    ])
+}
+
+test "another module imported as random blocks both imports and the help gives the place of its path" {
+    let src = #"import std.path as random
+
+fn deal(deck: List[Int]) -> List[Int] ! Rand {
+    rand.shuffle(deck)
+}
+
+fn main() {}
+"#
+    assert_eq(rows("rs_module_as_random", src), [
+        "UnresolvedMethod E0505 4:5: `shuffle` is not an operation of effect `Rand` | help: {help(\"shuffle\", \"random\")}. `random` is the import at 1:8, so `import std.random` would bind it twice\n{ALIAS_HELP} | notes: {OPS_NOTE}",
+    ])
+    assert_eq(rows("rs_pub_module_as_random", "pub {src}"), [
+        "UnresolvedMethod E0505 4:5: `shuffle` is not an operation of effect `Rand` | help: {help(\"shuffle\", \"random\")}. `random` is the import at 1:12, so `import std.random` would bind it twice\n{ALIAS_HELP} | notes: {OPS_NOTE}",
+    ])
+}
+
+test "a local random and a local shuffle both block, and the help gives each place" {
+    let src = #"fn deal(deck: List[Int]) -> List[Int] ! Rand {
+    let random = 7
+    let shuffle = 3
+    rand.shuffle(deck)
+}
+
+fn main() {}
+"#
+    assert_eq(rows("rs_local_random_and_shuffle", src), [
+        "UnresolvedMethod E0505 4:5: `shuffle` is not an operation of effect `Rand` | help: {help(\"shuffle\", \"random\")}. `random` is the local at 2:9 and `shuffle` is the local at 3:9, so neither `random.shuffle` nor `shuffle` is available here\n{ALIAS_HELP} | notes: {OPS_NOTE}",
+    ])
+}
+
+test "a local random and a function shuffle both block, and the help names the function" {
+    let src = #"fn shuffle(xs: List[Int]) -> List[Int] {
+    xs
+}
+
+fn deal(deck: List[Int]) -> List[Int] ! Rand {
+    let random = 7
+    rand.shuffle(deck)
+}
+
+fn main() {}
+"#
+    assert_eq(rows("rs_local_random_fn_shuffle", src), [
+        "UnresolvedMethod E0505 7:5: `shuffle` is not an operation of effect `Rand` | help: {help(\"shuffle\", \"random\")}. `random` is the local at 6:9 and `shuffle` is the function at 1:4, so neither `random.shuffle` nor `shuffle` is available here\n{ALIAS_HELP} | notes: {OPS_NOTE}",
+    ])
+}
+
+test "the alias help takes rng2 when the file binds rng" {
+    let src = #"fn random() -> Int {
+    4
+}
+
+fn rng() -> Int {
+    5
+}
+
+fn deal(deck: List[Int]) -> List[Int] ! Rand {
+    rand.shuffle(deck)
+}
+
+fn main() {}
+"#
+    let alias = "import it under another name and call through that name: `import std.random as rng2`, then `rng2.shuffle(deck)`"
+    assert_eq(rows("rs_rng_bound", src), [
+        "UnresolvedMethod E0505 10:5: `shuffle` is not an operation of effect `Rand` | help: {help(\"shuffle\", \"random\")}. `random` is the function at 1:4, so `import std.random` would bind it twice\n{alias} | notes: {OPS_NOTE}",
+    ])
+}
+
+test "a whole import of std.random that a local random hides gets the helper imported by name" {
+    let src = #"import std.random
+
+fn deal(deck: List[Int]) -> List[Int] ! Rand {
+    let random = 7
+    rand.shuffle(deck)
+}
+
+fn main() {}
+"#
+    assert_eq(rows("rs_whole_import_local_random", src), [
+        "UnresolvedMethod E0505 5:5: `shuffle` is not an operation of effect `Rand` | help: {help(\"shuffle\", \"random\")}. `random` is the local at 4:9, so `random.shuffle` is not available here | notes: {OPS_NOTE} | fix: add `import std.random.\{shuffle}` and call `shuffle(deck)` at 5:5-5:23 | and: `\nimport std.random.\{shuffle}` at 1:18-1:18",
+    ])
+}
+
+test "two helpers that each import by name carry one edit that imports both" {
+    let src = #"fn deal(deck: List[Int]) -> Option[Int] ! Rand {
+    let random = 7
+    let cards = rand.shuffle(deck)
+    rand.choice(cards)
+}
+
+fn main() {}
+"#
+    let action = "add `import std.random.\{choice, shuffle}` and call"
+    let edit = "| and: `import std.random.\{choice, shuffle}\n\n` at 1:1-1:1"
+    assert_eq(rows("rs_two_by_name", src), [
+        "UnresolvedMethod E0505 3:17: `shuffle` is not an operation of effect `Rand` | help: {help(\"shuffle\", \"random\")}. `random` is the local at 2:9, so `random.shuffle` is not available here | notes: {OPS_NOTE} | fix: {action} `shuffle(deck)` at 3:17-3:35 {edit}",
+        "UnresolvedMethod E0505 4:5: `choice` is not an operation of effect `Rand` | help: {help(\"choice\", \"random\")}. `random` is the local at 2:9, so `random.choice` is not available here | notes: {OPS_NOTE} | fix: {action} `choice(cards)` at 4:5-4:23 {edit}",
+    ])
+}
+
+test "a call with the wrong arguments that a blocker stops gets the alias help and the count" {
+    let src = #"fn random() -> Int {
+    4
+}
+
+fn deal(deck: List[Int]) -> List[Int] ! Rand {
+    rand.shuffle(deck, 3)
+}
+
+fn main() {}
+"#
+    let alias = "import it under another name and call through that name: `import std.random as rng`, then `rng.shuffle(deck, 3)`"
+    assert_eq(rows("rs_fn_random_arity", src), [
+        "UnresolvedMethod E0505 6:5: `shuffle` is not an operation of effect `Rand` | help: {help(\"shuffle\", \"random\")}. `random` is the function at 1:4, so `import std.random` would bind it twice\n{alias}\n`rng.shuffle` takes 1 argument, found 2 | notes: {OPS_NOTE}",
+    ])
+}

@@ -3,7 +3,7 @@ import std.str.{str_to_lower}
 import pkg.manifest.{manifest_name, manifest_header_is_declared}
 import unparse.{type_ann_text, unparse_expr, unparse_binop_with_lhs, unparse_range_membership, unparse_coalesce_start}
 import formatter.{effect_op_sig_text}
-import import_edit.{ImportEdit, import_module_edit}
+import import_edit.{ImportEdit, ImportNeed, import_module_edit, import_need}
 import parser.{
     effect_derived_ops, node_load_rank, parser_load_order_moved, parser_live_ranges,
     ann_str_val, positional_str_arg, positional_str_arg_count, impl_provided_by_closeable, closeable_impl_of, sublist_remove_members, get_annotation, get_str_named_arg, has_annotation, is_literal_string_part,
@@ -23,7 +23,7 @@ import parser.{
 }
 import diagnostics.{
     Diag, diag_clear_allows, diag_error_at, diag_error_at_notes, diag_error_span_at_notes, diag_error_no_loc,
-    diag_set_last_fix, diag_set_last_fix_at, diag_add_label_since, diag_add_last_fix_edit, diag_source_lines, diag_entries, UNDECLARED_EFFECT, UNSOURCED_EFFECT_WILDCARD,
+    diag_set_last_fix, diag_set_last_fix_at, diag_add_label_since, diag_add_last_fix_edit, diag_set_fix_edits_at, DiagEntry, DiagFixEdit, diag_source_lines, diag_entries, UNDECLARED_EFFECT, UNSOURCED_EFFECT_WILDCARD,
     diag_push_allows, diag_enter_allows, diag_exit_allows, NON_CONST_EXPR,
     diag_warn_at, diag_warn_at_notes, diag_warn_span_at_notes, PARTIAL_HANDLER, diag_truncate, diag_entry_count, diag_any_errors_since, diag_ice_at, diag_ice, PRELUDE_TYPE_NOT_LOADED, diag_count, diag_emit_in_file, diag_file_for_node, diag_file_node_range,
     diag_is_audit_gated, diag_audit_gated_help, AUDIT_GATED_SUPPRESSION, diag_normalize_path, diag_source_line, diag_errors_in_lines,
@@ -15730,6 +15730,7 @@ pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report {
     // Phase 2: Expression type inference
     tc_infer_program(program)
     tc_flush_index_sites()
+    tc_merge_helper_name_imports()
 
     // Phase 3: whatever Phase 1 found unresolvable and Phase 2 did not report on. The
     // receiver's type was never known at the call, so no type can be named as lacking the
@@ -16027,9 +16028,9 @@ fn tc_report_not_a_handle_op(node: Int, root: Str, name: Str) -> Int ! TypeCheck
 
 // The help and fix for a module function called through a handle. The fix is the first of
 // these that makes the callee the module's function and adds no diagnostic (§4.4.7): the bare
-// name or a qualifier the file already binds to the module, then a new `import module` and a
-// call through its qualifier. `callee` is "" when none does, or when the call with the new
-// callee would not type-check.
+// name or a qualifier the file already binds to the module, a new `import module` and a call
+// through its qualifier, then the name imported from the module. `callee` is "" when none does,
+// or when the call with the new callee would not type-check.
 type HelperCallPlan {
     help: Str
     callee: Str
@@ -16049,27 +16050,136 @@ fn tc_helper_call_plan(node: Int, root: Str, module: Str, name: Str, arg_tids: L
     let mut callee = ""
     let mut action = "call"
     let mut import_at = tc_no_import_edit()
+    let mut why = ""
+    let lines = diag_source_lines(diag_file_for_node(node))
     let decl = nr_resolve_bare_decl(name, site)
     let bare_reaches = decl != -1 && node_module(decl) == mod_key && node_name(decl) == name
-    if bare_reaches && tc_helper_name_blocker(node, name, module, name).kind == "" {
+    if bare_reaches && tc_helper_name_blocker(node, name, module, name, true).kind == "" {
         callee = name
     } else {
         let reused = tc_helper_reusable_qualifier(node, module)
+        let by_qualifier = tc_helper_name_blocker(node, leaf, module, "", true)
         if reused != "" {
             qualifier = reused
             callee = "{reused}.{name}"
-        } else if tc_helper_name_blocker(node, leaf, module, "").kind == "" {
+        } else if by_qualifier.kind == "" {
             callee = "{leaf}.{name}"
             action = "add `import {module}` and call"
-            import_at = import_module_edit(diag_source_lines(diag_file_for_node(node)), module)
+            import_at = import_module_edit(lines, module)
+        } else if by_qualifier.kind != "local" {
+            // A selective import binds the qualifier too, so a module-level binding of it
+            // blocks both imports.
+            why = "{tc_helper_blocker_text(leaf, by_qualifier)}, so `import {module}` would bind it twice"
+        } else {
+            let by_name = tc_helper_name_blocker(node, name, module, name, true)
+            let qualifier_above = tc_helper_name_blocker(node, leaf, module, "", false)
+            let local_text = tc_helper_blocker_text(leaf, by_qualifier)
+            let other = if by_name.kind != "" { tc_helper_blocker_text(name, by_name) } else if qualifier_above.kind != "" { tc_helper_blocker_text(leaf, qualifier_above) } else { "" }
+            let need = if other == "" { import_need(lines, module, [name]) } else { ImportNeed.Blocked }
+            match need {
+                ImportNeed.Add(edit) => {
+                    callee = name
+                    action = "add `import {module}.\{{name}}` and call"
+                    import_at = edit
+                    why = "{local_text}, so `{leaf}.{name}` is not available here"
+                }
+                _ => {
+                    let both = if other == "" { local_text } else { "{local_text} and {other}" }
+                    why = "{both}, so neither `{leaf}.{name}` nor `{name}` is available here"
+                }
+            }
         }
     }
     let mut help = "`{name}` is a function in module `{module}`; `{node_name(node_obj(node))}` is the handle of `{root}` and `{qualifier}` is the module"
+    if why != "" { help = help.concat(". {why}") }
+    let mut shown = callee
+    if callee == "" {
+        let alias = tc_helper_free_alias(node)
+        shown = "{alias}.{name}"
+        help = help.concat("\nimport it under another name and call through that name: `import {module} as {alias}`, then `{shown}{tc_helper_call_args_text(node, lines)}`")
+    }
     let sig = nr_module_names_of(mod_key).sigs.get(name) ?? -1
-    let mismatch = if sig == -1 { "" } else { tc_helper_call_mismatch(if callee != "" { callee } else { "{leaf}.{name}" }, sig, node_args(node), arg_tids) }
+    let mismatch = if sig == -1 { "" } else { tc_helper_call_mismatch(shown, sig, node_args(node), arg_tids) }
     if mismatch != "" || sig == -1 { callee = "" }
     if mismatch != "" { help = help.concat("\n{mismatch}") }
     HelperCallPlan { help: help, callee: callee, action: action, import_at: import_at }
+}
+
+// `name` and the binding `b` of it, as the help names a binding that blocks a fix.
+fn tc_helper_blocker_text(name: Str, b: HelperBlocker) -> Str {
+    "`{name}` is the {b.kind} at {b.line}:{b.col}"
+}
+
+// The first of `rng`, `rng2`, `rng3`, ... that nothing binds where `node` reads it: an alias
+// that the help can show without making up a name the file already uses.
+fn tc_helper_free_alias(node: Int) -> Str ! Diag.Report {
+    let mut n = 1
+    while true {
+        let alias = if n == 1 { "rng" } else { "rng{n}" }
+        if tc_helper_name_blocker(node, alias, "", "", true).kind == "" { return alias }
+        n = n + 1
+    }
+    "rng"
+}
+
+// The arguments of the call `node` as the source writes them, with their parens, or `(...)`
+// for a call that runs over lines.
+fn tc_helper_call_args_text(node: Int, lines: List[Str]) -> Str {
+    let line = node_line(node)
+    let src = lines.get(line - 1) ?? ""
+    let callee_end = node_col(node) - 1 + "{node_name(node_obj(node))}.{node_method(node)}".byte_len()
+    let end_col = node_end_col(node)
+    if node_end_line(node) == line && end_col > callee_end && end_col - 1 <= src.byte_len() {
+        return src.byte_slice(callee_end, end_col - 1)
+    }
+    "(...)"
+}
+
+// Two E0505 fixes in one file that each import a helper by name would add two imports at one
+// place, and `blink fix` applies neither of two edits there. Each such fix gets the one edit
+// that imports every name the file's fixes need, in name order, so the edits are equal.
+fn tc_merge_helper_name_imports() {
+    let mut groups: Map[Str, List[Str]] = Map()
+    for d in diag_entries {
+        let (module, names) = tc_helper_name_import_of(d)
+        if module == "" { continue }
+        let key = "{d.file}|{module}"
+        let mut have = groups.get(key) ?? []
+        for name in names {
+            if !have.contains(name) { have.push(name) }
+        }
+        groups.insert(key, have)
+    }
+    let mut i = 0
+    while i < diag_entries.len() {
+        let d = diag_entries.get(i).unwrap()
+        let (module, _) = tc_helper_name_import_of(d)
+        let names = (groups.get("{d.file}|{module}") ?? []).sort()
+        if module != "" && names.len() > 1 {
+            match import_need(diag_source_lines(d.file), module, names) {
+                ImportNeed.Add(e) => diag_set_fix_edits_at(i, "add `import {module}.\{{names.join(", ")}}` and call", [DiagFixEdit { line: e.line, col: e.col, end_line: e.end_line, end_col: e.end_col, text: e.text }])
+                _ => {}
+            }
+        }
+        i = i + 1
+    }
+}
+
+// The module and names of the import that the E0505 fix `d` adds to call a helper by name, or
+// ("", []) for any other diagnostic.
+fn tc_helper_name_import_of(d: DiagEntry) -> (Str, List[Str]) {
+    let head = "add `import "
+    let tail = "}` and call"
+    if d.code != "E0505" || !d.fix_action.starts_with(head) || !d.fix_action.ends_with(tail) { return ("", []) }
+    let path = d.fix_action.byte_slice(head.byte_len(), d.fix_action.byte_len() - tail.byte_len())
+    match path.byte_index_of(".\{", 0) {
+        Some(at) => {
+            let mut names: List[Str] = []
+            for raw in path.byte_slice(at + 2, path.byte_len()).split(",") { names.push(raw.trim()) }
+            (path.byte_slice(0, at), names)
+        }
+        None => ("", [])
+    }
 }
 
 // The last segment of a dotted module path: the qualifier a whole import of it binds.
@@ -16089,11 +16199,14 @@ type HelperBlocker {
 // What binds `name` where `node` reads it, other than an import of `module` that binds the
 // name as its qualifier or, when `member` is the name, as that member of the module: a local,
 // a declaration of the file's module, or another import.
-fn tc_helper_name_blocker(node: Int, name: Str, module: Str, member: Str) -> HelperBlocker ! Diag.Report {
+fn tc_helper_name_blocker(node: Int, name: Str, module: Str, member: Str, locals: Bool) -> HelperBlocker ! Diag.Report {
     let idx = nr_top_index(name)
-    if idx >= 0 && nr_index_is_global(idx) == 0 {
+    if locals && idx >= 0 && nr_index_is_global(idx) == 0 {
         let binder = nr_scope_nodes.get(idx) ?? -1
-        if binder >= 0 { return HelperBlocker { kind: "local", line: node_line(binder), col: node_col(binder) } }
+        if binder >= 0 {
+            let (line, col) = nr_decl_name_at(ModuleDeclName { namespace: "value", name: name, decl: binder, binder: -1 })
+            return HelperBlocker { kind: "local", line: line, col: col }
+        }
         return HelperBlocker { kind: "local", line: 0, col: 0 }
     }
     let decl = nr_module_decl(tc_site_module(node), name)
@@ -16139,11 +16252,13 @@ fn tc_decl_kind_word(decl: Int) -> Str {
     }
 }
 
-// Where an import statement writes its module path: after `import`, and `pub` before it.
+// Where an import statement writes its module path: after `import`, and `pub` before it. The
+// node's own column is past the path, so the scan starts at the first word of its line.
 fn tc_import_path_at(imp: Int) -> (Int, Int) {
     let line = node_line(imp)
     let text = diag_source_line(diag_file_for_node(imp), line)
-    let mut at = if node_col(imp) > 0 { node_col(imp) - 1 } else { 0 }
+    let mut at = 0
+    while at < text.byte_len() && text.byte_at(at).to_int() == 32 { at = at + 1 }
     for word in ["pub", "import"] {
         let end = at + word.byte_len()
         if end <= text.byte_len() && text.byte_slice(at, end) == word {
@@ -16163,7 +16278,7 @@ fn tc_helper_reusable_qualifier(node: Int, module: Str) -> Str ! Diag.Report {
     while n < end {
         if node_kind(n) == NodeKind.ImportStmt && diag_file_for_node(n) == file && node_str_val(n) == module {
             let qual = if node_name(n) != "" { node_name(n) } else { tc_module_leaf(module) }
-            if tc_helper_name_blocker(node, qual, module, "").kind == "" { return qual }
+            if tc_helper_name_blocker(node, qual, module, "", true).kind == "" { return qual }
         }
         n = n + 1
     }
