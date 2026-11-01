@@ -174,17 +174,19 @@ BLINK_RT_FN void blink_trace_parse_item(const char* item) {
         p = end + 1;
     }
     if (f.count == 0) blink_trace_bad_filter("empty value", NULL, item);
+    /* The items of `,` all must match (§8.15.5), so a second `event:` item narrows the set. */
     if (strcmp(key, "event") == 0) {
-        __blink_trace.event_enter = 0;
-        __blink_trace.event_exit = 0;
-        __blink_trace.event_effect = 0;
-        __blink_trace.event_state = 0;
+        int enter = 0, exit_ = 0, effect = 0, state = 0;
         for (int i = 0; i < f.count; i++) {
-            if (strcmp(f.values[i], "enter") == 0) __blink_trace.event_enter = 1;
-            if (strcmp(f.values[i], "exit") == 0) __blink_trace.event_exit = 1;
-            if (strcmp(f.values[i], "effect") == 0) __blink_trace.event_effect = 1;
-            if (strcmp(f.values[i], "state") == 0) __blink_trace.event_state = 1;
+            if (strcmp(f.values[i], "enter") == 0) enter = 1;
+            if (strcmp(f.values[i], "exit") == 0) exit_ = 1;
+            if (strcmp(f.values[i], "effect") == 0) effect = 1;
+            if (strcmp(f.values[i], "state") == 0) state = 1;
         }
+        __blink_trace.event_enter &= enter;
+        __blink_trace.event_exit &= exit_;
+        __blink_trace.event_effect &= effect;
+        __blink_trace.event_state &= state;
     }
     blink_trace_filter* grown = (blink_trace_filter*)realloc(__blink_trace.filters,
         (size_t)(__blink_trace.filter_count + 1) * sizeof(blink_trace_filter));
