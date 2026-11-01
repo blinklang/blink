@@ -16033,7 +16033,7 @@ fn tc_report_not_a_handle_op(node: Int, root: Str, name: Str) -> Int ! TypeCheck
 // these that makes the callee the module's function and adds no diagnostic (§4.4.7): the bare
 // name or a qualifier the file already binds to the module, a new `import module` and a call
 // through its qualifier, then the name imported from the module. `callee` is "" when none does,
-// or when the call with the new callee would not type-check.
+// or when the call with the new callee is not proven to type-check where it is.
 type HelperCallPlan {
     help: Str
     callee: Str
@@ -16103,9 +16103,9 @@ fn tc_helper_call_plan(node: Int, root: Str, module: Str, name: Str, arg_tids: L
         help = help.concat("\nimport it under another name and call through that name: `import {module} as {alias}`, then `{shown}{tc_helper_call_args_text(node, lines)}`")
     }
     let sig = nr_module_names_of(mod_key).sigs.get(name) ?? -1
-    let mismatch = if sig == -1 { "" } else { tc_helper_call_mismatch(shown, sig, node_args(node), arg_tids, tc_helper_call_want(node)) }
-    if mismatch != "" || sig == -1 { callee = "" }
-    if mismatch != "" { help = help.concat("\n{mismatch}") }
+    let check = if sig == -1 { HelperCallCheck { mismatch: "", proven: false } } else { tc_helper_call_check(shown, sig, node_args(node), arg_tids, tc_helper_call_want(node)) }
+    if !check.proven { callee = "" }
+    if check.mismatch != "" { help = help.concat("\n{check.mismatch}") }
     HelperCallPlan { help: help, callee: callee, action: action, import_at: import_at }
 }
 
@@ -16306,43 +16306,55 @@ fn tc_helper_call_want(node: Int) -> Int {
     tc_method_calls.seeded_expected.get(node) ?? -1
 }
 
-// Why `callee(args)` would not type-check against the signature `sig`, or "". The arguments
-// were inferred once, to `arg_tids`; one whose type is not known yet is not judged. `want` is
-// the type the call's place expects, or -1 when the place sets none.
-fn tc_helper_call_mismatch(callee: Str, sig: Int, args: Int, arg_tids: List[Int], want: Int) -> Str {
+// Whether `callee(args)` type-checks against the signature `sig` where the call is. `mismatch`
+// says why it does not, or is "". `proven` is true only when the arguments fit and the place
+// expects a known type that the result fits: a place that expects no type, such as a `let`
+// with none or an operand of `==`, gives the result to code this check does not see.
+type HelperCallCheck {
+    mismatch: Str
+    proven: Bool
+}
+
+// The arguments were inferred once, to `arg_tids`; one whose type is not known yet is not
+// judged, and the call is then not proven. `want` is the type the call's place expects, or -1
+// when the place sets none.
+fn tc_helper_call_check(callee: Str, sig: Int, args: Int, arg_tids: List[Int], want: Int) -> HelperCallCheck {
     let fs = fnsig_pool.get(sig).unwrap()
     let kw_start = tc_fnsig_kw_start(fs.params_start, fs.params_count, 0)
     let got = if args == -1 { 0 } else { sublist_length(args) }
     if got != fs.params_count {
         let noun = if fs.params_count == 1 { "argument" } else { "arguments" }
-        return "`{callee}` takes {fs.params_count} {noun}, found {got}"
+        return HelperCallCheck { mismatch: "`{callee}` takes {fs.params_count} {noun}, found {got}", proven: false }
     }
     let mut binds: Map[Str, Int] = Map()
+    let mut all_judged = true
     let mut i = 0
     while i < got {
         let arg = sublist_get(args, i)
         let mut pidx = i
         if node_kind(arg) == NodeKind.NamedArg {
             pidx = tc_fnsig_param_index_by_name(fs.params_start, fs.params_count, 0, node_name(arg))
-            if pidx < 0 { return "`{callee}` has no parameter `{node_name(arg)}`" }
-            if pidx < kw_start { return "`{node_name(arg)}` is a positional parameter of `{callee}`" }
+            if pidx < 0 { return HelperCallCheck { mismatch: "`{callee}` has no parameter `{node_name(arg)}`", proven: false } }
+            if pidx < kw_start { return HelperCallCheck { mismatch: "`{node_name(arg)}` is a positional parameter of `{callee}`", proven: false } }
         }
         let arg_t = arg_tids.get(i) ?? -1
         if tc_tid_is_no_info(arg_t) == 0 && tc_tid_has_unknown(arg_t) == 0 {
             let formal = fnsig_param_list.get(fs.params_start + pidx).unwrap()
             unify_typevar_binds(formal, arg_t, binds)
             if types_compatible(substitute_typevar_tid(formal, binds), arg_t) == 0 {
-                return "argument {i + 1} of `{callee}` expects {tc_type_str(formal)}, got {tc_type_str(arg_t)}"
+                return HelperCallCheck { mismatch: "argument {i + 1} of `{callee}` expects {tc_type_str(formal)}, got {tc_type_str(arg_t)}", proven: false }
             }
+        } else {
+            all_judged = false
         }
         i = i + 1
     }
     let ret = substitute_typevar_tid(fs.ret, binds)
     let known = tc_tid_is_no_info(want) == 0 && tc_tid_has_unknown(want) == 0 && tc_tid_has_bare_typevar(ret) == 0
     if want >= 0 && known && types_compatible(want, ret) == 0 {
-        return "`{callee}` returns {tc_type_str(ret)}, and {tc_type_str(want)} is expected here"
+        return HelperCallCheck { mismatch: "`{callee}` returns {tc_type_str(ret)}, and {tc_type_str(want)} is expected here", proven: false }
     }
-    ""
+    HelperCallCheck { mismatch: "", proven: all_judged && want >= 0 && known }
 }
 
 // The fix of `plan` on the call `node`: its callee rewritten, and the import it adds.
