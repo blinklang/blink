@@ -1,15 +1,29 @@
 // `--trace` has two forms (§8.14, §8.15.1): a bare `--trace`, and `--trace=<filters>`.
 // A bare `--trace` takes no value, so it never takes the source file that comes after it.
-// The `enter` event of `main` shows that the trace reached the built program.
+// The `enter` event of `main` shows that the trace reached the built program. `blink run` hands
+// the filters on in `BLINK_TRACE`, so the program's argv stays its own (§8.15.13).
 
 import compile_test_helpers
 import std.process.{ProcessResult}
 
 let TRACE_SRC = "fn add(a: Int, b: Int) -> Int \{ a + b }\nfn main() \{\n    io.println(add(1, 2))\n}\n"
 
+let ARGS_SRC = #"fn add(a: Int, b: Int) -> Int { a + b }
+fn main() {
+    io.println(add(1, 2))
+    for a in env.args() {
+        if a.starts_with("-") { io.println(a) }
+    }
+}
+"#
+
 fn src_path(tag: Str) -> Str ! FS.Write, Process.Spawn, Env.Read {
+    write_src(tag, TRACE_SRC)
+}
+
+fn write_src(tag: Str, src: Str) -> Str ! FS.Write, Process.Spawn, Env.Read {
     let path = "{compile_test_helpers.scratch_root()}/_trace_form_{tag}.bl"
-    fs.write(path, TRACE_SRC).unwrap()
+    fs.write(path, src).unwrap()
     path
 }
 
@@ -28,7 +42,7 @@ test "build takes a bare --trace that comes before the source" {
     let r = cli(["build", "--trace", path, "-o", bin])
     assert_eq(r.err_out, "")
     assert(r.success())
-    let ran = process.run(bin, ["--trace"]).unwrap()
+    let ran = process.run("env", ["BLINK_TRACE=all", bin]).unwrap()
     assert_eq(ran.out, "3\n")
     assert(ran.err_out.contains("\"event\":\"enter\",\"fn\":\"_trace_form_build_bare.main\""))
     clean(path, bin)
@@ -68,6 +82,29 @@ test "run takes --trace=<filters> before the source" {
     assert_eq(r.out, "3\n")
     assert(r.err_out.contains("\"event\":\"enter\",\"fn\":\"_trace_form_run_filter.add\""))
     assert(!r.err_out.contains("_trace_form_run_filter.main"))
+    compile_test_helpers.sh("rm -f {path}")
+}
+
+test "run --trace replaces a BLINK_TRACE that the shell set" {
+    let path = src_path("run_replace")
+    let bare: ProcessResult = process.run("env", ["BLINK_TRACE=fn:nothing", "build/blink", "run", path, "--trace"]).unwrap()
+    assert(bare.success())
+    assert(bare.err_out.contains("\"event\":\"enter\",\"fn\":\"_trace_form_run_replace.main\""))
+    let filtered: ProcessResult = process.run("env", ["BLINK_TRACE=fn:nothing", "build/blink", "run", "--trace=fn:add", path]).unwrap()
+    assert(filtered.success())
+    assert(filtered.err_out.contains("\"event\":\"enter\",\"fn\":\"_trace_form_run_replace.add\""))
+    assert(!filtered.err_out.contains("_trace_form_run_replace.main"))
+    compile_test_helpers.sh("rm -f {path}")
+}
+
+test "run --trace adds no argument to the program it runs" {
+    let path = write_src("run_argv", ARGS_SRC)
+    let r = cli(["run", "--trace=fn:add", path, "--", "-x"])
+    assert(r.success())
+    assert_eq(r.out, "3\n-x\n")
+    let bare = cli(["run", path, "--trace"])
+    assert(bare.success())
+    assert_eq(bare.out, "3\n")
     compile_test_helpers.sh("rm -f {path}")
 }
 

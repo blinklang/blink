@@ -117,8 +117,9 @@ fn clean(bin: Str) ! Process.Spawn {
     compile_test_helpers.sh("rm -rf {bin} {bin}.units")
 }
 
-fn run_bin(bin: Str, args: List[Str]) -> ProcessResult ! Process.Spawn {
-    process.run(bin, args).unwrap()
+// A traced binary reads its filters from BLINK_TRACE only.
+fn run_bin(bin: Str, value: Str) -> ProcessResult ! Process.Spawn {
+    process.run("env", ["BLINK_TRACE={value}", bin]).unwrap()
 }
 
 fn str_field(obj: Int, key: Str) -> Str {
@@ -175,7 +176,7 @@ fn shape(evs: List[Ev]) -> Str {
 }
 
 fn traced_with(bin: Str, filter: Str) -> List[Ev] ! Process.Spawn {
-    let r = run_bin(bin, ["--trace={filter}"])
+    let r = run_bin(bin, filter)
     assert_eq(r.out, STDOUT)
     assert(r.success())
     events(r.err_out)
@@ -183,7 +184,7 @@ fn traced_with(bin: Str, filter: Str) -> List[Ev] ! Process.Spawn {
 
 test "each traced call writes an enter and an exit event at its depth" {
     let bin = build_traced(TRACE_SRC, "trace_fn_ev_all")
-    let r = run_bin(bin, ["--trace"])
+    let r = run_bin(bin, "all")
     assert_eq(r.out, STDOUT)
     assert(r.success())
     let evs = events(r.err_out)
@@ -265,18 +266,21 @@ test "BLINK_TRACE takes the filter syntax of --trace" {
     clean(bin)
 }
 
-test "a traced build run without --trace writes no events" {
-    let bin = build_traced(TRACE_SRC, "trace_fn_ev_quiet")
-    let r = run_bin(bin, [])
+test "a traced binary with BLINK_TRACE unset traces every call" {
+    let bin = build_traced(TRACE_SRC, "trace_fn_ev_unset")
+    let r: ProcessResult = process.run("env", ["-u", "BLINK_TRACE", bin]).unwrap()
     assert_eq(r.out, STDOUT)
-    assert_eq(r.err_out, "")
     assert(r.success())
+    let m = "trace_fn_ev_unset"
+    let evs = events(r.err_out)
+    assert_eq(evs.len(), 12)
+    assert_eq(evs.get(0).unwrap().fn_name, "{m}.main")
     clean(bin)
 }
 
 test "a panic in a traced function keeps every event line whole" {
     let bin = build_traced(PANIC_SRC, "trace_fn_ev_panic")
-    let r = run_bin(bin, ["--trace"])
+    let r = run_bin(bin, "all")
     assert_eq(r.end, ChildEnd.Exited(101))
     assert_eq(r.out, "1\n")
     assert(r.err_out.contains("too big"))
@@ -297,7 +301,7 @@ test "a build without --trace has no trace calls" {
 
 test "a call made as a with block ends is inside the traced call" {
     let bin = build_traced(WITH_SRC, "trace_fn_ev_with")
-    let r = run_bin(bin, ["--trace"])
+    let r = run_bin(bin, "all")
     assert_eq(r.out, "close t\n5\nclose e\n7\nclose v\n")
     assert(r.success())
     let m = "trace_fn_ev_with"
@@ -315,7 +319,7 @@ test "a call made as a with block ends is inside the traced call" {
 
 test "a value is cut at 200 characters, not bytes, and its escapes decode back" {
     let bin = build_traced(TEXT_SRC, "trace_fn_ev_text")
-    let r = run_bin(bin, ["--trace=fn:echo"])
+    let r = run_bin(bin, "fn:echo")
     assert(r.success())
     let evs = events(r.err_out)
     assert_eq(evs.len(), 4)

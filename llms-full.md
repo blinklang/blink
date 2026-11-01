@@ -1758,13 +1758,15 @@ build/blink run app.bl --trace=event:state               # only state mutations
 build/blink run app.bl --trace=effect:FS.Write
 build/blink run app.bl --trace=state:count
 
-# Cap output to N events
-build/blink run app.bl --trace --trace-limit 100
-
 # Environment variable (same filter syntax)
 BLINK_TRACE=all build/blink run app.bl
-BLINK_TRACE_LIMIT=50 BLINK_TRACE=all build/blink run app.bl
+
+# A binary built with --trace reads BLINK_TRACE only; unset traces every call
+build/blink build --trace app.bl -o app
+BLINK_TRACE=fn:parse_block ./app
 ```
+
+There is no event limit. A bad filter (an unknown key, an empty value, a `depth:` value that is not a number, an unknown event type) stops the program with exit code 2 before `main` runs.
 
 Trace event types:
 

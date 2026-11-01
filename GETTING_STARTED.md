@@ -205,12 +205,9 @@ build/blink run hello.bl --trace=event:state        # variable mutations
 # Filter by effect type or variable name
 build/blink run hello.bl --trace=effect:FS.Write
 build/blink run hello.bl --trace=state:count
-
-# Cap output to avoid runaway traces
-build/blink run hello.bl --trace --trace-limit 100
 ```
 
-Trace can also be enabled via environment variables: `BLINK_TRACE=all` and `BLINK_TRACE_LIMIT=100`.
+Trace can also be enabled via an environment variable: `BLINK_TRACE=all`. A binary built with `blink build --trace` reads its filters from `BLINK_TRACE` only, and traces every call when it is unset.
 
 Inspect the parsed AST:
 

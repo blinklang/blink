@@ -1,13 +1,13 @@
 #ifndef BLINK_RUNTIME_TRACE_H
 #define BLINK_RUNTIME_TRACE_H
 
-#define BLINK_TRACE_MAX_FILTERS 16
-#define BLINK_TRACE_MAX_OR_VALUES 8
 #define BLINK_TRACE_MAX_VALUE_LEN 200
 
+/* One filter of BLINK_TRACE: its key and the values that compose with OR. The value has no
+   limit on its items or their length, so the filter holds them on the heap. */
 typedef struct {
-    char key[32];
-    char values[BLINK_TRACE_MAX_OR_VALUES][128];
+    char* key;
+    char** values;
     int count;
 } blink_trace_filter;
 
@@ -15,14 +15,12 @@ typedef struct {
     int active;
     int depth;
     struct timespec start;
-    blink_trace_filter filters[BLINK_TRACE_MAX_FILTERS];
+    blink_trace_filter* filters;
     int filter_count;
     int event_enter;
     int event_exit;
     int event_effect;
     int event_state;
-    int event_limit;
-    int event_count;
 } blink_trace_state;
 
 #ifdef BLINK_USE_EXTERN_RUNTIME_STORAGE
@@ -80,57 +78,147 @@ BLINK_RT_FN int64_t blink_trace_ts_us(void) {
 }
 #endif
 
+/* A bad BLINK_TRACE value is a usage error: the program writes no event and does not start. */
+BLINK_RT_FN void blink_trace_bad_filter(const char* why, const char* what, const char* item, size_t n);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void blink_trace_bad_filter(const char* why, const char* what, const char* item, size_t n) {
+    fprintf(stderr, "error: bad BLINK_TRACE value: %s", why);
+    if (what) fprintf(stderr, " `%s`", what);
+    fprintf(stderr, " in `%.*s`\n", (int)n, item);
+    exit(2);
+}
+#endif
+
+/* A copy of s[0..n) with ASCII space and tab cut from its two ends, or NULL when that is
+   empty. */
+BLINK_RT_FN char* blink_trace_trim_dup(const char* s, size_t n);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN char* blink_trace_trim_dup(const char* s, size_t n) {
+    while (n > 0 && (*s == ' ' || *s == '\t')) { s++; n--; }
+    while (n > 0 && (s[n - 1] == ' ' || s[n - 1] == '\t')) n--;
+    if (n == 0) return NULL;
+    char* out = (char*)malloc(n + 1);
+    if (!out) { fputs("error: out of memory reading BLINK_TRACE\n", stderr); exit(2); }
+    memcpy(out, s, n);
+    out[n] = '\0';
+    return out;
+}
+#endif
+
+BLINK_RT_FN int blink_trace_is_event_type(const char* v);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN int blink_trace_is_event_type(const char* v) {
+    return strcmp(v, "enter") == 0 || strcmp(v, "exit") == 0 || strcmp(v, "state") == 0
+        || strcmp(v, "effect") == 0 || strcmp(v, "note") == 0;
+}
+#endif
+
+/* Whether v is a whole decimal number, as a depth: value must be. */
+BLINK_RT_FN int blink_trace_is_number(const char* v);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN int blink_trace_is_number(const char* v) {
+    char* end = NULL;
+    errno = 0;
+    (void)strtol(v, &end, 10);
+    return end != v && *end == '\0' && errno == 0;
+}
+#endif
+
+/* Reads one trimmed `,` item of BLINK_TRACE into a filter, or exits on a bad one. */
+BLINK_RT_FN void blink_trace_parse_item(const char* item);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void blink_trace_parse_item(const char* item) {
+    size_t len = strlen(item);
+    /* `all` beside other filters adds no filter, so it never hides one. */
+    if (strcmp(item, "all") == 0) return;
+    const char* colon = strchr(item, ':');
+    if (!colon) blink_trace_bad_filter("a filter needs `key:value`, not", NULL, item, len);
+    size_t klen = (size_t)(colon - item);
+    char* key = (char*)malloc(klen + 1);
+    if (!key) { fputs("error: out of memory reading BLINK_TRACE\n", stderr); exit(2); }
+    memcpy(key, item, klen);
+    key[klen] = '\0';
+    if (strcmp(key, "fn") != 0 && strcmp(key, "module") != 0 && strcmp(key, "depth") != 0
+        && strcmp(key, "event") != 0 && strcmp(key, "effect") != 0 && strcmp(key, "state") != 0) {
+        blink_trace_bad_filter("unknown key", key, item, len);
+    }
+    blink_trace_filter f = { key, NULL, 0 };
+    int cap = 0;
+    const char* p = colon + 1;
+    for (;;) {
+        const char* end = strchr(p, '+');
+        size_t n = end ? (size_t)(end - p) : strlen(p);
+        char* v = blink_trace_trim_dup(p, n);
+        if (v) {
+            if (strcmp(key, "depth") == 0 && !blink_trace_is_number(v)) {
+                blink_trace_bad_filter("depth is not a number:", v, item, len);
+            }
+            if (strcmp(key, "event") == 0 && !blink_trace_is_event_type(v)) {
+                blink_trace_bad_filter("unknown event type", v, item, len);
+            }
+            if (f.count == cap) {
+                cap = cap ? cap * 2 : 4;
+                f.values = (char**)realloc(f.values, (size_t)cap * sizeof(char*));
+                if (!f.values) { fputs("error: out of memory reading BLINK_TRACE\n", stderr); exit(2); }
+            }
+            f.values[f.count++] = v;
+        }
+        if (!end) break;
+        p = end + 1;
+    }
+    if (f.count == 0) blink_trace_bad_filter("empty value", NULL, item, len);
+    if (strcmp(key, "event") == 0) {
+        __blink_trace.event_enter = 0;
+        __blink_trace.event_exit = 0;
+        __blink_trace.event_effect = 0;
+        __blink_trace.event_state = 0;
+        for (int i = 0; i < f.count; i++) {
+            if (strcmp(f.values[i], "enter") == 0) __blink_trace.event_enter = 1;
+            if (strcmp(f.values[i], "exit") == 0) __blink_trace.event_exit = 1;
+            if (strcmp(f.values[i], "effect") == 0) __blink_trace.event_effect = 1;
+            if (strcmp(f.values[i], "state") == 0) __blink_trace.event_state = 1;
+        }
+    }
+    blink_trace_filter* grown = (blink_trace_filter*)realloc(__blink_trace.filters,
+        (size_t)(__blink_trace.filter_count + 1) * sizeof(blink_trace_filter));
+    if (!grown) { fputs("error: out of memory reading BLINK_TRACE\n", stderr); exit(2); }
+    __blink_trace.filters = grown;
+    __blink_trace.filters[__blink_trace.filter_count++] = f;
+}
+#endif
+
+/* Reads the `,` items of a BLINK_TRACE value (§8.15.5); exits on a bad one (§8.15.12). */
 BLINK_RT_FN void blink_trace_parse_filters(const char* filter_str);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN void blink_trace_parse_filters(const char* filter_str) {
-    if (!filter_str || !*filter_str) return;
-    __blink_trace.event_enter = 1;
-    __blink_trace.event_exit = 1;
     const char* p = filter_str;
-    while (*p && __blink_trace.filter_count < BLINK_TRACE_MAX_FILTERS) {
-        blink_trace_filter* f = &__blink_trace.filters[__blink_trace.filter_count];
-        const char* colon = p;
-        while (*colon && *colon != ':' && *colon != ',') colon++;
-        if (*colon != ':') break;
-        int klen = (int)(colon - p);
-        if (klen >= 32) klen = 31;
-        memcpy(f->key, p, klen);
-        f->key[klen] = '\0';
-        p = colon + 1;
-        f->count = 0;
-        while (f->count < BLINK_TRACE_MAX_OR_VALUES) {
-            const char* end = p;
-            while (*end && *end != '+' && *end != ',') end++;
-            int vlen = (int)(end - p);
-            if (vlen >= 128) vlen = 127;
-            memcpy(f->values[f->count], p, vlen);
-            f->values[f->count][vlen] = '\0';
-            f->count++;
-            if (*end == '+') { p = end + 1; continue; }
-            p = (*end == ',') ? end + 1 : end;
-            break;
+    for (;;) {
+        const char* end = strchr(p, ',');
+        size_t n = end ? (size_t)(end - p) : strlen(p);
+        char* item = blink_trace_trim_dup(p, n);
+        if (item) {
+            blink_trace_parse_item(item);
+            free(item);
         }
-        if (strcmp(f->key, "event") == 0) {
-            __blink_trace.event_enter = 0;
-            __blink_trace.event_exit = 0;
-            __blink_trace.event_effect = 0;
-            __blink_trace.event_state = 0;
-            for (int i = 0; i < f->count; i++) {
-                if (strcmp(f->values[i], "enter") == 0) __blink_trace.event_enter = 1;
-                if (strcmp(f->values[i], "exit") == 0) __blink_trace.event_exit = 1;
-                if (strcmp(f->values[i], "effect") == 0) __blink_trace.event_effect = 1;
-                if (strcmp(f->values[i], "state") == 0) __blink_trace.event_state = 1;
-            }
-            continue;
-        }
-        __blink_trace.filter_count++;
+        if (!end) break;
+        p = end + 1;
     }
 }
 #endif
 
+/* A traced binary reads BLINK_TRACE and nothing else, so its argv stays the program's own
+   (§8.15.13). The parameters stay because the code of an older compiler passes them. */
 BLINK_RT_FN void blink_trace_init(int argc, char** argv);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN void blink_trace_init(int argc, char** argv) {
+    (void)argc; (void)argv;
+    for (int i = 0; i < __blink_trace.filter_count; i++) {
+        free(__blink_trace.filters[i].key);
+        for (int j = 0; j < __blink_trace.filters[i].count; j++) free(__blink_trace.filters[i].values[j]);
+        free(__blink_trace.filters[i].values);
+    }
+    free(__blink_trace.filters);
+    __blink_trace.filters = NULL;
     __blink_trace.active = 0;
     __blink_trace.depth = 0;
     __blink_trace.filter_count = 0;
@@ -138,42 +226,27 @@ BLINK_RT_FN void blink_trace_init(int argc, char** argv) {
     __blink_trace.event_exit = 1;
     __blink_trace.event_effect = 1;
     __blink_trace.event_state = 1;
-    __blink_trace.event_limit = 0;
-    __blink_trace.event_count = 0;
 #ifndef BLINK_NO_TRACE_INIT
-    const char* filter_str = NULL;
-    for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--trace") == 0) {
-            __blink_trace.active = 1;
-        } else if (strncmp(argv[i], "--trace=", 8) == 0) {
-            __blink_trace.active = 1;
-            filter_str = argv[i] + 8;
-        } else if (strcmp(argv[i], "--trace-limit") == 0 && i + 1 < argc) {
-            __blink_trace.event_limit = atoi(argv[++i]);
-        } else if (strncmp(argv[i], "--trace-limit=", 14) == 0) {
-            __blink_trace.event_limit = atoi(argv[i] + 14);
-        }
-    }
-    if (!__blink_trace.active) {
-        const char* env = getenv("BLINK_TRACE");
-        if (env && *env) {
-            __blink_trace.active = 1;
-            filter_str = (strcmp(env, "1") == 0) ? NULL : env;
-        }
-    }
-    if (!__blink_trace.event_limit) {
-        const char* limit_env = getenv("BLINK_TRACE_LIMIT");
-        if (limit_env && *limit_env) {
-            __blink_trace.event_limit = atoi(limit_env);
-        }
-    }
-    if (__blink_trace.active) {
-        clock_gettime(CLOCK_MONOTONIC, &__blink_trace.start);
-        if (filter_str) blink_trace_parse_filters(filter_str);
-    }
-#else
-    (void)argc; (void)argv;
+    const char* env = getenv("BLINK_TRACE");
+    /* Unset traces everything. The spec has no rule yet for an empty value, so it keeps the
+       reading it had: no trace. */
+    if (env && !*env) return;
+    __blink_trace.active = 1;
+    clock_gettime(CLOCK_MONOTONIC, &__blink_trace.start);
+    if (env) blink_trace_parse_filters(env);
 #endif
+}
+#endif
+
+/* Whether a `fn:` value names the frame: the whole name, or its last whole dot segments. */
+BLINK_RT_FN int blink_trace_fn_named(const char* fn, const char* value);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN int blink_trace_fn_named(const char* fn, const char* value) {
+    size_t n = strlen(fn);
+    size_t v = strlen(value);
+    if (v > n) return 0;
+    if (strcmp(fn + (n - v), value) != 0) return 0;
+    return v == n || fn[n - v - 1] == '.';
 }
 #endif
 
@@ -181,17 +254,12 @@ BLINK_RT_FN int blink_trace_match(const char* fn, const char* module, int depth)
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN int blink_trace_match(const char* fn, const char* module, int depth) {
     if (!__blink_trace.active) return 0;
-    if (__blink_trace.filter_count == 0) return 1;
     for (int i = 0; i < __blink_trace.filter_count; i++) {
         blink_trace_filter* f = &__blink_trace.filters[i];
         if (strcmp(f->key, "fn") == 0) {
-            const char* dot = strrchr(fn, '.');
-            const char* short_name = dot ? dot + 1 : fn;
             int matched = 0;
             for (int j = 0; j < f->count; j++) {
-                if (strcmp(fn, f->values[j]) == 0 || strcmp(short_name, f->values[j]) == 0) {
-                    matched = 1; break;
-                }
+                if (blink_trace_fn_named(fn, f->values[j])) { matched = 1; break; }
             }
             if (!matched) return 0;
         } else if (strcmp(f->key, "module") == 0) {
@@ -201,8 +269,11 @@ BLINK_RT_FN int blink_trace_match(const char* fn, const char* module, int depth)
             }
             if (!matched) return 0;
         } else if (strcmp(f->key, "depth") == 0) {
-            int max_depth = atoi(f->values[0]);
-            if (depth > max_depth) return 0;
+            int matched = 0;
+            for (int j = 0; j < f->count; j++) {
+                if ((long)depth <= strtol(f->values[j], NULL, 10)) { matched = 1; break; }
+            }
+            if (!matched) return 0;
         }
     }
     return 1;
@@ -281,8 +352,6 @@ BLINK_RT_FN void blink_trace_enter(const char* fn, const char* module, int depth
 BLINK_RT_FN void blink_trace_enter(const char* fn, const char* module, int depth,
     const char* file, int line, int col, const char* args_json) {
     if (!__blink_trace.event_enter) return;
-    if (__blink_trace.event_limit > 0 && __blink_trace.event_count >= __blink_trace.event_limit) return;
-    __blink_trace.event_count++;
     int64_t ts = blink_trace_ts_us();
     fprintf(stderr, "{\"ts_us\":%lld,\"event\":\"enter\",\"fn\":\"%s\",\"module\":\"%s\",\"depth\":%d,"
         "\"span\":{\"file\":\"%s\",\"line\":%d,\"col\":%d}",
@@ -301,8 +370,6 @@ BLINK_RT_FN void blink_trace_exit(const char* fn, const char* module, int depth,
 BLINK_RT_FN void blink_trace_exit(const char* fn, const char* module, int depth,
     int64_t enter_ts, const char* ret_str) {
     if (!__blink_trace.event_exit) return;
-    if (__blink_trace.event_limit > 0 && __blink_trace.event_count >= __blink_trace.event_limit) return;
-    __blink_trace.event_count++;
     int64_t ts = blink_trace_ts_us();
     int64_t duration = ts - enter_ts;
     fprintf(stderr, "{\"ts_us\":%lld,\"event\":\"exit\",\"fn\":\"%s\",\"module\":\"%s\",\"depth\":%d,"
@@ -328,8 +395,6 @@ BLINK_RT_FN void blink_trace_state_event(const char* fn, const char* module, int
 BLINK_RT_FN void blink_trace_state_event(const char* fn, const char* module, int depth,
     const char* var, const char* op, const char* value) {
     if (!__blink_trace.event_state) return;
-    if (__blink_trace.event_limit > 0 && __blink_trace.event_count >= __blink_trace.event_limit) return;
-    __blink_trace.event_count++;
     int64_t ts = blink_trace_ts_us();
     fprintf(stderr, "{\"ts_us\":%lld,\"event\":\"state\",\"fn\":\"%s\",\"module\":\"%s\",\"depth\":%d,"
         "\"var\":\"%s\",\"op\":\"%s\",\"value\":\"",
@@ -352,8 +417,6 @@ BLINK_RT_FN void blink_trace_effect(const char* fn, const char* module, int dept
 BLINK_RT_FN void blink_trace_effect(const char* fn, const char* module, int depth,
     const char* effect, const char* op, const char* args_json) {
     if (!__blink_trace.event_effect) return;
-    if (__blink_trace.event_limit > 0 && __blink_trace.event_count >= __blink_trace.event_limit) return;
-    __blink_trace.event_count++;
     int64_t ts = blink_trace_ts_us();
     fprintf(stderr, "{\"ts_us\":%lld,\"event\":\"effect\",\"fn\":\"%s\",\"module\":\"%s\",\"depth\":%d,"
         "\"effect\":\"%s\",\"op\":\"%s\"",
@@ -374,8 +437,6 @@ BLINK_RT_FN void blink_trace_arena_capture(const char* op, int64_t slot, const c
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN void blink_trace_arena_capture(const char* op, int64_t slot, const char* name) {
     if (!__blink_trace.active) return;
-    if (__blink_trace.event_limit > 0 && __blink_trace.event_count >= __blink_trace.event_limit) return;
-    __blink_trace.event_count++;
     int64_t ts = blink_trace_ts_us();
     fprintf(stderr, "{\"ts_us\":%lld,\"event\":\"arena.promote.capture\",\"depth\":%d,"
         "\"op\":\"%s\",\"slot\":%lld,\"capture\":\"%s\"}\n",
@@ -397,8 +458,6 @@ BLINK_RT_FN void blink_trace_arena_promote(const char* fn, const char* module, i
     const char* phase, const char* target, const char* desc,
     const char* file, int line, int col) {
     if (!__blink_trace.active) return;
-    if (__blink_trace.event_limit > 0 && __blink_trace.event_count >= __blink_trace.event_limit) return;
-    __blink_trace.event_count++;
     int64_t ts = blink_trace_ts_us();
     fprintf(stderr, "{\"ts_us\":%lld,\"event\":\"arena.promote\",\"fn\":\"%s\",\"module\":\"%s\",\"depth\":%d,"
         "\"phase\":\"%s\",\"target\":\"%s\",\"desc\":\"%s\","
@@ -459,13 +518,6 @@ BLINK_RT_FN int blink_trace_match_event(const char* fn, const char* module, int6
 }
 #endif
 
-BLINK_RT_FN int blink_trace_under_limit(void);
-#ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN int blink_trace_under_limit(void) {
-    return __blink_trace.event_limit <= 0 || __blink_trace.event_count < __blink_trace.event_limit;
-}
-#endif
-
 /* Writes s as the inside of a JSON string. With max_chars >= 0 it writes at most that many
    characters and answers whether s had more. */
 BLINK_RT_FN int blink_trace_put_json(FILE* out, const char* s, int64_t max_chars);
@@ -499,7 +551,6 @@ BLINK_RT_FN void blink_trace_put_head(const char* event, const char* fn, const c
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN void blink_trace_put_head(const char* event, const char* fn, const char* module,
     int64_t depth) {
-    __blink_trace.event_count++;
     fprintf(stderr, "{\"ts_us\":%lld,\"event\":\"%s\",\"fn\":\"", (long long)blink_trace_ts_us(), event);
     blink_trace_put_json(stderr, fn, -1);
     fputs("\",\"module\":\"", stderr);
@@ -551,7 +602,7 @@ BLINK_RT_FN int blink_trace_fn_enter(const char* fn, const char* module) {
     __blink_trace_frames[depth].module = module;
     __blink_trace_frames[depth].exit_value = NULL;
     __blink_trace_frames[depth].exit_kept = 0;
-    return matched && __blink_trace.event_enter && blink_trace_under_limit();
+    return matched && __blink_trace.event_enter;
 }
 #endif
 
@@ -592,7 +643,7 @@ BLINK_RT_FN int blink_trace_on_exit(void) {
     if (!__blink_trace.active || !__blink_trace.event_exit) return 0;
     int64_t depth = __blink_trace_frame_top - 1;
     if (depth < 0 || depth >= __blink_trace_frame_cap) return 0;
-    return __blink_trace_frames[depth].matched && blink_trace_under_limit();
+    return __blink_trace_frames[depth].matched;
 }
 #endif
 
@@ -617,8 +668,7 @@ BLINK_RT_FN int blink_trace_on_state(const char* fn, const char* module, const c
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN int blink_trace_on_state(const char* fn, const char* module, const char* var) {
     if (!__blink_trace.active || !__blink_trace.event_state || __blink_trace_frame_top <= 0) return 0;
-    return blink_trace_under_limit()
-        && blink_trace_match_event(fn, module, blink_trace_frame_depth(), NULL, var);
+    return blink_trace_match_event(fn, module, blink_trace_frame_depth(), NULL, var);
 }
 #endif
 
