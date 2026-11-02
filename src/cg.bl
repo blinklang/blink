@@ -60,11 +60,11 @@ import cg_promote.{
     cg_promote_body_enter, cg_promote_body_exit, cg_promote_has_pending, cg_promote_print_walkers,
     cg_promote_reset,
 }
-import cg_trace.{cg_trace_arm, cg_trace_set}
+import cg_trace.{cg_trace_arm, cg_trace_arm_default, cg_trace_body_leave, cg_trace_exit_void, cg_trace_set}
 import cg_expr.{cg_expr_frame_clear, cg_expr_reset, cg_expr_set_return_type, cg_expr_set_test_body}
 import cg_eff.{
     cg_eff_forwarding_body, cg_eff_pending_thunks, cg_eff_print_thunk, cg_eff_register_async_scope_guard_support,
-    cg_eff_register_ffi_scope_guard_support, cg_eff_reset, cg_eff_thunk_body_node, cg_eff_thunk_close,
+    cg_eff_register_ffi_scope_guard_support, cg_eff_reset, cg_eff_thunk_body_node, cg_eff_thunk_close, cg_eff_thunk_trace_enter,
     cg_eff_thunk_has_body, cg_eff_thunk_open, cg_eff_thunk_ret_tid, cg_eff_thunks_drained, cg_eff_lowered_thunks,
     cg_eff_thunk_set_body, cg_eff_thunk_body,
 }
@@ -625,7 +625,10 @@ fn emit_bodies(cfg: CgConfig, decls: List[Int]) ! Diag.Report {
 // after every signature that body may call.
 fn emit_derived_op_bodies() ! Diag.Report {
     set_current_inst(-1)
-    for s in cg_decl_derived_slots() { print_vtable_slot_fn(s.ret, s.symbol, s.params, lower_body(s.op)) }
+    for s in cg_decl_derived_slots() {
+        cg_trace_arm_default(s.op, s.effect_decl)
+        print_vtable_slot_fn(s.ret, s.symbol, s.params, lower_body(s.op))
+    }
 }
 
 // One lowered unit, checked before the printer reads it. The printer reads a tree by
@@ -759,15 +762,19 @@ fn lower_thunk_body(n: Int) -> Int ! Diag.Report {
     cg_expr_set_test_body(false)
     cg_expr_frame_clear()
     let k = tc_tid_kind(tc_resolve(ret))
+    let discards = k == TyKind.Void || k == TyKind.Never
+    let enter = cg_eff_thunk_trace_enter(n)
     cg_promote_body_enter()
-    let body = if k == TyKind.Void || k == TyKind.Never {
-        lower_block(body_node)
-    } else {
-        lower_block_returning(body_node)
-    }
+    let body = if discards { lower_block(body_node) } else { lower_block_returning(body_node) }
+    let leave = if body >= 0 && discards { cg_trace_exit_void(body_node) } else { [] }
+    cg_trace_body_leave()
     cg_promote_body_exit()
     cg_expr_set_return_type(-1)
-    verify_lowered_unit(body, body_node)
+    if body < 0 || enter.len() == 0 { return verify_lowered_unit(body, body_node) }
+    let mut stmts = enter
+    stmts.push(body)
+    for s in leave { stmts.push(s) }
+    verify_lowered_unit(ir_block(body_node, stmts), body_node)
 }
 
 // The definition half. Test blocks are not here: they are written beside the entry shim,

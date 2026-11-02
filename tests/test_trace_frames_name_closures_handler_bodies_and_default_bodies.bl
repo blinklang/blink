@@ -1,0 +1,105 @@
+// A closure, the body of an operation in a `with handler` block and the default body of an
+// operation of a user effect are frames (§8.15.8). A closure is `<frame>.fn@L:C`, a handler
+// body is `<frame>.handler@L:C.<EffectPath>.<op>` and a default body is
+// `module.<EffectPath>.<op>`, where L:C is the place of the `fn` or `handler` keyword and
+// the enter event has that place in its span. A closure that a std fn calls is one step
+// below the frame that called the std fn.
+
+import compile_test_helpers
+import std.json.{json_clear, json_parse, json_get, json_as_str, json_as_int}
+
+let SRC = #"effect Log {
+    effect Out {
+        fn write(s: Str)
+        fn emit(s: Str) { log.write(s) }
+    }
+}
+
+fn run() ! Log.Out {
+    log.emit("a")
+}
+
+fn main() ! IO {
+    let ys = [1, 2].map(fn(x: Int) -> Int { x + 1 })
+    with handler Log {
+        fn write(s: Str) { io.println(s) }
+    } {
+        run()
+    }
+    let add = fn(a: Int) -> Int {
+        let inner = fn(b: Int) -> Int { a + b }
+        inner(1)
+    }
+    io.println(ys.len() + add(2))
+}
+"#
+
+fn str_field(obj: Int, key: Str) -> Str {
+    let n = json_get(obj, key)
+    if n < 0 { "" } else { json_as_str(n) }
+}
+
+// Each enter and exit event as `event fn depth`, and for an enter also the line and column
+// of its span, one per line.
+fn shape(text: Str) -> Str {
+    let mut lines: List[Str] = []
+    for line in text.split("\n") {
+        if !line.starts_with("\{") { continue }
+        json_clear()
+        let obj = json_parse(line)
+        assert(obj >= 0)
+        let event = str_field(obj, "event")
+        if event != "enter" && event != "exit" { continue }
+        let head = "{event} {str_field(obj, "fn")} {json_as_int(json_get(obj, "depth"))}"
+        let span = json_get(obj, "span")
+        if span < 0 {
+            lines.push(head)
+        } else {
+            lines.push("{head} {json_as_int(json_get(span, "line"))}:{json_as_int(json_get(span, "col"))}")
+        }
+    }
+    lines.join("\n")
+}
+
+fn traced(bin: Str, value: Str) -> Str ! Process.Spawn {
+    let r = process.run("env", ["BLINK_TRACE={value}", bin]).unwrap()
+    assert_eq(r.out, "a\n5\n")
+    assert(r.success())
+    shape(r.err_out)
+}
+
+test "closures, handler bodies and default bodies are frames with the names of the spec" {
+    let bin = compile_test_helpers.build_bin(SRC, "trace_frames", ["--trace"])
+    let m = "trace_frames"
+    assert_eq(traced(bin, "all"), [
+        "enter {m}.main 0 12:1",
+        "enter {m}.main.fn@13:25 1 13:25",
+        "exit {m}.main.fn@13:25 1",
+        "enter {m}.main.fn@13:25 1 13:25",
+        "exit {m}.main.fn@13:25 1",
+        "enter {m}.run 1 8:1",
+        "enter {m}.Log.Out.emit 2 4:9",
+        "enter {m}.main.handler@14:10.Log.Out.write 3 14:10",
+        "exit {m}.main.handler@14:10.Log.Out.write 3",
+        "exit {m}.Log.Out.emit 2",
+        "exit {m}.run 1",
+        "enter {m}.main.fn@19:15 1 19:15",
+        "enter {m}.main.fn@19:15.fn@20:21 2 20:21",
+        "exit {m}.main.fn@19:15.fn@20:21 2",
+        "exit {m}.main.fn@19:15 1",
+        "exit {m}.main 0",
+    ].join("\n"))
+    compile_test_helpers.clean_bin("trace_frames")
+}
+
+test "the fn filter matches the segments of a closure and a handler body name" {
+    let bin = compile_test_helpers.build_bin(SRC, "trace_frames_filter", ["--trace"])
+    let m = "trace_frames_filter"
+    assert_eq(traced(bin, "fn:fn@13:25,event:enter"), [
+        "enter {m}.main.fn@13:25 1 13:25",
+        "enter {m}.main.fn@13:25 1 13:25",
+    ].join("\n"))
+    assert_eq(traced(bin, "fn:Out.write,event:enter"), "enter {m}.main.handler@14:10.Log.Out.write 3 14:10")
+    assert_eq(traced(bin, "fn:Log.Out.emit,event:enter"), "enter {m}.Log.Out.emit 2 4:9")
+    compile_test_helpers.clean_bin("trace_frames_filter")
+}

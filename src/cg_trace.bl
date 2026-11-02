@@ -21,24 +21,32 @@
 // exit of the BlockHandler impl that an `impl Closeable` gets, is no frame: no source text
 // spells it. The driver arms a body before it lowers it, and lower_fn takes the arm, so the
 // closures a body queued, which lower after it, carry no trace calls of that body.
+//
+// A closure and the body of an operation in a handler literal are frames of their own, named
+// after the frame that holds them. The thunk queue lowers them after that frame's body is
+// done, so each takes its frame name when it is queued, while the frame that holds it is the
+// one being lowered. The default body of an operation of a user effect is a frame too, which
+// the driver arms with its effect.
 
 import std.path.{path_stem}
 import ast.{NodeKind}
-import parser.{impl_provided_by_closeable, node_kind, node_module, node_name, node_params, sublist_get, sublist_length}
-import typecheck.{TyKind, TYPE_BOOL, TYPE_INT, TYPE_STR, TYPE_VOID, tc_get_dotted_module_path, tc_module_in_std, tc_tid_kind, tc_type_str}
+import parser.{impl_provided_by_closeable, node_col, node_elements, node_kind, node_line, node_methods, node_module, node_name, node_params, sublist_get, sublist_length}
+import typecheck.{TyKind, TYPE_BOOL, TYPE_INT, TYPE_STR, TYPE_VOID, builtin_effect_op_sub, builtin_op_sub_effect, io_op_sub_effect, tc_get_dotted_module_path, tc_handler_effect_root, tc_module_in_std, tc_tid_kind, tc_type_str}
 import layout.{LayoutRecord, Position, layout_of, tid_of_node}
 import cname.{c_local_name, c_mint_local, c_runtime_helper, c_str_const}
 import ir.{ir_block, ir_call_runtime, ir_col, ir_const, ir_expr_stmt, ir_if, ir_let, ir_line_text, ir_trace_frame, ir_var_ref}
 import diagnostics.{Diag, diag_file_for_node}
-import cg_reg.{cg_reg_impl_of}
+import cg_reg.{cg_reg_effect_root_decl, cg_reg_impl_of}
 import cg_call.{cg_call_has_debug, lower_debug_of_value}
 import cg_expr.{cg_expr_can_display, cg_expr_display_text, cg_expr_pending_count, cg_expr_take_pending, x_layout_checked, x_stopped}
 
 // on: the unit is built with --trace. armed: the declaration the driver will lower next, or
-// -1. traced: the body being lowered is traced, and fn_name and module name its events.
+// -1, and armed_effect the effect that declares it when it is the default body of an
+// operation. traced: the body being lowered is traced, and fn_name and module name its events.
 type TraceUnit {
     on: Bool = false
     armed: Int = -1
+    armed_effect: Int = -1
     traced: Bool = false
     fn_name: Str = ""
     module: Str = ""
@@ -57,25 +65,85 @@ pub fn cg_trace_arm(decl: Int) {
     tr_unit = TraceUnit { on: true, armed: decl }
 }
 
+// The default body of an operation of `effect_decl` is armed with its effect, which names it.
+pub fn cg_trace_arm_default(op: Int, effect_decl: Int) {
+    if !tr_unit.on { return }
+    tr_unit = TraceUnit { on: true, armed: op, armed_effect: effect_decl }
+}
+
 // Takes the arm when it names this body, and answers the statements that open the body:
 // the push, and the enter event when it prints. None when the body is not traced.
 pub fn cg_trace_body_enter(fn_node: Int) -> List[Int] ! Diag.Report {
     let armed = tr_unit.armed == fn_node
+    let effect_decl = tr_unit.armed_effect
     tr_unit = TraceUnit { on: tr_unit.on }
-    if !armed || tc_module_in_std(tr_module_key(fn_node)) || tr_compiler_written(fn_node) { return [] }
+    if !armed { return [] }
+    if effect_decl >= 0 {
+        if tc_module_in_std(tr_module_key(effect_decl)) { return [] }
+        let module = tr_module_name(effect_decl)
+        let path = tr_effect_path(node_name(effect_decl), node_name(fn_node))
+        return tr_enter(fn_node, fn_node, "{module}.{path}.{node_name(fn_node)}", module, tr_param_tids(fn_node))
+    }
+    if tc_module_in_std(tr_module_key(fn_node)) || tr_compiler_written(fn_node) { return [] }
     let module = tr_module_name(fn_node)
-    let fn_name = tr_frame_name(fn_node, module)
-    let mut args = [tr_text(fn_node, fn_name), tr_text(fn_node, module),
-        tr_text(fn_node, diag_file_for_node(fn_node)), tr_int(fn_node, ir_line_text(fn_node)),
-        tr_int(fn_node, "{ir_col(fn_node)}")]
+    tr_enter(fn_node, fn_node, tr_frame_name(fn_node, module), module, tr_param_tids(fn_node))
+}
+
+// The frame name of a closure written at `node` in the body being lowered, or "" when that
+// body is not traced, as a closure in the std library is no frame (§8.15.8).
+pub fn cg_trace_closure_frame(node: Int) -> Str {
+    if !tr_unit.traced { return "" }
+    "{tr_unit.fn_name}.fn@{node_line(node)}:{node_col(node)}"
+}
+
+// The frame name of the body of operation `op` in a handler literal of `eff` written at
+// `node` in the body being lowered, or "" when that body is not traced.
+pub fn cg_trace_handler_frame(node: Int, eff: Str, op: Str) -> Str {
+    if !tr_unit.traced { return "" }
+    let path = tr_effect_path(eff, op)
+    "{tr_unit.fn_name}.handler@{node_line(node)}:{node_col(node)}.{path}.{op}"
+}
+
+// The module of the events of the body being lowered, which a closure or a handler body
+// written in it shares.
+pub fn cg_trace_frame_module() -> Str { tr_unit.module }
+
+// The statements that open the body of a closure or a handler operation that is the frame
+// `fn_name`: the push, and the enter event when it prints. `sig` holds the parameters, whose
+// types are `tids`, and `at` is the keyword the enter event names in its span. None when
+// fn_name is "".
+pub fn cg_trace_thunk_enter(sig: Int, at: Int, fn_name: Str, module: Str, tids: List[Int]) -> List[Int] ! Diag.Report {
+    tr_unit = TraceUnit { on: tr_unit.on }
+    if fn_name.is_empty() { return [] }
+    tr_enter(sig, at, fn_name, module, tids)
+}
+
+fn tr_param_tids(fn_node: Int) -> List[Int] ! Diag.Report {
+    let mut out: List[Int] = []
     let params = node_params(fn_node)
     let n = if params == -1 { 0 } else { sublist_length(params) }
-    args.push(tr_int(fn_node, "{n}"))
+    let mut i = 0
+    while i < n {
+        out.push(tid_of_node(sublist_get(params, i)))
+        i = i + 1
+    }
+    out
+}
+
+// The push and the enter event of a frame. The span of the event is the place of `at`.
+fn tr_enter(sig: Int, at: Int, fn_name: Str, module: Str, tids: List[Int]) -> List[Int] ! Diag.Report {
+    let mut args = [tr_text(at, fn_name), tr_text(at, module),
+        tr_text(at, diag_file_for_node(at)), tr_int(at, ir_line_text(at)),
+        tr_int(at, "{ir_col(at)}")]
+    let params = node_params(sig)
+    let n = if params == -1 { 0 } else { sublist_length(params) }
+    if tids.len() != n { return [] }
+    args.push(tr_int(at, "{n}"))
     let render: List[Int] = []
     let mut i = 0
     while i < n {
         let p = sublist_get(params, i)
-        let tid = tid_of_node(p)
+        let tid = tids.get(i).unwrap()
         if tid < 0 { return [] }
         let rec = tr_local(tid, p)
         if x_stopped(rec) { return [] }
@@ -85,11 +153,11 @@ pub fn cg_trace_body_enter(fn_node: Int) -> List[Int] ! Diag.Report {
         args.push(text)
         i = i + 1
     }
-    let mut event = tr_muted(fn_node, render)
-    event.push(tr_call(fn_node, TYPE_VOID, "trace_enter_event", args))
-    let gate = tr_call_value(fn_node, TYPE_BOOL, "trace_fn_enter", [tr_text(fn_node, fn_name), tr_text(fn_node, module)])
+    let mut event = tr_muted(at, render)
+    event.push(tr_call(at, TYPE_VOID, "trace_enter_event", args))
+    let gate = tr_call_value(at, TYPE_BOOL, "trace_fn_enter", [tr_text(at, fn_name), tr_text(at, module)])
     tr_unit = TraceUnit { on: true, traced: true, fn_name: fn_name, module: module }
-    [ir_if(fn_node, gate, ir_block(fn_node, event), -1), ir_trace_frame(fn_node)]
+    [ir_if(at, gate, ir_block(at, event), -1), ir_trace_frame(at)]
 }
 
 // The body has lowered: nothing after it is the traced body.
@@ -200,6 +268,33 @@ fn tr_frame_name(fn_node: Int, module: Str) -> Str {
     let head = written.split("[").get(0) ?? written
     let parts = head.split(".")
     "{module}.{parts.get(parts.len() - 1) ?? head}.{node_name(fn_node)}"
+}
+
+// The effect that declares operation `op` of a handler of `eff`, written with its parent,
+// as in `Log.Out` or `IO.Print` (§8.15.8). An effect with no sub-effect that declares the
+// operation is the root alone.
+fn tr_effect_path(eff: Str, op: Str) -> Str {
+    let root = tc_handler_effect_root(eff)
+    let decl = cg_reg_effect_root_decl(eff)
+    if decl >= 0 {
+        let children = node_elements(decl)
+        let n = if children == -1 { 0 } else { sublist_length(children) }
+        let mut i = 0
+        while i < n {
+            let child = sublist_get(children, i)
+            let ops = node_methods(child)
+            let m = if ops == -1 { 0 } else { sublist_length(ops) }
+            let mut k = 0
+            while k < m {
+                if node_name(sublist_get(ops, k)) == op { return "{root}.{node_name(child)}" }
+                k = k + 1
+            }
+            i = i + 1
+        }
+        return root
+    }
+    let sub = builtin_effect_op_sub(root, op)
+    if sub == "" { root } else { "{root}.{sub}" }
 }
 
 fn tr_local(tid: Int, node: Int) -> LayoutRecord ! Diag.Report {
