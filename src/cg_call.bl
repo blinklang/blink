@@ -73,7 +73,7 @@ import cg_expr.{
     lower_expr, lower_expr_as_value, cg_expr_async_scope_current, cg_expr_push_pending, cg_expr_pending_count, cg_expr_take_pending,
     x_unbox_payload, x_layout_checked, lower_value_as_text, cg_expr_option_some, cg_expr_option_none, cg_expr_option_wrap,
     x_is_c_comparable, cg_expr_builds_carrier, cg_expr_lower_carrier_ctor, cg_expr_sequence, cg_expr_lower_pair,
-    x_lower_default, cg_expr_field_value, cg_expr_field_stored, x_panic_at, x_panic_what,
+    x_lower_default, cg_expr_field_value, cg_expr_field_stored, x_panic_at, x_panic_what, x_site_args,
 }
 import cg_stmt.{enum_tag_word, lower_block_into}
 import cg_eff.{
@@ -1511,7 +1511,7 @@ fn cc_checked_tail(node: Int, removes: Bool) -> Int ! Diag.Report {
     cc_temp_ref(node, tid, carrier, held)
 }
 
-// `.remove(i)` on a List answers the bare element, not an Option: blink_list_remove makes
+// `.remove(i)` on a List answers the bare element, not an Option: blink_list_remove_at makes
 // the bounds test itself and panics as an out-of-range `xs[i]` does, so unlike `get` and
 // `pop` there is no carrier to fill and the call is the whole lowering.
 fn cc_list_remove(node: Int, obj: Int) -> Int ! Diag.Report {
@@ -1527,7 +1527,56 @@ fn cc_list_remove(node: Int, obj: Int) -> Int ! Diag.Report {
     if index < 0 { return -1 }
     let receiver = cc_receiver_held(lowered, recv_end)
     if receiver < 0 { return -1 }
-    cg_call_element_from_runtime(node, tid, c_runtime_helper("list_remove"), [receiver, index])
+    let site = x_site_args(node)
+    if site.len() == 0 { return -1 }
+    cg_call_element_from_runtime(node, tid, c_runtime_helper("list_remove_at"), [receiver, index, site.get(0).unwrap(), site.get(1).unwrap()])
+}
+
+// The intrinsic declarations that fault on a bad index, each with the runtime entry that
+// takes the Blink call site and the count of written arguments. The binding the declaration
+// names takes no site, so a call to one of these is lowered to the sited entry instead.
+fn cc_sited_fault_entry(declared: Str) -> Str {
+    let mut table: Map[Str, Str] = Map()
+    table.insert("std_str:str_char_at", "str_char_at_at")
+    table.insert("std_str:str_byte_slice", "str_byte_slice_at")
+    table.insert("std_bytes:bytes_set", "bytes_set_at")
+    table.get(declared) ?? ""
+}
+
+fn cc_sited_fault_arity(op: Str) -> Int {
+    let mut table: Map[Str, Int] = Map()
+    table.insert("str_char_at_at", 1)
+    table.insert("str_byte_slice_at", 2)
+    table.insert("bytes_set_at", 2)
+    table.get(op) ?? 0
+}
+
+fn cc_sited_fault_call(node: Int, obj: Int, kind: TyKind, method: Str, op: Str) -> Int ! Diag.Report {
+    let written = node_args(node)
+    let want = cc_sited_fault_arity(op)
+    let given = sublist_length(written)
+    if given != want { return cc_intrinsic_arity_wrong(node, kind, method, want, given) }
+    let tid = tid_of_node(node)
+    if tid < 0 { return -1 }
+    let result = cc_local(tid, node)
+    if cc_stopped(result) { return -1 }
+    let lowered = lower_expr(obj)
+    if lowered < 0 { return -1 }
+    let mut parts = [lowered]
+    let mut ends = [cg_expr_pending_count()]
+    let mut i = 0
+    while i < want {
+        let a = lower_expr_as_value(sublist_get(written, i))
+        if a < 0 { return -1 }
+        parts.push(a)
+        ends.push(cg_expr_pending_count())
+        i = i + 1
+    }
+    let mut args = cg_expr_sequence(parts, ends, false)
+    let site = x_site_args(node)
+    if site.len() == 0 { return -1 }
+    for a in site { args.push(a) }
+    ir_call_runtime(tid, node, result.c_spelling, c_runtime_helper(op), result.slot_form, args)
 }
 
 // Not a checked get. The seam reads an element, so any other node reached it by a wrong
@@ -4100,6 +4149,8 @@ fn cc_field(owner_tid: Int, field_tid: Int, node: Int) -> LayoutRecord ! Diag.Re
 // foreign binding carries the symbol its annotation gives, which its Blink name does not
 // always spell. Naming symbols here would repeat both rules and could disagree with them.
 fn lower_intrinsic_method(node: Int, obj: Int, kind: TyKind, method: Str, row: Str) -> Int ! Diag.Report {
+    let sited = cc_sited_fault_entry(row)
+    if sited != "" { return cc_sited_fault_call(node, obj, kind, method, sited) }
     let cut = match row.byte_index_of(":", 0) {
         Some(i) => i
         None => { return cc_intrinsic_row_malformed(node, row) }
@@ -4144,9 +4195,21 @@ fn cc_lower_runtime_method(node: Int, obj: Int, kind: TyKind, method: Str, op: S
     if cc_stopped(result) { return -1 }
     let receiver = lower_expr(obj)
     if receiver < 0 { return -1 }
-    let args = cc_store_args(node, receiver, want, shape)
+    let mut args = cc_store_args(node, receiver, want, shape)
     if args.len() == 0 { return -1 }
-    ir_call_runtime(tid, node, result.c_spelling, c_runtime_helper(op), result.slot_form, args)
+    let sited = cc_sited_store(op)
+    if sited == "" { return ir_call_runtime(tid, node, result.c_spelling, c_runtime_helper(op), result.slot_form, args) }
+    let site = x_site_args(node)
+    if site.len() == 0 { return -1 }
+    for a in site { args.push(a) }
+    ir_call_runtime(tid, node, result.c_spelling, c_runtime_helper(sited), result.slot_form, args)
+}
+
+// The stores that fault on a bad index take the Blink call site, so the fault names it.
+fn cc_sited_store(op: Str) -> Str {
+    if op == "list_set" { return "list_set_at" }
+    if op == "list_insert" { return "list_insert_at" }
+    ""
 }
 
 // The receiver followed by the written arguments, with the element boxed if the slot holds

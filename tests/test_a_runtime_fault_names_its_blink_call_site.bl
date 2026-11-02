@@ -1,0 +1,113 @@
+// A fault that Blink code can cause is a panic with a site in that code (sections/02_syntax.md
+// §2.20 *A fault that the runtime raises*). The hook gets it, its message has no `blink: `
+// lead-in and names the index and the length, and `file` and `line` name the call that
+// caused it. A fault with no Blink site is a fatal runtime error, and the hook does not run.
+
+import compile_test_helpers.{compile_and_run}
+
+fn report_src() -> Str {
+    #"fn report(p: PanicInfo) -> Never ! IO.Eprint, Env.Exit {
+    let at = match p.line {
+        Some(n) => "{p.file}:{n}"
+        None => p.file
+    }
+    io.eprintln("fatal: {p.message} at {at}")
+    env.exit(70)
+}
+"#
+}
+
+// The fault stands on line 14 of each program.
+fn hooked(stmt: Str) -> Str {
+    report_src().concat(#"
+fn main() ! IO, Env {
+    with on_panic(report) {
+        let mut xs = [1]
+        let i = xs.len() + 3
+"#).concat("        {stmt}\n").concat(#"        io.println("{xs.len()} {i}")
+    }
+}
+"#)
+}
+
+fn expect_hook_report(stmt: Str, tag: Str, message: Str) ! FS.Delete, FS.Write, Process.Spawn, FS.Read, Env.Read {
+    let r = compile_and_run(hooked(stmt), tag)
+    assert(r.exit_code == 70, "exit {r.exit_code}: {r.err_out}")
+    assert(r.err_out.starts_with("fatal: {message} at "), r.err_out)
+    assert(r.err_out.ends_with("/{tag}.bl:14\n"), r.err_out)
+    assert_eq(r.err_out.split("\n").len(), 2)
+}
+
+test "the spec example: a list set out of range reaches the hook with its site" {
+    let tag = "rf_list_set_{getpid()}"
+    expect_hook_report("xs.set(i, 2)", tag, "list set index out of bounds: 4, length 1")
+}
+
+test "a list insert out of range reaches the hook with its site" {
+    let tag = "rf_list_insert_{getpid()}"
+    expect_hook_report("xs.insert(i, 2)", tag, "list insert index out of bounds: 4, length 1")
+}
+
+test "a list remove out of range reaches the hook with its site" {
+    let tag = "rf_list_remove_{getpid()}"
+    expect_hook_report("let _ = xs.remove(i)", tag, "list remove index out of bounds: 4, length 1")
+}
+
+test "a Bytes set out of range reaches the hook with its site" {
+    let tag = "rf_bytes_set_{getpid()}"
+    expect_hook_report("Bytes.new().set(i, 1)", tag, "bytes set index out of bounds: 4, length 0")
+}
+
+test "a Str byte_at out of range reaches the hook with its site" {
+    let tag = "rf_byte_at_{getpid()}"
+    expect_hook_report("let _ = \"ab\".byte_at(i)", tag, "Str.byte_at index out of bounds: 4, length 2")
+}
+
+test "a Str byte_slice that cuts a codepoint reaches the hook with its site" {
+    let tag = "rf_byte_slice_{getpid()}"
+    expect_hook_report("let _ = \"aé\".byte_slice(0, i - 2)", tag,
+        "Str.byte_slice end=2 is inside a codepoint: cuts U+00E9 at bytes 1..3, length 3")
+}
+
+test "an overflow reaches the hook with its site" {
+    let tag = "rf_overflow_{getpid()}"
+    expect_hook_report("let _ = 9223372036854775807 + i", tag,
+        "Int overflow in addition (9223372036854775807 + 4)")
+}
+
+// §2.20 *No hook*: the report holds the fault text and the site, with no `blink: `.
+test "with no hook a list set out of range reports its text and site and exits 101" {
+    let tag = "rf_no_hook_{getpid()}"
+    let src = #"fn main() ! IO {
+    let mut xs = [1]
+    let i = xs.len() + 3
+    xs.set(i, 2)
+}
+"#
+    let r = compile_and_run(src, tag)
+    assert(r.exit_code == 101, "exit {r.exit_code}: {r.err_out}")
+    assert(r.err_out.contains("list set index out of bounds: 4, length 1"), r.err_out)
+    assert(r.err_out.contains("{tag}.bl:4"), r.err_out)
+    assert(!r.err_out.contains("blink: "), r.err_out)
+}
+
+// The C side returns NULL for a Str, which breaks the layout rule of `Str`: the fault is in
+// the runtime, at no call that Blink code can name.
+test "a fault with no Blink site does not run the hook" {
+    let tag = "rf_no_site_{getpid()}"
+    let src = report_src().concat(#"
+@ffi("getenv")
+@trusted(audit: "TEST-NULL-STR")
+fn bad_name(name: Str) -> Str ! () {}
+
+fn main() ! IO, Env {
+    with on_panic(report) {
+        io.println("{bad_name("BLINK_RF_SURELY_UNSET_VAR").len()}")
+    }
+}
+"#)
+    let r = compile_and_run(src, tag)
+    assert(r.exit_code != 70, "the hook ran: {r.err_out}")
+    assert(r.exit_code != 0, "no fault: {r.out}")
+    assert(!r.err_out.contains("fatal: "), r.err_out)
+}

@@ -350,6 +350,22 @@ BLINK_RT_FN void __blink_panic_dispatchf(const char* fmt, ...) {
 }
 #endif
 
+BLINK_RT_FN void __blink_panic_dispatch_at(const char* what, const char* file, int64_t line);
+
+/* A fault that Blink code caused, raised at the call that caused it. The text has no
+   `blink: ` lead-in, so a panic hook sees one message form for a fault and for `panic()`. */
+BLINK_RT_FN void __blink_panic_dispatchf_at(const char* file, int64_t line, const char* fmt, ...);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void __blink_panic_dispatchf_at(const char* file, int64_t line, const char* fmt, ...) {
+    char __buf[BLINK_PANIC_MSG_SIZE];
+    va_list __ap;
+    va_start(__ap, fmt);
+    vsnprintf(__buf, BLINK_PANIC_MSG_SIZE, fmt, __ap);
+    va_end(__ap);
+    __blink_panic_dispatch_at(__buf, file, line);
+}
+#endif
+
 BLINK_RT_FN blink_arena_chunk* blink_arena_chunk_new(int64_t capacity);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN blink_arena_chunk* blink_arena_chunk_new(int64_t capacity) {
@@ -1168,6 +1184,18 @@ BLINK_RT_FN void blink_list_set(blink_list* l, int64_t index, void* item) {
 }
 #endif
 
+/* The `_at` forms take the Blink call site, so the fault names the line that caused it. */
+BLINK_RT_FN void blink_list_set_at(blink_list* l, int64_t index, void* item, const char* file, int64_t line);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void blink_list_set_at(blink_list* l, int64_t index, void* item, const char* file, int64_t line) {
+    if (index < 0 || index >= l->len) {
+        __blink_panic_dispatchf_at(file, line, "list set index out of bounds: %lld, length %lld",
+                                   (long long)index, (long long)l->len);
+    }
+    l->items[index] = item;
+}
+#endif
+
 BLINK_RT_FN void* blink_list_pop(blink_list* l);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN void* blink_list_pop(blink_list* l) {
@@ -1191,6 +1219,17 @@ BLINK_RT_FN void blink_list_insert(blink_list* l, int64_t index, void* item) {
 }
 #endif
 
+BLINK_RT_FN void blink_list_insert_at(blink_list* l, int64_t index, void* item, const char* file, int64_t line);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void blink_list_insert_at(blink_list* l, int64_t index, void* item, const char* file, int64_t line) {
+    if (index < 0 || index > l->len) {
+        __blink_panic_dispatchf_at(file, line, "list insert index out of bounds: %lld, length %lld",
+                                   (long long)index, (long long)l->len);
+    }
+    blink_list_insert(l, index, item);
+}
+#endif
+
 BLINK_RT_FN void* blink_list_remove(blink_list* l, int64_t index);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN void* blink_list_remove(blink_list* l, int64_t index) {
@@ -1201,6 +1240,17 @@ BLINK_RT_FN void* blink_list_remove(blink_list* l, int64_t index) {
     /* The vacated slot would otherwise keep the removed element reachable to the GC. */
     l->items[l->len] = NULL;
     return item;
+}
+#endif
+
+BLINK_RT_FN void* blink_list_remove_at(blink_list* l, int64_t index, const char* file, int64_t line);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void* blink_list_remove_at(blink_list* l, int64_t index, const char* file, int64_t line) {
+    if (index < 0 || index >= l->len) {
+        __blink_panic_dispatchf_at(file, line, "list remove index out of bounds: %lld, length %lld",
+                                   (long long)index, (long long)l->len);
+    }
+    return blink_list_remove(l, index);
 }
 #endif
 
@@ -2104,6 +2154,17 @@ BLINK_RT_FN void blink_bytes_set(blink_bytes* b, int64_t index, int64_t byte) {
 }
 #endif
 
+BLINK_RT_FN void blink_bytes_set_at(blink_bytes* b, int64_t index, int64_t byte, const char* file, int64_t line);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void blink_bytes_set_at(blink_bytes* b, int64_t index, int64_t byte, const char* file, int64_t line) {
+    if (index < 0 || index >= b->len) {
+        __blink_panic_dispatchf_at(file, line, "bytes set index out of bounds: %lld, length %lld",
+                                   (long long)index, (long long)b->len);
+    }
+    b->data[index] = (uint8_t)(byte & 0xFF);
+}
+#endif
+
 BLINK_RT_FN int64_t blink_bytes_len(const blink_bytes* b);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN int64_t blink_bytes_len(const blink_bytes* b) {
@@ -2805,6 +2866,18 @@ BLINK_RT_FN uint8_t blink_str_char_at(const char* s, int64_t i) {
 }
 #endif
 
+BLINK_RT_FN uint8_t blink_str_char_at_at(const char* s, int64_t i, const char* file, int64_t line);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN uint8_t blink_str_char_at_at(const char* s, int64_t i, const char* file, int64_t line) {
+    int64_t len = blink_str_len(s);
+    if (__builtin_expect((uint64_t)i >= (uint64_t)len, 0)) {
+        __blink_panic_dispatchf_at(file, line, "Str.byte_at index out of bounds: %lld, length %lld",
+                                   (long long)i, (long long)len);
+    }
+    return (uint8_t)s[i];
+}
+#endif
+
 /* One step of a for-in over a Str: decodes the scalar value at byte *pos into *out, moves
  * *pos past it and returns 1, or returns 0 at the terminating NUL. A Str is valid UTF-8 by
  * the spec, but FFI and Bytes.to_str can still hand in overlong forms, surrogates or cut
@@ -3331,36 +3404,56 @@ BLINK_RT_FN int64_t blink_str_index_of_from(const char* s, const char* needle, i
 
 /* Panics for a byte offset `off` that falls inside a codepoint. The message names the
    codepoint the offset cuts and the bytes it spans, so the caller can see which unit
-   it mixed up. */
-BLINK_RT_FN void blink_str_cut_panic(const char* method, const char* bound, const char* s, int64_t off, int64_t len);
+   it mixed up. A NULL file is a caller with no Blink site to name. */
+BLINK_RT_FN void blink_str_cut_panic_at(const char* method, const char* bound, const char* s, int64_t off, int64_t len,
+                                        const char* file, int64_t line);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN void blink_str_cut_panic(const char* method, const char* bound, const char* s, int64_t off, int64_t len) {
+BLINK_RT_FN void blink_str_cut_panic_at(const char* method, const char* bound, const char* s, int64_t off, int64_t len,
+                                        const char* file, int64_t line) {
     int64_t lead = off;
     while (lead > 0 && off - lead < 3 && BLINK_UTF8_IS_CONT(s[lead])) lead--;
     int64_t next = lead;
     int32_t cp = 0xFFFD;
     if (!blink_str_next_char(s, &next, &cp)) next = lead + 1;
+    if (file) {
+        __blink_panic_dispatchf_at(file, line, "Str.%s %s=%lld is inside a codepoint: cuts U+%04X at bytes %lld..%lld, length %lld",
+                                   method, bound, (long long)off, (unsigned)cp, (long long)lead, (long long)next, (long long)len);
+    }
     __blink_panic_dispatchf("blink: Str.%s %s=%lld is inside a codepoint: cuts U+%04X at bytes %lld..%lld byte_len=%lld",
                             method, bound, (long long)off, (unsigned)cp, (long long)lead, (long long)next, (long long)len);
 }
 #endif
 
+BLINK_RT_FN void blink_str_cut_panic(const char* method, const char* bound, const char* s, int64_t off, int64_t len);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void blink_str_cut_panic(const char* method, const char* bound, const char* s, int64_t off, int64_t len) {
+    blink_str_cut_panic_at(method, bound, s, off, len, NULL, 0);
+}
+#endif
+
 /* The out-of-range rule clamps first; a cut inside a codepoint is never clamped,
    because any result would be invalid UTF-8 or a silent move of the caller's offset. */
-BLINK_RT_FN const char* blink_str_byte_slice(const char* s, int64_t start, int64_t end);
+BLINK_RT_FN const char* blink_str_byte_slice_at(const char* s, int64_t start, int64_t end, const char* file, int64_t line);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN const char* blink_str_byte_slice(const char* s, int64_t start, int64_t end) {
+BLINK_RT_FN const char* blink_str_byte_slice_at(const char* s, int64_t start, int64_t end, const char* file, int64_t line) {
     int64_t slen = blink_str_len(s);
     if (start < 0) start = 0;
     if (end > slen) end = slen;
     if (start >= end) return BLINK_STR_EMPTY;
-    if (BLINK_UTF8_IS_CONT(s[start])) blink_str_cut_panic("byte_slice", "start", s, start, slen);
-    if (BLINK_UTF8_IS_CONT(s[end])) blink_str_cut_panic("byte_slice", "end", s, end, slen);
+    if (BLINK_UTF8_IS_CONT(s[start])) blink_str_cut_panic_at("byte_slice", "start", s, start, slen, file, line);
+    if (BLINK_UTF8_IS_CONT(s[end])) blink_str_cut_panic_at("byte_slice", "end", s, end, slen, file, line);
     int64_t rlen = end - start;
     char* buf = blink_str_alloc(rlen);
     memcpy(buf, s + start, (size_t)rlen);
     blink_str_count_and_set_cps(buf);
     return buf;
+}
+#endif
+
+BLINK_RT_FN const char* blink_str_byte_slice(const char* s, int64_t start, int64_t end);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN const char* blink_str_byte_slice(const char* s, int64_t start, int64_t end) {
+    return blink_str_byte_slice_at(s, start, end, NULL, 0);
 }
 #endif
 
