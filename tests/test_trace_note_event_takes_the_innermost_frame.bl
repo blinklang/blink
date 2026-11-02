@@ -1,0 +1,254 @@
+// A note event belongs to the innermost traced frame of its thread: a closure, a method, a
+// handler body or a default body when the call is in one (§8.15.3, §8.15.8). msg runs before
+// the note writes, so what msg calls comes first. The note is one line of the stream: it keeps
+// program order with stderr writes, never splits around another thread, and a closed stream
+// stops it and not the program (§8.15.7, §8.15.13).
+
+import compile_test_helpers
+import std.process.{ChildEnd}
+import std.json.{json_clear, json_parse, json_get, json_as_str, json_as_int}
+
+let FRAMES_SRC = #"effect Log {
+    effect Out {
+        fn write(s: Str)
+        fn emit(s: Str) {
+            trace.log("c", "default")
+            log.write(s)
+        }
+    }
+}
+
+type P { v: Int }
+
+trait Area {
+    fn area(self) -> Int
+}
+
+impl Area for P {
+    fn area(self) -> Int {
+        trace.log("c", "method")
+        self.v
+    }
+}
+
+fn run() ! Log.Out {
+    log.emit("a")
+}
+
+fn main() ! IO {
+    let ys = [1].map(fn(x: Int) -> Int {
+        trace.log("c", "closure")
+        x + 1
+    })
+    let area = P { v: 3 }.area()
+    with handler Log {
+        fn write(s: Str) {
+            trace.log("c", "handler")
+            io.println(s)
+        }
+    } {
+        run()
+    }
+    io.println(ys.len() + area)
+}
+"#
+
+let SPAWN_SRC = #"fn main() ! IO {
+    let h = async.spawn(fn() -> Str {
+        trace.log("c", "spawned")
+        "x"
+    })
+    io.println(h.await)
+}
+"#
+
+let NESTED_SRC = #"fn inner() -> Str {
+    trace.log("c", "from inner")
+    "i"
+}
+
+fn outer() {
+    trace.log("c", "from outer {inner()}")
+}
+
+fn main() ! IO {
+    outer()
+    io.println("end")
+}
+"#
+
+let DISPLAY_SRC = #"type B { v: Int }
+
+impl Display for B {
+    fn fmt(self, sb: StringBuilder) {
+        trace.log("disp", "render {self.v}")
+        sb.write("B={self.v}")
+    }
+}
+
+fn take(b: B) -> Int {
+    b.v
+}
+
+fn main() ! IO {
+    let n = take(B { v: 1 })
+    let text = "{B { v: 2 }}"
+    io.println("{n} {text}")
+}
+"#
+
+let ORDER_SRC = #"fn step() ! IO.Eprint {
+    io.eprintln("before")
+    trace.log("c", "middle")
+    io.eprintln("after")
+}
+
+fn main() ! IO {
+    step()
+}
+"#
+
+let PANIC_SRC = #"fn boom() -> Str {
+    panic("msg was evaluated")
+}
+
+fn main() {
+    trace.log("c", "x {boom()}")
+}
+"#
+
+let CLOSED_SRC = #"fn step(n: Int) -> Int {
+    trace.log("c", "step {n}")
+    n + 1
+}
+
+fn main() ! IO, Env {
+    let mut total = 0
+    let mut i = 0
+    while i < 5000 {
+        total = step(total)
+        i = i + 1
+    }
+    io.println("total {total}")
+    env.exit(7)
+}
+"#
+
+let THREADS_SRC = #"fn work(id: Int) -> Int {
+    let mut i = 0
+    while i < 200 {
+        trace.log("c", "worker {id} line {i}")
+        i = i + 1
+    }
+    i
+}
+
+fn main() ! IO {
+    let a = async.spawn(fn() -> Int { work(1) })
+    let b = async.spawn(fn() -> Int { work(2) })
+    let c = async.spawn(fn() -> Int { work(3) })
+    io.println(a.await + b.await + c.await)
+}
+"#
+
+fn run_note(bin: Str, filter: Str) -> Str ! Process.Spawn {
+    let r = process.run("env", ["BLINK_TRACE_CHANNELS=all", "BLINK_TRACE={filter}", bin]).unwrap()
+    assert(r.success(), r.err_out)
+    r.err_out
+}
+
+// Each event line of the stream as `event fn depth`, a note with its msg in place of its event.
+fn shape(text: Str) -> List[Str] {
+    let mut rows: List[Str] = []
+    for line in text.split("\n") {
+        if line == "" { continue }
+        json_clear()
+        let obj = json_parse(line)
+        assert(obj >= 0, "not JSON: {line}")
+        let event = json_as_str(json_get(obj, "event"))
+        let name = json_as_str(json_get(obj, "fn"))
+        let depth = json_as_int(json_get(obj, "depth"))
+        if event == "note" {
+            rows.push("{json_as_str(json_get(obj, "msg"))} {name} {depth}")
+        } else {
+            rows.push("{event} {name} {depth}")
+        }
+    }
+    rows
+}
+
+test "a note in a closure, a method, a default body or a handler body takes that frame" {
+    let bin = compile_test_helpers.build_bin(FRAMES_SRC, "trace_note_frames", ["--trace"])
+    assert_eq(shape(run_note(bin, "event:note")).join("\n"), [
+        "closure trace_note_frames.main.fn@29:22 1",
+        "method trace_note_frames.P.area 1",
+        "default trace_note_frames.Log.Out.emit 2",
+        "handler trace_note_frames.main.handler@34:10.Log.Out.write 3",
+    ].join("\n"))
+    compile_test_helpers.clean_bin("trace_note_frames")
+}
+
+test "a note in a spawned closure takes that closure as its frame, at depth 0 on its thread" {
+    let bin = compile_test_helpers.build_bin(SPAWN_SRC, "trace_note_spawn", ["--trace"])
+    assert_eq(shape(run_note(bin, "event:note")).join("\n"), "spawned trace_note_spawn.main.fn@2:25 0")
+    compile_test_helpers.clean_bin("trace_note_spawn")
+}
+
+test "what msg calls comes before the note: its enter, its own note and its exit" {
+    let bin = compile_test_helpers.build_bin(NESTED_SRC, "trace_note_nested", ["--trace"])
+    let f = "trace_note_nested"
+    assert_eq(shape(run_note(bin, "event:enter+exit+note")).join("\n"), [
+        "enter {f}.main 0",
+        "enter {f}.outer 1",
+        "enter {f}.inner 2",
+        "from inner {f}.inner 2",
+        "exit {f}.inner 2",
+        "from outer i {f}.outer 1",
+        "exit {f}.outer 1",
+        "exit {f}.main 0",
+    ].join("\n"))
+    compile_test_helpers.clean_bin("trace_note_nested")
+}
+
+test "a Display impl that the tracer runs to render a value writes no note, and a program call does" {
+    let bin = compile_test_helpers.build_bin(DISPLAY_SRC, "trace_note_display", ["--trace"])
+    let rows = shape(run_note(bin, "event:note"))
+    assert_eq(rows.len(), 1, rows.join("\n"))
+    assert(rows.get(0).unwrap().starts_with("render 2 "), rows.join("\n"))
+    compile_test_helpers.clean_bin("trace_note_display")
+}
+
+test "a note keeps program order with the stderr writes of its thread" {
+    let bin = compile_test_helpers.build_bin(ORDER_SRC, "trace_note_stderr_order", ["--trace"])
+    let lines = run_note(bin, "event:note").split("\n").filter(fn(l) { l != "" })
+    assert_eq(lines.len(), 3, lines.join("\n"))
+    assert_eq(lines.get(0).unwrap(), "before")
+    assert(lines.get(1).unwrap().contains(#""msg":"middle""#), lines.join("\n"))
+    assert_eq(lines.get(2).unwrap(), "after")
+    compile_test_helpers.clean_bin("trace_note_stderr_order")
+}
+
+test "a msg that panics writes no note, and the program exits with code 101" {
+    let bin = compile_test_helpers.build_bin(PANIC_SRC, "trace_note_panic", ["--trace"])
+    let r = process.run("env", ["BLINK_TRACE_CHANNELS=c", "BLINK_TRACE=all", bin]).unwrap()
+    assert_eq(r.end, ChildEnd.Exited(101))
+    assert(r.err_out.contains("msg was evaluated"), r.err_out)
+    assert(!r.err_out.contains(#""event":"note""#), r.err_out)
+    compile_test_helpers.clean_bin("trace_note_panic")
+}
+
+test "a closed trace stream stops the notes and leaves the exit code and stdout of the program" {
+    let bin = compile_test_helpers.build_bin(CLOSED_SRC, "trace_note_closed", ["--trace"])
+    let dir = "{compile_test_helpers.scratch_root()}/trace_note_closed"
+    let env_set = "BLINK_TRACE_CHANNELS=c BLINK_TRACE=event:note"
+    let r = process.run("sh", ["-c", "\{ {env_set} {bin} 2>&1 > {dir}/out; echo $? > {dir}/rc; \} | head -c 1 > /dev/null; cat {dir}/rc {dir}/out"]).unwrap()
+    assert_eq(r.out, "7\ntotal 5000\n")
+    compile_test_helpers.clean_bin("trace_note_closed")
+}
+
+test "notes of threads that run at once stay whole lines" {
+    let bin = compile_test_helpers.build_bin(THREADS_SRC, "trace_note_threads", ["--trace"])
+    let rows = shape(run_note(bin, "event:note"))
+    assert_eq(rows.len(), 600)
+    compile_test_helpers.clean_bin("trace_note_threads")
+}
