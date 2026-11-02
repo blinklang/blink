@@ -32173,9 +32173,8 @@ type TmTouch {
 // body calls: a write of a module `let mut` beats a read of one, and a read is State too
 // (§4.16.1). A generic body runs at the types its call gives its type parameters, so a method
 // call through a bound walks the impl of the type the parameter stands for there; one that
-// still stands for every impl names no body. A closure body counts only where the closure is
-// called, which a call through a fn value hides, so it is not walked; neither is a nested fn
-// or a trace.log msg, which adds no State.
+// still stands for every impl names no body. A closure body counts only where it runs
+// (tc_tm_touch_closures), and a nested fn or a trace.log msg adds no State.
 fn tc_tm_touch(call: Int) -> TmTouch ! TypeCheck.Resolve, Diag.Report {
     let mut seen: Set[Str] = Set()
     let mut reads: List[Str] = []
@@ -32260,6 +32259,7 @@ fn tc_tm_touch_walk(node: Int, binds: Map[Str, Int], depth: Int, seen: Set[Str],
             }
         }
         tc_tm_touch_call(node, binds, depth + 1, seen, reads, writes, kids)
+        tc_tm_touch_closures(node, binds, depth + 1, seen, reads, writes, kids)
     }
     if k == NodeKind.WithBlock { tc_tm_touch_with(node, binds, depth, seen, reads, writes, kids) }
     let base = kids.len()
@@ -32273,6 +32273,47 @@ fn tc_tm_touch_walk(node: Int, binds: Map[Str, Int], depth: Int, seen: Set[Str],
     while kids.len() > base {
         let _ = kids.pop()
     }
+}
+
+// The closures a call runs: the closure it calls, and each closure argument of a built-in
+// method such as `map`, which forwards its callback's row with `_` (§4.16.6). A fn type in a
+// declared signature carries no row, so a declared callee runs none of its closure arguments'
+// effects, and a closure that is only returned or stored runs nowhere here.
+fn tc_tm_touch_closures(node: Int, binds: Map[Str, Int], depth: Int, seen: Set[Str], reads: List[Str], writes: List[Str], kids: List[Int]) ! TypeCheck.Resolve, Diag.Report {
+    if node_kind(node) == NodeKind.Call {
+        let c = tc_tm_closure_of(node_left(node))
+        if c >= 0 { tc_tm_touch_walk(node_body(c), binds, depth, seen, reads, writes, kids) }
+    }
+    if node_kind(node) != NodeKind.MethodCall || tc_call_decl_node(node) >= 0 { return }
+    let args = node_args(node)
+    if args == -1 { return }
+    let mut i = 0
+    while i < sublist_length(args) {
+        let c = tc_tm_closure_of(sublist_get(args, i))
+        if c >= 0 { tc_tm_touch_walk(node_body(c), binds, depth, seen, reads, writes, kids) }
+        i = i + 1
+    }
+}
+
+// The closure literal an expression is, or names through a local `let`, or -1.
+fn tc_tm_closure_of(node0: Int) -> Int {
+    let mut node = node0
+    let mut hops = 0
+    while node >= 0 && hops < 64 {
+        let k = node_kind(node)
+        if k == NodeKind.Closure { return node }
+        if k == NodeKind.NamedArg {
+            node = node_value(node)
+        } else if k == NodeKind.Ident {
+            let binder = tc_ident_binder_node(node)
+            if binder < 0 || node_kind(binder) != NodeKind.LetBinding { return -1 }
+            node = node_value(binder)
+        } else {
+            return -1
+        }
+        hops = hops + 1
+    }
+    -1
 }
 
 // What the with items of `node` run through their enter and exit, or close.
