@@ -69,7 +69,8 @@ import emit_record
 import std_cache_key.{archive_compiler_path, sha256_of_file_first, sorted_strs}
 import ast_dump.{ast_to_json}
 import formatter.{Format, format}
-import trace_filter.{trace_filter_error, trace_filter_has_items}
+import trace_filter.{trace_filter_error, trace_filter_has_items, trace_filter_names_code, trace_names_error}
+import cg_trace_names.{cg_trace_names}
 import escape.{ffi_scope_resource_name}
 import check_pipeline.{check_source, run_build_analyses, check_exit_code, check_status_line}
 import fix_edits.{FixEdit, fix_plan, fix_apply, fix_byte_offset}
@@ -221,10 +222,16 @@ fn extract_embedded_gc() -> Str ! IO, FS.Write, FS.Read, FS.Delete {
     dir
 }
 
-// Two emit settings the CLI learns while parsing arguments and needs again at the
-// emit call, several frames down. Everything else the emit needs is set beside the
-// call itself and travels in the CgConfig record.
-let mut cli_trace_codegen: Int = 0
+// The settings the CLI learns while parsing arguments and needs again at the emit call,
+// several frames down. Everything else the emit needs is set beside the call itself and
+// travels in the CgConfig record. run_filter is the `--trace=` value of `blink run`, whose
+// names the front end checks against the program (§8.15.12).
+type CliTrace {
+    codegen: Int = 0
+    run_filter: Str = ""
+}
+
+let mut cli_trace = CliTrace {}
 let mut cli_deterministic: Int = 0
 
 // -1 until has_ccache looks for ccache, then 1 when it found it and 0 when not.
@@ -601,7 +608,13 @@ fn compile_front_end(source_path: Str, strict_mode: Int) -> Result[Int, Int] ! L
         }
     }
 
-    run_build_analyses(final_program, trace: cli_trace_codegen != 0)
+    let bad_name = run_trace_name_error(final_program)
+    if bad_name != "" {
+        io.eprintln(bad_name)
+        env.exit(2)
+    }
+
+    run_build_analyses(final_program, trace: cli_trace.codegen != 0)
     if diag_ice_count > 0 {
         diag_flush()
         return Err(101)
@@ -611,6 +624,15 @@ fn compile_front_end(source_path: Str, strict_mode: Int) -> Result[Int, Int] ! L
         return Err(1)
     }
     Ok(final_program)
+}
+
+// The usage error of a `--trace=` value of `blink run` that names no code of the program, or
+// "". Only the typecheck knows every name, so this check waits for it (§8.15.12).
+fn run_trace_name_error(program: Int) -> Str ! Diag.Report {
+    let value = cli_trace.run_filter
+    if !trace_filter_names_code(value) { return "" }
+    let why = trace_names_error(value, cg_trace_names(program))
+    if why == "" { "" } else { "error: bad --trace value \"{value}\": {why}" }
 }
 
 // What compile_front_end returns for the program the daemon checked, printing what it would
@@ -747,7 +769,7 @@ fn compile_to_text(source_path: Str, debug_mode: Int, strict_mode: Int, test_bui
     }
 
     let cfg = CgConfig { debug_mode: if debug_mode != 0 { 1 } else { 0 },
-        trace_codegen: cli_trace_codegen, deterministic: cli_deterministic,
+        trace_codegen: cli_trace.codegen, deterministic: cli_deterministic,
         emit_only_module: env.var("BLINK_ONLY_MODULE") ?? "", skip_modules: skip_modules,
         user_tu_mode: 1, blink_ev_extern_only: 0, archive_build_mode: 0, archive_over_std: 0,
         compiler_archive_modules: layer_modules, test_build: if test_build { 1 } else { 0 } }
@@ -2268,7 +2290,7 @@ fn units_cg_config(debug_mode: Int, test_build: Bool) -> CgConfig ! FS.Read, Env
         skip.insert(k, 1)
     }
     CgConfig { debug_mode: if debug_mode != 0 { 1 } else { 0 },
-        trace_codegen: cli_trace_codegen, deterministic: cli_deterministic,
+        trace_codegen: cli_trace.codegen, deterministic: cli_deterministic,
         emit_only_module: "", skip_modules: skip,
         user_tu_mode: 1, blink_ev_extern_only: 0, archive_build_mode: 0, archive_over_std: 0,
         compiler_archive_modules: Map(), test_build: if test_build { 1 } else { 0 } }
@@ -2296,7 +2318,7 @@ type CompiledUnits {
 // A build reuses or records units only when the emit would print nothing: no trace but the
 // build's own channels. --no-cache asks for every step again.
 fn emit_reuse_allowed() -> Bool ! Env.Read {
-    if trace_mode != "" || cli_trace_codegen != 0 { return false }
+    if trace_mode != "" || cli_trace.codegen != 0 { return false }
     if cg_obj_cache_enabled == 0 || !build_objcache.cache_enabled() { return false }
     if dbg_channels != "" {
         for ch in dbg_channels.split(",") {
@@ -4583,7 +4605,7 @@ fn build_here(p: ArgParser, a: Args, checked: Option[DaemonBuild], test_build: B
     }
     trace_mode = args_get(a, "blink-trace")
     if args_has(a, "trace") {
-        cli_trace_codegen = 1
+        cli_trace.codegen = 1
     }
     cli_deterministic = if args_has(a, "deterministic") { 1 } else { 0 }
     let basename = path_basename(source_path)
@@ -4689,7 +4711,8 @@ fn run_build_here(p: ArgParser, a: Args, checked: Option[DaemonBuild]) -> Str ! 
     let out_base = strip_extension(path_basename(output_path))
     let c_path = "{out_dir}/{out_base}.c"
     if run_traces(a) {
-        cli_trace_codegen = 1
+        cli_trace.codegen = 1
+        cli_trace.run_filter = args_get(a, TRACE_FILTER_KEY)
     }
     cli_deterministic = if args_has(a, "deterministic") { 1 } else { 0 }
     ensure_deps_resolved()
@@ -6225,6 +6248,10 @@ fn build_through_daemon(a: Args, command: Str) -> Bool ! IO, FS.Read, Env.Read, 
     if !daemon_may_build(a) {
         return false
     }
+    // The daemon's front end does not check the names of a trace filter, so this process does.
+    if command == "run" && run_traces(a) && trace_filter_names_code(args_get(a, TRACE_FILTER_KEY)) {
+        return false
+    }
     let sock = daemon_socket_path()
     if !build_fs.path_exists(sock) {
         return false
@@ -6233,7 +6260,7 @@ fn build_through_daemon(a: Args, command: Str) -> Bool ! IO, FS.Read, Env.Read, 
     apply_cache_flag(a)
     trace_mode = args_get(a, "blink-trace")
     if (command == "build" && args_has(a, "trace")) || (command == "run" && run_traces(a)) {
-        cli_trace_codegen = 1
+        cli_trace.codegen = 1
     }
     let settings = front_settings(args_has(a, "strict-struct-layout"))
     let fd = unix_socket_connect(sock)
@@ -6315,7 +6342,7 @@ fn cmd_emit_archive_header(args_list: List[Str]) ! Lex.Tokenize, Parse, Parse.Bu
         env.exit(1)
     }
 
-    run_build_analyses(final_program, trace: cli_trace_codegen != 0)
+    run_build_analyses(final_program, trace: cli_trace.codegen != 0)
     if diag_ice_count > 0 {
         diag_flush()
         env.exit(101)
@@ -6325,7 +6352,7 @@ fn cmd_emit_archive_header(args_list: List[Str]) ! Lex.Tokenize, Parse, Parse.Bu
         env.exit(1)
     }
 
-    let hdr_cfg = CgConfig { debug_mode: 0, trace_codegen: cli_trace_codegen,
+    let hdr_cfg = CgConfig { debug_mode: 0, trace_codegen: cli_trace.codegen,
         deterministic: cli_deterministic, emit_only_module: "", skip_modules: Map(),
         user_tu_mode: 0, blink_ev_extern_only: 0, archive_build_mode: 0, archive_over_std: 0, compiler_archive_modules: Map() }
     let header = generate_archive_header(final_program, hdr_cfg)
@@ -6380,7 +6407,7 @@ fn cmd_emit_per_module(args_list: List[Str]) ! Lex.Tokenize, Parse, Parse.Build,
         env.exit(1)
     }
 
-    run_build_analyses(final_program, trace: cli_trace_codegen != 0)
+    run_build_analyses(final_program, trace: cli_trace.codegen != 0)
     if diag_ice_count > 0 {
         diag_flush()
         env.exit(101)
@@ -6390,7 +6417,7 @@ fn cmd_emit_per_module(args_list: List[Str]) ! Lex.Tokenize, Parse, Parse.Build,
         env.exit(1)
     }
 
-    let mod_cfg = CgConfig { debug_mode: 0, trace_codegen: cli_trace_codegen,
+    let mod_cfg = CgConfig { debug_mode: 0, trace_codegen: cli_trace.codegen,
         deterministic: cli_deterministic, emit_only_module: "", skip_modules: Map(),
         user_tu_mode: 0, blink_ev_extern_only: 0, archive_build_mode: 0, archive_over_std: 0, compiler_archive_modules: Map() }
 

@@ -1,0 +1,125 @@
+// Under `blink run`, a `fn:`, `module:`, `effect:` or `state:` value that matches no
+// declaration is a usage error with exit code 2 (§8.15.12). The check matches by the rules of
+// §8.15.5 over the frame names of §8.15.8, the modules, the effects and the `let mut`
+// bindings. A fn that never runs is still a declaration, and a std fn is no frame. A traced
+// binary that a person starts by hand does not check names.
+
+import compile_test_helpers
+import std.process.{ChildEnd}
+
+let SRC = #"effect Log {
+    effect Out {
+        fn write(s: Str)
+        fn emit(s: Str) { log.write(s) }
+    }
+}
+
+type Point { x: Int, y: Int }
+
+trait Shape {
+    fn norm(self) -> Int
+}
+
+impl Shape for Point {
+    fn norm(self) -> Int { self.x * self.x + self.y * self.y }
+}
+
+let mut total = 0
+
+fn add(a: Int, b: Int) -> Int { a + b }
+
+fn never_called() -> Int { add(0, 0) }
+
+fn run() ! Log.Out {
+    log.emit("a")
+}
+
+fn main() ! IO {
+    let (mut pair, other) = (1, 2)
+    pair += other
+    let mut xs: List[Int] = []
+    xs.push(add(1, 2))
+    let twice = fn(n: Int) -> Int { n * 2 }
+    with handler Log {
+        fn write(s: Str) { io.println(s) }
+    } {
+        run()
+    }
+    total = Point { x: 3, y: 4 }.norm() + twice(pair) + xs.len()
+    io.println(total)
+}
+"#
+
+let STDOUT = "a\n32\n"
+
+fn write_src(stem: Str) -> Str ! FS.Write, Process.Spawn, Env.Read {
+    let path = "{compile_test_helpers.scratch_root()}/{stem}.bl"
+    fs.write(path, SRC).unwrap()
+    path
+}
+
+fn bin_of(stem: Str) -> Str ! Process.Spawn, Env.Read {
+    "{compile_test_helpers.scratch_root()}/{stem}_bin"
+}
+
+// A build also writes `<bin>.c` and the directory `<bin>.units`.
+fn clean(path: Str, bin: Str) ! Process.Spawn {
+    compile_test_helpers.sh("rm -rf {path} {bin} {bin}.c {bin}.units")
+}
+
+test "run stops on a name that no code declares, with the reason and a near name" {
+    let stem = "trace_names_bad"
+    let path = write_src(stem)
+    let bin = bin_of(stem)
+    let rows = [
+        ["fn:ad", "no function named `ad`; did you mean `add`?"],
+        ["fn:dd", "no function named `dd`; did you mean `add`?"],
+        ["fn:Point.nrm", "no function named `Point.nrm`; did you mean `Point.norm`?"],
+        ["fn:println", "no function named `println`"],
+        ["module:{stem}x", "no module named `{stem}x`; did you mean `{stem}`?"],
+        ["effect:Logg", "no effect named `Logg`; did you mean `Log`?"],
+        ["effect:Log.Ot", "no effect named `Log.Ot`; did you mean `Log.Out`?"],
+        ["effect:{stem}", "no effect named `{stem}`"],
+        ["state:totl", "no `let mut` binding named `totl`; did you mean `total`?"],
+        ["state:other", "no `let mut` binding named `other`"],
+        ["fn:add,state:xz", "no `let mut` binding named `xz`; did you mean `xs`?"],
+    ]
+    for row in rows {
+        let value = row.get(0).unwrap()
+        let r = process.run("build/blink", ["run", "--trace={value}", path, "-o", bin]).unwrap()
+        assert_eq("`{value}`: {r.end} {r.out}", "`{value}`: {ChildEnd.Exited(2)} ")
+        assert_eq(r.err_out, "error: bad --trace value \"{value}\": {row.get(1).unwrap()}\n")
+        assert(!compile_test_helpers.path_exists(bin), "`{value}` built {bin}")
+    }
+    clean(path, bin)
+}
+
+test "run lets through each name of a frame, a module, an effect and a let mut binding" {
+    let stem = "trace_names_good"
+    let path = write_src(stem)
+    let bin = bin_of(stem)
+    let fns = [
+        "add", "{stem}.add", "never_called", "norm", "Point.norm", "main", "main.fn@33:17",
+        "{stem}.main.handler@34:10.Log.Out.write", "Log.Out.emit", "{stem}.Log.Out.emit",
+    ]
+    let effects = ["Log", "Log.Out", "{stem}.Log", "{stem}.Log.Out", "IO", "IO.Print", "FS.Write", "Rand"]
+    // The filters AND, so this run prints no event; it proves that the check lets each name through.
+    let value = "fn:{fns.join("+")},module:{stem},effect:{effects.join("+")},state:total+pair+xs"
+    let r = process.run("build/blink", ["run", "--trace={value}", path, "-o", bin]).unwrap()
+    assert_eq("{r.end} {r.out}", "{ChildEnd.Exited(0)} {STDOUT}", r.err_out)
+    let one = process.run("build/blink", ["run", "--trace=fn:main.fn@33:17", path, "-o", bin]).unwrap()
+    assert(one.err_out.contains("\"event\":\"enter\",\"fn\":\"{stem}.main.fn@33:17\""), one.err_out)
+    clean(path, bin)
+}
+
+test "a traced binary run by hand does not check names" {
+    let stem = "trace_names_by_hand"
+    let path = write_src(stem)
+    let bin = bin_of(stem)
+    let built = process.run("build/blink", ["build", "--trace", path, "-o", bin]).unwrap()
+    assert_eq("{built.end} {built.err_out}", "{ChildEnd.Exited(0)} ")
+    let r = process.run("env", ["BLINK_TRACE=fn:nope,state:nope", bin]).unwrap()
+    assert_eq("{r.end} {r.out}", "{ChildEnd.Exited(0)} {STDOUT}")
+    assert_eq(r.err_out, "")
+    clean(path, bin)
+}

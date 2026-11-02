@@ -1,0 +1,114 @@
+// cg_trace_names.bl: the names that a trace filter of `blink run` may name (§8.15.12).
+//
+// `blink run` checks each `fn:`, `module:`, `effect:` and `state:` value after the typecheck
+// and before the build. The frame names come from cg_trace, which names the frames of the
+// events, so the check takes each name an event can carry. The table holds the names of code
+// that the build drops too, as that code is still a declaration.
+
+import ast.{NodeKind}
+import parser.{node_body, node_is_mut, node_kind, node_elements, node_methods, node_name, node_value_child_ids, sublist_get, sublist_length}
+import typecheck.{tc_builtin_effect_paths, tc_resolve, tc_tid_handler_effect}
+import layout.{tid_of_node}
+import cg_reg.{cg_reg_build, cg_reg_effect_decls, cg_reg_fn_decls, cg_reg_global_decls, cg_reg_impl_methods, cg_reg_reset, cg_reg_type_decls}
+import cg_trace.{cg_trace_closure_name, cg_trace_decl_frame, cg_trace_decl_in_std, cg_trace_default_frame, cg_trace_handler_name, cg_trace_module_name}
+import trace_filter.{TraceNames}
+import diagnostics.{Diag}
+
+// The names of the program. It reads the registry of the emit, which it builds for itself
+// and leaves empty, as the emit builds its own.
+pub fn cg_trace_names(program: Int) -> TraceNames ! Diag.Report {
+    cg_reg_build(program)
+    let mut frames: List[Str] = []
+    let mut modules: List[Str] = []
+    let mut effects = tc_builtin_effect_paths()
+    let mut vars: List[Str] = []
+    for d in cg_reg_fn_decls().append(cg_reg_impl_methods()) {
+        let frame = cg_trace_decl_frame(d)
+        if frame == "" { continue }
+        frames.push(frame)
+        tn_add_module(modules, d)
+        tn_walk(d, frame, frames, vars)
+    }
+    for e in cg_reg_effect_decls() { tn_effect(e, frames, modules, effects, vars) }
+    // A module-level closure is a frame of its module.
+    for g in cg_reg_global_decls() {
+        if cg_trace_decl_in_std(g) { continue }
+        tn_add_module(modules, g)
+        tn_walk(g, cg_trace_module_name(g), frames, vars)
+    }
+    for t in cg_reg_type_decls() {
+        if !cg_trace_decl_in_std(t) { tn_add_module(modules, t) }
+    }
+    cg_reg_reset()
+    TraceNames { frames: frames, modules: modules, effects: effects, vars: vars }
+}
+
+fn tn_add_module(modules: List[Str], decl: Int) {
+    let m = cg_trace_module_name(decl)
+    if !modules.contains(m) { modules.push(m) }
+}
+
+// Each value that selects the effect `e` (§8.15.5): its root and each sub-effect, with and
+// without its module. The default bodies of a user effect are frames.
+fn tn_effect(e: Int, frames: List[Str], modules: List[Str], effects: List[Str], vars: List[Str]) ! Diag.Report {
+    let root = node_name(e)
+    let module = cg_trace_module_name(e)
+    let decls = [e, ..tn_sublist(node_elements(e))]
+    for d in decls {
+        let path = if d == e { root } else { "{root}.{node_name(d)}" }
+        effects.push(path)
+        effects.push("{module}.{path}")
+    }
+    if cg_trace_decl_in_std(e) { return }
+    tn_add_module(modules, e)
+    for d in decls {
+        for op in tn_sublist(node_methods(d)) {
+            if node_body(op) == -1 { continue }
+            let frame = cg_trace_default_frame(op, e)
+            frames.push(frame)
+            tn_walk(op, frame, frames, vars)
+        }
+    }
+}
+
+// The closures and handler bodies below `node`, which are frames named after the frame that
+// holds them, and the `let mut` bindings.
+fn tn_walk(node: Int, frame: Str, frames: List[Str], vars: List[Str]) ! Diag.Report {
+    let k = node_kind(node)
+    if k == NodeKind.Closure {
+        let name = cg_trace_closure_name(frame, node)
+        frames.push(name)
+        for c in node_value_child_ids(node) { tn_walk(c, name, frames, vars) }
+        return
+    }
+    if k == NodeKind.HandlerExpr {
+        let eff = tc_tid_handler_effect(tc_resolve(tid_of_node(node)))
+        for op in tn_sublist(node_methods(node)) {
+            let name = cg_trace_handler_name(frame, node, eff, node_name(op))
+            frames.push(name)
+            tn_walk(op, name, frames, vars)
+        }
+        return
+    }
+    if tn_mut_binder(node) { vars.push(node_name(node)) }
+    for c in node_value_child_ids(node) { tn_walk(c, frame, frames, vars) }
+}
+
+// A binder that `mut` marks: a `let mut`, or a name in a pattern. A parameter is no binding
+// of a state event.
+fn tn_mut_binder(node: Int) -> Bool {
+    let k = node_kind(node)
+    let binder = k == NodeKind.LetBinding || k == NodeKind.IdentPattern || k == NodeKind.AsPattern || k == NodeKind.StructLitField
+    binder && node_is_mut(node) != 0 && node_name(node).len() > 0
+}
+
+fn tn_sublist(sl: Int) -> List[Int] {
+    let mut out: List[Int] = []
+    let n = if sl == -1 { 0 } else { sublist_length(sl) }
+    let mut i = 0
+    while i < n {
+        out.push(sublist_get(sl, i))
+        i = i + 1
+    }
+    out
+}
