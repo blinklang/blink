@@ -209,12 +209,13 @@ pub fn program_spawns() -> Bool {
 }
 
 // Run the pass over `program`. Every emit path calls this once after typecheck.
-pub fn run_mono(program: Int) ! Diag.Report {
+pub fn run_mono(program: Int, -- trace: Bool = false) ! Diag.Report {
     require_sealed_ops_rewritten(program)
     mono_reset()
     mono_build_decl_maps(program)
     walk_roots(program)
     mono_drain()
+    if trace { register_traced_debug() }
     dbg_trace("mono", "instances={mono_table.len()}")
 }
 
@@ -435,7 +436,11 @@ fn walk_impl_root_methods(im: Int) ! Diag.Report {
 // instance's walk reaches the generic types its fields name, so `Outer[Int]` brings
 // in `Inner[Int]` without any root spelling it.
 fn mono_drain() ! Diag.Report {
-    let mut di = 0
+    mono_drain_from(0)
+}
+
+fn mono_drain_from(start: Int) ! Diag.Report {
+    let mut di = start
     while di < mono_table.len() {
         mono_walk(di, mono_table.get(di).unwrap().base_decl_node)
         di = di + 1
@@ -780,19 +785,43 @@ fn register_type_instance(tid: Int) ! Diag.Report {
     register_operator_methods(td, ct)
 }
 
-// `==`, `<`, a range's clone and the value string of a traced value reach a written Eq, Ord,
-// Clone or Debug impl with no call node to discover it by, so an instance of the type registers
-// the impl's method itself. Only where the impl holds at this instance: a bounded body at an
-// argument without the bound has nothing to compile against. The bound check of Debug reads
-// the derive alone, so the written impl is asked as well.
+// `==`, `<` and a range's clone reach a written Eq, Ord or Clone impl with no call node to
+// discover it by, so an instance of the type registers the impl's method itself.
 fn register_operator_methods(td: Int, ct: Int) {
-    for pair in [("Eq", "eq"), ("Ord", "cmp"), ("Clone", "clone"), ("Debug", "debug")] {
-        match poly_user_method_by_recv.get(poly_user_key(td, "{pair.0}.{pair.1}")) {
-            Some(m) => if tc_instance_has_trait(ct, pair.0) || tc_written_impl_holds(ct, pair.0, pair.1) {
-                register_poly_method(m, type_args_of(ct))
-            }
-            None => {}
+    for pair in [("Eq", "eq"), ("Ord", "cmp"), ("Clone", "clone")] {
+        register_method_where_it_holds(td, ct, pair.0, pair.1)
+    }
+}
+
+// Only where the impl holds at this instance: a bounded body at an argument without the bound
+// has nothing to compile against. The bound check of Debug reads the derive alone, so the
+// written impl is asked as well.
+fn register_method_where_it_holds(td: Int, ct: Int, trait_name: Str, method: Str) {
+    match poly_user_method_by_recv.get(poly_user_key(td, "{trait_name}.{method}")) {
+        Some(m) => if tc_instance_has_trait(ct, trait_name) || tc_written_impl_holds(ct, trait_name, method) {
+            register_poly_method(m, type_args_of(ct))
         }
+        None => {}
+    }
+}
+
+// The value string of a traced value reaches the written Debug of its type with no call node
+// to discover it by, so a traced build registers it at each type instance. A build that does
+// not trace compiles a Debug body only where a call needs it. A body this adds can reach more
+// type instances, so the pass runs until no instance is new.
+fn register_traced_debug() ! Diag.Report {
+    let mut i = 0
+    while i < mono_table.len() {
+        let walked = mono_table.len()
+        while i < walked {
+            let inst = mono_table.get(i).unwrap()
+            let k = tc_tid_kind(inst.inst_tid)
+            if (k == TyKind.Struct || k == TyKind.Enum) && tc_tid_decl_node(inst.inst_tid) == inst.base_decl_node {
+                register_method_where_it_holds(inst.base_decl_node, inst.inst_tid, "Debug", "debug")
+            }
+            i = i + 1
+        }
+        mono_drain_from(walked)
     }
 }
 
