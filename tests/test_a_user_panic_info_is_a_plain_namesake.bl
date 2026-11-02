@@ -1,0 +1,86 @@
+// `PanicInfo` is not a compiler-known type name, so a user type of that name gets no W1010, and
+// a hook over it prints each type with its module (sections/02_syntax.md §2.20).
+
+import compile_test_helpers.{check_via_cli, compile_and_run, compile_xmod_capture}
+
+const WANT_MAIN: Str = "expected `fn(PanicInfo (std.panic)) -> Never`, found `fn(PanicInfo (main)) -> Never`"
+
+fn user_type() -> Str {
+    #"type PanicInfo {
+    code: Int
+}
+"#
+}
+
+test "a user type named PanicInfo runs with no warning" {
+    let tag = "upi_runs_{getpid()}"
+    let src = user_type().concat(#"
+fn main() ! IO {
+    let p = PanicInfo { code: 3 }
+    io.println("{p.code}")
+}
+"#)
+    let out = check_via_cli(src, "{tag}_check")
+    assert(!out.contains("W1010"), out)
+    assert(!out.contains("\"severity\":\"warning\""), out)
+    let r = compile_and_run(src, tag)
+    assert(r.exit_code == 0, "exit {r.exit_code}: {r.err_out}")
+    assert_eq(r.out, "3\n")
+}
+
+test "the spec example: a hook over the namesake prints both types with their modules" {
+    let src = user_type().concat(#"
+fn report(p: PanicInfo) -> Never ! Env.Exit {
+    env.exit(p.code)
+}
+
+fn main() ! Env {
+    with on_panic(report) { panic("x") }
+}
+"#)
+    let out = check_via_cli(src, "upi_named_{getpid()}")
+    assert(out.contains("\"message\":\"{WANT_MAIN}\""), out)
+}
+
+test "an annotated closure over the namesake gets the same message and no other" {
+    let src = user_type().concat(#"
+fn main() ! Env {
+    with on_panic(fn(p: PanicInfo) -> Never { env.exit(p.code) }) { panic("x") }
+}
+"#)
+    let out = check_via_cli(src, "upi_closure_{getpid()}")
+    assert(out.contains("\"message\":\"{WANT_MAIN}\""), out)
+    assert_eq(out.split("\"severity\":\"error\"").len(), 2)
+}
+
+test "a hook over a namesake of another module names that module" {
+    let tag = "upi_other_{getpid()}"
+    let entry = #"import upi_helper.{PanicInfo}
+
+fn report(p: PanicInfo) -> Never ! Env.Exit {
+    env.exit(p.code)
+}
+
+fn main() ! Env {
+    with on_panic(report) { panic("x") }
+}
+"#
+    let helper = #"pub type PanicInfo {
+    code: Int
+}
+"#
+    let out = compile_xmod_capture(entry, "upi_helper", helper, tag)
+    assert(out.contains("found `fn(PanicInfo (upi_helper)) -> Never`"), out)
+}
+
+test "a hook of another shape keeps the usual mismatch" {
+    let src = #"fn report(n: Int) -> Never { panic("{n}") }
+
+fn main() {
+    with on_panic(report) { panic("x") }
+}
+"#
+    let out = check_via_cli(src, "upi_shape_{getpid()}")
+    assert(out.contains("\"severity\":\"error\""), out)
+    assert(!out.contains("(std.panic)"), out)
+}

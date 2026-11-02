@@ -93,6 +93,7 @@ Single source of truth for release history. `blink llms` and `blink llms --full`
 
 ## Fixes (v0.59.0)
 
+- **`PanicInfo` moved to `std.panic`.** A module that writes the name needs `import std.panic.{PanicInfo}`; without it the name is `UnknownType` (E0507), and the fix adds the import. `with on_panic(f)` and a closure hook `fn(p) { ... }` need no import. A hook on a user `type PanicInfo` gets a message that prints each type with its module.
 - **A module qualifier or a built-in namespace as a bare value is an error.** `import auth` then `let a = auth`, or `let a = io`, gave an internal compiler error. Each now gives `UndefinedVariable` (E0506), and the help for a qualifier says to write `auth.y`.
 - **The compiler's trace channels are named `blink.<area>`.** `blink build`, `blink run` and `blinkc` write their trace notes through `trace.log`, on channels such as `blink.mono` and `blink.build.units`, as `[trace:blink.<area>] <msg>` (was `[dbg:<area>]`). So `BLINK_TRACE_CHANNELS=mono blink run p.bl` now shows only the program's `mono` lines. `all` still turns on the compiler's channels too.
 - **A panic in the compiler is an internal compiler error.** An unwrap of `None`, an index out of bounds or a formatter fault in `blink` or `blinkc` now reports I0021 CompilerPanic in the run's diagnostic format, with a note that names the place in the compiler, and exits 101. `blink check` still prints its status line, and `blink lsp` still publishes the fault before it exits.

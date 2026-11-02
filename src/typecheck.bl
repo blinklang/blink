@@ -8963,6 +8963,10 @@ fn tc_unix_stream_maker(name: Str) -> Str {
 // already made one for it.
 fn tc_arg_mismatch(callee: Str, pos: Int, node: Int, want: Int, got: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     if tc_closure_checked_against(node, want) { return }
+    if callee == "on_panic" {
+        let hook_msg = tc_panic_hook_fn_value_mismatch(got)
+        if hook_msg != "" { return tc_error_at(hook_msg, node) }
+    }
     let (want_s, got_s) = tc_type_pair_strs(want, got)
     let msg = "argument {pos} of `{callee}` expects {want_s}, got {got_s}{tc_fn_mismatch_suffix(want, got)}"
     if tc_read_line_used_as_str(node, want) { return tc_value_mismatch_at(msg, node, node, want, got) }
@@ -17463,6 +17467,8 @@ pub fn is_builtin_namespace(name: Str) -> Int {
 }
 
 pub fn tc_get_dotted_module_path(mod_key: Str) -> Str {
+    // Each program loads std.panic for the hook's type, most with no import node to read.
+    if mod_key == "std_panic" { return "std.panic" }
     match tc_module_import_node.get(mod_key) {
         Some(imp_node) => {
             let dotted = node_str_val(imp_node)
@@ -17587,6 +17593,10 @@ fn nr_check_selective_access_at(name: Str, node: Int, idx: Int) -> Int ! Diag.Re
     if source_mod == "" { return 0 }
     // No import qualifier names the main file, so a selective import is its one fix.
     let qual = if source_mod == "__main__" { "" } else { nr_qualifier_of_module_in(source_mod, nr_current_module) }
+    if qual == "" && source_mod == "std_panic" {
+        nr_report_panic_info_needs_import(name, node)
+        return 1
+    }
     let fix = if qual == "" { "add it to the import list" } else { "add it to the import list or use qualified access `{qual}.{name}`" }
     if node == -1 {
         diag_error_no_loc("ImportNotSelected", IMPORT_NOT_SELECTED, "`{name}` is not in scope — {fix}", "add `{name}` to your selective import")
@@ -22583,6 +22593,21 @@ fn nr_check_type_ref(name: Str, at: Int) ! TypeCheck.Resolve, Diag.Report {
     }
     tc_errors.push("unknown type `{name}`")
     nr_error("UnknownType", UNKNOWN_TYPE, "unknown type `{name}`", at, "")
+}
+
+// std.panic is loaded in each program for the hook's type, so its type has a declaration that
+// no import in this file brings in. The type is not in scope: a bare name is unknown (§2.20),
+// and the import line is the fix.
+fn nr_report_panic_info_needs_import(name: Str, at: Int) ! Diag.Report {
+    let help = "add `import std.panic.\{{name}}`"
+    tc_errors.push("unknown type `{name}`")
+    nr_error("UnknownType", UNKNOWN_TYPE, "unknown type `{name}`", at, help)
+    if at == -1 { return }
+    let file = diag_file_for_node(at)
+    match import_need(diag_source_lines(file), tc_import_lines_of_file(file), "std.panic", [name]) {
+        ImportNeed.Add(e) => diag_set_fix_edits_at(diag_entry_count() - 1, help, [DiagFixEdit { line: e.line, col: e.col, end_line: e.end_line, end_col: e.end_col, text: e.text }])
+        _ => {}
+    }
 }
 
 // `Self.Context` and `T.Item` qualify by a type, not a module.
@@ -31749,12 +31774,58 @@ fn tc_report_panic_hook_not_with_item(node: Int) ! Diag.Report {
     diag_error_label_at_notes("PanicHookPlacement", PANIC_HOOK_PLACEMENT, PANIC_HOOK_NOT_WITH_ITEM, node, PANIC_HOOK_NOT_WITH_ITEM, PANIC_HOOK_HELP, [])
 }
 
-// PanicInfo is the prelude's, found by identity: a module's own `type PanicInfo` is not what
-// the runtime builds.
+// PanicInfo is the one of std.panic, found by its module: a module's own `type PanicInfo` is
+// not what the runtime builds.
 pub fn tc_panic_info_type() -> Int ! Diag.Report {
-    let known = tc_compiler_known_tid("PanicInfo")
-    if known != -1 { return known }
-    ensure_runtime_struct_type("std_traits", "PanicInfo")
+    ensure_runtime_struct_type("std_panic", "PanicInfo")
+}
+
+// A hook over a user namesake of PanicInfo: the message of §2.20, each type with its module. ""
+// for any other mismatch at a hook.
+fn tc_panic_hook_namesake_mismatch(params: List[Int], ret: Int) -> Str ! Diag.Report {
+    let info = tc_panic_info_type()
+    let mut shown: List[Str] = []
+    let mut named = false
+    for p in params {
+        if p != info && tc_types_share_name(info, p) {
+            named = true
+            shown.push(tc_type_with_home(p, type_to_str(p)))
+        } else {
+            shown.push(type_to_str(p))
+        }
+    }
+    if !named { return "" }
+    "expected `fn({tc_type_with_home(info, "PanicInfo")}) -> Never`, found `fn({shown.join(", ")}) -> {type_to_str(ret)}`"
+}
+
+fn tc_panic_hook_fn_value_mismatch(got: Int) -> Str ! Diag.Report {
+    let g = tc_resolve(resolve_alias_tid(got))
+    if tc_tid_kind(g) != TyKind.Fn { return "" }
+    let mut params: List[Int] = []
+    let mut i = 1
+    while i < tc_tid_child_count(g) {
+        params.push(tc_resolve(resolve_alias_tid(tc_tid_child(g, i))))
+        i = i + 1
+    }
+    tc_panic_hook_namesake_mismatch(params, tc_tid_child(g, 0))
+}
+
+// A closure's annotations are held to the hook's type before its value is, so the message of a
+// written namesake comes from here.
+fn tc_panic_hook_closure_mismatch(cls: Int) -> Str ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    let params_sl = node_params(cls)
+    if params_sl == -1 { return "" }
+    let info = tc_panic_info_type()
+    let mut params: List[Int] = []
+    let mut i = 0
+    while i < sublist_length(params_sl) {
+        let p = sublist_get(params_sl, i)
+        let written = node_type_ann(p) != -1 || node_type_name(p) != ""
+        params.push(if written { tc_resolve(resolve_alias_tid(resolve_param_type(p))) } else { info })
+        i = i + 1
+    }
+    let ret = if node_type_ann(cls) == -1 { TYPE_NEVER } else { tc_closure_declared_ret(cls) }
+    tc_panic_hook_namesake_mismatch(params, ret)
 }
 
 // `on_panic(f)` takes one `f: fn(PanicInfo) -> Never`, with whatever row `f` declares: a fn
@@ -31774,7 +31845,12 @@ fn tc_check_panic_hook_item(item: Int) ! TypeCheck.Resolve, TypeCheck.Report, Di
         if node_kind(f) == NodeKind.NamedArg {
             tc_error_at("`on_panic` takes no labelled argument", f)
         } else {
-            check_arg_value("on_panic", 0, hook_t, f, false)
+            let closure_msg = if node_kind(f) == NodeKind.Closure { tc_panic_hook_closure_mismatch(f) } else { "" }
+            if closure_msg != "" {
+                tc_error_at(closure_msg, f)
+            } else {
+                check_arg_value("on_panic", 0, hook_t, f, false)
+            }
         }
     }
     tc_check_callable_arg_bodies(args, -1)

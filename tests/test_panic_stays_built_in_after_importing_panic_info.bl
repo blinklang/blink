@@ -1,0 +1,107 @@
+// A qualifier is used only in `q.y`, so the module std.panic and the built-in `panic` share a
+// name with no clash (sections/07_trust_modules_metadata.md §10.5 *A qualifier is used only in
+// `q.y`*).
+
+import compile_test_helpers.{check_via_cli, compile_and_run, run_xmod}
+
+test "panic is the built-in after a selective import of std.panic" {
+    let tag = "psb_selective_{getpid()}"
+    let src = #"import std.panic.{PanicInfo}
+
+fn report(p: PanicInfo) -> Never ! IO.Eprint, Env.Exit {
+    io.eprintln("fatal: {p.message}")
+    env.exit(70)
+}
+
+fn main() ! IO, Env {
+    with on_panic(report) { panic("boom") }
+}
+"#
+    let r = compile_and_run(src, tag)
+    assert(r.exit_code == 70, "exit {r.exit_code}: {r.err_out}")
+    assert_eq(r.err_out, "fatal: boom\n")
+}
+
+test "panic is the built-in after a whole-module import, and panic.PanicInfo names the type" {
+    let tag = "psb_whole_{getpid()}"
+    let src = #"import std.panic
+
+fn report(p: panic.PanicInfo) -> Never ! IO.Eprint, Env.Exit {
+    io.eprintln("fatal: {p.message}")
+    env.exit(70)
+}
+
+fn main() ! IO, Env {
+    with on_panic(report) { panic("boom") }
+}
+"#
+    let r = compile_and_run(src, tag)
+    assert(r.exit_code == 70, "exit {r.exit_code}: {r.err_out}")
+    assert_eq(r.err_out, "fatal: boom\n")
+}
+
+test "both import forms in one file load std.panic once" {
+    let tag = "psb_both_{getpid()}"
+    let src = #"import std.panic
+import std.panic.{PanicInfo}
+
+fn same(p: panic.PanicInfo) -> PanicInfo { p }
+
+fn main() ! IO {
+    let p = same(PanicInfo { message: "m", file: "f", line: None })
+    io.println(p.message)
+}
+"#
+    let r = compile_and_run(src, tag)
+    assert(r.exit_code == 0, "exit {r.exit_code}: {r.err_out}")
+    assert_eq(r.out, "m\n")
+}
+
+test "a user module named panic keeps its qualifier and leaves the built-in alone" {
+    let tag = "psb_user_module_{getpid()}"
+    let entry = #"import util.panic
+
+fn main() ! IO {
+    io.println("{panic.twice(2)}")
+    panic("boom")
+}
+"#
+    let helper = #"pub fn twice(n: Int) -> Int { n * 2 }
+"#
+    let r = run_xmod(entry, "util", "panic", helper, tag)
+    assert(r.exit_code == 101, "exit {r.exit_code}: {r.err_out}")
+    assert_eq(r.out, "4\n")
+    assert(r.err_out.starts_with("panic: boom"), r.err_out)
+}
+
+test "a local named panic hides the qualifier in panic.y" {
+    let tag = "psb_local_{getpid()}"
+    let src = #"import std.panic.{PanicInfo}
+
+fn name_of(p: PanicInfo) -> Str { p.message }
+
+fn main() ! IO {
+    let panic = "abc"
+    io.println("{panic.len()}")
+    io.println(name_of(PanicInfo { message: "m", file: "f", line: None }))
+}
+"#
+    let r = compile_and_run(src, tag)
+    assert(r.exit_code == 0, "exit {r.exit_code}: {r.err_out}")
+    assert_eq(r.out, "3\nm\n")
+}
+
+test "a local named panic has no member PanicInfo to fall back from" {
+    let src = #"import std.panic.{PanicInfo}
+
+fn name_of(p: PanicInfo) -> Str { p.message }
+
+fn main() ! IO {
+    let panic = 1
+    io.println("{panic.message}")
+    io.println(name_of(PanicInfo { message: "m", file: "f", line: None }))
+}
+"#
+    let out = check_via_cli(src, "psb_local_no_member_{getpid()}")
+    assert(out.contains("\"severity\":\"error\""), out)
+}
