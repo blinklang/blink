@@ -1,0 +1,311 @@
+// A binding named `on_panic` hides the built-in hook by lexical scope, so the item is an
+// ordinary `with` item and E0565 does not apply. An error at that item must say what happened,
+// since the user wrote what reads as a hook (sections/02_syntax.md §2.20 *A user value named
+// `on_panic`*). A whole-module import binds only its qualifier, so it hides nothing.
+
+import compile_test_helpers.{check_via_cli, compile_xmod_capture, run_xmod}
+
+fn lines_with(out: Str, what: Str) -> List[Str] {
+    let mut found: List[Str] = []
+    for line in out.split("\n") {
+        if line.contains(what) { found.push(line) }
+    }
+    found
+}
+
+fn only_error(out: Str, code: Str) -> Str {
+    let errors = lines_with(out, "\"severity\":\"error\"")
+    assert(errors.len() == 1, out)
+    assert_eq(lines_with(out, "\"code\":\"E0565\"").len(), 0)
+    let e = errors.get(0).unwrap()
+    assert(e.contains("\"code\":\"{code}\""), out)
+    e
+}
+
+test "the spec example: a module fn that returns Int gets E0839 and the note" {
+    let src = #"fn on_panic(x: Int) -> Int { x }
+
+fn main() ! IO, Env {
+    with on_panic(3) { io.println("x") }
+}
+"#
+    let e = only_error(check_via_cli(src, "obh_spec_{getpid()}"), "E0839")
+    assert(e.contains("`on_panic` here is the fn at line 1, which hides the built-in panic hook"), e)
+}
+
+test "an argument of the wrong type is E0300 with the note" {
+    let src = #"fn on_panic(x: Int) -> Int { x }
+
+fn main() {
+    with on_panic("s") { }
+}
+"#
+    let out = check_via_cli(src, "obh_arg_{getpid()}")
+    let es = lines_with(out, "\"code\":\"E0300\"")
+    assert(es.len() >= 1, out)
+    assert(es.get(0).unwrap().contains("the fn at line 1, which hides the built-in panic hook"), out)
+}
+
+test "a wrong argument count is E0300 with the note" {
+    let src = #"fn on_panic(x: Int) -> Int { x }
+
+fn main() {
+    with on_panic(1, 2) { }
+}
+"#
+    let out = check_via_cli(src, "obh_count_{getpid()}")
+    let es = lines_with(out, "\"code\":\"E0300\"")
+    assert(es.len() >= 1, out)
+    assert(es.get(0).unwrap().contains("the fn at line 1, which hides the built-in panic hook"), out)
+}
+
+test "the as form gets the note too" {
+    let src = #"fn on_panic(x: Int) -> Int { x }
+
+fn main() {
+    with on_panic(3) as y {
+        let _ = y
+    }
+}
+"#
+    let e = only_error(check_via_cli(src, "obh_as_{getpid()}"), "E0839")
+    assert(e.contains("the fn at line 1, which hides the built-in panic hook"), e)
+}
+
+test "a module-level let names itself in the note" {
+    let src = #"let on_panic: fn(Int) -> Int = fn(x: Int) -> Int { x }
+
+fn main() {
+    with on_panic(3) { }
+}
+"#
+    let e = only_error(check_via_cli(src, "obh_global_{getpid()}"), "E0839")
+    assert(e.contains("at line 1, which hides the built-in panic hook"), e)
+}
+
+test "a parameter names itself in the note" {
+    let src = #"fn serve(on_panic: fn(Int) -> Int) {
+    with on_panic(3) { }
+}
+
+fn main() {
+    serve(fn(x: Int) -> Int { x })
+}
+"#
+    let e = only_error(check_via_cli(src, "obh_param_{getpid()}"), "E0839")
+    assert(e.contains("the parameter at line 1, which hides the built-in panic hook"), e)
+}
+
+test "a local names itself in the note" {
+    let src = #"fn main() {
+    let on_panic = fn(x: Int) -> Int { x }
+    with on_panic(3) { }
+}
+"#
+    let e = only_error(check_via_cli(src, "obh_local_{getpid()}"), "E0839")
+    assert(e.contains("the local at line 2, which hides the built-in panic hook"), e)
+}
+
+fn lib_src() -> Str {
+    #"pub fn on_panic(x: Int) -> Int {
+    x
+}
+
+pub fn renamed(x: Int) -> Int {
+    x
+}
+"#
+}
+
+test "a selective import names itself in the note" {
+    let entry = #"import obh_lib.{on_panic}
+
+fn main() {
+    with on_panic(3) { }
+}
+"#
+    let e = only_error(compile_xmod_capture(entry, "obh_lib", lib_src(), "obh_sel_{getpid()}"), "E0839")
+    assert(e.contains("the import at line 1, which hides the built-in panic hook"), e)
+}
+
+test "a selective import under another name names itself in the note" {
+    let entry = #"
+import obh_lib.{renamed as on_panic}
+
+fn main() {
+    with on_panic(3) { }
+}
+"#
+    let e = only_error(compile_xmod_capture(entry, "obh_lib", lib_src(), "obh_alias_{getpid()}"), "E0839")
+    assert(e.contains("the import at line 2, which hides the built-in panic hook"), e)
+}
+
+test "a qualified call hides nothing and gets no note" {
+    let entry = #"import obh_lib
+
+fn main() {
+    with obh_lib.on_panic(3) { }
+}
+"#
+    let e = only_error(compile_xmod_capture(entry, "obh_lib", lib_src(), "obh_qual_{getpid()}"), "E0839")
+    assert(!e.contains("hides"), e)
+}
+
+test "an unrelated E0839 gets no note, with a binding named on_panic in scope" {
+    let src = #"fn on_panic(x: Int) -> Int { x }
+
+fn three(x: Int) -> Int { on_panic(x) }
+
+fn main() {
+    with three(3) { }
+}
+"#
+    let e = only_error(check_via_cli(src, "obh_other_e0839_{getpid()}"), "E0839")
+    assert(!e.contains("hides"), e)
+}
+
+test "an unrelated E0300 gets no note, with a binding named on_panic in scope" {
+    let src = #"fn on_panic(x: Int) -> Int { x }
+
+fn main() {
+    let y: Int = "s"
+    let _ = on_panic(y)
+}
+"#
+    let e = only_error(check_via_cli(src, "obh_other_e0300_{getpid()}"), "E0300")
+    assert(!e.contains("hides"), e)
+}
+
+test "an E0300 in a closure the item takes is not about the binding" {
+    let src = #"fn on_panic(f: fn() -> Int) -> Int { f() }
+
+fn main() {
+    with on_panic(fn() -> Int {
+        let y: Int = "s"
+        y
+    }) { }
+}
+"#
+    let out = check_via_cli(src, "obh_closure_{getpid()}")
+    let es = lines_with(out, "\"code\":\"E0300\"")
+    assert(es.len() == 1, out)
+    assert(!es.get(0).unwrap().contains("hides"), out)
+}
+
+test "a binding named on_panic that the item uses well has no error and no warning" {
+    let src = #"type Res { n: Int }
+
+impl Closeable for Res {
+    fn close(self) { let _ = self.n }
+}
+
+fn on_panic(x: Int) -> Res { Res { n: x } }
+
+fn main() ! IO {
+    with on_panic(3) as r { io.println("{r.n}") }
+}
+"#
+    let out = check_via_cli(src, "obh_ok_{getpid()}")
+    assert_eq(lines_with(out, "\"severity\":\"error\"").len(), 0)
+    assert_eq(lines_with(out, "\"severity\":\"warning\"").len(), 0)
+}
+
+test "a local in an inner scope hides the hook only there" {
+    let src = #"import std.panic.{PanicInfo}
+fn report(p: PanicInfo) -> Never ! IO.Eprint, Env.Exit {
+    io.eprintln(p.message)
+    env.exit(70)
+}
+
+fn main() ! IO, Env {
+    with on_panic(report) {
+        if true {
+            let on_panic = 3
+            io.println("{on_panic}")
+        }
+    }
+}
+"#
+    let out = check_via_cli(src, "obh_inner_{getpid()}")
+    assert_eq(lines_with(out, "\"severity\":\"error\"").len(), 0)
+}
+
+fn auth_src() -> Str {
+    #"pub fn on_panic(x: Int) -> Int {
+    x + 1
+}
+"#
+}
+
+test "a whole-module import keeps the built-in hook" {
+    let entry = #"import obh_dir.obh_auth
+import std.panic.{PanicInfo}
+
+fn report(p: PanicInfo) -> Never ! IO.Print, Env.Exit {
+    io.println("hook: {p.message}")
+    env.exit(0)
+}
+
+fn main() ! IO, Env {
+    with on_panic(report) {
+        io.println("{obh_auth.on_panic(1)}")
+        panic("boom")
+    }
+}
+"#
+    let r = run_xmod(entry, "obh_dir", "obh_auth", auth_src(), "obh_whole_{getpid()}")
+    assert(r.out.contains("2"), r.out)
+    assert(r.out.contains("hook: boom"), r.out)
+}
+
+test "after a whole-module import, on_panic that is not a with item is still the form error" {
+    let entry = #"import obh_auth
+
+fn main() {
+    let h = on_panic
+    let _ = obh_auth.on_panic(1)
+}
+"#
+    let e = only_e0565(compile_xmod_capture(entry, "obh_auth", auth_src(), "obh_whole_value_{getpid()}"))
+    assert(e.contains("`on_panic` is only a `with` item"), e)
+}
+
+test "after a whole-module import, a call of on_panic as a statement is still the form error" {
+    let entry = #"import obh_auth
+
+fn main() {
+    on_panic(1)
+    let _ = obh_auth.on_panic(1)
+}
+"#
+    let e = only_e0565(compile_xmod_capture(entry, "obh_auth", auth_src(), "obh_whole_stmt_{getpid()}"))
+    assert(e.contains("`on_panic` is only a `with` item"), e)
+}
+
+test "after a whole-module import, a hook outside main is still the place error" {
+    let entry = #"import obh_auth
+import std.panic.{PanicInfo}
+
+fn report(p: PanicInfo) -> Never ! Env.Exit {
+    env.exit(p.message.len())
+}
+
+fn serve() ! Env {
+    with on_panic(report) { let _ = obh_auth.on_panic(1) }
+}
+
+fn main() ! Env {
+    serve()
+}
+"#
+    let e = only_e0565(compile_xmod_capture(entry, "obh_auth", auth_src(), "obh_whole_place_{getpid()}"))
+    assert(e.contains("`on_panic` outside `main`"), e)
+}
+
+fn only_e0565(out: Str) -> Str {
+    let errors = lines_with(out, "\"severity\":\"error\"")
+    assert(errors.len() == 1, out)
+    let e = errors.get(0).unwrap()
+    assert(e.contains("\"code\":\"E0565\""), out)
+    e
+}

@@ -34,7 +34,7 @@ import diagnostics.{
     UNSOLVED_TYPEVAR_AT_CODEGEN, SEALED_OPS_REWRITE_INVARIANT, VARIANT_WITHOUT_ENUM,
     NO_SUCH_VARIANT, TYPE_ERROR, TEMPLATE_MISMATCH, UNEXPECTED_ANNOTATION, MISSING_RETURN, NO_CONVERSION_IMPL, CANNOT_INFER_TYPE, NOT_ITERABLE, MISSING_ELSE, UNLICENSED_SELF_OP, TRAIT_BOUND_NOT_SATISFIED, CAPABILITY_BUDGET, QM_INVALID_OPERAND, UNDEFINED_FUNCTION,
     UNRESOLVED_METHOD, AMBIGUOUS_METHOD_CALL, MISSING_DISPLAY_IMPL,
-    MUTATION_REQUIRES_MUT, MUT_ON_PATTERN, NOT_A_PLACE, PARAM_ASSIGN, diag_error_label_at_notes, diag_error_span_label_at_notes, diag_warn_label_at_notes, EMPTY_ROW_OUTSIDE_FFI, PANIC_HOOK_PLACEMENT, TRACE_MESSAGE_EFFECT, EFFECTS_ANNOTATION_REMOVED, UNKNOWN_EFFECT, diag_fix_before_starts_with, diag_drop_fix_over_others, diag_drop_fix_at,
+    MUTATION_REQUIRES_MUT, MUT_ON_PATTERN, NOT_A_PLACE, PARAM_ASSIGN, diag_error_label_at_notes, diag_add_note_at_spots_since, diag_error_span_label_at_notes, diag_warn_label_at_notes, EMPTY_ROW_OUTSIDE_FFI, PANIC_HOOK_PLACEMENT, TRACE_MESSAGE_EFFECT, EFFECTS_ANNOTATION_REMOVED, UNKNOWN_EFFECT, diag_fix_before_starts_with, diag_drop_fix_over_others, diag_drop_fix_at,
     UNDEFINED_VARIABLE, UNKNOWN_TYPE, QM_RESULT_IN_NON_RESULT,
     QM_OPTION_IN_NON_OPTION, QM_ERROR_MISMATCH,
     QM_TEST_DISPLAY_REQUIRED, TEST_ANNOTATED_RETURN, SKIP_OUTSIDE_TEST,
@@ -23441,6 +23441,10 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     if kind == NodeKind.Ident {
         let name = node_name(node)
         if name == "true" || name == "false" || name == "None" { return }
+        if name == "on_panic" && !nr_on_panic_is_bound_here() {
+            tc_report_panic_hook_not_with_item(node)
+            return
+        }
         let top = nr_top_index(name)
         if top != -1 {
             nr_mark_read_at(top)
@@ -23522,10 +23526,6 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
             diag_error_at("UndefinedVariable", UNDEFINED_VARIABLE, "undefined variable `{name}`", node, "`{name}` is a module qualifier, not a value: write `{name}.y`")
             return
         }
-        if name == "on_panic" {
-            tc_report_panic_hook_not_with_item(node)
-            return
-        }
         tc_errors.push("undefined variable `{name}`")
         let help = if is_import_module_name(name) != 0 {
             nr_missing_import_help(name)
@@ -23582,7 +23582,10 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                 // intrinsic: a user fn of that spelling, pub or not, is never in scope there, so
                 // it must not be reported as unselected or private, nor take the intrinsic's place.
                 let range_intrinsic = fn_name == "range_bounds" && tc_site_in_std(node) && nr_resolve_bare_decl(fn_name, nr_current_module) < 0
-                if !range_intrinsic && nr_check_selective_access_at(fn_name, node, top) == 0 {
+                if fn_name == "on_panic" && !nr_on_panic_is_bound_here() {
+                    tc_type_args_unresolved.insert(node, 1)
+                    tc_report_panic_hook_not_with_item(callee)
+                } else if !range_intrinsic && nr_check_selective_access_at(fn_name, node, top) == 0 {
                     // A call through a local closure reads that binding like any other
                     // read, and the escape pass follows it to what the closure captures.
                     nr_note_local_binder_at(callee, top)
@@ -23606,9 +23609,6 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                         tc_type_args_unresolved.insert(node, 1)
                         tc_errors.push("undefined function `{fn_name}`")
                         diag_error_at("UndefinedFunction", UNDEFINED_FUNCTION, "undefined function `{fn_name}`", node, tc_no_call_form_repair(fn_name))
-                    } else if !defined && fn_name == "on_panic" {
-                        tc_type_args_unresolved.insert(node, 1)
-                        tc_report_panic_hook_not_with_item(callee)
                     } else if !defined && is_builtin_fn(fn_name) == 0 && is_variant_name(fn_name) == 0 && is_known_type(fn_name) == 0 && is_trait_name(fn_name) == 0 {
                         tc_errors.push("undefined function `{fn_name}`")
                         tc_report_undefined_fn(fn_name, node, callee)
@@ -32039,8 +32039,7 @@ fn tc_check_with_item(item: Int, tid0: Int, binds: Bool) -> Bool ! Diag.Report {
     false
 }
 
-// The labels of PanicHookPlacement (E0565), one per place a hook may not stand (§2.20). A use
-// of `on_panic` that is not a `with` item has its wording still open, so it stands here once.
+// The labels of PanicHookPlacement (E0565), one per rule a site can break (§2.20).
 const PANIC_HOOK_OUTSIDE_MAIN = "`on_panic` outside `main`"
 const PANIC_HOOK_SECOND = "a second `on_panic` in `main`"
 const PANIC_HOOK_IN_TEST = "`on_panic` in a `test` block"
@@ -32055,7 +32054,73 @@ fn nr_is_builtin_panic_hook_call(item: Int) -> Bool {
     if node_kind(item) != NodeKind.Call { return false }
     let callee = node_left(item)
     if callee == -1 || node_kind(callee) != NodeKind.Ident || node_name(callee) != "on_panic" { return false }
-    nr_top_index("on_panic") == -1
+    !nr_on_panic_is_bound_here()
+}
+
+// A whole-module import binds only its qualifier (§10.1), so a module that declares `on_panic`
+// binds that name only in its own file and where a selective import takes it.
+fn nr_on_panic_is_bound_here() -> Bool {
+    let idx = nr_top_index("on_panic")
+    if idx == -1 { return false }
+    if nr_index_is_local(idx) || nr_current_module == "" { return true }
+    nr_bare_name_in_scope_here("on_panic", nr_current_module) != 0
+}
+
+// The line of the import in this file that binds `name`, or -1 when none lists it itself, as a
+// name that reaches the file through a re-export is not.
+fn nr_selective_import_line(name: Str) -> Int {
+    let here = nr_main_key(nr_current_module)
+    for reader in nr_module_names.keys() {
+        if nr_main_key(reader) != here { continue }
+        for stmt in nr_module_names_of(reader).clash.import_stmts.keys() {
+            let items = node_args(stmt)
+            let mut i = 0
+            while items != -1 && i < sublist_length(items) {
+                if nr_item_bound(sublist_get(items, i)) == name { return node_line(stmt) }
+                i = i + 1
+            }
+        }
+    }
+    -1
+}
+
+// What `on_panic` reads at an item where a binding hides the built-in hook.
+fn tc_on_panic_hiding_note() -> Str {
+    let idx = nr_top_index("on_panic")
+    let mut what = ""
+    let mut decl = -1
+    if nr_index_is_local(idx) {
+        decl = nr_scope_nodes.get(idx).unwrap()
+        what = if decl >= 0 && node_kind(decl) == NodeKind.Param { "parameter" } else { "local" }
+    } else if nr_resolve_imported_decl("on_panic", nr_current_module) != -1 {
+        what = "import"
+    } else {
+        decl = nr_resolve_bare_decl("on_panic", nr_current_module)
+        what = if decl >= 0 && node_kind(decl) == NodeKind.FnDef { "fn" } else { "module-level binding" }
+    }
+    let line = if what == "import" { nr_selective_import_line("on_panic") } else if decl >= 0 { node_line(decl) } else { -1 }
+    let binding = if line > 0 { "the {what} at line {line}" } else { "a {what}" }
+    "`on_panic` here is {binding}, which hides the built-in panic hook"
+}
+
+// An item whose callee is the bare name `on_panic` reads as a hook, so an error about the item
+// itself says what the name is. An error at another spot in the item, such as in the body of a
+// closure it takes, is about that code.
+fn tc_note_on_panic_hiding_since(before: Int, item: Int) ! Diag.Report {
+    if node_kind(item) != NodeKind.Call || diag_any_errors_since(before) == 0 { return }
+    let callee = node_left(item)
+    if callee == -1 || node_kind(callee) != NodeKind.Ident || node_name(callee) != "on_panic" { return }
+    let mut spots = ["{node_line(item)}:{node_col(item)}", "{node_line(callee)}:{node_col(callee)}"]
+    let args = node_args(item)
+    let mut i = 0
+    while args != -1 && i < sublist_length(args) {
+        let a = sublist_get(args, i)
+        let at = if node_kind(a) == NodeKind.NamedArg { node_value(a) } else { a }
+        spots.push("{node_line(a)}:{node_col(a)}")
+        spots.push("{node_line(at)}:{node_col(at)}")
+        i = i + 1
+    }
+    diag_add_note_at_spots_since(before, [TYPE_ERROR, WITH_ITEM_NOT_A_HANDLER], spots, tc_on_panic_hiding_note())
 }
 
 fn nr_check_panic_hook_item(item: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
@@ -33265,6 +33330,7 @@ fn tc_bind_with_resource(item: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.
         nr_define_typed(node_name(item), 0, tc_unknown_tid(), -1)
         return
     }
+    let before = diag_entry_count()
     let prev_res = tc_with_resource_node
     tc_with_resource_node = res_expr
     tc_check_body(res_expr)
@@ -33272,6 +33338,7 @@ fn tc_bind_with_resource(item: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.
     tc_with_resource_node = prev_res
     // A refused item binds its name with no type, so uses in the body do not repeat the error.
     let bind_tid = if tc_check_with_item(res_expr, res_tid, true) { tc_with_binder_tid(res_tid) } else { tc_unknown_tid() }
+    tc_note_on_panic_hiding_since(before, res_expr)
     // The node's tid is the BINDER's type, not the resource expression's: codegen's only consumer
     // reads it to stamp the binder's ScopeVar, so keeping the resource type here would just move
     // the same wrong answer one phase later.
@@ -35046,6 +35113,7 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                 } else if tc_is_panic_hook_item(wh_item2) {
                     tc_check_panic_hook_item(wh_item2)
                 } else {
+                    let before_item = diag_entry_count()
                     tc_check_body(wh_item2)
                     // tc_check_body WALKS the operand but never types it (no Ident arm, no
                     // FieldAccess arm), so its tid must be memoized here instead: the operand of
@@ -35059,6 +35127,7 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                     // do. The two are complements, and the order keeps handler-body diagnostics
                     // reported before any type error on the operand itself.
                     let _ = tc_check_with_item(wh_item2, infer_type(wh_item2), false)
+                    tc_note_on_panic_hiding_since(before_item, wh_item2)
                 }
                 wi2 = wi2 + 1
             }
