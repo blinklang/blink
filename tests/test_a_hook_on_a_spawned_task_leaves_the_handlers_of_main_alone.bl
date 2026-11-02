@@ -1,0 +1,47 @@
+// A fault on a spawned task runs the `on_panic` hook on that task's thread. Main keeps running
+// meanwhile, so the hook must not hand main's effect slots the handlers of the `with`: main's
+// own innermost handler still answers its ops (sections/02_syntax.md §2.20 *What the hook
+// gets*, sections/04_effects.md §4.7).
+
+import compile_test_helpers.{compile_and_run}
+
+test "main reads its own handler while the hook of a spawned task runs" {
+    let src = #"effect Tag {
+    effect Get {
+        fn tag() -> Str
+    }
+}
+
+fn boom(i: Int) -> Int {
+    let mut xs = [1, 2]
+    xs.set(i, 5)
+    xs.len()
+}
+
+fn main() ! IO, Env, Async, Tag {
+    let hooked = channel.new[Int](buffer: 1)
+    let seen = channel.new[Int](buffer: 1)
+    let report = fn(_p: PanicInfo) -> Never {
+        hooked.send(1)
+        let _ = seen.recv()
+        env.exit(70)
+    }
+    with handler Tag { fn tag() -> Str { "with-site" } } {
+        with on_panic(report) {
+            with handler Tag { fn tag() -> Str { "main-inner" } } {
+                async.scope {
+                    let a = async.spawn(fn() { boom(10) })
+                    let _ = hooked.recv()
+                    io.println("main sees tag: {tag.tag()}")
+                    seen.send(1)
+                    io.println("{a.await}")
+                }
+            }
+        }
+    }
+}
+"#
+    let r = compile_and_run(src, "spawned_hook_ev_{getpid()}")
+    assert(r.exit_code == 70, "exit {r.exit_code}: {r.out}{r.err_out}")
+    assert_eq(r.out, "main sees tag: main-inner\n")
+}

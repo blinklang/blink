@@ -3205,6 +3205,9 @@ BLINK_RT_FN const char* blink_str_format(const char* fmt, ...) {
    adapter is a C fn the compiler prints for main: it builds the PanicInfo and calls the hook
    closure. `ev` is the program's effect vector and `ev_at_with` a copy of it at the `with`, so
    the hook's operations go to the handlers in scope at the `with`, not at the panic point.
+   Only a panic on the thread that installed the hook copies it back: on any other thread the
+   vector holds the slots main is running with, and the copy would change them under main.
+   `owner` is that thread's address of __blink_in_panic_hook, which no other live thread shares.
    The record is one per process: main holds the only hook, and a panic on any thread is a
    panic of the program. `test_run` is set by the test runner, which takes every panic itself,
    so a test that calls main installs no hook. It is per process, not per thread: the runner's
@@ -3217,6 +3220,7 @@ typedef struct {
     void* ev;
     const void* ev_at_with;
     size_t ev_size;
+    const int* owner;
     int test_run;
 } __blink_panic_hook_record;
 
@@ -3255,6 +3259,7 @@ BLINK_RT_FN __blink_panic_hook_frame __blink_panic_hook_enter(__blink_panic_hook
     __blink_panic_hook.ev = ev;
     __blink_panic_hook.ev_at_with = ev_at_with;
     __blink_panic_hook.ev_size = ev_size;
+    __blink_panic_hook.owner = &__blink_in_panic_hook;
     __blink_panic_hook.adapter = adapter;
     frame.installed = 1;
     return frame;
@@ -3276,6 +3281,7 @@ BLINK_RT_FN void __blink_panic_hook_leave_run(void* frame, int ok) {
     __blink_panic_hook.ev = f->saved.ev;
     __blink_panic_hook.ev_at_with = f->saved.ev_at_with;
     __blink_panic_hook.ev_size = f->saved.ev_size;
+    __blink_panic_hook.owner = f->saved.owner;
     __blink_panic_hook.adapter = f->saved.adapter;
 }
 #endif
@@ -3308,7 +3314,9 @@ BLINK_RT_FN void __blink_panic_hook_run(const char* what, const char* file, int6
     if (__blink_in_cleanup_drain || __blink_panic_armed || __blink_panic_test_hook != NULL) return;
     if (__blink_in_panic_hook) return;
     __blink_in_panic_hook = 1;
-    memcpy(__blink_panic_hook.ev, __blink_panic_hook.ev_at_with, __blink_panic_hook.ev_size);
+    if (__blink_panic_hook.owner == &__blink_in_panic_hook) {
+        memcpy(__blink_panic_hook.ev, __blink_panic_hook.ev_at_with, __blink_panic_hook.ev_size);
+    }
     adapter(__blink_panic_hook.hook, blink_str_format("%s", what ? what : ""),
             blink_str_format("%s", file ? file : ""), line);
 }
