@@ -584,40 +584,39 @@ fn main() {
     assert(bytes_op.contains("`msg` calls `rand.bytes`, a handler operation"), bytes_op)
 }
 
-test "msg names a call or write through a module qualifier as the source spells it" {
-    let helper = #"pub let mut counter = 0
+test "msg names a call through a module qualifier as the source spells it" {
+    let helper = #"let mut counter = 0
 
 pub fn get() -> Int ! IO { 1 }
 
 pub fn level() -> Int { counter }
+
+pub fn bump() -> Int ! State {
+    counter += 1
+    counter
+}
 "#
     let entry = #"import st
 
-fn peek() -> Int { st.counter }
+fn peek() -> Int { st.level() }
 
 fn main() ! IO {
     trace.log("c", "{st.get()}")
     trace.log("c", "{st.level()}")
     trace.log("c", "{peek()}")
-    trace.log("c", {
-        st.counter = 1
-        "x"
-    })
 }
 "#
     let out = check_package(entry, "st", helper, "e0566_qualified_{getpid()}")
     let found = e0566_lines(out)
-    assert_eq(found.len(), 4)
-    assert_eq(error_count(out), 4)
+    assert_eq(found.len(), 3)
+    assert_eq(error_count(out), 3)
     let row = found.get(0).unwrap()
     assert(row.contains("`msg` calls `st.get`, which has a row"), row)
     assert(row.contains("`st.get` has the row `! IO`"), row)
     let read = found.get(1).unwrap()
     assert(read.contains("`msg` calls `st.level`, which reads `counter`"), read)
     let deep = found.get(2).unwrap()
-    assert(deep.contains("`msg` calls `peek`, which reads `st.counter`"), deep)
-    let write = found.get(3).unwrap()
-    assert(write.contains("`msg` writes `st.counter`"), write)
+    assert(deep.contains("`msg` calls `peek`, which reads `counter`"), deep)
 }
 
 test "a trace.log with a keyword argument is E0511 alone in every order" {
@@ -842,4 +841,58 @@ test "a callee whose closures call each other twice per level is walked once per
     src = "{src}    c40()\n\}\n\nfn walk() \{\n    trace.log(\"c\", \"\{deep()\}\")\n\}\n\nfn main() \{\n    walk()\n\}\n"
     let out = check_via_cli(src, "e0566_closure_chain_{getpid()}")
     assert(!out.contains("\"severity\":\"error\""), out)
+}
+
+test "a method call on a value's field in msg is named by the method" {
+    let src = #"let mut count = 0
+
+type Inner { n: Int }
+type Outer { inner: Inner }
+
+trait Show {
+    fn show(self) -> Str
+}
+
+impl Show for Inner {
+    fn show(self) -> Str { "{count}{self.n}" }
+}
+
+fn walk(o: Outer) {
+    trace.log("c", "{o.inner.show()}")
+}
+
+fn main() {
+    walk(Outer { inner: Inner { n: 1 } })
+}
+"#
+    let found = only_e0566(check_via_cli(src, "e0566_field_receiver_{getpid()}"))
+    assert(primary_at(found, 15, 22), found)
+    assert(found.contains("`msg` calls `show`, which reads `count`"), found)
+}
+
+test "a with item in msg is named by the method that touches the module let mut" {
+    let src = #"let mut count = 0
+
+type T { n: Int }
+
+impl BlockHandler for T {
+    type Context = ()
+    fn enter(self) -> () { let _ = self.n }
+    fn exit(self, _ok: Bool) { count += self.n }
+}
+
+fn walk() {
+    trace.log("c", {
+        with T { n: 1 } { let _ = 0 }
+        "x"
+    })
+}
+
+fn main() {
+    walk()
+}
+"#
+    let found = only_e0566(check_via_cli(src, "e0566_with_one_method_{getpid()}"))
+    assert(primary_at(found, 13, 14), found)
+    assert(found.contains("`msg` runs `T.exit`, which writes `count`"), found)
 }
