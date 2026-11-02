@@ -1740,7 +1740,7 @@ build/blink build src/main.bl --strict
 
 ### Runtime Execution Tracing (`--trace`)
 
-Writes NDJSON to stderr: one line for each function enter and exit, `let mut` change and effect operation. In a program that is not built with `--trace`, user code has no trace code, and an effect operation called from std code reads one flag.
+Writes NDJSON to stderr: one line for each function enter and exit, `let mut` change, effect operation and `trace.log` call whose channel is on. In a program that is not built with `--trace`, user code has no trace code, and an effect operation called from std code reads one flag.
 
 ```sh
 # Trace everything
@@ -1757,6 +1757,7 @@ build/blink run app.bl --trace=fn:skip_ws+parse_block   # OR with +
 build/blink run app.bl --trace=event:enter+exit          # only enter/exit
 build/blink run app.bl --trace=event:effect              # only effect operations
 build/blink run app.bl --trace=event:state               # only state changes
+build/blink run app.bl --trace=event:note                # only trace.log notes
 
 # Filter by effect or state variable
 build/blink run app.bl --trace=effect:FS.Write
@@ -1789,7 +1790,7 @@ All events include: `ts_us`, `event`, `fn`, `module`, `depth`. A value is its `D
 
 ### Trace Notes (`trace.log`)
 
-`trace.log(channel: Str, msg: Str)` is a built-in call with no row: a fn that calls it declares nothing, and no handler sees it (a `capture_eprint` list does not get the line). With its channel on, and with no `--trace`, it writes `[trace:<channel>] <msg>` to stderr, in program order with the other stderr writes of the thread. Under `--trace` it writes a `note` event in place of that line, with the frame of the call, so each stderr line stays JSON.
+`trace.log(channel: Str, msg: Str)` is a built-in call with no row: a fn that calls it declares nothing, and no handler sees it (a `capture_eprint` list does not get the line). With its channel on, and with no `--trace`, it writes `[trace:<channel>] <msg>` to stderr, in program order with the other stderr writes of the thread. Under `--trace` it writes a `note` event in place of that line, with the frame of the call, so each stderr line stays JSON. A call with no traced frame on its thread, such as one directly in a module `let` block, writes no event.
 
 ```blink
 fn lower(id: Int) -> Int {
