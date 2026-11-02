@@ -182,8 +182,9 @@ BLINK_RT_FN void blink_trace_take_value(char* v, void* ctx) {
     }
     if (c->f->count == c->cap) {
         c->cap = c->cap ? c->cap * 2 : 4;
-        c->f->values = (char**)realloc(c->f->values, (size_t)c->cap * sizeof(char*));
-        if (!c->f->values) blink_trace_oom("reading", "BLINK_TRACE");
+        char** grown = (char**)realloc(c->f->values, (size_t)c->cap * sizeof(char*));
+        if (!grown) blink_trace_oom("reading", "BLINK_TRACE");
+        c->f->values = grown;
     }
     c->f->values[c->f->count++] = v;
 }
