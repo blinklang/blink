@@ -24,6 +24,7 @@ typedef struct {
     int event_exit;
     int event_effect;
     int event_state;
+    int event_note;
     /* Set when the stream of the trace closes; the program writes no more events (§8.15.13). */
     int closed;
 } blink_trace_state;
@@ -332,17 +333,19 @@ BLINK_RT_FN void blink_trace_parse_item_of(const char* item, const char* value) 
     if (f.count == 0) blink_trace_reject(value, "the key ", key, " has no value", NULL, 0);
     /* The items of `,` all must match (§8.15.5), so a second `event:` item narrows the set. */
     if (strcmp(key, "event") == 0) {
-        int enter = 0, exit_ = 0, effect = 0, state = 0;
+        int enter = 0, exit_ = 0, effect = 0, state = 0, note = 0;
         for (int i = 0; i < f.count; i++) {
             if (strcmp(f.values[i], "enter") == 0) enter = 1;
             if (strcmp(f.values[i], "exit") == 0) exit_ = 1;
             if (strcmp(f.values[i], "effect") == 0) effect = 1;
             if (strcmp(f.values[i], "state") == 0) state = 1;
+            if (strcmp(f.values[i], "note") == 0) note = 1;
         }
         __blink_trace.event_enter &= enter;
         __blink_trace.event_exit &= exit_;
         __blink_trace.event_effect &= effect;
         __blink_trace.event_state &= state;
+        __blink_trace.event_note &= note;
     }
     blink_trace_filter* grown = (blink_trace_filter*)realloc(__blink_trace.filters,
         (size_t)(__blink_trace.filter_count + 1) * sizeof(blink_trace_filter));
@@ -420,6 +423,7 @@ BLINK_RT_FN void blink_trace_init(int argc, char** argv) {
     __blink_trace.event_exit = 1;
     __blink_trace.event_effect = 1;
     __blink_trace.event_state = 1;
+    __blink_trace.event_note = 1;
 #ifndef BLINK_NO_TRACE_INIT
     /* No value turns tracing off: unset, empty text and a list with no items all trace
        every event (§8.15.13). */

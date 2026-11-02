@@ -1,0 +1,227 @@
+// Under `--trace` a `trace.log` call writes a `note` event: `ts_us`, `event`, `fn`, `module`,
+// `depth`, `channel`, `msg`, in that order, and no span (§8.15.3). `event:note` selects it;
+// `fn:`, `module:` and `depth:` apply to the frame of the call; `effect:` and `state:` never
+// select it (§8.15.5). The channel decides whether msg runs; a filter chooses only the output
+// (§8.15.7).
+
+import compile_test_helpers
+import std.process.{ChildEnd}
+
+let LOWER_SRC = #"fn lower(id: Int) -> Int {
+    trace.log("mono", "lower {id}")
+    id + 1
+}
+
+fn main() ! IO {
+    io.println("{lower(4)}")
+}
+"#
+
+// msg calls g, and g panics when the program sets its flag.
+let LAZY_SRC = #"fn g() -> Str {
+    trace.log("inner", "in g")
+    "g"
+}
+
+fn lower() {
+    trace.log("mono", "x {g()}")
+}
+
+fn main() ! IO {
+    lower()
+    io.println("end")
+}
+"#
+
+let PANIC_MSG_SRC = #"fn boom() -> Str {
+    panic("msg was evaluated")
+}
+
+fn lower() {
+    trace.log("mono", "x {boom()}")
+}
+
+fn main() ! IO {
+    lower()
+    io.println("end")
+}
+"#
+
+let PAL_SRC = #"pub fn dbl(n: Int) -> Int {
+    trace.log("mono", "dbl {n}")
+    n * 2
+}
+"#
+
+let PACKAGE_MAIN_SRC = #"import pal
+
+fn lower(id: Int) -> Int {
+    trace.log("mono", "lower {id}")
+    id + 1
+}
+
+fn main() ! IO {
+    io.println("{pal.dbl(lower(4))}")
+}
+"#
+
+fn stderr_of(bin: Str, channels: Str, filter: Str) -> Str ! Process.Spawn {
+    let r = process.run("env", ["BLINK_TRACE_CHANNELS={channels}", "BLINK_TRACE={filter}", bin]).unwrap()
+    assert(r.success(), r.err_out)
+    r.err_out
+}
+
+fn lines_with(text: Str, needle: Str) -> List[Str] {
+    text.split("\n").filter(fn(l) { l.contains(needle) })
+}
+
+fn note_lines(text: Str) -> List[Str] {
+    lines_with(text, #""event":"note""#)
+}
+
+test "a note event has its fields in spec order and no span" {
+    let bin = compile_test_helpers.build_bin(LOWER_SRC, "trace_note_shape", ["--trace"])
+    let notes = note_lines(stderr_of(bin, "mono", "all"))
+    assert_eq(notes.len(), 1)
+    let line = notes.get(0).unwrap()
+    assert(line.starts_with(#"{"ts_us":"#), line)
+    assert(line.ends_with(#","event":"note","fn":"trace_note_shape.lower","module":"trace_note_shape","depth":1,"channel":"mono","msg":"lower 4"}"#), line)
+    compile_test_helpers.clean_bin("trace_note_shape")
+}
+
+test "with no filter the note comes between the enter and the exit of its frame" {
+    let bin = compile_test_helpers.build_bin(LOWER_SRC, "trace_note_order", ["--trace"])
+    let mut events: List[Str] = []
+    for line in stderr_of(bin, "mono", "all").split("\n") {
+        if line == "" { continue }
+        let parts = line.split(#""event":""#)
+        events.push(parts.get(1).unwrap().split(#"""#).get(0).unwrap())
+    }
+    assert_eq(events.join(" "), "enter enter note exit effect exit")
+    compile_test_helpers.clean_bin("trace_note_order")
+}
+
+test "event:note selects the note alone, event:enter leaves it out and event:note+enter takes both" {
+    let bin = compile_test_helpers.build_bin(LOWER_SRC, "trace_note_event", ["--trace"])
+    let only = stderr_of(bin, "mono", "event:note")
+    assert_eq(only.split("\n").filter(fn(l) { l != "" }).len(), 1)
+    assert_eq(note_lines(only).len(), 1)
+    assert(only.contains(#""depth":1,"#), only)
+    assert_eq(note_lines(stderr_of(bin, "mono", "event:enter")).len(), 0)
+    assert_eq(note_lines(stderr_of(bin, "mono", "event:exit+effect+state")).len(), 0)
+    let both = stderr_of(bin, "mono", "event:note+enter")
+    assert_eq(note_lines(both).len(), 1)
+    assert_eq(lines_with(both, #""event":"enter""#).len(), 2)
+    assert_eq(lines_with(both, #""event":"exit""#).len(), 0)
+    compile_test_helpers.clean_bin("trace_note_event")
+}
+
+test "fn: selects the note by the name of its frame" {
+    let bin = compile_test_helpers.build_bin(LOWER_SRC, "trace_note_fn", ["--trace"])
+    assert_eq(note_lines(stderr_of(bin, "mono", "fn:lower")).len(), 1)
+    assert_eq(note_lines(stderr_of(bin, "mono", "fn:trace_note_fn.lower")).len(), 1)
+    assert_eq(note_lines(stderr_of(bin, "mono", "fn:main")).len(), 0)
+    assert_eq(note_lines(stderr_of(bin, "mono", "fn:ower")).len(), 0)
+    compile_test_helpers.clean_bin("trace_note_fn")
+}
+
+test "module: selects the note by the module of its frame" {
+    let blink_root = compile_test_helpers.sh("pwd -P")
+    let dir = "{compile_test_helpers.scratch_root()}/trace_note_module"
+    compile_test_helpers.sh("mkdir -p {dir}/src")
+    fs.write("{dir}/blink.toml", "[package]\nname = \"trace_note_module\"\nversion = \"0.1.0\"\n").unwrap()
+    fs.write("{dir}/src/pal.bl", PAL_SRC).unwrap()
+    fs.write("{dir}/src/main.bl", PACKAGE_MAIN_SRC).unwrap()
+    let b = process.run("sh", ["-c", "cd {dir} && {blink_root}/build/blink build --trace src/main.bl -o main_bin 2>&1"]).unwrap()
+    assert_eq("{b.success()} {b.out}", "true {b.out}")
+    let bin = "{dir}/main_bin"
+
+    let in_pal = note_lines(stderr_of(bin, "mono", "module:pal"))
+    assert_eq(in_pal.len(), 1)
+    assert(in_pal.get(0).unwrap().ends_with(#","event":"note","fn":"pal.dbl","module":"pal","depth":1,"channel":"mono","msg":"dbl 5"}"#), in_pal.join("\n"))
+
+    let in_main = note_lines(stderr_of(bin, "mono", "module:main"))
+    assert_eq(in_main.len(), 1)
+    assert(in_main.get(0).unwrap().ends_with(#","event":"note","fn":"main.lower","module":"main","depth":1,"channel":"mono","msg":"lower 4"}"#), in_main.join("\n"))
+
+    assert_eq(note_lines(stderr_of(bin, "mono", "module:other")).len(), 0)
+    compile_test_helpers.sh("rm -rf {dir}")
+}
+
+test "depth: selects the note by the depth of its frame" {
+    let bin = compile_test_helpers.build_bin(LOWER_SRC, "trace_note_depth", ["--trace"])
+    assert_eq(note_lines(stderr_of(bin, "mono", "depth:1")).len(), 1)
+    assert_eq(note_lines(stderr_of(bin, "mono", "depth:0")).len(), 0)
+    compile_test_helpers.clean_bin("trace_note_depth")
+}
+
+test "effect: and state: never select a note, also next to event:note" {
+    let bin = compile_test_helpers.build_bin(LOWER_SRC, "trace_note_no_effect", ["--trace"])
+    assert_eq(note_lines(stderr_of(bin, "mono", "effect:IO")).len(), 0)
+    assert_eq(note_lines(stderr_of(bin, "mono", "state:x")).len(), 0)
+    assert_eq(note_lines(stderr_of(bin, "mono", "event:note,effect:IO")).len(), 0)
+    assert_eq(note_lines(stderr_of(bin, "mono", "event:note,state:x")).len(), 0)
+    compile_test_helpers.clean_bin("trace_note_no_effect")
+}
+
+test "under --trace a channel that is off writes no note and does not run msg" {
+    let bin = compile_test_helpers.build_bin(PANIC_MSG_SRC, "trace_note_off", ["--trace"])
+    let r = process.run("env", ["BLINK_TRACE_CHANNELS=other", "BLINK_TRACE=all", bin]).unwrap()
+    assert_eq(r.end, ChildEnd.Exited(0))
+    assert_eq(r.out, "end\n")
+    assert_eq(note_lines(r.err_out).len(), 0)
+    compile_test_helpers.clean_bin("trace_note_off")
+}
+
+test "the channel alone decides that msg runs, so a filter that leaves the note out still runs msg" {
+    let bin = compile_test_helpers.build_bin(PANIC_MSG_SRC, "trace_note_msg_runs", ["--trace"])
+    let r = process.run("env", ["BLINK_TRACE_CHANNELS=mono", "BLINK_TRACE=event:enter", bin]).unwrap()
+    assert_eq(r.end, ChildEnd.Exited(101))
+    assert(r.err_out.contains("msg was evaluated"), r.err_out)
+    assert_eq(note_lines(r.err_out).len(), 0)
+    compile_test_helpers.clean_bin("trace_note_msg_runs")
+}
+
+test "a filter that leaves out the outer note still shows what msg calls" {
+    let bin = compile_test_helpers.build_bin(LAZY_SRC, "trace_note_msg_calls", ["--trace"])
+
+    let enters = stderr_of(bin, "mono", "event:enter")
+    assert_eq(compile_test_helpers.trace_enter_fns(enters), "trace_note_msg_calls.main trace_note_msg_calls.lower trace_note_msg_calls.g")
+    assert_eq(note_lines(enters).len(), 0)
+
+    let only_g = note_lines(stderr_of(bin, "mono,inner", "fn:g"))
+    assert_eq(only_g.len(), 1)
+    assert(only_g.get(0).unwrap().contains(#""channel":"inner","msg":"in g""#), only_g.join("\n"))
+    compile_test_helpers.clean_bin("trace_note_msg_calls")
+}
+
+test "BLINK_TRACE_CHANNELS as all or as a list turns on the note event as it does the text line" {
+    let bin = compile_test_helpers.build_bin(LOWER_SRC, "trace_note_channels", ["--trace"])
+    assert_eq(note_lines(stderr_of(bin, "all", "event:note")).len(), 1)
+    assert_eq(note_lines(stderr_of(bin, "a, mono ,b", "event:note")).len(), 1)
+    assert_eq(note_lines(stderr_of(bin, "a,b", "event:note")).len(), 0)
+    assert_eq(note_lines(stderr_of(bin, "", "event:note")).len(), 0)
+    compile_test_helpers.clean_bin("trace_note_channels")
+}
+
+test "a build with no --trace writes the text line, also with BLINK_TRACE set" {
+    let bin = compile_test_helpers.build_bin(LOWER_SRC, "trace_note_untraced", [])
+    assert_eq(stderr_of(bin, "mono", "event:note"), "[trace:mono] lower 4\n")
+    compile_test_helpers.clean_bin("trace_note_untraced")
+}
+
+test "blink run with --trace and BLINK_TRACE_CHANNELS writes the note end to end" {
+    let dir = "{compile_test_helpers.scratch_root()}/trace_note_run"
+    compile_test_helpers.sh("mkdir -p {dir}")
+    let path = "{dir}/trace_note_run.bl"
+    fs.write(path, LOWER_SRC).unwrap()
+    for flag in ["--trace=event:note", "--trace=fn:lower"] {
+        let r = process.run("env", ["BLINK_TRACE_CHANNELS=mono", "build/blink", "run", path, flag]).unwrap()
+        assert(r.success(), r.err_out)
+        assert_eq(r.out, "5\n")
+        let notes = note_lines(r.err_out)
+        assert_eq(notes.len(), 1, r.err_out)
+        assert(notes.get(0).unwrap().ends_with(#","channel":"mono","msg":"lower 4"}"#), r.err_out)
+    }
+    compile_test_helpers.sh("rm -rf {dir}")
+}

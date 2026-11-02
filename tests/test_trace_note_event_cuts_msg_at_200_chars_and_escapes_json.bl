@@ -1,0 +1,108 @@
+// The `msg` of a note event is cut to 200 characters, and the line then ends with
+// `"truncated":true`. `channel` is never cut. Both are JSON strings, so a quote, a backslash or
+// a control character in the text leaves the line valid (§8.15.3, §8.15.7).
+
+import compile_test_helpers
+import std.json.{json_clear, json_parse, json_get, json_as_str}
+
+// A program whose one note has the channel and the msg that its env vars name, so that one
+// binary covers each row and no row needs a build of its own.
+let SRC = #"fn run_note(ch: Str, msg: Str) {
+    trace.log(ch, msg)
+}
+
+fn main() ! Env, IO {
+    run_note(env.var("NOTE_CH") ?? "c", env.var("NOTE_MSG") ?? "")
+    io.println("end")
+}
+"#
+
+fn times(s: Str, n: Int) -> Str {
+    let mut out = ""
+    let mut i = 0
+    while i < n {
+        out = "{out}{s}"
+        i = i + 1
+    }
+    out
+}
+
+fn note_line(bin: Str, ch: Str, msg: Str) -> Str ! Process.Spawn {
+    let r = process.run("env", ["BLINK_TRACE_CHANNELS=all", "BLINK_TRACE=event:note", "NOTE_CH={ch}", "NOTE_MSG={msg}", bin]).unwrap()
+    assert(r.success(), r.err_out)
+    assert_eq(r.out, "end\n")
+    assert(r.err_out.ends_with("\n"))
+    let lines = r.err_out.split("\n").filter(fn(l) { l != "" })
+    assert_eq(lines.len(), 1, r.err_out)
+    lines.get(0).unwrap()
+}
+
+fn field(line: Str, key: Str) -> Str {
+    json_clear()
+    let obj = json_parse(line)
+    assert(obj >= 0, "not JSON: {line}")
+    json_as_str(json_get(obj, key))
+}
+
+fn has_truncated(line: Str) -> Bool {
+    line.contains("truncated")
+}
+
+test "a msg of 200 characters is whole, with no truncated field" {
+    let bin = compile_test_helpers.build_bin(SRC, "trace_note_200", ["--trace"])
+    let msg = times("a", 200)
+    let line = note_line(bin, "c", msg)
+    assert_eq(field(line, "msg"), msg)
+    assert(!has_truncated(line), line)
+    compile_test_helpers.clean_bin("trace_note_200")
+}
+
+test "a msg of 201 characters is cut to 200, and truncated comes last on the line" {
+    let bin = compile_test_helpers.build_bin(SRC, "trace_note_201", ["--trace"])
+    let line = note_line(bin, "c", times("a", 201))
+    assert_eq(field(line, "msg"), times("a", 200))
+    assert(line.ends_with(#","truncated":true}"#), line)
+    compile_test_helpers.clean_bin("trace_note_201")
+}
+
+test "the cut counts characters, not bytes, and never splits a character" {
+    let bin = compile_test_helpers.build_bin(SRC, "trace_note_utf8", ["--trace"])
+    let two = note_line(bin, "c", times("é", 201))
+    assert_eq(field(two, "msg"), times("é", 200))
+    assert(two.ends_with(#","truncated":true}"#), two)
+    let four = note_line(bin, "c", times("😀", 201))
+    assert_eq(field(four, "msg"), times("😀", 200))
+    assert(four.ends_with(#","truncated":true}"#), four)
+    compile_test_helpers.clean_bin("trace_note_utf8")
+}
+
+test "the cut counts a character that JSON escapes as one" {
+    let bin = compile_test_helpers.build_bin(SRC, "trace_note_escape_count", ["--trace"])
+    let msg = times("\"", 200)
+    let line = note_line(bin, "c", msg)
+    assert_eq(field(line, "msg"), msg)
+    assert(!has_truncated(line), line)
+    compile_test_helpers.clean_bin("trace_note_escape_count")
+}
+
+test "a quote, a backslash and a control character in msg or channel leave the line valid JSON" {
+    let bin = compile_test_helpers.build_bin(SRC, "trace_note_escape", ["--trace"])
+    for text in ["say \"hi\"", "a\\b", "one\ntwo", "a\tb"] {
+        let line = note_line(bin, text, text)
+        assert_eq(field(line, "channel"), text)
+        assert_eq(field(line, "msg"), text)
+    }
+    let line = note_line(bin, "a\u{1}b", "a\u{1}b")
+    assert(line.ends_with(#","channel":"a\u0001b","msg":"a\u0001b"}"#), line)
+    compile_test_helpers.clean_bin("trace_note_escape")
+}
+
+test "a channel longer than 200 characters is whole, with no truncated field" {
+    let bin = compile_test_helpers.build_bin(SRC, "trace_note_long_channel", ["--trace"])
+    let ch = times("c", 300)
+    let line = note_line(bin, ch, "m")
+    assert_eq(field(line, "channel"), ch)
+    assert_eq(field(line, "msg"), "m")
+    assert(!has_truncated(line), line)
+    compile_test_helpers.clean_bin("trace_note_long_channel")
+}

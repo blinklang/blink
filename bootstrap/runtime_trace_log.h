@@ -81,12 +81,40 @@ BLINK_RT_FN int blink_trace_channel_on(const char* ch) {
 }
 #endif
 
+/* The note event goes to the innermost traced call of this thread (§8.15.3), so a call with
+   no traced call on the stack writes none. An effect: or state: filter never selects it:
+   it has no effect and no variable. */
+BLINK_RT_FN void blink_trace_note_event(const char* ch, const char* msg);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void blink_trace_note_event(const char* ch, const char* msg) {
+    if (!__blink_trace.event_note) return;
+    int64_t depth = __blink_trace_frame_top - 1;
+    if (depth < 0 || depth >= __blink_trace_frame_cap) return;
+    blink_trace_frame* f = &__blink_trace_frames[depth];
+    if (!f->fn || !blink_trace_match_event(f->fn, f->module, depth, NULL, NULL)) return;
+    blink_trace_write_guard g;
+    if (!blink_trace_write_begin(&g)) return;
+    blink_trace_put_head("note", f->fn, f->module, depth);
+    fputs(",\"channel\":\"", stderr);
+    blink_trace_put_json(stderr, ch, -1);
+    fputs("\",\"msg\":\"", stderr);
+    int truncated = blink_trace_put_json(stderr, msg, BLINK_TRACE_MAX_VALUE_LEN);
+    fputs("\"", stderr);
+    blink_trace_put_tail(truncated);
+    blink_trace_write_end(&g);
+}
+#endif
+
 /* One write of the whole line, so a line of one thread never splits around a line of
-   another. Under --trace each stderr line must be JSON, so the text line is not written. */
+   another. Under --trace each stderr line must be JSON, so a note event takes the place of
+   the text line. */
 BLINK_RT_FN void blink_trace_note(const char* ch, const char* msg);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN void blink_trace_note(const char* ch, const char* msg) {
-    if (__blink_trace.active) return;
+    if (__blink_trace.active) {
+        blink_trace_note_event(ch, msg);
+        return;
+    }
     static const char head[] = "[trace:";
     static const char mid[] = "] ";
     size_t hn = sizeof(head) - 1, mn = sizeof(mid) - 1;

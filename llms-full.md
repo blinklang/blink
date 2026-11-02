@@ -1783,12 +1783,13 @@ Trace event types:
 | `exit` | `duration_us`, `return` | Function exit with duration and return value |
 | `effect` | `effect`, `op`, `args` | One event for each dispatch, before the handler body enters. `effect` is the effect path (`IO.Print`; a user effect has its module: `main.Log.Out`). `op` is the call as written (`io.println`). `args` has every parameter by its declared name |
 | `state` | `var`, `op`, `value` | A change to a `let mut` binding. `op` is `assign`, or the name of the mutating method (`push`). `value` is the whole binding after the change. The first binding gives no event |
+| `note` | `channel`, `msg` | A `trace.log` call whose channel is on. `event:note`, `fn:`, `module:` and `depth:` apply to it; `effect:` and `state:` never select it. `channel` is never cut |
 
 All events include: `ts_us`, `event`, `fn`, `module`, `depth`. A value is its `Display` text, else its `Debug` text, else `<TypeName>`. Values longer than 200 characters are cut, with `"truncated":true`.
 
 ### Trace Notes (`trace.log`)
 
-`trace.log(channel: Str, msg: Str)` is a built-in call with no row: a fn that calls it declares nothing, and no handler sees it (a `capture_eprint` list does not get the line). With its channel on, and with no `--trace`, it writes `[trace:<channel>] <msg>` to stderr, in program order with the other stderr writes of the thread.
+`trace.log(channel: Str, msg: Str)` is a built-in call with no row: a fn that calls it declares nothing, and no handler sees it (a `capture_eprint` list does not get the line). With its channel on, and with no `--trace`, it writes `[trace:<channel>] <msg>` to stderr, in program order with the other stderr writes of the thread. Under `--trace` it writes a `note` event in place of that line, with the frame of the call, so each stderr line stays JSON.
 
 ```blink
 fn lower(id: Int) -> Int {
@@ -1803,9 +1804,13 @@ BLINK_TRACE_CHANNELS="walk, mono" ./app
 BLINK_TRACE_CHANNELS=all ./app         # every channel
 ```
 
+```json
+{"ts_us":40,"event":"note","fn":"main.lower","module":"main","depth":1,"channel":"mono","msg":"lower 4"}
+```
+
 - The program reads `BLINK_TRACE_CHANNELS` once, when it starts; a later `env.set_var` changes nothing. It is separate from `BLINK_TRACE`.
 - The value splits on `,`. Each item is trimmed of ASCII space and tab, an empty item is skipped, and an item matches a channel by exact text (case counts). `all` in any place turns on every channel. No value gives a warning.
-- `msg` is not evaluated when the channel is off, so a `msg` that panics panics only with the channel on. The channel argument is always evaluated.
+- `msg` is not evaluated when the channel is off, so a `msg` that panics panics only with the channel on. The channel argument is always evaluated. Only the channel decides this: under `--trace`, a filter that leaves the note out still runs `msg`.
 - `msg` is lazy and may only read state; anything else is E0566. It may read a module `let` or `let mut` directly and call fns with an empty row; a write, a call of a fn with a row, a call of a fn that reads or writes a module `let mut`, and a handler operation such as `env.cwd()` are `TraceMessageEffect`. Compute such a value before the call.
 - A trace call keeps no code alive: if the compiler drops an unused call to a fn with an empty row, that fn's lines do not appear.
 - A fn, parameter or local named `trace` hides `trace.log` in its own scope, and `trace.log` there is a method call on it (E0505 if it has no `log`). A `pub fn trace` in another module does not hide it: with `import a`, `trace.log` is the built-in and `a.trace` is the fn. `trace` alone is no value.
