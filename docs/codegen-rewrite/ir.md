@@ -169,6 +169,7 @@ spelling `void`. Its parent is an `ExprStmt`.
 |---|---|---|---|
 | `FieldSet` | `ir_field_set(span, field, obj, value)` | `[obj: value, value: value]` | the C field name |
 | `HandlerInstall` | `ir_handler_install(span, ev_field, handler_value, body)` | `[handler: value, body: Block]` | the `__ev` field the handler is stored in |
+| `PanicHook` | `ir_panic_hook(span, adapter, hook, body)` | `[hook: value, body: Block]` | the C fn that builds the PanicInfo and calls the hook |
 | `Let` | `ir_let(tid, span, c_spelling, c_name, slot_form, init)` | `[]` or `[init: value]` | the local's C identifier |
 | `Assign` | `ir_assign(span, target, value)` | `[target: lvalue, value: value]` | empty |
 | `ExprStmt` | `ir_expr_stmt(span, expr)` | `[expr: value]` | empty |
@@ -230,7 +231,7 @@ begins `root <r>: `. It rejects:
 The kinds that print a c_name: `Const`, `VarRef`, `GlobalRef`, `Unary`,
 `Binary`, `FieldGet`, `FieldSet`, `ContainerNew`, `ContainerSpread`, `Box`, `CarrierUnwrap`,
 `CallDirect`, `CallClosure`, `CallVirtual`, `CallRuntime`, `ClosureNew`,
-`EvidenceVector`, `EffectPerform`, `HandlerInstall`, `Let`, and `CarrierWrap` with a payload.
+`EvidenceVector`, `EffectPerform`, `HandlerInstall`, `PanicHook`, `Let`, and `CarrierWrap` with a payload.
 `CarrierWrap` without a payload and `WithScope` take a c_name that may be empty.
 
 `ir_binds_statement(id) -> Bool` says whether printing the value at `id` writes a

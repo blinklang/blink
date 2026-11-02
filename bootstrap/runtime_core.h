@@ -3094,6 +3094,105 @@ BLINK_RT_FN const char* blink_str_format(const char* fmt, ...) {
 }
 #endif
 
+/* The panic hook of the program (spec §2.20). `with on_panic(f)` in main installs it for the
+   body of the `with`, and a panic with a Blink site calls it there, at the panic point. The
+   adapter is a C fn the compiler prints for main: it builds the PanicInfo and calls the hook
+   closure. `ev` is the program's effect vector and `ev_at_with` a copy of it at the `with`, so
+   the hook's operations go to the handlers in scope at the `with`, not at the panic point.
+   The record is one per process: main holds the only hook, and a panic on any thread is a
+   panic of the program. `test_run` is set by the test runner, which takes every panic itself,
+   so a test that calls main installs no hook. */
+struct blink_closure_;
+typedef void (*__blink_panic_hook_adapter)(struct blink_closure_* hook, const char* message, const char* file, int64_t line);
+typedef struct {
+    __blink_panic_hook_adapter adapter;
+    struct blink_closure_* hook;
+    void* ev;
+    const void* ev_at_with;
+    size_t ev_size;
+    int test_run;
+} __blink_panic_hook_record;
+
+/* §2.20 leaves open what a panic on a second thread does while the first runs the hook. The
+   flag is per thread, so each thread falls back to the default report on its own panic in the
+   hook. */
+#ifdef BLINK_USE_EXTERN_RUNTIME_STORAGE
+  #ifdef BLINK_RUNTIME_STORAGE_DEFINE
+    __blink_panic_hook_record __blink_panic_hook = {0};
+    __thread int __blink_in_panic_hook = 0;
+  #else
+    extern __blink_panic_hook_record __blink_panic_hook;
+    extern __thread int __blink_in_panic_hook;
+  #endif
+#else
+static __blink_panic_hook_record __blink_panic_hook = {0};
+static __thread int __blink_in_panic_hook = 0;
+#endif
+
+/* Install the hook for the body of a `with`. The result is 1 when it installed it, and the
+   cleanup of the `with` hands it to __blink_panic_hook_leave. */
+BLINK_RT_FN int __blink_panic_hook_enter(__blink_panic_hook_adapter adapter, struct blink_closure_* hook, void* ev, const void* ev_at_with, size_t ev_size);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN int __blink_panic_hook_enter(__blink_panic_hook_adapter adapter, struct blink_closure_* hook, void* ev, const void* ev_at_with, size_t ev_size) {
+    if (__blink_panic_hook.test_run || __blink_panic_test_hook != NULL) return 0;
+    __blink_panic_hook.hook = hook;
+    __blink_panic_hook.ev = ev;
+    __blink_panic_hook.ev_at_with = ev_at_with;
+    __blink_panic_hook.ev_size = ev_size;
+    __blink_panic_hook.adapter = adapter;
+    return 1;
+}
+#endif
+
+/* The adapter goes first: dispatch reads it to decide whether a hook is installed. */
+BLINK_RT_FN void __blink_panic_hook_leave_run(void* installed, int ok);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void __blink_panic_hook_leave_run(void* installed, int ok) {
+    (void)ok;
+    if (!*(int*)installed) return;
+    *(int*)installed = 0;
+    __blink_panic_hook.adapter = NULL;
+    __blink_panic_hook.hook = NULL;
+    __blink_panic_hook.ev = NULL;
+    __blink_panic_hook.ev_at_with = NULL;
+    __blink_panic_hook.ev_size = 0;
+}
+#endif
+
+/* Every exit from the body of the `with` runs this, so a panic after it gets the default
+   report. The cleanup stack holds the hook too while an assert_panics is armed, and the
+   attribute cleanup pops it on every way out but a panic, as a resource guard does. */
+BLINK_RT_FN void __blink_panic_hook_leave(int* installed);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void __blink_panic_hook_leave(int* installed) {
+    __blink_cleanup_pop((void*)installed);
+    __blink_panic_hook_leave_run((void*)installed, 1);
+}
+#endif
+
+BLINK_RT_FN void __blink_panic_hook_mark_test_run(void);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void __blink_panic_hook_mark_test_run(void) { __blink_panic_hook.test_run = 1; }
+#endif
+
+/* Run the hook for a panic that nothing else takes: a draining cleanup, an armed
+   assert_panics and the test runner each take theirs first, as __blink_panic_dispatch does.
+   A panic inside the hook does not call it again. A hook that returns, which its Never type
+   forbids, falls through to the default report. */
+BLINK_RT_FN void __blink_panic_hook_run(const char* what, const char* file, int64_t line);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void __blink_panic_hook_run(const char* what, const char* file, int64_t line) {
+    __blink_panic_hook_adapter adapter = __blink_panic_hook.adapter;
+    if (__builtin_expect(adapter == NULL, 1)) return;
+    if (__blink_in_cleanup_drain || __blink_panic_armed || __blink_panic_test_hook != NULL) return;
+    if (__blink_in_panic_hook) return;
+    __blink_in_panic_hook = 1;
+    memcpy(__blink_panic_hook.ev, __blink_panic_hook.ev_at_with, __blink_panic_hook.ev_size);
+    adapter(__blink_panic_hook.hook, blink_str_format("%s", what ? what : ""),
+            blink_str_format("%s", file ? file : ""), line);
+}
+#endif
+
 /* The panic the compiler raises: its message, its file and its line, kept apart up to here so
    the runtime is what joins them. No source line is 0 or less, so such a line names a node the
    compiler built. The joined sentence is sized to fit, so the uncaught report prints a long
@@ -3101,6 +3200,7 @@ BLINK_RT_FN const char* blink_str_format(const char* fmt, ...) {
 BLINK_RT_FN void __blink_panic_dispatch_at(const char* what, const char* file, int64_t line);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN void __blink_panic_dispatch_at(const char* what, const char* file, int64_t line) {
+    __blink_panic_hook_run(what, file, line);
     if (line <= 0) {
         __blink_panic_dispatch(blink_str_format("panic: %s at %s:<synthesized>", what, file));
     }

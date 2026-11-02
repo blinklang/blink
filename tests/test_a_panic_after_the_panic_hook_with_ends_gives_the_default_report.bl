@@ -1,0 +1,65 @@
+// The hook lives for the body of its `with`, as every `with` item does. Once the body ends, by
+// any path, a panic gets the default report and exit 101 (sections/02_syntax.md §2.20
+// *No hook*). `main` returns no Result, so no `?` can leave the body.
+
+import compile_test_helpers.{compile_and_run}
+
+fn report_src() -> Str {
+    #"fn report(p: PanicInfo) -> Never ! IO.Print, Env.Exit {
+    io.println("hook: {p.message}")
+    env.exit(70)
+}
+"#
+}
+
+fn expect_default(src: Str, tag: Str) ! FS.Delete, FS.Write, Process.Spawn, FS.Read, Env.Read {
+    let r = compile_and_run(report_src().concat(src), tag)
+    assert(r.exit_code == 101, "exit {r.exit_code}: {r.out}{r.err_out}")
+    assert(!r.out.contains("hook:"), r.out)
+    assert(r.err_out.contains("late"), r.err_out)
+}
+
+test "a panic after the body falls through gets the default report" {
+    expect_default(#"
+fn main() ! IO, Env {
+    with on_panic(report) {
+        io.println("in")
+    }
+    panic("late")
+}
+"#, "ph_after_fall_{getpid()}")
+}
+
+// The only code that runs after a `return` out of main is the close of an outer `with` item,
+// so that close is where the late panic stands.
+test "a panic after a return out of the body gets the default report" {
+    expect_default(#"
+type Bomb { n: Int }
+
+impl Closeable for Bomb {
+    fn close(self) { panic("late") }
+}
+
+fn main() ! IO, Env {
+    with Bomb { n: 1 } {
+        with on_panic(report) {
+            if true { return }
+            io.println("not here")
+        }
+    }
+}
+"#, "ph_after_return_{getpid()}")
+}
+
+test "a panic after a break out of the body gets the default report" {
+    expect_default(#"
+fn main() ! IO, Env {
+    for i in [1, 2] {
+        with on_panic(report) {
+            if i == 1 { break }
+        }
+    }
+    panic("late")
+}
+"#, "ph_after_break_{getpid()}")
+}

@@ -1439,6 +1439,8 @@ fn main() ! IO.Print {
 }
 ```
 
+Hook: `with on_panic(f)` in main's body, once, f: fn(PanicInfo) -> Never. PanicInfo { message: Str, file: Str, line: Int? }. Runs at the panic point, nothing unwinds, row charged to main. Not a catch. A panic in the hook gives the default report and exit 101. A hook elsewhere or a second hook is E0565. Under `blink test` the hook never runs; test it by calling it directly under mock_env(Map.new()) and assert_panics.
+
 ## BlockHandler Trait & Scoped Blocks
 
 Types that implement `BlockHandler` (from `std.traits`) provide scoped enter/exit semantics with an associated `Context` type.

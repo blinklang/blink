@@ -777,6 +777,7 @@ BLINK_RT_FN void blink_test_run(const blink_test_entry* tests, int count, int ar
     int human = !json_output && !quiet;
 
     __blink_panic_test_hook = __blink_test_panic_handler;
+    __blink_panic_hook_mark_test_run();
     if (__blink_test_case_records == NULL) {
         __blink_test_case_records = (blink_test_case_record*)calloc(BLINK_TEST_CASE_INITIAL, sizeof(blink_test_case_record));
         if (__blink_test_case_records == NULL) { fprintf(stderr, "blink: out of memory\n"); exit(1); }

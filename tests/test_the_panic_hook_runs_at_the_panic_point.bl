@@ -1,0 +1,168 @@
+// `with on_panic(f)` in main runs f at the panic point (sections/02_syntax.md §2.20 *Panic
+// Hook*). The hook writes its own report and picks the exit code. Nothing unwinds, and each
+// operation in the hook goes to the handlers in scope at the `with`.
+
+import compile_test_helpers.{compile_and_run}
+
+fn report_src() -> Str {
+    #"fn report(p: PanicInfo) -> Never ! IO.Eprint, Env.Exit {
+    let at = match p.line {
+        Some(n) => "{p.file}:{n}"
+        None => p.file
+    }
+    io.eprintln("fatal: {p.message} at {at}")
+    env.exit(70)
+}
+
+fn deep(n: Int) -> Int {
+    if n > 3 { panic("n out of range: {n}") }
+    n
+}
+"#
+}
+
+test "the hook writes its report and picks the exit code" {
+    let tag = "ph_report_{getpid()}"
+    let src = report_src().concat(#"
+fn main() ! IO, Env {
+    with on_panic(report) {
+        io.println("{deep(9)}")
+    }
+}
+"#)
+    let r = compile_and_run(src, tag)
+    assert(r.exit_code == 70, "exit {r.exit_code}: {r.err_out}")
+    assert_eq(r.out, "")
+    assert(r.err_out.starts_with("fatal: n out of range: 9 at "), r.err_out)
+    assert(r.err_out.contains("{tag}.bl:11\n"), r.err_out)
+}
+
+test "a body that does not panic runs as it would with no hook" {
+    let src = report_src().concat(#"
+fn main() ! IO, Env {
+    with on_panic(report) {
+        io.println("{deep(2)}")
+    }
+    io.println("after")
+}
+"#)
+    let r = compile_and_run(src, "ph_no_panic_{getpid()}")
+    assert(r.exit_code == 0, "exit {r.exit_code}: {r.err_out}")
+    assert_eq(r.out, "2\nafter\n")
+    assert_eq(r.err_out, "")
+}
+
+test "nothing unwinds: no close of a with item runs" {
+    let src = report_src().concat(#"
+type Lock { name: Str }
+
+impl Closeable for Lock {
+    fn close(self) ! IO.Print { io.println("closed {self.name}") }
+}
+
+fn main() ! IO, Env {
+    with on_panic(report) {
+        with Lock { name: "outer" } {
+            with Lock { name: "inner" } {
+                let _ = deep(9)
+            }
+        }
+    }
+}
+"#)
+    let r = compile_and_run(src, "ph_no_unwind_{getpid()}")
+    assert(r.exit_code == 70, "exit {r.exit_code}: {r.err_out}")
+    assert(!r.out.contains("closed"), r.out)
+    assert(r.err_out.starts_with("fatal: n out of range: 9"), r.err_out)
+}
+
+// §2.20 *The row of the hook*: the capture is in scope at the panic point, not at the `with`.
+test "the hook's operations go to the handlers in scope at the with" {
+    let src = report_src().concat(#"
+import std.testing.{capture_eprint}
+
+fn main() ! IO, Env {
+    let got: List[Str] = []
+    with on_panic(report) {
+        with capture_eprint(got) {
+            io.eprintln("captured")
+            let _ = deep(9)
+        }
+    }
+}
+"#)
+    let r = compile_and_run(src, "ph_handlers_at_with_{getpid()}")
+    assert(r.exit_code == 70, "exit {r.exit_code}: {r.err_out}")
+    assert(r.err_out.starts_with("fatal: n out of range: 9"), r.err_out)
+    assert(!r.err_out.contains("captured"), r.err_out)
+}
+
+test "a hook reads the module state the program wrote" {
+    let src = #"let mut cur_uri = ""
+let mut cur_id = 0
+
+fn report(p: PanicInfo) -> Never ! IO.Print, Env.Exit, State {
+    io.println("error id={cur_id} uri={cur_uri}: {p.message}")
+    env.exit(101)
+}
+
+fn handle(id: Int) ! State {
+    cur_uri = "/item/{id}"
+    cur_id = id
+    if id == 3 { panic("bad item") }
+}
+
+fn main() ! IO, Env {
+    with on_panic(report) {
+        for id in [1, 2, 3, 4] {
+            handle(id)
+        }
+    }
+}
+"#
+    let r = compile_and_run(src, "ph_module_state_{getpid()}")
+    assert(r.exit_code == 101, "exit {r.exit_code}: {r.err_out}")
+    assert_eq(r.out, "error id=3 uri=/item/3: bad item\n")
+}
+
+test "a closure is a hook" {
+    let src = #"fn main() ! IO, Env {
+    with on_panic(fn(p: PanicInfo) -> Never {
+        io.eprintln("closure: {p.message}")
+        env.exit(3)
+    }) {
+        todo()
+    }
+}
+"#
+    let r = compile_and_run(src, "ph_closure_hook_{getpid()}")
+    assert(r.exit_code == 3, "exit {r.exit_code}: {r.err_out}")
+    assert(r.err_out.starts_with("closure: "), r.err_out)
+}
+
+// The hook gets each panic that no catch frame takes, so `unreachable()` reaches it with its
+// own file and line.
+test "the hook gets the file and line of the panic" {
+    let tag = "ph_file_line_{getpid()}"
+    let src = #"fn report(p: PanicInfo) -> Never ! IO.Print, Env.Exit {
+    io.println(p.message)
+    io.println(p.file)
+    match p.line {
+        Some(n) => io.println("line {n}")
+        None => io.println("no line")
+    }
+    env.exit(9)
+}
+
+fn main() ! IO, Env {
+    with on_panic(report) {
+        unreachable()
+    }
+}
+"#
+    let r = compile_and_run(src, tag)
+    assert(r.exit_code == 9, "exit {r.exit_code}: {r.err_out}")
+    let lines = r.out.split("\n")
+    assert(lines.get(1).unwrap().ends_with("{tag}.bl"), r.out)
+    assert_eq(lines.get(2).unwrap(), "line 13")
+}

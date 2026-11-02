@@ -46,6 +46,7 @@ Key facts:
 - `@trusted(audit: "ID")` needs an audit id. `@ffi.opaque(header, name)` declares a C handle type
 - `blink build`, `run` and `test` compile one C unit per module. `--no-per-module` or `BLINK_PER_MODULE=0` builds one C unit, to bisect a per-module bug
 - An uncaught panic exits with code 101. That covers `panic`, `todo`, `unreachable`, a failed `assert` outside a test, and a panic the runtime raises (an index out of bounds, an overflow). Under `blink test` the runner records the panic as a failed test, and `blink test` exits 1
+- Hook: `with on_panic(f)` in main's body, once, f: fn(PanicInfo) -> Never. PanicInfo { message: Str, file: Str, line: Int? }. Runs at the panic point, nothing unwinds, row charged to main. Not a catch. A panic in the hook gives the default report and exit 101. A hook elsewhere or a second hook is E0565. Under `blink test` the hook never runs; test it by calling it directly under mock_env(Map.new()) and assert_panics.
 - `blink test` ends each test binary after a 10m timeout. `--timeout`, `--memory` and `--processes` set the limits (`30m`, `2G`, `1024`; `none` turns one off); `[test] timeout = "30m"` in blink.toml sets the timeout. A bad value exits 2 before any build
 
 ## Standard Library

@@ -24,12 +24,13 @@ import typecheck.{
     tc_call_declared_name, tc_enum_has_payload, tc_global_decl_node, tc_let_binder_is_discard,
     tc_lookup_node_tid, tc_resolve, tc_tid_kind, make_list_type,
     tc_alias_decl_of_ann, tc_ensures_preds_of, tc_is_old_snapshot, tc_requires_preds_of,
+    tc_is_panic_hook_item, tc_panic_hook_fn_type, tc_panic_info_type, make_option_type,
 }
 import layout.{
     Position, Slot, SlotForm, LayoutRecord, async_scope_handles_spelling, bind_binder_cell,
     bind_binder_mut, binder_is_celled,
     binder_scope_pop, binder_scope_push, carrier_member_layout, child_tid,
-    ensure_typedef_for, field_layout_of,
+    ensure_typedef_for, field_layout_of, fn_pointer_spelling_of,
     layout_of, tid_holds_tag_member, tid_of_binder,
     tid_of_node, varargs_spelling,
 }
@@ -46,6 +47,7 @@ import ir.{
     ir_loop, ir_mark_materialize, ir_new, ir_return, ir_slot_form, ir_span, ir_switch, ir_tid,
     ir_tuple_new, ir_unary, ir_unreachable, ir_var_ref, ir_with_scope,
     ir_panic_catch, ir_panic_catch_exit, ir_volatile_let, ir_arena_scope,
+    ir_call_closure, ir_panic_hook, ir_select, ir_struct_new,
 }
 import diagnostics.{
     Diag, diag_file_for_node, diag_ice_at, diag_ice_stage_not_built, diag_is_ice_seg,
@@ -60,7 +62,7 @@ import cg_expr.{
     cg_expr_take_pending, cg_expr_value_count, lower_expr, cg_expr_sequence, cg_expr_lower_pair,
     cg_expr_clear_old_snapshots, cg_expr_set_old_snapshot,
     x_layout_checked, x_panic_at, x_panic_what, x_stopped, x_unbox_payload, ArithSite, lower_arith_operator,
-    cg_expr_field_stored, cg_expr_field_value,
+    cg_expr_field_stored, cg_expr_field_value, cg_expr_option_none, cg_expr_option_some,
 }
 import cg_eff.{
     cg_eff_async_scope_exit_symbol, cg_eff_binder_is_shared, cg_eff_block_handler_calls,
@@ -2739,6 +2741,7 @@ fn lower_with_block(node: Int, tail: Int, dest: Str, dest_tid: Int) -> Int ! Dia
 fn wrap_with_items(node: Int, items: Int, n: Int, i: Int, tail: Int, dest: Str, dest_tid: Int) -> Int ! Diag.Report {
     if i >= n { return lower_body_block(node_body(node), tail, dest, dest_tid) }
     let item = sublist_get(items, i)
+    if tc_is_panic_hook_item(item) { return wrap_panic_hook(node, items, n, i, tail, dest, dest_tid) }
     let kind = node_kind(item)
     // A block handler is one with or without `as`, so the question is asked of the item's
     // expression before the binder decides between a resource and an effect handler.
@@ -2940,6 +2943,71 @@ fn bind_context(item: Int, init: Int) -> Int ! Diag.Report {
     let name = node_name(item)
     bind_binder_mut(cur_scope(), name, tid, false)
     ir_let(tid, item, rec.c_spelling, cg_local_c_name(name), rec.slot_form, init)
+}
+
+// `on_panic(f)` holds no value of its own: the item is f, held by the runtime for the body.
+fn wrap_panic_hook(node: Int, items: Int, n: Int, i: Int, tail: Int, dest: Str, dest_tid: Int) -> Int ! Diag.Report {
+    let item = sublist_get(items, i)
+    let args = node_args(item)
+    if args == -1 || sublist_length(args) != 1 {
+        diag_ice_at("PanicHookWithoutHook", CODEGEN_STAGE_NOT_BUILT,
+            "`on_panic` reached codegen without its one argument", item,
+            "typecheck reports each other arity; this is a compiler bug")
+        return -1
+    }
+    let hook = lower_value(sublist_get(args, 0))
+    let rest = wrap_with_items(node, items, n, i + 1, tail, dest, dest_tid)
+    if rest < 0 { return -1 }
+    ir_panic_hook(item, PANIC_HOOK_ADAPTER, hook, as_block(rest))
+}
+
+// The C fn the runtime calls with a panic's message, file and line: it builds the PanicInfo
+// and calls the hook. Only the entry `main` holds a hook, so one adapter serves the program.
+pub let PANIC_HOOK_ADAPTER = "__blink_main_panic_hook"
+
+pub type PanicHookAdapter {
+    params: List[Str]
+    body: Int
+}
+
+// No source line is 0 or less, so the runtime's line of a node the compiler built is None.
+pub fn cg_stmt_panic_hook_adapter(at: Int) -> PanicHookAdapter ! Diag.Report {
+    let none = PanicHookAdapter { params: [], body: -1 }
+    let hook_t = tc_panic_hook_fn_type()
+    let info_t = tc_panic_info_type()
+    let line_t = make_option_type(TYPE_INT)
+    let hook_rec = layout_at(hook_t, Position.Param, at)
+    let str_rec = layout_at(TYPE_STR, Position.Param, at)
+    let int_rec = layout_at(TYPE_INT, Position.Param, at)
+    let bool_rec = layout_at(TYPE_BOOL, Position.Local, at)
+    let line_rec = layout_at(line_t, Position.Local, at)
+    let info_rec = layout_at(info_t, Position.Local, at)
+    for rec in [hook_rec, str_rec, int_rec, bool_rec, line_rec, info_rec] {
+        if x_stopped(rec) { return none }
+    }
+    let fn_type = fn_pointer_spelling_of(hook_t, at)
+    if fn_type == "" { return none }
+    ensure_typedef_for(info_t)
+    let hook = ir_var_ref(hook_t, at, hook_rec.c_spelling, "__ph_hook", hook_rec.slot_form)
+    let message = ir_var_ref(TYPE_STR, at, str_rec.c_spelling, "__ph_message", str_rec.slot_form)
+    let file = ir_var_ref(TYPE_STR, at, str_rec.c_spelling, "__ph_file", str_rec.slot_form)
+    let known = ir_binary(TYPE_BOOL, at, bool_rec.c_spelling, ">",
+        ir_var_ref(TYPE_INT, at, int_rec.c_spelling, "__ph_line", int_rec.slot_form), ir_const(TYPE_INT, at, int_rec.c_spelling, "0"))
+    let some = cg_expr_option_some(line_t, at, line_rec,
+        ir_var_ref(TYPE_INT, at, int_rec.c_spelling, "__ph_line", int_rec.slot_form))
+    let absent = cg_expr_option_none(line_t, at, line_rec)
+    if some < 0 || absent < 0 { return none }
+    let line = ir_select(line_t, at, line_rec.c_spelling, line_rec.slot_form, known, some, absent)
+    let info = ir_struct_new(info_t, at, info_rec.c_spelling, [message, file, line])
+    let never_rec = layout_of(TYPE_NEVER, Position.Local)
+    let call = ir_call_closure(TYPE_NEVER, at, never_rec.c_spelling, fn_type, never_rec.slot_form, hook, [info])
+    PanicHookAdapter {
+        params: [
+            "{hook_rec.c_spelling} __ph_hook", "{str_rec.c_spelling} __ph_message",
+            "{str_rec.c_spelling} __ph_file", "{int_rec.c_spelling} __ph_line",
+        ]
+        body: ir_block(at, [ir_expr_stmt(at, call), ir_unreachable(at)])
+    }
 }
 
 // A handler replaces one slot of the effect vector for the body. Which slot is a fact
