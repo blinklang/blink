@@ -1,0 +1,157 @@
+// A site gets one E0565, and the compiler decides its form before its place
+// (sections/02_syntax.md §2.20 *The labels of E0565*). The form label's help shows the whole
+// repair, so a user who moves the hook into `main` gets no second report on the same token.
+
+import compile_test_helpers.{check_via_cli}
+
+fn report_src() -> Str {
+    #"import std.panic.{PanicInfo}
+fn report(p: PanicInfo) -> Never ! IO.Eprint, Env.Exit {
+    io.eprintln("fatal: {p.message}")
+    env.exit(70)
+}
+
+fn run() ! IO {
+    io.println("run")
+}
+"#
+}
+
+const FORM_HELP = "\"help\":\"write `with on_panic(f) \{ ... }` in the body of `main`\""
+const CLOSURE_NOTE = "this is in a closure; its body is not the body of `main`"
+
+// The E0565 line of the report; there must be just one, and no other error.
+fn only_e0565(src: Str, tag: Str) -> Str ! FS.Write, Process.Spawn, FS.Delete, Env.Read {
+    let out = check_via_cli(report_src().concat(src), "{tag}_{getpid()}")
+    let mut found = ""
+    for line in out.split("\n") {
+        if line.contains("\"severity\":\"error\"") {
+            assert_eq(found, "")
+            found = line
+        }
+    }
+    assert(found.contains("\"code\":\"E0565\""), out)
+    found
+}
+
+test "on_panic as a value in another fn has the form label, not the place label" {
+    let e = only_e0565(#"
+fn serve() {
+    let h = on_panic
+}
+
+fn main() ! IO, Env {
+    serve()
+}
+"#, "e0565l_value_other_fn")
+    assert(e.contains("`on_panic` is only a `with` item"), e)
+    assert(e.contains(FORM_HELP), e)
+    assert(e.contains("\"line\":12,\"col\":13,\"end_line\":12,\"end_col\":21"), e)
+    assert(!e.contains("outside"), e)
+}
+
+test "on_panic as a statement in main has the form label" {
+    let e = only_e0565(#"
+fn main() ! IO, Env {
+    on_panic(report)
+}
+"#, "e0565l_statement_main")
+    assert(e.contains("`on_panic` is only a `with` item"), e)
+    assert(e.contains(FORM_HELP), e)
+}
+
+test "on_panic as a statement in a test block has the form label, not the test label" {
+    let e = only_e0565(#"
+fn main() ! IO, Env {
+    run()
+}
+
+test "form first" {
+    on_panic(report)
+}
+"#, "e0565l_statement_test")
+    assert(e.contains("`on_panic` is only a `with` item"), e)
+    assert(!e.contains("`test` block"), e)
+}
+
+test "on_panic as a statement in a closure has the form label and no closure note" {
+    let e = only_e0565(#"
+fn main() ! IO, Env {
+    let f = fn() { on_panic(report) }
+    f()
+}
+"#, "e0565l_statement_closure")
+    assert(e.contains("`on_panic` is only a `with` item"), e)
+    assert(!e.contains(CLOSURE_NOTE), e)
+}
+
+test "a hook in a closure in main is outside main, with a note" {
+    let e = only_e0565(#"
+fn main() ! IO, Env {
+    let f = fn() { with on_panic(report) { run() } }
+    f()
+}
+"#, "e0565l_closure_main")
+    assert(e.contains("`on_panic` outside `main`"), e)
+    assert(e.contains(CLOSURE_NOTE), e)
+}
+
+test "a hook in a closure in a closure in main has the note" {
+    let e = only_e0565(#"
+fn main() ! IO, Env {
+    let f = fn() {
+        let g = fn() { with on_panic(report) { run() } }
+        g()
+    }
+    f()
+}
+"#, "e0565l_closure_closure")
+    assert(e.contains("`on_panic` outside `main`"), e)
+    assert(e.contains(CLOSURE_NOTE), e)
+}
+
+test "a hook in a closure in a test block is outside main, with the note" {
+    let e = only_e0565(#"
+fn main() ! IO, Env {
+    run()
+}
+
+test "closure in a test" {
+    let f = fn() { with on_panic(report) { run() } }
+    f()
+}
+"#, "e0565l_closure_test")
+    assert(e.contains("`on_panic` outside `main`"), e)
+    assert(e.contains(CLOSURE_NOTE), e)
+    assert(!e.contains("`test` block"), e)
+}
+
+test "a hook in a closure in another fn is outside main, with no note" {
+    let e = only_e0565(#"
+fn serve() ! IO {
+    let f = fn() { with on_panic(report) { run() } }
+    f()
+}
+
+fn main() ! IO, Env {
+    serve()
+}
+"#, "e0565l_closure_other_fn")
+    assert(e.contains("`on_panic` outside `main`"), e)
+    assert(!e.contains(CLOSURE_NOTE), e)
+}
+
+test "a hook in a fn other than main has no closure note" {
+    let e = only_e0565(#"
+fn serve() ! IO {
+    with on_panic(report) { run() }
+}
+
+fn main() ! IO, Env {
+    serve()
+}
+"#, "e0565l_other_fn")
+    assert(e.contains("`on_panic` outside `main`"), e)
+    assert(e.contains("\"line\":12,\"col\":10,\"end_line\":12,\"end_col\":18"), e)
+    assert(!e.contains(CLOSURE_NOTE), e)
+}

@@ -1439,7 +1439,7 @@ fn main() ! IO.Print {
 }
 ```
 
-Hook: `with on_panic(f)` in main's body, once, f: fn(PanicInfo) -> Never. PanicInfo { message: Str, file: Str, line: Int? }. `PanicInfo` is a type of `std.panic`: write `import std.panic.{PanicInfo}` to name it. `with on_panic(f)` and a closure hook `fn(p) {...}` need no import. A qualifier is used only in `q.y`; `panic("x")` stays the built-in after `import std.panic.{PanicInfo}`. Runs at the panic point, nothing unwinds, row charged to main. Not a catch. A panic in the hook gives the default report and exit 101. A hook elsewhere or a second hook is E0565. Under `blink test` the hook never runs; test it by calling it directly under mock_env(Map.new()) and assert_panics.
+Hook: `with on_panic(f)` in main's body, once, f: fn(PanicInfo) -> Never. PanicInfo { message: Str, file: Str, line: Int? }. `PanicInfo` is a type of `std.panic`: write `import std.panic.{PanicInfo}` to name it. `with on_panic(f)` and a closure hook `fn(p) {...}` need no import. A qualifier is used only in `q.y`; `panic("x")` stays the built-in after `import std.panic.{PanicInfo}`. Runs at the panic point, nothing unwinds, row charged to main. Not a catch. A panic in the hook gives the default report and exit 101. A hook elsewhere or a second hook is E0565. E0565 labels: `on_panic` is only a `with` item / outside `main` (a closure adds a note) / in a `test` block / a second `on_panic` in `main` / `with on_panic(f) as x` gives no value to bind (span `as x`, help remove `as x`). Under `blink test` the hook never runs; test it by calling it directly under mock_env(Map.new()) and assert_panics.
 
 ## BlockHandler Trait & Scoped Blocks
 

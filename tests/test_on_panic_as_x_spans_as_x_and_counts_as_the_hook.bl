@@ -1,0 +1,170 @@
+// The hook gives no value, so `as` has nothing to bind. `on_panic(f)` is a correct hook and
+// `as x` is the fault, so the primary span is `as x` and the fix removes it. The site is still
+// the hook of `main` (sections/02_syntax.md §2.20 *A name bound with `as`*).
+
+import compile_test_helpers.{check_via_cli}
+
+fn report_src() -> Str {
+    #"import std.panic.{PanicInfo}
+fn report(p: PanicInfo) -> Never ! IO.Eprint, Env.Exit {
+    io.eprintln("fatal: {p.message}")
+    env.exit(70)
+}
+
+fn run() ! IO {
+    io.println("run")
+}
+"#
+}
+
+const AS_LABEL = "`on_panic` gives no value to bind"
+
+fn lines_with(out: Str, what: Str) -> List[Str] {
+    let mut found: List[Str] = []
+    for line in out.split("\n") {
+        if line.contains(what) { found.push(line) }
+    }
+    found
+}
+
+fn only_error(src: Str, tag: Str) -> Str ! FS.Write, Process.Spawn, FS.Delete, Env.Read {
+    let out = check_via_cli(report_src().concat(src), "{tag}_{getpid()}")
+    let errors = lines_with(out, "\"severity\":\"error\"")
+    assert(errors.len() == 1, out)
+    assert(lines_with(out, "\"code\":\"W0600\"").len() == 0, out)
+    errors.get(0).unwrap()
+}
+
+test "the spec example: the span is exactly as x, and the fix removes it" {
+    let e = only_error(#"
+fn main() ! IO, Env {
+    with on_panic(report) as x { run() }
+}
+"#, "pax_spec")
+    assert(e.contains("\"code\":\"E0565\""), e)
+    assert(e.contains("\"name\":\"PanicHookPlacement\""), e)
+    assert(e.contains(AS_LABEL), e)
+    // `as` is at column 27, and `x` ends before column 31.
+    assert(e.contains("\"line\":12,\"col\":27,\"end_line\":12,\"end_col\":31"), e)
+    assert(e.contains("\"help\":\"remove `as x`\""), e)
+    // The edit starts after `)`, so the result reads `with on_panic(report) { run() }`.
+    assert(e.contains("\"fix\":\{\"action\":\"remove `as x`\",\"text\":\"\""), e)
+    assert(e.contains("\"line\":12,\"col\":26,\"end_line\":12,\"end_col\":31"), e)
+}
+
+test "a longer name widens the span to the end of the name" {
+    let e = only_error(#"
+fn main() ! IO, Env {
+    with on_panic(report) as hook_value { run() }
+}
+"#, "pax_long_name")
+    assert(e.contains("\"line\":12,\"col\":27,\"end_line\":12,\"end_col\":40"), e)
+    assert(e.contains("\"help\":\"remove `as hook_value`\""), e)
+}
+
+test "a read of the name in the body gives no second error" {
+    let e = only_error(#"
+fn main() ! IO, Env {
+    with on_panic(report) as x {
+        let y = x
+        io.println("{y}")
+    }
+}
+"#, "pax_read")
+    assert(e.contains(AS_LABEL), e)
+}
+
+test "a name that is never read gives no warning" {
+    let out = check_via_cli(report_src().concat(#"
+fn main() ! IO, Env {
+    with on_panic(report) as x { run() }
+}
+"#), "pax_unread_{getpid()}")
+    assert_eq(lines_with(out, "\"severity\":\"warning\"").len(), 0)
+}
+
+test "the site counts as the hook: a later on_panic is a second hook" {
+    let out = check_via_cli(report_src().concat(#"
+fn main() ! IO, Env {
+    with on_panic(report) as x { run() }
+    with on_panic(report) { run() }
+}
+"#), "pax_counts_{getpid()}")
+    let es = lines_with(out, "\"code\":\"E0565\"")
+    assert_eq(es.len(), 2)
+    assert(es.get(0).unwrap().contains(AS_LABEL), out)
+    let second = es.get(1).unwrap()
+    assert(second.contains("a second `on_panic` in `main`"), out)
+    assert(second.contains("\"span\":\{\"line\":12,\"col\":10,"), out)
+}
+
+test "after a first hook, the as x site keeps its own label and a third is a second hook" {
+    let out = check_via_cli(report_src().concat(#"
+fn main() ! IO, Env {
+    with on_panic(report) { run() }
+    with on_panic(report) as x { run() }
+    with on_panic(report) { run() }
+}
+"#), "pax_middle_{getpid()}")
+    let es = lines_with(out, "\"code\":\"E0565\"")
+    assert_eq(es.len(), 2)
+    assert(es.get(0).unwrap().contains(AS_LABEL), out)
+    assert(es.get(1).unwrap().contains("a second `on_panic` in `main`"), out)
+}
+
+test "outside main the as x label is the one label" {
+    let e = only_error(#"
+fn serve() ! IO {
+    with on_panic(report) as x { run() }
+}
+
+fn main() ! IO, Env {
+    serve()
+}
+"#, "pax_other_fn")
+    assert(e.contains(AS_LABEL), e)
+    assert(!e.contains("outside"), e)
+}
+
+test "in a test block the as x label is the one label" {
+    let e = only_error(#"
+fn main() ! IO, Env {
+    run()
+}
+
+test "as x in a test" {
+    with on_panic(report) as x { run() }
+}
+"#, "pax_test")
+    assert(e.contains(AS_LABEL), e)
+    assert(!e.contains("`test` block"), e)
+}
+
+test "the name is not in scope in the argument" {
+    let out = check_via_cli(report_src().concat(#"
+fn main() ! IO, Env {
+    with on_panic(x) as x { run() }
+}
+"#), "pax_arg_{getpid()}")
+    assert_eq(lines_with(out, "\"code\":\"E0300\"").len() + lines_with(out, "\"code\":\"E0506\"").len(), 1)
+}
+
+test "a name that shadows the hook does not hide the hook it binds on" {
+    let e = only_error(#"
+fn main() ! IO, Env {
+    with on_panic(report) as on_panic { run() }
+}
+"#, "pax_self_name")
+    assert(e.contains(AS_LABEL), e)
+}
+
+test "E0839 stays for an as item that is not the hook" {
+    let out = check_via_cli(#"fn main() {
+    with 3 as x {
+        let _ = x
+    }
+}
+"#, "pax_e0839_{getpid()}")
+    assert_eq(lines_with(out, "\"code\":\"E0839\"").len(), 1)
+    assert_eq(lines_with(out, "\"code\":\"E0565\"").len(), 0)
+}

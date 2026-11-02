@@ -24006,22 +24006,21 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                 let wh_item = sublist_get(wh_sl, wi)
                 let wh_kind = node_kind(wh_item)
                 if wh_kind == NodeKind.WithResource {
-                    nr_define_at(node_name(wh_item), wh_item)
-                    nr_check_node(node_value(wh_item))
+                    if nr_is_builtin_panic_hook_call(node_value(wh_item)) {
+                        nr_check_panic_hook_item(node_value(wh_item))
+                        // The name is bound so a read of it repeats nothing. E0565 is the report
+                        // for this name, so it carries no node for the unused and shadow checks.
+                        nr_define_typed(node_name(wh_item), 0, TYPE_UNKNOWN, -1)
+                    } else {
+                        nr_define_at(node_name(wh_item), wh_item)
+                        nr_check_node(node_value(wh_item))
+                    }
                 } else if wh_kind == NodeKind.Ident && node_name(wh_item) == "arena" {
                     // `arena` is a keyword in `with arena { }` — skip the
                     // bare ident so we don't emit E0506. Matches the skip
                     // guard in tc_check_body's WithBlock branch.
                 } else if nr_is_builtin_panic_hook_call(wh_item) {
-                    tc_intrinsic_calls.insert(wh_item, INTRINSIC_ON_PANIC)
-                    let ph_args = node_args(wh_item)
-                    if ph_args != -1 {
-                        let mut pi = 0
-                        while pi < sublist_length(ph_args) {
-                            nr_check_node(sublist_get(ph_args, pi))
-                            pi = pi + 1
-                        }
-                    }
+                    nr_check_panic_hook_item(wh_item)
                 } else {
                     nr_check_node(wh_item)
                     if wh_kind != NodeKind.HandlerExpr { has_item_without_as = true }
@@ -32046,7 +32045,10 @@ const PANIC_HOOK_OUTSIDE_MAIN = "`on_panic` outside `main`"
 const PANIC_HOOK_SECOND = "a second `on_panic` in `main`"
 const PANIC_HOOK_IN_TEST = "`on_panic` in a `test` block"
 const PANIC_HOOK_NOT_WITH_ITEM = "`on_panic` is only a `with` item"
+const PANIC_HOOK_NO_VALUE = "`on_panic` gives no value to bind"
 const PANIC_HOOK_HELP = "install the hook once, as a `with` item in the body of the entry `main`"
+const PANIC_HOOK_FORM_HELP = "write `with on_panic(f) \{ ... }` in the body of `main`"
+const PANIC_HOOK_CLOSURE_NOTE = "this is in a closure; its body is not the body of `main`"
 
 // `on_panic(f)` as a with item, where the name binds nothing the program declares.
 fn nr_is_builtin_panic_hook_call(item: Int) -> Bool {
@@ -32056,15 +32058,32 @@ fn nr_is_builtin_panic_hook_call(item: Int) -> Bool {
     nr_top_index("on_panic") == -1
 }
 
+fn nr_check_panic_hook_item(item: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    tc_intrinsic_calls.insert(item, INTRINSIC_ON_PANIC)
+    let args = node_args(item)
+    if args != -1 {
+        let mut i = 0
+        while i < sublist_length(args) {
+            nr_check_node(sublist_get(args, i))
+            i = i + 1
+        }
+    }
+}
+
 // Whether `item` installs the built-in panic hook. Codegen reads this, since the item has no
 // handler value.
 pub fn tc_is_panic_hook_item(item: Int) -> Bool {
     (tc_intrinsic_calls.get(item) ?? 0) == INTRINSIC_ON_PANIC
 }
 
+// `at` is the name `on_panic`, which is the primary span of each label but the `as x` one.
+fn tc_report_panic_hook_at(at: Int, label: Str, help: Str, notes: List[Str]) ! Diag.Report {
+    diag_error_span_label_at_notes("PanicHookPlacement", PANIC_HOOK_PLACEMENT, label, at, node_line(at), node_col(at), node_col(at) + "on_panic".byte_len(), label, help, notes)
+}
+
 fn tc_report_panic_hook_not_with_item(node: Int) ! Diag.Report {
     tc_errors.push(PANIC_HOOK_NOT_WITH_ITEM)
-    diag_error_label_at_notes("PanicHookPlacement", PANIC_HOOK_PLACEMENT, PANIC_HOOK_NOT_WITH_ITEM, node, PANIC_HOOK_NOT_WITH_ITEM, PANIC_HOOK_HELP, [])
+    tc_report_panic_hook_at(node, PANIC_HOOK_NOT_WITH_ITEM, PANIC_HOOK_FORM_HELP, [])
 }
 
 // PanicInfo is the one of std.panic, found by its module: a module's own `type PanicInfo` is
@@ -32188,13 +32207,16 @@ fn tc_check_panic_hook_placement(program: Int) ! Diag.Report {
 const PH_OUTSIDE_MAIN = 0
 const PH_MAIN_BODY = 1
 const PH_TEST = 2
+// A closure's body is not the body of what holds it, but in `main` or a `test` block it reads
+// as if it were, so the report says why it does not count.
+const PH_CLOSURE = 3
 
 fn tc_ph_walk(node: Int, ctx0: Int, entry_main: Int, first: List[Int], kids: List[Int]) ! Diag.Report {
     let k = node_kind(node)
     let ctx = if k == NodeKind.FnDef {
         if node == entry_main { PH_MAIN_BODY } else { PH_OUTSIDE_MAIN }
     } else if k == NodeKind.Closure {
-        PH_OUTSIDE_MAIN
+        if ctx0 == PH_OUTSIDE_MAIN { PH_OUTSIDE_MAIN } else { PH_CLOSURE }
     } else if k == NodeKind.TestBlock {
         PH_TEST
     } else {
@@ -32206,7 +32228,12 @@ fn tc_ph_walk(node: Int, ctx0: Int, entry_main: Int, first: List[Int], kids: Lis
             let mut i = 0
             while i < sublist_length(items) {
                 let item = sublist_get(items, i)
-                if tc_is_panic_hook_item(item) { tc_ph_check_item(item, ctx, first) }
+                if tc_is_panic_hook_item(item) {
+                    tc_ph_check_item(item, ctx, first)
+                } else if node_kind(item) == NodeKind.WithResource && tc_is_panic_hook_item(node_value(item)) {
+                    tc_ph_report_as(item)
+                    if ctx == PH_MAIN_BODY && first.len() == 0 { first.push(node_left(node_value(item))) }
+                }
                 i = i + 1
             }
         }
@@ -32224,19 +32251,32 @@ fn tc_ph_walk(node: Int, ctx0: Int, entry_main: Int, first: List[Int], kids: Lis
     }
 }
 
+// The form of `with on_panic(f) as x` is the fault wherever it stands, so this is its one report.
+fn tc_ph_report_as(item: Int) ! Diag.Report {
+    let name = node_name(item)
+    let line = node_line(item)
+    let end_col = node_end_col(item)
+    let lhs = node_var_name(item)
+    let help = if lhs == "" { "remove `as {name}`" } else { "remove `{lhs} =` and `as {name}`" }
+    diag_error_span_label_at_notes("PanicHookPlacement", PANIC_HOOK_PLACEMENT, PANIC_HOOK_NO_VALUE, item, line, node_col(item), end_col, PANIC_HOOK_NO_VALUE, help, [])
+    // A `lhs = on_panic(f) as lhs` item needs an edit at `lhs` too, so the help alone serves it.
+    if lhs == "" { diag_set_last_fix_at(help, "", line, node_int_val(item), line, end_col) }
+}
+
 fn tc_ph_check_item(item: Int, ctx: Int, first: List[Int]) ! Diag.Report {
     let at = node_left(item)
     if ctx == PH_OUTSIDE_MAIN {
-        diag_error_label_at_notes("PanicHookPlacement", PANIC_HOOK_PLACEMENT, PANIC_HOOK_OUTSIDE_MAIN, at, PANIC_HOOK_OUTSIDE_MAIN, PANIC_HOOK_HELP, [])
+        tc_report_panic_hook_at(at, PANIC_HOOK_OUTSIDE_MAIN, PANIC_HOOK_HELP, [])
+    } else if ctx == PH_CLOSURE {
+        tc_report_panic_hook_at(at, PANIC_HOOK_OUTSIDE_MAIN, PANIC_HOOK_HELP, [PANIC_HOOK_CLOSURE_NOTE])
     } else if ctx == PH_TEST {
-        diag_error_label_at_notes("PanicHookPlacement", PANIC_HOOK_PLACEMENT, PANIC_HOOK_IN_TEST, at, PANIC_HOOK_IN_TEST,
-            "`main` does not run under the test runner; call the hook as a plain fn under mock_env and assert_panics", [])
+        tc_report_panic_hook_at(at, PANIC_HOOK_IN_TEST, "`main` does not run under the test runner; call the hook as a plain fn under mock_env and assert_panics", [])
     } else if first.len() == 0 {
         first.push(at)
     } else {
         let prev = first.get(0).unwrap()
         let before = diag_entry_count()
-        diag_error_label_at_notes("PanicHookPlacement", PANIC_HOOK_PLACEMENT, PANIC_HOOK_SECOND, at, PANIC_HOOK_SECOND, "a program has at most one hook; remove this one", [])
+        tc_report_panic_hook_at(at, PANIC_HOOK_SECOND, "a program has at most one hook; remove this one", [])
         diag_add_label_since(before, node_line(prev), node_col(prev), node_col(prev) + "on_panic".byte_len(), "the hook `main` installs first")
     }
 }
@@ -33220,6 +33260,11 @@ fn tc_tid_has_scoped_impl(tid: Int) -> Bool ! Diag.Report {
 
 fn tc_bind_with_resource(item: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     let res_expr = node_value(item)
+    if tc_is_panic_hook_item(res_expr) {
+        tc_check_panic_hook_item(res_expr)
+        nr_define_typed(node_name(item), 0, tc_unknown_tid(), -1)
+        return
+    }
     let prev_res = tc_with_resource_node
     tc_with_resource_node = res_expr
     tc_check_body(res_expr)
