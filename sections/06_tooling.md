@@ -2562,7 +2562,7 @@ Filters use colon-syntax: `--trace=key:value`. Multiple filters compose with AND
 |--------|---------|
 | `fn:<name>` | Match the frame name (§8.15.8) by whole dot segments, from the end |
 | `module:<name>` | Match module name |
-| `depth:<n>` | Events at call depth <= N |
+| `depth:<n>` | Events at call depth <= N (`<n>` is ASCII digits only) |
 | `event:<type>` | Only emit specified event types (`event:note` selects `note` events) |
 | `effect:<name>` | Match effect type (e.g. `FS.Write`) by whole dot segments |
 | `state:<var>` | Match state variable name |
@@ -2595,7 +2595,50 @@ blink run app.bl --trace=event:state,module:parser      # state events in parser
 
 **`module:` and `state:`** match the whole text of the module name and of the binding name.
 
-Bare `--trace` with no value traces all events. The `BLINK_TRACE` environment variable accepts the same filter syntax. A bad filter is an error (§8.15.12). The `fn:`, `module:` and `depth:` filters apply to a `note` event. A `note` event has no effect type and no state variable, so an `effect:` or `state:` filter does not select it.
+**`depth:`.** The value is one or more ASCII digits `0` to `9` and nothing else, and the number must fit in `Int`. A sign is not a digit, so `depth:-1` and `depth:+3` are bad filters. A number that does not fit in `Int` is a bad filter with the same error shape as a sign. Leading zeros are digits: `depth:03` is `depth:3`. `main` is at depth 0, so `depth:0` selects the events of `main` only.
+
+**The word `all`.** The item `all` selects every event. It is valid only when every item of the list is `all`. `all` beside an item that is not `all` is a bad filter, in any place of the list and also when `all` occurs more than once. An item with no `:` that is not `all` has no key, so it is a bad filter too. Case counts. `all` is a word of the `,` list only: in `fn:all`, the text `all` is a frame name.
+
+`BLINK_TRACE_CHANNELS` is a separate list with a separate rule (§8.15.7). There, `all` in any place of the list turns on every channel. The rule for `all` in a filter list does not change that rule, and that rule does not change this one.
+
+**A list with no items.** If no item is left after the item rule, the list has zero filters, and zero filters select every event. This is the same result as an unset `BLINK_TRACE` and as a bare `--trace`. It holds for `--trace=` and for `BLINK_TRACE`. It is not the empty value of §8.15.12: that is a key with nothing after the `:`, as in `fn:`.
+
+| Value | Result |
+|-------|--------|
+| `all` | every event |
+| `all,` | every event (one item is left: `all`) |
+| `all,all` | every event |
+| `all,fn:add` | bad filter, exit code 2 |
+| `fn:add,all` | bad filter, exit code 2 |
+| `all,fn:add,all` | bad filter, exit code 2 (a second `all` does not make the list good) |
+| `fn:all` | the filter `fn` with the value `all`: a frame named `all` |
+| `add` | bad filter, exit code 2: no `:`, so no key |
+| `depth:0` | events at depth 0 |
+| `depth:03` | the same as `depth:3` |
+| `depth:-1` | bad filter, exit code 2 |
+| `depth:+3` | bad filter, exit code 2 |
+| `depth:99999999999999999999` | bad filter, exit code 2 (20 digits do not fit in `Int`) |
+| `""`, `" "`, `","`, `" , "` | no filters: every event (one case) |
+| `fn:` | bad filter, exit code 2 (empty value) |
+
+The quotes in the rows with spaces mark the end spaces; they are not part of the value.
+
+Example output of a bad filter. The words are an example; the spec does not require them. The text must name the source of the value (§8.15.12):
+
+```
+$ blink run p.bl --trace=depth:-1
+error: bad --trace value "depth:-1": depth takes digits only
+$ blink run p.bl --trace=depth:99999999999999999999
+error: bad --trace value "depth:99999999999999999999": depth takes digits only, and the number must fit in Int
+$ blink run p.bl --trace=fn:add,all
+error: bad --trace value "fn:add,all": `all` cannot be used with another filter
+$ BLINK_TRACE=depth:-1 ./p                 # a traced binary that a person starts by hand
+error: bad BLINK_TRACE value "depth:-1": depth takes digits only
+```
+
+Here `p.bl` is `fn add(a: Int, b: Int) -> Int { a + b }` and `fn main() ! IO { io.println("{add(1, 2)}") }`. `blink run p.bl --trace=all,all` and `blink run p.bl --trace=` write every event of `main` and `add`, then `3`.
+
+Bare `--trace` with no value traces all events. The `BLINK_TRACE` environment variable accepts the same filter syntax; a traced binary reads it (§8.15.13), and `blink run` does not read it to decide how to build. A bad filter is an error (§8.15.12). The `fn:`, `module:` and `depth:` filters apply to a `note` event. A `note` event has no effect type and no state variable, so an `effect:` or `state:` filter does not select it.
 
 #### 8.15.6 Timestamp Semantics
 
@@ -2630,6 +2673,8 @@ fn lower(id: Int) -> Int {
 | `mo no` | only the channel `mo no` (a space inside an item stays) |
 
 The quotes in the row `" , "` mark the end spaces; they are not part of the value. With `BLINK_TRACE_CHANNELS="walk, mono"`, `lower(4)` writes `[trace:mono] lower 4` to stderr.
+
+This list is not the list of `BLINK_TRACE`. In `BLINK_TRACE`, `all` beside another item is a bad filter, and a list with no items selects every event (§8.15.5).
 
 **A binding named `trace`.** `trace` is not an effect handle, and the name is not reserved. A binding named `trace` hides the built-in `trace.log` by lexical scope, as a local named `io` or `env` hides that handle in a fn that does not declare its effect (§3c.4 *Effect Handle Operations*). The binding can be a module-level fn, a parameter or a local. In the scope of that binding, `trace.log` is a method call on the binding. If the binding has no method `log`, the call is `UnresolvedMethod` (E0505):
 
@@ -2886,18 +2931,23 @@ fn main() {
 
 #### 8.15.12 Errors in a Filter
 
-A bad trace filter is a usage error (*Usage errors*, §8.10.7): the program prints text on stderr, writes no trace event, and exits with code `2` before `main` starts. These are bad filters: a key that is not in §8.15.5, an empty value, a `depth:` value that is not a number, and an `event:` value that is not an event type. `BLINK_TRACE` and `--trace=` have the same rule. `blink run` finds the error before it builds the program.
+A bad trace filter is a usage error (*Usage errors*, §8.10.7): the program prints text on stderr, writes no trace event, and exits with code `2` before `main` starts. These are bad filters: a key that is not in §8.15.5 (an item with no `:` has no key, unless it is the word `all`), an empty value, `all` beside an item that is not `all`, a `depth:` value that is not ASCII digits or does not fit in `Int`, and an `event:` value that is not an event type. A list with no items is not a bad filter: it selects every event (§8.15.5). `BLINK_TRACE` and `--trace=` have the same rule. `blink run` finds the error before it builds the program.
+
+**The source of the value.** The text of the error names where the bad value came from: `--trace` when `blink run` got it as a flag, `BLINK_TRACE` when a traced binary read it from its environment. The spec requires the source in the text and requires no other words. `blink run` passes the value of `--trace` to the child in `BLINK_TRACE` (§8.15.13), but the text does not relabel it: a value that came from `--trace` is named `--trace` in every message of `blink run`.
 
 Example output. The words are an example; the spec does not require them:
 
 ```
-error: bad --trace value: unknown event type `stat` in `event:stat`; did you mean `state`?
+error: bad --trace value "event:stat": unknown event type `stat`; did you mean `state`?
+error: bad BLINK_TRACE value "event:stat": unknown event type `stat`; did you mean `state`?
 ```
+
+The first line is the output of `blink run p.bl --trace=event:stat`. The second line is the output of `BLINK_TRACE=event:stat ./p`, where `./p` is a traced binary that a person starts by hand.
 
 **Names that no code declares.** Under `blink run`, the check goes one step further. After the typecheck and before the program starts, `blink run` checks each `fn:`, `module:`, `effect:` and `state:` value. A value that matches no declaration is the same usage error, with exit code `2`:
 
 ```
-error: bad --trace value: no function named `skip_newlinez`; did you mean `skip_newlines`?
+error: bad --trace value "fn:skip_newlinez": no function named `skip_newlinez`; did you mean `skip_newlines`?
 ```
 
 - The check matches with the rule of §8.15.5, over every name in the program: frames (with the names of §8.15.8), modules, effects and the names of `let mut` bindings.
@@ -2907,11 +2957,23 @@ error: bad --trace value: no function named `skip_newlinez`; did you mean `skip_
 
 #### 8.15.13 The Traced Binary
 
-A traced binary reads `BLINK_TRACE` and nothing else. Its argv and `env.args()` are never changed by tracing. `blink run --trace[=filter]` sets `BLINK_TRACE` for the child process. A bare `--trace` sets `all`. The flag replaces a value that the shell had set. A binary with `BLINK_TRACE` unset traces everything. `BLINK_TRACE=1` is not a value: the word `all` is.
+A traced binary reads `BLINK_TRACE` and nothing else. Its argv and `env.args()` are never changed by tracing. `blink run --trace[=filter]` sets `BLINK_TRACE` for the child process. A bare `--trace` sets `all`. The flag replaces a value that the shell had set. A binary with `BLINK_TRACE` unset traces everything. A binary with `BLINK_TRACE` set to the empty text or to a list with no items (§8.15.5) also traces everything: `BLINK_TRACE=` is not "no trace". No value of `BLINK_TRACE` turns tracing off; to run with no trace, run an untraced build. `BLINK_TRACE=1` is not a value: the word `all` is.
+
+**Only `--trace` builds traced.** `blink run` builds the program traced only when its command has `--trace` or `--trace=filter`. It does not read `BLINK_TRACE` to decide. `BLINK_TRACE=fn:add blink run p.bl` builds an untraced program: it prints `3` and writes no trace event. An untraced program does not read `BLINK_TRACE`. The text of `blink run --help` states that only `--trace` builds the program traced.
+
+**The note.** `blink run` prints one note line when both of these hold: the command has no `--trace`, and `BLINK_TRACE` is not empty after the item rule (§8.15.5). `blink run` prints the line itself, on stderr, before it builds; the program does not print it. The note changes no exit code. If `BLINK_TRACE` is unset, is empty text, or is a list with no items (`BLINK_TRACE=" , "`), `blink run` prints no note. If the command has `--trace`, `blink run` prints no note. Example output; the words are an example, and the spec does not require them:
+
+```
+$ BLINK_TRACE=fn:add blink run p.bl
+note: BLINK_TRACE is set, but `blink run` builds traced only with --trace; use --trace=fn:add
+3
+```
 
 There is no limit on the number of events. The flag `--trace-limit` and the variable `BLINK_TRACE_LIMIT` do not exist.
 
 If the stream of the trace closes (for example, a reader of the pipe exits), the program stops writing trace events and runs to its end with its own exit code. Only the trace writes stop. A write by the program to its own stdout or stderr keeps the behavior of that stream, also when `2>&1` puts both in one pipe.
+
+**Panel vote (filter edge cases):** **6-0** that `all` beside an item that is not `all` is a bad filter, and a lone `all`, `all,` and `all,all` trace everything (**4-2** in the first vote). **6-0** that `depth:` takes ASCII digits that fit in `Int`. **6-0** that a list with no items selects every event. **6-0** that only `--trace` makes `blink run` build traced. **4-2** for the note of `blink run` (Systems and Minimalism dissented: no note). **5-1** that the error names the source of the value (Minimalism dissented: not a rule). See [decisions/trace-filter-edge-cases.md](../decisions/trace-filter-edge-cases.md).
 
 **Panel vote:** **5-1** that a `test` block is a frame (Minimalism dissented: no rule until `blink test --trace` is in the spec). **5-1** that the `op` of an `effect` event is the call (Programming Language Theory dissented: the handler operation). **5-1** that a user effect has its module in `effect` (Minimalism dissented: no module). **5-1** for the check of filter names under `blink run` (Minimalism dissented: no check). **6-0** for the names of closures, handler bodies, default bodies and tests, for one event for each dispatch, for `assign` or the method name in `op`, for no `path` field, for the value chain, for the stream rules and for the removal of `--trace-limit`. See [decisions/runtime-trace-open-points.md](../decisions/runtime-trace-open-points.md) and [decisions/trace-ndjson-format.md](../decisions/trace-ndjson-format.md).
 
