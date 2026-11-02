@@ -1,0 +1,51 @@
+// `for_each` outside a test run has no case record to write. A duplicate label is still a panic,
+// so it reaches the hook with a site (sections/06_tooling.md, Label uniqueness). The site is the
+// line in std, because a panic() in a std function keeps its own site. Inside a test run the
+// duplicate stays a panicked case, which tests/test_for_each_runs_every_case.bl covers.
+
+import compile_test_helpers.{compile_and_run}
+
+fn dup_src(extra: Str) -> Str {
+    #"import std.testing.{for_each}
+
+"#.concat(extra).concat(#"
+fn walk() ! IO {
+    for_each([("a", 1), ("a", 2)], fn(v: Int) {
+        io.println("ran {v}")
+    })
+}
+"#)
+}
+
+test "the duplicate reaches the hook with a site and the case body does not run" {
+    let r = compile_and_run(dup_src(#"fn report(p: PanicInfo) -> Never ! IO.Eprint, Env.Exit {
+    let at = match p.line {
+        Some(n) => "line {n} of {p.file}"
+        None => "no line in {p.file}"
+    }
+    io.eprintln("fatal: {p.message} at {at}")
+    env.exit(70)
+}
+"#).concat(#"
+fn main() ! IO, Env {
+    with on_panic(report) {
+        walk()
+    }
+}
+"#), "dup_hook_{getpid()}")
+    assert(r.exit_code == 70, "exit {r.exit_code}: {r.err_out}")
+    assert(r.err_out.starts_with("fatal: for_each: duplicate case label \"a\" at indices 0 and 1 at line "), r.err_out)
+    assert(r.out.contains("ran 1"), r.out)
+    assert(!r.out.contains("ran 2"), r.out)
+}
+
+test "with no hook the duplicate exits 101 and names a site" {
+    let r = compile_and_run(dup_src("").concat(#"
+fn main() ! IO {
+    walk()
+}
+"#), "dup_nohook_{getpid()}")
+    assert(r.exit_code == 101, "exit {r.exit_code}: {r.err_out}")
+    assert(r.err_out.contains("for_each: duplicate case label"), r.err_out)
+    assert(r.err_out.contains("testing.bl:"), r.err_out)
+}
