@@ -1,0 +1,167 @@
+// A module may not both import a name and declare it, because module scope is one flat namespace
+// (sections/07_trust_modules_metadata.md, "Imported and Declared Names").
+
+import compile_test_helpers.{check_via_cli, scratch_root, verify_catalog_entry}
+
+let ALPHA = "pub type Point \{ a: Int }\npub type Other \{ c: Int }\npub fn make() -> Point \{ Point \{ a: 1 } }\n"
+
+fn stage(entry: Str, tag: Str) -> Str ! Process.Spawn, FS.Write, Env.Read {
+    let src = "{scratch_root()}/{tag}/src"
+    let _mk = process.run("mkdir", ["-p", src]).unwrap()
+    fs.write("{scratch_root()}/{tag}/blink.toml", "[package]\nname = \"{tag}\"\nversion = \"0.1.0\"\n").unwrap()
+    for m in ["alpha", "beta", "gamma"] {
+        fs.write("{src}/{m}.bl", ALPHA).unwrap()
+    }
+    let path = "{src}/main.bl"
+    fs.write(path, entry).unwrap()
+    path
+}
+
+fn check_pkg(entry: Str, tag: Str) -> Str ! Process.Spawn, FS.Write, Env.Read {
+    let r = process.run("build/blink", ["check", stage(entry, "e1012_{tag}_{getpid()}"), "--format", "json"]).unwrap()
+    "{r.out}{r.err_out}"
+}
+
+// The lines of a JSON report that hold `code`.
+fn rows(out: Str, code: Str) -> List[Str] {
+    out.split("\n").filter(fn(l) { l.contains("\"code\":\"{code}\"") })
+}
+
+fn error_rows(out: Str) -> List[Str] {
+    out.split("\n").filter(fn(l) { l.contains("\"severity\":\"error\"") })
+}
+
+test "the spec example: a listed name and a type, with the import labelled" {
+    let e = error_rows(check_pkg("import alpha.\{Point}\n\ntype Point \{\n    b: Int\n}\n\nfn main() \{ }\n", "listed"))
+    assert_eq(e.len(), 1)
+    let r = e.get(0).unwrap()
+    assert(r.contains("\"name\":\"DuplicateSymbol\",\"code\":\"E1012\""), r)
+    assert(r.contains("\"message\":\"`Point` is both imported and declared in module `main`\""), r)
+    assert(r.contains("\"span\":\{\"line\":3,\"col\":6,\"end_line\":3,\"end_col\":11},\"message\":\"also declared here\""), r)
+    assert(r.contains("\"span\":\{\"line\":1,\"col\":15,\"end_line\":1,\"end_col\":20},\"message\":\"imported from `alpha` here\""), r)
+    assert(r.contains("drop `Point` from the import list and use `alpha.Point`,\\nor import it under another name: import alpha.\{Point as AlphaPoint}"), r)
+}
+
+test "every declaration kind collides with a listed name" {
+    let mut n = 0
+    for decl in ["type Point \{ b: Int }", "type Point = Int", "trait Point \{ }", "effect Point \{ }",
+        "fn Point() -> Int \{ 1 }", "const Point: Int = 1", "let Point = 1", "let mut Point = 1"] {
+        n = n + 1
+        let out = check_pkg("import alpha.\{Point}\n{decl}\nfn main() \{ }\n", "kind_{n}")
+        assert_eq(rows(out, "E1012").len(), 1)
+    }
+}
+
+test "pub import and a private or public declaration collide alike" {
+    assert_eq(rows(check_pkg("pub import alpha.\{Point}\ntype Point \{ b: Int }\nfn main() \{ }\n", "pub_imp"), "E1012").len(), 1)
+    assert_eq(rows(check_pkg("import alpha.\{Point}\npub type Point \{ b: Int }\nfn main() \{ }\n", "pub_decl"), "E1012").len(), 1)
+}
+
+test "the check uses the name after as" {
+    let p = check_pkg("import alpha.\{Point as P}\ntype P \{ b: Int }\nfn main() \{ }\n", "as_hit")
+    assert(rows(p, "E1012").get(0).unwrap().contains("`P` is both imported and declared"), p)
+    assert_eq(rows(check_pkg("import alpha.\{Point as AlphaPoint}\ntype Point \{ b: Int }\nfn main() \{ let _ = AlphaPoint \{ a: 1 } }\n", "as_ok"), "E1012").len(), 0)
+}
+
+test "the spec example: each qualifier collides, whole, renamed and selective" {
+    let out = check_pkg("import alpha\nimport beta as b\nimport gamma.\{Point}\n\ntype alpha \{ x: Int }\nfn b() -> Int \{ 1 }\nlet gamma = 3\n\nfn main() \{ }\n", "quals")
+    let e = rows(out, "E1012")
+    assert_eq(e.len(), 3)
+    let of = fn(name) { e.filter(fn(r) { r.contains("\"message\":\"`{name}` is both a module qualifier and a declaration in module `main`\"") }).get(0).unwrap() }
+    assert(of("alpha").contains("\"span\":\{\"line\":1,\"col\":8,\"end_line\":1,\"end_col\":13},\"message\":\"this import binds the qualifier `alpha`\""), out)
+    assert(of("alpha").contains("import alpha as alpha_mod\\nor rename the declaration"), out)
+    assert(of("b").contains("\"span\":\{\"line\":2,\"col\":16,\"end_line\":2,\"end_col\":17},\"message\":\"this import binds the qualifier `b`\""), out)
+    assert(of("b").contains("import beta as b_mod\\nor rename the declaration"), out)
+    assert(of("gamma").contains("\"span\":\{\"line\":3,\"col\":8,\"end_line\":3,\"end_col\":13},\"message\":\"this import also binds the qualifier `gamma`\""), out)
+    assert(of("gamma").contains("import the module under another name: import gamma as gamma_mod.\{Point}\\nor rename the declaration"), out)
+    assert(of("gamma").contains("\"line\":7,\"col\":5,\"end_line\":7,\"end_col\":10},\"labels\""), out)
+    for r in e { assert(!r.contains("\"fix\""), r) }
+}
+
+test "the name after as has no case rule" {
+    assert_eq(rows(check_pkg("import alpha as Alpha\ntype Alpha \{ x: Int }\nfn main() \{ }\n", "as_case"), "E1012").len(), 1)
+}
+
+test "several import entries colliding with one declaration each get their own E1012 and no E1005" {
+    let out = check_pkg("import alpha.\{Point}\nimport beta.\{Point}\ntype Point \{ b: Int }\nfn main() \{ }\n", "several")
+    assert_eq(rows(out, "E1012").len(), 2)
+    assert_eq(rows(out, "E1005").len(), 0)
+}
+
+test "E1012 replaces W0602 on the entry, and a use failing only for the collision reports nothing" {
+    let listed = check_pkg("import alpha.\{Point}\ntype Point \{ b: Int }\nfn main() \{ let p = Point \{ a: 1 }\n let _ = p.nope }\n", "follow_listed")
+    assert_eq(error_rows(listed).len(), 1)
+    assert_eq(rows(listed, "W0602").len(), 0)
+    let value = check_pkg("import gamma.\{Point}\nlet gamma = 3\nfn main() \{ let _ = gamma.make()\n let _ = gamma.Point \{ a: 1 }\n let _ = Point \{ a: 1 } }\n", "follow_value")
+    assert_eq(error_rows(value).len(), 1)
+    let typed = check_pkg("import alpha\ntype alpha \{ x: Int }\nfn main() \{ let _ = alpha.make()\n let _ = alpha \{ x: 1 } }\n", "follow_type")
+    assert_eq(error_rows(typed).len(), 1)
+    let func = check_pkg("import beta as b\nfn b() -> Int \{ 1 }\nfn main() \{ let _ = b.make()\n let _ = b.Point \{ a: 1 }\n let _ = b() + 1 }\n", "follow_fn")
+    assert_eq(error_rows(func).len(), 1)
+}
+
+test "a compiler-known module's import collides, and the type gets E1012 and no W1010" {
+    let out = check_via_cli("import blink.core.\{Handler}\ntype Handler \{ x: Int }\nfn main() \{ }\n", "e1012_core_{getpid()}")
+    assert_eq(rows(out, "E1012").len(), 1)
+    assert_eq(rows(out, "W1010").len(), 0)
+    let tr = check_via_cli("import blink.core.\{Eq}\ntrait Eq \{ }\nfn main() \{ }\n", "e1012_core_eq_{getpid()}")
+    assert_eq(rows(tr, "E1012").len(), 1)
+    assert_eq(rows(tr, "W1010").len(), 0)
+    let plain = check_via_cli("type Handler \{ x: Int }\nfn main() \{ }\n", "e1012_plain_{getpid()}")
+    assert_eq(rows(plain, "E1012").len(), 0)
+    assert_eq(rows(plain, "W1010").len(), 1)
+}
+
+test "a bare variant's name at an import entry and a listed name with no item take no part" {
+    let variant = check_pkg("import alpha.\{Ok}\nfn main() \{ }\n", "variant")
+    assert_eq(rows(variant, "E1012").len(), 0)
+    let missing = check_pkg("import alpha.\{Nope}\ntype Nope \{ x: Int }\nfn main() \{ }\n", "missing")
+    assert_eq(rows(missing, "E1012").len(), 0)
+}
+
+test "a helper that imports main and declares fn main collides" {
+    let dir = "e1012_helper_{getpid()}"
+    let entry = stage("import helper\nfn main() \{ helper.run() }\n", dir)
+    fs.write(entry.replace("main.bl", "helper.bl"), "import main\npub fn run() \{ }\nfn main() \{ }\n").unwrap()
+    let r = process.run("build/blink", ["check", entry, "--format", "json"]).unwrap()
+    let e = rows("{r.out}{r.err_out}", "E1012")
+    assert_eq(e.len(), 1)
+    assert(e.get(0).unwrap().contains("`main` is both a module qualifier and a declaration in module `helper`"), r.err_out)
+}
+
+// Runs `blink fix` on the entry and returns the file it leaves.
+fn fixed(entry: Str, tag: Str) -> Str ! Process.Spawn, FS.Write, FS.Read, Env.Read {
+    let path = stage(entry, "e1012_fix_{tag}_{getpid()}")
+    let _ = process.run("build/blink", ["fix", path]).unwrap()
+    fs.read(path).unwrap()
+}
+
+test "the fix drops a listed name, and each place in a list keeps the rest valid" {
+    assert_eq(fixed("import alpha.\{Point, Other}\ntype Point \{ b: Int }\nfn main() \{ let _ = Other \{ c: 1 } }\n", "first"),
+        "import alpha.\{Other}\ntype Point \{ b: Int }\nfn main() \{ let _ = Other \{ c: 1 } }\n")
+    assert_eq(fixed("import alpha.\{Other, Point as P}\ntype P \{ b: Int }\nfn main() \{ let _ = Other \{ c: 1 } }\n", "last"),
+        "import alpha.\{Other}\ntype P \{ b: Int }\nfn main() \{ let _ = Other \{ c: 1 } }\n")
+    assert_eq(fixed("import alpha.\{\n    Point, // the local one wins\n    Other,\n}\ntype Point \{ b: Int }\nfn main() \{ let _ = Other \{ c: 1 } }\n", "own_line"),
+        "import alpha.\{\n    Other,\n}\ntype Point \{ b: Int }\nfn main() \{ let _ = Other \{ c: 1 } }\n")
+}
+
+test "an emptied list leaves a whole import while a name resolves through the qualifier, and else goes" {
+    assert_eq(fixed("import alpha.\{Point}\ntype Point \{ b: Int }\nfn main() \{ let _ = alpha.make() }\n", "kept"),
+        "import alpha\ntype Point \{ b: Int }\nfn main() \{ let _ = alpha.make() }\n")
+    assert_eq(fixed("import alpha as a.\{Point}\ntype Point \{ b: Int }\nfn main() \{ let _ = a.make() }\n", "kept_as"),
+        "import alpha as a\ntype Point \{ b: Int }\nfn main() \{ let _ = a.make() }\n")
+    // Text search would see `alpha.make` in the string and the comment; name resolution does not.
+    assert_eq(fixed("import alpha.\{Point}\ntype Point \{ b: Int }\n// alpha.make\nfn main() \{ let _ = \"alpha.make\" }\n", "gone"),
+        "type Point \{ b: Int }\n// alpha.make\nfn main() \{ let _ = \"alpha.make\" }\n")
+}
+
+test "a pub import and a qualifier have no machine fix" {
+    let e = rows(check_pkg("pub import alpha.\{Point}\ntype Point \{ b: Int }\nfn main() \{ }\n", "pub_fix"), "E1012")
+    assert(!e.get(0).unwrap().contains("\"fix\""), e.get(0).unwrap())
+    let src = "import alpha\ntype alpha \{ x: Int }\nfn main() \{ }\n"
+    assert_eq(fixed(src, "qual"), src)
+}
+
+test "blink explain knows E1012" {
+    verify_catalog_entry("E1012", "DuplicateSymbol")
+}

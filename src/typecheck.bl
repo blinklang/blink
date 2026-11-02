@@ -23,7 +23,7 @@ import parser.{
 }
 import diagnostics.{
     Diag, diag_clear_allows, diag_error_at, diag_error_at_notes, diag_error_span_at_notes, diag_error_no_loc,
-    diag_set_last_fix, diag_set_last_fix_at, diag_add_label_since, diag_add_last_fix_edit, diag_set_fix_edits_at, DiagEntry, DiagFixEdit, diag_source_lines, diag_entries, UNDECLARED_EFFECT, UNSOURCED_EFFECT_WILDCARD,
+    diag_set_last_fix, diag_set_last_fix_at, diag_add_label_since, diag_release_repeat_key_since, diag_add_last_fix_edit, diag_set_fix_edits_at, DiagEntry, DiagFixEdit, diag_source_lines, diag_entries, UNDECLARED_EFFECT, UNSOURCED_EFFECT_WILDCARD,
     diag_push_allows, diag_enter_allows, diag_exit_allows, NON_CONST_EXPR,
     diag_warn_at, diag_warn_at_notes, diag_warn_span_at_notes, PARTIAL_HANDLER, diag_truncate, diag_entry_count, diag_any_errors_since, diag_ice_at, diag_ice, PRELUDE_TYPE_NOT_LOADED, diag_count, diag_emit_in_file, diag_file_for_node, diag_file_node_range,
     diag_is_audit_gated, diag_audit_gated_help, AUDIT_GATED_SUPPRESSION, diag_normalize_path, diag_source_line, diag_errors_in_lines,
@@ -62,7 +62,7 @@ import diagnostics.{
     DERIVE_DEBUG_FIELD_NO_DEBUG, STR_PLUS_UNSUPPORTED,
     PRIVATE_ITEM_ACCESS, AMBIGUOUS_IMPORT, IMPORT_NOT_SELECTED,
     MODULE_QUALIFIED_TYPE,
-    UNKNOWN_METHOD, UNUSED_VARIABLE, SET_BUT_NOT_READ, SHADOWED_VARIABLE, SHADOWED_PRELUDE_NAME,
+    UNKNOWN_METHOD, UNUSED_VARIABLE, SET_BUT_NOT_READ, SHADOWED_VARIABLE, SHADOWED_PRELUDE_NAME, DUPLICATE_SYMBOL,
     DISCARDED_COLLECTION_COPY, TODO_IN_CODE, NEGATIVE_ZERO_COMPARISON, diag_warn_span_label_at_notes,
     UNREACHABLE_CODE, UNAUDITED_FFI, DEPRECATED_USAGE,
     NAME_COLLISION, AMBIGUOUS_CONSTRUCTION, RESERVED_TYPE_NAME, NOT_DERIVABLE,
@@ -1928,8 +1928,9 @@ fn tc_mark_qualifier_used(qualifier: Str) {
     }
 }
 
-// Whether the program's own module declares a name more than once (E1016). The copies after
-// the first are never checked, so no one knows which imports they use.
+// Whether the program's own module declares a name more than once (E1016), or declares a name
+// that an import binds (E1012). The copies after the first are never checked, and a use of a
+// name that collides stops at the name, so no one knows which imports they use.
 pub fn tc_main_module_has_duplicates() -> Bool {
     for m in ["", "__main__"] {
         match nr_module_names.get(m) {
@@ -9427,6 +9428,7 @@ fn arith_backing_trait(op: Str, is_unary: Int) -> Str {
 // W1010 at a trait that shadows a compiler-known one, with the forms in this module that
 // still use the compiler-known trait and the alias import that names it (sections/07 §10.6).
 fn tc_warn_shadowed_trait(tr: Int) ! Diag.Report {
+    if nr_clash_of(node_module(tr)).nodes.contains_key(tr) { return }
     let name = node_name(tr)
     let mut notes = ["shadows compiler-known trait `{name}` (blink.core)"]
     for n in tc_desugaring_forms_note(name, "blink.core") { notes.push(n) }
@@ -9446,6 +9448,7 @@ fn tc_warn_shadowed_type(decl: Int) ! Diag.Report {
     let name = node_name(decl)
     let (home, spelled) = tc_shadowable_type(name)
     if home == "" || tc_prelude_modules.contains_key(node_module(decl)) { return }
+    if nr_clash_of(node_module(decl)).nodes.contains_key(decl) { return }
     let mut notes = ["shadows compiler-known type `{spelled}` ({home})"]
     for n in tc_desugaring_forms_note(name, home) { notes.push(n) }
     let help = tc_shadowed_type_help(name, home, node_module(decl))
@@ -12314,6 +12317,7 @@ fn tc_check_imported_struct_collisions() ! TypeCheck.Register, Diag.Report {
                 while k < sublist_length(names_sl) {
                     let name_node = sublist_get(names_sl, k)
                     k = k + 1
+                    if nr_clash_of(reader).nodes.contains_key(name_node) { continue }
                     let member = node_name(name_node)
                     let alias = node_str_val(name_node)
                     let bound = if alias != "" { alias } else { member }
@@ -15431,6 +15435,7 @@ pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report {
     init_types()
     nr_check_duplicate_declarations(program)
     nr_record_program_decls(program)
+    let import_collisions = nr_find_import_collisions(program)
 
     // A trait name is read from the first signature on, so every trait is filed under its
     // identity, and every name that refers to one knows its file, before anything registers.
@@ -15832,6 +15837,11 @@ pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report {
     // method — the honest report is the soft one.
     tc_flush_unresolved_method_warnings()
 
+    // After every body, because a fix that empties an import list asks whether anything used
+    // the qualifier. Before phase 5, whose hold on a declaration the collision poisoned
+    // stands down only for a program with an error.
+    nr_report_import_collisions(import_collisions)
+
     // Phases 4 and 5: recover the types inference determined but never wrote down, then hold
     // every value node to carrying one.
     tc_stamp_program(program)
@@ -15853,7 +15863,7 @@ fn tc_flush_unresolved_method_warnings() ! Diag.Report {
     let mut i = 0
     while i < tc_method_calls.unresolved.len() {
         let n = tc_method_calls.unresolved.get(i).unwrap()
-        if tc_method_calls.hard.contains_key(n) == 0 && tc_call_decl.contains_key(n) == 0 {
+        if tc_method_calls.hard.contains_key(n) == 0 && tc_call_decl.contains_key(n) == 0 && !nr_is_call_on_collided_qualifier(n) {
             let m = node_method(n)
             diag_warn_at("UnknownMethod", UNKNOWN_METHOD, "method `{m}` resolves to nothing, and the receiver's type is not known here", n, "annotate the receiver so the method can be resolved, or correct the method name")
         }
@@ -17251,8 +17261,11 @@ type ImportBinding {
     member: Str
 }
 
-pub fn record_module_import(consuming_mod: Str, source_mod: Str, imp_node: Int) {
+// `imp_node` is -1 for a whole import that does not rename its qualifier; `stmt` is its node all
+// the same.
+pub fn record_module_import(consuming_mod: Str, source_mod: Str, imp_node: Int, stmt: Int) {
     nr_drop_import_index(consuming_mod)
+    nr_module_names_of(consuming_mod).clash.import_stmts.insert(stmt, source_mod)
     let mut imports = per_module_imports.get(consuming_mod) ?? Map()
     let mut nodes = imports.get(source_mod) ?? []
     if nodes.contains(imp_node) { return }
@@ -17264,6 +17277,7 @@ pub fn record_module_import(consuming_mod: Str, source_mod: Str, imp_node: Int) 
 pub fn clear_module_imports() {
     per_module_imports.clear()
     for mod_name in nr_module_names.keys() {
+        nr_module_names_of(mod_name).clash.import_stmts.clear()
         nr_drop_import_index(mod_name)
     }
 }
@@ -17279,7 +17293,7 @@ fn nr_drop_import_index(consuming_mod: Str) {
                 r.imports.clear()
                 r.selects.clear()
                 r.qualifiers.clear()
-                nr_module_names.insert(consuming_mod, ModuleNames { decls: r.decls, sigs: r.sigs, imports: r.imports, selects: r.selects, qualifiers: r.qualifiers, imports_built: false, unselected: r.unselected, private_access: r.private_access, bare_decl: r.bare_decl, package: r.package, poisoned: r.poisoned })
+                nr_module_names.insert(consuming_mod, ModuleNames { decls: r.decls, sigs: r.sigs, imports: r.imports, selects: r.selects, qualifiers: r.qualifiers, imports_built: false, unselected: r.unselected, private_access: r.private_access, bare_decl: r.bare_decl, package: r.package, poisoned: r.poisoned, clash: r.clash })
             }
         }
         None => {}
@@ -17317,6 +17331,10 @@ fn nr_module_imports_built(consuming_mod: Str) -> ModuleNames {
                     let mut i = 0
                     while i < sublist_length(names_sl) {
                         let name_node = sublist_get(names_sl, i)
+                        if nr_clash_of(consuming_mod).nodes.contains_key(name_node) {
+                            i = i + 1
+                            continue
+                        }
                         let alias = node_str_val(name_node)
                         let bound = if alias != "" { alias } else { node_name(name_node) }
                         let mut binds = idx.get(bound) ?? []
@@ -17332,7 +17350,7 @@ fn nr_module_imports_built(consuming_mod: Str) -> ModuleNames {
         }
         None => {}
     }
-    let built = ModuleNames { decls: r.decls, sigs: r.sigs, imports: idx, selects: selects, qualifiers: quals, imports_built: true, unselected: r.unselected, private_access: r.private_access, bare_decl: r.bare_decl, package: r.package, poisoned: r.poisoned }
+    let built = ModuleNames { decls: r.decls, sigs: r.sigs, imports: idx, selects: selects, qualifiers: quals, imports_built: true, unselected: r.unselected, private_access: r.private_access, bare_decl: r.bare_decl, package: r.package, poisoned: r.poisoned, clash: r.clash }
     nr_module_names.insert(consuming_mod, built)
     built
 }
@@ -17724,11 +17742,25 @@ type ModuleNames {
     // Only the first is checked, and what a use of the name gets from it is not reported
     // against it, since the use may have meant a later one.
     poisoned: Map[Str, Int]
+    clash: ModuleClash
 }
 let mut nr_module_names: Map[Str, ModuleNames] = Map()
 // The same declarations gathered by bare name, so a caller can see every module that spells
 // it and let its own import list choose between them.
 let mut nr_decls_by_name: Map[Str, List[Int]] = Map()
+
+// What E1012 needs of one module.
+type ModuleClash {
+    // Each import statement of the module to the module it names. E1012 reports on the
+    // statement's place, which per_module_imports does not keep for a plain whole-module import.
+    import_stmts: Map[Int, Str]
+    // The list entries that collide and the declarations that collide. An entry leaves the
+    // binding table, so the declaration answers for the name and E1005 sees only the entries
+    // with no E1012. A declaration gets no W1010 on top of its E1012.
+    nodes: Map[Int, Int]
+    // The qualifiers that collide.
+    qualifiers: Map[Str, Int]
+}
 
 // The record of `mod_name`, created empty on first use. Its maps are shared with the stored
 // record, so a caller fills them in place.
@@ -17736,7 +17768,7 @@ fn nr_module_names_of(mod_name: Str) -> ModuleNames {
     match nr_module_names.get(mod_name) {
         Some(r) => r
         None => {
-            let r = ModuleNames { decls: Map(), sigs: Map(), imports: Map(), selects: Map(), qualifiers: Map(), imports_built: false, unselected: Map(), private_access: Map(), bare_decl: Map(), package: "", poisoned: Map() }
+            let r = ModuleNames { decls: Map(), sigs: Map(), imports: Map(), selects: Map(), qualifiers: Map(), imports_built: false, unselected: Map(), private_access: Map(), bare_decl: Map(), package: "", poisoned: Map(), clash: ModuleClash { import_stmts: Map(), nodes: Map(), qualifiers: Map() } }
             nr_module_names.insert(mod_name, r)
             r
         }
@@ -17745,7 +17777,7 @@ fn nr_module_names_of(mod_name: Str) -> ModuleNames {
 
 pub fn tc_record_module_package(mod_name: Str, package: Str) {
     let r = nr_module_names_of(mod_name)
-    nr_module_names.insert(mod_name, ModuleNames { decls: r.decls, sigs: r.sigs, imports: r.imports, selects: r.selects, qualifiers: r.qualifiers, imports_built: r.imports_built, unselected: r.unselected, private_access: r.private_access, bare_decl: r.bare_decl, package: package, poisoned: r.poisoned })
+    nr_module_names.insert(mod_name, ModuleNames { decls: r.decls, sigs: r.sigs, imports: r.imports, selects: r.selects, qualifiers: r.qualifiers, imports_built: r.imports_built, unselected: r.unselected, private_access: r.private_access, bare_decl: r.bare_decl, package: package, poisoned: r.poisoned, clash: r.clash })
 }
 
 // Whether two modules sit in one package. A module is always in its own, and the standard
@@ -17868,6 +17900,257 @@ type ModuleDeclName {
     binder: Int
 }
 
+// A module-level declaration of a name that an import binds (sections/07, "Imported and Declared
+// Names"). `item` is the list entry that binds it, or -1 when the import binds it as a qualifier.
+type ImportCollision {
+    reader: Str
+    decl: ModuleDeclName
+    source_mod: Str
+    stmt: Int
+    item: Int
+}
+
+// Finds the collisions before anything reads a name, and poisons each declaration: which of the
+// two the program meant is not known, so a use that fails only for that reason reports nothing.
+fn nr_find_import_collisions(program: Int) -> List[ImportCollision] {
+    let mut decls: Map[Str, List[ModuleDeclName]] = Map()
+    for d in nr_module_decl_names(program) {
+        let key = "{nr_main_key(node_module(d.decl))}|{d.name}"
+        let mut named = decls.get(key) ?? []
+        named.push(d)
+        decls.insert(key, named)
+    }
+    for mod_name in nr_module_names.keys() {
+        let clash = nr_module_names_of(mod_name).clash
+        clash.nodes.clear()
+        clash.qualifiers.clear()
+    }
+    let mut found: List[ImportCollision] = []
+    for reader in nr_module_names.keys() {
+        let stmts = nr_module_names_of(reader).clash.import_stmts
+        let here = nr_main_key(reader)
+        for stmt in stmts.keys() {
+            let source_mod = stmts.get(stmt).unwrap()
+            for d in decls.get("{here}|{nr_import_qualifier(stmt)}") ?? [] {
+                found.push(ImportCollision { reader: reader, decl: d, source_mod: source_mod, stmt: stmt, item: -1 })
+            }
+            let items = node_args(stmt)
+            let mut i = 0
+            while items != -1 && i < sublist_length(items) {
+                let item = sublist_get(items, i)
+                i = i + 1
+                if !nr_item_can_collide(source_mod, stmt, item) { continue }
+                for d in decls.get("{here}|{nr_item_bound(item)}") ?? [] {
+                    nr_clash_of(reader).nodes.insert(item, 1)
+                    found.push(ImportCollision { reader: reader, decl: d, source_mod: source_mod, stmt: stmt, item: item })
+                }
+            }
+        }
+    }
+    for c in found {
+        let d = c.decl
+        let clash = nr_clash_of(node_module(d.decl))
+        clash.nodes.insert(d.decl, 1)
+        if c.item == -1 { clash.qualifiers.insert(d.name, 1) }
+        nr_module_names_of(node_module(d.decl)).poisoned.insert("{d.namespace}|{d.name}", if d.binder != -1 { d.binder } else { d.decl })
+    }
+    for c in found { nr_drop_import_index(c.reader) }
+    found
+}
+
+// `q.y` on a name that both an import and a declaration bind. Which of the two the compiler went
+// on with is its own choice, so a member that choice does not have was not the user's mistake.
+fn nr_is_call_on_collided_qualifier(call: Int) -> Bool {
+    let obj = node_obj(call)
+    node_kind(obj) == NodeKind.Ident && nr_clash_of(node_module(call)).qualifiers.contains_key(node_name(obj))
+}
+
+// The program's own file goes by two module keys.
+fn nr_main_key(mod_name: Str) -> Str {
+    if tc_module_key_is_main(mod_name) != 0 { "__main__" } else { mod_name }
+}
+
+// The collisions of `mod_name` under the one key its file answers to.
+fn nr_clash_of(mod_name: Str) -> ModuleClash {
+    nr_module_names_of(nr_main_key(mod_name)).clash
+}
+
+fn nr_import_qualifier(stmt: Int) -> Str {
+    if node_name(stmt) != "" { node_name(stmt) } else { tc_module_leaf(node_str_val(stmt)) }
+}
+
+fn nr_item_bound(item: Int) -> Str {
+    if node_str_val(item) != "" { node_str_val(item) } else { node_name(item) }
+}
+
+// An entry that names no item of its module denotes nothing, and an entry that binds a bare
+// variant's name is E1016 at the entry (sections/02, §2.12.1): neither takes part in E1012.
+fn nr_item_can_collide(source_mod: Str, stmt: Int, item: Int) -> Bool {
+    if ["Some", "None", "Ok", "Err"].contains(nr_item_bound(item)) { return false }
+    node_str_val(stmt).starts_with("blink.") || nr_resolve_decl_in_module(source_mod, node_name(item), 0) != -1
+}
+
+fn nr_report_import_collisions(collisions: List[ImportCollision]) ! Diag.Report {
+    for c in collisions {
+        let d = c.decl
+        let (line, col) = nr_decl_name_at(d)
+        let node = if d.binder != -1 { d.binder } else { d.decl }
+        let end_col = col + d.name.byte_len()
+        let module = tc_module_display_name(c.reader)
+        let before = diag_entry_count()
+        if c.item != -1 {
+            diag_error_span_label_at_notes("DuplicateSymbol", DUPLICATE_SYMBOL,
+                "`{d.name}` is both imported and declared in module `{module}`",
+                node, line, col, end_col, "also declared here", nr_item_collision_help(c), [])
+            let at = node_col(c.item)
+            diag_add_label_since(before, node_line(c.item), at, nr_item_end_col(c.item),
+                "imported from `{node_str_val(c.stmt)}` here")
+            if diag_entry_count() > before && node_is_pub(c.stmt) == 0 { nr_set_drop_item_fix(c) }
+            // Each entry gets its own E1012, and only the import's label tells two of them apart.
+            diag_release_repeat_key_since(before)
+        } else {
+            diag_error_span_label_at_notes("DuplicateSymbol", DUPLICATE_SYMBOL,
+                "`{d.name}` is both a module qualifier and a declaration in module `{module}`",
+                node, line, col, end_col, "also declared here", nr_qualifier_collision_help(c.stmt), [])
+            let (q_line, q_col) = nr_import_qualifier_at(c.stmt)
+            let verb = if node_args(c.stmt) != -1 { "also binds" } else { "binds" }
+            diag_add_label_since(before, q_line, q_col, q_col + d.name.byte_len(),
+                "this import {verb} the qualifier `{d.name}`")
+            diag_release_repeat_key_since(before)
+        }
+    }
+}
+
+fn nr_item_collision_help(c: ImportCollision) -> Str {
+    let member = node_name(c.item)
+    let qual = nr_import_qualifier(c.stmt)
+    let first = qual.byte_at(0).to_int()
+    let renamed = if member.byte_at(0).to_int() >= 65 && member.byte_at(0).to_int() <= 90 && first >= 97 && first <= 122 {
+        "{qual.byte_slice(0, 1).to_upper()}{qual.byte_slice(1, qual.byte_len())}{member}"
+    } else {
+        "{qual}_{member}"
+    }
+    let as_qual = if node_name(c.stmt) != "" { " as {qual}" } else { "" }
+    "drop `{nr_item_bound(c.item)}` from the import list and use `{qual}.{member}`,\nor import it under another name: import {node_str_val(c.stmt)}{as_qual}.\{{member} as {renamed}}"
+}
+
+fn nr_qualifier_collision_help(stmt: Int) -> Str {
+    let mut list = ""
+    let items = node_args(stmt)
+    if items != -1 {
+        let mut written: List[Str] = []
+        let mut i = 0
+        while i < sublist_length(items) {
+            let item = sublist_get(items, i)
+            written.push(if node_str_val(item) != "" { "{node_name(item)} as {node_str_val(item)}" } else { node_name(item) })
+            i = i + 1
+        }
+        list = ".\{{written.join(", ")}}"
+    }
+    "import the module under another name: import {node_str_val(stmt)} as {nr_import_qualifier(stmt)}_mod{list}\nor rename the declaration"
+}
+
+// Where an import statement writes the qualifier it binds: the name after `as`, or the leaf of
+// the path.
+fn nr_import_qualifier_at(stmt: Int) -> (Int, Int) {
+    let (line, path_col) = tc_import_path_at(stmt)
+    let path_end = path_col + node_str_val(stmt).byte_len()
+    if node_name(stmt) == "" { return (line, path_end - nr_import_qualifier(stmt).byte_len()) }
+    let text = diag_source_line(diag_file_for_node(stmt), line)
+    match nr_whole_word_at(text, node_name(stmt), path_end - 1) {
+        Some(at) => (line, at + 1)
+        None => (line, path_col)
+    }
+}
+
+// The column past what a list entry writes: `Point`, or `Point as P`.
+fn nr_item_end_col(item: Int) -> Int {
+    let name_end = node_col(item) + node_name(item).byte_len()
+    if node_str_val(item) == "" { return name_end }
+    let text = diag_source_line(diag_file_for_node(item), node_line(item))
+    match nr_whole_word_at(text, node_str_val(item), name_end - 1) {
+        Some(at) => at + 1 + node_str_val(item).byte_len()
+        None => name_end
+    }
+}
+
+// Sets the fix that drops a list entry from a plain `import`. The edit stays out of the text of
+// the other entries, so two fixes in one list apply together unless they share a comma.
+fn nr_set_drop_item_fix(c: ImportCollision) {
+    let items = node_args(c.stmt)
+    let n = sublist_length(items)
+    let action = "drop `{nr_item_bound(c.item)}` from the import list"
+    let line = node_line(c.item)
+    let file = diag_file_for_node(c.item)
+    if n == 1 {
+        nr_set_empty_list_fix(c, action)
+        return
+    }
+    let text = diag_source_line(file, line)
+    let end_col = nr_item_end_col(c.item)
+    let before = text.byte_slice(0, node_col(c.item) - 1).trim()
+    let mut after = text.byte_slice(end_col - 1, text.byte_len()).trim()
+    if after.starts_with(",") { after = after.byte_slice(1, after.byte_len()).trim() }
+    if before == "" && (after == "" || after.starts_with("//")) {
+        diag_set_last_fix_at(action, "", line, 1, line + 1, 1)
+        return
+    }
+    let mut at = 0
+    while sublist_get(items, at) != c.item { at = at + 1 }
+    if at < n - 1 {
+        let next = sublist_get(items, at + 1)
+        diag_set_last_fix_at(action, "", line, node_col(c.item), node_line(next), node_col(next))
+    } else {
+        let prev = sublist_get(items, at - 1)
+        diag_set_last_fix_at(action, "", node_line(prev), nr_item_end_col(prev), line, end_col)
+    }
+}
+
+// A selective import also gives qualified access (sections/07, "Imported and Declared Names"),
+// so with its list empty it stays as a whole-module import unless name resolution found no use
+// of the qualifier. Only the program's own file records that, so any other file keeps the line.
+fn nr_set_empty_list_fix(c: ImportCollision, action: Str) {
+    let line = node_line(c.stmt)
+    let file = diag_file_for_node(c.stmt)
+    let (close_line, close_col) = nr_import_list_close(c.item)
+    let used = tc_is_module_used(c.source_mod) != 0 || tc_is_module_used(nr_import_qualifier(c.stmt)) != 0
+    if tc_module_key_is_main(c.reader) != 0 && !used {
+        if close_line < diag_source_lines(file).len() {
+            diag_set_last_fix_at(action, "", line, 1, close_line + 1, 1)
+        } else {
+            diag_set_last_fix_at(action, "", line, 1, close_line, close_col + 1)
+        }
+        return
+    }
+    let mut dot = node_col(c.stmt) - 1
+    let text = diag_source_line(file, line)
+    while dot > 0 && text.byte_slice(dot - 1, dot) != "." { dot = dot - 1 }
+    diag_set_last_fix_at(action, "", line, dot, close_line, close_col + 1)
+}
+
+// The line and column of the `}` after a list's last entry. A comment may stand between them.
+fn nr_import_list_close(last: Int) -> (Int, Int) {
+    let lines = diag_source_lines(diag_file_for_node(last))
+    let mut line = node_line(last)
+    let mut from = nr_item_end_col(last) - 1
+    while line <= lines.len() {
+        let text = lines.get(line - 1).unwrap()
+        let code_end = match text.byte_index_of("//", from) {
+            Some(at) => at
+            None => text.byte_len()
+        }
+        match text.byte_index_of("}", from) {
+            Some(at) => {
+                if at < code_end { return (line, at + 1) }
+            }
+            None => {}
+        }
+        line = line + 1
+        from = 0
+    }
+    (node_line(last), node_col(last))
+}
+
 // Module scope has two namespaces (sections/02_syntax.md §2.12.1): values (`let`, `let mut`,
 // `const`, `fn`) and types (`type`, alias, `trait`, `effect`). Each declaration after the
 // first of one name in one namespace of one module is DuplicateModuleBinding (E1016). The
@@ -17948,20 +18231,29 @@ fn nr_decl_name_at(d: ModuleDeclName) -> (Int, Int) {
     if d.binder != -1 { return (node_line(d.binder), node_col(d.binder)) }
     let line = node_line(d.decl)
     let text = diag_source_line(diag_file_for_node(d.decl), line)
-    let mut from = if node_col(d.decl) > 0 { node_col(d.decl) - 1 } else { 0 }
-    while from < text.byte_len() {
-        match text.byte_index_of(d.name, from) {
+    let from = if node_col(d.decl) > 0 { node_col(d.decl) - 1 } else { 0 }
+    match nr_whole_word_at(text, d.name, from) {
+        Some(at) => (line, at + 1)
+        None => (line, node_col(d.decl))
+    }
+}
+
+// The byte index of the first whole word `word` in `text`, at or after byte `from`.
+fn nr_whole_word_at(text: Str, word: Str, from: Int) -> Option[Int] {
+    let mut search = from
+    while search < text.byte_len() {
+        match text.byte_index_of(word, search) {
             Some(at) => {
-                let end = at + d.name.byte_len()
+                let end = at + word.byte_len()
                 let starts_word = at == 0 || !nr_is_ident_byte(text.byte_at(at - 1).to_int())
                 let ends_word = end >= text.byte_len() || !nr_is_ident_byte(text.byte_at(end).to_int())
-                if starts_word && ends_word { return (line, at + 1) }
-                from = at + 1
+                if starts_word && ends_word { return Some(at) }
+                search = at + 1
             }
-            None => return (line, node_col(d.decl))
+            None => return None
         }
     }
-    (line, node_col(d.decl))
+    None
 }
 
 fn nr_is_ident_byte(b: Int) -> Bool {
@@ -23633,7 +23925,8 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                 Some(dot_pos) => {
                     let prefix = type_name.byte_slice(0, dot_pos)
                     let names_module = nr_qualifier_module_here(prefix) != "" || (is_import_module_name(prefix) != 0 && is_known_type(prefix) == 0)
-                    if names_module && nr_is_defined(prefix) == 0 {
+                    let collided = nr_clash_of(node_module(node)).qualifiers.contains_key(prefix)
+                    if names_module && (nr_is_defined(prefix) == 0 || collided) {
                         // module.Type qualified construction reads the type as an annotation does.
                         nr_check_type_ref(type_name, node)
                     } else {
@@ -37872,6 +38165,8 @@ fn tc_report_unclaimed_calls(order: List[Int], mods: List[Str]) ! Diag.Report {
                 // forms, and the help shows both (sections/04_effects.md §4.4.9).
                 diag_error_at("UnresolvedMethod", UNRESOLVED_METHOD, "no method `lines` on the `io` handle", uc,
                     "read all the input, then split it: `for line in io.read_all().lines() \{ ... }`\nor read one line at a time: `loop \{ match io.read_line() \{ Some(line) => ..., None => break } }`")
+            } else if nr_is_call_on_collided_qualifier(uc) {
+                // E1012 already reports the mistake.
             } else if is_builtin_namespace(q) == 1 || is_import_module_name(q) == 1 {
                 let near = suggest_module_member(tc_qualifier_to_module_or_self(q), mname)
                 let help = if near != "" { "did you mean `{q}.{near}`?" } else { "" }
