@@ -1781,6 +1781,29 @@ Trace event types:
 
 All events include: `ts_us`, `event`, `fn`, `module`, `depth`. Values truncated at 200 chars.
 
+### Trace Notes (`trace.log`)
+
+`trace.log(channel: Str, msg: Str)` is a built-in call with no row: a fn that calls it declares nothing, and no handler sees it (a `capture_eprint` list does not get the line). With its channel on, and with no `--trace`, it writes `[trace:<channel>] <msg>` to stderr, in program order with the other stderr writes of the thread.
+
+```blink
+fn lower(id: Int) -> Int {
+    trace.log("mono", "lower {id}")
+    id + 1
+}
+```
+
+```sh
+BLINK_TRACE_CHANNELS=mono ./app        # [trace:mono] lower 4
+BLINK_TRACE_CHANNELS="walk, mono" ./app
+BLINK_TRACE_CHANNELS=all ./app         # every channel
+```
+
+- The program reads `BLINK_TRACE_CHANNELS` once, when it starts; a later `env.set_var` changes nothing. It is separate from `BLINK_TRACE`.
+- The value splits on `,`. Each item is trimmed of ASCII space and tab, an empty item is skipped, and an item matches a channel by exact text (case counts). `all` in any place turns on every channel. No value gives a warning.
+- `msg` is not evaluated when the channel is off, so a `msg` that panics panics only with the channel on. The channel argument is always evaluated.
+- A trace call keeps no code alive: if the compiler drops an unused call to a fn with an empty row, that fn's lines do not appear.
+- A fn, parameter or local named `trace` hides `trace.log` in its own scope, and `trace.log` there is a method call on it (E0505 if it has no `log`). A `pub fn trace` in another module does not hide it: with `import a`, `trace.log` is the built-in and `a.trace` is the fn. `trace` alone is no value.
+
 ### Low-level Compiler Flags (blinkc)
 
 ```sh
