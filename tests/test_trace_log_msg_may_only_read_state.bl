@@ -1917,3 +1917,136 @@ fn main() {
     assert(primary_at(found.get(0).unwrap(), 12, 22), found.get(0).unwrap())
     assert(primary_at(found.get(1).unwrap(), 13, 22), found.get(1).unwrap())
 }
+
+test "a generic named fn called through a let in msg takes its binds from the args of that call" {
+    let src = #"let mut count = 0
+
+trait Bump {
+    fn bump(self) -> Int
+}
+
+impl Bump for Int {
+    fn bump(self) -> Int {
+        count += self
+        count
+    }
+}
+
+impl Bump for Str {
+    fn bump(self) -> Int { 0 }
+}
+
+type Loud { n: Int }
+
+impl Closeable for Loud {
+    fn close(self) ! IO { io.println("x") }
+}
+
+type Mute { n: Int }
+
+impl Closeable for Mute {
+    fn close(self) { }
+}
+
+fn go[T: Bump](x: T) -> Int { x.bump() }
+
+fn shut[T: Closeable](t: T) -> Int ! _ {
+    t.close()
+    1
+}
+
+fn callee() -> Int {
+    let g = go
+    g(1)
+}
+
+fn at_binder[T: Bump](x: T) -> Int {
+    let g: fn(T) -> Int = go
+    g(x)
+}
+
+fn walk() ! IO {
+    let g = shut
+    let h = go
+    let g2 = shut
+    let h2 = go
+    let k = fn() -> Int { g(Mute { n: 1 }) }
+    trace.log("c", "{g(Mute { n: 1 })}")
+    trace.log("c", "{k()}")
+    trace.log("c", "{h("a")}")
+    trace.log("c", "{at_binder("a")}")
+    trace.log("c", "{g2(Loud { n: 1 })}")
+    trace.log("c", "{h2(1)}")
+    trace.log("c", "{callee()}")
+    trace.log("c", "{at_binder(1)}")
+}
+
+fn main() ! IO {
+    walk()
+}
+"#
+    let out = check_via_cli(src, "e0566_msg_let_called_generic_named_fn_{getpid()}")
+    let found = e0566_lines(out)
+    assert_eq(found.len(), 4)
+    assert_eq(error_count(out), 4)
+    let loud = found.get(0).unwrap()
+    assert(primary_at(loud, 57, 22), loud)
+    assert(loud.contains("`shut` has the row `! IO`"), loud)
+    let direct = found.get(1).unwrap()
+    assert(primary_at(direct, 58, 22), direct)
+    assert(direct.contains("which writes `count`"), direct)
+    let callee = found.get(2).unwrap()
+    assert(primary_at(callee, 59, 22), callee)
+    assert(callee.contains("`msg` calls `callee`, which writes `count`"), callee)
+    let binder = found.get(3).unwrap()
+    assert(primary_at(binder, 60, 22), binder)
+    assert(binder.contains("`msg` calls `at_binder`, which writes `count`"), binder)
+}
+
+test "each call of a generic named fn in a closure that msg runs reads the row of its own instance" {
+    let src = #"type Loud { n: Int }
+
+impl Closeable for Loud {
+    fn close(self) ! IO { io.println("x") }
+}
+
+type Mute { n: Int }
+
+impl Closeable for Mute {
+    fn close(self) { }
+}
+
+fn shut[T: Closeable](t: T) -> Int ! _ {
+    t.close()
+    1
+}
+
+fn walk() ! IO {
+    let by_map = fn() -> Int { [Mute { n: 1 }].map(shut).len() + [Loud { n: 1 }].map(shut).len() }
+    let g = shut
+    let h = shut
+    let by_let = fn() -> Int { g(Mute { n: 1 }) + h(Loud { n: 1 }) }
+    let m = fn() -> Int { [Mute { n: 1 }].map(shut).len() }
+    let nested = fn() -> Int { m() + [Loud { n: 1 }].map(shut).len() }
+    let clean = fn() -> Int { [Mute { n: 1 }].map(shut).len() + [Mute { n: 2 }].map(shut).len() }
+    trace.log("c", "{by_map()}")
+    trace.log("c", "{by_let()}")
+    trace.log("c", "{nested()}")
+    trace.log("c", "{clean()}")
+}
+
+fn main() ! IO {
+    walk()
+}
+"#
+    let out = check_via_cli(src, "e0566_msg_closure_named_fn_instances_{getpid()}")
+    let found = e0566_lines(out)
+    assert_eq(found.len(), 3)
+    assert_eq(error_count(out), 3)
+    let mut line = 26
+    for e in found {
+        assert(primary_at(e, line, 22), e)
+        assert(e.contains("`shut`, which has the row `! IO`"), e)
+        line = line + 1
+    }
+}

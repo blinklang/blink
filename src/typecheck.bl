@@ -32104,12 +32104,14 @@ fn tc_tm_check_closures_run(node: Int, inside: Set[Int], assigns: Map[Int, List[
 // "calls `f`, which has the row `! IO`", "calls `env.cwd`, a handler operation" or
 // "runs `T.close`, which has the row `! IO`"; "" for none.
 fn tc_tm_closure_row_call(call: Int, c: Int, walked: Set[Int], assigns: Map[Int, List[Int]], kids: List[Int]) -> Str ! TypeCheck.Resolve, Diag.Report {
-    if walked.contains(c) { return "" }
-    walked.insert(c)
+    // A named fn's row depends on the call, so each call reads it. It walks no body, so the
+    // walk needs no guard for it.
     if node_kind(c) == NodeKind.FnDef {
         let row = tc_tm_callback_row(c, tc_tm_callback_binds(call, c, tc_no_binds))
         return if row.len() > 0 { "calls `{node_name(c)}`, which has the row `! {row.join(", ")}`" } else { "" }
     }
+    if walked.contains(c) { return "" }
+    walked.insert(c)
     tc_tm_row_call_in(node_body(c), walked, assigns, kids)
 }
 
@@ -32546,14 +32548,20 @@ fn tc_tm_touch_closures(node: Int, binds: Map[Str, Int], depth: Int, seen: Set[S
     }
 }
 
-// The binds a generic named fn takes where the built-in `call` runs it as its callback. The
-// type of a fn value passed to a built-in is never unified with the callback type, so each
-// param is solved here from the value the call gives it: the receiver's element, and for fold
-// the init first. A caller's binders in the receiver type are read off its binds.
+// The binds a generic named fn takes where `call` runs it: a call of a `let` bound to the fn, or
+// a built-in that runs it as its callback. The type of a fn value passed to a built-in is never
+// unified with the callback type, so each param is solved here from the value the call gives
+// it: the receiver's element, and for fold the init first. A caller's binders in the types the
+// call gives are read off its binds.
 fn tc_tm_callback_binds(call: Int, fndef: Int, binds: Map[Str, Int]) -> Map[Str, Int] ! TypeCheck.Resolve, Diag.Report {
     let mut out: Map[Str, Int] = Map()
     let idx = fnsig_by_decl.get(fndef) ?? -1
-    if idx < 0 || node_kind(call) != NodeKind.MethodCall { return out }
+    if idx < 0 { return out }
+    if node_kind(call) == NodeKind.Call {
+        for (k, v) in tc_er_call_binds(call, fndef) { out.insert(k, tc_resolve(substitute_typevar_tid(v, binds))) }
+        return out
+    }
+    if node_kind(call) != NodeKind.MethodCall { return out }
     let fs = fnsig_pool.get(idx).unwrap()
     let recv = resolve_alias_tid(tc_resolve(substitute_typevar_tid(tc_lookup_node_tid(node_obj(call)), binds)))
     if recv < 0 || tc_tid_is_no_info(recv) != 0 { return out }
