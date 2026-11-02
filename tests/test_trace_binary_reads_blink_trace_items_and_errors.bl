@@ -26,69 +26,37 @@ fn main() {
 
 let STDOUT = "6\nx\ny\nfalse\n"
 
-fn build(stem: Str) -> Str ! FS.Write, Process.Spawn, Env.Read {
-    let dir = compile_test_helpers.scratch_root()
-    let path = "{dir}/{stem}.bl"
-    let bin = "{dir}/{stem}_bin"
-    fs.write(path, SRC).unwrap()
-    let r = process.run("build/blink", ["build", "--trace", path, "-o", bin]).unwrap()
-    assert_eq(r.err_out, "")
-    assert(r.success())
-    compile_test_helpers.sh("rm -f {path}")
-    bin
-}
-
-// A build also writes the directory `<bin>.units`.
-fn clean(bin: Str) ! Process.Spawn {
-    compile_test_helpers.sh("rm -rf {bin} {bin}.units")
-}
-
 fn run_env(bin: Str, value: Str) -> ProcessResult ! Process.Spawn {
     process.run("env", ["BLINK_TRACE={value}", bin]).unwrap()
-}
-
-// Each enter event as the name of its fn, joined by a space.
-fn enters(text: Str) -> Str {
-    let mut names: List[Str] = []
-    for line in text.split("\n") {
-        if !line.contains("\"event\":\"enter\"") { continue }
-        let at = line.index_of("\"fn\":\"") ?? -1
-        assert(at >= 0)
-        let rest = line.substring(at + 6, line.len())
-        let end = rest.index_of("\"") ?? -1
-        assert(end >= 0)
-        names.push(rest.substring(0, end))
-    }
-    names.join(" ")
 }
 
 fn traced(bin: Str, value: Str) -> Str ! Process.Spawn {
     let r = run_env(bin, value)
     assert_eq(r.out, STDOUT)
     assert(r.success())
-    enters(r.err_out)
+    compile_test_helpers.trace_enter_fns(r.err_out)
 }
 
 test "a traced binary does not read its argv, and its program sees every argument" {
-    let bin = build("trace_bin_argv")
+    let bin = compile_test_helpers.build_bin(SRC, "trace_bin_argv", ["--trace"])
     let m = "trace_bin_argv"
     let r: ProcessResult = process.run("env", ["BLINK_TRACE=fn:show", bin, "--trace=fn:echo", "--trace"]).unwrap()
     assert_eq(r.out, "6\nx\ny\ntrue\n--trace=fn:echo\n--trace\n")
     assert(r.success())
-    assert_eq(enters(r.err_out), "{m}.show")
-    clean(bin)
+    assert_eq(compile_test_helpers.trace_enter_fns(r.err_out), "{m}.show")
+    compile_test_helpers.clean_bin("trace_bin_argv")
 }
 
 test "BLINK_TRACE_LIMIT does not cut the trace" {
-    let bin = build("trace_bin_limit")
+    let bin = compile_test_helpers.build_bin(SRC, "trace_bin_limit", ["--trace"])
     let r: ProcessResult = process.run("env", ["BLINK_TRACE=all", "BLINK_TRACE_LIMIT=1", bin]).unwrap()
     assert(r.success())
-    assert_eq(enters(r.err_out).split(" ").len(), 6)
-    clean(bin)
+    assert_eq(compile_test_helpers.trace_enter_fns(r.err_out).split(" ").len(), 6)
+    compile_test_helpers.clean_bin("trace_bin_limit")
 }
 
 test "the items of BLINK_TRACE are trimmed and an empty item is skipped" {
-    let bin = build("trace_bin_items")
+    let bin = compile_test_helpers.build_bin(SRC, "trace_bin_items", ["--trace"])
     let m = "trace_bin_items"
     let two = "{m}.fact {m}.fact"
     assert_eq(traced(bin, "fn:fact,depth:2"), two)
@@ -101,11 +69,11 @@ test "the items of BLINK_TRACE are trimmed and an empty item is skipped" {
     assert_eq(traced(bin, "fn:show + echo"), pair)
     assert_eq(traced(bin, "fn:show++echo"), pair)
     assert_eq(traced(bin, "fn:show+echo+"), pair)
-    clean(bin)
+    compile_test_helpers.clean_bin("trace_bin_items")
 }
 
 test "a filter takes any number of values and any number of items" {
-    let bin = build("trace_bin_many")
+    let bin = compile_test_helpers.build_bin(SRC, "trace_bin_many", ["--trace"])
     let m = "trace_bin_many"
     let mut values: List[Str] = []
     let mut i = 0
@@ -123,28 +91,28 @@ test "a filter takes any number of values and any number of items" {
     }
     items.push("fn:show")
     assert_eq(traced(bin, items.join(",")), "{m}.show")
-    clean(bin)
+    compile_test_helpers.clean_bin("trace_bin_many")
 }
 
 test "a fn filter matches whole dot segments from the end of the name" {
-    let bin = build("trace_bin_segments")
+    let bin = compile_test_helpers.build_bin(SRC, "trace_bin_segments", ["--trace"])
     let m = "trace_bin_segments"
     assert_eq(traced(bin, "fn:echo"), "{m}.echo")
     assert_eq(traced(bin, "fn:{m}.echo"), "{m}.echo")
     assert_eq(traced(bin, "fn:cho"), "")
     assert_eq(traced(bin, "fn:s.echo"), "")
     assert_eq(traced(bin, "fn:{m}"), "")
-    clean(bin)
+    compile_test_helpers.clean_bin("trace_bin_segments")
 }
 
 test "the key of a filter ends at its first colon" {
-    let bin = build("trace_bin_colon")
+    let bin = compile_test_helpers.build_bin(SRC, "trace_bin_colon", ["--trace"])
     assert_eq(traced(bin, "fn:echo:x"), "")
-    clean(bin)
+    compile_test_helpers.clean_bin("trace_bin_colon")
 }
 
 test "a bad filter exits with code 2 before main and writes no event" {
-    let bin = build("trace_bin_bad")
+    let bin = compile_test_helpers.build_bin(SRC, "trace_bin_bad", ["--trace"])
     for value in [
         "nope:1", "fn:", "fn: + ", "depth:x", "depth:2x", "depth:", "event:stat",
         "event:enter+stat", "1", "fn", "depth : 2", "Fn:echo", "fn:echo,bogus",
@@ -155,15 +123,15 @@ test "a bad filter exits with code 2 before main and writes no event" {
         assert(!r.err_out.contains("\{"))
         assert(r.err_out.starts_with("error: bad BLINK_TRACE value: "))
     }
-    clean(bin)
+    compile_test_helpers.clean_bin("trace_bin_bad")
 }
 
 test "every event type is a valid event filter" {
-    let bin = build("trace_bin_events")
+    let bin = compile_test_helpers.build_bin(SRC, "trace_bin_events", ["--trace"])
     for value in ["event:enter", "event:exit", "event:state", "event:effect", "event:note"] {
         let r = run_env(bin, value)
         assert_eq(r.out, STDOUT)
         assert(r.success())
     }
-    clean(bin)
+    compile_test_helpers.clean_bin("trace_bin_events")
 }
