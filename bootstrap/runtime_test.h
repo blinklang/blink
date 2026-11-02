@@ -102,6 +102,8 @@ BLINK_TEST_STORAGE char __blink_test_skip_reason[256];
  * not compile a copy of each one. */
 BLINK_RT_FN void __blink_assert_fail(const char* msg, int line);
 BLINK_RT_FN void __blink_assert_fail_eq(const char* msg, const char* expected, const char* actual, int line);
+BLINK_RT_FN void __blink_assert_fail_at(const char* msg, const char* file, int line);
+BLINK_RT_FN void __blink_assert_fail_eq_at(const char* msg, const char* expected, const char* actual, const char* file, int line);
 BLINK_RT_FN void __blink_assert_fail_intro(const char* assertion, const char* intro, const char* file, int line, int col, const char* user_msg);
 BLINK_RT_FN void __blink_test_set_propagate(const char* message, const char* error_type, const char* file, int line, int col);
 BLINK_RT_FN void __blink_test_set_skipped(const char* reason);
@@ -128,8 +130,9 @@ BLINK_RT_FN void blink_test_run(const blink_test_entry* tests, int count, int ar
  * runner's panic hook is the marker for a test run. A program's on_panic hook
  * gets the failure at its call, with the message and none of the report's
  * operand lines. Renders the recorded failure the way the runner's human
- * output does. */
-BLINK_UNUSED static void __blink_assert_fail_uncaught(void) {
+ * output does. site_file is the file of a call that records no file of its own, for the
+ * hook only. */
+BLINK_UNUSED static void __blink_assert_fail_uncaught(const char* site_file) {
     char buf[BLINK_PA_INTRO_BUF_SIZE + 2048];
     size_t n = 0;
     if (__blink_test_fail_assertion[0]) {
@@ -142,7 +145,8 @@ BLINK_UNUSED static void __blink_assert_fail_uncaught(void) {
     } else {
         snprintf(buf, sizeof(buf), "%s", __blink_test_fail_msg);
     }
-    __blink_panic_hook_run(buf, __blink_test_fail_file, __blink_test_fail_line);
+    const char* hook_file = __blink_test_fail_file[0] || site_file == NULL ? __blink_test_fail_file : site_file;
+    __blink_panic_hook_run(buf, hook_file, __blink_test_fail_line);
     if (__blink_test_fail_assertion[0]) {
         n += snprintf(buf + n, sizeof(buf) - n, "assertion failed: %s", __blink_test_fail_assertion);
         if (__blink_test_fail_user_msg[0] && n < sizeof(buf)) {
@@ -182,7 +186,9 @@ BLINK_UNUSED static void __blink_test_fail_unless_first(const char* msg) {
     if (__blink_test_failed) __blink_test_unwind();
 }
 
-BLINK_RT_FN void __blink_assert_fail(const char* msg, int line) {
+/* The file goes to the hook and not to the record: the record of an assert_eq or assert_ne
+ * names a line only, and the runner's output keeps that form. */
+BLINK_RT_FN void __blink_assert_fail_at(const char* msg, const char* file, int line) {
     __blink_test_fail_unless_first(msg);
     __blink_test_failed = 1;
     __blink_test_fail_cause = BLINK_TEST_CAUSE_ASSERTION;
@@ -200,8 +206,12 @@ BLINK_RT_FN void __blink_assert_fail(const char* msg, int line) {
     __blink_test_fail_user_msg[0] = '\0';
     __blink_test_fail_expected[0] = '\0';
     __blink_test_fail_actual[0] = '\0';
-    if (__blink_panic_test_hook == NULL) __blink_assert_fail_uncaught();
+    if (__blink_panic_test_hook == NULL) __blink_assert_fail_uncaught(file);
     __blink_test_unwind();
+}
+
+BLINK_RT_FN void __blink_assert_fail(const char* msg, int line) {
+    __blink_assert_fail_at(msg, NULL, line);
 }
 
 #define BLINK_COPY_OR_EMPTY(dst, src) do { \
@@ -250,10 +260,11 @@ BLINK_UNUSED static void __blink_test_case_records_reset(void) {
 
 /* assert_eq failure: like __blink_assert_fail but also records the separately
  * rendered expected (RHS) and actual (LHS) operands for spec §8.10 JSON. */
-BLINK_RT_FN void __blink_assert_fail_eq(const char* msg,
-                                        const char* expected,
-                                        const char* actual,
-                                        int line) {
+BLINK_RT_FN void __blink_assert_fail_eq_at(const char* msg,
+                                           const char* expected,
+                                           const char* actual,
+                                           const char* file,
+                                           int line) {
     __blink_test_fail_unless_first(msg);
     __blink_test_failed = 1;
     __blink_test_fail_cause = BLINK_TEST_CAUSE_ASSERTION;
@@ -266,8 +277,15 @@ BLINK_RT_FN void __blink_assert_fail_eq(const char* msg,
     __blink_test_fail_user_msg[0] = '\0';
     BLINK_COPY_OR_EMPTY(__blink_test_fail_expected, expected);
     BLINK_COPY_OR_EMPTY(__blink_test_fail_actual, actual);
-    if (__blink_panic_test_hook == NULL) __blink_assert_fail_uncaught();
+    if (__blink_panic_test_hook == NULL) __blink_assert_fail_uncaught(file);
     __blink_test_unwind();
+}
+
+BLINK_RT_FN void __blink_assert_fail_eq(const char* msg,
+                                        const char* expected,
+                                        const char* actual,
+                                        int line) {
+    __blink_assert_fail_eq_at(msg, expected, actual, NULL, line);
 }
 
 BLINK_RT_FN void __blink_assert_fail_intro(const char* assertion,
@@ -293,7 +311,7 @@ BLINK_RT_FN void __blink_assert_fail_intro(const char* assertion,
     BLINK_COPY_OR_EMPTY(__blink_test_fail_user_msg, user_msg);
     __blink_test_fail_expected[0] = '\0';
     __blink_test_fail_actual[0] = '\0';
-    if (__blink_panic_test_hook == NULL) __blink_assert_fail_uncaught();
+    if (__blink_panic_test_hook == NULL) __blink_assert_fail_uncaught(NULL);
     __blink_test_unwind();
 }
 
