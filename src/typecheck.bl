@@ -3,7 +3,7 @@ import std.str.{str_to_lower}
 import pkg.manifest.{manifest_name, manifest_header_is_declared}
 import unparse.{type_ann_text, unparse_expr, unparse_binop_with_lhs, unparse_range_membership, unparse_coalesce_start}
 import formatter.{effect_op_sig_text}
-import import_edit.{ImportEdit, ImportNeed, import_module_edit, import_need}
+import import_edit.{ImportEdit, ImportNeed, import_aliased_edit, import_module_edit, import_need}
 import parser.{
     effect_derived_ops, node_load_rank, parser_load_order_moved, parser_live_ranges,
     ann_str_val, positional_str_arg, positional_str_arg_count, impl_provided_by_closeable, closeable_impl_of, sublist_remove_members, get_annotation, get_str_named_arg, has_annotation, is_literal_string_part,
@@ -10733,7 +10733,9 @@ fn tc_bind_has_hole(tid: Int) -> Int {
 }
 
 fn tc_struct_lit_instance_tid(stid: Int, node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
-    tc_check_brace_literal(tc_struct_literal_owner(stid), node)
+    if !nr_clash_of(node_module(node)).rejected_literals.contains_key(node) {
+        tc_check_brace_literal(tc_struct_literal_owner(stid), node)
+    }
     tc_check_struct_lit_field_closures(stid, node)
     let bare = tc_instance_base_name(stid)
     let decl = tc_struct_decl_nodes.get(bare) ?? -1
@@ -17609,6 +17611,7 @@ fn nr_check_selective_access_at(name: Str, node: Int, idx: Int) -> Int ! Diag.Re
         }
     }
     if source_mod == "" { return 0 }
+    if node != -1 && node_kind(node) == NodeKind.StructLit { nr_clash_of(node_module(node)).rejected_literals.insert(node, 1) }
     // No import qualifier names the main file, so a selective import is its one fix.
     let qual = if source_mod == "__main__" { "" } else { nr_qualifier_of_module_in(source_mod, nr_current_module) }
     if qual == "" && source_mod == "std_panic" {
@@ -17760,6 +17763,9 @@ type ModuleClash {
     nodes: Map[Int, Int]
     // The qualifiers that collide.
     qualifiers: Map[Str, Int]
+    // The struct literals whose type this module cannot name yet. The field check stays quiet on
+    // these, so one mistake gets one report.
+    rejected_literals: Map[Int, Int]
 }
 
 // The record of `mod_name`, created empty on first use. Its maps are shared with the stored
@@ -17768,7 +17774,7 @@ fn nr_module_names_of(mod_name: Str) -> ModuleNames {
     match nr_module_names.get(mod_name) {
         Some(r) => r
         None => {
-            let r = ModuleNames { decls: Map(), sigs: Map(), imports: Map(), selects: Map(), qualifiers: Map(), imports_built: false, unselected: Map(), private_access: Map(), bare_decl: Map(), package: "", poisoned: Map(), clash: ModuleClash { import_stmts: Map(), nodes: Map(), qualifiers: Map() } }
+            let r = ModuleNames { decls: Map(), sigs: Map(), imports: Map(), selects: Map(), qualifiers: Map(), imports_built: false, unselected: Map(), private_access: Map(), bare_decl: Map(), package: "", poisoned: Map(), clash: ModuleClash { import_stmts: Map(), nodes: Map(), qualifiers: Map(), rejected_literals: Map() } }
             nr_module_names.insert(mod_name, r)
             r
         }
@@ -17924,6 +17930,7 @@ fn nr_find_import_collisions(program: Int) -> List[ImportCollision] {
         let clash = nr_module_names_of(mod_name).clash
         clash.nodes.clear()
         clash.qualifiers.clear()
+        clash.rejected_literals.clear()
     }
     let mut found: List[ImportCollision] = []
     for reader in nr_module_names.keys() {
@@ -18005,7 +18012,7 @@ fn nr_report_import_collisions(collisions: List[ImportCollision]) ! Diag.Report 
             let at = node_col(c.item)
             diag_add_label_since(before, node_line(c.item), at, nr_item_end_col(c.item),
                 "imported from `{node_str_val(c.stmt)}` here")
-            if diag_entry_count() > before && node_is_pub(c.stmt) == 0 { nr_set_drop_item_fix(c) }
+            if diag_entry_count() > before && node_is_pub(c.stmt) == 0 { nr_set_drop_item_fix(c, collisions) }
             // Each entry gets its own E1012, and only the import's label tells two of them apart.
             diag_release_repeat_key_since(before)
         } else {
@@ -18074,35 +18081,45 @@ fn nr_item_end_col(item: Int) -> Int {
     }
 }
 
-// Sets the fix that drops a list entry from a plain `import`. The edit stays out of the text of
-// the other entries, so two fixes in one list apply together unless they share a comma.
-fn nr_set_drop_item_fix(c: ImportCollision) {
+// Sets the fix that drops a list entry from a plain `import`. Entries next to each other that all
+// collide share one edit, which applies once (§8.6), and it stays out of the text of the entries
+// that stay, so every fix in one list applies.
+fn nr_set_drop_item_fix(c: ImportCollision, collisions: List[ImportCollision]) {
     let items = node_args(c.stmt)
     let n = sublist_length(items)
     let action = "drop `{nr_item_bound(c.item)}` from the import list"
-    let line = node_line(c.item)
-    let file = diag_file_for_node(c.item)
-    if n == 1 {
-        nr_set_empty_list_fix(c, action)
-        return
-    }
-    let text = diag_source_line(file, line)
-    let end_col = nr_item_end_col(c.item)
-    let before = text.byte_slice(0, node_col(c.item) - 1).trim()
-    let mut after = text.byte_slice(end_col - 1, text.byte_len()).trim()
-    if after.starts_with(",") { after = after.byte_slice(1, after.byte_len()).trim() }
-    if before == "" && (after == "" || after.starts_with("//")) {
-        diag_set_last_fix_at(action, "", line, 1, line + 1, 1)
-        return
+    let dropped = fn(at: Int) -> Bool {
+        let item = sublist_get(items, at)
+        collisions.filter(fn(o) { o.stmt == c.stmt && o.item == item }).len() > 0
     }
     let mut at = 0
     while sublist_get(items, at) != c.item { at = at + 1 }
-    if at < n - 1 {
-        let next = sublist_get(items, at + 1)
-        diag_set_last_fix_at(action, "", line, node_col(c.item), node_line(next), node_col(next))
+    let mut first = at
+    while first > 0 && dropped(first - 1) { first = first - 1 }
+    let mut last = at
+    while last < n - 1 && dropped(last + 1) { last = last + 1 }
+    if first == 0 && last == n - 1 {
+        nr_set_empty_list_fix(c, action)
+        return
+    }
+    let head = sublist_get(items, first)
+    let tail = sublist_get(items, last)
+    let line = node_line(head)
+    let file = diag_file_for_node(head)
+    let end_line = node_line(tail)
+    let end_col = nr_item_end_col(tail)
+    let tail_text = diag_source_line(file, end_line)
+    let before = diag_source_line(file, line).byte_slice(0, node_col(head) - 1).trim()
+    let mut after = tail_text.byte_slice(end_col - 1, tail_text.byte_len()).trim()
+    if after.starts_with(",") { after = after.byte_slice(1, after.byte_len()).trim() }
+    if before == "" && (after == "" || after.starts_with("//")) {
+        diag_set_last_fix_at(action, "", line, 1, end_line + 1, 1)
+    } else if last < n - 1 {
+        let next = sublist_get(items, last + 1)
+        diag_set_last_fix_at(action, "", line, node_col(head), node_line(next), node_col(next))
     } else {
-        let prev = sublist_get(items, at - 1)
-        diag_set_last_fix_at(action, "", node_line(prev), nr_item_end_col(prev), line, end_col)
+        let prev = sublist_get(items, first - 1)
+        diag_set_last_fix_at(action, "", node_line(prev), nr_item_end_col(prev), end_line, end_col)
     }
 }
 
@@ -18112,9 +18129,14 @@ fn nr_set_drop_item_fix(c: ImportCollision) {
 fn nr_set_empty_list_fix(c: ImportCollision, action: Str) {
     let line = node_line(c.stmt)
     let file = diag_file_for_node(c.stmt)
-    let (close_line, close_col) = nr_import_list_close(c.item)
-    let used = tc_is_module_used(c.source_mod) != 0 || tc_is_module_used(nr_import_qualifier(c.stmt)) != 0
+    let items = node_args(c.stmt)
+    let (close_line, close_col) = nr_import_list_close(sublist_get(items, sublist_length(items) - 1))
+    let qualifier = nr_import_qualifier(c.stmt)
+    let used = tc_is_module_used(c.source_mod) != 0 || tc_is_module_used(qualifier) != 0
     if tc_module_key_is_main(c.reader) != 0 && !used {
+        // A module's fn of the qualifier's own name takes `q.y` from the qualifier, so no use is
+        // recorded although the file may have some.
+        if nr_module_declares(c.source_mod, qualifier) != 0 { return }
         if close_line < diag_source_lines(file).len() {
             diag_set_last_fix_at(action, "", line, 1, close_line + 1, 1)
         } else {
@@ -22891,15 +22913,36 @@ fn nr_check_type_ref(name: Str, at: Int) ! TypeCheck.Resolve, Diag.Report {
 // no import in this file brings in. The type is not in scope: a bare name is unknown (§2.20),
 // and the import line is the fix.
 fn nr_report_panic_info_needs_import(name: Str, at: Int) ! Diag.Report {
-    let help = "add `import std.panic.\{{name}}`"
+    // An import binds the qualifier `panic` too, which is E1012 or E1005 where that name is taken.
+    let qualifier_free = !nr_name_taken_here("panic")
+    let alias_free = !nr_name_taken_here("panic_mod")
+    let help = if qualifier_free {
+        "add `import std.panic.\{{name}}`"
+    } else if alias_free {
+        "add `import std.panic as panic_mod.\{{name}}`"
+    } else {
+        "add `import std.panic as <name>.\{{name}}`, with a <name> that is not in use"
+    }
+    let before = diag_entry_count()
     tc_errors.push("unknown type `{name}`")
     nr_error("UnknownType", UNKNOWN_TYPE, "unknown type `{name}`", at, help)
-    if at == -1 { return }
+    if at == -1 || diag_entry_count() == before { return }
     let file = diag_file_for_node(at)
-    match import_need(diag_source_lines(file), tc_import_lines_of_file(file), "std.panic", [name]) {
-        ImportNeed.Add(e) => diag_set_fix_edits_at(diag_entry_count() - 1, help, [DiagFixEdit { line: e.line, col: e.col, end_line: e.end_line, end_col: e.end_col, text: e.text }])
-        _ => {}
+    let lines = diag_source_lines(file)
+    let starts = tc_import_lines_of_file(file)
+    if qualifier_free {
+        match import_need(lines, starts, "std.panic", [name]) {
+            ImportNeed.Add(e) => diag_set_last_fix_at(help, e.text, e.line, e.col, e.end_line, e.end_col)
+            _ => {}
+        }
+    } else if alias_free {
+        let e = import_aliased_edit(lines, starts, "std.panic", "panic_mod", [name])
+        diag_set_last_fix_at(help, e.text, e.line, e.col, e.end_line, e.end_col)
     }
+}
+
+fn nr_name_taken_here(name: Str) -> Bool {
+    nr_module_declares(nr_current_module, name) != 0 || nr_qualifier_module_here(name) != ""
 }
 
 // `Self.Context` and `T.Item` qualify by a type, not a module.
@@ -23408,6 +23451,10 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                 // read of the name — selective-import gate included, or an assignment to a
                 // global this module never imported would be silently accepted here and
                 // only fail later, opaquely, in codegen.
+                if assign_name == "on_panic" && !nr_on_panic_is_bound_here() {
+                    tc_report_panic_hook_not_with_item(assign_target)
+                    return
+                }
                 // nr_has_binding, not nr_is_defined: a write must not count as a read.
                 if nr_has_binding(assign_name) == 0 {
                     tc_errors.push("undefined variable `{assign_name}`")
@@ -32110,7 +32157,9 @@ fn tc_note_on_panic_hiding_since(before: Int, item: Int) ! Diag.Report {
     if node_kind(item) != NodeKind.Call || diag_any_errors_since(before) == 0 { return }
     let callee = node_left(item)
     if callee == -1 || node_kind(callee) != NodeKind.Ident || node_name(callee) != "on_panic" { return }
-    let mut spots = ["{node_line(item)}:{node_col(item)}", "{node_line(callee)}:{node_col(callee)}"]
+    let note = tc_on_panic_hiding_note()
+    diag_add_note_at_spots_since(before, [TYPE_ERROR, WITH_ITEM_NOT_A_HANDLER], ["{node_line(item)}:{node_col(item)}", "{node_line(callee)}:{node_col(callee)}"], "", note)
+    let mut spots: List[Str] = []
     let args = node_args(item)
     let mut i = 0
     while args != -1 && i < sublist_length(args) {
@@ -32120,7 +32169,8 @@ fn tc_note_on_panic_hiding_since(before: Int, item: Int) ! Diag.Report {
         spots.push("{node_line(at)}:{node_col(at)}")
         i = i + 1
     }
-    diag_add_note_at_spots_since(before, [TYPE_ERROR, WITH_ITEM_NOT_A_HANDLER], spots, tc_on_panic_hiding_note())
+    // An error at an argument may be about a call inside that argument.
+    diag_add_note_at_spots_since(before, [TYPE_ERROR], spots, "`on_panic`", note)
 }
 
 fn nr_check_panic_hook_item(item: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
@@ -32318,6 +32368,8 @@ fn tc_ph_walk(node: Int, ctx0: Int, entry_main: Int, first: List[Int], kids: Lis
 
 // The form of `with on_panic(f) as x` is the fault wherever it stands, so this is its one report.
 fn tc_ph_report_as(item: Int) ! Diag.Report {
+    // The parser found no name to bind and has reported that.
+    if node_end_col(item) == 0 { return }
     let name = node_name(item)
     let line = node_line(item)
     let end_col = node_end_col(item)

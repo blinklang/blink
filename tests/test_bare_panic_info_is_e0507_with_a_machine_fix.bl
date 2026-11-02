@@ -2,7 +2,7 @@
 // its module for the hook's type (sections/02_syntax.md §2.20 *The name `PanicInfo` and its
 // import*). The fix adds the one import line.
 
-import compile_test_helpers.{check_via_cli}
+import compile_test_helpers.{check_via_cli, scratch_root}
 
 fn only_error_line(out: Str) -> Str {
     let mut found = ""
@@ -75,4 +75,51 @@ test "a closure hook that writes no type name needs no import" {
 "#
     let out = check_via_cli(src, "bpi_closure_{getpid()}")
     assert(!out.contains("\"severity\":\"error\""), out)
+}
+
+// Runs `blink fix` on a file, then returns the fixed text and the check of that text.
+fn fix_and_recheck(src: Str, tag: Str) -> (Str, Str) ! Process.Spawn, FS.Write, FS.Read, Env.Read {
+    let dir = "{scratch_root()}/{tag}"
+    let _mk = process.run("mkdir", ["-p", dir]).unwrap()
+    let path = "{dir}/main.bl"
+    fs.write(path, src).unwrap()
+    let _ = process.run("build/blink", ["fix", path]).unwrap()
+    let r = process.run("build/blink", ["check", path, "--format", "json"]).unwrap()
+    (fs.read(path).unwrap(), "{r.out}{r.err_out}")
+}
+
+test "blink fix adds the import once for two bare uses, and the file then checks clean" {
+    let src = "fn a(p: PanicInfo) -> Str \{ p.message }\n\nfn b(p: PanicInfo) -> Str \{ p.message }\n\nfn main() \{ }\n"
+    let (text, out) = fix_and_recheck(src, "bpi_fix_{getpid()}")
+    assert_eq(text, "import std.panic.\{PanicInfo}\n\n{src}")
+    assert(!out.contains("\"severity\":\"error\""), out)
+}
+
+test "a literal of a bare PanicInfo reports only E0507, with no missing-field error on top" {
+    let src = "fn main() \{\n    let _ = PanicInfo \{ message: \"m\" }\n}\n"
+    let e = only_error_line(check_via_cli(src, "bpi_one_error_{getpid()}"))
+    assert(e.contains("\"code\":\"E0507\""), e)
+}
+
+test "a literal of an unselected type reports only the selection, with no missing-field error on top" {
+    let src = "import std.panic\n\nfn main() \{\n    let _ = PanicInfo \{ message: \"m\" }\n}\n"
+    let e = only_error_line(check_via_cli(src, "bpi_one_error_sel_{getpid()}"))
+    assert(e.contains("\"code\":\"E1006\""), e)
+}
+
+test "with `panic` declared here, the fix imports under another qualifier, and the file then checks clean" {
+    let src = "fn panic() -> Int \{ 1 }\n\nfn name_of(p: PanicInfo) -> Str \{ p.message }\n\nfn main() \{ let _ = panic() }\n"
+    let e = only_error_line(check_via_cli(src, "bpi_taken_{getpid()}"))
+    assert(e.contains("\"help\":\"add `import std.panic as panic_mod.\{PanicInfo}`\""), e)
+    let (text, out) = fix_and_recheck(src, "bpi_taken_fix_{getpid()}")
+    assert_eq(text, "import std.panic as panic_mod.\{PanicInfo}\n\n{src}")
+    assert(!out.contains("\"severity\":\"error\""), out)
+}
+
+test "with `panic` and `panic_mod` both declared here, the error gives help and no machine fix" {
+    let src = "fn panic() -> Int \{ 1 }\n\nfn panic_mod() -> Int \{ 2 }\n\nfn name_of(p: PanicInfo) -> Str \{ p.message }\n\nfn main() \{ let _ = panic() + panic_mod() }\n"
+    let e = only_error_line(check_via_cli(src, "bpi_both_taken_{getpid()}"))
+    assert(e.contains("\"code\":\"E0507\""), e)
+    assert(e.contains("import std.panic as <name>"), e)
+    assert(!e.contains("\"fix\":"), e)
 }
