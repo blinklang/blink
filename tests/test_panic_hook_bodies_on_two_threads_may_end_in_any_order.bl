@@ -5,36 +5,41 @@
 
 import compile_test_helpers.{compile_and_run}
 
-// The two bodies take turns by env vars: the outer body waits until the inner one has
-// installed its hook, and the inner one waits until the outer body has ended.
+// The two bodies take turns by marker files, as setenv is not safe while another thread reads
+// the environment: the outer body waits until the inner one has installed its hook, and the
+// inner one waits until the outer body has ended.
 fn program_src(inner_tail: Str, outer_tail: Str) -> Str {
     #"fn report(p: PanicInfo) -> Never ! IO.Print, Env.Exit {
     io.println("hook: {p.message}")
     env.exit(70)
 }
 
-fn wait_for(name: Str) ! Env.Read, Time.Sleep {
-    while env.var(name).is_none() {
+fn wait_for(path: Str) ! FS.Read, Time.Sleep {
+    while fs.stat(path).is_err() {
         time.sleep(Duration.ms(1))
     }
 }
 
-fn main() ! IO, Env, Async, Time {
+fn main() ! IO, Env, Async, Time, FS {
     let inner = env.var("PH_INNER").is_some()
+    let dir = env.var("TMPDIR") ?? "/tmp"
+    let marks = "{dir}/ph_two_threads_{env.pid()}"
     async.scope {
         with on_panic(report) {
             if inner {
-                env.set_var("PH_INNER_LIVE", "1")
-                wait_for("PH_OUTER_DONE")
+                fs.write("{marks}_inner_live", "").unwrap()
+                wait_for("{marks}_outer_done")
+                let _ = fs.delete("{marks}_inner_live")
+                let _ = fs.delete("{marks}_outer_done")
                 "#.concat(inner_tail).concat(#"
             } else {
                 env.set_var("PH_INNER", "1")
                 let _t = async.spawn(fn() { main() })
-                wait_for("PH_INNER_LIVE")
+                wait_for("{marks}_inner_live")
             }
         }
         if !inner {
-            env.set_var("PH_OUTER_DONE", "1")
+            fs.write("{marks}_outer_done", "").unwrap()
         }
     }
     if !inner {

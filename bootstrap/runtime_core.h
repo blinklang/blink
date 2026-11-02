@@ -3283,9 +3283,14 @@ static inline void __blink_panic_hook_publish(void) {
 BLINK_RT_FN void __blink_panic_hook_enter(__blink_panic_hook_frame* frame, __blink_panic_hook_adapter adapter, struct blink_closure_* hook, void* ev, const void* ev_at_with, size_t ev_size);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN void __blink_panic_hook_enter(__blink_panic_hook_frame* frame, __blink_panic_hook_adapter adapter, struct blink_closure_* hook, void* ev, const void* ev_at_with, size_t ev_size) {
+    frame->installed = 0;
+    frame->below = NULL;
     __blink_panic_hook_lock_take();
     if (!__blink_panic_hook.test_run && __blink_panic_test_hook == NULL) {
-        __blink_panic_hook_record record = { adapter, hook, ev, ev_at_with, ev_size, &__blink_in_panic_hook, 0 };
+        __blink_panic_hook_record record = {
+            .adapter = adapter, .hook = hook, .ev = ev, .ev_at_with = ev_at_with,
+            .ev_size = ev_size, .owner = &__blink_in_panic_hook,
+        };
         frame->record = record;
         frame->below = __blink_panic_hook_top;
         frame->installed = 1;
