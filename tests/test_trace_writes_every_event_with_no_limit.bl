@@ -1,0 +1,48 @@
+// A traced binary has no limit on the number of events, and BLINK_TRACE_LIMIT does not exist
+// (§8.15.13). Each of 5000 calls writes its enter event, also with BLINK_TRACE_LIMIT set.
+
+import compile_test_helpers
+import std.json.{json_clear, json_parse, json_get, json_as_str}
+
+let SRC = "fn step(n: Int) -> Int \{
+    n + 1
+}
+fn main() \{
+    let mut i = 0
+    while i < 5000 \{
+        i = step(i)
+    }
+    io.println(\"done\")
+}
+"
+
+fn step_enters(err_out: Str) -> Int {
+    let mut n = 0
+    for line in err_out.split("\n") {
+        if !line.starts_with("\{") { continue }
+        json_clear()
+        let obj = json_parse(line)
+        assert(obj >= 0)
+        if json_as_str(json_get(obj, "event")) == "enter" && json_as_str(json_get(obj, "fn")).ends_with(".step") {
+            n = n + 1
+        }
+    }
+    n
+}
+
+test "each of 5000 calls writes its enter event, with or without BLINK_TRACE_LIMIT" {
+    let dir = compile_test_helpers.scratch_root()
+    let path = "{dir}/trace_no_limit.bl"
+    let bin = "{dir}/trace_no_limit_bin"
+    fs.write(path, SRC).unwrap()
+    let b = process.run("build/blink", ["build", "--trace", path, "-o", bin]).unwrap()
+    assert_eq(b.err_out, "")
+    assert(b.success())
+    let plain = process.run("env", ["BLINK_TRACE=fn:step", bin]).unwrap()
+    assert_eq(plain.out, "done\n")
+    assert_eq(step_enters(plain.err_out), 5000)
+    let capped = process.run("env", ["BLINK_TRACE=fn:step", "BLINK_TRACE_LIMIT=10", bin]).unwrap()
+    assert_eq(capped.out, "done\n")
+    assert_eq(step_enters(capped.err_out), 5000)
+    compile_test_helpers.sh("rm -rf {path} {bin} {bin}.units")
+}
