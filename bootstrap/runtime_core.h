@@ -1341,6 +1341,15 @@ BLINK_RT_FN int64_t blink_template_get_int(const blink_template* t, int64_t i);
 BLINK_RT_FN double blink_template_get_float(const blink_template* t, int64_t i);
 BLINK_RT_FN int blink_template_get_bool(const blink_template* t, int64_t i);
 BLINK_RT_FN const char* blink_template_get_str(const blink_template* t, int64_t i);
+/* The readers a Blink call reaches, each with the Blink call site, so a bad index or a getter
+   of the wrong kind names that site. A NULL file is a caller with no Blink site to name. */
+BLINK_RT_FN int64_t blink_template_type_tag_at(const blink_template* t, int64_t i, const char* file, int64_t line);
+BLINK_RT_FN void* blink_template_value_of_at(const blink_template* t, int64_t i, int64_t tag, const char* kind,
+                                             const char* file, int64_t line);
+BLINK_RT_FN int64_t blink_template_get_int_at(const blink_template* t, int64_t i, const char* file, int64_t line);
+BLINK_RT_FN double blink_template_get_float_at(const blink_template* t, int64_t i, const char* file, int64_t line);
+BLINK_RT_FN int blink_template_get_bool_at(const blink_template* t, int64_t i, const char* file, int64_t line);
+BLINK_RT_FN const char* blink_template_get_str_at(const blink_template* t, int64_t i, const char* file, int64_t line);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN void blink_template_push_value(blink_template* t, void* word, int64_t tag) {
     blink_list_push(t->values, word);
@@ -1374,33 +1383,57 @@ BLINK_RT_FN blink_list* blink_template_parts(const blink_template* t) {
 BLINK_RT_FN int64_t blink_template_count(const blink_template* t) {
     return t->count;
 }
-BLINK_RT_FN int64_t blink_template_type_tag(const blink_template* t, int64_t i) {
+BLINK_RT_FN int64_t blink_template_type_tag_at(const blink_template* t, int64_t i, const char* file, int64_t line) {
     if (i < 0 || i >= t->count) {
+        if (file) {
+            __blink_panic_dispatchf_at(file, line, "template value index out of bounds: %lld, length %lld",
+                                       (long long)i, (long long)t->count);
+        }
         __blink_panic_dispatchf("blink: template value index out of bounds: idx=%lld count=%lld", (long long)i, (long long)t->count);
     }
     return (int64_t)(intptr_t)blink_list_get(t->types, i);
 }
+BLINK_RT_FN int64_t blink_template_type_tag(const blink_template* t, int64_t i) {
+    return blink_template_type_tag_at(t, i, NULL, 0);
+}
 /* A getter of the wrong kind would reinterpret the word, so it panics instead. */
-BLINK_RT_FN void* blink_template_value_of(const blink_template* t, int64_t i, int64_t tag, const char* kind) {
-    if (blink_template_type_tag(t, i) != tag) {
+BLINK_RT_FN void* blink_template_value_of_at(const blink_template* t, int64_t i, int64_t tag, const char* kind,
+                                             const char* file, int64_t line) {
+    if (blink_template_type_tag_at(t, i, file, line) != tag) {
+        if (file) __blink_panic_dispatchf_at(file, line, "template value %lld is not %s", (long long)i, kind);
         __blink_panic_dispatchf("blink: template value %lld is not %s", (long long)i, kind);
     }
     return blink_list_get(t->values, i);
 }
-BLINK_RT_FN int64_t blink_template_get_int(const blink_template* t, int64_t i) {
-    return (int64_t)(intptr_t)blink_template_value_of(t, i, BLINK_TPL_INT, "an Int");
+BLINK_RT_FN void* blink_template_value_of(const blink_template* t, int64_t i, int64_t tag, const char* kind) {
+    return blink_template_value_of_at(t, i, tag, kind, NULL, 0);
 }
-BLINK_RT_FN double blink_template_get_float(const blink_template* t, int64_t i) {
-    void* word = blink_template_value_of(t, i, BLINK_TPL_FLOAT, "a Float");
+BLINK_RT_FN int64_t blink_template_get_int_at(const blink_template* t, int64_t i, const char* file, int64_t line) {
+    return (int64_t)(intptr_t)blink_template_value_of_at(t, i, BLINK_TPL_INT, "an Int", file, line);
+}
+BLINK_RT_FN int64_t blink_template_get_int(const blink_template* t, int64_t i) {
+    return blink_template_get_int_at(t, i, NULL, 0);
+}
+BLINK_RT_FN double blink_template_get_float_at(const blink_template* t, int64_t i, const char* file, int64_t line) {
+    void* word = blink_template_value_of_at(t, i, BLINK_TPL_FLOAT, "a Float", file, line);
     double v;
     memcpy(&v, &word, sizeof(double));
     return v;
 }
+BLINK_RT_FN double blink_template_get_float(const blink_template* t, int64_t i) {
+    return blink_template_get_float_at(t, i, NULL, 0);
+}
+BLINK_RT_FN int blink_template_get_bool_at(const blink_template* t, int64_t i, const char* file, int64_t line) {
+    return (int)(intptr_t)blink_template_value_of_at(t, i, BLINK_TPL_BOOL, "a Bool", file, line);
+}
 BLINK_RT_FN int blink_template_get_bool(const blink_template* t, int64_t i) {
-    return (int)(intptr_t)blink_template_value_of(t, i, BLINK_TPL_BOOL, "a Bool");
+    return blink_template_get_bool_at(t, i, NULL, 0);
+}
+BLINK_RT_FN const char* blink_template_get_str_at(const blink_template* t, int64_t i, const char* file, int64_t line) {
+    return (const char*)blink_template_value_of_at(t, i, BLINK_TPL_STR, "a Str", file, line);
 }
 BLINK_RT_FN const char* blink_template_get_str(const blink_template* t, int64_t i) {
-    return (const char*)blink_template_value_of(t, i, BLINK_TPL_STR, "a Str");
+    return blink_template_get_str_at(t, i, NULL, 0);
 }
 #endif
 

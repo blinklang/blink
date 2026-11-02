@@ -1,0 +1,101 @@
+// A fault keeps its Blink site on every path a call to it can take: a method call with keyword
+// arguments in any order, a call of the free function the method stands for, and a template
+// getter in a handler (sections/02_syntax.md §2.20 *A fault that the runtime raises*).
+
+import compile_test_helpers.{compile_and_run}
+
+fn report_src() -> Str {
+    #"fn report(p: PanicInfo) -> Never ! IO.Eprint, Env.Exit {
+    let at = match p.line {
+        Some(n) => "{p.file}:{n}"
+        None => p.file
+    }
+    io.eprintln("fatal: {p.message} at {at}")
+    env.exit(70)
+}
+"#
+}
+
+fn expect_hook_report(src: Str, tag: Str, message: Str, line: Int) ! FS.Delete, FS.Write, Process.Spawn, FS.Read, Env.Read {
+    let r = compile_and_run(src, tag)
+    assert(r.exit_code == 70, "exit {r.exit_code}: {r.err_out}")
+    assert(r.err_out.starts_with("fatal: {message} at "), r.err_out)
+    assert(r.err_out.ends_with("/{tag}.bl:{line}\n"), r.err_out)
+}
+
+test "keyword arguments to a method that can fault bind by label in any order" {
+    let src = #"fn main() ! IO {
+    let s = "hello"
+    io.println(s.byte_slice(start: 1, end: 3))
+    io.println(s.byte_slice(end: 3, start: 1))
+    io.println("{s.byte_at(i: 1)}")
+    let b = Bytes.from_str("abcd")
+    b.set(byte: 65, index: 1)
+    io.println("{b.get(1).unwrap()}")
+}
+"#
+    let r = compile_and_run(src, "fs_named_args_{getpid()}")
+    assert(r.exit_code == 0, "exit {r.exit_code}: {r.err_out}")
+    assert_eq(r.out, "el\nel\n101\n65\n")
+}
+
+test "a keyword argument out of range still reaches the hook with its site" {
+    let tag = "fs_named_oob_{getpid()}"
+    let src = report_src().concat(#"
+fn main() ! IO, Env {
+    with on_panic(report) {
+        let s = "aé"
+        let _ = s.byte_slice(end: 2, start: 0)
+    }
+}
+"#)
+    expect_hook_report(src, tag, "Str.byte_slice end=2 is inside a codepoint: cuts U+00E9 at bytes 1..3, length 3", 13)
+}
+
+test "the free fn bytes_set out of range reaches the hook with its site" {
+    let tag = "fs_bytes_set_fn_{getpid()}"
+    let src = "import std.bytes\n".concat(report_src()).concat(#"
+fn main() ! IO, Env {
+    with on_panic(report) {
+        let b = Bytes.from_str("abcd")
+        bytes.bytes_set(b, 9, 1)
+    }
+}
+"#)
+    expect_hook_report(src, tag, "bytes set index out of bounds: 9, length 4", 14)
+}
+
+fn template_src(read: Str) -> Str {
+    report_src().concat(#"
+pub effect Rd {
+    effect Read {
+        fn read(t: Template[Rd]) -> Str
+    }
+}
+
+fn show(t: Template[Rd]) -> Str {
+"#).concat("    \"\{{read}}\"\n").concat(#"}
+
+fn main() ! IO, Env {
+    with on_panic(report) {
+        let n = 7
+        io.println(show("a {n} b"))
+    }
+}
+"#)
+}
+
+test "a template getter out of range reaches the hook with its site" {
+    let tag = "fs_tpl_index_{getpid()}"
+    expect_hook_report(template_src("t.get_int(5)"), tag, "template value index out of bounds: 5, length 1", 17)
+}
+
+test "a template type_tag out of range reaches the hook with its site" {
+    let tag = "fs_tpl_tag_{getpid()}"
+    expect_hook_report(template_src("t.type_tag(-1)"), tag, "template value index out of bounds: -1, length 1", 17)
+}
+
+test "a template getter of the wrong kind reaches the hook with its site" {
+    let tag = "fs_tpl_kind_{getpid()}"
+    expect_hook_report(template_src("t.get_str(0)"), tag, "template value 0 is not a Str", 17)
+}
