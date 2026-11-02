@@ -32576,18 +32576,12 @@ fn tc_tm_callback_binds(call: Int, fndef: Int, binds: Map[Str, Int]) -> Map[Str,
     out
 }
 
-// The init argument of a fold call, or -1.
+// The init argument of a fold call, its first slot, or -1.
 fn tc_tm_fold_init(call: Int) -> Int {
     let args = node_args(call)
-    if args == -1 { return -1 }
-    let mut i = 0
-    while i < sublist_length(args) {
-        let a = sublist_get(args, i)
-        if node_kind(a) != NodeKind.NamedArg { return a }
-        if node_name(a) == "init" { return node_value(a) }
-        i = i + 1
-    }
-    -1
+    if args == -1 || sublist_length(args) == 0 { return -1 }
+    let a = sublist_get(args, 0)
+    if node_kind(a) == NodeKind.NamedArg { node_value(a) } else { a }
 }
 
 // The row of a named fn a built-in runs as its callback, at these binds. A `_` whose binder
@@ -32635,32 +32629,36 @@ fn tc_tm_closures_run(node: Int, assigns: Map[Int, List[Int]]) -> List[TmRun] {
         let cs = tc_tm_closures_of(from, assigns)
         if cs.len() > 0 { out.push(TmRun { expr: node_left(node), closures: cs }) }
     }
-    if node_kind(node) != NodeKind.MethodCall || d >= 0 || !tc_tm_builtin_runs_callback(node_method(node)) { return out }
+    if node_kind(node) != NodeKind.MethodCall || d >= 0 { return out }
+    let recv = resolve_alias_tid(tc_resolve(tc_lookup_node_tid(node_obj(node))))
+    if !tc_tm_builtin_runs_callback(tc_tid_kind(recv), node_method(node)) { return out }
     // A method the check could not resolve runs nothing that is known.
     if tc_tid_is_no_info(resolve_alias_tid(tc_resolve(tc_lookup_node_tid(node)))) != 0 { return out }
     let args = node_args(node)
     if args == -1 { return out }
-    let mut i = 0
-    let mut positional = 0
+    // The first arg of fold is its init, a value it returns, not a callback it runs. A built-in
+    // types its args by slot, whatever their labels say.
+    let mut i = if node_method(node) == "fold" { 1 } else { 0 }
     while i < sublist_length(args) {
         let a = sublist_get(args, i)
-        let named = node_kind(a) == NodeKind.NamedArg
-        // The `init` of fold is a value fold returns, not a callback it runs.
-        let init = node_method(node) == "fold" && (if named { node_name(a) == "init" } else { positional == 0 })
-        if !init {
-            let cs = tc_tm_closures_of([a], assigns)
-            if cs.len() > 0 { out.push(TmRun { expr: a, closures: cs }) }
-        }
-        if !named { positional = positional + 1 }
+        let cs = tc_tm_closures_of([a], assigns)
+        if cs.len() > 0 { out.push(TmRun { expr: a, closures: cs }) }
         i = i + 1
     }
     out
 }
 
-// The built-in methods whose callback has the row `! _`, so the call runs it: the List, Map,
-// Iterator, Option, Result and Str rows of §3.2, §3c.1 and §7.6.
-fn tc_tm_builtin_runs_callback(method: Str) -> Bool {
-    ["map", "filter", "flat_map", "fold", "for_each", "any", "all", "find", "sort_by", "map_values", "map_err", "trim_by", "trim_start_by", "trim_end_by"].contains(method)
+// The built-in methods that run their callback, on each kind of receiver: the List, Map,
+// Iterator, Option, Result and Str rows of §3.2, §3c.1 and §7.6. A fn-typed field of the same
+// name is a call through a rowless fn type, so the name alone says nothing.
+fn tc_tm_builtin_runs_callback(recv: TyKind, method: Str) -> Bool {
+    if recv == TyKind.List { return ["map", "filter", "flat_map", "fold", "for_each", "any", "all", "find", "sort_by"].contains(method) }
+    if recv == TyKind.Iterator { return ["map", "filter", "flat_map", "fold", "for_each", "any", "all", "find"].contains(method) }
+    if recv == TyKind.Map { return ["filter", "map_values", "fold"].contains(method) }
+    if recv == TyKind.Option { return method == "map" }
+    if recv == TyKind.Result { return ["map", "map_err"].contains(method) }
+    if recv == TyKind.Str { return ["trim_by", "trim_start_by", "trim_end_by"].contains(method) }
+    false
 }
 
 // The local or module `let` an ident names, or -1.
