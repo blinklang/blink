@@ -69,6 +69,70 @@ fn fault() -> Int {
 "#
 }
 
+fn direct_cut_src() -> Str {
+    #"@ffi("blink_str_byte_index_of")
+@trusted(audit: "TEST-NO-SLOT")
+fn raw_byte_index_of(s: Str, needle: Str, from: Int) -> Int ! () {}
+
+fn fault() -> Int {
+    raw_byte_index_of("é", "x", 1)
+}
+"#
+}
+
+fn direct_count_src() -> Str {
+    #"@ffi("blink_io_read_bytes_count")
+@trusted(audit: "TEST-NO-SLOT")
+fn raw_count(n: Int) -> Int ! () {}
+
+fn fault() -> Int {
+    raw_count(0)
+}
+"#
+}
+
+// A clause that does no read leaves the site of the earlier call in place.
+fn stale_site_src() -> Str {
+    #"@ffi("blink_stdin_read_bytes")
+@trusted(audit: "TEST-NO-SLOT")
+fn raw_read_bytes(n: Int) -> Bytes ! () {}
+
+fn fault() -> Int {
+    with handler IO.Read {
+        fn read_bytes(_n: Int) -> Bytes { Bytes.new() }
+        fn read_line() -> Str? { None }
+        fn read_all() -> Str { "" }
+    } {
+        let _ = io.read_bytes(1)
+    }
+    raw_read_bytes(0).len()
+}
+"#
+}
+
+// Over the walk limit: 5000 continuation bytes, which fs.read, env.var and process output pass on
+// with no UTF-8 check. Their recorded count of 0 is right.
+fn invalid_bytes_src() -> Str {
+    #"fn invalid() -> Str ! Process.Spawn {
+    process.run("sh", ["-c", "head -c 5000 /dev/zero | tr '\\0' '\\200'"]).unwrap().out
+}
+"#
+}
+
+fn low_count_src() -> Str {
+    invalid_bytes_src().concat(#"
+@ffi("memset", header: "string.h")
+@trusted(audit: "TEST-WRONG-COUNT")
+fn poke(s: Str, c: I32, n: Int) ! () {}
+
+fn fault() -> Int ! Process.Spawn {
+    let s = invalid()
+    poke(s, 97.to_i32(), 5000)
+    s.len()
+}
+"#)
+}
+
 fn expect_fatal(r: RunResult) {
     assert(r.exit_code == 101, "exit {r.exit_code}: {r.out} {r.err_out}")
     assert(r.err_out.len() > 0, "no report")
@@ -133,6 +197,33 @@ test "a Str whose recorded count is wrong goes past assert_panics" {
     assert(!r.out.contains("runs after"), r.out)
 }
 
+test "a low recorded count over the walk limit goes past assert_panics" {
+    let r = compile_and_run_test_json_opt(catches_src(low_count_src()), "ns_low_count_catch_{getpid()}", "-DBLINK_DEBUG")
+    expect_fatal(r)
+    assert(!r.out.contains("runs after"), r.out)
+}
+
+test "the right count of 5000 invalid bytes is not a fault" {
+    let r = compile_and_run_test_json_opt(invalid_bytes_src().concat(#"
+test "the count" {
+    assert_eq(invalid().len(), 0)
+}
+"#), "ns_invalid_count_{getpid()}", "-DBLINK_DEBUG")
+    assert(r.exit_code == 0, "exit {r.exit_code}: {r.out} {r.err_out}")
+}
+
+test "a direct byte_index_of cut goes past assert_panics" {
+    expect_past_assert_panics(direct_cut_src(), "ns_cut_catch_{getpid()}")
+}
+
+test "a direct read_bytes count check goes past assert_panics" {
+    expect_past_assert_panics(direct_count_src(), "ns_direct_count_catch_{getpid()}")
+}
+
+test "a stale read site does not make a bad direct count catchable" {
+    expect_past_assert_panics(stale_site_src(), "ns_stale_count_catch_{getpid()}")
+}
+
 test "a foreign NULL goes past the hook" {
     expect_past_the_hook(foreign_null_src(), "ns_foreign_hook_{getpid()}")
 }
@@ -147,6 +238,14 @@ test "a stdin fault with no read call goes past the hook" {
 
 test "a bad read_bytes count with no read call goes past the hook" {
     expect_past_the_hook(read_bytes_no_call_src(), "ns_count_hook_{getpid()}")
+}
+
+test "a direct byte_index_of cut goes past the hook" {
+    expect_past_the_hook(direct_cut_src(), "ns_cut_hook_{getpid()}")
+}
+
+test "a direct read_bytes count check goes past the hook" {
+    expect_past_the_hook(direct_count_src(), "ns_direct_count_hook_{getpid()}")
 }
 
 test "a foreign NULL does not fail only one test" {

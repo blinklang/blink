@@ -183,8 +183,8 @@ BLINK_RT_FN blink_bytes* blink_stdin_read_bytes(int64_t n) {
     if (n <= 0) {
         char msg[64];
         snprintf(msg, sizeof msg, "io.read_bytes: n must be at least 1, got %lld", (long long)n);
-        if (site.file != NULL) __blink_panic_dispatch_at(msg, site.file, site.line);
-        /* Generated code checks the count first, so only a direct C entry reaches this. */
+        /* Generated code checks the count first, so only a direct C entry reaches this. Any site
+           here is stale: a handler clause that did no read left it. */
         __blink_fatal(msg);
     }
     blink_stdin_reader_t* r = &blink_stdin_reader;

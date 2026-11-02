@@ -784,8 +784,9 @@ static inline int64_t blink_str_cp_len(const char* s) {
                      (long long)cps, (long long)walked);
             __blink_fatal(msg);
         }
-    } else if (cps > n || cps * 4 < n) {
-        /* A codepoint is 1 to 4 bytes, so n bytes hold n/4 to n of them. */
+    } else if (cps > n || (cps * 4 < n && blink_str_count_cps(s, n) != cps)) {
+        /* Valid text holds n/4 to n codepoints in n bytes, so only a low count costs a walk. A Str
+           from fs.read or a process can hold invalid bytes, and a low count is right for those. */
         char msg[128];
         snprintf(msg, sizeof msg, "blink: internal error: a Str records %lld codepoints in %lld bytes",
                  (long long)cps, (long long)n);
@@ -3534,7 +3535,7 @@ BLINK_RT_FN int64_t blink_str_index_of_from(const char* s, const char* needle, i
 
 /* Panics for a byte offset `off` that falls inside a codepoint. The message names the
    codepoint the offset cuts and the bytes it spans, so the caller can see which unit
-   it mixed up. A NULL file is a caller with no Blink site to name. */
+   it mixed up. A NULL file is a caller with no Blink site to name, so the fault is fatal. */
 BLINK_RT_FN void blink_str_cut_panic_at(const char* method, const char* bound, const char* s, int64_t off, int64_t len,
                                         const char* file, int64_t line);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
@@ -3549,8 +3550,10 @@ BLINK_RT_FN void blink_str_cut_panic_at(const char* method, const char* bound, c
         __blink_panic_dispatchf_at(file, line, "Str.%s %s=%lld is inside a codepoint: cuts U+%04X at bytes %lld..%lld, length %lld",
                                    method, bound, (long long)off, (unsigned)cp, (long long)lead, (long long)next, (long long)len);
     }
-    __blink_panic_dispatchf("blink: Str.%s %s=%lld is inside a codepoint: cuts U+%04X at bytes %lld..%lld byte_len=%lld",
-                            method, bound, (long long)off, (unsigned)cp, (long long)lead, (long long)next, (long long)len);
+    char msg[160];
+    snprintf(msg, sizeof msg, "blink: Str.%s %s=%lld is inside a codepoint: cuts U+%04X at bytes %lld..%lld byte_len=%lld",
+             method, bound, (long long)off, (unsigned)cp, (long long)lead, (long long)next, (long long)len);
+    __blink_fatal(msg);
 }
 #endif
 
@@ -4295,7 +4298,9 @@ BLINK_RT_FN int64_t blink_io_read_bytes_count(int64_t n);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN int64_t blink_io_read_bytes_count(int64_t n) {
     if (n <= 0) {
-        __blink_panic_dispatchf("io.read_bytes: n must be at least 1, got %lld", (long long)n);
+        char msg[64];
+        snprintf(msg, sizeof msg, "io.read_bytes: n must be at least 1, got %lld", (long long)n);
+        __blink_fatal(msg);
     }
     return n;
 }
