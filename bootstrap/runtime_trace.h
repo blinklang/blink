@@ -94,6 +94,16 @@ BLINK_RT_FN void blink_trace_bad_filter(const char* why, const char* what, const
 }
 #endif
 
+/* The trace code cannot go on without the memory it asked for. The words name the work, such
+   as "reading" "BLINK_TRACE", so the message says which env var or line ran out. */
+BLINK_RT_FN void blink_trace_oom(const char* verb, const char* what);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void blink_trace_oom(const char* verb, const char* what) {
+    fprintf(stderr, "error: out of memory %s %s\n", verb, what);
+    exit(2);
+}
+#endif
+
 /* A copy of s[0..n) with ASCII space and tab cut from its two ends, or NULL when that is
    empty. Out of memory names `var`, the env var whose item this is. */
 BLINK_RT_FN char* blink_trace_trim_dup_for(const char* s, size_t n, const char* var);
@@ -103,7 +113,7 @@ BLINK_RT_FN char* blink_trace_trim_dup_for(const char* s, size_t n, const char* 
     while (n > 0 && (s[n - 1] == ' ' || s[n - 1] == '\t')) n--;
     if (n == 0) return NULL;
     char* out = (char*)malloc(n + 1);
-    if (!out) { fprintf(stderr, "error: out of memory reading %s\n", var); exit(2); }
+    if (!out) blink_trace_oom("reading", var);
     memcpy(out, s, n);
     out[n] = '\0';
     return out;
@@ -173,7 +183,7 @@ BLINK_RT_FN void blink_trace_take_value(char* v, void* ctx) {
     if (c->f->count == c->cap) {
         c->cap = c->cap ? c->cap * 2 : 4;
         c->f->values = (char**)realloc(c->f->values, (size_t)c->cap * sizeof(char*));
-        if (!c->f->values) { fputs("error: out of memory reading BLINK_TRACE\n", stderr); exit(2); }
+        if (!c->f->values) blink_trace_oom("reading", "BLINK_TRACE");
     }
     c->f->values[c->f->count++] = v;
 }
@@ -189,7 +199,7 @@ BLINK_RT_FN void blink_trace_parse_item(const char* item) {
     if (!colon) blink_trace_bad_filter("a filter is `key:value`, not", item, NULL);
     size_t klen = (size_t)(colon - item);
     char* key = (char*)malloc(klen + 1);
-    if (!key) { fputs("error: out of memory reading BLINK_TRACE\n", stderr); exit(2); }
+    if (!key) blink_trace_oom("reading", "BLINK_TRACE");
     memcpy(key, item, klen);
     key[klen] = '\0';
     if (strcmp(key, "fn") != 0 && strcmp(key, "module") != 0 && strcmp(key, "depth") != 0
@@ -216,7 +226,7 @@ BLINK_RT_FN void blink_trace_parse_item(const char* item) {
     }
     blink_trace_filter* grown = (blink_trace_filter*)realloc(__blink_trace.filters,
         (size_t)(__blink_trace.filter_count + 1) * sizeof(blink_trace_filter));
-    if (!grown) { fputs("error: out of memory reading BLINK_TRACE\n", stderr); exit(2); }
+    if (!grown) blink_trace_oom("reading", "BLINK_TRACE");
     __blink_trace.filters = grown;
     __blink_trace.filters[__blink_trace.filter_count++] = f;
 }

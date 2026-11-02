@@ -4,12 +4,18 @@
 /* `trace.log` reads a Blink Str, so it comes after runtime_core.h; it also reads the
    --trace state and its item parser from runtime_trace.h, which stays free of core. */
 
+/* A Blink Str may hold a NUL, so a channel compares by its length, not by strcmp; each name
+   keeps its length, as the compare runs on every trace.log call. */
+typedef struct {
+    char* name;
+    size_t len;
+} blink_trace_channel;
+
 /* The channels BLINK_TRACE_CHANNELS turns on for `trace.log` (§8.15.7). The program reads the
    var once, at start, so a later set_var changes nothing; threads only read it after that. */
 typedef struct {
     int all;
-    char** names;
-    size_t* lens;
+    blink_trace_channel* items;
     int count;
 } blink_trace_channels_state;
 
@@ -35,15 +41,13 @@ BLINK_RT_FN void blink_trace_take_channel(char* item, void* ctx) {
     }
     if (__blink_trace_channels.count == *cap) {
         *cap = *cap ? *cap * 2 : 4;
-        char** grown = (char**)realloc(__blink_trace_channels.names, (size_t)*cap * sizeof(char*));
-        if (!grown) { fputs("error: out of memory reading BLINK_TRACE_CHANNELS\n", stderr); exit(2); }
-        __blink_trace_channels.names = grown;
-        size_t* lens = (size_t*)realloc(__blink_trace_channels.lens, (size_t)*cap * sizeof(size_t));
-        if (!lens) { fputs("error: out of memory reading BLINK_TRACE_CHANNELS\n", stderr); exit(2); }
-        __blink_trace_channels.lens = lens;
+        blink_trace_channel* grown = (blink_trace_channel*)realloc(__blink_trace_channels.items,
+            (size_t)*cap * sizeof(blink_trace_channel));
+        if (!grown) blink_trace_oom("reading", "BLINK_TRACE_CHANNELS");
+        __blink_trace_channels.items = grown;
     }
-    __blink_trace_channels.lens[__blink_trace_channels.count] = strlen(item);
-    __blink_trace_channels.names[__blink_trace_channels.count++] = item;
+    blink_trace_channel c = { item, strlen(item) };
+    __blink_trace_channels.items[__blink_trace_channels.count++] = c;
 }
 #endif
 
@@ -52,11 +56,9 @@ BLINK_RT_FN void blink_trace_take_channel(char* item, void* ctx) {
 BLINK_RT_FN void blink_trace_channels_init(void);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN void blink_trace_channels_init(void) {
-    for (int i = 0; i < __blink_trace_channels.count; i++) free(__blink_trace_channels.names[i]);
-    free(__blink_trace_channels.names);
-    free(__blink_trace_channels.lens);
-    __blink_trace_channels.names = NULL;
-    __blink_trace_channels.lens = NULL;
+    for (int i = 0; i < __blink_trace_channels.count; i++) free(__blink_trace_channels.items[i].name);
+    free(__blink_trace_channels.items);
+    __blink_trace_channels.items = NULL;
     __blink_trace_channels.count = 0;
     __blink_trace_channels.all = 0;
     const char* env = getenv("BLINK_TRACE_CHANNELS");
@@ -66,15 +68,14 @@ BLINK_RT_FN void blink_trace_channels_init(void) {
 }
 #endif
 
-/* A Blink Str may hold a NUL, so a channel compares by its length, not by strcmp; init keeps
-   each name's length, as this runs on every trace.log call. */
 BLINK_RT_FN int blink_trace_channel_on(const char* ch);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN int blink_trace_channel_on(const char* ch) {
     if (__blink_trace_channels.all) return 1;
     size_t n = (size_t)blink_str_len(ch);
     for (int i = 0; i < __blink_trace_channels.count; i++) {
-        if (__blink_trace_channels.lens[i] == n && memcmp(__blink_trace_channels.names[i], ch, n) == 0) return 1;
+        blink_trace_channel c = __blink_trace_channels.items[i];
+        if (c.len == n && memcmp(c.name, ch, n) == 0) return 1;
     }
     return 0;
 }
@@ -93,7 +94,7 @@ BLINK_RT_FN void blink_trace_note(const char* ch, const char* msg) {
     size_t total = hn + cn + mn + sn + 1;
     char small[512];
     char* buf = total <= sizeof(small) ? small : (char*)malloc(total);
-    if (!buf) { fputs("error: out of memory writing a trace line\n", stderr); exit(2); }
+    if (!buf) blink_trace_oom("writing", "a trace line");
     memcpy(buf, head, hn);
     memcpy(buf + hn, ch, cn);
     memcpy(buf + hn + cn, mid, mn);
