@@ -31948,7 +31948,7 @@ fn tc_tm_check_call(node: Int, inside: Set[Int]) ! TypeCheck.Resolve, Diag.Repor
             return
         }
         if tc_call_user_effect(node) < 0 {
-            let t = tc_tm_touch(decl)
+            let t = tc_tm_touch(node)
             if t.name != "" {
                 let how = if t.writes { "writes" } else { "reads" }
                 tc_tm_report(node, "`msg` calls `{node_name(decl)}`, which {how} `{t.name}`", [])
@@ -32004,13 +32004,14 @@ fn tc_tm_check_with_item(item: Int) ! TypeCheck.Resolve, Diag.Report {
             }
         }
         if ran.len() == 0 {
-            let mut seen: Set[Int] = Set()
+            let mut seen: Set[Str] = Set()
             let mut reads: List[Str] = []
             let mut writes: List[Str] = []
             let mut kids: List[Int] = []
             let mut shown: List[Str] = []
+            let mb = tc_impl_binds_for_instance(im, tid)
             for m in methods {
-                tc_tm_touch_fn(m, seen, reads, writes, kids)
+                tc_tm_touch_fn(m, mb, 0, seen, reads, writes, kids)
                 shown.push("`{tname}.{node_name(m)}`")
             }
             let t = tc_tm_touch_result(reads, writes)
@@ -32134,16 +32135,19 @@ type TmTouch {
     name: Str
 }
 
-// What a call of `decl` does to module state, through its body and the bodies of the fns it
-// calls: a write of a module `let mut` beats a read of one, and a read is State too (§4.16.1).
-// A closure body counts only where the closure is called, which a call through a fn value
-// hides, so it is not walked; neither is a nested fn or a trace.log msg, which adds no State.
-fn tc_tm_touch(decl: Int) -> TmTouch ! TypeCheck.Resolve, Diag.Report {
-    let mut seen: Set[Int] = Set()
+// What a call does to module state, through the body it runs and the bodies of the fns that
+// body calls: a write of a module `let mut` beats a read of one, and a read is State too
+// (§4.16.1). A generic body runs at the types its call gives its type parameters, so a method
+// call through a bound walks the impl of the type the parameter stands for there; one that
+// still stands for every impl names no body. A closure body counts only where the closure is
+// called, which a call through a fn value hides, so it is not walked; neither is a nested fn
+// or a trace.log msg, which adds no State.
+fn tc_tm_touch(call: Int) -> TmTouch ! TypeCheck.Resolve, Diag.Report {
+    let mut seen: Set[Str] = Set()
     let mut reads: List[Str] = []
     let mut writes: List[Str] = []
     let mut kids: List[Int] = []
-    tc_tm_touch_fn(decl, seen, reads, writes, kids)
+    tc_tm_touch_call(call, tc_no_binds, 0, seen, reads, writes, kids)
     tc_tm_touch_result(reads, writes)
 }
 
@@ -32155,20 +32159,52 @@ fn tc_tm_touch_result(reads: List[Str], writes: List[Str]) -> TmTouch {
     }
 }
 
-fn tc_tm_touch_fn(decl: Int, seen: Set[Int], reads: List[Str], writes: List[Str], kids: List[Int]) ! TypeCheck.Resolve, Diag.Report {
-    if seen.contains(decl) || writes.len() > 0 { return }
-    seen.insert(decl)
-    if node_kind(decl) != NodeKind.FnDef { return }
-    tc_tm_touch_walk(node_body(decl), seen, reads, writes, kids)
+// The body a call runs, with the types its callee's parameters take there, read through the
+// binds of the body the call is in.
+fn tc_tm_touch_call(node: Int, binds: Map[Str, Int], depth: Int, seen: Set[Str], reads: List[Str], writes: List[Str], kids: List[Int]) ! TypeCheck.Resolve, Diag.Report {
+    let decl = tc_call_decl_node(node)
+    if decl < 0 || tc_call_user_effect(node) >= 0 { return }
+    let block = tc_method_block.get(decl) ?? -1
+    if block != -1 && node_kind(block) == NodeKind.TraitDef {
+        let recv = tc_er_call_receiver(node)
+        let a = if recv >= 0 { resolve_alias_tid(tc_resolve(substitute_typevar_tid(recv, binds))) } else { -1 }
+        if a >= 0 && tc_tid_is_no_info(a) == 0 && tc_tid_kind(a) != TyKind.Typevar {
+            let m = tc_er_impl_decl(a, decl)
+            if m >= 0 {
+                let ib = tc_method_block.get(m) ?? -1
+                let mb = if ib != -1 && node_kind(ib) == NodeKind.ImplBlock { tc_impl_binds_for_instance(ib, a) } else { tc_no_binds }
+                tc_tm_touch_fn(m, mb, depth, seen, reads, writes, kids)
+                return
+            }
+        }
+        tc_tm_touch_fn(decl, tc_no_binds, depth, seen, reads, writes, kids)
+        return
+    }
+    let mut cb: Map[Str, Int] = Map()
+    for (k, v) in tc_er_call_binds(node, decl) { cb.insert(k, substitute_typevar_tid(v, binds)) }
+    tc_tm_touch_fn(decl, cb, depth, seen, reads, writes, kids)
 }
 
-fn tc_tm_touch_walk(node: Int, seen: Set[Int], reads: List[Str], writes: List[Str], kids: List[Int]) ! TypeCheck.Resolve, Diag.Report {
+// Each instance is walked once. A generic fn that calls itself at a larger type argument has
+// no last instance, so the walk stops at a depth cap.
+fn tc_tm_touch_fn(decl: Int, binds: Map[Str, Int], depth: Int, seen: Set[Str], reads: List[Str], writes: List[Str], kids: List[Int]) ! TypeCheck.Resolve, Diag.Report {
+    if writes.len() > 0 || depth > 64 { return }
+    let mut parts: List[Str] = []
+    for (k, v) in binds { parts.push("{k}={tc_resolve(v)}") }
+    let key = "{decl}:{parts.sort().join(",")}"
+    if seen.contains(key) { return }
+    seen.insert(key)
+    if node_kind(decl) != NodeKind.FnDef { return }
+    tc_tm_touch_walk(node_body(decl), binds, depth, seen, reads, writes, kids)
+}
+
+fn tc_tm_touch_walk(node: Int, binds: Map[Str, Int], depth: Int, seen: Set[Str], reads: List[Str], writes: List[Str], kids: List[Int]) ! TypeCheck.Resolve, Diag.Report {
     if node < 0 || writes.len() > 0 { return }
     let k = node_kind(node)
     if k == NodeKind.FnDef || k == NodeKind.Closure || k == NodeKind.HandlerExpr { return }
     if k == NodeKind.MethodCall && tc_call_is_trace_log(node) {
         let args = node_args(node)
-        if args != -1 && sublist_length(args) > 0 { tc_tm_touch_walk(sublist_get(args, 0), seen, reads, writes, kids) }
+        if args != -1 && sublist_length(args) > 0 { tc_tm_touch_walk(sublist_get(args, 0), binds, depth, seen, reads, writes, kids) }
         return
     }
     if k == NodeKind.Ident || k == NodeKind.FieldAccess {
@@ -32183,23 +32219,22 @@ fn tc_tm_touch_walk(node: Int, seen: Set[Int], reads: List[Str], writes: List[St
         }
     }
     if k == NodeKind.Call || k == NodeKind.MethodCall {
-        let decl = tc_call_decl_node(node)
-        if k == NodeKind.MethodCall && tc_tm_call_writes_receiver(node, decl) {
+        if k == NodeKind.MethodCall && tc_tm_call_writes_receiver(node, tc_call_decl_node(node)) {
             let shown = tc_tm_module_root(node_obj(node))
             if shown != "" {
                 writes.push(shown)
                 return
             }
         }
-        if decl >= 0 && tc_call_user_effect(node) < 0 { tc_tm_touch_fn(decl, seen, reads, writes, kids) }
+        tc_tm_touch_call(node, binds, depth + 1, seen, reads, writes, kids)
     }
-    if k == NodeKind.WithBlock { tc_tm_touch_with(node, seen, reads, writes, kids) }
+    if k == NodeKind.WithBlock { tc_tm_touch_with(node, binds, depth, seen, reads, writes, kids) }
     let base = kids.len()
     node_push_value_child_ids(node, kids)
     let end = kids.len()
     let mut i = base
     while i < end {
-        tc_tm_touch_walk(kids.get(i).unwrap(), seen, reads, writes, kids)
+        tc_tm_touch_walk(kids.get(i).unwrap(), binds, depth, seen, reads, writes, kids)
         i = i + 1
     }
     while kids.len() > base {
@@ -32208,7 +32243,7 @@ fn tc_tm_touch_walk(node: Int, seen: Set[Int], reads: List[Str], writes: List[St
 }
 
 // What the with items of `node` run through their enter and exit, or close.
-fn tc_tm_touch_with(node: Int, seen: Set[Int], reads: List[Str], writes: List[Str], kids: List[Int]) ! TypeCheck.Resolve, Diag.Report {
+fn tc_tm_touch_with(node: Int, binds: Map[Str, Int], depth: Int, seen: Set[Str], reads: List[Str], writes: List[Str], kids: List[Int]) ! TypeCheck.Resolve, Diag.Report {
     let items = node_handlers(node)
     if items == -1 { return }
     let mut i = 0
@@ -32216,11 +32251,11 @@ fn tc_tm_touch_with(node: Int, seen: Set[Int], reads: List[Str], writes: List[St
         let it = sublist_get(items, i)
         if node_kind(it) != NodeKind.Ident || node_name(it) != "arena" {
             let vn = if node_kind(it) == NodeKind.WithResource { node_value(it) } else { it }
-            let tid = resolve_alias_tid(tc_resolve(tc_lookup_node_tid(vn)))
+            let tid = resolve_alias_tid(tc_resolve(substitute_typevar_tid(tc_lookup_node_tid(vn), binds)))
             if tid >= 0 && tc_tid_is_no_info(tid) == 0 && tc_tid_kind(tid) != TyKind.Typevar {
                 let im = tc_er_scoped_impl(tid)
                 if im >= 0 {
-                    for m in tc_tm_with_methods(im) { tc_tm_touch_fn(m, seen, reads, writes, kids) }
+                    for m in tc_tm_with_methods(im) { tc_tm_touch_fn(m, tc_impl_binds_for_instance(im, tid), depth + 1, seen, reads, writes, kids) }
                 }
             }
         }
@@ -38118,18 +38153,7 @@ fn tc_er_impl_row(a0: Int, tm: Int, depth: Int) -> List[Str] ! TypeCheck.Resolve
         out.push("_")
         return out
     }
-    let tkey = tc_trait_key_of(tc_method_block.get(tm) ?? -1)
-    let mname = node_name(tm)
-    let mut decl = -1
-    if tkey == "BlockHandler" || tkey == "Closeable" {
-        let im = tc_er_scoped_impl(a)
-        if im >= 0 { decl = tc_er_impl_method(im, if tc_impl_trait_id(im) == "Closeable" { "close" } else { mname }) }
-    } else {
-        let k = tc_tid_kind(a)
-        let tname = if k == TyKind.Struct || k == TyKind.Enum { ty_pool.get(a).unwrap().name } else { tc_builtin_receiver_name(a) }
-        let sig = if tname != "" { lookup_fnsig(tc_impl_method_stem(tname, tkey, mname)) } else { -1 }
-        if sig >= 0 { decl = fnsig_pool.get(sig).unwrap().decl }
-    }
+    let decl = tc_er_impl_decl(a, tm)
     if decl < 0 { return out }
     for e in tc_er_fn_row(decl) {
         if e == "_" {
@@ -38151,6 +38175,21 @@ fn tc_er_impl_row(a0: Int, tm: Int, depth: Int) -> List[Str] ! TypeCheck.Resolve
         }
     }
     out
+}
+
+// The impl method that concrete type `a` runs for trait method `tm`, or -1.
+fn tc_er_impl_decl(a: Int, tm: Int) -> Int ! Diag.Report {
+    let tkey = tc_trait_key_of(tc_method_block.get(tm) ?? -1)
+    let mname = node_name(tm)
+    if tkey == "BlockHandler" || tkey == "Closeable" {
+        let im = tc_er_scoped_impl(a)
+        if im < 0 { return -1 }
+        return tc_er_impl_method(im, if tc_impl_trait_id(im) == "Closeable" { "close" } else { mname })
+    }
+    let k = tc_tid_kind(a)
+    let tname = if k == TyKind.Struct || k == TyKind.Enum { ty_pool.get(a).unwrap().name } else { tc_builtin_receiver_name(a) }
+    let sig = if tname != "" { lookup_fnsig(tc_impl_method_stem(tname, tkey, mname)) } else { -1 }
+    if sig >= 0 { fnsig_pool.get(sig).unwrap().decl } else { -1 }
 }
 
 fn tc_er_impl_method(im: Int, name: Str) -> Int {

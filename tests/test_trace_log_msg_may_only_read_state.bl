@@ -451,3 +451,96 @@ fn main() {
     assert(primary_at(callee, 19, 22), callee)
     assert(callee.contains("`msg` calls `shut_one`, which writes `count`"), callee)
 }
+
+test "a generic fn whose bound method's impl touches a module let mut is E0566 in msg" {
+    let src = #"let mut count = 0
+
+trait Show {
+    fn show(self) -> Str
+}
+
+type A { x: Int }
+
+impl Show for A {
+    fn show(self) -> Str { "{count}{self.x}" }
+}
+
+type Quiet { name: Str }
+
+impl Closeable for Quiet {
+    fn close(self) { count += self.name.len() }
+}
+
+fn gen[T: Show](t: T) -> Str { t.show() }
+
+fn outer[T: Show](t: T) -> Str { gen(t) }
+
+fn shut[T: Closeable](t: T) ! _ { t.close() }
+
+fn walk() {
+    trace.log("c", "{gen(A { x: 1 })}")
+    trace.log("c", "{outer(A { x: 2 })}")
+    trace.log("c", {
+        shut(Quiet { name: "b" })
+        "x"
+    })
+}
+
+fn main() {
+    count = 1
+    walk()
+}
+"#
+    let out = check_via_cli(src, "e0566_bound_impl_{getpid()}")
+    let found = e0566_lines(out)
+    assert_eq(found.len(), 3)
+    assert_eq(error_count(out), 3)
+    let read = found.get(0).unwrap()
+    assert(primary_at(read, 26, 22), read)
+    assert(read.contains("`msg` calls `gen`, which reads `count`"), read)
+    let deep = found.get(1).unwrap()
+    assert(primary_at(deep, 27, 22), deep)
+    assert(deep.contains("`msg` calls `outer`, which reads `count`"), deep)
+    let write = found.get(2).unwrap()
+    assert(primary_at(write, 29, 9), write)
+    assert(write.contains("`msg` calls `shut`, which writes `count`"), write)
+}
+
+test "a generic fn in msg is E0566 only at a type whose impl touches a module let mut" {
+    let src = #"let mut count = 0
+
+trait Show {
+    fn show(self) -> Str
+}
+
+type A { x: Int }
+
+impl Show for A {
+    fn show(self) -> Str { "{count}{self.x}" }
+}
+
+type B { y: Int }
+
+impl Show for B {
+    fn show(self) -> Str { "{self.y}" }
+}
+
+fn gen[T: Show](t: T) -> Str { t.show() }
+
+fn both() -> Str { "{gen(B { y: 1 })}{gen(A { x: 2 })}" }
+
+fn walk() {
+    trace.log("c", "{gen(B { y: 3 })}")
+    trace.log("c", "{both()}")
+}
+
+fn main() {
+    count = 1
+    walk()
+}
+"#
+    let out = check_via_cli(src, "e0566_bound_instance_{getpid()}")
+    let found = only_e0566(out)
+    assert(primary_at(found, 25, 22), found)
+    assert(found.contains("`msg` calls `both`, which reads `count`"), found)
+}
