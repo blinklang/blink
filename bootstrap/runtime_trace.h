@@ -286,10 +286,6 @@ BLINK_RT_FN void blink_trace_take_value(char* v, void* ctx);
 BLINK_RT_FN void blink_trace_take_value(char* v, void* ctx) {
     blink_trace_value_ctx* c = (blink_trace_value_ctx*)ctx;
     const char* key = c->f->key;
-    if (strcmp(key, "depth") == 0) {
-        const char* why = blink_trace_depth_error(v);
-        if (why) blink_trace_reject(c->value, why, NULL, "", NULL, 0);
-    }
     if (strcmp(key, "event") == 0 && !blink_trace_is_event_type(v)) {
         blink_trace_reject(c->value, "unknown event type ", v, "", blink_trace_event_types, 5);
     }
@@ -322,7 +318,17 @@ BLINK_RT_FN void blink_trace_parse_item_of(const char* item, const char* value) 
     }
     blink_trace_filter f = { key, NULL, 0 };
     blink_trace_value_ctx ctx = { &f, 0, item, value };
-    blink_trace_each_item(colon + 1, '+', "BLINK_TRACE", blink_trace_take_value, &ctx);
+    if (strcmp(key, "depth") == 0) {
+        /* The depth: rule is "digits and nothing else", so a `+` in its value is a bad digit. */
+        char* v = blink_trace_trim_dup_for(colon + 1, strlen(colon + 1), "BLINK_TRACE");
+        if (v) {
+            const char* why = blink_trace_depth_error(v);
+            if (why) blink_trace_reject(value, why, NULL, "", NULL, 0);
+            blink_trace_take_value(v, &ctx);
+        }
+    } else {
+        blink_trace_each_item(colon + 1, '+', "BLINK_TRACE", blink_trace_take_value, &ctx);
+    }
     if (f.count == 0) blink_trace_reject(value, "the key ", key, " has no value", NULL, 0);
     /* The items of `,` all must match (§8.15.5), so a second `event:` item narrows the set. */
     if (strcmp(key, "event") == 0) {
