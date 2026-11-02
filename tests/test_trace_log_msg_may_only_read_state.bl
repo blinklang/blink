@@ -2050,3 +2050,120 @@ fn main() ! IO {
         line = line + 1
     }
 }
+
+test "a value with no type leaves no row _ open beside its own error" {
+    let src = #"type Mute { n: Int }
+
+impl Closeable for Mute {
+    fn close(self) { }
+}
+
+fn shut[T: Closeable](t: T) -> Int ! _ {
+    t.close()
+    1
+}
+
+fn fshut[T: Closeable](acc: Int, t: T) -> Int ! _ {
+    t.close()
+    acc
+}
+
+fn fg[T: Closeable](acc: T, x: Int) -> T ! _ {
+    acc.close()
+    acc
+}
+
+fn lshut[T: Closeable](t: List[T]) -> Int ! _ { 1 }
+
+fn io_f(x: Int) -> Int ! IO {
+    io.println("x")
+    x
+}
+
+fn walk() ! IO {
+    let g = shut
+    trace.log("c", "{[undefined_thing].map(shut).len()}")
+    trace.log("c", "{[[undefined_thing]].map(lshut).len()}")
+    trace.log("c", "{[undefined_thing].fold(0, fshut)}")
+    trace.log("c", "{[1].fold(undefined_thing, fg)}")
+    trace.log("c", "{g(undefined_thing)}")
+    trace.log("c", "{[undefined_thing].map(io_f).len()}")
+}
+
+fn main() ! IO {
+    walk()
+}
+"#
+    let out = check_via_cli(src, "e0566_msg_no_type_no_open_row_{getpid()}")
+    let found = e0566_lines(out)
+    assert_eq(found.len(), 1)
+    let e = found.get(0).unwrap()
+    assert(primary_at(e, 36, 22), e)
+    assert(e.contains("`io_f` has the row `! IO`"), e)
+}
+
+test "an unsolved binder with a known element still reports the row _" {
+    let src = #"fn odd[T: Closeable](x: Int) -> Int ! _ { x }
+
+fn walk() {
+    let xs: List[Int] = []
+    trace.log("c", "{xs.map(odd).len()}")
+}
+
+fn main() {
+    walk()
+}
+"#
+    let e = only_e0566(check_via_cli(src, "e0566_msg_known_element_open_row_{getpid()}"))
+    assert(primary_at(e, 5, 22), e)
+    assert(e.contains("`odd` has the row `! _`"), e)
+}
+
+test "a trait method with a row State or _ at a binder of the caller is E0566 for every impl" {
+    let src = #"trait Tick {
+    fn tick(self) -> Int ! State
+}
+
+impl Tick for Str {
+    fn tick(self) -> Int ! State { 0 }
+}
+
+trait Open {
+    fn open(self) -> Int ! _
+}
+
+impl Open for Str {
+    fn open(self) -> Int { 0 }
+}
+
+fn go[T: Tick](x: T) -> Int ! State { x.tick() }
+
+fn so[T: Open](x: T) -> Int ! _ { x.open() }
+
+fn at_state[U: Tick](x: U, xs: List[U]) ! State {
+    trace.log("c", "{x.tick()}")
+    trace.log("c", "{go(x)}")
+    trace.log("c", "{xs.map(go).len()}")
+}
+
+fn at_wild[U: Open](x: U, xs: List[U]) ! _ {
+    trace.log("c", "{x.open()}")
+    trace.log("c", "{so(x)}")
+    trace.log("c", "{xs.map(so).len()}")
+}
+
+fn main() ! State {
+    at_state("a", ["a"])
+    at_wild("a", ["a"])
+}
+"#
+    let out = check_via_cli(src, "e0566_msg_trait_row_at_binder_{getpid()}")
+    let found = e0566_lines(out)
+    assert_eq(found.len(), 6)
+    assert(found.get(0).unwrap().contains("`tick` has the row `! State`"), found.get(0).unwrap())
+    assert(found.get(1).unwrap().contains("`go` has the row `! State`"), found.get(1).unwrap())
+    assert(found.get(2).unwrap().contains("`go` has the row `! State`"), found.get(2).unwrap())
+    assert(found.get(3).unwrap().contains("`open` has the row `! _`"), found.get(3).unwrap())
+    assert(found.get(4).unwrap().contains("`so` has the row `! _`"), found.get(4).unwrap())
+    assert(found.get(5).unwrap().contains("`so` has the row `! _`"), found.get(5).unwrap())
+}

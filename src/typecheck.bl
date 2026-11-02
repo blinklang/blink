@@ -32070,7 +32070,7 @@ fn tc_tm_check_closures_run(node: Int, inside: Set[Int], assigns: Map[Int, List[
             let named = node_kind(c) == NodeKind.FnDef
             let cb = if named { tc_tm_callback_binds(node, c, tc_no_binds) } else { tc_no_binds }
             if named {
-                let row = tc_tm_callback_row(c, cb)
+                let row = tc_tm_callback_row(node, c, cb)
                 if row.len() > 0 {
                     tc_tm_report(node, "`msg` calls `{node_name(c)}`, which has a row", ["`{node_name(c)}` has the row `! {row.join(", ")}`"])
                     return
@@ -32107,7 +32107,7 @@ fn tc_tm_closure_row_call(call: Int, c: Int, walked: Set[Int], assigns: Map[Int,
     // A named fn's row depends on the call, so each call reads it. It walks no body, so the
     // walk needs no guard for it.
     if node_kind(c) == NodeKind.FnDef {
-        let row = tc_tm_callback_row(c, tc_tm_callback_binds(call, c, tc_no_binds))
+        let row = tc_tm_callback_row(call, c, tc_tm_callback_binds(call, c, tc_no_binds))
         return if row.len() > 0 { "calls `{node_name(c)}`, which has the row `! {row.join(", ")}`" } else { "" }
     }
     if walked.contains(c) { return "" }
@@ -32592,9 +32592,10 @@ fn tc_tm_fold_init(call: Int) -> Int {
     if node_kind(a) == NodeKind.NamedArg { node_value(a) } else { a }
 }
 
-// The row of a named fn a built-in runs as its callback, at these binds. A `_` whose binder
-// the call does not solve stands for every impl, so it is `_`, not the empty row.
-fn tc_tm_callback_row(fndef: Int, binds: Map[Str, Int]) -> List[Str] ! TypeCheck.Resolve, Diag.Report {
+// The row of a named fn that `call` runs, at these binds. A `_` whose binder the call does not
+// solve stands for every impl, so it is `_`, not the empty row. A value with no type solves
+// nothing either, but its own error stands, so it says nothing of the row.
+fn tc_tm_callback_row(call: Int, fndef: Int, binds: Map[Str, Int]) -> List[Str] ! TypeCheck.Resolve, Diag.Report {
     let mut row = tc_tm_decl_row(fndef, binds)
     let idx = fnsig_by_decl.get(fndef) ?? -1
     if idx < 0 || row.contains("_") { return row }
@@ -32605,7 +32606,7 @@ fn tc_tm_callback_row(fndef: Int, binds: Map[Str, Int]) -> List[Str] ! TypeCheck
         if fnsig_effect_names.get(fs.effects_start + i).unwrap() == "_" { wild = true }
         i = i + 1
     }
-    if !wild { return row }
+    if !wild || tc_tm_call_gives_unknown(call) { return row }
     for p in tc_er_wild_params(fndef) {
         if (binds.get(tc_binder_key(p.binder, p.name)) ?? (binds.get(p.name) ?? -1)) < 0 {
             row.push("_")
@@ -32613,6 +32614,25 @@ fn tc_tm_callback_row(fndef: Int, binds: Map[Str, Int]) -> List[Str] ! TypeCheck
         }
     }
     row
+}
+
+// Whether a type this call gives the fn it runs holds a hole: the receiver of a built-in and the
+// init of fold, or an arg of a call of a `let`.
+fn tc_tm_call_gives_unknown(call: Int) -> Bool {
+    if node_kind(call) == NodeKind.MethodCall {
+        if tc_tid_has_unknown(tc_lookup_node_tid(node_obj(call))) != 0 { return true }
+        return node_method(call) == "fold" && tc_tid_has_unknown(tc_lookup_node_tid(tc_tm_fold_init(call))) != 0
+    }
+    let args = node_args(call)
+    if args == -1 { return false }
+    let mut i = 0
+    while i < sublist_length(args) {
+        let a = sublist_get(args, i)
+        let v = if node_kind(a) == NodeKind.NamedArg { node_value(a) } else { a }
+        if tc_tid_has_unknown(tc_lookup_node_tid(v)) != 0 { return true }
+        i = i + 1
+    }
+    false
 }
 
 fn tc_tm_touch_closure(c: Int, binds: Map[Str, Int], depth: Int, seen: Set[Str], todo: List[TmBody]) ! TypeCheck.Resolve, Diag.Report {
