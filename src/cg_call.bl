@@ -679,32 +679,44 @@ fn cc_eq_sizes_differ(e: EqFn, len_helper: Str) -> Int {
         ir_call_runtime(TYPE_INT, e.node, e.ints.c_spelling, h, e.ints.slot_form, [cc_eq_side(e, eq_rhs)]))
 }
 
+// `i = 0; loop { head; turn; i += 1 }`.
+fn cc_eq_walk(e: EqFn, i: Str, head: List[Int], turn: List[Int], out: List[Int]) {
+    let mut body: List[Int] = []
+    for s in head { body.push(s) }
+    for s in turn { body.push(s) }
+    body.push(ir_assign(e.node, cc_eq_int_ref(e, i),
+        ir_binary(TYPE_INT, e.node, e.ints.c_spelling, "+", cc_eq_int_ref(e, i), cc_eq_int(e, "1"))))
+    out.push(ir_let(TYPE_INT, e.node, e.ints.c_spelling, i, e.ints.slot_form, cc_eq_int(e, "0")))
+    out.push(ir_loop(e.node, ir_block(e.node, body)))
+}
+
 // `for i in 0..count(lhs) { turn }`, the count read once.
 fn cc_eq_index_loop(e: EqFn, count_helper: Str, i: Str, turn: List[Int], out: List[Int]) {
     let n = c_mint_local("n")
     let count = ir_call_runtime(TYPE_INT, e.node, e.ints.c_spelling, c_runtime_helper(count_helper),
         e.ints.slot_form, [cc_eq_side(e, eq_lhs)])
     let done = ir_binary(TYPE_BOOL, e.node, e.bools.c_spelling, ">=", cc_eq_int_ref(e, i), cc_eq_int_ref(e, n))
-    let mut body: List[Int] = [ir_if(e.node, done, ir_block(e.node, [ir_break(e.node)]), -1)]
-    for s in turn { body.push(s) }
-    body.push(ir_assign(e.node, cc_eq_int_ref(e, i),
-        ir_binary(TYPE_INT, e.node, e.ints.c_spelling, "+", cc_eq_int_ref(e, i), cc_eq_int(e, "1"))))
-    out.push(ir_let(TYPE_INT, e.node, e.ints.c_spelling, i, e.ints.slot_form, cc_eq_int(e, "0")))
     out.push(ir_let(TYPE_INT, e.node, e.ints.c_spelling, n, e.ints.slot_form, count))
-    out.push(ir_loop(e.node, ir_block(e.node, body)))
+    cc_eq_walk(e, i, [ir_if(e.node, done, ir_block(e.node, [ir_break(e.node)]), -1)], turn, out)
 }
 
+// An element's written Eq can change either list through an alias, so each turn reads both
+// lengths again: a list that changed size is not equal, and no read runs past an end.
 fn cc_list_eq_stmts(e: EqFn, out: List[Int]) -> Bool ! Diag.Report {
     let elem = child_tid(e.tid, Slot.Inner1)
     if elem < 0 { return cc_element_type_unrecorded(e.node, TyKind.List) >= 0 }
-    out.push(cc_eq_fails_when(e, cc_eq_sizes_differ(e, "list_len")))
     let i = c_mint_local("i")
     let get = c_runtime_helper("list_get")
     let l = cg_call_element_from_runtime(e.node, elem, get, [cc_eq_side(e, eq_lhs), cc_eq_int_ref(e, i)])
     let r = cg_call_element_from_runtime(e.node, elem, get, [cc_eq_side(e, eq_rhs), cc_eq_int_ref(e, i)])
     let mut turn: List[Int] = []
     if !cc_eq_member_into(e, elem, l, r, turn) { return false }
-    cc_eq_index_loop(e, "list_len", i, turn, out)
+    let len = ir_call_runtime(TYPE_INT, e.node, e.ints.c_spelling, c_runtime_helper("list_len"),
+        e.ints.slot_form, [cc_eq_side(e, eq_lhs)])
+    let done = ir_binary(TYPE_BOOL, e.node, e.bools.c_spelling, ">=", cc_eq_int_ref(e, i), len)
+    let head = [cc_eq_fails_when(e, cc_eq_sizes_differ(e, "list_len")),
+        ir_if(e.node, done, ir_block(e.node, [ir_break(e.node)]), -1)]
+    cc_eq_walk(e, i, head, turn, out)
     true
 }
 
