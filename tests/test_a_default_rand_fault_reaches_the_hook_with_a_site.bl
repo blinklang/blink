@@ -1,0 +1,86 @@
+// A handler can call `default.int(hi, lo)` or `default.bytes(-1)`. The fault is in Blink code,
+// so it is a panic with a site. The site is the line in the std body, because a panic() in a
+// std function keeps its own site. The tests do not pin that line number.
+
+import compile_test_helpers.{compile_and_run}
+
+fn hook_src(handler_body: Str, use_line: Str) -> Str {
+    #"fn report(p: PanicInfo) -> Never ! IO.Eprint, Env.Exit {
+    let at = match p.line {
+        Some(n) => "line {n} of {p.file}"
+        None => "no line in {p.file}"
+    }
+    io.eprintln("fatal: {p.message} at {at}")
+    env.exit(70)
+}
+
+fn main() ! IO, Env, Rand {
+    with on_panic(report) {
+        with handler Rand {
+            "#.concat(handler_body).concat(#"
+        } {
+            "#).concat(use_line).concat(#"
+        }
+    }
+}
+"#)
+}
+
+fn int_src() -> Str {
+    hook_src(#"fn int(lo: Int, hi: Int) -> Int { default.int(hi, lo) }"#, #"io.println("{rand.int(1..3)}")"#)
+}
+
+fn bytes_src() -> Str {
+    hook_src(#"fn bytes(n: Int) -> Bytes { default.bytes(0 - n - 1) }"#, #"io.println("{rand.bytes(3).len()}")"#)
+}
+
+fn expect_std_site(src: Str, tag: Str, op: Str) ! FS.Delete, FS.Write, Process.Spawn, FS.Read, Env.Read {
+    let r = compile_and_run(src, tag)
+    assert(r.exit_code == 70, "exit {r.exit_code}: {r.err_out}")
+    assert(r.err_out.starts_with("fatal: {op}: "), r.err_out)
+    assert(r.err_out.contains(" at line "), r.err_out)
+    assert(!r.err_out.contains(" of \n"), r.err_out)
+    assert(!r.err_out.contains("blink: "), r.err_out)
+}
+
+test "default.int with lo above hi reaches the hook with a site" {
+    expect_std_site(int_src(), "rand_int_site_{getpid()}", "rand.int")
+}
+
+test "default.bytes with a negative count reaches the hook with a site" {
+    expect_std_site(bytes_src(), "rand_bytes_site_{getpid()}", "rand.bytes")
+}
+
+test "assert_panics catches default.int with lo above hi" {
+    assert_panics {
+        let _ = default_int_with_bounds_swapped()
+    }
+}
+
+test "assert_panics catches default.bytes with a negative count" {
+    assert_panics {
+        let _ = default_bytes_with_a_negative_count()
+    }
+}
+
+fn default_int_with_bounds_swapped() -> Int ! Rand {
+    with handler Rand {
+        fn int(lo: Int, hi: Int) -> Int { default.int(hi, lo) }
+    } {
+        rand.int(1..3)
+    }
+}
+
+fn default_bytes_with_a_negative_count() -> Int ! Rand {
+    with handler Rand {
+        fn bytes(n: Int) -> Bytes { default.bytes(0 - n - 1) }
+    } {
+        rand.bytes(3).len()
+    }
+}
+
+test "default.int and default.bytes with good arguments still answer" {
+    let x = rand.int(1..=1)
+    assert_eq(x, 1)
+    assert_eq(rand.bytes(4).len(), 4)
+}

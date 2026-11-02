@@ -93,6 +93,7 @@ Single source of truth for release history. `blink llms` and `blink llms --full`
 
 ## Fixes (v0.59.0)
 
+- **A bad call of the default `Rand` operations has a site.** A handler that calls `default.int(hi, lo)` or `default.bytes(-1)` now gets a panic with a file and a line, which reaches the panic hook. The text starts with `rand.int: ` or `rand.bytes: `, not `Rand default handler: `.
 - **A fault with no Blink line is fatal.** A foreign function that returns NULL for a `Str`, a `Str` with no length header and a stdin fault that no Blink read call caused now end the process with exit code 101. A panic hook, `assert_panics`, a test record and a cleanup drain no longer take them, so a test can no longer pass by catching one.
 - **A list that changes size under `==` is not equal.** An element's `Eq` can change either list through an alias. `==` on lists now reads both lengths each turn, so it answers `false` when the sizes differ and no longer panics with a read past the end.
 - **A list that shrinks under a walk names the walk.** A `for` body that shrinks the list it walks, or an element's `Eq` that shrinks the list `contains` or `index_of` walks, now panics with the file and line of the `for` or the call. The panic reaches the panic hook and `assert_panics`, and its text has no `blink: ` lead-in. A list that grows under a `for` keeps the turn count the loop started with.
