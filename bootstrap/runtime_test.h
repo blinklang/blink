@@ -125,11 +125,24 @@ BLINK_RT_FN void blink_test_run(const blink_test_entry* tests, int count, int ar
 
 /* Spec §2.20: an assertion failure panics. Outside a test run there is no
  * per-test frame to longjmp to, so the failure is an uncaught panic. The
- * runner's panic hook is the marker for a test run. Renders the recorded
- * failure the way the runner's human output does. */
+ * runner's panic hook is the marker for a test run. A program's on_panic hook
+ * gets the failure at its call, with the message and none of the report's
+ * operand lines. Renders the recorded failure the way the runner's human
+ * output does. */
 BLINK_UNUSED static void __blink_assert_fail_uncaught(void) {
     char buf[BLINK_PA_INTRO_BUF_SIZE + 2048];
     size_t n = 0;
+    if (__blink_test_fail_assertion[0]) {
+        if (__blink_test_fail_user_msg[0]) {
+            snprintf(buf, sizeof(buf), "assertion failed: %s: %s", __blink_test_fail_assertion,
+                     __blink_test_fail_user_msg);
+        } else {
+            snprintf(buf, sizeof(buf), "assertion failed: %s", __blink_test_fail_assertion);
+        }
+    } else {
+        snprintf(buf, sizeof(buf), "%s", __blink_test_fail_msg);
+    }
+    __blink_panic_hook_run(buf, __blink_test_fail_file, __blink_test_fail_line);
     if (__blink_test_fail_assertion[0]) {
         n += snprintf(buf + n, sizeof(buf) - n, "assertion failed: %s", __blink_test_fail_assertion);
         if (__blink_test_fail_user_msg[0] && n < sizeof(buf)) {

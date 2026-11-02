@@ -1,0 +1,102 @@
+// In a debug build `debug_assert(c, m)` is `assert(c, m)` in every context: the same failure
+// path, the same report and the same test record (sections/02_syntax.md §2.20 *`debug_assert`*).
+// Outside a test it is a panic, so it exits 101 and `on_panic` gets it. In a test it fails
+// that test, and the next test runs. In a build that is not a debug build it does nothing.
+
+import compile_test_helpers.{compile_and_run, compile_and_run_debug, compile_and_run_test_json_debug}
+
+fn small_src() -> Str {
+    #"fn main() ! IO {
+    let n = 3
+    debug_assert(n > 5, "n is small")
+    io.println("after")
+}
+"#
+}
+
+test "outside a test a failed debug_assert writes the assert report and exits 101" {
+    let tag = "da_report_{getpid()}"
+    let r = compile_and_run_debug(small_src(), tag)
+    assert(r.exit_code == 101, "exit {r.exit_code}: {r.err_out}")
+    assert_eq(r.out, "")
+    assert(r.err_out.starts_with("assertion failed: debug_assert(n > 5)\n"), r.err_out)
+    assert(r.err_out.contains("message: n is small"), r.err_out)
+    assert(r.err_out.contains("n = 3"), r.err_out)
+    assert(r.err_out.contains("{tag}.bl:3:5"), r.err_out)
+}
+
+test "a build that is not a debug build does not evaluate debug_assert" {
+    let src = #"fn check(n: Int) -> Bool ! IO {
+    io.println("checked")
+    n > 0
+}
+
+fn main() ! IO {
+    debug_assert(check(-1))
+    io.println("done")
+}
+"#
+    let release = compile_and_run(src, "da_off_{getpid()}")
+    assert(release.exit_code == 0, "exit {release.exit_code}: {release.err_out}")
+    assert_eq(release.out, "done\n")
+    let debug = compile_and_run_debug(src, "da_on_{getpid()}")
+    assert(debug.exit_code == 101, "exit {debug.exit_code}: {debug.err_out}")
+    assert_eq(debug.out, "checked\n")
+}
+
+fn hooked_src(call: Str) -> Str {
+    #"fn report(p: PanicInfo) -> Never ! IO.Print, Env.Exit {
+    io.println(p.message)
+    io.println(p.file)
+    match p.line {
+        Some(n) => io.println("line {n}")
+        None => io.println("no line")
+    }
+    env.exit(70)
+}
+
+fn main() ! IO, Env {
+    with on_panic(report) {
+        let n = 3
+"#.concat("        {call}\n").concat(#"        io.println("after")
+    }
+}
+"#)
+}
+
+test "the hook gets a failed debug_assert at its call" {
+    let tag = "da_hook_{getpid()}"
+    let r = compile_and_run_debug(hooked_src("debug_assert(n > 5)"), tag)
+    assert(r.exit_code == 70, "exit {r.exit_code}: {r.out}{r.err_out}")
+    assert_eq(r.err_out, "")
+    let lines = r.out.split("\n")
+    assert_eq(lines.get(0).unwrap(), "assertion failed: debug_assert(n > 5)")
+    assert(lines.get(1).unwrap().ends_with("/{tag}.bl"), r.out)
+    assert_eq(lines.get(2).unwrap(), "line 14")
+}
+
+test "the hook's message holds the message of a failed debug_assert" {
+    let tag = "da_hook_msg_{getpid()}"
+    let r = compile_and_run_debug(hooked_src(#"debug_assert(n > 5, "n is small")"#), tag)
+    assert(r.exit_code == 70, "exit {r.exit_code}: {r.out}{r.err_out}")
+    let first = r.out.split("\n").get(0).unwrap()
+    assert(first.starts_with("assertion failed: debug_assert(n > 5)"), r.out)
+    assert(first.contains("n is small"), r.out)
+}
+
+test "in a test a failed debug_assert fails that test as an assert and the next test runs" {
+    let src = #"test "u" {
+    let n = 3
+    debug_assert(n > 5)
+}
+
+test "next" {
+    assert_eq(1 + 1, 2)
+}
+"#
+    let r = compile_and_run_test_json_debug(src, "da_in_test_{getpid()}")
+    assert(r.out.contains(#""name":"u","status":"failed""#), r.out)
+    assert(r.out.contains(#""cause":"assertion""#), r.out)
+    assert(r.out.contains(#""assertion":"debug_assert(n > 5)""#), r.out)
+    assert(r.out.contains(#""name":"next","status":"passed""#), r.out)
+}
