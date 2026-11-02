@@ -2,7 +2,7 @@
 // hook gets it. The site is the line in the std body, because a panic() in a std function keeps
 // its own site. The test does not pin that line number.
 
-import compile_test_helpers.{compile_and_run}
+import compile_test_helpers.{compile_and_run, RunResult}
 
 fn cut_src(main_body: Str) -> Str {
     #"fn cut() -> Int {
@@ -43,4 +43,45 @@ test "with no hook the cut exits 101 and names a site" {
     assert(r.exit_code == 101, "exit {r.exit_code}: {r.err_out}")
     assert(r.err_out.contains("Str.byte_index_of from=1 is inside "), r.err_out)
     assert(r.err_out.contains("str.bl:"), r.err_out)
+}
+
+// fs.read, env.var and process output pass on bytes with no UTF-8 check, so byte 0 can be a
+// continuation byte, and a negative `from` searches from byte 0.
+fn leading_cut_src(from: Int) -> Str {
+    #"@ffi("memset", header: "string.h")
+@trusted(audit: "TEST-LEADING-CUT")
+fn poke(s: Str, c: I32, n: Int) ! () {}
+
+fn report(p: PanicInfo) -> Never ! IO.Eprint, Env.Exit {
+    let at = match p.line {
+        Some(n) => "line {n} of {p.file}"
+        None => "no line in {p.file}"
+    }
+    io.eprintln("fatal: {p.message} at {at}")
+    env.exit(70)
+}
+
+fn main() ! IO, Env {
+    let s = "abc".concat("def")
+    poke(s, 128.to_i32(), 1)
+    with on_panic(report) {
+        io.println("{s.byte_index_of("x", FROM) ?? 0}")
+    }
+}
+"#.replace("FROM", "{from}")
+}
+
+fn expect_leading_cut_site(r: RunResult) {
+    assert(r.exit_code == 70, "exit {r.exit_code}: {r.err_out}")
+    assert(r.err_out.starts_with("fatal: Str.byte_index_of from=0 is inside "), r.err_out)
+    assert(r.err_out.contains(" at line "), r.err_out)
+    assert(!r.err_out.contains("blink: "), r.err_out)
+}
+
+test "a continuation byte at byte 0 reaches the hook with a site" {
+    expect_leading_cut_site(compile_and_run(leading_cut_src(0), "cut_lead_{getpid()}"))
+}
+
+test "a negative from at a continuation byte 0 reaches the hook with a site" {
+    expect_leading_cut_site(compile_and_run(leading_cut_src(-1), "cut_lead_neg_{getpid()}"))
 }
