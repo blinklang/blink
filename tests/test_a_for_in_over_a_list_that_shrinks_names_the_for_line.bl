@@ -1,0 +1,181 @@
+// A loop reads the length of a list once, so a body that shrinks the list makes a later turn
+// read past the end. That is a fault Blink code causes, so it reaches the hook with the line
+// of the loop (sections/02_syntax.md §2.20). `contains` and `index_of` walk the same way, and
+// an element's written Eq can shrink the list they walk through an alias.
+
+import compile_test_helpers.{compile_and_run}
+
+fn report_src() -> Str {
+    #"fn report(p: PanicInfo) -> Never ! IO.Eprint, Env.Exit {
+    let at = match p.line {
+        Some(n) => "{p.file}:{n}"
+        None => p.file
+    }
+    io.eprintln("fatal: {p.message} at {at}")
+    env.exit(70)
+}
+"#
+}
+
+fn expect_site(body: Str, tag: Str, line: Int) ! FS.Delete, FS.Write, Process.Spawn, FS.Read, Env.Read {
+    let r = compile_and_run(report_src().concat(body), tag)
+    assert(r.exit_code == 70, "exit {r.exit_code}: {r.err_out}")
+    assert(r.err_out.starts_with("fatal: list index out of bounds: "), r.err_out)
+    assert(r.err_out.ends_with("/{tag}.bl:{line}\n"), r.err_out)
+}
+
+test "a body that shrinks the list reaches the hook with the line of the for" {
+    expect_site(#"
+fn main() ! IO, Env {
+    with on_panic(report) {
+        let mut xs = [1, 2, 3]
+        for x in xs {
+            let _ = xs.pop()
+            let _ = xs.pop()
+            io.println("{x}")
+        }
+    }
+}
+"#, "shrink_hook_{getpid()}", 13)
+}
+
+test "the shrink names the for line when the loop binds a tuple pattern" {
+    expect_site(#"
+fn main() ! IO, Env {
+    with on_panic(report) {
+        let mut xs = [(1, 2), (3, 4), (5, 6)]
+        for (a, b) in xs {
+            xs.clear()
+            io.println("{a} {b}")
+        }
+    }
+}
+"#, "shrink_tuple_{getpid()}", 13)
+}
+
+test "the shrink names the for line inside a closure" {
+    expect_site(#"
+fn main() ! IO, Env {
+    with on_panic(report) {
+        let walk = fn(xs: List[Str]) {
+            for x in xs {
+                xs.clear()
+                io.println(x)
+            }
+        }
+        walk(["a", "b"])
+    }
+}
+"#, "shrink_closure_{getpid()}", 13)
+}
+
+test "the shrink names the for line in a generic function" {
+    expect_site(#"
+fn walk[T](xs: List[T]) -> Int {
+    let mut n = 0
+    for _x in xs {
+        xs.clear()
+        n += 1
+    }
+    n
+}
+
+fn main() ! IO, Env {
+    with on_panic(report) {
+        io.println("{walk([1, 2])}")
+    }
+}
+"#, "shrink_generic_{getpid()}", 12)
+}
+
+test "with no hook the report has no lead-in, names the for line and exits 101" {
+    let tag = "shrink_nohook_{getpid()}"
+    let r = compile_and_run(#"fn main() ! IO {
+    let mut xs = [1, 2]
+    for x in xs {
+        xs.clear()
+        io.println("{x}")
+    }
+}
+"#, tag)
+    assert(r.exit_code == 101, "exit {r.exit_code}: {r.err_out}")
+    assert(r.err_out.contains("list index out of bounds: "), r.err_out)
+    assert(r.err_out.contains("/{tag}.bl:3"), r.err_out)
+    assert(!r.err_out.contains("blink: "), r.err_out)
+}
+
+test "assert_panics catches the shrink" {
+    assert_panics {
+        let mut xs = [1, 2, 3]
+        for x in xs {
+            xs.clear()
+            assert(x == 1, "the second turn must panic before this line")
+        }
+    }
+}
+
+test "a body that grows the list keeps the turn count the loop started with" {
+    let mut xs = [1, 2, 3]
+    let mut turns = 0
+    for x in xs {
+        xs.push(x)
+        turns += 1
+    }
+    assert_eq(turns, 3)
+    assert_eq(xs.len(), 6)
+}
+
+test "a body that shrinks on the last turn has no fault" {
+    let mut xs = [1, 2, 3]
+    let mut turns = 0
+    for _x in xs {
+        turns += 1
+        if turns == 3 {
+            xs.clear()
+        }
+    }
+    assert_eq(turns, 3)
+}
+
+fn shrinking_eq_src() -> Str {
+    #"
+type W { n: Int, l: List[W] }
+
+impl Eq for W {
+    fn eq(self, _other: W) -> Bool {
+        self.l.clear()
+        false
+    }
+}
+
+"#
+}
+
+test "contains names its own line when an element's Eq shrinks the list" {
+    expect_site(shrinking_eq_src().concat(#"fn main() ! IO, Env {
+    with on_panic(report) {
+        let mut xs: List[W] = []
+        let a = W { n: 1, l: xs }
+        xs.push(a)
+        xs.push(a)
+        let probe = W { n: 2, l: xs }
+        io.println("{xs.contains(probe)}")
+    }
+}
+"#), "shrink_contains_{getpid()}", 26)
+}
+
+test "index_of names its own line when an element's Eq shrinks the list" {
+    expect_site(shrinking_eq_src().concat(#"fn main() ! IO, Env {
+    with on_panic(report) {
+        let mut xs: List[W] = []
+        let a = W { n: 1, l: xs }
+        xs.push(a)
+        xs.push(a)
+        let probe = W { n: 2, l: xs }
+        let at = xs.index_of(probe)
+        io.println("{at.is_some()}")
+    }
+}
+"#), "shrink_index_of_{getpid()}", 26)
+}

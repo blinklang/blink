@@ -4602,6 +4602,14 @@ fn cc_key_arg(node: Int, plan: KeyPlan, written: Int) -> Int ! Diag.Report {
 
 // ── Element scans ─────────────────────────────────────────────────────────
 
+// An element's written Eq can shrink the list through an alias, past the length the scan
+// holds, so the read names the call.
+fn cc_scan_read(node: Int, elem: Int, list: Int, idx: Int) -> Int ! Diag.Report {
+    let site = x_site_args(node)
+    if site.len() == 0 { return -1 }
+    cg_call_element_from_runtime(node, elem, c_runtime_helper("list_get_at"), [list, idx].append(site))
+}
+
 // `xs.contains(x)` and `xs.index_of(x)`: a loop over the elements that reads and compares
 // one per turn by the element type's own `==`, stopping the first time it answers true.
 // The receiver, its length and the index are each bound once ahead of the loop, as
@@ -4667,8 +4675,8 @@ fn cc_element_scan(node: Int, container: Int) -> Int ! Diag.Report {
     // turn, since a fresh element is read every turn; drained here, it lands inside the loop
     // body rather than ahead of the loop.
     let turn_mark = cg_expr_pending_count()
-    let read = cg_call_element_from_runtime(node, elem, c_runtime_helper("list_get"),
-        [cc_temp_ref(node, container, recv_rec, recv_name), cc_temp_ref(node, TYPE_INT, idx_rec, idx_name)])
+    let read = cc_scan_read(node, elem, cc_temp_ref(node, container, recv_rec, recv_name),
+        cc_temp_ref(node, TYPE_INT, idx_rec, idx_name))
     if read < 0 { return -1 }
     let hit = cc_values_equal(node, elem, read, cc_temp_ref(node, elem, elem_rec, needle_name))
     if hit < 0 { return -1 }
@@ -6693,6 +6701,8 @@ pub type ForInIteration {
     strategy: ForInStrategy
     len_symbol: Str
     get_symbol: Str
+    // Whether get_symbol takes the file and line of the loop: a body can shrink what it walks.
+    get_takes_site: Bool
     materialize_symbol: Str
     pair_symbol: Str
     recv_symbol: Str
@@ -6705,13 +6715,13 @@ pub type ForInIteration {
 // field back as "" and a tid field back as unspellable rather than an answer that merely
 // looks empty by coincidence.
 fn cc_for_in_refused() -> ForInIteration {
-    ForInIteration { strategy: ForInStrategy.Indexed, len_symbol: "", get_symbol: "",
+    ForInIteration { strategy: ForInStrategy.Indexed, len_symbol: "", get_symbol: "", get_takes_site: false,
         materialize_symbol: "", pair_symbol: "", recv_symbol: "", step_symbol: "", element_tid: -1 }
 }
 
-fn cc_for_in_indexed(len_op: Str, get_op: Str, elem: Int) -> ForInIteration {
+fn cc_for_in_indexed(len_op: Str, get_op: Str, get_takes_site: Bool, elem: Int) -> ForInIteration {
     ForInIteration { strategy: ForInStrategy.Indexed,
-        len_symbol: c_runtime_helper(len_op), get_symbol: c_runtime_helper(get_op),
+        len_symbol: c_runtime_helper(len_op), get_symbol: c_runtime_helper(get_op), get_takes_site: get_takes_site,
         materialize_symbol: "", pair_symbol: "", recv_symbol: "", step_symbol: "",
         element_tid: elem }
 }
@@ -6719,24 +6729,24 @@ fn cc_for_in_indexed(len_op: Str, get_op: Str, elem: Int) -> ForInIteration {
 fn cc_for_in_materialized(materialize_op: Str, pair_op: Str, elem: Int) -> ForInIteration {
     let pair = if pair_op == "" { "" } else { c_runtime_helper(pair_op) }
     ForInIteration { strategy: ForInStrategy.Materialized,
-        len_symbol: c_runtime_helper("list_len"), get_symbol: c_runtime_helper("list_get"),
+        len_symbol: c_runtime_helper("list_len"), get_symbol: c_runtime_helper("list_get"), get_takes_site: false,
         materialize_symbol: c_runtime_helper(materialize_op), pair_symbol: pair,
         recv_symbol: "", step_symbol: "", element_tid: elem }
 }
 
 fn cc_for_in_drained(recv_op: Str, elem: Int) -> ForInIteration {
-    ForInIteration { strategy: ForInStrategy.Drained, len_symbol: "", get_symbol: "",
+    ForInIteration { strategy: ForInStrategy.Drained, len_symbol: "", get_symbol: "", get_takes_site: false,
         materialize_symbol: "", pair_symbol: "", recv_symbol: c_runtime_helper(recv_op),
         step_symbol: "", element_tid: elem }
 }
 
 fn cc_for_in_cursor(elem: Int) -> ForInIteration {
-    ForInIteration { strategy: ForInStrategy.Cursor, len_symbol: "", get_symbol: "",
+    ForInIteration { strategy: ForInStrategy.Cursor, len_symbol: "", get_symbol: "", get_takes_site: false,
         materialize_symbol: "", pair_symbol: "", recv_symbol: "", step_symbol: "", element_tid: elem }
 }
 
 fn cc_for_in_stepped(step_op: Str, elem: Int) -> ForInIteration {
-    ForInIteration { strategy: ForInStrategy.Stepped, len_symbol: "", get_symbol: "",
+    ForInIteration { strategy: ForInStrategy.Stepped, len_symbol: "", get_symbol: "", get_takes_site: false,
         materialize_symbol: "", pair_symbol: "", recv_symbol: "",
         step_symbol: c_runtime_helper(step_op), element_tid: elem }
 }
@@ -6769,8 +6779,8 @@ pub fn for_in_iteration_of(iterable_tid: Int, node: Int) -> ForInIteration ! Dia
     // arm (Map's freshly interned pair tuple, Str, Bytes' TYPE_U8 constant) is already
     // canonical, so resolving again is a no-op for them.
     let elem = tc_resolve(tc_tid_iter_elem(tid))
-    if kind == TyKind.List { return cc_for_in_indexed("list_len", "list_get", elem) }
-    if kind == TyKind.Bytes { return cc_for_in_indexed("bytes_len", "bytes_get", elem) }
+    if kind == TyKind.List { return cc_for_in_indexed("list_len", "list_get_at", true, elem) }
+    if kind == TyKind.Bytes { return cc_for_in_indexed("bytes_len", "bytes_get", false, elem) }
     if kind == TyKind.Set { return cc_for_in_materialized("set_to_list", "", elem) }
     if kind == TyKind.Map { return cc_for_in_materialized("map_keys", "map_values", elem) }
     if kind == TyKind.Channel { return cc_for_in_drained(channel_recv_op, elem) }

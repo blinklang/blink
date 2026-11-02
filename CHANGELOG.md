@@ -93,6 +93,7 @@ Single source of truth for release history. `blink llms` and `blink llms --full`
 
 ## Fixes (v0.59.0)
 
+- **A list that shrinks under a walk names the walk.** A `for` body that shrinks the list it walks, or an element's `Eq` that shrinks the list `contains` or `index_of` walks, now panics with the file and line of the `for` or the call. The panic reaches the panic hook and `assert_panics`, and its text has no `blink: ` lead-in. A list that grows under a `for` keeps the turn count the loop started with.
 - **A failed read of standard input names the call.** An OS read error or invalid UTF-8 in `io.read_line`, `io.read_all` or `io.read_bytes` is now a panic with the file and line of the read call, and the panic hook runs for it. A read in a closure, in a fn value or through `default.` in a handler clause names its own line.
 - **A count below one for `io.read_bytes` names the call.** It is now a panic with the file and line of the `io.read_bytes` call, on a direct call, in a closure, in a fn value and through `default.read_bytes` in a handler clause. The panic hook runs for it.
 - **A fn in another module no longer hides a built-in namespace such as `env`, `process` or `trace`.** With `import a`, a `pub fn env` in `a` left `env.var` an error in the importer, and a private `fn process` in a file hid `process.run` in each module that file imports. Now a binding hides a namespace only in its own scope: the module that declares it, or a file that selects it.

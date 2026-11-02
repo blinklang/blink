@@ -1159,11 +1159,26 @@ BLINK_RT_FN void blink_list_index_oob(int64_t index, int64_t len) {
 }
 #endif
 
+/* A walk that read the length once can run past a list its own body shrank. */
+BLINK_RT_FN void blink_list_index_oob_at(int64_t index, int64_t len, const char* file, int64_t line);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void blink_list_index_oob_at(int64_t index, int64_t len, const char* file, int64_t line) {
+    __blink_panic_dispatchf_at(file, line, "list index out of bounds: idx=%lld len=%lld", (long long)index, (long long)len);
+}
+#endif
+
 /* Inline in every TU, archive or not: under the archive an extern call here cost every
    list index in a program a call it could not inline. */
 static inline void* blink_list_get(const blink_list* l, int64_t index) {
     if (__builtin_expect(index < 0 || index >= l->len, 0)) {
         blink_list_index_oob(index, l->len);
+    }
+    return l->items[index];
+}
+
+static inline void* blink_list_get_at(const blink_list* l, int64_t index, const char* file, int64_t line) {
+    if (__builtin_expect(index < 0 || index >= l->len, 0)) {
+        blink_list_index_oob_at(index, l->len, file, line);
     }
     return l->items[index];
 }
