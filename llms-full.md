@@ -1740,7 +1740,7 @@ build/blink build src/main.bl --strict
 
 ### Runtime Execution Tracing (`--trace`)
 
-Writes NDJSON to stderr: one line for each function enter and exit, `let mut` change and effect operation. A program that is not built with `--trace` has no trace code.
+Writes NDJSON to stderr: one line for each function enter and exit, `let mut` change and effect operation. In a program that is not built with `--trace`, user code has no trace code, and an effect operation called from std code reads one flag.
 
 ```sh
 # Trace everything
