@@ -34,7 +34,7 @@ import diagnostics.{
     UNSOLVED_TYPEVAR_AT_CODEGEN, SEALED_OPS_REWRITE_INVARIANT, VARIANT_WITHOUT_ENUM,
     NO_SUCH_VARIANT, TYPE_ERROR, TEMPLATE_MISMATCH, UNEXPECTED_ANNOTATION, MISSING_RETURN, NO_CONVERSION_IMPL, CANNOT_INFER_TYPE, NOT_ITERABLE, MISSING_ELSE, UNLICENSED_SELF_OP, TRAIT_BOUND_NOT_SATISFIED, CAPABILITY_BUDGET, QM_INVALID_OPERAND, UNDEFINED_FUNCTION,
     UNRESOLVED_METHOD, AMBIGUOUS_METHOD_CALL, MISSING_DISPLAY_IMPL,
-    MUTATION_REQUIRES_MUT, MUT_ON_PATTERN, NOT_A_PLACE, PARAM_ASSIGN, diag_error_label_at_notes, diag_error_span_label_at_notes, diag_warn_label_at_notes, EMPTY_ROW_OUTSIDE_FFI, PANIC_HOOK_PLACEMENT, EFFECTS_ANNOTATION_REMOVED, UNKNOWN_EFFECT, diag_fix_before_starts_with, diag_drop_fix_over_others, diag_drop_fix_at,
+    MUTATION_REQUIRES_MUT, MUT_ON_PATTERN, NOT_A_PLACE, PARAM_ASSIGN, diag_error_label_at_notes, diag_error_span_label_at_notes, diag_warn_label_at_notes, EMPTY_ROW_OUTSIDE_FFI, PANIC_HOOK_PLACEMENT, TRACE_MESSAGE_EFFECT, EFFECTS_ANNOTATION_REMOVED, UNKNOWN_EFFECT, diag_fix_before_starts_with, diag_drop_fix_over_others, diag_drop_fix_at,
     UNDEFINED_VARIABLE, UNKNOWN_TYPE, QM_RESULT_IN_NON_RESULT,
     QM_OPTION_IN_NON_OPTION, QM_ERROR_MISMATCH,
     QM_TEST_DISPLAY_REQUIRED, TEST_ANNOTATED_RETURN, SKIP_OUTSIDE_TEST,
@@ -28815,6 +28815,7 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
             // is_intrinsic_method already restricts the namespace. nr_is_defined keeps a
             // local that shadows the namespace spelling on its own receiver-typed arm.
             if nr_receiver_is_defined(obj_name) == 0 && is_intrinsic_method(obj_name, method) != 0 && tc_ns_call_reads_module(obj_name) == 0 {
+                if obj_name == "trace" && method == "log" { tc_intrinsic_calls.insert(node, INTRINSIC_TRACE_LOG) }
                 let surface_root = builtin_op_root_of_handle(obj_name)
                 if surface_root != "" && builtin_op_surface_fn(surface_root, method) != "" {
                     let surface_ret = tc_infer_builtin_surface_call(node, surface_root, obj_name, method)
@@ -31312,10 +31313,12 @@ let mut tc_fn_ensures: Map[Int, List[Int]] = Map()
 
 // The calls the typecheck read as a compiler intrinsic, keyed by the call node, with the
 // intrinsic as the value. Codegen lowers exactly these, so a call to a user fn named `old`,
-// `range_bounds` or `on_panic` is never read as the intrinsic.
+// `range_bounds` or `on_panic` is never read as the intrinsic. tc_check_trace_messages
+// checks the `msg` of each `trace.log`.
 let INTRINSIC_OLD = 1
 let INTRINSIC_RANGE_BOUNDS = 2
 let INTRINSIC_ON_PANIC = 3
+let INTRINSIC_TRACE_LOG = 4
 let mut tc_intrinsic_calls: Map[Int, Int] = Map()
 
 pub fn tc_requires_preds_of(fn_node: Int) -> List[Int] {
@@ -31853,6 +31856,182 @@ fn tc_ph_check_item(item: Int, ctx: Int, first: List[Int]) ! Diag.Report {
         diag_error_label_at_notes("PanicHookPlacement", PANIC_HOOK_PLACEMENT, PANIC_HOOK_SECOND, at, PANIC_HOOK_SECOND, "a program has at most one hook; remove this one", [])
         diag_add_label_since(before, node_line(prev), node_col(prev), node_col(prev) + "on_panic".byte_len(), "the hook `main` installs first")
     }
+}
+
+// ── The `msg` of trace.log ──────────────────────────────────────────
+
+const TRACE_MESSAGE_HELP = "compute the value before the `trace.log` call, and read it in `msg`"
+
+// `msg` runs only when its channel is on, so it may only read state: a write, a call of a fn
+// with a row and a handler operation in it are E0566 (§8.15.7). The check runs over every
+// `trace.log` that typecheck typed, so `main`, test blocks and closures are covered too.
+fn tc_check_trace_messages() ! TypeCheck.Resolve, Diag.Report {
+    let mut calls: List[Int] = []
+    for (call, kind) in tc_intrinsic_calls {
+        if kind == INTRINSIC_TRACE_LOG { calls.push(call) }
+    }
+    let mut kids: List[Int] = []
+    for call in calls.sort() {
+        if !tc_call_is_trace_log(call) { continue }
+        let args = node_args(call)
+        if args == -1 || sublist_length(args) != 2 { continue }
+        let mut msg = sublist_get(args, 1)
+        if node_kind(msg) == NodeKind.NamedArg { msg = node_value(msg) }
+        let mut inside: Set[Int] = Set()
+        tc_tm_collect(msg, inside, kids)
+        tc_tm_walk(msg, inside, kids)
+    }
+}
+
+// The nodes of `msg`, so a write can tell a binding `msg` declares from one outside it.
+fn tc_tm_collect(node: Int, inside: Set[Int], kids: List[Int]) {
+    if node < 0 { return }
+    inside.insert(node)
+    let base = kids.len()
+    node_push_value_child_ids(node, kids)
+    let end = kids.len()
+    let mut i = base
+    while i < end {
+        tc_tm_collect(kids.get(i).unwrap(), inside, kids)
+        i = i + 1
+    }
+    while kids.len() > base {
+        let _ = kids.pop()
+    }
+}
+
+fn tc_tm_walk(node: Int, inside: Set[Int], kids: List[Int]) ! TypeCheck.Resolve, Diag.Report {
+    if node < 0 { return }
+    let k = node_kind(node)
+    // A nested fn runs only when called, and the call is what this walk checks.
+    if k == NodeKind.FnDef { return }
+    // The `msg` of a nested trace.log gets a check of its own.
+    if k == NodeKind.MethodCall && tc_call_is_trace_log(node) {
+        let args = node_args(node)
+        if args != -1 && sublist_length(args) > 0 { tc_tm_walk(sublist_get(args, 0), inside, kids) }
+        return
+    }
+    if k == NodeKind.Call || k == NodeKind.MethodCall { tc_tm_check_call(node, inside) }
+    if k == NodeKind.Assignment || k == NodeKind.CompoundAssign {
+        let shown = tc_tm_written_outside(node_target(node), inside)
+        if shown != "" { tc_tm_report(node, "`msg` writes `{shown}`", []) }
+    }
+    let base = kids.len()
+    node_push_value_child_ids(node, kids)
+    let end = kids.len()
+    let mut i = base
+    while i < end {
+        tc_tm_walk(kids.get(i).unwrap(), inside, kids)
+        i = i + 1
+    }
+    while kids.len() > base {
+        let _ = kids.pop()
+    }
+}
+
+fn tc_tm_report(site: Int, message: Str, notes: List[Str]) ! Diag.Report {
+    diag_error_label_at_notes("TraceMessageEffect", TRACE_MESSAGE_EFFECT, message, site, message, TRACE_MESSAGE_HELP, notes)
+}
+
+fn tc_tm_check_call(node: Int, inside: Set[Int]) ! TypeCheck.Resolve, Diag.Report {
+    let op = tc_tm_handler_op(node)
+    if op != "" {
+        tc_tm_report(node, "`msg` calls `{op}`, a handler operation", [])
+        return
+    }
+    let decl = tc_call_decl_node(node)
+    if decl >= 0 {
+        let row = tc_tm_call_row(node, decl)
+        if row.len() > 0 {
+            tc_tm_report(node, "`msg` calls `{node_name(decl)}`, which has a row", ["`{node_name(decl)}` has the row `! {row.join(", ")}`"])
+            return
+        }
+    }
+    if node_kind(node) == NodeKind.MethodCall && tc_tm_call_writes_receiver(node, decl) {
+        let shown = tc_tm_written_outside(node_obj(node), inside)
+        if shown != "" { tc_tm_report(node, "`msg` writes `{shown}`", []) }
+    }
+}
+
+// The operation a call performs through a handler, as the source spells it, or "": an
+// operation of a user effect, a built-in operation through `default`, or a call of a built-in
+// namespace such as `env.cwd()`.
+fn tc_tm_handler_op(node: Int) -> Str {
+    let shown = if node_kind(node) == NodeKind.MethodCall && node_kind(node_obj(node)) == NodeKind.Ident {
+        "{node_name(node_obj(node))}.{node_method(node)}"
+    } else if node_kind(node) == NodeKind.Call {
+        node_name(node_left(node))
+    } else {
+        ""
+    }
+    if tc_call_user_effect(node) >= 0 || tc_call_builtin_default(node) >= 0 { return shown }
+    if node_kind(node) != NodeKind.MethodCall { return "" }
+    let obj = node_obj(node)
+    if node_kind(obj) != NodeKind.Ident || tc_ident_binder_node(obj) >= 0 || tc_global_decl_node(obj) >= 0 { return "" }
+    if tc_mc_obj_is_value(node) != 0 || tc_namespace_call_reads_module(node) { return "" }
+    let ns = node_name(obj)
+    // `ffi.scope` opens an arena, which is the FFI row, not a handler.
+    if ns == "trace" || ns == "ffi" || is_intrinsic_method(ns, node_method(node)) == 0 { return "" }
+    shown
+}
+
+// The row a call runs: the callee's declared row, with `_` read off this call's instance and
+// FFI kept, since an FFI call is no read of state either.
+fn tc_tm_call_row(node: Int, decl: Int) -> List[Str] ! TypeCheck.Resolve, Diag.Report {
+    let mut out: List[Str] = []
+    let block = tc_method_block.get(decl) ?? -1
+    if block != -1 && node_kind(block) == NodeKind.TraitDef {
+        let recv = tc_er_call_receiver(node)
+        if recv >= 0 && tc_tid_kind(recv) != TyKind.Typevar { return tc_er_impl_row(recv, decl, 0) }
+        return tc_er_fn_row(decl)
+    }
+    let idx = fnsig_by_decl.get(decl) ?? -1
+    if idx < 0 { return tc_er_fn_row(decl) }
+    let fs = fnsig_pool.get(idx).unwrap()
+    let mut i = 0
+    while i < fs.effects_count {
+        let req = fnsig_effect_names.get(fs.effects_start + i).unwrap()
+        if req == "_" {
+            for w in tc_er_wild_row(decl, tc_er_call_binds(node, decl), 0) {
+                if !out.contains(w) { out.push(w) }
+            }
+        } else if !out.contains(req) {
+            out.push(req)
+        }
+        i = i + 1
+    }
+    out
+}
+
+// Whether a method call changes its receiver: a `mut self` method, or a builtin row that
+// declares `mut self`.
+fn tc_tm_call_writes_receiver(node: Int, decl: Int) -> Bool ! TypeCheck.Resolve {
+    if decl >= 0 { return tc_decl_has_mut_self(decl) }
+    let t = resolve_alias_tid(tc_resolve(tc_lookup_node_tid(node_obj(node))))
+    t >= 0 && tc_builtin_method_writes_receiver(tc_tid_kind(t), node_method(node))
+}
+
+// The binding a write to `place` changes, as the source names it, when `msg` does not declare
+// it; "" for a binding of `msg`'s own or a place that is no binding.
+fn tc_tm_written_outside(place: Int, inside: Set[Int]) -> Str {
+    let mut root = place
+    while node_kind(root) == NodeKind.FieldAccess || node_kind(root) == NodeKind.IndexExpr {
+        if node_kind(root) == NodeKind.FieldAccess {
+            match tc_module_global_decl(root) {
+                Some(_) => return node_name(root)
+                None => {}
+            }
+        }
+        root = node_obj(root)
+    }
+    if root < 0 || node_kind(root) != NodeKind.Ident { return "" }
+    let binder = tc_ident_binder_node(root)
+    if binder >= 0 {
+        if inside.contains(binder) { return "" }
+        return node_name(root)
+    }
+    if tc_global_decl_node(root) >= 0 { return node_name(root) }
+    ""
 }
 
 // A type parameter is a scoped value when a bound says so. Every active frame of its binder
@@ -35542,6 +35721,7 @@ fn tc_infer_program_body(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Di
 
     tc_check_effect_rows(program)
     tc_check_panic_hook_placement(program)
+    tc_check_trace_messages()
     nr_pop_scope()
     // Last: every constraining use in the program has now run, so a deferred alias blame
     // whose metavar is still unbound is genuinely under-determined. A deferred conversion
@@ -37977,6 +38157,13 @@ fn tc_er_walk(program: Int, node: Int, held: List[Str], owner: ErOwner, kids: Li
                 i = i + 1
             }
         }
+    }
+    // `msg` may only read state, which tc_check_trace_messages checks, so no call in it
+    // charges the enclosing row (§8.15.7).
+    if k == NodeKind.MethodCall && tc_call_is_trace_log(node) {
+        let args = node_args(node)
+        if args != -1 && sublist_length(args) > 0 { tc_er_walk(program, sublist_get(args, 0), held, owner, kids) }
+        return
     }
     if k == NodeKind.Call || k == NodeKind.MethodCall { tc_er_check_call(program, node, held, owner) }
     if k == NodeKind.MethodCall { tc_er_check_helper_fix(program, node, held) }

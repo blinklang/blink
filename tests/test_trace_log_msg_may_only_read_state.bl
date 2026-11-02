@@ -1,0 +1,235 @@
+// `msg` of `trace.log` runs only when its channel is on, so it may only read state: a direct
+// read of a module `let` or `let mut`, and calls of fns with an empty row
+// (sections/06_tooling.md §8.15.7 *`msg` is lazy*). A write to state, a call of a fn that has a
+// row, and any handler operation in `msg` is TraceMessageEffect (E0566), with the primary span
+// on the offending expression.
+
+import compile_test_helpers.{check_via_cli, verify_catalog_entry}
+
+fn e0566_lines(out: Str) -> List[Str] {
+    let mut found: List[Str] = []
+    for line in out.split("\n") {
+        if line.contains("\"code\":\"E0566\"") { found.push(line) }
+    }
+    found
+}
+
+fn error_count(out: Str) -> Int {
+    let mut n = 0
+    for line in out.split("\n") {
+        if line.contains("\"severity\":\"error\"") { n = n + 1 }
+    }
+    n
+}
+
+// The one E0566 line, after a check that the report holds that error and no other.
+fn only_e0566(out: Str) -> Str {
+    let found = e0566_lines(out)
+    assert_eq(found.len(), 1)
+    assert_eq(error_count(out), 1)
+    found.get(0).unwrap()
+}
+
+fn primary_at(entry: Str, line: Int, col: Int) -> Bool {
+    entry.contains("\"line\":{line},\"col\":{col}")
+}
+
+test "blink explain E0566 names TraceMessageEffect" {
+    verify_catalog_entry("E0566", "TraceMessageEffect")
+}
+
+test "msg may read module bindings and call fns with an empty row" {
+    let src = #"let limit = 3
+let mut depth = 0
+
+fn twice(n: Int) -> Int { n * 2 }
+
+fn boom() -> Str {
+    panic("only when the channel is on")
+}
+
+fn show(f: fn() -> Int) -> Int {
+    trace.log("c", "f={f()}")
+    f()
+}
+
+fn walk(n: Int) -> Int {
+    trace.log("c", "limit={limit} depth={depth}")
+    trace.log("c", "twice={twice(depth)}")
+    trace.log("c", if depth > 0 { boom() } else { "none" })
+    trace.log("c", match n {
+        0 => "zero"
+        _ => "n={n + limit}"
+    })
+    trace.log("c", {
+        let pick = fn() { depth + 1 }
+        "pick={pick()}"
+    })
+    trace.log("outer", {
+        trace.log("inner", "depth={depth}")
+        "x"
+    })
+    n
+}
+
+fn main() {
+    depth = 1
+    let _ = walk(1)
+    let _ = show(fn() { 4 })
+}
+"#
+    let out = check_via_cli(src, "e0566_reads_ok_{getpid()}")
+    assert(!out.contains("\"severity\":\"error\""), out)
+}
+
+test "a handler operation in msg is E0566" {
+    let src = #"fn walk(n: Int) -> Int {
+    trace.log("walk", "dir={env.cwd()}")
+    n
+}
+
+fn main() {
+    let _ = walk(1)
+}
+"#
+    let e = only_e0566(check_via_cli(src, "e0566_env_cwd_{getpid()}"))
+    assert(primary_at(e, 2, 29), e)
+    assert(e.contains("`msg` calls `env.cwd`, a handler operation"), e)
+}
+
+test "a handler operation in msg is E0566 in main too" {
+    let src = #"fn main() ! IO {
+    trace.log("c", {
+        io.println("x")
+        "m"
+    })
+}
+"#
+    let e = only_e0566(check_via_cli(src, "e0566_io_main_{getpid()}"))
+    assert(primary_at(e, 3, 9), e)
+    assert(e.contains("`msg` calls `io.println`, a handler operation"), e)
+}
+
+test "an operation of a user effect in msg is E0566" {
+    let src = #"effect Metrics {
+    effect Emit {
+        fn count(name: Str, n: Int) -> Int
+    }
+}
+
+fn walk() -> Int ! Metrics.Emit {
+    trace.log("c", "n={metrics.count("w", 2)}")
+    1
+}
+
+fn main() {
+    let _ = walk()
+}
+"#
+    let out = check_via_cli(src, "e0566_user_op_{getpid()}")
+    let found = e0566_lines(out)
+    assert_eq(found.len(), 1)
+    let e = found.get(0).unwrap()
+    assert(primary_at(e, 8, 24), e)
+    assert(e.contains("a handler operation"), e)
+}
+
+test "a call of a fn with a row is E0566 and not E0500" {
+    let src = #"let mut depth = 0
+
+fn next_id() -> Int ! State {
+    depth
+}
+
+fn walk(n: Int) -> Int {
+    trace.log("walk", "next={next_id()}")
+    n
+}
+
+fn main() {
+    let _ = walk(1)
+}
+"#
+    let e = only_e0566(check_via_cli(src, "e0566_next_id_{getpid()}"))
+    assert(primary_at(e, 8, 30), e)
+    assert(e.contains("`msg` calls `next_id`, which has a row"), e)
+}
+
+test "a call of a method with a row is E0566" {
+    let src = #"type Probe { n: Int }
+
+trait Labeled {
+    fn label(self) -> Str ! IO
+}
+
+impl Labeled for Probe {
+    fn label(self) -> Str ! IO {
+        io.println("probe")
+        "p{self.n}"
+    }
+}
+
+fn walk(p: Probe) ! IO {
+    trace.log("c", "p={p.label()}")
+}
+
+fn main() ! IO {
+    walk(Probe { n: 1 })
+}
+"#
+    let e = only_e0566(check_via_cli(src, "e0566_method_row_{getpid()}"))
+    assert(e.contains("`msg` calls `label`, which has a row"), e)
+}
+
+test "a call of an ffi decl with the row FFI is E0566" {
+    let src = #"@ffi("c", "getpid")
+fn libc_getpid() -> I32 ! FFI
+
+fn walk() {
+    trace.log("c", "pid={libc_getpid()}")
+}
+
+fn main() {
+    walk()
+}
+"#
+    let e = only_e0566(check_via_cli(src, "e0566_ffi_row_{getpid()}"))
+    assert(primary_at(e, 5, 26), e)
+    assert(e.contains("`msg` calls `libc_getpid`, which has a row"), e)
+}
+
+test "a write to a module let mut in msg is E0566" {
+    let src = #"let mut depth = 0
+
+fn walk() {
+    trace.log("c", {
+        depth = 1
+        "x"
+    })
+}
+
+fn main() {
+    walk()
+}
+"#
+    let e = only_e0566(check_via_cli(src, "e0566_module_write_{getpid()}"))
+    assert(primary_at(e, 5, 9), e)
+    assert(e.contains("`msg` writes `depth`"), e)
+}
+
+test "a bad msg of a trace.log nested in msg is still E0566" {
+    let src = #"fn walk() {
+    trace.log("outer", {
+        trace.log("inner", "dir={env.cwd()}")
+        "x"
+    })
+}
+
+fn main() {
+    walk()
+}
+"#
+    let e = only_e0566(check_via_cli(src, "e0566_nested_{getpid()}"))
+    assert(primary_at(e, 3, 34), e)
+    assert(e.contains("`msg` calls `env.cwd`, a handler operation"), e)
+}
