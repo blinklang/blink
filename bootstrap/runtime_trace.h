@@ -110,11 +110,22 @@ BLINK_RT_FN char* blink_trace_trim_dup_for(const char* s, size_t n, const char* 
 }
 #endif
 
-/* blink_trace_trim_dup_for for an item of BLINK_TRACE. */
-BLINK_RT_FN char* blink_trace_trim_dup(const char* s, size_t n);
+/* The one item rule of §8.15.5 for every list a trace env var holds: split `v` on `sep`, trim
+   each item, skip an empty one, and hand the rest to `take`, which owns the copy. */
+BLINK_RT_FN void blink_trace_each_item(const char* v, char sep, const char* var,
+    void (*take)(char* item, void* ctx), void* ctx);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN char* blink_trace_trim_dup(const char* s, size_t n) {
-    return blink_trace_trim_dup_for(s, n, "BLINK_TRACE");
+BLINK_RT_FN void blink_trace_each_item(const char* v, char sep, const char* var,
+    void (*take)(char* item, void* ctx), void* ctx) {
+    const char* p = v;
+    for (;;) {
+        const char* end = strchr(p, sep);
+        size_t n = end ? (size_t)(end - p) : strlen(p);
+        char* item = blink_trace_trim_dup_for(p, n, var);
+        if (item) take(item, ctx);
+        if (!end) break;
+        p = end + 1;
+    }
 }
 #endif
 
@@ -140,6 +151,34 @@ BLINK_RT_FN int blink_trace_is_number(const char* v) {
 }
 #endif
 
+/* The filter one `key:v+v` item of BLINK_TRACE fills, and the item, for its errors. */
+typedef struct {
+    blink_trace_filter* f;
+    int cap;
+    const char* item;
+} blink_trace_value_ctx;
+
+/* Checks one `+` value of a BLINK_TRACE item and adds it to the item's filter. */
+BLINK_RT_FN void blink_trace_take_value(char* v, void* ctx);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void blink_trace_take_value(char* v, void* ctx) {
+    blink_trace_value_ctx* c = (blink_trace_value_ctx*)ctx;
+    const char* key = c->f->key;
+    if (strcmp(key, "depth") == 0 && !blink_trace_is_number(v)) {
+        blink_trace_bad_filter("depth is not a number:", v, c->item);
+    }
+    if (strcmp(key, "event") == 0 && !blink_trace_is_event_type(v)) {
+        blink_trace_bad_filter("unknown event type", v, c->item);
+    }
+    if (c->f->count == c->cap) {
+        c->cap = c->cap ? c->cap * 2 : 4;
+        c->f->values = (char**)realloc(c->f->values, (size_t)c->cap * sizeof(char*));
+        if (!c->f->values) { fputs("error: out of memory reading BLINK_TRACE\n", stderr); exit(2); }
+    }
+    c->f->values[c->f->count++] = v;
+}
+#endif
+
 /* Reads one trimmed `,` item of BLINK_TRACE into a filter, or exits on a bad one. */
 BLINK_RT_FN void blink_trace_parse_item(const char* item);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
@@ -158,29 +197,8 @@ BLINK_RT_FN void blink_trace_parse_item(const char* item) {
         blink_trace_bad_filter("unknown key", key, item);
     }
     blink_trace_filter f = { key, NULL, 0 };
-    int cap = 0;
-    const char* p = colon + 1;
-    for (;;) {
-        const char* end = strchr(p, '+');
-        size_t n = end ? (size_t)(end - p) : strlen(p);
-        char* v = blink_trace_trim_dup(p, n);
-        if (v) {
-            if (strcmp(key, "depth") == 0 && !blink_trace_is_number(v)) {
-                blink_trace_bad_filter("depth is not a number:", v, item);
-            }
-            if (strcmp(key, "event") == 0 && !blink_trace_is_event_type(v)) {
-                blink_trace_bad_filter("unknown event type", v, item);
-            }
-            if (f.count == cap) {
-                cap = cap ? cap * 2 : 4;
-                f.values = (char**)realloc(f.values, (size_t)cap * sizeof(char*));
-                if (!f.values) { fputs("error: out of memory reading BLINK_TRACE\n", stderr); exit(2); }
-            }
-            f.values[f.count++] = v;
-        }
-        if (!end) break;
-        p = end + 1;
-    }
+    blink_trace_value_ctx ctx = { &f, 0, item };
+    blink_trace_each_item(colon + 1, '+', "BLINK_TRACE", blink_trace_take_value, &ctx);
     if (f.count == 0) blink_trace_bad_filter("empty value", NULL, item);
     /* The items of `,` all must match (§8.15.5), so a second `event:` item narrows the set. */
     if (strcmp(key, "event") == 0) {
@@ -204,22 +222,21 @@ BLINK_RT_FN void blink_trace_parse_item(const char* item) {
 }
 #endif
 
+/* Reads one `,` item of BLINK_TRACE into a filter, then frees the copy. */
+BLINK_RT_FN void blink_trace_take_filter(char* item, void* ctx);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void blink_trace_take_filter(char* item, void* ctx) {
+    (void)ctx;
+    blink_trace_parse_item(item);
+    free(item);
+}
+#endif
+
 /* Reads the `,` items of a BLINK_TRACE value (§8.15.5); exits on a bad one (§8.15.12). */
 BLINK_RT_FN void blink_trace_parse_filters(const char* filter_str);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN void blink_trace_parse_filters(const char* filter_str) {
-    const char* p = filter_str;
-    for (;;) {
-        const char* end = strchr(p, ',');
-        size_t n = end ? (size_t)(end - p) : strlen(p);
-        char* item = blink_trace_trim_dup(p, n);
-        if (item) {
-            blink_trace_parse_item(item);
-            free(item);
-        }
-        if (!end) break;
-        p = end + 1;
-    }
+    blink_trace_each_item(filter_str, ',', "BLINK_TRACE", blink_trace_take_filter, NULL);
 }
 #endif
 

@@ -23,6 +23,30 @@ typedef struct {
 BLINK_UNUSED static blink_trace_channels_state __blink_trace_channels = {0};
 #endif
 
+/* Adds one item of BLINK_TRACE_CHANNELS; `ctx` is the capacity of the name list. */
+BLINK_RT_FN void blink_trace_take_channel(char* item, void* ctx);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void blink_trace_take_channel(char* item, void* ctx) {
+    int* cap = (int*)ctx;
+    if (strcmp(item, "all") == 0) {
+        __blink_trace_channels.all = 1;
+        free(item);
+        return;
+    }
+    if (__blink_trace_channels.count == *cap) {
+        *cap = *cap ? *cap * 2 : 4;
+        char** grown = (char**)realloc(__blink_trace_channels.names, (size_t)*cap * sizeof(char*));
+        if (!grown) { fputs("error: out of memory reading BLINK_TRACE_CHANNELS\n", stderr); exit(2); }
+        __blink_trace_channels.names = grown;
+        size_t* lens = (size_t*)realloc(__blink_trace_channels.lens, (size_t)*cap * sizeof(size_t));
+        if (!lens) { fputs("error: out of memory reading BLINK_TRACE_CHANNELS\n", stderr); exit(2); }
+        __blink_trace_channels.lens = lens;
+    }
+    __blink_trace_channels.lens[__blink_trace_channels.count] = strlen(item);
+    __blink_trace_channels.names[__blink_trace_channels.count++] = item;
+}
+#endif
+
 /* The items split on `,` only, unlike BLINK_TRACE, and `all` in any place turns on every
    channel. No value is an error. */
 BLINK_RT_FN void blink_trace_channels_init(void);
@@ -38,30 +62,7 @@ BLINK_RT_FN void blink_trace_channels_init(void) {
     const char* env = getenv("BLINK_TRACE_CHANNELS");
     if (!env) return;
     int cap = 0;
-    const char* p = env;
-    for (;;) {
-        const char* end = strchr(p, ',');
-        size_t n = end ? (size_t)(end - p) : strlen(p);
-        char* item = blink_trace_trim_dup_for(p, n, "BLINK_TRACE_CHANNELS");
-        if (item && strcmp(item, "all") == 0) {
-            __blink_trace_channels.all = 1;
-            free(item);
-        } else if (item) {
-            if (__blink_trace_channels.count == cap) {
-                cap = cap ? cap * 2 : 4;
-                char** grown = (char**)realloc(__blink_trace_channels.names, (size_t)cap * sizeof(char*));
-                if (!grown) { fputs("error: out of memory reading BLINK_TRACE_CHANNELS\n", stderr); exit(2); }
-                __blink_trace_channels.names = grown;
-                size_t* lens = (size_t*)realloc(__blink_trace_channels.lens, (size_t)cap * sizeof(size_t));
-                if (!lens) { fputs("error: out of memory reading BLINK_TRACE_CHANNELS\n", stderr); exit(2); }
-                __blink_trace_channels.lens = lens;
-            }
-            __blink_trace_channels.lens[__blink_trace_channels.count] = strlen(item);
-            __blink_trace_channels.names[__blink_trace_channels.count++] = item;
-        }
-        if (!end) break;
-        p = end + 1;
-    }
+    blink_trace_each_item(env, ',', "BLINK_TRACE_CHANNELS", blink_trace_take_channel, &cap);
 }
 #endif
 

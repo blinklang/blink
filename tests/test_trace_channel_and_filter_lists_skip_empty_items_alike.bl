@@ -1,0 +1,77 @@
+// BLINK_TRACE_CHANNELS and BLINK_TRACE read their `,` lists by one item rule (§8.15.5): each
+// item is trimmed of space and tab, and an empty item is skipped, at any place in the list. So
+// each list shape below turns on the one channel when it holds a channel, and sets the one
+// filter when it holds a filter.
+
+import compile_test_helpers
+
+let LOG_SRC = #"fn main() {
+    trace.log("mono", "m")
+    trace.log("walk", "w")
+}
+"#
+
+let FILTER_SRC = #"fn show() { }
+fn echo() { }
+fn main() {
+    show()
+    echo()
+}
+"#
+
+// Each shape holds one item, `X`, among empty and blank ones.
+let SHAPES = ["X", ",X", "X,", ",,X,,", " , X ", "\tX\t", "X, ,", " ,\t, X"]
+
+fn build(src: Str, stem: Str, flags: List[Str]) -> Str ! FS.Write, Process.Spawn, Env.Read {
+    let dir = "{compile_test_helpers.scratch_root()}/{stem}"
+    compile_test_helpers.sh("mkdir -p {dir}")
+    let path = "{dir}/{stem}.bl"
+    let bin = "{dir}/{stem}_bin"
+    fs.write(path, src).unwrap()
+    let mut args = ["build"]
+    for f in flags { args.push(f) }
+    args.push(path)
+    args.push("-o")
+    args.push(bin)
+    let b = process.run("build/blink", args).unwrap()
+    assert_eq(b.err_out, "")
+    assert(b.success())
+    bin
+}
+
+fn clean(stem: Str) ! Process.Spawn, Env.Read {
+    compile_test_helpers.sh("rm -rf {compile_test_helpers.scratch_root()}/{stem}")
+}
+
+// The stderr of one run with `var` set to `value`.
+fn stderr_with(bin: Str, var: Str, value: Str) -> Str ! Process.Spawn {
+    let r = process.run("env", ["-u", "BLINK_TRACE", "-u", "BLINK_TRACE_CHANNELS", "{var}={value}", bin]).unwrap()
+    assert(r.success(), r.err_out)
+    r.err_out
+}
+
+// The fn of each enter event, joined by a space.
+fn enters(text: Str) -> Str {
+    let mut names: List[Str] = []
+    for line in text.split("\n") {
+        if !line.contains("\"event\":\"enter\"") { continue }
+        let at = line.index_of("\"fn\":\"") ?? -1
+        assert(at >= 0)
+        let rest = line.substring(at + 6, line.len())
+        let end = rest.index_of("\"") ?? -1
+        assert(end >= 0)
+        names.push(rest.substring(0, end))
+    }
+    names.join(" ")
+}
+
+test "each list shape turns on one channel in BLINK_TRACE_CHANNELS and sets one filter in BLINK_TRACE" {
+    let log_bin = build(LOG_SRC, "trace_items_alike_log", [])
+    let filter_bin = build(FILTER_SRC, "trace_items_alike_filter", ["--trace"])
+    for shape in SHAPES {
+        assert_eq(stderr_with(log_bin, "BLINK_TRACE_CHANNELS", shape.replace("X", "mono")), "[trace:mono] m\n")
+        assert_eq(enters(stderr_with(filter_bin, "BLINK_TRACE", shape.replace("X", "fn:show"))), "trace_items_alike_filter.show")
+    }
+    clean("trace_items_alike_log")
+    clean("trace_items_alike_filter")
+}
