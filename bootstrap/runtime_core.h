@@ -779,13 +779,17 @@ static inline int64_t blink_str_cp_len(const char* s) {
     if (n <= BLINK_STR_CPS_CHECK_MAX) {
         int64_t walked = blink_str_count_cps(s, n);
         if (walked != cps) {
-            __blink_panic_dispatchf("blink: internal error: a Str records %lld codepoints but holds %lld",
-                                    (long long)cps, (long long)walked);
+            char msg[128];
+            snprintf(msg, sizeof msg, "blink: internal error: a Str records %lld codepoints but holds %lld",
+                     (long long)cps, (long long)walked);
+            __blink_fatal(msg);
         }
     } else if (cps > n || cps * 4 < n) {
         /* A codepoint is 1 to 4 bytes, so n bytes hold n/4 to n of them. */
-        __blink_panic_dispatchf("blink: internal error: a Str records %lld codepoints in %lld bytes",
-                                (long long)cps, (long long)n);
+        char msg[128];
+        snprintf(msg, sizeof msg, "blink: internal error: a Str records %lld codepoints in %lld bytes",
+                 (long long)cps, (long long)n);
+        __blink_fatal(msg);
     }
 #endif
     return (int64_t)c - 1;
