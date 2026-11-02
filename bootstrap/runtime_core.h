@@ -3207,7 +3207,8 @@ BLINK_RT_FN const char* blink_str_format(const char* fmt, ...) {
    the hook's operations go to the handlers in scope at the `with`, not at the panic point.
    The record is one per process: main holds the only hook, and a panic on any thread is a
    panic of the program. `test_run` is set by the test runner, which takes every panic itself,
-   so a test that calls main installs no hook. */
+   so a test that calls main installs no hook. It is per process, not per thread: the runner's
+   test hook is per thread, and a task that a test spawns to run main has none. */
 struct blink_closure_;
 typedef void (*__blink_panic_hook_adapter)(struct blink_closure_* hook, const char* message, const char* file, int64_t line);
 typedef struct {
