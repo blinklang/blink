@@ -24,4 +24,5 @@ cat "$src/runtime_core.h" \
     "$src/runtime_stdio.h" \
     "$src/runtime_term.h" \
     "$src/runtime_trace.h" \
+    "$src/runtime_trace_log.h" \
     > "$out"

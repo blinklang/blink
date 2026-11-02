@@ -35,7 +35,7 @@ import typecheck.{
     substitute_typevar_tid, tc_binder_key, tc_tid_typevar_key,
     tc_call_declared_name, tc_call_decl_node, tc_call_trait, tc_impl_trait_id, tc_impl_conv_source, tc_impl_recv_spelling,
     tc_impl_is_poly_conversion, tc_conversion_impl_for, tc_check_conversion, tc_conversion_trait_of, tc_conversion_target_of, tc_is_conversion_trait, tc_is_into_method, tc_is_default_fill, tc_call_user_effect, tc_field_tid_at_instance,
-    tc_lookup_node_tid, tc_mc_obj_is_value, tc_is_sealed_list_hof, tc_is_list_generic_adapter, tc_map_generic_adapter, tc_map_generic_adapter_module, tc_is_iterator_method, tc_resolve,
+    tc_lookup_node_tid, tc_mc_obj_is_value, tc_call_is_trace_log, tc_is_sealed_list_hof, tc_is_list_generic_adapter, tc_map_generic_adapter, tc_map_generic_adapter_module, tc_is_iterator_method, tc_resolve,
     tc_ret_mint_at, tc_tid_child, tc_tid_child_count,
     tc_tid_decl_node, tc_tid_kind, tc_impl_is_poly_user, tc_poly_user_impl_decl, tc_instance_has_trait, tc_written_impl_holds,
     tc_tid_is_no_info, tc_tid_list_elem, tc_tid_name, tc_tid_resolved, tc_tid_struct, tc_type_str,
@@ -71,10 +71,15 @@ let mut mono_call_target: Map[Int, Int] = Map()
 // Raw tids already searched for a Ptr over a type parameter, keyed by instance and tid. Every
 // node that carries the same type shares one search, so a refused pointee reports once.
 let mut ptr_tids_judged: Map[Int, Int] = Map()
-// Whether any body the walk reaches calls async.spawn. main starts the thread pool on it, and
-// main must not depend on which units a build lowered or in what order, so the answer comes
-// from the walk over the whole program, not from the lowering of one unit.
-let mut mono_saw_spawn: Bool = false
+// Whether any body the walk reaches calls async.spawn, and trace.log. main starts the thread
+// pool on the first and reads BLINK_TRACE_CHANNELS on the second, and main must not depend on
+// which units a build lowered or in what order, so the answers come from the walk over the
+// whole program, not from the lowering of one unit.
+type ProgramCalls {
+    spawn: Bool
+    trace_log: Bool
+}
+let mut mono_saw: ProgramCalls = ProgramCalls { spawn: false, trace_log: false }
 
 // Declaration lookups the walk resolves a call through. Names here are how source
 // spells a callee; instance identity never depends on them.
@@ -205,7 +210,12 @@ pub fn instance_of_poly_method(m: Int, recv_tid: Int) -> Int {
 
 // Whether the program calls async.spawn anywhere the walk reached.
 pub fn program_spawns() -> Bool {
-    mono_saw_spawn
+    mono_saw.spawn
+}
+
+// Whether the program calls trace.log anywhere the walk reached.
+pub fn program_calls_trace_log() -> Bool {
+    mono_saw.trace_log
 }
 
 // Run the pass over `program`. Every emit path calls this once after typecheck.
@@ -227,7 +237,7 @@ fn mono_reset() {
     type_insts_done = Map()
     mono_call_target = Map()
     ptr_tids_judged = Map()
-    mono_saw_spawn = false
+    mono_saw = ProgramCalls { spawn: false, trace_log: false }
     generic_fn_by_name = Map()
     generic_fn_by_module_name = Map()
     generic_fn_nodes = Map()
@@ -1278,7 +1288,8 @@ fn mono_walk_call(ctx: Int, node: Int) ! Diag.Report {
 }
 
 fn mono_walk_method_call(ctx: Int, node: Int) ! Diag.Report {
-    if is_async_spawn(node) { mono_saw_spawn = true }
+    if is_async_spawn(node) { mono_saw.spawn = true }
+    if tc_call_is_trace_log(node) { mono_saw.trace_log = true }
     discover_method_call(ctx, node)
     register_default_fill_instances(ctx, node)
     walk_ref_and_list(ctx, node_obj(node), node_args(node))

@@ -20,6 +20,7 @@ cat "$SCRIPT_DIR/runtime_core.h" \
     "$SCRIPT_DIR/runtime_stdio.h" \
     "$SCRIPT_DIR/runtime_term.h" \
     "$SCRIPT_DIR/runtime_trace.h" \
+    "$SCRIPT_DIR/runtime_trace_log.h" \
     > "$BUILD_DIR/runtime.h"
 # Build gc_unity.c — inline all ../*.c includes from gc/extra/gc.c into a
 # single translation unit so the embedded version has no relative .c deps.

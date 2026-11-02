@@ -1,0 +1,92 @@
+// The program reads BLINK_TRACE_CHANNELS once, when it starts, so a later `env.set_var` or
+// `env.remove_var` does not change which channels are on. `msg` is not evaluated when its
+// channel is off, so a `msg` that panics panics only with the channel on (§8.15.7, *Known
+// limit*). The channel argument is evaluated once, whether its channel is on or off.
+
+import compile_test_helpers
+
+let LAZY_SRC = #"fn boom() -> Str {
+    panic("msg was evaluated")
+}
+
+fn main() ! IO {
+    trace.log("c", "x {boom()}")
+    io.println("done")
+}
+"#
+
+let CHANNEL_ONCE_SRC = #"fn chan() -> Str ! IO {
+    io.eprintln("chan")
+    "c"
+}
+
+fn main() ! IO {
+    trace.log(chan(), "x")
+}
+"#
+
+let SET_AFTER_START_SRC = #"fn main() ! Env, IO {
+    env.set_var("BLINK_TRACE_CHANNELS", "late")
+    trace.log("late", "set after start")
+    env.remove_var("BLINK_TRACE_CHANNELS")
+    trace.log("early", "removed after start")
+    io.println("{env.var("BLINK_TRACE_CHANNELS").is_some()}")
+}
+"#
+
+fn build(src: Str, tag: Str) -> Str ! FS.Write, Process.Spawn, Env.Read {
+    let dir = "{compile_test_helpers.scratch_root()}/trace_log_once_{tag}"
+    compile_test_helpers.sh("mkdir -p {dir}")
+    let path = "{dir}/trace_log_once_{tag}.bl"
+    let bin = "{dir}/trace_log_once_{tag}_bin"
+    fs.write(path, src).unwrap()
+    let b = process.run("build/blink", ["build", path, "-o", bin]).unwrap()
+    assert_eq(b.err_out, "")
+    assert(b.success())
+    bin
+}
+
+fn clean(tag: Str) ! Process.Spawn, Env.Read {
+    compile_test_helpers.sh("rm -rf {compile_test_helpers.scratch_root()}/trace_log_once_{tag}")
+}
+
+test "msg is not evaluated when its channel is off" {
+    let bin = build(LAZY_SRC, "lazy")
+    let off = process.run("env", ["BLINK_TRACE_CHANNELS=other", bin]).unwrap()
+    assert_eq(off.out, "done\n")
+    assert_eq(off.err_out, "")
+    assert(off.success())
+    let unset = process.run("env", ["-u", "BLINK_TRACE_CHANNELS", bin]).unwrap()
+    assert_eq(unset.out, "done\n")
+    assert(unset.success())
+    let on = process.run("env", ["BLINK_TRACE_CHANNELS=c", bin]).unwrap()
+    assert_eq(on.out, "")
+    assert(on.err_out.contains("msg was evaluated"))
+    assert(!on.err_out.contains("[trace:c]"))
+    assert(!on.success())
+    clean("lazy")
+}
+
+test "the channel argument is evaluated once whether its channel is on or off" {
+    let bin = build(CHANNEL_ONCE_SRC, "channel")
+    let on = process.run("env", ["BLINK_TRACE_CHANNELS=c", bin]).unwrap()
+    assert_eq(on.err_out, "chan\n[trace:c] x\n")
+    assert(on.success())
+    let off = process.run("env", ["-u", "BLINK_TRACE_CHANNELS", bin]).unwrap()
+    assert_eq(off.err_out, "chan\n")
+    assert(off.success())
+    clean("channel")
+}
+
+test "a set_var or remove_var of BLINK_TRACE_CHANNELS after start changes no channel" {
+    let bin = build(SET_AFTER_START_SRC, "set")
+    let unset = process.run("env", ["-u", "BLINK_TRACE_CHANNELS", bin]).unwrap()
+    assert_eq(unset.out, "false\n")
+    assert_eq(unset.err_out, "")
+    assert(unset.success())
+    let early = process.run("env", ["BLINK_TRACE_CHANNELS=early", bin]).unwrap()
+    assert_eq(early.out, "false\n")
+    assert_eq(early.err_out, "[trace:early] removed after start\n")
+    assert(early.success())
+    clean("set")
+}

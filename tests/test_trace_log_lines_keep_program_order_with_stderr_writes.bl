@@ -1,0 +1,139 @@
+// The trace lines of a thread come in program order with its other stderr writes, and a
+// capturing handler of `IO.Eprint` does not see them, since a trace call is no operation
+// (§8.15.7, *Order*). A call that runs writes its line once, wherever the call sits: a
+// statement, a `let _`, a match arm, a closure body, a loop, or a module-level initializer.
+
+import compile_test_helpers
+
+let ORDER_SRC = #"fn main() ! IO {
+    io.eprintln("a")
+    trace.log("t", "b")
+    io.eprintln("c")
+}
+"#
+
+let CAPTURE_SRC = #"import std.testing.{capture_eprint}
+
+fn main() ! IO {
+    let got: List[Str] = []
+    with capture_eprint(got) {
+        io.eprintln("a")
+        trace.log("t", "b")
+        io.eprintln("c")
+    }
+    io.println(got.join(","))
+}
+"#
+
+// stderr is `[trace:c] cost 3`, or empty if the compiler drops the call to `cost`.
+let COST_SRC = #"fn cost(n: Int) -> Int {
+    trace.log("c", "cost {n}")
+    n * 2
+}
+
+fn main() ! IO {
+    let _ = cost(3)
+    io.println("done")
+}
+"#
+
+let PLACES_SRC = #"let START = start()
+
+fn start() -> Int {
+    trace.log("p", "init")
+    1
+}
+
+fn pick(n: Int) -> Int {
+    match n {
+        0 => trace.log("p", "arm zero")
+        _ => {}
+    }
+    n
+}
+
+fn main() ! IO {
+    let _ = trace.log("p", "let")
+    let unit = trace.log("p", "named")
+    let _ = unit
+    let _ = pick(0)
+    let f = fn(k: Int) { trace.log("p", "closure {k}") }
+    f(7)
+    for i in 0..2 {
+        trace.log("p", "loop {i}")
+    }
+    let mut j = 0
+    while j < 1 {
+        trace.log("p", if j == 0 { "if arm" } else { "else arm" })
+        j += 1
+    }
+    io.println("{START}")
+}
+"#
+
+fn build(src: Str, tag: Str) -> Str ! FS.Write, Process.Spawn, Env.Read {
+    let dir = "{compile_test_helpers.scratch_root()}/trace_log_order_{tag}"
+    compile_test_helpers.sh("mkdir -p {dir}")
+    let path = "{dir}/trace_log_order_{tag}.bl"
+    let bin = "{dir}/trace_log_order_{tag}_bin"
+    fs.write(path, src).unwrap()
+    let b = process.run("build/blink", ["build", path, "-o", bin]).unwrap()
+    assert_eq(b.err_out, "")
+    assert(b.success())
+    bin
+}
+
+fn clean(tag: Str) ! Process.Spawn, Env.Read {
+    compile_test_helpers.sh("rm -rf {compile_test_helpers.scratch_root()}/trace_log_order_{tag}")
+}
+
+test "a trace line comes between the stderr writes before and after it" {
+    let bin = build(ORDER_SRC, "order")
+    let r = process.run("env", ["BLINK_TRACE_CHANNELS=t", bin]).unwrap()
+    assert_eq(r.err_out, "a\n[trace:t] b\nc\n")
+    assert(r.success())
+    clean("order")
+}
+
+test "a capturing eprint handler does not see the trace line" {
+    let bin = build(CAPTURE_SRC, "capture")
+    let r = process.run("env", ["BLINK_TRACE_CHANNELS=t", bin]).unwrap()
+    assert_eq(r.out, "a,c\n")
+    assert_eq(r.err_out, "[trace:t] b\n")
+    assert(r.success())
+    clean("capture")
+}
+
+test "a call whose result no code uses writes its line once or not at all" {
+    let bin = build(COST_SRC, "cost")
+    let on = process.run("env", ["BLINK_TRACE_CHANNELS=c", bin]).unwrap()
+    assert_eq(on.out, "done\n")
+    assert(on.err_out == "[trace:c] cost 3\n" || on.err_out == "")
+    assert(on.success())
+    let unset = process.run("env", ["-u", "BLINK_TRACE_CHANNELS", bin]).unwrap()
+    assert_eq(unset.out, "done\n")
+    assert_eq(unset.err_out, "")
+    clean("cost")
+}
+
+test "a trace call writes its line once in each place a call can sit" {
+    let bin = build(PLACES_SRC, "places")
+    let r = process.run("env", ["BLINK_TRACE_CHANNELS=p", bin]).unwrap()
+    assert_eq(r.out, "1\n")
+    assert_eq(r.err_out, [
+        "[trace:p] init",
+        "[trace:p] let",
+        "[trace:p] named",
+        "[trace:p] arm zero",
+        "[trace:p] closure 7",
+        "[trace:p] loop 0",
+        "[trace:p] loop 1",
+        "[trace:p] if arm",
+        "",
+    ].join("\n"))
+    assert(r.success())
+    let off = process.run("env", ["-u", "BLINK_TRACE_CHANNELS", bin]).unwrap()
+    assert_eq(off.out, "1\n")
+    assert_eq(off.err_out, "")
+    clean("places")
+}

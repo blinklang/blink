@@ -1,0 +1,101 @@
+// `trace.log(channel, msg)` is a built-in call with no row (§8.15.7). With its channel on in
+// BLINK_TRACE_CHANNELS, it writes `[trace:<channel>] <msg>` to stderr; with the var unset, or
+// naming other channels, it writes nothing. The value splits on `,`, each item is trimmed of
+// ASCII space and tab at its two ends, an empty item is skipped, each other item matches a
+// channel by exact text, and `all` anywhere turns on every channel.
+
+import compile_test_helpers
+
+// `lower` has no row: the build fails if the call needs one.
+let LOWER_SRC = #"fn lower(id: Int) -> Int {
+    trace.log("mono", "lower {id}")
+    id + 1
+}
+
+fn main() ! IO {
+    io.println("{lower(4)}")
+}
+"#
+
+let ITEMS_SRC = #"fn main() {
+    trace.log("mono", "m")
+    trace.log("walk", "w")
+    trace.log("mo no", "s")
+    trace.log("other", "o")
+}
+"#
+
+fn build(src: Str, tag: Str) -> Str ! FS.Write, Process.Spawn, Env.Read {
+    let dir = "{compile_test_helpers.scratch_root()}/trace_log_gate_{tag}"
+    compile_test_helpers.sh("mkdir -p {dir}")
+    let path = "{dir}/trace_log_gate_{tag}.bl"
+    let bin = "{dir}/trace_log_gate_{tag}_bin"
+    fs.write(path, src).unwrap()
+    let b = process.run("build/blink", ["build", path, "-o", bin]).unwrap()
+    assert_eq(b.err_out, "")
+    assert(b.success())
+    bin
+}
+
+fn clean(tag: Str) ! Process.Spawn, Env.Read {
+    compile_test_helpers.sh("rm -rf {compile_test_helpers.scratch_root()}/trace_log_gate_{tag}")
+}
+
+// The stderr of one run with BLINK_TRACE_CHANNELS set to `channels`.
+fn stderr_with(bin: Str, channels: Str) -> Str ! Process.Spawn {
+    let r = process.run("env", ["BLINK_TRACE_CHANNELS={channels}", bin]).unwrap()
+    assert(r.success())
+    r.err_out
+}
+
+test "lower writes its line when its channel is on, and nothing when the var is unset or names another channel" {
+    let bin = build(LOWER_SRC, "lower")
+    let on = process.run("env", ["BLINK_TRACE_CHANNELS=mono", bin]).unwrap()
+    assert_eq(on.out, "5\n")
+    assert_eq(on.err_out, "[trace:mono] lower 4\n")
+    assert(on.success())
+    let unset = process.run("env", ["-u", "BLINK_TRACE_CHANNELS", bin]).unwrap()
+    assert_eq(unset.out, "5\n")
+    assert_eq(unset.err_out, "")
+    let other = process.run("env", ["BLINK_TRACE_CHANNELS=walk", bin]).unwrap()
+    assert_eq(other.out, "5\n")
+    assert_eq(other.err_out, "")
+    assert_eq(stderr_with(bin, "walk, mono"), "[trace:mono] lower 4\n")
+    clean("lower")
+}
+
+test "BLINK_TRACE does not turn on a channel" {
+    let bin = build(LOWER_SRC, "not_trace")
+    let r = process.run("env", ["-u", "BLINK_TRACE_CHANNELS", "BLINK_TRACE=all", bin]).unwrap()
+    assert_eq(r.err_out, "")
+    assert(r.success())
+    clean("not_trace")
+}
+
+test "each item is trimmed, empty items are skipped, and an item matches a channel by exact text" {
+    let bin = build(ITEMS_SRC, "items")
+    let m = "[trace:mono] m\n"
+    let w = "[trace:walk] w\n"
+    let s = "[trace:mo no] s\n"
+    let o = "[trace:other] o\n"
+    assert_eq(stderr_with(bin, "mono"), m)
+    assert_eq(stderr_with(bin, "mono, walk"), "{m}{w}")
+    assert_eq(stderr_with(bin, "mono,,walk,"), "{m}{w}")
+    assert_eq(stderr_with(bin, "\tmono\t,  walk  "), "{m}{w}")
+    assert_eq(stderr_with(bin, " , "), "")
+    assert_eq(stderr_with(bin, ""), "")
+    assert_eq(stderr_with(bin, "Mono"), "")
+    assert_eq(stderr_with(bin, "mo no"), s)
+    assert_eq(stderr_with(bin, "mono+walk"), "")
+    clean("items")
+}
+
+test "the item all, in any place in the list, turns on every channel" {
+    let bin = build(ITEMS_SRC, "all")
+    let every = "[trace:mono] m\n[trace:walk] w\n[trace:mo no] s\n[trace:other] o\n"
+    assert_eq(stderr_with(bin, "all"), every)
+    assert_eq(stderr_with(bin, "mono,all"), every)
+    assert_eq(stderr_with(bin, " all ,walk"), every)
+    assert_eq(stderr_with(bin, "All"), "")
+    clean("all")
+}

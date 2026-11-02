@@ -15,5 +15,6 @@
 #include "runtime_stdio.h"
 #include "runtime_term.h"
 #include "runtime_trace.h"
+#include "runtime_trace_log.h"
 
 #endif /* BLINK_RUNTIME_H */

@@ -73,9 +73,9 @@ import cg_expr.{
     lower_expr, lower_expr_as_value, cg_expr_async_scope_current, cg_expr_push_pending, cg_expr_pending_count, cg_expr_take_pending,
     x_unbox_payload, x_layout_checked, lower_value_as_text, cg_expr_option_some, cg_expr_option_none, cg_expr_option_wrap,
     x_is_c_comparable, cg_expr_builds_carrier, cg_expr_lower_carrier_ctor, cg_expr_sequence, cg_expr_lower_pair,
-    x_lower_default, cg_expr_field_value, cg_expr_field_stored, x_panic_at, x_panic_what, x_site_args,
+    x_lower_default, cg_expr_pending_leaves_from, cg_expr_field_value, cg_expr_field_stored, x_panic_at, x_panic_what, x_site_args,
 }
-import cg_stmt.{enum_tag_word, lower_block_into}
+import cg_stmt.{enum_tag_word, lower_block_into, cg_stmt_materialise_where_run}
 import cg_eff.{
     cg_eff_ev_argument, cg_eff_lower_builtin_perform, cg_eff_lower_time_perform, cg_eff_lower_user_perform,
     cg_eff_lower_builtin_default_perform, cg_eff_lower_builtin_op_perform,
@@ -2118,6 +2118,7 @@ let ns_fs = "fs"
 let ns_process = "process"
 let ns_rand = "rand"
 let ns_async = "async"
+let ns_trace = "trace"
 
 // The io names a handler can replace, and the env names it can. Both lists are written
 // under the names a caller writes, not under the vtable slots they reach, because the
@@ -2147,7 +2148,59 @@ fn lower_namespace_call(node: Int, obj: Int) -> Int ! Diag.Report {
     if ns == ns_process { return lower_builtin_op_call(node, "Process", method) }
     if ns == ns_rand { return lower_builtin_op_call(node, "Rand", method) }
     if ns == ns_async { return lower_async_call(node, method) }
+    if ns == ns_trace { return lower_trace_call(node, method) }
     cc_ns_not_built(node, ns, method)
+}
+
+// `trace.log(channel, msg)` is a call the program makes to itself: no row, no handler,
+// and no value (sections/06_tooling.md §8.15.7). The channel runs once, where the call
+// stands. The msg runs only when its channel is on, so its own statements wait inside the
+// test, as the right operand of `&&` does, and the statement walk leaves the msg to this
+// walk (see cc_is_trace_log_call). A msg that leaves -- a call of type Never -- writes no
+// line, so the arm stops where the msg does.
+fn lower_trace_call(node: Int, method: Str) -> Int ! Diag.Report {
+    if is_intrinsic_method(ns_trace, method) == 0 { return cc_ns_not_built(node, ns_trace, method) }
+    let tid = tid_of_node(node)
+    if tid < 0 { return -1 }
+    let unit = cc_local(tid, node)
+    if cc_stopped(unit) { return -1 }
+    let strs = cc_local(TYPE_STR, node)
+    if cc_stopped(strs) { return -1 }
+    let bools = cc_local(TYPE_BOOL, node)
+    if cc_stopped(bools) { return -1 }
+    let channel = lower_expr(sublist_get(node_args(node), 0))
+    if channel < 0 { return -1 }
+    let ch = c_mint_local("trace_ch")
+    cg_expr_push_pending(node, ir_let(TYPE_STR, node, strs.c_spelling, ch, strs.slot_form, channel))
+    let mark = cg_expr_pending_count()
+    let msg_node = sublist_get(node_args(node), 1)
+    if !cg_stmt_materialise_where_run(msg_node) { return -1 }
+    let msg = lower_expr(msg_node)
+    if msg < 0 { return -1 }
+    let left = cg_expr_pending_leaves_from(mark)
+    if left >= 0 { let _dead = cg_expr_take_pending(left + 1) }
+    let mut arm = cg_expr_take_pending(mark)
+    if left < 0 {
+        let note = ir_call_runtime(TYPE_VOID, node, unit.c_spelling, c_runtime_helper("trace_note"), unit.slot_form,
+            [cc_temp_ref(node, TYPE_STR, strs, ch), msg])
+        arm.push(ir_expr_stmt(node, note))
+    }
+    let on = ir_call_runtime(TYPE_BOOL, node, bools.c_spelling, c_runtime_helper("trace_channel_on"), bools.slot_form,
+        [cc_temp_ref(node, TYPE_STR, strs, ch)])
+    cg_expr_push_pending(node, ir_if(node, on, ir_block(node, arm), -1))
+    ir_const(tid, node, unit.c_spelling, "0")
+}
+
+// Whether this is the built-in `trace.log`, read the way the call's lowering reads its
+// receiver, so a `trace` value or module keeps its own call. The statement walk asks, so
+// that it leaves the msg to lower_trace_call.
+pub fn cc_is_trace_log_call(node: Int) -> Bool {
+    if node_kind(node) != NodeKind.MethodCall { return false }
+    let obj = node_obj(node)
+    if !cc_is_free_name(obj) || node_name(obj) != ns_trace { return false }
+    // `log` is the one intrinsic of `trace`, so the table answers for the method name.
+    if is_intrinsic_method(ns_trace, node_method(node)) == 0 { return false }
+    cc_receiver_role(node, obj) == Receiver.Namespace
 }
 
 // `async.spawn(f)` runs f on the pool thread and hands the caller a Handle right away. A
