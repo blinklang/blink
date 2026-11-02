@@ -4265,6 +4265,17 @@ BLINK_RT_FN int64_t blink_io_read_bytes_count(int64_t n) {
 }
 #endif
 
+/* The form lowering calls: the count check names the Blink call that gave the count. */
+BLINK_RT_FN int64_t blink_io_read_bytes_count_at(int64_t n, const char* file, int64_t line);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN int64_t blink_io_read_bytes_count_at(int64_t n, const char* file, int64_t line) {
+    if (n <= 0) {
+        __blink_panic_dispatchf_at(file, line, "io.read_bytes: n must be at least 1, got %lld", (long long)n);
+    }
+    return n;
+}
+#endif
+
 /* The defaults read the one standard input buffer. Its read_line and read_all give what the
  * derived bodies of §4.4.9 give over its read_bytes. */
 BLINK_RT_FN blink_bytes* blink_io_default_read_bytes(void* __self, int64_t n);

@@ -1,0 +1,101 @@
+// A count below one for io.read_bytes is a fault Blink code causes, so it reaches the hook with
+// the line of the call, whichever way the program got there (sections/02_syntax.md §2.20,
+// sections/04_effects.md §4.4.9).
+
+import compile_test_helpers.{compile_and_run}
+
+fn report_src() -> Str {
+    #"fn report(p: PanicInfo) -> Never ! IO.Eprint, Env.Exit {
+    let at = match p.line {
+        Some(n) => "{p.file}:{n}"
+        None => p.file
+    }
+    io.eprintln("fatal: {p.message} at {at}")
+    env.exit(70)
+}
+"#
+}
+
+fn expect_site(body: Str, tag: Str, line: Int) ! FS.Delete, FS.Write, Process.Spawn, FS.Read, Env.Read {
+    let r = compile_and_run(report_src().concat(body), tag)
+    assert(r.exit_code == 70, "exit {r.exit_code}: {r.err_out}")
+    assert(r.err_out.starts_with("fatal: io.read_bytes: "), r.err_out)
+    assert(r.err_out.ends_with("/{tag}.bl:{line}\n"), r.err_out)
+}
+
+test "a direct call names its own line" {
+    expect_site(#"
+fn main() ! IO, Env {
+    with on_panic(report) {
+        let n = 0
+        let _ = io.read_bytes(n)
+    }
+}
+"#, "rbc_direct_{getpid()}", 13)
+}
+
+test "a call in a closure names the line in the closure" {
+    expect_site(#"
+fn main() ! IO, Env {
+    with on_panic(report) {
+        let n = 0
+        let take = fn() {
+            io.read_bytes(n).len()
+        }
+        io.println("{take()}")
+    }
+}
+"#, "rbc_closure_{getpid()}", 14)
+}
+
+test "a call in a fn passed as a value names the line in that fn" {
+    expect_site(#"
+fn take(n: Int) -> Int ! IO.Read {
+    io.read_bytes(n).len()
+}
+
+fn main() ! IO, Env {
+    with on_panic(report) {
+        let f = take
+        io.println("{f(0)}")
+    }
+}
+"#, "rbc_fn_value_{getpid()}", 11)
+}
+
+test "a call in a handler clause through default names the clause line" {
+    expect_site(#"
+fn main() ! IO, Env {
+    with on_panic(report) {
+        with handler IO.Read {
+            fn read_bytes(n: Int) -> Bytes {
+                default.read_bytes(0 - n)
+            }
+        } {
+            io.println("{io.read_bytes(2).len()}")
+        }
+    }
+}
+"#, "rbc_default_{getpid()}", 14)
+}
+
+test "the fault has no runtime lead-in with no hook" {
+    let src = #"fn main() ! IO {
+    let n = 0
+    let _ = io.read_bytes(n)
+}
+"#
+    let tag = "rbc_no_hook_{getpid()}"
+    let r = compile_and_run(src, tag)
+    assert(r.exit_code == 101, "exit {r.exit_code}: {r.err_out}")
+    assert(!r.err_out.contains("blink: "), r.err_out)
+    assert(r.err_out.contains("io.read_bytes: "), r.err_out)
+    assert(r.err_out.contains("/{tag}.bl:3"), r.err_out)
+}
+
+test "assert_panics catches the fault" {
+    let n = 0
+    assert_panics(matching: "io.read_bytes: ") {
+        let _ = io.read_bytes(n)
+    }
+}
