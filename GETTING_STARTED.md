@@ -207,7 +207,7 @@ build/blink run hello.bl --trace=effect:FS.Write
 build/blink run hello.bl --trace=state:count
 ```
 
-Trace can also be enabled via an environment variable: `BLINK_TRACE=all`. A binary built with `blink build --trace` reads its filters from `BLINK_TRACE` only, and traces every call when it is unset.
+Only `--trace` makes `blink run` build a traced program: `BLINK_TRACE=all build/blink run hello.bl` does not trace. A binary built with `blink build --trace` reads its filters from `BLINK_TRACE` only, and traces every call when it is unset. A filter that names no function, module, effect or `let mut` binding of the program stops `blink run` with exit code 2.
 
 Inspect the parsed AST:
 

@@ -1740,7 +1740,7 @@ build/blink build src/main.bl --strict
 
 ### Runtime Execution Tracing (`--trace`)
 
-Emits structured NDJSON to stderr with function enter/exit, state mutations, and effect invocations. Zero cost when not enabled.
+Writes NDJSON to stderr: one line for each function enter and exit, `let mut` change and effect operation. A program that is not built with `--trace` has no trace code.
 
 ```sh
 # Trace everything
@@ -1748,27 +1748,32 @@ build/blink run app.bl --trace
 
 # Filter by function, module, or depth
 build/blink run app.bl --trace=fn:parse_expr
-build/blink run app.bl --trace=module:parser,depth:2
+build/blink run app.bl --trace=fn:Point.norm            # one method
+build/blink run app.bl --trace=fn:main.main.fn@11:25    # one closure
+build/blink run app.bl --trace=module:parser,depth:2    # AND with ,
 build/blink run app.bl --trace=fn:skip_ws+parse_block   # OR with +
 
 # Filter by event type
 build/blink run app.bl --trace=event:enter+exit          # only enter/exit
-build/blink run app.bl --trace=event:effect              # only effect invocations
-build/blink run app.bl --trace=event:state               # only state mutations
+build/blink run app.bl --trace=event:effect              # only effect operations
+build/blink run app.bl --trace=event:state               # only state changes
 
 # Filter by effect or state variable
 build/blink run app.bl --trace=effect:FS.Write
 build/blink run app.bl --trace=state:count
-
-# Environment variable (same filter syntax)
-BLINK_TRACE=all build/blink run app.bl
 
 # A binary built with --trace reads BLINK_TRACE only; unset traces every call
 build/blink build --trace app.bl -o app
 BLINK_TRACE=fn:parse_block ./app
 ```
 
-There is no event limit. A bad filter (an unknown key, an empty value, a `depth:` value that is not a number, an unknown event type) stops the program with exit code 2 before `main` runs.
+- Only `--trace` makes `blink run` build traced. `BLINK_TRACE=all build/blink run app.bl` builds an untraced program and prints a note that says to use `--trace`.
+- `blink run --trace=<filters>` gives the program `BLINK_TRACE=<filters>`. A bare `--trace` gives `all`. `BLINK_TRACE=1` is not a value.
+- `fn:` matches a frame name, or its last whole dot segments: `fn:norm` and `fn:Point.norm` both match `geo.Point.norm`. `effect:` matches the effect or a parent, by whole segments, with or without the module: `effect:Log` matches `main.Log.Out`. `module:` and `state:` match the exact name.
+- Frame names: `module.function`, `module.Type.method`, `<frame>.fn@L:C` for a closure, `<frame>.handler@L:C.<EffectPath>.<op>` for a handler body, `module.<EffectPath>.<op>` for a default body. A std fn is not a frame: its effects and calls are credited to the user frame that called it.
+- A bad filter (an unknown key, an empty value, `all` beside another item, a `depth:` value that is not ASCII digits, an unknown event type) is a usage error: exit code 2 before `main` runs. `blink run` finds it before it builds.
+- Under `blink run`, a `fn:`, `module:`, `effect:` or `state:` value that matches no name of the program is the same error, as in ``error: bad --trace value "fn:ad": no function named `ad`; did you mean `add`?``. A traced binary that you start yourself does not check names; a name that matches nothing gives an empty trace.
+- There is no event limit. If the reader of the trace closes the stream (`./app 2>&1 | head -1`), the program stops tracing and runs to its own end.
 
 Trace event types:
 
@@ -1776,10 +1781,10 @@ Trace event types:
 |-------|--------|-------------|
 | `enter` | `span`, `args` | Function entry with source location and arguments |
 | `exit` | `duration_us`, `return` | Function exit with duration and return value |
-| `effect` | `effect`, `op`, `args` | Effect invocation (IO, FS, DB) |
-| `state` | `var`, `op`, `value` | State mutation (assign, push, insert) |
+| `effect` | `effect`, `op`, `args` | One event for each dispatch, before the handler body enters. `effect` is the effect path (`IO.Print`; a user effect has its module: `main.Log.Out`). `op` is the call as written (`io.println`). `args` has every parameter by its declared name |
+| `state` | `var`, `op`, `value` | A change to a `let mut` binding. `op` is `assign`, or the name of the mutating method (`push`). `value` is the whole binding after the change. The first binding gives no event |
 
-All events include: `ts_us`, `event`, `fn`, `module`, `depth`. Values truncated at 200 chars.
+All events include: `ts_us`, `event`, `fn`, `module`, `depth`. A value is its `Display` text, else its `Debug` text, else `<TypeName>`. Values longer than 200 characters are cut, with `"truncated":true`.
 
 ### Trace Notes (`trace.log`)
 
