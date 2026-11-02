@@ -351,7 +351,7 @@ pub const CALL_ARG_UNBOUND_AT_CODEGEN = "I0010"
 pub const ARENA_PROMOTION_INVARIANT = "I0011"
 // I0012: the parser's node pool or sublist stack met a state it can not hold: a limit of its
 // packed layout, or a call out of order or out of bounds. The parser can not go on past it,
-// so this one stops the compiler (diag_ice_abort) instead of returning. The message names
+// so this one stops the compiler (diag_ice_abort panics) instead of returning. The message names
 // the limit.
 pub const PARSER_INTERNAL_LIMIT = "I0012"
 pub const PARSER_INTERNAL_LIMIT_NAME = "ParserInternalLimit"
@@ -386,6 +386,11 @@ pub const PRELUDE_TYPE_NOT_LOADED = "I0019"
 // every embed and reports a file that is not there, so a miss means a caller lowered a
 // program the loader did not load.
 pub const EMBED_TEXT_NOT_LOADED = "I0020"
+// I0021: the compiler panicked: an unwrap of None, an index out of bounds, a formatter with no
+// layout for a node. A panic is a compiler bug, so the hook in each compiler main reports it as
+// an internal error, with the place of the panic in a note.
+pub const COMPILER_PANIC = "I0021"
+pub const COMPILER_PANIC_NAME = "CompilerPanic"
 
 // ── I0001 mangler sentinels ──────────────────────────────
 //
@@ -576,15 +581,22 @@ type DiagIceState {
     // caller reads to decide whether a result is usable must move on every report, and a
     // reader must still be shown the fault once.
     rendered: Int
-    // What a command prints on stdout when diag_ice_abort stops the compiler, byte for byte,
-    // or "".
+    // What a command prints on stdout when a panic stops the compiler, byte for byte, or "".
     abort_stdout: Str
     // The document and the open request of the language server check in progress, or "" and
-    // None. diag_ice_abort writes their frames from the fault itself.
+    // None. diag_panic_exit writes their frames from the fault itself.
     abort_lsp_uri: Str
     abort_lsp_request: Option[Int]
+    // The fault diag_ice_abort recorded just before it panicked, for the panic hook to report.
+    // None when the panic came from anywhere else.
+    abort: Option[IceAbort]
 }
-let mut diag_ice_state: DiagIceState = DiagIceState { rendered: 0, abort_stdout: "", abort_lsp_uri: "", abort_lsp_request: None }
+type IceAbort {
+    name: Str
+    code: Str
+    message: Str
+}
+let mut diag_ice_state: DiagIceState = DiagIceState { rendered: 0, abort_stdout: "", abort_lsp_uri: "", abort_lsp_request: None, abort: None }
 
 // `blink check` sets its status line here, so a check --json that stops on an internal error
 // still ends with one.
@@ -1181,14 +1193,35 @@ pub fn diag_ice(name: Str, code: Str, message: Str, line: Int, col: Int, help: S
 }
 
 // An internal error for a stage whose own state can not hold what comes next, so it can not
-// go on after it as it does after diag_ice. It records the fault as diag_ice does, prints
-// all that was reported in the run's format, and exits 101 as any internal error does.
-pub fn diag_ice_abort(name: Str, code: Str, message: Str) {
+// go on after it as it does after diag_ice. It records the fault as diag_ice does and
+// panics. The hook that each compiler main installs reports it (diag_panic_exit).
+pub fn diag_ice_abort(name: Str, code: Str, message: Str) -> Never {
     diag_record("ice", name, code, message, 0, 0, 0, 0, "", [])
+    diag_ice_state.abort = Some(IceAbort { name: name, code: code, message: message })
+    panic(message)
+}
+
+// The body of the panic hook of each compiler main. Every panic in the compiler is a compiler
+// bug, so each one ends as an internal error does: all that was reported, in the run's
+// format, on stderr, the command's abort line on stdout, the frames of the language server
+// check in progress, and exit 101. A panic that diag_ice_abort did not raise is recorded
+// here as a CompilerPanic. It takes the panic's place as plain values, not as the hook's record.
+pub fn diag_panic_exit(message: Str, file: Str, line: Int?) -> Never ! IO, Env.Exit {
+    let fault = match diag_ice_state.abort {
+        Some(a) => a
+        None => {
+            let at = match line {
+                Some(n) => "{file}:{n}"
+                None => file
+            }
+            diag_record("ice", COMPILER_PANIC_NAME, COMPILER_PANIC, message, 0, 0, 0, 0, "", ["the compiler panicked at {at}"])
+            IceAbort { name: COMPILER_PANIC_NAME, code: COMPILER_PANIC, message: message }
+        }
+    }
     io.eprint(diag_unflushed(diag_format))
     io.print(diag_ice_state.abort_stdout)
     if diag_ice_state.abort_lsp_uri != "" {
-        io.print(lsp_abort_frames(diag_ice_state.abort_lsp_uri, diag_ice_state.abort_lsp_request, name, code, message))
+        io.print(lsp_abort_frames(diag_ice_state.abort_lsp_uri, diag_ice_state.abort_lsp_request, fault.name, fault.code, fault.message))
     }
     env.exit(101)
 }
@@ -1625,6 +1658,7 @@ pub fn diag_reset() {
     diag_ice_state = DiagIceState {
         rendered: 0, abort_stdout: diag_ice_state.abort_stdout,
         abort_lsp_uri: diag_ice_state.abort_lsp_uri, abort_lsp_request: diag_ice_state.abort_lsp_request,
+        abort: None,
     }
     diag_module_files.clear()
     file_ranges.clear()
@@ -2030,6 +2064,9 @@ pub fn diag_explain(code: Str) -> Str {
     }
     if code == TEST_BUILD_ENDED_WITHOUT_DIAGNOSTIC {
         return "I0018 -- TestBuildEndedWithoutDiagnostic\n\nAn internal error of `blink test`: the build of one test file failed,\nand the build printed no error that says why. A failed C compile, link\nor native dependency step has its own code (I0017, E0857, E0858), so\nthis one means the build ended in some other way. The file counts as\none that did not build; this diagnostic follows any warnings the build\nprinted. Its notes hold the rest of what the build printed. It is a bug\nin the compiler or in `blink test`, not in the test code. Please report\nit with the notes."
+    }
+    if code == COMPILER_PANIC {
+        return "I0021 -- CompilerPanic\n\nAn internal error: the compiler panicked, for example on an index out of\nbounds or an unwrap of None. The compiler stops, prints what it reported\nso far, and exits 101. A note names the place in the compiler source\nwhere it panicked. This is a compiler bug, not an error in the program.\nPlease report it with the message and the note."
     }
     if code == EMBED_TEXT_NOT_LOADED {
         return "I0020 -- EmbedTextNotLoaded\n\nAn internal error of code generation: an `#embed` has no text from\nthe loader. The loader reads the file of every `#embed` and reports one\nthat is not there, so this is a compiler bug, not an error in the\nprogram. Please report it with the message, which names the path."

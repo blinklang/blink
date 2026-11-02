@@ -97,6 +97,7 @@ ICE codes use the `I` prefix. `@allow` and `[lints]` take warning names only, so
 | TestBuildEndedWithoutDiagnostic | I0018 | `blink test` built a test file, the build failed, and it printed no error or ice diagnostic. A failed C compile, link or native-dependency step has its own code (I0017, E0857, E0858), so this code means the build ended in some other way. The file is `build_failed` with this diagnostic after any warnings the build printed; its `notes` hold the rest of what the build printed (§8.10.5) |
 | PreludeTypeNotLoaded | I0019 | A builtin returns a type that the prelude declares (such as `std_time.Instant`), and that declaration is not loaded. The prelude always loads, so it is a compiler bug |
 | EmbedTextNotLoaded | I0020 | An `#embed` reached code generation with no text from the loader. The loader reads every embed and reports a missing file, so it is a compiler bug |
+| CompilerPanic | I0021 | The compiler panicked (an unwrap of `None`, an index out of bounds, a formatter with no layout for a node). The compiler stops as on any internal error: it prints what it reported so far in the run's format, the command's status line, and exits 101. A note names the place in the compiler source |
 
 ---
 

@@ -5,7 +5,7 @@ import parser.{Parse, parse_program, pos, node_count, parse_desugar_enabled}
 import typecheck.{TypeCheck, check_types, tc_import_modules, tc_import_qualifiers, tc_import_nodes}
 import cg.{Codegen, CgConfig, generate}
 import formatter.{Format, format}
-import diagnostics.{Diag, diag_flush, diag_format, diag_source_file, diag_count, diag_warn_count, diag_ice_count, diag_register_source}
+import diagnostics.{Diag, diag_flush, diag_format, diag_source_file, diag_count, diag_warn_count, diag_ice_count, diag_register_source, diag_panic_exit}
 import check_pipeline.{run_build_analyses}
 import std.path.{path_dirname, path_join}
 import ast_dump.{ast_to_json}
@@ -26,129 +26,184 @@ fn write_output(path: Str, text: Str) ! FS.Write, IO, Env.Exit {
     }
 }
 
+// Every panic in the compiler is a compiler bug, so the hook reports each one as an internal
+// error (diag_panic_exit) in place of the bare panic report.
 fn main() {
-    let argv = env.args()
-    tune_compiler_gc(env.var("GC_FREE_SPACE_DIVISOR"))
+    with on_panic(fn(p) { diag_panic_exit(p.message, p.file, p.line) }) {
+        let argv = env.args()
+        tune_compiler_gc(env.var("GC_FREE_SPACE_DIVISOR"))
 
-    // Fine-grained internal trace channels (ast.dbg_trace), mirroring src/cli.bl's own
-    // startup. blinkc needs its own copy because `dbg_channels` is a plain global with no
-    // reader-side env lookup, and blinkc is the only MONOLITHIC emitter — without this the
-    // whole trace surface is dark in exactly the build mode `blink build` cannot produce.
-    // Empty = off (zero cost).
-    dbg_channels = env.var("BLINK_TRACE_CHANNELS") ?? ""
-    quiet_manifest_lib()
+        // Fine-grained internal trace channels (ast.dbg_trace), mirroring src/cli.bl's own
+        // startup. blinkc needs its own copy because `dbg_channels` is a plain global with no
+        // reader-side env lookup, and blinkc is the only MONOLITHIC emitter — without this the
+        // whole trace surface is dark in exactly the build mode `blink build` cannot produce.
+        // Empty = off (zero cost).
+        dbg_channels = env.var("BLINK_TRACE_CHANNELS") ?? ""
+        quiet_manifest_lib()
 
-    if argv.len() < 2 {
-        print_usage()
-        return
-    }
-
-    let mut source_path = ""
-    let mut out_path = ""
-    let mut emit_mode = ""
-    let mut stats_mode = 0
-    let mut check_only = 0
-    let mut dump_ast = 0
-    let mut blink_trace_flag = ""
-    let mut link_archive_header = ""
-    let mut cg_debug_mode = 0
-    let mut cg_test_build = 0
-    let mut cg_user_tu_mode = 0
-    let mut cg_skip_modules: Map[Str, Int] = Map()
-    let mut format_flag = ""
-    let mut json_flag = false
-    let mut i = 1
-    while i < argv.len() {
-        let arg = argv.get(i).unwrap()
-        if arg == "--format" {
-            if i + 1 < argv.len() {
-                i = i + 1
-                format_flag = argv.get(i).unwrap()
-            }
-        } else if arg == "--json" {
-            json_flag = true
-        } else if arg == "--emit" {
-            if i + 1 < argv.len() {
-                i = i + 1
-                emit_mode = argv.get(i).unwrap()
-            }
-        } else if arg == "--debug" {
-            cg_debug_mode = 1
-        } else if arg == "--test-build" {
-            cg_test_build = 1
-        } else if arg == "--stats" {
-            stats_mode = 1
-        } else if arg == "--check-only" {
-            check_only = 1
-        } else if arg == "--dump-ast" {
-            dump_ast = 1
-        } else if arg == "--blink-trace" || arg == "--pact-trace" {
-            if i + 1 < argv.len() {
-                i = i + 1
-                blink_trace_flag = argv.get(i).unwrap()
-            }
-        } else if arg == "--link-archive" {
-            if i + 1 < argv.len() {
-                i = i + 1
-                link_archive_header = argv.get(i).unwrap()
-            }
-        } else if source_path == "" {
-            source_path = arg
-        } else {
-            out_path = arg
+        if argv.len() < 2 {
+            print_usage()
+            return
         }
-        i = i + 1
-    }
-    // human names the default. --json is the short form of --format json, so beside another
-    // format it asks for two at once.
-    if format_flag != "" && format_flag != "json" && format_flag != "human" {
-        io.eprintln("error: --format must be json or human, got '{format_flag}'")
-        env.exit(1)
-    }
-    if json_flag && format_flag != "" && format_flag != "json" {
-        io.eprintln("error: --json conflicts with --format {format_flag}")
-        env.exit(1)
-    }
-    if json_flag || format_flag == "json" {
-        diag_format = 1
-    }
 
-    if source_path == "" {
-        print_usage()
-        return
-    }
+        let mut source_path = ""
+        let mut out_path = ""
+        let mut emit_mode = ""
+        let mut stats_mode = 0
+        let mut check_only = 0
+        let mut dump_ast = 0
+        let mut blink_trace_flag = ""
+        let mut link_archive_header = ""
+        let mut cg_debug_mode = 0
+        let mut cg_test_build = 0
+        let mut cg_user_tu_mode = 0
+        let mut cg_skip_modules: Map[Str, Int] = Map()
+        let mut format_flag = ""
+        let mut json_flag = false
+        let mut i = 1
+        while i < argv.len() {
+            let arg = argv.get(i).unwrap()
+            if arg == "--format" {
+                if i + 1 < argv.len() {
+                    i = i + 1
+                    format_flag = argv.get(i).unwrap()
+                }
+            } else if arg == "--json" {
+                json_flag = true
+            } else if arg == "--emit" {
+                if i + 1 < argv.len() {
+                    i = i + 1
+                    emit_mode = argv.get(i).unwrap()
+                }
+            } else if arg == "--debug" {
+                cg_debug_mode = 1
+            } else if arg == "--test-build" {
+                cg_test_build = 1
+            } else if arg == "--stats" {
+                stats_mode = 1
+            } else if arg == "--check-only" {
+                check_only = 1
+            } else if arg == "--dump-ast" {
+                dump_ast = 1
+            } else if arg == "--blink-trace" || arg == "--pact-trace" {
+                if i + 1 < argv.len() {
+                    i = i + 1
+                    blink_trace_flag = argv.get(i).unwrap()
+                }
+            } else if arg == "--link-archive" {
+                if i + 1 < argv.len() {
+                    i = i + 1
+                    link_archive_header = argv.get(i).unwrap()
+                }
+            } else if source_path == "" {
+                source_path = arg
+            } else {
+                out_path = arg
+            }
+            i = i + 1
+        }
+        // human names the default. --json is the short form of --format json, so beside another
+        // format it asks for two at once.
+        if format_flag != "" && format_flag != "json" && format_flag != "human" {
+            io.eprintln("error: --format must be json or human, got '{format_flag}'")
+            env.exit(1)
+        }
+        if json_flag && format_flag != "" && format_flag != "json" {
+            io.eprintln("error: --json conflicts with --format {format_flag}")
+            env.exit(1)
+        }
+        if json_flag || format_flag == "json" {
+            diag_format = 1
+        }
 
-    check_file_exists(source_path)
-    diag_source_file = source_path
-    trace_mode = blink_trace_flag
-    let src_root = find_src_root(source_path)
-    load_lint_overrides(src_root)
-    exit_if_input_unread()
-    let source = read_entry_or_exit(source_path)
-    diag_register_source(source_path, source)
+        if source_path == "" {
+            print_usage()
+            return
+        }
 
-    let t_lex_start = time_ms()
-    load_phase_begin()
-    lex(source)
-    let t_lex_end = time_ms()
-    pos = 0
-    let t_parse_start = time_ms()
-    let first_node_blinkc = node_count()
-    // Format (`--emit blink`) must round-trip the original `@expect_panic`
-    // surface syntax, so suppress the parse-time desugar on that path. The
-    // compile path keeps it enabled to gain the assert_panics machinery.
-    if emit_mode == "blink" {
-        parse_desugar_enabled = 0
-    }
-    let program_node = parse_program()
-    parse_desugar_enabled = 1
-    attach_comments_pass(program_node, first_node_blinkc)
-    let t_parse_end = time_ms()
+        check_file_exists(source_path)
+        diag_source_file = source_path
+        trace_mode = blink_trace_flag
+        let src_root = find_src_root(source_path)
+        load_lint_overrides(src_root)
+        exit_if_input_unread()
+        let source = read_entry_or_exit(source_path)
+        diag_register_source(source_path, source)
 
-    reject_empty_module_annotation(program_node)
+        let t_lex_start = time_ms()
+        load_phase_begin()
+        lex(source)
+        let t_lex_end = time_ms()
+        pos = 0
+        let t_parse_start = time_ms()
+        let first_node_blinkc = node_count()
+        // Format (`--emit blink`) must round-trip the original `@expect_panic`
+        // surface syntax, so suppress the parse-time desugar on that path. The
+        // compile path keeps it enabled to gain the assert_panics machinery.
+        if emit_mode == "blink" {
+            parse_desugar_enabled = 0
+        }
+        let program_node = parse_program()
+        parse_desugar_enabled = 1
+        attach_comments_pass(program_node, first_node_blinkc)
+        let t_parse_end = time_ms()
 
-    if emit_mode == "blink" {
+        reject_empty_module_annotation(program_node)
+
+        if emit_mode == "blink" {
+            load_phase_end()
+            if diag_ice_count > 0 {
+                diag_flush()
+                env.exit(101)
+            }
+            if diag_count > 0 {
+                diag_flush()
+                env.exit(1)
+            }
+            let fmt_output = format(program_node)
+            if out_path != "" {
+                write_output(out_path, fmt_output)
+            } else {
+                io.println(fmt_output)
+            }
+            return
+        }
+
+        loaded_inputs.files.push(source_path)
+        note_audit_dir(source_path)
+
+        let t_import_start = time_ms()
+        let mut imported_programs: List[Int] = []
+        collect_root_imports(program_node)
+        collect_imports(program_node, src_root, imported_programs)
+        inject_prelude(src_root, imported_programs)
         load_phase_end()
+        exit_if_input_unread()
+        check_embed_targets()
+        load_audit_records()
+        build_reexport_map(imported_programs)
+
+        let mut final_program = program_node
+        if imported_programs.len() > 0 {
+            final_program = merge_programs(program_node, imported_programs, import_map_nodes)
+        }
+        resolve_root_import_qualifiers()
+        tc_import_modules = import_map_modules
+        tc_import_qualifiers = import_map_qualifiers
+        tc_import_nodes = import_map_nodes
+        let t_import_end = time_ms()
+
+        if dump_ast == 1 {
+            io.println(ast_to_json(final_program))
+            return
+        }
+
+        let t_tc_start = time_ms()
+        let _tc_err_count = check_types(final_program)
+        let t_tc_end = time_ms()
+
+        check_unused_imports()
+
         if diag_ice_count > 0 {
             diag_flush()
             env.exit(101)
@@ -157,136 +212,85 @@ fn main() {
             diag_flush()
             env.exit(1)
         }
-        let fmt_output = format(program_node)
-        if out_path != "" {
-            write_output(out_path, fmt_output)
-        } else {
-            io.println(fmt_output)
-        }
-        return
-    }
-
-    loaded_inputs.files.push(source_path)
-    note_audit_dir(source_path)
-
-    let t_import_start = time_ms()
-    let mut imported_programs: List[Int] = []
-    collect_root_imports(program_node)
-    collect_imports(program_node, src_root, imported_programs)
-    inject_prelude(src_root, imported_programs)
-    load_phase_end()
-    exit_if_input_unread()
-    check_embed_targets()
-    load_audit_records()
-    build_reexport_map(imported_programs)
-
-    let mut final_program = program_node
-    if imported_programs.len() > 0 {
-        final_program = merge_programs(program_node, imported_programs, import_map_nodes)
-    }
-    resolve_root_import_qualifiers()
-    tc_import_modules = import_map_modules
-    tc_import_qualifiers = import_map_qualifiers
-    tc_import_nodes = import_map_nodes
-    let t_import_end = time_ms()
-
-    if dump_ast == 1 {
-        io.println(ast_to_json(final_program))
-        return
-    }
-
-    let t_tc_start = time_ms()
-    let _tc_err_count = check_types(final_program)
-    let t_tc_end = time_ms()
-
-    check_unused_imports()
-
-    if diag_ice_count > 0 {
-        diag_flush()
-        env.exit(101)
-    }
-    if diag_count > 0 {
-        diag_flush()
-        env.exit(1)
-    }
-    if diag_warn_count > 0 {
-        diag_flush()
-    }
-
-    // Check reports every error build would, so it runs the stages the build runs.
-    if check_only != 0 {
-        run_build_analyses(final_program, trace: false)
-        if diag_ice_count > 0 {
+        if diag_warn_count > 0 {
             diag_flush()
-            env.exit(101)
         }
-        if diag_count > 0 {
-            diag_flush()
-            env.exit(1)
-        }
-        return
-    }
 
-    let t_mut_start = time_ms()
-    run_build_analyses(final_program, trace: false)
-    let t_mut_end = time_ms()
-
-    if diag_count > 0 {
-        diag_flush()
-        env.exit(1)
-    }
-
-    if link_archive_header != "" {
-        let header_dir = path_dirname(link_archive_header)
-        let skip_path = path_join(header_dir, "skip_modules.txt")
-        let skip_src = read_entry_or_exit(skip_path)
-        let skip_lines = skip_src.split("\n")
-        let mut sl = 0
-        while sl < skip_lines.len() {
-            let key = skip_lines.get(sl).unwrap()
-            if key != "" {
-                cg_skip_modules.insert(key, 1)
+        // Check reports every error build would, so it runs the stages the build runs.
+        if check_only != 0 {
+            run_build_analyses(final_program, trace: false)
+            if diag_ice_count > 0 {
+                diag_flush()
+                env.exit(101)
             }
-            sl = sl + 1
+            if diag_count > 0 {
+                diag_flush()
+                env.exit(1)
+            }
+            return
         }
-        cg_user_tu_mode = 1
-    }
 
-    let t_cg_start = time_ms()
-    let cfg = CgConfig { debug_mode: cg_debug_mode, trace_codegen: 0, deterministic: 0,
-        emit_only_module: "", skip_modules: cg_skip_modules, user_tu_mode: cg_user_tu_mode,
-        blink_ev_extern_only: 0, archive_build_mode: 0, archive_over_std: 0, compiler_archive_modules: Map(),
-        test_build: cg_test_build }
-    let c_output = generate(final_program, cfg)
-    let t_cg_end = time_ms()
+        let t_mut_start = time_ms()
+        run_build_analyses(final_program, trace: false)
+        let t_mut_end = time_ms()
 
-    if diag_ice_count > 0 {
-        diag_flush()
-        env.exit(101)
-    }
-    if diag_count > 0 {
-        diag_flush()
-        env.exit(1)
-    }
-    if diag_warn_count > 0 {
-        diag_flush()
-    }
+        if diag_count > 0 {
+            diag_flush()
+            env.exit(1)
+        }
 
-    if out_path != "" {
-        write_output(out_path, c_output)
-    } else {
-        io.println(c_output)
-    }
+        if link_archive_header != "" {
+            let header_dir = path_dirname(link_archive_header)
+            let skip_path = path_join(header_dir, "skip_modules.txt")
+            let skip_src = read_entry_or_exit(skip_path)
+            let skip_lines = skip_src.split("\n")
+            let mut sl = 0
+            while sl < skip_lines.len() {
+                let key = skip_lines.get(sl).unwrap()
+                if key != "" {
+                    cg_skip_modules.insert(key, 1)
+                }
+                sl = sl + 1
+            }
+            cg_user_tu_mode = 1
+        }
 
-    if stats_mode == 1 {
-        let lex_ms = t_lex_end - t_lex_start
-        let parse_ms = t_parse_end - t_parse_start
-        let import_ms = t_import_end - t_import_start
-        let typecheck_ms = t_tc_end - t_tc_start
-        let mutation_ms = t_mut_end - t_mut_start
-        let codegen_ms = t_cg_end - t_cg_start
-        let total_ms = t_cg_end - t_lex_start
-        let q = "\""
-        io.eprintln("\{{q}lex_ms{q}:{lex_ms},{q}parse_ms{q}:{parse_ms},{q}import_ms{q}:{import_ms},{q}typecheck_ms{q}:{typecheck_ms},{q}mutation_ms{q}:{mutation_ms},{q}codegen_ms{q}:{codegen_ms},{q}total_ms{q}:{total_ms}\}")
+        let t_cg_start = time_ms()
+        let cfg = CgConfig { debug_mode: cg_debug_mode, trace_codegen: 0, deterministic: 0,
+            emit_only_module: "", skip_modules: cg_skip_modules, user_tu_mode: cg_user_tu_mode,
+            blink_ev_extern_only: 0, archive_build_mode: 0, archive_over_std: 0, compiler_archive_modules: Map(),
+            test_build: cg_test_build }
+        let c_output = generate(final_program, cfg)
+        let t_cg_end = time_ms()
+
+        if diag_ice_count > 0 {
+            diag_flush()
+            env.exit(101)
+        }
+        if diag_count > 0 {
+            diag_flush()
+            env.exit(1)
+        }
+        if diag_warn_count > 0 {
+            diag_flush()
+        }
+
+        if out_path != "" {
+            write_output(out_path, c_output)
+        } else {
+            io.println(c_output)
+        }
+
+        if stats_mode == 1 {
+            let lex_ms = t_lex_end - t_lex_start
+            let parse_ms = t_parse_end - t_parse_start
+            let import_ms = t_import_end - t_import_start
+            let typecheck_ms = t_tc_end - t_tc_start
+            let mutation_ms = t_mut_end - t_mut_start
+            let codegen_ms = t_cg_end - t_cg_start
+            let total_ms = t_cg_end - t_lex_start
+            let q = "\""
+            io.eprintln("\{{q}lex_ms{q}:{lex_ms},{q}parse_ms{q}:{parse_ms},{q}import_ms{q}:{import_ms},{q}typecheck_ms{q}:{typecheck_ms},{q}mutation_ms{q}:{mutation_ms},{q}codegen_ms{q}:{codegen_ms},{q}total_ms{q}:{total_ms}\}")
+        }
     }
 }

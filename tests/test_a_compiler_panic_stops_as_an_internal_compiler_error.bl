@@ -1,0 +1,76 @@
+// Every panic in the compiler is a compiler bug, not only the ones a stage raises on purpose
+// (diag_ice_abort). The panic hook in each compiler main reports one as I0021 CompilerPanic: an
+// internal compiler error on stderr in the format the run asked for, with a note that names the
+// place of the panic, the command's internal error line on stdout, and exit 101. The probes run
+// in a child run of a plain build of this file, whose main installs the same hook as the
+// compiler mains.
+
+import compile_test_helpers
+import std.process.{ProcessResult, ChildEnd}
+import diagnostics.{diag_set_abort_status_line, diag_format, diag_panic_exit, diag_set_abort_lsp}
+import check_pipeline.{check_status_line}
+
+fn probe(which: Str) -> ProcessResult ! Process.Spawn, FS.Read, IO, Env.Read {
+    let exe = compile_test_helpers.main_binary_of("tests/test_a_compiler_panic_stops_as_an_internal_compiler_error.bl")
+    process.run("sh", ["-c", "COMPILER_PANIC_PROBE={which} {exe}"]).unwrap()
+}
+
+test "a plain panic in the compiler stops as a CompilerPanic internal compiler error" {
+    let r = probe("plain")
+    assert_eq(r.end, ChildEnd.Exited(101))
+    assert_eq(r.out, "")
+    assert(r.err_out.contains("internal compiler error[CompilerPanic]: a probe panic\n"), "stderr: {r.err_out}")
+    assert(r.err_out.contains("the compiler panicked at tests/test_a_compiler_panic_stops_as_an_internal_compiler_error.bl:"), "stderr: {r.err_out}")
+    assert_eq(r.err_out.split("This is a compiler bug").len() - 1, 1)
+    assert(!r.err_out.contains("panic: a probe panic"), "the bare panic report ran too: {r.err_out}")
+}
+
+test "a runtime fault in the compiler, an unwrap of None, stops as a CompilerPanic" {
+    let r = probe("unwrap_none")
+    assert_eq(r.end, ChildEnd.Exited(101))
+    assert(r.err_out.contains("internal compiler error[CompilerPanic]: "), "stderr: {r.err_out}")
+    assert(!r.err_out.contains("FAIL"), "stderr: {r.err_out}")
+}
+
+test "under json diagnostics a compiler panic is one I0021 internal error row" {
+    let r = probe("plain_format_json")
+    assert_eq(r.end, ChildEnd.Exited(101))
+    assert_eq(r.out, "")
+    let row = "\{\"severity\":\"ice\",\"name\":\"CompilerPanic\",\"code\":\"I0021\",\"message\":\"a probe panic\""
+    assert(r.err_out.starts_with(row), "stderr has no I0021 row: {r.err_out}")
+    assert(r.err_out.trim().split("\n").len() == 1, "stderr is not the one row: {r.err_out}")
+}
+
+test "a check --json that panics prints the ice status line on stdout" {
+    let line = check_status_line("main.bl", 1, 0, 1, 0, 0)
+    let r = probe("plain_json_status")
+    assert_eq(r.end, ChildEnd.Exited(101))
+    assert_eq(r.out, "{line}\n")
+}
+
+test "a language server check that panics writes the internal error frames on stdout" {
+    let r = probe("plain_lsp")
+    assert_eq(r.end, ChildEnd.Exited(101))
+    assert(r.out.contains("Content-Length: "), "stdout: {r.out}")
+    assert(r.out.contains("file:///probe.bl"), "stdout: {r.out}")
+    assert(r.out.contains("I0021"), "stdout: {r.out}")
+    assert(r.out.contains("a probe panic"), "stdout: {r.out}")
+}
+
+fn main() {
+    with on_panic(fn(p) { diag_panic_exit(p.message, p.file, p.line) }) {
+        let which = env.var("COMPILER_PANIC_PROBE") ?? ""
+        if which == "" { return }
+        if which == "plain_format_json" { diag_format = 1 }
+        if which == "plain_json_status" {
+            diag_set_abort_status_line(check_status_line("main.bl", 1, 0, 1, 0, 0))
+        }
+        if which == "plain_lsp" { diag_set_abort_lsp("file:///probe.bl", None) }
+        if which.starts_with("plain") { panic("a probe panic") }
+        if which == "unwrap_none" {
+            let empty: List[Int] = []
+            io.eprintln("{empty.get(0).unwrap()}")
+        }
+        io.eprintln("FAIL: {which} did not stop")
+    }
+}

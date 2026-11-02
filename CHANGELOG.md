@@ -93,6 +93,7 @@ Single source of truth for release history. `blink llms` and `blink llms --full`
 
 ## Fixes (v0.59.0)
 
+- **A panic in the compiler is an internal compiler error.** An unwrap of `None`, an index out of bounds or a formatter fault in `blink` or `blinkc` now reports I0021 CompilerPanic in the run's diagnostic format, with a note that names the place in the compiler, and exits 101. `blink check` still prints its status line, and `blink lsp` still publishes the fault before it exits.
 - **`Str.byte_index_of` with a `from` inside a codepoint has a site.** The panic now reaches the hook with a file and a line, and the text has no `blink: ` lead-in. A `Str` with a continuation byte at byte 0, which `fs.read` can give, gets the same panic.
 - **A duplicate `for_each` label outside a test has a site.** The duplicate is now a `panic()` in `std.testing`, so it reaches the panic hook with a file and a line. Inside a test run it stays a panicked case and the next case still runs.
 - **A bad call of the default `Rand` operations has a site.** A handler that calls `default.int(hi, lo)` or `default.bytes(-1)` now gets a panic with a file and a line, which reaches the panic hook. The text starts with `rand.int: ` or `rand.bytes: `, not `Rand default handler: `.

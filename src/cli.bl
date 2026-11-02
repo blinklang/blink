@@ -89,7 +89,7 @@ import diagnostics.{
     embedded_inner_key, diag_entry_text, diag_normalize_path, diag_usage_error_text, diag_register_source, json_escape,
     MISSING_NATIVE_DEP, NATIVE_DEP_UNAVAILABLE_CROSS, INCOMPATIBLE_STDLIB_ARCHIVE,
     TEST_RESULT_LOST, TEST_BINARY_DID_NOT_RUN, TEST_BUILD_ENDED_WITHOUT_DIAGNOSTIC, GENERATED_C_DID_NOT_COMPILE,
-    LINK_FAILED, NATIVE_DEPENDENCY_BUILD_FAILED,
+    LINK_FAILED, NATIVE_DEPENDENCY_BUILD_FAILED, diag_panic_exit,
 }
 import daemon.{Daemon, DaemonBuild, daemon_start, daemon_socket_path, daemon_send, daemon_proc_identity}
 import docgen.{generate_doc}
@@ -7594,232 +7594,236 @@ fn cli_parser() -> ArgParser {
     p
 }
 
+// Every panic in the compiler is a compiler bug, so the hook reports each one as an internal
+// error (diag_panic_exit) in place of the bare panic report.
 fn main() {
-    let argv = env.args()
-    tune_compiler_gc(env.var("GC_FREE_SPACE_DIVISOR"))
-    init_embedded_stdlib()
+    with on_panic(fn(p) { diag_panic_exit(p.message, p.file, p.line) }) {
+        let argv = env.args()
+        tune_compiler_gc(env.var("GC_FREE_SPACE_DIVISOR"))
+        init_embedded_stdlib()
 
-    // Fine-grained internal trace channels (ast.dbg_trace). Comma-separated
-    // channel names, or "all". Empty = off (zero cost). Set once here so every
-    // command path (build/run/check + hidden archive/per-module emitters) sees it.
-    dbg_channels = env.var("BLINK_TRACE_CHANNELS") ?? ""
-    quiet_manifest_lib()
+        // Fine-grained internal trace channels (ast.dbg_trace). Comma-separated
+        // channel names, or "all". Empty = off (zero cost). Set once here so every
+        // command path (build/run/check + hidden archive/per-module emitters) sees it.
+        dbg_channels = env.var("BLINK_TRACE_CHANNELS") ?? ""
+        quiet_manifest_lib()
 
-    if argv.len() >= 2 && argv.get(1).unwrap() == "__emit-archive-header" {
-        let mut hidden_args: List[Str] = []
-        let mut hi = 2
-        while hi < argv.len() {
-            hidden_args.push(argv.get(hi).unwrap())
-            hi = hi + 1
+        if argv.len() >= 2 && argv.get(1).unwrap() == "__emit-archive-header" {
+            let mut hidden_args: List[Str] = []
+            let mut hi = 2
+            while hi < argv.len() {
+                hidden_args.push(argv.get(hi).unwrap())
+                hi = hi + 1
+            }
+            cmd_emit_archive_header(hidden_args)
+            return
         }
-        cmd_emit_archive_header(hidden_args)
-        return
-    }
 
-    // A test that speaks the daemon's protocol itself sends the fields a check with no flags
-    // names, as only this compiler under this environment can spell them.
-    if argv.len() == 2 && argv.get(1).unwrap() == "__daemon-front-fields" {
-        io.println(json_encode(daemon_front_request("check", front_settings(false))))
-        return
-    }
-
-    if argv.len() >= 2 && argv.get(1).unwrap() == "__emit-per-module" {
-        let mut hidden_args: List[Str] = []
-        let mut hi = 2
-        while hi < argv.len() {
-            hidden_args.push(argv.get(hi).unwrap())
-            hi = hi + 1
+        // A test that speaks the daemon's protocol itself sends the fields a check with no flags
+        // names, as only this compiler under this environment can spell them.
+        if argv.len() == 2 && argv.get(1).unwrap() == "__daemon-front-fields" {
+            io.println(json_encode(daemon_front_request("check", front_settings(false))))
+            return
         }
-        cmd_emit_per_module(hidden_args)
-        return
-    }
 
-    // The build a `blink test` worker makes: `blink build` with the same arguments, but a test
-    // build. It is not a public flag, since no command but `blink test` makes a test build.
-    if argv.len() >= 2 && argv.get(1).unwrap() == "__test-build" {
-        let mut build_argv: List[Str] = [argv.get(0).unwrap(), "build"]
-        let mut hi = 2
-        while hi < argv.len() {
-            build_argv.push(argv.get(hi).unwrap())
-            hi = hi + 1
+        if argv.len() >= 2 && argv.get(1).unwrap() == "__emit-per-module" {
+            let mut hidden_args: List[Str] = []
+            let mut hi = 2
+            while hi < argv.len() {
+                hidden_args.push(argv.get(hi).unwrap())
+                hi = hi + 1
+            }
+            cmd_emit_per_module(hidden_args)
+            return
         }
+
+        // The build a `blink test` worker makes: `blink build` with the same arguments, but a test
+        // build. It is not a public flag, since no command but `blink test` makes a test build.
+        if argv.len() >= 2 && argv.get(1).unwrap() == "__test-build" {
+            let mut build_argv: List[Str] = [argv.get(0).unwrap(), "build"]
+            let mut hi = 2
+            while hi < argv.len() {
+                build_argv.push(argv.get(hi).unwrap())
+                hi = hi + 1
+            }
+            let p = cli_parser()
+            let a = parse_argv(p, build_argv)
+            let err = args_error(a)
+            if err == "help" || err == "version" {
+                return
+            }
+            if err != "" {
+                io.eprintln("error: {err}")
+                env.exit(1)
+            }
+            build_here(p, a, None, true)
+            return
+        }
+
+        if argv.len() >= 3 && argv.get(1).unwrap() == "__build-compiler-archive" {
+            let mut roots: List[Str] = []
+            let mut ri = 3
+            while ri < argv.len() {
+                roots.push(argv.get(ri).unwrap())
+                ri = ri + 1
+            }
+            // The compiler archive records the stdlib archive it was built against.
+            let arc_rc = ensure_dev_archive()
+            if arc_rc != 0 {
+                env.exit(arc_rc)
+            }
+            let rc = build_compiler_archive(argv.get(2).unwrap(), roots)
+            if rc != 0 {
+                env.exit(rc)
+            }
+            return
+        }
+
+        if argv.len() >= 2 && argv.get(1).unwrap() == "__build-stdlib-archive" {
+            let rc = build_stdlib_archive(peeled_module_keys())
+            if rc != 0 {
+                env.exit(rc)
+            }
+            return
+        }
+
+        // Pipe-separated record per registered native dep, sourced from the
+        // stdlib_native_deps registry. Taskfile install + cross-compile loops
+        // consume this so they never hardcode a dep name.
+        // Format: name|source_paths(comma)|header_dir|compile_defs(comma)|gate_macro
+        if argv.len() >= 2 && argv.get(1).unwrap() == "__native-deps" {
+            let names = stdlib_native_dep_names()
+            let mut ni = 0
+            while ni < names.len() {
+                let n = names.get(ni).unwrap()
+                let srcs = stdlib_native_dep_source_paths(n).join(",")
+                let hdr = stdlib_native_dep_header_dir(n)
+                let defs = stdlib_native_dep_compile_defs(n).join(",")
+                let gate = stdlib_native_dep_gate_macro(n)
+                io.println("{n}|{srcs}|{hdr}|{defs}|{gate}")
+                ni = ni + 1
+            }
+            return
+        }
+
+        if argv.len() >= 2 && argv.get(1).unwrap() == "cache" {
+            let mut sub = ""
+            if argv.len() >= 3 {
+                sub = argv.get(2).unwrap()
+            }
+            if sub == "" || sub == "info" {
+                env.exit(build_objcache.cmd_info())
+            }
+            if sub == "clean" {
+                let mut older = ""
+                let mut ai = 3
+                while ai < argv.len() {
+                    let a = argv.get(ai).unwrap()
+                    if a == "--older-than" && ai + 1 < argv.len() {
+                        older = argv.get(ai + 1).unwrap()
+                        ai = ai + 2
+                    } else {
+                        ai = ai + 1
+                    }
+                }
+                env.exit(build_objcache.cmd_clean(older))
+            }
+            if sub == "key" {
+                let mut text = ""
+                if argv.len() >= 4 {
+                    text = argv.get(3).unwrap()
+                }
+                env.exit(build_objcache.cmd_key(text))
+            }
+            if sub == "__lookup" && argv.len() >= 4 {
+                env.exit(build_objcache.cmd_internal_lookup(argv.get(3).unwrap()))
+            }
+            if sub == "__store" && argv.len() >= 7 {
+                env.exit(build_objcache.cmd_internal_store(argv.get(3).unwrap(), argv.get(4).unwrap(), argv.get(5).unwrap(), argv.get(6).unwrap()))
+            }
+            if sub == "__gc" {
+                env.exit(build_objcache.cmd_internal_gc())
+            }
+            io.eprintln("usage: blink cache <info|clean [--older-than DUR]|key>")
+            env.exit(1)
+        }
+
         let p = cli_parser()
-        let a = parse_argv(p, build_argv)
+
+        let a = parse_cli_argv(p, argv)
+
         let err = args_error(a)
         if err == "help" || err == "version" {
             return
         }
         if err != "" {
+            // A command line blink can not act on is a usage error: it exits 1 like any other
+            // failing command, with the message on stderr, so a script sees the failure. The
+            // parser stops at the bad argument, so --json or --format json counts only when it came
+            // first.
             io.eprintln("error: {err}")
+            if args_command_path(a).join(" ") == "check" && json_requested(a) {
+                io.println(check_failed_status_line(args_positional(a, 0)))
+            }
             env.exit(1)
         }
-        build_here(p, a, None, true)
-        return
-    }
 
-    if argv.len() >= 3 && argv.get(1).unwrap() == "__build-compiler-archive" {
-        let mut roots: List[Str] = []
-        let mut ri = 3
-        while ri < argv.len() {
-            roots.push(argv.get(ri).unwrap())
-            ri = ri + 1
+        let command = args_command(a)
+        if command == "" {
+            io.println(generate_help(p))
+            return
         }
-        // The compiler archive records the stdlib archive it was built against.
-        let arc_rc = ensure_dev_archive()
-        if arc_rc != 0 {
-            env.exit(arc_rc)
-        }
-        let rc = build_compiler_archive(argv.get(2).unwrap(), roots)
-        if rc != 0 {
-            env.exit(rc)
-        }
-        return
-    }
 
-    if argv.len() >= 2 && argv.get(1).unwrap() == "__build-stdlib-archive" {
-        let rc = build_stdlib_archive(peeled_module_keys())
-        if rc != 0 {
-            env.exit(rc)
+        if command == "init" {
+            cmd_init(p, a)
+        } else if command == "llms" {
+            cmd_llms(p, a)
+        } else if command == "build" {
+            cmd_build(p, a)
+        } else if command == "run" {
+            cmd_run(p, a)
+        } else if command == "test" {
+            cmd_test(p, a)
+        } else if command == "check" {
+            cmd_check(p, a)
+        } else if command == "fix" {
+            cmd_fix(p, a)
+        } else if command == "fmt" {
+            cmd_fmt(p, a)
+        } else if command == "audit" {
+            cmd_audit(p, a)
+        } else if command == "add" {
+            cmd_add(p, a)
+        } else if command == "remove" {
+            cmd_remove(p, a)
+        } else if command == "update" {
+            cmd_update(p, a)
+        } else if command == "doc" {
+            cmd_doc(p, a)
+        } else if command == "query" {
+            cmd_query(p, a)
+        } else if command == "daemon start" {
+            cmd_daemon_start(p, a)
+        } else if command == "daemon status" {
+            cmd_daemon_status(p, a)
+        } else if command == "daemon stop" {
+            cmd_daemon_stop(p, a)
+        } else if command == "daemon" {
+            cmd_daemon_bare(p, a)
+        } else if command == "shim init" {
+            cmd_shim_init(p, a)
+        } else if command == "shim" {
+            cmd_shim_bare(p, a)
+        } else if command == "explain" {
+            cmd_explain(p, a)
+        } else if command == "ast" {
+            cmd_ast(p, a)
+        } else if command == "lsp" {
+            cmd_lsp(p, a)
+        } else {
+            io.eprintln("error: unknown command '{command}'")
+            io.eprintln(generate_help(p))
+            env.exit(1)
         }
-        return
-    }
-
-    // Pipe-separated record per registered native dep, sourced from the
-    // stdlib_native_deps registry. Taskfile install + cross-compile loops
-    // consume this so they never hardcode a dep name.
-    // Format: name|source_paths(comma)|header_dir|compile_defs(comma)|gate_macro
-    if argv.len() >= 2 && argv.get(1).unwrap() == "__native-deps" {
-        let names = stdlib_native_dep_names()
-        let mut ni = 0
-        while ni < names.len() {
-            let n = names.get(ni).unwrap()
-            let srcs = stdlib_native_dep_source_paths(n).join(",")
-            let hdr = stdlib_native_dep_header_dir(n)
-            let defs = stdlib_native_dep_compile_defs(n).join(",")
-            let gate = stdlib_native_dep_gate_macro(n)
-            io.println("{n}|{srcs}|{hdr}|{defs}|{gate}")
-            ni = ni + 1
-        }
-        return
-    }
-
-    if argv.len() >= 2 && argv.get(1).unwrap() == "cache" {
-        let mut sub = ""
-        if argv.len() >= 3 {
-            sub = argv.get(2).unwrap()
-        }
-        if sub == "" || sub == "info" {
-            env.exit(build_objcache.cmd_info())
-        }
-        if sub == "clean" {
-            let mut older = ""
-            let mut ai = 3
-            while ai < argv.len() {
-                let a = argv.get(ai).unwrap()
-                if a == "--older-than" && ai + 1 < argv.len() {
-                    older = argv.get(ai + 1).unwrap()
-                    ai = ai + 2
-                } else {
-                    ai = ai + 1
-                }
-            }
-            env.exit(build_objcache.cmd_clean(older))
-        }
-        if sub == "key" {
-            let mut text = ""
-            if argv.len() >= 4 {
-                text = argv.get(3).unwrap()
-            }
-            env.exit(build_objcache.cmd_key(text))
-        }
-        if sub == "__lookup" && argv.len() >= 4 {
-            env.exit(build_objcache.cmd_internal_lookup(argv.get(3).unwrap()))
-        }
-        if sub == "__store" && argv.len() >= 7 {
-            env.exit(build_objcache.cmd_internal_store(argv.get(3).unwrap(), argv.get(4).unwrap(), argv.get(5).unwrap(), argv.get(6).unwrap()))
-        }
-        if sub == "__gc" {
-            env.exit(build_objcache.cmd_internal_gc())
-        }
-        io.eprintln("usage: blink cache <info|clean [--older-than DUR]|key>")
-        env.exit(1)
-    }
-
-    let p = cli_parser()
-
-    let a = parse_cli_argv(p, argv)
-
-    let err = args_error(a)
-    if err == "help" || err == "version" {
-        return
-    }
-    if err != "" {
-        // A command line blink can not act on is a usage error: it exits 1 like any other
-        // failing command, with the message on stderr, so a script sees the failure. The
-        // parser stops at the bad argument, so --json or --format json counts only when it came
-        // first.
-        io.eprintln("error: {err}")
-        if args_command_path(a).join(" ") == "check" && json_requested(a) {
-            io.println(check_failed_status_line(args_positional(a, 0)))
-        }
-        env.exit(1)
-    }
-
-    let command = args_command(a)
-    if command == "" {
-        io.println(generate_help(p))
-        return
-    }
-
-    if command == "init" {
-        cmd_init(p, a)
-    } else if command == "llms" {
-        cmd_llms(p, a)
-    } else if command == "build" {
-        cmd_build(p, a)
-    } else if command == "run" {
-        cmd_run(p, a)
-    } else if command == "test" {
-        cmd_test(p, a)
-    } else if command == "check" {
-        cmd_check(p, a)
-    } else if command == "fix" {
-        cmd_fix(p, a)
-    } else if command == "fmt" {
-        cmd_fmt(p, a)
-    } else if command == "audit" {
-        cmd_audit(p, a)
-    } else if command == "add" {
-        cmd_add(p, a)
-    } else if command == "remove" {
-        cmd_remove(p, a)
-    } else if command == "update" {
-        cmd_update(p, a)
-    } else if command == "doc" {
-        cmd_doc(p, a)
-    } else if command == "query" {
-        cmd_query(p, a)
-    } else if command == "daemon start" {
-        cmd_daemon_start(p, a)
-    } else if command == "daemon status" {
-        cmd_daemon_status(p, a)
-    } else if command == "daemon stop" {
-        cmd_daemon_stop(p, a)
-    } else if command == "daemon" {
-        cmd_daemon_bare(p, a)
-    } else if command == "shim init" {
-        cmd_shim_init(p, a)
-    } else if command == "shim" {
-        cmd_shim_bare(p, a)
-    } else if command == "explain" {
-        cmd_explain(p, a)
-    } else if command == "ast" {
-        cmd_ast(p, a)
-    } else if command == "lsp" {
-        cmd_lsp(p, a)
-    } else {
-        io.eprintln("error: unknown command '{command}'")
-        io.eprintln(generate_help(p))
-        env.exit(1)
     }
 }
