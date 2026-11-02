@@ -15,7 +15,7 @@ import parser.{
     sublist_length,
 }
 import typecheck.{
-    TyKind, TYPE_INT, TYPE_STR, make_ffi_scope_type, make_fn_type, make_handler_type, tc_resolve,
+    TyKind, TYPE_INT, TYPE_STR, TYPE_VOID, make_ffi_scope_type, make_fn_type, make_handler_type, tc_resolve,
     tc_impl_owner_decl, tc_tid_decl_node, tc_tid_handler_effect, tc_tid_kind, tc_void_tid, tk_name, ty_pool,
     tc_call_decl_node, tc_call_user_effect, tc_decl_ret_tid, tc_handler_effect_root, tc_impl_trait_id, io_read_ops, is_io_read_derived_op, IO_READ_PRIMITIVE, handles_io_read,
 }
@@ -1798,6 +1798,16 @@ fn io_read_checked_count(node: Int, count: Int) -> Int ! Diag.Report {
     ir_call_runtime(TYPE_INT, node, rec.c_spelling, c_runtime_helper("io_read_bytes_count_at"), rec.slot_form, [count].append(site))
 }
 
+// Leaves the site of a read_line or read_all for the runtime default, which a vtable slot cannot
+// pass it to. read_bytes leaves its site in the count check. False when a layout stopped.
+fn note_io_read_site(node: Int) -> Bool ! Diag.Report {
+    let rec = perform_layout(TYPE_VOID, Position.Local, node)
+    let site = x_site_args(node)
+    if rec.c_spelling == "" || site.is_empty() { return false }
+    cg_expr_push_pending(node, ir_expr_stmt(node, ir_call_runtime(TYPE_VOID, node, rec.c_spelling, c_runtime_helper("io_read_site"), rec.slot_form, site)))
+    true
+}
+
 fn perform_op(node: Int, handler_tid: Int, op: Str) -> Int ! Diag.Report {
     match lower_args(node) {
         None => -1
@@ -1820,6 +1830,7 @@ fn perform_lowered(node: Int, handler_tid: Int, op: Str, lowered: List[Int]) -> 
     let traced = cg_trace_builtin_effect(node, tc_handler_effect_root(tc_tid_handler_effect(handler_tid)), op, lowered)
     let read = slot_read(node, handler_tid)
     if read < 0 { return -1 }
+    if c_ev_field_name(handler_tid) == NS_IO && is_io_read_derived_op(op) && !note_io_read_site(node) { return -1 }
     if c_ev_field_name(handler_tid) != NS_IO || op != IO_READ_PRIMITIVE || traced.len() != 1 {
         return ir_effect_perform(tid, node, rec.c_spelling, slot, rec.slot_form, read, traced)
     }

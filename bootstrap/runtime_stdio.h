@@ -139,19 +139,38 @@ BLINK_RT_FN const char* blink_stdin_take_text(int64_t n, int64_t skip, blink_std
 }
 #endif
 
+/* The Blink call that reached this read. A second read on this thread never sees it. */
+typedef struct {
+    const char* file;
+    int64_t line;
+} blink_stdin_site_t;
+
+BLINK_RT_FN blink_stdin_site_t blink_stdin_take_site(void);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN blink_stdin_site_t blink_stdin_take_site(void) {
+    blink_stdin_site_t site = {__blink_io_read_site_file, __blink_io_read_site_line};
+    __blink_io_read_site_file = NULL;
+    return site;
+}
+#endif
+
 /* Panics for a recorded fault, naming op; returns when there is none. The caller has
    dropped blink_stdin_mu. */
-BLINK_RT_FN void blink_stdin_raise(const char* op, const blink_stdin_fault_t* f);
+BLINK_RT_FN void blink_stdin_raise(const char* op, const blink_stdin_fault_t* f, blink_stdin_site_t site);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN void blink_stdin_raise(const char* op, const blink_stdin_fault_t* f) {
+BLINK_RT_FN void blink_stdin_raise(const char* op, const blink_stdin_fault_t* f, blink_stdin_site_t site) {
+    char msg[BLINK_PANIC_MSG_SIZE];
     if (f->err != 0) {
-        __blink_panic_dispatchf("%s: cannot read standard input: %s (errno %d)",
-                                op, blink_strerror(f->err), f->err);
+        snprintf(msg, sizeof msg, "%s: cannot read standard input: %s (errno %d)",
+                 op, blink_strerror(f->err), f->err);
+    } else if (f->why != NULL) {
+        snprintf(msg, sizeof msg, "%s: input is not valid UTF-8; read it with io.read_bytes "
+                 "(%s at byte %lld of the input)", op, f->why, (long long)f->at);
+    } else {
+        return;
     }
-    if (f->why != NULL) {
-        __blink_panic_dispatchf("%s: input is not valid UTF-8; read it with io.read_bytes "
-                                "(%s at byte %lld of the input)", op, f->why, (long long)f->at);
-    }
+    if (site.file != NULL) __blink_panic_dispatch_at(msg, site.file, site.line);
+    __blink_panic_dispatch(msg);
 }
 #endif
 
@@ -159,6 +178,7 @@ BLINK_RT_FN void blink_stdin_raise(const char* op, const blink_stdin_fault_t* f)
 BLINK_RT_FN blink_bytes* blink_stdin_read_bytes(int64_t n);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN blink_bytes* blink_stdin_read_bytes(int64_t n) {
+    blink_stdin_site_t site = blink_stdin_take_site();
     if (n <= 0) {
         __blink_panic_dispatchf("io.read_bytes: n must be at least 1, got %lld", (long long)n);
     }
@@ -179,7 +199,7 @@ BLINK_RT_FN blink_bytes* blink_stdin_read_bytes(int64_t n) {
         blink_stdin_advance(take);
     }
     pthread_mutex_unlock(&blink_stdin_mu);
-    blink_stdin_raise("io.read_bytes", &f);
+    blink_stdin_raise("io.read_bytes", &f, site);
     return b;
 }
 #endif
@@ -188,6 +208,7 @@ BLINK_RT_FN blink_bytes* blink_stdin_read_bytes(int64_t n) {
 BLINK_RT_FN const char* blink_stdin_read_line(void);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN const char* blink_stdin_read_line(void) {
+    blink_stdin_site_t site = blink_stdin_take_site();
     blink_stdin_reader_t* r = &blink_stdin_reader;
     blink_stdin_fault_t f = {0, NULL, 0};
     const char* line = NULL;
@@ -214,7 +235,7 @@ BLINK_RT_FN const char* blink_stdin_read_line(void) {
         }
     }
     pthread_mutex_unlock(&blink_stdin_mu);
-    blink_stdin_raise("io.read_line", &f);
+    blink_stdin_raise("io.read_line", &f, site);
     return line;
 }
 #endif
@@ -223,6 +244,7 @@ BLINK_RT_FN const char* blink_stdin_read_line(void) {
 BLINK_RT_FN const char* blink_stdin_read_all(void);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN const char* blink_stdin_read_all(void) {
+    blink_stdin_site_t site = blink_stdin_take_site();
     blink_stdin_fault_t f = {0, NULL, 0};
     const char* all = NULL;
     pthread_mutex_lock(&blink_stdin_mu);
@@ -231,7 +253,7 @@ BLINK_RT_FN const char* blink_stdin_read_all(void) {
         all = blink_stdin_take_text(blink_stdin_reader.end - blink_stdin_reader.start, 0, &f);
     }
     pthread_mutex_unlock(&blink_stdin_mu);
-    blink_stdin_raise("io.read_all", &f);
+    blink_stdin_raise("io.read_all", &f, site);
     return all;
 }
 #endif

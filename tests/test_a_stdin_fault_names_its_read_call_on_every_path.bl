@@ -1,0 +1,292 @@
+// A failed read of standard input is a panic of the read operation (sections/04_effects.md §4.4.9),
+// and it names the read call that reached the runtime (sections/02_syntax.md §2.20). The vtable
+// slot has no room for a site, so these tests cover each way a read reaches the default body.
+// Tests match the operation and the errno number, not the text of the OS error.
+
+import compile_test_helpers.{compile_and_run}
+
+fn prelude() -> Str {
+    #"import std.libc.{write_bytes}
+
+@ffi("close", header: "unistd.h")
+@trusted(audit: "TEST-STDIN-FAULT: read standard input with no such fd")
+fn t_close(fd: I32) -> I32 ! () {}
+
+@ffi("memfd_create", header: "sys/mman.h")
+@trusted(audit: "TEST-STDIN-FAULT: bytes that are not UTF-8 as standard input")
+fn t_memfd_create(name: Ptr[U8], flags: U32) -> I32 ! () {}
+
+@ffi("lseek", header: "unistd.h")
+@trusted(audit: "TEST-STDIN-FAULT: rewind the in-memory fd")
+fn t_lseek(fd: I32, offset: I64, whence: I32) -> I64 ! () {}
+
+fn no_stdin() {
+    let _ = t_close(0.to_i32())
+}
+
+// With fd 0 closed, the new fd is fd 0.
+fn stdin_ok_then_bad() ! IO {
+    let _ = t_close(0.to_i32())
+    let fd = with ffi.scope() as scope { t_memfd_create(scope.cstr("in"), 0.to_u32()).to_int() }
+    let mut data = Bytes.from_str("ok\nx")
+    data.push(255)
+    data = data.concat(Bytes.from_str("\n"))
+    let _ = write_bytes(fd, data)
+    let _ = t_lseek(fd.to_i32(), 0, 0)
+}
+
+fn report(p: PanicInfo) -> Never ! IO.Eprint, Env.Exit {
+    let at = match p.line {
+        Some(n) => "{p.file}:{n}"
+        None => p.file
+    }
+    io.eprintln("fatal: {p.message} at {at}")
+    env.exit(70)
+}
+"#
+}
+
+// The line of the first body line, so each body counts from one.
+fn site_line(in_body: Int) -> Int {
+    prelude().split("\n").len() - 1 + in_body
+}
+
+fn expect_site(body: Str, tag: Str, op: Str, line: Int, errno: Str) ! FS.Delete, FS.Write, Process.Spawn, FS.Read, Env.Read {
+    let r = compile_and_run(prelude().concat(body), tag)
+    assert(r.exit_code == 70, "exit {r.exit_code}: {r.err_out}")
+    assert(r.err_out.starts_with("fatal: {op}: "), r.err_out)
+    assert(r.err_out.contains(errno), r.err_out)
+    assert(r.err_out.ends_with("/{tag}.bl:{site_line(line)}\n"), r.err_out)
+}
+
+test "an os error in read_line names its call" {
+    expect_site(#"fn main() ! IO, Env {
+    no_stdin()
+    with on_panic(report) {
+        let _ = io.read_line()
+    }
+}
+"#, "sf_line_{getpid()}", "io.read_line", 4, "(errno 9)")
+}
+
+test "an os error in read_all names its call" {
+    expect_site(#"fn main() ! IO, Env {
+    no_stdin()
+    with on_panic(report) {
+        let _ = io.read_all()
+    }
+}
+"#, "sf_all_{getpid()}", "io.read_all", 4, "(errno 9)")
+}
+
+test "an os error in read_bytes names its call" {
+    expect_site(#"fn main() ! IO, Env {
+    no_stdin()
+    with on_panic(report) {
+        let _ = io.read_bytes(4)
+    }
+}
+"#, "sf_bytes_{getpid()}", "io.read_bytes", 4, "(errno 9)")
+}
+
+test "bad UTF-8 in read_line names its call" {
+    expect_site(#"fn main() ! IO, Env {
+    stdin_ok_then_bad()
+    with on_panic(report) {
+        let _ = io.read_line()
+        let _ = io.read_line()
+    }
+}
+"#, "sf_utf8_{getpid()}", "io.read_line", 5, "UTF-8")
+}
+
+test "bad UTF-8 in read_all names its call" {
+    expect_site(#"fn main() ! IO, Env {
+    stdin_ok_then_bad()
+    with on_panic(report) {
+        let _ = io.read_all()
+    }
+}
+"#, "sf_utf8_all_{getpid()}", "io.read_all", 4, "UTF-8")
+}
+
+test "a read in a closure names the line in the closure" {
+    expect_site(#"fn main() ! IO, Env {
+    no_stdin()
+    with on_panic(report) {
+        let take = fn() {
+            io.read_all()
+        }
+        io.println(take())
+    }
+}
+"#, "sf_closure_{getpid()}", "io.read_all", 5, "(errno 9)")
+}
+
+test "a read in a fn passed as a value names the line in that fn" {
+    expect_site(#"fn take() -> Str ! IO.Read {
+    io.read_all()
+}
+
+fn main() ! IO, Env {
+    no_stdin()
+    with on_panic(report) {
+        let f = take
+        io.println(f())
+    }
+}
+"#, "sf_fn_value_{getpid()}", "io.read_all", 2, "(errno 9)")
+}
+
+test "a read through default in a handler clause names the clause line" {
+    expect_site(#"fn main() ! IO, Env {
+    no_stdin()
+    with on_panic(report) {
+        with handler IO.Read {
+            fn read_bytes(n: Int) -> Bytes { default.read_bytes(n) }
+            fn read_line() -> Str? {
+                default.read_line()
+            }
+            fn read_all() -> Str { default.read_all() }
+        } {
+            let _ = io.read_line()
+        }
+    }
+}
+"#, "sf_default_{getpid()}", "io.read_line", 7, "(errno 9)")
+}
+
+// A read that a user handler answers leaves the site of the read that reaches the default.
+test "a read after one that a handler answered names its own line" {
+    expect_site(#"fn main() ! IO, Env {
+    no_stdin()
+    with on_panic(report) {
+        with handler IO.Read {
+            fn read_bytes(_n: Int) -> Bytes { Bytes.new() }
+            fn read_line() -> Str? { None }
+            fn read_all() -> Str { "" }
+        } {
+            let _ = io.read_line()
+        }
+        let _ = io.read_all()
+    }
+}
+"#, "sf_after_handler_{getpid()}", "io.read_all", 11, "(errno 9)")
+}
+
+// Reads in one expression run in program order, each with its own site.
+test "two reads in one call name the line of the read that failed" {
+    expect_site(#"fn both(a: Str?, b: Str?) -> Int {
+    if a == b { 1 } else { 2 }
+}
+
+fn main() ! IO, Env {
+    stdin_ok_then_bad()
+    with on_panic(report) {
+        let n = both(
+            io.read_line(),
+            io.read_line(),
+        )
+        io.println("{n}")
+    }
+}
+"#, "sf_two_reads_{getpid()}", "io.read_line", 10, "UTF-8")
+}
+
+// A later read must not rewrite the site of a read in the same expression that runs first.
+test "the first of two reads in one call names its own line" {
+    expect_site(#"fn both(a: Str?, b: Str?) -> Int {
+    if a == b { 1 } else { 2 }
+}
+
+fn main() ! IO, Env {
+    no_stdin()
+    with on_panic(report) {
+        let n = both(
+            io.read_line(),
+            io.read_line(),
+        )
+        io.println("{n}")
+    }
+}
+"#, "sf_first_read_{getpid()}", "io.read_line", 9, "(errno 9)")
+}
+
+test "a read in the right arm of && names its own line" {
+    expect_site(#"fn main() ! IO, Env {
+    no_stdin()
+    with on_panic(report) {
+        let n = 1
+        if n == 1 && io.read_all() == "" {
+            io.println("x")
+        }
+    }
+}
+"#, "sf_and_{getpid()}", "io.read_all", 5, "(errno 9)")
+}
+
+test "a read in a while condition names its own line" {
+    expect_site(#"fn main() ! IO, Env {
+    no_stdin()
+    with on_panic(report) {
+        while io.read_all() == "x" {
+            io.println("x")
+        }
+    }
+}
+"#, "sf_while_{getpid()}", "io.read_all", 4, "(errno 9)")
+}
+
+test "the fault has no runtime lead-in with no hook" {
+    let tag = "sf_no_hook_{getpid()}"
+    let r = compile_and_run(prelude().concat(#"fn main() ! IO {
+    no_stdin()
+    let _ = io.read_all()
+}
+"#), tag)
+    assert(r.exit_code == 101, "exit {r.exit_code}: {r.err_out}")
+    assert(!r.err_out.contains("blink: "), r.err_out)
+    assert(r.err_out.contains("/{tag}.bl:{site_line(3)}"), r.err_out)
+}
+
+// In a derived read_line the failing read is the read_bytes of the std body. The site is that
+// std line: file is not "" and line is Some, and no line number is pinned.
+test "an os error in a derived read_line reaches the hook with a site" {
+    let tag = "sf_derived_{getpid()}"
+    let r = compile_and_run(prelude().concat(#"fn main() ! IO, Env {
+    no_stdin()
+    with on_panic(report) {
+        with handler IO.Read {
+            fn read_bytes(n: Int) -> Bytes { default.read_bytes(n) }
+        } {
+            let _ = io.read_line()
+        }
+    }
+}
+"#), tag)
+    assert(r.exit_code == 70, "exit {r.exit_code}: {r.err_out}")
+    assert(r.err_out.contains("(errno 9)"), r.err_out)
+    assert(r.err_out.contains(".bl:"), r.err_out)
+}
+
+@ffi("dup", header: "unistd.h")
+@trusted(audit: "TEST-STDIN-FAULT: keep standard input for the tests that follow")
+fn t_dup(fd: I32) -> I32 ! () {}
+
+@ffi("dup2", header: "unistd.h")
+@trusted(audit: "TEST-STDIN-FAULT: put standard input back")
+fn t_dup2(old_fd: I32, new_fd: I32) -> I32 ! () {}
+
+@ffi("close", header: "unistd.h")
+@trusted(audit: "TEST-STDIN-FAULT: read standard input with no such fd")
+fn t_close_fd(fd: I32) -> I32 ! () {}
+
+test "assert_panics catches an os error of the default read" {
+    let kept = t_dup(0.to_i32())
+    let _ = t_close_fd(0.to_i32())
+    assert_panics(matching: "io.read_all: cannot read standard input") {
+        let _ = io.read_all()
+    }
+    let _ = t_dup2(kept, 0.to_i32())
+    let _ = t_close_fd(kept)
+}

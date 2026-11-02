@@ -146,6 +146,8 @@ typedef struct {
     __thread char __blink_cleanup_warnings[BLINK_CLEANUP_WARN_MAX][BLINK_CLEANUP_WARN_MSG_SIZE];
     __thread int __blink_cleanup_warning_count = 0;
     __thread void (*__blink_panic_test_hook)(const char* msg) = NULL;
+    __thread const char* __blink_io_read_site_file = NULL;
+    __thread int64_t __blink_io_read_site_line = 0;
   #else
     extern __thread int __blink_panic_armed;
     extern __thread jmp_buf __blink_panic_jmp;
@@ -158,6 +160,8 @@ typedef struct {
     extern __thread char __blink_cleanup_warnings[BLINK_CLEANUP_WARN_MAX][BLINK_CLEANUP_WARN_MSG_SIZE];
     extern __thread int __blink_cleanup_warning_count;
     extern __thread void (*__blink_panic_test_hook)(const char* msg);
+    extern __thread const char* __blink_io_read_site_file;
+    extern __thread int64_t __blink_io_read_site_line;
   #endif
 #else
 static __thread int __blink_panic_armed = 0;
@@ -171,6 +175,8 @@ static __thread jmp_buf __blink_cleanup_thunk_jmp;
 static __thread char __blink_cleanup_warnings[BLINK_CLEANUP_WARN_MAX][BLINK_CLEANUP_WARN_MSG_SIZE];
 static __thread int __blink_cleanup_warning_count = 0;
 static __thread void (*__blink_panic_test_hook)(const char* msg) = NULL;
+BLINK_UNUSED static __thread const char* __blink_io_read_site_file = NULL;
+BLINK_UNUSED static __thread int64_t __blink_io_read_site_line = 0;
 #endif
 
 BLINK_RT_FN size_t __blink_cleanup_depth(void);
@@ -4265,6 +4271,18 @@ BLINK_RT_FN int64_t blink_io_read_bytes_count(int64_t n) {
 }
 #endif
 
+/* A vtable slot has no room for a site, so a read leaves the site of its Blink call here just
+ * before it calls the slot. The defaults take it on entry. The thread is the one that performs:
+ * nothing runs between this write and the default but a handler clause, and a clause's own
+ * read writes again. */
+BLINK_RT_FN void blink_io_read_site(const char* file, int64_t line);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void blink_io_read_site(const char* file, int64_t line) {
+    __blink_io_read_site_file = file;
+    __blink_io_read_site_line = line;
+}
+#endif
+
 /* The form lowering calls: the count check names the Blink call that gave the count. */
 BLINK_RT_FN int64_t blink_io_read_bytes_count_at(int64_t n, const char* file, int64_t line);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
@@ -4272,6 +4290,7 @@ BLINK_RT_FN int64_t blink_io_read_bytes_count_at(int64_t n, const char* file, in
     if (n <= 0) {
         __blink_panic_dispatchf_at(file, line, "io.read_bytes: n must be at least 1, got %lld", (long long)n);
     }
+    blink_io_read_site(file, line);
     return n;
 }
 #endif
