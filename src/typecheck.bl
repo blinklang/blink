@@ -19111,6 +19111,32 @@ fn nr_has_binding(name: Str) -> Int {
     0
 }
 
+// Whether the only bindings of `name`, a built-in namespace, are top-level ones outside this
+// file's scope. All modules share the outermost frame, so a `pub fn trace` in a module this
+// file imports whole has an entry there, but `import a` binds only `a`: in this file,
+// `trace.log` stays the built-in. A local, or a top-level binding this file declares or
+// selects, hides it.
+fn nr_namespace_binding_out_of_scope(name: Str) -> Bool {
+    if is_builtin_namespace(name) == 0 { return false }
+    let idx = nr_top_index(name)
+    if idx == -1 || nr_index_is_local(idx) { return false }
+    if nr_current_module == "" { return false }
+    nr_bare_name_in_scope_here(name, nr_current_module) == 0
+}
+
+// nr_is_defined for a method receiver: a namespace whose bindings are all out of scope here
+// is not defined.
+fn nr_receiver_is_defined(name: Str) -> Int {
+    if nr_namespace_binding_out_of_scope(name) { return 0 }
+    nr_is_defined(name)
+}
+
+// nr_has_binding for a method receiver, with the same namespace rule as nr_receiver_is_defined.
+fn nr_receiver_has_binding(name: Str) -> Int {
+    if nr_namespace_binding_out_of_scope(name) { return 0 }
+    nr_has_binding(name)
+}
+
 // Whether `name`'s current top binding lives in the global frame (depth 1).
 // A cross-module private-access violation can only legitimately apply to a
 // real top-level free-fn/let reference (global frame); when a name resolves to
@@ -21334,11 +21360,13 @@ pub fn tc_names_a_type(name: Str) -> Bool {
 
 // A method call's receiver. A bare name with no value under it that names a type is the
 // qualifier of a static call (`Errno.from(3)`), not a read of the type's namesake variant,
-// so it answers what every other type qualifier answers: no type.
+// so it answers what every other type qualifier answers: no type. So does a built-in
+// namespace whose only bindings are out of this file's scope.
 fn tc_infer_receiver(recv: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     if recv != -1 && node_kind(recv) == NodeKind.Ident {
         let name = node_name(recv)
         if is_variant_name(name) != 0 && tc_names_a_type(name) && tc_tid_is_no_info(nr_get_type(name)) != 0 { return -1 }
+        if nr_namespace_binding_out_of_scope(name) { return -1 }
     }
     // The type expected of the call is not expected of its receiver, so it does not reach an
     // operator there (sections/03_types.md §3.2 *Operator operands*).
@@ -21651,6 +21679,8 @@ fn tc_refuse_list_scan(node: Int, obj_t: Int, need: List[Int], method: Str) -> I
 // The help line for an unresolved method: the rename note the resolver already carries for
 // a renamed List operation, else the near-miss suggestion, else nothing.
 fn tc_unresolved_method_help(obj_k: TyKind, tname: Str, method: Str, node: Int) -> Str {
+    let hides = tc_trace_hiding_help(method, node)
+    if hides != "" { return hides }
     if method == "display" {
         return "add an `impl Display for {tname}` (with `fn fmt(self, sb: StringBuilder)`)"
     }
@@ -21679,6 +21709,28 @@ fn tc_unresolved_method_help(obj_k: TyKind, tname: Str, method: Str, node: Int) 
     // Naming the method the caller already wrote sends them in a circle.
     if near != "" && near != method { return "did you mean `.{near}`?" }
     ""
+}
+
+// A binding named `trace` hides the built-in `trace.log` where it is in scope (§8.15.7), so a
+// `trace.log` that fails on that binding was most likely meant as the built-in. "" when the call
+// is not `trace.log` on a binding of this module.
+fn tc_trace_hiding_help(method: Str, call: Int) -> Str {
+    if method != "log" { return "" }
+    let obj = node_obj(call)
+    if obj == -1 || node_kind(obj) != NodeKind.Ident || node_name(obj) != "trace" { return "" }
+    let mut decl = tc_ident_binder_node(obj)
+    let mut what = "local"
+    if decl >= 0 && node_kind(decl) == NodeKind.Param { what = "parameter" }
+    if decl < 0 {
+        decl = tc_fn_value_decl_node(obj)
+        what = "fn"
+    }
+    if decl < 0 {
+        decl = tc_global_decl_node(obj)
+        what = "module-level binding"
+    }
+    if decl < 0 || node_module(decl) != nr_current_module { return "" }
+    "`trace` here is the {what} at line {node_line(decl)}, which hides the built-in `trace.log`; rename the {what} to use it"
 }
 
 // A receiver whose type the front end KNOWS. Struct and Enum are absent because their own
@@ -23205,7 +23257,7 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
             }
             // A namespace receiver names no value, so the Ident walk has nothing to check on it.
             // Skipping it leaves that walk to report a namespace in a value position.
-            if node_kind(obj) != NodeKind.Ident || nr_top_index(node_name(obj)) != -1 || is_builtin_namespace(node_name(obj)) == 0 {
+            if node_kind(obj) != NodeKind.Ident || (nr_top_index(node_name(obj)) != -1 && !nr_namespace_binding_out_of_scope(node_name(obj))) || is_builtin_namespace(node_name(obj)) == 0 {
                 nr_check_node(obj)
             }
         }
@@ -23233,7 +23285,7 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                     // name on another type. Adding `exit` there would be the wrong key: it would
                     // silence `.exit()` on every type. A namespace intrinsic has to be recognized
                     // by NAMESPACE AND METHOD, which is what is_intrinsic_method answers.
-                    if is_intrinsic_method(node_name(obj), method_name) != 0 && nr_is_defined(node_name(obj)) == 0 {
+                    if is_intrinsic_method(node_name(obj), method_name) != 0 && nr_receiver_is_defined(node_name(obj)) == 0 {
                         is_ue_call = 1
                     }
                     // A type its module declares twice (E1016) may have meant the member of
@@ -27210,7 +27262,7 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
         // it here while scope is live so the mono pass can route it correctly after
         // nr scope is torn down. Monotonic, so a later scope-torn-down re-inference
         // never un-marks it.
-        if obj_node != -1 && node_kind(obj_node) == NodeKind.Ident && nr_has_binding(node_name(obj_node)) != 0 {
+        if obj_node != -1 && node_kind(obj_node) == NodeKind.Ident && nr_receiver_has_binding(node_name(obj_node)) != 0 {
             tc_mc_obj_value_marks.set(node, 1)
         }
 
@@ -28603,7 +28655,7 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
 
         if obj_node != -1 && node_kind(obj_node) == NodeKind.Ident {
             let obj_written = node_name(obj_node)
-            let obj_name = if nr_has_binding(obj_written) != 0 { obj_written } else { tc_static_qualifier(obj_written) }
+            let obj_name = if nr_receiver_has_binding(obj_written) != 0 { obj_written } else { tc_static_qualifier(obj_written) }
             if obj_name == "Char" {
                 if method == "from_code_point" {
                     return make_result_type(TYPE_CHAR, tc_conversion_error_type())
@@ -28625,14 +28677,14 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
             // `nr_is_defined` gates it so a local binding that happens to share the handle's
             // spelling keeps its own type — that variable's receiver arm has already run and
             // fallen through only because the method was genuinely unresolved on it.
-            if obj_name == "default" && nr_has_binding(obj_name) == 0 {
+            if obj_name == "default" && nr_receiver_has_binding(obj_name) == 0 {
                 let dflt_eff = tc_tid_handler_effect(tc_lookup_node_tid(obj_node))
                 if dflt_eff != "" {
                     let dflt_ret = tc_infer_default_perform(node, dflt_eff, method)
                     if dflt_ret != -1 { return dflt_ret }
                 }
             }
-            if nr_is_defined(obj_name) == 0 && is_user_effect_handle_name(obj_name) != 0 {
+            if nr_receiver_is_defined(obj_name) == 0 && is_user_effect_handle_name(obj_name) != 0 {
                 let ue_sig = lookup_fnsig("{obj_name}.{method}")
                 if ue_sig != -1 {
                     nr_note_call_decl(node, fnsig_pool.get(ue_sig).unwrap().decl)
@@ -28642,14 +28694,14 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
             }
             // `rand.<name>` always means the handle, so a name that is no operation of `Rand` is
             // E0505 here, before the unclaimed-call report can read `rand` as a module (§4.4.7).
-            if nr_is_defined(obj_name) == 0 && tc_ns_call_reads_module(obj_name) == 0 && builtin_op_root_of_handle(obj_name) == "Rand" && !builtin_op_exists("Rand", method) {
+            if nr_receiver_is_defined(obj_name) == 0 && tc_ns_call_reads_module(obj_name) == 0 && builtin_op_root_of_handle(obj_name) == "Rand" && !builtin_op_exists("Rand", method) {
                 return tc_report_not_a_handle_op(node, "Rand", method)
             }
             // Intrinsic time.* methods type even without `import std.time` (they emit as
             // codegen intrinsics like io.println). Typing read() as Instant lets the
             // comparison check (Stage 4) catch `time.read() > 0` at `blink check` instead
             // of leaking an Instant into invalid C.
-            if is_import_module_name(obj_name) != 0 && nr_is_defined(obj_name) == 0 && is_intrinsic_method(obj_name, method) != 0 {
+            if is_import_module_name(obj_name) != 0 && nr_receiver_is_defined(obj_name) == 0 && is_intrinsic_method(obj_name, method) != 0 {
                 if obj_name == "time" { tc_check_time_op_args(node, method) }
                 if obj_name == "time" && method == "read" {
                     // std.time is a prelude module (compiler.bl:1357), so the declaration
@@ -28667,7 +28719,7 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
             // intrinsic needs no import (that is what makes it an intrinsic), and
             // is_intrinsic_method already restricts the namespace. nr_is_defined keeps a
             // local that shadows the namespace spelling on its own receiver-typed arm.
-            if nr_is_defined(obj_name) == 0 && is_intrinsic_method(obj_name, method) != 0 && tc_ns_call_reads_module(obj_name) == 0 {
+            if nr_receiver_is_defined(obj_name) == 0 && is_intrinsic_method(obj_name, method) != 0 && tc_ns_call_reads_module(obj_name) == 0 {
                 let surface_root = builtin_op_root_of_handle(obj_name)
                 if surface_root != "" && builtin_op_surface_fn(surface_root, method) != "" {
                     let surface_ret = tc_infer_builtin_surface_call(node, surface_root, obj_name, method)
@@ -28717,7 +28769,7 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                     return TYPE_VOID
                 }
             }
-            if is_import_module_name(obj_name) != 0 && nr_is_defined(obj_name) == 0 && (is_intrinsic_method(obj_name, method) == 0 || tc_ns_call_reads_module(obj_name) != 0) {
+            if is_import_module_name(obj_name) != 0 && nr_receiver_is_defined(obj_name) == 0 && (is_intrinsic_method(obj_name, method) == 0 || tc_ns_call_reads_module(obj_name) != 0) {
                 if tc_call_is_skip_intrinsic(node) { return tc_check_skip_call(node) }
                 let sig = tc_qualified_call_fnsig(node, method)
                 if sig != -1 { return tc_check_free_call("{obj_name}.{method}", sig, node) }
@@ -28736,7 +28788,7 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
             // above, so a struct/enum receiver has already been through
             // tc_method_resolvable_on_type, and a scalar one falls through to Unknown and
             // the codegen E0505 backstop. The wrong ANSWER is what this removes.
-            let obj_is_value = nr_has_binding(obj_name)
+            let obj_is_value = nr_receiver_has_binding(obj_name)
             // The qualified trait call `Trait.method(receiver, args)` — parsed as
             // MethodCall(obj = Ident(Trait)), and the spec's ONLY way to name one of two
             // traits that define the same method (sections/03c_protocols.md:697-712,
@@ -29017,7 +29069,7 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
             // names an import and is not shadowed by a binding. Fails CLOSED —
             // an unregistered key falls through to the existing behaviour rather
             // than guessing a type.
-            if is_import_module_name(obj_name) != 0 && nr_is_defined(obj_name) == 0 {
+            if is_import_module_name(obj_name) != 0 && nr_receiver_is_defined(obj_name) == 0 {
                 let qual_mod = tc_qualifier_module_at(obj_name, node)
                 let qual_decl = tc_module_let_decl_node(qual_mod, fname)
                 // Codegen has no file import list to ask which module an alias names.

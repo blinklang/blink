@@ -1,0 +1,62 @@
+// A module-level binding hides a built-in namespace only where it is in scope (§8.15.7, *A
+// binding named `trace`*). `import a` brings in the qualifier `a`, not the bare names of
+// `a`, so a `pub fn trace` or `pub fn env` in `a` leaves `trace.log` and `env.var` the
+// built-ins in the importer, and `a.trace` still reaches the fn.
+
+import compile_test_helpers
+import std.process.{ProcessResult}
+
+let TRACE_HELPER = #"pub fn trace(phase: Str) -> Int {
+    phase.len()
+}
+"#
+
+let TRACE_MAIN = #"import a
+
+fn main() ! IO {
+    trace.log("c", "x")
+    io.println("{a.trace("ab")}")
+}
+"#
+
+let ENV_HELPER = #"pub fn env(k: Str) -> Int {
+    k.len()
+}
+"#
+
+let ENV_MAIN = #"import d
+
+fn main() ! IO, Env {
+    io.println("{env.var("UNSELECTED_IMPORT_PROBE") ?? "unset"}")
+    io.println("{d.env("abc")}")
+}
+"#
+
+// Builds a package of `helper` (as src/<helper_name>.bl) and `entry`, and runs it with the
+// one var `var_name`=`var_value` set.
+fn build_and_run(tag: Str, helper_name: Str, helper: Str, entry: Str, var_name: Str, var_value: Str) -> ProcessResult ! FS.Write, Process.Spawn, Env.Read {
+    let root = "{compile_test_helpers.scratch_root()}/{tag}"
+    compile_test_helpers.sh("mkdir -p {root}/src")
+    fs.write("{root}/blink.toml", "[package]\nname = \"{tag}\"\nversion = \"0.1.0\"\n").unwrap()
+    fs.write("{root}/src/{helper_name}.bl", helper).unwrap()
+    fs.write("{root}/src/main.bl", entry).unwrap()
+    let bin = "{root}/main_bin"
+    let b = process.run("build/blink", ["build", "{root}/src/main.bl", "-o", bin]).unwrap()
+    assert(b.success(), "{b.out}{b.err_out}")
+    let r = process.run("env", ["{var_name}={var_value}", bin]).unwrap()
+    compile_test_helpers.sh("rm -rf {root}")
+    r
+}
+
+test "a pub fn trace in an unselected import leaves trace.log the built-in" {
+    let r = build_and_run("unselected_trace_import", "a", TRACE_HELPER, TRACE_MAIN, "BLINK_TRACE_CHANNELS", "c")
+    assert(r.success())
+    assert_eq(r.out, "2\n")
+    assert_eq(r.err_out, "[trace:c] x\n")
+}
+
+test "a pub fn env in an unselected import leaves env.var the built-in" {
+    let r = build_and_run("unselected_env_import", "d", ENV_HELPER, ENV_MAIN, "UNSELECTED_IMPORT_PROBE", "set")
+    assert(r.success())
+    assert_eq(r.out, "set\n3\n")
+}
