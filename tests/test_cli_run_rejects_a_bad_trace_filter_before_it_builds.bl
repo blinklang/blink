@@ -1,8 +1,9 @@
 // `blink run` finds a bad trace filter before it builds the program (§8.15.12). It is a usage
-// error: text on stderr, nothing on stdout, exit code 2, and no binary. `--trace=` and an
-// inherited `BLINK_TRACE` have the same rule, and the flag replaces a value that the shell had
-// set (§8.15.13). The check of `blink run` and the check of the traced binary must agree on
-// each value, so a value that `blink run` lets through never stops the program it starts.
+// error: text on stderr, nothing on stdout, exit code 2, and no binary. Only `--trace` builds
+// traced, so `blink run` checks an inherited `BLINK_TRACE` only through the flag, which
+// replaces it; with no flag it builds untraced and gives a note (§8.15.13). The check of
+// `blink run` and the check of the traced binary must agree on each value, so a value that
+// `blink run` lets through never stops the program it starts.
 
 import compile_test_helpers
 import std.process.{ProcessResult, ChildEnd}
@@ -68,15 +69,43 @@ test "run stops on a bad --trace filter before it builds" {
     clean(path, bin)
 }
 
-test "run stops on a bad inherited BLINK_TRACE before it builds" {
-    let stem = "trace_run_bad_env"
+// The lines of stderr that are notes.
+fn notes(err_out: Str) -> List[Str] {
+    err_out.split("\n").filter(fn(l: Str) -> Bool { l.starts_with("note: ") })
+}
+
+test "run with BLINK_TRACE set and no --trace builds untraced, says so in a note and prints 3" {
+    let stem = "trace_run_env_only"
     let path = write_src(stem)
     let bin = bin_of(stem)
-    for value in BAD {
+    for value in ["fn:add", "all", " fn:add , ", "event:stat", "depth:-1", "all,fn:add"] {
         let r = process.run("env", ["BLINK_TRACE={value}", "build/blink", "run", path, "-o", bin]).unwrap()
-        let prefix = "error: bad BLINK_TRACE value \"{value}\": "
-        assert_eq("`{value}`: {usage_error_for(r, bin, prefix)}", "`{value}`: ")
+        assert_eq("`{value}`: {r.end} {r.out}", "`{value}`: {ChildEnd.Exited(0)} 3\n")
+        assert(!r.err_out.contains("\"event\""), "`{value}` wrote a trace event:\n{r.err_out}")
+        let lines = notes(r.err_out)
+        assert_eq(lines.len(), 1, "`{value}`:\n{r.err_out}")
+        assert(lines.get(0).unwrap().contains("BLINK_TRACE"))
+        assert(lines.get(0).unwrap().contains("--trace"))
     }
+    clean(path, bin)
+}
+
+test "run gives no note when BLINK_TRACE has no items or the command has --trace" {
+    let stem = "trace_run_env_no_note"
+    let path = write_src(stem)
+    let bin = bin_of(stem)
+    let unset = process.run("env", ["-u", "BLINK_TRACE", "build/blink", "run", path, "-o", bin]).unwrap()
+    assert_eq(unset.out, "3\n")
+    assert_eq(notes(unset.err_out).len(), 0)
+    for value in ["", " , ", "\t,,"] {
+        let r = process.run("env", ["BLINK_TRACE={value}", "build/blink", "run", path, "-o", bin]).unwrap()
+        assert_eq("`{value}`: {r.out}", "`{value}`: 3\n")
+        assert_eq(notes(r.err_out).len(), 0, "`{value}`:\n{r.err_out}")
+        assert(!r.err_out.contains("\"event\""))
+    }
+    let flagged = process.run("env", ["BLINK_TRACE=fn:add", "build/blink", "run", "--trace", path, "-o", bin]).unwrap()
+    assert_eq(flagged.out, "3\n")
+    assert_eq(notes(flagged.err_out).len(), 0)
     clean(path, bin)
 }
 
@@ -149,4 +178,9 @@ test "run --trace=all,all and an empty --trace= write every event of main and ad
         assert_eq(compile_test_helpers.trace_enter_fns(r.err_out), "{stem}.main {stem}.add")
     }
     clean(path, bin)
+}
+
+test "run --help says that only --trace builds the program traced" {
+    let r = process.run("build/blink", ["run", "--help"]).unwrap()
+    assert(r.out.contains("Only --trace builds the program traced"), r.out)
 }
