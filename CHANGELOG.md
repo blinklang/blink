@@ -89,6 +89,7 @@ Single source of truth for release history. `blink llms` and `blink llms --full`
 - **Compile time of wide nested types is lower.** A program with 800 non-recursive types compiles in 0.06 s; before, it took 3.8 s.
 - **`fs.*` needs no import.** `fs.read`, `fs.write`, `fs.stat` and the other `fs` operations compile and run without `import std.fs`. Import `std.fs` only to name `FsError`, `FsOp`, `FileInfo` or `FileKind`.
 - **An import can rename the module qualifier.** `import legacy.auth as la` binds `la` and not `auth`, and `import db.conn as dbc.{Connection}` binds `dbc` and `Connection`. The alias is local to the file that writes it. Before, an `as` after the module path was a parse error.
+- **A `trace.log` msg may only read state (section 8.15.7).** `msg` may read a module `let` or `let mut` directly and call fns with an empty row. A write, a call of a fn that has a row or that reads or writes a module `let mut`, and a handler operation such as `env.cwd()` in `msg` is `TraceMessageEffect` (E0566). A call in `msg` charges no row to the enclosing fn.
 
 ## Fixes (v0.59.0)
 

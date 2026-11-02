@@ -1806,6 +1806,7 @@ BLINK_TRACE_CHANNELS=all ./app         # every channel
 - The program reads `BLINK_TRACE_CHANNELS` once, when it starts; a later `env.set_var` changes nothing. It is separate from `BLINK_TRACE`.
 - The value splits on `,`. Each item is trimmed of ASCII space and tab, an empty item is skipped, and an item matches a channel by exact text (case counts). `all` in any place turns on every channel. No value gives a warning.
 - `msg` is not evaluated when the channel is off, so a `msg` that panics panics only with the channel on. The channel argument is always evaluated.
+- `msg` is lazy and may only read state; anything else is E0566. It may read a module `let` or `let mut` directly and call fns with an empty row; a write, a call of a fn with a row, a call of a fn that reads or writes a module `let mut`, and a handler operation such as `env.cwd()` are `TraceMessageEffect`. Compute such a value before the call.
 - A trace call keeps no code alive: if the compiler drops an unused call to a fn with an empty row, that fn's lines do not appear.
 - A fn, parameter or local named `trace` hides `trace.log` in its own scope, and `trace.log` there is a method call on it (E0505 if it has no `log`). A `pub fn trace` in another module does not hide it: with `import a`, `trace.log` is the built-in and `a.trace` is the fn. `trace` alone is no value.
 
