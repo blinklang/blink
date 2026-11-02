@@ -1,0 +1,254 @@
+// A program has one panic hook, and only the entry `main` holds it, as an item of a `with`
+// in its own body (sections/02_syntax.md §2.20 *One hook, in `main`*). Every other place is
+// PanicHookPlacement (E0565), with the primary span on `on_panic`. A library cannot take the
+// crash report of the program that uses it, so a `main` in an imported module is outside
+// `main` too.
+
+import compile_test_helpers.{check_via_cli, compile_xmod_capture, verify_catalog_entry}
+
+fn report_src() -> Str {
+    #"fn report(p: PanicInfo) -> Never ! IO.Eprint, Env.Exit {
+    io.eprintln("fatal: {p.message}")
+    env.exit(70)
+}
+
+fn run() ! IO {
+    io.println("run")
+}
+"#
+}
+
+// The one E0565 line of the JSON report, or "" when there is none.
+fn e0565_line(out: Str) -> Str {
+    for line in out.split("\n") {
+        if line.contains("\"code\":\"E0565\"") { return line }
+    }
+    ""
+}
+
+fn e0565_count(out: Str) -> Int {
+    let mut n = 0
+    for line in out.split("\n") {
+        if line.contains("\"code\":\"E0565\"") { n = n + 1 }
+    }
+    n
+}
+
+// Whether the E0565 line puts its primary span at `line`:`col`.
+fn primary_at(entry: Str, line: Int, col: Int) -> Bool {
+    entry.contains("\"line\":{line},\"col\":{col}")
+}
+
+test "blink explain E0565 names PanicHookPlacement" {
+    verify_catalog_entry("E0565", "PanicHookPlacement")
+}
+
+test "one hook in the body of main is no error" {
+    let src = report_src().concat(#"
+fn main() ! IO, Env {
+    with on_panic(report) {
+        run()
+    }
+}
+"#)
+    let out = check_via_cli(src, "e0565_one_hook_ok_{getpid()}")
+    assert(!out.contains("\"severity\":\"error\""), out)
+}
+
+test "a hook in a fn other than main is outside main" {
+    let src = report_src().concat(#"
+fn serve() ! IO {
+    with on_panic(report) {
+        run()
+    }
+}
+
+fn main() ! IO, Env {
+    serve()
+}
+"#)
+    let out = check_via_cli(src, "e0565_other_fn_{getpid()}")
+    let e = e0565_line(out)
+    assert(e != "", out)
+    assert(primary_at(e, 11, 10), e)
+    assert(e.contains("`on_panic` outside `main`"), e)
+}
+
+test "a hook in a closure in main is outside main" {
+    let src = report_src().concat(#"
+fn main() ! IO, Env {
+    let f = fn() {
+        with on_panic(report) {
+            run()
+        }
+    }
+    f()
+}
+"#)
+    let out = check_via_cli(src, "e0565_closure_{getpid()}")
+    let e = e0565_line(out)
+    assert(e != "", out)
+    assert(primary_at(e, 12, 14), e)
+    assert(e.contains("`on_panic` outside `main`"), e)
+}
+
+// Blink has no nested fn declaration. A handler clause is the fn that a body can hold.
+test "a hook in a handler clause in main is outside main" {
+    let src = report_src().concat(#"
+fn main() ! IO, Env {
+    with handler Log {
+        fn put(s: Str) {
+            with on_panic(report) {
+                run()
+            }
+        }
+    } {
+        log.put("x")
+    }
+}
+
+effect Log {
+    effect Put {
+        fn put(s: Str)
+    }
+}
+"#)
+    let out = check_via_cli(src, "e0565_handler_clause_{getpid()}")
+    let e = e0565_line(out)
+    assert(e != "", out)
+    assert(primary_at(e, 13, 18), e)
+    assert(e.contains("`on_panic` outside `main`"), e)
+}
+
+test "a hook in a test block is E0565" {
+    let src = report_src().concat(#"
+fn main() ! IO, Env {
+    run()
+}
+
+test "no hook in a test" {
+    with on_panic(report) {
+        run()
+    }
+}
+"#)
+    let out = check_via_cli(src, "e0565_test_block_{getpid()}")
+    let e = e0565_line(out)
+    assert(e != "", out)
+    assert(primary_at(e, 15, 10), e)
+    assert(e.contains("`on_panic` in a `test` block"), e)
+}
+
+test "a second hook in main is E0565 with a span on the first" {
+    let src = report_src().concat(#"
+fn main() ! IO, Env {
+    with on_panic(report) { run() }
+    with on_panic(report) { run() }
+}
+"#)
+    let out = check_via_cli(src, "e0565_second_{getpid()}")
+    assert(e0565_count(out) == 1, out)
+    let e = e0565_line(out)
+    assert(primary_at(e, 12, 10), e)
+    assert(e.contains("a second `on_panic` in `main`"), e)
+    // The secondary span marks the first hook.
+    assert(e.contains("\"span\":\{\"line\":11,\"col\":10,"), e)
+}
+
+test "a hook nested in the first hook is a second hook" {
+    let src = report_src().concat(#"
+fn main() ! IO, Env {
+    with on_panic(report) {
+        with on_panic(report) {
+            run()
+        }
+    }
+}
+"#)
+    let out = check_via_cli(src, "e0565_nested_hook_{getpid()}")
+    assert(e0565_count(out) == 1, out)
+    let e = e0565_line(out)
+    assert(primary_at(e, 12, 14), e)
+    assert(e.contains("a second `on_panic` in `main`"), e)
+}
+
+test "two items of one with that are both hooks are a second hook" {
+    let src = report_src().concat(#"
+fn main() ! IO, Env {
+    with on_panic(report), on_panic(report) {
+        run()
+    }
+}
+"#)
+    let out = check_via_cli(src, "e0565_two_items_{getpid()}")
+    assert(e0565_count(out) == 1, out)
+    let e = e0565_line(out)
+    assert(primary_at(e, 11, 28), e)
+    assert(e.contains("a second `on_panic` in `main`"), e)
+}
+
+// The label of this case waits for the panel, so the row pins only the code and the span.
+test "on_panic used as a plain call is E0565" {
+    let src = report_src().concat(#"
+fn main() ! IO, Env {
+    on_panic(report)
+}
+"#)
+    let out = check_via_cli(src, "e0565_plain_call_{getpid()}")
+    let e = e0565_line(out)
+    assert(e != "", out)
+    assert(primary_at(e, 11, 5), e)
+    assert(!out.contains("\"code\":\"E0504\""), out)
+}
+
+test "on_panic used as a value is E0565" {
+    let src = report_src().concat(#"
+fn main() ! IO, Env {
+    let h = on_panic
+    run()
+}
+"#)
+    let out = check_via_cli(src, "e0565_value_{getpid()}")
+    let e = e0565_line(out)
+    assert(e != "", out)
+    assert(primary_at(e, 11, 13), e)
+}
+
+test "a main in an imported module is outside main" {
+    let helper = report_src().concat(#"
+pub fn main() ! IO, Env {
+    with on_panic(report) {
+        run()
+    }
+}
+"#)
+    let entry = #"import lib_main
+
+fn main() ! IO, Env {
+    lib_main.main()
+}
+"#
+    let out = compile_xmod_capture(entry, "lib_main", helper, "e0565_lib_main_{getpid()}")
+    let e = e0565_line(out)
+    assert(e != "", out)
+    assert(primary_at(e, 11, 10), e)
+    assert(e.contains("`on_panic` outside `main`"), e)
+}
+
+// The hook is built in only where the name binds nothing else, so a program's own `on_panic`
+// is the thing it means.
+test "a fn the program names on_panic is an ordinary fn" {
+    let src = #"fn on_panic(n: Int) -> Int {
+    n + 1
+}
+
+fn main() ! IO {
+    io.println("{on_panic(2)}")
+    let f = on_panic
+    io.println("{f(3)}")
+}
+"#
+    let out = check_via_cli(src, "e0565_own_fn_{getpid()}")
+    assert(!out.contains("\"code\":\"E0565\""), out)
+    assert(!out.contains("\"severity\":\"error\""), out)
+}

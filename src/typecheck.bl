@@ -34,7 +34,7 @@ import diagnostics.{
     UNSOLVED_TYPEVAR_AT_CODEGEN, SEALED_OPS_REWRITE_INVARIANT, VARIANT_WITHOUT_ENUM,
     NO_SUCH_VARIANT, TYPE_ERROR, TEMPLATE_MISMATCH, UNEXPECTED_ANNOTATION, MISSING_RETURN, NO_CONVERSION_IMPL, CANNOT_INFER_TYPE, NOT_ITERABLE, MISSING_ELSE, UNLICENSED_SELF_OP, TRAIT_BOUND_NOT_SATISFIED, CAPABILITY_BUDGET, QM_INVALID_OPERAND, UNDEFINED_FUNCTION,
     UNRESOLVED_METHOD, AMBIGUOUS_METHOD_CALL, MISSING_DISPLAY_IMPL,
-    MUTATION_REQUIRES_MUT, MUT_ON_PATTERN, NOT_A_PLACE, PARAM_ASSIGN, diag_error_label_at_notes, diag_error_span_label_at_notes, diag_warn_label_at_notes, EMPTY_ROW_OUTSIDE_FFI, EFFECTS_ANNOTATION_REMOVED, UNKNOWN_EFFECT, diag_fix_before_starts_with, diag_drop_fix_over_others, diag_drop_fix_at,
+    MUTATION_REQUIRES_MUT, MUT_ON_PATTERN, NOT_A_PLACE, PARAM_ASSIGN, diag_error_label_at_notes, diag_error_span_label_at_notes, diag_warn_label_at_notes, EMPTY_ROW_OUTSIDE_FFI, PANIC_HOOK_PLACEMENT, EFFECTS_ANNOTATION_REMOVED, UNKNOWN_EFFECT, diag_fix_before_starts_with, diag_drop_fix_over_others, diag_drop_fix_at,
     UNDEFINED_VARIABLE, UNKNOWN_TYPE, QM_RESULT_IN_NON_RESULT,
     QM_OPTION_IN_NON_OPTION, QM_ERROR_MISMATCH,
     QM_TEST_DISPLAY_REQUIRED, TEST_ANNOTATED_RETURN, SKIP_OUTSIDE_TEST,
@@ -23037,6 +23037,10 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
             return
         }
         if nr_qualifier_module_here(name) != "" { return }
+        if name == "on_panic" {
+            tc_report_panic_hook_not_with_item(node)
+            return
+        }
         tc_errors.push("undefined variable `{name}`")
         let help = if is_import_module_name(name) != 0 {
             nr_missing_import_help(name)
@@ -23117,6 +23121,9 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                         tc_type_args_unresolved.insert(node, 1)
                         tc_errors.push("undefined function `{fn_name}`")
                         diag_error_at("UndefinedFunction", UNDEFINED_FUNCTION, "undefined function `{fn_name}`", node, tc_no_call_form_repair(fn_name))
+                    } else if !defined && fn_name == "on_panic" {
+                        tc_type_args_unresolved.insert(node, 1)
+                        tc_report_panic_hook_not_with_item(callee)
                     } else if !defined && is_builtin_fn(fn_name) == 0 && is_variant_name(fn_name) == 0 && is_known_type(fn_name) == 0 && is_trait_name(fn_name) == 0 {
                         tc_errors.push("undefined function `{fn_name}`")
                         tc_report_undefined_fn(fn_name, node, callee)
@@ -23519,6 +23526,16 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                     // `arena` is a keyword in `with arena { }` — skip the
                     // bare ident so we don't emit E0506. Matches the skip
                     // guard in tc_check_body's WithBlock branch.
+                } else if nr_is_builtin_panic_hook_call(wh_item) {
+                    tc_intrinsic_calls.insert(wh_item, INTRINSIC_ON_PANIC)
+                    let ph_args = node_args(wh_item)
+                    if ph_args != -1 {
+                        let mut pi = 0
+                        while pi < sublist_length(ph_args) {
+                            nr_check_node(sublist_get(ph_args, pi))
+                            pi = pi + 1
+                        }
+                    }
                 } else {
                     nr_check_node(wh_item)
                     if wh_kind != NodeKind.HandlerExpr { has_item_without_as = true }
@@ -31128,10 +31145,12 @@ let mut tc_fn_requires: Map[Int, List[Int]] = Map()
 let mut tc_fn_ensures: Map[Int, List[Int]] = Map()
 
 // The calls the typecheck read as a compiler intrinsic, keyed by the call node, with the
-// intrinsic as the value. Codegen lowers exactly these, so a call to a user fn named `old`
-// or `range_bounds` is never read as the intrinsic.
+// intrinsic as the value. Codegen lowers exactly these, so a call to a user fn named `old`,
+// `range_bounds` or `on_panic` is never read as the intrinsic.
 let INTRINSIC_OLD = 1
 let INTRINSIC_RANGE_BOUNDS = 2
+// A `with` item that installs the panic hook.
+let INTRINSIC_ON_PANIC = 3
 let mut tc_intrinsic_calls: Map[Int, Int] = Map()
 
 pub fn tc_requires_preds_of(fn_node: Int) -> List[Int] {
@@ -31519,6 +31538,139 @@ fn tc_check_with_item(item: Int, tid0: Int, binds: Bool) -> Bool ! Diag.Report {
     diag_error_at("NonHandlerWithItem", WITH_ITEM_NOT_A_HANDLER,
         "a with-item must be a Handler[E] or a scoped value, got {type_to_str(tid)}", item, help)
     false
+}
+
+// The labels of PanicHookPlacement (E0565), one per place a hook may not stand (§2.20). A use
+// of `on_panic` that is not a `with` item has its wording still open, so it stands here once.
+const PANIC_HOOK_OUTSIDE_MAIN = "`on_panic` outside `main`"
+const PANIC_HOOK_SECOND = "a second `on_panic` in `main`"
+const PANIC_HOOK_IN_TEST = "`on_panic` in a `test` block"
+const PANIC_HOOK_NOT_WITH_ITEM = "`on_panic` is only a `with` item"
+const PANIC_HOOK_HELP = "install the hook once, as a `with` item in the body of the entry `main`"
+
+// `on_panic(f)` as a with item, where the name binds nothing the program declares.
+fn nr_is_builtin_panic_hook_call(item: Int) -> Bool {
+    if node_kind(item) != NodeKind.Call { return false }
+    let callee = node_left(item)
+    if callee == -1 || node_kind(callee) != NodeKind.Ident || node_name(callee) != "on_panic" { return false }
+    nr_top_index("on_panic") == -1
+}
+
+// Whether `item` installs the built-in panic hook. Codegen reads this, since the item has no
+// handler value.
+pub fn tc_is_panic_hook_item(item: Int) -> Bool {
+    (tc_intrinsic_calls.get(item) ?? 0) == INTRINSIC_ON_PANIC
+}
+
+fn tc_report_panic_hook_not_with_item(node: Int) ! Diag.Report {
+    tc_errors.push(PANIC_HOOK_NOT_WITH_ITEM)
+    diag_error_label_at_notes("PanicHookPlacement", PANIC_HOOK_PLACEMENT, PANIC_HOOK_NOT_WITH_ITEM, node, PANIC_HOOK_NOT_WITH_ITEM, PANIC_HOOK_HELP, [])
+}
+
+// PanicInfo is the prelude's, found by identity: a module's own `type PanicInfo` is not what
+// the runtime builds.
+fn tc_panic_info_type() -> Int ! Diag.Report {
+    let known = tc_compiler_known_tid("PanicInfo")
+    if known != -1 { return known }
+    ensure_runtime_struct_type("std_traits", "PanicInfo")
+}
+
+// `on_panic(f)` takes one `f: fn(PanicInfo) -> Never`, with whatever row `f` declares: a fn
+// type carries no row, so the row is not part of the check. The item itself holds no value.
+@allow(UnrestoredMutation)
+fn tc_check_panic_hook_item(item: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    let hook_t = make_fn_type(TYPE_NEVER, [tc_panic_info_type()])
+    tc_publish_node_tid(node_left(item), make_fn_type(TYPE_VOID, [hook_t]))
+    tc_publish_node_tid(item, TYPE_VOID)
+    let args = node_args(item)
+    let got = if args != -1 { sublist_length(args) } else { 0 }
+    if got != 1 {
+        tc_error_at("`on_panic` expects 1 argument(s), got {got}", item)
+    } else {
+        let f = sublist_get(args, 0)
+        if node_kind(f) == NodeKind.NamedArg {
+            tc_error_at("`on_panic` takes no labelled argument", f)
+        } else {
+            check_arg_value("on_panic", 0, hook_t, f, false)
+        }
+    }
+    tc_check_callable_arg_bodies(args, -1)
+}
+
+// Where each `with on_panic(f)` stands (§2.20 *One hook, in `main`*). Only the body of the
+// entry `main` may hold one, and only one: a closure or nested fn there is a body of its own,
+// and a library's `main` is not the program's.
+fn tc_check_panic_hook_placement(program: Int) ! Diag.Report {
+    if !tc_intrinsic_calls.values().contains(INTRINSIC_ON_PANIC) { return }
+    let mut entry_main = -1
+    let fns = node_params(program)
+    if fns != -1 {
+        let mut i = 0
+        while i < sublist_length(fns) {
+            let f = sublist_get(fns, i)
+            if node_name(f) == "main" && node_source_module(f) == "__main__" { entry_main = f }
+            i = i + 1
+        }
+    }
+    let mut kids: List[Int] = []
+    let mut first: List[Int] = []
+    tc_ph_walk(program, PH_OUTSIDE_MAIN, entry_main, first, kids)
+}
+
+const PH_OUTSIDE_MAIN = 0
+const PH_MAIN_BODY = 1
+const PH_TEST = 2
+
+fn tc_ph_walk(node: Int, ctx0: Int, entry_main: Int, first: List[Int], kids: List[Int]) ! Diag.Report {
+    let k = node_kind(node)
+    let ctx = if k == NodeKind.FnDef {
+        if node == entry_main { PH_MAIN_BODY } else { PH_OUTSIDE_MAIN }
+    } else if k == NodeKind.Closure {
+        PH_OUTSIDE_MAIN
+    } else if k == NodeKind.TestBlock {
+        PH_TEST
+    } else {
+        ctx0
+    }
+    if k == NodeKind.WithBlock {
+        let items = node_handlers(node)
+        if items != -1 {
+            let mut i = 0
+            while i < sublist_length(items) {
+                let item = sublist_get(items, i)
+                if tc_is_panic_hook_item(item) { tc_ph_check_item(item, ctx, first) }
+                i = i + 1
+            }
+        }
+    }
+    let base = kids.len()
+    node_push_value_child_ids(node, kids)
+    let end = kids.len()
+    let mut i = base
+    while i < end {
+        tc_ph_walk(kids.get(i).unwrap(), ctx, entry_main, first, kids)
+        i = i + 1
+    }
+    while kids.len() > base {
+        let _ = kids.pop()
+    }
+}
+
+fn tc_ph_check_item(item: Int, ctx: Int, first: List[Int]) ! Diag.Report {
+    let at = node_left(item)
+    if ctx == PH_OUTSIDE_MAIN {
+        diag_error_label_at_notes("PanicHookPlacement", PANIC_HOOK_PLACEMENT, PANIC_HOOK_OUTSIDE_MAIN, at, PANIC_HOOK_OUTSIDE_MAIN, PANIC_HOOK_HELP, [])
+    } else if ctx == PH_TEST {
+        diag_error_label_at_notes("PanicHookPlacement", PANIC_HOOK_PLACEMENT, PANIC_HOOK_IN_TEST, at, PANIC_HOOK_IN_TEST,
+            "`main` does not run under the test runner; call the hook as a plain fn under mock_env and assert_panics", [])
+    } else if first.len() == 0 {
+        first.push(at)
+    } else {
+        let prev = first.get(0).unwrap()
+        let before = diag_entry_count()
+        diag_error_label_at_notes("PanicHookPlacement", PANIC_HOOK_PLACEMENT, PANIC_HOOK_SECOND, at, PANIC_HOOK_SECOND, "a program has at most one hook; remove this one", [])
+        diag_add_label_since(before, node_line(prev), node_col(prev), node_col(prev) + "on_panic".byte_len(), "the hook `main` installs first")
+    }
 }
 
 // A type parameter is a scoped value when a bound says so. Every active frame of its binder
@@ -33287,6 +33439,8 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                 let wh_kind2 = node_kind(wh_item2)
                 if wh_kind2 == NodeKind.WithResource {
                     tc_bind_with_resource(wh_item2)
+                } else if tc_is_panic_hook_item(wh_item2) {
+                    tc_check_panic_hook_item(wh_item2)
                 } else {
                     tc_check_body(wh_item2)
                     // tc_check_body WALKS the operand but never types it (no Ident arm, no
@@ -35160,6 +35314,7 @@ fn tc_infer_program_body(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Di
     }
 
     tc_check_effect_rows(program)
+    tc_check_panic_hook_placement(program)
     nr_pop_scope()
     // Last: every constraining use in the program has now run, so a deferred alias blame
     // whose metavar is still unbound is genuinely under-determined. A deferred conversion
