@@ -3219,6 +3219,14 @@ typedef struct {
     int test_run;
 } __blink_panic_hook_record;
 
+/* A `with on_panic` holds this for its body: whether it installed the hook, and the record it
+   replaced. A main that calls main runs the `with` again, and the inner leave hands the outer
+   body its hook back. */
+typedef struct {
+    int installed;
+    __blink_panic_hook_record saved;
+} __blink_panic_hook_frame;
+
 /* §2.20 leaves open what a panic on a second thread does while the first runs the hook. The
    flag is per thread, so each thread falls back to the default report on its own panic in the
    hook. */
@@ -3235,44 +3243,50 @@ static __blink_panic_hook_record __blink_panic_hook = {0};
 static __thread int __blink_in_panic_hook = 0;
 #endif
 
-/* Install the hook for the body of a `with`. The result is 1 when it installed it, and the
-   cleanup of the `with` hands it to __blink_panic_hook_leave. */
-BLINK_RT_FN int __blink_panic_hook_enter(__blink_panic_hook_adapter adapter, struct blink_closure_* hook, void* ev, const void* ev_at_with, size_t ev_size);
+/* Install the hook for the body of a `with`. The cleanup of the `with` hands the frame to
+   __blink_panic_hook_leave. */
+BLINK_RT_FN __blink_panic_hook_frame __blink_panic_hook_enter(__blink_panic_hook_adapter adapter, struct blink_closure_* hook, void* ev, const void* ev_at_with, size_t ev_size);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN int __blink_panic_hook_enter(__blink_panic_hook_adapter adapter, struct blink_closure_* hook, void* ev, const void* ev_at_with, size_t ev_size) {
-    if (__blink_panic_hook.test_run || __blink_panic_test_hook != NULL) return 0;
+BLINK_RT_FN __blink_panic_hook_frame __blink_panic_hook_enter(__blink_panic_hook_adapter adapter, struct blink_closure_* hook, void* ev, const void* ev_at_with, size_t ev_size) {
+    __blink_panic_hook_frame frame = { 0, __blink_panic_hook };
+    if (__blink_panic_hook.test_run || __blink_panic_test_hook != NULL) return frame;
     __blink_panic_hook.hook = hook;
     __blink_panic_hook.ev = ev;
     __blink_panic_hook.ev_at_with = ev_at_with;
     __blink_panic_hook.ev_size = ev_size;
     __blink_panic_hook.adapter = adapter;
-    return 1;
+    frame.installed = 1;
+    return frame;
 }
 #endif
 
-/* The adapter goes first: dispatch reads it to decide whether a hook is installed. */
-BLINK_RT_FN void __blink_panic_hook_leave_run(void* installed, int ok);
+/* The adapter goes NULL first and back last: dispatch reads it to decide whether a hook is
+   installed, so it never sees the saved adapter with this frame's closure. The saved ev copy
+   lives in the frame of the outer `with`, which is still running. */
+BLINK_RT_FN void __blink_panic_hook_leave_run(void* frame, int ok);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN void __blink_panic_hook_leave_run(void* installed, int ok) {
+BLINK_RT_FN void __blink_panic_hook_leave_run(void* frame, int ok) {
     (void)ok;
-    if (!*(int*)installed) return;
-    *(int*)installed = 0;
+    __blink_panic_hook_frame* f = (__blink_panic_hook_frame*)frame;
+    if (!f->installed) return;
+    f->installed = 0;
     __blink_panic_hook.adapter = NULL;
-    __blink_panic_hook.hook = NULL;
-    __blink_panic_hook.ev = NULL;
-    __blink_panic_hook.ev_at_with = NULL;
-    __blink_panic_hook.ev_size = 0;
+    __blink_panic_hook.hook = f->saved.hook;
+    __blink_panic_hook.ev = f->saved.ev;
+    __blink_panic_hook.ev_at_with = f->saved.ev_at_with;
+    __blink_panic_hook.ev_size = f->saved.ev_size;
+    __blink_panic_hook.adapter = f->saved.adapter;
 }
 #endif
 
 /* Every exit from the body of the `with` runs this, so a panic after it gets the default
    report. The cleanup stack holds the hook too while an assert_panics is armed, and the
    attribute cleanup pops it on every way out but a panic, as a resource guard does. */
-BLINK_RT_FN void __blink_panic_hook_leave(int* installed);
+BLINK_RT_FN void __blink_panic_hook_leave(__blink_panic_hook_frame* frame);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN void __blink_panic_hook_leave(int* installed) {
-    __blink_cleanup_pop((void*)installed);
-    __blink_panic_hook_leave_run((void*)installed, 1);
+BLINK_RT_FN void __blink_panic_hook_leave(__blink_panic_hook_frame* frame) {
+    __blink_cleanup_pop((void*)frame);
+    __blink_panic_hook_leave_run((void*)frame, 1);
 }
 #endif
 
