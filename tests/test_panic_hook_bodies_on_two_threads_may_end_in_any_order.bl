@@ -1,0 +1,60 @@
+// A main that runs main on a task holds two `with on_panic` bodies at once, one per thread, and
+// the outer one can end first. Each hook lives for the body of its own `with`
+// (sections/02_syntax.md §2.20 *No hook*, sections/04_effects.md §4.7), so the end of one body
+// leaves the hook of the other in place, and once both have ended no hook runs.
+
+import compile_test_helpers.{compile_and_run}
+
+// The two bodies take turns by env vars: the outer body waits until the inner one has
+// installed its hook, and the inner one waits until the outer body has ended.
+fn program_src(inner_tail: Str, outer_tail: Str) -> Str {
+    #"fn report(p: PanicInfo) -> Never ! IO.Print, Env.Exit {
+    io.println("hook: {p.message}")
+    env.exit(70)
+}
+
+fn wait_for(name: Str) ! Env.Read, Time.Sleep {
+    while env.var(name).is_none() {
+        time.sleep(Duration.ms(1))
+    }
+}
+
+fn main() ! IO, Env, Async, Time {
+    let inner = env.var("PH_INNER").is_some()
+    async.scope {
+        with on_panic(report) {
+            if inner {
+                env.set_var("PH_INNER_LIVE", "1")
+                wait_for("PH_OUTER_DONE")
+                "#.concat(inner_tail).concat(#"
+            } else {
+                env.set_var("PH_INNER", "1")
+                let _t = async.spawn(fn() { main() })
+                wait_for("PH_INNER_LIVE")
+            }
+        }
+        if !inner {
+            env.set_var("PH_OUTER_DONE", "1")
+        }
+    }
+    if !inner {
+        "#).concat(outer_tail).concat(#"
+    }
+}
+"#)
+}
+
+test "a panic in the inner body after the outer body ends reaches the hook" {
+    let src = program_src("panic(\"inner\")", "io.println(\"unreached\")")
+    let r = compile_and_run(src, "ph_two_threads_inner_{getpid()}")
+    assert(r.exit_code == 70, "exit {r.exit_code}: {r.out}{r.err_out}")
+    assert_eq(r.out, "hook: inner\n")
+}
+
+test "a panic after both bodies end gets the default report" {
+    let src = program_src("io.println(\"inner done\")", "panic(\"late\")")
+    let r = compile_and_run(src, "ph_two_threads_late_{getpid()}")
+    assert(r.exit_code == 101, "exit {r.exit_code}: {r.out}{r.err_out}")
+    assert_eq(r.out, "inner done\n")
+    assert(r.err_out.contains("late"), r.err_out)
+}

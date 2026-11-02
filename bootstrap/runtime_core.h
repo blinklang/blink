@@ -3224,12 +3224,14 @@ typedef struct {
     int test_run;
 } __blink_panic_hook_record;
 
-/* A `with on_panic` holds this for its body: whether it installed the hook, and the record it
-   replaced. A main that calls main runs the `with` again, and the inner leave hands the outer
-   body its hook back. */
-typedef struct {
+/* A `with on_panic` holds this for its body: the record it installs and the frame below it.
+   A main that calls main runs the `with` again, so several bodies can hold a frame at once,
+   and on two threads (a main that runs main on a task) they can end in any order. Each leave
+   unlinks its own frame, and the top frame left is the hook. */
+typedef struct __blink_panic_hook_frame {
     int installed;
-    __blink_panic_hook_record saved;
+    __blink_panic_hook_record record;
+    struct __blink_panic_hook_frame* below;
 } __blink_panic_hook_frame;
 
 /* §2.20 leaves open what a panic on a second thread does while the first runs the hook. The
@@ -3240,15 +3242,18 @@ typedef struct {
 #ifdef BLINK_USE_EXTERN_RUNTIME_STORAGE
   #ifdef BLINK_RUNTIME_STORAGE_DEFINE
     __blink_panic_hook_record __blink_panic_hook = {0};
+    __blink_panic_hook_frame* __blink_panic_hook_top = NULL;
     __thread int __blink_in_panic_hook = 0;
     char __blink_panic_hook_lock = 0;
   #else
     extern __blink_panic_hook_record __blink_panic_hook;
+    extern __blink_panic_hook_frame* __blink_panic_hook_top;
     extern __thread int __blink_in_panic_hook;
     extern char __blink_panic_hook_lock;
   #endif
 #else
 static __blink_panic_hook_record __blink_panic_hook = {0};
+static __blink_panic_hook_frame* __blink_panic_hook_top = NULL;
 static __thread int __blink_in_panic_hook = 0;
 static char __blink_panic_hook_lock = 0;
 #endif
@@ -3261,28 +3266,36 @@ static inline void __blink_panic_hook_lock_give(void) {
     __atomic_clear(&__blink_panic_hook_lock, __ATOMIC_RELEASE);
 }
 
+/* Make the top frame's record the hook, under the lock. */
+static inline void __blink_panic_hook_publish(void) {
+    int test_run = __blink_panic_hook.test_run;
+    if (__blink_panic_hook_top != NULL) {
+        __blink_panic_hook = __blink_panic_hook_top->record;
+    } else {
+        __blink_panic_hook_record none = {0};
+        __blink_panic_hook = none;
+    }
+    __blink_panic_hook.test_run = test_run;
+}
+
 /* Install the hook for the body of a `with`. The cleanup of the `with` hands the frame to
    __blink_panic_hook_leave. */
-BLINK_RT_FN __blink_panic_hook_frame __blink_panic_hook_enter(__blink_panic_hook_adapter adapter, struct blink_closure_* hook, void* ev, const void* ev_at_with, size_t ev_size);
+BLINK_RT_FN void __blink_panic_hook_enter(__blink_panic_hook_frame* frame, __blink_panic_hook_adapter adapter, struct blink_closure_* hook, void* ev, const void* ev_at_with, size_t ev_size);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN __blink_panic_hook_frame __blink_panic_hook_enter(__blink_panic_hook_adapter adapter, struct blink_closure_* hook, void* ev, const void* ev_at_with, size_t ev_size) {
+BLINK_RT_FN void __blink_panic_hook_enter(__blink_panic_hook_frame* frame, __blink_panic_hook_adapter adapter, struct blink_closure_* hook, void* ev, const void* ev_at_with, size_t ev_size) {
     __blink_panic_hook_lock_take();
-    __blink_panic_hook_frame frame = { 0, __blink_panic_hook };
     if (!__blink_panic_hook.test_run && __blink_panic_test_hook == NULL) {
-        __blink_panic_hook.adapter = adapter;
-        __blink_panic_hook.hook = hook;
-        __blink_panic_hook.ev = ev;
-        __blink_panic_hook.ev_at_with = ev_at_with;
-        __blink_panic_hook.ev_size = ev_size;
-        __blink_panic_hook.owner = &__blink_in_panic_hook;
-        frame.installed = 1;
+        __blink_panic_hook_record record = { adapter, hook, ev, ev_at_with, ev_size, &__blink_in_panic_hook, 0 };
+        frame->record = record;
+        frame->below = __blink_panic_hook_top;
+        frame->installed = 1;
+        __blink_panic_hook_top = frame;
+        __blink_panic_hook_publish();
     }
     __blink_panic_hook_lock_give();
-    return frame;
 }
 #endif
 
-/* The saved ev copy lives in the frame of the outer `with`, which is still running. */
 BLINK_RT_FN void __blink_panic_hook_leave_run(void* frame, int ok);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN void __blink_panic_hook_leave_run(void* frame, int ok) {
@@ -3291,9 +3304,13 @@ BLINK_RT_FN void __blink_panic_hook_leave_run(void* frame, int ok) {
     if (!f->installed) return;
     f->installed = 0;
     __blink_panic_hook_lock_take();
-    int test_run = __blink_panic_hook.test_run;
-    __blink_panic_hook = f->saved;
-    __blink_panic_hook.test_run = test_run;
+    for (__blink_panic_hook_frame** at = &__blink_panic_hook_top; *at != NULL; at = &(*at)->below) {
+        if (*at == f) {
+            *at = f->below;
+            break;
+        }
+    }
+    __blink_panic_hook_publish();
     __blink_panic_hook_lock_give();
 }
 #endif
