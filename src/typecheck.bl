@@ -31946,6 +31946,14 @@ fn tc_tm_check_call(node: Int, inside: Set[Int]) ! TypeCheck.Resolve, Diag.Repor
             tc_tm_report(node, "`msg` calls `{node_name(decl)}`, which has a row", ["`{node_name(decl)}` has the row `! {row.join(", ")}`"])
             return
         }
+        if tc_call_user_effect(node) < 0 {
+            let t = tc_tm_touch(decl)
+            if t.name != "" {
+                let how = if t.writes { "writes" } else { "reads" }
+                tc_tm_report(node, "`msg` calls `{node_name(decl)}`, which {how} `{t.name}`", [])
+                return
+            }
+        }
     }
     if node_kind(node) == NodeKind.MethodCall && tc_tm_call_writes_receiver(node, decl) {
         let shown = tc_tm_written_outside(node_obj(node), inside)
@@ -32032,6 +32040,104 @@ fn tc_tm_written_outside(place: Int, inside: Set[Int]) -> Str {
     }
     if tc_global_decl_node(root) >= 0 { return node_name(root) }
     ""
+}
+
+// What a call does to module state: the module `let mut` it writes or else reads, "" for none.
+type TmTouch {
+    writes: Bool
+    name: Str
+}
+
+// What a call of `decl` does to module state, through its body and the bodies of the fns it
+// calls: a write of a module `let mut` beats a read of one, and a read is State too (§4.16.1).
+// A closure body counts only where the closure is called, which a call through a fn value
+// hides, so it is not walked; neither is a nested fn or a trace.log msg, which adds no State.
+fn tc_tm_touch(decl: Int) -> TmTouch ! TypeCheck.Resolve {
+    let mut seen: Set[Int] = Set()
+    let mut reads: List[Str] = []
+    let mut writes: List[Str] = []
+    let mut kids: List[Int] = []
+    tc_tm_touch_fn(decl, seen, reads, writes, kids)
+    if writes.len() > 0 {
+        TmTouch { writes: true, name: writes.get(0).unwrap() }
+    } else {
+        TmTouch { writes: false, name: reads.get(0) ?? "" }
+    }
+}
+
+fn tc_tm_touch_fn(decl: Int, seen: Set[Int], reads: List[Str], writes: List[Str], kids: List[Int]) ! TypeCheck.Resolve {
+    if seen.contains(decl) || writes.len() > 0 { return }
+    seen.insert(decl)
+    if node_kind(decl) != NodeKind.FnDef { return }
+    tc_tm_touch_walk(node_body(decl), seen, reads, writes, kids)
+}
+
+fn tc_tm_touch_walk(node: Int, seen: Set[Int], reads: List[Str], writes: List[Str], kids: List[Int]) ! TypeCheck.Resolve {
+    if node < 0 || writes.len() > 0 { return }
+    let k = node_kind(node)
+    if k == NodeKind.FnDef || k == NodeKind.Closure || k == NodeKind.HandlerExpr { return }
+    if k == NodeKind.MethodCall && tc_call_is_trace_log(node) {
+        let args = node_args(node)
+        if args != -1 && sublist_length(args) > 0 { tc_tm_touch_walk(sublist_get(args, 0), seen, reads, writes, kids) }
+        return
+    }
+    if k == NodeKind.Ident || k == NodeKind.FieldAccess {
+        let shown = tc_tm_module_mut(node)
+        if shown != "" { reads.push(shown) }
+    }
+    if k == NodeKind.Assignment || k == NodeKind.CompoundAssign {
+        let shown = tc_tm_module_root(node_target(node))
+        if shown != "" {
+            writes.push(shown)
+            return
+        }
+    }
+    if k == NodeKind.Call || k == NodeKind.MethodCall {
+        let decl = tc_call_decl_node(node)
+        if k == NodeKind.MethodCall && tc_tm_call_writes_receiver(node, decl) {
+            let shown = tc_tm_module_root(node_obj(node))
+            if shown != "" {
+                writes.push(shown)
+                return
+            }
+        }
+        if decl >= 0 && tc_call_user_effect(node) < 0 { tc_tm_touch_fn(decl, seen, reads, writes, kids) }
+    }
+    let base = kids.len()
+    node_push_value_child_ids(node, kids)
+    let end = kids.len()
+    let mut i = base
+    while i < end {
+        tc_tm_touch_walk(kids.get(i).unwrap(), seen, reads, writes, kids)
+        i = i + 1
+    }
+    while kids.len() > base {
+        let _ = kids.pop()
+    }
+}
+
+// The module `let mut` this ident or `module.name` access reads, as the source names it, or "".
+fn tc_tm_module_mut(node: Int) -> Str {
+    if node_kind(node) == NodeKind.FieldAccess {
+        return match tc_module_global_decl(node) {
+            Some(g) => if node_is_mut(g) != 0 { node_name(node) } else { "" }
+            None => ""
+        }
+    }
+    let g = tc_global_decl_node(node)
+    if g >= 0 && node_is_mut(g) != 0 { node_name(node) } else { "" }
+}
+
+// The module `let mut` a place starts at, as the source names it, or "" for a local.
+fn tc_tm_module_root(place: Int) -> Str {
+    let mut root = place
+    while node_kind(root) == NodeKind.FieldAccess || node_kind(root) == NodeKind.IndexExpr {
+        let shown = if node_kind(root) == NodeKind.FieldAccess { tc_tm_module_mut(root) } else { "" }
+        if shown != "" { return shown }
+        root = node_obj(root)
+    }
+    if root < 0 || node_kind(root) != NodeKind.Ident { return "" }
+    tc_tm_module_mut(root)
 }
 
 // A type parameter is a scoped value when a bound says so. Every active frame of its binder

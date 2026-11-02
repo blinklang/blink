@@ -233,3 +233,129 @@ fn main() {
     assert(primary_at(e, 3, 34), e)
     assert(e.contains("`msg` calls `env.cwd`, a handler operation"), e)
 }
+
+test "a call of a fn that writes a module let mut is E0566" {
+    let src = #"let mut depth = 0
+
+fn bump() -> Int {
+    depth = depth + 1
+    depth
+}
+
+fn walk() {
+    trace.log("walk", "d={bump()}")
+}
+
+fn main() {
+    walk()
+}
+"#
+    let e = only_e0566(check_via_cli(src, "e0566_bump_{getpid()}"))
+    assert(primary_at(e, 9, 27), e)
+    assert(e.contains("`msg` calls `bump`, which writes `depth`"), e)
+}
+
+test "a call of a fn that reads a module let mut is E0566" {
+    let src = #"let mut depth = 0
+
+fn level() -> Int {
+    depth * 2
+}
+
+fn walk() {
+    trace.log("walk", "l={level()}")
+}
+
+fn main() {
+    walk()
+}
+"#
+    let e = only_e0566(check_via_cli(src, "e0566_reader_{getpid()}"))
+    assert(primary_at(e, 8, 27), e)
+    assert(e.contains("`msg` calls `level`, which reads `depth`"), e)
+}
+
+test "a fn that changes module state through a callee is E0566 in msg" {
+    let src = #"let mut seen: List[Int] = []
+
+fn note(n: Int) -> Int {
+    seen.push(n)
+    n
+}
+
+fn tag(n: Int) -> Str {
+    "n={note(n)}"
+}
+
+fn walk() {
+    trace.log("walk", tag(1))
+}
+
+fn main() {
+    walk()
+}
+"#
+    let e = only_e0566(check_via_cli(src, "e0566_transitive_{getpid()}"))
+    assert(primary_at(e, 13, 23), e)
+    assert(e.contains("`msg` calls `tag`, which writes `seen`"), e)
+}
+
+test "a fn that reads a module let only or its own locals is allowed in msg" {
+    let src = #"let limit = 3
+
+fn spread(n: Int) -> Int {
+    let mut total = 0
+    for i in 0..n { total = total + i * limit }
+    total
+}
+
+fn walk() {
+    trace.log("walk", "s={spread(4)}")
+}
+
+fn main() {
+    walk()
+}
+"#
+    let out = check_via_cli(src, "e0566_local_mut_ok_{getpid()}")
+    assert(!out.contains("\"severity\":\"error\""), out)
+}
+
+test "the walk example of the spec gives its three errors" {
+    let src = #"let mut depth = 0
+
+fn next_id() -> Int ! State {
+    depth
+}
+
+fn bump() -> Int {
+    depth = depth + 1
+    depth
+}
+
+fn walk(n: Int) -> Int {
+    trace.log("walk", "depth={depth}")
+    trace.log("walk", "dir={env.cwd()}")
+    trace.log("walk", "next={next_id()}")
+    trace.log("walk", "d={bump()}")
+    n
+}
+
+fn main() {
+    let _ = walk(1)
+}
+"#
+    let out = check_via_cli(src, "e0566_walk_{getpid()}")
+    let found = e0566_lines(out)
+    assert_eq(found.len(), 3)
+    assert_eq(error_count(out), 3)
+    let cwd = found.get(0).unwrap()
+    assert(primary_at(cwd, 14, 29), cwd)
+    assert(cwd.contains("`msg` calls `env.cwd`, a handler operation"), cwd)
+    let next = found.get(1).unwrap()
+    assert(primary_at(next, 15, 30), next)
+    assert(next.contains("`msg` calls `next_id`, which has a row"), next)
+    let bump = found.get(2).unwrap()
+    assert(primary_at(bump, 16, 27), bump)
+    assert(bump.contains("`msg` calls `bump`, which writes `depth`"), bump)
+}
