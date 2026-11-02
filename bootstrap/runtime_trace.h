@@ -1,6 +1,9 @@
 #ifndef BLINK_RUNTIME_TRACE_H
 #define BLINK_RUNTIME_TRACE_H
 
+#include <pthread.h>
+#include <signal.h>
+
 #define BLINK_TRACE_MAX_VALUE_LEN 200
 
 /* One filter of BLINK_TRACE: its key and the values that compose with OR. The value has no
@@ -21,6 +24,8 @@ typedef struct {
     int event_exit;
     int event_effect;
     int event_state;
+    /* Set when the stream of the trace closes; the program writes no more events (§8.15.13). */
+    int closed;
 } blink_trace_state;
 
 #ifdef BLINK_USE_EXTERN_RUNTIME_STORAGE
@@ -31,6 +36,60 @@ typedef struct {
   #endif
 #else
 static blink_trace_state __blink_trace = {0};
+#endif
+
+/* The state of one event write, which blink_trace_write_begin saves and
+   blink_trace_write_end restores. */
+typedef struct {
+    sigset_t old_mask;
+    int pipe_was_pending;
+    int had_error;
+} blink_trace_write_guard;
+
+/* Starts the write of one event: takes the stderr lock and blocks SIGPIPE for this thread, so
+   a closed stream ends the trace and not the program (§8.15.13). Gives 0, with no lock held,
+   when the stream closed before. */
+BLINK_RT_FN int blink_trace_write_begin(blink_trace_write_guard* g);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN int blink_trace_write_begin(blink_trace_write_guard* g) {
+    flockfile(stderr);
+    if (__blink_trace.closed) {
+        funlockfile(stderr);
+        return 0;
+    }
+    sigset_t pipe_set, pending;
+    sigemptyset(&pipe_set);
+    sigaddset(&pipe_set, SIGPIPE);
+    pthread_sigmask(SIG_BLOCK, &pipe_set, &g->old_mask);
+    sigpending(&pending);
+    g->pipe_was_pending = sigismember(&pending, SIGPIPE);
+    g->had_error = ferror(stderr);
+    return 1;
+}
+#endif
+
+/* Ends the write of one event. A write that failed closes the trace, as the stream lost the
+   event text. The SIGPIPE of that write is consumed and the error flag is cleared, so the next
+   write of the program to stderr sees the stream as it would with no trace. A SIGPIPE or an
+   error that was there before the event belongs to the program, so it stays. */
+BLINK_RT_FN void blink_trace_write_end(blink_trace_write_guard* g);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void blink_trace_write_end(blink_trace_write_guard* g) {
+    sigset_t pipe_set, pending;
+    sigemptyset(&pipe_set);
+    sigaddset(&pipe_set, SIGPIPE);
+    sigpending(&pending);
+    int raised_pipe = !g->pipe_was_pending && sigismember(&pending, SIGPIPE);
+    int raised_error = !g->had_error && ferror(stderr);
+    if (raised_pipe || raised_error) __blink_trace.closed = 1;
+    if (raised_error) clearerr(stderr);
+    if (raised_pipe) {
+        int got;
+        sigwait(&pipe_set, &got);
+    }
+    pthread_sigmask(SIG_SETMASK, &g->old_mask, NULL);
+    funlockfile(stderr);
+}
 #endif
 
 /* One traced call on this thread's stack: when it began, and whether the filters chose its
@@ -480,6 +539,8 @@ BLINK_RT_FN void blink_trace_enter(const char* fn, const char* module, int depth
 BLINK_RT_FN void blink_trace_enter(const char* fn, const char* module, int depth,
     const char* file, int line, int col, const char* args_json) {
     if (!__blink_trace.event_enter) return;
+    blink_trace_write_guard g;
+    if (!blink_trace_write_begin(&g)) return;
     int64_t ts = blink_trace_ts_us();
     fprintf(stderr, "{\"ts_us\":%lld,\"event\":\"enter\",\"fn\":\"%s\",\"module\":\"%s\",\"depth\":%d,"
         "\"span\":{\"file\":\"%s\",\"line\":%d,\"col\":%d}",
@@ -489,6 +550,7 @@ BLINK_RT_FN void blink_trace_enter(const char* fn, const char* module, int depth
     }
     fprintf(stderr, "}\n");
     fflush(stderr);
+    blink_trace_write_end(&g);
 }
 #endif
 
@@ -498,6 +560,8 @@ BLINK_RT_FN void blink_trace_exit(const char* fn, const char* module, int depth,
 BLINK_RT_FN void blink_trace_exit(const char* fn, const char* module, int depth,
     int64_t enter_ts, const char* ret_str) {
     if (!__blink_trace.event_exit) return;
+    blink_trace_write_guard g;
+    if (!blink_trace_write_begin(&g)) return;
     int64_t ts = blink_trace_ts_us();
     int64_t duration = ts - enter_ts;
     fprintf(stderr, "{\"ts_us\":%lld,\"event\":\"exit\",\"fn\":\"%s\",\"module\":\"%s\",\"depth\":%d,"
@@ -514,6 +578,7 @@ BLINK_RT_FN void blink_trace_exit(const char* fn, const char* module, int depth,
     }
     fputs("}\n", stderr);
     fflush(stderr);
+    blink_trace_write_end(&g);
 }
 #endif
 
@@ -523,6 +588,8 @@ BLINK_RT_FN void blink_trace_state_event(const char* fn, const char* module, int
 BLINK_RT_FN void blink_trace_state_event(const char* fn, const char* module, int depth,
     const char* var, const char* op, const char* value) {
     if (!__blink_trace.event_state) return;
+    blink_trace_write_guard g;
+    if (!blink_trace_write_begin(&g)) return;
     int64_t ts = blink_trace_ts_us();
     fprintf(stderr, "{\"ts_us\":%lld,\"event\":\"state\",\"fn\":\"%s\",\"module\":\"%s\",\"depth\":%d,"
         "\"var\":\"%s\",\"op\":\"%s\",\"value\":\"",
@@ -536,6 +603,7 @@ BLINK_RT_FN void blink_trace_state_event(const char* fn, const char* module, int
     }
     fputs("}\n", stderr);
     fflush(stderr);
+    blink_trace_write_end(&g);
 }
 #endif
 
@@ -545,6 +613,8 @@ BLINK_RT_FN void blink_trace_effect(const char* fn, const char* module, int dept
 BLINK_RT_FN void blink_trace_effect(const char* fn, const char* module, int depth,
     const char* effect, const char* op, const char* args_json) {
     if (!__blink_trace.event_effect) return;
+    blink_trace_write_guard g;
+    if (!blink_trace_write_begin(&g)) return;
     int64_t ts = blink_trace_ts_us();
     fprintf(stderr, "{\"ts_us\":%lld,\"event\":\"effect\",\"fn\":\"%s\",\"module\":\"%s\",\"depth\":%d,"
         "\"effect\":\"%s\",\"op\":\"%s\"",
@@ -554,6 +624,7 @@ BLINK_RT_FN void blink_trace_effect(const char* fn, const char* module, int dept
     }
     fputs("}\n", stderr);
     fflush(stderr);
+    blink_trace_write_end(&g);
 }
 #endif
 
@@ -737,7 +808,8 @@ BLINK_RT_FN void blink_trace_enter_event(const char* fn, const char* module, con
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN void blink_trace_enter_event(const char* fn, const char* module, const char* file,
     int64_t line, int64_t col, int64_t n, ...) {
-    flockfile(stderr);
+    blink_trace_write_guard g;
+    if (!blink_trace_write_begin(&g)) return;
     blink_trace_put_head("enter", fn, module, blink_trace_frame_depth());
     fputs(",\"span\":{\"file\":\"", stderr);
     blink_trace_put_json(stderr, file, -1);
@@ -757,7 +829,7 @@ BLINK_RT_FN void blink_trace_enter_event(const char* fn, const char* module, con
     va_end(ap);
     if (n > 0) fputs("}", stderr);
     blink_trace_put_tail(truncated);
-    funlockfile(stderr);
+    blink_trace_write_end(&g);
 }
 #endif
 
@@ -778,13 +850,14 @@ BLINK_RT_FN void blink_trace_exit_event(const char* fn, const char* module, cons
 BLINK_RT_FN void blink_trace_exit_event(const char* fn, const char* module, const char* value) {
     int64_t depth = blink_trace_frame_depth();
     int64_t duration = blink_trace_ts_us() - __blink_trace_frames[depth].enter_ts;
-    flockfile(stderr);
+    blink_trace_write_guard g;
+    if (!blink_trace_write_begin(&g)) return;
     blink_trace_put_head("exit", fn, module, depth);
     fprintf(stderr, ",\"duration_us\":%lld,\"return\":\"", (long long)duration);
     int truncated = blink_trace_put_json(stderr, value ? value : "()", BLINK_TRACE_MAX_VALUE_LEN);
     fputs("\"", stderr);
     blink_trace_put_tail(truncated);
-    funlockfile(stderr);
+    blink_trace_write_end(&g);
 }
 #endif
 
@@ -804,7 +877,8 @@ BLINK_RT_FN void blink_trace_state_emit(const char* fn, const char* module, cons
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN void blink_trace_state_emit(const char* fn, const char* module, const char* var,
     const char* op, const char* value) {
-    flockfile(stderr);
+    blink_trace_write_guard g;
+    if (!blink_trace_write_begin(&g)) return;
     blink_trace_put_head("state", fn, module, blink_trace_frame_depth());
     fputs(",\"var\":\"", stderr);
     blink_trace_put_json(stderr, var, -1);
@@ -814,7 +888,7 @@ BLINK_RT_FN void blink_trace_state_emit(const char* fn, const char* module, cons
     int truncated = blink_trace_put_json(stderr, value, BLINK_TRACE_MAX_VALUE_LEN);
     fputs("\"", stderr);
     blink_trace_put_tail(truncated);
-    funlockfile(stderr);
+    blink_trace_write_end(&g);
 }
 #endif
 

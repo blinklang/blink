@@ -1,0 +1,42 @@
+// When the stream of the trace closes, a traced program stops writing trace events and runs
+// to its end with its own exit code. Only the trace writes stop: a write by the program to its
+// own stdout or stderr keeps the behavior of that stream, also when `2>&1` puts both in one
+// pipe (§8.15.13). Each run puts stderr into a pipe whose reader exits after one byte, and the
+// trace writes far more than a pipe holds, so the stream closes while the program runs.
+
+import compile_test_helpers
+
+let SRC = #"fn step(n: Int) -> Int {
+    n + 1
+}
+
+fn main() ! IO, Env {
+    let mut total = 0
+    let mut i = 0
+    while i < 5000 {
+        total = step(total)
+        i = i + 1
+    }
+    io.println("total {total}")
+    if env.var("WRITE_ERR") == Some("1") { io.eprintln("done") }
+    env.exit(7)
+}
+"#
+
+test "a program whose trace stream closes ends with its own exit code and all its stdout" {
+    let bin = compile_test_helpers.build_bin(SRC, "trace_closed_stdout", ["--trace"])
+    let dir = "{compile_test_helpers.scratch_root()}/trace_closed_stdout"
+    let r = process.run("sh", ["-c", "\{ {bin} 2>&1 > {dir}/out; echo $? > {dir}/rc; \} | head -c 1 > /dev/null; cat {dir}/rc {dir}/out"]).unwrap()
+    assert_eq(r.out, "7\ntotal 5000\n")
+    compile_test_helpers.clean_bin("trace_closed_stdout")
+}
+
+test "a write of the program to the closed stream keeps the default behavior of the stream" {
+    let bin = compile_test_helpers.build_bin(SRC, "trace_closed_own", ["--trace"])
+    let dir = "{compile_test_helpers.scratch_root()}/trace_closed_own"
+    let both = "\{ {bin} 2>&1; echo $? > {dir}/rc; \} | head -c 1 > /dev/null; cat {dir}/rc"
+    assert_eq(process.run("sh", ["-c", both]).unwrap().out, "141\n")
+    let err = "\{ WRITE_ERR=1 {bin} 2>&1 > /dev/null; echo $? > {dir}/rc; \} | head -c 1 > /dev/null; cat {dir}/rc"
+    assert_eq(process.run("sh", ["-c", err]).unwrap().out, "141\n")
+    compile_test_helpers.clean_bin("trace_closed_own")
+}
