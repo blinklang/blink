@@ -9,6 +9,7 @@
 typedef struct {
     int all;
     char** names;
+    size_t* lens;
     int count;
 } blink_trace_channels_state;
 
@@ -29,7 +30,9 @@ BLINK_RT_FN void blink_trace_channels_init(void);
 BLINK_RT_FN void blink_trace_channels_init(void) {
     for (int i = 0; i < __blink_trace_channels.count; i++) free(__blink_trace_channels.names[i]);
     free(__blink_trace_channels.names);
+    free(__blink_trace_channels.lens);
     __blink_trace_channels.names = NULL;
+    __blink_trace_channels.lens = NULL;
     __blink_trace_channels.count = 0;
     __blink_trace_channels.all = 0;
     const char* env = getenv("BLINK_TRACE_CHANNELS");
@@ -39,7 +42,7 @@ BLINK_RT_FN void blink_trace_channels_init(void) {
     for (;;) {
         const char* end = strchr(p, ',');
         size_t n = end ? (size_t)(end - p) : strlen(p);
-        char* item = blink_trace_trim_dup(p, n);
+        char* item = blink_trace_trim_dup_for(p, n, "BLINK_TRACE_CHANNELS");
         if (item && strcmp(item, "all") == 0) {
             __blink_trace_channels.all = 1;
             free(item);
@@ -49,7 +52,11 @@ BLINK_RT_FN void blink_trace_channels_init(void) {
                 char** grown = (char**)realloc(__blink_trace_channels.names, (size_t)cap * sizeof(char*));
                 if (!grown) { fputs("error: out of memory reading BLINK_TRACE_CHANNELS\n", stderr); exit(2); }
                 __blink_trace_channels.names = grown;
+                size_t* lens = (size_t*)realloc(__blink_trace_channels.lens, (size_t)cap * sizeof(size_t));
+                if (!lens) { fputs("error: out of memory reading BLINK_TRACE_CHANNELS\n", stderr); exit(2); }
+                __blink_trace_channels.lens = lens;
             }
+            __blink_trace_channels.lens[__blink_trace_channels.count] = strlen(item);
             __blink_trace_channels.names[__blink_trace_channels.count++] = item;
         }
         if (!end) break;
@@ -58,15 +65,15 @@ BLINK_RT_FN void blink_trace_channels_init(void) {
 }
 #endif
 
-/* A Blink Str may hold a NUL, so a channel compares by its length, not by strcmp. */
+/* A Blink Str may hold a NUL, so a channel compares by its length, not by strcmp; init keeps
+   each name's length, as this runs on every trace.log call. */
 BLINK_RT_FN int blink_trace_channel_on(const char* ch);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN int blink_trace_channel_on(const char* ch) {
     if (__blink_trace_channels.all) return 1;
     size_t n = (size_t)blink_str_len(ch);
     for (int i = 0; i < __blink_trace_channels.count; i++) {
-        const char* name = __blink_trace_channels.names[i];
-        if (strlen(name) == n && memcmp(name, ch, n) == 0) return 1;
+        if (__blink_trace_channels.lens[i] == n && memcmp(__blink_trace_channels.names[i], ch, n) == 0) return 1;
     }
     return 0;
 }

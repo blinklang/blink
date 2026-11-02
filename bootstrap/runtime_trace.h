@@ -95,18 +95,26 @@ BLINK_RT_FN void blink_trace_bad_filter(const char* why, const char* what, const
 #endif
 
 /* A copy of s[0..n) with ASCII space and tab cut from its two ends, or NULL when that is
-   empty. */
-BLINK_RT_FN char* blink_trace_trim_dup(const char* s, size_t n);
+   empty. Out of memory names `var`, the env var whose item this is. */
+BLINK_RT_FN char* blink_trace_trim_dup_for(const char* s, size_t n, const char* var);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN char* blink_trace_trim_dup(const char* s, size_t n) {
+BLINK_RT_FN char* blink_trace_trim_dup_for(const char* s, size_t n, const char* var) {
     while (n > 0 && (*s == ' ' || *s == '\t')) { s++; n--; }
     while (n > 0 && (s[n - 1] == ' ' || s[n - 1] == '\t')) n--;
     if (n == 0) return NULL;
     char* out = (char*)malloc(n + 1);
-    if (!out) { fputs("error: out of memory reading BLINK_TRACE\n", stderr); exit(2); }
+    if (!out) { fprintf(stderr, "error: out of memory reading %s\n", var); exit(2); }
     memcpy(out, s, n);
     out[n] = '\0';
     return out;
+}
+#endif
+
+/* blink_trace_trim_dup_for for an item of BLINK_TRACE. */
+BLINK_RT_FN char* blink_trace_trim_dup(const char* s, size_t n);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN char* blink_trace_trim_dup(const char* s, size_t n) {
+    return blink_trace_trim_dup_for(s, n, "BLINK_TRACE");
 }
 #endif
 
