@@ -1,0 +1,76 @@
+// A qualifier is used only in `q.y` (sections/07_trust_modules_metadata.md §10.5). A bare value
+// `q` never resolves to a qualifier, so it is an undefined name, whichever import form bound
+// the qualifier. A built-in namespace has the same shape: `io` names no value.
+
+import compile_test_helpers.{check_via_cli, compile_xmod_capture}
+
+fn helper() -> Str {
+    "pub type Token \{ v: Int }\npub fn login() -> Int \{ 1 }\n"
+}
+
+fn expect_undefined(out: Str, name: Str, at: Str) {
+    assert(out.contains("\"code\":\"E0506\""), out)
+    assert(out.contains("undefined variable `{name}`"), out)
+    assert(out.contains(at), out)
+    assert(!out.contains("NodeCarriesNoType"), out)
+    assert(!out.contains("internal compiler error"), out)
+}
+
+test "a whole-module qualifier bound to a let is undefined, and its help says write q.y" {
+    let out = compile_xmod_capture("import auth\nfn main() \{ let _a = auth }\n", "auth", helper(), "bare_q_let")
+    expect_undefined(out, "auth", "\"line\":2,\"col\":22")
+    assert(out.contains("`auth` is a module qualifier, not a value: write `auth.y`"), out)
+}
+
+test "a qualifier passed as an argument is undefined" {
+    let src = "import auth\nfn f(x: Int) -> Int \{ x }\nfn main() \{ let _a = f(auth) + auth.login() }\n"
+    let out = compile_xmod_capture(src, "auth", helper(), "bare_q_arg")
+    expect_undefined(out, "auth", "\"line\":3,\"col\":24")
+}
+
+test "a qualifier as a statement is undefined" {
+    let out = compile_xmod_capture("import auth\nfn main() \{ auth }\n", "auth", helper(), "bare_q_stmt")
+    expect_undefined(out, "auth", "\"line\":2,\"col\":13")
+}
+
+test "a qualifier in an interpolation is undefined" {
+    let out = compile_xmod_capture("import auth\nfn main() ! IO \{ io.println(\"\{auth}\") }\n", "auth", helper(), "bare_q_interp")
+    expect_undefined(out, "auth", "undefined variable")
+}
+
+test "the qualifier a selective import binds is no value" {
+    let src = "import auth.\{Token}\nfn main() \{\n    let _t: Token? = None\n    let _a = auth\n}\n"
+    let out = compile_xmod_capture(src, "auth", helper(), "bare_q_selective")
+    expect_undefined(out, "auth", "\"line\":4,\"col\":14")
+}
+
+test "the name after as is a qualifier and no value" {
+    let out = compile_xmod_capture("import auth as a\nfn main() \{ let _b = a + a.login() }\n", "auth", helper(), "bare_q_alias")
+    expect_undefined(out, "a", "\"line\":2,\"col\":22")
+}
+
+test "a call of a bare qualifier is an undefined function" {
+    let out = compile_xmod_capture("import auth\nfn main() \{ let _a = auth() + auth.login() }\n", "auth", helper(), "bare_q_call")
+    assert(out.contains("\"code\":\"E0304\"") || out.contains("UndefinedFunction"), out)
+    assert(!out.contains("internal compiler error"), out)
+}
+
+test "q.y still resolves next to a local of another name" {
+    let src = "import auth\nfn main() ! IO \{\n    let n = auth.login()\n    io.println(\"\{n}\")\n}\n"
+    let out = compile_xmod_capture(src, "auth", helper(), "bare_q_ok")
+    assert(!out.contains("\"severity\":\"error\""), out)
+}
+
+test "a built-in namespace is no value" {
+    let out = check_via_cli("fn main() ! IO \{\n    let _a = io\n    io.println(\"x\")\n}\n", "bare_ns_let_{getpid()}")
+    expect_undefined(out, "io", "\"line\":2,\"col\":14")
+    assert(out.contains("`io` is a built-in namespace, not a value"), out)
+}
+
+test "each built-in namespace passed as an argument is no value" {
+    for name in ["fs", "net", "env", "time", "async", "channel", "default", "term", "ffi"] {
+        let src = "fn f(x: Int) -> Int \{ x }\nfn main() \{\n    let _a = f({name})\n}\n"
+        let out = check_via_cli(src, "bare_ns_arg_{name}_{getpid()}")
+        expect_undefined(out, name, "\"line\":3,\"col\":16")
+    }
+}
