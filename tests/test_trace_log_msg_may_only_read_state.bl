@@ -4,7 +4,7 @@
 // row, and any handler operation in `msg` is TraceMessageEffect (E0566), with the primary span
 // on the offending expression.
 
-import compile_test_helpers.{check_via_cli, verify_catalog_entry}
+import compile_test_helpers.{check_via_cli, scratch_root, verify_catalog_entry}
 
 fn e0566_lines(out: Str) -> List[Str] {
     let mut found: List[Str] = []
@@ -28,6 +28,17 @@ fn only_e0566(out: Str) -> Str {
     assert_eq(found.len(), 1)
     assert_eq(error_count(out), 1)
     found.get(0).unwrap()
+}
+
+// `blink check` of a package of two files, the entry and a helper module it imports.
+fn check_package(entry_src: Str, helper_name: Str, helper_src: Str, tag: Str) -> Str ! FS.Write, Process.Spawn, Env.Read {
+    let root = "{scratch_root()}/{tag}"
+    let _mk = process.run("mkdir", ["-p", "{root}/src"]).unwrap()
+    fs.write("{root}/blink.toml", "[package]\nname = \"{tag}\"\nversion = \"0.1.0\"\n").unwrap()
+    fs.write("{root}/src/{helper_name}.bl", helper_src).unwrap()
+    fs.write("{root}/src/{tag}.bl", entry_src).unwrap()
+    let result = process.run("build/blink", ["check", "{root}/src/{tag}.bl", "--format", "json"]).unwrap()
+    "{result.out}{result.err_out}"
 }
 
 fn primary_at(entry: Str, line: Int, col: Int) -> Bool {
@@ -543,4 +554,62 @@ fn main() {
     let found = only_e0566(out)
     assert(primary_at(found, 25, 22), found)
     assert(found.contains("`msg` calls `both`, which reads `count`"), found)
+}
+
+test "an op of the rand handle in msg is E0566 as a handler operation" {
+    let src = #"fn walk() {
+    trace.log("c", "{rand.int(1..=6)}")
+    trace.log("c", "{rand.bytes(2).len()}")
+}
+
+fn main() {
+    walk()
+}
+"#
+    let out = check_via_cli(src, "e0566_rand_op_{getpid()}")
+    let found = e0566_lines(out)
+    assert_eq(found.len(), 2)
+    assert_eq(error_count(out), 2)
+    let int_op = found.get(0).unwrap()
+    assert(primary_at(int_op, 2, 22), int_op)
+    assert(int_op.contains("`msg` calls `rand.int`, a handler operation"), int_op)
+    let bytes_op = found.get(1).unwrap()
+    assert(primary_at(bytes_op, 3, 22), bytes_op)
+    assert(bytes_op.contains("`msg` calls `rand.bytes`, a handler operation"), bytes_op)
+}
+
+test "msg names a call or write through a module qualifier as the source spells it" {
+    let helper = #"pub let mut counter = 0
+
+pub fn get() -> Int ! IO { 1 }
+
+pub fn level() -> Int { counter }
+"#
+    let entry = #"import st
+
+fn peek() -> Int { st.counter }
+
+fn main() ! IO {
+    trace.log("c", "{st.get()}")
+    trace.log("c", "{st.level()}")
+    trace.log("c", "{peek()}")
+    trace.log("c", {
+        st.counter = 1
+        "x"
+    })
+}
+"#
+    let out = check_package(entry, "st", helper, "e0566_qualified_{getpid()}")
+    let found = e0566_lines(out)
+    assert_eq(found.len(), 4)
+    assert_eq(error_count(out), 4)
+    let row = found.get(0).unwrap()
+    assert(row.contains("`msg` calls `st.get`, which has a row"), row)
+    assert(row.contains("`st.get` has the row `! IO`"), row)
+    let read = found.get(1).unwrap()
+    assert(read.contains("`msg` calls `st.level`, which reads `counter`"), read)
+    let deep = found.get(2).unwrap()
+    assert(deep.contains("`msg` calls `peek`, which reads `st.counter`"), deep)
+    let write = found.get(3).unwrap()
+    assert(write.contains("`msg` writes `st.counter`"), write)
 }

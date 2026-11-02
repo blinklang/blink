@@ -31942,16 +31942,17 @@ fn tc_tm_check_call(node: Int, inside: Set[Int]) ! TypeCheck.Resolve, Diag.Repor
     }
     let decl = tc_call_decl_node(node)
     if decl >= 0 {
+        let callee = tc_tm_callee_shown(node, decl)
         let row = tc_tm_call_row(node, decl)
         if row.len() > 0 {
-            tc_tm_report(node, "`msg` calls `{node_name(decl)}`, which has a row", ["`{node_name(decl)}` has the row `! {row.join(", ")}`"])
+            tc_tm_report(node, "`msg` calls `{callee}`, which has a row", ["`{callee}` has the row `! {row.join(", ")}`"])
             return
         }
         if tc_call_user_effect(node) < 0 {
             let t = tc_tm_touch(node)
             if t.name != "" {
                 let how = if t.writes { "writes" } else { "reads" }
-                tc_tm_report(node, "`msg` calls `{node_name(decl)}`, which {how} `{t.name}`", [])
+                tc_tm_report(node, "`msg` calls `{callee}`, which {how} `{t.name}`", [])
                 return
             }
         }
@@ -32058,11 +32059,37 @@ fn tc_tm_handler_op(node: Int) -> Str {
     if node_kind(node) != NodeKind.MethodCall { return "" }
     let obj = node_obj(node)
     if node_kind(obj) != NodeKind.Ident || tc_ident_binder_node(obj) >= 0 || tc_global_decl_node(obj) >= 0 { return "" }
-    if tc_mc_obj_is_value(node) != 0 || tc_namespace_call_reads_module(node) { return "" }
+    if tc_mc_obj_is_value(node) != 0 { return "" }
     let ns = node_name(obj)
+    // A `rand.op(..)` call reaches the op through its wrapper declaration, and is still the op.
+    if tc_namespace_call_reads_module(node) && !tc_tm_calls_op_wrapper(node, ns) { return "" }
     // `ffi.scope` opens an arena, which is the FFI row, not a handler.
     if ns == "trace" || ns == "ffi" || is_intrinsic_method(ns, node_method(node)) == 0 { return "" }
     shown
+}
+
+fn tc_tm_calls_op_wrapper(node: Int, ns: Str) -> Bool {
+    let decl = tc_call_decl_node(node)
+    let root = builtin_op_root_of_handle(ns)
+    decl >= 0 && node_module(decl) == builtin_op_module(root).replace(".", "_") && builtin_op_surface_fn(root, node_method(node)) == node_name(decl)
+}
+
+// The callee of a call in `msg` as the source spells it: `st.get` through a module or type
+// qualifier, else the declared name.
+fn tc_tm_callee_shown(node: Int, decl: Int) -> Str {
+    if node_kind(node) == NodeKind.MethodCall && tc_mc_obj_is_value(node) == 0 {
+        let q = tc_tm_path_shown(node_obj(node))
+        if q != "" { return "{q}.{node_method(node)}" }
+    }
+    node_name(decl)
+}
+
+// A path of idents, such as `st` or `a.b`, as the source spells it, or "".
+fn tc_tm_path_shown(node: Int) -> Str {
+    if node_kind(node) == NodeKind.Ident { return node_name(node) }
+    if node_kind(node) != NodeKind.FieldAccess { return "" }
+    let q = tc_tm_path_shown(node_obj(node))
+    if q == "" { "" } else { "{q}.{node_name(node)}" }
 }
 
 // The row a call runs: the callee's declared row, with `_` read off this call's instance and
@@ -32113,7 +32140,7 @@ fn tc_tm_written_outside(place: Int, inside: Set[Int]) -> Str {
     while node_kind(root) == NodeKind.FieldAccess || node_kind(root) == NodeKind.IndexExpr {
         if node_kind(root) == NodeKind.FieldAccess {
             match tc_module_global_decl(root) {
-                Some(_) => return node_name(root)
+                Some(_) => return tc_tm_path_shown(root)
                 None => {}
             }
         }
@@ -32267,7 +32294,7 @@ fn tc_tm_touch_with(node: Int, binds: Map[Str, Int], depth: Int, seen: Set[Str],
 fn tc_tm_module_mut(node: Int) -> Str {
     if node_kind(node) == NodeKind.FieldAccess {
         return match tc_module_global_decl(node) {
-            Some(g) => if node_is_mut(g) != 0 { node_name(node) } else { "" }
+            Some(g) => if node_is_mut(g) != 0 { tc_tm_path_shown(node) } else { "" }
             None => ""
         }
     }
