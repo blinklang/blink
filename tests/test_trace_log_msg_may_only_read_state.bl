@@ -723,3 +723,123 @@ fn main() {
     let out = check_via_cli(src, "e0566_callee_closure_ok_{getpid()}")
     assert(!out.contains("\"severity\":\"error\""), out)
 }
+
+test "a msg that runs a closure declared outside it is E0566 when the closure touches a module let mut" {
+    let src = #"let mut count = 0
+
+fn walk() {
+    let bump = fn(x: Int) -> Int {
+        count += x
+        count
+    }
+    let peek = fn() -> Int { count }
+    let one = fn() -> Int { 1 }
+    trace.log("c", "{bump(1)}")
+    trace.log("c", "{[1].map(bump).len()}")
+    trace.log("c", "{peek()}")
+    trace.log("c", "{one()}")
+}
+
+fn main() {
+    walk()
+}
+"#
+    let out = check_via_cli(src, "e0566_msg_outer_closure_{getpid()}")
+    let found = e0566_lines(out)
+    assert_eq(found.len(), 3)
+    assert_eq(error_count(out), 3)
+    let call = found.get(0).unwrap()
+    assert(primary_at(call, 10, 22), call)
+    assert(call.contains("`msg` runs `bump`, which writes `count`"), call)
+    let mapped = found.get(1).unwrap()
+    assert(primary_at(mapped, 11, 22), mapped)
+    assert(mapped.contains("`msg` runs `bump`, which writes `count`"), mapped)
+    let read = found.get(2).unwrap()
+    assert(primary_at(read, 12, 22), read)
+    assert(read.contains("`msg` runs `peek`, which reads `count`"), read)
+}
+
+test "a callee that hands a closure to a built-in that stores it is allowed in msg, and one that runs it is E0566" {
+    let src = #"let mut count = 0
+
+fn stash() -> Int {
+    let mut fs: List[fn() -> Int] = []
+    fs.push(fn() -> Int {
+        count += 1
+        count
+    })
+    fs.len()
+}
+
+fn keyed() -> Int {
+    let mut m: Map[Str, fn() -> Int] = Map.new()
+    m.insert("a", fn() -> Int { count })
+    m.len()
+}
+
+fn sorted() -> Int {
+    let xs = [2, 1].sort_by(fn(a: Int, b: Int) -> Ordering {
+        count += 1
+        a.cmp(b)
+    })
+    xs.len()
+}
+
+fn folded() -> Int {
+    [1].fold(0, fn(acc: Int, x: Int) -> Int { acc + x + count })
+}
+
+fn walk() {
+    trace.log("c", "{stash()}")
+    trace.log("c", "{keyed()}")
+    trace.log("c", "{sorted()}")
+    trace.log("c", "{folded()}")
+}
+
+fn main() {
+    count = 1
+    walk()
+}
+"#
+    let out = check_via_cli(src, "e0566_builtin_stores_closure_{getpid()}")
+    let found = e0566_lines(out)
+    assert_eq(found.len(), 2)
+    assert_eq(error_count(out), 2)
+    let write = found.get(0).unwrap()
+    assert(primary_at(write, 33, 22), write)
+    assert(write.contains("`msg` calls `sorted`, which writes `count`"), write)
+    let read = found.get(1).unwrap()
+    assert(primary_at(read, 34, 22), read)
+    assert(read.contains("`msg` calls `folded`, which reads `count`"), read)
+}
+
+test "a generic fn in msg that recurses at two growing types still ends the check" {
+    let src = #"fn grow[T](x: T, n: Int) -> Int {
+    if n == 0 { return 0 }
+    grow([x], n - 1) + grow((x, x), n - 1)
+}
+
+fn walk() {
+    trace.log("c", "{grow(1, 3)}")
+}
+
+fn main() {
+    walk()
+}
+"#
+    let out = check_via_cli(src, "e0566_poly_recursion_{getpid()}")
+    assert(out.contains("\"code\":\"E0300\""), out)
+    assert_eq(e0566_lines(out).len(), 0)
+}
+
+test "a callee whose closures call each other twice per level is walked once per closure" {
+    let mut src = "fn deep() -> Int \{\n    let c0 = fn() -> Int \{ 1 \}\n"
+    let mut i = 1
+    while i <= 40 {
+        src = "{src}    let c{i} = fn() -> Int \{ c{i - 1}() + c{i - 1}() \}\n"
+        i = i + 1
+    }
+    src = "{src}    c40()\n\}\n\nfn walk() \{\n    trace.log(\"c\", \"\{deep()\}\")\n\}\n\nfn main() \{\n    walk()\n\}\n"
+    let out = check_via_cli(src, "e0566_closure_chain_{getpid()}")
+    assert(!out.contains("\"severity\":\"error\""), out)
+}

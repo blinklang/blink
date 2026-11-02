@@ -31964,9 +31964,30 @@ fn tc_tm_check_call(node: Int, inside: Set[Int]) ! TypeCheck.Resolve, Diag.Repor
             }
         }
     }
+    if decl < 0 { tc_tm_check_closures_run(node, inside) }
     if node_kind(node) == NodeKind.MethodCall && tc_tm_call_writes_receiver(node, decl) {
         let shown = tc_tm_written_outside(node_obj(node), inside)
         if shown != "" { tc_tm_report(node, "`msg` writes `{shown}`", []) }
+    }
+}
+
+// A closure `msg` runs that is declared outside it, as `c` in `let c = fn() {..}` and then
+// `"{c()}"`: its body is no part of `msg`, so the walk of `msg` does not reach it.
+fn tc_tm_check_closures_run(node: Int, inside: Set[Int]) ! TypeCheck.Resolve, Diag.Report {
+    for e in tc_tm_closures_run(node) {
+        let c = tc_tm_closure_of(e)
+        if inside.contains(c) { continue }
+        let mut seen: Set[Str] = Set()
+        let mut reads: List[Str] = []
+        let mut writes: List[Str] = []
+        let mut kids: List[Int] = []
+        tc_tm_touch_closure(c, tc_no_binds, 0, seen, reads, writes, kids)
+        let t = tc_tm_touch_result(reads, writes)
+        if t.name != "" {
+            let how = if t.writes { "writes" } else { "reads" }
+            let shown = if node_kind(e) == NodeKind.Ident { "`{node_name(e)}`" } else { "a closure" }
+            tc_tm_report(node, "`msg` runs {shown}, which {how} `{t.name}`", [])
+        }
     }
 }
 
@@ -32218,17 +32239,28 @@ fn tc_tm_touch_call(node: Int, binds: Map[Str, Int], depth: Int, seen: Set[Str],
     tc_tm_touch_fn(decl, cb, depth, seen, reads, writes, kids)
 }
 
-// Each instance is walked once. A generic fn that calls itself at a larger type argument has
-// no last instance, so the walk stops at a depth cap.
 fn tc_tm_touch_fn(decl: Int, binds: Map[Str, Int], depth: Int, seen: Set[Str], reads: List[Str], writes: List[Str], kids: List[Int]) ! TypeCheck.Resolve, Diag.Report {
-    if writes.len() > 0 || depth > 64 { return }
-    let mut parts: List[Str] = []
-    for (k, v) in binds { parts.push("{k}={tc_resolve(v)}") }
-    let key = "{decl}:{parts.sort().join(",")}"
-    if seen.contains(key) { return }
-    seen.insert(key)
-    if node_kind(decl) != NodeKind.FnDef { return }
+    if !tc_tm_first_visit(decl, binds, depth, seen) || node_kind(decl) != NodeKind.FnDef { return }
     tc_tm_touch_walk(node_body(decl), binds, depth, seen, reads, writes, kids)
+}
+
+const TM_INSTANCE_KEYS = 256
+
+// Whether the walk has yet to visit this fn or closure at these binds. Each instance is walked
+// once. A generic fn that calls itself at larger type arguments has no last instance, and two
+// such calls double the instances at each level, so past TM_INSTANCE_KEYS the key drops the
+// binds and each body is walked at most once more; a depth cap stops a lone chain sooner.
+fn tc_tm_first_visit(id: Int, binds: Map[Str, Int], depth: Int, seen: Set[Str]) -> Bool {
+    if depth > 64 { return false }
+    let mut key = "{id}"
+    if seen.len() < TM_INSTANCE_KEYS {
+        let mut parts: List[Str] = []
+        for (k, v) in binds { parts.push("{k}={tc_resolve(v)}") }
+        key = "{id}:{parts.sort().join(",")}"
+    }
+    if seen.contains(key) { return false }
+    seen.insert(key)
+    true
 }
 
 fn tc_tm_touch_walk(node: Int, binds: Map[Str, Int], depth: Int, seen: Set[Str], reads: List[Str], writes: List[Str], kids: List[Int]) ! TypeCheck.Resolve, Diag.Report {
@@ -32278,21 +32310,35 @@ fn tc_tm_touch_walk(node: Int, binds: Map[Str, Int], depth: Int, seen: Set[Str],
 // The closures a call runs: the closure it calls, and each closure argument of a built-in
 // method such as `map`, which forwards its callback's row with `_` (§4.16.6). A fn type in a
 // declared signature carries no row, so a declared callee runs none of its closure arguments'
-// effects, and a closure that is only returned or stored runs nowhere here.
+// effects, and a closure that is only returned or stored, as by `push`, runs nowhere here.
 fn tc_tm_touch_closures(node: Int, binds: Map[Str, Int], depth: Int, seen: Set[Str], reads: List[Str], writes: List[Str], kids: List[Int]) ! TypeCheck.Resolve, Diag.Report {
-    if node_kind(node) == NodeKind.Call {
-        let c = tc_tm_closure_of(node_left(node))
-        if c >= 0 { tc_tm_touch_walk(node_body(c), binds, depth, seen, reads, writes, kids) }
-    }
-    if node_kind(node) != NodeKind.MethodCall || tc_call_decl_node(node) >= 0 { return }
+    for e in tc_tm_closures_run(node) { tc_tm_touch_closure(tc_tm_closure_of(e), binds, depth, seen, reads, writes, kids) }
+}
+
+fn tc_tm_touch_closure(c: Int, binds: Map[Str, Int], depth: Int, seen: Set[Str], reads: List[Str], writes: List[Str], kids: List[Int]) ! TypeCheck.Resolve, Diag.Report {
+    if tc_tm_first_visit(c, binds, depth, seen) { tc_tm_touch_walk(node_body(c), binds, depth, seen, reads, writes, kids) }
+}
+
+// The callee or arguments of a call that name a closure literal the call runs.
+fn tc_tm_closures_run(node: Int) -> List[Int] {
+    let mut out: List[Int] = []
+    if node_kind(node) == NodeKind.Call && tc_tm_closure_of(node_left(node)) >= 0 { out.push(node_left(node)) }
+    if node_kind(node) != NodeKind.MethodCall || tc_call_decl_node(node) >= 0 || !tc_tm_builtin_runs_callback(node_method(node)) { return out }
     let args = node_args(node)
-    if args == -1 { return }
+    if args == -1 { return out }
     let mut i = 0
     while i < sublist_length(args) {
-        let c = tc_tm_closure_of(sublist_get(args, i))
-        if c >= 0 { tc_tm_touch_walk(node_body(c), binds, depth, seen, reads, writes, kids) }
+        let a = sublist_get(args, i)
+        if tc_tm_closure_of(a) >= 0 { out.push(a) }
         i = i + 1
     }
+    out
+}
+
+// The built-in methods whose callback has the row `! _`, so the call runs it: the List, Map,
+// Iterator, Option, Result and Str rows of §3.2, §3c.1 and §7.6.
+fn tc_tm_builtin_runs_callback(method: Str) -> Bool {
+    ["map", "filter", "flat_map", "fold", "for_each", "any", "all", "find", "sort_by", "map_values", "map_err", "trim_by", "trim_start_by", "trim_end_by"].contains(method)
 }
 
 // The closure literal an expression is, or names through a local `let`, or -1.
