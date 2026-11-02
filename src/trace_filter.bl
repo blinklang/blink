@@ -1,0 +1,129 @@
+// The rules of a trace filter list (sections/06_tooling.md §8.15.5, §8.15.12), as `blink run`
+// checks one before it builds. A traced binary checks the same value in
+// bootstrap/runtime_trace.h, and the two must give the same reason, word for word, so a value
+// that `blink run` lets through never stops the program it starts.
+
+let TRACE_FILTER_KEYS = ["fn", "module", "depth", "event", "effect", "state"]
+let TRACE_EVENT_TYPES = ["enter", "exit", "state", "effect", "note"]
+
+// Why a filter list is bad, or "". The items are read in order and the first bad one gives
+// the reason; `all` beside another item is checked after them, as it needs the whole list.
+pub fn trace_filter_error(value: Str) -> Str {
+    let mut alls = 0
+    let mut others = 0
+    for raw in value.split(",") {
+        let item = trace_trim_space_tab(raw)
+        if item == "" { continue }
+        if item == "all" {
+            alls = alls + 1
+            continue
+        }
+        others = others + 1
+        let why = trace_item_error(item)
+        if why != "" { return why }
+    }
+    if alls > 0 && others > 0 { return "`all` cannot be used with another filter" }
+    ""
+}
+
+fn trace_item_error(item: Str) -> Str {
+    let colon = item.byte_index_of(":", 0) ?? -1
+    if colon < 0 { return "a filter is `key:value`, not `{item}`" }
+    let key = item.byte_slice(0, colon)
+    if !TRACE_FILTER_KEYS.contains(key) { return "unknown key `{key}`{trace_did_you_mean(key, TRACE_FILTER_KEYS)}" }
+    let mut count = 0
+    for raw_value in item.byte_slice(colon + 1, item.byte_len()).split("+") {
+        let v = trace_trim_space_tab(raw_value)
+        if v == "" { continue }
+        if key == "depth" {
+            let why = trace_depth_error(v)
+            if why != "" { return why }
+        }
+        if key == "event" && !TRACE_EVENT_TYPES.contains(v) {
+            return "unknown event type `{v}`{trace_did_you_mean(v, TRACE_EVENT_TYPES)}"
+        }
+        count = count + 1
+    }
+    if count == 0 { return "the key `{key}` has no value" }
+    ""
+}
+
+// A sign is not a digit, and leading zeros do not count toward the size of the number.
+fn trace_depth_error(v: Str) -> Str {
+    let mut i = 0
+    while i < v.byte_len() {
+        let b = v.byte_at(i)
+        if b < 48 || b > 57 { return "depth takes digits only" }
+        i = i + 1
+    }
+    let mut start = 0
+    while start < v.byte_len() - 1 && v.byte_at(start) == 48 { start = start + 1 }
+    let digits = v.byte_slice(start, v.byte_len())
+    let max = "9223372036854775807"
+    if digits.byte_len() > max.byte_len() || (digits.byte_len() == max.byte_len() && digits > max) {
+        return "depth takes digits only, and the number must fit in Int"
+    }
+    ""
+}
+
+// "; did you mean `x`?" for the nearest known word, or "". The threshold is the one of the
+// compiler's other did-you-mean helps, max(1, len / 3) edits, and a tie goes to the first word.
+pub fn trace_did_you_mean(name: Str, known: List[Str]) -> Str {
+    let mut best_dist = -1
+    let mut best = ""
+    for k in known {
+        let d = trace_edit_distance(name, k)
+        if best_dist == -1 || d < best_dist {
+            best_dist = d
+            best = k
+        }
+    }
+    let mut threshold = name.byte_len() / 3
+    if threshold < 1 { threshold = 1 }
+    if best_dist == -1 || best_dist > threshold { return "" }
+    "; did you mean `{best}`?"
+}
+
+fn trace_edit_distance(a: Str, b: Str) -> Int {
+    let alen = a.byte_len()
+    let blen = b.byte_len()
+    if alen == 0 { return blen }
+    if blen == 0 { return alen }
+    let mut prev: List[Int] = []
+    let mut j = 0
+    while j <= blen {
+        prev.push(j)
+        j = j + 1
+    }
+    let mut i = 0
+    while i < alen {
+        let mut curr: List[Int] = [i + 1]
+        let mut k = 0
+        while k < blen {
+            let cost = if a.byte_at(i) == b.byte_at(k) { 0 } else { 1 }
+            let mut best = prev.get(k + 1).unwrap() + 1
+            let ins = curr.get(k).unwrap() + 1
+            let sub = prev.get(k).unwrap() + cost
+            if ins < best { best = ins }
+            if sub < best { best = sub }
+            curr.push(best)
+            k = k + 1
+        }
+        prev = curr
+        i = i + 1
+    }
+    prev.get(blen).unwrap()
+}
+
+// s without the spaces and tabs at its ends: the trim of a trace filter, which keeps the other
+// whitespace that Str.trim cuts.
+fn trace_trim_space_tab(s: Str) -> Str {
+    let mut t = s
+    while t.starts_with(" ") || t.starts_with("\t") {
+        t = t.byte_slice(1, t.byte_len())
+    }
+    while t.ends_with(" ") || t.ends_with("\t") {
+        t = t.byte_slice(0, t.byte_len() - 1)
+    }
+    t
+}

@@ -18,11 +18,14 @@ fn main() {
 let BAD = [
     "nope:1", "fn:", "fn: + ", "depth:x", "depth:2x", "depth:", "event:stat",
     "event:enter+stat", "1", "fn", "depth : 2", "Fn:add", "fn:add,bogus",
+    "all,fn:add", "fn:add,all", "all,fn:add,all", "depth:-1",
+    "depth:99999999999999999999", "modul:x",
 ]
 
 let GOOD = [
     "all", "fn:add", " fn:add , depth:2 ", "fn:add+main", "fn:add,,", "event:enter+exit",
     "event:state", "event:effect", "event:note", "effect:IO", "state:total", "depth:0",
+    "all,", "all,all", "depth:03",
 ]
 
 fn write_src(stem: Str) -> Str ! FS.Write, Process.Spawn, Env.Read {
@@ -59,7 +62,8 @@ test "run stops on a bad --trace filter before it builds" {
     let bin = bin_of(stem)
     for value in BAD {
         let r = process.run("build/blink", ["run", "--trace={value}", path, "-o", bin]).unwrap()
-        assert_eq("`{value}`: {usage_error_for(r, bin, "error: bad --trace value: ")}", "`{value}`: ")
+        let prefix = "error: bad --trace value \"{value}\": "
+        assert_eq("`{value}`: {usage_error_for(r, bin, prefix)}", "`{value}`: ")
     }
     clean(path, bin)
 }
@@ -70,7 +74,8 @@ test "run stops on a bad inherited BLINK_TRACE before it builds" {
     let bin = bin_of(stem)
     for value in BAD {
         let r = process.run("env", ["BLINK_TRACE={value}", "build/blink", "run", path, "-o", bin]).unwrap()
-        assert_eq("`{value}`: {usage_error_for(r, bin, "error: bad BLINK_TRACE value: ")}", "`{value}`: ")
+        let prefix = "error: bad BLINK_TRACE value \"{value}\": "
+        assert_eq("`{value}`: {usage_error_for(r, bin, prefix)}", "`{value}`: ")
     }
     clean(path, bin)
 }
@@ -98,8 +103,8 @@ test "run and the traced binary give the same reason for each bad filter" {
         assert_eq(ran.end, ChildEnd.Exited(2))
         let run = process.run("build/blink", ["run", "--trace={value}", path, "-o", other]).unwrap()
         assert_eq(run.end, ChildEnd.Exited(2))
-        let binary_why = ran.err_out.replace("error: bad BLINK_TRACE value: ", "")
-        let run_why = run.err_out.replace("error: bad --trace value: ", "")
+        let binary_why = ran.err_out.replace("error: bad BLINK_TRACE value \"{value}\": ", "")
+        let run_why = run.err_out.replace("error: bad --trace value \"{value}\": ", "")
         assert_eq(run_why, binary_why)
     }
     clean(path, bin)
@@ -115,6 +120,33 @@ test "run lets each good filter through, as the traced binary does" {
         assert_eq("`{value}`: {r.end == ChildEnd.Exited(0)} {r.out}", "`{value}`: true 3\n")
         let again = process.run("env", ["BLINK_TRACE={value}", bin]).unwrap()
         assert_eq("`{value}`: {again.end == ChildEnd.Exited(0)} {again.out}", "`{value}`: true 3\n")
+    }
+    clean(path, bin)
+}
+
+test "run names --trace and the whole value in the text of a bad filter" {
+    let stem = "trace_run_bad_words"
+    let path = write_src(stem)
+    let bin = bin_of(stem)
+    let r = process.run("build/blink", ["run", "--trace=depth:-1", path, "-o", bin]).unwrap()
+    assert_eq(r.err_out, "error: bad --trace value \"depth:-1\": depth takes digits only\n")
+    let big = process.run("build/blink", ["run", "--trace=depth:99999999999999999999", path, "-o", bin]).unwrap()
+    assert_eq(big.err_out, "error: bad --trace value \"depth:99999999999999999999\": depth takes digits only, and the number must fit in Int\n")
+    let mixed = process.run("build/blink", ["run", "--trace=fn:add,all", path, "-o", bin]).unwrap()
+    assert_eq(mixed.err_out, "error: bad --trace value \"fn:add,all\": `all` cannot be used with another filter\n")
+    let typo = process.run("build/blink", ["run", "--trace=event:stat", path, "-o", bin]).unwrap()
+    assert_eq(typo.err_out, "error: bad --trace value \"event:stat\": unknown event type `stat`; did you mean `state`?\n")
+    clean(path, bin)
+}
+
+test "run --trace=all,all and an empty --trace= write every event of main and add" {
+    let stem = "trace_run_every_event"
+    let path = write_src(stem)
+    let bin = bin_of(stem)
+    for flag in ["--trace=all,all", "--trace=", "--trace= , "] {
+        let r = process.run("build/blink", ["run", flag, path, "-o", bin]).unwrap()
+        assert_eq("`{flag}`: {r.end == ChildEnd.Exited(0)} {r.out}", "`{flag}`: true 3\n")
+        assert_eq(compile_test_helpers.trace_enter_fns(r.err_out), "{stem}.main {stem}.add")
     }
     clean(path, bin)
 }

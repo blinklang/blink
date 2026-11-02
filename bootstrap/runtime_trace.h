@@ -81,14 +81,59 @@ BLINK_RT_FN int64_t blink_trace_ts_us(void) {
 }
 #endif
 
-/* A bad BLINK_TRACE value is a usage error: the program writes no event and does not start.
-   `blink run` gives the same words for the same value (trace_filter_error in src/cli.bl). */
-BLINK_RT_FN void blink_trace_bad_filter(const char* why, const char* what, const char* item);
+/* The edit distance of a and b in bytes, for the did-you-mean of a bad filter. */
+BLINK_RT_FN size_t blink_trace_edit_distance(const char* a, const char* b);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN void blink_trace_bad_filter(const char* why, const char* what, const char* item) {
-    fprintf(stderr, "error: bad BLINK_TRACE value: %s", why);
-    if (what) fprintf(stderr, " `%s`", what);
-    if (item) fprintf(stderr, " in `%s`", item);
+BLINK_RT_FN size_t blink_trace_edit_distance(const char* a, const char* b) {
+    size_t alen = strlen(a), blen = strlen(b);
+    if (alen == 0) return blen;
+    if (blen == 0) return alen;
+    size_t* prev = (size_t*)malloc((blen + 1) * sizeof(size_t));
+    size_t* curr = (size_t*)malloc((blen + 1) * sizeof(size_t));
+    if (!prev || !curr) { free(prev); free(curr); return (size_t)-1; }
+    for (size_t j = 0; j <= blen; j++) prev[j] = j;
+    for (size_t i = 0; i < alen; i++) {
+        curr[0] = i + 1;
+        for (size_t k = 0; k < blen; k++) {
+            size_t best = prev[k + 1] + 1;
+            size_t ins = curr[k] + 1;
+            size_t sub = prev[k] + (a[i] == b[k] ? 0 : 1);
+            if (ins < best) best = ins;
+            if (sub < best) best = sub;
+            curr[k + 1] = best;
+        }
+        size_t* t = prev; prev = curr; curr = t;
+    }
+    size_t d = prev[blen];
+    free(prev);
+    free(curr);
+    return d;
+}
+#endif
+
+/* A bad filter list (§8.15.12): the text names the source and the whole value, then the
+   reason, which is `before`, `name` in backticks and `after`. With `known`, the nearest known
+   word within max(1, len / 3) edits follows as a did-you-mean; a tie goes to the first word.
+   trace_filter_error in src/trace_filter.bl gives the same reason for the same value. */
+BLINK_RT_FN void blink_trace_reject(const char* value, const char* before, const char* name,
+    const char* after, const char* const* known, int nknown);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void blink_trace_reject(const char* value, const char* before, const char* name,
+    const char* after, const char* const* known, int nknown) {
+    fprintf(stderr, "error: bad BLINK_TRACE value \"%s\": %s", value, before);
+    if (name) fprintf(stderr, "`%s`", name);
+    fputs(after, stderr);
+    if (name && known) {
+        const char* best = NULL;
+        size_t best_dist = 0;
+        for (int i = 0; i < nknown; i++) {
+            size_t d = blink_trace_edit_distance(name, known[i]);
+            if (!best || d < best_dist) { best = known[i]; best_dist = d; }
+        }
+        size_t threshold = strlen(name) / 3;
+        if (threshold < 1) threshold = 1;
+        if (best && best_dist <= threshold) fprintf(stderr, "; did you mean `%s`?", best);
+    }
     fputs("\n", stderr);
     exit(2);
 }
@@ -147,25 +192,33 @@ BLINK_RT_FN int blink_trace_is_event_type(const char* v) {
 }
 #endif
 
-/* Whether v is a whole decimal number, as a depth: value must be: an optional `-`, then
-   digits, with no overflow. */
-BLINK_RT_FN int blink_trace_is_number(const char* v);
+/* Why v is not a depth: value, or NULL. The value is ASCII digits only and fits in Int
+   (§8.15.5); a sign is not a digit, and leading zeros are digits. */
+BLINK_RT_FN const char* blink_trace_depth_error(const char* v);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN int blink_trace_is_number(const char* v) {
-    const char* d = (*v == '-') ? v + 1 : v;
-    if (*d < '0' || *d > '9') return 0;
-    char* end = NULL;
-    errno = 0;
-    (void)strtol(v, &end, 10);
-    return end != v && *end == '\0' && errno == 0;
+BLINK_RT_FN const char* blink_trace_depth_error(const char* v) {
+    int64_t n = 0;
+    int big = 0;
+    for (const char* p = v; *p; p++) {
+        if (*p < '0' || *p > '9') return "depth takes digits only";
+        int d = *p - '0';
+        if (n > (INT64_MAX - d) / 10) big = 1;
+        else n = n * 10 + d;
+    }
+    return big ? "depth takes digits only, and the number must fit in Int" : NULL;
 }
 #endif
 
-/* The filter one `key:v+v` item of BLINK_TRACE fills, and the item, for its errors. */
+BLINK_UNUSED static const char* const blink_trace_filter_keys[] = { "fn", "module", "depth", "event", "effect", "state" };
+BLINK_UNUSED static const char* const blink_trace_event_types[] = { "enter", "exit", "state", "effect", "note" };
+
+/* The filter one `key:v+v` item of BLINK_TRACE fills, the item, and the whole value, for its
+   errors. */
 typedef struct {
     blink_trace_filter* f;
     int cap;
     const char* item;
+    const char* value;
 } blink_trace_value_ctx;
 
 /* Checks one `+` value of a BLINK_TRACE item and adds it to the item's filter. */
@@ -174,11 +227,12 @@ BLINK_RT_FN void blink_trace_take_value(char* v, void* ctx);
 BLINK_RT_FN void blink_trace_take_value(char* v, void* ctx) {
     blink_trace_value_ctx* c = (blink_trace_value_ctx*)ctx;
     const char* key = c->f->key;
-    if (strcmp(key, "depth") == 0 && !blink_trace_is_number(v)) {
-        blink_trace_bad_filter("depth is not a number:", v, c->item);
+    if (strcmp(key, "depth") == 0) {
+        const char* why = blink_trace_depth_error(v);
+        if (why) blink_trace_reject(c->value, why, NULL, "", NULL, 0);
     }
     if (strcmp(key, "event") == 0 && !blink_trace_is_event_type(v)) {
-        blink_trace_bad_filter("unknown event type", v, c->item);
+        blink_trace_reject(c->value, "unknown event type ", v, "", blink_trace_event_types, 5);
     }
     if (c->f->count == c->cap) {
         c->cap = c->cap ? c->cap * 2 : 4;
@@ -190,14 +244,14 @@ BLINK_RT_FN void blink_trace_take_value(char* v, void* ctx) {
 }
 #endif
 
-/* Reads one trimmed `,` item of BLINK_TRACE into a filter, or exits on a bad one. */
-BLINK_RT_FN void blink_trace_parse_item(const char* item);
+/* Reads one trimmed `,` item of the BLINK_TRACE value `value` into a filter, or exits on a
+   bad one. `all` adds no filter; blink_trace_read_filters checks where it may stand. */
+BLINK_RT_FN void blink_trace_parse_item_of(const char* item, const char* value);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN void blink_trace_parse_item(const char* item) {
-    /* `all` beside other filters adds no filter, so it never hides one. */
+BLINK_RT_FN void blink_trace_parse_item_of(const char* item, const char* value) {
     if (strcmp(item, "all") == 0) return;
     const char* colon = strchr(item, ':');
-    if (!colon) blink_trace_bad_filter("a filter is `key:value`, not", item, NULL);
+    if (!colon) blink_trace_reject(value, "a filter is `key:value`, not ", item, "", NULL, 0);
     size_t klen = (size_t)(colon - item);
     char* key = (char*)malloc(klen + 1);
     if (!key) blink_trace_oom("reading", "BLINK_TRACE");
@@ -205,12 +259,12 @@ BLINK_RT_FN void blink_trace_parse_item(const char* item) {
     key[klen] = '\0';
     if (strcmp(key, "fn") != 0 && strcmp(key, "module") != 0 && strcmp(key, "depth") != 0
         && strcmp(key, "event") != 0 && strcmp(key, "effect") != 0 && strcmp(key, "state") != 0) {
-        blink_trace_bad_filter("unknown key", key, item);
+        blink_trace_reject(value, "unknown key ", key, "", blink_trace_filter_keys, 6);
     }
     blink_trace_filter f = { key, NULL, 0 };
-    blink_trace_value_ctx ctx = { &f, 0, item };
+    blink_trace_value_ctx ctx = { &f, 0, item, value };
     blink_trace_each_item(colon + 1, '+', "BLINK_TRACE", blink_trace_take_value, &ctx);
-    if (f.count == 0) blink_trace_bad_filter("empty value", NULL, item);
+    if (f.count == 0) blink_trace_reject(value, "the key ", key, " has no value", NULL, 0);
     /* The items of `,` all must match (§8.15.5), so a second `event:` item narrows the set. */
     if (strcmp(key, "event") == 0) {
         int enter = 0, exit_ = 0, effect = 0, state = 0;
@@ -233,21 +287,51 @@ BLINK_RT_FN void blink_trace_parse_item(const char* item) {
 }
 #endif
 
-/* Reads one `,` item of BLINK_TRACE into a filter, then frees the copy. */
+BLINK_RT_FN void blink_trace_parse_item(const char* item);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void blink_trace_parse_item(const char* item) {
+    blink_trace_parse_item_of(item, item);
+}
+#endif
+
+/* Reads one `,` item of BLINK_TRACE into a filter, then frees the copy. ctx is the value. */
 BLINK_RT_FN void blink_trace_take_filter(char* item, void* ctx);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN void blink_trace_take_filter(char* item, void* ctx) {
-    (void)ctx;
-    blink_trace_parse_item(item);
+    blink_trace_parse_item_of(item, (const char*)ctx);
     free(item);
 }
 #endif
 
-/* Reads the `,` items of a BLINK_TRACE value (§8.15.5); exits on a bad one (§8.15.12). */
+/* Counts the `,` items of a value: [0] the items `all`, [1] the others. */
+BLINK_RT_FN void blink_trace_count_item(char* item, void* ctx);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void blink_trace_count_item(char* item, void* ctx) {
+    int* counts = (int*)ctx;
+    counts[strcmp(item, "all") == 0 ? 0 : 1]++;
+    free(item);
+}
+#endif
+
+/* Reads the `,` items of a BLINK_TRACE value (§8.15.5); exits on a bad one (§8.15.12). The
+   items are checked in order first, and `all` beside another item after them, as the check
+   of `blink run` does. A list with no items adds no filter, so it selects every event. */
+BLINK_RT_FN void blink_trace_read_filters(const char* value);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void blink_trace_read_filters(const char* value) {
+    int counts[2] = { 0, 0 };
+    blink_trace_each_item(value, ',', "BLINK_TRACE", blink_trace_count_item, counts);
+    blink_trace_each_item(value, ',', "BLINK_TRACE", blink_trace_take_filter, (void*)value);
+    if (counts[0] > 0 && counts[1] > 0) {
+        blink_trace_reject(value, "`all` cannot be used with another filter", NULL, "", NULL, 0);
+    }
+}
+#endif
+
 BLINK_RT_FN void blink_trace_parse_filters(const char* filter_str);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN void blink_trace_parse_filters(const char* filter_str) {
-    blink_trace_each_item(filter_str, ',', "BLINK_TRACE", blink_trace_take_filter, NULL);
+    blink_trace_read_filters(filter_str);
 }
 #endif
 
@@ -272,13 +356,12 @@ BLINK_RT_FN void blink_trace_init(int argc, char** argv) {
     __blink_trace.event_effect = 1;
     __blink_trace.event_state = 1;
 #ifndef BLINK_NO_TRACE_INIT
+    /* No value turns tracing off: unset, empty text and a list with no items all trace
+       every event (§8.15.13). */
     const char* env = getenv("BLINK_TRACE");
-    /* Unset traces everything. The spec has no rule yet for an empty value, so it keeps the
-       reading it had: no trace. */
-    if (env && !*env) return;
     __blink_trace.active = 1;
     clock_gettime(CLOCK_MONOTONIC, &__blink_trace.start);
-    if (env) blink_trace_parse_filters(env);
+    if (env) blink_trace_read_filters(env);
 #endif
 }
 #endif
@@ -316,7 +399,7 @@ BLINK_RT_FN int blink_trace_match(const char* fn, const char* module, int depth)
         } else if (strcmp(f->key, "depth") == 0) {
             int matched = 0;
             for (int j = 0; j < f->count; j++) {
-                if ((long)depth <= strtol(f->values[j], NULL, 10)) { matched = 1; break; }
+                if ((long long)depth <= strtoll(f->values[j], NULL, 10)) { matched = 1; break; }
             }
             if (!matched) return 0;
         }
@@ -474,27 +557,16 @@ BLINK_RT_FN void blink_trace_effect(const char* fn, const char* module, int dept
 }
 #endif
 
-// Emitted by the runtime for each capture of a closure promoted out of `with arena`,
-// between the begin and end events of that promotion, which carry the fn and span.
-// `op` says how the capture moved: "cell" (a `let mut` cell copied), "walk" (the value
-// copied by its walker), "word" (kept as is) or "refused" (no walker; a panic follows).
+/* `arena.promote` and `arena.promote.capture` are not trace events (§8.15.2 lists the event
+   types), so these write nothing. They stay because the runtime and the code of an older
+   compiler call them. */
 BLINK_RT_FN void blink_trace_arena_capture(const char* op, int64_t slot, const char* name);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN void blink_trace_arena_capture(const char* op, int64_t slot, const char* name) {
-    if (!__blink_trace.active) return;
-    int64_t ts = blink_trace_ts_us();
-    fprintf(stderr, "{\"ts_us\":%lld,\"event\":\"arena.promote.capture\",\"depth\":%d,"
-        "\"op\":\"%s\",\"slot\":%lld,\"capture\":\"%s\"}\n",
-        (long long)ts, __blink_trace.depth, op, (long long)slot, name ? name : "");
-    fflush(stderr);
+    (void)op; (void)slot; (void)name;
 }
 #endif
 
-// Emitted by codegen at the closing `}` of a `with arena { expr }` block.
-// `phase` is "begin" (pre-promotion, inner arena still live) or "end"
-// (post-promotion, inner arena destroyed). `target` is the human-readable
-// promotion target — either "outer arena" or "GC heap". `desc` is the
-// promoted tail's type descriptor (e.g. "P:Int", "S:MyStruct", "C:<hash>").
 BLINK_RT_FN void blink_trace_arena_promote(const char* fn, const char* module, int depth,
     const char* phase, const char* target, const char* desc,
     const char* file, int line, int col);
@@ -502,18 +574,12 @@ BLINK_RT_FN void blink_trace_arena_promote(const char* fn, const char* module, i
 BLINK_RT_FN void blink_trace_arena_promote(const char* fn, const char* module, int depth,
     const char* phase, const char* target, const char* desc,
     const char* file, int line, int col) {
-    if (!__blink_trace.active) return;
-    int64_t ts = blink_trace_ts_us();
-    fprintf(stderr, "{\"ts_us\":%lld,\"event\":\"arena.promote\",\"fn\":\"%s\",\"module\":\"%s\",\"depth\":%d,"
-        "\"phase\":\"%s\",\"target\":\"%s\",\"desc\":\"%s\","
-        "\"span\":{\"file\":\"%s\",\"line\":%d,\"col\":%d}}\n",
-        (long long)ts, fn, module, depth, phase, target ? target : "",
-        desc ? desc : "", file ? file : "", line, col);
-    fflush(stderr);
+    (void)fn; (void)module; (void)depth; (void)phase; (void)target; (void)desc;
+    (void)file; (void)line; (void)col;
 }
 #endif
 
-/* The two ends of one promotion, as codegen calls them. "begin" runs inside the block,
+/* The two ends of one promotion, as the code of an older compiler calls them. "begin" runs inside the block,
    where `target` is the arena it was entered from. "end" runs after the block closed,
    where that arena is current again. */
 BLINK_RT_FN void blink_trace_arena_promote_begin(const char* fn, const char* module,

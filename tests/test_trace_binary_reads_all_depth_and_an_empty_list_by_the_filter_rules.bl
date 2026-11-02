@@ -1,0 +1,106 @@
+// A traced binary reads `BLINK_TRACE` with the rules of §8.15.5. `all` is valid only when
+// every item of the list is `all`. `depth:` takes ASCII digits that fit in Int. Empty text and
+// a list with no items select every event, as an unset `BLINK_TRACE` does: no value turns
+// tracing off (§8.15.13). A bad value is a usage error whose text names `BLINK_TRACE` and the
+// whole value (§8.15.12).
+
+import compile_test_helpers
+import std.process.{ProcessResult, ChildEnd}
+
+let SRC = #"fn fact(n: Int) -> Int {
+    if n <= 1 { return 1 }
+    n * fact(n - 1)
+}
+fn main() {
+    io.println(fact(3))
+}
+"#
+
+fn run_env(bin: Str, value: Str) -> ProcessResult ! Process.Spawn {
+    process.run("env", ["BLINK_TRACE={value}", bin]).unwrap()
+}
+
+fn traced(bin: Str, value: Str) -> Str ! Process.Spawn {
+    let r = run_env(bin, value)
+    assert_eq(r.out, "6\n")
+    assert(r.success())
+    compile_test_helpers.trace_enter_fns(r.err_out)
+}
+
+fn unset(bin: Str) -> Str ! Process.Spawn {
+    let r = process.run("env", ["-u", "BLINK_TRACE", bin]).unwrap()
+    assert(r.success())
+    compile_test_helpers.trace_enter_fns(r.err_out)
+}
+
+// The whole stderr of a run that a bad value stopped, after a check that it stopped as a
+// usage error: exit code 2, no stdout, no event.
+fn rejected(bin: Str, value: Str) -> Str ! Process.Spawn {
+    let r = run_env(bin, value)
+    assert_eq(r.end, ChildEnd.Exited(2))
+    assert_eq(r.out, "")
+    assert(!r.err_out.contains("\{"))
+    r.err_out
+}
+
+test "a lone all, all with an empty item, and all twice trace every event" {
+    let bin = compile_test_helpers.build_bin(SRC, "trace_bin_all_rule", ["--trace"])
+    let every = unset(bin)
+    assert_eq(every.split(" ").len(), 4)
+    for value in ["all", "all,", "all,all", " all , all "] {
+        assert_eq(traced(bin, value), every)
+    }
+    compile_test_helpers.clean_bin("trace_bin_all_rule")
+}
+
+test "all beside another item is a bad filter in any place" {
+    let bin = compile_test_helpers.build_bin(SRC, "trace_bin_all_mixed", ["--trace"])
+    for value in ["all,fn:fact", "fn:fact,all", "all,fn:fact,all", "depth:1, all"] {
+        assert_eq(rejected(bin, value), "error: bad BLINK_TRACE value \"{value}\": `all` cannot be used with another filter\n")
+    }
+    compile_test_helpers.clean_bin("trace_bin_all_mixed")
+}
+
+test "all after fn: is a frame name, not the word all" {
+    let bin = compile_test_helpers.build_bin(SRC, "trace_bin_fn_all", ["--trace"])
+    assert_eq(traced(bin, "fn:all"), "")
+    compile_test_helpers.clean_bin("trace_bin_fn_all")
+}
+
+test "empty text and a list with no items trace every event" {
+    let bin = compile_test_helpers.build_bin(SRC, "trace_bin_empty_list", ["--trace"])
+    let every = unset(bin)
+    assert_eq(every.split(" ").len(), 4)
+    for value in ["", " ", ",", " , ", "\t,,"] {
+        assert_eq(traced(bin, value), every)
+    }
+    compile_test_helpers.clean_bin("trace_bin_empty_list")
+}
+
+test "depth takes digits, and leading zeros are digits" {
+    let bin = compile_test_helpers.build_bin(SRC, "trace_bin_depth_digits", ["--trace"])
+    let m = "trace_bin_depth_digits"
+    assert_eq(traced(bin, "depth:0"), "{m}.main")
+    assert_eq(traced(bin, "depth:02"), "{m}.main {m}.fact {m}.fact")
+    assert_eq(traced(bin, "depth:2"), "{m}.main {m}.fact {m}.fact")
+    assert_eq(traced(bin, "depth:9223372036854775807").split(" ").len(), 4)
+    compile_test_helpers.clean_bin("trace_bin_depth_digits")
+}
+
+test "a sign or a number too big for Int is a bad depth" {
+    let bin = compile_test_helpers.build_bin(SRC, "trace_bin_depth_bad", ["--trace"])
+    assert_eq(rejected(bin, "depth:-1"), "error: bad BLINK_TRACE value \"depth:-1\": depth takes digits only\n")
+    for value in ["depth:99999999999999999999", "depth:9223372036854775808"] {
+        assert_eq(rejected(bin, value), "error: bad BLINK_TRACE value \"{value}\": depth takes digits only, and the number must fit in Int\n")
+    }
+    compile_test_helpers.clean_bin("trace_bin_depth_bad")
+}
+
+test "a bad value names BLINK_TRACE and the nearest known word" {
+    let bin = compile_test_helpers.build_bin(SRC, "trace_bin_bad_words", ["--trace"])
+    assert_eq(rejected(bin, "event:stat"), "error: bad BLINK_TRACE value \"event:stat\": unknown event type `stat`; did you mean `state`?\n")
+    assert_eq(rejected(bin, "1"), "error: bad BLINK_TRACE value \"1\": a filter is `key:value`, not `1`\n")
+    assert_eq(rejected(bin, "modul:x"), "error: bad BLINK_TRACE value \"modul:x\": unknown key `modul`; did you mean `module`?\n")
+    assert_eq(rejected(bin, "fn:echo, fn: + "), "error: bad BLINK_TRACE value \"fn:echo, fn: + \": the key `fn` has no value\n")
+    compile_test_helpers.clean_bin("trace_bin_bad_words")
+}
