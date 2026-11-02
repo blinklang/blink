@@ -2699,10 +2699,11 @@ The output never proposes changing `panic` to `unreachable` as the repair by its
 
 A program can run its own code when a panic ends it. That code is a **panic hook**. A hook lets a tool write its own report (a status line on stdout, a JSON error frame for an editor) and choose its exit code. A hook is not a catch. The fns that can panic keep their rows: they carry no row for the hook.
 
-`on_panic(f)` is a built-in `with` item (§4.7). Its argument `f` has type `fn(PanicInfo) -> Never`, with whatever row `f` declares. `PanicInfo` is a built-in type:
+`on_panic(f)` is a built-in `with` item (§4.7). Its argument `f` has type `fn(PanicInfo) -> Never`, with whatever row `f` declares. `on_panic` is built in. `PanicInfo` is not: it is an ordinary type of the module `std.panic`, and it is not a compiler-known type name (§10.6). Code that writes the name imports it, as code imports `Duration` from `std.time` (§3.2.3):
 
 ```blink
-type PanicInfo {
+// std.panic
+pub type PanicInfo {
     message: Str
     file: Str
     line: Int?
@@ -2712,6 +2713,8 @@ type PanicInfo {
 `message` is the text that `panic` got. `line` is `None` when the line is not known. It is never `0`.
 
 ```blink
+import std.panic.{PanicInfo}
+
 fn report(p: PanicInfo) -> Never ! IO.Eprint, Env.Exit {
     let at = match p.line {
         Some(n) => "{p.file}:{n}"
@@ -2735,6 +2738,64 @@ fn main() ! IO, Env {
 
 stdout is empty. stderr is `fatal: n out of range: 9 at app.bl:12`. The exit code is 70. `deep` has no row.
 
+**The name `PanicInfo` and its import.** Every module that writes the name `PanicInfo` imports it with `import std.panic.{PanicInfo}`. The import binds the qualifier `panic` too (§10.1). The qualifier does not change a call of `panic`: a qualifier is used only in `q.y`, so `panic("boom")` is still the built-in (§10.5 *Imported Names*). In the example above, `deep` calls `panic` in a module that imports `PanicInfo`.
+
+`with on_panic(f)` needs no import. A closure hook with an inferred parameter writes no type name, so it needs no import either:
+
+```blink
+fn main() ! IO, Env {
+    with on_panic(fn(p) {
+        io.eprintln("fatal: {p.message}")
+        env.exit(70)
+    }) {
+        run()
+    }
+}
+```
+
+A bare `PanicInfo` with no import is `UnknownType` (E0507). The help names the import line. The fix is machine-applicable (§8.6):
+
+```blink
+fn report(p: PanicInfo) -> Never ! Env.Exit {    // error[UnknownType] E0507
+    env.exit(70)
+}
+```
+
+```
+error[UnknownType]: unknown type `PanicInfo`
+  help: add `import std.panic.{PanicInfo}`
+```
+
+A user `type PanicInfo` is a plain namesake. `PanicInfo` is not a compiler-known type name, so the declaration gets no W1010 (§10.6). The hook takes the `PanicInfo` of `std.panic` only. A diagnostic that names both types prints each as `Name (module)` (§10.6 *Diagnostics that involve a shadowing name*, rule 3):
+
+```blink
+type PanicInfo {
+    code: Int
+}
+
+fn report(p: PanicInfo) -> Never ! Env.Exit {
+    env.exit(p.code)
+}
+
+fn main() ! Env {
+    with on_panic(report) { run() }      // error[TypeError] E0300
+}
+```
+
+```
+error[TypeError]: expected `fn(PanicInfo (std.panic)) -> Never`, found `fn(PanicInfo (main)) -> Never`
+```
+
+A module that declares `type PanicInfo` and also imports the name `PanicInfo` has two bindings of one name. That is `DuplicateSymbol` (E1012, §10.5 *Imported and Declared Names*):
+
+```blink
+import std.panic.{PanicInfo}
+
+type PanicInfo {                         // error[DuplicateSymbol] E1012
+    code: Int
+}
+```
+
 **Where the hook runs.** The hook runs at the panic point, on the thread that panicked. Nothing unwinds: no `exit()` of a `with` item and no `close()` runs (§4.7.2). The hook cannot return, because its type is `-> Never`. A hook body that can fall through is the error of §3.3 *Divergence and Body Completeness*. The process ends when the hook calls `env.exit`.
 
 **What the hook gets.** It gets each panic that no runtime catch frame takes (§4.7.2): `panic()`, `todo()`, `unreachable()`, a failed contract, a failed `debug_assert` (*`debug_assert`*, below), an overflow, an index out of bounds. A fatal runtime error (out of memory, stack overflow) is not a panic. The hook does not run for it.
@@ -2746,6 +2807,8 @@ stdout is empty. stderr is `fatal: n out of range: 9 at app.bl:12`. The exit cod
 - The wording of the fault text is not normative. The text names the index and the length.
 
 ```blink
+import std.panic.{PanicInfo}
+
 fn report(p: PanicInfo) -> Never ! IO.Eprint, Env.Exit {
     let at = match p.line {
         Some(n) => "{p.file}:{n}"
@@ -2798,7 +2861,7 @@ fn main() ! IO, Env {
 }
 ```
 
-**One hook, in `main`.** A program has at most one hook. It stands in the body of `main`, as an item of a `with` that `main` itself holds. A hook in any other place is `PanicHookPlacement` (E0565), and so is a second hook in `main`. A library cannot take the crash report of the program that uses it. The places that fail are a fn other than `main`, a closure or nested fn in `main`, a `test` block, any other use of `on_panic` (it is only a `with` item), and a second `on_panic`:
+**One hook, in `main`.** A program has at most one hook. It stands in the body of `main`, as an item of a `with` that `main` itself holds. A hook in any other place is `PanicHookPlacement` (E0565), and so is a second hook in `main`. A library cannot take the crash report of the program that uses it. The places that fail are a fn other than `main`, a closure or nested fn in `main`, a `test` block, any other use of `on_panic` (it is only a `with` item), a `with` item that binds a name with `as`, and a second `on_panic`:
 
 ```blink
 fn serve() ! IO {
@@ -2817,11 +2880,75 @@ test "no hook in a test" {
 }
 ```
 
+**The labels of E0565.** A site gets one E0565, and the label tells which rule it breaks:
+
+| The site | Label |
+|----------|-------|
+| `on_panic` is not a `with` item (`let h = on_panic`, or `on_panic(report)` as a statement) | "`on_panic` is only a `with` item" |
+| a fn other than `main` | "`on_panic` outside `main`" |
+| a closure or nested fn in `main` | "`on_panic` outside `main`", and a note |
+| a `test` block | "`on_panic` in a `test` block" |
+| a second `on_panic` in `main` | "a second `on_panic` in `main`", and a secondary span on the first |
+| `with on_panic(f) as x` | "`on_panic` gives no value to bind" |
+
+The compiler decides the form of the site before its place. When one site breaks both rules, the form label is the one the compiler reports. The user repairs the form and the place in one edit, and gets no second E0565 on the same token. The help of the form label shows the whole repair:
+
+```blink
+fn serve() {
+    let h = on_panic
+    //      ^^^^^^^^ error[PanicHookPlacement] E0565: `on_panic` is only a `with` item
+    //   help: write `with on_panic(f) { ... }` in the body of `main`
+}
+```
+
+A closure or nested fn has a body of its own, and that body is not the body of `main`. So the label is "`on_panic` outside `main`", and the note says that the use is in a closure or a nested fn:
+
+```blink
+fn main() ! IO, Env {
+    let f = fn() { with on_panic(report) { run() } }
+    //                  ^^^^^^^^ error[PanicHookPlacement] E0565: `on_panic` outside `main`
+    //   note: this is in a closure; its body is not the body of `main`
+}
+```
+
+**A name bound with `as`.** The hook gives no value, so `as` has nothing to bind. `with on_panic(f) as x` is E0565. It is not E0839, because E0839 does not apply to `on_panic` (§4.7). The primary span is `as x`: it starts at the `as` keyword and ends after the name. It is not `on_panic`, because `on_panic(f)` is a correct hook and `as x` is the fault. The help is ``remove `as x` ``, and the fix is machine-applicable. The site still counts as the one hook of `main`: a later `on_panic` in `main` is still a second hook.
+
+```blink
+fn main() ! IO, Env {
+    with on_panic(report) as x { run() }
+    //                    ^^^^ error[PanicHookPlacement] E0565: `on_panic` gives no value to bind
+    //   help: remove `as x`
+}
+```
+
+**A user value named `on_panic`.** The name `on_panic` is not reserved, and a declaration with this name gets no warning. A binding named `on_panic` hides the built-in hook by lexical scope, as a binding named `trace` hides `trace.log` (§8.15.7 *A binding named `trace`*). The binding can be a module-level fn or `let`, a parameter, a local, or a name that a selective import binds. In the scope of that binding, `with on_panic(f)` is an ordinary `with` item (§4.7). It gets the typing rule of its value, and E0565 does not apply to it.
+
+When that item has an error, `TypeError` (E0300) or `NonHandlerWithItem` (E0839), the error carries a note. The note names the hiding binding and says that it hides the built-in panic hook. The words of the note are free. The shape is the shape of the `trace` note (§8.15.7), but this note is required. The note is on the error in these cases:
+
+- the hiding binding is a module-level fn or `let`, a parameter, a local, or a name from a selective import;
+- the item is a call of the bare name `on_panic`.
+
+The note is not on these errors:
+
+- a qualified call `lib.on_panic(...)`: it names an item of the module `lib`, and nothing is hidden;
+- an E0300 or an E0839 that has nothing to do with a binding named `on_panic`.
+
+```blink
+fn on_panic(x: Int) -> Int { x }
+
+fn main() ! IO, Env {
+    with on_panic(3) { run() }
+}
+// error[E0839]: a with-item must be a Handler[E] or a scoped value, got Int
+//   = note: `on_panic` here is the fn at line 1, which hides the built-in panic hook
+```
+
 **A panic in the hook.** A panic inside the hook writes the default report and exits with code 101. The runtime does not call the hook a second time. A hook runs after the panic says that program data may be broken. A hook that walks that data can panic again, and then the default report is all that the program writes.
 
 **The hook in tests.** `main` does not run under the test runner, so no hook is installed. The runner frame (or an `assert_panics` block) takes every panic (§4.7.2). A test checks the hook by calling it as a plain fn. `mock_env` makes `env.exit` panic, and `assert_panics` takes that panic (§8.10.3):
 
 ```blink
+import std.panic.{PanicInfo}
 import std.testing.{capture_print, mock_env}
 
 test "report writes the status line and exits 101" {
@@ -2840,6 +2967,8 @@ This example uses a `report` that writes with `io.println` and ends with `env.ex
 **State for the report.** A hook that must name the current request reads it from module state. The program writes that state before it handles each request:
 
 ```blink
+import std.panic.{PanicInfo}
+
 let mut cur_uri = ""
 let mut cur_id = 0
 

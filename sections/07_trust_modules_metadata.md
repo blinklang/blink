@@ -3938,6 +3938,16 @@ import auth.{Error}
 import db.{Error}             // error[E1005]: `Error` is imported twice
 ```
 
+**A qualifier is used only in `q.y`.** A qualifier is not a value. A bare call `q(...)` or a bare value `q` never resolves to a qualifier, and this holds for every qualifier. A local binding named `q` hides the qualifier in `q.y` for its scope (§10.1 *Qualified Access*). In this example, `import std.panic.{PanicInfo}` binds the qualifier `panic`, and `panic("boom")` is still the built-in `panic`:
+
+```blink
+import std.panic.{PanicInfo}
+
+fn main() ! IO, Env {
+    with on_panic(report) { panic("boom") }   // the built-in panic, not the qualifier `panic`
+}
+```
+
 ```
 error[E1005]: `Error` is imported twice in module `main`
  --> src/main.bl:2:12

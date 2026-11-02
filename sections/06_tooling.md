@@ -2715,6 +2715,8 @@ fn g() {
 }
 ```
 
+A binding named `on_panic` hides the built-in panic hook in the same way, and the error at the `with` item has a note of the same shape: it names the hiding binding and says that it hides the built-in (§2.20 *Panic Hook: `on_panic`*). The `trace` note stays an example, as above. The `on_panic` note is required.
+
 **The form.** By default a call writes one text line, `[trace:<channel>] <msg>`, to stderr. When `--trace` is on (§8.15.1), the same call writes a `note` event to the NDJSON stream, in place of the text line, so that each stderr line is valid JSON:
 
 ```json

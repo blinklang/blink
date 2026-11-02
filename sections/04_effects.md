@@ -3826,7 +3826,7 @@ The type of a `with` item decides what the item does. A `with` item has one of t
 | `Handler[E]` or `Handler[E ! R]` | Install the handler for `E`, run the body, uninstall the handler. The enclosing code must hold `R` (§4.7.1, *The clause row*). |
 | A scoped value: `T` where `T: Scoped`, which includes every `Closeable` type (§4.7.2) | Call `enter()`. If `T.Context` is `Handler[E]` with a concrete `E`, install the handler that `enter()` returned. Run the body. Uninstall that handler. Call `exit(ok)`. |
 
-`arena` is a keyword item with its own typing rule (§5.2). `on_panic(f)` is a built-in item with its own typing rule (§2.20): it takes a fn of type `fn(PanicInfo) -> Never` and installs a panic hook. It is not a `Handler` or a scoped value, and E0839 does not apply to it. It is allowed only in the body of `main` (E0565). A `handler E { ... }` expression has type `Handler[E]`, so it takes the first rule.
+`arena` is a keyword item with its own typing rule (§5.2). `on_panic(f)` is a built-in item with its own typing rule (§2.20): it takes a fn of type `fn(PanicInfo) -> Never` and installs a panic hook. It is not a `Handler` or a scoped value, and E0839 does not apply to it. It is allowed only in the body of `main` (E0565). A binding named `on_panic` hides it by lexical scope (§2.20). A `handler E { ... }` expression has type `Handler[E]`, so it takes the first rule.
 
 An item of any other type is a compile error (E0839). If the type is a `Result` or an `Option`, the help text says to add `?`.
 
@@ -3858,6 +3858,7 @@ fn stub() {
 - For a `Handler[E]` item, `name` is the handler. It is the same first-class value (see *Handlers are values*). It is not a scoped value, so W0610, W0611 and E0601 do not apply to it.
 - For a scoped value, `name` is the value that `enter()` returns (the `Context`). For a `Closeable` type, that is the value itself.
 - Without `as`, a scoped value runs `enter()` and `exit(ok)` as before, and the compiler discards the `Context`. This is legal for every `Context`.
+- `on_panic(f)` gives no value, so `with on_panic(f) as x` is E0565 and not E0839 (§2.20 *Panic Hook: `on_panic`*).
 
 ```blink
 with mock_db(fixtures) {
