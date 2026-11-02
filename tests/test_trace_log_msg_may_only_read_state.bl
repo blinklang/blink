@@ -896,3 +896,716 @@ fn main() {
     assert(primary_at(found, 13, 14), found)
     assert(found.contains("`msg` runs `T.exit`, which writes `count`"), found)
 }
+
+test "a closure literal in msg runs only when msg calls it" {
+    let src = #"let mut count = 0
+
+fn bump() -> Int {
+    count += 1
+    count
+}
+
+fn walk() {
+    trace.log("c", {
+        let f = fn() -> Int { bump() }
+        "x"
+    })
+    trace.log("c", {
+        let f = fn() -> Int { bump() }
+        "{f()}"
+    })
+    trace.log("c", "{[1].map(fn(x: Int) -> Int { x + bump() }).len()}")
+}
+
+fn main() {
+    walk()
+}
+"#
+    let out = check_via_cli(src, "e0566_msg_closure_literal_{getpid()}")
+    let found = e0566_lines(out)
+    assert_eq(found.len(), 2)
+    assert_eq(error_count(out), 2)
+    let called = found.get(0).unwrap()
+    assert(primary_at(called, 14, 31), called)
+    assert(called.contains("`msg` calls `bump`, which writes `count`"), called)
+    let mapped = found.get(1).unwrap()
+    assert(primary_at(mapped, 17, 54), mapped)
+    assert(mapped.contains("`msg` calls `bump`, which writes `count`"), mapped)
+}
+
+test "a msg that calls a let mut closure binding runs every closure assigned to it" {
+    let src = #"let mut count = 0
+
+fn walk() {
+    let mut f = fn() -> Int { 1 }
+    f = fn() -> Int {
+        count += 1
+        count
+    }
+    let mut g = fn() -> Int { 1 }
+    g = fn() -> Int { 2 }
+    trace.log("c", "{f()}")
+    trace.log("c", "{g()}")
+}
+
+fn main() {
+    walk()
+}
+"#
+    let e = only_e0566(check_via_cli(src, "e0566_let_mut_closure_{getpid()}"))
+    assert(primary_at(e, 11, 22), e)
+    assert(e.contains("`msg` runs `f`, which writes `count`"), e)
+}
+
+test "a msg that runs a closure declared outside it is E0566 when the closure's body has a row" {
+    let src = #"fn shout(s: Str) ! IO {
+    io.println(s)
+}
+
+fn walk() ! IO {
+    let cwd = fn() -> Str { env.cwd() }
+    let loud = fn() -> Int {
+        shout("x")
+        1
+    }
+    let nested = fn() -> Int {
+        let inner = fn() -> Str { env.cwd() }
+        inner().len()
+    }
+    trace.log("c", "{cwd()}")
+    trace.log("c", "{loud()}")
+    trace.log("c", "{[1].map(fn(x: Int) -> Int { x + nested() }).len()}")
+}
+
+fn main() ! IO {
+    walk()
+}
+"#
+    let out = check_via_cli(src, "e0566_outer_closure_row_{getpid()}")
+    let found = e0566_lines(out)
+    assert_eq(found.len(), 3)
+    assert_eq(error_count(out), 3)
+    let op = found.get(0).unwrap()
+    assert(primary_at(op, 15, 22), op)
+    assert(op.contains("`msg` runs `cwd`, which has a row"), op)
+    assert(op.contains("`cwd` calls `env.cwd`, a handler operation"), op)
+    let rowed = found.get(1).unwrap()
+    assert(primary_at(rowed, 16, 22), rowed)
+    assert(rowed.contains("`msg` runs `loud`, which has a row"), rowed)
+    assert(rowed.contains("`loud` calls `shout`, which has the row `! IO`"), rowed)
+    let deep = found.get(2).unwrap()
+    assert(primary_at(deep, 17, 54), deep)
+    assert(deep.contains("`msg` runs `nested`, which has a row"), deep)
+    assert(deep.contains("`nested` calls `env.cwd`, a handler operation"), deep)
+}
+
+fn code_lines(out: Str, code: Str) -> List[Str] {
+    let mut found: List[Str] = []
+    for line in out.split("\n") {
+        if line.contains("\"code\":\"{code}\"") { found.push(line) }
+    }
+    found
+}
+
+test "a fn the walk first meets at its depth cap is walked again when a shorter call path reaches it" {
+    let mut parts = ["let mut counter = 0\n\nfn z() \{\n    counter += 1\n\}\n\nfn w() \{\n    z()\n\}\n"]
+    let mut i = 1
+    while i < 63 {
+        parts.push("\nfn c{i}() \{\n    c{i + 1}()\n\}\n")
+        i = i + 1
+    }
+    parts.push("\nfn c63() \{\n    w()\n\}\n\nfn a() -> Int \{\n    c1()\n    w()\n    1\n\}\n")
+    parts.push("\nfn main() \{\n    trace.log(\"c\", \"v=\{a()\}\")\n\}\n")
+    let e = only_e0566(check_via_cli(parts.join(""), "e0566_depth_cap_{getpid()}"))
+    assert(e.contains("`msg` calls `a`, which writes `counter`"), e)
+}
+
+test "a msg that calls a module let closure runs the closure it holds" {
+    let src = #"let mut count = 0
+
+let cb = fn() -> Int {
+    count += 1
+    count
+}
+let mut cbm = fn() -> Int { 1 }
+
+fn walk() {
+    trace.log("c", "{cb()}")
+    trace.log("c", "{cbm()}")
+    trace.log("c", "{[1].map(cb).len()}")
+}
+
+fn main() {
+    cbm = fn() -> Int {
+        count += 1
+        count
+    }
+    walk()
+}
+"#
+    let out = check_via_cli(src, "e0566_module_let_closure_{getpid()}")
+    let found = e0566_lines(out)
+    assert_eq(found.len(), 3)
+    assert_eq(error_count(out), 3)
+    let held = found.get(0).unwrap()
+    assert(primary_at(held, 10, 22), held)
+    assert(held.contains("`msg` runs `cb`, which writes `count`"), held)
+    let assigned = found.get(1).unwrap()
+    assert(primary_at(assigned, 11, 22), assigned)
+    assert(assigned.contains("`msg` runs `cbm`, which writes `count`"), assigned)
+    let mapped = found.get(2).unwrap()
+    assert(primary_at(mapped, 12, 22), mapped)
+    assert(mapped.contains("`msg` runs `cb`, which writes `count`"), mapped)
+}
+
+test "a msg that runs a closure declared outside it is E0566 when a with item in the closure has a row" {
+    let src = #"type Log { name: Str }
+
+impl Closeable for Log {
+    fn close(self) ! IO.Print { io.println("closed {self.name}") }
+}
+
+type T { n: Int }
+
+impl BlockHandler for T {
+    type Context = ()
+    fn enter(self) -> () ! IO { io.println("in {self.n}") }
+    fn exit(self, _ok: Bool) ! IO { io.println("out {self.n}") }
+}
+
+fn walk() ! IO {
+    let shut = fn() -> Int {
+        with Log { name: "a" } as l { let _ = l.name }
+        1
+    }
+    let held = fn() -> Int {
+        with T { n: 1 } { 1 }
+    }
+    trace.log("c", "{shut()}")
+    trace.log("c", "{held()}")
+}
+
+fn main() ! IO {
+    walk()
+}
+"#
+    let out = check_via_cli(src, "e0566_outer_closure_with_{getpid()}")
+    let found = e0566_lines(out)
+    assert_eq(found.len(), 2)
+    assert_eq(error_count(out), 2)
+    let closed = found.get(0).unwrap()
+    assert(primary_at(closed, 23, 22), closed)
+    assert(closed.contains("`msg` runs `shut`, which has a row"), closed)
+    assert(closed.contains("`shut` runs `Log.close`, which has the row `! IO.Print`"), closed)
+    let entered = found.get(1).unwrap()
+    assert(primary_at(entered, 24, 22), entered)
+    assert(entered.contains("`msg` runs `held`, which has a row"), entered)
+    assert(entered.contains("`held` runs `T.enter`, which has the row `! IO`"), entered)
+}
+
+test "a msg that runs a closure an if, match or block yields runs each closure it may yield" {
+    let src = #"let mut count = 0
+
+fn bump() -> Int {
+    count += 1
+    count
+}
+
+fn walk(flag: Bool, n: Int) {
+    let picked = if flag { fn() -> Int { bump() } } else { fn() -> Int { 2 } }
+    let matched = match n {
+        0 => fn() -> Int { 0 }
+        _ => fn() -> Int { bump() }
+    }
+    let blocked = {
+        let k = 1
+        fn() -> Int { bump() + k }
+    }
+    let pure = if flag { fn() -> Int { 1 } } else { fn() -> Int { 2 } }
+    trace.log("c", "{picked()}")
+    trace.log("c", "{matched()}")
+    trace.log("c", "{blocked()}")
+    trace.log("c", "{pure()}")
+}
+
+fn main() {
+    walk(true, 1)
+}
+"#
+    let out = check_via_cli(src, "e0566_branch_closure_{getpid()}")
+    let found = e0566_lines(out)
+    assert_eq(found.len(), 3)
+    assert_eq(error_count(out), 3)
+    let picked = found.get(0).unwrap()
+    assert(primary_at(picked, 19, 22), picked)
+    assert(picked.contains("`msg` runs `picked`, which writes `count`"), picked)
+    let matched = found.get(1).unwrap()
+    assert(primary_at(matched, 20, 22), matched)
+    assert(matched.contains("`msg` runs `matched`, which writes `count`"), matched)
+    let blocked = found.get(2).unwrap()
+    assert(primary_at(blocked, 21, 22), blocked)
+    assert(blocked.contains("`msg` runs `blocked`, which writes `count`"), blocked)
+}
+
+test "a closure literal in msg that msg does not run is held to the row of the enclosing fn" {
+    let src = #"fn shout() -> Int ! IO {
+    io.println("x")
+    1
+}
+
+fn apply(f: fn() -> Int) -> Int { f() }
+
+fn walk() {
+    trace.log("c", "{apply(fn() -> Int { shout() })}")
+    trace.log("c", {
+        let d = fn() -> Int { shout() }
+        "x"
+    })
+    trace.log("c", "{[1].map(fn(x: Int) -> Int { x + shout() }).len()}")
+}
+
+fn main() ! IO {
+    walk()
+}
+"#
+    let out = check_via_cli(src, "e0566_msg_literal_row_{getpid()}")
+    let rows = code_lines(out, "E0500")
+    assert_eq(rows.len(), 2)
+    assert(primary_at(rows.get(0).unwrap(), 9, 42), rows.get(0).unwrap())
+    assert(primary_at(rows.get(1).unwrap(), 11, 31), rows.get(1).unwrap())
+    let found = e0566_lines(out)
+    assert_eq(found.len(), 1)
+    assert_eq(error_count(out), 3)
+    assert(primary_at(found.get(0).unwrap(), 14, 54), found.get(0).unwrap())
+}
+
+test "a msg method call the check cannot resolve gives no E0566" {
+    let src = #"let mut count = 0
+
+fn bump() -> Int {
+    count += 1
+    count
+}
+
+fn walk() {
+    let r: Result[Int, Str] = Ok(1)
+    trace.log("c", "{r.map_err(fn(x: Str) -> Str { "{bump()}" }).is_ok()}")
+}
+
+fn main() {
+    walk()
+}
+"#
+    let out = check_via_cli(src, "e0566_unresolved_method_{getpid()}")
+    assert_eq(e0566_lines(out).len(), 0)
+    assert_eq(code_lines(out, "E0505").len(), 1)
+    assert_eq(error_count(out), 1)
+}
+
+test "a with item on a local named arena in a closure that msg runs counts its close row" {
+    let src = #"type Loud { name: Str }
+
+impl Closeable for Loud {
+    fn close(self) ! IO.Print { io.println("closed {self.name}") }
+}
+
+fn direct() ! IO.Print {
+    let arena = Loud { name: "a" }
+    trace.log("c", {
+        with arena as l { l.name }
+    })
+}
+
+fn outside() ! IO.Print {
+    let arena = Loud { name: "a" }
+    let c = fn() -> Str {
+        with arena as l { l.name }
+    }
+    trace.log("c", "{c()}")
+}
+
+fn main() ! IO {
+    direct()
+    outside()
+}
+"#
+    let out = check_via_cli(src, "e0566_arena_local_{getpid()}")
+    let found = e0566_lines(out)
+    assert_eq(found.len(), 2)
+    assert_eq(error_count(out), 2)
+    let direct = found.get(0).unwrap()
+    assert(primary_at(direct, 10, 14), direct)
+    assert(direct.contains("`msg` runs `Loud.close`, which has a row"), direct)
+    let outside = found.get(1).unwrap()
+    assert(primary_at(outside, 19, 22), outside)
+    assert(outside.contains("`msg` runs `c`, which has a row"), outside)
+    assert(outside.contains("`c` runs `Loud.close`, which has the row `! IO.Print`"), outside)
+}
+
+test "msg names a module let closure read through its module as the source spells it" {
+    let helper = #"let mut count = 0
+
+pub let cb = fn(x: Int) -> Int {
+    count += x
+    count
+}
+"#
+    let entry = #"import hooks
+
+fn main() {
+    trace.log("c", "{[1].map(hooks.cb).len()}")
+}
+"#
+    let e = only_e0566(check_package(entry, "hooks", helper, "e0566_module_let_path_{getpid()}"))
+    assert(primary_at(e, 4, 22), e)
+    assert(e.contains("`msg` runs `hooks.cb`, which writes `count`"), e)
+}
+
+test "a nested trace.log in msg charges no row of the enclosing fn, its channel too" {
+    let src = #"fn chan_io() -> Str ! IO { "c" }
+
+fn io_fn() -> Int ! IO { 1 }
+
+fn f() -> Int {
+    trace.log("c", {
+        trace.log(chan_io(), "inner")
+        "outer"
+    })
+    0
+}
+
+fn g() -> Int {
+    trace.log("c", {
+        let h = fn() -> Int { io_fn() }
+        trace.log("d", "inner {h()}")
+        "x"
+    })
+    0
+}
+
+fn main() ! IO {
+    let _ = f()
+    let _ = g()
+}
+"#
+    let out = check_via_cli(src, "e0566_nested_trace_row_{getpid()}")
+    assert_eq(code_lines(out, "E0500").len(), 0)
+    let found = e0566_lines(out)
+    assert_eq(found.len(), 3)
+    assert_eq(error_count(out), 3)
+    let chan = found.get(0).unwrap()
+    assert(primary_at(chan, 7, 19), chan)
+    assert(chan.contains("`msg` calls `chan_io`, which has a row"), chan)
+    let ran = found.get(1).unwrap()
+    assert(primary_at(ran, 16, 32), ran)
+    assert(ran.contains("`msg` runs `h`, which has a row"), ran)
+    // The outer msg runs `h` too, through the nested one, and `h` is its own literal.
+    let outer = found.get(2).unwrap()
+    assert(primary_at(outer, 15, 31), outer)
+    assert(outer.contains("`msg` calls `io_fn`, which has a row"), outer)
+}
+
+test "a closure literal in a nested trace.log that no msg runs is held to the row of the enclosing fn" {
+    let src = #"fn io_fn() -> Int ! IO { 1 }
+
+fn f() -> Int {
+    trace.log("c", {
+        trace.log({
+            let g = fn() -> Int { io_fn() }
+            "d"
+        }, "inner")
+        trace.log("d", {
+            let g = fn() -> Int { io_fn() }
+            "inner"
+        })
+        "outer"
+    })
+    0
+}
+
+fn main() ! IO {
+    let _ = f()
+}
+"#
+    let out = check_via_cli(src, "e0566_nested_trace_literal_{getpid()}")
+    assert_eq(e0566_lines(out).len(), 0)
+    let rows = code_lines(out, "E0500")
+    assert_eq(rows.len(), 2)
+    assert_eq(error_count(out), 2)
+    assert(primary_at(rows.get(0).unwrap(), 6, 35), rows.get(0).unwrap())
+    assert(primary_at(rows.get(1).unwrap(), 10, 35), rows.get(1).unwrap())
+}
+
+test "the ops of a handler in msg are held to the row of the enclosing fn" {
+    let src = #"effect Ask {
+    effect Get {
+        fn ask() -> Int
+    }
+}
+
+fn io_fn() -> Int ! IO { 1 }
+
+fn f() -> Int {
+    trace.log("c", {
+        let h = handler Ask { fn ask() -> Int { io_fn() } }
+        "x"
+    })
+    0
+}
+
+fn g() -> Int {
+    trace.log("c", {
+        let h = handler Ask {
+            fn ask() -> Int {
+                let k = fn() -> Int { io_fn() }
+                1
+            }
+        }
+        "x"
+    })
+    0
+}
+
+fn main() ! IO {
+    let _ = f()
+    let _ = g()
+}
+"#
+    let out = check_via_cli(src, "e0566_msg_handler_row_{getpid()}")
+    assert_eq(e0566_lines(out).len(), 0)
+    let rows = code_lines(out, "E0500")
+    assert_eq(rows.len(), 2)
+    assert_eq(error_count(out), 2)
+    assert(primary_at(rows.get(0).unwrap(), 11, 49), rows.get(0).unwrap())
+    assert(primary_at(rows.get(1).unwrap(), 21, 39), rows.get(1).unwrap())
+}
+
+test "the closures that a closure of an outer msg runs, when a nested msg runs it, charge no row" {
+    let src = #"fn io_fn() -> Int ! IO { 1 }
+
+fn chained() -> Int {
+    trace.log("a", {
+        let e = fn() -> Int { io_fn() }
+        let d = fn() -> Int { e() }
+        let c = fn() -> Int { d() }
+        trace.log("b", "{c()}")
+        "a"
+    })
+    0
+}
+
+fn mapped() -> Int {
+    trace.log("a", {
+        let d = fn(x: Int) -> Int { io_fn() + x }
+        let c = fn() -> Int { [1].map(d).len() }
+        trace.log("b", "{c()}")
+        "a"
+    })
+    0
+}
+
+fn main() ! IO {
+    let _ = chained()
+    let _ = mapped()
+}
+"#
+    let out = check_via_cli(src, "e0566_nested_run_chain_{getpid()}")
+    assert_eq(code_lines(out, "E0500").len(), 0)
+    let found = e0566_lines(out)
+    assert_eq(found.len(), 4)
+    assert_eq(error_count(out), 4)
+    let chained = found.get(0).unwrap()
+    assert(primary_at(chained, 8, 26), chained)
+    assert(chained.contains("`msg` runs `c`, which has a row"), chained)
+    // The outer msg runs the chain too, and walks its own literals down to the call.
+    let chained_outer = found.get(1).unwrap()
+    assert(primary_at(chained_outer, 5, 31), chained_outer)
+    assert(chained_outer.contains("`msg` calls `io_fn`, which has a row"), chained_outer)
+    let mapped = found.get(2).unwrap()
+    assert(primary_at(mapped, 18, 26), mapped)
+    assert(mapped.contains("`msg` runs `c`, which has a row"), mapped)
+    let mapped_outer = found.get(3).unwrap()
+    assert(primary_at(mapped_outer, 16, 37), mapped_outer)
+    assert(mapped_outer.contains("`msg` calls `io_fn`, which has a row"), mapped_outer)
+}
+
+test "msg names a closure passed as a keyword argument by its binding" {
+    let src = #"let mut n = 0
+
+let cb = fn(x: Int) -> Int {
+    n += x
+    n
+}
+
+fn main() {
+    trace.log("c", "{[1].map(f: cb).len()}")
+}
+"#
+    let e = only_e0566(check_via_cli(src, "e0566_named_arg_label_{getpid()}"))
+    assert(primary_at(e, 9, 22), e)
+    assert(e.contains("`msg` runs `cb`, which writes `n`"), e)
+}
+
+test "a closure literal msg assigns and runs through a closure declared outside it is walked as msg" {
+    let src = #"fn io_fn() -> Int ! IO { 1 }
+
+fn writes() -> Int {
+    let mut x = 0
+    let mut g = fn() -> Int { 0 }
+    let k = fn() -> Int { g() }
+    trace.log("a", {
+        g = fn() -> Int {
+            x = 1
+            0
+        }
+        "{k()}"
+    })
+    x
+}
+
+fn rowed() -> Int {
+    let mut g = fn() -> Int { 0 }
+    let k = fn() -> Int { g() }
+    trace.log("a", {
+        g = fn() -> Int { io_fn() }
+        "{k()}"
+    })
+    0
+}
+
+fn main() ! IO {
+    let _ = writes()
+    let _ = rowed()
+}
+"#
+    let out = check_via_cli(src, "e0566_literal_run_through_outside_{getpid()}")
+    assert_eq(code_lines(out, "E0500").len(), 0)
+    let found = e0566_lines(out)
+    assert(found.any(fn(e: Str) -> Bool { primary_at(e, 8, 9) && e.contains("`msg` writes `g`") }), out)
+    assert(found.any(fn(e: Str) -> Bool { primary_at(e, 9, 13) && e.contains("`msg` writes `x`") }), out)
+    assert(found.any(fn(e: Str) -> Bool { primary_at(e, 21, 27) && e.contains("`msg` calls `io_fn`, which has a row") }), out)
+}
+
+test "a closure literal of an outer msg that a nested msg runs is walked as the outer msg" {
+    let src = #"fn io_fn() -> Int ! IO { 1 }
+
+fn direct() -> Int {
+    let mut x = 0
+    trace.log("a", {
+        let h = fn() -> Int {
+            x = 1
+            0
+        }
+        trace.log("b", "{h()}")
+        "s"
+    })
+    x
+}
+
+fn through_outside() -> Int {
+    let mut xs = [0]
+    let mut g = fn() -> Int { 0 }
+    let k = fn() -> Int { g() }
+    trace.log("a", {
+        g = fn() -> Int {
+            xs.push(1)
+            io_fn()
+        }
+        trace.log("b", "{k()}")
+        "s"
+    })
+    xs.len()
+}
+
+fn writes_outer_local() -> Int {
+    trace.log("a", {
+        let mut y = 0
+        let h = fn() -> Int {
+            y = 1
+            y
+        }
+        trace.log("b", "{h()}")
+        "s"
+    })
+    0
+}
+
+fn main() ! IO {
+    let _ = direct()
+    let _ = through_outside()
+    let _ = writes_outer_local()
+}
+"#
+    let out = check_via_cli(src, "e0566_outer_literal_nested_run_{getpid()}")
+    assert_eq(code_lines(out, "E0500").len(), 0)
+    let found = e0566_lines(out)
+    assert(found.any(fn(e: Str) -> Bool { primary_at(e, 7, 13) && e.contains("`msg` writes `x`") }), out)
+    assert(found.any(fn(e: Str) -> Bool { primary_at(e, 21, 9) && e.contains("`msg` writes `g`") }), out)
+    assert(found.any(fn(e: Str) -> Bool { primary_at(e, 22, 13) && e.contains("`xs`") }), out)
+    assert(found.any(fn(e: Str) -> Bool { primary_at(e, 23, 13) && e.contains("`msg` calls `io_fn`, which has a row") }), out)
+    assert_eq(found.filter(fn(e: Str) -> Bool { e.contains("`y`") }).len(), 0)
+    assert(!found.any(fn(e: Str) -> Bool { primary_at(e, 35, 13) }), out)
+}
+
+test "a named fn that msg passes to a built-in that runs its callback is checked as a call of it" {
+    let src = #"let mut count = 0
+
+fn shout(x: Int) -> Int ! IO {
+    io.println("x")
+    x
+}
+
+fn bump(x: Int) -> Int {
+    count += x
+    count
+}
+
+fn peek(x: Int) -> Int { x + count }
+
+fn walk() ! IO {
+    let g = shout
+    trace.log("c", "{[1].map(shout).len()}")
+    trace.log("c", "{[1].map(bump).len()}")
+    trace.log("c", "{[1].map(peek).len()}")
+    trace.log("c", "{[1].map(g).len()}")
+}
+
+fn main() ! IO {
+    walk()
+}
+"#
+    let out = check_via_cli(src, "e0566_msg_named_fn_callback_{getpid()}")
+    let found = e0566_lines(out)
+    assert_eq(found.len(), 4)
+    assert_eq(error_count(out), 4)
+    let rowed = found.get(0).unwrap()
+    assert(primary_at(rowed, 17, 22), rowed)
+    assert(rowed.contains("`msg` calls `shout`, which has a row"), rowed)
+    assert(rowed.contains("`shout` has the row `! IO`"), rowed)
+    let written = found.get(1).unwrap()
+    assert(primary_at(written, 18, 22), written)
+    assert(written.contains("`msg` calls `bump`, which writes `count`"), written)
+    let read = found.get(2).unwrap()
+    assert(primary_at(read, 19, 22), read)
+    assert(read.contains("`msg` calls `peek`, which reads `count`"), read)
+    let through = found.get(3).unwrap()
+    assert(primary_at(through, 20, 22), through)
+    assert(through.contains("`msg` calls `shout`, which has a row"), through)
+}
+
+test "a pure named fn with no row that msg passes to map is allowed" {
+    let src = #"fn twice(x: Int) -> Int { x * 2 }
+
+fn walk() {
+    let g = twice
+    trace.log("c", "{[1].map(twice).len()}")
+    trace.log("c", "{[1].map(g).len()}")
+}
+
+fn main() {
+    walk()
+}
+"#
+    let out = check_via_cli(src, "e0566_msg_pure_named_fn_callback_{getpid()}")
+    assert(!out.contains("\"severity\":\"error\""), out)
+}
