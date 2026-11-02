@@ -1133,7 +1133,7 @@ fn format_log() -> Str ! Time.Read {
 
 **Instant** is an opaque type (§2.12.2), declared `pub opaque type Instant` in `std.time`. It has nanosecond precision. Code builds an `Instant` only through `time.read()` and its type-scoped functions, such as `Instant.from_epoch_secs` and `Instant.parse` (§2.12.3).
 
-**The std.time range.** An `Instant` lies in the std.time range 1677-09-22T00:00:00Z ..= 2262-04-11T23:47:16.854775807Z. Every Instant constructor checks this range: `Instant.parse` returns `Err` outside it; `Instant.add` and `Instant.from_epoch_secs` panic outside it, as `Int` overflow does. The range starts on a whole day, so every `Instant` has a `Date` (*Date and Weekday* below). Calendar fields use the proleptic Gregorian calendar in UTC, with no leap seconds.
+**The std.time range.** An `Instant` lies in the std.time range 1677-09-22T00:00:00Z ..= 2262-04-11T23:47:16.854775807Z. Every Instant constructor checks this range: `Instant.parse` returns `Err` outside it; `Instant.add` and `Instant.from_epoch_secs` panic outside it, as `Int` overflow does. The range starts on a whole day, so every `Instant` has a `Date`, which `instant.date()` returns (*Date and Weekday* below). Calendar fields use the proleptic Gregorian calendar in UTC, with no leap seconds.
 
 | Method | Signature | Notes |
 |--------|-----------|-------|
@@ -1212,22 +1212,22 @@ A `Time` handler that omits `monotonic` gets W0545, and its help names `Monotoni
 
 ##### Date and Weekday
 
-**Date** is an opaque type, declared `pub opaque type Date` in `std.time`. It is one day of the proleptic Gregorian calendar, with no time of day and no time zone. Its range is 1677-09-22 ..= 2262-04-11, the whole days of the std.time range. Code builds a `Date` only through `Date.from_ymd`, `Date.parse`, `instant.date()` and `add_days`.
+**Date** is an opaque type, declared `pub opaque type Date` in `std.time`. It is one day of the proleptic Gregorian calendar, with no time of day and no time zone. Its range is 0001-01-01 ..= 9999-12-31, wider than the std.time range: every `Instant` has a `Date`, but a `Date` before 1677-09-22 or after 2262-04-11 has no `Instant` at its midnight. A `Date` holds a day count, so it needs no nanoseconds, and its range has no link to the `Instant` range. Code builds a `Date` only through `Date.from_ymd`, `Date.parse`, `instant.date()` and `add_days`.
 
 | Function | Signature | Notes |
 |----------|-----------|-------|
 | `Date.from_ymd` | `fn(y: Int, m: Int, d: Int) -> Result[Date, ConversionError]` | `m` is 1..=12; `d` is 1 to the last day of that month |
-| `Date.parse` | `fn(s: Str) -> Result[Date, ConversionError]` | `YYYY-MM-DD` only: 4 digits, `-`, 2 digits, `-`, 2 digits, nothing else |
+| `Date.parse` | `fn(s: Str) -> Result[Date, ConversionError]` | `YYYY-MM-DD` only: 4 digits, `-`, 2 digits, `-`, 2 digits, nothing else. A 5-digit or negative year is a syntax error; year `0000` has the right syntax and is a range error |
 
 | Method | Signature | Notes |
 |--------|-----------|-------|
-| `year` | `fn(self) -> Int` | 1677..=2262 |
+| `year` | `fn(self) -> Int` | 1..=9999 |
 | `month` | `fn(self) -> Int` | 1..=12 |
 | `day` | `fn(self) -> Int` | 1..=31 |
 | `weekday` | `fn(self) -> Weekday` | Day of the week |
 | `add_days` | `fn(self, n: Int) -> Date` | `n` may be negative; panics outside the Date range |
 | `days_since` | `fn(self, earlier: Date) -> Int` | Days from `earlier` to `self`; negative when `earlier` is later |
-| `to_instant` | `fn(self) -> Instant` | 00:00:00Z on this day; total |
+| `to_instant` | `fn(self) -> Result[Instant, ConversionError]` | `Ok` of 00:00:00Z on this day; `Err` when that midnight is outside the std.time range, that is, for a `Date` before 1677-09-22 or after 2262-04-11 |
 
 **Weekday** is a fieldless enum in `std.time`:
 
@@ -1237,9 +1237,9 @@ pub type Weekday { Monday, Tuesday, Wednesday, Thursday, Friday, Saturday, Sunda
 
 `Weekday.Monday.to_int()` is 0 and `Weekday.Sunday.to_int()` is 6 (§3.4 *Tag Operations*). The ISO 8601 day number is `to_int() + 1`. `Display` writes the English name: `Monday`.
 
-Date and Weekday implement: `Eq`, `Ord`, `Hash`, `Display`, `Clone`, `Debug`. `Debug` writes the same text as `Display`. `Date`'s `Display` writes `YYYY-MM-DD`: `2026-10-17`. Dates order by time, and weekdays order from Monday to Sunday.
+Date and Weekday implement: `Eq`, `Ord`, `Hash`, `Display`, `Clone`, `Debug`. `Debug` writes the same text as `Display`. `Date`'s `Display` writes `YYYY-MM-DD` with a 4-digit year: `2026-10-17`, `0001-01-01`. Dates order by time, and weekdays order from Monday to Sunday.
 
-**Errors.** Each parse and constructor failure is `Err(ConversionError)`. Its `message` starts with `invalid date: ` (from `Date.from_ymd` and `Date.parse`) or `invalid timestamp: ` (from `Instant.parse`), then gives exactly one of these texts. The texts are fixed, and tests check them word for word.
+**Errors.** Each parse and constructor failure is `Err(ConversionError)`. Its `message` starts with `invalid date: ` (from `Date.from_ymd` and `Date.parse`) or `invalid timestamp: ` (from `Instant.parse` and `Date.to_instant`), then gives exactly one of these texts. The texts are fixed, and tests check them word for word.
 
 - **Syntax errors** give the byte offset, counted from 0, of the first byte that does not match the grammar:
   - `expected X at byte N (found 'c')`, where `X` is one of `digit`, `'-'`, `':'`, `'T' or ' '`, `'Z', '+' or '-'`, and `c` is the character that starts at byte `N`. At the end of the text, `(found end of input)` replaces `(found 'c')`.
@@ -1252,26 +1252,39 @@ Date and Weekday implement: `Eq`, `Ord`, `Hash`, `Display`, `Clone`, `Debug`. `D
   - `hour H out of range 0..23`, `minute M out of range 0..59`, `second S out of range 0..59`
   - `offset hour H out of range 0..23`, `offset minute M out of range 0..59`
 - **Range errors** name the std.time range and give no offset:
-  - `YYYY-MM-DD outside 1677-09-22..2262-04-11`
-  - `S outside 1677-09-22T00:00:00Z..2262-04-11T23:47:16.854775807Z`, where `S` is the input text
+  - `YYYY-MM-DD outside 0001-01-01..9999-12-31`, from `Date.from_ymd` and `Date.parse`
+  - `S outside 1677-09-22T00:00:00Z..2262-04-11T23:47:16.854775807Z`, from `Instant.parse` and `Date.to_instant`, where `S` is the input text. For `Date.to_instant`, `S` is the midnight of that day, written as an `Instant` is written
 
-A check stops at the first error. Syntax comes first, then the fields from left to right, then the range, which `Instant.parse` checks after it applies the offset. In a `Date.from_ymd` message, the year is written as `y.display_zero_padded(4)` and the month and day with two digits. The panics use the same range text: `Date.add_days` panics with `date out of range: result outside 1677-09-22..2262-04-11`, and `Instant.add` and `Instant.from_epoch_secs` panic with `instant out of range: result outside 1677-09-22T00:00:00Z..2262-04-11T23:47:16.854775807Z`.
+A check stops at the first error. Syntax comes first, then the fields from left to right, then the range, which `Instant.parse` checks after it applies the offset. In a `Date.from_ymd` message, the year is written as `y.display_zero_padded(4)` and the month and day with two digits. The panics use the same range texts: `Date.add_days` panics with `date out of range: result outside 0001-01-01..9999-12-31`, and `Instant.add` and `Instant.from_epoch_secs` panic with `instant out of range: result outside 1677-09-22T00:00:00Z..2262-04-11T23:47:16.854775807Z`.
 
 ```blink
 Date.parse("2026-1-07")          // Err: "invalid date: expected digit at byte 6 (found '-')"
 Date.parse("2026-02-30")         // Err: "invalid date: day 30 out of range 1..28 for 2026-02"
-Date.from_ymd(1677, 9, 21)       // Err: "invalid date: 1677-09-21 outside 1677-09-22..2262-04-11"
+Date.parse("0000-01-01")         // Err: "invalid date: 0000-01-01 outside 0001-01-01..9999-12-31"
+Date.parse("0000-02-29")         // Err: same range text, with 0000-02-29 (year 0 is a leap year)
+Date.parse("0000-12-31")         // Err: same range text, with 0000-12-31
+Date.from_ymd(0, 2, 29)          // Err: same range text, with 0000-02-29
+Date.from_ymd(10000, 1, 1)       // Err: "invalid date: 10000-01-01 outside 0001-01-01..9999-12-31"
+Date.parse("10000-01-01")        // Err: "invalid date: expected '-' at byte 4 (found '0')"
 Instant.parse("2026-02-14t12:00:00Z")
 // Err: "invalid timestamp: expected 'T' or ' ' at byte 10 (found 't')"
 Instant.parse("2026-02-14 12:00:00")
 // Err: "invalid timestamp: no UTC offset at byte 19; append Z if the time is UTC"
 ```
 
+The `Date` range is not exactly the set of texts that `YYYY-MM-DD` can write: year `0000` has valid syntax and is outside the range. Fields are checked before the range, and year 0 is a leap year, so `0000-02-29` passes the field check and then fails the range check. `Date.add_days` panics at both ends of the range:
+
+```blink
+let first = Date.from_ymd(1, 1, 1).unwrap()
+first.add_days(-1)    // panic: "date out of range: result outside 0001-01-01..9999-12-31"
+```
+
 **Laws.** For every `d: Date`, every `i: Instant` and every `n: Int` where `d.add_days(n)` is in range:
 
 - `Date.parse("{d}") == Ok(d)` and `Instant.parse("{i}") == Ok(i)`
-- `d.to_instant().date() == d`
-- `d.to_instant() <= i` exactly when `d <= i.date()`
+- `d.to_instant()` is `Ok(j)` with `j.date() == d` exactly when `d` is in 1677-09-22 ..= 2262-04-11, and `Err` for every other `d`
+- `i.date().to_instant()` is always `Ok`
+- `d.to_instant() <= i` exactly when `d <= i.date()`, whenever `d.to_instant()` is `Ok`
 - `d.add_days(n).days_since(d) == n`
 
 The laws are on values. Text with an offset other than `Z`, a space separator or a fraction with trailing zeros does not round-trip as text: `Instant.parse("2026-02-14 12:00:00+01:00")` gives the instant whose `Display` is `2026-02-14T11:00:00Z`.
@@ -1298,6 +1311,29 @@ fn report(launch: Date) ! Time.Read, IO.Print {
 
 Cut the stamp with `substring`, not `split(" ")`: a space separator splits the stamp in two.
 
+**Dates and instants.** To compare a `Date` with an `Instant`, compare on the `Date` side: `instant.date()` has a result for every `Instant`, so the comparison never fails, whatever `Date` it meets. Use `to_instant` only when the program needs a point in time.
+
+```blink
+import std.time.{Instant, Date}
+
+// 9999-12-31 is a common "valid until" value for a record with no end
+fn active_at(valid_until: Str, at: Instant) -> Result[Bool, ConversionError] {
+    let until = Date.parse(valid_until)?
+    Ok(at.date() <= until)
+}
+
+fn expiry_instant(valid_until: Str) -> Result[Instant, ConversionError] {
+    Date.parse(valid_until)?.to_instant()
+}
+
+// active_at("9999-12-31", now)     ->  Ok(true)
+// expiry_instant("2027-01-01")    ->  Ok(2027-01-01T00:00:00Z)
+// expiry_instant("9999-12-31")
+//   ->  Err: "invalid timestamp: 9999-12-31T00:00:00Z outside 1677-09-22T00:00:00Z..2262-04-11T23:47:16.854775807Z"
+```
+
+`Date.parse("9999-12-31")` is `Ok`, because the `Date` range allows it. Only the step to an `Instant` fails.
+
 **Out of v1.** Each item below needs its own panel decision.
 
 - Time zones and zone names. `Instant` is UTC; an offset in parsed text is applied and then dropped.
@@ -1306,7 +1342,7 @@ Cut the stamp with `substring`, not `split(" ")`: a space separator splits the s
 - `today()`. Write `time.read().date()`, which shows the `Time.Read` effect at the call.
 - `day_of_year`.
 - Leap seconds. A second of `60` is a field error.
-- `and_time` or `at` to join a `Date` and a time of day. Write `d.to_instant().add(...)`.
+- `and_time` or `at` to join a `Date` and a time of day. Write `d.to_instant()?.add(...)`, or handle the `Err`.
 
 **Duration** is a typed time span. Named constructors enforce units at construction — no ambiguity between seconds and milliseconds.
 
@@ -1341,7 +1377,11 @@ Duration's `Display` writes the same text as Go's `time.Duration.String`. A dura
 
 **Why Date and no DateTime.** An `Instant` is already a point in UTC, so a UTC `DateTime` would hold the same value under a second name, and each signature would have to choose one. `Instant` gets the time-of-day accessors, and `Date` is the one new value: a calendar day with no time. A zone-aware type needs time-zone data and its own panel; v1 has no zone support and reserves no name for it. (Panel vote: 6-0.)
 
-**Why the std.time range starts at 1677-09-22.** An `Int64` count of nanoseconds reaches back to 1677-09-21T00:12:43.145224192Z, part way through a day. If the range started there, `instant.date()` could give 1677-09-21, and `Date.to_instant()` on that date would have no midnight to return. Starting the range at the next whole day keeps both conversions total. The cost is one range check in `Instant.add` and `Instant.from_epoch_secs`, which panic on overflow anyway. (Panel vote: 5-1; Web/Scripting dissented, to keep the full `Int64` domain for `Instant` and reject only in the parsers.)
+**Why the std.time range starts at 1677-09-22.** An `Int64` count of nanoseconds reaches back to 1677-09-21T00:12:43.145224192Z, part way through a day. If the `Instant` range started there, `instant.date()` could give 1677-09-21, and that date would have no midnight in the range. Starting the `Instant` range at the next whole day keeps `instant.date()` total and gives every `Date` that is in the `Instant` range a midnight. The cost is one range check in `Instant.add` and `Instant.from_epoch_secs`, which panic on overflow anyway. (Panel vote: 5-1; Web/Scripting dissented, to keep the full `Int64` domain for `Instant` and reject only in the parsers.)
+
+**Why Date has its own range, 0001-01-01 to 9999-12-31.** A `Date` is a day count. It needs no nanoseconds, so the `Int64` limit of `Instant` has no cause in `Date`. Real data holds dates outside 1677..2262: the open-ended value 9999-12-31 in contracts and SQL tables, and birth dates before 1677. Python `date`, SQL `DATE` and .NET `DateOnly` all cover 0001..9999, so data from those systems fits a `Date` in both directions. The range stops at 9999 because `Date.parse` reads a 4-digit year and `Display` writes one, so `Date.parse("{d}") == Ok(d)` holds for every `Date` with no new syntax. It starts at 0001, not 0000, so that Blink never writes a date that those systems reject. Every `Instant` still has a `Date`, so `instant.date()` stays total. (Panel vote: 6-0 after a second round; the first round was 4-2. This reopens the Date half of the 5-1 vote above.)
+
+**Why `to_instant` returns a `Result`.** A `Date` outside the `Instant` range has no `Instant` at its midnight. The panic rule is: a panic means arithmetic left the type's own range (`add_days`, `Instant.add`). An `Err` means a valid value has no image in the other type (`to_instant`, as `Date.parse` and `Date.from_ymd` return `Err` for text that names no `Date`). The failing input of `to_instant` is a valid `Date`, often read from data, so a panic would give a program that passes every test with recent dates and stops on the first 9999-12-31 row. The type shows the failure, and the compiler finds each call. Rust's chrono met the same limit: `timestamp_nanos()` panicked outside the `Int64` nanosecond range and was replaced by `timestamp_nanos_opt()`. (Panel vote: 6-0.)
 
 **Why Monday is 0.** `Weekday` is a fieldless enum, and §3.4 gives the first variant the tag 0. Monday is first, as in ISO 8601. A second numbering method would give two numbers for one day; the ISO number is `to_int() + 1`. (Panel vote: 6-0.)
 

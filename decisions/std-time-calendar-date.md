@@ -28,6 +28,8 @@ Two notes for readers of the record:
 | EQ1 Instant-side lower edge | E1c: one std.time range from 1677-09-22T00:00:00Z; every Instant constructor checks it | 5-1 (Web/Scripting dissents for E1b) |
 | EQ2 Range-error text | R1: names the range, no byte offset | 6-0 (PLT moved from offset 0) |
 
+EQ1 is reopened for `Date` only: the Date range is now 0001-01-01 ..= 9999-12-31 and `Date.to_instant()` returns a `Result`. See [std-time-date-range.md](std-time-date-range.md). The `Instant` half of EQ1 stands.
+
 **Dissent (EQ1, Web/Scripting, from the edge debate):** "it changes the closed `Instant` contract (Int64 nanos, an approved earlier decision) and adds a range check on every `Instant.add` to guard a day no one reads."
 
 #### Phase A — Independent proposals
