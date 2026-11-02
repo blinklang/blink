@@ -1,21 +1,41 @@
 // An event names a module by the name the program imports it by, so a fn of `src/a/b.bl` is in
-// module `a.b` and its frame is `a.b.twice` (§8.15.8). `module:a.b` matches that whole name, and
-// `fn:b.twice` matches its last dot segments (§8.15.5).
+// module `a.b` and its frame is `a.b.twice` (§8.15.8). A method of that file is in the same
+// module, as `a.b.P.sz`. Files that share a name through `@module("c")` are one module `c`.
+// `module:a.b` matches that whole name, and `fn:b.twice` matches its last dot segments (§8.15.5).
 
 import compile_test_helpers
 import std.json.{json_clear, json_parse, json_get, json_as_str, json_as_int}
 
-let NESTED = #"pub fn twice(n: Int) -> Int { n + n }
+let NESTED = #"pub type P { x: Int }
+pub trait Sz { fn sz(self) -> Int }
+impl Sz for P {
+    fn sz(self) -> Int {
+        let mut y = self.x
+        y = y + 1
+        y
+    }
+}
+pub fn twice(n: Int) -> Int { n + n }
 "#
 
-let MAIN = #"import a.b
+let SHARED_D = #"@module("c")
+pub fn d1(n: Int) -> Int { n + 1 }
+"#
+
+let SHARED_E = #"@module("c")
+pub fn e1(n: Int) -> Int { n + 2 }
+"#
+
+let MAIN = #"import a.b.{twice, P, Sz}
+import c.d
+import c.e
 
 fn main() {
-    io.println("{b.twice(3)}")
+    io.println("{twice(3)} {P { x: 4 }.sz()} {c.d1(1)} {c.e1(1)}")
 }
 "#
 
-// Each enter and exit event as `event fn module depth`.
+// Each enter, exit and state event as `event fn module depth`.
 fn lines_of(err_out: Str) -> List[Str] {
     let mut out: List[Str] = []
     for line in err_out.split("\n") {
@@ -24,7 +44,7 @@ fn lines_of(err_out: Str) -> List[Str] {
         let obj = json_parse(line)
         assert(obj >= 0)
         let event = json_as_str(json_get(obj, "event"))
-        if event != "enter" && event != "exit" { continue }
+        if event != "enter" && event != "exit" && event != "state" { continue }
         out.push("{event} {json_as_str(json_get(obj, "fn"))} {json_as_str(json_get(obj, "module"))} {json_as_int(json_get(obj, "depth"))}")
     }
     out
@@ -32,24 +52,30 @@ fn lines_of(err_out: Str) -> List[Str] {
 
 fn traced(dir: Str, filter: Str) -> Str ! Process.Spawn {
     let r = process.run("sh", ["-c", "cd {dir} && BLINK_TRACE={filter} ./main_bin"]).unwrap()
-    assert_eq(r.out, "6\n")
+    assert_eq(r.out, "6 5 2 3\n")
     assert(r.success())
     lines_of(r.err_out).join("\n")
 }
 
-test "a fn of a nested module is traced under the dotted module name" {
+test "a fn and a method of a nested module are traced under the module name" {
     let blink_root = compile_test_helpers.sh("pwd -P")
     let dir = "{compile_test_helpers.scratch_root()}/trace_nested_module"
-    compile_test_helpers.sh("rm -rf {dir} && mkdir -p {dir}/src/a")
+    compile_test_helpers.sh("rm -rf {dir} && mkdir -p {dir}/src/a {dir}/src/c")
     fs.write("{dir}/blink.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\n").unwrap()
     fs.write("{dir}/src/a/b.bl", NESTED).unwrap()
+    fs.write("{dir}/src/c/d.bl", SHARED_D).unwrap()
+    fs.write("{dir}/src/c/e.bl", SHARED_E).unwrap()
     fs.write("{dir}/src/main.bl", MAIN).unwrap()
     let b = process.run("sh", ["-c", "cd {dir} && {blink_root}/build/blink build --trace src/main.bl -o main_bin 2>&1"]).unwrap()
     assert_eq("{b.success()} {b.out}", "true {b.out}")
     let twice = "enter a.b.twice a.b 1\nexit a.b.twice a.b 1"
-    assert_eq(traced(dir, "all"), "enter main.main main 0\n{twice}\nexit main.main main 0")
-    assert_eq(traced(dir, "module:a.b"), twice)
+    let sz = "enter a.b.P.sz a.b 1\nstate a.b.P.sz a.b 1\nexit a.b.P.sz a.b 1"
+    let shared = "enter c.d1 c 1\nexit c.d1 c 1\nenter c.e1 c 1\nexit c.e1 c 1"
+    assert_eq(traced(dir, "all"), "enter main.main main 0\n{twice}\n{sz}\n{shared}\nexit main.main main 0")
+    assert_eq(traced(dir, "module:a.b"), "{twice}\n{sz}")
     assert_eq(traced(dir, "fn:b.twice"), twice)
+    assert_eq(traced(dir, "fn:b.P.sz"), sz)
+    assert_eq(traced(dir, "module:c"), shared)
     assert_eq(traced(dir, "module:a_b"), "")
     compile_test_helpers.sh("rm -rf {dir}")
 }
