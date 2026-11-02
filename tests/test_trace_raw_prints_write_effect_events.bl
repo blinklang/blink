@@ -1,0 +1,58 @@
+// `io.print_raw` and `io.eprint_raw` are operations, so each call writes an `effect` event
+// whose `args` key is the declared parameter `s` (§8.15.10). Under the default handler the
+// call is one dispatch. A handler of `IO.Print` with no `print_raw` sends the call to the
+// default body, which calls `print_no_nl`: a second dispatch with a second event.
+
+import compile_test_helpers
+import std.json.{json_clear, json_parse, json_get, json_as_str, json_obj_child_at, json_key_at}
+
+let DEFAULT_SRC = #"fn main() ! IO {
+    io.print_raw("c")
+    io.eprint_raw("d")
+}
+"#
+
+let HANDLED_SRC = #"fn main() ! IO {
+    with handler IO.Print {
+        fn print_no_nl(_msg: Str) { }
+    } {
+        io.print_raw("c")
+    }
+}
+"#
+
+// Each effect event as `effect op key=value`, one per line.
+fn effects(text: Str) -> Str {
+    let mut lines: List[Str] = []
+    for line in text.split("\n") {
+        if !line.starts_with("\{") { continue }
+        json_clear()
+        let obj = json_parse(line)
+        assert(obj >= 0)
+        if json_as_str(json_get(obj, "event")) != "effect" { continue }
+        let args = json_get(obj, "args")
+        let arg = "{json_key_at(args, 0)}={json_as_str(json_obj_child_at(args, 0))}"
+        lines.push("{json_as_str(json_get(obj, "effect"))} {json_as_str(json_get(obj, "op"))} {arg}")
+    }
+    lines.join("\n")
+}
+
+test "a raw print under the default handler writes one effect event" {
+    let bin = compile_test_helpers.build_bin(DEFAULT_SRC, "trace_raw_default", ["--trace"])
+    let r = process.run("env", ["BLINK_TRACE=all", bin]).unwrap()
+    assert_eq(r.out, "c")
+    assert(r.success())
+    assert_eq(effects(r.err_out), "IO.Print io.print_raw s=c\nIO.Eprint io.eprint_raw s=d")
+    compile_test_helpers.clean_bin("trace_raw_default")
+}
+
+test.failing(
+    "the default body of print_raw is a second dispatch with its own effect event",
+    reason: "io.print_raw goes to the default writer, not to the handler in force",
+) {
+    let bin = compile_test_helpers.build_bin(HANDLED_SRC, "trace_raw_handled", ["--trace"])
+    let r = process.run("env", ["BLINK_TRACE=all", bin]).unwrap()
+    compile_test_helpers.clean_bin("trace_raw_handled")
+    assert_eq(r.out, "")
+    assert_eq(effects(r.err_out), "IO.Print io.print_raw s=c\nIO.Print io.print msg=c")
+}

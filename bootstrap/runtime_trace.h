@@ -898,6 +898,97 @@ BLINK_RT_FN void blink_trace_state_emit(const char* fn, const char* module, cons
 }
 #endif
 
+/* Whether the tracer runs. Std code asks it before each dispatch in a build with or without
+   --trace, so the one cost to a program that is not traced is this read. */
+static inline int blink_trace_live(void) { return __blink_trace.active; }
+
+/* Whether `value` names the effect `path`, or a parent of it, by whole dot segments. */
+BLINK_RT_FN int blink_trace_path_has(const char* path, const char* value);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN int blink_trace_path_has(const char* path, const char* value) {
+    size_t v = strlen(value);
+    if (v == 0 || strncmp(path, value, v) != 0) return 0;
+    return path[v] == '\0' || path[v] == '.';
+}
+#endif
+
+/* Whether an `effect:` value selects the effect `path` of `module` (§8.15.5). The value can
+   name the module first, but the module alone selects nothing. A built-in effect has the
+   module "". */
+BLINK_RT_FN int blink_trace_effect_selected(const char* module, const char* path, const char* value);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN int blink_trace_effect_selected(const char* module, const char* path, const char* value) {
+    if (blink_trace_path_has(path, value)) return 1;
+    size_t m = strlen(module);
+    return m > 0 && strncmp(value, module, m) == 0 && value[m] == '.'
+        && blink_trace_path_has(path, value + m + 1);
+}
+#endif
+
+/* Whether the effect event of one dispatch prints. The event goes to the innermost traced
+   call of this thread (§8.15.10), so a dispatch with no traced call on the stack writes none. */
+BLINK_RT_FN int blink_trace_on_effect(const char* module, const char* path);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN int blink_trace_on_effect(const char* module, const char* path) {
+    if (!__blink_trace.active || !__blink_trace.event_effect || __blink_trace_mute_count > 0) return 0;
+    int64_t depth = __blink_trace_frame_top - 1;
+    if (depth < 0 || depth >= __blink_trace_frame_cap) return 0;
+    blink_trace_frame* f = &__blink_trace_frames[depth];
+    if (!f->fn || !blink_trace_match(f->fn, f->module, (int)depth)) return 0;
+    for (int i = 0; i < __blink_trace.filter_count; i++) {
+        blink_trace_filter* flt = &__blink_trace.filters[i];
+        if (strcmp(flt->key, "state") == 0) return 0;
+        if (strcmp(flt->key, "effect") != 0) continue;
+        int matched = 0;
+        for (int j = 0; j < flt->count; j++) {
+            if (blink_trace_effect_selected(module, path, flt->values[j])) { matched = 1; break; }
+        }
+        if (!matched) return 0;
+    }
+    return 1;
+}
+#endif
+
+/* The effect event, after its gate. The variadic part is n pairs of (name, value) C strings,
+   one for each parameter of the operation. */
+BLINK_RT_FN void blink_trace_effect_emit(const char* module, const char* path, const char* op,
+    int64_t n, ...);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void blink_trace_effect_emit(const char* module, const char* path, const char* op,
+    int64_t n, ...) {
+    int64_t depth = blink_trace_frame_depth();
+    blink_trace_frame* f = &__blink_trace_frames[depth];
+    blink_trace_write_guard g;
+    if (!blink_trace_write_begin(&g)) return;
+    blink_trace_put_head("effect", f->fn, f->module, depth);
+    fputs(",\"effect\":\"", stderr);
+    if (*module) {
+        blink_trace_put_json(stderr, module, -1);
+        fputs(".", stderr);
+    }
+    blink_trace_put_json(stderr, path, -1);
+    fputs("\",\"op\":\"", stderr);
+    blink_trace_put_json(stderr, op, -1);
+    fputs("\"", stderr);
+    int truncated = 0;
+    va_list ap;
+    va_start(ap, n);
+    for (int64_t i = 0; i < n; i++) {
+        const char* name = va_arg(ap, const char*);
+        const char* value = va_arg(ap, const char*);
+        fputs(i == 0 ? ",\"args\":{\"" : ",\"", stderr);
+        blink_trace_put_json(stderr, name, -1);
+        fputs("\":\"", stderr);
+        truncated |= blink_trace_put_json(stderr, value, BLINK_TRACE_MAX_VALUE_LEN);
+        fputs("\"", stderr);
+    }
+    va_end(ap);
+    if (n > 0) fputs("}", stderr);
+    blink_trace_put_tail(truncated);
+    blink_trace_write_end(&g);
+}
+#endif
+
 /* Keeps the return text of the innermost traced call, after its exit gate, for the exit
    event. The caller's text may be gone by the time the call is popped, so this copies it. A
    NULL value is the exit of a function with no result. */

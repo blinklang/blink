@@ -31,21 +31,22 @@
 import std.path.{path_stem}
 import ast.{NodeKind}
 import parser.{impl_provided_by_closeable, node_col, node_elements, node_kind, node_line, node_methods, node_module, node_name, node_params, sublist_get, sublist_length}
-import typecheck.{TyKind, TYPE_BOOL, TYPE_INT, TYPE_STR, TYPE_VOID, builtin_effect_op_sub, builtin_op_sub_effect, io_op_sub_effect, tc_get_dotted_module_path, tc_handler_effect_root, tc_module_in_std, tc_tid_kind, tc_type_str}
+import typecheck.{TyKind, TYPE_BOOL, TYPE_INT, TYPE_STR, TYPE_VOID, builtin_effect_op_call, builtin_effect_op_params, builtin_effect_op_sub, tc_get_dotted_module_path, tc_handler_effect_root, tc_module_in_std, tc_tid_kind, tc_type_str}
 import layout.{LayoutRecord, Position, layout_of, tid_of_node}
 import cname.{c_local_name, c_mint_local, c_runtime_helper, c_str_const}
-import ir.{ir_block, ir_call_runtime, ir_col, ir_const, ir_expr_stmt, ir_if, ir_let, ir_line_text, ir_trace_frame, ir_var_ref}
-import diagnostics.{Diag, diag_file_for_node}
-import cg_reg.{cg_reg_effect_root_decl, cg_reg_impl_of}
+import ir.{ir_block, ir_call_runtime, ir_col, ir_const, ir_expr_stmt, ir_if, ir_let, ir_line_text, ir_tid, ir_trace_frame, ir_var_ref}
+import diagnostics.{Diag, UNSOLVED_TYPEVAR_AT_CODEGEN, diag_file_for_node, diag_ice_at}
+import cg_reg.{cg_reg_builtin_op_decl, cg_reg_effect_root_decl, cg_reg_impl_of}
 import cg_call.{cg_call_has_debug, lower_debug_of_value}
 import cg_derive.{cg_derive_container_debug_renders, cg_derive_container_debug_text}
-import cg_expr.{cg_expr_can_display, cg_expr_display_text, cg_expr_pending_count, cg_expr_take_pending, x_layout_checked, x_stopped}
+import cg_expr.{cg_expr_can_display, cg_expr_display_text, cg_expr_hold_for_reread, cg_expr_pending_count, cg_expr_push_pending, cg_expr_take_pending, x_layout_checked, x_stopped}
 
 // on: the unit is built with --trace. armed: the declaration the driver will lower next, or
 // -1, and armed_effect the effect that declares it when it is the default body of an
 // operation. traced: the body being lowered is traced, and fn_name and module name its events.
 // mut_self_call: the last method call of the body built against a `mut self` declaration,
-// which the dispatch finds deep down and the state event of the call reads after it.
+// which the dispatch finds deep down and the state event of the call reads after it. in_std:
+// the body being lowered is std code, whose dispatches write effect events in any build.
 type TraceUnit {
     on: Bool = false
     armed: Int = -1
@@ -54,6 +55,7 @@ type TraceUnit {
     fn_name: Str = ""
     module: Str = ""
     mut_self_call: Int = -1
+    in_std: Bool = false
 }
 
 let mut tr_unit = TraceUnit {}
@@ -62,33 +64,35 @@ pub fn cg_trace_set(on: Bool) { tr_unit = TraceUnit { on: on } }
 
 pub fn cg_trace_on() -> Bool { tr_unit.on }
 
-// The driver arms each fn and each impl method before it lowers the body. A test block and a
-// derived operation are never armed.
+// The driver arms each fn and each impl method before it lowers the body, also in a build
+// without --trace, as the arm says whether the body is std code. A test block and a derived
+// operation are never armed.
 pub fn cg_trace_arm(decl: Int) {
-    if !tr_unit.on || node_kind(decl) != NodeKind.FnDef { return }
-    tr_unit = TraceUnit { on: true, armed: decl }
+    if node_kind(decl) != NodeKind.FnDef { return }
+    tr_unit = TraceUnit { on: tr_unit.on, armed: decl }
 }
 
 // The default body of an operation of `effect_decl` is armed with its effect, which names it.
 pub fn cg_trace_arm_default(op: Int, effect_decl: Int) {
-    if !tr_unit.on { return }
-    tr_unit = TraceUnit { on: true, armed: op, armed_effect: effect_decl }
+    tr_unit = TraceUnit { on: tr_unit.on, armed: op, armed_effect: effect_decl }
 }
 
 // Takes the arm when it names this body, and answers the statements that open the body:
 // the push, and the enter event when it prints. None when the body is not traced.
 pub fn cg_trace_body_enter(fn_node: Int) -> List[Int] ! Diag.Report {
     let armed = tr_unit.armed == fn_node
-    let effect_decl = tr_unit.armed_effect
-    tr_unit = TraceUnit { on: tr_unit.on }
-    if !armed { return [] }
+    let effect_decl = if armed { tr_unit.armed_effect } else { -1 }
+    // A default body belongs to the module of its effect, the decl that names it.
+    let owner = if effect_decl < 0 { fn_node } else { effect_decl }
+    let in_std = tc_module_in_std(tr_module_key(owner))
+    tr_unit = TraceUnit { on: tr_unit.on, in_std: in_std }
+    if !armed || !tr_unit.on || in_std { return [] }
     if effect_decl >= 0 {
-        if tc_module_in_std(tr_module_key(effect_decl)) { return [] }
         let module = tr_module_name(effect_decl)
         let path = tr_effect_path(node_name(effect_decl), node_name(fn_node))
         return tr_enter(fn_node, fn_node, "{module}.{path}.{node_name(fn_node)}", module, tr_param_tids(fn_node))
     }
-    if tc_module_in_std(tr_module_key(fn_node)) || tr_compiler_written(fn_node) { return [] }
+    if tr_compiler_written(fn_node) { return [] }
     let module = tr_module_name(fn_node)
     tr_enter(fn_node, fn_node, tr_frame_name(fn_node, module), module, tr_param_tids(fn_node))
 }
@@ -112,12 +116,15 @@ pub fn cg_trace_handler_frame(node: Int, eff: Str, op: Str) -> Str {
 // written in it shares.
 pub fn cg_trace_frame_module() -> Str { tr_unit.module }
 
+// Whether the body being lowered is std code, as a closure or a handler body written in it is.
+pub fn cg_trace_in_std() -> Bool { tr_unit.in_std }
+
 // The statements that open the body of a closure or a handler operation that is the frame
 // `fn_name`: the push, and the enter event when it prints. `sig` holds the parameters, whose
 // types are `tids`, and `at` is the keyword the enter event names in its span. None when
-// fn_name is "".
-pub fn cg_trace_thunk_enter(sig: Int, at: Int, fn_name: Str, module: Str, tids: List[Int]) -> List[Int] ! Diag.Report {
-    tr_unit = TraceUnit { on: tr_unit.on }
+// fn_name is "". in_std: the thunk is written in std code.
+pub fn cg_trace_thunk_enter(sig: Int, at: Int, fn_name: Str, module: Str, tids: List[Int], in_std: Bool) -> List[Int] ! Diag.Report {
+    tr_unit = TraceUnit { on: tr_unit.on, in_std: in_std }
     if fn_name.is_empty() { return [] }
     tr_enter(sig, at, fn_name, module, tids)
 }
@@ -308,6 +315,82 @@ fn tr_effect_path(eff: Str, op: Str) -> Str {
     }
     let sub = builtin_effect_op_sub(root, op)
     if sub == "" { root } else { "{root}.{sub}" }
+}
+
+// ── Effect events ──────────────────────────────────────────────────────────
+
+// The effect event of one dispatch (§8.15.10). Its statements go in front of the statement
+// that holds the dispatch, so the event comes before a handler body enters, and each argument
+// runs once, in front of them, for the event and the dispatch to read. `decl` is the
+// declaration of a user effect, or -1 for a built-in one, `path` is the effect that declares
+// the operation and `call` is the call as the program writes it. `names` are the declared
+// parameter names, one for each of `lowered`. Answers the arguments for the dispatch.
+//
+// A traced body has the event. So has std code in any build, as its dispatch is credited to
+// the traced frame that called into std; there the event waits on one read of whether the
+// tracer runs.
+pub fn cg_trace_effect(node: Int, decl: Int, path: Str, call: Str, names: List[Str], lowered: List[Int]) -> List[Int] ! Diag.Report {
+    if !tr_unit.traced && !tr_unit.in_std { return lowered }
+    if names.len() != lowered.len() {
+        diag_ice_at("TracedEffectArgsUnnamed", UNSOLVED_TYPEVAR_AT_CODEGEN,
+            "`{call}` passes {lowered.len()} argument(s) where its operation declares {names.len()}", node,
+            "typecheck holds a dispatch to the parameters of its operation; this is a compiler bug")
+        return lowered
+    }
+    let module = if decl >= 0 { tr_module_name(decl) } else { "" }
+    let mut args = [tr_text(node, module), tr_text(node, path), tr_text(node, call), tr_int(node, "{names.len()}")]
+    let mut out: List[Int] = []
+    let render: List[Int] = []
+    let mut renders = true
+    let mut i = 0
+    while i < lowered.len() {
+        let v = lowered.get(i).unwrap()
+        let held = cg_expr_hold_for_reread(v)
+        out.push(held.get(0).unwrap())
+        let read = held.get(1).unwrap()
+        let text = if read < 0 { tr_text(node, "()") } else { tr_value(node, ir_tid(read), read, render) }
+        if text < 0 { renders = false }
+        args.push(tr_text(node, names.get(i).unwrap()))
+        args.push(text)
+        i = i + 1
+    }
+    if !renders { return out }
+    let mut event = tr_muted(node, render)
+    event.push(tr_call(node, TYPE_VOID, "trace_effect_emit", args))
+    let gate = tr_call_value(node, TYPE_BOOL, "trace_on_effect", [tr_text(node, module), tr_text(node, path)])
+    let mut stmt = ir_if(node, gate, ir_block(node, event), -1)
+    if !tr_unit.traced {
+        stmt = ir_if(node, tr_call_value(node, TYPE_BOOL, "trace_live", []), ir_block(node, [stmt]), -1)
+    }
+    cg_expr_push_pending(node, stmt)
+    out
+}
+
+// The effect that declares operation `op` of the user effect `eff`, as its effect event
+// names it.
+pub fn cg_trace_effect_path(eff: Str, op: Str) -> Str { tr_effect_path(eff, op) }
+
+// The effect event of a dispatch of operation `op` of the built-in effect `root`.
+pub fn cg_trace_builtin_effect(node: Int, root: Str, op: Str, lowered: List[Int]) -> List[Int] ! Diag.Report {
+    if !tr_unit.traced && !tr_unit.in_std { return lowered }
+    let sub = builtin_effect_op_sub(root, op)
+    let path = if sub == "" { root } else { "{root}.{sub}" }
+    let names = builtin_effect_op_params(root, op) ?? tr_builtin_op_params(root, op)
+    cg_trace_effect(node, -1, path, builtin_effect_op_call(root, op), names, lowered)
+}
+
+// The parameter names of the std declaration of a built-in operation.
+fn tr_builtin_op_params(root: Str, op: Str) -> List[Str] {
+    let decl = cg_reg_builtin_op_decl(root, op)
+    let mut names: List[Str] = []
+    let params = if decl < 0 { -1 } else { node_params(decl) }
+    let n = if params == -1 { 0 } else { sublist_length(params) }
+    let mut i = 0
+    while i < n {
+        names.push(node_name(sublist_get(params, i)))
+        i = i + 1
+    }
+    names
 }
 
 fn tr_local(tid: Int, node: Int) -> LayoutRecord ! Diag.Report {

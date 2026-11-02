@@ -43,7 +43,7 @@ import cg_print.{
 }
 import cg_reg.{cg_reg_effect_root_decl, cg_reg_impl_decls, cg_reg_io_derived_decl}
 import cg_promote.{cg_promote_capture_table}
-import cg_trace.{cg_trace_closure_frame, cg_trace_frame_module, cg_trace_handler_frame, cg_trace_thunk_enter}
+import cg_trace.{cg_trace_builtin_effect, cg_trace_closure_frame, cg_trace_effect, cg_trace_effect_path, cg_trace_frame_module, cg_trace_handler_frame, cg_trace_in_std, cg_trace_thunk_enter}
 import free_names.{closure_read_names}
 import cg_decl.{cg_decl_takes_ev}
 import cg_expr.{
@@ -357,6 +357,7 @@ type PendingThunk {
     trace_name: Str = ""
     trace_module: Str = ""
     trace_at: Int = -1
+    trace_in_std: Bool = false
 }
 
 let mut eff_thunks: List[PendingThunk] = []
@@ -461,6 +462,7 @@ fn lower_closure_thunk(node: Int, task_symbol: Str) -> Int ! Diag.Report {
         cap_celled: celled, handler_tid: -1, outer_name: "", task_symbol: task_symbol,
         forward_to: -1, forward_symbol: "", forward_ev: false, lowered: false, body: -1,
         trace_name: cg_trace_closure_frame(node), trace_module: cg_trace_frame_module(), trace_at: node,
+        trace_in_std: cg_trace_in_std(),
     })
     ir_closure_new(tid, node, rec.c_spelling, symbol, descs, "", words)
 }
@@ -673,7 +675,7 @@ pub fn cg_eff_lower_handler_expr(node: Int) -> Int ! Diag.Report {
             cap_celled: b.celled, handler_tid: tid, outer_name: outer, task_symbol: "", forward_to: -1,
             forward_symbol: "", forward_ev: false, lowered: false, body: -1,
             trace_name: cg_trace_handler_frame(node, tc_tid_handler_effect(tid), node_name(sig.op)),
-            trace_module: cg_trace_frame_module(), trace_at: node,
+            trace_module: cg_trace_frame_module(), trace_at: node, trace_in_std: cg_trace_in_std(),
         })
         print_vtable_slot_fn_decl(sig.ret, b.symbol, sig.params)
         words.push(ir_closure_new(sig.fn_tid, sig.op, sig.closure_spelling, b.symbol, b.descs, "", b.kids))
@@ -1030,7 +1032,7 @@ pub fn cg_eff_thunk_trace_enter(i: Int) -> List[Int] ! Diag.Report {
         tids.push(if th.handler_tid >= 0 { tid_of_node(sublist_get(ps, k)) } else { child_tid(th.fn_tid, Slot.Param(k)) })
         k = k + 1
     }
-    cg_trace_thunk_enter(sig, th.trace_at, th.trace_name, th.trace_module, tids)
+    cg_trace_thunk_enter(sig, th.trace_at, th.trace_name, th.trace_module, tids, th.trace_in_std)
 }
 
 // The node whose parameters the thunk takes: the forwarded-to function's for a function
@@ -1748,9 +1750,11 @@ pub fn cg_eff_lower_builtin_perform(node: Int, ns: Str, method: Str) -> Int ! Di
     match args {
         None => -1
         Some(lowered) => {
+            let root = if ns == NS_IO { "IO" } else { "Env" }
+            let traced = cg_trace_builtin_effect(node, root, if ns == NS_IO { slot } else { method }, lowered)
             let read = slot_read(node, handler_tid)
             if read < 0 { return -1 }
-            let perform = ir_effect_perform(tid, node, rec.c_spelling, slot, rec.slot_form, read, lowered)
+            let perform = ir_effect_perform(tid, node, rec.c_spelling, slot, rec.slot_form, read, traced)
             if wraps { return cg_eff_wrap_nullable_text(node, call_tid, perform) }
             perform
         }
@@ -1811,12 +1815,13 @@ fn perform_lowered(node: Int, handler_tid: Int, op: Str, lowered: List[Int]) -> 
     if tid < 0 { return -1 }
     let rec = perform_layout(tid, Position.Local, node)
     if rec.c_spelling == "" { return -1 }
+    let traced = cg_trace_builtin_effect(node, tc_handler_effect_root(tc_tid_handler_effect(handler_tid)), op, lowered)
     let read = slot_read(node, handler_tid)
     if read < 0 { return -1 }
-    if c_ev_field_name(handler_tid) != NS_IO || op != IO_READ_PRIMITIVE || lowered.len() != 1 {
-        return ir_effect_perform(tid, node, rec.c_spelling, slot, rec.slot_form, read, lowered)
+    if c_ev_field_name(handler_tid) != NS_IO || op != IO_READ_PRIMITIVE || traced.len() != 1 {
+        return ir_effect_perform(tid, node, rec.c_spelling, slot, rec.slot_form, read, traced)
     }
-    let count = io_read_checked_count(node, lowered.get(0).unwrap())
+    let count = io_read_checked_count(node, traced.get(0).unwrap())
     if count < 0 { return -1 }
     ir_effect_perform(tid, node, rec.c_spelling, slot, rec.slot_form, read, [count])
 }
@@ -1849,7 +1854,7 @@ pub fn cg_eff_lower_time_perform(node: Int, method: Str) -> Int ! Diag.Report {
         if reading_tid < 0 { return -1 }
         let reading_rec = perform_layout(reading_tid, Position.Local, node)
         if reading_rec.c_spelling == "" { return -1 }
-        return ir_effect_perform(reading_tid, node, reading_rec.c_spelling, slot, reading_rec.slot_form, read, [])
+        return ir_effect_perform(reading_tid, node, reading_rec.c_spelling, slot, reading_rec.slot_form, read, cg_trace_builtin_effect(node, "Time", method, []))
     }
 
     let written = node_args(node)
@@ -1857,7 +1862,7 @@ pub fn cg_eff_lower_time_perform(node: Int, method: Str) -> Int ! Diag.Report {
     if dur_arg < 0 { return -1 }
     let void_rec = perform_layout(tc_void_tid(), Position.Local, node)
     if void_rec.c_spelling == "" { return -1 }
-    ir_effect_perform(tc_void_tid(), node, void_rec.c_spelling, slot, SlotForm.Inline, read, [dur_arg])
+    ir_effect_perform(tc_void_tid(), node, void_rec.c_spelling, slot, SlotForm.Inline, read, cg_trace_builtin_effect(node, "Time", method, [dur_arg]))
 }
 
 // Every io argument rendered to text. The kinds are read before any argument is lowered,
@@ -1940,11 +1945,26 @@ pub fn cg_eff_lower_user_perform(node: Int) -> Int ! Diag.Report {
         None => -1
         Some(lowered) => {
             let htid = make_handler_type(node_name(decl))
+            let path = cg_trace_effect_path(node_name(decl), op)
+            let traced = cg_trace_effect(node, decl, path, "{handle}.{op}", user_op_param_names(tc_call_decl_node(node)), lowered)
             let read = slot_read(node, htid)
             if read < 0 { return -1 }
-            ir_effect_perform(tid, node, rec.c_spelling, c_effect_vtable_slot_name(htid, op), rec.slot_form, read, lowered)
+            ir_effect_perform(tid, node, rec.c_spelling, c_effect_vtable_slot_name(htid, op), rec.slot_form, read, traced)
         }
     }
+}
+
+// The declared parameter names of a user operation, which its effect event keys its args by.
+fn user_op_param_names(op_decl: Int) -> List[Str] {
+    let mut out: List[Str] = []
+    let params = if op_decl < 0 { -1 } else { node_params(op_decl) }
+    let n = if params == -1 { 0 } else { sublist_length(params) }
+    let mut i = 0
+    while i < n {
+        out.push(node_name(sublist_get(params, i)))
+        i = i + 1
+    }
+    out
 }
 
 // ── The evidence argument of an effectful call ─────────────────────────────────

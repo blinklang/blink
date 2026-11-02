@@ -1,0 +1,121 @@
+// A call of an effect operation writes one `effect` event, credited to the innermost traced
+// frame (§8.15.10). `effect` is the effect path, with the module for a user effect, `op` is
+// the call as the program writes it and `args` holds every parameter by its declared name. A
+// default body that calls another operation is a second dispatch with its own event, and the
+// event of a dispatch comes before the handler body enters. An operation that std code calls
+// writes its event too, credited to the user frame that called into std. The `effect:` filter
+// selects an event by whole segments of its effect path (§8.15.5).
+
+import compile_test_helpers
+import std.json.{json_clear, json_parse, json_get, json_as_str, json_as_int, json_len, json_key_at, json_obj_child_at}
+
+let SRC = #"effect Log {
+    effect Out {
+        fn write(s: Str)
+        fn emit(s: Str) { log.write(s) }
+    }
+}
+
+fn run() ! Log.Out {
+    log.emit("a")
+}
+
+fn main() ! IO, FS, Env, Rand {
+    io.println("hi")
+    io.print("x")
+    io.eprintln("e")
+    with handler Log {
+        fn write(s: Str) { io.println(s) }
+    } {
+        run()
+    }
+    let path = env.var("TRACE_OUT") ?? "/dev/null"
+    fs.write(path, "body").unwrap()
+    let n = rand.int(5..=5)
+    io.println("{n}")
+}
+"#
+
+fn str_field(obj: Int, key: Str) -> Str {
+    let n = json_get(obj, key)
+    if n < 0 { "" } else { json_as_str(n) }
+}
+
+// Each enter, exit and effect event as `event fn depth`, and for an effect event also
+// `effect op` and each `name=value` of its args, one event per line.
+fn shape(text: Str) -> Str {
+    let mut lines: List[Str] = []
+    for line in text.split("\n") {
+        if !line.starts_with("\{") { continue }
+        json_clear()
+        let obj = json_parse(line)
+        assert(obj >= 0)
+        let event = str_field(obj, "event")
+        let head = "{event} {str_field(obj, "fn")} {json_as_int(json_get(obj, "depth"))}"
+        if event == "effect" {
+            let mut parts = [head, str_field(obj, "effect"), str_field(obj, "op")]
+            let args = json_get(obj, "args")
+            let mut i = 0
+            while args >= 0 && i < json_len(args) {
+                parts.push("{json_key_at(args, i)}={json_as_str(json_obj_child_at(args, i))}")
+                i = i + 1
+            }
+            lines.push(parts.join(" "))
+        } else if event == "enter" || event == "exit" {
+            lines.push(head)
+        }
+    }
+    lines.join("\n")
+}
+
+fn traced(bin: Str, value: Str) -> Str ! Process.Spawn {
+    let r = process.run("env", ["BLINK_TRACE={value}", bin]).unwrap()
+    assert_eq(r.out, "hi\nxa\n5\n")
+    assert(r.success())
+    shape(r.err_out)
+}
+
+test "each dispatch of an effect operation writes an effect event with the fields of the spec" {
+    let bin = compile_test_helpers.build_bin(SRC, "trace_effects", ["--trace"])
+    let m = "trace_effects"
+    let h = "{m}.main.handler@16:10.Log.Out.write"
+    assert_eq(traced(bin, "all"), [
+        "enter {m}.main 0",
+        "effect {m}.main 0 IO.Print io.println msg=hi",
+        "effect {m}.main 0 IO.Print io.print msg=x",
+        "effect {m}.main 0 IO.Eprint io.eprintln msg=e",
+        "enter {m}.run 1",
+        "effect {m}.run 1 {m}.Log.Out log.emit s=a",
+        "enter {m}.Log.Out.emit 2",
+        "effect {m}.Log.Out.emit 2 {m}.Log.Out log.write s=a",
+        "enter {h} 3",
+        "effect {h} 3 IO.Print io.println msg=a",
+        "exit {h} 3",
+        "exit {m}.Log.Out.emit 2",
+        "exit {m}.run 1",
+        "effect {m}.main 0 Env.Read env.var name=TRACE_OUT",
+        "effect {m}.main 0 FS.Write fs.write path=/dev/null content=body",
+        "effect {m}.main 0 Rand rand.int lo=5 hi=5",
+        "effect {m}.main 0 IO.Print io.println msg=5",
+        "exit {m}.main 0",
+    ].join("\n"))
+    compile_test_helpers.clean_bin("trace_effects")
+}
+
+test "the effect filter selects an event by whole segments of its effect path" {
+    let bin = compile_test_helpers.build_bin(SRC, "trace_effects_filter", ["--trace"])
+    let m = "trace_effects_filter"
+    let log = [
+        "effect {m}.run 1 {m}.Log.Out log.emit s=a",
+        "effect {m}.Log.Out.emit 2 {m}.Log.Out log.write s=a",
+    ].join("\n")
+    assert_eq(traced(bin, "effect:Log,event:effect"), log)
+    assert_eq(traced(bin, "effect:Log.Out,event:effect"), log)
+    assert_eq(traced(bin, "effect:{m}.Log,event:effect"), log)
+    assert_eq(traced(bin, "effect:{m},event:effect"), "")
+    assert_eq(traced(bin, "effect:Lo,event:effect"), "")
+    assert_eq(traced(bin, "effect:FS,event:effect"), "effect {m}.main 0 FS.Write fs.write path=/dev/null content=body")
+    assert_eq(traced(bin, "effect:IO.Eprint,event:effect"), "effect {m}.main 0 IO.Eprint io.eprintln msg=e")
+    assert_eq(traced(bin, "state:n,event:effect"), "")
+    compile_test_helpers.clean_bin("trace_effects_filter")
+}
