@@ -1,0 +1,114 @@
+// A call of a mutating method on a `let mut` binding, or on a part of it, writes one `state`
+// event whose `op` is the name of the method, and a write to a field of a binding writes one
+// `assign` event (§8.15.11). `var` is the root binding and `value` is the whole binding after
+// the change. A mutating method is one with a `mut self` receiver, so a user method counts
+// too, and its event comes after the method exits. A call that changes nothing still writes
+// its event. A mutating call in an argument writes its event before the call it is an
+// argument of. The first `let mut` of a value, a call that does not mutate and a write
+// through a parameter write no event.
+
+import compile_test_helpers
+import std.json.{json_clear, json_parse, json_get, json_as_str}
+
+let SRC = #"@derive(Debug)
+type Point { x: Int, y: Int }
+
+@derive(Debug)
+type Bag { items: List[Int], at: Point }
+
+trait Grow {
+    fn add(mut self, x: Int)
+    fn take(mut self) -> Int
+}
+
+impl Grow for Bag {
+    fn add(mut self, x: Int) {
+        self.items.push(x)
+    }
+    fn take(mut self) -> Int {
+        self.items.pop() ?? 0
+    }
+}
+
+let mut seen: List[Int] = []
+
+fn show(v: Option[Int]) -> Int {
+    v ?? 0
+}
+
+fn main() ! IO {
+    let mut xs = [3, 1, 2]
+    xs.push(4)
+    xs.set(0, 9)
+    let mut p = Point { x: 0, y: 0 }
+    p.x = 1
+    let mut b = Bag { items: [], at: Point { x: 0, y: 0 } }
+    b.add(5)
+    b.items.push(6)
+    b.at.y += 2
+    let mut empty: List[Int] = []
+    let got = empty.pop()
+    let shown = show(xs.pop())
+    seen.push(xs.len())
+    let mut c = Bag { items: [7], at: Point { x: 0, y: 0 } }
+    b.add(c.take())
+    io.println("{got ?? 0} {shown} {p.x} {b.items.len()} {seen.len()}")
+}
+"#
+
+fn str_field(obj: Int, key: Str) -> Str {
+    let n = json_get(obj, key)
+    if n < 0 { "" } else { json_as_str(n) }
+}
+
+// Each enter, exit and state event, one per line: `event fn`, and for a state event also
+// `var op value`.
+fn shape(text: Str) -> Str {
+    let mut lines: List[Str] = []
+    for line in text.split("\n") {
+        if !line.starts_with("\{") { continue }
+        json_clear()
+        let obj = json_parse(line)
+        assert(obj >= 0)
+        let event = str_field(obj, "event")
+        let head = "{event} {str_field(obj, "fn")}"
+        if event == "state" {
+            lines.push("{head} {str_field(obj, "var")} {str_field(obj, "op")} {str_field(obj, "value")}")
+        } else if event == "enter" || event == "exit" {
+            lines.push(head)
+        }
+    }
+    lines.join("\n")
+}
+
+test "mutating calls and field writes on a let mut binding write the events of the spec" {
+    let bin = compile_test_helpers.build_bin(SRC, "trace_state_calls", ["--trace"])
+    let m = "trace_state_calls"
+    let r = process.run("env", ["BLINK_TRACE=all", bin]).unwrap()
+    assert_eq(r.out, "0 4 1 3 1\n")
+    assert(r.success())
+    assert_eq(shape(r.err_out), [
+        "enter {m}.main",
+        "state {m}.main xs push [3, 1, 2, 4]",
+        "state {m}.main xs set [9, 1, 2, 4]",
+        "state {m}.main p assign Point \{ x: 1, y: 0 }",
+        "enter {m}.Bag.add",
+        "exit {m}.Bag.add",
+        "state {m}.main b add Bag \{ items: [5], at: Point \{ x: 0, y: 0 } }",
+        "state {m}.main b push Bag \{ items: [5, 6], at: Point \{ x: 0, y: 0 } }",
+        "state {m}.main b assign Bag \{ items: [5, 6], at: Point \{ x: 0, y: 2 } }",
+        "state {m}.main empty pop []",
+        "state {m}.main xs pop [9, 1, 2]",
+        "enter {m}.show",
+        "exit {m}.show",
+        "state {m}.main seen push [3]",
+        "enter {m}.Bag.take",
+        "exit {m}.Bag.take",
+        "state {m}.main c take Bag \{ items: [], at: Point \{ x: 0, y: 0 } }",
+        "enter {m}.Bag.add",
+        "exit {m}.Bag.add",
+        "state {m}.main b add Bag \{ items: [5, 6, 7], at: Point \{ x: 0, y: 2 } }",
+        "exit {m}.main",
+    ].join("\n"))
+    compile_test_helpers.clean_bin("trace_state_calls")
+}

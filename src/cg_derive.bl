@@ -34,7 +34,7 @@ import cg_promote.{
     cg_promote_has_pending, cg_promote_print_walkers, cg_promote_on_demand_claim, cg_promote_on_demand_settle,
     cg_promote_on_demand_queue,
 }
-import cg_expr.{cg_expr_field_value, cg_expr_field_stored}
+import cg_expr.{cg_expr_field_value, cg_expr_field_stored, cg_expr_push_pending}
 import ir.{
     ir_assign, ir_binary, ir_block, ir_call_direct, ir_call_runtime, ir_cast, ir_const,
     ir_field_get, ir_if, ir_let, ir_panic, ir_return, ir_switch, ir_unary, ir_var_ref,
@@ -1131,6 +1131,43 @@ fn debug_part(ftid: Int, value: Int, path: Str, span: Int) -> DebugPart ! Diag.R
     let promoted = varargs_spelling(ftid)
     let arg = if promoted == "" { value } else { ir_cast(ftid, span, promoted, value) }
     DebugPart { spec: spec, arg: arg, pre: [], ok: true }
+}
+
+// Whether a list, map or option renders through the walk debug_part builds with no refusal.
+// A reader for which a missing render is not an error asks first: the trace (§8.15.9) shows
+// such a value as its type name, and a refusal would stop a build the trace only reads.
+pub fn cg_derive_container_debug_renders(tid: Int) -> Bool {
+    let k = tc_tid_kind(tc_resolve(tid))
+    if k != TyKind.List && k != TyKind.Map && k != TyKind.Option { return false }
+    debug_part_renders(tid)
+}
+
+// The types debug_part takes without a refusal. A struct or an enum renders through its
+// derived method, so one with a written Debug does not.
+fn debug_part_renders(tid: Int) -> Bool {
+    let r = tc_resolve(tid)
+    let k = tc_tid_kind(r)
+    if k == TyKind.Bool || k == TyKind.Char || k == TyKind.Str { return true }
+    if k == TyKind.Struct || k == TyKind.Enum {
+        let decl = tc_tid_decl_node(r)
+        if decl < 0 || decl == DECL_NODE_AMBIGUOUS { return false }
+        if !has_str(derive_names(decl), derive_debug) || shape_refusal(decl, r, derive_debug) != "" { return false }
+        return tc_instance_has_trait(r, derive_debug)
+    }
+    if k == TyKind.List || k == TyKind.Option { return debug_part_renders(child_tid(r, Slot.Inner1)) }
+    if k == TyKind.Map { return debug_part_renders(child_tid(r, Slot.Inner1)) && debug_part_renders(child_tid(r, Slot.Inner2)) }
+    if k == TyKind.Range { return tc_instance_has_trait(r, derive_debug) }
+    format_spec_of(r) != ""
+}
+
+// The Debug text of a value whose type cg_derive_container_debug_renders accepts. The
+// statements the text reads go to the pending list of the statement being lowered. -1 when
+// the render stopped.
+pub fn cg_derive_container_debug_text(tid: Int, value: Int, span: Int) -> Int ! Diag.Report {
+    let part = debug_part(tid, value, tc_type_str(tid), span)
+    if !part.ok { return -1 }
+    for s in part.pre { cg_expr_push_pending(span, s) }
+    part.arg
 }
 
 // A scalar whose debug form the runtime owns: the helper answers a string, so the

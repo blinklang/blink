@@ -38,6 +38,7 @@ import typecheck.{
     tc_lookup_node_tid, tc_unclaimed_call_tid, tc_list_rename_help, tc_tid_iter_elem,
     tc_call_decl_node, tc_call_decl_is_fn, tc_call_is_skip_intrinsic, tc_call_is_range_bounds, tc_tid_name, tc_mc_obj_is_value, tc_call_is_trace_log,
     tc_impl_is_poly_user, tc_poly_user_impl_decl, tc_impl_trait_id, tc_call_trait, tc_impl_is_of_call_trait, tc_qualified_call_trait, tc_names_a_trait, tc_conversion_impl_for, tc_conversion_target_of, tc_conversion_trait_of, tc_is_into_method, CONVERSION_IS_IDENTITY,
+    tc_builtin_method_writes_receiver, tc_decl_has_mut_self, tc_let_mut_root,
     tc_tid_same_type, make_option_type, make_fn_type, tc_qualified_carrier, range_repr_tid,
     TYPE_INT, TYPE_BOOL, TYPE_STR, TYPE_VOID, TYPE_NEVER,
     type_bit_width, TYPE_U8, TYPE_U16, TYPE_U32, TYPE_U64,
@@ -86,6 +87,7 @@ import cg_print.{vtable_slot_self_spelling}
 import cg_promote.{cg_promote_on_demand_claim, cg_promote_on_demand_settle, cg_promote_on_demand_queue}
 import cg_decl.{BodySite, cg_decl_body_site, cg_decl_takes_ev}
 import cg_derive.{cg_derive_range_debug_fn, cg_derive_range_clone_fn}
+import cg_trace.{cg_trace_body_traced, cg_trace_is_mut_self_call, cg_trace_note_mut_self_call, cg_trace_state}
 import diagnostics.{
     Diag, diag_ice_at, diag_ice_stage_not_built, diag_error_at, diag_file_for_node, diag_source_file,
     diag_is_ice_seg,
@@ -148,6 +150,14 @@ let NO_RECEIVER = -1
 // Every call the language spells: a free function, an impl method, and the qualified
 // forms of both. cg_expr lowers the carrier constructors itself and hands over the rest.
 pub fn lower_call(node: Int) -> Int ! Diag.Report {
+    let value = cg_call_lower_unstated(node)
+    if node_kind(node) == NodeKind.MethodCall { return cc_state_event_in_value(node, value) }
+    value
+}
+
+// A call with no state event after it. A statement that is a method call writes the event
+// of the call itself, after the call (§8.15.11).
+pub fn cg_call_lower_unstated(node: Int) -> Int ! Diag.Report {
     if node_kind(node) == NodeKind.MethodCall && tc_lookup_node_tid(node) == tc_unclaimed_call_tid() {
         return cc_unclaimed_method_call(node)
     }
@@ -156,6 +166,55 @@ pub fn lower_call(node: Int) -> Int ! Diag.Report {
         NodeKind.MethodCall => lower_method_call(node)
         _ => cc_unhandled(node)
     }
+}
+
+// ── State events of mutating calls ────────────────────────────────────────
+
+// The ident of the `let mut` root that a lowered call of a mutating method changes, or -1
+// when the call writes no state event (§8.15.11).
+fn cc_state_root(node: Int) -> Int ! Diag.Report {
+    if node_kind(node) != NodeKind.MethodCall || !cg_trace_body_traced() { return -1 }
+    // The root first: a receiver such as `io` is no binding and has no type to ask for.
+    let obj = node_obj(node)
+    let root = tc_let_mut_root(obj)
+    if root < 0 { return -1 }
+    if cg_trace_is_mut_self_call(node) { return root }
+    let recv_tid = tid_of_node(obj)
+    if recv_tid < 0 || !tc_builtin_method_writes_receiver(cc_kind(recv_tid), node_method(node)) { return -1 }
+    root
+}
+
+fn cc_state_event(node: Int, root: Int) -> List[Int] ! Diag.Report {
+    let value = lower_expr(root)
+    if value < 0 { return [] }
+    cg_trace_state(node, node_name(root), node_method(node), tid_of_node(root), value)
+}
+
+// The state event of a call that has lowered, or none when the call writes none.
+pub fn cg_call_state_events(node: Int) -> List[Int] ! Diag.Report {
+    let root = cc_state_root(node)
+    if root < 0 { return [] }
+    cc_state_event(node, root)
+}
+
+// A mutating call inside a value. The call runs into a temp and its event follows, so the
+// event comes before the read of the result, and after the call as the spec orders it.
+fn cc_state_event_in_value(node: Int, value: Int) -> Int ! Diag.Report {
+    if value < 0 { return value }
+    let root = cc_state_root(node)
+    if root < 0 { return value }
+    let tid = tid_of_node(node)
+    let rec = cc_local(tid, node)
+    if cc_stopped(rec) { return -1 }
+    if cc_kind(tid) == TyKind.Void || cc_kind(tid) == TyKind.Never {
+        cg_expr_push_pending(node, ir_expr_stmt(node, value))
+        for s in cc_state_event(node, root) { cg_expr_push_pending(node, s) }
+        return ir_const(tid, node, rec.c_spelling, "0")
+    }
+    let held = c_mint_local("state_call")
+    cg_expr_push_pending(node, ir_let(tid, node, rec.c_spelling, held, rec.slot_form, value))
+    for s in cc_state_event(node, root) { cg_expr_push_pending(node, s) }
+    ir_var_ref(tid, node, rec.c_spelling, held, rec.slot_form)
 }
 
 // A method call no arm of inference claimed: typecheck's total-stamp pass stands the whole
@@ -1939,10 +1998,13 @@ fn cc_declared_call(node: Int, decl: Int, recv: Int) -> Int ! Diag.Report {
 // the parameters `decl` declares rather than by where the call writes them.
 fn cc_build_declared_call(node: Int, symbol: Str, recv: Int, decl: Int) -> Int ! Diag.Report {
     let lead = if recv == NO_RECEIVER { 0 } else { 1 }
-    match cc_args_in_param_order(node, decl, lead) {
+    let call = match cc_args_in_param_order(node, decl, lead) {
         Some(operands) => cc_build_call_of(node, symbol, recv, CallForm.Declared, cg_decl_takes_ev(decl), operands)
         None => -1
     }
+    // Noted once the arguments have lowered, so a call among them does not take its place.
+    if call >= 0 && lead == 1 && tc_decl_has_mut_self(decl) { cg_trace_note_mut_self_call(node) }
+    call
 }
 
 fn cc_written_args(node: Int) -> List[Int] {

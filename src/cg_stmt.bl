@@ -21,7 +21,7 @@ import parser.{
 }
 import typecheck.{
     TyKind, range_repr_tid, TYPE_BOOL, TYPE_CHAR, TYPE_FLOAT, TYPE_INT, TYPE_NEVER, TYPE_STR, TYPE_VOID,
-    tc_call_declared_name, tc_enum_has_payload, tc_global_decl_node, tc_let_binder_is_discard,
+    tc_call_declared_name, tc_enum_has_payload, tc_global_decl_node, tc_let_binder_is_discard, tc_let_mut_root,
     tc_lookup_node_tid, tc_resolve, tc_tid_kind, make_list_type,
     tc_alias_decl_of_ann, tc_ensures_preds_of, tc_is_old_snapshot, tc_requires_preds_of,
     tc_is_panic_hook_item, tc_panic_hook_fn_type, tc_panic_info_type, make_option_type,
@@ -74,6 +74,7 @@ import cg_call.{
     AssertKind, ForInIteration, ForInStrategy, cc_assert_family_kind, cc_display_or_placeholder,
     cc_values_equal, cc_is_ptr_write_stmt, cc_is_skip_call, cc_is_trace_log_call, cc_lower_ptr_write_stmt, cg_call_element_from_runtime,
     cg_call_channel_take, cg_call_cursor_walk, cg_call_str_step, for_in_iteration_of, lower_spread_copy,
+    cg_call_lower_unstated, cg_call_state_events,
 }
 import unparse.{unparse_expr}
 import cg_derive.{cg_derive_range_debug_fn}
@@ -692,7 +693,17 @@ fn lower_stmt_tail(node: Int, tail: Int, dest: Str, dest_tid: Int) -> Int ! Diag
 fn lower_method_call_stmt(node: Int, tail: Int, dest: Str, dest_tid: Int) -> Int ! Diag.Report {
     if cc_is_skip_call(node) { return lower_skip_call(node) }
     if cc_is_ptr_write_stmt(node) { return cc_lower_ptr_write_stmt(node) }
-    lower_value_stmt(node, tail, dest, dest_tid)
+    if tail != TAIL_DISCARD || !cg_trace_body_traced() || cg_expr_is_registered(node) { return lower_value_stmt(node, tail, dest, dest_tid) }
+    // The state event of a mutating call comes after the call (§8.15.11).
+    let mark = cg_expr_pending_count()
+    let lowered = cg_call_lower_unstated(node)
+    if lowered < 0 { let _dropped = cg_expr_take_pending(mark) }
+    let value = value_or_poison(lowered, node)
+    let stmt = tail_wrap(node, value, tail, dest, dest_tid)
+    if value < 0 || stmt < 0 { return stmt }
+    let event = cg_call_state_events(node)
+    if event.len() == 0 { return stmt }
+    ir_block(node, [stmt, ..event])
 }
 
 // The assert family is statement-shaped only: the parser fabricates a bare Call it never
@@ -1453,17 +1464,19 @@ fn lower_assign(node: Int) -> Int ! Diag.Report {
     // void call, so the ordinary assignment path is still the right one for it. The write
     // still has its state event, as a traced value is never left out (§8.15.9).
     if tid >= 0 && cs_is_void_like(tid) && !cg_expr_is_registered(rhs) {
-        return traced_store(node, target, tid, lower_stmt_tail(rhs, TAIL_DISCARD, "", -1))
+        return traced_store(node, target, lower_stmt_tail(rhs, TAIL_DISCARD, "", -1))
     }
-    if place_crosses_box(target) { return assign_through_boxes(node, target, lower_value(rhs)) }
-    traced_store(node, target, tid, ir_assign(node, lower_target(target), lower_value(rhs)))
+    if place_crosses_box(target) { return traced_store(node, target, assign_through_boxes(node, target, lower_value(rhs))) }
+    traced_store(node, target, ir_assign(node, lower_target(target), lower_value(rhs)))
 }
 
-// A store to a whole binding, followed by its state event when the body is traced. A write
-// to a field is not an event yet: what such an event names is not settled.
-fn traced_store(node: Int, target: Int, tid: Int, store: Int) -> Int ! Diag.Report {
-    if store < 0 || !cg_trace_body_traced() || node_kind(target) != NodeKind.Ident { return store }
-    let event = cg_trace_state(node, node_name(target), tid, lower_target(target))
+// A store to a binding or to a part of it, followed by its state event when the body is
+// traced. The event names the root binding and holds its whole value (§8.15.11).
+fn traced_store(node: Int, target: Int, store: Int) -> Int ! Diag.Report {
+    if store < 0 || !cg_trace_body_traced() { return store }
+    let root = tc_let_mut_root(target)
+    if root < 0 { return store }
+    let event = cg_trace_state(node, node_name(root), "assign", stmt_tid(root), lower_target(root))
     if event.len() == 0 { return store }
     ir_block(node, [store, ..event])
 }
@@ -1594,8 +1607,8 @@ fn lower_compound_assign(node: Int) -> Int ! Diag.Report {
     let site = ArithSite { node: node, op: node_op(node), tid: tid, lhs_node: target, rhs_node: node_value(node) }
     let sum = lower_arith_operator(site, read, lower_value(node_value(node)))
     if sum < 0 { return -1 }
-    if crosses { return assign_through_boxes(node, target, sum) }
-    traced_store(node, target, tid, ir_assign(node, lower_target(target), sum))
+    if crosses { return traced_store(node, target, assign_through_boxes(node, target, sum)) }
+    traced_store(node, target, ir_assign(node, lower_target(target), sum))
 }
 
 fn lower_return(node: Int) -> Int ! Diag.Report {

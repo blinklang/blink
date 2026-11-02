@@ -38,11 +38,14 @@ import ir.{ir_block, ir_call_runtime, ir_col, ir_const, ir_expr_stmt, ir_if, ir_
 import diagnostics.{Diag, diag_file_for_node}
 import cg_reg.{cg_reg_effect_root_decl, cg_reg_impl_of}
 import cg_call.{cg_call_has_debug, lower_debug_of_value}
+import cg_derive.{cg_derive_container_debug_renders, cg_derive_container_debug_text}
 import cg_expr.{cg_expr_can_display, cg_expr_display_text, cg_expr_pending_count, cg_expr_take_pending, x_layout_checked, x_stopped}
 
 // on: the unit is built with --trace. armed: the declaration the driver will lower next, or
 // -1, and armed_effect the effect that declares it when it is the default body of an
 // operation. traced: the body being lowered is traced, and fn_name and module name its events.
+// mut_self_call: the last method call of the body built against a `mut self` declaration,
+// which the dispatch finds deep down and the state event of the call reads after it.
 type TraceUnit {
     on: Bool = false
     armed: Int = -1
@@ -50,6 +53,7 @@ type TraceUnit {
     traced: Bool = false
     fn_name: Str = ""
     module: Str = ""
+    mut_self_call: Int = -1
 }
 
 let mut tr_unit = TraceUnit {}
@@ -166,6 +170,14 @@ pub fn cg_trace_body_leave() { tr_unit = TraceUnit { on: tr_unit.on } }
 // Whether the body being lowered is traced.
 pub fn cg_trace_body_traced() -> Bool { tr_unit.traced }
 
+// The method call `node` has been built against a declaration with a `mut self` receiver.
+pub fn cg_trace_note_mut_self_call(node: Int) {
+    if tr_unit.traced { tr_unit.mut_self_call = node }
+}
+
+// Whether `node` is the last method call built against a `mut self` declaration.
+pub fn cg_trace_is_mut_self_call(node: Int) -> Bool { node >= 0 && tr_unit.mut_self_call == node }
+
 // The statements before an exit with a value, which `value` reads. None when the body is
 // not traced.
 pub fn cg_trace_exit_value(node: Int, tid: Int, value: Int) -> List[Int] ! Diag.Report {
@@ -182,9 +194,9 @@ pub fn cg_trace_exit_void(node: Int) -> List[Int] ! Diag.Report {
     tr_exit(node, [], tr_text(node, "()"))
 }
 
-// The statements after a write to the whole `let mut` binding `var`, which `value` reads
-// once the write is done. None when the body is not traced.
-pub fn cg_trace_state(node: Int, var: Str, tid: Int, value: Int) -> List[Int] ! Diag.Report {
+// The statements after a change `op` of the `let mut` binding `var` (§8.15.11), which `value`
+// reads once the change is done. None when the body is not traced.
+pub fn cg_trace_state(node: Int, var: Str, op: Str, tid: Int, value: Int) -> List[Int] ! Diag.Report {
     if !cg_trace_body_traced() || tid < 0 { return [] }
     let render: List[Int] = []
     let text = tr_value(node, tid, value, render)
@@ -192,7 +204,7 @@ pub fn cg_trace_state(node: Int, var: Str, tid: Int, value: Int) -> List[Int] ! 
     let mut event = tr_muted(node, render)
     let fn_name = tr_text(node, tr_unit.fn_name)
     let module = tr_text(node, tr_unit.module)
-    event.push(tr_call(node, TYPE_VOID, "trace_state_emit", [fn_name, module, tr_text(node, var), tr_text(node, "assign"), text]))
+    event.push(tr_call(node, TYPE_VOID, "trace_state_emit", [fn_name, module, tr_text(node, var), tr_text(node, op), text]))
     let gate = tr_call_value(node, TYPE_BOOL, "trace_on_state", [tr_text(node, tr_unit.fn_name), tr_text(node, tr_unit.module), tr_text(node, var)])
     [ir_if(node, gate, ir_block(node, event), -1)]
 }
@@ -223,6 +235,7 @@ fn tr_value_text(node: Int, tid: Int, value: Int) -> Int ! Diag.Report {
     if tc_tid_kind(tid) == TyKind.Void { return tr_text(node, "()") }
     if cg_expr_can_display(node, tid) { return cg_expr_display_text(node, tid, value) }
     if cg_call_has_debug(node, tid) { return lower_debug_of_value(node, tid, value) }
+    if cg_derive_container_debug_renders(tid) { return cg_derive_container_debug_text(tid, value, node) }
     tr_text(node, "<{tc_type_str(tid)}>")
 }
 
