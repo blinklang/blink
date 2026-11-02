@@ -170,7 +170,8 @@ BLINK_RT_FN void blink_stdin_raise(const char* op, const blink_stdin_fault_t* f,
         return;
     }
     if (site.file != NULL) __blink_panic_dispatch_at(msg, site.file, site.line);
-    __blink_panic_dispatch(msg);
+    /* Every read Blink code writes sets the site, so only a direct C entry reaches this. */
+    __blink_fatal(msg);
 }
 #endif
 

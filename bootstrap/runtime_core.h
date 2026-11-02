@@ -344,6 +344,16 @@ BLINK_RT_FN void __blink_panic_dispatch(const char* msg) {
 }
 #endif
 
+/* A fault with no Blink line to name is not a panic: Blink code cannot act on it, so no
+   hook, no assert_panics frame, no test record and no cleanup drain may take it. */
+BLINK_RT_FN void __blink_fatal(const char* msg);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void __blink_fatal(const char* msg) {
+    fprintf(stderr, "%s\n", msg);
+    exit(101);
+}
+#endif
+
 BLINK_RT_FN void __blink_panic_dispatchf(const char* fmt, ...);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN void __blink_panic_dispatchf(const char* fmt, ...) {
@@ -716,10 +726,10 @@ BLINK_RT_FN void blink_str_bad(const char* s);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN void blink_str_bad(const char* s) {
     if (!s) {
-        __blink_panic_dispatch("blink: internal error: a Str is NULL");
+        __blink_fatal("blink: internal error: a Str is NULL");
     }
-    __blink_panic_dispatch("blink: internal error: a Str has no length header "
-                           "(a C string reached Blink without a copy)");
+    __blink_fatal("blink: internal error: a Str has no length header "
+                  "(a C string reached Blink without a copy)");
 }
 #endif
 
@@ -907,9 +917,10 @@ BLINK_RT_FN const char* blink_str_from_foreign(const char* p, const char* symbol
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN const char* blink_str_from_foreign(const char* p, const char* symbol) {
     if (!p) {
-        __blink_panic_dispatchf("blink: foreign function `%s` returned NULL for a Str; "
-                                "declare it `-> Ptr[U8]` and use `.to_str()` to handle NULL",
-                                symbol);
+        char msg[BLINK_PANIC_MSG_SIZE];
+        snprintf(msg, sizeof msg, "blink: foreign function `%s` returned NULL for a Str; "
+                 "declare it `-> Ptr[U8]` and use `.to_str()` to handle NULL", symbol);
+        __blink_fatal(msg);
     }
     return blink_str_from_cstr(p);
 }

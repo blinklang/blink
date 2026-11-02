@@ -1,0 +1,151 @@
+// A foreign NULL for a Str, a Str with no header and a stdin fault with no read call to name
+// have no Blink line, so they are not panics: no hook, no assert_panics, no test record and no
+// cleanup warning takes them. Each ends the process with the panic exit code. The report text
+// is not pinned here, because the spec gives it no form.
+
+import compile_test_helpers.{compile_and_run, compile_and_run_test_json, RunResult}
+
+fn foreign_null_src() -> Str {
+    #"@ffi("getenv")
+@trusted(audit: "TEST-NULL-STR")
+fn null_str(name: Str) -> Str ! () {}
+
+fn fault() -> Int {
+    null_str("BLINK_NO_SITE_SURELY_UNSET_VAR").len()
+}
+"#
+}
+
+fn bad_header_src() -> Str {
+    #"@ffi("blink_str_bad")
+@trusted(audit: "TEST-NO-HEADER")
+fn str_bad(s: Str) ! () {}
+
+fn fault() -> Int {
+    str_bad("x")
+    0
+}
+"#
+}
+
+fn stdin_no_slot_src() -> Str {
+    #"@ffi("close", header: "unistd.h")
+@trusted(audit: "TEST-CLOSE")
+fn close_fd(fd: I32) -> I32 ! () {}
+
+@ffi("blink_stdin_read_line")
+@trusted(audit: "TEST-NO-SLOT")
+fn raw_read_line() -> Str ! () {}
+
+fn fault() -> Int {
+    let _ = close_fd(0.to_i32())
+    raw_read_line().len()
+}
+"#
+}
+
+fn expect_fatal(r: RunResult) {
+    assert(r.exit_code == 101, "exit {r.exit_code}: {r.out} {r.err_out}")
+    assert(r.err_out.len() > 0, "no report")
+}
+
+fn catches_src(fault_src: Str) -> Str {
+    fault_src.concat(#"
+test "the catch" {
+    assert_panics {
+        let _ = fault()
+    }
+}
+
+test "runs after" {
+    assert_eq(1, 1)
+}
+"#)
+}
+
+fn expect_past_assert_panics(fault_src: Str, tag: Str) ! FS.Delete, FS.Write, Process.Spawn, FS.Read, Env.Read {
+    let r = compile_and_run_test_json(catches_src(fault_src), tag)
+    expect_fatal(r)
+    assert(!r.out.contains("runs after"), r.out)
+}
+
+fn expect_past_the_hook(fault_src: Str, tag: Str) ! FS.Delete, FS.Write, Process.Spawn, FS.Read, Env.Read {
+    let r = compile_and_run(fault_src.concat(#"
+fn report(_p: PanicInfo) -> Never ! IO.Eprint, Env.Exit {
+    io.eprintln("the hook ran")
+    env.exit(70)
+}
+
+fn main() ! IO, Env {
+    with on_panic(report) {
+        io.println("{fault()}")
+    }
+}
+"#), tag)
+    expect_fatal(r)
+    assert(!r.err_out.contains("the hook ran"), r.err_out)
+}
+
+test "a foreign NULL goes past assert_panics" {
+    expect_past_assert_panics(foreign_null_src(), "ns_foreign_catch_{getpid()}")
+}
+
+test "a Str with no header goes past assert_panics" {
+    expect_past_assert_panics(bad_header_src(), "ns_header_catch_{getpid()}")
+}
+
+test "a stdin fault with no read call goes past assert_panics" {
+    expect_past_assert_panics(stdin_no_slot_src(), "ns_stdin_catch_{getpid()}")
+}
+
+test "a foreign NULL goes past the hook" {
+    expect_past_the_hook(foreign_null_src(), "ns_foreign_hook_{getpid()}")
+}
+
+test "a Str with no header goes past the hook" {
+    expect_past_the_hook(bad_header_src(), "ns_header_hook_{getpid()}")
+}
+
+test "a stdin fault with no read call goes past the hook" {
+    expect_past_the_hook(stdin_no_slot_src(), "ns_stdin_hook_{getpid()}")
+}
+
+test "a foreign NULL does not fail only one test" {
+    let r = compile_and_run_test_json(foreign_null_src().concat(#"
+test "the fault" {
+    let _ = fault()
+}
+
+test "runs after" {
+    assert_eq(1, 1)
+}
+"#), "ns_foreign_test_{getpid()}")
+    expect_fatal(r)
+    assert(!r.out.contains("runs after"), r.out)
+}
+
+test "a foreign NULL in a cleanup is not a cleanup warning" {
+    let r = compile_and_run_test_json(foreign_null_src().concat(#"
+type Bad { id: Int }
+
+impl Closeable for Bad {
+    fn close(self) {
+        let _ = fault() + self.id
+    }
+}
+
+test "the unwind" {
+    assert_panics {
+        with Bad { id: 0 } as b {
+            panic("first {b.id}")
+        }
+    }
+}
+
+test "runs after" {
+    assert_eq(1, 1)
+}
+"#), "ns_foreign_cleanup_{getpid()}")
+    expect_fatal(r)
+    assert(!r.out.contains("runs after"), r.out)
+}
