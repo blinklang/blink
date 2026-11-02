@@ -32068,8 +32068,9 @@ fn tc_tm_check_closures_run(node: Int, inside: Set[Int], assigns: Map[Int, List[
         for c in r.closures {
             if inside.contains(c) { continue }
             let named = node_kind(c) == NodeKind.FnDef
+            let cb = if named { tc_tm_callback_binds(node, c, tc_no_binds) } else { tc_no_binds }
             if named {
-                let row = tc_tm_decl_row(c, tc_no_binds)
+                let row = tc_tm_callback_row(c, cb)
                 if row.len() > 0 {
                     tc_tm_report(node, "`msg` calls `{node_name(c)}`, which has a row", ["`{node_name(c)}` has the row `! {row.join(", ")}`"])
                     return
@@ -32077,7 +32078,7 @@ fn tc_tm_check_closures_run(node: Int, inside: Set[Int], assigns: Map[Int, List[
             }
             let mut walked: Set[Int] = Set()
             let mut kids: List[Int] = []
-            let why = if named { "" } else { tc_tm_closure_row_call(c, walked, assigns, kids) }
+            let why = if named { "" } else { tc_tm_closure_row_call(node, c, walked, assigns, kids) }
             if why != "" {
                 tc_tm_report(node, "`msg` runs {shown}, which has a row", ["{shown} {why}"])
                 return
@@ -32086,7 +32087,7 @@ fn tc_tm_check_closures_run(node: Int, inside: Set[Int], assigns: Map[Int, List[
             let mut todo: List[TmBody] = []
             let mut reads: List[Str] = []
             let mut writes: List[Str] = []
-            tc_tm_touch_closure(c, tc_no_binds, 0, seen, todo)
+            tc_tm_touch_closure(c, cb, 0, seen, todo)
             tc_tm_touch_drain(seen, todo, reads, writes, assigns, kids)
             let t = tc_tm_touch_result(reads, writes)
             if t.name != "" {
@@ -32102,11 +32103,11 @@ fn tc_tm_check_closures_run(node: Int, inside: Set[Int], assigns: Map[Int, List[
 // The first call or with item in a closure's body, or in a closure it runs, that has a row, as
 // "calls `f`, which has the row `! IO`", "calls `env.cwd`, a handler operation" or
 // "runs `T.close`, which has the row `! IO`"; "" for none.
-fn tc_tm_closure_row_call(c: Int, walked: Set[Int], assigns: Map[Int, List[Int]], kids: List[Int]) -> Str ! TypeCheck.Resolve, Diag.Report {
+fn tc_tm_closure_row_call(call: Int, c: Int, walked: Set[Int], assigns: Map[Int, List[Int]], kids: List[Int]) -> Str ! TypeCheck.Resolve, Diag.Report {
     if walked.contains(c) { return "" }
     walked.insert(c)
     if node_kind(c) == NodeKind.FnDef {
-        let row = tc_tm_decl_row(c, tc_no_binds)
+        let row = tc_tm_callback_row(c, tc_tm_callback_binds(call, c, tc_no_binds))
         return if row.len() > 0 { "calls `{node_name(c)}`, which has the row `! {row.join(", ")}`" } else { "" }
     }
     tc_tm_row_call_in(node_body(c), walked, assigns, kids)
@@ -32143,7 +32144,7 @@ fn tc_tm_row_call_in(node: Int, walked: Set[Int], assigns: Map[Int, List[Int]], 
         }
         for r in tc_tm_closures_run(node, assigns) {
             for inner in r.closures {
-                let why = tc_tm_closure_row_call(inner, walked, assigns, kids)
+                let why = tc_tm_closure_row_call(node, inner, walked, assigns, kids)
                 if why != "" { return why }
             }
         }
@@ -32538,8 +32539,78 @@ fn tc_tm_touch_walk(node: Int, binds: Map[Str, Int], depth: Int, seen: Set[Str],
 // effects, and a closure that is only returned or stored, as by `push`, runs nowhere here.
 fn tc_tm_touch_closures(node: Int, binds: Map[Str, Int], depth: Int, seen: Set[Str], todo: List[TmBody], assigns: Map[Int, List[Int]]) ! TypeCheck.Resolve, Diag.Report {
     for r in tc_tm_closures_run(node, assigns) {
-        for c in r.closures { tc_tm_touch_closure(c, binds, depth, seen, todo) }
+        for c in r.closures {
+            let cb = if node_kind(c) == NodeKind.FnDef { tc_tm_callback_binds(node, c, binds) } else { binds }
+            tc_tm_touch_closure(c, cb, depth, seen, todo)
+        }
     }
+}
+
+// The binds a generic named fn takes where the built-in `call` runs it as its callback. The
+// type of a fn value passed to a built-in is never unified with the callback type, so each
+// param is solved here from the value the call gives it: the receiver's element, and for fold
+// the init first. A caller's binders in the receiver type are read off its binds.
+fn tc_tm_callback_binds(call: Int, fndef: Int, binds: Map[Str, Int]) -> Map[Str, Int] ! TypeCheck.Resolve, Diag.Report {
+    let mut out: Map[Str, Int] = Map()
+    let idx = fnsig_by_decl.get(fndef) ?? -1
+    if idx < 0 || node_kind(call) != NodeKind.MethodCall { return out }
+    let fs = fnsig_pool.get(idx).unwrap()
+    let recv = resolve_alias_tid(tc_resolve(substitute_typevar_tid(tc_lookup_node_tid(node_obj(call)), binds)))
+    if recv < 0 || tc_tid_is_no_info(recv) != 0 { return out }
+    if tc_tid_kind(recv) != TyKind.List && tc_tid_kind(recv) != TyKind.Iterator { return out }
+    let elem = ty_pool.get(recv).unwrap().inner1
+    let mut given: List[Int] = [elem]
+    let method = node_method(call)
+    if method == "sort_by" { given.push(elem) }
+    if method == "fold" {
+        let init = tc_tm_fold_init(call)
+        let t = if init >= 0 { tc_lookup_node_tid(init) } else { -1 }
+        given = [if t >= 0 { tc_resolve(substitute_typevar_tid(t, binds)) } else { -1 }, elem]
+    }
+    let mut i = 0
+    while i < given.len() && i < fs.params_count {
+        let g = given.get(i).unwrap()
+        if g >= 0 { unify_typevar_binds(fnsig_param_list.get(fs.params_start + i).unwrap(), g, out) }
+        i = i + 1
+    }
+    out
+}
+
+// The init argument of a fold call, or -1.
+fn tc_tm_fold_init(call: Int) -> Int {
+    let args = node_args(call)
+    if args == -1 { return -1 }
+    let mut i = 0
+    while i < sublist_length(args) {
+        let a = sublist_get(args, i)
+        if node_kind(a) != NodeKind.NamedArg { return a }
+        if node_name(a) == "init" { return node_value(a) }
+        i = i + 1
+    }
+    -1
+}
+
+// The row of a named fn a built-in runs as its callback, at these binds. A `_` whose binder
+// the call does not solve stands for every impl, so it is `_`, not the empty row.
+fn tc_tm_callback_row(fndef: Int, binds: Map[Str, Int]) -> List[Str] ! TypeCheck.Resolve, Diag.Report {
+    let mut row = tc_tm_decl_row(fndef, binds)
+    let idx = fnsig_by_decl.get(fndef) ?? -1
+    if idx < 0 || row.contains("_") { return row }
+    let fs = fnsig_pool.get(idx).unwrap()
+    let mut wild = false
+    let mut i = 0
+    while i < fs.effects_count {
+        if fnsig_effect_names.get(fs.effects_start + i).unwrap() == "_" { wild = true }
+        i = i + 1
+    }
+    if !wild { return row }
+    for p in tc_er_wild_params(fndef) {
+        if (binds.get(tc_binder_key(p.binder, p.name)) ?? (binds.get(p.name) ?? -1)) < 0 {
+            row.push("_")
+            return row
+        }
+    }
+    row
 }
 
 fn tc_tm_touch_closure(c: Int, binds: Map[Str, Int], depth: Int, seen: Set[Str], todo: List[TmBody]) ! TypeCheck.Resolve, Diag.Report {
