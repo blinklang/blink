@@ -58,10 +58,12 @@ of `build/blink`.
 
 Inspect generated C: `build/blink build --emit c <file.bl>` — output goes to `build/<name>.c`
 Trace compiler phases: `build/blink run --blink-trace typecheck <file.bl>` (also: lex, parse, mono, all)
-Fine-grained trace: `BLINK_TRACE_CHANNELS=<ch>[,<ch>...|all] build/blink build --emit c <file.bl>` — must
-be built from `src/cli.bl` (not `src/blinkc_main.bl`); `build/blinkc` ignores this env var. Channels are
-defined via `dbg_trace(channel, msg)` calls (`grep dbg_trace\( src/`) — read the call site for what a
-channel means.
+Fine-grained trace: `BLINK_TRACE_CHANNELS=blink.<ch>[,blink.<ch>...|all] build/blink build --emit c <file.bl>`
+(`build/blinkc` reads it too). Each compiler channel is a `trace.log("blink.<ch>", msg)` call
+(`rg 'trace.log\(' src/`); a line reads `[trace:blink.<ch>] msg`. Read the call site for what a
+channel means. The `blink.` prefix keeps the compiler's channels apart from a program's, but `all`
+turns on both: trace the compiler with `blink build`, and do not use `all` with
+`blink run --trace` when you pipe its stderr to jq.
 Runtime trace: `build/blink run --trace <file.bl>` (NDJSON to stderr; filter with `--trace=fn:name,module:mod,depth:N`)
 Debug build: `build/blink run --debug <file.bl>` — enables debug_assert, compiles with `-g -O0`
 

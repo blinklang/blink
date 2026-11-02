@@ -1,0 +1,73 @@
+// A reused emit skips the stages whose trace lines a run asked for, so a per-module build
+// refuses the reuse when a compiler channel outside blink.build. is on, or `all` is. A channel
+// that is not under blink. names the program's own trace, which the compiler never writes, so it
+// keeps the reuse.
+
+import std.process.{ProcessResult}
+import compile_test_helpers
+
+fn sh(cmd: Str) -> Str ! Process.Spawn {
+    process.run("sh", ["-c", cmd]).unwrap().out.trim()
+}
+
+fn dev_tree(root: Str, tree: Str) ! Process.Spawn, FS.Write {
+    process.run("sh", ["-c", "rm -rf {tree}"]).unwrap()
+    process.run("sh", ["-c", "mkdir -p {tree}/build {tree}/app/src"]).unwrap()
+    // A copy, not a link: the install root comes from realpath(argv[0]).
+    process.run("sh", ["-c", "cp {sh("readlink -f build/blink")} {tree}/build/blink"]).unwrap()
+    process.run("sh", ["-c", "ln -s {root}/lib {tree}/lib"]).unwrap()
+    process.run("sh", ["-c", "ln -s {root}/lib {tree}/build/lib"]).unwrap()
+    for f in ["runtime.h", "libblink_std.a", "libblink_std.h", "skip_modules.txt", ".archive-id"] {
+        process.run("sh", ["-c", "[ -e {root}/build/{f} ] && cp -L {root}/build/{f} {tree}/build/{f}"]).unwrap()
+    }
+    // A dev build/ can hold runtime.h only beside the archive it links to.
+    process.run("sh", ["-c", "[ -e {tree}/build/runtime.h ] || cp -L $(dirname $(readlink -f {root}/build/libblink_std.h))/runtime.h {tree}/build/runtime.h"]).unwrap()
+    fs.write("{tree}/app/blink.toml", "[package]\nname = \"reuse_trace_app\"\nversion = \"0.1.0\"\n").unwrap()
+    fs.write("{tree}/app/src/greet.bl", [
+        #"pub fn greet(name: Str) -> Str {"#,
+        #"    "hello {name}""#,
+        #"}"#,
+        #""#,
+    ].join("\n")).unwrap()
+    fs.write("{tree}/app/src/main.bl", [
+        #"import greet.{greet}"#,
+        #""#,
+        #"fn main() {"#,
+        #"    io.println(greet("units"))"#,
+        #"}"#,
+        #""#,
+    ].join("\n")).unwrap()
+}
+
+// The corpus exports BLINK_COMPILER_ARCHIVE and may export BLINK_PER_MODULE; the first makes
+// --per-module build one unit, so the run drops both, and the module filters.
+fn blink_with(tree: Str, channels: Str, args: Str) -> ProcessResult ! Process.Spawn {
+    process.run("sh", ["-c", "cd {tree} && env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE BLINK_CACHE_DIR={tree}/objcache 'BLINK_TRACE_CHANNELS={channels}' build/blink {args}"]).unwrap()
+}
+
+fn emit_kind(r: ProcessResult) -> Str {
+    for line in "{r.out}\n{r.err_out}".split("\n") {
+        if line == "[trace:blink.build.units] reuse emit" { return "reuse emit" }
+        if line == "[trace:blink.build.units] emit" { return "emit" }
+    }
+    "none"
+}
+
+test "a per-module build reuses its emit under a program channel and refuses it under a compiler channel or all" {
+    let root = sh("pwd -P")
+    let tree = "{compile_test_helpers.scratch_root()}/_per_module_trace_reuse_{getpid()}"
+    dev_tree(root, tree)
+    let build = "build app/src/main.bl -o {tree}/out/app --per-module"
+    let mut kinds: List[Str] = []
+    let mut failed: List[Str] = []
+    // A refused build records no interface texts, so the first build after it emits once more
+    // and the next one reuses.
+    for channels in ["blink.build.units", "blink.build.units, mono", "blink.build.units,blink.mono", "blink.build.units,all", "blink.build.units", "blink.build.units"] {
+        let r = blink_with(tree, channels, build)
+        if !r.success() { failed.push("{channels}: {r.out}{r.err_out}") }
+        kinds.push(emit_kind(r))
+    }
+    process.run("sh", ["-c", "rm -rf {tree}"])?
+    assert_eq(failed.join("\n"), "")
+    assert_eq(kinds.join(","), "emit,reuse emit,emit,emit,emit,reuse emit")
+}

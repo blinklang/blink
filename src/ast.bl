@@ -779,52 +779,42 @@ pub fn nk_is_typed(k: NodeKind) -> Int {
     }
 }
 
-// ── Fine-grained internal trace sink ────────────────────────────────
+// ── Private trace gates ─────────────────────────────────────────────
 //
-// The coarse phase tracer (`phase_trace`/`--blink-trace` in compiler.bl) sits at the
-// TOP of the import DAG, so the modules doing the interesting work — typecheck,
-// codegen_types — cannot reach it without an import cycle. That is why the
-// monomorphization / tid-resolution paths have historically had zero
-// instrumentation and every debugging session reached for a throwaway printf +
-// recompile. This sink lives in ast.bl (the DAG root, imported transitively by
-// everyone) so ANY module can emit a fine-grained trace.
-//
-// Channels are opt-in via BLINK_TRACE_CHANNELS (comma-separated, or "all"),
-// wired once at CLI startup into dbg_channels. When unset the guard is a single
-// string compare and nothing is emitted — zero cost, and it never touches
-// generated C, so it is byte-neutral (Gen1==Gen2 unaffected). Taps ship in
-// source permanently: a future session sets the env var instead of editing code.
-pub let mut dbg_channels: Str = ""
+// The compiler's own trace notes are trace.log calls on channels named `blink.<area>`, so
+// that `BLINK_TRACE_CHANNELS=mono blink run p.bl` turns on the channel of the program and not
+// one of the compiler. A trace.log message is built only when its channel is on, but it may
+// not call a fn that reads module state, and the language has no call that asks whether a
+// channel is on. A few messages need such a fn (a type rendered as text), and the build
+// cache must know whether a reused emit would skip lines that a channel asked for. These
+// read the channel list here, which each compiler main fills once at start, with the same
+// item rule as the runtime (§8.15.7).
+pub let mut trace_gate_items: List[Str] = []
 
-// Public so hot-path callers can gate the construction of an interpolated trace
-// message (eagerly evaluated in Blink) behind the channel check, paying nothing
-// when the channel is off.
-pub fn dbg_channel_on(ch: Str) -> Int {
-    if ch == "" { return 0 }
-    if dbg_channels == "" { return 0 }
-    if dbg_channels == "all" { return 1 }
-    // Exact per-channel match against the comma list so "monotid" does not
-    // match a hypothetical "monotidx". Scan comma-delimited segments.
-    let needle = dbg_channels
-    let mut seg_start = 0
-    let mut ci = 0
-    while ci <= needle.byte_len() {
-        if ci == needle.byte_len() || needle.byte_at(ci) == 44 {
-            if needle.byte_slice(seg_start, ci) == ch { return 1 }
-            seg_start = ci + 1
-        }
-        ci = ci + 1
+// Splits on `,`, trims ASCII space and tab from the two ends of each item, and skips each
+// item that is empty after the trim.
+pub fn trace_gate_read(value: Str) {
+    let mut items: List[Str] = []
+    for raw in value.split(",") {
+        let mut lo = 0
+        let mut hi = raw.byte_len()
+        while lo < hi && (raw.byte_at(lo) == 32 || raw.byte_at(lo) == 9) { lo = lo + 1 }
+        while hi > lo && (raw.byte_at(hi - 1) == 32 || raw.byte_at(hi - 1) == 9) { hi = hi - 1 }
+        if hi > lo { items.push(raw.byte_slice(lo, hi)) }
     }
-    0
+    trace_gate_items = items
 }
 
-pub fn dbg_trace(ch: Str, msg: Str) {
-    if dbg_channel_on(ch) != 0 {
-        io.eprintln("[dbg:{ch}] {msg}")
+// Whether trace.log writes on channel `ch`: an item names it by exact text, or an item is
+// `all`.
+pub fn trace_gate_on(ch: Str) -> Bool {
+    for item in trace_gate_items {
+        if item == "all" || item == ch { return true }
     }
+    false
 }
 
-// Phase tracing lives beside the channel tracing, in the leaf every phase already
+// Phase tracing lives beside the trace gates, in the leaf every phase already
 // imports, so the lexer and the parser can trace without importing the driver.
 pub let mut trace_mode: Str = ""
 

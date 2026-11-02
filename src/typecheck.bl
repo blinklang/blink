@@ -1,4 +1,4 @@
-import ast.{NodeKind, node_kind_name, is_block_bearing, dbg_trace, dbg_channel_on, nk_is_typed, phase_trace, trace_mode}
+import ast.{NodeKind, node_kind_name, is_block_bearing, trace_gate_on, nk_is_typed, phase_trace, trace_mode}
 import std.str.{str_to_lower}
 import pkg.manifest.{manifest_name, manifest_header_is_declared}
 import unparse.{type_ann_text, unparse_expr, unparse_binop_with_lhs, unparse_range_membership, unparse_coalesce_start}
@@ -5522,10 +5522,12 @@ fn tc_pin_tail_ret_generic(declared_ret: Int, inferred_ret: Int) {
     // programs that have nothing to do with the new seam. `retpin` makes that blast
     // radius auditable without a printf+recompile: one line per pin that actually
     // fired, past both gates above (and, upstream, past whatever mint pre-check its
-    // caller applied). Gated on dbg_channel_on so the interpolation is not built when
-    // tracing is off.
-    if dbg_channel_on("retpin") != 0 {
-        dbg_trace("retpin", "pin declared={type_to_str(d)} inferred={type_to_str(inferred_ret)}")
+    // caller applied). A private gate: the message renders types, which a trace.log message
+    // can not.
+    if trace_gate_on("blink.retpin") {
+        let declared = type_to_str(d)
+        let inferred = type_to_str(inferred_ret)
+        trace.log("blink.retpin", "pin declared={declared} inferred={inferred}")
     }
     let _ = tc_unify(d, inferred_ret)
 }
@@ -8162,8 +8164,10 @@ fn tc_check_closure_ann_against_declared(cls: Int, declared_fn: Int) ! TypeCheck
 // behaves exactly as it did before, and a value that is neither a literal nor a closure is
 // untouched.
 fn tc_seed_expected_into_value(val: Int, expected: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
-    if dbg_channel_on("seedv") != 0 {
-        dbg_trace("seedv", "enter val={val} kind={if val >= 0 { node_kind_name(node_kind(val)) } else { "<none>" }} expected={expected}")
+    // A private gate: the message reads the node pool, which a trace.log message can not.
+    if trace_gate_on("blink.seedv") {
+        let kind = if val >= 0 { node_kind_name(node_kind(val)) } else { "<none>" }
+        trace.log("blink.seedv", "enter val={val} kind={kind} expected={expected}")
     }
     if val == -1 || expected < 0 { return }
     let mut v = val
@@ -19152,7 +19156,7 @@ fn nr_module_global_index(name: Str, top: Int) -> Int {
     if decl < 0 { return top }
     let idx = nr_entry_holding(top, decl)
     if idx == -1 { return top }
-    if idx != top { dbg_trace("nr.global", "`{name}` in {nr_current_module}: entry {idx} (decl {decl}), not newest {top}") }
+    if idx != top { trace.log("blink.nr.global", "`{name}` in {nr_current_module}: entry {idx} (decl {decl}), not newest {top}") }
     idx
 }
 
@@ -38135,25 +38139,28 @@ pub fn tc_stamp_program(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Dia
     if live_unclaimed > 0 {
         let owner_index = tc_stamp_owner_index(order, owners)
         stood = tc_stamp_standdown_bodies(owner_index)
-        if dbg_channel_on("stamp") != 0 {
-            // The module-level pseudo-body is a key in `stood` but is not a body, so it is not
-            // counted as one.
-            let bodies = stood.len() - (if stood.contains_key(-1) { 1 } else { 0 })
-            dbg_trace("stamp", "stood down: {live_unclaimed} call(s) left to the codegen backstop, in {bodies} body(ies)")
-            for uc in tc_unclaimed_call_nodes() {
-                // A call the owner walk never reached is fenced by nothing, which stands the
-                // pass down everywhere — the same effect as a module-level call and a
-                // different cause, so the trace names them apart.
-                let ob = tc_stamp_owner_of(owner_index, uc)
-                let where_ = if ob == TC_STAMP_UNOWNED {
-                    "<unowned: the whole program stands down>"
-                } else if ob == -1 {
-                    "<module level>"
-                } else {
-                    node_name(ob)
-                }
-                dbg_trace("stamp", "  .{node_method(uc)}() at {node_line(uc)}:{node_col(uc)} in {where_}")
+        // The module-level pseudo-body is a key in `stood` but is not a body, so it is not
+        // counted as one.
+        let bodies = stood.len() - (if stood.contains_key(-1) { 1 } else { 0 })
+        trace.log("blink.stamp", "stood down: {live_unclaimed} call(s) left to the codegen backstop, in {bodies} body(ies)")
+        // The values are built with the channel off too, as a trace.log message can not read
+        // the node pool. A stand-down is rare, so that costs little.
+        for uc in tc_unclaimed_call_nodes() {
+            // A call the owner walk never reached is fenced by nothing, which stands the
+            // pass down everywhere — the same effect as a module-level call and a
+            // different cause, so the trace names them apart.
+            let ob = tc_stamp_owner_of(owner_index, uc)
+            let where_ = if ob == TC_STAMP_UNOWNED {
+                "<unowned: the whole program stands down>"
+            } else if ob == -1 {
+                "<module level>"
+            } else {
+                node_name(ob)
             }
+            let method = node_method(uc)
+            let line = node_line(uc)
+            let col = node_col(uc)
+            trace.log("blink.stamp", "  .{method}() at {line}:{col} in {where_}")
         }
         // A module-level call has no body to be fenced by: it types a global, and a global's
         // readers are the whole program. That one case still stands the pass down everywhere.

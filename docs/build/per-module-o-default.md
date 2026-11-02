@@ -179,7 +179,8 @@ asks for the one-unit build.
   directory and its record. A reused build prints the warnings of the
   front end again. These turn reuse off: `--no-cache`, an empty
   `BLINK_CACHE_DIR`, `--blink-trace`, `--trace`, `BLINK_TRACE` on
-  `blink run`, and a `BLINK_TRACE_CHANNELS` channel outside `build.*`.
+  `blink run`, and a `BLINK_TRACE_CHANNELS` compiler channel outside
+  `blink.build.*`, or `all`.
   On `src/cli.bl` the text is 6.2 MB.
 - **Unit reuse.** Beside each loaded source's bytes, the inputs text holds
   its interface text: its tokens with no positions and with no fn body
@@ -252,9 +253,13 @@ asks for the one-unit build.
   `tests/test_*.bl` on this path with no compiler archive, and
   `task ci-release` runs it. See the
   per-module corpus in `docs/codegen-rewrite/harness.md`.
-- **Trace.** `BLINK_TRACE_CHANNELS=build.units` prints `reuse emit` or
+- **Trace.** `BLINK_TRACE_CHANNELS=blink.build.units` prints `reuse emit` or
   `emit` once per build, then `hit <module>` or `compile <module>` for each
   unit.
+  Trace the compiler with `blink build`. Under `blink run`, `all` turns on
+  the channels of the compiler and of the program. The compiler writes text
+  lines, so do not use `all` with `blink run --trace` when you pipe stderr
+  to jq.
 - **Tests.** `blink test <file>` builds the program under test
   on this path, at the debug flags `blink test` always uses. The test bodies,
   the runner and `main` are in the `__main__` unit; each imported module is a
@@ -312,7 +317,7 @@ count as a call does. A header that has a line the build cannot read
 one-line declarations), or a name without `blink` in it, goes into every
 unit as an include of the whole header. A unit with no include of its
 own header gets no copy, and its key takes every header.
-`BLINK_TRACE_CHANNELS=build.unit_headers` prints a line for each unit
+`BLINK_TRACE_CHANNELS=blink.build.unit_headers` prints a line for each unit
 that takes a whole header, with the reason. A cold build of `src/cli.bl`
 prints none.
 

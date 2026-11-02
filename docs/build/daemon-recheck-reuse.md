@@ -563,7 +563,7 @@ Mutations that make the reused-check build test fail, each alone:
 - `unit_sources` without the sort (it marks every source untracked): only the
   `.emit-record` files differ, since their `uses` lines are empty.
 
-**Journal trace.** `BLINK_TRACE_CHANNELS=journal` prints, on each undo, the writes it undid,
+**Journal trace.** `BLINK_TRACE_CHANNELS=blink.journal` prints, on each undo, the writes it undid,
 the nodes it dropped and the pool it leaves. A daemon check undoes twice: the index of the
 entry (`daemon_index_entry`) loads before the client's output is captured, so its undo
 prints to the daemon's stderr; the check's own undo then has no writes and drops the nodes
@@ -603,7 +603,7 @@ compares them, or prints one:
 | `tc_unclaimed_call_nodes` (`src/typecheck.bl:14190`) | sorts by `node_load_rank` when the order moved |
 | `desugar_sealed_ops_calls`, `require_sealed_ops_rewritten` (`src/typecheck.bl`) | walk `parser_live_ranges()`; the rewrite of one call does not depend on another, only the order of their internal errors did |
 | internal errors that print a node id (`src/typecheck.bl:7299`, `:11063`, `src/mono.bl:173`) | not held: an internal error is a compiler bug, and its text names the id of that check |
-| `dbg_trace` channels | not held: debug output |
+| compiler `trace.log` channels | not held: debug output |
 | tables sized by the pool, filled by a walk from the program | read in walk order; the walk follows the merged lists, which are in load order |
 | maps keyed by node id | lookup or membership only; no output iterates one |
 

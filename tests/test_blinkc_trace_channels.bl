@@ -1,22 +1,15 @@
 // `build/blinkc` must honour BLINK_TRACE_CHANNELS.
 //
-// dbg_trace's sink (src/ast.bl:230) gates on the mutable global `dbg_channels`, and only
-// ONE binary ever set it: src/cli.bl:3520 reads the env var at the top of `main`. The
-// compiler binary src/blinkc_main.bl never did, so every `dbg_trace` channel was
-// permanently dark there — the trace call sites are compiled in, the env var is set, and
-// nothing is emitted.
+// The compiler's trace notes are trace.log calls on channels named `blink.<area>`, so the
+// runtime of each compiler binary reads the var. `build/blinkc` is the only MONOLITHIC
+// emitter: `blink build` has no monolith flag (`--emit binary|c|per-module-dir`), so a trace
+// channel that only fires on the archive-linked codegen path can be observed nowhere else.
+// The two build modes take different codegen paths and a sweep in one is not coverage of
+// the other, so a channel dark in blinkc is unmeasurable in half the compiler.
 //
-// That matters beyond convenience. `build/blinkc` is the only MONOLITHIC emitter: `blink
-// build` has no monolith flag (`--emit binary|c|per-module-dir`), so any trace channel that
-// only fires on the archive-linked codegen path can be observed nowhere else. The two build
-// modes take different codegen paths and a sweep in one is not coverage of the other
-// (feedback_corpus_sweep_is_not_coverage), so a channel dark in blinkc is unmeasurable in
-// half the compiler.
-//
-// Asserts through a real child process rather than by calling dbg_channel_on directly:
-// the defect was never in the sink, it was in one binary's startup, and only spawning
-// that binary can observe its startup. Uses `mono` as a representative tap, because it fires
-// once on every compile — the property under test is the env-var wiring, not any one channel.
+// Asserts through a real child process: only spawning the binary can observe what its
+// runtime reads at start. Uses `blink.mono` as a representative tap, because it fires once
+// on every compile — the property under test is the env-var wiring, not any one channel.
 
 import std.fs
 import std.process.{ProcessResult, ChildEnd}
@@ -50,18 +43,18 @@ fn have_blinkc() -> Bool ! FS.Read {
     path_exists("build/blinkc")
 }
 
-test "blinkc emits dbg_trace rows when BLINK_TRACE_CHANNELS names a channel" {
+test "blinkc writes trace lines when BLINK_TRACE_CHANNELS names a compiler channel" {
     if !have_blinkc() {
         skip("build/blinkc is not present in this working tree")
         return
     }
     fs.write(probe_path(), PROBE_SRC).unwrap()
-    let r = run_blinkc("env BLINK_TRACE_CHANNELS=mono")
+    let r = run_blinkc("env BLINK_TRACE_CHANNELS=blink.mono")
     let _ = fs.delete(probe_path())
-    // 2>&1 above: the sink writes to stderr, and folding it into stdout keeps this
-    // assertion independent of which stream a future dbg_trace picks.
+    // 2>&1 above: trace.log writes to stderr, and folding it into stdout keeps this
+    // assertion independent of the stream.
     assert_eq(r.end, ChildEnd.Exited(0))
-    assert(r.out.contains("[dbg:mono]"))
+    assert(r.out.contains("[trace:blink.mono] "))
 }
 
 test "blinkc stays silent when the env var is unset" {
@@ -75,7 +68,7 @@ test "blinkc stays silent when the env var is unset" {
     // Empty channel list must cost nothing and print nothing — the trace surface is a
     // debugging tap, not output.
     assert_eq(r.end, ChildEnd.Exited(0))
-    assert(!r.out.contains("[dbg:"))
+    assert(!r.out.contains("[trace:"))
 }
 
 test "an unrelated channel name does not turn a channel on" {
@@ -86,10 +79,10 @@ test "an unrelated channel name does not turn a channel on" {
     fs.write(probe_path(), PROBE_SRC).unwrap()
     let r = run_blinkc("env BLINK_TRACE_CHANNELS=nosuchchannel")
     let _ = fs.delete(probe_path())
-    // dbg_channel_on matches whole comma-delimited segments; wiring the var up must not
-    // degrade into "any non-empty value means all".
+    // An item matches a channel by its whole text; wiring the var up must not degrade into
+    // "any non-empty value means all".
     assert_eq(r.end, ChildEnd.Exited(0))
-    assert(!r.out.contains("[dbg:mono]"))
+    assert(!r.out.contains("[trace:"))
 }
 
 test "the wildcard turns a channel on" {
@@ -101,5 +94,17 @@ test "the wildcard turns a channel on" {
     let r = run_blinkc("env BLINK_TRACE_CHANNELS=all")
     let _ = fs.delete(probe_path())
     assert_eq(r.end, ChildEnd.Exited(0))
-    assert(r.out.contains("[dbg:mono]"))
+    assert(r.out.contains("[trace:blink.mono] "))
+}
+
+test "a program's channel name does not turn on the compiler channel of the same area" {
+    if !have_blinkc() {
+        skip("build/blinkc is not present in this working tree")
+        return
+    }
+    fs.write(probe_path(), PROBE_SRC).unwrap()
+    let r = run_blinkc("env BLINK_TRACE_CHANNELS=mono")
+    let _ = fs.delete(probe_path())
+    assert_eq(r.end, ChildEnd.Exited(0))
+    assert(!r.out.contains("[trace:"))
 }

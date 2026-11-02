@@ -42,7 +42,7 @@ import parser.{
     ann_str_val, positional_str_arg, positional_str_arg_count,
     parser_want_interface_text,
 }
-import ast.{NodeKind, dbg_channels, dbg_trace, trace_mode}
+import ast.{NodeKind, trace_gate_items, trace_gate_read, trace_mode}
 import typecheck.{TypeCheck, check_types, strip_module_qualifier, tc_builtin_trait_names}
 import sha256.{sha256_hex, read_file_bytes}
 import compiler.{
@@ -1712,7 +1712,7 @@ fn do_link_target(out: Str, c_path: Str, c_source: Str, link_flags: Str, obj_fil
     // The map gives the binary the __FILE__ and debug paths a compile of c_path gives.
     let compile_input = if cached_o != "" { cached_o } else { "{snap} -ffile-prefix-map={snap_dir}={path_dirname(c_path)}" }
     if build_objcache.dev_evict_at("link") {
-        dbg_trace("build.units", "dev evict link")
+        trace.log("blink.build.units", "dev evict link")
     }
     let ran = run_cc_step("-o {out} {compile_input}{objs}{includes}{archive} {effective_link_flags}", debug_mode, release_mode, target, test_build)
     if ran.rc != 0 && test_build {
@@ -2209,7 +2209,7 @@ fn write_unit_headers(program: Int, modules: List[Str], cfg: CgConfig, facts: Pr
         }
         match linked {
             Some(ts) => {
-                dbg_trace("build.unit_headers", "keep headers {m}")
+                trace.log("blink.build.unit_headers", "keep headers {m}")
                 kept.insert(surface_name, true)
                 kept.insert(internal_name, true)
                 names.push(surface_name)
@@ -2257,7 +2257,7 @@ fn unit_with_includes(c: Str, m: Str, hs: UnitHeaders) -> (Str, List[Str]) {
         Some(text) => {
             let mut all = [types]
             for h in d.whole {
-                dbg_trace("build.unit_headers", "whole {m}: {h}: {hs.index.why.get(h) ?? ""}")
+                trace.log("blink.build.unit_headers", "whole {m}: {h}: {hs.index.why.get(h) ?? ""}")
                 all.push(h)
             }
             (text, all)
@@ -2265,7 +2265,7 @@ fn unit_with_includes(c: Str, m: Str, hs: UnitHeaders) -> (Str, List[Str]) {
         // A unit with no include of its own header is not one the emitter wrote, so its key
         // takes every header: a header too many costs a recompile, one too few a stale object.
         None => {
-            dbg_trace("build.unit_headers", "whole {m}: every header: no include of {own}")
+            trace.log("blink.build.unit_headers", "whole {m}: every header: no include of {own}")
             (c, hs.files)
         }
     }
@@ -2316,14 +2316,14 @@ type CompiledUnits {
 }
 
 // A build reuses or records units only when the emit would print nothing: no trace but the
-// build's own channels. --no-cache asks for every step again.
+// build's own channels. A channel outside `blink.` is the program's, which the emit does not
+// write. --no-cache asks for every step again.
 fn emit_reuse_allowed() -> Bool ! Env.Read {
     if trace_mode != "" || cli_trace.codegen != 0 { return false }
     if cg_obj_cache_enabled == 0 || !build_objcache.cache_enabled() { return false }
-    if dbg_channels != "" {
-        for ch in dbg_channels.split(",") {
-            if !ch.starts_with("build.") { return false }
-        }
+    for item in trace_gate_items {
+        if item == "all" { return false }
+        if item.starts_with("blink.") && !item.starts_with("blink.build.") { return false }
     }
     true
 }
@@ -2364,7 +2364,7 @@ fn do_compile_units(source_path: Str, dir: Str, last_dir: Str, debug_mode: Int, 
     if inputs != "" {
         match emit_record.reuse(last_dir, dir, inputs, resolve_archive_dir()) {
             Some(r) => {
-                dbg_trace("build.units", "reuse emit")
+                trace.log("blink.build.units", "reuse emit")
                 if verify {
                     let vrc = verify_against_cold_emit(program, modules, cfg, r.units, dir, chunk_decls)
                     if vrc != 0 { return Err(vrc) }
@@ -2376,7 +2376,7 @@ fn do_compile_units(source_path: Str, dir: Str, last_dir: Str, debug_mode: Int, 
             None => {}
         }
     }
-    dbg_trace("build.units", "emit")
+    trace.log("blink.build.units", "emit")
     let entries_before = diag_entry_count()
     let ice_before = diag_ice_count
     let facts = program_facts(program, cfg)
@@ -2403,7 +2403,7 @@ fn do_compile_units(source_path: Str, dir: Str, last_dir: Str, debug_mode: Int, 
                     if units_hold_module(t.units, "__main__") {
                         taken_entry_key = entry_unit_key(program, cfg, facts)
                         if taken_entry_key != lb.rec.entry_key {
-                            dbg_trace("build.units", "skip unit __main__: the facts of the whole program it reads differ")
+                            trace.log("blink.build.units", "skip unit __main__: the facts of the whole program it reads differ")
                             taken = Some(emit_record.without_unit(t, "__main__"))
                             taken_entry_key = ""
                         }
@@ -2418,7 +2418,7 @@ fn do_compile_units(source_path: Str, dir: Str, last_dir: Str, debug_mode: Int, 
     match taken {
         Some(t) => {
             for u in t.units {
-                dbg_trace("build.units", "reuse unit {u.module}")
+                trace.log("blink.build.units", "reuse unit {u.module}")
                 by_module.insert(u.module, u)
             }
         }
@@ -2456,7 +2456,7 @@ fn do_compile_units(source_path: Str, dir: Str, last_dir: Str, debug_mode: Int, 
             // Another build replaced the last units directory after this one read its record,
             // and every unit declares what the kept headers held. The build writes the headers
             // and every unit as one that keeps and takes nothing.
-            dbg_trace("build.units", "emit the headers and every unit again")
+            trace.log("blink.build.units", "emit the headers and every unit again")
             for name in build_fs.list_or_empty(dir) {
                 if build_fs.is_live_mark(name) { continue }
                 let _ = build_fs.remove_tree("{dir}/{name}")
@@ -2488,7 +2488,7 @@ fn do_compile_units(source_path: Str, dir: Str, last_dir: Str, debug_mode: Int, 
                     // record, so what it took may be of two builds. It emits them after all.
                     taken_entry_key = ""
                     for u in t.units {
-                        dbg_trace("build.units", "emit unit {u.module} again")
+                        trace.log("blink.build.units", "emit unit {u.module} again")
                         for f in emit_record.unit_files(u) { let _ = fs.delete("{dir}/{f.stem}.c") }
                         match emit_unit(program, u.module, cfg, facts, hs, sources, dir, chunk_decls) {
                             Ok(e) => by_module.insert(u.module, e)
@@ -2562,7 +2562,7 @@ fn verify_cold_files(program: Int, modules: List[Str], cfg: CgConfig, units: Lis
             io.eprintln("error: emit reuse verify: header {f} is not the header a cold emit writes")
             return 1
         }
-        dbg_trace("build.units", "verify header {f} same")
+        trace.log("blink.build.units", "verify header {f} same")
     }
     let unit_modules = archive_unit_modules(program, cfg)
     let urc = units_bail_on_diag()
@@ -2600,7 +2600,7 @@ fn verify_cold_files(program: Int, modules: List[Str], cfg: CgConfig, units: Lis
                 io.eprintln("error: emit reuse verify: unit {f} is not the unit a cold emit writes: {why}")
                 return 1
             }
-            dbg_trace("build.units", "verify unit {f} same")
+            trace.log("blink.build.units", "verify unit {f} same")
         }
         ui = ui + 1
     }
@@ -3012,7 +3012,7 @@ fn run_unit_compiles(plain: List[Str], with_pch: List[Str], pch_ready: Bool, pch
     let mut pch_child = no_child()
     if pch.cmd != "" {
         // No key: the key holds the archive dir, and tests match this trace across trees.
-        dbg_trace("build.units", "pch build")
+        trace.log("blink.build.units", "pch build")
         pch_child = spawn_unit(pch.cmd, io_dir, "pch")
         if pch_child.pid < 0 {
             let _ = build_fs.reap_to_files(pch_child)
@@ -3184,7 +3184,7 @@ fn link_units(out: Str, work: Str, units_dir: Str, units: List[emit_record.Emitt
         let hit = hits.get(ui).unwrap()
         ui = ui + 1
         if hit != "" {
-            dbg_trace("build.units", "hit {u.stem}")
+            trace.log("blink.build.units", "hit {u.stem}")
             objs.insert(u.stem, hit)
         } else {
             misses.push(u)
@@ -3301,7 +3301,7 @@ fn link_units(out: Str, work: Str, units_dir: Str, units: List[emit_record.Emitt
     let mut pch_cmds: List[Str] = []
     let mut mi = 0
     for u in misses {
-        dbg_trace("build.units", "compile {u.stem}")
+        trace.log("blink.build.units", "compile {u.stem}")
         let line = "-c {unit_cc_flags().join(" ")} {work}/{u.stem}.c -o {obj_dir}/{u.stem}.o -MMD -MF {obj_dir}/{u.stem}.d -ffile-prefix-map={work}={units_dir}"
         cmds.push(cc_command("{line} {includes}", debug_mode, release_mode, target))
         if pch_hold != "" && prefixes.get(mi).unwrap() == pch_prefix && clang {
@@ -3314,7 +3314,7 @@ fn link_units(out: Str, work: Str, units_dir: Str, units: List[emit_record.Emitt
         mi = mi + 1
     }
     if build_objcache.dev_evict_at("compile") {
-        dbg_trace("build.units", "dev evict compile")
+        trace.log("blink.build.units", "dev evict compile")
     }
     let run = run_unit_compiles(cmds, pch_cmds, pch_ready, pch, unit_jobs, obj_dir)
     let mut results = run.results
@@ -3332,7 +3332,7 @@ fn link_units(out: Str, work: Str, units_dir: Str, units: List[emit_record.Emitt
     let mut dropped = false
     for a in run_unit_compiles(retry_cmds, retry_cmds, false, no_pch_job(), unit_jobs, obj_dir).results {
         let idx = retry_idx.get(a.idx).unwrap()
-        dbg_trace("build.units", "pch fallback {misses.get(idx).unwrap().stem} exit {a.exit_code}")
+        trace.log("blink.build.units", "pch fallback {misses.get(idx).unwrap().stem} exit {a.exit_code}")
         if a.exit_code == 0 && !dropped {
             build_objcache.drop_pch(pch_key)
             dropped = true
@@ -3357,7 +3357,7 @@ fn link_units(out: Str, work: Str, units_dir: Str, units: List[emit_record.Emitt
         let reads: Option[List[Str]] = if r.exit_code == 0 && key != "" { build_objcache.compile_reads(depfile, scope) } else { None }
         let _ = fs.delete(depfile)
         if r.used_pch {
-            dbg_trace("build.units", "pch use {m}")
+            trace.log("blink.build.units", "pch use {m}")
         }
         if r.exit_code != 0 {
             if test_build {
@@ -3406,7 +3406,7 @@ fn link_units(out: Str, work: Str, units_dir: Str, units: List[emit_record.Emitt
     let incl = if include_flags != "" { " {include_flags}" } else { "" }
     let effective_link_flags = if link_flags.contains("-pthread") { link_flags } else { "{link_flags} -pthread" }
     if build_objcache.dev_evict_at("link") {
-        dbg_trace("build.units", "dev evict link")
+        trace.log("blink.build.units", "dev evict link")
     }
     let ran = run_cc_step("-o {out} {link_objs.join(" ")}{incl} -I{arc_dir} {std_archive} -Wl,--gc-sections {effective_link_flags}", debug_mode, release_mode, target, test_build)
     if finish_pch(run) {
@@ -5634,7 +5634,7 @@ fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
                             // The pre-pass printed the warnings of a built file, so of the
                             // worker's stderr only the trace lines that the run asked for go on.
                             for line in r.err_out.split("\n") {
-                                if line.starts_with("[dbg:") {
+                                if line.starts_with("[trace:blink.") {
                                     io.eprintln(line)
                                 }
                             }
@@ -7602,10 +7602,9 @@ fn main() {
         tune_compiler_gc(env.var("GC_FREE_SPACE_DIVISOR"))
         init_embedded_stdlib()
 
-        // Fine-grained internal trace channels (ast.dbg_trace). Comma-separated
-        // channel names, or "all". Empty = off (zero cost). Set once here so every
-        // command path (build/run/check + hidden archive/per-module emitters) sees it.
-        dbg_channels = env.var("BLINK_TRACE_CHANNELS") ?? ""
+        // The private trace gates read the channel list once, as the runtime does for
+        // trace.log.
+        trace_gate_read(env.var("BLINK_TRACE_CHANNELS") ?? "")
         quiet_manifest_lib()
 
         if argv.len() >= 2 && argv.get(1).unwrap() == "__emit-archive-header" {
