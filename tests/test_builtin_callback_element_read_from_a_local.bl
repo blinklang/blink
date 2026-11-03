@@ -1,0 +1,60 @@
+// A local has no type on the walk before inference, so a built-in HOF's element or accumulator
+// read from a local is not known on that walk. A callback must not be judged until it is.
+
+import compile_test_helpers
+
+fn bcl_inc(x: Int) -> Int { x + 1 }
+fn bcl_add(a: Int, x: Int) -> Int { a + x }
+fn bcl_pos(x: Int) -> Bool { x > 0 }
+fn bcl_order(a: Int, b: Int) -> Ordering { a.cmp(b) }
+
+fn rejects(body: Str, tag: Str, want: Str) ! FS.Delete, FS.Write, Process.Spawn, FS.Read, Env.Read, IO.Print {
+    let src = "fn inc(x: Int) -> Int \{ x + 1 }\nfn add(a: Int, x: Int) -> Int \{ a + x }\nfn pos(x: Int) -> Bool \{ x > 0 }\nfn main() \{ {body} }\n"
+    let out = compile_test_helpers.compile_and_capture(src, tag)
+    compile_test_helpers.expect_error(out, "E0300", tag)
+    compile_test_helpers.expect_contains(out, want, tag)
+}
+
+test "a list built from a local takes a named fn" {
+    let o = 1
+    assert_eq([o].map(bcl_inc), [2])
+    assert_eq([o].filter(bcl_pos), [1])
+    assert_eq([o, 0].sort_by(bcl_order), [0, 1])
+    assert_eq([o].into_iter().map(bcl_inc).collect(), [2])
+}
+
+test "a local accumulator takes a named fn" {
+    let g = 1
+    assert_eq([1].fold(g, bcl_add), 2)
+    assert_eq([1].into_iter().fold(g, bcl_add), 2)
+}
+
+test "a tuple field, a closure binder, a for binder and a match binder take a named fn" {
+    let t = (1, "s")
+    assert_eq([t.0].map(bcl_inc), [2])
+    let f = fn(o: Int) { [o].map(bcl_inc) }
+    assert_eq(f(1), [2])
+    for o in [1] {
+        assert_eq([o].map(bcl_inc), [2])
+    }
+    match Some(1) {
+        Some(o) => assert_eq([o].map(bcl_inc), [2])
+        None => {}
+    }
+}
+
+test "the result of a callback on a local element keeps its type" {
+    let o = 1
+    let a = [o].map(bcl_inc)
+    let n: Int = a.get(0).unwrap()
+    assert_eq(n, 2)
+}
+
+test "a local of the wrong type is still reported" {
+    rejects("let o = \"s\"\n let _ = [o].map(inc)", "bcl_map", "Str")
+    rejects("let o = \"s\"\n let _ = [o].filter(pos)", "bcl_filter", "Str")
+    rejects("let o = \"s\"\n let _ = [o].into_iter().map(inc).collect()", "bcl_it_map", "Str")
+    rejects("let g = \"s\"\n let _ = [1].fold(g, add)", "bcl_fold", "Str")
+    rejects("let t = (\"s\", 1)\n let _ = [t.0].map(inc)", "bcl_tuple", "Str")
+    rejects("for o in [\"s\"] \{ let _ = [o].map(inc) }", "bcl_for", "Str")
+}
