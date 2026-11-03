@@ -4,7 +4,7 @@ Single source of truth for release history. `blink llms` and `blink llms --full`
 
 ## Breaking Changes (v0.61.0)
 
-- **`Bool` and `Int` are distinct types (section 3.4).** An `Int` where a `Bool` is wanted, or a `Bool` where an `Int` is wanted, is now E0300 at a declaration, an argument, a struct field and a return. The condition of `if` and `while`, a match guard, and each operand of `&&`, `||` and `!` must be `Bool`: `if n { }`, `while 1 { }` and `!n` fail. `==` and `!=` between a `Bool` and an `Int` fail. A `true` or `false` pattern on an `Int` and an integer pattern on a `Bool` fail. Each error has a caret under the operand, the note `Blink has no truthiness` and a help line, and `blink fix` applies the rewrite: `n != 0`, `if b { 1 } else { 0 }`, `b`, `!b`. `Bool` has no `to_int()` and `Int` has no `to_bool()`. A function that returns a test should now say `-> Bool`.
+- **`Bool` and `Int` are distinct types (section 3.4).** An `Int` where a `Bool` is wanted, or a `Bool` where an `Int` is wanted, is now E0300 at a declaration, an argument, a struct field, a field default and a return. The condition of `if`, `while`, `assert` and `debug_assert`, a match guard, and each operand of `&&`, `||` and `!` must be `Bool`: `if n { }`, `while 1 { }` and `!n` fail. `==` and `!=` between a `Bool` and an `Int` fail. A `true` or `false` pattern on an `Int` and an integer pattern on a `Bool` fail. Each error has a caret under the operand, the note `Blink has no truthiness` and a help line, and `blink fix` applies the rewrite: `n != 0`, `if b { 1 } else { 0 }`, `b`, `!b`. `Bool` has no `to_int()` and `Int` has no `to_bool()`. A function that returns a test should now say `-> Bool`.
 
 ## Breaking Changes (v0.60.0)
 

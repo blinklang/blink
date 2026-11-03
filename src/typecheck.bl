@@ -9524,12 +9524,22 @@ fn tc_text_is_one_paren(text: Str) -> Bool {
     let mut i = 0
     while i < text.byte_len() {
         let c = text.byte_at(i)
+        // A paren in a char literal is not a group: `(m.get('(')) ?? (n)` is two groups.
+        if c == 39 {
+            i = i + 1
+            while i < text.byte_len() && text.byte_at(i) != 39 {
+                if text.byte_at(i) == 92 { i = i + 1 }
+                i = i + 1
+            }
+            // An apostrophe with no pair is in a comment, which the scan cannot read.
+            if i >= text.byte_len() { return false }
+        }
         if c == 40 { depth = depth + 1 }
         if c == 41 { depth = depth - 1 }
         if depth == 0 && i < text.byte_len() - 1 { return false }
         i = i + 1
     }
-    true
+    depth == 0
 }
 
 // An integer operand that `==` and `!=` would pull apart: every other operator with an integer
@@ -9616,6 +9626,9 @@ fn tc_comparison_fits(node: Int, p: WrittenOperand) -> Bool {
 }
 
 // A value of one where the other is wanted, whatever the site. False when this is not that pair.
+// For a Bool with no written text to quote: a help names only what the source has.
+const BOOL_TO_INT_HELP = "use an `if` that gives `1` or `0`"
+
 fn tc_report_bool_int_value(msg: Str, val0: Int, want: Int, got: Int) -> Bool ! TypeCheck.Report, Diag.Report {
     if val0 < 0 { return false }
     let k0 = node_kind(val0)
@@ -9635,7 +9648,7 @@ fn tc_report_bool_int_value(msg: Str, val0: Int, want: Int, got: Int) -> Bool ! 
         return true
     }
     if p.text == "" {
-        tc_report_no_truthiness(msg, val, label, "use `if b \{ 1 \} else \{ 0 \}`", [], [])
+        tc_report_no_truthiness(msg, val, label, BOOL_TO_INT_HELP, [], [])
         return true
     }
     tc_report_no_truthiness(msg, val, label, "use `if {p.text} \{ 1 \} else \{ 0 \}`", [], [tc_insert_before(p, "if "), tc_insert_after(p, " \{ 1 \} else \{ 0 \}")])
@@ -9768,12 +9781,12 @@ fn tc_report_bool_to_int(node: Int) ! Diag.Report {
     let msg = "unresolved method `.to_int` on type Bool"
     let p = tc_written_operand(node)
     let suffix = ".to_int()"
-    let obj = if p.text.ends_with(suffix) { p.text.byte_slice(0, p.text.byte_len() - suffix.byte_len()) } else { "" }
+    // A chain written over two lines has the break before the dot, which belongs to the layout.
+    let obj = if p.text.ends_with(suffix) { p.text.byte_slice(0, p.text.byte_len() - suffix.byte_len()).trim_right() } else { "" }
     let end_col = if p.end_line == p.line { p.end_col } else { 0 }
     let before = diag_entry_count()
-    let shown = if obj == "" { "b" } else { obj }
-    let rewrite = "if {shown} \{ 1 \} else \{ 0 \}"
-    let help = "use `{rewrite}`"
+    let rewrite = "if {obj} \{ 1 \} else \{ 0 \}"
+    let help = if obj == "" { BOOL_TO_INT_HELP } else { "use `{rewrite}`" }
     diag_error_span_at_notes("UnresolvedMethod", UNRESOLVED_METHOD, msg, node, p.line, p.col, end_col, help, [NO_TRUTHINESS_NOTE])
     if diag_entry_count() == before || obj == "" { return }
     let text = if tc_stands_alone(node, p) { rewrite } else { "({rewrite})" }
