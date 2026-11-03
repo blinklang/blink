@@ -917,10 +917,10 @@ fn resolve_from_lockfile(dotted_path: Str, _src_root: Str) -> Option[Str] ! Diag
 // are OPTIONAL documentation markers that must resolve as recognized inert
 // no-ops — never ModuleNotFound (6-0 panel decision; the two real FFI gates are
 // PtrOutsideFfiContext/E0811 and the #275 native-dependencies manifest requirement).
-fn is_blink_pseudo_module(dotted_path: Str) -> Int {
-    if dotted_path == "blink.ffi" { return 1 }
-    if dotted_path == "blink.core" { return 1 }
-    0
+fn is_blink_pseudo_module(dotted_path: Str) -> Bool {
+    if dotted_path == "blink.ffi" { return true }
+    if dotted_path == "blink.core" { return true }
+    false
 }
 
 pub fn resolve_module_path(dotted_path: Str, src_root: Str) -> Str ! Diag.Report, Env.Read, FS.Read, IO {
@@ -952,7 +952,7 @@ pub fn resolve_module_path(dotted_path: Str, src_root: Str) -> Str ! Diag.Report
     let full = if bl_exists { full_bl } else { full_pact }
 
     // Step 1: Check local src/ (skip for std.* — reserved stdlib namespace)
-    let local_exists = if is_std_ns { 0 } else if bl_exists { 1 } else { probe_file(full_pact) }
+    let local_exists = !is_std_ns && (bl_exists || probe_file(full_pact))
 
     // Step 2: Check dependencies via blink.lock
     ensure_lockfile_loaded(src_root)
@@ -1000,7 +1000,7 @@ pub fn resolve_module_path(dotted_path: Str, src_root: Str) -> Str ! Diag.Report
             }
         }
         let pkg_key = "pkg/".concat(dots_to_underscores(dotted_path.byte_slice(4, dotted_path.byte_len())))
-        if embedded_contains(pkg_key) != 0 {
+        if embedded_contains(pkg_key) {
             return "<embedded:{pkg_key}>"
         }
     }
@@ -1037,7 +1037,7 @@ pub fn resolve_module_path(dotted_path: Str, src_root: Str) -> Str ! Diag.Report
             }
         }
         if std_resolved == "" {
-            if embedded_contains(std_key) != 0 {
+            if embedded_contains(std_key) {
                 std_resolved = "<embedded:{std_key}>"
             }
         }
@@ -1353,7 +1353,7 @@ pub fn register_embedded(key: Str, source: Str) {
     embedded_stdlib.insert(key, source)
 }
 
-pub fn embedded_contains(key: Str) -> Int {
+pub fn embedded_contains(key: Str) -> Bool {
     embedded_stdlib.contains_key(key)
 }
 
@@ -1402,7 +1402,7 @@ fn detect_package_cycles() -> Str {
         let to = pkg_edges.imported.get(i).unwrap()
         all_pkgs.insert(from, 1)
         all_pkgs.insert(to, 1)
-        if adj.contains_key(from) == 0 {
+        if !adj.contains_key(from) {
             let mut neighbors: List[Str] = []
             neighbors.push(to)
             adj.insert(from, neighbors)
@@ -1433,7 +1433,7 @@ fn detect_package_cycles() -> Str {
     let mut pi = 0
     while pi < pkg_list.len() {
         let pkg = pkg_list.get(pi).unwrap()
-        if visited.contains_key(pkg) == 0 {
+        if !visited.contains_key(pkg) {
             stack.clear()
             let result = dfs_detect_cycle(pkg, adj, visited, in_stack, stack)
             if result != "" {
@@ -1451,12 +1451,12 @@ fn dfs_detect_cycle(node: Str, adj: Map[Str, List[Str]], visited: Map[Str, Int],
     in_stack.insert(node, 1)
     stack.push(node)
 
-    if adj.contains_key(node) != 0 {
+    if adj.contains_key(node) {
         let neighbors = adj.get(node).unwrap()
         let mut i = 0
         while i < neighbors.len() {
             let neighbor = neighbors.get(i).unwrap()
-            if in_stack.contains_key(neighbor) != 0 {
+            if in_stack.contains_key(neighbor) {
                 let mut cycle_parts: List[Str] = []
                 let mut j = 0
                 let mut found_start = 0
@@ -1481,7 +1481,7 @@ fn dfs_detect_cycle(node: Str, adj: Map[Str, List[Str]], visited: Map[Str, Int],
                 }
                 return sb.to_str()
             }
-            if visited.contains_key(neighbor) == 0 {
+            if !visited.contains_key(neighbor) {
                 let result = dfs_detect_cycle(neighbor, adj, visited, in_stack, stack)
                 if result != "" {
                     return result
@@ -1885,7 +1885,7 @@ pub fn collect_imports(program: Int, src_root: Str, all_programs: List[Int]) ! L
         // source — record the import for selective-name resolution but never
         // load/parse a file for it.
         let is_pseudo = file_path.starts_with("<blink-pseudo:")
-        if file_path != "" && is_pseudo == 0 {
+        if file_path != "" && !is_pseudo {
             let tgt_pkg = extract_package(file_path, src_root)
             if src_pkg != "" && tgt_pkg != "" && src_pkg != tgt_pkg {
                 pkg_edges.importers.push(src_pkg)
@@ -1896,7 +1896,7 @@ pub fn collect_imports(program: Int, src_root: Str, all_programs: List[Int]) ! L
             }
         }
         let mut target_mod = ""
-        if file_path != "" && is_pseudo == 0 {
+        if file_path != "" && !is_pseudo {
             // The program's own file is loaded first and its declarations carry "__main__".
             target_mod = if file_path == (loaded_inputs.files.get(0) ?? "") { "__main__" } else { find_module_key(file_path) }
         }
@@ -2188,7 +2188,7 @@ pub fn check_unused_imports() ! Diag.Report {
             // without them, so such an import is never "unused" in a way worth
             // warning about.
             let is_pseudo = is_blink_pseudo_module(node_str_val(imp_node))
-            if node_is_pub(imp_node) == 0 && selective_import_all_prelude(imp_node) == 0 && is_pseudo == 0 {
+            if node_is_pub(imp_node) == 0 && selective_import_all_prelude(imp_node) == 0 && !is_pseudo {
                 let display_name = if qualifier != "" { qualifier } else { mod_key }
                 diag_warn_at("UnusedImport", UNUSED_IMPORT, "module `{display_name}` is imported but not used", imp_node, "remove the unused import")
                 diag_set_last_fix("Remove unused import", "")
