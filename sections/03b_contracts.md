@@ -203,6 +203,13 @@ let account = BankAccount { owner: "Alice", balance: 1000 }
 // OK: invariant holds
 ```
 
+A bound written on a type declaration, as `T: Ord` on `SortedList`, holds at each place where a program writes or infers the type: `SortedList[Bad]` is `error[TraitBoundNotSatisfied]` (E0306) when `Bad` has no `Ord` impl (§3.6 *Bounds on a Type Declaration*). The `@invariant` of the declaration is under that bound, so it may use methods of `Ord` on `T`. A function that names `SortedList[U]` gets nothing from the bound: it writes `U: Ord` itself.
+
+```blink
+fn first[U: Ord](xs: SortedList[U]) -> U? { xs.items.get(0) }   // OK: `first` writes the bound
+fn count[U](xs: SortedList[U]) -> Int { xs.items.len() }        // error[TraitBoundNotSatisfied] (E0306) at `U`
+```
+
 #### A Complete Example
 
 ```blink

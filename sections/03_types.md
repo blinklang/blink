@@ -3280,7 +3280,7 @@ let r = Registry[User] { entries: [] }      // OK -- brackets on a struct-litera
 
 - **All or none.** A type-argument list supplies every one of the declaration's type parameters or none of them. There is no partial application and no placeholder for "infer this one."
 - **Arity is exact.** Supplying the wrong count is `error[TypeArgArity]` (E0303) in every position — at a callee exactly as in a type position (§3.4 *Kind-Correctness*) — not a prompt to infer the remainder.
-- **Bounds are checked against the arguments as written.** An explicit type argument satisfies the binder's bounds or the call is rejected; explicitness never bypasses a bound. The error is E0306, or E0523 for a `Display` bound (§3.6 *Trait Bounds*).
+- **Bounds are checked against the arguments as written.** An explicit type argument satisfies the binder's bounds or the program is rejected; explicitness never bypasses a bound. This holds for a bound written on a function and for a bound written on a type declaration (§3.6 *Bounds on a Type Declaration*). The error is E0306, or E0523 for a `Display` bound (§3.6 *Trait Bounds*).
 
 **A redundant type-argument list is permitted and carries no diagnostic.** When inference would have reached the same answer, writing the arguments anyway is neither an error nor a warning nor a lint — exactly as `let x: Int = 1` is permitted where `let x = 1` would do. A diagnostic here would be non-monotonic: adding an annotation elsewhere in the program could make an untouched line retroactively noisy.
 
@@ -3298,7 +3298,7 @@ let m: Tagged[Meters] = Tagged { source: "12.5" }
 let f: Tagged[Feet] = Tagged { source: "41.0" }     // a distinct type from Tagged[Meters]
 ```
 
-`Tagged[Meters]` and `Tagged[Feet]` are different types, and neither is assignable to the other. This pattern is not reserved to compiler-known types — it is the same mechanism the compiler-known `Template[C]` uses (§3b.5), available to user code on the same terms.
+`Tagged[Meters]` and `Tagged[Feet]` are different types, and neither is assignable to the other. This pattern is not reserved to compiler-known types — it is the same mechanism the compiler-known `Template[C]` uses (§3b.5), available to user code on the same terms. A phantom parameter that has a bound is checked at the annotation, although no value holds the argument (§3.6 *Bounds on a Type Declaration*).
 
 **Lint: a type parameter that occurs nowhere.** `W0604 UnusedTypeParamBinder` fires when **the type parameter occurs nowhere in the declaration or its body.** That is the whole gate, and it is decided by inspection of one declaration:
 
@@ -6292,6 +6292,130 @@ fn dedup[T: Eq + Hash](items: List[T]) -> List[T] {
 
 An argument whose type does not implement the bound's trait is `error[TraitBoundNotSatisfied]` (E0306), with one exception: a failed `Display` bound is `error[E0523]` (`MissingDisplayImpl`) at every call, so a missing `Display` impl reads the same whether the call is `"{x}"`, `sb.write(x)`, `io.println(x)` or `print_all(xs)` (§3.6 *Display Format Protocol*).
 
+The E0306 of a call carries a `note:` that names the declaration which wrote the bound and gives its location, as `` `max` declares `T: Ord` at a.bl:1:8 ``. The `--json` form carries the note too. The same note is part of the error for a bound written on a type declaration (§3.6 *Bounds on a Type Declaration*), where the bound is checked at each place a program writes or infers the type, not only at a call.
+
+#### Bounds on a Type Declaration
+
+A bound written on a type declaration restricts the type. In `type S[T: Tr] { v: T }`, `S[X]` is a type only when `X` implements `Tr`. The compiler checks the bound at each place where a program writes `S[X]` and at each place where inference gives `S` an argument. A failed bound is `error[TraitBoundNotSatisfied]` (E0306), or `error[MissingDisplayImpl]` (E0523) for a `Display` bound, the same as at a call. The bound causes no run-time check and changes no layout.
+
+The rule is for a bound that a declaration writes. It adds no bound that nobody wrote.
+
+**Where the compiler checks.** Two kinds of place count:
+
+- **A written type.** An annotation, a parameter type, a return type, a field type, an alias target, an `impl` header, a type argument written at a call, and a type argument nested in another type (`List[S[Bad]]`). The check does not need a value or a call: a function that nobody calls, and a phantom parameter that no field holds, are checked too.
+- **An inferred argument.** A struct literal or a variant constructor whose argument comes from inference, as in `S { v: Bad { x: 1 } }` and `E.L(Bad { x: 1 })`. The check runs when inference for the item ends. A type argument that inference never fixes gets no E0306; it is `error[CannotInferType]` (E0301). The order of items and files does not matter: an `impl` counts wherever it is.
+
+```blink
+trait Tr { fn m(self) -> Int }
+type Good { x: Int }
+impl Tr for Good { fn m(self) -> Int { self.x } }
+type Bad { x: Int }
+
+type S[T: Tr] { v: T }
+type E[T: Tr] { L(T), N }
+type Ph[T: Tr] { n: Int }
+
+let a = S { v: Good { x: 1 } }           // OK
+let b = S { v: Bad { x: 1 } }            // error[TraitBoundNotSatisfied] (E0306) at `S`; note: T := Bad
+let c = E.L(Bad { x: 1 })                // E0306 at `E.L`
+let d: S[Bad] = S { v: Bad { x: 1 } }    // E0306, one report, at `Bad` in the annotation
+let e: E[Bad] = E.N                      // E0306 at `Bad`: no value holds a `Bad`
+let p: Ph[Bad] = Ph { n: 1 }             // E0306 at `Bad`: a phantom parameter has the bound too
+
+fn f1(s: S[Bad]) -> Int { s.v.x }        // E0306 at `Bad`, although nothing calls f1
+type W { s: S[Bad] }                     // E0306 at `Bad`
+type A = S[Bad]                          // E0306 at `Bad`
+fn f2(s: S[Good]) -> Int { s.v.m() }     // OK: `Good` has its own impl of `Tr`
+
+let mut xs = []
+xs.push(S { v: Good { x: 1 } })          // OK: inference fixes T := Good
+```
+
+A `Display` bound gives E0523 in the same places:
+
+```blink
+type Label[T: Display] { v: T }
+let l: Label[Bad] = Label { v: Bad { x: 1 } }    // error[MissingDisplayImpl] (E0523), one report, at `Bad`
+```
+
+A literal whose type comes from a written type does not report again. In `d`, the annotation is the one cause, so there is one report. For the call `f1(S { v: Bad { x: 1 } })`, the report is at the parameter type in `f1`. For `g(S { v: Bad { x: 1 } })` with `fn g[V: Tr](s: S[V])`, the literal and `V` fail from one cause, and there is one report, at the literal.
+
+A field default is not on this rule. A default is a const expression (§2.14), so it cannot call a method of `Tr`.
+
+**No implied bounds.** A type parameter of a function, an impl, a type or a trait meets the bound of `S` only through a bound that its own binder writes (*No implied bounds*, below). A body gets no method of `Tr` from `S` either:
+
+```blink
+fn k1[U](s: S[U]) -> Int { 1 }           // error[TraitBoundNotSatisfied] (E0306) at `U` in `S[U]`
+fn k2[U: Tr](s: S[U]) -> Int { 1 }       // OK
+type W2[T] { s: S[T] }                   // E0306 at `T`
+type W3[T: Tr] { s: S[T] }               // OK
+type A2[X: Tr] = S[X]                    // OK
+type R[T: Tr] { next: Option[R[T]] }     // OK: R writes T: Tr itself
+trait Foo { fn g(self) -> S[Self] }      // E0306 at `Self` until the trait is `trait Foo: Tr`
+```
+
+Only code inside the declaration of `S` is under the bound of `S`. The `@invariant` of `type SortedList[T: Ord]` (§3b.2 *Type Invariants with `@invariant`*) may use methods of `Ord` on `T` for this reason. A function that names `SortedList[U]` writes `U: Ord` itself. Whether an `@invariant` body type-checks is a separate matter from this rule, and no example here depends on it.
+
+A function writes the bound on its own binder. The help for a type parameter of the item is a machine-applicable fix (§8.6). It inserts `: Tr` after a bare parameter, or ` + Tr` on a bound list. A function has no `where` clause, so the help offers no `where` item. The binder edit is the first help. A bound on a type should be rare: write it on a type only when the declaration itself needs it, and write it on the function or the `impl` in all other cases.
+
+**An impl header is a written type.**
+
+```blink
+trait Q { fn q(self) -> Int }
+impl[T] Q for S[T] { fn q(self) -> Int { 1 } }       // E0306 at `T` in `S[T]`, whatever the body does
+impl[T: Tr] Q for S[T] { fn q(self) -> Int { 1 } }   // OK
+impl Q for S[Bad] { fn q(self) -> Int { 1 } }        // E0306 at `Bad`
+```
+
+`@derive` copies the declared bounds. For `@derive(Eq) type D[T: Tr] { v: T }`, the generated impl is `impl[T: Tr + Eq] Eq for D[T]`, so no E0306 points at generated code. This is a bound that the declaration wrote, not an implied bound.
+
+**The diagnostic.** The primary span is the type argument, as written, when the program writes the type. When inference gives the argument, the primary span is the head: `S` in `S { v: Bad { x: 1 } }`, and `E.L` for a variant. The head always exists, also where no single argument has the type (two fields share `T`, or `T` is phantom). Then a `note:` says `T := Bad`. When one field fixed `T`, a secondary label marks that field. Every E0306 on a declared bound carries a `note:` that names the declaration and gives the place of its bound; the `--json` form carries the note too (§8.6). For a type parameter of the enclosing item, the first help is the machine-applicable binder edit. For a concrete type there is no machine-applicable fix, because the compiler cannot write an impl body; the help is to use a type that has the impl, or to write it.
+
+```
+error[TraitBoundNotSatisfied]: `U` does not satisfy the Tr bound on type parameter T of S: `U` has no Tr bound
+  --> a.bl:7:14
+  |
+7 | fn f[U](s: S[U]) -> Int { 1 }
+  |              ^
+  |
+  = note: `S` declares `T: Tr` at a.bl:5:8
+  = help: write the bound on the binder: `fn f[U: Tr]`
+```
+
+```
+error[TraitBoundNotSatisfied]: `Bad` does not satisfy the Tr bound on type parameter T of S: it has no impl of Tr
+  --> a.bl:9:9
+  |
+9 | let s = S { v: Bad { x: 1 } }
+  |         ^   --------------- `T` is fixed by this field
+  |
+  = note: T := Bad
+  = note: `S` declares `T: Tr` at a.bl:5:8
+  = help: use a type that implements Tr, or write `impl Tr for Bad`
+```
+
+**The count of reports.** A concrete argument reports at each site, because each site has its own repair: change the type, or write one impl. A type parameter of the enclosing item reports once for each binder and trait, at the first occurrence in source order. One edit to that binder clears every occurrence, and one report states the one fault.
+
+After the compiler reports E0306 for a binder `U` and a trait `Tr`, it checks the rest of that item as if `U: Tr` were written. This is error recovery in a program that is already rejected: the program still fails, no code is generated, and no program becomes valid. The assumption comes only after the error is reported, and it holds only in the item that owns the binder. It shows what the program has left after the repair. An error that the repair does not clear still reports. A concrete argument gets no such recovery, because `impl Tr for Bad` would be a new fact and the repair is not unique.
+
+```blink
+fn f[U](a: S[U], b: S[U]) -> S[U] { S { v: a.v } }   // one E0306, at the first `S[U]`
+fn d[U](s: S[U]) -> Int { s.v.m() }                  // E0306 at `U`; one error
+fn e[U](u: U) -> S[U] { S { v: u } }                 // E0306 at `U`; one error
+fn g[U](s: S[U]) -> Int { s.v.nope() }               // E0306, and also the error for `nope`
+fn h(s: S[Bad]) -> Int { s.v.m() }                   // E0306 at `Bad`, then UnresolvedMethod (E0505)
+```
+
+The count rule is for one compile. It does not promise how many compiles a program needs, and a different repair can show a report that was not visible before. If a repair changes the first `S[U]` to a type with no `U`, the next `S[U]` reports on the next compile. One shape has two reports. The signature has no `S[U]`, so the first error comes from `u.m()`. The E0306 comes later, at the literal, and the recovery starts after that report, so it removes nothing that came before it:
+
+```blink
+fn j[U](u: U) -> Int {
+    let n = u.m()               // error: `U` has no bound that gives it `m` (a rule outside this section)
+    let s = S { v: u }          // error[TraitBoundNotSatisfied] (E0306) at `S`; note: T := U
+    n
+}
+```
+
 #### Why Traits Over Inheritance
 
 Inheritance creates vertical hierarchies. Understanding a method call requires traversing the class tree upward through potentially dozens of files. This is anti-locality at its worst -- a single method dispatch can depend on code scattered across an entire codebase.
@@ -6551,7 +6675,7 @@ error[MissingSupertraitImpl]: impl Ord for H[T] requires H[T] to also implement 
 
 The help is machine-applicable. It adds only the bounds that the impl's own bounds do not already give, in the form the impl already uses: `: Eq` after a bare parameter, ` + Eq` on a bound list, or an item in the `where` clause. If the receiver type has no impl of the supertrait at all, the help is to derive it or to write it (`@derive(Eq)` on the type, or a hand-written `impl Eq`).
 
-**No implied bounds.** The compiler never adds a bound that the user did not write. `impl[T] Ord for H[T]` does not mean `impl[T: Eq] Ord for H[T]`. A polymorphic impl varies behavior only through the bounds it writes.
+**No implied bounds.** The compiler never adds a bound that the user did not write. `impl[T] Ord for H[T]` does not mean `impl[T: Eq] Ord for H[T]`. A polymorphic impl varies behavior only through the bounds it writes. The same holds for a bound written on a type declaration: `fn f[U](s: S[U])` with `type S[T: Tr]` is E0306 until the function writes `fn f[U: Tr]`, and `s.v.m()` gets no method from the bound of `S` (*Bounds on a Type Declaration*).
 
 **A derived supertrait impl.** The supertrait impl can come from `@derive`. The rule, the code, the message and the help are the same as for a hand-written pair, and a label or note points at the `@derive(...)` attribute. With `@derive(Eq)` on `H[T]`, the hand-written `impl[T] Ord for H[T]` is E0911, and the help is `impl[T: Eq] Ord for H[T]`. For the bounds of a derived impl, see *Supertrait Auto-Derivation*.
 
@@ -6990,7 +7114,7 @@ error[E0505]: unresolved method `.to_string` on type Int
 | `s.rjust(w)`, `s.padStart(w)`, `s.pad_left(w, c)` | `s.pad_start(w, ' ')` (or the given fill) |
 | `s.ljust(w)`, `s.padEnd(w)`, `s.pad_right(w, c)` | `s.pad_end(w, ' ')` (or the given fill) |
 
-**Every Display sink uses the same bound.** `"{x}"`, `x.display()`, `sb.write(x)` (§3.2 *String Building*) and the `io` print functions (§4.4) each require `T: Display` and nothing else. A `Str` argument is one `Display` type among five; it takes no separate path in the type system. A value that fails the bound at any of these sinks, or at any other call whose type parameter is bounded by `Display`, gets the same `MissingDisplayImpl` (E0523) error. The message names the sink and the span covers the argument:
+**Every Display sink uses the same bound.** `"{x}"`, `x.display()`, `sb.write(x)` (§3.2 *String Building*) and the `io` print functions (§4.4) each require `T: Display` and nothing else. A `Str` argument is one `Display` type among five; it takes no separate path in the type system. A value that fails the bound at any of these sinks, or at any other call whose type parameter is bounded by `Display`, gets the same `MissingDisplayImpl` (E0523) error. A `Display` bound that a type declaration writes (`type Label[T: Display]`) gives the same error where a program writes or infers `Label[X]` (*Bounds on a Type Declaration*). The message names the sink and the span covers the argument:
 
 ```
 error[E0523]: type `Matrix` does not implement `Display`
