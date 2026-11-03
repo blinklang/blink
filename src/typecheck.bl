@@ -5,7 +5,7 @@ import unparse.{type_ann_text, unparse_expr, unparse_binop_with_lhs, unparse_ran
 import formatter.{effect_op_sig_text}
 import import_edit.{ImportEdit, ImportNeed, import_aliased_edit, import_module_edit, import_need}
 import parser.{
-    effect_derived_ops, node_load_rank, parser_load_order_moved, parser_live_ranges,
+    node_written_span, effect_derived_ops, node_load_rank, parser_load_order_moved, parser_live_ranges,
     ann_str_val, positional_str_arg, positional_str_arg_count, impl_provided_by_closeable, closeable_impl_of, sublist_remove_members, get_annotation, get_str_named_arg, has_annotation, is_literal_string_part,
     node_args, node_assoc_types, node_arms, node_body, node_captures, node_col, node_condition,
     node_effects, node_elements, node_else_body, node_end, node_fields, node_for_binder, node_guard,
@@ -2915,7 +2915,7 @@ fn tc_method_call_unanswered(node: Int, method: Str, obj_t: Int, args_sl: Int) -
     if tc_recv_type_is_determined(obj_k, obj_t) != 0 && tc_method_unavailable_on_receiver(obj_k, method) != 0 {
         let tname = type_to_str(obj_t)
         tc_method_calls.hard.insert(node, 1)
-        tc_error_naming_types("UnresolvedMethod", UNRESOLVED_METHOD, "unresolved method `.{method}` on type {tname}", node, tc_unresolved_method_help(obj_k, tname, method, node), [obj_t])
+        tc_report_unresolved_method(node, obj_t, tname, method)
         return tc_error_recovery_tid()
     }
     // Nothing claimed this node, so nothing has typed it — an absence. Codegen's backstop is
@@ -8298,43 +8298,6 @@ fn tc_elem_hof_closure_ret(method: Str) -> Int {
     TYPE_BOOL
 }
 
-// types_compatible still takes Int for Bool both ways, and a closure literal has no other check
-// against the method's signature. `filter(fn(x) { x })` must not pass where `filter(f)` with the
-// same f fails. This goes when Bool is distinct from Int.
-fn tc_int_bool_differ(a: Int, b: Int) -> Bool {
-    let ka = tc_tid_kind(tc_resolve(resolve_alias_tid(a)))
-    let kb = tc_tid_kind(tc_resolve(resolve_alias_tid(b)))
-    (ka == TyKind.Int && kb == TyKind.Bool) || (ka == TyKind.Bool && kb == TyKind.Int)
-}
-
-fn tc_check_closure_int_bool(label: Str, cls: Int, want_ret: Int, params: List[Int]) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
-    if cls == -1 || node_kind(cls) != NodeKind.Closure { return }
-    let params_sl = node_params(cls)
-    if params_sl != -1 {
-        let mut i = 0
-        while i < sublist_length(params_sl) && i < params.len() {
-            let p = sublist_get(params_sl, i)
-            let want = params.get(i).unwrap()
-            let decl = resolve_param_type(p)
-            if tc_tid_is_no_info(decl) == 0 && tc_int_bool_differ(decl, want) {
-                tc_error_at("closure parameter {i + 1} of `{label}` expects {type_to_str(want)}, got {type_to_str(decl)}", p)
-            }
-            i = i + 1
-        }
-    }
-    if node_type_ann(cls) != -1 {
-        let ann = tc_closure_declared_ret(cls)
-        if tc_int_bool_differ(ann, want_ret) { tc_error_at("closure of `{label}` must return {type_to_str(want_ret)}, got {type_to_str(ann)}", cls) }
-        return
-    }
-    let tail = tc_closure_body_result_tid(cls)
-    if tail >= 0 && tc_int_bool_differ(tail, want_ret) { tc_error_at("closure of `{label}` must return {type_to_str(want_ret)}, got {type_to_str(tail)}", cls) }
-    for r in tc_body_valued_returns(node_body(cls)) {
-        let vt = tc_lookup_node_tid(node_value(r))
-        if tc_tid_is_no_info(vt) == 0 && tc_int_bool_differ(vt, want_ret) { tc_error_at("closure of `{label}` must return {type_to_str(want_ret)}, got {type_to_str(vt)}", r) }
-    }
-}
-
 // List HOFs whose closure takes a single element-typed param. `fold` is handled
 // separately (its closure takes accumulator + element).
 fn is_elem_closure_hof(method: Str) -> Bool {
@@ -9336,6 +9299,7 @@ fn tc_error_at_code(msg: Str, node_id: Int, name: Str, code: Str, help: Str) ! T
 // help never shows `?? ""`: that form brings the old confusion back (sections/04_effects.md
 // §4.4.9, "Migration").
 fn tc_value_mismatch_at(msg: Str, at: Int, val: Int, want: Int, got: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    if tc_report_bool_int_value(msg, val, want, got) { return }
     if !tc_read_line_used_as_str(val, want) { return tc_mismatch_at_help(msg, at, tc_accept_timeout_help(val, want, got), want, got) }
     tc_errors.push(msg)
     diag_error_at_notes("TypeError", TYPE_ERROR, msg, at,
@@ -9406,6 +9370,7 @@ fn tc_unix_stream_maker(name: Str) -> Str {
 // already made one for it.
 fn tc_arg_mismatch(callee: Str, pos: Int, node: Int, want: Int, got: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     if tc_closure_checked_against(node, want) { return }
+    if tc_report_bool_int_value("argument {pos} of `{callee}` expects {type_to_str(want)}, got {type_to_str(got)}", node, want, got) { return }
     if callee == "on_panic" {
         let hook_msg = tc_panic_hook_fn_value_mismatch(got)
         if hook_msg != "" { return tc_error_at(hook_msg, node) }
@@ -9470,11 +9435,314 @@ fn tc_is_read_line_call(val: Int) -> Bool {
 // help names the forms that handle a closed channel before the `.unwrap()` that panics on one.
 fn tc_report_declared_mismatch(msg: Str, at: Int, val: Int, declared: Int, got: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     if tc_handler_short_of(declared, got) { return tc_report_handler_coverage(val, declared, got) }
+    if tc_report_bool_int_value(msg, val, declared, got) { return }
     let recv_help = tc_recv_option_help(val, declared, got)
     if recv_help == "" && tc_read_line_used_as_str(val, declared) { return tc_value_mismatch_at(msg, at, val, declared, got) }
     let accept_help = tc_accept_timeout_help(val, declared, got)
     let help = if recv_help != "" { recv_help } else if accept_help != "" { accept_help } else { tc_hidden_variant_help(val, declared) }
     tc_type_error_naming(msg, at, help, [declared, got])
+}
+
+// -- Bool is distinct from Int (sections/03_types.md §3.4 *Diagnostics*) --
+//
+// Each rejected form carets its operand, says the fixed note, and gives the rewrite as a fix.
+const NO_TRUTHINESS_NOTE = "Blink has no truthiness"
+
+// Where operand `node` was written, and its text. `text` is "" when the place is not known:
+// such a form gets its help and no fix.
+type WrittenOperand {
+    line: Int
+    col: Int
+    end_line: Int
+    end_col: Int
+    text: Str
+}
+
+fn tc_written_operand(node: Int) -> WrittenOperand {
+    let (line, col, end_line, end_col) = node_written_span(node)
+    if line == 0 { return WrittenOperand { line: node_line(node), col: node_col(node), end_line: 0, end_col: 0, text: "" } }
+    WrittenOperand { line: line, col: col, end_line: end_line, end_col: end_col, text: tc_source_text(diag_file_for_node(node), line, col, end_line, end_col) }
+}
+
+fn tc_insert_before(p: WrittenOperand, text: Str) -> DiagFixEdit {
+    DiagFixEdit { line: p.line, col: p.col, end_line: p.line, end_col: p.col, text: text }
+}
+
+fn tc_insert_after(p: WrittenOperand, text: Str) -> DiagFixEdit {
+    DiagFixEdit { line: p.end_line, col: p.end_col, end_line: p.end_line, end_col: p.end_col, text: text }
+}
+
+fn tc_replace_written(p: WrittenOperand, text: Str) -> DiagFixEdit {
+    DiagFixEdit { line: p.line, col: p.col, end_line: p.end_line, end_col: p.end_col, text: text }
+}
+
+// One report at `at`, with the note, a type under the caret, and all of `edits` as the fix.
+fn tc_report_no_truthiness(msg: Str, at: Int, label: Str, help: Str, notes: List[Str], edits: List[DiagFixEdit]) ! TypeCheck.Report, Diag.Report {
+    tc_errors.push(msg)
+    let p = tc_written_operand(at)
+    let mut all = [NO_TRUTHINESS_NOTE]
+    for n in notes { all.push(n) }
+    let end_col = if p.end_line == p.line { p.end_col } else { 0 }
+    let before = diag_entry_count()
+    diag_error_span_label_at_notes("TypeError", TYPE_ERROR, msg, at, p.line, p.col, end_col, label, help, all)
+    // A repeat of a diagnostic makes no entry, and the last entry is then some other report's.
+    if diag_entry_count() == before || edits.len() == 0 { return }
+    let first = edits.get(0).unwrap()
+    diag_set_last_fix_at(help, first.text, first.line, first.col, first.end_line, first.end_col)
+    let mut i = 1
+    while i < edits.len() {
+        let e = edits.get(i).unwrap()
+        diag_add_last_fix_edit(e.line, e.col, e.end_line, e.end_col, e.text)
+        i = i + 1
+    }
+}
+
+// True when `text` is one parenthesized expression, so a comparison may follow it as written.
+fn tc_text_is_one_paren(text: Str) -> Bool {
+    if !text.starts_with("(") || !text.ends_with(")") || text.contains("\"") { return false }
+    let mut depth = 0
+    let mut i = 0
+    while i < text.byte_len() {
+        let c = text.byte_at(i)
+        if c == 40 { depth = depth + 1 }
+        if c == 41 { depth = depth - 1 }
+        if depth == 0 && i < text.byte_len() - 1 { return false }
+        i = i + 1
+    }
+    true
+}
+
+// An integer operand that `==` and `!=` would pull apart: every other operator with an integer
+// result binds tighter (§2.19).
+fn tc_needs_parens_to_compare(node: Int, text: Str) -> Bool {
+    if tc_text_is_one_paren(text) { return false }
+    let k = node_kind(node)
+    if k == NodeKind.BinOp { return node_op(node) == "??" }
+    !(k == NodeKind.Ident || k == NodeKind.IntLit || k == NodeKind.Call || k == NodeKind.MethodCall || k == NodeKind.FieldAccess || k == NodeKind.UnaryOp)
+}
+
+// The help and the edits that write integer `val` as `val {cmp}`.
+fn tc_compare_with_zero(val: Int, cmp: Str) -> (Str, List[DiagFixEdit]) {
+    let p = tc_written_operand(val)
+    if p.text == "" { return ("compare explicitly with 0", []) }
+    if tc_needs_parens_to_compare(val, p.text) {
+        return ("compare explicitly: `({p.text}) {cmp}`", [tc_insert_before(p, "("), tc_insert_after(p, ") {cmp}")])
+    }
+    ("compare explicitly: `{p.text} {cmp}`", [tc_insert_after(p, " {cmp}")])
+}
+
+// The rewrite of an integer where a Bool is wanted (§3.4): `true`/`false` for a literal 1/0, and
+// any other literal states no test the compiler could guess.
+fn tc_int_as_bool_fix(val: Int) -> (Str, List[DiagFixEdit]) {
+    if node_kind(val) != NodeKind.IntLit { return tc_compare_with_zero(val, "!= 0") }
+    let p = tc_written_operand(val)
+    let v = node_str_val(val)
+    if v != "1" && v != "0" || p.text == "" { return ("write `true` or `false`", []) }
+    let b = if v == "1" { "true" } else { "false" }
+    ("write `{b}`", [tc_replace_written(p, b)])
+}
+
+fn tc_is_integer_tid(t: Int) -> Bool {
+    is_integer_type(tc_resolve(resolve_alias_tid(t)))
+}
+
+fn tc_is_bool_tid(t: Int) -> Bool {
+    type_kind(resolve_alias_tid(tc_resolve(t))) == TyKind.Bool
+}
+
+// `msg` is the condition's rule without its type: the check of `if`, `while`, a guard and the
+// operands of `&&` and `||` (§2.19 *No Truthiness*).
+fn tc_require_condition(msg: Str, cond: Int, got: Int) ! TypeCheck.Report, Diag.Report {
+    if is_bool_compat(got) { return }
+    let (help, edits) = if tc_is_integer_tid(got) { tc_int_as_bool_fix(cond) } else { ("", []) }
+    tc_report_no_truthiness("{msg}, got {type_to_str(got)}", cond, type_to_str(got), help, [], edits)
+}
+
+// `!n` loses its bang: `n == 0` is the whole test.
+fn tc_require_negatable(node: Int, got: Int) ! TypeCheck.Report, Diag.Report {
+    if is_bool_compat(got) { return }
+    let operand = node_left(node)
+    let msg = "`!` requires a Bool operand, got {type_to_str(got)}"
+    if !tc_is_integer_tid(got) { return tc_report_no_truthiness(msg, operand, type_to_str(got), "", [], []) }
+    let (help, edits) = tc_compare_with_zero(operand, "== 0")
+    let p = tc_written_operand(operand)
+    let mut all: List[DiagFixEdit] = []
+    if edits.len() > 0 { all.push(DiagFixEdit { line: node_line(node), col: node_col(node), end_line: p.line, end_col: p.col, text: "" }) }
+    for e in edits { all.push(e) }
+    tc_report_no_truthiness(msg, operand, type_to_str(got), help, [], all)
+}
+
+// A value of one where the other is wanted, whatever the site. False when this is not that pair.
+fn tc_report_bool_int_value(msg: Str, val0: Int, want: Int, got: Int) -> Bool ! TypeCheck.Report, Diag.Report {
+    if val0 < 0 { return false }
+    let k0 = node_kind(val0)
+    let val = if k0 == NodeKind.Return || k0 == NodeKind.NamedArg { node_value(val0) } else { val0 }
+    if val < 0 { return false }
+    let label = type_to_str(got)
+    if tc_is_bool_tid(want) && tc_is_integer_tid(got) {
+        let (help, edits) = tc_int_as_bool_fix(val)
+        tc_report_no_truthiness(msg, val, label, help, [], edits)
+        return true
+    }
+    if !tc_is_integer_tid(want) || !tc_is_bool_tid(got) { return false }
+    let p = tc_written_operand(val)
+    if node_kind(val) == NodeKind.BoolLit && p.text != "" {
+        let v = if p.text == "true" { "1" } else { "0" }
+        tc_report_no_truthiness(msg, val, label, "write `{v}`", [], [tc_replace_written(p, v)])
+        return true
+    }
+    if p.text == "" {
+        tc_report_no_truthiness(msg, val, label, "use `if b \{ 1 \} else \{ 0 \}`", [], [])
+        return true
+    }
+    tc_report_no_truthiness(msg, val, label, "use `if {p.text} \{ 1 \} else \{ 0 \}`", [], [tc_insert_before(p, "if "), tc_insert_after(p, " \{ 1 \} else \{ 0 \}")])
+    true
+}
+
+fn tc_negates_cleanly(node: Int, text: Str) -> Bool {
+    if tc_text_is_one_paren(text) { return true }
+    let k = node_kind(node)
+    k == NodeKind.Ident || k == NodeKind.BoolLit || k == NodeKind.Call || k == NodeKind.MethodCall || k == NodeKind.FieldAccess || k == NodeKind.UnaryOp
+}
+
+// `==` or `!=` between a Bool and an integer (§3.4). False when this is not that pair.
+fn tc_report_bool_int_compare(msg: Str, node: Int, op: Str, lt: Int, rt: Int) -> Bool ! TypeCheck.Report, Diag.Report {
+    if op != "==" && op != "!=" { return false }
+    let bool_left = tc_is_bool_tid(lt) && tc_is_integer_tid(rt)
+    if !bool_left && !(tc_is_bool_tid(rt) && tc_is_integer_tid(lt)) { return false }
+    let b = if bool_left { node_left(node) } else { node_right(node) }
+    let n = if bool_left { node_right(node) } else { node_left(node) }
+    let label = type_to_str(if bool_left { rt } else { lt })
+    let bp = tc_written_operand(b)
+    let np = tc_written_operand(n)
+    if is_int_literal_node(n) == 0 {
+        let (_, zero) = tc_compare_with_zero(n, "!= 0")
+        if bp.text == "" || zero.len() == 0 {
+            tc_report_no_truthiness(msg, n, label, "compare the Int with 0 first", [], [])
+            return true
+        }
+        let written = if bool_left { "{bp.text} {op} ({np.text} != 0)" } else { "({np.text} != 0) {op} {bp.text}" }
+        tc_report_no_truthiness(msg, n, label, "compare Bool with Bool: `{written}`", [], [tc_insert_before(np, "("), tc_insert_after(np, " != 0)")])
+        return true
+    }
+    let v = if node_kind(n) == NodeKind.IntLit { node_str_val(n) } else { "-{node_str_val(node_left(n))}" }
+    if v != "1" && v != "0" {
+        let answer = if op == "==" { "false" } else { "true" }
+        tc_report_no_truthiness(msg, n, label, "", ["a Bool is never {v}, so this comparison is always {answer}"], [])
+        return true
+    }
+    if bp.text == "" {
+        tc_report_no_truthiness(msg, n, label, "write the test directly", [], [])
+        return true
+    }
+    // `b == 1` and `b != 0` ask for b; the other two ask for its negation.
+    let same = (op == "==") == (v == "1")
+    let bare = tc_negates_cleanly(b, bp.text)
+    let shown = if same { bp.text } else if bare { "!{bp.text}" } else { "!({bp.text})" }
+    let cut = if bool_left {
+        DiagFixEdit { line: bp.end_line, col: bp.end_col, end_line: np.end_line, end_col: np.end_col, text: "" }
+    } else {
+        DiagFixEdit { line: np.line, col: np.col, end_line: bp.line, end_col: bp.col, text: "" }
+    }
+    let mut edits = [cut]
+    if !same { edits.push(tc_insert_before(bp, if bare { "!" } else { "!(" })) }
+    if !same && !bare { edits.push(tc_insert_after(bp, ")")) }
+    tc_report_no_truthiness(msg, n, label, "write the test directly: `{shown}`", [], edits)
+    true
+}
+
+// The scrutinee of `m` when each arm is `true`, `false` or a wildcard, so that comparing it
+// with 0 repairs them all. A nested or a mixed pattern leaves more to do than one edit, so -1.
+fn tc_bool_arms_repair_scrutinee(m: Int) -> Int {
+    let arms = node_arms(m)
+    if arms == -1 { return -1 }
+    let mut i = 0
+    while i < sublist_length(arms) {
+        let pat = node_pattern(sublist_get(arms, i))
+        let k = node_kind(pat)
+        if !(k == NodeKind.WildcardPattern || k == NodeKind.IntPattern && node_type_name(pat) == "Bool") { return -1 }
+        i = i + 1
+    }
+    node_scrutinee(m)
+}
+
+// A `true` or `false` arm of a match that `tc_bool_arms_repair_scrutinee` found repairable.
+fn tc_report_repairable_bool_arm(pat: Int, repair: Int, scrut_t: Int) -> Bool ! Diag.Report {
+    if repair == -1 || node_kind(pat) != NodeKind.IntPattern || node_type_name(pat) != "Bool" || !tc_is_integer_tid(scrut_t) { return false }
+    let h = type_to_str(scrut_t)
+    let word = if node_str_val(pat) == "1" { "true" } else { "false" }
+    let (help, edits) = tc_compare_with_zero(repair, "!= 0")
+    let shown = help.replace("compare explicitly: `", "match on a Bool: `match ")
+    tc_report_pattern_at(pat, word.byte_len(), "pattern of type Bool cannot match a value of type {h}", h, shown, edits)
+    true
+}
+
+// A literal pattern must have the scrutinee's type (§3.4 *Patterns follow the same rule*).
+fn tc_report_bool_int_pattern(pat: Int, hint: Int) -> Bool ! Diag.Report {
+    let k = node_kind(pat)
+    if hint < 0 || k != NodeKind.IntPattern && k != NodeKind.RangePattern { return false }
+    let spelled = node_type_name(pat)
+    if spelled == "Bool" && tc_is_integer_tid(hint) {
+        let h = type_to_str(hint)
+        let word = if node_str_val(pat) == "1" { "true" } else { "false" }
+        tc_report_pattern_at(pat, word.byte_len(), "pattern of type Bool cannot match a value of type {h}", h, "a pattern on an integer is an integer", [])
+        return true
+    }
+    if spelled != "" || !tc_is_bool_tid(hint) { return false }
+    let v = node_str_val(pat)
+    let msg = "pattern of type Int cannot match a value of type Bool"
+    if k == NodeKind.RangePattern || v != "1" && v != "0" {
+        tc_report_pattern_at(pat, if k == NodeKind.RangePattern { 0 } else { v.byte_len() }, msg, "Bool", "a Bool pattern is `true` or `false`", [])
+        return true
+    }
+    let word = if v == "1" { "true" } else { "false" }
+    let edit = DiagFixEdit { line: node_line(pat), col: node_col(pat), end_line: node_line(pat), end_col: node_col(pat) + v.byte_len(), text: word }
+    tc_report_pattern_at(pat, v.byte_len(), msg, "Bool", "write the pattern `{word}`", [edit])
+    true
+}
+
+// A pattern has no written span: its literal starts at its own column.
+fn tc_report_pattern_at(pat: Int, width: Int, msg: Str, label: Str, help: Str, edits: List[DiagFixEdit]) ! Diag.Report {
+    let before = diag_entry_count()
+    let end_col = if width > 0 { node_col(pat) + width } else { 0 }
+    diag_error_span_label_at_notes("TypeError", TYPE_ERROR, msg, pat, node_line(pat), node_col(pat), end_col, label, help, [NO_TRUTHINESS_NOTE])
+    if diag_entry_count() == before || edits.len() == 0 { return }
+    let first = edits.get(0).unwrap()
+    diag_set_last_fix_at(help, first.text, first.line, first.col, first.end_line, first.end_col)
+    let mut i = 1
+    while i < edits.len() {
+        let e = edits.get(i).unwrap()
+        diag_add_last_fix_edit(e.line, e.col, e.end_line, e.end_col, e.text)
+        i = i + 1
+    }
+}
+
+// `b.to_int()` names no method (§3.4 *No conversion methods*). The rewrite is wrapped unless it
+// is the whole of what surrounds it, since an `if` would take in an operator that follows it.
+fn tc_report_bool_to_int(node: Int) ! Diag.Report {
+    let msg = "unresolved method `.to_int` on type Bool"
+    let p = tc_written_operand(node)
+    let suffix = ".to_int()"
+    let obj = if p.text.ends_with(suffix) { p.text.byte_slice(0, p.text.byte_len() - suffix.byte_len()) } else { "" }
+    let end_col = if p.end_line == p.line { p.end_col } else { 0 }
+    let before = diag_entry_count()
+    let shown = if obj == "" { "b" } else { obj }
+    let rewrite = "if {shown} \{ 1 \} else \{ 0 \}"
+    let help = "use `{rewrite}`"
+    diag_error_span_at_notes("UnresolvedMethod", UNRESOLVED_METHOD, msg, node, p.line, p.col, end_col, help, [NO_TRUTHINESS_NOTE])
+    if diag_entry_count() == before || obj == "" { return }
+    let text = if tc_stands_alone(node, p) { rewrite } else { "({rewrite})" }
+    diag_set_last_fix_at(help, text, p.line, p.col, p.end_line, p.end_col)
+}
+
+fn tc_stands_alone(node: Int, p: WrittenOperand) -> Bool {
+    let file = diag_file_for_node(node)
+    let head = diag_source_line(file, p.line).byte_slice(0, p.col - 1).trim()
+    let tail = diag_source_line(file, p.end_line)
+    let rest = tail.byte_slice(p.end_col - 1, tail.byte_len()).trim()
+    let opens = head == "" || head.ends_with("=") && !head.ends_with("==") && !head.ends_with("!=") || head.ends_with("(") || head.ends_with(",") || head.ends_with("return")
+    let closes = rest == "" || rest.starts_with(")") || rest.starts_with(",")
+    opens && closes
 }
 
 // A value that hides a variant reads as the value even where the hint names the variant's
@@ -22562,6 +22830,12 @@ fn tc_refuse_list_scan(node: Int, obj_t: Int, need: List[Int], method: Str) -> I
 // The help line for an unresolved method, first match wins: the note for a binding that hides
 // the built-in `trace.log`, then a note for a renamed or removed method of the type, then the
 // near-miss suggestion, else nothing.
+fn tc_report_unresolved_method(node: Int, recv: Int, tname: Str, method: Str) ! Diag.Report {
+    let k = type_kind(recv)
+    if k == TyKind.Bool && method == "to_int" { return tc_report_bool_to_int(node) }
+    tc_error_naming_types("UnresolvedMethod", UNRESOLVED_METHOD, "unresolved method `.{method}` on type {tname}", node, tc_unresolved_method_help(k, tname, method, node), [recv])
+}
+
 fn tc_unresolved_method_help(obj_k: TyKind, tname: Str, method: Str, node: Int) -> Str {
     let hides = tc_trace_hiding_help(method, node)
     if hides != "" { return hides }
@@ -25017,8 +25291,6 @@ fn types_compatible(a0: Int, b0: Int) -> Int {
     // singleton) is still "compatible with anything" pending the boundary check.
     if ka == TyKind.Unknown || kb == TyKind.Unknown { return 1 }
     if ka == TyKind.Typevar || kb == TyKind.Typevar { return tc_typevar_pair_compatible(a, b) }
-    // Int and Bool are interchangeable in Blink (C-style truthiness)
-    if (ka == TyKind.Int || ka == TyKind.Bool) && (kb == TyKind.Int || kb == TyKind.Bool) { return 1 }
     // Sized integer kinds are compatible only with themselves (no implicit promotion)
     let is_sized_a = is_sized_int(ka)
     let is_sized_b = is_sized_int(kb)
@@ -25529,21 +25801,21 @@ fn tc_check_arm_guard(arm: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repo
     let g = node_guard(arm)
     if g == -1 { return }
     let gt = tc_check_nested_value(g)
-    if is_bool_compat(gt) == 0 {
-        tc_error_at("match guard must be Bool, got {type_to_str(gt)}", g)
-    }
+    tc_require_condition("match guard must be Bool", g, gt)
 }
 
 // A pattern fault is reported here as well as from the statement walk: a match nested in an
 // expression (a call argument) is reached by this walk alone. Repeats are one diagnostic.
-fn infer_arm_body(arm: Int, scrut_tid: Int, subject: Str) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+fn infer_arm_body(arm: Int, scrut_tid: Int, subject: Str, bool_repair: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     let b = node_body(arm)
     // No body is an ABSENCE — this arm contributes nothing to the merge. The merge below reads
     // that through tc_tid_is_no_info, which is the same test it applies to the diverging-arm
     // placeholder, so the two need not be the same value.
     if b == -1 { return -1 }
     nr_push_scope()
-    let _ = tc_check_pattern_types_against(node_pattern(arm), scrut_tid, subject, true)
+    if !tc_report_repairable_bool_arm(node_pattern(arm), bool_repair, scrut_tid) {
+        let _ = tc_check_pattern_types_against(node_pattern(arm), scrut_tid, subject, true)
+    }
     tc_check_arm_guard(arm)
     // Infer the BODY NODE whatever its shape. infer_type answers for the statement kinds a
     // braceless arm produces (ExprStmt passes through to its value, a control transfer is
@@ -25561,14 +25833,9 @@ pub fn type_kind(tid0: Int) -> TyKind {
     ty_pool.get(tid).unwrap().kind
 }
 
-// Blink treats Int as truthy — Int is valid in Bool contexts
-fn is_bool_compat(tid: Int) -> Int {
-    if tc_tid_is_no_info(tid) != 0 { return 1 }
-    if tid == TYPE_BOOL { return 1 }
-    if tid == TYPE_INT { return 1 }
-    let k = type_kind(tid)
-    if k == TyKind.Bool || k == TyKind.Int { return 1 }
-    0
+// A type with no information yet is not a mismatch here; its uses settle it.
+fn is_bool_compat(tid: Int) -> Bool {
+    tc_tid_is_no_info(tid) != 0 || type_kind(resolve_alias_tid(tc_resolve(tid))) == TyKind.Bool
 }
 
 pub fn is_sized_int(k: TyKind) -> Bool {
@@ -26371,17 +26638,12 @@ fn cmp_operands_ok(lt: Int, rt: Int, relational: Int) -> Int {
     if ka == TyKind.Void || kb == TyKind.Void { return 1 }
     if ka == TyKind.Unknown || kb == TyKind.Unknown { return 1 }
 
-    // Int and Bool are interchangeable (C-style truthiness, mirroring
-    // types_compatible:5132). `flag == 0`, `set.contains(x) != 0`, and
-    // `true == false` are all pervasive Blink idioms. Bool participates only in
-    // equality — it has Eq but not Ord (spec §3.6) — so relational against a Bool
-    // operand falls through to the reject path below.
-    let a_intbool = ka == TyKind.Int || ka == TyKind.Bool
-    let b_intbool = kb == TyKind.Int || kb == TyKind.Bool
-    if a_intbool && b_intbool {
-        if relational != 0 && (ka == TyKind.Bool || kb == TyKind.Bool) { return 0 }
-        return 1
+    // Bool has Eq but not Ord (§3.6), and it compares with nothing but Bool (§3.4).
+    if ka == TyKind.Bool || kb == TyKind.Bool {
+        if ka != kb { return 0 }
+        return if relational != 0 { 0 } else { 1 }
     }
+    if ka == TyKind.Int && kb == TyKind.Int { return 1 }
 
     // Scalars: same kind only (no implicit promotion), mirroring types_compatible.
     // Int<->sized-int literal coercion is handled by the caller. Float/Char and
@@ -26587,6 +26849,7 @@ fn tc_operator_result_type(node: Int, lit_t: Int, lt: Int, rt: Int) -> Int {
 
 // The operand check of unary `-` and `~`; see tc_check_arith_operands.
 fn tc_check_unary_operand(node: Int, op: Str, t: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    if op == "!" { return tc_require_negatable(node, t) }
     // Unary minus desugars to Neg.neg, a sealed arithmetic trait (spec
     // sections/02_syntax.md:1046) — `-someStruct` / `-someOpaque` is not numeric.
     if op == "-" { reject_non_numeric_arith_operand(op, t, node, 1) }
@@ -26738,15 +27001,17 @@ fn tc_check_comparison_operands(node: Int, op: Str, lt: Int, rt: Int) ! TypeChec
                 let relational = if op == "==" || op == "!=" { 0 } else { 1 }
                 let refused = if relational == 0 { reject_eq_less_operands(op, lt, rt, node) } else { reject_ord_less_operands(lt, rt, node) }
                 if refused == 0 && cmp_operands_ok(lt, rt, relational) == 0 {
-                    // Operands that pass as an equality pair fail only for want of Ord.
-                    // Name the side without it: `1 < true` lacks Ord on the Bool.
-                    if relational != 0 && cmp_operands_ok(lt, rt, 0) != 0 {
+                    // Operands that pass as an equality pair fail only for want of Ord, and a
+                    // Bool has none whatever is beside it. Name the side without it: `1 < true`
+                    // lacks Ord on the Bool.
+                    if relational != 0 && (cmp_operands_ok(lt, rt, 0) != 0 || tc_is_bool_tid(lt) || tc_is_bool_tid(rt)) {
                         let unordered = if cmp_operands_ok(lt, lt, 1) != 0 { rt } else { lt }
                         tc_error_at("binary `{op}` needs Ord, and {type_to_str(unordered)} does not implement Ord", node)
                     } else {
                         let cmp_msg = "binary `{op}`: incompatible types {type_to_str(lt)} and {type_to_str(rt)}"
                         let range_help = tc_range_operand_help(node, lt, rt)
-                        if range_help != "" {
+                        if tc_report_bool_int_compare(cmp_msg, node, op, lt, rt) {
+                        } else if range_help != "" {
                             tc_error_at_code(cmp_msg, node, "TypeError", TYPE_ERROR, range_help)
                         } else if tc_is_read_line_value(node_right(node)) {
                             tc_value_mismatch_at(cmp_msg, node, node_right(node), lt, rt)
@@ -27891,12 +28156,8 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
         let rt = infer_type(node_right(node))
 
         if op == "&&" || op == "||" {
-            if is_bool_compat(lt) == 0 {
-                tc_error_at("logical operator `{op}` requires Bool operands, got {type_to_str(lt)}", node)
-            }
-            if is_bool_compat(rt) == 0 {
-                tc_error_at("logical operator `{op}` requires Bool operands, got {type_to_str(rt)}", node)
-            }
+            tc_require_condition("logical operator `{op}` requires Bool operands", node_left(node), lt)
+            tc_require_condition("logical operator `{op}` requires Bool operands", node_right(node), rt)
             return TYPE_BOOL
         }
         if tc_check_str_plus(node, op, lt, rt) { return TYPE_STR }
@@ -27923,7 +28184,10 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
     if kind == NodeKind.UnaryOp {
         let op = node_op(node)
         let operand = infer_type(node_left(node))
-        if op == "!" { return TYPE_BOOL }
+        if op == "!" {
+            tc_check_unary_operand(node, op, operand)
+            return TYPE_BOOL
+        }
         if op == "-" || op == "~" {
             tc_check_unary_operand(node, op, operand)
             return operand
@@ -29592,9 +29856,8 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
             // actionable help; blinkc_main aborts on diag_count > 0 before codegen, so
             // the backstop never re-fires.
             if tc_method_resolvable_on_type(obj_k, tname, method) == 0 {
-                let help = tc_unresolved_method_help(obj_k, tname, method, node)
                 tc_method_calls.hard.insert(node, 1)
-                tc_error_naming_types("UnresolvedMethod", UNRESOLVED_METHOD, "unresolved method `.{method}` on type {tname}", node, help, [obj_t])
+                tc_report_unresolved_method(node, obj_t, tname, method)
                 return tc_error_recovery_tid()
             }
         }
@@ -30303,9 +30566,7 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
         // inherit THIS if's own consumed-ness, so restore `incoming` before descending them.
         // The condition is a Bool, whatever the if is expected to be.
         let cond_t = tc_infer_unhinted(node_condition(node))
-        if is_bool_compat(cond_t) == 0 {
-            tc_error_at("if condition must be Bool, got {type_to_str(cond_t)}", node)
-        }
+        tc_require_condition("if condition must be Bool", node_condition(node), cond_t)
         tc_if_value_ctx = incoming
         let then_t = infer_type(node_then_body(node))
         let else_node = node_else_body(node)
@@ -30350,12 +30611,13 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
             // What the match is expected to be says nothing about what it matches on.
             let scrut_tid = tc_infer_unhinted(node_scrutinee(node))
             let subject = tc_match_subject(node)
+            let bool_repair = tc_bool_arms_repair_scrutinee(node)
             tc_if_value_ctx = incoming
             // §3.3: `()` is contagious across an arm-bearing form. One arm that falls out
             // with no value makes the WHOLE match `()`, whatever its siblings produce.
             // type_merge cannot say this — it keeps the first side when the kinds differ —
             // so the completing arm is tracked alongside the merge.
-            let mut merged = infer_arm_body(sublist_get(arms_sl, 0), scrut_tid, subject)
+            let mut merged = infer_arm_body(sublist_get(arms_sl, 0), scrut_tid, subject, bool_repair)
             let mut completes = 0
             if tc_resolve(merged) == TYPE_VOID { completes = 1 }
             let mut arm_nodes: List[Int] = [tc_arm_body_value(sublist_get(arms_sl, 0))]
@@ -30363,7 +30625,7 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
             let mut i = 1
             while i < sublist_length(arms_sl) {
                 tc_if_value_ctx = incoming
-                let arm_t = infer_arm_body(sublist_get(arms_sl, i), scrut_tid, subject)
+                let arm_t = infer_arm_body(sublist_get(arms_sl, i), scrut_tid, subject, bool_repair)
                 arm_nodes.push(tc_arm_body_value(sublist_get(arms_sl, i)))
                 arm_types.push(arm_t)
                 if tc_resolve(arm_t) == TYPE_VOID { completes = 1 }
@@ -32268,9 +32530,7 @@ fn tc_type_predicate(pred: Int, what: Str) ! TypeCheck.Resolve, TypeCheck.Report
     let reread = tc_value_awaits_closure_ret(pred)
     tc_walk_stmt_value(pred)
     if reread { t = tc_infer_value(pred) }
-    if is_bool_compat(t) == 0 {
-        tc_error_at("{what} predicate must be Bool, got {type_to_str(t)}", pred)
-    }
+    tc_require_condition("{what} predicate must be Bool", pred, t)
 }
 
 // A @where predicate is an expression over `self`, the value of the alias's base type. It is
@@ -35549,9 +35809,7 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
 
     if kind == NodeKind.IfExpr {
         let cond_t = tc_check_nested_value(node_condition(node))
-        if is_bool_compat(cond_t) == 0 {
-            tc_error_at("if condition must be Bool, got {type_to_str(cond_t)}", node)
-        }
+        tc_require_condition("if condition must be Bool", node_condition(node), cond_t)
         // The branch tails as the speculative inference left them, read before either branch
         // scope exists. The recovery below reads them again and takes the delta as its gate.
         let pre_if_memo = tc_scoped_value_memo(node)
@@ -35589,9 +35847,7 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
 
     if kind == NodeKind.WhileLoop {
         let cond_t = tc_check_nested_value(node_condition(node))
-        if is_bool_compat(cond_t) == 0 {
-            tc_error_at("while condition must be Bool, got {type_to_str(cond_t)}", node)
-        }
+        tc_require_condition("while condition must be Bool", node_condition(node), cond_t)
         tc_check_body(node_body(node))
         tc_check_dropped_value(node_body(node))
         return
@@ -35668,6 +35924,7 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
         let arms_sl = node_arms(node)
         if arms_sl != -1 {
             let subject = tc_match_subject(node)
+            let bool_repair = tc_bool_arms_repair_scrutinee(node)
             // An arm whose pattern names nothing the value can be covers nothing (§3.5
             // Exhaustiveness). When such an arm is unguarded, the author meant it to cover
             // something, so the coverage error would only restate the pattern error.
@@ -35677,7 +35934,7 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                 let arm = sublist_get(arms_sl, i)
                 nr_push_scope()
                 tc_pattern_binding_type = scrut_tid
-                let bad = tc_check_pattern_types(node_pattern(arm), subject, false, true)
+                let bad = tc_report_repairable_bool_arm(node_pattern(arm), bool_repair, scrut_tid) || tc_check_pattern_types(node_pattern(arm), subject, false, true)
                 tc_pattern_binding_type = -1
                 if bad && node_guard(arm) == -1 { bad_unguarded = true }
                 tc_check_or_pattern_bindings(node_pattern(arm))
@@ -36004,7 +36261,6 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                     tc_close_hof_result(node)
                 } else {
                     check_closure_body(hof_cls, make_fn_type(want_ret, [elem]))
-                    if want_ret == TYPE_BOOL { tc_check_closure_int_bool(label, hof_cls, want_ret, [elem]) }
                     if method == "map" || method == "flat_map" { tc_bind_hof_result(node, hof_cls, method, type_kind(obj_t), diag_before) }
                 }
             } else if method == "fold" {
@@ -36014,7 +36270,6 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                     hof_arg = 1
                     if tc_closure_param_count_fits(label, 2, fold_cls, [acc_t, elem], acc_t) {
                         check_closure_body(fold_cls, make_fn_type(acc_t, [acc_t, elem]))
-                        tc_check_closure_int_bool(label, fold_cls, acc_t, [acc_t, elem])
                     }
                 }
             } else if method == "sort_by" && type_kind(obj_t) == TyKind.List {
@@ -36661,6 +36916,7 @@ fn tc_check_pattern_types(node: Int, subject: Str, poisoned: Bool, refutable: Bo
     // and a nested variant pattern were the shapes nothing published for, and codegen asking
     // one of them for its type found no answer at all.
     if tc_pattern_binding_type >= 0 { tc_publish_node_tid(node, tc_pattern_binding_type) }
+    if !poisoned && tc_report_bool_int_pattern(node, tc_pattern_binding_type) { return true }
     if kind == NodeKind.IntPattern || kind == NodeKind.RangePattern { tc_check_int_pattern_range(node, tc_pattern_binding_type) }
     if kind == NodeKind.RangePattern { tc_check_range_bound_foreign(node) }
     // An uppercase name in a refutable pattern is a variant: it is judged below like `Red(x)`.
@@ -38930,8 +39186,7 @@ fn tc_report_unclaimed_calls(order: List[Int], mods: List[Str]) ! Diag.Report {
         let recv = tc_lookup_node_tid(obj)
         if tc_unclaimed_receiver_is_named(recv) != 0 {
             let tname = tc_type_str(recv)
-            tc_error_naming_types("UnresolvedMethod", UNRESOLVED_METHOD, "unresolved method `.{mname}` on type {tname}",
-                uc, tc_unresolved_method_help(type_kind(recv), tname, mname, uc), [recv])
+            tc_report_unresolved_method(uc, recv, tname, mname)
         } else if node_kind(obj) == NodeKind.Ident {
             let q = node_name(obj)
             if q == "default" {

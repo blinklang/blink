@@ -1,0 +1,210 @@
+// Bool and Int are distinct types (§3.4 *Bool Is Distinct from Int*, §2.19 *No Truthiness*).
+// Each rejected form is E0300 with the caret under the offending operand, the fixed note and a
+// help that gives the rewrite. `blink fix` applies the rewrite, so each row also applies the fix
+// and checks that the result type-checks: a fix that leaves a broken file is no fix.
+
+import typecheck.{check_types}
+import compiler.{compile_to_program}
+import diagnostics.{DiagEntry, diag_entries, diag_reset, diag_fix_edits}
+import fix_edits.{FixEdit, fix_apply, fix_byte_offset}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+import std.fs
+import std.io
+
+const PATH = "build/tc_bool_is_distinct_src.bl"
+const NOTE = "Blink has no truthiness"
+
+fn front_errors(src: Str) -> List[DiagEntry] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    init_embedded_stdlib()
+    fs.write(PATH, src).unwrap()
+    diag_reset()
+    let program = compile_to_program(PATH, 1)
+    check_types(program)
+    let _ = fs.delete(PATH)
+    let mut out: List[DiagEntry] = []
+    for d in diag_entries {
+        if d.severity == "error" { out.push(d) }
+    }
+    out
+}
+
+fn the_error(src: Str) -> DiagEntry ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    let errs = front_errors(src)
+    if errs.len() != 1 {
+        for d in errs { io.println("FAIL: {d.line}:{d.col}: {d.message}") }
+        io.println("FAIL: want one error, got {errs.len()} in:\n{src}")
+    }
+    assert_eq(errs.len(), 1)
+    errs.get(0).unwrap()
+}
+
+fn apply_fix(src: Str, d: DiagEntry) -> Str {
+    let mut edits: List[FixEdit] = []
+    for e in diag_fix_edits(d) {
+        edits.push(FixEdit { file: PATH, start: fix_byte_offset(src, e.line, e.col), end: fix_byte_offset(src, e.end_line, e.end_col), text: e.text, diag: 0 })
+    }
+    fix_apply(src, edits)
+}
+
+// The column of the first place `marker` appears on the line.
+fn col_of(src: Str, line: Int, marker: Str) -> Int {
+    let text = src.split("\n").get(line - 1).unwrap()
+    (text.byte_index_of(marker, 0) ?? -1) + 1
+}
+
+// The wrapper around `body` declares what the rows use. The body starts on line 6.
+const LINE = 6
+
+fn wrap(body: Str) -> Str {
+    "fn flag() -> Bool \{ true \}\nfn count() -> Int \{ 3 \}\nfn takes_bool(b: Bool) -> Bool \{ b \}\ntype Holder \{ on: Bool \}\nfn run(n: Int, b: Bool) -> Int ! IO \{\n{body}\n    0\n\}\nfn main() \{ io.println(\"\{run(1, true)\}\") \}\n"
+}
+
+// One rejected form: the message, the caret's column and width, the help, the edit.
+fn expect_form(body: Str, msg: Str, caret: Str, help: Str, fixed_body: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    expect_form_on(LINE, body, msg, caret, help, fixed_body)
+}
+
+fn expect_form_on(line: Int, body: Str, msg: Str, caret: Str, help: Str, fixed_body: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    let src = wrap(body)
+    let d = the_error(src)
+    if !d.message.contains(msg) { io.println("FAIL: want message '{msg}', got '{d.message}'") }
+    assert(d.message.contains(msg))
+    assert_eq(d.code, "E0300")
+    assert_eq(d.line, line)
+    let col = col_of(src, line, caret)
+    if d.col != col { io.println("FAIL: caret of '{caret}' at {col}, got {d.col} on: {body}") }
+    assert_eq(d.col, col)
+    assert_eq(d.end_col, col + caret.byte_len())
+    if !d.notes.contains(NOTE) { io.println("FAIL: no fixed note on: {body}") }
+    assert(d.notes.contains(NOTE))
+    if !d.help.contains(help) { io.println("FAIL: want help '{help}', got '{d.help}'") }
+    assert(d.help.contains(help))
+    let fixed = apply_fix(src, d)
+    if fixed != wrap(fixed_body) { io.println("FAIL: fix of '{body}' gave:\n{fixed}") }
+    assert_eq(fixed, wrap(fixed_body))
+    let after = front_errors(fixed)
+    for e in after { io.println("FAIL: after the fix of '{body}': {e.line}:{e.col}: {e.message}") }
+    assert_eq(after.len(), 0)
+}
+
+test "an Int literal 1 or 0 where a Bool is declared takes true or false" {
+    expect_form("    let x: Bool = 1\n    let _ = x", "declared type Bool but got Int", "1", "`true`", "    let x: Bool = true\n    let _ = x")
+    expect_form("    let x: Bool = 0\n    let _ = x", "declared type Bool but got Int", "0", "`false`", "    let x: Bool = false\n    let _ = x")
+}
+
+test "an Int value where a Bool is declared compares with 0" {
+    expect_form("    let x: Bool = n\n    let _ = x", "declared type Bool but got Int", "n", "`n != 0`", "    let x: Bool = n != 0\n    let _ = x")
+    expect_form("    let x: Bool = count() + 1\n    let _ = x", "declared type Bool but got Int", "count() + 1", "`count() + 1 != 0`", "    let x: Bool = count() + 1 != 0\n    let _ = x")
+}
+
+test "a Bool where an Int is declared takes the if expression" {
+    expect_form("    let y: Int = b\n    let _ = y", "declared type Int but got Bool", "b", "`if b \{ 1 \} else \{ 0 \}`", "    let y: Int = if b \{ 1 \} else \{ 0 \}\n    let _ = y")
+    expect_form("    let y: Int = flag()\n    let _ = y", "declared type Int but got Bool", "flag()", "`if flag() \{ 1 \} else \{ 0 \}`", "    let y: Int = if flag() \{ 1 \} else \{ 0 \}\n    let _ = y")
+}
+
+test "an Int argument to a Bool parameter compares with 0" {
+    expect_form("    let _ = takes_bool(n)", "expects Bool, got Int", "n", "`n != 0`", "    let _ = takes_bool(n != 0)")
+}
+
+test "an Int in a Bool struct field compares with 0" {
+    expect_form("    let _ = Holder \{ on: count() \}", "declared type Bool but got Int", "count()", "`count() != 0`", "    let _ = Holder \{ on: count() != 0 \}")
+}
+
+test "an if condition of Int compares with 0" {
+    expect_form("    if n \{ io.println(\"x\") \}", "if condition must be Bool, got Int", "n", "`n != 0`", "    if n != 0 \{ io.println(\"x\") \}")
+    expect_form("    if count() \{ io.println(\"x\") \}", "if condition must be Bool, got Int", "count()", "`count() != 0`", "    if count() != 0 \{ io.println(\"x\") \}")
+}
+
+test "a while condition of Int compares with 0, and a literal 1 is no exception" {
+    expect_form("    while n \{ break \}", "while condition must be Bool, got Int", "n", "`n != 0`", "    while n != 0 \{ break \}")
+    expect_form("    while 1 \{ break \}", "while condition must be Bool, got Int", "1", "`true`", "    while true \{ break \}")
+}
+
+test "a match guard of Int compares with 0" {
+    expect_form_on(LINE + 1, "    let _ = match count() \{\n        w if n => w\n        _ => 2\n    \}", "match guard must be Bool, got Int", "n", "`n != 0`", "    let _ = match count() \{\n        w if n != 0 => w\n        _ => 2\n    \}")
+}
+
+test "an operand of a logical operator that is Int compares with 0" {
+    expect_form("    if b && n \{ io.println(\"x\") \}", "requires Bool operands, got Int", "n", "`n != 0`", "    if b && n != 0 \{ io.println(\"x\") \}")
+    expect_form("    if n || b \{ io.println(\"x\") \}", "requires Bool operands, got Int", "n", "`n != 0`", "    if n != 0 || b \{ io.println(\"x\") \}")
+}
+
+test "the negation of an Int compares with 0 and the bang goes" {
+    expect_form("    let _ = !n", "`!` requires a Bool operand, got Int", "n", "`n == 0`", "    let _ = n == 0")
+    expect_form("    let _ = !(n + 1)", "`!` requires a Bool operand, got Int", "(n + 1)", "`(n + 1) == 0`", "    let _ = (n + 1) == 0")
+}
+
+test "a Bool compared with 1 or 0 is the Bool or its negation" {
+    expect_form("    if b == 1 \{ io.println(\"x\") \}", "incompatible types Bool and Int", "1", "`b`", "    if b \{ io.println(\"x\") \}")
+    expect_form("    if b != 0 \{ io.println(\"x\") \}", "incompatible types Bool and Int", "0", "`b`", "    if b \{ io.println(\"x\") \}")
+    expect_form("    if b == 0 \{ io.println(\"x\") \}", "incompatible types Bool and Int", "0", "`!b`", "    if !b \{ io.println(\"x\") \}")
+    expect_form("    if b != 1 \{ io.println(\"x\") \}", "incompatible types Bool and Int", "1", "`!b`", "    if !b \{ io.println(\"x\") \}")
+    expect_form("    if 1 == flag() \{ io.println(\"x\") \}", "incompatible types Int and Bool", "1", "`flag()`", "    if flag() \{ io.println(\"x\") \}")
+}
+
+test "a Bool compared with another Int literal is always false and has no fix" {
+    let d = the_error(wrap("    if b == 2 \{ io.println(\"x\") \}"))
+    assert_eq(d.code, "E0300")
+    assert(d.notes.contains(NOTE))
+    assert(d.notes.contains("a Bool is never 2, so this comparison is always false"))
+    assert_eq(d.fix_action, "")
+    let e = the_error(wrap("    if b != 2 \{ io.println(\"x\") \}"))
+    assert(e.notes.contains("a Bool is never 2, so this comparison is always true"))
+    assert_eq(e.fix_action, "")
+}
+
+test "a Bool compared with an Int value compares the Int with 0" {
+    expect_form("    if b == n \{ io.println(\"x\") \}", "incompatible types Bool and Int", "n", "`b == (n != 0)`", "    if b == (n != 0) \{ io.println(\"x\") \}")
+}
+
+test "an Int pattern 1 or 0 on a Bool is the true or false pattern" {
+    let msg = "pattern of type Int cannot match a value of type Bool"
+    expect_form_on(LINE + 1, "    let _ = match b \{\n        0 => 1\n        true => 2\n    \}", msg, "0", "`false`", "    let _ = match b \{\n        false => 1\n        true => 2\n    \}")
+    expect_form_on(LINE + 2, "    let _ = match b \{\n        false => 1\n        1 => 2\n    \}", msg, "1", "`true`", "    let _ = match b \{\n        false => 1\n        true => 2\n    \}")
+}
+
+test "a true or false pattern on an Int matches on the comparison" {
+    let src = "fn run(n: Int) -> Int \{\n    match n \{\n        true => 1\n        false => 0\n    \}\n\}\nfn main() \{ io.println(\"\{run(1)\}\") \}\n"
+    let errs = front_errors(src)
+    assert_eq(errs.len(), 2)
+    let d = errs.get(0).unwrap()
+    assert(d.message.contains("pattern of type Bool cannot match a value of type Int"))
+    assert_eq(d.code, "E0300")
+    assert_eq(d.line, 3)
+    assert_eq(d.col, 9)
+    assert_eq(d.end_col, 13)
+    assert(d.notes.contains(NOTE))
+    assert(d.help.contains("`match n != 0`"))
+    assert_eq(apply_fix(src, d), src.replace("match n \{", "match n != 0 \{"))
+    assert_eq(front_errors(apply_fix(src, d)).len(), 0)
+}
+
+test "the to_int method on a Bool is the if expression" {
+    let src = wrap("    let y = b.to_int()\n    let _ = y")
+    let d = the_error(src)
+    assert_eq(d.name, "UnresolvedMethod")
+    assert(d.help.contains("`if b \{ 1 \} else \{ 0 \}`"))
+    assert(d.notes.contains(NOTE))
+    let fixed = apply_fix(src, d)
+    assert_eq(fixed, wrap("    let y = if b \{ 1 \} else \{ 0 \}\n    let _ = y"))
+    assert_eq(front_errors(fixed).len(), 0)
+}
+
+test "a closure that a filter holds to Bool may not answer Int" {
+    let errs = front_errors("fn main() \{\n    let xs = [1, 2]\n    let ys = xs.filter(fn(x) \{ x \})\n    io.println(\"\{ys.len()\}\")\n\}\n")
+    assert(errs.len() > 0)
+    assert_eq(errs.get(0).unwrap().code, "E0300")
+}
+
+test "the Range of Int does not bind to a Range of Bool" {
+    let errs = front_errors("fn main() \{\n    let r: Range[Bool] = 0..3\n    let _ = r\n\}\n")
+    assert_eq(errs.len(), 1)
+    assert_eq(errs.get(0).unwrap().code, "E0300")
+}
+
+test "the controls still pass: enum tags compare with Int, and Bool compares with Bool" {
+    let src = "type S \{ A, B \}\nfn main() \{\n    let a = true\n    let s = S.A\n    if a == false \{ io.println(\"x\") \}\n    if s == 0 \{ io.println(\"y\") \}\n    if !a \{ io.println(\"z\") \}\n    let _ = S.B\n\}\n"
+    let errs = front_errors(src)
+    for e in errs { io.println("FAIL: control: {e.line}:{e.col}: {e.message}") }
+    assert_eq(errs.len(), 0)
+}

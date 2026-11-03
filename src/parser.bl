@@ -203,12 +203,21 @@ let mut fn_bodies: FnBodies = FnBodies { wanted: false, deferred: false, depth: 
 // next format and is non-idempotent.
 pub let mut parse_desugar_enabled: Int = 1
 
-// Side table: dotted-path-derived module key per top-level decl node.
-// Populated during merge_programs from the import graph. Used by
-// codegen's archive-mode emission filter to route decls by source
-// of origin. blink_map keys must be const char*, so the node id is
-// stringified.
-pub let mut source_module_for_node: Map[Int, Str] = Map()
+// Facts about a node that its head word and payload do not hold.
+// `source_module`: dotted-path-derived module key per top-level decl node. Populated during
+// merge_programs from the import graph. Used by codegen's archive-mode emission filter to route
+// decls by source of origin. blink_map keys must be const char*, so the node id is stringified.
+// `written_starts`, `written_ends`: where each operand was written, parens included, one packed
+// line and column per node. The parser keeps no paren nodes and a BinOp's own place is its
+// operator, so a fix that rewrites an operand reads the operand's place here. 0 means nothing
+// was recorded.
+type NodeSideTables {
+    source_module: Map[Int, Str]
+    written_starts: List[Int]
+    written_ends: List[Int]
+}
+
+let mut node_sides: NodeSideTables = NodeSideTables { source_module: Map(), written_starts: [], written_ends: [] }
 
 // A daemon recheck keeps the nodes of each source whose bytes did not change, so the pool must
 // go back to what the parses wrote before each check. Every write to a node or a closed
@@ -386,7 +395,12 @@ pub fn parser_rewind() {
     journal.order_floor = 0
     annotations = PendingAnnotations { item: [], program: [] }
     fn_bodies = FnBodies { wanted: fn_bodies.wanted, deferred: fn_bodies.deferred, depth: 0, tok_firsts: [], tok_lasts: [], item_firsts: [], item_kinds: [] }
-    source_module_for_node.clear()
+    node_sides.source_module.clear()
+    // A node the next parse pushes at a dropped id must not read that id's old place.
+    while node_sides.written_starts.len() > columns.count {
+        node_sides.written_starts.pop()
+        node_sides.written_ends.pop()
+    }
     pos = 0
     parse_desugar_enabled = 1
     trace.log("blink.journal", "undo undid {undone} writes, dropped {before - columns.count} nodes; pool {columns.count} nodes, parsed end {journal.floor}")
@@ -485,18 +499,44 @@ pub fn parser_reset() {
     annotations = PendingAnnotations { item: [], program: [] }
     // The build sets wanted before the front end, which resets the parser first.
     fn_bodies = FnBodies { wanted: fn_bodies.wanted, deferred: fn_bodies.deferred, depth: 0, tok_firsts: [], tok_lasts: [], item_firsts: [], item_kinds: [] }
-    source_module_for_node.clear()
+    node_sides = NodeSideTables { source_module: Map(), written_starts: [], written_ends: [] }
     pos = 0
     parse_desugar_enabled = 1
     journal = node_journal_empty(journal.keep)
 }
 
+fn written_put(id: Int, start: Int, end: Int) {
+    while node_sides.written_starts.len() <= id {
+        node_sides.written_starts.push(0)
+        node_sides.written_ends.push(0)
+    }
+    node_sides.written_starts.set(id, start)
+    node_sides.written_ends.set(id, end)
+}
+
+fn written_at(places: List[Int], id: Int) -> Int {
+    if id < 0 || id >= places.len() { return 0 }
+    places.get(id).unwrap()
+}
+
+fn written_pack(line: Int, col: Int) -> Int {
+    (line << 24) | col
+}
+
+// (line, col, end line, end col) of operand `id`. All 0 when the parser did not record it.
+pub fn node_written_span(id: Int) -> (Int, Int, Int, Int) {
+    let s = written_at(node_sides.written_starts, id)
+    let e = written_at(node_sides.written_ends, id)
+    if s == 0 || e == 0 { return (0, 0, 0, 0) }
+    (s >> 24, s & 16777215, e >> 24, e & 16777215)
+}
+
 pub fn record_source_module(node_id: Int, key: Str) {
-    source_module_for_node.insert(node_id, key)
+    node_sides.source_module.insert(node_id, key)
 }
 
 pub fn node_source_module(id: Int) -> Str {
-    match source_module_for_node.get(id) {
+    match node_sides.source_module.get(id) {
         Some(key) => key
         None => {
             node_get_str(checked_node_id(id, "node_source_module"), columns.at_module, node_blank.module)
@@ -5114,6 +5154,7 @@ fn parse_nullcoalesce() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
         let right = parse_or()
         let nd = node_count()
         node_push(AstNode { kind: NodeKind.BinOp, op: "??", left: left, right: right, line: op_line, col: op_col })
+        written_put(nd, written_at(node_sides.written_starts, left), written_at(node_sides.written_ends, right))
         left = nd
     }
     left
@@ -5129,6 +5170,7 @@ fn parse_or() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
         let right = parse_and()
         let nd = node_count()
         node_push(AstNode { kind: NodeKind.BinOp, op: "||", left: left, right: right, line: op_line, col: op_col })
+        written_put(nd, written_at(node_sides.written_starts, left), written_at(node_sides.written_ends, right))
         left = nd
     }
     left
@@ -5144,6 +5186,7 @@ fn parse_and() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
         let right = parse_equality()
         let nd = node_count()
         node_push(AstNode { kind: NodeKind.BinOp, op: "&&", left: left, right: right, line: op_line, col: op_col })
+        written_put(nd, written_at(node_sides.written_starts, left), written_at(node_sides.written_ends, right))
         left = nd
     }
     left
@@ -5159,6 +5202,7 @@ fn parse_equality() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
         let right = parse_comparison()
         let nd = node_count()
         node_push(AstNode { kind: NodeKind.BinOp, op: op, left: left, right: right, line: op_line, col: op_col })
+        written_put(nd, written_at(node_sides.written_starts, left), written_at(node_sides.written_ends, right))
         left = nd
     }
     left
@@ -5174,6 +5218,7 @@ fn parse_comparison() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
         let right = parse_range()
         let nd = node_count()
         node_push(AstNode { kind: NodeKind.BinOp, op: op, left: left, right: right, line: op_line, col: op_col })
+        written_put(nd, written_at(node_sides.written_starts, left), written_at(node_sides.written_ends, right))
         left = nd
     }
     left
@@ -5406,6 +5451,7 @@ fn int_ops_tree(operands: List[Int], ops: List[Str], op_toks: List[Int], lo: Int
     let tok = op_toks.get(k).unwrap()
     let nd = node_count()
     node_push(AstNode { kind: NodeKind.BinOp, op: ops.get(k).unwrap(), left: left, right: right, line: tokens.lines.get(tok).unwrap(), col: tokens.cols.get(tok).unwrap() })
+    written_put(nd, written_at(node_sides.written_starts, left), written_at(node_sides.written_ends, right))
     nd
 }
 
@@ -5554,6 +5600,15 @@ fn parse_int_ops() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
 }
 
 fn parse_unary() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
+    let start = written_pack(peek_line(), peek_col())
+    let id = parse_unary_unwritten()
+    let mut last = pos - 1
+    while last > 0 && peek_kind_at(last) == TokenKind.Newline { last = last - 1 }
+    if id >= 0 && last >= 0 { written_put(id, start, written_pack(tokens.lines.get(last).unwrap(), tokens.end_cols.get(last).unwrap())) }
+    id
+}
+
+fn parse_unary_unwritten() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
     if at(TokenKind.Minus) {
         let op_line = peek_line()
         let op_col = peek_col()

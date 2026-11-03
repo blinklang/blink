@@ -2,6 +2,10 @@
 
 Single source of truth for release history. `blink llms` and `blink llms --full` both append this file after the reference text, and every release version is indexed as a topic (e.g. `blink llms --topic v0.36`). **Edit only here** — `llms.md` and `llms-full.md` hold only a `## Recent Changes` stub pointing at this file.
 
+## Breaking Changes (v0.61.0)
+
+- **`Bool` and `Int` are distinct types (section 3.4).** An `Int` where a `Bool` is wanted, or a `Bool` where an `Int` is wanted, is now E0300 at a declaration, an argument, a struct field and a return. The condition of `if` and `while`, a match guard, and each operand of `&&`, `||` and `!` must be `Bool`: `if n { }`, `while 1 { }` and `!n` fail. `==` and `!=` between a `Bool` and an `Int` fail. A `true` or `false` pattern on an `Int` and an integer pattern on a `Bool` fail. Each error has a caret under the operand, the note `Blink has no truthiness` and a help line, and `blink fix` applies the rewrite: `n != 0`, `if b { 1 } else { 0 }`, `b`, `!b`. `Bool` has no `to_int()` and `Int` has no `to_bool()`. A function that returns a test should now say `-> Bool`.
+
 ## Breaking Changes (v0.60.0)
 
 - **`shell_exec` and the `process_*` free functions are removed.** A call to `shell_exec`, `process_run`, `process_run_with_stdin`, `process_exec`, `process_spawn`, `process_pid_wait`, `process_pid_kill` or `process_pid_send_signal` is now E0504, and its help names the `process` operation and its effect. Before, these calls went straight to the runtime and skipped any `Process` handler. `blink fix` rewrites `process_run`, `process_spawn` and `process_exec`; the others change their arguments, so the help shows the new call. A function of your own with one of these names still compiles and is called.
