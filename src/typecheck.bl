@@ -2961,8 +2961,9 @@ let mut tc_ud_blamed: Map[Int, Int] = Map()
 // record of a node is the one that counts. A group in tc_call_open_tids is one of
 // [sig, self_offset, n, tid..., open...] (tc_note_generic_call),
 // [-1, im, n, tid...] (tc_note_conversion_call), [-1, -1, 1, ctor] (tc_note_open_ctor_key),
-// [-2, -1, 0] (tc_note_deferred_conversion), [-3, -1, 0] (tc_note_open_variant) or
-// [-4, sig, tid, n, binder..., enclosing fn] (tc_note_fn_value).
+// [-2, -1, 0] (tc_note_deferred_conversion), [-3, -1, 0] (tc_note_open_variant),
+// [-4, sig, tid, n, binder..., enclosing fn] (tc_note_fn_value) or
+// [-5, -1, 0] (tc_note_void_return).
 let mut tc_call_open_calls: List[Int] = []
 let mut tc_call_open_group: Map[Int, Int] = Map()
 let mut tc_call_open_tids: List[Int] = []
@@ -3284,6 +3285,17 @@ fn tc_note_open_variant(node: Int, tid: Int) -> Int {
     tid
 }
 
+// The `return e` of a closure under an expected (), where `e` was open at the closure's walk, as
+// the group [-5, -1, 0].
+fn tc_note_void_return(ret: Int) {
+    if tc_call_open_group.contains_key(ret) { return }
+    tc_call_open_calls.push(ret)
+    tc_call_open_group.insert(ret, tc_call_open_tids.len())
+    tc_call_open_tids.push(-5)
+    tc_call_open_tids.push(-1)
+    tc_call_open_tids.push(0)
+}
+
 fn tc_open_group_is_variant(g: Int) -> Bool {
     tc_call_open_tids.get(g).unwrap() == -3
 }
@@ -3352,12 +3364,22 @@ fn tc_note_open_ctor_key(node: Int, ctor: Int) {
     let t = tc_resolve(ctor)
     let k = type_kind(t)
     if k != TyKind.Map && k != TyKind.Set { return }
-    if tc_call_open_group.contains_key(node) == 0 { tc_call_open_calls.push(node) }
+    let g = tc_call_open_group.get(node) ?? -1
+    if g < 0 { tc_call_open_calls.push(node) }
     tc_call_open_group.insert(node, tc_call_open_tids.len())
     tc_call_open_tids.push(-1)
     tc_call_open_tids.push(-1)
     tc_call_open_tids.push(1)
     tc_call_open_tids.push(if tc_tid_has_unbound_metavar(ty_pool.get(t).unwrap().inner1) != 0 { t } else { -1 })
+    tc_call_open_tids.push(if tc_open_group_is_receiver(g) { 1 } else { 0 })
+}
+// A receiver has no later binding or parameter to give its key a type, so the flush judges it.
+fn tc_note_open_receiver(node: Int) {
+    let g = tc_call_open_group.get(node) ?? -1
+    if tc_open_group_has_open_key(g) { tc_call_open_tids.set(g + 4, 1) }
+}
+fn tc_open_group_is_receiver(g: Int) -> Bool {
+    tc_open_group_has_open_key(g) && tc_call_open_tids.get(g + 4).unwrap() == 1
 }
 
 // The Hash judgment of a recorded group, made once inference is done (see
@@ -3398,13 +3420,17 @@ fn tc_flush_open_keys_of(call_node: Int, g: Int) ! Diag.Report {
 //
 // Each definition flushes before its type parameters leave scope, so a chosen impl may bind
 // a binder to one of them. The flush at the end of the program has none in scope.
-fn tc_flush_deferred_conversions() ! TypeCheck.Resolve, Diag.Report {
+fn tc_flush_deferred_conversions() ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     let mut chose = true
     while chose {
         chose = false
         for call_node in tc_deferred_conversion_calls() {
             if tc_choose_deferred_conversion(call_node) { chose = true }
         }
+    }
+    // An open value that stays open is the E0301 of whatever left it open, not this error.
+    for r in tc_call_open_calls {
+        if tc_call_open_tids.get(tc_call_open_group.get(r).unwrap()).unwrap() == -5 { tc_report_value_returned_as_void(r) }
     }
 }
 
@@ -3573,16 +3599,25 @@ fn tc_ud_flush_calls() ! Diag.Report {
 fn tc_ud_flush_open_variants() ! Diag.Report {
     for node in tc_call_open_calls {
         let g = tc_call_open_group.get(node).unwrap()
-        if !tc_open_group_is_variant(g) || tc_call_reported.contains_key(node) { continue }
-        let tid = tc_lookup_node_tid(node)
-        if tc_tid_has_unbound_metavar(tid) == 0 || tc_ud_already_blamed(tid) != 0 { continue }
-        // An error already on the construction's lines is the first report, and the open slot
-        // may be its consequence: a call that does not resolve gives its argument no type.
-        let end_line = if node_end_line(node) > node_line(node) { node_end_line(node) } else { node_line(node) }
-        if diag_errors_in_lines(diag_file_for_node(node), node_line(node), end_line) > 0 { continue }
-        tc_call_reported.insert(node, 1)
-        tc_report_under_determined_at(node, tid, "no annotation, parameter type or return type gives this value its type")
+        if tc_open_group_is_variant(g) || tc_open_group_is_receiver(g) { tc_ud_judge_open_value(node) }
     }
+}
+
+// A key the group's walk left open has no operations for codegen to choose, whatever reads it.
+fn tc_open_group_has_open_key(g: Int) -> Bool {
+    g >= 0 && tc_call_open_tids.get(g).unwrap() == -1 && tc_call_open_tids.get(g + 1).unwrap() == -1 && tc_call_open_tids.get(g + 3).unwrap() >= 0
+}
+
+fn tc_ud_judge_open_value(node: Int) ! Diag.Report {
+    if tc_call_reported.contains_key(node) { return }
+    let tid = tc_lookup_node_tid(node)
+    if tc_tid_has_unbound_metavar(tid) == 0 || tc_ud_already_blamed(tid) != 0 { return }
+    // An error already on the construction's lines is the first report, and the open slot
+    // may be its consequence: a call that does not resolve gives its argument no type.
+    let end_line = if node_end_line(node) > node_line(node) { node_end_line(node) } else { node_line(node) }
+    if diag_errors_in_lines(diag_file_for_node(node), node_line(node), end_line) > 0 { return }
+    tc_call_reported.insert(node, 1)
+    tc_report_under_determined_at(node, tid, "no annotation, parameter type or return type gives this value its type")
 }
 
 // Report each generic function's name whose binders nothing fixed, at the reference, where its
@@ -3743,7 +3778,41 @@ fn tc_ud_open_slot(tid: Int, val: Int) -> (Str, Str) {
     if val >= 0 && node_kind(val) == NodeKind.MethodCall && (node_method(val) == "map" || node_method(val) == "flat_map") {
         if k == TyKind.List || k == TyKind.Iterator { return (tc_ud_call_source(val), "element type") }
     }
-    ("the empty construction here", "element type")
+    if tc_ud_value_is_empty_construction(val) { return ("the empty construction here", "element type") }
+    (tc_ud_call_source(val), "element type")
+}
+
+// Whether a value spells the empty construction it leaves open, directly or under a method of it,
+// a wrapping variant or a tuple. Any other value is open for a reason this note cannot name.
+fn tc_ud_value_is_empty_construction(val: Int) -> Bool {
+    if val < 0 { return false }
+    let k = node_kind(val)
+    if k == NodeKind.ListLit { return sublist_length(node_elements(val)) == 0 }
+    if k == NodeKind.Ident { return node_name(val) == "None" }
+    if k == NodeKind.TupleLit {
+        let els = node_elements(val)
+        let mut i = 0
+        while i < sublist_length(els) {
+            if tc_ud_value_is_empty_construction(sublist_get(els, i)) { return true }
+            i = i + 1
+        }
+        return false
+    }
+    if k == NodeKind.Call && node_kind(node_left(val)) == NodeKind.Ident {
+        let callee = node_name(node_left(val))
+        if callee == "Map" || callee == "Set" { return true }
+        if callee == "Some" || callee == "Ok" || callee == "Err" {
+            let args = node_args(val)
+            return args != -1 && sublist_length(args) == 1 && tc_ud_value_is_empty_construction(sublist_get(args, 0))
+        }
+        return false
+    }
+    if k == NodeKind.MethodCall {
+        let obj = node_obj(val)
+        if node_kind(obj) == NodeKind.Ident { return (node_name(obj) == "Map" || node_name(obj) == "Set") && node_method(val) == "new" }
+        return tc_ud_value_is_empty_construction(obj)
+    }
+    false
 }
 
 // The call a value is, spelled as written, or a plain "the value" when it is not a call.
@@ -7890,6 +7959,9 @@ fn check_closure_param(closure_node: Int, param_idx: Int, expected_t: Int, metho
     if tc_tid_is_no_info(ptid) != 0 { return }
     if types_compatible(ptid, expected_t) == 0 {
         tc_error_at("closure parameter {param_idx + 1} of `{container_label}.{method}` expects {type_to_str(expected_t)}, got {type_to_str(ptid)}", p)
+    } else if tc_tid_has_unbound_metavar(expected_t) != 0 {
+        // A written parameter type is the only word on an element that `[]` left open.
+        let _ = tc_unify(expected_t, ptid)
     }
 }
 
@@ -7984,14 +8056,29 @@ fn tc_check_callback_value(label: Str, pos: Int, value: Int, params: List[Int], 
     let want = make_fn_type(want_ret, params)
     let saved_hint = tc_construct_hint
     tc_construct_hint = want
-    let got = tc_resolve(resolve_alias_tid(infer_type(value)))
+    let mut got = tc_resolve(resolve_alias_tid(infer_type(value)))
     tc_construct_hint = saved_hint
     if tc_tid_is_no_info(got) != 0 { return -1 }
+    // A closure's own unannotated param: this use is what says it is a function.
+    if tc_is_unbound_metavar(got) != 0 {
+        let _ = tc_unify(want, got)
+        got = tc_resolve(got)
+    }
     if tc_tid_kind(got) != TyKind.Fn || tc_unify(want, got) == 0 || types_compatible(got, want) == 0 {
         tc_arg_mismatch(label, pos, value, want, got)
         return tc_error_recovery_tid()
     }
     tc_fn_tid_ret(got)
+}
+
+// `with_ptr`'s one parameter is positional (sections/07_trust_modules_metadata.md), and a label on
+// a positional parameter is E0511 (sections/02_syntax.md 2.13). Each walk reads this node again.
+fn tc_refuse_label_on_with_ptr(args_sl: Int) ! Diag.Report {
+    if args_sl == -1 || sublist_length(args_sl) == 0 { return }
+    let arg = sublist_get(args_sl, 0)
+    if node_kind(arg) != NodeKind.NamedArg || tc_call_reported.contains_key(arg) { return }
+    tc_call_reported.insert(arg, 1)
+    diag_error_at("InvalidKeywordArg", INVALID_KEYWORD_ARG, "`Bytes.with_ptr` takes no keyword arguments", arg, "pass the closure without a label")
 }
 
 // The accumulator type a fold's callback states, or -1 for one that states none: an unannotated
@@ -8132,17 +8219,18 @@ fn tc_bind_hof_result(node: Int, cls: Int, method: Str, recv_kind: TyKind, diag_
     let slot = tc_hof_result_slot_elem(node)
     if slot == -1 { return }
     let ret = tc_fn_tid_ret(tc_lookup_node_tid(cls))
+    // A body that never completes names no element and answers to any carrier, so an open slot
+    // here is reported at the end if no expected type fills it (sections/03_types.md: inference
+    // never chooses `Never` for a slot the program left open).
+    if ret >= 0 && tc_resolve(ret) == TYPE_NEVER {
+        let _ = tc_note_open_variant(node, tc_lookup_node_tid(node))
+        return
+    }
     let mut produced = ret
     if method == "flat_map" && ret >= 0 {
         let rk = type_kind(ret)
         if rk == TyKind.Unknown || rk == TyKind.Typevar {
             if diag_count > diag_before { tc_ud_mark_blamed(slot) }
-            return
-        }
-        // A body that never completes answers to any carrier, and names no element, so an open
-        // element here has to be reported at the end if no expected type gives it.
-        if tc_resolve(ret) == TYPE_NEVER {
-            let _ = tc_note_open_variant(node, tc_lookup_node_tid(node))
             return
         }
         if rk != recv_kind {
@@ -8660,10 +8748,21 @@ fn check_closure_body(cls: Int, exp_fn: Int) ! TypeCheck.Resolve, TypeCheck.Repo
 // off them (tc_settle_closure_ret).
 fn tc_report_values_returned_as_void(cls: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     for r in tc_body_valued_returns(node_body(cls)) {
-        let vt = tc_resolve(tc_lookup_node_tid(node_value(r)))
-        if tc_tid_is_no_info(vt) != 0 || vt == TYPE_VOID || vt == TYPE_NEVER { continue }
-        tc_error_at_code("return value type {type_to_str(vt)} does not match closure return type (), which the expected function type gives", r, "TypeError", TYPE_ERROR, "add `-> T` to the expected function type, or drop the value")
+        // A later use in the definition can still settle this value (sections/03_types.md 3.4).
+        if tc_tid_has_unbound_metavar(tc_resolve(tc_lookup_node_tid(node_value(r)))) != 0 {
+            tc_note_void_return(r)
+        } else {
+            tc_report_value_returned_as_void(r)
+        }
     }
+}
+
+fn tc_report_value_returned_as_void(r: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    let vt = tc_resolve(tc_lookup_node_tid(node_value(r)))
+    if tc_tid_is_no_info(vt) != 0 || vt == TYPE_VOID || vt == TYPE_NEVER || tc_tid_has_unbound_metavar(vt) != 0 { return }
+    if tc_call_reported.contains_key(r) { return }
+    tc_call_reported.insert(r, 1)
+    tc_error_at_code("return value type {type_to_str(vt)} does not match closure return type (), which the expected function type gives", r, "TypeError", TYPE_ERROR, "add `-> T` to the expected function type, or drop the value")
 }
 
 // The return of a closure that neither writes `-> R` nor sits where one is declared is what its
@@ -27417,9 +27516,11 @@ pub fn infer_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.
     // §2.9: the walk runs with tc_if_value_ctx at 1, because most child descents use their
     // value. Restore it on return so a walk does not change the flag its caller set; a
     // discarded statement relies on it staying 0 across statements.
+    let earlier = tc_empty_ctor_stamp(node)
     let incoming = tc_if_value_ctx
     tc_if_value_ctx = 1
     let tid = infer_type_uncached(node, incoming)
+    if earlier != -1 && tc_tid_is_no_info(tid) == 0 { let _ = tc_unify(tid, earlier) }
     tc_if_value_ctx = incoming
     tc_infer_unclaimed_args(node)
     tc_check_type_args_claimed(node, tid)
@@ -27443,6 +27544,36 @@ pub fn infer_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.
         }
     }
     tid
+}
+
+// The type an earlier walk gave an empty `[]`, `Map()`, `Set()` or `.new()`, or -1. Its own
+// elements say nothing, so all it knows comes from uses, and each walk mints new metavariables.
+// infer_type ties them to these, or a later walk cuts the node off from what the uses bound, and
+// codegen reads the node.
+fn tc_empty_ctor_stamp(node: Int) -> Int {
+    if !tc_node_is_empty_ctor(node) { return -1 }
+    let memo = tc_lookup_node_tid(node)
+    if memo < 0 || tc_tid_has_unknown(memo) != 0 { return -1 }
+    let k = tc_tid_kind(tc_resolve(memo))
+    if k == TyKind.List || k == TyKind.Map || k == TyKind.Set { memo } else { -1 }
+}
+
+fn tc_node_is_empty_ctor(node: Int) -> Bool {
+    if node < 0 { return false }
+    let k = node_kind(node)
+    if k == NodeKind.ListLit {
+        let els = node_elements(node)
+        return els == -1 || sublist_length(els) == 0
+    }
+    if k == NodeKind.Call && node_kind(node_left(node)) == NodeKind.Ident {
+        let name = node_name(node_left(node))
+        return name == "Map" || name == "Set"
+    }
+    if k == NodeKind.MethodCall && node_method(node) == "new" && node_kind(node_obj(node)) == NodeKind.Ident {
+        let name = node_name(node_obj(node))
+        return name == "Map" || name == "Set" || name == "List"
+    }
+    false
 }
 
 pub fn tc_lookup_node_tid(node: Int) -> Int {
@@ -28270,6 +28401,11 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
         // child, which typed `e.unwrap()` on an `Option[T]` α one level too deep.
         let obj_t = tc_resolve(tc_infer_receiver(recv_node))
         let obj_k = type_kind(obj_t)
+        // An open iterator has no generic fns to call, where `[].len()` reads no element at all.
+        if obj_k == TyKind.List && method == "into_iter" && tc_node_is_empty_ctor(recv_node) {
+            let _ = tc_note_open_variant(recv_node, obj_t)
+        }
+        tc_note_open_receiver(recv_node)
 
         // A plain method call on `Self` in a trait default body is licensed only when the
         // method is in the trait's guarantee set (its own methods + the supertrait
@@ -29909,10 +30045,10 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                     }
                     // A walk before the boundary check does not see a local that hides the
                     // module, and each later one reads this node again.
-                    if qual_fn == -1 && tc_boundary_check_active != 0 && !nr_is_call_on_collided_qualifier(node) {
+                    if qual_fn == -1 && tc_boundary_check_active != 0 && !nr_is_call_on_collided_qualifier(node) && nr_qualifier_module_in(obj_name, tc_site_module(node)) != "" {
                         if !tc_call_reported.contains_key(node) {
                             tc_call_reported.insert(node, 1)
-                            tc_report_no_module_member(node, obj_name, fname)
+                            tc_report_member_read_as_value(node, obj_name, fname)
                         }
                         return tc_error_recovery_tid()
                     }
@@ -35808,6 +35944,7 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
         // closure's return tid publish faithfully. An annotated param keeps its own type
         // (check_closure_body prefers the declared type over this hint).
         if type_kind(obj_t) == TyKind.Bytes && node_method(node) == "with_ptr" {
+            tc_refuse_label_on_with_ptr(args_sl)
             let wp_cls = closure_arg_at(args_sl, 0)
             let wp_params = [make_ptr_type(TYPE_U8)]
             hof_arg = 0
@@ -38727,8 +38864,19 @@ fn tc_report_unclaimed_calls(order: List[Int], mods: List[Str]) ! Diag.Report {
 
 fn tc_report_no_module_member(node: Int, q: Str, member: Str) ! Diag.Report {
     let near = suggest_module_member(tc_qualifier_to_module_or_self(q), member)
-    let help = if near != "" { "did you mean `{q}.{near}`?" } else { "" }
+    let help = if near != "" && near != member { "did you mean `{q}.{near}`?" } else { "" }
     diag_error_at("UnresolvedMethod", UNRESOLVED_METHOD, "no member `{member}` on module `{q}`", node, help)
+}
+
+// A built-in call and an effect have a name in the module, and no value to read.
+fn tc_report_member_read_as_value(node: Int, q: Str, member: Str) ! Diag.Report {
+    if is_intrinsic_method(q, member) != 0 {
+        diag_error_at("UnresolvedMethod", UNRESOLVED_METHOD, "`{q}.{member}` is a built-in call and cannot be read as a value", node, "wrap the call in a closure, such as `fn(x) \{ {q}.{member}(x) }`")
+    } else if suggest_module_member(tc_qualifier_to_module_or_self(q), member) == member {
+        diag_error_at("UnresolvedMethod", UNRESOLVED_METHOD, "`{q}.{member}` cannot be read as a value", node, "")
+    } else {
+        tc_report_no_module_member(node, q, member)
+    }
 }
 
 // A value receiver's type, determined all the way down. A local shadowing a module name

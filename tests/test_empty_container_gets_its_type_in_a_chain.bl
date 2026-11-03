@@ -1,0 +1,89 @@
+// An empty `[]`, `Map()` or `Set()` has no elements to say its type, so uses say it. Each walk of
+// the node mints new metavariables, and codegen reads the node, so a use has to reach the node, or
+// the build stops in codegen. What no use fixes is E0301 at the construction (section 3.4).
+
+import compile_test_helpers
+
+fn ecc_add(a: Map[Str, Int], x: Int) -> Map[Str, Int] {
+    let mut m = a
+    m.insert("{x}", x)
+    m
+}
+
+fn ecc_pick(a: Map[Str, Int], x: Int) -> Map[Str, Int] { ecc_add(a, x) }
+fn ecc_make() -> fn(Map[Str, Int], Int) -> Map[Str, Int] { ecc_add }
+fn ecc_keep[K: Hash + Eq](a: Map[K, Int], x: Int) -> Map[K, Int] { a }
+fn ecc_opt(a: Int?, x: Int) -> Int? { Some(x) }
+fn ecc_take(it: Iterator[Str]) -> Int { it.count() }
+fn ecc_size(s: Set[Int]) -> Int { s.len() }
+
+fn open_value(body: Str, tag: Str) ! FS.Delete, FS.Write, Process.Spawn, FS.Read, Env.Read, IO.Print {
+    let src = "fn oo(a: Map[Str, Int], x: Int) -> Map[Str, Int] \{ a }\nfn gm[K: Hash + Eq](a: Map[K, Int], x: Int) -> Map[K, Int] \{ a }\nfn main() \{ {body} }\n"
+    let out = compile_test_helpers.compile_and_capture(src, tag)
+    compile_test_helpers.expect_error(out, "E0301", tag)
+    assert(!out.contains("internal compiler error"), out)
+}
+
+test "a closure over an empty list's iterator gets the element from an expected type" {
+    let a: Iterator[Int] = [].into_iter().map(fn(x) { x })
+    assert_eq(a.count(), 0)
+    let b: Iterator[Int] = [].into_iter()
+    assert_eq(b.count(), 0)
+    assert_eq(ecc_take([].into_iter()), 0)
+}
+
+test "a written closure parameter gives an empty list its element" {
+    let a: Iterator[Int] = [].into_iter().map(fn(x: Int) { x })
+    assert_eq(a.count(), 0)
+    let b = [].into_iter().map(fn(x: Int) { x })
+    assert_eq(b.count(), 0)
+    assert_eq([].into_iter().map(fn(x: Int) -> Str { "a" }).count(), 0)
+    assert_eq([].into_iter().filter(fn(x: Str) { x == "a" }).collect().len(), 0)
+    assert_eq([].fold(0, fn(a: Int, x: Str) { a + x.len() }), 0)
+    assert_eq([].map(fn(x: List[Int]) { x.len() }).len(), 0)
+}
+
+test "an empty map accumulator takes its key from each form of callback" {
+    assert_eq([1, 2].fold(Map.new(), ecc_add).len(), 2)
+    assert_eq([1, 2].fold(Map(), ecc_make()).len(), 2)
+    assert_eq([1, 2].fold(Map.new(), ecc_make()).len(), 2)
+    assert_eq([1, 2].fold(Map.new(), if true { ecc_add } else { ecc_pick }).len(), 2)
+    let k = fn(a: Map[Str, Int], x: Int) -> Map[Str, Int] { ecc_add(a, x) }
+    assert_eq([1, 2].fold(Map.new(), k).len(), 2)
+    let fs = [ecc_add]
+    assert_eq([1, 2].fold(Map(), fs.get(0).unwrap()).len(), 2)
+    let m: Map[Str, Int] = [1, 2].fold(Map.new(), ecc_keep)
+    assert_eq(m.len(), 0)
+}
+
+test "a None accumulator takes its element from the callback" {
+    assert_eq([1, 2].fold(None, ecc_opt), Some(2))
+}
+
+test "an empty construction that a call or a later use fixes still runs" {
+    assert_eq(ecc_size(Set()), 0)
+    let mut m = Map()
+    m.insert("a", 1)
+    assert_eq(m.len(), 1)
+    assert_eq([].len(), 0)
+}
+
+test "an empty list's iterator that nothing fixes is E0301" {
+    open_value("let _ = [].into_iter().count()", "ecc_count")
+    open_value("let _ = [].into_iter().collect().len()", "ecc_collect")
+    open_value("let _ = [].into_iter().map(fn(x) \{ x })", "ecc_map")
+    open_value("let _ = [].into_iter().filter(fn(x) \{ true }).count()", "ecc_filter")
+    open_value("for x in [].into_iter() \{ let _ = 1 }", "ecc_for")
+}
+
+test "an empty map or set whose key nothing fixes is E0301" {
+    open_value("let _ = Map().len()", "ecc_map_len")
+    open_value("let _ = Set().len()", "ecc_set_len")
+    open_value("let _ = Set().into_iter().count()", "ecc_set_iter")
+    open_value("let _ = Set.new().into_iter().count()", "ecc_set_new_iter")
+    open_value("let _ = Map.new().len()", "ecc_map_new_len")
+}
+
+test "a fold whose callback does not fix the key is E0301" {
+    open_value("let m = [1].fold(Map.new(), gm)\n let _ = m.len()", "ecc_generic")
+}
