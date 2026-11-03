@@ -2963,7 +2963,7 @@ let mut tc_ud_blamed: Map[Int, Int] = Map()
 // [-1, im, n, tid...] (tc_note_conversion_call), [-1, -1, 1, ctor] (tc_note_open_ctor_key),
 // [-2, -1, 0] (tc_note_deferred_conversion), [-3, -1, 0] (tc_note_open_variant),
 // [-4, sig, tid, n, binder..., enclosing fn] (tc_note_fn_value) or
-// [-5, -1, 0] (tc_note_void_return).
+// [-5, closure, 0] (tc_note_void_return).
 let mut tc_call_open_calls: List[Int] = []
 let mut tc_call_open_group: Map[Int, Int] = Map()
 let mut tc_call_open_tids: List[Int] = []
@@ -3286,13 +3286,13 @@ fn tc_note_open_variant(node: Int, tid: Int) -> Int {
 }
 
 // The `return e` of a closure under an expected (), where `e` was open at the closure's walk, as
-// the group [-5, -1, 0].
-fn tc_note_void_return(ret: Int) {
+// the group [-5, closure, 0].
+fn tc_note_void_return(ret: Int, cls: Int) {
     if tc_call_open_group.contains_key(ret) { return }
     tc_call_open_calls.push(ret)
     tc_call_open_group.insert(ret, tc_call_open_tids.len())
     tc_call_open_tids.push(-5)
-    tc_call_open_tids.push(-1)
+    tc_call_open_tids.push(cls)
     tc_call_open_tids.push(0)
 }
 
@@ -3429,7 +3429,8 @@ fn tc_flush_deferred_conversions() ! TypeCheck.Resolve, TypeCheck.Report, Diag.R
         }
     }
     for r in tc_call_open_calls {
-        if tc_call_open_tids.get(tc_call_open_group.get(r).unwrap()).unwrap() == -5 { tc_report_value_returned_as_void(r) }
+        let group = tc_call_open_group.get(r).unwrap()
+        if tc_call_open_tids.get(group).unwrap() == -5 { tc_report_value_returned_as_void(r, tc_call_open_tids.get(group + 1).unwrap()) }
     }
 }
 
@@ -8750,14 +8751,14 @@ fn tc_report_values_returned_as_void(cls: Int) ! TypeCheck.Resolve, TypeCheck.Re
     for r in tc_body_valued_returns(node_body(cls)) {
         // A later use in the definition can still settle this value (sections/03_types.md 3.4).
         if tc_tid_has_unbound_metavar(tc_resolve(tc_lookup_node_tid(node_value(r)))) != 0 {
-            tc_note_void_return(r)
+            tc_note_void_return(r, cls)
         } else {
-            tc_report_value_returned_as_void(r)
+            tc_report_value_returned_as_void(r, cls)
         }
     }
 }
 
-fn tc_report_value_returned_as_void(r: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+fn tc_report_value_returned_as_void(r: Int, cls: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     let vt = tc_resolve(tc_lookup_node_tid(node_value(r)))
     // An operand that is one open slot and stays open is the E0301 of whatever left it open. A
     // type with a head is not (), whatever fills its slots.
@@ -8766,7 +8767,11 @@ fn tc_report_value_returned_as_void(r: Int) ! TypeCheck.Resolve, TypeCheck.Repor
     if tc_tid_has_unknown(vt) != 0 { return }
     if tc_call_reported.contains_key(r) { return }
     tc_call_reported.insert(r, 1)
-    tc_error_at_code("return value type {type_to_str(vt)} does not match closure return type ()", r, "TypeError", TYPE_ERROR, "drop the value, or change the `()` on the closure or on the function type it is passed as")
+    if node_type_ann(cls) != -1 {
+        tc_error_at_code("return value type {type_to_str(vt)} does not match closure return type ()", r, "TypeError", TYPE_ERROR, "change `-> ()` to `-> T`, or drop the value")
+    } else {
+        tc_error_at_code("return value type {type_to_str(vt)} does not match closure return type (), which the expected function type gives", r, "TypeError", TYPE_ERROR, "add `-> T` to the expected function type, or drop the value")
+    }
 }
 
 // The return of a closure that neither writes `-> R` nor sits where one is declared is what its
