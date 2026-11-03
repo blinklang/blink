@@ -7867,7 +7867,8 @@ fn register_derive_method_sigs(program: Int) {
 // tolerate -1 (they no-op on a non-Closure node), so call sites need no guard.
 fn closure_arg_at(args_sl: Int, idx: Int) -> Int {
     if args_sl == -1 || idx >= sublist_length(args_sl) { return -1 }
-    sublist_get(args_sl, idx)
+    let arg = sublist_get(args_sl, idx)
+    if node_kind(arg) == NodeKind.NamedArg { node_value(arg) } else { arg }
 }
 
 // Validate one explicitly-annotated closure parameter against the type the HOF
@@ -8064,7 +8065,7 @@ fn tc_fn_ret_open_in(fn_tid: Int, memo: Int) -> Bool {
 // `fn f[T](xs: List[T]) { xs.map(fn(x) { Some(x) }) }` as under-determined. An undeterminable
 // body leaves the slot open for the E0301 boundary check; when the body already reported
 // why, the slot is marked so that check does not report the same hole again.
-fn tc_bind_hof_result(node: Int, cls: Int, method: Str, diag_before: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+fn tc_bind_hof_result(node: Int, cls: Int, method: Str, recv_kind: TyKind, diag_before: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     if cls == -1 || node_kind(cls) != NodeKind.Closure { return }
     if node_type_ann(cls) != -1 || node_return_type(cls) != "" { return }
     let slot = tc_hof_result_slot_elem(node)
@@ -8077,8 +8078,10 @@ fn tc_bind_hof_result(node: Int, cls: Int, method: Str, diag_before: Int) ! Type
             if diag_count > diag_before { tc_ud_mark_blamed(slot) }
             return
         }
-        if rk != TyKind.List && rk != TyKind.Iterator {
-            tc_error_at("the closure of `flat_map` must return a List or an Iterator, got {type_to_str(ret)}", cls)
+        // A body that never completes answers to any carrier, and names no element.
+        if tc_resolve(ret) == TYPE_NEVER { return }
+        if rk != recv_kind {
+            tc_report_flat_map_carrier(cls, ret, recv_kind)
             // A let binder's E0301 ignores the blamed set, so close the hole instead: this
             // error already stops the build, and an unknown element keeps uses quiet.
             bind_metavar(slot, TYPE_UNKNOWN)
@@ -8096,6 +8099,85 @@ fn tc_bind_hof_result(node: Int, cls: Int, method: Str, diag_before: Int) ! Type
     }
     if types_compatible(tc_resolve(slot), produced) == 0 {
         tc_error_at("`{method}` is used here as producing {type_to_str(slot)}, but its closure returns {type_to_str(produced)}", cls)
+    }
+}
+
+// `flat_map` keeps the receiver's own carrier: the signature names it in the callback's return
+// (sections/03_types.md, sections/03c_protocols.md), and codegen builds no bridge to the other.
+fn tc_report_flat_map_carrier(cls: Int, got: Int, recv_kind: TyKind) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    let (label, want) = if recv_kind == TyKind.Iterator { ("Iterator", "an Iterator") } else { ("List", "a List") }
+    tc_error_at("the closure of `{label}.flat_map` must return {want}, got {type_to_str(got)}", cls)
+}
+
+// The result of a `flat_map` whose closure writes `-> R`. On the wrong carrier the element is
+// left unknown, so the uses of the result add no second report to this one.
+fn tc_flat_map_annotated_result(cls: Int, annotated: Int, recv_kind: TyKind) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    if tc_tid_kind(tc_resolve(resolve_alias_tid(annotated))) == recv_kind { return annotated }
+    tc_report_flat_map_carrier(cls, annotated, recv_kind)
+    if recv_kind == TyKind.Iterator { make_iterator_type(TYPE_UNKNOWN) } else { make_list_type(TYPE_UNKNOWN) }
+}
+
+// Whether a closure literal takes as many parameters as a built-in method hands it. The other
+// count has no walk: a parameter with no hint would add its own E0301 to this report, and the
+// body means nothing until the signature is right.
+fn tc_closure_param_count_fits(label: Str, pos: Int, cls: Int, params: List[Int], want_ret: Int) -> Bool ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    if cls == -1 || node_kind(cls) != NodeKind.Closure { return true }
+    let params_sl = node_params(cls)
+    let n = if params_sl == -1 { 0 } else { sublist_length(params_sl) }
+    if n == params.len() { return true }
+    tc_arg_mismatch(label, pos, cls, make_fn_type(want_ret, params), infer_type(cls))
+    false
+}
+
+// A call whose closure has no walk has no body to bind its result. The element stays unknown:
+// the report already stops the build, and a let binder's E0301 would add a second one.
+fn tc_close_hof_result(node: Int) {
+    let slot = tc_hof_result_slot_elem(node)
+    if slot != -1 && tc_is_unbound_metavar(tc_resolve(slot)) != 0 { bind_metavar(slot, TYPE_UNKNOWN) }
+}
+
+// What the signature of an element HOF states for its closure's return. `map` and `flat_map`
+// leave it to the body; the others declare it, and a body answers to it as a named fn's does.
+fn tc_elem_hof_closure_ret(method: Str) -> Int {
+    if method == "for_each" { return TYPE_VOID }
+    if method == "map" || method == "flat_map" { return TYPE_UNKNOWN }
+    TYPE_BOOL
+}
+
+// types_compatible still takes Int for Bool both ways, and a closure the signature of a built-in
+// types has no other place to meet that. `filter(fn(x) { x })` must not pass where `filter(f)`
+// with the same f fails. This goes when Bool is distinct from Int.
+fn tc_int_bool_differ(a: Int, b: Int) -> Bool {
+    let ka = tc_tid_kind(tc_resolve(resolve_alias_tid(a)))
+    let kb = tc_tid_kind(tc_resolve(resolve_alias_tid(b)))
+    (ka == TyKind.Int && kb == TyKind.Bool) || (ka == TyKind.Bool && kb == TyKind.Int)
+}
+
+fn tc_check_closure_int_bool(label: Str, cls: Int, want_ret: Int, params: List[Int]) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    if cls == -1 || node_kind(cls) != NodeKind.Closure { return }
+    let params_sl = node_params(cls)
+    if params_sl != -1 {
+        let mut i = 0
+        while i < sublist_length(params_sl) && i < params.len() {
+            let p = sublist_get(params_sl, i)
+            let want = params.get(i).unwrap()
+            let decl = resolve_param_type(p)
+            if tc_tid_is_no_info(decl) == 0 && tc_int_bool_differ(decl, want) {
+                tc_error_at("closure parameter {i + 1} of `{label}` expects {type_to_str(want)}, got {type_to_str(decl)}", p)
+            }
+            i = i + 1
+        }
+    }
+    if node_type_ann(cls) != -1 {
+        let ann = tc_closure_declared_ret(cls)
+        if tc_int_bool_differ(ann, want_ret) { tc_error_at("closure of `{label}` must return {type_to_str(want_ret)}, got {type_to_str(ann)}", cls) }
+        return
+    }
+    let tail = tc_closure_body_result_tid(cls)
+    if tail >= 0 && tc_int_bool_differ(tail, want_ret) { tc_error_at("closure of `{label}` must return {type_to_str(want_ret)}, got {type_to_str(tail)}", cls) }
+    for r in tc_body_valued_returns(node_body(cls)) {
+        let vt = tc_lookup_node_tid(node_value(r))
+        if tc_tid_is_no_info(vt) == 0 && tc_int_bool_differ(vt, want_ret) { tc_error_at("closure of `{label}` must return {type_to_str(want_ret)}, got {type_to_str(vt)}", r) }
     }
 }
 
@@ -28239,7 +28321,7 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                 let ret_ann = node_type_ann(cls)
                 if ret_ann != -1 {
                     let u = resolve_type_ann(ret_ann)
-                    if u != -1 { return u }
+                    if u != -1 { return tc_flat_map_annotated_result(cls, u, TyKind.Iterator) }
                 }
                 let fv_result = tc_flat_map_callback_result("Iterator.flat_map", cls, elem, TyKind.Iterator)
                 if fv_result != -1 { return fv_result }
@@ -28288,6 +28370,7 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
             if method == "count" { return TYPE_INT }
             if method == "for_each" {
                 check_closure_param(closure_arg_at(args_sl, 0), 0, elem, method, "Iterator")
+                check_closure_ret(closure_arg_at(args_sl, 0), TYPE_VOID, method, "Iterator")
                 let _ = tc_check_callback_value("Iterator.for_each", 1, closure_arg_at(args_sl, 0), [elem], TYPE_VOID)
                 return TYPE_VOID
             }
@@ -28311,6 +28394,7 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                 let cls = closure_arg_at(args_sl, 1)
                 check_closure_param(cls, 0, init_t, method, "Iterator")
                 check_closure_param(cls, 1, elem, method, "Iterator")
+                check_closure_ret(cls, init_t, method, "Iterator")
                 let _ = tc_check_callback_value("Iterator.fold", 2, cls, [init_t, elem], init_t)
                 return init_t
             }
@@ -28364,6 +28448,7 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
             if method == "clear" { return TYPE_VOID }
             if method == "for_each" {
                 check_closure_param(closure_arg_at(args_sl, 0), 0, elem, method, "List")
+                check_closure_ret(closure_arg_at(args_sl, 0), TYPE_VOID, method, "List")
                 let _ = tc_check_callback_value("List.for_each", 1, closure_arg_at(args_sl, 0), [elem], TYPE_VOID)
                 return TYPE_VOID
             }
@@ -28479,7 +28564,7 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                 let ret_ann = node_type_ann(cls)
                 if ret_ann != -1 {
                     let u = resolve_type_ann(ret_ann)
-                    if u != -1 { return u }
+                    if u != -1 { return tc_flat_map_annotated_result(cls, u, TyKind.List) }
                 }
                 let fv_result = tc_flat_map_callback_result("List.flat_map", cls, elem, TyKind.List)
                 if fv_result != -1 { return fv_result }
@@ -28528,7 +28613,7 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                     return tc_error_recovery_tid()
                 }
                 let acc_t = infer_type(sublist_get(args_sl, 0))
-                let cls = sublist_get(args_sl, 1)
+                let cls = closure_arg_at(args_sl, 1)
                 check_closure_param(cls, 0, acc_t, method, "List")
                 check_closure_param(cls, 1, elem, method, "List")
                 check_closure_ret(cls, acc_t, method, "List")
@@ -28849,7 +28934,10 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
             if method == "with_ptr" {
                 if args_sl == -1 || sublist_length(args_sl) < 1 { return TYPE_VOID }
                 let cls_node = sublist_get(args_sl, 0)
-                if node_kind(cls_node) != NodeKind.Closure { return TYPE_VOID }
+                if node_kind(cls_node) != NodeKind.Closure {
+                    let fv_ret = tc_check_callback_value("Bytes.with_ptr", 1, cls_node, [make_ptr_type(TYPE_U8)], make_metavar())
+                    return if fv_ret == -1 { tc_error_recovery_tid() } else { fv_ret }
+                }
                 let ret_str = node_return_type(cls_node)
                 // `-> T` is not the only channel: the unascribed spelling — the one the spec
                 // writes and the one the corpus uses — must NOT type as Void, since Void is not
@@ -35609,21 +35697,35 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
         if type_kind(obj_t) == TyKind.List || type_kind(obj_t) == TyKind.Iterator {
             let method = node_method(node)
             let elem = tc_tid_iter_elem(obj_t)
+            let label = if type_kind(obj_t) == TyKind.List { "List.{method}" } else { "Iterator.{method}" }
             if is_elem_closure_hof(method) != 0 {
                 let hof_cls = closure_arg_at(args_sl, 0)
+                let want_ret = tc_elem_hof_closure_ret(method)
                 let diag_before = diag_count
-                check_closure_body(hof_cls, make_fn_type(TYPE_UNKNOWN, [elem]))
                 hof_arg = 0
-                if method == "map" || method == "flat_map" { tc_bind_hof_result(node, hof_cls, method, diag_before) }
+                if !tc_closure_param_count_fits(label, 1, hof_cls, [elem], want_ret) {
+                    tc_close_hof_result(node)
+                } else {
+                    check_closure_body(hof_cls, make_fn_type(want_ret, [elem]))
+                    if want_ret == TYPE_BOOL { tc_check_closure_int_bool(label, hof_cls, want_ret, [elem]) }
+                    if method == "map" || method == "flat_map" { tc_bind_hof_result(node, hof_cls, method, type_kind(obj_t), diag_before) }
+                }
             } else if method == "fold" {
                 if args_sl != -1 && sublist_length(args_sl) >= 2 {
                     let acc_t = infer_type(sublist_get(args_sl, 0))
-                    check_closure_body(sublist_get(args_sl, 1), make_fn_type(TYPE_UNKNOWN, [acc_t, elem]))
+                    let fold_cls = closure_arg_at(args_sl, 1)
                     hof_arg = 1
+                    if tc_closure_param_count_fits(label, 2, fold_cls, [acc_t, elem], acc_t) {
+                        check_closure_body(fold_cls, make_fn_type(acc_t, [acc_t, elem]))
+                        tc_check_closure_int_bool(label, fold_cls, acc_t, [acc_t, elem])
+                    }
                 }
             } else if method == "sort_by" && type_kind(obj_t) == TyKind.List {
-                tc_check_sort_by_body(closure_arg_at(args_sl, 0), elem)
+                let cmp_cls = closure_arg_at(args_sl, 0)
                 hof_arg = 0
+                if tc_closure_param_count_fits(label, 1, cmp_cls, [elem, elem], TYPE_UNKNOWN) {
+                    tc_check_sort_by_body(cmp_cls, elem)
+                }
             }
         }
         // Bytes.with_ptr hands its closure a `Ptr[U8]` (sections/07_trust_modules_metadata.md;
@@ -35636,8 +35738,11 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
         // (check_closure_body prefers the declared type over this hint).
         if type_kind(obj_t) == TyKind.Bytes && node_method(node) == "with_ptr" {
             let wp_cls = closure_arg_at(args_sl, 0)
-            check_closure_body(wp_cls, make_fn_type(TYPE_UNKNOWN, [make_ptr_type(TYPE_U8)]))
+            let wp_params = [make_ptr_type(TYPE_U8)]
             hof_arg = 0
+            if tc_closure_param_count_fits("Bytes.with_ptr", 1, wp_cls, wp_params, TYPE_UNKNOWN) {
+                check_closure_body(wp_cls, make_fn_type(TYPE_UNKNOWN, wp_params))
+            }
         }
         // "Only List has closure-taking HOFs" is true of the STDLIB and false of the
         // LANGUAGE — any fn-typed param takes a closure, and `async.spawn(fn() { ... })`
