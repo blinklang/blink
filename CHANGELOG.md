@@ -93,6 +93,9 @@ Single source of truth for release history. `blink llms` and `blink llms --full`
 
 ## Fixes (v0.59.0)
 
+- **`return` of a value that panics on each edge compiles.** `fn f(c: Bool) { return if c { panic("a") } else { panic("b") } }` passed the check and failed in the C compiler. The same held for `match`, for a closure, and for a return type such as `Str`.
+- **A closure that writes `-> ()` holds its `return` to it.** `let k = fn() -> () { return 1 }` passed the check and failed in the C compiler. It is now E0300.
+- **A missing method on any type with a head is E0505 alone.** `([], 1).nope()`, `Some([]).nope()` and `fn g[T](x: T?) { x.nope() }` gave only the W0501 warning, then stopped later or passed `check`. A bare `T` is still decided per instance.
 - **A generic fn named as a value runs.** `let g: fn(Str) -> Str = identity` and `apply(identity, 3)` passed the check, then stopped the build with `CodegenStageNotBuilt`. Each reference now gets the instance that its expected type solves.
 - **A fn read through its module is a value.** `let f = alpha.make` and `apply(3, alpha.make)` stopped the build with an internal error, because the read carried no type. They now type and run the same as the bare name, generic and re-exported fns too, and a wrong one is E0300 at the argument.
 - **A generic fn's name whose binders nothing fixes gives `CannotInferType` (E0301) at the reference.** `let f = identity` blamed `f` and spoke of an empty construction. A binder that the fn type does not mention (`fn p[T]() -> Int`) now gets the error in every position.

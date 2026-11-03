@@ -8727,6 +8727,7 @@ fn check_closure_body(cls: Int, exp_fn: Int) ! TypeCheck.Resolve, TypeCheck.Repo
     tc_publish_node_tid(cls, make_fn_type(stamp_ret, param_types))
     tc_check_closure_body_against_own_ret(cls, obligation)
     if cls_ret_ann != -1 {
+        if tc_resolve(obligation) == TYPE_VOID { tc_report_values_returned_as_void(cls) }
         nr_pop_scope()
         return
     }
@@ -8761,6 +8762,8 @@ fn tc_report_value_returned_as_void(r: Int) ! TypeCheck.Resolve, TypeCheck.Repor
     // An operand that is one open slot and stays open is the E0301 of whatever left it open. A
     // type with a head is not (), whatever fills its slots.
     if tc_tid_is_no_info(vt) != 0 || vt == TYPE_VOID || vt == TYPE_NEVER || tc_is_unbound_metavar(vt) != 0 { return }
+    // A part with no type is the mark of an earlier error, which already reports this operand.
+    if tc_tid_has_unknown(vt) != 0 { return }
     if tc_call_reported.contains_key(r) { return }
     tc_call_reported.insert(r, 1)
     tc_error_at_code("return value type {type_to_str(vt)} does not match closure return type (), which the expected function type gives", r, "TypeError", TYPE_ERROR, "add `-> T` to the expected function type, or drop the value")
@@ -16292,14 +16295,15 @@ pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report {
 
 // Report the Phase-1 unresolvable method names that Phase 2 left alone. A receiver whose
 // type is a bare typevar or an unresolved metavar at the call has no type to name, so this
-// stays a warning; every receiver whose type IS known was already reported as E0505. A call
+// stays a warning; a receiver with a head gets its E0505 from tc_report_unclaimed_calls. A call
 // Phase 2 resolved to a declaration is skipped too: a free fn `{Type}_{method}` supplies a
 // method name that no impl lists, so Phase 1 records it, but the name does resolve.
 fn tc_flush_unresolved_method_warnings() ! Diag.Report {
     let mut i = 0
     while i < tc_method_calls.unresolved.len() {
         let n = tc_method_calls.unresolved.get(i).unwrap()
-        if tc_method_calls.hard.contains_key(n) == 0 && tc_call_decl.contains_key(n) == 0 && !nr_is_call_on_collided_qualifier(n) {
+        let reported_later = tc_unclaimed_receiver_is_named(tc_lookup_node_tid(node_obj(n))) != 0
+        if tc_method_calls.hard.contains_key(n) == 0 && tc_call_decl.contains_key(n) == 0 && !nr_is_call_on_collided_qualifier(n) && !reported_later {
             let m = node_method(n)
             diag_warn_at("UnknownMethod", UNKNOWN_METHOD, "method `{m}` resolves to nothing, and the receiver's type is not known here", n, "annotate the receiver so the method can be resolved, or correct the method name")
         }
@@ -22557,6 +22561,8 @@ fn tc_unresolved_method_help(obj_k: TyKind, tname: Str, method: Str, node: Int) 
     let hides = tc_trace_hiding_help(method, node)
     if hides != "" { return hides }
     if method == "display" {
+        // No impl can name an open slot.
+        if tname.contains("?") { return "" }
         return "add an `impl Display for {tname}` (with `fn fmt(self, sb: StringBuilder)`)"
     }
     if obj_k == TyKind.List {
@@ -38864,7 +38870,7 @@ fn tc_report_unclaimed_calls(order: List[Int], mods: List[Str]) ! Diag.Report {
 }
 
 fn tc_report_no_module_member(node: Int, q: Str, member: Str) ! Diag.Report {
-    let near = suggest_module_member(tc_qualifier_to_module_or_self(q), member)
+    let near = suggest_module_member(tc_qualifier_module_at(q, node), member)
     let help = if near != "" && near != member { "did you mean `{q}.{near}`?" } else { "" }
     diag_error_at("UnresolvedMethod", UNRESOLVED_METHOD, "no member `{member}` on module `{q}`", node, help)
 }
@@ -38872,27 +38878,24 @@ fn tc_report_no_module_member(node: Int, q: Str, member: Str) ! Diag.Report {
 // A built-in call and an effect have a name in the module, and no value to read.
 fn tc_report_member_read_as_value(node: Int, q: Str, member: Str) ! Diag.Report {
     // An alias spelled like a built-in namespace names its own module (section 10.5).
-    if is_intrinsic_method(q, member) != 0 && tc_qualifier_module_at(q, node) == "std_{q}" {
+    let module = tc_qualifier_module_at(q, node)
+    if is_intrinsic_method(q, member) != 0 && module == "std_{q}" {
         diag_error_at("UnresolvedMethod", UNRESOLVED_METHOD, "`{q}.{member}` is a built-in call and cannot be read as a value", node, "wrap the call in a closure")
-    } else if suggest_module_member(tc_qualifier_to_module_or_self(q), member) == member {
+    } else if suggest_module_member(module, member) == member {
         diag_error_at("UnresolvedMethod", UNRESOLVED_METHOD, "`{q}.{member}` cannot be read as a value", node, "")
     } else {
         tc_report_no_module_member(node, q, member)
     }
 }
 
-// A value receiver's type, determined all the way down. A local shadowing a module name
-// lands here too, so it is named by its type and not as the module.
+// A value receiver with a head. An open slot or a typevar under the head does not change which
+// methods it has. A part an earlier error left without a type has that error already. A local
+// shadowing a module name lands here too, so it is named by its type and not as the module.
 fn tc_unclaimed_receiver_is_named(tid: Int) -> Int {
-    // An open slot does not change which methods a built-in container has.
-    if tid >= 0 {
-        let k = type_kind(tid)
-        if k == TyKind.List || k == TyKind.Map || k == TyKind.Set { return 1 }
-    }
-    if tc_tid_is_concrete(tid) == 0 { return 0 }
-    let r = tc_tid_resolved(tid)
-    if tc_tid_has_unbound_metavar(r) != 0 || tc_tid_has_unknown(r) != 0 { return 0 }
-    if tc_tid_has_bare_typevar(r) != 0 { return 0 }
+    if tid < 0 { return 0 }
+    let r = tc_resolve(tid)
+    if tc_tid_has_unknown(r) != 0 || tc_is_unbound_metavar(r) != 0 { return 0 }
+    if type_kind(r) == TyKind.Typevar { return 0 }
     1
 }
 
