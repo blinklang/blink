@@ -1,5 +1,5 @@
 // A call of a built-in handle operation charges the operation's effect to the caller's row, the
-// same way a call of a function does (sections/04_effects.md §4.4, §4.6). A row that does not
+// same way a call of a function does (sections/04_effects.md §4.4, §4.5). A row that does not
 // hold the effect, or holds only a sibling sub-effect, is UndeclaredEffect (E0500), and the
 // report names the op and the row it misses.
 
@@ -42,7 +42,7 @@ fn main() {
     expect_undeclared(src, "handle_op_wrong_sub_effect", "fs.write", "FS.Write")
     let out = compile_test_helpers.compile_and_capture(src, "handle_op_wrong_sub_effect_note")
     compile_test_helpers.expect_contains(out, "function `read_only` only declares `FS.Read`", "row note")
-    compile_test_helpers.expect_contains(out, "FS.Write", "fix text")
+    compile_test_helpers.expect_contains(out, #""fix":{"action":"add effect","text":"FS.Write""#, "fix text")
 }
 
 test "IO.Print does not grant io.eprintln" {
@@ -89,7 +89,7 @@ fn main() {
     expect_undeclared(src, "handle_op_rand", "rand.int", "Rand")
 }
 
-test "env.exit charges Env.Exit and points to panic for an internal error" {
+test "env.exit charges Env.Exit" {
     let src = #"fn die() {
     env.exit(1)
 }
@@ -98,8 +98,74 @@ fn main() {
 }
 "#
     expect_undeclared(src, "handle_op_env_exit", "env.exit", "Env.Exit")
-    let out = compile_test_helpers.compile_and_capture(src, "handle_op_env_exit_help")
-    compile_test_helpers.expect_contains(out, "for an internal error, call panic(...) and install on_panic in main", "exit help")
+}
+
+fn expect_no_text(out: Str, text: Str, tag: Str) {
+    assert(!out.contains(text), "{tag}: found `{text}` in:\n{out}")
+}
+
+// The help is for the shape of an internal error: a message on stderr, then a failing exit (§2.20).
+let panic_help = "for an internal error, call panic(...) and install on_panic in main"
+
+test "an eprint and then a failing exit points to panic, on the report the row misses" {
+    let held_exit = compile_test_helpers.compile_and_capture(#"fn fail_hard(msg: Str) ! Env.Exit {
+    io.eprintln("fatal: {msg}")
+    env.exit(2)
+}
+fn main() {
+    fail_hard("x")
+}
+"#, "handle_op_exit_help_held")
+    compile_test_helpers.expect_contains(held_exit, "`io.eprintln` requires effect `IO.Eprint`", "eprint report")
+    compile_test_helpers.expect_contains(held_exit, panic_help, "help on the eprint report")
+    let rowless = compile_test_helpers.compile_and_capture(#"fn die(code: Int) {
+    io.eprintln("fatal")
+    env.exit(code)
+}
+fn main() {
+    die(3)
+}
+"#, "handle_op_exit_help_rowless")
+    compile_test_helpers.expect_contains(rowless, panic_help, "help with a code that is not a literal")
+}
+
+test "an exit that is no internal error does not point to panic" {
+    let alone = compile_test_helpers.compile_and_capture(#"fn die() {
+    env.exit(1)
+}
+fn main() {
+    die()
+}
+"#, "handle_op_exit_no_eprint")
+    expect_no_text(alone, panic_help, "exit with no eprint")
+    let clean_exit = compile_test_helpers.compile_and_capture(#"fn done() {
+    io.eprintln("bye")
+    env.exit(0)
+}
+fn main() {
+    done()
+}
+"#, "handle_op_exit_zero")
+    compile_test_helpers.expect_error(clean_exit, "E0500", "exit zero")
+    expect_no_text(clean_exit, panic_help, "exit zero")
+    let exit_first = compile_test_helpers.compile_and_capture(#"fn f(b: Bool) {
+    if b { env.exit(1) }
+    io.eprintln("after")
+}
+fn main() {
+    f(false)
+}
+"#, "handle_op_exit_first")
+    expect_no_text(exit_first, panic_help, "eprint after the exit")
+    let exec = compile_test_helpers.compile_and_capture(#"import std.process
+fn replace() ! Process.Spawn {
+    let _ = process.exec("true", [])
+}
+fn main() {
+    replace()
+}
+"#, "handle_op_exec_no_help")
+    expect_no_text(exec, panic_help, "process.exec")
 }
 
 test "process.exec needs Env.Exit as well as Process.Spawn" {
@@ -443,6 +509,115 @@ fn main() {
     let _ = w(channel.new[Int](buffer: 1))
 }
 "#, "handle_op_async_row")
+}
+
+test "an op that misses two effects names both, and the fix adds both" {
+    let out = compile_test_helpers.compile_and_capture(#"import std.process
+fn replace() {
+    let _ = process.exec("true", [])
+}
+fn main() {
+    replace()
+}
+"#, "handle_op_exec_rowless")
+    compile_test_helpers.expect_contains(out, "`process.exec` requires effects `Process.Spawn`, `Env.Exit`", "label")
+    compile_test_helpers.expect_contains(out, #""fix":{"action":"add effect","text":"Process.Spawn, Env.Exit""#, "fix")
+}
+
+test "a file's own effect named Term keeps its term ops" {
+    expect_clean(#"effect Term {
+    effect W {
+        fn width() -> Int
+    }
+}
+fn a() -> Int ! Term.W {
+    term.width()
+}
+fn main() {
+    let _ = 1
+}
+"#, "handle_op_user_term_clean")
+    let out = compile_test_helpers.compile_and_capture(#"effect Term {
+    effect W {
+        fn width() -> Int
+    }
+}
+fn b() -> Int {
+    term.width()
+}
+fn main() {
+    let _ = 1
+}
+"#, "handle_op_user_term_rowless")
+    compile_test_helpers.expect_error(out, "E0500", "own op is still charged")
+    compile_test_helpers.expect_contains(out, "Term.W", "own op's effect")
+    expect_no_text(out, "IO.Print", "not the built-in row")
+}
+
+test "the span covers the op only where the source spells it there" {
+    let flat = compile_test_helpers.compile_and_capture(#"fn f(c: Channel[Int]) -> Option[Int] {
+    c.recv()
+}
+fn main() {
+    let _ = 1
+}
+"#, "handle_op_span_flat")
+    compile_test_helpers.expect_contains(flat, #""line":2,"col":5,"end_line":2,"end_col":11"#, "flat path")
+    let parens = compile_test_helpers.compile_and_capture(#"type S {
+    ch: Channel[Int]
+}
+fn f(s: S) {
+    (s.ch).send(1)
+}
+fn main() {
+    let _ = 1
+}
+"#, "handle_op_span_parens")
+    compile_test_helpers.expect_contains(parens, "`s.ch.send` requires effect `Async`", "parenthesized receiver")
+    expect_no_text(parens, #""end_col":15"#, "parenthesized receiver span")
+    let lines = compile_test_helpers.compile_and_capture(#"fn f(c: Channel[Int]) -> Option[Int] {
+    c
+        .recv()
+}
+fn main() {
+    let _ = 1
+}
+"#, "handle_op_span_two_lines")
+    compile_test_helpers.expect_contains(lines, "`c.recv` requires effect `Async`", "receiver on its own line")
+    expect_no_text(lines, #""end_col":11"#, "receiver on its own line span")
+}
+
+test "a receiver with no name is not given one in the label" {
+    let out = compile_test_helpers.compile_and_capture(#"fn make() -> Handle[Int] ! Async {
+    async.spawn(fn() -> Int { 1 })
+}
+fn f() -> Int {
+    make().await
+}
+fn main() {
+    let _ = 1
+}
+"#, "handle_op_await_of_a_call")
+    compile_test_helpers.expect_contains(out, "`.await` requires effect `Async`", "label")
+    expect_no_text(out, "handle.await", "no made-up name")
+}
+
+test "an op in a keyword default is the default's error, not the caller's" {
+    let out = compile_test_helpers.compile_and_capture(#"fn g() -> Int ! Env.Read {
+    1
+}
+fn kw(-- x: Int = env.pid(), -- y: Int = g()) -> Int {
+    x + y
+}
+fn caller() -> Int {
+    kw()
+}
+fn main() {
+    let _ = caller()
+}
+"#, "handle_op_keyword_default")
+    compile_test_helpers.expect_contains(out, "NonConstParamDefault", "default report")
+    expect_no_text(out, "UndeclaredEffect", "no charge to the caller")
 }
 
 test "UndeclaredEffect is catalogued" {

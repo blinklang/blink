@@ -1824,6 +1824,7 @@ fn node_die(id: Int, where: Str) {
     // Forensic dump for the node-index race: opt-in through the trace channel, so normal panic
     // output is unchanged in CI, every node accessor stays rowless, and the next sighting
     // captures enough state to localize the race.
+    // The state may be corrupt here, so no read may panic: the named panic must come out.
     let nlen = columns.count
     let sl_len = sublists.start.len()
     trace.log("blink.parser_dump", "pos={pos} src='{diag_source_file}' sublists.len={sl_len}")
@@ -1832,9 +1833,12 @@ fn node_die(id: Int, where: Str) {
     if start < 0 { start = 0 }
     let mut i = start
     while i < nlen {
-        let nk = node_kind_name(columns.kind.get(i).unwrap())
-        let nl = node_get_int(i, columns.at_line, node_blank.line)
-        let nc = node_get_int(i, columns.at_col, node_blank.col)
+        let nk = match columns.kind.get(i) {
+            Some(kind) => node_kind_name(kind)
+            None => "?"
+        }
+        let nl = node_dump_int(i, columns.at_line, node_blank.line)
+        let nc = node_dump_int(i, columns.at_col, node_blank.col)
         trace.log("blink.parser_dump", "node[{i}] kind={nk} line={nl} col={nc}")
         i = i + 1
     }
@@ -1843,7 +1847,7 @@ fn node_die(id: Int, where: Str) {
     let mut max_sl = 0
     let mut max_sl_idx = -1
     while j < sl_len {
-        let l = sublists.len.get(j).unwrap()
+        let l = sublists.len.get(j) ?? 0
         if l > max_sl {
             max_sl = l
             max_sl_idx = j
@@ -1852,6 +1856,16 @@ fn node_die(id: Int, where: Str) {
     }
     trace.log("blink.parser_dump", "max_sublist_len={max_sl} at_index={max_sl_idx}")
     parser_limit_stop("parser: {where}({id}) out of bounds; nodes.len()={columns.count}")
+}
+
+// node_get_int for the panic dump, where the columns may not agree.
+fn node_dump_int(i: Int, offsets: List[Int], dflt: Int) -> Int {
+    let chunk = columns.ints.get(i >> 12) ?? []
+    let h = chunk.get(i & 4095) ?? -1
+    if h < 0 { return dflt }
+    let o = offsets.get(h & 65535) ?? -1
+    if o < 0 { return dflt }
+    chunk.get(((h >> 16) & 16777215) + o) ?? dflt
 }
 
 pub fn node_kind(id: Int) -> NodeKind {
