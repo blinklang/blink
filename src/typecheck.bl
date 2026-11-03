@@ -2961,7 +2961,8 @@ let mut tc_ud_blamed: Map[Int, Int] = Map()
 // record of a node is the one that counts. A group in tc_call_open_tids is one of
 // [sig, self_offset, n, tid..., open...] (tc_note_generic_call),
 // [-1, im, n, tid...] (tc_note_conversion_call), [-1, -1, 1, ctor] (tc_note_open_ctor_key),
-// [-2, -1, 0] (tc_note_deferred_conversion) or [-3, -1, 0] (tc_note_open_variant).
+// [-2, -1, 0] (tc_note_deferred_conversion), [-3, -1, 0] (tc_note_open_variant) or
+// [-4, sig, tid, n, binder...] (tc_note_fn_value).
 let mut tc_call_open_calls: List[Int] = []
 let mut tc_call_open_group: Map[Int, Int] = Map()
 let mut tc_call_open_tids: List[Int] = []
@@ -3287,9 +3288,27 @@ fn tc_open_group_is_variant(g: Int) -> Bool {
     tc_call_open_tids.get(g).unwrap() == -3
 }
 
+// A reference to a generic function's name, with the type it has as a value and the metavars
+// it minted for the binders. Its binders are judged once inference is done, as a call's are.
+fn tc_note_fn_value(node: Int, sig: Int, tid: Int, binders: List[Int]) {
+    tc_call_open_calls.push(node)
+    tc_call_open_group.insert(node, tc_call_open_tids.len())
+    tc_call_open_tids.push(-4)
+    tc_call_open_tids.push(sig)
+    tc_call_open_tids.push(tid)
+    tc_call_open_tids.push(binders.len())
+    for b in binders { tc_call_open_tids.push(b) }
+}
+
+// The group of this reference to a generic function's name, or -1 for any other node.
+fn tc_fn_value_group(node: Int) -> Int {
+    let g = tc_call_open_group.get(node) ?? -1
+    if g >= 0 && tc_call_open_tids.get(g).unwrap() == -4 { g } else { -1 }
+}
+
 // Whether the group at `g` is a conversion call's (tc_note_conversion_call).
 fn tc_open_group_is_conversion(g: Int) -> Bool {
-    tc_call_open_tids.get(g).unwrap() < 0 && tc_call_open_tids.get(g + 1).unwrap() >= 0
+    tc_call_open_tids.get(g).unwrap() == -1 && tc_call_open_tids.get(g + 1).unwrap() >= 0
 }
 
 // The flush half of tc_note_conversion_call.
@@ -3345,7 +3364,7 @@ fn tc_note_open_ctor_key(node: Int, ctor: Int) {
 // any report has claimed it.
 fn tc_flush_open_keys_of(call_node: Int, g: Int) ! Diag.Report {
     let sig = tc_call_open_tids.get(g).unwrap()
-    if tc_open_group_is_conversion(g) || tc_open_group_is_deferred_conversion(g) || tc_open_group_is_variant(g) { return }
+    if sig < -1 || tc_open_group_is_conversion(g) { return }
     if sig < 0 {
         let ctor = tc_call_open_tids.get(g + 3).unwrap()
         if ctor < 0 { return }
@@ -4833,18 +4852,27 @@ fn unify_typevar_binds(ptid: Int, atid: Int, binds: Map[Str, Int]) {
 // The type a generic function's NAME has as a value: its declared type with every binder
 // replaced by a fresh metavar, one set per reference. Two references to the same generic
 // function are two values and may be instantiated differently, so the mint cannot be shared.
-fn tc_generic_fn_value_tid(sig: Int, decl_tid: Int) -> Int {
+// A node is inferred more than once, and what one pass pinned has to hold in the next, so one
+// reference mints once.
+fn tc_generic_fn_value_tid(node: Int, sig: Int, decl_tid: Int) -> Int {
+    let g = tc_fn_value_group(node)
+    if g >= 0 { return tc_call_open_tids.get(g + 2).unwrap() }
     let fs = fnsig_pool.get(sig).unwrap()
     let mut binds: Map[Str, Int] = Map()
+    let mut mints: List[Int] = []
     let mut i = 0
     while i < fs.type_params_count {
-        let idx = fs.type_params_start + i
-        let nm = fnsig_type_param_names.get(idx) ?? ""
-        let binder = fnsig_tparam_nodes.get(idx) ?? -1
-        binds.insert(tc_binder_key(binder, nm), make_metavar())
+        let nidx = fs.type_params_start + i
+        let nm = fnsig_type_param_names.get(nidx).unwrap()
+        let binder = if nidx < fnsig_tparam_nodes.len() { fnsig_tparam_nodes.get(nidx).unwrap() } else { NO_BINDER_NODE }
+        let meta = make_metavar()
+        binds.insert(tc_binder_key(binder, nm), meta)
+        mints.push(meta)
         i = i + 1
     }
-    substitute_typevar_tid(decl_tid, binds)
+    let tid = substitute_typevar_tid(decl_tid, binds)
+    tc_note_fn_value(node, sig, tid, mints)
+    tid
 }
 
 // Whether a declaration writes type parameters of its own. -1 is a signature with no
@@ -27402,7 +27430,7 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
             // is the type expected where the name stands. Each binder becomes a metavar so the
             // expectation can solve it, because a bare typevar is invisible to every part of the
             // solving machinery and would reach codegen unsolved with nothing reported.
-            let val_tid = tc_generic_fn_value_tid(fn_sig, decl_tid)
+            let val_tid = tc_generic_fn_value_tid(node, fn_sig, decl_tid)
             if tc_construct_hint >= 0 {
                 let want = resolve_alias_tid(tc_construct_hint)
                 if type_kind(want) == TyKind.Fn { tc_unify(val_tid, want) }

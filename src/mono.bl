@@ -35,7 +35,7 @@ import typecheck.{
     substitute_typevar_tid, tc_binder_key, tc_tid_typevar_key,
     tc_call_declared_name, tc_call_decl_node, tc_call_trait, tc_impl_trait_id, tc_impl_conv_source, tc_impl_recv_spelling,
     tc_impl_is_poly_conversion, tc_conversion_impl_for, tc_check_conversion, tc_conversion_trait_of, tc_conversion_target_of, tc_is_conversion_trait, tc_is_into_method, tc_is_default_fill, tc_call_user_effect, tc_field_tid_at_instance,
-    tc_lookup_node_tid, tc_mc_obj_is_value, tc_call_is_trace_log, tc_is_sealed_list_hof, tc_is_list_generic_adapter, tc_map_generic_adapter, tc_map_generic_adapter_module, tc_is_iterator_method, tc_resolve,
+    tc_lookup_node_tid, tc_fn_value_decl_node, tc_mc_obj_is_value, tc_call_is_trace_log, tc_is_sealed_list_hof, tc_is_list_generic_adapter, tc_map_generic_adapter, tc_map_generic_adapter_module, tc_is_iterator_method, tc_resolve,
     tc_ret_mint_at, tc_tid_child, tc_tid_child_count,
     tc_tid_decl_node, tc_tid_kind, tc_impl_is_poly_user, tc_poly_user_impl_decl, tc_instance_has_trait, tc_written_impl_holds,
     tc_tid_is_no_info, tc_tid_list_elem, tc_tid_name, tc_tid_resolved, tc_tid_struct, tc_type_str,
@@ -900,6 +900,27 @@ fn discover_call(ctx: Int, node: Int) ! Diag.Report {
     }
 }
 
+// A generic function named as a value has no call to solve its binders from. Its type at
+// this reference does the same job. An item callee carries no stamp (discover_call), so
+// this answers nothing for the name a call is written with.
+fn discover_fn_value(ctx: Int, node: Int) ! Diag.Report {
+    let gfn = tc_fn_value_decl_node(node)
+    if gfn < 0 || !generic_fn_nodes.contains_key(gfn) { return }
+    let tid = ctx_node_tid(ctx, node)
+    if tc_tid_is_no_info(tid) != 0 || tc_tid_kind(tid) != TyKind.Fn { return }
+    let binds: Map[Str, Int] = Map()
+    // Child 0 of a Fn is its return; the params start at 1.
+    let params_sl = node_params(gfn)
+    let mut i = 0
+    while i < sl_len(params_sl) {
+        unify(tc_lookup_node_tid(sublist_get(params_sl, i)), tc_tid_child(tid, i + 1), binds)
+        i = i + 1
+    }
+    let ret_ann = node_type_ann(gfn)
+    if ret_ann != -1 { unify(tc_lookup_node_tid(ret_ann), tc_tid_child(tid, 0), binds) }
+    note_call_target(ctx, node, register_fn(gfn, binder_args(ctx, gfn, node, binds)))
+}
+
 // `mod.f(args)` parses as a MethodCall on a module Ident; it is a free-fn call.
 fn discover_module_call(ctx: Int, node: Int) ! Diag.Report {
     // As in discover_call, the declaration typecheck resolved the call to is the whole answer.
@@ -1393,7 +1414,7 @@ fn mono_walk(ctx: Int, node: Int) ! Diag.Report {
     match kind {
         NodeKind.IntLit => {}
         NodeKind.FloatLit => {}
-        NodeKind.Ident => {}
+        NodeKind.Ident => discover_fn_value(ctx, node)
         NodeKind.Call => mono_walk_call(ctx, node)
         NodeKind.MethodCall => mono_walk_method_call(ctx, node)
         NodeKind.BinOp => walk2(ctx, node_left(node), node_right(node))
