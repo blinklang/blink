@@ -93,6 +93,7 @@ Single source of truth for release history. `blink llms` and `blink llms --full`
 
 ## Fixes (v0.59.0)
 
+- **A multi-byte char at byte 4096 of a generated C unit no longer stops `blink build`.** The per-module build cut the head of each unit at 4096 bytes to read its macro prologue, and the cut was an internal compiler error when it fell inside a codepoint, for example a `"—"` in a string literal. The build now reads the prologue a whole line at a time.
 - **`return` of a value that panics on each edge compiles.** `fn f(c: Bool) { return if c { panic("a") } else { panic("b") } }` passed the check and failed in the C compiler. The same held for `match`, for a closure, and for a return type such as `Str`.
 - **A closure that writes `-> ()` holds its `return` to it.** `let k = fn() -> () { return 1 }` passed the check and failed in the C compiler. It is now E0300.
 - **A missing method on any type with a head is E0505 alone.** `([], 1).nope()`, `Some([]).nope()` and `fn g[T](x: T?) { x.nope() }` gave only the W0501 warning, then stopped later or passed `check`. A bare `T` is still decided per instance.

@@ -1,0 +1,68 @@
+// The build reads the head of each generated C unit to find the macros it defines before the
+// archive header. A multi-byte char that starts before, spans or ends at that read limit
+// must not stop a valid program from building.
+
+import std.process.{ProcessResult}
+import compile_test_helpers
+
+fn sh(cmd: Str) -> Str ! Process.Spawn {
+    process.run("sh", ["-c", cmd]).unwrap().out.trim()
+}
+
+fn dev_tree(root: Str, tree: Str) ! Process.Spawn, FS.Write {
+    process.run("sh", ["-c", "rm -rf {tree}"]).unwrap()
+    process.run("sh", ["-c", "mkdir -p {tree}/build {tree}/app"]).unwrap()
+    // A copy, not a link: the install root comes from realpath(argv[0]).
+    process.run("sh", ["-c", "cp {sh("readlink -f build/blink")} {tree}/build/blink"]).unwrap()
+    process.run("sh", ["-c", "ln -s {root}/lib {tree}/lib"]).unwrap()
+    process.run("sh", ["-c", "ln -s {root}/lib {tree}/build/lib"]).unwrap()
+    for f in ["runtime.h", "libblink_std.a", "libblink_std.h", "skip_modules.txt", ".archive-id"] {
+        process.run("sh", ["-c", "[ -e {root}/build/{f} ] && cp -L {root}/build/{f} {tree}/build/{f}"]).unwrap()
+    }
+    // A dev build/ can hold runtime.h only beside the archive it links to.
+    process.run("sh", ["-c", "[ -e {tree}/build/runtime.h ] || cp -L $(dirname $(readlink -f {root}/build/libblink_std.h))/runtime.h {tree}/build/runtime.h"]).unwrap()
+}
+
+// The corpus exports BLINK_COMPILER_ARCHIVE and module filters, which make the build one
+// unit, so the run drops them.
+fn blink_in(tree: Str, args: Str) -> ProcessResult ! Process.Spawn {
+    process.run("sh", ["-c", "cd {tree} && env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE BLINK_CACHE_DIR={tree}/objcache build/blink {args}"]).unwrap()
+}
+
+fn rep(s: Str, n: Int) -> Str {
+    let mut out = ""
+    for _ in 0..n {
+        out = "{out}{s}"
+    }
+    out
+}
+
+// A literal of `ch` repeated, led by `pad` ASCII bytes, so the char's bytes land at another
+// offset of the unit for each pad.
+fn build_with(tree: Str, ch: Str, pad: Int) -> Str ! Process.Spawn, FS.Write {
+    let lead = rep("a", pad)
+    let body = rep(ch, 2500)
+    fs.write("{tree}/app/main.bl", "import std.io\n\nfn main() \{\n    io.println(\"{lead}{body}\")\n\}\n").unwrap()
+    let r = blink_in(tree, "build app/main.bl -o {tree}/out/app --per-module")
+    assert(r.success(), "build failed for {ch} with pad {pad}: {r.out}{r.err_out}")
+    sh("{tree}/out/app")
+}
+
+test "a multi-byte char that starts before, spans or ends at the prologue scan limit builds" {
+    let root = sh("pwd -P")
+    let tree = "{compile_test_helpers.scratch_root()}/_prologue_limit_{getpid()}"
+    dev_tree(root, tree)
+    let mut bad: List[Str] = []
+    // Every byte offset of a char of 2, 3 and 4 bytes is covered: pads 0 to width - 1, and
+    // enough text that one char falls on byte 4096 whatever the unit's own prologue holds.
+    for ch in ["é", "—", "😀"] {
+        for pad in 0..ch.byte_len() {
+            let out = build_with(tree, ch, pad)
+            if out != "{rep("a", pad)}{rep(ch, 2500)}" {
+                bad.push("{ch}/{pad}")
+            }
+        }
+    }
+    process.run("sh", ["-c", "rm -rf {tree}"])?
+    assert_eq(bad.len(), 0)
+}

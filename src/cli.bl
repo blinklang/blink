@@ -3089,17 +3089,24 @@ fn run_unit_compiles(plain: List[Str], with_pch: List[Str], pch_ready: Bool, pch
     UnitRun { results: by_idx, pch_stored: stored, pch: pch, pch_child: pch_child, pch_reads: pch_reads }
 }
 
+let ARCHIVE_PROLOGUE_LIMIT = 4096
+
 // The macros the unit at c_path defines before it includes the archive header, as -D flags
 // in its order, or None when anything else comes first. gcc takes a PCH only for a unit that
 // defines the macros it was built with. clang reads a PCH before the unit's first line and
 // stops only on a macro the unit defines to another value, so this rule is what keeps a clang
 // unit from reading one built with macros it does not define. The prologue is a line per gate the unit reads, so
-// the head of the file holds it.
+// the head of the file holds it: a line that starts at or after ARCHIVE_PROLOGUE_LIMIT is not
+// read. Each line is cut at its newline, never at a byte count, so a line is judged whole and
+// a cut cannot fall inside a codepoint.
 fn archive_header_prefix(c_path: Str) -> Option[List[Str]] ! IO, FS.Read {
     let text = build_fs.read_or_empty(c_path)
-    let head = text.byte_slice(0, if text.byte_len() < 4096 { text.byte_len() } else { 4096 })
+    let n = text.byte_len()
     let mut defines: List[Str] = []
-    for line in head.split("\n") {
+    let mut start = 0
+    while start < n && start < ARCHIVE_PROLOGUE_LIMIT {
+        let end = text.byte_index_of("\n", start) ?? n
+        let line = text.byte_slice(start, end)
         if line == "#include \"libblink_std.h\"" {
             return Some(defines)
         }
@@ -3108,6 +3115,7 @@ fn archive_header_prefix(c_path: Str) -> Option[List[Str]] ! IO, FS.Read {
             return None
         }
         defines.push("-D{parts.get(1).unwrap()}={parts.get(2).unwrap()}")
+        start = end + 1
     }
     None
 }
