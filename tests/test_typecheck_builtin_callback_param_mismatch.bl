@@ -1,0 +1,59 @@
+// A callback that is not a closure literal has the type the method's signature states
+// (sections/03_types.md, the List and Iterator signatures). Before this check a wrong one
+// compiled and read a pointer as an Int.
+
+import compile_test_helpers
+
+fn rejects(body: Str, tag: Str, want: Str) ! FS.Delete, FS.Write, Process.Spawn, FS.Read, Env.Read, IO.Print {
+    let src = "fn gi(x: Int) -> Int \{ x }\nfn gb(x: Int) -> Bool \{ x > 0 }\nfn gv(x: Int) \{ let _ = x }\nfn gf(a: Int, x: Int) -> Int \{ a + x }\nfn gl(x: Int) -> List[Int] \{ [x] }\nfn go(a: Int, b: Int) -> Ordering \{ a.cmp(b) }\n{body}\n"
+    let out = compile_test_helpers.compile_and_capture(src, tag)
+    compile_test_helpers.expect_error(out, "E0300", tag)
+    compile_test_helpers.expect_contains(out, want, tag)
+}
+
+test "each List method checks the element against a named fn's parameter" {
+    rejects("fn main() \{ let _ = [\"a\"].map(gi) }", "cbp_map", "argument 1 of `List.map` expects Fn(Str)")
+    rejects("fn main() \{ let _ = [\"a\"].filter(gb) }", "cbp_filter", "`List.filter` expects Fn(Str) -> Bool")
+    rejects("fn main() \{ let _ = [\"a\"].flat_map(gl) }", "cbp_flat", "`List.flat_map` expects Fn(Str)")
+    rejects("fn main() \{ let _ = [\"a\"].any(gb) }", "cbp_any", "`List.any` expects Fn(Str) -> Bool")
+    rejects("fn main() \{ let _ = [\"a\"].all(gb) }", "cbp_all", "`List.all` expects Fn(Str) -> Bool")
+    rejects("fn main() \{ let _ = [\"a\"].find(gb) }", "cbp_find", "`List.find` expects Fn(Str) -> Bool")
+    rejects("fn main() \{ [\"a\"].for_each(gv) }", "cbp_each", "`List.for_each` expects Fn(Str) -> ()")
+    rejects("fn main() \{ let _ = [\"a\"].fold(0, gf) }", "cbp_fold", "argument 2 of `List.fold` expects Fn(Int, Str) -> Int")
+    rejects("fn main() \{ let _ = [\"a\"].sort_by(go) }", "cbp_sort", "`List.sort_by` expects Fn(Str, Str) -> Ordering")
+}
+
+test "each Iterator method checks the element against a named fn's parameter" {
+    let it = "[\"a\"].into_iter()"
+    rejects("fn main() \{ let _ = {it}.map(gi).collect() }", "cbp_it_map", "`Iterator.map` expects Fn(Str)")
+    rejects("fn main() \{ let _ = {it}.filter(gb).collect() }", "cbp_it_filter", "`Iterator.filter` expects Fn(Str) -> Bool")
+    rejects("fn main() \{ let _ = {it}.flat_map(gl).collect() }", "cbp_it_flat", "`Iterator.flat_map` expects Fn(Str)")
+    rejects("fn main() \{ let _ = {it}.any(gb) }", "cbp_it_any", "`Iterator.any` expects Fn(Str) -> Bool")
+    rejects("fn main() \{ let _ = {it}.all(gb) }", "cbp_it_all", "`Iterator.all` expects Fn(Str) -> Bool")
+    rejects("fn main() \{ let _ = {it}.find(gb) }", "cbp_it_find", "`Iterator.find` expects Fn(Str) -> Bool")
+    rejects("fn main() \{ {it}.for_each(gv) }", "cbp_it_each", "`Iterator.for_each` expects Fn(Str) -> ()")
+    rejects("fn main() \{ let _ = {it}.fold(0, gf) }", "cbp_it_fold", "`Iterator.fold` expects Fn(Int, Str) -> Int")
+}
+
+test "every way to hold a function is checked" {
+    rejects("fn main() \{\n    let f = gi\n    let _ = [\"a\"].map(f)\n}", "cbp_local", "`List.map` expects Fn(Str)")
+    rejects("fn main() \{\n    let f = fn(x: Int) -> Int \{ x }\n    let _ = [\"a\"].map(f)\n}", "cbp_closure_local", "`List.map` expects Fn(Str)")
+    rejects("fn k(f: fn(Int) -> Int) \{ let _ = [\"a\"].map(f) }\nfn main() \{ k(gi) }", "cbp_param", "`List.map` expects Fn(Str)")
+    rejects("type H \{ cb: fn(Int) -> Int }\nfn main() \{\n    let h = H \{ cb: gi }\n    let _ = [\"a\"].map(h.cb)\n}", "cbp_field", "`List.map` expects Fn(Str)")
+    rejects("fn main() \{ let _ = [\"a\"].map(if true \{ gi } else \{ gi }) }", "cbp_if", "`List.map` expects Fn(Str)")
+    rejects("fn main() \{ let _ = [\"a\"].map(f: gi) }", "cbp_keyword", "`List.map` expects Fn(Str)")
+}
+
+test "a typevar element does not take a concrete parameter" {
+    rejects("fn g[T](xs: List[T]) -> Int \{ xs.map(gi).len() }\nfn main() \{ let _ = g([1]) }", "cbp_typevar", "parameter 1 expects T")
+}
+
+test "a parameter that wraps the element is still another type" {
+    rejects("fn w(x: Option[Int]) -> Int \{ x ?? 0 }\nfn main() \{ let _ = [1].map(w) }", "cbp_wrap", "parameter 1 expects Int")
+}
+
+test "the error stands at the callback and is one report" {
+    let out = compile_test_helpers.compile_and_capture("fn gi(x: Int) -> Int \{ x }\nfn main() \{\n    let _ = [\"a\"].map(gi)\n}\n", "cbp_site")
+    compile_test_helpers.expect_contains(out, "\"line\":3,\"col\":23", "cbp_site")
+    assert_eq(out.split("\"severity\":\"error\"").len(), 2)
+}
