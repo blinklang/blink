@@ -396,11 +396,7 @@ pub fn parser_rewind() {
     annotations = PendingAnnotations { item: [], program: [] }
     fn_bodies = FnBodies { wanted: fn_bodies.wanted, deferred: fn_bodies.deferred, depth: 0, tok_firsts: [], tok_lasts: [], item_firsts: [], item_kinds: [] }
     node_sides.source_module.clear()
-    // A node the next parse pushes at a dropped id must not read that id's old place.
-    while node_sides.written_starts.len() > columns.count {
-        node_sides.written_starts.pop()
-        node_sides.written_ends.pop()
-    }
+    written_trim()
     pos = 0
     parse_desugar_enabled = 1
     trace.log("blink.journal", "undo undid {undone} writes, dropped {before - columns.count} nodes; pool {columns.count} nodes, parsed end {journal.floor}")
@@ -505,6 +501,14 @@ pub fn parser_reset() {
     journal = node_journal_empty(journal.keep)
 }
 
+// A node pushed later at a dropped id must not read that id's old place.
+fn written_trim() {
+    while node_sides.written_starts.len() > columns.count {
+        node_sides.written_starts.pop()
+        node_sides.written_ends.pop()
+    }
+}
+
 fn written_put(id: Int, start: Int, end: Int) {
     while node_sides.written_starts.len() <= id {
         node_sides.written_starts.push(0)
@@ -512,6 +516,10 @@ fn written_put(id: Int, start: Int, end: Int) {
     }
     node_sides.written_starts.set(id, start)
     node_sides.written_ends.set(id, end)
+}
+
+fn written_join(id: Int, left: Int, right: Int) {
+    written_put(id, written_at(node_sides.written_starts, left), written_at(node_sides.written_ends, right))
 }
 
 fn written_at(places: List[Int], id: Int) -> Int {
@@ -1117,6 +1125,7 @@ pub fn node_pop() {
     let _ = columns.kind.pop()
     let run = columns.child_at.get(c).unwrap().pop() ?? 0
     columns.count = id
+    written_trim()
     if (id & 4095) == 0 {
         let _ = columns.ints.pop()
         let _ = columns.strs.pop()
@@ -5154,7 +5163,7 @@ fn parse_nullcoalesce() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
         let right = parse_or()
         let nd = node_count()
         node_push(AstNode { kind: NodeKind.BinOp, op: "??", left: left, right: right, line: op_line, col: op_col })
-        written_put(nd, written_at(node_sides.written_starts, left), written_at(node_sides.written_ends, right))
+        written_join(nd, left, right)
         left = nd
     }
     left
@@ -5170,7 +5179,7 @@ fn parse_or() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
         let right = parse_and()
         let nd = node_count()
         node_push(AstNode { kind: NodeKind.BinOp, op: "||", left: left, right: right, line: op_line, col: op_col })
-        written_put(nd, written_at(node_sides.written_starts, left), written_at(node_sides.written_ends, right))
+        written_join(nd, left, right)
         left = nd
     }
     left
@@ -5186,7 +5195,7 @@ fn parse_and() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
         let right = parse_equality()
         let nd = node_count()
         node_push(AstNode { kind: NodeKind.BinOp, op: "&&", left: left, right: right, line: op_line, col: op_col })
-        written_put(nd, written_at(node_sides.written_starts, left), written_at(node_sides.written_ends, right))
+        written_join(nd, left, right)
         left = nd
     }
     left
@@ -5202,7 +5211,7 @@ fn parse_equality() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
         let right = parse_comparison()
         let nd = node_count()
         node_push(AstNode { kind: NodeKind.BinOp, op: op, left: left, right: right, line: op_line, col: op_col })
-        written_put(nd, written_at(node_sides.written_starts, left), written_at(node_sides.written_ends, right))
+        written_join(nd, left, right)
         left = nd
     }
     left
@@ -5218,7 +5227,7 @@ fn parse_comparison() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
         let right = parse_range()
         let nd = node_count()
         node_push(AstNode { kind: NodeKind.BinOp, op: op, left: left, right: right, line: op_line, col: op_col })
-        written_put(nd, written_at(node_sides.written_starts, left), written_at(node_sides.written_ends, right))
+        written_join(nd, left, right)
         left = nd
     }
     left
@@ -5451,7 +5460,7 @@ fn int_ops_tree(operands: List[Int], ops: List[Str], op_toks: List[Int], lo: Int
     let tok = op_toks.get(k).unwrap()
     let nd = node_count()
     node_push(AstNode { kind: NodeKind.BinOp, op: ops.get(k).unwrap(), left: left, right: right, line: tokens.lines.get(tok).unwrap(), col: tokens.cols.get(tok).unwrap() })
-    written_put(nd, written_at(node_sides.written_starts, left), written_at(node_sides.written_ends, right))
+    written_join(nd, left, right)
     nd
 }
 

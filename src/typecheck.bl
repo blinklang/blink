@@ -9265,8 +9265,10 @@ fn tc_check_call_against_fn_tid(fn_tid: Int, args_sl: Int, label: Str, node: Int
                 tc_report_handler_coverage(sublist_get(args_sl, li), ptid, arg_tid)
             } else if tc_tid_is_no_info(arg_tid) == 0 && tc_tid_is_no_info(ptid) == 0 && !tc_value_fits_expected(ptid, arg_tid) {
                 let (want_s, got_s) = tc_type_pair_strs(ptid, arg_tid)
-                tc_type_error_naming("{label} argument {li} expects {want_s}, got {got_s}{tc_fn_mismatch_suffix(ptid, arg_tid)}", node,
-                    tc_accept_timeout_help(sublist_get(args_sl, li), ptid, arg_tid), [ptid, arg_tid])
+                let arg_msg = "{label} argument {li} expects {want_s}, got {got_s}{tc_fn_mismatch_suffix(ptid, arg_tid)}"
+                if !tc_report_bool_int_value(arg_msg, sublist_get(args_sl, li), ptid, arg_tid) {
+                    tc_type_error_naming(arg_msg, node, tc_accept_timeout_help(sublist_get(args_sl, li), ptid, arg_tid), [ptid, arg_tid])
+                }
             }
         }
         li = li + 1
@@ -9443,9 +9445,6 @@ fn tc_report_declared_mismatch(msg: Str, at: Int, val: Int, declared: Int, got: 
     tc_type_error_naming(msg, at, help, [declared, got])
 }
 
-// -- Bool is distinct from Int (sections/03_types.md §3.4 *Diagnostics*) --
-//
-// Each rejected form carets its operand, says the fixed note, and gives the rewrite as a fix.
 const NO_TRUTHINESS_NOTE = "Blink has no truthiness"
 
 // Where operand `node` was written, and its text. `text` is "" when the place is not known:
@@ -9485,7 +9484,11 @@ fn tc_report_no_truthiness(msg: Str, at: Int, label: Str, help: Str, notes: List
     let end_col = if p.end_line == p.line { p.end_col } else { 0 }
     let before = diag_entry_count()
     diag_error_span_label_at_notes("TypeError", TYPE_ERROR, msg, at, p.line, p.col, end_col, label, help, all)
-    // A repeat of a diagnostic makes no entry, and the last entry is then some other report's.
+    tc_attach_fix(before, help, edits)
+}
+
+// A repeat of a diagnostic makes no entry, and the last entry is then some other report's.
+fn tc_attach_fix(before: Int, help: Str, edits: List[DiagFixEdit]) ! Diag.Report {
     if diag_entry_count() == before || edits.len() == 0 { return }
     let first = edits.get(0).unwrap()
     diag_set_last_fix_at(help, first.text, first.line, first.col, first.end_line, first.end_col)
@@ -9558,18 +9561,41 @@ fn tc_require_condition(msg: Str, cond: Int, got: Int) ! TypeCheck.Report, Diag.
     tc_report_no_truthiness("{msg}, got {type_to_str(got)}", cond, type_to_str(got), help, [], edits)
 }
 
-// `!n` loses its bang: `n == 0` is the whole test.
+// `!n` loses its bang: `n == 0` is the whole test. A value of type Never has no truth to test.
 fn tc_require_negatable(node: Int, got: Int) ! TypeCheck.Report, Diag.Report {
-    if is_bool_compat(got) { return }
+    if is_bool_compat(got) || type_kind(resolve_alias_tid(tc_resolve(got))) == TyKind.Never { return }
     let operand = node_left(node)
     let msg = "`!` requires a Bool operand, got {type_to_str(got)}"
     if !tc_is_integer_tid(got) { return tc_report_no_truthiness(msg, operand, type_to_str(got), "", [], []) }
-    let (help, edits) = tc_compare_with_zero(operand, "== 0")
     let p = tc_written_operand(operand)
-    let mut all: List[DiagFixEdit] = []
-    if edits.len() > 0 { all.push(DiagFixEdit { line: node_line(node), col: node_col(node), end_line: p.line, end_col: p.col, text: "" }) }
-    for e in edits { all.push(e) }
-    tc_report_no_truthiness(msg, operand, type_to_str(got), help, [], all)
+    if p.text == "" { return tc_report_no_truthiness(msg, operand, type_to_str(got), "compare explicitly with 0", [], []) }
+    let inner = tc_needs_parens_to_compare(operand, p.text)
+    let outer = !tc_comparison_fits(node, tc_written_operand(node))
+    let open = (if outer { "(" } else { "" }).concat(if inner { "(" } else { "" })
+    let close = (if inner { ") == 0" } else { " == 0" }).concat(if outer { ")" } else { "" })
+    let bang = DiagFixEdit { line: node_line(node), col: node_col(node), end_line: p.line, end_col: p.col, text: open }
+    tc_report_no_truthiness(msg, operand, type_to_str(got), "compare explicitly: `{open}{p.text}{close}`", [], [bang, tc_insert_after(p, close)])
+}
+
+// What the source line holds before and after `p`. Parens are not in the tree, so a rewrite that
+// depends on its neighbours reads them here.
+fn tc_written_neighbours(node: Int, p: WrittenOperand) -> (Str, Str) {
+    let file = diag_file_for_node(node)
+    let head = diag_source_line(file, p.line).byte_slice(0, p.col - 1).trim()
+    let tail = diag_source_line(file, p.end_line)
+    (head, tail.byte_slice(p.end_col - 1, tail.byte_len()).trim())
+}
+
+// `==` binds looser than `!`, so a comparison in place of `!n` needs parens unless what stands
+// each side of it binds looser still (`&&`, `||`) or delimits it.
+fn tc_comparison_fits(node: Int, p: WrittenOperand) -> Bool {
+    if p.text == "" { return false }
+    let (head, rest) = tc_written_neighbours(node, p)
+    let assigns = head.ends_with("=") && !head.ends_with("==") && !head.ends_with("!=") && !head.ends_with("<=") && !head.ends_with(">=")
+    let keyword = head == "if" || head == "while" || head == "return" || head.ends_with(" if") || head.ends_with(" while") || head.ends_with(" return")
+    let opens = head == "" || assigns || keyword || head.ends_with("(") || head.ends_with("[") || head.ends_with("\{") || head.ends_with(",") || head.ends_with(":") || head.ends_with("=>") || head.ends_with("&&") || head.ends_with("||")
+    let closes = rest == "" || rest.starts_with(")") || rest.starts_with("]") || rest.starts_with("\{") || rest.starts_with("}") || rest.starts_with(",") || rest.starts_with("&&") || rest.starts_with("||")
+    opens && closes
 }
 
 // A value of one where the other is wanted, whatever the site. False when this is not that pair.
@@ -9584,10 +9610,10 @@ fn tc_report_bool_int_value(msg: Str, val0: Int, want: Int, got: Int) -> Bool ! 
         tc_report_no_truthiness(msg, val, label, help, [], edits)
         return true
     }
-    if !tc_is_integer_tid(want) || !tc_is_bool_tid(got) { return false }
+    if !tc_is_integer_tid(want) || !tc_is_bool_tid(got) { return tc_report_bool_int_parts(msg, val, want) }
     let p = tc_written_operand(val)
     if node_kind(val) == NodeKind.BoolLit && p.text != "" {
-        let v = if p.text == "true" { "1" } else { "0" }
+        let v = if node_int_val(val) != 0 { "1" } else { "0" }
         tc_report_no_truthiness(msg, val, label, "write `{v}`", [], [tc_replace_written(p, v)])
         return true
     }
@@ -9597,6 +9623,17 @@ fn tc_report_bool_int_value(msg: Str, val0: Int, want: Int, got: Int) -> Bool ! 
     }
     tc_report_no_truthiness(msg, val, label, "use `if {p.text} \{ 1 \} else \{ 0 \}`", [], [tc_insert_before(p, "if "), tc_insert_after(p, " \{ 1 \} else \{ 0 \}")])
     true
+}
+
+// The pair may sit inside what was written: `let xs: List[Bool] = [1]` reports at the `1`, which
+// is where the fix goes. A range of Bool has no bound to repair, so it stays one report.
+fn tc_report_bool_int_parts(msg: Str, val: Int, want: Int) -> Bool ! TypeCheck.Report, Diag.Report {
+    if node_kind(val) == NodeKind.RangeLit { return false }
+    let mut any = false
+    for part in tc_expected_parts(val, want) {
+        if tc_report_bool_int_value(msg, part.value, part.expected, tc_lookup_node_tid(part.value)) { any = true }
+    }
+    any
 }
 
 fn tc_negates_cleanly(node: Int, text: Str) -> Bool {
@@ -9616,8 +9653,7 @@ fn tc_report_bool_int_compare(msg: Str, node: Int, op: Str, lt: Int, rt: Int) ->
     let bp = tc_written_operand(b)
     let np = tc_written_operand(n)
     if is_int_literal_node(n) == 0 {
-        let (_, zero) = tc_compare_with_zero(n, "!= 0")
-        if bp.text == "" || zero.len() == 0 {
+        if bp.text == "" || np.text == "" {
             tc_report_no_truthiness(msg, n, label, "compare the Int with 0 first", [], [])
             return true
         }
@@ -9706,15 +9742,7 @@ fn tc_report_pattern_at(pat: Int, width: Int, msg: Str, label: Str, help: Str, e
     let before = diag_entry_count()
     let end_col = if width > 0 { node_col(pat) + width } else { 0 }
     diag_error_span_label_at_notes("TypeError", TYPE_ERROR, msg, pat, node_line(pat), node_col(pat), end_col, label, help, [NO_TRUTHINESS_NOTE])
-    if diag_entry_count() == before || edits.len() == 0 { return }
-    let first = edits.get(0).unwrap()
-    diag_set_last_fix_at(help, first.text, first.line, first.col, first.end_line, first.end_col)
-    let mut i = 1
-    while i < edits.len() {
-        let e = edits.get(i).unwrap()
-        diag_add_last_fix_edit(e.line, e.col, e.end_line, e.end_col, e.text)
-        i = i + 1
-    }
+    tc_attach_fix(before, help, edits)
 }
 
 // `b.to_int()` names no method (§3.4 *No conversion methods*). The rewrite is wrapped unless it
@@ -9736,10 +9764,7 @@ fn tc_report_bool_to_int(node: Int) ! Diag.Report {
 }
 
 fn tc_stands_alone(node: Int, p: WrittenOperand) -> Bool {
-    let file = diag_file_for_node(node)
-    let head = diag_source_line(file, p.line).byte_slice(0, p.col - 1).trim()
-    let tail = diag_source_line(file, p.end_line)
-    let rest = tail.byte_slice(p.end_col - 1, tail.byte_len()).trim()
+    let (head, rest) = tc_written_neighbours(node, p)
     let opens = head == "" || head.ends_with("=") && !head.ends_with("==") && !head.ends_with("!=") || head.ends_with("(") || head.ends_with(",") || head.ends_with("return")
     let closes = rest == "" || rest.starts_with(")") || rest.starts_with(",")
     opens && closes
@@ -22827,15 +22852,15 @@ fn tc_refuse_list_scan(node: Int, obj_t: Int, need: List[Int], method: Str) -> I
     tc_error_recovery_tid()
 }
 
-// The help line for an unresolved method, first match wins: the note for a binding that hides
-// the built-in `trace.log`, then a note for a renamed or removed method of the type, then the
-// near-miss suggestion, else nothing.
 fn tc_report_unresolved_method(node: Int, recv: Int, tname: Str, method: Str) ! Diag.Report {
     let k = type_kind(recv)
     if k == TyKind.Bool && method == "to_int" { return tc_report_bool_to_int(node) }
     tc_error_naming_types("UnresolvedMethod", UNRESOLVED_METHOD, "unresolved method `.{method}` on type {tname}", node, tc_unresolved_method_help(k, tname, method, node), [recv])
 }
 
+// The help line for an unresolved method, first match wins: the note for a binding that hides
+// the built-in `trace.log`, then a note for a renamed or removed method of the type, then the
+// near-miss suggestion, else nothing.
 fn tc_unresolved_method_help(obj_k: TyKind, tname: Str, method: Str, node: Int) -> Str {
     let hides = tc_trace_hiding_help(method, node)
     if hides != "" { return hides }
@@ -22844,6 +22869,7 @@ fn tc_unresolved_method_help(obj_k: TyKind, tname: Str, method: Str, node: Int) 
         if tname.contains("?") { return "" }
         return "add an `impl Display for {tname}` (with `fn fmt(self, sb: StringBuilder)`)"
     }
+    if method == "to_bool" && (obj_k == TyKind.Int || is_sized_int(obj_k)) { return "compare with 0: `n != 0`" }
     if obj_k == TyKind.List {
         let rename = tc_list_rename_help(method)
         if rename != "" { return rename }
@@ -25835,7 +25861,7 @@ pub fn type_kind(tid0: Int) -> TyKind {
 
 // A type with no information yet is not a mismatch here; its uses settle it.
 fn is_bool_compat(tid: Int) -> Bool {
-    tc_tid_is_no_info(tid) != 0 || type_kind(resolve_alias_tid(tc_resolve(tid))) == TyKind.Bool
+    tc_tid_is_no_info(tid) != 0 || tc_is_bool_tid(tid)
 }
 
 pub fn is_sized_int(k: TyKind) -> Bool {
@@ -26849,7 +26875,10 @@ fn tc_operator_result_type(node: Int, lit_t: Int, lt: Int, rt: Int) -> Int {
 
 // The operand check of unary `-` and `~`; see tc_check_arith_operands.
 fn tc_check_unary_operand(node: Int, op: Str, t: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
-    if op == "!" { return tc_require_negatable(node, t) }
+    if op == "!" {
+        if !tc_operand_type_pending(t) { tc_require_negatable(node, t) }
+        return
+    }
     // Unary minus desugars to Neg.neg, a sealed arithmetic trait (spec
     // sections/02_syntax.md:1046) — `-someStruct` / `-someOpaque` is not numeric.
     if op == "-" { reject_non_numeric_arith_operand(op, t, node, 1) }
@@ -28327,6 +28356,7 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                         while bai < sublist_length(bf_args) {
                             let bf_arg = sublist_get(bf_args, bai)
                             let bf_t = infer_type(bf_arg)
+                            if shows_msg && bai == 0 { tc_require_condition("`{fn_name}` condition must be Bool", bf_arg, bf_t) }
                             if shows_msg && bai == 1 { tc_raw_reject_display_sink(bf_arg, bf_t) }
                             bai = bai + 1
                         }
@@ -38925,6 +38955,10 @@ fn tc_stamp_field_default(dflt: Int, ftid: Int) ! TypeCheck.Resolve, TypeCheck.R
     if tc_tid_is_concrete(tc_lookup_node_tid(dflt)) == 0 { tc_publish_node_tid(dflt, inferred) }
     if !reread { tc_walk_stmt_value(dflt) }
     tc_literal_takes(dflt, ftid)
+    if tc_tid_is_no_info(inferred) == 0 && tc_tid_is_no_info(ftid) == 0 && !tc_value_fits_expected(ftid, inferred) {
+        let (want_s, got_s) = tc_type_pair_strs(ftid, inferred)
+        tc_report_declared_mismatch("field default: declared type {want_s} but got {got_s}", dflt, dflt, ftid, inferred)
+    }
 }
 
 // Post-order over the value children of `node`. Explicitly iterative: the AST is as deep as

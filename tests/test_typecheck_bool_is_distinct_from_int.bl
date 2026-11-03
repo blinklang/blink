@@ -5,7 +5,7 @@
 
 import typecheck.{check_types}
 import compiler.{compile_to_program}
-import diagnostics.{DiagEntry, diag_entries, diag_reset, diag_fix_edits}
+import diagnostics.{DiagEntry, diag_entries, diag_reset, diag_fix_edits, diag_entry_text}
 import fix_edits.{FixEdit, fix_apply, fix_byte_offset}
 import embedded_stdlib_registry.{init_embedded_stdlib}
 import std.fs
@@ -46,7 +46,6 @@ fn apply_fix(src: Str, d: DiagEntry) -> Str {
     fix_apply(src, edits)
 }
 
-// The column of the first place `marker` appears on the line.
 fn col_of(src: Str, line: Int, marker: Str) -> Int {
     let text = src.split("\n").get(line - 1).unwrap()
     (text.byte_index_of(marker, 0) ?? -1) + 1
@@ -59,7 +58,6 @@ fn wrap(body: Str) -> Str {
     "fn flag() -> Bool \{ true \}\nfn count() -> Int \{ 3 \}\nfn takes_bool(b: Bool) -> Bool \{ b \}\ntype Holder \{ on: Bool \}\nfn run(n: Int, b: Bool) -> Int ! IO \{\n{body}\n    0\n\}\nfn main() \{ io.println(\"\{run(1, true)\}\") \}\n"
 }
 
-// One rejected form: the message, the caret's column and width, the help, the edit.
 fn expect_form(body: Str, msg: Str, caret: Str, help: Str, fixed_body: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
     expect_form_on(LINE, body, msg, caret, help, fixed_body)
 }
@@ -200,6 +198,85 @@ test "the Range of Int does not bind to a Range of Bool" {
     let errs = front_errors("fn main() \{\n    let r: Range[Bool] = 0..3\n    let _ = r\n\}\n")
     assert_eq(errs.len(), 1)
     assert_eq(errs.get(0).unwrap().code, "E0300")
+}
+
+test "assert and debug_assert hold their condition to Bool" {
+    expect_form("    assert(n)", "`assert` condition must be Bool, got Int", "n", "`n != 0`", "    assert(n != 0)")
+    expect_form("    assert(count(), \"msg\")", "`assert` condition must be Bool, got Int", "count()", "`count() != 0`", "    assert(count() != 0, \"msg\")")
+    expect_form("    debug_assert(n)", "`debug_assert` condition must be Bool, got Int", "n", "`n != 0`", "    debug_assert(n != 0)")
+    assert_eq(front_errors(wrap("    assert(b)\n    debug_assert(flag(), \"msg\")")).len(), 0)
+}
+
+test "a parenthesized Bool literal where an Int is declared keeps its value" {
+    expect_form("    let y: Int = (true)\n    let _ = y", "declared type Int but got Bool", "(true)", "`1`", "    let y: Int = 1\n    let _ = y")
+    expect_form("    let y: Int = (false)\n    let _ = y", "declared type Int but got Bool", "(false)", "`0`", "    let y: Int = 0\n    let _ = y")
+}
+
+test "the rewrite of bang on an Int keeps its meaning beside an operator" {
+    expect_form("    let _ = b == !n", "`!` requires a Bool operand", "n", "`(n == 0)`", "    let _ = b == (n == 0)")
+    expect_form("    let _ = !n == b", "`!` requires a Bool operand", "n", "`(n == 0)`", "    let _ = (n == 0) == b")
+    expect_form("    let _ = !!n", "`!` requires a Bool operand", "n", "`(n == 0)`", "    let _ = !(n == 0)")
+    expect_form("    let _ = !n && b", "`!` requires a Bool operand", "n", "`n == 0`", "    let _ = n == 0 && b")
+    expect_form("    let _ = b || !n", "`!` requires a Bool operand", "n", "`n == 0`", "    let _ = b || n == 0")
+    expect_form("    let _ = [!n]", "`!` requires a Bool operand", "n", "`n == 0`", "    let _ = [n == 0]")
+}
+
+test "bang waits for a closure parameter, and then checks it once" {
+    assert_eq(front_errors(wrap("    let t = fn(x) \{ !x \}\n    let _ = t(true)")).len(), 0)
+    let errs = front_errors(wrap("    let t = fn(x) \{ !x \}\n    let _ = t(1)"))
+    for e in errs { io.println("closure bang: {e.line}:{e.col}: {e.message}") }
+    assert_eq(errs.len(), 1)
+    assert_eq(errs.get(0).unwrap().code, "E0300")
+}
+
+test "bang takes a value that never arrives" {
+    assert_eq(front_errors(wrap("    let _ = !panic(\"x\")")).len(), 0)
+}
+
+test "a field default of the other type is rejected with its fix" {
+    let src = "type D \{ on: Bool = 1 \}\nfn main() \{\n    let d = D \{ \}\n    io.println(\"\{d.on\}\")\n\}\n"
+    let d = the_error(src)
+    assert(d.message.contains("declared type Bool but got Int"))
+    assert_eq(d.code, "E0300")
+    assert_eq(d.line, 1)
+    assert(d.notes.contains(NOTE))
+    let fixed = apply_fix(src, d)
+    assert_eq(fixed, src.replace("on: Bool = 1", "on: Bool = true"))
+    assert_eq(front_errors(fixed).len(), 0)
+    let other = the_error("type E \{ n: Int = true \}\nfn main() \{\n    let e = E \{ \}\n    io.println(\"\{e.n\}\")\n\}\n")
+    assert(other.help.contains("`1`"))
+}
+
+test "a literal inside a list, a tuple or a payload is rejected where it was written" {
+    expect_form("    let xs: List[Bool] = [1]\n    let _ = xs", "declared type List[Bool] but got", "1", "`true`", "    let xs: List[Bool] = [true]\n    let _ = xs")
+    expect_form("    let xs: List[Int] = [true]\n    let _ = xs", "declared type List[Int] but got", "true", "`1`", "    let xs: List[Int] = [1]\n    let _ = xs")
+    expect_form("    let o: Option[Bool] = Some(0)\n    let _ = o", "declared type Option[Bool] but got", "0", "`false`", "    let o: Option[Bool] = Some(false)\n    let _ = o")
+    expect_form("    let t: (Bool, Str) = (n, \"s\")\n    let _ = t", "declared type (Bool, Str) but got", "n", "`n != 0`", "    let t: (Bool, Str) = (n != 0, \"s\")\n    let _ = t")
+    let errs = front_errors(wrap("    let xs: List[Bool] = [1, 0]\n    let _ = xs"))
+    assert_eq(errs.len(), 2)
+    assert(errs.get(0).unwrap().notes.contains(NOTE))
+    let held = the_error("fn all(xs: List[Bool]) -> Int \{ xs.len() \}\nfn main() \{ io.println(\"\{all([1])\}\") \}\n")
+    assert_eq(held.code, "E0300")
+    assert(held.notes.contains(NOTE))
+    assert(held.help.contains("`true`"))
+}
+
+test "an argument to a closure held by a local is rejected where it was written" {
+    expect_form_on(LINE + 1, "    let f = fn(x: Bool) -> Bool \{ x \}\n    let _ = f(1)", "expects Bool, got Int", "1", "`true`", "    let f = fn(x: Bool) -> Bool \{ x \}\n    let _ = f(true)")
+}
+
+test "to_bool names no method and the help gives the comparison" {
+    let d = the_error(wrap("    let _ = n.to_bool()"))
+    assert_eq(d.code, "E0505")
+    assert(d.help.contains("`n != 0`"))
+}
+
+test "a fix over two lines stays one line of JSON" {
+    let d = the_error(wrap("    if (n +\n        1) \{ io.println(\"x\") \}"))
+    assert(d.fix_action.contains("\n"))
+    let mut idx = 0
+    while diag_entries.get(idx).unwrap().severity != "error" { idx = idx + 1 }
+    assert_eq(diag_entry_text(idx, 1).trim().split("\n").len(), 1)
 }
 
 test "the controls still pass: enum tags compare with Int, and Bool compares with Bool" {

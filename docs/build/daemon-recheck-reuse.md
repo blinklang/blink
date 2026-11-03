@@ -70,8 +70,8 @@ each check. Then `check_source_reporting` (`src/check_pipeline.bl:69`) builds al
 state below again, starting from node 0.
 
 - **Lex and parse.** All modules share one node arena: `columns` (`src/parser.bl:140`),
-  `node_count` (`:1211`), and one sublist pool `sublists` (`:156`). `source_module_for_node`
-  (`:205`) maps a node to its module. Node ids are given in load order (`load_module`,
+  `node_count` (`:1211`), and one sublist pool `sublists` (`:156`). `node_sides.source_module`
+  (`:214`) maps a node to its module. Node ids are given in load order (`load_module`,
   `src/compiler.bl:1373`; `collect_imports`, `:1461`). An edit to a module that loads early
   therefore moves the ids of every module that loads after it.
 - **Per-module records.** `record_source_nodes` (`src/compiler.bl:1335`) keeps the node range
@@ -582,7 +582,8 @@ place gives. Each piece of parser and lexer state that outlives one file:
 | program annotations | `src/parser.bl:164` | handed to later parses; part of the key of a kept source |
 | fn bodies | `src/parser.bl:190` | lists reset on undo (`:363`); the two flags are part of the key |
 | `parse_desugar_enabled` | `src/parser.bl:198` | reset on undo (`:366`) |
-| `source_module_for_node` | `src/parser.bl:205` | cleared on undo (`:364`) and made again by the merge |
+| `node_sides.source_module` | `src/parser.bl:214` | cleared on undo (`:364`) and made again by the merge |
+| `node_sides.written_starts`, `written_ends` | `src/parser.bl:214` | trimmed to the node count on undo and at `node_pop`; made again by each parse |
 | `pos` | `src/parser.bl:2236` | reset on undo (`:365`) and at each file (`src/compiler.bl:1480`) |
 | lexer tokens | `src/lexer.bl:395` | made again for each file |
 | comment attachment | `src/comment_attach.bl:24` | reset at each file (`:27`) |
