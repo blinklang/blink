@@ -1,0 +1,50 @@
+// A field default reaches every value built without that field, so a default of the wrong type
+// truncates or fails in cc when nothing checks it against the field.
+
+import typecheck.{check_types}
+import compiler.{compile_to_program}
+import diagnostics.{DiagEntry, diag_entries, diag_reset}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+
+const PATH = "build/test_field_default_probe.bl"
+
+fn front_errors(src: Str) -> List[DiagEntry] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    init_embedded_stdlib()
+    fs.write(PATH, src).unwrap()
+    diag_reset()
+    let program = compile_to_program(PATH, 1)
+    check_types(program)
+    let _ = fs.delete(PATH)
+    let mut out: List[DiagEntry] = []
+    for d in diag_entries {
+        if d.severity == "error" { out.push(d) }
+    }
+    out
+}
+
+fn expect_rejected(decl: Str, msg: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    let errs = front_errors("{decl}\nfn main() \{\n    let t = T \{\}\n    let _ = t.v\n\}\n")
+    assert_eq(errs.len(), 1)
+    let e = errs.get(0).unwrap()
+    assert_eq(e.code, "E0300")
+    if !e.message.contains(msg) { io.println("FAIL: want '{msg}', got '{e.message}'") }
+    assert(e.message.contains(msg))
+    assert_eq(e.line, decl.split("\n").len())
+}
+
+test "a default of a wider integer type does not narrow into the field" {
+    expect_rejected("const Q: U64 = 300\ntype T \{ v: U8 = Q * 2 \}", "declared type U8 but got U64")
+}
+
+test "a default of an unrelated type is rejected" {
+    expect_rejected("type T \{ v: U8 = \"a\" \}", "declared type U8 but got Str")
+    expect_rejected("type T \{ v: Str = 1 \}", "declared type Str but got Int")
+    expect_rejected("type T \{ v: List[Int] = [\"a\"] \}", "declared type List[Int] but got List[Str]")
+}
+
+test "defaults that fit stay legal" {
+    let src = "type T[A] \{\n    o: Option[A] = None\n    u: U8 = 3\n    f: Float = 1.5\n    xs: List[Int] = []\n    g: fn(Int) -> Int = fn(x) \{ x \}\n    b: Bool = true\n\}\nfn main() \{\n    let t: T[Str] = T \{\}\n    io.println(\"\{t.u\}\")\n\}\n"
+    let errs = front_errors(src)
+    for e in errs { io.println("FAIL: {e.line}:{e.col}: {e.message}") }
+    assert_eq(errs.len(), 0)
+}
