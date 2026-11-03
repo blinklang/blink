@@ -93,7 +93,7 @@ Single source of truth for release history. `blink llms` and `blink llms --full`
 
 ## Fixes (v0.59.0)
 
-- **`blink fix` for `DuplicateSymbol` (E1012) keeps code that follows an import on its line.** The fix that removed the import took the whole line with it.
+- **`blink fix` for `DuplicateSymbol` (E1012) keeps other code on an import's line.** The fix that removed the import took the whole line with it.
 - **A token after `as` in a `with` item that is not a name binds no variable.** `with x as 7 { }` gave `UnusedVariable` (W0600) for a variable `7` on top of the parse error.
 - **Each `PanicHookPlacement` (E0565) site gets one report with its own label.** A use that is not a `with` item gets the form label, wherever it stands, and a help that shows the whole repair. A hook in a closure in `main` or a `test` block carries a note that the closure's body is not the body of `main`. `with on_panic(f) as x` is E0565, not `NonHandlerWithItem` (E0839): its span is `as x`, `blink fix` removes it, and the site still counts as the one hook of `main`. The span of a `with ... as x` item is now `as x` for its other reports too, not the token after it.
 - **A binding named `on_panic` hides the built-in hook, and an error at the `with` item says so.** A module fn or `let`, a parameter, a local or a selective import of that name makes `with on_panic(x)` an ordinary `with` item, so `E0300` or `E0839` at the item now carries a note such as "`on_panic` here is the fn at line 1, which hides the built-in panic hook". A whole-module import binds only its qualifier, so a module that declares `on_panic` no longer takes the hook away or gives `E1006` at a bare `on_panic`.
