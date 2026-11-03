@@ -1,0 +1,105 @@
+// A built-in HOF runs its callback in the caller's frame, so the row of a named fn passed to
+// it is charged to the caller at the call (sections/04_effects.md, E0500).
+
+import compile_test_helpers
+
+fn base_src() -> Str {
+    #"effect Note { effect Say { fn say(s: Str) } }
+fn io_fn(x: Int) -> Int ! IO {
+    io.println("{x}")
+    x
+}
+fn say_fn(x: Int) -> Int ! Note.Say {
+    note.say("{x}")
+    x
+}
+fn pure_fn(x: Int) -> Int { x + 1 }
+fn keep_io(x: Int) -> Bool ! IO {
+    io.println("{x}")
+    x > 0
+}
+fn add_io(a: Int, x: Int) -> Int ! IO {
+    io.println("{x}")
+    a + x
+}
+type R { n: Int }
+impl Closeable for R {
+    fn close(self) ! Note.Say { note.say("close {self.n}") }
+}
+fn shut[T: Closeable](t: T) -> Int ! _ {
+    t.close()
+    1
+}
+"#
+}
+
+fn expect_charged(tag: Str, body: Str, callee: Str, eff: Str) ! FS.Delete, FS.Write, Process.Spawn, FS.Read, Env.Read, IO.Print {
+    let out = compile_test_helpers.compile_and_capture("{base_src()}{body}\nfn main() ! IO \{ }\n", tag)
+    compile_test_helpers.expect_error(out, "E0500", "{tag} is charged {eff}")
+    assert(out.contains("needs effect `{eff}`"))
+    assert(out.contains("`{callee}`"))
+}
+
+fn expect_clean(tag: Str, body: Str) ! FS.Delete, FS.Write, Process.Spawn, FS.Read, Env.Read, IO.Print {
+    let out = compile_test_helpers.compile_and_capture("{base_src()}{body}\nfn main() ! IO \{ }\n", tag)
+    compile_test_helpers.expect_compiles_clean(out, tag)
+}
+
+test "a named fn given to List.map charges its row to a pure caller" {
+    expect_charged("cbrow_map", "fn f() -> Int \{ [1, 2].map(io_fn).len() }", "io_fn", "IO")
+}
+
+test "filter and fold charge the row of the fn they run" {
+    expect_charged("cbrow_filter", "fn f() -> Int \{ [1, 2].filter(keep_io).len() }", "keep_io", "IO")
+    expect_charged("cbrow_fold", "fn f() -> Int \{ [1, 2].fold(0, add_io) }", "add_io", "IO")
+}
+
+test "an Iterator adapter charges the row of the fn it runs" {
+    expect_charged("cbrow_iter", "fn f() -> Int \{ [1, 2].into_iter().map(io_fn).count() }", "io_fn", "IO")
+}
+
+test "a local that holds the fn charges its row" {
+    expect_charged("cbrow_local", "fn f() -> Int \{\n    let g = io_fn\n    [1, 2].map(g).len()\n}", "io_fn", "IO")
+}
+
+test "a let mut charges the row of each fn it may hold" {
+    expect_charged("cbrow_mut", "fn f() -> Int \{\n    let mut g = pure_fn\n    g = io_fn\n    [1, 2].map(g).len()\n}", "io_fn", "IO")
+}
+
+test "each branch of an if charges the row of its fn" {
+    expect_charged("cbrow_if", "fn f(b: Bool) -> Int \{ [1, 2].map(if b \{ pure_fn } else \{ io_fn }).len() }", "io_fn", "IO")
+}
+
+test "a caller that holds only a sibling sub-effect is charged the row" {
+    expect_charged("cbrow_sub", "fn f() -> Int ! IO.Eprint \{ [1, 2].map(io_fn).len() }", "io_fn", "IO")
+}
+
+test "a generic callback with a wild row charges its type argument's impl row" {
+    expect_charged("cbrow_wild", "fn f() -> Int \{ [R \{ n: 1 }].map(shut).len() }", "shut", "Note.Say")
+}
+
+test "a generic callback under a caller's type parameter charges the wild row" {
+    expect_charged("cbrow_wild_open", "fn f[T: Closeable](xs: List[T]) -> Int \{ xs.map(shut).len() }", "shut", "_")
+}
+
+test "a call of a local that holds the fn charges its row" {
+    expect_charged("cbrow_call", "fn f() -> Int \{\n    let g = io_fn\n    g(1)\n}", "io_fn", "IO")
+}
+
+test "a caller that declares the row may pass the fn" {
+    expect_clean("cbrow_ok_decl", "fn f() -> Int ! IO \{ [1, 2].map(io_fn).len() }")
+    expect_clean("cbrow_ok_local", "fn f() -> Int ! IO \{\n    let g = io_fn\n    [1, 2].map(g).len()\n}")
+    expect_clean("cbrow_ok_wild", "fn f() -> Int ! Note.Say \{ [R \{ n: 1 }].map(shut).len() }")
+    expect_clean("cbrow_ok_wild_open", "fn f[T: Closeable](xs: List[T]) -> Int ! _ \{ xs.map(shut).len() }")
+}
+
+test "a fn with no row passes in a pure caller" {
+    expect_clean("cbrow_ok_pure", "fn f() -> Int \{ [1, 2].map(pure_fn).len() }")
+}
+
+test "a with block that provides the effect holds the row" {
+    expect_clean("cbrow_ok_with", #"fn f() -> Int ! IO {
+    let h = handler Note.Say { fn say(s: Str) { io.println(s) } }
+    with h { [1, 2].map(say_fn).len() }
+}"#)
+}

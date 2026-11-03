@@ -105,6 +105,7 @@ Single source of truth for release history. `blink llms` and `blink llms --full`
 - **An empty `Map()` or `Set()` given to `fold` takes its key from the callback.** `[1].fold(Map(), f)` with a named fn or a closure with typed parameters stopped the build with `ContainerCtorNeedsKeyOps`, or gave E0301.
 - **An empty `[]`, `Map()` or `Set()` that a method reads gets its type from a later use, or E0301.** `[].into_iter().map(fn(x: Int) { x })` now runs. `[].into_iter().count()` and `Map().len()` stopped the build with an internal error, and now are `CannotInferType` (E0301) at the construction.
 - **`return e` where `e` has type `()` compiles.** `fn f() { return () }` stopped in the C compiler.
+- **A named fn given to a built-in callback method charges its row to the caller (E0500).** `[1].map(io_fn)` in a pure fn compiled clean. A call of a local that holds the fn is charged too, and a `! _` row reads the type arguments of the fn value.
 - **A `map` or `flat_map` closure with no normal finish gets a diagnostic.** A closure whose every path panics left the result element type with no answer, and the call reached codegen with it. It is now `CannotInferType` (E0301).
 - **`blink fix` for `DuplicateSymbol` (E1012) keeps other code on an import's line.** The fix that removed the import took the whole line with it.
 - **A token after `as` in a `with` item that is not a name binds no variable.** `with x as 7 { }` gave `UnusedVariable` (W0600) for a variable `7` on top of the parse error.

@@ -39487,6 +39487,8 @@ type ErOwner {
     default_body: Bool
     // The closures that a trace.log `msg` runs, which tc_check_trace_messages checks.
     msg_ran: Set[Int]
+    // The values assigned to each `let mut`, so a fn value is charged for each fn it may hold.
+    assigns: Map[Int, List[Int]]
 }
 
 // The `_` of a default body holds nothing (see tc_er_walk_fn), so no `! _` can help it.
@@ -39542,6 +39544,12 @@ fn tc_er_check_call(program: Int, node: Int, held: List[Str], owner: ErOwner) ! 
         }
         return
     }
+    tc_er_require_sig_row(program, node, held, owner, decl, -1)
+}
+
+// Charge `node` with the signature row of `decl`, called directly when `value` is -1, or run
+// through the fn value `value`, whose type gives the type arguments of a `_`.
+fn tc_er_require_sig_row(program: Int, node: Int, held: List[Str], owner: ErOwner, decl: Int, value: Int) ! TypeCheck.Resolve, Diag.Report {
     let idx = fnsig_by_decl.get(decl) ?? -1
     if idx < 0 { return }
     let fs = fnsig_pool.get(idx).unwrap()
@@ -39551,13 +39559,39 @@ fn tc_er_check_call(program: Int, node: Int, held: List[Str], owner: ErOwner) ! 
         // FFI is left out until the owner rules on whether @trusted discharges it; reporting
         // it now, or making the lib wrappers declare it, would settle that question here.
         if req == "_" {
-            for w in tc_er_wild_row(decl, tc_er_call_binds(node, decl), 0) {
+            let binds = if value >= 0 { tc_er_fn_value_binds(value, fs) } else { tc_er_call_binds(node, decl) }
+            for w in tc_er_wild_row(decl, binds, 0) {
                 tc_er_require(program, node, held, owner, node_name(decl), w)
             }
         } else if req != "FFI" && !req.starts_with("FFI.") {
             tc_er_require(program, node, held, owner, node_name(decl), req)
         }
         i = i + 1
+    }
+}
+
+fn tc_er_fn_value_binds(value: Int, fs: FnSigEntry) -> Map[Str, Int] {
+    let mut binds: Map[Str, Int] = Map()
+    let arg = if node_kind(value) == NodeKind.NamedArg { node_value(value) } else { value }
+    let got = resolve_alias_tid(tc_resolve(tc_lookup_node_tid(arg)))
+    if got < 0 || tc_tid_kind(got) != TyKind.Fn { return binds }
+    let mut params: List[Int] = []
+    let mut i = 0
+    while i < fs.params_count {
+        params.push(fnsig_param_list.get(fs.params_start + i).unwrap())
+        i = i + 1
+    }
+    unify_typevar_binds(make_fn_type(fs.ret, params), got, binds)
+    binds
+}
+
+// A fn value's type holds no row, so a run of one that names a fn is charged here: the fn
+// runs in this frame. A closure's body is walked where it is written.
+fn tc_er_check_fn_values_run(program: Int, node: Int, held: List[Str], owner: ErOwner) ! TypeCheck.Resolve, Diag.Report {
+    for r in tc_tm_closures_run(node, owner.assigns) {
+        for c in r.closures {
+            if node_kind(c) == NodeKind.FnDef { tc_er_require_sig_row(program, node, held, owner, c, r.expr) }
+        }
     }
 }
 
@@ -40028,7 +40062,7 @@ fn tc_er_walk(program: Int, node: Int, held: List[Str], owner: ErOwner, kids: Li
     if node < 0 { return }
     let k = node_kind(node)
     if k == NodeKind.FnDef {
-        tc_er_walk_fn(program, node, owner.msg_ran, kids)
+        tc_er_walk_fn(program, node, owner.msg_ran, owner.assigns, kids)
         return
     }
     if k == NodeKind.WithBlock {
@@ -40055,7 +40089,10 @@ fn tc_er_walk(program: Int, node: Int, held: List[Str], owner: ErOwner, kids: Li
         tc_er_walk_msg(program, tc_trace_log_msg(node), held, owner, kids)
         return
     }
-    if k == NodeKind.Call || k == NodeKind.MethodCall { tc_er_check_call(program, node, held, owner) }
+    if k == NodeKind.Call || k == NodeKind.MethodCall {
+        tc_er_check_call(program, node, held, owner)
+        tc_er_check_fn_values_run(program, node, held, owner)
+    }
     if k == NodeKind.MethodCall { tc_er_check_helper_fix(program, node, held) }
     // One child buffer serves the whole descent: each node appends its children, walks them,
     // and gives the slots back, so a body is walked without a list per node.
@@ -40075,7 +40112,7 @@ fn tc_er_walk(program: Int, node: Int, held: List[Str], owner: ErOwner, kids: Li
     }
 }
 
-fn tc_er_walk_fn(program: Int, fn_node: Int, msg_ran: Set[Int], kids: List[Int]) ! TypeCheck.Resolve, Diag.Report {
+fn tc_er_walk_fn(program: Int, fn_node: Int, msg_ran: Set[Int], assigns: Map[Int, List[Int]], kids: List[Int]) ! TypeCheck.Resolve, Diag.Report {
     tc_er_check_wild_source(fn_node)
     // `main` holds every effect (§4.6).
     if node_name(fn_node) == "main" && node_source_module(fn_node) == "__main__" { return }
@@ -40088,7 +40125,7 @@ fn tc_er_walk_fn(program: Int, fn_node: Int, msg_ran: Set[Int], kids: List[Int])
     for e in tc_er_fn_row(fn_node) {
         if !(default_body && e == "_") { held.push(e) }
     }
-    tc_er_walk(program, node_body(fn_node), held, ErOwner { name: node_name(fn_node), decl: fn_node, default_body: default_body, msg_ran: msg_ran }, kids)
+    tc_er_walk(program, node_body(fn_node), held, ErOwner { name: node_name(fn_node), decl: fn_node, default_body: default_body, msg_ran: msg_ran, assigns: assigns }, kids)
 }
 
 // An impl method's row may narrow its trait method's row but not widen it, so a bound
@@ -40197,7 +40234,7 @@ fn tc_er_check_wild_source(fn_node: Int) ! Diag.Report {
 }
 
 // `owners` is a list of impl or trait nodes; each one's methods are walked.
-fn tc_er_walk_methods(program: Int, owners: Int, msg_ran: Set[Int], kids: List[Int]) ! TypeCheck.Resolve, Diag.Report {
+fn tc_er_walk_methods(program: Int, owners: Int, msg_ran: Set[Int], assigns: Map[Int, List[Int]], kids: List[Int]) ! TypeCheck.Resolve, Diag.Report {
     if owners == -1 { return }
     let mut i = 0
     while i < sublist_length(owners) {
@@ -40205,7 +40242,7 @@ fn tc_er_walk_methods(program: Int, owners: Int, msg_ran: Set[Int], kids: List[I
         if ms != -1 {
             let mut j = 0
             while j < sublist_length(ms) {
-                tc_er_walk_fn(program, sublist_get(ms, j), msg_ran, kids)
+                tc_er_walk_fn(program, sublist_get(ms, j), msg_ran, assigns, kids)
                 j = j + 1
             }
         }
@@ -40217,22 +40254,23 @@ fn tc_er_walk_methods(program: Int, owners: Int, msg_ran: Set[Int], kids: List[I
 // still open with the owner.
 fn tc_check_effect_rows(program: Int, msg_ran: Set[Int]) ! TypeCheck.Resolve, Diag.Report {
     let mut kids: List[Int] = []
+    let assigns = tc_tm_assigns()
     let fns = node_params(program)
     if fns != -1 {
         let mut i = 0
         while i < sublist_length(fns) {
-            tc_er_walk_fn(program, sublist_get(fns, i), msg_ran, kids)
+            tc_er_walk_fn(program, sublist_get(fns, i), msg_ran, assigns, kids)
             i = i + 1
         }
     }
-    tc_er_walk_methods(program, node_methods(program), msg_ran, kids)
-    tc_er_walk_methods(program, node_arms(program), msg_ran, kids)
+    tc_er_walk_methods(program, node_methods(program), msg_ran, assigns, kids)
+    tc_er_walk_methods(program, node_arms(program), msg_ran, assigns, kids)
     tc_er_check_impl_rows(program)
     // A derived body runs at the call site, and that call needs only the effect that declares
     // the operation, so the body holds that effect and nothing more.
     for op in effect_derived_ops(program) {
         match tc_ue_op_root.get(op) {
-            Some(ed) => tc_er_walk(program, node_body(op), [tc_er_op_effect(ed, op)], ErOwner { name: "{node_name(ed)}.{node_name(op)}", decl: -1, default_body: false, msg_ran: msg_ran }, kids)
+            Some(ed) => tc_er_walk(program, node_body(op), [tc_er_op_effect(ed, op)], ErOwner { name: "{node_name(ed)}.{node_name(op)}", decl: -1, default_body: false, msg_ran: msg_ran, assigns: assigns }, kids)
             None => {}
         }
     }
