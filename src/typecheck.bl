@@ -4845,6 +4845,32 @@ fn unify_typevar_binds(ptid: Int, atid: Int, binds: Map[Str, Int]) {
     }
 }
 
+// The type of a function named as a value, bare or qualified.
+fn tc_fn_value_type(node: Int, fn_sig: Int) -> Int {
+    let fs = fnsig_pool.get(fn_sig).unwrap()
+    // A function its module declares twice (E1016) may have meant either signature.
+    if tc_value_decl_poisoned(fs.decl) { return tc_error_recovery_tid() }
+    let mut fn_param_types: List[Int] = []
+    let mut fpi = 0
+    while fpi < fs.params_count {
+        fn_param_types.push(fnsig_param_list.get(fs.params_start + fpi).unwrap())
+        fpi = fpi + 1
+    }
+    let decl_tid = make_fn_type(fs.ret, fn_param_types)
+    if fs.type_params_count == 0 { return decl_tid }
+    // A generic function's NAME is a value, and its binders are open at the reference:
+    // `apply(identity, 3)` and `let f = identity` name the same value, and what fixes T
+    // is the type expected where the name stands. Each binder becomes a metavar so the
+    // expectation can solve it, because a bare typevar is invisible to every part of the
+    // solving machinery and would reach codegen unsolved with nothing reported.
+    let val_tid = tc_generic_fn_value_tid(node, fn_sig, decl_tid)
+    if tc_construct_hint >= 0 {
+        let want = resolve_alias_tid(tc_construct_hint)
+        if type_kind(want) == TyKind.Fn { tc_unify(val_tid, want) }
+    }
+    val_tid
+}
+
 // Build a typevar-name → concrete-tid map from the call's args by structurally
 // unifying each param tid against its argument's inferred tid. Covers both the
 // whole-bare-typevar rule (`x: T`) and typevars nested inside a compound param
@@ -18557,7 +18583,9 @@ fn nr_note_global_decl(ident_node: Int, decl_node: Int) {
 // the two key kinds never meet, since an access node is never an ident.
 pub fn tc_module_global_decl(access_node: Int) -> Option[Int] {
     if node_kind(access_node) != NodeKind.FieldAccess { return None }
-    tc_global_read_decl.get(access_node)
+    let decl = tc_global_read_decl.get(access_node) ?? -1
+    if decl < 0 || node_kind(decl) != NodeKind.LetBinding { return None }
+    Some(decl)
 }
 
 // The function declaration this ident read names as a value, or -1.
@@ -27414,28 +27442,7 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
         if nr_index_is_local(top) { return -1 }
         let fn_sig = tc_bare_callee_sig(name)
         if fn_sig != -1 {
-            let fs = fnsig_pool.get(fn_sig).unwrap()
-            // A function its module declares twice (E1016) may have meant either signature.
-            if tc_value_decl_poisoned(fs.decl) { return tc_error_recovery_tid() }
-            let mut fn_param_types: List[Int] = []
-            let mut fpi = 0
-            while fpi < fs.params_count {
-                fn_param_types.push(fnsig_param_list.get(fs.params_start + fpi).unwrap())
-                fpi = fpi + 1
-            }
-            let decl_tid = make_fn_type(fs.ret, fn_param_types)
-            if fs.type_params_count == 0 { return decl_tid }
-            // A generic function's NAME is a value, and its binders are open at the reference:
-            // `apply(identity, 3)` and `let f = identity` name the same value, and what fixes T
-            // is the type expected where the name stands. Each binder becomes a metavar so the
-            // expectation can solve it, because a bare typevar is invisible to every part of the
-            // solving machinery and would reach codegen unsolved with nothing reported.
-            let val_tid = tc_generic_fn_value_tid(node, fn_sig, decl_tid)
-            if tc_construct_hint >= 0 {
-                let want = resolve_alias_tid(tc_construct_hint)
-                if type_kind(want) == TyKind.Fn { tc_unify(val_tid, want) }
-            }
-            return val_tid
+            return tc_fn_value_type(node, fn_sig)
         }
         // `with arena` names the built-in Arena effect where every other with-item names a
         // handler VALUE. It denotes a handler all the same, so it answers the type its siblings
@@ -29611,6 +29618,15 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                 if qual_decl != -1 {
                     let let_tid = tc_lookup_node_tid(qual_decl)
                     if let_tid >= 0 { return let_tid }
+                } else {
+                    let qual_fn = nr_resolve_decl_in_module(qual_mod, fname, 0)
+                    nr_note_fn_value_decl(node, qual_fn)
+                    if tc_fn_value_decl_node(node) >= 0 {
+                        match fnsig_by_decl.get(qual_fn) {
+                            Some(sig) => return tc_fn_value_type(node, sig)
+                            None => {}
+                        }
+                    }
                 }
             }
         }
@@ -33334,7 +33350,7 @@ fn tc_tm_closures_of(exprs: List[Int], assigns: Map[Int, List[Int]]) -> List[Int
             todo.push(node_value(node))
         } else if k == NodeKind.Ident || k == NodeKind.FieldAccess {
             let decl = if k == NodeKind.Ident { tc_tm_let_of(node) } else { tc_module_global_decl(node) ?? -1 }
-            let named = if k == NodeKind.Ident { tc_fn_value_decl_node(node) } else { -1 }
+            let named = tc_fn_value_decl_node(node)
             if named >= 0 { out.push(named) }
             if decl >= 0 {
                 for v in tc_tm_let_values(decl, assigns) { todo.push(v) }

@@ -94,6 +94,7 @@ Single source of truth for release history. `blink llms` and `blink llms --full`
 ## Fixes (v0.59.0)
 
 - **A generic fn named as a value runs.** `let g: fn(Str) -> Str = identity` and `apply(identity, 3)` passed the check, then stopped the build with `CodegenStageNotBuilt`. Each reference now gets the instance that its expected type solves.
+- **A fn read through its module is a value.** `let f = alpha.make` and `apply(3, alpha.make)` stopped the build with an internal error, because the read carried no type. They now type and run the same as the bare name, generic and re-exported fns too, and a wrong one is E0300 at the argument.
 - **`blink fix` for `DuplicateSymbol` (E1012) keeps other code on an import's line.** The fix that removed the import took the whole line with it.
 - **A token after `as` in a `with` item that is not a name binds no variable.** `with x as 7 { }` gave `UnusedVariable` (W0600) for a variable `7` on top of the parse error.
 - **Each `PanicHookPlacement` (E0565) site gets one report with its own label.** A use that is not a `with` item gets the form label, wherever it stands, and a help that shows the whole repair. A hook in a closure in `main` or a `test` block carries a note that the closure's body is not the body of `main`. `with on_panic(f) as x` is E0565, not `NonHandlerWithItem` (E0839): its span is `as x`, `blink fix` removes it, and the site still counts as the one hook of `main`. The span of a `with ... as x` item is now `as x` for its other reports too, not the token after it.
