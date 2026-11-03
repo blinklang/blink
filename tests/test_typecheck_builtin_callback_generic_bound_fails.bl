@@ -1,0 +1,64 @@
+// The bound of a generic fn named as a value holds at the types inference gives its binders.
+// E0306 stands at the reference in every position a fn value can take.
+
+import compile_test_helpers
+
+fn program(body: Str) -> Str {
+    "trait Bump \{ fn b(self) -> Int }\nimpl Bump for Int \{ fn b(self) -> Int \{ self } }\nfn go[T: Bump](x: T) -> Int \{ x.b() }\nfn ordered[T: Ord](x: T) -> T \{ x }\ntype Plain \{ n: Int }\n{body}\n"
+}
+
+fn rejects(body: Str, tag: Str, want: Str) ! FS.Delete, FS.Write, Process.Spawn, FS.Read, Env.Read, IO.Print {
+    let out = compile_test_helpers.compile_and_capture(program(body), tag)
+    compile_test_helpers.expect_error(out, "E0306", tag)
+    compile_test_helpers.expect_contains(out, want, tag)
+}
+
+fn accepts(body: Str, tag: Str) ! FS.Delete, FS.Write, Process.Spawn, FS.Read, Env.Read, IO.Print {
+    compile_test_helpers.expect_compiles_clean(compile_test_helpers.compile_and_capture(program(body), tag), tag)
+}
+
+test "a built-in HOF's element must meet the bound" {
+    rejects("fn main() \{ let _ = [\"a\"].map(go) }", "cbb_map", "`Str` does not satisfy the Bump bound on type parameter T")
+    rejects("fn main() \{ let _ = [\"a\"].into_iter().map(go).collect() }", "cbb_it", "`Str` does not satisfy the Bump bound")
+}
+
+test "a bound on a compiler-known trait" {
+    rejects("fn main() \{ let _ = [Plain \{ n: 1 }].map(ordered) }", "cbb_ord", "does not satisfy the Ord bound")
+}
+
+test "a user HOF and a typed let are judged the same way" {
+    rejects("fn ap[T, U](xs: List[T], f: fn(T) -> U) -> List[U] \{ xs.map(f) }\nfn main() \{ let _ = ap([\"a\"], go) }", "cbb_user_hof", "`Str` does not satisfy the Bump bound")
+    rejects("fn main() \{\n    let f: fn(Str) -> Int = go\n    let _ = f\n}", "cbb_let", "`Str` does not satisfy the Bump bound")
+}
+
+test "a typevar with no such bound does not stand in for one" {
+    rejects("fn g[T](xs: List[T]) -> Int \{ xs.map(go).len() }\nfn main() \{ let _ = g([1]) }", "cbb_typevar", "`T` does not satisfy the Bump bound on type parameter T")
+}
+
+test "the error stands at the reference" {
+    let out = compile_test_helpers.compile_and_capture(program("fn main() \{\n    let _ = [\"a\"].map(go)\n}"), "cbb_site")
+    compile_test_helpers.expect_contains(out, "\"line\":7,\"col\":23", "cbb_site")
+    assert_eq(out.split("\"severity\":\"error\"").len(), 2)
+}
+
+test "a typevar that states the bound passes" {
+    accepts("fn g[T: Bump](xs: List[T]) -> List[Int] \{ xs.map(go) }\nfn main() \{ let _ = g([1]) }", "cbb_ok_typevar")
+}
+
+test "a supertrait gives the bound" {
+    accepts("trait Up: Bump \{ fn u(self) -> Int }\nimpl Up for Int \{ fn u(self) -> Int \{ self } }\nfn g[T: Up](xs: List[T]) -> List[Int] \{ xs.map(go) }\nfn main() \{ let _ = g([1]) }", "cbb_ok_super")
+}
+
+test "an impl's where clause gives the bound" {
+    accepts("type Box[T] \{ xs: List[T] }\ntrait Sum \{ fn sum(self) -> List[Int] }\nimpl[T] Sum for Box[T] where T: Bump \{ fn sum(self) -> List[Int] \{ self.xs.map(go) } }\nfn main() \{ let _ = Box \{ xs: [1] }.sum() }", "cbb_ok_where")
+}
+
+test "an element that wraps the enclosing fn's typevar is not judged without its frame" {
+    accepts("fn eqd[U: Eq](x: U) -> U \{ x }\nfn g[T: Eq](xs: List[List[T]]) -> List[List[T]] \{ xs.map(eqd) }\nfn main() \{ let _ = g([[1]]) }", "cbb_ok_nested")
+}
+
+test "a bound that holds passes in each position" {
+    accepts("fn main() \{ let _ = [1].map(go) }", "cbb_ok_map")
+    accepts("fn ap[T, U](xs: List[T], f: fn(T) -> U) -> List[U] \{ xs.map(f) }\nfn main() \{ let _ = ap([1], go) }", "cbb_ok_hof")
+    accepts("fn main() \{\n    let f: fn(Int) -> Int = go\n    let _ = f\n}", "cbb_ok_let")
+}

@@ -2962,7 +2962,7 @@ let mut tc_ud_blamed: Map[Int, Int] = Map()
 // [sig, self_offset, n, tid..., open...] (tc_note_generic_call),
 // [-1, im, n, tid...] (tc_note_conversion_call), [-1, -1, 1, ctor] (tc_note_open_ctor_key),
 // [-2, -1, 0] (tc_note_deferred_conversion), [-3, -1, 0] (tc_note_open_variant) or
-// [-4, sig, tid, n, binder...] (tc_note_fn_value).
+// [-4, sig, tid, n, binder..., enclosing fn] (tc_note_fn_value).
 let mut tc_call_open_calls: List[Int] = []
 let mut tc_call_open_group: Map[Int, Int] = Map()
 let mut tc_call_open_tids: List[Int] = []
@@ -3298,6 +3298,7 @@ fn tc_note_fn_value(node: Int, sig: Int, tid: Int, binders: List[Int]) {
     tc_call_open_tids.push(tid)
     tc_call_open_tids.push(binders.len())
     for b in binders { tc_call_open_tids.push(b) }
+    tc_call_open_tids.push(tc_current_fn_node)
 }
 
 // The group of this reference to a generic function's name, or -1 for any other node.
@@ -3587,12 +3588,60 @@ fn tc_ud_flush_open_variants() ! Diag.Report {
 // Report each generic function's name whose binders nothing fixed, at the reference, where its
 // repair attaches (§3.4 "A generic function named as a value"). A binder that the function's
 // type does not mention is open whatever the expected type is.
-fn tc_ud_flush_fn_values() ! Diag.Report {
+fn tc_ud_flush_fn_values() ! TypeCheck.Resolve, Diag.Report {
     for node in tc_call_open_calls {
         if tc_fn_value_group(node) < 0 || tc_call_reported.contains_key(node) { continue }
         let end_line = if node_end_line(node) > node_line(node) { node_end_line(node) } else { node_line(node) }
         if diag_errors_in_lines(diag_file_for_node(node), node_line(node), end_line) > 0 { continue }
         tc_report_fn_value_unfixed(node)
+        if !tc_call_reported.contains_key(node) { tc_check_fn_value_bounds(node) }
+    }
+}
+
+// The bounds of a generic function's name, at the types inference gave its binders. They are
+// judged here and not at the reference, which has seen none of the types yet. No frame of the
+// enclosing fn is active here, and tc_check_bounds_for_binds reads a typevar under one, so a
+// binder that holds a typevar is left out. A binder that is one is read from its declaration.
+fn tc_check_fn_value_bounds(node: Int) ! TypeCheck.Resolve, Diag.Report {
+    let g = tc_fn_value_group(node)
+    let sig = tc_call_open_tids.get(g + 1).unwrap()
+    let fs = fnsig_pool.get(sig).unwrap()
+    let enclosing = tc_call_open_tids.get(g + 4 + fs.type_params_count).unwrap()
+    let mut binds: Map[Str, Int] = Map()
+    let mut pi = 0
+    while pi < fs.type_params_count {
+        let tid = tc_resolve(tc_call_open_tids.get(g + 4 + pi).unwrap())
+        let idx = fs.type_params_start + pi
+        if tc_tid_kind(tid) == TyKind.Typevar {
+            tc_check_typevar_meets_bounds(tid, fnsig_tparam_nodes.get(idx) ?? NO_BINDER_NODE, enclosing, node)
+        } else if tc_tid_is_judgeable(tid) != 0 {
+            binds.insert(fnsig_type_param_names.get(idx).unwrap(), tid)
+        }
+        pi = pi + 1
+    }
+    tc_check_bounds_for_binds(sig, binds, node)
+}
+
+// A typevar of the enclosing fn in a binder with bounds: that fn must state each one, as it
+// stands for every type a caller may give it.
+fn tc_check_typevar_meets_bounds(tid: Int, carrier: Int, enclosing: Int, node: Int) ! Diag.Report {
+    let binder = ty_pool.get(tid).unwrap().inner1
+    if carrier < 0 || binder == NO_BINDER_NODE { return }
+    let bounds = node_elements(carrier)
+    if bounds == -1 { return }
+    let held = tc_er_binder_traits(enclosing, binder)
+    let mut i = 0
+    while i < sublist_length(bounds) {
+        let want = tc_bound_trait(sublist_get(bounds, i))
+        if tc_pipe_has(held, want) == 0 {
+            let shown = tc_trait_shown(want)
+            let t = type_to_str(tid)
+            diag_error_at("TraitBoundNotSatisfied", TRAIT_BOUND_NOT_SATISFIED,
+                "`{t}` does not satisfy the {shown} bound on type parameter {node_name(carrier)}", node,
+                "add the bound where `{t}` is declared: `{t}: {shown}`")
+            return
+        }
+        i = i + 1
     }
 }
 
