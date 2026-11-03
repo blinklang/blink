@@ -77,7 +77,7 @@ fn main() {
 
 test "an outer clause for a derived op is bypassed by an inner handler that omits it" {
     let r = run_kv(#"
-fn logging_shout() -> Handler[Kv.Get] {
+fn logging_shout() -> Handler[Kv.Get] ! IO.Print {
     handler Kv.Get {
         fn shout(key: Str) -> Str {
             io.println("LOG {key}")
@@ -103,7 +103,7 @@ fn main() {
 
 test "default.op on a derived op runs the enclosing handler's version of it" {
     let r = run_kv(#"
-fn logging_shout() -> Handler[Kv.Get] {
+fn logging_shout() -> Handler[Kv.Get] ! IO.Print {
     handler Kv.Get {
         fn shout(key: Str) -> Str {
             io.println("LOG {key}")
@@ -349,8 +349,8 @@ fn main() {
     assert(r.out.contains("real-df-p!"))
 }
 
-test "a derived body may open an async scope" {
-    let r = run_both(#"effect Kv {
+test "a handle op of another effect in a derived body is E0557 and not E0500" {
+    let out = compile_test_helpers.compile_and_capture(#"effect Kv {
     effect Get {
         fn fetch(key: Str) -> Str
         fn par(key: Str) -> Str {
@@ -368,8 +368,35 @@ fn main() {
     }
 }
 "#, "derived_op_async_scope")
-    assert_eq(r.exit_code, 0)
-    assert(r.out.contains("got-q"))
+    compile_test_helpers.expect_error(out, "E0557", "derived body")
+    assert(!out.contains("E0500"), "E0500 as well: {out}")
+    compile_test_helpers.expect_contains(out, "derived operation `Kv.Get.par` performs `Async`", "title")
+    compile_test_helpers.expect_contains(out, "`Async` is not `Kv.Get`", "label")
+    compile_test_helpers.expect_contains(out, "may perform only the effect it is declared in, `Kv.Get`", "note")
+    compile_test_helpers.expect_contains(out, "move the logic to a plain function", "first help")
+    compile_test_helpers.expect_contains(out, "make `par` a primitive operation", "second help")
+    assert(!out.contains("add effect"), "a fix no one can write: {out}")
+    assert(!out.contains("is a different effect"), "a sibling help on a foreign effect: {out}")
+}
+
+fn net_effect_with(body_line: Str) -> Str {
+    "effect Net \{\n    effect Connect \{\n        fn request(url: Str) -> Str\n        fn get(url: Str) -> Str \{\n            {body_line}\n            net.request(url)\n        \}\n    \}\n\}\nfn main() \{\n    with handler Net.Connect \{ fn request(url: Str) -> Str \{ url \} \} \{\n        io.println(net.get(\"a\"))\n    \}\n\}\n"
+}
+
+test "a handle op of the body's own leaf effect in a derived body stays clean" {
+    let out = compile_test_helpers.compile_and_capture(net_effect_with("let _ = net.connect(\"h\", 80)"), "derived_op_own_leaf")
+    compile_test_helpers.expect_compiles_clean(out, "own leaf")
+}
+
+test "a handle op of a sibling leaf effect in a derived body is E0557" {
+    let out = compile_test_helpers.compile_and_capture(net_effect_with("let _ = net.listen(\"h\", 80)"), "derived_op_sibling_leaf")
+    compile_test_helpers.expect_error(out, "E0557", "sibling leaf")
+    compile_test_helpers.expect_contains(out, "derived operation `Net.Connect.get` performs `Net.Listen`", "title")
+    compile_test_helpers.expect_contains(out, "`Net.Listen` is a different effect from `Net.Connect`, and may have no handler where `Net.Connect` is handled", "sibling help")
+}
+
+test "DerivedOpForeignEffect is catalogued" {
+    compile_test_helpers.verify_catalog_entry("E0557", "DerivedOpForeignEffect")
 }
 
 test "a derived body is checked for a mutable capture in a spawned task" {
@@ -392,7 +419,7 @@ fn main() {
     }
 }
 "#
-    let out = compile_test_helpers.compile_and_capture(src, "derived_op_spawn_mut_capture")
+    let out = compile_test_helpers.check_via_cli(src, "derived_op_spawn_mut_capture")
     compile_test_helpers.expect_contains(out, "MutableCaptureInSpawn", "mutable capture in a derived body")
 }
 

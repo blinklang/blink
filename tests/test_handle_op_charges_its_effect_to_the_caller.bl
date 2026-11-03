@@ -1,0 +1,450 @@
+// A call of a built-in handle operation charges the operation's effect to the caller's row, the
+// same way a call of a function does (sections/04_effects.md §4.4, §4.6). A row that does not
+// hold the effect, or holds only a sibling sub-effect, is UndeclaredEffect (E0500), and the
+// report names the op and the row it misses.
+
+import compile_test_helpers
+
+fn expect_undeclared(src: Str, tag: Str, op: Str, req: Str) ! FS.Delete, FS.Write, Process.Spawn, FS.Read, Env.Read, IO.Print {
+    let out = compile_test_helpers.compile_and_capture(src, tag)
+    compile_test_helpers.expect_error(out, "E0500", tag)
+    compile_test_helpers.expect_contains(out, "insufficient effect capability", tag)
+    compile_test_helpers.expect_contains(out, "`{op}` requires effect `{req}`", tag)
+}
+
+fn expect_clean(src: Str, tag: Str) ! FS.Delete, FS.Write, Process.Spawn, FS.Read, Env.Read, IO.Print {
+    let out = compile_test_helpers.compile_and_capture(src, tag)
+    compile_test_helpers.expect_compiles_clean(out, tag)
+}
+
+test "a fn with no row may not call io.println, and the note says it declares none" {
+    let src = #"fn bad() {
+    io.println("x")
+}
+fn main() {
+    bad()
+}
+"#
+    expect_undeclared(src, "handle_op_rowless_fn", "io.println", "IO.Print")
+    let out = compile_test_helpers.compile_and_capture(src, "handle_op_rowless_fn_note")
+    compile_test_helpers.expect_contains(out, "function `bad` declares no effects", "rowless note")
+}
+
+test "FS.Read does not grant fs.write, and the note names the row the fn has" {
+    let src = #"import std.fs
+fn read_only() ! FS.Read {
+    let _ = fs.write("x", "y")
+}
+fn main() {
+    read_only()
+}
+"#
+    expect_undeclared(src, "handle_op_wrong_sub_effect", "fs.write", "FS.Write")
+    let out = compile_test_helpers.compile_and_capture(src, "handle_op_wrong_sub_effect_note")
+    compile_test_helpers.expect_contains(out, "function `read_only` only declares `FS.Read`", "row note")
+    compile_test_helpers.expect_contains(out, "FS.Write", "fix text")
+}
+
+test "IO.Print does not grant io.eprintln" {
+    let src = #"fn warn() ! IO.Print {
+    io.eprintln("x")
+}
+fn main() {
+    warn()
+}
+"#
+    expect_undeclared(src, "handle_op_eprint_sibling", "io.eprintln", "IO.Eprint")
+}
+
+test "time.monotonic charges Time.Read" {
+    let src = #"fn clock() {
+    let _ = time.monotonic()
+}
+fn main() {
+    clock()
+}
+"#
+    expect_undeclared(src, "handle_op_time_read", "time.monotonic", "Time.Read")
+}
+
+test "env.pid charges Env.Read" {
+    let src = #"fn me() -> Int {
+    env.pid()
+}
+fn main() {
+    io.println("{me()}")
+}
+"#
+    expect_undeclared(src, "handle_op_env_read", "env.pid", "Env.Read")
+}
+
+test "rand.int charges Rand" {
+    let src = #"fn roll() -> Int {
+    rand.int(1..=6)
+}
+fn main() {
+    io.println("{roll()}")
+}
+"#
+    expect_undeclared(src, "handle_op_rand", "rand.int", "Rand")
+}
+
+test "env.exit charges Env.Exit and points to panic for an internal error" {
+    let src = #"fn die() {
+    env.exit(1)
+}
+fn main() {
+    die()
+}
+"#
+    expect_undeclared(src, "handle_op_env_exit", "env.exit", "Env.Exit")
+    let out = compile_test_helpers.compile_and_capture(src, "handle_op_env_exit_help")
+    compile_test_helpers.expect_contains(out, "for an internal error, call panic(...) and install on_panic in main", "exit help")
+}
+
+test "process.exec needs Env.Exit as well as Process.Spawn" {
+    let src = #"import std.process
+fn replace() ! Process.Spawn {
+    let _ = process.exec("true", [])
+}
+fn main() {
+    replace()
+}
+"#
+    expect_undeclared(src, "handle_op_exec_needs_exit", "process.exec", "Env.Exit")
+}
+
+test "a row with Process.Spawn and Env.Exit may call process.exec" {
+    expect_clean(#"import std.process
+fn replace() ! Process.Spawn, Env.Exit {
+    let _ = process.exec("true", [])
+}
+fn main() {
+    replace()
+}
+"#, "handle_op_exec_row_holds_both")
+}
+
+test "the name io.write charges IO.Print as io.print_raw does" {
+    let src = #"fn raw() {
+    io.write("x")
+}
+fn main() {
+    raw()
+}
+"#
+    expect_undeclared(src, "handle_op_removed_write", "io.write", "IO.Print")
+}
+
+test "a parent effect in the row grants each child op" {
+    expect_clean(#"import std.fs
+fn work(p: Str) ! IO, FS, Env, Time {
+    io.println(env.var("HOME") ?? "")
+    io.eprintln("x")
+    let _ = fs.write(p, "x")
+    let _ = time.read()
+}
+fn main() {
+    work("/tmp/handle_op_parent_row")
+}
+"#, "handle_op_parent_row")
+}
+
+test "a row that holds each sub-effect compiles clean" {
+    expect_clean(#"import std.fs
+fn work(p: Str) ! IO.Print, IO.Eprint, Env.Read, FS.Write, Time.Read {
+    io.println(env.var("HOME") ?? "")
+    io.eprintln("x")
+    let _ = fs.write(p, "x")
+    let _ = time.read()
+}
+fn main() {
+    work("/tmp/handle_op_row_holds_all")
+}
+"#, "handle_op_row_holds_all")
+}
+
+test "an op in a closure charges the enclosing fn" {
+    let src = #"fn later() {
+    let f = fn() { env.exit(1) }
+    f()
+}
+fn main() {
+    later()
+}
+"#
+    expect_undeclared(src, "handle_op_closure", "env.exit", "Env.Exit")
+}
+
+test "an op in a spawned closure charges the enclosing fn" {
+    let src = #"fn spawner() ! Async {
+    let h = async.spawn(fn() -> Int { io.println("x") 1 })
+    let _ = h.await
+}
+fn main() {
+    spawner()
+}
+"#
+    expect_undeclared(src, "handle_op_spawned_closure", "io.println", "IO.Print")
+}
+
+test "an op in a handler clause body charges the fn that builds the handler" {
+    let src = #"fn quiet() ! IO.Log {
+    with handler IO.Log { fn log(msg: Str) { io.println(msg) } } {
+        io.log("x")
+    }
+}
+fn main() {
+    quiet()
+}
+"#
+    expect_undeclared(src, "handle_op_handler_body", "io.println", "IO.Print")
+}
+
+test "a with block that installs a handler holds its effect" {
+    expect_clean(#"fn quiet() {
+    with handler IO.Log { fn log(_msg: Str) { } } {
+        io.log("x")
+    }
+}
+fn main() {
+    quiet()
+}
+"#, "handle_op_with_discharges")
+}
+
+test "main holds every effect" {
+    expect_clean(#"import std.fs
+fn main() {
+    io.println("x")
+    io.eprintln("y")
+    let _ = fs.write("/tmp/handle_op_main_holds", "x")
+    let _ = time.read()
+}
+"#, "handle_op_main_holds")
+}
+
+test "@trusted does not discharge an op" {
+    let src = #"@trusted(audit: "probe")
+fn t() {
+    io.println("x")
+}
+fn main() {
+    t()
+}
+"#
+    expect_undeclared(src, "handle_op_trusted", "io.println", "IO.Print")
+}
+
+test "a helper fn of a test block is charged, though the test block is not walked" {
+    let src = #"fn helper() {
+    io.println("x")
+}
+test "t" {
+    helper()
+}
+fn main() { }
+"#
+    expect_undeclared(src, "handle_op_test_helper", "io.println", "IO.Print")
+}
+
+test "a named panic hook is charged for what it runs" {
+    let src = #"import std.traits.{PanicInfo}
+fn hook(p: PanicInfo) {
+    io.eprintln(p.message)
+}
+fn main() {
+    with on_panic(hook) {
+        io.println("x")
+    }
+}
+"#
+    expect_undeclared(src, "handle_op_named_hook", "io.eprintln", "IO.Eprint")
+}
+
+test "a local named like a handle is not charged" {
+    expect_clean(#"type Sink { n: Int }
+trait Out {
+    fn println(self, s: Str) -> Int
+}
+impl Out for Sink {
+    fn println(self, s: Str) -> Int { self.n + s.len() }
+}
+fn f() -> Int {
+    let io = Sink { n: 1 }
+    io.println("x")
+}
+fn main() {
+    let _ = f()
+}
+"#, "handle_op_shadow")
+}
+
+test "term ops with a literal charge by the table of removed names" {
+    expect_undeclared(#"fn a() -> Int {
+    term.isatty(1)
+}
+fn main() {
+    let _ = a()
+}
+"#, "handle_op_isatty_stdout", "term.isatty", "IO.Print")
+    expect_undeclared(#"fn a() -> Int {
+    term.isatty(2)
+}
+fn main() {
+    let _ = a()
+}
+"#, "handle_op_isatty_stderr", "term.isatty", "IO.Log")
+    expect_undeclared(#"fn a() -> Int {
+    term.width()
+}
+fn main() {
+    let _ = a()
+}
+"#, "handle_op_term_width", "term.width", "IO.Print")
+    expect_undeclared(#"fn a() -> Int {
+    term.height()
+}
+fn main() {
+    let _ = a()
+}
+"#, "handle_op_term_height", "term.height", "IO.Print")
+}
+
+test "term.isatty of another fd charges nothing yet" {
+    expect_clean(#"fn a(fd: Int) -> Bool {
+    term.isatty(3) == 1 || term.isatty(fd) == 1
+}
+fn main() {
+    let _ = a(4)
+}
+"#, "handle_op_isatty_other")
+}
+
+test "fs.errno and ffi.scope charge nothing" {
+    expect_clean(#"import std.fs
+@trusted(audit: "probe")
+fn a() -> Int {
+    with ffi.scope() as scope {
+        let _p: Ptr[U8] = scope.alloc()
+    }
+    fs.errno()
+}
+fn main() {
+    let _ = a()
+}
+"#, "handle_op_no_charge")
+}
+
+test "net.connect charges Net.Connect and net.listen charges Net.Listen" {
+    expect_undeclared(#"fn a() {
+    let _ = net.connect("localhost", 80)
+}
+fn main() {
+    a()
+}
+"#, "handle_op_net_connect", "net.connect", "Net.Connect")
+    expect_undeclared(#"fn a() {
+    let _ = net.listen("localhost", 80)
+}
+fn main() {
+    a()
+}
+"#, "handle_op_net_listen", "net.listen", "Net.Listen")
+}
+
+test "a raw net stream op charges nothing yet" {
+    expect_clean(#"fn a(fd: Int) {
+    let _ = net.read(fd, 1)
+    let _ = net.close(fd)
+}
+fn main() {
+    a(0)
+}
+"#, "handle_op_net_raw")
+}
+
+test "async.spawn and async.scope charge Async" {
+    expect_undeclared(#"fn spawner() {
+    let _h = async.spawn(fn() -> Int { 10 })
+}
+fn main() {
+    spawner()
+}
+"#, "handle_op_rowless_spawn", "async.spawn", "Async")
+    expect_undeclared(#"fn scoped() {
+    async.scope {
+        let _x = 42
+    }
+}
+fn main() {
+    scoped()
+}
+"#, "handle_op_rowless_scope", "async.scope", "Async")
+}
+
+test "await charges Async" {
+    expect_undeclared(#"fn waits(h: Handle[Int]) -> Int {
+    h.await
+}
+fn main() {
+    let h = async.spawn(fn() -> Int { 1 })
+    let _ = waits(h)
+}
+"#, "handle_op_await", "h.await", "Async")
+}
+
+test "a channel send, recv and for-in charge Async" {
+    expect_undeclared(#"fn s(ch: Channel[Int]) {
+    ch.send(1)
+}
+fn main() {
+    s(channel.new[Int](buffer: 1))
+}
+"#, "handle_op_send", "ch.send", "Async")
+    expect_undeclared(#"fn r(ch: Channel[Int]) {
+    let _ = ch.recv()
+}
+fn main() {
+    r(channel.new[Int](buffer: 1))
+}
+"#, "handle_op_recv", "ch.recv", "Async")
+    expect_undeclared(#"fn drain(ch: Channel[Int]) {
+    for x in ch { let _y = x }
+}
+fn main() {
+    drain(channel.new[Int](buffer: 1))
+}
+"#, "handle_op_for_in_channel", "for .. in ch", "Async")
+}
+
+test "channel.new and ch.close charge nothing" {
+    expect_clean(#"fn make() -> Int {
+    let ch = channel.new[Int](buffer: 1)
+    ch.close()
+    1
+}
+fn main() {
+    let _ = make()
+}
+"#, "handle_op_channel_clean")
+}
+
+test "a row with Async may await, send, receive and iterate" {
+    expect_clean(#"fn w(ch: Channel[Int]) -> Int ! Async {
+    ch.send(1)
+    ch.close()
+    let h = async.spawn(fn() -> Int { 2 })
+    let mut n = h.await
+    for x in ch { n = n + x }
+    n
+}
+fn main() {
+    let _ = w(channel.new[Int](buffer: 1))
+}
+"#, "handle_op_async_row")
+}
+
+test "UndeclaredEffect is catalogued" {
+    compile_test_helpers.verify_catalog_entry("E0500", "UndeclaredEffect")
+}

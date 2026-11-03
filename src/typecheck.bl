@@ -23,7 +23,7 @@ import parser.{
 }
 import diagnostics.{
     Diag, diag_clear_allows, diag_error_at, diag_error_at_notes, diag_error_span_at_notes, diag_error_no_loc,
-    diag_set_last_fix, diag_set_last_fix_at, diag_add_label_since, diag_release_repeat_key_since, diag_add_last_fix_edit, diag_set_fix_edits_at, DiagEntry, DiagFixEdit, diag_source_lines, diag_entries, UNDECLARED_EFFECT, UNSOURCED_EFFECT_WILDCARD,
+    diag_set_last_fix, diag_set_last_fix_at, diag_add_label_since, diag_release_repeat_key_since, diag_add_last_fix_edit, diag_set_fix_edits_at, DiagEntry, DiagFixEdit, diag_source_lines, diag_entries, UNDECLARED_EFFECT, UNSOURCED_EFFECT_WILDCARD, DERIVED_OP_FOREIGN_EFFECT,
     diag_push_allows, diag_enter_allows, diag_exit_allows, NON_CONST_EXPR,
     diag_warn_at, diag_warn_at_notes, diag_warn_span_at_notes, PARTIAL_HANDLER, diag_truncate, diag_entry_count, diag_any_errors_since, diag_ice_at, diag_ice, PRELUDE_TYPE_NOT_LOADED, diag_count, diag_emit_in_file, diag_file_for_node, diag_file_node_range,
     diag_is_audit_gated, diag_audit_gated_help, AUDIT_GATED_SUPPRESSION, diag_normalize_path, diag_source_line, diag_errors_in_lines,
@@ -33016,6 +33016,8 @@ fn tc_tm_walk(node: Int, inside: Set[Int], ran: Set[Int], assigns: Map[Int, List
             }
         }
     }
+    let suspends = tc_suspension_shown(node)
+    if suspends != "" { tc_tm_report(node, "`msg` runs `{suspends}`, which suspends the task", []) }
     if k == NodeKind.WithBlock { tc_tm_check_with(node, assigns) }
     if k == NodeKind.Assignment || k == NodeKind.CompoundAssign {
         let shown = tc_tm_written_outside(node_target(node), inside)
@@ -33339,16 +33341,92 @@ fn tc_tm_handler_op(node: Int) -> Str {
         ""
     }
     if tc_call_user_effect(node) >= 0 || tc_call_builtin_default(node) >= 0 { return shown }
-    if node_kind(node) != NodeKind.MethodCall { return "" }
+    if !tc_call_is_handle_op(node) { return "" }
+    // `ffi.scope` opens an arena, which is the FFI row, not a handler.
+    let ns = node_name(node_obj(node))
+    if ns == "trace" || ns == "ffi" { return "" }
+    shown
+}
+
+// Whether a method call reaches a built-in operation through its handle, not through a local,
+// a module `let`, or a std module that the file imports under the handle's name.
+fn tc_call_is_handle_op(node: Int) -> Bool {
+    if node_kind(node) != NodeKind.MethodCall { return false }
     let obj = node_obj(node)
-    if node_kind(obj) != NodeKind.Ident || tc_ident_binder_node(obj) >= 0 || tc_global_decl_node(obj) >= 0 { return "" }
-    if tc_mc_obj_is_value(node) != 0 { return "" }
+    if node_kind(obj) != NodeKind.Ident || tc_ident_binder_node(obj) >= 0 || tc_global_decl_node(obj) >= 0 { return false }
+    if tc_mc_obj_is_value(node) != 0 { return false }
     let ns = node_name(obj)
     // A `rand.op(..)` call reaches the op through its wrapper declaration, and is still the op.
-    if tc_namespace_call_reads_module(node) && !tc_tm_calls_op_wrapper(node, ns) { return "" }
-    // `ffi.scope` opens an arena, which is the FFI row, not a handler.
-    if ns == "trace" || ns == "ffi" || is_intrinsic_method(ns, node_method(node)) == 0 { return "" }
-    shown
+    if tc_namespace_call_reads_module(node) && !tc_tm_calls_op_wrapper(node, ns) { return false }
+    is_intrinsic_method(ns, node_method(node)) != 0
+}
+
+// The row that a call of a built-in handle op needs (§4.4). Empty for any other call, and for
+// a name the spec gives no row: raw `net.read`, `fs.errno`, `ffi.scope`, `trace.log`.
+fn tc_handle_op_row(node: Int) -> List[Str] {
+    if !tc_call_is_handle_op(node) { return [] }
+    let op = node_method(node)
+    match node_name(node_obj(node)) {
+        "io" => tc_op_row("IO", match op {
+            "println" | "write" | "write_bytes" => "Print"
+            "eprintln" => "Eprint"
+            _ => builtin_effect_op_sub("IO", op)
+        })
+        "fs" => tc_op_row("FS", builtin_effect_op_sub("FS", op))
+        "env" => tc_op_row("Env", builtin_effect_op_sub("Env", op))
+        "time" => tc_op_row("Time", builtin_effect_op_sub("Time", op))
+        // exec replaces the process, so the caller's own exit path ends as env.exit does.
+        "process" => if op == "exec" { ["Process.Spawn", "Env.Exit"] } else { tc_op_row("Process", builtin_effect_op_sub("Process", op)) }
+        "rand" => ["Rand"]
+        "async" => ["Async"]
+        "net" => match op {
+            "connect" | "request" => ["Net.Connect"]
+            "listen" => ["Net.Listen"]
+            _ => []
+        }
+        "term" => tc_term_op_row(node)
+        _ => []
+    }
+}
+
+fn tc_op_row(root: Str, sub: Str) -> List[Str] {
+    if sub == "" { [] } else { ["{root}.{sub}"] }
+}
+
+// The removed names of §4.4: stdout answers IO.Print and stderr answers IO.Log. The spec gives
+// `term.isatty` on any other fd no row, and a fd that is not a literal could be any of them.
+fn tc_term_op_row(node: Int) -> List[Str] {
+    if node_method(node) != "isatty" { return ["IO.Print"] }
+    let args = node_args(node)
+    if args == -1 || sublist_length(args) != 1 { return [] }
+    match int_lit_node_digits(sublist_get(args, 0)) {
+        "1" => ["IO.Print"]
+        "2" => ["IO.Log"]
+        _ => []
+    }
+}
+
+// What the source spells for a node that suspends the task it runs in and needs `Async`
+// (§4.13), or "". async.spawn is a handle op; `channel.new` and `ch.close` do not block.
+fn tc_suspension_shown(node: Int) -> Str ! TypeCheck.Resolve {
+    let k = node_kind(node)
+    if k == NodeKind.AsyncScope { return "async.scope" }
+    if k == NodeKind.AwaitExpr { return "{tc_suspension_path(node_obj(node), "handle")}.await" }
+    if k == NodeKind.ForIn && tc_node_is_channel(node_iterable(node)) { return "for .. in {tc_suspension_path(node_iterable(node), "channel")}" }
+    if k == NodeKind.MethodCall && (node_method(node) == "send" || node_method(node) == "recv") && tc_node_is_channel(node_obj(node)) {
+        return "{tc_suspension_path(node_obj(node), "channel")}.{node_method(node)}"
+    }
+    ""
+}
+
+fn tc_suspension_path(node: Int, fallback: Str) -> Str {
+    let path = tc_tm_path_shown(node)
+    if path != "" { path } else { fallback }
+}
+
+fn tc_node_is_channel(node: Int) -> Bool ! TypeCheck.Resolve {
+    let t = resolve_alias_tid(tc_resolve(tc_lookup_node_tid(node)))
+    t >= 0 && tc_tid_kind(t) == TyKind.Channel
 }
 
 fn tc_tm_calls_op_wrapper(node: Int, ns: Str) -> Bool {
@@ -39532,7 +39610,47 @@ fn tc_er_require(program: Int, site: Int, held: List[Str], owner: ErOwner, calle
     diag_set_last_fix("add effect", req)
 }
 
+// A built-in op has no declaration to point to, so the report points to the row it misses (§4.4).
+// A `@pure` fn may hold no row at all, so adding the effect is no way out of its report (§4.16.3).
+// `width` is how much of the source the op's name takes, 0 when `op` is not what the source spells.
+fn tc_er_require_op(program: Int, site: Int, held: List[Str], owner: ErOwner, op: Str, width: Int, req: Str) ! Diag.Report {
+    if tc_er_satisfied(program, held, req) { return }
+    let line = node_line(site)
+    let col = node_col(site)
+    let end_col = if width > 0 { col + width } else { 0 }
+    // An operation declaration has no row, so no effect can be added to a derived body (§4.7.1).
+    if owner.decl == -1 {
+        let leaf = held.get(0) ?? ""
+        let parts = owner.name.split(".")
+        let sibling = req.contains(".") && (req.split(".").get(0) ?? "") == (leaf.split(".").get(0) ?? "")
+        let sibling_help = if sibling { "\n`{req}` is a different effect from `{leaf}`, and may have no handler where `{leaf}` is handled" } else { "" }
+        diag_error_span_label_at_notes("DerivedOpForeignEffect", DERIVED_OP_FOREIGN_EFFECT,
+            "derived operation `{owner.name}` performs `{req}`", site, line, col, end_col, "`{req}` is not `{leaf}`",
+            "move the logic to a plain function that declares the effects it performs\nor make `{parts.get(parts.len() - 1) ?? ""}` a primitive operation, with no body, and implement it in each handler; the clause row of a handler covers other effects{sibling_help}",
+            ["a derived operation body runs at the call site and may perform only the effect it is declared in, `{leaf}`"])
+        return
+    }
+    if owner.decl >= 0 && has_annotation(owner.decl, "pure") != 0 {
+        diag_error_span_label_at_notes("ImpureBodyForPureAnnotation", IMPURE_BODY_FOR_PURE_ANNOTATION,
+            "`@pure` function `{owner.name}` has the effect `{req}`", site, line, col, end_col, "`{op}` needs `{req}`",
+            "remove `@pure`, or pass the value in as an argument", [])
+        return
+    }
+    let declared = if owner.decl >= 0 { tc_er_fn_row(owner.decl) } else { [] }
+    let note = if declared.len() > 0 { "function `{owner.name}` only declares `{declared.join("`, `")}`" } else { "function `{owner.name}` declares no effects" }
+    let help = if req == "Env.Exit" { "for an internal error, call panic(...) and install on_panic in main" } else { "" }
+    diag_error_span_label_at_notes("UndeclaredEffect", UNDECLARED_EFFECT, "insufficient effect capability", site, line, col, end_col,
+        "`{op}` requires effect `{req}`", help, [note])
+    diag_set_last_fix("add effect", req)
+}
+
 fn tc_er_check_call(program: Int, node: Int, held: List[Str], owner: ErOwner) ! TypeCheck.Resolve, Diag.Report {
+    let op_row = tc_handle_op_row(node)
+    if op_row.len() > 0 {
+        let shown = "{node_name(node_obj(node))}.{node_method(node)}"
+        for req in op_row { tc_er_require_op(program, node, held, owner, shown, shown.byte_len(), req) }
+        return
+    }
     let decl = tc_call_decl_node(node)
     if decl < 0 { return }
     match tc_ue_op_root.get(decl) {
@@ -40104,6 +40222,12 @@ fn tc_er_walk(program: Int, node: Int, held: List[Str], owner: ErOwner, kids: Li
         tc_er_walk_msg(program, tc_trace_log_msg(node), held, owner, kids)
         return
     }
+    let suspends = tc_suspension_shown(node)
+    if suspends != "" {
+        // The placeholder name of an unspellable receiver and the `for .. in` form are not source text.
+        let is_source = node_kind(node) != NodeKind.ForIn && !suspends.starts_with("handle.") && !suspends.starts_with("channel.")
+        tc_er_require_op(program, node, held, owner, suspends, if is_source { suspends.byte_len() } else { 0 }, "Async")
+    }
     if k == NodeKind.Call || k == NodeKind.MethodCall {
         tc_er_check_call(program, node, held, owner)
         tc_er_check_fn_values_run(program, node, held, owner)
@@ -40285,7 +40409,7 @@ fn tc_check_effect_rows(program: Int, msg_ran: Set[Int]) ! TypeCheck.Resolve, Di
     // the operation, so the body holds that effect and nothing more.
     for op in effect_derived_ops(program) {
         match tc_ue_op_root.get(op) {
-            Some(ed) => tc_er_walk(program, node_body(op), [tc_er_op_effect(ed, op)], ErOwner { name: "{node_name(ed)}.{node_name(op)}", decl: -1, default_body: false, msg_ran: msg_ran, assigns: assigns }, kids)
+            Some(ed) => tc_er_walk(program, node_body(op), [tc_er_op_effect(ed, op)], ErOwner { name: "{tc_er_op_effect(ed, op)}.{node_name(op)}", decl: -1, default_body: false, msg_ran: msg_ran, assigns: assigns }, kids)
             None => {}
         }
     }
