@@ -1,6 +1,6 @@
 # Blink Language Reference
 
-> Blink is a statically-typed, effect-tracked language compiling to C. **Compiler v0.59.0**.
+> Blink is a statically-typed, effect-tracked language compiling to C. **Compiler v0.60.0**.
 
 ## Install
 
@@ -12,7 +12,7 @@ docker pull ghcr.io/blinklang/blink:latest
 docker run --rm -v "$PWD":/workspace ghcr.io/blinklang/blink run myfile.bl
 ```
 
-Tags: `latest`, `0.59`, `0.59.0` (semver). Image is `debian:bookworm-slim` with `gcc`, `zig`, `blink`, and `libgc-dev`.
+Tags: `latest`, `0.60`, `0.60.0` (semver). Image is `debian:bookworm-slim` with `gcc`, `zig`, `blink`, and `libgc-dev`.
 
 ## Recent Changes
 
@@ -379,6 +379,7 @@ test "addition works" {
 - **`T.name` with no argument list is a function value** for a type-scoped fn (`Duration.ms`), one on a generic type (`Stack.empty`), a trait associated fn (`W.make`, `Int.default`) and one reached through a type parameter (`T.from`). `xs.map(Duration.ms)` works. The type is the declaration's type (`Self` is the head type); a fn's own `[...]` list gives the binders, and the expected type fixes them. When nothing fixes them it is `E0301` at the reference: `let e: fn() -> Stack[Int] = Stack.empty`. `Stack.empty[Int]` with no call is `E0314`. A name that two impls give `T` is `E0522` at the reference, and the help writes a closure: `fn(n) { (Alpha for Widget).make(n) }`; `(Alpha for Widget).make` with no call is not a value. `let s: Stack[Int] = Stack.empty` is `E0300`: call it, `Stack.empty()`. Method syntax does not reach it (§2.12.3).
 - **Two `impl` blocks that can apply to one type for one trait are `E0526 OverlappingImpls`.**
 - **Two module-scope declarations of one name in one namespace are `E1016 DuplicateModuleBinding`** (values: `let`, `const`, `fn`; types: `type`, `alias`, `trait`, `effect`). A `let`, `fn` or type named `Some`, `None`, `Ok` or `Err` is also `E1016`, and so is an import entry that binds one (alias it: `import pal.{Ok as PalOk}`). A name of any other variant is free for a value or a type. A struct named like a variant of an enum in the package or the prelude is `E0518 NameCollision`, also at an import entry that binds it. A bare `Name { ... }` is only a struct literal; write `Enum.Variant { ... }` for the variant.
+- **A declaration of any kind whose name an import binds is `E1012 DuplicateSymbol`:** a listed name, the name after `as`, or a module qualifier. `blink fix` drops a listed name from a plain import; when the list empties it leaves `import alpha`, or removes the line if nothing resolves through the qualifier.
 - **Two `test` or `test.failing` blocks of one module with the same name are `E0851 DuplicateTestName`.** Names compare by `Str` value after escapes decode, so `"ab"` and `"a\u{62}"` collide. `blink check` reports it, with the span on the later name and a label on the first. A `fn`, `let` or `type` of the same text does not collide. The help is `give each test its own name`.
 - **A local named `Some`, `None`, `Ok` or `Err` hides the prelude variant and warns `W1011 ShadowedVariant`.**
 - **A selective import of a name that the module does not declare is `E1023 UnknownImportName`** (`import other.{x, nothre}`; also `pub import`). The compiler reports it when it reads the import, used or not, with the span on the listed name. The help names the nearest `pub` item or `pub import` name of the module, or lists the candidates. A name that the module declares without `pub` is `E1003`. The entry gets no `W0602`, and a use of the name gets no `E0504`, `E0507` or `E1006`. With one suggestion, the fix renames the listed name and every use that resolves to it; with an alias (`nothre as n`) it renames the listed name only.
@@ -493,7 +494,7 @@ let text = #"{{x}}"#                    // a lone { is text: "{{x}}"
 | ~~`process_run(cmd, args)`~~ | — | **Removed** — use `process.run(cmd, args)` (effect `Process.Spawn`); a bare call is E0504 |
 | ~~`process_run_with_stdin(cmd, args, input)`~~ | — | **Removed** — use `process.run(cmd, args, stdin: Some(input))`; a bare call is E0504 |
 | ~~`process_exec(cmd, args)`~~ | — | **Removed** — use `process.exec(cmd, args)` (effects `Process.Spawn`, `Env.Exit`); a bare call is E0504 |
-| ~~`process_spawn(cmd, args)`~~ | — | **Removed** — use `process.spawn(cmd, args)`, which returns a `Child`; a bare call is E0504 |
+| ~~`process_spawn(cmd, args)`~~ | — | **Removed** — use `process.spawn(cmd, args)`, which returns `Result[Child, ProcessError]`; a bare call is E0504 |
 | ~~`process_pid_wait(pid)`~~ | — | **Removed** — use `process.wait(child)`; a bare call is E0504 |
 | ~~`process_pid_kill(pid, sig)`~~, ~~`process_pid_send_signal(pid, sig)`~~ | — | **Removed** — use `process.signal(child, sig)` (effect `Process.Signal`); a bare call is E0504 |
 | ~~`exit(code)`~~ | — | **Removed** — use `env.exit(code)` (effect `Env.Exit`); a bare `exit(code)` is E0504 |
@@ -502,7 +503,7 @@ let text = #"{{x}}"#                    // a lone { is text: "{{x}}"
 | `unreachable()` | Never | Mark code that must not run; panics |
 | ~~`arg_count()`~~, ~~`get_arg(idx)`~~ | — | **Removed** — use `env.args()` (effect `Env.Read`), which returns `List[Str]`; a bare call is E0504 |
 | `time_ms()` | Int | Current time in milliseconds |
-| `getpid()` | Int | Process ID |
+| `getpid()` | Int | Process ID. Skips any `Env` handler; use `env.pid()` (effect `Env.Read`). `getpid` will be removed in a later release |
 | `str_from_code_point(n)` | Str | Convert char code to 1-char string (was `str_from_char_code`) |
 | `unix_socket_listen(path)` | Int | Listen on Unix domain socket; -1 on failure, and for a path longer than a socket address holds (107 bytes on Linux) |
 | `unix_socket_connect(path)` | Int | Connect to Unix domain socket; -1 on failure, and for a path longer than a socket address holds |
@@ -975,7 +976,7 @@ displays as `exit 3`, `signal SIGSEGV` or `limit timeout`.
 ## Process Child
 
 `Child` is opaque, has no methods, and implements `Eq`, `Hash` and `Debug`. A handler
-makes one with `Child.mock(id)` ("made by a handler", not "test only"). No getter reads
+makes one with `Child.mock(id)` ("made by a handler", not "test only"; not built yet in v0.60.0: a call is an internal error). No getter reads
 the key or the pid. A real `Child` prints as `Child(pid 4211)`, and `Child(pid 4211, ended)`
 after a wait reaped it. That text changes from run to run: never parse or compare it.
 
@@ -1278,7 +1279,7 @@ Selective imports (`import mod.{a, b}`) restrict which *unqualified* items are v
 | `@ensures(expr)` | fn | Postcondition (`result` = return value). Needs `@verify(fallback: ...)` on the fn, or it is `V0003 ContractUnverifiable`; with `"runtime"` it is checked at every return. Inside the predicate, `old(arg)` snapshots an argument's value at fn entry. |
 | `@where(expr)` | fn, type | Type constraint; on a fn, runtime-checked at param/return coercion |
 | `@invariant(expr)` | type | Type invariant |
-| `@pure` | fn | No effects, no mutation, no FFI; may only call other `@pure` fns. Recursion allowed. |
+| `@pure` | fn | No effects, no mutation, no FFI; may only call other `@pure` fns. Recursion allowed. A handle operation (`io.println`, `fs.write`, ...) in a `@pure` fn is E1307. A derived operation body may call only operations of its own leaf effect (E0557). |
 | `@modifies(...)` | fn | Reserves syntax for the future SMT backend (parses-and-validates only) |
 | `@ffi("lib", "sym")` | fn | FFI binding — link to C function |
 | `@trusted` | fn | FFI audit marker — function reviewed for safety |
@@ -1382,6 +1383,12 @@ An operation can have a default body in the effect declaration (`fn b() { ... }`
 import std.testing.{stdin_from}
 with stdin_from("1\n2") { /* code that reads stdin sees "1\n2" */ }
 ```
+
+**Rows with `_`:**
+
+- A `_` in a row needs a source: a type parameter whose bound has a method with a `_` row (`T: Closeable`). Else it is `E0551 UnsourcedEffectWildcard`. A `_` in a trait method declaration needs no source.
+- An impl method's row may not be wider than its trait method's row (`E0904 TraitContractEffectMismatch`). Give the trait method `! _` to let each impl choose.
+- A generic fn that calls `t.close()`, or holds `with t`, through a `Closeable` or `BlockHandler` bound must declare `! _` (E0500).
 
 ## `with` Items, `as`, and Closeable
 
@@ -1562,7 +1569,7 @@ show(42)          // "42"
 | `std.num` | `parse_int`, `parse_float`, `int_to_str`, `float_to_str` |
 | `std.sb` | StringBuilder extensions |
 | `std.bytes` | Bytes type operations |
-| `std.time` | Duration/Instant constructors and methods |
+| `std.time` | Duration/Instant constructors and methods; `Monotonic` (`time.monotonic()`, `Monotonic.from_offset(d)`, `b.since(a) -> Duration`) |
 | `std.traits` | Core traits: `Closeable`, `BlockHandler`, `Sized`, `Contains`, `From[T]`, `Into[T]`, `TryFrom[T]`, `ConversionError`, `StrOps`, `ListOps`, `MapOps`, `SetOps`, `BytesOps`, `StringBuildOps`, `Joinable`. `Sized` is the canonical length / emptiness trait — `Str`, `List`, `Map`, `Set`, `Bytes`, and `StringBuilder` all provide it (uniform `.len()` / `.is_empty()`). |
 
 Run `blink doc <module>` for full documentation (e.g. `blink doc std.args`).
@@ -1579,6 +1586,7 @@ Run `blink doc --list` to list available modules.
 - An arm that the unguarded arms above it already cover is warning `UnreachableArm` (W0710): an arm after `_`, or a repeated variant, `true`, `false` or literal. Remove it or move it above. It never reports a live arm and may miss a dead one
 - List patterns in `match` ALWAYS need a wildcard `_` or rest `...` arm — finite patterns can't cover unbounded lists
 - `(0..3) == (0..=2)` is `false`: `==` on ranges compares start, end and kind (`..` or `..=`), not the elements. Collect both sides to compare elements: `let a: List[Int] = (0..3).into_iter().collect()`. `Range[T]` is `Eq` for every `T`, and `Debug` and `Clone` when `T` is. It has no `Hash` (E1400 as a `Map` key or `Set` element), no `Ord` and no `Display` (E0523).
+- A range with no end or no start (`0..`, `..5`) is E1100. `0..<n` gets a fix and `0...n` gets help. `0..1..2` is E1141. `@derive(Hash)` or `@derive(Ord)` over a `Range` field is E1401.
 - `let mut` required for any variable you want to reassign. In a pattern, `mut` goes on each name: `let (mut x, y) = pair`, not `let mut (x, y) = pair`
 - Function args separated by commas in calls, but by newlines in multi-line definitions
 - `assert`, `assert_eq`, `assert_ne` only available inside `test` blocks and debug mode
@@ -1618,6 +1626,7 @@ build/blink check src/main.bl --format json
 # A file the front end accepts can fail a later step; it then has one diagnostic for the step:
 # I0017 the generated C did not compile (ice), E0857 the link failed, E0858 a native dependency
 # did not build. Its notes hold the tool's output (cut at 200 lines, the last note says so).
+# I0018: a test build failed and printed no diagnostic. I0021 CompilerPanic: a panic in blink or blinkc (exit 101).
 build/blink test --json
 # Human output: dots, then BUILD FAILED <file> and its diagnostics, ABORTED <file> and how it
 # ended, and the output of a failed file (of every file with --verbose). The summary line:
