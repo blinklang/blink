@@ -1821,39 +1821,36 @@ fn parser_limit_stop(message: Str) {
 // concurrency or stale-id corruption nearly impossible to diagnose from
 // a CI log.
 fn node_die(id: Int, where: Str) {
-    // Forensic dump for the node-index race: opt-in via BLINK_PARSER_PANIC_DUMP=1 so normal
-    // panic output is unchanged in CI but the next sighting captures enough
-    // state to localize the race.
-    let dump = env.var("BLINK_PARSER_PANIC_DUMP") ?? ""
-    if dump != "" {
-        let nlen = columns.count
-        let sl_len = sublists.start.len()
-        io.eprintln("parser-dump: pos={pos} src='{diag_source_file}' sublists.len={sl_len}")
-        // Tail of the node pool — last 32 kinds + line:col, oldest first.
-        let mut start = nlen - 32
-        if start < 0 { start = 0 }
-        let mut i = start
-        while i < nlen {
-            let nk = columns.kind.get(i).unwrap()
-            let nl = node_get_int(i, columns.at_line, node_blank.line)
-            let nc = node_get_int(i, columns.at_col, node_blank.col)
-            io.eprintln("parser-dump: node[{i}] kind={node_kind_name(nk)} line={nl} col={nc}")
-            i = i + 1
-        }
-        // Largest sublist sizes — useful if a sublist length looks insane.
-        let mut j = 0
-        let mut max_sl = 0
-        let mut max_sl_idx = -1
-        while j < sl_len {
-            let l = sublists.len.get(j).unwrap()
-            if l > max_sl {
-                max_sl = l
-                max_sl_idx = j
-            }
-            j = j + 1
-        }
-        io.eprintln("parser-dump: max_sublist_len={max_sl} at_index={max_sl_idx}")
+    // Forensic dump for the node-index race: opt-in through the trace channel, so normal panic
+    // output is unchanged in CI, every node accessor stays rowless, and the next sighting
+    // captures enough state to localize the race.
+    let nlen = columns.count
+    let sl_len = sublists.start.len()
+    trace.log("blink.parser_dump", "pos={pos} src='{diag_source_file}' sublists.len={sl_len}")
+    // Tail of the node pool — last 32 kinds + line:col, oldest first.
+    let mut start = nlen - 32
+    if start < 0 { start = 0 }
+    let mut i = start
+    while i < nlen {
+        let nk = node_kind_name(columns.kind.get(i).unwrap())
+        let nl = node_get_int(i, columns.at_line, node_blank.line)
+        let nc = node_get_int(i, columns.at_col, node_blank.col)
+        trace.log("blink.parser_dump", "node[{i}] kind={nk} line={nl} col={nc}")
+        i = i + 1
     }
+    // Largest sublist sizes — useful if a sublist length looks insane.
+    let mut j = 0
+    let mut max_sl = 0
+    let mut max_sl_idx = -1
+    while j < sl_len {
+        let l = sublists.len.get(j).unwrap()
+        if l > max_sl {
+            max_sl = l
+            max_sl_idx = j
+        }
+        j = j + 1
+    }
+    trace.log("blink.parser_dump", "max_sublist_len={max_sl} at_index={max_sl_idx}")
     parser_limit_stop("parser: {where}({id}) out of bounds; nodes.len()={columns.count}")
 }
 
@@ -2921,7 +2918,7 @@ fn parse_annotation() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
 // Dev knob: BLINK_DEV_PARSER_LIMIT=<name> stops the parse of a file that holds the identifier
 // <name> as a parser internal limit does. No source program reaches a limit, so a test makes a
 // daemon or language server meet one with this.
-fn parser_dev_limit() {
+fn parser_dev_limit() ! Env.Read {
     let name = env.var("BLINK_DEV_PARSER_LIMIT") ?? ""
     if name == "" { return }
     let mut i = 0
@@ -2933,7 +2930,7 @@ fn parser_dev_limit() {
     }
 }
 
-pub fn parse_program() -> Int ! Parse, Diag.Report {
+pub fn parse_program() -> Int ! Parse, Diag.Report, Env.Read, IO.Eprint {
     parser_dev_limit()
     if trace_mode != "" { phase_trace("parse", "start ({tokens.kinds.len()} tokens)") }
     let mut fn_nodes: List[Int] = []
