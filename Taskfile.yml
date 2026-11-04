@@ -787,6 +787,51 @@ tasks:
       - task: gen1
       - WARNING_GATE_BLINK={{.BUILD_DIR}}/gen1/bin/blink ./scripts/check_build_warnings.sh
 
+  # The shrink check reads history, which no checksum here hashes, so it always
+  # runs. The sweep's result is a function of its sources, so it can skip.
+  check-clean:
+    desc: Fail when a program that passes blink check does not build, and when the known-failure list grows (spec 6.7)
+    silent: true
+    cmds: *capped
+
+  __check-clean:
+    internal: true
+    label: check-clean
+    silent: true
+    cmds:
+      - task: gen1
+      - ./scripts/check_clean_shrink.sh
+      # A file, as a task source can only hash a file; the row proves that an
+      # executable exists, and that depends on cc.
+      - cc --version > {{.BUILD_DIR}}/check_clean.cc
+      - task: __check-clean-sweep
+      # task prints nothing for a skip, and a gate log must show the row's result.
+      - 'echo "check-clean: last sweep of these sources: $(cat {{.BUILD_DIR}}/check_clean.result)"'
+
+  __check-clean-sweep:
+    internal: true
+    label: check-clean-sweep
+    silent: true
+    sources:
+      - tests/check_clean/**/*
+      - examples/**/*
+      - scripts/check_clean_known_failures.txt
+      - scripts/check_clean.sh
+      - scripts/capped.sh
+      - '{{.BUILD_DIR}}/gen1/bin/blink'
+      - '{{.BUILD_DIR}}/gen1/bin/blinkc'
+      - '{{.BUILD_DIR}}/gen1/share/blink/libblink_std.a'
+      - '{{.BUILD_DIR}}/gen1/share/blink/runtime.h'
+      - '{{.BUILD_DIR}}/check_clean.cc'
+    generates:
+      - '{{.BUILD_DIR}}/check_clean.result'
+    cmds:
+      # task writes its checksum before the first cmd. A hard kill leaves it there,
+      # and an old result would then read as a pass on sources no sweep judged. With
+      # no result, the next run sweeps.
+      - rm -f {{.BUILD_DIR}}/check_clean.result
+      - CHECK_CLEAN_BLINK={{.BUILD_DIR}}/gen1/bin/blink CHECK_CLEAN_RESULT={{.BUILD_DIR}}/check_clean.result ./scripts/check_clean.sh
+
   # Docs only, no compiler: it reads sections/, ERROR_CATALOG.md, llms*.md and src/diagnostics.bl.
   spec-refs:
     desc: Fail on any section ref in sections/, ERROR_CATALOG.md, llms*.md or src/diagnostics.bl that names no numbered heading, printing each site
@@ -865,16 +910,19 @@ tasks:
     deps: [gen1, ratchet, __gate-selftests]
 
   # ci's first stage: the same deps as __gen1-ratchet-and-selftests, with the
-  # corpus after gen1 in place of gen1 alone. The self-tests outlast gen1 and
-  # the corpus reads nothing they write (each works in a temp tree of its own),
-  # so the corpus does not wait on them. failfast stops the rest when one fails,
-  # so a red self-test fails ci in seconds and not after the sweep; corpus.sh
-  # stops its sweep on task's interrupt.
+  # corpus after gen1 in place of gen1 alone, and the check-clean row. The
+  # self-tests outlast gen1 and the corpus reads nothing they write (each works in
+  # a temp tree of its own), so the corpus does not wait on them. failfast stops
+  # the rest when one fails, so a red self-test fails ci in seconds and not after
+  # the sweep; corpus.sh and check_clean.sh stop their sweeps on task's interrupt.
+  # check-clean stays out of the stamped step: the shrink check reads history, and
+  # the input stamp hashes only the tree. So a stamp hit, which skips the corpus,
+  # still rebuilds gen1 for the row.
   __ci-corpus-ratchet-and-selftests:
     internal: true
     silent: true
     failfast: true
-    deps: [ratchet, __gate-selftests, __ci-corpus]
+    deps: [ratchet, __gate-selftests, __ci-corpus, check-clean]
 
   # The sweep is the slow part of ci and depends only on the tree, the pinned
   # compiler and the CORPUS_* settings (the tree minus the doc-only paths the stamp
@@ -931,6 +979,7 @@ tasks:
         ./scripts/test_lint_commit_messages.sh
         ./scripts/test_release_notes.sh
         ./scripts/test_check_build_warnings.sh
+        ./scripts/test_check_clean.sh
         ./scripts/test_capped.sh
         ./scripts/test_capped_child.sh
         ./scripts/test_gate_budget.sh
@@ -962,13 +1011,15 @@ tasks:
   #       run the suites again; ci-fast does, as it has no full corpus
   #   (g) last, the size of the probe dirs (scripts/scratch.sh check): a line
   #       past its limit or on tmpfs, never a failure
+  #   (h) beside (c): a program that passes check must build, and the
+  #       known-failure list only shrinks (check-clean)
   # (c)'s sweep, (d) and (e) skip when the input stamp matches (the stamp
   # hashes the tree, so the same tree already passed them); the checks that
   # read corpus.json still run.
   # No self-host regen here: the rewrite cannot self-host until it is done.
   # gen0 runs first: its provenance check is cheap and rebuilds a stale pin.
   ci:
-    desc: CI gate (gen0 compiles src, full corpus passes, lint, fmt goldens, no compiler-build warning, suite files pass in the corpus)
+    desc: CI gate (gen0 compiles src, full corpus passes, lint, fmt goldens, no compiler-build warning, check-clean programs build, suite files pass in the corpus)
     silent: true
     cmds: *capped
 
@@ -1003,6 +1054,7 @@ tasks:
     cmds:
       - task: __gen1-ratchet-and-selftests
       - task: warning-gate
+      - task: check-clean
       - task: __blink-test-caps
       - task: corpus-sample
       - task: __fmt-goldens

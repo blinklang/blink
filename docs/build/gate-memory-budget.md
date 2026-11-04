@@ -116,7 +116,8 @@ or the worker count when a caller sets more workers than B.
 | `BLINK_JOBS` for each `blink test` worker | Taskfile `__test`, `__ci-monolith`, `__ci-profile` | `inner_jobs.sh JOBS`: 1 (the CLI alone uses `nproc`) |
 | `parallel -j` in the fmt stage | Taskfile `__fmt-goldens`, `__ci-profile` | `JOBS`: 12 |
 | `BLINK_JOBS` for each fmt worker | Taskfile `__fmt-goldens`, `__ci-profile` | `inner_jobs.sh JOBS`: 1 |
-| `GC_MARKERS` | `corpus.sh`, `__fmt-goldens`, `__test`, `__ci-monolith`, `__ci-profile` | 1 (the CLI alone does not set it, so Boehm starts one marker per CPU) |
+| `GC_MARKERS` | `corpus.sh`, `check_clean.sh`, `__fmt-goldens`, `__test`, `__ci-monolith`, `__ci-profile` | 1 (the CLI alone does not set it, so Boehm starts one marker per CPU) |
+| check-clean workers | `scripts/check_clean.sh` | 4, or B when B is smaller, each at `BLINK_JOBS=1` |
 | `cc -flto` jobs for each gen1 link | `scripts/gen1.sh` | B; the two links run at once, 2B for about 10 s |
 | ratchet commit walk | `scripts/lint_codegen.sh` | B subshells |
 
@@ -145,8 +146,8 @@ Where stages run at once, their workers add:
 - `task ci` first runs gen1 (two links, 2B for about 10 s) beside the ratchet's commit walk
   (B) and the gate self-tests (about 15 processes): about 3B at the peak.
 - Then it starts the corpus (B workers) beside the fmt goldens (B workers) and the warning
-  gate (two `blink check` processes, each with one Boehm marker per CPU). At most this is
-  2B + 2 processes. In practice the two fan-outs do not overlap: the corpus first builds
+  gate (two `blink check` processes, each with one Boehm marker per CPU). The check-clean
+  row adds at most 4 workers for a few seconds. At most this is 2B + 6 processes. In practice the two fan-outs do not overlap: the corpus first builds
   its compiler archive on one core, and the goldens end before its workers start.
 - Two gates in two worktrees at the same time double all of this. The slice holds the sum
   only when both run in it.
@@ -206,7 +207,7 @@ re-runs itself through it: `bootstrap`, `regen`, `gen0`, `gen1`, `build-cli`, `b
 `compile-test`, `test`, `test-fmt`, `test-installed`, `test-sqlite-peel`, `fuzz`,
 `bench`, `build-binaries`, `ci`, `ci-fast`, `ci-release`, `ci-monolith`,
 `ci-per-module-checks`, `ci-profile`, `corpus`, `corpus-per-module`, `corpus-sample`,
-`corpus-only`, `warning-gate`, `typecheck-suite` and `rewrite-suite`. The task `<name>`
+`corpus-only`, `warning-gate`, `check-clean`, `typecheck-suite` and `rewrite-suite`. The task `<name>`
 holds only the re-run; its steps are in the internal task `__<name>`.
 `test-bootstrap-cold` has no re-run: its one heavy step is its `build-cli` dep, which caps
 itself, and the rest is one `nm`.
