@@ -10,7 +10,7 @@
 // result, or an unbuilt stage looks like a program that legitimately emits nothing.
 
 import diagnostics.{
-    Diag, diag_ice, diag_ice_at, diag_ice_count, diag_ice_stage_not_built, UNSOLVED_TYPEVAR_AT_CODEGEN,
+    Diag, diag_ice, diag_ice_at, diag_ice_count, UNSOLVED_TYPEVAR_AT_CODEGEN,
     UNVERIFIED_IR_AT_PRINT, TYPEDEF_QUEUED_NOT_WRITTEN, TWO_DECLARATIONS_ONE_C_SYMBOL,
 }
 import cname.{
@@ -51,7 +51,7 @@ import cg_derive.{
 }
 import ir.{ir_begin_body, ir_block, ir_note_source, ir_pos_begin, ir_pos_take, ir_reset, ir_sources_pause, ir_sources_resume, ir_span, ir_verify}
 import mono.{instances, named_instance_rows, program_calls_trace_log, program_spawns, set_named_instance_rows}
-import typecheck.{TYPE_INT, TYPE_VOID, TyKind, tc_enter_body_module, tc_program_has_panic_hook, tc_impl_is_poly_conversion, tc_leave_body_module, tc_resolve, tc_tid_kind}
+import typecheck.{TYPE_INT, TYPE_VOID, TyKind, tc_enter_body_module, tc_program_has_panic_hook, tc_leave_body_module, tc_resolve, tc_tid_kind}
 import cg_stmt.{
     PANIC_HOOK_ADAPTER, PanicHookAdapter, cg_stmt_panic_hook_adapter, cg_stmt_reset, cg_stmt_set_debug_mode, lower_block, lower_block_returning, lower_fn,
     lower_global_init,
@@ -248,10 +248,13 @@ fn emit_instance_decls(decl: Int, is_static: Bool) ! Diag.Report {
 // One body per instance, under the instance's own name and its substituted types. The
 // instance is current only for the lowering and the signature that wraps it, and the root
 // is restored immediately after so nothing later reads a declaration through an instance.
+//
+// No row is not a gap here: a type argument comes only from a site that reaches the
+// declaration, so with none there is no copy to write. A site that does reach it asks for
+// its own instance and stops there when the pass recorded none (cc_instance_name), which
+// also catches a site whose instance is missing while other instances exist.
 fn emit_instance_bodies(decl: Int, is_static: Bool) ! Diag.Report {
-    let rows = instance_rows_of(decl)
-    if rows.len() == 0 { return no_instance_bodies(decl) }
-    for row in rows { emit_instance_body(decl, row, is_static) }
+    for row in instance_rows_of(decl) { emit_instance_body(decl, row, is_static) }
 }
 
 fn emit_instance_body(decl: Int, row: Int, is_static: Bool) ! Diag.Report {
@@ -335,21 +338,6 @@ fn rows_by_c_name(rows: List[Int]) -> List[Int] {
 // definitions of one external symbol do not link, so those copies are internal.
 fn instance_is_private_copy(cfg: CgConfig, decl: Int) -> Bool {
     cfg.skip_modules.contains_key(cg_reg_module_of(decl))
-}
-
-// A generic declaration the mono pass registered no instance for. For a free function
-// that means nothing called it: there is no body to write and no caller left undefined,
-// so this is not a gap. For a method it means the pass did not monomorphize the impl it
-// belongs to and no single body is right either, so the body a call needs is written
-// nowhere and this stage must say so rather than emit nothing and leave the name to fail
-// at link. A From or TryFrom impl with binders is the exception: a call is the only way to
-// reach its method, and the mono pass registers an instance at every call, so one with no
-// instance is one nothing calls (a call that found none stops at cc_instance_name).
-fn no_instance_bodies(decl: Int) ! Diag.Report {
-    let im = cg_reg_impl_of(decl)
-    if im >= 0 && !tc_impl_is_poly_conversion(im) {
-        diag_ice_stage_not_built("cg generic impl method bodies", decl)
-    }
 }
 
 // Every global in `globals`' initializer, lowered through the same expression seam as any

@@ -8,13 +8,13 @@
 // the pass never registers, and the body a live call needs is written nowhere.
 //
 // The disagreement is not a missing body alone. A method whose binder is named in a
-// signature has no single correct body either, and for those the body stage must still
-// say so rather than leave the symbol to fail at link.
+// signature has no single correct body either. The stage that names such a method must
+// say so when it has no instance, rather than leave the symbol to fail at link.
 
 import std.io
 import layout.{layout_reset}
 import cname.{cname_reset, c_impl_method_name}
-import cg_test_helpers.{cg_probe_compile, cg_probe_ices_naming}
+import cg_test_helpers.{cg_probe_compile, cg_probe_ices_named, cg_probe_ices_naming}
 import cg.{CgConfig, generate}
 import cg_reg.{cg_reg_impl_methods, cg_reg_impl_of}
 import mono.{run_mono, instances, is_poly_impl, poly_impl_is_element_agnostic}
@@ -232,4 +232,106 @@ fn instance_symbols(mname: Str) -> List[Str] {
         }
     }
     out
+}
+
+// A method no call reaches has no row, and a body stage with no row has nothing to write.
+// It cannot ask for a row to make one, because no type argument exists to make it with.
+test "a generic impl method no call reaches is written nowhere and reported never" {
+    let stem = "cg_pim_unreached"
+    let program = probe(stem, #"type Box[T] {
+    v: T
+}
+
+trait Sz {
+    fn sz(self) -> Int
+    fn unreached(self) -> Int
+}
+
+impl[T] Sz for Box[T] {
+    fn sz(self) -> Int { 1 }
+    fn unreached(self) -> Int { 2 }
+}
+
+fn main() {
+    assert(Box { v: 1 }.sz() == 1)
+}
+"#)
+    let text = generate(program, standalone_cfg())
+    assert_eq(cg_probe_ices_naming(BODY_GAP), 0)
+    assert_eq(instance_symbols("sz").len(), 1)
+    assert_eq(instance_symbols("unreached").len(), 0)
+    assert_eq(definitions_of(text, method_symbol("unreached")), 0)
+    assert(!text.contains(method_symbol("unreached")))
+}
+
+// An interpolation reaches the dispatcher beside `fmt`, by a name that takes no instance.
+// The pass registers no instance for that site yet. With no body to call, the site itself
+// must stop, because the body stage reads "no row" as "no call" and writes nothing.
+test "a site that names a dispatcher with no instance stops at that site" {
+    let stem = "cg_pim_display_reached"
+    let program = probe(stem, #"type Box[T] {
+    v: T
+}
+
+impl[T] Display for Box[T] {
+    fn fmt(self, sb: StringBuilder) { sb.write("box") }
+}
+
+fn main() {
+    let b = Box { v: 1 }
+    let s = "{b}"
+    assert(s == "box")
+}
+"#)
+    generate(program, standalone_cfg())
+    assert_eq(cg_probe_ices_named("CodegenStageNotBuilt"), 1)
+    assert_eq(cg_probe_ices_naming("Display of a generic type"), 1)
+    assert_eq(cg_probe_ices_naming(BODY_GAP), 0)
+}
+
+// The with stage names enter and exit by the name of the impl, with no instance.
+test "a with-item whose handler method takes its own type parameter stops at that site" {
+    let stem = "cg_pim_handler_own_binder"
+    let program = probe(stem, #"type P {
+    v: Int
+}
+
+impl BlockHandler for P {
+    type Context = Int
+    fn enter[U](self) -> Int { self.v }
+    fn exit(self, ok: Bool) { }
+}
+
+fn main() {
+    with P { v: 1 } as b {
+        assert(b == 1)
+    }
+}
+"#)
+    generate(program, standalone_cfg())
+    assert_eq(cg_probe_ices_named("CodegenStageNotBuilt"), 1)
+    assert_eq(cg_probe_ices_naming("BlockHandler method has its own type parameter"), 1)
+    assert_eq(cg_probe_ices_naming(BODY_GAP), 0)
+}
+
+// An operator reaches its method through the symbol of the impl, which a per-instance body
+// never defines.
+test "an operator whose method takes its own type parameter stops at that site" {
+    let stem = "cg_pim_operator_own_binder"
+    let program = probe(stem, #"type P {
+    v: Int
+}
+
+impl Eq for P {
+    fn eq[U](self, o: P) -> Bool { self.v == o.v }
+}
+
+fn main() {
+    let a = P { v: 1 }
+    assert(a == a)
+}
+"#)
+    generate(program, standalone_cfg())
+    assert_eq(cg_probe_ices_named("MonoInstanceNotRegistered"), 1)
+    assert_eq(cg_probe_ices_naming(BODY_GAP), 0)
 }
