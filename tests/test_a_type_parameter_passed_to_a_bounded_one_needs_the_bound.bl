@@ -1,0 +1,83 @@
+// Inside a generic body a type parameter has only the traits of its own bounds. A call that
+// passes a bare `T` where the callee's binder has a bound that `T` does not have is E0306 at
+// the call, whether or not code calls the body, and whatever type a caller gives `T`
+// (section 6.3.3). The help names the bound to add.
+
+import compile_test_helpers.{compile_and_capture, expect_compiles_clean}
+
+let SH = "trait Sh \{\n    fn sh(self) -> Int\n\}\nfn h[U: Sh](u: U) -> Int \{\n    u.sh()\n\}\n"
+let MAIN = "fn main() \{\n    io.println(\"hi\")\n\}\n"
+
+fn count(output: Str, code: Str) -> Int {
+    output.split("\"code\":\"{code}\"").len() - 1
+}
+
+test "a forward in a function that no code calls is E0306 with the bound as the help" {
+    let src = "{SH}fn g[T](x: T) -> Int \{\n    h(x)\n\}\n{MAIN}"
+    let out = compile_and_capture(src, "_fwd_uncalled")
+    assert_eq(count(out, "E0306"), 1, out)
+    assert(out.contains("`T` does not satisfy the Sh bound on type parameter U of h: `T` has no Sh bound"), out)
+    assert(out.contains("write the bound on the binder: `[T: Sh]`"), out)
+    assert(out.contains("`h` declares `U: Sh` at "), out)
+}
+
+test "a forward is E0306 even when each caller passes a type that has the bound" {
+    let src = "{SH}impl Sh for Int \{\n    fn sh(self) -> Int \{\n        self\n    \}\n\}\nfn g[T](x: T) -> Int \{\n    h(x)\n\}\nfn main() \{\n    io.println(\"\{g(2)\}\")\n\}\n"
+    let out = compile_and_capture(src, "_fwd_called")
+    assert_eq(count(out, "E0306"), 1, out)
+}
+
+test "a compiler-known bound is judged the same way" {
+    let src = "fn h[U: Ord](u: U) -> Bool \{\n    u < u\n\}\nfn g[T](x: T) -> Bool \{\n    h(x)\n\}\n{MAIN}"
+    let out = compile_and_capture(src, "_fwd_ord")
+    assert_eq(count(out, "E0306"), 1, out)
+    assert(out.contains("`[T: Ord]`"), out)
+}
+
+test "a parameter with other bounds gets a help that adds to them" {
+    let src = "{SH}fn g[T: Eq](x: T) -> Int \{\n    h(x)\n\}\n{MAIN}"
+    let out = compile_and_capture(src, "_fwd_other_bound")
+    assert_eq(count(out, "E0306"), 1, out)
+    assert(out.contains("write ` + Sh` on the bound list of `T`"), out)
+}
+
+test "a parameter whose bounds give the trait passes, also through a supertrait" {
+    let src = "{SH}fn g[T: Sh](x: T) -> Int \{\n    h(x)\n\}\nfn q[U: Eq](u: U) -> Bool \{\n    u == u\n\}\nfn r[T: Ord](x: T) -> Bool \{\n    q(x)\n\}\nimpl Sh for Int \{\n    fn sh(self) -> Int \{\n        self\n    \}\n\}\nfn main() \{\n    io.println(\"\{g(2)\} \{r(1)\}\")\n\}\n"
+    let out = compile_and_capture(src, "_fwd_bounded")
+    expect_compiles_clean(out, "a forward that the bounds allow")
+}
+
+// A parameter inside a type argument, as `List[T]` where the callee asks `U: Sh`, is not judged
+// at the call today. Whether an impl such as `impl[V: Sh] Sh for List[V]` makes that call an
+// error in the body is an open question for the spec. This test holds the current result
+// until the spec settles it.
+test "a parameter inside a type argument is not judged at the call" {
+    let src = "{SH}impl[V: Sh] Sh for List[V] \{\n    fn sh(self) -> Int \{\n        self.len()\n    \}\n\}\nfn g[T](x: T) -> Int \{\n    h([x])\n\}\n{MAIN}"
+    let out = compile_and_capture(src, "_fwd_nested")
+    assert_eq(count(out, "E0306"), 0, out)
+}
+
+// An impl's `where` clause bounds the parameter from a frame of its own, beside the frame of
+// the inline bounds, so both give the parameter its traits.
+test "an impl parameter with one bound inline and one in a where clause has both" {
+    let traits = "{SH}trait Eqq \{\n    fn eqq(self) -> Int\n\}\n"
+    let in_impl = "trait Box2[T] \{\n    fn go(self, a: T) -> Int\n\}\nimpl[T: Sh] Box2[T] for List[T] where T: Eqq \{\n    fn go(self, a: T) -> Int \{\n        h(a) + a.eqq()\n    \}\n\}\n"
+    let out = compile_and_capture("{traits}{in_impl}{MAIN}", "_fwd_where_and_inline")
+    expect_compiles_clean(out, "a forward that an inline bound allows beside a where clause")
+}
+
+let CONV = "trait Conv[X] \{\n    fn conv(self) -> X\n\}\nfn want[U: Conv[Int]](u: U) -> Int \{\n    u.conv()\n\}\n"
+
+test "a bound with trait arguments needs the same arguments" {
+    let src = "{CONV}fn have[T: Conv[Str]](x: T) -> Int \{\n    want(x)\n\}\n{MAIN}"
+    let out = compile_and_capture(src, "_fwd_trait_args_differ")
+    assert_eq(count(out, "E0306"), 1, out)
+    assert(out.contains("`T` does not satisfy the Conv[Int] bound on type parameter U of want: `T` has no Conv[Int] bound"), out)
+    assert(out.contains("write ` + Conv[Int]` on the bound list of `T`"), out)
+}
+
+test "a bound with the same trait arguments passes, also beside other arguments" {
+    let src = "{CONV}fn have[T: Conv[Int]](x: T) -> Int \{\n    want(x)\n\}\nfn both[T: Conv[Str] + Conv[Int]](x: T) -> Int \{\n    want(x)\n\}\n{MAIN}"
+    let out = compile_and_capture(src, "_fwd_trait_args_same")
+    expect_compiles_clean(out, "a forward whose bound has the arguments the callee asks for")
+}
