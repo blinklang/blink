@@ -639,3 +639,52 @@ fn main() {
     }
     assert_eq(seen, 2)
 }
+
+// A type with two instances of one generic trait has one impl per instance, and a call
+// through a bound runs only the impl of the instance the bound names. The mono pass and
+// the body stage each choose that impl, so each impl must have its own one row, and the
+// call the body stage writes must reach that row: a stage that chose the other impl would
+// call a symbol the pass never registered.
+test "a call through a bound on a type with two instances reaches the impl mono chose" {
+    let stem = "cg_pim_two_instances"
+    let program = probe(stem, #"trait Conv[U] {
+    fn conv(self) -> U
+}
+
+type Box[T] {
+    v: T
+}
+
+impl[T] Conv[List[T]] for Box[T] {
+    fn conv(self) -> List[T] { [self.v] }
+}
+
+impl[T] Conv[Int] for Box[T] {
+    fn conv(self) -> Int { 42 }
+}
+
+fn as_int[X: Conv[Int]](x: X) -> Int { x.conv() }
+fn as_strs[X: Conv[List[Str]]](x: X) -> List[Str] { x.conv() }
+
+fn main() {
+    assert(as_int(Box { v: "s" }) == 42)
+    assert(as_strs(Box { v: "s" }).len() == 1)
+}
+"#)
+    let text = generate(program, standalone_cfg())
+    assert_eq(stops(), 0)
+    let mut impls = 0
+    for m in cg_reg_impl_methods() {
+        if node_name(m) != "conv" { continue }
+        impls = impls + 1
+        let mut rows: List[Str] = []
+        for mi in instances() {
+            if mi.base_decl_node == m { rows.push(mi.c_name) }
+        }
+        assert_eq(rows.len(), 1)
+        let symbol = rows.get(0) ?? ""
+        assert_eq(definitions_of(text, symbol), 1)
+        assert(text.split("{symbol}(").len() > 2)
+    }
+    assert_eq(impls, 2)
+}

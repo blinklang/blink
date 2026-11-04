@@ -32,8 +32,8 @@ import typecheck.{
     make_fn_type, make_handle_type, make_iterator_type, make_range_type, make_list_type, make_map_type, make_option_type,
     make_ptr_type, make_result_type, make_set_type, make_struct_instance_type, make_template_type,
     make_tuple_type,
-    substitute_typevar_tid, tc_binder_key, tc_tid_typevar_key,
-    tc_call_declared_name, tc_call_decl_node, tc_call_trait, tc_impl_trait_id, tc_impl_conv_source, tc_impl_recv_spelling,
+    substitute_typevar_tid, tc_binder_key, tc_tid_typevar_key, tc_call_bound_trait_args, tc_impl_takes_trait_args,
+    tc_call_declared_name, tc_call_decl_node, tc_call_trait, tc_impl_trait_id, tc_impl_conv_source, tc_impl_trait_args, tc_impl_recv_spelling,
     tc_impl_is_poly_conversion, tc_conversion_impl_for, tc_check_conversion, tc_conversion_trait_of, tc_conversion_target_of, tc_is_conversion_trait, tc_is_into_method, tc_is_default_fill, tc_call_user_effect, tc_field_tid_at_instance,
     tc_lookup_node_tid, tc_fn_value_decl_node, tc_mc_obj_is_value, tc_call_is_trace_log, tc_is_sealed_list_hof, tc_is_list_generic_adapter, tc_map_generic_adapter, tc_map_generic_adapter_module, tc_is_iterator_method, tc_resolve,
     tc_ret_mint_at, tc_tid_child, tc_tid_child_count,
@@ -103,13 +103,14 @@ let mut generic_fn_nodes: Map[Int, Int] = Map()
 let mut own_generic_method_impl: Map[Int, Int] = Map()
 // Generic methods of impls with binders, by how a call names them, with the impl block of each.
 // by_recv holds a user generic type's per-instance impl methods, keyed by the receiver's
-// declaration and the method name. A call reaches one through its receiver, which inside a
-// bounded body is known only once the instance substitutes it.
+// declaration and the method name, one per impl: a type may hold two instances of one
+// generic trait. A call reaches one through its receiver, which inside a bounded body is
+// known only once the instance substitutes it.
 type PolyMethods {
     by_name: Map[Str, Int]
     by_qualified: Map[Str, Int]
     block_of: Map[Int, Int]
-    by_recv: Map[Str, Int]
+    by_recv: Map[Str, List[Int]]
 }
 let mut poly_methods: PolyMethods = PolyMethods { by_name: Map(), by_qualified: Map(), block_of: Map(), by_recv: Map() }
 
@@ -259,6 +260,12 @@ pub fn node_tid_for_inst(inst: MonoInstance, node: Int) -> Int ! Diag.Report {
 // call, which is every call of a plain function.
 pub fn instance_for_call(ctx_inst: Int, call_node: Int) -> Int {
     mono_call_target.get(call_site_key(ctx_inst, call_node)) ?? -1
+}
+
+// A type the generic body writes, as the instance `ctx` reads it, for a type typecheck
+// recorded beside a node and not on it. -1 is a body the pass walked as a root.
+pub fn tid_in_instance(ctx: Int, tid: Int) -> Int {
+    canon_tid(substitute_typevar_tid(tc_tid_resolved(tid), ctx_binds(ctx)))
 }
 
 // The instance a generic struct or enum type names, as an index into `instances()`, so a
@@ -451,8 +458,8 @@ fn register_poly_impl(im: Int) {
             continue
         }
         if user_decl >= 0 {
-            poly_methods.by_recv.insert(poly_user_key(user_decl, node_name(m)), m)
-            poly_methods.by_recv.insert(poly_user_key(user_decl, "{trait_id}.{node_name(m)}"), m)
+            add_poly_recv(poly_user_key(user_decl, node_name(m)), m)
+            add_poly_recv(poly_user_key(user_decl, "{trait_id}.{node_name(m)}"), m)
         } else {
             poly_methods.by_name.insert(node_name(m), m)
             poly_methods.by_qualified.insert("{trait_id}.{node_name(m)}", m)
@@ -460,6 +467,12 @@ fn register_poly_impl(im: Int) {
         poly_methods.block_of.insert(m, im)
         j = j + 1
     }
+}
+
+fn add_poly_recv(key: Str, m: Int) {
+    let mut ms = poly_methods.by_recv.get(key) ?? []
+    ms.push(m)
+    poly_methods.by_recv.insert(key, ms)
 }
 
 fn poly_user_key(decl: Int, method: Str) -> Str {
@@ -821,8 +834,8 @@ fn register_own_generic_method(m: Int, arg_tids0: List[Int]) -> Int {
     let seen = seen_or_paid(m, args_tid, arg_tids)
     if seen != NEW_INSTANCE { return seen }
     let inst_tid = canon_tid(fn_signature_tid(m, binds_from_binders(binders_sl, arg_tids)))
-    let source = impl_source_tid(im, Map())
-    register(m, binders_sl, arg_tids, inst_tid, fn() -> Str { c_poly_method_name(im, node_name(m), args_tid, source) })
+    let trait_args = impl_trait_arg_tids(im, Map())
+    register(m, binders_sl, arg_tids, inst_tid, fn() -> Str { c_poly_method_name(im, node_name(m), args_tid, trait_args) })
 }
 
 // A poly-impl method that declares type parameters of its own answers to two declarations:
@@ -859,8 +872,8 @@ fn register_poly_own_generic_method(m: Int, impl_tids0: List[Int], own_tids0: Li
     for k in own_binds.keys() { binds.insert(k, own_binds.get(k) ?? -1) }
     let args_tid = make_tuple_type(arg_tids)
     let inst_tid = canon_tid(fn_signature_tid(m, binds))
-    let source = impl_source_tid(im, binds)
-    register_with_binds(m, binds, arg_tids, inst_tid, fn() -> Str { c_poly_method_name(im, node_name(m), args_tid, source) })
+    let trait_args = impl_trait_arg_tids(im, binds)
+    register_with_binds(m, binds, arg_tids, inst_tid, fn() -> Str { c_poly_method_name(im, node_name(m), args_tid, trait_args) })
 }
 
 // Keyed on the impl binders' tids, so two receivers that differ only inside an argument the
@@ -879,16 +892,16 @@ fn register_poly_method(m: Int, impl_tids0: List[Int]) -> Int {
     let binds = binds_from_binders(binders_sl, impl_tids)
     let inst_tid = canon_tid(fn_signature_tid(m, binds))
     let args_tid = make_tuple_type(impl_tids)
-    let source = impl_source_tid(im, binds)
-    register(m, binders_sl, impl_tids, inst_tid, fn() -> Str { c_poly_method_name(im, node_name(m), args_tid, source) })
+    let trait_args = impl_trait_arg_tids(im, binds)
+    register(m, binders_sl, impl_tids, inst_tid, fn() -> Str { c_poly_method_name(im, node_name(m), args_tid, trait_args) })
 }
 
-// The source a conversion impl's instance converts from, with the instance's binders put in,
-// or -1 for any other impl.
-fn impl_source_tid(im: Int, binds: Map[Str, Int]) -> Int {
-    let source = tc_impl_conv_source(im)
-    if source < 0 { return -1 }
-    canon_tid(substitute_typevar_tid(source, binds))
+// The trait arguments of an impl's instance, with the instance's binders put in, or [] for a
+// trait that takes none.
+fn impl_trait_arg_tids(im: Int, binds: Map[Str, Int]) -> List[Int] {
+    let mut out: List[Int] = []
+    for t in tc_impl_trait_args(im) { out.push(canon_tid(substitute_typevar_tid(t, binds))) }
+    out
 }
 
 fn note_call_target(ctx: Int, call_node: Int, inst_index: Int) {
@@ -942,11 +955,10 @@ fn register_operator_methods(td: Int, ct: Int) {
 // written impl is asked as well. A method with its own binders is left out: a type instance
 // gives no argument for them, so its body has unsolved types.
 fn register_method_where_it_holds(td: Int, ct: Int, trait_name: Str, method: Str) {
-    match poly_methods.by_recv.get(poly_user_key(td, "{trait_name}.{method}")) {
-        Some(m) => if !has_own_binders(m) && (tc_instance_has_trait(ct, trait_name) || tc_written_impl_holds(ct, trait_name, method)) {
+    for m in poly_methods.by_recv.get(poly_user_key(td, "{trait_name}.{method}")) ?? [] {
+        if !has_own_binders(m) && (tc_instance_has_trait(ct, trait_name) || tc_written_impl_holds(ct, trait_name, method)) {
             register_poly_method(m, type_args_of(ct))
         }
-        None => {}
     }
 }
 
@@ -1110,13 +1122,18 @@ fn discover_poly_user_call(ctx: Int, node: Int, obj: Int, method: Str) -> Bool !
     if recv_tid < 0 { return false }
     let decl = tc_tid_decl_node(recv_tid)
     if decl < 0 { return false }
-    match poly_methods.by_recv.get(poly_user_key(decl, method)) {
-        Some(m) => {
-            register_poly_instance(ctx, m, recv_tid, recv_args(recv_tid), node)
-            true
-        }
-        None => false
+    let ms = poly_methods.by_recv.get(poly_user_key(decl, method)) ?? []
+    if ms.len() == 0 { return false }
+    let mut want: List[Int] = []
+    for t in tc_call_bound_trait_args(node) { want.push(tid_in_instance(ctx, t)) }
+    let mut picked: List[Int] = []
+    for m in ms {
+        if tc_impl_takes_trait_args(poly_methods.block_of.get(m) ?? -1, recv_tid, want) { picked.push(m) }
     }
+    // Two impls that both match are a call typecheck refused; registering either would
+    // build a body codegen then cannot reach.
+    if picked.len() == 1 { register_poly_instance(ctx, picked.get(0).unwrap(), recv_tid, recv_args(recv_tid), node) }
+    true
 }
 
 fn recv_args(recv_tid: Int) -> List[Int] {
@@ -1807,9 +1824,8 @@ fn note_type_edges(tid: Int) {
     let args = type_args_of(tid)
     note_decl_edge(td, binder_names(node_type_params(td)), args)
     for pair in operator_methods() {
-        match poly_methods.by_recv.get(poly_user_key(td, "{pair.0}.{pair.1}")) {
-            Some(m) => register_poly_method(m, args)
-            None => {}
+        for m in poly_methods.by_recv.get(poly_user_key(td, "{pair.0}.{pair.1}")) ?? [] {
+            register_poly_method(m, args)
         }
     }
 }

@@ -1,0 +1,62 @@
+// A call through a bound on a generic trait keeps the bound's arguments in the generic
+// body's own types (`X: Conv[Y]` keeps `Y`). Each instance of the body reads them at its
+// own type arguments, which is what picks one impl of a type that holds two instances.
+
+import lower_test_helpers.{rhs_of, fn_decl_of, assert_eq_str}
+import cg_test_helpers.{cg_probe_compile}
+import mono.{run_mono, instances, tid_in_instance}
+import typecheck.{tc_type_str, tc_call_bound_trait_args}
+import diagnostics.{Diag}
+
+fn src() -> Str {
+    #"trait Conv[T] {
+    fn conv(self) -> T
+}
+
+type Foo { n: Int }
+
+impl Conv[Int] for Foo {
+    fn conv(self) -> Int { self.n }
+}
+
+impl Conv[Str] for Foo {
+    fn conv(self) -> Str { "foo {self.n}" }
+}
+
+fn via[Y, X: Conv[Y]](x: X) -> Y {
+    let bound_read = x.conv()
+    bound_read
+}
+
+fn main() {
+    let f = Foo { n: 3 }
+    let a = via[Int, Foo](f)
+    let b = via[Str, Foo](f)
+    let _keep = [a == 3, b == "foo 3"]
+}
+"#
+}
+
+// The bound's first argument, as each instance of `via` reads it, in table order.
+fn bound_arg_per_instance() -> List[Str] ! Diag.Report, IO.Print {
+    let call = rhs_of("bound_read")
+    let via = fn_decl_of("via")
+    let args = tc_call_bound_trait_args(call)
+    let mut out: List[Str] = []
+    if args.len() != 1 { return out }
+    let table = instances()
+    let mut row = 0
+    while row < table.len() {
+        if table.get(row).unwrap().base_decl_node == via {
+            out.push(tc_type_str(tid_in_instance(row, args.get(0).unwrap())))
+        }
+        row = row + 1
+    }
+    out
+}
+
+test "each instance reads the bound's argument at its own type" {
+    run_mono(cg_probe_compile("build/mono_bound_arg.bl", src()))
+    let got = bound_arg_per_instance().sort()
+    assert_eq_str("per instance", got.join(" "), "Int Str")
+}

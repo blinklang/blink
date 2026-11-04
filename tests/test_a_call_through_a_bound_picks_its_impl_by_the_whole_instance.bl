@@ -1,0 +1,119 @@
+import compile_test_helpers
+
+// A call through a bound runs the impl whose whole instance the bound names: the receiver
+// and the trait arguments together, with the impl's own binders filled from both. A type
+// that holds two instances of one trait leaves a call that names neither of them ambiguous
+// (sections/03c_protocols.md, *Trait Method Lookup*, rule 3).
+
+trait Conv[U] {
+    fn conv(self) -> U
+}
+
+type Box[T] { v: T }
+
+impl[T] Conv[List[T]] for Box[T] {
+    fn conv(self) -> List[T] { [self.v, self.v] }
+}
+
+impl[T] Conv[Int] for Box[T] {
+    fn conv(self) -> Int { 42 }
+}
+
+type W[T] { v: T }
+
+impl[T] Conv[List[T]] for W[T] {
+    fn conv(self) -> List[T] { [self.v] }
+}
+
+impl[T] Conv[Option[T]] for W[T] {
+    fn conv(self) -> Option[T] { Some(self.v) }
+}
+
+fn as_int[X: Conv[Int]](x: X) -> Int { x.conv() }
+fn as_strs[X: Conv[List[Str]]](x: X) -> List[Str] { x.conv() }
+fn as_ints[X: Conv[List[Int]]](x: X) -> List[Int] { x.conv() }
+fn as_opt[X: Conv[Option[Int]]](x: X) -> Option[Int] { x.conv() }
+
+@derive(Debug, Clone, Eq)
+type Pt { x: Int }
+
+impl Display for Pt {
+    fn fmt(self, sb: StringBuilder) { sb.write("Pt{self.x}") }
+}
+
+type Src { x: Int }
+
+impl Conv[Pt] for Src {
+    fn conv(self) -> Pt { Pt { x: self.x } }
+}
+
+fn shown[X: Conv[Pt]](x: X) -> Str { "{x.conv()}" }
+fn displayed[X: Conv[Pt]](x: X) -> Str { x.conv().display() }
+fn debugged[X: Conv[Pt]](x: X) -> Str { x.conv().debug() }
+fn cloned[X: Conv[Pt]](x: X) -> Pt { x.conv().clone() }
+
+test "an argument with a binder matches only its own instance" {
+    let b = Box { v: "s" }
+    assert_eq(as_int(b), 42)
+    assert_eq(as_strs(b).len(), 2)
+    assert_eq(as_ints(Box { v: 7 }).get(1) ?? 0, 7)
+}
+
+test "two impls whose arguments both hold the binder stay apart" {
+    assert_eq(as_ints(W { v: 3 }).len(), 1)
+    assert_eq(as_opt(W { v: 3 }) ?? 0, 3)
+}
+
+test "a value a bound call returns takes its own traits" {
+    let s = Src { x: 1 }
+    assert_eq(shown(s), "Pt1")
+    assert_eq(displayed(s), "Pt1")
+    assert_eq(debugged(s), "Pt \{ x: 1 }")
+    assert_eq(cloned(s), Pt { x: 1 })
+}
+
+const TWO_INSTANCES = "trait Conv[T] \{ fn conv(self) -> T }\ntype Foo \{ n: Int }\nimpl Conv[Int] for Foo \{ fn conv(self) -> Int \{ self.n } }\nimpl Conv[Str] for Foo \{ fn conv(self) -> Str \{ \"s\" } }\n"
+
+fn expect_ambiguous(src: Str, tag: Str, instances: Str) ! FS.Delete, FS.Write, Process.Spawn, FS.Read, Env.Read {
+    let out = compile_test_helpers.compile_and_capture(src, tag)
+    assert(out.contains("E0522"))
+    assert(out.contains(instances))
+    assert(!out.contains("internal compiler error"))
+}
+
+test "a receiver call on a type with two instances names both" {
+    let src = "{TWO_INSTANCES}fn main() \{ let s: Str = Foo \{ n: 1 }.conv()\n io.println(s) }\n"
+    expect_ambiguous(src, "bound_instance_receiver_two", "Conv[Int] and Conv[Str]")
+}
+
+test "a trait-qualified call on a type with two instances is ambiguous" {
+    let src = "{TWO_INSTANCES}fn main() \{ io.println(Conv.conv(Foo \{ n: 1 })) }\n"
+    expect_ambiguous(src, "bound_instance_qualified_two", "Conv[Int] and Conv[Str]")
+}
+
+test "an associated function of two instances is ambiguous" {
+    let src = "trait Make[T] \{ fn make(n: Int) -> Self }\ntype Foo \{ n: Int }\nimpl Make[Int] for Foo \{ fn make(n: Int) -> Foo \{ Foo \{ n: n } } }\nimpl Make[Str] for Foo \{ fn make(n: Int) -> Foo \{ Foo \{ n: n * 10 } } }\nfn main() \{ io.println(\"\{Foo.make(2).n}\") }\n"
+    expect_ambiguous(src, "bound_instance_static_two", "Make[Int] and Make[Str]")
+}
+
+test "two bounds of one trait at two arguments leave the call ambiguous" {
+    let src = "{TWO_INSTANCES}fn g[X: Conv[Int] + Conv[Str]](x: X) -> Str \{ let v = x.conv()\n \"\{v}\" }\nfn main() \{ io.println(g(Foo \{ n: 1 })) }\n"
+    expect_ambiguous(src, "bound_instance_two_bounds", "Conv[Int] and Conv[Str]")
+}
+
+test "a qualified call through two bounds of one trait is ambiguous" {
+    let src = "{TWO_INSTANCES}fn g[X: Conv[Int] + Conv[Str]](x: X) -> Str \{ let v = Conv.conv(x)\n \"\{v}\" }\nfn main() \{ io.println(g(Foo \{ n: 1 })) }\n"
+    expect_ambiguous(src, "bound_instance_two_bounds_qualified", "Conv[Int] and Conv[Str]")
+}
+
+test "a call through a bound charges the effects of the instance it runs" {
+    let src = "trait Conv[T] \{ fn conv(self) -> T ! _ }\ntype Foo \{ n: Int }\nimpl Conv[Int] for Foo \{ fn conv(self) -> Int \{ self.n } }\nimpl Conv[Str] for Foo \{ fn conv(self) -> Str ! IO \{\n io.println(\"side effect\")\n \"s\" } }\nfn via_str[X: Conv[Str]](x: X) -> Str ! _ \{ x.conv() }\nfn pure_caller() -> Str \{ via_str(Foo \{ n: 1 }) }\nfn main() ! IO \{ io.println(pure_caller()) }\n"
+    let out = compile_test_helpers.compile_and_capture(src, "bound_instance_effect_charged")
+    assert(out.contains("E0500"))
+    assert(out.contains("pure_caller"))
+}
+
+test "a call through a bound charges no effect of another instance" {
+    let src = "trait Conv[T] \{ fn conv(self) -> T ! _ }\ntype Foo \{ n: Int }\nimpl Conv[Int] for Foo \{ fn conv(self) -> Int \{ self.n } }\nimpl Conv[Str] for Foo \{ fn conv(self) -> Str ! IO \{\n io.println(\"side effect\")\n \"s\" } }\nfn via_int[X: Conv[Int]](x: X) -> Int ! _ \{ x.conv() }\nfn pure_caller() -> Int \{ via_int(Foo \{ n: 1 }) }\nfn main() ! IO \{ io.println(\"\{pure_caller()}\") }\n"
+    compile_test_helpers.expect_no_error(src, "bound_instance_effect_other", "E0500")
+}

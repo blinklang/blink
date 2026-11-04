@@ -597,17 +597,27 @@ pub fn tc_is_iterator_method(method: Str) -> Int {
     0
 }
 
-// The fnsig key for an impl method, from the trait's identity. One type takes many From and
-// TryFrom impls, so their keys hold the impl itself where the C stem holds the source. Every
-// reader of the key has the impl in hand, and only cname spells the source: a second
-// spelling here could name an alias source, or a source with binders, apart from the symbol.
-// All other traits use the trait-qualified tc_impl_method_stem.
+// The fnsig key for an impl method, from the trait's identity. One type takes many instances
+// of a generic trait (From[U8] and From[Char], Conv[Int] and Conv[Str]), so the key of an
+// impl of a generic trait holds the impl itself where the C stem holds the trait arguments.
+// Only cname spells the arguments: a second spelling here could name an alias, or an
+// argument with binders, apart from the symbol. A trait with no arguments uses the
+// trait-qualified tc_impl_method_stem.
 fn tc_mangle_impl_fnsig(impl_type: Str, trait_key: Str, mname: Str, im: Int) -> Str ! TypeCheck.Resolve, Diag.Report {
-    if tc_is_conversion_trait(trait_key) {
-        let src = tc_impl_conv_source_tid(im)
-        if src >= 0 { return tc_impl_conv_stem(impl_type, trait_key, mname, "{im}") }
-    }
+    if tc_impl_trait_args_resolve(im).len() > 0 { return tc_impl_instance_stem(impl_type, trait_key, mname, ["{im}"]) }
     tc_impl_method_stem(impl_type, trait_key, mname)
+}
+
+// The keys an impl method's signature registers under. A name reader that knows the type and
+// the trait but not the trait's arguments (a receiver call, `Trait.m(x)`) reads the
+// trait-qualified key, so the sole instance of a generic trait on a type registers there too.
+// Two instances leave that key unset: no single signature answers it. A From or TryFrom impl
+// stays off it even alone, since a conversion picks its impl by the source on every path.
+fn tc_impl_fnsig_keys(impl_type: Str, trait_key: Str, mname: Str, im: Int, instance_counts: Map[Str, Int]) -> List[Str] ! TypeCheck.Resolve, Diag.Report {
+    let own = tc_mangle_impl_fnsig(impl_type, trait_key, mname, im)
+    let plain = tc_impl_method_stem(impl_type, trait_key, mname)
+    if own == plain || tc_is_conversion_trait(trait_key) || (instance_counts.get("{impl_type}|{trait_key}") ?? 0) != 1 { return [own] }
+    [own, plain]
 }
 
 pub fn tc_is_conversion_trait(trait_name: Str) -> Bool {
@@ -637,33 +647,51 @@ pub fn tc_conversion_trait_of(method: Str) -> Str {
     ""
 }
 
-// Resolved once per impl and on demand, because the fnsig registration loop needs it before
+// The trait arguments an impl header writes, in order, or [] for a trait that takes none.
+// Resolved once per impl and on demand, because the fnsig registration loop needs them before
 // validate_trait_impls records any receiver. The binders are pushed so `impl[T] From[T]`
 // reads its own T; validation is off since the impl header was already checked.
-@allow(UnrestoredMutation)
-fn tc_impl_conv_source_tid(im: Int) -> Int ! TypeCheck.Resolve, Diag.Report {
-    match tc_conv_source_tids.get(im) {
-        Some(t) => return t
+fn tc_impl_trait_args_resolve(im: Int) -> List[Int] ! TypeCheck.Resolve, Diag.Report {
+    match tc_impl_trait_args_cache.get(im) {
+        Some(ts) => return ts
         None => {}
     }
-    let tparams = node_type_params(im)
-    if tparams == -1 || sublist_length(tparams) == 0 { return -1 }
-    let binders_sl = node_impl_binders(im)
-    tc_push_tparam_scope(binders_sl)
-    let saved_suppress = tc_suppress_ann_validation
-    tc_suppress_ann_validation = 1
-    let t = resolve_type_ann(sublist_get(tparams, 0))
-    tc_suppress_ann_validation = saved_suppress
-    tc_pop_tparam_scope(binders_sl)
-    tc_conv_source_tids.insert(im, t)
-    t
+    let out = tc_impl_trait_arg_tids(im)
+    tc_impl_trait_args_cache.insert(im, out)
+    out
+}
+
+// How many impls of each generic trait a type has, keyed "{type}|{trait}", for
+// tc_impl_fnsig_keys.
+fn tc_count_trait_instances(impls_sl: Int) -> Map[Str, Int] {
+    let mut counts: Map[Str, Int] = Map()
+    if impls_sl == -1 { return counts }
+    let mut i = 0
+    while i < sublist_length(impls_sl) {
+        let im = sublist_get(impls_sl, i)
+        let tparams = node_type_params(im)
+        if tparams != -1 && sublist_length(tparams) > 0 {
+            let key = "{tc_impl_target_name(im)}|{tc_impl_trait_id(im)}"
+            counts.insert(key, (counts.get(key) ?? 0) + 1)
+        }
+        i = i + 1
+    }
+    counts
+}
+
+// The trait arguments of an impl, as typecheck resolved them, or [] for a trait that takes
+// none. Pure, so cname spells an impl's symbol from the types and not from the header's
+// text: Conv[List[Int]] and Conv[List[Str]] are two symbols.
+pub fn tc_impl_trait_args(im: Int) -> List[Int] {
+    tc_impl_trait_args_cache.get(im) ?? []
 }
 
 // The source type a From/TryFrom impl converts from, or -1 for any other impl. Pure, so
 // cname spells the impl's symbol from the type typecheck resolved and not from the head
 // the header wrote: From[List[Int]] and From[List[Str]] are two symbols.
 pub fn tc_impl_conv_source(im: Int) -> Int {
-    tc_conv_source_tids.get(im) ?? -1
+    if !tc_is_conversion_trait(tc_impl_trait_id(im)) { return -1 }
+    tc_impl_trait_args(im).get(0) ?? -1
 }
 
 // What tc_conversion_impl_for answers for a From of a type to itself (section 3c.2): no impl
@@ -698,7 +726,7 @@ fn tc_conversion_impls_matching(trait_name: Str, source: Int, target: Int) -> Li
 // there: the impls inference could still pick once the call's types settle.
 fn tc_conversion_impls_matching_at(trait_name: Str, source: Int, target: Int, open: Bool) -> List[Int] {
     let mut found: List[Int] = []
-    for im in tc_conv_source_tids.keys() {
+    for im in tc_impl_trait_args_cache.keys() {
         if tc_impl_trait_id(im) != trait_name { continue }
         let binds = match tc_conversion_match_binds_at(im, source, target, open) {
             Some(b) => b
@@ -729,7 +757,7 @@ pub fn tc_conversion_match_binds(im: Int, source0: Int, target0: Int) -> Option[
 }
 
 fn tc_conversion_match_binds_at(im: Int, source0: Int, target0: Int, open: Bool) -> Option[Map[Str, Int]] {
-    let src = tc_conv_source_tids.get(im) ?? -1
+    let src = tc_impl_conv_source(im)
     let recv = tc_impl_recv_tids.get(im) ?? -1
     if src < 0 || recv < 0 { return None }
     let no_binds: Map[Str, Int] = Map()
@@ -755,7 +783,7 @@ pub fn tc_impl_is_poly_conversion(im: Int) -> Bool {
     if !tc_is_conversion_trait(tc_impl_trait_id(im)) { return false }
     let binders = node_impl_binders(im)
     if binders == -1 || sublist_length(binders) == 0 { return false }
-    let src = tc_conv_source_tids.get(im) ?? -1
+    let src = tc_impl_conv_source(im)
     let recv = tc_impl_recv_tids.get(im) ?? -1
     if src < 0 || recv < 0 { return false }
     if tc_tid_decl_node(recv) < 0 { return false }
@@ -1624,9 +1652,9 @@ let mut tc_current_self_tid: Int = -1
 // The receiver tid of every impl block that has a `for` clause, keyed by impl node. Written
 // once, while validate_trait_impls checks the header; read through tc_impl_recv_tid.
 let mut tc_impl_recv_tids: Map[Int, Int] = Map()
-// The source tid of every From/TryFrom impl, keyed by impl node. Written through
-// tc_impl_conv_source_tid while the impl's methods register.
-let mut tc_conv_source_tids: Map[Int, Int] = Map()
+// The resolved trait arguments of every impl of a generic trait, keyed by impl node. Written
+// through tc_impl_trait_args_resolve while the impl's methods register.
+let mut tc_impl_trait_args_cache: Map[Int, List[Int]] = Map()
 // The impls over a user generic type that are checked and emitted per instance: impl node to
 // the receiver type's declaration. Written beside the receiver tid; read through
 // tc_poly_user_impl_decl.
@@ -14902,11 +14930,13 @@ pub fn tc_impl_method_stem(impl_type: Str, trait_key: Str, mname: Str) -> Str {
     "{tc_sym_escape(impl_type)}_{tc_trait_segment(trait_key)}_{tc_sym_escape(mname)}"
 }
 
-// The signature key of a From or TryFrom impl's method, and the stem of its C symbol, with the
-// source spelled the way the caller names types. One type takes many sources, so the source
-// follows the method's stem as a mono argument after `_0`, which no other stem holds there.
-pub fn tc_impl_conv_stem(impl_type: Str, trait_key: Str, mname: Str, src: Str) -> Str {
-    "{tc_impl_method_stem(impl_type, trait_key, mname)}_0{tc_sym_escape(src)}"
+// The stem of an impl method of a generic trait, with each trait argument spelled the way the
+// caller names types. One type takes many instances of the trait, so the arguments follow the
+// method's stem as mono arguments, each after `_0`, which no other stem holds there.
+pub fn tc_impl_instance_stem(impl_type: Str, trait_key: Str, mname: Str, segs: List[Str]) -> Str {
+    let mut out = tc_impl_method_stem(impl_type, trait_key, mname)
+    for seg in segs { out = "{out}_0{tc_sym_escape(seg)}" }
+    out
 }
 
 // A " and "-joined list of trait keys, as a diagnostic names them.
@@ -15391,13 +15421,12 @@ fn subst_trait_type_tid(type_tid: Int, impl_recv_tid: Int, tmsig_idx: Int, impl_
 // through `U: Tr[Int]` the trait's `T` is `Int`. The bound is read off the receiver's binder,
 // which keeps the argument a bound spelled with another type parameter (`U: Tr[V]`) in that
 // declaration's scope. A trait type parameter the bound gives no argument for stays unbound.
-fn tc_bound_call_binds(recv_tid: Int, tmsig_idx: Int) -> Map[Str, Int] ! TypeCheck.Resolve, Diag.Report {
+fn tc_bound_call_binds(recv_tid: Int, tmsig_idx: Int, arg_tids: List[Int]) -> Map[Str, Int] {
     let mut binds: Map[Str, Int] = Map()
     binds.insert("Self", recv_tid)
     binds.insert(tc_binder_key(SELF_BINDER_NODE, "Self"), recv_tid)
     let tm = tc_tmsig_pool.get(tmsig_idx).unwrap()
     if tm.tparams_count == 0 { return binds }
-    let arg_tids = tc_bound_trait_arg_tids(tc_tid_binder(recv_tid), tm.trait_name)
     let mut k = 0
     while k < tm.tparams_count && k < arg_tids.len() {
         let tp_name = tc_trait_tparam_names.get(tm.tparams_start + k).unwrap()
@@ -15408,6 +15437,46 @@ fn tc_bound_call_binds(recv_tid: Int, tmsig_idx: Int) -> Map[Str, Int] ! TypeChe
         k = k + 1
     }
     binds
+}
+
+// Each distinct argument list the bounds of the type parameter at `binder` name `trait_name`
+// at directly, from every active frame of the binder and from the binder's own node: two for
+// `X: Conv[Int] + Conv[Str]`.
+fn tc_bound_trait_instances(binder: Int, trait_name: Str) -> List[List[Int]] ! TypeCheck.Resolve, Diag.Report {
+    let mut out: List[List[Int]] = []
+    if binder < 0 { return out }
+    let mut nodes: List[Int] = [binder]
+    for f in tc_tp_frames {
+        if f.binder == binder && !nodes.contains(f.bounds_node) { nodes.push(f.bounds_node) }
+    }
+    for bn in nodes {
+        if bn < 0 || node_kind(bn) != NodeKind.TypeParam { continue }
+        let bounds = node_elements(bn)
+        let mut i = 0
+        while bounds != -1 && i < sublist_length(bounds) {
+            let b = sublist_get(bounds, i)
+            if tc_bound_trait(b) == trait_name {
+                let args = tc_resolve_type_args(node_elements(b))
+                if args.len() > 0 && !tc_arg_lists_hold(out, args) { out.push(args) }
+            }
+            i = i + 1
+        }
+    }
+    out
+}
+
+fn tc_arg_lists_hold(lists: List[List[Int]], args: List[Int]) -> Bool {
+    for l in lists {
+        if l.len() != args.len() { continue }
+        let mut same = true
+        let mut i = 0
+        while i < l.len() {
+            if !tc_tid_same_type(l.get(i).unwrap(), args.get(i).unwrap()) { same = false }
+            i = i + 1
+        }
+        if same { return true }
+    }
+    false
 }
 
 // The trait arguments the type parameter declared at `binder` is bounded by `trait_name`
@@ -15765,7 +15834,7 @@ fn validate_trait_impls_in_own_modules(program: Int) ! TypeCheck.Register, TypeC
         // `List[Int]`, a nested binder (Box[List[T]]) and a repeated one.
         // tc_impl_is_poly_conversion reads the source from the cache, which only the fnsig
         // loop has filled so far, and only for an impl that writes a method.
-        if tc_is_conversion_trait(tc_impl_trait_id(im)) { let _ = tc_impl_conv_source_tid(im) }
+        if tc_is_conversion_trait(tc_impl_trait_id(im)) { let _ = tc_impl_trait_args_resolve(im) }
         let mut poly_supported = if tc_impl_is_poly_user(im) || tc_impl_is_poly_conversion(im) { 1 } else { 0 }
         if binders_sl != -1 && recv_args_sl != -1 {
             let nb = sublist_length(binders_sl)
@@ -16204,7 +16273,7 @@ fn init_types() ! TypeCheck.Register {
     ty_param_list.clear()
     // The method-call facts span all three phases of one check_types, so they are cleared
     // here rather than in resolve_names with the registries that feed them.
-    tc_method_calls = MethodCallFacts { unresolved: [], hard: Map(), seeded_expected: Map(), dropped: Map(), helper_fixes: Map() }
+    tc_method_calls = MethodCallFacts { unresolved: [], hard: Map(), seeded_expected: Map(), dropped: Map(), helper_fixes: Map(), bound_args: Map() }
     // Load-bearing for the daemon/LSP (long-lived processes, daemon.bl / lsp.bl): a
     // surviving intern map would hand out tids keyed against the PREVIOUS, since-cleared
     // pool on the next check_types() call — out-of-bounds unwrap panic or a silently
@@ -16239,7 +16308,7 @@ fn init_types() ! TypeCheck.Register {
     tc_type_decl_ambiguous_names = Map()
     tc_namesake_type_modules = Map()
     tc_impl_recv_tids = Map()
-    tc_conv_source_tids = Map()
+    tc_impl_trait_args_cache = Map()
     tc_poly_user_impls = Map()
     tc_method_block = Map()
     tc_active_tparams.clear()
@@ -16648,6 +16717,7 @@ pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report, IO.Eprint {
 
     // Register impl method signatures
     let impls_sl = node_methods(program)
+    let instance_counts = tc_count_trait_instances(impls_sl)
     if impls_sl != -1 {
         let mut i = 0
         while i < sublist_length(impls_sl) {
@@ -16718,11 +16788,12 @@ pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report, IO.Eprint {
                     // From/TryFrom key each impl apart; all
                     // other impl methods register under the trait-qualified key
                     // so two traits sharing a method name don't overwrite.
-                    let mangled = tc_mangle_impl_fnsig(impl_type, trait_id, orig_name, im)
                     tc_record_method_trait(impl_type, orig_name, trait_id)
                     tc_method_block.insert(m, im)
-                    node_set_name(m, mangled)
-                    register_fn_sig(m)
+                    for key in tc_impl_fnsig_keys(impl_type, trait_id, orig_name, im, instance_counts) {
+                        node_set_name(m, key)
+                        register_fn_sig(m)
+                    }
                     node_set_name(m, orig_name)
                     j = j + 1
                 }
@@ -16789,7 +16860,9 @@ pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report, IO.Eprint {
                     let mut j = 0
                     while j < sublist_length(methods_sl_sym) {
                         let m = sublist_get(methods_sl_sym, j)
-                        tc_symbol_module.insert(tc_mangle_impl_fnsig(impl_type, trait_id, node_name(m), im), mod_name)
+                        for key in tc_impl_fnsig_keys(impl_type, trait_id, node_name(m), im, instance_counts) {
+                            tc_symbol_module.insert(key, mod_name)
+                        }
                         j = j + 1
                     }
                 }
@@ -22731,6 +22804,124 @@ pub fn tc_call_trait(call_node: Int) -> Option[Str] {
     Some(tc_trait_key_of(block))
 }
 
+// The trait arguments of the bound a call reached its method through, in the generic
+// body's own types, or [] for a call through no bound or a trait that takes none.
+pub fn tc_call_bound_trait_args(call_node: Int) -> List[Int] {
+    tc_method_calls.bound_args.get(call_node) ?? []
+}
+
+// The bound's trait arguments when the call reached a method of `trait_key`, else []: the
+// Display impl of the value `x.conv()` returns is not picked by Conv's arguments.
+pub fn tc_call_bound_args_of(call_node: Int, trait_key: Str) -> List[Int] {
+    if (tc_call_trait(call_node) ?? "") != trait_key { return [] }
+    tc_call_bound_trait_args(call_node)
+}
+
+// Whether an impl over `recv` is the instance whose trait arguments a call through a bound
+// wants, as concrete types; [] wants none. The caller has matched the receiver's base already;
+// the receiver still fills the impl's binders, so `impl[T] Conv[List[T]] for Box[T]` takes
+// Conv[List[Str]] at Box[Str] and not Conv[Int].
+pub fn tc_impl_takes_trait_args(im: Int, recv: Int, want: List[Int]) -> Bool {
+    if want.len() == 0 { return true }
+    match tc_impl_instance_binds(im, recv, want) {
+        Some(_) => true
+        None => false
+    }
+}
+
+// The binds under which impl `im` is the instance with trait arguments `want` at receiver
+// `recv`, or None. The impl's binders are filled from the receiver and the arguments together,
+// and the arguments they fill must then be `want` itself, so the two sides cannot fill one
+// binder two ways. A receiver named bare (`Box.make(..)`) or -1 leaves the arguments to decide.
+fn tc_impl_instance_binds(im: Int, recv0: Int, want: List[Int]) -> Option[Map[Str, Int]] {
+    let have = tc_impl_trait_args(im)
+    if have.len() != want.len() { return None }
+    let impl_recv = tc_impl_recv_tids.get(im) ?? -1
+    let no_binds: Map[Str, Int] = Map()
+    let mut binds: Map[Str, Int] = Map()
+    if recv0 >= 0 && impl_recv >= 0 {
+        let recv = substitute_typevar_tid(recv0, no_binds)
+        let decl = tc_tid_decl_node(recv)
+        let bare = decl >= 0 && tc_tid_struct_arg_count(tc_resolve(recv)) == 0
+        if !bare { unify_typevar_binds(impl_recv, recv, binds) }
+    }
+    let mut i = 0
+    while i < want.len() {
+        unify_typevar_binds(have.get(i).unwrap(), substitute_typevar_tid(want.get(i).unwrap(), no_binds), binds)
+        i = i + 1
+    }
+    i = 0
+    while i < want.len() {
+        if !tc_tid_same_type(substitute_typevar_tid(have.get(i).unwrap(), binds), want.get(i).unwrap()) { return None }
+        i = i + 1
+    }
+    Some(binds)
+}
+
+// Every impl of the trait `trait_key` over the base of `recv` whose instance is `want`, in the
+// order a cold load parsed them; [] for `want` takes every instance. An impl with no method
+// registers no trait arguments and is not listed, so this answers for calls, not for headers.
+fn tc_impls_of_trait_on(trait_key: Str, recv: Int, want: List[Int]) -> List[Int] {
+    let mut found: List[Int] = []
+    let decl = tc_tid_decl_node(recv)
+    for im in tc_impl_trait_args_cache.keys() {
+        if tc_impl_trait_id(im) != trait_key { continue }
+        let impl_recv = tc_impl_recv_tids.get(im) ?? -1
+        if decl >= 0 {
+            if tc_tid_decl_node(impl_recv) != decl { continue }
+        } else if impl_recv < 0 || type_kind(tc_resolve(impl_recv)) != type_kind(tc_resolve(recv)) {
+            continue
+        }
+        if want.len() > 0 && !tc_impl_takes_trait_args(im, recv, want) { continue }
+        let mut at = found.len()
+        while at > 0 && node_load_rank(found.get(at - 1).unwrap()) > node_load_rank(im) { at = at - 1 }
+        found.insert(at, im)
+    }
+    found
+}
+
+// How a diagnostic spells one instance of a trait: `Conv[Int]`, or `Conv` for one with none.
+fn tc_trait_instance_shown(trait_key: Str, args: List[Int]) -> Str {
+    if args.len() == 0 { return tc_trait_shown(trait_key) }
+    let mut parts: List[Str] = []
+    for a in args { parts.push(tc_type_str(a)) }
+    "{tc_trait_shown(trait_key)}[{parts.join(", ")}]"
+}
+
+// §3c rule 3 for one generic trait that `owner` holds at two or more instances: the trait
+// names no one impl, so the help gives the impl-qualified call of each instance
+// (sections/03c_protocols.md, *E0522 help*).
+fn tc_instance_ambiguity(node: Int, call: Str, owner: Str, trait_key: Str, method: Str, ims: List[Int]) -> Int ! Diag.Report {
+    let mut insts: List[Str] = []
+    for im in ims { insts.push(tc_trait_instance_shown(trait_key, tc_impl_trait_args(im))) }
+    tc_report_instance_ambiguity(node, call, owner, "for {owner}", trait_key, method, insts)
+}
+
+// The same for a type parameter whose bounds name one trait at two instances
+// (`X: Conv[Int] + Conv[Str]`): the bounds give the call two signatures, and refusal is the
+// rule (sections/03c_protocols.md, *Trait Method Lookup*).
+fn tc_bound_instance_ambiguity(node: Int, call: Str, tp: Str, trait_key: Str, method: Str, arg_lists: List[List[Int]]) -> Int ! Diag.Report {
+    let mut insts: List[Str] = []
+    for args in arg_lists { insts.push(tc_trait_instance_shown(trait_key, args)) }
+    tc_report_instance_ambiguity(node, call, tp, "that bounds type parameter `{tp}`", trait_key, method, insts)
+}
+
+fn tc_report_instance_ambiguity(node: Int, call: Str, owner: Str, held: Str, trait_key: Str, method: Str, insts: List[Str]) -> Int ! Diag.Report {
+    let mut params: List[Str] = []
+    let decl = tc_trait_method_decl(trait_key, method)
+    let psl = if decl >= 0 { node_params(decl) } else { -1 }
+    let mut i = 0
+    while psl != -1 && i < sublist_length(psl) {
+        let pn = node_name(sublist_get(psl, i))
+        params.push(if pn == "self" { "receiver" } else { pn })
+        i = i + 1
+    }
+    let mut lines: List[Str] = []
+    for inst in insts { lines.push("`({inst} for {owner}).{method}({params.join(", ")})`") }
+    diag_error_at("AmbiguousMethodCall", AMBIGUOUS_METHOD_CALL, "ambiguous method call: `{call}` is defined in more than one instance of `{tc_trait_shown(trait_key)}` {held} ({insts.join(" and ")})", node, "use an impl-qualified call to choose one: {lines.join(" or ")}")
+    tc_error_recovery_tid()
+}
+
 // A call read through no trait may take an impl of any trait.
 pub fn tc_impl_is_of_call_trait(im: Int, call_trait: Option[Str]) -> Bool {
     match call_trait {
@@ -22898,6 +23089,10 @@ type MethodCallFacts {
     // The helper calls given a fix, by the call's node. Only the effect-row pass knows the row
     // the call runs under, and it drops the fix where that row lacks an effect of the helper.
     helper_fixes: Map[Int, HelperFix]
+    // The trait arguments a call through a bound reads its trait at, by the call's node: one
+    // type may hold two instances of one generic trait, and only the bound says which one the
+    // call means.
+    bound_args: Map[Int, List[Int]]
 }
 
 type HelperFix {
@@ -22905,7 +23100,7 @@ type HelperFix {
     sig: Int
 }
 
-let mut tc_method_calls: MethodCallFacts = MethodCallFacts { unresolved: [], hard: Map(), seeded_expected: Map(), dropped: Map(), helper_fixes: Map() }
+let mut tc_method_calls: MethodCallFacts = MethodCallFacts { unresolved: [], hard: Map(), seeded_expected: Map(), dropped: Map(), helper_fixes: Map(), bound_args: Map() }
 
 // Mark a method call the inference pass could not type and did not report on: the name
 // resolves somewhere in the program, so name resolution let it pass, but no arm here claims
@@ -30078,7 +30273,11 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                     // Each instance picks its impl by the trait that declares the method: the
                     // type may hold another trait of one spelling with a method of this name.
                     nr_note_call_decl(node, tc_trait_method_decl(tm.trait_name, method))
-                    let binds = tc_bound_call_binds(obj_t, found)
+                    let bound_insts = tc_bound_trait_instances(tc_tid_binder(obj_t), tm.trait_name)
+                    if bound_insts.len() >= 2 { return tc_bound_instance_ambiguity(node, ".{method}", tv_name, tm.trait_name, method, bound_insts) }
+                    let bound_args = tc_bound_trait_arg_tids(tc_tid_binder(obj_t), tm.trait_name)
+                    let binds = tc_bound_call_binds(obj_t, found, bound_args)
+                    if bound_args.len() > 0 { tc_method_calls.bound_args.insert(node, bound_args) }
                     let _ = check_arg_shapes_with_binds("{tc_trait_shown(tm.trait_name)}.{method}", tc_call_view_sig(tm.sig), args_sl, 1, node, binds)
                     return substitute_typevar_tid(tm.ret_tid, binds)
                 }
@@ -30134,6 +30333,13 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
             // §3c rule-3: an unqualified call to a method defined by two
             // or more traits this type implements is ambiguous. Reject before
             // resolving — the qualified call `Trait.method(receiver)` selects one.
+            if tc_method_trait_count(tname, method) >= 2 && tc_method_distinct_trait_count(tname, method) == 1 {
+                let inst_key = tc_method_distinct_trait_names(tname, method)
+                if !tc_is_conversion_trait(inst_key) {
+                    let inst_ims = tc_impls_of_trait_on(inst_key, obj_t, [])
+                    if inst_ims.len() >= 2 { return tc_instance_ambiguity(node, ".{method}", tc_type_str(obj_t), inst_key, method, inst_ims) }
+                }
+            }
             if tc_method_trait_count(tname, method) >= 2 {
                 let names = tc_traits_shown(tc_method_trait_names(tname, method))
                 // The program may not spell BlockHandler at all: `impl Closeable` provides it
@@ -30545,7 +30751,11 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                                 if qtm_kw_bad == 0 && qtm_filled != qtm.params_count {
                                     tc_error_at("qualified trait call `{obj_name}.{method}` expects {qtm.params_count} argument(s) including the receiver, got {qtm_filled}", node)
                                 }
-                                let qtm_binds = tc_bound_call_binds(qt_recv, qv)
+                                let qt_insts = tc_bound_trait_instances(tc_tid_binder(qt_recv), qt_trait)
+                                if qt_insts.len() >= 2 { return tc_bound_instance_ambiguity(node, "{obj_name}.{method}", qt_tp, qt_trait, method, qt_insts) }
+                                let qt_bound_args = tc_bound_trait_arg_tids(tc_tid_binder(qt_recv), qt_trait)
+                                let qtm_binds = tc_bound_call_binds(qt_recv, qv, qt_bound_args)
+                                if qt_bound_args.len() > 0 { tc_method_calls.bound_args.insert(node, qt_bound_args) }
                                 let _ = tc_check_arg_types_with_binds("{obj_name}.{method}", qtm.sig, qt_args, 0, qtm_binds)
                                 return substitute_typevar_tid(qtm.ret_tid, qtm_binds)
                             }
@@ -30565,6 +30775,12 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                 }
                 if qt_tname != "" {
                     let qt_sig = tc_call_view_sig(lookup_fnsig(tc_impl_method_stem(qt_tname, qt_trait, method)))
+                    // A type that holds the trait at two instances registers no plain key, and
+                    // the trait alone does not say which instance runs.
+                    if qt_sig == -1 && !tc_is_conversion_trait(qt_trait) {
+                        let qt_ims = tc_impls_of_trait_on(qt_trait, qt_recv, [])
+                        if qt_ims.len() >= 2 { return tc_instance_ambiguity(node, "{obj_name}.{method}", tc_type_str(qt_recv), qt_trait, method, qt_ims) }
+                    }
                     if qt_sig != -1 {
                         let qt_fs = fnsig_pool.get(qt_sig).unwrap()
                         // The receiver IS param 0 (`self`), so the qualified form's arity is
@@ -30665,6 +30881,14 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                     let amb_traits = tc_traits_shown(tc_method_distinct_trait_names(obj_name, method))
                     diag_error_at("AmbiguousMethodCall", AMBIGUOUS_METHOD_CALL, "ambiguous static call: `{obj_name}.{method}` is declared by multiple traits implemented by {obj_name} ({amb_traits})", node, "rename one of the methods, or drop one of the impls: a qualified call names the trait by passing the receiver first, and an associated function has no receiver to pass")
                     return tc_error_recovery_tid()
+                }
+                if tc_method_trait_count(obj_name, method) >= 2 && tc_method_distinct_trait_count(obj_name, method) == 1 {
+                    let st_key = tc_method_distinct_trait_names(obj_name, method)
+                    let st_tid = lookup_named_type(obj_name)
+                    if !tc_is_conversion_trait(st_key) && st_tid != -1 {
+                        let st_ims = tc_impls_of_trait_on(st_key, st_tid, [])
+                        if st_ims.len() >= 2 { return tc_instance_ambiguity(node, "{obj_name}.{method}", obj_name, st_key, method, st_ims) }
+                    }
                 }
                 let static_trait = tc_method_trait_names(obj_name, method)
                 if static_trait != "" && tc_method_trait_count(obj_name, method) == 1 {
@@ -34161,7 +34385,7 @@ fn tc_tm_call_row(node: Int, decl: Int) -> List[Str] ! TypeCheck.Resolve, Diag.R
     let block = tc_method_block.get(decl) ?? -1
     if block != -1 && node_kind(block) == NodeKind.TraitDef {
         let recv = tc_er_call_receiver(node)
-        if recv >= 0 && tc_tid_kind(recv) != TyKind.Typevar { return tc_er_impl_row(recv, decl, 0) }
+        if recv >= 0 && tc_tid_kind(recv) != TyKind.Typevar { return tc_er_impl_row(recv, decl, tc_er_call_want(node, tc_no_binds), 0) }
         return tc_er_fn_row(decl)
     }
     tc_tm_decl_row(decl, tc_er_call_binds(node, decl))
@@ -34260,13 +34484,13 @@ fn tc_tm_touch_call(node: Int, binds: Map[Str, Int], depth: Int, seen: Set[Str],
         let recv = tc_er_call_receiver(node)
         let a = if recv >= 0 { resolve_alias_tid(tc_resolve(substitute_typevar_tid(recv, binds))) } else { -1 }
         if a >= 0 && tc_tid_is_no_info(a) == 0 && tc_tid_kind(a) != TyKind.Typevar {
-            let m = tc_er_impl_decl(a, decl)
-            if m >= 0 {
+            let ms = tc_er_impl_decls(a, decl, tc_er_call_want(node, binds))
+            for m in ms {
                 let ib = tc_method_block.get(m) ?? -1
                 let mb = if ib != -1 && node_kind(ib) == NodeKind.ImplBlock { tc_impl_binds_for_instance(ib, a) } else { tc_no_binds }
                 tc_tm_touch_fn(m, mb, depth, seen, todo)
-                return
             }
+            if ms.len() > 0 { return }
         }
         tc_tm_touch_fn(decl, tc_no_binds, depth, seen, todo)
         return
@@ -40430,7 +40654,7 @@ fn tc_er_check_call(program: Int, node: Int, held: List[Str], owner: ErOwner) ! 
         // `Closeable.close(r)` names the trait but runs the impl of a concrete `r`.
         let recv = tc_er_call_receiver(node)
         if recv >= 0 && tc_tid_kind(recv) != TyKind.Typevar {
-            for req in tc_er_impl_row(recv, decl, 0) { tc_er_require(program, node, held, owner, node_name(decl), req) }
+            for req in tc_er_impl_row(recv, decl, tc_er_call_want(node, tc_no_binds), 0) { tc_er_require(program, node, held, owner, node_name(decl), req) }
             return
         }
         let shown = "{tc_er_receiver_shown(node, block)}.{node_name(decl)}"
@@ -40673,7 +40897,8 @@ fn tc_er_wild_row(decl: Int, binds: Map[Str, Int], depth: Int) -> List[Str] ! Ty
         let a = binds.get(tc_binder_key(p.binder, p.name)) ?? (binds.get(p.name) ?? -1)
         if a < 0 { continue }
         for tm in tc_er_wild_methods(p.traits) {
-            for e in tc_er_impl_row(a, tm, depth) {
+            let want = tc_er_bound_want(decl, p.binder, tc_trait_key_of(tc_method_block.get(tm) ?? -1), binds)
+            for e in tc_er_impl_row(a, tm, want, depth) {
                 if !out.contains(e) { out.push(e) }
             }
         }
@@ -40684,7 +40909,7 @@ fn tc_er_wild_row(decl: Int, binds: Map[Str, Int], depth: Int) -> List[Str] ! Ty
 // The row that type `a0` runs for trait method `tm`. A type parameter of the caller stands
 // for every impl, so it is `_`. A Closeable type runs close for BlockHandler's enter and exit
 // as well, through the impl the parser writes for it (§4.7.2).
-fn tc_er_impl_row(a0: Int, tm: Int, depth: Int) -> List[Str] ! TypeCheck.Resolve, Diag.Report {
+fn tc_er_impl_row(a0: Int, tm: Int, want: List[Int], depth: Int) -> List[Str] ! TypeCheck.Resolve, Diag.Report {
     let mut out: List[Str] = []
     let a = resolve_alias_tid(tc_resolve(a0))
     if a < 0 || tc_tid_is_no_info(a) != 0 { return out }
@@ -40692,8 +40917,11 @@ fn tc_er_impl_row(a0: Int, tm: Int, depth: Int) -> List[Str] ! TypeCheck.Resolve
         out.push("_")
         return out
     }
-    let decl = tc_er_impl_decl(a, tm)
-    if decl < 0 { return out }
+    for decl in tc_er_impl_decls(a, tm, want) { tc_er_push_impl_row(out, a, decl, depth) }
+    out
+}
+
+fn tc_er_push_impl_row(out: List[Str], a: Int, decl: Int, depth: Int) ! TypeCheck.Resolve, Diag.Report {
     for e in tc_er_fn_row(decl) {
         if e == "_" {
             // An impl that forwards its own binders' rows, as `Guard[T]` does, reads them off
@@ -40713,22 +40941,69 @@ fn tc_er_impl_row(a0: Int, tm: Int, depth: Int) -> List[Str] ! TypeCheck.Resolve
             out.push(e)
         }
     }
-    out
 }
 
-// The impl method that concrete type `a` runs for trait method `tm`, or -1.
-fn tc_er_impl_decl(a: Int, tm: Int) -> Int ! Diag.Report {
+// The impl methods that concrete type `a` may run for trait method `tm`: the one impl of the
+// trait over `a`, or, for a type with several instances of the trait, those whose trait
+// arguments are `want`. An empty `want` names no instance, so it takes every one, and the
+// row charged is then their union rather than none of them.
+fn tc_er_impl_decls(a: Int, tm: Int, want: List[Int]) -> List[Int] ! Diag.Report {
     let tkey = tc_trait_key_of(tc_method_block.get(tm) ?? -1)
     let mname = node_name(tm)
+    let mut out: List[Int] = []
     if tkey == "BlockHandler" || tkey == "Closeable" {
         let im = tc_er_scoped_impl(a)
-        if im < 0 { return -1 }
-        return tc_er_impl_method(im, if tc_impl_trait_id(im) == "Closeable" { "close" } else { mname })
+        if im < 0 { return out }
+        let m = tc_er_impl_method(im, if tc_impl_trait_id(im) == "Closeable" { "close" } else { mname })
+        if m >= 0 { out.push(m) }
+        return out
     }
     let k = tc_tid_kind(a)
     let tname = if k == TyKind.Struct || k == TyKind.Enum { ty_pool.get(a).unwrap().name } else { tc_builtin_receiver_name(a) }
     let sig = if tname != "" { lookup_fnsig(tc_impl_method_stem(tname, tkey, mname)) } else { -1 }
-    if sig >= 0 { fnsig_pool.get(sig).unwrap().decl } else { -1 }
+    if sig >= 0 {
+        out.push(fnsig_pool.get(sig).unwrap().decl)
+        return out
+    }
+    for im in tc_impls_of_trait_on(tkey, a, want) {
+        let m = tc_er_impl_method(im, mname)
+        if m >= 0 { out.push(m) }
+    }
+    out
+}
+
+// The trait arguments of the bound a call reached its method through, read at `binds`; []
+// when they still hold a type parameter, which names no one instance.
+fn tc_er_call_want(node: Int, binds: Map[Str, Int]) -> List[Int] {
+    tc_er_concrete_args(tc_call_bound_trait_args(node), binds)
+}
+
+// The trait arguments the bound of type parameter `binder` of `decl` names `trait_key` at,
+// read at `binds`, or [] as tc_er_call_want. The bound is read in `decl`'s own scope, so its
+// arguments may name `decl`'s type parameters.
+fn tc_er_bound_want(decl: Int, binder: Int, trait_key: Str, binds: Map[Str, Int]) -> List[Int] ! TypeCheck.Resolve, Diag.Report {
+    if binder < 0 { return [] }
+    let block = tc_method_block.get(decl) ?? -1
+    let impl_binders = if block != -1 && node_kind(block) == NodeKind.ImplBlock { node_impl_binders(block) } else { -1 }
+    let saved = tc_suppress_ann_validation
+    tc_suppress_ann_validation = 1
+    tc_push_tparam_scope(impl_binders)
+    tc_push_tparam_scope(node_type_params(decl))
+    let args = tc_bounds_node_trait_arg_tids(binder, trait_key)
+    tc_pop_tparam_scope(node_type_params(decl))
+    tc_pop_tparam_scope(impl_binders)
+    tc_suppress_ann_validation = saved
+    tc_er_concrete_args(args, binds)
+}
+
+fn tc_er_concrete_args(args: List[Int], binds: Map[Str, Int]) -> List[Int] {
+    let mut out: List[Int] = []
+    for t in args {
+        let c = substitute_typevar_tid(t, binds)
+        if tc_tid_has_bare_typevar(c) != 0 { return [] }
+        out.push(c)
+    }
+    out
 }
 
 fn tc_er_impl_method(im: Int, name: Str) -> Int {
