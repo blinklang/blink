@@ -1,0 +1,73 @@
+// When the front end of a build finds no error and a later step stops with an internal error,
+// the command exits 101, and the diagnostic has a note: this source passes `blink check`, so
+// the cause is a bug of the compiler (section 6.7.4). No source program meets an internal
+// error on purpose, so the dev knob BLINK_DEV_BACK_END_ICE makes the back end report one.
+
+import compile_test_helpers
+import std.process.{ProcessResult, ChildEnd}
+
+let PASSES_CHECK_NOTE = "note: this source passes `blink check`; the cause is a bug of the compiler"
+
+fn sh(cmd: Str) -> ProcessResult ! Process.Spawn {
+    process.run("sh", ["-c", cmd]).unwrap()
+}
+
+// A directory with a clean program in it, x.bl.
+fn program_dir(tag: Str) -> Str ! FS.Write, Process.Spawn, Env.Read {
+    let dir = "{compile_test_helpers.scratch_root()}/{tag}"
+    let _ = sh("mkdir -p {dir}")
+    fs.write("{dir}/x.bl", "fn main() \{\n    io.println(\"hi\")\n}\n").unwrap()
+    dir
+}
+
+// Runs `blink args` in dir with the knob set.
+fn with_knob(dir: Str, args: Str) -> ProcessResult ! Process.Spawn {
+    sh("B=$(pwd)/build/blink; cd {dir} && BLINK_DEV_BACK_END_ICE=1 $B {args}")
+}
+
+// What is wrong with how a back-end internal error stopped, or "".
+fn ice_stop_error(r: ProcessResult, what: Str) -> Str {
+    if r.end != ChildEnd.Exited(101) { return "{what}: ended with {r.end}, not 101; stderr: {r.err_out}" }
+    if !r.err_out.contains("internal compiler error[CodegenStageNotBuilt]") { return "{what}: stderr has no internal error: {r.err_out}" }
+    if !r.err_out.contains(PASSES_CHECK_NOTE) { return "{what}: stderr has no note that the source passes check: {r.err_out}" }
+    ""
+}
+
+test "blink build exits 101 on an internal error after a clean front end" {
+    let dir = program_dir("build_one_unit")
+    assert_eq(ice_stop_error(with_knob(dir, "build --no-per-module x.bl"), "build --no-per-module"), "")
+    assert_eq(ice_stop_error(with_knob(dir, "build --per-module x.bl"), "build --per-module"), "")
+    let _ = sh("rm -rf {dir}")
+}
+
+test "blink run exits 101 on an internal error after a clean front end" {
+    let dir = program_dir("run")
+    let r = with_knob(dir, "run x.bl")
+    assert_eq(ice_stop_error(r, "run"), "")
+    assert(!r.out.contains("hi"), "the program ran: {r.out}")
+    let _ = sh("rm -rf {dir}")
+}
+
+test "blinkc exits 101 on an internal error after a clean front end" {
+    let dir = program_dir("blinkc")
+    // The test runs from the repo root, where build/blinkc is.
+    let r = sh("BLINK_DEV_BACK_END_ICE=1 build/blinkc {dir}/x.bl {dir}/x.c")
+    assert_eq(ice_stop_error(r, "blinkc"), "")
+    let _ = sh("rm -rf {dir}")
+}
+
+test "under json diagnostics the note is in the notes of the internal error row" {
+    let dir = program_dir("build_json")
+    let r = with_knob(dir, "build --json x.bl")
+    assert_eq(r.end, ChildEnd.Exited(101))
+    assert(r.err_out.contains("\"code\":\"I0004\""), "stderr: {r.err_out}")
+    assert(r.err_out.contains("this source passes `blink check`; the cause is a bug of the compiler"), "stderr: {r.err_out}")
+    let _ = sh("rm -rf {dir}")
+}
+
+test "blink check does not run the back end, so the knob does not stop it" {
+    let dir = program_dir("check")
+    let r = with_knob(dir, "check x.bl")
+    assert_eq(r.end, ChildEnd.Exited(0))
+    let _ = sh("rm -rf {dir}")
+}
