@@ -1,0 +1,133 @@
+// A type that holds itself at a larger type argument has no finite set of instances
+// (sections/03_types.md §3.4 *Limit on Generic Instances*). The front end still reads such a
+// type at an instance, so each walk over its fields must end. A file with a type error shows
+// that error alone: no crash, no hang and no cycle error.
+
+import compile_test_helpers.{check_via_cli}
+
+fn error_count(out: Str) -> Int {
+    let mut n = 0
+    for line in out.split("\n") {
+        if line.contains("\"severity\":\"error\"") { n = n + 1 }
+    }
+    n
+}
+
+fn assert_only_the_type_error(src: Str, tag: Str) ! FS.Write, FS.Delete, Env.Read, Process.Spawn {
+    let out = check_via_cli(src, "{tag}_{getpid()}")
+    assert_eq(error_count(out), 1)
+    assert(out.contains("\"code\":\"E0300\""), out)
+    assert(out.contains("\"code\":\"E0324\"") == false, out)
+}
+
+test "a read of an enum that holds itself larger ends" {
+    assert_only_the_type_error(#"type P[T] { Leaf(v: T), Node(p: P[(T, T)]) }
+fn main() {
+    let x: P[Int] = P.Leaf(1)
+    let bad: Int = "s"
+}
+"#, "enum_read")
+}
+
+test "a read of a struct that holds itself larger behind a List ends" {
+    assert_only_the_type_error(#"type Q[T] { v: T, next: List[Q[List[T]]] }
+fn main() {
+    let x: Q[Int] = Q { v: 1, next: [] }
+    let n = x.next.len()
+    let bad: Int = "s"
+}
+"#, "struct_read")
+}
+
+test "two types that grow through each other end" {
+    assert_only_the_type_error(#"type A[T] { b: Option[B[List[T]]] }
+type B[T] { a: Option[A[T]] }
+fn take(a: A[Int]) -> Int { 1 }
+fn main() {
+    let n = take(A { b: None })
+    let bad: Int = "s"
+}
+"#, "mutual")
+}
+
+test "== and clone on a derived enum that holds itself larger end" {
+    assert_only_the_type_error(#"@derive(Eq, Ord, Clone, Hash, Debug)
+type P[T] { Leaf(v: T), Node(p: P[(T, T)]) }
+fn main() {
+    let x: P[Int] = P.Leaf(1)
+    let y = x.clone()
+    let same = x == y
+    let less = x < y
+    let bad: Int = "s"
+}
+"#, "derive_enum")
+}
+
+test "== and clone on a derived struct that holds itself larger end" {
+    assert_only_the_type_error(#"@derive(Eq, Clone, Debug)
+type Q[T] { v: T, next: Option[Q[(T, T)]] }
+fn main() {
+    let x: Q[Int] = Q { v: 1, next: None }
+    let y = x.clone()
+    let same = x == y
+    let bad: Int = "s"
+}
+"#, "derive_struct")
+}
+
+test "a Set and a Map key of a type that holds itself larger end" {
+    assert_only_the_type_error(#"@derive(Eq, Hash)
+type P[T] { Leaf(v: T), Node(p: P[(T, T)]) }
+fn main() {
+    let s: Set[P[Int]] = Set()
+    let m: Map[P[Int], Int] = Map()
+    let bad: Int = "s"
+}
+"#, "hash_key")
+}
+
+test "a match on a type that holds itself larger ends" {
+    assert_only_the_type_error(#"type P[T] { Leaf(v: T), Node(p: P[(T, T)]) }
+fn g[T](x: P[T]) -> Int {
+    match x {
+        P.Leaf(_) => 1
+        P.Node(q) => g[(T, T)](q)
+    }
+}
+fn main() {
+    let x: P[Int] = P.Leaf(1)
+    let n = g(x)
+    let bad: Int = "s"
+}
+"#, "match")
+}
+
+test "a Ptr at a type that holds itself larger ends the pointer walks" {
+    assert_only_the_type_error(#"import blink.ffi
+type P[T] { v: T, next: Option[P[List[T]]] }
+fn main() {
+    with ffi.scope() as s {
+        let p: Ptr[Int] = s.alloc()
+        let x = P { v: p, next: None }
+        let bad: Int = "s"
+    }
+}
+"#, "ptr")
+}
+
+test "a type with a fixed argument in its recursion still counts as holding a pointer" {
+    let out = check_via_cli(#"import blink.ffi
+type Y[T] { v: T, b: Option[Y[Ptr[Int]]] }
+fn leak() -> Y[Int] {
+    let mut kept: Y[Int] = Y { v: 1, b: None }
+    with ffi.scope() as s {
+        let p: Ptr[Int] = s.alloc()
+        kept = Y { v: 1, b: Some(Y { v: p, b: None }) }
+    }
+    kept
+}
+fn main() { let k = leak().v; print(k) }
+"#, "fixed_arg_{getpid()}")
+    assert(out.contains("\"code\":\"E0601\""), out)
+    assert(out.contains("\"code\":\"E0324\"") == false, out)
+}

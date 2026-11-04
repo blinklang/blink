@@ -4528,13 +4528,13 @@ pub fn tc_declared_field_tids(tid0: Int) -> List[Int] {
 // through its type.
 pub fn tc_tid_is_pointer_bearing(tid: Int) -> Int {
     let r = tc_resolve(tid)
-    match tc_ptr_bearing_memo.get(r) {
+    match tc_type_walks.ptr_bearing.get(r) {
         Some(hit) => { return hit }
         None => {}
     }
     let mut seen: Map[Int, Int] = Map()
     let answer = ptr_bearing_walk(r, seen)
-    if !seen.contains_key(PTR_BEARING_MET_METAVAR) { tc_ptr_bearing_memo.insert(r, answer) }
+    if !seen.contains_key(PTR_BEARING_MET_METAVAR) { tc_type_walks.ptr_bearing.insert(r, answer) }
     answer
 }
 
@@ -4543,7 +4543,12 @@ pub fn tc_tid_is_pointer_bearing(tid: Int) -> Int {
 // entry, the field declarations and the instances they map to are fixed once interned, so
 // only init_types, which clears them, clears this. The one entry that can still change is a
 // metavar a later unify binds, so a walk that meets an unbound one is not kept.
-let mut tc_ptr_bearing_memo: Map[Int, Int] = Map()
+// decl_grows caches tc_tid_decl_grows, and is fixed once interned for the same reason.
+type TypeWalkMemos {
+    ptr_bearing: Map[Int, Int]
+    decl_grows: Map[Int, Bool]
+}
+let mut tc_type_walks: TypeWalkMemos = TypeWalkMemos { ptr_bearing: Map(), decl_grows: Map() }
 let PTR_BEARING_MET_METAVAR = -2
 
 fn ptr_bearing_walk(r: Int, seen: Map[Int, Int]) -> Int {
@@ -4554,7 +4559,7 @@ fn ptr_bearing_walk(r: Int, seen: Map[Int, Int]) -> Int {
     let k = type_kind(r)
     if k == TyKind.Ptr { return 1 }
     if k == TyKind.Fn { return 0 }
-    if k == TyKind.Struct || k == TyKind.Enum {
+    if (k == TyKind.Struct || k == TyKind.Enum) && !tc_tid_decl_grows(r) {
         for f in tc_declared_field_tids(r) {
             if ptr_bearing_walk(tc_resolve(tc_member_tid_at_instance(f, r)), seen) != 0 { return 1 }
         }
@@ -4565,6 +4570,80 @@ fn ptr_bearing_walk(r: Int, seen: Map[Int, Int]) -> Int {
         i = i + 1
     }
     0
+}
+
+// Whether a type argument holds a type parameter inside a type constructor. A parameter alone
+// does not grow: `T`, or another parameter of the declaration (a swap).
+pub fn tc_type_arg_grows(arg0: Int) -> Bool {
+    let arg = tc_resolve(arg0)
+    if type_kind(arg) == TyKind.Typevar { return false }
+    tc_tid_holds_typevar(arg)
+}
+
+fn tc_tid_holds_typevar(tid0: Int) -> Bool {
+    let tid = tc_resolve(tid0)
+    if type_kind(tid) == TyKind.Typevar { return true }
+    let mut i = 0
+    while i < tc_tid_child_count(tid) {
+        if tc_tid_holds_typevar(tc_tid_child(tid, i)) { return true }
+        i = i + 1
+    }
+    false
+}
+
+// Whether the declaration of this struct or enum reaches itself through its field types with a
+// type argument that grew (§3.4 *Limit on Generic Instances*). Such a type has no last instance,
+// so a walk over its fields at an instance would not end. The program can never build, because
+// E0324 rejects it once the front end is clean, so each walk stops at its fields and the answer
+// it gives there reaches no build. A declaration with no such cycle is read as before.
+pub fn tc_tid_decl_grows(tid0: Int) -> Bool {
+    let r = tc_resolve(tid0)
+    let k = type_kind(r)
+    if k != TyKind.Struct && k != TyKind.Enum { return false }
+    let base = if k == TyKind.Struct { tc_struct_base_tid(r) } else { tc_enum_base_tid(r) }
+    match tc_type_walks.decl_grows.get(base) {
+        Some(hit) => { return hit }
+        None => {}
+    }
+    let mut seen: Map[Int, Int] = Map()
+    let answer = decl_grows_walk(base, base, false, seen)
+    tc_type_walks.decl_grows.insert(base, answer)
+    answer
+}
+
+// A state is a declaration and whether a type argument has grown on the way to it, so a search
+// that reached a declaration with no growth can still pass through it with growth.
+fn decl_grows_walk(target: Int, decl: Int, grown: Bool, seen: Map[Int, Int]) -> Bool {
+    let key = decl * 2 + (if grown { 1 } else { 0 })
+    if seen.contains_key(key) { return false }
+    seen.insert(key, 1)
+    for f in tc_declared_field_tids(decl) {
+        if decl_grows_field_walk(target, f, grown, seen) { return true }
+    }
+    false
+}
+
+fn decl_grows_field_walk(target: Int, tid0: Int, grown: Bool, seen: Map[Int, Int]) -> Bool {
+    let tid = tc_resolve(tid0)
+    let k = type_kind(tid)
+    let n = tc_tid_child_count(tid)
+    if (k == TyKind.Struct || k == TyKind.Enum) && n > 0 {
+        let mut now = grown
+        let mut i = 0
+        while i < n {
+            if tc_type_arg_grows(tc_tid_child(tid, i)) { now = true }
+            i = i + 1
+        }
+        let decl = if k == TyKind.Struct { tc_struct_base_tid(tid) } else { tc_enum_base_tid(tid) }
+        if decl == target && now { return true }
+        if decl_grows_walk(target, decl, now, seen) { return true }
+    }
+    let mut j = 0
+    while j < n {
+        if decl_grows_field_walk(target, tc_tid_child(tid, j), grown, seen) { return true }
+        j = j + 1
+    }
+    false
 }
 
 // The first struct or enum a value of this type holds inside itself, or -1. A function,
@@ -15965,7 +16044,7 @@ fn tc_drop_unprovided_closeable_impls(program: Int) {
 
 fn init_types() ! TypeCheck.Register {
     ty_pool.clear()
-    tc_ptr_bearing_memo.clear()
+    tc_type_walks = TypeWalkMemos { ptr_bearing: Map(), decl_grows: Map() }
     tc_arg_binds_free.clear()
     ty_param_list.clear()
     // The method-call facts span all three phases of one check_types, so they are cleared
@@ -26119,9 +26198,9 @@ fn tc_struct_need_fields(tid: Int, base: Int, tr: Str, visiting: List[Int]) -> L
 // An instance already being walked counts as having the trait, which lets a recursive type
 // answer from its other parts. The walk is keyed by instance, so `Box[Box[Widget]]` still
 // reads `Box[Widget]`; a type whose recursion grows its arguments (`Nest[A]` holding a `Nest[List[A]]`)
-// would never repeat one, so past a fixed depth the walk stops and asks nothing.
+// would never repeat one, so the walk stops there and asks nothing, as it does past a fixed depth.
 fn tc_need_visited(visiting: List[Int], tid: Int) -> Bool {
-    if visiting.len() >= 32 { return true }
+    if visiting.len() >= 32 || tc_tid_decl_grows(tid) { return true }
     for v in visiting {
         if tc_tid_same_type(v, tid) { return true }
     }
