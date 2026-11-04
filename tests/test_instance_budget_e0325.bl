@@ -1,0 +1,296 @@
+// A program that needs too many generic instances is E0325 (sections/03_types.md §3.4 *Limit on
+// Generic Instances*). Each route that builds an instance pays, and a shape with no end stops at the
+// budget, in check and in build, with no hang and no run out of memory.
+
+import std.process.{ChildEnd}
+import compile_test_helpers.{check_via_cli, compile_and_run, scratch_root, verify_catalog_entry}
+
+fn error_count(out: Str) -> Int {
+    let mut n = 0
+    for line in out.split("\n") {
+        if line.contains("\"severity\":\"error\"") { n = n + 1 }
+    }
+    n
+}
+
+fn assert_limit(src: Str, tag: Str) -> Str ! FS.Write, FS.Delete, Env.Read, Process.Spawn {
+    let out = check_via_cli(src, "lim_{tag}_{getpid()}")
+    assert(out.contains("\"code\":\"E0325\""), out)
+    assert_eq(error_count(out), 1)
+    out
+}
+
+fn check_text(src: Str, tag: Str) -> Str ! FS.Write, FS.Delete, Env.Read, Process.Spawn {
+    let path = "{scratch_root()}/lim_{tag}_{getpid()}.bl"
+    fs.write(path, src).unwrap()
+    let result = process.run("build/blink", ["check", path]).unwrap()
+    let _ = fs.delete(path)
+    "{result.out}{result.err_out}"
+}
+
+fn grow_src() -> Str {
+    #"trait Grow { fn g(self, n: Int) -> Int }
+type Box[T] { v: T }
+impl Grow for Int { fn g(self, n: Int) -> Int { n } }
+fn h[T: Grow](x: T, n: Int) -> Int { x.g(n) }
+impl[U: Grow] Grow for Box[U] {
+    fn g(self, n: Int) -> Int {
+        if n == 0 { 0 } else { h(Box { v: self }, n - 1) }
+    }
+}
+fn main() { io.println("{h(Box { v: 1 }, 2)}") }
+"#
+}
+
+// A chain of `count` fns, each of which calls the next at `(x, x)`. The types double at each step, so
+// the chain is finite and each fn has one instance.
+fn doubling_chain(count: Int) -> Str {
+    let mut out = ""
+    let mut i = 1
+    while i < count {
+        out = "{out}fn f{i}[T](x: T) -> Int \{ f{i + 1}((x, x)) }\n"
+        i = i + 1
+    }
+    "{out}fn f{count}[T](x: T) -> Int \{ 0 }\nfn main() \{ io.println(\"\{f1(1)}\") }\n"
+}
+
+test "the catalog explains the budget error" {
+    verify_catalog_entry("E0325", "InstanceLimit")
+}
+
+test "growth through a bound ends at the budget, and the span is the call where the type grew" {
+    let out = assert_limit(grow_src(), "grow")
+    assert(out.contains("the generic instances of this program weigh more than 1,048,576"), out)
+    assert(out.contains("\"line\":7,\"col\":32,\"end_line\":7,\"end_col\":57"), out)
+    assert(out.contains("`T` of `h` becomes `Box[T]` here"), out)
+}
+
+test "the error has the root note, the repeat note and the note that the compiler does not read n" {
+    let out = check_text(grow_src(), "grow_text")
+    assert(out.contains("error[InstanceLimit]: the generic instances of this program weigh more than 1,048,576"), out)
+    assert(out.contains("the chain starts at the call `h(Box \{ v: 1 }, 2)` at "), out)
+    assert(out.contains(":10:26"), out)
+    assert(out.contains("`h` appears again with a larger type: `h[Box[Int]]`, then `h[Box[Box[Int]]]`, then `h[Box[Box[Box[...]]]]`; it has "), out)
+    assert(out.contains("the compiler builds one copy for each type. It does not read `n`, so `n == 0` does not end the chain"), out)
+    assert(out.contains("write the growing part as a recursive type"), out)
+    assert(out.contains("type Nest[T] \{ One(v: T), Wrap(inner: Nest[T]) }"), out)
+    assert(!out.contains("budget"), out)
+}
+
+test "the message prints no type past depth 3 and stays short" {
+    let out = check_text(grow_src(), "grow_short")
+    assert(!out.contains("Box[Box[Box[Box["), out)
+    assert(out.split("\n").len() <= 24, out)
+}
+
+test "the JSON form carries the edge list of the chain from the root" {
+    let out = assert_limit(grow_src(), "grow_json")
+    assert(out.contains("\"edges\":[\{\"decl\":\"h\",\"param\":\"T\",\"becomes\":\"Box[Int]\",\"span\":\{"), out)
+    assert(out.contains("\"decl\":\"g\",\"param\":\"U\""), out)
+}
+
+test "a chain whose type grows in an imported module still names the root call in user code" {
+    let dir = "{scratch_root()}/lim_module_{getpid()}"
+    process.run("sh", ["-c", "mkdir -p {dir}/src"]).unwrap()
+    fs.write("{dir}/blink.toml", "[package]\nname = \"limmodule\"\nversion = \"0.1.0\"\n").unwrap()
+    fs.write("{dir}/src/growlib.bl", #"pub trait Tr { fn m(self) -> Int }
+pub type Wrap[T] { v: T }
+pub fn wrap_up[T: Tr](x: T) -> Int { reach(Wrap { v: x }) }
+fn reach[T: Tr](x: T) -> Int { x.m() }
+"#).unwrap()
+    fs.write("{dir}/src/main.bl", #"import growlib.{Tr, Wrap, wrap_up}
+impl Tr for Int { fn m(self) -> Int { self } }
+impl[U: Tr] Tr for Wrap[U] {
+    fn m(self) -> Int { wrap_up(self) }
+}
+fn main() { io.println("{wrap_up(1)}") }
+"#).unwrap()
+    let result = process.run("build/blink", ["check", "{dir}/src/main.bl"]).unwrap()
+    let out = "{result.out}{result.err_out}"
+    assert(out.contains("error[InstanceLimit]"), out)
+    assert(out.contains("growlib.bl:3"), out)
+    assert(out.contains("note: the chain starts at the call `wrap_up(1)`"), out)
+}
+
+test "a program with a call on a bound that ends is legal: the Wrap program prints 7" {
+    let r = compile_and_run(#"trait Foo { fn foo(self) -> Int }
+type Box[T] { v: T }
+type Wrap[T] { v: T }
+fn f[T: Foo](x: T) -> Int { x.foo() }
+impl[U] Foo for Box[U] { fn foo(self) -> Int { f(Wrap { v: self }) } }
+impl[U] Foo for Wrap[U] { fn foo(self) -> Int { 7 } }
+fn main() { io.println("{f(Box { v: 1 })}") }
+"#, "lim_wrap_{getpid()}")
+    assert_eq(r.exit_code, 0)
+    assert_eq(r.out.trim(), "7")
+}
+
+test "a program with a call on a bound that ends is legal: the W program prints 7" {
+    let r = compile_and_run(#"trait M { fn m(self) -> Int }
+impl M for Int { fn m(self) -> Int { self } }
+type W[T] { v: T }
+impl[U: M] M for List[U] { fn m(self) -> Int { g(W { v: W { v: self.get(0).unwrap() } }) } }
+impl[U: M] M for W[U] { fn m(self) -> Int { self.v.m() } }
+fn g[T: M](x: T) -> Int { x.m() }
+fn main() { io.println("{[[7]].m()}") }
+"#, "lim_w_{getpid()}")
+    assert_eq(r.exit_code, 0)
+    assert_eq(r.out.trim(), "7")
+}
+
+test "growth through a bound in a generic method of its own pays the budget" {
+    let _ = assert_limit(#"trait Grow { fn g[V](self, v: V) -> Int }
+type Box[T] { v: T }
+impl Grow for Int { fn g[V](self, v: V) -> Int { 0 } }
+impl[U: Grow] Grow for Box[U] {
+    fn g[V](self, v: V) -> Int { Box { v: self }.next(v) }
+}
+trait Next { fn next[V](self, v: V) -> Int }
+impl[U: Grow] Next for Box[U] {
+    fn next[V](self, v: V) -> Int { h(self, [v]) }
+}
+fn h[T: Grow, V](x: T, v: V) -> Int { x.g(v) }
+fn main() { io.println("{Box { v: 1 }.g(1)}") }
+"#, "own")
+}
+
+test "growth through a bound that fills a trait default at each type pays the budget" {
+    let _ = assert_limit(#"trait Tr { fn m(self, -- k: List[Self] = []) -> Int }
+type Box[T] { v: T }
+impl Tr for Int { fn m(self, -- k: List[Int] = []) -> Int { k.len() } }
+fn h[T: Tr](x: T) -> Int { x.m() }
+impl[U: Tr] Tr for Box[U] {
+    fn m(self, -- k: List[Box[U]] = []) -> Int { k.len() + h(Box { v: self }) }
+}
+fn main() { io.println("{h(Box { v: 1 })}") }
+"#, "fill")
+}
+
+test "growth through a bound that reaches only a type instance pays the budget" {
+    let _ = assert_limit(#"trait Grow { fn g(self) -> Int }
+type Box[T] { v: T }
+type Hold[T] { b: Box[T] }
+impl Grow for Int { fn g(self) -> Int { 0 } }
+impl[U: Grow] Grow for Box[U] {
+    fn g(self) -> Int { pass(Hold { b: self }) }
+}
+impl[U: Grow] Grow for Hold[U] {
+    fn g(self) -> Int { self.b.g() + pass(Box { v: self }) }
+}
+fn pass[T: Grow](x: T) -> Int { x.g() }
+fn main() { io.println("{pass(Box { v: 1 })}") }
+"#, "type")
+}
+
+test "a finite chain whose types double is E0325, at the call that made the crossing instance" {
+    let src = doubling_chain(26)
+    let out = assert_limit(src, "chain")
+    assert(out.contains("`f1` has the most: 1 instance. Write a recursive type, or a named type for the part that repeats"), out)
+    assert(out.contains("the chain starts at the call `f1(1)`"), out)
+    assert(out.contains("the compiler builds one copy for each type"), out)
+}
+
+test "when two declarations have the same count the note names the one built first" {
+    let out = assert_limit(#"fn pick[T](x: T) -> Int { 0 }
+fn other[T](x: T) -> Int { 0 }
+fn f1[T](x: T) -> Int { other(x) + pick(x) + f2(((((x, x), (x, x)), ((x, x), (x, x))), (((x, x), (x, x)), ((x, x), (x, x))))) }
+fn f2[T](x: T) -> Int { other(x) + pick(x) + f3(((((x, x), (x, x)), ((x, x), (x, x))), (((x, x), (x, x)), ((x, x), (x, x))))) }
+fn f3[T](x: T) -> Int { other(x) + pick(x) + f4(((((x, x), (x, x)), ((x, x), (x, x))), (((x, x), (x, x)), ((x, x), (x, x))))) }
+fn f4[T](x: T) -> Int { other(x) + pick(x) + f5(((((x, x), (x, x)), ((x, x), (x, x))), (((x, x), (x, x)), ((x, x), (x, x))))) }
+fn f5[T](x: T) -> Int { other(x) + pick(x) + f6(((((x, x), (x, x)), ((x, x), (x, x))), (((x, x), (x, x)), ((x, x), (x, x))))) }
+fn f6[T](x: T) -> Int { other(x) + pick(x) + f7(((((x, x), (x, x)), ((x, x), (x, x))), (((x, x), (x, x)), ((x, x), (x, x))))) }
+fn f7[T](x: T) -> Int { other(x) + pick(x) + f8(((((x, x), (x, x)), ((x, x), (x, x))), (((x, x), (x, x)), ((x, x), (x, x))))) }
+fn f8[T](x: T) -> Int { other(x) + pick(x) }
+fn main() { io.println("{f1(1)}") }
+"#, "tie")
+    assert(out.contains("`other` has the most: "), out)
+}
+
+test "a type argument far past the budget in one step stops before the build reads it" {
+    let mut src = ""
+    let wide = "(((((x, x), (x, x)), ((x, x), (x, x))), (((x, x), (x, x)), ((x, x), (x, x)))), ((((x, x), (x, x)), ((x, x), (x, x))), (((x, x), (x, x)), ((x, x), (x, x)))))"
+    let mut i = 1
+    while i < 40 {
+        src = "{src}fn f{i}[T](x: T) -> Int \{ f{i + 1}({wide}) }\n"
+        i = i + 1
+    }
+    let out = assert_limit("{src}fn f40[T](x: T) -> Int \{ 0 }\nfn main() \{ io.println(\"\{f1(1)}\") }\n", "wide")
+    assert(out.contains("the generic instances of this program weigh more"), out)
+}
+
+test "build stops at the budget too, with the same error" {
+    let path = "{scratch_root()}/lim_build_{getpid()}.bl"
+    fs.write(path, grow_src()).unwrap()
+    let result = process.run("build/blink", ["build", path, "-o", "{path}.bin"]).unwrap()
+    let _ = fs.delete(path)
+    assert(result.end != ChildEnd.Exited(0))
+    assert("{result.out}{result.err_out}".contains("error[InstanceLimit]"), result.err_out)
+}
+
+test "a file with a type error shows that error, with no budget error" {
+    let out = check_via_cli("{grow_src()}\nfn bad() -> Int \{ \"no\" }\n", "lim_front_{getpid()}")
+    assert(out.contains("\"code\":\"E0300\""), out)
+    assert(!out.contains("E0325"), out)
+    assert_eq(error_count(out), 1)
+}
+
+test "the repair for a chain of 24 fns: fns that take a recursive type print 8388608" {
+    let mut src = "type Tree[T] \{ Leaf(v: T), Pair(l: Tree[T], r: Tree[T]) }\nfn leaves[T](t: Tree[T]) -> Int \{\n    match t \{\n        Tree.Leaf(_) => 1\n        Tree.Pair(l, r) => leaves(l) + leaves(r)\n    }\n}\n"
+    let mut i = 1
+    while i < 24 {
+        src = "{src}fn f{i}[T](x: Tree[T]) -> Int \{ f{i + 1}(Tree.Pair(x, x)) }\n"
+        i = i + 1
+    }
+    src = "{src}fn f24[T](x: Tree[T]) -> Int \{ leaves(x) }\nfn main() \{ io.println(\"\{f1(Tree.Leaf(1))}\") }\n"
+    let r = compile_and_run(src, "lim_tree_{getpid()}")
+    assert_eq(r.exit_code, 0)
+    assert_eq(r.out.trim(), "8388608")
+}
+
+test "the repair for a box that wraps itself: a recursive type builds" {
+    let r = compile_and_run(#"type Nest[T] { One(v: T), Wrap(inner: Nest[T]) }
+trait Grow { fn g(self, n: Int) -> Int }
+impl[T] Grow for Nest[T] {
+    fn g(self, n: Int) -> Int {
+        if n == 0 { 0 } else { h(Nest.Wrap(self), n - 1) + 1 }
+    }
+}
+fn h[T: Grow](x: T, n: Int) -> Int { x.g(n) }
+fn main() { io.println("{h(Nest.One(1), 2)}") }
+"#, "lim_nest_{getpid()}")
+    assert_eq(r.exit_code, 0)
+    assert_eq(r.out.trim(), "2")
+}
+
+test "the repair for 26 tuple levels: a named type for each level builds" {
+    let mut src = "type N0 \{ v: Int }\n"
+    let mut i = 1
+    while i <= 26 {
+        src = "{src}type N{i} \{ a: N{i - 1}, b: N{i - 1} }\n"
+        i = i + 1
+    }
+    src = "{src}fn id[T](x: T) -> T \{ x }\nfn main() \{\n    let x = id(N0 \{ v: 3 })\n    io.println(\"\{x.v}\")\n}\n"
+    let r = compile_and_run(src, "lim_named_{getpid()}")
+    assert_eq(r.exit_code, 0)
+    assert_eq(r.out.trim(), "3")
+}
+
+test "a type past the budget that only a traced build reaches is E0325" {
+    let path = "{scratch_root()}/lim_traced_{getpid()}.bl"
+    fs.write(path, #"type Box[T] { v: T }
+impl[T] Debug for Box[T] {
+    fn debug(self) -> Str {
+        let _b: Option[Box[List[T]]] = None
+        "x"
+    }
+}
+fn main() {
+    let _b = Box { v: 1 }
+}
+"#).unwrap()
+    let result = process.run("build/blink", ["run", "--trace", path]).unwrap()
+    let _ = fs.delete(path)
+    let out = "{result.out}{result.err_out}"
+    assert(out.contains("error[InstanceLimit]"), out)
+    assert(!out.contains("internal compiler error"), out)
+}

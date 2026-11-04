@@ -21,6 +21,7 @@ fn assert_cycle(src: Str, tag: Str, message: Str) ! FS.Write, FS.Delete, Env.Rea
 
 fn assert_no_error(src: Str, tag: Str) ! FS.Write, FS.Delete, Env.Read, Process.Spawn {
     let out = check_via_cli(src, "cyc_{tag}_{getpid()}")
+    assert(out.contains("\"status\":\"ok\""), out)
     assert_eq(error_count(out), 0)
 }
 
@@ -99,6 +100,64 @@ fn main() { }
 "#, "field_fn", "`F` needs `F[List[T]]` inside `F[T]`, without end")
 }
 
+test "a qualified call of a shared impl method takes its receiver from the first argument" {
+    assert_cycle(#"trait X { fn x(self, n: Int) -> Int }
+impl[T] X for List[T] {
+    fn x(self, n: Int) -> Int {
+        if n <= 0 { return 0 }
+        X.x([self], n - 1)
+    }
+}
+fn main() { }
+"#, "shared_qualified", "`x` needs `X for List[List[T]]` inside `X for List[T]`, without end")
+}
+
+test "a qualified self-call of a method's own type parameter is an edge" {
+    assert_cycle(#"trait Tm { fn m[U](self, xs: List[U], n: Int) -> Int }
+type H { v: Int }
+impl Tm for H {
+    fn m[U](self, xs: List[U], n: Int) -> Int {
+        if n <= 0 { return xs.len() }
+        Tm.m(self, [xs], n - 1)
+    }
+}
+fn main() { }
+"#, "qualified_own", "`m` needs `m[List[U]]` inside `m[U]`, without end")
+}
+
+test "a shared impl method's own type parameter is an edge" {
+    assert_cycle(#"trait Y { fn g[U](self, x: U, n: Int) -> Int }
+impl[T] Y for List[T] {
+    fn g[U](self, x: U, n: Int) -> Int {
+        if n <= 0 { return 0 }
+        self.g([x], n - 1)
+    }
+}
+fn main() { }
+"#, "shared_own", "`g` needs `Y for List[T].g[List[U]]` inside `Y for List[T].g[U]`, without end")
+}
+
+test "a cycle does not hide the errors of the analyses that read no instance" {
+    let out = check_via_cli(#"type G[T] { v: Option[G[List[T]]] }
+type Ctx { v: Int }
+type BH { x: Int }
+impl BlockHandler for BH {
+    type Context = Ctx
+    fn enter(self) -> Ctx { Ctx { v: 1 } }
+    fn exit(self, ok: Bool) { }
+}
+fn main() {
+    async.scope {
+        with BH { x: 0 } as ctx {
+            let _h = async.spawn(fn() { ctx.v })
+        }
+    }
+}
+"#, "other_errors_{getpid()}")
+    assert(out.contains("\"code\":\"E0324\""), out)
+    assert(out.contains("\"code\":\"E0601\""), out)
+}
+
 test "two types that grow through each other are one cycle" {
     assert_cycle(#"type A[T] { b: Option[B[List[T]]] }
 type B[U] { a: Option[A[U]] }
@@ -107,10 +166,13 @@ fn main() { }
 }
 
 test "a field default that calls a generic fn is an edge" {
-    assert_cycle(#"type D[T] { n: Int = 0, more: Option[T] = pick[D[List[T]]]() }
-fn pick[U]() -> Option[U] { None }
+    assert_cycle(#"type D[T] { n: Int = g[List[T]]() }
+fn g[V]() -> Int {
+    let d: D[V] = D { }
+    d.n
+}
 fn main() { }
-"#, "field_default", "`D` needs ")
+"#, "field_default", "`D` needs `g[List[T]]` inside `D[T]`")
 }
 
 test "a type written in a fn body is an edge" {
@@ -273,7 +335,7 @@ fn main() { io.println("{a("s", 2)}") }
 "#, "concrete")
 }
 
-// The rule reads declarations, so these finite programs are errors while the rule stands.
+// The rule reads declarations and not values, so `n` does not make these programs pass.
 test "a cycle with a growing edge is an error at the declaration even if the program is finite" {
     assert_cycle(#"fn f[T, U](x: T, y: U, n: Int) -> Int {
     if n == 0 { return 0 }

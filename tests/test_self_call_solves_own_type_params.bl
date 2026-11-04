@@ -1,0 +1,286 @@
+// A call from a generic fn to itself follows the rule of any other call (sections/03_types.md, the self-call
+// rule of §3.4): the type parameters of the callee are not those of the body. A growing self-call is
+// E0324, and a parameter that nothing fixes is E0301, with a help that compiles.
+
+import compile_test_helpers.{check_via_cli, compile_and_run}
+
+fn error_count(out: Str) -> Int {
+    let mut n = 0
+    for line in out.split("\n") {
+        if line.contains("\"severity\":\"error\"") { n = n + 1 }
+    }
+    n
+}
+
+fn assert_e0301(src: Str, tag: Str, help: Str) ! FS.Write, FS.Delete, Env.Read, Process.Spawn {
+    let out = check_via_cli(src, "self_{tag}_{getpid()}")
+    assert(out.contains("\"code\":\"E0301\""), out)
+    assert_eq(error_count(out), 1)
+    assert(out.contains(help), out)
+}
+
+fn assert_ok(src: Str, tag: Str) ! FS.Write, FS.Delete, Env.Read, Process.Spawn {
+    let out = check_via_cli(src, "self_{tag}_{getpid()}")
+    assert(out.contains("\"status\":\"ok\""), out)
+    assert_eq(error_count(out), 0)
+}
+
+test "an empty list in a self-call does not take the type of the enclosing fn" {
+    assert_e0301(#"fn e[T](xs: List[T], n: Int) -> Int {
+    if n == 0 { return xs.len() }
+    e([], n - 1)
+}
+"#, "list", "write the type arguments at this call: `e[T]([], n - 1)`")
+}
+
+test "the written list that the help gives compiles" {
+    let r = compile_and_run(#"fn e[T](xs: List[T], n: Int) -> Int {
+    if n == 0 { return xs.len() }
+    e[T]([], n - 1)
+}
+fn main() { io.println("{e([1, 2], 1)}") }
+"#, "self_fix_{getpid()}")
+    assert_eq(r.exit_code, 0)
+    assert_eq(r.out.trim(), "0")
+}
+
+test "a self-call in a closure follows the same rule" {
+    assert_e0301(#"fn c[T](xs: List[T], n: Int) -> Int {
+    if n <= 0 { return xs.len() }
+    let f = fn(k: Int) -> Int { c([], k) }
+    f(n - 1)
+}
+"#, "closure", "`c[T]([], k)`")
+}
+
+test "a let with no type is reported at the let" {
+    let out = check_via_cli(#"fn d[T](xs: List[T], n: Int) -> Int {
+    if n <= 0 { return xs.len() }
+    let ys = []
+    d(ys, n - 1)
+}
+"#, "self_let_{getpid()}")
+    assert(out.contains("\"code\":\"E0301\""), out)
+    assert_eq(error_count(out), 1)
+    assert(out.contains("\"line\":3"), out)
+}
+
+test "an empty map in a self-call names both parameters" {
+    assert_e0301(#"fn m[K, V](mp: Map[K, V], n: Int) -> Int {
+    if n <= 0 { return mp.len() }
+    m(Map(), n - 1)
+}
+"#, "map", "`m[K, V](Map(), n - 1)`")
+}
+
+test "None in a self-call follows the same rule" {
+    assert_e0301(#"fn o[T](xs: Option[T], n: Int) -> Int {
+    if n <= 0 { return 0 }
+    o(None, n - 1)
+}
+"#, "none", "`o[T](None, n - 1)`")
+}
+
+test "a method's own type parameter follows the same rule" {
+    assert_e0301(#"trait Tm { fn m[U](self, xs: List[U], n: Int) -> Int }
+type Holder[T] { v: T }
+impl[T] Tm for Holder[T] {
+    fn m[U](self, xs: List[U], n: Int) -> Int {
+        if n <= 0 { return xs.len() }
+        self.m([], n - 1)
+    }
+}
+"#, "method", "`self.m[U]([], n - 1)`")
+}
+
+test "the help reads the list of the call, not of a call on its receiver" {
+    assert_e0301(#"type H[T] { v: T }
+trait Tm { fn mk(self) -> H[Int] }
+impl[T] Tm for H[T] { fn mk(self) -> H[Int] { H { v: 1 } } }
+trait Tq { fn q[U](self, xs: List[U], n: Int) -> Int }
+impl[T] Tq for H[T] {
+    fn q[U](self, xs: List[U], n: Int) -> Int {
+        if n <= 0 { return xs.len() }
+        self.mk().q([], (n - 1))
+    }
+}
+"#, "receiver", "`self.mk().q[U]([], (n - 1))`")
+}
+
+test "a type parameter of the impl, which the receiver fixes, needs no list" {
+    assert_ok(#"trait Tn[T] { fn m(self, xs: List[T], n: Int) -> Int }
+type Cell[T] { v: T }
+impl[T] Tn[T] for Cell[T] {
+    fn m(self, xs: List[T], n: Int) -> Int {
+        if n <= 0 { return xs.len() }
+        self.m([], n - 1)
+    }
+}
+"#, "impl_binder")
+}
+
+test "the return type of a tail fixes the parameter" {
+    assert_ok(#"fn t[T](xs: List[T], n: Int) -> List[T] {
+    if n <= 0 { return xs }
+    t([], n - 1)
+}
+"#, "tail")
+}
+
+test "an annotated let fixes the parameter" {
+    assert_ok(#"fn u[T](xs: List[T], n: Int) -> Int {
+    if n <= 0 { return xs.len() }
+    let e: List[T] = []
+    u(e, n - 1)
+}
+"#, "annotated")
+}
+
+test "a swap is legal, inferred or written, and it runs" {
+    let r = compile_and_run(#"fn swap[A, B](a: A, b: B, n: Int) -> Int {
+    if n == 0 { return 0 }
+    swap(b, a, n - 1)
+}
+fn swap2[A, B](a: A, b: B, n: Int) -> Int {
+    if n == 0 { return 7 }
+    swap2[B, A](b, a, n - 1)
+}
+fn main() { io.println("{swap(1, "s", 3)} {swap2(1, "s", 3)}") }
+"#, "self_swap_{getpid()}")
+    assert_eq(r.exit_code, 0)
+    assert_eq(r.out.trim(), "0 7")
+}
+
+test "a self-call whose inferred type argument grows is E0324" {
+    let out = check_via_cli(#"fn k4[T](x: T, n: Int) -> Int {
+    if n == 0 { return 0 }
+    k4([x], n - 1)
+}
+"#, "self_grow_{getpid()}")
+    assert(out.contains("\"code\":\"E0324\""), out)
+    assert_eq(error_count(out), 1)
+    assert(out.contains("`T` of `k4` becomes `List[T]`"), out)
+}
+
+test "the same self-call type still reads as the caller's type" {
+    let r = compile_and_run(#"fn r[T](xs: List[T], n: Int) -> Int {
+    if n == 0 { return xs.len() }
+    r(xs, n - 1)
+}
+fn main() { io.println("{r([1, 2], 3)}") }
+"#, "self_same_{getpid()}")
+    assert_eq(r.exit_code, 0)
+    assert_eq(r.out.trim(), "2")
+}
+
+test "a qualified self-call takes a new type for the method's own parameter" {
+    assert_ok(#"trait Tm { fn m[U](self, xs: List[U], n: Int) -> Int }
+type H { v: Int }
+impl Tm for H {
+    fn m[U](self, xs: List[U], n: Int) -> Int {
+        if n <= 0 { return xs.len() }
+        let e: List[Int] = [1]
+        Tm.m(self, e, n - 1)
+    }
+}
+fn main() { }
+"#, "qualified")
+}
+
+test "a qualified call of a method with its own type parameter builds and runs" {
+    let r = compile_and_run(#"trait Tm { fn m[U](self, x: U, n: Int) -> U ! IO.Print }
+type H { v: Int }
+impl Tm for H {
+    fn m[U](self, x: U, n: Int) -> U ! IO.Print {
+        if n <= 0 { return x }
+        let y: Int = Tm.m(self, self.v, n - 1)
+        io.println("{y}")
+        x
+    }
+}
+fn main() {
+    io.println(Tm.m(H { v: 3 }, "s", 1))
+}
+"#, "self_qualified_run_{getpid()}")
+    assert_eq(r.exit_code, 0)
+    assert_eq(r.out.trim(), "3\ns")
+}
+
+test "a qualified self-call answers with the type the call chose" {
+    assert_ok(#"trait Tm { fn m[U](self, x: U, n: Int) -> U }
+type H { v: Int }
+impl Tm for H {
+    fn m[U](self, x: U, n: Int) -> U {
+        if n <= 0 { return x }
+        let _y: Int = Tm.m(self, 1, n - 1)
+        x
+    }
+}
+fn main() { }
+"#, "qualified_ret")
+}
+
+test "a self-call on a builtin receiver answers with the type the call chose" {
+    assert_ok(#"trait Tm { fn m[U](self, x: U, n: Int) -> U }
+impl Tm for Str {
+    fn m[U](self, x: U, n: Int) -> U {
+        if n <= 0 { return x }
+        let _y: Int = self.m(1, n - 1)
+        x
+    }
+}
+fn main() { }
+"#, "builtin_ret")
+}
+
+test "the help writes the list after the callee when an argument holds a paren in a char" {
+    assert_e0301(#"fn e[T](xs: List[T], c: Char, n: Int) -> Int {
+    if n == 0 { return xs.len() }
+    e([], ')', n - 1)
+}
+fn main() { }
+"#, "char", "`e[T]([], ')', n - 1)`")
+}
+
+test "the help gives the form with placeholders for a call that fills more than one line" {
+    assert_e0301(#"fn e[T](xs: List[T], n: Int) -> Int {
+    if n == 0 { return xs.len() }
+    e(
+        [],
+        n - 1,
+    )
+}
+fn main() { }
+"#, "lines", "`e[T](...)`")
+}
+
+test "the help writes the type an argument fixed, so that the list compiles" {
+    assert_e0301(#"fn f[A, B](x: List[A], y: B, n: Int) -> Int {
+    if n <= 0 { return x.len() }
+    f([], 1, n - 1)
+}
+fn main() { }
+"#, "fixed", "`f[A, Int]([], 1, n - 1)`")
+}
+
+test "the help writes the list after a method name" {
+    assert_e0301(#"trait Tm { fn m[U](self, xs: List[U], n: Int) -> Int }
+type H { v: Int }
+impl Tm for H {
+    fn m[U](self, xs: List[U], n: Int) -> Int {
+        if n <= 0 { return xs.len() }
+        self.m([], n - 1)
+    }
+}
+fn main() { }
+"#, "method", "`self.m[U]([], n - 1)`")
+}
+
+test "the help gives the form with placeholders for an argument that holds an interpolation" {
+    assert_e0301(#"fn e[T](xs: List[T], s: Str, n: Int) -> Int {
+    if n == 0 { return xs.len() }
+    e([], "{")"}", n - 1)
+}
+fn main() { }
+"#, "interp", "`e[T](...)`")
+}

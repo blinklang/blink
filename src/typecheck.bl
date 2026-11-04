@@ -2960,16 +2960,26 @@ let mut tc_ud_blamed: Map[Int, Int] = Map()
 // Each unbracketed generic call's own binder tids, each conversion call's impl binder tids,
 // and each bare Map()/Set() key, judged once inference is done: a binder a later statement
 // pins is solved by then. A call is walked again after a speculative walk, so the last
-// record of a node is the one that counts. A group in tc_call_open_tids is one of
+// record of a node is the one that counts. A group in tc_calls.open_tids is one of
 // [sig, self_offset, n, tid..., open...] (tc_note_generic_call),
 // [-1, im, n, tid...] (tc_note_conversion_call), [-1, -1, 1, ctor] (tc_note_open_ctor_key),
 // [-2, -1, 0] (tc_note_deferred_conversion), [-3, -1, 0] (tc_note_open_variant),
 // [-4, sig, tid, n, binder..., enclosing fn] (tc_note_fn_value) or
 // [-5, closure, 0] (tc_note_void_return).
-let mut tc_call_open_calls: List[Int] = []
-let mut tc_call_open_group: Map[Int, Int] = Map()
-let mut tc_call_open_tids: List[Int] = []
-let mut tc_call_reported: Map[Int, Int] = Map()
+// self_views maps a signature to its view for calls in its own body, and view_sigs maps back
+// (tc_call_view_sig).
+type CallFacts {
+    open_calls: List[Int]
+    open_group: Map[Int, Int]
+    open_tids: List[Int]
+    reported: Map[Int, Int]
+    self_views: Map[Int, Int]
+    view_sigs: Map[Int, Int]
+}
+fn new_call_facts() -> CallFacts {
+    CallFacts { open_calls: [], open_group: Map(), open_tids: [], reported: Map(), self_views: Map(), view_sigs: Map() }
+}
+let mut tc_calls: CallFacts = new_call_facts()
 
 // Every unbound metavar reachable from `tid`, by pool id. Structural walk in lockstep
 // with tc_tid_has_unbound_metavar — that one answers WHETHER a tid is open, this one
@@ -3128,18 +3138,96 @@ pub fn tc_ticked_names(names: List[Str]) -> Str {
 }
 
 // The repair for a call no inference can complete: written type arguments. The help
-// lists every own binder, since a bracket list must supply all of them.
-fn tc_call_type_args_help(sig: Int, self_offset: Int) -> Str {
+// lists every own binder, since a bracket list must supply all of them. `solved` holds what the
+// arguments fixed, one type per binder, -1 where they fixed nothing.
+fn tc_call_type_args_help(sig: Int, self_offset: Int, call_node: Int, solved: List[Int]) -> Str {
     let fs = fnsig_pool.get(sig).unwrap()
     let mut all: List[Str] = []
+    let mut filled: List[Str] = []
     let mut pi = 0
     while pi < fs.type_params_count {
-        all.push(fnsig_type_param_names.get(fs.type_params_start + pi).unwrap())
+        let name = fnsig_type_param_names.get(fs.type_params_start + pi).unwrap()
+        all.push(name)
+        let tid = if pi < solved.len() { solved.get(pi).unwrap() } else { -1 }
+        filled.push(if tid < 0 || tc_tid_has_unbound_metavar(tid) != 0 { name } else { tc_type_str(tid) })
         pi = pi + 1
     }
     let callee = node_name(fs.decl)
+    // In its own body a fn has its binders in scope, so the list is a repair as written, not a
+    // form with placeholders. A binder an argument fixed takes that type: the fn's own binder
+    // there would not fit the argument.
+    if tc_calls.view_sigs.contains_key(sig) {
+        let written = tc_call_with_list(call_node, callee, filled.join(", "))
+        if written != "" { return "write the type arguments at this call: `{written}`" }
+    }
     let args = if fs.params_count - self_offset > 0 { "..." } else { "" }
     "write the type arguments at this call, as in `{callee}[{all.join(", ")}]({args})` (replace each placeholder with the intended type)"
+}
+
+// How many argument lists a call's receiver or callee writes before the call's own.
+fn tc_lists_before_call(call_node: Int) -> Int {
+    let mut count = 0
+    let mut at = if node_kind(call_node) == NodeKind.MethodCall { node_obj(call_node) } else { node_left(call_node) }
+    while at >= 0 {
+        let k = node_kind(at)
+        if k == NodeKind.MethodCall {
+            count = count + 1
+            at = node_obj(at)
+        } else if k == NodeKind.Call {
+            count = count + 1
+            at = node_left(at)
+        } else if k == NodeKind.FieldAccess {
+            at = node_obj(at)
+        } else {
+            at = -1
+        }
+    }
+    count
+}
+
+// The source of a call with `list` written after its callee, or "" when the call does not fit on
+// its line, does not read as a call to `callee`, or holds a form this does not read: an
+// interpolation or a raw string can hold parens and quotes that are not the call's.
+fn tc_call_with_list(call_node: Int, callee: Str, list: Str) -> Str {
+    let line = diag_source_line(diag_file_for_node(call_node), node_line(call_node))
+    let from = node_col(call_node) - 1
+    if from < 0 { return "" }
+    let skip = tc_lists_before_call(call_node)
+    let mut closed = 0
+    let mut depth = 0
+    let mut open = -1
+    let mut in_str = false
+    let mut i = from
+    while i < line.byte_len() {
+        let ch = line.byte_at(i)
+        if in_str {
+            if ch == 123 { return "" }
+            if ch == 92 { i = i + 1 } else if ch == 34 { in_str = false }
+        } else if ch == 35 {
+            return ""
+        } else if ch == 39 {
+            // Past the opening quote and one character, which an escape makes two bytes.
+            i = i + (if i + 1 < line.byte_len() && line.byte_at(i + 1) == 92 { 3 } else { 2 })
+            if i >= line.byte_len() || line.byte_at(i) != 39 { return "" }
+        } else if ch == 34 {
+            in_str = true
+        } else if ch == 40 {
+            if depth == 0 && closed == skip { open = i }
+            depth = depth + 1
+        } else if ch == 41 {
+            depth = depth - 1
+            if depth == 0 {
+                closed = closed + 1
+                if closed > skip {
+                    let head = line.byte_slice(from, open)
+                    if !head.ends_with(callee) { return "" }
+                    return "{head}[{list}]{line.byte_slice(open, i + 1)}"
+                }
+            }
+        }
+        i = i + 1
+    }
+    ""
 }
 
 // A binder no parameter and no return type names can get its type only from written
@@ -3147,7 +3235,7 @@ fn tc_call_type_args_help(sig: Int, self_offset: Int) -> Str {
 // once, whatever the rest of the program does.
 fn tc_report_unsourced_binders(sig: Int, call_node: Int, self_offset: Int) ! Diag.Report {
     if tc_boundary_check_active == 0 || call_node < 0 { return }
-    if tc_call_reported.contains_key(call_node) { return }
+    if tc_calls.reported.contains_key(call_node) { return }
     let fs = fnsig_pool.get(sig).unwrap()
     let mut names: List[Str] = []
     let mut pi = 0
@@ -3159,17 +3247,17 @@ fn tc_report_unsourced_binders(sig: Int, call_node: Int, self_offset: Int) ! Dia
         pi = pi + 1
     }
     if names.len() == 0 { return }
-    tc_call_reported.insert(call_node, 1)
+    tc_calls.reported.insert(call_node, 1)
     let callee = node_name(fs.decl)
     let mut msg = "type parameter {tc_ticked_names(names)} of `{callee}` has no source -- it is bound by the declaration but supplied by neither a parameter nor the return type"
     if names.len() > 1 {
         msg = "type parameters {tc_ticked_names(names)} of `{callee}` have no source -- they are bound by the declaration but supplied by neither a parameter nor the return type"
     }
-    diag_error_at("CannotInferType", CANNOT_INFER_TYPE, msg, call_node, tc_call_type_args_help(sig, self_offset))
+    diag_error_at("CannotInferType", CANNOT_INFER_TYPE, msg, call_node, tc_call_type_args_help(sig, self_offset, call_node, []))
 }
 
 // Record an unbracketed generic call's own binder tids for tc_ud_flush_calls. Group
-// layout in tc_call_open_tids: [sig, self_offset, n, tid..., open...], -1 for a slot with
+// layout in tc_calls.open_tids: [sig, self_offset, n, tid..., open...], -1 for a slot with
 // no bind, and open 1 for a tid still open and not yet refused here. A binder the callee uses as a key is judged
 // for Hash in the flush when it was open here: the use that solves it can come later, and a
 // closed one was judged at the call. A keyed construction records a group too (see
@@ -3178,12 +3266,12 @@ fn tc_note_generic_call(sig: Int, call_node: Int, self_offset: Int, binds: Map[S
     if tc_boundary_check_active == 0 || call_node < 0 { return }
     let fs = fnsig_pool.get(sig).unwrap()
     if fs.type_params_count == 0 { return }
-    let prev = tc_call_open_group.get(call_node) ?? -1
-    if prev < 0 { tc_call_open_calls.push(call_node) }
-    tc_call_open_group.insert(call_node, tc_call_open_tids.len())
-    tc_call_open_tids.push(sig)
-    tc_call_open_tids.push(self_offset)
-    tc_call_open_tids.push(fs.type_params_count)
+    let prev = tc_calls.open_group.get(call_node) ?? -1
+    if prev < 0 { tc_calls.open_calls.push(call_node) }
+    tc_calls.open_group.insert(call_node, tc_calls.open_tids.len())
+    tc_calls.open_tids.push(sig)
+    tc_calls.open_tids.push(self_offset)
+    tc_calls.open_tids.push(fs.type_params_count)
     let mut pi = 0
     while pi < fs.type_params_count {
         let nidx = fs.type_params_start + pi
@@ -3194,28 +3282,28 @@ fn tc_note_generic_call(sig: Int, call_node: Int, self_offset: Int, binds: Map[S
             if binds.contains_key(key) { tid = binds.get(key).unwrap() }
         }
         if tid == -1 && binds.contains_key(tpn) { tid = binds.get(tpn).unwrap() }
-        tc_call_open_tids.push(tid)
+        tc_calls.open_tids.push(tid)
         pi = pi + 1
     }
     let keyed = tc_fn_hash_obligations(sig).len() > 0
-    let first = tc_call_open_tids.len() - fs.type_params_count
+    let first = tc_calls.open_tids.len() - fs.type_params_count
     // One call has one set of binders. The body walk infers a call again after its argument
     // or statement already did, and that inference mints fresh metavariables, so an expected
     // type that filled the first set must reach the new one.
-    if prev >= 0 && tc_call_open_tids.get(prev).unwrap() == sig {
+    if prev >= 0 && tc_calls.open_tids.get(prev).unwrap() == sig {
         let mut li = 0
         while li < fs.type_params_count {
-            let was = tc_call_open_tids.get(prev + 3 + li).unwrap()
-            let now = tc_call_open_tids.get(first + li).unwrap()
+            let was = tc_calls.open_tids.get(prev + 3 + li).unwrap()
+            let now = tc_calls.open_tids.get(first + li).unwrap()
             if was >= 0 && now >= 0 { let _ = tc_unify(was, now) }
             li = li + 1
         }
     }
     let mut oi = 0
     while oi < fs.type_params_count {
-        let tid = tc_call_open_tids.get(first + oi).unwrap()
+        let tid = tc_calls.open_tids.get(first + oi).unwrap()
         let open = keyed && tid >= 0 && tc_tid_has_unbound_metavar(tid) != 0 && tc_tid_hash_fact(tid) != -1
-        tc_call_open_tids.push(if open { 1 } else { 0 })
+        tc_calls.open_tids.push(if open { 1 } else { 0 })
         oi = oi + 1
     }
 }
@@ -3228,15 +3316,15 @@ fn tc_note_conversion_call(im: Int, call_node: Int, binds: Map[Str, Int]) {
     if tc_boundary_check_active == 0 || call_node < 0 { return }
     let binders = node_impl_binders(im)
     if binders == -1 || sublist_length(binders) == 0 { return }
-    if !tc_call_open_group.contains_key(call_node) { tc_call_open_calls.push(call_node) }
-    tc_call_open_group.insert(call_node, tc_call_open_tids.len())
-    tc_call_open_tids.push(-1)
-    tc_call_open_tids.push(im)
-    tc_call_open_tids.push(sublist_length(binders))
+    if !tc_calls.open_group.contains_key(call_node) { tc_calls.open_calls.push(call_node) }
+    tc_calls.open_group.insert(call_node, tc_calls.open_tids.len())
+    tc_calls.open_tids.push(-1)
+    tc_calls.open_tids.push(im)
+    tc_calls.open_tids.push(sublist_length(binders))
     let mut i = 0
     while i < sublist_length(binders) {
         let tp = sublist_get(binders, i)
-        tc_call_open_tids.push(binds.get(tc_binder_key(tp, node_name(tp))) ?? -1)
+        tc_calls.open_tids.push(binds.get(tc_binder_key(tp, node_name(tp))) ?? -1)
         i = i + 1
     }
 }
@@ -3246,28 +3334,28 @@ fn tc_note_conversion_call(im: Int, call_node: Int, binds: Map[Str, Int]) {
 // `[]` gives it a fresh metavariable, and the node's type is the one codegen reads.
 fn tc_note_deferred_conversion(call_node: Int) {
     if tc_boundary_check_active == 0 || call_node < 0 { return }
-    if !tc_call_open_group.contains_key(call_node) { tc_call_open_calls.push(call_node) }
-    tc_call_open_group.insert(call_node, tc_call_open_tids.len())
-    tc_call_open_tids.push(-2)
-    tc_call_open_tids.push(-1)
-    tc_call_open_tids.push(0)
+    if !tc_calls.open_group.contains_key(call_node) { tc_calls.open_calls.push(call_node) }
+    tc_calls.open_group.insert(call_node, tc_calls.open_tids.len())
+    tc_calls.open_tids.push(-2)
+    tc_calls.open_tids.push(-1)
+    tc_calls.open_tids.push(0)
 }
 
 // A walk that chose a conversion at the call clears a deferred record an earlier walk left,
 // as the inert key group [-1, -1, 1, -1].
 fn tc_drop_deferred_conversion(call_node: Int) {
     if tc_boundary_check_active == 0 || call_node < 0 { return }
-    let g = tc_call_open_group.get(call_node) ?? -1
+    let g = tc_calls.open_group.get(call_node) ?? -1
     if g < 0 || !tc_open_group_is_deferred_conversion(g) { return }
-    tc_call_open_group.insert(call_node, tc_call_open_tids.len())
-    tc_call_open_tids.push(-1)
-    tc_call_open_tids.push(-1)
-    tc_call_open_tids.push(1)
-    tc_call_open_tids.push(-1)
+    tc_calls.open_group.insert(call_node, tc_calls.open_tids.len())
+    tc_calls.open_tids.push(-1)
+    tc_calls.open_tids.push(-1)
+    tc_calls.open_tids.push(1)
+    tc_calls.open_tids.push(-1)
 }
 
 fn tc_open_group_is_deferred_conversion(g: Int) -> Bool {
-    tc_call_open_tids.get(g).unwrap() == -2
+    tc_calls.open_tids.get(g).unwrap() == -2
 }
 
 // A variant construction whose instance has a slot open here, as the group [-3, -1, 0]. Its
@@ -3277,66 +3365,66 @@ fn tc_open_group_is_deferred_conversion(g: Int) -> Bool {
 fn tc_note_open_variant(node: Int, tid: Int) -> Int {
     if tc_boundary_check_active == 0 || node < 0 { return tid }
     if tc_tid_has_unbound_metavar(tid) == 0 { return tid }
-    let g = tc_call_open_group.get(node) ?? -1
+    let g = tc_calls.open_group.get(node) ?? -1
     if g >= 0 { return tid }
-    tc_call_open_calls.push(node)
-    tc_call_open_group.insert(node, tc_call_open_tids.len())
-    tc_call_open_tids.push(-3)
-    tc_call_open_tids.push(-1)
-    tc_call_open_tids.push(0)
+    tc_calls.open_calls.push(node)
+    tc_calls.open_group.insert(node, tc_calls.open_tids.len())
+    tc_calls.open_tids.push(-3)
+    tc_calls.open_tids.push(-1)
+    tc_calls.open_tids.push(0)
     tid
 }
 
 // The `return e` of a closure under an expected (), where `e` was open at the closure's walk, as
 // the group [-5, closure, 0].
 fn tc_note_void_return(ret: Int, cls: Int) {
-    if tc_call_open_group.contains_key(ret) { return }
-    tc_call_open_calls.push(ret)
-    tc_call_open_group.insert(ret, tc_call_open_tids.len())
-    tc_call_open_tids.push(-5)
-    tc_call_open_tids.push(cls)
-    tc_call_open_tids.push(0)
+    if tc_calls.open_group.contains_key(ret) { return }
+    tc_calls.open_calls.push(ret)
+    tc_calls.open_group.insert(ret, tc_calls.open_tids.len())
+    tc_calls.open_tids.push(-5)
+    tc_calls.open_tids.push(cls)
+    tc_calls.open_tids.push(0)
 }
 
 fn tc_open_group_is_variant(g: Int) -> Bool {
-    tc_call_open_tids.get(g).unwrap() == -3
+    tc_calls.open_tids.get(g).unwrap() == -3
 }
 
 // A reference to a generic function's name, with the type it has as a value and the metavars
 // it minted for the binders. Its binders are judged once inference is done, as a call's are.
 fn tc_note_fn_value(node: Int, sig: Int, tid: Int, binders: List[Int]) {
-    tc_call_open_calls.push(node)
-    tc_call_open_group.insert(node, tc_call_open_tids.len())
-    tc_call_open_tids.push(-4)
-    tc_call_open_tids.push(sig)
-    tc_call_open_tids.push(tid)
-    tc_call_open_tids.push(binders.len())
-    for b in binders { tc_call_open_tids.push(b) }
-    tc_call_open_tids.push(tc_current_fn_node)
+    tc_calls.open_calls.push(node)
+    tc_calls.open_group.insert(node, tc_calls.open_tids.len())
+    tc_calls.open_tids.push(-4)
+    tc_calls.open_tids.push(sig)
+    tc_calls.open_tids.push(tid)
+    tc_calls.open_tids.push(binders.len())
+    for b in binders { tc_calls.open_tids.push(b) }
+    tc_calls.open_tids.push(tc_current_fn_node)
 }
 
 // The group of this reference to a generic function's name, or -1 for any other node.
 fn tc_fn_value_group(node: Int) -> Int {
-    let g = tc_call_open_group.get(node) ?? -1
-    if g >= 0 && tc_call_open_tids.get(g).unwrap() == -4 { g } else { -1 }
+    let g = tc_calls.open_group.get(node) ?? -1
+    if g >= 0 && tc_calls.open_tids.get(g).unwrap() == -4 { g } else { -1 }
 }
 
 // Whether the group at `g` is a conversion call's (tc_note_conversion_call).
 fn tc_open_group_is_conversion(g: Int) -> Bool {
-    tc_call_open_tids.get(g).unwrap() == -1 && tc_call_open_tids.get(g + 1).unwrap() >= 0
+    tc_calls.open_tids.get(g).unwrap() == -1 && tc_calls.open_tids.get(g + 1).unwrap() >= 0
 }
 
 // The flush half of tc_note_conversion_call.
 fn tc_ud_flush_conversion_call(call_node: Int, g: Int) ! Diag.Report {
-    let im = tc_call_open_tids.get(g + 1).unwrap()
+    let im = tc_calls.open_tids.get(g + 1).unwrap()
     let binders = node_impl_binders(im)
-    let n = tc_call_open_tids.get(g + 2).unwrap()
+    let n = tc_calls.open_tids.get(g + 2).unwrap()
     let mut names: List[Str] = []
     let mut tids: List[Int] = []
     let mut source_fills = true
     let mut pi = 0
     while pi < n {
-        let tid = tc_call_open_tids.get(g + 3 + pi).unwrap()
+        let tid = tc_calls.open_tids.get(g + 3 + pi).unwrap()
         if tid >= 0 && tc_tid_has_unbound_metavar(tid) != 0 && tc_ud_already_blamed(tid) == 0 {
             let b = sublist_get(binders, pi)
             names.push(node_name(b))
@@ -3346,7 +3434,7 @@ fn tc_ud_flush_conversion_call(call_node: Int, g: Int) ! Diag.Report {
         pi = pi + 1
     }
     if names.len() == 0 { return }
-    tc_call_reported.insert(call_node, 1)
+    tc_calls.reported.insert(call_node, 1)
     let head = tc_conversion_impl_head(im)
     let mut msg = "type parameter {tc_ticked_names(names)} of `{head}` is unbound at this call and nothing supplies it"
     if names.len() > 1 {
@@ -3366,32 +3454,32 @@ fn tc_note_open_ctor_key(node: Int, ctor: Int) {
     let t = tc_resolve(ctor)
     let k = type_kind(t)
     if k != TyKind.Map && k != TyKind.Set { return }
-    let g = tc_call_open_group.get(node) ?? -1
-    if g < 0 { tc_call_open_calls.push(node) }
-    tc_call_open_group.insert(node, tc_call_open_tids.len())
-    tc_call_open_tids.push(-1)
-    tc_call_open_tids.push(-1)
-    tc_call_open_tids.push(1)
-    tc_call_open_tids.push(if tc_tid_has_unbound_metavar(ty_pool.get(t).unwrap().inner1) != 0 { t } else { -1 })
-    tc_call_open_tids.push(if tc_open_group_is_receiver(g) { 1 } else { 0 })
+    let g = tc_calls.open_group.get(node) ?? -1
+    if g < 0 { tc_calls.open_calls.push(node) }
+    tc_calls.open_group.insert(node, tc_calls.open_tids.len())
+    tc_calls.open_tids.push(-1)
+    tc_calls.open_tids.push(-1)
+    tc_calls.open_tids.push(1)
+    tc_calls.open_tids.push(if tc_tid_has_unbound_metavar(ty_pool.get(t).unwrap().inner1) != 0 { t } else { -1 })
+    tc_calls.open_tids.push(if tc_open_group_is_receiver(g) { 1 } else { 0 })
 }
 // A receiver has no later binding or parameter to give its key a type, so the flush judges it.
 fn tc_note_open_receiver(node: Int) {
-    let g = tc_call_open_group.get(node) ?? -1
-    if tc_open_group_has_open_key(g) { tc_call_open_tids.set(g + 4, 1) }
+    let g = tc_calls.open_group.get(node) ?? -1
+    if tc_open_group_has_open_key(g) { tc_calls.open_tids.set(g + 4, 1) }
 }
 fn tc_open_group_is_receiver(g: Int) -> Bool {
-    tc_open_group_has_open_key(g) && tc_call_open_tids.get(g + 4).unwrap() == 1
+    tc_open_group_has_open_key(g) && tc_calls.open_tids.get(g + 4).unwrap() == 1
 }
 
 // The Hash judgment of a recorded group, made once inference is done (see
 // tc_note_generic_call). Reported before the unbound-binder check, which skips a call once
 // any report has claimed it.
 fn tc_flush_open_keys_of(call_node: Int, g: Int) ! Diag.Report {
-    let sig = tc_call_open_tids.get(g).unwrap()
+    let sig = tc_calls.open_tids.get(g).unwrap()
     if sig < -1 || tc_open_group_is_conversion(g) { return }
     if sig < 0 {
-        let ctor = tc_call_open_tids.get(g + 3).unwrap()
+        let ctor = tc_calls.open_tids.get(g + 3).unwrap()
         if ctor < 0 { return }
         let t = tc_resolve(ctor)
         let key = ty_pool.get(t).unwrap().inner1
@@ -3400,13 +3488,13 @@ fn tc_flush_open_keys_of(call_node: Int, g: Int) ! Diag.Report {
     }
     let oblig = tc_fn_hash_obligations(sig)
     if oblig.len() == 0 { return }
-    let n = tc_call_open_tids.get(g + 2).unwrap()
+    let n = tc_calls.open_tids.get(g + 2).unwrap()
     let fs = fnsig_pool.get(sig).unwrap()
     let mut pi = 0
     while pi < n {
         let role = tc_hash_oblig_mark(oblig, pi)
-        let tid = tc_call_open_tids.get(g + 3 + pi).unwrap()
-        let was_open = tc_call_open_tids.get(g + 3 + n + pi).unwrap()
+        let tid = tc_calls.open_tids.get(g + 3 + pi).unwrap()
+        let was_open = tc_calls.open_tids.get(g + 3 + n + pi).unwrap()
         if role != HashRole.Free && was_open != 0 && tc_tid_hash_fact(tid) == -1 {
             tc_report_unhashable_bind(sig, fnsig_type_param_names.get(fs.type_params_start + pi).unwrap(), role, tid, call_node)
         }
@@ -3430,9 +3518,9 @@ fn tc_flush_deferred_conversions() ! TypeCheck.Resolve, TypeCheck.Report, Diag.R
             if tc_choose_deferred_conversion(call_node) { chose = true }
         }
     }
-    for r in tc_call_open_calls {
-        let group = tc_call_open_group.get(r).unwrap()
-        if tc_call_open_tids.get(group).unwrap() == -5 { tc_report_value_returned_as_void(r, tc_call_open_tids.get(group + 1).unwrap()) }
+    for r in tc_calls.open_calls {
+        let group = tc_calls.open_group.get(r).unwrap()
+        if tc_calls.open_tids.get(group).unwrap() == -5 { tc_report_value_returned_as_void(r, tc_calls.open_tids.get(group + 1).unwrap()) }
     }
 }
 
@@ -3446,9 +3534,9 @@ fn tc_refuse_deferred_conversions() ! Diag.Report {
 // The calls whose last record is a deferred conversion that no report has claimed.
 fn tc_deferred_conversion_calls() -> List[Int] {
     let mut out: List[Int] = []
-    for call_node in tc_call_open_calls {
-        let g = tc_call_open_group.get(call_node).unwrap()
-        if tc_open_group_is_deferred_conversion(g) && !tc_call_reported.contains_key(call_node) { out.push(call_node) }
+    for call_node in tc_calls.open_calls {
+        let g = tc_calls.open_group.get(call_node).unwrap()
+        if tc_open_group_is_deferred_conversion(g) && !tc_calls.reported.contains_key(call_node) { out.push(call_node) }
     }
     out
 }
@@ -3517,7 +3605,7 @@ fn tc_choose_deferred_conversion(call_node: Int) -> Bool ! TypeCheck.Resolve, Di
 // The open match let the sole impl through, but its types still refuse the call's once
 // unified (one metavariable that would have to be two types), so in fact none fits.
 fn tc_refuse_chosen_conversion(call_node: Int, d: TcDeferredConversion) ! Diag.Report {
-    tc_call_reported.insert(call_node, 1)
+    tc_calls.reported.insert(call_node, 1)
     tc_report_no_conversion(call_node, "", d.trait_name, d.source, d.target)
     tc_ud_mark_blamed(d.source)
     tc_ud_mark_blamed(d.target)
@@ -3529,11 +3617,11 @@ fn tc_refuse_deferred_conversion(call_node: Int) ! Diag.Report {
         None => { return }
     }
     if d.found.len() > 1 {
-        tc_call_reported.insert(call_node, 1)
+        tc_calls.reported.insert(call_node, 1)
         let call = if d.into { "`.into()`" } else { "`{node_name(node_obj(call_node))}.{node_method(call_node)}`" }
         tc_report_conversion_tie(call_node, call, "", d.source, d.found)
     } else if d.found.len() == 0 && tc_conversion_side_judgeable(d.source) && tc_conversion_side_judgeable(d.target) {
-        tc_call_reported.insert(call_node, 1)
+        tc_calls.reported.insert(call_node, 1)
         tc_report_no_conversion(call_node, "", d.trait_name, d.source, d.target)
     } else {
         return
@@ -3553,25 +3641,27 @@ fn tc_conversion_side_judgeable(t: Int) -> Bool {
 // and no binding or scrutinee has already answered for it.
 fn tc_ud_flush_calls() ! Diag.Report {
     let mut ci = 0
-    while ci < tc_call_open_calls.len() {
-        let call_node = tc_call_open_calls.get(ci).unwrap()
+    while ci < tc_calls.open_calls.len() {
+        let call_node = tc_calls.open_calls.get(ci).unwrap()
         ci = ci + 1
-        let g = tc_call_open_group.get(call_node).unwrap()
+        let g = tc_calls.open_group.get(call_node).unwrap()
         tc_flush_open_keys_of(call_node, g)
-        let sig = tc_call_open_tids.get(g).unwrap()
-        if tc_call_reported.contains_key(call_node) { continue }
+        let sig = tc_calls.open_tids.get(g).unwrap()
+        if tc_calls.reported.contains_key(call_node) { continue }
         if tc_open_group_is_conversion(g) {
             tc_ud_flush_conversion_call(call_node, g)
             continue
         }
         if sig < 0 { continue }
-        let n = tc_call_open_tids.get(g + 2).unwrap()
+        let n = tc_calls.open_tids.get(g + 2).unwrap()
         let fs = fnsig_pool.get(sig).unwrap()
         let mut names: List[Str] = []
         let mut tids: List[Int] = []
+        let mut solved: List[Int] = []
         let mut pi = 0
         while pi < n {
-            let tid = tc_call_open_tids.get(g + 3 + pi).unwrap()
+            let tid = tc_calls.open_tids.get(g + 3 + pi).unwrap()
+            solved.push(tid)
             if tid >= 0 && tc_tid_has_unbound_metavar(tid) != 0 && tc_ud_already_blamed(tid) == 0 {
                 names.push(fnsig_type_param_names.get(fs.type_params_start + pi).unwrap())
                 tids.push(tid)
@@ -3579,13 +3669,13 @@ fn tc_ud_flush_calls() ! Diag.Report {
             pi = pi + 1
         }
         if names.len() == 0 { continue }
-        tc_call_reported.insert(call_node, 1)
+        tc_calls.reported.insert(call_node, 1)
         let callee = node_name(fs.decl)
         let mut msg = "type parameter {tc_ticked_names(names)} of `{callee}` is unbound at this call and nothing supplies it"
         if names.len() > 1 {
             msg = "type parameters {tc_ticked_names(names)} of `{callee}` are unbound at this call and nothing supplies them"
         }
-        diag_error_at("CannotInferType", CANNOT_INFER_TYPE, msg, call_node, tc_call_type_args_help(sig, tc_call_open_tids.get(g + 1).unwrap()))
+        diag_error_at("CannotInferType", CANNOT_INFER_TYPE, msg, call_node, tc_call_type_args_help(sig, tc_calls.open_tids.get(g + 1).unwrap(), call_node, solved))
         let mut ti = 0
         while ti < tids.len() {
             tc_ud_mark_blamed(tids.get(ti).unwrap())
@@ -3599,26 +3689,26 @@ fn tc_ud_flush_calls() ! Diag.Report {
 // so a `let` that holds the value keeps the blame, as the spec places it (§3.4 *What pins
 // `E`*), and only a value no binding holds is blamed at its constructor.
 fn tc_ud_flush_open_variants() ! Diag.Report {
-    for node in tc_call_open_calls {
-        let g = tc_call_open_group.get(node).unwrap()
+    for node in tc_calls.open_calls {
+        let g = tc_calls.open_group.get(node).unwrap()
         if tc_open_group_is_variant(g) || tc_open_group_is_receiver(g) { tc_ud_judge_open_value(node) }
     }
 }
 
 // A key the group's walk left open has no operations for codegen to choose, whatever reads it.
 fn tc_open_group_has_open_key(g: Int) -> Bool {
-    g >= 0 && tc_call_open_tids.get(g).unwrap() == -1 && tc_call_open_tids.get(g + 1).unwrap() == -1 && tc_call_open_tids.get(g + 3).unwrap() >= 0
+    g >= 0 && tc_calls.open_tids.get(g).unwrap() == -1 && tc_calls.open_tids.get(g + 1).unwrap() == -1 && tc_calls.open_tids.get(g + 3).unwrap() >= 0
 }
 
 fn tc_ud_judge_open_value(node: Int) ! Diag.Report {
-    if tc_call_reported.contains_key(node) { return }
+    if tc_calls.reported.contains_key(node) { return }
     let tid = tc_lookup_node_tid(node)
     if tc_tid_has_unbound_metavar(tid) == 0 || tc_ud_already_blamed(tid) != 0 { return }
     // An error already on the construction's lines is the first report, and the open slot
     // may be its consequence: a call that does not resolve gives its argument no type.
     let end_line = if node_end_line(node) > node_line(node) { node_end_line(node) } else { node_line(node) }
     if diag_errors_in_lines(diag_file_for_node(node), node_line(node), end_line) > 0 { return }
-    tc_call_reported.insert(node, 1)
+    tc_calls.reported.insert(node, 1)
     tc_report_under_determined_at(node, tid, "no annotation, parameter type or return type gives this value its type")
 }
 
@@ -3626,12 +3716,12 @@ fn tc_ud_judge_open_value(node: Int) ! Diag.Report {
 // repair attaches (§3.4 "A generic function named as a value"). A binder that the function's
 // type does not mention is open whatever the expected type is.
 fn tc_ud_flush_fn_values() ! TypeCheck.Resolve, Diag.Report {
-    for node in tc_call_open_calls {
-        if tc_fn_value_group(node) < 0 || tc_call_reported.contains_key(node) { continue }
+    for node in tc_calls.open_calls {
+        if tc_fn_value_group(node) < 0 || tc_calls.reported.contains_key(node) { continue }
         let end_line = if node_end_line(node) > node_line(node) { node_end_line(node) } else { node_line(node) }
         if diag_errors_in_lines(diag_file_for_node(node), node_line(node), end_line) > 0 { continue }
         tc_report_fn_value_unfixed(node)
-        if !tc_call_reported.contains_key(node) { tc_check_fn_value_bounds(node) }
+        if !tc_calls.reported.contains_key(node) { tc_check_fn_value_bounds(node) }
     }
 }
 
@@ -3641,13 +3731,13 @@ fn tc_ud_flush_fn_values() ! TypeCheck.Resolve, Diag.Report {
 // binder that holds a typevar is left out. A binder that is one is read from its declaration.
 fn tc_check_fn_value_bounds(node: Int) ! TypeCheck.Resolve, Diag.Report {
     let g = tc_fn_value_group(node)
-    let sig = tc_call_open_tids.get(g + 1).unwrap()
+    let sig = tc_calls.open_tids.get(g + 1).unwrap()
     let fs = fnsig_pool.get(sig).unwrap()
-    let enclosing = tc_call_open_tids.get(g + 4 + fs.type_params_count).unwrap()
+    let enclosing = tc_calls.open_tids.get(g + 4 + fs.type_params_count).unwrap()
     let mut binds: Map[Str, Int] = Map()
     let mut pi = 0
     while pi < fs.type_params_count {
-        let tid = tc_resolve(tc_call_open_tids.get(g + 4 + pi).unwrap())
+        let tid = tc_resolve(tc_calls.open_tids.get(g + 4 + pi).unwrap())
         let idx = fs.type_params_start + pi
         if tc_tid_kind(tid) == TyKind.Typevar {
             tc_check_typevar_meets_bounds(tid, fnsig_tparam_nodes.get(idx) ?? NO_BINDER_NODE, enclosing, node)
@@ -3684,13 +3774,13 @@ fn tc_check_typevar_meets_bounds(tid: Int, carrier: Int, enclosing: Int, node: I
 
 fn tc_report_fn_value_unfixed(node: Int) ! Diag.Report {
     let g = tc_fn_value_group(node)
-    let fs = fnsig_pool.get(tc_call_open_tids.get(g + 1).unwrap()).unwrap()
-    let val_tid = tc_call_open_tids.get(g + 2).unwrap()
+    let fs = fnsig_pool.get(tc_calls.open_tids.get(g + 1).unwrap()).unwrap()
+    let val_tid = tc_calls.open_tids.get(g + 2).unwrap()
     let mut names: List[Str] = []
     let mut tids: List[Int] = []
     let mut pi = 0
     while pi < fs.type_params_count {
-        let tid = tc_call_open_tids.get(g + 4 + pi).unwrap()
+        let tid = tc_calls.open_tids.get(g + 4 + pi).unwrap()
         if tc_tid_has_unbound_metavar(tid) != 0 && tc_ud_already_blamed(tid) == 0 {
             names.push(fnsig_type_param_names.get(fs.type_params_start + pi).unwrap())
             tids.push(tid)
@@ -3698,7 +3788,7 @@ fn tc_report_fn_value_unfixed(node: Int) ! Diag.Report {
         pi = pi + 1
     }
     if names.len() == 0 { return }
-    tc_call_reported.insert(node, 1)
+    tc_calls.reported.insert(node, 1)
     let callee = node_name(fs.decl)
     let mut msg = "type parameter {tc_ticked_names(names)} of `{callee}` is unbound at this reference and nothing supplies it"
     if names.len() > 1 {
@@ -3720,9 +3810,9 @@ fn tc_report_fn_value_unfixed(node: Int) ! Diag.Report {
 
 // The recorded calls once every flush has read them.
 fn tc_drop_open_calls() {
-    tc_call_open_calls = []
-    tc_call_open_group.clear()
-    tc_call_open_tids = []
+    tc_calls.open_calls = []
+    tc_calls.open_group.clear()
+    tc_calls.open_tids = []
 }
 
 // Report a binding whose type is under-determined — HM finished the region with a
@@ -3951,6 +4041,64 @@ fn tc_typevar_is_open(tid: Int) -> Int {
     if e.kind != TyKind.Typevar { return 0 }
     if tc_typevar_binds_here(tid) != 0 { return 0 }
     1
+}
+
+// A self-call chooses its type arguments the way any other call does, so the callee's formal
+// must not be the body's rigid parameter. The view has the same declaration and parameters,
+// over twin binders no frame ever activates, so each formal reads as another declaration's.
+fn tc_twin_binder(binder: Int) -> Int { -1000 - binder }
+
+fn tc_call_view_sig(sig: Int) -> Int {
+    if sig < 0 { return sig }
+    let fs = fnsig_pool.get(sig).unwrap()
+    if fs.decl < 0 { return sig }
+    let tps = node_type_params(fs.decl)
+    if tps == -1 || sublist_length(tps) == 0 { return sig }
+    if tc_binder_is_active(sublist_get(tps, 0)) == 0 { return sig }
+    match tc_calls.self_views.get(sig) {
+        Some(v) => { return v }
+        None => {}
+    }
+    let mut twins: Map[Str, Int] = Map()
+    let mut i = 0
+    while i < sublist_length(tps) {
+        let tp = sublist_get(tps, i)
+        let nm = node_name(tp)
+        twins.insert(tc_binder_key(tp, nm), make_typevar_bound(nm, tc_twin_binder(tp)))
+        i = i + 1
+    }
+    let start = fnsig_param_list.len()
+    let mut pi = 0
+    while pi < fs.params_count {
+        let at = fs.params_start + pi
+        fnsig_param_list.push(substitute_typevar_tid(fnsig_param_list.get(at).unwrap(), twins))
+        fnsig_param_names.push(fnsig_param_names.get(at).unwrap())
+        fnsig_param_kw.push(fnsig_param_kw.get(at).unwrap())
+        fnsig_param_default.push(fnsig_param_default.get(at).unwrap())
+        pi = pi + 1
+    }
+    let view = fnsig_pool.len()
+    fnsig_pool.push(FnSigEntry { name: fs.name, ret: substitute_typevar_tid(fs.ret, twins), params_start: start, params_count: fs.params_count, type_params_start: fs.type_params_start, type_params_count: fs.type_params_count, effects_start: fs.effects_start, effects_count: fs.effects_count, decl: fs.decl })
+    tc_calls.self_views.insert(sig, view)
+    tc_calls.view_sigs.insert(view, sig)
+    view
+}
+
+// A bound's own arguments name the declaration's real binders, so they read a view's binds
+// under the real key.
+fn tc_binds_for_bounds(sig: Int, binds: Map[Str, Int]) -> Map[Str, Int] {
+    if !tc_calls.view_sigs.contains_key(sig) { return binds }
+    let fs = fnsig_pool.get(sig).unwrap()
+    let mut out: Map[Str, Int] = Map()
+    for (k, v) in binds { out.insert(k, v) }
+    let mut i = 0
+    while i < fs.type_params_count {
+        let idx = fs.type_params_start + i
+        let nm = fnsig_type_param_names.get(idx).unwrap()
+        if binds.contains_key(nm) { out.insert(tc_binder_key(fnsig_tparam_nodes.get(idx).unwrap(), nm), binds.get(nm).unwrap()) }
+        i = i + 1
+    }
+    out
 }
 
 fn tc_typevar_is_rigid(tid: Int) -> Int {
@@ -5138,7 +5286,7 @@ fn tc_fn_value_type(node: Int, fn_sig: Int) -> Int {
 // reference mints once.
 fn tc_generic_fn_value_tid(node: Int, sig: Int, decl_tid: Int) -> Int {
     let g = tc_fn_value_group(node)
-    if g >= 0 { return tc_call_open_tids.get(g + 2).unwrap() }
+    if g >= 0 { return tc_calls.open_tids.get(g + 2).unwrap() }
     let fs = fnsig_pool.get(sig).unwrap()
     let mut binds: Map[Str, Int] = Map()
     let mut mints: List[Int] = []
@@ -5261,7 +5409,8 @@ fn tc_field_receiver_hint(obj_node: Int, fname: Str, field_hint: Int) -> Int {
 // name+bound side-tables. Emits ONLY on a provably-unmet bound (tc_type_satisfies_bound
 // == -1); an unbound param, an unresolved concrete, or an unmodeled trait is skipped, so
 // this never rejects a program that compiles today (those already die at `cc`).
-fn tc_check_bounds_for_binds(sig: Int, binds: Map[Str, Int], node: Int) ! TypeCheck.Resolve, Diag.Report {
+fn tc_check_bounds_for_binds(sig: Int, binds0: Map[Str, Int], node: Int) ! TypeCheck.Resolve, Diag.Report {
+    let binds = tc_binds_for_bounds(sig, binds0)
     let fs = fnsig_pool.get(sig).unwrap()
     let start = fs.type_params_start
     let count = fs.type_params_count
@@ -5658,6 +5807,7 @@ fn instantiate_return_type(sig: Int, arg_tids: List[Int], call_node: Int, self_o
                     if nidx < fnsig_tparam_nodes.len() {
                         let tpnode = fnsig_tparam_nodes.get(nidx).unwrap()
                         binds.insert(tc_binder_key(tpnode, tpn), a)
+                        binds.insert(tc_binder_key(tc_twin_binder(tpnode), tpn), a)
                     }
                 }
             }
@@ -7033,7 +7183,8 @@ fn tc_raw_reject_display_sink(arg: Int, t: Int) ! Diag.Report {
 // `m.f(..)`. Both forms reach the same function, so both take the keyword fill, the count and
 // the argument types from check_arg_shapes; a form that skipped it would leave a defaulted
 // argument out of the call.
-fn tc_check_free_call(fn_name: Str, sig: Int, node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+fn tc_check_free_call(fn_name: Str, sig0: Int, node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    let sig = tc_call_view_sig(sig0)
     let fs = fnsig_pool.get(sig).unwrap()
     check_deprecated_fn(fn_name, fs.decl, node)
     if tc_value_decl_poisoned(fs.decl) {
@@ -8170,8 +8321,8 @@ fn tc_check_callback_value(label: Str, pos: Int, value: Int, params: List[Int], 
 fn tc_refuse_label_on_with_ptr(args_sl: Int) ! Diag.Report {
     if args_sl == -1 || sublist_length(args_sl) == 0 { return }
     let arg = sublist_get(args_sl, 0)
-    if node_kind(arg) != NodeKind.NamedArg || tc_call_reported.contains_key(arg) { return }
-    tc_call_reported.insert(arg, 1)
+    if node_kind(arg) != NodeKind.NamedArg || tc_calls.reported.contains_key(arg) { return }
+    tc_calls.reported.insert(arg, 1)
     diag_error_at("InvalidKeywordArg", INVALID_KEYWORD_ARG, "`Bytes.with_ptr` takes no keyword arguments", arg, "pass the closure without a label")
 }
 
@@ -8834,8 +8985,8 @@ fn tc_report_value_returned_as_void(r: Int, cls: Int) ! TypeCheck.Resolve, TypeC
     if tc_tid_is_no_info(vt) != 0 || vt == TYPE_VOID || vt == TYPE_NEVER || tc_is_unbound_metavar(vt) != 0 { return }
     // A part with no type is the mark of an earlier error, which already reports this operand.
     if tc_tid_has_unknown(vt) != 0 { return }
-    if tc_call_reported.contains_key(r) { return }
-    tc_call_reported.insert(r, 1)
+    if tc_calls.reported.contains_key(r) { return }
+    tc_calls.reported.insert(r, 1)
     if node_type_ann(cls) != -1 {
         tc_error_at_code("return value type {type_to_str(vt)} does not match closure return type ()", r, "TypeError", TYPE_ERROR, "change `-> ()` to `-> T`, or drop the value")
     } else {
@@ -14780,7 +14931,7 @@ fn tc_name_with_module(name: Str, mod_key: Str) -> Str {
 // How a diagnostic names a module: `main`, its dotted import path, or the name an `@module`
 // gives it. The import path of a file that names its module with `@module` reaches only that
 // one of the module's files.
-fn tc_module_display_name(mod_key: Str) -> Str {
+pub fn tc_module_display_name(mod_key: Str) -> Str {
     if tc_module_key_is_main(mod_key) != 0 { return "main" }
     let dotted = tc_get_dotted_module_path(mod_key)
     if dotted.replace(".", "_") == mod_key { dotted } else { mod_key }
@@ -16155,10 +16306,7 @@ fn init_types() ! TypeCheck.Register {
     tc_boundary_check_active = 0
     tc_ud_pending = []
     tc_ud_blamed.clear()
-    tc_call_open_calls = []
-    tc_call_open_group.clear()
-    tc_call_open_tids = []
-    tc_call_reported.clear()
+    tc_calls = new_call_facts()
     tc_errors.clear()
     depr_type_nodes.clear()
     tc_struct_decl_nodes.clear()
@@ -29304,7 +29452,7 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
             let sole_trait = tc_method_trait_names("List", method)
             if sole_trait != "" && tc_method_trait_count("List", method) == 1 {
                 let sig_name = tc_impl_method_stem("List", sole_trait, method)
-                let sig = lookup_fnsig(sig_name)
+                let sig = tc_call_view_sig(lookup_fnsig(sig_name))
                 if sig != -1 {
                     let im = tc_poly_list_impl_node.get(sig_name) ?? -1
                     // The registry only ever holds nodes that passed the
@@ -29845,7 +29993,7 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                     // type may hold another trait of one spelling with a method of this name.
                     nr_note_call_decl(node, tc_trait_method_decl(tm.trait_name, method))
                     let binds = tc_bound_call_binds(obj_t, found)
-                    let _ = check_arg_shapes_with_binds("{tc_trait_shown(tm.trait_name)}.{method}", tm.sig, args_sl, 1, node, binds)
+                    let _ = check_arg_shapes_with_binds("{tc_trait_shown(tm.trait_name)}.{method}", tc_call_view_sig(tm.sig), args_sl, 1, node, binds)
                     return substitute_typevar_tid(tm.ret_tid, binds)
                 }
                 // The bound is the whole licence, so a method none of its traits declares is
@@ -29878,13 +30026,17 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                 if btrait != "" {
                     let bsig = lookup_fnsig(tc_impl_method_stem(bname, btrait, method))
                     if bsig != -1 {
-                        let _ = check_arg_shapes("{bname}.{method}", bsig, node_args(node), 1, node)
+                        let bview = tc_call_view_sig(bsig)
+                        let btids = check_arg_shapes("{bname}.{method}", bview, node_args(node), 1, node)
                         // Which declaration this call reached. Phase 1 could not say: it has
                         // no receiver type, and the receiver is the only thing that tells two
                         // impls of one method name apart. The signature names it: the first
                         // impl of the method for this type may be of a trait this module
                         // cannot see.
                         nr_note_call_decl(node, fnsig_pool.get(bsig).unwrap().decl)
+                        if tc_decl_has_own_type_params(fnsig_pool.get(bsig).unwrap().decl) != 0 {
+                            return instantiate_return_type(bview, btids, node, 1)
+                        }
                         return fnsig_pool.get(bsig).unwrap().ret
                     }
                 }
@@ -29911,7 +30063,7 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
             // one key per impl (handled via the builtin-method path
             // below), so a bare-key fallback keeps any non-trait inherent sig.
             let sole_trait = tc_method_trait_names(tname, method)
-            let sig = tc_type_method_sig(tname, method)
+            let sig = tc_call_view_sig(tc_type_method_sig(tname, method))
             if sig != -1 {
                 // Before the argument check: an argument typed by an impl binder takes the
                 // receiver's type argument as its hint, as a List poly-impl argument does.
@@ -30326,7 +30478,7 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                     tc_builtin_receiver_name(qt_recv)
                 }
                 if qt_tname != "" {
-                    let qt_sig = lookup_fnsig(tc_impl_method_stem(qt_tname, qt_trait, method))
+                    let qt_sig = tc_call_view_sig(lookup_fnsig(tc_impl_method_stem(qt_tname, qt_trait, method)))
                     if qt_sig != -1 {
                         let qt_fs = fnsig_pool.get(qt_sig).unwrap()
                         // The receiver IS param 0 (`self`), so the qualified form's arity is
@@ -30346,7 +30498,11 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                         for (k, v) in tc_self_binds(qt_recv) {
                             if !qt_ibinds.contains_key(k) { qt_ibinds.insert(k, v) }
                         }
-                        let _ = tc_check_arg_types_with_binds("{obj_name}.{method}", qt_sig, qt_args, 0, qt_ibinds)
+                        let qt_tids = tc_check_arg_types_with_binds("{obj_name}.{method}", qt_sig, qt_args, 0, qt_ibinds)
+                        nr_note_call_decl(node, qt_fs.decl)
+                        if tc_decl_has_own_type_params(qt_fs.decl) != 0 {
+                            return substitute_typevar_tid(instantiate_return_type(qt_sig, qt_tids, node, 0), qt_ibinds)
+                        }
                         return substitute_typevar_tid(qt_fs.ret, qt_ibinds)
                     }
                     // The synthesized sealed `Display.display` has no user fnsig anywhere
@@ -30426,7 +30582,7 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                 }
                 let static_trait = tc_method_trait_names(obj_name, method)
                 if static_trait != "" && tc_method_trait_count(obj_name, method) == 1 {
-                    let q_sig = lookup_fnsig(tc_impl_method_stem(obj_name, static_trait, method))
+                    let q_sig = tc_call_view_sig(lookup_fnsig(tc_impl_method_stem(obj_name, static_trait, method)))
                     if q_sig != -1 {
                         nr_note_call_decl(node, fnsig_pool.get(q_sig).unwrap().decl)
                         // The impl's signature still says `Self`; the call names the type.
@@ -30442,7 +30598,7 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                     }
                 }
                 let static_sig_name = "{obj_name}_{method}"
-                let static_sig = lookup_fnsig(static_sig_name)
+                let static_sig = tc_call_view_sig(lookup_fnsig(static_sig_name))
                 if static_sig != -1 {
                     nr_note_call_decl(node, fnsig_pool.get(static_sig).unwrap().decl)
                     let _ = check_arg_shapes("{obj_name}.{method}", static_sig, node_args(node), 0, node)
@@ -30517,8 +30673,8 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                     // A walk before the boundary check does not see a local that hides the
                     // module, and each later one reads this node again.
                     if qual_fn == -1 && tc_boundary_check_active != 0 && !nr_is_call_on_collided_qualifier(node) {
-                        if !tc_call_reported.contains_key(node) {
-                            tc_call_reported.insert(node, 1)
+                        if !tc_calls.reported.contains_key(node) {
+                            tc_calls.reported.insert(node, 1)
                             tc_report_member_read_as_value(node, obj_name, fname)
                         }
                         return tc_error_recovery_tid()
@@ -31848,6 +32004,7 @@ fn tc_explicit_type_binds(decl: Int, call_node: Int) -> Map[Str, Int] ! TypeChec
         let t = resolve_type_ann(sublist_get(targs, i))
         binds.insert(node_name(b), t)
         binds.insert(tc_binder_key(b, node_name(b)), t)
+        binds.insert(tc_binder_key(tc_twin_binder(b), node_name(b)), t)
         tids.push(t)
         i = i + 1
     }
@@ -35102,7 +35259,7 @@ fn tc_assign_rhs_source(node: Int, path: Str) -> Str {
 }
 
 // The source from line:col up to end_line:end_col, or "" when the file does not hold it.
-fn tc_source_text(file: Str, line: Int, col: Int, end_line: Int, end_col: Int) -> Str {
+pub fn tc_source_text(file: Str, line: Int, col: Int, end_line: Int, end_col: Int) -> Str {
     let mut out = ""
     let mut l = line
     while l <= end_line {

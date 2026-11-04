@@ -22,7 +22,7 @@ import parser.{
     effect_derived_ops, node_args, node_body, node_condition, node_else_body, node_elements, node_end, node_fields,
     node_for_binder, node_guard, node_handlers, node_impl_binders, node_impl_where_bounds,
     node_index, node_iterable, node_kind, node_left, node_method, node_methods, node_name,
-    node_obj, node_params, node_pattern, node_recv_type_args, node_right, node_scrutinee, node_source_module,
+    node_module, node_obj, node_params, node_pattern, node_recv_type_args, node_right, node_scrutinee, node_source_module,
     node_start, node_stmts, node_target, node_then_body, node_trait_name, node_type_ann, node_line, node_col, node_end_line, node_end_col, node_written_span,
     node_type_params, node_value, node_captures, node_arms, node_assoc_types, get_annotation,
     sublist_get, sublist_length,
@@ -40,13 +40,13 @@ import typecheck.{
     tc_tid_decl_node, tc_tid_kind, tc_impl_is_poly_user, tc_poly_user_impl_decl, tc_instance_has_trait, tc_written_impl_holds,
     tc_tid_is_no_info, tc_tid_list_elem, tc_tid_name, tc_tid_resolved, tc_tid_struct, tc_type_str,
     tc_declared_field_tids, tc_ptr_pointee_is_valid, tc_decl_tid, tc_type_arg_grows,
-    tc_void_tid, tc_requires_preds_of, tc_ensures_preds_of,
+    tc_void_tid, tc_requires_preds_of, tc_ensures_preds_of, tc_source_text, tc_module_display_name,
 }
 import cname.{c_mono_fn_name, c_mono_type_c_name, c_poly_method_name}
 import escape.{is_async_spawn}
 import diagnostics.{
     DiagEdge, diag_error_at, diag_error_span_label_at_notes, diag_entry_count, diag_file_for_node, diag_ice_at, diag_set_edges_since,
-    INSTANTIATION_CYCLE, INVALID_PTR_TYPE, UNSOLVED_TYPEVAR_AT_CODEGEN,
+    INSTANCE_LIMIT, INSTANTIATION_CYCLE, INVALID_PTR_TYPE, UNSOLVED_TYPEVAR_AT_CODEGEN,
 }
 
 pub type MonoInstance {
@@ -86,10 +86,13 @@ let mut mono_saw: ProgramCalls = ProgramCalls { spawn: false, trace_log: false }
 
 // Declaration lookups the walk resolves a call through. Names here are how source
 // spells a callee; instance identity never depends on them.
-let mut generic_fn_by_name: Map[Str, Int] = Map()
-// Keyed "module:name", for routes that must reach one module's generic whatever else
-// the program declares under the same name.
-let mut generic_fn_by_module_name: Map[Str, Int] = Map()
+// by_module is keyed "module:name", for routes that must reach one module's generic whatever
+// else the program declares under the same name.
+type GenericFnLookup {
+    by_name: Map[Str, Int]
+    by_module: Map[Str, Int]
+}
+let mut generic_fns: GenericFnLookup = GenericFnLookup { by_name: Map(), by_module: Map() }
 // The same declarations as a set of nodes. A call resolved by typecheck arrives as a node,
 // and only a generic free function may be discovered through it: a generic type declaration
 // also carries type parameters and is not a callee of this kind.
@@ -146,6 +149,30 @@ let mut decl_check: DeclCheck = new_decl_check()
 fn new_decl_check() -> DeclCheck {
     DeclCheck { walking: -1, site: -1, edges: [], edge_seen: Map(), edges_from: Map(), method_impl: Map(),
         shared_methods: Map(), scc_next: 0, scc_index: Map(), scc_low: Map(), scc_stack: [], scc_on_stack: Map(), scc_of: Map() }
+}
+
+// What the build walk has spent of the budget on instances (§3.4 *Limit on Generic Instances*).
+// made_by and made_at sit beside mono_table: the instance whose body asked for each instance, and
+// the node there. ctx and site say where the walk reads now.
+type InstanceBudget {
+    weight: Int
+    sizes: Map[Int, Int]
+    ctx: Int
+    site: Int
+    made_by: List[Int]
+    made_at: List[Int]
+    // Beside mono_table: the C name of each instance, spelled after the walk. The name of a deep
+    // type is long, and a program over the budget needs none.
+    namers: List[fn() -> Str]
+    // The instance that crossed the budget. The walk stops there and the report runs after it,
+    // so the many register routes need no reporting effect.
+    over_decl: Int
+    over_args: List[Int]
+}
+let mut instance_budget: InstanceBudget = new_instance_budget()
+
+fn new_instance_budget() -> InstanceBudget {
+    InstanceBudget { weight: 0, sizes: Map(), ctx: -1, site: -1, made_by: [], made_at: [], namers: [], over_decl: -1, over_args: [] }
 }
 
 // A root walk has no instance; it reads types straight from typecheck.
@@ -221,7 +248,7 @@ pub fn node_tid_for_inst(inst: MonoInstance, node: Int) -> Int ! Diag.Report {
         }
     }
     diag_ice_at("MonoNodeNotInInstance", UNSOLVED_TYPEVAR_AT_CODEGEN,
-        "node {node} has no recorded type in mono instance {inst.c_name}", node,
+        "node {node} has no recorded type in mono instance of `{node_name(inst.base_decl_node)}`", node,
         "the walk records every typed node of an instance body; this is a compiler bug")
     -1
 }
@@ -268,9 +295,15 @@ pub fn run_mono(program: Int, -- traced: Bool = false) ! Diag.Report {
     require_sealed_ops_rewritten(program)
     mono_reset()
     mono_build_decl_maps(program)
+    build_decl_method_maps(program)
     walk_roots(program)
     mono_drain()
-    if traced { register_traced_debug() }
+    if traced && !over_budget() { register_traced_debug() }
+    if over_budget() {
+        report_instance_limit()
+        return
+    }
+    name_instances()
     trace.log("blink.mono", "instances={mono_table.len()}")
 }
 
@@ -283,12 +316,12 @@ fn mono_reset() {
     mono_call_target = Map()
     ptr_tids_judged = Map()
     mono_saw = ProgramCalls { spawn: false, trace_log: false }
-    generic_fn_by_name = Map()
-    generic_fn_by_module_name = Map()
+    generic_fns = GenericFnLookup { by_name: Map(), by_module: Map() }
     generic_fn_nodes = Map()
     own_generic_method_impl = Map()
     poly_methods = PolyMethods { by_name: Map(), by_qualified: Map(), block_of: Map(), by_recv: Map() }
     decl_check = new_decl_check()
+    instance_budget = new_instance_budget()
 }
 
 // ── Declaration maps ───────────────────────────────────────────────────────────
@@ -305,8 +338,8 @@ fn mono_build_decl_maps(program: Int) {
         let fn_node = sublist_get(fns_sl, i)
         // An FFI-bridged generic is one type-erased C symbol, never an instance.
         if has_type_params(fn_node) && get_annotation(fn_node, "ffi") == -1 {
-            generic_fn_by_name.insert(node_name(fn_node), fn_node)
-            generic_fn_by_module_name.insert("{node_source_module(fn_node)}:{node_name(fn_node)}", fn_node)
+            generic_fns.by_name.insert(node_name(fn_node), fn_node)
+            generic_fns.by_module.insert("{node_source_module(fn_node)}:{node_name(fn_node)}", fn_node)
             generic_fn_nodes.insert(fn_node, 1)
         }
         i = i + 1
@@ -494,7 +527,7 @@ fn mono_drain() ! Diag.Report {
 
 fn mono_drain_from(start: Int) ! Diag.Report {
     let mut di = start
-    while di < mono_table.len() {
+    while di < mono_table.len() && !over_budget() {
         mono_walk(di, mono_table.get(di).unwrap().base_decl_node)
         di = di + 1
     }
@@ -723,13 +756,13 @@ fn fn_signature_tid(fn_node: Int, binds: Map[Str, Int]) -> Int {
 // `arg_tids` are canonical (see canon_tid); the caller made them so to spell c_name.
 // Answers where the instance sits in the table, whether this call minted it or an
 // earlier one did.
-fn register(base_decl_node: Int, binders_sl: Int, arg_tids: List[Int], inst_tid: Int, c_name: Str) -> Int {
+fn register(base_decl_node: Int, binders_sl: Int, arg_tids: List[Int], inst_tid: Int, c_name: fn() -> Str) -> Int {
     register_with_binds(base_decl_node, binds_from_binders(binders_sl, arg_tids), arg_tids, inst_tid, c_name)
 }
 
 // The same, for an instance whose binders come from two declarations at once: the binds are
 // already merged, so there is no single binder list to zip against the arguments.
-fn register_with_binds(base_decl_node: Int, binds: Map[Str, Int], arg_tids: List[Int], inst_tid: Int, c_name: Str) -> Int {
+fn register_with_binds(base_decl_node: Int, binds: Map[Str, Int], arg_tids: List[Int], inst_tid: Int, c_name: fn() -> Str) -> Int {
     let tuple = make_tuple_type(arg_tids)
     let key = seen_key(base_decl_node, tuple)
     match mono_seen_keys.get(key) {
@@ -738,14 +771,17 @@ fn register_with_binds(base_decl_node: Int, binds: Map[Str, Int], arg_tids: List
     }
     let idx = mono_table.len()
     mono_seen_keys.insert(key, idx)
-    mono_table.push(MonoInstance { base_decl_node: base_decl_node, arg_tids: tuple, inst_tid: inst_tid, c_name: c_name, unit_named: false })
+    mono_table.push(MonoInstance { base_decl_node: base_decl_node, arg_tids: tuple, inst_tid: inst_tid, c_name: "", unit_named: false })
     mono_node_tids.push(Map())
     mono_binds.push(binds)
+    instance_budget.namers.push(c_name)
+    instance_budget.made_by.push(instance_budget.ctx)
+    instance_budget.made_at.push(instance_budget.site)
     // A private gate: the message renders types, which a trace.log message can not.
     if trace_gate_on("blink.mono") {
         let args = tc_type_str(tuple)
         let inst = tc_type_str(inst_tid)
-        trace.log("blink.mono", "instance {c_name} args={args} inst={inst}")
+        trace.log("blink.mono", "instance {c_name()} args={args} inst={inst}")
     }
     idx
 }
@@ -758,11 +794,14 @@ fn register_fn(gfn: Int, arg_tids0: List[Int]) -> Int {
         note_decl_edge(gfn, binder_names(node_type_params(gfn)), arg_tids0)
         return -1
     }
+    if !args_fit(gfn, arg_tids0) { return -1 }
     let arg_tids = canon_tids(arg_tids0)
     let binders_sl = node_type_params(gfn)
     let args_tid = make_tuple_type(arg_tids)
+    let seen = seen_or_paid(gfn, args_tid, arg_tids)
+    if seen != NEW_INSTANCE { return seen }
     let inst_tid = canon_tid(fn_signature_tid(gfn, binds_from_binders(binders_sl, arg_tids)))
-    register(gfn, binders_sl, arg_tids, inst_tid, c_mono_fn_name(gfn, args_tid))
+    register(gfn, binders_sl, arg_tids, inst_tid, fn() -> Str { c_mono_fn_name(gfn, args_tid) })
 }
 
 // An instance of a method's own type parameters. The impl block names the symbol, so two
@@ -773,14 +812,17 @@ fn register_own_generic_method(m: Int, arg_tids0: List[Int]) -> Int {
         note_decl_edge(m, binder_names(node_type_params(m)), arg_tids0)
         return -1
     }
+    if !args_fit(m, arg_tids0) { return -1 }
     let arg_tids = canon_tids(arg_tids0)
     let binders_sl = node_type_params(m)
     let args_tid = make_tuple_type(arg_tids)
     let im = own_generic_method_impl.get(m) ?? -1
     if im < 0 { return -1 }
+    let seen = seen_or_paid(m, args_tid, arg_tids)
+    if seen != NEW_INSTANCE { return seen }
     let inst_tid = canon_tid(fn_signature_tid(m, binds_from_binders(binders_sl, arg_tids)))
     let source = impl_source_tid(im, Map())
-    register(m, binders_sl, arg_tids, inst_tid, c_poly_method_name(im, node_name(m), args_tid, source))
+    register(m, binders_sl, arg_tids, inst_tid, fn() -> Str { c_poly_method_name(im, node_name(m), args_tid, source) })
 }
 
 // A poly-impl method that declares type parameters of its own answers to two declarations:
@@ -802,17 +844,23 @@ fn register_poly_own_generic_method(m: Int, impl_tids0: List[Int], own_tids0: Li
         note_decl_edge(m, params, all)
         return -1
     }
+    let mut raw_tids = impl_tids0.slice(0, impl_tids0.len())
+    for t in own_tids0 { raw_tids.push(t) }
+    if !args_fit(m, raw_tids) { return -1 }
     let impl_tids = canon_tids(impl_tids0)
     let own_tids = canon_tids(own_tids0)
     let mut arg_tids: List[Int] = []
     for t in impl_tids { arg_tids.push(t) }
     for t in own_tids { arg_tids.push(t) }
+    let seen = seen_or_paid(m, make_tuple_type(arg_tids), arg_tids)
+    if seen != NEW_INSTANCE { return seen }
     let mut binds = binds_from_binders(node_impl_binders(im), impl_tids)
     let own_binds = binds_from_binders(node_type_params(m), own_tids)
     for k in own_binds.keys() { binds.insert(k, own_binds.get(k) ?? -1) }
     let args_tid = make_tuple_type(arg_tids)
     let inst_tid = canon_tid(fn_signature_tid(m, binds))
-    register_with_binds(m, binds, arg_tids, inst_tid, c_poly_method_name(im, node_name(m), args_tid, impl_source_tid(im, binds)))
+    let source = impl_source_tid(im, binds)
+    register_with_binds(m, binds, arg_tids, inst_tid, fn() -> Str { c_poly_method_name(im, node_name(m), args_tid, source) })
 }
 
 // Keyed on the impl binders' tids, so two receivers that differ only inside an argument the
@@ -822,13 +870,17 @@ fn register_poly_method(m: Int, impl_tids0: List[Int]) -> Int {
         note_decl_edge(m, binder_names(node_impl_binders(poly_methods.block_of.get(m).unwrap())), impl_tids0)
         return -1
     }
+    if !args_fit(m, impl_tids0) { return -1 }
     let impl_tids = canon_tids(impl_tids0)
+    let seen = seen_or_paid(m, make_tuple_type(impl_tids), impl_tids)
+    if seen != NEW_INSTANCE { return seen }
     let im = poly_methods.block_of.get(m).unwrap()
     let binders_sl = node_impl_binders(im)
     let binds = binds_from_binders(binders_sl, impl_tids)
     let inst_tid = canon_tid(fn_signature_tid(m, binds))
-    let c_name = c_poly_method_name(im, node_name(m), make_tuple_type(impl_tids), impl_source_tid(im, binds))
-    register(m, binders_sl, impl_tids, inst_tid, c_name)
+    let args_tid = make_tuple_type(impl_tids)
+    let source = impl_source_tid(im, binds)
+    register(m, binders_sl, impl_tids, inst_tid, fn() -> Str { c_poly_method_name(im, node_name(m), args_tid, source) })
 }
 
 // The source a conversion impl's instance converts from, with the instance's binders put in,
@@ -855,8 +907,9 @@ fn register_type_instance(tid: Int) ! Diag.Report {
         note_type_edges(tid)
         return
     }
-    if tid_is_open(tid) { return }
     let td = tc_tid_decl_node(tid)
+    if td >= 0 && !args_fit(td, type_args_of(tid)) { return }
+    if tid_is_open(tid) { return }
     if td == DECL_NODE_AMBIGUOUS {
         diag_ice_at("MonoAmbiguousTypeDecl", UNSOLVED_TYPEVAR_AT_CODEGEN,
             "generic type `{tc_tid_name(tid)}` resolves to more than one declaration", -1,
@@ -865,14 +918,21 @@ fn register_type_instance(tid: Int) ! Diag.Report {
     }
     if td < 0 { return }
     let ct = canon_tid(tid)
-    register(td, node_type_params(td), type_args_of(ct), ct, c_mono_type_c_name(ct))
+    let args = type_args_of(ct)
+    let seen = seen_or_paid(td, make_tuple_type(args), args)
+    if seen == -1 { return }
+    if seen == NEW_INSTANCE { register(td, node_type_params(td), args, ct, fn() -> Str { c_mono_type_c_name(ct) }) }
     register_operator_methods(td, ct)
+}
+
+fn operator_methods() -> List[(Str, Str)] {
+    [("Eq", "eq"), ("Ord", "cmp"), ("Clone", "clone")]
 }
 
 // `==`, `<` and a range's clone reach a written Eq, Ord or Clone impl with no call node to
 // discover it by, so an instance of the type registers the impl's method itself.
 fn register_operator_methods(td: Int, ct: Int) {
-    for pair in [("Eq", "eq"), ("Ord", "cmp"), ("Clone", "clone")] {
+    for pair in operator_methods() {
         register_method_where_it_holds(td, ct, pair.0, pair.1)
     }
 }
@@ -965,7 +1025,7 @@ fn discover_call(ctx: Int, node: Int) ! Diag.Report {
         return
     }
     let fn_name = tc_call_declared_name(node)
-    match generic_fn_by_name.get(fn_name) {
+    match generic_fns.by_name.get(fn_name) {
         Some(gfn) => discover_generic_call(ctx, gfn, node, [], node_args(node))
         None => {}
     }
@@ -1001,7 +1061,7 @@ fn discover_module_call(ctx: Int, node: Int) ! Diag.Report {
         return
     }
     let fn_name = node_method(node)
-    match generic_fn_by_name.get(fn_name) {
+    match generic_fns.by_name.get(fn_name) {
         Some(gfn) => discover_generic_call(ctx, gfn, node, [], node_args(node))
         None => {}
     }
@@ -1098,7 +1158,7 @@ fn discover_list_hof_call(ctx: Int, node: Int, obj: Int) ! Diag.Report {
     if tc_is_sealed_list_hof(method) == 0 { return }
     let recv_tid = ctx_node_tid(ctx, obj)
     if recv_tid < 0 || tc_tid_kind(recv_tid) != TyKind.List { return }
-    match generic_fn_by_name.get("list_{method}") {
+    match generic_fns.by_name.get("list_{method}") {
         Some(gfn) => discover_generic_call(ctx, gfn, node, [recv_tid], node_args(node))
         None => {}
     }
@@ -1111,7 +1171,7 @@ fn discover_list_generic_adapter_call(ctx: Int, node: Int, obj: Int) ! Diag.Repo
     if tc_is_list_generic_adapter(method) == 0 { return }
     let recv_tid = ctx_node_tid(ctx, obj)
     if recv_tid < 0 || tc_tid_kind(recv_tid) != TyKind.List { return }
-    match generic_fn_by_name.get("list_{method}") {
+    match generic_fns.by_name.get("list_{method}") {
         Some(gfn) => discover_generic_call(ctx, gfn, node, [recv_tid], node_args(node))
         None => {}
     }
@@ -1124,7 +1184,7 @@ fn discover_map_generic_adapter_call(ctx: Int, node: Int, obj: Int) ! Diag.Repor
     if recv_tid < 0 { return }
     let callee = tc_map_generic_adapter(tc_tid_kind(recv_tid), node_method(node))
     if callee == "" { return }
-    match generic_fn_by_module_name.get("{tc_map_generic_adapter_module()}:{callee}") {
+    match generic_fns.by_module.get("{tc_map_generic_adapter_module()}:{callee}") {
         Some(gfn) => discover_generic_call(ctx, gfn, node, [recv_tid], node_args(node))
         None => {}
     }
@@ -1163,7 +1223,7 @@ fn discover_iterator_call(ctx: Int, node: Int, obj: Int) ! Diag.Report {
     if recv_tid < 0 { return }
     let name = iterator_route_name(recv_tid, node_method(node))
     if name == "" { return }
-    match generic_fn_by_module_name.get("{iterator_route_module()}:{name}") {
+    match generic_fns.by_module.get("{iterator_route_module()}:{name}") {
         Some(gfn) => discover_generic_call(ctx, gfn, node, [recv_tid], node_args(node))
         None => {}
     }
@@ -1176,9 +1236,11 @@ fn discover_own_generic_method_call(ctx: Int, node: Int, obj: Int) ! Diag.Report
     let m = tc_call_decl_node(node)
     if m < 0 { return }
     if !own_generic_method_impl.contains_key(m) { return }
+    // The qualified form names the trait, and its first argument fills `self` as any other does.
+    let qualified = node_kind(obj) == NodeKind.Ident && tc_mc_obj_is_value(node) == 0
     let recv_tid = ctx_node_tid(ctx, obj)
-    if recv_tid < 0 { return }
-    let binds = solve_call_binds(ctx, m, node, [recv_tid], node_args(node))
+    if recv_tid < 0 && !qualified { return }
+    let binds = solve_call_binds(ctx, m, node, if qualified { [] } else { [recv_tid] }, node_args(node))
     note_call_target(ctx, node, register_own_generic_method(m, binder_args(ctx, m, node, binds)))
 }
 
@@ -1367,7 +1429,7 @@ fn walk_fn_parts(ctx: Int, fn_node: Int) ! Diag.Report {
 fn walk_field_access(ctx: Int, node: Int) ! Diag.Report {
     let obj = node_obj(node)
     mono_walk(ctx, obj)
-    decl_check.site = node
+    if !over_budget() { note_walk_site(ctx, node) }
     discover_fn_value(ctx, node)
     if ctx < 0 || obj == -1 { return }
     match mono_node_tids.get(ctx).unwrap().get(node) {
@@ -1411,11 +1473,19 @@ fn register_default_fill_instances(ctx: Int, call_node: Int) {
         let dflt = node_value(fill)
         if tc_is_default_fill(fill) && !declares_default(callee_decl, dflt) {
             let declared = tc_lookup_node_tid(dflt)
-            let at_call = canon_tid(ctx_node_tid(ctx, fill))
-            if declared >= 0 && at_call >= 0 && tid_is_open(declared) && !tid_is_open(at_call) {
-                let binds: Map[Str, Int] = Map()
-                unify(declared, at_call, binds)
-                note_call_target(ctx, fill, register_with_binds(dflt, binds, [at_call], at_call, ""))
+            let raw = ctx_node_tid(ctx, fill)
+            if raw >= 0 && args_fit(dflt, [raw]) {
+                let at_call = canon_tid(raw)
+                if declared >= 0 && at_call >= 0 && tid_is_open(declared) && !tid_is_open(at_call) {
+                    let seen = seen_or_paid(dflt, make_tuple_type([at_call]), [at_call])
+                    if seen == NEW_INSTANCE {
+                        let binds: Map[Str, Int] = Map()
+                        unify(declared, at_call, binds)
+                        note_call_target(ctx, fill, register_with_binds(dflt, binds, [at_call], at_call, fn() -> Str { "" }))
+                    } else {
+                        note_call_target(ctx, fill, seen)
+                    }
+                }
             }
         }
         i = i + 1
@@ -1484,9 +1554,15 @@ fn ice_unwalkable(node: Int, kind: NodeKind) ! Diag.Report {
 
 // One arm per NodeKind. A kind added to the enum fails to compile here until it is
 // placed, and the two kinds that never sit inside a body are an ICE at runtime.
-fn mono_walk(ctx: Int, node: Int) ! Diag.Report {
-    if node == -1 { return }
+fn note_walk_site(ctx: Int, node: Int) {
     decl_check.site = node
+    instance_budget.ctx = ctx
+    instance_budget.site = node
+}
+
+fn mono_walk(ctx: Int, node: Int) ! Diag.Report {
+    if node == -1 || over_budget() { return }
+    note_walk_site(ctx, node)
     mono_record(ctx, node)
     let kind = node_kind(node)
     match kind {
@@ -1602,9 +1678,13 @@ fn build_decl_method_maps(program: Int) {
 }
 
 // A call that reaches a shared impl method. Only `impl[T] X for List[T]` shares a body, so the
-// receiver's one argument answers the one binder.
-fn note_shared_impl_call(node: Int, obj: Int) {
-    let recv = tc_resolve(ctx_node_tid(ROOT_CTX, obj))
+// receiver's one argument answers the one binder. The qualified form names the trait, so the
+// receiver is the first argument.
+fn note_shared_impl_call(node: Int, obj: Int) ! Diag.Report {
+    let args_sl = node_args(node)
+    let qualified = node_kind(obj) == NodeKind.Ident && tc_mc_obj_is_value(node) == 0
+    if qualified && sl_len(args_sl) == 0 { return }
+    let recv = tc_resolve(ctx_node_tid(ROOT_CTX, if qualified { sublist_get(args_sl, 0) } else { obj }))
     if recv < 0 || tc_tid_child_count(recv) == 0 { return }
     let m = decl_check.shared_methods.get("{constructor_name(recv, tc_tid_kind(recv))}.{node_method(node)}") ?? -1
     if m < 0 { return }
@@ -1613,7 +1693,14 @@ fn note_shared_impl_call(node: Int, obj: Int) {
         Some(key) => if key != tc_impl_trait_id(im) { return }
         None => {}
     }
-    note_decl_edge(m, binder_names(node_impl_binders(im)), recv_args(recv))
+    let mut args = recv_args(recv)
+    if has_type_params(m) {
+        let binds = solve_call_binds(ROOT_CTX, m, node, if qualified { [] } else { [recv] }, args_sl)
+        let own = binder_args(ROOT_CTX, m, node, binds)
+        if own.len() == 0 { return }
+        for t in own { args.push(t) }
+    }
+    note_decl_edge(m, own_params_of(m), args)
 }
 
 fn walk_generic_decls(program: Int) ! Diag.Report {
@@ -1713,7 +1800,7 @@ fn note_type_edges(tid: Int) {
     if td < 0 { return }
     let args = type_args_of(tid)
     note_decl_edge(td, binder_names(node_type_params(td)), args)
-    for pair in [("Eq", "eq"), ("Ord", "cmp"), ("Clone", "clone")] {
+    for pair in operator_methods() {
         match poly_methods.by_recv.get(poly_user_key(td, "{pair.0}.{pair.1}")) {
             Some(m) => register_poly_method(m, args)
             None => {}
@@ -1827,18 +1914,24 @@ fn path_back(from: Int, to: Int) -> List[Int] {
 // A diagnostic never prints a type in full (§3.4): past depth 3 it reads `...`. The size of a
 // type has no limit, so this never asks for the text of a whole type.
 fn shown_type(tid0: Int) -> Str {
-    shown_type_at(tid0, 0)
+    shown_type_at(tid0, 0, -1, "")
 }
 
-fn shown_type_at(tid0: Int, depth: Int) -> Str {
+// The same, with `earlier` printed as `param`, so the text shows what a step added.
+fn shown_type_over(tid0: Int, earlier: Int, param: Str) -> Str {
+    shown_type_at(tid0, 0, earlier, param)
+}
+
+fn shown_type_at(tid0: Int, depth: Int, earlier: Int, param: Str) -> Str {
     let tid = tc_resolve(tid0)
+    if earlier >= 0 && tid == tc_resolve(earlier) { return param }
+    if depth >= 3 { return "..." }
     let n = tc_tid_child_count(tid)
     if n == 0 { return tc_type_str(tid) }
-    if depth >= 3 { return "..." }
     let mut kids: List[Str] = []
     let mut i = 0
     while i < n {
-        kids.push(shown_type_at(tc_tid_child(tid, i), depth + 1))
+        kids.push(shown_type_at(tc_tid_child(tid, i), depth + 1, earlier, param))
         i = i + 1
     }
     let k = tc_tid_kind(tid)
@@ -2042,4 +2135,319 @@ fn cycle_help(e: DeclEdge) -> Str {
         return "take a recursive type in place of `{p}`, as in {nest}. A receiver of that type has a type argument that does not grow"
     }
     "take a recursive type in place of `{p}`, as in {nest} with `fn {d}[T](x: Nest[T], n: Int)`.\nThen `{d}(Nest.Many([x]), n - 1)` has a type argument that does not grow"
+}
+
+// ── The budget on instances ────────────────────────────────────────────────────
+
+// §3.4 *Limit on Generic Instances*.
+const INSTANCE_BUDGET = 1048576
+const NEW_INSTANCE = -2
+
+pub fn instance_weight() -> Int {
+    instance_budget.weight
+}
+
+// A type's node count, stopped just past the budget: a type shares its parts in the pool, so its
+// node count can be far larger than the walk that reads it, and a count past the budget is already
+// the answer.
+fn type_size(tid0: Int) -> Int {
+    let tid = tc_resolve(tid0)
+    match instance_budget.sizes.get(tid) {
+        Some(known) => { return known }
+        None => {}
+    }
+    let mut size = 1
+    let n = tc_tid_child_count(tid)
+    let mut i = 0
+    while i < n && size <= INSTANCE_BUDGET {
+        size = size + type_size(tc_tid_child(tid, i))
+        i = i + 1
+    }
+    instance_budget.sizes.insert(tid, size)
+    size
+}
+
+fn args_size(tids: List[Int]) -> Int {
+    let mut size = 0
+    for t in tids {
+        if size <= INSTANCE_BUDGET { size = size + type_size(t) }
+    }
+    size
+}
+
+fn over_budget() -> Bool {
+    instance_budget.over_decl >= 0
+}
+
+// Whether the build may read these type arguments at all. canon_tid, and each step after it, walks
+// a type node by node, so this runs first: a type over the budget can have more nodes than memory.
+fn args_fit(decl: Int, tids0: List[Int]) -> Bool {
+    if over_budget() { return false }
+    if 1 + args_size(tids0) <= INSTANCE_BUDGET { return true }
+    stop_at_crossing(decl, tids0)
+    false
+}
+
+fn stop_at_crossing(decl: Int, args: List[Int]) {
+    instance_budget.over_decl = decl
+    instance_budget.over_args = args
+}
+
+fn name_instances() {
+    let mut row = 0
+    while row < mono_table.len() {
+        mono_table.set(row, MonoInstance { c_name: instance_budget.namers.get(row).unwrap()(), ..mono_table.get(row).unwrap() })
+        row = row + 1
+    }
+    instance_budget.namers = []
+}
+
+// Each new instance pays here, before the signature tid and the C name exist. The answer is the
+// row of the instance when the table has it, NEW_INSTANCE when the caller must build it, and -1
+// when the budget stopped the build.
+fn seen_or_paid(decl: Int, args_tid: Int, arg_tids: List[Int]) -> Int {
+    match mono_seen_keys.get(seen_key(decl, args_tid)) {
+        Some(idx) => { return idx }
+        None => {}
+    }
+    let weight = 1 + args_size(arg_tids)
+    if instance_budget.weight + weight > INSTANCE_BUDGET {
+        stop_at_crossing(decl, arg_tids)
+        return -1
+    }
+    instance_budget.weight = instance_budget.weight + weight
+    NEW_INSTANCE
+}
+
+// One step of the chain: an instance and the site in its parent's body that asked for it.
+type ChainLink {
+    decl: Int
+    args: List[Int]
+    size: Int
+    site: Int
+}
+
+// The chain of the crossing instance, from the crossing instance to the root.
+fn instance_chain(decl: Int, args: List[Int]) -> List[ChainLink] {
+    let mut chain = [ChainLink { decl: decl, args: args, size: args_size(args), site: instance_budget.site }]
+    let mut at = instance_budget.ctx
+    while at >= 0 {
+        let inst = mono_table.get(at).unwrap()
+        let at_args = type_args_of(inst.arg_tids)
+        chain.push(ChainLink { decl: inst.base_decl_node, args: at_args, size: args_size(at_args), site: instance_budget.made_at.get(at).unwrap() })
+        at = instance_budget.made_by.get(at).unwrap()
+    }
+    chain
+}
+
+// Where the stretch starts: the nearest link whose declaration appears again toward the root with
+// a smaller list, or -1. One pass from the root keeps the smallest list seen for each declaration,
+// because a chain can hold many links and a pair search would read them all for each one.
+fn nearest_repeat(chain: List[ChainLink]) -> Int {
+    let mut smallest: Map[Int, Int] = Map()
+    let mut found = -1
+    let mut i = chain.len() - 1
+    while i >= 0 {
+        let link = chain.get(i).unwrap()
+        match smallest.get(link.decl) {
+            Some(size) => {
+                if link.size > size { found = i }
+                if link.size < size { smallest.insert(link.decl, link.size) }
+            }
+            None => { smallest.insert(link.decl, link.size) }
+        }
+        i = i - 1
+    }
+    found
+}
+
+// The earlier link of the same declaration, with a smaller list.
+fn repeat_of(chain: List[ChainLink], later: Int) -> Int {
+    let link = chain.get(later).unwrap()
+    let mut i = later + 1
+    while i < chain.len() {
+        let other = chain.get(i).unwrap()
+        if other.decl == link.decl && other.size < link.size { return i }
+        i = i + 1
+    }
+    -1
+}
+
+// The call in the stretch where the type argument grew: from the later instance toward the earlier,
+// the first link with a larger list than its parent.
+fn grew_at(chain: List[ChainLink], later: Int, earlier: Int) -> Int {
+    let mut i = later
+    while i < earlier {
+        if chain.get(i).unwrap().size > chain.get(i + 1).unwrap().size { return i }
+        i = i + 1
+    }
+    later
+}
+
+fn instance_params(decl: Int) -> List[Str] {
+    let mut out: List[Str] = []
+    match poly_methods.block_of.get(decl) {
+        Some(im) => { for name in binder_names(node_impl_binders(im)) { out.push(name) } }
+        None => {}
+    }
+    for name in binder_names(node_type_params(decl)) { out.push(name) }
+    out
+}
+
+fn instance_text(decl: Int, args: List[Int]) -> Str {
+    decl_at(decl, instance_params(decl), shown_types(args))
+}
+
+// The parameter of `link` that the link says the most about, by its largest argument. When an
+// earlier link of the same declaration is known, the earlier argument prints as the parameter, so
+// the text shows what the call added.
+fn link_growth(link: ChainLink, before: List[Int]) -> (Str, Str) {
+    let params = instance_params(link.decl)
+    let mut best = -1
+    let mut best_size = -1
+    let mut i = 0
+    while i < link.args.len() && i < params.len() {
+        let size = type_size(link.args.get(i).unwrap())
+        if size > best_size {
+            best = i
+            best_size = size
+        }
+        i = i + 1
+    }
+    if best < 0 { return ("", "") }
+    let param = params.get(best).unwrap()
+    let arg = link.args.get(best).unwrap()
+    let earlier = if best < before.len() { before.get(best).unwrap() } else { -1 }
+    (param, shown_type_over(arg, earlier, param))
+}
+
+fn chain_edge(link: ChainLink) -> DiagEdge {
+    let (param, becomes) = link_growth(link, [])
+    let (line, col, end_line, end_col) = site_span(link.site)
+    DiagEdge {
+        decl: node_name(link.decl), param: param, becomes: becomes,
+        file: diag_file_for_node(link.site), line: line, col: col, end_line: end_line, end_col: end_col,
+    }
+}
+
+// The outermost site on the chain in the code of the package that is built. A chain with no such
+// site starts in a library, so its outermost site is the one that exists.
+fn root_site(chain: List[ChainLink]) -> Int {
+    let mut i = chain.len() - 1
+    while i >= 0 {
+        let site = chain.get(i).unwrap().site
+        if site >= 0 && site_in_package(site) { return site }
+        i = i - 1
+    }
+    chain.get(chain.len() - 1).unwrap().site
+}
+
+fn site_in_package(site: Int) -> Bool {
+    let home = tc_module_display_name(node_module(site))
+    !home.starts_with("std.") && !home.starts_with("pkg.")
+}
+
+fn root_note(site: Int) -> Str {
+    let (line, col, end_line, end_col) = site_span(site)
+    let file = diag_file_for_node(site)
+    let at = "{file}:{line}:{col}"
+    let text = tc_source_text(file, line, col, end_line, end_col).split("\n").get(0) ?? ""
+    if text == "" { return "the chain starts at {at}" }
+    let k = node_kind(site)
+    if k == NodeKind.Call || k == NodeKind.MethodCall { return "the chain starts at the call `{text}` at {at}" }
+    "the chain starts at `{text}` at {at}"
+}
+
+fn thousands(n: Int) -> Str {
+    if n < 1000 { return "{n}" }
+    let tail = "{1000 + n % 1000}".byte_slice(1, 4)
+    "{thousands(n / 1000)},{tail}"
+}
+
+fn instance_counts() -> Map[Int, Int] {
+    let mut counts: Map[Int, Int] = Map()
+    for inst in mono_table {
+        counts.insert(inst.base_decl_node, (counts.get(inst.base_decl_node) ?? 0) + 1)
+    }
+    counts
+}
+
+fn instances_of(decl: Int) -> Str {
+    let count = instance_counts().get(decl) ?? 0
+    if count == 1 { "1 instance" } else { "{thousands(count)} instances" }
+}
+
+// Root first, as the program reaches them.
+fn repeat_note(chain: List[ChainLink], decl: Int) -> Str {
+    let mut shown: List[Str] = []
+    let mut i = chain.len() - 1
+    while i >= 0 && shown.len() < 3 {
+        let link = chain.get(i).unwrap()
+        if link.decl == decl { shown.push("`{instance_text(decl, link.args)}`") }
+        i = i - 1
+    }
+    "`{node_name(decl)}` appears again with a larger type: {shown.join(", then ")}; it has {instances_of(decl)}"
+}
+
+// The first declaration in the table with the highest count, so a tie has one answer.
+fn most_instances() -> Int {
+    let mut best = -1
+    let mut best_count = 0
+    let counts = instance_counts()
+    for inst in mono_table {
+        let count = counts.get(inst.base_decl_node) ?? 0
+        if count > best_count {
+            best = inst.base_decl_node
+            best_count = count
+        }
+    }
+    best
+}
+
+fn report_instance_limit() ! Diag.Report {
+    let decl = instance_budget.over_decl
+    let args = instance_budget.over_args
+    let chain = instance_chain(decl, args)
+    let mut edges: List[DiagEdge] = []
+    let mut i = chain.len() - 1
+    while i >= 0 {
+        edges.push(chain_edge(chain.get(i).unwrap()))
+        i = i - 1
+    }
+    let later = nearest_repeat(chain)
+    let one_copy = "the compiler builds one copy for each type. It does not read `n`, so `n == 0` does not end the chain"
+    let root = root_note(root_site(chain))
+    let mut notes = [root]
+    let mut span_link = 0
+    let mut label = ""
+    let mut help = "write the part that repeats as a recursive type, or as a named type for each level, such as `type N1 \{ a: N0, b: N0 }`"
+    if later >= 0 {
+        span_link = grew_at(chain, later, repeat_of(chain, later))
+        let link = chain.get(span_link).unwrap()
+        let before = link_before(chain, span_link)
+        let (param, becomes) = link_growth(link, before)
+        label = "`{param}` of `{node_name(link.decl)}` becomes `{becomes}` here"
+        notes.push(repeat_note(chain, chain.get(later).unwrap().decl))
+        help = "write the growing part as a recursive type, such as\n`type Nest[T] \{ One(v: T), Wrap(inner: Nest[T]) }`"
+    } else {
+        label = "this needs `{instance_text(decl, args)}`, past the limit"
+        let most = most_instances()
+        if most >= 0 {
+            notes.push("`{node_name(most)}` has the most: {instances_of(most)}. Write a recursive type, or a named type for the part that repeats")
+        }
+    }
+    notes.push(one_copy)
+    let site = chain.get(span_link).unwrap().site
+    let (line, col, end_line, end_col) = site_span(site)
+    let before_entries = diag_entry_count()
+    diag_error_span_label_at_notes("InstanceLimit", INSTANCE_LIMIT,
+        "the generic instances of this program weigh more than 1,048,576", site, line, col, if end_line == line { end_col } else { 0 },
+        label, help, notes)
+    diag_set_edges_since(before_entries, edges)
+}
+
+// The arguments of the nearest earlier link of the same declaration, or none.
+fn link_before(chain: List[ChainLink], at: Int) -> List[Int] {
+    let found = repeat_of(chain, at)
+    if found < 0 { [] } else { chain.get(found).unwrap().args }
 }

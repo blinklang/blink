@@ -1,0 +1,93 @@
+// The budget is exact (sections/03_types.md §3.4 *Limit on Generic Instances*): a total of 2^20 builds and
+// one more is E0325. Each instance weighs 1 plus the nodes in its type arguments, and only a
+// new instance pays. The program at the limit also runs through the CLI under an address space cap.
+
+import mono.{run_mono, instance_weight, check_instance_cycles}
+import diagnostics.{diag_count, diag_render}
+import cg_test_helpers.{cg_probe_compile}
+import std.process.{ChildEnd}
+import compile_test_helpers.{scratch_root}
+
+const LIMIT = 1048576
+
+fn weight_of(src: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Env.Exit, Env.Read, FS.Read, FS.Write, IO, Process.Spawn {
+    let path = "build/instance_limit_probe.bl"
+    let program = cg_probe_compile(path, src)
+    let _rm = process.run("rm", ["-f", path]).unwrap()
+    check_instance_cycles(program)
+    assert_eq(diag_count, 0)
+    run_mono(program)
+    instance_weight()
+}
+
+// `List` nested `depth` times over Int.
+fn nested(depth: Int) -> Str {
+    let mut out = "Int"
+    let mut i = 0
+    while i < depth {
+        out = "List[{out}]"
+        i = i + 1
+    }
+    out
+}
+
+// f1[Int] weighs 2, f2[(Int, Int)] weighs 4, and each next one doubles.
+fn program_with_pad(pad_weight: Int) -> Str {
+    let mut out = ""
+    let mut i = 1
+    while i < 18 {
+        out = "{out}fn f{i}[T](x: T) -> Int \{ f{i + 1}((x, x)) }\n"
+        i = i + 1
+    }
+    out = "{out}fn f18[T](x: T) -> Int \{ 0 }\n"
+    i = 1
+    while i < 18 {
+        out = "{out}fn g{i}[T](x: T) -> Int \{ g{i + 1}((x, x)) }\n"
+        i = i + 1
+    }
+    out = "{out}fn g18[T](x: T) -> Int \{ 0 }\nfn pad[T]() -> Int \{ 0 }\n"
+    let pads = if pad_weight > 0 { "pad[{nested(pad_weight - 2)}]()" } else { "0" }
+    "{out}fn main() \{ let _a = f1(1) + g1(1) + f1(1) + {pads} }\n"
+}
+
+test "weight: each new instance pays 1 plus the nodes in its type arguments" {
+    let base = weight_of("fn main() \{ }\n")
+    assert_eq(weight_of("fn id[T](x: T) -> T \{ x }\nfn main() \{ let _a = id(1) }\n"), base + 2)
+    assert_eq(weight_of("fn id[T](x: T) -> T \{ x }\nfn main() \{ let _a = id([1]) }\n"), base + 3)
+    assert_eq(weight_of("fn id[T](x: T) -> T \{ x }\nfn main() \{ let _a = id((1, 2)) }\n"), base + 4)
+    assert_eq(weight_of("fn two[A, B](a: A, b: B) -> Int \{ 0 }\nfn main() \{ let _a = two(1, \"s\") }\n"), base + 3)
+}
+
+test "weight: an instance the program already has pays nothing" {
+    let base = weight_of("fn main() \{ }\n")
+    assert_eq(weight_of("fn id[T](x: T) -> T \{ x }\nfn main() \{ let _a = id(1) + id(2) }\n"), base + 2)
+}
+
+test "weight: a generic type pays as a function does" {
+    let base = weight_of("fn main() \{ }\n")
+    assert_eq(weight_of("type Box[T] \{ v: T }\nfn main() \{ let _b = Box \{ v: 1 } }\n"), base + 2)
+}
+
+test "a total of exactly 2^20 builds, and one more is E0325" {
+    let without = weight_of(program_with_pad(0))
+    let pad = LIMIT - without
+    assert(pad >= 2)
+    assert_eq(weight_of(program_with_pad(pad)), LIMIT)
+    assert_eq(diag_count, 0)
+    let path = "build/instance_limit_probe.bl"
+    let program = cg_probe_compile(path, program_with_pad(pad + 1))
+    let _rm = process.run("rm", ["-f", path]).unwrap()
+    run_mono(program)
+    assert_eq(diag_count, 1)
+    assert(diag_render(1).contains("\"code\":\"E0325\""), diag_render(1))
+}
+
+test "the program at the limit checks under a 3 GB address space cap" {
+    let without = weight_of(program_with_pad(0))
+    let pad = LIMIT - without
+    let path = "{scratch_root()}/at_limit_{getpid()}.bl"
+    fs.write(path, program_with_pad(pad)).unwrap()
+    let result = process.run("sh", ["-c", "ulimit -v 3145728; exec build/blink check {path}"]).unwrap()
+    let _ = fs.delete(path)
+    assert_eq(result.end, ChildEnd.Exited(0))
+}
