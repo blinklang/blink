@@ -62,7 +62,7 @@ import diagnostics.{
     DERIVE_DEBUG_FIELD_NO_DEBUG, STR_PLUS_UNSUPPORTED,
     PRIVATE_ITEM_ACCESS, AMBIGUOUS_IMPORT, IMPORT_NOT_SELECTED,
     MODULE_QUALIFIED_TYPE,
-    UNKNOWN_METHOD, UNUSED_VARIABLE, SET_BUT_NOT_READ, SHADOWED_VARIABLE, SHADOWED_PRELUDE_NAME, DUPLICATE_SYMBOL,
+    UNUSED_VARIABLE, SET_BUT_NOT_READ, SHADOWED_VARIABLE, SHADOWED_PRELUDE_NAME, DUPLICATE_SYMBOL,
     DISCARDED_COLLECTION_COPY, TODO_IN_CODE, NEGATIVE_ZERO_COMPARISON, diag_warn_span_label_at_notes,
     UNREACHABLE_CODE, UNAUDITED_FFI, DEPRECATED_USAGE,
     NAME_COLLISION, AMBIGUOUS_CONSTRUCTION, RESERVED_TYPE_NAME, NOT_DERIVABLE,
@@ -1254,13 +1254,13 @@ fn tc_method_resolvable_on_type(obj_k: TyKind, tname: Str, method: Str) -> Int {
     if obj_k == TyKind.Enum && (method == "to_str" || method == "from_str") { return 1 }
     // (d) closure-typed struct field invoked like a method. Closure fields lower
     //     to TyKind.Typevar("Fn"), not a closure kind, so reuse the callable-field
-    //     name registry (the same signal that suppresses W0501).
+    //     name registry (the same signal that keeps the method flush from reporting it).
     if obj_k == TyKind.Struct && is_callable_field_name(method) != 0 { return 1 }
     // (e) trait/stdlib methods whose receiver-type resolution is not modeled at
     //     typecheck: `.into()` (From-trait auto-conversion), stdlib-type methods
     //     like `Instant.to_rfc3339()`, channel ops, etc. This is the SAME name
-    //     allowlist that suppresses the W0501 name-only warning — reusing it keeps
-    //     the hard E0505 and the soft W0501 consistent (no name warns-but-errors).
+    //     allowlist that keeps the method flush from reporting a name — reusing it keeps
+    //     the two E0505 checks consistent.
     //
     //     EXCLUDE `display`/`to_str`/`from_str`: those names live in is_builtin_method
     //     too, but on a struct/enum receiver they are SYNTHESIZED conditionally —
@@ -10514,6 +10514,24 @@ fn tc_tparam_bound_traits(name: Str) -> Str {
     ""
 }
 
+// The traits that declare a method of this name.
+fn tc_traits_declaring(method: Str) -> List[Str] {
+    let mut owners: List[Str] = []
+    for tm in tc_tmsig_pool {
+        if tm.method == method && !owners.contains(tm.trait_name) { owners.push(tm.trait_name) }
+    }
+    owners
+}
+
+// 1 when a type parameter of this name is in scope. A type variable with no frame is not a
+// parameter of the body being checked, so its missing bounds say nothing.
+fn tc_tparam_in_scope(name: Str) -> Int {
+    for f in tc_tp_frames {
+        if f.name == name { return 1 }
+    }
+    0
+}
+
 fn tc_tparam_bound_methods(name: Str) -> Str {
     let mut i = tc_tp_frames.len() - 1
     while i >= 0 {
@@ -16892,8 +16910,8 @@ pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report, IO.Eprint {
     register_derive_method_sigs(program)
 
     // Register user-defined effect handle names, and the SIGNATURE of every operation
-    // they declare. The handle name alone only suppresses the UnknownMethod
-    // warning; without the signatures `db.query(..)` has no return type and its
+    // they declare. The handle name alone only keeps the method flush from reporting
+    // the call; without the signatures `db.query(..)` has no return type and its
     // arguments are compared against nothing.
     tc_ue_handles = []
     tc_ue_op_root = Map()
@@ -17003,24 +17021,47 @@ pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report, IO.Eprint {
     tc_errors.len()
 }
 
-// Report the Phase-1 unresolvable method names that Phase 2 and tc_report_unclaimed_calls left
-// alone. A receiver whose type is a bare typevar or an unresolved metavar at the call has no type
-// to name, so this stays a warning. A call Phase 2 resolved to a declaration is skipped too: a
-// free fn `{Type}_{method}` supplies a method name that no impl lists, so Phase 1 records it,
-// but the name does resolve. A call whose receiver had an error is skipped, as that error is
-// the cause.
-fn tc_flush_unresolved_method_warnings() ! Diag.Report {
+// Report the Phase-1 method names that no type or trait declares, where Phase 2 and
+// tc_report_unclaimed_calls left the call alone (section 6.3.3). A call Phase 2 resolved to a
+// declaration is skipped: a free fn `{Type}_{method}` supplies a method name that no impl lists,
+// so Phase 1 records it, but the name does resolve.
+fn tc_flush_unresolved_methods() ! Diag.Report {
     let mut i = 0
     while i < tc_method_calls.unresolved.len() {
         let n = tc_method_calls.unresolved.get(i).unwrap()
         let reported_later = tc_unclaimed_receiver_is_named(tc_lookup_node_tid(node_obj(n))) != 0
-        let left_alone = !tc_method_calls.hard.contains_key(n) && !tc_method_calls.receiver_failed.contains_key(n)
-        if left_alone && !tc_call_decl.contains_key(n) && !nr_is_call_on_collided_qualifier(n) && !reported_later {
+        if !reported_later && !tc_call_decl.contains_key(n) && tc_receiver_call_has_no_report(n) == 0 {
             let m = node_method(n)
-            diag_warn_at("UnknownMethod", UNKNOWN_METHOD, "method `{m}` resolves to nothing, and the receiver's type is not known here", n, "annotate the receiver so the method can be resolved, or correct the method name")
+            let owners = tc_traits_declaring(m)
+            if owners.len() == 0 {
+                diag_error_at("UnresolvedMethod", UNRESOLVED_METHOD, "no type or trait declares method `{m}`", n, "correct the method name")
+            } else {
+                let mut shown: List[Str] = []
+                for o in owners { shown.push("`{tc_trait_shown(o)}`") }
+                let said = if owners.len() == 1 { "trait {shown.join("")} declares" } else { "traits {shown.join(" and ")} declare" }
+                diag_error_at("UnresolvedMethod", UNRESOLVED_METHOD,
+                    "the receiver has no method `{m}`: {said} it, but its type does not get it from an impl or a bound", n,
+                    "give the receiver a type that implements {shown.join(" or ")}")
+            }
         }
         i = i + 1
     }
+}
+
+// 1 when a method call needs no report of its own. Another check reported it, or its receiver
+// had an error, or an earlier error left the receiver with no type (section 6.3.5), or E0301
+// reported the open type of the receiver: each of those reports is the cause.
+fn tc_receiver_call_has_no_report(n: Int) -> Int {
+    if tc_method_calls.hard.contains_key(n) || tc_method_calls.receiver_failed.contains_key(n) { return 1 }
+    if nr_is_call_on_collided_qualifier(n) { return 1 }
+    let tid = tc_lookup_node_tid(node_obj(n))
+    if tid < 0 { return if diag_any_errors_since(0) > 0 { 1 } else { 0 } }
+    let r = tc_resolve(tid)
+    if tc_ud_already_blamed(r) != 0 { return 1 }
+    // TYPE_UNKNOWN is also the type an error leaves, so with an error in the program it is
+    // taken as that error's poison.
+    if tc_tid_has_unknown(r) != 0 && diag_any_errors_since(0) > 0 { return 1 }
+    0
 }
 
 // ── User-effect handle name tracking ────────────────────────────────
@@ -21052,8 +21093,8 @@ fn is_builtin_method(name: Str) -> Int {
     if name == "split" { return 1 }
     if name == "char_at" { return 1 }
     // `charAt` is deliberately NOT here: it has no codegen arm and no stdlib function, so
-    // listing it would only suppress the UnknownMethod warning for a method that does not
-    // exist, leaving the user with a hard UnresolvedMethod at codegen and no earlier signal.
+    // listing it would only keep the method flush from reporting a method that does not
+    // exist, leaving the user with an internal error at codegen and no earlier signal.
     // This list claims a method EXISTS (it also gates the :388 resolution check), so a name
     // with nothing behind it belongs out of it, not given a return type.
     if name == "byte_len" { return 1 }
@@ -21257,7 +21298,7 @@ fn is_builtin_method(name: Str) -> Int {
     if name == "write_char" { return 1 }
     if name == "capacity" { return 1 }
     // emit_sb_method's sibling constructor (codegen_methods.bl:2590) — must be listed
-    // here too, or `StringBuilder.with_capacity(8)` draws a W0501 for a method the
+    // here too, or `StringBuilder.with_capacity(8)` draws an E0505 for a method the
     // compiler is able to emit.
     if name == "with_capacity" { return 1 }
     // Bytes/Instant static constructors
@@ -23140,11 +23181,10 @@ let mut nr_callable_field_names: List[Str] = []
 
 // What one check_types records of method calls for the reports on them.
 type MethodCallFacts {
-    // Method calls whose NAME resolves nowhere, found in Phase 1. Phase 1 cannot decide the
-    // severity: it has no receiver type, and W0501-vs-E0505 turns on exactly that. So it
-    // records the node and Phase 2 decides — the nodes it reports as E0505 land in `hard`,
-    // and whatever is left over is flushed as W0501 once inference is done, which is where
-    // the receiver types stop changing.
+    // Method calls whose NAME resolves nowhere, found in Phase 1. Phase 1 has no receiver
+    // type, and a receiver that had an error gets no report, so it records the node. The
+    // nodes Phase 2 reports land in `hard`, and the rest are flushed as E0505 once inference
+    // is done, which is where the receiver types stop changing.
     unresolved: List[Int]
     hard: Map[Int, Int]
     // The method calls whose receiver had an error while name resolution or inference walked
@@ -23269,8 +23309,8 @@ fn nr_has_impl_method(type_name: Str, method: Str) -> Int {
 // Does this method NAME resolve to nothing anywhere in the program? A name-level fact,
 // so it holds for every receiver: a name no builtin, no impl, no derive and no callable
 // field supplies cannot be supplied by any type either. Phase 1 records the nodes that
-// answer yes; Phase 2 turns the ones with a KNOWN receiver type into E0505 and leaves the
-// rest as the soft W0501.
+// answer yes; Phase 2 reports the ones with a KNOWN receiver type, and the flush after
+// inference reports the rest.
 fn nr_method_name_unresolvable(method: Str) -> Int {
     if is_builtin_method(method) != 0 { return 0 }
     if is_variant_name(method) != 0 { return 0 }
@@ -23424,8 +23464,8 @@ fn tc_list_scan_elem_need(elem: Int) -> List[Int] {
     tc_eq_need(elem, [])
 }
 
-// Refused as hard, the way every other method the receiver does not answer is, so inference
-// does not go on to flush the softer W0501 about the same call. The answer is poisoned
+// Refused as hard, the way every other method the receiver does not answer is, so the flush
+// after inference does not report the same call again. The answer is poisoned
 // rather than absent, so a declared Bool over the call unifies with the recovery tid instead
 // of drawing a second error about a type the program never had.
 fn tc_refuse_list_scan(node: Int, obj_t: Int, need: List[Int], method: Str) -> Int ! Diag.Report {
@@ -23538,7 +23578,8 @@ fn tc_recv_type_is_known(obj_k: TyKind) -> Int {
 // diagnostic names a type the program never had, and inference visits the same node again
 // once the holes are filled — two errors for one call. A receiver counts as known only when
 // its type is determined all the way down, which is also the reading §3c.4 forces: a hole
-// is a type the compiler does not know, so the honest report there is the soft warning.
+// is a type the compiler does not know, so the method flush at the end of the pass judges
+// that call, after inference fills the hole.
 fn tc_recv_type_is_determined(obj_k: TyKind, obj_t: Int) -> Int {
     if tc_recv_type_is_known(obj_k) == 0 { return 0 }
     if tc_tid_has_unbound_metavar(obj_t) != 0 { return 0 }
@@ -23816,7 +23857,7 @@ fn resolve_names(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repor
         }
     }
 
-    // Register @derive-generated method names so derived calls don't trip W0501.
+    // Register @derive-generated method names so the method flush does not report derived calls.
     // Mirrors register_derive_annotations in src/codegen_derive.bl (runs after typecheck).
     let derive_types_sl = node_fields(program)
     if derive_types_sl != -1 {
@@ -25135,9 +25176,9 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                     if tc_type_name_poisoned(node_name(obj)) { is_ue_call = 1 }
                 }
                 if is_ue_call == 0 {
-                    // Recorded, not reported. Phase 2 knows the receiver type and turns
-                    // this into E0505 wherever the type is known; the leftovers are
-                    // flushed as W0501 after inference.
+                    // Recorded, not reported. Phase 2 knows the receiver type and reports
+                    // this wherever the type is known; the flush after inference reports
+                    // the rest.
                     tc_method_calls.unresolved.push(node)
                 }
             }
@@ -29330,7 +29371,7 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                 }
                 if tc_report_bad_variant_value(node, cname, method, 1) {
                     let _ = tc_infer_arg_tids(node_args(node))
-                    // Reported here, so the method-resolution flush adds no UnknownMethod.
+                    // Reported here, so the method-resolution flush adds no second report.
                     tc_method_calls.hard.insert(node, 1)
                     return tc_error_recovery_tid()
                 }
@@ -29691,7 +29732,7 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
             }
             // `join` must resolve to a real type, not TYPE_UNKNOWN: it is in
             // is_builtin_method (:6299) — which is what lets it past the E0505
-            // and W0501 gates — and codegen has always emitted
+            // gates — and codegen has always emitted
             // `str_join(obj, delim) -> string` (codegen_methods.bl:1620), so an
             // unresolved type here unifies with anything, lets a mistyped result
             // through, and leaves a non-Str element receiver unchecked (`[1, 2].join(",")`
@@ -30329,10 +30370,10 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
 
         // A method call on a BOUNDED type parameter (`fn show[T: Display](x: T) { x.fmt(sb) }`).
         // The bound is what licenses the call, so it is also what answers it: the trait's own
-        // declared signature. An unbounded parameter licenses nothing and reaches no arm.
+        // declared signature. An unbounded parameter licenses nothing.
         if obj_k == TyKind.Typevar {
             let tv_traits = tc_tparam_bound_traits(type_to_str(obj_t))
-            if tv_traits != "" {
+            if tc_pipe_joined(tv_traits) != "" {
                 // The sealed synthesized `display()`, which has no declared signature anywhere
                 // — the same arm the struct path carries below.
                 if method == "display" && tc_pipe_has(tv_traits, "Display") != 0 { return TYPE_STR }
@@ -30375,6 +30416,15 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                     diag_error_at("UnresolvedMethod", UNRESOLVED_METHOD, "type parameter `{tv_name}` is bounded by {tc_traits_shown(tc_pipe_joined(tv_traits))}, and none of them declares method `{method}`", node, "correct the method name, or add a bound whose trait declares `{method}`")
                     return tc_error_recovery_tid()
                 }
+            } else if type_to_str(obj_t) != "Self" && tc_tparam_in_scope(type_to_str(obj_t)) != 0 {
+                // An unbounded parameter licenses no method, so each call on it is refused in
+                // the generic body (section 6.3.3), whether or not a caller reaches it.
+                tc_method_calls.hard.insert(node, 1)
+                let tv_name = type_to_str(obj_t)
+                let owners = tc_traits_declaring(method)
+                let example = if owners.len() == 1 { ", such as `[{tv_name}: {tc_trait_shown(owners.get(0).unwrap())}]`" } else { "" }
+                diag_error_at("UnresolvedMethod", UNRESOLVED_METHOD, "type parameter `{tv_name}` has no bound, so it has no method `{method}`", node, "add a bound whose trait declares `{method}`{example}")
+                return tc_error_recovery_tid()
             }
         }
 
@@ -39960,6 +40010,12 @@ fn tc_report_unclaimed_calls(order: List[Int], mods: List[Str]) ! Diag.Report {
                 tc_report_no_module_member(uc, q, mname)
             }
         }
+        // A name receiver with no local binding names a type or a module, which the arms above
+        // decide; only a value receiver can have a type that is not known.
+        let value_receiver = node_kind(obj) != NodeKind.Ident || tc_mc_obj_is_value(uc) != 0
+        if value_receiver && diag_any_errors_since(before) == 0 && tc_receiver_type_is_open(recv) != 0 && tc_receiver_call_has_no_report(uc) == 0 {
+            diag_error_at("UnresolvedMethod", UNRESOLVED_METHOD, "the type of the receiver is not known here, so method `{mname}` cannot be resolved", uc, "annotate the receiver with its type")
+        }
         if diag_any_errors_since(before) > 0 { tc_method_calls.hard.insert(uc, 1) }
         nr_current_module = saved_module
     }
@@ -39987,6 +40043,15 @@ fn tc_report_member_read_as_value(node: Int, q: Str, member: Str) ! Diag.Report 
     } else {
         tc_report_no_module_member(node, q, member)
     }
+}
+
+// 1 when a receiver has no type that names its methods: no type at all, an unbound metavar or
+// the unknown type. A type parameter is not open: its bounds name its methods.
+fn tc_receiver_type_is_open(tid: Int) -> Int {
+    if tid < 0 { return 1 }
+    let r = tc_resolve(tid)
+    if tc_is_unbound_metavar(r) != 0 || r == TYPE_UNKNOWN { return 1 }
+    0
 }
 
 // A value receiver with a head. An open slot or a typevar under the head does not change which
@@ -40317,7 +40382,7 @@ pub fn tc_stamp_program(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Dia
     let order = tc_stamp_walk_sized(program, owners, mods, seen, node_count())
     tc_report_unclaimed_calls(order, mods)
     // After the unclaimed calls, so a call one of them reported gets no second report.
-    tc_flush_unresolved_method_warnings()
+    tc_flush_unresolved_methods()
     tc_report_literals_out_of_range(order)
     // A program that already has an error has nodes inference deliberately never typed: the
     // arm that would have typed them reported instead and returned. Asserting there turns
