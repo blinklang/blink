@@ -234,9 +234,9 @@ asks for the one-unit build.
   only the taken units: a unit's lowering can set state that `__main__`, a
   header or a unit lowered after it reads. The tests of the reuse key and
   of the module headers run under it.
-- **Errors.** A cc failure prints the cc output, then
-  `error: C compilation failed in unit <module>`, and exits 1, the same
-  code as the monolith.
+- **Errors.** A unit compile that fails gives one GeneratedCDidNotCompile
+  (I0017) diagnostic that names each failed unit, with the cc output in its
+  notes, and exits 101, the same as the monolith.
 - **Selection.** A flag on the command beats `BLINK_PER_MODULE`, which
   beats the default. `--per-module` or `--no-per-module` decides for that
   command; passing both is an error. Without a flag, `BLINK_PER_MODULE=0`

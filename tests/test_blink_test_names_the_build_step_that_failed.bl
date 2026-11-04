@@ -3,7 +3,8 @@
 // compile is an ice, a link or a native dependency that fails is an error. The message names
 // the step and the tool's first error line, and the notes hold the tool's output, cut with a
 // last note that says so. Only a build that ends in no way a step reports gets the diagnostic
-// that says the build ended with none. `blink build` prints these failures as before.
+// that says the build ended with none. `blink build` and `blink run` report the same
+// diagnostic, and exit 101 for the ice and 1 for an error (section 6.7.4).
 
 import std.process.{ChildEnd, ChildLimits, ProcessResult}
 import std.time.{Duration}
@@ -208,7 +209,8 @@ test "only a build that ends with no error diagnostic says it ended without one"
     assert(human.out.contains("internal compiler error[TestBuildEndedWithoutDiagnostic]: the test build ended with no diagnostic: something went wrong"), diag(human))
 }
 
-test "blink build prints a C compile failure as it did before, on both build paths" {
+// A project whose src/main.bl calls the C of WRONG_ARITY.
+fn wrong_arity_project() -> Str ! FS.Write, Process.Spawn {
     let dir = sh("mktemp -d /tmp/blink_build_step.XXXXXX").out.trim()
     let _ = sh("mkdir -p {dir}/src")
     fs.write("{dir}/blink.toml", PACKAGE).unwrap()
@@ -221,21 +223,47 @@ fn main() {
     io.println("{no_args_abs()}")
 }
 "#).unwrap()
+    dir
+}
+
+let PASSES_CHECK = "this source passes `blink check`; the cause is a bug of the compiler"
+// The stdlib has its own @ffi declarations; the note names only those of the program.
+let OWN_FFI = "this program has its own `@ffi` declarations (no_args_abs); a wrong `@ffi` prototype can also cause this error"
+
+test "blink build reports a C compile failure as the same internal error, on both build paths" {
+    let dir = wrong_arity_project()
     let pm = sh_in(dir, "", "$B build --per-module src/main.bl")
     let one = sh_in(dir, "", "$B build --no-per-module src/main.bl")
     let _ = sh("rm -rf {dir}")
-    assert_eq(pm.end, ChildEnd.Exited(1), diag(pm))
-    assert(pm.out.contains("error: C compilation failed in unit "), diag(pm))
-    assert(pm.err_out.contains("abs"), diag(pm))
-    assert(one.end != ChildEnd.Exited(0), diag(one))
-    assert(one.out.contains("error: C compilation failed\n"), diag(one))
-    assert(one.err_out.contains("abs"), diag(one))
     for r in [pm, one] {
-        assert(!"{r.out}{r.err_out}".contains("GeneratedCDidNotCompile"), diag(r))
+        assert_eq(r.end, ChildEnd.Exited(101), diag(r))
+        assert(r.err_out.contains("internal compiler error[GeneratedCDidNotCompile]: compiling the generated C"), diag(r))
+        assert(r.err_out.contains("  note: {PASSES_CHECK}\n"), diag(r))
+        assert(r.err_out.contains("  note: {OWN_FFI}\n"), diag(r))
+        assert(r.err_out.contains("abs"), diag(r))
+        assert(!"{r.out}{r.err_out}".contains("C compilation failed"), diag(r))
     }
+    assert(pm.err_out.contains("compiling the generated C of unit "), diag(pm))
 }
 
-test "blink build prints a link or native dependency failure as it did before, on both build paths" {
+test "under json, blink build gives the C compile failure one row with the notes first" {
+    let dir = wrong_arity_project()
+    let r = sh_in(dir, "", "$B build --json src/main.bl")
+    let _ = sh("rm -rf {dir}")
+    assert_eq(r.end, ChildEnd.Exited(101), diag(r))
+    let mut row = ""
+    for line in r.err_out.split("\n") {
+        if line.contains("\"code\":\"I0017\"") { row = line }
+    }
+    json_clear()
+    let d = json_parse(row)
+    assert_eq(json_as_str(json_get(d, "severity")), "ice", diag(r))
+    let notes = json_get(d, "notes")
+    assert_eq(json_as_str(json_at(notes, 0)), PASSES_CHECK, row)
+    assert_eq(json_as_str(json_at(notes, 1)), OWN_FFI, row)
+}
+
+test "blink build reports a link or native dependency failure with its code and exit 1, on both build paths" {
     for path in ["--per-module", "--no-per-module"] {
         let dir = project([], "int mylib_other(void) \{ return 0; \}\n")
         fs.write("{dir}/src/main.bl", #"@ffi("mylib", "mylib_missing", header: "mylib.h")
@@ -250,14 +278,16 @@ fn main() {
         fs.write("{dir}/native/mylib.c", "int mylib_missing(void) \{ return blink_no_such_name; \}\n").unwrap()
         let dep = sh_in(dir, "", "$B build {path} src/main.bl")
         let _ = sh("rm -rf {dir}")
-        assert(link.end != ChildEnd.Exited(0), diag(link))
-        assert(link.out.contains("error: C compilation failed"), diag(link))
+        assert_eq(link.end, ChildEnd.Exited(1), diag(link))
+        assert(link.err_out.contains("error[LinkFailed]: linking failed: "), diag(link))
         assert(link.err_out.contains("mylib_missing"), diag(link))
-        assert(dep.out.contains("error: compiling vendored source "), diag(dep))
+        assert_eq(dep.end, ChildEnd.Exited(1), diag(dep))
+        assert(dep.err_out.contains("error[NativeDependencyBuildFailed]: building native dependency mylib failed: "), diag(dep))
         assert(dep.err_out.contains("blink_no_such_name"), diag(dep))
         for r in [link, dep] {
-            assert(!"{r.out}{r.err_out}".contains("LinkFailed"), diag(r))
-            assert(!"{r.out}{r.err_out}".contains("NativeDependencyBuildFailed"), diag(r))
+            assert(!"{r.out}{r.err_out}".contains("C compilation failed"), diag(r))
+            assert(!"{r.out}{r.err_out}".contains("compiling vendored source"), diag(r))
+            assert(!r.err_out.contains("GeneratedCDidNotCompile"), diag(r))
         }
     }
 }
