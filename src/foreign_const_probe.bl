@@ -12,7 +12,7 @@ import parser.{get_annotation, get_str_named_arg, node_args, node_fields, node_p
 import ast.{NodeKind}
 import cname.{c_ffi_symbol}
 import typecheck.{TyKind, tc_lookup_node_tid, resolve_alias_tid, type_kind, tk_name}
-import diagnostics.{Diag, diag_error_span_at_notes, FOREIGN_CONST_INVALID, MISSING_NATIVE_DEP}
+import diagnostics.{Diag, diag_error_span_at_notes, FOREIGN_CONST_INVALID, FOREIGN_HEADER_NOT_FOUND, MISSING_NATIVE_DEP}
 
 pub type ForeignConst {
     decl: Int
@@ -97,6 +97,20 @@ pub fn foreign_consts_in(program: Int) -> List[ForeignConst] {
 pub fn own_ffi_note(program: Int) -> Str {
     let mut names: List[Str] = []
     let mut libs: List[Str] = []
+    for d in own_ffi_decls(program) {
+        names.push(node_name(d))
+        let lib = if get_annotation(d, "ffi") == -1 { "" } else { lib_of(d) }
+        if lib != "" && !is_runtime_lib(lib) && !libs.contains(lib) { libs.push(lib) }
+    }
+    if names.is_empty() { return "" }
+    let deps = if libs.is_empty() { "" } else { " and native dependencies ({libs.join(", ")})" }
+    "this program has its own `@ffi` declarations ({names.join(", ")}){deps}; a wrong `@ffi` prototype can also cause this error"
+}
+
+// The program's declarations with an `@ffi`, `@ffi.struct` or `@ffi.opaque` annotation, the
+// stdlib's left out.
+fn own_ffi_decls(program: Int) -> List[Int] {
+    let mut out: List[Int] = []
     for decls in [node_params(program), node_fields(program), node_stmts(program)] {
         if decls == -1 { continue }
         let mut i = 0
@@ -104,16 +118,45 @@ pub fn own_ffi_note(program: Int) -> Str {
             let d = sublist_get(decls, i)
             i = i + 1
             if node_source_module(d).starts_with("std_") { continue }
-            let ann = get_annotation(d, "ffi")
-            if ann == -1 && get_annotation(d, "ffi.struct") == -1 && get_annotation(d, "ffi.opaque") == -1 { continue }
-            names.push(node_name(d))
-            let lib = if ann == -1 { "" } else { lib_of(d) }
-            if lib != "" && !is_runtime_lib(lib) && !libs.contains(lib) { libs.push(lib) }
+            if ffi_annotation(d) != -1 { out.push(d) }
         }
     }
-    if names.is_empty() { return "" }
-    let deps = if libs.is_empty() { "" } else { " and native dependencies ({libs.join(", ")})" }
-    "this program has its own `@ffi` declarations ({names.join(", ")}){deps}; a wrong `@ffi` prototype can also cause this error"
+    out
+}
+
+fn ffi_annotation(d: Int) -> Int {
+    for name in ["ffi", "ffi.struct", "ffi.opaque"] {
+        let ann = get_annotation(d, name)
+        if ann != -1 { return ann }
+    }
+    -1
+}
+
+// The header that an `@ffi` declaration names, and the annotation that names it.
+pub type ForeignHeader {
+    decl: Int
+    annotation: Int
+    header: Str
+}
+
+// The headers that the program's own `@ffi` declarations name, for the header test of `blink
+// build` and `blink test` (section 9.1). The stdlib's headers are part of the compiler, so a
+// stdlib module that the program does not call into cannot stop the build. A header that is
+// not one header name never goes into C, and a foreign constant reports it as E0855.
+pub fn foreign_headers_in(program: Int) -> List[ForeignHeader] {
+    let mut out: List[ForeignHeader] = []
+    for d in own_ffi_decls(program) {
+        let ann = ffi_annotation(d)
+        let header = get_str_named_arg(ann, "header")
+        if is_header_name(header) { out.push(ForeignHeader { decl: d, annotation: ann, header: header }) }
+    }
+    out
+}
+
+pub fn report_header_not_found(fh: ForeignHeader) ! Diag.Report {
+    let ann = fh.annotation
+    let col = node_col(ann)
+    diag_error_span_at_notes("ForeignHeaderNotFound", FOREIGN_HEADER_NOT_FOUND, "header `{fh.header}` was not found by the C compiler on this host", fh.decl, node_line(ann), col, col + 1 + node_name(ann).byte_len(), "install the library that provides `{fh.header}`", [])
 }
 
 fn lib_of(d: Int) -> Str {

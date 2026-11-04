@@ -74,7 +74,7 @@ import cg_trace_names.{cg_trace_names}
 import escape.{ffi_scope_resource_name}
 import check_pipeline.{check_source, run_build_analyses, check_exit_code, check_status_line, build_passed_check}
 import fix_edits.{FixEdit, fix_plan, fix_apply, fix_byte_offset}
-import foreign_const_probe.{ForeignConst, ProbeVerdict, foreign_const_header, foreign_consts_in, own_ffi_note, is_runtime_lib, report_undeclared_lib, probe_of, probe_verdicts, report_verdicts, text_verdict, triple_of_machine}
+import foreign_const_probe.{ForeignConst, ForeignHeader, ProbeVerdict, foreign_const_header, foreign_consts_in, foreign_headers_in, own_ffi_note, report_header_not_found, is_runtime_lib, report_undeclared_lib, probe_of, probe_verdicts, report_verdicts, text_verdict, triple_of_machine}
 import symbol_index.{collect_effects}
 import query.{query_index_source, query_answer}
 import limit_values.{
@@ -730,6 +730,7 @@ fn format_to_text(source_path: Str) -> Result[Str, Int] ! Lex.Tokenize, Parse, P
 type CompiledText {
     c: Str
     foreign: List[ForeignConst]
+    headers: List[ForeignHeader]
     // Made while the checked program is at hand: the C compile that may need it runs later.
     ffi_note: Str
 }
@@ -794,7 +795,7 @@ fn compile_to_text(source_path: Str, debug_mode: Int, strict_mode: Int, test_bui
         }
     }
 
-    Ok(CompiledText { c: c_output, foreign: foreign, ffi_note: own_ffi_note(final_program) })
+    Ok(CompiledText { c: c_output, foreign: foreign, headers: foreign_headers_in(final_program), ffi_note: own_ffi_note(final_program) })
 }
 
 // Whether the compiler archive's evidence vector has a slot for every effect `program`
@@ -1870,6 +1871,94 @@ fn validate_build_deps(ffi_libs: List[Str], targets: List[Str]) -> Int ! Diag.Re
     0
 }
 
+// §9.1, the header test: before the unit compile, each header that the program's `@ffi`
+// declarations name must be one that the unit compile finds, so a missing one is E0859 at the
+// `@ffi` line and not GeneratedCDidNotCompile. The test reads only pass or fail; a failed
+// test of all the headers at once is run again for each header to find the missing ones.
+fn check_foreign_headers(headers: List[ForeignHeader], targets: List[Str], used_deps: List[Str], output_path: Str) -> Int ! Diag.Report, IO, FS.Read, FS.Write, FS.Delete, Process.Spawn, Env.Read {
+    if headers.is_empty() { return 0 }
+    let mut distinct: List[Str] = []
+    for fh in headers {
+        if !distinct.contains(fh.header) { distinct.push(fh.header) }
+    }
+    let mut out_dir = path_dirname(output_path)
+    if out_dir == "" { out_dir = "." }
+    build_fs.reap_dead(out_dir, [".fhprobe"])
+    let dir = build_fs.private_dir(out_dir, ".fhprobe")
+    if dir == "" { return 0 }
+    let mut missing: List[Str] = []
+    // The unit compile also reads the stdlib archive's directory.
+    let arc_inc = "-I{resolve_archive_dir()}"
+    let aliases = if targets.is_empty() { [""] } else { targets }
+    for alias in aliases {
+        let target = if alias == "" { "" } else { resolve_target_triple(alias) }
+        let inc_flags = match resolve_vendored_includes(used_deps, target) {
+            Some(v) => "{arc_inc} {v}"
+            None => {
+                let _ = build_fs.remove_tree(dir)
+                return 1
+            }
+        }
+        match header_probe(dir, "all", distinct, inc_flags, target) {
+            HeaderProbe.Fails => {}
+            _ => { continue }
+        }
+        // A probe with no header that also fails shows a fault in the command, such as a bad
+        // -I or target flag, and not a missing header: the unit compile reports it.
+        match header_probe(dir, "none", [], inc_flags, target) {
+            HeaderProbe.Passes => {}
+            _ => { continue }
+        }
+        let mut i = 0
+        for h in distinct {
+            i = i + 1
+            if missing.contains(h) { continue }
+            match header_probe(dir, "h{i}", [h], inc_flags, target) {
+                HeaderProbe.Fails => missing.push(h)
+                _ => {}
+            }
+        }
+    }
+    let _ = build_fs.remove_tree(dir)
+    if missing.is_empty() { return 0 }
+    for fh in headers {
+        if missing.contains(fh.header) { report_header_not_found(fh) }
+    }
+    diag_flush()
+    1
+}
+
+type HeaderProbe {
+    Passes
+    Fails
+    // No shell, no C compiler (127), a cc killed by a signal, or a probe file that cannot be
+    // written: the unit compile reports each of these.
+    NotRun
+}
+
+fn header_probe(dir: Str, name: Str, headers: List[Str], inc_flags: Str, target: Str) -> HeaderProbe ! IO, FS.Read, FS.Write, Process.Spawn, Env.Read {
+    let mut lines: List[Str] = []
+    for h in headers {
+        lines.push("#if !__has_include(<{h}>)\n#error \"blink: no header\"\n#endif")
+    }
+    let path = "{dir}/{name}.c"
+    match fs.write(path, "{lines.join("\n")}\n") {
+        Ok(_) => {}
+        Err(_) => return HeaderProbe.NotRun
+    }
+    let cmd = cc_command("-E {path} -o /dev/null {inc_flags}", 0, 0, target)
+    let r = match process.run("sh", ["-c", cmd]) {
+        Ok(r) => r
+        Err(_) => return HeaderProbe.NotRun
+    }
+    match r.end {
+        ChildEnd.Exited(0) => HeaderProbe.Passes
+        ChildEnd.Exited(127) => HeaderProbe.NotRun
+        ChildEnd.Exited(_) => HeaderProbe.Fails
+        _ => HeaderProbe.NotRun
+    }
+}
+
 // §9.1: the value of a foreign constant is the build target's, so `blink build` asks each
 // target's C compiler, before it compiles the program, whether each C name is an integer
 // constant expression that fits its declared type. A failure is E0855 at the declaration:
@@ -2017,6 +2106,10 @@ fn do_build(source_path: Str, output_path: Str, c_path: Str, debug_mode: Int, re
     let flrc = check_foreign_const_libs(compiled.foreign)
     if flrc != 0 {
         return flrc
+    }
+    let hrc = check_foreign_headers(compiled.headers, targets, used_deps, output_path)
+    if hrc != 0 {
+        return hrc
     }
     let frc = check_foreign_consts(compiled.foreign, targets, used_deps, output_path)
     if frc != 0 {
@@ -2310,6 +2403,7 @@ type CompiledUnits {
     entry_key: Str
     // Read from the checked program, so a build that reuses its units checks them too.
     foreign: List[ForeignConst]
+    headers: List[ForeignHeader]
     // Made while the checked program is at hand: the C compile that may need it runs later.
     ffi_note: Str
 }
@@ -2370,7 +2464,7 @@ fn do_compile_units(source_path: Str, dir: Str, last_dir: Str, debug_mode: Int, 
                 }
                 let wrc = units_flush_warnings(strict_mode)
                 if wrc != 0 { return Err(wrc) }
-                return Ok(CompiledUnits { units: r.units, inputs: inputs, shas: Some(r.shas), recordable: true, order: r.order, header_keys: r.header_keys, entry_key: r.entry_key, foreign: foreign, ffi_note: own_ffi_note(program) })
+                return Ok(CompiledUnits { units: r.units, inputs: inputs, shas: Some(r.shas), recordable: true, order: r.order, header_keys: r.header_keys, entry_key: r.entry_key, foreign: foreign, headers: foreign_headers_in(program), ffi_note: own_ffi_note(program) })
             }
             None => {}
         }
@@ -2524,7 +2618,7 @@ fn do_compile_units(source_path: Str, dir: Str, last_dir: Str, debug_mode: Int, 
     let recordable = diag_entry_count() == entries_before && diag_ice_count == ice_before
     let wrc = units_flush_warnings(strict_mode)
     if wrc != 0 { return Err(wrc) }
-    Ok(CompiledUnits { units: out, inputs: inputs, shas: shas, recordable: recordable, order: hs.order.join(","), header_keys: hs.keys, entry_key: entry_key, foreign: foreign, ffi_note: own_ffi_note(program) })
+    Ok(CompiledUnits { units: out, inputs: inputs, shas: shas, recordable: recordable, order: hs.order.join(","), header_keys: hs.keys, entry_key: entry_key, foreign: foreign, headers: foreign_headers_in(program), ffi_note: own_ffi_note(program) })
 }
 
 // BLINK_EMIT_REUSE_VERIFY=1 makes each per-module build emit the whole program again and fail
@@ -2781,7 +2875,7 @@ fn do_build_units(source_path: Str, output_path: Str, debug_mode: Int, release_m
     if shas.is_none() && cg_obj_cache_enabled != 0 && build_objcache.cache_enabled() {
         shas = build_objcache.unit_file_shas(work, resolve_archive_dir())
     }
-    let rc = link_units_all_targets(source_path, output_path, work, units_dir, compiled.units, compiled.foreign, compiled.ffi_note, shas, debug_mode, release_mode, targets, status_mode, unit_jobs, test_build)
+    let rc = link_units_all_targets(source_path, output_path, work, units_dir, compiled.units, compiled.foreign, compiled.headers, compiled.ffi_note, shas, debug_mode, release_mode, targets, status_mode, unit_jobs, test_build)
     // Written last, and into the directory that replaces units_dir only after this: a build
     // that stops before here leaves the last record beside the files it describes.
     if rc == 0 && compiled.inputs != "" && compiled.recordable {
@@ -2804,7 +2898,7 @@ fn do_build_units(source_path: Str, output_path: Str, debug_mode: Int, release_m
     rc
 }
 
-fn link_units_all_targets(source_path: Str, output_path: Str, work: Str, units_dir: Str, units: List[emit_record.EmittedUnit], foreign: List[ForeignConst], ffi_note: Str, shas: Option[Map[Str, Str]], debug_mode: Int, release_mode: Int, targets: List[Str], status_mode: Int, unit_jobs: Int, test_build: Bool) -> Int ! Diag.Report, IO, FS.Write, FS.Read, FS.Delete, Process.Spawn, Env.Exit, Env.Read, Time.Read {
+fn link_units_all_targets(source_path: Str, output_path: Str, work: Str, units_dir: Str, units: List[emit_record.EmittedUnit], foreign: List[ForeignConst], headers: List[ForeignHeader], ffi_note: Str, shas: Option[Map[Str, Str]], debug_mode: Int, release_mode: Int, targets: List[Str], status_mode: Int, unit_jobs: Int, test_build: Bool) -> Int ! Diag.Report, IO, FS.Write, FS.Read, FS.Delete, Process.Spawn, Env.Exit, Env.Read, Time.Read {
     // The scans below read what the one-unit build reads from its single C file: each unit
     // and each header a unit includes, which is all cc compiles. A marker the scans look
     // for starts a line, so each file starts one.
@@ -2832,6 +2926,10 @@ fn link_units_all_targets(source_path: Str, output_path: Str, work: Str, units_d
     let flrc = check_foreign_const_libs(foreign)
     if flrc != 0 {
         return flrc
+    }
+    let hrc = check_foreign_headers(headers, targets, used_deps, output_path)
+    if hrc != 0 {
+        return hrc
     }
     let frc = check_foreign_consts(foreign, targets, used_deps, output_path)
     if frc != 0 {

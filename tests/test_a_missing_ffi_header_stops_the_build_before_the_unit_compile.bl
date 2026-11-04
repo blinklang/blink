@@ -1,0 +1,131 @@
+// Before the unit compile, `blink build` and `blink test` test each header that an `@ffi`
+// declaration of the program names. A header that the C compiler cannot find is
+// ForeignHeaderNotFound (E0859) at the `@ffi` line, exit 1, and the unit compile does not
+// start. `blink check` reads no header, so it gives no error (section 9.1, the header test).
+
+import std.process.{ChildEnd, ChildLimits, ProcessResult}
+import std.time.{Duration}
+
+let MISSING = "blink_no_such_header_for_this_test.h"
+let NOT_FOUND = "header `blink_no_such_header_for_this_test.h` was not found by the C compiler on this host"
+
+fn sh(cmd: Str) -> ProcessResult ! Process.Spawn {
+    process.run("sh", ["-c", cmd], limits: ChildLimits { timeout: Some(Duration.seconds(300)) }).unwrap()
+}
+
+// A fresh project whose src/main.bl and tests/test_main.bl are `source`.
+fn project(source: Str) -> Str ! FS.Write, Process.Spawn {
+    let dir = sh("mktemp -d /tmp/blink_header_test.XXXXXX").out.trim()
+    let _ = sh("mkdir -p {dir}/src {dir}/tests")
+    fs.write("{dir}/blink.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\n").unwrap()
+    fs.write("{dir}/blink.lock", "[metadata]\nlockfile-version = 1\n").unwrap()
+    fs.write("{dir}/src/main.bl", source).unwrap()
+    dir
+}
+
+// Runs `$B <cmd>` in dir. The corpus exports module filters that make each build one unit,
+// so the run drops them: --per-module must reach the per-module path.
+fn blink_in(dir: Str, cmd: Str) -> ProcessResult ! Process.Spawn {
+    sh("B=$(pwd)/build/blink; cd {dir} && env -u BLINK_PER_MODULE -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE BLINK_CACHE_DIR={dir}/cache BLINK_BIN=$B $B {cmd}")
+}
+
+fn diag(r: ProcessResult) -> Str {
+    "exit {r.end}\nstdout:\n{r.out}\nstderr:\n{r.err_out}"
+}
+
+fn ffi_fn(header: Str) -> Str {
+    "@ffi(\"c\", \"abs\", header: \"{header}\")\n@trusted(audit: \"test\")\nfn my_abs(x: I32) -> I32 ! ()\n\nfn main() \{\n    io.println(\"\{my_abs(-3)\}\")\n\}\n"
+}
+
+// What is wrong with how a build stopped on the missing header, or "".
+fn header_stop_error(r: ProcessResult, what: Str) -> Str {
+    if r.end != ChildEnd.Exited(1) { return "{what}: ended with {r.end}, not 1\n{diag(r)}" }
+    if !r.err_out.contains("error[ForeignHeaderNotFound]: {NOT_FOUND}") { return "{what}: no E0859\n{diag(r)}" }
+    if !r.err_out.contains("src/main.bl:1:") { return "{what}: the span is not the @ffi line\n{diag(r)}" }
+    if r.err_out.contains("GeneratedCDidNotCompile") || r.err_out.contains("ForeignConstInvalid") { return "{what}: a later step ran\n{diag(r)}" }
+    ""
+}
+
+test "a missing header of an @ffi function stops blink build with E0859, on both build paths" {
+    let dir = project(ffi_fn(MISSING))
+    let pm = blink_in(dir, "build --per-module src/main.bl")
+    let one = blink_in(dir, "build --no-per-module src/main.bl")
+    let run = blink_in(dir, "run src/main.bl")
+    let built = sh("test -e {dir}/build/main && echo yes").out.trim()
+    let _ = sh("rm -rf {dir}")
+    assert_eq(header_stop_error(pm, "build --per-module"), "")
+    assert_eq(header_stop_error(one, "build --no-per-module"), "")
+    assert_eq(header_stop_error(run, "run"), "")
+    assert(!run.out.contains("3"), diag(run))
+    assert_eq(built, "")
+}
+
+test "blink check reads no header, so a missing one is no error there" {
+    let dir = project(ffi_fn(MISSING))
+    let r = blink_in(dir, "check src/main.bl")
+    let _ = sh("rm -rf {dir}")
+    assert_eq(r.end, ChildEnd.Exited(0), diag(r))
+}
+
+test "a header that is present passes the test" {
+    let dir = project(ffi_fn("stdlib.h"))
+    let r = blink_in(dir, "run src/main.bl")
+    let _ = sh("rm -rf {dir}")
+    assert_eq(r.end, ChildEnd.Exited(0), diag(r))
+    assert_eq(r.out.trim(), "3", diag(r))
+}
+
+// The unit compile reads the stdlib archive's directory with -I, so the test reads it too.
+test "a header that only the include path of the stdlib archive holds passes the test" {
+    let dir = project(ffi_fn("runtime.h"))
+    let r = blink_in(dir, "run src/main.bl")
+    let _ = sh("rm -rf {dir}")
+    assert_eq(r.end, ChildEnd.Exited(0), diag(r))
+    assert_eq(r.out.trim(), "3", diag(r))
+}
+
+test "the header of an @ffi.opaque type and of a foreign constant are tested too" {
+    let opaque = project("@ffi.opaque(header: \"{MISSING}\", name: \"blink_thing\")\ntype Thing\n\nfn main() \{\n    io.println(\"hi\")\n\}\n")
+    let r_opaque = blink_in(opaque, "build src/main.bl")
+    let _ = sh("rm -rf {opaque}")
+    assert_eq(header_stop_error(r_opaque, "@ffi.opaque"), "")
+    let constant = project("@ffi(\"BLINK_NO_SUCH_CONSTANT\", header: \"{MISSING}\")\npub let NO_SUCH: Int\n\nfn main() \{\n    io.println(\"\{NO_SUCH\}\")\n\}\n")
+    let r_const = blink_in(constant, "build src/main.bl")
+    let _ = sh("rm -rf {constant}")
+    assert_eq(header_stop_error(r_const, "foreign constant"), "")
+}
+
+test "under json the stop is one E0859 row" {
+    let dir = project(ffi_fn(MISSING))
+    let r = blink_in(dir, "build --json src/main.bl")
+    let _ = sh("rm -rf {dir}")
+    assert_eq(r.end, ChildEnd.Exited(1), diag(r))
+    assert(r.err_out.contains("\"code\":\"E0859\""), diag(r))
+    assert(r.err_out.contains("\"name\":\"ForeignHeaderNotFound\""), diag(r))
+}
+
+test "blink test gives the file the one E0859 diagnostic" {
+    let dir = project("fn main() \{\}\n")
+    let src = ffi_fn(MISSING).replace("fn main() \{\n    io.println(\"\{my_abs(-3)\}\")\n\}\n", "test \"calls it\" \{\n    assert(my_abs(-3) == 3)\n\}\n")
+    fs.write("{dir}/tests/test_main.bl", src).unwrap()
+    let r = blink_in(dir, "test --json tests")
+    let _ = sh("rm -rf {dir}")
+    assert_eq(r.end, ChildEnd.Exited(1), diag(r))
+    let mut line = ""
+    for l in r.out.split("\n") {
+        if l.contains("\"record\":\"file\"") { line = l }
+    }
+    assert(line.contains("\"outcome\":\"build_failed\""), diag(r))
+    assert(line.contains("\"code\":\"E0859\""), diag(r))
+    assert(!line.contains("I0017"), diag(r))
+}
+
+// A header test that fails with no header in it, such as for an output path that the shell
+// splits at a space, shows no missing header: the unit compile reports that failure.
+test "a header test that fails for a reason other than the header gives no E0859" {
+    let dir = project(ffi_fn("stdlib.h"))
+    let _ = sh("mkdir -p '{dir}/sp ace'")
+    let r = blink_in(dir, "build -o 'sp ace/main' src/main.bl")
+    let _ = sh("rm -rf {dir}")
+    assert(!r.err_out.contains("ForeignHeaderNotFound"), diag(r))
+}
