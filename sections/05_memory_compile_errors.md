@@ -541,6 +541,36 @@ error[UndefinedFunction]: undefined function `List`
   = help: an empty list is `[]`; the annotation or a later use gives the element type
 ```
 
+**A name that another file declares.** A call `f(x)` of a bare name is E0504 when no scope binds `f`. If one or more other files of the root package (§10.5 *Project root discovery*) declare a module-scope `fn f`, the error gets one more `help:` line for each such file. The line names the file and its module, and gives the repair: add `import <module>.{f}`, and make `f` `pub` first when it is private. When `f` is already `pub` there, the repair is the import alone. The rules:
+
+- The help is part of the error. The compiler reads no other file for it in a build that has no E0504.
+- The help lists every match, in the byte order of the package-relative paths, never a part of them. When no other file declares `f`, there is no sibling help and the error is as before.
+- A file that does not parse is left out of the list.
+- The help adds no new diagnostic and no new code.
+- The language server shows the same help for the same program, and computes it again after each edit.
+
+```blink
+// src/pg/conn.bl
+pub fn run(sql: Str) -> Int {
+    helper(sql)
+}
+
+// src/pg/util.bl
+fn helper(sql: Str) -> Int { 1 }
+```
+
+```
+error[UndefinedFunction]: undefined function `helper`
+ --> src/pg/conn.bl:2:5
+  |
+2 |     helper(sql)
+  |     ^^^^^^ not found in this scope
+  |
+  = help: `helper` is declared in src/pg/util.bl (module `pg.util`): make it `pub` there and add `import pg.util.{helper}`
+```
+
+The repair is `pub fn helper` in `src/pg/util.bl` and `import pg.util.{helper}` in `src/pg/conn.bl`. Two files of the package are two modules, so a name from one is not in the scope of the other.
+
 When a missing import causes cascading errors (one unresolved name triggers many downstream failures), the compiler applies cascade suppression: downstream references to a poison symbol suppress their own diagnostics. A method call on a poison receiver gets no diagnostic: the first error already names the cause, and the call has no type to look the method up in.
 
 ```blink

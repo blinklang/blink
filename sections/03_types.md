@@ -2578,11 +2578,11 @@ fn main() {
 }
 ```
 
-A bare `Name` and `Name(...)` stay under *Values come first*: a type name is never a bare value. A variant with the name of its own enum is E0518 (*Name collisions*, below).
+A bare `Name` and `Name(...)` stay under *Values come first*: a type name is never a bare value. A variant with the name of its own enum is E0518 (*Name collisions*, below). A struct with the name of a variant is legal; `Name { ... }` then reads as the struct literal (*Name collisions*, below).
 
 When a site reads a type path and fails (an unknown member or a wrong number of arguments), and a candidate enum has a variant of that name, the error gets a `help:` line that names the qualified variant.
 
-**Unqualified variant.** A bare user variant in an expression is `error[UnqualifiedVariant]` (E0554). The rule covers `X`, `X(...)` and `X { ... }`. It holds in every expression, also at a position with an expected type (*Expected type at a site*, above): an expected type never makes the bare form legal. A type named `X` in scope does not change it either. It does not reach patterns: a pattern finds its variant from the type of the matched value (§3.5). The help writes the qualified form. When one candidate enum has a variant `X`, the help is machine-applicable. When two or more have it, the help lists each qualified form.
+**Unqualified variant.** A bare user variant in an expression is `error[UnqualifiedVariant]` (E0554). The rule covers `X`, `X(...)` and `X { ... }`. It holds in every expression, also at a position with an expected type (*Expected type at a site*, above): an expected type never makes the bare form legal. A type named `X` in scope does not change it for `X` and `X(...)`. For `X { ... }`, a struct `X` in scope makes the form a struct literal, not an error (*Name collisions*, below). It does not reach patterns: a pattern finds its variant from the type of the matched value (§3.5). The help writes the qualified form. When one candidate enum has a variant `X`, the help is machine-applicable. When two or more have it, the help lists each qualified form.
 
 ```
 error[E0554]: variant `Green` needs its enum in an expression
@@ -2631,11 +2631,14 @@ fn lookup(id: Int) -> Result[Str, QueryError] {
 }
 ```
 
-**Name collisions** fall into two distinct kinds:
+**Name collisions.** A name and a variant name meet in three ways:
 
-- **A type name equal to an enum variant name** is a **compile error at declaration time** (`error[NameCollision]`, E0518) in two cases: a struct has the name of a variant, or a variant has the name of its own enum. For a struct, the reach is the package, not the module: a struct in one module and a variant of that name in another module of the package collide. The variants of a prelude enum count as declared in every module. A variant of a dependency enum never gives E0518. An import entry that binds a struct named like a variant of the package or of the prelude is also E0518, at the import entry. The fix is an alias: `import geo.{Point as GeoPoint}`. A variant with the name of its own enum, such as `type Token { Token(Str), End }` or `type Errno { Errno(Int) }`, is E0518 at the variant, once, and not at each use. The type name `Token` would then be both a type and a variant of that type:
+- **A variant with the name of its own enum** is a **compile error at declaration time** (`error[NameCollision]`, E0518). The rule covers every such variant, with or without a payload: `type Unit { Unit }`, `type Token { Token(Str), End }` and `type Errno { Errno(Int) }` are all E0518. The error is at the variant, once, and not at each use. A sum type is never one of its own injections: the name `Token` would be both the type and one of its variants.
 
   ```
+  error[NameCollision]: variant `Unit` has the name of its enum `Unit`
+    help: rename the variant: `type Unit { Only }`
+
   error[NameCollision]: variant `Token` has the name of its enum `Token`
     help: rename the variant: `type Token { Word(Str), End }`
 
@@ -2644,7 +2647,70 @@ fn lookup(id: Int) -> Result[Str, QueryError] {
     help: to wrap one value, use a one-field struct (*Newtypes*, above): `type Errno { code: Int }`
   ```
 
-  The struct help appears only for an enum with one variant and one payload. Neither help is machine-applicable. Within one package, a name is never both a product type and a sum injection, and a sum type is never one of its own injections. These two cases are the whole rule; it does not require all constructible names to be globally unique. For a struct, E0518 holds because `Name { ... }` reads as both a struct literal and a variant brace literal. An enum, alias, trait or effect has no such literal, so a type of one of those kinds named like a variant of a different enum is legal at its declaration. At a dotted head the type comes before the variant (*Dotted heads*, above), and a bare use of the variant is E0554 (*Unqualified variant*, above).
+  The one-field-struct help appears only for an enum with exactly one variant, and that variant has exactly one payload. `type Unit { Unit }` and `type Token { Token(Str), End }` get the rename help only. Neither help is machine-applicable. This case is the whole rule of E0518. It does not require all constructible names to be unique.
+
+- **A struct and a variant may have one name.** This is legal at every reach: in one module, in two modules of one package, and through an import. The variant of a prelude enum is the exception for the four bare names `Some`, `None`, `Ok` and `Err`: a type with one of these names is E1016 (§2.12.1). Each use names one thing:
+
+  - A struct literal `Lit { v: 1 }` names the struct `Lit` when a struct `Lit` is in scope.
+  - A variant carries its enum in an expression: `Hid.Lit { v: 1 }`. A bare `Lit(3)` or `Lit { ... }` that names no struct is E0554 (*Unqualified variant*, above).
+  - A pattern finds its variant from the type of the matched value (§3.5 *Brace patterns*), so a struct of the same name in scope does not change an arm.
+
+  ```blink
+  // src/other.bl
+  type Hid { Lit(Int), Other }       // private
+  pub fn n() -> Int { 1 }
+
+  // src/main.bl
+  import other
+
+  type Lit { v: Int }                // legal: `other.Hid` has a variant `Lit`
+
+  fn main() ! IO {
+      io.println("{other.n()}")      // prints 1
+  }
+  ```
+
+  A struct and a variant of one name in one program is legal also when both are in the same module:
+
+  ```blink
+  type Lit { v: Int }
+  type Hid { Lit { v: Int }, Other }
+
+  fn f() -> Hid { Lit { v: 1 } }     // error[TypeError]: expected `Hid`, found `Lit`
+                                     // help: for the variant, write `Hid.Lit { v: 1 }`
+  ```
+
+  When a struct literal has the wrong type at a place that expects an enum, and that enum has a variant of the same name declared with `{ }`, the `TypeError` (E0300) has a `help:` that writes the qualified brace literal with the same fields. The help is machine-applicable only when the literal's field names are the fields of that variant; otherwise it is a suggestion. Without such a variant the error has no help.
+
+  A bare `Click(3)` where a struct `Click` is in scope is E0554, not a call of the struct, because a struct has no paren form. The help writes the qualified variant:
+
+  ```blink
+  type Click { x: Int }
+  type Event { Click(Int), Other }
+
+  fn main() {
+      let e = Click(3)               // error[UnqualifiedVariant]: variant `Click` needs its enum in an expression
+                                     // help: write `Event.Click(3)`
+  }
+  ```
+
+  A variant may have the name of a struct that is not its enum. `type Shape { Circle(Circle), Dot }` with `type Circle { r: Int }` is legal: the variant `Shape.Circle` is an injection of `Shape`, and the struct `Circle` is a different type, so no sum type is one of its own injections.
+
+  ```blink
+  type Circle { r: Int }
+  type Shape { Circle(Circle), Dot }
+
+  fn count(s: Shape) -> Int {
+      match s {
+          Circle(c) => c.r           // the variant `Shape.Circle`, found from the type of `s`
+          Dot => 0
+      }
+  }
+
+  fn main() ! IO {
+      io.println("{count(Shape.Circle(Circle { r: 2 }))}")    // prints 2
+  }
+  ```
 
 - **The same variant name in two different enums is legal.** For example, `Pending` may appear in both `JobState` and `NetState`. Each use in an expression names its enum. A bare `Pending` is E0554, and its help lists both qualified forms:
 
@@ -2659,7 +2725,7 @@ fn lookup(id: Int) -> Result[Str, QueryError] {
   }
   ```
 
-No path ever silently picks a winner between two constructible names: a struct and a variant with one name is a declaration-time error (E0518), and a variant carries its enum in an expression. A value with the name of a user variant does not collide with it, because a bare name never reaches a user variant. A local named `Some`, `None`, `Ok` or `Err` hides the prelude variant. That is a shadow between scopes, by the order in *Values come first*, and W1011 marks it (§10.6 *Shadowing Rules*).
+No path silently picks a winner between two constructible names: a variant carries its enum in an expression, so a bare `Name { ... }` is the struct, and a bare variant is E0554. A value with the name of a user variant does not collide with it, because a bare name never reaches a user variant. A local named `Some`, `None`, `Ok` or `Err` hides the prelude variant. That is a shadow between scopes, by the order in *Values come first*, and W1011 marks it (§10.6 *Shadowing Rules*).
 
 **A variant the enum does not declare.** A qualified construction `K.Zed`, `K.Zed(1)` or `K.Zed { .. }` where the enum `K` declares no variant `Zed` is `NoSuchVariant` (E0547). The span, the candidates, the machine-applicable rename and the variant list follow the pattern rule (§3.5 *Pattern Forms*); the payload form is that of the construction. The order of checks is also the same: resolve `K` (`UnknownType`, E0507), look up the variant (E0547), then compare with the expected type (`TypeError`, E0300). A name after `K.` that does not start with an uppercase letter is never a variant, so it never gets E0547 (*Member case*, above). A `Q` that is not an enum is E0547 in an expression too (`Int.Zed`, `Point.Zed(1)`). The message says what `Q` is, as in a pattern. A bare `Zedd(1)` that names no variant and no value stays `UndefinedFunction` (E0504). A binding whose value has the error, such as `x` in `let x = K.Zed`, has the poison type (§6.3.5), so a later use of `x` reports nothing more.
 
@@ -4211,6 +4277,30 @@ fn h(s: Shape) -> Float {
 | a struct, a builtin type, a tuple or a type parameter | no type, and no variant of a visible enum | `UnknownType` (E0507); the help gives the nearest type name |
 
 When the position is an enum that declares a variant `Name`, a struct `Name` in scope does not change the result. So a new `import` cannot change the meaning of an arm. If an error occurs inside such an arm (a wrong field label, for example), the diagnostic has a `note:` that says a struct `Name` is also in scope. It has no `help:`, because the arm is valid. To name the variant in a way that scope cannot change, write `Enum.Name { .. }`: a qualified name resolves by its path (*Qualified names and the wrong type*, below).
+
+**A value whose type is not known.** A pattern finds its variant from the type of the matched value. When an unannotated closure parameter has no known type yet, a brace head means a struct and sets the type. A variant head has no enum to search, so it is `error[CannotInferType]` (E0301), and the help annotates the parameter:
+
+```blink
+type Lit { v: Int }
+type Tok { Word(Int), End }
+
+fn main() ! IO {
+    let f = fn(x) {
+        match x {
+            Lit { v } => v           // `x` is the struct `Lit`
+        }
+    }
+    io.println("{f(Lit { v: 3 })}")  // prints 3
+
+    let g = fn(y) {
+        match y {
+            Word(n) => n             // error[CannotInferType] (E0301): the type of `y` is not known here,
+            End => 0                 //   so `Word` names no variant
+        }                            //   help: annotate the parameter: `fn(y: Tok)`
+    }
+    io.println("{g(Tok.Word(3))}")
+}
+```
 
 The search for a visible enum with a variant `Name` runs only after the name has failed to resolve. It can change the code of an error. It never changes the meaning of a valid pattern. A bare name or a paren payload on a struct (`Point(x)`) stays E0308, as *Bare names: variant or binding* says.
 

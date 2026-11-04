@@ -1372,8 +1372,7 @@ fn pick(a: Int, flag: Bool) -> Int {
 `pub type T { ... }` exports the name `T` and its body: its fields or its variants. Code in any module can build a `T`, match on it, and read its fields. `pub opaque type T { ... }` exports only the name. The body is visible only in the module that declares `T`.
 
 ```blink
-@module("clock")
-
+// src/clock.bl
 pub opaque type Stamp {
     nanos: Int
 }
@@ -1881,7 +1880,7 @@ let interleaved = [..heads, separator, ..tails]
 
 Annotations use the `@` prefix and are **compiler-checked** — they are not comments, not decorators, not optional metadata. They participate in type checking, verification, and optimization.
 
-The complete, normative list of annotations is the table in §11.1. A name not in that table is an error (`UnknownAnnotation`). This section introduces the most common ones:
+The complete, normative list of annotations is the table in §11.1. A name not in that table is an error (`UnknownAnnotation`). The removed names `@effects` and `@module` have their own diagnostics (§11.1 *Rules for Every Annotation*). This section introduces the most common ones:
 
 | Annotation | Purpose |
 |------------|---------|

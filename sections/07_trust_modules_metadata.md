@@ -1293,7 +1293,7 @@ fn raw_open(f: Ptr[U8], db: Ptr[Ptr[Void]]) -> Int ! ()
 
 A change to this order, for example a row of the §11.1 table that moves, changes the hash. That change bumps the prefix to `ast2`.
 
-**What is out of the hash.** Comments and doc comments are out. So is formatting. The `@module` of the file is out: it changes the key (*Pin Keys* below), not the hash. After `@module("db.sqlite")` becomes `@module("db.sql")`, the key `db.sql.raw_open` has no pin, and the suppression lapses.
+**What is out of the hash.** Comments and doc comments are out. So is formatting. The module name is out: it comes from the path of the file, and it changes the key (*Pin Keys* below), not the hash. After the file `src/db/sqlite.bl` moves to `src/db/sql.bl`, the key `db.sql.raw_open` has no pin, and the suppression lapses.
 
 **The prefix.** `ast1` names the set of hashed parts and their serialization. Any change to either gives a new prefix, `ast2`. A pin with an old or unknown prefix is stale, with a note to re-pin. It is never an error.
 
@@ -1319,29 +1319,27 @@ pub fn fetch_table(table: Str) -> Result[List[Row], DBError] ! DB.Read {
 - The hash is a function of the parse tree alone. It needs no name resolution and no typecheck. `blink check`, the LSP and `blink audit pin` compute the same value, and a name error in an unrelated file does not stop a pin.
 - If Blink adds glob imports, this rule must be revisited and the prefix bumped to `ast2`.
 
-**What a pin does not cover.** A pin covers the item and the imports it uses, and nothing else: not the body of a function it calls or of a function that calls it, not the right-hand side of a type alias it names, not the layout of an `@ffi.struct` in its signature, not which impl a method call reaches by the type of its receiver, and not the module that an imported name is re-exported from. A guard in a **caller** is outside every pin: deleting it changes no pin, and the claim can become false with no warning. So is a callee that another file defines. Two files of one module show it:
+**What a pin does not cover.** A pin covers the item and the imports it uses, and nothing else: not the body of a function it calls or of a function that calls it, not the right-hand side of a type alias it names, not the layout of an `@ffi.struct` in its signature, not which impl a method call reaches by the type of its receiver, and not the module that an imported name is re-exported from. A guard in a **caller** is outside every pin: deleting it changes no pin, and the claim can become false with no warning. So is a callee that another file defines. Two modules show it:
 
 ```blink
 // src/pg/conn.bl
-@module("pg")
+import pg.util.{helper}
 
 @trusted(audit: "PG-001")
 pub fn run(sql: Str) -> Int ! DB {
-    helper(sql)                       // no import binds `helper`: it is defined in util.bl
+    helper(sql)
 }
 ```
 
 ```blink
 // src/pg/util.bl
-@module("pg")
-
-fn helper(sql: Str) -> Int ! DB {
-    // an edit here leaves the pin of `pg.run` fresh
+pub fn helper(sql: Str) -> Int ! DB {
+    // an edit here leaves the pin of `pg.conn.run` fresh
     exec_unchecked(sql)
 }
 ```
 
-An edit of `helper`, or a move of `helper` to a third file of `pg`, leaves the pin of `pg.run` fresh: the hash does not see a definition in a sibling file. If `conn.bl` instead adds `import extra.{helper}`, the pin is stale, because that import line binds a name the item uses. Keep a guard inside the audited item, and keep that item small:
+An edit of the body of `helper` leaves the pin of `pg.conn.run` fresh: the hash does not see the body of a function in another module. If `helper` moves to a third file, `conn.bl` must change the line `import pg.util.{helper}`, and the pin is stale, because that import line binds a name the item uses. Keep a guard inside the audited item, and keep that item small:
 
 ```blink
 pub fn fetch_table(table: Str) -> Result[List[Row], DBError] ! DB.Read {
@@ -1365,7 +1363,7 @@ A pin key names one item. `blink audit pin` writes it, and the compiler looks it
 | Trait-impl method | `<module>.(<Trait> for <Type>).<method>` | `report.(Show for Thing).show` |
 | Generic impl method | impl head as written, normalized as `blink fmt` writes it | `conv.(From[List[T]] for Box[T]).from` |
 | `test` block | `<module>.test "<decoded name>"` | `report.test "fetch rejects unknown table"` |
-| Item in a file with no `@module` | `"<package-relative path>".<item>` | `"tests/db_test.bl".raw_open` |
+| Item in a file with no module name | `"<package-relative path>".<item>` | `"tests/db_test.bl".raw_open` |
 | `test` block in such a file | `"<package-relative path>".test "<decoded name>"` | `"tests/db_test.bl".test "opens: 12"` |
 
 - `<module>` is the module name as `import` writes it. A function, a method and a `test` block can all carry a pin.
@@ -1374,7 +1372,7 @@ A pin key names one item. `blink audit pin` writes it, and the compiler looks it
 - **Names with escapes.** A `test` name and a file path use the decoded text. One escape set applies: `\"` for a quote, `\\` for a backslash, `\{` for a brace, and `\u{..}` (lowercase hex, no leading zeros) for a control character. Two names that decode to the same text are the same key, as they are the same name (E0851).
 
 ```blink
-// src/report.bl, @module("report")
+// src/report.bl, module `report`
 test "says \"hi\"" {
     assert_eq(greet(), "hi")
 }
@@ -1382,10 +1380,10 @@ test "says \"hi\"" {
 
 The key of this test is `report.test "says \"hi\""`. In `audits.toml` it is `'report.test "says \"hi\""' = "ast1:..."`. A help line prints it shell-quoted: `blink audit pin RPT-002 'report.test "says \"hi\""'`. A key that holds only letters, digits and `. _ / -` is printed bare. Any other key is wrapped in single quotes, and each `'` in it is written as `'\''`. The `--json` output gives the raw key and no shell quoting.
 
-**A file with no `@module`.** A file under `tests/`, `examples/` or `bench/`, and a loose file in the package, has no module name. Its items use the path of the file, relative to the package root and written as a Blink string literal, then `.` and the item:
+**A file with no module name.** A file under `tests/`, `examples/` or `bench/`, and a loose file in the package, has no module name. Its items use the path of the file, relative to the package root and written as a Blink string literal, then `.` and the item:
 
 ```blink
-// tests/db_test.bl (no @module)
+// tests/db_test.bl (no module name)
 @trusted(audit: "DB-003")
 fn raw_open(f: Ptr[U8]) -> Int ! () { ... }
 
@@ -1485,15 +1483,25 @@ error: no item carries `@trusted(audit: "RPT-009")` (scanned 41 files)
 
 The exit code is 1.
 
-**A duplicate key.** Two items can have one key. For example, two files of one `@module("pg")` can both define `fn connect`. Pin refuses, exits 1 and lists both sites. It never picks one:
+**A duplicate key.** Two items can have one key. For example, one file can define `fn connect` twice. A build reports that as E1016 (§2.12.1), but `blink audit pin` reads the parse tree and runs before any check, so the command meets both items. Pin refuses, exits 1 and lists both sites. It never picks one:
+
+```blink
+// src/pg/conn.bl
+@trusted(audit: "PG-001")
+fn connect() -> Int ! DB { 1 }
+
+fn connect() -> Int ! DB { 2 }
+```
 
 ```
 $ blink audit pin PG-001
-error: two items have the key `pg.connect`
-  --> src/pg/conn.bl:4:1
-  --> src/pg/legacy.bl:9:1
+error: two items have the key `pg.conn.connect`
+  --> src/pg/conn.bl:3:1
+  --> src/pg/conn.bl:5:1
   = help: rename one of them
 ```
+
+Two items in different files can also share a key, as `fn m` in module `a.B` and `fn B.m` in module `a` do. The rule is the same.
 
 **A file with faults.** The command checks the file before it writes. It refuses, with exit 1 and no write, when `audits.toml` has a syntax error, when `K` has a bad or empty `claim`, or when `K` has `AuditRecordUnknownKey` (E0830). A fault in another record does not block it.
 
@@ -3153,9 +3161,9 @@ myapp/
       queries.bl     # module: db.queries
 ```
 
-The module name is derived from the file path relative to `src/`. The directory structure IS the package hierarchy. There is no `mod.bl` index file, no `__init__` file, no module declarations in a parent file.
+The module name is derived from the file path relative to `src/`. The directory structure IS the package hierarchy. There is no `mod.bl` index file, no `__init__` file, no module declarations in a parent file. The path alone names a module: no annotation changes the name, and two files are never one module.
 
-The file that declares `fn main` is an ordinary module. It takes its name by the same rule: from its path under `src/`, or from `@module`. Any file under `src/` may declare `fn main`, and the file given to `blink build` or `blink run` keeps its path-derived name. So `src/main.bl` is the module `main`, a legal ordinary module, and the package entry is `src/<name>.bl` (§10.5 *Package Entry Resolution*). A file is one module however the build reaches it: the file given to `blink build` or `blink run` and an import of that file name the same module, with one copy of each module-level binding and one set of types.
+The file that declares `fn main` is an ordinary module. It takes its name by the same rule: from its path under `src/`. Any file under `src/` may declare `fn main`, and the file given to `blink build` or `blink run` keeps its path-derived name. So `src/main.bl` is the module `main`, a legal ordinary module, and the package entry is `src/<name>.bl` (§10.5 *Package Entry Resolution*). A file is one module however the build reaches it: the file given to `blink build` or `blink run` and an import of that file name the same module, with one copy of each module-level binding and one set of types.
 
 A sibling imports that file like any other module, selectively or by qualifier (intra-package cycles are allowed, §10.5 *Cycle Detection*):
 
@@ -3200,34 +3208,58 @@ import util              // error E1200 ModuleNotFound
                          // help: files outside `src/` are not modules; move the file under `src/`
 ```
 
-**Why file = module:** Go proved this works at scale. One file, one module, one namespace. No indirection. An AI agent looking at `auth/login.bl` knows immediately that it's the `auth.login` module. No configuration to parse, no module maps to resolve.
+**Why file = module:** One file, one module, one namespace. No indirection. An AI agent looking at `auth/login.bl` knows immediately that it's the `auth.login` module. No configuration to parse, no module maps to resolve.
 
-#### `@module` — Explicit Module Naming
+#### A File Cannot Rename Its Module
 
-The `@module` annotation at the top of a file overrides the path-derived name. This is optional — most files don't need it.
+`@module` is removed. A file under `src/` has the module name its path gives, and nothing in the file changes it. A `@module(...)` annotation in a file is `error[InvalidModuleAnnotation]` (E1008), whatever its argument. This is the rule for removed syntax: the compiler does not read the argument. The span is the annotation. The help names the module that the file has.
 
 ```blink
-// File: src/auth/login.bl
-// Without @module, this module is auth.login
-// With @module, it can be renamed:
-@module("auth")
-
-// Now this file's public items are importable as auth.login(), auth.Token, etc.
-// rather than auth.login.login(), auth.login.Token
+// src/pg/util.bl
+@module("pg")                  // error[InvalidModuleAnnotation]: `@module` is removed
+                               // help: this file is module `pg.util`; delete the annotation
+pub fn helper() -> Int { 1 }
 ```
 
-The primary use case for `@module` is when a directory has a single "main" file that should represent the package itself:
+The delete is machine-applicable only when the argument equals the last segment of the path of the file. In `src/pg.bl`, `@module("pg")` has the argument `pg`, which is the last segment, so the fix deletes it. In `src/pg/util.bl` the last segment is `util`, and the argument `pg` shows that the author wanted the items in module `pg`. The help there is not machine-applicable. It explains how to get that effect with a re-export, as below.
+
+A directory can still have one file that stands for the whole directory. Name it as the directory and put it beside the directory, and let it re-export (`pub import`, *Re-exports*, below):
 
 ```
-auth/
-  auth.bl        # @module("auth") — the package's primary module
-  rate_limit.bl  # module: auth.rate_limit
-  token.bl       # module: auth.token
+src/
+  pg.bl           # module: pg
+  pg/
+    conn.bl       # module: pg.conn
+    util.bl       # module: pg.util
 ```
 
-Without `@module`, you'd import as `auth.auth.login()`. With `@module("auth")` on `auth.bl`, you import as `auth.login()`.
+```blink
+// src/pg.bl
+pub import pg.conn.{run}
+```
 
-**Constraint:** `@module` can only set the name to the parent package name. You cannot use `@module` to move a module into a completely different package. The compiler rejects `@module("billing")` on a file inside `auth/`.
+```blink
+// src/pg/conn.bl
+import pg.util.{helper}
+
+pub fn run() -> Int { helper() }
+```
+
+```blink
+// src/pg/util.bl
+pub fn helper() -> Int { 1 }       // must be `pub`: conn.bl is another module
+```
+
+```blink
+// src/main.bl
+import pg
+
+fn main() {
+    io.println("{pg.run()}")       // prints 1
+}
+```
+
+A sibling file is another module, so `helper` must be `pub` for `pg.conn` to use it. There are two visibility levels (§10.2) and no level between them.
 
 #### Imports
 
@@ -3406,7 +3438,7 @@ There is no `pub(crate)`, no `protected`, no `internal`, no `friend`. Two levels
 A module can declare a capability ceiling with `@capabilities`. This sets a hard upper bound on what effects any function in the module is allowed to perform.
 
 ```blink
-@module("auth")
+// src/auth/login.bl
 @capabilities(DB, Crypto, IO)
 
 // OK — DB and Crypto are within budget
@@ -3439,10 +3471,9 @@ error[E0900]: effect exceeds module capabilities
 Capability budgets compose hierarchically. A package-level `@capabilities` in the directory's primary module constrains all modules in that package:
 
 ```blink
-// auth/auth.bl
-@module("auth")
+// src/auth.bl
 @capabilities(DB, Crypto, IO)
-// All modules under auth/ inherit this ceiling
+// All modules under src/auth/ inherit this ceiling
 ```
 
 A child module can declare a **narrower** budget but never a wider one:
@@ -3524,7 +3555,7 @@ Import resolution is a deterministic function from module path to file path. No 
 
 ```
 resolve("auth.token") → <project>/src/auth/token.bl
-resolve("auth")       → <project>/src/auth.bl (if @module("auth"))
+resolve("auth")       → <project>/src/auth.bl
                         OR <project>/src/auth/ (package — exposes pub items)
 ```
 
@@ -3555,8 +3586,8 @@ Local modules shadow dependencies with the same name. This is intentional — it
 warning[W1000]: local module shadows dependency
  --> src/http.bl:1:1
   |
-1 | @module("http")
-  | ^^^^^^^^^^^^ shadows package `blink.http` from blink.toml
+1 | pub fn get(url: Str) -> Str ! Net {
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ shadows package `blink.http` from blink.toml
   |
   = help: this is allowed but may confuse consumers expecting the library
 ```
@@ -3668,8 +3699,6 @@ The entry filename equals `[package].name` from the package's `blink.toml`, with
 // name = "pg"
 
 // libs/pg/src/pg.bl  -- the entry file (mandatory for bare external import)
-@module("pg")
-
 pub fn connect(url: Str) -> Connection { ... }
 ```
 
@@ -3679,7 +3708,7 @@ import pg                    // resolves to libs/pg/src/pg.bl
 import pg.protocol           // resolves to libs/pg/src/protocol.bl
 ```
 
-**Package name grammar.** The `[package].name` field must match `[a-z][a-z0-9_]*` (validated as `error[E1011]`). An empty `name`, and a `name` that is not a string, are also E1011. The span follows §8.9.8. Hyphens are forbidden. Dots are forbidden in the bare name (dots are the import sub-path separator and are reserved for registry paths per §8.9.2). The constraint exists so that the four-way invariant — `[package].name` = directory name = entry filename stem = `@module(...)` argument — holds character-for-character with no transformation table.
+**Package name grammar.** The `[package].name` field must match `[a-z][a-z0-9_]*` (validated as `error[E1011]`). An empty `name`, and a `name` that is not a string, are also E1011. The span follows §8.9.8. Hyphens are forbidden. Dots are forbidden in the bare name (dots are the import sub-path separator and are reserved for registry paths per §8.9.2). The constraint exists so that the four-way invariant — `[package].name` = directory name = entry filename stem — holds character-for-character with no transformation table.
 
 **Project root discovery.** A source file's package root is the nearest ancestor directory containing a `blink.toml`. The walk starts at the file's own path, made absolute first: a relative path and the absolute path of the same file give the same package root. The cwd is never an input. `src/` beneath the package root is the source root. Files under `tests/`, `examples/`, and `bench/` are *peers* of `src/`, not children: their imports resolve against the same package root that walking up from `src/` would find. This rule applies uniformly to first-party (self-package) and third-party imports — there is no special-case "self-import" branch.
 
@@ -3690,8 +3719,8 @@ libs/pg/
   blink.toml              [package].name = "pg"
   audits.toml             records for src/, tests/, examples/, bench/
   src/
-    pg.bl                 @module("pg") — entry
-    protocol.bl           @module("pg") — sibling, merges into pg.*
+    pg.bl                 module pg, the entry
+    protocol.bl           module pg.protocol
   tests/
     test_connect.bl       walks up to libs/pg/blink.toml,
                           import pg → libs/pg/src/pg.bl
@@ -3744,7 +3773,7 @@ error[NoSuchField]: `Local` has no field `c`
 
 `Local` is in the root package, so it gets both helps. `Point` is in `geo`, so it gets the rename help only. Running the tool from the `geo/` directory makes `geo` the root package, and then `Point` gets both helps.
 
-**`@module` on the entry file.** The entry file's `@module(...)` argument, if present, must equal `[package].name`. If they disagree, the compiler rejects with `error[E1008]`. The annotation may be omitted on the entry file — its meaning is implied by location — but conforming style is to declare it explicitly for parity with non-entry files.
+**`@module` on the entry file.** `@module` is removed (*A File Cannot Rename Its Module*, above). A `@module(...)` on the entry file is E1008 like any other. The entry file takes its name from its path, `src/<name>.bl`.
 
 **Failure mode.** When the entry file is missing, the compiler reports a single path:
 
@@ -3761,27 +3790,6 @@ error[E1009]: package entry not found
 ```
 
 There is no second candidate to mention. The diagnostic names exactly one expected path because there is exactly one rule.
-
-#### `@module` Resolution
-
-When a file declares `@module("parent_package")`, its public items merge into the parent package namespace. The compiler validates that `@module` only refers to the immediate parent:
-
-```
-src/auth/
-  auth.bl         @module("auth") — items available as auth.X
-  token.bl        items available as auth.token.X
-  rate_limit.bl   items available as auth.rate_limit.X
-```
-
-If two files in the same directory both declare `@module` with the same name, or if `@module` conflicts with a sibling module name, the compiler rejects it:
-
-```
-error[E1001]: duplicate module name
- --> src/auth/helpers.bl:1:1
-  |
-1 | @module("auth")
-  | ^^^^^^^^^^^^ module name `auth` already claimed by src/auth/auth.bl
-```
 
 #### Cycle Detection
 
@@ -3832,8 +3840,7 @@ The `blink update` command uses minimum version selection: it picks the lowest v
 A module can re-export items from other modules using `pub import`. This decouples a package's public API from its internal file structure.
 
 ```blink
-// src/auth/auth.bl
-@module("auth")
+// src/auth.bl
 pub import auth.token.{Token, verify}
 pub import auth.login.{login, AuthError}
 pub import auth.rate_limit.{RateLimiter}
@@ -3849,7 +3856,7 @@ pub import auth.rate_limit.{RateLimiter}
 - The compiler tracks the original declaration for go-to-definition (LSP lands on the source, not the re-export)
 - `pub import` of an entire module re-exports all its `pub` items: `pub import auth.token` makes `auth.Token`, `auth.verify` etc. available
 - Circular re-exports are detected and rejected at compile time
-- Any module can use `pub import` — no restriction to `@module`-annotated facade files
+- Any module can use `pub import`
 
 **Consumer-side access:** Re-exported items are indistinguishable from locally-defined `pub` items. If module A does `pub import B.{foo}`, then consumers can access `foo` via both selective import (`import A.{foo}`) and qualified access (`A.foo`). The same access rules apply as for any other pub item in A's namespace.
 
@@ -4072,14 +4079,13 @@ When the entry names a type whose methods the file calls, the note says that the
 | Code | Error | Cause |
 |------|-------|-------|
 | E1000 | Module not found | No file at resolved path, no matching dependency |
-| E1001 | Duplicate module name | Two files claim same `@module` name |
 | E1002 | Circular package dependency | Cross-package import cycle |
 | E1003 | Private item access | Referencing or importing a function, type, trait, variant or other item that is not `pub` in its declaring module, or using the body of an opaque type outside its declaring module (§2.12.2). The import form is checked when the import is read (§10.5) |
 | E1004 | Version conflict | Diamond dependency with incompatible versions |
 | E1005 | Ambiguous import | Two imports in one file bind one name, bare name or qualifier, to different items. Checked when the import is read (§10.5) |
 | E1006 | Import not selected | A bare name comes from an imported module but is not in the selective import list |
 | E1007 | Module-qualified type member | A type member or variant is reached through a module qualifier (`mod.Type.Member`) instead of an imported type |
-| E1008 | Invalid module annotation | `@module(...)` disagrees with parent package or entry file's `[package].name` |
+| E1008 | Invalid module annotation | A file has a `@module(...)` annotation. `@module` is removed syntax; the path of a file names its module (§10.1) |
 | E1009 | Package entry not found | Bare `import <pkg>` resolved to a package whose `src/<name>.bl` does not exist |
 | E1010 | Orphan file | Bare external import from a file with no enclosing `blink.toml` |
 | E1011 | Invalid package name | `[package].name` violates the `[a-z][a-z0-9_]*` grammar, is empty, or is not a string |
@@ -4656,7 +4662,6 @@ The rows are in canonical order (see *Canonical Ordering* below).
 
 | Annotation | Target | Repeats | Meaning | Status |
 |------------|--------|---------|---------|--------|
-| `@module("name")` | first declaration of a file | no | Sets the module name to the parent package name. See §10.1. | checked |
 | `@capabilities(list)` | module | no | Hard ceiling on the effects this module may perform. See §10.3. | checked |
 | `@derive(Trait, ...)` | type | no | Generates trait implementations. Seven compiler-known traits only: `Eq`, `Ord`, `Hash`, `Clone`, `Debug`, `Serialize`, `Deserialize`. Each derived implementation obeys the laws in §3.6.1 *Derive Laws*. Any other argument, `Display` included, is `NotDerivable` (E1402). | checked |
 | `@handle_all` | effect | no | Every handler of this effect should implement each primitive operation. Covers the sub-effects; on a nested sub-effect, covers only that sub-effect. A handler that omits one gets the warning `PartialHandler` (W0545). The stdlib marks `Rand`, `Time` and `IO.Read`. See §4.7.1. | checked |
@@ -4704,7 +4709,7 @@ error[AnnotationNotSupported]: `@perf` is not supported by this toolchain
    - `@modifies` names the `State` effect (§4.16.1), which tracks writes to module-level state.
    - Common names from other languages, such as `@inline`, `@override` and `@test`, name the Blink form, if there is one.
 
-   `@effects` keeps its own diagnostic, `EffectsAnnotationRemoved` (§9.1).
+   `@effects` keeps its own diagnostic, `EffectsAnnotationRemoved` (§9.1). `@module` keeps its own diagnostic too, `InvalidModuleAnnotation` (E1008, §10.1): it is not `UnknownAnnotation`, because the name was once in the table.
 2. **Targets.** An annotation on a target that its row does not list is `UnexpectedAnnotation` (E1110).
 3. **Repeats.** A name may occur only once on one declaration, unless its row says it repeats. A second occurrence is `DuplicateAnnotation`. The Repeats column says how repeated occurrences combine.
 4. **Arguments.** The Annotation column of a row writes the one form that row accepts. Arguments that do not match that form are `AnnotationArguments` (E1134). It is an error. It is never a warning, and the compiler never accepts it. These are the cases:
@@ -4750,21 +4755,20 @@ error[AnnotationArguments]: `@handle_all` takes no arguments
 `blink fmt` enforces a deterministic annotation order. No style debates.
 
 ```blink
-@module("auth")                          // 1. module declaration
-@capabilities(DB, Crypto)             // 2. capability budget
-@src(req: "AUTH-001")                 // 3. provenance
+@capabilities(DB, Crypto)             // 1. capability budget
+@src(req: "AUTH-001")                 // 2. provenance
 
-@src(req: "AUTH-001")                 // 4. provenance (on function)
-@requires(email.len() > 0)           // 5. preconditions
-@ensures(result.is_ok() => result.unwrap().token.is_valid())  // 6. postconditions
-@perf(p99 < 200ms)                   // 7. performance contracts
-@deprecated(since: "2026", removal: "2028", replacement: "login_v2", fix: "replace")  // 8. deprecation
+@src(req: "AUTH-001")                 // 3. provenance (on function)
+@requires(email.len() > 0)           // 4. preconditions
+@ensures(result.is_ok() => result.unwrap().token.is_valid())  // 5. postconditions
+@perf(p99 < 200ms)                   // 6. performance contracts
+@deprecated(since: "2026", removal: "2028", replacement: "login_v2", fix: "replace")  // 7. deprecation
 pub fn login(email: Str, pwd: Str) -> Result[Session, AuthError] ! DB, Crypto {
     // ...
 }
 ```
 
-The order is the row order of the table in §11.1: `@module` > `@capabilities` > `@derive` > `@handle_all` > `@src` > `@requires` > `@ensures` > `@where` > `@invariant` > `@pure` > `@perf` > `@ffi` > `@ffi.struct` > `@ffi.opaque` > `@trusted` > `@alt` > `@verify` > `@tags` > `@skip` > `@allow` > `@deprecated` > `@deprecate_override`.
+The order is the row order of the table in §11.1: `@capabilities` > `@derive` > `@handle_all` > `@src` > `@requires` > `@ensures` > `@where` > `@invariant` > `@pure` > `@perf` > `@ffi` > `@ffi.struct` > `@ffi.opaque` > `@trusted` > `@alt` > `@verify` > `@tags` > `@skip` > `@allow` > `@deprecated` > `@deprecate_override`.
 
 The audit pin hash takes annotations in this order (§9.1 *Pins — What the Hash Covers*), so `blink fmt` never makes a pin stale. A change to this row order changes every hash and bumps the pin prefix.
 
@@ -4871,7 +4875,7 @@ pub type MaskedCardNumber {
 Module-level provenance applies to the entire module:
 
 ```blink
-@module("auth")
+// src/auth.bl
 @src(req: "AUTH-001", "AUTH-002", "AUTH-003")
 @src(design: "RFC-2026-07")
 
