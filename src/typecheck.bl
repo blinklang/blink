@@ -1370,6 +1370,10 @@ fn tc_type_satisfies_bound(concrete_tid: Int, trait_name: Str) -> Int ! TypeChec
 // needs no effect and mono can ask it at an instance. The overlap check and conversion
 // selection both judge bounds here, so a pair of impls the overlap check let through never
 // both answer one call. Display is judged by tc_display_fact.
+fn tc_is_arith_trait(tr: Str) -> Bool {
+    tr == "Add" || tr == "Sub" || tr == "Mul" || tr == "Div" || tr == "Rem" || tr == "Neg"
+}
+
 fn tc_bound_fact(concrete_tid: Int, trait_name: Str) -> Int {
     let k = type_kind(concrete_tid)
     // Unknowable for an unresolved/generic type — fail open, never reject.
@@ -1393,7 +1397,7 @@ fn tc_bound_fact(concrete_tid: Int, trait_name: Str) -> Int {
     // 0 for an unresolved/typevar concrete, so a -1 here means a genuinely non-numeric
     // argument (Str/Bool/Char/user) was bound to an arithmetic-bounded param — the ugly
     // `cc` error today, a clean E0306 with this branch.
-    if trait_name == "Add" || trait_name == "Sub" || trait_name == "Mul" || trait_name == "Div" || trait_name == "Rem" || trait_name == "Neg" {
+    if tc_is_arith_trait(trait_name) {
         if is_arith_numeric_type(concrete_tid) != 0 { return 1 }
         return -1
     }
@@ -26490,40 +26494,89 @@ pub fn tc_written_impl_holds(tid0: Int, tr: Str, method: Str) -> Bool {
     }
 }
 
+// A written bound that does not hold: the trait it names, and the chain from its argument.
+type TcFailedBound {
+    tr: Str
+    need: List[Int]
+}
+
 // What an impl's binder bounds and `where` bounds need of the arguments `binds` gives its
 // binders: the first bound that does not hold, as tc_trait_need answers it.
 fn tc_impl_bounds_need(im: Int, binds: Map[Str, Int], visiting: List[Int]) -> List[Int] {
+    match tc_impl_failed_bound(im, binds, visiting) {
+        Some(failed) => failed.need
+        None => []
+    }
+}
+
+fn tc_impl_failed_bound(im: Int, binds: Map[Str, Int], visiting: List[Int]) -> Option[TcFailedBound] {
     let binders = node_impl_binders(im)
     let mut i = 0
     while binders != -1 && i < sublist_length(binders) {
         let tp = sublist_get(binders, i)
-        let need = tc_carrier_bounds_need(tp, binds.get(tc_binder_key(tp, node_name(tp))) ?? -1, visiting)
-        if need.len() > 0 { return need }
+        let failed = tc_carrier_failed_bound(tp, binds.get(tc_binder_key(tp, node_name(tp))) ?? -1, visiting)
+        if failed.is_some() { return failed }
         i = i + 1
     }
     let wb = node_impl_where_bounds(im)
     let mut j = 0
     while wb != -1 && j < sublist_length(wb) {
         let cons = sublist_get(wb, j)
-        let need = tc_carrier_bounds_need(cons, binds.get(node_name(cons)) ?? -1, visiting)
-        if need.len() > 0 { return need }
+        let failed = tc_carrier_failed_bound(cons, binds.get(node_name(cons)) ?? -1, visiting)
+        if failed.is_some() { return failed }
         j = j + 1
     }
-    []
+    None
 }
 
 // The first of the bounds written on `carrier` (a binder or a `where` constraint) that the
 // type `arg` does not have. An argument nothing binds is not judged.
-fn tc_carrier_bounds_need(carrier: Int, arg: Int, visiting: List[Int]) -> List[Int] {
+fn tc_carrier_failed_bound(carrier: Int, arg: Int, visiting: List[Int]) -> Option[TcFailedBound] {
     let bounds = node_elements(carrier)
-    if arg == -1 || bounds == -1 { return [] }
+    if arg == -1 || bounds == -1 { return None }
     let mut i = 0
     while i < sublist_length(bounds) {
-        let need = tc_trait_need(arg, tc_bound_trait(sublist_get(bounds, i)), visiting)
-        if need.len() > 0 { return need }
+        let tr = tc_bound_trait(sublist_get(bounds, i))
+        let need = tc_bound_need(arg, tr, visiting)
+        if need.len() > 0 { return Some(TcFailedBound { tr: tr, need: need }) }
         i = i + 1
     }
-    []
+    None
+}
+
+// A written bound can name any trait, and tc_trait_need has a rule only for the derivable
+// ones. A bound read as held on a type without the trait sends the impl's body to mono at a
+// type that body cannot compile against.
+fn tc_bound_need(arg: Int, tr: Str, visiting: List[Int]) -> List[Int] {
+    let need = tc_trait_need(arg, tr, visiting)
+    if need.len() > 0 { return need }
+    if tc_bound_fact(arg, tr) == -1 { return [arg] }
+    tc_user_trait_need(arg, tr, visiting)
+}
+
+// What a bound on a trait a program module declares needs of `tid`, read from the impls
+// written for it, where their own bounds hold. A trait a std module declares is left out, as
+// tc_unmet_user_bound leaves it out. The trait's arguments are not read: they need the
+// resolver, so this asks only for an impl at some arguments, and the call-site check judges
+// the arguments.
+fn tc_user_trait_need(tid0: Int, tr: Str, visiting: List[Int]) -> List[Int] {
+    let trait_node = tc_trait_node_idx.get(tr) ?? -1
+    if trait_node == -1 || node_source_module(trait_node).starts_with("std_") { return [] }
+    let tid = resolve_alias_tid(tc_resolve(tid0))
+    if tc_tid_is_judgeable(tid) == 0 { return [] }
+    let mut failed: List[Int] = []
+    for im in tc_impl_recv_tids.keys() {
+        if tc_impl_trait_id(im) != tr { continue }
+        let raw = tc_impl_recv_tids.get(im) ?? -1
+        let binds: Map[Str, Int] = Map()
+        unify_typevar_binds(raw, tid, binds)
+        if !tc_tid_same_type(tc_resolve(substitute_typevar_tid(raw, binds)), tid) { continue }
+        let need = tc_impl_bounds_need(im, binds, visiting)
+        if need.len() == 0 { return [] }
+        if failed.len() == 0 { failed = need }
+    }
+    if failed.len() == 0 { return [tid] }
+    eq_need_through(tid, failed)
 }
 
 fn tc_eq_need(tid0: Int, visiting: List[Int]) -> List[Int] {
@@ -26607,12 +26660,17 @@ fn tc_eq_need_fixes(path: List[Int]) -> List[Str] {
     tc_trait_need_fixes(path.get(path.len() - 1).unwrap(), tc_need_fix_trait(path, "Eq"))
 }
 
-// The trait the fix for the innermost type of `path` names. A range is written over an `Ord`
-// type (§3.6 *Traits of Range[T]*) and `Ord` gives `Eq`, so a type parameter a range holds
-// asks for `Ord`, the bound its range is written with.
+// The trait the fix for the innermost type of `path` names: the one the last step asks. A
+// range is written over an `Ord` type (§3.6 *Traits of Range[T]*) and `Ord` gives `Eq`, so a
+// type parameter a range holds asks for `Ord`, the bound its range is written with.
 fn tc_need_fix_trait(path: List[Int], tr: Str) -> Str {
-    if path.len() < 2 { return tr }
-    if tc_range_needs_ord(path.get(path.len() - 2).unwrap(), path.get(path.len() - 1).unwrap(), tr) { "Ord" } else { tr }
+    let mut asked = tr
+    let mut i = 0
+    while i + 1 < path.len() {
+        asked = tc_step_asks(path.get(i).unwrap(), path.get(i + 1).unwrap(), asked)
+        i = i + 1
+    }
+    asked
 }
 
 fn tc_range_needs_ord(outer: Int, inner: Int, tr: Str) -> Bool {
@@ -26625,6 +26683,11 @@ fn tc_range_needs_ord(outer: Int, inner: Int, tr: Str) -> Bool {
 fn tc_trait_need_fixes(leaf: Int, tr: Str) -> List[Str] {
     let mut lines: List[Str] = []
     let k = type_kind(leaf)
+    // A trait with no derive can only be written, and an arithmetic one not even that.
+    if tc_trait_method(tr) == "" && tr != "Serialize" && k != TyKind.Typevar {
+        if !tc_is_arith_trait(tr) { lines.push("write `impl {tr} for {type_to_str(leaf)}`") }
+        return lines
+    }
     if k == TyKind.Struct || k == TyKind.Enum {
         let base = if k == TyKind.Struct { tc_struct_base_tid(leaf) } else { tc_enum_base_tid(leaf) }
         let bname = strip_module_qualifier(tc_type_name(base))
@@ -26691,9 +26754,13 @@ fn tc_eq_need_notes(path: List[Int]) -> List[Str] {
 
 fn tc_trait_need_notes(path: List[Int], tr: Str) -> List[Str] {
     let mut notes = tc_shadowed_trait_notes(tr)
+    let mut asked = tr
     let mut i = 0
     while i + 1 < path.len() {
-        notes.push(tc_trait_need_step(path.get(i).unwrap(), path.get(i + 1).unwrap(), tr))
+        let outer = path.get(i).unwrap()
+        let inner = path.get(i + 1).unwrap()
+        notes.push(tc_trait_need_step(outer, inner, asked))
+        asked = tc_step_asks(outer, inner, asked)
         i = i + 1
     }
     notes
@@ -26701,7 +26768,26 @@ fn tc_trait_need_notes(path: List[Int], tr: Str) -> List[Str] {
 
 fn tc_trait_need_step(outer: Int, inner: Int, tr: Str) -> Str {
     if tc_range_needs_ord(outer, inner, tr) { return "`{type_to_str(outer)}` needs `{type_to_str(inner)}: Ord`, and `Ord` gives `Eq`" }
-    "`{type_to_str(outer)}` is `{tr}` only if `{type_to_str(inner)}` is `{tr}`"
+    "`{type_to_str(outer)}` is `{tr}` only if `{type_to_str(inner)}` is `{tc_step_asks(outer, inner, tr)}`"
+}
+
+// The trait one step of a chain asks of `inner`. A written impl's bound can name another
+// trait than the one judged, and a fix for the judged trait would not help.
+fn tc_step_asks(outer: Int, inner: Int, tr: Str) -> Str {
+    if tc_range_needs_ord(outer, inner, tr) { return "Ord" }
+    let tid = resolve_alias_tid(tc_resolve(outer))
+    for im in tc_impl_recv_tids.keys() {
+        if tc_impl_trait_id(im) != tr { continue }
+        let raw = tc_impl_recv_tids.get(im) ?? -1
+        let binds: Map[Str, Int] = Map()
+        unify_typevar_binds(raw, tid, binds)
+        if !tc_tid_same_type(tc_resolve(substitute_typevar_tid(raw, binds)), tid) { continue }
+        match tc_impl_failed_bound(im, binds, []) {
+            Some(failed) => { if tc_tid_same_type(tc_resolve(failed.need.get(0).unwrap()), inner) { return failed.tr } }
+            None => { }
+        }
+    }
+    tr
 }
 
 // `==` and `!=` need `Eq` on the operand type, recursively. Returns 1 when it reported,

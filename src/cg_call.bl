@@ -52,7 +52,7 @@ import layout.{
     tid_holds_tag_member, spawn_pair_spelling, task_entry_spelling, pool_spelling,
     async_scope_handles_spelling, list_slots_hold_no_pointer,
 }
-import mono.{instances, instance_for_call, instance_of_poly_method, iterator_route_name, iterator_route_module, mark_instance_named}
+import mono.{has_own_binders, instances, instance_for_call, instance_of_poly_method, iterator_route_name, iterator_route_module, mark_instance_named}
 import cg_reg.{cg_reg_fn_decls, cg_reg_builtin_op_decl, cg_reg_fns_named, cg_reg_impl_decls, cg_reg_impl_of, cg_reg_tid_for_decl}
 import cname.{
     c_fn_decl_name, c_impl_method_name, c_impl_method_name_q,
@@ -85,7 +85,7 @@ import cg_eff.{
 }
 import cg_print.{vtable_slot_self_spelling}
 import cg_promote.{cg_promote_on_demand_claim, cg_promote_on_demand_settle, cg_promote_on_demand_queue}
-import cg_decl.{BodySite, cg_decl_body_site, cg_decl_is_per_instance, cg_decl_takes_ev}
+import cg_decl.{BodySite, cg_decl_body_site, cg_decl_has_display_dispatch, cg_decl_is_per_instance, cg_decl_takes_ev, display_method}
 import cg_derive.{cg_derive_range_debug_fn, cg_derive_range_clone_fn}
 import cg_trace.{cg_trace_body_traced, cg_trace_builtin_effect, cg_trace_is_mut_self_call, cg_trace_note_mut_self_call, cg_trace_state}
 import diagnostics.{
@@ -101,7 +101,6 @@ import diagnostics.{
 // a trait carries a declaration id.
 let trait_display = "Display"
 let method_display = "display"
-let method_fmt = "fmt"
 let trait_eq = "Eq"
 let trait_ord = "Ord"
 let method_eq = "eq"
@@ -452,7 +451,7 @@ fn cc_impl_operator_symbol(node: Int, im: Int, mname: Str, recv_tid: Int) -> Str
     }
     diag_ice_at("MonoInstanceNotRegistered", UNSOLVED_TYPEVAR_AT_CODEGEN,
         "`{mname}` of `{tc_type_str(recv_tid)}` has no monomorphised instance here", node,
-        "the pass must register the impl method at every instance of the type it holds at")
+        "the pass registers the impl method at each instance of the type where it holds, unless the method has its own binders")
     ""
 }
 
@@ -894,7 +893,13 @@ pub fn cg_call_has_debug(node: Int, tid: Int) -> Bool ! Diag.Report {
     let k = cc_kind(tid)
     if k == TyKind.Range { return tc_instance_has_trait(tid, trait_debug) }
     if k != TyKind.Struct && k != TyKind.Enum { return false }
-    if cc_impl_for(node, tid, trait_debug) != -1 { return tc_written_impl_holds(tid, trait_debug, method_debug) }
+    let im = cc_impl_for(node, tid, trait_debug)
+    if im >= 0 {
+        // A method with its own binders has no body a type instance can name.
+        let m = cc_method_of(im, method_debug)
+        if m < 0 || has_own_binders(m) { return false }
+    }
+    if im != -1 { return tc_written_impl_holds(tid, trait_debug, method_debug) }
     tc_instance_has_trait(tid, trait_debug)
 }
 
@@ -925,29 +930,33 @@ pub fn cg_call_display_resolves(node: Int, tid: Int) -> Bool ! Diag.Report {
 
 // The same question, asked where a type with no impl is not an error, so it reports nothing.
 pub fn cg_call_has_display_impl(node: Int, tid: Int) -> Bool ! Diag.Report {
-    cc_impl_for(node, tid, trait_display) >= 0
+    let im = cc_impl_for(node, tid, trait_display)
+    im >= 0 && cc_impl_has_dispatch(im)
 }
 
 fn cc_display_impl(node: Int, tid: Int) -> Int ! Diag.Report {
     let im = cc_impl_for(node, tid, trait_display)
     if im == IMPL_REFUSED { return -1 }
-    if im >= 0 { return im }
+    if im >= 0 {
+        if cc_impl_has_dispatch(im) { return im }
+        diag_ice_stage_not_built("cg_call Display through a `fmt` with one body per instance", node)
+        return -1
+    }
     diag_ice_at("DisplayImplNotFound", UNSOLVED_TYPEVAR_AT_CODEGEN,
         "a {tk_name(cc_kind(tid))} value has no Display impl to call", node,
         "typecheck must reject a value whose type cannot be shown; this is a compiler bug")
     -1
 }
 
-// The dispatcher takes no instance in its name, and the body stage writes it beside a
-// shared `fmt` only. Over a `fmt` with one body per instance it does not exist, so a call
-// of it must stop here and not fail in the C compiler.
+// The dispatcher takes no instance in its name, and the body stage writes it only beside a
+// `fmt` with one name. Over any other `fmt` it does not exist, so every caller of
+// cc_display_call asks here first.
+fn cc_impl_has_dispatch(im: Int) -> Bool ! Diag.Report {
+    let fmt = cc_method_of(im, display_method)
+    fmt >= 0 && cg_decl_has_display_dispatch(fmt)
+}
+
 fn cc_display_call(node: Int, im: Int, value: Int) -> Int ! Diag.Report {
-    let fmt = cc_method_of(im, method_fmt)
-    if fmt < 0 { return -1 }
-    if cg_decl_is_per_instance(fmt) {
-        diag_ice_stage_not_built("cg_call Display of a generic type", node)
-        return -1
-    }
     let rec = cc_local(TYPE_STR, node)
     if cc_stopped(rec) { return -1 }
     ir_call_direct(TYPE_STR, node, rec.c_spelling, c_display_dispatch_name(im), rec.slot_form, [value])
@@ -1062,7 +1071,7 @@ fn cc_scalar_fmt(node: Int, obj: Int, kind: TyKind) -> Int ! Diag.Report {
 pub fn cc_display_or_placeholder(node: Int, tid: Int, value: Int) -> Int ! Diag.Report {
     let im = cc_impl_for(node, tid, trait_display)
     if im == IMPL_REFUSED { return -1 }
-    if im >= 0 { return cc_display_call(node, im, value) }
+    if im >= 0 && cc_impl_has_dispatch(im) { return cc_display_call(node, im, value) }
     let rec = cc_local(TYPE_STR, node)
     if cc_stopped(rec) { return -1 }
     ir_const(TYPE_STR, node, rec.c_spelling, c_str_const("<{tc_tid_name(tid)}>"))
@@ -3934,7 +3943,7 @@ fn lower_method_call(node: Int) -> Int ! Diag.Report {
         // after its receiver's declared type, and last a closure-typed struct field called as a method.
         if cc_is_sealed_display(trait_display, mname, kind) { return lower_display_call(obj) }
         if mname == method_display && cc_is_scalar_display_kind(kind) { return cc_scalar_display(node, obj, kind) }
-        if mname == "fmt" && cc_is_scalar_display_kind(kind) { return cc_scalar_fmt(node, obj, kind) }
+        if mname == display_method && cc_is_scalar_display_kind(kind) { return cc_scalar_fmt(node, obj, kind) }
         if tc_is_into_method(mname) { return cc_into_call(node, obj, recv_tid) }
         if kind == TyKind.Enum && mname == method_to_int { return cc_enum_to_int(node, obj, recv_tid) }
         let derived = cc_derived_method_symbol(recv_tid, mname)
@@ -5628,7 +5637,7 @@ fn cc_panic_shown(node: Int, plan: PanicRender) -> PanicRender ! Diag.Report {
     if k != TyKind.Struct && k != TyKind.Enum { return cc_panic_placeholder(plan) }
     let im = cc_impl_for(node, plan.tid, trait_display)
     if im == IMPL_REFUSED { return cc_panic_refused() }
-    if im < 0 { return cc_panic_placeholder(plan) }
+    if im < 0 || !cc_impl_has_dispatch(im) { return cc_panic_placeholder(plan) }
     cc_panic_on_road(plan, PanicSay.Shown, format_spec_of(TYPE_STR), im)
 }
 

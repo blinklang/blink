@@ -13,19 +13,21 @@
 
 import std.io
 import layout.{layout_reset}
-import cname.{cname_reset, c_impl_method_name}
-import cg_test_helpers.{cg_probe_compile, cg_probe_ices_named, cg_probe_ices_naming}
+import cname.{cname_reset, c_display_dispatch_name, c_impl_method_name}
+import cg_test_helpers.{cg_probe_compile, cg_probe_ices_saying}
 import cg.{CgConfig, generate}
 import cg_reg.{cg_reg_impl_methods, cg_reg_impl_of}
-import mono.{run_mono, instances, is_poly_impl, poly_impl_is_element_agnostic}
+import mono.{has_own_binders, run_mono, instances, is_poly_impl, poly_impl_is_element_agnostic}
 import parser.{node_name}
-import diagnostics.{diag_entries}
-
-// The report the body stage makes for a declaration it was sent and cannot write.
-let BODY_GAP = "cg generic impl method bodies"
+import diagnostics.{CODEGEN_STAGE_NOT_BUILT_NAME, diag_entries}
 
 fn standalone_cfg() -> CgConfig {
     CgConfig { debug_mode: 0, trace_codegen: 0, deterministic: 0, emit_only_module: "",
+        skip_modules: Map(), user_tu_mode: 0, blink_ev_extern_only: 0, archive_build_mode: 0, archive_over_std: 0, compiler_archive_modules: Map() }
+}
+
+fn traced_cfg() -> CgConfig {
+    CgConfig { debug_mode: 0, trace_codegen: 1, deterministic: 0, emit_only_module: "",
         skip_modules: Map(), user_tu_mode: 0, blink_ev_extern_only: 0, archive_build_mode: 0, archive_over_std: 0, compiler_archive_modules: Map() }
 }
 
@@ -37,15 +39,23 @@ fn probe(stem: Str, src: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Re
     program
 }
 
-// The same report, counted on the files this probe does not own. A whole-program unit
-// lowers the prelude too, so the container impls the standard library writes are
-// measured here rather than folded into the probe's own count.
-fn prelude_body_gaps(stem: Str) -> Int {
+// Every stop the probe recorded, whatever its name. A test that says nothing stops reads this,
+// so a new refusal cannot pass it by having a new name.
+fn stops() -> Int {
     let mut n = 0
     for d in diag_entries {
-        if d.severity == "ice" && d.file != "build/{stem}.bl" && d.message.contains(BODY_GAP) {
-            n = n + 1
-        }
+        if d.severity == "ice" { n = n + 1 }
+    }
+    n
+}
+
+// The same count, on the files this probe does not own. A whole-program unit lowers the
+// prelude too, so the container impls the standard library writes are measured here rather
+// than folded into the probe's own count.
+fn prelude_stops(stem: Str) -> Int {
+    let mut n = 0
+    for d in diag_entries {
+        if d.severity == "ice" && d.file != "build/{stem}.bl" { n = n + 1 }
     }
     n
 }
@@ -79,6 +89,9 @@ fn instance_symbol(mname: Str) -> Str ! IO.Print {
     assert(false)
     ""
 }
+
+// What the Display site says when it stops.
+let DISPLAY_STOP = "Display through a `fmt` with one body per instance"
 
 // A definition is written at file scope, so its line is unindented and opens a brace.
 fn definitions_of(text: Str, symbol: Str) -> Int {
@@ -115,7 +128,7 @@ fn main() {
     let im = impl_of("tally")
     assert(poly_impl_is_element_agnostic(im))
     assert(!is_poly_impl(im))
-    assert_eq(cg_probe_ices_naming(BODY_GAP), 0)
+    assert_eq(stops(), 0)
     assert_eq(definitions_of(text, method_symbol("tally")), 1)
 }
 
@@ -141,7 +154,7 @@ fn main() {
     let text = generate(program, standalone_cfg())
     assert(!poly_impl_is_element_agnostic(impl_of("pick")))
     assert(is_poly_impl(impl_of("pick")))
-    assert_eq(cg_probe_ices_naming(BODY_GAP), 0)
+    assert_eq(stops(), 0)
     assert_eq(definitions_of(text, instance_symbol("pick")), 1)
 }
 
@@ -157,7 +170,7 @@ test "the prelude's container impl methods are reported never" {
 }
 "#)
     let text = generate(program, standalone_cfg())
-    assert_eq(prelude_body_gaps(stem), 0)
+    assert_eq(prelude_stops(stem), 0)
     assert_eq(definitions_of(text, method_symbol("len")), 1)
 }
 
@@ -186,9 +199,9 @@ fn main() {
 }
 "#)
     let text = generate(program, standalone_cfg())
-    assert_eq(cg_probe_ices_naming(BODY_GAP), 0)
+    assert_eq(stops(), 0)
     assert_eq(definitions_of(text, instance_symbol("peek")), 1)
-    assert_eq(prelude_body_gaps(stem), 0)
+    assert_eq(prelude_stops(stem), 0)
 }
 
 // A generic user type is a different C struct per argument and has no spelling at all
@@ -216,7 +229,7 @@ fn main() {
     let text = generate(program, standalone_cfg())
     assert(poly_impl_is_element_agnostic(impl_of("sz")))
     assert(is_poly_impl(impl_of("sz")))
-    assert_eq(cg_probe_ices_naming(BODY_GAP), 0)
+    assert_eq(stops(), 0)
     let symbols = instance_symbols("sz")
     assert_eq(symbols.len(), 2)
     for s in symbols { assert_eq(definitions_of(text, s), 1) }
@@ -257,16 +270,15 @@ fn main() {
 }
 "#)
     let text = generate(program, standalone_cfg())
-    assert_eq(cg_probe_ices_naming(BODY_GAP), 0)
+    assert_eq(stops(), 0)
     assert_eq(instance_symbols("sz").len(), 1)
     assert_eq(instance_symbols("unreached").len(), 0)
-    assert_eq(definitions_of(text, method_symbol("unreached")), 0)
     assert(!text.contains(method_symbol("unreached")))
 }
 
 // An interpolation reaches the dispatcher beside `fmt`, by a name that takes no instance.
-// The pass registers no instance for that site yet. With no body to call, the site itself
-// must stop, because the body stage reads "no row" as "no call" and writes nothing.
+// The pass registers no instance for that site. With no body to call, the site itself must
+// stop, because the body stage reads "no row" as "no call" and writes nothing.
 test "a site that names a dispatcher with no instance stops at that site" {
     let stem = "cg_pim_display_reached"
     let program = probe(stem, #"type Box[T] {
@@ -284,9 +296,243 @@ fn main() {
 }
 "#)
     generate(program, standalone_cfg())
-    assert_eq(cg_probe_ices_named("CodegenStageNotBuilt"), 1)
-    assert_eq(cg_probe_ices_naming("Display of a generic type"), 1)
-    assert_eq(cg_probe_ices_naming(BODY_GAP), 0)
+    assert_eq(cg_probe_ices_saying(CODEGEN_STAGE_NOT_BUILT_NAME, DISPLAY_STOP), 1)
+    assert_eq(stops(), 1)
+}
+
+// The dispatcher of a `fmt` with its own type parameter does not exist either.
+test "an interpolation whose fmt takes its own type parameter stops at that site" {
+    let stem = "cg_pim_display_own_binder"
+    let program = probe(stem, #"type P {
+    v: Int
+}
+
+impl Display for P {
+    fn fmt[U](_self, sb: StringBuilder) { sb.write("p") }
+}
+
+fn main() {
+    let p = P { v: 1 }
+    assert("{p}" == "p")
+}
+"#)
+    generate(program, standalone_cfg())
+    assert_eq(cg_probe_ices_saying(CODEGEN_STAGE_NOT_BUILT_NAME, DISPLAY_STOP), 1)
+    assert_eq(stops(), 1)
+}
+
+// A message that only names a value has a placeholder for a type it cannot show, so it takes
+// that over a stop: the program is valid, and only its failure text is plainer.
+test "assert_eq and unwrap name a value by its type when its Display has no dispatcher" {
+    let stem = "cg_pim_message_placeholder"
+    let program = probe(stem, #"type W[T] {
+    v: T
+}
+
+impl[T] Display for W[T] {
+    fn fmt(_self, sb: StringBuilder) { sb.write("w") }
+}
+
+impl[T] Eq for W[T] {
+    fn eq(_self, _o: W[T]) -> Bool { true }
+}
+
+impl[T] Debug for W[T] {
+    fn debug(_self) -> Str { "w" }
+}
+
+fn f() -> Result[Int, W[Int]] { Ok(1) }
+
+fn main() {
+    assert_eq(W { v: 1 }, W { v: 1 })
+    assert_eq(f().unwrap(), 1)
+}
+"#)
+    let text = generate(program, standalone_cfg())
+    assert_eq(stops(), 0)
+    assert(text.contains("<W"))
+}
+
+// A traced build reads each value it records, with no call in the source. It has a Debug and
+// a placeholder route for a value it cannot show, so a program that runs must also trace.
+test "a traced value whose Display has no dispatcher takes the route below it" {
+    let stem = "cg_pim_trace_display"
+    let program = probe(stem, #"type W[T] {
+    v: T
+}
+
+impl[T] Display for W[T] {
+    fn fmt(_self, sb: StringBuilder) { sb.write("w") }
+}
+
+fn gw(w: W[Int]) -> Int { w.v }
+
+fn main() {
+    assert(gw(W { v: 1 }) == 1)
+}
+"#)
+    let text = generate(program, traced_cfg())
+    assert_eq(stops(), 0)
+    assert(text.contains("<W"))
+}
+
+test "a traced value whose debug takes its own type parameter takes the placeholder" {
+    let stem = "cg_pim_trace_debug_own_binder"
+    let program = probe(stem, #"type P {
+    n: Int
+}
+
+impl Debug for P {
+    fn debug[U](_self) -> Str { "p" }
+}
+
+fn f(p: P) -> Int { p.n }
+
+fn main() {
+    assert(f(P { n: 1 }) == 1)
+}
+"#)
+    let text = generate(program, traced_cfg())
+    assert_eq(stops(), 0)
+    assert(text.contains("<P"))
+}
+
+// A foreign `fmt` has one name, so an interpolation calls the dispatcher beside it, and the
+// body stage must write that dispatcher there as it does beside a Blink body. With none,
+// the program fails at link.
+test "a foreign fmt has its dispatcher written beside the wrapper" {
+    let stem = "cg_pim_foreign_fmt"
+    let program = probe(stem, #"type Foo {
+    n: Int
+}
+
+impl Display for Foo {
+    @ffi("gnu_get_libc_version") fn fmt(self, sb: StringBuilder)
+}
+
+fn main() {
+    let f = Foo { n: 1 }
+    assert("{f}" == "")
+}
+"#)
+    let text = generate(program, standalone_cfg())
+    assert_eq(stops(), 0)
+    assert_eq(definitions_of(text, c_display_dispatch_name(impl_of("fmt"))), 1)
+}
+
+// Only a call gives a type argument for a method's own binder, so a type instance alone must
+// not ask for a copy. The body here has a type no argument solves.
+test "a type instance registers no operator method with its own binder" {
+    let stem = "cg_pim_operator_own_binder_unreached"
+    let program = probe(stem, #"type Box[T] {
+    v: T
+}
+
+fn id[A](x: A) -> A { x }
+
+impl[T] Eq for Box[T] {
+    fn eq[U](_self, _o: Box[T]) -> Bool {
+        let c: Option[Box[U]] = None
+        let d = id(c)
+        d.is_none()
+    }
+}
+
+fn main() {
+    assert(Box { v: 1 }.v == 1)
+}
+"#)
+    generate(program, standalone_cfg())
+    assert_eq(stops(), 0)
+    assert_eq(instance_symbols("eq").len(), 0)
+}
+
+// The body of `eq` calls the bound's method. At an argument without the trait there is no
+// such method, so the pass must read that bound too before it asks for a copy.
+test "a type instance registers no operator method where a bound on a program trait fails" {
+    let stem = "cg_pim_operator_program_bound"
+    let program = probe(stem, #"trait Sh {
+    fn sh(self) -> Int
+}
+
+type NB {
+    x: Int
+}
+
+type B[T] {
+    v: T
+}
+
+impl[T: Sh] Eq for B[T] {
+    fn eq(self, o: B[T]) -> Bool { self.v.sh() == o.v.sh() }
+}
+
+impl[T: Sh] Clone for B[T] {
+    fn clone(self) -> B[T] { B { v: self.v } }
+}
+
+fn main() {
+    assert(B { v: NB { x: 1 } }.v.x == 1)
+}
+"#)
+    generate(program, standalone_cfg())
+    assert_eq(stops(), 0)
+    assert_eq(instance_symbols("eq").len(), 0)
+    assert_eq(instance_symbols("clone").len(), 0)
+}
+
+test "a type instance registers its operator method where the bound on a program trait holds" {
+    let stem = "cg_pim_operator_program_bound_met"
+    let program = probe(stem, #"trait Sh {
+    fn sh(self) -> Int
+}
+
+type NB {
+    x: Int
+}
+
+impl Sh for NB {
+    fn sh(self) -> Int { self.x }
+}
+
+type B[T] {
+    v: T
+}
+
+impl[T: Sh] Eq for B[T] {
+    fn eq(self, o: B[T]) -> Bool { self.v.sh() == o.v.sh() }
+}
+
+fn main() {
+    let a = B { v: NB { x: 1 } }
+    assert(a == a)
+}
+"#)
+    let text = generate(program, standalone_cfg())
+    assert_eq(stops(), 0)
+    assert_eq(definitions_of(text, instance_symbol("eq")), 1)
+}
+
+// The other side of the row above: `==` does reach it, and a binder no call solves has no
+// body to name.
+test "an operator on a generic type whose method takes its own type parameter stops at that site" {
+    let stem = "cg_pim_generic_operator_own_binder"
+    let program = probe(stem, #"type Box[T] {
+    v: T
+}
+
+impl[T] Eq for Box[T] {
+    fn eq[U](_self, _o: Box[T]) -> Bool { true }
+}
+
+fn main() {
+    let a = Box { v: 1 }
+    assert(a == a)
+}
+"#)
+    generate(program, standalone_cfg())
+    assert_eq(cg_probe_ices_saying("MonoInstanceNotRegistered", "`eq` of"), 1)
+    assert_eq(stops(), 1)
 }
 
 // The with stage names enter and exit by the name of the impl, with no instance.
@@ -309,9 +555,31 @@ fn main() {
 }
 "#)
     generate(program, standalone_cfg())
-    assert_eq(cg_probe_ices_named("CodegenStageNotBuilt"), 1)
-    assert_eq(cg_probe_ices_naming("BlockHandler method has its own type parameter"), 1)
-    assert_eq(cg_probe_ices_naming(BODY_GAP), 0)
+    assert_eq(cg_probe_ices_saying(CODEGEN_STAGE_NOT_BUILT_NAME, "BlockHandler method has its own type parameter"), 1)
+    assert_eq(stops(), 1)
+}
+
+test "a with-item whose exit takes its own type parameter stops at that site" {
+    let stem = "cg_pim_handler_exit_own_binder"
+    let program = probe(stem, #"type P {
+    v: Int
+}
+
+impl BlockHandler for P {
+    type Context = Int
+    fn enter(self) -> Int { self.v }
+    fn exit[U](_self, _ok: Bool) { }
+}
+
+fn main() {
+    with P { v: 1 } as b {
+        assert(b == 1)
+    }
+}
+"#)
+    generate(program, standalone_cfg())
+    assert_eq(cg_probe_ices_saying(CODEGEN_STAGE_NOT_BUILT_NAME, "BlockHandler method has its own type parameter"), 1)
+    assert_eq(stops(), 1)
 }
 
 // An operator reaches its method through the symbol of the impl, which a per-instance body
@@ -332,6 +600,42 @@ fn main() {
 }
 "#)
     generate(program, standalone_cfg())
-    assert_eq(cg_probe_ices_named("MonoInstanceNotRegistered"), 1)
-    assert_eq(cg_probe_ices_naming(BODY_GAP), 0)
+    assert_eq(cg_probe_ices_saying("MonoInstanceNotRegistered", "`eq` of"), 1)
+    assert_eq(stops(), 1)
+}
+
+// The impl's binder is not the method's own: it has an argument at each instance of the type.
+test "a method has its own binders only where it declares them" {
+    let stem = "cg_pim_own_binders"
+    let program = probe(stem, #"type Box[T] {
+    v: T
+}
+
+trait Tr {
+    fn plain(self) -> Int
+    fn own[U](self, u: U) -> Int
+}
+
+impl[T] Tr for Box[T] {
+    fn plain(_self) -> Int { 1 }
+    fn own[U](_self, _u: U) -> Int { 2 }
+}
+
+fn main() {
+    assert(Box { v: 1 }.v == 1)
+}
+"#)
+    generate(program, standalone_cfg())
+    let mut seen = 0
+    for m in cg_reg_impl_methods() {
+        if node_name(m) == "plain" {
+            assert(!has_own_binders(m))
+            seen = seen + 1
+        }
+        if node_name(m) == "own" {
+            assert(has_own_binders(m))
+            seen = seen + 1
+        }
+    }
+    assert_eq(seen, 2)
 }

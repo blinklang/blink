@@ -12,7 +12,9 @@ Single source of truth for release history. `blink llms` and `blink llms --full`
 
 ## Fixes (v0.61.0)
 
-- **A generic impl that no call reaches no longer stops the build.** `impl[T] Tr for W[T] { fn n(_self) -> Int { 1 } }` with no call to `n` passed `blink check`, then `blink build` gave the internal error CodegenStageNotBuilt. The same applies to an impl for `List[T]`, to a method with its own type parameter, and to `@derive` on a generic type. A call to such a method still gets the body of its own instance.
+- **A generic impl that no call reaches no longer stops the build.** `impl[T] Tr for W[T] { fn n(_self) -> Int { 1 } }` with no call to `n` passed `blink check`, then `blink build` gave the internal error CodegenStageNotBuilt. The same applies to an impl for `List[T]` and to a method with its own type parameter. A call to such a method gets the body of its own instance, except an own type parameter on a List[T] impl (still an internal error).
+- **`==` and the other operators read a written impl's bound on any trait.** With `impl[T: Sh] Eq for B[T]`, `a == a` on a `B[NB]` where `NB` has no `Sh` is now a TypeError that says to write `impl Sh for NB`. Before, it was an internal error. The same applies to `Ord`, to `Clone`, and to a bound on `Display`.
+- **`assert_eq`, `unwrap` and `--trace` do not stop on a value with a generic `Display`.** A failure message and a trace record now show such a value as `<W>`, or by its `Debug` in a trace. `"{w}"` on such a value is still an internal error. A `@ffi` `fmt` now links.
 
 ## Breaking Changes (v0.60.0)
 
