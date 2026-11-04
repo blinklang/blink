@@ -3294,10 +3294,11 @@ fn tc_report_unsourced_binders(sig: Int, call_node: Int, self_offset: Int) ! Dia
 }
 
 // Record an unbracketed generic call's own binder tids for tc_ud_flush_calls. Group
-// layout in tc_calls.open_tids: [sig, self_offset, n, tid..., open...], -1 for a slot with
-// no bind, and open 1 for a tid still open and not yet refused here. A binder the callee uses as a key is judged
-// for Hash in the flush when it was open here: the use that solves it can come later, and a
-// closed one was judged at the call. A keyed construction records a group too (see
+// layout in tc_calls.open_tids: [sig, self_offset, n, tid..., open..., enclosing fn], -1 for a
+// slot with no bind. In open, 1 marks a key binder still open and not yet refused here, and 2
+// a binder still open. The flush judges a binder that was open here for Hash when the callee
+// uses it as a key, and for its bounds: the use that solves it can come later, and a closed
+// one was judged at the call. A keyed construction records a group too (see
 // tc_note_open_ctor_key).
 fn tc_note_generic_call(sig: Int, call_node: Int, self_offset: Int, binds: Map[Str, Int]) {
     if tc_boundary_check_active == 0 || call_node < 0 { return }
@@ -3339,10 +3340,15 @@ fn tc_note_generic_call(sig: Int, call_node: Int, self_offset: Int, binds: Map[S
     let mut oi = 0
     while oi < fs.type_params_count {
         let tid = tc_calls.open_tids.get(first + oi).unwrap()
-        let open = keyed && tid >= 0 && tc_tid_has_unbound_metavar(tid) != 0 && tc_tid_hash_fact(tid) != -1
-        tc_calls.open_tids.push(if open { 1 } else { 0 })
+        let unbound = tid >= 0 && tc_tid_has_unbound_metavar(tid) != 0
+        let hash_open = keyed && unbound && tc_tid_hash_fact(tid) != -1
+        // The first walk's expected type can fill the binder before this walk records it, and
+        // no walk judged its bounds while it was open.
+        let was_open = prev >= 0 && tc_calls.open_tids.get(prev).unwrap() == sig && tc_calls.open_tids.get(prev + 3 + fs.type_params_count + oi).unwrap() >= 2
+        tc_calls.open_tids.push((if hash_open { 1 } else { 0 }) + (if unbound || was_open { 2 } else { 0 }))
         oi = oi + 1
     }
+    tc_calls.open_tids.push(tc_current_fn_node)
 }
 
 // A call that converts through an impl with binders, as the group [-1, im, n, tid...]: one
@@ -3532,7 +3538,7 @@ fn tc_flush_open_keys_of(call_node: Int, g: Int) ! Diag.Report {
         let role = tc_hash_oblig_mark(oblig, pi)
         let tid = tc_calls.open_tids.get(g + 3 + pi).unwrap()
         let was_open = tc_calls.open_tids.get(g + 3 + n + pi).unwrap()
-        if role != HashRole.Free && was_open != 0 && tc_tid_hash_fact(tid) == -1 {
+        if role != HashRole.Free && was_open % 2 != 0 && tc_tid_hash_fact(tid) == -1 {
             tc_report_unhashable_bind(sig, fnsig_type_param_names.get(fs.type_params_start + pi).unwrap(), role, tid, call_node)
         }
         pi = pi + 1
@@ -3676,7 +3682,7 @@ fn tc_conversion_side_judgeable(t: Int) -> Bool {
 
 // Report the recorded calls a binder of which is still unbound once inference is done
 // and no binding or scrutinee has already answered for it.
-fn tc_ud_flush_calls() ! Diag.Report {
+fn tc_ud_flush_calls() ! TypeCheck.Resolve, Diag.Report {
     let mut ci = 0
     while ci < tc_calls.open_calls.len() {
         let call_node = tc_calls.open_calls.get(ci).unwrap()
@@ -3705,7 +3711,10 @@ fn tc_ud_flush_calls() ! Diag.Report {
             }
             pi = pi + 1
         }
-        if names.len() == 0 { continue }
+        if names.len() == 0 {
+            tc_check_open_call_bounds(call_node, g)
+            continue
+        }
         tc_calls.reported.insert(call_node, 1)
         let callee = node_name(fs.decl)
         let mut msg = "type parameter {tc_ticked_names(names)} of `{callee}` is unbound at this call and nothing supplies it"
@@ -3719,6 +3728,45 @@ fn tc_ud_flush_calls() ! Diag.Report {
             ti = ti + 1
         }
     }
+}
+
+// The bounds of each binder that was open at the call, at the type inference gave it: an
+// annotation or a later use can fill a binder no argument reaches, and its bounds hold there as
+// at a type the call writes (E0306). An error already on the call's lines is the first report,
+// such as an unhashable key the flush found or a bound judged at the call.
+fn tc_check_open_call_bounds(call_node: Int, g: Int) ! TypeCheck.Resolve, Diag.Report {
+    let sig = tc_calls.open_tids.get(g).unwrap()
+    let n = tc_calls.open_tids.get(g + 2).unwrap()
+    let fs = fnsig_pool.get(sig).unwrap()
+    let mut any_open = false
+    let mut pi = 0
+    while pi < n {
+        if tc_calls.open_tids.get(g + 3 + n + pi).unwrap() >= 2 { any_open = true }
+        pi = pi + 1
+    }
+    if !any_open { return }
+    let end_line = if node_end_line(call_node) > node_line(call_node) { node_end_line(call_node) } else { node_line(call_node) }
+    if diag_errors_in_lines(diag_file_for_node(call_node), node_line(call_node), end_line) > 0 { return }
+    let enclosing = tc_calls.open_tids.get(g + 3 + 2 * n).unwrap()
+    let mut binds: Map[Str, Int] = Map()
+    pi = 0
+    while pi < n {
+        let raw = tc_calls.open_tids.get(g + 3 + pi).unwrap()
+        let idx = fs.type_params_start + pi
+        let open = tc_calls.open_tids.get(g + 3 + n + pi).unwrap() >= 2
+        let tid = if raw >= 0 { tc_resolve(raw) } else { -1 }
+        if tid < 0 {
+            pi = pi + 1
+            continue
+        }
+        if tc_tid_kind(tid) == TyKind.Typevar {
+            if open { tc_check_typevar_meets_bounds(tid, fnsig_tparam_nodes.get(idx) ?? NO_BINDER_NODE, enclosing, call_node) }
+        } else if tc_tid_is_judgeable(tid) != 0 {
+            binds.insert(fnsig_type_param_names.get(idx).unwrap(), tid)
+        }
+        pi = pi + 1
+    }
+    tc_check_bounds_for_binds(sig, binds, call_node)
 }
 
 // Report each recorded variant construction whose type is still open once inference is
@@ -5961,7 +6009,9 @@ fn tc_formal_reaches_closure(formal: Int) -> Int {
 // fix only the name and leave resolve_ctor_kops_elem on its string default —
 // blink_kops_str for an Int key, trading a loud ICE for a silent hash collision.
 //
-// tc_pin_admits_declared is the gate; each branch is load-bearing:
+// tc_pin_admits_declared is the gate for a value with structure to fill slot by slot;
+// tc_pin_open_value_takes_declared admits a value whose whole type is open. In the first,
+// each branch is load-bearing:
 //   TyKind.Map/TyKind.Set/     — the kinds whose params_count is never set
 //   TyKind.Option/TyKind.Result   (make_*_type store inner1/inner2, not a
 //                        ty_param_list), so they must admit unconditionally rather
@@ -5975,7 +6025,7 @@ fn tc_formal_reaches_closure(formal: Int) -> Int {
 //   TyKind.Tuple       — each slot is an expected type for the value in it, so
 //                        `let t: (Map[Str, Str], Int) = pair(Map(), 1)` pins pair's A.
 //   TyKind.Struct/TyKind.Enum  — excludes Handler returns.
-//   params_count > 0   — a monomorphic struct has nothing to pin.
+//   params_count > 0   — a struct with no parameters has no slot to fill.
 // The caller additionally requires an unbound metavar in the inferred value, which
 // excludes a bare TyKind.Typevar, so a generic fn's `-> Box[T]` keeps its existing
 // per-T monomorphization untouched.
@@ -6012,9 +6062,21 @@ fn tc_pin_admits_declared(d: Int) -> Int {
     1
 }
 
+// A value whose whole type is still open, as `zero()` is for `fn zero[T]() -> T`, has no
+// structure for the declared type to fill slot by slot, so the declared type is its type
+// whatever its kind: a scalar, a struct with no parameters, or a type parameter of the
+// enclosing declaration (sections/03_types.md 3.4 *Under-Determined Types*). A Handler stays
+// out, as in tc_pin_admits_declared.
+fn tc_pin_open_value_takes_declared(d: Int, inferred: Int) -> Int {
+    if tc_tid_is_no_info(d) != 0 { return 0 }
+    if tc_is_unbound_metavar(tc_resolve(inferred)) == 0 { return 0 }
+    if ty_pool.get(d).unwrap().kind == TyKind.Handler { return 0 }
+    1
+}
+
 fn tc_pin_tail_ret_generic(declared_ret: Int, inferred_ret: Int) {
     let d = resolve_alias_tid(declared_ret)
-    if tc_pin_admits_declared(d) == 0 { return }
+    if tc_pin_admits_declared(d) == 0 && tc_pin_open_value_takes_declared(d, inferred_ret) == 0 { return }
     if tc_tid_has_unbound_metavar(inferred_ret) == 0 { return }
     // Every pin mutates ty_pool IN PLACE, so adding a caller can change emitted C for
     // programs that have nothing to do with the new seam. `retpin` makes that blast
@@ -6062,7 +6124,10 @@ fn tc_arm_tail_value_node(body: Int) -> Int {
 // field, a `Some`/`Ok`/`Err` payload, a list element, a tuple slot and a `?`/`??` operand all
 // pin through here, so a position cannot fill a binder another position leaves open.
 fn tc_pin_declared_into_value(declared_tid: Int, val: Int, val_tid: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
-    tc_pin_tail_ret_generic(declared_tid, val_tid)
+    // The operand of `?` is a carrier, so a declared type is no expected type for a wholly
+    // open one: only the carrier arm below may pin into it.
+    let is_try = node_kind(val) == NodeKind.UnaryOp && node_op(val) == "?"
+    if !is_try || tc_pin_admits_declared(resolve_alias_tid(declared_tid)) != 0 { tc_pin_tail_ret_generic(declared_tid, val_tid) }
     let parts = tc_expected_parts(val, declared_tid)
     if parts.len() > 0 {
         for p in parts {
@@ -36263,10 +36328,9 @@ fn tc_check_assignment(node: Int, block: Int, at: Int) ! TypeCheck.Resolve, Type
                 // captured binding pins that binding's own declared type
                 // regardless.
                 //
-                // Assignment only, never CompoundAssign: no compound operator is
-                // defined over any kind tc_pin_admits_declared admits (Map, Set,
-                // generic struct/enum), so the branch would be dead. Excluded on
-                // purpose rather than by accident.
+                // Assignment only, never CompoundAssign: the value of `n += v` is an
+                // operand of the operator, not an expected-type site (sections/03_types.md
+                // 3.3), so only a literal takes the target's type.
                 //
                 // The same walker as the LetBinding arm, so a block or a branch
                 // around the value does not change what the target fills

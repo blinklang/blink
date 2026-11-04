@@ -1,0 +1,164 @@
+import compile_test_helpers
+
+// A type parameter that only the return names takes the expected type at the call
+// (sections/03_types.md 3.4 *Under-Determined Types*: the repair for a binding is a type
+// annotation). A scalar and a struct with no parameters are expected types as much as a
+// generic head is, at a let, a return, an assignment and an argument alike.
+
+type Plain {
+    a: Int
+}
+
+type Shade { Light, Dark }
+
+fn zero[T]() -> T {
+    panic("zero ran")
+}
+
+fn zero_after[U](n: Int) -> U {
+    panic("zero_after ran {n}")
+}
+
+fn via[A](f: fn() -> A) -> A {
+    f()
+}
+
+fn tail_str() -> Str {
+    zero()
+}
+
+fn return_str() -> Str {
+    return zero()
+}
+
+fn tail_plain() -> Plain {
+    zero()
+}
+
+fn branch_int(b: Bool) -> Int {
+    if b { zero() } else { 1 }
+}
+
+fn len_of(s: Str) -> Int {
+    s.len()
+}
+
+fn open_in_own[T]() -> T {
+    zero()
+}
+
+test "a let annotation fixes the return-only parameter at a scalar" {
+    assert_panics(matching: "zero ran") {
+        let s: Str = zero()
+        assert_eq(s.len(), 0)
+    }
+    assert_panics(matching: "zero ran") {
+        let b: Bool = zero()
+        assert(b)
+    }
+    assert_panics(matching: "zero ran") {
+        let f: Float = zero()
+        assert(f > 0.0)
+    }
+    assert_panics(matching: "zero_after ran 1") {
+        let w: Int = zero_after(1)
+        assert_eq(w, 0)
+    }
+}
+
+test "a let annotation fixes the return-only parameter at a type with no parameters" {
+    assert_panics(matching: "zero ran") {
+        let p: Plain = zero()
+        assert_eq(p.a, 0)
+    }
+    assert_panics(matching: "zero ran") {
+        let c: Shade = zero()
+        assert(c == Shade.Light)
+    }
+}
+
+test "a declared return fixes the return-only parameter" {
+    assert_panics(matching: "zero ran") {
+        assert_eq(tail_str(), "")
+    }
+    assert_panics(matching: "zero ran") {
+        assert_eq(return_str(), "")
+    }
+    assert_panics(matching: "zero ran") {
+        assert_eq(tail_plain().a, 0)
+    }
+    assert_panics(matching: "zero ran") {
+        assert_eq(branch_int(true), 0)
+    }
+    assert_eq(branch_int(false), 1)
+}
+
+test "an assignment target fixes the return-only parameter" {
+    assert_panics(matching: "zero ran") {
+        let mut t: Str = "x"
+        t = zero()
+        assert_eq(t, "")
+    }
+}
+
+test "an argument and a field still fix the return-only parameter" {
+    assert_panics(matching: "zero ran") {
+        assert_eq(len_of(zero()), 0)
+    }
+    assert_panics(matching: "zero ran") {
+        let p = Plain { a: zero() }
+        assert_eq(p.a, 0)
+    }
+    let a: Int = via(fn() -> Int { 3 })
+    assert_eq(a, 3)
+}
+
+test "a parameter of the enclosing generic fixes the return-only parameter" {
+    assert_panics(matching: "zero ran") {
+        let s: Str = open_in_own()
+        assert_eq(s, "")
+    }
+}
+
+// The operand of `?` is a Result or an Option, and the annotation names neither, so it is no
+// expected type for the call: the parameter stays open, as an unannotated `let` leaves it.
+test "an annotation over a try leaves the return-only parameter open" {
+    let src = "fn zero[T]() -> T \{ panic(\"zero ran\") }\nfn h() -> Result[Int, Str] \{\n let x: Int = zero()?\n Ok(x) }\nfn main() \{ let _ = h() }\n"
+    let out = compile_test_helpers.compile_and_capture(src, "annotation_over_try_stays_open")
+    assert(out.contains("E0301"))
+    assert(!out.contains("internal compiler error"))
+}
+
+// A bound holds at the type the annotation gives, as at a type the call writes or an argument
+// gives (sections/03_types.md, E0306).
+const TAGGED = "trait Tag \{ fn tag(self) -> Int }\ntype Foo \{ n: Int }\ntype Bar \{ n: Int }\nimpl Tag for Foo \{ fn tag(self) -> Int \{ self.n } }\n"
+
+fn expect_unmet_bound(src: Str, tag: Str) ! FS.Delete, FS.Write, Process.Spawn, FS.Read, Env.Read {
+    let out = compile_test_helpers.compile_and_capture(src, tag)
+    assert(out.contains("E0306"))
+    assert(out.contains("`Bar` does not satisfy the Tag bound"))
+    assert(!out.contains("internal compiler error"))
+}
+
+test "an annotation that fixes a return-only parameter meets its bound" {
+    let src = "{TAGGED}fn one[X: Tag]() -> X \{ panic(\"x\") }\nfn main() \{ let b: Bar = one()\n io.println(\"\{b.n}\") }\n"
+    expect_unmet_bound(src, "annotation_bound_scalar_slot")
+}
+
+test "an annotation that fixes a parameter inside a generic head meets its bound" {
+    let src = "{TAGGED}fn none[X: Tag]() -> List[X] \{ [] }\nfn main() \{ let b: List[Bar] = none()\n io.println(\"\{b.len()}\") }\n"
+    expect_unmet_bound(src, "annotation_bound_list_slot")
+}
+
+test "an annotation of a type that meets the bound compiles" {
+    let src = "{TAGGED}fn none[X: Tag]() -> List[X] \{ [] }\nfn main() \{ let f: List[Foo] = none()\n io.println(\"\{f.len()}\") }\n"
+    compile_test_helpers.expect_no_error(src, "annotation_bound_met", "E0306")
+}
+
+test "a return type of the enclosing generic fn must state the bound it fixes" {
+    let src = "{TAGGED}fn one[X: Tag]() -> X \{ panic(\"x\") }\nfn pass[T]() -> T \{ one() }\nfn main() \{ let f: Foo = pass()\n io.println(\"\{f.n}\") }\n"
+    let out = compile_test_helpers.compile_and_capture(src, "annotation_bound_typevar")
+    assert(out.contains("E0306"))
+    assert(out.contains("`T` does not satisfy the Tag bound"))
+    assert(!out.contains("internal compiler error"))
+}
