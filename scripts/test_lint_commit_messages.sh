@@ -84,6 +84,28 @@ else
     echo "PASS no-br-says-so"
 fi
 
+# br prints ids as `br-<id>`; the ids it lists must still count, bare or prefixed.
+fake_br="$WORK/fake_br"
+cat > "$fake_br" <<'EOF2'
+#!/bin/sh
+case "$1" in
+list) printf '[ ] br-q7tzp2  P2  a ticket\n' ;;
+project) printf 'br-m4n8x1  a-project  (1/1)  done\n' ;;
+esac
+EOF2
+chmod +x "$fake_br"
+lint_fake_br() {
+    (cd "$R" && COMMIT_MSG_BR="$fake_br" ./scripts/lint_commit_messages.sh) > "$WORK/out.log" 2>&1
+}
+(cd "$R" && git checkout -q -b prefixed_ticket main)
+commit "Close the gap in q7tzp2"
+lint_fake_br
+expect "prefixed-br-bare-ticket" 1 $? 'q7tzp2'
+(cd "$R" && git checkout -q -b prefixed_project main)
+commit "Close the gap in br-m4n8x1"
+lint_fake_br
+expect "prefixed-br-prefixed-project" 1 $? 'm4n8x1'
+
 if [ "$fail" -ne 0 ]; then
     echo "test_lint_commit_messages: FAILED"
     exit 1

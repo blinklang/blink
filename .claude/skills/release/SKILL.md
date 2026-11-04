@@ -114,7 +114,7 @@ Stage all changes and commit with: `Prepare vX.Y.Z release`
 
 ## Step 8b: Scan for br IDs
 
-br is local-only, so a ticket ID in pushed text means nothing to a reader. Before the push, collect every ID (`br list --all --json`) and `rg -wf` them against the commit messages, the added lines and the added file names in `origin/main..HEAD`. Fix new hits in docs and changelog text. Report hits in `decisions/` and in existing test names to the user; never rename tests.
+br is local-only, so a ticket ID in pushed text means nothing to a reader. Before the push, collect every ID (`scripts/br_ids.sh list`, bare IDs of tickets and projects) and `rg -wf` them against the commit messages, the added lines and the added file names in `origin/main..HEAD`. Fix new hits in docs and changelog text. Report hits in `decisions/` and in existing test names to the user; never rename tests.
 
 ## Step 9: Push
 

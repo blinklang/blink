@@ -155,6 +155,28 @@ if [ "$(env -u BR_IDS_FILE BR_IDS_BR="$fake_br" ./scripts/br_ids.sh list | tr '\
 else
     echo "FAIL br_ids.sh list did not give both the ticket and the project id"; fail=1
 fi
+# br may print ids as `br-<id>`; the gates still match the bare id.
+fake_br_pre="$WORK/fake_br_prefixed"
+cat > "$fake_br_pre" <<'EOF2'
+#!/bin/sh
+case "$1" in
+list) echo '[{"id": "br-q7tzp2", "title": "a ticket"}, {"id":"br-m4n8x1"}]' ;;
+project) printf 'br-jkwqzv  a-project  (1/1)  done\n' ;;
+esac
+EOF2
+chmod +x "$fake_br_pre"
+if [ "$(env -u BR_IDS_FILE BR_IDS_BR="$fake_br_pre" ./scripts/br_ids.sh list | tr '\n' ' ')" = "jkwqzv m4n8x1 q7tzp2 " ]; then
+    echo "ok   br_ids.sh list strips the br- prefix from ticket and project ids"
+else
+    echo "FAIL br_ids.sh list did not give bare ids from prefixed br output"; fail=1
+fi
+printf '// tracked as br-q7tzp2\n' > "$WORK/prefixed_token.txt"
+printf 'q7tzp2\n' > "$WORK/prefixed_ids.txt"
+if ./scripts/br_ids.sh scan "$WORK/prefixed_ids.txt" "$WORK/prefixed_token.txt" | grep -q ':q7tzp2$'; then
+    echo "ok   br_ids.sh scan finds a br- prefixed id"
+else
+    echo "FAIL br_ids.sh scan missed a br- prefixed id"; fail=1
+fi
 : > "$WORK/empty_ids.txt"
 if BR_IDS_FILE="$WORK/empty_ids.txt" ./scripts/br_ids.sh list > /dev/null 2>&1; then
     echo "FAIL br_ids.sh list took an empty BR_IDS_FILE as a list"; fail=1

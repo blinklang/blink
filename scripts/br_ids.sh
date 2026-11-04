@@ -4,6 +4,8 @@
 # rows that hold source to zero ids (ratchet.sh br_ids_in_source and
 # lint_codegen.sh L10) read through this script.
 #
+# br may print an id as `br-<id>`; `list` always gives the bare id.
+#
 # An id is six [0-9a-z] with no fixed shape: some are all letters, some are
 # hex, and most such tokens in source are plain words. So a token counts only
 # when it is an id br knows, a ticket's or a project's. A token is bounded by
@@ -28,9 +30,9 @@ list)
     fi
     br="${BR_IDS_BR:-br}"
     command -v "$br" > /dev/null 2>&1 || { echo "br_ids: $br is not on PATH" >&2; exit 1; }
-    tickets=$("$br" list --all --json 2>/dev/null | grep -oP '"id":\s*"\K[0-9a-z]{6}(?=")')
+    tickets=$("$br" list --all --json 2>/dev/null | grep -oP '"id":\s*"(?:br-)?\K[0-9a-z]{6}(?=")')
     [ -n "$tickets" ] || { echo "br_ids: $br list --all --json gave no ids" >&2; exit 1; }
-    projects=$("$br" project ls 2>/dev/null | grep -oP '^[0-9a-z]{6}(?=\s)')
+    projects=$("$br" project ls 2>/dev/null | grep -oP '^(?:br-)?\K[0-9a-z]{6}(?=\s)')
     ids=$(printf '%s\n%s\n' "$tickets" "$projects" | grep . | sort -u)
     printf '%s\n' "$ids"
     ;;

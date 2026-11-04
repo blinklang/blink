@@ -44,8 +44,8 @@ if [ -n "${COMMIT_MSG_IDS:-}" ]; then
     sort -u "$COMMIT_MSG_IDS" > "$ids"
 elif command -v "$br_cmd" >/dev/null 2>&1; then
     {
-        "$br_cmd" list --all 2>/dev/null | grep -oP '^\[.\]\s+\K[0-9a-z]{6}(?=\s)'
-        "$br_cmd" project ls 2>/dev/null | grep -oP '^[0-9a-z]{6}(?=\s)'
+        "$br_cmd" list --all 2>/dev/null | grep -oP '^\[.\]\s+(?:br-)?\K[0-9a-z]{6}(?=\s)'
+        "$br_cmd" project ls 2>/dev/null | grep -oP '^(?:br-)?\K[0-9a-z]{6}(?=\s)'
     } | sort -u > "$ids"
     if [ ! -s "$ids" ]; then
         echo "lint_commit_messages: '$br_cmd' listed no ids; checking the br-free forms only" >&2
