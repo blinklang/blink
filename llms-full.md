@@ -1603,7 +1603,7 @@ build/blink run src/main.bl       # compile + run
 build/blink test                    # discover + run all test blocks
 # `blink test` makes the test build. No other command makes one, so every other build,
 # with any option, leaves out `test` blocks. Every build still typechecks each test body.
-build/blink check src/main.bl     # typecheck without compiling
+build/blink check src/main.bl     # no binary; a clean check promises the build (exit 0, 1, or 101 = compiler bug)
 build/blink fix src/main.bl       # apply the machine-applicable fixes of its diagnostics
 build/blink fmt src/main.bl       # format in place
 build/blink doc --list              # list available stdlib modules
@@ -1629,6 +1629,9 @@ build/blink check src/main.bl --format json
 # A file the front end accepts can fail a later step; it then has one diagnostic for the step:
 # I0017 the generated C did not compile (ice), E0857 the link failed, E0858 a native dependency
 # did not build. Its notes hold the tool's output (cut at 200 lines, the last note says so).
+# blink build and blink run give the same diagnostics; I0017 and other I-codes exit 101, the others exit 1.
+# E0859 a header that an @ffi declaration names is not on the host: the build tests each header
+# before the unit compile, at the @ffi line, exit 1. blink check reads no header.
 # I0018: a test build failed and printed no diagnostic. I0021 CompilerPanic: a panic in blink or blinkc (exit 101).
 build/blink test --json
 # Human output: dots, then BUILD FAILED <file> and its diagnostics, ABORTED <file> and how it

@@ -449,7 +449,7 @@ The self-hosting compiler (`src/codegen_types.bl`, `src/codegen_expr.bl`) curren
 | E0509 | QuestionMarkOptionInNonOption | `codegen_expr.bl` — `?` on Option in non-Option function |
 | E0512 | QuestionMarkErrorMismatch | Not yet implemented — requires type checker |
 | E0504 | UndefinedFunction | `typecheck.bl` — name resolution + `codegen_expr.bl` — codegen |
-| E0505 | UnresolvedMethod | `typecheck.bl` — unresolved method on any receiver: struct/enum, the builtin scalars/containers, a type parameter, and a receiver of unknown type (primary) + `codegen_methods.bl` — method dispatch (backstop: an ICE, I0022) |
+| E0505 | UnresolvedMethod | `typecheck.bl` — unresolved method on any receiver: struct/enum, the builtin scalars/containers, a type parameter, and a receiver of unknown type (primary) + `cg_call.bl` — method dispatch (backstop: an ICE, I0022) |
 | E0506 | UndefinedVariable | `typecheck.bl` — name resolution |
 | E0507 | UnknownType | `typecheck.bl` — name resolution |
 | E0547 | NoSuchVariant | `typecheck.bl` — `tc_pattern_fault`, from the pattern walk `tc_check_pattern_types` at every depth (match arms, nested matches, for-in), including a bare uppercase name with no payload in a match arm, and the qualified construction sites (`K.Zed`, `K.Zed(..)`, `K.Zed {..}`) via `tc_report_bad_variant_value`, also when `K` is a type that is not an enum. Codegen `UnknownVariant` stays as an internal-error backstop |
