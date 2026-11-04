@@ -42,6 +42,7 @@ pub const INT_LITERAL_OUT_OF_RANGE = "E0318"
 pub const PATTERN_MISSING_REST    = "E0319"
 pub const MIXED_VARIANT_FIELDS    = "E0320"
 pub const RANGE_BOUND_NOT_CONST   = "E0323"
+pub const INSTANTIATION_CYCLE     = "E0324"
 
 // E0500+ — effects, capabilities, ?-propagation
 pub const UNDECLARED_EFFECT       = "E0500"
@@ -488,6 +489,19 @@ pub type DiagFixEdit {
     text: Str
 }
 
+// One use of a generic declaration in the chain of an instance error: the parameter of the
+// declaration, what it becomes, and where.
+pub type DiagEdge {
+    decl: Str
+    param: Str
+    becomes: Str
+    file: Str
+    line: Int
+    col: Int
+    end_line: Int
+    end_col: Int
+}
+
 pub type DiagEntry {
     severity: Str
     name: Str
@@ -511,6 +525,8 @@ pub type DiagEntry {
     // needs. Only a fix with its own span has them.
     fix_more: List[DiagFixEdit] = []
     notes: List[Str]
+    // The chain of an instance error (§3.4), for the `--json` form.
+    edges: List[DiagEdge] = []
     // A repair a person applies by hand, such as fields to fill in: it inserts text at one
     // point. The language server offers it under a kind that "fix all" never applies, and
     // `blink fix` ignores it, because the text it leaves is not yet a program.
@@ -1120,6 +1136,14 @@ pub fn diag_error_span_label_at_notes(name: Str, code: Str, message: Str, node_i
     diag_label_last_since(before, label)
 }
 
+// Sets the edge list of the newest entry, under the rule diag_label_last_since gives.
+pub fn diag_set_edges_since(before: Int, edges: List[DiagEdge]) ! Diag.Report {
+    if diag_entries.len() <= before { return }
+    let idx = diag_entries.len() - 1
+    let d = diag_entries.get(idx).unwrap()
+    diag_entries.set(idx, DiagEntry { edges: edges, ..d })
+}
+
 // Adds a labeled span to the newest entry, under the rule diag_label_last_since gives.
 pub fn diag_add_label_since(before: Int, line: Int, col: Int, end_col: Int, label: Str) ! Diag.Report {
     if diag_entries.len() <= before { return }
@@ -1437,6 +1461,11 @@ pub fn diag_entry_text(idx: Int, format: Int) -> Str {
     if format == 1 { diag_json_line(idx) } else { diag_human_text(idx) }
 }
 
+fn diag_edge_json(e: DiagEdge) -> Str {
+    let span = "\{\"file\":\"{json_escape(e.file)}\",\"line\":{e.line},\"col\":{e.col},\"end_line\":{e.end_line},\"end_col\":{e.end_col}}"
+    "\{\"decl\":\"{json_escape(e.decl)}\",\"param\":\"{json_escape(e.param)}\",\"becomes\":\"{json_escape(e.becomes)}\",\"span\":{span}}"
+}
+
 fn diag_json_line(idx: Int) -> Str {
     let d = diag_entries.get(idx).unwrap()
     let sev = json_escape(d.severity)
@@ -1476,6 +1505,16 @@ fn diag_json_line(idx: Int) -> Str {
             if ni > 0 { json = json.concat(",") }
             json = json.concat("\"").concat(json_escape(d.notes.get(ni).unwrap())).concat("\"")
             ni = ni + 1
+        }
+        json = json.concat("]")
+    }
+    if d.edges.len() > 0 {
+        json = json.concat(",\"edges\":[")
+        let mut ei = 0
+        while ei < d.edges.len() {
+            if ei > 0 { json = json.concat(",") }
+            json = json.concat(diag_edge_json(d.edges.get(ei).unwrap()))
+            ei = ei + 1
         }
         json = json.concat("]")
     }
@@ -2126,6 +2165,9 @@ pub fn diag_explain(code: Str) -> Str {
     }
     if code == EMPTY_ROW_OUTSIDE_FFI {
         return "E0564 -- EmptyRowOutsideFfi\n\n`! ()` is the empty effect row written out. It means no effects, the\nsame as no row. It is legal only on an `@ffi` decl, where a row is a\nclaim the author must write. On any other function, fn type or trait\nmethod signature the compiler proves purity, so no row already means\nno effects.\n\n  fn add(a: Int, b: Int) -> Int ! () \{   // E0564\n      a + b\n  \}\n\nFix: remove `! ()`.\n\n  fn add(a: Int, b: Int) -> Int \{\n      a + b\n  \}"
+    }
+    if code == INSTANTIATION_CYCLE {
+        return "E0324 -- InstantiationCycle\n\nA generic fn, method or type needs a copy of itself at a larger type\nargument. That copy needs a still larger one, and the copies have no\nend. The compiler reads the declarations, not the values, so `n == 0`\ndoes not end the chain, and it is an error even if no code uses the\ndeclaration:\n\n    fn r[T](x: T, n: Int) -> Int \{\n        if n == 0 \{ return 0 }\n        r[List[T]]([x], n - 1)\n    }\n\n    type P[T] \{ Leaf(v: T), Node(p: P[(T, T)]) }\n\nTake a recursive type in place of the type that grows. Its type\nargument stays the same at each level:\n\n    type Nest[T] \{ One(v: T), Many(items: List[Nest[T]]) }\n\n    fn r[T](x: Nest[T], n: Int) -> Int \{\n        if n == 0 \{ return 0 }\n        r(Nest.Many([x]), n - 1)\n    }\n\nA type that is a parameter alone does not grow, so a swap is legal:\n`swap(b, a, n - 1)` in `fn swap[A, B](a: A, b: B, n: Int)`."
     }
     if code == RANGE_BOUND_NOT_CONST {
         return "E0323 -- RangeBoundNotConst\n\nA range-pattern bound is a literal or the name of a `const` item. The\ncompiler reads each bound at type check, to check the arms and their\ncoverage. A foreign constant is not a `const` item: the C headers of\nthe build target set its value, so the compiler cannot read it.\n\n  @ffi(\"SIGBUS\", header: \"signal.h\")\n  pub let SIGBUS: Int\n\n  match n \{\n      0..=SIGBUS => \"low\"       // E0323\n      _ => \"high\"\n  }\n\nFix: use a guard. A guard is run-time code, so it reads the value.\n\n  match n \{\n      n if n >= 0 && n <= SIGBUS => \"low\"\n      _ => \"high\"\n  }"

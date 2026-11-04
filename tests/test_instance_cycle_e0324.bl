@@ -1,0 +1,435 @@
+// A cycle of generic declarations in which a type argument grows is E0324
+// (sections/03_types.md §3.4 *Limit on Generic Instances*). Each use that builds an instance is
+// an edge, and each edge has a row here, because a use with no edge reaches the budget instead.
+
+import compile_test_helpers.{check_via_cli, scratch_root, verify_catalog_entry}
+
+fn error_count(out: Str) -> Int {
+    let mut n = 0
+    for line in out.split("\n") {
+        if line.contains("\"severity\":\"error\"") { n = n + 1 }
+    }
+    n
+}
+
+fn assert_cycle(src: Str, tag: Str, message: Str) ! FS.Write, FS.Delete, Env.Read, Process.Spawn {
+    let out = check_via_cli(src, "cyc_{tag}_{getpid()}")
+    assert(out.contains("\"code\":\"E0324\""), out)
+    assert_eq(error_count(out), 1)
+    assert(out.contains(message), out)
+}
+
+fn assert_no_error(src: Str, tag: Str) ! FS.Write, FS.Delete, Env.Read, Process.Spawn {
+    let out = check_via_cli(src, "cyc_{tag}_{getpid()}")
+    assert_eq(error_count(out), 0)
+}
+
+test "the catalog explains the cycle error" {
+    verify_catalog_entry("E0324", "InstantiationCycle")
+}
+
+// ── One row for each edge ──────────────────────────────────────────────
+
+test "a generic fn call with written type arguments is an edge" {
+    assert_cycle(#"fn r[T](x: T, n: Int) -> Int {
+    if n == 0 { return 0 }
+    r[List[T]]([x], n - 1)
+}
+fn main() { io.println("{r(1, 2)}") }
+"#, "written", "`r` needs `r[List[T]]` inside `r[T]`, without end")
+}
+
+test "a generic fn call with inferred type arguments is an edge" {
+    assert_cycle(#"fn a[T](x: T, n: Int) -> Int { b((x, x), n - 1) }
+fn b[U](y: U, n: Int) -> Int { a(y, n - 1) }
+fn main() { io.println("{a(1, 2)}") }
+"#, "inferred", "`a` needs `b[(T, T)]` inside `a[T]`, without end")
+}
+
+test "a generic fn named as a value is an edge" {
+    assert_cycle(#"fn v[T](x: T, n: Int) -> Int {
+    let f: fn(List[T], Int) -> Int = v
+    if n == 0 { 0 } else { f([x], n - 1) }
+}
+fn main() { io.println("{v(1, 2)}") }
+"#, "fn_value", "`v` needs `v[List[T]]` inside `v[T]`, without end")
+}
+
+test "a call inside a closure of the body is an edge" {
+    assert_cycle(#"fn c[T](x: T, n: Int) -> Int {
+    let go = fn(k: Int) -> Int { c[List[T]]([x], k) }
+    go(n - 1)
+}
+fn main() { io.println("{c(1, 2)}") }
+"#, "closure", "`c` needs `c[List[T]]` inside `c[T]`, without end")
+}
+
+test "a call inside a closure passed to a std method is an edge" {
+    assert_cycle(#"fn hof[T](xs: List[T]) -> List[Int] {
+    xs.map(fn(x: T) -> Int { hof[List[T]]([[x]]).len() })
+}
+fn main() { io.println("{hof([1]).len()}") }
+"#, "std_hof", "`hof` needs `hof[List[T]]` inside `hof[T]`, without end")
+}
+
+test "a variant payload type is an edge" {
+    assert_cycle(#"type P[T] { Leaf(v: T), Node(p: P[(T, T)]) }
+fn main() { }
+"#, "payload", "`P` needs `P[(T, T)]` inside `P[T]`, without end")
+}
+
+test "a labelled variant payload type is an edge" {
+    assert_cycle(#"type L[T] { Leaf, Node { p: L[Option[T]] } }
+fn main() { }
+"#, "brace_payload", "`L` needs `L[Option[T]]` inside `L[T]`, without end")
+}
+
+test "a field type behind a List is an edge" {
+    assert_cycle(#"type Q[T] { v: T, next: List[Q[List[T]]] }
+fn main() { }
+"#, "field_list", "`Q` needs `Q[List[T]]` inside `Q[T]`, without end")
+}
+
+test "a field type behind an Option or a fn type is an edge" {
+    assert_cycle(#"type O[T] { next: Option[O[(T, Int)]] }
+fn main() { }
+"#, "field_option", "`O` needs `O[(T, Int)]` inside `O[T]`, without end")
+    assert_cycle(#"type F[T] { next: fn(F[List[T]]) -> Int }
+fn main() { }
+"#, "field_fn", "`F` needs `F[List[T]]` inside `F[T]`, without end")
+}
+
+test "two types that grow through each other are one cycle" {
+    assert_cycle(#"type A[T] { b: Option[B[List[T]]] }
+type B[U] { a: Option[A[U]] }
+fn main() { }
+"#, "types_mutual", "`A` needs `B[List[T]]` inside `A[T]`, without end")
+}
+
+test "a field default that calls a generic fn is an edge" {
+    assert_cycle(#"type D[T] { n: Int = 0, more: Option[T] = pick[D[List[T]]]() }
+fn pick[U]() -> Option[U] { None }
+fn main() { }
+"#, "field_default", "`D` needs ")
+}
+
+test "a type written in a fn body is an edge" {
+    assert_cycle(#"type B[T] { v: T }
+impl[T] Eq for B[T] {
+    fn eq(self, other: B[T]) -> Bool { same[List[T]]() }
+}
+fn same[U]() -> Bool {
+    let x: Option[B[U]] = None
+    x.is_none()
+}
+fn main() { }
+"#, "type_in_body", "needs `same[List[T]]`")
+}
+
+test "a method call whose impl the receiver fixes is an edge" {
+    assert_cycle(#"trait Deep { fn deep(self, n: Int) -> Int }
+type Box[T] { v: T }
+impl[T] Deep for Box[T] {
+    fn deep(self, n: Int) -> Int {
+        if n == 0 { 0 } else { Box { v: self }.deep(n - 1) }
+    }
+}
+fn main() { }
+"#, "method", "`deep` needs `Deep for Box[Box[T]]` inside `Deep for Box[T]`, without end")
+}
+
+test "a method of an impl on List is an edge" {
+    assert_cycle(#"trait Lm { fn lm(self, n: Int) -> Int }
+impl[T] Lm for List[T] {
+    fn lm(self, n: Int) -> Int {
+        if n == 0 { 0 } else { [self].lm(n - 1) }
+    }
+}
+fn main() { }
+"#, "list_impl", "`lm` needs `Lm for List[List[T]]` inside `Lm for List[T]`, without end")
+}
+
+test "a method of an impl on List whose signature names the element is an edge" {
+    assert_cycle(#"trait Le[T] { fn le(self, x: T, n: Int) -> Int }
+impl[T] Le[T] for List[T] {
+    fn le(self, x: T, n: Int) -> Int {
+        if n == 0 { 0 } else { [self].le(self, n - 1) }
+    }
+}
+fn main() { }
+"#, "list_impl_elem", "`le` needs ")
+}
+
+test "a method call through a written bound on an impl is an edge" {
+    assert_cycle(#"trait Bd { fn bd(self, n: Int) -> Int }
+type Box[T] { v: T }
+impl Bd for Int { fn bd(self, n: Int) -> Int { n } }
+impl[T: Bd] Bd for Box[T] {
+    fn bd(self, n: Int) -> Int {
+        if n == 0 { 0 } else { Box { v: self }.bd(n - 1) }
+    }
+}
+fn main() { io.println("{Box { v: 1 }.bd(2)}") }
+"#, "bound_impl", "`bd` needs `Bd for Box[Box[T]]` inside `Bd for Box[T]`, without end")
+}
+
+test "a generic method of a plain type is an edge" {
+    assert_cycle(#"type Own { n: Int }
+trait Tm { fn m[U](self, u: U, k: Int) -> Int }
+impl Tm for Own {
+    fn m[U](self, u: U, k: Int) -> Int {
+        if k == 0 { 0 } else { self.m[List[U]]([u], k - 1) }
+    }
+}
+fn main() { }
+"#, "own_method", "`m` needs `m[List[U]]` inside `m[U]`, without end")
+}
+
+test "a generic method of a generic type is an edge" {
+    assert_cycle(#"type Bx[T] { v: T }
+trait Tb { fn m[U](self, u: U, k: Int) -> Int }
+impl[T] Tb for Bx[T] {
+    fn m[U](self, u: U, k: Int) -> Int {
+        if k == 0 { 0 } else { self.m[List[U]]([u], k - 1) }
+    }
+}
+fn main() { }
+"#, "poly_own_method", "`m` needs `Tb for Bx[T].m[List[U]]` inside `Tb for Bx[T].m[U]`, without end")
+}
+
+test "a written Eq that compares a larger type is an edge" {
+    assert_cycle(#"type E[T] { v: T }
+impl[T] Eq for E[T] {
+    fn eq(self, other: E[T]) -> Bool { E { v: self } == E { v: other } }
+}
+fn main() { }
+"#, "operator_eq", "`eq` needs `Eq for E[E[T]]`")
+}
+
+test "a conversion whose impl the source fixes is an edge" {
+    assert_cycle(#"type W[T] { v: T }
+type V { n: Int }
+impl[T] From[W[T]] for V {
+    fn from(w: W[T]) -> V { V.from(W { v: w }) }
+}
+fn main() { }
+"#, "conversion", "`from` needs ")
+}
+
+// ── What the check reads ───────────────────────────────────────────────
+
+test "a declaration that nothing uses is checked, and a file with no main is too" {
+    assert_cycle(#"fn r[T](x: T, n: Int) -> Int {
+    if n == 0 { return 0 }
+    r[List[T]]([x], n - 1)
+}
+"#, "unused", "`r` needs `r[List[T]]`")
+}
+
+test "a growing call inside if false gives the same verdict" {
+    assert_cycle(#"fn r[T](x: T, n: Int) -> Int {
+    if false { return r[List[T]]([x], n) }
+    0
+}
+fn main() { io.println("{r(1, 2)}") }
+"#, "if_false", "`r` needs `r[List[T]]`")
+}
+
+test "a call on a bound is not an edge" {
+    assert_no_error(#"trait Foo { fn foo(self) -> Int }
+type Box[T] { v: T }
+type Wrap[T] { v: T }
+fn f[T: Foo](x: T) -> Int { x.foo() }
+impl[U] Foo for Box[U] { fn foo(self) -> Int { f(Wrap { v: self }) } }
+impl[U] Foo for Wrap[U] { fn foo(self) -> Int { 7 } }
+fn main() { io.println("{f(Box { v: 1 })}") }
+"#, "bound_not_edge")
+}
+
+test "a recursive type with an argument that stays the same is legal" {
+    assert_no_error(#"type Nest[T] { One(v: T), Many(items: List[Nest[T]]) }
+type Tree[T] { Leaf(v: T), Pair(l: Tree[T], r: Tree[T]) }
+fn r[T](x: Nest[T], n: Int) -> Int {
+    if n == 0 { return 0 }
+    r(Nest.Many([x]), n - 1)
+}
+fn main() { io.println("{r(Nest.One(1), 3)}") }
+"#, "repair")
+}
+
+test "a larger argument with no way back is legal" {
+    assert_no_error(#"fn leaf[U](y: U) -> Int { 1 }
+fn top[T](x: T) -> Int { leaf([x]) }
+fn main() { io.println("{top(1)}") }
+"#, "no_way_back")
+}
+
+test "a concrete argument in a cycle does not grow" {
+    assert_no_error(#"fn a[T](x: T, n: Int) -> Int {
+    if n == 0 { return 0 }
+    a[List[Int]]([1], n - 1)
+}
+fn main() { io.println("{a("s", 2)}") }
+"#, "concrete")
+}
+
+// The rule reads declarations, so these finite programs are errors while the rule stands.
+test "a cycle with a growing edge is an error at the declaration even if the program is finite" {
+    assert_cycle(#"fn f[T, U](x: T, y: U, n: Int) -> Int {
+    if n == 0 { return 0 }
+    f[T, List[T]](x, [x], n - 1)
+}
+fn main() { io.println("{f(1, 2, 3)}") }
+"#, "finite_second_param", "`f` needs `f[T, List[T]]` inside `f[T, U]`, without end")
+    assert_cycle(#"fn a[T](x: T, n: Int) -> Int { b[List[T]]([x], n - 1) }
+fn b[U](y: U, n: Int) -> Int {
+    if n == 0 { return 0 }
+    a[Int](1, n - 1)
+}
+fn main() { io.println("{a(1, 2)}") }
+"#, "finite_concrete_back", "`a` needs `b[List[T]]` inside `a[T]`, without end")
+}
+
+// ── What the error says ────────────────────────────────────────────────
+
+test "the span is the written type, with the label and the help of the spec" {
+    let out = check_via_cli(#"type P[T] { Leaf(v: T), Node(p: P[(T, T)]) }
+"#, "cyc_span_{getpid()}")
+    assert(out.contains("\"line\":1,\"col\":33,\"end_line\":1,\"end_col\":42"), out)
+    assert(out.contains("`T` of `P` becomes `(T, T)` here"), out)
+    assert(out.contains("write a recursive type: `type P[T] \{ Leaf(v: T), Node(l: P[T], r: P[T]) }`"), out)
+    assert(out.contains("This gives up the guarantee of `P[(T, T)]` that both sides have the same depth"), out)
+}
+
+test "the span of a call covers the whole call" {
+    let out = check_via_cli(#"fn r[T](x: T, n: Int) -> Int {
+    r[List[T]]([x], n - 1)
+}
+"#, "cyc_call_span_{getpid()}")
+    assert(out.contains("\"line\":2,\"col\":5,\"end_line\":2,\"end_col\":27"), out)
+}
+
+test "the help of a fn names the recursive type" {
+    let out = check_via_cli(#"fn r[T](x: T, n: Int) -> Int {
+    r[List[T]]([x], n - 1)
+}
+"#, "cyc_help_{getpid()}")
+    assert(out.contains("`type Nest[T] \{ One(v: T), Many(items: List[Nest[T]]) }`"), out)
+    assert(out.contains("`fn r[T](x: Nest[T], n: Int)`"), out)
+}
+
+test "the note lists the chain, one line for each edge" {
+    let out = check_via_cli(#"fn a[T](x: T, n: Int) -> Int { b((x, x), n - 1) }
+fn b[U](y: U, n: Int) -> Int { a(y, n - 1) }
+"#, "cyc_chain_{getpid()}")
+    assert(out.contains("`T` of `a` becomes `(T, T)`"), out)
+    assert(out.contains("then `U` of `b` becomes `U`"), out)
+}
+
+test "the json form carries the edge list of the chain" {
+    let out = check_via_cli(#"fn a[T](x: T, n: Int) -> Int { b((x, x), n - 1) }
+fn b[U](y: U, n: Int) -> Int { a(y, n - 1) }
+"#, "cyc_json_{getpid()}")
+    assert(out.contains("\"edges\":[\{\"decl\":\"a\",\"param\":\"T\",\"becomes\":\"(T, T)\",\"span\":\{"), out)
+    assert(out.contains("\"line\":1,\"col\":32,\"end_line\":1,\"end_col\":48}}"), out)
+    assert(out.contains("\{\"decl\":\"b\",\"param\":\"U\",\"becomes\":\"U\",\"span\":\{"), out)
+    assert(out.contains("\"line\":2,\"col\":32,\"end_line\":2,\"end_col\":43}}"), out)
+}
+
+test "two growing edges in one cycle give one error that names both, with the first at the span" {
+    let out = check_via_cli(#"fn a[T](x: T, n: Int) -> Int { b((x, x), n - 1) }
+fn b[U](y: U, n: Int) -> Int { a([y], n - 1) }
+"#, "cyc_two_{getpid()}")
+    assert_eq(error_count(out), 1)
+    assert(out.contains("\"span\":\{\"file\""), out)
+    assert(out.contains("`a` needs `b[(T, T)]` inside `a[T]`, without end"), out)
+    assert(out.contains("then `U` of `b` becomes `List[U]`"), out)
+}
+
+test "two growing edges that close two ways name the one the chain leaves out" {
+    let out = check_via_cli(#"fn a[T](x: T, n: Int) -> Int {
+    b((x, x), n - 1)
+    b([x], n - 1)
+}
+fn b[U](y: U, n: Int) -> Int { a(y, n - 1) }
+"#, "cyc_other_{getpid()}")
+    assert_eq(error_count(out), 1)
+    assert(out.contains("also, `T` of `a` becomes `List[T]`"), out)
+}
+
+test "two separate cycles give two errors" {
+    let out = check_via_cli(#"type P[T] { Node(p: P[(T, T)]) }
+type Q[T] { next: List[Q[List[T]]] }
+"#, "cyc_separate_{getpid()}")
+    assert_eq(error_count(out), 2)
+}
+
+test "a type deeper than three levels prints with dots" {
+    let out = check_via_cli(#"fn r[T](x: T, n: Int) -> Int {
+    r[List[List[List[List[T]]]]]([[[[x]]]], n - 1)
+}
+"#, "cyc_depth_{getpid()}")
+    assert(out.contains("`r` needs `r[List[List[List[...]]]]` inside `r[T]`, without end"), out)
+}
+
+test "the check runs on the build too" {
+    let path = "{scratch_root()}/_cyc_build_{getpid()}.bl"
+    fs.write(path, #"fn r[T](x: T, n: Int) -> Int {
+    if n == 0 { return 0 }
+    r[List[T]]([x], n - 1)
+}
+fn main() { io.println("{r(1, 2)}") }
+"#).unwrap()
+    let res = process.run("build/blink", ["build", path, "--format", "json"]).unwrap()
+    let _ = fs.delete(path)
+    assert("{res.out}{res.err_out}".contains("E0324"), "{res.out}{res.err_out}")
+}
+
+// ── A front-end error comes first ──────────────────────────────────────
+
+test "a file with a type error reports that error and no false cycle" {
+    let out = check_via_cli(#"fn leaf[U](y: U) -> Int { 1 }
+fn top[T](x: T) -> Int { leaf([x]) + leaf([[x]]) }
+fn a[T](x: T, n: Int) -> Int {
+    if n == 0 { return 0 }
+    a[T](x, n - 1)
+}
+fn main() {
+    let bad: Int = "s"
+    io.println("{top(1)} {a(1, 2)}")
+}
+"#, "cyc_fe_clean_{getpid()}")
+    assert_eq(error_count(out), 1)
+    assert(out.contains("\"code\":\"E0300\""), out)
+    assert(out.contains("\"code\":\"E0324\"") == false, out)
+}
+
+test "a real cycle waits until the type error is fixed" {
+    let out = check_via_cli(#"fn r[T](x: T, n: Int) -> Int {
+    r[List[T]]([x], n - 1)
+}
+fn main() {
+    let bad: Int = "s"
+}
+"#, "cyc_fe_real_{getpid()}")
+    assert_eq(error_count(out), 1)
+    assert(out.contains("\"code\":\"E0300\""), out)
+    assert(out.contains("\"code\":\"E0324\"") == false, out)
+}
+
+test "a file with a parse error reports no cycle" {
+    let out = check_via_cli(#"type P[T] { Node(p: P[(T, T)]) }
+fn main( {
+"#, "cyc_fe_parse_{getpid()}")
+    assert(out.contains("\"code\":\"E0324\"") == false, out)
+    assert(out.contains("\"severity\":\"error\""), out)
+}
+
+test "the standard library holds no cycle" {
+    assert_no_error(#"import std.json
+import std.path
+import std.fs
+import std.process
+fn main() { io.println("ok") }
+"#, "std")
+}

@@ -23,7 +23,7 @@ import parser.{
     node_for_binder, node_guard, node_handlers, node_impl_binders, node_impl_where_bounds,
     node_index, node_iterable, node_kind, node_left, node_method, node_methods, node_name,
     node_obj, node_params, node_pattern, node_recv_type_args, node_right, node_scrutinee, node_source_module,
-    node_start, node_stmts, node_target, node_then_body, node_type_ann,
+    node_start, node_stmts, node_target, node_then_body, node_trait_name, node_type_ann, node_line, node_col, node_end_line, node_end_col, node_written_span,
     node_type_params, node_value, node_captures, node_arms, node_assoc_types, get_annotation,
     sublist_get, sublist_length,
 }
@@ -39,12 +39,15 @@ import typecheck.{
     tc_ret_mint_at, tc_tid_child, tc_tid_child_count,
     tc_tid_decl_node, tc_tid_kind, tc_impl_is_poly_user, tc_poly_user_impl_decl, tc_instance_has_trait, tc_written_impl_holds,
     tc_tid_is_no_info, tc_tid_list_elem, tc_tid_name, tc_tid_resolved, tc_tid_struct, tc_type_str,
-    tc_declared_field_tids, tc_ptr_pointee_is_valid,
+    tc_declared_field_tids, tc_ptr_pointee_is_valid, tc_decl_tid, tc_type_arg_grows,
     tc_void_tid, tc_requires_preds_of, tc_ensures_preds_of,
 }
 import cname.{c_mono_fn_name, c_mono_type_c_name, c_poly_method_name}
 import escape.{is_async_spawn}
-import diagnostics.{diag_error_at, diag_ice_at, INVALID_PTR_TYPE, UNSOLVED_TYPEVAR_AT_CODEGEN}
+import diagnostics.{
+    DiagEdge, diag_error_at, diag_error_span_label_at_notes, diag_entry_count, diag_file_for_node, diag_ice_at, diag_set_edges_since,
+    INSTANTIATION_CYCLE, INVALID_PTR_TYPE, UNSOLVED_TYPEVAR_AT_CODEGEN,
+}
 
 pub type MonoInstance {
     base_decl_node: Int,
@@ -95,13 +98,55 @@ let mut generic_fn_nodes: Map[Int, Int] = Map()
 // holding the impl block it sits in. The impl supplies the symbol stem; the method's own
 // binders supply the instance arguments, so the two never come from the same place.
 let mut own_generic_method_impl: Map[Int, Int] = Map()
-let mut poly_method_by_name: Map[Str, Int] = Map()
-let mut poly_method_by_qualified: Map[Str, Int] = Map()
-let mut poly_block_of_method: Map[Int, Int] = Map()
-// A user generic type's per-instance impl methods, keyed by the receiver's declaration and
-// the method name. A call reaches one through its receiver, which inside a bounded body is
-// known only once the instance substitutes it.
-let mut poly_user_method_by_recv: Map[Str, Int] = Map()
+// Generic methods of impls with binders, by how a call names them, with the impl block of each.
+// by_recv holds a user generic type's per-instance impl methods, keyed by the receiver's
+// declaration and the method name. A call reaches one through its receiver, which inside a
+// bounded body is known only once the instance substitutes it.
+type PolyMethods {
+    by_name: Map[Str, Int]
+    by_qualified: Map[Str, Int]
+    block_of: Map[Int, Int]
+    by_recv: Map[Str, Int]
+}
+let mut poly_methods: PolyMethods = PolyMethods { by_name: Map(), by_qualified: Map(), block_of: Map(), by_recv: Map() }
+
+// One use of a generic declaration inside another (§3.4 *Limit on Generic Instances*): the
+// declaration the check walks, the one it uses, and what each parameter of the second becomes.
+type DeclEdge {
+    from: Int
+    to: Int
+    params: List[Str]
+    args: List[Int]
+    site: Int
+}
+
+// While the declaration check runs, each register_* below records an edge from `walking` and
+// builds nothing, so a new instance site gets an edge by the route that builds the instance. -1
+// is the build walk. method_impl holds each method of an impl with binders, and shared_methods
+// the methods of such an impl that share one C body: a shared body builds no instance, but its
+// verdict must not turn on what its signature mentions. The scc_ fields are Tarjan's search over
+// the edges, because a cycle is a component with an edge inside it.
+type DeclCheck {
+    walking: Int
+    site: Int
+    edges: List[DeclEdge]
+    edge_seen: Map[Str, Int]
+    edges_from: Map[Int, List[Int]]
+    method_impl: Map[Int, Int]
+    shared_methods: Map[Str, Int]
+    scc_next: Int
+    scc_index: Map[Int, Int]
+    scc_low: Map[Int, Int]
+    scc_stack: List[Int]
+    scc_on_stack: Map[Int, Int]
+    scc_of: Map[Int, Int]
+}
+let mut decl_check: DeclCheck = new_decl_check()
+
+fn new_decl_check() -> DeclCheck {
+    DeclCheck { walking: -1, site: -1, edges: [], edge_seen: Map(), edges_from: Map(), method_impl: Map(),
+        shared_methods: Map(), scc_next: 0, scc_index: Map(), scc_low: Map(), scc_stack: [], scc_on_stack: Map(), scc_of: Map() }
+}
 
 // A root walk has no instance; it reads types straight from typecheck.
 let ROOT_BINDS: Map[Str, Int] = Map()
@@ -242,10 +287,8 @@ fn mono_reset() {
     generic_fn_by_module_name = Map()
     generic_fn_nodes = Map()
     own_generic_method_impl = Map()
-    poly_method_by_name = Map()
-    poly_method_by_qualified = Map()
-    poly_block_of_method = Map()
-    poly_user_method_by_recv = Map()
+    poly_methods = PolyMethods { by_name: Map(), by_qualified: Map(), block_of: Map(), by_recv: Map() }
+    decl_check = new_decl_check()
 }
 
 // ── Declaration maps ───────────────────────────────────────────────────────────
@@ -370,18 +413,18 @@ fn register_poly_impl(im: Int) {
     while j < sl_len(methods_sl) {
         let m = sublist_get(methods_sl, j)
         if is_conversion {
-            poly_block_of_method.insert(m, im)
+            poly_methods.block_of.insert(m, im)
             j = j + 1
             continue
         }
         if user_decl >= 0 {
-            poly_user_method_by_recv.insert(poly_user_key(user_decl, node_name(m)), m)
-            poly_user_method_by_recv.insert(poly_user_key(user_decl, "{trait_id}.{node_name(m)}"), m)
+            poly_methods.by_recv.insert(poly_user_key(user_decl, node_name(m)), m)
+            poly_methods.by_recv.insert(poly_user_key(user_decl, "{trait_id}.{node_name(m)}"), m)
         } else {
-            poly_method_by_name.insert(node_name(m), m)
-            poly_method_by_qualified.insert("{trait_id}.{node_name(m)}", m)
+            poly_methods.by_name.insert(node_name(m), m)
+            poly_methods.by_qualified.insert("{trait_id}.{node_name(m)}", m)
         }
-        poly_block_of_method.insert(m, im)
+        poly_methods.block_of.insert(m, im)
         j = j + 1
     }
 }
@@ -628,11 +671,15 @@ fn binder_args(ctx: Int, gfn: Int, call_node: Int, binds: Map[Str, Int]) -> List
             Some(bt) => bt
             None => binds.get(node_name(b)) ?? -1
         }
-        if t < 0 || tid_is_open(t) {
+        // Inside a generic body a type parameter is the answer, so only a type that is still
+        // unsolved asks the mint, and the edge is left out if the mint can not solve it either.
+        let reading_decl = decl_check.walking >= 0
+        if t < 0 || (if reading_decl { tid_holds_unknown(t) } else { tid_is_open(t) }) {
             let minted = tc_ret_mint_at(call_node, n, pi)
             if minted >= 0 { t = substitute_typevar_tid(minted, ctx_binds(ctx)) }
         }
-        if t < 0 || tid_is_open(t) {
+        if reading_decl && (t < 0 || tid_holds_unknown(t)) { return [] }
+        if !reading_decl && (t < 0 || tid_is_open(t)) {
             diag_ice_at("MonoUnsolvedTypeParam", UNSOLVED_TYPEVAR_AT_CODEGEN,
                 "type parameter `{node_name(b)}` of `{node_name(gfn)}` is unsolved at this call", call_node,
                 "typecheck must reject a call it cannot fully type; this is a compiler bug")
@@ -707,6 +754,10 @@ fn register_with_binds(base_decl_node: Int, binds: Map[Str, Int], arg_tids: List
 // means nothing was registered, which is what an unsolved type parameter leaves behind.
 fn register_fn(gfn: Int, arg_tids0: List[Int]) -> Int {
     if arg_tids0.len() == 0 { return -1 }
+    if decl_check.walking >= 0 {
+        note_decl_edge(gfn, binder_names(node_type_params(gfn)), arg_tids0)
+        return -1
+    }
     let arg_tids = canon_tids(arg_tids0)
     let binders_sl = node_type_params(gfn)
     let args_tid = make_tuple_type(arg_tids)
@@ -718,6 +769,10 @@ fn register_fn(gfn: Int, arg_tids0: List[Int]) -> Int {
 // impls of one trait method stay apart, and the arguments are the method's binders alone.
 fn register_own_generic_method(m: Int, arg_tids0: List[Int]) -> Int {
     if arg_tids0.len() == 0 { return -1 }
+    if decl_check.walking >= 0 {
+        note_decl_edge(m, binder_names(node_type_params(m)), arg_tids0)
+        return -1
+    }
     let arg_tids = canon_tids(arg_tids0)
     let binders_sl = node_type_params(m)
     let args_tid = make_tuple_type(arg_tids)
@@ -736,9 +791,17 @@ fn register_own_generic_method(m: Int, arg_tids0: List[Int]) -> Int {
 // The impl's binders first, in impl-header order, then the method's own binders in
 // declaration order.
 fn register_poly_own_generic_method(m: Int, impl_tids0: List[Int], own_tids0: List[Int]) -> Int {
-    let im = poly_block_of_method.get(m) ?? -1
+    let im = poly_methods.block_of.get(m) ?? -1
     if im < 0 { return -1 }
     if own_tids0.len() == 0 { return -1 }
+    if decl_check.walking >= 0 {
+        let mut params = binder_names(node_impl_binders(im))
+        for name in binder_names(node_type_params(m)) { params.push(name) }
+        let mut all = impl_tids0.slice(0, impl_tids0.len())
+        for t in own_tids0 { all.push(t) }
+        note_decl_edge(m, params, all)
+        return -1
+    }
     let impl_tids = canon_tids(impl_tids0)
     let own_tids = canon_tids(own_tids0)
     let mut arg_tids: List[Int] = []
@@ -755,8 +818,12 @@ fn register_poly_own_generic_method(m: Int, impl_tids0: List[Int], own_tids0: Li
 // Keyed on the impl binders' tids, so two receivers that differ only inside an argument the
 // C layout erases are still two instances.
 fn register_poly_method(m: Int, impl_tids0: List[Int]) -> Int {
+    if decl_check.walking >= 0 {
+        note_decl_edge(m, binder_names(node_impl_binders(poly_methods.block_of.get(m).unwrap())), impl_tids0)
+        return -1
+    }
     let impl_tids = canon_tids(impl_tids0)
-    let im = poly_block_of_method.get(m).unwrap()
+    let im = poly_methods.block_of.get(m).unwrap()
     let binders_sl = node_impl_binders(im)
     let binds = binds_from_binders(binders_sl, impl_tids)
     let inst_tid = canon_tid(fn_signature_tid(m, binds))
@@ -784,6 +851,10 @@ fn register_type_instance(tid: Int) ! Diag.Report {
     if k != TyKind.Struct && k != TyKind.Enum { return }
     let n = tc_tid_child_count(tid)
     if n == 0 { return }
+    if decl_check.walking >= 0 {
+        note_type_edges(tid)
+        return
+    }
     if tid_is_open(tid) { return }
     let td = tc_tid_decl_node(tid)
     if td == DECL_NODE_AMBIGUOUS {
@@ -810,7 +881,7 @@ fn register_operator_methods(td: Int, ct: Int) {
 // has nothing to compile against. The bound check of Debug reads the derive alone, so the
 // written impl is asked as well.
 fn register_method_where_it_holds(td: Int, ct: Int, trait_name: Str, method: Str) {
-    match poly_user_method_by_recv.get(poly_user_key(td, "{trait_name}.{method}")) {
+    match poly_methods.by_recv.get(poly_user_key(td, "{trait_name}.{method}")) {
         Some(m) => if tc_instance_has_trait(ct, trait_name) || tc_written_impl_holds(ct, trait_name, method) {
             register_poly_method(m, type_args_of(ct))
         }
@@ -948,7 +1019,7 @@ fn discover_poly_impl_call(ctx: Int, node: Int, obj: Int) ! Diag.Report {
         let trait_id = tc_call_trait(node) ?? node_name(obj)
         let qualified = "{trait_id}.{method}"
         if discover_poly_user_call(ctx, node, recv, qualified) { return }
-        match poly_method_by_qualified.get(qualified) {
+        match poly_methods.by_qualified.get(qualified) {
             Some(m) => register_poly_recv(ctx, m, recv, node)
             None => {}
         }
@@ -960,7 +1031,7 @@ fn discover_poly_impl_call(ctx: Int, node: Int, obj: Int) ! Diag.Report {
         None => {}
     }
     if discover_poly_user_call(ctx, node, obj, method) { return }
-    match poly_method_by_name.get(method) {
+    match poly_methods.by_name.get(method) {
         Some(m) => register_poly_recv(ctx, m, obj, node)
         None => {}
     }
@@ -973,7 +1044,7 @@ fn discover_poly_user_call(ctx: Int, node: Int, obj: Int, method: Str) -> Bool !
     if recv_tid < 0 { return false }
     let decl = tc_tid_decl_node(recv_tid)
     if decl < 0 { return false }
-    match poly_user_method_by_recv.get(poly_user_key(decl, method)) {
+    match poly_methods.by_recv.get(poly_user_key(decl, method)) {
         Some(m) => {
             register_poly_instance(ctx, m, recv_tid, recv_args(recv_tid), node)
             true
@@ -1005,8 +1076,10 @@ fn register_poly_recv(ctx: Int, m: Int, recv_node: Int, call_node: Int) ! Diag.R
 // generic body, which is registered once that body's instance substitutes it.
 fn register_poly_instance(ctx: Int, m: Int, recv_tid: Int, impl_tids: List[Int], call_node: Int) ! Diag.Report {
     if impl_tids.len() == 0 { return }
-    for t in impl_tids {
-        if tid_is_open(t) { return }
+    if decl_check.walking < 0 {
+        for t in impl_tids {
+            if tid_is_open(t) { return }
+        }
     }
     if has_type_params(m) {
         let binds = solve_call_binds(ctx, m, call_node, [recv_tid], node_args(call_node))
@@ -1134,7 +1207,7 @@ fn discover_conversion_call(ctx: Int, node: Int, obj: Int) ! Diag.Report {
         m = conversion_method_of(im)
         if into { lead.push(source) }
     }
-    let im = poly_block_of_method.get(m) ?? -1
+    let im = poly_methods.block_of.get(m) ?? -1
     if im < 0 || tc_impl_conv_source(im) < 0 { return }
     let binds = solve_call_binds(ctx, m, node, lead, node_args(node))
     let binders_sl = node_impl_binders(im)
@@ -1143,7 +1216,8 @@ fn discover_conversion_call(ctx: Int, node: Int, obj: Int) ! Diag.Report {
     while i < sl_len(binders_sl) {
         let b = sublist_get(binders_sl, i)
         let t = binds.get(tc_binder_key(b, node_name(b))) ?? -1
-        if t < 0 || tid_is_open(t) {
+        if decl_check.walking >= 0 && t < 0 { return }
+        if decl_check.walking < 0 && (t < 0 || tid_is_open(t)) {
             diag_ice_at("MonoUnsolvedTypeParam", UNSOLVED_TYPEVAR_AT_CODEGEN,
                 "type parameter `{node_name(b)}` of `{tc_impl_trait_id(im)}` for `{node_name(im)}` is unsolved at this call", node,
                 "typecheck must reject a conversion it cannot fully type; this is a compiler bug")
@@ -1184,6 +1258,7 @@ fn discover_method_call(ctx: Int, node: Int) ! Diag.Report {
     discover_list_generic_adapter_call(ctx, node, obj)
     discover_map_generic_adapter_call(ctx, node, obj)
     discover_iterator_call(ctx, node, obj)
+    if decl_check.walking >= 0 { note_shared_impl_call(node, obj) }
 }
 
 // ── The walk ───────────────────────────────────────────────────────────────────
@@ -1292,6 +1367,7 @@ fn walk_fn_parts(ctx: Int, fn_node: Int) ! Diag.Report {
 fn walk_field_access(ctx: Int, node: Int) ! Diag.Report {
     let obj = node_obj(node)
     mono_walk(ctx, obj)
+    decl_check.site = node
     discover_fn_value(ctx, node)
     if ctx < 0 || obj == -1 { return }
     match mono_node_tids.get(ctx).unwrap().get(node) {
@@ -1410,6 +1486,7 @@ fn ice_unwalkable(node: Int, kind: NodeKind) ! Diag.Report {
 // placed, and the two kinds that never sit inside a body are an ICE at runtime.
 fn mono_walk(ctx: Int, node: Int) ! Diag.Report {
     if node == -1 { return }
+    decl_check.site = node
     mono_record(ctx, node)
     let kind = node_kind(node)
     match kind {
@@ -1485,4 +1562,484 @@ fn mono_walk(ctx: Int, node: Int) ! Diag.Report {
         NodeKind.AssertPanics => walk2(ctx, node_value(node), node_body(node))
         NodeKind.KindCount => ice_unwalkable(node, kind)
     }
+}
+
+// ── The declaration check ──────────────────────────────────────────────────────────
+
+// A cycle of generic declarations in which a type argument grows has no last instance, so
+// this rejects it before the build walk starts (§3.4 *Limit on Generic Instances*). It reads
+// declarations only: nothing here depends on what the program calls.
+pub fn check_instance_cycles(program: Int) ! Diag.Report {
+    require_sealed_ops_rewritten(program)
+    mono_reset()
+    mono_build_decl_maps(program)
+    build_decl_method_maps(program)
+    walk_generic_decls(program)
+    decl_check.walking = -1
+    trace.log("blink.mono", "decl edges={decl_check.edges.len()}")
+    report_instance_cycles()
+}
+
+fn build_decl_method_maps(program: Int) {
+    let impls_sl = node_methods(program)
+    let mut ii = 0
+    while ii < sl_len(impls_sl) {
+        let im = sublist_get(impls_sl, ii)
+        if sl_len(node_impl_binders(im)) > 0 {
+            let methods_sl = node_methods(im)
+            let mut j = 0
+            while j < sl_len(methods_sl) {
+                let m = sublist_get(methods_sl, j)
+                decl_check.method_impl.insert(m, im)
+                if !poly_methods.block_of.contains_key(m) {
+                    decl_check.shared_methods.insert("{tc_impl_recv_spelling(im)}.{node_name(m)}", m)
+                }
+                j = j + 1
+            }
+        }
+        ii = ii + 1
+    }
+}
+
+// A call that reaches a shared impl method. Only `impl[T] X for List[T]` shares a body, so the
+// receiver's one argument answers the one binder.
+fn note_shared_impl_call(node: Int, obj: Int) {
+    let recv = tc_resolve(ctx_node_tid(ROOT_CTX, obj))
+    if recv < 0 || tc_tid_child_count(recv) == 0 { return }
+    let m = decl_check.shared_methods.get("{constructor_name(recv, tc_tid_kind(recv))}.{node_method(node)}") ?? -1
+    if m < 0 { return }
+    let im = decl_check.method_impl.get(m).unwrap()
+    match tc_call_trait(node) {
+        Some(key) => if key != tc_impl_trait_id(im) { return }
+        None => {}
+    }
+    note_decl_edge(m, binder_names(node_impl_binders(im)), recv_args(recv))
+}
+
+fn walk_generic_decls(program: Int) ! Diag.Report {
+    let fns_sl = node_params(program)
+    let mut i = 0
+    while i < sl_len(fns_sl) {
+        let fn_node = sublist_get(fns_sl, i)
+        if generic_fn_nodes.contains_key(fn_node) { walk_decl_body(fn_node) }
+        i = i + 1
+    }
+    let types_sl = node_fields(program)
+    let mut ti = 0
+    while ti < sl_len(types_sl) {
+        let td = sublist_get(types_sl, ti)
+        if has_type_params(td) { walk_type_decl(td) }
+        ti = ti + 1
+    }
+    let impls_sl = node_methods(program)
+    let mut ii = 0
+    while ii < sl_len(impls_sl) {
+        let methods_sl = node_methods(sublist_get(impls_sl, ii))
+        let mut j = 0
+        while j < sl_len(methods_sl) {
+            let m = sublist_get(methods_sl, j)
+            if decl_check.method_impl.contains_key(m) || own_generic_method_impl.contains_key(m) { walk_decl_body(m) }
+            j = j + 1
+        }
+        ii = ii + 1
+    }
+}
+
+// A type recorded as done for one declaration is still a new edge from the next one.
+fn walk_decl_body(decl: Int) ! Diag.Report {
+    decl_check.walking = decl
+    type_insts_done = Map()
+    mono_walk(ROOT_CTX, decl)
+}
+
+// The body walk does not read a field's declared type. The declared types come in field order,
+// so each one takes the span of the annotation that wrote it.
+fn walk_type_decl(td: Int) ! Diag.Report {
+    decl_check.walking = td
+    type_insts_done = Map()
+    let declared = tc_declared_field_tids(tc_decl_tid(td))
+    let mut slot = 0
+    let fields_sl = node_fields(td)
+    let mut i = 0
+    while i < sl_len(fields_sl) {
+        let f = sublist_get(fields_sl, i)
+        if node_kind(f) == NodeKind.TypeVariant {
+            let payload_sl = node_fields(f)
+            let mut vi = 0
+            while vi < sl_len(payload_sl) {
+                note_declared_field(sublist_get(payload_sl, vi), declared, slot)
+                slot = slot + 1
+                vi = vi + 1
+            }
+        } else if node_kind(f) == NodeKind.TypeField {
+            note_declared_field(f, declared, slot)
+            slot = slot + 1
+            mono_walk(ROOT_CTX, node_condition(f))
+        }
+        i = i + 1
+    }
+}
+
+fn note_declared_field(field: Int, declared: List[Int], slot: Int) ! Diag.Report {
+    if slot >= declared.len() { return }
+    decl_check.site = node_value(field)
+    register_type_instances_in(declared.get(slot).unwrap())
+}
+
+fn binder_names(binders_sl: Int) -> List[Str] {
+    let mut out: List[Str] = []
+    let mut i = 0
+    while i < sl_len(binders_sl) {
+        out.push(node_name(sublist_get(binders_sl, i)))
+        i = i + 1
+    }
+    out
+}
+
+fn tid_holds_unknown(tid0: Int) -> Bool {
+    let tid = tc_resolve(tid0)
+    if tc_tid_kind(tid) == TyKind.Unknown { return true }
+    let mut i = 0
+    while i < tc_tid_child_count(tid) {
+        if tid_holds_unknown(tc_tid_child(tid, i)) { return true }
+        i = i + 1
+    }
+    false
+}
+
+// A type also reaches the written Eq, Ord and Clone of its declaration (register_operator_methods).
+fn note_type_edges(tid: Int) {
+    let td = tc_tid_decl_node(tid)
+    if td < 0 { return }
+    let args = type_args_of(tid)
+    note_decl_edge(td, binder_names(node_type_params(td)), args)
+    for pair in [("Eq", "eq"), ("Ord", "cmp"), ("Clone", "clone")] {
+        match poly_methods.by_recv.get(poly_user_key(td, "{pair.0}.{pair.1}")) {
+            Some(m) => register_poly_method(m, args)
+            None => {}
+        }
+    }
+}
+
+// An edge with a type typecheck left unsolved says nothing about growth. If it was the one that
+// closes a cycle, the budget stops the program instead.
+fn note_decl_edge(to: Int, params: List[Str], args0: List[Int]) {
+    let args = canon_tids(args0)
+    for t in args {
+        if tid_holds_unknown(t) { return }
+    }
+    let key = "{decl_check.walking}|{to}|{make_tuple_type(args)}"
+    if decl_check.edge_seen.contains_key(key) { return }
+    decl_check.edge_seen.insert(key, 1)
+    let idx = decl_check.edges.len()
+    decl_check.edges.push(DeclEdge { from: decl_check.walking, to: to, params: params, args: args, site: decl_check.site })
+    let mut out = decl_check.edges_from.get(decl_check.walking) ?? []
+    out.push(idx)
+    decl_check.edges_from.insert(decl_check.walking, out)
+}
+
+fn edge_grows(e: DeclEdge) -> Bool {
+    for t in e.args {
+        if tc_type_arg_grows(t) { return true }
+    }
+    false
+}
+
+fn report_instance_cycles() ! Diag.Report {
+    for e in decl_check.edges {
+        if edge_grows(e) && !decl_check.scc_index.contains_key(e.from) { scc_search(e.from) }
+    }
+    let mut reported: Map[Int, Int] = Map()
+    let mut i = 0
+    while i < decl_check.edges.len() {
+        let e = decl_check.edges.get(i).unwrap()
+        if edge_grows(e) && (decl_check.scc_of.get(e.from) ?? -1) == (decl_check.scc_of.get(e.to) ?? -2) && !reported.contains_key(decl_check.scc_of.get(e.from) ?? -1) {
+            reported.insert(decl_check.scc_of.get(e.from) ?? -1, 1)
+            report_cycle(i)
+        }
+        i = i + 1
+    }
+}
+
+fn scc_search(v: Int) {
+    let at = decl_check.scc_next
+    decl_check.scc_next = decl_check.scc_next + 1
+    decl_check.scc_index.insert(v, at)
+    decl_check.scc_low.insert(v, at)
+    decl_check.scc_stack.push(v)
+    decl_check.scc_on_stack.insert(v, 1)
+    for ei in decl_check.edges_from.get(v) ?? [] {
+        let w = decl_check.edges.get(ei).unwrap().to
+        if !decl_check.scc_index.contains_key(w) {
+            scc_search(w)
+            if (decl_check.scc_low.get(w) ?? at) < (decl_check.scc_low.get(v) ?? at) { decl_check.scc_low.insert(v, decl_check.scc_low.get(w) ?? at) }
+        } else if decl_check.scc_on_stack.contains_key(w) {
+            if (decl_check.scc_index.get(w) ?? at) < (decl_check.scc_low.get(v) ?? at) { decl_check.scc_low.insert(v, decl_check.scc_index.get(w) ?? at) }
+        }
+    }
+    if (decl_check.scc_low.get(v) ?? at) == at {
+        loop {
+            let w = decl_check.scc_stack.pop().unwrap()
+            decl_check.scc_on_stack.remove(w)
+            decl_check.scc_of.insert(w, at)
+            if w == v { break }
+        }
+    }
+}
+
+// The way back from the growing edge to where it starts, inside its component: the fewest edges,
+// and among those the ones the walk found first.
+fn path_back(from: Int, to: Int) -> List[Int] {
+    let mut out: List[Int] = []
+    if from == to { return out }
+    let comp = decl_check.scc_of.get(from) ?? -1
+    let mut reached_by: Map[Int, Int] = Map()
+    reached_by.insert(from, -1)
+    let mut queue = [from]
+    let mut qi = 0
+    while qi < queue.len() && !reached_by.contains_key(to) {
+        let v = queue.get(qi).unwrap()
+        qi = qi + 1
+        for ei in decl_check.edges_from.get(v) ?? [] {
+            let w = decl_check.edges.get(ei).unwrap().to
+            if (decl_check.scc_of.get(w) ?? -2) == comp && !reached_by.contains_key(w) {
+                reached_by.insert(w, ei)
+                queue.push(w)
+            }
+        }
+    }
+    let mut at = to
+    while at != from {
+        let ei = reached_by.get(at) ?? -1
+        if ei < 0 { return [] }
+        out.push(ei)
+        at = decl_check.edges.get(ei).unwrap().from
+    }
+    let mut back: List[Int] = []
+    let mut bi = out.len() - 1
+    while bi >= 0 {
+        back.push(out.get(bi).unwrap())
+        bi = bi - 1
+    }
+    back
+}
+
+// A diagnostic never prints a type in full (§3.4): past depth 3 it reads `...`. The size of a
+// type has no limit, so this never asks for the text of a whole type.
+fn shown_type(tid0: Int) -> Str {
+    shown_type_at(tid0, 0)
+}
+
+fn shown_type_at(tid0: Int, depth: Int) -> Str {
+    let tid = tc_resolve(tid0)
+    let n = tc_tid_child_count(tid)
+    if n == 0 { return tc_type_str(tid) }
+    if depth >= 3 { return "..." }
+    let mut kids: List[Str] = []
+    let mut i = 0
+    while i < n {
+        kids.push(shown_type_at(tc_tid_child(tid, i), depth + 1))
+        i = i + 1
+    }
+    let k = tc_tid_kind(tid)
+    if k == TyKind.Tuple { return "({kids.join(", ")})" }
+    if k == TyKind.Fn { return "fn({kids.slice(1, n).join(", ")}) -> {kids.get(0).unwrap()}" }
+    "{constructor_name(tid, k)}[{kids.join(", ")}]"
+}
+
+fn constructor_name(tid: Int, k: TyKind) -> Str {
+    match k {
+        TyKind.List => "List"
+        TyKind.Option => "Option"
+        TyKind.Set => "Set"
+        TyKind.Map => "Map"
+        TyKind.Result => "Result"
+        TyKind.Handle => "Handle"
+        TyKind.Channel => "Channel"
+        TyKind.Ptr => "Ptr"
+        TyKind.Template => "Template"
+        TyKind.Iterator => "Iterator"
+        TyKind.Range => "Range"
+        _ => tc_tid_name(tid)
+    }
+}
+
+fn shown_types(tids: List[Int]) -> List[Str] {
+    let mut out: List[Str] = []
+    for t in tids { out.push(shown_type(t)) }
+    out
+}
+
+fn impl_of_method(m: Int) -> Int {
+    match decl_check.method_impl.get(m) {
+        Some(im) => im
+        None => own_generic_method_impl.get(m) ?? -1
+    }
+}
+
+// How source spells the impl, with each binder replaced as `at` says.
+fn impl_header_text(im: Int, at: Map[Str, Str]) -> Str {
+    let mut recv_shown: List[Str] = []
+    let recv_sl = node_recv_type_args(im)
+    let mut i = 0
+    while i < sl_len(recv_sl) {
+        let name = node_name(sublist_get(recv_sl, i))
+        recv_shown.push(at.get(name) ?? name)
+        i = i + 1
+    }
+    let recv = if recv_shown.len() > 0 { "{node_name(im)}[{recv_shown.join(", ")}]" } else { node_name(im) }
+    let tr = node_trait_name(im)
+    if tr == "" { recv } else { "{tr} for {recv}" }
+}
+
+// A declaration at these type arguments, as an error names it: `r[List[T]]` or
+// `Deep for Box[Box[T]]`. A poly method's own binders follow its impl's in `params`.
+fn decl_at(decl: Int, params: List[Str], args: List[Str]) -> Str {
+    let name = node_name(decl)
+    if !decl_check.method_impl.contains_key(decl) { return "{name}[{args.join(", ")}]" }
+    let im = decl_check.method_impl.get(decl).unwrap()
+    let n_impl = sl_len(node_impl_binders(im))
+    let mut at: Map[Str, Str] = Map()
+    let mut i = 0
+    while i < n_impl && i < args.len() {
+        at.insert(params.get(i).unwrap(), args.get(i).unwrap())
+        i = i + 1
+    }
+    let header = impl_header_text(im, at)
+    if args.len() > n_impl { "{header}.{name}[{args.slice(n_impl, args.len()).join(", ")}]" } else { header }
+}
+
+fn own_params_of(decl: Int) -> List[Str] {
+    if node_kind(decl) == NodeKind.TypeDef { return binder_names(node_type_params(decl)) }
+    match decl_check.method_impl.get(decl) {
+        Some(im) => {
+            let mut out = binder_names(node_impl_binders(im))
+            for name in binder_names(node_type_params(decl)) { out.push(name) }
+            out
+        }
+        None => binder_names(node_type_params(decl))
+    }
+}
+
+// The declaration a parameter name belongs to, for the line `T` of `Deep for Box[T]`.
+fn param_owner(decl: Int, param: Str) -> Str {
+    let im = impl_of_method(decl)
+    if im >= 0 && binder_names(node_impl_binders(im)).contains(param) { return impl_header_text(im, Map()) }
+    node_name(decl)
+}
+
+fn first_typevar(tid0: Int) -> Str {
+    let tid = tc_resolve(tid0)
+    if tc_tid_kind(tid) == TyKind.Typevar { return tc_tid_name(tid) }
+    let mut i = 0
+    while i < tc_tid_child_count(tid) {
+        let found = first_typevar(tc_tid_child(tid, i))
+        if found != "" { return found }
+        i = i + 1
+    }
+    ""
+}
+
+// The argument a line of the chain tells about: one that grew, else one that names a parameter
+// of the declaration, else the first.
+fn telling_arg(e: DeclEdge) -> Int {
+    for t in e.args {
+        if tc_type_arg_grows(t) { return t }
+    }
+    for t in e.args {
+        if first_typevar(t) != "" { return t }
+    }
+    e.args.get(0).unwrap()
+}
+
+fn edge_param(e: DeclEdge) -> Str {
+    let found = first_typevar(telling_arg(e))
+    if found != "" { found } else { e.params.get(0) ?? "" }
+}
+
+fn edge_owner(e: DeclEdge) -> Str {
+    let found = first_typevar(telling_arg(e))
+    if found != "" { param_owner(e.from, found) } else { param_owner(e.to, edge_param(e)) }
+}
+
+fn edge_line(e: DeclEdge) -> Str {
+    "`{edge_param(e)}` of `{edge_owner(e)}` becomes `{shown_type(telling_arg(e))}`"
+}
+
+// A node with no written span still has the place where it starts.
+fn site_span(site: Int) -> (Int, Int, Int, Int) {
+    let (line, col, end_line, end_col) = node_written_span(site)
+    if line != 0 { return (line, col, end_line, end_col) }
+    (node_line(site), node_col(site), node_end_line(site), node_end_col(site))
+}
+
+fn diag_edge_of(e: DeclEdge) -> DiagEdge {
+    let (line, col, end_line, end_col) = site_span(e.site)
+    DiagEdge {
+        decl: edge_owner(e), param: edge_param(e), becomes: shown_type(telling_arg(e)),
+        file: diag_file_for_node(e.site), line: line, col: col, end_line: end_line, end_col: end_col,
+    }
+}
+
+// A message holds at most about 20 lines of declared forms (§3.4).
+let CYCLE_NOTE_LINES: Int = 18
+
+fn report_cycle(grown: Int) ! Diag.Report {
+    let e = decl_check.edges.get(grown).unwrap()
+    let chain = path_back(e.to, e.from)
+    let mut on_chain: Map[Int, Int] = Map()
+    on_chain.insert(grown, 1)
+    for ei in chain { on_chain.insert(ei, 1) }
+    let mut notes: List[Str] = []
+    let mut edges = [diag_edge_of(e)]
+    for ei in chain {
+        let link = decl_check.edges.get(ei).unwrap()
+        edges.push(diag_edge_of(link))
+    }
+    if chain.len() > 0 {
+        notes.push("the chain: {edge_line(e)}")
+        for ei in chain { notes.push("then {edge_line(decl_check.edges.get(ei).unwrap())}") }
+    }
+    // A growing edge the chain does not pass through still has to go, so the error names it.
+    let comp = decl_check.scc_of.get(e.from) ?? -1
+    let mut i = 0
+    while i < decl_check.edges.len() {
+        let other = decl_check.edges.get(i).unwrap()
+        if !on_chain.contains_key(i) && edge_grows(other) && (decl_check.scc_of.get(other.from) ?? -1) == comp && (decl_check.scc_of.get(other.to) ?? -2) == comp {
+            let (other_line, other_col, _, _) = site_span(other.site)
+            notes.push("also, {edge_line(other)}, at {diag_file_for_node(other.site)}:{other_line}:{other_col}")
+            edges.push(diag_edge_of(other))
+        }
+        i = i + 1
+    }
+    if notes.len() > CYCLE_NOTE_LINES {
+        let hidden = notes.len() - CYCLE_NOTE_LINES
+        notes = notes.slice(0, CYCLE_NOTE_LINES)
+        notes.push("and {hidden} more; `--json` lists each edge")
+    }
+    let inside = decl_at(e.from, own_params_of(e.from), own_params_of(e.from))
+    let needs = decl_at(e.to, e.params, shown_types(e.args))
+    let (line, col, end_line, end_col) = site_span(e.site)
+    let before = diag_entry_count()
+    diag_error_span_label_at_notes("InstantiationCycle", INSTANTIATION_CYCLE,
+        "`{node_name(e.from)}` needs `{needs}` inside `{inside}`, without end", e.site, line, col, if end_line == line { end_col } else { 0 },
+        "{edge_line(e)} here", cycle_help(e), notes)
+    diag_set_edges_since(before, edges)
+}
+
+fn cycle_help(e: DeclEdge) -> Str {
+    let d = node_name(e.from)
+    let p = edge_param(e)
+    if node_kind(e.from) == NodeKind.TypeDef {
+        let head = "{d}[{own_params_of(e.from).join(", ")}]"
+        if tc_tid_kind(tc_resolve(telling_arg(e))) == TyKind.Tuple {
+            return "write a recursive type: `type {head} \{ Leaf(v: {p}), Node(l: {head}, r: {head}) }`.\nThis gives up the guarantee of `{decl_at(e.to, e.params, shown_types(e.args))}` that both sides have the same depth"
+        }
+        return "write a recursive type: `type {head} \{ One(v: {p}), Many(items: List[{head}]) }`"
+    }
+    let nest = "`type Nest[T] \{ One(v: T), Many(items: List[Nest[T]]) }`"
+    if impl_of_method(e.from) >= 0 {
+        return "take a recursive type in place of `{p}`, as in {nest}. A receiver of that type has a type argument that does not grow"
+    }
+    "take a recursive type in place of `{p}`, as in {nest} with `fn {d}[T](x: Nest[T], n: Int)`.\nThen `{d}(Nest.Many([x]), n - 1)` has a type argument that does not grow"
 }
