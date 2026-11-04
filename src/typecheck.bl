@@ -3012,9 +3012,10 @@ type CallFacts {
     reported: Map[Int, Int]
     self_views: Map[Int, Int]
     view_sigs: Map[Int, Int]
+    hash_aliases_above: List[Int]
 }
 fn new_call_facts() -> CallFacts {
-    CallFacts { open_calls: [], open_group: Map(), open_tids: [], reported: Map(), self_views: Map(), view_sigs: Map() }
+    CallFacts { open_calls: [], open_group: Map(), open_tids: [], reported: Map(), self_views: Map(), view_sigs: Map(), hash_aliases_above: [] }
 }
 let mut tc_calls: CallFacts = new_call_facts()
 
@@ -5120,6 +5121,11 @@ pub fn substitute_typevar_tid(t0: Int, binds: Map[Str, Int]) -> Int {
         let inner = substitute_typevar_tid(e.inner1, binds)
         if inner == e.inner1 { return t }
         return make_range_type(inner)
+    }
+    if k == TyKind.Raw {
+        let inner = substitute_typevar_tid(e.inner1, binds)
+        if inner == e.inner1 { return t }
+        return make_raw_type(inner)
     }
     if k == TyKind.Ptr {
         let inner = substitute_typevar_tid(e.inner1, binds)
@@ -11294,9 +11300,12 @@ fn resolve_type_parts(name: Str, elems_sl: Int, ann_node: Int) -> Int ! TypeChec
     // while the annotation/param path lowered it to Int (two spellings of one
     // type), and an alias-keyed map inside a compound carrier emitted a void key
     // temp. The annotation node still names what the user wrote for diagnostics.
-    // A generic alias applied to arguments owes the same Hash checks as the type it names.
-    if tc_suppress_ann_validation == 0 && elems_sl != -1 && tc_alias_underlying_of(name) != -1 {
-        tc_validate_type_arg_hashability(tc_hash_oblig_of(name), elems_sl)
+    let written_alias = tc_alias_decl_of_written(name)
+    if written_alias != -1 {
+        // An alias that names a later generic alias settles it first, because applying it needs
+        // its target: `type B[Y] = A[Y]` before `type A[X] = P[X]` has no other way to reach `P[Y]`.
+        tc_settle_alias_decl(written_alias)
+        if tc_generic_alias_decl_applies(written_alias, elems_sl) { return tc_apply_generic_alias(written_alias, name, elems_sl, ann_node) }
     }
     let alias_name_tid = tc_resolve_transparent_alias_name(name)
     if alias_name_tid != -1 {
@@ -11345,6 +11354,110 @@ fn resolve_type_parts(name: Str, elems_sl: Int, ann_node: Int) -> Int ! TypeChec
     // underlying" leak (the positions name-resolution does not walk) must be closed in the
     // name-resolution walker with its full acceptance set, not in this fallback.
     make_typevar(name)
+}
+
+// The declaration of the generic alias `name` means when `elems_sl` gives it an argument for
+// each of its parameters, or -1. An alias still being settled also answers -1: a cycle of
+// aliases has no target to read yet.
+fn tc_generic_alias_applied(name: Str, elems_sl: Int) -> Int {
+    if elems_sl == -1 || tc_alias_underlying.len() == 0 { return -1 }
+    let decl = tc_alias_decl_of_written(name)
+    if decl == -1 || !tc_generic_alias_decl_applies(decl, elems_sl) { return -1 }
+    decl
+}
+
+fn tc_generic_alias_decl_applies(decl: Int, elems_sl: Int) -> Bool {
+    if elems_sl == -1 { return false }
+    let tparams = node_type_params(decl)
+    if tparams == -1 || sublist_length(tparams) != sublist_length(elems_sl) { return false }
+    (tc_alias_underlying.get(tc_nominal_type_name(decl)) ?? -1) != -1
+}
+
+// Whether alias `decl`'s target holds parameter `i`, after the alias's own aliases are flat.
+// `Fixed[X] = Box[Int]` holds none, so an argument in that place supplies nothing.
+fn tc_generic_alias_keeps_param(decl: Int, i: Int) -> Bool {
+    let tp = sublist_get(node_type_params(decl), i)
+    let target = tc_alias_underlying.get(tc_nominal_type_name(decl)) ?? -1
+    let mut probe: Map[Str, Int] = Map()
+    probe.insert(tc_binder_key(tp, node_name(tp)), TYPE_INT)
+    substitute_typevar_tid(target, probe) != target
+}
+
+// The alias declaration the written `name` reaches, or -1. Through the named type, so a
+// renamed import and a namesake reach the declaration the reading file selected.
+fn tc_alias_decl_of_written(name: Str) -> Int {
+    let t = lookup_named_type(name)
+    if t == -1 || (type_kind(t) != TyKind.Struct && type_kind(t) != TyKind.Enum) { return -1 }
+    let decl = tc_tid_decl_node(t)
+    if decl < 0 || node_kind(decl) != NodeKind.TypeDef || node_value(decl) == -1 { return -1 }
+    decl
+}
+
+// A generic alias means its target with its arguments in place of its parameters. The target
+// has its own parameters, so the arguments never bind them by position: `Swap[A, B] =
+// Pair[B, A]` reorders them and `Fixed[X] = Box[Int]` drops one.
+@allow(UnrestoredMutation)
+fn tc_apply_generic_alias(decl: Int, name: Str, elems_sl: Int, ann_node: Int) -> Int ! TypeCheck.Resolve, Diag.Report {
+    if tc_type_name_poisoned(name) { return tc_error_recovery_tid() }
+    if tc_suppress_ann_validation == 0 {
+        tc_validate_type_arg_hashability(tc_hash_oblig_at(decl), elems_sl)
+    }
+    let saved_suppress = tc_suppress_ann_validation
+    tc_suppress_ann_validation = 1
+    let mut args: List[Int] = []
+    let mut i = 0
+    while i < sublist_length(elems_sl) {
+        args.push(resolve_type_ann(sublist_get(elems_sl, i)))
+        i = i + 1
+    }
+    tc_suppress_ann_validation = saved_suppress
+    let target = tc_alias_underlying.get(tc_nominal_type_name(decl)) ?? -1
+    let applied = tc_tid_subst_mono(target, node_type_params(decl), args)
+    if ann_node >= 0 && ann_node < tc_node_tid.len() {
+        tc_node_tid.set(ann_node, applied)
+    }
+    applied
+}
+
+// Whether the annotation names a generic alias at its arguments. Its resolved tid is already
+// the target at the right arguments, so a reader that rebuilds an instance from the written
+// arguments must not: they are the alias's, not the target's.
+fn tc_ann_is_applied_generic_alias(ann_node: Int) -> Bool {
+    let elems_sl = node_elements(ann_node)
+    if elems_sl == -1 { return false }
+    let name = node_name(ann_node)
+    tc_generic_alias_applied(name, elems_sl) != -1 && tc_compiler_known_type_meant(name, ann_node) == ""
+}
+
+// Resolves the target of an alias not yet settled, in the alias's own scope. It may run in the
+// middle of another alias's target, whose binders and module are not in scope here. The entry
+// reads -1 while the target resolves, which is what a name with no alias reads.
+@allow(UnrestoredMutation)
+fn tc_settle_alias_decl(atd: Int) ! TypeCheck.Resolve, Diag.Report {
+    // E0524 rejected the declaration, so the builtin keeps the name.
+    if node_value(atd) == -1 || tc_type_name_is_undeclarable(node_name(atd)) { return }
+    let key = tc_nominal_type_name(atd)
+    if tc_alias_underlying.contains_key(key) { return }
+    tc_alias_underlying.insert(key, -1)
+    let saved_module = nr_current_module
+    let saved_frames = tc_tp_frames
+    let saved_active = tc_active_tparams
+    let saved_suppress = tc_suppress_ann_validation
+    nr_current_module = node_module(atd)
+    tc_tp_frames = []
+    tc_active_tparams = Map()
+    tc_suppress_ann_validation = 0
+    // The alias's own binders are in scope inside its underlying type, so
+    // a binder that shadows a builtin (`type Wrap[List] = List`) is a type
+    // variable there, not the constructor (§3.4:1259).
+    let alias_tparams = node_type_params(atd)
+    tc_push_tparam_scope(alias_tparams)
+    tc_alias_underlying.insert(key, resolve_type_ann(node_value(atd)))
+    tc_pop_tparam_scope(alias_tparams)
+    tc_suppress_ann_validation = saved_suppress
+    tc_active_tparams = saved_active
+    tc_tp_frames = saved_frames
+    nr_current_module = saved_module
 }
 
 // The one write of an impl block's receiver tid — i.e. what `self` is — made while the header
@@ -11540,6 +11653,7 @@ fn tc_produce_enum_instance_tid(ann_node: Int, name: Str, elems_sl: Int) -> Int 
 // covers only tc_suppress_ann_validation, so the mutation-analyzer flag is expected.
 @allow(UnrestoredMutation)
 fn tc_fnsig_param_instance_tid(ann_node: Int, bare_tid: Int) -> Int ! TypeCheck.Resolve, Diag.Report {
+    if tc_ann_is_applied_generic_alias(ann_node) { return -1 }
     let bk = type_kind(bare_tid)
     // A CONTAINER param/return (`Map[Str, Box[T]]`, `List[Box[T]]`, …) whose element
     // is a generic user-struct: resolve_type_ann once erased that element to its bare
@@ -11611,7 +11725,7 @@ fn tc_fnsig_param_instance_tid(ann_node: Int, bare_tid: Int) -> Int ! TypeCheck.
 // generic user-enum with type-args.
 @allow(UnrestoredMutation)
 fn tc_evfield_instance_tid(ann_node: Int, bare_tid: Int) -> Int ! TypeCheck.Resolve, Diag.Report {
-    if type_kind(bare_tid) != TyKind.Enum { return -1 }
+    if type_kind(bare_tid) != TyKind.Enum || tc_ann_is_applied_generic_alias(ann_node) { return -1 }
     let elems_sl = node_elements(ann_node)
     if elems_sl == -1 || sublist_length(elems_sl) < 1 { return -1 }
     let saved_suppress = tc_suppress_ann_validation
@@ -12561,6 +12675,18 @@ fn tc_tuple_hash_fact(tid: Int) -> Int {
 }
 
 fn tc_nominal_hash_fact(tid: Int) -> Int {
+    // A derive written on an alias grants nothing: the alias is its target.
+    let target = resolve_alias_tid(tid)
+    if target != tid {
+        // Aliases that name each other, in a tuple or through a derived generic's field, have
+        // no finite value, so no hash. The walk leaves this function at a derive, so the
+        // aliases above it are not a parameter.
+        if tc_need_visited(tc_calls.hash_aliases_above, tid) { return -1 }
+        tc_calls.hash_aliases_above.push(tid)
+        let fact = tc_tid_hash_fact(target)
+        let _ = tc_calls.hash_aliases_above.pop()
+        return fact
+    }
     // A type with no declaration node is compiler-provided; its Hash is not ours to judge.
     let td = tc_type_decl_node_by_tid.get(tid) ?? -1
     if td == -1 && tc_decl_node_for_type(tc_tid_name(tid)) == -1 { return 0 }
@@ -13217,7 +13343,9 @@ fn tc_check_one_derive_trait_field(f: Int, ftid: Int, tname: Str, tr: Str) ! Dia
         tc_check_derive_eq_field(f, ftid, tname, generic_help)
         return
     }
-    if tc_field_type_derivable(ftype_name, tr) == 0 {
+    // A generic alias's target holds its arguments, so its name alone says too little.
+    let judged = if tc_ann_is_applied_generic_alias(ann) { tc_tid_name(tc_resolve(ftid)) } else { ftype_name }
+    if tc_field_type_derivable(judged, tr) == 0 {
         diag_error_at("NonDerivableTrait", NON_DERIVABLE_TRAIT, "@derive({tr}) on `{tname}`: field `{node_name(f)}` has type `{ftype_name}` which does not implement {tr}", f, generic_help)
     }
 }
@@ -16612,22 +16740,7 @@ fn tc_register_type_decls(types_sl: Int) ! TypeCheck.Register, TypeCheck.Resolve
     // resolves to its real instance tid instead of an orphan typevar.
     let mut j = 0
     while j < sublist_length(types_sl) {
-        let atd = sublist_get(types_sl, j)
-        let alias_ann = node_value(atd)
-        // E0524 rejected the declaration, so the builtin keeps the name.
-        if alias_ann != -1 && !tc_type_name_is_undeclarable(node_name(atd)) {
-            // The alias's own binders are in scope inside its underlying type, so
-            // a binder that shadows a builtin (`type Wrap[List] = List`) is a type
-            // variable there, not the constructor (§3.4:1259).
-            let alias_tparams = node_type_params(atd)
-            let atd_module = node_module(atd)
-            let saved_module = nr_current_module
-            nr_current_module = atd_module
-            tc_push_tparam_scope(alias_tparams)
-            tc_alias_underlying.insert(tc_nominal_type_name(atd), resolve_type_ann(alias_ann))
-            tc_pop_tparam_scope(alias_tparams)
-            nr_current_module = saved_module
-        }
+        tc_settle_alias_decl(sublist_get(types_sl, j))
         j = j + 1
     }
     // Third pass: resolve enum variant payloads and struct field types.
@@ -25903,6 +26016,9 @@ pub fn resolve_alias_tid(tid: Int) -> Int {
     if tc_alias_underlying.len() == 0 { return tid }
     if tid < 0 || tid >= ty_pool.len() { return tid }
     let entry = ty_pool.get(tid).unwrap()
+    // A type parameter named like an alias binds its own type: a program's `type K = List[Int]`
+    // says nothing about the `K` of `fn map_filter[K, V]`.
+    if entry.kind == TyKind.Typevar { return tid }
     let name = entry.name
     // The builtin's own tid has the compiler-known name too, but it is not the alias that
     // shadows that name; only a declaration's tid is.
@@ -39351,9 +39467,10 @@ fn tc_ann_names_tparam(ann: Int, param_name: Str) -> Bool {
     if tc_ann_names_tparam(node_type_ann(ann), param_name) { return true }
     let elems_sl = node_elements(ann)
     if elems_sl == -1 { return false }
+    let alias = tc_generic_alias_applied(node_name(ann), elems_sl)
     let mut i = 0
     while i < sublist_length(elems_sl) {
-        if tc_ann_names_tparam(sublist_get(elems_sl, i), param_name) { return true }
+        if (alias == -1 || tc_generic_alias_keeps_param(alias, i)) && tc_ann_names_tparam(sublist_get(elems_sl, i), param_name) { return true }
         i = i + 1
     }
     false

@@ -1,0 +1,50 @@
+// A generic alias means its target, so each check that reads a type asks about the target and
+// not about the alias's written arguments.
+
+import compile_test_helpers.{compile_and_capture, expect_compiles_clean}
+
+fn count(out: Str, code: Str) -> Int {
+    out.split("\"code\":\"{code}\"").len() - 1
+}
+
+fn errors(out: Str) -> Int {
+    out.split("\"severity\":\"error\"").len() - 1
+}
+
+let BOX = "type Box[T] \{ x: T \}\n"
+let MAIN = "fn main() \{ io.println(\"hi\") \}\n"
+
+test "an alias that drops its parameter gives a binder no source" {
+    let fixed = compile_and_capture("{BOX}type Fixed[X] = Box[Int]\nfn f[T](a: Fixed[T]) -> Int \{ a.x \}\nfn main() \{ io.println(\"\{f(Box \{ x: 1 \})\}\") \}\n", "_alias_dropped")
+    assert_eq(count(fixed, "E0301"), 1, fixed)
+    assert_eq(errors(fixed), 1, fixed)
+    let flat = compile_and_capture("type Ig[X] = Int\nfn f[T](a: Ig[T]) -> Int \{ a \}\nfn main() \{ io.println(\"\{f(1)\}\") \}\n", "_alias_dropped_flat")
+    assert_eq(count(flat, "E0301"), 1, flat)
+    let nested = compile_and_capture("{BOX}type Fixed[X] = Box[Int]\nfn f[T](a: List[Fixed[T]]) -> Int \{ a.len() \}\nfn main() \{ let a: List[Fixed[Str]] = []\n io.println(\"\{f(a)\}\") \}\n", "_alias_dropped_nested")
+    assert_eq(count(nested, "E0301"), 1, nested)
+}
+
+test "an alias cycle through a derived generic has no hash, and the compiler does not overflow" {
+    let nb = "@derive(Eq, Hash)\ntype NB[T] \{ x: T \}\n"
+    let plain = compile_and_capture("{nb}type C = NB[C]\nfn main() \{ let m: Map[C, Int] = Map()\n io.println(\"\{m.len()\}\") \}\n", "_alias_cycle_plain")
+    assert_eq(count(plain, "E1400"), 1, plain)
+    let applied = compile_and_capture("{nb}type G[X] = NB[G[X]]\nfn main() \{ let m: Map[G[Int], Int] = Map()\n io.println(\"\{m.len()\}\") \}\n", "_alias_cycle_applied")
+    assert_eq(count(applied, "E1400"), 1, applied)
+    let call = compile_and_capture("{nb}type C = NB[C]\nfn f[T](s: Set[T], t: T) -> Int \{ s.len() \}\nfn g(s: Set[C], c: C) -> Int \{ f(s, c) \}\n{MAIN}", "_alias_cycle_call")
+    assert(errors(call) >= 1, call)
+}
+
+test "a derive judges a field of alias type by what the alias means at its arguments" {
+    let self2 = "type Self2[X] = X\n"
+    let hash_bad = compile_and_capture("{self2}@derive(Hash, Eq)\ntype H \{ a: Self2[Float] \}\n{MAIN}", "_alias_derive_hash")
+    assert_eq(count(hash_bad, "E1401"), 1, hash_bad)
+    let ord_bad = compile_and_capture("{self2}@derive(Eq)\ntype EO \{ a: Int \}\n@derive(Eq, Ord)\ntype H \{ a: Self2[EO] \}\n{MAIN}", "_alias_derive_ord")
+    assert_eq(count(ord_bad, "E1401"), 1, ord_bad)
+    expect_compiles_clean(compile_and_capture("{self2}@derive(Hash, Eq, Ord)\ntype H \{ a: Self2[Int] \}\n{MAIN}", "_alias_derive_ok"), "alias to Int derives")
+}
+
+test "a wrong number of arguments to an alias reports the count and nothing else" {
+    let out = compile_and_capture("type S[X] = Set[X]\nfn main() \{ let a: S[Float, Int] = Set()\n io.println(\"\{a.len()\}\") \}\n", "_alias_arity")
+    assert_eq(count(out, "E0303"), 1, out)
+    assert_eq(errors(out), 1, out)
+}
