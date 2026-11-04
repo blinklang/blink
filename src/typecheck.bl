@@ -6998,14 +6998,27 @@ fn tc_check_poisoned_call_args(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.
     tc_error_recovery_tid()
 }
 
-// The signature a module-qualified call names. Name resolution recorded the declaration the
-// qualifier reaches, and that settles it: the bare spelling may name a namesake in the
-// caller's own module or in another import.
-fn tc_qualified_call_fnsig(node: Int, method: Str) -> Int {
-    match fnsig_by_decl.get(tc_call_decl_node(node)) {
-        Some(s) => s
-        None => lookup_fnsig(method)
+// The module a qualifier binds in the file that holds this site, or "". A qualifier that no
+// file loaded has its error at the failed import, and has no members to ask about. One that
+// only another file binds names no module here.
+fn tc_site_qualifier_module(qualifier: Str, site: Int) -> Str {
+    if is_import_module_name(qualifier) == 0 { return "" }
+    nr_qualifier_module_in(qualifier, tc_site_module(site))
+}
+
+// The signature a module-qualified call names. The declaration the qualifier reaches settles
+// it: the bare spelling may name a namesake in the caller's own module or in another import.
+// Name resolution does not walk a trait default body or a contract, so a call there has no
+// record until this asks.
+fn tc_qualified_call_fnsig(node: Int, qualifier: Str, method: Str) -> Int ! Diag.Report {
+    if tc_call_decl_node(node) == -1 {
+        let site_module = tc_site_module(node)
+        let outer_module = nr_current_module
+        nr_current_module = site_module
+        nr_record_qualified_call(node, qualifier, method)
+        nr_current_module = outer_module
     }
+    fnsig_by_decl.get(tc_call_decl_node(node)) ?? -1
 }
 
 // Validate a call against a fnsig: its keyword shape, its argument count, and each
@@ -19539,6 +19552,42 @@ fn nr_reexport_sources(target: Str, member: Str) -> List[Str] {
     out
 }
 
+// Each name a qualifier on `target` can reach from nr_current_module: its `pub` items in either
+// namespace, and what it re-exports with `pub import`. A module's own qualifier reaches its
+// private items too. A re-export list is not a promise: it can name a private item or nothing.
+fn nr_reachable_member_names(target: Str, depth: Int, out: List[Str]) ! Diag.Report {
+    if depth >= 8 { return }
+    for name in nr_module_names_of(target).decls.keys() {
+        if out.contains(name) { continue }
+        let is_pub_value = nr_module_decl_in(target, "value", name) != -1 && nr_is_private_in("value", name, target) == 0
+        let is_pub_type = nr_module_decl_in(target, "type", name) != -1 && nr_is_private_in("type", name, target) == 0
+        if is_pub_value || is_pub_type || target == nr_current_module { out.push(name) }
+    }
+    let prefix = "{target}:"
+    let wildcard = "*:"
+    for key in tc_reexport_source.keys() {
+        if !key.starts_with(prefix) { continue }
+        let rest = key.byte_slice(prefix.byte_len(), key.byte_len())
+        if rest.starts_with(wildcard) {
+            nr_reachable_member_names(rest.byte_slice(wildcard.byte_len(), rest.byte_len()), depth + 1, out)
+        } else if !out.contains(rest) && nr_reexport_reach("value", target, rest, 0) == 2 {
+            out.push(rest)
+        }
+    }
+}
+
+// The member to suggest for a qualified name that `target` does not declare, or "". A name at
+// the far edge of the nearest-name distance is more often a different name than a typo.
+fn nr_near_module_member(target: Str, member: Str) -> Str ! Diag.Report {
+    let mut names: List[Str] = []
+    nr_reachable_member_names(target, 0, names)
+    let near = nearest_name(member, names)
+    if near == "" { return "" }
+    let key = nearest_name_key(member)
+    let threshold = key.byte_len() / 3
+    if threshold > 1 && str_levenshtein(key, nearest_name_key(near)) >= threshold { "" } else { near }
+}
+
 // A module qualifier settles the module before any name is looked up, so an alias another
 // file bound to the same spelling has nothing to say here.
 fn nr_resolve_qualified_decl(qualifier: Str, member: Str) -> Int {
@@ -19673,6 +19722,18 @@ fn nr_qualified_private_access(space: Str, qualifier: Str, name: Str) -> Int ! D
     if nr_space_private(target, space, name) != 0 { return 1 }
     if nr_module_decl(target, name) != -1 { return 0 }
     if nr_reexport_reach(space, target, name, 0) == 1 { 1 } else { 0 }
+}
+
+// What a call through a module qualifier owes in the module of nr_current_module: the privacy
+// check, the import it uses, and the declaration it reaches.
+fn nr_record_qualified_call(node: Int, qualifier: Str, method: Str) ! Diag.Report {
+    if nr_qualified_private_access("value", qualifier, method) != 0 {
+        nr_emit_private_access(method, nr_qualified_use_decl("value", qualifier, method), node)
+    } else {
+        tc_mark_symbol_used(method)
+    }
+    nr_note_call_decl(node, nr_resolve_qualified_decl(qualifier, method))
+    tc_mark_qualifier_used(qualifier)
 }
 
 fn nr_qualified_target(qualifier: Str) -> Str {
@@ -24504,16 +24565,9 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
         let mut is_module_qual = 0
         if obj != -1 && node_kind(obj) == NodeKind.Ident {
             let obj_name = node_name(obj)
-            if nr_qualifier_module_here(obj_name) != "" && nr_is_defined(obj_name) == 0 {
+            if nr_qualifier_module_here(obj_name) != "" && nr_receiver_is_defined(obj_name) == 0 {
                 is_module_qual = 1
-                let mq_method = node_method(node)
-                if nr_qualified_private_access("value", obj_name, mq_method) != 0 {
-                    nr_emit_private_access(mq_method, nr_qualified_use_decl("value", obj_name, mq_method), node)
-                } else {
-                    tc_mark_symbol_used(mq_method)
-                }
-                nr_note_call_decl(node, nr_resolve_qualified_decl(obj_name, mq_method))
-                tc_mark_qualifier_used(obj_name)
+                nr_record_qualified_call(node, obj_name, node_method(node))
             }
         }
         if is_module_qual == 0 && obj != -1 {
@@ -30061,10 +30115,13 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                     return TYPE_VOID
                 }
             }
-            if is_import_module_name(obj_name) != 0 && nr_receiver_is_defined(obj_name) == 0 && (is_intrinsic_method(obj_name, method) == 0 || tc_ns_call_reads_module(obj_name) != 0) {
+            if tc_site_qualifier_module(obj_name, node) != "" && nr_receiver_is_defined(obj_name) == 0 && (is_intrinsic_method(obj_name, method) == 0 || tc_ns_call_reads_module(obj_name) != 0) {
                 if tc_call_is_skip_intrinsic(node) { return tc_check_skip_call(node) }
-                let sig = tc_qualified_call_fnsig(node, method)
+                let sig = tc_qualified_call_fnsig(node, obj_name, method)
                 if sig != -1 { return tc_check_free_call("{obj_name}.{method}", sig, node) }
+                // This file binds the qualifier to a module, so the arms below that read the
+                // receiver as a type have no say.
+                return tc_method_call_unanswered(node, method, obj_t, args_sl)
             }
             // Every path below reads the receiver Ident as a TYPE NAME. A name with
             // a binding in scope is a value, and `value.method()` is an instance call no
@@ -30361,8 +30418,8 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
             // names an import and is not shadowed by a binding. Fails CLOSED —
             // an unregistered key falls through to the existing behaviour rather
             // than guessing a type.
-            if is_import_module_name(obj_name) != 0 && nr_receiver_is_defined(obj_name) == 0 {
-                let qual_mod = tc_qualifier_module_at(obj_name, node)
+            let qual_mod = tc_site_qualifier_module(obj_name, node)
+            if qual_mod != "" && nr_receiver_is_defined(obj_name) == 0 {
                 let qual_decl = tc_module_let_decl_node(qual_mod, fname)
                 // Codegen has no file import list to ask which module an alias names.
                 nr_note_global_decl(node, qual_decl)
@@ -30380,7 +30437,7 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                     }
                     // A walk before the boundary check does not see a local that hides the
                     // module, and each later one reads this node again.
-                    if qual_fn == -1 && tc_boundary_check_active != 0 && !nr_is_call_on_collided_qualifier(node) && nr_qualifier_module_in(obj_name, tc_site_module(node)) != "" {
+                    if qual_fn == -1 && tc_boundary_check_active != 0 && !nr_is_call_on_collided_qualifier(node) {
                         if !tc_call_reported.contains_key(node) {
                             tc_call_reported.insert(node, 1)
                             tc_report_member_read_as_value(node, obj_name, fname)
@@ -39263,7 +39320,11 @@ fn tc_report_unclaimed_calls(order: List[Int], mods: List[Str]) ! Diag.Report {
                     "read all the input, then split it: `for line in io.read_all().lines() \{ ... }`\nor read one line at a time: `loop \{ match io.read_line() \{ Some(line) => ..., None => break } }`")
             } else if nr_is_call_on_collided_qualifier(uc) {
                 // E1012 already reports the mistake.
-            } else if is_builtin_namespace(q) == 1 || is_import_module_name(q) == 1 {
+            } else if nr_qualified_private_access("value", q, mname) != 0 {
+                // E1003 already reports the mistake, and the module does declare the name.
+            } else if is_builtin_namespace(q) == 1 || (is_import_module_name(q) == 1 && nr_qualifier_module_here(q) != "") {
+                // Elsewhere the spelling is not a loaded module of this file, so it has no
+                // members to miss.
                 tc_report_no_module_member(uc, q, mname)
             }
         }
@@ -39272,7 +39333,12 @@ fn tc_report_unclaimed_calls(order: List[Int], mods: List[Str]) ! Diag.Report {
 }
 
 fn tc_report_no_module_member(node: Int, q: Str, member: Str) ! Diag.Report {
-    let near = suggest_module_member(tc_qualifier_module_at(q, node), member)
+    let site_module = tc_site_module(node)
+    let target = tc_qualifier_module_at(q, node)
+    let outer_module = nr_current_module
+    nr_current_module = site_module
+    let near = nr_near_module_member(target, member)
+    nr_current_module = outer_module
     let help = if near != "" && near != member { "did you mean `{q}.{near}`?" } else { "" }
     diag_error_at("UnresolvedMethod", UNRESOLVED_METHOD, "no member `{member}` on module `{q}`", node, help)
 }

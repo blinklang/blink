@@ -1,0 +1,227 @@
+// A qualified name names a member of the one module its qualifier binds in the file that writes
+// it (section 10.1). A name another module declares under that spelling, or a bare name of that
+// spelling, does not answer for it. The miss is E0505 at the name (section 10.5).
+
+import compile_test_helpers
+
+let HAS = "pub fn real() -> Int \{ 1 }\npub let K_REAL = 3\n"
+let OTHER = "pub fn only_in_other(n: Int) -> Int \{ n }\npub let ONLY_IN_OTHER = 4\nfn private_in_other() -> Int \{ 5 }\n"
+let FWD = "import hasmod\nimport othermod\npub import hasmod.\{real}\npub fn fwd() -> Int \{ hasmod.K_REAL + othermod.only_in_other(1) + othermod.ONLY_IN_OTHER }\n"
+
+let NS_FN = "pub fn process() -> Int \{ 1 }\npub fn tie_a() -> Int \{ 2 }\npub fn tie_b() -> Int \{ 3 }\n"
+let WILD = "pub import hasmod\n"
+let PRIV_FWD = "pub import othermod.\{private_in_other, ghost_name, only_in_other}\n"
+let SELF_CALL = "fn helper_thing() -> Int \{ 1 }\npub fn f() -> Int \{ selfcall.helper_thng() + helper_thing() }\n"
+let SELF_READ = "let limit_value = 1\npub fn f() -> Int \{ selfread.limit_valu + limit_value }\n"
+let HIDDEN = "type Priv \{ PCirc(Int) PDot }\ntype Plain \{ n: Int }\npub fn p() -> Int \{ 1 }\n"
+let ALIASES = "import hasmod as Color\nimport hasmod as Duration\nimport hasmod as lgg\npub fn aliased() -> Int \{ Color.real() + Duration.real() + lgg.real() }\n"
+
+// The entry and four more modules, so a name has a home other than the module that is asked.
+fn compile_program(src: Str, tag: Str) -> Str ! Process.Spawn, FS.Write, FS.Read, Env.Read {
+    let dir = "{compile_test_helpers.scratch_root()}/{tag}/src"
+    let _mk = process.run("mkdir", ["-p", dir]).unwrap()
+    fs.write("{dir}/othermod.bl", OTHER).unwrap()
+    fs.write("{dir}/fwdmod.bl", FWD).unwrap()
+    fs.write("{dir}/nsfns.bl", NS_FN).unwrap()
+    fs.write("{dir}/aliases.bl", ALIASES).unwrap()
+    fs.write("{dir}/privfwd.bl", PRIV_FWD).unwrap()
+    fs.write("{dir}/selfcall.bl", SELF_CALL).unwrap()
+    fs.write("{dir}/selfread.bl", SELF_READ).unwrap()
+    fs.write("{dir}/hidden.bl", HIDDEN).unwrap()
+    fs.write("{dir}/wildmod.bl", WILD).unwrap()
+    compile_test_helpers.compile_xmod_capture(src, "hasmod", HAS, tag)
+}
+
+fn no_member(src: Str, member: Str, q: Str, tag: Str) ! Process.Spawn, FS.Write, FS.Read, Env.Read, IO.Print {
+    let out = compile_program(src, tag)
+    compile_test_helpers.expect_contains(out, "UnresolvedMethod", tag)
+    let want = "no member `{member}` on module `{q}`"
+    compile_test_helpers.expect_contains(out, want, tag)
+    assert_eq(out.split(want).len(), 2)
+    assert(!out.contains("internal compiler error"), out)
+}
+
+test "a call does not take the signature of a name another imported module declares" {
+    no_member("import hasmod\nimport othermod\nfn main() \{\n let _ = hasmod.only_in_other(1)\n let _ = othermod.only_in_other(1)\n}\n", "only_in_other", "hasmod", "qn_call_other")
+}
+
+test "a call does not take the signature of a name the module of the call declares" {
+    no_member("import hasmod\nfn mine() -> Int \{ 2 }\nfn main() \{\n let _ = mine()\n let _ = hasmod.mine()\n}\n", "mine", "hasmod", "qn_call_own")
+}
+
+test "a call does not reach a name the module only imports" {
+    no_member("import fwdmod\nfn main() \{\n let _ = fwdmod.fwd()\n let _ = fwdmod.only_in_other(1)\n}\n", "only_in_other", "fwdmod", "qn_call_import")
+}
+
+test "a call does not reach a free function spelled from the qualifier and the name" {
+    no_member("import hasmod\nfn hasmod_extra() -> Int \{ 2 }\nfn main() \{\n let _ = hasmod_extra()\n let _ = hasmod.extra()\n}\n", "extra", "hasmod", "qn_call_prefixed")
+}
+
+test "a call does not reach a free function when the module declares that name as something else" {
+    no_member("import hasmod\nfn hasmod_K_REAL() -> Str \{ \"x\" }\nfn main() \{\n let _ = hasmod_K_REAL()\n let _ = hasmod.K_REAL()\n}\n", "K_REAL", "hasmod", "qn_call_prefixed_let")
+}
+
+test "a call does not reach a private name of another module" {
+    no_member("import hasmod\nimport othermod\nfn main() \{\n let _ = othermod.ONLY_IN_OTHER\n let _ = hasmod.private_in_other()\n}\n", "private_in_other", "hasmod", "qn_call_private_elsewhere")
+}
+
+test "the arguments of a call to a missing member are still checked" {
+    let out = compile_program("import hasmod\nfn main() \{\n let _ = hasmod.nope(undefined_arg)\n}\n", "qn_call_arg")
+    compile_test_helpers.expect_contains(out, "no member `nope` on module `hasmod`", "qn_call_arg")
+    compile_test_helpers.expect_contains(out, "undefined_arg", "qn_call_arg")
+}
+
+test "a value read does not take the type of a name another imported module declares" {
+    no_member("import hasmod\nimport othermod\nfn main() \{\n let _ = hasmod.ONLY_IN_OTHER\n let _ = othermod.ONLY_IN_OTHER\n}\n", "ONLY_IN_OTHER", "hasmod", "qn_read_other")
+}
+
+test "a function named as a value does not take the type of a function another module declares" {
+    no_member("import hasmod\nimport othermod\nfn main() \{\n let _ = hasmod.only_in_other\n let _ = othermod.only_in_other\n}\n", "only_in_other", "hasmod", "qn_fnval_other")
+}
+
+// One mistake gives one diagnostic: the missing qualifier. The type of a name in a module this
+// file does not bind must not reach the file.
+fn only_the_undefined_qualifier(src: Str, tag: Str) ! Process.Spawn, FS.Write, FS.Read, Env.Read, IO.Print {
+    let out = compile_program(src, tag)
+    compile_test_helpers.expect_contains(out, "undefined variable `othermod`", tag)
+    compile_test_helpers.expect_contains(out, "add `import othermod`", tag)
+    assert(!out.contains("TypeError"), out)
+    assert(!out.contains("no member"), out)
+    assert(!out.contains("internal compiler error"), out)
+}
+
+test "a call through a qualifier only another file binds takes no signature" {
+    only_the_undefined_qualifier("import fwdmod\nfn main() \{\n let _ = fwdmod.fwd()\n let x: Str = othermod.only_in_other(1)\n let _ = x\n}\n", "qn_unbound_call")
+}
+
+test "a read through a qualifier only another file binds takes no type" {
+    only_the_undefined_qualifier("import fwdmod\nfn main() \{\n let _ = fwdmod.fwd()\n let x: Str = othermod.ONLY_IN_OTHER\n let _ = x\n}\n", "qn_unbound_read")
+}
+
+test "a function named as a value through a qualifier only another file binds takes no type" {
+    only_the_undefined_qualifier("import fwdmod\nfn main() \{\n let _ = fwdmod.fwd()\n let x: Str = othermod.only_in_other\n let _ = x\n}\n", "qn_unbound_fnval")
+}
+
+test "a call of a standard module does not reach a module it only loads" {
+    let out = compile_test_helpers.compile_and_capture("import std.db.\{DB}\nfn main() \{\n let _ = db.sqlite_open(\":memory:\")\n}\n", "qn_std_sibling")
+    compile_test_helpers.expect_contains(out, "no member `sqlite_open` on module `db`", "qn_std_sibling")
+}
+
+test "each declared and forwarded member still resolves" {
+    let out = compile_program("import hasmod\nimport fwdmod\nimport othermod as o\nfn main() ! IO \{\n let f = hasmod.real\n io.println(\"\{f() + hasmod.real() + hasmod.K_REAL + fwdmod.real() + fwdmod.fwd() + o.only_in_other(1) + o.ONLY_IN_OTHER}\")\n}\n", "qn_all_resolve")
+    compile_test_helpers.expect_compiles_clean(out, "qn_all_resolve")
+}
+
+// All modules share one top-level frame, so the name of a function in an imported module looks
+// defined in this file too. Only the file's own alias binds the spelling here.
+test "a call through an alias spelled like a namespace reaches its module beside a function of that name elsewhere" {
+    let out = compile_program("import nsfns\nimport hasmod as process\nfn main() ! IO \{\n let _ = nsfns.process()\n io.println(\"\{process.real()}\")\n}\n", "qn_ns_alias")
+    compile_test_helpers.expect_compiles_clean(out, "qn_ns_alias")
+}
+
+// An alias binds its spelling only in the file that writes it, so a type of that spelling
+// elsewhere is still a type.
+test "a type call keeps its type beside an alias of that spelling in another file" {
+    let out = compile_program("import aliases\npub trait Mk \{ fn make() -> Self }\npub type Color \{ r: Int }\nimpl Mk for Color \{ fn make() -> Color \{ Color \{ r: 1 } } }\nfn main() \{\n let _ = aliases.aliased()\n let x: Str = Color.make()\n let _ = x\n}\n", "qn_alias_type_call")
+    compile_test_helpers.expect_contains(out, "declared type Str but got Color", "qn_alias_type_call")
+    assert(!out.contains("no member"), out)
+}
+
+test "a call of a standard type builds beside an alias of that spelling in another file" {
+    let out = compile_program("import aliases\nfn wait() ! Time.Sleep \{\n time.sleep(Duration.ms(1))\n}\nfn main() ! IO, Time.Sleep \{\n wait()\n io.println(\"\{aliases.aliased()}\")\n}\n", "qn_alias_std_type_call")
+    compile_test_helpers.expect_compiles_clean(out, "qn_alias_std_type_call")
+}
+
+// Name resolution does not walk these two positions, so inference asks for the declaration.
+test "a qualified call in a trait default body reaches its module" {
+    let out = compile_program("import hasmod\ntrait Tr \{ fn go(self) -> Int \{ hasmod.real() + hasmod.K_REAL } }\ntype U \{ n: Int }\nimpl Tr for U \{ fn go(self) -> Int \{ self.n + hasmod.real() } }\nfn main() ! IO \{\n let u = U \{ n: 1 }\n io.println(\"\{u.go()}\")\n}\n", "qn_default_body")
+    compile_test_helpers.expect_compiles_clean(out, "qn_default_body")
+}
+
+test "a call of a missing member in a trait default body is E0505" {
+    no_member("import hasmod\nimport othermod\ntrait Tr \{ fn go(self) -> Int \{ hasmod.only_in_other(1) } }\ntype U \{ n: Int }\nimpl Tr for U \{ fn go(self) -> Int \{ othermod.only_in_other(self.n) } }\nfn main() \{\n let u = U \{ n: 1 }\n let _ = u.go()\n}\n", "only_in_other", "hasmod", "qn_default_body_miss")
+}
+
+test "a qualified call in a contract reaches its module" {
+    let out = compile_program("import hasmod\n@verify(fallback: \"runtime\")\n@requires(a > hasmod.real())\n@ensures(result > hasmod.real())\nfn cc(a: Int) -> Int \{ a + 1 }\nfn main() ! IO \{\n io.println(\"\{cc(5)}\")\n}\n", "qn_contract")
+    assert(!out.contains("no member"), out)
+    compile_test_helpers.expect_compiles_clean(out, "qn_contract")
+}
+
+test "the help of a missing member names no private item" {
+    let out = compile_program("import othermod\nfn main() \{\n let _ = othermod.private_in_othr()\n}\n", "qn_help_private")
+    compile_test_helpers.expect_contains(out, "no member `private_in_othr` on module `othermod`", "qn_help_private")
+    assert(!out.contains("did you mean"), out)
+}
+
+test "the help of a missing member ignores case and underscores" {
+    let out = compile_program("import hasmod\nfn main() \{\n let _ = hasmod.kreal\n}\n", "qn_help_key")
+    compile_test_helpers.expect_contains(out, "did you mean `hasmod.K_REAL`?", "qn_help_key")
+}
+
+test "the help of a missing member names no candidate when two are equally near" {
+    let out = compile_program("import nsfns\nfn main() \{\n let _ = nsfns.tie_c()\n}\n", "qn_help_tie")
+    compile_test_helpers.expect_contains(out, "no member `tie_c` on module `nsfns`", "qn_help_tie")
+    assert(!out.contains("did you mean"), out)
+}
+
+test "the help of a missing member names what the module re-exports" {
+    let named = compile_program("import fwdmod\nfn main() \{\n let _ = fwdmod.reel()\n}\n", "qn_help_named")
+    compile_test_helpers.expect_contains(named, "did you mean `fwdmod.real`?", "qn_help_named")
+    let whole = compile_program("import wildmod\nfn main() \{\n let _ = wildmod.reel()\n}\n", "qn_help_whole")
+    compile_test_helpers.expect_contains(whole, "did you mean `wildmod.real`?", "qn_help_whole")
+}
+
+test "a private name of another module in a contract or a trait default body is E1003" {
+    let contract = compile_program("import othermod\n@verify(fallback: \"runtime\")\n@requires(a > othermod.private_in_other())\nfn cc(a: Int) -> Int \{ a }\nfn main() \{\n let _ = cc(9)\n}\n", "qn_contract_private")
+    compile_test_helpers.expect_contains(contract, "cannot access private function `private_in_other`", "qn_contract_private")
+    let body = compile_program("import othermod\ntrait Tr \{ fn go(self) -> Int \{ othermod.private_in_other() } }\ntype U \{ n: Int }\nimpl Tr for U \{ fn go(self) -> Int \{ self.n }  }\nfn main() \{\n let u = U \{ n: 1 }\n let _ = u.go()\n}\n", "qn_default_body_private")
+    compile_test_helpers.expect_contains(body, "cannot access private function `private_in_other`", "qn_default_body_private")
+}
+
+test "an import that only a qualified call in a contract uses is used" {
+    let out = compile_program("import hasmod\n@verify(fallback: \"runtime\")\n@requires(a > hasmod.real())\nfn cc(a: Int) -> Int \{ a }\nfn main() \{\n let _ = cc(9)\n}\n", "qn_contract_used")
+    assert(!out.contains("UnusedImport"), out)
+}
+
+test "the help of a missing member names no private item that a list re-exports" {
+    let out = compile_program("import privfwd\nfn main() \{\n let _ = privfwd.private_in_othr()\n}\n", "qn_help_listed_private")
+    assert(!out.contains("did you mean"), out)
+}
+
+test "the help of a missing member names no name that a list re-exports and no module declares" {
+    let out = compile_program("import privfwd\nfn main() \{\n let _ = privfwd.ghost_nam()\n}\n", "qn_help_listed_ghost")
+    assert(!out.contains("did you mean"), out)
+}
+
+test "the help of a missing member through a module's own qualifier names its private items" {
+    let call = compile_program("import selfcall\nfn main() \{\n let _ = selfcall.f()\n}\n", "qn_help_own_call")
+    compile_test_helpers.expect_contains(call, "did you mean `selfcall.helper_thing`?", "qn_help_own_call")
+    let read = compile_program("import selfread\nfn main() \{\n let _ = selfread.f()\n}\n", "qn_help_own_read")
+    compile_test_helpers.expect_contains(read, "did you mean `selfread.limit_value`?", "qn_help_own_read")
+}
+
+fn private_call_only(src: Str, private_text: Str, tag: Str) ! Process.Spawn, FS.Write, FS.Read, Env.Read, IO.Print {
+    let out = compile_program(src, tag)
+    compile_test_helpers.expect_contains(out, private_text, tag)
+    assert(!out.contains("no member"), out)
+}
+
+test "a call to a private variant through a qualifier reports the privacy and no missing member" {
+    private_call_only("import hidden\nfn main() \{\n let _ = hidden.PCirc(1)\n}\n", "cannot access private variant", "qn_private_variant")
+}
+
+test "a call to a private variant in a contract reports the privacy and no missing member" {
+    private_call_only("import hidden\n@verify(fallback: \"runtime\")\n@requires(a > hidden.PCirc(1))\nfn cc(a: Int) -> Int \{ a }\nfn main() \{\n let _ = cc(9)\n}\n", "cannot access private variant", "qn_private_variant_contract")
+}
+
+test "a call to a private type through a qualifier reports the privacy and no missing member" {
+    private_call_only("import hidden\nfn main() \{\n let _ = hidden.Plain(1)\n}\n", "cannot access private", "qn_private_type")
+}
+
+// The compiler cannot know a member is absent from a module it did not load.
+test "a use of an import that failed has only the import error" {
+    let out = compile_program("import nosuchmod\nfn main() \{\n let _ = nosuchmod.f(1)\n let _ = nosuchmod.K\n}\n", "qn_failed_import")
+    compile_test_helpers.expect_contains(out, "nosuchmod", "qn_failed_import")
+    assert(!out.contains("no member"), out)
+}

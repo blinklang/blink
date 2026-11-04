@@ -5,6 +5,7 @@ Single source of truth for release history. `blink llms` and `blink llms --full`
 ## Breaking Changes (v0.61.0)
 
 - **`Bool` and `Int` are distinct types (section 3.4).** An `Int` where a `Bool` is wanted, or a `Bool` where an `Int` is wanted, is now E0300 at a declaration, an argument, a struct field, a field default and a return. The condition of `if`, `while`, `assert` and `debug_assert`, a match guard, and each operand of `&&`, `||` and `!` must be `Bool`: `if n { }`, `while 1 { }` and `!n` fail. `==` and `!=` between a `Bool` and an `Int` fail. A `true` or `false` pattern on an `Int` and an integer pattern on a `Bool` fail. Each error has a caret under the operand, the note `Blink has no truthiness` and a help line, and `blink fix` applies the rewrite: `n != 0`, `if b { 1 } else { 0 }`, `b`, `!b`. `Bool` has no `to_int()` and `Int` has no `to_bool()`. A function that returns a test should now say `-> Bool`.
+- **A qualified call needs a declaration in the module it names (section 10.5).** `m.f()` where `m` does not declare or re-export `f` is now E0505, also when another module or the calling file has a function `f` or `m_f`, or when `m` only imports the module that has it. For example, `db.sqlite_open` with `import std.db.{DB}` fails: import `std.db_sqlite`. A call or a read through a qualifier that the file does not bind has only its E0506, and takes no type from a module that another file imports.
 
 ## Breaking Changes (v0.60.0)
 
