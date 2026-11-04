@@ -16343,7 +16343,7 @@ fn init_types() ! TypeCheck.Register {
     ty_param_list.clear()
     // The method-call facts span all three phases of one check_types, so they are cleared
     // here rather than in resolve_names with the registries that feed them.
-    tc_method_calls = MethodCallFacts { unresolved: [], hard: Map(), seeded_expected: Map(), dropped: Map(), helper_fixes: Map(), bound_args: Map() }
+    tc_method_calls = MethodCallFacts { unresolved: [], hard: Map(), receiver_failed: Map(), seeded_expected: Map(), dropped: Map(), helper_fixes: Map(), bound_args: Map() }
     // Load-bearing for the daemon/LSP (long-lived processes, daemon.bl / lsp.bl): a
     // surviving intern map would hand out tids keyed against the PREVIOUS, since-cleared
     // pool on the next check_types() call — out-of-bounds unwrap panic or a silently
@@ -16986,11 +16986,6 @@ pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report, IO.Eprint {
     tc_flush_index_sites()
     tc_merge_helper_name_imports()
 
-    // Phase 3: whatever Phase 1 found unresolvable and Phase 2 did not report on. The
-    // receiver's type was never known at the call, so no type can be named as lacking the
-    // method — the honest report is the soft one.
-    tc_flush_unresolved_method_warnings()
-
     // After every body, because a fix that empties an import list asks whether anything used
     // the qualifier. Before phase 5, whose hold on a declaration the collision poisoned
     // stands down only for a program with an error.
@@ -17008,17 +17003,19 @@ pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report, IO.Eprint {
     tc_errors.len()
 }
 
-// Report the Phase-1 unresolvable method names that Phase 2 left alone. A receiver whose
-// type is a bare typevar or an unresolved metavar at the call has no type to name, so this
-// stays a warning; a receiver with a head gets its E0505 from tc_report_unclaimed_calls. A call
-// Phase 2 resolved to a declaration is skipped too: a free fn `{Type}_{method}` supplies a
-// method name that no impl lists, so Phase 1 records it, but the name does resolve.
+// Report the Phase-1 unresolvable method names that Phase 2 and tc_report_unclaimed_calls left
+// alone. A receiver whose type is a bare typevar or an unresolved metavar at the call has no type
+// to name, so this stays a warning. A call Phase 2 resolved to a declaration is skipped too: a
+// free fn `{Type}_{method}` supplies a method name that no impl lists, so Phase 1 records it,
+// but the name does resolve. A call whose receiver had an error is skipped, as that error is
+// the cause.
 fn tc_flush_unresolved_method_warnings() ! Diag.Report {
     let mut i = 0
     while i < tc_method_calls.unresolved.len() {
         let n = tc_method_calls.unresolved.get(i).unwrap()
         let reported_later = tc_unclaimed_receiver_is_named(tc_lookup_node_tid(node_obj(n))) != 0
-        if !tc_method_calls.hard.contains_key(n) && !tc_call_decl.contains_key(n) && !nr_is_call_on_collided_qualifier(n) && !reported_later {
+        let left_alone = !tc_method_calls.hard.contains_key(n) && !tc_method_calls.receiver_failed.contains_key(n)
+        if left_alone && !tc_call_decl.contains_key(n) && !nr_is_call_on_collided_qualifier(n) && !reported_later {
             let m = node_method(n)
             diag_warn_at("UnknownMethod", UNKNOWN_METHOD, "method `{m}` resolves to nothing, and the receiver's type is not known here", n, "annotate the receiver so the method can be resolved, or correct the method name")
         }
@@ -17690,6 +17687,7 @@ fn tc_infer_default_perform(call: Int, root: Str, method: Str) -> Int ! TypeChec
         diag_error_at("UnresolvedMethod", UNRESOLVED_METHOD,
             "`default` cannot be used inside a closure within a handler operation", call,
             "call `default.{method}` in the operation body itself")
+        tc_method_calls.hard.insert(call, 1)
         return tc_error_recovery_tid()
     }
     let handle = str_to_lower(root)
@@ -17698,12 +17696,14 @@ fn tc_infer_default_perform(call: Int, root: Str, method: Str) -> Int ! TypeChec
         diag_error_at("UnresolvedMethod", UNRESOLVED_METHOD,
             "`default` is not supported yet in a handler of effect `{root}`", call,
             "call the effect's handle directly, or forward to a handler you hold")
+        tc_method_calls.hard.insert(call, 1)
         return tc_error_recovery_tid()
     }
     let key = if user { "{handle}.{method}" } else { builtin_handler_op_key(root, method) }
     let sig = if user { lookup_fnsig(key) } else { builtin_handler_op_sig(root, method) }
     if sig == -1 {
         diag_error_at("UnresolvedMethod", UNRESOLVED_METHOD, "effect `{root}` has no operation `{method}`", call, "")
+        tc_method_calls.hard.insert(call, 1)
         return tc_error_recovery_tid()
     }
     let _ = check_arg_shapes(key, sig, node_args(call), 0, call)
@@ -23147,6 +23147,10 @@ type MethodCallFacts {
     // the receiver types stop changing.
     unresolved: List[Int]
     hard: Map[Int, Int]
+    // The method calls whose receiver had an error while name resolution or inference walked
+    // it. That error is the cause, so the flush adds no report that the method resolves to
+    // nothing.
+    receiver_failed: Map[Int, Int]
     // The type a declared place expects of a method call, by the call's node, as
     // tc_seed_expected_into_value reaches it: a `let` annotation, a return type, a parameter.
     // The construction hint is no stand-in, since a call's receiver and the operands of `??`
@@ -23170,7 +23174,7 @@ type HelperFix {
     sig: Int
 }
 
-let mut tc_method_calls: MethodCallFacts = MethodCallFacts { unresolved: [], hard: Map(), seeded_expected: Map(), dropped: Map(), helper_fixes: Map(), bound_args: Map() }
+let mut tc_method_calls: MethodCallFacts = MethodCallFacts { unresolved: [], hard: Map(), receiver_failed: Map(), seeded_expected: Map(), dropped: Map(), helper_fixes: Map(), bound_args: Map() }
 
 // Mark a method call the inference pass could not type and did not report on: the name
 // resolves somewhere in the program, so name resolution let it pass, but no arm here claims
@@ -23218,6 +23222,13 @@ fn tc_unclaimed_call_nodes() -> List[Int] {
 }
 
 pub fn tc_unresolved_call_count() -> Int { tc_unclaimed_call_nodes().len() }
+
+// Marks a typed call as unclaimed. Source that type checks holds no unclaimed call, so a test of
+// the stand-down grafts one.
+pub fn tc_graft_unclaimed_call(node: Int) {
+    if node < 0 || node >= tc_node_tid.len() { return }
+    tc_node_tid.set(node, tc_unclaimed_call_tid())
+}
 
 // `with X as ctx` does not always bind X: for a BlockHandler the binder is what
 // `enter()` returns, i.e. the impl's `type Context`. Resource type name -> the impl's Context
@@ -25087,7 +25098,9 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
             // A namespace receiver names no value, so the Ident walk has nothing to check on it.
             // Skipping it leaves that walk to report a namespace in a value position.
             if node_kind(obj) != NodeKind.Ident || is_builtin_namespace(node_name(obj)) == 0 || (nr_top_index(node_name(obj)) != -1 && !nr_namespace_binding_out_of_scope(node_name(obj))) {
+                let receiver_diags = diag_entry_count()
                 nr_check_node(obj)
+                if diag_any_errors_since(receiver_diags) > 0 { tc_method_calls.receiver_failed.insert(node, 1) }
             }
         }
         let method_name = node_method(node)
@@ -29367,7 +29380,9 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
         // type_kind already resolves, so `obj_k` names the solution's kind — but reading
         // the UNRESOLVED α's inner1 returns the binding pointer, not the type's real
         // child, which typed `e.unwrap()` on an `Option[T]` α one level too deep.
+        let receiver_diags = diag_entry_count()
         let obj_t = tc_resolve(tc_infer_receiver(recv_node))
+        if diag_any_errors_since(receiver_diags) > 0 { tc_method_calls.receiver_failed.insert(node, 1) }
         let obj_k = type_kind(obj_t)
         // An open iterator has no generic fns to call, where `[].len()` reads no element at all.
         if obj_k == TyKind.List && method == "into_iter" && tc_node_is_empty_ctor(recv_node) {
@@ -29470,6 +29485,7 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
         // receiver's collect is answered by the Iterator dispatch block immediately below.
         if method == "collect" && (obj_k == TyKind.List || obj_k == TyKind.Map || obj_k == TyKind.Set || obj_k == TyKind.Str || obj_k == TyKind.Bytes) {
             diag_error_at("UnresolvedMethod", UNRESOLVED_METHOD, "unresolved method `.collect` on type {type_to_str(obj_t)}", node, tc_list_rename_help("collect"))
+            tc_method_calls.hard.insert(node, 1)
             return tc_error_recovery_tid()
         }
 
@@ -39920,6 +39936,7 @@ fn tc_report_unclaimed_calls(order: List[Int], mods: List[Str]) ! Diag.Report {
         let obj = node_obj(uc)
         let mname = node_method(uc)
         let recv = tc_lookup_node_tid(obj)
+        let before = diag_entry_count()
         if tc_unclaimed_receiver_is_named(recv) != 0 {
             let tname = tc_type_str(recv)
             tc_report_unresolved_method(uc, recv, tname, mname)
@@ -39943,6 +39960,7 @@ fn tc_report_unclaimed_calls(order: List[Int], mods: List[Str]) ! Diag.Report {
                 tc_report_no_module_member(uc, q, mname)
             }
         }
+        if diag_any_errors_since(before) > 0 { tc_method_calls.hard.insert(uc, 1) }
         nr_current_module = saved_module
     }
 }
@@ -40298,6 +40316,8 @@ pub fn tc_stamp_program(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Dia
     let mut seen: List[Int] = List.with_capacity(node_count())
     let order = tc_stamp_walk_sized(program, owners, mods, seen, node_count())
     tc_report_unclaimed_calls(order, mods)
+    // After the unclaimed calls, so a call one of them reported gets no second report.
+    tc_flush_unresolved_method_warnings()
     tc_report_literals_out_of_range(order)
     // A program that already has an error has nodes inference deliberately never typed: the
     // arm that would have typed them reported instead and returned. Asserting there turns

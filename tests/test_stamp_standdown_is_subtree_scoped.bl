@@ -6,12 +6,14 @@
 //
 // A hole is grafted rather than written, because a hole in clean source is exactly what the
 // pass exists to make impossible. The graft appends a value node with no type to a body's
-// statement list, which is what a stamping hole looks like from the pass's side.
+// statement list, which is what a stamping hole looks like from the pass's side. The unclaimed
+// call is grafted too: a method call that no arm claims is an error (section 6.3.3), so source
+// that type checks holds none.
 
 import std.fs
 import compiler.{compile_to_program}
-import typecheck.{check_types, tc_unresolved_call_count, tc_stamp_program, tc_lookup_node_tid, tc_tid_is_concrete}
-import parser.{node_count, node_push, node_kind, node_name, node_body, node_stmts, sublist_push, new_sublist, finalize_sublist, node_value_child_ids}
+import typecheck.{check_types, tc_unresolved_call_count, tc_graft_unclaimed_call, tc_stamp_program, tc_lookup_node_tid, tc_tid_is_concrete}
+import parser.{node_count, node_push, node_kind, node_name, node_method, node_body, node_stmts, sublist_push, new_sublist, finalize_sublist, node_value_child_ids}
 import ast.{NodeKind, AstNode}
 import diagnostics.{diag_count, diag_ice_count, diag_reset}
 import embedded_stdlib_registry.{init_embedded_stdlib}
@@ -73,6 +75,20 @@ fn untyped_blocks_in(root: Int) -> Int {
     bad
 }
 
+// Mark each call of `zzq` unclaimed, as the stand-down needs one.
+fn graft_unclaimed_calls() -> Int ! TypeCheck.Resolve {
+    let mut marked = 0
+    let mut i = 0
+    while i < node_count() {
+        if node_kind(i) == NodeKind.MethodCall && node_method(i) == "zzq" {
+            tc_graft_unclaimed_call(i)
+            marked = marked + 1
+        }
+        i = i + 1
+    }
+    marked
+}
+
 // Append a value node with no type as the last statement of `body`, and answer the count of
 // internal errors the pass then raises over the whole program.
 fn ice_count_with_hole_in(program: Int, body: Int) -> Int ! Parse.Build, TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
@@ -89,19 +105,25 @@ fn ice_count_with_hole_in(program: Int, body: Int) -> Int ! Parse.Build, TypeChe
     diag_ice_count
 }
 
-// `zzx.concat([2])` on a type parameter is a call no arm of inference claims and the report
-// pass leaves to each instance, so the record of unclaimed calls is non-empty for the whole
-// compile with no error. `zzother` shares nothing with it.
-fn two_bodies_src() -> Str {
-    let mut s = "fn zzunres[T](zzx: T) -> Int \{\n"
-    s = s.concat("    let zzys = zzx.concat([2])\n")
-    s = s.concat("    zzys.len()\n")
+// The grafted call is `zzx.zzq()` on a bounded type parameter, a receiver the report pass
+// does not name, so the stamp pass reports nothing about it. `zzother` shares nothing with it.
+fn zzq_src() -> Str {
+    let mut s = "trait Zzq \{ fn zzq(self) -> Int }\n"
+    s = s.concat("impl Zzq for Int \{ fn zzq(self) -> Int \{ self } }\n")
+    s = s.concat("fn zzunres[T: Zzq](zzx: T) -> Int \{\n")
+    s = s.concat("    let zzys = zzx.zzq()\n")
+    s = s.concat("    zzys + 1\n")
     s = s.concat("}\n")
+    s
+}
+
+fn two_bodies_src() -> Str {
+    let mut s = zzq_src()
     s = s.concat("fn zzother(zzn: Int) -> Int \{\n")
     s = s.concat("    let zzm = zzn + 1\n")
     s = s.concat("    zzm * 2\n")
     s = s.concat("}\n")
-    s = s.concat("fn main() \{ let _ = zzunres([1]) + zzother(1) }\n")
+    s = s.concat("fn main() \{ let _ = zzunres(1) + zzother(1) }\n")
     s
 }
 
@@ -109,6 +131,7 @@ test "an unclaimed call leaves the rest of the program asserted" {
     let program = compile_probe("build/stamp_scope_other_body.bl", two_bodies_src())
     assert(diag_count == 0)
     assert(diag_ice_count == 0)
+    assert(graft_unclaimed_calls() == 1)
     assert(tc_unresolved_call_count() > 0)
     assert(ice_count_with_hole_in(program, fn_body_of("zzother")) == 1)
 }
@@ -116,6 +139,7 @@ test "an unclaimed call leaves the rest of the program asserted" {
 test "an unclaimed call silences its own body" {
     let program = compile_probe("build/stamp_scope_own_body.bl", two_bodies_src())
     assert(diag_count == 0)
+    assert(graft_unclaimed_calls() == 1)
     assert(tc_unresolved_call_count() > 0)
     assert(ice_count_with_hole_in(program, fn_body_of("zzunres")) == 0)
 }
@@ -125,12 +149,9 @@ test "an unclaimed call silences its own body" {
 // block can do is reach an unclaimed call in a generic body, and that must not excuse a hole
 // in a third body.
 fn two_tests_src() -> Str {
-    let mut s = "fn zzunres[T](zzx: T) -> Int \{\n"
-    s = s.concat("    let zzys = zzx.concat([2])\n")
-    s = s.concat("    zzys.len()\n")
-    s = s.concat("}\n")
+    let mut s = zzq_src()
     s = s.concat("test \"zzfirst\" \{\n")
-    s = s.concat("    assert(zzunres([1]) == 2)\n")
+    s = s.concat("    assert(zzunres(1) == 2)\n")
     s = s.concat("}\n")
     s = s.concat("fn zzclean(zzn: Int) -> Int \{ zzn + 1 }\n")
     s = s.concat("fn main() \{ let _ = zzclean(1) }\n")
@@ -140,6 +161,7 @@ fn two_tests_src() -> Str {
 test "an unclaimed call reached from a test block leaves other bodies asserted" {
     let program = compile_probe("build/stamp_scope_test_block.bl", two_tests_src())
     assert(diag_count == 0)
+    assert(graft_unclaimed_calls() == 1)
     assert(tc_unresolved_call_count() > 0)
     assert(ice_count_with_hole_in(program, fn_body_of("zzclean")) == 1)
 }
