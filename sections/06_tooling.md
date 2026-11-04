@@ -1823,9 +1823,21 @@ The last three `file` lines are runner faults. The first one is a spawn failure:
 - `diagnostics` is a list of diagnostic objects in the shape of §8.6. It is never empty.
 - A diagnostic with no source location has no `span`. It never carries a placeholder location such as `line: 0`.
 - When the front end accepts the file and a later build step fails, `diagnostics` holds one diagnostic for that step:
-  - The generated C does not compile: `severity: "ice"` (internal compiler error). This is a compiler bug, not an error in the test file.
+  - A header that an `@ffi` declaration names is not on the host: `severity: "error"`, `ForeignHeaderNotFound` (E0859), with the span of the `@ffi` line. Before it compiles the unit, `blink test` tests each header that an `@ffi` declaration of the file names, the same way `blink build` does (§9.1 *`@ffi`*). The test uses the C compiler, the target, the include paths and the vendored native directories of the unit compile, so a header that the unit compile finds is never reported missing. The test reads only pass or fail. It does not read the text of the C compiler.
+  - The generated C does not compile: `severity: "ice"` (internal compiler error), `GeneratedCDidNotCompile` (I0017). This is a compiler bug, not an error in the test file. A header that is missing is E0859 and not this code. If the file has its own `@ffi` declaration or a native dependency, a note names them and says that a wrong `@ffi` prototype can also give this code. A file with none gets no such note.
   - The link step or a native-dependency step fails: `severity: "error"`. The cause is the project's setup, for example a missing native library.
   - `message` names the failed step and gives the tool's first error line. `notes` is a list of strings that holds the tool's full output, one line per entry. `blink test` may cut `notes` short; when it does, the last entry says that the output was cut.
+
+`blink build` reports a stop for each of these causes with the same code, and E0857 and E0858 are among them. A stop with E0857, E0858 or E0859 exits `1`; a stop with I0017 exits `101` (§6.7.4). The note that I0017 carries for `@ffi` and the E0859 test apply to `blink build` as they do to `blink test`.
+
+This rule changes an earlier one. Before, a header that the host lacked reached I0017, and the file was an internal error. Now it is an error with its own code at the `@ffi` line.
+
+```json
+{"record": "file", "file": "tests/test_codec.bl", "outcome": "build_failed", "summary": {"total": 0, "passed": 0, "failed": 0, "panicked": 0, "skipped": 0, "duration_ms": 0},
+ "diagnostics": [{"severity": "error", "name": "ForeignHeaderNotFound", "code": "E0859", "message": "header `zstd.h` was not found by the C compiler on this host", "span": {"file": "tests/test_codec.bl", "line": 3, "col": 1}}]}
+```
+
+**Panel vote** (header test before the unit compile): **5-1** (Minimalism dissented). See [DECISIONS.md](../DECISIONS.md) and [decisions/check-build-promise.md](../decisions/check-build-promise.md).
 
 **`aborted` fields.**
 
@@ -2409,7 +2421,7 @@ The AI gets structured feedback — result value, type, effects actually perform
 | `blink run` | Compile and execute in one step |
 | `blink run --trace` | Run with full execution tracing (NDJSON to stderr) |
 | `blink run --trace=<filter>` | Run with filtered tracing (see §8.15) |
-| `blink check` | Type-check without codegen (fast) |
+| `blink check` | Check the program. A clean result promises the build (§6.7) |
 | `blink fix <file>` | Apply the machine-applicable fixes of a file's diagnostics (§8.6) |
 | `blink eval <expr>` | Interpret an expression with full checking |
 | **Query & Inspect** | |

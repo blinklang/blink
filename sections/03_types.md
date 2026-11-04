@@ -6294,6 +6294,31 @@ An argument whose type does not implement the bound's trait is `error[TraitBound
 
 The E0306 of a call carries a `note:` that names the declaration which wrote the bound and gives its location, as `` `max` declares `T: Ord` at a.bl:1:8 ``. The `--json` form carries the note too. The same note is part of the error for a bound written on a type declaration (§3.6 *Bounds on a Type Declaration*), where the bound is checked at each place a program writes or infers the type, not only at a call.
 
+**A type parameter has only the bounds it declares.** The compiler types a generic body once, at its definition. Inside the body, a type parameter `T` has the methods of its declared bounds and no other method. The body does not get a bound from a call site or from an instance. This holds whether or not any code calls the function.
+
+Two rules follow:
+
+- A method call on a `T` whose bounds lack that method is `error[UnresolvedMethod]` (E0505) (§6.3.3).
+- A call in the body that passes a `T` where the callee needs a bound is `error[TraitBoundNotSatisfied]` (E0306) at that call. The `help:` says to add the bound to `T`.
+
+```blink
+trait Sh { fn sh(self) -> Int }
+impl Sh for Int { fn sh(self) -> Int { 2 } }
+
+fn h[U: Sh](x: U) -> Int { x.sh() }
+
+fn g[T](x: T) -> Int { h(x) }               // error[TraitBoundNotSatisfied] (E0306) at `h(x)`: `T` does not implement `Sh`
+                                            //   help: write `[T: Sh]`
+fn g2[T: Sh](x: T) -> Int { h(x) }          // ok
+
+fn k[T: Sized](x: T) -> Int { x.len() }     // ok: `Sized` gives `len`
+fn main() -> Int { k(1) }                   // error[TraitBoundNotSatisfied] (E0306) at `k(1)`: `Int` does not implement `Sized`
+```
+
+`g` is E0306 although no code calls it, and although `g(1)` would run and give `2` if the compiler let it through. The compiler does not type `g` again for `T := Int`. `blink check` and `blink build` give the same verdict (§6.7).
+
+A rule that depends on the type that `T` stands for, such as the pointee of `Ptr[T]` (§9.1), is judged on each instance of the function that exists in the program. A generic function with no instance has no such judgment.
+
 #### Bounds on a Type Declaration
 
 A bound written on a type declaration restricts the type. In `type S[T: Tr] { v: T }`, `S[X]` is a type only when `X` implements `Tr`. The compiler checks the bound at each place where a program writes `S[X]` and at each place where inference gives `S` an argument. A failed bound is `error[TraitBoundNotSatisfied]` (E0306), or `error[MissingDisplayImpl]` (E0523) for a `Display` bound, the same as at a call. The bound causes no run-time check and changes no layout.

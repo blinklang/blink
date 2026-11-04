@@ -47,6 +47,19 @@ fn c_cos(x: Float) -> Float ! ()
 
 Prefer the two-argument form. It names the library that supplies the symbol, so a reader and `blink audit` can see where the symbol comes from. The one-argument form does not make a third-party symbol legal: a symbol that is not in `c` or `m` must use the two-argument form with a declared library. The one-argument form binds only `c` and `m` symbols. It does not bind a `blink_*` runtime symbol; `lib/std` binds those with `@runtime` (*`@runtime` — The Runtime Bridge*). Every `@ffi` declaration, in either form, follows the rules of *Signature Types*.
 
+**The header test.** `blink check` does not look at the C headers. `blink build` and `blink test` do. Before the unit compile, each of them tests every header that an `@ffi` declaration names. The test uses the same C compiler, target, include paths and vendored native directories as the unit compile, so it gives no error for a program that builds. It reads only pass or fail, and it does not read the text of the C compiler. A header that the test cannot find is `ForeignHeaderNotFound` (E0859) at the `@ffi` line, and the command exits `1`. The unit compile does not start (§6.7.3).
+
+```blink
+@ffi("zstd_compress", header: "zstd.h")
+fn c_compress(src: Ptr[U8], n: Int) -> Int ! ()
+// blink check: no error
+// blink build: error[ForeignHeaderNotFound] (E0859) at the @ffi line, exit 1
+//   `zstd.h` was not found by the C compiler on this host
+//   help: install the library that provides `zstd.h`
+```
+
+If the header is there and the C compiler still rejects the generated C, the stop is `GeneratedCDidNotCompile` (I0017). Its note names the `@ffi` declarations of the program and says that a wrong prototype can also cause it (§8.10.5).
+
 #### `@ffi let` — Foreign Constants
 
 Some integer constants have a different value on each host. `SIGBUS` is 7 on Linux and 10 on macOS. `ENOTSUP` is 95 on Linux and 45 on macOS. No Blink source can write the right number for every target, and Blink has no conditional compilation. A **foreign constant** is a module-level `let` with no initializer. The C compiler of the build target sets its value from the target's C headers.
@@ -151,7 +164,7 @@ pub let SIGBUZ: Int
 //   help: check the spelling, and that `signal.h` defines `SIGBUZ` on this target
 ```
 
-This error differs from `ForeignConstNoHeader` (E0854). E0854 says the declaration has no `header:` and names the fix. E0855 says the header is there, and the target's C compiler does not give an integer constant.
+This error differs from `ForeignConstNoHeader` (E0854). E0854 says the declaration has no `header:` and names the fix. E0855 says the header is there, and the target's C compiler does not give an integer constant. A header that the host lacks is `ForeignHeaderNotFound` (E0859), found by the header test before E0855 is judged (*The header test*, §9.1 *`@ffi`*).
 
 **What tools show.** Hover and `blink doc` may show the value for the current target, for display only. The front end never uses it. `blink audit` and the link tooling treat an `@ffi let` as a value from a header and not as a linked symbol: it has no address to link and no effect row to audit.
 

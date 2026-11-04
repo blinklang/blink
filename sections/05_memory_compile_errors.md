@@ -472,7 +472,21 @@ fn example(items: List[Str]) -> Int {
 }
 ```
 
-If the compiler cannot find the type of the receiver, it reports an error. It never accepts the call without a check.
+If the compiler cannot find the type of the receiver, it reports an error. It never accepts the call without a check. The error is E0505, or E0301 when that error fires first for the same expression. There is no warning for this case.
+
+A receiver of a type parameter type `T` has only the methods of the bounds that `T` declares (§3.6 *Trait Bounds*). A method that no bound gives is E0505, whether or not the function is called:
+
+```blink
+fn first_len[T](x: T) -> Int {
+    x.len()                   // E0505 — `T` has no bound that gives `len`; write `[T: Sized]`
+}
+
+fn first_len2[T: Sized](x: T) -> Int {
+    x.len()                   // ok
+}
+```
+
+A receiver that is a poison value (§6.3.5) is not an unknown receiver. It gets no diagnostic.
 
 #### 6.3.4 Module Scope
 
@@ -527,7 +541,17 @@ error[UndefinedFunction]: undefined function `List`
   = help: an empty list is `[]`; the annotation or a later use gives the element type
 ```
 
-When a missing import causes cascading errors (one unresolved name triggers many downstream failures), the compiler applies cascade suppression: downstream references to a poison symbol suppress their own diagnostics. A pattern or a construction that names a variant its enum does not declare (`NoSuchVariant`, §3.5 *Pattern Forms*) also makes poison: each binder under the pattern, and each binding of the construction's value, has the poison type. An import that fails, with `ModuleNotFound` (E1200) or `FileReadFailed` (E1025), also makes poison: the module name binds a poison module, a use of `m.x` has the poison type, and the import gets no `UnusedImport` (W0602). An error count cap (~20 errors) prevents terminal flooding.
+When a missing import causes cascading errors (one unresolved name triggers many downstream failures), the compiler applies cascade suppression: downstream references to a poison symbol suppress their own diagnostics. A method call on a poison receiver gets no diagnostic: the first error already names the cause, and the call has no type to look the method up in.
+
+```blink
+import missing_mod                 // E1200 — poison module
+
+fn f() {
+    missing_mod.load().parse()     // no second diagnostic: the receiver of `.parse()` is poison
+}
+```
+
+A pattern or a construction that names a variant its enum does not declare (`NoSuchVariant`, §3.5 *Pattern Forms*) also makes poison: each binder under the pattern, and each binding of the construction's value, has the poison type. An import that fails, with `ModuleNotFound` (E1200) or `FileReadFailed` (E1025), also makes poison: the module name binds a poison module, a use of `m.x` has the poison type, and the import gets no `UnusedImport` (W0602). An error count cap (~20 errors) prevents terminal flooding.
 
 ### 6.4 Compiler-as-Service Daemon Architecture
 
@@ -617,7 +641,7 @@ This loop is mechanical. The AI does not need to "understand" the error -- it ap
 | `blink build` | AOT compile to native binary | `./myapp` static binary |
 | `blink build --target arm64` | Cross-compile | `./myapp` for target arch |
 | `blink run` | Compile + execute in one step | Program output |
-| `blink check` | Type-check without codegen | Structured diagnostics (JSON) |
+| `blink check` | Check the program; a clean result promises the build (§6.7) | Structured diagnostics (JSON) |
 | `blink check --format json` | Machine-readable type-check | JSON diagnostics with `fixes` |
 | `blink fix <file>` | Apply machine-applicable fixes | One line per applied fix; the rest as `check` prints them |
 | `blink eval <expr>` | Interpret expression | Result + effect/allocation report |
@@ -629,6 +653,116 @@ This loop is mechanical. The AI does not need to "understand" the error -- it ap
 | `blink daemon` | Start compiler daemon | Persistent process (LSP + incremental) |
 
 All commands that produce diagnostics support `--format json` for machine consumption. The human-readable format is the default for terminal use; the JSON format is the default when stdout is not a TTY (pipe detection).
+
+### 6.7 What a Clean `blink check` Promises
+
+`blink check` stops with exit code `0` when it finds no error. This section says what that result means for a later `blink build`.
+
+#### 6.7.1 The Promise
+
+If `blink check` exits `0`, and `blink build` gets the same inputs (§6.7.2) and the same strict flags, then `blink build` stops only for a cause outside the Blink source (§6.7.3). Any other stop is a compiler bug.
+
+The promise holds for every supported target. `blink check` does not take a target and does not need one.
+
+```blink
+fn main() {
+    let xs = [1, 2, 3]
+    io.println("{xs.len()}")
+}
+// blink check: exit 0
+// blink build: a binary, or a stop for a cause in §6.7.3. A C compiler error here is a bug of the compiler.
+```
+
+The promise has three limits:
+
+- **`blink check` need not produce code.** It reports the errors of the language rules. This specification does not list the phases that `blink check` runs, and it does not say that `blink check` skips one. A rule of the language that `blink build` enforces is also a rule of `blink check` (§3.1 *Diagnostic Discipline*). There is no `blink check --deep` and no `blink check --target`.
+- **No proof about the run.** A clean check does not say that the program ends, that it does not panic, that an `Int` operation does not trap, or that its tests pass.
+- **A flag that changes the rules must match.** `--strict` and `--strict-struct-layout` change which diagnostics are errors (§8.9.8; §9.1.3 *Static layout assertions*). A check without the flag promises nothing about a build with the flag. `--debug`, `--release` and `--trace` change the generated code, not the rules, so they need not match.
+
+```blink
+@ffi.struct(header: "time.h", name: "timespec")
+type Timespec { tv_sec: Int, tv_nsec: Int }   // W0812 without a canonical header in [native-dependencies].headers
+// blink check:                          exit 0, with the warning
+// blink build:                          exit 0, with the warning
+// blink build --strict-struct-layout:   exit 1, W0812 is an error. The check ran without the flag, so it promised nothing about this build.
+```
+
+#### 6.7.2 The Same Inputs
+
+The inputs of `blink check` and of `blink build` are:
+
+- the source files that the entry file reaches through `import`, and the files that `#embed` reads (§2.4.1 *`#embed`*);
+- `blink.toml`, `audits.toml`, the dependencies they name, and the edition;
+- the compiler build.
+
+The working directory is not an input. A relative path in the source is relative to its file, and a file belongs to the package that its path walks up to (§10.5 *Package Entry Resolution*). The two commands give the same result from every working directory:
+
+```
+$ cd libs/pg/tests && blink check test_connect.bl             # ok
+$ cd / && blink build /home/u/libs/pg/tests/test_connect.bl   # the same package, the same result
+```
+
+A file that the program opens at run time is not an input. `blink check` does not read it, and `blink build` does not read it.
+
+If a file changes between the two commands, the inputs are not the same, and the promise does not apply.
+
+#### 6.7.3 Causes Outside the Blink Source
+
+A stop of `blink build` is outside the Blink source when the cause is in the host or in the C side of the program. The list is closed:
+
+| Cause | What `blink build` reports | Exit |
+|-------|----------------------------|------|
+| A header that an `@ffi` declaration names is not on the host | `ForeignHeaderNotFound` (E0859), at the `@ffi` line (§9.1) | `1` |
+| The C name of an `@ffi let` is not an integer constant on the target, or its value does not fit | `ForeignConstInvalid` (E0855), at the declaration | `1` |
+| The link step fails: a native library is missing or lacks a symbol | `LinkFailed` (E0857) | `1` |
+| A vendored native dependency does not compile | `NativeDependencyBuildFailed` (E0858) | `1` |
+
+An `@ffi` signature is the claim of the author about C (§9.1). `blink check` cannot test the claim. If the claim is wrong, the C compiler can reject the C that the compiler wrote. That stop is `GeneratedCDidNotCompile` (I0017), and its note names the `@ffi` declarations of the program (§8.10.5). A program with no `@ffi` declaration and no native dependency gets no such note: the cause is a bug of the compiler.
+
+```blink
+@ffi("no_such_header_fn", header: "no_such_header.h")
+fn missing() -> Int ! ()
+// blink check: exit 0
+// blink build: error[ForeignHeaderNotFound] (E0859) at the @ffi line, exit 1
+//   `no_such_header.h` was not found by the C compiler on this host
+```
+
+#### 6.7.4 Exit Codes
+
+`blink check` and `blink build` exit with one of three codes:
+
+| Exit | Meaning |
+|------|---------|
+| `0` | No error. Warnings do not change this, except under `--strict`, where a warning is an error. |
+| `1` | At least one error: an error in the program, or a cause outside the Blink source (§6.7.3). |
+| `101` | An internal compiler error, an `I` code of the catalog (`ERROR_CATALOG.md`, *Internal Compiler Errors*). This is a bug of the compiler. |
+
+No other code exists for these commands. Exit `101` means a compiler bug only for `blink check` and `blink build`. A program that panics under `blink run` also exits `101`; there, the code is the code of the program (§2.20 *Panic Hook*).
+
+When the front end finds no error and a later step of `blink build` stops with an internal error, the diagnostic carries a note: this source passes `blink check`, so the cause is not in the code of the user. The diagnostic does not tell the user to use another compiler build.
+
+```
+$ blink build app.bl
+ice[GeneratedCDidNotCompile] (I0017): the generated C did not compile
+  note: this source passes `blink check`; the cause is a bug of the compiler
+$ echo $?
+101
+```
+
+#### 6.7.5 Generic Functions
+
+A generic function body is typed once, at its definition. `blink check` gives the same verdict on it whether or not code calls it, and whether or not an instance exists. A method call on a type parameter `T` that no bound of `T` gives is E0505 (§6.3.3). A call that passes `T` where the callee needs a bound is E0306 at the call (§3.6 *Trait Bounds*). A rule that depends on the type that `T` stands for is judged on each instance that exists.
+
+```blink
+trait Sh { fn sh(self) -> Int }
+fn h[U: Sh](x: U) -> Int { x.sh() }
+
+fn g[T](x: T) -> Int { h(x) }       // E0306 at `h(x)`: write `[T: Sh]`. No code calls `g`; the verdict is the same.
+```
+
+#### 6.7.6 What Keeps the Promise
+
+The test suite of the compiler holds the promise. Each file of the check-clean corpus must build, and a generic function in it needs at least one instance, so the build types the instance as well. A file that `blink check` accepts and `blink build` rejects for a cause outside §6.7.3 fails the suite. The known failures, each with its tracker entry, are kept in the gate and in the tracker, not in this specification. A known failure is a bug of the compiler. It does not narrow the promise.
 
 ---
 
