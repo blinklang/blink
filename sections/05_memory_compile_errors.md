@@ -760,6 +760,15 @@ fn h[U: Sh](x: U) -> Int { x.sh() }
 fn g[T](x: T) -> Int { h(x) }       // E0306 at `h(x)`: write `[T: Sh]`. No code calls `g`; the verdict is the same.
 ```
 
+A generic that needs ever larger instances of itself is not a cause outside the Blink source. `blink check` reports it as E0324 on the declaration, or as E0325 when the budget stops the program (§3.4 *Limit on Generic Instances*). It does not hang, and it does not run out of memory. The LSP and the daemon report the same errors. A file with another error shows that error first, and `blink check` and `blink build` still give the same verdict for the same file.
+
+```blink
+fn r[T](x: T, n: Int) -> Int {
+    if n == 0 { return 0 }
+    r[List[T]]([x], n - 1)      // blink check and blink build: error[InstantiationCycle] (E0324), exit 1
+}
+```
+
 #### 6.7.6 What Keeps the Promise
 
 The test suite of the compiler holds the promise. Each file of the check-clean corpus must build, and a generic function in it needs at least one instance, so the build types the instance as well. A file that `blink check` accepts and `blink build` rejects for a cause outside §6.7.3 fails the suite. The known failures, each with its tracker entry, are kept in the gate and in the tracker, not in this specification. A known failure is a bug of the compiler. It does not narrow the promise.

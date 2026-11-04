@@ -2478,7 +2478,7 @@ A bare name that matches no candidate, but matches a `pub` enum of another packa
 1. the value of `let x: T = e`;
 2. the value of an assignment to a place of type `T` (`x = e`, `p.f = e`);
 3. the tail of a function body, and the operand of `return`, where the function declares the return type `T`;
-4. a call or method argument, where the declared parameter type is `T`. A parameter whose type is a type parameter of the callee gives no expected type, unless explicit type arguments fix it: `id[Option[Int]](None)` has the expected type `Option[Int]`, and `id(None)` has none;
+4. a call or method argument, where the declared parameter type is `T`. A parameter whose type is a type parameter of the callee gives no expected type, unless explicit type arguments fix it: `id[Option[Int]](None)` has the expected type `Option[Int]`, and `id(None)` has none. A call from a fn to itself follows the same rule (§3.4 *Explicit Type Application*);
 5. a field value in a struct or variant brace literal, and the payload of a call-form variant constructor, where the declared field type is `T`. When the expected type of the literal is an instance `G[A1, .., An]` of the literal's own generic type `G`, or the head of the literal writes type arguments, each type parameter of `G` in the declared field or payload type first takes the matching argument. This holds for any generic struct or enum, and for a field type that contains a type parameter, such as `Option[T]` or `List[T]`: items 6 and 7 then apply to the result. If the expected type has a different head, or an unsolved variable at an argument position, that position gives no expected type. A type parameter of a callee still gives no expected type (item 4). A type parameter of the type being built does, when an instance fixes it;
 6. the payload of `Some(e)`, `Ok(e)` or `Err(e)` under an expected `Option[T]` or `Result[T, E]`: `T`, or `E` for `Err`;
 7. each element of a list literal under an expected `List[T]`; element `i` of a tuple literal under an expected tuple type;
@@ -3103,6 +3103,99 @@ The first `help:` names the **annotation**, not a bracket form. Brackets on a ca
 
 *Rationale.* The rule this replaces refused `apply(identity, 3)` and accepted `let f = identity` followed by `apply(f, 3)` — the same value, one line apart, separated by where it was written rather than by anything about its type. A rule that distinguishes a term from its own η-expansion is a syntactic filter standing in a typing rule's position, and its prescribed repair — wrapping the name in a closure — means the same program. It refused one spelling of an identical program, it was defeated by one `let`, and it has been deleted rather than restated.
 
+**A call from a fn to itself.** A call in the body of a generic fn to that same fn follows the rule of any other call. The call has its own type parameters, and the compiler solves them from the arguments, from the expected type and from a written list. They are not the type parameters of the enclosing fn. So the type arguments of a self-call can differ from the type parameters of the fn, and moving a body into a helper fn does not change whether it compiles. A redundant list is not required here either.
+
+```blink
+fn swap[A, B](a: A, b: B, n: Int) -> Int {
+    if n == 0 { return 0 }
+    swap(b, a, n - 1)            // ok: A becomes B, and B becomes A
+}
+
+fn swap2[A, B](a: A, b: B, n: Int) -> Int {
+    if n == 0 { return 0 }
+    swap2[B, A](b, a, n - 1)     // ok: the same call with a written list
+}
+```
+
+A self-call whose type argument grows is E0324 (§3.4 *Limit on Generic Instances*). No type parameter is fixed to the one of the enclosing fn.
+
+A self-call has no special source for a type parameter. If no argument, no expected type and no written list fixes a type parameter, the call is `error[CannotInferType]` (E0301), as a call to another fn is. The help writes the list with the exact count, and that list is a repair that compiles:
+
+```blink
+fn e[T](xs: List[T], n: Int) -> Int {
+    if n == 0 { return xs.len() }
+    e([], n - 1)                 // error[CannotInferType] (E0301): type parameter `T` of `e` is unbound at this call
+                                 //   and nothing supplies it
+                                 //   help: write the type arguments at this call: `e[T]([], n - 1)`
+}
+```
+
+A self-call of this kind compiled before, because the compiler held its type parameters fixed to those of the enclosing fn. The new rejection follows §8.16.1 *Rollout of a new error*.
+
+The same holds for each value with no type of its own:
+
+```blink
+fn c[T](xs: List[T], n: Int) -> Int {
+    if n <= 0 { return xs.len() }
+    let f = fn(k: Int) -> Int { c([], k) }   // error[CannotInferType] (E0301) at `c([], k)`: write `c[T]([], k)`
+    f(n - 1)
+}
+
+fn d[T](xs: List[T], n: Int) -> Int {
+    if n <= 0 { return xs.len() }
+    let ys = []                  // error[CannotInferType] (E0301) at the `let`: write `let ys: List[T] = []`
+    d(ys, n - 1)
+}
+
+fn m[K, V](mp: Map[K, V], n: Int) -> Int {
+    if n <= 0 { return mp.len() }
+    m(Map(), n - 1)              // error[CannotInferType] (E0301): write `m[K, V](Map(), n - 1)`
+}
+
+fn o[T](xs: Option[T], n: Int) -> Int {
+    if n <= 0 { return 0 }
+    o(None, n - 1)               // error[CannotInferType] (E0301): write `o[T](None, n - 1)`
+}
+```
+
+An expected type or an annotation still fixes the type parameter, as at a call to another fn:
+
+```blink
+fn t[T](xs: List[T], n: Int) -> List[T] {
+    if n <= 0 { return xs }
+    t([], n - 1)                 // ok: the return type `List[T]` is the expected type of the tail
+}
+
+fn u[T](xs: List[T], n: Int) -> Int {
+    if n <= 0 { return xs.len() }
+    let e: List[T] = []
+    u(e, n - 1)                  // ok: the annotation fixes the element type
+}
+```
+
+A method's own type parameter follows the same rule. A type parameter of the impl, which the receiver fixes, does not:
+
+```blink
+trait Tm { fn m[U](self, xs: List[U], n: Int) -> Int }
+type Holder[T] { v: T }
+impl[T] Tm for Holder[T] {
+    fn m[U](self, xs: List[U], n: Int) -> Int {
+        if n <= 0 { return xs.len() }
+        self.m([], n - 1)        // error[CannotInferType] (E0301): type parameter `U` of `m` is unbound at this call
+                                 //   help: write `self.m[U]([], n - 1)`
+    }
+}
+
+trait Tn[T] { fn m(self, xs: List[T], n: Int) -> Int }
+type Cell[T] { v: List[T] }
+impl[T] Tn[T] for Cell[T] {
+    fn m(self, xs: List[T], n: Int) -> Int {
+        if n <= 0 { return xs.len() }
+        self.m([], n - 1)        // ok: the receiver fixes `T` of the impl
+    }
+}
+```
+
 **A payload variant named as a value.** A variant with a positional payload, written with no argument list, is a function value. It may stand wherever a function value is expected, as a generic function's name may. A variant `V(P1, ..., Pn)` of the enum `E[ᾱ]` has the type `fn(P1, ..., Pn) -> E[ᾱ]`: one parameter for each payload type, in declaration order, and an empty effect row. A payload of two or more types gives that many parameters, not one tuple parameter. The binders `ᾱ` are the type parameters of the enum, and the rule above solves them: the expected type fixes them, and a reference whose binders nothing fixes is `error[CannotInferType]` (E0301) at the reference.
 
 The rule covers the prelude variants and user variants alike. `Some` is `fn(T) -> Option[T]`, `Ok` is `fn(T) -> Result[T, E]`, and `Err` is `fn(E) -> Result[T, E]`. `Option.Some`, `Result.Ok` and `Result.Err` are the same values. A user variant is qualified, as in every expression: a bare `Leaf` is still `error[UnqualifiedVariant]` (E0554, *Variant Construction*), and this rule does not apply to it.
@@ -3660,6 +3753,164 @@ type Tree {
 ```
 
 The JSON data model is the compiler-known `JsonValue` (§3.6.2), not a user declaration.
+
+A recursive type holds itself at its own type arguments. A type that holds itself at a larger type argument, such as `type P[T] { Leaf(v: T), Node(p: P[(T, T)]) }`, is E0324 (§3.4 *Limit on Generic Instances*).
+
+#### Limit on Generic Instances
+
+The compiler builds one copy of a generic function, method or type for each list of type arguments that the program uses. A generic that needs a copy at a larger type argument than its own needs a still larger copy after that, and the copies have no end. Two rules stop this. A check of the declarations rejects a cycle in which a type argument grows: `error[InstantiationCycle]` (E0324). A fixed budget stops each other program that needs too many copies: `error[InstanceLimit]` (E0325). `blink check`, the LSP and the daemon report both errors, and none of them hangs or runs out of memory (§6.7).
+
+Both errors follow §8.16.1 *Rollout of a new error*.
+
+**Growth in a cycle (E0324).** Each use of a generic declaration `G` inside a declaration `D` is an **edge** from `D` to `G`. The edge sends each type parameter of `G` to a type argument, written or inferred. These uses are edges:
+
+- a call of a generic fn, with a written or an inferred type-argument list;
+- a generic fn named as a value (§3.4 *Explicit Type Application*);
+- a field type or a variant payload type of a generic type;
+- a method call whose impl the receiver type fixes.
+
+A method call on a value whose type is a type parameter, through a bound (`x.m()` with `x: T`), is not an edge. The impl is not known until `T` has a type, and a declaration check does not look there. Growth through a bound is stopped by the budget below.
+
+An edge **grows** when its type argument holds a type parameter of `D` inside a type constructor, as in `List[T]`, `(T, T)`, `Option[T]` or `Box[T]`. A type argument that is a type parameter alone does not grow: `T`, or another parameter of `D` (a swap). A cycle of edges with at least one growing edge is E0324.
+
+The check reads declarations only:
+
+- The value of `n` plays no part. `if false { r[List[T]](...) }` gives the same verdict as the code without the `if`.
+- A declaration that nothing uses is checked in the same way. A library with no `main` gets the error.
+- A type that holds itself at a larger type argument is the same case, also behind a `List`. No boxed form makes it legal.
+
+```blink
+fn r[T](x: T, n: Int) -> Int {
+    if n == 0 { return 0 }
+    r[List[T]]([x], n - 1)       // error[InstantiationCycle] (E0324): `T` of `r` becomes `List[T]`
+}                                //   no code calls `r`; the verdict is the same
+
+fn k4[T](x: T, n: Int) -> Int {
+    if n == 0 { return 0 }
+    k4([x], n - 1)               // error[InstantiationCycle] (E0324): `T` of `k4` becomes `List[T]`
+}
+
+fn a[T](x: T, n: Int) -> Int { b((x, x), n - 1) }   // error[InstantiationCycle] (E0324):
+fn b[U](y: U, n: Int) -> Int { a(y, n - 1) }        //   `T` of `a` becomes `(T, T)`, then `U` of `b` becomes `U`
+
+type P[T] { Leaf(v: T), Node(p: P[(T, T)]) }        // error[InstantiationCycle] (E0324): `T` of `P` becomes `(T, T)`
+type Q[T] { v: T, next: List[Q[List[T]]] }          // error[InstantiationCycle] (E0324): `T` of `Q` becomes `List[T]`
+
+fn v[T](x: T, n: Int) -> Int {
+    let f: fn(List[T], Int) -> Int = v    // error[InstantiationCycle] (E0324): `T` of `v` becomes `List[T]`
+    if n == 0 { 0 } else { f([x], n - 1) }
+}
+
+trait Deep { fn deep(self, n: Int) -> Int }
+type Box[T] { v: T }
+impl[T] Deep for Box[T] {
+    fn deep(self, n: Int) -> Int {
+        if n == 0 { 0 } else { Box { v: self }.deep(n - 1) }   // error[InstantiationCycle] (E0324):
+    }                                                          //   `T` of `Deep for Box[T]` becomes `Box[T]`; the receiver fixes the impl
+}
+
+fn swap[A, B](a: A, b: B, n: Int) -> Int {
+    if n == 0 { return 0 }
+    swap(b, a, n - 1)            // ok: `A` becomes `B` and `B` becomes `A`; no type grows
+}
+```
+
+E0324 and E0325 run only when the front end finds no error. A file with a type error shows that error first, and the cycle error shows after the type errors are fixed.
+
+One error is reported for each cycle. The span is one growing edge of the cycle. The note lists the whole chain, one line for each edge, with the declaration, the parameter and what it becomes. When a cycle has two growing edges, the span shows one and the note names both. A test of the compiler fixes which edge the span shows. The `--json` form of the error carries the edge list: for each edge, `decl`, `param`, `becomes` and `span`.
+
+The help gives a repair, as text only. No repair is machine-applicable. A type argument that must grow needs a recursive type in its place:
+
+```
+error[InstantiationCycle] (E0324): `P` needs `P[(T, T)]` inside `P[T]`, without end
+  --> a.bl:1:33
+  |
+1 | type P[T] { Leaf(v: T), Node(p: P[(T, T)]) }
+  |                                 ^^^^^^^^^ `T` of `P` becomes `(T, T)` here
+  help: write a recursive type: `type P[T] { Leaf(v: T), Node(l: P[T], r: P[T]) }`.
+        This gives up the guarantee of `P[(T, T)]` that both sides have the same depth
+```
+
+For a fn, the help says to take a recursive type in place of `T`, as in `type Nest[T] { One(v: T), Many(items: List[Nest[T]]) }` with `fn r[T](x: Nest[T], n: Int)`. Then `r(Nest.Many([x]), n - 1)` has a type argument that does not grow.
+
+**The budget (E0325).** The compiler counts each instance it builds. A type's **size** is its number of nodes. A type name counts 1. A type constructor with arguments counts 1 plus the sizes of its arguments. `Int` has size 1, `List[Int]` has size 2, `(Int, Int)` has size 3 and `Map[Str, List[Int]]` has size 4. An instance weighs 1 plus the sizes of its type arguments added together. `f[Int]` weighs 2, `f[List[Int]]` weighs 3 and `f[Int, Str]` weighs 3.
+
+The total weight of all instances of the program may not pass 2^20, which is 1,048,576. A program over the total is E0325. The rule has these parts:
+
+- One budget covers all generic functions, methods and types. There is no second limit for time, memory or depth.
+- No flag, annotation or configuration key changes the budget, and every host gives the same verdict. A later release can raise the number.
+- The compiler adds the size of a type to the total before it builds the text or the C name of the type. A program over the budget stops with E0325. It does not run out of memory.
+- The total is for the whole program. A change in one function can reach the limit through an instance that another function needs.
+- The value of `n` plays no part. The compiler builds one copy for each type, and it does not read the code that ends the recursion at run time.
+- A cycle that grows only through a bound (`x.m()` with `x: T`) is E0325, because E0324 does not see it.
+- A finite program that has many instances is legal when its total is under the budget. The first two programs below use a call on a bound, and both compile and print `7`. The third program has no end, and it is E0325.
+
+```blink
+trait Foo { fn foo(self) -> Int }
+type Box[T] { v: T }
+type Wrap[T] { v: T }
+fn f[T: Foo](x: T) -> Int { x.foo() }
+impl[U] Foo for Box[U] { fn foo(self) -> Int { f(Wrap { v: self }) } }
+impl[U] Foo for Wrap[U] { fn foo(self) -> Int { 7 } }
+fn main() { io.println("{f(Box { v: 1 })}") }   // ok: prints 7; the call `x.foo()` on a bound is not an edge
+```
+
+```blink
+trait M { fn m(self) -> Int }
+impl M for Int { fn m(self) -> Int { self } }
+type W[T] { v: T }
+impl[U: M] M for List[U] { fn m(self) -> Int { g(W { v: W { v: self.get(0).unwrap() } }) } }
+impl[U: M] M for W[U] { fn m(self) -> Int { self.v.m() } }
+fn g[T: M](x: T) -> Int { x.m() }
+fn main() { io.println("{[[7]].m()}") }       // ok: prints 7; the chain of instances ends at `Int`
+```
+
+```blink
+trait Grow { fn g(self, n: Int) -> Int }
+type Box[T] { v: T }
+impl Grow for Int { fn g(self, n: Int) -> Int { n } }
+fn h[T: Grow](x: T, n: Int) -> Int { x.g(n) }
+impl[U: Grow] Grow for Box[U] {
+    fn g(self, n: Int) -> Int {
+        if n == 0 { 0 } else { h(Box { v: self }, n - 1) }   // error[InstanceLimit] (E0325)
+    }
+}
+fn main() { io.println("{h(Box { v: 1 }, 2)}") }
+```
+
+The third program ends at run time, but the compiler does not read `n`. `h` is called at `Box[Int]`, then at `Box[Box[Int]]`, and so on without end.
+
+**Where E0325 points.** Each instance is made by a call in another instance. The **chain** of the instance that crosses the budget is the list of instances from a call in the code of the package that you build, to the crossing instance. A type argument list is **larger** than another when the sum of the sizes of its type arguments is larger.
+
+The compiler walks the chain from the crossing instance toward the root. It looks for the nearest declaration on the chain that appears again with a larger type-argument list. The part of the chain between the two instances of that declaration is the **stretch**. The span of the error is the call in the stretch where the type argument grew. The type-argument list of the later instance is larger than the list of the earlier instance, not the reverse. A declaration that appears twice with no growth, such as a helper used at two types, is not a repeat. When the stretch has two growing calls, the span shows one, and the note names the chain. A test of the compiler fixes the order of the walk and so fixes which call the span shows.
+
+The error always has these notes:
+
+- The **root note** names the call at the root of the chain, in the code of the package that you build. It prints also when the span is in your code, and it prints when the span is in a library that you cannot edit.
+- A note that says the compiler builds one copy for each type and does not read `n`.
+- A note with the name of the declaration that repeated, and how many instances it has.
+
+When no declaration repeats with a larger list, the span is the call that made the crossing instance. The note names the declaration with the most instances, gives the count, and says what to change: a recursive type, or a named type for the part that repeats. A test of the compiler fixes the choice when two declarations have the same count.
+
+A diagnostic never prints a type in full. A type prints to depth 3, then `...`, as `Box[Box[Box[...]]]`. A message holds at most about 20 lines of declared forms. The `--json` form carries the edge list of the chain: for each edge, `decl`, `param`, `becomes` and `span`.
+
+```
+error[InstanceLimit] (E0325): the generic instances of this program weigh more than 1,048,576
+  --> a.bl:7:32
+  |
+7 |         if n == 0 { 0 } else { h(Box { v: self }, n - 1) }
+  |                                ^^^^^^^^^^^^^^^^^^^^^^^^^ `T` of `h` becomes `Box[T]` here
+  note: the chain starts at the call `h(Box { v: 1 }, 2)` at a.bl:10:26
+  note: `h` appears again with a larger type: `h[Box[Int]]`, then `h[Box[Box[Int]]]`, then
+        `h[Box[Box[Box[...]]]]`; it has 1,447 instances
+  note: the compiler builds one copy for each type. It does not read `n`, so `n == 0` does not end the chain
+  help: write the growing part as a recursive type, such as
+        `type Nest[T] { One(v: T), Wrap(inner: Nest[T]) }`
+```
+
+The counts in this message show its form. The exact counts depend on the compiler.
+
+The help gives repairs that compile. Three tests ran: a chain of 24 fns, each of which calls the next one with `(x, x)`, becomes 24 fns that take `Tree[T]` with `type Tree[T] { Leaf(v: T), Pair(l: Tree[T], r: Tree[T]) }`; it builds and prints 8388608. A `Box[T]` that wraps itself becomes `type Nest[T] { One(v: T), Wrap(inner: Nest[T]) }`, and it builds. A chain of 26 tuple levels becomes 26 named types, one for each level (`type N1 { a: N0, b: N0 }`), and it builds. The help says "a recursive type" or "a named type" and never says to raise the budget.
 
 ---
 
