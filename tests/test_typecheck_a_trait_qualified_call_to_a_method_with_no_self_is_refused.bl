@@ -1,0 +1,88 @@
+// `Trait.method(receiver, args)` gets `Self` from its receiver. A method with no `self` (an
+// associated function) has no receiver, so `Trait.method(..)` cannot say which type's impl to
+// run, and the call is a compile error at check, also when the first argument has a type with
+// an impl of the trait (sections/03c_protocols.md *Qualified Calls*, *Impl-Qualified Calls*).
+
+import std.fs
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_reset}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+import std.io
+
+fn typecheck_probe(path: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    init_embedded_stdlib()
+    fs.write(path, src).unwrap()
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+}
+
+// Each error as "name: message | note | note | help: help".
+fn errors_of(src: Str) -> List[Str] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    typecheck_probe("build/test_typecheck_a_trait_qualified_call_with_no_self_probe.bl", src)
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" {
+            let mut line = "{d.name}: {d.message}"
+            for n in d.notes { line = "{line} | {n}" }
+            out.push("{line} | help: {d.help}")
+        }
+    }
+    for e in out { io.println("  diag: {e}") }
+    out
+}
+
+fn body(decls: Str, stmts: Str) -> Str {
+    "{decls}fn main() \{\n{stmts}}\n"
+}
+
+fn one_error(src: Str) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    let errs = errors_of(src)
+    assert_eq(errs.len(), 1)
+    errs.get(0).unwrap()
+}
+
+let MAKER = "trait NsMk \{\n    fn make(_n: Int) -> Int\n}\ntype NsS \{\n    n: Int\n}\nimpl NsMk for NsS \{\n    fn make(_n: Int) -> Int \{ 7 }\n}\nimpl NsMk for Int \{\n    fn make(_n: Int) -> Int \{ 9 }\n}\n"
+
+let NO_ARGS = "trait NsAlpha \{\n    fn make() -> Self\n}\ntype NsW \{\n    v: Int\n}\nimpl NsAlpha for NsW \{\n    fn make() -> Self \{ NsW \{ v: 1 } }\n}\n"
+
+test "an associated function called through its trait is refused" {
+    let e = one_error(body(MAKER, "    let _ = NsMk.make(3)\n"))
+    assert(e.starts_with("TypeError: "), e)
+    assert(e.contains("`NsMk.make` takes no `self`, so the call names no type whose impl to run"), e)
+    assert(e.contains("help: call it through the type: `Type.make(..)`"), e)
+}
+
+test "an associated function with no parameters called through its trait is refused" {
+    let e = one_error(body(NO_ARGS, "    let _ = NsAlpha.make()\n"))
+    assert(e.contains("`NsAlpha.make` takes no `self`"), e)
+    assert(e.contains("help: call it through the type: `Type.make()`"), e)
+    let typed = one_error(body(NO_ARGS, "    let _w: NsW = NsAlpha.make()\n"))
+    assert(typed.contains("`NsAlpha.make` takes no `self`"), typed)
+}
+
+test "a generic associated function called through its trait is refused" {
+    let decls = "trait NsGen \{\n    fn make[U](_u: U) -> Int\n}\nimpl NsGen for Int \{\n    fn make[U](_u: U) -> Int \{ 9 }\n}\n"
+    let e = one_error(body(decls, "    let _ = NsGen.make(3)\n"))
+    assert(e.contains("`NsGen.make` takes no `self`"), e)
+}
+
+test "an associated function called through its trait in a generic body is refused" {
+    let decls = "{NO_ARGS}fn ns_build[T: NsAlpha]() -> T \{\n    NsAlpha.make()\n}\n"
+    let e = one_error(body(decls, "    let _w: NsW = ns_build()\n"))
+    assert(e.contains("`NsAlpha.make` takes no `self`"), e)
+}
+
+test "a conversion called through its trait is refused" {
+    let from = one_error(body("", "    let _x: Int = From.from(3)\n"))
+    assert(from.contains("`From.from` takes no `self`"), from)
+    let try_from = one_error(body("", "    let _c: Result[U8, ConversionError] = TryFrom.try_from(65)\n"))
+    assert(try_from.contains("`TryFrom.try_from` takes no `self`"), try_from)
+}
+
+test "a method with self called through its trait still checks" {
+    let decls = "trait NsSize \{\n    fn size(self) -> Int\n}\ntype NsBox \{\n    n: Int\n}\nimpl NsSize for NsBox \{\n    fn size(self) -> Int \{ self.n }\n}\n"
+    assert_eq(errors_of(body(decls, "    let _s: Int = NsSize.size(NsBox \{ n: 1 })\n")).len(), 0)
+}
