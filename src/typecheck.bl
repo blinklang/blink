@@ -23898,6 +23898,19 @@ pub fn tc_call_trait_head(node: Int) -> Option[Str] {
     tc_calls.trait_heads.get(node)
 }
 
+// Whether no impl of the trait can hold for this receiver, so `Trait.method(recv, ..)` has no
+// method to run. A std trait also reaches a type through a derive or a builtin impl, which
+// register no impl node, so the bound judgement answers for it.
+fn tc_trait_qualified_unanswered(trait_name: Str, method: Str, recv: Int) -> Bool ! TypeCheck.Resolve, Diag.Report {
+    let tr = tc_trait_node_idx.get(trait_name) ?? -1
+    if tr == -1 || tc_tid_is_judgeable(recv) == 0 || tc_trait_declares_method(trait_name, method) == 0 {
+        return false
+    }
+    if node_source_module(tr).starts_with("std_") { return tc_type_satisfies_bound(recv, trait_name) == -1 }
+    let held = tc_impl_trait_args_held(recv, trait_name)
+    held.verdict == 1 && held.impls == 0
+}
+
 // Does the trait's own DECLARATION list a method of this name? register_trait
 // pushes "{trait}.{method}" per declared method, so this is an exact-name membership test —
 // deliberately not a substring probe of tc_method_trait_names, whose values are " and
@@ -31892,6 +31905,13 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                         diag_error_at("UnresolvedMethod", UNRESOLVED_METHOD, "trait `{obj_name}` does not define method `{method}`", node, qt_help)
                         return tc_error_recovery_tid()
                     }
+                }
+                // No answer above, and no impl of the trait can hold for this receiver: the call
+                // has no method to run, so it reports as `x.method()` does.
+                if tc_trait_qualified_unanswered(qt_trait, method, qt_recv) {
+                    tc_method_calls.hard.insert(node, 1)
+                    tc_report_unresolved_method(node, qt_recv, tc_type_str(qt_recv), method)
+                    return tc_error_recovery_tid()
                 }
             }
             // Static constructor on a sealed builtin type: Bytes.new/from_str/zeroed,
