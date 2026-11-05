@@ -5,7 +5,9 @@
 // of it, or of a member of it, with no call is E0506, as it is for the built-in handles. Each
 // shape stops at check: none of them may reach codegen with a node that has no type.
 import lower_test_helpers.{probe, probe_but}
-import diagnostics.{diag_entries}
+import diagnostics.{diag_entries, diag_reset}
+import compiler.{compile_to_program}
+import typecheck.{check_types}
 
 fn rows(stem: Str, source: Str, expected: Str) -> List[Str] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Env.Exit, Env.Read, FS.Read, FS.Write, IO, Env.Write, Process.Spawn {
     let program = probe_but(stem, source, expected)
@@ -136,4 +138,75 @@ fn main() {
 "#
     let program = probe("eh_handle_named_like_builtin", io_named)
     assert(program >= 0)
+}
+
+// A binding of the handle's spelling holds a value, so its fields and methods are its own.
+let SHADOW_DECL = #"effect Tag {
+    effect Read { fn tag() -> Str }
+}
+type P { x: Int }
+trait Measured {
+    fn size(self) -> Int
+}
+impl Measured for P {
+    fn size(self) -> Int { self.x }
+}
+"#
+
+fn shadow_src(body: Str) -> Str { SHADOW_DECL.concat(body).concat("\nfn main() \{}\n") }
+
+test "a parameter named like the handle keeps its fields and methods" {
+    let program = probe("eh_shadow_param", shadow_src("fn f(tag: P) -> Int \{ tag.x + tag.size() }"))
+    assert(program >= 0)
+}
+
+test "a let named like the handle keeps its fields and methods" {
+    let program = probe("eh_shadow_let", shadow_src("fn f() -> Int \{\n    let tag = P \{ x: 2 }\n    tag.x + tag.size()\n}"))
+    assert(program >= 0)
+}
+
+test "a closure that captures a parameter named like the handle keeps its fields and methods" {
+    let program = probe("eh_shadow_capture", shadow_src("fn f(tag: P) -> Int \{\n    let g = fn() \{ tag.x + tag.size() }\n    g()\n}"))
+    assert(program >= 0)
+}
+
+test "a closure parameter named like the handle keeps its fields and methods" {
+    let program = probe("eh_shadow_closure_param", shadow_src("fn f() -> Int \{\n    let g = fn(tag: P) \{ tag.x + tag.size() }\n    g(P \{ x: 1 })\n}"))
+    assert(program >= 0)
+}
+
+test "a for binder named like the handle keeps its fields and methods" {
+    let program = probe("eh_shadow_for", shadow_src("fn f(items: List[P]) -> Int \{\n    let mut n = 0\n    for tag in items \{ n = n + tag.x + tag.size() }\n    n\n}"))
+    assert(program >= 0)
+}
+
+test "a match binder named like the handle keeps its fields and methods" {
+    let program = probe("eh_shadow_match", shadow_src("fn f(o: Option[P]) -> Int \{\n    match o \{\n        Some(tag) => tag.x + tag.size()\n        None => 0\n    }\n}"))
+    assert(program >= 0)
+}
+
+test "a module-level let named like the handle keeps its fields and methods" {
+    let program = probe("eh_shadow_global", shadow_src("let tag = P \{ x: 1 }\nfn f() -> Int \{ tag.x + tag.size() }"))
+    assert(program >= 0)
+}
+
+let MODULES = "tests/zzeh_effect_handle/src"
+
+fn module_errors(file: Str) -> List[Str] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    diag_reset()
+    check_types(compile_to_program("{MODULES}/{file}", 1))
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity != "error" { continue }
+        out.push("{d.name} {d.code} {d.line}:{d.col}: {d.message} | help: {d.help}")
+    }
+    out
+}
+
+test "a binder in another module than the effect keeps the fields of its value" {
+    assert_eq(module_errors("main_binder_elsewhere.bl"), [])
+}
+
+test "a module bound under the handle's name is the qualifier when it is read as a value" {
+    assert_eq(module_errors("main_qualifier.bl"), ["UndefinedVariable E0506 7:14: undefined variable `ledger` | help: `ledger` is a module qualifier, not a value: write `ledger.y`"])
 }
