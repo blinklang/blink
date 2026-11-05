@@ -18020,6 +18020,103 @@ fn tc_report_not_a_handle_op(node: Int, root: Str, name: Str) -> Int ! TypeCheck
     tc_error_recovery_tid()
 }
 
+// A note that lists more operations than this is too long to help.
+let UE_OPS_LISTED_MAX = 8
+
+// The operations of a user root effect, in declaration order.
+fn tc_ue_ops(ed: Int) -> List[Int] {
+    let mut ops: List[Int] = []
+    let children_sl = node_elements(ed)
+    if children_sl == -1 { return ops }
+    let mut ci = 0
+    while ci < sublist_length(children_sl) {
+        let ops_sl = node_methods(sublist_get(children_sl, ci))
+        let mut oi = 0
+        while ops_sl != -1 && oi < sublist_length(ops_sl) {
+            ops.push(sublist_get(ops_sl, oi))
+            oi = oi + 1
+        }
+        ci = ci + 1
+    }
+    ops
+}
+
+// `handle.op(p1, p2)` as the source spells a call of `op`, with its parameter names as the
+// arguments.
+fn tc_ue_op_call_text(handle: Str, op: Int) -> Str {
+    let mut names: List[Str] = []
+    let params_sl = node_params(op)
+    let mut i = 0
+    while params_sl != -1 && i < sublist_length(params_sl) {
+        names.push(node_name(sublist_get(params_sl, i)))
+        i = i + 1
+    }
+    "{handle}.{node_name(op)}({names.join(\", \")})"
+}
+
+// "call one of its operations, such as `tag.tag()`", or "" for an effect with no operations.
+fn tc_ue_call_one_help(handle: Str, ed: Int) -> Str {
+    let ops = tc_ue_ops(ed)
+    if ops.len() == 0 { return "" }
+    "call one of its operations, such as `{tc_ue_op_call_text(handle, ops.get(0).unwrap())}`"
+}
+
+// A call through a user effect handle of a name its effect does not declare (§4.4). The
+// arguments are typed so that each node of the call has a type, as the call has none.
+fn tc_report_unknown_ue_op(node: Int, handle: Str, method: Str) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    let ed = tc_ue_handle_decl(handle)
+    let root = node_name(ed)
+    let args = node_args(node)
+    let mut i = 0
+    while args != -1 && i < sublist_length(args) {
+        let _ = tc_infer_unhinted(sublist_get(args, i))
+        i = i + 1
+    }
+    let ops = tc_ue_ops(ed)
+    let mut notes: List[Str] = []
+    if ops.len() > 0 && ops.len() <= UE_OPS_LISTED_MAX {
+        let mut names: List[Str] = []
+        for op in ops { names.push("`{node_name(op)}`") }
+        notes.push("`{root}` operations are {names.join(\", \")}")
+    }
+    let call_one = tc_ue_call_one_help(handle, ed)
+    let mut what = ""
+    if method == root {
+        what = "`{root}` is the effect of the handle `{handle}`, not an operation"
+    } else {
+        let children_sl = node_elements(ed)
+        let mut ci = 0
+        while children_sl != -1 && ci < sublist_length(children_sl) {
+            if node_name(sublist_get(children_sl, ci)) == method { what = "`{method}` is a sub-effect of `{root}`, not an operation" }
+            ci = ci + 1
+        }
+    }
+    let help = if what == "" { "" } else if call_one == "" { what } else { "{what}: {call_one}" }
+    tc_method_calls.hard.insert(node, 1)
+    diag_error_at_notes("UnresolvedMethod", UNRESOLVED_METHOD, "`{method}` is not an operation of effect `{root}`", node, help, notes)
+    tc_error_recovery_tid()
+}
+
+// A user effect handle read as a value (sections/03_types.md: a handle is not a value). `member`
+// is the name read off it, or "" for the bare handle. The code is the one the built-in handles
+// give for the same read.
+fn nr_report_ue_handle_value(node: Int, handle: Str, member: Str) ! Diag.Report {
+    let ed = tc_ue_handle_decl(handle)
+    let mut help = "`{handle}` is the handle of effect `{node_name(ed)}`, not a value"
+    let mut op_named = -1
+    for op in tc_ue_ops(ed) {
+        if member != "" && node_name(op) == member { op_named = op }
+    }
+    let call_one = tc_ue_call_one_help(handle, ed)
+    if op_named != -1 {
+        help = "{help}: call the operation, as in `{tc_ue_op_call_text(handle, op_named)}`"
+    } else if call_one != "" {
+        help = "{help}: {call_one}"
+    }
+    tc_errors.push("undefined variable `{handle}`")
+    diag_error_at("UndefinedVariable", UNDEFINED_VARIABLE, "undefined variable `{handle}`", node, help)
+}
+
 // The help and fix for a module function called through a handle. The fix is the first of
 // these that makes the callee the module's function and adds no diagnostic (§4.4.7): the bare
 // name or a qualifier the file already binds to the module, a new `import module` and a call
@@ -25810,7 +25907,10 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
             diag_error_at("UndefinedVariable", UNDEFINED_VARIABLE, "undefined variable `{name}`", node, "`{name}` is a built-in namespace, not a value: use it as `{name}.y`")
             return
         }
-        if is_user_effect_handle_name(name) != 0 { return }
+        if is_user_effect_handle_name(name) != 0 {
+            nr_report_ue_handle_value(node, name, "")
+            return
+        }
         if is_variant_name(name) != 0 {
             if nr_check_selective_access(name, node) != 0 { return }
             if is_private_access("value", name) != 0 {
@@ -26001,7 +26101,8 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
             }
             // A namespace receiver names no value, so the Ident walk has nothing to check on it.
             // Skipping it leaves that walk to report a namespace in a value position.
-            if node_kind(obj) != NodeKind.Ident || is_builtin_namespace(node_name(obj)) == 0 || (nr_top_index(node_name(obj)) != -1 && !nr_namespace_binding_out_of_scope(node_name(obj))) {
+            let ue_handle_recv = node_kind(obj) == NodeKind.Ident && is_user_effect_handle_name(node_name(obj)) != 0 && nr_top_index(node_name(obj)) == -1
+            if !ue_handle_recv && (node_kind(obj) != NodeKind.Ident || is_builtin_namespace(node_name(obj)) == 0 || (nr_top_index(node_name(obj)) != -1 && !nr_namespace_binding_out_of_scope(node_name(obj)))) {
                 let receiver_diags = diag_entry_count()
                 nr_check_node(obj)
                 if diag_any_errors_since(receiver_diags) > 0 { tc_method_calls.receiver_failed.insert(node, 1) }
@@ -26092,6 +26193,10 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                         tc_mark_symbol_used(fa_field)
                     }
                     tc_mark_qualifier_used(fa_obj_name)
+                }
+                if is_mod_fa == 0 && is_user_effect_handle_name(fa_obj_name) != 0 && is_builtin_namespace(fa_obj_name) == 0 {
+                    nr_report_ue_handle_value(obj, fa_obj_name, node_name(node))
+                    return
                 }
             }
             if is_mod_fa == 0 && obj_kind == NodeKind.FieldAccess {
@@ -32004,6 +32109,9 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                     let _ = check_arg_shapes("{obj_name}.{method}", ue_sig, node_args(node), 0, node)
                     return fnsig_pool.get(ue_sig).unwrap().ret
                 }
+                // A module bound under the same name is resolved below.
+                // A built-in namespace of the same spelling keeps its own members.
+                if nr_qualifier_module_here(obj_name) == "" && is_builtin_namespace(obj_name) == 0 { return tc_report_unknown_ue_op(node, obj_name, method) }
             }
             // `rand.<name>` always means the handle, so a name that is no operation of `Rand` is
             // E0505 here, before the unclaimed-call report can read `rand` as a module (§4.4.7).

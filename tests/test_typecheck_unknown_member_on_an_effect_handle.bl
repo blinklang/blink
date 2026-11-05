@@ -1,0 +1,139 @@
+// A user effect's handle reaches only the operations its effect declares, and only through a
+// call (sections/04_effects.md §4.4, sections/03c_protocols.md §3c.4 *Effect Handle
+// Operations*). A call of a name the effect does not declare is E0505, also when the name is a
+// sub-effect or the effect itself. The handle is not a value (sections/03_types.md), so a read
+// of it, or of a member of it, with no call is E0506, as it is for the built-in handles. Each
+// shape stops at check: none of them may reach codegen with a node that has no type.
+import lower_test_helpers.{probe, probe_but}
+import diagnostics.{diag_entries}
+
+fn rows(stem: Str, source: Str, expected: Str) -> List[Str] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Env.Exit, Env.Read, FS.Read, FS.Write, IO, Env.Write, Process.Spawn {
+    let program = probe_but(stem, source, expected)
+    assert(program >= 0)
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity != "error" { continue }
+        out.push("{d.name} {d.code} {d.line}:{d.col}: {d.message} | help: {d.help} | notes: {d.notes.join(\"; \")}")
+    }
+    out
+}
+
+let DECL = #"effect Tag {
+    effect Read { fn tag() -> Str }
+    effect Write { fn set_tag(name: Str, n: Int) }
+}
+"#
+
+fn src(body: Str) -> Str { DECL.concat(body).concat("\nfn main() \{}\n") }
+
+let OPS = "`Tag` operations are `tag`, `set_tag`"
+
+fn unknown(col: Int, name: Str, help: Str) -> Str {
+    "UnresolvedMethod E0505 6:{col}: `{name}` is not an operation of effect `Tag` | help: {help} | notes: {OPS}"
+}
+
+fn not_a_value(col: Int, help: Str) -> Str {
+    "UndefinedVariable E0506 6:{col}: undefined variable `tag` | help: {help} | notes: "
+}
+
+let CALL_ONE = "`tag` is the handle of effect `Tag`, not a value: call one of its operations, such as `tag.tag()`"
+
+test "a call of a name the effect does not declare is E0505 and lists the operations" {
+    let got = rows("eh_unknown_op", src("fn f() -> Bool ! Tag \{\n    let z: Bool = tag.nosuchthing(1)\n    z\n}"), "UnresolvedMethod")
+    assert_eq(got, [unknown(19, "nosuchthing", "")])
+}
+
+test "an unknown operation whose answer is never read is E0505" {
+    let got = rows("eh_unknown_op_stmt", src("fn f() ! Tag \{\n    tag.nosuchthing(1)\n}"), "UnresolvedMethod")
+    assert_eq(got, [unknown(5, "nosuchthing", "")])
+}
+
+test "a call of a sub-effect name through the handle is E0505" {
+    let got = rows("eh_sub_effect_call", src("fn f() -> Str ! Tag \{\n    tag.Read()\n}"), "UnresolvedMethod")
+    assert_eq(got, [unknown(5, "Read", "`Read` is a sub-effect of `Tag`, not an operation: call one of its operations, such as `tag.tag()`")])
+}
+
+test "a call of the effect's own name through the handle is E0505" {
+    let got = rows("eh_root_effect_call", src("fn f() -> Str ! Tag \{\n    tag.Tag()\n}"), "UnresolvedMethod")
+    assert_eq(got, [unknown(5, "Tag", "`Tag` is the effect of the handle `tag`, not an operation: call one of its operations, such as `tag.tag()`")])
+}
+
+test "an operation called with the wrong number of arguments is an error at check" {
+    let program = probe_but("eh_op_wrong_arity", src("fn f() -> Str ! Tag \{\n    tag.tag(1)\n}"), "TypeError")
+    assert(program >= 0)
+}
+
+test "a read of an unknown member of the handle with no call is E0506" {
+    let got = rows("eh_unknown_member_read", src("fn f() -> Str ! Tag \{\n    let _z = tag.nosuchthing\n    \"\"\n}"), "UndefinedVariable")
+    assert_eq(got, [not_a_value(14, CALL_ONE)])
+}
+
+test "a read of an operation with no call is E0506 and shows the call" {
+    let got = rows("eh_op_read_no_call", src("fn f() -> Str ! Tag \{\n    let _z = tag.set_tag\n    \"\"\n}"), "UndefinedVariable")
+    assert_eq(got, [not_a_value(14, "`tag` is the handle of effect `Tag`, not a value: call the operation, as in `tag.set_tag(name, n)`")])
+}
+
+test "the handle bound to a name is E0506" {
+    let got = rows("eh_handle_as_value", src("fn f() ! Tag \{\n    let _z = tag\n}"), "UndefinedVariable")
+    assert_eq(got, [not_a_value(14, CALL_ONE)])
+}
+
+test "a call through a sub-effect read off the handle is one E0506 at the handle" {
+    let got = rows("eh_sub_effect_path_call", src("fn f() -> Str ! Tag \{\n    tag.Read.tag()\n}"), "UndefinedVariable")
+    assert_eq(got, [not_a_value(5, CALL_ONE)])
+}
+
+test "an operation called through the handle still checks clean" {
+    let program = probe("eh_known_op", src("fn f() -> Str ! Tag \{\n    tag.set_tag(\"a\", 1)\n    tag.tag()\n}"))
+    assert(program >= 0)
+}
+
+test "an effect with many operations does not list them" {
+    let many = #"effect Wide {
+    effect A {
+        fn a1()
+        fn a2()
+        fn a3()
+        fn a4()
+        fn a5()
+        fn a6()
+        fn a7()
+        fn a8()
+        fn a9()
+    }
+}
+fn f() ! Wide {
+    wide.nope()
+}
+fn main() {}
+"#
+    let got = rows("eh_unknown_op_many", many, "UnresolvedMethod")
+    assert_eq(got, ["UnresolvedMethod E0505 15:5: `nope` is not an operation of effect `Wide` | help:  | notes: "])
+}
+
+test "a module imported under the handle's name keeps its calls in a fn that does not declare the effect" {
+    let shared_name = #"import std.random
+
+effect Random {
+    effect Roll { fn roll() -> Int }
+}
+fn deal(deck: List[Int]) -> List[Int] ! Rand {
+    random.shuffle(deck)
+}
+fn main() {}
+"#
+    let program = probe("eh_module_named_like_handle", shared_name)
+    assert(program >= 0)
+}
+
+test "a user effect whose handle is spelled like a built-in namespace leaves the built-in members to it" {
+    let io_named = #"effect Io {
+    effect Write { fn put(line: Str) }
+}
+fn main() {
+    io.println("ok")
+}
+"#
+    let program = probe("eh_handle_named_like_builtin", io_named)
+    assert(program >= 0)
+}
