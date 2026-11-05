@@ -21208,6 +21208,28 @@ fn nr_namespace_binding_out_of_scope(name: Str) -> Bool {
     nr_bare_name_in_scope_here(name, nr_current_module) == 0
 }
 
+fn nr_decl_is_value(decl: Int) -> Bool {
+    (nr_privacy.space.get(decl) ?? "") == "value"
+}
+
+// Whether the only top-level bindings of `name` are values this file cannot read. All modules
+// share the outermost frame, so its entry may be a private let of a module this file does not
+// import, and a type this file selects does not make that let visible. An entry with no recorded
+// declaration is the compiler's own, which each file sees.
+fn nr_value_binding_out_of_scope(name: Str) -> Bool {
+    let idx = nr_top_index(name)
+    if idx == -1 || nr_index_is_local(idx) { return false }
+    if nr_current_module == "" { return false }
+    let cands = nr_decls_by_name.get(name) ?? []
+    if cands.len() == 0 { return false }
+    for c in cands {
+        if !nr_decl_is_value(c) { continue }
+        if node_module(c) == nr_current_module || !is_filtered_for_module(name, node_module(c), nr_current_module) { return false }
+    }
+    let imported = nr_resolve_imported_decl(name, nr_current_module)
+    imported == -1 || !nr_decl_is_value(imported)
+}
+
 // nr_is_defined for a method receiver: a namespace whose bindings are all out of scope here
 // is not defined.
 fn nr_receiver_is_defined(name: Str) -> Int {
@@ -21215,9 +21237,9 @@ fn nr_receiver_is_defined(name: Str) -> Int {
     nr_is_defined(name)
 }
 
-// nr_has_binding for a method receiver, with the same namespace rule as nr_receiver_is_defined.
+// nr_has_binding for a dotted head: a top-level value out of scope here is no binding of it.
 fn nr_receiver_has_binding(name: Str) -> Int {
-    if nr_namespace_binding_out_of_scope(name) { return 0 }
+    if nr_value_binding_out_of_scope(name) { return 0 }
     nr_has_binding(name)
 }
 
@@ -29800,7 +29822,7 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
 
         // `Option.Some(x)` and `Result.Err(e)` name the carrier directly (§3.4 resolution
         // step 1), so neither the expected type nor a user enum's namesake variant is asked.
-        if obj_node != -1 && node_kind(obj_node) == NodeKind.Ident && tc_tid_is_no_info(nr_get_type(node_name(obj_node))) != 0 {
+        if obj_node != -1 && node_kind(obj_node) == NodeKind.Ident && nr_receiver_has_binding(node_name(obj_node)) == 0 {
             if tc_qualified_carrier(node_name(obj_node), method).is_some() {
                 if tc_alias_decl_of_written(node_name(obj_node)) != -1 {
                     return tc_alias_carrier_call_tid(tc_value_head_tid(node_name(obj_node)), "{node_name(obj_node)}.{method}", method, node_args(node), node)
@@ -29816,7 +29838,7 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
         // the shadowing variant's enum and `.Variant` fails to resolve.
         if obj_node != -1 && node_kind(obj_node) == NodeKind.Ident {
             let cname = node_name(obj_node)
-            if tc_tid_is_no_info(nr_get_type(cname)) != 0 {
+            if nr_receiver_has_binding(cname) == 0 {
                 let ctor_tid = tc_value_head_tid(cname)
                 if ctor_tid != -1 && type_kind(ctor_tid) == TyKind.Enum {
                     let cvar_idx = get_variant_by_name(tc_enum_base_tid(ctor_tid), method)
@@ -31560,16 +31582,18 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
 
         if node_kind(obj_node) == NodeKind.Ident {
             let obj_name = node_name(obj_node)
-            if tc_tid_is_no_info(nr_get_type(obj_name)) != 0 && tc_qualified_carrier(obj_name, fname).is_some() {
+            // A value comes first at a dotted head, so a binder named like a type reads its own field.
+            let head_is_type = nr_receiver_has_binding(obj_name) == 0
+            if head_is_type && tc_qualified_carrier(obj_name, fname).is_some() {
                 if fname == "None" && tc_alias_decl_of_written(obj_name) != -1 {
                     return tc_note_open_variant(node, tc_value_head_tid(obj_name))
                 }
                 return tc_carrier_nullary_tid(fname, "{obj_name}.{fname}", node)
             }
-            if tc_tid_is_no_info(nr_get_type(obj_name)) != 0 {
+            if head_is_type {
                 if tc_report_bad_variant_value(node, obj_name, fname, 0) { return tc_error_recovery_tid() }
             }
-            let tid = tc_value_head_tid(obj_name)
+            let tid = if head_is_type { tc_value_head_tid(obj_name) } else { -1 }
             if tid != -1 && type_kind(tid) == TyKind.Enum {
                 let vi = get_variant_by_name(tc_enum_base_tid(tid), fname)
                 if vi != -1 && variant_field_count(vi) != 0 { return tc_declared_variant_value_tid(tid, vi, "{obj_name}.{fname}", node) }
