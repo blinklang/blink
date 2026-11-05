@@ -13678,14 +13678,16 @@ fn tc_check_one_debug_field(f: Int, ftid: Int, tname: Str) ! TypeCheck.Resolve, 
     tc_check_container_elems(ann, core, ftid, f, tname)
 }
 
-fn tc_check_derive_debug() ! TypeCheck.Resolve, Diag.Report {
+// One walk serves each derive field check: each struct field and each variant field of each
+// type that carries `@derive(tr)`, with its declared tid. A field annotation means what it
+// means in the module that declares the type.
+fn tc_check_derive_fields(tr: Str) ! TypeCheck.Resolve, Diag.Report {
     let mut ti = 0
     while ti < named_type_names.len() {
         let tname = named_type_names.get(ti).unwrap()
         let td = tc_decl_node_for_type(tname)
-        if td != -1 && tc_decl_derives(td, "Debug") != 0 {
+        if td != -1 && tc_decl_derives(td, tr) != 0 {
             let ttid = named_type_ids.get(ti) ?? -1
-            // A field annotation means what it means in the declaring module.
             let saved_module = tc_enter_body_module(td)
             let flds_sl = node_fields(td)
             let mut i = 0
@@ -13695,11 +13697,11 @@ fn tc_check_derive_debug() ! TypeCheck.Resolve, Diag.Report {
                     let vflds_sl = node_fields(f)
                     let mut vi = 0
                     while vflds_sl != -1 && vi < sublist_length(vflds_sl) {
-                        tc_check_one_debug_field(sublist_get(vflds_sl, vi), tc_derive_variant_field_tid(f, vi), tname)
+                        tc_check_derive_field(tr, sublist_get(vflds_sl, vi), f, tc_derive_variant_field_tid(f, vi), tname)
                         vi = vi + 1
                     }
                 } else {
-                    tc_check_one_debug_field(f, tc_derive_struct_field_tid(ttid, f), tname)
+                    tc_check_derive_field(tr, f, -1, tc_derive_struct_field_tid(ttid, f), tname)
                 }
                 i = i + 1
             }
@@ -13707,6 +13709,14 @@ fn tc_check_derive_debug() ! TypeCheck.Resolve, Diag.Report {
         }
         ti = ti + 1
     }
+}
+
+// Debug and Serialize are judged by what the derive writes for a field, which is narrower
+// than the trait. Each other trait is judged by the trait itself.
+fn tc_check_derive_field(tr: Str, f: Int, variant: Int, ftid: Int, tname: Str) ! TypeCheck.Resolve, Diag.Report {
+    if tr == "Debug" { return tc_check_one_debug_field(f, ftid, tname) }
+    if tr == "Serialize" { return tc_check_one_serialize_field(f, variant, ftid, tname) }
+    tc_check_one_derive_trait_field(f, variant, ftid, tname, tr)
 }
 
 // ---------------------------------------------------------------------------
@@ -13725,7 +13735,7 @@ fn tc_derive_field_label(variant: Int, f: Int) -> Str {
 
 fn tc_check_one_derive_trait_field(f: Int, variant: Int, ftid: Int, tname: Str, tr: Str) ! Diag.Report {
     if ftid < 0 { return }
-    let path = if tr == "Eq" { tc_eq_need(ftid, []) } else if tr == "Ord" { tc_ord_need(ftid, []) } else { tc_derive_only_need(ftid, tr) }
+    let path = tc_trait_need(ftid, tr, [])
     if path.len() == 0 { return }
     let mut notes: List[Str] = []
     let mut i = 0
@@ -13770,38 +13780,6 @@ fn tc_derive_variant_field_tid(v: Int, fi: Int) -> Int {
     -1
 }
 
-fn tc_check_one_derive_trait(tr: Str) ! Diag.Report {
-    let mut ti = 0
-    while ti < named_type_names.len() {
-        let tname = named_type_names.get(ti).unwrap()
-        let td = tc_type_decl_nodes.get(tname) ?? -1
-        if td != -1 && tc_decl_derives(td, tr) != 0 {
-            let ttid = named_type_ids.get(ti) ?? -1
-            let td_module = node_module(td)
-            let saved_module = nr_current_module
-            nr_current_module = td_module
-            let flds_sl = node_fields(td)
-            let mut i = 0
-            while flds_sl != -1 && i < sublist_length(flds_sl) {
-                let f = sublist_get(flds_sl, i)
-                if node_kind(f) == NodeKind.TypeVariant {
-                    let vflds_sl = node_fields(f)
-                    let mut vi = 0
-                    while vflds_sl != -1 && vi < sublist_length(vflds_sl) {
-                        tc_check_one_derive_trait_field(sublist_get(vflds_sl, vi), f, tc_derive_variant_field_tid(f, vi), tname, tr)
-                        vi = vi + 1
-                    }
-                } else {
-                    tc_check_one_derive_trait_field(f, -1, tc_derive_struct_field_tid(ttid, f), tname, tr)
-                }
-                i = i + 1
-            }
-            nr_current_module = saved_module
-        }
-        ti = ti + 1
-    }
-}
-
 // A handle the compiler cannot see inside exposes no field a derived method could read,
 // so the derive is refused where the author wrote it. The stage that would have to write
 // the body reports the same shape as an internal error, which is the wrong reader: there
@@ -13826,11 +13804,11 @@ fn tc_check_derive_opaque_handle() ! Diag.Report {
     }
 }
 
-fn tc_check_derive_hash_eq_ord() ! Diag.Report {
+fn tc_check_derive_hash_eq_ord() ! TypeCheck.Resolve, Diag.Report {
     tc_check_derive_opaque_handle()
-    tc_check_one_derive_trait("Hash")
-    tc_check_one_derive_trait("Eq")
-    tc_check_one_derive_trait("Ord")
+    tc_check_derive_fields("Hash")
+    tc_check_derive_fields("Eq")
+    tc_check_derive_fields("Ord")
 }
 
 // ---------------------------------------------------------------------------
@@ -13880,38 +13858,6 @@ fn tc_check_one_serialize_field(f: Int, variant: Int, ftid: Int, tname: Str) ! D
     let ok = if variant != -1 { tc_serialize_variant_tid_ok(ftid) } else { tc_serialize_field_tid_ok(ftid) }
     if ok == 0 {
         diag_error_at("NonDerivableTrait", NON_DERIVABLE_TRAIT, "@derive(Serialize) on `{tname}`: field `{tc_derive_field_label(variant, f)}` has type `{type_ann_text(node_value(f))}` which does not implement Serialize", f, "remove the field from the derive, give it a type that implements Serialize, or implement Serialize by hand")
-    }
-}
-
-fn tc_check_derive_serialize() ! TypeCheck.Resolve, Diag.Report {
-    let mut ti = 0
-    while ti < named_type_names.len() {
-        let tname = named_type_names.get(ti).unwrap()
-        let td = tc_decl_node_for_type(tname)
-        if td != -1 && tc_decl_derives(td, "Serialize") != 0 {
-            let ttid = named_type_ids.get(ti) ?? -1
-            let td_module = node_module(td)
-            let saved_module = nr_current_module
-            nr_current_module = td_module
-            let flds_sl = node_fields(td)
-            let mut i = 0
-            while flds_sl != -1 && i < sublist_length(flds_sl) {
-                let f = sublist_get(flds_sl, i)
-                if node_kind(f) == NodeKind.TypeVariant {
-                    let vflds_sl = node_fields(f)
-                    let mut vi = 0
-                    while vflds_sl != -1 && vi < sublist_length(vflds_sl) {
-                        tc_check_one_serialize_field(sublist_get(vflds_sl, vi), f, tc_derive_variant_field_tid(f, vi), tname)
-                        vi = vi + 1
-                    }
-                } else {
-                    tc_check_one_serialize_field(f, -1, tc_derive_struct_field_tid(ttid, f), tname)
-                }
-                i = i + 1
-            }
-            nr_current_module = saved_module
-        }
-        ti = ti + 1
     }
 }
 
@@ -17312,11 +17258,11 @@ pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report, IO.Eprint {
     tc_check_imported_struct_collisions()
 
     // @derive(Debug) requires every user-type field to also derive Debug.
-    tc_check_derive_debug()
+    tc_check_derive_fields("Debug")
 
     // @derive(Serialize) requires every field's type to be serializable by the
     // generated to_json (spec §3.6.2/§3.6.6 NonDerivableTrait, E1401).
-    tc_check_derive_serialize()
+    tc_check_derive_fields("Serialize")
 
     // Register all function signatures
     let fns_sl = node_params(program)
