@@ -3096,9 +3096,12 @@ type CallFacts {
     static_head_binders: Map[Int, List[Int]]
     // The owner each static call's head names. Its spelling may not say it, as `Self` does not.
     static_owners: Map[Int, Str]
+    // The trait each trait-qualified call's head names. A type of the same spelling in a
+    // module this one does not import must not take the call at a later stage.
+    trait_heads: Map[Int, Str]
 }
 fn new_call_facts() -> CallFacts {
-    CallFacts { open_calls: [], open_group: Map(), open_tids: [], reported: Map(), self_views: Map(), view_sigs: Map(), hash_aliases_above: [], static_head_insts: Map(), static_head_binders: Map(), static_owners: Map() }
+    CallFacts { open_calls: [], open_group: Map(), open_tids: [], reported: Map(), self_views: Map(), view_sigs: Map(), hash_aliases_above: [], static_head_insts: Map(), static_head_binders: Map(), static_owners: Map(), trait_heads: Map() }
 }
 let mut tc_calls: CallFacts = new_call_facts()
 
@@ -23863,16 +23866,36 @@ pub fn tc_impl_is_of_call_trait(im: Int, call_trait: Option[Str]) -> Bool {
     }
 }
 
-// The trait a `Trait.method(value, ..)` call names. The call's record answers when the trait
-// declares the method; a method the compiler synthesizes (Display's `display`) has no
-// declaration, so its qualifier is read in the module whose body holds the call.
+// The trait a `Trait.method(value, ..)` call names. Typecheck read the head in the calling
+// file's scope and recorded the trait. A sealed builtin trait's head is not recorded, so the
+// call's record answers when the trait declares the method, and else the qualifier is read in
+// the module whose body holds the call.
 pub fn tc_qualified_call_trait(call_node: Int, written: Str) -> Str {
-    tc_call_trait(call_node) ?? tc_trait_ref_key(written, nr_current_module)
+    match tc_calls.trait_heads.get(call_node) {
+        Some(key) => key
+        None => tc_call_trait(call_node) ?? tc_trait_ref_key(written, nr_current_module)
+    }
 }
 
 // Whether a qualifier names a trait, read as the qualified-call arm reads it.
 pub fn tc_names_a_trait(name: Str) -> Bool {
     is_trait_name(name) != 0
+}
+
+// Whether a static head written in the current module names a trait. A trait and a type can
+// share a spelling in two modules, and the one this module declares or imports is the one it
+// means. A spelling no declaration answers here keeps the trait reading.
+fn tc_head_names_trait(name: Str) -> Bool {
+    if is_trait_name(name) == 0 { return false }
+    if nr_current_module == "" { return true }
+    let d = nr_resolve_bare_decl(name, nr_current_module)
+    d < 0 || node_kind(d) != NodeKind.TypeDef
+}
+
+// The trait the head of the trait-qualified call `node` names, or None when typecheck read the
+// head as something else.
+pub fn tc_call_trait_head(node: Int) -> Option[Str] {
+    tc_calls.trait_heads.get(node)
 }
 
 // Does the trait's own DECLARATION list a method of this name? register_trait
@@ -31722,10 +31745,11 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
             // (they are the sole codegen-dispatched surface) and their qualified form already
             // emits correct C through the intrinsics; their own missing declared-type compare
             // needs a signature table rather than another resolution arm.
-            if obj_is_value == 0 && is_trait_name(obj_name) != 0 && is_sealed_builtin_trait(obj_name) == 0 {
+            if obj_is_value == 0 && tc_head_names_trait(obj_name) && is_sealed_builtin_trait(obj_name) == 0 {
                 // The trait the qualifier names in this file: a shared spelling reaches the
                 // file's own trait or the one it selects, as an impl header or a bound does.
                 let qt_trait = tc_trait_ref_key(obj_name, nr_current_module)
+                tc_calls.trait_heads.insert(node, qt_trait)
                 // Mono and codegen pick the impl by this trait, and only the calling file's
                 // scope says which trait a shared spelling names.
                 nr_note_call_decl(node, tc_trait_method_decl(qt_trait, method))

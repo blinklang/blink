@@ -1,0 +1,58 @@
+// `C.go(x)` in a module that imports trait `C` calls that trait's method. A type `C` that another
+// module declares is not in scope there, so it must not take the call, and the head of `C.go(x)`
+// in the module that declares type `C` stays that type.
+
+import std.process.{ProcessResult, ChildEnd}
+
+fn sh(cmd: Str) -> ProcessResult ! Process.Spawn {
+    process.run("sh", ["-c", cmd]).unwrap()
+}
+
+fn fixture(w_body: Str) -> Str ! Process.Spawn, FS.Write {
+    let dir = sh("mktemp -d /tmp/blink_qt_head.XXXXXX").out.trim()
+    let _ = sh("mkdir -p {dir}/src")
+    fs.write("{dir}/blink.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\n").unwrap()
+    // A lock no older than blink.toml keeps dependency resolution out of the command.
+    fs.write("{dir}/blink.lock", "[metadata]\nlockfile-version = 1\n").unwrap()
+    fs.write("{dir}/src/m.bl", "pub trait C \{ fn go(self) -> Int }\n").unwrap()
+    fs.write("{dir}/src/a.bl", #"
+import m.{C}
+type b { v: Int }
+impl C for b { fn go(_self) -> Int { 1 } }
+pub fn run() -> Int { C.go(b { v: 0 }) }
+"#).unwrap()
+    fs.write("{dir}/src/w.bl", w_body).unwrap()
+    fs.write("{dir}/src/main.bl", #"
+import a
+import w
+fn main() { io.println("{a.run()} {w.mk()}") }
+"#).unwrap()
+    dir
+}
+
+fn runs_and_prints(w_body: Str, want: Str) ! Process.Spawn, FS.Write {
+    let dir = fixture(w_body)
+    // BLINK_BIN makes the build workers the compiler under test, not the blink on PATH.
+    let r = sh("B=$(pwd)/build/blink; cd {dir} && BLINK_BIN=$B $B run src/main.bl 2>&1")
+    let _ = sh("rm -rf {dir}")
+    assert(r.end == ChildEnd.Exited(0), r.out)
+    assert_eq(r.out.trim(), want)
+}
+
+test "a trait-qualified call reaches the imported trait when another module declares a type of that name" {
+    runs_and_prints(#"
+trait Z { fn go(self) -> Int }
+pub type C { v: Int }
+impl Z for C { fn go(_self) -> Int { 2 } }
+pub fn mk() -> Int { C { v: 0 }.go() }
+"#, "1 2")
+}
+
+test "a static call through the type of that name stays in the module that declares it" {
+    runs_and_prints(#"
+trait Z { fn go(self) -> Int }
+pub type C { v: Int }
+impl Z for C { fn go(_self) -> Int { 2 } }
+pub fn mk() -> Int { C.go(C { v: 0 }) }
+"#, "1 2")
+}
