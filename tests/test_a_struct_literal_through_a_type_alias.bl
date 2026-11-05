@@ -1,0 +1,237 @@
+// An alias and its target are one type (sections/03_types.md), so a brace literal headed by an
+// alias builds the target. The literal has the target's type at the alias's arguments.
+
+import compile_test_helpers.{compile_and_capture, run_xmod}
+
+@derive(Debug)
+type Plain {
+    x: Int
+}
+type A = Plain
+type Chain = Link
+type Link = Plain
+
+type Box[T] {
+    value: T
+}
+type BoxInt = Box[Int]
+type BoxOf[X] = Box[X]
+type BoxInts = Box[List[Int]]
+
+type Pair[L, R] {
+    a: L
+    b: R
+}
+type Dup[X] = Pair[X, X]
+type WithStr[X] = Pair[X, Str]
+type Swapped[P, Q] = Pair[Q, P]
+
+type Mark[Unused] {
+    x: Int
+}
+type MarkInt = Mark[Int]
+
+type Holder {
+    inner: A
+}
+
+fn x_of(p: Plain) -> Int {
+    p.x
+}
+
+fn show[T: Debug](t: T) -> Str {
+    t.debug()
+}
+
+fn wrap[T](v: T) -> Box[T] {
+    BoxOf { value: v }
+}
+
+fn rejected(src: Str, tag: Str, code: Str) ! Process.Spawn, FS.Write, FS.Read, FS.Delete, Env.Read {
+    let out = compile_and_capture(src, tag)
+    assert(out.contains("\"code\":\"{code}\""), "expected {code}, got: {out}")
+}
+
+test "a literal through an alias of a plain struct has the struct's type" {
+    let a = A { x: 1 }
+    assert_eq(x_of(a), 1)
+    let c = Chain { x: 2 }
+    assert_eq(x_of(c), 2)
+    let p: A = Plain { x: 3 }
+    assert_eq(p.x, 3)
+}
+
+test "a literal through an alias meets the target's own derive" {
+    assert_eq(show(A { x: 1 }), show(Plain { x: 1 }))
+}
+
+test "a literal through an alias of a struct instance fills the alias's arguments" {
+    let b = BoxInt { value: 3 }
+    assert_eq(b.value + 1, 4)
+    let ints = BoxInts { value: [] }
+    assert_eq(ints.value.len(), 0)
+    let m = MarkInt { x: 5 }
+    assert_eq(m.x, 5)
+}
+
+test "a literal through a generic alias settles the alias's parameters from its fields" {
+    let b = BoxOf { value: "s" }
+    assert_eq(b.value, "s")
+    let d = Dup { a: 1, b: 2 }
+    assert_eq(d.a + d.b, 3)
+    let w = WithStr { a: 1, b: "t" }
+    assert_eq(w.b, "t")
+    let s = Swapped { a: "u", b: 7 }
+    assert_eq(s.b, 7)
+    let e: BoxOf[List[Int]] = BoxOf { value: [] }
+    assert_eq(e.value.len(), 0)
+}
+
+test "a literal through an alias works in a generic fn, a field and a list" {
+    assert_eq(wrap(4).value, 4)
+    let h = Holder { inner: A { x: 6 } }
+    assert_eq(h.inner.x, 6)
+    let xs = [A { x: 1 }, Plain { x: 2 }]
+    assert_eq(xs.len(), 2)
+}
+
+test "a spread in a literal through an alias takes the target as its source" {
+    let p = Plain { x: 1 }
+    let q = A { ..p }
+    assert_eq(q.x, 1)
+}
+
+test "a Debug bound on a literal through an alias is held to the target" {
+    rejected(#"
+type Plain { x: Int }
+type A = Plain
+fn show[T: Debug](t: T) -> Str { t.debug() }
+fn main() {
+    let _s = show(A { x: 1 })
+}
+"#, "_struct_lit_alias_bound", "E0306")
+}
+
+test "a derive written on an alias does not end in an ICE for a literal through it" {
+    let out = compile_and_capture(#"
+type Plain { x: Int }
+@derive(Debug)
+type A = Plain
+fn show[T: Debug](t: T) -> Str { t.debug() }
+fn main() {
+    let _s = show(A { x: 1 })
+}
+"#, "_struct_lit_alias_derive")
+    assert(!out.contains("\"severity\":\"ice\""), out)
+    assert(!out.contains("CompilerPanic"), out)
+}
+
+test "a field value that misses the alias's argument is an error" {
+    rejected(#"
+type Box[T] { value: T }
+type BoxInt = Box[Int]
+fn main() {
+    let _b = BoxInt { value: "s" }
+}
+"#, "_struct_lit_alias_fixed_arg", "E0300")
+    rejected(#"
+type Pair[L, R] { a: L, b: R }
+type Dup[X] = Pair[X, X]
+fn main() {
+    let _d = Dup { a: 1, b: "s" }
+}
+"#, "_struct_lit_alias_shared_param", "E0300")
+    rejected(#"
+type Plain { x: Int }
+type A = Plain
+fn main() {
+    let _a = A { x: "s" }
+}
+"#, "_struct_lit_alias_plain_field", "E0300")
+}
+
+test "a field the target does not have or a field left out is an error through an alias" {
+    rejected(#"
+type Plain { x: Int }
+type A = Plain
+fn main() {
+    let _a = A { y: 1 }
+}
+"#, "_struct_lit_alias_no_field", "E0525")
+    rejected(#"
+type Plain { x: Int, y: Int }
+type A = Plain
+fn main() {
+    let _a = A { x: 1 }
+}
+"#, "_struct_lit_alias_missing_field", "E0315")
+}
+
+test "an alias of a type with no brace form is no literal head" {
+    rejected(#"
+type I = Int
+fn main() {
+    let _a = I { }
+}
+"#, "_struct_lit_alias_of_int", "E0300")
+    rejected(#"
+type T = (Int, Str)
+fn main() {
+    let _a = T { x: 1 }
+}
+"#, "_struct_lit_alias_of_tuple", "E0300")
+    rejected(#"
+type E { A, B }
+type EA = E
+fn main() {
+    let _a = EA { x: 1 }
+}
+"#, "_struct_lit_alias_of_enum", "E0300")
+    rejected(#"
+@ffi.opaque(header: "stdio.h", name: "FILE")
+type File
+type F = File
+fn main() {
+    let _a = F { }
+}
+"#, "_struct_lit_alias_of_opaque", "E0300")
+    rejected(#"
+type OI = Option[Int]
+fn main() {
+    let _a = OI { }
+}
+"#, "_struct_lit_alias_of_option", "E0300")
+}
+
+test "a literal through an alias another module declares, by each spelling" {
+    let helper = #"
+pub type P {
+    x: Int
+}
+pub type PA = P
+pub type Box[T] {
+    value: T
+}
+pub type BI = Box[Int]
+pub type BO[X] = Box[X]
+"#
+    let entry = #"
+import std.io
+import shapes.kinds
+import shapes.kinds.{PA as Renamed, PA, BI, BO, P, Box}
+
+fn main() {
+    let a = Renamed { x: 1 }
+    let b = PA { x: 2 }
+    let c = BI { value: 3 }
+    let d = BO { value: "d" }
+    let e = kinds.PA { x: 4 }
+    let f: P = a
+    let g: Box[Int] = c
+    io.println("{f.x} {b.x} {g.value} {d.value} {e.x}")
+}
+"#
+    let r = run_xmod(entry, "shapes", "kinds", helper, "struct_lit_through_alias_xmod")
+    assert(r.exit_code == 0, "compile or run failed: {r.out}{r.err_out}")
+    assert_eq(r.out, "1 2 3 d 4\n")
+}

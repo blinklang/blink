@@ -28593,6 +28593,20 @@ fn tc_infer_unclaimed_args(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Dia
     }
 }
 
+// A brace struct literal under its resolved head. A head that is an instance came from an alias,
+// and a value that clashes with it leaves the instance as the alias says it, for
+// tc_check_lit_field_values to report.
+fn tc_struct_lit_at_head(head: Int, node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    let base = tc_struct_base_tid(head)
+    if tc_resolve(head) == base { return tc_struct_lit_instance_tid(head, node) }
+    let saved_hint = tc_construct_hint
+    tc_construct_hint = head
+    let built = tc_struct_lit_instance_tid(base, node)
+    tc_construct_hint = saved_hint
+    let _ = tc_unify(head, built)
+    head
+}
+
 // A brace literal's own type: a struct, or a struct-style variant of an enum.
 fn tc_infer_struct_lit_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     let sname = node_type_name(node)
@@ -28637,7 +28651,7 @@ fn tc_infer_struct_lit_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Rep
                     tc_infer_orphan_field_values(node_fields(node))
                     return tc_error_recovery_tid()
                 }
-                let etid = lookup_named_type(sname)
+                let etid = tc_value_head_tid(sname)
                 if etid != -1 {
                     check_deprecated_type(sname, node)
                     if tc_head_constructible_struct(etid) == 0 {
@@ -28648,17 +28662,17 @@ fn tc_infer_struct_lit_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Rep
                     // answer the same way — the bare spelling reverse-infers its instance and
                     // types its field values, this one returned the head and looked at nothing,
                     // so every field value under a qualified literal carried no type.
-                    return tc_struct_lit_instance_tid(etid, node)
+                    return tc_struct_lit_at_head(etid, node)
                 }
             }
             None => {
                 // 0) A struct the module declares or imports is the literal, whatever the hint
                 //    names (sections/03_types.md §3.4). The hint's enum may come from another
                 //    package, where a variant of the same name is legal (E0518 reach).
-                let in_scope_tid = lookup_named_type(sname)
+                let in_scope_tid = tc_value_head_tid(sname)
                 if in_scope_tid != -1 && tc_head_constructible_struct(in_scope_tid) != 0 && tc_struct_head_in_scope(sname) {
                     check_deprecated_type(sname, node)
-                    return tc_struct_lit_instance_tid(in_scope_tid, node)
+                    return tc_struct_lit_at_head(in_scope_tid, node)
                 }
                 // 1) hint before the program-wide search (monotonicity: a distant enum decl
                 //    must never retroactively rebind a locally-determined site).
@@ -28689,7 +28703,7 @@ fn tc_infer_struct_lit_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Rep
                 //    User-first: a user type shadowing a builtin name (`type Char { .. }`)
                 //    resolves here and stays constructible, matching how the annotation and
                 //    field-access paths resolve the same name.
-                let stid = lookup_named_type(sname)
+                let stid = tc_value_head_tid(sname)
                 if stid != -1 {
                     check_deprecated_type(sname, node)
                     if tc_head_constructible_struct(stid) == 0 {
@@ -28700,7 +28714,7 @@ fn tc_infer_struct_lit_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Rep
                     // field values so the literal carries its specialization, not the
                     // bare generic tid. Falls back to the bare stid when no concrete
                     // bind is discoverable (all-typevar / empty collection fields).
-                    return tc_struct_lit_instance_tid(stid, node)
+                    return tc_struct_lit_at_head(stid, node)
                 }
                 // A builtin type used as a struct-literal head — scalar (`Int { }`) or
                 // structural (`List { }`, `Map { }`, `Option { }`) — is not a product struct
