@@ -1,0 +1,123 @@
+// A renamed import spells no declaration, so `@derive(Debug)` must judge a field written through
+// one by the declaration the import selects. A field type with no Debug is refused at check, and
+// one that derives Debug renders, as a field and as a Map key.
+
+import std.process.{ProcessResult, ChildEnd}
+
+fn sh(cmd: Str) -> ProcessResult ! Process.Spawn {
+    process.run("sh", ["-c", cmd]).unwrap()
+}
+
+fn run_main(src: Str) -> ProcessResult ! Process.Spawn, FS.Write {
+    let dir = sh("mktemp -d /tmp/blink_renamed_debug.XXXXXX").out.trim()
+    let _ = sh("mkdir -p {dir}/src")
+    fs.write("{dir}/blink.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\n").unwrap()
+    // A lock no older than blink.toml keeps dependency resolution out of the command.
+    fs.write("{dir}/blink.lock", "[metadata]\nlockfile-version = 1\n").unwrap()
+    fs.write("{dir}/src/alpha.bl", #"
+pub type Plain {
+    n: Int
+}
+pub type Box[T] {
+    v: T
+}
+@derive(Debug)
+pub type Shown {
+    n: Int
+}
+@derive(Debug, Eq, Hash)
+pub type Key {
+    n: Int
+}
+"#).unwrap()
+    fs.write("{dir}/src/main.bl", src).unwrap()
+    // BLINK_BIN makes the build workers the compiler under test, not the blink on PATH.
+    let r = sh("B=$(pwd)/build/blink; cd {dir} && BLINK_BIN=$B $B run src/main.bl 2>&1")
+    let _ = sh("rm -rf {dir}")
+    r
+}
+
+fn refused(src: Str) -> Str ! Process.Spawn, FS.Write {
+    let r = run_main(src)
+    assert(r.out.contains("error[DeriveDebugFieldNoDebug]"), "expected DeriveDebugFieldNoDebug, got: {r.out}")
+    assert(!r.out.contains("internal compiler error"), "expected no ICE, got: {r.out}")
+    r.out
+}
+
+test "a field whose renamed type has no Debug is refused" {
+    let plain = refused(#"
+import alpha.{Plain as P}
+
+@derive(Debug)
+type W {
+    p: P
+}
+
+fn main() {
+    io.println(W { p: P { n: 1 } }.debug())
+}
+"#)
+    // The fix goes on the declaration; no type is declared under the alias.
+    assert(plain.contains("add @derive(Debug) to `Plain`"), plain)
+    let _ = refused(#"
+import alpha.{Plain as P}
+
+@derive(Debug)
+type E {
+    One(P)
+    Two
+}
+
+fn main() {
+    io.println(E.Two.debug())
+}
+"#)
+    let _ = refused(#"
+import alpha.{Box as B}
+
+@derive(Debug)
+type W {
+    b: B[Int]
+}
+
+fn main() {
+    io.println(W { b: B { v: 1 } }.debug())
+}
+"#)
+}
+
+test "a field whose renamed type derives Debug renders" {
+    let r = run_main(#"
+import alpha.{Shown as S}
+
+@derive(Debug)
+type W {
+    s: S
+}
+
+fn main() {
+    io.println(W { s: S { n: 2 } }.debug())
+}
+"#)
+    assert(r.end == ChildEnd.Exited(0), r.out)
+    assert_eq(r.out.trim(), "W \{ s: Shown \{ n: 2 } }")
+}
+
+test "a Map key whose renamed type derives Debug renders" {
+    let r = run_main(#"
+import alpha.{Key as K}
+
+@derive(Debug)
+type W {
+    m: Map[K, Int]
+}
+
+fn main() {
+    let mut m: Map[K, Int] = Map.new()
+    m.insert(K { n: 3 }, 4)
+    io.println(W { m: m }.debug())
+}
+"#)
+    assert(r.end == ChildEnd.Exited(0), r.out)
+    assert(r.out.contains("Key \{ n: 3 }"), r.out)
+}
