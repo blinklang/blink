@@ -1,0 +1,139 @@
+// In an impl, `Self` is an alias of the impl's type (sections/03_types.md, The `Self` Type). So a
+// static call on a `Self` head is the same call on the impl's type: it answers what that type
+// answers and is refused where that type is refused.
+
+import compile_test_helpers.{compile_and_capture, compile_and_run}
+
+fn runs_and_prints(src: Str, fixture: Str, want: Str) ! FS.Delete, FS.Write, Process.Spawn, FS.Read, Env.Read {
+    let r = compile_and_run(src, fixture)
+    assert(r.exit_code == 0, "{r.out}{r.err_out}")
+    assert_eq(r.out.trim(), want)
+}
+
+fn refused_with(code: Str, src: Str, fixture: Str) ! FS.Delete, FS.Write, Process.Spawn, FS.Read, Env.Read {
+    let r = compile_and_capture(src, fixture)
+    assert(r.contains(code), r)
+    assert(!r.contains("\"severity\":\"ice\""), r)
+}
+
+test "a trait static on a Self head calls the impl type's static" {
+    runs_and_prints(#"
+trait Mk { fn mk() -> Self }
+type W { n: Int }
+impl Mk for W { fn mk() -> W { W { n: 2 } } }
+trait Dup { fn dup(self) -> Self }
+impl Dup for W { fn dup(self) -> W {
+    let _n = self.n
+    Self.mk() } }
+fn main() { io.println("{W { n: 1 }.dup().n}") }
+"#, "_self_head_trait_static", "2")
+}
+
+test "a type-scoped fn on a Self head calls the impl type's fn" {
+    runs_and_prints(#"
+trait Mk { fn mk() -> Self }
+type W { n: Int }
+fn W_make() -> W { W { n: 5 } }
+impl Mk for W { fn mk() -> W { Self.make() } }
+fn main() { io.println("{W.mk().n}") }
+"#, "_self_head_type_scoped_fn", "5")
+}
+
+test "a conversion on a Self head calls the impl type's conversion" {
+    runs_and_prints(#"
+type W { xs: List[Int] }
+impl From[Int] for W { fn from(n: Int) -> W { W { xs: [n] } } }
+trait Two { fn two(self) -> Self }
+impl Two for W { fn two(self) -> W { Self.from(self.xs.len() + 1) } }
+fn main() { io.println("{W.from(7).two().xs.get(0).unwrap()}") }
+"#, "_self_head_conversion", "2")
+}
+
+test "a trait static on a Self head in a generic impl builds the impl's instance" {
+    runs_and_prints(#"
+trait Mk { fn mk() -> Self }
+type B[X] { xs: List[X] }
+impl[X] Mk for B[X] { fn mk() -> B[X] { B { xs: [] } } }
+trait Dup { fn dup(self) -> Self }
+impl[X] Dup for B[X] { fn dup(self) -> B[X] {
+    let _n = self.xs.len()
+    Self.mk() } }
+fn main() {
+    let b: B[Str] = B { xs: ["a"] }
+    io.println("{b.dup().xs.len()}")
+}
+"#, "_self_head_generic_impl", "0")
+}
+
+test "a static the impl type does not declare is refused on a Self head" {
+    refused_with("UnresolvedMethod", #"
+trait Mk { fn mk() -> Self }
+type W { xs: List[Int] }
+impl Mk for W { fn mk() -> W { W { xs: Self.with_capacity(2) } } }
+fn main() { io.println("{W.mk().xs.len()}") }
+"#, "_self_head_undeclared_static")
+}
+
+test "a conversion with a wrong number of arguments is refused on a Self head" {
+    refused_with("expects 1 argument(s), got 2", #"
+type W { n: Int }
+impl From[Int] for W { fn from(n: Int) -> W { W { n: n } } }
+trait Mk { fn mk() -> Self }
+impl Mk for W { fn mk() -> W { Self.from(1, 2) } }
+fn main() { io.println("{W.mk().n}") }
+"#, "_self_head_conversion_arity")
+}
+
+test "a conversion on a Self head in a generic impl converts at each instance" {
+    runs_and_prints(#"
+type B[X] { xs: List[X] }
+impl[X] From[X] for B[X] { fn from(x: X) -> B[X] { B { xs: [x] } } }
+trait Mk { fn mk(x: Int) -> Self }
+impl[X] Mk for B[X] { fn mk(x: Int) -> B[X] { Self.from(x) } }
+fn main() {
+    let b: B[Int] = B.mk(3)
+    io.println("{b.xs.len()}")
+}
+"#, "_self_head_generic_conversion", "1")
+}
+
+test "a type-scoped fn on a Self head that builds another instance is refused" {
+    refused_with("TypeError", #"
+type B[X] { xs: List[X] }
+fn B_one[Y](y: Y) -> B[Y] { B { xs: [y] } }
+trait Tw { fn tw(self) -> Int }
+impl[X] Tw for B[X] { fn tw(self) -> Int {
+    let o = Self.one(5)
+    o.xs.len() + self.xs.len() } }
+fn main() {
+    let b: B[Str] = B { xs: ["a", "b"] }
+    io.println("{b.tw()}")
+}
+"#, "_self_head_other_instance")
+}
+
+test "a generic type-scoped fn on a Self head builds the impl's instance" {
+    runs_and_prints(#"
+type B[X] { xs: List[X] }
+fn B_empty[Y]() -> B[Y] { B { xs: [] } }
+trait Ct { fn ct(self) -> Int }
+impl[X] Ct for B[X] { fn ct(self) -> Int {
+    let o = Self.empty()
+    o.xs.len() + self.xs.len() } }
+fn main() {
+    let b: B[Str] = B { xs: ["a", "b"] }
+    io.println("{b.ct()}")
+}
+"#, "_self_head_generic_free_fn", "2")
+}
+
+test "a builtin static on a Self head calls the builtin's static" {
+    runs_and_prints(#"
+trait Mk { fn mk() -> Self }
+impl Mk for StringBuilder { fn mk() -> StringBuilder {
+    let mut sb = Self.new()
+    sb.write("hi")
+    sb } }
+fn main() { io.println("{StringBuilder.mk().len()}") }
+"#, "_self_head_builtin_static", "2")
+}

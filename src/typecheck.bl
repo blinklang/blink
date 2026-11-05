@@ -3091,12 +3091,14 @@ type CallFacts {
     view_sigs: Map[Int, Int]
     hash_aliases_above: List[Int]
     // The instance a static call through a type head reads its head as, and the impl binder
-    // tids that call settled. Mono reads the binders, so they outlive the walk.
+    // tids that call settled. Mono reads the binders, so they stay after the walk.
     static_head_insts: Map[Int, Int]
     static_head_binders: Map[Int, List[Int]]
+    // The owner each static call's head names. Its spelling may not say it, as `Self` does not.
+    static_owners: Map[Int, Str]
 }
 fn new_call_facts() -> CallFacts {
-    CallFacts { open_calls: [], open_group: Map(), open_tids: [], reported: Map(), self_views: Map(), view_sigs: Map(), hash_aliases_above: [], static_head_insts: Map(), static_head_binders: Map() }
+    CallFacts { open_calls: [], open_group: Map(), open_tids: [], reported: Map(), self_views: Map(), view_sigs: Map(), hash_aliases_above: [], static_head_insts: Map(), static_head_binders: Map(), static_owners: Map() }
 }
 let mut tc_calls: CallFacts = new_call_facts()
 
@@ -3847,6 +3849,14 @@ fn tc_refuse_deferred_conversion(call_node: Int) ! Diag.Report {
 // every impl, so a side that holds one and matches none could never convert.
 fn tc_conversion_side_judgeable(t: Int) -> Bool {
     tc_tid_has_unknown(t) == 0 && tc_tid_has_bare_typevar(t) == 0
+}
+
+// Whether no impl, and not the value itself, can convert `source` to `target` whatever their
+// open metavariables become.
+fn tc_conversion_never_fits(trait_name: Str, source: Int, target: Int) -> Bool {
+    if !tc_conversion_side_judgeable(source) || !tc_conversion_side_judgeable(target) { return false }
+    if trait_name == "From" && tc_tid_same_type_at(source, target, true, Map()) { return false }
+    tc_conversion_impls_matching_at(trait_name, source, target, true).is_empty()
 }
 
 // Report the recorded calls a binder of which is still unbound once inference is done
@@ -15724,46 +15734,66 @@ fn tc_static_qualifier(written: Str) -> Str {
 // alias means its target, so the target owns the call, as it owns an impl written on the alias.
 // `alias` keeps the alias's declaration, which says the arguments of the type the call builds.
 // `decl` is the target's declaration, or -1 when the plain lookup answers. `builtin` says the
-// head means a compiler-known type even where the module declares a namesake.
+// head means a compiler-known type even where the module declares a namesake. `inst` is the
+// instance a head names in full, or -1: `Self` in an impl names the impl's type at its binders.
 type StaticHead {
     owner: Str
     alias: Int
     decl: Int
     builtin: Bool
+    inst: Int
 }
 
 fn tc_static_head(written: Str) -> StaticHead {
     let q = tc_static_qualifier(written)
-    if tc_name_is_tparam_in_scope(q) != 0 { return StaticHead { owner: q, alias: -1, decl: -1, builtin: false } }
+    // In an impl, `Self` is an alias of the impl's type (§3c.2), so the call is the one on
+    // that type. A trait's default body leaves `Self` a type parameter.
+    if q == "Self" && tc_current_self_tid >= 0 {
+        let st = resolve_alias_tid(tc_current_self_tid)
+        let owner = tc_type_name(st)
+        if type_kind(st) != TyKind.Typevar && owner != "" && tc_type_has_receiver(st) {
+            let decl = tc_tid_decl_node(st)
+            return StaticHead { owner: owner, alias: -1, decl: decl, builtin: decl < 0, inst: st }
+        }
+    }
+    if tc_name_is_tparam_in_scope(q) != 0 { return StaticHead { owner: q, alias: -1, decl: -1, builtin: false, inst: -1 } }
     // A declaration that takes a compiler-known name in another module, and that this module
     // does not import, leaves the name to the builtin here, as an annotation reads it. A name
     // imported from blink.core under another name is the builtin even where the module declares
     // the plain name, so the written spelling is what this asks about.
     let core = tc_compiler_known_type_meant(written, -1)
-    if core != "" && tc_is_shadowable_type_name(core) { return StaticHead { owner: core, alias: -1, decl: -1, builtin: true } }
+    if core != "" && tc_is_shadowable_type_name(core) { return StaticHead { owner: core, alias: -1, decl: -1, builtin: true, inst: -1 } }
     let alias = tc_alias_decl_of_written(q)
     if alias == -1 {
         // A renamed import, or a namesake whose pool name carries its module, is the declared
         // type under another spelling, and that type's own name owns the call.
         let named = tc_head_decl_tid(q)
         let decl = tc_tid_decl_node(named)
-        if decl < 0 || tc_type_name(named) == q { return StaticHead { owner: q, alias: -1, decl: -1, builtin: false } }
-        return StaticHead { owner: tc_type_name(named), alias: -1, decl: decl, builtin: false }
+        if decl < 0 || tc_type_name(named) == q { return StaticHead { owner: q, alias: -1, decl: -1, builtin: false, inst: -1 } }
+        return StaticHead { owner: tc_type_name(named), alias: -1, decl: decl, builtin: false, inst: -1 }
     }
     let target = tc_head_decl_tid(q)
     let owner = tc_type_name(target)
     // An impl on an alias of a tuple or a function type stays under the alias's own name.
-    if owner == "" || !tc_type_has_receiver(target) { return StaticHead { owner: q, alias: alias, decl: -1, builtin: false } }
-    StaticHead { owner: owner, alias: alias, decl: tc_tid_decl_node(target), builtin: false }
+    if owner == "" || !tc_type_has_receiver(target) { return StaticHead { owner: q, alias: alias, decl: -1, builtin: false, inst: -1 } }
+    StaticHead { owner: owner, alias: alias, decl: tc_tid_decl_node(target), builtin: false, inst: -1 }
 }
 
 pub fn tc_static_owner(written: Str) -> Str {
     tc_static_head(written).owner
 }
 
+// The owner typecheck read for the static call `node`. A head such as `Self` means a type
+// only in the impl it is written in, and a head's spelling can mean another type in another
+// module, so codegen reads the answer and not the spelling.
+pub fn tc_static_call_owner(node: Int, written: Str) -> Str {
+    tc_calls.static_owners.get(node) ?? tc_static_owner(written)
+}
+
 // The type the head builds: the alias's target, at open arguments that the call settles, or -1
 // with no alias, where the owner's own name says the type.
 fn tc_static_head_type(head: StaticHead) -> Int {
+    if head.inst != -1 { return head.inst }
     if head.alias == -1 { -1 } else { tc_alias_target_open(head.alias) }
 }
 
@@ -30266,6 +30296,7 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
             // An alias or a renamed import of StringBuilder names the same constructors.
             let sb_written = node_name(obj_node)
             if nr_is_defined(sb_written) == 0 && tc_static_owner(sb_written) == "StringBuilder" {
+                tc_calls.static_owners.insert(node, "StringBuilder")
                 if method == "new" { return type_stringbuilder() }
                 // Kept beside `new` rather than folded into get_builtin_fn_ret, which is
                 // keyed on the type name alone and so cannot tell two constructors apart.
@@ -31530,8 +31561,9 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
 
         if obj_node != -1 && node_kind(obj_node) == NodeKind.Ident {
             let obj_written = node_name(obj_node)
-            let static_head = if nr_receiver_has_binding(obj_written) != 0 { StaticHead { owner: obj_written, alias: -1, decl: -1, builtin: false } } else { tc_static_head(obj_written) }
+            let static_head = if nr_receiver_has_binding(obj_written) != 0 { StaticHead { owner: obj_written, alias: -1, decl: -1, builtin: false, inst: -1 } } else { tc_static_head(obj_written) }
             let obj_name = static_head.owner
+            if nr_receiver_has_binding(obj_written) == 0 { tc_calls.static_owners.insert(node, obj_name) }
             if obj_name == "Char" {
                 if method == "from_code_point" {
                     return make_result_type(TYPE_CHAR, tc_conversion_error_type())
@@ -31954,9 +31986,11 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                     // What the function builds as the alias's target holds to the alias's
                     // arguments, as a constructor's result does.
                     if head_type != -1 && static_ret >= 0 && tc_tid_decl_node(static_ret) >= 0 && tc_tid_decl_node(static_ret) == tc_tid_decl_node(head_type) {
-                        if tc_unify(static_ret, head_type) == 0 {
+                        // Asked before the unify, which takes the impl's own binders as open.
+                        if types_compatible(static_ret, head_type) == 0 || tc_unify(static_ret, head_type) == 0 {
+                            let builds_help = if static_head.inst != -1 { "change the arguments so that the call builds `{type_to_str(head_type)}`, the type `Self` names in this impl" } else { "change the arguments to match the alias" }
                             tc_error_at_code("`{obj_written}.{method}` builds `{type_to_str(head_type)}`, but its arguments say `{type_to_str(static_ret)}`", node,
-                                "TypeError", TYPE_ERROR, "change the arguments to match the alias")
+                                "TypeError", TYPE_ERROR, builds_help)
                             return tc_error_recovery_tid()
                         }
                     }
@@ -31973,7 +32007,7 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                 let ff_count = if ff_args == -1 { 0 } else { sublist_length(ff_args) }
                 let conv_trait = tc_conversion_trait_of(method)
                 if conv_trait != "" && ff_count == 1 {
-                    let named = if head_type != -1 { head_type } else { resolve_alias_tid(resolve_type_name(obj_name)) }
+                    let named = if head_type != -1 { head_type } else { tc_fresh_builtin_args(resolve_alias_tid(resolve_type_name(obj_name))) }
                     return tc_static_conversion(node, obj_name, named, method, tc_infer_unhinted(sublist_get(ff_args, 0)))
                 }
                 // Every rung that a type's namespace has is above, so a head that names a type
@@ -31981,7 +32015,9 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                 // builtin and an alias head too, and for a name that only some other type
                 // declares. A type parameter is not the type it shadows.
                 let head_tid = if tc_name_is_tparam_in_scope(obj_name) != 0 || nr_method_name_unresolvable(method) != 0 { -1 } else { tc_enum_base_tid(resolve_alias_tid(resolve_type_name(obj_name))) }
-                if head_tid >= 0 {
+                // A variant is no static: `Self.Rgb(7)` names one through a head that the
+                // variant arm above does not read as the enum.
+                if head_tid >= 0 && get_variant_by_name(head_tid, method) == -1 {
                     if args_sl != -1 {
                         for a in 0..sublist_length(args_sl) { infer_type(sublist_get(args_sl, a)) }
                     }
@@ -32619,8 +32655,13 @@ fn tc_report_conversion_tie(node: Int, call: Str, at: Str, source: Int, found: L
 }
 
 fn tc_report_no_conversion(node: Int, at: Str, trait_name: Str, source: Int, target: Int) ! Diag.Report {
+    tc_report_no_conversion_to(node, at, trait_name, source, tc_type_str(target))
+}
+
+// `t` is the target as the program would write it, which a bare generic head says by its
+// name alone.
+fn tc_report_no_conversion_to(node: Int, at: Str, trait_name: Str, source: Int, t: Str) ! Diag.Report {
     let s = tc_type_str(source)
-    let t = tc_type_str(target)
     diag_error_at("NoConversionImpl", NO_CONVERSION_IMPL,
         "{s} does not convert to {t}{at}: there is no `impl {trait_name}[{s}] for {t}`", node,
         "declare the impl, or name the conversion: `.to_float()` widens, `.truncate()` drops a fraction, `.to_int_checked()` checks the range, `{t}.try_from(x)` can fail, `.to_string()` renders text")
@@ -32651,12 +32692,26 @@ fn tc_static_conversion(node: Int, obj_name: Str, named: Int, method: Str, src_t
     // A deferred choice may fill the receiver's arguments a bare generic qualifier leaves
     // open, so they get metavariables of their own.
     let target = if found == -1 && tc_tid_has_unbound_metavar(src_t) != 0 { tc_fresh_instance_tid(named_target) } else { named_target }
+    // An open slot of the head matches what an impl holds there, so when no impl fits even so,
+    // no later use can make one fit: the call is refused here, before the slot reads as a type
+    // nothing settles. An open source is left to the under-determined report, which names the
+    // type the program must write.
+    if found == -1 && tc_tid_has_unbound_metavar(src_t) == 0 && tc_conversion_never_fits(trait_name, src_t, target) {
+        tc_drop_deferred_conversion(node)
+        tc_report_no_conversion_to(node, "", trait_name, src_t, if tc_tid_has_unbound_metavar(target) != 0 { obj_name } else { tc_type_str(target) })
+        // A walk that ran before the source was typed deferred the call and answered with an
+        // open target, and a binding may hold that answer. This error already stops the build.
+        tc_close_open_slots(tc_lookup_node_tid(node))
+        return tc_error_recovery_tid()
+    }
     if tc_defer_conversion(node, found, src_t, target) { return tc_static_conversion_answer(trait_name, target) }
     let im = tc_judge_conversion(node, "`{obj_name}.{method}`", "", trait_name, src_t, target, found)
     if im == CONVERSION_IS_IDENTITY { return target }
     // A generic body's `T` picks its impl per instance, so the call still answers the type
     // the qualifier names, and each instance reads that answer to find its impl.
     if im == -1 && !tc_conversion_side_settled(src_t) && tc_conversion_side_settled(target) { return tc_static_conversion_answer(trait_name, target) }
+    // So does an impl type's binder in the target, as `Self.from(x)` in `impl[X] .. for B[X]`.
+    if im == -1 && tc_tid_has_bare_typevar(target) != 0 && tc_tid_has_unbound_metavar(target) == 0 && tc_tid_has_unbound_metavar(src_t) == 0 { return tc_static_conversion_answer(trait_name, target) }
     if im < 0 { return -1 }
     let sig = tc_conversion_method_sig(im, method)
     if sig == -1 { return -1 }
@@ -32669,6 +32724,22 @@ fn tc_static_conversion(node: Int, obj_name: Str, named: Int, method: Str, src_t
     binds.insert("Self", self_t)
     binds.insert(tc_binder_key(SELF_BINDER_NODE, "Self"), self_t)
     substitute_typevar_tid(fnsig_pool.get(sig).unwrap().ret, binds)
+}
+
+// Bind each open slot of `tid` to the unknown type, so that the uses of a value whose call was
+// refused add no report of their own.
+fn tc_close_open_slots(tid0: Int) {
+    let tid = tc_resolve(tid0)
+    if tid < 0 || tid >= ty_pool.len() { return }
+    if tc_is_unbound_metavar(tid) != 0 {
+        bind_metavar(tid, TYPE_UNKNOWN)
+        return
+    }
+    let mut i = 0
+    while i < tc_tid_child_count(tid) {
+        tc_close_open_slots(tc_tid_child(tid, i))
+        i = i + 1
+    }
 }
 
 // `tid` with each typevar the declaration being checked does not bind replaced by a fresh
