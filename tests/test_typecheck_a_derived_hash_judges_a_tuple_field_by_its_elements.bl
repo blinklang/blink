@@ -1,0 +1,68 @@
+// A tuple is Hash when every element is (sections/03_types.md *Hash Contract and Seeding*), so a
+// derived Hash refuses a tuple field only when an element is not Hash, and names the tuple as
+// written. A generic tuple field is asked at each instance. Eq on the same field reads `==`.
+
+import std.fs
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_reset}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+import std.io
+
+fn typecheck_probe(path: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    init_embedded_stdlib()
+    fs.write(path, src).unwrap()
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+}
+
+// Each error as "name: message".
+fn errors_of(src: Str) -> List[Str] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    typecheck_probe("build/test_typecheck_derived_hash_tuple_field_probe.bl", src)
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" { out.push("{d.name}: {d.message}") }
+    }
+    for e in out { io.println("  diag: {e}") }
+    out
+}
+
+test "a tuple field of Hash elements is a derived Hash field" {
+    let src = "@derive(Eq, Hash)\ntype TupleHashOk \{\n    p: (Int, (Str, Bool))\n}\n@derive(Eq, Hash)\ntype TupleHashOkChoice \{\n    Dot((Int, Char))\n    Empty\n}\nfn main() \{\n}\n"
+    assert_eq(errors_of(src).len(), 0)
+}
+
+test "a tuple field with a Float element is not a derived Hash field" {
+    let src = "@derive(Eq, Hash)\ntype TupleHashFloat \{\n    p: (Int, Float)\n}\nfn main() \{\n}\n"
+    let errs = errors_of(src)
+    assert_eq(errs.len(), 1)
+    let e = errs.get(0).unwrap()
+    assert(e.contains("NonDerivableTrait"), e)
+    assert(e.contains("field `p` has type `(Int, Float)` which does not implement Hash"), e)
+}
+
+test "a variant payload tuple with a List element is not a derived Hash field" {
+    let src = "@derive(Eq, Hash)\ntype TupleHashListChoice \{\n    Many((Int, List[Int]))\n    Empty\n}\nfn main() \{\n}\n"
+    let errs = errors_of(src)
+    assert_eq(errs.len(), 1)
+    let e = errs.get(0).unwrap()
+    assert(e.contains("NonDerivableTrait"), e)
+    assert(e.contains("has type `(Int, List[Int])` which does not implement Hash"), e)
+}
+
+test "a derived Eq takes a tuple field with a Float element" {
+    let src = "@derive(Eq)\ntype TupleEqFloat \{\n    p: (Int, Float)\n}\nfn main() \{\n}\n"
+    assert_eq(errors_of(src).len(), 0)
+}
+
+test "a generic tuple field is judged at each instance" {
+    let head = "@derive(Eq, Hash)\ntype TupleHashOf[T] \{\n    v: (T, Int)\n}\n"
+    assert_eq(errors_of("{head}fn main() \{\n    let m: Map[TupleHashOf[Str], Int] = Map.new()\n}\n").len(), 0)
+    let errs = errors_of("{head}fn main() \{\n    let m: Map[TupleHashOf[Float], Int] = Map.new()\n}\n")
+    assert_eq(errs.len(), 1)
+    let e = errs.get(0).unwrap()
+    assert(e.contains("MapKeyNotHashable"), e)
+    assert(e.contains("`TupleHashOf[Float]` does not implement Hash"), e)
+}

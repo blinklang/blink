@@ -13749,8 +13749,8 @@ fn tc_field_type_derivable(written: Str, tr: Str) -> Int {
     // A derive written on the alias grants nothing: the alias is that type.
     let aliased = tc_alias_underlying_of(ftype_name)
     if aliased != -1 {
+        if tr == "Hash" { return if tc_tid_hash_fact(aliased) == -1 { 0 } else { 1 } }
         if type_kind(tc_resolve(aliased)) == TyKind.Tuple { return 0 }
-        if tr == "Hash" && tc_tid_hash_fact(aliased) == -1 { return 0 }
         if tr == "Ord" && tc_ord_need(aliased, []).len() > 0 { return 0 }
         return 1
     }
@@ -13760,12 +13760,8 @@ fn tc_field_type_derivable(written: Str, tr: Str) -> Int {
     // A range is never Hash or Ord (§3.6 *Traits of Range[T]*).
     if ftype_name == "Range" { return 0 }
 
-    // Tuple struct fields: a tuple is structurally Hash/Eq/Ord when its
-    // elements are, but codegen (emit_struct_hash/_eq/_cmp) cannot synthesize a
-    // per-tuple adapter for a struct FIELD today — it emits a BLINK_COMPILER_BUG
-    // sentinel and a degenerate constant hash. Reject here so the failure is a
-    // clear E1401 instead of a silent hash collapse. (Tuples as Map KEYS take a
-    // different codegen path and remain supported.)
+    // A tuple field under Hash is judged by its type before this point. Codegen builds no
+    // tuple compare yet, so a tuple field under Ord is refused here rather than at C time.
     if ftype_name == "Tuple" { return 0 }
 
     if tc_is_integer_scalar(ftype_name) != 0 { return 1 }
@@ -13809,11 +13805,24 @@ fn tc_check_one_derive_trait_field(f: Int, ftid: Int, tname: Str, tr: Str) ! Dia
         tc_check_derive_eq_field(f, ftid, tname, generic_help)
         return
     }
+    // A tuple has no name that carries Hash: it is Hash when its elements are, so the field's
+    // type answers. A type parameter among them is asked at each instance.
+    if tr == "Hash" && tc_derive_field_is_tuple(ftid) {
+        if tc_tid_hash_fact(ftid) == -1 {
+            diag_error_at("NonDerivableTrait", NON_DERIVABLE_TRAIT, "@derive(Hash) on `{tname}`: field `{node_name(f)}` has type `{type_ann_text(ann)}` which does not implement Hash", f, generic_help)
+        }
+        return
+    }
     // A generic alias's target holds its arguments, so its name alone says too little.
     let judged = if tc_ann_is_applied_generic_alias(ann) { tc_tid_name(tc_resolve(ftid)) } else { ftype_name }
     if tc_field_type_derivable(judged, tr) == 0 {
         diag_error_at("NonDerivableTrait", NON_DERIVABLE_TRAIT, "@derive({tr}) on `{tname}`: field `{node_name(f)}` has type `{ftype_name}` which does not implement {tr}", f, generic_help)
     }
+}
+
+fn tc_derive_field_is_tuple(ftid: Int) -> Bool {
+    if ftid < 0 { return false }
+    type_kind(tc_resolve(resolve_alias_tid(tc_resolve(ftid)))) == TyKind.Tuple
 }
 
 // A derived Eq compares each field the way `==` would (03_types.md, *Derived Equality*),
