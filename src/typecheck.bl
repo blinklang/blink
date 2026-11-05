@@ -1616,6 +1616,7 @@ fn tc_ann_tparam_fact(ann: Int, tps: Int, tid: Int, tr: Str) -> Int {
 // `b: B[(T, Int)]`, is left to each instance. tc_derive_only_fact needs no such guard: it
 // answers unknown at a type parameter itself, and a cyclic alias, which holds one, has no Hash.
 fn tc_derive_arg_fact(arg: Int, tr: Str) -> Int {
+    if tr == "Deserialize" { return tc_deserialize_read_fact(arg) }
     if tr != "Debug" && tr != "Serialize" { return tc_derive_only_fact(arg, tr) }
     if tc_tid_has_bare_typevar(arg) != 0 { return 0 }
     if tr == "Debug" { return if tc_debug_tid_ok(arg) == 0 { -1 } else { 0 } }
@@ -13716,6 +13717,7 @@ fn tc_check_derive_fields(tr: Str) ! TypeCheck.Resolve, Diag.Report {
 fn tc_check_derive_field(tr: Str, f: Int, variant: Int, ftid: Int, tname: Str) ! TypeCheck.Resolve, Diag.Report {
     if tr == "Debug" { return tc_check_one_debug_field(f, ftid, tname) }
     if tr == "Serialize" { return tc_check_one_serialize_field(f, variant, ftid, tname) }
+    if tr == "Deserialize" { return tc_check_one_deserialize_field(f, variant, ftid, tname) }
     tc_check_one_derive_trait_field(f, variant, ftid, tname, tr)
 }
 
@@ -13859,6 +13861,50 @@ fn tc_check_one_serialize_field(f: Int, variant: Int, ftid: Int, tname: Str) ! D
     if ok == 0 {
         diag_error_at("NonDerivableTrait", NON_DERIVABLE_TRAIT, "@derive(Serialize) on `{tname}`: field `{tc_derive_field_label(variant, f)}` has type `{type_ann_text(node_value(f))}` which does not implement Serialize", f, "remove the field from the derive, give it a type that implements Serialize, or implement Serialize by hand")
     }
+}
+
+// ---------------------------------------------------------------------------
+// E1401 NonDerivableTrait for @derive(Deserialize) — spec §3.6.2 *Type Mapping* and
+// *Option and Result in JSON*.
+
+// Whether a value of type `tid` is Deserialize, tri-state as tc_derive_only_fact: Int,
+// Float, Bool and Str are, Option and List are when the element is, Result is when both
+// sides are, and a struct or enum is when it derives Deserialize at its arguments. Any
+// other kind is not judged here, so the derive stage reports it.
+fn tc_deserialize_read_fact(tid: Int) -> Int {
+    let t = resolve_alias_tid(tc_resolve(tid))
+    let k = type_kind(t)
+    if k == TyKind.Int || k == TyKind.Float || k == TyKind.Bool || k == TyKind.Str { return 1 }
+    if k == TyKind.List || k == TyKind.Option { return tc_deserialize_read_fact(tc_tid_child(t, 0)) }
+    if k == TyKind.Result {
+        let ok_side = tc_deserialize_read_fact(tc_tid_child(t, 0))
+        let err_side = tc_deserialize_read_fact(tc_tid_child(t, 1))
+        if ok_side == -1 || err_side == -1 { return -1 }
+        return if ok_side == 1 && err_side == 1 { 1 } else { 0 }
+    }
+    if k == TyKind.Struct || k == TyKind.Enum { return tc_derive_only_fact(t, "Deserialize") }
+    0
+}
+
+// The part of `tid` that makes it not Deserialize: an element or a side that is not, else
+// `tid` itself.
+fn tc_deserialize_refused_part(tid: Int) -> Int {
+    let t = resolve_alias_tid(tc_resolve(tid))
+    let k = type_kind(t)
+    if k == TyKind.List || k == TyKind.Option || k == TyKind.Result {
+        let mut i = 0
+        while i < (if k == TyKind.Result { 2 } else { 1 }) {
+            let part = tc_tid_child(t, i)
+            if tc_deserialize_read_fact(part) == -1 { return tc_deserialize_refused_part(part) }
+            i = i + 1
+        }
+    }
+    t
+}
+
+fn tc_check_one_deserialize_field(f: Int, variant: Int, ftid: Int, tname: Str) ! Diag.Report {
+    if ftid < 0 || tc_deserialize_read_fact(ftid) != -1 { return }
+    diag_error_at("NonDerivableTrait", NON_DERIVABLE_TRAIT, "@derive(Deserialize) on `{tname}`: field `{tc_derive_field_label(variant, f)}` has type `{type_ann_text(node_value(f))}` which does not implement Deserialize", f, tc_derive_field_help(tc_deserialize_refused_part(ftid), "Deserialize"))
 }
 
 // Kind A collision: a struct type whose name equals an enum variant name. Two enums sharing
@@ -17260,9 +17306,11 @@ pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report, IO.Eprint {
     // @derive(Debug) requires every user-type field to also derive Debug.
     tc_check_derive_fields("Debug")
 
-    // @derive(Serialize) requires every field's type to be serializable by the
-    // generated to_json (spec §3.6.2/§3.6.6 NonDerivableTrait, E1401).
+    // @derive(Serialize) and @derive(Deserialize) require every field's type to be
+    // written by the generated to_json and read by from_json (spec §3.6.2/§3.6.6
+    // NonDerivableTrait, E1401).
     tc_check_derive_fields("Serialize")
+    tc_check_derive_fields("Deserialize")
 
     // Register all function signatures
     let fns_sl = node_params(program)

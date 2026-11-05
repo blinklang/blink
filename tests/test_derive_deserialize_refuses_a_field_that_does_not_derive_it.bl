@@ -1,0 +1,69 @@
+// A @derive(Deserialize) field whose type does not implement Deserialize is E1401
+// NonDerivableTrait (ERROR_CATALOG.md E1401, sections/03_types.md §3.6.2 *Type Mapping*).
+// Option[T] and List[T] are Deserialize when T is, and Result[T, E] when T and E are
+// (§3.6.2 *Option and Result in JSON*), so a part that does not derive it is refused there
+// too. A field the spec makes valid is not refused.
+
+import compile_test_helpers
+
+fn de_src(body: Str) -> Str {
+    "import std.json\ntype NoDe \{ a: Int }\n@derive(Deserialize)\ntype DeOk \{ a: Int }\n@derive(Deserialize)\ntype B[T] \{ v: T }\n{body}\nfn main() \{\n    match W.from_json(\"x\") \{\n        Ok(_) => io.println(\"ok\")\n        Err(_) => io.println(\"err\")\n    }\n}\n"
+}
+
+fn assert_refused(field: Str, label: Str, tag: Str) ! FS.Write, Process.Spawn, FS.Delete, Env.Read {
+    let out = compile_test_helpers.check_via_cli(de_src("@derive(Deserialize)\ntype W \{ {field} }"), tag)
+    assert(out.contains("E1401"), "{field}: no E1401\n{out}")
+    assert(out.contains("@derive(Deserialize) on `W`: field `{label}`"), "{field}: no refusal of `{label}`\n{out}")
+}
+
+fn assert_kept(field: Str, tag: Str) ! FS.Write, Process.Spawn, FS.Delete, Env.Read {
+    let out = compile_test_helpers.check_via_cli(de_src("@derive(Deserialize)\ntype W \{ {field} }"), tag)
+    assert(!out.contains("E1401"), "{field}: refused\n{out}")
+}
+
+test "a field whose type does not derive Deserialize is refused" {
+    assert_refused("x: NoDe", "x", "de_direct")
+}
+
+test "a List of a type that does not derive Deserialize is refused" {
+    assert_refused("x: List[NoDe]", "x", "de_list")
+}
+
+test "an Option of a type that does not derive Deserialize is refused" {
+    assert_refused("x: Option[NoDe]", "x", "de_option")
+}
+
+test "a Result is refused when either side does not derive Deserialize" {
+    assert_refused("x: Result[NoDe, Str]", "x", "de_result_ok")
+    assert_refused("x: Result[Str, NoDe]", "x", "de_result_err")
+}
+
+test "a generic that derives Deserialize is refused at an argument that does not" {
+    assert_refused("x: B[NoDe]", "x", "de_generic_arg")
+}
+
+test "a variant field whose type does not derive Deserialize is refused" {
+    let out = compile_test_helpers.check_via_cli(de_src("@derive(Deserialize)\ntype W \{\n    V(x: NoDe)\n    U\n}"), "de_variant")
+    assert(out.contains("E1401"), "no E1401\n{out}")
+    assert(out.contains("@derive(Deserialize) on `W`: field `V.x`"), "no refusal of `V.x`\n{out}")
+}
+
+test "a field the spec makes Deserialize is not refused" {
+    assert_kept("x: DeOk", "de_kept_direct")
+    assert_kept("x: List[DeOk]", "de_kept_list")
+    assert_kept("x: Option[Int]", "de_kept_option")
+    assert_kept("x: Option[DeOk]", "de_kept_option_nested")
+    assert_kept("x: Result[DeOk, Str]", "de_kept_result")
+    assert_kept("x: B[Int]", "de_kept_generic_arg")
+}
+
+test "a type parameter field of a generic Deserialize is not judged at the declaration" {
+    let out = compile_test_helpers.check_via_cli(de_src("@derive(Deserialize)\ntype W \{ x: Int }\n@derive(Deserialize)\ntype G[T] \{ v: T, xs: List[T] }"), "de_kept_tparam")
+    assert(!out.contains("E1401"), "refused\n{out}")
+}
+
+test "a type whose fields all derive Deserialize reads back what it wrote" {
+    let src = "import std.json\n@derive(Serialize, Deserialize)\ntype Inner \{ a: Int }\n@derive(Serialize, Deserialize)\ntype W \{ n: Int, inner: Inner, xs: List[Int] }\nfn main() \{\n    let w = W \{ n: 7, inner: Inner \{ a: 3 }, xs: [1, 2] }\n    match W.from_json(w.to_json()) \{\n        Ok(v) => io.println(\"\{v.n} \{v.inner.a} \{v.xs.len()}\")\n        Err(e) => io.println(\"err \{e}\")\n    }\n}\n"
+    let r = compile_test_helpers.compile_and_run(src, "de_round_trip")
+    assert_eq(r.out.trim(), "7 3 2")
+}
