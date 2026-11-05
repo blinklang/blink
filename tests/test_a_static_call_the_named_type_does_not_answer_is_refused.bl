@@ -1,0 +1,79 @@
+// A static call `T.f()` reads only the namespace of the type its head names. When that type has
+// no `f`, the call is an unresolved method, even when some other type declares `f`.
+
+import compile_test_helpers.{compile_and_capture, run_xmod}
+
+fn refused_with(code: Str, src: Str, fixture: Str) ! FS.Delete, FS.Write, Process.Spawn, FS.Read, Env.Read {
+    let r = compile_and_capture(src, fixture)
+    assert(r.contains(code), r)
+    assert(!r.contains("\"severity\":\"ice\""), r)
+}
+
+test "a static call on a struct is refused when only another type declares the function" {
+    refused_with("UnresolvedMethod", #"
+trait Mk { fn mk() -> Int }
+type T { x: Int }
+type U { x: Int }
+impl Mk for U { fn mk() -> Int { 9 } }
+fn main() { io.println("{T.mk()}") }
+"#, "_static_unanswered_struct")
+}
+
+test "a static call on an enum is refused when only another type declares the function" {
+    refused_with("UnresolvedMethod", #"
+trait Mk { fn mk() -> Int }
+type E {
+    P
+    Q
+}
+type U { x: Int }
+impl Mk for U { fn mk() -> Int { 9 } }
+fn main() { io.println("{E.mk()}") }
+"#, "_static_unanswered_enum")
+}
+
+test "a static call on a type parameter is not judged as a call on the type it shadows" {
+    let r = compile_and_capture(#"
+trait Mk { fn mk() -> Self }
+type T { x: Int }
+type R { x: Int }
+impl Mk for R { fn mk() -> R { R { x: 2 } } }
+fn make[T: Mk]() -> T { T.mk() }
+fn main() {
+    let r: R = make()
+    io.println("{r.x}")
+}
+"#, "_static_on_tparam_shadowing_type")
+    assert(!r.contains("UnresolvedMethod"), r)
+    assert(!r.contains("\"severity\":\"ice\""), r)
+}
+
+test "a static call to a name that no type declares says so" {
+    let r = compile_and_capture(#"
+import std.time
+fn main() { io.println("{Duration.secnds(2)}") }
+"#, "_static_name_no_type_declares")
+    assert(r.contains("no type or trait declares method"), r)
+    assert(!r.contains("\"severity\":\"ice\""), r)
+}
+
+test "a static call on a renamed import does not take the impl of a namesake in the reader" {
+    let helper = #"
+pub type T { x: Int }
+"#
+    let entry = #"
+import shapes.kinds.{T as Q}
+trait Mk { fn mk() -> Int }
+type T { x: Int }
+impl Mk for T { fn mk() -> Int { 9 } }
+fn main() {
+    io.println("{T.mk()}")
+    io.println("{Q.mk()}")
+}
+"#
+    let r = run_xmod(entry, "shapes", "kinds", helper, "static_renamed_import_namesake_xmod")
+    let all = "{r.out}{r.err_out}"
+    assert(r.exit_code != 0, all)
+    assert(all.contains("UnresolvedMethod"), all)
+    assert(!all.contains("internal compiler error"), all)
+}
