@@ -433,6 +433,7 @@ Value methods on the sized ints and `Int`:
 | Method | Returns | Purpose |
 |--------|---------|---------|
 | `.min(y)` / `.max(y)` | self type | Smaller / larger; `y` must have the receiver's type; a tie returns `self` |
+| `.abs()` | `Int` | `Int` only; panics on the minimum, which has no positive `Int` |
 
 `Type.from(x)` and `Type.try_from(x)` cover the widening / narrowing
 conversion matrix between sized ints — see the `From` / `TryFrom`

@@ -57,7 +57,7 @@ import cg_reg.{cg_reg_fn_decls, cg_reg_builtin_op_decl, cg_reg_fns_named, cg_reg
 import cname.{
     c_fn_decl_name, c_impl_method_name,
     c_display_dispatch_name, c_derive_method_name, c_derived_method_symbol,
-    c_runtime_helper, c_sited_fault_symbol, c_panic_dispatcher, c_ffi_symbol, c_mint_local, c_is_minted_temp, c_str_const, c_field_name,
+    c_runtime_helper, c_int_min_macro, c_sited_fault_symbol, c_panic_dispatcher, c_ffi_symbol, c_mint_local, c_is_minted_temp, c_str_const, c_field_name,
     cname_ffi_struct_mirror, c_local_name,
     c_variant_discriminant, c_variant_member_name, c_variant_field_path,
     c_container_ctor, c_pool_global,
@@ -75,6 +75,7 @@ import cg_expr.{
     x_unbox_payload, x_layout_checked, lower_value_as_text, cg_expr_option_some, cg_expr_option_none, cg_expr_option_wrap,
     x_is_c_comparable, cg_expr_builds_carrier, cg_expr_lower_carrier_ctor, cg_expr_sequence, cg_expr_lower_pair,
     x_lower_default, cg_expr_pending_leaves_from, cg_expr_field_value, cg_expr_field_stored, x_panic_at, x_panic_what, x_site_args,
+    x_operand_spec, x_promote_for_varargs,
 }
 import cg_stmt.{enum_tag_word, lower_block_into, cg_stmt_materialise_where_run}
 import cg_eff.{
@@ -4142,6 +4143,7 @@ fn cc_scalar_method(node: Int, obj: Int, recv_tid: Int, kind: TyKind, mname: Str
     if cc_is_wrapping_arith(kind, mname) { return cc_wrapping_arith(node, obj, recv_tid, kind, mname) }
     if cc_is_scalar_compare(kind, mname) { return cc_scalar_compare(node, obj, recv_tid, kind, mname) }
     let arith = scalar_arith_of(kind, mname)
+    if arith == ScalarArith.Abs { return cc_int_abs(node, obj, recv_tid, kind, mname) }
     if arith != ScalarArith.NotOne { return cc_scalar_min_max(node, obj, recv_tid, kind, mname, arith) }
     cc_float_bits(node, obj, kind, mname)
 }
@@ -5263,18 +5265,20 @@ fn cc_ieee_equal(node: Int, recv: Int, rhs: Int) -> Int ! Diag.Report {
 // keeps the receiver's payload. A Float is ordered by the total-order helper, not by C's <
 // or by fmin/fmax: NaN is greater than every other value, so NaN wins max and loses min.
 
-type ScalarArith { NotOne, Min, Max }
+type ScalarArith { NotOne, Min, Max, Abs }
 
 fn scalar_arith_of(kind: TyKind, m: Str) -> ScalarArith {
     let row = match m {
         "min" => ScalarArith.Min
         "max" => ScalarArith.Max
+        "abs" => ScalarArith.Abs
         _ => ScalarArith.NotOne
     }
     let held = match row {
         ScalarArith.NotOne => false
         ScalarArith.Min => kind == TyKind.Int || kind == TyKind.Float || cc_is_sized_int(kind)
         ScalarArith.Max => kind == TyKind.Int || kind == TyKind.Float || cc_is_sized_int(kind)
+        ScalarArith.Abs => kind == TyKind.Int
     }
     if held { row } else { ScalarArith.NotOne }
 }
@@ -5319,6 +5323,48 @@ fn cc_scalar_min_max(node: Int, obj: Int, recv_tid: Int, kind: TyKind, method: S
     }
     ir_select(tid, node, answer.c_spelling, answer.slot_form, wins,
         cc_temp_ref(node, recv_tid, reads, right), cc_temp_ref(node, recv_tid, reads, left))
+}
+
+// ── Int abs ─────────────────────────────────────────────────────────────
+//
+// Int's `abs` follows the sized integer method table (sections/03_types.md): it panics on
+// the minimum of a signed type, which has no positive value in its own type. The check runs
+// first, so the negation that follows can never overflow.
+
+fn cc_int_abs(node: Int, obj: Int, recv_tid: Int, kind: TyKind, method: Str) -> Int ! Diag.Report {
+    let given = sublist_length(node_args(node))
+    if given != 0 { return cc_intrinsic_arity_wrong(node, kind, method, 0, given) }
+    let tid = tid_of_node(node)
+    if tid < 0 { return -1 }
+    let answer = cc_local(tid, node)
+    if cc_stopped(answer) { return -1 }
+    let reads = cc_local(recv_tid, node)
+    if cc_stopped(reads) { return -1 }
+    let bools = cc_local(TYPE_BOOL, node)
+    if cc_stopped(bools) { return -1 }
+    let recv = lower_expr(obj)
+    if recv < 0 { return -1 }
+    // The value is read by the check, the sign test and the negation, so it is bound once.
+    let held = c_mint_local("self")
+    cg_expr_push_pending(node, ir_let(recv_tid, node, reads.c_spelling, held, reads.slot_form, recv))
+    let at_min = ir_binary(TYPE_BOOL, node, bools.c_spelling, "==", cc_temp_ref(node, recv_tid, reads, held),
+        ir_const(recv_tid, node, reads.c_spelling, c_int_min_macro(kind)))
+    let raised = x_panic_at(node, cc_abs_overflow_said(node, recv_tid, kind, cc_temp_ref(node, recv_tid, reads, held)))
+    if raised < 0 { return -1 }
+    cg_expr_push_pending(node, ir_if(node, at_min, ir_block(node, [raised]), -1))
+    let negative = ir_binary(TYPE_BOOL, node, bools.c_spelling, "<", cc_temp_ref(node, recv_tid, reads, held),
+        ir_const(recv_tid, node, reads.c_spelling, "0"))
+    let negated = ir_unary(tid, node, answer.c_spelling, "-", cc_temp_ref(node, recv_tid, reads, held))
+    ir_select(tid, node, answer.c_spelling, answer.slot_form, negative, negated, cc_temp_ref(node, recv_tid, reads, held))
+}
+
+// "Int overflow in abs (-9223372036854775808)", the form of the overflow panics in
+// src/cg_expr.bl. The type name and the minimum come from the receiver's kind and the run,
+// so a sized receiver that reuses this path reports its own type and value.
+fn cc_abs_overflow_said(node: Int, recv_tid: Int, kind: TyKind, value: Int) -> Int ! Diag.Report {
+    let spec = x_operand_spec(recv_tid, node)
+    if spec == "" { return -1 }
+    x_panic_what(node, "{tk_name(kind)} overflow in abs ({spec})", [x_promote_for_varargs(node, recv_tid, value)])
 }
 
 // ── Float bits ──────────────────────────────────────────────────────────
