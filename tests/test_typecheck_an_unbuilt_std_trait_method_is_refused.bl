@@ -103,9 +103,40 @@ test "a written Clone is called on its own value and through a bound" {
     assert_eq(errors_of(body("{WRITTEN_CLONE}{BOUNDS}", "    let _ = ub_dup(UbWritten \{ a: 1 })\n")).len(), 0)
 }
 
-test "the hash of a tuple through a method call is not built yet" {
-    let e = one_error(body("", "    let _ = (1, 2).hash()\n"))
-    assert(e.contains("`hash` on `(Int, Int)` is not built yet: the compiler cannot hash a tuple through a method call"), e)
+test "a tuple whose elements all have Hash has a hash method" {
+    assert_eq(errors_of(body("", "    let _ = (1, \"a\").hash()\n")).len(), 0)
+    assert_eq(errors_of(body("", "    let _ = Hash.hash((1, (2, 'c')))\n")).len(), 0)
+    let bound = "fn ub_hash[T: Hash](x: T) -> U64 \{\n    x.hash()\n}\n"
+    assert_eq(errors_of(body(bound, "    let _ = ub_hash((1, 2))\n")).len(), 0)
+}
+
+test "a tuple with an element that has no Hash has no hash method" {
+    let f = one_error(body("", "    let _ = (1, 2.0).hash()\n"))
+    assert(f.starts_with("UnresolvedMethod: no method `hash` on `(Int, Float)`"), f)
+    let q = one_error(body("", "    let _ = Hash.hash((1, [2]))\n"))
+    assert(q.starts_with("TypeError: `(Int, List[Int])` does not implement `Hash`"), q)
+    let bound = "fn ub_hash[T: Hash](x: T) -> U64 \{\n    x.hash()\n}\n"
+    let b = one_error(body(bound, "    let _ = ub_hash((1, Some(2)))\n"))
+    assert(b.contains("`(Int, Option[Int])` does not satisfy the Hash bound on type parameter T"), b)
+}
+
+test "a tuple of a type parameter has Hash only through a Hash bound on that parameter" {
+    let dotted = one_error("fn tp_dot[T](x: T) -> U64 \{\n    (x, 1).hash()\n}\n{body("", "    let _ = tp_dot(1.5)\n")}")
+    assert(dotted.starts_with("UnresolvedMethod: no method `hash` on `(T, Int)`"), dotted)
+    let qualified = one_error("fn tp_q[T](x: T) -> U64 \{\n    Hash.hash((1, x))\n}\n{body("", "    let _ = tp_q([2])\n")}")
+    assert(qualified.starts_with("TypeError: `(Int, T)` does not implement `Hash`"), qualified)
+    let bound = "fn tp_want[T: Hash](x: T) -> U64 \{\n    x.hash()\n}\nfn tp_pass[U: Eq](y: U) -> U64 \{\n    tp_want((y, 1))\n}\n"
+    let b = one_error(body(bound, "    let _ = tp_pass(1.5)\n"))
+    assert(b.contains("`(U, Int)` does not satisfy the Hash bound on type parameter T"), b)
+    let held = "fn tp_ok[T: Hash](x: T) -> Bool \{\n    (x, 1).hash() == Hash.hash((1, x))\n}\nfn tp_fwd[U: Hash](y: U) -> Bool \{\n    tp_ok((y, 2))\n}\n"
+    assert_eq(errors_of(body(held, "    let _ = tp_fwd(\"a\")\n")).len(), 0)
+}
+
+test "a tuple of a type parameter used as a Map key obliges the callers, not the binder" {
+    let keyed = "fn tp_keyed[T](k: T) -> Int \{\n    let mut m: Map[(T, Int), Int] = Map.new()\n    m.insert((k, 1), 2)\n    m.len()\n}\n"
+    assert_eq(errors_of(body(keyed, "    let _ = tp_keyed(\"a\")\n")).len(), 0)
+    let refused = one_error(body(keyed, "    let _ = tp_keyed(1.5)\n"))
+    assert(refused.contains("Float"), refused)
 }
 
 test "a type with no Hash impl has no hash method" {

@@ -361,7 +361,7 @@ fn eq_method(decl: Int, tid: Int, arg: Int, bodies: Bool) ! Diag.Report {
 }
 
 // A field compared or rendered through a function built on demand calls a name the unit
-// has not printed yet, and an eq or debug body prints after the unit's last walker flush.
+// has not printed yet, and an eq, debug or hash body prints after the unit's last walker flush.
 fn print_pending_walkers() ! Diag.Report {
     if cg_promote_has_pending() {
         print_typedef_blocks(layout_take_typedefs())
@@ -1526,6 +1526,7 @@ fn hash_method(decl: Int, tid: Int, arg: Int, bodies: Bool) ! Diag.Report {
     }
     let body = hash_body(decl, tid, arg)
     if body < 0 { return }
+    print_pending_walkers()
     print_fn(false, ret, symbol, params, false, body)
     kops_table(tid, rec, self_spelling)
 }
@@ -1662,11 +1663,12 @@ fn tuple_key_table(n: Int) ! Diag.Report {
         c_tid_derive_method_name(tid, "eq"), rec.kops_inline_key)
 }
 
-// One tuple's hash and equality, and every tuple inside it first. An element that is itself
+// One tuple's equality and hash, and every tuple inside it first. An element that is itself
 // a tuple is compared by that tuple's own method, and C reads a static function only after
-// its definition, so the inner pair is written before the outer one. Both bodies are built
-// before either is printed: a refusal in the hash must not leave an equality behind that
-// nothing calls. Answers whether the pair now exists, so a refusal deep in an element stops
+// its definition, so the inner pair is written before the outer one. The hash comes from
+// cg_derive_tuple_hash_fn, which a `hash()` call shares, and the walker flush prints it. The
+// equality is printed only after the hash is built: a refusal in the hash must not leave an
+// equality behind that nothing calls. Answers whether the pair now exists, so a refusal deep in an element stops
 // the table that would have named it.
 fn tuple_methods(tid: Int, span: Int) -> Bool ! Diag.Report {
     let eq_symbol = c_tid_derive_method_name(tid, "eq")
@@ -1683,17 +1685,46 @@ fn tuple_methods(tid: Int, span: Int) -> Bool ! Diag.Report {
         i = i + 1
     }
     let key_spelling = spelling_or_ice(layout_of(tid, Position.Param), tc_type_str(tid), span)
-    let hashed = u64_spelling(span)
     let compared = bool_spelling(span)
-    if key_spelling == "" || hashed == "" || compared == "" { return false }
+    if key_spelling == "" || compared == "" { return false }
     let equality = tuple_eq_body(tid, span)
     if equality < 0 { return false }
-    let hash = tuple_hash_body(tid, span)
-    if hash < 0 { return false }
+    if cg_derive_tuple_hash_fn(tid, span) == "" { return false }
     print_pending_walkers()
     print_fn(true, compared, eq_symbol, ["{key_spelling} {self_param()}", "{key_spelling} {other_param()}"], false, equality)
-    print_fn(true, hashed, c_tid_derive_method_name(tid, "hash"), ["{key_spelling} {self_param()}"], false, hash)
     tuple_methods_done.insert(eq_symbol, 1)
+    true
+}
+
+// The one producer of a tuple's hash function, for a key table and for a `hash()` call
+// alike, so a unit that has both defines it once. "" is a refusal already reported.
+fn cg_derive_tuple_hash_fn(tid: Int, span: Int) -> Str ! Diag.Report {
+    let r = tc_resolve(tid)
+    let symbol = c_tid_derive_method_name(r, "hash")
+    if diag_is_ice_seg(symbol) {
+        derive_ice(span, "no hash function name for {tc_type_str(r)}: {symbol}")
+        return ""
+    }
+    match cg_promote_on_demand_claim(symbol) {
+        Some(known) => { return known }
+        None => {}
+    }
+    cg_promote_on_demand_settle(symbol, tuple_hash_build(r, symbol, span))
+}
+
+fn tuple_hash_build(r: Int, symbol: Str, span: Int) -> Bool ! Diag.Report {
+    let _td = ensure_typedef_for(r)
+    let spelling = spelling_or_ice(layout_of(r, Position.Param), tc_type_str(r), span)
+    let hashed = u64_spelling(span)
+    if spelling == "" || hashed == "" { return false }
+    let body = tuple_hash_body(r, span)
+    if body < 0 { return false }
+    let problems = ir_verify_in_frame(body, [self_param()])
+    if problems.len() > 0 {
+        derive_ice(span, "the hash function {symbol} does not verify: {problems.get(0).unwrap()}")
+        return false
+    }
+    cg_promote_on_demand_queue(symbol, hashed, ["{spelling} {self_param()}"], body)
     true
 }
 
@@ -1904,8 +1935,9 @@ fn hash_contribution(ftid: Int, value: Int, path: Str, span: Int) -> Int ! Diag.
     }
     if k == TyKind.Struct || k == TyKind.Enum { return hash_nested(ftid, value, path, span) }
     if k == TyKind.Tuple {
-        return ir_call_direct(TYPE_U64, span, u64s,
-            c_tid_derive_method_name(tc_resolve(ftid), "hash"), u64_form(), [value])
+        let symbol = cg_derive_tuple_hash_fn(ftid, span)
+        if symbol == "" { return -1 }
+        return ir_call_direct(TYPE_U64, span, u64s, symbol, u64_form(), [value])
     }
     if !hash_is_integral(k) {
         not_built(span, "@derive(Hash) on the {tk_name(k)} field `{path}`")

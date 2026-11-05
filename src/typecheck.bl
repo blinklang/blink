@@ -1495,9 +1495,8 @@ fn tc_bound_fact(concrete_tid: Int, trait_name: Str) -> Int {
     }
     // The derivable traits are read at the instance, through its arguments and the bounds
     // of any impl written for it (tc_trait_need).
-    if trait_name == "Hash" || trait_name == "Serialize" {
-        return tc_derive_only_fact(concrete_tid, trait_name)
-    }
+    if trait_name == "Hash" { return tc_hash_fact_by_bounds(concrete_tid) }
+    if trait_name == "Serialize" { return tc_derive_only_fact(concrete_tid, trait_name) }
     if trait_name == "Eq" || trait_name == "Ord" || trait_name == "Clone" || trait_name == "Debug" {
         if tc_tid_has_unbound_metavar(concrete_tid) != 0 { return 0 }
         if tc_trait_need(concrete_tid, trait_name, []).len() == 0 { return 1 }
@@ -3094,6 +3093,10 @@ type CallFacts {
     self_views: Map[Int, Int]
     view_sigs: Map[Int, Int]
     hash_aliases_above: List[Int]
+    // Set while a bound or a method call asks for Hash. A type parameter then has Hash only
+    // through a bound its binder writes; a key or an element walk leaves it open for the
+    // obligation it puts on the callers.
+    hash_by_bounds: Bool
     // The instance a static call through a type head reads its head as, and the impl binder
     // tids that call settled. Mono reads the binders, so they stay after the walk.
     static_head_insts: Map[Int, Int]
@@ -3105,7 +3108,7 @@ type CallFacts {
     trait_heads: Map[Int, Str]
 }
 fn new_call_facts() -> CallFacts {
-    CallFacts { open_calls: [], open_group: Map(), open_tids: [], reported: Map(), self_views: Map(), view_sigs: Map(), hash_aliases_above: [], static_head_insts: Map(), static_head_binders: Map(), static_owners: Map(), trait_heads: Map() }
+    CallFacts { open_calls: [], open_group: Map(), open_tids: [], reported: Map(), self_views: Map(), view_sigs: Map(), hash_aliases_above: [], hash_by_bounds: false, static_head_insts: Map(), static_head_binders: Map(), static_owners: Map(), trait_heads: Map() }
 }
 let mut tc_calls: CallFacts = new_call_facts()
 
@@ -5810,8 +5813,7 @@ fn tc_check_one_bound(name: Str, bounds: Str, concrete: Int, node: Int) -> Int !
                 tc_trait_need_notes(path, tr))
             return 1
         }
-        // A Hash bound is left out: a tuple is a Map key, which hashes it with no method call.
-        if tc_pipe_has(bounds, tr) != 0 && tr != "Hash" {
+        if tc_pipe_has(bounds, tr) != 0 {
             match tc_std_trait_unbuilt(concrete, tr) {
                 Some(why) => {
                     diag_error_at("TypeError", TYPE_ERROR,
@@ -12674,7 +12676,9 @@ fn tc_refuse_unhashable_instance(tid0: Int, ann: Int, role: HashRole) ! Diag.Rep
     let base = if k == TyKind.Struct { tc_struct_base_tid(tid) } else { tc_enum_base_tid(tid) }
     let decl = tc_tid_decl_node(base)
     if decl < 0 || tc_decl_derives(decl, "Hash") == 0 { return }
-    if tc_instance_has_trait(tid, "Hash") { return }
+    // A key is judged at each instance, as a bare `K` key is, so a type parameter among the
+    // arguments does not refuse it here; a bound or a method call reads bounds instead.
+    if tc_tid_hash_fact(tid) != -1 { return }
     tc_report_unhashable(role, HashRefusal.Instance, type_to_str(tid), "", ann)
 }
 
@@ -13039,7 +13043,7 @@ fn tc_tid_hash_fact(tid0: Int) -> Int {
     let tid = tc_resolve(tid0)
     match type_kind(tid) {
         TyKind.Unknown => 0
-        TyKind.Typevar => 0
+        TyKind.Typevar => tc_typevar_hash_fact(tid)
         TyKind.Int => 1
         TyKind.Bool => 1
         TyKind.Char => 1
@@ -13058,6 +13062,24 @@ fn tc_tid_hash_fact(tid0: Int) -> Int {
         TyKind.Enum => tc_nominal_hash_fact(tid)
         _ => -1
     }
+}
+
+// The compiler adds no bound the user did not write (sections/03_types.md *No implied bounds*),
+// so where a bound or a method needs Hash, `(T, Int)` has it only when `T: Hash` is written.
+fn tc_hash_fact_by_bounds(tid: Int) -> Int {
+    let saved = tc_calls.hash_by_bounds
+    tc_calls.hash_by_bounds = true
+    let fact = tc_tid_hash_fact(tid)
+    tc_calls.hash_by_bounds = saved
+    fact
+}
+
+fn tc_typevar_hash_fact(tid: Int) -> Int {
+    if !tc_calls.hash_by_bounds { return 0 }
+    // "" is a name that is not an active type parameter, so its bounds say nothing.
+    let traits = tc_tparam_bound_traits(type_to_str(tid))
+    if traits == "" { return 0 }
+    if tc_pipe_has(traits, "Hash") != 0 { 1 } else { -1 }
 }
 
 fn tc_tuple_hash_fact(tid: Int) -> Int {
@@ -27726,6 +27748,7 @@ fn tc_trait_need(tid: Int, tr: Str, visiting: List[Int]) -> List[Int] {
 fn tc_derive_only_need(tid0: Int, tr: Str) -> List[Int] {
     let tid = resolve_alias_tid(tc_resolve(tid0))
     if tr == "Debug" { return tc_debug_need(tid, []) }
+    if tr == "Hash" { return if tc_hash_fact_by_bounds(tid) == -1 { [tid] } else { [] } }
     if tc_derive_only_fact(tid, tr) == -1 { return [tid] }
     []
 }
@@ -27827,7 +27850,6 @@ fn tc_std_trait_unbuilt(tid0: Int, tr: Str) -> Option[Str] {
     match tr {
         "Debug" => tc_debug_unbuilt(tid, true)
         "Clone" => tc_clone_unbuilt(tid, true)
-        "Hash" => if type_kind(tid) == TyKind.Tuple { Some("hash a tuple through a method call") } else { None }
         "Ord" => tc_ord_unbuilt(tid)
         _ => None
     }
@@ -28089,7 +28111,6 @@ fn tc_std_trait_unbuilt_help(method: Str) -> Str {
     match method {
         "debug" => "build the text from the parts of the value whose `debug` is built"
         "clone" => "build the copy from the parts of the value"
-        "hash" => "hash each element and combine the results, or use the tuple as a `Map` or `Set` key"
         _ => "compare one part of the value at a time"
     }
 }
@@ -28226,8 +28247,8 @@ fn tc_bound_need(arg: Int, tr: Str, visiting: List[Int]) -> List[Int] {
     if need.len() > 0 { return need }
     if tc_bound_fact(arg, tr) == -1 { return [arg] }
     // A std method the compiler cannot build fails the bound as the bound check refuses it,
-    // so no body reaches mono at that type. A Hash bound is left out for the same reason.
-    if tr != "Hash" && tc_std_trait_unbuilt(arg, tr).is_some() { return [arg] }
+    // so no body reaches mono at that type.
+    if tc_std_trait_unbuilt(arg, tr).is_some() { return [arg] }
     tc_user_trait_need(arg, tr, visiting)
 }
 
