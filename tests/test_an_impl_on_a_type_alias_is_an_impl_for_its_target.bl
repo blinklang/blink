@@ -1,0 +1,234 @@
+// An alias and its target are one type (sections/03_types.md), and impl lookup tests the resolved
+// type (sections/07_trust_modules_metadata.md). So an impl written on an alias is the target's
+// impl: each spelling of the type finds it, and no other type does.
+
+import std.process.{ChildEnd}
+import compile_test_helpers.{compile_and_capture, compile_and_run, run_xmod, scratch_root}
+
+fn runs_and_prints(src: Str, fixture: Str, want: Str) ! FS.Delete, FS.Write, Process.Spawn, FS.Read, Env.Read {
+    let r = compile_and_run(src, fixture)
+    assert(r.exit_code == 0, "compile or run failed: {r.out}{r.err_out}")
+    assert_eq(r.out, want)
+}
+
+fn run_modules(tag: Str, files: List[(Str, Str)]) -> Str ! Process.Spawn, FS.Write, Env.Read {
+    let root = "{scratch_root()}/{tag}"
+    let _mk = process.run("mkdir", ["-p", "{root}/src"]).unwrap()
+    fs.write("{root}/blink.toml", "[package]\nname = \"{tag}\"\nversion = \"0.1.0\"\n").unwrap()
+    for f in files { fs.write("{root}/src/{f.0}", f.1).unwrap() }
+    let r = process.run("build/blink", ["run", "-o", "{root}/main", "{root}/src/main.bl"]).unwrap()
+    if r.end == ChildEnd.Exited(0) { r.out } else { "failed: {r.out}{r.err_out}" }
+}
+
+fn refused_with(code: Str, src: Str, fixture: Str) ! FS.Delete, FS.Write, Process.Spawn, FS.Read, Env.Read {
+    let r = compile_and_capture(src, fixture)
+    assert(r.contains(code), r)
+    assert(!r.contains("\"severity\":\"ice\""), r)
+}
+
+test "a static call through the target or another alias finds the impl on an alias" {
+    runs_and_prints(#"
+trait Mk { fn mk() -> Self }
+type T { x: Int }
+type A = T
+type B = A
+type C = T
+impl Mk for A { fn mk() -> A { T { x: 1 } } }
+fn main() {
+    io.println("{T.mk().x}")
+    io.println("{A.mk().x}")
+    io.println("{B.mk().x}")
+    io.println("{C.mk().x}")
+}
+"#, "_impl_on_alias_static", "1\n1\n1\n1\n")
+}
+
+test "an impl on an alias of an enum is the enum's impl" {
+    runs_and_prints(#"
+trait Mk { fn mk() -> Self }
+type E {
+    P
+    Q(Int)
+}
+type EA = E
+impl Mk for EA { fn mk() -> EA { E.Q(4) } }
+fn main() {
+    let e = E.mk()
+    io.println("{match e {
+        E.P => 0
+        E.Q(n) => n
+    }}")
+}
+"#, "_impl_on_alias_enum", "4\n")
+}
+
+test "a method from an impl on an alias reaches a value of the target type" {
+    runs_and_prints(#"
+trait Sh { fn n(self) -> Int }
+type Pt { x: Int }
+type P2 = Pt
+impl Sh for P2 { fn n(self) -> Int { self.x + 10 } }
+fn total[X: Sh](v: X) -> Int { v.n() }
+fn main() {
+    let p = Pt { x: 3 }
+    io.println("{p.n()}")
+    io.println("{total(p)}")
+    let q: P2 = Pt { x: 5 }
+    io.println("{q.n()}")
+}
+"#, "_impl_on_alias_method", "13\n13\n15\n")
+}
+
+test "an impl on an alias of a builtin is the builtin's impl" {
+    runs_and_prints(#"
+trait Mk { fn mk() -> Self }
+trait Sh { fn n(self) -> Int }
+type I = Int
+impl Mk for I { fn mk() -> I { 3 } }
+impl Sh for I { fn n(self) -> Int { self + 1 } }
+fn main() {
+    io.println("{Int.mk()}")
+    io.println("{I.mk()}")
+    let v = 6
+    io.println("{v.n()}")
+}
+"#, "_impl_on_alias_builtin", "3\n3\n7\n")
+}
+
+test "an impl on an alias of a tuple or a function type answers a static call through the alias" {
+    runs_and_prints(#"
+trait Mk { fn mk() -> Self }
+type P = (Int, Int)
+impl Mk for P { fn mk() -> P { (1, 2) } }
+fn main() {
+    let p = P.mk()
+    io.println("{p.0}")
+}
+"#, "_impl_on_alias_of_tuple", "1\n")
+    runs_and_prints(#"
+trait Mk { fn mk() -> Int }
+type F = fn(Int) -> Int
+impl Mk for F { fn mk() -> Int { 5 } }
+fn main() { io.println("{F.mk()}") }
+"#, "_impl_on_alias_of_fn", "5\n")
+}
+
+test "an impl binder named like an alias is the binder, not the alias" {
+    let r = compile_and_capture(#"
+trait Sh { fn n(self) -> Int }
+type S { x: Int }
+type A = S
+impl[A: Eq] Sh for A { fn n(self) -> Int { 1 } }
+impl Sh for S { fn n(self) -> Int { 2 } }
+fn main() {
+    let s = S { x: 0 }
+    io.println("{s.n()}")
+}
+"#, "_impl_binder_named_like_alias")
+    assert(!r.contains("AmbiguousMethodCall"), r)
+    assert(!r.contains("\"severity\":\"ice\""), r)
+}
+
+test "an impl on an alias and an impl on its target overlap" {
+    refused_with("OverlappingImpls", #"
+trait Mk { fn mk() -> Self }
+type T { x: Int }
+type A = T
+impl Mk for T { fn mk() -> T { T { x: 1 } } }
+impl Mk for A { fn mk() -> A { T { x: 2 } } }
+fn main() { io.println("{T.mk().x}") }
+"#, "_impl_on_alias_and_target")
+}
+
+test "an impl on an alias of a type with arguments is refused as on the type itself" {
+    refused_with("E0908", #"
+trait Sh { fn n(self) -> Int }
+type LI = List[Int]
+impl Sh for LI { fn n(self) -> Int { self.len() } }
+fn main() { io.println("{[1, 2].n()}") }
+"#, "_impl_on_alias_of_list_instance")
+    refused_with("E0908", #"
+trait Sh { fn n(self) -> Int }
+type Bx[T] { v: T }
+type BS = Bx[Str]
+impl Sh for BS { fn n(self) -> Int { 7 } }
+fn main() { io.println("{Bx { v: "a" }.n()}") }
+"#, "_impl_on_alias_of_user_instance")
+    refused_with("E0908", #"
+trait Sh { fn n(self) -> Int }
+type O = Option[Int]
+impl Sh for O { fn n(self) -> Int { 7 } }
+fn main() {
+    let o: Option[Int] = Some(1)
+    io.println("{o.n()}")
+}
+"#, "_impl_on_alias_of_option_instance")
+}
+
+test "an impl on a local alias of an imported type is found through the imported name" {
+    let helper = #"
+pub type T { x: Int }
+"#
+    let entry = #"
+import shapes.kinds.{T}
+trait Mk { fn mk() -> Self }
+type A = T
+impl Mk for A { fn mk() -> A { T { x: 8 } } }
+fn main() {
+    io.println("{T.mk().x}")
+    io.println("{A.mk().x}")
+}
+"#
+    let r = run_xmod(entry, "shapes", "kinds", helper, "impl_on_alias_of_import_xmod")
+    assert(r.exit_code == 0, "compile or run failed: {r.out}{r.err_out}")
+    assert_eq(r.out, "8\n8\n")
+}
+
+test "two modules with a private alias of one name each keep their own impl" {
+    let helper = #"
+pub trait Mk { fn mk() -> Self }
+pub type T { x: Int }
+impl Mk for T { fn mk() -> T { T { x: 1 } } }
+type A = T
+pub fn from_helper() -> Int { A.mk().x }
+"#
+    let entry = #"
+import shapes.kinds.{Mk, from_helper}
+type U { x: Int }
+type A = U
+impl Mk for A { fn mk() -> A { U { x: 99 } } }
+fn main() {
+    io.println("{from_helper()} {A.mk().x} {U.mk().x}")
+}
+"#
+    let r = run_xmod(entry, "shapes", "kinds", helper, "impl_on_private_alias_namesake_xmod")
+    assert(r.exit_code == 0, "compile or run failed: {r.out}{r.err_out}")
+    assert_eq(r.out, "1 99 99\n")
+}
+
+test "impls on aliases of two namesake types from two modules each answer for their own type" {
+    let main_src = #"
+import k
+import j
+trait Mk { fn mk() -> Self }
+trait Sh { fn n(self) -> Int }
+type KA = k.T
+type JA = j.T
+impl Mk for KA { fn mk() -> KA { k.T { x: 1 } } }
+impl Mk for JA { fn mk() -> JA { j.T { x: 2 } } }
+impl Sh for KA { fn n(self) -> Int { self.x + 10 } }
+impl Sh for JA { fn n(self) -> Int { self.x + 20 } }
+fn main() {
+    io.println("{KA.mk().x} {JA.mk().x}")
+    io.println("{KA.mk().n()} {JA.mk().n()}")
+    let a = k.T { x: 3 }
+    let b = j.T { x: 4 }
+    io.println("{a.n()} {b.n()}")
+}
+"#
+    assert_eq(run_modules("impl_on_aliases_of_namesakes", [
+        ("k.bl", "pub type T \{ x: Int \}\n"),
+        ("j.bl", "pub type T \{ x: Int \}\n"),
+        ("main.bl", main_src),
+    ]), "1 2\n11 22\n13 24\n")
+}

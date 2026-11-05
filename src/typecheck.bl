@@ -1036,15 +1036,62 @@ fn tc_impl_target_name(im: Int) -> Str {
     let written = node_name(im)
     let spelled = tc_impl_recv_spelling(im)
     if spelled != written { return spelled }
+    let target = tc_impl_alias_target(im)
+    if target != -1 { return tc_tid_name(target) }
     tc_nominal_type_name_in(written, node_module(im))
 }
 
 // The type name an impl header writes, with a name imported from a compiler-known type's home
-// under another name read as that type: `impl Tally for CoreList[T]` extends List.
+// under another name read as that type: `impl Tally for CoreList[T]` extends List. An alias of a
+// builtin is that builtin too, because a builtin has no declaration to tell its impls apart by.
 pub fn tc_impl_recv_spelling(im: Int) -> Str {
     let written = node_name(im)
     let core = tc_core_type_alias_target(written, tc_body_module(im))
-    if core != "" { core } else { written }
+    if core != "" { return core }
+    let target = tc_impl_alias_target(im)
+    if target != -1 && type_kind(target) != TyKind.Struct && type_kind(target) != TyKind.Enum { return tk_name(type_kind(target)) }
+    written
+}
+
+// The type an impl header means when it names an alias, read in the impl's own module, or -1.
+// Impl lookup tests the resolved type (sections/07_trust_modules_metadata.md), so an impl on an
+// alias is an impl on its target. Only a target with no type arguments: E0908 refuses an impl
+// on an alias of an instance as it refuses one on the instance, and a generic alias or a tuple
+// or function target has no receiver a header can write.
+fn tc_impl_alias_target(im: Int) -> Int {
+    let t = tc_impl_alias_resolved(im)
+    if t < 0 || !tc_impl_alias_target_is_bare(t) { -1 } else { t }
+}
+
+// Whether the impl header names an alias of a type with type arguments, as `type L = List[Int]`.
+fn tc_impl_names_alias_of_instance(im: Int) -> Bool {
+    let t = tc_impl_alias_resolved(im)
+    t >= 0 && tc_type_has_receiver(t) && !tc_impl_alias_target_is_bare(t)
+}
+
+// A declared type or a builtin with no type arguments, which is what a header can write.
+fn tc_impl_alias_target_is_bare(t: Int) -> Bool {
+    let k = type_kind(t)
+    if k == TyKind.Struct || k == TyKind.Enum { return ty_pool.get(t).unwrap().params_count == 0 }
+    tc_type_has_receiver(t) && type_to_str(t) == tk_name(k)
+}
+
+// A tuple or a function type has no name an impl header or a static call can write.
+fn tc_type_has_receiver(t: Int) -> Bool {
+    let k = type_kind(t)
+    k != TyKind.Tuple && k != TyKind.Fn && k != TyKind.Typevar && k != TyKind.Unknown
+}
+
+fn tc_impl_alias_resolved(im: Int) -> Int {
+    let name = node_name(im)
+    // A binder shadows a type of the same name in its header.
+    if name == "" || impl_binder_declared(node_impl_binders(im), name) != 0 { return -1 }
+    let saved = tc_enter_body_module(im)
+    let decl = if tc_compiler_known_type_meant(name, -1) != "" { -1 } else { tc_alias_decl_of_written(name) }
+    let generic = decl != -1 && node_type_params(decl) != -1 && sublist_length(node_type_params(decl)) > 0
+    let t = if decl == -1 || generic { -1 } else { resolve_alias_tid(lookup_named_type(name)) }
+    tc_leave_body_module(saved)
+    t
 }
 
 // The declaration an impl header names, read in the impl's own module, or -1 when it names a
@@ -1059,6 +1106,8 @@ pub fn tc_impl_owner_decl(im: Int) -> Int {
     tc_leave_body_module(saved)
     if meant != "" { return tc_prelude_type_decl(meant) }
     if tid < 0 { return -1 }
+    let target = tc_impl_alias_target(im)
+    if target != -1 { return tc_tid_decl_node(target) }
     tc_tid_decl_node(tid)
 }
 
@@ -1193,7 +1242,7 @@ fn tc_impl_exists(impls_sl: Int, sname: Str, tname: Str) -> Int {
     while i < sublist_length(impls_sl) {
         let other = sublist_get(impls_sl, i)
         if tc_impl_trait_id(other) == sname {
-            if node_name(other) == tname { return 1 }
+            if tc_impl_target_name(other) == tname { return 1 }
         }
         i = i + 1
     }
@@ -11542,17 +11591,19 @@ fn tc_record_impl_recv_tid(im: Int) ! TypeCheck.Resolve, Diag.Report {
     let binders_sl = node_impl_binders(im)
     // The module-resolved name: a namesake type is keyed under its module, not its bare name.
     let name = tc_impl_target_name(im)
+    // An aliased compiler-known receiver resolves through its alias: the builtin's own
+    // spelling would mean a declaration that takes the name in this module. An alias of a
+    // declared type does too, because its target's own name may not be in scope here.
+    let via_alias = tc_impl_recv_spelling(im) != written || tc_impl_alias_target(im) != -1
+    let resolved = if via_alias { written } else { name }
     let unbound = impl_binder_declared(binders_sl, written) == 0
     let reserved = if unbound { tc_report_reserved_unbuilt(written, im) } else { 0 }
-    if reserved == 0 && unbound && is_known_type(written) == 0 && lookup_named_type(name) == -1 {
+    if reserved == 0 && unbound && is_known_type(written) == 0 && lookup_named_type(resolved) == -1 {
         diag_error_at("UnknownType", UNKNOWN_TYPE, "unknown type `{written}` in receiver of impl `{node_trait_name(im)}`", im, "the receiver must be a declared type, a builtin type, or a name declared in `impl[...]` binders")
     }
     tc_push_tparam_scope(binders_sl)
     let saved_suppress = tc_suppress_ann_validation
     tc_suppress_ann_validation = 1
-    // An aliased compiler-known receiver resolves through its alias: the builtin's own
-    // spelling would mean a declaration that takes the name in this module.
-    let resolved = if tc_impl_recv_spelling(im) != written { written } else { name }
     let t = tc_impl_recv_structural(resolve_type_parts(resolved, node_recv_type_args(im), -1), node_recv_type_args(im))
     tc_suppress_ann_validation = saved_suppress
     tc_pop_tparam_scope(binders_sl)
@@ -15554,29 +15605,28 @@ fn tc_static_qualifier(written: Str) -> Str {
 }
 
 // What the head of a static call means. `owner` is the type whose members the call reads. An
-// alias means its target, so the target owns the call, unless an impl is written over the
-// alias's own name, since the impl is kept under that name. `alias` keeps the alias's
-// declaration, which says the arguments of the type the call builds. `decl` is the target's
-// declaration, or -1 when the plain lookup answers.
+// alias means its target, so the target owns the call, as it owns an impl written on the alias.
+// `alias` keeps the alias's declaration, which says the arguments of the type the call builds.
+// `decl` is the target's declaration, or -1 when the plain lookup answers.
 type StaticHead {
     owner: Str
     alias: Int
     decl: Int
 }
 
-fn tc_static_head(written: Str, method: Str) -> StaticHead {
+fn tc_static_head(written: Str) -> StaticHead {
     let q = tc_static_qualifier(written)
     let alias = tc_alias_decl_of_written(q)
     if alias == -1 || tc_name_is_tparam_in_scope(q) != 0 { return StaticHead { owner: q, alias: -1, decl: -1 } }
-    if tc_method_trait_names(q, method) != "" { return StaticHead { owner: q, alias: alias, decl: -1 } }
     let target = tc_head_decl_tid(q)
     let owner = tc_type_name(target)
-    if owner == "" { return StaticHead { owner: q, alias: alias, decl: -1 } }
+    // An impl on an alias of a tuple or a function type stays under the alias's own name.
+    if owner == "" || !tc_type_has_receiver(target) { return StaticHead { owner: q, alias: alias, decl: -1 } }
     StaticHead { owner: owner, alias: alias, decl: tc_tid_decl_node(target) }
 }
 
-pub fn tc_static_owner(written: Str, method: Str) -> Str {
-    tc_static_head(written, method).owner
+pub fn tc_static_owner(written: Str) -> Str {
+    tc_static_head(written).owner
 }
 
 // The type the head builds: the alias's target, at open arguments that the call settles, or -1
@@ -16384,7 +16434,7 @@ fn validate_trait_impls_in_own_modules(program: Int) ! TypeCheck.Register, TypeC
         // Codegen monomorphization of a polymorphic impl is not yet supported; the
         // E0908 gate is emitted after those checks (so a malformed poly impl reports
         // both its specific contract error and E0908) to block codegen.
-        let is_poly = if binders_sl != -1 || recv_args_sl != -1 { 1 } else { 0 }
+        let is_poly = if binders_sl != -1 || recv_args_sl != -1 || tc_impl_names_alias_of_instance(im) { 1 } else { 0 }
         // Two supported canonical builtin forms:
         //  1. `impl[T] Trait[T] for List[T]` — monomorphized per element T in
         //     codegen (or, when element-agnostic, routed to the single-symbol
@@ -31224,7 +31274,7 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
 
         if obj_node != -1 && node_kind(obj_node) == NodeKind.Ident {
             let obj_written = node_name(obj_node)
-            let static_head = if nr_receiver_has_binding(obj_written) != 0 { StaticHead { owner: obj_written, alias: -1, decl: -1 } } else { tc_static_head(obj_written, method) }
+            let static_head = if nr_receiver_has_binding(obj_written) != 0 { StaticHead { owner: obj_written, alias: -1, decl: -1 } } else { tc_static_head(obj_written) }
             let obj_name = static_head.owner
             if obj_name == "Char" {
                 if method == "from_code_point" {
