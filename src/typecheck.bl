@@ -11439,6 +11439,11 @@ fn tc_value_head_tid(name: Str) -> Int {
     let named = lookup_named_type(name)
     let decl = tc_alias_decl_of_written(name)
     if decl == -1 { return named }
+    let target = tc_alias_target_open(decl)
+    if target == -1 { named } else { target }
+}
+
+fn tc_alias_target_open(decl: Int) -> Int {
     let tps = node_type_params(decl)
     let mut args: List[Int] = []
     let mut i = 0
@@ -11446,8 +11451,7 @@ fn tc_value_head_tid(name: Str) -> Int {
         args.push(make_metavar())
         i = i + 1
     }
-    let target = tc_alias_target_at(decl, args)
-    if target == -1 { named } else { target }
+    tc_alias_target_at(decl, args)
 }
 
 // The declared type a head written `name` reaches, through any alias and with no instance's
@@ -15476,9 +15480,74 @@ fn tc_core_alias_target(written: Str, in_mod: Str) -> Str {
 
 // The type a static-call qualifier names: a name imported from a compiler-known type's home
 // under another name (`CoreBytes.from_str`) is that type, as `Bytes.from_str` is.
-pub fn tc_static_qualifier(written: Str) -> Str {
+fn tc_static_qualifier(written: Str) -> Str {
     let core = tc_core_type_alias_target(written, nr_current_module)
     if core != "" { core } else { written }
+}
+
+// What the head of a static call means. `owner` is the type whose members the call reads. An
+// alias means its target, so the target owns the call, unless an impl is written over the
+// alias's own name, since the impl is kept under that name. `alias` keeps the alias's
+// declaration, which says the arguments of the type the call builds. `decl` is the target's
+// declaration, or -1 when the plain lookup answers.
+type StaticHead {
+    owner: Str
+    alias: Int
+    decl: Int
+}
+
+fn tc_static_head(written: Str, method: Str) -> StaticHead {
+    let q = tc_static_qualifier(written)
+    let alias = tc_alias_decl_of_written(q)
+    if alias == -1 || tc_name_is_tparam_in_scope(q) != 0 { return StaticHead { owner: q, alias: -1, decl: -1 } }
+    if tc_method_trait_names(q, method) != "" { return StaticHead { owner: q, alias: alias, decl: -1 } }
+    let target = tc_head_decl_tid(q)
+    let owner = tc_type_name(target)
+    if owner == "" { return StaticHead { owner: q, alias: alias, decl: -1 } }
+    StaticHead { owner: owner, alias: alias, decl: tc_tid_decl_node(target) }
+}
+
+pub fn tc_static_owner(written: Str, method: Str) -> Str {
+    tc_static_head(written, method).owner
+}
+
+// The type the head builds: the alias's target, at open arguments that the call settles, or -1
+// with no alias, where the owner's own name says the type.
+fn tc_static_head_type(head: StaticHead) -> Int {
+    if head.alias == -1 { -1 } else { tc_alias_target_open(head.alias) }
+}
+
+// The function that a call `Head.method` names by the target's name. §2.12.3 lets only the
+// module that declares a type add to its namespace, so only that module's function counts. A
+// signature with no declaration is one the compiler makes for the type, such as a derived
+// method. The name is the declaration's own, because the pool name of a namesake carries its
+// module.
+fn tc_static_head_sig(head: StaticHead, method: Str) -> Int {
+    if head.decl < 0 { return lookup_fnsig("{head.owner}_{method}") }
+    let home = node_module(head.decl)
+    let name = "{node_name(head.decl)}_{method}"
+    let own = match nr_module_names.get(home) {
+        Some(r) => r.sigs.get(name) ?? -1
+        None => -1
+    }
+    let sig = if own == -1 { fnsig_map.get(name) ?? -1 } else { own }
+    if sig == -1 { return -1 }
+    let fdecl = fnsig_pool.get(sig).unwrap().decl
+    if fdecl >= 0 && !tc_same_module(node_module(fdecl), home) { return -1 }
+    sig
+}
+
+// A constructor reached through an alias builds what the alias says, not what the context
+// asks for. So a context that disagrees is a mismatch at that context. Type arguments written
+// at the call must agree too.
+fn tc_static_ctor_answer(head_type: Int, node: Int, label: Str, built: Int) -> Int ! TypeCheck.Report, Diag.Report {
+    if head_type == -1 || built < 0 || built == tc_error_recovery_tid() { return built }
+    if node_type_params(node) != -1 && tc_unify(built, head_type) == 0 {
+        tc_error_at_code("`{label}` builds `{type_to_str(head_type)}`, but its type arguments say `{type_to_str(built)}`", node,
+            "TypeError", TYPE_ERROR, "remove the type arguments, or change them to match the alias")
+        return tc_error_recovery_tid()
+    }
+    head_type
 }
 
 // The compiler-known type that `written` names in module `in_mod` through an import from the
@@ -31056,7 +31125,8 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
 
         if obj_node != -1 && node_kind(obj_node) == NodeKind.Ident {
             let obj_written = node_name(obj_node)
-            let obj_name = if nr_receiver_has_binding(obj_written) != 0 { obj_written } else { tc_static_qualifier(obj_written) }
+            let static_head = if nr_receiver_has_binding(obj_written) != 0 { StaticHead { owner: obj_written, alias: -1, decl: -1 } } else { tc_static_head(obj_written, method) }
+            let obj_name = static_head.owner
             if obj_name == "Char" {
                 if method == "from_code_point" {
                     return make_result_type(TYPE_CHAR, tc_conversion_error_type())
@@ -31078,14 +31148,14 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
             // `nr_is_defined` gates it so a local binding that happens to share the handle's
             // spelling keeps its own type — that variable's receiver arm has already run and
             // fallen through only because the method was genuinely unresolved on it.
-            if obj_name == "default" && nr_receiver_has_binding(obj_name) == 0 {
+            if obj_name == "default" && nr_receiver_has_binding(obj_written) == 0 {
                 let dflt_eff = tc_tid_handler_effect(tc_lookup_node_tid(obj_node))
                 if dflt_eff != "" {
                     let dflt_ret = tc_infer_default_perform(node, dflt_eff, method)
                     if dflt_ret != -1 { return dflt_ret }
                 }
             }
-            if nr_receiver_is_defined(obj_name) == 0 && is_user_effect_handle_name(obj_name) != 0 {
+            if nr_receiver_is_defined(obj_written) == 0 && is_user_effect_handle_name(obj_name) != 0 {
                 let ue_sig = lookup_fnsig("{obj_name}.{method}")
                 if ue_sig != -1 {
                     nr_note_call_decl(node, fnsig_pool.get(ue_sig).unwrap().decl)
@@ -31095,14 +31165,14 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
             }
             // `rand.<name>` always means the handle, so a name that is no operation of `Rand` is
             // E0505 here, before the unclaimed-call report can read `rand` as a module (§4.4.7).
-            if nr_receiver_is_defined(obj_name) == 0 && tc_ns_call_reads_module(obj_name) == 0 && builtin_op_root_of_handle(obj_name) == "Rand" && !builtin_op_exists("Rand", method) {
+            if nr_receiver_is_defined(obj_written) == 0 && tc_ns_call_reads_module(obj_name) == 0 && builtin_op_root_of_handle(obj_name) == "Rand" && !builtin_op_exists("Rand", method) {
                 return tc_report_not_a_handle_op(node, "Rand", method)
             }
             // Intrinsic time.* methods type even without `import std.time` (they emit as
             // codegen intrinsics like io.println). Typing read() as Instant lets the
             // comparison check (Stage 4) catch `time.read() > 0` at `blink check` instead
             // of leaking an Instant into invalid C.
-            if is_import_module_name(obj_name) != 0 && nr_receiver_is_defined(obj_name) == 0 && is_intrinsic_method(obj_name, method) != 0 {
+            if is_import_module_name(obj_name) != 0 && nr_receiver_is_defined(obj_written) == 0 && is_intrinsic_method(obj_name, method) != 0 {
                 if obj_name == "time" { tc_check_time_op_args(node, method) }
                 if obj_name == "time" && method == "read" {
                     // std.time is a prelude module (compiler.bl:1357), so the declaration
@@ -31120,7 +31190,7 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
             // intrinsic needs no import (that is what makes it an intrinsic), and
             // is_intrinsic_method already restricts the namespace. nr_is_defined keeps a
             // local that shadows the namespace spelling on its own receiver-typed arm.
-            if nr_receiver_is_defined(obj_name) == 0 && is_intrinsic_method(obj_name, method) != 0 && tc_ns_call_reads_module(obj_name) == 0 {
+            if nr_receiver_is_defined(obj_written) == 0 && is_intrinsic_method(obj_name, method) != 0 && tc_ns_call_reads_module(obj_name) == 0 {
                 if obj_name == "trace" && method == "log" { tc_intrinsic_calls.insert(node, INTRINSIC_TRACE_LOG) }
                 let surface_root = builtin_op_root_of_handle(obj_name)
                 if surface_root != "" && builtin_op_surface_fn(surface_root, method) != "" {
@@ -31171,7 +31241,7 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                     return TYPE_VOID
                 }
             }
-            if tc_site_qualifier_module(obj_name, node) != "" && nr_receiver_is_defined(obj_name) == 0 && (is_intrinsic_method(obj_name, method) == 0 || tc_ns_call_reads_module(obj_name) != 0) {
+            if tc_site_qualifier_module(obj_name, node) != "" && nr_receiver_is_defined(obj_written) == 0 && (is_intrinsic_method(obj_name, method) == 0 || tc_ns_call_reads_module(obj_name) != 0) {
                 if tc_call_is_skip_intrinsic(node) { return tc_check_skip_call(node) }
                 let sig = tc_qualified_call_fnsig(node, obj_name, method)
                 if sig != -1 { return tc_check_free_call("{obj_name}.{method}", sig, node) }
@@ -31193,7 +31263,7 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
             // above, so a struct/enum receiver has already been through
             // tc_method_resolvable_on_type, and a scalar one falls through to Unknown and
             // the codegen E0505 backstop. The wrong ANSWER is what this removes.
-            let obj_is_value = nr_receiver_has_binding(obj_name)
+            let obj_is_value = nr_receiver_has_binding(obj_written)
             // The qualified trait call `Trait.method(receiver, args)` — parsed as
             // MethodCall(obj = Ident(Trait)), and the spec's ONLY way to name one of two
             // traits that define the same method (sections/03c_protocols.md:697-712,
@@ -31373,8 +31443,9 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
             // List is a type and not a builtin fn, so its constructors need their own arms.
             // They sit above every declaration rung, as the builtin constructors below do, so a
             // program that declares `List_new` cannot type this call as its own function.
-            if obj_name == "List" && obj_is_value == 0 && method == "new" { return tc_list_new_ctor(node) }
-            if obj_name == "List" && obj_is_value == 0 && method == "with_capacity" { return tc_list_with_capacity_ctor(node) }
+            let head_type = tc_static_head_type(static_head)
+            if obj_name == "List" && obj_is_value == 0 && method == "new" { return tc_static_ctor_answer(head_type, node, "{obj_written}.{method}", tc_list_new_ctor(node)) }
+            if obj_name == "List" && obj_is_value == 0 && method == "with_capacity" { return tc_static_ctor_answer(head_type, node, "{obj_written}.{method}", tc_list_with_capacity_ctor(node)) }
             // Only the namespaced `channel.new[T]` builds a channel, so the static spelling gets
             // the bare call's refusal. The recovery type keeps the uses of the value quiet.
             if obj_name == "Channel" && obj_is_value == 0 && method == "new" && tc_names_type_without_call_form(obj_name) {
@@ -31387,9 +31458,9 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                     return tc_error_recovery_tid()
                 }
                 if (obj_name == "Map" || obj_name == "Set") && method == "new" && node_type_params(node) != -1 {
-                    return tc_container_ctor_from_type_args(node, obj_name)
+                    return tc_static_ctor_answer(head_type, node, "{obj_written}.{method}", tc_container_ctor_from_type_args(node, obj_name))
                 }
-                let bs_ret = tc_builtin_static_ret(obj_name, method)
+                let bs_ret = tc_static_ctor_answer(head_type, node, "{obj_written}.{method}", tc_builtin_static_ret(obj_name, method))
                 if method == "new" { tc_note_open_ctor_key(node, bs_ret) }
                 if bs_ret >= 0 { return bs_ret }
             }
@@ -31417,7 +31488,7 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                 }
                 if tc_method_trait_count(obj_name, method) >= 2 && tc_method_distinct_trait_count(obj_name, method) == 1 {
                     let st_key = tc_method_distinct_trait_names(obj_name, method)
-                    let st_tid = lookup_named_type(obj_name)
+                    let st_tid = if head_type != -1 { head_type } else { lookup_named_type(obj_name) }
                     if !tc_is_conversion_trait(st_key) && st_tid != -1 {
                         let st_ims = tc_impls_of_trait_on(st_key, st_tid, [])
                         if st_ims.len() >= 2 { return tc_instance_ambiguity(node, "{obj_name}.{method}", obj_name, st_key, method, st_ims) }
@@ -31430,7 +31501,7 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                         nr_note_call_decl(node, fnsig_pool.get(q_sig).unwrap().decl)
                         // The impl's signature still says `Self`; the call names the type.
                         let q_ret = fnsig_pool.get(q_sig).unwrap().ret
-                        let self_tid = lookup_named_type(obj_name)
+                        let self_tid = if head_type != -1 { head_type } else { lookup_named_type(obj_name) }
                         if self_tid == -1 {
                             let _ = check_arg_shapes("{obj_name}.{method}", q_sig, node_args(node), 0, node)
                             return q_ret
@@ -31440,12 +31511,27 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                         return substitute_typevar_tid(q_ret, self_bind)
                     }
                 }
-                let static_sig_name = "{obj_name}_{method}"
-                let static_sig = tc_call_view_sig(lookup_fnsig(static_sig_name))
+                let static_sig = tc_call_view_sig(tc_static_head_sig(static_head, method))
                 if static_sig != -1 {
-                    nr_note_call_decl(node, fnsig_pool.get(static_sig).unwrap().decl)
-                    let _ = check_arg_shapes("{obj_name}.{method}", static_sig, node_args(node), 0, node)
-                    return fnsig_pool.get(static_sig).unwrap().ret
+                    let static_decl = fnsig_pool.get(static_sig).unwrap().decl
+                    if static_head.decl >= 0 && static_decl >= 0 && node_is_pub(static_decl) == 0 && !tc_same_module(node_module(static_decl), nr_current_module) {
+                        diag_error_at("PrivateItemAccess", PRIVATE_ITEM_ACCESS, "cannot access private function `{node_name(static_decl)}` from another module", node, "mark the function as `pub` in its module")
+                        return tc_error_recovery_tid()
+                    }
+                    nr_note_call_decl(node, static_decl)
+                    let static_args = check_arg_shapes("{obj_name}.{method}", static_sig, node_args(node), 0, node)
+                    let static_ret = fnsig_pool.get(static_sig).unwrap().ret
+                    // What the function builds as the alias's target holds to the alias's
+                    // arguments, as a constructor's result does.
+                    if head_type != -1 && static_ret >= 0 && tc_tid_decl_node(static_ret) >= 0 && tc_tid_decl_node(static_ret) == tc_tid_decl_node(head_type) {
+                        let built = substitute_typevar_tid(static_ret, build_typevar_binds(static_sig, static_args, 0))
+                        if tc_unify(built, head_type) == 0 {
+                            tc_error_at_code("`{obj_written}.{method}` builds `{type_to_str(head_type)}`, but its arguments say `{type_to_str(built)}`", node,
+                                "TypeError", TYPE_ERROR, "change the arguments to match the alias")
+                            return tc_error_recovery_tid()
+                        }
+                    }
+                    return static_ret
                 }
                 // From/TryFrom key each impl apart (tc_mangle_impl_fnsig), because one target
                 // carries several: lib/std/int_conv.bl declares try_from on I8 from Int, I32
@@ -31457,7 +31543,8 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                 if tc_conversion_trait_of(method) != "" {
                     let ff_args = node_args(node)
                     if ff_args != -1 && sublist_length(ff_args) == 1 {
-                        return tc_static_conversion(node, obj_name, method, tc_infer_unhinted(sublist_get(ff_args, 0)))
+                        let named = if head_type != -1 { head_type } else { resolve_alias_tid(resolve_type_name(obj_name)) }
+                        return tc_static_conversion(node, obj_name, named, method, tc_infer_unhinted(sublist_get(ff_args, 0)))
                     }
                 }
             }
@@ -32105,9 +32192,7 @@ fn tc_defer_conversion(node: Int, im: Int, source: Int, target: Int) -> Bool {
 // declared impl answers with its method's return, Self read as that target. The impl's
 // binders take what the source fills in, and a binder the source leaves open gets a fresh
 // metavar, so a bare generic qualifier (`Box.from(xs)`) answers `Box[Int]` for a List[Int].
-fn tc_static_conversion(node: Int, obj_name: Str, method: Str, src_t: Int) -> Int ! TypeCheck.Resolve, Diag.Report {
-    // An alias qualifier converts to the type it names, as an alias source does.
-    let named = resolve_alias_tid(resolve_type_name(obj_name))
+fn tc_static_conversion(node: Int, obj_name: Str, named: Int, method: Str, src_t: Int) -> Int ! TypeCheck.Resolve, Diag.Report {
     if named < 0 { return -1 }
     let trait_name = tc_conversion_trait_of(method)
     let named_target = tc_static_conversion_target(trait_name, src_t, named)
@@ -32198,7 +32283,10 @@ fn tc_static_conversion_target(trait_name: Str, src_t: Int, named: Int) -> Int {
     let hint = if tc_construct_hint < 0 { -1 } else { tc_conversion_target_of(trait_name, tc_construct_hint) }
     let decl = tc_tid_decl_node(named)
     if hint < 0 || decl < 0 || tc_tid_decl_node(hint) != decl { return named }
+    // A head an alias closed leaves no argument for the annotation to name.
+    if tc_tid_struct_arg_count(named) != 0 && tc_tid_has_unbound_metavar(named) == 0 && tc_tid_has_bare_typevar(named) == 0 { return named }
     if tc_conversion_side_settled(src_t) && tc_tid_has_unbound_metavar(src_t) == 0 && tc_conversion_impl_for(trait_name, src_t, hint) == -1 { return named }
+    if tc_unify(named, hint) == 0 { return named }
     hint
 }
 

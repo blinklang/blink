@@ -1,0 +1,402 @@
+// An alias and its target are one type (sections/03_types.md), so a static call through an alias
+// finds what the target declares and gives what the target gives.
+
+import std.json
+import std.process.{ChildEnd}
+import compile_test_helpers.{compile_and_capture, run_xmod, scratch_root}
+
+trait Mk {
+    fn mk() -> Self
+}
+
+type T1 {
+    x: Int
+}
+impl Mk for T1 {
+    fn mk() -> T1 { T1 { x: 1 } }
+}
+type T1A = T1
+type T1Chain = T1Mid
+type T1Mid = T1
+
+type E1 {
+    A
+    B(Int)
+}
+impl Mk for E1 {
+    fn mk() -> E1 { E1.B(3) }
+}
+type EA = E1
+
+@derive(Deserialize, Serialize)
+type J {
+    x: Int
+}
+type JA = J
+
+type T2 {
+    x: Int
+}
+fn T2_sh(a: T2) -> Int { a.x + 1 }
+type T2A = T2
+
+type Color {
+    Red = "red"
+    Blue = "blue"
+}
+type ColorA = Color
+
+type F = Float
+type CC = Char
+type L[T] = List[T]
+type LI = List[Int]
+type M[K, V] = Map[K, V]
+type St[X] = Set[X]
+type B2 = Bytes
+
+test "a trait's associated function through an alias of a struct or an enum" {
+    let a = T1A.mk()
+    assert_eq(a.x, 1)
+    let b: T1A = T1Chain.mk()
+    assert_eq(b.x, 1)
+    let e = EA.mk()
+    assert_eq(match e {
+        E1.A => 0
+        E1.B(n) => n
+    }, 3)
+}
+
+test "a derived static through an alias" {
+    let j = JA.from_json("\{\"x\": 4}").unwrap()
+    assert_eq(j.x, 4)
+    let c = ColorA.from_str("blue")
+    assert_eq(c, Some(Color.Blue))
+}
+
+test "a function named by convention after the target through an alias" {
+    assert_eq(T2A.sh(T2 { x: 1 }), 2)
+}
+
+test "a builtin's static through an alias" {
+    let u: U64 = 4607182418800017408
+    assert_eq(F.from_bits(u), 1.0)
+    assert_eq(CC.from_code_point(65).unwrap(), 'A')
+    let l: L[Int] = L.new()
+    assert_eq(l.len(), 0)
+    let li: LI = LI.with_capacity(4)
+    assert_eq(li.len(), 0)
+    let m: M[Str, Int] = M.new()
+    assert_eq(m.len(), 0)
+    let s: St[Int] = St.new()
+    assert_eq(s.len(), 0)
+    let b = B2.new()
+    assert_eq(b.len(), 0)
+}
+
+test "a value named like the target does not take the call" {
+    let T1 = 3
+    let a = T1A.mk()
+    assert_eq(a.x + T1, 4)
+}
+
+test "an impl written over the alias's name stays callable through it" {
+    let r = compile_and_capture(#"
+trait Mk { fn mk() -> Self }
+type P { x: Int }
+type PA = P
+impl Mk for PA { fn mk() -> PA { P { x: 1 } } }
+fn main() {
+    let a = PA.mk()
+    assert_eq(a.x, 1)
+}
+"#, "_static_alias_own_name")
+    assert(!r.contains("\"severity\":\"error\""), r)
+    assert(!r.contains("\"severity\":\"ice\""), r)
+}
+
+test "a function by the alias's name does not answer a static call through the alias" {
+    refused_with("UnresolvedMethod", #"
+type P { x: Int }
+type PA = P
+fn PA_sh(v: Int) -> P { P { x: v } }
+fn main() {
+    let b = PA.sh(2)
+    io.println("{b.x}")
+}
+"#, "_static_alias_own_name_fn")
+}
+
+test "a method the target does not declare is the error the target gives" {
+    let r = compile_and_capture(#"
+type P { x: Int }
+type PA = P
+fn main() {
+    let _a = PA.nope()
+}
+"#, "_static_alias_unknown")
+    assert(r.contains("UnresolvedMethod"), r)
+    assert(!r.contains("\"severity\":\"ice\""), r)
+}
+
+test "a wrong argument through an alias is the error the target gives" {
+    let r = compile_and_capture(#"
+type F = Float
+fn main() {
+    let _a = F.from_bits("x")
+}
+"#, "_static_alias_bad_arg")
+    assert(r.contains("TypeError"), r)
+    assert(!r.contains("\"severity\":\"ice\""), r)
+}
+
+test "an alias from another module reaches a target this file does not import" {
+    let helper = #"
+pub trait Mk { fn mk() -> Self }
+pub type Hid { x: Int }
+impl Mk for Hid { fn mk() -> Hid { Hid { x: 5 } } }
+pub type HidA = Hid
+pub type Own { y: Int }
+pub type OwnA = Own
+pub fn Own_sh(v: Int) -> Own { Own { y: v } }
+"#
+    let entry = #"
+import shapes.kinds.{HidA, OwnA}
+fn main() {
+    let a = HidA.mk()
+    io.println("{a.x}")
+    let b = OwnA.sh(6)
+    io.println("{b.y}")
+}
+"#
+    let r = run_xmod(entry, "shapes", "kinds", helper, "static_through_alias_xmod")
+    assert(r.exit_code == 0, "compile or run failed: {r.out}{r.err_out}")
+    assert_eq(r.out, "5\n6\n")
+}
+
+test "an alias of a namesake reaches the type its own module means" {
+    let helper = #"
+pub trait Mk { fn mk() -> Self }
+pub type T { x: Int }
+impl Mk for T { fn mk() -> T { T { x: 7 } } }
+pub type TA = T
+"#
+    let entry = #"
+import shapes.kinds.{TA}
+type T { y: Int }
+fn main() {
+    let a = TA.mk()
+    io.println("{a.x}")
+    let b = T { y: 8 }
+    io.println("{b.y}")
+}
+"#
+    let r = run_xmod(entry, "shapes", "kinds", helper, "static_alias_namesake_xmod")
+    assert(r.exit_code == 0, "compile or run failed: {r.out}{r.err_out}")
+    assert_eq(r.out, "7\n8\n")
+}
+
+fn refused_with(code: Str, src: Str, fixture: Str) ! FS.Delete, FS.Write, Process.Spawn, FS.Read, Env.Read {
+    let r = compile_and_capture(src, fixture)
+    assert(r.contains(code), r)
+    assert(!r.contains("\"severity\":\"ice\""), r)
+}
+
+test "a constructor through an alias builds the alias's target" {
+    let li = LI.new()
+    assert_eq(li.len(), 0)
+    let lc = LI.with_capacity(2)
+    assert_eq(lc.len(), 0)
+    let mut open = L.new()
+    open.push("a")
+    assert_eq(open.len(), 1)
+    refused_with("TypeError", #"
+type L = List[Int]
+fn main() {
+    let mut x = L.new()
+    x.push("a")
+    io.println("{x.len()}")
+}
+"#, "_static_alias_list_element")
+    refused_with("TypeError", #"
+type L = List[Int]
+fn main() {
+    let mut x = L.with_capacity(2)
+    x.push("a")
+    io.println("{x.len()}")
+}
+"#, "_static_alias_list_capacity_element")
+    refused_with("TypeError", #"
+type L = List[Int]
+fn main() {
+    let x: List[Str] = L.new()
+    io.println("{x.len()}")
+}
+"#, "_static_alias_list_annotation")
+    refused_with("TypeError", #"
+type L = List[Int]
+fn main() {
+    let x = L.new[Str]()
+    io.println("{x.len()}")
+}
+"#, "_static_alias_list_type_argument")
+    refused_with("TypeError", #"
+type M = Map[Str, Int]
+fn main() {
+    let mut x = M.new()
+    x.insert(1, "b")
+    io.println("{x.len()}")
+}
+"#, "_static_alias_map_arguments")
+}
+
+test "a conversion through an alias converts to the alias's arguments" {
+    let r = compile_and_capture(#"
+type B[T] { v: T }
+impl[T] From[T] for B[T] { fn from(x: T) -> B[T] { B { v: x } } }
+type BS = B[Str]
+fn main() {
+    let a = BS.from("a")
+    io.println(a.v)
+}
+"#, "_static_alias_conversion_holds")
+    assert(!r.contains("\"severity\":\"error\""), r)
+    assert(!r.contains("\"severity\":\"ice\""), r)
+    refused_with("NoConversionImpl", #"
+type B[T] { v: T }
+impl[T] From[T] for B[T] { fn from(x: T) -> B[T] { B { v: x } } }
+type BS = B[Str]
+fn main() {
+    let b = BS.from(1)
+    io.println("{b.v}")
+}
+"#, "_static_alias_conversion_argument")
+    refused_with("TypeError", #"
+type B[T] { v: T }
+impl[T] From[T] for B[T] { fn from(x: T) -> B[T] { B { v: x } } }
+type BS = B[Str]
+fn main() {
+    let b: B[Int] = BS.from("a")
+    io.println("{b.v}")
+}
+"#, "_static_alias_conversion_annotation")
+}
+
+test "a conversion through an alias of a builtin is the refusal of a missing impl" {
+    refused_with("NoConversionImpl", "type L = List[Int]\nfn main() \{ let _x = L.from(1) \}\n", "_static_alias_from_list")
+    refused_with("NoConversionImpl", "type O = Option[Int]\nfn main() \{ let _x = O.from(1) \}\n", "_static_alias_from_option")
+    refused_with("NoConversionImpl", "type R = Result[Int, Str]\nfn main() \{ let _x = R.from(1) \}\n", "_static_alias_from_result")
+}
+
+test "a function by the target's name counts only in the module that declares the target" {
+    let helper = #"
+pub type T { x: Int }
+pub type A = T
+pub fn T_near() -> Int { 4 }
+"#
+    let foreign = #"
+import shapes.kinds.{A}
+fn T_mk() -> Int { 5 }
+fn main() { io.println("{A.mk()}") }
+"#
+    let r = run_xmod(foreign, "shapes", "kinds", helper, "static_alias_foreign_fn_xmod")
+    assert(r.exit_code != 0, "compiled: {r.out}")
+    assert("{r.out}{r.err_out}".contains("UnresolvedMethod"), "{r.out}{r.err_out}")
+    let by_alias = #"
+import shapes.kinds.{A}
+fn A_mk() -> Int { 6 }
+fn main() { io.println("{A.mk()}") }
+"#
+    let ba = run_xmod(by_alias, "shapes", "kinds", helper, "static_alias_foreign_alias_fn_xmod")
+    assert(ba.exit_code != 0, "compiled: {ba.out}")
+    assert("{ba.out}{ba.err_out}".contains("UnresolvedMethod"), "{ba.out}{ba.err_out}")
+    let home = #"
+import shapes.kinds.{A}
+fn main() { io.println("{A.near()}") }
+"#
+    let h = run_xmod(home, "shapes", "kinds", helper, "static_alias_home_fn_xmod")
+    assert(h.exit_code == 0, "compile or run failed: {h.out}{h.err_out}")
+    assert_eq(h.out, "4\n")
+}
+
+// Runs a package whose files are each a path under src/ and its text, with src/main.bl as the
+// entry. Answers what the program prints, or the build's output after "failed: ".
+fn run_modules(tag: Str, files: List[(Str, Str)]) -> Str ! Process.Spawn, FS.Write, Env.Read {
+    let root = "{scratch_root()}/{tag}"
+    let _mk = process.run("mkdir", ["-p", "{root}/src"]).unwrap()
+    fs.write("{root}/blink.toml", "[package]\nname = \"{tag}\"\nversion = \"0.1.0\"\n").unwrap()
+    for f in files { fs.write("{root}/src/{f.0}", f.1).unwrap() }
+    let r = process.run("build/blink", ["run", "-o", "{root}/main", "{root}/src/main.bl"]).unwrap()
+    if r.end == ChildEnd.Exited(0) { r.out } else { "failed: {r.out}{r.err_out}" }
+}
+
+test "a function by the alias's name in any module does not answer a call through the alias" {
+    assert_eq(run_modules("static_alias_reader_fn", [
+        ("m.bl", "pub type T \{ x: Int \}\npub fn T_mk() -> Int \{ 1 \}\ntype A = T\npub fn from_m() -> Int \{ A.mk() \}\n"),
+        ("main.bl", "import m.\{from_m\}\nfn A_mk() -> Int \{ 99 \}\nfn main() \{ io.println(\"\{from_m()\}\") \}\n"),
+    ]), "1\n")
+    assert_eq(run_modules("static_alias_reader_builtin_fn", [
+        ("m.bl", "type L = List[Int]\npub fn mk_l() -> L \{ L.new() \}\n"),
+        ("main.bl", "import m.\{mk_l\}\nfn L_new() -> List[Int] \{ [1, 2, 3] \}\nfn main() \{ io.println(\"\{mk_l().len()\}\") \}\n"),
+    ]), "0\n")
+    assert_eq(run_modules("static_alias_over_imported_namesake", [
+        ("m.bl", "pub type T \{ x: Int \}\npub fn T_mk() -> Int \{ 1 \}\npub fn zero() -> Int \{ 0 \}\n"),
+        ("main.bl", "import m.\{zero\}\ntype U \{ x: Int \}\nfn U_mk() -> Int \{ 2 \}\ntype T = U\nfn main() \{ io.println(\"\{T.mk()\} \{zero()\}\") \}\n"),
+    ]), "2 0\n")
+    assert_eq(run_modules("static_alias_third_module_pub_fn", [
+        ("m.bl", "pub type U \{ x: Int \}\npub fn U_mk() -> Int \{ 1 \}\npub type A = U\n"),
+        ("n.bl", "pub type V \{ x: Int \}\npub fn V_mk() -> Int \{ 2 \}\npub type B = V\npub fn A_mk() -> Int \{ 3 \}\n"),
+        ("main.bl", "import m.\{A\}\nimport n.\{B\}\nfn main() \{ io.println(\"\{A.mk()\} \{B.mk()\}\") \}\n"),
+    ]), "1 2\n")
+    assert_eq(run_modules("static_alias_third_module_private_fn", [
+        ("m.bl", "pub type U \{ x: Int \}\npub fn U_mk() -> Int \{ 1 \}\npub type A = U\n"),
+        ("n.bl", "fn A_mk() -> Int \{ 3 \}\npub fn call_it() -> Int \{ A_mk() \}\n"),
+        ("main.bl", "import m.\{A\}\nimport n.\{call_it\}\nfn main() \{ io.println(\"\{A.mk()\} \{call_it()\}\") \}\n"),
+    ]), "1 3\n")
+    assert_eq(run_modules("static_alias_third_module_imported_fn", [
+        ("m.bl", "pub type T \{ x: Int \}\npub fn T_who() -> Int \{ 1 \}\npub type A = T\n"),
+        ("n.bl", "pub fn A_who() -> Int \{ 2 \}\n"),
+        ("main.bl", "import m.\{A\}\nimport n.\{A_who\}\nfn main() \{ io.println(\"\{A.who()\} \{A_who()\}\") \}\n"),
+    ]), "1 2\n")
+}
+
+test "an alias of a namesake calls the function its own module declares" {
+    assert_eq(run_modules("static_alias_namesake_targets", [
+        ("m.bl", "pub type T \{ x: Int \}\nfn T_mk() -> Int \{ 10 \}\ntype A = T\npub fn from_m() -> Int \{ A.mk() \}\n"),
+        ("n.bl", "pub type T \{ x: Int \}\nfn T_mk() -> Int \{ 20 \}\ntype A = T\npub fn from_n() -> Int \{ A.mk() \}\n"),
+        ("main.bl", "import m.\{from_m\}\nimport n.\{from_n\}\nfn main() \{ io.println(\"\{from_m()\} \{from_n()\}\") \}\n"),
+    ]), "10 20\n")
+}
+
+test "a public alias does not open a private function of the target's module" {
+    let pv = run_modules("static_alias_private_fn", [
+        ("m.bl", "pub type T \{ x: Int \}\nfn T_pv() -> T \{ T \{ x: 8 \} \}\npub type A = T\n"),
+        ("main.bl", "import m.\{A\}\nfn main() \{ io.println(\"\{A.pv().x\}\") \}\n"),
+    ])
+    assert(pv.starts_with("failed: ") && pv.contains("PrivateItemAccess"), pv)
+    let pt = run_modules("static_alias_private_type_fn", [
+        ("m.bl", "type Pv \{ x: Int \}\nfn Pv_mk() -> Pv \{ Pv \{ x: 9 \} \}\npub type A = Pv\n"),
+        ("main.bl", "import m.\{A\}\nfn main() \{ io.println(\"\{A.mk().x\}\") \}\n"),
+    ])
+    assert(pt.starts_with("failed: ") && pt.contains("PrivateItemAccess"), pt)
+}
+
+test "a generic function by the target's name builds at the alias's arguments" {
+    refused_with("TypeError", #"
+type B[T] { v: T }
+fn B_mk[X](v: X) -> B[X] { B { v: v } }
+type BS = B[Str]
+fn main() {
+    let b = BS.mk(1)
+    io.println("{b.v}")
+}
+"#, "_static_alias_generic_fn_argument")
+    refused_with("TypeError", #"
+type B[T] { v: T }
+fn B_mk[X](v: X) -> B[X] { B { v: v } }
+type BS = B[Str]
+fn main() {
+    let a: B[Int] = BS.mk(1)
+    io.println("{a.v}")
+}
+"#, "_static_alias_generic_fn_annotation")
+}
