@@ -3077,8 +3077,9 @@ let mut tc_ud_blamed: Map[Int, Int] = Map()
 // [sig, self_offset, n, tid..., open...] (tc_note_generic_call),
 // [-1, im, n, tid...] (tc_note_conversion_call), [-1, -1, 1, ctor] (tc_note_open_ctor_key),
 // [-2, -1, 0] (tc_note_deferred_conversion), [-3, -1, 0] (tc_note_open_variant),
-// [-4, sig, tid, n, binder..., enclosing fn] (tc_note_fn_value) or
-// [-5, closure, 0] (tc_note_void_return).
+// [-4, sig, tid, n, binder..., enclosing fn] (tc_note_fn_value),
+// [-5, closure, 0] (tc_note_void_return) or
+// [-6, im, n, tid..., call, receiver] (tc_note_static_impl_call).
 // self_views maps a signature to its view for calls in its own body, and view_sigs maps back
 // (tc_call_view_sig).
 type CallFacts {
@@ -3089,9 +3090,13 @@ type CallFacts {
     self_views: Map[Int, Int]
     view_sigs: Map[Int, Int]
     hash_aliases_above: List[Int]
+    // The instance a static call through a type head reads its head as, and the impl binder
+    // tids that call settled. Mono reads the binders, so they outlive the walk.
+    static_head_insts: Map[Int, Int]
+    static_head_binders: Map[Int, List[Int]]
 }
 fn new_call_facts() -> CallFacts {
-    CallFacts { open_calls: [], open_group: Map(), open_tids: [], reported: Map(), self_views: Map(), view_sigs: Map(), hash_aliases_above: [] }
+    CallFacts { open_calls: [], open_group: Map(), open_tids: [], reported: Map(), self_views: Map(), view_sigs: Map(), hash_aliases_above: [], static_head_insts: Map(), static_head_binders: Map() }
 }
 let mut tc_calls: CallFacts = new_call_facts()
 
@@ -3449,6 +3454,88 @@ fn tc_note_conversion_call(im: Int, call_node: Int, binds: Map[Str, Int]) {
     }
 }
 
+// A static call through a type head whose impl has binders, as the group
+// [-6, im, n, tid..., call, receiver]. The head is no value, so it is the key, and the call
+// node keeps its own group. A binder that the call's value or its receiver carries is judged
+// with that value (tc_note_open_variant); the flush blames the head for any other binder.
+fn tc_note_static_impl_call(head: Int, im: Int, call_node: Int, recv: Int, binds: Map[Str, Int]) {
+    if tc_boundary_check_active == 0 || head < 0 { return }
+    let binders = node_impl_binders(im)
+    if binders == -1 || sublist_length(binders) == 0 { return }
+    if !tc_calls.open_group.contains_key(head) { tc_calls.open_calls.push(head) }
+    tc_calls.open_group.insert(head, tc_calls.open_tids.len())
+    tc_calls.open_tids.push(-6)
+    tc_calls.open_tids.push(im)
+    tc_calls.open_tids.push(sublist_length(binders))
+    for i in 0..sublist_length(binders) {
+        let tp = sublist_get(binders, i)
+        tc_calls.open_tids.push(binds.get(tc_binder_key(tp, node_name(tp))) ?? -1)
+    }
+    tc_calls.open_tids.push(call_node)
+    tc_calls.open_tids.push(recv)
+}
+
+fn tc_open_group_is_static_impl(g: Int) -> Bool {
+    tc_calls.open_tids.get(g).unwrap() == -6
+}
+
+// The binds of an impl's binders by name, as tc_check_impl_bounds reads them, at the types
+// `tids` give them in header order. A slot with no judgeable type is left out.
+fn tc_impl_binds_by_name(im: Int, tids: List[Int]) -> Map[Str, Int] {
+    let mut out: Map[Str, Int] = Map()
+    let binders = node_impl_binders(im)
+    if binders == -1 { return out }
+    for i in 0..sublist_length(binders) {
+        let t = tc_resolve(tids.get(i) ?? -1)
+        if t >= 0 && tc_tid_is_judgeable(t) != 0 { out.insert(node_name(sublist_get(binders, i)), t) }
+    }
+    out
+}
+
+// The flush half of tc_note_static_impl_call. A binder that inference filled holds the impl's
+// bounds at that type, as a binder an annotation fills does at a generic call.
+fn tc_ud_flush_static_impl_call(head: Int, g: Int) ! TypeCheck.Resolve, Diag.Report {
+    let im = tc_calls.open_tids.get(g + 1).unwrap()
+    let binders = node_impl_binders(im)
+    let n = tc_calls.open_tids.get(g + 2).unwrap()
+    let call_node = tc_calls.open_tids.get(g + 3 + n).unwrap()
+    let recv = tc_calls.open_tids.get(g + 4 + n).unwrap()
+    let call_t = if tc_node_judged_as_value(call_node) { tc_lookup_node_tid(call_node) } else { -1 }
+    let recv_t = if tc_node_judged_as_value(recv) { tc_lookup_node_tid(recv) } else { -1 }
+    let mut all: List[Int] = []
+    let mut names: List[Str] = []
+    let mut tids: List[Int] = []
+    for pi in 0..n {
+        let tid = tc_calls.open_tids.get(g + 3 + pi).unwrap()
+        all.push(tid)
+        if tid >= 0 && tc_tid_has_unbound_metavar(tid) != 0 && tc_ud_already_blamed(tid) == 0 {
+            let r = tc_resolve(tid)
+            if (call_t < 0 || tc_occurs_in(r, call_t) == 0) && (recv_t < 0 || tc_occurs_in(r, recv_t) == 0) {
+                names.push(node_name(sublist_get(binders, pi)))
+                tids.push(tid)
+            }
+        }
+    }
+    if names.len() == 0 {
+        let end_line = if node_end_line(call_node) > node_line(call_node) { node_end_line(call_node) } else { node_line(call_node) }
+        if diag_errors_in_lines(diag_file_for_node(call_node), node_line(call_node), end_line) > 0 { return }
+        tc_check_impl_bounds(im, tc_impl_binds_by_name(im, all), call_node)
+        return
+    }
+    tc_calls.reported.insert(head, 1)
+    let trait_args = tc_impl_trait_args(im)
+    let mut shown_args: List[Str] = []
+    for t in trait_args { shown_args.push(tc_type_str(t)) }
+    let args_str = if shown_args.len() == 0 { "" } else { "[{shown_args.join(", ")}]" }
+    let impl_head = "impl {tc_trait_shown(tc_impl_trait_id(im))}{args_str} for {tc_type_str(tc_impl_recv_tids.get(im) ?? -1)}"
+    let mut msg = "type parameter {tc_ticked_names(names)} of `{impl_head}` is unbound at this call and nothing supplies it"
+    if names.len() > 1 {
+        msg = "type parameters {tc_ticked_names(names)} of `{impl_head}` are unbound at this call and nothing supplies them"
+    }
+    diag_error_at("CannotInferType", CANNOT_INFER_TYPE, msg, head, "call the function through a type alias that names the type's arguments, such as `type Named = {tc_type_str(tc_impl_recv_tids.get(im) ?? -1)}` with each parameter written")
+    for t in tids { tc_ud_mark_blamed(t) }
+}
+
 // A conversion whose impl is chosen once inference is done (tc_defer_conversion). The flush
 // reads the call's types off its nodes, not off this walk: a later walk of a receiver such as
 // `[]` gives it a fresh metavariable, and the node's type is the one codegen reads.
@@ -3508,6 +3595,11 @@ fn tc_note_void_return(ret: Int, cls: Int) {
 
 fn tc_open_group_is_variant(g: Int) -> Bool {
     tc_calls.open_tids.get(g).unwrap() == -3
+}
+
+fn tc_node_judged_as_value(node: Int) -> Bool {
+    let g = if node < 0 { -1 } else { tc_calls.open_group.get(node) ?? -1 }
+    g >= 0 && tc_open_group_is_variant(g)
 }
 
 // A reference to a generic function's name, with the type it has as a value and the metavars
@@ -3770,6 +3862,10 @@ fn tc_ud_flush_calls() ! TypeCheck.Resolve, Diag.Report {
         if tc_calls.reported.contains_key(call_node) { continue }
         if tc_open_group_is_conversion(g) {
             tc_ud_flush_conversion_call(call_node, g)
+            continue
+        }
+        if tc_open_group_is_static_impl(g) {
+            tc_ud_flush_static_impl_call(call_node, g)
             continue
         }
         if sig < 0 { continue }
@@ -5720,6 +5816,10 @@ fn tc_check_user_bounds(decl: Int, idx: Int, concrete: Int, binds: Map[Str, Int]
 fn tc_check_impl_bounds_at_call(decl: Int, ibinds: Map[Str, Int], node: Int) ! TypeCheck.Resolve, Diag.Report {
     let im = tc_method_block.get(decl) ?? -1
     if im == -1 || node_kind(im) != NodeKind.ImplBlock { return }
+    tc_check_impl_bounds(im, ibinds, node)
+}
+
+fn tc_check_impl_bounds(im: Int, ibinds: Map[Str, Int], node: Int) ! TypeCheck.Resolve, Diag.Report {
     let binders = node_impl_binders(im)
     let mut carriers: List[Int] = []
     let mut i = 0
@@ -15665,6 +15765,75 @@ pub fn tc_static_owner(written: Str) -> Str {
 // with no alias, where the owner's own name says the type.
 fn tc_static_head_type(head: StaticHead) -> Int {
     if head.alias == -1 { -1 } else { tc_alias_target_open(head.alias) }
+}
+
+// The instance a static call reads its head as. A bare generic head (`B.mk()`, `List.make()`)
+// names the type with its arguments open, and the call's arguments or the expected type settle
+// them (§3c.2), so each open argument is a metavariable. The call keeps the one it got first:
+// it is walked again after its statement was, and a later use settles the first walk's set.
+fn tc_static_head_instance(head_type: Int, obj_name: Str, node: Int) -> Int ! TypeCheck.Resolve, Diag.Report {
+    if head_type != -1 { return head_type }
+    match tc_calls.static_head_insts.get(node) {
+        Some(t) => return t
+        None => {}
+    }
+    let named = resolve_alias_tid(resolve_type_name(obj_name))
+    if named < 0 { return named }
+    let inst = tc_fresh_builtin_args(tc_fresh_instance_tid(named))
+    tc_calls.static_head_insts.insert(node, inst)
+    inst
+}
+
+// A compiler-known generic type named bare, such as `Option`, as an instance whose
+// arguments are fresh metavariables. The bare name resolves with Unknown in each slot, and
+// Unknown unifies with every type, so it would settle nothing.
+fn tc_fresh_builtin_args(tid: Int) -> Int {
+    let t = tc_resolve(tid)
+    if t < 0 || t >= ty_pool.len() { return tid }
+    let ty = ty_pool.get(t).unwrap()
+    let k = type_kind(t)
+    if k == TyKind.List && ty.inner1 == TYPE_UNKNOWN { return make_list_type(make_metavar()) }
+    if k == TyKind.Set && ty.inner1 == TYPE_UNKNOWN { return make_set_type(make_metavar()) }
+    if k == TyKind.Option && ty.inner1 == TYPE_UNKNOWN { return make_option_type(make_metavar()) }
+    if k == TyKind.Map && ty.inner1 == TYPE_UNKNOWN && ty.inner2 == TYPE_UNKNOWN { return make_map_type(make_metavar(), make_metavar()) }
+    if k == TyKind.Result && ty.inner1 == TYPE_UNKNOWN && ty.inner2 == TYPE_UNKNOWN { return make_result_type(make_metavar(), make_metavar()) }
+    tid
+}
+
+// The binds a trait method's impl gets at a static call through a type head: `Self` is the
+// head's instance, and each impl binder is a metavariable that the impl's receiver type,
+// unified with that instance, fills. The binder tids are recorded on the call in the impl's
+// header order, because the head is no value and mono has no receiver to read them from. A
+// call walked again keeps its first set, as its head instance does.
+fn tc_static_impl_binds(sig: Int, inst: Int, node: Int) -> Map[Str, Int] ! TypeCheck.Resolve, Diag.Report {
+    let mut binds = tc_self_binds(inst)
+    let im = tc_method_block.get(fnsig_pool.get(sig).unwrap().decl) ?? -1
+    if im == -1 { return binds }
+    let binders = node_impl_binders(im)
+    if binders == -1 || sublist_length(binders) == 0 { return binds }
+    let mut tids = tc_static_head_binders(node)
+    if tids.len() != sublist_length(binders) {
+        let fresh = tc_impl_fresh_binders(im)
+        let recv = tc_impl_recv_tids.get(im) ?? -1
+        if recv >= 0 { let _ = tc_unify(substitute_typevar_tid(recv, fresh), inst) }
+        tids = []
+        for i in 0..sublist_length(binders) {
+            let tp = sublist_get(binders, i)
+            tids.push(fresh.get(tc_binder_key(tp, node_name(tp))) ?? -1)
+        }
+        tc_calls.static_head_binders.insert(node, tids)
+    }
+    for i in 0..sublist_length(binders) {
+        let tp = sublist_get(binders, i)
+        binds.insert(tc_binder_key(tp, node_name(tp)), tids.get(i).unwrap())
+    }
+    binds
+}
+
+// The impl binder tids a static call through a type head settled, in the impl's header
+// order, or [] when the call is not one.
+pub fn tc_static_head_binders(node: Int) -> List[Int] {
+    tc_calls.static_head_binders.get(node) ?? []
 }
 
 // The function that a call `Head.method` names by the target's name. §2.12.3 lets only the
@@ -31734,27 +31903,41 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                 if static_trait != "" && tc_method_trait_count(obj_name, method) == 1 {
                     let q_sig = tc_call_view_sig(lookup_fnsig(tc_impl_method_stem(obj_name, static_trait, method)))
                     if q_sig != -1 {
-                        nr_note_call_decl(node, fnsig_pool.get(q_sig).unwrap().decl)
-                        // The impl's signature still says `Self`; the call names the type.
-                        let q_ret = fnsig_pool.get(q_sig).unwrap().ret
-                        let self_tid = if head_type != -1 { head_type } else { lookup_named_type(obj_name) }
+                        let q_decl = fnsig_pool.get(q_sig).unwrap().decl
+                        nr_note_call_decl(node, q_decl)
+                        let q_args = node_args(node)
+                        let self_tid = tc_static_head_instance(head_type, obj_name, node)
+                        if self_tid < 0 {
+                            let _ = check_arg_shapes("{obj_written}.{method}", q_sig, q_args, 0, node)
+                            return fnsig_pool.get(q_sig).unwrap().ret
+                        }
+                        // The impl's signature still says `Self` and the impl's binders; the
+                        // call names the type, and its arguments or the expected type fill them.
+                        let q_binds = tc_static_impl_binds(q_sig, self_tid, node)
                         // A method's signature leaves its receiver untyped, so `T.sh(1)` would
                         // pass the receiver unchecked. Checked first, the receiver also takes the
-                        // head's type as its hint. A builtin head has no declared type, so the
-                        // receiver is checked against the type its name resolves to.
-                        let recv_tid = if self_tid != -1 { self_tid } else { resolve_alias_tid(resolve_type_name(obj_name)) }
-                        let q_decl = fnsig_pool.get(q_sig).unwrap().decl
-                        let q_args = node_args(node)
-                        if recv_tid >= 0 && tc_fn_decl_takes_self(q_decl) && q_args != -1 && sublist_length(q_args) > 0 && node_kind(sublist_get(q_args, 0)) != NodeKind.NamedArg {
-                            let _ = check_one_arg_shape("{obj_written}.{method}", 0, sublist_get(q_args, 0), recv_tid, false)
+                        // head's type as its hint.
+                        let q_recv = if tc_fn_decl_takes_self(q_decl) && q_args != -1 && sublist_length(q_args) > 0 && node_kind(sublist_get(q_args, 0)) != NodeKind.NamedArg { sublist_get(q_args, 0) } else { -1 }
+                        if q_recv != -1 {
+                            let _ = check_one_arg_shape("{obj_written}.{method}", 0, q_recv, self_tid, false)
                         }
-                        if self_tid == -1 {
-                            let _ = check_arg_shapes("{obj_written}.{method}", q_sig, q_args, 0, node)
-                            return q_ret
+                        // A receiver whose type nothing settles leaves the impl's binders open,
+                        // and no binding receives it, so the flush blames the receiver itself.
+                        if q_recv != -1 { let _ = tc_note_open_variant(q_recv, tc_lookup_node_tid(q_recv)) }
+                        let q_im = tc_method_block.get(q_decl) ?? -1
+                        if q_im != -1 { tc_note_static_impl_call(obj_node, q_im, node, q_recv, q_binds) }
+                        if q_im != -1 && node_kind(q_im) == NodeKind.ImplBlock {
+                            tc_check_impl_bounds(q_im, tc_impl_binds_by_name(q_im, tc_static_head_binders(node)), node)
                         }
-                        let self_bind = tc_self_binds(self_tid)
-                        let _ = check_arg_shapes_with_binds("{obj_written}.{method}", q_sig, q_args, 0, node, self_bind)
-                        return substitute_typevar_tid(q_ret, self_bind)
+                        if node_type_params(node) != -1 {
+                            return tc_call_with_type_args("{obj_written}.{method}", q_sig, node, 0, q_binds)
+                        }
+                        let q_tids = check_arg_shapes_with_binds("{obj_written}.{method}", q_sig, q_args, 0, node, q_binds)
+                        if tc_decl_has_own_type_params(q_decl) != 0 {
+                            tc_check_bounds_for_binds(q_sig, build_typevar_binds(q_sig, q_tids, 0), node)
+                            return substitute_typevar_tid(instantiate_return_type(q_sig, q_tids, node, 0), q_binds)
+                        }
+                        return tc_note_open_variant(node, substitute_typevar_tid(fnsig_pool.get(q_sig).unwrap().ret, q_binds))
                     }
                 }
                 let static_sig = tc_call_view_sig(tc_static_head_sig(static_head, method))
@@ -31765,14 +31948,14 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                         return tc_error_recovery_tid()
                     }
                     nr_note_call_decl(node, static_decl)
-                    let static_args = check_arg_shapes("{obj_name}.{method}", static_sig, node_args(node), 0, node)
-                    let static_ret = fnsig_pool.get(static_sig).unwrap().ret
+                    // `B.mk(x)` is the call `B_mk(x)`, so its own binders are bound as a free
+                    // generic call's are.
+                    let static_ret = tc_check_free_call("{obj_name}.{method}", static_sig, node)
                     // What the function builds as the alias's target holds to the alias's
                     // arguments, as a constructor's result does.
                     if head_type != -1 && static_ret >= 0 && tc_tid_decl_node(static_ret) >= 0 && tc_tid_decl_node(static_ret) == tc_tid_decl_node(head_type) {
-                        let built = substitute_typevar_tid(static_ret, build_typevar_binds(static_sig, static_args, 0))
-                        if tc_unify(built, head_type) == 0 {
-                            tc_error_at_code("`{obj_written}.{method}` builds `{type_to_str(head_type)}`, but its arguments say `{type_to_str(built)}`", node,
+                        if tc_unify(static_ret, head_type) == 0 {
+                            tc_error_at_code("`{obj_written}.{method}` builds `{type_to_str(head_type)}`, but its arguments say `{type_to_str(static_ret)}`", node,
                                 "TypeError", TYPE_ERROR, "change the arguments to match the alias")
                             return tc_error_recovery_tid()
                         }
@@ -31933,7 +32116,7 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                                 if ak != TyKind.Unknown {
                                     binds.insert(tpname, arg_tid)
                                     binds.insert(tpkey, arg_tid)
-                                } else if tc_is_unbound_metavar(arg_tid) != 0 {
+                                } else if tc_is_unbound_metavar(tc_resolve(arg_tid)) != 0 {
                                     // The instance param is an as-yet-unpinned
                                     // metavar α (`let b = GBox { s: Set() }`). Bind the
                                     // field's typevar to THAT SAME α so the field-access
@@ -31942,6 +32125,8 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                                     // whole instance resolves. Without this the field
                                     // type is a fresh disconnected Set[T] and the pin is
                                     // lost (→ spurious E0301 on the recovery idiom).
+                                    // An α unified with another open β is a link to
+                                    // it, still open, so it is read through the link.
                                     binds.insert(tpname, arg_tid)
                                     binds.insert(tpkey, arg_tid)
                                 }

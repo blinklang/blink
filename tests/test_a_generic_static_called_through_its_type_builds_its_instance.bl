@@ -1,0 +1,235 @@
+// A static called through a type head binds its type parameters the same way a free generic call
+// does: from the arguments, from the expected type, or from both. A parameter that nothing binds
+// is the under-determined type error at check (sections/03_types.md, Under-Determined Types).
+
+import compile_test_helpers.{compile_and_capture, compile_and_run}
+
+fn runs_and_prints(src: Str, fixture: Str, want: Str) ! FS.Delete, FS.Write, Process.Spawn, FS.Read, Env.Read {
+    let r = compile_and_run(src, fixture)
+    assert(r.exit_code == 0, "{r.out}{r.err_out}")
+    assert_eq(r.out.trim(), want)
+}
+
+fn refused_with(code: Str, src: Str, fixture: Str) ! FS.Delete, FS.Write, Process.Spawn, FS.Read, Env.Read {
+    let r = compile_and_capture(src, fixture)
+    assert(r.contains(code), r)
+    assert(!r.contains("\"severity\":\"ice\""), r)
+}
+
+test "a generic type-scoped fn called through its type binds its parameter from the argument" {
+    runs_and_prints(#"
+type B[T] { v: T }
+fn B_mk[X](v: X) -> B[X] { B { v: v } }
+fn main() {
+    let b = B.mk("s")
+    let n = B.mk(4)
+    io.println("{b.v} {n.v + 1}")
+}
+"#, "_gstatic_free_fn_from_arg", "s 5")
+}
+
+test "a generic type-scoped fn called through an alias binds each parameter" {
+    runs_and_prints(#"
+type B[X, Y] { a: X, b: Y }
+fn B_mk3[P1, P2](a: P1, b: P2) -> B[P1, P2] { B { a: a, b: b } }
+type Q = B[Int, Float]
+fn main() {
+    let q = Q.mk3(3, 2.5)
+    io.println("{q.a} {q.b}")
+}
+"#, "_gstatic_free_fn_alias", "3 2.5")
+}
+
+test "a trait static of a generic impl takes its parameter from the expected type" {
+    runs_and_prints(#"
+trait Mk { fn mk() -> Self }
+type B[X] { xs: List[X] }
+impl[X] Mk for B[X] { fn mk() -> B[X] { B { xs: [] } } }
+fn main() {
+    let b: B[Str] = B.mk()
+    let mut c: B[Int] = B.mk()
+    c.xs.push(7)
+    io.println("{b.xs.len()} {c.xs.get(0).unwrap()}")
+}
+"#, "_gstatic_trait_static_expected", "0 7")
+}
+
+test "a trait static of a generic impl takes its parameter from a later use" {
+    runs_and_prints(#"
+trait Mk { fn mk() -> Self }
+type B[X] { xs: List[X] }
+impl[X] Mk for B[X] { fn mk() -> B[X] { B { xs: [] } } }
+fn main() {
+    let mut b = B.mk()
+    b.xs.push("a")
+    io.println("{b.xs.len()}")
+}
+"#, "_gstatic_trait_static_later_use", "1")
+}
+
+test "a trait static of a generic impl through an alias builds the alias's instance" {
+    runs_and_prints(#"
+trait Empty { fn empty() -> Self }
+type Stack[T] { items: List[T] }
+impl[T] Empty for Stack[T] { fn empty() -> Stack[T] { Stack { items: [] } } }
+type SI = Stack[Int]
+fn main() {
+    let s: Stack[Str] = Stack.empty()
+    let mut t = SI.empty()
+    t.items.push(3)
+    io.println("{s.items.len()} {t.items.get(0).unwrap()}")
+}
+"#, "_gstatic_trait_static_alias", "0 3")
+}
+
+test "a trait static of a generic impl on a builtin head builds its instance" {
+    runs_and_prints(#"
+trait Make { fn make() -> Self }
+impl[T] Make for List[T] { fn make() -> List[T] { [] } }
+fn main() {
+    let mut xs: List[Int] = List.make()
+    xs.push(2)
+    io.println("{xs.len()}")
+}
+"#, "_gstatic_trait_static_builtin_head", "1")
+}
+
+test "a trait static of a generic impl with its own parameter binds both" {
+    runs_and_prints(#"
+trait Fill { fn fill[T](t: T, n: Int) -> Self }
+type B[X] { xs: List[X], tag: Str }
+impl[X] Fill for B[X] { fn fill[T](t: T, n: Int) -> B[X] { B { xs: [], tag: "{t}:{n}" } } }
+fn main() {
+    let b: B[Int] = B.fill("k", 2)
+    let c: B[Str] = B.fill(9, 1)
+    io.println("{b.tag} {c.tag} {b.xs.len()}")
+}
+"#, "_gstatic_trait_static_own_param", "k:2 9:1 0")
+}
+
+test "a self method of a generic impl called through its type takes its parameter from the receiver" {
+    runs_and_prints(#"
+trait Sh { fn sh(self) -> Int }
+type B[X] { xs: List[X] }
+impl[X] Sh for B[X] { fn sh(self) -> Int { self.xs.len() } }
+fn main() {
+    let b: B[Str] = B { xs: ["a", "b"] }
+    io.println("{B.sh(b)} {B.sh(B { xs: [1] })}")
+}
+"#, "_gstatic_self_method_recv", "2 1")
+}
+
+test "a generic trait method called through its type binds its own parameter" {
+    runs_and_prints(#"
+type S { n: Int }
+trait Mk { fn m[T](self, a: T, b: U8) -> T }
+impl Mk for S { fn m[T](self, a: T, b: U8) -> T {
+    let _n = self.n
+    let _b = b
+    a } }
+fn main() {
+    let r: Int = S.m(S { n: 1 }, 300, 1)
+    let s = S.m(S { n: 2 }, "x", 2)
+    io.println("{r} {s}")
+}
+"#, "_gstatic_trait_method_own_param", "300 x")
+}
+
+test "a trait static of a generic impl that nothing binds is under-determined" {
+    refused_with("CannotInferType", #"
+trait Mk { fn mk() -> Self }
+type B[X] { xs: List[X] }
+impl[X] Mk for B[X] { fn mk() -> B[X] { B { xs: [] } } }
+fn main() {
+    let b = B.mk()
+    io.println("{b.xs.len()}")
+}
+"#, "_gstatic_trait_static_unbound")
+}
+
+test "a self method of a generic impl called through its type on an open receiver is under-determined" {
+    refused_with("CannotInferType", #"
+trait Sh { fn sh(self) -> Int }
+type B[X] { xs: List[X] }
+impl[X] Sh for B[X] { fn sh(self) -> Int { self.xs.len() } }
+fn main() { io.println("{B.sh(B { xs: [] })}") }
+"#, "_gstatic_self_method_open_recv")
+}
+
+test "a generic type-scoped fn whose parameter only the result names is under-determined" {
+    refused_with("CannotInferType", #"
+type B[T] { xs: List[T] }
+fn B_empty[X]() -> B[X] { B { xs: [] } }
+fn main() {
+    let b = B.empty()
+    io.println("{b.xs.len()}")
+}
+"#, "_gstatic_free_fn_unbound")
+}
+
+test "a trait static whose impl parameter neither the arguments nor the result name is under-determined" {
+    refused_with("CannotInferType", #"
+trait Ct { fn count() -> Int }
+type B[X] { xs: List[X] }
+impl[X] Ct for B[X] { fn count() -> Int {
+    let ys: List[X] = []
+    ys.len() + 1 } }
+fn main() { io.println("{B.count()}") }
+"#, "_gstatic_trait_static_no_mention")
+}
+
+test "a trait static of a generic impl holds the impl's bounds at the type the expected type gives" {
+    refused_with("TraitBoundNotSatisfied", #"
+trait Mk { fn mk() -> Self }
+type B[X] { xs: List[X] }
+type P { n: Int }
+impl[X: Ord] Mk for B[X] { fn mk() -> B[X] { B { xs: [] } } }
+fn main() {
+    let b: B[P] = B.mk()
+    io.println("{b.xs.len()}")
+}
+"#, "_gstatic_impl_bound_expected")
+}
+
+test "a self method of a generic impl called through its type holds the impl's bounds at the receiver" {
+    refused_with("TraitBoundNotSatisfied", #"
+trait Sh { fn sh(self) -> Int }
+type B[X] { xs: List[X] }
+type P { n: Int }
+impl[X: Ord] Sh for B[X] { fn sh(self) -> Int { self.xs.len() } }
+fn main() {
+    let b: B[P] = B { xs: [P { n: 1 }] }
+    io.println("{B.sh(b)}")
+}
+"#, "_gstatic_impl_bound_receiver")
+}
+
+test "a generic trait method called through its type holds its own parameter's bounds" {
+    refused_with("TraitBoundNotSatisfied", #"
+type S { n: Int }
+type P { n: Int }
+trait Mk { fn m[T: Ord](self, a: T) -> T }
+impl Mk for S { fn m[T: Ord](self, a: T) -> T {
+    let _n = self.n
+    a } }
+fn main() {
+    let r = S.m(S { n: 1 }, P { n: 3 })
+    io.println("{r.n}")
+}
+"#, "_gstatic_own_bound")
+}
+
+test "a generic trait method called through its type takes explicit type arguments" {
+    runs_and_prints(#"
+type S { n: Int }
+trait Mk { fn m[T](self, a: T) -> T }
+impl Mk for S { fn m[T](self, a: T) -> T {
+    let _n = self.n
+    a } }
+fn main() {
+    let s = S { n: 1 }
+    let k = S.m[Int](s, 5)
+    io.println("{k + 1}")
+}
+"#, "_gstatic_explicit_type_args", "6")
+}
