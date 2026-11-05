@@ -25,7 +25,7 @@ import cname.{
 }
 import cg_print.{print_fn, print_fn_decl, print_kops_table, print_kops_table_decl, print_typedef_blocks}
 import cg_reg.{cg_reg_tid_for_decl, cg_reg_global_decls, cg_reg_module_of}
-import mono.{instances}
+import mono.{instance_node_tids, instances}
 import cg_call.{
     cg_call_element_from_runtime, cg_call_element_to_slot, cg_call_stdlib_declares,
     cg_call_stdlib_symbol, cg_call_equality_fn, cg_call_container_ctor, cg_call_order_sign_helper,
@@ -1574,8 +1574,8 @@ fn kops_table_decl(rec: LayoutRecord) {
 // which is the only reader that knows which units a program is cut into. The hash and the
 // equality are static: the adapters the table holds are the only callers, and they are
 // written beside it.
-pub fn cg_derive_emit_key_tables(key_nodes: List[Int]) ! Diag.Report {
-    for n in key_nodes { tuple_key_table(n) }
+pub fn cg_derive_emit_key_tables(uses: List[KeyTableUse]) ! Diag.Report {
+    for u in uses { tuple_key_table(u) }
 }
 
 // Declared in every unit and defined in one, the rule every derived method already
@@ -1583,12 +1583,9 @@ pub fn cg_derive_emit_key_tables(key_nodes: List[Int]) ! Diag.Report {
 // holds the table, and the reference is emitted inside a function body, so a declaration
 // that arrived with the bodies would arrive after its own first use.
 fn key_table_decls() ! Diag.Report {
-    for n in cg_derive_key_table_nodes() {
-        // The key's typedef is the driver's: it hands each key to the typedef walk with the
-        // spelled carriers (cg_derive_key_table_keys), so the shared declarations hold it.
-        let key = tuple_key_of(n)
-        if key >= 0 { kops_table_decl(layout_of(key, Position.Param)) }
-    }
+    // The key's typedef is the driver's: it hands each key to the typedef walk with the
+    // spelled carriers (cg_derive_key_table_keys), so the shared declarations hold it.
+    for u in cg_derive_key_table_uses() { kops_table_decl(layout_of(u.key, Position.Param)) }
 }
 
 // The keys the program USES, not the tuples it merely names. Layout answers with a table
@@ -1596,59 +1593,83 @@ fn key_table_decls() ! Diag.Report {
 // it, so walking the type pool instead would write a hash and an equality for every pair a
 // program holds and call neither.
 //
-// A node rather than a type id: it carries the source position every producer below needs,
-// and a structural type has none of its own. The first node that spells each table is
-// enough, because the table is named from the type and two nodes spelling one type ask for
-// one table. The nodes go in load order, which a load that kept sources does not give by id.
-pub fn cg_derive_key_table_nodes() -> List[Int] {
+// A node carries the source position every producer below needs, and a structural type has
+// none of its own. The first node that spells each table is enough, because the table is
+// named from the type and two nodes spelling one type ask for one table. The nodes go in
+// load order, which a load that kept sources does not give by id.
+//
+// A node inside a generic body keys on a tuple over the body's type parameters, which has
+// no table; each instance of the body keys on its own tuple, so the instance supplies the
+// key and the node only the position. `owner` is what the driver's scope rule places the
+// table by: the node for a body the program writes once, and the generic declaration for an
+// instance, which is written wherever that declaration's instances are. The instance tables
+// go after the others in table-name order: the instance table is in the order the program
+// first named each instance, which an edit to another module can change.
+pub type KeyTableUse {
+    node: Int
+    key: Int
+    owner: Int
+}
+
+pub fn cg_derive_key_table_uses() -> List[KeyTableUse] {
     let mut seen: Map[Str, Int] = Map()
-    let mut out: List[Int] = []
+    let mut out: List[KeyTableUse] = []
     let ranges = parser_live_ranges()
     let mut r = 0
     while r < ranges.len() {
         let mut n = ranges.get(r).unwrap()
         while n < ranges.get(r + 1).unwrap() {
-            let key = tuple_key_of(n)
-            if key >= 0 {
-                let table = layout_of(key, Position.Param).kops_table
-                if table != "" && !seen.contains_key(table) {
-                    seen.insert(table, 1)
-                    out.push(n)
-                }
-            }
+            let key = tuple_key_of(tc_lookup_node_tid(n))
+            if unclaimed_key_table(seen, key) != "" { out.push(KeyTableUse { node: n, key: key, owner: n }) }
             n = n + 1
         }
         r = r + 2
     }
+    let mut by_table: Map[Str, KeyTableUse] = Map()
+    let table = instances()
+    let mut row = 0
+    while row < table.len() {
+        let owner = table.get(row).unwrap().base_decl_node
+        for (n, tid) in instance_node_tids(row) {
+            let key = tuple_key_of(tid)
+            let claimed = unclaimed_key_table(seen, key)
+            if claimed != "" { by_table.insert(claimed, KeyTableUse { node: n, key: key, owner: owner }) }
+        }
+        row = row + 1
+    }
+    for name in by_table.keys().sort() { out.push(by_table.get(name).unwrap()) }
     out
 }
 
-// The tuple type each of key_nodes keys on, in their order. A Map is not a carrier, so the
-// typedef walk reaches no key through the map: the driver hands it these as well, or a
-// program that spells the pair nowhere else names a table over a type no unit declares.
-pub fn cg_derive_key_table_keys(key_nodes: List[Int]) -> List[Int] {
+// The name of the table `key` needs when no earlier use has claimed it, or "".
+fn unclaimed_key_table(seen: Map[Str, Int], key: Int) -> Str {
+    if key < 0 { return "" }
+    let table = layout_of(key, Position.Param).kops_table
+    if table == "" || seen.contains_key(table) { return "" }
+    seen.insert(table, 1)
+    table
+}
+
+// The tuple type each use keys on, in their order. A Map is not a carrier, so the typedef
+// walk reaches no key through the map: the driver hands it these as well, or a program that
+// spells the pair nowhere else names a table over a type no unit declares.
+pub fn cg_derive_key_table_keys(uses: List[KeyTableUse]) -> List[Int] {
     let mut out: List[Int] = []
-    for n in key_nodes {
-        let key = tuple_key_of(n)
-        if key >= 0 { out.push(key) }
-    }
+    for u in uses { out.push(u.key) }
     out
 }
 
-// The name of the table each of key_nodes spells, in their order.
-pub fn cg_derive_key_table_names(key_nodes: List[Int]) -> List[Str] {
+// The name of the table each use spells, in their order.
+pub fn cg_derive_key_table_names(uses: List[KeyTableUse]) -> List[Str] {
     let mut out: List[Str] = []
-    for n in key_nodes {
-        let key = tuple_key_of(n)
-        out.push(if key >= 0 { layout_of(key, Position.Param).kops_table } else { "" })
-    }
+    for u in uses { out.push(layout_of(u.key, Position.Param).kops_table) }
     out
 }
 
-// The tuple a keyed container at this node keys on, or -1. Map and Set are the two kinds
+// The tuple a keyed container of type `tid0` keys on, or -1. Map and Set are the two kinds
 // with a key, and child 0 is that key for both.
-fn tuple_key_of(n: Int) -> Int {
-    let tid = tc_tid_resolved(tc_lookup_node_tid(n))
+fn tuple_key_of(tid0: Int) -> Int {
+    let tid = tc_tid_resolved(tid0)
     if tid < 0 { return -1 }
     let k = tc_tid_kind(tid)
     if k != TyKind.Map && k != TyKind.Set { return -1 }
@@ -1661,9 +1682,9 @@ fn tuple_key_of(n: Int) -> Int {
 // One structural key's table, over the methods the key and its elements need. The two
 // symbols are spelled from the typedef name, which is the name the table is spelled from,
 // so a non-empty table means both are spellable and neither needs a second check here.
-fn tuple_key_table(n: Int) ! Diag.Report {
-    let tid = tuple_key_of(n)
-    if tid < 0 { return }
+fn tuple_key_table(u: KeyTableUse) ! Diag.Report {
+    let tid = u.key
+    let n = u.node
     let rec = layout_of(tid, Position.Param)
     if rec.kops_table == "" { return }
     if !tuple_methods(tid, n) { return }

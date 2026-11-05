@@ -454,7 +454,7 @@ pool, so the program has the cold sources at other node ids, in another id order
 child calls `loader_keep_sources_for_build`: it keeps no source and records no write, but
 keeps the load order, so `node_load_rank` and `parser_live_ranges` still give load order.
 These places read node order in the build:
-- `cg_decl_spelled_carrier_tids` and `cg_derive_key_table_nodes` walk the pool. They walk
+- `cg_decl_spelled_carrier_tids` and `cg_derive_key_table_uses` walk the pool. They walk
   `parser_live_ranges()`, which skips the dead ranges and gives the live ones in load order;
 - `unit_sources` (`src/cli.bl`) sorts the source ranges by node for `ir_track_sources`,
   whose lookup is a binary search, and maps each read source back to its load index for the
@@ -555,7 +555,7 @@ Mutations that make the reused-check build test fail, each alone:
   again;
 - `cg_decl_spelled_carrier_tids` walks the pool in id order: `blink.types.h` and the
   `.emit-record` of each unit differ from a cold build's;
-- `cg_derive_key_table_nodes` walks the pool in id order: `__main__.c`, `blink.types.h` and
+- `cg_derive_key_table_uses` walks the pool in id order: `__main__.c`, `blink.types.h` and
   the `.emit-record` differ;
 - keep the edited source's old range in `loaded_inputs`: C compilation fails in unit `early`;
 - the build child drops the load order (`loader_keep_sources(false)` in place of
@@ -598,7 +598,7 @@ compares them, or prints one:
 | site | how a warm check keeps the cold order |
 |---|---|
 | `check_embed_targets` (`src/compiler.bl:235`) | walks `parser_live_ranges()`, which are in load order |
-| `cg_decl_spelled_carrier_tids`, `cg_derive_key_table_nodes` (`src/cg_decl.bl`, `src/cg_derive.bl`) | walk `parser_live_ranges()`; the build child keeps the load order |
+| `cg_decl_spelled_carrier_tids`, `cg_derive_key_table_uses` (`src/cg_decl.bl`, `src/cg_derive.bl`) | walk `parser_live_ranges()`; the build child keeps the load order |
 | `unit_sources` (`src/cli.bl`) | sorts the ranges by node for the lookup, and maps a read source back to its load index |
 | `tc_conversion_impl_for` (`src/typecheck.bl:609`) | picks the lowest `node_load_rank` |
 | `tc_unclaimed_call_nodes` (`src/typecheck.bl:14190`) | sorts by `node_load_rank` when the order moved |
@@ -623,7 +623,7 @@ the build path*.
 | site | verdict |
 |---|---|
 | `src/cg_decl.bl:192` `cg_decl_spelled_carrier_tids` | live ranges |
-| `src/cg_derive.bl:1391` `cg_derive_key_table_nodes` | live ranges |
+| `src/cg_derive.bl:1391` `cg_derive_key_table_uses` | live ranges |
 | `src/cli.bl:2067` `unit_sources`, `:2114` `ir_track_sources`, `:2171` `unit_uses` | live ranges: sorted by node for the lookup, then mapped back to the load index |
 | `src/compiler.bl:235` `check_embed_targets` | live ranges |
 | `src/typecheck.bl:17413` `desugar_sealed_ops_calls` | live ranges |

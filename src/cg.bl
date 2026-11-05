@@ -47,7 +47,7 @@ import cg_decl.{
 }
 import cg_derive.{
     cg_derive_emit_bodies, cg_derive_emit_decls, cg_derive_emit_key_tables, cg_derive_key_table_keys,
-    cg_derive_key_table_names, cg_derive_key_table_nodes, cg_derive_reset,
+    cg_derive_key_table_names, cg_derive_key_table_uses, cg_derive_reset, KeyTableUse,
 }
 import ir.{ir_begin_body, ir_block, ir_note_source, ir_pos_begin, ir_pos_take, ir_reset, ir_sources_pause, ir_sources_resume, ir_span, ir_verify}
 import mono.{instances, named_instance_rows, program_calls_trace_log, program_spawns, set_named_instance_rows}
@@ -373,10 +373,10 @@ fn globals_in_scope(cfg: CgConfig, module_key: Str, declare_only: Bool) -> List[
 // signature names them again. Answers the globals that could not take their value on the
 // definition line, in declaration order, for the entry point to assign before anything
 // else runs; a header declares no definition and so never has any to answer.
-fn emit_declarations(cfg: CgConfig, header_guard: Str, self_header: Str, define_ev: Bool, globals_extern: Bool, shared: Bool, key_table_nodes: List[Int]) -> List[Int] ! Diag.Report {
+fn emit_declarations(cfg: CgConfig, header_guard: Str, self_header: Str, define_ev: Bool, globals_extern: Bool, shared: Bool, key_tables: List[KeyTableUse]) -> List[Int] ! Diag.Report {
     cg_decl_emit_prologue(cfg.user_tu_mode != 0, cfg.archive_over_std != 0, defines_runtime_storage(cfg), false, header_guard, self_header, false)
     if links_compiler_archive(cfg) { print_include(c_layer_archive_header_name()) }
-    cg_decl_emit_typedefs_over(program_carrier_tids(key_table_nodes))
+    cg_decl_emit_typedefs_over(program_carrier_tids(key_tables))
     if define_ev {
         emit_ev(cfg)
     } else if cfg.archive_over_std != 0 {
@@ -758,13 +758,13 @@ fn lower_thunk_body(n: Int) -> Int ! Diag.Report {
 
 // The definition half. Test blocks are not here: they are written beside the entry shim,
 // which is a different unit under the per-module mode.
-fn emit_definitions(cfg: CgConfig, module_key: Str, shared: Bool, key_table_nodes: List[Int]) ! Diag.Report {
-    emit_definitions_of(cfg, module_key, fns_in_scope(cfg, module_key, shared, false), methods_in_scope(cfg, module_key, shared, false), key_table_nodes, true)
+fn emit_definitions(cfg: CgConfig, module_key: Str, shared: Bool, key_tables: List[KeyTableUse]) ! Diag.Report {
+    emit_definitions_of(cfg, module_key, fns_in_scope(cfg, module_key, shared, false), methods_in_scope(cfg, module_key, shared, false), key_tables, true)
 }
 
 // The definitions of scope_fns and scope_methods. Of the files of a module's unit, only the
 // one that passes with_derived writes the module's @derive bodies and key tables.
-fn emit_definitions_of(cfg: CgConfig, module_key: Str, scope_fns: List[Int], scope_methods: List[Int], key_table_nodes: List[Int], with_derived: Bool) ! Diag.Report {
+fn emit_definitions_of(cfg: CgConfig, module_key: Str, scope_fns: List[Int], scope_methods: List[Int], key_tables: List[KeyTableUse], with_derived: Bool) ! Diag.Report {
     let fns = without_on_demand_copies(cfg, module_key, scope_fns)
     let methods = without_on_demand_copies(cfg, module_key, scope_methods)
     // A unit declares every instance it defines, in its own text, ahead of every body.
@@ -784,7 +784,7 @@ fn emit_definitions_of(cfg: CgConfig, module_key: Str, scope_fns: List[Int], sco
     // table's name. The node it is written from only lends the lowering a span, so the table
     // reads no source, and a unit that writes it stays keyed on its own sources.
     let track = ir_sources_pause()
-    cg_derive_emit_key_tables(key_tables_in_scope(cfg, module_key, key_table_nodes))
+    cg_derive_emit_key_tables(key_tables_in_scope(cfg, module_key, key_tables))
     ir_sources_resume(track)
 }
 
@@ -792,10 +792,14 @@ fn emit_definitions_of(cfg: CgConfig, module_key: Str, scope_fns: List[Int], sco
 // an expression, which carries no module of its own, so the module scope rule would place
 // it in no unit at all. The entry unit is the one unit every per-module program has, so it
 // defines each table and every other unit declares it. A one-unit build keeps its filters.
-fn key_tables_in_scope(cfg: CgConfig, module_key: Str, key_table_nodes: List[Int]) -> List[Int] {
-    if module_key == "" { return decls_in_scope(cfg, module_key, key_table_nodes, false) }
-    if module_key == "__main__" { return key_table_nodes }
-    []
+fn key_tables_in_scope(cfg: CgConfig, module_key: Str, key_tables: List[KeyTableUse]) -> List[KeyTableUse] {
+    if module_key == "__main__" { return key_tables }
+    if module_key != "" { return [] }
+    let mut out: List[KeyTableUse] = []
+    for u in key_tables {
+        if decls_in_scope(cfg, module_key, [u.owner], false).len() > 0 { out.push(u) }
+    }
+    out
 }
 
 // ── Test blocks ──────────────────────────────────────────────────────────────
@@ -951,8 +955,8 @@ pub fn generate(program: Int, cfg: CgConfig) -> Str ! Codegen, Diag.Report {
     begin_unit(program)
     cg_trace_set(cfg.trace_codegen != 0)
     let shared = cfg.archive_build_mode != 0
-    let key_table_nodes = cg_derive_key_table_nodes()
-    let deferred = emit_declarations(cfg, "", "", true, false, shared, key_table_nodes)
+    let key_tables = cg_derive_key_table_uses()
+    let deferred = emit_declarations(cfg, "", "", true, false, shared, key_tables)
     print_scope_restore_support()
     cg_eff_register_ffi_scope_guard_support()
     // Pre-scan for the async.scope guard (see unit_uses_async_scope): an archive monolith
@@ -964,7 +968,7 @@ pub fn generate(program: Int, cfg: CgConfig) -> Str ! Codegen, Diag.Report {
         cg_eff_register_async_scope_guard_support()
     }
     cg_stmt_set_debug_mode(cfg.debug_mode != 0)
-    emit_definitions(cfg, "", shared, key_table_nodes)
+    emit_definitions(cfg, "", shared, key_tables)
     // An archive monolith has no entry point: the user TU that links against it owns
     // main(), so neither the test-body table nor the main shim belongs here.
     let init_fns = emit_global_init_fn(cfg, program, deferred)
@@ -983,7 +987,7 @@ pub fn generate(program: Int, cfg: CgConfig) -> Str ! Codegen, Diag.Report {
 pub fn generate_archive_header(program: Int, cfg: CgConfig) -> Str ! Codegen, Diag.Report {
     begin_unit(program)
     let guard = if cfg.archive_over_std != 0 { c_layer_archive_header_guard() } else { c_archive_header_guard() }
-    let _ = emit_declarations(cfg, guard, "", false, true, true, cg_derive_key_table_nodes())
+    let _ = emit_declarations(cfg, guard, "", false, true, true, cg_derive_key_table_uses())
     print_fn_decl(false, layout_of(TYPE_VOID, Position.Return).c_spelling, archive_init_globals_name(cfg), [], false)
     cg_decl_emit_epilogue(guard)
     print_take()
@@ -998,7 +1002,7 @@ pub fn generate_types_header(program: Int, cfg: CgConfig) -> Str ! Codegen, Diag
     begin_unit(program)
     let guard = c_program_types_header_guard()
     cg_decl_emit_prologue(cfg.user_tu_mode != 0, cfg.archive_over_std != 0, false, false, guard, "", false)
-    cg_decl_emit_typedefs_over(program_carrier_tids(cg_derive_key_table_nodes()))
+    cg_decl_emit_typedefs_over(program_carrier_tids(cg_derive_key_table_uses()))
     cg_decl_emit_ev_typedef()
     cg_derive_emit_decls(derived_decls_declared_everywhere())
     types_header_check_queue_drained()
@@ -1035,7 +1039,7 @@ pub type ModuleHeaders {
 // the units, so a driver that emits many units scans once and hands the answers to each.
 // Only codegen runs between the scan and the units, and it adds no node and stamps no type.
 pub type ProgramFacts {
-    key_table_nodes: List[Int]
+    key_tables: List[KeyTableUse]
     carrier_tids: List[Int]
     // The init names the entry unit's shim calls. Finding one lowers another module's
     // globals, so it runs here, before any unit: the entry unit's emit then lowers no code
@@ -1047,8 +1051,8 @@ pub fn program_facts(program: Int, cfg: CgConfig) -> ProgramFacts ! Diag.Report 
     begin_unit(program)
     let init_fns = module_init_fn_names(cfg)
     begin_unit(program)
-    let key_table_nodes = cg_derive_key_table_nodes()
-    ProgramFacts { key_table_nodes: key_table_nodes, carrier_tids: program_carrier_tids(key_table_nodes), entry_init_fns: init_fns }
+    let key_tables = cg_derive_key_table_uses()
+    ProgramFacts { key_tables: key_tables, carrier_tids: program_carrier_tids(key_tables), entry_init_fns: init_fns }
 }
 
 // The carriers whose typedefs the declarations every unit shares hold: each one a node
@@ -1056,9 +1060,9 @@ pub fn program_facts(program: Int, cfg: CgConfig) -> ProgramFacts ! Diag.Report 
 // node's own type, yet its table names it, and the unit that defines the table reads the
 // key's typedef from those shared declarations. The types header writes this list and
 // every other unit marks it written, so both read this one list.
-fn program_carrier_tids(key_table_nodes: List[Int]) -> List[Int] {
+fn program_carrier_tids(key_tables: List[KeyTableUse]) -> List[Int] {
     let mut out = cg_decl_spelled_carrier_tids()
-    for key in cg_derive_key_table_keys(key_table_nodes) { out.push(key) }
+    for key in cg_derive_key_table_keys(key_tables) { out.push(key) }
     out
 }
 
@@ -1246,7 +1250,7 @@ fn emit_module_head(module_key: Str, self_header: Str, cfg: CgConfig, facts: Pro
         cg_eff_register_async_scope_guard_support()
     }
     cg_stmt_set_debug_mode(cfg.debug_mode != 0)
-    emit_definitions_of(cfg, module_key, fns, methods, facts.key_table_nodes, true)
+    emit_definitions_of(cfg, module_key, fns, methods, facts.key_tables, true)
     // After the definitions, which print the closures it names and the scope support it
     // calls, as the one-unit build's init function does.
     if init_body >= 0 {
@@ -1464,7 +1468,7 @@ pub fn entry_unit_facts(program: Int, cfg: CgConfig, facts: ProgramFacts) -> Lis
         let name = node_str_val(t)
         out.push("test {c_test_fn_name(t)} {name.byte_len()} {name}")
     }
-    for name in cg_derive_key_table_names(facts.key_table_nodes) { out.push("table {name}") }
+    for name in cg_derive_key_table_names(facts.key_tables) { out.push("table {name}") }
     out
 }
 
