@@ -17994,6 +17994,12 @@ fn tc_rand_range_start_text(arg: Int, tid: Int) -> Str ! Diag.Report {
     tc_rand_range_end_text(arg, tid)
 }
 
+fn tc_effect_ops_note(root: Str, ops: List[Str]) -> Str {
+    let mut quoted: List[Str] = []
+    for op in ops { quoted.push("`{op}`") }
+    "`{root}` operations are {quoted.join(\", \")}"
+}
+
 // `{handle}.{name}(args)` where `name` is no operation of `root`. A std helper of that name gets
 // a help that names its module and both spellings, and the fix tc_helper_call_plan finds.
 fn tc_report_not_a_handle_op(node: Int, root: Str, name: Str) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
@@ -18005,14 +18011,14 @@ fn tc_report_not_a_handle_op(node: Int, root: Str, name: Str) -> Int ! TypeCheck
         i = i + 1
     }
     let mut ops: List[Str] = []
-    for row in builtin_op_rows(root) { ops.push("`{row.op}`") }
+    for row in builtin_op_rows(root) { ops.push(row.op) }
     let module = builtin_op_helper_module(root, name)
     let plan = if module == "" { HelperCallPlan { help: "", callee: "", action: "", import_at: tc_no_import_edit(), sig: -1 } } else { tc_helper_call_plan(node, root, module, name, arg_tids) }
     tc_method_calls.hard.insert(node, 1)
     // A call the typecheck visits again reports nothing new, and the newest error is then
     // another call's.
     let before = diag_entry_count()
-    diag_error_at_notes("UnresolvedMethod", UNRESOLVED_METHOD, "`{name}` is not an operation of effect `{root}`", node, plan.help, ["`{root}` operations are {ops.join(\", \")}"])
+    diag_error_at_notes("UnresolvedMethod", UNRESOLVED_METHOD, "`{name}` is not an operation of effect `{root}`", node, plan.help, [tc_effect_ops_note(root, ops)])
     if plan.callee != "" && diag_entry_count() > before {
         tc_set_helper_call_fix(node, plan)
         tc_method_calls.helper_fixes.insert(node, HelperFix { diag: diag_entry_count() - 1, sig: plan.sig })
@@ -18024,6 +18030,8 @@ fn tc_report_not_a_handle_op(node: Int, root: Str, name: Str) -> Int ! TypeCheck
 // buries the error.
 let UE_OPS_LISTED_MAX = 8
 
+// cg_reg_effect_ops walks the same order, but the codegen layer imports this module, so this
+// one cannot import it. The help needs the op nodes, for their parameter names.
 fn tc_ue_ops(ed: Int) -> List[Int] {
     let mut ops: List[Int] = []
     let children_sl = node_elements(ed)
@@ -18052,10 +18060,17 @@ fn tc_ue_op_call_text(handle: Str, op: Int) -> Str {
     "{handle}.{node_name(op)}({names.join(\", \")})"
 }
 
-fn tc_ue_call_one_help(handle: Str, ed: Int) -> Str {
-    let ops = tc_ue_ops(ed)
-    if ops.len() == 0 { return "" }
-    "call one of its operations, such as `{tc_ue_op_call_text(handle, ops.get(0).unwrap())}`"
+fn tc_ue_op_named(ops: List[Int], name: Str) -> Int {
+    for op in ops {
+        if node_name(op) == name { return op }
+    }
+    -1
+}
+
+// `what` with a call of the effect's first operation, so the reader sees the form that works.
+fn tc_ue_help_with_a_call(what: Str, handle: Str, ops: List[Int]) -> Str {
+    if ops.len() == 0 { return what }
+    "{what}: call one of its operations, such as `{tc_ue_op_call_text(handle, ops.get(0).unwrap())}`"
 }
 
 // A call through a user effect handle of a name its effect does not declare (§4.4). The
@@ -18073,22 +18088,17 @@ fn tc_report_unknown_ue_op(node: Int, handle: Str, method: Str) -> Int ! TypeChe
     let mut notes: List[Str] = []
     if ops.len() > 0 && ops.len() <= UE_OPS_LISTED_MAX {
         let mut names: List[Str] = []
-        for op in ops { names.push("`{node_name(op)}`") }
-        notes.push("`{root}` operations are {names.join(\", \")}")
+        for op in ops { names.push(node_name(op)) }
+        notes.push(tc_effect_ops_note(root, names))
     }
-    let call_one = tc_ue_call_one_help(handle, ed)
-    let mut what = ""
-    if method == root {
-        what = "`{root}` is the effect of the handle `{handle}`, not an operation"
+    let what = if method == root {
+        "`{root}` is the effect of the handle `{handle}`, not an operation"
+    } else if nr_sub_effect_names(ed).contains(method) {
+        "`{method}` is a sub-effect of `{root}`, not an operation"
     } else {
-        let children_sl = node_elements(ed)
-        let mut ci = 0
-        while children_sl != -1 && ci < sublist_length(children_sl) {
-            if node_name(sublist_get(children_sl, ci)) == method { what = "`{method}` is a sub-effect of `{root}`, not an operation" }
-            ci = ci + 1
-        }
+        ""
     }
-    let help = if what == "" { "" } else if call_one == "" { what } else { "{what}: {call_one}" }
+    let help = if what == "" { "" } else { tc_ue_help_with_a_call(what, handle, ops) }
     tc_method_calls.hard.insert(node, 1)
     diag_error_at_notes("UnresolvedMethod", UNRESOLVED_METHOD, "`{method}` is not an operation of effect `{root}`", node, help, notes)
     tc_error_recovery_tid()
@@ -18110,19 +18120,13 @@ fn nr_names_ue_handle(name: Str) -> Bool {
 // give for the same read.
 fn nr_report_ue_handle_value(node: Int, handle: Str, member: Str) ! Diag.Report {
     let ed = tc_ue_handle_decl(handle)
-    let mut help = "`{handle}` is the handle of effect `{node_name(ed)}`, not a value"
-    let mut op_named = -1
-    for op in tc_ue_ops(ed) {
-        if member != "" && node_name(op) == member { op_named = op }
-    }
-    let call_one = tc_ue_call_one_help(handle, ed)
-    if op_named != -1 {
-        help = "{help}: call the operation, as in `{tc_ue_op_call_text(handle, op_named)}`"
-    } else if call_one != "" {
-        help = "{help}: {call_one}"
-    }
-    tc_errors.push("undefined variable `{handle}`")
-    diag_error_at("UndefinedVariable", UNDEFINED_VARIABLE, "undefined variable `{handle}`", node, help)
+    let ops = tc_ue_ops(ed)
+    let what = "`{handle}` is the handle of effect `{node_name(ed)}`, not a value"
+    let op_named = if member == "" { -1 } else { tc_ue_op_named(ops, member) }
+    let help = if op_named != -1 { "{what}: call the operation, as in `{tc_ue_op_call_text(handle, op_named)}`" } else { tc_ue_help_with_a_call(what, handle, ops) }
+    let message = "undefined variable `{handle}`"
+    tc_errors.push(message)
+    diag_error_at("UndefinedVariable", UNDEFINED_VARIABLE, message, node, help)
 }
 
 // The help and fix for a module function called through a handle. The fix is the first of
