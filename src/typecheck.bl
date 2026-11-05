@@ -1010,9 +1010,18 @@ fn tc_type_declared_in_scope(name: Str) -> Int {
             if tc_prelude_modules.contains_key(m) { return 0 }
             if tc_module_key_is_main(m) != 0 { return tc_module_key_is_main(cur) }
             if m == cur { return 1 }
-            if !is_filtered_for_module(name, m, cur) { 1 } else { 0 }
+            if !is_filtered_for_module(name, m, cur) { 1 } else { tc_import_binds_decl(name, cur, td) }
         }
     }
+}
+
+// Whether an import in `cur` binds `name` to the declaration `td`. A `pub import` passes the
+// declaration on, so a selection from the facade binds it as a selection from its home does.
+fn tc_import_binds_decl(name: Str, cur: Str, td: Int) -> Int {
+    for b in nr_module_imports_built(cur).imports.get(name) ?? [] {
+        if nr_resolve_decl_in_module(b.source_mod, b.member, 0) == td { return 1 }
+    }
+    0
 }
 
 // The compiler-known type an annotation means, or "" when it means a declaration. A
@@ -15614,30 +15623,38 @@ fn tc_static_qualifier(written: Str) -> Str {
 // What the head of a static call means. `owner` is the type whose members the call reads. An
 // alias means its target, so the target owns the call, as it owns an impl written on the alias.
 // `alias` keeps the alias's declaration, which says the arguments of the type the call builds.
-// `decl` is the target's declaration, or -1 when the plain lookup answers.
+// `decl` is the target's declaration, or -1 when the plain lookup answers. `builtin` says the
+// head means a compiler-known type even where the module declares a namesake.
 type StaticHead {
     owner: Str
     alias: Int
     decl: Int
+    builtin: Bool
 }
 
 fn tc_static_head(written: Str) -> StaticHead {
     let q = tc_static_qualifier(written)
+    if tc_name_is_tparam_in_scope(q) != 0 { return StaticHead { owner: q, alias: -1, decl: -1, builtin: false } }
+    // A declaration that takes a compiler-known name in another module, and that this module
+    // does not import, leaves the name to the builtin here, as an annotation reads it. A name
+    // imported from blink.core under another name is the builtin even where the module declares
+    // the plain name, so the written spelling is what this asks about.
+    let core = tc_compiler_known_type_meant(written, -1)
+    if core != "" && tc_is_shadowable_type_name(core) { return StaticHead { owner: core, alias: -1, decl: -1, builtin: true } }
     let alias = tc_alias_decl_of_written(q)
-    if tc_name_is_tparam_in_scope(q) != 0 { return StaticHead { owner: q, alias: -1, decl: -1 } }
     if alias == -1 {
         // A renamed import, or a namesake whose pool name carries its module, is the declared
         // type under another spelling, and that type's own name owns the call.
         let named = tc_head_decl_tid(q)
         let decl = tc_tid_decl_node(named)
-        if decl < 0 || tc_type_name(named) == q { return StaticHead { owner: q, alias: -1, decl: -1 } }
-        return StaticHead { owner: tc_type_name(named), alias: -1, decl: decl }
+        if decl < 0 || tc_type_name(named) == q { return StaticHead { owner: q, alias: -1, decl: -1, builtin: false } }
+        return StaticHead { owner: tc_type_name(named), alias: -1, decl: decl, builtin: false }
     }
     let target = tc_head_decl_tid(q)
     let owner = tc_type_name(target)
     // An impl on an alias of a tuple or a function type stays under the alias's own name.
-    if owner == "" || !tc_type_has_receiver(target) { return StaticHead { owner: q, alias: alias, decl: -1 } }
-    StaticHead { owner: owner, alias: alias, decl: tc_tid_decl_node(target) }
+    if owner == "" || !tc_type_has_receiver(target) { return StaticHead { owner: q, alias: alias, decl: -1, builtin: false } }
+    StaticHead { owner: owner, alias: alias, decl: tc_tid_decl_node(target), builtin: false }
 }
 
 pub fn tc_static_owner(written: Str) -> Str {
@@ -15656,7 +15673,7 @@ fn tc_static_head_type(head: StaticHead) -> Int {
 // method. The name is the declaration's own, because the pool name of a namesake carries its
 // module.
 fn tc_static_head_sig(head: StaticHead, method: Str) -> Int {
-    if head.decl < 0 { return lookup_fnsig("{head.owner}_{method}") }
+    if head.decl < 0 { return tc_undeclared_static_sig(head, method) }
     let home = node_module(head.decl)
     let name = "{node_name(head.decl)}_{method}"
     let own = match nr_module_names.get(home) {
@@ -15667,6 +15684,20 @@ fn tc_static_head_sig(head: StaticHead, method: Str) -> Int {
     if sig == -1 { return -1 }
     let fdecl = fnsig_pool.get(sig).unwrap().decl
     if fdecl >= 0 && !tc_same_module(node_module(fdecl), home) { return -1 }
+    sig
+}
+
+// The static `{owner}_{method}` of a head with no declaration. A function that a module
+// declares beside its own namesake of a compiler-known type is that namesake's static, so a
+// head that means the builtin does not take it.
+fn tc_undeclared_static_sig(head: StaticHead, method: Str) -> Int {
+    let sig = lookup_fnsig("{head.owner}_{method}")
+    if sig == -1 || !head.builtin { return sig }
+    let fdecl = fnsig_pool.get(sig).unwrap().decl
+    if fdecl < 0 { return sig }
+    let fm = node_source_module(fdecl)
+    let shadow = tc_type_decl_nodes.get(if fm == "" { head.owner } else { "{fm}.{head.owner}" }) ?? -1
+    if shadow >= 0 && !tc_prelude_modules.contains_key(node_module(shadow)) && tc_same_module(node_module(shadow), node_module(fdecl)) { return -1 }
     sig
 }
 
@@ -24088,6 +24119,45 @@ fn tc_report_unresolved_method(node: Int, recv: Int, tname: Str, method: Str) ! 
     tc_error_naming_types("UnresolvedMethod", UNRESOLVED_METHOD, "unresolved method `.{method}` on type {tname}", node, tc_unresolved_method_help(k, tname, method, node), [recv])
 }
 
+// A static call names the type's namespace, so the help offers only a static that the same head
+// would answer, never an instance method or a builtin of another type.
+fn tc_report_unresolved_static(node: Int, recv: Int, head: StaticHead, written: Str, method: Str) ! Diag.Report {
+    let near = nearest_name(method, tc_static_names(head))
+    let help = if near != "" {
+        "did you mean `{written}.{near}`?"
+    } else if (method == "display" || method == "to_string") && tc_type_has_display_impl(head.owner) != 0 {
+        // Display's methods take a receiver, so the call is on a value or names the trait.
+        "`{method}` takes a receiver: call it on a value, as `x.{method}()`, or as `Display.display(x)`"
+    } else {
+        ""
+    }
+    tc_error_naming_types("UnresolvedMethod", UNRESOLVED_METHOD, "unresolved method `.{method}` on type {written}", node, help, [recv])
+}
+
+// The functions a static call on `head` resolves to: the type-scoped functions and the trait
+// statics of its impls. Each name is kept only when a call on the head would reach it.
+fn tc_static_names(head: StaticHead) -> List[Str] {
+    let owner = if head.decl >= 0 { node_name(head.decl) } else { head.owner }
+    let prefix = "{owner}_"
+    let mut out: List[Str] = []
+    for fs in fnsig_pool {
+        if fs.name.starts_with(prefix) && !tc_fnsig_takes_receiver(fs, owner) {
+            let own = if fs.decl >= 0 { node_name(fs.decl) } else { fs.name }
+            let short = if own != fs.name { own } else { fs.name.byte_slice(prefix.byte_len(), fs.name.byte_len()) }
+            let reached = tc_static_head_sig(head, short) != -1 || tc_method_trait_count(head.owner, short) == 1
+            if reached && !out.contains(short) { out.push(short) }
+        }
+    }
+    out
+}
+
+// Whether a signature of type `owner` takes a receiver. A signature the compiler makes, such as
+// a derived `clone`, has no declaration, and its first parameter is the type itself.
+fn tc_fnsig_takes_receiver(fs: FnSigEntry, owner: Str) -> Bool {
+    if fs.decl >= 0 { return tc_fn_decl_takes_self(fs.decl) }
+    fs.params_count > 0 && tc_type_name(fnsig_param_list.get(fs.params_start).unwrap()) == owner
+}
+
 // The help line for an unresolved method, first match wins: the note for a binding that hides
 // the built-in `trace.log`, then a note for a renamed or removed method of the type, then the
 // near-miss suggestion, else nothing.
@@ -30024,7 +30094,9 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
         // A local genuinely named `StringBuilder` still wins: it is a value, and a value
         // receiver is not a static call.
         if obj_node != -1 && node_kind(obj_node) == NodeKind.Ident {
-            if node_name(obj_node) == "StringBuilder" && nr_is_defined("StringBuilder") == 0 {
+            // An alias or a renamed import of StringBuilder names the same constructors.
+            let sb_written = node_name(obj_node)
+            if nr_is_defined(sb_written) == 0 && tc_static_owner(sb_written) == "StringBuilder" {
                 if method == "new" { return type_stringbuilder() }
                 // Kept beside `new` rather than folded into get_builtin_fn_ret, which is
                 // keyed on the type name alone and so cannot tell two constructors apart.
@@ -31289,7 +31361,7 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
 
         if obj_node != -1 && node_kind(obj_node) == NodeKind.Ident {
             let obj_written = node_name(obj_node)
-            let static_head = if nr_receiver_has_binding(obj_written) != 0 { StaticHead { owner: obj_written, alias: -1, decl: -1 } } else { tc_static_head(obj_written) }
+            let static_head = if nr_receiver_has_binding(obj_written) != 0 { StaticHead { owner: obj_written, alias: -1, decl: -1, builtin: false } } else { tc_static_head(obj_written) }
             let obj_name = static_head.owner
             if obj_name == "Char" {
                 if method == "from_code_point" {
@@ -31704,24 +31776,29 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                 // Gated on the method NAME rather than on static_trait, to stay independent of
                 // the count == 1 guard above. A miss does not fall through, because the shared
                 // fall-through below re-infers every argument and would report a bad one twice.
-                if tc_conversion_trait_of(method) != "" {
-                    let ff_args = node_args(node)
-                    if ff_args != -1 && sublist_length(ff_args) == 1 {
-                        let named = if head_type != -1 { head_type } else { resolve_alias_tid(resolve_type_name(obj_name)) }
-                        return tc_static_conversion(node, obj_name, named, method, tc_infer_unhinted(sublist_get(ff_args, 0)))
-                    }
+                let ff_args = node_args(node)
+                let ff_count = if ff_args == -1 { 0 } else { sublist_length(ff_args) }
+                let conv_trait = tc_conversion_trait_of(method)
+                if conv_trait != "" && ff_count == 1 {
+                    let named = if head_type != -1 { head_type } else { resolve_alias_tid(resolve_type_name(obj_name)) }
+                    return tc_static_conversion(node, obj_name, named, method, tc_infer_unhinted(sublist_get(ff_args, 0)))
                 }
-                // The namespace of a declared struct or enum answers a head that names it, and
-                // every rung of that namespace is above. The fall-through refuses only a name
-                // that no type declares, so a name that some other type declares would pass
-                // with nothing to call. A type parameter is not the type it shadows.
-                let head_tid = if tc_name_is_tparam_in_scope(obj_name) != 0 || nr_method_name_unresolvable(method) != 0 { -1 } else { tc_head_decl_tid(obj_name) }
-                if tc_tid_decl_node(head_tid) >= 0 && tc_method_resolvable_on_type(type_kind(head_tid), tc_tid_name(head_tid), method) == 0 {
+                // Every rung that a type's namespace has is above, so a head that names a type
+                // and reaches here names a static the type does not have. That holds for a
+                // builtin and an alias head too, and for a name that only some other type
+                // declares. A type parameter is not the type it shadows.
+                let head_tid = if tc_name_is_tparam_in_scope(obj_name) != 0 || nr_method_name_unresolvable(method) != 0 { -1 } else { tc_enum_base_tid(resolve_alias_tid(resolve_type_name(obj_name))) }
+                if head_tid >= 0 {
                     if args_sl != -1 {
                         for a in 0..sublist_length(args_sl) { infer_type(sublist_get(args_sl, a)) }
                     }
                     tc_method_calls.hard.insert(node, 1)
-                    tc_report_unresolved_method(node, head_tid, type_to_str(head_tid), method)
+                    // A conversion takes one argument: the value it converts.
+                    if conv_trait != "" {
+                        tc_error_at("function `{obj_written}.{method}` expects 1 argument(s), got {ff_count}", node)
+                        return tc_error_recovery_tid()
+                    }
+                    tc_report_unresolved_static(node, head_tid, static_head, obj_written, method)
                     return tc_error_recovery_tid()
                 }
             }

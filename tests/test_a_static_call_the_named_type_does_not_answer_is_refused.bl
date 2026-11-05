@@ -1,7 +1,7 @@
 // A static call `T.f()` reads only the namespace of the type its head names. When that type has
 // no `f`, the call is an unresolved method, even when some other type declares `f`.
 
-import compile_test_helpers.{compile_and_capture, run_xmod}
+import compile_test_helpers.{compile_and_capture, compile_and_run, run_xmod, scratch_root}
 
 fn refused_with(code: Str, src: Str, fixture: Str) ! FS.Delete, FS.Write, Process.Spawn, FS.Read, Env.Read {
     let r = compile_and_capture(src, fixture)
@@ -76,4 +76,308 @@ fn main() {
     assert(r.exit_code != 0, all)
     assert(all.contains("UnresolvedMethod"), all)
     assert(!all.contains("internal compiler error"), all)
+}
+
+test "a static call on a struct is refused when only a builtin type answers the name" {
+    refused_with("UnresolvedMethod", #"
+type S { x: Int }
+fn main() {
+    let n = S.len()
+    io.println("{n}")
+}
+"#, "_static_unanswered_struct_len")
+    refused_with("UnresolvedMethod", #"
+type S { x: Int }
+fn main() { S.push(1) }
+"#, "_static_unanswered_struct_push")
+}
+
+test "a static from_str on an enum with no string backing is refused" {
+    refused_with("UnresolvedMethod", #"
+type Day {
+    Mon
+    Tue
+}
+fn main() {
+    let d = Day.from_str("Mon")
+    io.println("{d}")
+}
+"#, "_static_unanswered_enum_from_str")
+}
+
+test "a static call on a builtin type is refused when the type has no such static" {
+    refused_with("UnresolvedMethod", #"
+fn main() {
+    let x = Int.new()
+    io.println("{x}")
+}
+"#, "_static_unanswered_int_new")
+    refused_with("UnresolvedMethod", #"
+fn main() {
+    let x = Str.new()
+    io.println("{x}")
+}
+"#, "_static_unanswered_str_new")
+    refused_with("UnresolvedMethod", #"
+fn main() {
+    let x: Option[Int] = Option.new()
+    io.println("{x ?? 0}")
+}
+"#, "_static_unanswered_option_new")
+    refused_with("UnresolvedMethod", #"
+fn main() {
+    let s: Set[Int] = Set.with_capacity(3)
+    io.println("{s.len()}")
+}
+"#, "_static_unanswered_set_with_capacity")
+    refused_with("UnresolvedMethod", #"
+fn main() {
+    let m: Map[Int, Int] = Map.with_capacity(3)
+    io.println("{m.len()}")
+}
+"#, "_static_unanswered_map_with_capacity")
+}
+
+test "a static call through a tuple alias is refused and names the alias" {
+    let r = compile_and_capture(#"
+type P = (Int, Int)
+fn main() {
+    let p = P.new()
+    io.println("{p.0}")
+}
+"#, "_static_unanswered_tuple_alias")
+    assert(r.contains("UnresolvedMethod"), r)
+    assert(r.contains("on type P"), r)
+    assert(!r.contains("\"severity\":\"ice\""), r)
+}
+
+test "a conversion static with a wrong argument count is an arity error" {
+    let two = compile_and_capture(#"
+fn main() {
+    let x = Int.from(1, 2)
+    io.println("{x}")
+}
+"#, "_static_from_two_args_builtin")
+    assert(two.contains("expects 1 argument(s), got 2"), two)
+    assert(!two.contains("\"severity\":\"ice\""), two)
+    let user = compile_and_capture(#"
+type T { x: Int }
+fn main() {
+    let t: T = T.from(1, 2)
+    io.println("{t.x}")
+}
+"#, "_static_from_two_args_struct")
+    assert(user.contains("expects 1 argument(s), got 2"), user)
+    assert(!user.contains("\"severity\":\"ice\""), user)
+    let none = compile_and_capture(#"
+type T { x: Int }
+fn main() {
+    let t: T = T.from()
+    io.println("{t.x}")
+}
+"#, "_static_from_no_args_struct")
+    assert(none.contains("expects 1 argument(s), got 0"), none)
+    assert(!none.contains("\"severity\":\"ice\""), none)
+}
+
+test "the help of a refused static names only a static of the type" {
+    let r = compile_and_capture(#"
+trait Bk { fn bake(self) -> Int }
+type S { x: Int }
+impl Bk for S { fn bake(self) -> Int { self.x } }
+fn S_make() -> S { S { x: 1 } }
+fn main() {
+    let b = S.take()
+    io.println("{b.x}")
+}
+"#, "_static_unanswered_help_statics_only")
+    assert(r.contains("UnresolvedMethod"), r)
+    assert(!r.contains("bake"), r)
+    assert(r.contains("did you mean `S.make`?"), r)
+    assert(!r.contains("\"severity\":\"ice\""), r)
+}
+
+test "a declared static, a trait static and a conversion still answer" {
+    let r = compile_and_capture(#"
+trait Mk { fn mk() -> Self }
+type W { n: Int }
+impl Mk for W { fn mk() -> W { W { n: 2 } } }
+fn W_make() -> W { W { n: 1 } }
+type T { x: Int }
+impl From[Int] for T { fn from(n: Int) -> T { T { x: n } } }
+fn main() {
+    let a = W_make()
+    let b = W.make()
+    let c = W.mk()
+    let t = T.from(3)
+    let xs: List[Int] = List.new()
+    io.println("{a.n} {b.n} {c.n} {t.x} {xs.len()}")
+}
+"#, "_static_answered_rows")
+    assert(!r.contains("UnresolvedMethod"), r)
+    assert(!r.contains("\"severity\":\"error\""), r)
+}
+
+// A declaration that takes a compiler-known name holds only in its own module and the modules
+// that import it. A static call anywhere else, std included, still reaches the builtin.
+test "a static call on a builtin name answers in a module that does not see another module's shadow" {
+    let helper = #"
+pub type List = Int
+pub type Map = Int
+pub type Set = Int
+
+pub fn bump(l: List) -> List { l + 1 }
+"#
+    let entry = #"
+import geo.sim
+
+fn main() {
+    let mut m: Map[Str, Int] = Map.new()
+    m.insert("a", 1)
+    let mut l: List[Int] = List.with_capacity(2)
+    l.push(sim.bump(1))
+    let mut s: Set[Int] = Set.new()
+    s.insert(3)
+    let mut total = 0
+    for (k, v) in m.entries() { total = total + v + k.len() }
+    io.println("{total} {l.len()} {s.len()}")
+}
+"#
+    let r = run_xmod(entry, "geo", "sim", helper, "static_builtin_past_foreign_shadow_xmod")
+    let all = "{r.out}{r.err_out}"
+    assert(r.exit_code == 0, all)
+    assert(r.out.contains("2 1 1"), all)
+}
+
+test "a static call on a shadowed builtin name is refused in the module that declares the shadow" {
+    let helper = #"
+pub type List = Int
+
+pub fn make() -> List { List.with_capacity(2) }
+"#
+    let entry = #"
+import geo.sim
+
+fn main() { io.println("{sim.make()}") }
+"#
+    let r = run_xmod(entry, "geo", "sim", helper, "static_shadowed_builtin_in_its_module_xmod")
+    let all = "{r.out}{r.err_out}"
+    assert(r.exit_code != 0, all)
+    assert(all.contains("unresolved method `.with_capacity` on type List"), all)
+    assert(!all.contains("internal compiler error"), all)
+}
+
+// A `pub import` passes the declaration on, so a reader that selects the name from the facade
+// has the declaration in scope, as a reader that selects it from the home module does.
+test "a static call through a re-exported alias with a builtin name reaches the alias target" {
+    let tag = "static_reexported_builtin_named_alias_xmod"
+    let home = #"
+pub trait Mk { fn mk() -> Self }
+pub type Span { a: Int }
+pub fn Span_make() -> Span { Span { a: 5 } }
+impl Mk for Span { fn mk() -> Span { Span { a: 6 } } }
+pub type Range = Span
+"#
+    let geo = "{scratch_root()}/{tag}/src/geo"
+    let _mk = process.run("mkdir", ["-p", geo]).unwrap()
+    fs.write("{geo}/m.bl", home).unwrap()
+    let facade = #"
+pub import geo.m.{Range, Mk}
+"#
+    let entry = #"
+import geo.r.{Range, Mk}
+
+fn main() {
+    let s: Range = Range.make()
+    io.println("{s.a} {Range.mk().a}")
+}
+"#
+    let r = run_xmod(entry, "geo", "r", facade, tag)
+    let all = "{r.out}{r.err_out}"
+    assert(r.exit_code == 0, all)
+    assert(r.out.contains("5 6"), all)
+}
+
+// An import of the builtin under another name means the builtin, even where the module also
+// declares the plain name. The module's own `Map_make` is the static of its own `Map`.
+test "a static call through a renamed builtin import does not take the static of a same-module shadow" {
+    refused_with("UnresolvedMethod", #"
+import blink.core.{Map as CoreMap}
+type Map { n: Int }
+fn Map_make() -> Map { Map { n: 5 } }
+fn main() {
+    let m: CoreMap[Str, Int] = CoreMap.make()
+    io.println("{m.len()}")
+}
+"#, "_static_renamed_core_import_past_shadow")
+}
+
+test "the help of a refused static does not offer a derived method that takes a receiver" {
+    let r = compile_and_capture(#"
+@derive(Clone)
+type S { a: Int }
+fn S_make() -> S { S { a: 1 } }
+trait K { fn clonee() -> Self }
+type Q { a: Int }
+impl K for Q { fn clonee() -> Q { Q { a: 1 } } }
+fn main() {
+    let s = S.clonee()
+    io.println("{s.a}")
+}
+"#, "_static_unanswered_help_no_derived_self")
+    assert(r.contains("UnresolvedMethod"), r)
+    assert(!r.contains(".clone`"), r)
+    assert(!r.contains("\"severity\":\"ice\""), r)
+}
+
+test "a display called through its type says that it takes a receiver" {
+    let r = compile_and_capture(#"
+type T { a: Int }
+impl Display for T { fn fmt(self, sb: StringBuilder) { sb.write("t") } }
+fn main() {
+    let t = T { a: 1 }
+    io.println(T.display(t))
+}
+"#, "_static_display_through_type_help")
+    assert(r.contains("UnresolvedMethod"), r)
+    assert(r.contains("`display` takes a receiver"), r)
+    assert(!r.contains("\"severity\":\"ice\""), r)
+}
+
+test "a StringBuilder constructor answers through an alias" {
+    let r = compile_and_run(#"
+type SB = StringBuilder
+fn main() {
+    let b = SB.with_capacity(8)
+    b.write("hi")
+    let c = SB.new()
+    c.write("yo")
+    io.println("{b.to_str()} {c.to_str()}")
+}
+"#, "_static_sb_ctor_through_alias")
+    assert_eq(r.exit_code, 0)
+    assert_eq(r.out.trim(), "hi yo")
+}
+
+test "a StringBuilder constructor through an alias checks its argument" {
+    refused_with("argument 1 of `StringBuilder.with_capacity` expects Int, got Str", #"
+type SB = StringBuilder
+fn main() {
+    let b = SB.with_capacity("x")
+    io.println("{b.len()}")
+}
+"#, "_static_sb_ctor_through_alias_bad_arg")
+}
+
+test "a static call on a shadow of a builtin name takes the shadow's own static" {
+    let r = compile_and_run(#"
+type Map { n: Int }
+fn Map_make() -> Map { Map { n: 5 } }
+fn main() {
+    let m = Map.make()
+    io.println("{m.n}")
+}
+"#, "_static_shadow_own_static")
+    assert_eq(r.exit_code, 0)
+    assert_eq(r.out.trim(), "5")
 }
