@@ -4131,16 +4131,18 @@ fn cc_clone_is_copy(node: Int, tid: Int) -> Int ! Diag.Report {
     CLONE_COPIES
 }
 
-// The built-in methods on a scalar receiver: a cast, wrapping arithmetic, a comparison and
-// a Float's bits. The two functions read the rows in the same order.
+// The built-in methods on a scalar receiver: a cast, wrapping arithmetic, a comparison,
+// min and max, and a Float's bits. The two functions read the rows in the same order.
 fn cc_is_scalar_method(kind: TyKind, mname: Str) -> Bool {
-    cc_is_scalar_cast(kind, mname) || cc_is_wrapping_arith(kind, mname) || cc_is_scalar_compare(kind, mname) || float_bits_op(kind, mname) != ""
+    cc_is_scalar_cast(kind, mname) || cc_is_wrapping_arith(kind, mname) || cc_is_scalar_compare(kind, mname) || scalar_arith_of(kind, mname) != ScalarArith.NotOne || float_bits_op(kind, mname) != ""
 }
 
 fn cc_scalar_method(node: Int, obj: Int, recv_tid: Int, kind: TyKind, mname: Str) -> Int ! Diag.Report {
     if cc_is_scalar_cast(kind, mname) { return cc_scalar_cast(node, obj, kind, mname) }
     if cc_is_wrapping_arith(kind, mname) { return cc_wrapping_arith(node, obj, recv_tid, kind, mname) }
     if cc_is_scalar_compare(kind, mname) { return cc_scalar_compare(node, obj, recv_tid, kind, mname) }
+    let arith = scalar_arith_of(kind, mname)
+    if arith != ScalarArith.NotOne { return cc_scalar_min_max(node, obj, recv_tid, kind, mname, arith) }
     cc_float_bits(node, obj, kind, mname)
 }
 
@@ -5251,6 +5253,72 @@ fn cc_ieee_equal(node: Int, recv: Int, rhs: Int) -> Int ! Diag.Report {
     let answer = cc_local(TYPE_BOOL, node)
     if cc_stopped(answer) { return -1 }
     ir_binary(TYPE_BOOL, node, answer.c_spelling, "==", recv, rhs)
+}
+
+// ── Min and max ─────────────────────────────────────────────────────────
+//
+// sections/03_types.md, the sized integer method table and §3.2.6 Float Math. The argument
+// comes back only when it is strictly on the wanted side of the receiver, so a tie returns
+// the receiver: on a Float that keeps the receiver's sign of zero, and a NaN against a NaN
+// keeps the receiver's payload. A Float is ordered by the total-order helper, not by C's <
+// or by fmin/fmax: NaN is greater than every other value, so NaN wins max and loses min.
+
+type ScalarArith { NotOne, Min, Max }
+
+fn scalar_arith_of(kind: TyKind, m: Str) -> ScalarArith {
+    let row = match m {
+        "min" => ScalarArith.Min
+        "max" => ScalarArith.Max
+        _ => ScalarArith.NotOne
+    }
+    let held = match row {
+        ScalarArith.NotOne => false
+        ScalarArith.Min => kind == TyKind.Int || kind == TyKind.Float || cc_is_sized_int(kind)
+        ScalarArith.Max => kind == TyKind.Int || kind == TyKind.Float || cc_is_sized_int(kind)
+    }
+    if held { row } else { ScalarArith.NotOne }
+}
+
+// Each operand is bound once, because the select reads both of them twice: once in the
+// test and once as its answer. A second evaluation would repeat the operand's effects.
+fn cc_scalar_min_max(node: Int, obj: Int, recv_tid: Int, kind: TyKind, method: Str, arith: ScalarArith) -> Int ! Diag.Report {
+    let given = sublist_length(node_args(node))
+    if given != 1 { return cc_intrinsic_arity_wrong(node, kind, method, 1, given) }
+    let tid = tid_of_node(node)
+    if tid < 0 { return -1 }
+    let answer = cc_local(tid, node)
+    if cc_stopped(answer) { return -1 }
+    let reads = cc_local(recv_tid, node)
+    if cc_stopped(reads) { return -1 }
+    let bools = cc_local(TYPE_BOOL, node)
+    if cc_stopped(bools) { return -1 }
+    let pair = cg_expr_lower_pair(obj, sublist_get(node_args(node), 0))
+    let recv = pair.get(0).unwrap()
+    let rhs = pair.get(1).unwrap()
+    if recv < 0 || rhs < 0 { return -1 }
+    let left = c_mint_local("self")
+    let right = c_mint_local("other")
+    cg_expr_push_pending(node, ir_let(recv_tid, node, reads.c_spelling, left, reads.slot_form, recv))
+    cg_expr_push_pending(node, ir_let(recv_tid, node, reads.c_spelling, right, reads.slot_form, rhs))
+    // The argument wins when the receiver is greater than it (min) or less than it (max).
+    let op = match arith {
+        ScalarArith.Min => ">"
+        _ => "<"
+    }
+    let helper = cg_call_order_sign_helper(kind)
+    let mut wins = -1
+    if helper != "" {
+        let ints = cc_local(TYPE_INT, node)
+        if cc_stopped(ints) { return -1 }
+        let sign = ir_call_runtime(TYPE_INT, node, ints.c_spelling, c_runtime_helper(helper), SlotForm.InlineWord,
+            [cc_temp_ref(node, recv_tid, reads, left), cc_temp_ref(node, recv_tid, reads, right)])
+        wins = ir_binary(TYPE_BOOL, node, bools.c_spelling, op, sign, ir_const(TYPE_INT, node, ints.c_spelling, "0"))
+    } else {
+        wins = ir_binary(TYPE_BOOL, node, bools.c_spelling, op,
+            cc_temp_ref(node, recv_tid, reads, left), cc_temp_ref(node, recv_tid, reads, right))
+    }
+    ir_select(tid, node, answer.c_spelling, answer.slot_form, wins,
+        cc_temp_ref(node, recv_tid, reads, right), cc_temp_ref(node, recv_tid, reads, left))
 }
 
 // ── Float bits ──────────────────────────────────────────────────────────

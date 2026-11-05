@@ -101,19 +101,20 @@ traits, and tc_std_trait_call counts their arguments against the trait's own sig
 
 | method | args | reads |
 |---|---|---|
-| `Int.min`, `Int.max` | 1 | none |
+| `Int.min`, `Int.max` | 1 | typed |
+| sized `min`, `max` | 1 | typed |
 | sized `wrapping_add`, `wrapping_sub`, `wrapping_mul` | 1 | none |
 | `Int.to_str`, `Int.to_string`, `Int.to_float`, `Int.abs`, `Int.to_i8` … `Int.to_u64` | 0 | none |
-| `Float.ieee_eq` | 1 | typed |
+| `Float.ieee_eq`, `Float.min`, `Float.max` | 1 | typed |
 | `Float.to_string`, `Float.to_int` | 0 | none |
 | `Float.to_bits`, `Float.is_sign_negative` | 0 | none |
 | `Float.from_bits` (static) | 1 | typed |
 | `Char.to_int`, `Char.to_str` | 0 | none |
 | sized `to_int`, `to_i8` … `to_u64` | 0 | none |
 
-The 1-argument rows here read nothing at all: the arm returns a type without
-looking at the argument, so today `x.min()` and `x.wrapping_add()` are both
-accepted and reach codegen short.
+The `wrapping_*` rows read nothing at all: the arm returns a type without
+looking at the argument. The count check ahead of the arm refuses `x.wrapping_add()`,
+but it does not check the type of the argument.
 
 ### Option, Result
 
