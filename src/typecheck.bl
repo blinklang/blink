@@ -18104,15 +18104,35 @@ fn tc_report_unknown_ue_op(node: Int, handle: Str, method: Str) -> Int ! TypeChe
     tc_error_recovery_tid()
 }
 
-// Whether `name` here is a user effect handle. A binding of the spelling holds a value, and a
-// module bound under it reads as that module, as it does for the built-in handles. A built-in
-// namespace of the same spelling keeps its own members. Asking must not count as a read of a
-// binding, or the unused-variable warnings would go silent.
+// Whether `name` here is a user effect handle. A function whose row names the effect reserves
+// the handle, so in it the handle hides a module qualifier of the same spelling; elsewhere the
+// qualifier holds (sections/04_effects.md §4.12 *A handle wins over a module qualifier*). A
+// binding of the spelling holds a value. A built-in namespace of the same spelling keeps its
+// own members. Asking must not count as a read of a binding, or the unused-variable warnings
+// would go silent.
 fn nr_names_ue_handle(name: Str) -> Bool {
     if is_user_effect_handle_name(name) == 0 { return false }
     if is_builtin_namespace(name) != 0 { return false }
-    if nr_qualifier_module_here(name) != "" { return false }
+    if nr_qualifier_module_here(name) != "" && !nr_fn_reserves_ue_handle(name) { return false }
     nr_receiver_has_binding(name) == 0
+}
+
+// Whether the row of the function under check names the user effect whose handle is `handle`,
+// or one of its sub-effects (§3c.4 *Effect Handle Operations*).
+fn nr_fn_reserves_ue_handle(handle: Str) -> Bool {
+    if tc_current_fn_node == -1 { return false }
+    let row = node_effects(tc_current_fn_node)
+    if row == -1 { return false }
+    let ed = tc_ue_handle_decl(handle)
+    let mut i = 0
+    while i < sublist_length(row) {
+        let parts = node_name(sublist_get(row, i)).split(".")
+        // `lib.Tag` names the effect through the qualifier of its module.
+        let root = if parts.len() > 1 && nr_qualifier_module_here(parts.get(0).unwrap()) != "" { parts.get(1).unwrap() } else { parts.get(0).unwrap() }
+        if tc_effect_decl_named(root) == ed { return true }
+        i = i + 1
+    }
+    false
 }
 
 // A user effect handle read as a value (sections/03_types.md: a handle is not a value). `member`
@@ -26196,6 +26216,10 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
             let obj_kind = node_kind(obj)
             if obj_kind == NodeKind.Ident {
                 let fa_obj_name = node_name(obj)
+                if nr_names_ue_handle(fa_obj_name) {
+                    nr_report_ue_handle_value(obj, fa_obj_name, node_name(node))
+                    return
+                }
                 if nr_qualifier_module_here(fa_obj_name) != "" && nr_is_defined(fa_obj_name) == 0 {
                     is_mod_fa = 1
                     let fa_field = node_name(node)
@@ -26205,10 +26229,6 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                         tc_mark_symbol_used(fa_field)
                     }
                     tc_mark_qualifier_used(fa_obj_name)
-                }
-                if is_mod_fa == 0 && nr_names_ue_handle(fa_obj_name) {
-                    nr_report_ue_handle_value(obj, fa_obj_name, node_name(node))
-                    return
                 }
             }
             if is_mod_fa == 0 && obj_kind == NodeKind.FieldAccess {
@@ -32121,7 +32141,9 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                     let _ = check_arg_shapes("{obj_name}.{method}", ue_sig, node_args(node), 0, node)
                     return fnsig_pool.get(ue_sig).unwrap().ret
                 }
-                if nr_names_ue_handle(obj_name) { return tc_report_unknown_ue_op(node, obj_name, method) }
+                // A call through a qualifier the handle hides needs the help and fix of §4.4.7,
+                // which this report does not give, so that call still reads the module.
+                if nr_names_ue_handle(obj_name) && nr_qualifier_module_here(obj_name) == "" { return tc_report_unknown_ue_op(node, obj_name, method) }
             }
             // `rand.<name>` always means the handle, so a name that is no operation of `Rand` is
             // E0505 here, before the unclaimed-call report can read `rand` as a module (§4.4.7).
