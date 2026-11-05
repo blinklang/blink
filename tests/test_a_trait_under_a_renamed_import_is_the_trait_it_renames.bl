@@ -1,0 +1,98 @@
+// `import m.{C as D}` makes `D` name trait `C` in this file (sections/07_trust_modules_metadata.md
+// *Import Aliases*). So `D` works in each place a trait name goes: an impl head, a bound, a
+// supertrait, a trait-qualified call, and a generic trait with its argument. The old
+// spelling `C` is not in scope in that file.
+
+import std.process.{ProcessResult, ChildEnd}
+
+fn sh(cmd: Str) -> ProcessResult ! Process.Spawn {
+    process.run("sh", ["-c", cmd]).unwrap()
+}
+
+fn fixture(main_body: Str) -> Str ! Process.Spawn, FS.Write {
+    let dir = sh("mktemp -d /tmp/blink_trait_alias.XXXXXX").out.trim()
+    let _ = sh("mkdir -p {dir}/src")
+    fs.write("{dir}/blink.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\n").unwrap()
+    // A lock no older than blink.toml keeps dependency resolution out of the command.
+    fs.write("{dir}/blink.lock", "[metadata]\nlockfile-version = 1\n").unwrap()
+    fs.write("{dir}/src/m.bl", #"
+pub trait C {
+    fn go(self) -> Int
+}
+pub trait K[T] {
+    fn put(self, x: T) -> T
+}
+"#).unwrap()
+    fs.write("{dir}/src/main.bl", main_body).unwrap()
+    dir
+}
+
+fn run_in(main_body: Str) -> ProcessResult ! Process.Spawn, FS.Write {
+    let dir = fixture(main_body)
+    // BLINK_BIN makes the build workers the compiler under test, not the blink on PATH.
+    let r = sh("B=$(pwd)/build/blink; cd {dir} && BLINK_BIN=$B $B run src/main.bl 2>&1")
+    let _ = sh("rm -rf {dir}")
+    r
+}
+
+test "a renamed trait works in an impl head, a bound, a supertrait and a qualified call" {
+    let r = run_in(#"
+import m.{C as D, K as L}
+
+type Q {
+    n: Int
+}
+
+impl D for Q {
+    fn go(self) -> Int { self.n }
+}
+
+impl L[Int] for Q {
+    fn put(self, x: Int) -> Int { self.n + x }
+}
+
+trait E: D {
+    fn twice(self) -> Int
+}
+
+impl E for Q {
+    fn twice(self) -> Int { self.go() * 2 }
+}
+
+fn via[T: D](x: T) -> Int {
+    x.go()
+}
+
+fn via_both[T: D + L[Int]](x: T) -> Int {
+    D.go(x) + L.put(x, 0)
+}
+
+fn main() {
+    let q = Q { n: 4 }
+    io.println("{q.go()} {D.go(q)} {via(q)} {via_both(q)} {q.twice()} {q.put(1)} {L.put(q, 2)}")
+}
+"#)
+    assert(r.end == ChildEnd.Exited(0), r.out)
+    assert_eq(r.out.trim(), "4 4 4 8 8 5 6")
+}
+
+test "the old name of a renamed trait is not in scope" {
+    let r = run_in(#"
+import m.{C as D}
+
+type Q {
+    n: Int
+}
+
+impl C for Q {
+    fn go(self) -> Int { self.n }
+}
+
+fn main() {
+    io.println("{D.go(Q { n: 1 })}")
+}
+"#)
+    assert(r.end != ChildEnd.Exited(0), r.out)
+    assert(r.out.contains("`C` is not in scope"), r.out)
+}
+
