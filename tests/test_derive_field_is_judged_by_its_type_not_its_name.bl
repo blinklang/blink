@@ -1,0 +1,122 @@
+import compile_test_helpers
+
+// A derive judges each field by the type the field has, not by the name the field's type is
+// written with (sections/03_types.md *Generic Type Bound Inference*: a concrete field type is
+// checked where the derive is declared). `B[NoD]` names a type that derives Debug, but the
+// instance at NoD has no Debug, so a field of that type refuses the derive. The same holds for
+// a container element, a variant field, an alias, and a type named through its module.
+
+fn refused(src: Str, tag: Str, code: Str) ! FS.Delete, FS.Write, Process.Spawn, FS.Read, Env.Read, IO.Print {
+    let out = compile_test_helpers.compile_and_capture(src, tag)
+    compile_test_helpers.expect_error(out, code, tag)
+}
+
+fn runs(src: Str, tag: Str, want: Str) ! FS.Delete, FS.Write, Process.Spawn, FS.Read, Env.Read, IO.Print {
+    let r = compile_test_helpers.compile_and_run(src, tag)
+    if r.exit_code != 0 || r.out != want {
+        io.println("FAIL: {tag}: exit {r.exit_code}, out '{r.out}', err '{r.err_out}'")
+    }
+    assert(r.exit_code == 0 && r.out == want)
+}
+
+let DEBUG_FIELD = "E0520"
+let NON_DERIVABLE = "E1401"
+
+fn debug_box() -> Str {
+    "@derive(Debug)\ntype B[T] \{ v: T }\ntype NoD \{ y: Int }\n"
+}
+
+test "a Debug field of an applied generic is judged at its argument" {
+    refused("{debug_box()}@derive(Debug)\ntype W \{ a: B[NoD] }\nfn main() \{ io.println(\"x\") }\n", "dfield_dbg_applied", DEBUG_FIELD)
+}
+
+test "a Debug field holds an applied generic inside a List, an Option or a Map value" {
+    refused("{debug_box()}@derive(Debug)\ntype W \{ a: List[B[NoD]] }\nfn main() \{ io.println(\"x\") }\n", "dfield_dbg_list", DEBUG_FIELD)
+    refused("{debug_box()}@derive(Debug)\ntype W \{ a: Option[B[NoD]] }\nfn main() \{ io.println(\"x\") }\n", "dfield_dbg_option", DEBUG_FIELD)
+    refused("{debug_box()}@derive(Debug)\ntype W \{ a: Map[Str, B[NoD]] }\nfn main() \{ io.println(\"x\") }\n", "dfield_dbg_map_value", DEBUG_FIELD)
+}
+
+test "a Debug variant field of an applied generic is judged at its argument" {
+    refused("{debug_box()}@derive(Debug)\ntype W \{ A(a: B[NoD]) }\nfn main() \{ io.println(\"x\") }\n", "dfield_dbg_variant", DEBUG_FIELD)
+}
+
+test "a Debug field reads a derived generic through its own field types" {
+    let src = "type N \{ a: Int }\n@derive(Debug)\ntype W[T] \{ x: List[T] }\n@derive(Debug)\ntype Z \{ w: W[N] }\nfn main() \{ io.println(\"x\") }\n"
+    refused(src, "dfield_dbg_nested_instance", DEBUG_FIELD)
+}
+
+test "a Debug field through an alias of an applied generic is judged at its argument" {
+    refused("{debug_box()}type G = B[NoD]\n@derive(Debug)\ntype W \{ a: G }\nfn main() \{ io.println(\"x\") }\n", "dfield_dbg_alias", DEBUG_FIELD)
+}
+
+// An alias names no declaration that a derive could go on, so the fix it offers must not
+// be one.
+test "a Debug field through an alias of a type with no Debug does not ask for a derive on the alias" {
+    for shape in ["Set[Int]", "(Int, Int)", "Result[Int, Str]"] {
+        let tag = "dfield_dbg_alias_leaf"
+        let out = compile_test_helpers.compile_and_capture("type S = {shape}\n@derive(Debug)\ntype W \{ a: S }\nfn main() \{ io.println(\"x\") }\n", tag)
+        compile_test_helpers.expect_error(out, DEBUG_FIELD, tag)
+        compile_test_helpers.expect_contains(out, "which is not Debug-renderable", tag)
+        if out.contains("add @derive(Debug) to `S`") { io.println("FAIL: {tag} {shape}: asks for a derive on the alias") }
+        assert(!out.contains("add @derive(Debug) to `S`"))
+    }
+}
+
+fn hash_box() -> Str {
+    "@derive(Eq, Hash)\ntype B[T] \{ v: T }\n@derive(Eq)\ntype NoH \{ y: Int }\n"
+}
+
+test "a Hash field of an applied generic is judged at its argument" {
+    refused("{hash_box()}@derive(Eq, Hash)\ntype W \{ a: B[NoH] }\nfn main() \{ io.println(\"x\") }\n", "dfield_hash_applied", NON_DERIVABLE)
+    refused("{hash_box()}type G = B[NoH]\n@derive(Eq, Hash)\ntype W \{ a: G }\nfn main() \{ io.println(\"x\") }\n", "dfield_hash_alias", NON_DERIVABLE)
+}
+
+fn ord_box() -> Str {
+    "@derive(Eq, Ord)\ntype B[T] \{ v: T }\n@derive(Eq)\ntype NoO \{ y: Int }\n"
+}
+
+test "an Ord field of an applied generic is judged at its argument" {
+    refused("{ord_box()}@derive(Eq, Ord)\ntype W \{ a: B[NoO] }\nfn main() \{ io.println(\"x\") }\n", "dfield_ord_applied", NON_DERIVABLE)
+    refused("{ord_box()}type G = B[NoO]\n@derive(Eq, Ord)\ntype W \{ a: G }\nfn main() \{ io.println(\"x\") }\n", "dfield_ord_alias", NON_DERIVABLE)
+}
+
+// Bytes is Eq but neither Hash nor Ord (sections/03_types.md *Bytes*, and the hashable-key list).
+test "a Bytes field refuses Hash and Ord" {
+    refused("@derive(Eq, Hash)\ntype W \{ a: Int, b: Bytes }\nfn main() \{ io.println(\"x\") }\n", "dfield_hash_bytes", NON_DERIVABLE)
+    refused("@derive(Eq, Ord)\ntype W \{ a: Int, b: Bytes }\nfn main() \{ io.println(\"x\") }\n", "dfield_ord_bytes", NON_DERIVABLE)
+}
+
+test "a Serialize field of an applied generic is judged at its argument" {
+    let boxed = "@derive(Serialize)\ntype B[T] \{ v: T }\ntype NoS \{ y: Int }\n"
+    refused("{boxed}@derive(Serialize)\ntype W \{ a: B[NoS] }\nfn main() \{ io.println(\"x\") }\n", "dfield_ser_applied", NON_DERIVABLE)
+    let listed = "type N \{ a: Int }\n@derive(Serialize)\ntype W[T] \{ x: List[T] }\n@derive(Serialize)\ntype Z \{ w: W[N] }\nfn main() \{ io.println(\"x\") }\n"
+    refused(listed, "dfield_ser_nested_instance", NON_DERIVABLE)
+}
+
+test "a field of an applied generic whose argument has the trait still derives and runs" {
+    let decls = "@derive(Debug, Eq, Hash, Ord, Serialize)\ntype B[T] \{ v: T }\n@derive(Debug, Eq, Serialize)\ntype W \{ a: B[Int], b: List[B[Str]] }\n@derive(Eq, Hash, Ord)\ntype K \{ a: B[Int] }\n"
+    let body = "fn main() \{\n    let w = W \{ a: B \{ v: 1 }, b: [B \{ v: \"s\" }] }\n    io.println(w.debug())\n    io.println(w.to_json())\n    let k = K \{ a: B \{ v: 2 } }\n    io.println(\"\{w == w} \{k < k} \{k.hash() == k.hash()}\")\n}\n"
+    runs("{decls}{body}", "dfield_applied_ok", "W \{ a: B \{ v: 1 }, b: [B \{ v: \"s\" }] }\n\{\"a\":\{\"v\":1},\"b\":[\{\"v\":\"s\"}]}\ntrue false true\n")
+}
+
+fn qualified_helper() -> Str {
+    "@derive(Eq, Hash)\npub type N \{ v: Int }\n@derive(Debug)\npub type D \{ v: Int }\n"
+}
+
+fn qualified_entry(field: Str) -> Str {
+    "import m\n@derive(Debug)\ntype W \{ a: {field} }\nfn main() \{ io.println(\"x\") }\n"
+}
+
+test "a Debug field of a module-qualified type is judged by that type" {
+    let plain = compile_test_helpers.compile_xmod_capture(qualified_entry("m.N"), "m", qualified_helper(), "dfield_qual_plain")
+    compile_test_helpers.expect_error(plain, DEBUG_FIELD, "dfield_qual_plain")
+    let listed = compile_test_helpers.compile_xmod_capture(qualified_entry("List[m.N]"), "m", qualified_helper(), "dfield_qual_list")
+    compile_test_helpers.expect_error(listed, DEBUG_FIELD, "dfield_qual_list")
+    let keyed = compile_test_helpers.compile_xmod_capture(qualified_entry("Map[m.N, Int]"), "m", qualified_helper(), "dfield_qual_map_key")
+    compile_test_helpers.expect_error(keyed, DEBUG_FIELD, "dfield_qual_map_key")
+}
+
+test "a Debug field of a module-qualified type that derives Debug is accepted" {
+    let out = compile_test_helpers.compile_xmod_capture(qualified_entry("List[m.D]"), "m", qualified_helper(), "dfield_qual_ok")
+    compile_test_helpers.expect_compiles_clean(out, "dfield_qual_ok")
+}

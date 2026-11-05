@@ -13466,12 +13466,11 @@ fn tc_fields_mix_named_and_unnamed(vflds_sl: Int) -> Bool {
     named && unnamed
 }
 
-// A field of a @derive(Debug) type whose own type is a user struct/enum must
-// itself derive Debug — the generated debug() renders each field via its
-// debug(). A built-in scalar / Str is always OK; a user type is OK iff it
-// itself carries @derive(Debug).
-// A name through an alias shows neither the target nor a generic alias's arguments, so it is
-// judged at the type it resolves to: `L = List[Plain]` holds to the rule `List[Plain]` holds to.
+// A field of a @derive(Debug) type must have a type the generated debug() can render: a
+// scalar, a List, Option, Map or Range of renderable parts, or a type whose Debug holds at its
+// own arguments. The field is judged by its type, not by the name the type is written with:
+// `B[NoD]` names a type that derives Debug, but `B` at `NoD` has no Debug, and `L =
+// List[Plain]` holds to the rule `List[Plain]` holds to.
 fn tc_debug_tid_ok(tid: Int) -> Int {
     let t = resolve_alias_tid(tc_resolve(tid))
     let k = type_kind(t)
@@ -13485,26 +13484,37 @@ fn tc_debug_tid_ok(tid: Int) -> Int {
     if tc_derive_only_fact(t, "Debug") == -1 { 0 } else { 1 }
 }
 
+// The Map-key types the v1 renderer can read back through the kops storage layer: a scalar
+// stored inline (Char in single-quoted debug-form, decisions/char-debug-form.md), or a
+// @derive(Debug, Hash, Eq) STRUCT, read via blink_map_key_slot and rendered via its debug.
+// Enum and container keys stay rejected.
 fn tc_debug_key_tid_ok(tid: Int) -> Int {
     let t = resolve_alias_tid(tc_resolve(tid))
     let k = type_kind(t)
     if k == TyKind.Str || k == TyKind.Char || k == TyKind.Int || k == TyKind.Bool || is_sized_int(k) { return 1 }
-    if tc_type_is_struct(tc_tid_name(t)) != 0 { return tc_debug_tid_ok(t) }
+    if k == TyKind.Struct { return tc_debug_tid_ok(t) }
     if k == TyKind.Unknown { 1 } else { 0 }
 }
 
-fn tc_debug_field_ok(ann: Int) -> Int ! TypeCheck.Resolve, Diag.Report {
-    let ftype_name = node_name(ann)
-    if tc_alias_decl_of_written(ftype_name) != -1 { return tc_debug_tid_ok(resolve_type_ann(ann)) }
-    let nominal = tc_written_type_nominal(ftype_name)
-    if !named_type_map.contains_key(nominal) { return 1 }
-    if tc_type_name_derives(nominal, "Debug") != 0 { return 1 }
-    0
+// The part at child `i` of a List, Option, Range or Map field type, or -1.
+fn tc_debug_part_tid(tid: Int, i: Int) -> Int {
+    if tid < 0 { return -1 }
+    let t = resolve_alias_tid(tc_resolve(tid))
+    let k = type_kind(t)
+    if k != TyKind.List && k != TyKind.Option && k != TyKind.Range && k != TyKind.Map { return -1 }
+    tc_tid_child(t, i)
 }
 
-// The Debug field check for a leaf annotation that `core`, what it means
-// (tc_compiler_known_type_meant), may name as a compiler-known type. A builtin with a prelude
-// declaration (Ordering, ConversionError) answers by that declaration, not by a namesake.
+// Does the struct or enum `tid` is an instance of carry `@derive(tr)`?
+fn tc_tid_base_derives(tid: Int, tr: Str) -> Bool {
+    let t = resolve_alias_tid(tc_resolve(tid))
+    let k = type_kind(t)
+    if k != TyKind.Struct && k != TyKind.Enum { return false }
+    // The base tid finds its own declaration; the name may be a namesake's.
+    let td = tc_tid_decl_node(if k == TyKind.Struct { tc_struct_base_tid(t) } else { tc_enum_base_tid(t) })
+    td >= 0 && tc_decl_derives(td, tr) != 0
+}
+
 // The fix names the declaration: a renamed import spells a type that no `type` line declares.
 fn tc_add_debug_derive_help(written: Str) -> Str {
     let renamed = tc_type_renamed_here(written)
@@ -13513,10 +13523,25 @@ fn tc_add_debug_derive_help(written: Str) -> Str {
     "{tc_derive_fix_imports(["Debug"], target)}add @derive({tc_derive_arg_for("Debug", target)}) to `{shown}`"
 }
 
-fn tc_debug_leaf_ok(ann: Int, core: Str) -> Int ! TypeCheck.Resolve, Diag.Report {
-    if core == "" { return tc_debug_field_ok(ann) }
-    let td = tc_prelude_type_decl(core)
-    if td == -1 { 1 } else { tc_decl_derives(td, "Debug") }
+// A type that derives Debug and still has none lacks it at one of its arguments, so a
+// second derive on it is no fix.
+fn tc_debug_leaf_help(ann: Int, tid: Int) -> Str {
+    if tc_tid_base_derives(tid, "Debug") { return "implement Debug for each type argument of `{type_ann_text(ann)}`, or implement Debug by hand for this field's type" }
+    tc_add_debug_derive_help(node_name(ann))
+}
+
+// A field (`what` "type") or a part of one (`what` "element type") whose type `tid` the
+// generated debug() cannot render. A tid the pools hold no entry for is not judged.
+fn tc_check_debug_leaf(ann: Int, tid: Int, f: Int, tname: Str, what: Str) ! Diag.Report {
+    if tid < 0 || tc_debug_tid_ok(tid) != 0 { return }
+    // Only a struct or enum declaration can take a derive; an alias of any other type
+    // names nothing to put one on.
+    let k = type_kind(resolve_alias_tid(tc_resolve(tid)))
+    if k != TyKind.Struct && k != TyKind.Enum {
+        diag_error_at("DeriveDebugFieldNoDebug", DERIVE_DEBUG_FIELD_NO_DEBUG, "@derive(Debug) on `{tname}`: field `{node_name(f)}` has {what} `{type_ann_text(ann)}` which is not Debug-renderable in v1", f, "implement Debug manually for this field's type")
+        return
+    }
+    diag_error_at("DeriveDebugFieldNoDebug", DERIVE_DEBUG_FIELD_NO_DEBUG, "@derive(Debug) on `{tname}`: field `{node_name(f)}` has {what} `{type_ann_text(ann)}` which does not derive Debug", f, tc_debug_leaf_help(ann, tid))
 }
 
 // The container type constructors that the v1 Debug renderer can walk
@@ -13540,7 +13565,7 @@ fn tc_debug_peels(core: Str) -> Int {
 //   tuples auto-derive Eq/Ord/Hash/Display/Clone but NOT Debug, spec §3.6);
 //   handler[E] → "Handler" (parser.bl:1453); Raw[Str] → "Raw", a marker with no Debug
 //   (§3b.5). Rejected E0520 like Set/Result
-//   else they slip past tc_debug_field_ok and emit BLINK_COMPILER_BUG.
+//   else they slip past tc_check_one_debug_field and emit BLINK_COMPILER_BUG.
 //
 // "Void" is the one entry that is NOT a parser pseudo-type — it is an ordinary inhabited
 // type (decisions/under-determined-types.md:39) — but it belongs here for the same reason
@@ -13555,49 +13580,11 @@ fn tc_is_non_debug_pseudo_type(n: Str, core: Str) -> Int {
     0
 }
 
-// Is `tname` a user STRUCT (not an enum)? A struct decl's fields are plain
-// TypeField nodes; an enum decl's first field is a TypeVariant (same shape used
-// at whole-program registration, typecheck.bl:2644). Returns 0 for unknown /
-// non-user names.
-pub fn tc_type_is_struct(tname: Str) -> Int {
-    let td = tc_type_decl_nodes.get(tname) ?? -1
-    if td == -1 { return 0 }
-    let flds = node_fields(td)
-    if flds != -1 && sublist_length(flds) > 0 {
-        if node_kind(sublist_get(flds, 0)) == NodeKind.TypeVariant { return 0 }
-    }
-    1
-}
-
-// The Map-key types the v1 renderer can read back through the kops storage
-// layer. Two families: (a) scalars — Str / Char / Int / Bool / sized ints,
-// stored inline (Char in single-quoted debug-form, decisions/char-debug-form.md);
-// (b) @derive(Debug, Hash, Eq) user STRUCTS, read via blink_map_key_slot (which
-// dereferences the inline_key=0 pointer) and rendered via {sname}_debug (mirrors
-// the struct-VALUE path). Enums and non-Debug user types are still rejected
-// (E0520 via tc_check_debug_element).
-fn tc_debug_map_key_ok(key_ann: Int) -> Int ! TypeCheck.Resolve, Diag.Report {
-    let key_name = node_name(key_ann)
-    if tc_alias_decl_of_written(key_name) != -1 { return tc_debug_key_tid_ok(resolve_type_ann(key_ann)) }
-    if key_name == "Str" || key_name == "Char" || key_name == "Int" || key_name == "Bool" { return 1 }
-    if key_name == "I8" || key_name == "I16" || key_name == "I32" || key_name == "I64" { return 1 }
-    if key_name == "U8" || key_name == "U16" || key_name == "U32" || key_name == "U64" { return 1 }
-    let nominal = tc_written_type_nominal(key_name)
-    if tc_type_is_struct(nominal) != 0 && tc_type_name_derives(nominal, "Debug") != 0 { return 1 }
-    0
-}
-
-fn tc_debug_key_is_struct(key_ann: Int) -> Bool ! TypeCheck.Resolve, Diag.Report {
-    let key_name = node_name(key_ann)
-    if tc_alias_decl_of_written(key_name) != -1 { return type_kind(resolve_type_ann(key_ann)) == TyKind.Struct }
-    tc_type_is_struct(tc_written_type_nominal(key_name)) != 0
-}
-
 // Check one element / value of a Debug-renderable container field. The rule is
 // fully inductive (spec §3.6): a non-Debug leaf → E0520; a Set/Result element →
 // E0520 (not renderable at any level); a List/Option/Map element recurses into
 // its own element/key/value checks so arbitrary nesting is proven Debug.
-fn tc_check_debug_element(elem_ann: Int, f: Int, tname: Str) ! TypeCheck.Resolve, Diag.Report {
+fn tc_check_debug_element(elem_ann: Int, etid: Int, f: Int, tname: Str) ! TypeCheck.Resolve, Diag.Report {
     let elem_name = node_name(elem_ann)
     let core = tc_compiler_known_type_meant(elem_name, elem_ann)
     if tc_is_non_debug_pseudo_type(elem_name, core) != 0 {
@@ -13611,54 +13598,49 @@ fn tc_check_debug_element(elem_ann: Int, f: Int, tname: Str) ! TypeCheck.Resolve
             diag_error_at("DeriveDebugFieldNoDebug", DERIVE_DEBUG_FIELD_NO_DEBUG, "@derive(Debug) on `{tname}`: field `{node_name(f)}` has element type `{elem_name}` which is not Debug-renderable (only List/Option/Map containers render)", f, "implement Debug manually for this field's type")
             return
         }
-        tc_check_container_elems(elem_ann, core, f, tname)
+        tc_check_container_elems(elem_ann, core, etid, f, tname)
         return
     }
-    if tc_debug_leaf_ok(elem_ann, core) == 0 {
-        diag_error_at("DeriveDebugFieldNoDebug", DERIVE_DEBUG_FIELD_NO_DEBUG, "@derive(Debug) on `{tname}`: field `{node_name(f)}` has element type `{elem_name}` which does not derive Debug", f, tc_add_debug_derive_help(elem_name))
-    }
+    tc_check_debug_leaf(elem_ann, etid, f, tname, "element type")
 }
 
-// Peel a List/Option/Map/Range annotation `ann` and check its element (or
+// Peel a List/Option/Map/Range annotation `ann`, of type `tid`, and check its element (or
 // key + value) types. Shared between the top-level field check and the nested
 // recursion in tc_check_debug_element, so nesting is pure composition. The
 // caller guarantees `ann` names List / Option / Map / Range (Set/Result rejected first).
-fn tc_check_container_elems(ann: Int, core: Str, f: Int, tname: Str) ! TypeCheck.Resolve, Diag.Report {
+fn tc_check_container_elems(ann: Int, core: Str, tid: Int, f: Int, tname: Str) ! TypeCheck.Resolve, Diag.Report {
     let elems_sl = node_elements(ann)
     if core == "Map" {
         if elems_sl != -1 && sublist_length(elems_sl) >= 2 {
             let key_ann = sublist_get(elems_sl, 0)
             let key_name = node_name(key_ann)
-            if tc_debug_map_key_ok(key_ann) != 0 {
-                tc_check_debug_element(key_ann, f, tname)
-            } else if tc_debug_key_is_struct(key_ann) {
-                // A user STRUCT key that isn't Debug (tc_debug_map_key_ok gates
-                // the Debug ones above): let tc_check_debug_element emit the
-                // precise "does not derive Debug" diagnostic.
-                tc_check_debug_element(key_ann, f, tname)
-            } else {
-                // Container map keys (List/Map/Option/Set/Result) and other
-                // unsupported keys land here — container keys stay rejected,
-                // which is why the map-debug emitter never recurses on keys.
-                diag_error_at("DeriveDebugFieldNoDebug", DERIVE_DEBUG_FIELD_NO_DEBUG, "@derive(Debug) on `{tname}`: field `{node_name(f)}` has Map key type `{key_name}` which v1 Debug cannot render (Str/Char/Int/Bool/sized-int keys, or a @derive(Debug, Hash, Eq) struct key)", f, "use a supported scalar key or a Debug struct key, or implement Debug manually")
+            let ktid = tc_debug_part_tid(tid, 0)
+            if ktid >= 0 && tc_debug_key_tid_ok(ktid) == 0 {
+                if type_kind(resolve_alias_tid(tc_resolve(ktid))) == TyKind.Struct {
+                    // A STRUCT key with no Debug: tc_check_debug_element emits the precise
+                    // "does not derive Debug" diagnostic.
+                    tc_check_debug_element(key_ann, ktid, f, tname)
+                } else {
+                    // Container map keys (List/Map/Option/Set/Result) and other
+                    // unsupported keys land here — container keys stay rejected,
+                    // which is why the map-debug emitter never recurses on keys.
+                    diag_error_at("DeriveDebugFieldNoDebug", DERIVE_DEBUG_FIELD_NO_DEBUG, "@derive(Debug) on `{tname}`: field `{node_name(f)}` has Map key type `{key_name}` which v1 Debug cannot render (Str/Char/Int/Bool/sized-int keys, or a @derive(Debug, Hash, Eq) struct key)", f, "use a supported scalar key or a Debug struct key, or implement Debug manually")
+                }
             }
-            tc_check_debug_element(sublist_get(elems_sl, 1), f, tname)
+            tc_check_debug_element(sublist_get(elems_sl, 1), tc_debug_part_tid(tid, 1), f, tname)
         }
         return
     }
 
     // List / Option / Range: peel element 0.
     if elems_sl != -1 && sublist_length(elems_sl) >= 1 {
-        tc_check_debug_element(sublist_get(elems_sl, 0), f, tname)
+        tc_check_debug_element(sublist_get(elems_sl, 0), tc_debug_part_tid(tid, 0), f, tname)
     }
 }
 
-// Reject one field `f` of a @derive(Debug) type `tname` whose type — or whose
-// container element/key/value type — does not derive Debug. `is_variant_field`
-// is 1 when `f` is a field of an enum variant; container Debug rendering applies
-// to struct fields AND enum-variant fields, so the param is threaded
-// only to keep call sites unchanged.
-fn tc_check_one_debug_field(f: Int, tname: Str, _is_variant_field: Int) ! TypeCheck.Resolve, Diag.Report {
+// Reject one field `f`, of declared type `ftid`, of a @derive(Debug) type `tname` whose type —
+// or whose container element/key/value type — does not derive Debug.
+fn tc_check_one_debug_field(f: Int, ftid: Int, tname: Str) ! TypeCheck.Resolve, Diag.Report {
     let ann = node_value(f)
     let ftype_name = node_name(ann)
     let core = tc_compiler_known_type_meant(ftype_name, ann)
@@ -13669,9 +13651,7 @@ fn tc_check_one_debug_field(f: Int, tname: Str, _is_variant_field: Int) ! TypeCh
     }
 
     if tc_debug_peels(core) == 0 {
-        if tc_debug_leaf_ok(ann, core) == 0 {
-            diag_error_at("DeriveDebugFieldNoDebug", DERIVE_DEBUG_FIELD_NO_DEBUG, "@derive(Debug) on `{tname}`: field `{node_name(f)}` has type `{ftype_name}` which does not derive Debug", f, tc_add_debug_derive_help(ftype_name))
-        }
+        tc_check_debug_leaf(ann, ftid, f, tname, "type")
         return
     }
 
@@ -13681,7 +13661,7 @@ fn tc_check_one_debug_field(f: Int, tname: Str, _is_variant_field: Int) ! TypeCh
         return
     }
 
-    tc_check_container_elems(ann, core, f, tname)
+    tc_check_container_elems(ann, core, ftid, f, tname)
 }
 
 fn tc_check_derive_debug() ! TypeCheck.Resolve, Diag.Report {
@@ -13690,6 +13670,7 @@ fn tc_check_derive_debug() ! TypeCheck.Resolve, Diag.Report {
         let tname = named_type_names.get(ti).unwrap()
         let td = tc_decl_node_for_type(tname)
         if td != -1 && tc_decl_derives(td, "Debug") != 0 {
+            let ttid = named_type_ids.get(ti) ?? -1
             // A field annotation means what it means in the declaring module.
             let saved_module = tc_enter_body_module(td)
             let flds_sl = node_fields(td)
@@ -13700,11 +13681,11 @@ fn tc_check_derive_debug() ! TypeCheck.Resolve, Diag.Report {
                     let vflds_sl = node_fields(f)
                     let mut vi = 0
                     while vflds_sl != -1 && vi < sublist_length(vflds_sl) {
-                        tc_check_one_debug_field(sublist_get(vflds_sl, vi), tname, 1)
+                        tc_check_one_debug_field(sublist_get(vflds_sl, vi), tc_derive_variant_field_tid(f, vi), tname)
                         vi = vi + 1
                     }
                 } else {
-                    tc_check_one_debug_field(f, tname, 0)
+                    tc_check_one_debug_field(f, tc_derive_struct_field_tid(ttid, f), tname)
                 }
                 i = i + 1
             }
@@ -13716,141 +13697,47 @@ fn tc_check_derive_debug() ! TypeCheck.Resolve, Diag.Report {
 
 // ---------------------------------------------------------------------------
 // E1401 NonDerivableTrait — spec §3.6.6: a @derive(Hash/Eq/Ord) type may only
-// contain fields whose type itself implements the derived trait. Modeled on
-// tc_check_derive_debug (the Debug-field pass). Fail-open on generic /
-// unresolved names so the compiler's own generic code keeps typechecking.
-//
-// Eq asks each field what `==` asks of its type (tc_eq_need), so a container field is
-// `Eq` when its parts are. Hash and Ord still go by the field's written name:
-// collections are rejected under both, Float is not Hashable and Bool is not Orderable.
-
-// Is a bare scalar type name integer-like (Int / sized ints / Char)?
-fn tc_is_integer_scalar(n: Str) -> Int {
-    if n == "Int" || n == "Char" { return 1 }
-    if n == "I8" || n == "I16" || n == "I32" || n == "I64" { return 1 }
-    if n == "U8" || n == "U16" || n == "U32" || n == "U64" { return 1 }
-    0
-}
-
-fn tc_is_float_scalar(n: Str) -> Int {
-    if n == "Float" || n == "F32" || n == "F64" { return 1 }
-    0
-}
-
-// Does the named field type satisfy `tr` ("Hash"/"Ord")? Returns 1 for
-// OK, 0 for reject. Fails OPEN (returns 1) for names that are neither a builtin
-// scalar nor a known user type — generics / type params we can't resolve here.
-fn tc_field_type_derivable(written: Str, tr: Str) -> Int {
-    // An alias stands for its target everywhere else in the type system, so the trait is
-    // asked of what the name resolves to. The caller keeps the written name for the
-    // message, because that is the text the author can change.
-    let ftype_name = resolve_alias_type_name(written)
-    // A name the hops cannot see through, such as a tuple alias, is judged by the type it names.
-    // A derive written on the alias grants nothing: the alias is that type.
-    let aliased = tc_alias_underlying_of(ftype_name)
-    if aliased != -1 {
-        if tr == "Hash" { return if tc_tid_hash_fact(aliased) == -1 { 0 } else { 1 } }
-        if type_kind(tc_resolve(aliased)) == TyKind.Tuple { return 0 }
-        if tr == "Ord" && tc_ord_need(aliased, []).len() > 0 { return 0 }
-        return 1
-    }
-
-    // Collections are never hashable or orderable in v1.
-    if tc_is_container_name(ftype_name) != 0 { return 0 }
-    // A range is never Hash or Ord (§3.6 *Traits of Range[T]*).
-    if ftype_name == "Range" { return 0 }
-
-    // A tuple field under Hash is judged by its type before this point. Codegen builds no
-    // tuple compare yet, so a tuple field under Ord is refused here rather than at C time.
-    if ftype_name == "Tuple" { return 0 }
-
-    if tc_is_integer_scalar(ftype_name) != 0 { return 1 }
-    if ftype_name == "Str" {
-        // Str is Hash + Eq + Ord.
-        return 1
-    }
-    if ftype_name == "Bool" {
-        // Bool: Hash + Eq, but NOT Ord.
-        if tr == "Ord" { return 0 }
-        return 1
-    }
-    if tc_is_float_scalar(ftype_name) != 0 {
-        // Float: Eq + Ord, but NOT Hash.
-        if tr == "Hash" { return 0 }
-        return 1
-    }
-
-    // User type: it must itself carry the trait (derive or hand-impl).
-    let bare = strip_module_qualifier(ftype_name)
-    let nominal = tc_written_type_nominal(ftype_name)
-    if named_type_map.contains_key(nominal) || named_type_map.contains_key(bare) {
-        if tr == "Hash" {
-            if tc_type_name_derives(nominal, "Hash") != 0 { return 1 }
-            return 0
-        }
-        // Ord
-        if tc_type_has_ord_impl(nominal) != 0 || tc_type_has_ord_impl(bare) != 0 { return 1 }
-        return 0
-    }
-
-    // Generic type param / unknown name — fail open.
-    1
-}
+// contain fields whose type itself implements the derived trait. Each field is asked
+// what its type needs, read over the type's own binders, which pass here: a generic
+// derive holds where its arguments have the trait, and that is asked at each instance.
+// A field of an applied generic is asked at its arguments, so `B[NoHash]` has no Hash
+// though `B` derives it.
 
 fn tc_check_one_derive_trait_field(f: Int, ftid: Int, tname: Str, tr: Str) ! Diag.Report {
-    let ann = node_value(f)
-    let ftype_name = node_name(ann)
-    let generic_help = "remove the field from the derive, give it a type that implements {tr}, or implement {tr} by hand"
-    if tr == "Eq" {
-        tc_check_derive_eq_field(f, ftid, tname, generic_help)
-        return
-    }
-    // A tuple has no name that carries Hash: it is Hash when its elements are, so the field's
-    // type answers. A type parameter among them is asked at each instance.
-    if tr == "Hash" && tc_derive_field_is_tuple(ftid) {
-        if tc_tid_hash_fact(ftid) == -1 {
-            diag_error_at("NonDerivableTrait", NON_DERIVABLE_TRAIT, "@derive(Hash) on `{tname}`: field `{node_name(f)}` has type `{type_ann_text(ann)}` which does not implement Hash", f, generic_help)
-        }
-        return
-    }
-    // A generic alias's target holds its arguments, so its name alone says too little.
-    let judged = if tc_ann_is_applied_generic_alias(ann) { tc_tid_name(tc_resolve(ftid)) } else { ftype_name }
-    if tc_field_type_derivable(judged, tr) == 0 {
-        diag_error_at("NonDerivableTrait", NON_DERIVABLE_TRAIT, "@derive({tr}) on `{tname}`: field `{node_name(f)}` has type `{ftype_name}` which does not implement {tr}", f, generic_help)
-    }
-}
-
-fn tc_derive_field_is_tuple(ftid: Int) -> Bool {
-    if ftid < 0 { return false }
-    type_kind(tc_resolve(resolve_alias_tid(tc_resolve(ftid)))) == TyKind.Tuple
-}
-
-// A derived Eq compares each field the way `==` would (03_types.md, *Derived Equality*),
-// so a field is asked what `==` asks of its type. The field's declared tid is read over the
-// type's own binders, which pass here: a generic derive is `Eq` where its arguments are,
-// and that is asked at each instance.
-fn tc_check_derive_eq_field(f: Int, ftid: Int, tname: Str, generic_help: Str) ! Diag.Report {
     if ftid < 0 { return }
-    let path = tc_eq_need(ftid, [])
+    let path = if tr == "Eq" { tc_eq_need(ftid, []) } else if tr == "Ord" { tc_derive_ord_need(ftid) } else { tc_derive_only_need(ftid, tr) }
     if path.len() == 0 { return }
     let mut notes: List[Str] = []
     let mut i = 0
     while i + 1 < path.len() {
-        notes.push("`{type_to_str(path.get(i).unwrap())}` is `Eq` only if `{type_to_str(path.get(i + 1).unwrap())}` is `Eq`")
+        notes.push("`{type_to_str(path.get(i).unwrap())}` is `{tr}` only if `{type_to_str(path.get(i + 1).unwrap())}` is `{tr}`")
         i = i + 1
     }
-    let leaf = path.get(path.len() - 1).unwrap()
-    let k = type_kind(leaf)
-    let help = if k == TyKind.Struct || k == TyKind.Enum {
-        let base = if k == TyKind.Struct { tc_struct_base_tid(leaf) } else { tc_enum_base_tid(leaf) }
-        let bname = strip_module_qualifier(tc_type_name(base))
-        "{tc_derive_fix_imports(["Eq"], bname)}add `@derive({tc_derive_arg_for("Eq", bname)})` to `type {bname}`"
-    } else {
-        generic_help
-    }
     diag_error_at_notes("NonDerivableTrait", NON_DERIVABLE_TRAIT,
-        "@derive(Eq) on `{tname}`: field `{node_name(f)}` has type `{type_ann_text(node_value(f))}` which does not implement Eq",
-        f, help, notes)
+        "@derive({tr}) on `{tname}`: field `{node_name(f)}` has type `{type_ann_text(node_value(f))}` which does not implement {tr}",
+        f, tc_derive_field_help(path.get(path.len() - 1).unwrap(), tr), notes)
+}
+
+// What a derived cmp needs of a field. Codegen builds no compare for a tuple, nor for a
+// fieldless enum with no derive, though the spec gives both an order, so such a field is
+// refused here rather than at C time.
+fn tc_derive_ord_need(ftid: Int) -> List[Int] {
+    let need = tc_ord_need(ftid, [])
+    if need.len() > 0 { return need }
+    let unbuilt = tc_ord_not_lowered(ftid)
+    if unbuilt != -1 { [unbuilt] } else { [] }
+}
+
+// A struct or enum at the end of the chain gets the derive it lacks. One that derives the
+// trait and still has none lacks it at an argument, so a second derive on it is no fix.
+fn tc_derive_field_help(leaf: Int, tr: Str) -> Str {
+    let generic_help = "remove the field from the derive, give it a type that implements {tr}, or implement {tr} by hand"
+    let k = type_kind(leaf)
+    if k != TyKind.Struct && k != TyKind.Enum { return generic_help }
+    if tc_tid_base_derives(leaf, tr) { return generic_help }
+    let base = if k == TyKind.Struct { tc_struct_base_tid(leaf) } else { tc_enum_base_tid(leaf) }
+    let bname = strip_module_qualifier(tc_type_name(base))
+    "{tc_derive_fix_imports([tr], bname)}add `@derive({tc_derive_arg_for(tr, bname)})` to `type {bname}`"
 }
 
 // The declared tid of the struct field `f`, or of the `fi`th field of variant `v`; -1 when
@@ -13937,57 +13824,30 @@ fn tc_check_derive_hash_eq_ord() ! Diag.Report {
 }
 
 // ---------------------------------------------------------------------------
-// E1401 NonDerivableTrait for @derive(Serialize) — spec §3.6.6, §3.6.2. Mirrors
-// tc_check_derive_debug: every field of a @derive(Serialize) type (and every
-// enum-variant field) must have a type the generated to_json can faithfully
-// serialize. The emitter (emit_field_serialize / emit_list_serialize in
-// codegen_derive.bl) produces a real value for exactly: the scalar primitives,
-// a List of a serializable element (recursively), and a struct/enum that itself
-// carries @derive(Serialize) (has_derive_method is derive-only). Any other type
-// — Ptr, an @ffi.opaque handle, a non-Serialize user type, or a container the
-// emitter does not yet walk (Option/Map/Set/Result) — falls through to the
-// literal "null", the banned silent fallback the per-field derive checks exist
-// to prevent. Reject those at derive time instead. Fails OPEN on a generic type
-// param (a name that is neither a builtin nor a registered user type), deferring
-// the decision to instantiation, exactly as the Debug and Hash/Eq/Ord passes do.
+// E1401 NonDerivableTrait for @derive(Serialize) — spec §3.6.6, §3.6.2. A field type the
+// derived to_json has no writer for would fall through to a literal "null", the silent
+// fallback the per-field derive checks exist to prevent.
 
-// Is a bare scalar type name one the to_json emitter renders as a real JSON leaf
-// (not "null")? Only these four reach a faithful emitter branch: Int / I64 →
-// int_to_str (both lower to int), Float → float_to_str, Bool → true/false,
-// Str → escaped string. Char, the sized ints (I8/I16/I32, U8/U16/U32/U64) and
-// F32/F64 keep distinct CTs that fall through the emitter's else arm to the
-// literal "null", so they are NOT accepted here — this must not reuse the
-// Hash/Eq/Ord scalar helpers, whose set is wider than the emitter's.
-fn tc_serialize_scalar_ok(n: Str) -> Int {
-    if n == "Int" || n == "I64" || n == "Float" || n == "Bool" || n == "Str" { return 1 }
-    0
-}
-
-// A user type is faithfully serialized only when it itself derives Serialize
-// (mirrors the emitter's derive-only has_derive_method). An @ffi.opaque handle
-// is a registered struct with no derive, so it is rejected. A name that is
-// neither a builtin nor a registered user type is a generic type param — fail
-// open, deferring the decision to instantiation, as the Debug / Hash-Eq-Ord
-// passes do.
-fn tc_serialize_user_type_ok(name: Str) -> Int {
-    let bare = strip_module_qualifier(name)
-    let nominal = tc_written_type_nominal(name)
-    if named_type_map.contains_key(nominal) || named_type_map.contains_key(bare) {
-        if tc_type_name_derives(nominal, "Serialize") != 0 { return 1 }
-        return 0
-    }
-    1
-}
-
-// The Serialize answer at a resolved type, for a name through an alias, whose written spelling
-// shows neither the target nor a generic alias's arguments. A leaf is what a List element holds.
-fn tc_serialize_leaf_tid_ok(tid: Int) -> Int {
+// What a derived to_json writes for a value of type `tid` (cg_derive ser_part): Int, Float,
+// Bool and Str as JSON leaves, a List through its element, and a struct or enum through its
+// own derived to_json. Tri-state as tc_derive_only_fact: a type parameter or an unsolved type
+// is not judged. Char, the sized ints and every other kind have no writer and answer -1.
+fn tc_serialize_written_fact(tid: Int) -> Int {
     let t = resolve_alias_tid(tc_resolve(tid))
     let k = type_kind(t)
+    if k == TyKind.Typevar || k == TyKind.Unknown { return 0 }
     if k == TyKind.Int || k == TyKind.Float || k == TyKind.Bool || k == TyKind.Str { return 1 }
-    if k == TyKind.Typevar || k == TyKind.Unknown { return 1 }
-    if k != TyKind.Struct && k != TyKind.Enum { return 0 }
-    if tc_derive_only_fact(t, "Serialize") == -1 { 0 } else { 1 }
+    if k == TyKind.List { return tc_serialize_written_fact(tc_tid_child(t, 0)) }
+    if k == TyKind.Struct || k == TyKind.Enum { return tc_derive_only_fact(t, "Serialize") }
+    -1
+}
+
+// The declaration check is stricter than the writer: a List element must be a leaf, not
+// another List.
+fn tc_serialize_leaf_tid_ok(tid: Int) -> Int {
+    let t = resolve_alias_tid(tc_resolve(tid))
+    if type_kind(t) == TyKind.List { return 0 }
+    if tc_serialize_written_fact(t) == -1 { 0 } else { 1 }
 }
 
 fn tc_serialize_field_tid_ok(tid: Int) -> Int {
@@ -13995,74 +13855,21 @@ fn tc_serialize_field_tid_ok(tid: Int) -> Int {
     if type_kind(t) == TyKind.List { tc_serialize_leaf_tid_ok(tc_tid_child(t, 0)) } else { tc_serialize_leaf_tid_ok(t) }
 }
 
+// An enum-variant field has a narrower set than a struct field: no List, and no enum.
 fn tc_serialize_variant_tid_ok(tid: Int) -> Int {
     let t = resolve_alias_tid(tc_resolve(tid))
-    let k = type_kind(t)
-    if (k == TyKind.Struct || k == TyKind.Enum) && tc_type_is_struct(tc_tid_name(t)) == 0 { return 0 }
+    if type_kind(t) == TyKind.Enum { return 0 }
     tc_serialize_leaf_tid_ok(t)
 }
 
-// A List element type emit_list_serialize renders faithfully: a scalar leaf, or
-// a user struct/enum that itself derives Serialize (the elem_struct +
-// has_derive_method arm covers both). A nested List, Char, a sized int, F32/F64,
-// Option, Map, etc. all fall through to "null", so is_primitive_type rejects
-// them (List included) before the user-type check.
-fn tc_serialize_list_elem_ok(ann: Int) -> Int ! TypeCheck.Resolve, Diag.Report {
-    let name = node_name(ann)
-    if tc_alias_decl_of_written(name) != -1 { return tc_serialize_leaf_tid_ok(resolve_type_ann(ann)) }
-    if tc_serialize_scalar_ok(name) != 0 { return 1 }
-    if is_primitive_type(name) != 0 { return 0 }
-    tc_serialize_user_type_ok(name)
-}
-
-// A struct-field type emit_field_serialize renders faithfully: a scalar leaf, a
-// List of a faithful element, or a user struct/enum that derives Serialize (its
-// void + has_derive_method arm covers both struct and enum fields).
-fn tc_serialize_struct_field_ok(ann: Int) -> Int ! TypeCheck.Resolve, Diag.Report {
-    let name = node_name(ann)
-    if tc_alias_decl_of_written(name) != -1 { return tc_serialize_field_tid_ok(resolve_type_ann(ann)) }
-    if tc_serialize_scalar_ok(name) != 0 { return 1 }
-    if name == "List" {
-        let elems_sl = node_elements(ann)
-        if elems_sl != -1 && sublist_length(elems_sl) >= 1 {
-            return tc_serialize_list_elem_ok(sublist_get(elems_sl, 0))
-        }
-        // A bare List with no element annotation cannot be proven serializable.
-        return 0
-    }
-    if is_primitive_type(name) != 0 { return 0 }
-    tc_serialize_user_type_ok(name)
-}
-
-// An enum-variant field type emit_enum_to_json renders faithfully — a strictly
-// weaker set than the struct path. It has NO List branch (even List[Int] emits
-// "null") and gates nested recursion on is_struct_type, so an enum-typed field
-// (even one deriving Serialize) also emits "null". Faithful set: a scalar leaf,
-// or a user STRUCT that derives Serialize. List and enum-typed fields are
-// rejected here until emit_enum_to_json grows the matching branches.
-fn tc_serialize_variant_field_ok(ann: Int) -> Int ! TypeCheck.Resolve, Diag.Report {
-    let name = node_name(ann)
-    if tc_alias_decl_of_written(name) != -1 { return tc_serialize_variant_tid_ok(resolve_type_ann(ann)) }
-    if tc_serialize_scalar_ok(name) != 0 { return 1 }
-    if is_primitive_type(name) != 0 { return 0 }
-    let bare = strip_module_qualifier(name)
-    let nominal = tc_written_type_nominal(name)
-    if named_type_map.contains_key(nominal) || named_type_map.contains_key(bare) {
-        if tc_type_name_derives(nominal, "Serialize") != 0 {
-            if tc_type_is_struct(nominal) != 0 || tc_type_is_struct(bare) != 0 { return 1 }
-            return 0
-        }
-        return 0
-    }
-    // Generic type param — fail open.
-    1
-}
-
-fn tc_check_one_serialize_field(f: Int, tname: Str, in_variant: Int) ! TypeCheck.Resolve, Diag.Report {
-    let ann = node_value(f)
-    let ok = if in_variant != 0 { tc_serialize_variant_field_ok(ann) } else { tc_serialize_struct_field_ok(ann) }
+// A field is judged by its declared type `ftid`, not by the name the type is written with,
+// so `B[NoSer]` is refused though `B` derives Serialize. A tid the pools hold no entry for is
+// not judged.
+fn tc_check_one_serialize_field(f: Int, ftid: Int, tname: Str, in_variant: Int) ! Diag.Report {
+    if ftid < 0 { return }
+    let ok = if in_variant != 0 { tc_serialize_variant_tid_ok(ftid) } else { tc_serialize_field_tid_ok(ftid) }
     if ok == 0 {
-        diag_error_at("NonDerivableTrait", NON_DERIVABLE_TRAIT, "@derive(Serialize) on `{tname}`: field `{node_name(f)}` has type `{node_name(ann)}` which does not implement Serialize", f, "remove the field from the derive, give it a type that implements Serialize, or implement Serialize by hand")
+        diag_error_at("NonDerivableTrait", NON_DERIVABLE_TRAIT, "@derive(Serialize) on `{tname}`: field `{node_name(f)}` has type `{type_ann_text(node_value(f))}` which does not implement Serialize", f, "remove the field from the derive, give it a type that implements Serialize, or implement Serialize by hand")
     }
 }
 
@@ -14072,6 +13879,7 @@ fn tc_check_derive_serialize() ! TypeCheck.Resolve, Diag.Report {
         let tname = named_type_names.get(ti).unwrap()
         let td = tc_decl_node_for_type(tname)
         if td != -1 && tc_decl_derives(td, "Serialize") != 0 {
+            let ttid = named_type_ids.get(ti) ?? -1
             let td_module = node_module(td)
             let saved_module = nr_current_module
             nr_current_module = td_module
@@ -14083,11 +13891,11 @@ fn tc_check_derive_serialize() ! TypeCheck.Resolve, Diag.Report {
                     let vflds_sl = node_fields(f)
                     let mut vi = 0
                     while vflds_sl != -1 && vi < sublist_length(vflds_sl) {
-                        tc_check_one_serialize_field(sublist_get(vflds_sl, vi), tname, 1)
+                        tc_check_one_serialize_field(sublist_get(vflds_sl, vi), tc_derive_variant_field_tid(f, vi), tname, 1)
                         vi = vi + 1
                     }
                 } else {
-                    tc_check_one_serialize_field(f, tname, 0)
+                    tc_check_one_serialize_field(f, tc_derive_struct_field_tid(ttid, f), tname, 0)
                 }
                 i = i + 1
             }
