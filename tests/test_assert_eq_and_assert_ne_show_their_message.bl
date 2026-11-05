@@ -108,3 +108,60 @@ test "blink test shows the message of a failed assert_eq" {
     let shown = "{r.out}{r.err_out}"
     assert(shown.contains("  ASSERT_EQ FAILED: 3 != 5 (line 3)\n    message: my note\n"), shown)
 }
+
+// A message is kept whole at any length: a cut at a fixed size can also split a UTF-8
+// sequence. The marks at the end show nothing was cut.
+fn long_text() -> Str {
+    let sb = StringBuilder.new()
+    for _ in 0..1024 {
+        sb.write("0123456789")
+    }
+    sb.write("END")
+    sb.to_str()
+}
+
+// The two-byte char starts at byte 255 and the three-byte ones end past byte 256.
+fn wide_text() -> Str {
+    let sb = StringBuilder.new()
+    for _ in 0..255 {
+        sb.write("a")
+    }
+    sb.write("é日本語END")
+    sb.to_str()
+}
+
+test "a failed assert_eq in main shows a 10 KB message whole" {
+    let big = long_text()
+    expect_main_report("assert_eq(n, 5, \"{big}\")", "msg_long_eq",
+        "ASSERT_EQ FAILED: 3 != 5 (line 6)\n    message: {big}\n")
+}
+
+test "a failed assert_eq in main shows a multi-byte char past byte 256 whole" {
+    let wide = wide_text()
+    expect_main_report("assert_eq(n, 5, \"{wide}\")", "msg_wide_eq",
+        "ASSERT_EQ FAILED: 3 != 5 (line 6)\n    message: {wide}\n")
+}
+
+test "a failed assert in main shows a long message whole" {
+    for text in [long_text(), wide_text()] {
+        let r = compile_and_run(in_main("assert(n == 5, \"{text}\")"), "msg_long_assert_{getpid()}")
+        assert_eq(r.exit_code, 101, "exit {r.exit_code}: {r.out}{r.err_out}")
+        assert(r.err_out.starts_with("assertion failed: assert(n == 5)\n    message: {text}\n"), r.err_out)
+    }
+}
+
+test "the test record carries a long message whole" {
+    for text in [long_text(), wide_text()] {
+        let eq = test_record("assert_eq(n, 5, \"{text}\")", "msg_rec_long_eq")
+        assert(eq.contains("\"user_message\":\"{text}\""), eq)
+        let plain = test_record("assert(n == 5, \"{text}\")", "msg_rec_long_assert")
+        assert(plain.contains("\"user_message\":\"{text}\""), plain)
+    }
+}
+
+test "a for_each case gives its test a long message whole" {
+    let text = wide_text()
+    let src = "import std.testing.\{for_each\}\n\ntest \"t\" \{\n    for_each([(\"a\", 3), (\"b\", 4)], fn(v: Int) \{\n        assert_eq(v, 3, \"{text}\")\n    \})\n\}\n"
+    let out = compile_and_run_test_json(src, "msg_rec_case_{getpid()}").out
+    assert(out.contains("\"user_message\":\"{text}\""), out)
+}

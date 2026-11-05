@@ -50,7 +50,10 @@ BLINK_TEST_STORAGE char __blink_test_fail_assertion[256];
 BLINK_TEST_STORAGE char __blink_test_fail_intro[BLINK_PA_INTRO_BUF_SIZE];
 BLINK_TEST_STORAGE char __blink_test_fail_file[256];
 BLINK_TEST_STORAGE int __blink_test_fail_col;
-BLINK_TEST_STORAGE char __blink_test_fail_user_msg[256];
+/* The message an assertion was given, whole: a cut at any size can split a UTF-8 sequence.
+ * A malloc'd copy, not the Blink string, since the GC does not scan thread-local storage.
+ * NULL when there is none. */
+BLINK_TEST_STORAGE char* __blink_test_fail_user_msg;
 /* Cause discriminator for NDJSON output: "assertion", or "propagated_error"
  * from __blink_test_set_propagate for spec §2.20 test-body `?` propagation.
  * Each path that fails a test sets it, so it never names an earlier failure. */
@@ -102,6 +105,8 @@ BLINK_TEST_STORAGE char __blink_test_skip_reason[256];
  * not compile a copy of each one. */
 BLINK_RT_FN void __blink_assert_fail(const char* msg, int line);
 BLINK_RT_FN void __blink_assert_fail_eq(const char* msg, const char* expected, const char* actual, int line);
+/* The pinned gen0 compiler emits calls to these two, and the code it builds links against this
+ * runtime, so they stay until a gen0 pin emits the _user_msg_at forms. */
 BLINK_RT_FN void __blink_assert_fail_at(const char* msg, const char* file, int line);
 BLINK_RT_FN void __blink_assert_fail_eq_at(const char* msg, const char* expected, const char* actual, const char* file, int line);
 BLINK_RT_FN void __blink_assert_fail_user_msg_at(const char* msg, const char* file, int line, const char* user_msg);
@@ -127,6 +132,23 @@ BLINK_RT_FN void blink_test_run(const blink_test_entry* tests, int count, int ar
 
 #ifdef BLINK_RUNTIME_TEST_BODIES
 
+/* malloc, not blink_strdup, for text kept where the GC does not look: thread-local storage
+ * or a malloc'd array. A GC string held only there could be collected. */
+BLINK_UNUSED static char* __blink_test_malloc_copy(const char* text) {
+    size_t len = strlen(text) + 1;
+    char* copy = (char*)malloc(len);
+    if (copy == NULL) { fprintf(stderr, "blink: out of memory\n"); exit(1); }
+    memcpy(copy, text, len);
+    return copy;
+}
+
+BLINK_UNUSED static void __blink_test_set_user_msg(const char* text) {
+    free(__blink_test_fail_user_msg);
+    __blink_test_fail_user_msg = NULL;
+    if (text == NULL || text[0] == '\0') return;
+    __blink_test_fail_user_msg = __blink_test_malloc_copy(text);
+}
+
 /* Spec §2.20: an assertion failure panics. Outside a test run there is no
  * per-test frame to longjmp to, so the failure is an uncaught panic. The
  * runner's panic hook is the marker for a test run. A program's on_panic hook
@@ -135,42 +157,46 @@ BLINK_RT_FN void blink_test_run(const blink_test_entry* tests, int count, int ar
  * output does. site_file is the file of a call that records no file of its own, for the
  * hook only. */
 BLINK_UNUSED static void __blink_assert_fail_uncaught(const char* site_file) {
-    char buf[BLINK_PA_INTRO_BUF_SIZE + 2048];
+    /* The fixed part bounds the other fields, which keep their own caps; the user message
+     * comes on top so it prints whole. Not malloc, since dispatch may longjmp past a free. */
+    size_t cap = BLINK_PA_INTRO_BUF_SIZE + 2048
+               + (__blink_test_fail_user_msg ? strlen(__blink_test_fail_user_msg) : 0);
+    char* buf = (char*)blink_alloc_atomic((int64_t)cap);
     size_t n = 0;
     if (__blink_test_fail_assertion[0]) {
-        if (__blink_test_fail_user_msg[0]) {
-            snprintf(buf, sizeof(buf), "assertion failed: %s: %s", __blink_test_fail_assertion,
+        if (__blink_test_fail_user_msg) {
+            snprintf(buf, cap, "assertion failed: %s: %s", __blink_test_fail_assertion,
                      __blink_test_fail_user_msg);
         } else {
-            snprintf(buf, sizeof(buf), "assertion failed: %s", __blink_test_fail_assertion);
+            snprintf(buf, cap, "assertion failed: %s", __blink_test_fail_assertion);
         }
-    } else if (__blink_test_fail_user_msg[0]) {
-        snprintf(buf, sizeof(buf), "%s: %s", __blink_test_fail_msg, __blink_test_fail_user_msg);
+    } else if (__blink_test_fail_user_msg) {
+        snprintf(buf, cap, "%s: %s", __blink_test_fail_msg, __blink_test_fail_user_msg);
     } else {
-        snprintf(buf, sizeof(buf), "%s", __blink_test_fail_msg);
+        snprintf(buf, cap, "%s", __blink_test_fail_msg);
     }
     const char* hook_file = __blink_test_fail_file[0] || site_file == NULL ? __blink_test_fail_file : site_file;
     __blink_panic_hook_run(buf, hook_file, __blink_test_fail_line);
     if (__blink_test_fail_assertion[0]) {
-        n += snprintf(buf + n, sizeof(buf) - n, "assertion failed: %s", __blink_test_fail_assertion);
-        if (__blink_test_fail_user_msg[0] && n < sizeof(buf)) {
-            n += snprintf(buf + n, sizeof(buf) - n, "\n    message: %s", __blink_test_fail_user_msg);
+        n += snprintf(buf + n, cap - n, "assertion failed: %s", __blink_test_fail_assertion);
+        if (__blink_test_fail_user_msg && n < cap) {
+            n += snprintf(buf + n, cap - n, "\n    message: %s", __blink_test_fail_user_msg);
         }
-        if (__blink_test_fail_intro[0] && n < sizeof(buf)) {
-            n += snprintf(buf + n, sizeof(buf) - n, "\n%s", __blink_test_fail_intro);
+        if (__blink_test_fail_intro[0] && n < cap) {
+            n += snprintf(buf + n, cap - n, "\n%s", __blink_test_fail_intro);
         }
-        if (n < sizeof(buf)) {
+        if (n < cap) {
             if (__blink_test_fail_file[0]) {
-                snprintf(buf + n, sizeof(buf) - n, "\n  --> %s:%d:%d", __blink_test_fail_file,
+                snprintf(buf + n, cap - n, "\n  --> %s:%d:%d", __blink_test_fail_file,
                          __blink_test_fail_line, __blink_test_fail_col);
             } else {
-                snprintf(buf + n, sizeof(buf) - n, "\n  (line %d)", __blink_test_fail_line);
+                snprintf(buf + n, cap - n, "\n  (line %d)", __blink_test_fail_line);
             }
         }
     } else {
-        n += snprintf(buf, sizeof(buf), "%s (line %d)", __blink_test_fail_msg, __blink_test_fail_line);
-        if (__blink_test_fail_user_msg[0] && n < sizeof(buf)) {
-            snprintf(buf + n, sizeof(buf) - n, "\n    message: %s", __blink_test_fail_user_msg);
+        n += snprintf(buf, cap, "%s (line %d)", __blink_test_fail_msg, __blink_test_fail_line);
+        if (__blink_test_fail_user_msg && n < cap) {
+            snprintf(buf + n, cap - n, "\n    message: %s", __blink_test_fail_user_msg);
         }
     }
     __blink_panic_dispatch(buf);
@@ -211,7 +237,7 @@ BLINK_RT_FN void __blink_assert_fail_user_msg_at(const char* msg, const char* fi
     __blink_test_fail_intro[0] = '\0';
     __blink_test_fail_file[0] = '\0';
     __blink_test_fail_col = 0;
-    BLINK_COPY_OR_EMPTY(__blink_test_fail_user_msg, user_msg);
+    __blink_test_set_user_msg(user_msg);
     __blink_test_fail_expected[0] = '\0';
     __blink_test_fail_actual[0] = '\0';
     if (__blink_panic_test_hook == NULL) __blink_assert_fail_uncaught(file);
@@ -250,15 +276,7 @@ BLINK_UNUSED static void blink_record_case(const char* label, int status, const 
     blink_test_case_record* r = &__blink_test_case_records[n];
     BLINK_COPY_OR_EMPTY(r->label, label);
     r->status = status;
-    r->message = NULL;
-    /* malloc, not blink_strdup: the GC does not scan this malloc'd array, so a
-     * GC string held only here could be collected. */
-    if (message) {
-        size_t len = strlen(message) + 1;
-        r->message = (char*)malloc(len);
-        if (r->message == NULL) { fprintf(stderr, "blink: out of memory\n"); exit(1); }
-        memcpy(r->message, message, len);
-    }
+    r->message = message ? __blink_test_malloc_copy(message) : NULL;
     __blink_test_case_record_count = n + 1;
 }
 
@@ -287,7 +305,7 @@ BLINK_RT_FN void __blink_assert_fail_eq_user_msg_at(const char* msg,
     __blink_test_fail_intro[0] = '\0';
     __blink_test_fail_file[0] = '\0';
     __blink_test_fail_col = 0;
-    BLINK_COPY_OR_EMPTY(__blink_test_fail_user_msg, user_msg);
+    __blink_test_set_user_msg(user_msg);
     BLINK_COPY_OR_EMPTY(__blink_test_fail_expected, expected);
     BLINK_COPY_OR_EMPTY(__blink_test_fail_actual, actual);
     if (__blink_panic_test_hook == NULL) __blink_assert_fail_uncaught(file);
@@ -329,7 +347,7 @@ BLINK_RT_FN void __blink_assert_fail_intro(const char* assertion,
     BLINK_COPY_OR_EMPTY(__blink_test_fail_assertion, assertion);
     BLINK_COPY_OR_EMPTY(__blink_test_fail_intro, intro);
     BLINK_COPY_OR_EMPTY(__blink_test_fail_file, file);
-    BLINK_COPY_OR_EMPTY(__blink_test_fail_user_msg, user_msg);
+    __blink_test_set_user_msg(user_msg);
     __blink_test_fail_expected[0] = '\0';
     __blink_test_fail_actual[0] = '\0';
     if (__blink_panic_test_hook == NULL) __blink_assert_fail_uncaught(NULL);
@@ -356,7 +374,7 @@ BLINK_RT_FN void __blink_test_set_propagate(const char* message,
     BLINK_COPY_OR_EMPTY(__blink_test_fail_file, file);
     __blink_test_fail_assertion[0] = '\0';
     __blink_test_fail_intro[0] = '\0';
-    __blink_test_fail_user_msg[0] = '\0';
+    __blink_test_set_user_msg(NULL);
     __blink_test_fail_expected[0] = '\0';
     __blink_test_fail_actual[0] = '\0';
 }
@@ -419,7 +437,7 @@ BLINK_UNUSED static void __blink_test_note_panic(const char* msg) {
     __blink_test_fail_intro[0] = '\0';
     __blink_test_fail_file[0] = '\0';
     __blink_test_fail_col = 0;
-    __blink_test_fail_user_msg[0] = '\0';
+    __blink_test_set_user_msg(NULL);
     __blink_test_fail_expected[0] = '\0';
     __blink_test_fail_actual[0] = '\0';
 }
@@ -445,7 +463,7 @@ typedef struct {
     char assertion[sizeof(__blink_test_fail_assertion)];
     char intro[sizeof(__blink_test_fail_intro)];
     char file[sizeof(__blink_test_fail_file)];
-    char user_msg[sizeof(__blink_test_fail_user_msg)];
+    char* user_msg;
     char error_type[sizeof(__blink_test_fail_error_type)];
     char error_message[sizeof(__blink_test_fail_error_message)];
     char case_label[sizeof(__blink_test_case_label)];
@@ -461,13 +479,14 @@ BLINK_UNUSED static void __blink_test_fail_record_save(blink_test_fail_record* r
     memcpy(r->assertion, __blink_test_fail_assertion, sizeof(r->assertion));
     memcpy(r->intro, __blink_test_fail_intro, sizeof(r->intro));
     memcpy(r->file, __blink_test_fail_file, sizeof(r->file));
-    memcpy(r->user_msg, __blink_test_fail_user_msg, sizeof(r->user_msg));
+    r->user_msg = __blink_test_fail_user_msg;
+    __blink_test_fail_user_msg = NULL;
     memcpy(r->error_type, __blink_test_fail_error_type, sizeof(r->error_type));
     memcpy(r->error_message, __blink_test_fail_error_message, sizeof(r->error_message));
     memcpy(r->case_label, __blink_test_case_label, sizeof(r->case_label));
 }
 
-BLINK_UNUSED static void __blink_test_fail_record_restore(const blink_test_fail_record* r) {
+BLINK_UNUSED static void __blink_test_fail_record_restore(blink_test_fail_record* r) {
     __blink_test_fail_cause = r->cause;
     __blink_test_fail_line = r->line;
     __blink_test_fail_col = r->col;
@@ -477,7 +496,9 @@ BLINK_UNUSED static void __blink_test_fail_record_restore(const blink_test_fail_
     memcpy(__blink_test_fail_assertion, r->assertion, sizeof(r->assertion));
     memcpy(__blink_test_fail_intro, r->intro, sizeof(r->intro));
     memcpy(__blink_test_fail_file, r->file, sizeof(r->file));
-    memcpy(__blink_test_fail_user_msg, r->user_msg, sizeof(r->user_msg));
+    free(__blink_test_fail_user_msg);
+    __blink_test_fail_user_msg = r->user_msg;
+    r->user_msg = NULL;
     memcpy(__blink_test_fail_error_type, r->error_type, sizeof(r->error_type));
     memcpy(__blink_test_fail_error_message, r->error_message, sizeof(r->error_message));
     memcpy(__blink_test_case_label, r->case_label, sizeof(r->case_label));
@@ -553,6 +574,7 @@ BLINK_RT_FN void blink_test_run_case(const char* label, const char* duplicate, b
         __blink_test_failed = prev_failed;
         __blink_test_fail_record_restore(&prev_record);
     }
+    free(prev_record.user_msg);
     __blink_test_skipped = prev_skipped;
     if (status != BLINK_TEST_CASE_SKIPPED || prev_reason[0]) {
         memcpy(__blink_test_skip_reason, prev_reason, sizeof(prev_reason));
@@ -867,7 +889,7 @@ BLINK_RT_FN void blink_test_run(const blink_test_entry* tests, int count, int ar
         __blink_test_fail_intro[0] = '\0';
         __blink_test_fail_file[0] = '\0';
         __blink_test_fail_col = 0;
-        __blink_test_fail_user_msg[0] = '\0';
+        __blink_test_set_user_msg(NULL);
         __blink_test_fail_expected[0] = '\0';
         __blink_test_fail_actual[0] = '\0';
         __blink_test_case_label[0] = '\0';
@@ -923,7 +945,7 @@ BLINK_RT_FN void blink_test_run(const blink_test_entry* tests, int count, int ar
                 __blink_test_fail_expected[0] = '\0';
                 __blink_test_fail_actual[0] = '\0';
                 __blink_test_fail_intro[0] = '\0';
-                __blink_test_fail_user_msg[0] = '\0';
+                __blink_test_set_user_msg(NULL);
                 snprintf(__blink_test_fail_assertion, sizeof(__blink_test_fail_assertion),
                          "expected failure, got pass");
             } else {
@@ -1007,7 +1029,7 @@ BLINK_RT_FN void blink_test_run(const blink_test_entry* tests, int count, int ar
                 if (__blink_test_fail_intro[0]) {
                     __blink_test_rec_printf(",\"introspection\":"); __blink_test_print_json_str(__blink_test_fail_intro);
                 }
-                if (__blink_test_fail_user_msg[0]) {
+                if (__blink_test_fail_user_msg) {
                     __blink_test_rec_printf(",\"user_message\":"); __blink_test_print_json_str(__blink_test_fail_user_msg);
                 }
                 if (__blink_test_fail_error_type[0] || __blink_test_fail_error_message[0]) {
@@ -1038,7 +1060,7 @@ BLINK_RT_FN void blink_test_run(const blink_test_entry* tests, int count, int ar
                 }
                 if (__blink_test_fail_assertion[0]) {
                     fprintf(stderr, "  assertion failed: %s\n", __blink_test_fail_assertion);
-                    if (__blink_test_fail_user_msg[0]) {
+                    if (__blink_test_fail_user_msg) {
                         fprintf(stderr, "    message: %s\n", __blink_test_fail_user_msg);
                     }
                     if (__blink_test_fail_intro[0]) {
@@ -1058,7 +1080,7 @@ BLINK_RT_FN void blink_test_run(const blink_test_entry* tests, int count, int ar
                     } else {
                         fprintf(stderr, "  %s\n", __blink_test_fail_msg);
                     }
-                    if (__blink_test_fail_user_msg[0]) {
+                    if (__blink_test_fail_user_msg) {
                         fprintf(stderr, "    message: %s\n", __blink_test_fail_user_msg);
                     }
                 }
