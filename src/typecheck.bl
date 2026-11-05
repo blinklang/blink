@@ -21112,11 +21112,9 @@ fn nr_private_access_here(space: Str, name: Str) -> Int ! Diag.Report {
     // user variant must not poison the verdict. Mirrors nr_check_selective_access.
     if is_builtin_name(name) != 0 { return 0 }
     let decl = nr_resolve_bare_decl(name, nr_current_module)
-    if decl != -1 {
-        // A renamed import is checked against its declaration by nr_emit_imported_private_access.
-        if node_name(decl) != name { return 0 }
-        return nr_bound_use_private(decl, space, name)
-    }
+    // An import can bind the declaration under another name, and its module records it under
+    // the name it declares.
+    if decl != -1 { return nr_bound_use_private(decl, space, node_name(decl)) }
     // The file binds no declaration of the spelling. The use is private only when every
     // declaration of the namespace it can mean is, the ones this file's imports reach if there
     // are any, else all of them.
@@ -21234,23 +21232,11 @@ fn nr_bare_private_use_decl(name: Str, resolved: Int) -> Int {
     if cands.len() == 1 { cands.get(0) ?? -1 } else { -1 }
 }
 
-// A selective import can bind a private item under a new name, and the bare-name privacy
-// table only knows the old one, so the use must be checked against the declaration itself.
-fn nr_imported_private_decl(name: Str) -> Int ! Diag.Report {
-    let decl = nr_resolve_imported_decl(name, nr_current_module)
-    if decl == -1 { return -1 }
-    if nr_decl_private(decl) != 0 { decl } else { -1 }
-}
-
-// Reports a use of `name` that reaches a private item through an import rename.
-fn nr_emit_imported_private_access(name: Str, node: Int, what: Str, repair: Str) -> Bool ! Diag.Report {
-    let decl = nr_imported_private_decl(name)
-    if decl == -1 { return false }
-    let real = node_name(decl)
-    if nr_emit_default_body_access(real, decl, node) { return true }
-    tc_errors.push("cannot access private {what} `{real}`")
-    diag_error_at("PrivateItemAccess", PRIVATE_ITEM_ACCESS, "cannot access private {what} `{real}` from another module", node, repair)
-    true
+// The name E1003 gives a bare private use: an import can bind the item under another name, and
+// the message names the item its module declares.
+fn nr_private_use_name(name: Str) -> Str {
+    let decl = nr_resolve_bare_decl(name, nr_current_module)
+    if decl == -1 { name } else { node_name(decl) }
 }
 
 fn nr_register_private(space: Str, name: Str, mod_name: Str) {
@@ -25346,8 +25332,9 @@ fn nr_check_type_ref(name: Str, at: Int) ! TypeCheck.Resolve, Diag.Report {
     if is_known_type(name) != 0 {
         if nr_check_selective_access(name, at) != 0 { return }
         if is_private_access("type", name) != 0 {
-            tc_errors.push("cannot access private type `{name}`")
-            nr_error("PrivateItemAccess", PRIVATE_ITEM_ACCESS, "cannot access private type `{name}` from another module", at, "mark the type as `pub` in its module")
+            let real = nr_private_use_name(name)
+            tc_errors.push("cannot access private type `{real}`")
+            nr_error("PrivateItemAccess", PRIVATE_ITEM_ACCESS, "cannot access private type `{real}` from another module", at, "mark the type as `pub` in its module")
             return
         }
         tc_mark_symbol_used(name)
@@ -25356,8 +25343,9 @@ fn nr_check_type_ref(name: Str, at: Int) ! TypeCheck.Resolve, Diag.Report {
     if is_trait_name(name) != 0 {
         if nr_check_selective_access(name, at) != 0 { return }
         if is_private_access("type", name) != 0 {
-            tc_errors.push("cannot access private trait `{name}`")
-            nr_error("PrivateItemAccess", PRIVATE_ITEM_ACCESS, "cannot access private trait `{name}` from another module", at, "mark the trait as `pub` in its module")
+            let real = nr_private_use_name(name)
+            tc_errors.push("cannot access private trait `{real}`")
+            nr_error("PrivateItemAccess", PRIVATE_ITEM_ACCESS, "cannot access private trait `{real}` from another module", at, "mark the trait as `pub` in its module")
             return
         }
         tc_mark_symbol_used(name)
@@ -25957,12 +25945,12 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
             nr_note_local_binder_at(node, top)
             let global = nr_index_is_global(top) != 0
             if global && is_private_access("value", name) != 0 {
-                if nr_emit_default_body_access(name, nr_bare_private_use_decl(name, nr_resolve_bare_decl(name, nr_current_module)), node) { return }
-                tc_errors.push("cannot access private item `{name}`")
-                diag_error_at("PrivateItemAccess", PRIVATE_ITEM_ACCESS, "cannot access private item `{name}` from another module", node, "mark the item as `pub` in its module")
+                let real = nr_private_use_name(name)
+                if nr_emit_default_body_access(real, nr_bare_private_use_decl(name, nr_resolve_bare_decl(name, nr_current_module)), node) { return }
+                tc_errors.push("cannot access private item `{real}`")
+                diag_error_at("PrivateItemAccess", PRIVATE_ITEM_ACCESS, "cannot access private item `{real}` from another module", node, "mark the item as `pub` in its module")
                 return
             }
-            if global && nr_emit_imported_private_access(name, node, "item", "mark the item as `pub` in its module") { return }
             // A local binder of the same spelling holds a value, not a declaration, so a
             // read through it names no global.
             if global {
@@ -25997,8 +25985,9 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
         if is_variant_name(name) != 0 {
             if nr_check_selective_access(name, node) != 0 { return }
             if is_private_access("value", name) != 0 {
-                tc_errors.push("cannot access private variant `{name}`")
-                diag_error_at("PrivateItemAccess", PRIVATE_ITEM_ACCESS, "cannot access private variant `{name}` from another module", node, "mark the enum as `pub` in its module")
+                let real = nr_private_use_name(name)
+                tc_errors.push("cannot access private variant `{real}`")
+                diag_error_at("PrivateItemAccess", PRIVATE_ITEM_ACCESS, "cannot access private variant `{real}` from another module", node, "mark the enum as `pub` in its module")
                 return
             }
             tc_mark_symbol_used(name)
@@ -26010,8 +25999,9 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
         if names_type && is_known_type(name) != 0 {
             if nr_check_selective_access(name, node) != 0 { return }
             if is_private_access("type", name) != 0 {
-                tc_errors.push("cannot access private type `{name}`")
-                diag_error_at("PrivateItemAccess", PRIVATE_ITEM_ACCESS, "cannot access private type `{name}` from another module", node, "mark the type as `pub` in its module")
+                let real = nr_private_use_name(name)
+                tc_errors.push("cannot access private type `{real}`")
+                diag_error_at("PrivateItemAccess", PRIVATE_ITEM_ACCESS, "cannot access private type `{real}` from another module", node, "mark the type as `pub` in its module")
                 return
             }
             tc_mark_symbol_used(name)
@@ -26020,8 +26010,9 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
         if is_trait_name(name) != 0 {
             if nr_check_selective_access(name, node) != 0 { return }
             if is_private_access("type", name) != 0 {
-                tc_errors.push("cannot access private trait `{name}`")
-                diag_error_at("PrivateItemAccess", PRIVATE_ITEM_ACCESS, "cannot access private trait `{name}` from another module", node, "mark the trait as `pub` in its module")
+                let real = nr_private_use_name(name)
+                tc_errors.push("cannot access private trait `{real}`")
+                diag_error_at("PrivateItemAccess", PRIVATE_ITEM_ACCESS, "cannot access private trait `{real}` from another module", node, "mark the trait as `pub` in its module")
                 return
             }
             tc_mark_symbol_used(name)
@@ -26100,14 +26091,15 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                     if defined { nr_mark_read_at(top) }
                     let global = defined && nr_index_is_global(top) != 0
                     if global && is_private_access("value", fn_name) != 0 {
-                        if !nr_emit_default_body_access(fn_name, nr_bare_private_use_decl(fn_name, nr_resolve_bare_call_decl(fn_name, nr_current_module)), node) {
-                            tc_errors.push("cannot access private function `{fn_name}`")
-                            diag_error_at("PrivateItemAccess", PRIVATE_ITEM_ACCESS, "cannot access private function `{fn_name}` from another module", node, "mark the function as `pub` in its module")
+                        let real = nr_private_use_name(fn_name)
+                        if !nr_emit_default_body_access(real, nr_bare_private_use_decl(fn_name, nr_resolve_bare_call_decl(fn_name, nr_current_module)), node) {
+                            tc_errors.push("cannot access private function `{real}`")
+                            diag_error_at("PrivateItemAccess", PRIVATE_ITEM_ACCESS, "cannot access private function `{real}` from another module", node, "mark the function as `pub` in its module")
                         }
-                    } else if global && nr_emit_imported_private_access(fn_name, node, "function", "mark the function as `pub` in its module") {
                     } else if !defined && is_variant_name(fn_name) != 0 && is_private_access("value", fn_name) != 0 {
-                        tc_errors.push("cannot access private variant `{fn_name}`")
-                        diag_error_at("PrivateItemAccess", PRIVATE_ITEM_ACCESS, "cannot access private variant `{fn_name}` from another module", node, "mark the enum as `pub` in its module")
+                        let real = nr_private_use_name(fn_name)
+                        tc_errors.push("cannot access private variant `{real}`")
+                        diag_error_at("PrivateItemAccess", PRIVATE_ITEM_ACCESS, "cannot access private variant `{real}` from another module", node, "mark the enum as `pub` in its module")
                     } else if nr_is_unimported_prelude_free_fn(fn_name) != 0 {
                         tc_errors.push("undefined function `{fn_name}`")
                         diag_error_at("UndefinedFunction", UNDEFINED_FUNCTION, "undefined function `{fn_name}`", node, "this stdlib function is not in the prelude — add an explicit import, e.g. import {tc_qualifier_for_module(tc_get_symbol_module(fn_name))}.\{{fn_name}}")
