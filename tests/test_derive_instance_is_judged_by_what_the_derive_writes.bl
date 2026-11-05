@@ -47,10 +47,57 @@ test "to_json at an instance whose argument the derive does not write is refused
     refused(aliased, "dinst_ser_alias_option", "`W[Option[Int]]` does not implement `Serialize`")
 }
 
-test "debug at an instance whose argument the derive does not write is refused" {
+// A Set or a tuple is Debug when its parts are (*Debug vs Display* and *Tuples*), so a debug
+// call at an instance that holds one is never refused for its trait. Until the compiler
+// writes their text, it refuses the call as not built. When it does, change this test with
+// its test.failing partner in
+// tests/test_derive_debug_at_an_instance_renders_a_container_type_argument.bl.
+test "debug at an instance whose argument is a Set or a tuple is refused as not built, not for its trait" {
     let boxed = "@derive(Debug)\ntype W[T] \{ x: T }\n"
-    refused("{boxed}fn main() \{\n    let s: Set[Int] = Set()\n    io.println(W \{ x: s }.debug())\n}\n", "dinst_dbg_set", "`W[Set[Int]]` does not implement `Debug`")
-    refused("{boxed}fn main() \{ io.println(W \{ x: (1, 2) }.debug()) }\n", "dinst_dbg_tuple", "`W[(Int, Int)]` does not implement `Debug`")
+    let set_out = compile_test_helpers.compile_and_capture("{boxed}fn main() \{\n    let s: Set[Int] = Set()\n    io.println(W \{ x: s }.debug())\n}\n", "dinst_dbg_set")
+    assert(!set_out.contains("does not implement `Debug`"), set_out)
+    assert(set_out.contains("`debug` on `W[Set[Int]]` is not built yet: the compiler cannot write the debug text of a Set"), set_out)
+    let tuple_out = compile_test_helpers.compile_and_capture("{boxed}fn main() \{ io.println(W \{ x: (1, 2) }.debug()) }\n", "dinst_dbg_tuple")
+    assert(!tuple_out.contains("does not implement `Debug`"), tuple_out)
+    assert(tuple_out.contains("`debug` on `W[(Int, Int)]` is not built yet: the compiler cannot write the debug text of a tuple"), tuple_out)
+}
+
+// A Map key must be a scalar or a struct (*Container Debug Rendering*), and the trait table
+// gives a Raw no Debug (*Built-in Type Trait Implementations*), at an instance as at a field.
+test "debug at an instance whose argument is a Map with an enum key or a Raw is refused for its trait" {
+    let boxed = "@derive(Debug)\ntype W[T] \{ x: T }\n@derive(Debug, Eq, Hash)\ntype E \{ A(Int) }\n"
+    refused("{boxed}fn main() \{\n    let mut m: Map[E, Int] = Map.new()\n    m.insert(E.A(1), 2)\n    io.println(W \{ x: m }.debug())\n}\n", "dinst_dbg_enum_key", "`W[Map[E, Int]]` does not implement `Debug`")
+    refused("{boxed}fn main() \{\n    let r: Raw[Str] = Raw(\"x\")\n    io.println(W \{ x: r }.debug())\n}\n", "dinst_dbg_raw", "`W[Raw[Str]]` does not implement `Debug`")
+}
+
+// The Map key rule (*Container Debug Rendering*) holds at each place that asks for Debug:
+// a field, a derive at an instance, a bound and a direct call give one answer.
+test "a Map whose key is an enum has no Debug at a field, at an instance, at a bound or at a call" {
+    let decls = "@derive(Debug, Eq, Hash)\ntype E \{ A(Int) }\n"
+    let fill = "    let mut m: Map[E, Int] = Map.new()\n    m.insert(E.A(1), 2)\n"
+    let field = compile_test_helpers.compile_and_capture("{decls}@derive(Debug)\ntype S \{ m: Map[E, Int] }\nfn main() \{ io.println(\"x\") }\n", "dinst_key_field")
+    compile_test_helpers.expect_error(field, "E0520", "dinst_key_field")
+    compile_test_helpers.expect_contains(field, "field `m` has Map key type `E` which a debug text cannot hold", "dinst_key_field")
+    let bound = compile_test_helpers.compile_and_capture("{decls}fn show[T: Debug](x: T) -> Str \{ x.debug() }\nfn main() \{\n{fill}    io.println(show(m))\n}\n", "dinst_key_bound")
+    compile_test_helpers.expect_error(bound, "E0306", "dinst_key_bound")
+    compile_test_helpers.expect_contains(bound, "`Map[E, Int]` does not satisfy the Debug bound on type parameter T", "dinst_key_bound")
+    let call = compile_test_helpers.compile_and_capture("{decls}fn main() \{\n{fill}    io.println(m.debug())\n}\n", "dinst_key_call")
+    compile_test_helpers.expect_contains(call, "`Map[E, Int]` does not implement `Debug`", "dinst_key_call")
+}
+
+// The trait table gives a StringBuilder no Debug, so the derive writes no body at that
+// instance, and a program that does not call debug builds.
+test "a derived Debug type that holds a StringBuilder builds when nothing calls debug" {
+    runs("@derive(Debug)\ntype W[T] \{ v: T, n: Int }\nfn main() \{ io.println(\"\{W \{ v: StringBuilder.new(), n: 3 }.n}\") }\n", "dinst_sb_no_call", "3\n")
+    refused("@derive(Debug)\ntype W[T] \{ v: T }\nfn main() \{ io.println(W \{ v: StringBuilder.new() }.debug()) }\n", "dinst_sb_call", "`W[StringBuilder]` does not implement `Debug`")
+}
+
+// A Never has Debug (§3.2 *Never*) but no text the compiler writes, so a call is refused as
+// not built, and a type that holds one at an instance still builds.
+test "the debug text of a Never is not built, and an instance that holds one builds" {
+    runs("@derive(Debug)\ntype W[T] \{ v: T, n: Int }\nfn none_w() -> Option[W[Never]] \{ None }\nfn main() \{ io.println(\"\{none_w().is_none()}\") }\n", "dinst_never_no_call", "true\n")
+    let out = compile_test_helpers.compile_and_capture("fn main() \{\n    let o: Option[Never] = None\n    io.println(o.debug())\n}\n", "dinst_never_call")
+    compile_test_helpers.expect_contains(out, "`debug` on `Option[Never]` is not built yet: the compiler cannot write the debug text of a Never", "dinst_never_call")
 }
 
 // A fieldless enum is `Ord` by its declaration, with no derive (sections/03_types.md *Enum

@@ -1517,11 +1517,11 @@ fn tc_bound_fact(concrete_tid: Int, trait_name: Str) -> Int {
     0
 }
 
-// The answer of a trait a type gets through @derive, for one type, tri-state as
-// tc_type_satisfies_bound's: a scalar has each of them, and a type parameter or an unsolved
-// type is not judged. Hash has its own closed list, which is narrower: a Float, a container
-// or a tuple holding one has no Hash, so a bound, a derive at an instance and a container key
-// all read that list.
+// The answer of Hash, Debug, Serialize or Deserialize, the traits a type gets through
+// @derive, for one type, tri-state as tc_type_satisfies_bound's: a scalar has each of them,
+// and a type parameter or an unsolved type is not judged. Hash has its own closed list,
+// which is narrower: a Float, a container or a tuple holding one has no Hash, so a bound, a
+// derive at an instance and a container key all read that list.
 fn tc_derive_only_fact(tid: Int, tr: Str) -> Int {
     if tr == "Hash" { return tc_tid_hash_fact(tid) }
     let k = type_kind(tid)
@@ -1683,17 +1683,19 @@ fn tc_ann_tparam_fact(ann: Int, tps: Int, tid: Int, tr: Str) -> Int {
     0
 }
 
-// An argument at a type parameter's place is judged by what the derive writes there, which
-// for Debug and Serialize is narrower than the trait: a derived debug() cannot render a Set,
-// and a derived to_json writes no Option or Char. The declaration check refuses those field
-// types, and the instance check must agree with it. Those two judgments do not stop at a
-// type parameter, so an argument that still holds one, such as `(T, Int)` in a field
-// `b: B[(T, Int)]`, is left to each instance. tc_derive_only_fact needs no such guard: it
-// answers unknown at a type parameter itself, and a cyclic alias, which holds one, has no Hash.
+// An argument at a type parameter's place is judged by what the derive writes there. For
+// Debug that is the trait itself: a tuple, a Set or a Result has Debug when its parts have
+// it, and a part whose text the compiler cannot build yet is tc_debug_unbuilt's answer,
+// given at the call. For Serialize it is narrower than the trait: a derived to_json writes no
+// Option or Char. The declaration check refuses those field types, and the instance check
+// must agree with it. Those two judgments do not stop at a type parameter, so an argument
+// that still holds one, such as `(T, Int)` in a field `b: B[(T, Int)]`, is left to each
+// instance. tc_derive_only_fact needs no such guard: it answers unknown at a type parameter
+// itself, and a cyclic alias, which holds one, has no Hash.
 fn tc_derive_arg_fact(arg: Int, tr: Str) -> Int {
     match tr {
         "Deserialize" => tc_deserialize_read_fact(arg)
-        "Debug" => if tc_tid_has_bare_typevar(arg) != 0 || tc_debug_tid_ok(arg) != 0 { 0 } else { -1 }
+        "Debug" => if tc_tid_has_bare_typevar(arg) != 0 || tc_debug_need(arg, []).len() == 0 { 0 } else { -1 }
         "Serialize" => if tc_tid_has_bare_typevar(arg) != 0 { 0 } else { tc_serialize_written_fact(arg) }
         _ => tc_derive_only_fact(arg, tr)
     }
@@ -3193,6 +3195,9 @@ type CallFacts {
     derive_facts_low: Int
     derive_facts_open: List[Str]
     derive_facts_open_low: Map[Str, Int]
+    // The instances tc_debug_unbuilt has entered in its current walk. One set for the whole
+    // walk, not one path, so a type that reaches another type by two fields enters it once.
+    debug_unbuilt_seen: Map[Int, Int]
     // Set while a bound or a method call asks for Hash. A type parameter then has Hash only
     // through a bound its binder writes; a key or an element walk leaves it open for the
     // obligation it puts on the callers.
@@ -3208,7 +3213,7 @@ type CallFacts {
     trait_heads: Map[Int, Str]
 }
 fn new_call_facts() -> CallFacts {
-    CallFacts { open_calls: [], open_group: Map(), open_tids: [], reported: Map(), self_views: Map(), view_sigs: Map(), hash_aliases_above: [], derive_facts_above: [], derive_facts_low: 0, derive_facts_open: [], derive_facts_open_low: Map(), hash_by_bounds: false, static_head_insts: Map(), static_head_binders: Map(), static_owners: Map(), trait_heads: Map() }
+    CallFacts { open_calls: [], open_group: Map(), open_tids: [], reported: Map(), self_views: Map(), view_sigs: Map(), hash_aliases_above: [], derive_facts_above: [], derive_facts_low: 0, derive_facts_open: [], derive_facts_open_low: Map(), debug_unbuilt_seen: Map(), hash_by_bounds: false, static_head_insts: Map(), static_head_binders: Map(), static_owners: Map(), trait_heads: Map() }
 }
 let mut tc_calls: CallFacts = new_call_facts()
 
@@ -5148,13 +5153,15 @@ pub fn tc_tid_is_pointer_bearing(tid: Int) -> Int {
 // derive_facts keeps the finished answers of tc_applied_fields_derive_fact by
 // "{resolved tid}:{trait}", under the same rule for a metavar. An answer reads only the
 // @derive lists and the declaration of each type, which tc_register_type_decls holds in full
-// before the first derive check asks.
+// before the first derive check asks. std_trait_built keeps tc_std_trait_built by the same
+// key, only for a type that names no type parameter, whose answer reads the bounds in scope.
 type TypeWalkMemos {
     ptr_bearing: Map[Int, Int]
     decl_grows: Map[Int, Bool]
     derive_facts: Map[Str, Int]
+    std_trait_built: Map[Str, Bool]
 }
-let mut tc_type_walks: TypeWalkMemos = TypeWalkMemos { ptr_bearing: Map(), decl_grows: Map(), derive_facts: Map() }
+let mut tc_type_walks: TypeWalkMemos = TypeWalkMemos { ptr_bearing: Map(), decl_grows: Map(), derive_facts: Map(), std_trait_built: Map() }
 let PTR_BEARING_MET_METAVAR = -2
 
 fn ptr_bearing_walk(r: Int, seen: Map[Int, Int]) -> Int {
@@ -5922,7 +5929,7 @@ fn tc_check_one_bound(name: Str, bounds: Str, concrete: Int, node: Int) -> Int !
             match tc_std_trait_unbuilt(concrete, tr) {
                 Some(why) => {
                     diag_error_at("TypeError", TYPE_ERROR,
-                        "the {tc_core_trait_shown(tr)} bound on type parameter {name} is not built yet for `{type_to_str(concrete)}`: the compiler cannot {why}", node,
+                        tc_not_built_text("the {tc_core_trait_shown(tr)} bound on type parameter {name}", " for `{type_to_str(concrete)}`", why), node,
                         "pass a value of a type whose {tc_core_trait_shown(tr)} methods are built")
                     return 1
                 }
@@ -13571,45 +13578,6 @@ fn tc_fields_mix_named_and_unnamed(vflds_sl: Int) -> Bool {
     named && unnamed
 }
 
-// A field of a @derive(Debug) type must have a type the generated debug() can render: a
-// scalar, a List, Option, Map or Range of renderable parts, or a type whose Debug holds at its
-// own arguments. The field is judged by its type, not by the name the type is written with:
-// `B[NoD]` names a type that derives Debug, but `B` at `NoD` has no Debug, and `L =
-// List[Plain]` holds to the rule `List[Plain]` holds to.
-fn tc_debug_tid_ok(tid: Int) -> Int {
-    let t = resolve_alias_tid(tc_resolve(tid))
-    let k = type_kind(t)
-    if k == TyKind.List || k == TyKind.Option || k == TyKind.Range { return tc_debug_tid_ok(tc_tid_child(t, 0)) }
-    if k == TyKind.Map {
-        if tc_debug_key_tid_ok(tc_tid_child(t, 0)) == 0 { return 0 }
-        return tc_debug_tid_ok(tc_tid_child(t, 1))
-    }
-    if k == TyKind.Set || k == TyKind.Result || k == TyKind.Fn || k == TyKind.Tuple || k == TyKind.Void { return 0 }
-    if k == TyKind.Raw || k == TyKind.Handler { return 0 }
-    if tc_derive_only_fact(t, "Debug") == -1 { 0 } else { 1 }
-}
-
-// The Map-key types the v1 renderer can read back through the kops storage layer: a scalar
-// stored inline (Char in single-quoted debug-form, decisions/char-debug-form.md), or a
-// @derive(Debug, Hash, Eq) STRUCT, read via blink_map_key_slot and rendered via its debug.
-// Enum and container keys stay rejected.
-fn tc_debug_key_tid_ok(tid: Int) -> Int {
-    let t = resolve_alias_tid(tc_resolve(tid))
-    let k = type_kind(t)
-    if k == TyKind.Str || k == TyKind.Char || k == TyKind.Int || k == TyKind.Bool || is_sized_int(k) { return 1 }
-    if k == TyKind.Struct { return tc_debug_tid_ok(t) }
-    if k == TyKind.Unknown { 1 } else { 0 }
-}
-
-// The part at child `i` of a List, Option, Range or Map field type, or -1.
-fn tc_debug_part_tid(tid: Int, i: Int) -> Int {
-    if tid < 0 { return -1 }
-    let t = resolve_alias_tid(tc_resolve(tid))
-    let k = type_kind(t)
-    if k != TyKind.List && k != TyKind.Option && k != TyKind.Range && k != TyKind.Map { return -1 }
-    tc_tid_child(t, i)
-}
-
 // Does the struct or enum `tid` is an instance of carry `@derive(tr)`?
 fn tc_tid_base_derives(tid: Int, tr: Str) -> Bool {
     let t = resolve_alias_tid(tc_resolve(tid))
@@ -13635,139 +13603,76 @@ fn tc_debug_leaf_help(ann: Int, tid: Int) -> Str {
     tc_add_debug_derive_help(node_name(ann))
 }
 
-// A field (`what` "type") or a part of one (`what` "element type") whose type `tid` the
-// generated debug() cannot render. A tid the pools hold no entry for is not judged.
-fn tc_check_debug_leaf(ann: Int, tid: Int, f: Int, field: Str, tname: Str, what: Str) ! Diag.Report {
-    if tid < 0 || tc_debug_tid_ok(tid) != 0 { return }
-    // Only a struct or enum declaration can take a derive; an alias of any other type
-    // names nothing to put one on.
-    let k = type_kind(resolve_alias_tid(tc_resolve(tid)))
-    if k != TyKind.Struct && k != TyKind.Enum {
-        diag_error_at("DeriveDebugFieldNoDebug", DERIVE_DEBUG_FIELD_NO_DEBUG, "@derive(Debug) on `{tname}`: field `{field}` has {what} `{type_ann_text(ann)}` which is not Debug-renderable in v1", f, "implement Debug manually for this field's type")
-        return
-    }
-    diag_error_at("DeriveDebugFieldNoDebug", DERIVE_DEBUG_FIELD_NO_DEBUG, "@derive(Debug) on `{tname}`: field `{field}` has {what} `{type_ann_text(ann)}` which does not derive Debug", f, tc_debug_leaf_help(ann, tid))
+// A field of a @derive(Debug) type must have a type that has Debug (tc_debug_need) and whose
+// debug text the compiler builds (tc_debug_unbuilt), by the same rules a debug call at an
+// instance is judged by. The field is judged by its type, not by the name the type is
+// written with: `B[NoD]` names a type that derives Debug, but `B` at `NoD` has no Debug, and
+// `L = List[Plain]` holds to the rule `List[Plain]` holds to.
+fn tc_check_one_debug_field(f: Int, variant: Int, ftid: Int, tname: Str) ! Diag.Report {
+    tc_check_debug_part(node_value(f), ftid, f, tc_derive_field_label(variant, f), tname, "type")
 }
 
-// The container type constructors that the v1 Debug renderer can walk
-// (or that the typecheck rule peels into the element/key/value check).
-// Set/Result are container-shaped but NOT in the v1 renderable set.
-fn tc_is_container_name(n: Str) -> Int {
-    if n == "List" || n == "Option" || n == "Map" || n == "Set" || n == "Result" { return 1 }
-    0
-}
-
-// The annotations the Debug field check reads through to their parts. A range renders
-// through its bound type (§3.6 *Traits of Range[T]*), as a List renders through its element.
-fn tc_debug_peels(core: Str) -> Int {
-    if core == "Range" { return 1 }
-    tc_is_container_name(core)
-}
-
-// Leaf type names that reach the Debug field check but are NOT Debug-renderable in v1 and
-// can never be made so by adding a derive:
-//   fn(...) -> T  → "Fn" (parser.bl:1437); (A, B) → "Tuple" (parser.bl:1408;
-//   tuples auto-derive Eq/Ord/Hash/Display/Clone but NOT Debug, spec §3.6);
-//   handler[E] → "Handler" (parser.bl:1453); Raw[Str] → "Raw", a marker with no Debug
-//   (§3b.5). Rejected E0520 like Set/Result
-//   else they slip past tc_check_one_debug_field and emit BLINK_COMPILER_BUG.
-//
-// "Void" is the one entry that is NOT a parser pseudo-type — it is an ordinary inhabited
-// type (decisions/under-determined-types.md:39) — but it belongs here for the same reason
-// "Tuple" does: `()` IS the 0-tuple, so rejecting the n-tuple and rendering the 0-tuple
-// would be incoherent, and Void's single value carries no information to render. A
-// declared Void field lowers to an int64_t placeholder, so without this arm the type
-// builds and RUNS, printing `<?>` for the field with a BLINK_COMPILER_BUG marker compiled
-// into the binary — a silent wrong answer instead of a diagnostic.
-fn tc_is_non_debug_pseudo_type(n: Str, core: Str) -> Int {
-    if n == "Fn" || n == "Tuple" || n == "Void" { return 1 }
-    if core == "Raw" || core == "Handler" { return 1 }
-    0
-}
-
-// Check one element / value of a Debug-renderable container field. The rule is
-// fully inductive (spec §3.6): a non-Debug leaf → E0520; a Set/Result element →
-// E0520 (not renderable at any level); a List/Option/Map element recurses into
-// its own element/key/value checks so arbitrary nesting is proven Debug.
-fn tc_check_debug_element(elem_ann: Int, etid: Int, f: Int, field: Str, tname: Str) ! TypeCheck.Resolve, Diag.Report {
-    let elem_name = node_name(elem_ann)
-    let core = tc_compiler_known_type_meant(elem_name, elem_ann)
-    if tc_is_non_debug_pseudo_type(elem_name, core) != 0 {
-        diag_error_at("DeriveDebugFieldNoDebug", DERIVE_DEBUG_FIELD_NO_DEBUG, "@derive(Debug) on `{tname}`: field `{field}` has element type `{elem_name}` which is not Debug-renderable in v1", f, "implement Debug manually for this field's type")
-        return
-    }
-    if tc_debug_peels(core) != 0 {
-        // Nested container: Set/Result are still rejected at every level; the
-        // renderable containers (List/Option/Map/Range) recurse.
-        if core == "Set" || core == "Result" {
-            diag_error_at("DeriveDebugFieldNoDebug", DERIVE_DEBUG_FIELD_NO_DEBUG, "@derive(Debug) on `{tname}`: field `{field}` has element type `{elem_name}` which is not Debug-renderable (only List/Option/Map containers render)", f, "implement Debug manually for this field's type")
-            return
+// One level of a Debug field's type: `ann` is the annotation written at this level, and `tid`
+// its type. The refusal names the part that lacks Debug as the user wrote it, so the walk
+// follows the annotation down to that part where it can. A part that still names a type
+// parameter is judged at each instance, and a tid the pools hold no entry for is not judged.
+fn tc_check_debug_part(ann: Int, tid: Int, f: Int, field: Str, tname: Str, what: Str) ! Diag.Report {
+    if tid < 0 { return }
+    let t = resolve_alias_tid(tc_resolve(tid))
+    let shown = type_ann_text(ann)
+    let need = tc_debug_need(t, [])
+    if need.len() == 0 {
+        if tc_tid_has_bare_typevar(t) != 0 { return }
+        match tc_debug_unbuilt(t, true) {
+            Some(why) => tc_refuse_debug_field(f, field, tname, what, shown, tc_not_built_text("whose debug text", "", why), "implement Debug manually for this field's type", [])
+            None => {}
         }
-        tc_check_container_elems(elem_ann, core, etid, f, field, tname)
         return
     }
-    tc_check_debug_leaf(elem_ann, etid, f, field, tname, "element type")
+    if type_kind(need.get(need.len() - 1).unwrap()) == TyKind.Typevar { return }
+    if need.len() > 1 && tc_check_debug_parts(ann, t, f, field, tname) { return }
+    let k = type_kind(t)
+    if need.len() == 1 && (k == TyKind.Map || k == TyKind.Set) {
+        let elems_sl = node_elements(ann)
+        let part = if elems_sl != -1 && sublist_length(elems_sl) >= 1 { type_ann_text(sublist_get(elems_sl, 0)) } else { type_to_str(tc_tid_child(t, 0)) }
+        let place = if k == TyKind.Map { "Map key type" } else { "Set element type" }
+        tc_refuse_debug_field(f, field, tname, place, part, "which a debug text cannot hold: a Map key or a Set element must be a Str, Char, Int, Bool or sized-int, or a struct that implements Debug, Hash and Eq", "use a scalar or a struct for this part, or implement Debug manually for this field's type", [])
+        return
+    }
+    if need.len() == 1 && (k == TyKind.Struct || k == TyKind.Enum) {
+        tc_refuse_debug_field(f, field, tname, what, shown, "which does not derive Debug", tc_debug_leaf_help(ann, t), [])
+        return
+    }
+    tc_refuse_debug_field(f, field, tname, what, shown, "which does not implement Debug", tc_derive_field_help(need.get(need.len() - 1).unwrap(), "Debug"), tc_trait_need_notes(need, "Debug"))
 }
 
-// Peel a List/Option/Map/Range annotation `ann`, of type `tid`, and check its element (or
-// key + value) types. Shared between the top-level field check and the nested
-// recursion in tc_check_debug_element, so nesting is pure composition. The
-// caller guarantees `ann` names List / Option / Map / Range (Set/Result rejected first).
-fn tc_check_container_elems(ann: Int, core: Str, tid: Int, f: Int, field: Str, tname: Str) ! TypeCheck.Resolve, Diag.Report {
+// Judge each part of a List, Option, Range, Map, Set, Result or tuple annotation at its own
+// type. False when the annotation does not spell the parts, as an alias does not.
+fn tc_check_debug_parts(ann: Int, t: Int, f: Int, field: Str, tname: Str) -> Bool ! Diag.Report {
     let elems_sl = node_elements(ann)
-    if core == "Map" {
-        if elems_sl != -1 && sublist_length(elems_sl) >= 2 {
-            let key_ann = sublist_get(elems_sl, 0)
-            let key_name = node_name(key_ann)
-            let ktid = tc_debug_part_tid(tid, 0)
-            if ktid >= 0 && tc_debug_key_tid_ok(ktid) == 0 {
-                if type_kind(resolve_alias_tid(tc_resolve(ktid))) == TyKind.Struct {
-                    // A STRUCT key with no Debug: tc_check_debug_element emits the precise
-                    // "does not derive Debug" diagnostic.
-                    tc_check_debug_element(key_ann, ktid, f, field, tname)
-                } else {
-                    // Container map keys (List/Map/Option/Set/Result) and other
-                    // unsupported keys land here — container keys stay rejected,
-                    // which is why the map-debug emitter never recurses on keys.
-                    diag_error_at("DeriveDebugFieldNoDebug", DERIVE_DEBUG_FIELD_NO_DEBUG, "@derive(Debug) on `{tname}`: field `{field}` has Map key type `{key_name}` which v1 Debug cannot render (Str/Char/Int/Bool/sized-int keys, or a @derive(Debug, Hash, Eq) struct key)", f, "use a supported scalar key or a Debug struct key, or implement Debug manually")
-                }
-            }
-            tc_check_debug_element(sublist_get(elems_sl, 1), tc_debug_part_tid(tid, 1), f, field, tname)
+    if elems_sl == -1 { return false }
+    let k = type_kind(t)
+    let mut kids: List[Int] = []
+    if k == TyKind.Tuple { kids = tc_tuple_elem_tids(t) }
+    if k == TyKind.List || k == TyKind.Option || k == TyKind.Range || k == TyKind.Map || k == TyKind.Set || k == TyKind.Result {
+        let mut i = 0
+        while i < tc_tid_child_count(t) {
+            kids.push(tc_tid_child(t, i))
+            i = i + 1
         }
-        return
     }
-
-    // List / Option / Range: peel element 0.
-    if elems_sl != -1 && sublist_length(elems_sl) >= 1 {
-        tc_check_debug_element(sublist_get(elems_sl, 0), tc_debug_part_tid(tid, 0), f, field, tname)
+    if kids.len() == 0 || kids.len() != sublist_length(elems_sl) { return false }
+    let mut i = 0
+    while i < kids.len() {
+        let what = if k == TyKind.Map && i == 0 { "Map key type" } else { "element type" }
+        tc_check_debug_part(sublist_get(elems_sl, i), kids.get(i).unwrap(), f, field, tname, what)
+        i = i + 1
     }
+    true
 }
 
-// Reject one field `f`, of declared type `ftid`, of a @derive(Debug) type `tname` whose type —
-// or whose container element/key/value type — does not derive Debug.
-fn tc_check_one_debug_field(f: Int, variant: Int, ftid: Int, tname: Str) ! TypeCheck.Resolve, Diag.Report {
-    let ann = node_value(f)
-    let field = tc_derive_field_label(variant, f)
-    let ftype_name = node_name(ann)
-    let core = tc_compiler_known_type_meant(ftype_name, ann)
-
-    if tc_is_non_debug_pseudo_type(ftype_name, core) != 0 {
-        diag_error_at("DeriveDebugFieldNoDebug", DERIVE_DEBUG_FIELD_NO_DEBUG, "@derive(Debug) on `{tname}`: field `{field}` has type `{ftype_name}` which is not Debug-renderable in v1", f, "implement Debug manually for this field's type")
-        return
-    }
-
-    if tc_debug_peels(core) == 0 {
-        tc_check_debug_leaf(ann, ftid, f, field, tname, "type")
-        return
-    }
-
-    // Field is a container type. Set/Result are not renderable at any level.
-    if core == "Set" || core == "Result" {
-        diag_error_at("DeriveDebugFieldNoDebug", DERIVE_DEBUG_FIELD_NO_DEBUG, "@derive(Debug) on `{tname}`: field `{field}` has type `{ftype_name}` which is not Debug-renderable in v1 (only List/Option/Map containers render)", f, "implement Debug manually for this field's type")
-        return
-    }
-
-    tc_check_container_elems(ann, core, ftid, f, field, tname)
+fn tc_refuse_debug_field(f: Int, field: Str, tname: Str, what: Str, shown: Str, reason: Str, help: Str, notes: List[Str]) ! Diag.Report {
+    diag_error_at_notes("DeriveDebugFieldNoDebug", DERIVE_DEBUG_FIELD_NO_DEBUG, "@derive(Debug) on `{tname}`: field `{field}` has {what} `{shown}` {reason}", f, help, notes)
 }
 
 // One walk serves each derive field check: each struct field and each variant field of each
@@ -17146,7 +17051,7 @@ fn tc_drop_unprovided_closeable_impls(program: Int) {
 
 fn init_types() ! TypeCheck.Register {
     ty_pool.clear()
-    tc_type_walks = TypeWalkMemos { ptr_bearing: Map(), decl_grows: Map(), derive_facts: Map() }
+    tc_type_walks = TypeWalkMemos { ptr_bearing: Map(), decl_grows: Map(), derive_facts: Map(), std_trait_built: Map() }
     tc_arg_binds_free.clear()
     ty_param_list.clear()
     // The method-call facts span all three phases of one check_types, so they are cleared
@@ -27666,44 +27571,71 @@ fn tc_trait_need(tid: Int, tr: Str, visiting: List[Int]) -> List[Int] {
     }
 }
 
+// Hash, Serialize and Deserialize have no chain: the closed Hash list and the derive answer
+// for the type as a whole.
 fn tc_derive_only_need(tid0: Int, tr: Str) -> List[Int] {
     let tid = resolve_alias_tid(tc_resolve(tid0))
-    if tr == "Debug" { return tc_debug_need(tid, []) }
-    if tr == "Hash" { return if tc_hash_fact_by_bounds(tid) == -1 { [tid] } else { [] } }
-    if tc_derive_only_fact(tid, tr) == -1 { return [tid] }
-    []
+    let fact = match tr {
+        "Hash" => tc_hash_fact_by_bounds(tid)
+        _ => tc_derive_only_fact(tid, tr)
+    }
+    if fact == -1 { [tid] } else { [] }
 }
 
 // What `debug` needs of `tid` that it lacks. A container, a tuple and a range are `Debug`
-// when each part is (§3.6 *Traits of Range[T]*, *Built-in Trait Implementations*), so the
-// chain goes on to the part. A type parameter needs `Debug` among its own bounds, since the
-// compiler adds no bound the user did not write (sections/03_types.md *No implied bounds*).
+// when each part is (§3.6 *Traits of Range[T]*, *Built-in Type Trait Implementations*), so
+// the chain goes on to the part. A Map key or a Set element must also be a scalar or a struct
+// (*Container Debug Rendering*); the container itself is what lacks `Debug` then, since the
+// key may have it. A type parameter needs `Debug` among its own bounds, since the compiler
+// adds no bound the user did not write (sections/03_types.md *No implied bounds*). The trait
+// table gives each scalar, a Bytes and a Never `Debug` (§3.2 *Never*), and no other kind; the
+// match names each kind so that a new one must get its answer here.
 fn tc_debug_need(tid0: Int, visiting: List[Int]) -> List[Int] {
     let tid = resolve_alias_tid(tc_resolve(tid0))
     if tc_tid_is_no_info(tid) != 0 || tc_tid_has_unbound_metavar(tid) != 0 { return [] }
     let t = ty_pool.get(tid).unwrap()
-    let k = t.kind
-    if k == TyKind.Typevar {
-        let traits = tc_tparam_bound_traits(type_to_str(tid))
-        if traits != "" && tc_pipe_has(traits, "Debug") == 0 { return [tid] }
-        return []
-    }
-    let mut parts: List[Int] = []
-    if k == TyKind.List || k == TyKind.Option || k == TyKind.Set || k == TyKind.Range { parts = [t.inner1] }
-    if k == TyKind.Map || k == TyKind.Result { parts = [t.inner1, t.inner2] }
-    if k == TyKind.Tuple { parts = tc_tuple_elem_tids(tid) }
-    if parts.len() > 0 {
-        for p in parts {
-            let need = tc_debug_need(p, visiting)
-            if need.len() > 0 { return eq_need_through(tid, need) }
+    let parts = match t.kind {
+        TyKind.Int | TyKind.Float | TyKind.Bool | TyKind.Str | TyKind.Char => { return [] }
+        TyKind.I8 | TyKind.I16 | TyKind.I32 | TyKind.U8 | TyKind.U16 | TyKind.U32 | TyKind.U64 => { return [] }
+        TyKind.Bytes | TyKind.Never | TyKind.Unknown => { return [] }
+        TyKind.Typevar => {
+            let traits = tc_tparam_bound_traits(type_to_str(tid))
+            if traits != "" && tc_pipe_has(traits, "Debug") == 0 { return [tid] }
+            return []
         }
-        return []
+        TyKind.Struct | TyKind.Enum => {
+            if tc_derive_only_fact(tid, "Debug") == -1 { return [tid] }
+            return []
+        }
+        TyKind.List | TyKind.Option | TyKind.Range => [t.inner1]
+        TyKind.Result => [t.inner1, t.inner2]
+        TyKind.Map => {
+            if !tc_debug_key_kind_ok(t.inner1) { return [tid] }
+            [t.inner1, t.inner2]
+        }
+        TyKind.Set => {
+            if !tc_debug_key_kind_ok(t.inner1) { return [tid] }
+            [t.inner1]
+        }
+        TyKind.Tuple => tc_tuple_elem_tids(tid)
+        TyKind.Void | TyKind.Fn | TyKind.Iterator | TyKind.Handle | TyKind.Channel | TyKind.Ptr | TyKind.Handler => { return [tid] }
+        TyKind.StringBuilder | TyKind.Template | TyKind.FfiScope | TyKind.Raw => { return [tid] }
     }
-    if k == TyKind.Bytes { return [] }
-    // The trait table gives a function and the unit value no `Debug`.
-    if k == TyKind.Fn || k == TyKind.Void { return [tid] }
-    if tc_derive_only_fact(tid, "Debug") == -1 { return [tid] }
+    for p in parts {
+        let need = tc_debug_need(p, visiting)
+        if need.len() > 0 { return eq_need_through(tid, need) }
+    }
     []
+}
+
+// A Map key or a Set element that debug renders: a scalar, a struct, or a type parameter,
+// which each instance judges.
+fn tc_debug_key_kind_ok(tid0: Int) -> Bool {
+    let tid = resolve_alias_tid(tc_resolve(tid0))
+    if tc_tid_is_no_info(tid) != 0 { return true }
+    let k = type_kind(tid)
+    if k == TyKind.Str || k == TyKind.Char || k == TyKind.Int || k == TyKind.Bool || is_sized_int(k) { return true }
+    k == TyKind.Struct || k == TyKind.Typevar || k == TyKind.Unknown
 }
 
 // What a clone of `tid` needs that it lacks: `Range[T]`, `Option[T]`, `Result[T, E]` and a
@@ -27777,30 +27709,62 @@ fn tc_std_trait_unbuilt(tid0: Int, tr: Str) -> Option[Str] {
 }
 
 // A struct or an enum answers its own `debug`. Inside a list, an option, a map or a range, the
-// text is built from the derived `debug`, so a written one is not called there.
-fn tc_debug_unbuilt(tid0: Int, top: Bool) -> Option[Str] {
+// text is built from the derived `debug`, so a written one is not called there. A derived one
+// renders its fields, so it is built only where each field part is.
+fn tc_debug_unbuilt(tid: Int, top: Bool) -> Option[Str] {
+    tc_calls.debug_unbuilt_seen = Map()
+    tc_debug_unbuilt_in(tid, top)
+}
+
+// Each kind is named, so that a new one must get its answer here. A kind with no `Debug` has
+// no text to build, which tc_debug_need answers. A Never has `Debug` but the spec gives it no
+// text (§3.2 *Never*), and the compiler writes none.
+fn tc_debug_unbuilt_in(tid0: Int, top: Bool) -> Option[Str] {
     let tid = resolve_alias_tid(tc_resolve(tid0))
     if tc_tid_is_no_info(tid) != 0 { return None }
     let t = ty_pool.get(tid).unwrap()
-    let k = t.kind
-    if k == TyKind.Tuple { return Some("write the debug text of a tuple") }
-    if k == TyKind.Result { return Some("write the debug text of a Result") }
-    if k == TyKind.Set { return Some("write the debug text of a Set") }
-    if k == TyKind.Bytes { return Some("write the debug text of a Bytes") }
-    if k == TyKind.Struct || k == TyKind.Enum {
-        if top { return None }
-        let base = if k == TyKind.Struct { tc_struct_base_tid(tid) } else { tc_enum_base_tid(tid) }
-        let bname = strip_module_qualifier(tc_type_name(base))
-        if tc_type_name_derives(bname, "Debug") != 0 { return None }
-        return Some("call the written `debug` of `{bname}` inside another value")
+    match t.kind {
+        TyKind.Tuple => Some("write the debug text of a tuple")
+        TyKind.Result => Some("write the debug text of a Result")
+        TyKind.Set => Some("write the debug text of a Set")
+        TyKind.Bytes => Some("write the debug text of a Bytes")
+        TyKind.Never => Some("write the debug text of a Never")
+        TyKind.Struct | TyKind.Enum => {
+            if tc_tid_base_derives(tid, "Debug") { return tc_debug_fields_unbuilt(tid) }
+            if top { return None }
+            let base = if t.kind == TyKind.Struct { tc_struct_base_tid(tid) } else { tc_enum_base_tid(tid) }
+            Some("call the written `debug` of `{strip_module_qualifier(tc_type_name(base))}` inside another value")
+        }
+        TyKind.List | TyKind.Option | TyKind.Range => tc_debug_unbuilt_in(t.inner1, false)
+        TyKind.Map => {
+            match tc_debug_unbuilt_in(t.inner1, false) {
+                Some(why) => Some(why)
+                None => tc_debug_unbuilt_in(t.inner2, false)
+            }
+        }
+        TyKind.Int | TyKind.Float | TyKind.Bool | TyKind.Str | TyKind.Char => None
+        TyKind.I8 | TyKind.I16 | TyKind.I32 | TyKind.U8 | TyKind.U16 | TyKind.U32 | TyKind.U64 => None
+        TyKind.Typevar | TyKind.Unknown => None
+        TyKind.Void | TyKind.Fn | TyKind.Iterator | TyKind.Handle | TyKind.Channel | TyKind.Ptr | TyKind.Handler => None
+        TyKind.StringBuilder | TyKind.Template | TyKind.FfiScope | TyKind.Raw => None
     }
-    if k == TyKind.List || k == TyKind.Option || k == TyKind.Range { return tc_debug_unbuilt(t.inner1, false) }
-    if k == TyKind.Map {
-        match tc_debug_unbuilt(t.inner1, false) {
+}
+
+// The derived debug of an instance renders each field as it reads at that instance. A field
+// that names no type parameter was judged at the declaration, so only the others are read.
+// The walk ends as tc_applied_fields_derive_fact's does: it enters each instance once, and
+// it does not enter a declaration that grows its arguments, which E0324 refuses.
+fn tc_debug_fields_unbuilt(tid: Int) -> Option[Str] {
+    if tc_tid_struct_arg_count(tid) == 0 || tc_tid_decl_grows(tid) { return None }
+    let key = tc_resolve(tid)
+    if tc_calls.debug_unbuilt_seen.contains_key(key) { return None }
+    tc_calls.debug_unbuilt_seen.insert(key, 1)
+    for declared in tc_declared_field_tids(tid) {
+        if !tc_tid_holds_typevar(declared) { continue }
+        match tc_debug_unbuilt_in(tc_member_tid_at_instance(declared, tid), false) {
             Some(why) => { return Some(why) }
             None => {}
         }
-        return tc_debug_unbuilt(t.inner2, false)
     }
     None
 }
@@ -27925,7 +27889,7 @@ fn tc_std_trait_call(node: Int, obj_t: Int, recv_node: Int, tr: Str, shown_trait
     }
     match tc_std_trait_unbuilt(obj_t, tr) {
         Some(why) => {
-            tc_error_at_code("`{method}` on `{type_to_str(obj_t)}` is not built yet: the compiler cannot {why}", node, "TypeError", TYPE_ERROR,
+            tc_error_at_code(tc_not_built_text("`{method}` on `{type_to_str(obj_t)}`", "", why), node, "TypeError", TYPE_ERROR,
                 tc_std_trait_unbuilt_help(method))
             return tc_error_recovery_tid()
         }
@@ -28028,6 +27992,12 @@ fn tc_std_trait_qualified_call(node: Int, shown: Str, tr: Str, method: Str, args
     substitute_typevar_tid(tc_member_tid_at_instance(fs.ret, recv), binds)
 }
 
+// The one text for a method the spec gives a type and the compiler cannot build yet. `at`
+// names the type when `subject` does not.
+fn tc_not_built_text(subject: Str, at: Str, why: Str) -> Str {
+    "{subject} is not built yet{at}: the compiler cannot {why}"
+}
+
 fn tc_std_trait_unbuilt_help(method: Str) -> Str {
     match method {
         "debug" => "build the text from the parts of the value whose `debug` is built"
@@ -28051,7 +28021,13 @@ pub fn tc_instance_has_trait(tid: Int, tr: Str) -> Bool {
 // Whether the instance `tid` has `tr` and the compiler builds its method, so a reader that
 // takes a value only where it has a text asks for no body that cannot be built.
 pub fn tc_std_trait_built(tid: Int, tr: Str) -> Bool {
-    tc_instance_has_trait(tid, tr) && tc_std_trait_unbuilt(tid, tr).is_none()
+    let r = tc_resolve(tid)
+    let keep = tc_tid_has_unbound_metavar(r) == 0 && !tc_tid_holds_typevar(r)
+    let key = "{r}:{tr}"
+    if keep && tc_type_walks.std_trait_built.contains_key(key) { return tc_type_walks.std_trait_built.get(key) ?? false }
+    let built = tc_instance_has_trait(r, tr) && tc_std_trait_unbuilt(r, tr).is_none()
+    if keep { tc_type_walks.std_trait_built.insert(key, built) }
+    built
 }
 
 // Whether a method call reached a method of a trait a program module declares. Typecheck
@@ -28353,13 +28329,20 @@ fn tc_derived_method_trait(method: Str) -> Str {
 }
 
 // A derived method called by name is the derive at this instance, so it holds only where the
-// derive does, as `==` holds only there.
+// derive does, as `==` holds only there, and it is called only where the compiler builds it.
 fn tc_refuse_derived_method_at(recv: Int, method: Str, node: Int) ! Diag.Report {
     let tr = tc_derived_method_trait(method)
     if tr == "" { return }
     let path = tc_trait_need(recv, tr, [])
-    if path.len() == 0 { return }
-    tc_report_trait_need(path, tr, node)
+    if path.len() > 0 {
+        tc_report_trait_need(path, tr, node)
+        return
+    }
+    match tc_std_trait_unbuilt(recv, tr) {
+        Some(why) => diag_error_at("TypeError", TYPE_ERROR, tc_not_built_text("`{method}` on `{type_to_str(recv)}`", "", why), node,
+            tc_std_trait_unbuilt_help(method))
+        None => {}
+    }
 }
 
 fn tc_report_trait_need(path: List[Int], tr: Str, node: Int) ! Diag.Report {
