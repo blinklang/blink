@@ -1,0 +1,67 @@
+// A derive at a generic instance is judged through the field types at that instance. The
+// walk has no depth limit, so a part with no trait is found at any depth, and it judges each
+// instance once, so a type that reaches another type by two fields does not double the work
+// at each level.
+
+import compile_test_helpers
+import std.process.{ChildEnd, ChildLimits}
+import std.time.{Duration}
+
+// `depth` generic types, each with two fields of the next, over a last type that holds `T`.
+fn diamond_src(depth: Int) -> Str {
+    let mut s = ""
+    let mut i = 0
+    while i < depth {
+        s = "{s}@derive(Debug)\ntype A{i}[T] \{ a: A{i + 1}[T], b: A{i + 1}[T] }\n"
+        i = i + 1
+    }
+    "{s}@derive(Debug)\ntype A{depth}[T] \{ v: T }\nfn show(x: A0[Int]) -> Str \{ x.debug() }\nfn main() \{ io.println(\"ok\") }\n"
+}
+
+// `depth` generic types, each with one field of the next, over a last type that holds `T`.
+fn chain_decls(depth: Int, tr: Str) -> Str {
+    let mut s = "type NoD \{ n: Int }\n"
+    let mut i = 0
+    while i < depth {
+        s = "{s}@derive({tr})\ntype C{i}[T] \{ c: C{i + 1}[T] }\n"
+        i = i + 1
+    }
+    "{s}@derive({tr})\ntype C{depth}[T] \{ v: T }\n"
+}
+
+// A walk that judged each path, not each instance, takes 2^26 steps here, so it fails the
+// deadline instead of holding the run.
+test "a type that reaches each next type by two fields 26 levels deep checks clean before a deadline" {
+    let path = "{compile_test_helpers.scratch_root()}/_chk_inst_walk_diamond.bl"
+    fs.write(path, diamond_src(26)).unwrap()
+    let r = process.run("build/blink", ["check", path, "--format", "json"], limits: ChildLimits { timeout: Some(Duration.seconds(60)) }).unwrap()
+    let _ = fs.delete(path)
+    assert_eq(r.end, ChildEnd.Exited(0))
+    assert(r.out.contains("\"status\":\"ok\""), "{r.out}{r.err_out}")
+}
+
+test "a derived debug at an instance 40 types deep is refused at check" {
+    let src = "{chain_decls(40, "Debug")}fn show(x: C0[NoD]) -> Str \{ x.debug() }\nfn main() \{ io.println(\"ok\") }\n"
+    let out = compile_test_helpers.check_via_cli(src, "inst_walk_deep_debug")
+    assert(out.contains("`C0[NoD]` does not implement `Debug`"), out)
+}
+
+test "a derived to_json at an instance 40 types deep is refused at check" {
+    let src = "import std.json\n{chain_decls(40, "Serialize")}fn show(x: C0[NoD]) -> Str \{ x.to_json() }\nfn main() \{ io.println(\"ok\") }\n"
+    let out = compile_test_helpers.check_via_cli(src, "inst_walk_deep_ser")
+    assert(out.contains("`C0[NoD]` does not implement `Serialize`"), out)
+}
+
+test "a Deserialize field whose instance is 40 types deep is refused at check" {
+    let src = "import std.json\n{chain_decls(40, "Deserialize")}@derive(Deserialize)\ntype Top \{ c: C0[NoD] }\nfn main() \{\n    match Top.from_json(\"x\") \{\n        Ok(_) => io.println(\"ok\")\n        Err(_) => io.println(\"err\")\n    }\n}\n"
+    let out = compile_test_helpers.check_via_cli(src, "inst_walk_deep_deser")
+    assert(out.contains("field `c` has type `C0[NoD]` which does not implement Deserialize"), out)
+}
+
+// Neither declaration holds itself, but together they grow an argument at each turn, so
+// the instances have no end (sections/03_types.md *Limit on Generic Instances*).
+test "two types that grow each other's argument end the check with E0324" {
+    let src = "@derive(Debug)\ntype A[T] \{ b: B[T] }\n@derive(Debug)\ntype B[U] \{ a: Option[A[List[U]]] }\nfn show(x: A[Int]) -> Str \{ x.debug() }\nfn main() \{ io.println(\"ok\") }\n"
+    let out = compile_test_helpers.check_via_cli(src, "inst_walk_mutual_grow")
+    assert(out.contains("\"code\":\"E0324\""), out)
+}

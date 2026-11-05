@@ -1582,9 +1582,37 @@ fn tc_tid_derive_fact(tid: Int, tr: Str) -> Int {
     1
 }
 
+// A walk ends: each step goes to a field of a type that does not grow its arguments, so the
+// walk meets finitely many instances, and an instance it is still judging answers unknown.
+// A finished answer is kept, so a type that reaches another type by two fields judges it
+// once. A refusal is always kept. An answer that holds is kept once no instance above the
+// one judged is still open under it: until then it holds only if that instance holds, so it
+// waits in the open list and is dropped if that instance is refused. An instance that holds
+// an unsolved metavariable keeps nothing, since its answer can change once it is solved.
 fn tc_applied_fields_derive_fact(tid: Int, tr: Str) -> Int {
     let key = "{tc_resolve(tid)}:{tr}"
-    if tc_calls.derive_facts_above.len() >= 32 || tc_calls.derive_facts_above.contains(key) { return 0 }
+    match tc_type_walks.derive_facts.get(key) {
+        Some(fact) => { return fact }
+        None => {}
+    }
+    match tc_calls.derive_facts_open_low.get(key) {
+        Some(low) => {
+            tc_derive_facts_meet(low)
+            return 1
+        }
+        None => {}
+    }
+    let at = tc_calls.derive_facts_above.len()
+    match tc_calls.derive_facts_above.index_of(key) {
+        Some(above) => {
+            tc_derive_facts_meet(above)
+            return 0
+        }
+        None => {}
+    }
+    let low_outside = tc_calls.derive_facts_low
+    let open_mark = tc_calls.derive_facts_open.len()
+    tc_calls.derive_facts_low = at
     tc_calls.derive_facts_above.push(key)
     let mut fact = 1
     for declared in tc_declared_field_tids(tid) {
@@ -1595,7 +1623,33 @@ fn tc_applied_fields_derive_fact(tid: Int, tr: Str) -> Int {
         }
     }
     let _ = tc_calls.derive_facts_above.pop()
+    let low = tc_calls.derive_facts_low
+    let keeps = tc_tid_has_unbound_metavar(tid) == 0
+    if fact == 1 && low < at && keeps {
+        let mut i = open_mark
+        while i < tc_calls.derive_facts_open.len() {
+            tc_calls.derive_facts_open_low.insert(tc_calls.derive_facts_open.get(i).unwrap(), low)
+            i = i + 1
+        }
+        tc_calls.derive_facts_open.push(key)
+        tc_calls.derive_facts_open_low.insert(key, low)
+    } else {
+        while tc_calls.derive_facts_open.len() > open_mark {
+            let done = tc_calls.derive_facts_open.pop().unwrap()
+            let _ = tc_calls.derive_facts_open_low.remove(done)
+            if fact == 1 && keeps { tc_type_walks.derive_facts.insert(done, 1) }
+        }
+        if keeps && (fact == -1 || low >= at) { tc_type_walks.derive_facts.insert(key, fact) }
+    }
+    let low_after = if low < low_outside { low } else { low_outside }
+    tc_calls.derive_facts_low = low_after
     fact
+}
+
+// The walk met the instance at place `above` on the stack again, so each instance under it
+// holds only if that one holds.
+fn tc_derive_facts_meet(above: Int) {
+    if above < tc_calls.derive_facts_low { tc_calls.derive_facts_low = above }
 }
 
 // One field of a generic declaration, judged against the instance `tid`. Answers -1 only
@@ -3130,9 +3184,15 @@ type CallFacts {
     self_views: Map[Int, Int]
     view_sigs: Map[Int, Int]
     hash_aliases_above: List[Int]
-    // The (instance, trait) pairs tc_tid_derive_fact is judging, so a type that holds itself
-    // answers unknown at the repeat instead of walking again.
+    // The (instance, trait) pairs tc_applied_fields_derive_fact is judging, so a type that
+    // holds itself answers unknown at the repeat instead of walking again. low is the lowest
+    // place on that stack the current walk met again. open holds the answers that hold only
+    // if an instance still on the stack holds, with that place. The kept answers are in
+    // tc_type_walks.derive_facts.
     derive_facts_above: List[Str]
+    derive_facts_low: Int
+    derive_facts_open: List[Str]
+    derive_facts_open_low: Map[Str, Int]
     // Set while a bound or a method call asks for Hash. A type parameter then has Hash only
     // through a bound its binder writes; a key or an element walk leaves it open for the
     // obligation it puts on the callers.
@@ -3148,7 +3208,7 @@ type CallFacts {
     trait_heads: Map[Int, Str]
 }
 fn new_call_facts() -> CallFacts {
-    CallFacts { open_calls: [], open_group: Map(), open_tids: [], reported: Map(), self_views: Map(), view_sigs: Map(), hash_aliases_above: [], derive_facts_above: [], hash_by_bounds: false, static_head_insts: Map(), static_head_binders: Map(), static_owners: Map(), trait_heads: Map() }
+    CallFacts { open_calls: [], open_group: Map(), open_tids: [], reported: Map(), self_views: Map(), view_sigs: Map(), hash_aliases_above: [], derive_facts_above: [], derive_facts_low: 0, derive_facts_open: [], derive_facts_open_low: Map(), hash_by_bounds: false, static_head_insts: Map(), static_head_binders: Map(), static_owners: Map(), trait_heads: Map() }
 }
 let mut tc_calls: CallFacts = new_call_facts()
 
@@ -5085,11 +5145,16 @@ pub fn tc_tid_is_pointer_bearing(tid: Int) -> Int {
 // only init_types, which clears them, clears this. The one entry that can still change is a
 // metavar a later unify binds, so a walk that meets an unbound one is not kept.
 // decl_grows caches tc_tid_decl_grows, and is fixed once interned for the same reason.
+// derive_facts keeps the finished answers of tc_applied_fields_derive_fact by
+// "{resolved tid}:{trait}", under the same rule for a metavar. An answer reads only the
+// @derive lists and the declaration of each type, which tc_register_type_decls holds in full
+// before the first derive check asks.
 type TypeWalkMemos {
     ptr_bearing: Map[Int, Int]
     decl_grows: Map[Int, Bool]
+    derive_facts: Map[Str, Int]
 }
-let mut tc_type_walks: TypeWalkMemos = TypeWalkMemos { ptr_bearing: Map(), decl_grows: Map() }
+let mut tc_type_walks: TypeWalkMemos = TypeWalkMemos { ptr_bearing: Map(), decl_grows: Map(), derive_facts: Map() }
 let PTR_BEARING_MET_METAVAR = -2
 
 fn ptr_bearing_walk(r: Int, seen: Map[Int, Int]) -> Int {
@@ -17078,7 +17143,7 @@ fn tc_drop_unprovided_closeable_impls(program: Int) {
 
 fn init_types() ! TypeCheck.Register {
     ty_pool.clear()
-    tc_type_walks = TypeWalkMemos { ptr_bearing: Map(), decl_grows: Map() }
+    tc_type_walks = TypeWalkMemos { ptr_bearing: Map(), decl_grows: Map(), derive_facts: Map() }
     tc_arg_binds_free.clear()
     ty_param_list.clear()
     // The method-call facts span all three phases of one check_types, so they are cleared
