@@ -995,22 +995,20 @@ fn lower_checked_assert(node: Int, args: Int, label: Str) -> Int ! Diag.Report {
     let bool_rec = layout_at(TYPE_BOOL, Position.Local, node)
     let neg = ir_unary(TYPE_BOOL, node, bool_rec.c_spelling, "!", cond_value)
     let intro_arg = if decomposed.ok { decomposed.intro } else { str_const(node, "") }
-    let mut user_msg = str_const(node, "")
-    if sublist_length(args) >= 2 {
-        user_msg = lower_value(sublist_get(args, 1))
-        if user_msg < 0 { return -1 }
-    }
+    let mut fail: List[Int] = []
+    let user_msg = lower_assert_user_msg(node, fail)
+    if user_msg < 0 { return -1 }
     let assertion = "{label}({unparse_expr(cond_node)})"
-    let fail_stmt = call_runtime_void(node, c_assert_fail_intro_name(), [
+    fail.push(call_runtime_void(node, c_assert_fail_intro_name(), [
         str_const(node, assertion),
         intro_arg,
         str_const(node, diag_file_for_node(node)),
         int_const(node, ir_line_text(node)),
         int_const(node, "{ir_col(node)}"),
         user_msg,
-    ])
+    ]))
     let mut pre = decomposed.pre
-    pre.push(ir_if(node, neg, ir_block(node, [fail_stmt]), -1))
+    pre.push(ir_if(node, neg, ir_block(node, fail), -1))
     ir_block(node, pre)
 }
 
@@ -1115,13 +1113,39 @@ fn assert_fail_call(node: Int, site: List[Int], msg: Int, user_msg: Int) -> Int 
     call_runtime_void(node, c_assert_fail_name(), [msg, site.get(0).unwrap(), site.get(1).unwrap(), user_msg])
 }
 
-// The call's own trailing message, or "" when it has none. What it hoists goes into `fail`,
-// the failing branch, since the spec evaluates the message only on failure (§2.20).
-fn lower_assert_user_msg(node: Int, fail: List[Int]) -> Int ! Diag.Report {
+// The index of an assert's trailing message, or -1 when the call is no assert or has none.
+fn assert_msg_index(node: Int) -> Int {
+    let callee = node_left(node)
+    if callee < 0 || node_kind(callee) != NodeKind.Ident { return -1 }
+    let kind = cc_assert_family_kind(tc_call_declared_name(node))
+    if kind == AssertKind.None { return -1 }
+    let at = if kind == AssertKind.AssertEq || kind == AssertKind.AssertNe { 2 } else { 1 }
     let args = node_args(node)
-    if sublist_length(args) < 3 { return str_const(node, "") }
+    if args == -1 || sublist_length(args) <= at { return -1 }
+    at
+}
+
+// The call's own trailing message, or "" when it has none. Everything it runs goes into
+// `fail`, the failing branch, since the spec evaluates the message only on failure (§2.20);
+// that is also why mv_call leaves it out of the walk above the statement.
+fn lower_assert_user_msg(node: Int, fail: List[Int]) -> Int ! Diag.Report {
+    let at = assert_msg_index(node)
+    if at < 0 { return str_const(node, "") }
+    let msg_node = sublist_get(node_args(node), at)
     let mark = cg_expr_pending_count()
-    let user_msg = lower_value(sublist_get(args, 2))
+    if !cg_stmt_materialise_where_run(msg_node) {
+        let _dropped = cg_expr_take_pending(mark)
+        return -1
+    }
+    let left = cg_expr_pending_leaves_from(mark)
+    if left >= 0 {
+        // A message that never returns ends the branch, so the fail call after it is dead
+        // and reads "" rather than a value that does not exist.
+        let _dead = cg_expr_take_pending(left + 1)
+        cg_expr_drain_pending(mark, fail)
+        return str_const(node, "")
+    }
+    let user_msg = lower_value(msg_node)
     cg_expr_drain_pending(mark, fail)
     user_msg
 }
@@ -1926,8 +1950,12 @@ fn mv_interp_is_text(e: Int) -> Bool {
 
 fn mv_list(sl: Int) -> Bool ! Diag.Report {
     if sl == -1 { return true }
+    mv_list_before(sl, sublist_length(sl))
+}
+
+fn mv_list_before(sl: Int, end: Int) -> Bool ! Diag.Report {
     let mut i = 0
-    while i < sublist_length(sl) {
+    while i < end {
         if !mv_expr(sublist_get(sl, i)) { return false }
         i = i + 1
     }
@@ -1993,6 +2021,10 @@ fn mv_call(e: Int, head: Int) -> Bool ! Diag.Report {
     // A trace call's msg runs only when its channel is on, so the call's lowering walks
     // it inside that test.
     if cc_is_trace_log_call(e) { return mv_after(mv_expr(sublist_get(node_args(e), 0)), e) }
+    // An assert's message runs only when the assertion fails, so lower_assert_user_msg
+    // walks it inside the failing branch.
+    let msg_at = assert_msg_index(e)
+    if msg_at >= 0 { return mv_after(mv_call_head(head) && mv_list_before(node_args(e), msg_at), e) }
     mv_after(mv_call_head(head) && mv_list(node_args(e)), e)
 }
 
