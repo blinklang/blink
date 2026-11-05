@@ -6541,7 +6541,7 @@ fn tc_qualified_variant_decl_of_call(call: Int) -> Int {
     if obj == -1 || node_kind(obj) != NodeKind.Ident || tc_ident_binder_node(obj) != -1 { return -1 }
     let cname = node_name(obj)
     if tc_tid_is_no_info(nr_get_type(cname)) == 0 { return -1 }
-    let ctor_tid = lookup_named_type(cname)
+    let ctor_tid = tc_head_decl_tid(cname)
     if ctor_tid == -1 || type_kind(ctor_tid) != TyKind.Enum { return -1 }
     let var_idx = get_variant_by_name(ctor_tid, node_method(call))
     if var_idx < 0 { return -1 }
@@ -11411,12 +11411,40 @@ fn tc_apply_generic_alias(decl: Int, name: Str, elems_sl: Int, ann_node: Int) ->
         i = i + 1
     }
     tc_suppress_ann_validation = saved_suppress
-    let target = tc_alias_underlying.get(tc_nominal_type_name(decl)) ?? -1
-    let applied = tc_tid_subst_mono(target, node_type_params(decl), args)
+    let applied = tc_alias_target_at(decl, args)
     if ann_node >= 0 && ann_node < tc_node_tid.len() {
         tc_node_tid.set(ann_node, applied)
     }
     applied
+}
+
+fn tc_alias_target_at(decl: Int, args: List[Int]) -> Int {
+    let target = tc_alias_underlying.get(tc_nominal_type_name(decl)) ?? -1
+    tc_tid_subst_mono(target, node_type_params(decl), args)
+}
+
+// The type a name written as the head of a value means. An alias means its target, and a
+// generic alias its target at open arguments that the value settles, so a value built through
+// `P = Pick[Int, Str]` or `Same[X] = Pick[X, X]` is held to what the alias says of them.
+fn tc_value_head_tid(name: Str) -> Int {
+    let named = lookup_named_type(name)
+    let decl = tc_alias_decl_of_written(name)
+    if decl == -1 { return named }
+    let tps = node_type_params(decl)
+    let mut args: List[Int] = []
+    let mut i = 0
+    while tps != -1 && i < sublist_length(tps) {
+        args.push(make_metavar())
+        i = i + 1
+    }
+    let target = tc_alias_target_at(decl, args)
+    if target == -1 { named } else { target }
+}
+
+// The declared type a head written `name` reaches, through any alias and with no instance's
+// arguments: the tid its variants and its declaration are keyed on.
+pub fn tc_head_decl_tid(name: Str) -> Int {
+    tc_enum_base_tid(resolve_alias_tid(lookup_named_type(name)))
 }
 
 // Whether the annotation names a generic alias at its arguments. Its resolved tid is already
@@ -21826,9 +21854,27 @@ fn tc_prelude_carrier_name(k: TyKind) -> Str {
 // qualifier is a free name and not a value spelled `Option`.
 pub fn tc_qualified_carrier(qualifier: Str, variant: Str) -> Option[TyKind] {
     match tc_prelude_carrier_of(variant) {
-        Some(k) => if tc_prelude_carrier_name(k) == qualifier { Some(k) } else { None }
+        Some(k) => {
+            if tc_prelude_carrier_name(k) == qualifier { return Some(k) }
+            let target = resolve_alias_tid(lookup_named_type(qualifier))
+            if target >= 0 && type_kind(target) == k { Some(k) } else { None }
+        }
         None => None
     }
+}
+
+// A carrier variant called through an alias, as `OI.Some(1)`. The alias's target is the value's
+// type, so the payload is held to the slot the target gives it.
+fn tc_alias_carrier_call_tid(head: Int, spelled: Str, variant: Str, args_sl: Int, node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    if !tc_check_carrier_arity(variant, args_sl, node) { return tc_error_recovery_tid() }
+    let h = ty_pool.get(tc_resolve(head)).unwrap()
+    let slot = if variant == "Err" { h.inner2 } else { h.inner1 }
+    if args_sl != -1 && sublist_length(args_sl) == 1 {
+        check_arg_value(spelled, 0, slot, sublist_get(args_sl, 0), false)
+    } else if variant == "Ok" && tc_unify(slot, TYPE_VOID) == 0 {
+        tc_report_declared_mismatch("{spelled}: expected {type_to_str(slot)} but got ()", node, node, slot, TYPE_VOID)
+    }
+    tc_note_open_variant(node, head)
 }
 
 // A carrier variant named with no argument list, bare (`None`) or qualified (`Option.None`).
@@ -22141,9 +22187,13 @@ fn tc_variant_open_instance(var_idx: Int) -> Int {
 // Answers each payload's type in argument order, so the instance is read off the types this
 // check recorded and no payload is inferred twice.
 fn tc_check_variant_payload_values(label: Str, var_idx: Int, args_sl: Int) -> List[Int] ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    if args_sl == -1 { return [] }
+    tc_check_variant_payload_values_at(label, var_idx, args_sl, tc_variant_open_instance(var_idx))
+}
+
+fn tc_check_variant_payload_values_at(label: Str, var_idx: Int, args_sl: Int, inst: Int) -> List[Int] ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     let mut tids: List[Int] = []
     if args_sl == -1 { return tids }
-    let inst = tc_variant_open_instance(var_idx)
     let mut i = 0
     while i < sublist_length(args_sl) {
         let p = tc_variant_payload(var_idx, args_sl, i)
@@ -22904,6 +22954,17 @@ fn tc_enum_structlit_instance_tid(enum_tid: Int, vname: Str, flds_sl: Int) -> In
         fi = fi + 1
     }
     tc_enum_instance_from_binds(enum_tid, tparams_sl, binds, true)
+}
+
+// A brace variant through an alias, whose target is the literal's type. A value that clashes
+// with it leaves the instance as the alias says it, for tc_check_lit_field_values to report.
+fn tc_alias_brace_variant_tid(head: Int, vname: Str, flds_sl: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    let saved_hint = tc_construct_hint
+    tc_construct_hint = head
+    let built = tc_enum_structlit_instance_tid(tc_enum_base_tid(head), vname, flds_sl)
+    tc_construct_hint = saved_hint
+    let _ = tc_unify(head, built)
+    head
 }
 
 // When a generic-enum ctor slot is unbound after arg-unification (a subset variant
@@ -28563,10 +28624,13 @@ fn tc_infer_struct_lit_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Rep
                 // (§3.4); its field values are still typed so nothing under it goes untyped.
                 let qual = sname.byte_slice(0, dot)
                 let vname = sname.byte_slice(dot + 1, sname.byte_len())
-                let qtid = lookup_named_type(qual)
-                if qtid != -1 && type_kind(qtid) == TyKind.Enum && get_variant_by_name(qtid, vname) != -1 {
+                let qtid = tc_value_head_tid(qual)
+                if qtid != -1 && type_kind(qtid) == TyKind.Enum && get_variant_by_name(tc_enum_base_tid(qtid), vname) != -1 {
                     check_deprecated_type(qual, node)
-                    tc_check_brace_literal(tc_variant_literal_owner(get_variant_by_name(qtid, vname)), node)
+                    tc_check_brace_literal(tc_variant_literal_owner(get_variant_by_name(tc_enum_base_tid(qtid), vname)), node)
+                    if tc_alias_decl_of_written(qual) != -1 {
+                        return tc_note_open_variant(node, tc_alias_brace_variant_tid(qtid, vname, node_fields(node)))
+                    }
                     return tc_note_open_variant(node, tc_enum_structlit_instance_tid(qtid, vname, node_fields(node)))
                 }
                 if tc_report_bad_variant_value(node, qual, vname, 2) {
@@ -29534,6 +29598,9 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
         // step 1), so neither the expected type nor a user enum's namesake variant is asked.
         if obj_node != -1 && node_kind(obj_node) == NodeKind.Ident && tc_tid_is_no_info(nr_get_type(node_name(obj_node))) != 0 {
             if tc_qualified_carrier(node_name(obj_node), method).is_some() {
+                if tc_alias_decl_of_written(node_name(obj_node)) != -1 {
+                    return tc_alias_carrier_call_tid(tc_value_head_tid(node_name(obj_node)), "{node_name(obj_node)}.{method}", method, node_args(node), node)
+                }
                 return tc_carrier_call_tid(method, node_args(node), node)
             }
         }
@@ -29546,13 +29613,17 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
         if obj_node != -1 && node_kind(obj_node) == NodeKind.Ident {
             let cname = node_name(obj_node)
             if tc_tid_is_no_info(nr_get_type(cname)) != 0 {
-                let ctor_tid = lookup_named_type(cname)
+                let ctor_tid = tc_value_head_tid(cname)
                 if ctor_tid != -1 && type_kind(ctor_tid) == TyKind.Enum {
-                    let cvar_idx = get_variant_by_name(ctor_tid, method)
+                    let cvar_idx = get_variant_by_name(tc_enum_base_tid(ctor_tid), method)
                     if cvar_idx != -1 {
                         nr_note_call_decl(node, tc_variant_decl_node(cvar_idx))
                         let cargs_sl = node_args(node)
                         tc_check_variant_paren_payload(cvar_idx, method, node)
+                        if tc_alias_decl_of_written(cname) != -1 {
+                            let _ = tc_check_variant_payload_values_at("{cname}.{method}", cvar_idx, cargs_sl, ctor_tid)
+                            return tc_note_open_variant(node, ctor_tid)
+                        }
                         let payload_tids = tc_check_variant_payload_values("{cname}.{method}", cvar_idx, cargs_sl)
                         // A generic-enum qualified ctor (`Tree.Leaf(1)`) reverse-infers
                         // its concrete instance tid; a non-generic enum keeps the bare
@@ -31268,15 +31339,19 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
         if node_kind(obj_node) == NodeKind.Ident {
             let obj_name = node_name(obj_node)
             if tc_tid_is_no_info(nr_get_type(obj_name)) != 0 && tc_qualified_carrier(obj_name, fname).is_some() {
+                if fname == "None" && tc_alias_decl_of_written(obj_name) != -1 {
+                    return tc_note_open_variant(node, tc_value_head_tid(obj_name))
+                }
                 return tc_carrier_nullary_tid(fname, "{obj_name}.{fname}", node)
             }
             if tc_tid_is_no_info(nr_get_type(obj_name)) != 0 {
                 if tc_report_bad_variant_value(node, obj_name, fname, 0) { return tc_error_recovery_tid() }
             }
-            let tid = lookup_named_type(obj_name)
+            let tid = tc_value_head_tid(obj_name)
             if tid != -1 && type_kind(tid) == TyKind.Enum {
-                let vi = get_variant_by_name(tid, fname)
+                let vi = get_variant_by_name(tc_enum_base_tid(tid), fname)
                 if vi != -1 && variant_field_count(vi) != 0 { return tc_declared_variant_value_tid(tid, vi, "{obj_name}.{fname}", node) }
+                if tc_alias_decl_of_written(obj_name) != -1 { return tc_note_open_variant(node, tid) }
                 return tc_note_open_variant(node, tc_nullary_variant_tid(tid, vi))
             }
             // A MODULE qualifier. This arm covers an enum type qualifier, a struct
