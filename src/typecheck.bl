@@ -1541,11 +1541,16 @@ fn tc_derive_only_fact(tid: Int, tr: Str) -> Int {
 // §3.4:1908 for Hash; the Debug and Serialize emitters are derive-only), so there are no
 // impl nodes to consult.
 //
-// A field annotated with one of the declaration's type parameters takes that slot's
-// concrete argument and must satisfy the trait itself. Every other field was already
-// judged against the declaration by the derive-field passes (E0520 / E1401), so it is
-// skipped here rather than decided twice. Recursion runs on the instance's arguments,
-// which are strictly less nested than the instance, so it terminates.
+// A field whose declared type names a type parameter is read at the instance as a whole,
+// so `b: B[(T, Int)]` at `W[Int]` is judged as `B[(Int, Int)]`, which is what the derived
+// method calls. Every other field was already judged against the declaration by the
+// derive-field passes (E0520 / E1401), so it is skipped here rather than decided twice.
+// A type that holds itself at the same instance meets that instance again while it is
+// judged, and the repeat answers unknown. A type whose declaration grows its arguments
+// meets no repeat, so it is judged by its arguments only: they are strictly less nested
+// than the instance, so that walk ends. Hash is judged by its arguments too: its closed
+// list refuses a part for its own kind alone, so each part the applied field refuses is an
+// argument or was refused at the declaration, and an alias cycle in an argument has no Hash.
 fn tc_tid_derive_fact(tid: Int, tr: Str) -> Int {
     let base = tc_tid_struct(tid)
     if base == "" { return 0 }
@@ -1555,6 +1560,7 @@ fn tc_tid_derive_fact(tid: Int, tr: Str) -> Int {
     if td == -1 { return -1 }
     if tc_decl_derives(td, tr) == 0 { return -1 }
     if tc_tid_struct_arg_count(tid) == 0 { return 1 }
+    if tr != "Hash" && !tc_tid_decl_grows(tid) { return tc_applied_fields_derive_fact(tid, tr) }
     let tps = node_type_params(td)
     let flds = node_fields(td)
     if tps == -1 || flds == -1 { return 1 }
@@ -1574,6 +1580,22 @@ fn tc_tid_derive_fact(tid: Int, tr: Str) -> Int {
         i = i + 1
     }
     1
+}
+
+fn tc_applied_fields_derive_fact(tid: Int, tr: Str) -> Int {
+    let key = "{tc_resolve(tid)}:{tr}"
+    if tc_calls.derive_facts_above.len() >= 32 || tc_calls.derive_facts_above.contains(key) { return 0 }
+    tc_calls.derive_facts_above.push(key)
+    let mut fact = 1
+    for declared in tc_declared_field_tids(tid) {
+        if !tc_tid_holds_typevar(declared) { continue }
+        if tc_derive_arg_fact(tc_member_tid_at_instance(declared, tid), tr) == -1 {
+            fact = -1
+            break
+        }
+    }
+    let _ = tc_calls.derive_facts_above.pop()
+    fact
 }
 
 // One field of a generic declaration, judged against the instance `tid`. Answers -1 only
@@ -3108,6 +3130,9 @@ type CallFacts {
     self_views: Map[Int, Int]
     view_sigs: Map[Int, Int]
     hash_aliases_above: List[Int]
+    // The (instance, trait) pairs tc_tid_derive_fact is judging, so a type that holds itself
+    // answers unknown at the repeat instead of walking again.
+    derive_facts_above: List[Str]
     // Set while a bound or a method call asks for Hash. A type parameter then has Hash only
     // through a bound its binder writes; a key or an element walk leaves it open for the
     // obligation it puts on the callers.
@@ -3123,7 +3148,7 @@ type CallFacts {
     trait_heads: Map[Int, Str]
 }
 fn new_call_facts() -> CallFacts {
-    CallFacts { open_calls: [], open_group: Map(), open_tids: [], reported: Map(), self_views: Map(), view_sigs: Map(), hash_aliases_above: [], hash_by_bounds: false, static_head_insts: Map(), static_head_binders: Map(), static_owners: Map(), trait_heads: Map() }
+    CallFacts { open_calls: [], open_group: Map(), open_tids: [], reported: Map(), self_views: Map(), view_sigs: Map(), hash_aliases_above: [], derive_facts_above: [], hash_by_bounds: false, static_head_insts: Map(), static_head_binders: Map(), static_owners: Map(), trait_heads: Map() }
 }
 let mut tc_calls: CallFacts = new_call_facts()
 
