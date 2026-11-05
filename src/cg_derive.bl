@@ -674,6 +674,7 @@ fn cmp_method(decl: Int, tid: Int, arg: Int, bodies: Bool) ! Diag.Report {
     if !bodies { return print_fn_decl(false, ret, symbol, params, false) }
     let body = cmp_body(decl, tid, arg)
     if body < 0 { return }
+    print_pending_walkers()
     print_fn(false, ret, symbol, params, false, body)
 }
 
@@ -802,6 +803,11 @@ fn cmp_field(owner_tid: Int, ftid: Int, path: Str, label: Str, span: Int) -> Lis
     if k == TyKind.Struct || k == TyKind.Enum {
         return cmp_nested_field(owner_tid, ftid, frec, path, label, span)
     }
+    if k == TyKind.Tuple {
+        let symbol = tuple_cmp_fn(ftid, span)
+        if symbol == "" { return [] }
+        return cmp_call_field(symbol, owner_tid, ftid, frec, path, span)
+    }
     not_built(span, "@derive(Ord) on the {tk_name(k)} field `{label}`")
     []
 }
@@ -848,8 +854,7 @@ fn cmp_sign_guard(name: Str, ints: Str, op: Str, answer: Str, span: Int) -> Int 
 }
 
 // A nested type is ordered by its own derived method, so the comparison stays one call
-// deep however far the nesting goes. A local holds the answer because the guard tests it
-// and then returns that same answer.
+// deep however far the nesting goes.
 fn cmp_nested_field(owner_tid: Int, ftid: Int, frec: LayoutRecord, path: Str, label: Str, span: Int) -> List[Int] ! Diag.Report {
     let fdecl = tc_tid_decl_node(ftid)
     if fdecl < 0 || fdecl == DECL_NODE_AMBIGUOUS {
@@ -865,6 +870,12 @@ fn cmp_nested_field(owner_tid: Int, ftid: Int, frec: LayoutRecord, path: Str, la
         not_built(span, "{refusal}, which the field `{label}` would have to call")
         return []
     }
+    cmp_call_field(c_derived_method_symbol(ftid, "cmp"), owner_tid, ftid, frec, path, span)
+}
+
+// A field ordered by a call: a local holds the answer because the guard tests it and then
+// returns that same answer.
+fn cmp_call_field(symbol: Str, owner_tid: Int, ftid: Int, frec: LayoutRecord, path: Str, span: Int) -> List[Int] ! Diag.Report {
     let otid = ordering_tid(span)
     if otid < 0 { return [] }
     let ospelling = ordering_spelling(otid, span)
@@ -875,7 +886,7 @@ fn cmp_nested_field(owner_tid: Int, ftid: Int, frec: LayoutRecord, path: Str, la
     if ospelling == "" || bools == "" || equal < 0 || lhs < 0 || rhs < 0 { return [] }
     let form = layout_of(otid, Position.Return).slot_form
     let name = c_mint_local("ord")
-    let call = ir_call_direct(otid, span, ospelling, c_derived_method_symbol(ftid, "cmp"), form, [lhs, rhs])
+    let call = ir_call_direct(otid, span, ospelling, symbol, form, [lhs, rhs])
     let differs = ir_binary(TYPE_BOOL, span, bools, "!=",
         ir_var_ref(otid, span, ospelling, name, form), equal)
     let answer = ir_return(span, ir_var_ref(otid, span, ospelling, name, form))
@@ -1778,6 +1789,62 @@ fn tuple_hash_body(tid: Int, span: Int) -> Int ! Diag.Report {
         i = i + 1
     }
     stmts.push(ir_return(span, ir_var_ref(TYPE_U64, span, u64s, acc, u64_form())))
+    ir_block(span, stmts)
+}
+
+// A tuple's order, built on demand as its hash is, so every field and instance that holds
+// one tuple type calls one function. "" is a refusal already reported.
+fn tuple_cmp_fn(tid: Int, span: Int) -> Str ! Diag.Report {
+    let r = tc_resolve(tid)
+    let symbol = c_tid_derive_method_name(r, "cmp")
+    if diag_is_ice_seg(symbol) {
+        derive_ice(span, "no cmp function name for {tc_type_str(r)}: {symbol}")
+        return ""
+    }
+    match cg_promote_on_demand_claim(symbol) {
+        Some(known) => { return known }
+        None => {}
+    }
+    cg_promote_on_demand_settle(symbol, tuple_cmp_build(r, symbol, span))
+}
+
+fn tuple_cmp_build(r: Int, symbol: Str, span: Int) -> Bool ! Diag.Report {
+    let _td = ensure_typedef_for(r)
+    let spelling = spelling_or_ice(layout_of(r, Position.Param), tc_type_str(r), span)
+    let otid = ordering_tid(span)
+    if spelling == "" || otid < 0 { return false }
+    let ret = ordering_spelling(otid, span)
+    if ret == "" { return false }
+    let body = tuple_cmp_body(r, span)
+    if body < 0 { return false }
+    let problems = ir_verify_in_frame(body, [self_param(), other_param()])
+    if problems.len() > 0 {
+        derive_ice(span, "the cmp function {symbol} does not verify: {problems.get(0).unwrap()}")
+        return false
+    }
+    cg_promote_on_demand_queue(symbol, ret, ["{spelling} {self_param()}", "{spelling} {other_param()}"], body)
+    true
+}
+
+// Lexicographic, as a struct's fields are: the elements order exactly as fields do, so the
+// guards and every refusal an element can raise stay in cmp_field. A unit element holds no
+// value and every unit is equal, so it never decides.
+fn tuple_cmp_body(tid: Int, span: Int) -> Int ! Diag.Report {
+    let mut stmts: List[Int] = []
+    let mut i = 0
+    while i < tc_tid_child_count(tid) {
+        let ftid = tc_tid_child(tid, i)
+        if !member_is_unit(ftid) {
+            let path = c_tuple_member(i)
+            let part = cmp_field(tid, ftid, path, path, span)
+            if part.len() == 0 { return -1 }
+            for st in part { stmts.push(st) }
+        }
+        i = i + 1
+    }
+    let equal = ordering_return(ordering_equal, span)
+    if equal < 0 { return -1 }
+    stmts.push(equal)
     ir_block(span, stmts)
 }
 
