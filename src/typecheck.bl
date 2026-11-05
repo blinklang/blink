@@ -304,6 +304,10 @@ let mut tc_type_decl_node_by_tid: Map[Int, Int] = Map()
 // answer a question about it. Delete this the day resolution mints a tid per
 // declaration; the tid then names its own node and there is nothing to be unsure of.
 pub let DECL_NODE_AMBIGUOUS: Int = -2
+// What a declaration lookup gives for a type that declares no node of its own.
+// DECL_NODE_AMBIGUOUS is negative too, so a caller that means "no declaration" compares
+// with this value, not with `< 0`.
+pub let NO_DECL_NODE: Int = -1
 // Bare names two modules both declared. tc_type_decl_nodes keeps only the last
 // declaration under such a name, so a lookup that starts from a bare name (an
 // INSTANCE tid carries nothing else) must consult this set before trusting it.
@@ -1115,13 +1119,13 @@ fn tc_impl_alias_resolved(im: Int) -> Int {
 // lib/std extends.
 pub fn tc_impl_owner_decl(im: Int) -> Int {
     let name = node_name(im)
-    if name == "" { return -1 }
+    if name == "" { return NO_DECL_NODE }
     let saved = tc_enter_body_module(im)
     let meant = tc_compiler_known_type_meant(name, -1)
     let tid = if meant != "" { -1 } else { lookup_named_type(name) }
     tc_leave_body_module(saved)
     if meant != "" { return tc_prelude_type_decl(meant) }
-    if tid < 0 { return -1 }
+    if tid < 0 { return NO_DECL_NODE }
     let target = tc_impl_alias_target(im)
     if target != -1 { return tc_tid_decl_node(target) }
     tc_tid_decl_node(tid)
@@ -23859,11 +23863,65 @@ fn tc_report_instance_ambiguity(node: Int, call: Str, owner: Str, held: Str, tra
 }
 
 // A call read through no trait may take an impl of any trait.
-pub fn tc_impl_is_of_call_trait(im: Int, call_trait: Option[Str]) -> Bool {
+fn tc_impl_is_of_call_trait(im: Int, call_trait: Option[Str]) -> Bool {
     match call_trait {
         Some(key) => tc_impl_trait_id(im) == key
         None => true
     }
+}
+
+// Whether a call on `recv_tid`, read through `call_trait` with a bound's trait arguments
+// `want_args`, reaches impl `im`. Codegen lowers the call through the one impl that answers,
+// and mono builds that impl's instance of a generic method, so the two read one rule.
+pub fn tc_impl_answers_call(im: Int, recv_tid: Int, call_trait: Option[Str], want_args: List[Int]) -> Bool {
+    if !tc_impl_is_of_call_trait(im, call_trait) { return false }
+    let want = tc_tid_decl_node(recv_tid)
+    let builtin = tc_builtin_owner_name(recv_tid)
+    if want < 0 && builtin == "" { return false }
+    if !tc_impl_answers_for(im, want, builtin) { return false }
+    tc_impl_takes_trait_args(im, recv_tid, want_args)
+}
+
+// A receiver identifies the impls written over it in one of two ways. A struct or enum is
+// its declaration node, which keeps two modules' namesakes apart. Every other type
+// declares nothing at all, so it is its kind, which is the name `impl ... for List[T]`
+// writes; a struct or enum with no declaration is a gap and not one of these.
+pub fn tc_builtin_owner_name(recv_tid: Int) -> Str {
+    let k = tc_tid_kind(tc_resolve(recv_tid))
+    if k == TyKind.Struct || k == TyKind.Enum { return "" }
+    tk_name(k)
+}
+
+// A kind name is a weaker key than a declaration node: every impl over `List` writes the
+// same one, and so does an impl over a type the program itself declares under that name.
+// So an impl that binds type parameters answers for the container alone, whatever the
+// program declares, and one that binds none answers for a declaration and, failing that,
+// for the container it names. An impl whose owner is a name two modules both declare is in
+// neither channel: it extends a declaration, the pair is just unresolved here. A
+// per-instance impl over a declared type answers for the declaration typecheck recorded.
+// Only NO_DECL_NODE from tc_impl_owner_decl means "no declaration": the ambiguous answer is
+// another negative value.
+pub fn tc_impl_answers_for(im: Int, want: Int, builtin: Str) -> Bool {
+    if tc_impl_is_poly_user(im) { return tc_poly_user_impl_decl(im) == want }
+    if tc_impl_binds_parameters(im) { return want < 0 && tc_impl_recv_spelling(im) == builtin }
+    if want >= 0 { return tc_impl_owner_decl(im) == want }
+    tc_impl_owner_decl(im) == NO_DECL_NODE && tc_impl_recv_spelling(im) == builtin
+}
+
+// Past the per-instance impls over a declared type, which typecheck records with their
+// declaration, an impl that binds type parameters extends a builtin container: an impl
+// header resolves its receiver name to the builtin before any declaration of that name,
+// and every other generic impl over a declared type is refused (PolyImplUnsupported).
+fn tc_impl_binds_parameters(im: Int) -> Bool {
+    let binders = node_impl_binders(im)
+    binders != -1 && sublist_length(binders) > 0
+}
+
+// Whether a call reached a trait's own method and not an impl's. A call on a bound receiver
+// does, and only an instance of the body says which impl runs.
+pub fn tc_call_reaches_trait_method(call_node: Int) -> Bool {
+    let block = tc_method_block.get(tc_call_decl_node(call_node)) ?? -1
+    block != -1 && node_kind(block) == NodeKind.TraitDef
 }
 
 // The trait a `Trait.method(value, ..)` call names. Typecheck read the head in the calling

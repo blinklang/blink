@@ -20,13 +20,13 @@
 import parser.{
     node_kind, node_name, node_left, node_right, node_obj, node_index, node_method, node_args,
     node_body, node_is_mut, node_handlers, node_stmts,
-    node_methods, node_impl_binders, node_type_params,
+    node_methods, node_type_params,
     node_module, node_source_module, node_params, node_fields, node_value, node_str_val,
     sublist_get, sublist_length,
 }
 import ast.{NodeKind, node_kind_name}
 import typecheck.{
-    TyKind, tk_name, tc_resolve, tc_tid_kind, tc_tid_decl_node, tc_impl_owner_decl, tc_impl_recv_spelling, tc_static_call_owner, lookup_named_type, tc_head_decl_tid, tc_compiler_known_tid, is_io_read_op,
+    TyKind, tk_name, tc_resolve, tc_tid_kind, tc_tid_decl_node, tc_static_call_owner, lookup_named_type, tc_head_decl_tid, tc_compiler_known_tid, is_io_read_op,
     tc_scalar_has_eq, tc_scalar_has_ord, tc_instance_has_trait, tc_written_impl_holds, tc_is_default_fill, tc_is_float_from_bits,
     DECL_NODE_AMBIGUOUS,
     is_import_module_name, is_builtin_namespace, is_builtin_fn, is_intrinsic_method, tc_call_declared_name,
@@ -37,7 +37,7 @@ import typecheck.{
     tc_names_a_type, tc_is_sealed_list_hof, tc_is_list_generic_adapter, tc_map_generic_adapter, tc_map_generic_adapter_module, tc_list_generic_module, tc_call_user_effect, tc_call_builtin_default, tc_namespace_call_reads_module, tc_handler_effect_root, tc_tid_handler_effect, builtin_op_roots,
     tc_lookup_node_tid, tc_unclaimed_call_tid, tc_tid_iter_elem,
     tc_call_decl_node, tc_call_decl_is_fn, tc_call_is_skip_intrinsic, tc_call_is_range_bounds, tc_tid_name, tc_mc_obj_is_value, tc_call_is_trace_log,
-    tc_impl_is_poly_user, tc_poly_user_impl_decl, tc_impl_trait_id, tc_call_trait, tc_impl_is_of_call_trait, tc_qualified_call_trait, tc_call_trait_head, tc_names_a_trait, tc_conversion_impl_for, tc_conversion_target_of, tc_conversion_trait_of, tc_is_into_method, CONVERSION_IS_IDENTITY, tc_impl_conv_source, tc_call_bound_trait_args, tc_call_bound_args_of, tc_impl_takes_trait_args,
+    tc_call_trait, tc_qualified_call_trait, tc_call_trait_head, tc_impl_answers_call, tc_impl_answers_for, tc_builtin_owner_name, tc_names_a_trait, tc_conversion_impl_for, tc_conversion_target_of, tc_conversion_trait_of, tc_is_into_method, CONVERSION_IS_IDENTITY, tc_impl_conv_source, tc_call_bound_trait_args, tc_call_bound_args_of,
     tc_builtin_method_writes_receiver, tc_decl_has_mut_self, tc_let_mut_root,
     tc_tid_same_type, make_option_type, make_fn_type, tc_qualified_carrier, range_repr_tid,
     TYPE_INT, TYPE_BOOL, TYPE_STR, TYPE_VOID, TYPE_NEVER,
@@ -135,11 +135,6 @@ let ROW_REFUSED = ":"
 // What an arity table answers for a key it does not own. No call is written with a
 // negative number of arguments, so it can never equal a count read off a call.
 let NO_ARITY = -1
-
-// What typecheck answers for a type that declares no node of its own. Every other answer
-// names a declaration, including the one that says two modules declare the name and the
-// pair is unresolved, so only this exact value means "there is no declaration".
-let NO_DECL_NODE = -1
 
 // What a call with no receiver passes where a receiver node would go. A free function is
 // written without one, so there is no node to lower and nothing precedes the arguments.
@@ -3392,7 +3387,7 @@ fn cc_impls_over(owner: Str, method: Str) -> List[Int] {
     if key.decl < 0 && key.builtin == "" { return out }
     for im in cg_reg_impl_decls() {
         if cc_method_index(im, method) < 0 { continue }
-        if !cc_impl_answers_for(im, key.decl, key.builtin) { continue }
+        if !tc_impl_answers_for(im, key.decl, key.builtin) { continue }
         out.push(im)
     }
     out
@@ -3419,7 +3414,7 @@ fn cc_owner_key(owner: Str) -> OwnerKey {
     }
     let decl = tc_tid_decl_node(owner_tid)
     if decl == DECL_NODE_AMBIGUOUS { return OwnerKey { decl: -1, builtin: "" } }
-    OwnerKey { decl: decl, builtin: cc_builtin_owner_name(owner_tid) }
+    OwnerKey { decl: decl, builtin: tc_builtin_owner_name(owner_tid) }
 }
 
 // The two methods Blink keys per impl, read from typecheck's own rule so the rung is
@@ -6351,9 +6346,6 @@ fn cc_is_free_name(obj: Int) -> Bool {
 // written over that base: a generic struct through its declaration, and a container
 // through its kind however it is parameterized.
 fn cc_impl_with_method(node: Int, recv_tid: Int, mname: Str) -> Int ! Diag.Report {
-    let want = tc_tid_decl_node(recv_tid)
-    let builtin = cc_builtin_owner_name(recv_tid)
-    if want < 0 && builtin == "" { return -1 }
     // The trait typecheck read the call through, when it read one: one type may hold two
     // traits of one spelling, each with a method of this name.
     let call_trait = tc_call_trait(node)
@@ -6362,9 +6354,7 @@ fn cc_impl_with_method(node: Int, recv_tid: Int, mname: Str) -> Int ! Diag.Repor
     let mut clashes = 0
     for im in cg_reg_impl_decls() {
         if cc_method_index(im, mname) < 0 { continue }
-        if !tc_impl_is_of_call_trait(im, call_trait) { continue }
-        if !cc_impl_answers_for(im, want, builtin) { continue }
-        if !tc_impl_takes_trait_args(im, recv_tid, want_args) { continue }
+        if !tc_impl_answers_call(im, recv_tid, call_trait, want_args) { continue }
         if found >= 0 { clashes = clashes + 1 }
         found = im
     }
@@ -6380,39 +6370,6 @@ fn cc_in_instance(tids: List[Int]) -> List[Int] {
     out
 }
 
-// A receiver identifies the impls written over it in one of two ways. A struct or enum is
-// its declaration node, which keeps two modules' namesakes apart. Every other type
-// declares nothing at all, so it is its kind, which is the name `impl ... for List[T]`
-// writes; a struct or enum with no declaration is a gap and not one of these.
-fn cc_builtin_owner_name(recv_tid: Int) -> Str {
-    let k = cc_kind(recv_tid)
-    if k == TyKind.Struct || k == TyKind.Enum { return "" }
-    tk_name(k)
-}
-
-// A kind name is a weaker key than a declaration node: every impl over `List` writes the
-// same one, and so does an impl over a type the program itself declares under that name.
-// So an impl that binds type parameters answers for the container alone, whatever the
-// program declares, and one that binds none answers for a declaration and, failing that,
-// for the container it names. An impl whose owner is a name two modules both declare is in
-// neither channel: it extends a declaration, the pair is just unresolved here. A
-// per-instance impl over a declared type answers for the declaration typecheck recorded.
-fn cc_impl_answers_for(im: Int, want: Int, builtin: Str) -> Bool {
-    if tc_impl_is_poly_user(im) { return tc_poly_user_impl_decl(im) == want }
-    if cc_impl_binds_parameters(im) { return want < 0 && tc_impl_recv_spelling(im) == builtin }
-    if want >= 0 { return cc_impl_owner(im) == want }
-    cc_impl_owner(im) == NO_DECL_NODE && tc_impl_recv_spelling(im) == builtin
-}
-
-// Past the per-instance impls over a declared type, which typecheck records with their
-// declaration, an impl that binds type parameters extends a builtin container: an impl
-// header resolves its receiver name to the builtin before any declaration of that name,
-// and every other generic impl over a declared type is refused (PolyImplUnsupported).
-fn cc_impl_binds_parameters(im: Int) -> Bool {
-    let binders = node_impl_binders(im)
-    binders != -1 && sublist_length(binders) > 0
-}
-
 // Two impls that both answer for one receiver leave no choice to make here: picking either
 // calls a body that may have been written for the other, so the ambiguity is reported the
 // way an ambiguous free-function name already is. Typecheck refuses the calls that reach
@@ -6424,21 +6381,13 @@ fn cc_impl_ambiguous(node: Int, recv_tid: Int, what: Str) -> Int ! Diag.Report {
     IMPL_REFUSED
 }
 
-// The declaration an impl block extends, as its own module reads the name.
-fn cc_impl_owner(im: Int) -> Int { tc_impl_owner_decl(im) }
-
 // The impl block of one trait over the receiver's declaration, whatever its methods.
 fn cc_impl_for(node: Int, recv_tid: Int, trait_name: Str) -> Int ! Diag.Report {
-    let want = tc_tid_decl_node(recv_tid)
-    let builtin = cc_builtin_owner_name(recv_tid)
-    if want < 0 && builtin == "" { return -1 }
     let mut found = -1
     let mut clashes = 0
     let want_args = cc_in_instance(tc_call_bound_args_of(node, trait_name))
     for im in cg_reg_impl_decls() {
-        if tc_impl_trait_id(im) != trait_name { continue }
-        if !cc_impl_answers_for(im, want, builtin) { continue }
-        if !tc_impl_takes_trait_args(im, recv_tid, want_args) { continue }
+        if !tc_impl_answers_call(im, recv_tid, Some(trait_name), want_args) { continue }
         if found >= 0 { clashes = clashes + 1 }
         found = im
     }

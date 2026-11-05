@@ -33,7 +33,7 @@ import typecheck.{
     make_ptr_type, make_result_type, make_set_type, make_struct_instance_type, make_template_type,
     make_tuple_type,
     substitute_typevar_tid, tc_binder_key, tc_tid_typevar_key, tc_call_bound_trait_args, tc_impl_takes_trait_args,
-    tc_call_declared_name, tc_call_decl_node, tc_static_head_binders, tc_call_trait, tc_impl_trait_id, tc_impl_conv_source, tc_impl_trait_args, tc_impl_recv_spelling,
+    tc_call_declared_name, tc_call_decl_node, tc_static_head_binders, tc_call_trait, tc_call_reaches_trait_method, tc_impl_answers_call, tc_impl_trait_id, tc_impl_conv_source, tc_impl_trait_args, tc_impl_recv_spelling,
     tc_impl_is_poly_conversion, tc_conversion_impl_for, tc_check_conversion, tc_conversion_trait_of, tc_conversion_target_of, tc_is_conversion_trait, tc_is_into_method, tc_is_default_fill, tc_call_user_effect, tc_field_tid_at_instance,
     tc_lookup_node_tid, tc_fn_value_decl_node, tc_mc_obj_is_value, tc_call_is_trace_log, tc_is_sealed_list_hof, tc_is_list_generic_adapter, tc_map_generic_adapter, tc_map_generic_adapter_module, tc_list_generic_module, tc_is_iterator_method, tc_resolve,
     tc_ret_mint_at, tc_tid_child, tc_tid_child_count,
@@ -97,10 +97,15 @@ let mut generic_fns: GenericFnLookup = GenericFnLookup { by_name: Map(), by_modu
 // and only a generic free function may be discovered through it: a generic type declaration
 // also carries type parameters and is not a callee of this kind.
 let mut generic_fn_nodes: Map[Int, Int] = Map()
-// A method that declares type parameters of its OWN, keyed by its declaration node and
-// holding the impl block it sits in. The impl supplies the symbol stem; the method's own
-// binders supply the instance arguments, so the two never come from the same place.
-let mut own_generic_method_impl: Map[Int, Int] = Map()
+// A method that declares type parameters of its OWN. impl_of is keyed by its declaration
+// node and holds the impl block it sits in. The impl supplies the symbol stem; the method's
+// own binders supply the instance arguments, so the two never come from the same place.
+// by_name holds the same methods by name, for a call that typecheck linked to no impl.
+type OwnGenericMethods {
+    impl_of: Map[Int, Int]
+    by_name: Map[Str, List[Int]]
+}
+let mut own_generic_methods: OwnGenericMethods = OwnGenericMethods { impl_of: Map(), by_name: Map() }
 // Generic methods of impls with binders, by how a call names them, with the impl block of each.
 // by_recv holds a user generic type's per-instance impl methods, keyed by the receiver's
 // declaration and the method name, one per impl: a type may hold two instances of one
@@ -325,7 +330,7 @@ fn mono_reset() {
     mono_saw = ProgramCalls { spawn: false, trace_log: false }
     generic_fns = GenericFnLookup { by_name: Map(), by_module: Map() }
     generic_fn_nodes = Map()
-    own_generic_method_impl = Map()
+    own_generic_methods = OwnGenericMethods { impl_of: Map(), by_name: Map() }
     poly_methods = PolyMethods { by_name: Map(), by_qualified: Map(), block_of: Map(), by_recv: Map() }
     decl_check = new_decl_check()
     instance_budget = new_instance_budget()
@@ -371,7 +376,12 @@ fn register_own_generic_methods(im: Int) {
     let mut j = 0
     while j < sl_len(methods_sl) {
         let m = sublist_get(methods_sl, j)
-        if has_type_params(m) { own_generic_method_impl.insert(m, im) }
+        if has_type_params(m) {
+            own_generic_methods.impl_of.insert(m, im)
+            let mut same = own_generic_methods.by_name.get(node_name(m)) ?? []
+            same.push(m)
+            own_generic_methods.by_name.insert(node_name(m), same)
+        }
         j = j + 1
     }
 }
@@ -526,7 +536,7 @@ fn walk_impl_root_methods(im: Int) ! Diag.Report {
     let mut j = 0
     while j < sl_len(methods_sl) {
         let m = sublist_get(methods_sl, j)
-        if !own_generic_method_impl.contains_key(m) { mono_walk(ROOT_CTX, m) }
+        if !own_generic_methods.impl_of.contains_key(m) { mono_walk(ROOT_CTX, m) }
         j = j + 1
     }
 }
@@ -829,7 +839,7 @@ fn register_own_generic_method(m: Int, arg_tids0: List[Int]) -> Int {
     let arg_tids = canon_tids(arg_tids0)
     let binders_sl = node_type_params(m)
     let args_tid = make_tuple_type(arg_tids)
-    let im = own_generic_method_impl.get(m) ?? -1
+    let im = own_generic_methods.impl_of.get(m) ?? -1
     if im < 0 { return -1 }
     let seen = seen_or_paid(m, args_tid, arg_tids)
     if seen != NEW_INSTANCE { return seen }
@@ -1274,29 +1284,61 @@ fn discover_iterator_call(ctx: Int, node: Int, obj: Int) ! Diag.Report {
     }
 }
 
-// `recv.m(..)` where `m` declares type parameters of its own. Typecheck already said which
-// declaration the receiver reached, and the receiver is the only thing that tells two impls
-// of one method name apart, so the decl link is the whole resolution.
+// `recv.m(..)` or `Trait.m(recv, ..)` where `m` declares type parameters of its own.
 fn discover_own_generic_method_call(ctx: Int, node: Int, obj: Int) ! Diag.Report {
-    let m = tc_call_decl_node(node)
-    if m < 0 { return }
-    if !own_generic_method_impl.contains_key(m) { return }
     // The qualified form names the trait, and its first argument fills `self` as any other does.
     let qualified = node_kind(obj) == NodeKind.Ident && tc_mc_obj_is_value(node) == 0
+    let m = own_generic_method_at(ctx, node, obj, qualified)
+    if m < 0 { return }
     let recv_tid = ctx_node_tid(ctx, obj)
     if recv_tid < 0 && !qualified { return }
     let binds = solve_call_binds(ctx, m, node, if qualified { [] } else { [recv_tid] }, node_args(node))
     note_call_target(ctx, node, register_own_generic_method(m, binder_args(ctx, m, node, binds)))
 }
 
+// The method with its own type parameters that a call reaches at this instance, or -1.
+// Typecheck links the call to the impl's method when the receiver's type settles one. A
+// bound receiver reaches the trait's method, and a receiver of a builtin generic type reaches
+// no declaration, so there the instance's receiver picks the impl, by the rule codegen
+// lowers the call through.
+fn own_generic_method_at(ctx: Int, node: Int, obj: Int, qualified: Bool) -> Int {
+    let linked = tc_call_decl_node(node)
+    if linked >= 0 && !tc_call_reaches_trait_method(node) {
+        return if own_generic_methods.impl_of.contains_key(linked) { linked } else { -1 }
+    }
+    // The declaration check notes a call on a shared impl through note_shared_impl_call, with
+    // the impl's binders, and a call on a bound is no edge, so only an instance picks here.
+    if decl_check.walking >= 0 { return -1 }
+    let ms = own_generic_methods.by_name.get(node_method(node)) ?? []
+    if ms.len() == 0 { return -1 }
+    let args_sl = node_args(node)
+    if qualified && sl_len(args_sl) == 0 { return -1 }
+    let recv_tid = ctx_node_tid(ctx, if qualified { sublist_get(args_sl, 0) } else { obj })
+    // A receiver may stay open past its base: in an impl over `List[T]` that does not use
+    // `T`, `self` is `List[T]` in every instance, and its base alone picks the impl.
+    if recv_tid < 0 { return -1 }
+    let call_trait = tc_call_trait(node)
+    let mut want: List[Int] = []
+    for t in tc_call_bound_trait_args(node) { want.push(tid_in_instance(ctx, t)) }
+    let mut found = -1
+    for m in ms {
+        if !tc_impl_answers_call(own_generic_methods.impl_of.get(m) ?? -1, recv_tid, call_trait, want) { continue }
+        // Two impls that both answer leave codegen nothing to call, and it reports that.
+        if found >= 0 { return -1 }
+        found = m
+    }
+    found
+}
+
 // `T.from(v)`, `T.try_from(v)` or `v.into()` that reaches a From or TryFrom impl with
 // binders. Typecheck linked a static form to the method it picked where the call's types
 // settled one; `.into()`, and a static form whose source is a generic body's `T`, are linked
-// to nothing, so the impl is the one typecheck's rule picks from this instance's tids. The
-// binders are solved from the call like any generic call's, the receiver of `.into()`
-// standing for the method's source parameter.
+// to nothing or, through a bound, to the trait's own method. So the impl is the one
+// typecheck's rule picks from this instance's tids. The binders are solved from the call
+// like any generic call's, the receiver of `.into()` standing for the method's source
+// parameter.
 fn discover_conversion_call(ctx: Int, node: Int, obj: Int) ! Diag.Report {
-    let mut m = tc_call_decl_node(node)
+    let mut m = if tc_call_reaches_trait_method(node) { -1 } else { tc_call_decl_node(node) }
     let mut lead: List[Int] = []
     if m < 0 {
         let args = node_args(node)
@@ -1771,7 +1813,7 @@ fn walk_generic_decls(program: Int) ! Diag.Report {
         let mut j = 0
         while j < sl_len(methods_sl) {
             let m = sublist_get(methods_sl, j)
-            if decl_check.method_impl.contains_key(m) || own_generic_method_impl.contains_key(m) { walk_decl_body(m) }
+            if decl_check.method_impl.contains_key(m) || own_generic_methods.impl_of.contains_key(m) { walk_decl_body(m) }
             j = j + 1
         }
         ii = ii + 1
@@ -2011,7 +2053,7 @@ fn shown_types(tids: List[Int]) -> List[Str] {
 fn impl_of_method(m: Int) -> Int {
     match decl_check.method_impl.get(m) {
         Some(im) => im
-        None => own_generic_method_impl.get(m) ?? -1
+        None => own_generic_methods.impl_of.get(m) ?? -1
     }
 }
 
