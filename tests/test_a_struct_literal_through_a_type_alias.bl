@@ -112,6 +112,59 @@ fn main() {
 "#, "_struct_lit_alias_bound", "E0306")
 }
 
+test "a derive written on an alias does not end in an ICE for a literal through it" {
+    let out = compile_and_capture(#"
+type Plain { x: Int }
+@derive(Debug)
+type A = Plain
+fn show[T: Debug](t: T) -> Str { t.debug() }
+fn main() {
+    let _s = show(A { x: 1 })
+}
+"#, "_struct_lit_alias_derive")
+    assert(!out.contains("\"severity\":\"ice\""), out)
+    assert(!out.contains("CompilerPanic"), out)
+}
+
+fn no_ice(out: Str) {
+    assert(!out.contains("\"severity\":\"ice\""), out)
+    assert(!out.contains("CompilerPanic"), out)
+}
+
+test "a derive written on an alias of a type with no fields does not end in an ICE" {
+    no_ice(compile_and_capture("@derive(Debug)\ntype I2 = Int\nfn main() \{ let i: I2 = 1\n io.println(\"\{i\}\") \}\n", "_derive_alias_int"))
+    no_ice(compile_and_capture("@derive(Debug)\ntype L2 = List[Int]\nfn main() \{ let i: L2 = [1]\n io.println(\"\{i.len()\}\") \}\n", "_derive_alias_list"))
+    no_ice(compile_and_capture("@derive(Debug)\ntype M2 = Map[Str, Int]\nfn main() \{ let i: M2 = Map()\n io.println(\"\{i.len()\}\") \}\n", "_derive_alias_map"))
+    no_ice(compile_and_capture("@derive(Debug)\ntype T2 = (Int, Str)\nfn main() \{ io.println(\"n\") \}\n", "_derive_alias_tuple"))
+    no_ice(compile_and_capture("@derive(Debug)\ntype F2 = fn(Int) -> Int\nfn main() \{ io.println(\"n\") \}\n", "_derive_alias_fn"))
+    no_ice(compile_and_capture("@derive(Deserialize)\ntype I3 = Int\nfn main() \{ io.println(\"n\") \}\n", "_derive_alias_deserialize"))
+}
+
+test "a field of an alias type is judged for a derive by the alias's target" {
+    let granted = compile_and_capture("@derive(Debug)\ntype Plain \{ x: Int \}\ntype A = Plain\n@derive(Debug)\ntype W \{ a: A \}\nfn main() \{ io.println(W \{ a: A \{ x: 2 \} \}.debug()) \}\n", "_derive_field_alias_granted")
+    assert(!granted.contains("\"severity\":\"error\""), granted)
+    no_ice(granted)
+    let scalar = compile_and_capture("type I2 = Int\n@derive(Debug)\ntype W \{ a: I2 \}\nfn main() \{ io.println(W \{ a: 2 \}.debug()) \}\n", "_derive_field_alias_scalar")
+    assert(!scalar.contains("\"severity\":\"error\""), scalar)
+    no_ice(scalar)
+    let refused = compile_and_capture("type Plain \{ x: Int \}\ntype A = Plain\n@derive(Debug)\ntype W \{ a: A \}\nfn main() \{ io.println(W \{ a: A \{ x: 2 \} \}.debug()) \}\n", "_derive_field_alias_refused")
+    assert(refused.contains("DeriveDebugFieldNoDebug"), refused)
+    no_ice(refused)
+    let through_list = compile_and_capture("type Plain \{ x: Int \}\ntype L = List[Plain]\n@derive(Debug)\ntype W \{ a: L \}\nfn main() \{ io.println(W \{ a: [] \}.debug()) \}\n", "_derive_field_alias_list")
+    assert(through_list.contains("DeriveDebugFieldNoDebug"), through_list)
+    let of_fn = compile_and_capture("type F2 = fn(Int) -> Int\n@derive(Debug)\ntype W \{ a: F2 \}\nfn main() \{ io.println(\"n\") \}\n", "_derive_field_alias_fn")
+    assert(of_fn.contains("DeriveDebugFieldNoDebug"), of_fn)
+    let generic = compile_and_capture("type NoD \{ y: Int \}\n@derive(Debug)\ntype B[T] \{ v: T \}\ntype G[T] = B[T]\n@derive(Debug)\ntype W \{ a: G[NoD] \}\nfn main() \{ io.println(W \{ a: B \{ v: NoD \{ y: 1 \} \} \}.debug()) \}\n", "_derive_field_alias_generic")
+    assert(generic.contains("DeriveDebugFieldNoDebug"), generic)
+    let serial = compile_and_capture("@derive(Serialize)\ntype Plain \{ x: Int \}\ntype A = Plain\ntype L = List[A]\n@derive(Serialize)\ntype W \{ a: A, b: L \}\n@derive(Serialize)\ntype E \{ V(a: A) \}\nfn main() \{ io.println(\"n\") \}\n", "_derive_field_alias_serialize")
+    assert(!serial.contains("\"severity\":\"error\""), serial)
+    no_ice(serial)
+    let serial_no = compile_and_capture("type Plain \{ x: Int \}\ntype L = List[Plain]\n@derive(Serialize)\ntype W \{ b: L \}\nfn main() \{ io.println(\"n\") \}\n", "_derive_field_alias_serialize_refused")
+    assert(serial_no.contains("NonDerivableTrait"), serial_no)
+    let on_alias = compile_and_capture("type Plain \{ x: Int \}\n@derive(Debug)\ntype A = Plain\n@derive(Debug)\ntype W \{ a: A \}\nfn main() \{ io.println(W \{ a: A \{ x: 2 \} \}.debug()) \}\n", "_derive_field_alias_on_alias")
+    no_ice(on_alias)
+}
+
 test "a literal headed by a type parameter named like an alias does not read the alias" {
     let out = compile_and_capture("type Bx \{ v: Int \}\ntype B = Bx\nfn f[B](x: B) -> Bx \{\n let _ = x\n B \{ v: 1 \}\n\}\nfn main() \{ io.println(\"\{f(1).v\}\") \}\n", "_tparam_alias_literal")
     assert(out.contains("\"severity\":\"error\""), out)
@@ -250,4 +303,19 @@ fn main() {
     let r = run_xmod(entry, "shapes", "kinds", helper, "struct_lit_through_alias_xmod")
     assert(r.exit_code == 0, "compile or run failed: {r.out}{r.err_out}")
     assert_eq(r.out, "1 2 3 d 4\n")
+}
+
+test "a Map key through an alias under Debug is judged as its target" {
+    let direct = compile_and_capture("@derive(Debug, Hash, Eq)\ntype C \{ R\n G \}\n@derive(Debug)\ntype W \{ a: Map[C, Int] \}\nfn main() \{ io.println(\"n\") \}\n", "_derive_key_enum_direct")
+    assert(direct.contains("DeriveDebugFieldNoDebug"), direct)
+    let through = compile_and_capture("@derive(Debug, Hash, Eq)\ntype C \{ R\n G \}\ntype K = C\n@derive(Debug)\ntype W \{ a: Map[K, Int] \}\nfn main() \{ io.println(\"n\") \}\n", "_derive_key_enum_alias")
+    assert(through.contains("DeriveDebugFieldNoDebug"), through)
+    let plain = compile_and_capture("@derive(Hash, Eq)\ntype P \{ x: Int \}\ntype K = P\n@derive(Debug)\ntype W \{ a: Map[K, Int] \}\nfn main() \{ io.println(\"n\") \}\n", "_derive_key_struct_alias")
+    assert(plain.contains("DeriveDebugFieldNoDebug"), plain)
+    let granted = compile_and_capture("@derive(Debug, Hash, Eq)\ntype P \{ x: Int \}\ntype K = P\n@derive(Debug)\ntype W \{ a: Map[K, Int] \}\nfn main() \{ io.println(\"n\") \}\n", "_derive_key_struct_alias_granted")
+    assert(!granted.contains("\"severity\":\"error\""), granted)
+    assert(!granted.contains("\"severity\":\"ice\""), granted)
+    let param = compile_and_capture("type I[X] = X\n@derive(Debug)\ntype W[T] \{ m: Map[I[T], Int] \}\nfn main() \{ io.println(\"n\") \}\n", "_derive_key_param_alias")
+    assert(param.contains("DeriveDebugFieldNoDebug"), param)
+    assert(!param.contains("\"severity\":\"ice\""), param)
 }
