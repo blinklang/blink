@@ -1,0 +1,105 @@
+import compile_test_helpers
+
+// A derive on a generic type holds at an instance where each type argument a field uses has
+// the trait (sections/03_types.md *Generic Type Bound Inference* and *Serialize Derive
+// Bounds*). The instance is judged by what the derive writes at the argument's place: a
+// derived to_json writes Int, Float, Bool, Str, a List of those, and a type that derives
+// Serialize, and a derived debug writes what a Debug field may hold. A call at an instance
+// the derive cannot write is refused at check, the way a bound at that instance is refused.
+
+fn refused(src: Str, tag: Str, want: Str) ! FS.Delete, FS.Write, Process.Spawn, FS.Read, Env.Read, IO.Print {
+    let out = compile_test_helpers.compile_and_capture(src, tag)
+    compile_test_helpers.expect_error(out, "E0300", tag)
+    compile_test_helpers.expect_contains(out, want, tag)
+}
+
+fn unbuilt(src: Str, tag: Str, want: Str) ! FS.Delete, FS.Write, Process.Spawn, FS.Read, Env.Read, IO.Print {
+    let out = compile_test_helpers.compile_and_capture(src, tag)
+    compile_test_helpers.expect_contains(out, "CodegenStageNotBuilt", tag)
+    compile_test_helpers.expect_contains(out, want, tag)
+}
+
+fn runs(src: Str, tag: Str, want: Str) ! FS.Delete, FS.Write, Process.Spawn, FS.Read, Env.Read, IO.Print {
+    let r = compile_test_helpers.compile_and_run(src, tag)
+    if r.exit_code != 0 || r.out != want {
+        io.println("FAIL: {tag}: exit {r.exit_code}, out '{r.out}', err '{r.err_out}'")
+    }
+    assert(r.exit_code == 0 && r.out == want)
+}
+
+fn listed() -> Str {
+    "type N \{ a: Int }\n@derive(Serialize)\ntype W[T] \{ x: List[T] }\n"
+}
+
+fn held() -> Str {
+    "@derive(Serialize)\ntype W[T] \{ x: T }\n"
+}
+
+test "to_json at an instance whose argument has no Serialize is refused" {
+    refused("{listed()}fn main() \{ io.println(W \{ x: [N \{ a: 1 }] }.to_json()) }\n", "dinst_ser_list", "`W[N]` does not implement `Serialize`")
+    let variant = "type N \{ a: Int }\n@derive(Serialize)\ntype W[T] \{ A(x: T) }\nfn main() \{ io.println(W.A(N \{ a: 1 }).to_json()) }\n"
+    refused(variant, "dinst_ser_variant", "`W[N]` does not implement `Serialize`")
+    let aliased = "type N \{ a: Int }\ntype A[X] = List[X]\n@derive(Serialize)\ntype W[T] \{ x: A[T] }\nfn main() \{ io.println(W \{ x: [N \{ a: 1 }] }.to_json()) }\n"
+    refused(aliased, "dinst_ser_alias", "`W[N]` does not implement `Serialize`")
+}
+
+// Option is Serialize where its element is, but a derived to_json does not write it yet; the
+// declaration check refuses an Option field for the same reason, and the instance check must
+// agree with it.
+test "to_json at an instance whose argument the derive does not write is refused" {
+    refused("{held()}fn main() \{ io.println(W \{ x: Some(1) }.to_json()) }\n", "dinst_ser_option", "`W[Option[Int]]` does not implement `Serialize`")
+    refused("{held()}fn main() \{ io.println(W \{ x: 'a' }.to_json()) }\n", "dinst_ser_char", "`W[Char]` does not implement `Serialize`")
+    let aliased = "type A[X] = X\n@derive(Serialize)\ntype W[T] \{ x: A[T] }\nfn main() \{ io.println(W \{ x: Some(1) }.to_json()) }\n"
+    refused(aliased, "dinst_ser_alias_option", "`W[Option[Int]]` does not implement `Serialize`")
+}
+
+test "debug at an instance whose argument the derive does not write is refused" {
+    let boxed = "@derive(Debug)\ntype W[T] \{ x: T }\n"
+    refused("{boxed}fn main() \{\n    let s: Set[Int] = Set()\n    io.println(W \{ x: s }.debug())\n}\n", "dinst_dbg_set", "`W[Set[Int]]` does not implement `Debug`")
+    refused("{boxed}fn main() \{ io.println(W \{ x: (1, 2) }.debug()) }\n", "dinst_dbg_tuple", "`W[(Int, Int)]` does not implement `Debug`")
+}
+
+// A fieldless enum is `Ord` by its declaration, with no derive (sections/03_types.md *Enum
+// Ord*), so a derived cmp orders a field of its type in declaration order. A Str-backed enum
+// is fieldless too, and orders by declaration, not by its strings.
+test "a compare at an instance whose argument is a fieldless enum runs in declaration order" {
+    let boxed = "@derive(Eq, Ord)\ntype W[T] \{ x: T }\n"
+    runs("{boxed}type C \{ R, G }\nfn main() \{\n    io.println(\"\{W \{ x: C.R } < W \{ x: C.G }}\")\n    io.println(\"\{W \{ x: C.G } < W \{ x: C.R }}\")\n}\n", "dinst_ord_enum", "true\nfalse\n")
+    let backed = "type S \{\n    Zed = \"z\"\n    Ann = \"a\"\n}\n"
+    runs("{boxed}{backed}fn main() \{\n    io.println(\"\{W \{ x: S.Zed } < W \{ x: S.Ann }}\")\n    io.println(\"\{W \{ x: S.Ann } < W \{ x: S.Zed }}\")\n}\n", "dinst_ord_str_enum", "true\nfalse\n")
+}
+
+// A tuple of `Ord` parts is `Ord` (*Tuples*), so check accepts the instance. Codegen builds no
+// compare for a tuple yet, so the derived cmp stops there and names the unbuilt part.
+test "a compare at an instance whose argument is a tuple stops at the unbuilt tuple compare" {
+    let boxed = "@derive(Eq, Ord)\ntype W[T] \{ x: T }\n"
+    unbuilt("{boxed}fn main() \{ io.println(\"\{W \{ x: (1, 2) } < W \{ x: (1, 3) }}\") }\n", "dinst_ord_tuple", "@derive(Ord) on the Tuple field `x`")
+    let variant = "@derive(Eq, Ord)\ntype V[T] \{ A(x: T), B }\nfn main() \{ io.println(\"\{V.A((1, 2)) < V.B}\") }\n"
+    unbuilt(variant, "dinst_ord_variant", "@derive(Ord) on the Tuple field `A.x`")
+}
+
+// An enum with a payload is `Ord` only through a derive or an impl (*Enum Ord*), and a derived
+// one only where each payload type is.
+test "a compare of two enum values with no Ord is refused" {
+    refused("type V \{ A(x: Int), B }\nfn main() \{ io.println(\"\{V.A(1) < V.B}\") }\n", "dinst_ord_enum_no_derive", "`V` does not implement `Ord`")
+    let held = "type N \{ a: Int }\n@derive(Eq, Ord)\ntype V[T] \{ A(x: T), B }\nfn main() \{\n    let a: V[N] = V.B\n    io.println(\"\{a < a}\")\n}\n"
+    refused(held, "dinst_ord_enum_arg", "`V[N]` does not implement `Ord`")
+}
+
+test "a compare at an instance whose argument the derived cmp orders still runs" {
+    let src = "@derive(Eq, Ord)\ntype W[T] \{ x: T }\n@derive(Eq, Ord)\ntype C \{ R, G }\ntype F \{ X, Y }\n@derive(Eq, Ord)\ntype V[T] \{ A(x: T), B }\nfn main() \{\n    io.println(\"\{W \{ x: 1 } < W \{ x: 2 }}\")\n    io.println(\"\{W \{ x: C.G } < W \{ x: C.R }}\")\n    io.println(\"\{F.X < F.Y}\")\n    io.println(\"\{V.A(2) < V.A(1)}\")\n}\n"
+    runs(src, "dinst_ord_ok", "true\nfalse\ntrue\nfalse\n")
+}
+
+// A field type that names a type parameter is judged at each instance, not at the
+// declaration, even where no instance could meet it: `B[(T, Int)]` derives no Debug at any
+// T, but only a call at an instance asks for it.
+test "a field that applies a derived generic at a tuple of a type parameter still declares" {
+    let src = "@derive(Debug, Serialize)\ntype B[T] \{ v: T }\n@derive(Debug, Serialize)\ntype W[T] \{ b: B[(T, Int)], n: Int }\nfn main() \{ io.println(\"\{W \{ b: B \{ v: (1, 2) }, n: 3 }.n}\") }\n"
+    compile_test_helpers.expect_compiles_clean(compile_test_helpers.check_via_cli(src, "dinst_tparam_tuple_decl"), "dinst_tparam_tuple_decl")
+}
+
+test "an instance whose argument the derive writes still runs" {
+    let src = "@derive(Serialize, Debug)\ntype W[T] \{ x: List[T] }\n@derive(Serialize, Debug)\ntype N \{ a: Int }\nfn main() \{\n    io.println(W \{ x: [[1]] }.to_json())\n    io.println(W \{ x: [N \{ a: 2 }] }.to_json())\n    io.println(W \{ x: [1.5] }.debug())\n}\n"
+    runs(src, "dinst_ok", "\{\"x\":[[1]]}\n\{\"x\":[\{\"a\":2}]}\nW \{ x: [1.5] }\n")
+}

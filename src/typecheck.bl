@@ -1595,7 +1595,7 @@ fn tc_ann_tparam_fact(ann: Int, tps: Int, tid: Int, tr: Str) -> Int {
         if node_name(sublist_get(tps, i)) == aname {
             let arg = tc_tid_struct_arg_tid(tid, i)
             if arg == -1 { return 0 }
-            return tc_derive_only_fact(arg, tr)
+            return tc_derive_arg_fact(arg, tr)
         }
         i = i + 1
     }
@@ -1606,6 +1606,20 @@ fn tc_ann_tparam_fact(ann: Int, tps: Int, tid: Int, tr: Str) -> Int {
         j = j + 1
     }
     0
+}
+
+// An argument at a type parameter's place is judged by what the derive writes there, which
+// for Debug and Serialize is narrower than the trait: a derived debug() cannot render a Set,
+// and a derived to_json writes no Option or Char. The declaration check refuses those field
+// types, and the instance check must agree with it. Those two judgments do not stop at a
+// type parameter, so an argument that still holds one, such as `(T, Int)` in a field
+// `b: B[(T, Int)]`, is left to each instance. tc_derive_only_fact needs no such guard: it
+// answers unknown at a type parameter itself, and a cyclic alias, which holds one, has no Hash.
+fn tc_derive_arg_fact(arg: Int, tr: Str) -> Int {
+    if tr != "Debug" && tr != "Serialize" { return tc_derive_only_fact(arg, tr) }
+    if tc_tid_has_bare_typevar(arg) != 0 { return 0 }
+    if tr == "Debug" { return if tc_debug_tid_ok(arg) == 0 { -1 } else { 0 } }
+    tc_serialize_written_fact(arg)
 }
 
 // Does the single Display impl `im` apply to the generic instance `tid`?
@@ -13705,7 +13719,7 @@ fn tc_check_derive_debug() ! TypeCheck.Resolve, Diag.Report {
 
 fn tc_check_one_derive_trait_field(f: Int, ftid: Int, tname: Str, tr: Str) ! Diag.Report {
     if ftid < 0 { return }
-    let path = if tr == "Eq" { tc_eq_need(ftid, []) } else if tr == "Ord" { tc_derive_ord_need(ftid) } else { tc_derive_only_need(ftid, tr) }
+    let path = if tr == "Eq" { tc_eq_need(ftid, []) } else if tr == "Ord" { tc_ord_need(ftid, []) } else { tc_derive_only_need(ftid, tr) }
     if path.len() == 0 { return }
     let mut notes: List[Str] = []
     let mut i = 0
@@ -13716,16 +13730,6 @@ fn tc_check_one_derive_trait_field(f: Int, ftid: Int, tname: Str, tr: Str) ! Dia
     diag_error_at_notes("NonDerivableTrait", NON_DERIVABLE_TRAIT,
         "@derive({tr}) on `{tname}`: field `{node_name(f)}` has type `{type_ann_text(node_value(f))}` which does not implement {tr}",
         f, tc_derive_field_help(path.get(path.len() - 1).unwrap(), tr), notes)
-}
-
-// What a derived cmp needs of a field. Codegen builds no compare for a tuple, nor for a
-// fieldless enum with no derive, though the spec gives both an order, so such a field is
-// refused here rather than at C time.
-fn tc_derive_ord_need(ftid: Int) -> List[Int] {
-    let need = tc_ord_need(ftid, [])
-    if need.len() > 0 { return need }
-    let unbuilt = tc_ord_not_lowered(ftid)
-    if unbuilt != -1 { [unbuilt] } else { [] }
 }
 
 // A struct or enum at the end of the chain gets the derive it lacks. One that derives the
@@ -28249,6 +28253,7 @@ fn tc_derived_method_trait(method: Str) -> Str {
         "cmp" => "Ord"
         "hash" => "Hash"
         "debug" => "Debug"
+        "to_json" => "Serialize"
         _ => ""
     }
 }
@@ -28334,14 +28339,17 @@ fn reject_eq_less_operands(op: Str, lt: Int, rt: Int, node: Int) -> Int ! TypeCh
     0
 }
 
-// `<`, `>`, `<=` and `>=` on two values of one struct need `Ord` on it, read at the instance
-// as `==` reads `Eq`. Returns 1 when it reported. An enum compares by its tag, and other
-// operand kinds are left to the caller's own match.
+// `<`, `>`, `<=` and `>=` on two values of one struct or enum need `Ord` on it, read at the
+// instance as `==` reads `Eq` (*Enum Ord*). Returns 1 when it reported. Other operand kinds
+// are left to the caller's own match.
 fn reject_ord_less_operands(lt: Int, rt: Int, node: Int) -> Int ! TypeCheck.Report, Diag.Report {
     let a = resolve_alias_tid(tc_resolve(lt))
     let b = resolve_alias_tid(tc_resolve(rt))
-    if type_kind(a) != TyKind.Struct || type_kind(b) != TyKind.Struct { return 0 }
-    if tc_struct_base_tid(a) != tc_struct_base_tid(b) || types_compatible(a, b) == 0 { return 0 }
+    let k = type_kind(a)
+    if k != type_kind(b) || (k != TyKind.Struct && k != TyKind.Enum) { return 0 }
+    if k == TyKind.Struct && tc_struct_base_tid(a) != tc_struct_base_tid(b) { return 0 }
+    if k == TyKind.Enum && tc_enum_base_tid(a) != tc_enum_base_tid(b) { return 0 }
+    if types_compatible(a, b) == 0 { return 0 }
     let path = tc_ord_need(a, [])
     if path.len() == 0 { return 0 }
     tc_report_trait_need(path, "Ord", node)
