@@ -333,9 +333,10 @@ fn pick(mut xs: List[Int]) -> Option[List[Int]] {
     assert_eq_str("refusals recorded", "{ice_count()}", "0")
 }
 
-// An assignment's target is read where it is written, so nothing found there may move,
-// and an if in the value after it has no place for its arms. It refuses by name.
-test "an if after a field assignment's target refuses because the target cannot move" {
+// `place = rhs` runs rhs, then reads the place's root, then stores (sections/02_syntax.md
+// §2.22 Assignment places). So the if's temp and arms stand in front of the store, and the
+// field path is read only by the store.
+test "an if after a field assignment's target fills its temp before the store" {
     let body = probe_fn("cg_stmt_value_after_field_target", #"type P { n: Int }
 fn main() {
     let c = 1
@@ -343,9 +344,38 @@ fn main() {
     p.n = if c > 0 { 1 } else { 2 }
 }
 "#, "main")
-    assert_eq_str("block shape", shape(body), "Block")
-    assert_eq_str("refusal", last_ice(), "ValuePositionExprMovesWork")
-    assert_eq_str("refusals recorded", "{ice_count()}", "1")
+    assert_eq_str("refusals recorded", "{ice_count()}", "0")
+    assert_eq_str("block shape", shape(body),
+        "Block(Let(Const), Let(StructNew(Const)), Let, If(Binary(VarRef, Const), Block(Assign(VarRef, Const)), Block(Assign(VarRef, Const))), Assign(FieldGet(VarRef), VarRef))")
+}
+
+// `place op= rhs` reads the place before rhs runs (§2.22 Assignment places). The arms of an
+// if in rhs run ahead of the statement, so the read goes into a temp ahead of them, and the
+// store reads that temp, not the place a second time.
+test "an if in a compound assignment to a field stands after a temp of the field's value" {
+    let body = probe_fn("cg_stmt_value_after_compound_field_target", #"type P { n: Int }
+fn main() {
+    let c = 1
+    let mut p = P { n: 0 }
+    p.n += if c > 0 { 1 } else { 2 }
+}
+"#, "main")
+    assert_eq_str("refusals recorded", "{ice_count()}", "0")
+    assert_eq_str("block shape", shape(body),
+        "Block(Let(Const), Let(StructNew(Const)), Let(FieldGet(VarRef)), Let, If(Binary(VarRef, Const), Block(Assign(VarRef, Const)), Block(Assign(VarRef, Const))), Let, If(CallRuntime(VarRef, VarRef, Unary(VarRef)), Block(Panic(CallRuntime(Const, Cast(VarRef), Cast(VarRef)), Const, Const))), Assign(FieldGet(VarRef), VarRef))")
+}
+
+test "an if in a compound assignment to a local stands after a temp of the local's value" {
+    let body = probe_fn("cg_stmt_value_after_compound_local_target", #"fn main() {
+    let c = 1
+    let mut n = 0
+    n += if c > 0 { 1 } else { 2 }
+    let _keep = [n]
+}
+"#, "main")
+    assert_eq_str("refusals recorded", "{ice_count()}", "0")
+    assert_eq_str("block shape", shape(body),
+        "Block(Let(Const), Let(Const), Let(VarRef), Let, If(Binary(VarRef, Const), Block(Assign(VarRef, Const)), Block(Assign(VarRef, Const))), Let, If(CallRuntime(VarRef, VarRef, Unary(VarRef)), Block(Panic(CallRuntime(Const, Cast(VarRef), Cast(VarRef)), Const, Const))), Assign(VarRef, VarRef), Let(ContainerNew(Cast(Cast(VarRef)))))")
 }
 
 // The literal writes `b` and leaves `a` to its default. A default is a const
