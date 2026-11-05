@@ -378,6 +378,66 @@ test "an if in a compound assignment to a local stands after a temp of the local
         "Block(Let(Const), Let(Const), Let(VarRef), Let, If(Binary(VarRef, Const), Block(Assign(VarRef, Const)), Block(Assign(VarRef, Const))), Let, If(CallRuntime(VarRef, VarRef, Unary(VarRef)), Block(Panic(CallRuntime(Const, Cast(VarRef), Cast(VarRef)), Const, Const))), Assign(VarRef, VarRef), Let(ContainerNew(Cast(Cast(VarRef)))))")
 }
 
+// A call in rhs can write the place, so the place is read into a temp before the call runs
+// (§2.22 Assignment places), and the store adds to that temp.
+test "a compound assignment to a global whose rhs calls a fn reads the global before the call" {
+    let body = probe_fn("cg_stmt_compound_global_call", #"let mut g = 10
+fn bump() -> Int {
+    g = g + 1
+    0
+}
+fn main() {
+    g += bump()
+}
+"#, "main")
+    assert_eq_str("refusals recorded", "{ice_count()}", "0")
+    assert_eq_str("block shape", shape(body),
+        "Block(Let(GlobalRef), Let(CallDirect), Let, If(CallRuntime(VarRef, VarRef, Unary(VarRef)), Block(Panic(CallRuntime(Const, Cast(VarRef), Cast(VarRef)), Const, Const))), Assign(GlobalRef, VarRef))")
+}
+
+// The right operand of `&&` lowers into statements ahead of the store, so the place is read
+// into a temp ahead of them.
+test "a compound assignment whose rhs holds a short-circuit reads the place first" {
+    let body = probe_fn("cg_stmt_compound_and_rhs", #"fn one_if(b: Bool) -> Int { if b { 1 } else { 0 } }
+fn main() {
+    let c = true
+    let mut n = 1
+    n += one_if(c && if n > 0 { true } else { false })
+    let _keep = [n]
+}
+"#, "main")
+    assert_eq_str("refusals recorded", "{ice_count()}", "0")
+    assert_eq_str("block shape", shape(body),
+        "Block(Let(Const), Let(Const), Let(VarRef), Let(VarRef), If(VarRef, Block(Let, If(Binary(VarRef, Const), Block(Assign(VarRef, Const)), Block(Assign(VarRef, Const))), Assign(VarRef, VarRef))), Let(CallDirect(VarRef)), Let, If(CallRuntime(VarRef, VarRef, Unary(VarRef)), Block(Panic(CallRuntime(Const, Cast(VarRef), Cast(VarRef)), Const, Const))), Assign(VarRef, VarRef), Let(ContainerNew(Cast(Cast(VarRef)))))")
+}
+
+test "a compound assignment whose rhs holds a coalesce reads the place first" {
+    let body = probe_fn("cg_stmt_compound_coalesce_rhs", #"fn main() {
+    let none: Option[Int] = None
+    let mut n = 1
+    n += none ?? n
+    let _keep = [n]
+}
+"#, "main")
+    assert_eq_str("refusals recorded", "{ice_count()}", "0")
+    assert_eq_str("block shape", shape(body),
+        "Block(Let(CarrierWrap(Const)), Let(Const), Let(VarRef), Let(VarRef), Let, If(Binary(CarrierTag(VarRef), Const), Block(Assign(VarRef, CarrierUnwrap(VarRef))), Block(Assign(VarRef, VarRef))), Let, If(CallRuntime(VarRef, VarRef, Unary(VarRef)), Block(Panic(CallRuntime(Const, Cast(VarRef), Cast(VarRef)), Const, Const))), Assign(VarRef, VarRef), Let(ContainerNew(Cast(Cast(VarRef)))))")
+}
+
+// An rhs that runs no fn cannot write the place, so the store reads the place itself.
+test "a compound assignment whose rhs runs no fn reads the place in the store" {
+    let body = probe_fn("cg_stmt_compound_plain_rhs", #"fn main() {
+    let a = 2
+    let mut n = 1
+    n += a * 3
+    let _keep = [n]
+}
+"#, "main")
+    assert_eq_str("refusals recorded", "{ice_count()}", "0")
+    assert_eq_str("block shape", shape(body),
+        "Block(Let(Const), Let(Const), Let(Const), Let, If(CallRuntime(VarRef, VarRef, Unary(VarRef)), Block(Panic(CallRuntime(Const, Cast(VarRef), Cast(VarRef)), Const, Const))), Let, If(CallRuntime(VarRef, VarRef, Unary(VarRef)), Block(Panic(CallRuntime(Const, Cast(VarRef), Cast(VarRef)), Const, Const))), Assign(VarRef, VarRef), Let(ContainerNew(Cast(Cast(VarRef)))))")
+}
+
 // The literal writes `b` and leaves `a` to its default. A default is a const
 // (sections/02_syntax.md §2.21), so it reads and writes nothing an arm could see, and the
 // arm is materialised as in any other value position.
@@ -653,6 +713,21 @@ test "a compound assignment of a Never call runs the call as a statement before 
     assert_eq_str("refusals recorded", "{ice_count()}", "0")
     assert_eq_str("block shape", shape(body),
         "Block(Let(Const), Block(ExprStmt(EffectPerform(FieldGet(EvidenceVector), Const)), Unreachable), Let(ContainerNew(Cast(Cast(VarRef)))))")
+}
+
+// The read of `x` runs before rhs (§2.22 Assignment places), so it goes into a temp ahead of
+// the call. The call leaves the block, so the store never runs.
+test "a compound assignment whose rhs holds a Never call reads the place before the call" {
+    let body = probe_body("cg_stmt_never_in_compound_rhs", #"fn same(n: Int) -> Int { n }
+fn main() {
+    let mut x = 0
+    x += same(env.exit(7))
+    let _keep = [x]
+}
+"#, "main")
+    assert_eq_str("refusals recorded", "{ice_count()}", "0")
+    assert_eq_str("block shape", shape(body),
+        "Block(Let(Const), Block(Let(VarRef), ExprStmt(EffectPerform(FieldGet(EvidenceVector), Const)), Unreachable), Let(ContainerNew(Cast(Cast(VarRef)))))")
 }
 
 // An arm that ends in an assignment of a Never call leaves the block through its right

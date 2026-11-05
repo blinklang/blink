@@ -1601,7 +1601,7 @@ fn lower_compound_assign(node: Int) -> Int ! Diag.Report {
     let tid = stmt_tid(target)
     if tid < 0 { return -1 }
     let crosses = place_crosses_box(target)
-    // The walk read the place into a temp when an arm in rhs runs ahead of this statement.
+    // The walk read the place into a temp ahead of an rhs that runs a fn.
     let read = if cg_expr_is_registered(node) { lower_value(node) } else { lower_target(target) }
     // The same seam as the operator, so `x += 1` is checked wherever `x + 1` is.
     let site = ArithSite { node: node, op: node_op(node), tid: tid, lhs_node: target, rhs_node: node_value(node) }
@@ -1805,7 +1805,7 @@ fn mv_stmt(s: Int) -> Bool ! Diag.Report {
 // reached afterward can hoist each one into a temp of its own standing in front of it,
 // in that same order, rather than being refused outright. `hoistable` is false for a value
 // with no type of its own (a spread is judged by its source's type, the type of the copy
-// it moves), and for a compound assignment's place that lower_target cannot reach.
+// it moves).
 // Whether a node has a type of its own is answered by tc_lookup_node_tid, never by
 // stmt_tid: a bare name resolved structurally -- a type, a trait, a module, an effect
 // handle -- carries no type of its own by design, and stmt_tid's tid_of_node reports that
@@ -1840,17 +1840,51 @@ fn mv_pair(a: Int, b: Int) -> Bool ! Diag.Report {
 }
 
 // §2.22 Assignment places: `place op= rhs` reads the place's current value, then runs rhs.
-// So the read is work that an arm in rhs must run after. It is one item, keyed by the
-// statement and not by the place: the place node is also the lvalue of the store, and a
-// temp named to it would turn the store into a write to the temp.
+// An rhs that runs a fn can write the place, and the statements a short-circuit or an arm
+// in rhs pushes stand ahead of the store, so the read goes into a temp ahead of all of
+// them. An rhs that runs no fn cannot write the place, so the store reads it in place.
 fn mv_compound_assign(s: Int) -> Bool ! Diag.Report {
     let target = node_target(s)
-    if is_assignable_place(target) {
-        if !mv_record(s, target) { return false }
-    } else {
-        mv_work.push(MvWork { node: s, hoistable: false })
+    let rhs = node_value(s)
+    if is_assignable_place(target) && !leaves_by_type(rhs) && !mv_runs_no_fn(rhs) {
+        let tid = stmt_tid(target)
+        if tid < 0 { return false }
+        cg_expr_register_value(s, mv_hoist_into_temp(target, tid, lower_target(target)), tid)
     }
-    mv_expr(node_value(s))
+    mv_expr(rhs)
+}
+
+// Whether e reads cells and runs no fn: a literal, a name, a field of one, and an operator
+// on scalars, which no impl can take over. `?` returns from the fn, so it is not one.
+fn mv_runs_no_fn(e: Int) -> Bool ! Diag.Report {
+    match node_kind(e) {
+        NodeKind.IntLit => true
+        NodeKind.FloatLit => true
+        NodeKind.CharLit => true
+        NodeKind.BoolLit => true
+        NodeKind.Ident => true
+        NodeKind.FieldAccess => mv_runs_no_fn(node_obj(e))
+        NodeKind.InterpString => mv_interp_is_text(e)
+        NodeKind.UnaryOp => node_op(e) != "?" && mv_scalar_operand(node_left(e))
+        NodeKind.BinOp => mv_scalar_operand(node_left(e)) && mv_runs_no_fn(node_right(e))
+        _ => false
+    }
+}
+
+fn mv_scalar_operand(e: Int) -> Bool ! Diag.Report {
+    let tid = tc_lookup_node_tid(e)
+    if tid < 0 { return false }
+    (tid_is_ordinal(tid) || tc_tid_kind(tid) == TyKind.Float) && mv_runs_no_fn(e)
+}
+
+fn mv_interp_is_text(e: Int) -> Bool {
+    let parts = node_elements(e)
+    let mut i = 0
+    while i < sublist_length(parts) {
+        if !interp_part_is_literal(sublist_get(parts, i)) { return false }
+        i = i + 1
+    }
+    true
 }
 
 fn mv_list(sl: Int) -> Bool ! Diag.Report {
@@ -1926,7 +1960,7 @@ fn mv_call(e: Int, head: Int) -> Bool ! Diag.Report {
 }
 
 // A call of type Never that every passed work item can move above. One that sits after
-// unhoistable work keeps its place and is lowered where it stands.
+// work with no temp type keeps its place and is lowered where it stands.
 fn mv_call_leaves(e: Int) -> Bool ! Diag.Report {
     let tid = tc_lookup_node_tid(e)
     if tid < 0 || tc_tid_kind(tid) != TyKind.Never { return false }
@@ -1938,7 +1972,6 @@ fn mv_call_leaves(e: Int) -> Bool ! Diag.Report {
 // the call runs there as a statement with the marker after it, and the node reads a word
 // zero nothing reaches. lower_stmt_hoisted sees the marker and ends the statement there.
 fn mv_leave_through_call(e: Int, head: Int) -> Bool ! Diag.Report {
-    mv_drop_place_reads()
     if !mv_hoist_pending() { return false }
     if !mv_call_head(head) { return false }
     if !mv_list(node_args(e)) { return false }
@@ -1949,16 +1982,6 @@ fn mv_leave_through_call(e: Int, head: Int) -> Bool ! Diag.Report {
     cg_expr_register_value(e, "0", TYPE_NEVER)
     mv_work = []
     true
-}
-
-// A compound assignment's place read only feeds its store, which a leaving call never
-// reaches, and a read of a place has no effect (§2.22 Assignment places).
-fn mv_drop_place_reads() {
-    let mut kept: List[MvWork] = []
-    for w in mv_work {
-        if node_kind(w.node) != NodeKind.CompoundAssign { kept.push(w) }
-    }
-    mv_work = kept
 }
 
 // skip(reason) has no C call to run as a statement: it is the record-and-return that
@@ -2085,28 +2108,20 @@ fn mv_hoist_pending() -> Bool ! Diag.Report {
 // literal's own spread lowers unchanged and spreads the copy. A source that is itself a
 // value-position construct is named again, to the copy, which is the only read left of it.
 fn mv_hoist_one(w: MvWork) ! Diag.Report {
-    if node_kind(w.node) == NodeKind.CompoundAssign { return mv_hoist_place_read(w.node) }
     let spread = node_kind(w.node) == NodeKind.SpreadExpr
     let read = if spread { node_value(w.node) } else { w.node }
     let tid = stmt_tid(read)
-    let rec = layout_at(tid, Position.Local, w.node)
-    let _ = ensure_typedef_for(tid)
-    let name = c_mint_local("hoist")
     let value = if spread { value_or_poison(lower_spread_copy(w.node), w.node) } else { lower_value(w.node) }
-    cg_expr_push_pending(w.node, ir_let(tid, w.node, rec.c_spelling, name, rec.slot_form, value))
-    cg_expr_register_value(read, name, tid)
+    cg_expr_register_value(read, mv_hoist_into_temp(w.node, tid, value), tid)
 }
 
-// The current value of a compound assignment's place, read into a temp named to the
-// statement. lower_compound_assign reads that temp in place of a second read of the place.
-fn mv_hoist_place_read(s: Int) ! Diag.Report {
-    let target = node_target(s)
-    let tid = stmt_tid(target)
-    let rec = layout_at(tid, Position.Local, target)
+// A temp of type tid that holds value, pushed ahead of the statement. Answers its name.
+fn mv_hoist_into_temp(node: Int, tid: Int, value: Int) -> Str ! Diag.Report {
+    let rec = layout_at(tid, Position.Local, node)
     let _ = ensure_typedef_for(tid)
     let name = c_mint_local("hoist")
-    cg_expr_push_pending(s, ir_let(tid, target, rec.c_spelling, name, rec.slot_form, lower_target(target)))
-    cg_expr_register_value(s, name, tid)
+    cg_expr_push_pending(node, ir_let(tid, node, rec.c_spelling, name, rec.slot_form, value))
+    name
 }
 
 // The temp for one value-position `if` or `match`: declared unset, filled by the arms,
