@@ -203,10 +203,20 @@ row=$!
 for _ in $(seq 1 100); do [ -s "$WORK/pids" ] && break; sleep 0.1; done
 kill -TERM "$row"
 wait "$row"; rc=$?
-if [ "$rc" = 143 ] && [ -s "$WORK/pids" ] && ! kill -0 "$(cat "$WORK/pids")" 2> /dev/null && [ -z "$(ls -A "$WORK/tmp")" ]; then
+# The KILLed worker's parent dies with it, so the user's systemd reaps it, and a
+# busy systemd reaps late. kill -0 still finds a zombie, but a zombie does not
+# run. A worker that the KILL reached may still be in its exit, so this waits
+# for that a short time.
+alive() {
+    local st
+    st=$(ps -o stat= -p "$1" 2> /dev/null) && [ "${st#Z}" = "$st" ]
+}
+worker=$(cat "$WORK/pids")
+for _ in $(seq 1 20); do alive "$worker" || break; sleep 0.1; done
+if [ "$rc" = 143 ] && [ -n "$worker" ] && ! alive "$worker" && [ -z "$(ls -A "$WORK/tmp")" ]; then
     echo "PASS: a signal stops the sweep's workers and removes its temp dir"
 else
-    echo "FAIL: a signal stops the sweep (exit $rc, pids $(cat "$WORK/pids"), temp: $(ls -A "$WORK/tmp"))"
+    echo "FAIL: a signal stops the sweep (exit $rc, pids $worker, state $(ps -o stat= -p "$worker" 2> /dev/null), temp: $(ls -A "$WORK/tmp"))"
     fail=1
 fi
 
