@@ -1,0 +1,91 @@
+// A renamed import is another spelling of the type it names (sections/07_trust_modules_metadata.md),
+// so a static call through that spelling reads the type's own namespace, in the module that
+// declares it.
+
+import std.process.{ChildEnd}
+import compile_test_helpers.{scratch_root}
+
+fn run_modules(tag: Str, files: List[(Str, Str)]) -> Str ! Process.Spawn, FS.Write, Env.Read {
+    let root = "{scratch_root()}/{tag}"
+    let _mk = process.run("mkdir", ["-p", "{root}/src"]).unwrap()
+    fs.write("{root}/blink.toml", "[package]\nname = \"{tag}\"\nversion = \"0.1.0\"\n").unwrap()
+    for f in files { fs.write("{root}/src/{f.0}", f.1).unwrap() }
+    let r = process.run("build/blink", ["run", "-o", "{root}/main", "{root}/src/main.bl"]).unwrap()
+    if r.end == ChildEnd.Exited(0) { r.out } else { "failed: {r.out}{r.err_out}" }
+}
+
+test "a static call through a renamed import finds the impl in the declaring module" {
+    let m = #"
+pub trait Mk { fn mk() -> Self }
+pub type T { x: Int }
+impl Mk for T { fn mk() -> T { T { x: 3 } } }
+"#
+    let main_src = #"
+import m.{T as Q, Mk}
+fn main() { io.println("{Q.mk().x}") }
+"#
+    assert_eq(run_modules("static_through_renamed_import", [("m.bl", m), ("main.bl", main_src)]), "3\n")
+}
+
+test "an impl on a local alias of a renamed import answers a call through the renamed name" {
+    let m = #"
+pub type T { x: Int }
+"#
+    let main_src = #"
+import m.{T as Q}
+trait Mk { fn mk() -> Self }
+type A = Q
+impl Mk for A { fn mk() -> A { Q { x: 4 } } }
+fn main() { io.println("{Q.mk().x} {A.mk().x}") }
+"#
+    assert_eq(run_modules("static_through_renamed_import_alias_impl", [("m.bl", m), ("main.bl", main_src)]), "4 4\n")
+}
+
+test "a static call in one of two modules that each declare a type of one name reads its own type" {
+    let t = #"
+pub trait Mk { fn mk() -> Self }
+"#
+    let k = #"
+import t.{Mk}
+pub type Pt { x: Int }
+impl Mk for Pt { fn mk() -> Pt { Pt { x: 1 } } }
+pub fn km() -> Int { Pt.mk().x }
+"#
+    let j = #"
+import t.{Mk}
+pub type Pt { x: Int }
+impl Mk for Pt { fn mk() -> Pt { Pt { x: 2 } } }
+pub fn jm() -> Int { Pt.mk().x }
+"#
+    let main_src = #"
+import k.{km}
+import j.{jm}
+fn main() { io.println("{km()} {jm()}") }
+"#
+    assert_eq(run_modules("static_in_namesake_modules", [("t.bl", t), ("k.bl", k), ("j.bl", j), ("main.bl", main_src)]), "1 2\n")
+}
+
+test "a static call through a renamed import of a standard library type reads that type" {
+    let main_src = #"
+import std.time.{Duration as D}
+fn main() { io.println("{D.seconds(2).to_ms()}") }
+"#
+    assert_eq(run_modules("static_through_renamed_std_import", [("main.bl", main_src)]), "2000\n")
+}
+
+test "an impl written on a renamed import reaches a value of the type" {
+    let kinds = #"
+pub type T { x: Int }
+"#
+    let main_src = #"
+import kinds.{T as Q}
+trait Sh { fn n(self) -> Int }
+impl Sh for Q { fn n(self) -> Int { self.x + 1 } }
+fn total[X: Sh](v: X) -> Int { v.n() }
+fn main() {
+    let q = Q { x: 5 }
+    io.println("{q.n()} {total(q)}")
+}
+"#
+    assert_eq(run_modules("impl_on_renamed_import", [("kinds.bl", kinds), ("main.bl", main_src)]), "6 6\n")
+}
