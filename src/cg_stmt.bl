@@ -1107,12 +1107,41 @@ fn lower_assert_sides(left_node: Int, right_node: Int) -> List[Int] ! Diag.Repor
 
 // The fail call of an assert_eq or assert_ne. site is the call's file and line: a failure
 // outside a test is a panic, and the hook gets its site (§2.20).
-fn assert_fail_eq_call(node: Int, site: List[Int], msg: Int, exp: Int, act: Int) -> Int ! Diag.Report {
-    call_runtime_void(node, c_assert_fail_eq_name(), [msg, exp, act, site.get(0).unwrap(), site.get(1).unwrap()])
+fn assert_fail_eq_call(node: Int, site: List[Int], msg: Int, exp: Int, act: Int, user_msg: Int) -> Int ! Diag.Report {
+    call_runtime_void(node, c_assert_fail_eq_name(), [msg, exp, act, site.get(0).unwrap(), site.get(1).unwrap(), user_msg])
 }
 
-fn assert_fail_call(node: Int, site: List[Int], msg: Int) -> Int ! Diag.Report {
-    call_runtime_void(node, c_assert_fail_name(), [msg, site.get(0).unwrap(), site.get(1).unwrap()])
+fn assert_fail_call(node: Int, site: List[Int], msg: Int, user_msg: Int) -> Int ! Diag.Report {
+    call_runtime_void(node, c_assert_fail_name(), [msg, site.get(0).unwrap(), site.get(1).unwrap(), user_msg])
+}
+
+// The call's own trailing message, or "" when it has none. What it hoists goes into `fail`,
+// the failing branch, since the spec evaluates the message only on failure (§2.20).
+fn lower_assert_user_msg(node: Int, fail: List[Int]) -> Int ! Diag.Report {
+    let args = node_args(node)
+    if sublist_length(args) < 3 { return str_const(node, "") }
+    let mark = cg_expr_pending_count()
+    let user_msg = lower_value(sublist_get(args, 2))
+    cg_expr_drain_pending(mark, fail)
+    user_msg
+}
+
+// The failing branch of a scalar assert_eq: its message, then the fail call.
+fn assert_fail_eq_block(node: Int, site: List[Int], msg: Int, exp: Int, act: Int) -> Int ! Diag.Report {
+    let mut fail: List[Int] = []
+    let user_msg = lower_assert_user_msg(node, fail)
+    if user_msg < 0 { return -1 }
+    fail.push(assert_fail_eq_call(node, site, msg, exp, act, user_msg))
+    ir_block(node, fail)
+}
+
+// The failing branch of a scalar assert_ne: its message, then the fail call.
+fn assert_fail_block(node: Int, site: List[Int], msg: Int) -> Int ! Diag.Report {
+    let mut fail: List[Int] = []
+    let user_msg = lower_assert_user_msg(node, fail)
+    if user_msg < 0 { return -1 }
+    fail.push(assert_fail_call(node, site, msg, user_msg))
+    ir_block(node, fail)
 }
 
 // assert_eq and assert_ne share the same comparison and the same two rendered sides; only
@@ -1144,6 +1173,8 @@ fn lower_assert_aggregate(node: Int, tid: Int, left_node: Int, right_node: Int, 
     // expected/actual value), so mark it the same way bind_temp marks a repeated read.
     ir_mark_materialize(left_str)
     ir_mark_materialize(right_str)
+    let user_msg = lower_assert_user_msg(node, fail)
+    if user_msg < 0 { return -1 }
     let mut failing = equal
     if is_eq {
         let bools = layout_at(TYPE_BOOL, Position.Local, node).c_spelling
@@ -1151,10 +1182,10 @@ fn lower_assert_aggregate(node: Int, tid: Int, left_node: Int, right_node: Int, 
         let msg = call_str_format(node, "ASSERT_EQ FAILED: %s != %s", [left_str, right_str])
         let exp = call_str_format(node, "%s", [right_str])
         let act = call_str_format(node, "%s", [left_str])
-        fail.push(assert_fail_eq_call(node, site, msg, exp, act))
+        fail.push(assert_fail_eq_call(node, site, msg, exp, act, user_msg))
     } else {
         let msg = call_str_format(node, "ASSERT_NE FAILED: %s == %s", [left_str, right_str])
-        fail.push(assert_fail_call(node, site, msg))
+        fail.push(assert_fail_call(node, site, msg, user_msg))
     }
     stmts.push(ir_if(node, failing, ir_block(node, fail), -1))
     ir_block(node, stmts)
@@ -1185,8 +1216,9 @@ fn lower_assert_eq_call(node: Int) -> Int ! Diag.Report {
         let msg = call_str_format(node, "ASSERT_EQ FAILED: \"%s\" != \"%s\"", [left_bound.ref, right_bound.ref])
         let exp = call_str_format(node, "%s", [right_bound.ref])
         let act = call_str_format(node, "%s", [left_bound.ref])
-        let fail_stmt = assert_fail_eq_call(node, site, msg, exp, act)
-        pre.push(ir_if(node, neq, ir_block(node, [fail_stmt]), -1))
+        let fail = assert_fail_eq_block(node, site, msg, exp, act)
+        if fail < 0 { return -1 }
+        pre.push(ir_if(node, neq, fail, -1))
         return ir_block(node, pre)
     }
     if eq_is_float(tid) {
@@ -1196,8 +1228,9 @@ fn lower_assert_eq_call(node: Int) -> Int ! Diag.Report {
         let msg = call_str_format(node, "ASSERT_EQ FAILED: %f != %f", [left_bound.ref, right_bound.ref])
         let exp = call_str_format(node, "%f", [right_bound.ref])
         let act = call_str_format(node, "%f", [left_bound.ref])
-        let fail_stmt = assert_fail_eq_call(node, site, msg, exp, act)
-        pre.push(ir_if(node, neq, ir_block(node, [fail_stmt]), -1))
+        let fail = assert_fail_eq_block(node, site, msg, exp, act)
+        if fail < 0 { return -1 }
+        pre.push(ir_if(node, neq, fail, -1))
         return ir_block(node, pre)
     }
     let left_arg = eq_default_arg(tid, node, left_bound.ref)
@@ -1206,8 +1239,9 @@ fn lower_assert_eq_call(node: Int) -> Int ! Diag.Report {
     let msg = call_str_format(node, "ASSERT_EQ FAILED: %lld != %lld", [left_arg, right_arg])
     let exp = call_str_format(node, "%lld", [right_arg])
     let act = call_str_format(node, "%lld", [left_arg])
-    let fail_stmt = assert_fail_eq_call(node, site, msg, exp, act)
-    pre.push(ir_if(node, neq, ir_block(node, [fail_stmt]), -1))
+    let fail = assert_fail_eq_block(node, site, msg, exp, act)
+    if fail < 0 { return -1 }
+    pre.push(ir_if(node, neq, fail, -1))
     ir_block(node, pre)
 }
 
@@ -1233,24 +1267,27 @@ fn lower_assert_ne_call(node: Int) -> Int ! Diag.Report {
         let eq = ir_call_runtime(TYPE_BOOL, node, bool_rec.c_spelling,
             c_runtime_helper("str_eq"), bool_rec.slot_form, [left_bound.ref, right_bound.ref])
         let msg = call_str_format(node, "ASSERT_NE FAILED: \"%s\" == \"%s\"", [left_bound.ref, right_bound.ref])
-        let fail_stmt = assert_fail_call(node, site, msg)
-        pre.push(ir_if(node, eq, ir_block(node, [fail_stmt]), -1))
+        let fail = assert_fail_block(node, site, msg)
+        if fail < 0 { return -1 }
+        pre.push(ir_if(node, eq, fail, -1))
         return ir_block(node, pre)
     }
     if eq_is_float(tid) {
         let eq = ir_call_runtime(TYPE_BOOL, node, bool_rec.c_spelling,
             c_runtime_helper("float_eq"), bool_rec.slot_form, [left_bound.ref, right_bound.ref])
         let msg = call_str_format(node, "ASSERT_NE FAILED: %f == %f", [left_bound.ref, right_bound.ref])
-        let fail_stmt = assert_fail_call(node, site, msg)
-        pre.push(ir_if(node, eq, ir_block(node, [fail_stmt]), -1))
+        let fail = assert_fail_block(node, site, msg)
+        if fail < 0 { return -1 }
+        pre.push(ir_if(node, eq, fail, -1))
         return ir_block(node, pre)
     }
     let left_arg = eq_default_arg(tid, node, left_bound.ref)
     let right_arg = eq_default_arg(tid, node, right_bound.ref)
     let eq = ir_binary(TYPE_BOOL, node, bool_rec.c_spelling, "==", left_bound.ref, right_bound.ref)
     let msg = call_str_format(node, "ASSERT_NE FAILED: %lld == %lld", [left_arg, right_arg])
-    let fail_stmt = assert_fail_call(node, site, msg)
-    pre.push(ir_if(node, eq, ir_block(node, [fail_stmt]), -1))
+    let fail = assert_fail_block(node, site, msg)
+    if fail < 0 { return -1 }
+    pre.push(ir_if(node, eq, fail, -1))
     ir_block(node, pre)
 }
 

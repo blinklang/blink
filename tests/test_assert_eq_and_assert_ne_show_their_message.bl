@@ -1,0 +1,110 @@
+// Every assertion takes an optional trailing message (sections/02_syntax.md, Built-in
+// Assertions). A failed assert_eq or assert_ne shows its message under the failure line,
+// the way a failed assert does, and evaluates it only on failure.
+
+import compile_test_helpers.{compile_and_run, compile_and_run_test_json, scratch_root}
+
+fn in_main(call: Str) -> Str {
+    "fn main() ! IO.Print \{\n    let s = \"ab\"\n    let n = 3\n    let l = [1, 2]\n    let f = 1.5\n    {call}\n    io.println(\"after\")\n}\n"
+}
+
+fn expect_main_report(call: Str, tag: Str, report: Str) ! FS.Delete, FS.Write, Process.Spawn, FS.Read, Env.Read {
+    let r = compile_and_run(in_main(call), "{tag}_{getpid()}")
+    assert_eq(r.exit_code, 101, "exit {r.exit_code}: {r.out}{r.err_out}")
+    assert_eq(r.out, "")
+    assert_eq(r.err_out, report)
+}
+
+test "a failed assert_eq of Ints in main shows its message" {
+    expect_main_report(#"assert_eq(n, 5, "my note")"#, "msg_eq_int",
+        "ASSERT_EQ FAILED: 3 != 5 (line 6)\n    message: my note\n")
+}
+
+test "a failed assert_eq of Strs in main shows its message" {
+    expect_main_report(#"assert_eq(s, "cd", "my note")"#, "msg_eq_str",
+        "ASSERT_EQ FAILED: \"ab\" != \"cd\" (line 6)\n    message: my note\n")
+}
+
+test "a failed assert_eq of Floats in main shows its message" {
+    expect_main_report(#"assert_eq(f, 2.5, "my note")"#, "msg_eq_float",
+        "ASSERT_EQ FAILED: 1.500000 != 2.500000 (line 6)\n    message: my note\n")
+}
+
+test "a failed assert_eq of Lists in main shows its message" {
+    let r = compile_and_run(in_main(#"assert_eq(l, [3], "my note")"#), "msg_eq_list_{getpid()}")
+    assert_eq(r.exit_code, 101, "exit {r.exit_code}: {r.out}{r.err_out}")
+    assert(r.err_out.starts_with("ASSERT_EQ FAILED: "), r.err_out)
+    assert(r.err_out.ends_with(" (line 6)\n    message: my note\n"), r.err_out)
+}
+
+test "a failed assert_ne in main shows its message" {
+    expect_main_report(#"assert_ne(n, 3, "my note")"#, "msg_ne_int",
+        "ASSERT_NE FAILED: 3 == 3 (line 6)\n    message: my note\n")
+    expect_main_report(#"assert_ne(s, "ab", "my note")"#, "msg_ne_str",
+        "ASSERT_NE FAILED: \"ab\" == \"ab\" (line 6)\n    message: my note\n")
+}
+
+test "a failed assert_ne of Lists in main shows its message" {
+    let r = compile_and_run(in_main(#"assert_ne(l, [1, 2], "my note")"#), "msg_ne_list_{getpid()}")
+    assert_eq(r.exit_code, 101, "exit {r.exit_code}: {r.out}{r.err_out}")
+    assert(r.err_out.starts_with("ASSERT_NE FAILED: "), r.err_out)
+    assert(r.err_out.ends_with(" (line 6)\n    message: my note\n"), r.err_out)
+}
+
+test "an interpolated message shows its values" {
+    expect_main_report(#"assert_eq(n, 5, "n was {n}, s was {s}")"#, "msg_interp",
+        "ASSERT_EQ FAILED: 3 != 5 (line 6)\n    message: n was 3, s was ab\n")
+}
+
+test "with no message the report is the same as before" {
+    expect_main_report("assert_eq(n, 5)", "msg_none_eq", "ASSERT_EQ FAILED: 3 != 5 (line 6)\n")
+    expect_main_report("assert_ne(n, 3)", "msg_none_ne", "ASSERT_NE FAILED: 3 == 3 (line 6)\n")
+    expect_main_report(#"assert_eq(n, 5, "")"#, "msg_empty_eq", "ASSERT_EQ FAILED: 3 != 5 (line 6)\n")
+}
+
+test "the message is evaluated only when the assertion fails" {
+    let src = #"fn note(tag: Str) -> Str ! IO.Print {
+    io.println("evaluated {tag}")
+    tag
+}
+
+fn main() ! IO.Print {
+    let n = 3
+    assert_eq(n, 3, note("eq"))
+    assert_ne(n, 4, note("ne"))
+    assert_eq([n], [3], note("list"))
+    io.println("passed")
+    assert_eq(n, 5, note("fail"))
+}
+"#
+    let r = compile_and_run(src, "msg_lazy_{getpid()}")
+    assert_eq(r.exit_code, 101, "exit {r.exit_code}: {r.out}{r.err_out}")
+    assert_eq(r.out, "passed\nevaluated fail\n")
+    assert_eq(r.err_out, "ASSERT_EQ FAILED: 3 != 5 (line 12)\n    message: fail\n")
+}
+
+fn test_record(call: Str, tag: Str) -> Str ! FS.Delete, FS.Write, Process.Spawn, FS.Read, Env.Read {
+    let src = "test \"t\" \{\n    let n = 3\n    {call}\n}\n"
+    compile_and_run_test_json(src, "{tag}_{getpid()}").out
+}
+
+test "the test record of a failed assert_eq or assert_ne carries its message" {
+    let eq = test_record(#"assert_eq(n, 5, "my note")"#, "msg_rec_eq")
+    assert(eq.contains(#""message":"ASSERT_EQ FAILED: 3 != 5""#), eq)
+    assert(eq.contains(#""user_message":"my note""#), eq)
+    let ne = test_record(#"assert_ne(n, 3, "my note")"#, "msg_rec_ne")
+    assert(ne.contains(#""message":"ASSERT_NE FAILED: 3 == 3""#), ne)
+    assert(ne.contains(#""user_message":"my note""#), ne)
+    let none = test_record("assert_eq(n, 5)", "msg_rec_none")
+    assert(none.contains(#""message":"ASSERT_EQ FAILED: 3 != 5""#), none)
+    assert(!none.contains("user_message"), none)
+}
+
+test "blink test shows the message of a failed assert_eq" {
+    let path = "{scratch_root()}/msg_cli_{getpid()}.bl"
+    fs.write(path, "test \"t\" \{\n    let n = 3\n    assert_eq(n, 5, \"my note\")\n}\n").unwrap()
+    let r = process.run("build/blink", ["test", path]).unwrap()
+    let _ = fs.delete(path)
+    let shown = "{r.out}{r.err_out}"
+    assert(shown.contains("  ASSERT_EQ FAILED: 3 != 5 (line 3)\n    message: my note\n"), shown)
+}
