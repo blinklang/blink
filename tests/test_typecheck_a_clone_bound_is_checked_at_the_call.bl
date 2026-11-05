@@ -1,0 +1,74 @@
+// A `T: Clone` bound is judged at each call, as every other bound is: an argument whose
+// type is not `Clone` is a type error at the call, and never reaches a build
+// (sections/03_types.md §3.6.1 *Clone Semantics*).
+
+import std.fs
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_reset}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+import std.io
+
+fn typecheck_probe(path: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    init_embedded_stdlib()
+    fs.write(path, src).unwrap()
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+}
+
+// Each error as "name: message | note | note", then its help.
+fn errors_of(src: Str) -> List[Str] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    typecheck_probe("build/test_typecheck_a_clone_bound_probe.bl", src)
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" {
+            let mut line = "{d.name}: {d.message}"
+            for n in d.notes { line = "{line} | {n}" }
+            out.push("{line} | help: {d.help}")
+        }
+    }
+    for e in out { io.println("  diag: {e}") }
+    out
+}
+
+let DUP = "fn dup[T: Clone](x: T) -> T \{\n    x.clone()\n}\n"
+
+fn call_with(decls: Str, arg: Str) -> Str {
+    "{decls}{DUP}fn main() \{\n    let _ = dup({arg})\n}\n"
+}
+
+test "a struct with no Clone is refused at the call" {
+    let errs = errors_of(call_with("type CloneBoundNoClone \{\n    a: Int\n}\n", "CloneBoundNoClone \{ a: 1 }"))
+    assert_eq(errs.len(), 1)
+    let e = errs.get(0).unwrap()
+    assert(e.contains("TraitBoundNotSatisfied"), e)
+    assert(e.contains("`CloneBoundNoClone` does not satisfy the Clone bound on type parameter T"), e)
+    assert(e.contains("@derive(Clone"), e)
+}
+
+test "an option of a struct with no Clone is refused at the call" {
+    let errs = errors_of(call_with("type CloneBoundOptNoClone \{\n    a: Int\n}\n", "Some(CloneBoundOptNoClone \{ a: 1 })"))
+    assert_eq(errs.len(), 1)
+    assert(errs.get(0).unwrap().contains("does not satisfy the Clone bound on type parameter T"), errs.get(0).unwrap())
+}
+
+test "a struct that derives Clone is accepted" {
+    assert_eq(errors_of(call_with("@derive(Clone)\ntype CloneBoundDerived \{\n    a: Int\n}\n", "CloneBoundDerived \{ a: 1 }")).len(), 0)
+}
+
+test "a struct with a written Clone is accepted" {
+    let decls = "type CloneBoundWritten \{\n    a: Int\n}\nimpl Clone for CloneBoundWritten \{\n    fn clone(self) -> CloneBoundWritten \{ CloneBoundWritten \{ a: self.a } }\n}\n"
+    assert_eq(errors_of(call_with(decls, "CloneBoundWritten \{ a: 1 }")).len(), 0)
+}
+
+test "the built-in types are accepted" {
+    assert_eq(errors_of(call_with("", "7")).len(), 0)
+    assert_eq(errors_of(call_with("", "\"text\"")).len(), 0)
+    assert_eq(errors_of(call_with("", "[1, 2]")).len(), 0)
+}
+
+test "a list of a struct with no Clone is accepted, since a list clone shares the list" {
+    assert_eq(errors_of(call_with("type CloneBoundListNoClone \{\n    a: Int\n}\n", "[CloneBoundListNoClone \{ a: 1 }]")).len(), 0)
+}
