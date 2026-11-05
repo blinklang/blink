@@ -12328,12 +12328,22 @@ fn validate_keyed_ann(key_ann: Int, key_tid: Option[Int], role: HashRole) ! Diag
     // A derive written on the alias grants nothing: the alias is that type.
     let aliased = tc_alias_underlying_of(key_name)
     if aliased != -1 {
-        // Without the caller's type, the alias's declared type is the one it names.
-        let judged = match key_tid {
-            Some(t) => t
-            None => aliased
+        match key_tid {
+            Some(t) => tc_refuse_unhashable_tid(t, role, key_ann)
+            None => {
+                // With no type from the caller, the alias's declared type answers for its own
+                // parts, and the written arguments answer for the parameters in it.
+                tc_refuse_unhashable_tid(aliased, role, key_ann)
+                let args = node_elements(key_ann)
+                let arg_roles = tc_hash_roles_at_key(decl_name, role, [])
+                let mut i = 0
+                while args != -1 && i < sublist_length(args) {
+                    let arg_role = tc_hash_oblig_mark(arg_roles, i)
+                    if tc_hash_role_is_free(arg_role) == 0 { validate_keyed_ann(sublist_get(args, i), None, arg_role) }
+                    i = i + 1
+                }
+            }
         }
-        tc_refuse_unhashable_tid(judged, role, key_ann)
         return
     }
     if key_name == "Float" || key_name == "F32" || key_name == "F64" {
@@ -12526,6 +12536,39 @@ fn tc_hash_oblig_of(name: Str) -> List[HashRole] {
 // type's role for its parameter. `key_role` is the role `ann` itself is in. Returns 1 when a
 // role changed.
 fn tc_hash_oblig_walk(ann: Int, key_role: HashRole, names: List[Str], roles: List[HashRole]) -> Int {
+    tc_hash_oblig_walk_in(ann, key_role, names, roles, [])
+}
+
+// The roles of the parameters of generic alias `name` when the alias itself stands in role
+// `key_role`: a parameter its target puts in that position takes it. `visiting` holds the alias
+// declarations above this one, because an alias can name itself in its target. Empty when `name`
+// is no alias or the position is free.
+fn tc_hash_roles_at_key(name: Str, key_role: HashRole, visiting: List[Int]) -> List[HashRole] {
+    let none: List[HashRole] = []
+    if name == "" || tc_hash_role_is_free(key_role) != 0 { return none }
+    let decl = tc_decl_node_for_type(tc_written_type_nominal(name))
+    if decl < 0 || node_value(decl) == -1 || visiting.contains(decl) { return none }
+    let tps = node_type_params(decl)
+    if tps == -1 { return none }
+    let mut names: List[Str] = []
+    let mut p = 0
+    while p < sublist_length(tps) {
+        names.push(node_name(sublist_get(tps, p)))
+        p = p + 1
+    }
+    let roles = tc_hash_roles_from(names, none)
+    let mut inner: List[Int] = []
+    for v in visiting { inner.push(v) }
+    inner.push(decl)
+    let decl_module = node_module(decl)
+    let saved_module = nr_current_module
+    nr_current_module = decl_module
+    let _ = tc_hash_oblig_walk_in(node_value(decl), key_role, names, roles, inner)
+    nr_current_module = saved_module
+    roles
+}
+
+fn tc_hash_oblig_walk_in(ann: Int, key_role: HashRole, names: List[Str], roles: List[HashRole], visiting: List[Int]) -> Int {
     if ann == -1 { return 0 }
     let name = node_name(ann)
     let elems = node_elements(ann)
@@ -12547,20 +12590,23 @@ fn tc_hash_oblig_walk(ann: Int, key_role: HashRole, names: List[Str], roles: Lis
         if name == "Tuple" && elems != -1 {
             let mut t = 0
             while t < sublist_length(elems) {
-                if tc_hash_oblig_walk(sublist_get(elems, t), key_role, names, roles) != 0 { changed = 1 }
+                if tc_hash_oblig_walk_in(sublist_get(elems, t), key_role, names, roles, visiting) != 0 { changed = 1 }
                 t = t + 1
             }
             return changed
         }
     }
     if name == "Fn" {
-        if tc_hash_oblig_walk(node_type_ann(ann), HashRole.Free, names, roles) != 0 { changed = 1 }
+        if tc_hash_oblig_walk_in(node_type_ann(ann), HashRole.Free, names, roles, visiting) != 0 { changed = 1 }
     }
     if elems == -1 { return changed }
     let owner = if name == "Map" { [HashRole.MapKey] } else if name == "Set" { [HashRole.SetElement] } else { tc_hash_oblig_of(name) }
+    let at_key = tc_hash_roles_at_key(name, key_role, visiting)
     let mut i = 0
     while i < sublist_length(elems) {
-        if tc_hash_oblig_walk(sublist_get(elems, i), tc_hash_oblig_mark(owner, i), names, roles) != 0 { changed = 1 }
+        let declared = tc_hash_oblig_mark(owner, i)
+        let role = if tc_hash_role_is_free(declared) != 0 { tc_hash_oblig_mark(at_key, i) } else { declared }
+        if tc_hash_oblig_walk_in(sublist_get(elems, i), role, names, roles, visiting) != 0 { changed = 1 }
         i = i + 1
     }
     changed
