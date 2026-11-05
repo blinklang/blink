@@ -1,0 +1,180 @@
+// A derived Hash holds only where each type argument its fields use has Hash (sections/03_types.md),
+// so a parameter of a derived generic type in a key position is a key when a field uses it.
+
+import compile_test_helpers.{compile_and_capture}
+
+@derive(Hash, Eq)
+type B[T] {
+    v: T
+}
+@derive(Hash, Eq)
+type Mark[P] {
+    x: Int
+}
+@derive(Hash, Eq)
+type Node[T] {
+    Leaf(T)
+    Pair(B[T], Int)
+}
+type SS[X] = Set[X]
+type D[X] = Set[B[X]]
+type H[T] {
+    items: Set[B[T]]
+}
+
+fn empty_of[T]() -> Set[B[T]] {
+    Set()
+}
+
+fn error_count(out: Str) -> Int {
+    out.split("\"severity\":\"error\"").len() - 1
+}
+
+fn refused(src: Str, tag: Str) -> Str ! Process.Spawn, FS.Write, FS.Read, FS.Delete, Env.Read {
+    let out = compile_and_capture(src, tag)
+    assert(out.contains("E1400"), "expected E1400, got: {out}")
+    assert(!out.contains("\"severity\":\"ice\""), "expected no ICE, got: {out}")
+    out
+}
+
+test "an argument with Hash builds in each key position" {
+    let a: SS[B[Int]] = Set()
+    assert_eq(a.len(), 0)
+    let b: D[Str] = Set()
+    assert_eq(b.len(), 0)
+    let c = empty_of[Int]()
+    assert_eq(c.len(), 0)
+    let d: H[Str] = H { items: Set() }
+    assert_eq(d.items.len(), 0)
+    let e: SS[Node[Int]] = Set()
+    assert_eq(e.len(), 0)
+}
+
+test "a parameter no field uses is no key" {
+    let a: SS[Mark[Float]] = Set()
+    assert_eq(a.len(), 0)
+    let b: Set[Mark[Float]] = Set()
+    assert_eq(b.len(), 0)
+}
+
+test "an argument with no Hash is E1400 through a Set alias" {
+    let _ = refused(#"
+@derive(Hash, Eq)
+type B[T] { v: T }
+type SS[X] = Set[X]
+fn main() {
+    let _s: SS[B[Float]] = Set()
+}
+"#, "_key_derived_set_alias")
+}
+
+test "an alias whose target holds a Set of the type obliges its parameter" {
+    let _ = refused(#"
+@derive(Hash, Eq)
+type B[T] { v: T }
+type D[X] = Set[B[X]]
+fn main() {
+    let _s: D[Float] = Set()
+}
+"#, "_key_derived_alias_target")
+}
+
+test "a fn signature and a struct field oblige a parameter through the type" {
+    let _ = refused(#"
+@derive(Hash, Eq)
+type B[T] { v: T }
+fn mk[T]() -> Set[B[T]] { Set() }
+fn main() {
+    let _s = mk[Float]()
+}
+"#, "_key_derived_fn_sig")
+    let _ = refused(#"
+@derive(Hash, Eq)
+type B[T] { v: T }
+type H[T] { items: Set[B[T]] }
+fn main() {
+    let _h: H[Float] = H { items: Set() }
+}
+"#, "_key_derived_struct_field")
+}
+
+test "a variant payload and a nested derived type pass the position down" {
+    let _ = refused(#"
+@derive(Hash, Eq)
+type B[T] { v: T }
+@derive(Hash, Eq)
+type Node[T] {
+    Leaf(Int)
+    Pair(B[T], Int)
+}
+fn mk[T]() -> Set[Node[T]] { Set() }
+fn main() {
+    let _s = mk[Float]()
+}
+"#, "_key_derived_variant")
+}
+
+test "a type that names itself in a field ends the check" {
+    let out = compile_and_capture(#"
+@derive(Hash, Eq)
+type Tree[T] {
+    Leaf(T)
+    Up(Tree[T])
+}
+fn mk[T]() -> Set[Tree[T]] { Set() }
+fn main() {
+    let _s = mk[Int]()
+}
+"#, "_key_derived_recursive")
+    assert(!out.contains("\"severity\":\"ice\""), out)
+}
+
+test "one key with no Hash is one report" {
+    let enum_key = refused(#"
+@derive(Hash, Eq)
+type En[T] {
+    V(T)
+    N
+}
+fn main() {
+    let _s: Set[En[Float]] = Set()
+}
+"#, "_key_derived_one_report_enum")
+    assert_eq(error_count(enum_key), 1)
+    let param = refused(#"
+@derive(Hash, Eq)
+type B[T] { v: T }
+fn f(s: Set[B[Float]]) -> Int { s.len() }
+fn main() {
+    let _ = f
+}
+"#, "_key_derived_one_report_param")
+    assert_eq(error_count(param), 1)
+    let field = refused(#"
+@derive(Hash, Eq)
+type B[T] { v: T }
+type H { s: Set[B[Float]] }
+fn main() {}
+"#, "_key_derived_one_report_field")
+    assert_eq(error_count(field), 1)
+    let alias_of = refused(#"
+@derive(Hash, Eq)
+type B[T] { v: T }
+type A = B[Float]
+fn main() {
+    let _s: Set[A] = Set()
+}
+"#, "_key_derived_one_report_alias")
+    assert_eq(error_count(alias_of), 1)
+}
+
+test "a tuple part of a derived generic type is judged at its arguments" {
+    let out = refused(#"
+@derive(Hash, Eq)
+type B[T] { v: T }
+fn main() {
+    let _s: Set[(B[Float], Int)] = Set()
+}
+"#, "_key_derived_tuple_part")
+    assert_eq(error_count(out), 1)
+}

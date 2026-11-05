@@ -11077,7 +11077,6 @@ fn tc_resolve_compiler_known_type(name: Str, elems_sl: Int, ann_node: Int) -> In
             let val_t = resolve_type_ann(sublist_get(elems_sl, 1))
             if tc_suppress_ann_validation == 0 {
                 validate_keyed_ann(key_ann, Some(key_t), HashRole.MapKey)
-                tc_refuse_unhashable_instance(key_t, key_ann, HashRole.MapKey)
             }
             return make_map_type(key_t, val_t)
         }
@@ -11089,7 +11088,6 @@ fn tc_resolve_compiler_known_type(name: Str, elems_sl: Int, ann_node: Int) -> In
             let elem_t = resolve_type_ann(elem_ann)
             if tc_suppress_ann_validation == 0 {
                 validate_keyed_ann(elem_ann, Some(elem_t), HashRole.SetElement)
-                tc_refuse_unhashable_instance(elem_t, elem_ann, HashRole.SetElement)
             }
             return make_set_type(elem_t)
         }
@@ -12334,14 +12332,7 @@ fn validate_keyed_ann(key_ann: Int, key_tid: Option[Int], role: HashRole) ! Diag
                 // With no type from the caller, the alias's declared type answers for its own
                 // parts, and the written arguments answer for the parameters in it.
                 tc_refuse_unhashable_tid(aliased, role, key_ann)
-                let args = node_elements(key_ann)
-                let arg_roles = tc_hash_roles_at_key(decl_name, role, [])
-                let mut i = 0
-                while args != -1 && i < sublist_length(args) {
-                    let arg_role = tc_hash_oblig_mark(arg_roles, i)
-                    if tc_hash_role_is_free(arg_role) == 0 { validate_keyed_ann(sublist_get(args, i), None, arg_role) }
-                    i = i + 1
-                }
+                tc_validate_key_args(key_ann, role)
             }
         }
         return
@@ -12366,6 +12357,12 @@ fn validate_keyed_ann(key_ann: Int, key_tid: Option[Int], role: HashRole) ! Diag
     let bare = strip_module_qualifier(key_name)
     let nominal = tc_written_type_nominal(key_name)
     if tc_type_name_derives(nominal, "Hash") != 0 {
+        // The instance answers for all its arguments, so the written ones are read only with no
+        // type from the caller: one key with no Hash is one report.
+        match key_tid {
+            Some(t) => tc_refuse_unhashable_instance(t, key_ann, role)
+            None => tc_validate_key_args(key_ann, role)
+        }
         return
     }
     // Generic type params and unknown names — let later phases handle them.
@@ -12389,6 +12386,19 @@ fn validate_keyed_ann(key_ann: Int, key_tid: Option[Int], role: HashRole) ! Diag
     }
 }
 
+// The written arguments of a key annotation, each judged in the role the type gives it there.
+fn tc_validate_key_args(key_ann: Int, role: HashRole) ! Diag.Report {
+    let args = node_elements(key_ann)
+    if args == -1 { return }
+    let arg_roles = tc_hash_roles_at_key(node_name(key_ann), role, [])
+    let mut i = 0
+    while i < sublist_length(args) {
+        let arg_role = tc_hash_oblig_mark(arg_roles, i)
+        if tc_hash_role_is_free(arg_role) == 0 { validate_keyed_ann(sublist_get(args, i), None, arg_role) }
+        i = i + 1
+    }
+}
+
 // validate_keyed_ann reads the written name, so it passes any instance of a type that derives
 // Hash. The derive holds only at an instance whose arguments have Hash, read here at the tid.
 fn tc_refuse_unhashable_instance(tid0: Int, ann: Int, role: HashRole) ! Diag.Report {
@@ -12397,7 +12407,8 @@ fn tc_refuse_unhashable_instance(tid0: Int, ann: Int, role: HashRole) ! Diag.Rep
     if k != TyKind.Struct && k != TyKind.Enum { return }
     if tc_tid_child_count(tid) == 0 { return }
     let base = if k == TyKind.Struct { tc_struct_base_tid(tid) } else { tc_enum_base_tid(tid) }
-    if tc_type_name_derives(strip_module_qualifier(tc_type_name(base)), "Hash") == 0 { return }
+    let decl = tc_tid_decl_node(base)
+    if decl < 0 || tc_decl_derives(decl, "Hash") == 0 { return }
     if tc_instance_has_trait(tid, "Hash") { return }
     tc_report_unhashable(role, HashRefusal.Instance, type_to_str(tid), "", ann)
 }
@@ -12539,15 +12550,17 @@ fn tc_hash_oblig_walk(ann: Int, key_role: HashRole, names: List[Str], roles: Lis
     tc_hash_oblig_walk_in(ann, key_role, names, roles, [])
 }
 
-// The roles of the parameters of generic alias `name` when the alias itself stands in role
-// `key_role`: a parameter its target puts in that position takes it. `visiting` holds the alias
-// declarations above this one, because an alias can name itself in its target. Empty when `name`
-// is no alias or the position is free.
+// The roles of the parameters of generic type `name` when the type itself stands in role
+// `key_role`: a parameter that an alias's target or a derived Hash's fields put in that position
+// takes it. `visiting` holds the declarations above this one, because a declaration can name
+// itself. Empty when `name` has no such body or the position is free.
 fn tc_hash_roles_at_key(name: Str, key_role: HashRole, visiting: List[Int]) -> List[HashRole] {
     let none: List[HashRole] = []
     if name == "" || tc_hash_role_is_free(key_role) != 0 { return none }
-    let decl = tc_decl_node_for_type(tc_written_type_nominal(name))
-    if decl < 0 || node_value(decl) == -1 || visiting.contains(decl) { return none }
+    let nominal = tc_written_type_nominal(name)
+    let decl = tc_decl_node_for_type(nominal)
+    if decl < 0 || visiting.contains(decl) { return none }
+    if node_value(decl) == -1 && tc_type_name_derives(nominal, "Hash") == 0 { return none }
     let tps = node_type_params(decl)
     if tps == -1 { return none }
     let mut names: List[Str] = []
@@ -12563,9 +12576,32 @@ fn tc_hash_roles_at_key(name: Str, key_role: HashRole, visiting: List[Int]) -> L
     let decl_module = node_module(decl)
     let saved_module = nr_current_module
     nr_current_module = decl_module
-    let _ = tc_hash_oblig_walk_in(node_value(decl), key_role, names, roles, inner)
+    let _ = tc_hash_oblig_walk_body(decl, key_role, names, roles, inner)
     nr_current_module = saved_module
     roles
+}
+
+// Walks what a type declaration holds: an alias's target, a struct's fields and each variant's
+// fields, with `key_role` as the role of each. Returns 1 when a role changed.
+fn tc_hash_oblig_walk_body(td: Int, key_role: HashRole, names: List[Str], roles: List[HashRole], visiting: List[Int]) -> Int {
+    let mut grew = tc_hash_oblig_walk_in(node_value(td), key_role, names, roles, visiting)
+    let flds = node_fields(td)
+    let mut f = 0
+    while flds != -1 && f < sublist_length(flds) {
+        let fd = sublist_get(flds, f)
+        if node_kind(fd) == NodeKind.TypeVariant {
+            let vflds = node_fields(fd)
+            let mut v = 0
+            while vflds != -1 && v < sublist_length(vflds) {
+                if tc_hash_oblig_walk_in(node_value(sublist_get(vflds, v)), key_role, names, roles, visiting) != 0 { grew = 1 }
+                v = v + 1
+            }
+        } else {
+            if tc_hash_oblig_walk_in(node_value(fd), key_role, names, roles, visiting) != 0 { grew = 1 }
+        }
+        f = f + 1
+    }
+    grew
 }
 
 fn tc_hash_oblig_walk_in(ann: Int, key_role: HashRole, names: List[Str], roles: List[HashRole], visiting: List[Int]) -> Int {
@@ -12645,24 +12681,7 @@ fn tc_compute_type_hash_obligations(types_sl: Int) {
                     p = p + 1
                 }
                 let roles = tc_hash_roles_from(names, tc_hash_oblig_at(td))
-                let mut grew = tc_hash_oblig_walk(node_value(td), HashRole.Free, names, roles)
-                let flds = node_fields(td)
-                let mut f = 0
-                while flds != -1 && f < sublist_length(flds) {
-                    let fd = sublist_get(flds, f)
-                    if node_kind(fd) == NodeKind.TypeVariant {
-                        let vflds = node_fields(fd)
-                        let mut v = 0
-                        while vflds != -1 && v < sublist_length(vflds) {
-                            if tc_hash_oblig_walk(node_value(sublist_get(vflds, v)), HashRole.Free, names, roles) != 0 { grew = 1 }
-                            v = v + 1
-                        }
-                    } else {
-                        if tc_hash_oblig_walk(node_value(fd), HashRole.Free, names, roles) != 0 { grew = 1 }
-                    }
-                    f = f + 1
-                }
-                if grew != 0 {
+                if tc_hash_oblig_walk_body(td, HashRole.Free, names, roles, []) != 0 {
                     tc_hash_oblig.insert(td, roles)
                     changed = 1
                 }
@@ -32850,7 +32869,6 @@ fn tc_container_ctor_from_type_args(call_node: Int, name: Str) -> Int ! TypeChec
     if tc_suppress_ann_validation == 0 {
         let role = if declared == 1 { HashRole.SetElement } else { HashRole.MapKey }
         validate_keyed_ann(sublist_get(targs, 0), Some(first), role)
-        tc_refuse_unhashable_instance(first, sublist_get(targs, 0), role)
     }
     if declared == 1 { return make_set_type(first) }
     make_map_type(first, resolve_type_ann(sublist_get(targs, 1)))
