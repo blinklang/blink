@@ -1495,10 +1495,10 @@ fn tc_bound_fact(concrete_tid: Int, trait_name: Str) -> Int {
     }
     // The derivable traits are read at the instance, through its arguments and the bounds
     // of any impl written for it (tc_trait_need).
-    if trait_name == "Debug" || trait_name == "Hash" || trait_name == "Serialize" {
+    if trait_name == "Hash" || trait_name == "Serialize" {
         return tc_derive_only_fact(concrete_tid, trait_name)
     }
-    if trait_name == "Eq" || trait_name == "Ord" || trait_name == "Clone" {
+    if trait_name == "Eq" || trait_name == "Ord" || trait_name == "Clone" || trait_name == "Debug" {
         if tc_tid_has_unbound_metavar(concrete_tid) != 0 { return 0 }
         if tc_trait_need(concrete_tid, trait_name, []).len() == 0 { return 1 }
         return -1
@@ -5810,6 +5810,18 @@ fn tc_check_one_bound(name: Str, bounds: Str, concrete: Int, node: Int) -> Int !
                 tc_trait_need_notes(path, tr))
             return 1
         }
+        // A Hash bound is left out: a tuple is a Map key, which hashes it with no method call.
+        if tc_pipe_has(bounds, tr) != 0 && tr != "Hash" {
+            match tc_std_trait_unbuilt(concrete, tr) {
+                Some(why) => {
+                    diag_error_at("TypeError", TYPE_ERROR,
+                        "the {tc_core_trait_shown(tr)} bound on type parameter {name} is not built yet for `{type_to_str(concrete)}`: the compiler cannot {why}", node,
+                        "pass a value of a type whose {tc_core_trait_shown(tr)} methods are built")
+                    return 1
+                }
+                None => {}
+            }
+        }
         i = i + 1
     }
     0
@@ -5823,7 +5835,8 @@ fn tc_check_user_bounds(decl: Int, idx: Int, concrete: Int, binds: Map[Str, Int]
     let tp = fnsig_tparam_nodes.get(idx) ?? NO_BINDER_NODE
     let block = tc_method_block.get(decl) ?? -1
     let impl_binders = if block != -1 && node_kind(block) == NodeKind.ImplBlock { node_impl_binders(block) } else { -1 }
-    let _ = tc_report_unmet_user_bound(tp, impl_binders, node_type_params(decl), concrete, binds, node)
+    if tc_report_unmet_user_bound(tp, impl_binders, node_type_params(decl), concrete, binds, node) != 0 { return }
+    let _ = tc_report_user_bound_impl_bounds(tp, concrete, node, [])
 }
 
 // The bounds of the impl a method call reached, on its binders and in its `where` clause,
@@ -5837,6 +5850,12 @@ fn tc_check_impl_bounds_at_call(decl: Int, ibinds: Map[Str, Int], node: Int) ! T
 }
 
 fn tc_check_impl_bounds(im: Int, ibinds: Map[Str, Int], node: Int) ! TypeCheck.Resolve, Diag.Report {
+    let _ = tc_judge_impl_bounds(im, ibinds, node, [])
+}
+
+// Answers 1 when it reported. `seen` holds the impl and type pairs judged on the way here,
+// so two impls whose bounds ask for each other end the walk.
+fn tc_judge_impl_bounds(im: Int, ibinds: Map[Str, Int], node: Int, seen: List[Str]) -> Int ! TypeCheck.Resolve, Diag.Report {
     let binders = node_impl_binders(im)
     let mut carriers: List[Int] = []
     let mut i = 0
@@ -5853,9 +5872,52 @@ fn tc_check_impl_bounds(im: Int, ibinds: Map[Str, Int], node: Int) ! TypeCheck.R
     for c in carriers {
         let concrete = ibinds.get(node_name(c)) ?? -1
         if concrete == -1 { continue }
-        if tc_check_one_bound(node_name(c), tparam_node_bound_traits(c), concrete, node) != 0 { return }
-        if tc_report_unmet_user_bound(c, binders, -1, concrete, ibinds, node) != 0 { return }
+        if tc_check_one_bound(node_name(c), tparam_node_bound_traits(c), concrete, node) != 0 { return 1 }
+        if tc_report_unmet_user_bound(c, binders, -1, concrete, ibinds, node) != 0 { return 1 }
+        if tc_report_user_bound_impl_bounds(c, concrete, node, seen) != 0 { return 1 }
     }
+    0
+}
+
+// A bound on a trait a program module declares holds through an impl only where that impl's
+// own bounds hold at the argument. Else mono builds the impl's body at a type the body cannot
+// compile against. Only an impl that alone answers for the type is judged, so a choice among
+// impls is never refused here. Answers 1 when it reported.
+fn tc_report_user_bound_impl_bounds(carrier: Int, concrete0: Int, node: Int, seen: List[Str]) -> Int ! TypeCheck.Resolve, Diag.Report {
+    if carrier < 0 || node_kind(carrier) != NodeKind.TypeParam { return 0 }
+    let bounds = node_elements(carrier)
+    if bounds == -1 { return 0 }
+    let concrete = resolve_alias_tid(tc_resolve(concrete0))
+    if tc_tid_is_judgeable(concrete) == 0 { return 0 }
+    let mut i = 0
+    while i < sublist_length(bounds) {
+        let trait_name = tc_bound_trait(sublist_get(bounds, i))
+        let tr = tc_trait_node_idx.get(trait_name) ?? -1
+        if tr != -1 && !node_source_module(tr).starts_with("std_") {
+            let mut hits = 0
+            let mut hit = -1
+            let mut hit_binds: Map[Str, Int] = Map()
+            for im in tc_impl_recv_tids.keys() {
+                if tc_impl_trait_id(im) != trait_name { continue }
+                let raw = tc_impl_recv_tids.get(im) ?? -1
+                let binds: Map[Str, Int] = Map()
+                unify_typevar_binds(raw, concrete, binds)
+                if !tc_tid_same_type(tc_resolve(substitute_typevar_tid(raw, binds)), concrete) { continue }
+                hits = hits + 1
+                hit = im
+                hit_binds = binds
+            }
+            let key = "{hit}|{concrete}"
+            if hits == 1 && !seen.contains(key) {
+                let mut next: List[Str] = []
+                for k in seen { next.push(k) }
+                next.push(key)
+                if tc_judge_impl_bounds(hit, hit_binds, node, next) != 0 { return 1 }
+            }
+        }
+        i = i + 1
+    }
+    0
 }
 
 // E0306 for the first bound on `carrier` that tc_unmet_user_bound finds; answers 1 when it
@@ -8039,13 +8101,10 @@ pub fn tc_scalar_has_ord(k: TyKind) -> Bool {
 // docs/codegen-rewrite/builtin_method_arity.md is the survey this reproduces, arm by arm,
 // and is where a new method's row gets recorded.
 fn tc_builtin_method_arity(obj_k: TyKind, method: Str) -> Int {
-    if method == "eq" && tc_scalar_has_eq(obj_k) { return 1 }
-    if method == "cmp" && tc_scalar_has_ord(obj_k) { return 1 }
     if obj_k == TyKind.Int || obj_k == TyKind.Float || obj_k == TyKind.Bool || obj_k == TyKind.Str || obj_k == TyKind.Char {
         if method == "display" { return 0 }
         if method == "fmt" { return 1 }
     }
-    if obj_k == TyKind.Range && (method == "debug" || method == "clone") { return 0 }
     if method == "into_iter" {
         if obj_k == TyKind.List || obj_k == TyKind.Set || obj_k == TyKind.Str || obj_k == TyKind.Iterator || obj_k == TyKind.Range { return 0 }
     }
@@ -24268,7 +24327,7 @@ fn tc_ident_alphabet() -> Str {
 fn tc_builtin_suggestion_ok(obj_k: TyKind, method: Str, cand: Str) -> Int {
     if cand == method { return 0 }
     if is_builtin_method_on_receiver(obj_k, cand) == 0 { return 0 }
-    if tc_builtin_method_arity(obj_k, cand) < 0 { return 0 }
+    if tc_builtin_method_arity(obj_k, cand) < 0 && tc_builtin_std_trait(obj_k, cand).is_none() { return 0 }
     1
 }
 
@@ -27657,7 +27716,7 @@ fn tc_trait_need(tid: Int, tr: Str, visiting: List[Int]) -> List[Int] {
         "Eq" => tc_eq_need(tid, visiting)
         "Ord" => tc_ord_need(tid, visiting)
         "Hash" => tc_derive_only_need(tid, tr)
-        "Debug" => tc_derive_only_need(tid, tr)
+        "Debug" => tc_debug_need(tid, visiting)
         "Serialize" => tc_derive_only_need(tid, tr)
         "Clone" => tc_clone_need(tid, visiting)
         _ => []
@@ -27666,38 +27725,48 @@ fn tc_trait_need(tid: Int, tr: Str, visiting: List[Int]) -> List[Int] {
 
 fn tc_derive_only_need(tid0: Int, tr: Str) -> List[Int] {
     let tid = resolve_alias_tid(tc_resolve(tid0))
-    if tr == "Debug" && type_kind(tid) == TyKind.Range { return tc_range_debug_need(tid) }
+    if tr == "Debug" { return tc_debug_need(tid, []) }
     if tc_derive_only_fact(tid, tr) == -1 { return [tid] }
     []
 }
 
-// A range is Debug when its bound type is, so the chain goes on to the bound. A bound that
-// is a type parameter needs `Debug` among its own bounds, since the compiler adds no bound
-// the user did not write (sections/03_types.md *No implied bounds*). A tuple has no debug()
-// yet, so a tuple bound is reported here rather than reaching codegen with nothing to call.
-fn tc_range_debug_need(tid: Int) -> List[Int] {
-    let bound = resolve_alias_tid(tc_resolve(tc_tid_child(tid, 0)))
-    let mut inner: List[Int] = []
-    if type_kind(bound) == TyKind.Typevar {
-        let traits = tc_tparam_bound_traits(type_to_str(bound))
-        if traits != "" && tc_pipe_has(traits, "Debug") == 0 { inner = [bound] }
-    } else if type_kind(bound) == TyKind.Tuple {
-        inner = [bound]
-    } else {
-        inner = tc_derive_only_need(bound, "Debug")
+// What `debug` needs of `tid` that it lacks. A container, a tuple and a range are `Debug`
+// when each part is (§3.6 *Traits of Range[T]*, *Built-in Trait Implementations*), so the
+// chain goes on to the part. A type parameter needs `Debug` among its own bounds, since the
+// compiler adds no bound the user did not write (sections/03_types.md *No implied bounds*).
+fn tc_debug_need(tid0: Int, visiting: List[Int]) -> List[Int] {
+    let tid = resolve_alias_tid(tc_resolve(tid0))
+    if tc_tid_is_no_info(tid) != 0 || tc_tid_has_unbound_metavar(tid) != 0 { return [] }
+    let t = ty_pool.get(tid).unwrap()
+    let k = t.kind
+    if k == TyKind.Typevar {
+        let traits = tc_tparam_bound_traits(type_to_str(tid))
+        if traits != "" && tc_pipe_has(traits, "Debug") == 0 { return [tid] }
+        return []
     }
-    if inner.len() == 0 { return [] }
-    let mut path = [tid]
-    for t in inner { path.push(t) }
-    path
+    let mut parts: List[Int] = []
+    if k == TyKind.List || k == TyKind.Option || k == TyKind.Set || k == TyKind.Range { parts = [t.inner1] }
+    if k == TyKind.Map || k == TyKind.Result { parts = [t.inner1, t.inner2] }
+    if k == TyKind.Tuple { parts = tc_tuple_elem_tids(tid) }
+    if parts.len() > 0 {
+        for p in parts {
+            let need = tc_debug_need(p, visiting)
+            if need.len() > 0 { return eq_need_through(tid, need) }
+        }
+        return []
+    }
+    if k == TyKind.Bytes { return [] }
+    // The trait table gives a function and the unit value no `Debug`.
+    if k == TyKind.Fn || k == TyKind.Void { return [tid] }
+    if tc_derive_only_fact(tid, "Debug") == -1 { return [tid] }
+    []
 }
 
-// What a clone of `tid` needs that it lacks, for a range and its parts: `Range[T]` is `Clone` when `T` is,
-// and each bound is copied by the `clone` of `T` (§3.6.1 *Clone Semantics*). The chain goes
-// through the carriers whose clone copies each part by its own `clone`; a shared cell is
-// `Clone` whatever it holds. A type parameter needs `Clone` among its own bounds. A written
-// impl answers where its own bounds hold, as an `Eq` impl does. A tuple has no clone() yet, so
-// it ends the chain.
+// What a clone of `tid` needs that it lacks: `Range[T]`, `Option[T]`, `Result[T, E]` and a
+// tuple are `Clone` when each part is, since their clone copies each part by its own `clone`
+// (§3.6.1 *Clone Semantics*). A shared cell is `Clone` whatever it holds. A type parameter
+// needs `Clone` among its own bounds. A written impl answers where its own bounds hold, as an
+// `Eq` impl does.
 fn tc_clone_need(tid0: Int, visiting: List[Int]) -> List[Int] {
     let tid = resolve_alias_tid(tc_resolve(tid0))
     let k = type_kind(tid)
@@ -27712,26 +27781,348 @@ fn tc_clone_need(tid0: Int, visiting: List[Int]) -> List[Int] {
         if tc_type_name_derives(bname, "Clone") != 0 { return [] }
         return tc_hand_impl_need(tid, base, "Clone", "clone", visiting) ?? [tid]
     }
-    if k == TyKind.Tuple { return [tid] }
-    if k == TyKind.Range || k == TyKind.Option || k == TyKind.Result {
+    let parts = if k == TyKind.Tuple { tc_tuple_elem_tids(tid) } else if k == TyKind.Range || k == TyKind.Option || k == TyKind.Result {
+        let mut ps: List[Int] = []
         let mut i = 0
         while i < tc_tid_child_count(tid) {
-            let inner = tc_clone_need(tc_tid_child(tid, i), visiting)
-            if inner.len() > 0 {
-                let mut path = [tid]
-                for t in inner { path.push(t) }
-                return path
-            }
+            ps.push(tc_tid_child(tid, i))
             i = i + 1
         }
+        ps
+    } else { [] }
+    for p in parts {
+        let inner = tc_clone_need(p, visiting)
+        if inner.len() > 0 { return eq_need_through(tid, inner) }
     }
     []
+}
+
+// The std trait methods each built-in type answers with no impl to resolve (sections/03_types.md
+// *Built-in Trait Implementations*), as the trait that owns the method.
+fn tc_builtin_std_trait(k: TyKind, method: Str) -> Option[Str] {
+    if k == TyKind.Struct || k == TyKind.Enum || k == TyKind.Typevar || k == TyKind.Unknown { return None }
+    if !tc_kind_has_std_traits(k) { return None }
+    match method {
+        "clone" => Some("Clone")
+        "debug" => Some("Debug")
+        "hash" => Some("Hash")
+        "eq" => Some("Eq")
+        "cmp" => Some("Ord")
+        _ => None
+    }
+}
+
+fn tc_kind_has_std_traits(k: TyKind) -> Bool {
+    if k == TyKind.Int || k == TyKind.Float || k == TyKind.Bool || k == TyKind.Char || k == TyKind.Str { return true }
+    if k == TyKind.Bytes || is_sized_int(k) || k == TyKind.Tuple || k == TyKind.Range { return true }
+    k == TyKind.List || k == TyKind.Map || k == TyKind.Set || k == TyKind.Option || k == TyKind.Result
+}
+
+// The method of `tr` on `tid` that the compiler cannot build yet, as the words that end "the
+// compiler cannot ...", or None when it is built. The spec gives each of these types the
+// trait, so this is a TypeError that names a missing engine, and never an unmet trait.
+fn tc_std_trait_unbuilt(tid0: Int, tr: Str) -> Option[Str] {
+    let tid = resolve_alias_tid(tc_resolve(tid0))
+    if tc_tid_is_no_info(tid) != 0 { return None }
+    match tr {
+        "Debug" => tc_debug_unbuilt(tid, true)
+        "Clone" => tc_clone_unbuilt(tid, true)
+        "Hash" => if type_kind(tid) == TyKind.Tuple { Some("hash a tuple through a method call") } else { None }
+        "Ord" => tc_ord_unbuilt(tid)
+        _ => None
+    }
+}
+
+// A struct or an enum answers its own `debug`. Inside a list, an option, a map or a range, the
+// text is built from the derived `debug`, so a written one is not called there.
+fn tc_debug_unbuilt(tid0: Int, top: Bool) -> Option[Str] {
+    let tid = resolve_alias_tid(tc_resolve(tid0))
+    if tc_tid_is_no_info(tid) != 0 { return None }
+    let t = ty_pool.get(tid).unwrap()
+    let k = t.kind
+    if k == TyKind.Tuple { return Some("write the debug text of a tuple") }
+    if k == TyKind.Result { return Some("write the debug text of a Result") }
+    if k == TyKind.Set { return Some("write the debug text of a Set") }
+    if k == TyKind.Bytes { return Some("write the debug text of a Bytes") }
+    if k == TyKind.Struct || k == TyKind.Enum {
+        if top { return None }
+        let base = if k == TyKind.Struct { tc_struct_base_tid(tid) } else { tc_enum_base_tid(tid) }
+        let bname = strip_module_qualifier(tc_type_name(base))
+        if tc_type_name_derives(bname, "Debug") != 0 { return None }
+        return Some("call the written `debug` of `{bname}` inside another value")
+    }
+    if k == TyKind.List || k == TyKind.Option || k == TyKind.Range { return tc_debug_unbuilt(t.inner1, false) }
+    if k == TyKind.Map {
+        match tc_debug_unbuilt(t.inner1, false) {
+            Some(why) => { return Some(why) }
+            None => {}
+        }
+        return tc_debug_unbuilt(t.inner2, false)
+    }
+    None
+}
+
+// A carrier and a tuple copy each part by its own `clone`, and that copy is built only where
+// the part's clone is the value itself. A range calls the written `clone` of its bound type.
+// A Bytes is a value whose copy is not built: a bind of one shares its bytes. A type
+// parameter inside another value may stand for a type with a written `clone`, which the
+// carrier's copy does not call.
+fn tc_clone_unbuilt(tid0: Int, top: Bool) -> Option[Str] {
+    let tid = resolve_alias_tid(tc_resolve(tid0))
+    if tc_tid_is_no_info(tid) != 0 { return None }
+    let k = type_kind(tid)
+    if k == TyKind.Bytes { return Some("copy a Bytes") }
+    if k == TyKind.Typevar {
+        if top { return None }
+        return Some("copy a type parameter inside another value")
+    }
+    if k == TyKind.Struct || k == TyKind.Enum {
+        if top { return None }
+        let base = if k == TyKind.Struct { tc_struct_base_tid(tid) } else { tc_enum_base_tid(tid) }
+        let bname = strip_module_qualifier(tc_type_name(base))
+        if tc_type_name_derives(bname, "Clone") != 0 || !tc_type_writes_trait_method(bname, "clone", "Clone") { return None }
+        return Some("call the written `clone` of `{bname}` inside another value")
+    }
+    if k == TyKind.Range { return tc_clone_unbuilt(tc_tid_child(tid, 0), top) }
+    let parts = if k == TyKind.Tuple { tc_tuple_elem_tids(tid) } else if k == TyKind.Option || k == TyKind.Result {
+        let mut ps: List[Int] = []
+        let mut i = 0
+        while i < tc_tid_child_count(tid) {
+            ps.push(tc_tid_child(tid, i))
+            i = i + 1
+        }
+        ps
+    } else { [] }
+    for p in parts {
+        match tc_clone_unbuilt(p, false) {
+            Some(why) => { return Some(why) }
+            None => {}
+        }
+    }
+    None
+}
+
+// The std trait whose method `method` the compiler answers itself on `tid0`, or None. A
+// built-in type answers by the trait table; a fieldless enum is `Eq` and `Ord` by its tag
+// with no derive (sections/03_types.md *Enums*), so its `eq` and `cmp` are the compiler's
+// where no derive or written impl gives the type its own.
+pub fn tc_std_trait_owner(tid0: Int, method: Str) -> Option[Str] {
+    let tid = resolve_alias_tid(tc_resolve(tid0))
+    let k = type_kind(tid)
+    if k == TyKind.Enum {
+        if tc_enum_has_payload(tid) { return None }
+        let name = strip_module_qualifier(tc_type_name(tc_enum_base_tid(tid)))
+        if method == "eq" && tc_type_has_eq_impl(name) == 0 { return Some("Eq") }
+        if method == "cmp" && tc_type_has_ord_impl(name) == 0 { return Some("Ord") }
+        return None
+    }
+    tc_builtin_std_trait(k, method)
+}
+
+// The type a std trait method answers on a receiver of type `obj_t`.
+fn tc_std_trait_ret(obj_t: Int, method: Str) -> Int {
+    match method {
+        "clone" => obj_t
+        "debug" => TYPE_STR
+        "hash" => TYPE_U64
+        "eq" => TYPE_BOOL
+        _ => tc_compiler_known_tid("Ordering")
+    }
+}
+
+// A std trait method that tc_std_trait_owner gives the compiler, in either spelling: judged
+// by the trait's own signature with `Self` as the receiver's type, refused where the type
+// lacks the trait, and refused as not built where the compiler cannot build it yet.
+// `self_offset` is 1 for `x.m(..)` and 0 for `Tr.m(x, ..)`, which writes the receiver as its
+// first argument.
+fn tc_std_trait_call(node: Int, obj_t: Int, recv_node: Int, tr: Str, shown_trait: Str, method: Str, args_sl: Int, self_offset: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    let tm = match tc_trait_method_entry(tr, method) {
+        Some(e) => e
+        None => { return tc_error_recovery_tid() }
+    }
+    let shown = "{shown_trait}.{method}"
+    let sig = tc_call_view_sig(tm.sig)
+    let start = diag_entry_count()
+    if self_offset == 1 {
+        let _ = check_arg_shapes_with_binds(shown, sig, args_sl, 1, node, tc_self_binds(obj_t))
+    } else {
+        let _ = tc_check_qualified_trait_args(shown, sig, args_sl, node, tc_self_binds(obj_t))
+    }
+    if diag_any_errors_since(start) > 0 { return tc_error_recovery_tid() }
+    if method == "eq" || method == "cmp" {
+        let family = if method == "eq" { NegativeZeroFamily.TrueForBoth } else { NegativeZeroFamily.SameForBoth }
+        tc_warn_negative_zero_method(obj_t, recv_node, args_sl, 1 - self_offset, family)
+    }
+    // The compiler builds the method for one type, so a receiver of no known type has none
+    // to build. A named place may be pinned later, and its binding is judged then.
+    if tc_tid_has_unbound_metavar(obj_t) != 0 {
+        if tc_scrut_is_named_place(recv_node) == 0 && tc_ud_already_blamed(obj_t) == 0 {
+            tc_report_under_determined_at(recv_node, obj_t,
+                "`{method}` is built for one type, and nothing here says which type this value has")
+            return tc_error_recovery_tid()
+        }
+        return tc_std_trait_ret(obj_t, method)
+    }
+    // A hole is what an earlier error left, and that error already speaks for this value.
+    if tc_tid_has_unknown(obj_t) != 0 { return tc_error_recovery_tid() }
+    let need = tc_trait_need(obj_t, tr, [])
+    if need.len() > 0 {
+        // A dotted call finds a method only through an impl for the receiver's type
+        // (sections/03c_protocols.md *Trait Method Lookup*). A type with no impl of the trait at
+        // all has no such method; a type whose impl asks more of an inner type has one, unmet.
+        if self_offset == 1 && need.len() == 1 {
+            let mut notes = ["`{type_to_str(obj_t)}` does not implement `{tc_core_trait_shown(tr)}`"]
+            for n in tc_trait_need_notes(need, tr) { notes.push(n) }
+            diag_error_at_notes("UnresolvedMethod", UNRESOLVED_METHOD, "no method `{method}` on `{type_to_str(obj_t)}`", node,
+                tc_trait_need_fixes(obj_t, tc_need_fix_trait(need, tr)).join("\n"), notes)
+        } else {
+            tc_report_trait_need(need, tr, node)
+        }
+        return tc_error_recovery_tid()
+    }
+    match tc_std_trait_unbuilt(obj_t, tr) {
+        Some(why) => {
+            tc_error_at_code("`{method}` on `{type_to_str(obj_t)}` is not built yet: the compiler cannot {why}", node, "TypeError", TYPE_ERROR,
+                tc_std_trait_unbuilt_help(method))
+            return tc_error_recovery_tid()
+        }
+        None => {}
+    }
+    tc_std_trait_ret(obj_t, method)
+}
+
+// The traits this module can see that give the type of `obj_t` a method `method`, other than
+// the std trait `tr`. Only a type an impl header can name has any.
+fn tc_std_method_user_owners(obj_t: Int, tr: Str, method: Str) -> List[Str] {
+    let k = type_kind(obj_t)
+    let tname = if k == TyKind.Enum { ty_pool.get(obj_t).unwrap().name } else { tc_builtin_receiver_name(obj_t) }
+    if tname == "" { return [] }
+    let mut users: List[Str] = []
+    let names = tc_trait_names_visible_here(tc_method_distinct_trait_names(tname, method))
+    if names == "" { return users }
+    for key in names.split(" and ") {
+        if key != tr { users.push(key) }
+    }
+    users
+}
+
+// E0522 for an unqualified call whose name a std trait and a user trait both give the
+// receiver's type. The help writes the qualified call of each owner.
+fn tc_std_method_ambiguity(node: Int, obj_t: Int, recv_node: Int, args_sl: Int, tr: Str, method: Str, users: List[Str]) -> Int ! TypeCheck.Report, Diag.Report {
+    let written = tc_written_operand(recv_node).text
+    let mut parts = [if written != "" { written } else { "receiver" }]
+    let mut i = 0
+    while args_sl != -1 && i < sublist_length(args_sl) {
+        let arg = tc_written_operand(sublist_get(args_sl, i)).text
+        parts.push(if arg != "" { arg } else { "..." })
+        i = i + 1
+    }
+    let args = parts.join(", ")
+    let std_shown = tc_core_trait_shown(tr)
+    let mut notes: List[Str] = []
+    let mut calls = ["  {std_shown}.{method}({args})"]
+    for u in users {
+        let shown = tc_trait_shown(u)
+        notes.push("`{method}` is a built-in `{std_shown}` method and is also defined by `{shown}`")
+        calls.push("  {shown}.{method}({args})")
+    }
+    tc_errors.push("ambiguous method call `.{method}`")
+    diag_error_at_notes("AmbiguousMethodCall", AMBIGUOUS_METHOD_CALL,
+        "ambiguous method call: `.{method}` is defined in multiple traits implemented by {type_to_str(obj_t)} ({std_shown} and {tc_traits_shown(users.join(" and "))})", node,
+        "use qualified syntax to disambiguate:\n{calls.join("\n")}", notes)
+    tc_error_recovery_tid()
+}
+
+// The method `method` as the trait `tr` declares it, from the signatures each trait records.
+fn tc_trait_method_entry(tr: Str, method: Str) -> Option[TraitMethodSigEntry] {
+    for tm in tc_tmsig_pool {
+        if tm.trait_name == tr && tm.method == method { return Some(tm) }
+    }
+    None
+}
+
+// The arguments of `Tr.m(x, ..)`: the receiver is parameter 0 (`self`), so the declared
+// count is the call's count. The keyword names, then the count, then each type; a wrong label
+// is named alone, as a method call names it.
+fn tc_check_qualified_trait_args(shown: Str, sig: Int, args_sl: Int, node: Int, binds: Map[Str, Int]) -> List[Int] ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    let want = fnsig_pool.get(sig).unwrap().params_count
+    let kw_bad = tc_check_keyword_args(shown, sig, args_sl, 0, node)
+    // Counted after the keyword check, which appends each omitted defaulted keyword.
+    let given = if args_sl != -1 { sublist_length(args_sl) } else { 0 }
+    if kw_bad == 0 && given != want {
+        tc_error_at("qualified trait call `{shown}` expects {want} argument(s) including the receiver, got {given}", node)
+    }
+    tc_check_arg_types_with_binds(shown, sig, args_sl, 0, binds)
+}
+
+// Whether `method` is the method of the std trait `tr` that the compiler answers itself, on a
+// built-in value or through a derive.
+fn tc_is_std_trait_method(tr: Str, method: Str) -> Bool {
+    let t = tc_trait_node_idx.get(tr) ?? -1
+    t != -1 && node_source_module(t).starts_with("std_") && tc_trait_method(tr) == method
+}
+
+// `Tr.method(x, ..)` over a std trait that no written impl answers: the compiler's own impl on a
+// built-in value, or a derive on a struct or an enum. Neither writes a signature for the
+// qualified rung to read, so the call is judged as `x.method(..)` is. -1 when neither answers.
+fn tc_std_trait_qualified_call(node: Int, shown: Str, tr: Str, method: Str, args_sl: Int, recv: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    let k = type_kind(recv)
+    match tc_std_trait_owner(recv, method) {
+        Some(_) => { return tc_std_trait_call(node, recv, tc_arg_value_at(args_sl, 0), tr, shown, method, args_sl, 0) }
+        None => {}
+    }
+    if k != TyKind.Struct && k != TyKind.Enum { return -1 }
+    // A derive registers its method under the type's own key, with no declaration.
+    let sig = lookup_fnsig("{ty_pool.get(recv).unwrap().name}_{method}")
+    if sig == -1 || fnsig_pool.get(sig).unwrap().decl >= 0 { return -1 }
+    let fs = fnsig_pool.get(sig).unwrap()
+    let mut binds = tc_impl_binds_at_call(sig, recv)
+    for (bk, bv) in tc_self_binds(recv) {
+        if !binds.contains_key(bk) { binds.insert(bk, bv) }
+    }
+    let _ = tc_check_qualified_trait_args("{shown}.{method}", sig, args_sl, node, binds)
+    tc_refuse_derived_method_at(recv, method, node)
+    substitute_typevar_tid(tc_member_tid_at_instance(fs.ret, recv), binds)
+}
+
+fn tc_std_trait_unbuilt_help(method: Str) -> Str {
+    match method {
+        "debug" => "build the text from the parts of the value whose `debug` is built"
+        "clone" => "build the copy from the parts of the value"
+        "hash" => "hash each element and combine the results, or use the tuple as a `Map` or `Set` key"
+        _ => "compare one part of the value at a time"
+    }
+}
+
+// A fieldless enum orders by its tag with no derive, as `<` does, so only a tuple is left.
+fn tc_ord_unbuilt(tid0: Int) -> Option[Str] {
+    if type_kind(resolve_alias_tid(tc_resolve(tid0))) == TyKind.Tuple { return Some("order a tuple") }
+    None
 }
 
 // Whether the instance `tid` has `tr`, by the rule the type checker judged it with. Pure,
 // so codegen emits a derived body only at an instance where the derive holds.
 pub fn tc_instance_has_trait(tid: Int, tr: Str) -> Bool {
     tc_trait_need(tid, tr, []).len() == 0
+}
+
+// Whether the instance `tid` has `tr` and the compiler builds its method, so a reader that
+// takes a value only where it has a text asks for no body that cannot be built.
+pub fn tc_std_trait_built(tid: Int, tr: Str) -> Bool {
+    tc_instance_has_trait(tid, tr) && tc_std_trait_unbuilt(tid, tr).is_none()
+}
+
+// Whether a method call reached a method of a trait a program module declares. Typecheck
+// refuses the call as ambiguous where a std method of the same name also answers, so codegen
+// lowers such a call through the impl and no built-in row answers it.
+pub fn tc_call_reaches_user_trait(call_node: Int) -> Bool {
+    match tc_call_trait(call_node) {
+        Some(key) => {
+            let tr = tc_trait_node_idx.get(key) ?? -1
+            tr != -1 && !node_source_module(tr).starts_with("std_")
+        }
+        None => false
+    }
 }
 
 // What the impls of `tr` written for `base` need of the instance `tid`, or None when no
@@ -27834,6 +28225,9 @@ fn tc_bound_need(arg: Int, tr: Str, visiting: List[Int]) -> List[Int] {
     let need = tc_trait_need(arg, tr, visiting)
     if need.len() > 0 { return need }
     if tc_bound_fact(arg, tr) == -1 { return [arg] }
+    // A std method the compiler cannot build fails the bound as the bound check refuses it,
+    // so no body reaches mono at that type. A Hash bound is left out for the same reason.
+    if tr != "Hash" && tc_std_trait_unbuilt(arg, tr).is_some() { return [arg] }
     tc_user_trait_need(arg, tr, visiting)
 }
 
@@ -28840,8 +29234,8 @@ fn tc_negative_zero_help(other: Int, family: NegativeZeroFamily) -> Str ! Diag.R
 
 // The caller has just checked the argument, so its type is read from the memo: inferring it
 // again would walk each nested call's argument twice per level.
-fn tc_warn_negative_zero_method(obj_t: Int, recv_node: Int, args_sl: Int, family: NegativeZeroFamily) ! Diag.Report {
-    let arg = tc_arg_value_at(args_sl, 0)
+fn tc_warn_negative_zero_method(obj_t: Int, recv_node: Int, args_sl: Int, other_idx: Int, family: NegativeZeroFamily) ! Diag.Report {
+    let arg = tc_arg_value_at(args_sl, other_idx)
     if arg == -1 || !tc_has_written_negative_zero(recv_node, arg) { return }
     if !tc_is_float_comparison(obj_t) || !tc_is_float_comparison(tc_lookup_node_tid(arg)) { return }
     tc_warn_negative_zero_pair(recv_node, arg, family)
@@ -30463,6 +30857,21 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
             }
         }
 
+        // A std trait method the compiler answers itself, judged by the trait's signature. A
+        // user trait that gives the same type a method of the name is a second owner, and no
+        // trait ranks above another (sections/03c_protocols.md *Built-in Type Method
+        // Dispatch*). A type without the std trait leaves the user trait the one owner.
+        if qualified == -1 {
+            match tc_std_trait_owner(obj_t, method) {
+                Some(tr) => {
+                    let users = tc_std_method_user_owners(obj_t, tr, method)
+                    if users.len() == 0 { return tc_std_trait_call(node, obj_t, recv_node, tr, tc_core_trait_shown(tr), method, args_sl, 1) }
+                    if tc_instance_has_trait(obj_t, tr) { return tc_std_method_ambiguity(node, obj_t, recv_node, args_sl, tr, method, users) }
+                }
+                None => {}
+            }
+        }
+
         // A builtin method has no fnsig, so nothing counted the arguments a caller wrote:
         // the count is implicit in which arm below answers, and an arm that never asks about
         // an index — every nullary method — could not notice a surplus at all. Ask the table
@@ -30483,20 +30892,6 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
         if obj_k == TyKind.Int || obj_k == TyKind.Float || obj_k == TyKind.Bool || obj_k == TyKind.Str || obj_k == TyKind.Char {
             if method == "display" { return TYPE_STR }
             if method == "fmt" { return TYPE_VOID }
-        }
-
-        // `Range[T]` is `Debug` and `Clone` when `T` is (§3.6 *Traits of Range[T]*).
-        if obj_k == TyKind.Range && method == "debug" {
-            let need = tc_range_debug_need(resolve_alias_tid(tc_resolve(obj_t)))
-            if need.len() == 0 { return TYPE_STR }
-            tc_report_trait_need(need, "Debug", node)
-            return tc_error_recovery_tid()
-        }
-        if obj_k == TyKind.Range && method == "clone" {
-            let need = tc_clone_need(obj_t, [])
-            if need.len() == 0 { return obj_t }
-            tc_report_trait_need(need, "Clone", node)
-            return tc_error_recovery_tid()
         }
 
         // `.into_iter()` is the crossing door into the lazy world (§3c.1:11-18, IntoIterator
@@ -30884,19 +31279,6 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
             }
         }
 
-        // The explicit forms of a scalar's `==` and `<`, against one value of the receiver's
-        // own type, with the Ordering the prelude declares.
-        if method == "eq" && tc_scalar_has_eq(obj_k) {
-            check_builtin_arg(method, 0, obj_t, args_sl, tc_builtin_recv_label(obj_k))
-            tc_warn_negative_zero_method(obj_t, recv_node, args_sl, NegativeZeroFamily.TrueForBoth)
-            return TYPE_BOOL
-        }
-        if method == "cmp" && tc_scalar_has_ord(obj_k) {
-            check_builtin_arg(method, 0, obj_t, args_sl, tc_builtin_recv_label(obj_k))
-            tc_warn_negative_zero_method(obj_t, recv_node, args_sl, NegativeZeroFamily.SameForBoth)
-            return tc_compiler_known_tid("Ordering")
-        }
-
         if obj_k == TyKind.Str {
             if method == "len" { return TYPE_INT }
             // The one Ptr-producing method the spec states outright AND codegen agrees with:
@@ -30991,7 +31373,7 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
             if method == "is_sign_negative" { return TYPE_BOOL }
             if method == "ieee_eq" {
                 check_builtin_arg(method, 0, TYPE_FLOAT, args_sl, "Float")
-                tc_warn_negative_zero_method(obj_t, recv_node, args_sl, NegativeZeroFamily.TrueForBoth)
+                tc_warn_negative_zero_method(obj_t, recv_node, args_sl, 0, NegativeZeroFamily.TrueForBoth)
                 return TYPE_BOOL
             }
         }
@@ -31830,7 +32212,7 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                     tc_error_at("qualified trait call `{obj_name}.{method}` expects the receiver as its first argument, got none", node)
                     return tc_error_recovery_tid()
                 }
-                let qt_recv = infer_type(sublist_get(qt_args, 0))
+                let qt_recv = infer_type(tc_arg_value_at(qt_args, 0))
                 let qt_k = type_kind(qt_recv)
                 // A receiver that is a BOUNDED type parameter — the spec's own
                 // `fn show[T: Describe](v: T) { Describe.describe(v) }` form (:706). No impl
@@ -31878,20 +32260,12 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                         while qv < tc_tmsig_pool.len() {
                             let qtm = tc_tmsig_pool.get(qv).unwrap()
                             if qtm.trait_name == qt_trait && qtm.method == method {
-                                // The receiver IS param 0 (`self`), so the declared param count
-                                // is the qualified form's arity exactly, as it is on the concrete
-                                // path below.
-                                let qtm_kw_bad = tc_check_keyword_args("{obj_name}.{method}", qtm.sig, qt_args, 0, node)
-                                let qtm_filled = if qt_args != -1 { sublist_length(qt_args) } else { 0 }
-                                if qtm_kw_bad == 0 && qtm_filled != qtm.params_count {
-                                    tc_error_at("qualified trait call `{obj_name}.{method}` expects {qtm.params_count} argument(s) including the receiver, got {qtm_filled}", node)
-                                }
                                 let qt_insts = tc_bound_trait_instances(tc_tid_binder(qt_recv), qt_trait)
                                 if qt_insts.len() >= 2 { return tc_bound_instance_ambiguity(node, "{obj_name}.{method}", qt_tp, qt_trait, method, qt_insts) }
                                 let qt_bound_args = tc_bound_trait_arg_tids(tc_tid_binder(qt_recv), qt_trait)
                                 let qtm_binds = tc_bound_call_binds(qt_recv, qv, qt_bound_args)
                                 if qt_bound_args.len() > 0 { tc_method_calls.bound_args.insert(node, qt_bound_args) }
-                                let _ = tc_check_arg_types_with_binds("{obj_name}.{method}", qtm.sig, qt_args, 0, qtm_binds)
+                                let _ = tc_check_qualified_trait_args("{obj_name}.{method}", qtm.sig, qt_args, node, qtm_binds)
                                 return substitute_typevar_tid(qtm.ret_tid, qtm_binds)
                             }
                             qv = qv + 1
@@ -31918,24 +32292,13 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                     }
                     if qt_sig != -1 {
                         let qt_fs = fnsig_pool.get(qt_sig).unwrap()
-                        // The receiver IS param 0 (`self`), so the qualified form's arity is
-                        // the declared param count exactly and check_arg_shapes runs at
-                        // self_offset 0, where the instance path uses 1. `self` itself has no
-                        // annotation, so its param tid is Unknown and check_arg_shapes skips
-                        // it — the receiver's own type was already established by the
-                        // fnsig key.
-                        let qt_kw_bad = tc_check_keyword_args("{obj_name}.{method}", qt_sig, qt_args, 0, node)
-                        let qt_filled = if qt_args != -1 { sublist_length(qt_args) } else { 0 }
-                        if qt_kw_bad == 0 && qt_filled != qt_fs.params_count {
-                            tc_error_at("qualified trait call `{obj_name}.{method}` expects {qt_fs.params_count} argument(s) including the receiver, got {qt_filled}", node)
-                        }
                         // The receiver's type arguments answer a per-instance impl's binders,
                         // as on the instance path.
                         let mut qt_ibinds = tc_impl_binds_at_call(qt_sig, qt_recv)
                         for (k, v) in tc_self_binds(qt_recv) {
                             if !qt_ibinds.contains_key(k) { qt_ibinds.insert(k, v) }
                         }
-                        let qt_tids = tc_check_arg_types_with_binds("{obj_name}.{method}", qt_sig, qt_args, 0, qt_ibinds)
+                        let qt_tids = tc_check_qualified_trait_args("{obj_name}.{method}", qt_sig, qt_args, node, qt_ibinds)
                         nr_note_call_decl(node, qt_fs.decl)
                         if tc_decl_has_own_type_params(qt_fs.decl) != 0 {
                             return substitute_typevar_tid(instantiate_return_type(qt_sig, qt_tids, node, 0), qt_ibinds)
@@ -31963,6 +32326,10 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                         diag_error_at("UnresolvedMethod", UNRESOLVED_METHOD, "trait `{obj_name}` does not define method `{method}`", node, qt_help)
                         return tc_error_recovery_tid()
                     }
+                }
+                if tc_is_std_trait_method(qt_trait, method) {
+                    let qt_std = tc_std_trait_qualified_call(node, obj_name, qt_trait, method, qt_args, qt_recv)
+                    if qt_std != -1 { return qt_std }
                 }
                 // No answer above, and no impl of the trait can hold for this receiver: the call
                 // has no method to run, so it reports as `x.method()` does.

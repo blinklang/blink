@@ -1,0 +1,85 @@
+// A user trait that gives a built-in type a method named like a std trait method makes an
+// unqualified call of that name have two owners, so it is AmbiguousMethodCall (E0522). The note
+// names the built-in trait and the help gives the qualified call of each owner. A bound or a
+// qualified call names one owner and resolves, and a type that lacks the std trait leaves the
+// user trait as the one owner (sections/03c_protocols.md *Built-in Type Method Dispatch*).
+
+
+import std.fs
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_reset}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+import std.io
+
+fn typecheck_probe(path: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    init_embedded_stdlib()
+    fs.write(path, src).unwrap()
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+}
+
+// Each error as "name: message | note | note | help: help".
+fn errors_of(src: Str) -> List[Str] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    typecheck_probe("build/test_typecheck_a_std_method_name_with_a_user_owner_probe.bl", src)
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" {
+            let mut line = "{d.name}: {d.message}"
+            for n in d.notes { line = "{line} | {n}" }
+            out.push("{line} | help: {d.help}")
+        }
+    }
+    for e in out { io.println("  diag: {e}") }
+    out
+}
+
+fn body(decls: Str, stmts: Str) -> Str {
+    "{decls}fn main() \{\n{stmts}}\n"
+}
+
+fn one_error(src: Str) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    let errs = errors_of(src)
+    assert_eq(errs.len(), 1)
+    errs.get(0).unwrap()
+}
+
+let SHOW = "trait UaShow \{\n    fn debug(self) -> Str\n}\nimpl UaShow for Int \{\n    fn debug(self) -> Str \{ \"mine\" }\n}\nimpl[T] UaShow for List[T] \{\n    fn debug(self) -> Str \{ \"mine\" }\n}\n"
+
+let HASH = "trait UaHash \{\n    fn hash(self) -> U64\n}\nimpl UaHash for Str \{\n    fn hash(self) -> U64 \{ 42 }\n}\nimpl UaHash for Float \{\n    fn hash(self) -> U64 \{ 5 }\n}\n"
+
+fn assert_ambiguous(e: Str, method: Str, tr: Str, user: Str) {
+    assert(e.starts_with("AmbiguousMethodCall: "), e)
+    assert(e.contains("`{method}` is a built-in `{tr}` method and is also defined by `{user}`"), e)
+    assert(e.contains("{tr}.{method}(") && e.contains("{user}.{method}("), e)
+}
+
+test "an unqualified call with a std owner and a user owner is ambiguous" {
+    assert_ambiguous(one_error(body(HASH, "    let _ = \"a\".hash()\n")), "hash", "Hash", "UaHash")
+    assert_ambiguous(one_error(body(SHOW, "    let _ = 3.debug()\n")), "debug", "Debug", "UaShow")
+    assert_ambiguous(one_error(body(SHOW, "    let _ = [1, 2].debug()\n")), "debug", "Debug", "UaShow")
+}
+
+test "the user method's own signature does not take the call from the std owner" {
+    let cmp = "trait UaOrder \{\n    fn cmp(self, other: Int) -> Int\n}\nimpl UaOrder for Int \{\n    fn cmp(self, other: Int) -> Int \{ other }\n}\n"
+    assert_ambiguous(one_error(body(cmp, "    let _ = 5.cmp(2)\n")), "cmp", "Ord", "UaOrder")
+    let seed = "trait UaSeed \{\n    fn hash(self, seed: Int) -> Int\n}\nimpl UaSeed for Int \{\n    fn hash(self, seed: Int) -> Int \{ seed }\n}\n"
+    assert_ambiguous(one_error(body(seed, "    let a = 3\n    let _ = a.hash(5)\n")), "hash", "Hash", "UaSeed")
+}
+
+test "a call on self inside the user impl is ambiguous too" {
+    let twice = "trait UaTwice \{\n    fn clone(self) -> Int\n}\nimpl UaTwice for Int \{\n    fn clone(self) -> Int \{ self.clone() }\n}\nfn main() \{\n}\n"
+    assert_ambiguous(one_error(twice), "clone", "Clone", "UaTwice")
+}
+
+test "a bound or a qualified call names one owner" {
+    let bounds = "fn ua_show[T: UaShow](x: T) -> Str \{\n    x.debug()\n}\nfn ua_std[T: Debug](x: T) -> Str \{\n    x.debug()\n}\n"
+    assert_eq(errors_of(body("{SHOW}{bounds}", "    let _ = ua_show(3)\n    let _ = ua_std(3)\n")).len(), 0)
+    assert_eq(errors_of(body("{SHOW}{HASH}", "    let _ = UaShow.debug(3)\n    let _ = Debug.debug(3)\n    let _ = UaHash.hash(\"a\")\n    let _ = Hash.hash(\"a\")\n")).len(), 0)
+}
+
+test "a built-in type without the std trait leaves the user trait as the one owner" {
+    assert_eq(errors_of(body(HASH, "    let _ = 1.5.hash()\n")).len(), 0)
+}

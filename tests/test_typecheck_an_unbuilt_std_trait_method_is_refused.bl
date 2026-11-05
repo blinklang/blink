@@ -1,0 +1,194 @@
+// A built-in type that has a std trait by the spec, but whose method the compiler cannot build
+// yet, is refused at check with a TypeError that says so: at a method call on the value and at
+// a bound that would call the method. A type without the trait is refused as an unmet trait,
+// which names the part that lacks it (sections/03_types.md *Clone Semantics*, *Built-in Trait
+// Implementations*).
+
+import std.fs
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_reset}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+import std.io
+
+fn typecheck_probe(path: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    init_embedded_stdlib()
+    fs.write(path, src).unwrap()
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+}
+
+// Each error as "name: message | note | note | help: help".
+fn errors_of(src: Str) -> List[Str] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    typecheck_probe("build/test_typecheck_an_unbuilt_std_trait_method_probe.bl", src)
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" {
+            let mut line = "{d.name}: {d.message}"
+            for n in d.notes { line = "{line} | {n}" }
+            out.push("{line} | help: {d.help}")
+        }
+    }
+    for e in out { io.println("  diag: {e}") }
+    out
+}
+
+fn body(decls: Str, stmts: Str) -> Str {
+    "{decls}fn main() \{\n{stmts}}\n"
+}
+
+fn one_error(src: Str) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    let errs = errors_of(src)
+    assert_eq(errs.len(), 1)
+    errs.get(0).unwrap()
+}
+
+let BOUNDS = "fn ub_dup[T: Clone](x: T) -> T \{\n    x.clone()\n}\nfn ub_show[T: Debug](x: T) -> Str \{\n    x.debug()\n}\nfn ub_order[T: Ord](a: T, b: T) -> Ordering \{\n    a.cmp(b)\n}\n"
+
+let WRITTEN_CLONE = "type UbWritten \{\n    a: Int\n}\nimpl Clone for UbWritten \{\n    fn clone(self) -> UbWritten \{ UbWritten \{ a: self.a } }\n}\n"
+
+test "the debug text of a tuple is not built yet" {
+    let e = one_error(body("", "    let _ = (1, 2).debug()\n"))
+    assert(e.starts_with("TypeError: "), e)
+    assert(e.contains("`debug` on `(Int, Int)` is not built yet: the compiler cannot write the debug text of a tuple"), e)
+}
+
+test "the debug text of a Result, a Set or a Bytes is not built yet" {
+    let ok = one_error(body("", "    let r: Result[Int, Str] = Ok(1)\n    let _ = r.debug()\n"))
+    assert(ok.contains("`debug` on `Result[Int, Str]` is not built yet: the compiler cannot write the debug text of a Result"), ok)
+    let set = one_error(body("", "    let s: Set[Int] = Set()\n    let _ = s.debug()\n"))
+    assert(set.contains("`debug` on `Set[Int]` is not built yet: the compiler cannot write the debug text of a Set"), set)
+    let bytes = one_error(body("", "    let b = Bytes.new()\n    let _ = b.debug()\n"))
+    assert(bytes.contains("`debug` on `Bytes` is not built yet: the compiler cannot write the debug text of a Bytes"), bytes)
+}
+
+test "the debug text of a list of tuples is not built yet" {
+    let e = one_error(body("", "    let _ = [(1, 2)].debug()\n"))
+    assert(e.contains("`debug` on `List[(Int, Int)]` is not built yet: the compiler cannot write the debug text of a tuple"), e)
+}
+
+test "a Debug bound at a tuple is not built yet" {
+    let e = one_error(body(BOUNDS, "    let _ = ub_show((1, 2))\n"))
+    assert(e.starts_with("TypeError: "), e)
+    assert(e.contains("the Debug bound on type parameter T is not built yet for `(Int, Int)`: the compiler cannot write the debug text of a tuple"), e)
+}
+
+test "a list of a type with no Debug does not implement Debug" {
+    let decls = "type UbNoDebug \{\n    a: Int\n}\n"
+    let direct = one_error(body(decls, "    let _ = [UbNoDebug \{ a: 1 }].debug()\n"))
+    assert(direct.contains("`List[UbNoDebug]` does not implement `Debug`"), direct)
+    let bound = one_error(body("{decls}{BOUNDS}", "    let _ = ub_show([UbNoDebug \{ a: 1 }])\n"))
+    assert(bound.contains("TraitBoundNotSatisfied"), bound)
+    assert(bound.contains("`List[UbNoDebug]` does not satisfy the Debug bound on type parameter T"), bound)
+}
+
+test "the clone of a Bytes is not built yet" {
+    let e = one_error(body("", "    let b = Bytes.new()\n    let _ = b.clone()\n"))
+    assert(e.contains("`clone` on `Bytes` is not built yet: the compiler cannot copy a Bytes"), e)
+    let bound = one_error(body(BOUNDS, "    let _ = ub_dup(Bytes.new())\n"))
+    assert(bound.contains("the Clone bound on type parameter T is not built yet for `Bytes`"), bound)
+}
+
+test "the clone of an option of a written Clone is not built yet" {
+    let e = one_error(body(WRITTEN_CLONE, "    let _ = Some(UbWritten \{ a: 1 }).clone()\n"))
+    assert(e.contains("`clone` on `Option[UbWritten]` is not built yet: the compiler cannot call the written `clone` of `UbWritten` inside another value"), e)
+    let bound = one_error(body("{WRITTEN_CLONE}{BOUNDS}", "    let _ = ub_dup((UbWritten \{ a: 1 }, 2))\n"))
+    assert(bound.contains("the Clone bound on type parameter T is not built yet for `(UbWritten, Int)`"), bound)
+}
+
+test "a written Clone is called on its own value and through a bound" {
+    assert_eq(errors_of(body(WRITTEN_CLONE, "    let _ = UbWritten \{ a: 1 }.clone()\n")).len(), 0)
+    assert_eq(errors_of(body("{WRITTEN_CLONE}{BOUNDS}", "    let _ = ub_dup(UbWritten \{ a: 1 })\n")).len(), 0)
+}
+
+test "the hash of a tuple through a method call is not built yet" {
+    let e = one_error(body("", "    let _ = (1, 2).hash()\n"))
+    assert(e.contains("`hash` on `(Int, Int)` is not built yet: the compiler cannot hash a tuple through a method call"), e)
+}
+
+test "a type with no Hash impl has no hash method" {
+    let f = one_error(body("", "    let _ = 1.5.hash()\n"))
+    assert(f.starts_with("UnresolvedMethod: no method `hash` on `Float`"), f)
+    assert(f.contains("`Float` does not implement `Hash`"), f)
+    let l = one_error(body("", "    let _ = [1].hash()\n"))
+    assert(l.starts_with("UnresolvedMethod: no method `hash` on `List[Int]`"), l)
+    assert(l.contains("`List[Int]` does not implement `Hash`"), l)
+    let q = one_error(body("", "    let _ = Hash.hash(1.5)\n"))
+    assert(q.starts_with("TypeError: `Float` does not implement `Hash`"), q)
+}
+
+test "the order of a tuple is not built yet" {
+    let e = one_error(body("", "    let _ = (1, 2).cmp((1, 3))\n"))
+    assert(e.contains("`cmp` on `(Int, Int)` is not built yet: the compiler cannot order a tuple"), e)
+    let bound = one_error(body(BOUNDS, "    let _ = ub_order((1, 2), (1, 3))\n"))
+    assert(bound.contains("the Ord bound on type parameter T is not built yet for `(Int, Int)`: the compiler cannot order a tuple"), bound)
+}
+
+test "a std trait method on a built-in value takes the trait's argument count" {
+    let e = one_error(body("", "    let _ = 7.clone(1)\n"))
+    assert(e.contains("clone"), e)
+    let eq = one_error(body("", "    let _ = [1].eq()\n"))
+    assert(eq.contains("eq"), eq)
+}
+
+test "eq takes a value of the receiver's own type" {
+    let e = one_error(body("", "    let _ = [1].eq([\"a\"])\n"))
+    assert(e.contains("eq"), e)
+}
+
+test "the clone of a carrier or a tuple of a type parameter is not built yet in a generic body" {
+    let opt = one_error("fn ub_wrap[T: Clone](x: T) -> Option[T] \{\n    Some(x).clone()\n}\nfn main() \{\n    let _ = ub_wrap(1)\n}\n")
+    assert(opt.contains("`clone` on `Option[T]` is not built yet: the compiler cannot copy a type parameter inside another value"), opt)
+    let pair = one_error("fn ub_pair[T: Clone](x: T) -> (T, Int) \{\n    (x, 1).clone()\n}\nfn main() \{\n    let _ = ub_pair(1)\n}\n")
+    assert(pair.contains("`clone` on `(T, Int)` is not built yet: the compiler cannot copy a type parameter inside another value"), pair)
+    let qual = one_error("fn ub_qual[T: Clone](x: T) -> Option[T] \{\n    Clone.clone(Some(x))\n}\nfn main() \{\n    let _ = ub_qual(1)\n}\n")
+    assert(qual.contains("`clone` on `Option[T]` is not built yet"), qual)
+    let forwarded = one_error("fn ub_dup[U: Clone](u: U) -> U \{\n    u.clone()\n}\nfn ub_fwd[T: Clone](x: T) -> Option[T] \{\n    ub_dup(Some(x))\n}\nfn main() \{\n    let _ = ub_fwd(1)\n}\n")
+    assert(forwarded.contains("not built yet"), forwarded)
+}
+
+test "the debug text of a carrier of a type parameter is built in a generic body" {
+    assert_eq(errors_of("fn ub_some[T: Debug](x: T) -> Str \{\n    Some(x).debug()\n}\nfn main() \{\n    let _ = ub_some(1)\n}\n").len(), 0)
+}
+
+let IMPL_BOUND = "trait UbShow \{\n    fn show(self) -> Str\n}\ntype UbWrap[T] \{\n    v: T\n}\nimpl[T: Debug] UbShow for UbWrap[T] \{\n    fn show(self) -> Str \{ self.v.debug() }\n}\nfn ub_via[T: UbShow](x: T) -> Str \{\n    x.show()\n}\n"
+
+test "an impl bound at a type whose method is not built is refused" {
+    let direct = one_error(body(IMPL_BOUND, "    let _ = UbWrap \{ v: (1, 2) }.show()\n"))
+    assert(direct.contains("(Int, Int)"), direct)
+    assert(direct.contains("not built yet"), direct)
+    let bound = one_error(body(IMPL_BOUND, "    let _ = ub_via(UbWrap \{ v: (1, 2) })\n"))
+    assert(bound.contains("(Int, Int)"), bound)
+    assert(bound.contains("not built yet"), bound)
+    assert_eq(errors_of(body(IMPL_BOUND, "    let _ = UbWrap \{ v: 1 }.show()\n    let _ = ub_via(UbWrap \{ v: 1 })\n")).len(), 0)
+}
+
+test "a function or a unit value does not implement Debug" {
+    let decls = "fn ub_inc(x: Int) -> Int \{\n    x + 1\n}\n"
+    let f = one_error(body(decls, "    let _ = [ub_inc].debug()\n"))
+    assert(f.contains("does not implement `Debug`"), f)
+    let unit = one_error(body("", "    let _ = [()].debug()\n"))
+    assert(unit.contains("does not implement `Debug`"), unit)
+    let bound = one_error(body("{decls}{BOUNDS}", "    let _ = ub_show(Some(ub_inc))\n"))
+    assert(bound.contains("TraitBoundNotSatisfied"), bound)
+}
+
+test "a std trait method on a value of no known type cannot infer it" {
+    let empty = one_error(body("", "    let _ = [].debug()\n"))
+    assert(empty.starts_with("CannotInferType: "), empty)
+    let map = one_error(body("", "    let _ = Debug.debug(Map())\n"))
+    assert(map.starts_with("CannotInferType: "), map)
+    let eq = one_error(body("", "    let _ = [].eq([])\n"))
+    assert(eq.starts_with("CannotInferType: "), eq)
+}
+
+test "a std trait method on a built-in value checks its argument labels" {
+    let wrong = one_error(body("", "    let _ = Eq.eq(1, wrong: 2)\n"))
+    assert(wrong.starts_with("InvalidKeywordArg: "), wrong)
+    let method = one_error(body("", "    let _ = [1].eq(zzz: [1])\n"))
+    assert(method.starts_with("InvalidKeywordArg: "), method)
+    let recv = one_error(body("", "    let _ = Eq.eq(x: 1, other: 1)\n"))
+    assert(recv.starts_with("InvalidKeywordArg: "), recv)
+}

@@ -96,10 +96,11 @@ method name and never the arm:
 
 ### Int, Float, Char, sized ints
 
+`clone`, `debug`, `hash`, `eq` and `cmp` are not in this table. They are the methods of the std
+traits, and tc_std_trait_call counts their arguments against the trait's own signature.
+
 | method | args | reads |
 |---|---|---|
-| `eq` on Int, Float, Char, Str, Bool, sized ints | 1 | typed |
-| `cmp` on Int, Float, Char, Str, sized ints | 1 | typed |
 | `Int.min`, `Int.max` | 1 | none |
 | sized `wrapping_add`, `wrapping_sub`, `wrapping_mul` | 1 | none |
 | `Int.to_str`, `Int.to_string`, `Int.to_float`, `Int.abs`, `Int.to_i8` … `Int.to_u64` | 0 | none |
