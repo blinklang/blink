@@ -24,6 +24,13 @@ fn disagrees(body: Str, tag: Str) ! FS.Delete, FS.Write, Process.Spawn, FS.Read,
     assert(!out.contains("internal compiler error"), out)
 }
 
+fn disagrees_with(body: Str, tag: Str, text: Str) ! FS.Delete, FS.Write, Process.Spawn, FS.Read, Env.Read, IO.Print {
+    let out = compile_test_helpers.compile_and_capture(src_of(body), tag)
+    compile_test_helpers.expect_error(out, "E0300", tag)
+    compile_test_helpers.expect_contains(out, text, tag)
+    assert(!out.contains("internal compiler error"), out)
+}
+
 fn accepts(body: Str, tag: Str) ! FS.Delete, FS.Write, Process.Spawn, FS.Read, Env.Read, IO.Print {
     compile_test_helpers.expect_compiles_clean(compile_test_helpers.compile_and_capture(src_of(body), tag), tag)
 }
@@ -36,11 +43,26 @@ test "a tail that can complete after a valued return is E0311" {
     falls_through("let k = fn() \{ if b \{ return 5 }\n match b \{\n true => lg()\n false => lg()\n }\n }\n io.println(\"\{k()}\")", "cre_match")
     falls_through("let k = fn() \{ if b \{ return 5 }\n lg() }\n io.println(\"\{k()}\")", "cre_unit_call")
     falls_through("let k = fn() \{ if b \{ return 5 }\n let y = 1\n io.println(\"\{y}\") }\n io.println(\"\{k()}\")", "cre_end")
+    falls_through("let k = fn() \{ let _ = 1 + if b \{ return 5 } else \{ 1 } }\n io.println(\"\{k()}\")", "cre_nested_return")
+    falls_through("let k = fn() \{ let _ = [if b \{ return 5 } else \{ 1 }] }\n io.println(\"\{k()}\")", "cre_nested_in_list")
+    falls_through("let k = fn() \{ let _ = 1 + match b \{\n true => return 5\n false => 1\n } }\n io.println(\"\{k()}\")", "cre_nested_in_bare_arm")
+}
+
+// The cause names the form that completes: a () value at the tail, or an arm of a branching tail.
+test "the E0311 cause names the form that completes with ()" {
+    let unit = compile_test_helpers.compile_and_capture(src_of("let k = fn() \{ if b \{ return 5 }\n lg() }\n io.println(\"\{k()}\")"), "cre_cause_unit")
+    compile_test_helpers.expect_contains(unit, "its tail expression has type ()", "cre_cause_unit")
+    let arm = compile_test_helpers.compile_and_capture(src_of("let k = fn() \{ if b \{ return 5 } else \{ lg() } }\n io.println(\"\{k()}\")"), "cre_cause_arm")
+    compile_test_helpers.expect_error(arm, "E0311", "cre_cause_arm")
+    compile_test_helpers.expect_contains(arm, "an arm of its tail completes without producing a value", "cre_cause_arm")
 }
 
 test "exits that disagree are E0300" {
-    disagrees("let k = fn() \{ if b \{ return 5 }\n \"s\" }\n io.println(\"\{k()}\")", "cre_tail_str")
-    disagrees("let k = fn() \{ if b \{ return 5 }\n return \"s\" }\n io.println(\"\{k()}\")", "cre_two_returns")
+    disagrees_with("let k = fn() \{ if b \{ return 5 }\n \"s\" }\n io.println(\"\{k()}\")", "cre_tail_str", "return value type Int does not match function `closure` return type Str")
+    disagrees_with("let k = fn() \{ if b \{ return 5 }\n return \"s\" }\n io.println(\"\{k()}\")", "cre_two_returns", "return value type Str does not match function `closure` return type Int")
+    disagrees_with("let k = fn() \{ if b \{ return 1 }\n return }\n k()", "cre_value_then_bare", "function `closure` returns Int but bare `return` has no value")
+    disagrees_with("let k = fn() \{ if b \{ return }\n return 1 }\n k()", "cre_bare_then_value", "return value type Int does not match function `closure` return type ()")
+    disagrees_with("let k = fn() \{ if b \{ return }\n return 1 }\n k()", "cre_bare_then_value", "return value type Int does not match function `closure` return type ()")
     disagrees("let k = fn() \{ if b \{ return lg() }\n return 5 }\n k()", "cre_unit_then_int")
 }
 
@@ -52,6 +74,36 @@ test "exits that agree are legal" {
     accepts("let k = fn() \{ return panic(\"x\") }\n k()", "cre_ok_never_only")
     accepts("let k = fn() \{ if b \{ return 5 } else \{ return 6 } }\n io.println(\"\{k()}\")", "cre_ok_both_arms")
     accepts("let k = fn() \{ loop \{ if b \{ return 5 } } }\n io.println(\"\{k()}\")", "cre_ok_loop")
+}
+
+// An `if` with no `else` completes with () on the path that skips the branch (sections/02_syntax.md
+// 2.9), whatever the branch gives.
+test "a closure whose tail is an if with no else returns ()" {
+    disagrees_with("let k = fn() \{ if b \{ 5 } }\n let x: Int = k()\n io.println(\"\{x}\")", "cre_elseless_tail_is_unit", "declared type Int but got ()")
+}
+
+// The U of `map` is open, so a body whose only exits give () makes it ().
+test "a closure whose exits give () fills the open return of the expected type with ()" {
+    let u = [2, 3].map(fn(x) {
+        if x == 1 { return panic("a") }
+    })
+    assert_eq(u.len(), 2)
+    let v = [1, 2].map(fn(x) {
+        if x == 1 { return }
+    })
+    assert_eq(v.len(), 2)
+}
+
+// No exit gives a value, so the return is (), not Never: a use that wants a value is E0300.
+test "a closure with no expected type whose body never completes returns ()" {
+    let out = compile_test_helpers.compile_and_capture(src_of("let q = fn() \{ return panic(\"x\") }\n let x: Int = q()\n io.println(\"\{x}\")"), "cre_never_return_is_unit")
+    compile_test_helpers.expect_error(out, "E0300", "cre_never_return_is_unit")
+    compile_test_helpers.expect_contains(out, "declared type Int but got ()", "cre_never_return_is_unit")
+    let src = "fn main() ! Env.Exit \{\n let q = fn() \{ env.exit(3) }\n let x: Int = q()\n io.println(\"\{x}\")\n}\n"
+    let tail = compile_test_helpers.compile_and_capture(src, "cre_never_tail_is_unit")
+    compile_test_helpers.expect_error(tail, "E0300", "cre_never_tail_is_unit")
+    compile_test_helpers.expect_contains(tail, "declared type Int but got ()", "cre_never_tail_is_unit")
+    assert(!tail.contains("internal compiler error"), tail)
 }
 
 // The return type of each closure is read off its exits; these values come back through it.

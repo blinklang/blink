@@ -3211,9 +3211,28 @@ type CallFacts {
     // The trait each trait-qualified call's head names. A type of the same spelling in a
     // module this one does not import must not take the call at a later stage.
     trait_heads: Map[Int, Str]
+    // The written function type that gives a closure its expected type and its (), inside the
+    // type of the parameter, `let`, field, assignment target or return that the closure meets.
+    // An error on that () points there (sections/03_types.md 3.3).
+    closure_expected_at: Map[Int, Int]
+    // The written return type of the fn, method or closure whose body the walk is in, or -1.
+    ret_ann: Int
+    // Each `if` with no `else` that E0304 reported where a value is needed.
+    missing_else: Map[Int, Int]
+    // Each `return` the walk meets, in order. A fn, method or closure takes the ones its own
+    // walk added when that walk ends, so a `return` goes to the nearest one around it, at any
+    // depth of expression.
+    walk_returns: List[Int]
+    // The name an impl method was written with. Its node carries the impl-qualified name
+    // while its body is checked, and an error must name the method as the author wrote it.
+    written_names: Map[Int, Str]
+    // Each closure with no `-> R` that a call gave an expected function type. A return that
+    // type leaves open (the `U` of `fn() -> U`) is tied to the closure's own slot, so the body
+    // walk cannot tell it from no expected type by the slot alone.
+    under_fn_type: Map[Int, Int]
 }
 fn new_call_facts() -> CallFacts {
-    CallFacts { open_calls: [], open_group: Map(), open_tids: [], reported: Map(), self_views: Map(), view_sigs: Map(), hash_aliases_above: [], derive_facts_above: [], derive_facts_low: 0, derive_facts_open: [], derive_facts_open_low: Map(), debug_unbuilt_seen: Map(), hash_by_bounds: false, static_head_insts: Map(), static_head_binders: Map(), static_owners: Map(), trait_heads: Map() }
+    CallFacts { open_calls: [], open_group: Map(), open_tids: [], reported: Map(), self_views: Map(), view_sigs: Map(), hash_aliases_above: [], derive_facts_above: [], derive_facts_low: 0, derive_facts_open: [], derive_facts_open_low: Map(), debug_unbuilt_seen: Map(), hash_by_bounds: false, static_head_insts: Map(), static_head_binders: Map(), static_owners: Map(), trait_heads: Map(), closure_expected_at: Map(), ret_ann: -1, missing_else: Map(), walk_returns: [], written_names: Map(), under_fn_type: Map() }
 }
 let mut tc_calls: CallFacts = new_call_facts()
 
@@ -3701,13 +3720,33 @@ fn tc_note_open_variant(node: Int, tid: Int) -> Int {
 
 // The `return e` of a fn, method or closure that returns (), where `e` was open after the walk,
 // as the group [-5, owner, 0].
-fn tc_note_void_return(ret: Int, cls: Int) {
+fn tc_note_void_return(ret: Int, owner: Int) {
     if tc_calls.open_group.contains_key(ret) { return }
     tc_calls.open_calls.push(ret)
     tc_calls.open_group.insert(ret, tc_calls.open_tids.len())
     tc_calls.open_tids.push(-5)
-    tc_calls.open_tids.push(cls)
+    tc_calls.open_tids.push(owner)
     tc_calls.open_tids.push(0)
+}
+
+fn tc_returns_mark() -> Int { tc_calls.walk_returns.len() }
+
+// The `return`s met since `mark`, each once, in order; they leave the list. A later walk of
+// the same node meets its `return` again.
+fn tc_returns_since(mark: Int) -> List[Int] {
+    let mut out: List[Int] = []
+    let mut seen: Map[Int, Int] = Map()
+    let mut i = mark
+    while i < tc_calls.walk_returns.len() {
+        let r = tc_calls.walk_returns.get(i).unwrap()
+        if !seen.contains_key(r) {
+            seen.insert(r, 1)
+            out.push(r)
+        }
+        i = i + 1
+    }
+    while tc_calls.walk_returns.len() > mark { let _ = tc_calls.walk_returns.pop() }
+    out
 }
 
 fn tc_open_group_is_variant(g: Int) -> Bool {
@@ -6993,11 +7032,11 @@ fn tc_pin_tail_tid(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag
 //   • the tc_current_fn_ret Void/Unknown skip — a Void return here may be the
 //     placeholder of a closure that reads its return off the body, so the `return e`
 //     of a fn or closure that returns () is checked after the walk instead
-//     (tc_report_values_returned_as_void, tc_settle_closure_ret). And when tc_check_fn's `lookup_fnsig` misses it
-//     never installs one at all, leaving tc_current_fn_ret at -1 (tc_check_fn is
-//     called only from two non-reentrant top-level loops, so prev_fn_ret is always
-//     -1 at entry). -1 stays vacuous through types_compatible's `a < 0` escape,
-//     exactly as today. Do not "tighten" this with a >= 0 test: the Return arm has
+//     (tc_report_values_returned_as_void, tc_settle_closure_ret). And when
+//     tc_check_fn's `lookup_fnsig` misses it never installs one at all, leaving
+//     tc_current_fn_ret at -1 (tc_check_fn is called only from two non-reentrant
+//     top-level loops, so prev_fn_ret is always -1 at entry). -1 stays vacuous
+//     through types_compatible's `a < 0` escape, exactly as today. Do not "tighten" this with a >= 0 test: the Return arm has
 //     always called through with -1 and must keep doing so. (The tail call site
 //     does add >= 0, for an unrelated reason — see it.)
 //     That miss is not hypothetical: EVERY impl method takes it, because the
@@ -7894,6 +7933,7 @@ fn tc_check_arg_types_with_binds(fn_name: Str, sig: Int, args_sl: Int, self_offs
                 arg_t = ptid
                 tc_publish_node_tid(arg_node, ptid)
             } else if tc_tid_is_no_info(ptid) == 0 {
+                tc_note_closure_expected_at(arg_node, tc_decl_param_type_ann(fs.decl, pidx), ptid)
                 // A type parameter that an earlier argument fixed joins the two arguments, and
                 // projection is no join; only a parameter written as a handler type projects.
                 let projects = tc_handler_effect_of(bound) != ""
@@ -9142,7 +9182,7 @@ fn tc_check_sort_by_body(cls: Int, elem: Int) ! TypeCheck.Resolve, TypeCheck.Rep
 // ty_pool, ...) that this function does not save/restore around that one call,
 // which the analyzer correctly flags (mirrors tc_check_fn:9052).
 @allow(UnrestoredMutation, IncompleteStateRestore)
-fn tc_check_closure_body_against_own_ret(cls: Int, ret: Int, held_by: Str) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+fn tc_check_closure_body_against_own_ret(cls: Int, ret: Int, held_by: Str) -> List[Int] ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     let prev_fn_name = tc_current_fn_name
     let prev_fn_ret = tc_current_fn_ret
     let prev_held_by = tc_closure_held_by
@@ -9163,13 +9203,19 @@ fn tc_check_closure_body_against_own_ret(cls: Int, ret: Int, held_by: Str) ! Typ
     let saved_in_test = tc_in_test_body
     tc_in_test_body = 0
     tc_closure_scope_base.push(nr_scope_names.len())
+    let prev_ret_ann = tc_calls.ret_ann
+    tc_calls.ret_ann = cls_ret_ann
+    let mark = tc_returns_mark()
     tc_check_body(body)
+    let returns = tc_returns_since(mark)
+    tc_calls.ret_ann = prev_ret_ann
     let _ = tc_closure_scope_base.pop()
     tc_in_test_body = saved_in_test
     tc_check_missing_tail_value(body, tc_current_fn_ret, "closure", cls)
     tc_closure_held_by = prev_held_by
     tc_current_fn_name = prev_fn_name
     tc_current_fn_ret = prev_fn_ret
+    returns
 }
 
 fn tc_return_mismatch_head(val_t: Int) -> Str {
@@ -9281,6 +9327,7 @@ fn tc_seed_closure_expected_fn(arg0: Int, expected: Int) ! TypeCheck.Resolve, Ty
     // captured.
     let mut published = seed
     if node_type_ann(a) == -1 {
+        tc_calls.under_fn_type.insert(a, 1)
         let want_ret = tc_fn_tid_ret(seed)
         if tc_tid_is_no_info(want_ret) != 0 {
             published = make_fn_type(tc_closure_ret_slot(a), tc_fn_tid_param_hints(seed))
@@ -9494,9 +9541,14 @@ fn check_closure_body_held_by(held_by: Str, cls: Int, exp_fn: Int) ! TypeCheck.R
     // closure before this walk (a list literal's element type) holds it, so it is bound below
     // rather than replaced, and the closure keeps it as its return.
     let mut slot = -1
+    let mut has_expected = false
     if cls_ret_ann == -1 {
         slot = tc_closure_ret_slot(cls)
         stamp_ret = slot
+        // A context fn type whose return is still open (the U of `map`) is an expected type too.
+        // A context that is this closure's own earlier walk gives back its slot, which is not.
+        let exp_ret = tc_fn_tid_ret(exp_fn)
+        has_expected = tc_calls.under_fn_type.contains_key(cls) || (exp_ret >= 0 && tc_resolve(exp_ret) != tc_resolve(slot))
         let declared_ret = tc_closure_context_ret(exp_fn)
         if declared_ret >= 0 {
             obligation = declared_ret
@@ -9504,16 +9556,16 @@ fn check_closure_body_held_by(held_by: Str, cls: Int, exp_fn: Int) ! TypeCheck.R
         }
     }
     tc_publish_node_tid(cls, make_fn_type(stamp_ret, param_types))
-    tc_check_closure_body_against_own_ret(cls, obligation, held_by)
+    let returns = tc_check_closure_body_against_own_ret(cls, obligation, held_by)
     if cls_ret_ann != -1 {
-        if tc_resolve(obligation) == TYPE_VOID { tc_report_values_returned_as_void(cls) }
+        tc_report_values_returned_as_void(cls, obligation, returns)
         nr_pop_scope()
         return
     }
     if stamp_ret == slot {
-        tc_settle_closure_ret(cls, slot)
+        tc_settle_closure_ret(cls, slot, has_expected, returns)
     } else {
-        if stamp_ret == TYPE_VOID { tc_report_values_returned_as_void(cls) }
+        tc_report_values_returned_as_void(cls, stamp_ret, returns)
         let _ = bind_metavar(slot, stamp_ret)
     }
     // The slot, not its solution, is published: a later walk reads this tid back as `exp_fn`,
@@ -9526,8 +9578,10 @@ fn check_closure_body_held_by(held_by: Str, cls: Int, exp_fn: Int) ! TypeCheck.R
 // closure whose context gave it (). The walk could not check its `return`s, because the same
 // Void obligation stands for "no declared R" and a closure with none reads its return off them
 // (tc_settle_closure_ret).
-fn tc_report_values_returned_as_void(owner: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
-    for r in tc_body_valued_returns(node_body(owner)) {
+fn tc_report_values_returned_as_void(owner: Int, ret: Int, returns: List[Int]) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    if tc_resolve(ret) != TYPE_VOID { return }
+    for r in returns {
+        if node_value(r) == -1 { continue }
         // A later use in the definition can still settle this value (sections/03_types.md 3.4).
         if tc_tid_has_unbound_metavar(tc_resolve(tc_lookup_node_tid(node_value(r)))) != 0 {
             tc_note_void_return(r, owner)
@@ -9537,10 +9591,103 @@ fn tc_report_values_returned_as_void(owner: Int) ! TypeCheck.Resolve, TypeCheck.
     }
 }
 
-// The fix names a type the program can write, so an open slot reads as `T`.
+// `ann` is the written type that gives `val` the type `expected`. Each closure that type reaches
+// in `val` (tc_expected_parts) records the function type in `ann` that gives it a ().
+fn tc_note_closure_expected_at(val: Int, ann: Int, expected: Int) {
+    if val == -1 || ann == -1 { return }
+    let v = if node_kind(val) == NodeKind.NamedArg { node_value(val) } else { val }
+    if v == -1 { return }
+    if node_kind(v) == NodeKind.Closure {
+        let params = node_params(v)
+        let fn_ann = tc_unit_fn_type_ann_in(ann, if params == -1 { 0 } else { sublist_length(params) })
+        if fn_ann != -1 { tc_calls.closure_expected_at.insert(v, fn_ann) }
+        return
+    }
+    if expected < 0 { return }
+    for p in tc_expected_parts(v, expected) { tc_note_closure_expected_at(p.value, ann, p.expected) }
+}
+
+// The one function type written in `ann` that takes `arity` params and returns (): `ann`
+// itself, or one inside its arguments, as in `List[fn(Int)]`. -1 when there is none, or more
+// than one and the closure could meet either.
+fn tc_unit_fn_type_ann_in(ann: Int, arity: Int) -> Int {
+    let found = tc_unit_fn_type_anns(ann, arity)
+    if found.len() == 1 { found.get(0).unwrap() } else { -1 }
+}
+
+fn tc_unit_fn_type_anns(ann: Int, arity: Int) -> List[Int] {
+    let mut out: List[Int] = []
+    if ann == -1 || node_kind(ann) != NodeKind.TypeAnn { return out }
+    let elems = node_elements(ann)
+    if node_name(ann) == "Fn" {
+        let n = if elems == -1 { 0 } else { sublist_length(elems) }
+        let r = node_type_ann(ann)
+        // A closure inside a param or the return of this type meets that type, not this one.
+        if n == arity && (r == -1 || node_name(r) == "Void") { out.push(ann) }
+        return out
+    }
+    if elems == -1 { return out }
+    let mut i = 0
+    while i < sublist_length(elems) {
+        for a in tc_unit_fn_type_anns(sublist_get(elems, i), arity) { out.push(a) }
+        i = i + 1
+    }
+    out
+}
+
+// The written type of field `fname` in the declaration of the struct `stid`, or -1.
+fn tc_struct_field_type_ann(stid: Int, fname: Str) -> Int {
+    let td = tc_tid_decl_node(tc_struct_base_tid(stid))
+    if td < 0 { return -1 }
+    let flds = node_fields(td)
+    if flds == -1 { return -1 }
+    let mut i = 0
+    while i < sublist_length(flds) {
+        let f = sublist_get(flds, i)
+        if node_name(f) == fname { return node_value(f) }
+        i = i + 1
+    }
+    -1
+}
+
+// The written type of an assignment target: a local's `let` annotation or a struct field's
+// declared type. -1 for any other target.
+fn tc_assign_target_type_ann(target: Int) -> Int {
+    if target == -1 { return -1 }
+    let k = node_kind(target)
+    if k == NodeKind.Ident {
+        let binder = tc_ident_binder_node(target)
+        if binder == -1 || node_kind(binder) != NodeKind.LetBinding { return -1 }
+        return node_target(binder)
+    }
+    if k == NodeKind.FieldAccess {
+        let obj_t = tc_resolve(tc_lookup_node_tid(node_obj(target)))
+        if tc_tid_kind(obj_t) != TyKind.Struct { return -1 }
+        return tc_struct_field_type_ann(obj_t, node_name(target))
+    }
+    -1
+}
+
+// The type annotation of parameter `idx` of a declaration, or -1 for an intrinsic.
+fn tc_decl_param_type_ann(decl: Int, idx: Int) -> Int {
+    if decl == -1 || idx < 0 { return -1 }
+    let params_sl = node_params(decl)
+    if params_sl == -1 || idx >= sublist_length(params_sl) { return -1 }
+    node_type_ann(sublist_get(params_sl, idx))
+}
+
+// The fix names a type the program can write. A type parameter in scope reads as written; an
+// open slot, or a type parameter of another declaration, reads as a name no type parameter in
+// scope already has.
 fn tc_void_return_fix_type(vt: Int) -> Str {
-    if tc_tid_has_unbound_metavar(vt) != 0 || tc_tid_has_bare_typevar(vt) != 0 { return "T" }
-    type_to_str(vt)
+    if tc_tid_has_unbound_metavar(vt) == 0 && tc_tid_has_foreign_typevar(vt) == 0 { return type_to_str(vt) }
+    let mut name = "T"
+    let mut i = 1
+    while tc_name_is_tparam_in_scope(name) != 0 {
+        name = "T{i}"
+        i = i + 1
+    }
+    name
 }
 
 fn tc_report_value_returned_as_void(r: Int, owner: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
@@ -9553,87 +9700,139 @@ fn tc_report_value_returned_as_void(r: Int, owner: Int) ! TypeCheck.Resolve, Typ
     if tc_calls.reported.contains_key(r) { return }
     tc_calls.reported.insert(r, 1)
     let t = tc_void_return_fix_type(vt)
-    // Dropping `return save(x)` whole would also drop the call's effects (sections/03_types.md 3.3).
-    let keep_call = "keep a call as its own statement, then write `return`"
-    if node_kind(owner) != NodeKind.Closure {
-        let name = node_name(owner)
-        let msg = "return value type {type_to_str(vt)} does not match function `{name}` return type ()"
-        if node_type_ann(owner) != -1 {
-            return tc_error_at_code(msg, r, "TypeError", TYPE_ERROR, "change `-> ()` to `-> {t}`, or drop the value ({keep_call})")
-        }
+    // Dropping `return save(x)` whole would also drop the call's effects
+    // (sections/03_types.md 3.3).
+    let drop = "drop the value (keep a call as its own statement, then write `return`)"
+    let is_closure = node_kind(owner) == NodeKind.Closure
+    let name = tc_calls.written_names.get(owner) ?? node_name(owner)
+    let msg = if is_closure { "return value type {type_to_str(vt)} does not match closure return type ()" } else { "return value type {type_to_str(vt)} does not match function `{name}` return type ()" }
+    let ann = node_type_ann(owner)
+    if ann != -1 {
+        return tc_error_at_code(msg, r, "TypeError", TYPE_ERROR, "change `-> {tc_written_type_text(ann)}` to `-> {t}`, or {drop}")
+    }
+    if !is_closure {
         // The () comes from the `-> R` the signature leaves out, so the error also points there.
-        // The JSON form lists a second label only after a label on the primary span.
-        let before = diag_entry_count()
-        tc_errors.push(msg)
-        diag_error_label_at_notes("TypeError", TYPE_ERROR, msg, r, "returns a value of type {type_to_str(vt)}", "add `-> {t}` to the signature of `{name}`, or drop the value ({keep_call})", [])
         let body = node_body(owner)
-        diag_add_label_since(before, node_line(body), node_col(body), node_col(body) + 1, "`{name}` has no `-> R`, so it returns ()")
-        return
+        let help = "add `-> {t}` to the signature of `{name}`, or {drop}"
+        return tc_report_void_return_with_site(msg, r, vt, help, body, node_line(body), node_col(body), node_col(body) + 1, "`{name}` has no `-> R`, so it returns ()")
     }
-    if node_type_ann(owner) != -1 {
-        tc_error_at_code("return value type {type_to_str(vt)} does not match closure return type ()", r, "TypeError", TYPE_ERROR, "change `-> ()` to `-> T`, or drop the value ({keep_call})")
-    } else {
-        tc_error_at_code("return value type {type_to_str(vt)} does not match closure return type (), which the expected function type gives", r, "TypeError", TYPE_ERROR, "add `-> T` to the expected function type, or drop the value ({keep_call})")
+    let cmsg = "{msg}, which the expected function type gives"
+    let help = "add `-> {t}` to the expected function type, or {drop}"
+    let exp = tc_calls.closure_expected_at.get(owner) ?? -1
+    if exp == -1 { return tc_error_at_code(cmsg, r, "TypeError", TYPE_ERROR, help) }
+    // A type node's own line and column are those of the token after it; the written span
+    // holds where the author wrote it. A span over several lines marks its first column.
+    let w = tc_written_operand(exp)
+    let end_col = if w.end_line == w.line && w.end_col > 0 { w.end_col } else { w.col + 1 }
+    tc_report_void_return_with_site(cmsg, r, vt, help, exp, w.line, w.col, end_col, "the expected function type `{tc_written_type_text(exp)}` gives the return ()")
+}
+
+fn tc_written_type_text(ann: Int) -> Str {
+    let text = tc_written_operand(ann).text
+    if text != "" { text } else { type_ann_text(ann) }
+}
+
+// The error on `r`, with a second label on the written `site` that gives the (). A label holds a
+// line and a column of the error's own file only, so a site in another file is a note instead.
+// The JSON form lists a second label only after a label on the primary span.
+fn tc_report_void_return_with_site(msg: Str, r: Int, vt: Int, help: Str, site: Int, line: Int, col: Int, end_col: Int, label: Str) ! TypeCheck.Report, Diag.Report {
+    tc_errors.push(msg)
+    if diag_file_for_node(site) != diag_file_for_node(r) {
+        return diag_error_at_notes("TypeError", TYPE_ERROR, msg, r, help, ["{label}, at {diag_normalize_path(diag_file_for_node(site))}:{line}"])
     }
+    let before = diag_entry_count()
+    diag_error_label_at_notes("TypeError", TYPE_ERROR, msg, r, "returns a value of type {type_to_str(vt)}", help, [])
+    diag_add_label_since(before, line, col, end_col, label)
 }
 
 // The return of a closure that neither writes `-> R` nor sits where one is declared is the one
 // type on which every `return e` and a tail that can complete agree, and () when there is none
-// (sections/03_types.md 3.3). A `return e` whose operand is Never adds no constraint. A slot
-// already bound — by an earlier walk of this closure, or by a use that pinned it — is the
-// answer the body is held to instead.
+// (sections/03_types.md 3.3). A bare `return` gives (). A `return e` whose operand is Never adds
+// no constraint. A slot already bound — by an earlier walk of this closure, or by a use that
+// pinned it — is the answer the body is held to instead. With an expected type that is still
+// open, a body that never completes leaves the slot for the other uses to fill.
 //
 // Read after the walk, off the memo, so nothing in the body is reported twice.
-fn tc_settle_closure_ret(cls: Int, slot: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+fn tc_settle_closure_ret(cls: Int, slot: Int, has_expected: Bool, returns: List[Int]) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     let body = node_body(cls)
-    let returns = tc_body_valued_returns(body)
     let tail_t = tc_closure_body_result_tid(cls)
-    let mut first_value = -1
-    for r in returns {
-        let vt = tc_lookup_node_tid(node_value(r))
-        if tc_tid_is_no_info(vt) == 0 && tc_resolve(vt) != TYPE_NEVER {
-            first_value = vt
-            break
-        }
-    }
-    // The memo reads an `if` with no `else` as its `then` branch, but the closure leaves through
-    // the missing `else` too; only a value `return` makes that edge an error, so only then is it
-    // read.
-    let completes = if first_value >= 0 { tc_tail_completion(body) } else { tail_t }
     let mut ret = tc_resolve(slot)
     // Unless a use already pinned the return to (), the tail is the value the closure hands
     // back, so the walk (which checked the body against the Void default) did not compare it.
     if tc_is_unbound_metavar(ret) != 0 || (tc_tid_is_no_info(ret) == 0 && ret != TYPE_VOID) {
         tc_report_consumed_branch_mismatch(tc_value_tail_of(body))
     }
-    let completes_with_value = completes >= 0 && tc_tid_is_no_info(completes) == 0 && tc_resolve(completes) != TYPE_NEVER && tc_resolve(completes) != TYPE_VOID
-    // After a value `return`, a tail that completes with () is E0311 below, not a mismatch here.
-    let tail_is_value = tc_tid_is_no_info(tail_t) == 0 && (first_value < 0 || completes_with_value)
+    // After a value `return`, a tail that completes with () is E0311 below, not a mismatch.
+    let falls_through = tail_t >= 0 && tc_resolve(tail_t) == TYPE_VOID && tc_has_value_return(returns)
     // Resolved first: a slot tied to a sibling's (tc_tie_fn_rets) is bound to that slot, which
     // may itself still be open.
     if tc_is_unbound_metavar(ret) != 0 {
-        // With no value `return`, the body is a statement body when the walk names no value for
-        // its tail, such as a match whose arms assign: a named fn with that body returns ().
-        // A value tail that an error left untyped is not one.
-        let mut found = if completes_with_value { completes } else { first_value }
-        if first_value < 0 && found < 0 { found = tail_t }
-        if found < 0 { found = if tc_value_tail_lost(body) { tc_error_recovery_tid() } else { TYPE_VOID } }
-        ret = found
+        ret = tc_pick_closure_ret(body, tail_t, returns, has_expected)
         let _ = bind_metavar(slot, ret)
-    } else if tail_is_value && tc_tid_is_no_info(ret) == 0 && ret != TYPE_VOID && (types_compatible(ret, tail_t) == 0 || tc_value_misses_never_slot(ret, tail_t) != 0) {
-        tc_mismatch_at("return value type {type_to_str(tail_t)} does not match function `closure` return type {type_to_str(ret)}", cls, ret, tail_t)
-    } else if tail_is_value {
-        // The bound return fixes an open slot of the tail, as a written `-> R` would.
-        tc_join_agreeing_values(ret, tail_t)
+    } else if tail_t >= 0 && !falls_through && tc_resolve(tail_t) != TYPE_NEVER {
+        tc_check_closure_tail(cls, ret, tail_t)
     }
     if tc_tid_is_no_info(ret) != 0 { return }
-    // A tail that can complete with () after a value `return` is E0311, as in a named fn with `-> R`.
-    if first_value >= 0 && tc_resolve(ret) != TYPE_VOID && completes >= 0 && tc_resolve(completes) == TYPE_VOID {
-        tc_report_closure_falls_through(cls, ret)
-    }
+    if falls_through && tc_resolve(ret) != TYPE_VOID { tc_report_closure_falls_through(cls, ret) }
+    tc_check_closure_returns(ret, returns)
+}
+
+// The type a `return` hands back: () for a bare one, -1 when the walk could not type its value.
+fn tc_return_exit_tid(r: Int) -> Int {
+    let v = node_value(r)
+    if v == -1 { return TYPE_VOID }
+    let vt = tc_lookup_node_tid(v)
+    if tc_tid_is_no_info(vt) != 0 { return -1 }
+    vt
+}
+
+fn tc_has_value_return(returns: List[Int]) -> Bool {
     for r in returns {
-        let vt = tc_lookup_node_tid(node_value(r))
-        if tc_tid_is_no_info(vt) != 0 || tc_calls.reported.contains_key(r) { continue }
+        if node_value(r) == -1 { continue }
+        let vt = tc_return_exit_tid(r)
+        if vt >= 0 && tc_resolve(vt) != TYPE_NEVER { return true }
+    }
+    false
+}
+
+// The return of a body that nothing pinned: a tail that completes with a value, else the first
+// exit that can give one, else what the tail gives.
+fn tc_pick_closure_ret(body: Int, tail_t: Int, returns: List[Int], has_expected: Bool) -> Int {
+    if tail_t >= 0 && tc_resolve(tail_t) != TYPE_NEVER && tc_resolve(tail_t) != TYPE_VOID { return tail_t }
+    for r in returns {
+        let vt = tc_return_exit_tid(r)
+        if vt >= 0 && tc_resolve(vt) != TYPE_NEVER { return vt }
+    }
+    if tail_t >= 0 {
+        // With no expected type, no exit gives a type to agree on, so the return is () (3.3).
+        if !has_expected && tc_resolve(tail_t) == TYPE_NEVER { return TYPE_VOID }
+        return tail_t
+    }
+    // A value tail that an error left untyped is not a statement body.
+    if tc_value_tail_lost(body) { tc_error_recovery_tid() } else { TYPE_VOID }
+}
+
+fn tc_check_closure_tail(cls: Int, ret: Int, tail_t: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    if tc_tid_is_no_info(ret) != 0 { return }
+    if ret != TYPE_VOID && (types_compatible(ret, tail_t) == 0 || tc_value_misses_never_slot(ret, tail_t) != 0) {
+        return tc_mismatch_at("return value type {type_to_str(tail_t)} does not match function `closure` return type {type_to_str(ret)}", cls, ret, tail_t)
+    }
+    // The bound return fixes an open slot of the tail, as a written `-> R` would.
+    tc_join_agreeing_values(ret, tail_t)
+}
+
+fn tc_check_closure_returns(ret: Int, returns: List[Int]) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    for r in returns {
+        if tc_calls.reported.contains_key(r) { continue }
+        if node_value(r) == -1 {
+            if tc_resolve(ret) != TYPE_VOID {
+                tc_calls.reported.insert(r, 1)
+                tc_error_at("function `closure` returns {type_to_str(ret)} but bare `return` has no value", r)
+            }
+            continue
+        }
+        let vt = tc_return_exit_tid(r)
+        if vt < 0 { continue }
         if types_compatible(ret, vt) == 0 || tc_value_misses_never_slot(ret, vt) != 0 {
             tc_calls.reported.insert(r, 1)
             tc_mismatch_at("return value type {type_to_str(vt)} does not match function `closure` return type {type_to_str(ret)}", r, ret, vt)
@@ -9641,47 +9840,6 @@ fn tc_settle_closure_ret(cls: Int, slot: Int) ! TypeCheck.Resolve, TypeCheck.Rep
             tc_join_agreeing_values(ret, vt)
         }
     }
-}
-
-// What a closure body yields at its end, as the memo reads it, except that an `if` with no
-// `else` can complete with (): the memo answers for its `then` branch alone. Never when every
-// path leaves by another edge.
-fn tc_tail_completion(node: Int) -> Int {
-    if node == -1 { return -1 }
-    let k = node_kind(node)
-    if k == NodeKind.WithBlock || k == NodeKind.AsyncScope { return tc_tail_completion(node_body(node)) }
-    if k == NodeKind.Block {
-        if tc_block_exits(node) != 0 { return TYPE_NEVER }
-        let tail = tc_block_tail_stmt(node)
-        if tail == -1 { return TYPE_VOID }
-        return tc_tail_completion(tc_block_tail_value(tail))
-    }
-    if k == NodeKind.IfExpr {
-        let else_node = node_else_body(node)
-        if else_node == -1 { return TYPE_VOID }
-        return tc_join_completions(tc_tail_completion(node_then_body(node)), tc_tail_completion(else_node), node)
-    }
-    if k == NodeKind.MatchExpr {
-        let arms_sl = node_arms(node)
-        if arms_sl == -1 { return tc_scoped_value_memo(node) }
-        let mut out = TYPE_NEVER
-        let mut i = 0
-        while i < sublist_length(arms_sl) {
-            out = tc_join_completions(out, tc_tail_completion(tc_arm_body_value(sublist_get(arms_sl, i))), node)
-            i = i + 1
-        }
-        return out
-    }
-    tc_scoped_value_memo(node)
-}
-
-// A branch that leaves by another edge yields to the other; one that can complete with ()
-// makes the whole form complete with (). Any other pair is what the memo says of the form.
-fn tc_join_completions(a: Int, b: Int, form: Int) -> Int {
-    if a >= 0 && tc_resolve(a) == TYPE_NEVER { return b }
-    if b >= 0 && tc_resolve(b) == TYPE_NEVER { return a }
-    if (a >= 0 && tc_resolve(a) == TYPE_VOID) || (b >= 0 && tc_resolve(b) == TYPE_VOID) { return TYPE_VOID }
-    tc_scoped_value_memo(form)
 }
 
 fn tc_report_closure_falls_through(cls: Int, ret: Int) ! Diag.Report {
@@ -9701,24 +9859,6 @@ fn tc_value_tail_lost(body: Int) -> Bool {
     if tail == -1 { return false }
     let k = node_kind(tail)
     k == NodeKind.Call || k == NodeKind.MethodCall || k == NodeKind.Ident || k == NodeKind.FieldAccess || k == NodeKind.BinOp || k == NodeKind.UnaryOp || k == NodeKind.IndexExpr
-}
-
-// The `return e` statements of a body, not those of a closure nested in it, whose `return`
-// leaves that closure. The shapes descended are tc_loop_scan_children's, which names every
-// statement position a `return` can sit in.
-fn tc_body_valued_returns(node: Int) -> List[Int] {
-    let mut out: List[Int] = []
-    if node == -1 { return out }
-    let kind = node_kind(node)
-    if kind == NodeKind.Return {
-        if node_value(node) != -1 { out.push(node) }
-        return out
-    }
-    if kind == NodeKind.Closure { return out }
-    for kid in tc_loop_scan_children(node) {
-        for r in tc_body_valued_returns(kid) { out.push(r) }
-    }
-    out
 }
 
 // A derived body is checked as a handler clause is, against the operation's own signature.
@@ -9802,11 +9942,16 @@ fn tc_check_handler_method(m: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.R
     // this method's own return, which is what depth 0 promises.
     let saved_closure_bases = tc_closure_scope_base
     tc_closure_scope_base = []
+    let prev_ret_ann = tc_calls.ret_ann
+    tc_calls.ret_ann = ret_ann
+    let mark = tc_returns_mark()
     tc_check_body(body)
+    let returns = tc_returns_since(mark)
+    tc_calls.ret_ann = prev_ret_ann
     tc_closure_scope_base = saved_closure_bases
     tc_in_test_body = saved_in_test
     tc_check_missing_tail_value(body, tc_current_fn_ret, mname, m)
-    if tc_resolve(tc_current_fn_ret) == TYPE_VOID { tc_report_values_returned_as_void(m) }
+    tc_report_values_returned_as_void(m, tc_current_fn_ret, returns)
     nr_pop_scope()
 
     tc_closure_held_by = prev_held_by
@@ -10013,6 +10158,12 @@ fn tc_walk_nested_hof_bodies(expr: Int) ! TypeCheck.Resolve, TypeCheck.Report, D
         tc_walk_nested_hof_bodies(node_left(expr))
         return
     }
+    // A braceless match arm holds a `return` with no statement around it. The fn or closure
+    // around it must check its value, and the value needs a type for codegen.
+    if k == NodeKind.Return {
+        tc_check_body(expr)
+        return
+    }
     if k == NodeKind.FieldAccess {
         tc_walk_nested_hof_bodies(node_obj(expr))
         return
@@ -10094,12 +10245,24 @@ fn tc_walk_nested_value_body(expr: Int) ! TypeCheck.Resolve, TypeCheck.Report, D
     if k == NodeKind.MatchExpr {
         let arms_sl = node_arms(expr)
         if arms_sl != -1 {
+            // The arm's pattern binds names its body reads, so the body is walked in the arm's
+            // scope, as infer_arm_body infers it. The pattern reports again here only what
+            // inference reported, which the diagnostic filter drops as a repeat.
+            let scrut_tid = infer_type(node_scrutinee(expr))
+            let subject = tc_match_subject(expr)
+            let bool_repair = tc_bool_arms_repair_scrutinee(expr)
             let mut i = 0
             while i < sublist_length(arms_sl) {
-                let b = node_body(sublist_get(arms_sl, i))
+                let arm = sublist_get(arms_sl, i)
+                let b = node_body(arm)
                 if b != -1 {
+                    nr_push_scope()
+                    if !tc_report_repairable_bool_arm(node_pattern(arm), bool_repair, scrut_tid) {
+                        let _ = tc_check_pattern_types_against(node_pattern(arm), scrut_tid, subject, true)
+                    }
                     let inner = if node_kind(b) == NodeKind.ExprStmt { node_value(b) } else { b }
                     if node_kind(inner) == NodeKind.Block { tc_walk_value_block(inner) } else { tc_walk_nested_hof_bodies(inner) }
+                    nr_pop_scope()
                 }
                 i = i + 1
             }
@@ -12389,6 +12552,7 @@ fn tc_check_struct_lit_field_closures(stid: Int, node: Int) ! TypeCheck.Resolve,
             let vk = node_kind(v)
             let declared = resolve_alias_tid(get_struct_field_tid(stid, node_name(f)))
             if type_kind(declared) == TyKind.Fn {
+                tc_note_closure_expected_at(v, tc_struct_field_type_ann(stid, node_name(f)), declared)
                 tc_check_struct_lit_fn_field(v, declared)
             }
             if vk == NodeKind.HandlerExpr {
@@ -29801,6 +29965,7 @@ pub fn tc_fn_tid_more_specific(existing0: Int, fresh0: Int) -> Int {
 // arm calls it only when tc_if_value_ctx is set, so a statement-context else-less `if` (value
 // discarded) is never reported.
 fn tc_report_missing_else(node: Int) ! Diag.Report {
+    tc_calls.missing_else.insert(node, 1)
     diag_error_at("MissingElse", MISSING_ELSE, "an `if` used as a value must have an `else` — the false path produces no value (§2.9)", node, "add an `else` branch, or make the `if` a statement if you only want its effect")
 }
 
@@ -33737,7 +33902,9 @@ fn tc_scoped_value_memo(node: Int) -> Int {
     if k == NodeKind.IfExpr {
         let then_t = tc_scoped_value_memo(node_then_body(node))
         let else_node = node_else_body(node)
-        if else_node == -1 { return then_t }
+        // The missing `else` completes with () (§2.9). Where a value is needed, E0304 reported
+        // it, and the `then` type stands in, as in infer_type, so the error is not made twice.
+        if else_node == -1 { return if tc_calls.missing_else.contains_key(node) { then_t } else { TYPE_VOID } }
         let else_t = tc_scoped_value_memo(else_node)
         if tc_tid_is_no_info(then_t) != 0 { return else_t }
         if tc_tid_is_no_info(else_t) != 0 { return then_t }
@@ -34887,9 +35054,14 @@ fn tc_check_fn(fn_node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report 
         // falls to the bare-stid return, which then overwrites the good memo and
         // compares vacuously.
         if node_kind(body) == NodeKind.Block { tc_fn_body_block = 1 }
+        let prev_ret_ann = tc_calls.ret_ann
+        tc_calls.ret_ann = ret_ann
+        let mark = tc_returns_mark()
         tc_check_body(body)
+        let returns = tc_returns_since(mark)
+        tc_calls.ret_ann = prev_ret_ann
         tc_fn_body_block = 0
-        if tc_resolve(fn_ret_tid) == TYPE_VOID { tc_report_values_returned_as_void(fn_node) }
+        tc_report_values_returned_as_void(fn_node, fn_ret_tid, returns)
 
         // The one branch that CANNOT move: a body with no tail value at all reports
         // against the whole function, not against a statement that does not exist. The
@@ -37984,7 +38156,10 @@ fn tc_infer_returned_value(val: Int, returns_value: Bool) -> Int ! TypeCheck.Res
     // way a call argument takes the formal: a literal needs it to be other than Int, and a
     // closure body reads its signature from it while it is walked. Inside a closure
     // body tc_current_fn_ret is that closure's own return (tc_check_closure_body_against_own_ret).
-    if returns_value { tc_seed_expected_into_value(val, tc_current_fn_ret) }
+    if returns_value {
+        tc_note_closure_expected_at(val, tc_calls.ret_ann, tc_current_fn_ret)
+        tc_seed_expected_into_value(val, tc_current_fn_ret)
+    }
     if returns_value { tc_infer_value(val) } else { infer_type(val) }
 }
 
@@ -38025,6 +38200,7 @@ fn tc_check_assignment(node: Int, block: Int, at: Int) ! TypeCheck.Resolve, Type
         let first = diag_entry_count()
         tc_check_assign_root(node, block, at)
         let root_reported = diag_entry_count() > first
+        tc_note_closure_expected_at(val, tc_assign_target_type_ann(target), target_t)
         let val_t = tc_infer_assigned_value(target_t, val)
         if kind == NodeKind.CompoundAssign {
             // No expected type reaches a compound operator but the target's own.
@@ -38095,6 +38271,7 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
             let seed_tail = tc_block_tail_stmt(node)
             if seed_tail != -1 {
                 if tc_block_tail_value(seed_tail) != -1 { hint_tail = seed_tail }
+                tc_note_closure_expected_at(tc_block_tail_value(seed_tail), tc_calls.ret_ann, tc_current_fn_ret)
                 tc_seed_expected_into_value(tc_block_tail_value(seed_tail), tc_current_fn_ret)
             }
         }
@@ -38193,6 +38370,7 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
 
         let mut inferred_tid = TYPE_UNKNOWN
         if val != -1 {
+            tc_note_closure_expected_at(val, type_ann, declared_tid)
             tc_seed_expected_into_value(val, declared_tid)
             // With no annotation the value has no expected type: the expectation of the block
             // this `let` sits in is the block's TAIL's, not this value's.
@@ -38639,6 +38817,7 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     }
 
     if kind == NodeKind.Return {
+        tc_calls.walk_returns.push(node)
         let val = node_value(node)
         if val != -1 {
             // An explicit `return` is expression context (§2.9) ONLY when the fn returns a
@@ -39931,7 +40110,12 @@ fn tc_check_test_block(tb: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repo
     let prev_boundary = tc_boundary_check_active
     tc_boundary_check_active = 1
     nr_push_scope()
+    let prev_ret_ann = tc_calls.ret_ann
+    tc_calls.ret_ann = -1
+    let mark = tc_returns_mark()
     tc_check_body(tbody)
+    let _ = tc_returns_since(mark)
+    tc_calls.ret_ann = prev_ret_ann
     tc_flush_deferred_conversions()
     nr_pop_scope()
     tc_boundary_check_active = prev_boundary
@@ -40296,6 +40480,7 @@ fn tc_infer_program_body(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Di
                         // Same spelling the registration loop (:5183) wrote, so tc_check_fn can
                         // find the signature and install the declared return.
                         tc_current_method_sig_key = tc_mangle_impl_fnsig(impl_type, tc_impl_trait_id(im), orig_name, im)
+                        tc_calls.written_names.insert(m, orig_name)
                         node_set_name(m, qualified)
                         tc_check_fn(m)
                         node_set_name(m, orig_name)

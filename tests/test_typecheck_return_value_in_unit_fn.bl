@@ -15,6 +15,32 @@ fn forward(b: Bool, n: Int) {
 
 fn tail_value() { 5 }
 
+fn id(x: Int) -> Int { x }
+
+fn arm_in_arg(x: Int) -> Int {
+    id(match x {
+        0 => return 6
+        _ => 1
+    }) + 1
+}
+
+fn arm_in_operand(o: Option[Int]) -> Int {
+    1 + match o {
+        Some(v) => return v + 7
+        None => 1
+    }
+}
+
+fn arm_block_in_operand(o: Option[Int]) -> Int {
+    1 + match o {
+        Some(v) => {
+            let w = v + 7
+            return w
+        }
+        None => 1
+    }
+}
+
 fn rejects(src: Str, tag: Str, ty: Str) ! FS.Delete, FS.Write, Process.Spawn, FS.Read, Env.Read, IO.Print {
     let out = compile_test_helpers.compile_and_capture("{src}\nfn main() \{ f() }\n", tag)
     compile_test_helpers.expect_error(out, "E0300", tag)
@@ -31,6 +57,37 @@ test "a value in a return of a fn with no -> R is E0300" {
     rejects("fn f() \{ return 5 }", "rvu_int", "Int")
     rejects("fn f() \{ return \"s\" }", "rvu_str", "Str")
     rejects("fn f() \{ if true \{ return 5 }\n lg() }\nfn lg() \{ }", "rvu_early", "Int")
+}
+
+// A `return` inside a value leaves the fn as one at a statement does.
+fn rejects_nested(src: Str, tag: Str) ! FS.Delete, FS.Write, Process.Spawn, FS.Read, Env.Read, IO.Print {
+    let out = compile_test_helpers.compile_and_capture("fn id(x: Int) -> Int \{ x }\n{src}\nfn main() \{ f(true) }\n", tag)
+    compile_test_helpers.expect_error(out, "E0300", tag)
+    compile_test_helpers.expect_contains(out, "return value type Int does not match function `f` return type ()", tag)
+    assert(!out.contains("internal compiler error"), out)
+    assert(!out.contains("GeneratedCDidNotCompile"), out)
+}
+
+test "a value in a return nested in an expression is E0300" {
+    rejects_nested("fn f(b: Bool) \{ return if b \{ return 9 } else \{ () } }", "rvu_nested_in_return")
+    rejects_nested("fn f(b: Bool) \{ let _ = id(if b \{ return 9 } else \{ 1 }) }", "rvu_nested_in_arg")
+    rejects_nested("fn f(b: Bool) \{ let _ = 1 + if b \{ return 9 } else \{ 1 } }", "rvu_nested_in_operand")
+    rejects_nested("fn f(b: Bool) \{ let _ = \"\{if b \{ return 8 } else \{ 1 }}\" }", "rvu_nested_in_interpolation")
+    rejects_nested("fn f(b: Bool) \{ let _ = [if b \{ return 9 } else \{ 1 }] }", "rvu_nested_in_list")
+    rejects_nested("fn f(b: Bool) \{ let _ = id(match b \{\n true => \{ return 9 }\n false => 1\n }) }", "rvu_nested_in_arm_of_arg")
+    rejects_nested("fn f(b: Bool) \{ let _ = id(match b \{\n true => return 9\n false => 1\n }) }", "rvu_nested_in_bare_arm_of_arg")
+    rejects_nested("fn f(b: Bool) \{ let _ = 1 + match b \{\n true => return 9\n false => 1\n } }", "rvu_nested_in_bare_arm_of_operand")
+}
+
+// A `return` in a braceless arm of a match inside a value leaves the fn, in a fn that returns a
+// value as in one that returns ().
+test "a return in an arm of a match inside a value runs and reads the arm bindings" {
+    assert_eq(arm_in_arg(0), 6)
+    assert_eq(arm_in_arg(1), 2)
+    assert_eq(arm_in_operand(Some(0)), 7)
+    assert_eq(arm_in_operand(None), 2)
+    assert_eq(arm_block_in_operand(Some(0)), 7)
+    assert_eq(arm_block_in_operand(None), 2)
 }
 
 test "a value in a return of a fn that writes -> () is E0300" {
@@ -56,6 +113,16 @@ test "the help names the repairs in order and the place the () comes from" {
     assert(!written.contains("has no `-> R`"), written)
 }
 
+// The fix names the return type as the program wrote it, not the type an alias stands for.
+test "the help names a written alias of ()" {
+    let f = compile_test_helpers.compile_and_capture("type U = ()\nfn f() -> U \{ return 5 }\nfn main() \{ f() }\n", "rvu_help_alias")
+    compile_test_helpers.expect_error(f, "E0300", "rvu_help_alias")
+    compile_test_helpers.expect_contains(f, "change `-> U` to `-> Int`, or drop the value", "rvu_help_alias")
+    let c = compile_test_helpers.compile_and_capture("type U = ()\nfn main() \{\n let k = fn() -> U \{ return 5 }\n k()\n}\n", "rvu_help_alias_closure")
+    compile_test_helpers.expect_error(c, "E0300", "rvu_help_alias_closure")
+    compile_test_helpers.expect_contains(c, "change `-> U` to `-> Int`, or drop the value", "rvu_help_alias_closure")
+}
+
 test "a method and a handler operation hold their return to () as a fn does" {
     let m = compile_test_helpers.compile_and_capture("trait Tr \{ fn m(self) }\ntype P \{ x: Int }\nimpl Tr for P \{ fn m(self) \{ return self.x } }\nfn main() \{ P \{ x: 1 }.m() }\n", "rvu_method")
     compile_test_helpers.expect_error(m, "E0300", "rvu_method")
@@ -63,6 +130,34 @@ test "a method and a handler operation hold their return to () as a fn does" {
     let h = compile_test_helpers.compile_and_capture("effect Ee \{\n effect S \{\n fn op()\n }\n}\nfn main() \{\n with handler Ee.S \{\n fn op() \{ return 4 }\n } \{\n ee.op()\n }\n}\n", "rvu_handler")
     compile_test_helpers.expect_error(h, "E0300", "rvu_handler")
     compile_test_helpers.expect_contains(h, "drop the value", "rvu_handler")
+}
+
+// The impl gives its method a qualified internal name; the error names the method as written.
+test "the error names a method as the program wrote it" {
+    let m = compile_test_helpers.compile_and_capture("trait Tr \{\n fn m(self)\n fn mk()\n}\ntype P \{ x: Int }\nimpl Tr for P \{\n fn m(self) \{ return self.x }\n fn mk() \{ return 3 }\n}\nfn main() \{\n P \{ x: 1 }.m()\n P.mk()\n}\n", "rvu_method_name")
+    compile_test_helpers.expect_contains(m, "does not match function `m` return type ()", "rvu_method_name")
+    compile_test_helpers.expect_contains(m, "add `-> Int` to the signature of `m`", "rvu_method_name")
+    compile_test_helpers.expect_contains(m, "`m` has no `-> R`, so it returns ()", "rvu_method_name")
+    compile_test_helpers.expect_contains(m, "does not match function `mk` return type ()", "rvu_method_name")
+    assert(!m.contains("P_m"), m)
+    assert(!m.contains("P_mk"), m)
+}
+
+test "a trait default body holds its return to () and names the method as written" {
+    let d = compile_test_helpers.compile_and_capture("trait Tr \{\n fn d(self) \{ return 5 }\n}\nfn main() \{ }\n", "rvu_trait_default")
+    compile_test_helpers.expect_error(d, "E0300", "rvu_trait_default")
+    compile_test_helpers.expect_contains(d, "does not match function `d` return type ()", "rvu_trait_default")
+    compile_test_helpers.expect_contains(d, "add `-> Int` to the signature of `d`", "rvu_trait_default")
+}
+
+// The fix names a type the program can write: a type parameter in scope as written, and for an
+// open slot a name that no type parameter in scope has.
+test "the help names a type parameter as written and gives an open slot a free name" {
+    let g = compile_test_helpers.compile_and_capture("fn f[A](x: A) \{ return x }\nfn main() \{ f(1) }\n", "rvu_help_tparam")
+    compile_test_helpers.expect_contains(g, "add `-> A` to the signature of `f`", "rvu_help_tparam")
+    let o = compile_test_helpers.compile_and_capture("fn f[T](x: T) \{ return [] }\nfn main() \{ f(1) }\n", "rvu_help_free_name")
+    compile_test_helpers.expect_error(o, "E0300", "rvu_help_free_name")
+    compile_test_helpers.expect_contains(o, "add `-> T1` to the signature of `f`", "rvu_help_free_name")
 }
 
 test "a return with no value, a unit value or a Never operand stays legal in a unit fn" {

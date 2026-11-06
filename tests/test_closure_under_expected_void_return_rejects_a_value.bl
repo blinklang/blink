@@ -22,6 +22,7 @@ test "a value in a return is E0300" {
     rejects("[1].into_iter().for_each(fn(x) \{ return x })", "cvr_iter")
     rejects("h(fn(i: Int) \{ return i })", "cvr_user")
     rejects("[1].for_each(fn(x) \{ if x > 0 \{ return x }\n lg() })", "cvr_early")
+    rejects("h(fn(i: Int) \{ let _ = 1 + if i > 0 \{ return i } else \{ 1 } })", "cvr_nested")
 }
 
 test "a return with no value, a unit value or a Never operand stays legal" {
@@ -101,7 +102,7 @@ test "a closure that writes -> () holds its return to it" {
     let written = compile_test_helpers.compile_and_capture("fn main() \{ let k = fn() -> () \{ return 1 }\n k() }\n", "cvr_written_text")
     assert(!written.contains("expected function type gives"), written)
     assert(!written.contains("to the expected function type"), written)
-    compile_test_helpers.expect_contains(written, "change `-> ()` to `-> T`, or drop the value", "cvr_written_text")
+    compile_test_helpers.expect_contains(written, "change `-> ()` to `-> Int`, or drop the value", "cvr_written_text")
     rejects("let k = fn() -> () \{ return 1 }\n k()", "cvr_written_int")
     let out = compile_test_helpers.compile_and_capture("fn main() \{ let k = fn() -> () \{ return [] }\n k() }\n", "cvr_written_open")
     compile_test_helpers.expect_error(out, "E0300", "cvr_written_open")
@@ -114,11 +115,60 @@ test "a closure under an expected type names that type as the source of its ()" 
     for body in ["h(fn(i) \{ return i })", "let f: fn(Int) -> () = fn(x) \{ return x }\n f(1)"] {
         let out = compile_test_helpers.compile_and_capture("{PRELUDE}fn main() \{ {body} }\n", "cvr_expected_text")
         compile_test_helpers.expect_contains(out, "which the expected function type gives", "cvr_expected_text")
-        compile_test_helpers.expect_contains(out, "add `-> T` to the expected function type, or drop the value", "cvr_expected_text")
+        compile_test_helpers.expect_contains(out, "add `-> Int` to the expected function type, or drop the value", "cvr_expected_text")
     }
 }
 
+// The label spans the type as the author wrote it: the param's annotation for an argument, the
+// let's annotation for a typed let.
+test "the error labels the expected function type that gives the ()" {
+    let arg = compile_test_helpers.compile_and_capture("{PRELUDE}fn main() \{ h(fn(i) \{ return i }) }\n", "cvr_label_arg")
+    compile_test_helpers.expect_contains(arg, "\"span\":\{\"line\":1,\"col\":10,\"end_line\":1,\"end_col\":23},\"message\":\"the expected function type `fn(Int) -> ()` gives the return ()\"", "cvr_label_arg")
+    let typed_let = compile_test_helpers.compile_and_capture("{PRELUDE}fn main() \{ let f: fn(Int) -> () = fn(x) \{ return x }\n f(1) }\n", "cvr_label_let")
+    compile_test_helpers.expect_contains(typed_let, "\"span\":\{\"line\":3,\"col\":20,\"end_line\":3,\"end_col\":33},\"message\":\"the expected function type `fn(Int) -> ()` gives the return ()\"", "cvr_label_let")
+}
+
+fn expect_label(src: Str, tag: Str, line: Int, col: Int, end_col: Int) ! FS.Delete, FS.Write, Process.Spawn, FS.Read, Env.Read, IO.Print {
+    let out = compile_test_helpers.compile_and_capture(src, tag)
+    compile_test_helpers.expect_error(out, "E0300", tag)
+    compile_test_helpers.expect_contains(out, "\"span\":\{\"line\":{line},\"col\":{col},\"end_line\":{line},\"end_col\":{end_col}},\"message\":\"the expected function type `fn(Int)` gives the return ()\"", tag)
+}
+
+// The () comes from the written type the closure meets, so the fix goes there and not on the
+// closure.
+test "the label points to the expected function type at each place that gives it" {
+    expect_label("type S \{ cb: fn(Int) }\nfn main() \{ let s = S \{ cb: fn(i) \{ return i } }\n s.cb(1) }\n", "cvr_label_field", 1, 14, 21)
+    expect_label("fn mk() -> fn(Int) \{\n fn(i) \{ return i }\n}\nfn main() \{ mk()(1) }\n", "cvr_label_return", 1, 12, 19)
+    expect_label("fn main() \{\n let mut k: fn(Int) = fn(_i) \{ }\n k = fn(i) \{ return i }\n k(1)\n}\n", "cvr_label_assign", 2, 13, 20)
+    expect_label("type S \{ cb: fn(Int) }\nfn main() \{\n let mut s = S \{ cb: fn(_i) \{ } }\n s.cb = fn(i) \{ return i }\n s.cb(1)\n}\n", "cvr_label_assign_field", 1, 14, 21)
+    expect_label("fn main() \{\n let xs: List[fn(Int)] = [fn(i) \{ return i }]\n io.println(\"\{xs.len()}\")\n}\n", "cvr_label_list", 2, 15, 22)
+    expect_label("fn main() \{\n let o: Option[fn(Int)] = Some(fn(i) \{ return i })\n let _ = o\n}\n", "cvr_label_some", 2, 16, 23)
+}
+
+// The U of `hf` is open, so a body that never completes leaves it for the other uses to fill.
+test "a closure that never completes under an open return leaves it to the other uses" {
+    let pre = "fn hf[U](f: fn() -> U) -> U \{ f() }\n"
+    compile_test_helpers.expect_compiles_clean(compile_test_helpers.compile_and_capture("{pre}fn main() \{\n hf(fn() \{ panic(\"x\") })\n}\n", "cvr_hof_free"), "cvr_hof_free")
+    compile_test_helpers.expect_compiles_clean(compile_test_helpers.compile_and_capture("{pre}fn main() \{\n let x: Int = hf(fn() \{ panic(\"x\") })\n io.println(\"\{x}\")\n}\n", "cvr_hof_int"), "cvr_hof_int")
+    let take = "fn take(_a: Int) \{ }\n"
+    let cases = [
+        ("let x = hf(fn() \{ panic(\"x\") })\n take(x)", "cvr_hof_let_arg"),
+        ("let x = hf(fn() \{ return panic(\"x\") })\n take(x)", "cvr_hof_let_arg_return"),
+        ("let s = hf(fn() \{ panic(\"x\") })\n let _t: Str = s", "cvr_hof_let_ann"),
+        ("let s = hf(fn() \{ return panic(\"x\") })\n let _t: Str = s", "cvr_hof_let_ann_return"),
+    ]
+    for c in cases {
+        let (body, tag) = c
+        compile_test_helpers.expect_compiles_clean(compile_test_helpers.compile_and_capture("{pre}{take}fn main() \{\n {body}\n}\n", tag), tag)
+    }
+}
+
+// `v` is still open when the closure body is checked; the use after the closure settles it.
 test "the text of a value settled later names the same source" {
-    let out = compile_test_helpers.compile_and_capture("fn mk[T]() -> T \{ panic(\"x\") }\nfn take(a: Int) \{ }\nfn main() \{ let k = fn() -> () \{ let v = mk()\n if true \{ return v }\n take(v)\n }\n k() }\n", "cvr_written_later")
-    compile_test_helpers.expect_contains(out, "change `-> ()` to `-> T`", "cvr_written_later")
+    let pre = "fn mk[T]() -> T \{ panic(\"x\") }\nfn take(_a: Int) \{ }\nfn h(f: fn(Int) -> ()) \{ f(1) }\n"
+    let out = compile_test_helpers.compile_and_capture("{pre}fn main() \{\n let v = mk()\n let k = fn() -> () \{ if true \{ return v } }\n take(v)\n k() }\n", "cvr_written_later")
+    compile_test_helpers.expect_contains(out, "change `-> ()` to `-> Int`", "cvr_written_later")
+    let exp = compile_test_helpers.compile_and_capture("{pre}fn main() \{\n let v = mk()\n h(fn(_i) \{ return v })\n take(v)\n }\n", "cvr_expected_later")
+    compile_test_helpers.expect_contains(exp, "add `-> Int` to the expected function type", "cvr_expected_later")
+    compile_test_helpers.expect_contains(exp, "the expected function type `fn(Int) -> ()` gives the return ()", "cvr_expected_later")
 }
