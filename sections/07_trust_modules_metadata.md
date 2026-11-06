@@ -4151,7 +4151,30 @@ error[E1023]: module `other` has no item `Hidden`
 - A use of the name gets no E0504, E0507 or E1006.
 - The entry takes no part in E1005 or E1012.
 
-A qualified name that the module does not declare (`other.nothre()`) keeps its own error, E0505. Its help uses the same candidates and the same nearest-name rule as E1023.
+A qualified name that the module does not declare (`other.nothre`, `other.nothre()`) keeps its own error, E0505, as a read and as a call. The head is "no member `nothre` on module `other`", the head shape of an unknown member of a type path (§3.4 *An unknown member of a type path*). The span is the member name `nothre`, not the qualifier `other`. Its help uses the same candidates and the same nearest-name rule as E1023.
+
+Suppose `other` declares `pub fn nothere()`:
+
+```blink
+import other
+
+fn main() {
+    let f = other.nothre
+    other.nothre()
+}
+```
+
+```
+error[UnresolvedMethod]: no member `nothre` on module `other`
+ --> main.bl:4:19
+  |
+4 |     let f = other.nothre
+  |                   ^^^^^^ `other` has no member `nothre`
+  |
+  = help: did you mean `other.nothere`?
+```
+
+The call on line 5 gives the same head and the same span on `nothre`, and the same help.
 
 #### Import Aliases
 

@@ -2560,8 +2560,8 @@ The compiler picks the reading from scope and namespaces only, never from the me
 
 **Member case.** In a type path `K.x`, the first character of `x` decides which members it can name:
 
-- An uppercase first character (Unicode `Lu` or `Lt`) never names a function. `K.X` names a variant of `K` or a type-scoped constant `const K.X` (§2.12.3). When `K` is an enum that has neither, the site is `NoSuchVariant` (E0547).
-- Any other first character never names a variant. `K.x` names a type-scoped function `fn K.x`, an associated function that a trait impl gives `K` (§3c.4), or a type-scoped constant. When `K` has none of these, the site is an unknown member of the type path, never E0547. The candidates of its nearest-name suggestion (ERROR_CATALOG *Conventions*) include the variants of `K`, so `K.zed` suggests the variant `K.Zed`.
+- An uppercase first character (Unicode `Lu` or `Lt`) never names a function. `K.X` names a variant of `K` or a type-scoped constant `const K.X` (§2.12.3). When `K` has neither, the site is `NoSuchVariant` (E0547). `K` is an enum for this rule, or a type that is not an enum (*A variant the enum does not declare*, below).
+- Any other first character never names a variant. `K.x` names a type-scoped function `fn K.x`, an associated function that a trait impl gives `K` (§3c.4), or a type-scoped constant. When `K` has none of these, and no other rule of this specification gives the site its own code, the site is `UnresolvedMethod` (E0505), never E0547. It is E0505 for a read (`K.zed`) and for a call (`K.zed(1)`). The name says "method", but the code covers a read of a member too. The first character of the member picks the code: uppercase is E0547, any other character is E0505. The candidates of its nearest-name suggestion (ERROR_CATALOG *Conventions*) include the variants of `K`, so `K.zed` suggests the variant `K.Zed` (*An unknown member of a type path*, below).
 
 No function in a `T.` namespace has an uppercase name (§2.12.3 *Function names*), so each case looks in one set of members, with no order between them.
 
@@ -2574,9 +2574,81 @@ fn main() {
     let a = Level.High        // a variant
     let b = Level.parse("hi") // a type-scoped function
     let c = Level.Hihg        // error[NoSuchVariant]
-    let d = Level.high        // error: `Level` has no member `high`; the help suggests `Level.High`
+    let d = Level.high        // error[UnresolvedMethod]: no member `high` on type `Level`; the help suggests `Level.High`
 }
 ```
+
+```
+error[UnresolvedMethod]: no member `high` on type `Level`
+ --> level.bl:9:19
+  |
+9 |     let d = Level.high
+  |                   ^^^^ `Level` has no member `high`
+  |
+  = help: did you mean the variant `Level.High`?
+  = fix: Level.High
+```
+
+**An unknown member of a type path.** These rules cover a lowercase member that `K` does not declare, as a read (`K.zed`) and as a call (`K.zed(1)`, `K.zed()`). Both give one code, E0505, and one head.
+
+- **Head and span.** The head is "no member `x` on type `K`". A member of a module that the module does not declare has the same shape: "no member `x` on module `m`" (§10.5 *Import Errors*). The span is the member name `x`, never `K` or `m`, for a type path and for a module path alike. The binding that holds the value of the site has the poison type (§6.3.5), so a later use of it reports nothing more.
+- **Candidates.** The candidates for the nearest-name suggestion are the type-scoped functions, the associated functions, the type-scoped constants and the variants of `K`. A field of a struct is never a candidate. With one nearest candidate, the help names it. With two or more equally near candidates, or none near enough, there is no suggestion, and the help lists the members of `K` by kind.
+- **The fix.** The help for a candidate of any kind carries a machine-applicable fix only when all of these hold:
+  1. the rewritten site passes the checker and adds no diagnostic;
+  2. for a variant candidate, the payload form of the site agrees with the payload form of the variant, the rule of E0547;
+  3. the candidate is the one nearest candidate across the functions, the constants and the variants together.
+
+  When one condition fails, the help names the candidate and there is no fix. The rule is on the result: the compiler offers a fix only for a site that it has checked after the edit.
+- **A field.** When `x` is a field of the struct `K`, the error adds a `note:` that says so. The note has no fix, because the compiler cannot choose the value to read the field on.
+
+```blink
+type Level { Low, High }
+
+fn main() {
+    let a = Level.high                   // error[UnresolvedMethod], fix: Level.High
+    let f: fn() -> Level = Level.high    // error[UnresolvedMethod], help names Level.High, no fix: it does not type-check
+    let b = Level.high(1)                // error[UnresolvedMethod], help names Level.High, no fix: High takes no payload
+}
+```
+
+In the second line the rewrite `Level.High` has the type `Level`, and the site wants `fn() -> Level`, so the rewrite is not accepted. In the third line `High` has no payload, so the call form does not fit it. 
+```blink
+type Dir { Left, Lift }
+
+fn main() {
+    let a = Dir.lxft     // error[UnresolvedMethod]: `Left` and `Lift` are equally near, so no suggestion and no fix
+}
+```
+
+```
+error[UnresolvedMethod]: no member `lxft` on type `Dir`
+ --> dir.bl:4:17
+  |
+4 |     let a = Dir.lxft
+  |                 ^^^^ `Dir` has no member `lxft`
+  |
+  = help: `Dir` declares: variants Left, Lift
+```
+
+```blink
+type Point { x: Int, y: Int }
+
+fn main() {
+    let v = Point.x
+}
+```
+
+```
+error[UnresolvedMethod]: no member `x` on type `Point`
+ --> point.bl:4:19
+  |
+4 |     let v = Point.x
+  |                   ^ `Point` has no member `x`
+  |
+  = note: `x` is a field of `Point`; read it on a value, such as `p.x`
+```
+
+A call and a read of the same name give the same diagnostic, so adding `()` while fixing a site does not change the code. The rule for a module path is in §10.5 (*Import Errors*), and the code row is in ERROR_CATALOG (UnresolvedMethod).
 
 A bare `Name` and `Name(...)` stay under *Values come first*: a type name is never a bare value. A variant with the name of its own enum is E0518 (*Name collisions*, below). A struct with the name of a variant is legal; `Name { ... }` then reads as the struct literal (*Name collisions*, below).
 
@@ -2727,7 +2799,7 @@ fn lookup(id: Int) -> Result[Str, QueryError] {
 
 No path silently picks a winner between two constructible names: a variant carries its enum in an expression, so a bare `Name { ... }` is the struct, and a bare variant is E0554. A value with the name of a user variant does not collide with it, because a bare name never reaches a user variant. A local named `Some`, `None`, `Ok` or `Err` hides the prelude variant. That is a shadow between scopes, by the order in *Values come first*, and W1011 marks it (§10.6 *Shadowing Rules*).
 
-**A variant the enum does not declare.** A qualified construction `K.Zed`, `K.Zed(1)` or `K.Zed { .. }` where the enum `K` declares no variant `Zed` is `NoSuchVariant` (E0547). The span, the candidates, the machine-applicable rename and the variant list follow the pattern rule (§3.5 *Pattern Forms*); the payload form is that of the construction. The order of checks is also the same: resolve `K` (`UnknownType`, E0507), look up the variant (E0547), then compare with the expected type (`TypeError`, E0300). A name after `K.` that does not start with an uppercase letter is never a variant, so it never gets E0547 (*Member case*, above). A `Q` that is not an enum is E0547 in an expression too (`Int.Zed`, `Point.Zed(1)`). The message says what `Q` is, as in a pattern. A bare `Zedd(1)` that names no variant and no value stays `UndefinedFunction` (E0504). A binding whose value has the error, such as `x` in `let x = K.Zed`, has the poison type (§6.3.5), so a later use of `x` reports nothing more.
+**A variant the enum does not declare.** A qualified construction `K.Zed`, `K.Zed(1)` or `K.Zed { .. }` where the enum `K` declares no variant `Zed` is `NoSuchVariant` (E0547). The span, the candidates, the machine-applicable rename and the variant list follow the pattern rule (§3.5 *Pattern Forms*); the payload form is that of the construction. The order of checks is also the same: resolve `K` (`UnknownType`, E0507), look up the variant (E0547), then compare with the expected type (`TypeError`, E0300). A name after `K.` that does not start with an uppercase letter is never a variant, so it never gets E0547 (*Member case*, above). A `Q` that is not an enum is E0547 in an expression too (`Int.Zed`, `Point.Zed(1)`). The message says what `Q` is, as in a pattern. In an expression, the candidates are the variants of `Q` and its type-scoped constants (§2.12.3), because an uppercase member names one of the two (*Member case*, above). So a struct that declares `const Config.MAX` gets a help for `Config.MAXX`; the code and the head stay as they are. A bare `Zedd(1)` that names no variant and no value stays `UndefinedFunction` (E0504). A binding whose value has the error, such as `x` in `let x = K.Zed`, has the poison type (§6.3.5), so a later use of `x` reports nothing more.
 
 ```blink
 type Level { Low, High }
@@ -2736,6 +2808,16 @@ fn main() {
     let x = Level.Hihg     // error[NoSuchVariant]
     let y = x              // no further error: `x` has the poison type
 }
+```
+
+```blink
+type Config { port: Int }
+
+const Config.MAX = 10
+
+fn main() {
+    let m = Config.MAXX   // error[NoSuchVariant]: `Config` is a struct; it has no variants
+}                         // help: did you mean the constant `Config.MAX`?
 ```
 
 ```
