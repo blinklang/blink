@@ -53,6 +53,8 @@ The one exception is an iterator built from a mutable closure (`iter.from_fn`, b
 
 The adapter methods on `Iterator[T]` are lazy: each returns a new iterator and touches no elements until a consuming method or a `for` loop pulls from the end. They are compiler-provided; the bodies are internal (the carrier layout is unspecified), so only signatures are shown.
 
+These signatures show the shape that §3.6 *Method Type Parameters* lets a user trait declare. `Iterator` is sealed, so §3.6 gives the rule for user code, and this list does not.
+
 ```blink
 // Transforming
 fn map[U](self, f: fn(T) -> U) -> Iterator[U]

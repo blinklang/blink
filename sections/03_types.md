@@ -3120,7 +3120,7 @@ let buf = alloc_ptr[U8]()
 
 Explicit type application is a third supply mechanism alongside inference at a construction site and a type annotation on the binding. All three name the same type parameters and differ only in where the program writes them. Brackets in this position can never be confused with indexing or comparison — Blink has no index operator, and element access is `.get()` (§2.6).
 
-**No erasure.** Every type parameter a declaration binds is part of that declaration's instantiation, whether or not a parameter type or the return type mentions it. `probe[Int]()` and `probe[Str]()` are distinct instantiations. A type parameter is never dropped, never defaulted, and never merged with another instantiation's — the guarantee §3.4 *Under-Determined Types* makes at a binding, applied to a declaration.
+**No erasure.** Every type parameter a declaration binds is part of that declaration's instantiation, whether or not a parameter type or the return type mentions it. `probe[Int]()` and `probe[Str]()` are distinct instantiations. A type parameter is never dropped, never defaulted, and never merged with another instantiation's — the guarantee §3.4 *Under-Determined Types* makes at a binding, applied to a declaration. A method is a declaration: its own binders join the binders of its impl in its instantiation (§3.6 *Method Type Parameters*).
 
 **When brackets are mandatory.** A type parameter is **supplied by the signature** when it occurs in a parameter type or in the return type: inference solves it from the call's arguments, or from the annotation on the binding the call feeds. A type parameter the signature does not supply has no other source, so every call must write it:
 
@@ -3472,6 +3472,30 @@ fn cell[T]() -> Ptr[T] { alloc_ptr[T]() }      // no warning -- T occurs in the 
 A **bound is an occurrence.** `T: Serialize` partitions the instantiations into well-typed and ill-typed, so the binder decides which programs exist: `assert_serializable[NotSerializable]()` is rejected and `assert_serializable[User]()` is accepted. Deleting that binder would accept both. A declaration whose only mention of `T` is its bound is a compile-time assertion, and warning that `T` is unused would assert something untrue about the code.
 
 *Rationale.* The gate is drawn where it is because **W0604 fires exactly when deleting the binder is a safe edit** — when the declaration still compiles afterwards and means the same thing, so the fix the lint prescribes cannot break working code. Occurrence is what makes that property checkable: any mention of `T` anywhere in the declaration or its body is a way the declaration could depend on `T`, and a mention in a body form the language has not been given yet is still a mention. Stated as a predicate the counterfactual needs machinery the gate does not — the comparison is between programs modulo the mechanical erasure of type-argument lists at call sites, since deleting any binder turns `tag[Int]()` into an arity error on its own. The occurrence clause is the rule; safety of the prescribed edit is the reason the rule is drawn there. If a future type position lets a body depend on `T` without naming it, this rationale is the criterion for amending the clause.
+
+**A method binder.** For a function, and for an inherent method, the gate above is the whole rule. For a method of a trait, it is the same gate, applied to the one declaration that can be the whole method. A required method and an open default method have more than one body: an impl may provide or override the method in another file or package, and that body may use the binder. Deleting the binder is then not a safe edit, because every impl that repeats it (§3.6 *Method Type Parameters*) would stop compiling. So W0604 does not fire on a required method or an open default method. A `final` default method (§3.6 *Trait Declaration*) has one body and no impl can override it, so the declaration is the whole method, and W0604 fires on it by the gate above. An impl method of a trait never gets W0604, because the trait forces the impl to repeat the binder.
+
+```blink
+trait Odd {
+    fn odd[U](self) -> Int                        // no W0604: an impl body may use U
+}
+
+trait Odd3 {
+    fn odd3[U](self) -> Int { 1 }                 // no W0604: an override may use U
+}
+
+trait Odd2 {
+    final fn tag[U](self) -> Int { 1 }            // W0604: U occurs nowhere, and no impl can override this method
+}
+
+type A { n: Int }
+
+impl Odd for A {
+    fn odd[U](self) -> Int { let xs: List[U] = []  xs.len() }   // no W0604: E0906 forces this binder
+}
+```
+
+The `help:` of W0604 on a `final` method says that no impl can override the method. The bare call `a.odd()` is still `error[CannotInferType]` (E0301) at the call, and the brackets are the repair (§3.6 *Method Type Parameters*).
 
 W0604 is a warning and not an error: a binder nothing supplies is still callable, because the brackets reach it. Nothing about such a declaration is unsound — it is merely a declaration whose every call must carry a type argument that changes nothing, and the lint is what keeps those out of a codebase.
 
@@ -6603,6 +6627,173 @@ fn main() {
 A fix for a marker that is missing, added or moved is machine-applicable. So is a fix for keyword order. A fix for a renamed keyword is machine-applicable only when each impl name matches one trait name by position and the new name is free in the body. That fix renames the uses in the body too. Otherwise a rename gets a `help:` only. A fix for E0915 that deletes a default is machine-applicable when the default has the same value as the trait's. A default with another value, or a default that only the impl writes, gets a `help:` only, because the deletion changes the value that a call passes (§3.1 rule 1).
 
 Hover and `blink query` on an impl method show the defaults that it inherits from the trait.
+
+#### Method Type Parameters
+
+A method may declare type parameters of its own, in brackets after its name, as a generic function does (§3.4 *Explicit Type Application*). A trait method, an impl method and a trait default method may each do so. A method is a declaration, so *no erasure* (§3.4) applies to it: every binder that it declares is part of its instantiation.
+
+```blink
+trait Comb {
+    fn combine[U](self, a: U, b: U) -> U
+}
+
+type C { n: Int }
+
+impl Comb for C {
+    fn combine[U](self, a: U, b: U) -> U { a }
+}
+
+fn use_it[T: Comb](t: T) -> Str { t.combine("x", "y") }
+
+fn main() {
+    let c = C { n: 1 }
+    io.println("{c.combine(2, 3)}")             // 2: the arguments fix U = Int
+    io.println("{c.combine[Int](4, 5)}")        // 4
+    io.println("{Comb.combine[Int](c, 4, 5)}")  // 4
+    io.println(use_it(c))                       // x
+}
+```
+
+**One instance for each pair of lists.** The instantiation of a method is keyed by the binders of its impl, then the binders of the method. The receiver fixes the impl binders, through impl selection. The arguments, the expected type or a written list fix the method binders. A trait default method is keyed in the same way, for each impl that inherits it: each impl has its own instances of the default. The compiler checks the default body once, with `Self` and the method binders abstract (*Parametricity*, §3.6 *Polymorphic Trait Implementations*).
+
+```blink
+trait Wrap {
+    fn wrap[U](self, u: U) -> (Int, U)
+}
+
+impl[T] Wrap for List[T] {
+    fn wrap[U](self, u: U) -> (Int, U) { (self.len(), u) }
+}
+
+trait Tagged {
+    fn sh[U](self, u: U) -> Int { 7 }
+}
+
+type A { n: Int }
+
+impl Tagged for A {}
+impl[T] Tagged for List[T] {}
+
+fn main() {
+    let (a, b) = [1, 2].wrap("s")    // instance T = Int, U = Str
+    let (c, d) = ["x"].wrap(1)       // instance T = Str, U = Int: a second instance
+    let (e, f) = [9].wrap("t")       // the instance of the first call
+    io.println("{a} {b} {c} {d} {e} {f}")   // 2 s 1 1 1 t
+    io.println("{A { n: 1 }.sh(1)} {[1].sh("x")}")   // 7 7: one instance of the default for each impl
+}
+```
+
+**Brackets after a method name fill the method's own binders, and only those.** The list fills them in declaration order. It never names `Self` or an impl binder: impl selection admits no type-argument list (E0909). The same rule holds for a call on a receiver (`c.combine[Int](4, 5)`), for a trait-qualified call (`Comb.combine[Int](c, 4, 5)`) and for a call through a bound (`t.combine[Int](4, 5)` with `T: Comb`). A list that has the wrong count is `error[TypeArgArity]` (E0303) once the receiver type is known. The count does not include the impl binders.
+
+```blink
+fn main() {
+    let c = C { n: 1 }
+    io.println("{c.combine[Int, Str](4, 5)}")   // error[TypeArgArity] (E0303): `combine` takes 1 type argument, 2 given
+    io.println("{[1].wrap[Int, Str]("s")}")     // error[TypeArgArity] (E0303): `wrap` takes 1 type argument, 2 given
+                                                //   `T` of the impl comes from the receiver and is not written
+    io.println("{[1].wrap[Str]("s")}")          // 1 s
+}
+```
+
+**A binder that no argument fixes.** When no argument, no expected type and no written list fixes a binder of a user trait method, a bare call is `error[CannotInferType]` (E0301) at the call, as it is for a function (§3.4 *Explicit Type Application*). The brackets are the repair. The `help:` prints the call as the program wrote it, with the receiver, so that the user can use it as it is:
+
+```blink
+trait Mk {
+    fn mk[U](self) -> Int
+}
+
+impl Mk for C {
+    fn mk[U](self) -> Int { let xs: List[U] = []  xs.len() }
+}
+
+fn main() {
+    let c = C { n: 1 }
+    io.println("{c.mk[Int]()}")   // 0
+    io.println("{c.mk()}")        // error[CannotInferType] (E0301): type parameter `U` of `mk` is unbound at this call
+                                  //   and nothing supplies it
+                                  //   help: write the type arguments at this call: `c.mk[U]()`
+}
+```
+
+For a trait-qualified call, the `help:` prints `Mk.mk[U](c)`.
+
+An operator, a `with` block, a `for` loop and a string interpolation call only compiler-known trait methods that declare no binder (`Eq.eq` and `Display.fmt` are two). An impl cannot add a binder to such a method (below). So no call that has no place for brackets can reach an open binder. An impl that adds a binder to one of these methods is E0906 at the impl, and the use site gets no second error.
+
+**An impl method repeats the binder list of its trait method.** The impl method has the same number of binders. A binder in the impl matches the binder of the trait method at the same position, and its bounds are the same bounds. The names may differ, as positional parameter names may. A bound that names a parameter of the trait is read after the impl's trait arguments replace that parameter: for `trait Tr[A] { fn m[U: Into[A]](self, u: U) -> Int }`, the impl `impl Tr[Int] for B` writes `fn m[U: Into[Int]]`. A binder list that does not match is `error[TraitContractGenericMismatch]` (E0906). The span is the impl method's binder list. When the impl method has no list, the span is the method name. There is one error for each method. The same fault gives no E0902 and no E0903 for that method: a renamed binder, or a missing one, would give those errors for the wrong cause.
+
+```blink
+trait Conv {
+    fn conv[U: Display](self, u: U) -> Str
+}
+
+type A { n: Int }
+type B { n: Int }
+type D { n: Int }
+
+impl Conv for A {
+    fn conv[V: Display](self, v: V) -> Str { "a" }    // OK: the name differs, the position and the bound match
+}
+
+impl Conv for B {
+    fn conv[U](self, u: U) -> Str { "b" }             // error[TraitContractGenericMismatch] (E0906)
+                                                      //   `Conv.conv` declares `U: Display`, this method declares `U` with no bound
+}
+
+impl Conv for D {
+    fn conv(self, u: Int) -> Str { "d" }              // error[TraitContractGenericMismatch] (E0906)
+                                                      //   `Conv.conv` declares 1 type parameter, this method declares 0
+                                                      //   help: the trait method is `fn conv[U: Display](self, u: U) -> Str`
+}
+```
+
+An impl method that adds a binder to a trait method that has none is the case that the operator and `with` rows raise. The error is at the impl:
+
+```blink
+type P { n: Int }
+
+impl Eq for P {
+    fn eq[U](self, o: P) -> Bool { self.n == o.n }
+    // error[TraitContractGenericMismatch] (E0906): method `eq` declares 1 type parameter, but `Eq.eq` declares 0
+    //   `Eq.eq` is declared as `fn eq(self, other: Self) -> Bool`
+    //   a call through `Eq`, such as `a == b`, has no place to write `U`
+    //   help: remove `[U]`: `fn eq(self, o: P) -> Bool`      (machine-applicable: `U` occurs nowhere else in the method)
+}
+
+type Q { n: Int }
+
+impl Eq for Q {
+    fn eq[U](self, o: Q) -> Bool { let xs: List[U] = []  xs.len() == 0 }
+    // error[TraitContractGenericMismatch] (E0906): the same message
+    //   help: remove `[U]`, and the use of `U` in the body       (a `help:` only: `U` occurs in the body)
+}
+```
+
+A fix that deletes `[U]` is machine-applicable only when `U` occurs nowhere else in the impl method. When `U` occurs in the body or in another signature position, the deletion alone would make the method fail, so the `help:` says what to change and the compiler does not apply it (§3.1 rule 1). When the trait method declares binders and the impl method has none, the `help:` prints the trait method's binder list, and the fix is not machine-applicable.
+
+*Rationale.* One method has one call surface (§3.6 *Keyword Parameters in Impls*). A call through a bound, a call on a concrete receiver and a trait-qualified call all read the binder list of the trait method, and each binder needs a value at each call (§3.4 *No erasure*). An impl that adds a binder has no call that could supply it. An impl that drops a binder is less general than its contract. The error is at the impl, by the argument of E0909: no use site can repair the declaration. The rule demands the same bounds, not weaker ones. This may refuse an impl that would be sound with a weaker bound. A later decision may relax the rule, and that change breaks no program that compiles under this rule.
+
+**A type-parameter name is unique in its scope.** At a declaration, the binders in scope are the binders of its own list and the binders of the declarations that enclose it: for an impl method, the binders of its impl; for a trait method, including a default method, the binders of its trait. No two of these binders have the same name. The rule covers a repeated name in one list, a method binder that repeats an impl binder, and a method binder that repeats a trait binder. It is `error[DuplicateTypeParam]` (E0326) at the second binder, with a `note:` at the first binder and the `help:` "rename it". The rule is about the binder lists of a function, a method, an impl and a trait. It says nothing about any other place that may declare a type parameter.
+
+```blink
+fn f[T, T](a: T) -> Int { 1 }
+// error[DuplicateTypeParam] (E0326): `T` is already a type parameter here
+//   note: `T` is first declared here
+//   help: rename it
+
+impl[T] Wrap for List[T] {
+    fn wrap[T](self, u: T) -> (Int, T) { (self.len(), u) }
+    // error[DuplicateTypeParam] (E0326): `T` is already a type parameter of this impl
+    //   note: `T` is declared by `impl[T]` here
+    //   help: rename it, as in `fn wrap[U](self, u: U) -> (Int, U)`
+}
+
+trait Tr[T] {
+    fn m[T](self, a: T) -> Int
+    // error[DuplicateTypeParam] (E0326): `T` is already a type parameter of this trait
+}
+```
+
+The fix is a `help:` only. A rename must follow every use of the name in the body, so the compiler does not apply it. A rename never breaks the matching rule above, because E0906 matches binders by position and not by name. The rule makes one name stand for one type variable in a body, and it gives one slot for each name in the key of an instance.
 
 #### Trait Bounds
 
