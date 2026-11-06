@@ -2800,7 +2800,7 @@ fn main() ! IO {
 }
 ```
 
-**Rollout.** The rule of §8.16.1 *Rollout of a new error* applies to this rule. A released compiler accepted `Str.len("abc")`, `List.len(xs)` and a call of a user trait method through the type, such as `Level.shout(u)`, and refused `Int.abs(-3)`. The message, the help and the fix are the same at each severity the rule gives the site. The code keeps its name and its number when its severity changes.
+**Rollout.** The rule of §8.16.1 *Rollout of a new error* applies to this rule. A released compiler accepted `Str.len("abc")`, `List.len(xs)` and a call of a user trait method through the type, such as `Level.shout(u)`, and refused `Int.abs(-3)`. Before 1.0 the error is an error at once, with the same message, help and fix that it keeps from 1.0 on. The code keeps its name and its number.
 
 A bare `Name` and `Name(...)` stay under *Values come first*: a type name is never a bare value. A variant with the name of its own enum is E0518 (*Name collisions*, below). A struct with the name of a variant is legal; `Name { ... }` then reads as the struct literal (*Name collisions*, below).
 
@@ -3108,11 +3108,11 @@ A variant with no payload that gets arguments (`None(1)`, `Shape.Dot(1.0)`) is `
 
 **`Ok` takes one argument.** `Ok` has one field, as `Some` and `Err` do. The unit success is `Ok(())`, so `Ok()` is `VariantArgumentCount`:
 
-- Where the success type is `()`, `Ok()` is a warning, with a machine-applicable fix to `Ok(())`. It becomes an error in the next release, and the diagnostic keeps its name and code (§8.16.1 *Rollout of a new error*).
+- Where the success type is `()`, `Ok()` is an error at once, with a machine-applicable fix to `Ok(())`. Before 1.0 a new error has no warning release (§8.16.1 *Rollout of a new error*).
 - Where the success type is not `()`, `Ok()` is an error at once, with no fix. That program has no meaning, and `Ok(())` would be the wrong value there.
 - Every other wrong count is an error at once.
 
-In `let r = Ok()` the success type is not known. While `Ok()` is a warning, the compiler cannot say if the arity diagnostic is a warning or an error, so it reports `CannotInferType` (E0301) only. When `Ok()` is an error, it reports the arity error first and not E0301: a rejected term gives no type to infer from.
+In `let r = Ok()` the success type is not known. The compiler reports the arity error and not `CannotInferType` (E0301): a rejected term gives no type to infer from.
 
 ```blink
 fn done() -> Result[(), Str] { Ok(()) }       // ok: the unit success
@@ -3122,14 +3122,14 @@ fn one() -> Option[Int] { Some(1) }           // ok
 ```blink
 type Shape { Sq(Float, Float), Dot }
 
-fn a() -> Result[(), Str] { Ok() }            // warning[VariantArgumentCount]: fix is Ok(())
+fn a() -> Result[(), Str] { Ok() }            // error[VariantArgumentCount]: at once, fix is Ok(())
 fn b() -> Result[Int, Str] { Ok() }           // error[VariantArgumentCount]: at once, no fix
 fn c() -> Option[Int] { Some() }              // error[VariantArgumentCount]
 fn d() -> Shape { Shape.Dot(1.0) }            // error[VariantArgumentCount]
 ```
 
 ```
-warning[VariantArgumentCount]: variant `Ok` takes 1 argument, got 0
+error[VariantArgumentCount]: variant `Ok` takes 1 argument, got 0
   note: fields of `Ok`, in order: T
   help: write `Ok(())`
 error[VariantArgumentCount]: variant `Ok` takes 1 argument, got 0
@@ -3142,7 +3142,7 @@ error[VariantArgumentCount]: variant `Shape.Dot` takes no arguments, got 1
 
 ```blink
 fn main() {
-    let r = Ok()    // warning stage: error[CannotInferType] only; later: error[VariantArgumentCount] only
+    let r = Ok()    // error[VariantArgumentCount] only, not CannotInferType
 }
 ```
 
@@ -6080,7 +6080,14 @@ impl Display for Marker {
 
 `MutAliasOfImmutable` checks direct aliases only. An alias made through a call result (`id(a)`) or a struct literal (`W { xs: a }`) passes it. An immutable `let` is not a promise that the value behind it never changes (§3.2.2).
 
-**Rollout.** Each new error in this subsection follows the rule of §8.16.1 *Rollout of a new error*. The warning carries a machine-applicable fix where one exists that keeps the program's meaning; otherwise it carries help only.
+**Rollout.** Each new error in this subsection follows the rule of §8.16.1 *Rollout of a new error*. That rule also says when a fix is machine-applicable and when the error carries help only. Before 1.0, `ParamAssign` (E0612) is an error in the first release that has it, with the fix of *A parameter is never assigned*; a program that assigns to a parameter gets the error, not a warning:
+
+```blink
+fn dec(n: Int) -> Int {
+    n = n - 1                   // error[ParamAssign] at once; blink fix inserts `let mut n = n` at the start of the body
+    n
+}
+```
 
 #### Operations on `Self` in a Default Body
 

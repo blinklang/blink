@@ -3021,14 +3021,26 @@ edition = "2026"
 - **Infinite compatibility.** Every edition is supported forever. The compiler never drops support for an older edition. A `edition = "2026"` package compiles with the 2035 compiler. There is no "upgrade or die" — upgrading editions is always voluntary.
 - **Default.** When `edition` is omitted from `blink.toml`, the compiler uses the latest stable edition at the time the compiler was built. For new projects, `blink init` writes the current edition explicitly. An `edition` that the toolchain does not know is an error (§8.9.8).
 
-**Rollout of a new error.** A new error that rejects a program that compiled and ran as written ships first as a warning with a machine-applicable fix that `blink fix` applies, and becomes an error in the next release. The diagnostic keeps its name and code when it becomes an error. A new error for a program that had no meaning is an error from the first release that has it. A program has no meaning if it ICEs or miscompiles, or if the spec never allowed it. A section that adds an error points to this rule and keeps no copy of it.
+**Rollout of a new error.** A new error carries a machine-applicable fix where one exists that keeps the program's meaning, so `blink fix` can migrate the code. Where no such fix exists, it carries help only. A section that adds an error points to this rule and keeps no copy of it.
 
-The warning and the error have one code when only the severity changes. They have two codes when the warning and the error name different properties: `W0731` and `E0731` (§3.6 *Migration: `@deprecate_override` warning hop*) are two codes because an override of a deprecated default and an override of a sealed method are two different faults.
+*Before 1.0.* A new error that rejects a program that an earlier release built and ran is an error in the first release that has it. There is no warning release. The *Breaking Changes* section of that release's CHANGELOG lists each such error, with its fix. The error keeps its name and its code from the first release on.
+
+*From 1.0 on.* A new error that rejects a program that compiled and ran as written ships first as a warning with the fix, and becomes an error in the next release. The diagnostic keeps its name and code when it becomes an error. A new error for a program that had no meaning is an error from the first release that has it. A program has no meaning if it ICEs or miscompiles, or if the spec never allowed it.
+
+The warning and the error have one code when only the severity changes. They have two codes when the warning and the error name different properties: `W0731` and `E0731` (§3.6 *Migration: `@deprecate_override` warning hop*) are two codes because an override of a deprecated default and an override of a sealed method are two different faults. This paragraph governs the rule for 1.0 and later.
+
+Before 1.0, `Ok()` at the success type `()` is an error at once, with the fix `Ok(())`:
 
 ```blink
 fn ok_now() -> Result[(), Str] { Ok(()) }     // ok
+fn breaks() -> Result[(), Str] { Ok() }       // error[VariantArgumentCount] at once; blink fix writes Ok(())
+fn never() -> Result[Int, Str] { Ok() }       // error[VariantArgumentCount] at once, no fix: it has no meaning
+```
+
+From 1.0 on, the middle line is the one that changes:
+
+```blink
 fn warns() -> Result[(), Str] { Ok() }        // warning[VariantArgumentCount], error in the next release: Ok() compiled and ran
-fn never() -> Result[Int, Str] { Ok() }       // error[VariantArgumentCount] at once: it has no meaning
 ```
 
 **How editions interact with dependencies:** The compiler resolves each package's edition independently. If package A (edition 2028) depends on package B (edition 2026), the compiler checks A against 2028 rules and B against 2026 rules. No edition leaks across package boundaries. This is why editions can only gate per-package concerns (stdlib, keywords, lint) — they cannot change type system semantics or effect resolution, which are cross-package.
