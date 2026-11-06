@@ -3174,7 +3174,7 @@ let mut tc_ud_blamed: Map[Int, Int] = Map()
 // [-1, im, n, tid...] (tc_note_conversion_call), [-1, -1, 1, ctor] (tc_note_open_ctor_key),
 // [-2, -1, 0] (tc_note_deferred_conversion), [-3, -1, 0] (tc_note_open_variant),
 // [-4, sig, tid, n, binder..., enclosing fn] (tc_note_fn_value),
-// [-5, closure, 0] (tc_note_void_return) or
+// [-5, owner, 0] (tc_note_void_return) or
 // [-6, im, n, tid..., call, receiver] (tc_note_static_impl_call).
 // self_views maps a signature to its view for calls in its own body, and view_sigs maps back
 // (tc_call_view_sig).
@@ -3699,8 +3699,8 @@ fn tc_note_open_variant(node: Int, tid: Int) -> Int {
     tid
 }
 
-// The `return e` of a closure under an expected (), where `e` was open at the closure's walk, as
-// the group [-5, closure, 0].
+// The `return e` of a fn, method or closure that returns (), where `e` was open after the walk,
+// as the group [-5, owner, 0].
 fn tc_note_void_return(ret: Int, cls: Int) {
     if tc_calls.open_group.contains_key(ret) { return }
     tc_calls.open_calls.push(ret)
@@ -6990,8 +6990,10 @@ fn tc_pin_tail_tid(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag
 // one answer, and the only way to guarantee that is one implementation.
 //
 // Every guard here is byte-identical to the Return arm's, deliberately:
-//   • the tc_current_fn_ret Void/Unknown skip — a fn with no declared return has
-//     nothing to compare against, and when tc_check_fn's `lookup_fnsig` misses it
+//   • the tc_current_fn_ret Void/Unknown skip — a Void return here may be the
+//     placeholder of a closure that reads its return off the body, so the `return e`
+//     of a fn or closure that returns () is checked after the walk instead
+//     (tc_report_values_returned_as_void, tc_settle_closure_ret). And when tc_check_fn's `lookup_fnsig` misses it
 //     never installs one at all, leaving tc_current_fn_ret at -1 (tc_check_fn is
 //     called only from two non-reentrant top-level loops, so prev_fn_ret is always
 //     -1 at entry). -1 stays vacuous through types_compatible's `a < 0` escape,
@@ -7071,6 +7073,7 @@ fn tc_missing_return_cause(kind: Str) -> Str {
     if kind == "for" { return "its tail `for` loop can finish, because the iterable may be empty or exhaust" }
     if kind == "loop" { return "a `break` targets its tail `loop`, so the loop can finish" }
     if kind == "end" { return "its body reaches its end with no tail expression" }
+    if kind == "unit" { return "its tail expression has type ()" }
     "an arm of its tail completes without producing a value"
 }
 
@@ -9519,21 +9522,28 @@ fn check_closure_body_held_by(held_by: Str, cls: Int, exp_fn: Int) ! TypeCheck.R
     nr_pop_scope()
 }
 
-// The context gave this closure the return (). The walk could not check its `return`s, because
-// the same Void obligation stands for "no declared R" and a closure with none reads its return
-// off them (tc_settle_closure_ret).
-fn tc_report_values_returned_as_void(cls: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
-    for r in tc_body_valued_returns(node_body(cls)) {
+// `owner` returns (): a fn or method with no `-> R` or with `-> ()`, a handler operation, or a
+// closure whose context gave it (). The walk could not check its `return`s, because the same
+// Void obligation stands for "no declared R" and a closure with none reads its return off them
+// (tc_settle_closure_ret).
+fn tc_report_values_returned_as_void(owner: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    for r in tc_body_valued_returns(node_body(owner)) {
         // A later use in the definition can still settle this value (sections/03_types.md 3.4).
         if tc_tid_has_unbound_metavar(tc_resolve(tc_lookup_node_tid(node_value(r)))) != 0 {
-            tc_note_void_return(r, cls)
+            tc_note_void_return(r, owner)
         } else {
-            tc_report_value_returned_as_void(r, cls)
+            tc_report_value_returned_as_void(r, owner)
         }
     }
 }
 
-fn tc_report_value_returned_as_void(r: Int, cls: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+// The fix names a type the program can write, so an open slot reads as `T`.
+fn tc_void_return_fix_type(vt: Int) -> Str {
+    if tc_tid_has_unbound_metavar(vt) != 0 || tc_tid_has_bare_typevar(vt) != 0 { return "T" }
+    type_to_str(vt)
+}
+
+fn tc_report_value_returned_as_void(r: Int, owner: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     let vt = tc_resolve(tc_lookup_node_tid(node_value(r)))
     // An operand that is one open slot and stays open is the E0301 of whatever left it open. A
     // type with a head is not (), whatever fills its slots.
@@ -9542,65 +9552,145 @@ fn tc_report_value_returned_as_void(r: Int, cls: Int) ! TypeCheck.Resolve, TypeC
     if tc_tid_has_unknown(vt) != 0 { return }
     if tc_calls.reported.contains_key(r) { return }
     tc_calls.reported.insert(r, 1)
-    if node_type_ann(cls) != -1 {
-        tc_error_at_code("return value type {type_to_str(vt)} does not match closure return type ()", r, "TypeError", TYPE_ERROR, "change `-> ()` to `-> T`, or drop the value")
+    let t = tc_void_return_fix_type(vt)
+    // Dropping `return save(x)` whole would also drop the call's effects (sections/03_types.md 3.3).
+    let keep_call = "keep a call as its own statement, then write `return`"
+    if node_kind(owner) != NodeKind.Closure {
+        let name = node_name(owner)
+        let msg = "return value type {type_to_str(vt)} does not match function `{name}` return type ()"
+        if node_type_ann(owner) != -1 {
+            return tc_error_at_code(msg, r, "TypeError", TYPE_ERROR, "change `-> ()` to `-> {t}`, or drop the value ({keep_call})")
+        }
+        // The () comes from the `-> R` the signature leaves out, so the error also points there.
+        // The JSON form lists a second label only after a label on the primary span.
+        let before = diag_entry_count()
+        tc_errors.push(msg)
+        diag_error_label_at_notes("TypeError", TYPE_ERROR, msg, r, "returns a value of type {type_to_str(vt)}", "add `-> {t}` to the signature of `{name}`, or drop the value ({keep_call})", [])
+        let body = node_body(owner)
+        diag_add_label_since(before, node_line(body), node_col(body), node_col(body) + 1, "`{name}` has no `-> R`, so it returns ()")
+        return
+    }
+    if node_type_ann(owner) != -1 {
+        tc_error_at_code("return value type {type_to_str(vt)} does not match closure return type ()", r, "TypeError", TYPE_ERROR, "change `-> ()` to `-> T`, or drop the value ({keep_call})")
     } else {
-        tc_error_at_code("return value type {type_to_str(vt)} does not match closure return type (), which the expected function type gives", r, "TypeError", TYPE_ERROR, "add `-> T` to the expected function type, or drop the value")
+        tc_error_at_code("return value type {type_to_str(vt)} does not match closure return type (), which the expected function type gives", r, "TypeError", TYPE_ERROR, "add `-> T` to the expected function type, or drop the value ({keep_call})")
     }
 }
 
-// The return of a closure that neither writes `-> R` nor sits where one is declared is what its
-// body produces: the tail, or, when the tail leaves by another edge, the value its `return`s
-// carry. Every `return e` then answers to that type as it would to a written `-> R`. A slot
+// The return of a closure that neither writes `-> R` nor sits where one is declared is the one
+// type on which every `return e` and a tail that can complete agree, and () when there is none
+// (sections/03_types.md 3.3). A `return e` whose operand is Never adds no constraint. A slot
 // already bound — by an earlier walk of this closure, or by a use that pinned it — is the
 // answer the body is held to instead.
 //
 // Read after the walk, off the memo, so nothing in the body is reported twice.
 fn tc_settle_closure_ret(cls: Int, slot: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
-    let returns = tc_body_valued_returns(node_body(cls))
+    let body = node_body(cls)
+    let returns = tc_body_valued_returns(body)
     let tail_t = tc_closure_body_result_tid(cls)
+    let mut first_value = -1
+    for r in returns {
+        let vt = tc_lookup_node_tid(node_value(r))
+        if tc_tid_is_no_info(vt) == 0 && tc_resolve(vt) != TYPE_NEVER {
+            first_value = vt
+            break
+        }
+    }
+    // The memo reads an `if` with no `else` as its `then` branch, but the closure leaves through
+    // the missing `else` too; only a value `return` makes that edge an error, so only then is it
+    // read.
+    let completes = if first_value >= 0 { tc_tail_completion(body) } else { tail_t }
     let mut ret = tc_resolve(slot)
     // Unless a use already pinned the return to (), the tail is the value the closure hands
     // back, so the walk (which checked the body against the Void default) did not compare it.
     if tc_is_unbound_metavar(ret) != 0 || (tc_tid_is_no_info(ret) == 0 && ret != TYPE_VOID) {
-        tc_report_consumed_branch_mismatch(tc_value_tail_of(node_body(cls)))
+        tc_report_consumed_branch_mismatch(tc_value_tail_of(body))
     }
+    let completes_with_value = completes >= 0 && tc_tid_is_no_info(completes) == 0 && tc_resolve(completes) != TYPE_NEVER && tc_resolve(completes) != TYPE_VOID
+    // After a value `return`, a tail that completes with () is E0311 below, not a mismatch here.
+    let tail_is_value = tc_tid_is_no_info(tail_t) == 0 && (first_value < 0 || completes_with_value)
     // Resolved first: a slot tied to a sibling's (tc_tie_fn_rets) is bound to that slot, which
     // may itself still be open.
     if tc_is_unbound_metavar(ret) != 0 {
-        // A tail that leaves by another edge, or that the walk could not name, says nothing of
-        // the value; the `return`s do. With neither, the body is a statement body: the walk
-        // names no value for a tail such as a match whose arms assign, and a named fn with
-        // that body returns (). A value tail that an error left untyped is not one.
-        let mut found = tail_t
-        if found < 0 || tc_resolve(found) == TYPE_NEVER {
-            for r in returns {
-                let vt = tc_lookup_node_tid(node_value(r))
-                if tc_tid_is_no_info(vt) == 0 && tc_resolve(vt) != TYPE_NEVER {
-                    found = vt
-                    break
-                }
-            }
-        }
-        if found < 0 { found = if tc_value_tail_lost(node_body(cls)) { tc_error_recovery_tid() } else { TYPE_VOID } }
+        // With no value `return`, the body is a statement body when the walk names no value for
+        // its tail, such as a match whose arms assign: a named fn with that body returns ().
+        // A value tail that an error left untyped is not one.
+        let mut found = if completes_with_value { completes } else { first_value }
+        if first_value < 0 && found < 0 { found = tail_t }
+        if found < 0 { found = if tc_value_tail_lost(body) { tc_error_recovery_tid() } else { TYPE_VOID } }
         ret = found
         let _ = bind_metavar(slot, ret)
-    } else if tc_tid_is_no_info(tail_t) == 0 && tc_tid_is_no_info(ret) == 0 && ret != TYPE_VOID && (types_compatible(ret, tail_t) == 0 || tc_value_misses_never_slot(ret, tail_t) != 0) {
+    } else if tail_is_value && tc_tid_is_no_info(ret) == 0 && ret != TYPE_VOID && (types_compatible(ret, tail_t) == 0 || tc_value_misses_never_slot(ret, tail_t) != 0) {
         tc_mismatch_at("return value type {type_to_str(tail_t)} does not match function `closure` return type {type_to_str(ret)}", cls, ret, tail_t)
-    } else if tc_tid_is_no_info(tail_t) == 0 {
+    } else if tail_is_value {
         // The bound return fixes an open slot of the tail, as a written `-> R` would.
         tc_join_agreeing_values(ret, tail_t)
     }
-    // A Void return drops what a `return e` carries, as a named fn with no `-> R` does.
-    if ret == TYPE_VOID || tc_tid_is_no_info(ret) != 0 { return }
+    if tc_tid_is_no_info(ret) != 0 { return }
+    // A tail that can complete with () after a value `return` is E0311, as in a named fn with `-> R`.
+    if first_value >= 0 && tc_resolve(ret) != TYPE_VOID && completes >= 0 && tc_resolve(completes) == TYPE_VOID {
+        tc_report_closure_falls_through(cls, ret)
+    }
     for r in returns {
         let vt = tc_lookup_node_tid(node_value(r))
-        if tc_tid_is_no_info(vt) == 0 && (types_compatible(ret, vt) == 0 || tc_value_misses_never_slot(ret, vt) != 0) {
+        if tc_tid_is_no_info(vt) != 0 || tc_calls.reported.contains_key(r) { continue }
+        if types_compatible(ret, vt) == 0 || tc_value_misses_never_slot(ret, vt) != 0 {
+            tc_calls.reported.insert(r, 1)
             tc_mismatch_at("return value type {type_to_str(vt)} does not match function `closure` return type {type_to_str(ret)}", r, ret, vt)
         } else {
             tc_join_agreeing_values(ret, vt)
         }
     }
+}
+
+// What a closure body yields at its end, as the memo reads it, except that an `if` with no
+// `else` can complete with (): the memo answers for its `then` branch alone. Never when every
+// path leaves by another edge.
+fn tc_tail_completion(node: Int) -> Int {
+    if node == -1 { return -1 }
+    let k = node_kind(node)
+    if k == NodeKind.WithBlock || k == NodeKind.AsyncScope { return tc_tail_completion(node_body(node)) }
+    if k == NodeKind.Block {
+        if tc_block_exits(node) != 0 { return TYPE_NEVER }
+        let tail = tc_block_tail_stmt(node)
+        if tail == -1 { return TYPE_VOID }
+        return tc_tail_completion(tc_block_tail_value(tail))
+    }
+    if k == NodeKind.IfExpr {
+        let else_node = node_else_body(node)
+        if else_node == -1 { return TYPE_VOID }
+        return tc_join_completions(tc_tail_completion(node_then_body(node)), tc_tail_completion(else_node), node)
+    }
+    if k == NodeKind.MatchExpr {
+        let arms_sl = node_arms(node)
+        if arms_sl == -1 { return tc_scoped_value_memo(node) }
+        let mut out = TYPE_NEVER
+        let mut i = 0
+        while i < sublist_length(arms_sl) {
+            out = tc_join_completions(out, tc_tail_completion(tc_arm_body_value(sublist_get(arms_sl, i))), node)
+            i = i + 1
+        }
+        return out
+    }
+    tc_scoped_value_memo(node)
+}
+
+// A branch that leaves by another edge yields to the other; one that can complete with ()
+// makes the whole form complete with (). Any other pair is what the memo says of the form.
+fn tc_join_completions(a: Int, b: Int, form: Int) -> Int {
+    if a >= 0 && tc_resolve(a) == TYPE_NEVER { return b }
+    if b >= 0 && tc_resolve(b) == TYPE_NEVER { return a }
+    if (a >= 0 && tc_resolve(a) == TYPE_VOID) || (b >= 0 && tc_resolve(b) == TYPE_VOID) { return TYPE_VOID }
+    tc_scoped_value_memo(form)
+}
+
+fn tc_report_closure_falls_through(cls: Int, ret: Int) ! Diag.Report {
+    let body = node_body(cls)
+    let tail = tc_value_tail_of(body)
+    if tail == -1 { return tc_report_missing_return_of("end", "closure", ret, cls) }
+    let mut kind = tc_missing_return_tail_kind(tail, TYPE_VOID)
+    if kind == "" { kind = "unit" }
+    tc_report_missing_return_of(kind, "closure", ret, tail)
 }
 
 // Whether a body ends in a value expression that the walk could not type, which happens only
@@ -9716,6 +9806,7 @@ fn tc_check_handler_method(m: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.R
     tc_closure_scope_base = saved_closure_bases
     tc_in_test_body = saved_in_test
     tc_check_missing_tail_value(body, tc_current_fn_ret, mname, m)
+    if tc_resolve(tc_current_fn_ret) == TYPE_VOID { tc_report_values_returned_as_void(m) }
     nr_pop_scope()
 
     tc_closure_held_by = prev_held_by
@@ -34798,6 +34889,7 @@ fn tc_check_fn(fn_node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report 
         if node_kind(body) == NodeKind.Block { tc_fn_body_block = 1 }
         tc_check_body(body)
         tc_fn_body_block = 0
+        if tc_resolve(fn_ret_tid) == TYPE_VOID { tc_report_values_returned_as_void(fn_node) }
 
         // The one branch that CANNOT move: a body with no tail value at all reports
         // against the whole function, not against a statement that does not exist. The

@@ -1,0 +1,74 @@
+// A closure with no `-> R` and no expected type has the one type on which every `return e` and
+// a tail that can complete agree, and () when there is none (sections/03_types.md *Divergence
+// and Body Completeness*). A `Never` operand adds no constraint. A tail that can complete with
+// () after a valued `return` is E0311, as for a named fn with `-> R`.
+
+import compile_test_helpers
+
+let PRELUDE = "fn lg() \{ }\n"
+
+fn src_of(body: Str) -> Str {
+    "{PRELUDE}fn main() \{\n let b = true\n {body}\n}\n"
+}
+
+fn falls_through(body: Str, tag: Str) ! FS.Delete, FS.Write, Process.Spawn, FS.Read, Env.Read, IO.Print {
+    let out = compile_test_helpers.compile_and_capture(src_of(body), tag)
+    compile_test_helpers.expect_error(out, "E0311", tag)
+    compile_test_helpers.expect_contains(out, "function `closure` can finish without returning a value of type Int", tag)
+    assert(!out.contains("internal compiler error"), out)
+}
+
+fn disagrees(body: Str, tag: Str) ! FS.Delete, FS.Write, Process.Spawn, FS.Read, Env.Read, IO.Print {
+    let out = compile_test_helpers.compile_and_capture(src_of(body), tag)
+    compile_test_helpers.expect_error(out, "E0300", tag)
+    assert(!out.contains("internal compiler error"), out)
+}
+
+fn accepts(body: Str, tag: Str) ! FS.Delete, FS.Write, Process.Spawn, FS.Read, Env.Read, IO.Print {
+    compile_test_helpers.expect_compiles_clean(compile_test_helpers.compile_and_capture(src_of(body), tag), tag)
+}
+
+test "a tail that can complete after a valued return is E0311" {
+    falls_through("let k = fn() \{ if b \{ return 5 } }\n let x: Int = k()\n io.println(\"\{x}\")", "cre_if")
+    falls_through("let k = fn(c: Bool) \{ if c \{ return 5 } }\n io.println(\"\{k(b)}\")", "cre_if_param")
+    falls_through("let k = fn() \{ while b \{ return 5 } }\n io.println(\"\{k()}\")", "cre_while")
+    falls_through("let k = fn() \{ for i in [1] \{ return i } }\n io.println(\"\{k()}\")", "cre_for")
+    falls_through("let k = fn() \{ if b \{ return 5 }\n match b \{\n true => lg()\n false => lg()\n }\n }\n io.println(\"\{k()}\")", "cre_match")
+    falls_through("let k = fn() \{ if b \{ return 5 }\n lg() }\n io.println(\"\{k()}\")", "cre_unit_call")
+    falls_through("let k = fn() \{ if b \{ return 5 }\n let y = 1\n io.println(\"\{y}\") }\n io.println(\"\{k()}\")", "cre_end")
+}
+
+test "exits that disagree are E0300" {
+    disagrees("let k = fn() \{ if b \{ return 5 }\n \"s\" }\n io.println(\"\{k()}\")", "cre_tail_str")
+    disagrees("let k = fn() \{ if b \{ return 5 }\n return \"s\" }\n io.println(\"\{k()}\")", "cre_two_returns")
+    disagrees("let k = fn() \{ if b \{ return lg() }\n return 5 }\n k()", "cre_unit_then_int")
+}
+
+test "exits that agree are legal" {
+    accepts("let k = fn() \{ if b \{ return 5 }\n 7 }\n io.println(\"\{k()}\")", "cre_ok_tail")
+    accepts("let k = fn() \{ if b \{ return 5 }\n return 7 }\n io.println(\"\{k()}\")", "cre_ok_returns")
+    accepts("let k = fn() \{ if b \{ return panic(\"x\") }\n 7 }\n io.println(\"\{k()}\")", "cre_ok_never_operand")
+    accepts("let k = fn() \{ if b \{ return lg() }\n lg() }\n k()", "cre_ok_unit")
+    accepts("let k = fn() \{ return panic(\"x\") }\n k()", "cre_ok_never_only")
+    accepts("let k = fn() \{ if b \{ return 5 } else \{ return 6 } }\n io.println(\"\{k()}\")", "cre_ok_both_arms")
+    accepts("let k = fn() \{ loop \{ if b \{ return 5 } } }\n io.println(\"\{k()}\")", "cre_ok_loop")
+}
+
+// The return type of each closure is read off its exits; these values come back through it.
+test "a closure takes its return type from exits that agree" {
+    let k = fn(c: Bool) {
+        if c { return 5 }
+        7
+    }
+    assert_eq(k(true), 5)
+    assert_eq(k(false), 7)
+    let j = fn(c: Bool) {
+        if c { return panic("x") }
+        "tail"
+    }
+    assert_eq(j(false), "tail")
+    let r = fn(c: Bool) {
+        if c { return 1 } else { return 2 }
+    }
+    assert_eq(r(false), 2)
+}

@@ -1,0 +1,78 @@
+// `return e` checks e against the return type of the function, () included
+// (sections/03_types.md *Divergence and Body Completeness*). A tail is dropped in a function
+// that returns (); the operand of a `return` never is.
+
+import compile_test_helpers
+
+fn lg() { }
+
+fn forward(b: Bool, n: Int) {
+    if b && n == 0 { return lg() }
+    if b && n == 1 { return () }
+    if b && n == 2 { return panic("x") }
+    if b { return }
+}
+
+fn tail_value() { 5 }
+
+fn rejects(src: Str, tag: Str, ty: Str) ! FS.Delete, FS.Write, Process.Spawn, FS.Read, Env.Read, IO.Print {
+    let out = compile_test_helpers.compile_and_capture("{src}\nfn main() \{ f() }\n", tag)
+    compile_test_helpers.expect_error(out, "E0300", tag)
+    compile_test_helpers.expect_contains(out, "return value type {ty} does not match function `f` return type ()", tag)
+    compile_test_helpers.expect_contains(out, "drop the value", tag)
+    assert(!out.contains("internal compiler error"), out)
+}
+
+fn accepts(src: Str, tag: Str) ! FS.Delete, FS.Write, Process.Spawn, FS.Read, Env.Read, IO.Print {
+    compile_test_helpers.expect_compiles_clean(compile_test_helpers.compile_and_capture("fn lg() \{ }\n{src}\nfn main() \{ f(true) }\n", tag), tag)
+}
+
+test "a value in a return of a fn with no -> R is E0300" {
+    rejects("fn f() \{ return 5 }", "rvu_int", "Int")
+    rejects("fn f() \{ return \"s\" }", "rvu_str", "Str")
+    rejects("fn f() \{ if true \{ return 5 }\n lg() }\nfn lg() \{ }", "rvu_early", "Int")
+}
+
+test "a value in a return of a fn that writes -> () is E0300" {
+    rejects("fn f() -> () \{ return 5 }", "rvu_written_int", "Int")
+    rejects("fn f() -> () \{ return \"s\" }", "rvu_written_str", "Str")
+}
+
+// The head of `List[?]` is not (), whatever fills the slot, so the open slot need not wait for a use.
+test "an open construct in a return of a unit fn is E0300 before it reaches codegen" {
+    let out = compile_test_helpers.compile_and_capture("fn f() \{ return [] }\nfn main() \{ f() }\n", "rvu_open_list")
+    compile_test_helpers.expect_error(out, "E0300", "rvu_open_list")
+    compile_test_helpers.expect_contains(out, "drop the value", "rvu_open_list")
+    assert(!out.contains("internal compiler error"), out)
+}
+
+test "the help names the repairs in order and the place the () comes from" {
+    let out = compile_test_helpers.compile_and_capture("fn f() \{ return 5 }\nfn main() \{ f() }\n", "rvu_help_omitted")
+    compile_test_helpers.expect_contains(out, "add `-> Int` to the signature of `f`, or drop the value", "rvu_help_omitted")
+    compile_test_helpers.expect_contains(out, "keep a call as its own statement", "rvu_help_omitted")
+    compile_test_helpers.expect_contains(out, "`f` has no `-> R`, so it returns ()", "rvu_help_omitted")
+    let written = compile_test_helpers.compile_and_capture("fn f() -> () \{ return 5 }\nfn main() \{ f() }\n", "rvu_help_written")
+    compile_test_helpers.expect_contains(written, "change `-> ()` to `-> Int`, or drop the value", "rvu_help_written")
+    assert(!written.contains("has no `-> R`"), written)
+}
+
+test "a method and a handler operation hold their return to () as a fn does" {
+    let m = compile_test_helpers.compile_and_capture("trait Tr \{ fn m(self) }\ntype P \{ x: Int }\nimpl Tr for P \{ fn m(self) \{ return self.x } }\nfn main() \{ P \{ x: 1 }.m() }\n", "rvu_method")
+    compile_test_helpers.expect_error(m, "E0300", "rvu_method")
+    compile_test_helpers.expect_contains(m, "drop the value", "rvu_method")
+    let h = compile_test_helpers.compile_and_capture("effect Ee \{\n effect S \{\n fn op()\n }\n}\nfn main() \{\n with handler Ee.S \{\n fn op() \{ return 4 }\n } \{\n ee.op()\n }\n}\n", "rvu_handler")
+    compile_test_helpers.expect_error(h, "E0300", "rvu_handler")
+    compile_test_helpers.expect_contains(h, "drop the value", "rvu_handler")
+}
+
+test "a return with no value, a unit value or a Never operand stays legal in a unit fn" {
+    accepts("fn f(b: Bool) \{ if b \{ return lg() }\n return }", "rvu_ok_bare")
+    accepts("fn f(b: Bool) -> () \{ if b \{ return () }\n lg() }", "rvu_ok_unit")
+    accepts("fn f(b: Bool) \{ if b \{ return panic(\"x\") } }", "rvu_ok_never")
+    accepts("fn f(b: Bool) \{ 5 }", "rvu_ok_tail")
+    forward(true, 0)
+    forward(true, 1)
+    forward(true, 3)
+    forward(false, 2)
+    tail_value()
+}
