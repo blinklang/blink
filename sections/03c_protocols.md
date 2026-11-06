@@ -831,6 +831,21 @@ Qualified syntax is also useful for calling a specific trait's default method, o
 
 Qualified call is a *call-site* mechanism, not a *super-call* mechanism. Inside an `impl` block overriding an open trait default, writing `Trait.method(self, ...)` does not reach the trait's default body — it resolves to the same method the call site sees, which is the impl's override. Blink has no method-resolution-order chain to walk back through. If an override needs the default's body, factor that body into a free helper function and call the helper from both sites. See §3.6 *The `final` Modifier* for the replace-only override rule.
 
+**A type name does not qualify a method.** The qualifier of a method call is a trait (`Display.display(user)`) or an impl (`(Display for User).display(u)`). It is never a type. `User.display(user)` and `Int.abs(-3)` are `MethodThroughTypeName` (E0567): `display` and `abs` take `self`, and the `T.` namespace holds no method that takes `self` (§3.4 *A method called through its type name*). The fix is `user.display()`. With one owner, a trait that a program can write and that is not sealed also gets a help line (`Display.display(user)`).
+
+```blink
+@derive(Display)
+type User { name: Str }
+
+fn main() ! IO {
+    let user = User { name: "Ada" }
+    let a = Display.display(user)   // OK: names the trait
+    let b = user.display()          // OK
+    let c = User.display(user)      // COMPILE ERROR E0567: fix `user.display()`; help also `Display.display(user)`
+    io.println("{a} {b} {c}")
+}
+```
+
 #### Impl-Qualified Calls
 
 `Trait.method(receiver, args)` gets `Self` from its receiver. An associated function has no receiver, so that form cannot say which type's impl to call. When two traits give one type an associated function with the same name, the unqualified call `Type.fn()` is E0522, and the program needs a form that names both the trait and the type. That form is the **impl-qualified call**:
@@ -1000,6 +1015,53 @@ error[AmbiguousMethodCall]: ambiguous method call
 
 When one of the owners is a sealed trait, the E0522 note names that trait and says that it is built-in, and the help lists the qualified call for each owner. The spec fixes this content, not the wording.
 
+**Where a user meets `Sized.len`.** The sealed trait `Sized` gives `Str` and `List`, among other built-in types, their `len`, and most programs never write its name. It appears when a user trait gives the same type a method with the same name. Then `text.len()` is E0522, and the qualified call that fixes it names `Sized`. The call `Str.len(text)` has the same two owners. It is `MethodThroughTypeName` (E0567, §3.4 *A method called through its type name*) with no fix, because the type name does not choose between them. The help lists both owners, as E0522 does. With one owner, the help for `Str.len(text)` is `text.len()` only.
+
+```blink
+trait Measure {
+    fn len(self) -> Int
+}
+
+impl Measure for Str {                // warning W0734: see below
+    fn len(self) -> Int { 0 }
+}
+
+fn main() ! IO {
+    let text = "hello"
+    let a = text.len()                // COMPILE ERROR E0522: `len` is in Sized (built-in) and Measure
+    let b = Sized.len(text)           // OK: 5
+    let c = Measure.len(text)         // OK: 0
+    let d = Str.len(text)             // COMPILE ERROR E0567: two owners, no fix; the help lists both qualified calls
+    io.println("{b} {c}")
+}
+```
+
+```
+error[AmbiguousMethodCall]: ambiguous method call
+  --> measure.bl:11:18
+   |
+11 |     let a = text.len()
+   |                  ^^^ method `len` found in multiple traits
+   |
+   = note: `len` is a built-in `Sized` method and is also defined by `Measure`
+   = help: use qualified syntax to disambiguate:
+   |   Sized.len(text)
+   |   Measure.len(text)
+```
+
+```
+error[MethodThroughTypeName]: `len` is a method of `Str`, not a function of the type
+  --> measure.bl:14:17
+   |
+14 |     let d = Str.len(text)
+   |                 ^^^ `len` takes its receiver before the dot
+   |
+   = note: `len` is a built-in `Sized` method of `Str` and is also defined by `Measure`
+   = help: use qualified syntax to choose an owner:
+   |   Sized.len(text)
+   |   Measure.len(text)
+```
+
 **An impl body gets no special treatment.** Inside `impl Tidy for Str`, `self` has type `Str`, and `self.trim()` follows the same lookup as any other call. It is E0522. The body does not prefer its own trait, so the call is neither a recursive call nor a silent call to the built-in. Name the owner:
 
 ```blink
@@ -1058,6 +1120,7 @@ W0734 is diagnostic only. It has no effect on which method a call runs. A releas
 | `x.foo(args)` | Trait method call | Trait lookup on x's type |
 | `(x.foo)(args)` | Call function-typed field | Field access + function application |
 | `Trait.foo(x, args)` | Qualified trait method call | Explicit trait + method |
+| `Type.foo(x, args)`, where `foo` takes `self` | Error E0567 (`MethodThroughTypeName`): a method is not a function of its type | The `T.` namespace holds no method that takes `self` (§3.4 *A method called through its type name*) |
 | `handle.op(args)` | Effect handle operation | Effect declaration (`!`) |
 
 #### Interaction with Other Features

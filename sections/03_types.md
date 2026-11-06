@@ -2561,7 +2561,7 @@ The compiler picks the reading from scope and namespaces only, never from the me
 **Member case.** In a type path `K.x`, the first character of `x` decides which members it can name:
 
 - An uppercase first character (Unicode `Lu` or `Lt`) never names a function. `K.X` names a variant of `K` or a type-scoped constant `const K.X` (§2.12.3). When `K` has neither, the site is `NoSuchVariant` (E0547). `K` is an enum for this rule, or a type that is not an enum (*A variant the enum does not declare*, below).
-- Any other first character never names a variant. `K.x` names a type-scoped function `fn K.x`, an associated function that a trait impl gives `K` (§3c.4), or a type-scoped constant. When `K` has none of these, and no other rule of this specification gives the site its own code, the site is `UnresolvedMethod` (E0505), never E0547. It is E0505 for a read (`K.zed`) and for a call (`K.zed(1)`). The name says "method", but the code covers a read of a member too. The first character of the member picks the code: uppercase is E0547, any other character is E0505. The candidates of its nearest-name suggestion (ERROR_CATALOG *Conventions*) include the variants of `K`, so `K.zed` suggests the variant `K.Zed` (*An unknown member of a type path*, below).
+- Any other first character never names a variant. `K.x` names a type-scoped function `fn K.x`, an associated function that a trait impl gives `K` (§3c.4), or a type-scoped constant. When `K` has none of these, and no other rule of this specification gives the site its own code, the site is `UnresolvedMethod` (E0505), never E0547. One other rule does give a site its own code: when `x` is exactly the name of a method that takes `self` and that some trait gives `K`, the site is `MethodThroughTypeName` (E0567), never E0505 (*A method called through its type name*, below). It is E0505 for a read (`K.zed`) and for a call (`K.zed(1)`). The name says "method", but the code covers a read of a member too. The first character of the member picks the code: uppercase is E0547, any other character is E0505. The candidates of its nearest-name suggestion (ERROR_CATALOG *Conventions*) include the variants of `K`, so `K.zed` suggests the variant `K.Zed` (*An unknown member of a type path*, below).
 
 No function in a `T.` namespace has an uppercase name (§2.12.3 *Function names*), so each case looks in one set of members, with no order between them.
 
@@ -2589,10 +2589,10 @@ error[UnresolvedMethod]: no member `high` on type `Level`
   = fix: Level.High
 ```
 
-**An unknown member of a type path.** These rules cover a lowercase member that `K` does not declare, as a read (`K.zed`) and as a call (`K.zed(1)`, `K.zed()`). Both give one code, E0505, and one head.
+**An unknown member of a type path.** These rules cover a lowercase member that `K` does not declare, as a read (`K.zed`) and as a call (`K.zed(1)`, `K.zed()`), when `zed` is not the name of a method that takes `self` and that a trait gives `K` (that name is E0567, *A method called through its type name*, below). Both give one code, E0505, and one head.
 
 - **Head and span.** The head is "no member `x` on type `K`". A member of a module that the module does not declare has the same shape: "no member `x` on module `m`" (§10.5 *Import Errors*). The span is the member name `x`, never `K` or `m`, for a type path and for a module path alike. The binding that holds the value of the site has the poison type (§6.3.5), so a later use of it reports nothing more.
-- **Candidates.** The candidates for the nearest-name suggestion are the type-scoped functions, the associated functions, the type-scoped constants and the variants of `K`. A field of a struct is never a candidate. With one nearest candidate, the help names it. With two or more equally near candidates, or none near enough, there is no suggestion, and the help lists the members of `K` by kind.
+- **Candidates.** The candidates for the nearest-name suggestion are the type-scoped functions, the associated functions, the type-scoped constants and the variants of `K`. A field of a struct is never a candidate, and neither is a method that takes `self`: the name of such a method is E0567, and no name search runs for it. With one nearest candidate, the help names it. With two or more equally near candidates, or none near enough, there is no suggestion, and the help lists the members of `K` by kind.
 - **The fix.** The help for a candidate of any kind carries a machine-applicable fix only when all of these hold:
   1. the rewritten site passes the checker and adds no diagnostic;
   2. for a variant candidate, the payload form of the site agrees with the payload form of the variant, the rule of E0547;
@@ -2649,6 +2649,158 @@ error[UnresolvedMethod]: no member `x` on type `Point`
 ```
 
 A call and a read of the same name give the same diagnostic, so adding `()` while fixing a site does not change the code. The rule for a module path is in §10.5 (*Import Errors*), and the code row is in ERROR_CATALOG (UnresolvedMethod).
+
+**A method called through its type name.** A method that takes `self` is not in the `T.` namespace (§2.12.3 *One `T.` namespace*). It belongs to a trait (§3c.4). A call reaches it in one of two ways: on a value (`x.m(...)`), or through its trait (`Trait.m(x, ...)`, §3c.4 *Qualified Method Calls*). The form `T.m(x, ...)` puts the type name before the dot and the receiver in the first place. The language has no such form, for any type. The site is `error[MethodThroughTypeName]` (E0567) when all of these are true:
+
+1. `T` names a type: a built-in type, a type that the program declares, or a type parameter.
+2. `m` is not a member of the `T.` namespace of `T`. When it is, the site names that member, and this rule does not apply.
+3. `m` is exactly the name of a method that takes `self` and that at least one owner gives `T`. An owner is a trait that `x.m()` searches for a value `x` of type `T` at the site (§3c.4 *Trait Method Lookup*). A sealed trait is an owner. One owner and two or more owners are the same case for this rule.
+
+The rule covers a call (`Int.abs(-3)`, `T.clone(a)`) and a read with no call (`Str.len`). A trait-qualified call stays legal: `Sized.len("abc")` and `Clone.clone(a)` name an owner (§3c.4 *Qualified Method Calls*).
+
+**One code for each failed site.** A lowercase `T.name` that names no member of the `T.` namespace gets E0567 or E0505. It never gets both codes, and it never gets neither:
+
+- E0567, when `name` is exactly a method with `self` that some owner gives `T` (point 3 above).
+- E0505, for every other name. Only then does the nearest-name search run (*An unknown member of a type path*, above).
+
+An exact method name wins over a near name. When `T` has the method `shout` and also the type-scoped function `shouts`, the site `T.shout(u)` is E0567, and its help does not suggest `T.shouts`.
+
+```blink
+type Level { n: Int }
+
+trait Shout {
+    fn shout(self) -> Str
+}
+
+impl Shout for Level {
+    fn shout(self) -> Str { "LEVEL {self.n}" }
+}
+
+fn Level.parse(s: Str) -> Level { Level { n: s.len() } }
+fn Level.shouts() -> Level { Level { n: 0 } }
+
+fn main() ! IO {
+    let u = Level.parse("hi")
+    let a = Level.shout(u)     // error[MethodThroughTypeName]: `shout` is a method of `Level`; fix `u.shout()`
+    let b = Level.parsr("hi")  // error[UnresolvedMethod]: no member `parsr` on type `Level`; the help names `Level.parse`
+    io.println(a)
+}
+```
+
+`shout` is a method of `Level` and a near name of `shouts`. The site gets E0567 only. `parsr` is no method of `Level`, so the site gets E0505 and the nearest-name search.
+
+**The message.** The head names the method and the type, and says that the method takes a receiver: "`abs` is a method of `Int`, not a function of the type". The head never says "unresolved", "no member" or any other word that says the method does not exist, because it exists. The span is the method name, as for an unknown member.
+
+```blink
+fn main() {
+    let n = Int.abs(-3)   // error[MethodThroughTypeName], fix: (-3).abs()
+}
+```
+
+```
+error[MethodThroughTypeName]: `abs` is a method of `Int`, not a function of the type
+ --> abs.bl:2:17
+  |
+2 |     let n = Int.abs(-3)
+  |                 ^^^ `abs` takes its receiver before the dot
+  |
+  = help: call the method on the value: `(-3).abs()`
+  = fix: (-3).abs()
+```
+
+**The fix.** The fix writes `recv.m(rest)`: the first argument becomes the receiver, and the other arguments stay in the call. A receiver that is not a primary or postfix expression gets parentheses: `Int.abs(-3)` becomes `(-3).abs()`, and `Int.max(a + b, c)` becomes `(a + b).max(c)`. The fix is machine-applicable only when all of these are true:
+
+1. the call has a first argument;
+2. the type of the first argument is `T`: any instance of `T` when `T` is generic, or that parameter when `T` is a type parameter;
+3. `recv.m(rest)` finds one owner, so it is not E0522.
+
+When one condition is false, the help shows the form and there is no fix. When the first argument has a type other than `T`, a `note:` names both types. The fix would change what the program means: `Str.len(xs)` with `xs: List[Int]` would become `xs.len()`, which compiles and calls the `len` of `List`.
+
+```blink
+fn main() ! IO {
+    let xs = [1, 2, 3]
+    let n = Str.len(xs)   // error[MethodThroughTypeName]: note names `List[Int]` and `Str`; help `s.len()`, no fix
+    io.println("{n}")
+}
+```
+
+```
+error[MethodThroughTypeName]: `len` is a method of `Str`, not a function of the type
+ --> len.bl:3:17
+  |
+3 |     let n = Str.len(xs)
+  |                 ^^^ `len` takes its receiver before the dot
+  |
+  = note: the first argument `xs` has type `List[Int]`, not `Str`
+  = help: call the method on a `Str` value, as `s.len()`
+```
+
+A call with no argument (`Int.abs()`) has no receiver to move. Its help shows `x.abs()` and it has no fix.
+
+**The help lines.** The help depends on the number of owners.
+
+| Owners of `m` for `T` | Help | Fix |
+|---|---|---|
+| One | The fix line (`recv.m(rest)`). One more line, `Trait.m(recv, rest)`, only when the owner is a trait that a program can write and that is not sealed (`Clone.clone(a)`, a user trait). Never a sealed trait (`Sized.len(...)`, `StrOps.trim(...)`). | When the three conditions above hold |
+| Two or more (the E0522 case) | One `Trait.m(recv, rest)` line for each owner, sealed owners too, as E0522 lists them (§3c.4). | None |
+
+With one owner, `recv.m(rest)` finds the same method as the trait form, so a sealed trait name tells the user nothing. With two or more owners, the trait name is the only way to choose, so the help lists every owner.
+
+```blink
+@derive(Clone)
+type P { v: Int }
+
+trait Measure {
+    fn len(self) -> Int
+}
+
+impl Measure for Str {                // warning[SealedMethodNameCollision]
+    fn len(self) -> Int { 0 }
+}
+
+fn main() ! IO {
+    let a = P { v: 1 }
+    let b = P.clone(a)                // one owner (Clone): fix `a.clone()`, one more help line `Clone.clone(a)`
+    let c = Int.abs(-3)               // one owner: fix `(-3).abs()`, no trait line
+    let n = Str.len("abc")            // two owners (Sized, Measure): no fix; help `Sized.len("abc")` and `Measure.len("abc")`
+    io.println("{b.v} {c} {n}")
+}
+```
+
+```
+error[MethodThroughTypeName]: `len` is a method of `Str`, not a function of the type
+  --> len.bl:16:17
+   |
+16 |     let n = Str.len("abc")
+   |                 ^^^ `len` takes its receiver before the dot
+   |
+   = note: `len` is a built-in `Sized` method of `Str` and is also defined by `Measure`
+   = help: use qualified syntax to choose an owner:
+   |   Sized.len("abc")
+   |   Measure.len("abc")
+```
+
+**A type parameter.** `T.m(x)` on a type parameter is the same error. The first argument has the type `T`, so the fix applies when one owner gives `T` the method:
+
+```blink
+fn dup[T: Clone](x: T) -> T {
+    T.clone(x)   // error[MethodThroughTypeName], fix: x.clone(); help also `Clone.clone(x)`
+}
+```
+
+**A read with no call.** A `T.m` with no argument list, where `m` meets points 1 to 3, is the same code and the same head. A method with `self` is not a function value through its type. The help writes a closure and there is no machine fix, because the fix would have to choose a parameter name. The closure in the help compiles where the user pastes it. When `T` is not generic, the parameter carries the annotation `T`, because a closure with no context cannot type its parameter. When `T` is generic and an expected function type reaches the reference, as the argument of `map` does, the closure has no annotation, and the expected type gives the parameter its type.
+
+```blink
+fn main() ! IO {
+    let words = ["a", "bcd"]
+    let f = Str.len               // error[MethodThroughTypeName], help: `fn(s: Str) { s.len() }`, no fix
+    let ns = words.map(Str.len)   // error[MethodThroughTypeName], help: `fn(s: Str) { s.len() }`, no fix
+    let lens = [[1, 2], [3]].map(List.len)   // error[MethodThroughTypeName], help: `fn(xs) { xs.len() }`, no fix
+    io.println("{ns.len()} {lens.len()} {f("abc")}")
+}
+```
+
+**Rollout.** The rule of §8.16.1 *Rollout of a new error* applies to this rule. A released compiler accepted `Str.len("abc")`, `List.len(xs)` and a call of a user trait method through the type, such as `Level.shout(u)`, and refused `Int.abs(-3)`. The message, the help and the fix are the same at each severity the rule gives the site. The code keeps its name and its number when its severity changes.
 
 A bare `Name` and `Name(...)` stay under *Values come first*: a type name is never a bare value. A variant with the name of its own enum is E0518 (*Name collisions*, below). A struct with the name of a variant is legal; `Name { ... }` then reads as the struct literal (*Name collisions*, below).
 
@@ -3428,7 +3580,7 @@ error[TypeError]: variant `Shape.Circle` has named fields and is not a function 
 
 *Rationale.* `Some` and `fn(x) { Some(x) }` are the same term, so the rationale above applies word for word: a rule that refused `xs.map(Some)` would refuse one spelling of an identical program. A brace payload has no call form, so no one closure is equal to it. A variant with no payload is a value, not a function: `Color.Red` and `fn() { Color.Red }` are different terms.
 
-**A type-scoped or associated function named as a value.** `T.name`, written with no argument list, is a function value when `name` is a function in the `T.` namespace (§2.12.3). It may stand wherever a function value is expected, as a generic function's name may. The rule covers four forms: a type-scoped function (`Duration.ms`), a type-scoped function on a generic type (`Stack.empty`), an associated function that a trait impl gives `T` (`W.make`, `Int.default`), and an associated function reached through a type parameter (`T.from`). Method syntax does not reach it (§2.12.3).
+**A type-scoped or associated function named as a value.** `T.name`, written with no argument list, is a function value when `name` is a function in the `T.` namespace (§2.12.3). It may stand wherever a function value is expected, as a generic function's name may. The rule covers four forms: a type-scoped function (`Duration.ms`), a type-scoped function on a generic type (`Stack.empty`), an associated function that a trait impl gives `T` (`W.make`, `Int.default`), and an associated function reached through a type parameter (`T.from`). Method syntax does not reach it (§2.12.3). A method that takes `self` is not a function value through its type: `Str.len` is E0567 (*A method called through its type name*, above).
 
 The type is the declaration's type, `fn(P1, ..., Pn) -> R`. A trait associated function reads `Self` as the head type: `W.make` is `fn(Int) -> W`. Through a type parameter `T`, the name `T` is the parameter itself, not a binder: `T.from` in a function with the bound `T: From[U8]` is `fn(U8) -> T`, and nothing is left to solve. The binders of a function are its own list after the name (§2.12.3 *Functions on a generic type declare their own binders*) and no other: `fn Stack.empty[T]()` has the binder `T`, and the type head gives none. The rule above solves them. The expected type fixes them, and a reference whose binders nothing fixes is `error[CannotInferType]` (E0301) at the reference. The note names the reference and the binder. Brackets with no call, as in `Stack.empty[Int]`, are `error[TypeArgsWithoutCall]` (E0314).
 
