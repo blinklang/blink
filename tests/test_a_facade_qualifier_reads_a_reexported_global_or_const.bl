@@ -1,0 +1,167 @@
+// A re-exported item is indistinguishable from a pub item the facade declares itself
+// (sections/07_trust_modules_metadata.md, "Re-exports"): `pub import base.{G}` lets a consumer
+// read `facade.G` as well as `import facade.{G}`. That holds for a module-level `let` and a
+// `const`, not only for a function. Check, the one-unit build and the per-module build agree.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> ProcessResult ! Process.Spawn {
+    process.run("sh", ["-c", cmd]).unwrap()
+}
+
+fn blink_in(dir: Str, args: Str) -> ProcessResult ! Process.Spawn {
+    sh("B=$(pwd)/build/blink; cd {dir} && BLINK_BIN=$B timeout 120 $B {args} src/main.bl < /dev/null 2>&1")
+}
+
+// A package of the given files, each `path=source`; a path may name a subdirectory.
+fn new_package(files: List[(Str, Str)]) -> Str ! FS.Write, Process.Spawn {
+    let dir = sh("mktemp -d /tmp/blink_facade_read.XXXXXX").out.trim()
+    fs.write("{dir}/blink.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\n").unwrap()
+    for f in files {
+        let _ = sh("mkdir -p $(dirname {dir}/src/{f.0}.bl)")
+        fs.write("{dir}/src/{f.0}.bl", f.1).unwrap()
+    }
+    dir
+}
+
+fn cleanup(dir: Str) ! Process.Spawn {
+    let _ = sh("rm -rf {dir}")
+}
+
+fn expect_runs(files: List[(Str, Str)], want: Str) ! IO, FS.Write, Process.Spawn {
+    let dir = new_package(files)
+    let mut ok = true
+    for args in ["check", "run --no-per-module", "run --per-module"] {
+        let r = blink_in(dir, args)
+        let good = r.success() && !r.out.contains("warning[") && (args == "check" || r.out.trim().ends_with(want))
+        if !good {
+            io.eprintln("blink {args}: {r.end}\n{r.out}")
+            ok = false
+        }
+    }
+    cleanup(dir)
+    assert(ok)
+}
+
+// Check and the per-module build both stop on a front-end error whose output holds `want`,
+// never on an internal compiler error.
+fn expect_refused(files: List[(Str, Str)], want: Str) ! IO, FS.Write, Process.Spawn {
+    let dir = new_package(files)
+    let mut ok = true
+    for args in ["check", "build --per-module", "build --no-per-module"] {
+        let r = blink_in(dir, args)
+        let good = !r.success() && r.out.contains(want) && !r.out.contains("internal compiler error")
+        if !good {
+            io.eprintln("blink {args}: {r.end}\n{r.out}")
+            ok = false
+        }
+    }
+    cleanup(dir)
+    assert(ok)
+}
+
+let base = ("base", "pub let G: Int = 5\npub const K: Int = 3\nlet hidden: Int = 9\n")
+let facade = ("facade", "pub import base.\{K, G}\n")
+
+test "a facade qualifier reads a re-exported pub let" {
+    expect_runs([base, facade, ("main", "import facade\nfn main() \{ io.println(\"\{facade.G}\") }\n")], "5")
+}
+
+test "a facade qualifier reads a re-exported const" {
+    expect_runs([base, facade, ("main", "import facade\nfn main() \{ io.println(\"\{facade.K}\") }\n")], "3")
+}
+
+test "a re-exported global and const read through the facade in an expression" {
+    expect_runs([base, facade, ("main", "import facade\nfn main() \{\n    let n = facade.G * 10 + facade.K\n    io.println(\"\{n}\")\n}\n")], "53")
+}
+
+test "a re-exported global read through the facade as a call argument" {
+    expect_runs([base, facade,
+        ("main", "import facade\nfn twice(x: Int) -> Int \{ x * 2 }\nfn main() \{ io.println(\"\{twice(facade.G)} \{twice(facade.K)}\") }\n")], "10 6")
+}
+
+test "a re-export of a nested module path is read through the facade" {
+    expect_runs([("deep/inner", "pub let DK: Int = 3\npub const DC: Str = \"deep\"\n"),
+        ("hlp", "pub import deep.inner.\{DK, DC}\n"),
+        ("main", "import hlp\nfn main() \{\n    let g = hlp.DK\n    io.println(\"\{hlp.DC} \{g}\")\n}\n")], "deep 3")
+}
+
+test "a re-export of a re-export is read through the outer facade" {
+    expect_runs([base, facade, ("outer", "pub import facade.\{G, K}\n"),
+        ("main", "import outer\nfn main() \{ io.println(\"\{outer.G + outer.K}\") }\n")], "8")
+}
+
+test "a whole-module re-export is read through the facade" {
+    expect_runs([base, ("facade", "pub import base\n"),
+        ("main", "import facade\nfn main() \{ io.println(\"\{facade.G} \{facade.K}\") }\n")], "5 3")
+}
+
+test "a facade's own global and a re-exported one read side by side" {
+    expect_runs([base, ("facade", "pub import base.\{G}\npub let OWN: Int = 40\n"),
+        ("main", "import facade\nfn main() \{ io.println(\"\{facade.OWN + facade.G}\") }\n")], "45")
+}
+
+test "a re-exported global read through an alias of the facade" {
+    expect_runs([base, facade, ("main", "import facade as f\nfn main() \{ io.println(\"\{f.G + f.K}\") }\n")], "8")
+}
+
+test "a re-exported global whose value a function computes at run time is read through the facade" {
+    expect_runs([("base", "fn seed() -> Int \{ 6 * 7 }\npub let SEEDED: Int = seed()\n"),
+        ("facade", "pub import base.\{SEEDED}\n"),
+        ("main", "import facade\nfn main() \{ io.println(\"\{facade.SEEDED}\") }\n")], "42")
+}
+
+// Each name is private in one source of the facade and pub in the other, so both orders of the
+// two sources are read.
+let b1 = ("b1", "let X: Int = 1\npub let Y: Int = 2\nconst K: Int = 10\npub const J: Int = 20\nfn f() -> Int \{ 100 }\npub fn g() -> Int \{ 200 }\n")
+let b2 = ("b2", "pub let X: Int = 3\nlet Y: Int = 4\npub const K: Int = 30\nconst J: Int = 40\npub fn f() -> Int \{ 500 }\nfn g() -> Int \{ 600 }\n")
+let two_sources = ("facade", "pub import b1\npub import b2\n")
+
+test "a facade qualifier reads the pub item of two sources, not the private one" {
+    expect_runs([b1, b2, two_sources,
+        ("main", "import facade\nfn main() \{ io.println(\"\{facade.X} \{facade.Y} \{facade.K} \{facade.J} \{facade.f()} \{facade.g()}\") }\n")],
+        "3 2 30 20 500 200")
+}
+
+test "a selective import from a facade binds the pub item of two sources, not the private one" {
+    expect_runs([b1, b2, two_sources,
+        ("main", "import facade.\{X, Y, K, J, f, g}\nfn main() \{ io.println(\"\{X} \{Y} \{K} \{J} \{f()} \{g()}\") }\n")],
+        "3 2 30 20 500 200")
+}
+
+test "a name the facade does not re-export is not a member of the facade" {
+    expect_refused([base, facade, ("main", "import facade\nfn main() \{ io.println(\"\{facade.hidden}\") }\n")],
+        "no member `hidden` on module `facade`")
+}
+
+test "a name the facade imports without pub is not a member of the facade" {
+    expect_refused([base, ("facade", "import base.\{G}\npub fn f() -> Int \{ G }\n"),
+        ("main", "import facade\nfn main() \{ io.println(\"\{facade.G}\") }\n")],
+        "no member `G` on module `facade`")
+}
+
+test "a private global the facade re-exports is a private item to the consumer" {
+    expect_refused([base, ("facade", "pub import base.\{hidden}\n"),
+        ("main", "import facade\nfn main() \{ io.println(\"\{facade.hidden}\") }\n")],
+        "error[PrivateItemAccess]")
+}
+
+let private_base = ("base", "let H: Int = 1\nconst HK: Int = 2\nfn hf() -> Int \{ 3 }\npub fn keep() -> Int \{ H + HK + hf() }\n")
+
+test "a private global of a whole-module re-export is a private item to the consumer" {
+    expect_refused([private_base, ("facade", "pub import base\n"),
+        ("main", "import facade\nfn main() \{ io.println(\"\{facade.H}\") }\n")],
+        "error[PrivateItemAccess]")
+}
+
+test "a private const of a whole-module re-export is a private item to the consumer" {
+    expect_refused([private_base, ("facade", "pub import base\n"),
+        ("main", "import facade\nfn main() \{ io.println(\"\{facade.HK}\") }\n")],
+        "error[PrivateItemAccess]")
+}
+
+test "a private function of a whole-module re-export is a private item to the consumer" {
+    expect_refused([private_base, ("facade", "pub import base\n"),
+        ("main", "import facade\nfn main() \{ io.println(\"\{facade.hf()}\") }\n")],
+        "error[PrivateItemAccess]")
+}

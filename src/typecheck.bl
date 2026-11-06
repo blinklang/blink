@@ -21011,11 +21011,17 @@ fn nr_resolve_decl_in_module(target: Str, member: Str, depth: Int) -> Int {
     let direct = nr_module_decl(target, member)
     if direct != -1 { return direct }
     if depth >= 8 { return -1 }
+    // A `pub import` forwards only the pub items of its source, so a private one there must not
+    // hide a pub one that another source forwards. A private one alone still answers, so that
+    // the privacy check (nr_reexport_reach) names it and no second error follows.
+    let mut private_hit = -1
     for src in nr_reexport_sources(target, member) {
         let hit = nr_resolve_decl_in_module(src, member, depth + 1)
-        if hit != -1 { return hit }
+        if hit == -1 { continue }
+        if nr_is_private_in(nr_privacy.space.get(hit) ?? "any", member, node_module(hit)) == 0 { return hit }
+        if private_hit == -1 { private_hit = hit }
     }
-    -1
+    private_hit
 }
 
 // The modules a `pub import` in `target` forwards `member` from: a named re-export first,
@@ -21215,6 +21221,21 @@ fn nr_record_qualified_call(node: Int, qualifier: Str, method: Str) ! Diag.Repor
         tc_mark_symbol_used(method)
     }
     nr_note_call_decl(node, nr_resolve_qualified_decl(qualifier, method))
+    tc_mark_qualifier_used(qualifier)
+}
+
+// What a read through a module qualifier owes, as a call does: the privacy check, the import it
+// uses, and the declaration it reaches. A facade declares nothing of its own, so the record is
+// the declaration that a `pub import` forwards.
+fn nr_record_qualified_read(node: Int, qualifier: Str, name: Str) ! Diag.Report {
+    if nr_qualified_private_access("value", qualifier, name) != 0 {
+        nr_emit_private_access(name, nr_qualified_use_decl("value", qualifier, name), node)
+    } else {
+        tc_mark_symbol_used(name)
+    }
+    let decl = nr_resolve_qualified_decl(qualifier, name)
+    nr_note_global_decl(node, decl)
+    nr_note_fn_value_decl(node, decl)
     tc_mark_qualifier_used(qualifier)
 }
 
@@ -26478,13 +26499,7 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                 }
                 if nr_qualifier_module_here(fa_obj_name) != "" && nr_is_defined(fa_obj_name) == 0 {
                     is_mod_fa = 1
-                    let fa_field = node_name(node)
-                    if nr_qualified_private_access("value", fa_obj_name, fa_field) != 0 {
-                        nr_emit_private_access(fa_field, nr_qualified_use_decl("value", fa_obj_name, fa_field), node)
-                    } else {
-                        tc_mark_symbol_used(fa_field)
-                    }
-                    tc_mark_qualifier_used(fa_obj_name)
+                    nr_record_qualified_read(node, fa_obj_name, node_name(node))
                 }
             }
             if is_mod_fa == 0 && obj_kind == NodeKind.FieldAccess {
@@ -32888,24 +32903,31 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
             // than guessing a type.
             let qual_mod = tc_site_qualifier_module(obj_name, node)
             if qual_mod != "" && nr_receiver_is_defined(obj_name) == 0 {
-                let qual_decl = tc_module_let_decl_node(qual_mod, fname)
+                // Name resolution records the declaration a qualified read reaches. The module's own
+                // map answers first, as name resolution does not record a destructuring `let`
+                // leaf. A node name resolution did not walk, or one whose name is no let or fn,
+                // resolves here.
+                let own_let = tc_module_let_decl_node(qual_mod, fname)
+                let recorded = tc_global_read_decl.get(node) ?? -1
+                let qual_hit = if own_let != -1 { own_let } else if recorded != -1 { recorded } else { nr_resolve_decl_in_module(qual_mod, fname, 0) }
+                let qual_decl = if qual_hit != -1 && tc_module_let_decl_node(node_module(qual_hit), fname) == qual_hit { qual_hit } else { -1 }
+                trace.log("blink.tc.qualread", "`{obj_name}.{fname}` in {qual_mod}: module let {qual_decl}")
                 // Codegen has no file import list to ask which module an alias names.
                 nr_note_global_decl(node, qual_decl)
                 if qual_decl != -1 {
                     let let_tid = tc_lookup_node_tid(qual_decl)
                     if let_tid >= 0 { return let_tid }
                 } else {
-                    let qual_fn = nr_resolve_decl_in_module(qual_mod, fname, 0)
-                    nr_note_fn_value_decl(node, qual_fn)
+                    nr_note_fn_value_decl(node, qual_hit)
                     if tc_fn_value_decl_node(node) >= 0 {
-                        match fnsig_by_decl.get(qual_fn) {
+                        match fnsig_by_decl.get(qual_hit) {
                             Some(sig) => return tc_fn_value_type(node, sig)
                             None => {}
                         }
                     }
                     // A walk before the boundary check does not see a local that hides the
                     // module, and each later one reads this node again.
-                    if qual_fn == -1 && tc_boundary_check_active != 0 && !nr_is_call_on_collided_qualifier(node) {
+                    if qual_hit == -1 && tc_boundary_check_active != 0 && !nr_is_call_on_collided_qualifier(node) {
                         if !tc_calls.reported.contains_key(node) {
                             tc_calls.reported.insert(node, 1)
                             tc_report_member_read_as_value(node, obj_name, fname)
