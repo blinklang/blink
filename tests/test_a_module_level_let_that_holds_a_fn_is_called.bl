@@ -1,0 +1,172 @@
+// A module-level `let` may hold a function literal (sections/02_syntax.md §2.12.1). The
+// literal's body does not run at initialization; a call of the name runs it. A call of the
+// name is a call through the closure the global holds, as for a local of the same type, in
+// the module that declares it and through an import of a `pub let`. Check, the one-unit
+// build and the per-module build agree.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> ProcessResult ! Process.Spawn {
+    process.run("sh", ["-c", cmd]).unwrap()
+}
+
+fn blink_in(dir: Str, args: Str) -> ProcessResult ! Process.Spawn {
+    sh("B=$(pwd)/build/blink; cd {dir} && BLINK_BIN=$B timeout 120 $B {args} src/main.bl < /dev/null 2>&1")
+}
+
+fn new_package(files: List[(Str, Str)]) -> Str ! FS.Write, Process.Spawn {
+    let dir = sh("mktemp -d /tmp/blink_fn_let_call.XXXXXX").out.trim()
+    fs.write("{dir}/blink.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\n").unwrap()
+    let _ = sh("mkdir -p {dir}/src")
+    for f in files {
+        fs.write("{dir}/src/{f.0}.bl", f.1).unwrap()
+    }
+    dir
+}
+
+fn cleanup(dir: Str) ! Process.Spawn {
+    let _ = sh("rm -rf {dir}")
+}
+
+fn expect_runs(files: List[(Str, Str)], want: Str, -- warns: Bool = false) ! IO, FS.Write, Process.Spawn {
+    let dir = new_package(files)
+    let mut ok = true
+    for args in ["check", "run --no-per-module", "run --per-module"] {
+        let r = blink_in(dir, args)
+        let good = r.success() && r.out.contains("warning[") == warns && (args == "check" || r.out.trim().ends_with(want))
+        if !good {
+            io.eprintln("blink {args}: {r.end}\n{r.out}")
+            ok = false
+        }
+    }
+    cleanup(dir)
+    assert(ok)
+}
+
+// Check and both builds stop on a front-end error whose output holds `want`, never on an
+// internal compiler error.
+fn expect_refused(files: List[(Str, Str)], want: Str) ! IO, FS.Write, Process.Spawn {
+    let dir = new_package(files)
+    let mut ok = true
+    for args in ["check", "build --per-module", "build --no-per-module"] {
+        let r = blink_in(dir, args)
+        let good = !r.success() && r.out.contains(want) && !r.out.contains("internal compiler error")
+        if !good {
+            io.eprintln("blink {args}: {r.end}\n{r.out}")
+            ok = false
+        }
+    }
+    cleanup(dir)
+    assert(ok)
+}
+
+fn main_only(src: Str) -> List[(Str, Str)] {
+    [("main", src)]
+}
+
+test "a call of a module-level fn literal runs its body" {
+    expect_runs(main_only("let h: fn(Int) -> Int = fn(x: Int) -> Int \{ x + 1 }\nfn main() \{ io.println(\"\{h(1)}\") }\n"), "2")
+}
+
+test "a module-level fn literal with no annotation is called" {
+    expect_runs(main_only("let h = fn(x: Int) -> Int \{ x * 3 }\nfn main() \{ io.println(\"\{h(2)}\") }\n"), "6")
+}
+
+test "a module-level fn literal whose body calls a module fn is called from another fn" {
+    expect_runs(main_only("fn base(x: Int) -> Int \{ x * 10 }\nlet h: fn(Int) -> Int = fn(x: Int) -> Int \{ base(x) + 1 }\nfn twice(x: Int) -> Int \{ h(h(x)) }\nfn main() \{ io.println(\"\{twice(0)}\") }\n"), "11")
+}
+
+test "a module-level fn literal is passed as an argument" {
+    expect_runs(main_only("let h: fn(Int) -> Int = fn(x: Int) -> Int \{ x + 1 }\nfn main() \{ io.println(\"\{[1, 2].map(h).debug()}\") }\n"), "[2, 3]")
+}
+
+test "a module-level fn literal read into a local is called through the local" {
+    expect_runs(main_only("let h: fn(Int) -> Int = fn(x: Int) -> Int \{ x + 1 }\nfn main() \{\n    let k = h\n    io.println(\"\{k(4)} \{h(4)}\")\n}\n"), "5 5")
+}
+
+test "a module-level fn literal whose body does io runs the io at the call, not at initialization" {
+    expect_runs(main_only("let say = fn() \{ io.println(\"second\") }\nfn main() \{\n    io.println(\"first\")\n    say()\n}\n"), "first\nsecond")
+}
+
+test "a module-level let mut that holds a fn calls the closure assigned last" {
+    expect_runs(main_only("let mut op: fn(Int) -> Int = fn(x: Int) -> Int \{ x + 1 }\nfn main() \{\n    let a = op(1)\n    op = fn(x: Int) -> Int \{ x * 100 }\n    io.println(\"\{a} \{op(1)}\")\n}\n"), "2 100")
+}
+
+// A shadowing local warns (ShadowedVariable), so the row expects the warning, not a clean build.
+test "a local of the same name hides the module-level fn literal at a call" {
+    expect_runs(main_only("let h: fn(Int) -> Int = fn(x: Int) -> Int \{ x + 1 }\nfn main() \{\n    let h = fn(x: Int) -> Int \{ x - 1 }\n    io.println(\"\{h(5)}\")\n}\n"), "4", warns: true)
+}
+
+// Typecheck reads a local before the compiler-provided forms of these names, so the call
+// is a call through the local, in typecheck and in codegen.
+test "a local named like a compiler-provided form is called as the closure it holds" {
+    expect_runs(main_only("fn main() \{\n    let Raw = fn(x: Int) -> Int \{ x + 1 }\n    let skip = fn(x: Int) -> Int \{ x + 2 }\n    let old = fn(x: Int) -> Int \{ x + 3 }\n    let range_bounds = fn(x: Int) -> Int \{ x + 4 }\n    io.println(\"\{Raw(0)} \{skip(0)} \{old(0)} \{range_bounds(0)}\")\n}\n"), "1 2 3 4")
+}
+
+let lib = ("lib", "pub let inc: fn(Int) -> Int = fn(x: Int) -> Int \{ x + 1 }\nlet hid: fn(Int) -> Int = fn(x: Int) -> Int \{ x }\npub let n: Int = 3\n")
+
+test "a pub let that holds a fn is called through its module qualifier" {
+    expect_runs([lib, ("main", "import lib\nfn main() \{ io.println(\"\{lib.inc(1)}\") }\n")], "2")
+}
+
+test "a pub let that holds a fn is called through its module qualifier in a generic fn" {
+    expect_runs([lib, ("main", "import lib\nfn ap[T](_x: T) -> Int \{ lib.inc(1) }\nfn main() \{ io.println(\"\{ap(\"a\")} \{ap(2)}\") }\n")], "2 2")
+}
+
+test "a pub let that holds a fn is called through its module qualifier in a method of a generic type" {
+    expect_runs([lib, ("main", "import lib\ntype Box[T] \{ v: T, n: Int }\ntrait Bump \{\n    fn bump(self) -> Int\n}\nimpl[T] Bump for Box[T] \{\n    fn bump(self) -> Int \{ lib.inc(self.n) }\n}\nfn main() \{\n    let a = Box \{ v: \"s\", n: 1 }\n    let b = Box \{ v: 3, n: 1 }\n    io.println(\"\{a.bump()} \{b.bump()} \{a.v}\")\n}\n")], "2 2 s")
+}
+
+test "a pub let that holds a fn is called through a selective import in a generic fn" {
+    expect_runs([lib, ("main", "import lib.\{inc}\nfn ap[T](_x: T) -> Int \{ inc(1) }\nfn main() \{ io.println(\"\{ap(\"a\")} \{ap(2)}\") }\n")], "2 2")
+}
+
+test "a module-level fn literal named like a libc function is called" {
+    expect_runs(main_only("let getpid = fn() -> Int \{ 7 }\nfn main() \{ io.println(\"\{getpid()}\") }\n"), "7")
+}
+
+test "a module-level fn literal named skip is called outside a test" {
+    expect_runs(main_only("let skip = fn() -> Int \{ 8 }\nfn main() \{ io.println(\"\{skip()}\") }\n"), "8")
+}
+
+test "a pub let with no annotation that holds a fn is called from another module" {
+    expect_runs([("lib", "pub let inc = fn(x: Int) -> Int \{ x + 1 }\n"),
+        ("main", "import lib\nimport lib.\{inc}\nfn main() \{ io.println(\"\{lib.inc(1)} \{inc(2)}\") }\n")], "2 3")
+}
+
+test "a pub let that holds a fn is called through a selective import" {
+    expect_runs([lib, ("main", "import lib.\{inc}\nfn main() \{ io.println(\"\{inc(2)}\") }\n")], "3")
+}
+
+test "a pub let that holds a fn is called through a module alias and an item alias" {
+    expect_runs([lib, ("main", "import lib as l\nimport lib.\{inc as plus}\nfn main() \{ io.println(\"\{l.inc(1)} \{plus(2)}\") }\n")], "2 3")
+}
+
+test "a pub let that holds a fn is called through a facade that re-exports it" {
+    expect_runs([lib, ("facade", "pub import lib.\{inc}\n"),
+        ("main", "import facade\nimport facade.\{inc}\nfn main() \{ io.println(\"\{facade.inc(1)} \{inc(5)}\") }\n")], "2 6")
+}
+
+test "a pub let that holds a fn is passed as an argument through its module qualifier" {
+    expect_runs([lib, ("main", "import lib\nfn main() \{ io.println(\"\{[1, 2].map(lib.inc).debug()}\") }\n")], "[2, 3]")
+}
+
+test "a qualified call of a pub let that holds a fn checks the argument count" {
+    expect_refused([lib, ("main", "import lib\nfn main() \{ io.println(\"\{lib.inc(1, 2)}\") }\n")],
+        "function `lib.inc` expects 1 argument(s), got 2")
+}
+
+test "a qualified call of a pub let that holds a fn answers the fn's return type" {
+    expect_refused([lib, ("main", "import lib\nfn main() \{\n    let s: Str = lib.inc(1)\n    io.println(s)\n}\n")],
+        "declared type Str but got Int")
+}
+
+test "a qualified call of a pub let that holds no fn is refused" {
+    expect_refused([lib, ("main", "import lib\nfn main() \{ io.println(\"\{lib.n(1)}\") }\n")],
+        "cannot call `lib.n`: it has type Int, which is not a function")
+}
+
+test "a qualified call of a private let that holds a fn is a private item" {
+    expect_refused([lib, ("main", "import lib\nfn main() \{ io.println(\"\{lib.hid(1)}\") }\n")],
+        "error[PrivateItemAccess]")
+}

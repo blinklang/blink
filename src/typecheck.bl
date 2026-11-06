@@ -7847,6 +7847,83 @@ fn tc_qualified_call_fnsig(node: Int, qualifier: Str, method: Str) -> Int ! Diag
     fnsig_by_decl.get(tc_call_decl_node(node)) ?? -1
 }
 
+// The declaration `qual.name` reaches, given what name resolution recorded for the site. The
+// module's own map answers first, as name resolution does not record a destructuring `let`
+// leaf. A site name resolution did not walk resolves here.
+fn tc_qualified_name_hit(qual_mod: Str, name: Str, recorded: Int) -> Int {
+    let own_let = tc_module_let_decl_node(qual_mod, name)
+    if own_let != -1 { return own_let }
+    if recorded != -1 { return recorded }
+    nr_resolve_decl_in_module(qual_mod, name, 0)
+}
+
+// The hit as the module-level `let` that holds `name`, or -1. A re-export can rename a
+// declaration, and a `let` that its own module registers under another name holds another
+// value, so only the `let` registered under `name` counts.
+fn tc_module_let_of_hit(hit: Int, name: Str) -> Int {
+    if hit != -1 && tc_module_let_decl_node(node_module(hit), name) == hit { hit } else { -1 }
+}
+
+// A call whose callee is a value (a local, a parameter or a module-level `let`) is a read of
+// that value, so the global read record keeps it: the call node maps to the `let` it reads,
+// or -1 for a local. A call node is never an ident or a field access, so its key meets no
+// other. Codegen calls the closure that the value holds.
+fn tc_note_value_call(call_node: Int, let_decl: Int) {
+    tc_global_read_decl.insert(call_node, let_decl)
+}
+
+pub fn tc_call_is_through_value(call_node: Int) -> Bool {
+    let k = node_kind(call_node)
+    (k == NodeKind.Call || k == NodeKind.MethodCall) && tc_global_read_decl.contains_key(call_node)
+}
+
+// The type of the module-level `let` a value call reads, or -1 for a local. Each module-level
+// `let` has one type, so a call in a generic body reads the same type in every instance.
+pub fn tc_value_call_let_tid(call_node: Int) -> Int {
+    let decl = tc_value_call_let_decl(call_node)
+    if decl < 0 { return -1 }
+    tc_resolve(tc_lookup_node_tid(decl))
+}
+
+pub fn tc_value_call_let_decl(call_node: Int) -> Int {
+    if !tc_call_is_through_value(call_node) { return -1 }
+    tc_global_read_decl.get(call_node) ?? -1
+}
+
+// A call through a value of type `held`. A value declares no type parameters, so brackets
+// after it were meant as an index. A value whose type is still open is not yet known to be
+// uncallable, so only a settled non-Fn type is reported.
+fn tc_call_through_value(held: Int, args_sl: Int, label: Str, node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    if node_type_params(node) != -1 {
+        let _ = tc_claim_type_args(node, 0, label, ELEMENT_ACCESS_HELP)
+        let _ = tc_infer_arg_tids(args_sl)
+        return tc_error_recovery_tid()
+    }
+    if held >= 0 && type_kind(held) == TyKind.Fn {
+        return tc_check_call_against_fn_tid(held, args_sl, "function `{label}`", node)
+    }
+    let _ = tc_infer_arg_tids(args_sl)
+    if held < 0 || type_kind(held) == TyKind.Unknown || type_kind(held) == TyKind.Typevar { return -1 }
+    tc_error_at("cannot call `{label}`: it has type {type_to_str(held)}, which is not a function", node)
+    tc_error_recovery_tid()
+}
+
+// A call `qual.method(args)` whose qualifier names a module: a function of that module, or a
+// module-level `let` whose closure the call reads and calls.
+fn tc_infer_module_qualified_call(node: Int, obj_name: Str, method: Str, obj_t: Int, args_sl: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    if tc_call_is_skip_intrinsic(node) { return tc_check_skip_call(node) }
+    let sig = tc_qualified_call_fnsig(node, obj_name, method)
+    if sig != -1 { return tc_check_free_call("{obj_name}.{method}", sig, node) }
+    let held = tc_module_let_of_hit(tc_qualified_name_hit(tc_site_qualifier_module(obj_name, node), method, tc_call_decl_node(node)), method)
+    if held != -1 {
+        tc_note_value_call(node, held)
+        return tc_call_through_value(tc_lookup_node_tid(held), args_sl, "{obj_name}.{method}", node)
+    }
+    // This file binds the qualifier to a module, so the arms below that read the receiver as a
+    // type have no say.
+    tc_method_call_unanswered(node, method, obj_t, args_sl)
+}
+
 // Validate a call against a fnsig: its keyword shape, its argument count, and each
 // argument's type. `self_offset` skips leading implicit params: 0 for free functions, 1 for
 // methods whose fnsig carries `self` as param 0 (so explicit arg `i` aligns to
@@ -20769,6 +20846,9 @@ fn nr_note_call_decl(call_node: Int, decl_node: Int) {
 // with no diagnostic at all. A top-level function named as a value is the same fact, kept in
 // the same record: the declaration's kind tells the two apart, and a reader of the global
 // answer takes the name for a C global, which a function is not.
+// Three key kinds share the record and never meet: an ident (a bare read), a field access
+// (a `module.name` read) and a call through a value, which reads that value (see
+// tc_note_value_call).
 let mut tc_global_read_decl: Map[Int, Int] = Map()
 
 // The module-scope `let` this ident read resolved to, or -1 when the ident is not a read of
@@ -26328,11 +26408,14 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                     let defined = top != -1
                     if defined { nr_mark_read_at(top) }
                     let global = defined && nr_index_is_global(top) != 0
+                    let reached = nr_resolve_bare_call_decl(fn_name, nr_current_module)
                     if global && is_private_access("value", fn_name) != 0 {
                         let real = nr_private_use_name(fn_name)
-                        if !nr_emit_default_body_access(real, nr_bare_private_use_decl(fn_name, nr_resolve_bare_call_decl(fn_name, nr_current_module)), node) {
-                            tc_errors.push("cannot access private function `{real}`")
-                            diag_error_at("PrivateItemAccess", PRIVATE_ITEM_ACCESS, "cannot access private function `{real}` from another module", node, "mark the function as `pub` in its module")
+                        if !nr_emit_default_body_access(real, nr_bare_private_use_decl(fn_name, reached), node) {
+                            // A module-level `let` that holds a closure is a value, not a function.
+                            let what = if reached >= 0 && node_kind(reached) == NodeKind.LetBinding { "item" } else { "function" }
+                            tc_errors.push("cannot access private {what} `{real}`")
+                            diag_error_at("PrivateItemAccess", PRIVATE_ITEM_ACCESS, "cannot access private {what} `{real}` from another module", node, "mark the {what} as `pub` in its module")
                         }
                     } else if !defined && is_variant_name(fn_name) != 0 && is_private_access("value", fn_name) != 0 {
                         let real = nr_private_use_name(fn_name)
@@ -26350,12 +26433,15 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                         tc_errors.push("undefined function `{fn_name}`")
                         tc_report_undefined_fn(fn_name, node, callee)
                     } else {
-                        tc_mark_call_used(fn_name, nr_resolve_bare_call_decl(fn_name, nr_current_module))
+                        tc_mark_call_used(fn_name, reached)
                     }
                     // A local binding of the same spelling holds a value, not a declaration,
                     // so a call through it is a call through a closure and records nothing.
                     if global || !defined {
-                        nr_note_call_decl(node, nr_resolve_bare_call_decl(fn_name, nr_current_module))
+                        nr_note_call_decl(node, reached)
+                        // A module-level `let` holds a value as a local does, so the callee is a
+                        // read of that global, and codegen calls the closure the read gives.
+                        nr_note_global_decl(callee, reached)
                     }
                 }
             } else if callee_kind == NodeKind.IndexExpr && tc_index_is_type_application(callee) == 0 {
@@ -30739,6 +30825,18 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                 if as_carrier {
                     return tc_carrier_call_tid(fn_name, node_args(node), node)
                 }
+                // A local hides a builtin or a module-level fn of its name (§3.4 *Variant
+                // Construction*: a local binding comes first), so it is read before them.
+                // A closure parameter `f` that took the arity of a top-level fn `f` gave a
+                // false TypeError in the stdlib.
+                let local_tid = nr_get_type(written)
+                if tc_tid_is_no_info(local_tid) == 0 {
+                    // The callee names a VALUE — a closure in a local or a parameter — not an
+                    // item, so it is a value child like any other and carries its own type.
+                    tc_publish_node_tid(callee, local_tid)
+                    tc_note_value_call(node, tc_global_decl_node(callee))
+                    return tc_call_through_value(local_tid, node_args(node), fn_name, node)
+                }
                 if fn_name == "Raw" {
                     let args_sl = node_args(node)
                     let raw_count = if args_sl == -1 { 0 } else { sublist_length(args_sl) }
@@ -30817,51 +30915,11 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                         None => {}
                     }
                 }
-                // Local lexical scope shadows module-level definitions
-                // (sections/02_syntax.md:671-680, 07_trust_modules_metadata.md:1042).
-                // A closure parameter named `f` (e.g. list_fold's `f: fn(U,T)->U`)
-                // must NOT resolve against a same-named top-level fn — doing so
-                // applied the global fn's arity to the closure call and produced a
-                // spurious TypeError inside the stdlib. When the name
-                // is bound in local scope, it wins: infer the args (so nested
-                // expressions are still type-checked) and, if the local binding is
-                // a structured fn type, arity/type-check against THAT; otherwise
-                // return its type without consulting the global fnsig.
-                //
-                // The TyKind.Fn branch below is the live path: closure literals infer a
-                // structured tid and `fn(..)` annotations lower to it, so a locally-bound
-                // callable has a structured tid to check against, which is
-                // what makes `let g = c` followed by `g(21)` arity-checked.
-                let local_tid = nr_get_type(written)
-                if tc_tid_is_no_info(local_tid) == 0 {
-                    // The callee names a VALUE — a closure in a local or a parameter — not an
-                    // item, so it is a value child like any other and carries its own type.
-                    tc_publish_node_tid(callee, local_tid)
-                    let call_args_sl = node_args(node)
-                    if node_type_params(node) != -1 {
-                        // A value declares no type parameters, so brackets after it were
-                        // meant as an index.
-                        let _ = tc_claim_type_args(node, 0, fn_name, ELEMENT_ACCESS_HELP)
-                        let _ = tc_infer_arg_tids(call_args_sl)
-                        return tc_error_recovery_tid()
-                    }
-                    if type_kind(local_tid) == TyKind.Fn {
-                        return tc_check_call_against_fn_tid(local_tid, call_args_sl, "function `{fn_name}`", node)
-                    }
-                    if call_args_sl != -1 {
-                        let mut li = 0
-                        while li < sublist_length(call_args_sl) {
-                            infer_type(sublist_get(call_args_sl, li))
-                            li = li + 1
-                        }
-                    }
-                    // The name is in scope and carries a type, and that type is not a function.
-                    // A local whose own type is still open is not yet known to be uncallable, so
-                    // only a settled non-Fn type is reported.
-                    let lk = type_kind(local_tid)
-                    if lk == TyKind.Unknown || lk == TyKind.Typevar { return -1 }
-                    tc_error_at("cannot call `{fn_name}`: it has type {type_to_str(local_tid)}, which is not a function", node)
-                    return tc_error_recovery_tid()
+                // A module-level `let` whose type is not yet known is still a value.
+                let held_let = tc_global_decl_node(callee)
+                if held_let >= 0 {
+                    tc_note_value_call(node, held_let)
+                    return tc_call_through_value(tc_lookup_node_tid(held_let), node_args(node), fn_name, node)
                 }
                 let sig = tc_bare_callee_sig(written)
                 // Name resolution already reported the call; the arguments are still checked,
@@ -32505,12 +32563,7 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                 }
             }
             if tc_site_qualifier_module(obj_name, node) != "" && nr_receiver_is_defined(obj_written) == 0 && (is_intrinsic_method(obj_name, method) == 0 || tc_ns_call_reads_module(obj_name) != 0) {
-                if tc_call_is_skip_intrinsic(node) { return tc_check_skip_call(node) }
-                let sig = tc_qualified_call_fnsig(node, obj_name, method)
-                if sig != -1 { return tc_check_free_call("{obj_name}.{method}", sig, node) }
-                // This file binds the qualifier to a module, so the arms below that read the
-                // receiver as a type have no say.
-                return tc_method_call_unanswered(node, method, obj_t, args_sl)
+                return tc_infer_module_qualified_call(node, obj_name, method, obj_t, args_sl)
             }
             // Every path below reads the receiver Ident as a TYPE NAME. A name with
             // a binding in scope is a value, and `value.method()` is an instance call no
@@ -32903,14 +32956,8 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
             // than guessing a type.
             let qual_mod = tc_site_qualifier_module(obj_name, node)
             if qual_mod != "" && nr_receiver_is_defined(obj_name) == 0 {
-                // Name resolution records the declaration a qualified read reaches. The module's own
-                // map answers first, as name resolution does not record a destructuring `let`
-                // leaf. A node name resolution did not walk, or one whose name is no let or fn,
-                // resolves here.
-                let own_let = tc_module_let_decl_node(qual_mod, fname)
-                let recorded = tc_global_read_decl.get(node) ?? -1
-                let qual_hit = if own_let != -1 { own_let } else if recorded != -1 { recorded } else { nr_resolve_decl_in_module(qual_mod, fname, 0) }
-                let qual_decl = if qual_hit != -1 && tc_module_let_decl_node(node_module(qual_hit), fname) == qual_hit { qual_hit } else { -1 }
+                let qual_hit = tc_qualified_name_hit(qual_mod, fname, tc_global_read_decl.get(node) ?? -1)
+                let qual_decl = tc_module_let_of_hit(qual_hit, fname)
                 trace.log("blink.tc.qualread", "`{obj_name}.{fname}` in {qual_mod}: module let {qual_decl}")
                 // Codegen has no file import list to ask which module an alias names.
                 nr_note_global_decl(node, qual_decl)
@@ -36031,7 +36078,7 @@ fn tc_tm_check_call(node: Int, inside: Set[Int], assigns: Map[Int, List[Int]]) !
 // gives the closure that row.
 fn tc_tm_check_closures_run(node: Int, inside: Set[Int], assigns: Map[Int, List[Int]]) ! TypeCheck.Resolve, Diag.Report {
     for r in tc_tm_closures_run(node, assigns) {
-        let path = tc_tm_path_shown(if node_kind(r.expr) == NodeKind.NamedArg { node_value(r.expr) } else { r.expr })
+        let path = if r.expr == node { tc_tm_callee_shown(node, tc_value_call_let_decl(node)) } else { tc_tm_path_shown(if node_kind(r.expr) == NodeKind.NamedArg { node_value(r.expr) } else { r.expr }) }
         let shown = if path != "" { "`{path}`" } else { "a closure" }
         for c in r.closures {
             if inside.contains(c) { continue }
@@ -36545,7 +36592,7 @@ fn tc_tm_touch_walk(node: Int, binds: Map[Str, Int], depth: Int, seen: Set[Str],
         tc_tm_touch_walk(sublist_get(node_args(node), 0), binds, depth, seen, todo, reads, writes, assigns, kids)
         return
     }
-    if k == NodeKind.Ident || k == NodeKind.FieldAccess {
+    if k == NodeKind.Ident || k == NodeKind.FieldAccess || k == NodeKind.MethodCall {
         let shown = tc_tm_module_mut(node)
         if shown != "" { reads.push(shown) }
     }
@@ -36704,13 +36751,19 @@ type TmRun {
 fn tc_tm_closures_run(node: Int, assigns: Map[Int, List[Int]]) -> List[TmRun] {
     let mut out: List[TmRun] = []
     let d = tc_call_decl_node(node)
-    // A direct call of a named fn is checked as a call, not as a run of the fn value. Name
-    // resolution keeps the module `let` a callee such as `cb()` names on the call, not on
-    // the ident as it does for a read.
+    // A direct call of a named fn is checked as a call, not as a run of the fn value. A call of
+    // a module `let` runs each value the `let` may hold.
+    let held = tc_value_call_let_decl(node)
     if node_kind(node) == NodeKind.Call && !(d >= 0 && node_kind(d) == NodeKind.FnDef) {
-        let from = if d >= 0 && node_kind(d) == NodeKind.LetBinding { tc_tm_let_values(d, assigns) } else { [node_left(node)] }
+        let from = if held >= 0 { tc_tm_let_values(held, assigns) } else { [node_left(node)] }
         let cs = tc_tm_closures_of(from, assigns)
         if cs.len() > 0 { out.push(TmRun { expr: node_left(node), closures: cs }) }
+    }
+    // A qualified call such as `lib.say()` has no callee node, so the run names the call.
+    if node_kind(node) == NodeKind.MethodCall && held >= 0 {
+        let cs = tc_tm_closures_of(tc_tm_let_values(held, assigns), assigns)
+        if cs.len() > 0 { out.push(TmRun { expr: node, closures: cs }) }
+        return out
     }
     if node_kind(node) != NodeKind.MethodCall || d >= 0 { return out }
     let recv = resolve_alias_tid(tc_resolve(tc_lookup_node_tid(node_obj(node))))
@@ -36824,8 +36877,13 @@ fn tc_tm_touch_with(node: Int, binds: Map[Str, Int], depth: Int, seen: Set[Str],
     }
 }
 
-// The module `let mut` this ident or `module.name` access reads, as the source names it, or "".
+// The module `let mut` this ident, `module.name` access or `module.name(args)` call reads, as
+// the source names it, or "".
 fn tc_tm_module_mut(node: Int) -> Str {
+    if node_kind(node) == NodeKind.MethodCall {
+        let held = tc_value_call_let_decl(node)
+        return if held >= 0 && node_is_mut(held) != 0 { tc_tm_callee_shown(node, held) } else { "" }
+    }
     if node_kind(node) == NodeKind.FieldAccess {
         return match tc_module_global_decl(node) {
             Some(g) => if node_is_mut(g) != 0 { tc_tm_path_shown(node) } else { "" }

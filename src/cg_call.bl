@@ -36,7 +36,7 @@ import typecheck.{
     tc_struct_field_slots, tc_sfield_name, get_struct_field_tid,
     tc_names_a_type, tc_is_sealed_list_hof, tc_is_list_generic_adapter, tc_map_generic_adapter, tc_map_generic_adapter_module, tc_list_generic_module, tc_call_user_effect, tc_call_builtin_default, tc_namespace_call_reads_module, tc_handler_effect_root, tc_tid_handler_effect, builtin_op_roots,
     tc_lookup_node_tid, tc_unclaimed_call_tid, tc_tid_iter_elem,
-    tc_call_decl_node, tc_call_decl_is_fn, tc_call_is_skip_intrinsic, tc_call_is_range_bounds, tc_tid_name, tc_mc_obj_is_value, tc_call_is_trace_log,
+    tc_call_decl_node, tc_call_decl_is_fn, tc_call_is_through_value, tc_value_call_let_tid, tc_value_call_let_decl, tc_call_is_skip_intrinsic, tc_call_is_range_bounds, tc_tid_name, tc_mc_obj_is_value, tc_call_is_trace_log,
     tc_call_trait, tc_qualified_call_trait, tc_call_trait_head, tc_impl_answers_call, tc_impl_answers_for, tc_builtin_owner_name, tc_names_a_trait, tc_conversion_impl_for, tc_conversion_target_of, tc_conversion_trait_of, tc_is_into_method, CONVERSION_IS_IDENTITY, tc_impl_conv_source, tc_call_bound_trait_args, tc_call_bound_args_of,
     tc_builtin_method_writes_receiver, tc_decl_has_mut_self, tc_let_mut_root,
     tc_tid_same_type, make_option_type, make_fn_type, tc_qualified_carrier, range_repr_tid,
@@ -71,7 +71,7 @@ import ir.{
     ir_return, ir_verify_in_frame, ir_kind, ir_c_name, ir_c_spelling, ir_slot_form, ir_span, ir_tid, IrKind,
 }
 import cg_expr.{
-    lower_expr, lower_expr_as_value, cg_expr_async_scope_current, cg_expr_push_pending, cg_expr_pending_count, cg_expr_take_pending,
+    lower_expr, lower_expr_as_value, x_global_read, cg_expr_async_scope_current, cg_expr_push_pending, cg_expr_pending_count, cg_expr_take_pending,
     x_unbox_payload, x_layout_checked, lower_value_as_text, cg_expr_option_some, cg_expr_option_none, cg_expr_option_wrap,
     x_is_c_comparable, cg_expr_builds_carrier, cg_expr_lower_carrier_ctor, cg_expr_sequence, cg_expr_lower_pair,
     x_lower_default, cg_expr_pending_leaves_from, cg_expr_field_value, cg_expr_field_stored, x_panic_at, x_panic_what, x_site_args,
@@ -1685,10 +1685,9 @@ fn lower_fn_call(node: Int) -> Int ! Diag.Report {
     // would go: an expression that PRODUCES a closure value, not one that names a function.
     // A bound name is the same: the binder shadows whatever the name would name as a
     // function, so it is a closure value too, only spelled with one less step in between.
-    if callee < 0 || node_kind(callee) != NodeKind.Ident {
-        return cc_closure_call(node, callee)
-    }
-    if !cc_is_free_name(callee) {
+    // A module-level `let` holds a value just as a local does. Typecheck records each call
+    // it typed through a value, a local or a `let`, so codegen reads that record.
+    if callee < 0 || node_kind(callee) != NodeKind.Ident || tc_call_is_through_value(node) {
         return cc_closure_call(node, callee)
     }
     // skip is a compiler-provided form with no declaration to call: typecheck's own
@@ -1928,13 +1927,21 @@ fn cc_free_arity_wrong(node: Int, name: Str, want: Int, got: Int) -> Int ! Diag.
 // container element) build the same way.
 fn cc_closure_call(node: Int, callee: Int) -> Int ! Diag.Report {
     if callee < 0 { return cc_not_a_callee(node) }
+    cc_call_through_value(node, tid_of_node(callee), callee, -1)
+}
+
+// A call through the closure that `callee` gives or, when `decl` is a module-level `let`, the
+// one that global holds. `mod.g(args)` has no callee node to lower, so the read is built from
+// the declaration. The call's own layout is checked first, so a call that cannot be built
+// lowers no operand.
+fn cc_call_through_value(node: Int, fn_tid: Int, callee: Int, decl: Int) -> Int ! Diag.Report {
     let tid = tid_of_node(node)
     if tid < 0 { return -1 }
     let rec = cc_local(tid, node)
     if cc_stopped(rec) { return -1 }
-    let fn_type = fn_pointer_spelling_of(tid_of_node(callee), node)
+    let fn_type = fn_pointer_spelling_of(fn_tid, node)
     if fn_type == "" { return -1 }
-    let closure = lower_expr(callee)
+    let closure = if decl >= 0 { x_global_read(fn_tid, node, decl) } else { lower_expr(callee) }
     if closure < 0 { return -1 }
     let mut operands = [closure]
     let mut ends = [cg_expr_pending_count()]
@@ -1983,6 +1990,9 @@ fn lower_module_call(node: Int) -> Int ! Diag.Report {
     // std.testing's skip body is a placeholder; calling it would run the code after it.
     if tc_call_is_skip_intrinsic(node) { return cc_skip_not_lowered(node) }
     let decl = tc_call_decl_node(node)
+    // Each module-level `let` has one type, so typecheck's type for it holds in every instance,
+    // and a let of another module has no node in this instance's table.
+    if tc_call_is_through_value(node) { return cc_call_through_value(node, tc_value_call_let_tid(node), -1, tc_value_call_let_decl(node)) }
     if decl >= 0 { return cc_free_call(node, decl) }
     cc_no_module_member(node)
 }
