@@ -746,6 +746,7 @@ A stop of `blink build` is outside the Blink source when the cause is in the hos
 | The C name of an `@ffi let` is not an integer constant on the target, or its value does not fit | `ForeignConstInvalid` (E0855), at the declaration | `1` |
 | The link step fails: a native library is missing or lacks a symbol | `LinkFailed` (E0857) | `1` |
 | A vendored native dependency does not compile | `NativeDependencyBuildFailed` (E0858) | `1` |
+| The C compiler gave no verdict: it could not start, or a signal ended it | `CCompilerDidNotRun` (E0860), no span | `1` |
 
 An `@ffi` signature is the claim of the author about C (§9.1). `blink check` cannot test the claim. If the claim is wrong, the C compiler can reject the C that the compiler wrote. That stop is `GeneratedCDidNotCompile` (I0017), and its note names the `@ffi` declarations of the program (§8.10.5). A program with no `@ffi` declaration and no native dependency gets no such note: the cause is a bug of the compiler.
 
@@ -757,6 +758,54 @@ fn missing() -> Int ! ()
 //   `no_such_header.h` was not found by the C compiler on this host
 ```
 
+**The C compiler that gave no verdict.** `blink build` runs a C compiler: `cc` for a host build, and `zig cc` for a build with `--target`. If that tool gives no verdict on the generated C, the cause is the host, not the source. The tool gives no verdict in two cases:
+
+- It could not start: it is not on `PATH`, or it is not executable.
+- It started, and a signal ended it, for example `SIGKILL` from the out-of-memory killer, or `SIGSEGV`.
+
+Both cases are one code, `CCompilerDidNotRun` (E0860), with exit `1`. A C compiler that runs and exits with a non-zero status, whatever the status, gave a verdict. That stop is `GeneratedCDidNotCompile` (I0017), exit `101`, and never E0860. The compiler decides from "the tool could not start" or "a signal ended it". It never decides from the number of an exit status.
+
+The message names the tool as it ran (`cc`, or `zig cc` for `--target`) and begins with a fixed text, so a script can tell the two cases apart without a second code:
+
+| Case | Message | Help |
+|------|---------|------|
+| It could not start | ``could not start the C compiler `cc`: `` and the reason, `not found on PATH` or `not executable` | `install a C compiler or put it on PATH`; for `--target`, the help names `zig` |
+| A signal ended it | ``the C compiler `cc` ended on signal 9 (SIGKILL)``; the message gives the number and the name of the signal. If the platform has no name for the signal, it gives the number only | `the host stopped the C compiler; check memory and run again` |
+
+E0860 has no span. It never carries the note of I0017 that says the source passes `blink check` and that the cause is a bug of the compiler. The cause is not a bug of the compiler.
+
+**One report, before any unit compiles.** Before `blink build` compiles a unit, it runs the C compiler once to learn which compiler it is. A tool that is missing is reported once, at this step, and no unit compile starts. If this step fails in any way, that is, the tool could not start or a signal ended it, the stop is E0860.
+
+**An interrupt is not a cause.** If the compiler itself receives SIGINT or SIGTERM, it stops, prints no diagnostic and exits `1`. A terminal sends Ctrl-C to the whole process group, so the C compiler gets the signal too; the rule looks only at the signal that the compiler itself received. If a signal ends only the C compiler, the result is E0860 and the message names the signal. This is true for every signal, SIGINT included. The promise of §6.7.1 does not apply to a stop that the compiler itself receives as an interrupt.
+
+`blink check` runs no C compiler. E0860 does not change it, and it never reports E0860.
+
+```
+$ blink build hi.bl                  # no `cc` on PATH
+error[E0860] (CCompilerDidNotRun): could not start the C compiler `cc`: not found on PATH
+  help: install a C compiler or put it on PATH
+$ echo $?
+1
+
+$ blink build --target aarch64-linux-gnu hi.bl      # no `zig` on PATH
+error[E0860] (CCompilerDidNotRun): could not start the C compiler `zig cc`: not found on PATH
+  help: install `zig` or put it on PATH
+$ echo $?
+1
+
+$ blink build big.bl                 # the out-of-memory killer ends `cc`
+error[E0860] (CCompilerDidNotRun): the C compiler `cc` ended on signal 9 (SIGKILL)
+  help: the host stopped the C compiler; check memory and run again
+$ echo $?
+1
+
+$ blink build big.bl                 # the user presses Ctrl-C
+$ echo $?
+1
+```
+
+In the last example the compiler itself got SIGINT, so it prints no diagnostic. If `kill -INT` goes to the process of `cc` only, the compiler does not get the signal, and the result is ``error[E0860] ...: the C compiler `cc` ended on signal 2 (SIGINT)``, exit `1`.
+
 #### 6.7.4 Exit Codes
 
 `blink check` and `blink build` exit with one of three codes:
@@ -764,7 +813,7 @@ fn missing() -> Int ! ()
 | Exit | Meaning |
 |------|---------|
 | `0` | No error. Warnings do not change this, except under `--strict`, where a warning is an error. |
-| `1` | At least one error: an error in the program, or a cause outside the Blink source (§6.7.3). |
+| `1` | At least one error: an error in the program, or a cause outside the Blink source (§6.7.3). Also a stop on SIGINT or SIGTERM that the compiler itself received, which prints no diagnostic (§6.7.3). |
 | `101` | An internal compiler error, an `I` code of the catalog (`ERROR_CATALOG.md`, *Internal Compiler Errors*). This is a bug of the compiler. |
 
 No other code exists for these commands. Exit `101` means a compiler bug only for `blink check` and `blink build`. A program that panics under `blink run` also exits `101`; there, the code is the code of the program (§2.20 *Panic Hook*).
