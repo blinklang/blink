@@ -2455,6 +2455,96 @@ For `Option[T]` operands, the lowering is identical except the `None` arm produc
 
 **Hygiene.** The elaborated return type is internal to the test grammar form. User code cannot name it, dot into it, or observe it from outside. The runner is the sole caller of a test body and consumes the elaborated `Result[(), TestError]` directly.
 
+**`return` in a test body.** For `return`, a test body has the return type `()`. This holds with `?` and without `?`: a `?` elsewhere in the body does not change what a `return` means. `return e` is checked against `()` as §3.3 says for a function with no `-> R`. A test body has no signature, so the error message says "test body" and `()`. It never shows the elaborated type that *Hygiene* above hides.
+
+| Form | Result |
+|------|--------|
+| `return` | Compiles. The test passes at that line. |
+| `return ()` | Compiles. The test passes at that line. |
+| `return 5` | `TypeError` (E0300): `Int` does not match `()`, the return type of a test body. |
+| `return Ok(())`, `return Err("x")` | `TypeError` (E0300): `Result` does not match `()`. |
+| `return panic("x")` | Compiles, because the operand has type `Never`. The test fails by panic. |
+
+The table is the same for a body with `?` and a body without `?`. A test passes or fails by its body ending, by a panic, or by a propagated `Err`. A `return` that the body reaches is a pass. The runner reports it as a plain pass, with no separate state for an early exit.
+
+```blink
+fn f() -> Result[Int, Str] { Ok(1) }
+
+test "early exit" {
+    let n = 1
+    if n == 1 {
+        return                       // OK: the test passes at this line
+    }
+    assert_eq(n, 2)
+}
+
+test "early exit after ?" {
+    let x = f()?
+    if x == 1 {
+        return                       // OK: the test passes at this line
+    }
+    assert_eq(x, 2)
+}
+
+test "unit value" {
+    let n = 1
+    if n == 1 { return () }          // OK: the test passes at this line
+}
+
+test "unit value after ?" {
+    let x = f()?
+    if x == 1 { return () }          // OK: the test passes at this line
+}
+
+test "value" {
+    return 5                         // error[TypeError] (E0300): Int does not match (), the return type of a test body
+}
+
+test "value after ?" {
+    let x = f()?
+    return x                         // error[TypeError] (E0300): Int does not match (), the return type of a test body
+}
+
+test "result" {
+    return Ok(())                    // error[TypeError] (E0300): Result does not match (), the return type of a test body
+}
+
+test "result after ?" {
+    let x = f()?
+    return Err("x")                  // error[TypeError] (E0300): Result does not match (), the return type of a test body
+}
+
+test "fail by panic" {
+    return panic("x")                // OK: the operand has type Never; the test fails by panic
+}
+
+test "fail by panic after ?" {
+    let x = f()?
+    if x == 1 { return panic("x") }  // OK: the operand has type Never; the test fails by panic
+}
+```
+
+To fail a test, use `assert_eq`, `assert`, `panic`, or `?`. A `return` cannot fail a test.
+
+The help of this E0300 does not say to add `-> T`, because a test has no signature. It says to drop the value, and to use `assert` or `panic` to make the test fail. `blink check` reports the error, as it does for any type error.
+
+A `return` in a closure written in a test body is checked against the type of that closure, as in §3.3, with `?` in the test body or without:
+
+```blink
+test "closure return" {
+    let x = f()?
+    let g = fn(n: Int) { return n + 1 }   // OK: the closure returns Int
+    assert_eq(g(x), 2)
+    let h = fn(n: Int) -> Int { return n + 1 }
+    assert_eq(h(x), 2)
+}
+
+test "closure return without ?" {
+    let g = fn(n: Int) { return n + 1 }   // OK: the closure returns Int
+    assert_eq(g(1), 2)
+}
+```
+
 **Composition with HOFs.** Ordinary higher-order functions are *not* a test grammar form. A closure passed to `for_each` or any user-callable HOF follows the normal `?` rules from §3c.2 — the closure's own return type governs whether `?` is valid inside it, **not** the enclosing test body. A closure that uses `?` must itself return `Result[T, E]` or `Option[T]`:
 
 ```blink

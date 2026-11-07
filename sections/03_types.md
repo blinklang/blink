@@ -2273,6 +2273,13 @@ drop the value. Dropping the value keeps a call as its own statement: `return sa
 becomes `save(x)` and then `return`. When `()` comes from an omitted `-> R` or from an
 expected parameter type, the error also points to that place.
 
+A test body has the return type `()` for `return`, with `?` and without `?`
+(§2.20 *Error Propagation: `?` in Test Bodies*). So `return`, `return ()` and
+`return e` with `e` of type `Never` are legal in a test body, and `return 5` is E0300.
+A test body has no signature, so the help of this E0300 does not say to add `-> T`. It
+says to drop the value, and to use `assert` or `panic` to make the test fail. The
+message says "test body" and `()`.
+
 **Closures.** A closure with an expected function type takes its return type from that
 type. A closure with no expected type has the one type on which every `return e` and a
 tail that can complete agree, and `()` when there is none.
