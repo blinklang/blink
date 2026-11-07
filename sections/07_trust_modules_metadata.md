@@ -3858,9 +3858,103 @@ pub import auth.rate_limit.{RateLimiter}
 - Circular re-exports are detected and rejected at compile time
 - Any module can use `pub import`
 
-**Consumer-side access:** Re-exported items are indistinguishable from locally-defined `pub` items. If module A does `pub import B.{foo}`, then consumers can access `foo` via both selective import (`import A.{foo}`) and qualified access (`A.foo`). The same access rules apply as for any other pub item in A's namespace.
+**Consumer-side access:** Re-exported items are indistinguishable from locally-defined `pub` items. If module A does `pub import B.{foo}`, then consumers can access `foo` via both selective import (`import A.{foo}`) and qualified access (`A.foo`). The same access rules apply as for any other pub item in A's namespace. The two spellings name the same item:
 
-**Name collisions:** a module that both defines and re-exports one name gets E1012, the same error as for a plain import (*Imported and Declared Names* below).
+```blink
+// b1.bl
+pub let G: Int = 1
+
+// facade.bl
+pub import b1
+
+// main.bl
+import facade.{G}
+
+fn main() {
+    io.println("{facade.G} {G}")   // 1 1: one item under both spellings
+}
+```
+
+**Export set:** the export set of a module holds its own `pub` declarations and the `pub` items of each `pub import` (transitive). It maps each name to one item, and the kind of the item (`fn`, `let`, `type`, and so on) does not matter. Only `pub` items enter it: a private `G` in `b2` does not collide with the `G` of `b1`, and a plain `import` exports nothing. The compiler checks the export set when it checks the module that re-exports, whether or not any file reads the name. This holds for a whole-module `pub import` and for a selective one.
+
+Two `pub import` entries that give one name to different items are `AmbiguousImport` (E1005). The error is on the second entry, and it names the name and both source modules:
+
+```blink
+// b1.bl: pub let G: Int = 1
+// b2.bl: pub let G: Int = 2
+
+// facade.bl
+pub import b1
+pub import b2        // error[E1005]: `G` is exported by `b1` and `b2`
+```
+
+```blink
+// c1.bl: pub fn G() -> Int { 1 }
+// c2.bl: pub let G: Int = 2
+
+// facade.bl
+pub import c1
+pub import c2        // error[E1005]: the same; the kind of the item does not matter
+```
+
+```blink
+// facade.bl
+pub import b1.{G}
+pub import b2.{G}    // error[E1005]: the same rule for selective re-exports
+```
+
+```
+error[E1005]: `G` is exported by `b1` and `b2` in module `facade`
+ --> src/facade.bl:2:1
+  |
+1 | pub import b1
+  | ------------- `G` is first exported by `b1` here
+2 | pub import b2
+  | ^^^^^^^^^^^^^ `G` is also exported by `b2` here
+  |
+  = help: re-export only the names you need from `b2`: pub import b2.{other}
+```
+
+The fix is a selective `pub import` that does not list the name. This is legal, because `b1` has no `H`:
+
+```blink
+// facade.bl
+pub import b1
+pub import b2.{H}    // OK
+```
+
+A consumer that wants both values does not need the facade. A whole-module `import` binds only its qualifier (§10.1 *Qualified Access*), so nothing collides:
+
+```blink
+// main.bl
+import b1
+import b2
+
+fn main() {
+    io.println("{b1.G} {b2.G}")   // 1 2
+}
+```
+
+Two entries that reach one item through different paths give one item for the name, so they are legal:
+
+```blink
+// mid.bl
+pub import b1
+
+// facade.bl
+pub import b1
+pub import mid       // OK: both reach the one item `b1.G`
+```
+
+The cost: a new `pub` name in a module that a facade re-exports whole can break that facade, even when no file reads the name. A selective `pub import` prevents it.
+
+**Name collisions:** a module that both declares and re-exports one name gets E1012, the same error as for a plain import (*Imported and Declared Names* below). The rule covers a whole-module `pub import` as well as a selective one: a `pub` declaration of a name in the export set of a `pub import` is E1012.
+
+```blink
+// facade.bl, b1 exports G
+pub import b1
+pub let G: Int = 3   // error[E1012]: `G` is also re-exported by `pub import b1`
+```
 
 **Unused import warnings:** `pub import` never triggers W0602 (unused import). Re-exports declare public API surface, not local usage intent. The re-exporting module does not need to use the re-exported items itself.
 
@@ -3879,7 +3973,17 @@ import codegen_common.{emit_line, CT_INT, CT_STRING, c_fn_name}
 
 #### Imported and Declared Names
 
-An import binds names in module scope: a selective import binds each listed name, and every import binds its qualifier (§10.1 *Qualified Access*). Module scope is one flat namespace (§2.12.1, §10.6 *Shadowing Rules*). So a module may not both import a name and declare it. A module-level declaration of a name that an import binds is a compile error, `DuplicateSymbol` (E1012). The rule covers every declaration kind in both namespaces: `type`, type alias, `trait`, `effect`, `fn`, `const`, and module-level `let` and `let mut`. A qualifier collides in both namespaces, because `X.y` can be qualified access, access through a type (§2.12.3), or a method call on a value. The rule applies to `import` and `pub import` alike, and to every visibility of the declaration.
+An import binds names in module scope: a selective import binds each listed name, and every import binds its qualifier (§10.1 *Qualified Access*). Module scope is one flat namespace (§2.12.1, §10.6 *Shadowing Rules*). So a module may not both import a name and declare it. A module-level declaration of a name that an import binds is a compile error, `DuplicateSymbol` (E1012). The rule covers every declaration kind in both namespaces: `type`, type alias, `trait`, `effect`, `fn`, `const`, and module-level `let` and `let mut`. A qualifier collides in both namespaces, because `X.y` can be qualified access, access through a type (§2.12.3), or a method call on a value. The rule applies to `import` and `pub import` alike, and to every visibility of the declaration. A whole-module `pub import` also takes part, for a `pub` declaration of a name that it re-exports (*Re-exports*). The primary span is the declaration, and a second label is on the `pub import` line that re-exports the name:
+
+```
+error[E1012]: `G` is both re-exported and declared in module `facade`
+ --> src/facade.bl:2:12
+  |
+1 | pub import b1
+  | ------------- `G` is re-exported from `b1` here
+2 | pub let G: Int = 3
+  |         ^ also declared here
+```
 
 ```blink
 import alpha.{Point}
@@ -3951,7 +4055,7 @@ When several import entries collide with one declaration, each entry gets its ow
 
 #### Imported Names
 
-Each file has its own binding table. A selective import binds each listed name and its qualifier, and a whole-module import binds only its qualifier. The qualifier is the leaf name of the module path, or the name after the `as` that follows the path (*Import Aliases*). Bare names and qualifiers share one table, because `X.y` can be qualified access or access through a type. Two imports in one file that bind one name to different items are a compile error, `AmbiguousImport` (E1005). The check uses the name that each import binds, which is the name after `as` when there is one. It covers both namespaces and applies to `import` and `pub import` alike. Every check on an import entry runs when the compiler reads the import, whether or not the file uses the name. This holds for E1003 (import form), E1005 and E1023.
+Each file has its own binding table. A selective import binds each listed name and its qualifier, and a whole-module import binds only its qualifier. The qualifier is the leaf name of the module path, or the name after the `as` that follows the path (*Import Aliases*). Bare names and qualifiers share one table, because `X.y` can be qualified access or access through a type. Two imports in one file that bind one name to different items are a compile error, `AmbiguousImport` (E1005). The check uses the name that each import binds, which is the name after `as` when there is one. It covers both namespaces and applies to `import` and `pub import` alike. Every check on an import entry runs when the compiler reads the import, whether or not the file uses the name. This holds for E1003 (import form), E1005 and E1023. Two `pub import` entries can also give one name to different items of the export set without binding it in this file's table. That is E1005 too, at the second entry (*Re-exports*, *Export set*).
 
 ```blink
 import auth.{Error}
@@ -4082,14 +4186,14 @@ When the entry names a type whose methods the file calls, the note says that the
 | E1002 | Circular package dependency | Cross-package import cycle |
 | E1003 | Private item access | Referencing or importing a function, type, trait, variant or other item that is not `pub` in its declaring module, or using the body of an opaque type outside its declaring module (§2.12.2). The import form is checked when the import is read (§10.5) |
 | E1004 | Version conflict | Diamond dependency with incompatible versions |
-| E1005 | Ambiguous import | Two imports in one file bind one name, bare name or qualifier, to different items. Checked when the import is read (§10.5) |
+| E1005 | Ambiguous import | Two imports in one file bind one name, bare name or qualifier, to different items. Also two `pub import` entries, whole-module or selective, that give one name to different items of the export set, whatever the kind of the item; the error is on the second entry (§10.5 *Re-exports*). Checked when the import is read (§10.5) |
 | E1006 | Import not selected | A bare name comes from an imported module but is not in the selective import list |
 | E1007 | Module-qualified type member | A type member or variant is reached through a module qualifier (`mod.Type.Member`) instead of an imported type |
 | E1008 | Invalid module annotation | A file has a `@module(...)` annotation. `@module` is removed syntax; the path of a file names its module (§10.1) |
 | E1009 | Package entry not found | Bare `import <pkg>` resolved to a package whose `src/<name>.bl` does not exist |
 | E1010 | Orphan file | Bare external import from a file with no enclosing `blink.toml` |
 | E1011 | Invalid package name | `[package].name` violates the `[a-z][a-z0-9_]*` grammar, is empty, or is not a string |
-| E1012 | Duplicate symbol | A module-level declaration takes a name that an import (`import` or `pub import`) binds: a listed name or a qualifier |
+| E1012 | Duplicate symbol | A module-level declaration takes a name that an import (`import` or `pub import`) binds: a listed name or a qualifier. Also a `pub` declaration of a name that a `pub import` re-exports, whole-module or selective (§10.5 *Re-exports*) |
 | E1013 | `pub let mut` forbidden | A module-level `let mut` is marked `pub` (§2.12.1). Not yet enforced |
 | E1015 | Inline module not supported | A `mod name { ... }` block appears in source (§10.1.1) |
 | E1016 | Duplicate module binding | Two module-level declarations bind one name in one namespace (§2.12.1), two members of one `T.` namespace in a package share a name (§2.12.3), or a module-level value or type, or an import entry, has the name `Some`, `None`, `Ok` or `Err` (§2.12.1) |
