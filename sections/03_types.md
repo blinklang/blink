@@ -1469,6 +1469,8 @@ A method marked *grows* in the table above can change `len` and move the storage
 
 Bytes implements: `Sized`, `Eq`, `Clone`, `Debug`, `IntoIterator[U8]`.
 
+The `Debug` text of a `Bytes` is the `Bytes` row of *Container Debug Rendering* (§3.6.1): `Bytes.from_str("hi").debug()` is `Bytes(6869)`.
+
 **Why a separate type from `List[U8]`.** `Bytes` is the type for I/O, FFI, and crypto. `List[U8]` makes no contiguous-memory guarantee, so it cannot give FFI a `Ptr[U8]` view. (Panel vote: 5-0.)
 
 **Why Tier 1, not prelude.** `Bytes` is needed by core effects (`FS.Read`, `Net.Connect`, `Crypto.Hash`) but not every program does binary I/O. Tier 1 means it ships with the compiler and is version-locked. The API surface should remain minimal in Tier 1; richer operations (base64, compression) belong in higher tiers. (Panel vote: 5-0.)
@@ -7713,6 +7715,10 @@ prints exactly those three (*Container Debug Rendering*). `(0..3) == (0..=2)` is
 print different text, `0..3` and `0..=2`. `(5..3)` and `(0..0)` are empty, are not `==`, and print
 `5..3` and `0..0`.
 
+`Bytes` obeys the law: `Bytes.from_str("hi") == Bytes.from_list([104, 105])` is `true`, and both
+print `Bytes(6869)`. A `Bytes` that differs in one byte prints different text (*Container Debug
+Rendering*).
+
 The `Set` and `Map` debug order (*Container Debug Rendering*) depends on this law: when it holds for
 the elements, keys and values, equal containers render the same text. Every built-in type obeys the
 law. `Float` renders `-0.0` as `0.0` and every NaN as `NaN` (§3.6 *Float Text Form*), so two
@@ -8172,7 +8178,8 @@ Per-trait sum type rules:
 ##### Container Debug Rendering
 
 A field of a `@derive(Debug)` type may be a container — `List[T]`, `Option[T]`, `Map[K,V]`,
-`Set[T]`, `Result[T,E]`, `Range[T]` or a tuple. The
+`Set[T]`, `Result[T,E]`, `Range[T]` or a tuple. `Bytes` is not a container, but it has a row in the
+table below, and a field of type `Bytes` renders by that row. The
 uniform per-field model (each field renders via `{field.debug()}`) holds: the container's own
 `debug()` renders its contents, with every element, key, and value rendered in **debug-form** (so a
 `Str` element is quoted and escaped, matching `Str.debug()`). The compiler provides these `debug()`
@@ -8191,6 +8198,7 @@ between a map key and its value; there is no inner padding.
 | `Result[T,E]` | `"Ok(" + value.debug() + ")"` or `"Err(" + error.debug() + ")"` | — |
 | tuple | `"(" + elems.join(", ") + ")"`, each elem via its own `.debug()` | — |
 | `Range[T]` | `start.debug() + ".." + end.debug()`, or `start.debug() + "..=" + end.debug()` for an inclusive range | — |
+| `Bytes` | `"Bytes(" + b.to_hex() + ")"` | `"Bytes()"` |
 
 **Set and Map order.** `Set[T].debug()` sorts the rendered element strings by their UTF-8 bytes
 before it joins them. `Map[K,V].debug()` sorts its entries by the UTF-8 bytes of `key.debug()`; when
@@ -8218,6 +8226,45 @@ renders `["a", "b"]` (with the inner quotes), and a `Map[Str, Int]` with the ent
 renders `{"a": 1}`. `Char` elements likewise render single-quoted (`List[Char]` of `['a', 'b']`
 renders `['a', 'b']`), per the scalar debug-forms rule above. Numeric scalar elements render bare:
 `List[Int]` of `[1, 2, 3]` renders `[1, 2, 3]`.
+
+**Bytes.** The debug text of a `Bytes` value `b` is `"Bytes("`, then `b.to_hex()` (lower case, two
+digits per byte, no separator; §3.2), then `")"`. The text has no quote and no escape, so every byte
+value has a text, also NUL and a byte that is not part of valid UTF-8.
+
+- `debug()` never cuts its output. A long value gives a long text. A sink that needs a short text
+  cuts it: a trace cuts a value string at 200 characters (§8.15.9).
+- The text is the same on every path: `b.debug()`, a `@derive(Debug)` field, the payload of `Some`,
+  `Ok` and `Err`, an element of a `List`, a value of a `Map`, an element of a tuple, the value text
+  in the failure message of `unwrap`, `unwrap_err` and the assertions (§2.20), and a trace value
+  string.
+- The text is not source. `Bytes(6869)` is not a call and does not rebuild the value: no
+  `Bytes(...)` function exists (`Bytes()` is E0504, §3.2), and `Bytes` has no literal. The rule that
+  the debug text of a `Str` or a `Char` is a valid literal (*Scalar debug-forms*, §3.6.1) does not
+  extend to `Bytes`.
+- The text agrees with `Eq` (*Debug agrees with Eq*, §3.6.1). `to_hex` writes two digits for each
+  byte, so two `Bytes` values have the same text exactly when they have the same bytes.
+
+```blink
+@derive(Debug)
+type W { b: Bytes }
+
+fn main() ! IO {
+    io.println(Bytes.new().debug())                             // Bytes()
+    io.println(Bytes.from_str("hi").debug())                    // Bytes(6869)
+    io.println(Bytes.from_list([0, 255, 10]).debug())           // Bytes(00ff0a)
+    io.println(W { b: Bytes.from_list([0, 255, 10]) }.debug())  // W { b: Bytes(00ff0a) }
+    io.println([Bytes.from_str("a")].debug())                   // [Bytes(61)]
+    io.println(Some(Bytes.from_str("a")).debug())               // Some(Bytes(61))
+
+    let big = Bytes.zeroed(1000)
+    io.println("{big.debug().len()}")                           // 2007: "Bytes(", 2000 digits, ")"
+    let rule = "Bytes({big.to_hex()})"
+    io.println("{big.debug() == rule}")                         // true: nothing is cut
+}
+```
+
+A trace of a function that takes `big` as an argument writes the first 200 characters of the text
+and sets `"truncated":true` on the event (§8.15.9). The text that `big.debug()` returns is whole.
 
 **Conditional Debug — non-Debug element, key, or value.** A container field is Debug-renderable
 only when its type argument(s) are `Debug`. If an element type, a map key type, or a map value type

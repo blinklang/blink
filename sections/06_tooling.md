@@ -2863,7 +2863,7 @@ The program writes a value as a string in `args`, `return`, `value` and the `arg
 2. else the `Debug` text, if the type has `Debug`;
 3. else `<TypeName>`, with the name of the type.
 
-A value is never left out. A type that has a derived `Debug` takes the same chain, also when the type is opaque. `Bytes` takes the same chain with its own `Debug`. A call to `Display` or `Debug` that the tracer makes writes no event.
+A value is never left out. A type that has a derived `Debug` takes the same chain, also when the type is opaque. `Bytes` takes the same chain. It has no `Display`, so its string is its `Debug` text, the `Bytes` row of *Container Debug Rendering* (§3.6.1), and the cut below applies to it. A call to `Display` or `Debug` that the tracer makes writes no event.
 
 The program cuts a string that is longer than 200 characters and appends `"truncated":true` to the event. The cut is on the text, so a hand-written `Display` or `Debug` impl runs to its end before the cut. The cost of such an impl is the cost of the impl.
 
