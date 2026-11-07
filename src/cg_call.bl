@@ -1029,7 +1029,7 @@ fn cc_scalar_sb_write_name(kind: TyKind) -> Str {
 // `fmt(sb)` on a builtin scalar writes straight into the caller's StringBuilder, so it
 // cannot reuse `cc_build_call`: that helper always lowers the receiver into the call's
 // FIRST argument, but every `sb_write_*` declares the StringBuilder first and the scalar
-// second. Built by hand instead, the same way `.write_char` is (`cc_sb_write_char` above).
+// second. Built by hand instead, the same way `.write_char` is (`cc_sb_write_by_hand` below).
 fn cc_scalar_fmt(node: Int, obj: Int, kind: TyKind) -> Int ! Diag.Report {
     let given = sublist_length(node_args(node))
     if given != 1 { return cc_intrinsic_arity_wrong(node, kind, "fmt", 1, given) }
@@ -3940,7 +3940,7 @@ fn lower_method_call(node: Int) -> Int ! Diag.Report {
     if cc_is_map_slot_method(kind, mname) { return cc_map_slot_method(node, obj, kind) }
     if cc_is_scalar_method(kind, mname) { return cc_scalar_method(node, obj, recv_tid, kind, mname) }
     if cc_is_char_text(kind, mname) { return cc_char_text(node, obj, kind, mname) }
-    if cc_is_sb_write_char(kind, mname) { return cc_sb_write_char(node, obj) }
+    if cc_is_sb_write_by_hand(kind, mname) { return cc_sb_write_by_hand(node, obj, mname) }
     if cc_is_str_as_cstr(kind, mname) { return cc_str_as_cstr(node, obj, kind, mname) }
     if cc_is_bytes_with_ptr(kind, mname) { return cc_bytes_with_ptr(node, obj, kind, mname) }
     if cc_is_carrier_test(kind, mname) { return cc_carrier_test(node, obj, kind, mname) }
@@ -6197,7 +6197,7 @@ fn cc_bytes_set_method(method: Str) -> Bool {
 
 // `write_char` is absent from this table: its binding takes a Str where the method takes
 // a Char, so the call needs a conversion between the two and is not one plain redirect --
-// `cc_sb_write_char` builds it by hand instead. `len` and `is_empty` are answered by a
+// `cc_sb_write_by_hand` builds it instead. `len` and `is_empty` are answered by a
 // real impl, as they are for Str.
 fn cc_sb_intrinsic(node: Int, method: Str) -> Str ! Diag.Report {
     if method == "write" { return cc_sb_write_callee(node) }
@@ -6207,23 +6207,29 @@ fn cc_sb_intrinsic(node: Int, method: Str) -> Str ! Diag.Report {
     ""
 }
 
-fn cc_is_sb_write_char(kind: TyKind, method: Str) -> Bool {
+// `write` reaches this only for an argument no scalar binding takes: `cc_sb_intrinsic`
+// answers the scalar writes first.
+fn cc_is_sb_write_by_hand(kind: TyKind, method: Str) -> Bool {
     if kind != TyKind.StringBuilder { return false }
     let mut table: Map[Str, Bool] = Map()
     table.insert("write_char", true)
+    table.insert("write", true)
     table.get(method) ?? false
 }
 
-// The one Char-taking write: converted to text through the same runtime helper Char
-// interpolation reaches, then handed to `sb_write` as the Str it now is. Built by hand,
-// not through `lower_intrinsic_method`, because that path lowers the written argument
-// exactly as the call spells it and this call's argument is not the type the callee wants.
-fn cc_sb_write_char(node: Int, obj: Int) -> Int ! Diag.Report {
+// The two writes built by hand, not through `lower_intrinsic_method`, because that path
+// lowers the written argument exactly as the call spells it and here it is not the type the
+// callee wants. `write_char` converts its Char through the same runtime helper Char
+// interpolation reaches. `write` of a Display value that no scalar binding takes (a sized
+// int, a tuple, or a struct or enum with a Display impl) renders it with the hole renderer
+// an interpolation uses, so `sb.write(x)` and `sb.write("{x}")` write the same text. Each
+// then hands `sb_write` the Str it now is.
+fn cc_sb_write_by_hand(node: Int, obj: Int, method: Str) -> Int ! Diag.Report {
     let given = sublist_length(node_args(node))
-    if given != 1 { return cc_intrinsic_arity_wrong(node, TyKind.StringBuilder, "write_char", 1, given) }
+    if given != 1 { return cc_intrinsic_arity_wrong(node, TyKind.StringBuilder, method, 1, given) }
     let decl = cc_stdlib_fn_named(node, "std_sb", "sb_write")
     if decl == DECL_REFUSED { return -1 }
-    if decl < 0 { return cc_intrinsic_undeclared(node, TyKind.StringBuilder, "write_char", "std_sb", "sb_write") }
+    if decl < 0 { return cc_intrinsic_undeclared(node, TyKind.StringBuilder, method, "std_sb", "sb_write") }
     let symbol = cc_call_symbol(node, decl, c_fn_decl_name(decl))
     if symbol == "" { return -1 }
     let tid = tid_of_node(node)
@@ -6236,21 +6242,35 @@ fn cc_sb_write_char(node: Int, obj: Int) -> Int ! Diag.Report {
         ev = cg_eff_ev_argument(node)
         if ev < 0 { return -1 }
     }
-    let pair = cg_expr_lower_pair(obj, sublist_get(node_args(node), 0))
-    let receiver = pair.get(0).unwrap()
-    let ch = pair.get(1).unwrap()
-    if receiver < 0 || ch < 0 { return -1 }
-    let text = cc_char_text_of_value(node, rec.c_spelling, rec.slot_form, ch)
+    let arg = sublist_get(node_args(node), 0)
+    let mut receiver = -1
+    let mut text = -1
+    // A Char argument is `write_char`'s, or a `write` of a Char: both give the same text.
+    if cc_kind(tid_of_node(arg)) == TyKind.Char {
+        let pair = cg_expr_lower_pair(obj, arg)
+        receiver = pair.get(0).unwrap()
+        let ch = pair.get(1).unwrap()
+        if receiver < 0 || ch < 0 { return -1 }
+        text = cc_char_text_of_value(node, rec.c_spelling, rec.slot_form, ch)
+    } else {
+        let recv_lowered = lower_expr(obj)
+        if recv_lowered < 0 { return -1 }
+        let recv_end = cg_expr_pending_count()
+        text = lower_value_as_text(arg)
+        if text < 0 { return -1 }
+        receiver = cc_receiver_held(recv_lowered, recv_end)
+        if receiver < 0 { return -1 }
+    }
     let mut args: List[Int] = [receiver, text]
     if takes_ev { args.push(ev) }
     ir_call_direct(tid, node, rec.c_spelling, symbol, rec.slot_form, args)
 }
 
-// Which of the four write bindings a `write` means. Typecheck leaves the argument of this
-// one method unconstrained and records that codegen picks the binding from what the
-// argument IS, so this is the only row keyed on an argument rather than on the method
-// name. Each binding takes one type and no other, so naming the wrong one hands the C
-// compiler a value of a type its parameter cannot hold.
+// Which of the four write bindings a `write` of a scalar means. `write` takes any Display
+// value, so this is the only row keyed on an argument rather than on the method name. Each
+// binding takes one type and no other, so naming the wrong one hands the C compiler a value
+// of a type its parameter cannot hold. Any other type answers "", and `cc_sb_write_by_hand`
+// builds the call.
 fn cc_sb_write_callee(node: Int) -> Str ! Diag.Report {
     let args = node_args(node)
     if sublist_length(args) != 1 { return "std_sb:sb_write" }
