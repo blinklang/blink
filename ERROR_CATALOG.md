@@ -306,7 +306,7 @@ ICE codes use the `I` prefix. `@allow` and `[lints]` take warning names only, so
 | EmptyBraceExpr | E1107 | Empty `{}` used in expression position (use `Map.new()`) | Parser | §2 |
 | FileNotFound | E1108 | `#embed(...)` referenced a file that does not exist. A file that is there but cannot be read is E1025 `FileReadFailed`; the split is by errno (see E1025) | Parser | §2.20 |
 | MutFieldNotSupported | E1109 | `mut` keyword on struct field declaration | Parser | §2 |
-| UnexpectedAnnotation | E1110 | Annotation used in unsupported position | Parser | §2 |
+| UnexpectedAnnotation | E1110 | Annotation used in unsupported position. Includes `@derive`, `@where`, `@invariant`, `@ffi.struct` and `@ffi.opaque` on a type alias; the help names the declaration that takes the derive, when the alias names a struct or enum of this package (§11.1 *Annotations on a Type Alias*) | Parser | §2, §11.1 |
 | UnknownIntrinsic | E1111 | Unknown compile-time intrinsic (`#name`) | Parser | §2.20 |
 | UnexpectedCharacter | E1113 | The lexer found a character that starts no token | Lexer | §2 |
 | EmptyUnicodeEscape | E1114 | `\u{}` with no hex digits | Lexer | §2.4 |

@@ -4683,12 +4683,14 @@ This table is the one normative list of annotations. Every other list of annotat
 
 The rows are in canonical order (see *Canonical Ordering* below).
 
+In the Target column, `type` means a declaration that creates a type: a struct, an enum or a newtype. A type alias (`type X = <type>`) creates no type. It is another name for a type that exists, so it is a target of its own, `type alias`. A row lists `type alias` only where its annotation describes the name or the declaration site. Every other row that lists `type` does not apply to a type alias (rule 2).
+
 | Annotation | Target | Repeats | Meaning | Status |
 |------------|--------|---------|---------|--------|
 | `@capabilities(list)` | module | no | Hard ceiling on the effects this module may perform. See §10.3. | checked |
 | `@derive(Trait, ...)` | type | no | Generates trait implementations. Seven compiler-known traits only: `Eq`, `Ord`, `Hash`, `Clone`, `Debug`, `Serialize`, `Deserialize`. Each derived implementation obeys the laws in §3.6.1 *Derive Laws*. Any other argument, `Display` included, is `NotDerivable` (E1402). | checked |
 | `@handle_all` | effect | no | Every handler of this effect should implement each primitive operation. Covers the sub-effects; on a nested sub-effect, covers only that sub-effect. A handler that omits one gets the warning `PartialHandler` (W0545). The stdlib marks `Rand`, `Time` and `IO.Read`. See §4.7.1. | checked |
-| `@src(kind: "ID")` | fn, type, module | yes: the links add up | Provenance link to a requirement, design doc, issue or compliance mandate. See §11.3. | tool-checked (`blink trace`) |
+| `@src(kind: "ID")` | fn, type, type alias, module | yes: the links add up | Provenance link to a requirement, design doc, issue or compliance mandate. See §11.3. | tool-checked (`blink trace`) |
 | `@requires(expr)` | fn, trait method | yes: all must hold | Precondition. Must hold when the function is called. See §3b. | checked |
 | `@ensures(expr)` | fn, trait method | yes: all must hold | Postcondition. Must hold when the function returns. `result` refers to the return value. See §3b. | checked |
 | `@where(expr)` | fn, type | no | Constraint on generics, or a refinement. | checked |
@@ -4703,8 +4705,8 @@ The rows are in canonical order (see *Canonical Ordering* below).
 | `@verify(fallback: "runtime" \| "error" \| "trust")` | fn, trait method | no | What happens when the solver cannot prove or disprove a contract: a runtime check (the default), compile error V0003, or no check. A trait method takes `"runtime"` or `"error"` only (E0913). See §3b.4. | checked |
 | `@tags("tag", ...)` | test block | no | String tags for test filtering. See §2.20. | checked |
 | `@skip` or `@skip("reason")` | test block | no | Static, unconditional skip: the compiler type-checks the body and the runner does not run it. For a skip that depends on run-time state, call `skip()` in the body instead. See §2.20 *Skipping Tests*. | checked |
-| `@allow(WarningName, ...)` | fn, type, test block | yes: the names add up | Suppresses the named warnings inside the annotated function, or inside the type declaration and its body. On a test block it suppresses the named warnings in the whole body, including closures and `assert_panics` blocks written in it. It does not reach an `impl` block declared apart from the type. Overrides `blink.toml` `[lints]` for that scope. An argument that is not a live diagnostic name is `UnknownDiagnosticName` (E0842); a live name that is not a warning name is `NotAWarningName` (E0847). See §4.16.8. | checked |
-| `@deprecated(since, removal, replacement, fix)` | fn, type, trait method | no | Deprecates **use**: a call, or a reference to the type. Each key is written `key: value`, and the keys may come in any order. Keys: `since` (edition, required), `removal` (edition, optional), `replacement` (qualified name, optional), `fix` (`"replace"`/`"inline"`/`"manual"`, optional). W2000 when the current edition is before `removal`, E2001 from `removal` on. A `fix` of `"replace"` or `"inline"` gives a machine-applicable fix. On a trait method it deprecates calls, not overrides; for overrides see `@deprecate_override`. See §8.16.2. | checked |
+| `@allow(WarningName, ...)` | fn, type, type alias, test block | yes: the names add up | Suppresses the named warnings inside the annotated function, or inside the type declaration and its body. On a test block it suppresses the named warnings in the whole body, including closures and `assert_panics` blocks written in it. It does not reach an `impl` block declared apart from the type. Overrides `blink.toml` `[lints]` for that scope. An argument that is not a live diagnostic name is `UnknownDiagnosticName` (E0842); a live name that is not a warning name is `NotAWarningName` (E0847). See §4.16.8. | checked |
+| `@deprecated(since, removal, replacement, fix)` | fn, type, type alias, trait method | no | Deprecates **use**: a call, or a reference to the type. Each key is written `key: value`, and the keys may come in any order. Keys: `since` (edition, required), `removal` (edition, optional), `replacement` (qualified name, optional), `fix` (`"replace"`/`"inline"`/`"manual"`, optional). W2000 when the current edition is before `removal`, E2001 from `removal` on. A `fix` of `"replace"` or `"inline"` gives a machine-applicable fix. On a trait method it deprecates calls, not overrides; for overrides see `@deprecate_override`. See §8.16.2. | checked |
 | `@deprecate_override` | trait method with a default body | no | Deprecates **overriding** the default: an impl that overrides it gets `OverrideOfDeprecatedDefault` (W0731) at the override. Calls are not affected. It is the first step of the move to `final` (§3.6 *The `final` Modifier*). A method may carry both `@deprecated` and `@deprecate_override`. | checked |
 
 #### Status
@@ -4733,7 +4735,7 @@ error[AnnotationNotSupported]: `@perf` is not supported by this toolchain
    - Common names from other languages, such as `@inline`, `@override` and `@test`, name the Blink form, if there is one.
 
    `@effects` keeps its own diagnostic, `EffectsAnnotationRemoved` (§9.1). `@module` keeps its own diagnostic too, `InvalidModuleAnnotation` (E1008, §10.1): it is not `UnknownAnnotation`, because the name was once in the table.
-2. **Targets.** An annotation on a target that its row does not list is `UnexpectedAnnotation` (E1110).
+2. **Targets.** An annotation on a target that its row does not list is `UnexpectedAnnotation` (E1110). This includes `@derive`, `@where`, `@invariant`, `@ffi.struct` and `@ffi.opaque` on a type alias. *Annotations on a Type Alias* below shows the case.
 3. **Repeats.** A name may occur only once on one declaration, unless its row says it repeats. A second occurrence is `DuplicateAnnotation`. The Repeats column says how repeated occurrences combine.
 4. **Arguments.** The Annotation column of a row writes the one form that row accepts. Arguments that do not match that form are `AnnotationArguments` (E1134). It is an error. It is never a warning, and the compiler never accepts it. These are the cases:
    - Arguments on a row that takes none: `@handle_all(B)`, `@pure(x)`.
@@ -4772,6 +4774,63 @@ error[AnnotationArguments]: `@handle_all` takes no arguments
 ```
 
    A second `@handle_all` on the same effect is not this error. It is `DuplicateAnnotation` (rule 3).
+
+#### Annotations on a Type Alias
+
+An alias has the identity of the type it names (§3.4 *Newtypes*). It has no impls, fields, invariant or layout of its own. For this reason `@derive`, `@where`, `@invariant`, `@ffi.struct` and `@ffi.opaque` need a declaration that creates a type, and each is E1110 on an alias. `@src`, `@deprecated` and `@allow` describe the name or the declaration site, and they stay legal.
+
+The rule is the same for every alias target: a struct or enum of this package, a tuple, a built-in type, a container, a type from another package, and a generic alias.
+
+```blink
+@derive(Hash, Eq)
+type K = (Int, Str)
+// error[E1110]: `@derive` does not apply to a type alias
+//   `K` is another name for `(Int, Str)`
+//   help: `(Int, Str)` already has `Hash` and `Eq` (§3.8)
+//   help: for a distinct type, declare a newtype and put `@derive` on it:
+//         type K { key: (Int, Str) }
+//   fix: delete the attribute line
+
+type Plain { x: Int }
+
+@derive(Debug)
+type A = Plain
+// error[E1110]: `@derive` does not apply to a type alias
+//   `A` is another name for `Plain`
+//   help: put `@derive(Debug)` on `type Plain`
+//   fix: delete the attribute line
+
+@derive(Hash, Eq)
+type L = List[Int]
+// error[E1110]: `@derive` does not apply to a type alias
+//   `L` is another name for `List[Int]`
+//   note: `List[Int]` cannot gain `Hash`, so `L` is not a valid `Map` key or `Set` element (E1400)
+//   fix: delete the attribute line
+
+@derive(Debug)
+type Pair[T] = (T, T)
+// error[E1110]: `@derive` does not apply to a type alias
+//   `Pair` is another name for `(T, T)`
+//   fix: delete the attribute line
+
+@src(req: "ID-7")
+@deprecated(since: "2026", replacement: "AccountId")
+type UserId = Int
+
+@allow(DeprecatedUsage)
+type Legacy = UserId
+// both compile: each annotation describes the name, not the aliased type
+
+@invariant(self > 0)
+type Count = Int
+// error[E1110]: `@invariant` does not apply to a type alias
+//   `Count` is another name for `Int`
+//   help: declare a newtype: `type Count { value: Int }`
+```
+
+The fix of the E1110 on `@derive` deletes the attribute line, for every alias. It never moves the derive to another declaration. Deleting does not change what the program means, because a derive on an alias grants nothing. When the alias names a struct or enum of this package, the help names that declaration, so that the author can put the derive there.
+
+`@where` as written above a type alias is E1110. A refinement written after the aliased type, `type Port = Int @where(self > 0)` (§3b.1), is part of the type that the alias names. It is not an annotation on the alias.
 
 #### Canonical Ordering
 
@@ -4892,6 +4951,8 @@ pub type MaskedCardNumber {
     value: Str
 }
 ```
+
+An alias can carry provenance too (§11.1 *Annotations on a Type Alias*). The link is to the alias name, not to the aliased type: `@src(req: "ID-7")` on `type UserId = Int` links `UserId` and does not link `Int`.
 
 #### Provenance on Modules
 

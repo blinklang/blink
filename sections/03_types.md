@@ -2349,6 +2349,8 @@ Name the field for what it holds. Use `value` when nothing better fits.
 
 A type alias is not a newtype. `type Errno = Int` gives a second name to `Int`: both names are the same type.
 
+An alias creates no type, so `@derive`, `@where`, `@invariant`, `@ffi.struct` and `@ffi.opaque` are E1110 on it, and `@src`, `@deprecated` and `@allow` stay legal (§11.1 *Annotations on a Type Alias*).
+
 Blink has no tuple structs and no `newtype` keyword. A single-variant enum is an ordinary enum, not a newtype. To wrap a foreign type so that you can write an impl for it, see *Orphan Rule* (§3.6). For why `(T)` is not a 1-tuple, see *No 1-Tuples* (§3.8).
 
 A form from another language gets an error that names the Blink form. No help line offers an enum form:
@@ -7276,7 +7278,7 @@ impl Display for MyResponse {
 
 **Why strict orphan rules.** Without them, two packages could independently define `impl Display for HttpResponse`, and any program importing both would have two conflicting impls with no way to choose. This is Haskell's orphan instance problem -- widely considered a design mistake. Strict orphan rules make coherence a syntactic property (package ownership) rather than a whole-program analysis, keeping compilation fast and errors local.
 
-For compiler-known traits (`Eq`, `Hash`, `Display`, `From[T]`, etc.), the compiler is considered the "defining package." Any user package can implement compiler-known traits for its own types. `@derive` generates impls in the type's defining module, which trivially satisfies the orphan rule.
+For compiler-known traits (`Eq`, `Hash`, `Display`, `From[T]`, etc.), the compiler is considered the "defining package." Any user package can implement compiler-known traits for its own types. `@derive` generates impls in the type's defining module, which trivially satisfies the orphan rule. A type alias is not a defining declaration, so `@derive` on an alias is E1110 (§11.1 *Annotations on a Type Alias*).
 
 #### No Impl Overlap
 
