@@ -399,7 +399,7 @@ test "addition works" {
 - **`mut` goes before a name, not before a pattern.** `let mut (x, y) = pair` and `for mut (k, v) in pairs` are `E0613 MutOnPattern`; write `let (mut x, mut y) = pair`. `blink fix` makes this edit.
 - **The alternatives of an OR-pattern must bind the same names, with the same types and the same `mut`** (`E0005 InconsistentPatternBindings`). `Click(mut x, y) | Touch(x, y)` is an error; write `mut x` in both.
 - **`for x in <non-iterable>` is `E0302`.**
-- **A value in a string interpolation must implement `Display`** (`E0523`).
+- **A value in a string interpolation, `sb.write(x)`, `io.print`/`io.println`/`io.eprint`/`io.eprintln`/`io.log`, or a `[T: Display]` parameter must implement `Display`** (`E0523` at each; other failed bounds are `E0306`). `Option`, `Result`, `List`, `Map` and `Set` have no `Display`: match on `io.read_line()` before you print it. `io.print_raw` and `io.eprint_raw` take `Str`.
 - **`==`, `!=`, `assert_eq` and `assert_ne` need `Eq`**, also through `Option`, `Result`, containers and enum payloads (`E0306`, with the `@derive(Eq)` fix). `x.into()`, `T.from(x)` and `T.try_from(x)` need a matching `From`/`TryFrom` impl (`E0312`). `Int` widens to `Float` through `From[Int]`.
 - **`const X = some_fn()` is `E0533`.** A const takes a constant expression.
 
@@ -886,7 +886,7 @@ let first_two = names
 |--------|---------|---------|
 | `StringBuilder.new()` | StringBuilder | Create empty builder |
 | `StringBuilder.with_capacity(n)` | StringBuilder | Create with pre-allocated capacity |
-| `.write(s)` | () | Append string |
+| `.write(x)` | () | Append any `Display` value, rendered by its `fmt` |
 | `.write_char(ch)` | () | Append one `Char` |
 | `.to_str()` | Str | Build final string |
 | `.len()` | Int | Current length |

@@ -1,0 +1,351 @@
+// Every Display sink uses the same bound (sections/03_types.md *Display Format Protocol*,
+// *Trait Bounds*): `"{x}"`, `sb.write(x)`, the io print functions and a user `f[T: Display]`
+// each need `T: Display`, and a failed Display bound is E0523 at each of them. E0306 stays for
+// every other trait. `io.print_raw` and `io.eprint_raw` take `Str` (sections/04_effects.md §4.4).
+
+import compile_test_helpers
+
+// These assert and print nothing: the file has a `test.failing` row, so the corpus reads its
+// --test-json report from stdout.
+fn has(out: Str, needle: Str, label: Str) {
+    assert(out.contains(needle), "{label}: want `{needle}` in:\n{out}")
+}
+
+fn clean(out: Str, label: Str) {
+    assert(!out.contains("\"severity\":\"error\""), "{label}: want a clean compile, got:\n{out}")
+}
+
+fn rejects(src: Str, tag: Str, needle: Str) ! FS.Delete, FS.Write, Process.Spawn, FS.Read, Env.Read, IO.Print {
+    let out = compile_test_helpers.compile_and_capture(src, tag)
+    has(out, "E0523", tag)
+    has(out, needle, tag)
+    assert(!out.contains("E0306"), out)
+    assert(!out.contains("internal compiler error"), out)
+}
+
+fn accepts(src: Str, tag: Str) ! FS.Delete, FS.Write, Process.Spawn, FS.Read, Env.Read, IO.Print {
+    clean(compile_test_helpers.compile_and_capture(src, tag), tag)
+}
+
+test "a struct with no Display impl is E0523 at each sink, and the label names the sink" {
+    rejects(#"type P { x: Int }
+fn main() {
+    let sb = StringBuilder.new()
+    sb.write(P { x: 1 })
+}
+"#, "dsink_sb_write", "which `StringBuilder.write` requires")
+    rejects(#"type P { x: Int }
+fn main() ! IO.Print { io.println(P { x: 1 }) }
+"#, "dsink_println", "which `io.println` requires")
+    rejects(#"type P { x: Int }
+fn main() ! IO.Print { io.print(P { x: 1 }) }
+"#, "dsink_print", "which `io.print` requires")
+    rejects(#"type P { x: Int }
+fn main() ! IO.Print { io.eprintln(P { x: 1 }) }
+"#, "dsink_eprintln", "which `io.eprintln` requires")
+    rejects(#"type P { x: Int }
+fn main() ! IO.Print { io.eprint(P { x: 1 }) }
+"#, "dsink_eprint", "which `io.eprint` requires")
+    rejects(#"type P { x: Int }
+fn main() ! IO.Log { io.log(P { x: 1 }) }
+"#, "dsink_log", "which `io.log` requires")
+}
+
+test "the E0523 headline, help and note follow the spec form" {
+    let out = compile_test_helpers.compile_and_capture(#"type Matrix { x: Int }
+fn main() {
+    let matrix = Matrix { x: 1 }
+    let sb = StringBuilder.new()
+    sb.write(matrix)
+}
+"#, "dsink_form")
+    has(out, "type `Matrix` does not implement `Display`", "dsink_form headline")
+    has(out, "implement `Display` for `Matrix` with an `impl Display for Matrix` block", "dsink_form help")
+    has(out, "use `matrix.debug()` for structural representation", "dsink_form note")
+    assert(!out.contains("@derive(Display)"), out)
+    has(out, "\"line\":5,\"col\":14", "dsink_form span on the argument")
+}
+
+test "an interpolated value with no Display gets the same help, with no derive" {
+    let out = compile_test_helpers.compile_and_capture(#"type Matrix { x: Int }
+fn main() {
+    let matrix = Matrix { x: 1 }
+    let s = "m={matrix}"
+    let _ = s
+}
+"#, "dsink_interp_form")
+    has(out, "E0523", "dsink_interp_form")
+    has(out, "implement `Display` for `Matrix` with an `impl Display for Matrix` block", "dsink_interp_form help")
+    assert(!out.contains("@derive(Display)"), out)
+}
+
+test "Option, Result, List and Map have no Display at a sink" {
+    rejects(#"fn main() ! IO.Print, Env.Read { io.println(env.var("HOME")) }
+"#, "dsink_option", "Option[Str]")
+    rejects(#"fn main() ! IO.Print {
+    let r: Result[Int, Str] = Ok(1)
+    io.println(r)
+}
+"#, "dsink_result", "Result[Int, Str]")
+    rejects(#"fn main() ! IO.Print { io.println([1, 2]) }
+"#, "dsink_list", "List[Int]")
+    rejects(#"fn main() {
+    let m: Map[Str, Int] = Map()
+    let sb = StringBuilder.new()
+    sb.write(m)
+}
+"#, "dsink_map", "Map[Str, Int]")
+}
+
+test "a value from io.read_line at a sink carries the match note and help" {
+    let out = compile_test_helpers.compile_and_capture(#"fn main() ! IO.Read, IO.Print {
+    let line = io.read_line()
+    io.println(line)
+    io.println("got {line}")
+}
+"#, "dsink_read_line")
+    has(out, "E0523", "dsink_read_line")
+    has(out, "`io.read_line()` returns `None` at end of input and `Some(\\\"\\\")` for a blank line", "dsink_read_line note")
+    has(out, "match on it: `match io.read_line()", "dsink_read_line help")
+    assert(!out.contains(".debug()"), out)
+}
+
+test "a user fn with a Display bound is E0523, not E0306, at the argument" {
+    let out = compile_test_helpers.compile_and_capture(#"type P { x: Int }
+fn show[T: Display](x: T) -> Str { x.display() }
+fn main() {
+    let s = show(P { x: 1 })
+    let _ = s
+}
+"#, "dsink_user_fn")
+    has(out, "E0523", "dsink_user_fn")
+    has(out, "which `show` requires", "dsink_user_fn label")
+    has(out, "\"line\":4,\"col\":18", "dsink_user_fn span on the argument")
+    assert(!out.contains("E0306"), out)
+    rejects(#"type P { x: Int }
+fn show[T: Display]() -> Int { 0 }
+fn main() {
+    let v = show[P]()
+    let _ = v
+}
+"#, "dsink_user_fn_explicit", "type `P` does not implement `Display`")
+}
+
+test "a type parameter with no Display bound is E0523 at a sink in its body" {
+    rejects(#"fn h[T](x: T) ! IO.Print { io.println(x) }
+fn main() ! IO.Print { h(1) }
+"#, "dsink_tp_println", "[T: Display]")
+    rejects(#"fn h[T](x: T) -> Str {
+    let sb = StringBuilder.new()
+    sb.write(x)
+    sb.to_str()
+}
+fn main() { let _ = h(1) }
+"#, "dsink_tp_sb_write", "[T: Display]")
+    rejects(#"fn f[T: Display](x: T) -> Str { x.display() }
+fn g[T](x: T) -> Str { f(x) }
+fn main() { let _ = g(1) }
+"#, "dsink_tp_forward", "[T: Display]")
+    rejects(#"trait Sh { fn sh(self) -> Int }
+fn h[T: Sh](x: T) ! IO.Print { io.println(x) }
+fn main() { }
+"#, "dsink_tp_other_bound", "+ Display")
+}
+
+test "a type parameter whose bounds give Display passes every sink" {
+    accepts(#"fn h[T: Display](x: T) ! IO.Print {
+    io.println(x)
+    let sb = StringBuilder.new()
+    sb.write(x)
+    io.println(sb.to_str())
+}
+fn main() ! IO.Print { h(1) }
+"#, "dsink_tp_bound")
+    accepts(#"trait Pretty: Display { fn pretty(self) -> Str }
+fn h[T: Pretty](x: T) ! IO.Print { io.println(x) }
+fn main() { }
+"#, "dsink_tp_supertrait")
+    accepts(#"trait Shown { fn shown(self) -> Str }
+type Bx[T] { v: T }
+impl[T] Shown for Bx[T] where T: Display {
+    fn shown(self) -> Str {
+        let sb = StringBuilder.new()
+        sb.write(self.v)
+        sb.to_str()
+    }
+}
+fn main() { let _ = Bx { v: 1 }.shown() }
+"#, "dsink_tp_where")
+}
+
+test "a failed bound on another trait is still E0306" {
+    let out = compile_test_helpers.compile_and_capture(#"type P { x: Int }
+fn top[T: Ord](x: T) -> T { x }
+fn main() {
+    let v = top(P { x: 1 })
+    let _ = v
+}
+"#, "dsink_ord_stays_e0306")
+    has(out, "E0306", "dsink_ord_stays_e0306")
+    assert(!out.contains("E0523"), out)
+}
+
+test "a _raw print takes Str, and the help renders the value first" {
+    let out = compile_test_helpers.compile_and_capture(#"fn main() ! IO.Print {
+    let done = 3
+    io.print_raw(done)
+}
+"#, "dsink_print_raw")
+    has(out, "E0300", "dsink_print_raw")
+    has(out, "render it first: `io.print_raw(\\\"\{done}\\\")`", "dsink_print_raw help")
+    let out2 = compile_test_helpers.compile_and_capture(#"fn main() ! IO.Print { io.eprint_raw(3) }
+"#, "dsink_eprint_raw")
+    has(out2, "E0300", "dsink_eprint_raw")
+    has(out2, "render it first: `io.eprint_raw(", "dsink_eprint_raw help")
+    accepts(#"fn main() ! IO.Print {
+    io.print_raw("a")
+    io.eprint_raw("b {1}")
+}
+"#, "dsink_raw_str")
+}
+
+test "a Raw argument at a sink is RawOutsideTemplate, not E0523" {
+    let out = compile_test_helpers.compile_and_capture(#"fn main() ! IO.Print { io.println(Raw("x")) }
+"#, "dsink_raw_wrapper")
+    has(out, "E0530", "dsink_raw_wrapper")
+    assert(!out.contains("E0523"), out)
+}
+
+test "Display values, a Never argument and the scalars pass the sinks" {
+    accepts(#"type P { x: Int }
+impl Display for P {
+    fn fmt(self, sb: StringBuilder) { sb.write("P") }
+}
+fn main() ! IO.Print, IO.Log {
+    let sb = StringBuilder.new()
+    sb.write(1)
+    sb.write(1.5)
+    sb.write(true)
+    sb.write("s")
+    let b: U8 = 7
+    io.println(P { x: 1 })
+    io.print((1, 2))
+    io.eprintln('c')
+    io.eprint(b)
+    io.log(2.5)
+    io.println(sb.to_str())
+}
+"#, "dsink_display_values")
+    accepts(#"fn stop() -> Int ! IO.Print {
+    io.println(panic("x"))
+    0
+}
+fn main() ! IO.Print { let _ = stop() }
+"#, "dsink_never")
+}
+
+test.failing(
+    "a trait-qualified call of a method with a Display bound puts E0523 on the argument, not the receiver",
+    reason: "a trait-qualified call does not check the bounds of the method's own type parameters yet",
+) {
+    let out = compile_test_helpers.compile_and_capture(#"type W { n: Int }
+type P { x: Int }
+trait Put { fn put[T: Display](self, x: T) -> Int }
+impl Put for W { fn put[T: Display](self, _x: T) -> Int { self.n } }
+fn main() {
+    let w = W { n: 0 }
+    let v = Put.put(w, P { x: 1 })
+    let _ = v
+}
+"#, "dsink_trait_qualified_method")
+    has(out, "E0523", "dsink_trait_qualified_method")
+    has(out, "\"line\":7,\"col\":24", "dsink_trait_qualified_method span on the argument")
+}
+
+test "a trait-qualified sb.write puts E0523 on the argument, not the receiver" {
+    let out = compile_test_helpers.compile_and_capture(#"type P { x: Int }
+fn main() {
+    let sb = StringBuilder.new()
+    StringBuildOps.write(sb, P { x: 1 })
+}
+"#, "dsink_trait_qualified_write")
+    has(out, "E0523", "dsink_trait_qualified_write")
+    has(out, "\"line\":4,\"col\":30", "dsink_trait_qualified_write span on the argument")
+}
+
+test "a forwarded type parameter names the binder that declares the Display bound" {
+    let out = compile_test_helpers.compile_and_capture(#"fn f[T: Display](x: T) -> Str { x.display() }
+fn g[T](x: T) -> Str { f(x) }
+fn main() { let _ = g(1) }
+"#, "dsink_tp_forward_note")
+    has(out, "E0523", "dsink_tp_forward_note")
+    has(out, "`f` declares `T: Display` at ", "dsink_tp_forward_note note")
+}
+
+test "Self with no Display in a trait default body gets the supertrait help" {
+    rejects(#"trait Named {
+    fn name(self) -> Str
+    fn greet(self) -> Str { "hi {self}" }
+}
+fn main() { }
+"#, "dsink_self_default", "make `Display` a supertrait: `trait Named: Display`")
+}
+
+// The prelude gives Never a Display impl (sections/03_types.md *Never*), so the bound holds.
+test.failing(
+    "a Never argument meets a Display bound on a type parameter",
+    reason: "codegen cannot build a Display call on a Never receiver, so typecheck still refuses the bound",
+) {
+    let r = compile_test_helpers.compile_and_run(#"fn show[T: Display](x: T) -> Str { x.display() }
+fn main() ! IO.Print {
+    if false { io.println(show(panic("x"))) }
+    io.println("ok")
+}
+"#, "dsink_never_tparam")
+    assert(r.exit_code == 0, "{r.out}{r.err_out}")
+    assert(r.out.contains("ok"), r.out)
+}
+
+test "a _raw print of a value with no Display does not suggest an interpolation" {
+    let out = compile_test_helpers.compile_and_capture(#"type P { x: Int }
+fn main() ! IO.Print {
+    let p = P { x: 1 }
+    io.print_raw(p)
+}
+"#, "dsink_print_raw_no_display")
+    has(out, "E0300", "dsink_print_raw_no_display")
+    has(out, "`P` has no `Display`, so render it to a `Str` by hand", "dsink_print_raw_no_display help")
+    assert(!out.contains("io.print_raw(\\\"\{p}"), out)
+}
+
+test "a generic instance whose Display impl needs Display of its argument reports the argument" {
+    let bx = #"type P { x: Int }
+type Bx[U] { v: U }
+impl[U] Display for Bx[U] where U: Display {
+    fn fmt(self, sb: StringBuilder) { sb.write(self.v) }
+}
+"#
+    let out = compile_test_helpers.compile_and_capture(bx.concat(#"fn main() ! IO.Print { io.println(Bx { v: P { x: 1 } }) }
+"#), "dsink_instance_arg")
+    has(out, "E0523", "dsink_instance_arg")
+    has(out, "type `Bx[P]` does not implement `Display`", "dsink_instance_arg headline")
+    has(out, "implement `Display` for `P` with an `impl Display for P` block", "dsink_instance_arg help names the argument")
+    rejects(bx.concat(#"fn g[T](x: T) -> Str { "{Bx { v: x }}" }
+fn main() { let _ = g(1) }
+"#), "dsink_instance_tp", "write the bound on the binder: `[T: Display]`")
+    accepts(bx.concat(#"fn g[T: Display](x: T) -> Str { "{Bx { v: x }}" }
+fn main() { }
+"#), "dsink_instance_tp_bound")
+}
+
+test "an Option and a unit at a sink get help that fits them" {
+    let out = compile_test_helpers.compile_and_capture(#"fn main() ! IO.Print {
+    let v: Option[Int] = Some(1)
+    io.println(v)
+    io.println(())
+}
+"#, "dsink_option_unit")
+    has(out, "E0523", "dsink_option_unit")
+    has(out, "`Option[Int]` has no `Display`; `match` on it and show the value it holds, or use `v.debug()`", "dsink_option_unit option help")
+    has(out, "`()` has no `Display`: it holds no value to show", "dsink_option_unit unit help")
+}
