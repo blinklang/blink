@@ -16399,6 +16399,21 @@ fn tc_register_trait_method_sig(key: Str, m: Int, p_start: Int, ret: Int) -> Int
     sig
 }
 
+// A trait or impl method's signature resolves with the method's own type parameters in scope,
+// so a type of the same name cannot take their place. The contract check and a call through a
+// bound then read each one by its name alone, so it is given back that form here.
+fn tc_unbind_method_tparams(tid: Int, tparams_sl: Int) -> Int {
+    if tparams_sl == -1 || tid < 0 { return tid }
+    let mut binds: Map[Str, Int] = Map()
+    let mut i = 0
+    while i < sublist_length(tparams_sl) {
+        let tp = sublist_get(tparams_sl, i)
+        binds.insert(tc_binder_key(tp, node_name(tp)), make_typevar_bound(node_name(tp), NO_BINDER_NODE))
+        i = i + 1
+    }
+    substitute_typevar_tid(tid, binds)
+}
+
 fn register_trait(tr_node: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.Report {
     let name = tc_trait_key_of(tr_node)
     tc_trait_names.push(name)
@@ -16447,6 +16462,10 @@ fn register_trait(tr_node: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.Re
             let mname = node_name(m)
             tc_trait_method_names.push("{name}.{mname}")
             tc_method_block.insert(m, tr_node)
+            // The method's own type parameters are in scope in its signature too, so `T` in
+            // `fn write[T: Display](self, x: T)` names the parameter and not a type `T`.
+            let m_tparams = node_type_params(m)
+            tc_push_tparam_scope(m_tparams)
             // Store method signature for contract validation
             let p_start = tc_tmsig_param_tids.len()
             let params_sl = node_params(m)
@@ -16459,7 +16478,7 @@ fn register_trait(tr_node: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.Re
                     // impl must match, and the contract check skips it on that basis.
                     let p_ann = node_type_ann(p)
                     tc_check_trait_sig_ann(p_ann, name, mname, m)
-                    tc_tmsig_param_tids.push(if p_ann == -1 { -1 } else { resolve_type_ann(p_ann) })
+                    tc_tmsig_param_tids.push(if p_ann == -1 { -1 } else { tc_unbind_method_tparams(resolve_type_ann(p_ann), m_tparams) })
                     p_count = p_count + 1
                     j = j + 1
                 }
@@ -16469,7 +16488,8 @@ fn register_trait(tr_node: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.Re
             // contract check entirely, so an impl could return anything at all.
             let m_ann = node_type_ann(m)
             tc_check_trait_sig_ann(m_ann, name, mname, m)
-            let m_ret = if m_ann == -1 { TYPE_VOID } else { resolve_type_ann(m_ann) }
+            let m_ret = if m_ann == -1 { TYPE_VOID } else { tc_unbind_method_tparams(resolve_type_ann(m_ann), m_tparams) }
+            tc_pop_tparam_scope(m_tparams)
             let m_sig = tc_register_trait_method_sig("{name}.{mname}", m, p_start, m_ret)
             tc_tmsig_pool.push(TraitMethodSigEntry { trait_name: name, method: mname, ret_tid: m_ret, tparams_start: tp_start, tparams_count: tp_count, params_start: p_start, params_count: p_count, sig: m_sig })
             i = i + 1
@@ -16733,7 +16753,7 @@ type TraitContractTidResult {
 // / associated types to this impl), compared by interned tid? Caller must have
 // the impl binder scope pushed. Suppression of re-validation is saved/restored
 // here so the caller keeps no save/restore idiom of its own.
-fn tc_trait_contract_tid_check(trait_tid: Int, impl_ann: Int, impl_recv_tid: Int, tmsig_idx: Int, im: Int) -> TraitContractTidResult ! TypeCheck.Resolve, Diag.Report {
+fn tc_trait_contract_tid_check(trait_tid: Int, impl_ann: Int, impl_m: Int, impl_recv_tid: Int, tmsig_idx: Int, im: Int) -> TraitContractTidResult ! TypeCheck.Resolve, Diag.Report {
     if tc_tid_is_no_info(trait_tid) != 0 { return TraitContractTidResult { verdict: -1, actual: TYPE_UNKNOWN, expected: TYPE_UNKNOWN } }
     // A param the impl leaves unannotated — `self`, or any param written bare — has no
     // written type to compare. Reporting it against the trait's type names `?`, which is
@@ -16744,7 +16764,11 @@ fn tc_trait_contract_tid_check(trait_tid: Int, impl_ann: Int, impl_recv_tid: Int
     let mut self_binds: Map[Str, Int] = Map()
     self_binds.insert("Self", impl_recv_tid)
     self_binds.insert(tc_binder_key(SELF_BINDER_NODE, "Self"), impl_recv_tid)
-    let actual = substitute_typevar_tid(resolve_type_ann(impl_ann), self_binds)
+    // The method's own type parameters are in scope, as they are in the trait's signature.
+    let m_tparams = node_type_params(impl_m)
+    tc_push_tparam_scope(m_tparams)
+    let actual = substitute_typevar_tid(tc_unbind_method_tparams(resolve_type_ann(impl_ann), m_tparams), self_binds)
+    tc_pop_tparam_scope(m_tparams)
     tc_suppress_ann_validation = saved_suppress
     tc_trait_contract_tid_check_actual(trait_tid, actual, impl_recv_tid, tmsig_idx, im)
 }
@@ -17055,7 +17079,7 @@ fn validate_trait_impls_in_own_modules(program: Int) ! TypeCheck.Register, TypeC
                                     let trait_ptid = tc_tmsig_param_tids.get(tp_start + pi).unwrap()
                                     if tc_tid_is_no_info(trait_ptid) == 0 {
                                         let impl_p = sublist_get(impl_params_sl, pi)
-                                        let r = tc_trait_contract_tid_check(trait_ptid, node_type_ann(impl_p), impl_recv_tid, si, im)
+                                        let r = tc_trait_contract_tid_check(trait_ptid, node_type_ann(impl_p), impl_m, impl_recv_tid, si, im)
                                         if r.verdict == 1 && (tc_trait_sig_poisoned.get(trait_name) ?? 0) == 0 {
                                             let a_s = type_to_str(r.actual)
                                             let e_s = type_to_str(r.expected)
@@ -17075,7 +17099,7 @@ fn validate_trait_impls_in_own_modules(program: Int) ! TypeCheck.Register, TypeC
                                     let r = if impl_ret_ann == -1 {
                                         tc_trait_contract_tid_check_actual(tmsig.ret_tid, TYPE_VOID, impl_recv_tid, si, im)
                                     } else {
-                                        tc_trait_contract_tid_check(tmsig.ret_tid, impl_ret_ann, impl_recv_tid, si, im)
+                                        tc_trait_contract_tid_check(tmsig.ret_tid, impl_ret_ann, impl_m, impl_recv_tid, si, im)
                                     }
                                     if r.verdict == 1 && (tc_trait_sig_poisoned.get(trait_name) ?? 0) == 0 {
                                         // Void is not a return type a user may write, so the
