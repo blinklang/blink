@@ -851,6 +851,7 @@ let first_two = names
 | `.concat(other)` | Bytes | Concatenate |
 | `.to_str()` | Result[Str, Str] | Convert to UTF-8 string; Err on bad UTF-8 or a NUL byte |
 | `.to_hex()` | Str | Hex encoding |
+| `.debug()` | Str | `"Bytes(" + b.to_hex() + ")"`, never cut |
 | `.read_u16_be(offset)` | Result[Int, Str] | Read unsigned 16-bit big-endian at offset |
 | `.read_u16_le(offset)` | Result[Int, Str] | Read unsigned 16-bit little-endian at offset |
 | `.read_u32_be(offset)` | Result[Int, Str] | Read unsigned 32-bit big-endian at offset |
@@ -880,6 +881,8 @@ let first_two = names
 | `.set_i64_be(off, v)` | Result[(), Str] | In-place write signed 64-bit big-endian at offset |
 | `.set_i64_le(off, v)` | Result[(), Str] | In-place write signed 64-bit little-endian at offset |
 | `.with_ptr(fn(p) { ... })` | T | Pin buffer and call closure with `Ptr[U8]` (FFI alias path; no growth allowed inside) |
+
+`Bytes.debug()` is `"Bytes(" + b.to_hex() + ")"`: `Bytes.from_str("hi").debug()` is `Bytes(6869)`, `Bytes.zeroed(2).debug()` is `Bytes(0000)`, empty bytes are `Bytes()`. The text is the same in `@derive(Debug)` fields, in the `debug()` of a `List`, `Option` or `Map`, in traces, and in the `unwrap` and `assert_eq` message of a `Bytes` value. `debug()` never cuts its output (a trace cuts at 200 characters). The text is not source: `Bytes(6869)` is not a call and does not rebuild the value.
 
 ## StringBuilder Methods
 

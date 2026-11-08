@@ -1,0 +1,55 @@
+// A failed assert_eq and a trace value show a Bytes by its debug text, "Bytes(" + hex + ")"
+// (sections/03_types.md §3.6.1, the Bytes row; sections/06_tooling.md §8.15.9). The trace cuts
+// a value string at 200 characters and sets "truncated":true; debug() itself is whole.
+
+import compile_test_helpers
+import compile_test_helpers.{compile_and_run}
+import std.json.{json_clear, json_parse, json_get, json_as_str, json_as_bool}
+
+test "a failed assert_eq of Bytes shows each side by its debug text" {
+    let src = "fn main() \{\n    assert_eq(Bytes.from_str(\"hi\"), Bytes.from_str(\"ho\"))\n}\n"
+    let r = compile_and_run(src, "bytes_debug_assert_eq_{getpid()}")
+    assert_eq(r.exit_code, 101, "exit {r.exit_code}: {r.out}{r.err_out}")
+    assert_eq(r.err_out, "ASSERT_EQ FAILED: Bytes(6869) != Bytes(686f) (line 2)\n")
+}
+
+test "a failed assert_ne of Bytes shows the value by its debug text" {
+    let src = "fn main() \{\n    assert_ne(Bytes.new(), Bytes.new())\n}\n"
+    let r = compile_and_run(src, "bytes_debug_assert_ne_{getpid()}")
+    assert_eq(r.exit_code, 101, "exit {r.exit_code}: {r.out}{r.err_out}")
+    assert_eq(r.err_out, "ASSERT_NE FAILED: Bytes() == Bytes() (line 2)\n")
+}
+
+let TRACE_SRC = #"fn take(b: Bytes) -> Int { b.len() }
+fn take_list(xs: List[Bytes]) -> Int { xs.len() }
+fn main() ! IO {
+    io.println("{take(Bytes.from_str("hi"))}")
+    io.println("{take(Bytes.zeroed(1000))}")
+    io.println("{take_list([Bytes.from_str("a")])}")
+}
+"#
+
+test "a trace shows a Bytes argument by its debug text and cuts it at 200 characters" {
+    let bin = compile_test_helpers.build_bin(TRACE_SRC, "trace_bytes_debug", ["--trace"])
+    let r = process.run("env", ["BLINK_TRACE=event:enter", bin]).unwrap()
+    compile_test_helpers.clean_bin("trace_bytes_debug")
+    assert(r.success(), r.err_out)
+    assert_eq(r.out, "2\n1000\n1\n")
+    let mut seen: List[Str] = []
+    for line in r.err_out.split("\n") {
+        if !line.starts_with("\{") { continue }
+        json_clear()
+        let obj = json_parse(line)
+        assert(obj >= 0)
+        let args = json_get(obj, "args")
+        if args < 0 { continue }
+        let b = json_get(args, "b")
+        let xs = json_get(args, "xs")
+        let v = if b >= 0 { json_as_str(b) } else if xs >= 0 { json_as_str(xs) } else { continue }
+        let t = json_get(obj, "truncated")
+        let cut = t >= 0 && json_as_bool(t) == 1
+        let head = if v.len() > 12 { v.byte_slice(0, 12) } else { v }
+        seen.push("{v.len()} {cut} {head}")
+    }
+    assert_eq(seen.join("\n"), "11 false Bytes(6869)\n200 true Bytes(000000\n11 false [Bytes(61)]")
+}
