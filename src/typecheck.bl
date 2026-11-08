@@ -2,7 +2,7 @@ import ast.{NodeKind, node_kind_name, is_block_bearing, trace_gate_on, nk_is_typ
 import std.str.{str_to_lower}
 import pkg.manifest.{manifest_name, manifest_header_is_declared}
 import unparse.{type_ann_text, unparse_expr, unparse_binop_with_lhs, unparse_range_membership, unparse_coalesce_start}
-import formatter.{effect_op_sig_text}
+import formatter.{effect_op_sig_text, fn_sig_text, fn_sig_text_renamed, type_param_list_text, format_type_param_binder}
 import import_edit.{ImportEdit, ImportNeed, import_aliased_edit, import_module_edit, import_need}
 import parser.{
     node_written_span, effect_derived_ops, node_load_rank, parser_load_order_moved, parser_live_ranges,
@@ -18,7 +18,7 @@ import parser.{
     node_set_module, node_set_name, node_supertraits, node_empty_row_line, node_empty_row_col, node_empty_row_end_col, node_end_line, node_end_col, node_inclusive, BINDER_MUT_RECOVERED,
     synth_named_arg, sublist_append, sublist_of, node_set_obj, node_set_args,
     node_set_params, node_set_stmts, node_set_fields, node_set_arms,
-    node_xfail_reason, node_value_child_ids, node_push_value_child_ids, node_spell_child_ids,
+    node_xfail_reason, node_value_child_ids, node_push_value_child_ids, node_spell_child_ids, node_push_spell_child_ids,
     sublist_get, sublist_length,
 }
 import diagnostics.{
@@ -48,10 +48,11 @@ import diagnostics.{
     PINNED_BYTES_ESCAPE, BYTES_PTR_CAST_FORBIDDEN,
     FFI_OFFSET_ON_SINGLETON, FFI_OFFSET_UNKNOWN_STRIDE, VOID_POINTEE_ACCESS, WITH_ITEM_NOT_A_HANDLER, INSUFFICIENT_HANDLER_COVERAGE,
     TRAIT_CONTRACT_900, TRAIT_CONTRACT_901, TRAIT_CONTRACT_902,
-    TRAIT_CONTRACT_903, TRAIT_CONTRACT_904, TRAIT_CONTRACT_905,
+    TRAIT_CONTRACT_903, TRAIT_CONTRACT_904, TRAIT_CONTRACT_905, TRAIT_CONTRACT_906,
+    DUPLICATE_TYPE_PARAM,
     TRAIT_CONTRACT_907, SEALED_METHOD_OVERRIDE,
     POLY_IMPL_UNSUPPORTED, IMPL_BINDER_UNUSED, TRAIT_ARG_ARITY, MISSING_SUPERTRAIT_IMPL, TYPE_ARG_ARITY,
-    CALL_SITE_TYPE_ARGS, ELEMENT_ACCESS_HELP, ENUM_PATTERN_NON_ENUM, NO_INDEX_OPERATOR,
+    TYPE_ARGS_WITHOUT_CALL, ELEMENT_ACCESS_HELP, ENUM_PATTERN_NON_ENUM, NO_INDEX_OPERATOR,
     CONTRACT_PREDICATE_NOT_DECIDABLE, EFFECTFUL_CALL_IN_PREDICATE,
     IMPURE_CALL_IN_PREDICATE, LOOP_IN_PREDICATE,
     RESULT_OUTSIDE_ENSURES, OLD_OUTSIDE_ENSURES,
@@ -1796,6 +1797,16 @@ type TraitMethodSigEntry {
     // The same declaration as a fnsig, for the keyword and count rules of a call the trait
     // alone answers. No name resolves to it.
     sig: Int
+    // The bounds on the method's own binders, read in the trait's file, for E0906.
+    binder_bounds: List[MethodBinderBound]
+}
+
+// One bound `U: Tr[A]` on the binder at `pos` of a trait method. `args` are resolved with
+// the method's binders unbound, as the signature's tids are.
+type MethodBinderBound {
+    pos: Int
+    trait_key: Str
+    args: List[Int]
 }
 let mut tc_tmsig_pool: List[TraitMethodSigEntry] = []
 // Each trait method param's resolved tid, with Self/trait-tparams/Self.assoc
@@ -3415,6 +3426,12 @@ fn tc_call_type_args_help(sig: Int, self_offset: Int, call_node: Int, solved: Li
         let written = tc_call_with_list(call_node, callee, filled.join(", "))
         if written != "" { return "write the type arguments at this call: `{written}`" }
     }
+    // A method call keeps the receiver or the qualifier as written, as the help for a binder
+    // in no parameter does (sections/03_types.md 3.6).
+    if tc_fn_decl_takes_self(fs.decl) {
+        let written = tc_call_with_list(call_node, callee, all.join(", "))
+        if written != "" { return "write the type arguments at this call: `{written}`" }
+    }
     let args = if fs.params_count - self_offset > 0 { "..." } else { "" }
     "write the type arguments at this call, as in `{callee}[{all.join(", ")}]({args})` (replace each placeholder with the intended type)"
 }
@@ -3504,11 +3521,38 @@ fn tc_report_unsourced_binders(sig: Int, call_node: Int, self_offset: Int) ! Dia
     if names.len() == 0 { return }
     tc_calls.reported.insert(call_node, 1)
     let callee = node_name(fs.decl)
+    // A method's binder is open at this call, not unsourced in its declaration: an impl must
+    // repeat the trait's list, so the brackets at the call are the one repair, and its help
+    // keeps the receiver as written (sections/03_types.md 3.6).
+    if tc_fn_decl_takes_self(fs.decl) {
+        let mut mmsg = "type parameter {tc_ticked_names(names)} of `{callee}` is unbound at this call and nothing supplies it"
+        if names.len() > 1 {
+            mmsg = "type parameters {tc_ticked_names(names)} of `{callee}` are unbound at this call and nothing supplies them"
+        }
+        let written = tc_call_with_list(call_node, callee, tc_sig_binder_names(sig).join(", "))
+        if written != "" {
+            diag_error_at("CannotInferType", CANNOT_INFER_TYPE, mmsg, call_node, "write the type arguments at this call: `{written}`")
+            return
+        }
+        diag_error_at("CannotInferType", CANNOT_INFER_TYPE, mmsg, call_node, tc_call_type_args_help(sig, self_offset, call_node, []))
+        return
+    }
     let mut msg = "type parameter {tc_ticked_names(names)} of `{callee}` has no source -- it is bound by the declaration but supplied by neither a parameter nor the return type"
     if names.len() > 1 {
         msg = "type parameters {tc_ticked_names(names)} of `{callee}` have no source -- they are bound by the declaration but supplied by neither a parameter nor the return type"
     }
     diag_error_at("CannotInferType", CANNOT_INFER_TYPE, msg, call_node, tc_call_type_args_help(sig, self_offset, call_node, []))
+}
+
+fn tc_sig_binder_names(sig: Int) -> List[Str] {
+    let fs = fnsig_pool.get(sig).unwrap()
+    let mut all: List[Str] = []
+    let mut pi = 0
+    while pi < fs.type_params_count {
+        all.push(fnsig_type_param_names.get(fs.type_params_start + pi).unwrap())
+        pi = pi + 1
+    }
+    all
 }
 
 // Record an unbracketed generic call's own binder tids for tc_ud_flush_calls. Group
@@ -6037,8 +6081,10 @@ fn tc_check_user_bounds(decl: Int, idx: Int, concrete: Int, binds: Map[Str, Int]
     if decl < 0 { return }
     let tp = fnsig_tparam_nodes.get(idx) ?? NO_BINDER_NODE
     let block = tc_method_block.get(decl) ?? -1
-    let impl_binders = if block != -1 && node_kind(block) == NodeKind.ImplBlock { node_impl_binders(block) } else { -1 }
-    if tc_report_unmet_user_bound(tp, impl_binders, node_type_params(decl), concrete, binds, node) != 0 { return }
+    // A trait method's bound can name the trait's parameters, as `U: Got[A]` in `trait Tr[A]`;
+    // a call through a bound puts their types in `binds`.
+    let outer = if block == -1 { -1 } else if node_kind(block) == NodeKind.ImplBlock { node_impl_binders(block) } else if node_kind(block) == NodeKind.TraitDef { node_type_params(block) } else { -1 }
+    if tc_report_unmet_user_bound(tp, outer, node_type_params(decl), concrete, binds, node) != 0 { return }
     let _ = tc_report_user_bound_impl_bounds(tp, concrete, node, [])
 }
 
@@ -16602,14 +16648,14 @@ fn tc_stamp_names(names_sl: Int, m: Str) {
 // The parameter tids are the ones the contract check registered, with no annotation (`self`)
 // read as TYPE_UNKNOWN as register_fn_sig reads it. Kept out of fnsig_map: the key is never
 // looked up.
-fn tc_register_trait_method_sig(key: Str, m: Int, p_start: Int, ret: Int) -> Int {
+fn tc_register_trait_method_sig(key: Str, m: Int, ptids: List[Int], ret: Int) -> Int {
     let start = fnsig_param_list.len()
     let params_sl = node_params(m)
     let mut count = 0
     if params_sl != -1 {
         while count < sublist_length(params_sl) {
             let p = sublist_get(params_sl, count)
-            let ptid = tc_tmsig_param_tids.get(p_start + count).unwrap()
+            let ptid = ptids.get(count).unwrap()
             fnsig_param_list.push(if ptid == -1 { TYPE_UNKNOWN } else { ptid })
             fnsig_param_names.push(node_name(p))
             fnsig_param_kw.push(node_int_val(p))
@@ -16617,8 +16663,26 @@ fn tc_register_trait_method_sig(key: Str, m: Int, p_start: Int, ret: Int) -> Int
             count = count + 1
         }
     }
+    // The method's own binders, in the tables a fn signature fills, so a call fixes, checks and
+    // reports them as it does a fn's.
+    let tp_start = fnsig_type_param_names.len()
+    let tparams_sl = node_type_params(m)
+    let ret_ann = node_type_ann(m)
+    let mut tp_count = 0
+    if tparams_sl != -1 {
+        while tp_count < sublist_length(tparams_sl) {
+            let tp = sublist_get(tparams_sl, tp_count)
+            let tp_name = node_name(tp)
+            fnsig_type_param_names.push(tp_name)
+            fnsig_tparam_nodes.push(tp)
+            fnsig_tparam_ret_only.push(tc_tparam_is_ret_only(tp_name, ret_ann, params_sl))
+            fnsig_tparam_sourced.push(tc_tparam_is_sourced(tp_name, ret_ann, params_sl))
+            fnsig_tparam_bounds.push(tparam_node_bound_traits(tp))
+            tp_count = tp_count + 1
+        }
+    }
     let sig = fnsig_pool.len()
-    fnsig_pool.push(FnSigEntry { name: key, ret: ret, params_start: start, params_count: count, type_params_start: fnsig_type_param_names.len(), type_params_count: 0, effects_start: fnsig_effect_names.len(), effects_count: 0, decl: m })
+    fnsig_pool.push(FnSigEntry { name: key, ret: ret, params_start: start, params_count: count, type_params_start: tp_start, type_params_count: tp_count, effects_start: fnsig_effect_names.len(), effects_count: 0, decl: m })
     sig
 }
 
@@ -16626,15 +16690,46 @@ fn tc_register_trait_method_sig(key: Str, m: Int, p_start: Int, ret: Int) -> Int
 // so a type of the same name cannot take their place. The contract check and a call through a
 // bound then read each one by its name alone, so it is given back that form here.
 fn tc_unbind_method_tparams(tid: Int, tparams_sl: Int) -> Int {
+    tc_unbind_method_tparams_as(tid, tparams_sl, tparams_sl)
+}
+
+// tc_unbind_method_tparams, with binder i given the name of binder i of `names_sl`. An impl
+// method's binders match its trait method's by position, so the contract check reads each
+// impl binder under the trait binder's name.
+fn tc_unbind_method_tparams_as(tid: Int, tparams_sl: Int, names_sl: Int) -> Int {
     if tparams_sl == -1 || tid < 0 { return tid }
     let mut binds: Map[Str, Int] = Map()
     let mut i = 0
     while i < sublist_length(tparams_sl) {
         let tp = sublist_get(tparams_sl, i)
-        binds.insert(tc_binder_key(tp, node_name(tp)), make_typevar_bound(node_name(tp), NO_BINDER_NODE))
+        let shown = if names_sl != -1 && i < sublist_length(names_sl) { node_name(sublist_get(names_sl, i)) } else { node_name(tp) }
+        binds.insert(tc_binder_key(tp, node_name(tp)), make_typevar_bound(shown, NO_BINDER_NODE))
         i = i + 1
     }
     substitute_typevar_tid(tid, binds)
+}
+
+// The bounds on each binder of `tparams_sl`, with the binders unbound under the names of
+// `names_sl`. The caller has the binders in scope and ann validation suppressed.
+fn tc_method_binder_bounds(tparams_sl: Int, names_sl: Int) -> List[MethodBinderBound] ! TypeCheck.Resolve, Diag.Report {
+    let mut out: List[MethodBinderBound] = []
+    if tparams_sl == -1 { return out }
+    let mut i = 0
+    while i < sublist_length(tparams_sl) {
+        let bounds = node_elements(sublist_get(tparams_sl, i))
+        let mut bi = 0
+        while bounds != -1 && bi < sublist_length(bounds) {
+            let b = sublist_get(bounds, bi)
+            let mut args: List[Int] = []
+            for a in tc_resolve_type_args(node_elements(b)) {
+                args.push(tc_unbind_method_tparams_as(a, tparams_sl, names_sl))
+            }
+            out.push(MethodBinderBound { pos: i, trait_key: tc_bound_trait(b), args: args })
+            bi = bi + 1
+        }
+        i = i + 1
+    }
+    out
 }
 
 fn register_trait(tr_node: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.Report {
@@ -16693,6 +16788,9 @@ fn register_trait(tr_node: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.Re
             let p_start = tc_tmsig_param_tids.len()
             let params_sl = node_params(m)
             let mut p_count = 0
+            // The call surface keeps the method's binders bound, as a fn signature does, so a
+            // call can fix them; the contract check reads them unbound, by name.
+            let mut sig_ptids: List[Int] = []
             if params_sl != -1 {
                 let mut j = 0
                 while j < sublist_length(params_sl) {
@@ -16701,7 +16799,9 @@ fn register_trait(tr_node: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.Re
                     // impl must match, and the contract check skips it on that basis.
                     let p_ann = node_type_ann(p)
                     tc_check_trait_sig_ann(p_ann, name, mname, m)
-                    tc_tmsig_param_tids.push(if p_ann == -1 { -1 } else { tc_unbind_method_tparams(resolve_type_ann(p_ann), m_tparams) })
+                    let p_tid = if p_ann == -1 { -1 } else { resolve_type_ann(p_ann) }
+                    sig_ptids.push(p_tid)
+                    tc_tmsig_param_tids.push(if p_tid == -1 { -1 } else { tc_unbind_method_tparams(p_tid, m_tparams) })
                     p_count = p_count + 1
                     j = j + 1
                 }
@@ -16711,10 +16811,12 @@ fn register_trait(tr_node: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.Re
             // contract check entirely, so an impl could return anything at all.
             let m_ann = node_type_ann(m)
             tc_check_trait_sig_ann(m_ann, name, mname, m)
-            let m_ret = if m_ann == -1 { TYPE_VOID } else { tc_unbind_method_tparams(resolve_type_ann(m_ann), m_tparams) }
+            let sig_ret = if m_ann == -1 { TYPE_VOID } else { resolve_type_ann(m_ann) }
+            let m_ret = tc_unbind_method_tparams(sig_ret, m_tparams)
+            let m_bounds = tc_method_binder_bounds(m_tparams, m_tparams)
             tc_pop_tparam_scope(m_tparams)
-            let m_sig = tc_register_trait_method_sig("{name}.{mname}", m, p_start, m_ret)
-            tc_tmsig_pool.push(TraitMethodSigEntry { trait_name: name, method: mname, ret_tid: m_ret, tparams_start: tp_start, tparams_count: tp_count, params_start: p_start, params_count: p_count, sig: m_sig })
+            let m_sig = tc_register_trait_method_sig("{name}.{mname}", m, sig_ptids, sig_ret)
+            tc_tmsig_pool.push(TraitMethodSigEntry { trait_name: name, method: mname, ret_tid: m_ret, tparams_start: tp_start, tparams_count: tp_count, params_start: p_start, params_count: p_count, sig: m_sig, binder_bounds: m_bounds })
             i = i + 1
         }
         tc_suppress_ann_validation = saved_suppress
@@ -16987,13 +17089,237 @@ fn tc_trait_contract_tid_check(trait_tid: Int, impl_ann: Int, impl_m: Int, impl_
     let mut self_binds: Map[Str, Int] = Map()
     self_binds.insert("Self", impl_recv_tid)
     self_binds.insert(tc_binder_key(SELF_BINDER_NODE, "Self"), impl_recv_tid)
-    // The method's own type parameters are in scope, as they are in the trait's signature.
+    // The method's own type parameters are in scope, as they are in the trait's signature,
+    // and each one takes the name of the trait binder at its position.
     let m_tparams = node_type_params(impl_m)
     tc_push_tparam_scope(m_tparams)
-    let actual = substitute_typevar_tid(tc_unbind_method_tparams(resolve_type_ann(impl_ann), m_tparams), self_binds)
+    let trait_m = fnsig_pool.get(tc_tmsig_pool.get(tmsig_idx).unwrap().sig).unwrap().decl
+    let t_tparams = node_type_params(trait_m)
+    let actual = substitute_typevar_tid(tc_unbind_method_tparams_as(resolve_type_ann(impl_ann), m_tparams, t_tparams), self_binds)
     tc_pop_tparam_scope(m_tparams)
     tc_suppress_ann_validation = saved_suppress
-    tc_trait_contract_tid_check_actual(trait_tid, actual, impl_recv_tid, tmsig_idx, im)
+    let r = tc_trait_contract_tid_check_actual(trait_tid, actual, impl_recv_tid, tmsig_idx, im)
+    // The report quotes the binder names the impl wrote, not the trait's: with `fn k[W, U]`
+    // for the trait's `fn k[U, W]`, the trait's `U` is the impl's `W`.
+    let back = tc_trait_binder_renames(t_tparams, m_tparams)
+    TraitContractTidResult { verdict: r.verdict, actual: substitute_typevar_tid(r.actual, back), expected: substitute_typevar_tid(r.expected, back) }
+}
+
+// Binds that give each binder of the trait method `trait_sl`, unbound by name, the name of the
+// impl method's binder at its position.
+fn tc_trait_binder_renames(trait_sl: Int, impl_sl: Int) -> Map[Str, Int] {
+    let mut binds: Map[Str, Int] = Map()
+    if trait_sl == -1 || impl_sl == -1 { return binds }
+    let mut i = 0
+    while i < sublist_length(trait_sl) && i < sublist_length(impl_sl) {
+        let tp = sublist_get(trait_sl, i)
+        let to = make_typevar_bound(node_name(sublist_get(impl_sl, i)), NO_BINDER_NODE)
+        binds.insert(tc_binder_key(NO_BINDER_NODE, node_name(tp)), to)
+        binds.insert(tc_binder_key(tp, node_name(tp)), to)
+        i = i + 1
+    }
+    binds
+}
+
+// E0906: the impl method's binder list must repeat its trait method's list: the same count,
+// and at each position the same bounds. Names may differ, since binders match by position.
+// False when the lists differ, so the param and return compares, which read binders by
+// position too, do not report the same fault again. `can_subst` is false when the impl's
+// trait arguments do not fit the trait, and a bound that names a trait parameter cannot be
+// read then.
+fn tc_check_method_binders(tmsig_idx: Int, impl_m: Int, impl_recv_tid: Int, im: Int, can_subst: Bool) -> Bool ! TypeCheck.Resolve, Diag.Report {
+    let tm = tc_tmsig_pool.get(tmsig_idx).unwrap()
+    if (tc_trait_sig_poisoned.get(tm.trait_name) ?? 0) != 0 { return true }
+    let trait_m = fnsig_pool.get(tm.sig).unwrap().decl
+    let t_tps = node_type_params(trait_m)
+    let i_tps = node_type_params(impl_m)
+    let t_n = tc_own_type_param_count(trait_m)
+    let i_n = tc_own_type_param_count(impl_m)
+    let shown = "{tc_trait_shown(tm.trait_name)}.{tm.method}"
+    if t_n != i_n {
+        tc_report_binder_count(tm.trait_name, shown, fn_sig_text(trait_m, true), impl_m, t_n, i_n)
+        return false
+    }
+    if t_n == 0 || !can_subst { return true }
+    let saved_suppress = tc_suppress_ann_validation
+    tc_suppress_ann_validation = 1
+    tc_push_tparam_scope(i_tps)
+    let impl_bounds = tc_method_binder_bounds(i_tps, t_tps)
+    tc_pop_tparam_scope(i_tps)
+    let mut self_binds: Map[Str, Int] = Map()
+    self_binds.insert("Self", impl_recv_tid)
+    self_binds.insert(tc_binder_key(SELF_BINDER_NODE, "Self"), impl_recv_tid)
+    let mut want: List[MethodBinderBound] = []
+    for b in tm.binder_bounds {
+        let mut args: List[Int] = []
+        for a in b.args { args.push(subst_trait_type_tid(a, impl_recv_tid, tmsig_idx, im)) }
+        want.push(MethodBinderBound { pos: b.pos, trait_key: b.trait_key, args: args })
+    }
+    let mut have: List[MethodBinderBound] = []
+    for b in impl_bounds {
+        let mut args: List[Int] = []
+        for a in b.args { args.push(substitute_typevar_tid(a, self_binds)) }
+        have.push(MethodBinderBound { pos: b.pos, trait_key: b.trait_key, args: args })
+    }
+    tc_suppress_ann_validation = saved_suppress
+    let mut pos = 0
+    while pos < t_n {
+        if !tc_binder_bounds_cover(want, have, pos) || !tc_binder_bounds_cover(have, want, pos) {
+            let t_tp = sublist_get(t_tps, pos)
+            let i_tp = sublist_get(i_tps, pos)
+            let (line, col, end_col, _) = tc_method_binder_list_span(impl_m)
+            diag_error_span_at_notes("TraitContractGenericMismatch", TRAIT_CONTRACT_906, "`{shown}` declares {tc_binder_bound_shown(t_tp)}, this method declares {tc_binder_bound_shown(i_tp)}", impl_m, line, col, end_col, "the trait method is `{fn_sig_text(trait_m, true)}`", [])
+            return false
+        }
+        pos = pos + 1
+    }
+    true
+}
+
+// Whether each bound of `xs` at `pos` is also in `ys` at `pos`. Bounds are a set: their order
+// in the list does not matter.
+fn tc_binder_bounds_cover(xs: List[MethodBinderBound], ys: List[MethodBinderBound], pos: Int) -> Bool {
+    for x in xs {
+        if x.pos != pos { continue }
+        let mut found = false
+        for y in ys {
+            if y.pos == pos && y.trait_key == x.trait_key && tc_tid_lists_same(x.args, y.args) { found = true }
+        }
+        if !found { return false }
+    }
+    true
+}
+
+fn tc_tid_lists_same(a: List[Int], b: List[Int]) -> Bool {
+    if a.len() != b.len() { return false }
+    let mut i = 0
+    while i < a.len() {
+        if !tc_tid_same_type(a.get(i).unwrap(), b.get(i).unwrap()) { return false }
+        i = i + 1
+    }
+    true
+}
+
+// `U: Display`, or `U` with no bound, as an E0906 message names one binder.
+fn tc_binder_bound_shown(tp: Int) -> Str {
+    let bounds = node_elements(tp)
+    if bounds == -1 || sublist_length(bounds) == 0 { return "`{node_name(tp)}` with no bound" }
+    "`{format_type_param_binder(tp)}`"
+}
+
+fn tc_type_param_count_text(n: Int) -> Str {
+    if n == 1 { "1 type parameter" } else { "{n} type parameters" }
+}
+
+// E0906 for a binder list of another length than the trait method's.
+fn tc_report_binder_count(trait_key: Str, shown: Str, trait_sig: Str, impl_m: Int, t_n: Int, i_n: Int) ! Diag.Report {
+    let (line, col, end_col, closed) = tc_method_binder_list_span(impl_m)
+    if t_n > 0 {
+        diag_error_span_at_notes("TraitContractGenericMismatch", TRAIT_CONTRACT_906, "`{shown}` declares {tc_type_param_count_text(t_n)}, this method declares {i_n}", impl_m, line, col, end_col, "the trait method is `{trait_sig}`", [])
+        return
+    }
+    // The trait method has no binder, so the repair is to delete the impl's list.
+    let i_tps = node_type_params(impl_m)
+    let list_text = type_param_list_text(i_tps)
+    let mut notes = ["`{shown}` is declared as `{trait_sig}`"]
+    let surface = tc_implicit_call_surface(trait_key)
+    if surface != "" {
+        notes.push("a call through `{tc_trait_shown(trait_key)}`, such as {surface}, has no place to write `{tc_binder_names(i_tps).join("`, `")}`")
+    }
+    let body = node_body(impl_m)
+    let in_sig = tc_binders_used_in(impl_m, body, i_tps)
+    let in_body = tc_binders_used_in(body, -1, i_tps)
+    let msg = "method `{node_name(impl_m)}` declares {tc_type_param_count_text(i_n)}, but `{shown}` declares 0"
+    if in_sig.len() > 0 || in_body.len() > 0 {
+        let place = if in_body.len() == 0 { "the signature" } else if in_sig.len() == 0 { "the body" } else { "the signature and the body" }
+        let mut used: List[Str] = []
+        for nm in in_sig { used.push(nm) }
+        for nm in in_body {
+            if !used.contains(nm) { used.push(nm) }
+        }
+        diag_error_span_at_notes("TraitContractGenericMismatch", TRAIT_CONTRACT_906, msg, impl_m, line, col, end_col, "remove `{list_text}`, and the use of `{used.join("`, `")}` in {place}", notes)
+        return
+    }
+    let help = "remove `{list_text}`: `{fn_sig_text(impl_m, false)}`"
+    let before = diag_entry_count()
+    diag_error_span_at_notes("TraitContractGenericMismatch", TRAIT_CONTRACT_906, msg, impl_m, line, col, end_col, help, notes)
+    if closed { tc_attach_fix(before, help, [DiagFixEdit { line: line, col: col, end_line: line, end_col: end_col, text: "" }]) }
+}
+
+// The call a compiler-known trait method gets from syntax that has no place for brackets.
+fn tc_implicit_call_surface(trait_key: Str) -> Str {
+    if !tc_trait_is_compiler_known(trait_key) { return "" }
+    match trait_key {
+        "Eq" => "`a == b`"
+        "Ord" => "`a < b`"
+        "Display" => "a string interpolation"
+        "Hash" => "a `Map` key"
+        "BlockHandler" => "a `with` block"
+        "Closeable" => "a `with` block"
+        _ => ""
+    }
+}
+
+fn tc_binder_names(tparams: Int) -> List[Str] {
+    let mut names: List[Str] = []
+    let mut i = 0
+    while i < sublist_length(tparams) {
+        names.push(node_name(sublist_get(tparams, i)))
+        i = i + 1
+    }
+    names
+}
+
+// The names of `tparams` that the tree at `m` uses, outside the subtree at `skip`: with the
+// method as `m` and its body as `skip`, the uses in its signature and in other binders' bounds.
+fn tc_binders_used_in(m: Int, skip: Int, tparams: Int) -> List[Str] {
+    let names = tc_binder_names(tparams)
+    let mut binders: List[Int] = []
+    let mut i = 0
+    while i < sublist_length(tparams) {
+        binders.push(sublist_get(tparams, i))
+        i = i + 1
+    }
+    let mut used: List[Str] = []
+    let mut stack: List[Int] = [m]
+    while stack.len() > 0 {
+        let n = stack.pop().unwrap()
+        if n < 0 || n == skip { continue }
+        if n != m && !binders.contains(n) {
+            let k = node_kind(n)
+            if k == NodeKind.TypeAnn || k == NodeKind.Ident {
+                let nm = node_name(n)
+                if names.contains(nm) && !used.contains(nm) { used.push(nm) }
+            }
+        }
+        node_push_value_child_ids(n, stack)
+        node_push_spell_child_ids(n, stack)
+    }
+    used
+}
+
+// The span of a method's binder list, `[` through `]`, or of its name when it has no list.
+// The flag is false when the list runs past its first line: the span then stops at the line's
+// end, and deleting it would not delete the list.
+fn tc_method_binder_list_span(m: Int) -> (Int, Int, Int, Bool) {
+    let name = node_name(m)
+    let (line, col) = nr_decl_name_at(ModuleDeclName { namespace: "value", name: name, decl: m, binder: -1 })
+    let text = diag_source_line(diag_file_for_node(m), line)
+    let mut open = col - 1 + name.byte_len()
+    while open < text.byte_len() && (text.byte_at(open).to_int() == 32 || text.byte_at(open).to_int() == 9) { open = open + 1 }
+    if open >= text.byte_len() || text.byte_at(open).to_int() != 91 { return (line, col, col + name.byte_len(), true) }
+    let mut depth = 0
+    let mut j = open
+    while j < text.byte_len() {
+        let c = text.byte_at(j).to_int()
+        if c == 91 { depth = depth + 1 }
+        if c == 93 {
+            depth = depth - 1
+            if depth == 0 { return (line, open + 1, j + 2, true) }
+        }
+        j = j + 1
+    }
+    (line, open + 1, text.byte_len() + 1, false)
 }
 
 // Same contract compare, but the impl-side tid is supplied already resolved. The
@@ -17288,13 +17614,15 @@ fn validate_trait_impls_in_own_modules(program: Int) ! TypeCheck.Register, TypeC
                             if impl_params_sl != -1 {
                                 impl_pcount = sublist_length(impl_params_sl)
                             }
+                            let binders_match = tc_check_method_binders(si, impl_m, impl_recv_tid, im, trait_arg_arity_ok != 0)
                             if trait_pcount != impl_pcount {
                                 diag_error_at("TraitContractWrongArity", TRAIT_CONTRACT_901, "method `{expected_method}` in impl {tc_trait_shown(trait_name)} for {impl_type} has {impl_pcount} params, expected {trait_pcount}", impl_m, "trait requires {trait_pcount} parameters (including self)")
-                            } else if trait_arg_arity_ok != 0 {
+                            } else if trait_arg_arity_ok != 0 && binders_match {
                                 // Skipped when the impl's trait-arg arity is
                                 // wrong (E0910 already reported): subst_trait_type_tid
                                 // would otherwise leave an unbound trait tparam
-                                // typevar in the expected type.
+                                // typevar in the expected type. Skipped after E0906 too,
+                                // which names the cause the param compare would misname.
                                 // Check param types
                                 let tp_start = tmsig.params_start
                                 let mut pi = 0
@@ -17868,6 +18196,7 @@ pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report, IO.Eprint {
     // A trait name is read from the first signature on, so every trait is filed under its
     // identity, and every name that refers to one knows its file, before anything registers.
     tc_stamp_trait_ref_modules(program)
+    tc_check_duplicate_type_params(program)
     let all_traits_sl = node_arms(program)
     if all_traits_sl != -1 { tc_file_trait_keys(all_traits_sl, tc_prelude_trait_names(all_traits_sl)) }
 
@@ -20788,6 +21117,122 @@ fn nr_import_list_close(last: Int) -> (Int, Int) {
         from = 0
     }
     (node_line(last), node_col(last))
+}
+
+// No two type binders in scope share a name (§3.6): those of a declaration's own list, and for
+// a method those of its impl or trait. A trait or impl is checked once with all its methods.
+fn tc_check_duplicate_type_params(program: Int) ! Diag.Report {
+    let fns = node_params(program)
+    if fns != -1 {
+        for i in 0..sublist_length(fns) {
+            tc_check_binder_list(node_type_params(sublist_get(fns, i)))
+        }
+    }
+    let traits = node_arms(program)
+    if traits != -1 {
+        for i in 0..sublist_length(traits) {
+            let tr = sublist_get(traits, i)
+            tc_check_binders_with_methods(node_type_params(tr), node_methods(tr), "trait `{node_name(tr)}{type_param_list_text(node_type_params(tr))}`", "trait")
+        }
+    }
+    let impls = node_methods(program)
+    if impls != -1 {
+        for i in 0..sublist_length(impls) {
+            let im = sublist_get(impls, i)
+            tc_check_binders_with_methods(node_impl_binders(im), node_methods(im), "`impl{type_param_list_text(node_impl_binders(im))}`", "impl")
+        }
+    }
+}
+
+fn tc_check_binders_with_methods(outer: Int, methods: Int, outer_shown: Str, outer_kind: Str) ! Diag.Report {
+    tc_check_binder_list(outer)
+    if methods == -1 { return }
+    for i in 0..sublist_length(methods) {
+        let m = sublist_get(methods, i)
+        tc_check_binder_list(node_type_params(m))
+        tc_check_method_repeats_outer(m, outer, outer_shown, outer_kind)
+    }
+}
+
+fn tc_check_binder_list(tparams: Int) ! Diag.Report {
+    if tparams == -1 { return }
+    let mut firsts: Map[Str, Int] = Map()
+    for i in 0..sublist_length(tparams) {
+        let tp = sublist_get(tparams, i)
+        let name = node_name(tp)
+        match firsts.get(name) {
+            Some(first) => {
+                diag_error_span_at_notes("DuplicateTypeParam", DUPLICATE_TYPE_PARAM,
+                    "`{name}` is already a type parameter here",
+                    tp, node_line(tp), node_col(tp), node_col(tp) + name.byte_len(),
+                    "rename it",
+                    ["`{name}` is first declared at {diag_file_for_node(first)}:{node_line(first)}:{node_col(first)}"])
+            }
+            None => firsts.insert(name, tp)
+        }
+    }
+}
+
+fn tc_check_method_repeats_outer(m: Int, outer: Int, outer_shown: Str, outer_kind: Str) ! Diag.Report {
+    let own = node_type_params(m)
+    if own == -1 || outer == -1 { return }
+    let mut taken: Map[Str, Int] = Map()
+    for i in 0..sublist_length(own) {
+        let tp = sublist_get(own, i)
+        let name = node_name(tp)
+        // A second binder of one name in the list has its own report from tc_check_binder_list.
+        if tc_binder_named(own, name) != tp { continue }
+        let first = tc_binder_named(outer, name)
+        if first == -1 { continue }
+        let note = "`{name}` is declared by {outer_shown} at {diag_file_for_node(first)}:{node_line(first)}:{node_col(first)}"
+        let msg = "`{name}` is already a type parameter of this {outer_kind}"
+        let span_end = node_col(tp) + name.byte_len()
+        // A rename of `T` in `fn m[T, T]` would show both binders renamed, so that list gets
+        // the help with no example.
+        if tc_binder_named_after(own, name, i) {
+            diag_error_span_at_notes("DuplicateTypeParam", DUPLICATE_TYPE_PARAM, msg, tp, node_line(tp), node_col(tp), span_end, "rename it", [note])
+            continue
+        }
+        if taken.len() == 0 {
+            for n in tc_binder_names(outer) { taken.insert(n, 1) }
+            for n in tc_binder_names(own) { taken.insert(n, 1) }
+        }
+        let mut renames: Map[Str, Str] = Map()
+        renames.insert(name, tc_fresh_binder_name(taken))
+        diag_error_span_at_notes("DuplicateTypeParam", DUPLICATE_TYPE_PARAM, msg, tp, node_line(tp), node_col(tp), span_end,
+            "rename it, as in `{fn_sig_text_renamed(m, true, renames)}`", [note])
+    }
+}
+
+// Whether a binder after position `i` of `tparams` is named `name`.
+fn tc_binder_named_after(tparams: Int, name: Str, i: Int) -> Bool {
+    for j in (i + 1)..sublist_length(tparams) {
+        if node_name(sublist_get(tparams, j)) == name { return true }
+    }
+    false
+}
+
+fn tc_binder_named(tparams: Int, name: Str) -> Int {
+    for i in 0..sublist_length(tparams) {
+        let tp = sublist_get(tparams, i)
+        if node_name(tp) == name { return tp }
+    }
+    -1
+}
+
+// A binder name for a rename help: not a binder in `taken`, and not a name a loaded module
+// declares, since a binder of that name would hide the type.
+fn tc_fresh_binder_name(taken: Map[Str, Int]) -> Str {
+    for c in ["U", "V", "W", "X", "Y", "Z", "A", "B", "C", "D", "E", "F", "G", "H"] {
+        if tc_binder_name_free(taken, c) { return c }
+    }
+    let mut n = 1
+    while !tc_binder_name_free(taken, "U{n}") { n = n + 1 }
+    "U{n}"
+}
+
+fn tc_binder_name_free(taken: Map[Str, Int], name: Str) -> Bool {
+    !taken.contains_key(name) && !nr_decls_by_name.contains_key(name) && is_primitive_type(name) == 0
 }
 
 // Module scope has two namespaces (sections/02_syntax.md §2.12.1): values (`let`, `let mut`,
@@ -25034,12 +25479,16 @@ fn tc_refuse_list_scan(node: Int, obj_t: Int, need: List[Int], method: Str) -> I
         let sep = if fix.contains("\n") { "\n" } else { "; " }
         help = "{help}{sep}{fix}"
     }
+    tc_type_args_unresolved.insert(node, 1)
     diag_error_at("UnresolvedMethod", UNRESOLVED_METHOD,
         "unresolved method `.{method}` on type {type_to_str(obj_t)}", node, help)
     tc_error_recovery_tid()
 }
 
+// A call with no method behind it has no binders for its list to count, so the list gets no
+// second report.
 fn tc_report_unresolved_method(node: Int, recv: Int, tname: Str, method: Str) ! Diag.Report {
+    tc_type_args_unresolved.insert(node, 1)
     let k = type_kind(recv)
     if k == TyKind.Bool && method == "to_int" { return tc_report_bool_to_int(node) }
     tc_error_naming_types("UnresolvedMethod", UNRESOLVED_METHOD, "unresolved method `.{method}` on type {tname}", node, tc_unresolved_method_help(k, tname, method, node), [recv])
@@ -25048,6 +25497,7 @@ fn tc_report_unresolved_method(node: Int, recv: Int, tname: Str, method: Str) ! 
 // A static call names the type's namespace, so the help offers only a static that the same head
 // would answer, never an instance method or a builtin of another type.
 fn tc_report_unresolved_static(node: Int, recv: Int, head: StaticHead, written: Str, method: Str) ! Diag.Report {
+    tc_type_args_unresolved.insert(node, 1)
     let near = nearest_name(method, tc_static_names(head))
     let help = if near != "" {
         "did you mean `{written}.{near}`?"
@@ -26866,7 +27316,7 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
             let fn_text = if node_kind(obj) == NodeKind.Ident { node_name(obj) } else { "f" }
             tc_bracket_sites.insert(node, BRACKET_TYPE_ARGS)
             tc_errors.push("type arguments with no call")
-            diag_error_at("CallSiteTypeArgs", CALL_SITE_TYPE_ARGS, "type argument `[{ty_name}]` has no call to apply to", node, "type arguments belong to a call, as in `{fn_text}[{ty_name}]()`; to keep the function as a value, annotate the binding with its function type")
+            diag_error_at("TypeArgsWithoutCall", TYPE_ARGS_WITHOUT_CALL, "type argument `[{ty_name}]` has no call to apply to", node, "type arguments belong to a call, as in `{fn_text}[{ty_name}]()`; to keep the function as a value, annotate the binding with its function type")
             nr_check_node(obj)
             return
         }
@@ -28687,6 +29137,37 @@ fn tc_trait_method_entry(tr: Str, method: Str) -> Option[TraitMethodSigEntry] {
         if tm.trait_name == tr && tm.method == method { return Some(tm) }
     }
     None
+}
+
+// A call that a bound answers: `t.m(..)` with `T: Tr`, or `Tr.m(t, ..)`. The trait method's
+// own binders are the call's to fix, by a written list or by the arguments, as on a concrete
+// receiver; `binds` holds `Self` and the trait's arguments. `self_offset` is 1 when the receiver
+// is not among `args_sl`.
+fn tc_bound_method_call(shown: Str, tmsig_idx: Int, node: Int, args_sl: Int, self_offset: Int, binds: Map[Str, Int]) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    let tm = tc_tmsig_pool.get(tmsig_idx).unwrap()
+    let sig = tc_call_view_sig(tm.sig)
+    let decl = fnsig_pool.get(sig).unwrap().decl
+    if tc_decl_has_own_type_params(decl) == 0 {
+        if self_offset == 0 {
+            let _ = tc_check_qualified_trait_args(shown, sig, args_sl, node, binds)
+        } else {
+            let _ = check_arg_shapes_with_binds(shown, sig, args_sl, 1, node, binds)
+        }
+        return substitute_typevar_tid(tm.ret_tid, binds)
+    }
+    if node_type_params(node) != -1 { return tc_call_with_type_args(shown, sig, node, self_offset, binds) }
+    let mut tids = if self_offset == 0 {
+        tc_check_qualified_trait_args(shown, sig, args_sl, node, binds)
+    } else {
+        check_arg_shapes_with_binds(shown, sig, args_sl, 1, node, binds)
+    }
+    let mut mbinds = build_typevar_binds(sig, tids, self_offset)
+    for (k, v) in binds {
+        if !mbinds.contains_key(k) { mbinds.insert(k, v) }
+    }
+    tc_check_bounds_for_binds(sig, mbinds, node)
+    tids = tc_seed_closure_args_with_binds(sig, args_sl, tids, self_offset, mbinds)
+    substitute_typevar_tid(instantiate_return_type(sig, tids, node, self_offset), binds)
 }
 
 // The arguments of `Tr.m(x, ..)`: the receiver is parameter 0 (`self`), so the declared
@@ -31912,9 +32393,19 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                         // binds must exist before this call: a bare-literal argument whose
                         // static param type is the impl's own Typevar(T) needs the RECEIVER's
                         // concrete element type as its hint, not the raw unsubstituted binder.
-                        let _ = check_arg_shapes_with_binds("List.{method}", sig, args_sl, 1, node, binds)
-                        let raw_ret = fnsig_pool.get(sig).unwrap().ret
-                        return substitute_typevar_tid(raw_ret, binds)
+                        // Brackets fill the method's own binders only; the receiver fills `T`.
+                        if node_type_params(node) != -1 {
+                            return tc_call_with_type_args("List.{method}", sig, node, 1, binds)
+                        }
+                        let mut ltids = check_arg_shapes_with_binds("List.{method}", sig, args_sl, 1, node, binds)
+                        let lfs = fnsig_pool.get(sig).unwrap()
+                        if tc_decl_has_own_type_params(lfs.decl) != 0 {
+                            let mbinds = build_typevar_binds(sig, ltids, 1)
+                            tc_check_bounds_for_binds(sig, mbinds, node)
+                            ltids = tc_seed_closure_args_with_binds(sig, args_sl, ltids, 1, mbinds)
+                            return substitute_typevar_tid(instantiate_return_type(sig, ltids, node, 1), binds)
+                        }
+                        return substitute_typevar_tid(lfs.ret, binds)
                     }
                 }
             }
@@ -32427,8 +32918,7 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                     let bound_args = tc_bound_trait_arg_tids(tc_tid_binder(obj_t), tm.trait_name)
                     let binds = tc_bound_call_binds(obj_t, found, bound_args)
                     if bound_args.len() > 0 { tc_method_calls.bound_args.insert(node, bound_args) }
-                    let _ = check_arg_shapes_with_binds("{tc_trait_shown(tm.trait_name)}.{method}", tc_call_view_sig(tm.sig), args_sl, 1, node, binds)
-                    return substitute_typevar_tid(tm.ret_tid, binds)
+                    return tc_bound_method_call("{tc_trait_shown(tm.trait_name)}.{method}", found, node, args_sl, 1, binds)
                 }
                 // The bound is the whole licence, so a method none of its traits declares is
                 // refused here, in the generic body, not at each instance. Only a guarantee
@@ -32922,8 +33412,7 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                                 let qt_bound_args = tc_bound_trait_arg_tids(tc_tid_binder(qt_recv), qt_trait)
                                 let qtm_binds = tc_bound_call_binds(qt_recv, qv, qt_bound_args)
                                 if qt_bound_args.len() > 0 { tc_method_calls.bound_args.insert(node, qt_bound_args) }
-                                let _ = tc_check_qualified_trait_args("{obj_name}.{method}", qtm.sig, qt_args, node, qtm_binds)
-                                return substitute_typevar_tid(qtm.ret_tid, qtm_binds)
+                                return tc_bound_method_call("{obj_name}.{method}", qv, node, qt_args, 0, qtm_binds)
                             }
                             qv = qv + 1
                         }
@@ -32955,9 +33444,13 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                         for (k, v) in tc_self_binds(qt_recv) {
                             if !qt_ibinds.contains_key(k) { qt_ibinds.insert(k, v) }
                         }
-                        let qt_tids = tc_check_qualified_trait_args("{obj_name}.{method}", qt_sig, qt_args, node, qt_ibinds)
                         nr_note_call_decl(node, qt_fs.decl)
+                        if node_type_params(node) != -1 {
+                            return tc_call_with_type_args("{obj_name}.{method}", qt_sig, node, 0, qt_ibinds)
+                        }
+                        let qt_tids = tc_check_qualified_trait_args("{obj_name}.{method}", qt_sig, qt_args, node, qt_ibinds)
                         if tc_decl_has_own_type_params(qt_fs.decl) != 0 {
+                            tc_check_bounds_for_binds(qt_sig, build_typevar_binds(qt_sig, qt_tids, 0), node)
                             return substitute_typevar_tid(instantiate_return_type(qt_sig, qt_tids, node, 0), qt_ibinds)
                         }
                         return substitute_typevar_tid(qt_fs.ret, qt_ibinds)
@@ -34553,13 +35046,50 @@ fn tc_flush_index_sites() ! Diag.Report {
 // Marks the type-argument list at `call_node` as read, and reports it when the callee
 // declares a different count. Returns 1 when the list can bind.
 fn tc_claim_type_args(call_node: Int, declared: Int, callee: Str, help: Str) -> Int ! Diag.Report {
+    tc_claim_type_args_noted(call_node, declared, callee, help, [])
+}
+
+// As tc_claim_type_args, with notes on a wrong count.
+fn tc_claim_type_args_noted(call_node: Int, declared: Int, callee: Str, help: Str, notes: List[Str]) -> Int ! Diag.Report {
     tc_type_args_claimed.insert(call_node, 1)
     if (tc_type_args_unresolved.get(call_node) ?? 0) != 0 { return 0 }
     let given = sublist_length(node_type_params(call_node))
     if given == declared { return 1 }
     tc_errors.push("type argument count")
-    diag_error_at("CallSiteTypeArgs", CALL_SITE_TYPE_ARGS, "`{callee}` expects {declared} type argument(s), {given} given", call_node, help)
+    diag_error_at_notes("TypeArgArity", TYPE_ARG_ARITY, "`{callee}` {tc_type_arg_count_text(declared, given)}", call_node, help, notes)
     0
+}
+
+fn tc_type_arg_count_text(declared: Int, given: Int) -> Str {
+    let takes = if declared == 1 { "takes 1 type argument" } else { "takes {declared} type arguments" }
+    let was = if given == 1 { "was" } else { "were" }
+    "{takes}, {given} {was} given"
+}
+
+// The binders of the impl that declares the method `decl`, which the receiver fills.
+fn tc_impl_binder_notes(decl: Int) -> List[Str] {
+    let mut notes: List[Str] = []
+    if decl < 0 { return notes }
+    let mut im = tc_method_block.get(decl) ?? -1
+    // A List poly impl's methods are not in tc_method_block; the impl node holds them.
+    if im == -1 {
+        for (_, pim) in tc_poly_list_impl_node {
+            let ms = node_methods(pim)
+            let mut mi = 0
+            while im == -1 && ms != -1 && mi < sublist_length(ms) {
+                if sublist_get(ms, mi) == decl { im = pim }
+                mi = mi + 1
+            }
+        }
+    }
+    if im == -1 || node_kind(im) != NodeKind.ImplBlock { return notes }
+    let bs = node_impl_binders(im)
+    let mut bi = 0
+    while bs != -1 && bi < sublist_length(bs) {
+        notes.push("`{node_name(sublist_get(bs, bi))}` of the impl comes from the receiver and is not written")
+        bi = bi + 1
+    }
+    notes
 }
 
 // The repair for a wrong count at a callee that is a declaration.
@@ -34616,15 +35146,22 @@ fn tc_call_with_type_args(callee: Str, sig: Int, call_node: Int, self_offset: In
     let fs = fnsig_pool.get(sig).unwrap()
     let args_sl = node_args(call_node)
     let declared = tc_own_type_param_count(fs.decl)
-    if tc_claim_type_args(call_node, declared, callee, tc_type_arity_help(callee, declared)) == 0 {
-        let _ = check_arg_shapes_with_binds(callee, sig, args_sl, self_offset, call_node, outer)
+    let given = sublist_length(node_type_params(call_node))
+    let notes = if given != declared && self_offset == 1 { tc_impl_binder_notes(fs.decl) } else { [] }
+    // A method's count is of its own binders, whatever the receiver or qualifier resolved
+    // to, so the message names the method alone.
+    let shown = if tc_fn_decl_takes_self(fs.decl) && node_kind(call_node) == NodeKind.MethodCall { node_method(call_node) } else { callee }
+    // A trait-qualified call counts its receiver among the arguments, and its count error says so.
+    let qualified = self_offset == 0 && tc_calls.trait_heads.contains_key(call_node)
+    if tc_claim_type_args_noted(call_node, declared, shown, tc_type_arity_help(callee, declared), notes) == 0 {
+        let _ = if qualified { tc_check_qualified_trait_args(callee, sig, args_sl, call_node, outer) } else { check_arg_shapes_with_binds(callee, sig, args_sl, self_offset, call_node, outer) }
         return tc_error_recovery_tid()
     }
     let mut binds = tc_explicit_type_binds(fs.decl, call_node)
     for (k, v) in outer {
         if !binds.contains_key(k) { binds.insert(k, v) }
     }
-    let arg_tids = check_arg_shapes_with_binds(callee, sig, args_sl, self_offset, call_node, binds)
+    let arg_tids = if qualified { tc_check_qualified_trait_args(callee, sig, args_sl, call_node, binds) } else { check_arg_shapes_with_binds(callee, sig, args_sl, self_offset, call_node, binds) }
     tc_check_bounds_for_binds(sig, binds, call_node)
     let _ = tc_seed_closure_args_with_binds(sig, args_sl, arg_tids, self_offset, binds)
     substitute_typevar_tid(fs.ret, binds)
@@ -34732,10 +35269,11 @@ fn tc_report_unclaimed_type_args(node: Int) ! Diag.Report {
     let given = sublist_length(node_type_params(node))
     tc_errors.push("type arguments nothing reads")
     if k == NodeKind.Call && node_kind(node_left(node)) != NodeKind.Ident {
-        diag_error_at("CallSiteTypeArgs", CALL_SITE_TYPE_ARGS, "a function value expects 0 type argument(s), {given} given", node, ELEMENT_ACCESS_HELP)
+        diag_error_at("TypeArgArity", TYPE_ARG_ARITY, "this value {tc_type_arg_count_text(0, given)}", node, ELEMENT_ACCESS_HELP)
         return
     }
-    diag_error_at("CallSiteTypeArgs", CALL_SITE_TYPE_ARGS, "this call expects 0 type argument(s), {given} given", node, "remove the brackets; this call's types come from its arguments and from where its result goes")
+    let shown = if k == NodeKind.MethodCall { node_method(node) } else { node_name(node_left(node)) }
+    diag_error_at("TypeArgArity", TYPE_ARG_ARITY, "`{shown}` {tc_type_arg_count_text(0, given)}", node, "remove the brackets; this call's types come from its arguments and from where its result goes")
 }
 
 // A consumed `if` the value-context walk reached, checked once both branches were walked in

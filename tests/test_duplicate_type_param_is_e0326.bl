@@ -1,0 +1,187 @@
+// No two type binders in scope share a name: a repeat in one list, a method binder that repeats
+// an impl binder, and a method binder that repeats a trait binder are each E0326 at the second
+// binder, with a note at the first (sections/03_types.md §3.6 *Method Type Parameters*).
+
+import compile_test_helpers
+import compile_test_helpers.{check_via_cli}
+import std.process.{ChildEnd}
+
+fn error_lines(out: Str) -> List[Str] {
+    let mut found: List[Str] = []
+    for line in out.split("\n") {
+        if line.contains("\"severity\":\"error\"") || line.contains("\"severity\":\"ice\"") {
+            found.push(line)
+        }
+    }
+    found
+}
+
+// The check must report one error, E0326, and nothing else.
+fn only_e0326(src: Str, tag: Str) -> Str ! FS.Delete, FS.Read, FS.Write, Process.Spawn, Env.Read, IO.Print {
+    let out = check_via_cli(src, "{tag}_{getpid()}")
+    let errs = error_lines(out)
+    if errs.len() != 1 { io.println("FAIL: {tag}: {out}") }
+    assert_eq(errs.len(), 1)
+    let e = errs.get(0).unwrap()
+    assert(e.contains("\"code\":\"E0326\""), e)
+    assert(!e.contains("\"fix\":"), e)
+    e
+}
+
+test "a name repeated in one function's list is E0326 at the second binder" {
+    let e = only_e0326(#"fn f[T, T](a: T) -> T { a }
+
+fn main() { }
+"#, "dtp_fn_list")
+    assert(e.contains("`T` is already a type parameter here"), e)
+    assert(e.contains("\"line\":1,\"col\":9"), e)
+    assert(e.contains(":1:6"), e)
+    assert(e.contains("rename it"), e)
+}
+
+// The span and the note point at each binder's name, and a bound after the first binder does
+// not move either column.
+test "E0326 points at the binder name after a bound" {
+    let e = only_e0326(#"fn g[A: Display, A](x: A) -> Int { 1 }
+
+fn main() { }
+"#, "dtp_after_bound")
+    assert(e.contains("\"line\":1,\"col\":18"), e)
+    assert(e.contains(":1:6"), e)
+}
+
+test "a method binder that repeats an impl binder is E0326" {
+    let e = only_e0326(#"trait Wrap {
+    fn wrap[U](self, u: U) -> Int
+}
+
+type Box[T] { v: T }
+
+impl[T] Wrap for Box[T] {
+    fn wrap[T](self, u: T) -> Int { 1 }
+}
+
+fn main() { }
+"#, "dtp_impl")
+    assert(e.contains("`T` is already a type parameter of this impl"), e)
+    assert(e.contains("`T` is declared by `impl[T]` at"), e)
+    assert(e.contains("rename it, as in `fn wrap[U](self, u: U) -> Int`"), e)
+}
+
+test "a method binder that repeats a trait binder is E0326" {
+    let e = only_e0326(#"trait Tr[T] {
+    fn m[T](self, t: T) -> Int
+}
+
+fn main() { }
+"#, "dtp_trait")
+    assert(e.contains("`T` is already a type parameter of this trait"), e)
+    assert(e.contains("`T` is declared by trait `Tr[T]` at"), e)
+}
+
+test "the rename help renames the binder in another binder's bound" {
+    let e = only_e0326(#"trait Conv[A] {
+    fn c(self) -> A
+}
+
+trait Mk {
+    fn m[X, W: Conv[X]](self, w: W) -> Int
+}
+
+type Box[T] { v: T }
+
+impl[T] Mk for Box[T] {
+    fn m[T, W: Conv[T]](self, w: W) -> Int { 1 }
+}
+
+fn main() { }
+"#, "dtp_rename_bound")
+    assert(e.contains("rename it, as in `fn m[U, W: Conv[U]](self, w: W) -> Int`"), e)
+}
+
+test "the rename help skips a name that a type of the program has" {
+    let e = only_e0326(#"type U { n: Int }
+
+trait Wrap {
+    fn wrap[A](self, a: A) -> U
+}
+
+type Box[T] { v: T }
+
+impl[T] Wrap for Box[T] {
+    fn wrap[T](self, a: T) -> U { U { n: 1 } }
+}
+
+fn main() { }
+"#, "dtp_fresh_skips_type")
+    assert(e.contains("rename it, as in `fn wrap[V](self, a: V) -> U`"), e)
+}
+
+// One rename cannot fix `fn m[T, T]`, so the binder that repeats the trait's gets the help with
+// no example, and the second `T` gets one report, not two.
+test "a list that repeats a name and a trait binder gets one report per binder" {
+    let out = check_via_cli(#"trait Tr[T] {
+    fn m[T, T](self) -> Int
+}
+
+fn main() { }
+"#, "dtp_twice_{getpid()}")
+    let errs = error_lines(out)
+    if errs.len() != 2 { io.println("FAIL: dtp_twice: {out}") }
+    assert_eq(errs.len(), 2)
+    for e in errs {
+        assert(e.contains("\"code\":\"E0326\""), e)
+        assert(!e.contains("as in `"), e)
+    }
+}
+
+// A receiver with a repeated binder is not compiled yet (E0908), so this row checks only that
+// E0326 is among the errors.
+test "a name repeated in an impl's own list is E0326" {
+    let out = check_via_cli(#"trait Sh {
+    fn sh(self) -> Int
+}
+
+type Two[A, B] { a: A, b: B }
+
+impl[T, T] Sh for Two[T, T] {
+    fn sh(self) -> Int { 1 }
+}
+
+fn main() { }
+"#, "dtp_impl_list_{getpid()}")
+    let mut found = false
+    for e in error_lines(out) {
+        if e.contains("\"code\":\"E0326\"") && e.contains("`T` is already a type parameter here") { found = true }
+    }
+    if !found { io.println("FAIL: dtp_impl_list: {out}") }
+    assert(found)
+}
+
+test "distinct names in every scope compile and run" {
+    let r = compile_test_helpers.compile_and_run(#"trait Tr[T] {
+    fn m[U](self, t: T, u: U) -> T
+}
+
+type A { n: Int }
+
+impl Tr[Int] for A {
+    fn m[U](self, t: Int, u: U) -> Int { t + self.n }
+}
+
+fn f[T, U](a: T, b: U) -> T { a }
+
+fn main() ! IO {
+    io.println("{f(1, "x")} {A { n: 2 }.m(3, true)}")
+}
+"#, "_dtp_distinct")
+    if r.exit_code != 0 { io.println("FAIL: {r.err_out}") }
+    assert_eq(r.exit_code, 0)
+    assert_eq(r.out.trim(), "1 5")
+}
+
+test "blink explain E0326 prints the rule" {
+    let r = process.run("sh", ["-c", "timeout 60 build/blink explain E0326"]).unwrap()
+    assert_eq(r.end, ChildEnd.Exited(0))
+    assert(r.out.contains("DuplicateTypeParam"), r.out)
+}

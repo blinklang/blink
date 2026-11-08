@@ -1,0 +1,111 @@
+// An impl method that adds a binder list to a trait method with none is E0906, and the fix
+// deletes the list when no other place in the method uses its binders (sections/03_types.md
+// §3.6 *Method Type Parameters*). A binder that the body uses gets a help only, so `blink fix`
+// leaves that impl as it is. The commands run in a fresh temporary directory, since the test
+// tree itself sits inside a project.
+
+import std.process.{ProcessResult, ChildEnd}
+
+fn sh(cmd: Str) -> ProcessResult ! Process.Spawn {
+    process.run("sh", ["-c", cmd]).unwrap()
+}
+
+fn blink_in(dir: Str, args: Str) -> ProcessResult ! Process.Spawn {
+    sh("B=$(pwd)/build/blink; cd {dir} && timeout 120 $B {args}")
+}
+
+test "blink fix deletes an unused binder list on Eq.eq and the program runs" {
+    let dir = sh("mktemp -d /tmp/blink_fix_binder.XXXXXX").out.trim()
+    let src = #"type P { n: Int }
+
+impl Eq for P {
+    fn eq[U](self, o: P) -> Bool { self.n == o.n }
+}
+
+fn main() ! IO {
+    let a = P { n: 1 }
+    io.println("{a == a}")
+}
+"#
+    let want = #"type P { n: Int }
+
+impl Eq for P {
+    fn eq(self, o: P) -> Bool { self.n == o.n }
+}
+
+fn main() ! IO {
+    let a = P { n: 1 }
+    io.println("{a == a}")
+}
+"#
+    fs.write("{dir}/eq_binder.bl", src).unwrap()
+    let r = blink_in(dir, "fix eq_binder.bl")
+    let got = fs.read("{dir}/eq_binder.bl").unwrap()
+    if got != want { io.println("FAIL: got ({r.end}):\n{got}\nstdout:\n{r.out}\nstderr:\n{r.err_out}") }
+    assert_eq(got, want)
+    let run = blink_in(dir, "run eq_binder.bl")
+    assert_eq(run.out.trim(), "true")
+    let _ = sh("rm -rf {dir}")
+}
+
+test "blink fix leaves a binder list that the body uses" {
+    let dir = sh("mktemp -d /tmp/blink_fix_binder_used.XXXXXX").out.trim()
+    let src = #"type Q { n: Int }
+
+impl Eq for Q {
+    fn eq[U](self, o: Q) -> Bool { let xs: List[U] = []  xs.len() == o.n - self.n }
+}
+
+fn main() { }
+"#
+    fs.write("{dir}/eq_binder_used.bl", src).unwrap()
+    let r = blink_in(dir, "fix eq_binder_used.bl")
+    let got = fs.read("{dir}/eq_binder_used.bl").unwrap()
+    assert_eq(got, src)
+    // The check must still run and report the list, or an unchanged file proves nothing.
+    assert(r.out.concat(r.err_out).contains("error[TraitContractGenericMismatch]"), r.out.concat(r.err_out))
+    let _ = sh("rm -rf {dir}")
+}
+
+test "blink fix deletes a binder list written after a space" {
+    let dir = sh("mktemp -d /tmp/blink_fix_binder_space.XXXXXX").out.trim()
+    let src = #"type P { n: Int }
+
+impl Eq for P {
+    fn eq [U](self, o: P) -> Bool { self.n == o.n }
+}
+
+fn main() ! IO {
+    let a = P { n: 1 }
+    io.println("{a == a}")
+}
+"#
+    fs.write("{dir}/eq_binder_space.bl", src).unwrap()
+    let r = blink_in(dir, "fix eq_binder_space.bl")
+    let got = fs.read("{dir}/eq_binder_space.bl").unwrap()
+    if !got.contains("    fn eq (self, o: P) -> Bool") { io.println("FAIL: got ({r.end}):\n{got}\nstderr:\n{r.err_out}") }
+    assert(got.contains("    fn eq (self, o: P) -> Bool"), got)
+    let run = blink_in(dir, "run eq_binder_space.bl")
+    assert_eq(run.out.trim(), "true")
+    let _ = sh("rm -rf {dir}")
+}
+
+// Deleting only the first line of the list would leave a file that does not parse.
+test "blink fix leaves a binder list that runs over two lines" {
+    let dir = sh("mktemp -d /tmp/blink_fix_binder_lines.XXXXXX").out.trim()
+    let src = #"type B { n: Int }
+
+impl Eq for B {
+    fn eq[U,
+          V](self, o: B) -> Bool { true }
+}
+
+fn main() { }
+"#
+    fs.write("{dir}/eq_binder_lines.bl", src).unwrap()
+    let r = blink_in(dir, "fix eq_binder_lines.bl")
+    let got = fs.read("{dir}/eq_binder_lines.bl").unwrap()
+    assert_eq(got, src)
+    assert(r.out.concat(r.err_out).contains("error[TraitContractGenericMismatch]"), r.out.concat(r.err_out))
+    let _ = sh("rm -rf {dir}")
+}

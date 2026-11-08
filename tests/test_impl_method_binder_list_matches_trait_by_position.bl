@@ -1,0 +1,319 @@
+// An impl method repeats the binder list of its trait method: the same count, and at each
+// position the same bounds. The names may differ (sections/03_types.md §3.6 *Method Type
+// Parameters*). A list that does not match is E0906 alone, with no E0902 or E0903 for the same
+// fault.
+
+import compile_test_helpers
+import compile_test_helpers.{check_via_cli}
+
+fn expect_runs_printing(src: Str, tag: Str, want: Str) ! IO, FS.Delete, FS.Read, FS.Write, Process.Spawn, Env.Read {
+    let r = compile_test_helpers.compile_and_run(src, tag)
+    if r.exit_code != 0 || r.out.trim() != want {
+        io.println("FAIL: {tag} exit={r.exit_code} out={r.out} err={r.err_out}")
+    }
+    assert(r.exit_code == 0)
+    assert(r.out.trim() == want)
+}
+
+fn error_lines(out: Str) -> List[Str] {
+    let mut found: List[Str] = []
+    for line in out.split("\n") {
+        if line.contains("\"severity\":\"error\"") || line.contains("\"severity\":\"ice\"") {
+            found.push(line)
+        }
+    }
+    found
+}
+
+// The check must report one error, E0906, and nothing else.
+fn only_e0906(src: Str, tag: Str) -> Str ! FS.Delete, FS.Read, FS.Write, Process.Spawn, Env.Read, IO.Print {
+    let out = check_via_cli(src, "{tag}_{getpid()}")
+    let errs = error_lines(out)
+    if errs.len() != 1 { io.println("FAIL: {tag}: {out}") }
+    assert_eq(errs.len(), 1)
+    let e = errs.get(0).unwrap()
+    assert(e.contains("\"code\":\"E0906\""), e)
+    e
+}
+
+test "an impl binder with another name matches the trait binder at its position" {
+    expect_runs_printing(#"trait Conv {
+    fn conv[U: Display](self, u: U) -> Str
+}
+
+type A { n: Int }
+
+impl Conv for A {
+    fn conv[V: Display](self, v: V) -> Str { "a{v}" }
+}
+
+fn through_bound[T: Conv](t: T) -> Str { t.conv(true) }
+
+fn main() ! IO {
+    let a = A { n: 1 }
+    io.println("{a.conv(1)} {a.conv[Str]("s")} {Conv.conv(a, 2)} {through_bound(a)}")
+}
+"#, "_mb_rename_runs", "a1 as a2 atrue")
+}
+
+test "two renamed binders keep their order" {
+    expect_runs_printing(#"trait Two {
+    fn two[U, W](self, u: U, w: W) -> W
+}
+
+type A { n: Int }
+
+impl Two for A {
+    fn two[X, Y](self, x: X, y: Y) -> Y { y }
+}
+
+fn main() ! IO {
+    let a = A { n: 1 }
+    io.println("{a.two(1, "w")} {a.two[Str, Int]("u", 7)}")
+}
+"#, "_mb_rename_two_runs", "w 7")
+}
+
+test "a binder whose bound is missing is E0906 and not E0902" {
+    let e = only_e0906(#"trait Conv {
+    fn conv[U: Display](self, u: U) -> Str
+}
+
+type B { n: Int }
+
+impl Conv for B {
+    fn conv[U](self, u: U) -> Str { "b" }
+}
+
+fn main() { }
+"#, "mb_missing_bound")
+    assert(e.contains("`Conv.conv` declares `U: Display`, this method declares `U` with no bound"), e)
+}
+
+test "a binder with an added bound is E0906" {
+    let e = only_e0906(#"trait Conv {
+    fn conv[U](self, u: U) -> Str
+}
+
+type B { n: Int }
+
+impl Conv for B {
+    fn conv[U: Display](self, u: U) -> Str { "b" }
+}
+
+fn main() { }
+"#, "mb_added_bound")
+    assert(e.contains("Conv.conv"), e)
+}
+
+test "a dropped binder list is E0906 and its help prints the trait method" {
+    let e = only_e0906(#"trait Conv {
+    fn conv[U: Display](self, u: U) -> Str
+}
+
+type D { n: Int }
+
+impl Conv for D {
+    fn conv(self, u: Int) -> Str { "d" }
+}
+
+fn main() { }
+"#, "mb_dropped_list")
+    assert(e.contains("`Conv.conv` declares 1 type parameter, this method declares 0"), e)
+    assert(e.contains("the trait method is `fn conv[U: Display](self, u: U) -> Str`"), e)
+    assert(!e.contains("\"fix\":"), e)
+}
+
+test "an extra binder is E0906" {
+    let e = only_e0906(#"trait Conv {
+    fn conv[U](self, u: U) -> Str
+}
+
+type B { n: Int }
+
+impl Conv for B {
+    fn conv[U, W](self, u: U) -> Str { "b" }
+}
+
+fn main() { }
+"#, "mb_extra_binder")
+    assert(e.contains("`Conv.conv` declares 1 type parameter, this method declares 2"), e)
+}
+
+test "a binder added to Eq.eq is E0906 with a machine fix that deletes the list" {
+    let e = only_e0906(#"type P { n: Int }
+
+impl Eq for P {
+    fn eq[U](self, o: P) -> Bool { self.n == o.n }
+}
+
+fn main() ! IO {
+    let a = P { n: 1 }
+    let _ = a == a
+}
+"#, "mb_eq_added")
+    assert(e.contains("method `eq` declares 1 type parameter, but `Eq.eq` declares 0"), e)
+    assert(e.contains("`Eq.eq` is declared as `fn eq(self, other: Self) -> Bool`"), e)
+    assert(e.contains("a call through `Eq`, such as `a == b`, has no place to write `U`"), e)
+    assert(e.contains("remove `[U]`: `fn eq(self, o: P) -> Bool`"), e)
+    assert(e.contains("\"fix\":"), e)
+}
+
+test "a binder added to Eq.eq and used in the body gets a help and no machine fix" {
+    let e = only_e0906(#"type Q { n: Int }
+
+impl Eq for Q {
+    fn eq[U](self, o: Q) -> Bool { let xs: List[U] = []  xs.len() == 0 }
+}
+
+fn main() { }
+"#, "mb_eq_added_used")
+    assert(e.contains("remove `[U]`, and the use of `U` in the body"), e)
+    assert(!e.contains("\"fix\":"), e)
+}
+
+test "a binder added to Eq.eq in a generic impl that no call reaches is E0906 at check" {
+    let e = only_e0906(#"type OwnEq[T] { v: T }
+
+fn same[A](x: A) -> A { x }
+
+impl[T] Eq for OwnEq[T] {
+    fn eq[U](_self, _o: OwnEq[T]) -> Bool {
+        let c: Option[OwnEq[U]] = None
+        let d = same(c)
+        d.is_none()
+    }
+}
+
+fn main() { let _ = OwnEq { v: 2 }.v }
+"#, "mb_eq_added_generic_unreached")
+    assert(e.contains("method `eq` declares 1 type parameter, but `Eq.eq` declares 0"), e)
+}
+
+test "a binder added to BlockHandler.enter is E0906 at check" {
+    let e = only_e0906(#"type P { v: Int }
+
+impl BlockHandler for P {
+    type Context = Int
+    fn enter[U](self) -> Int { self.v }
+    fn exit(self, ok: Bool) { let _ = ok }
+}
+
+fn main() ! IO { with P { v: 1 } as b { io.println("{b}") } }
+"#, "mb_enter_added")
+    assert(e.contains("`BlockHandler.enter` declares 0"), e)
+}
+
+test "bounds in another order are the same bounds" {
+    expect_runs_printing(#"trait Sh {
+    fn sh[U: Display + Eq](self, u: U) -> Str
+}
+
+type A { n: Int }
+
+impl Sh for A {
+    fn sh[V: Eq + Display](self, v: V) -> Str { "{v}" }
+}
+
+fn main() ! IO {
+    io.println(A { n: 1 }.sh(5))
+}
+"#, "_mb_bound_order", "5")
+}
+
+test "a bound that names a trait parameter is read with the impl's trait argument" {
+    expect_runs_printing(#"trait Sz[X] {
+    fn size(self) -> X
+}
+
+trait Tr[X] {
+    fn m[U: Sz[X]](self, u: U) -> X
+}
+
+type B { n: Int }
+
+type W { n: Int }
+
+impl Sz[Int] for W {
+    fn size(self) -> Int { self.n }
+}
+
+impl Tr[Int] for B {
+    fn m[U: Sz[Int]](self, u: U) -> Int { u.size() + self.n }
+}
+
+fn main() ! IO {
+    io.println("{B { n: 1 }.m(W { n: 2 })}")
+}
+"#, "_mb_bound_trait_arg", "3")
+}
+
+test "a bound that names the wrong trait argument is E0906" {
+    let _ = only_e0906(#"trait Sz[X] {
+    fn size(self) -> X
+}
+
+trait Tr[X] {
+    fn m[U: Sz[X]](self, u: U) -> Int
+}
+
+type B { n: Int }
+
+impl Tr[Int] for B {
+    fn m[U: Sz[Str]](self, u: U) -> Int { self.n }
+}
+
+fn main() { }
+"#, "mb_bound_wrong_trait_arg")
+}
+
+// Binders match by position, so a swapped list is a contract error; the report names the
+// binders as the impl wrote them.
+test "a contract error on a swapped binder list names the impl's binders" {
+    let out = check_via_cli(#"trait Tm {
+    fn k[U, W](self, u: U, w: W) -> W
+}
+
+type A { n: Int }
+
+impl Tm for A {
+    fn k[W, U](self, u: U, w: W) -> W { w }
+}
+
+fn main() { }
+"#, "mb_swapped_names_{getpid()}")
+    let errs = error_lines(out)
+    if errs.len() != 3 { io.println("FAIL: mb_swapped_names: {out}") }
+    assert_eq(errs.len(), 3)
+    assert(errs.get(0).unwrap().contains("method `k` param has type `U`, expected `W`"), errs.get(0).unwrap())
+    assert(errs.get(1).unwrap().contains("method `k` param has type `W`, expected `U`"), errs.get(1).unwrap())
+    assert(errs.get(2).unwrap().contains("method `k` returns `W`, expected `U`"), errs.get(2).unwrap())
+}
+
+test "a binder added to Eq.eq and used in the signature names the signature and every binder" {
+    let e = only_e0906(#"type C { n: Int }
+
+impl Eq for C {
+    fn eq[U, V](self, o: U) -> Bool { true }
+}
+
+fn main() { }
+"#, "mb_eq_added_sig")
+    assert(e.contains("has no place to write `U`, `V`"), e)
+    assert(e.contains("remove `[U, V]`, and the use of `U` in the signature"), e)
+    assert(!e.contains("\"fix\":"), e)
+}
+
+test "a binder list over two lines gets a help and no machine fix" {
+    let e = only_e0906(#"type B { n: Int }
+
+impl Eq for B {
+    fn eq[U,
+          V](self, o: B) -> Bool { true }
+}
+
+fn main() { }
+"#, "mb_eq_added_lines")
+    assert(e.contains("remove `[U, V]`"), e)
+    assert(!e.contains("\"fix\":"), e)
+}

@@ -1,0 +1,398 @@
+// Brackets after a method name fill the method's own binders and only those, on a receiver, in
+// a trait-qualified call and through a bound. The binders of the impl come from the receiver
+// and are not written. A wrong count is E0303, and a binder that nothing fixes is E0301 with a
+// help that keeps the receiver (sections/03_types.md §3.6 *Method Type Parameters*).
+
+import compile_test_helpers
+import compile_test_helpers.{check_via_cli}
+
+fn expect_runs_printing(src: Str, tag: Str, want: Str) ! IO, FS.Delete, FS.Read, FS.Write, Process.Spawn, Env.Read {
+    let r = compile_test_helpers.compile_and_run(src, tag)
+    if r.exit_code != 0 || r.out.trim() != want {
+        io.println("FAIL: {tag} exit={r.exit_code} out={r.out} err={r.err_out}")
+    }
+    assert(r.exit_code == 0)
+    assert(r.out.trim() == want)
+}
+
+fn error_lines(out: Str) -> List[Str] {
+    let mut found: List[Str] = []
+    for line in out.split("\n") {
+        if line.contains("\"severity\":\"error\"") || line.contains("\"severity\":\"ice\"") {
+            found.push(line)
+        }
+    }
+    found
+}
+
+// Each error of the check, with a failure print of the whole output when the count is not `n`.
+fn errors_of(src: Str, tag: Str, n: Int) -> List[Str] ! FS.Delete, FS.Read, FS.Write, Process.Spawn, Env.Read, IO.Print {
+    let out = check_via_cli(src, "{tag}_{getpid()}")
+    let errs = error_lines(out)
+    if errs.len() != n { io.println("FAIL: {tag}: {out}") }
+    assert_eq(errs.len(), n)
+    errs
+}
+
+fn comb_decl(bound: Str) -> Str {
+    "trait Comb \{\n    fn combine[U{bound}](self, a: U, b: U) -> U\n}\n\ntype C \{ n: Int }\n\nimpl Comb for C \{\n    fn combine[V{bound}](self, a: V, b: V) -> V \{ b }\n}\n\n"
+}
+
+fn mk_decl() -> Str {
+    "trait Mk \{\n    fn mk[U](self) -> Int\n}\n\ntype C \{ n: Int }\n\nimpl Mk for C \{\n    fn mk[U](self) -> Int \{ let xs: List[U] = []  xs.len() + self.n }\n}\n\n"
+}
+
+test "brackets fill the method binder on a receiver, in a trait-qualified call and through a bound" {
+    expect_runs_printing(comb_decl(": Display").concat(#"fn through_bound[T: Comb](t: T) -> Str { t.combine[Str]("x", "y") }
+
+fn through_qualified[T: Comb](t: T) -> Int { Comb.combine[Int](t, 1, 2) }
+
+fn main() ! IO {
+    let c = C { n: 1 }
+    io.println("{c.combine[Int](4, 5)} {Comb.combine[Int](c, 7, 8)} {through_bound(c)} {through_qualified(c)}")
+}
+"#), "_mta_three_forms", "5 8 y 2")
+}
+
+test "a call with no brackets still infers the method binder in each form" {
+    expect_runs_printing(comb_decl("").concat(#"fn through_bound[T: Comb](t: T) -> Str { t.combine("x", "y") }
+
+fn through_qualified[T: Comb](t: T) -> Int { Comb.combine(t, 1, 2) }
+
+fn main() ! IO {
+    let c = C { n: 1 }
+    io.println("{c.combine(2, 3)} {Comb.combine(c, 4, 5)} {through_bound(c)} {through_qualified(c)}")
+}
+"#), "_mta_inferred", "3 5 y 2")
+}
+
+test "brackets on a List receiver fill the method binder and the receiver fills the impl binder" {
+    expect_runs_printing(#"trait Wrap {
+    fn wrap[U: Display](self, u: U) -> Str
+}
+
+impl[T] Wrap for List[T] {
+    fn wrap[U: Display](self, u: U) -> Str { "{self.len()} {u}" }
+}
+
+fn main() ! IO {
+    io.println("{[1].wrap[Str]("s")} {[1, 2].wrap(3)}")
+}
+"#, "_mta_list_receiver", "1 s 2 3")
+}
+
+test "a bound on the method binder holds through a bound and through a trait-qualified call" {
+    let errs = errors_of(comb_decl(": Display").concat(#"type NoD { n: Int }
+
+fn through_bound[T: Comb](t: T) -> NoD { t.combine(NoD { n: 1 }, NoD { n: 2 }) }
+
+fn through_qualified[T: Comb](t: T) -> NoD { Comb.combine(t, NoD { n: 1 }, NoD { n: 2 }) }
+
+fn main() {
+    let c = C { n: 1 }
+    let _ = Comb.combine(c, NoD { n: 1 }, NoD { n: 2 })
+    let _ = through_bound(c)
+    let _ = through_qualified(c)
+}
+"#), "mta_bound", 3)
+    for e in errs {
+        assert(e.contains("\"code\":\"E0523\""), e)
+        assert(e.contains("`NoD` does not implement `Display`"), e)
+    }
+}
+
+test "a non-Display bound on the method binder is E0306 on a receiver, through a bound and trait-qualified" {
+    let errs = errors_of(#"trait Sh {
+    fn sh(self) -> Int
+}
+
+type S { n: Int }
+
+impl Sh for S {
+    fn sh(self) -> Int { self.n }
+}
+
+"#.concat(comb_decl(": Sh")).concat(#"type NoS { n: Int }
+
+fn through_bound[T: Comb](t: T) -> NoS { t.combine(NoS { n: 1 }, NoS { n: 2 }) }
+
+fn through_qualified[T: Comb](t: T) -> NoS { Comb.combine(t, NoS { n: 1 }, NoS { n: 2 }) }
+
+fn main() {
+    let c = C { n: 1 }
+    let _ = c.combine(NoS { n: 1 }, NoS { n: 2 })
+    let _ = Comb.combine(c, NoS { n: 1 }, NoS { n: 2 })
+    let _ = through_bound(c)
+    let _ = through_qualified(c)
+    let _ = Comb.combine(c, S { n: 1 }, S { n: 2 })
+}
+"#), "mta_bound_sh", 4)
+    for e in errs {
+        assert(e.contains("\"code\":\"E0306\""), e)
+        assert(e.contains("`NoS` does not satisfy the Sh bound"), e)
+    }
+}
+
+test "a written type argument that breaks the method bound is an error through a bound" {
+    let errs = errors_of(comb_decl(": Display").concat(#"type NoD { n: Int }
+
+fn through_bound[T: Comb](t: T, a: NoD) -> NoD { t.combine[NoD](a, a) }
+
+fn main() {
+    let _ = through_bound(C { n: 1 }, NoD { n: 1 })
+}
+"#), "mta_bound_written", 1)
+    assert(errs.get(0).unwrap().contains("\"code\":\"E0523\""), errs.get(0).unwrap())
+}
+
+test "a wrong count on a receiver is E0303" {
+    let errs = errors_of(comb_decl("").concat(#"fn main() {
+    let c = C { n: 1 }
+    let _ = c.combine[Int, Str](4, 5)
+}
+"#), "mta_count_receiver", 1)
+    let e = errs.get(0).unwrap()
+    assert(e.contains("\"code\":\"E0303\""), e)
+    assert(e.contains("`combine` takes 1 type argument, 2 were given"), e)
+}
+
+test "a wrong count through a bound and in a trait-qualified call is E0303" {
+    let errs = errors_of(comb_decl("").concat(#"fn through_bound[T: Comb](t: T) -> Int { t.combine[Int, Str](1, 2) }
+
+fn through_qualified[T: Comb](t: T) -> Int { Comb.combine[Int, Str](t, 1, 2) }
+
+fn main() {
+    let c = C { n: 1 }
+    let _ = through_bound(c)
+    let _ = through_qualified(c)
+}
+"#), "mta_count_bound", 2)
+    for e in errs {
+        assert(e.contains("\"code\":\"E0303\""), e)
+        assert(e.contains("`combine` takes 1 type argument, 2 were given"), e)
+    }
+}
+
+test "a wrong count on a List receiver notes that the impl binder is not written" {
+    let errs = errors_of(#"trait Wrap {
+    fn wrap[U: Display](self, u: U) -> Str
+}
+
+impl[T] Wrap for List[T] {
+    fn wrap[U: Display](self, u: U) -> Str { "{self.len()} {u}" }
+}
+
+fn main() {
+    let _ = [1].wrap[Int, Str]("s")
+}
+"#, "mta_count_list", 1)
+    let e = errs.get(0).unwrap()
+    assert(e.contains("\"code\":\"E0303\""), e)
+    assert(e.contains("`wrap` takes 1 type argument, 2 were given"), e)
+    assert(e.contains("`T` of the impl comes from the receiver and is not written"), e)
+}
+
+test "a rejected list supplies nothing, so the call gets no E0301 and no E0306" {
+    let errs = errors_of(#"trait Mk {
+    fn mk[U: Display](self) -> Int
+}
+
+type C { n: Int }
+
+type NoD { n: Int }
+
+impl Mk for C {
+    fn mk[U: Display](self) -> Int { let xs: List[U] = []  xs.len() }
+}
+
+fn main() {
+    let c = C { n: 1 }
+    let _ = c.mk[NoD, Int]()
+}
+"#, "mta_count_no_cascade", 1)
+    let e = errs.get(0).unwrap()
+    assert(e.contains("\"code\":\"E0303\""), e)
+    assert(e.contains("`mk` takes 1 type argument, 2 were given"), e)
+}
+
+test "a wrong count on a function head is E0303 and names the function" {
+    let errs = errors_of(#"fn plain(n: Int) -> Int { n }
+
+fn decode[T](s: Str, t: T) -> T { t }
+
+fn main() {
+    let _ = plain[Int](3)
+    let _ = decode[Int, Str]("s", 1)
+}
+"#, "mta_count_fn", 2)
+    assert(errs.get(0).unwrap().contains("`plain` takes 0 type arguments, 1 was given"), errs.get(0).unwrap())
+    assert(errs.get(1).unwrap().contains("`decode` takes 1 type argument, 2 were given"), errs.get(1).unwrap())
+    for e in errs { assert(e.contains("\"code\":\"E0303\""), e) }
+}
+
+test "a method binder that nothing fixes is E0301 and the help keeps the receiver" {
+    let errs = errors_of(mk_decl().concat(#"fn main() {
+    let c = C { n: 1 }
+    let _ = c.mk()
+}
+"#), "mta_unbound_receiver", 1)
+    let e = errs.get(0).unwrap()
+    assert(e.contains("\"code\":\"E0301\""), e)
+    assert(e.contains("type parameter `U` of `mk` is unbound at this call"), e)
+    assert(e.contains("write the type arguments at this call: `c.mk[U]()`"), e)
+}
+
+test "the E0301 help for a trait-qualified call and a call through a bound keeps the call form" {
+    let errs = errors_of(mk_decl().concat(#"fn through_bound[T: Mk](t: T) -> Int { t.mk() }
+
+fn main() {
+    let c = C { n: 1 }
+    let _ = Mk.mk(c)
+    let _ = through_bound(c)
+}
+"#), "mta_unbound_forms", 2)
+    assert(errs.get(0).unwrap().contains("`t.mk[U]()`"), errs.get(0).unwrap())
+    assert(errs.get(1).unwrap().contains("`Mk.mk[U](c)`"), errs.get(1).unwrap())
+}
+
+fn tm_decl(recv: Str, body: Str) -> Str {
+    "trait Tm \{\n    fn m[U](self, xs: List[U], n: Int) -> Int\n}\n\nimpl Tm for {recv} \{\n    fn m[U](self, xs: List[U], n: Int) -> Int \{ {body} }\n}\n\n"
+}
+
+test "a method binder that nothing fixes on an Int receiver is E0301 with the receiver in the help" {
+    let errs = errors_of(tm_decl("Int", "xs.len() + n + self").concat(#"fn main() {
+    let _ = 1.m([], 2)
+}
+"#), "mta_unbound_int", 1)
+    let e = errs.get(0).unwrap()
+    assert(e.contains("\"code\":\"E0301\""), e)
+    assert(e.contains("write the type arguments at this call: `1.m[U]([], 2)`"), e)
+}
+
+test "the E0301 help for a binder the arguments do not fix keeps each call form" {
+    let errs = errors_of(#"type C { n: Int }
+
+"#.concat(tm_decl("C", "xs.len() + n + self.n")).concat(#"fn through_bound[T: Tm](t: T) -> Int { t.m([], 2) }
+
+fn main() {
+    let c = C { n: 1 }
+    let _ = c.m([], 2)
+    let _ = Tm.m(c, [], 2)
+    let _ = through_bound(c)
+}
+"#), "mta_unbound_three_forms", 3)
+    for e in errs { assert(e.contains("\"code\":\"E0301\""), e) }
+    assert(errs.get(0).unwrap().contains("`t.m[U]([], 2)`"), errs.get(0).unwrap())
+    assert(errs.get(1).unwrap().contains("`c.m[U]([], 2)`"), errs.get(1).unwrap())
+    assert(errs.get(2).unwrap().contains("`Tm.m[U](c, [], 2)`"), errs.get(2).unwrap())
+}
+
+test "the bracketed repair from the E0301 help compiles and runs" {
+    expect_runs_printing(mk_decl().concat(#"fn through_bound[T: Mk](t: T) -> Int { t.mk[Str]() }
+
+fn main() ! IO {
+    let c = C { n: 1 }
+    io.println("{c.mk[Int]()} {Mk.mk[Bool](c)} {through_bound(c)}")
+}
+"#), "_mta_unbound_repaired", "1 1 1")
+}
+
+fn got_decl() -> Str {
+    #"trait Got[X] {
+    fn got(self) -> X
+}
+
+trait Tr[A] {
+    fn m[U: Got[A]](self, u: U) -> A
+}
+
+type B { n: Int }
+
+impl Tr[Int] for B {
+    fn m[V: Got[Int]](self, u: V) -> Int { u.got() + self.n }
+}
+
+type GS { n: Int }
+
+impl Got[Str] for GS {
+    fn got(self) -> Str { "s{self.n}" }
+}
+
+type GI { n: Int }
+
+impl Got[Int] for GI {
+    fn got(self) -> Int { self.n }
+}
+
+"#
+}
+
+test "a method bound that names a trait argument is checked through a bound and in a trait-qualified call" {
+    let errs = errors_of(got_decl().concat(#"fn bad[T: Tr[Int]](t: T) -> Int { t.m(GS { n: 1 }) }
+
+fn badq[T: Tr[Int]](t: T) -> Int { Tr.m(t, GS { n: 1 }) }
+
+fn main() {
+    let b = B { n: 1 }
+    let _ = bad(b) + badq(b)
+}
+"#), "mta_trait_arg_bound", 2)
+    for e in errs {
+        assert(e.contains("\"code\":\"E0306\""), e)
+        assert(e.contains("`GS` does not satisfy the Got[Int] bound"), e)
+    }
+}
+
+test "a method bound that names a trait argument holds through a bound and in a trait-qualified call" {
+    expect_runs_printing(got_decl().concat(#"fn good[T: Tr[Int]](t: T) -> Int { t.m(GI { n: 3 }) }
+
+fn goodq[T: Tr[Int]](t: T) -> Int { Tr.m(t, GI { n: 5 }) }
+
+fn main() ! IO {
+    let b = B { n: 1 }
+    io.println("{good(b)} {goodq(b)} {Tr.m(b, GI { n: 7 })}")
+}
+"#), "_mta_trait_arg_bound_runs", "4 6 8")
+}
+
+test "a bracketed trait-qualified call with a wrong argument count counts the receiver" {
+    let errs = errors_of(comb_decl("").concat(#"fn tb[T: Comb](t: T) -> Int { Comb.combine[Int](t, 1) }
+
+fn main() {
+    let c = C { n: 1 }
+    let _ = Comb.combine[Int](c, 1)
+}
+"#), "mta_qualified_count", 2)
+    for e in errs {
+        assert(e.contains("qualified trait call `Comb.combine` expects 3 argument(s) including the receiver, got 2"), e)
+    }
+}
+
+test "a bracketed trait-qualified call on a receiver with no impl gets one error" {
+    let errs = errors_of(comb_decl("").concat(#"fn main() {
+    let _ = Comb.combine[Int](1, 1, 2)
+}
+"#), "mta_qualified_no_impl", 1)
+    assert(!errs.get(0).unwrap().contains("E0303"), errs.get(0).unwrap())
+}
+
+test "a wrong count on a generic impl's method names the impl binder in a note" {
+    let errs = errors_of(#"trait Comb {
+    fn combine[U](self, a: U, b: U) -> U
+}
+
+type Box[T] { v: T }
+
+impl[T] Comb for Box[T] {
+    fn combine[V](self, a: V, b: V) -> V { b }
+}
+
+fn main() {
+    let b = Box { v: 1 }
+    let _ = b.combine[Int, Int](1, 2)
+}
+"#, "mta_box_note", 1)
+    let e = errs.get(0).unwrap()
+    assert(e.contains("`combine` takes 1 type argument, 2 were given"), e)
+    assert(e.contains("`T` of the impl comes from the receiver and is not written"), e)
+}

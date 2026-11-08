@@ -14,12 +14,12 @@
 import std.io
 import layout.{layout_reset}
 import cname.{cname_reset, c_display_dispatch_name, c_impl_method_name}
-import cg_test_helpers.{cg_probe_compile, cg_probe_ices_saying}
+import cg_test_helpers.{cg_probe_compile, cg_probe_compile_but, cg_probe_ices_saying}
 import cg.{CgConfig, generate}
 import cg_reg.{cg_reg_impl_methods, cg_reg_impl_of}
 import mono.{has_own_binders, run_mono, instances, is_poly_impl, poly_impl_is_element_agnostic}
 import parser.{node_name}
-import diagnostics.{CODEGEN_STAGE_NOT_BUILT_NAME, diag_entries}
+import diagnostics.{CODEGEN_STAGE_NOT_BUILT_NAME, DiagEntry, diag_entries}
 
 fn standalone_cfg() -> CgConfig {
     CgConfig { debug_mode: 0, trace_codegen: 0, deterministic: 0, emit_only_module: "",
@@ -58,6 +58,31 @@ fn prelude_stops(stem: Str) -> Int {
         if d.severity == "ice" && d.file != "build/{stem}.bl" { n = n + 1 }
     }
     n
+}
+
+// The trait methods these rows implement declare no binder, so an impl method that adds one is
+// E0906 at check, alone, at its binder list, and the program never reaches mono or codegen.
+fn only_e0906_at(stem: Str, method: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Env.Exit, Env.Read, FS.Read, FS.Write, IO {
+    let _ = cg_probe_compile_but("build/{stem}.bl", src, "TraitContractGenericMismatch")
+    let mut errs: List[DiagEntry] = []
+    for d in diag_entries {
+        if d.severity == "error" { errs.push(d) }
+    }
+    assert_eq(errs.len(), 1)
+    let e = errs.get(0).unwrap()
+    assert_eq(e.code, "E0906")
+    let head = "fn {method}["
+    let mut line = 0
+    let mut col = 0
+    let mut n = 0
+    for text in src.split("\n") {
+        n = n + 1
+        let at = text.index_of(head) ?? -1
+        if at >= 0 { line = n  col = at + head.len() }
+    }
+    assert(line > 0, "no `{head}` in the probe source")
+    assert_eq(e.line, line)
+    assert_eq(e.col, col)
 }
 
 // The impl block a probe's method was written in, so a claim about the two stages can be
@@ -300,10 +325,9 @@ fn main() {
     assert_eq(stops(), 1)
 }
 
-// The dispatcher of a `fmt` with its own type parameter does not exist either.
-test "an interpolation whose fmt takes its own type parameter stops at that site" {
+test "an impl fmt that adds a binder is E0906 at check and never reaches the body stage" {
     let stem = "cg_pim_display_own_binder"
-    let program = probe(stem, #"type P {
+    only_e0906_at(stem, "fmt", #"type P {
     v: Int
 }
 
@@ -316,9 +340,6 @@ fn main() {
     assert("{p}" == "p")
 }
 "#)
-    generate(program, standalone_cfg())
-    assert_eq(cg_probe_ices_saying(CODEGEN_STAGE_NOT_BUILT_NAME, DISPLAY_STOP), 1)
-    assert_eq(stops(), 1)
 }
 
 // A message that only names a value has a placeholder for a type it cannot show, so it takes
@@ -376,9 +397,9 @@ fn main() {
     assert(text.contains("<W"))
 }
 
-test "a traced value whose debug takes its own type parameter takes the placeholder" {
+test "an impl debug that adds a binder is E0906 at check and never reaches the trace stage" {
     let stem = "cg_pim_trace_debug_own_binder"
-    let program = probe(stem, #"type P {
+    only_e0906_at(stem, "debug", #"type P {
     n: Int
 }
 
@@ -392,9 +413,6 @@ fn main() {
     assert(f(P { n: 1 }) == 1)
 }
 "#)
-    let text = generate(program, traced_cfg())
-    assert_eq(stops(), 0)
-    assert(text.contains("<P"))
 }
 
 // A foreign `fmt` has one name, so an interpolation calls the dispatcher beside it, and the
@@ -420,11 +438,9 @@ fn main() {
     assert_eq(definitions_of(text, c_display_dispatch_name(impl_of("fmt"))), 1)
 }
 
-// Only a call gives a type argument for a method's own binder, so a type instance alone must
-// not ask for a copy. The body here has a type no argument solves.
-test "a type instance registers no operator method with its own binder" {
+test "an impl eq on a generic type that adds a binder no call reaches is E0906 at check" {
     let stem = "cg_pim_operator_own_binder_unreached"
-    let program = probe(stem, #"type Box[T] {
+    only_e0906_at(stem, "eq", #"type Box[T] {
     v: T
 }
 
@@ -442,9 +458,6 @@ fn main() {
     assert(Box { v: 1 }.v == 1)
 }
 "#)
-    generate(program, standalone_cfg())
-    assert_eq(stops(), 0)
-    assert_eq(instance_symbols("eq").len(), 0)
 }
 
 // The body of `eq` calls the bound's method. At an argument without the trait there is no
@@ -513,11 +526,9 @@ fn main() {
     assert_eq(definitions_of(text, instance_symbol("eq")), 1)
 }
 
-// The other side of the row above: `==` does reach it, and a binder no call solves has no
-// body to name.
-test "an operator on a generic type whose method takes its own type parameter stops at that site" {
+test "an impl eq on a generic type that adds a binder `==` reaches is E0906 at check" {
     let stem = "cg_pim_generic_operator_own_binder"
-    let program = probe(stem, #"type Box[T] {
+    only_e0906_at(stem, "eq", #"type Box[T] {
     v: T
 }
 
@@ -530,15 +541,11 @@ fn main() {
     assert(a == a)
 }
 "#)
-    generate(program, standalone_cfg())
-    assert_eq(cg_probe_ices_saying("MonoInstanceNotRegistered", "`eq` of"), 1)
-    assert_eq(stops(), 1)
 }
 
-// The with stage names enter and exit by the name of the impl, with no instance.
-test "a with-item whose handler method takes its own type parameter stops at that site" {
+test "an impl enter that adds a binder is E0906 at check and never reaches the with stage" {
     let stem = "cg_pim_handler_own_binder"
-    let program = probe(stem, #"type P {
+    only_e0906_at(stem, "enter", #"type P {
     v: Int
 }
 
@@ -554,14 +561,11 @@ fn main() {
     }
 }
 "#)
-    generate(program, standalone_cfg())
-    assert_eq(cg_probe_ices_saying(CODEGEN_STAGE_NOT_BUILT_NAME, "BlockHandler method has its own type parameter"), 1)
-    assert_eq(stops(), 1)
 }
 
-test "a with-item whose exit takes its own type parameter stops at that site" {
+test "an impl exit that adds a binder is E0906 at check and never reaches the with stage" {
     let stem = "cg_pim_handler_exit_own_binder"
-    let program = probe(stem, #"type P {
+    only_e0906_at(stem, "exit", #"type P {
     v: Int
 }
 
@@ -577,16 +581,11 @@ fn main() {
     }
 }
 "#)
-    generate(program, standalone_cfg())
-    assert_eq(cg_probe_ices_saying(CODEGEN_STAGE_NOT_BUILT_NAME, "BlockHandler method has its own type parameter"), 1)
-    assert_eq(stops(), 1)
 }
 
-// An operator reaches its method through the symbol of the impl, which a per-instance body
-// never defines.
-test "an operator whose method takes its own type parameter stops at that site" {
+test "an impl eq on a concrete type that adds a binder is E0906 at check" {
     let stem = "cg_pim_operator_own_binder"
-    let program = probe(stem, #"type P {
+    only_e0906_at(stem, "eq", #"type P {
     v: Int
 }
 
@@ -599,9 +598,6 @@ fn main() {
     assert(a == a)
 }
 "#)
-    generate(program, standalone_cfg())
-    assert_eq(cg_probe_ices_saying("MonoInstanceNotRegistered", "`eq` of"), 1)
-    assert_eq(stops(), 1)
 }
 
 // The impl's binder is not the method's own: it has an argument at each instance of the type.
