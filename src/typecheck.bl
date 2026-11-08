@@ -17964,7 +17964,7 @@ fn init_types() ! TypeCheck.Register {
     ty_param_list.clear()
     // The method-call facts span all three phases of one check_types, so they are cleared
     // here rather than in resolve_names with the registries that feed them.
-    tc_method_calls = MethodCallFacts { unresolved: [], hard: Map(), receiver_failed: Map(), seeded_expected: Map(), dropped: Map(), helper_fixes: Map(), bound_args: Map() }
+    tc_method_calls = MethodCallFacts { unresolved: [], hard: Map(), receiver_failed: Map(), seeded_expected: Map(), dropped: Map(), helper_fixes: Map(), bound_args: Map(), type_qualified: Map() }
     // Load-bearing for the daemon/LSP (long-lived processes, daemon.bl / lsp.bl): a
     // surviving intern map would hand out tids keyed against the PREVIOUS, since-cleared
     // pool on the next check_types() call — out-of-bounds unwrap panic or a silently
@@ -18616,10 +18616,19 @@ pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report, IO.Eprint {
 // tc_report_unclaimed_calls left the call alone (section 6.3.3). A call Phase 2 resolved to a
 // declaration is skipped: a free fn `{Type}_{method}` supplies a method name that no impl lists,
 // so Phase 1 records it, but the name does resolve.
-fn tc_flush_unresolved_methods() ! Diag.Report {
+//
+// `type_qualified` picks the calls whose receiver names a type. Those go first, before the
+// unclaimed calls: no other check reports them, and their error is what makes the value of the
+// call poison, so a later call on that value must see it (section 6.3.5).
+fn tc_flush_unresolved_methods(type_qualified: Bool) ! Diag.Report {
     let mut i = 0
     while i < tc_method_calls.unresolved.len() {
         let n = tc_method_calls.unresolved.get(i).unwrap()
+        if tc_method_calls.type_qualified.contains_key(n) != type_qualified {
+            i = i + 1
+            continue
+        }
+        let before = diag_entry_count()
         let reported_later = tc_unclaimed_receiver_is_named(tc_lookup_node_tid(node_obj(n))) != 0
         if !reported_later && !tc_call_decl.contains_key(n) && tc_receiver_call_has_no_report(n) == 0 {
             let m = node_method(n)
@@ -18635,18 +18644,23 @@ fn tc_flush_unresolved_methods() ! Diag.Report {
                     "give the receiver a type that implements {shown.join(" or ")}")
             }
         }
+        if diag_any_errors_since(before) > 0 { tc_method_calls.hard.insert(n, 1) }
         i = i + 1
     }
 }
 
 // 1 when a method call needs no report of its own. Another check reported it, or its receiver
 // had an error, or an earlier error left the receiver with no type (section 6.3.5), or E0301
-// reported the open type of the receiver: each of those reports is the cause.
+// reported the open type of the receiver: each of those reports is the cause. A receiver that
+// names a type has no type either, but no error is its cause.
 fn tc_receiver_call_has_no_report(n: Int) -> Int {
     if tc_method_calls.hard.contains_key(n) || tc_method_calls.receiver_failed.contains_key(n) { return 1 }
     if nr_is_call_on_collided_qualifier(n) { return 1 }
     let tid = tc_lookup_node_tid(node_obj(n))
-    if tid < 0 { return if diag_any_errors_since(0) > 0 { 1 } else { 0 } }
+    if tid < 0 {
+        if tc_method_calls.type_qualified.contains_key(n) { return 0 }
+        return if diag_any_errors_since(0) > 0 { 1 } else { 0 }
+    }
     let r = tc_resolve(tid)
     if tc_ud_already_blamed(r) != 0 { return 1 }
     // TYPE_UNKNOWN is also the type an error leaves, so with an error in the program it is
@@ -25201,6 +25215,11 @@ type MethodCallFacts {
     // type may hold two instances of one generic trait, and only the bound says which one the
     // call means.
     bound_args: Map[Int, List[Int]]
+    // The unresolved calls whose receiver is a bare name that names a type and no value
+    // (`Bytes.nope()`). Such a receiver has no type of its own, as a poison value has none, but
+    // no error made it, so the call still gets its report (sections/05_memory_compile_errors.md
+    // §6.3.5). Recorded in Phase 1, the only phase that knows which names a scope binds.
+    type_qualified: Map[Int, Int]
 }
 
 type HelperFix {
@@ -25208,7 +25227,7 @@ type HelperFix {
     sig: Int
 }
 
-let mut tc_method_calls: MethodCallFacts = MethodCallFacts { unresolved: [], hard: Map(), receiver_failed: Map(), seeded_expected: Map(), dropped: Map(), helper_fixes: Map(), bound_args: Map() }
+let mut tc_method_calls: MethodCallFacts = MethodCallFacts { unresolved: [], hard: Map(), receiver_failed: Map(), seeded_expected: Map(), dropped: Map(), helper_fixes: Map(), bound_args: Map(), type_qualified: Map() }
 
 // Mark a method call the inference pass could not type and did not report on: the name
 // resolves somewhere in the program, so name resolution let it pass, but no arm here claims
@@ -27236,6 +27255,9 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                     // this wherever the type is known; the flush after inference reports
                     // the rest.
                     tc_method_calls.unresolved.push(node)
+                    if obj != -1 && node_kind(obj) == NodeKind.Ident && nr_receiver_has_binding(node_name(obj)) == 0 && tc_names_a_type(node_name(obj)) {
+                        tc_method_calls.type_qualified.insert(node, 1)
+                    }
                 }
             }
         }
@@ -42688,6 +42710,8 @@ fn tc_report_unclaimed_calls(order: List[Int], mods: List[Str]) ! Diag.Report {
     }
     let outer_module = nr_current_module
     for uc in calls {
+        // The flush of the calls on a type name has reported this one already.
+        if tc_method_calls.type_qualified.contains_key(uc) && tc_method_calls.hard.contains_key(uc) { continue }
         let uc_module = call_mod.get(uc) ?? outer_module
         let saved_module = nr_current_module
         nr_current_module = uc_module
@@ -43088,9 +43112,10 @@ pub fn tc_stamp_program(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Dia
     let mut mods: List[Str] = List.with_capacity(node_count())
     let mut seen: List[Int] = List.with_capacity(node_count())
     let order = tc_stamp_walk_sized(program, owners, mods, seen, node_count())
+    tc_flush_unresolved_methods(true)
     tc_report_unclaimed_calls(order, mods)
     // After the unclaimed calls, so a call one of them reported gets no second report.
-    tc_flush_unresolved_methods()
+    tc_flush_unresolved_methods(false)
     tc_report_literals_out_of_range(order)
     // A program that already has an error has nodes inference deliberately never typed: the
     // arm that would have typed them reported instead and returned. Asserting there turns

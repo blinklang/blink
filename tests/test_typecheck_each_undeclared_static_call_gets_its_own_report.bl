@@ -1,0 +1,134 @@
+// A call `T.name()` of a name that `T` does not declare is E0505 at its own site
+// (sections/05_memory_compile_errors.md §6.3.3). The qualifier names a type, not a value, so
+// it is no poison receiver, and an earlier error in the program does not take the report
+// away. A qualifier that an error left with no type is poison and gets no second report, and
+// so does a call on the result of a failed call: a poison receiver is not an unknown receiver
+// and gets no diagnostic (§6.3.3, §6.3.5).
+
+import std.fs
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_reset}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+
+fn typecheck_probe(path: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    init_embedded_stdlib()
+    fs.write(path, src).unwrap()
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+}
+
+// Each error as "name line:col: message", in report order.
+fn errors_of(src: Str) -> List[Str] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    typecheck_probe("build/test_typecheck_undeclared_static_call_probe.bl", src)
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" {
+            out.push("{d.name} {d.line}:{d.col}: {d.message}")
+        }
+    }
+    out
+}
+
+fn undeclared(at: Str, name: Str) -> Str {
+    "UnresolvedMethod {at}: no type or trait declares method `{name}`"
+}
+
+test "two undeclared static calls on two types get a report each" {
+    let src = "fn main() \{\n    let _a = Bytes.nope(1)\n    let _b = Str.other(1)\n}\n"
+    assert_eq(errors_of(src), [undeclared("2:14", "nope"), undeclared("3:14", "other")])
+}
+
+test "two undeclared static calls on one type in two fns get a report each" {
+    let src = "fn first() \{\n    let _a = Bytes.nope(1)\n}\nfn main() \{\n    first()\n    let _b = Bytes.other(1)\n}\n"
+    assert_eq(errors_of(src), [undeclared("2:14", "nope"), undeclared("6:14", "other")])
+}
+
+test "an unrelated type error does not take the reports of undeclared static calls away" {
+    let src = "fn main() \{\n    let _a = Bytes.nope(1)\n    let _b = Str.other(1)\n    let _x: Int = \"s\"\n}\n"
+    let got = errors_of(src)
+    assert_eq(got.len(), 3)
+    assert(got.contains(undeclared("2:14", "nope")), got.join("; "))
+    assert(got.contains(undeclared("3:14", "other")), got.join("; "))
+    assert(got.contains("TypeError 4:5: variable `_x`: declared type Int but got Str"), got.join("; "))
+}
+
+test "an undeclared static call on a user type gets a report after another one" {
+    let src = "type StaticK \{\n    a: Int\n}\nfn main() \{\n    let _a = StaticK.zed(1)\n    let _b = StaticK.other(1)\n}\n"
+    let got = errors_of(src)
+    assert_eq(got.len(), 2)
+    assert(got.get(0).unwrap().starts_with("UnresolvedMethod 5:14: "), got.join("; "))
+    assert(got.get(1).unwrap().starts_with("UnresolvedMethod 6:14: "), got.join("; "))
+}
+
+test "a qualifier that names no type gets one report and the next static call gets its own" {
+    let src = "fn main() \{\n    let _a = NoSuchStaticType.nope(1)\n    let _b = Bytes.other(1)\n}\n"
+    assert_eq(errors_of(src), ["UndefinedVariable 2:14: undefined variable `NoSuchStaticType`", undeclared("3:14", "other")])
+}
+
+test "a local that hides a type name and holds an error is poison, not a type qualifier" {
+    let src = "fn main() \{\n    let Bytes = undefined_thing\n    let _a = Bytes.nope(1)\n}\n"
+    assert_eq(errors_of(src), ["UndefinedVariable 2:17: undefined variable `undefined_thing`"])
+}
+
+test "a method call on the result of an undeclared static call gets no second report" {
+    let src = "fn main() ! IO \{\n    let c = Bytes.from_list([1, 2])\n    io.println(\"\{c.len()}\")\n}\n"
+    assert_eq(errors_of(src), [undeclared("2:13", "from_list")])
+}
+
+test "an undeclared static call does not take the report of a later call on a receiver with no known type" {
+    let src = "fn main() \{\n    let _a = Bytes.nope(1)\n    let _n = [].get(0).unwrap().len()\n}\n"
+    assert_eq(errors_of(src), [undeclared("2:14", "nope"), "UnresolvedMethod 3:14: the type of the receiver is not known here, so method `len` cannot be resolved"])
+}
+
+test "an undeclared static call with an undefined argument gets both reports" {
+    let src = "fn main() \{\n    let _a = Bytes.nope(undefined_arg)\n}\n"
+    let got = errors_of(src)
+    assert_eq(got.len(), 2)
+    assert(got.contains("UndefinedVariable 2:25: undefined variable `undefined_arg`"), got.join("; "))
+    assert(got.contains(undeclared("2:14", "nope")), got.join("; "))
+}
+
+test "a type parameter that shares a name with a declared type is not a type qualifier" {
+    let src = "type StaticT \{\n    a: Int\n}\ntrait StaticZero \{\n    fn zero() -> Self\n}\nfn f[StaticT: StaticZero]() -> StaticT \{\n    StaticT.nope()\n}\nfn main() \{\n    let _x: Int = \"s\"\n}\n"
+    let got = errors_of(src)
+    for e in got { assert(!e.starts_with("UnresolvedMethod"), got.join("; ")) }
+    assert(got.contains("TypeError 11:5: variable `_x`: declared type Int but got Str"), got.join("; "))
+}
+
+test "an undeclared call through a trait name and one through a type name get a report each" {
+    let src = "fn main() \{\n    let _a = Display.nope(1)\n    let _b = Bytes.other(1)\n}\n"
+    assert_eq(errors_of(src), ["UnresolvedMethod 2:14: trait `Display` does not define method `nope`", undeclared("3:14", "other")])
+}
+
+test "an undeclared member of a handle and an undeclared static call get a report each" {
+    let src = "fn main() ! IO \{\n    io.nope()\n    let _b = Bytes.other(1)\n}\n"
+    let got = errors_of(src)
+    assert_eq(got.len(), 2)
+    assert(got.contains("UnresolvedMethod 2:5: no member `nope` on module `io`"), got.join("; "))
+    assert(got.contains(undeclared("3:14", "other")), got.join("; "))
+}
+
+let PKG = "build/tc_undeclared_static_call_pkg"
+
+test "undeclared static calls in an imported module and in the main module get a report each" {
+    let _mk = process.run("mkdir", ["-p", "{PKG}/src"]).unwrap()
+    fs.write("{PKG}/blink.toml", "[package]\nname = \"tcundeclaredstatic\"\nversion = \"0.1.0\"\n").unwrap()
+    fs.write("{PKG}/src/helper.bl", "pub fn h() -> Int \{\n    let _a = Bytes.nope(1)\n    let _b = Str.other(1)\n    1\n}\n").unwrap()
+    fs.write("{PKG}/src/main.bl", "import helper.\{h}\nfn main() \{\n    let _x = h()\n    let _c = Bytes.third(1)\n}\n").unwrap()
+    init_embedded_stdlib()
+    diag_reset()
+    let program = compile_to_program("{PKG}/src/main.bl", 1)
+    check_types(program)
+    let mut got: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" { got.push("{d.name} {d.file}:{d.line}:{d.col}: {d.message}") }
+    }
+    let _rm = process.run("rm", ["-rf", PKG]).unwrap()
+    assert_eq(got.len(), 3)
+    assert(got.contains("UnresolvedMethod {PKG}/src/helper.bl:2:14: no type or trait declares method `nope`"), got.join("; "))
+    assert(got.contains("UnresolvedMethod {PKG}/src/helper.bl:3:14: no type or trait declares method `other`"), got.join("; "))
+    assert(got.contains("UnresolvedMethod {PKG}/src/main.bl:4:14: no type or trait declares method `third`"), got.join("; "))
+}

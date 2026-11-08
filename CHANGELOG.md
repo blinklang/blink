@@ -34,6 +34,7 @@ Single source of truth for release history. `blink llms` and `blink llms --full`
 - **An internal error tells you to report it, not to use another compiler build.** The help and the explain text of `CodegenStageNotBuilt` (I0004) said "use a released compiler build", which did not help. They now say that the error is a bug of the compiler and asks for a report with a small program. When the front end of a build found no error, the internal error has the note "this source passes `blink check`; the cause is a bug of the compiler".
 - **A method call that reaches code generation with no method is internal error I0022.** The type check reports each such call as E0505. Before, the code generator gave a second E0505 with exit 1. `UnresolvedMethodAtCodegen` (I0022) names the receiver and the method, and exits 101.
 - **The note of I0017 names the `@ffi` declarations of the program,** because a wrong prototype can also make the generated C fail. A program with no `@ffi` declaration gets no such note.
+- **Each call of an undeclared method through a type name gets its own E0505.** For `Bytes.nope(1)` and `Str.other(1)` in one program, `blink check` gave one error, and none when the program had another error. Now each call gets its error. A call on the value of such a call, as `c.len()` after `let c = Bytes.from_list([1, 2])`, gets no second report, because the first error names the cause.
 
 ## Breaking Changes (v0.60.0)
 
