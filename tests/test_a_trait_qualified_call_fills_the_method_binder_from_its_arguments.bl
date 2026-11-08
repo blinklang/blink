@@ -1,0 +1,69 @@
+// In `Trait.m(x, a)` the first argument is the receiver and fills `self`, so the method's own
+// binder is solved from `a`, not from `x`, on a generic impl as on a plain one
+// (sections/03_types.md §3.6 *Method Type Parameters*, sections/03c_protocols.md §3c.4). The
+// program is built both ways, because a per-module build and a whole-program build each lower
+// the impl body from the instance the call records.
+
+import compile_test_helpers
+
+let SRC = #"trait Mk {
+    fn mk2[U: Display](self, u: U) -> Str
+}
+type Box[T] { v: T }
+impl[T] Mk for Box[T] {
+    fn mk2[U: Display](_self, u: U) -> Str { "box {u}" }
+}
+type Plain { v: Int }
+impl Mk for Plain {
+    fn mk2[U: Display](_self, u: U) -> Str { "plain {u}" }
+}
+impl[T] Mk for List[T] {
+    fn mk2[U: Display](self, u: U) -> Str { "list {self.len()} {u}" }
+}
+fn in_generic_body[V: Display](v: V) -> Str { Mk.mk2(Box { v: v }, "z") }
+fn via[X: Mk](x: X) -> Str { Mk.mk2(x, "q") }
+fn via_bracketed[X: Mk](x: X) -> Str { Mk.mk2[Str](x, "r") }
+fn via_int[X: Mk](x: X) -> Str { Mk.mk2(x, 7) }
+fn main() ! IO {
+    let b = Box { v: 1 }
+    io.println(Mk.mk2(b, "a"))
+    io.println(Mk.mk2[Str](b, "b"))
+    io.println(via(b))
+    io.println(via_bracketed(b))
+    io.println(via_int(Box { v: "s" }))
+    io.println(b.mk2("c"))
+    io.println(in_generic_body(4))
+    io.println(Mk.mk2(Plain { v: 2 }, "d"))
+    io.println(via(Plain { v: 3 }))
+    let xs: List[Int] = [1, 2]
+    io.println(Mk.mk2(xs, 5))
+    io.println(Mk.mk2[Str](xs, "e"))
+}
+"#
+
+let WANT = "box a\nbox b\nbox q\nbox r\nbox 7\nbox c\nbox z\nplain d\nplain q\nlist 2 5\nlist 2 e\n"
+
+// The corpus exports BLINK_COMPILER_ARCHIVE, which, like the module filters, makes a build
+// one unit, so the build drops them and a per-module build really writes its units.
+fn build_and_run(stem: Str, flag: Str) -> Str ! FS.Read, FS.Write, Process.Spawn, Env.Read {
+    let dir = "{compile_test_helpers.scratch_root()}/{stem}_{getpid()}"
+    compile_test_helpers.sh("rm -rf {dir} && mkdir -p {dir}")
+    let path = "{dir}/{stem}.bl"
+    let bin = "{dir}/{stem}_bin"
+    fs.write(path, SRC).unwrap()
+    let b = process.run("sh", ["-c", "env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE BLINK_CACHE_DIR={dir}/objcache build/blink build {flag} {path} -o {bin}"]).unwrap()
+    assert(b.success(), "build failed: {b.out}{b.err_out}")
+    assert_eq(compile_test_helpers.path_exists("{bin}.units"), flag == "--per-module")
+    let r = process.run(bin, []).unwrap()
+    compile_test_helpers.sh("rm -rf {dir}")
+    assert(r.success(), r.err_out)
+    r.out
+}
+
+test "a trait-qualified call on a generic impl formats the argument, per module" {
+    assert_eq(build_and_run("trait_qualified_binder_per_module", "--per-module"), WANT)
+}
+
+test "a trait-qualified call on a generic impl formats the argument, whole program" {
+    assert_eq(build_and_run("trait_qualified_binder_whole_program", "--no-per-module"), WANT)
+}
