@@ -9753,7 +9753,8 @@ fn tc_seed_expected_into_value(val: Int, expected: Int) ! TypeCheck.Resolve, Typ
     let mut v = val
     if node_kind(v) == NodeKind.NamedArg { v = node_value(v) }
     if v == -1 { return }
-    if node_kind(v) == NodeKind.MethodCall { tc_method_calls.seeded_expected.insert(v, expected) }
+    // A type-path read `K.x` that no member answers reads it too: its fix needs the place's type.
+    if node_kind(v) == NodeKind.MethodCall || node_kind(v) == NodeKind.FieldAccess { tc_method_calls.seeded_expected.insert(v, expected) }
     // A literal tree is typed whole by tc_literal_takes; descending into it as well would walk
     // each subtree again from every level above it.
     if is_literal_tree_node(v) { return tc_literal_takes(v, expected) }
@@ -11672,8 +11673,21 @@ fn tc_error_naming_types(name: Str, code: Str, msg: Str, at: Int, help: Str, tid
 
 // tc_error_naming_types with `extra` notes after the ones it adds.
 fn tc_error_naming_types_noted(name: Str, code: Str, msg: Str, at: Int, help: Str, tids: List[Int], extra: List[Str]) ! Diag.Report {
-    let mut notes: List[Str] = []
+    let (shadow_notes, shadow_helps) = tc_shadowing_notes(tids)
+    let mut notes = shadow_notes
     let mut helps: List[Str] = if help == "" { [] } else { [help] }
+    for h in shadow_helps {
+        if !helps.contains(h) { helps.push(h) }
+    }
+    for n in extra { notes.push(n) }
+    if notes.len() == 0 { return diag_error_at(name, code, msg, at, help) }
+    diag_error_at_notes(name, code, msg, at, helps.join("\n"), notes)
+}
+
+// The notes and helps of tc_error_naming_types for the subjects `tids`.
+fn tc_shadowing_notes(tids: List[Int]) -> (List[Str], List[Str]) {
+    let mut notes: List[Str] = []
+    let mut helps: List[Str] = []
     let mut seen: List[Int] = []
     for t in tids {
         let d = tc_shadowing_type_decl(t)
@@ -11689,9 +11703,7 @@ fn tc_error_naming_types_noted(name: Str, code: Str, msg: Str, at: Int, help: St
         let h = tc_shadowed_type_help(tname, home, nr_current_module)
         if !helps.contains(h) { helps.push(h) }
     }
-    for n in extra { notes.push(n) }
-    if notes.len() == 0 { return diag_error_at(name, code, msg, at, help) }
-    diag_error_at_notes(name, code, msg, at, helps.join("\n"), notes)
+    (notes, helps)
 }
 
 // A type mismatch under TYPE_ERROR, counted as tc_error_at counts one, with the notes
@@ -18632,21 +18644,42 @@ fn tc_flush_unresolved_methods(type_qualified: Bool) ! Diag.Report {
         let reported_later = tc_unclaimed_receiver_is_named(tc_lookup_node_tid(node_obj(n))) != 0
         if !reported_later && !tc_call_decl.contains_key(n) && tc_receiver_call_has_no_report(n) == 0 {
             let m = node_method(n)
-            let owners = tc_traits_declaring(m)
-            if owners.len() == 0 {
-                diag_error_at("UnresolvedMethod", UNRESOLVED_METHOD, "no type or trait declares method `{m}`", n, "correct the method name")
+            if type_qualified {
+                tc_report_unknown_type_qualified_call(n, m)
             } else {
-                let mut shown: List[Str] = []
-                for o in owners { shown.push("`{tc_trait_shown(o)}`") }
-                let said = if owners.len() == 1 { "trait {shown.join("")} declares" } else { "traits {shown.join(" and ")} declare" }
-                diag_error_at("UnresolvedMethod", UNRESOLVED_METHOD,
-                    "the receiver has no method `{m}`: {said} it, but its type does not get it from an impl or a bound", n,
-                    "give the receiver a type that implements {shown.join(" or ")}")
+                let owners = tc_traits_declaring(m)
+                if owners.len() == 0 {
+                    diag_error_at("UnresolvedMethod", UNRESOLVED_METHOD, "no type or trait declares method `{m}`", n, "correct the method name")
+                } else {
+                    let mut shown: List[Str] = []
+                    for o in owners { shown.push("`{tc_trait_shown(o)}`") }
+                    let said = if owners.len() == 1 { "trait {shown.join("")} declares" } else { "traits {shown.join(" and ")} declare" }
+                    diag_error_at("UnresolvedMethod", UNRESOLVED_METHOD,
+                        "the receiver has no method `{m}`: {said} it, but its type does not get it from an impl or a bound", n,
+                        "give the receiver a type that implements {shown.join(" or ")}")
+                }
             }
         }
         if diag_any_errors_since(before) > 0 { tc_method_calls.hard.insert(n, 1) }
         i = i + 1
     }
+}
+
+// The head of the call `n` names a type, so the call is a member of that type's namespace
+// (§3.4 *An unknown member of a type path*), read in the module and under the `Self` where the
+// call is written.
+fn tc_report_unknown_type_qualified_call(n: Int, method: Str) ! Diag.Report {
+    let written = node_name(node_obj(n))
+    let site_module = tc_site_module(n)
+    let site_self = tc_method_calls.type_qualified.get(n) ?? -1
+    let saved_module = nr_current_module
+    let saved_self = tc_current_self_tid
+    nr_current_module = site_module
+    tc_current_self_tid = site_self
+    let head = tc_static_head(written)
+    tc_report_unknown_member(n, written, head, method, 1)
+    tc_current_self_tid = saved_self
+    nr_current_module = saved_module
 }
 
 // 1 when a method call needs no report of its own. Another check reported it, or its receiver
@@ -25262,6 +25295,7 @@ type MethodCallFacts {
     // (`Bytes.nope()`). Such a receiver has no type of its own, as a poison value has none, but
     // no error made it, so the call still gets its report (sections/05_memory_compile_errors.md
     // §6.3.5). Recorded in Phase 1, the only phase that knows which names a scope binds.
+    // Each call whose head names a type, to the `Self` type where it is written, or -1.
     type_qualified: Map[Int, Int]
 }
 
@@ -25556,20 +25590,235 @@ fn tc_report_unresolved_method(node: Int, recv: Int, tname: Str, method: Str) ! 
     tc_error_naming_types("UnresolvedMethod", UNRESOLVED_METHOD, "unresolved method `.{method}` on type {tname}", node, tc_unresolved_method_help(k, tname, method, node), [recv])
 }
 
-// A static call names the type's namespace, so the help offers only a static that the same head
-// would answer, never an instance method or a builtin of another type.
-fn tc_report_unresolved_static(node: Int, recv: Int, head: StaticHead, written: Str, method: Str) ! Diag.Report {
-    tc_type_args_unresolved.insert(node, 1)
-    let near = nearest_name(method, tc_static_names(head))
-    let help = if near != "" {
-        "did you mean `{written}.{near}`?"
-    } else if (method == "display" || method == "to_string") && tc_type_has_display_impl(head.owner) != 0 {
-        // Display's methods take a receiver, so the call is on a value or names the trait.
-        "`{method}` takes a receiver: call it on a value, as `x.{method}()`, or as `Display.display(x)`"
-    } else {
-        ""
+// A member a type path `K.x` can name (§3.4 *An unknown member of a type path*): `kind` is
+// "function", "constant" or "variant".
+type PathMember {
+    name: Str
+    kind: Str
+}
+
+// The members of `K` that a lowercase `K.x` is compared with: the type-scoped and associated
+// functions, the constants, then the variants. A field and a method that takes `self` are not
+// in the `T.` namespace.
+fn tc_path_members(written: Str, head: StaticHead) -> List[PathMember] {
+    let mut fns = tc_static_names(head)
+    for f in tc_assoc_fn_names(head.owner) {
+        if !fns.contains(f) { fns.push(f) }
     }
-    tc_error_naming_types("UnresolvedMethod", UNRESOLVED_METHOD, "unresolved method `.{method}` on type {written}", node, help, [recv])
+    for f in tc_builtin_static_names(written, head) {
+        if !fns.contains(f) { fns.push(f) }
+    }
+    let mut out: List[PathMember] = []
+    for f in fns { out.push(PathMember { name: f, kind: "function" }) }
+    if head.owner == "Float" {
+        for c in tc_float_const_names() { out.push(PathMember { name: c, kind: "constant" }) }
+    }
+    match tc_qualifier_owner(written) {
+        Some(o) => for v in tc_owner_variant_names(o) { out.push(PathMember { name: v, kind: "variant" }) }
+        None => {}
+    }
+    out
+}
+
+// The static functions of a built-in type that the compiler answers with no signature.
+fn tc_builtin_static_names(written: Str, head: StaticHead) -> List[Str] {
+    // A declared type of the same name shadows the built-in one.
+    if head.decl >= 0 || tc_tid_decl_node(tc_path_subject_tid(written)) >= 0 { return [] }
+    match head.owner {
+        "Char" => ["from_code_point"]
+        "Float" => ["from_bits"]
+        "List" => ["new", "with_capacity"]
+        "Map" => ["new"]
+        "Set" => ["new"]
+        "Bytes" => ["new", "from_str", "zeroed"]
+        "StringBuilder" => ["new", "with_capacity"]
+        _ => []
+    }
+}
+
+// The associated functions one trait impl gives `owner`, sorted: a name two traits give it is
+// no single member.
+fn tc_assoc_fn_names(owner: Str) -> List[Str] {
+    let prefix = tc_method_traits_key(owner, "")
+    let mut out: List[Str] = []
+    for key in tc_method_trait_count_idx.keys() {
+        if key.starts_with(prefix) {
+            let m = key.byte_slice(prefix.byte_len(), key.byte_len())
+            if tc_method_trait_count(owner, m) == 1 {
+                let sig = lookup_fnsig(tc_impl_method_stem(owner, tc_method_trait_names(owner, m), m))
+                let decl = if sig == -1 { -1 } else { fnsig_pool.get(sig).unwrap().decl }
+                if decl >= 0 && !tc_fn_decl_takes_self(decl) { out.push(m) }
+            }
+        }
+    }
+    out.sort()
+}
+
+// The one member nearest to `member`, or a member with an empty name when none is. Two
+// members that share a name, such as a function and a variant, tie in nearest_name, so neither
+// is offered.
+fn tc_nearest_path_member(member: Str, members: List[PathMember]) -> PathMember {
+    let mut names: List[Str] = []
+    for m in members { names.push(m.name) }
+    let near = nearest_name(member, names)
+    if near != "" {
+        for m in members {
+            if m.name == near { return m }
+        }
+    }
+    PathMember { name: "", kind: "" }
+}
+
+// `K declares: functions a, b; variants C, D`, or "" when `K` declares no member.
+fn tc_path_members_listed(written: Str, members: List[PathMember]) -> Str {
+    let mut parts: List[Str] = []
+    for kind in ["function", "constant", "variant"] {
+        let mut names: List[Str] = []
+        for m in members {
+            if m.kind == kind { names.push(m.name) }
+        }
+        if names.len() > 0 { parts.push("{kind}s {names.join(", ")}") }
+    }
+    if parts.len() == 0 { "" } else { "`{written}` declares: {parts.join("; ")}" }
+}
+
+// error[UnresolvedMethod] for a lowercase member `K.x` that `K` does not declare, as a read
+// (`form` 0) or a call (`form` 1), on the member name (§3.4 *An unknown member of a type
+// path*). The fix renames the member only when the rewritten site type-checks: the help
+// names the candidate either way.
+fn tc_report_unknown_member(node: Int, written: Str, head: StaticHead, member: Str, form: Int) ! Diag.Report {
+    let members = tc_path_members(written, head)
+    let nearest = tc_nearest_path_member(member, members)
+    let near = nearest.name
+    let kind = nearest.kind
+    let help = if near != "" {
+        "did you mean the {kind} `{written}.{near}`?"
+    } else if (member == "display" || member == "to_string") && tc_type_has_display_impl(head.owner) != 0 {
+        // Display's methods take a receiver, so the call is on a value or names the trait.
+        "`{member}` takes a receiver: call it on a value, as `x.{member}()`, or as `Display.display(x)`"
+    } else {
+        tc_path_members_listed(written, members)
+    }
+    let subject = tc_path_subject_tid(written)
+    let (shadow_notes, shadow_helps) = tc_shadowing_notes([subject])
+    let mut notes = shadow_notes
+    let mut helps: List[Str] = if help == "" { [] } else { [help] }
+    for h in shadow_helps {
+        if !helps.contains(h) { helps.push(h) }
+    }
+    if subject >= 0 && type_kind(subject) == TyKind.Struct && get_struct_field_tid(subject, member) != -1 {
+        let value = written.byte_slice(0, 1).to_lower()
+        notes.push("`{member}` is a field of `{written}`; read it on a value, such as `{value}.{member}`")
+    }
+    let mut shown: List[Str] = []
+    if tc_method_trait_count(head.owner, member) == 0 {
+        // A user type can not implement a sealed trait, so naming one helps no one.
+        for t in tc_traits_declaring(member) {
+            if is_sealed_builtin_trait(t) == 0 { shown.push("`{tc_trait_shown(t)}`") }
+        }
+    }
+    if shown.len() > 0 {
+        let said = if shown.len() == 1 { "trait {shown.join("")} declares" } else { "traits {shown.join(" and ")} declare" }
+        notes.push("{said} `{member}`, and `{written}` does not implement it")
+    }
+    let line = node_line(node)
+    let col = tc_qualified_name_col(node, written, member)
+    let start = if col == -1 { node_col(node) } else { col }
+    let end = start + member.byte_len()
+    let before = diag_entry_count()
+    diag_error_span_label_at_notes("UnresolvedMethod", UNRESOLVED_METHOD, "no member `{member}` on type `{written}`", node, line, start, end, "`{written}` has no member `{member}`", helps.join("\n"), notes)
+    if near != "" && col != -1 && diag_entry_count() > before && tc_unknown_member_fix_checks(node, written, head, near, kind, form) {
+        diag_set_last_fix_at("rename to", near, line, col, line, end)
+    }
+}
+
+// The type a type path names, alias resolved, or -1 for a type parameter.
+fn tc_path_subject_tid(written: Str) -> Int {
+    if written == "Self" { return if tc_current_self_tid < 0 { -1 } else { resolve_alias_tid(tc_current_self_tid) } }
+    if tc_name_is_tparam_in_scope(written) != 0 { return -1 }
+    let named = lookup_named_type(written)
+    if named == -1 { -1 } else { resolve_alias_tid(named) }
+}
+
+// Whether `K.near` in place of the member type-checks at `node`, in the payload form `form`
+// (§3.4 *An unknown member of a type path*, conditions 1 and 2). The place's expected type,
+// when it sets one, must take the result. A place that drops the value, or a `let` with no
+// annotation, takes any. Any other place, such as an operand of `==`, an interpolation or a
+// receiver, gives the value to code this check does not see.
+fn tc_unknown_member_fix_checks(node: Int, written: Str, head: StaticHead, near: Str, kind: Str, form: Int) -> Bool {
+    let dropped = tc_method_calls.dropped.contains(node)
+    if !dropped && !tc_method_calls.seeded_expected.contains_key(node) { return false }
+    let want = tc_method_calls.seeded_expected.get(node) ?? -1
+    if kind == "variant" {
+        match tc_qualifier_owner(written) {
+            Some(o) => {
+                // A payload would need its arguments checked against the variant's fields.
+                if form != 0 || tc_owner_variant_form(o, near) != 0 { return false }
+                return tc_variant_owner_takes_want(o, want)
+            }
+            None => return false
+        }
+    }
+    if kind == "constant" {
+        return form == 0 && (tc_want_sets_no_type(want) || types_compatible(want, TYPE_FLOAT) != 0)
+    }
+    // A function value has no type at a type path yet, so only a call can be checked.
+    if form != 1 { return false }
+    let sig = tc_path_fn_sig(head, near)
+    if sig == -1 { return false }
+    let args = node_args(node)
+    let mut arg_tids: List[Int] = []
+    if args != -1 {
+        for i in 0..sublist_length(args) { arg_tids.push(tc_lookup_node_tid(sublist_get(args, i))) }
+    }
+    let r = tc_helper_call_check("{written}.{near}", sig, args, arg_tids, want, dropped || tc_want_sets_no_type(want))
+    r.mismatch == "" && r.proven
+}
+
+// A place whose type has a shape, such as `List[?]`, still rules out a value of another shape.
+fn tc_want_sets_no_type(want: Int) -> Bool {
+    want < 0 || tc_tid_is_no_info(want) != 0
+}
+
+// Whether a value of the enum `o` fits a place that expects `want`.
+fn tc_variant_owner_takes_want(o: VariantOwner, want: Int) -> Bool {
+    if tc_want_sets_no_type(want) { return true }
+    match tc_variant_owner_of(resolve_alias_tid(tc_resolve(want))) {
+        Some(w) => tc_same_owner(w, o)
+        None => false
+    }
+}
+
+// The signature a call `K.name` reaches: a type-scoped function, or the associated function
+// of the one trait that gives it `K`.
+fn tc_path_fn_sig(head: StaticHead, name: Str) -> Int {
+    let own = tc_static_head_sig(head, name)
+    if own != -1 { return own }
+    if tc_method_trait_count(head.owner, name) != 1 { return -1 }
+    lookup_fnsig(tc_impl_method_stem(head.owner, tc_method_trait_names(head.owner, name), name))
+}
+
+// Whether a read `qual.name` (§3.4 *Member case*) names no member of the type `qual`: `name`
+// does not start with an uppercase letter, and no type-scoped function, associated function,
+// method, constant or built-in static of that type takes it. A method that takes `self` is
+// left out here as a call is: a call through the type name accepts it today.
+fn tc_type_path_member_unknown(qual: Str, name: Str, node: Int) -> Bool {
+    if name.byte_len() == 0 || tc_name_is_upper(name) { return false }
+    if tc_name_is_tparam_in_scope(qual) != 0 || tc_head_names_trait(qual) || tc_type_name_poisoned(qual) { return false }
+    if is_import_module_name(qual) != 0 || is_builtin_namespace(qual) != 0 || tc_site_qualifier_module(qual, node) != "" { return false }
+    if qual != "Self" && !tc_names_a_type(qual) { return false }
+    let head = tc_static_head(qual)
+    // A trait's default body does not know what `Self` is.
+    if qual == "Self" && head.owner == "Self" { return false }
+    let owner = head.owner
+    if tc_static_head_sig(head, name) != -1 || tc_static_method_named(qual, name) || tc_static_method_named(owner, name) { return false }
+    if tc_method_trait_count(owner, name) > 0 || tc_conversion_trait_of(name) != "" { return false }
+    if tc_builtin_static_names(qual, head).contains(name) { return false }
+    match tc_qualifier_owner(qual) {
+        Some(o) => if tc_owner_has_variant(o, name) { return false }
+        None => {}
+    }
+    true
 }
 
 // The functions a static call on `head` resolves to: the type-scoped functions and the trait
@@ -27299,7 +27548,7 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                     // the rest.
                     tc_method_calls.unresolved.push(node)
                     if obj != -1 && node_kind(obj) == NodeKind.Ident && nr_receiver_has_binding(node_name(obj)) == 0 && tc_names_a_type(node_name(obj)) {
-                        tc_method_calls.type_qualified.insert(node, 1)
+                        tc_method_calls.type_qualified.insert(node, -1)
                     }
                 }
             }
@@ -33235,6 +33484,9 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
 
         if obj_node != -1 && node_kind(obj_node) == NodeKind.Ident {
             let obj_written = node_name(obj_node)
+            // The flush reports the call after its impl is checked, under the `Self` it is
+            // written in.
+            if tc_method_calls.type_qualified.contains_key(node) { tc_method_calls.type_qualified.insert(node, tc_current_self_tid) }
             let static_head = if nr_receiver_has_binding(obj_written) != 0 { StaticHead { owner: obj_written, alias: -1, decl: -1, builtin: false, inst: -1 } } else { tc_static_head(obj_written) }
             let obj_name = static_head.owner
             if nr_receiver_has_binding(obj_written) == 0 { tc_calls.static_owners.insert(node, obj_name) }
@@ -33710,7 +33962,10 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                         tc_error_at("function `{obj_written}.{method}` expects 1 argument(s), got {ff_count}", node)
                         return tc_error_recovery_tid()
                     }
-                    tc_report_unresolved_static(node, head_tid, static_head, obj_written, method)
+                    // A call with no function behind it has no binders for its list to count,
+                    // so the list gets no second report.
+                    tc_type_args_unresolved.insert(node, 1)
+                    tc_report_unknown_member(node, obj_written, static_head, method, 1)
                     return tc_error_recovery_tid()
                 }
             }
@@ -33736,6 +33991,10 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
             }
             if head_is_type {
                 if tc_report_bad_variant_value(node, obj_name, fname, 0) { return tc_error_recovery_tid() }
+                if tc_type_path_member_unknown(obj_name, fname, node) {
+                    tc_report_unknown_member(node, obj_name, tc_static_head(obj_name), fname, 0)
+                    return tc_error_recovery_tid()
+                }
             }
             let tid = if head_is_type { tc_value_head_tid(obj_name) } else { -1 }
             if tid != -1 && type_kind(tid) == TyKind.Enum {
@@ -40284,7 +40543,10 @@ fn tc_report_bad_variant_value(node: Int, qual: Str, name: Str, form: Int) -> Bo
             if tc_report_reserved_unbuilt(qual, node) != 0 { return true }
             let col = tc_qualified_name_col(node, qual, name)
             let start = if col == -1 { node_col(node) } else { col }
-            diag_error_span_at_notes("NoSuchVariant", NO_SUCH_VARIANT, "`{shown}` is {noun}; it has no variants", node, node_line(node), start, start + name.byte_len(), "", [])
+            // An uppercase member can still mean a type-scoped constant (§3.4 *Member case*).
+            let near = if type_to_str(tc_qualifier_tid(qual)) == "Float" { nearest_name(name, tc_float_const_names()) } else { "" }
+            let help = if near == "" { "" } else { "did you mean the constant `{qual}.{near}`?" }
+            diag_error_span_at_notes("NoSuchVariant", NO_SUCH_VARIANT, "`{shown}` is {noun}; it has no variants", node, node_line(node), start, start + name.byte_len(), help, [])
             true
         }
         None => false
@@ -40307,16 +40569,12 @@ fn tc_value_on_non_enum(qual: Str, name: Str) -> Option[(Str, Str)] ! TypeCheck.
 
 fn tc_float_const_named(qual: Str, name: Str) -> Bool ! TypeCheck.Resolve, Diag.Report {
     if type_to_str(tc_qualifier_tid(qual)) != "Float" { return false }
-    match name {
-        "PI" => true
-        "E" => true
-        "INF" => true
-        "NAN" => true
-        "MAX" => true
-        "EPSILON" => true
-        "MIN_POSITIVE" => true
-        _ => false
-    }
+    tc_float_const_names().contains(name)
+}
+
+// The type-scoped constants of Float (§3.4 *Member case*).
+fn tc_float_const_names() -> List[Str] {
+    ["PI", "E", "INF", "NAN", "MAX", "EPSILON", "MIN_POSITIVE"]
 }
 
 fn tc_static_method_named(owner: Str, name: Str) -> Bool {
@@ -42804,7 +43062,9 @@ fn tc_report_no_module_member(node: Int, q: Str, member: Str) ! Diag.Report {
     let near = nr_near_module_member(target, member)
     nr_current_module = outer_module
     let help = if near != "" && near != member { "did you mean `{q}.{near}`?" } else { "" }
-    diag_error_at("UnresolvedMethod", UNRESOLVED_METHOD, "no member `{member}` on module `{q}`", node, help)
+    let col = tc_qualified_name_col(node, q, member)
+    let start = if col == -1 { node_col(node) } else { col }
+    diag_error_span_label_at_notes("UnresolvedMethod", UNRESOLVED_METHOD, "no member `{member}` on module `{q}`", node, node_line(node), start, start + member.byte_len(), "`{q}` has no member `{member}`", help, [])
 }
 
 // A built-in call and an effect have a name in the module, and no value to read.

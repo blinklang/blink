@@ -1,0 +1,229 @@
+// A lowercase member `K.zed` that the type `K` does not declare is E0505, as a read and as a
+// call, with the head "no member `zed` on type `K`" and the span on the member
+// (sections/03_types.md §3.4 *An unknown member of a type path*). A module path `m.nope` has
+// the same head shape and span (§10.5 *Import Errors*). The help names the one nearest
+// function, constant or variant; the fix is machine-applicable only when the rewritten site
+// type-checks, the payload forms agree and one candidate is nearest. A struct field is never a
+// candidate and gets a note. An uppercase member stays E0547, and its candidates include the
+// type-scoped constants. The binding of a failed site has the poison type, so later uses of it
+// report nothing more.
+
+import std.fs
+import std.process.{ProcessResult, ChildEnd}
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_reset}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+import compile_test_helpers
+
+fn typecheck_probe(path: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    init_embedded_stdlib()
+    fs.write(path, src).unwrap()
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+}
+
+// Each error as "name line:col-end: message | help | label | fix | notes", in report order.
+// The fix reads "action `text` at col-end", or "-" when there is none.
+fn errors_of(src: Str) -> List[Str] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    typecheck_probe("build/test_typecheck_unknown_member_of_a_type_path_probe.bl", src)
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" {
+            let fix = if d.fix_action == "" { "-" } else { "{d.fix_action} `{d.fix_text}` at {d.fix_col}-{d.fix_end_col}" }
+            out.push("{d.name} {d.line}:{d.col}-{d.end_col}: {d.message} | {d.help} | {d.label} | {fix} | {d.notes.join("; ")}")
+        }
+    }
+    out
+}
+
+// The head, help and fix of the one error a source gets, or every error when it gets another
+// count, so a failed assert shows them.
+fn only_error(src: Str) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    let got = errors_of(src)
+    if got.len() != 1 { return "{got.len()} errors: {got.join(" || ")}" }
+    got.get(0).unwrap()
+}
+
+let LEVEL = "type Level \{ Low, High }\nfn Level_parse(s: Str) -> Level \{\n    if s == \"hi\" \{ Level.High } else \{ Level.Low }\n}\n"
+
+test "a lowercase read of a variant name gets the variant as a machine-applicable fix" {
+    let src = "{LEVEL}fn main() \{\n    let _a = Level.high\n}\n"
+    assert_eq(only_error(src), "UnresolvedMethod 6:20-24: no member `high` on type `Level` | did you mean the variant `Level.High`? | `Level` has no member `high` | rename to `High` at 20-24 | ")
+}
+
+test "a variant candidate whose type the site does not want gets the help and no fix" {
+    let src = "{LEVEL}fn main() \{\n    let _f: fn() -> Level = Level.high\n}\n"
+    assert_eq(only_error(src), "UnresolvedMethod 6:35-39: no member `high` on type `Level` | did you mean the variant `Level.High`? | `Level` has no member `high` | - | ")
+}
+
+test "a call of a unit variant name gets the help and no fix" {
+    let src = "{LEVEL}fn main() \{\n    let _b = Level.high(1)\n}\n"
+    assert_eq(only_error(src), "UnresolvedMethod 6:20-24: no member `high` on type `Level` | did you mean the variant `Level.High`? | `Level` has no member `high` | - | ")
+}
+
+test "a misspelt type-scoped function whose call type-checks gets the function as a fix" {
+    let src = "{LEVEL}fn main() \{\n    let _b = Level.parsr(\"hi\")\n}\n"
+    assert_eq(only_error(src), "UnresolvedMethod 6:20-25: no member `parsr` on type `Level` | did you mean the function `Level.parse`? | `Level` has no member `parsr` | rename to `parse` at 20-25 | ")
+}
+
+test "a misspelt type-scoped function whose arguments do not fit gets the help and no fix" {
+    let src = "{LEVEL}fn main() \{\n    let _b = Level.parsr(1)\n}\n"
+    assert_eq(only_error(src), "UnresolvedMethod 6:20-25: no member `parsr` on type `Level` | did you mean the function `Level.parse`? | `Level` has no member `parsr` | - | ")
+}
+
+test "a field named through the struct type is no candidate and gets a note" {
+    let src = "type Point \{ x: Int, y: Int }\nfn main() \{\n    let _v = Point.x\n}\n"
+    assert_eq(only_error(src), "UnresolvedMethod 3:20-21: no member `x` on type `Point` |  | `Point` has no member `x` | - | `x` is a field of `Point`; read it on a value, such as `p.x`")
+}
+
+test "two equally near variants give no suggestion and the help lists the members" {
+    let src = "type Dir \{ Left, Lift }\nfn main() \{\n    let _a = Dir.lxft\n}\n"
+    assert_eq(only_error(src), "UnresolvedMethod 3:18-22: no member `lxft` on type `Dir` | `Dir` declares: variants Left, Lift | `Dir` has no member `lxft` | - | ")
+}
+
+test "the help lists the functions and the variants of a type with no near member" {
+    let src = "{LEVEL}fn main() \{\n    let _a = Level.zzzzzz\n}\n"
+    assert_eq(only_error(src), "UnresolvedMethod 6:20-26: no member `zzzzzz` on type `Level` | `Level` declares: functions parse; variants Low, High | `Level` has no member `zzzzzz` | - | ")
+}
+
+test "an uppercase member near a type-scoped constant is E0547 with the constant in the help" {
+    let src = "fn main() \{\n    let _m = Float.MAXX\n}\n"
+    let got = only_error(src)
+    assert(got.starts_with("NoSuchVariant 2:20-24: "), got)
+    assert(got.contains(" | did you mean the constant `Float.MAX`? | "), got)
+}
+
+test "an unknown member of a type alias names the alias" {
+    let src = "{LEVEL}type LevelAlias = Level\nfn main() \{\n    let _a = LevelAlias.high\n}\n"
+    assert_eq(only_error(src), "UnresolvedMethod 7:25-29: no member `high` on type `LevelAlias` | did you mean the variant `LevelAlias.High`? | `LevelAlias` has no member `high` | rename to `High` at 25-29 | ")
+}
+
+test "an unknown static call on a built-in type is E0505 on the member" {
+    let src = "fn main() \{\n    let _a = Bytes.nope(1)\n}\n"
+    let got = only_error(src)
+    assert(got.starts_with("UnresolvedMethod 2:20-24: no member `nope` on type `Bytes` | "), got)
+}
+
+test "the binding of an unknown member is poison and its later uses report nothing" {
+    let src = "type K \{ A(Int), B }\nfn main() \{\n    let k = K.zed\n    let _n: Int = k\n    let _m = k.anything()\n    let c = K.zed(1)\n    let _s: Str = c\n}\n"
+    let got = errors_of(src)
+    assert_eq(got.len(), 2)
+    assert(got.get(0).unwrap().starts_with("UnresolvedMethod 3:15-18: no member `zed` on type `K` | "), got.join(" || "))
+    assert(got.get(1).unwrap().starts_with("UnresolvedMethod 6:15-18: no member `zed` on type `K` | "), got.join(" || "))
+}
+
+test "an unknown call and an unknown uppercase member in one function get a report each" {
+    let src = "type Point \{ x: Int, y: Int }\nfn Point_make(n: Int) -> Point \{\n    Point \{ x: n, y: n }\n}\nfn main() \{\n    let _a = Point.mak(1)\n    let _b = Point.NOPE\n}\n"
+    let got = errors_of(src)
+    assert_eq(got.len(), 2)
+    // The uppercase member is reported as the function is walked, and the call after it.
+    assert(got.get(0).unwrap().starts_with("NoSuchVariant 7:20-24: "), got.join(" || "))
+    assert(got.get(1).unwrap().starts_with("UnresolvedMethod 6:20-23: no member `mak` on type `Point` | did you mean the function `Point.make`? | "), got.join(" || "))
+}
+
+test "a declared member, a variant and a binder that shadows a type read with no report" {
+    let src = "{LEVEL}type W \{ a: Int }\nfn W_make() -> W \{\n    W \{ a: 1 }\n}\nfn main() \{\n    let _a = Level.High\n    let _b = Level.parse(\"hi\")\n    let _m = W.make\n    let W = W \{ a: 2 }\n    let _x = W.a\n}\n"
+    assert_eq(errors_of(src), [])
+}
+
+// These members exist, so check reports nothing, the same as before the unknown-member report.
+// The build of either read still stops at an internal error: a type-scoped function has no
+// value form yet. This row keeps that gap in sight.
+test "a type-scoped function or a library static read as a value has no report from check" {
+    let src = "import std.time.\{Duration}\ntype W \{ a: Int }\nfn W_make() -> W \{\n    W \{ a: 1 }\n}\nfn main() \{\n    let _m = W.make\n    let _d = Duration.ms\n}\n"
+    assert_eq(errors_of(src), [])
+}
+
+// The trait method `abs` takes a receiver, so `Int.abs` names no member of the type path. A
+// later report for a method read with no receiver can take this site over.
+test "a receiver method read through a built-in type path is E0505 on the member" {
+    let src = "fn main() \{\n    let _a = Int.abs\n}\n"
+    assert_eq(only_error(src), "UnresolvedMethod 2:18-21: no member `abs` on type `Int` |  | `Int` has no member `abs` | - | ")
+}
+
+// A trait method that takes `self` is not a member of the type path, so its read is left to a
+// later report for a method read with no receiver, and it is no candidate for a misspelt call.
+test "a receiver trait method read through its type has no report and is no candidate" {
+    let src = "trait Shape \{\n    fn area(self) -> Int\n}\ntype K \{ x: Int }\nimpl Shape for K \{\n    fn area(self) -> Int \{ self.x }\n}\nfn main() \{\n    let _a = K.area\n    let _b = K.arae(K \{ x: 1 })\n}\n"
+    assert_eq(only_error(src), "UnresolvedMethod 10:16-20: no member `arae` on type `K` |  | `K` has no member `arae` | - | ")
+}
+
+test "a function and a variant of one name tie, so the help lists the members" {
+    let src = "type Level \{ Low, High }\nfn Level_high() -> Level \{\n    Level.High\n}\nfn main() \{\n    let _a = Level.hihg\n}\n"
+    assert_eq(only_error(src), "UnresolvedMethod 6:20-24: no member `hihg` on type `Level` | `Level` declares: functions high; variants Low, High | `Level` has no member `hihg` | - | ")
+}
+
+test "an unknown member of a module path is E0505 on the member, as a read and as a call" {
+    let src = "import std.random\nfn main() ! Rand \{\n    let _f = random.shufle\n    random.shufle([1, 2])\n}\n"
+    let got = errors_of(src)
+    assert_eq(got.len(), 2)
+    assert(got.get(0).unwrap().starts_with("UnresolvedMethod 3:21-27: no member `shufle` on module `random` | did you mean `random.shuffle`? | `random` has no member `shufle` | "), got.join(" || "))
+    assert(got.get(1).unwrap().starts_with("UnresolvedMethod 4:12-18: no member `shufle` on module `random` | did you mean `random.shuffle`? | `random` has no member `shufle` | "), got.join(" || "))
+}
+
+test "a variant candidate where the place sets no type and does not bind the value gets no fix" {
+    let src = "{LEVEL}fn main() \{\n    let x = Level.Low\n    let _c = x == Level.high\n    let _s = \"\{Level.high}\"\n}\n"
+    let got = errors_of(src)
+    assert_eq(got.len(), 2)
+    assert(got.get(0).unwrap().starts_with("UnresolvedMethod 7:25-29: no member `high` on type `Level` | did you mean the variant `Level.High`? | `Level` has no member `high` | - | "), got.join(" || "))
+    assert(got.get(1).unwrap().starts_with("UnresolvedMethod 8:22-26: no member `high` on type `Level` | did you mean the variant `Level.High`? | `Level` has no member `high` | - | "), got.join(" || "))
+}
+
+test "a misspelt call whose result is dropped gets the function as a fix" {
+    let src = "{LEVEL}fn main() \{\n    Level.parsr(\"hi\")\n}\n"
+    assert_eq(only_error(src), "UnresolvedMethod 6:11-16: no member `parsr` on type `Level` | did you mean the function `Level.parse`? | `Level` has no member `parsr` | rename to `parse` at 11-16 | ")
+}
+
+test "an unknown call through Self names the members of the impl's type" {
+    let src = "type K \{ x: Int }\nfn K_make() -> K \{\n    K \{ x: 1 }\n}\ntrait Mk \{\n    fn mk() -> Self\n}\nimpl Mk for K \{\n    fn mk() -> K \{\n        Self.mak()\n    }\n}\nfn main() \{\n}\n"
+    assert_eq(only_error(src), "UnresolvedMethod 10:14-17: no member `mak` on type `Self` | `Self` declares: functions make, mk | `Self` has no member `mak` | - | ")
+}
+
+test "a field read through Self in an impl gets the field note" {
+    let src = "type K \{ x: Int }\ntrait Mk \{\n    fn mk() -> Self\n}\nimpl Mk for K \{\n    fn mk() -> K \{\n        let _v = Self.x\n        K \{ x: 1 }\n    }\n}\nfn main() \{\n}\n"
+    assert_eq(only_error(src), "UnresolvedMethod 7:23-24: no member `x` on type `Self` | `Self` declares: functions mk | `Self` has no member `x` | - | `x` is a field of `Self`; read it on a value, such as `s.x`")
+}
+
+test "a member that a trait declares and the type does not implement gets a note naming the trait" {
+    let src = "trait Shape \{\n    fn area(self) -> Int\n}\ntype K \{ x: Int }\nfn main() \{\n    let _a = K.area(K \{ x: 1 })\n}\n"
+    assert_eq(only_error(src), "UnresolvedMethod 6:16-20: no member `area` on type `K` |  | `K` has no member `area` | - | trait `Shape` declares `area`, and `K` does not implement it")
+}
+
+test "a type that shadows a built-in one gets the shadow note and none of the built-in statics" {
+    let src = "type List \{ n: Int }\nfn main() \{\n    let _a = List.nw\n}\n"
+    let got = only_error(src)
+    assert(got.starts_with("UnresolvedMethod 3:19-21: no member `nw` on type `List` | "), got)
+    assert(got.contains("import blink.core.\{List as CoreList}"), got)
+    assert(got.contains("`List` here is `type List`"), got)
+    assert(!got.contains("Map.new") && !got.contains("`List.new`"), got)
+}
+
+test "the built-in statics of a built-in type read with no report" {
+    let src = "fn main() \{\n    let _a = StringBuilder.with_capacity\n    let _b = Char.from_code_point\n    let _c = Float.from_bits\n    let _d = Bytes.zeroed\n}\n"
+    assert_eq(errors_of(src), [])
+}
+
+let DIR = "{compile_test_helpers.scratch_root()}/unknown_member_check_build"
+
+fn sh(cmd: Str) -> ProcessResult ! Process.Spawn {
+    process.run("sh", ["-c", cmd]).unwrap()
+}
+
+test "check and build stop at the same report for an unknown member read, with no internal error" {
+    let _mk = sh("rm -rf {DIR} && mkdir -p {DIR}")
+    fs.write("{DIR}/main.bl", "type K \{ A(Int), B }\nfn main() \{\n    let k = K.zed\n    io.println(\"built\")\n}\n").unwrap()
+    let env_of = "env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE"
+    let check = sh("B=$(pwd)/build/blink; cd {DIR} && {env_of} $B check main.bl < /dev/null")
+    let build = sh("B=$(pwd)/build/blink; cd {DIR} && {env_of} $B build main.bl < /dev/null")
+    let _rm = sh("rm -rf {DIR}")
+    let head = "error[UnresolvedMethod]: no member `zed` on type `K`"
+    assert_eq(check.end, ChildEnd.Exited(1))
+    assert(check.out.concat(check.err_out).contains(head), check.out.concat(check.err_out))
+    assert_eq(build.end, ChildEnd.Exited(1))
+    let built = build.out.concat(build.err_out)
+    assert(built.contains(head), built)
+    assert(!built.contains("internal compiler error") && !built.contains("NoTypeForNode"), built)
+}
