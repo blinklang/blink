@@ -23534,7 +23534,7 @@ pub fn tc_qualified_carrier(qualifier: Str, variant: Str) -> Option[TyKind] {
 // A carrier variant called through an alias, as `OI.Some(1)`. The alias's target is the value's
 // type, so the payload is held to the slot the target gives it.
 fn tc_alias_carrier_call_tid(head: Int, spelled: Str, variant: Str, args_sl: Int, node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
-    if !tc_check_carrier_arity(variant, args_sl, node) { return tc_error_recovery_tid() }
+    if !tc_check_carrier_payload(variant, args_sl, node) { return tc_error_recovery_tid() }
     let h = ty_pool.get(tc_resolve(head)).unwrap()
     let slot = if variant == "Err" { h.inner2 } else { h.inner1 }
     if args_sl != -1 && sublist_length(args_sl) == 1 {
@@ -23611,15 +23611,24 @@ fn tc_ok_payload_may_be_unit() -> Bool {
     type_kind(resolve_alias_tid(payload)) == TyKind.Void
 }
 
-// Reports a carrier constructor call of the wrong arity in the words a user variant's gets.
-// Answers whether the count fits.
-fn tc_check_carrier_arity(variant: Str, args_sl: Int, call_node: Int) -> Bool ! TypeCheck.Report, Diag.Report {
-    let (fewest, most) = tc_carrier_arity(variant)
+// A carrier's fields have no names, so its payload takes the rules of a user variant declared
+// with unnamed fields (§3.4). Answers whether the payload can type the carrier's slot: a
+// label fills no slot, so its value is inferred for its own errors and checked against none.
+fn tc_check_carrier_payload(variant: Str, args_sl: Int, call_node: Int) -> Bool ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    let labels = tc_lit_labels(args_sl)
     let got = if args_sl != -1 { sublist_length(args_sl) } else { 0 }
-    if got >= fewest && got <= most { return true }
+    let (fewest, most) = tc_carrier_arity(variant)
+    if labels.len() == 0 && got >= fewest && got <= most { return true }
     let want = if fewest == most { "{most}" } else { "{fewest} or {most}" }
-    tc_error_at("variant `{variant}` expects {want} argument(s), got {got}", call_node)
-    false
+    let well_formed = tc_check_unnamed_payload(tc_carrier_literal_owner(variant), args_sl, fewest, most,
+        "variant `{variant}` expects {want} argument(s), got {got}", [], call_node)
+    let mut i = 0
+    while labels.len() > 0 && i < got {
+        let a = sublist_get(args_sl, i)
+        let _ = tc_infer_unhinted(if node_kind(a) == NodeKind.NamedArg { node_value(a) } else { a })
+        i = i + 1
+    }
+    well_formed
 }
 
 // A carrier constructor call, bare (`Some(x)`) or qualified (`Option.Some(x)`): the one path
@@ -23634,25 +23643,17 @@ fn tc_carrier_call_tid(variant: Str, args_sl: Int, call_node: Int) -> Int ! Type
 }
 
 fn tc_carrier_call_instance_tid(variant: Str, args_sl: Int, call_node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
-    let fits = tc_check_carrier_arity(variant, args_sl, call_node)
+    // A payload that cannot type the slot leaves the carrier's type unknown, not a guess from it.
+    if !tc_check_carrier_payload(variant, args_sl, call_node) { return tc_error_recovery_tid() }
     let arg = if args_sl != -1 && sublist_length(args_sl) >= 1 { sublist_get(args_sl, 0) } else { -1 }
     match variant {
         "None" => make_option_type(tc_carrier_slot_from_hint(TyKind.Option, 1))
-        "Some" => {
-            if arg == -1 { return make_option_type(make_metavar()) }
-            make_option_type(infer_carrier_arg(arg, variant))
-        }
+        "Some" => make_option_type(infer_carrier_arg(arg, variant))
         "Ok" => {
-            // A rejected `Ok()` has no payload type: unit would be a second, wrong error
-            // against the payload the expected type names.
-            if arg == -1 && !fits { return tc_error_recovery_tid() }
             let payload = if arg == -1 { TYPE_VOID } else { infer_carrier_arg(arg, variant) }
             make_result_type(payload, tc_carrier_slot_from_hint(TyKind.Result, 2))
         }
-        _ => {
-            if arg == -1 { return make_result_type(make_metavar(), make_metavar()) }
-            make_result_type(tc_carrier_slot_from_hint(TyKind.Result, 1), infer_carrier_arg(arg, variant))
-        }
+        _ => make_result_type(tc_carrier_slot_from_hint(TyKind.Result, 1), infer_carrier_arg(arg, variant))
     }
 }
 
@@ -24168,6 +24169,15 @@ fn tc_variant_literal_owner(var_idx: Int) -> Option[LitOwner] {
     Some(LitOwner { shown: "{tc_nominal_type_name(edecl)}.{node_name(vdecl)}", decl: edecl, rows: tc_lit_rows(node_fields(vdecl)), is_struct: false })
 }
 
+// Option and Result are not in evar_pool, and their fields have no names.
+fn tc_carrier_literal_owner(variant: Str) -> LitOwner {
+    let shown = match tc_prelude_carrier_of(variant) {
+        Some(k) => "{tc_prelude_carrier_name(k)}.{variant}"
+        None => variant
+    }
+    LitOwner { shown: shown, decl: -1, rows: [], is_struct: false }
+}
+
 fn tc_lit_labels(sl: Int) -> List[Int] {
     let mut labels: List[Int] = []
     if sl == -1 { return labels }
@@ -24204,9 +24214,9 @@ fn tc_check_brace_literal(owner: Option[LitOwner], node: Int) ! Diag.Report {
 
 // §3.4 Variant Construction. Positional arguments come first (E0527). A payload with no label
 // keeps the argument count, and so does one with more positions than fields. Any other payload
-// on a variant that names its fields takes the literal field checks on what its arguments
-// fill: argument i fills field i, and a label fills the field it names. A label can name no
-// field of a variant with unnamed fields, so there the count stays and its labels are unknown.
+// takes the field rules in place of the count: on a variant that names its fields, the
+// literal field checks on what its arguments fill (argument i fills field i, and a label
+// fills the field it names); on a variant with unnamed fields, `tc_check_unnamed_payload`.
 // A variant that mixes the two forms (E0320) reports nothing at its uses.
 fn tc_check_variant_paren_payload(var_idx: Int, vname: Str, node: Int) ! TypeCheck.Report, Diag.Report {
     let args_sl = node_args(node)
@@ -24215,30 +24225,63 @@ fn tc_check_variant_paren_payload(var_idx: Int, vname: Str, node: Int) ! TypeChe
     let expected = variant_field_count(var_idx)
     if labels.len() == 0 && got == expected { return }
     if tc_variant_mixes_fields(var_idx) { return }
-    let owner_opt = tc_variant_literal_owner(var_idx)
-    let named = match owner_opt {
-        Some(owner) => owner.rows.len() > 0 && owner.rows.len() == expected
-        None => false
+    // Every variant slot has its declaration node, so a known variant always has an owner.
+    let owner = match tc_variant_literal_owner(var_idx) {
+        Some(o) => o
+        None => {
+            tc_report_variant_arity("", var_idx, vname, got - labels.len(), labels, node)
+            return
+        }
     }
-    if tc_report_positional_after_label(args_sl, named) { return }
+    if owner.rows.len() == 0 {
+        let notes = tc_variant_fields_note(owner.shown, var_idx, got - labels.len(), labels)
+        let _ = tc_check_unnamed_payload(owner, args_sl, expected, expected, "variant `{vname}` expects {expected} argument(s), got {got}", notes, node)
+        return
+    }
+    if tc_report_positional_after_label(args_sl, true) { return }
     let mut positional: List[Int] = []
     let mut i = 0
     while i < got - labels.len() {
         positional.push(sublist_get(args_sl, i))
         i = i + 1
     }
-    match owner_opt {
-        Some(owner) => {
-            if named && labels.len() > 0 && positional.len() <= expected {
-                tc_report_literal_fields(owner, positional, labels, -1, node, -1)
-                return
-            }
-            tc_report_variant_arity(owner.shown, var_idx, vname, positional.len(), labels, node)
-            let faults = literal_field_faults(owner.rows, positional, labels, false)
-            for u in faults.unknowns { tc_report_unknown_label(owner, positional.len(), labels, u, false) }
-        }
-        None => tc_report_variant_arity("", var_idx, vname, positional.len(), labels, node)
+    if !tc_payload_takes_count(positional.len(), labels, expected) {
+        tc_report_literal_fields(owner, positional, labels, -1, node, -1)
+        return
     }
+    tc_report_variant_arity(owner.shown, var_idx, vname, positional.len(), labels, node)
+    let faults = literal_field_faults(owner.rows, positional, labels, false)
+    for u in faults.unknowns { tc_report_unknown_label(owner, positional.len(), labels, u, false) }
+}
+
+// §3.4: a labelled payload takes the field rules in place of the count, unless its positional
+// arguments alone are more than the variant's fields.
+fn tc_payload_takes_count(positional: Int, labels: List[Int], most: Int) -> Bool {
+    labels.len() == 0 || positional > most
+}
+
+// The payload rules of a variant whose fields have no names, a carrier among them (§3.4):
+// E0527 first; then the count error (`count_msg`, with `count_notes`) where the count governs;
+// then the field rules, under which no label names a field, so a label is NoSuchField and a
+// second use of it is DuplicateField. Answers whether the payload can type the variant's
+// slots: a positional count that fits and no label.
+fn tc_check_unnamed_payload(owner: LitOwner, args_sl: Int, fewest: Int, most: Int, count_msg: Str, count_notes: List[Str], node: Int) -> Bool ! TypeCheck.Report, Diag.Report {
+    if tc_report_positional_after_label(args_sl, false) { return false }
+    let labels = tc_lit_labels(args_sl)
+    let got = if args_sl != -1 { sublist_length(args_sl) } else { 0 }
+    let mut positional: List[Int] = []
+    let mut i = 0
+    while i < got - labels.len() {
+        positional.push(sublist_get(args_sl, i))
+        i = i + 1
+    }
+    let fits = got >= fewest && got <= most
+    if !fits && tc_payload_takes_count(positional.len(), labels, most) {
+        tc_errors.push(count_msg)
+        diag_error_at_notes("TypeError", TYPE_ERROR, count_msg, node, "", count_notes)
+    }
+    let _ = tc_report_label_faults(owner, owner.rows, positional, labels, false, false)
+    fits && labels.len() == 0
 }
 
 // The first positional argument after a label, as PositionalAfterKeyword. Only a variant

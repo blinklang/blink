@@ -1,0 +1,198 @@
+// `Some`, `Ok` and `Err` are variants declared with `( )` and no names (sections/05 §7.2,
+// §7.3), so a label in their paren payload names no field: NoSuchField (E0525) at the label,
+// the same answer a user variant declared `Pair(Int, Int)` gets (sections/03_types.md §3.4
+// *The payload form of a construction*). A labelled payload takes the field rules in place of
+// the argument count, unless its positional arguments alone are too many. `blink check` must
+// report it, so that a build never reaches lowering with a labelled payload.
+
+import std.process.{ProcessResult, ChildEnd}
+import compile_test_helpers
+
+let DIR = "{compile_test_helpers.scratch_root()}/a_label_on_a_carrier_payload"
+
+fn sh(cmd: Str) -> ProcessResult ! Process.Spawn {
+    process.run("sh", ["-c", cmd]).unwrap()
+}
+
+// The corpus variables would point the child at the corpus's own archive and module set.
+fn blink_in_dir(args: Str) -> ProcessResult ! Process.Spawn {
+    sh("B=$(pwd)/build/blink; cd {DIR} && env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE timeout 120 $B {args}")
+}
+
+fn error_rows(out: Str) -> List[Str] {
+    let mut rows: List[Str] = []
+    for row in out.trim().split("\n") {
+        if row.contains("\"severity\":\"error\"") { rows.push(row) }
+    }
+    rows
+}
+
+// Each want is "CODE@line:col@message@help", or "CODE@line:col@message@help@note", in the order
+// the errors are reported. An empty help means the row has none.
+fn expect_rows(name: Str, body: List[Str], want: List[Str]) -> Str ! FS.Write, Process.Spawn {
+    let src = [
+        "type Shape \{",
+        "    Pair(Int, Int)",
+        "    One(Int)",
+        "}",
+        "type OI = Option[Int]",
+        "fn main() \{",
+    ].append(body).append(["}", ""]).join("\n")
+    fs.write("{DIR}/{name}.bl", src).unwrap()
+    let r = blink_in_dir("check --json {name}.bl")
+    let rows = error_rows(r.err_out)
+    let mut problems: List[Str] = []
+    if r.end != ChildEnd.Exited(1) { problems.push("{name}: want exit 1, got {r.end}") }
+    if rows.len() != want.len() { problems.push("{name}: want {want.len()} error rows, got {rows.len()}:\n{r.err_out}") }
+    let mut i = 0
+    while i < rows.len() && i < want.len() {
+        let row = rows.get(i).unwrap()
+        let parts = want.get(i).unwrap().split("@")
+        let code = parts.get(0).unwrap()
+        let at = parts.get(1).unwrap().split(":")
+        let msg = parts.get(2).unwrap()
+        let help = parts.get(3).unwrap()
+        if !row.contains("\"code\":\"{code}\"") { problems.push("{name}: row {i}: want {code} in {row}") }
+        if !row.contains("\"line\":{at.get(0).unwrap()},\"col\":{at.get(1).unwrap()}") { problems.push("{name}: row {i}: want {parts.get(1).unwrap()} in {row}") }
+        if !row.contains("\"message\":\"{msg}\"") { problems.push("{name}: row {i}: want message {msg} in {row}") }
+        if help == "" && row.contains("\"help\":") { problems.push("{name}: row {i}: want no help in {row}") }
+        if help != "" && !row.contains("\"help\":\"{help}\"") { problems.push("{name}: row {i}: want help {help} in {row}") }
+        if parts.len() > 4 {
+            let note = parts.get(4).unwrap()
+            if !row.contains("\"notes\":[\"{note}\"]") { problems.push("{name}: row {i}: want the one note {note} in {row}") }
+        }
+        i = i + 1
+    }
+    problems.join("\n")
+}
+
+fn report(problems: List[Str]) ! IO.Eprint {
+    let mut bad = false
+    for p in problems {
+        if p != "" {
+            io.eprintln(p)
+            bad = true
+        }
+    }
+    assert(!bad)
+}
+
+fn no_field(shown: Str, label: Str) -> Str {
+    "`{shown}` has no field `{label}`@`{shown}` has no named fields"
+}
+
+test "a label on Some, Ok or Err names no field" {
+    let _ = sh("rm -rf {DIR}; mkdir -p {DIR}")
+    let some = expect_rows("some_label", [
+        "    let v: Option[Int] = Some(vale: 1)",
+        "    let _w = v",
+    ], ["E0525@7:31@{no_field("Option.Some", "vale")}"])
+    let ok = expect_rows("ok_label", [
+        "    let r: Result[Int, Str] = Ok(x: 1)",
+        "    let _w = r",
+    ], ["E0525@7:34@{no_field("Result.Ok", "x")}"])
+    let err = expect_rows("err_label", [
+        "    let r: Result[Int, Str] = Err(e: \"s\")",
+        "    let _w = r",
+    ], ["E0525@7:35@{no_field("Result.Err", "e")}"])
+    let qualified = expect_rows("qualified_label", [
+        "    let v = Option.Some(vale: 1)",
+        "    let _w = v",
+    ], ["E0525@7:25@{no_field("Option.Some", "vale")}"])
+    let _ = sh("rm -rf {DIR}")
+    report([some, ok, err, qualified])
+}
+
+test "a carrier gives the codes a user variant with unnamed fields gives" {
+    let _ = sh("rm -rf {DIR}; mkdir -p {DIR}")
+    let pair = expect_rows("pair_label", [
+        "    let p = Shape.Pair(x: 1, y: 2)",
+        "    let _w = p",
+    ], ["E0525@7:24@{no_field("Shape.Pair", "x")}", "E0525@7:30@{no_field("Shape.Pair", "y")}"])
+    let one_mixed = expect_rows("one_mixed", [
+        "    let p = Shape.One(1, x: 2)",
+        "    let _w = p",
+    ], ["E0525@7:26@{no_field("Shape.One", "x")}"])
+    let some_mixed = expect_rows("some_mixed", [
+        "    let v: Option[Int] = Some(1, x: 2)",
+        "    let _w = v",
+    ], ["E0525@7:34@{no_field("Option.Some", "x")}"])
+    let one_too_many = expect_rows("one_too_many", [
+        "    let p = Shape.One(1, 2, x: 3)",
+        "    let _w = p",
+    ], ["E0300@7:13@variant `One` expects 1 argument(s), got 3@", "E0525@7:29@{no_field("Shape.One", "x")}"])
+    let some_too_many = expect_rows("some_too_many", [
+        "    let v: Option[Int] = Some(1, 2, x: 3)",
+        "    let _w = v",
+    ], ["E0300@7:26@variant `Some` expects 1 argument(s), got 3@", "E0525@7:37@{no_field("Option.Some", "x")}"])
+    let one_after = expect_rows("one_after_label", [
+        "    let p = Shape.One(x: 1, 2)",
+        "    let _w = p",
+    ], ["E0527@7:29@a payload cannot write a positional argument after a labelled one@write the positional arguments first"])
+    let some_after = expect_rows("some_after_label", [
+        "    let v: Option[Int] = Some(x: 1, 2)",
+        "    let _w = v",
+    ], ["E0527@7:37@a payload cannot write a positional argument after a labelled one@write the positional arguments first"])
+    let _ = sh("rm -rf {DIR}")
+    report([pair, one_mixed, some_mixed, one_too_many, some_too_many, one_after, some_after])
+}
+
+test "a label on a nested carrier payload names no field" {
+    let _ = sh("rm -rf {DIR}; mkdir -p {DIR}")
+    let nested = expect_rows("nested_label", [
+        "    let v: Option[Option[Int]] = Some(Some(v: 1))",
+        "    let _w = v",
+    ], ["E0525@7:44@{no_field("Option.Some", "v")}"])
+    let in_ok = expect_rows("some_in_ok", [
+        "    let r: Result[Option[Int], Str] = Ok(Some(n: 1))",
+        "    let _w = r",
+    ], ["E0525@7:47@{no_field("Option.Some", "n")}"])
+    let _ = sh("rm -rf {DIR}")
+    report([nested, in_ok])
+}
+
+test "a labelled carrier value fills no slot, so only its label is reported" {
+    let _ = sh("rm -rf {DIR}; mkdir -p {DIR}")
+    let some_str = expect_rows("some_label_str", [
+        "    let v: Option[Int] = Some(v: \"s\")",
+        "    let _w = v",
+    ], ["E0525@7:31@{no_field("Option.Some", "v")}"])
+    let ok_str = expect_rows("ok_label_str", [
+        "    let r: Result[Int, Str] = Ok(v: \"s\")",
+        "    let _w = r",
+    ], ["E0525@7:34@{no_field("Result.Ok", "v")}"])
+    let alias_str = expect_rows("alias_label_str", [
+        "    let v = OI.Some(v: \"s\")",
+        "    let _w = v",
+    ], ["E0525@7:21@{no_field("Option.Some", "v")}"])
+    let alias = expect_rows("alias_label", [
+        "    let v = OI.Some(v: 1)",
+        "    let _w = v",
+    ], ["E0525@7:21@{no_field("Option.Some", "v")}"])
+    let undefined = expect_rows("label_value_undefined", [
+        "    let v: Option[Int] = Some(v: undefined_x)",
+        "    let _w = v",
+    ], ["E0506@7:34@undefined variable `undefined_x`@", "E0525@7:31@{no_field("Option.Some", "v")}"])
+    let none = expect_rows("none_label", [
+        "    let v: Option[Int] = None(x: 1)",
+        "    let _w = v",
+    ], ["E0525@7:31@{no_field("Option.None", "x")}"])
+    let _ = sh("rm -rf {DIR}")
+    report([some_str, ok_str, alias_str, alias, undefined, none])
+}
+
+// §2.14 *Checking a Literal's Fields*: the labels form a set, so the label is NoSuchField once,
+// and its second use is DuplicateField, reported first (§2.14 Order).
+test "a repeated label on a variant with unnamed fields is DuplicateField and then NoSuchField" {
+    let _ = sh("rm -rf {DIR}; mkdir -p {DIR}")
+    let some = expect_rows("some_repeated", [
+        "    let v: Option[Int] = Some(x: 1, x: 2)",
+        "    let _w = v",
+    ], ["E0316@7:37@field `x` is given twice@remove one of the two@first given here: 7:31", "E0525@7:31@{no_field("Option.Some", "x")}"])
+    let pair = expect_rows("pair_repeated", [
+        "    let p = Shape.Pair(x: 1, x: 2)",
+        "    let _w = p",
+    ], ["E0316@7:30@field `x` is given twice@remove one of the two@first given here: 7:24", "E0525@7:24@{no_field("Shape.Pair", "x")}"])
+    let _ = sh("rm -rf {DIR}")
+    report([some, pair])
+}
