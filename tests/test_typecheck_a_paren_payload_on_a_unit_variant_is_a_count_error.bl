@@ -1,0 +1,93 @@
+// A unit variant takes no paren payload (sections/03_types.md §3.4 *The payload form of a
+// construction*), not even `()`, so `K.A()` and `K.A(1)` are count errors. The spec code of a
+// count error is VariantArgumentCount (E0321). The compiler reports every variant count error as
+// TypeError (E0300), and these rows move to E0321 with the rest of them, in one change. `()`
+// gets the help only: the E0321 catalog entry gives a machine fix only for `Ok()`.
+
+import std.fs
+import std.process.{ProcessResult, ChildEnd}
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_reset}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+import compile_test_helpers
+
+fn typecheck_probe(path: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    init_embedded_stdlib()
+    fs.write(path, src).unwrap()
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+}
+
+// Each error as "name line:col-end: message | help | fix | notes", in report order. The fix
+// reads "action `text` at col-end", or "-" when there is none.
+fn errors_of(src: Str) -> List[Str] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    typecheck_probe("build/test_typecheck_paren_payload_on_a_unit_variant_probe.bl", src)
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" {
+            let fix = if d.fix_action == "" { "-" } else { "{d.fix_action} `{d.fix_text}` at {d.fix_line}:{d.fix_col}-{d.fix_end_line}:{d.fix_end_col}" }
+            out.push("{d.name} {d.line}:{d.col}-{d.end_col}: {d.message} | {d.help} | {fix} | {d.notes.join("; ")}")
+        }
+    }
+    out
+}
+
+// The one error a source gets, or every error when it gets another count, so a failed assert
+// shows them.
+fn only_error(src: Str) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    let got = errors_of(src)
+    if got.len() != 1 { return "{got.len()} errors: {got.join(" || ")}" }
+    got.get(0).unwrap()
+}
+
+let K = "type K \{\n    A\n    B\n}\n"
+
+test "empty parentheses on a qualified unit variant are a count error" {
+    let src = "{K}fn main() \{\n    let _v = K.A()\n}\n"
+    assert_eq(only_error(src), "TypeError 6:17-19: variant `A` takes no arguments | remove the parentheses | - | ")
+}
+
+test "empty parentheses on a unit variant at a typed place are a count error" {
+    let src = "{K}fn main() \{\n    let _v: K = K.A()\n}\n"
+    assert_eq(only_error(src), "TypeError 6:20-22: variant `A` takes no arguments | remove the parentheses | - | ")
+}
+
+test "empty parentheses through a type alias are a count error" {
+    let src = "{K}type KA = K\nfn main() \{\n    let _v = KA.A()\n}\n"
+    assert_eq(only_error(src), "TypeError 7:18-20: variant `A` takes no arguments | remove the parentheses | - | ")
+}
+
+test "empty parentheses on a unit variant of a generic enum are one error, and the call has the poison type" {
+    let src = "type Opt[T] \{\n    Yes(T)\n    No\n}\nfn main() \{\n    let _f = Opt.No()\n}\n"
+    assert_eq(only_error(src), "TypeError 6:20-22: variant `No` takes no arguments | remove the parentheses | - | ")
+}
+
+test "an argument to a unit variant is a count error" {
+    let src = "{K}fn main() \{\n    let _v = K.A(1)\n}\n"
+    assert_eq(only_error(src), "TypeError 6:14-0: variant `A` expects 0 argument(s), got 1 |  | - | ")
+}
+
+let DIR = "{compile_test_helpers.scratch_root()}/unit_variant_parens_check_build"
+
+fn sh(cmd: Str) -> ProcessResult ! Process.Spawn {
+    process.run("sh", ["-c", cmd]).unwrap()
+}
+
+test "check and build stop at the same count error for parentheses on a unit variant, with no internal error" {
+    let _mk = sh("rm -rf {DIR} && mkdir -p {DIR}")
+    fs.write("{DIR}/main.bl", "type K \{ A\n B }\nfn main() \{ let v = K.A()\n io.println(\"\{match v \{ K.A => 0\n K.B => 1 }}\") }\n").unwrap()
+    let env_of = "env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE"
+    let check = sh("B=$(pwd)/build/blink; cd {DIR} && {env_of} $B check main.bl < /dev/null")
+    let build = sh("B=$(pwd)/build/blink; cd {DIR} && {env_of} $B build main.bl < /dev/null")
+    let _rm = sh("rm -rf {DIR}")
+    let head = "error[TypeError]: variant `A` takes no arguments"
+    assert_eq(check.end, ChildEnd.Exited(1))
+    assert(check.out.concat(check.err_out).contains(head), check.out.concat(check.err_out))
+    assert_eq(build.end, ChildEnd.Exited(1))
+    let built = build.out.concat(build.err_out)
+    assert(built.contains(head), built)
+    assert(!built.contains("internal compiler error"), built)
+}

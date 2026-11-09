@@ -22,7 +22,7 @@ import parser.{
     sublist_get, sublist_length,
 }
 import diagnostics.{
-    Diag, diag_clear_allows, diag_error_at, diag_error_at_notes, diag_error_span_at_notes, diag_error_no_loc,
+    Diag, diag_clear_allows, diag_error_at, diag_error_at_notes, diag_error_in_file_label_notes, diag_error_span_at_notes, diag_error_no_loc,
     diag_set_last_fix, diag_set_last_fix_at, diag_add_label_since, diag_release_repeat_key_since, diag_add_last_fix_edit, diag_set_fix_edits_at, DiagEntry, DiagFixEdit, diag_source_lines, diag_entries, UNDECLARED_EFFECT, UNSOURCED_EFFECT_WILDCARD, DERIVED_OP_FOREIGN_EFFECT,
     diag_push_allows, diag_enter_allows, diag_exit_allows, NON_CONST_EXPR,
     diag_warn_at, diag_warn_at_notes, diag_warn_span_at_notes, PARTIAL_HANDLER, diag_truncate, diag_entry_count, diag_any_errors_since, diag_ice_at, diag_ice, PRELUDE_TYPE_NOT_LOADED, diag_count, diag_emit_in_file, diag_file_for_node, diag_file_node_range,
@@ -24245,6 +24245,87 @@ fn tc_check_brace_literal(owner: Option[LitOwner], node: Int) ! Diag.Report {
     }
 }
 
+// §3.4 *The payload form of a construction*: a unit variant takes no paren payload, not even
+// `()`. The argument count cannot see `()`, since it gives 0 arguments for 0 fields. A bare `A()`
+// is E0554 (§3.4 *Resolving a bare name*), so only a qualified head comes here. The caller
+// gives the call the poison type, so the site gets one report. No machine fix: the E0321
+// catalog entry gives one only for `Ok()`.
+fn tc_report_unit_variant_parens(var_idx: Int, vname: Str, node: Int) -> Bool ! TypeCheck.Report, Diag.Report {
+    if node_args(node) != -1 && sublist_length(node_args(node)) != 0 { return false }
+    if tc_variant_decl_form(var_idx) != 0 { return false }
+    let msg = "variant `{vname}` takes no arguments"
+    let help = "remove the parentheses"
+    tc_errors.push(msg)
+    let open = tc_open_col_after_head(node, 40)
+    let close = if open == -1 { -1 } else { tc_byte_col_from(node, open, 41) }
+    if close == -1 {
+        diag_error_at("TypeError", TYPE_ERROR, msg, node, help)
+    } else {
+        diag_error_in_file_label_notes("TypeError", TYPE_ERROR, msg, diag_file_for_node(node), node_line(node), open, node_line(node), close + 1, "", help, [])
+    }
+    true
+}
+
+// §3.4 *The payload form of a construction*: a brace literal constructs a variant declared
+// with `{ }`, or with `( )` and named fields. A unit variant is neither, so its brace literal
+// is E0300 on the braces, and the payload gets no other error. `written` is the head as the
+// site writes it, which is also the repair. A bare `A { }` is E0554, as with the parentheses.
+fn tc_report_unit_variant_braces(var_idx: Int, written: Str, node: Int) -> Bool ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    if tc_variant_decl_form(var_idx) != 0 { return false }
+    let vname = node_name(tc_variant_decl_node(var_idx))
+    let msg = "variant `{vname}` has no payload, and the literal has braces"
+    let help = "remove the braces: write `{written}`"
+    tc_errors.push(msg)
+    let open = tc_open_col_after_head(node, 123)
+    let end_line = node_end_line(node)
+    if end_line <= 0 {
+        diag_error_at("TypeError", TYPE_ERROR, msg, node, help)
+    } else {
+        let before = diag_entry_count()
+        let start = if open == -1 { node_col(node) } else { open }
+        diag_error_in_file_label_notes("TypeError", TYPE_ERROR, msg, diag_file_for_node(node), node_line(node), start, end_line, node_end_col(node), "", help, [])
+        if open != -1 && diag_entry_count() > before && tc_unit_braces_rewrite_types(var_idx, node) {
+            diag_set_last_fix_at("remove the braces", written, node_line(node), node_col(node), end_line, node_end_col(node))
+        }
+    }
+    tc_infer_orphan_field_values(node_fields(node))
+    true
+}
+
+// The column of the `{` or `(` that opens a payload, or -1 when the head line has none. The
+// parser keeps no column for it, and the head before it is a path, which holds neither byte.
+fn tc_open_col_after_head(node: Int, byte: U8) -> Int {
+    if node_col(node) < 1 { return -1 }
+    tc_byte_col_from(node, node_col(node), byte)
+}
+
+// The column of the first `byte` at or after column `col` on the line of `node`, or -1.
+fn tc_byte_col_from(node: Int, col: Int, byte: U8) -> Int {
+    let src = diag_source_line(diag_file_for_node(node), node_line(node))
+    let mut i = col - 1
+    while i < src.byte_len() {
+        if src.byte_at(i) == byte { return i + 1 }
+        i = i + 1
+    }
+    -1
+}
+
+// The catalog makes the fix machine-applicable only when the head alone types where the literal
+// stands. So the braces must hold no value whose effect the rewrite would drop, and the place
+// must want this enum: a generic enum needs the place to pin its instance, since nothing else
+// would. A hint that holds a callee's type parameter or an unsolved variable pins nothing.
+fn tc_unit_braces_rewrite_types(var_idx: Int, node: Int) -> Bool {
+    let flds = node_fields(node)
+    if flds != -1 && sublist_length(flds) > 0 { return false }
+    let ev = evar_pool.get(var_idx).unwrap()
+    let tps = node_type_params(ev.enum_decl)
+    let generic = tps != -1 && sublist_length(tps) > 0
+    if tc_construct_hint < 0 || tc_tid_is_no_info(tc_construct_hint) != 0 { return !generic }
+    let hint = resolve_alias_tid(tc_resolve(tc_construct_hint))
+    if type_kind(hint) != TyKind.Enum || tc_enum_base_tid(hint) != tc_enum_base_tid(ev.enum_id) { return false }
+    tc_tid_has_unknown(hint) == 0 && tc_tid_has_unbound_metavar(hint) == 0 && tc_tid_has_foreign_typevar(hint) == 0
+}
+
 // §3.4 Variant Construction. Positional arguments come first (E0527). A payload with no label
 // keeps the argument count, and so does one with more positions than fields. Any other payload
 // takes the field rules in place of the count: on a variant that names its fields, the
@@ -31210,9 +31291,11 @@ fn tc_infer_struct_lit_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Rep
                 let qual = sname.byte_slice(0, dot)
                 let vname = sname.byte_slice(dot + 1, sname.byte_len())
                 let qtid = tc_value_head_tid(qual)
-                if qtid != -1 && type_kind(qtid) == TyKind.Enum && get_variant_by_name(tc_enum_base_tid(qtid), vname) != -1 {
+                let qvar = if qtid != -1 && type_kind(qtid) == TyKind.Enum { get_variant_by_name(tc_enum_base_tid(qtid), vname) } else { -1 }
+                if qvar != -1 {
                     check_deprecated_type(qual, node)
-                    tc_check_brace_literal(tc_variant_literal_owner(get_variant_by_name(tc_enum_base_tid(qtid), vname)), node)
+                    if tc_report_unit_variant_braces(qvar, sname, node) { return tc_error_recovery_tid() }
+                    tc_check_brace_literal(tc_variant_literal_owner(qvar), node)
                     if tc_alias_decl_of_written(qual) != -1 {
                         return tc_note_open_variant(node, tc_alias_brace_variant_tid(qtid, vname, node_fields(node)))
                     }
@@ -32179,6 +32262,7 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                     if cvar_idx != -1 {
                         nr_note_call_decl(node, tc_variant_decl_node(cvar_idx))
                         let cargs_sl = node_args(node)
+                        if tc_report_unit_variant_parens(cvar_idx, method, node) { return tc_error_recovery_tid() }
                         tc_check_variant_paren_payload(cvar_idx, method, node)
                         if tc_alias_decl_of_written(cname) != -1 {
                             let _ = tc_check_variant_payload_values_at("{cname}.{method}", cvar_idx, cargs_sl, ctor_tid)
@@ -40293,7 +40377,13 @@ fn tc_owner_variant_names(o: VariantOwner) -> List[Str] {
 // written payload has the form the suggested variant was declared with.
 fn tc_owner_variant_form(o: VariantOwner, name: Str) -> Int {
     if o.base < 0 { return if name == "None" { 0 } else { 1 } }
-    let decl = tc_variant_decl_node(get_variant_by_name(o.base, name))
+    tc_variant_decl_form(get_variant_by_name(o.base, name))
+}
+
+// The declared form of a user variant, as tc_owner_variant_form numbers it, or -1 with no
+// declaration. `A()` in a declaration parses as `A`, so it is a unit variant.
+fn tc_variant_decl_form(var_idx: Int) -> Int {
+    let decl = tc_variant_decl_node(var_idx)
     if decl == -1 { return -1 }
     if node_int_val(decl) == 1 { return 2 }
     if node_fields(decl) != -1 { return 1 }

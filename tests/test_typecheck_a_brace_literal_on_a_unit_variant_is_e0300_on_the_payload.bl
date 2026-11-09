@@ -1,0 +1,136 @@
+// A brace literal constructs a variant declared with `{ }`, or one declared with `( )` whose
+// fields all have names (sections/03_types.md §3.4 *The payload form of a construction*). A
+// unit variant is neither, so `K.A { }` and `K.A { x: 1 }` are TypeError (E0300), with the span
+// on the payload and no other report for it: a label in it is no NoSuchField. The help writes
+// the head as written with no braces. The fix is machine-applicable only when that rewrite
+// type-checks: the braces are empty, and a generic enum's instance comes from the place. The
+// literal has the poison type, so later uses of its binding report nothing more.
+
+import std.fs
+import std.process.{ProcessResult, ChildEnd}
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_reset}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+import compile_test_helpers
+
+fn typecheck_probe(path: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    init_embedded_stdlib()
+    fs.write(path, src).unwrap()
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+}
+
+// Each error as "name line:col-end: message | help | fix | notes", in report order. The fix
+// reads "action `text` at col-end", or "-" when there is none.
+fn errors_of(src: Str) -> List[Str] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    typecheck_probe("build/test_typecheck_brace_literal_on_a_unit_variant_probe.bl", src)
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" {
+            let fix = if d.fix_action == "" { "-" } else { "{d.fix_action} `{d.fix_text}` at {d.fix_line}:{d.fix_col}-{d.fix_end_line}:{d.fix_end_col}" }
+            out.push("{d.name} {d.line}:{d.col}-{d.end_col}: {d.message} | {d.help} | {fix} | {d.notes.join("; ")}")
+        }
+    }
+    out
+}
+
+// The one error a source gets, or every error when it gets another count, so a failed assert
+// shows them.
+fn only_error(src: Str) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    let got = errors_of(src)
+    if got.len() != 1 { return "{got.len()} errors: {got.join(" || ")}" }
+    got.get(0).unwrap()
+}
+
+let K = "type K \{\n    A\n    B\n}\n"
+
+test "empty braces on a qualified unit variant are E0300 on the braces with a machine fix" {
+    let src = "{K}fn main() \{\n    let _v = K.A \{ }\n}\n"
+    assert_eq(only_error(src), "TypeError 6:18-21: variant `A` has no payload, and the literal has braces | remove the braces: write `K.A` | remove the braces `K.A` at 6:14-6:21 | ")
+}
+
+test "a label in braces on a unit variant gets the one E0300 and no fix" {
+    let src = "{K}fn main() \{\n    let _v = K.A \{ x: 1 }\n}\n"
+    assert_eq(only_error(src), "TypeError 6:18-26: variant `A` has no payload, and the literal has braces | remove the braces: write `K.A` | - | ")
+}
+
+test "empty braces through a type alias name the alias in the help and the fix" {
+    let src = "{K}type KA = K\nfn main() \{\n    let _v = KA.A \{ }\n}\n"
+    assert_eq(only_error(src), "TypeError 7:19-22: variant `A` has no payload, and the literal has braces | remove the braces: write `KA.A` | remove the braces `KA.A` at 7:14-7:22 | ")
+}
+
+test "empty braces on a unit variant of a generic enum at a typed place get the fix" {
+    let src = "type Opt[T] \{\n    No\n    Yes(T)\n}\nfn main() \{\n    let _v: Opt[Int] = Opt.No \{ }\n}\n"
+    assert_eq(only_error(src), "TypeError 6:31-34: variant `No` has no payload, and the literal has braces | remove the braces: write `Opt.No` | remove the braces `Opt.No` at 6:24-6:34 | ")
+}
+
+// `Opt.No` alone at a place that sets no type is CannotInferType, so the rewrite does not
+// type-check and the fix is not offered. The poison type keeps CannotInferType off the literal.
+test "empty braces on a unit variant of a generic enum at an untyped place get no fix" {
+    let src = "type Opt[T] \{\n    No\n    Yes(T)\n}\nfn main() \{\n    let _v = Opt.No \{ }\n}\n"
+    assert_eq(only_error(src), "TypeError 6:21-24: variant `No` has no payload, and the literal has braces | remove the braces: write `Opt.No` | - | ")
+}
+
+// The parameter type of a generic callee holds its own `T`, which pins no instance here, so
+// `Opt.No` alone would not type-check and the fix is not offered.
+test "empty braces on a unit variant of a generic enum passed to a generic parameter get no fix" {
+    let src = "type Opt[T] \{\n    No\n    Yes(T)\n}\nfn cnt[T](_x: Opt[T]) -> Int \{ 0 }\nfn main() \{\n    let _n = cnt(Opt.No \{ })\n}\n"
+    assert_eq(only_error(src), "TypeError 7:25-28: variant `No` has no payload, and the literal has braces | remove the braces: write `Opt.No` | - | ")
+}
+
+test "empty braces on a unit variant at a place of another type get no fix" {
+    let src = "{K}fn main() \{\n    let _n: Int = K.A \{ }\n}\n"
+    assert_eq(only_error(src), "TypeError 6:23-26: variant `A` has no payload, and the literal has braces | remove the braces: write `K.A` | - | ")
+}
+
+// The parser keeps no column for the `{`, and it is found on the line of the head only. A head
+// split over lines gets the span of the literal, and no fix.
+test "empty braces after a head split over lines get the span of the literal and no fix" {
+    let src = "{K}fn main() \{\n    let _v = K\n        .A \{ }\n}\n"
+    assert_eq(only_error(src), "TypeError 6:14-15: variant `A` has no payload, and the literal has braces | remove the braces: write `K.A` | - | ")
+}
+
+test "the binding of a brace literal on a unit variant is poison and its uses report nothing" {
+    let src = "{K}fn main() \{\n    let v = K.A \{ }\n    let _n: Int = v\n    io.println(\"\{match v \{ K.A => 0\n K.B => 1 }}\")\n}\n"
+    assert_eq(only_error(src), "TypeError 6:17-20: variant `A` has no payload, and the literal has braces | remove the braces: write `K.A` | remove the braces `K.A` at 6:13-6:20 | ")
+}
+
+// The payload is the one form error; a value under it is still checked as any expression is.
+test "an undefined name in a value under the braces is still reported" {
+    let src = "{K}fn main() \{\n    let _v = K.A \{ x: nope }\n}\n"
+    let got = errors_of(src)
+    assert_eq(got.len(), 2)
+    assert(got.join(" || ").contains("UndefinedVariable 6:23-"), got.join(" || "))
+    assert(got.join(" || ").contains("TypeError 6:18-29: variant `A` has no payload, and the literal has braces | remove the braces: write `K.A` | - | "), got.join(" || "))
+}
+
+// The build side of this program is a known gap: it fails in the generated C.
+test "empty braces on a variant declared with empty braces are legal" {
+    let src = "type K \{\n    A \{}\n    B\n}\nfn main() \{\n    let _v = K.A \{ }\n}\n"
+    assert_eq(errors_of(src), [])
+}
+
+let DIR = "{compile_test_helpers.scratch_root()}/unit_variant_braces_check_build"
+
+fn sh(cmd: Str) -> ProcessResult ! Process.Spawn {
+    process.run("sh", ["-c", cmd]).unwrap()
+}
+
+test "check and build stop at the same E0300 for braces on a unit variant, with no internal error" {
+    let _mk = sh("rm -rf {DIR} && mkdir -p {DIR}")
+    fs.write("{DIR}/main.bl", "type K \{ A\n B }\nfn main() \{ let v = K.A \{ }\n io.println(\"\{match v \{ K.A => 0\n K.B => 1 }}\") }\n").unwrap()
+    let env_of = "env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE"
+    let check = sh("B=$(pwd)/build/blink; cd {DIR} && {env_of} $B check main.bl < /dev/null")
+    let build = sh("B=$(pwd)/build/blink; cd {DIR} && {env_of} $B build main.bl < /dev/null")
+    let _rm = sh("rm -rf {DIR}")
+    let head = "error[TypeError]: variant `A` has no payload, and the literal has braces"
+    assert_eq(check.end, ChildEnd.Exited(1))
+    assert(check.out.concat(check.err_out).contains(head), check.out.concat(check.err_out))
+    assert_eq(build.end, ChildEnd.Exited(1))
+    let built = build.out.concat(build.err_out)
+    assert(built.contains(head), built)
+    assert(!built.contains("internal compiler error"), built)
+}

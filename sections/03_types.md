@@ -3023,11 +3023,13 @@ error[VariantSpread]: a variant literal cannot copy fields with `..s`
 
 **The payload form of a construction.** A paren payload constructs only a variant declared with `( )`. A brace literal constructs a variant declared with `{ }`, and a variant declared with `( )` whose fields all have names. So the declared form decides which payload forms a variant accepts:
 
-| Payload | Variant declared with `{ }` | Variant declared with `( )` and named fields | Variant declared with `( )` and no names |
-|---------|-----------------------------|----------------------------------------------|------------------------------------------|
-| brace literal, `V { x: 1, y: 2 }` | ok | ok | `NoSuchField` (E0525) |
-| paren payload, positional, `V(1, 2)` | `TypeError` (E0300) | ok | ok |
-| paren payload, all labelled, `V(x: 1, y: 2)` | `TypeError` (E0300) | ok | `NoSuchField` (E0525) |
+| Payload | Variant declared with `{ }` | Variant declared with `( )` and named fields | Variant declared with `( )` and no names | Unit variant |
+|---------|-----------------------------|----------------------------------------------|------------------------------------------|--------------|
+| brace literal, `V { x: 1, y: 2 }` | ok | ok | `NoSuchField` (E0525) | `TypeError` (E0300) |
+| paren payload, positional, `V(1, 2)` | `TypeError` (E0300) | ok | ok | `VariantArgumentCount` (E0321) |
+| paren payload, all labelled, `V(x: 1, y: 2)` | `TypeError` (E0300) | ok | `NoSuchField` (E0525) | `NoSuchField` (E0525) |
+
+A brace literal on a unit variant (`K.A { }`, `K.A { x: 1 }`) is `TypeError` (E0300) on the braces, and a label in them gets no other error. It has no `note:`, and the help writes the variant with no braces (`K.A`).
 
 ```blink
 type Shape {
