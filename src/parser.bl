@@ -2700,9 +2700,11 @@ fn synth_self_param(line: Int, col: Int) -> Int ! Parse.Build {
     id
 }
 
-fn synth_recv_ann(recv: Str, line: Int, col: Int) -> Int ! Parse.Build {
+// `recv`, or `recv[A, B]` with a copy of each annotation in `args`.
+fn synth_recv_ann(recv: Str, args: Int, line: Int, col: Int) -> Int ! Parse.Build {
+    let elems = synth_copy_type_list(args)
     let id = node_count()
-    node_push(AstNode { kind: NodeKind.TypeAnn, name: recv, line: line, col: col })
+    node_push(AstNode { kind: NodeKind.TypeAnn, name: recv, elements: elems, line: line, col: col })
     id
 }
 
@@ -2725,11 +2727,36 @@ fn synth_block_of(expr: Int, line: Int, col: Int) -> Int ! Parse.Build {
     block
 }
 
+// A copy of the type annotation or type parameter `id` and of each annotation under it, or
+// -1 for -1. The provided impl gets nodes of its own, so nothing typecheck records on a node
+// of one impl is read back for the other.
+fn synth_copy_type_tree(id: Int) -> Int ! Parse.Build {
+    if id < 0 { return id }
+    let n = node_at(id)
+    let elems = synth_copy_type_list(n.elements)
+    let ann = synth_copy_type_tree(n.type_ann)
+    let copy = node_count()
+    node_push(AstNode { elements: elems, type_ann: ann, ..n })
+    copy
+}
+
+fn synth_copy_type_list(sl: Int) -> Int ! Parse.Build {
+    if sl == -1 { return -1 }
+    let mut ids: List[Int] = []
+    let mut i = 0
+    while i < sublist_length(sl) {
+        ids.push(synth_copy_type_tree(sublist_get(sl, i)))
+        i = i + 1
+    }
+    synth_list_of(ids)
+}
+
 // `fn enter(self) -> R { self }`. It returns the receiver, not `Self`, because a method's
 // return is checked against the receiver the impl names.
-fn synth_closeable_enter(recv: Str, line: Int, col: Int) -> Int ! Parse.Build {
+fn synth_closeable_enter(im: Int, line: Int, col: Int) -> Int ! Parse.Build {
+    let recv = node_name(im)
     let params = synth_list_of([synth_self_param(line, col)])
-    let ret = synth_recv_ann(recv, line, col)
+    let ret = synth_recv_ann(node_name(im), node_recv_type_args(im), line, col)
     let body = synth_block_of(synth_ident("self", line, col), line, col)
     let id = node_count()
     node_push(AstNode {
@@ -2744,7 +2771,7 @@ fn synth_closeable_enter(recv: Str, line: Int, col: Int) -> Int ! Parse.Build {
 // impl written through an import alias may sit in a file where `Closeable` names another
 // trait, and a call cannot yet be qualified by an alias, so that exit calls `self.close()`.
 fn synth_closeable_exit(close: Int, by_alias: Bool, line: Int, col: Int) -> Int ! Parse.Build {
-    let ok_ann = synth_recv_ann("Bool", line, col)
+    let ok_ann = synth_recv_ann("Bool", -1, line, col)
     let ok = node_count()
     node_push(AstNode { kind: NodeKind.Param, name: "_ok", type_name: "Bool", type_ann: ok_ann, line: line, col: col })
     let params = synth_list_of([synth_self_param(line, col), ok])
@@ -2783,10 +2810,12 @@ fn synth_closeable_exit(close: Int, by_alias: Bool, line: Int, col: Int) -> Int 
 //         fn exit(self, _ok: Bool) ! <close's effects> { Closeable.close(self) }
 //     }
 //
-// Returns -1 when `im` names no spelling of Closeable, has no `close(self)` (typecheck reports
-// the impl), or is generic: a generic impl's methods are lowered per instance, which this
-// compiler does not build, and typecheck takes such a type as a scoped value by its Closeable
-// impl alone.
+// A generic impl gives a generic one, with the same binders, bounds and receiver:
+// `impl[T: Eq] Closeable for R[T]` gives `impl[T: Eq] BlockHandler for R[T]` with
+// Context = R[T].
+//
+// Returns -1 when `im` names no spelling of Closeable, or has no `close(self)` (typecheck
+// reports the impl).
 fn closeable_provided_impl(im: Int, spellings: List[Str]) -> Int ! Parse.Build {
     if parse_desugar_enabled == 0 { return -1 }
     let written = node_trait_name(im)
@@ -2794,20 +2823,24 @@ fn closeable_provided_impl(im: Int, spellings: List[Str]) -> Int ! Parse.Build {
     let last = parts.get(parts.len() - 1) ?? written
     if last != "Closeable" && !spellings.contains(written) { return -1 }
     let recv = node_name(im)
-    if recv == "" || node_impl_binders(im) != -1 || node_recv_type_args(im) != -1 { return -1 }
+    if recv == "" { return -1 }
     let close = closeable_close_method(im)
     if close == -1 { return -1 }
     let line = node_line(close)
     let col = node_col(close)
-    let ctx_ann = synth_recv_ann(recv, line, col)
+    let ctx_ann = synth_recv_ann(node_name(im), node_recv_type_args(im), line, col)
     let ctx = node_count()
     node_push(AstNode { kind: NodeKind.AssocType, name: "Context", type_name: recv, type_ann: ctx_ann, line: line, col: col })
     let assoc = synth_list_of([ctx])
-    let methods = synth_list_of([synth_closeable_enter(recv, line, col), synth_closeable_exit(close, last != "Closeable", line, col)])
+    let methods = synth_list_of([synth_closeable_enter(im, line, col), synth_closeable_exit(close, last != "Closeable", line, col)])
+    let binders = synth_copy_type_list(node_impl_binders(im))
+    let recv_args = synth_copy_type_list(node_recv_type_args(im))
+    let where_bounds = synth_copy_type_list(node_impl_where_bounds(im))
     let id = node_count()
     node_push(AstNode {
         kind: NodeKind.ImplBlock, trait_name: "BlockHandler", name: recv,
         str_val: CLOSEABLE_PROVIDED_IMPL, int_val: im, methods: methods, assoc_types: assoc,
+        impl_binders: binders, recv_type_args: recv_args, impl_where_bounds: where_bounds,
         line: node_line(im), col: node_col(im), end_line: node_end_line(im), end_col: node_end_col(im),
     })
     id

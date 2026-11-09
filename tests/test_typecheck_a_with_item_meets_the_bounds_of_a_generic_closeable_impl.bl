@@ -1,0 +1,186 @@
+// A with-item on an instance of a generic Closeable type runs the impl's close at that
+// instance (§5.5, §4.7.2), and a polymorphic impl covers only the instances that meet its
+// bounds (§3.6, Polymorphic Trait Implementations). An instance that does not meet them is
+// reported at the item, with the code a failed bound has at a call: E0306, or E0523 for Display.
+// A trait-qualified call to the BlockHandler methods the impl provides is judged the same way.
+// The provided BlockHandler impl copies the receiver, so an error in the receiver is reported
+// once, on the Closeable impl the author wrote, and never names BlockHandler.
+
+import std.fs
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_reset}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+
+fn probe(path: Str, src: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    init_embedded_stdlib()
+    fs.write(path, src).unwrap()
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+    program
+}
+
+// The code and line of each error.
+fn errors_reported() -> List[Str] {
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" { out.push("{d.code} line {d.line}") }
+    }
+    out
+}
+
+// The message of each error.
+fn error_messages() -> List[Str] {
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" { out.push(d.message) }
+    }
+    out
+}
+
+fn errors_of(name: Str, lines: List[Str]) -> List[Str] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    let text = lines.join("\n")
+    let _ = probe("build/tc_with_generic_closeable_{name}.bl", "{text}\n")
+    errors_reported()
+}
+
+fn names_block_handler(messages: List[Str]) -> Bool {
+    for m in messages {
+        if m.contains("BlockHandler") { return true }
+    }
+    false
+}
+
+fn errors_for(name: Str, impl_head: Str, body: Str) -> List[Str] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    let src = [
+        "trait Tag \{ fn tag(self) -> Int }",
+        "impl Tag for Int \{ fn tag(self) -> Int \{ self } }",
+        "type Plain \{ n: Int }",
+        "type Bx[T] \{ v: T }",
+        "{impl_head} \{ fn close(self) \{ } }",
+        "fn main() \{",
+        body,
+        "}",
+        "",
+    ].join("\n")
+    let _ = probe("build/tc_with_generic_closeable_{name}.bl", src)
+    errors_reported()
+}
+
+test "a with-item at an instance that misses a user trait bound of the impl is E0306" {
+    assert_eq(errors_for("user_as", "impl[T: Tag] Closeable for Bx[T]", "    with Bx \{ v: Plain \{ n: 1 } } as b \{ let _n = b.v.n }"), ["E0306 line 7"])
+}
+
+test "a with-item without as at an instance that misses a bound of the impl is reported" {
+    assert_eq(errors_for("user_bare", "impl[T: Tag] Closeable for Bx[T]", "    with Bx \{ v: Plain \{ n: 1 } } \{ let _n = 0 }"), ["E0306 line 7"])
+}
+
+test "a with-item at an instance that misses a where bound of the impl is reported" {
+    assert_eq(errors_for("user_where", "impl[T] Closeable for Bx[T] where T: Tag", "    with Bx \{ v: Plain \{ n: 1 } } as b \{ let _n = b.v.n }"), ["E0306 line 7"])
+}
+
+test "a with-item at an instance that misses a Display bound of the impl is E0523" {
+    assert_eq(errors_for("display", "impl[T: Display] Closeable for Bx[T]", "    with Bx \{ v: Plain \{ n: 1 } } as b \{ let _n = b.v.n }"), ["E0523 line 7"])
+}
+
+test "a with-item at an instance that meets the bounds of the impl is clean" {
+    assert_eq(errors_for("met", "impl[T: Tag] Closeable for Bx[T]", "    with Bx \{ v: 1 } as b \{ let _n = b.v.tag() }"), [])
+}
+
+test "BlockHandler.exit at an instance that misses an Eq bound of the impl is one E0306" {
+    assert_eq(errors_for("exit_eq", "impl[T: Eq] Closeable for Bx[T]", "    BlockHandler.exit(Bx \{ v: Plain \{ n: 1 } }, true)"), ["E0306 line 7"])
+}
+
+test "BlockHandler.enter at an instance that misses an Eq bound of the impl is one E0306" {
+    assert_eq(errors_for("enter_eq", "impl[T: Eq] Closeable for Bx[T]", "    let _b = BlockHandler.enter(Bx \{ v: Plain \{ n: 1 } })"), ["E0306 line 7"])
+}
+
+test "BlockHandler.exit at an instance that misses a Display bound of the impl is one E0523" {
+    assert_eq(errors_for("exit_display", "impl[T: Display] Closeable for Bx[T]", "    BlockHandler.exit(Bx \{ v: Plain \{ n: 1 } }, true)"), ["E0523 line 7"])
+}
+
+test "BlockHandler.enter at an instance that misses a Display bound of the impl is one E0523" {
+    assert_eq(errors_for("enter_display", "impl[T: Display] Closeable for Bx[T]", "    let _b = BlockHandler.enter(Bx \{ v: Plain \{ n: 1 } })"), ["E0523 line 7"])
+}
+
+test "BlockHandler.exit at an instance that meets the bounds of the impl is clean" {
+    assert_eq(errors_for("exit_met", "impl[T: Tag] Closeable for Bx[T]", "    BlockHandler.exit(Bx \{ v: 1 }, true)"), [])
+}
+
+test "a receiver with too many type arguments is reported once, on the Closeable impl" {
+    let errs = errors_of("arity", [
+        "type Sh[T] \{ v: T }",
+        "impl[T, U] Closeable for Sh[T, U] \{",
+        "    fn close(self) \{ }",
+        "}",
+        "fn main() \{ }",
+    ])
+    assert_eq(errs, ["E0303 line 2"])
+    assert(!names_block_handler(error_messages()))
+}
+
+test "a receiver with a repeated binder and too many type arguments is reported on the Closeable impl" {
+    let errs = errors_of("arity_repeat", [
+        "type Bx[T] \{ v: T }",
+        "impl[T] Closeable for Bx[T, T] \{",
+        "    fn close(self) \{ }",
+        "}",
+        "fn main() \{ }",
+    ])
+    assert_eq(errs, ["E0303 line 2", "E0908 line 2"])
+    assert(!names_block_handler(error_messages()))
+}
+
+test "a type argument on a receiver that takes none is reported once, on the Closeable impl" {
+    let errs = errors_of("arity_none", [
+        "type Nb \{ v: Int }",
+        "impl[T] Closeable for Nb[T] \{",
+        "    fn close(self) \{ }",
+        "}",
+        "fn main() \{ }",
+    ])
+    assert_eq(errs, ["E0303 line 2"])
+    assert(!names_block_handler(error_messages()))
+}
+
+test "an unknown type constructor in the receiver is reported once, on the Closeable impl" {
+    let errs = errors_of("bad_ctor", [
+        "type Sh[T] \{ v: T }",
+        "impl[T] Closeable for Sh[Lst[T]] \{",
+        "    fn close(self) \{ }",
+        "}",
+        "fn main() \{ }",
+    ])
+    assert_eq(errs, ["E0507 line 2", "E0908 line 2"])
+    assert(!names_block_handler(error_messages()))
+}
+
+test "an unknown type argument in the receiver is reported once, on the Closeable impl" {
+    let errs = errors_of("bad_arg", [
+        "type Bx[T] \{ v: T }",
+        "impl[T] Closeable for Bx[Nope] \{",
+        "    fn close(self) \{ }",
+        "}",
+        "fn main() \{ }",
+    ])
+    assert_eq(errs, ["E0909 line 2", "E0507 line 2", "E0908 line 2"])
+    assert(!names_block_handler(error_messages()))
+}
+
+test "a generic Closeable impl and a BlockHandler impl on one type overlap" {
+    let errs = errors_of("overlap", [
+        "type Bx[T] \{ v: T }",
+        "impl[T] Closeable for Bx[T] \{",
+        "    fn close(self) \{ }",
+        "}",
+        "impl[T] BlockHandler for Bx[T] \{",
+        "    type Context = Int",
+        "    fn enter(self) -> Int \{ 1 }",
+        "    fn exit(self, ok: Bool) \{ let _o = ok }",
+        "}",
+        "fn main() \{ }",
+    ])
+    assert_eq(errs, ["E0526 line 5"])
+}

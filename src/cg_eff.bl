@@ -15,8 +15,8 @@ import parser.{
     sublist_length,
 }
 import typecheck.{
-    TyKind, TYPE_INT, TYPE_STR, TYPE_VOID, make_ffi_scope_type, make_fn_type, make_handler_type, tc_resolve,
-    tc_impl_owner_decl, tc_tid_decl_node, tc_tid_handler_effect, tc_tid_kind, tc_void_tid, tk_name, ty_pool,
+    TyKind, TYPE_INT, TYPE_STR, TYPE_VOID, make_ffi_scope_type, make_fn_type, make_handler_type, tc_resolve, tc_type_str,
+    tc_impl_is_poly_user, tc_impl_owner_decl, tc_tid_decl_node, tc_tid_handler_effect, tc_tid_kind, tc_void_tid, tk_name, ty_pool,
     tc_call_decl_node, tc_call_user_effect, tc_decl_ret_tid, tc_handler_effect_root, tc_impl_trait_id, io_read_ops, is_io_read_derived_op, IO_READ_PRIMITIVE, handles_io_read,
 }
 import layout.{
@@ -41,6 +41,7 @@ import cg_print.{
     DefaultSlot, print_closure_thunk, print_handler_builder, print_resource_guard_support, print_spawn_pair_typedef,
     print_spawn_task_wrapper, print_vtable_slot_fn, print_vtable_slot_fn_decl, vtable_slot_self_spelling,
 }
+import mono.{instance_of_poly_method, instances, mark_instance_named, tid_in_instance}
 import cg_reg.{cg_reg_effect_root_decl, cg_reg_impl_decls, cg_reg_io_derived_decl}
 import cg_promote.{cg_promote_capture_table}
 import cg_trace.{cg_trace_builtin_effect, cg_trace_closure_frame, cg_trace_effect, cg_trace_effect_path, cg_trace_frame_module, cg_trace_handler_frame, cg_trace_in_std, cg_trace_thunk_enter}
@@ -74,7 +75,6 @@ pub type ResourceCleanup {
 // The trait that claims a scoped value. Held as a name because an impl block's trait is a
 // name, and written once so no comparison against a literal type name is needed.
 let TRAIT_BLOCK_HANDLER = "BlockHandler"
-let TRAIT_CLOSEABLE = "Closeable"
 // The runtime's own scope exit.
 let FFI_SCOPE_EXIT = "blink_ffi_scope_cleanup"
 // async.scope's own exit runner: awaits every handle the scope's body still has running.
@@ -133,9 +133,11 @@ fn impl_of_trait_for_decl(trait_name: Str, decl: Int, node: Int) -> Int ! Diag.R
                 // A receiver written with type arguments claims ONE instance, and the
                 // declaration node is shared by every instance, so the match above
                 // cannot tell `Box[Int]` from `Box[Str]`. Answering either way would
-                // close the wrong resource or none.
+                // close the wrong resource or none. An impl over the type's own binders,
+                // `impl[T] .. for Box[T]`, claims every instance, and its methods are
+                // named per instance where they are called.
                 let args = node_recv_type_args(im)
-                if args != -1 && sublist_length(args) > 0 {
+                if args != -1 && sublist_length(args) > 0 && !tc_impl_is_poly_user(im) {
                     diag_ice_stage_not_built(
                         "matching a {trait_name} impl written for one instance of a generic type", node)
                     return -2
@@ -210,6 +212,7 @@ pub fn cg_eff_resource_cleanup(item: Int) -> ResourceCleanup ! Diag.Report {
 pub type BlockHandlerCalls {
     impl_block: Int
     enter_method: Int
+    enter_symbol: Str
     // What enter returns: the Context the `as` binder holds.
     context_tid: Int
     exit_symbol: Str
@@ -229,33 +232,19 @@ pub fn cg_eff_block_handler_impl(expr: Int) -> Int ! Diag.Report {
     if !kind_can_carry_impl(tc_tid_kind(tid)) { return -1 }
     let decl = tc_tid_decl_node(tid)
     if decl < 0 { return -1 }
-    let bh = impl_of_trait_for_decl(TRAIT_BLOCK_HANDLER, decl, expr)
-    if bh != -1 { return bh }
-    // The parser writes no BlockHandler impl for a Closeable impl on a generic type, `impl[T]`
-    // or one instance alike, and typecheck still takes the type as a scoped value. Reporting
-    // here, not matching, keeps an impl written for `Box[Int]` from closing a `Box[Str]`.
-    for im in cg_reg_impl_decls() {
-        if tc_impl_trait_id(im) == TRAIT_CLOSEABLE && tc_impl_owner_decl(im) == decl {
-            diag_ice_stage_not_built("a with-item whose Closeable impl is written for a generic type", expr)
-            return -2
-        }
-    }
-    -1
+    impl_of_trait_for_decl(TRAIT_BLOCK_HANDLER, decl, expr)
 }
 
 // exit runs from the guard with the ok flag the guard recorded, and with the effect vector
 // when its row is not empty.
 pub fn cg_eff_block_handler_calls(im: Int, tid: Int, node: Int) -> BlockHandlerCalls ! Diag.Report {
-    let none = BlockHandlerCalls { impl_block: -1, enter_method: -1, context_tid: -1, exit_symbol: "" }
+    let none = BlockHandlerCalls { impl_block: -1, enter_method: -1, enter_symbol: "", context_tid: -1, exit_symbol: "" }
     let enter = impl_method_named(im, BLOCK_HANDLER_ENTER_METHOD, node)
     let exit = impl_method_named(im, BLOCK_HANDLER_EXIT_METHOD, node)
     if enter < 0 || exit < 0 { return none }
-    // The with stage names enter and exit with no instance, and neither name has a body when
-    // the method is written per instance.
-    if cg_decl_is_per_instance(enter) || cg_decl_is_per_instance(exit) {
-        diag_ice_stage_not_built("a with-item whose BlockHandler method has its own type parameter", node)
-        return none
-    }
+    let enter_at = block_handler_method_at(im, enter, tid, node)
+    let exit_at = block_handler_method_at(im, exit, tid, node)
+    if enter_at.symbol == "" || exit_at.symbol == "" { return none }
     let rec = layout_of(tid, Position.Local)
     if rec.decline_reason != "" {
         diag_ice_at("UnspellableBlockHandlerType", UNSOLVED_TYPEVAR_AT_CODEGEN,
@@ -263,11 +252,41 @@ pub fn cg_eff_block_handler_calls(im: Int, tid: Int, node: Int) -> BlockHandlerC
             "the spelling the handler has at the with-item must spell again where the guard declares it")
         return none
     }
-    let context_tid = callee_answer(enter, node)
-    if context_tid < 0 { return none }
-    let exit_symbol = c_impl_method_name(im, BLOCK_HANDLER_EXIT_METHOD)
-    print_resource_guard_support(exit_symbol, rec.c_spelling, true, cg_decl_takes_ev(exit))
-    BlockHandlerCalls { impl_block: im, enter_method: enter, context_tid: context_tid, exit_symbol: exit_symbol }
+    let ret = callee_answer(enter, node)
+    if ret < 0 { return none }
+    let context_tid = if enter_at.row < 0 { ret } else { tid_in_instance(enter_at.row, ret) }
+    print_resource_guard_support(exit_at.symbol, rec.c_spelling, true, cg_decl_takes_ev(exit))
+    BlockHandlerCalls { impl_block: im, enter_method: enter, enter_symbol: enter_at.symbol, context_tid: context_tid, exit_symbol: exit_at.symbol }
+}
+
+// The C function the impl method `m` is at the receiver `tid`, and the mono instance it is
+// when the impl writes it once per instance, else -1. symbol is "" when that instance is not
+// registered; the caller reports it, since only the caller knows why it needed the method.
+pub type ImplMethodAt {
+    symbol: Str
+    row: Int
+}
+
+pub fn cg_eff_impl_method_at(im: Int, m: Int, tid: Int) -> ImplMethodAt {
+    if !cg_decl_is_per_instance(m) { return ImplMethodAt { symbol: c_impl_method_name(im, node_name(m)), row: -1 } }
+    let row = instance_of_poly_method(m, tid)
+    match instances().get(row) {
+        Some(inst) => {
+            mark_instance_named(row)
+            ImplMethodAt { symbol: inst.c_name, row: row }
+        }
+        None => ImplMethodAt { symbol: "", row: -1 }
+    }
+}
+
+fn block_handler_method_at(im: Int, m: Int, tid: Int, node: Int) -> ImplMethodAt ! Diag.Report {
+    let at = cg_eff_impl_method_at(im, m, tid)
+    if at.symbol == "" {
+        diag_ice_at("MonoInstanceNotRegistered", UNSOLVED_TYPEVAR_AT_CODEGEN,
+            "{TRAIT_BLOCK_HANDLER} method `{node_name(m)}` of `{tc_type_str(tid)}` has no monomorphised instance at the with-item", node,
+            "mono registers enter and exit at the handler type of each with-item")
+    }
+    at
 }
 
 // `handler.enter()`, built by hand because no call node exists in the source. The handler
@@ -287,8 +306,7 @@ pub fn cg_eff_block_handler_enter(calls: BlockHandlerCalls, held: Int, node: Int
         if ev < 0 { return -1 }
         args.push(ev)
     }
-    let symbol = c_impl_method_name(calls.impl_block, BLOCK_HANDLER_ENTER_METHOD)
-    ir_call_direct(ret, node, rec.c_spelling, symbol, rec.slot_form, args)
+    ir_call_direct(ret, node, rec.c_spelling, calls.enter_symbol, rec.slot_form, args)
 }
 
 // Typecheck checks an impl against its trait, so a missing method here is a compiler bug.

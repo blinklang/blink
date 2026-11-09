@@ -1,0 +1,145 @@
+// A Closeable type is a scoped value (sections/05_memory_compile_errors.md §5.5): it also
+// implements BlockHandler with Context = Self, enter returning self, and exit calling close.
+// A generic impl, `impl[T] Closeable for Box[T]`, gives a generic one with the same binders,
+// bounds and receiver, so each instance of the type is a scoped value: a with-item, a
+// trait-qualified BlockHandler call and a `T: BlockHandler` bound all reach its close.
+
+effect Note {
+    effect Say {
+        fn say(s: Str)
+    }
+}
+
+fn recorder(log: List[Str]) -> Handler[Note] {
+    handler Note {
+        fn say(s: Str) { log.push(s) }
+    }
+}
+
+type Box[T] {
+    v: T
+}
+
+impl[T: Display] Closeable for Box[T] {
+    fn close(self) ! Note.Say { note.say("close {self.v}") }
+}
+
+// The bound of the impl is the bound of the BlockHandler impl it gives.
+type Keyed[K] {
+    key: K
+}
+
+impl[K: Eq + Display] Closeable for Keyed[K] {
+    fn close(self) ! Note.Say { note.say("close key {self.key}") }
+}
+
+// The section 4.7 example: close forwards the row of a Closeable type parameter.
+type Guard[T] {
+    inner: T
+}
+
+impl[T: Closeable] Closeable for Guard[T] {
+    fn close(self) ! _ {
+        self.inner.close()
+    }
+}
+
+fn exit_through_bound[H: BlockHandler](h: H) ! _ {
+    BlockHandler.exit(h, true)
+}
+
+fn hold_through_bound[H: BlockHandler](h: H) ! _ {
+    with h {
+        let _held = 0
+    }
+}
+
+fn with_in_generic_body[U: Display](u: U) ! Note.Say {
+    with Box { v: u } as b {
+        note.say("body {b.v}")
+    }
+}
+
+test "a with-item on a generic Closeable type binds the value and closes it" {
+    let log: List[Str] = []
+    with recorder(log) {
+        with Box { v: 1 } as b {
+            note.say("body {b.v + 1}")
+        }
+    }
+    assert_eq(log, ["body 2", "close 1"])
+}
+
+test "a with-item without as closes a generic Closeable value" {
+    let log: List[Str] = []
+    with recorder(log) {
+        with Box { v: "s" } {
+            note.say("body")
+        }
+    }
+    assert_eq(log, ["body", "close s"])
+}
+
+test "two instances of one generic Closeable type each close at their own type" {
+    let log: List[Str] = []
+    with recorder(log) {
+        with Box { v: 7 } as i, Box { v: "seven" } as s {
+            note.say("body {i.v} {s.v}")
+        }
+    }
+    assert_eq(log, ["body 7 seven", "close seven", "close 7"])
+}
+
+test "a trait-qualified BlockHandler call runs close of a generic Closeable impl" {
+    let log: List[Str] = []
+    with recorder(log) {
+        BlockHandler.exit(Box { v: 3 }, true)
+        BlockHandler.exit(Box { v: "three" }, false)
+        let b = BlockHandler.enter(Box { v: 4 })
+        note.say("entered {b.v}")
+    }
+    assert_eq(log, ["close 3", "close three", "entered 4"])
+}
+
+test "a BlockHandler bound accepts each instance of a generic Closeable type" {
+    let log: List[Str] = []
+    with recorder(log) {
+        exit_through_bound(Box { v: 5 })
+        exit_through_bound(Box { v: "five" })
+        hold_through_bound(Box { v: 6 })
+        hold_through_bound(Box { v: "six" })
+    }
+    assert_eq(log, ["close 5", "close five", "close 6", "close six"])
+}
+
+test "a generic Closeable impl with a bound of its own is a block handler" {
+    let log: List[Str] = []
+    with recorder(log) {
+        with Keyed { key: 9 } as k {
+            note.say("body {k.key}")
+        }
+        with Keyed { key: "nine" } {}
+        exit_through_bound(Keyed { key: 10 })
+    }
+    assert_eq(log, ["body 9", "close key 9", "close key nine", "close key 10"])
+}
+
+test "a with-item in a generic body closes the instance the body is at" {
+    let log: List[Str] = []
+    with recorder(log) {
+        with_in_generic_body(11)
+        with_in_generic_body("eleven")
+    }
+    assert_eq(log, ["body 11", "close 11", "body eleven", "close eleven"])
+}
+
+test "a generic Closeable impl that forwards the row of its type parameter closes the inner value" {
+    let log: List[Str] = []
+    with recorder(log) {
+        with Guard { inner: Box { v: 12 } } as g {
+            note.say("body {g.inner.v}")
+        }
+        BlockHandler.exit(Guard { inner: Keyed { key: "k" } }, true)
+    }
+    assert_eq(log, ["body 12", "close 12", "close key k"])
+}

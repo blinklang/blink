@@ -1,0 +1,55 @@
+// A generic Closeable impl that another module declares closes each instance of its type in a
+// with-item and in a trait-qualified BlockHandler call. The per-instance enter and exit bodies
+// must reach the unit that uses them, so the program builds both one C unit per module and one
+// unit for the whole program.
+
+import std.process.{ProcessResult}
+import compile_test_helpers.{scratch_root}
+
+fn shapes_src() -> Str {
+    #"pub type Bx[T] {
+    v: T
+}
+
+impl[T: Display] Closeable for Bx[T] {
+    fn close(self) ! IO.Print {
+        io.println("close {self.v}")
+    }
+}
+"#
+}
+
+fn main_src() -> Str {
+    #"import shapes.{Bx}
+
+fn main() {
+    with Bx { v: 1 } as a, Bx { v: "one" } as b {
+        io.println("body {a.v} {b.v}")
+    }
+    BlockHandler.exit(Bx { v: 2 }, true)
+}
+"#
+}
+
+// The corpus exports BLINK_COMPILER_ARCHIVE and BLINK_PER_MODULE, which pick the build mode,
+// so the run drops them and names the mode itself.
+fn run_in_mode(mode: Str, tag: Str) -> ProcessResult ! Process.Spawn, FS.Write, Env.Read {
+    let root = "{scratch_root()}/{tag}_{getpid()}"
+    process.run("mkdir", ["-p", "{root}/src"]).unwrap()
+    fs.write("{root}/blink.toml", "[package]\nname = \"{tag}\"\nversion = \"0.1.0\"\n").unwrap()
+    fs.write("{root}/src/shapes.bl", shapes_src()).unwrap()
+    fs.write("{root}/src/main.bl", main_src()).unwrap()
+    process.run("sh", ["-c", "env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE build/blink run {mode} -o {root}/main {root}/src/main.bl"]).unwrap()
+}
+
+fn expect_closes(r: ProcessResult) {
+    assert_eq(r.out, "body 1 one\nclose one\nclose 1\nclose 2\n", "{r.out}{r.err_out}")
+}
+
+test "a generic Closeable impl from another module closes each instance in a per-module build" {
+    expect_closes(run_in_mode("--per-module", "gcx_pm"))
+}
+
+test "a generic Closeable impl from another module closes each instance in a one-unit build" {
+    expect_closes(run_in_mode("--no-per-module", "gcx_one"))
+}

@@ -6239,7 +6239,7 @@ fn tc_unmet_user_bound(carrier: Int, outer_sl: Int, own_sl: Int, concrete: Int, 
         if arity == got && judged {
             let want = tc_bound_args_at_call(outer_sl, own_sl, args_sl, binds)
             if want.len() == got {
-                let held = tc_trait_held(concrete, trait_name, tr, row)
+                let held = tc_trait_held(concrete, trait_name, row)
                 if held.verdict == 1 && tc_impl_args_held_has(held, want) == 0 {
                     return UnmetBound { trait_name: trait_name, want: want, held: held }
                 }
@@ -6268,18 +6268,11 @@ fn tc_trait_judged_by_impls(tr: Int) -> Bool {
     }
 }
 
-// The impls of the trait `trait_name` (declared at `tr`, or -1, with §3.2.2 row `row`) that
+// The impls of the trait `trait_name` (with §3.2.2 row `row`) that
 // apply to `recv`, with their trait arguments.
-fn tc_trait_held(recv: Int, trait_name: Str, tr: Int, row: SurfaceRow) -> ImplArgsHeld ! TypeCheck.Resolve, Diag.Report {
+fn tc_trait_held(recv: Int, trait_name: Str, row: SurfaceRow) -> ImplArgsHeld ! TypeCheck.Resolve, Diag.Report {
     if row.kinds.len() > 0 { return tc_surface_held(recv, row) }
-    let held = tc_impl_trait_args_held(recv, trait_name)
-    // A Closeable type is a scoped value (§5.5), and the parser writes its BlockHandler impl
-    // only for a type with no binders.
-    if held.impls == 0 && trait_name == "BlockHandler" && tr != -1 && node_source_module(tr).starts_with("std_") {
-        let closeable = tc_impl_trait_args_held(recv, "Closeable")
-        if closeable.impls > 0 { return ImplArgsHeld { verdict: held.verdict * closeable.verdict, impls: closeable.impls, args: [] } }
-    }
-    held
+    tc_impl_trait_args_held(recv, trait_name)
 }
 
 // How a §3.2.2 row reads its trait arguments from the type.
@@ -18089,7 +18082,7 @@ fn tc_drop_unprovided_closeable_impls(program: Int) {
             let src = closeable_impl_of(im)
             let recv = tc_impl_target_name(src)
             let declared = is_known_type(node_name(src)) != 0 || lookup_named_type(recv) != -1
-            if tc_impl_trait_id(src) != "Closeable" || !declared || receivers.contains(recv) {
+            if tc_impl_trait_id(src) != "Closeable" || !declared || tc_impl_recv_args_fail(src) || receivers.contains(recv) {
                 drop.insert(im)
             } else {
                 receivers.insert(recv)
@@ -18098,6 +18091,26 @@ fn tc_drop_unprovided_closeable_impls(program: Int) {
         i = i + 1
     }
     sublist_remove_members(impls_sl, drop)
+}
+
+// True when the receiver of `im` gets the wrong number of type arguments, or an argument
+// names no type. These are the receiver errors validate_trait_impls reports on `im`; a
+// provided impl copies the receiver, so it is dropped to keep each error to one report.
+fn tc_impl_recv_args_fail(im: Int) -> Bool {
+    let args = node_recv_type_args(im)
+    let binders = node_impl_binders(im)
+    tc_push_tparam_scope(binders)
+    let want = tc_ctor_arity(node_name(im))
+    tc_pop_tparam_scope(binders)
+    let got = if args == -1 { 0 } else { sublist_length(args) }
+    if want != -1 && got != want { return true }
+    let mut i = 0
+    while i < got {
+        let arg = node_name(sublist_get(args, i))
+        if arg != "" && impl_binder_declared(binders, arg) == 0 && is_known_type(arg) == 0 && is_trait_name(arg) == 0 { return true }
+        i = i + 1
+    }
+    false
 }
 
 // ── Main entry point ────────────────────────────────────────────────
@@ -25442,7 +25455,7 @@ fn tc_trait_qualified_unanswered(trait_name: Str, method: Str, recv: Int) -> Boo
     }
     let row = tc_surface_row(trait_name, tr)
     if row.kinds.len() == 0 && !tc_trait_judged_by_impls(tr) { return tc_type_satisfies_bound(recv, trait_name) == -1 }
-    let held = tc_trait_held(recv, trait_name, tr, row)
+    let held = tc_trait_held(recv, trait_name, row)
     held.verdict == 1 && held.impls == 0
 }
 
@@ -34073,6 +34086,7 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                         for (k, v) in tc_self_binds(qt_recv) {
                             if !qt_ibinds.contains_key(k) { qt_ibinds.insert(k, v) }
                         }
+                        tc_check_impl_bounds_at_call(qt_fs.decl, qt_ibinds, node)
                         nr_note_call_decl(node, qt_fs.decl)
                         if node_type_params(node) != -1 {
                             return tc_call_with_type_args("{obj_name}.{method}", qt_sig, node, 0, qt_ibinds)
@@ -36939,8 +36953,9 @@ fn tc_with_binder_tid(res_tid: Int) -> Int ! TypeCheck.Resolve, Diag.Report {
     if tc_tid_kind(ctx_tid) == TyKind.Void { return res_tid }
     // A generic handler's `type Context = T` resolves to a typevar outside the binding instance.
     // Swapping a concrete resource tid for an unbound one trades a wrong answer for no answer, which
-    // is worse for every downstream consumer. No generic BlockHandler impl exists in-tree yet, so
-    // this guards the shape rather than a live case.
+    // is worse for every downstream consumer. A user-written `impl[T] BlockHandler for Bx[T]` with
+    // such a Context reaches here; its Context names a binder, which this cannot resolve
+    // without the instance, so the resource tid stands.
     let ctx_kind = tc_tid_kind(ctx_tid)
     if ctx_kind == TyKind.Typevar || ctx_kind == TyKind.Unknown { return res_tid }
     ctx_tid
@@ -36954,7 +36969,7 @@ fn tc_with_binder_tid(res_tid: Int) -> Int ! TypeCheck.Resolve, Diag.Report {
 // is abstract in the body. The spec does not say what a Never item is. Until it does, one
 // that `as` binds passes and one without `as` is E0839. Returns false when it reports the
 // item.
-fn tc_check_with_item(item: Int, tid0: Int, binds: Bool) -> Bool ! Diag.Report {
+fn tc_check_with_item(item: Int, tid0: Int, binds: Bool) -> Bool ! TypeCheck.Resolve, Diag.Report {
     let tid = tc_resolve(tid0)
     if tc_tid_is_no_info(tid) != 0 { return true }
     let k = tc_tid_kind(tid)
@@ -36962,7 +36977,12 @@ fn tc_check_with_item(item: Int, tid0: Int, binds: Bool) -> Bool ! Diag.Report {
     if k == TyKind.Typevar && tc_typevar_is_scoped(tid) { return true }
     // `ffi.scope()` is the arena the FFI chapter scopes with `with ... as` (§5.2).
     if k == TyKind.Handler || k == TyKind.FfiScope { return true }
-    if tc_tid_has_scoped_impl(tid) { return true }
+    if tc_tid_has_scoped_impl(tid) {
+        // The item runs the impl's enter and exit, or close, at this instance, so the impl's
+        // own bounds must hold here, as at a method call.
+        let im = tc_er_scoped_impl(tid)
+        return im < 0 || tc_judge_impl_bounds(im, tc_impl_binds_for_instance(im, tid), item, []) == 0
+    }
     // A handler or scoped value is usually acquired through a Result or an Option, and the
     // item then holds the carrier rather than the value it carries.
     let help = if k == TyKind.Result {
@@ -38338,16 +38358,16 @@ fn tc_typevar_is_scoped(tid: Int) -> Bool {
     false
 }
 
-// Whether a type implements BlockHandler or Closeable. A Closeable impl counts on its own for
-// a generic receiver, which gets no BlockHandler impl from the parser. The receiver is matched
-// by its declaration node, which every instance of a generic type shares. An impl written for
-// one instance cannot be told from another here, so it answers yes rather than refuse a
-// program codegen may accept.
+// Whether a type implements BlockHandler or Closeable. The receiver is matched by its
+// declaration node, which every instance of a generic type shares. An impl written for one
+// instance cannot be told from another here, so it answers yes rather than refuse a program
+// codegen may accept.
 fn tc_tid_has_scoped_impl(tid: Int) -> Bool ! Diag.Report {
     let decl = tc_tid_decl_node(tid)
     if decl < 0 { return false }
     for im in tc_impl_recv_tids.keys() {
         let trait_id = tc_impl_trait_id(im)
+        // Closeable too: a Closeable impl with no close gets no provided BlockHandler impl.
         if (trait_id == "BlockHandler" || trait_id == "Closeable") && tc_tid_decl_node(tc_impl_recv_tid(im)) == decl {
             return true
         }
