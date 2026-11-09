@@ -6251,15 +6251,21 @@ fn tc_unmet_user_bound(carrier: Int, outer_sl: Int, own_sl: Int, concrete: Int, 
 }
 
 // Whether a bound on the trait declared at `tr` is judged by the impl blocks the program
-// writes: every trait a program module declares, and of the std traits only Closeable and
-// BlockHandler, the ones a type meets through an impl it writes (§5.5). Other std traits get
-// impls no impl block states (the derivable traits, From's identity impl), or are met by a poly
-// impl over a built-in generic that the impl match does not see yet, so they keep the modeled
-// checks.
+// writes. A trait is met only through its impls (§3.6), so that is the rule for every trait,
+// including a std trait whose impls are poly impls over a built-in generic
+// (`impl[T] ListPure for List[T]`). The std traits refused here have impls that no impl block
+// states: the compiler supplies them (derives, identity and refinement impls, impls on a built-in
+// type), so the impl blocks would miss them and they keep the modeled checks. A sealed surface is
+// judged by its surface row (§3.2.2).
 fn tc_trait_judged_by_impls(tr: Int) -> Bool {
     if !node_source_module(tr).starts_with("std_") { return true }
     let name = node_name(tr)
-    name == "Closeable" || name == "BlockHandler"
+    if is_sealed_builtin_trait(name) != 0 { return false }
+    match name {
+        "Display" | "Eq" | "Hash" | "Ord" | "Clone" | "Debug" => false
+        "From" | "Into" | "TryFrom" | "StringBuilderPure" => false
+        _ => true
+    }
 }
 
 // The impls of the trait `trait_name` (declared at `tr`, or -1, with §3.2.2 row `row`) that
@@ -6413,13 +6419,17 @@ fn tc_impl_trait_args_held(recv: Int, trait_name: Str) -> ImplArgsHeld ! TypeChe
             verdict = 0
             continue
         }
-        if poly && tc_impl_matches_instance(im, recv) == 0 { continue }
-        let binds: Map[Str, Int] = if poly { tc_impl_binds_for_instance(im, recv) } else { Map() }
+        // The receiver as written, unified whole, so a built-in generic (`List[T]`), which holds
+        // its arguments in no struct slot, binds its binders as a user generic does.
+        let binds: Map[Str, Int] = Map()
+        if poly { unify_typevar_binds(raw_recv, recv, binds) }
         let at = tc_resolve(substitute_typevar_tid(raw_recv, binds))
         // A receiver of another kind (`List[T]` against a struct) cannot apply, pinned or not.
         if tc_tid_kind(at) != tc_tid_kind(recv) { continue }
+        // A binder the receiver did not fill means the shapes differ (`List[List[T]]` against
+        // `List[Int]`), so that impl does not apply.
         if tc_tid_has_bare_typevar(at) != 0 {
-            verdict = 0
+            if !poly { verdict = 0 }
             continue
         }
         if !tc_tid_same_type(at, recv) { continue }

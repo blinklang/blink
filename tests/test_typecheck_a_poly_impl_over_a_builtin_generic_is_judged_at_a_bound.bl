@@ -1,0 +1,115 @@
+// A polymorphic impl over a built-in generic (`impl[T] Tally for List[T]`, sections/03_types.md
+// §3.6 *Polymorphic Trait Implementations*) is matched against a bound at the call by the same
+// rule as an impl over a user generic: it meets the bound for each instance of its receiver, at
+// the trait arguments it writes, where its own bounds hold. A type it does not cover is E0306 at
+// the call (§3.6 *Trait Bounds*).
+
+import std.fs
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_reset}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+import compile_test_helpers
+
+fn probe(name: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO, Process.Spawn {
+    init_embedded_stdlib()
+    let path = "{compile_test_helpers.scratch_root()}/_tc_poly_builtin_bound_{name}.bl"
+    fs.write(path, src).unwrap()
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+}
+
+// Each error as "CODE@line:col@message@help".
+fn errors_of(name: Str, src: Str) -> List[Str] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO, Process.Spawn {
+    probe(name, src)
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" { out.push("{d.code}@{d.line}:{d.col}@{d.message}@{d.help}") }
+    }
+    out
+}
+
+// Rows pin 2:13 because the call is on line 2 at column 13.
+fn called(call: Str, decls: Str) -> Str {
+    "fn main() \{\n    let _ = {call}\n}\n{decls}\n"
+}
+
+fn expect_one(name: Str, src: Str, want: Str) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO, Process.Spawn {
+    let errs = errors_of(name, src)
+    if errs.len() == 1 && errs.get(0).unwrap() == want { return "" }
+    "{name}: want one error\n  {want}\ngot {errs.len()}:\n  {errs.join("\n  ")}"
+}
+
+// One error with this code at this position. The text is not pinned: it says the type has no
+// impl, though the impl exists and only its own bound fails, and the work that reports a failed
+// impl bound sets that text.
+fn expect_one_at(name: Str, src: Str, code_at: Str) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO, Process.Spawn {
+    let errs = errors_of(name, src)
+    if errs.len() == 1 && errs.get(0).unwrap().starts_with("{code_at}@") { return "" }
+    "{name}: want one error at\n  {code_at}\ngot {errs.len()}:\n  {errs.join("\n  ")}"
+}
+
+fn expect_none(name: Str, src: Str) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO, Process.Spawn {
+    let errs = errors_of(name, src)
+    if errs.len() == 0 { return "" }
+    "{name}: want no error, got:\n  {errs.join("\n  ")}"
+}
+
+fn report(problems: List[Str]) ! IO.Eprint {
+    let mut bad = false
+    for p in problems {
+        if p != "" {
+            io.eprintln(p)
+            bad = true
+        }
+    }
+    assert(!bad)
+}
+
+let LIST_TALLY = "trait Tally \{ fn tally(self) -> Int }\nimpl[T] Tally for List[T] \{ fn tally(self) -> Int \{ self.len() } }\nfn k[X: Tally](x: X) -> Int \{ x.tally() }"
+
+let TALLY = "{LIST_TALLY}\nimpl[K, V] Tally for Map[K, V] \{ fn tally(self) -> Int \{ self.len() } }\nimpl[T] Tally for Set[T] \{ fn tally(self) -> Int \{ self.len() } }"
+
+let MARK = "trait Mark[T] \{ fn mark(self) -> Int }\nimpl[T] Mark[Str] for List[T] \{ fn mark(self) -> Int \{ self.len() } }\nfn ks[X: Mark[Str]](x: X) -> Int \{ x.mark() }\nfn ki[X: Mark[Int]](x: X) -> Int \{ x.mark() }"
+
+let SAME = "type NoEq \{ n: Int }\ntrait Same \{ fn same(self) -> Int }\nimpl[T: Eq] Same for List[T] \{ fn same(self) -> Int \{ self.len() } }\nfn k[X: Same](x: X) -> Int \{ x.same() }"
+
+let SAME_WHERE = "type NoEq \{ n: Int }\ntrait Same \{ fn same(self) -> Int }\nimpl[T] Same for List[T] where T: Eq \{ fn same(self) -> Int \{ self.len() } }\nfn k[X: Same](x: X) -> Int \{ x.same() }"
+
+test "a poly impl over List, Map or Set meets a bound for each instance" {
+    report([
+        expect_none("tally_list", called("k([1, 2])", TALLY)),
+        expect_none("tally_list_str", called("k([\"a\"])", TALLY)),
+        expect_none("tally_map", called("k(Map.new[Str, Int]())", TALLY)),
+        expect_none("tally_set", called("k(Set.new[Int]())", TALLY)),
+    ])
+}
+
+test "a type the poly impl does not cover is refused at the call" {
+    report([
+        expect_one("tally_int", called("k(1)", LIST_TALLY),
+            "E0306@2:13@`Int` does not satisfy the Tally bound on type parameter X: it has no impl of Tally@pass an argument whose type implements Tally, or write `impl Tally for Int`"),
+        expect_one("tally_set_of_list_impl", called("k(Set.new[Int]())", LIST_TALLY),
+            "E0306@2:13@`Set[Int]` does not satisfy the Tally bound on type parameter X: it has no impl of Tally@pass an argument whose type implements Tally, or write `impl Tally for Set[Int]`"),
+    ])
+}
+
+test "a poly impl of a generic trait over List meets a bound only at its own argument" {
+    report([
+        expect_none("mark_str", called("ks([1])", MARK)),
+        expect_one("mark_int", called("ki([1])", MARK),
+            "E0306@2:13@`List[Int]` does not satisfy the Mark[Int] bound on type parameter X: it implements Mark[Str]@pass an argument whose type implements Mark[Int], or write `impl Mark[Int] for List[Int]`"),
+    ])
+}
+
+test "a poly impl over List meets a bound only where its own bound holds" {
+    report([
+        expect_none("same_int", called("k([1])", SAME)),
+        expect_one("same_no_eq", called("k([NoEq \{ n: 1 }])", SAME),
+            "E0306@2:13@`NoEq` does not satisfy the Eq bound on type parameter T@add `@derive(Eq)` to `type NoEq`"),
+        expect_none("same_where_int", called("k([1])", SAME_WHERE)),
+        expect_one_at("same_where_no_eq", called("k([NoEq \{ n: 1 }])", SAME_WHERE), "E0306@2:13"),
+    ])
+}
