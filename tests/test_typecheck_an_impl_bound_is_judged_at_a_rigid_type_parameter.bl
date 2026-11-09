@@ -1,0 +1,257 @@
+// A type parameter of the body being checked has only the bounds its binders give (§3.6
+// Trait Bounds), and a polymorphic impl covers only the instances that meet its bounds (§3.6
+// Polymorphic Trait Implementations). So an impl reached at an instance that holds such a
+// parameter is judged by the parameter's own bounds, for every trait: at a method call, at a
+// trait-qualified call, at a with-item, and where a callee's bound is met through the impl. A
+// miss is E0306 at the call, with a help that adds the bound to the parameter (E0523 for
+// Display). A bound written inline, in a where clause, or one a written bound gives through a
+// supertrait meets the impl's bound.
+
+import std.fs
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_reset}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+
+fn probe(path: Str, src: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    init_embedded_stdlib()
+    fs.write(path, src).unwrap()
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+    program
+}
+
+// The code, line, column and help of each error.
+fn errors_reported() -> List[Str] {
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" { out.push("{d.code} {d.line}:{d.col} | {d.help}") }
+    }
+    out
+}
+
+// The message and notes of each error.
+fn error_texts() -> List[Str] {
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" {
+            out.push(d.message)
+            for n in d.notes { out.push(n) }
+        }
+    }
+    out
+}
+
+// The program shares one prelude, so the body under test is on line 14.
+fn errors_for(name: Str, body: Str) -> List[Str] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    let src = [
+        "trait Shown \{ fn shown(self) -> Int }",
+        "trait Tag \{ fn tag(self) -> Int }",
+        "trait Loud: Tag \{ fn loud(self) -> Int }",
+        "impl Tag for Int \{ fn tag(self) -> Int \{ self } }",
+        "type Bx[T] \{ v: T }",
+        "type Cx[T] \{ v: T }",
+        "type Dx[T] \{ v: T }",
+        "impl[T: Ord] Shown for Bx[T] \{ fn shown(self) -> Int \{ if self.v < self.v \{ 1 } else \{ 0 } } }",
+        "impl[T: Tag] Shown for Cx[T] \{ fn shown(self) -> Int \{ self.v.tag() } }",
+        "impl[T] Shown for Dx[T] where T: Eq \{ fn shown(self) -> Int \{ if self.v == self.v \{ 1 } else \{ 0 } } }",
+        "impl[T: Tag] Closeable for Bx[T] \{ fn close(self) \{ let _t = self.v.tag() } }",
+        "trait Same \{ fn same(self) -> Bool }",
+        "impl[T: Eq] Same for List[T] \{ fn same(self) -> Bool \{ self.len() < 2 || self.get(0).unwrap() == self.get(1).unwrap() } }",
+        body,
+        "fn main() \{ }",
+        "",
+    ].join("\n")
+    let _ = probe("build/tc_rigid_impl_bound_{name}.bl", src)
+    errors_reported()
+}
+
+// Refused: each path, with no bound on the parameter.
+
+test "a method call whose impl needs Ord at an unbounded parameter is E0306" {
+    assert_eq(errors_for("method_ord", "fn g[T](x: T) -> Int \{ Bx \{ v: x }.shown() }"),
+        ["E0306 14:24 | write the bound on the binder: `[T: Ord]`"])
+}
+
+test "a method call whose impl needs a user trait at an unbounded parameter is E0306" {
+    assert_eq(errors_for("method_tag", "fn g[T](x: T) -> Int \{ Cx \{ v: x }.shown() }"),
+        ["E0306 14:24 | write the bound on the binder: `[T: Tag]`"])
+}
+
+test "a method call whose impl needs Eq in a where clause at an unbounded parameter is E0306" {
+    assert_eq(errors_for("method_where", "fn g[T](x: T) -> Int \{ Dx \{ v: x }.shown() }"),
+        ["E0306 14:24 | write the bound on the binder: `[T: Eq]`"])
+}
+
+test "a method call at a parameter with another bound gets a help that extends its bound list" {
+    assert_eq(errors_for("method_other", "fn g[T: Tag](x: T) -> Int \{ Bx \{ v: x }.shown() }"),
+        ["E0306 14:29 | write ` + Ord` on the bound list of `T`"])
+}
+
+test "a trait-qualified call whose impl needs Ord at an unbounded parameter is E0306" {
+    assert_eq(errors_for("qualified_ord", "fn g[T](x: T) -> Int \{ Shown.shown(Bx \{ v: x }) }"),
+        ["E0306 14:24 | write the bound on the binder: `[T: Ord]`"])
+}
+
+test "a callee bound met through an impl that needs Eq at an unbounded parameter is E0306" {
+    assert_eq(errors_for("callee_eq", "fn all_same[X: Same](x: X) -> Bool \{ x.same() }\nfn h[T](x: List[T]) -> Bool \{ all_same(x) }"),
+        ["E0306 15:31 | write the bound on the binder: `[T: Eq]`"])
+}
+
+test "a with-item whose impl needs a user trait at an unbounded parameter is E0306" {
+    assert_eq(errors_for("with_tag", "fn bad[U](u: U) \{ with Bx \{ v: u } \{ let _n = 0 } }"),
+        ["E0306 14:24 | write the bound on the binder: `[U: Tag]`"])
+}
+
+test "BlockHandler.exit whose impl needs a user trait at an unbounded parameter is E0306" {
+    assert_eq(errors_for("exit_tag", "fn bad[U](u: U) \{ BlockHandler.exit(Bx \{ v: u }, true) }"),
+        ["E0306 14:19 | write the bound on the binder: `[U: Tag]`"])
+}
+
+test "a method call whose impl needs Display at an unbounded parameter is E0523" {
+    let errs = errors_for("method_display", "type Ex[T] \{ v: T }\nimpl[T: Display] Shown for Ex[T] \{ fn shown(self) -> Int \{ \"\{self.v}\".len() } }\nfn g[T](x: T) -> Int \{ Ex \{ v: x }.shown() }")
+    assert_eq(errs.len(), 1)
+    assert(errs.get(0).unwrap().starts_with("E0523 16:"))
+}
+
+test "a method call whose impl needs Ord at a list of an unbounded parameter is E0306" {
+    let errs = errors_for("nested_ord", "fn g[T](x: List[T]) -> Int \{ Bx \{ v: x }.shown() }")
+    assert_eq(errs.len(), 1)
+    assert(errs.get(0).unwrap().starts_with("E0306 14:30 "))
+}
+
+test "a method call whose impl needs a user trait met through another impl at a parameter is E0306" {
+    assert_eq(errors_for("nested_tag", "impl[X: Tag] Tag for List[X] \{ fn tag(self) -> Int \{ self.len() } }\nfn g[T](x: List[T]) -> Int \{ Cx \{ v: x }.shown() }"),
+        ["E0306 15:30 | write the bound on the binder: `[T: Tag]`"])
+}
+
+test "an impl bound with a trait argument is judged against the parameter's bound at its argument" {
+    assert_eq(errors_for("trait_arg", [
+        "trait Conv[A] \{ fn conv(self) -> A }",
+        "type Ex[T] \{ v: T }",
+        "impl[T: Conv[Str]] Shown for Ex[T] \{ fn shown(self) -> Int \{ self.v.conv().len() } }",
+        "fn g[T: Conv[Int]](x: T) -> Int \{ Ex \{ v: x }.shown() }",
+        "fn ok[T: Conv[Str]](x: T) -> Int \{ Ex \{ v: x }.shown() }",
+    ].join("\n")), ["E0306 17:35 | write ` + Conv[Str]` on the bound list of `T`"])
+}
+
+test "a static call through the type name whose impl needs Ord at an unbounded parameter is E0306" {
+    assert_eq(errors_for("static_ord", "fn g[T](x: T) -> Int \{ Bx.shown(Bx \{ v: x }) }"),
+        ["E0306 14:24 | write the bound on the binder: `[T: Ord]`"])
+}
+
+test "a bound missed through a nested instance gets a help that extends the parameter's bound list" {
+    assert_eq(errors_for("nested_help", "fn all_same[X: Same](x: X) -> Bool \{ x.same() }\nfn h[T: Tag](x: List[List[T]]) -> Bool \{ all_same(x) }"),
+        ["E0306 15:42 | write ` + Eq` on the bound list of `T`"])
+}
+
+test "a trait-qualified call at an instance that holds a parameter and has no impl is refused" {
+    let errs = errors_for("qualified_no_impl", "type Ex[T] \{ v: T }\nfn g[T](x: T) -> Int \{ Shown.shown(Ex \{ v: x }) }")
+    assert_eq(errs.len(), 1)
+    assert(errs.get(0).unwrap().starts_with("E0505 15:24 "))
+}
+
+test "an impl's bound on a user trait is judged at a type argument that holds a parameter" {
+    let errs = errors_for("user_need", [
+        "type Pr[X, Y] \{ a: X, b: Y }",
+        "impl[X: Tag, Y: Tag] Tag for Pr[X, Y] \{ fn tag(self) -> Int \{ self.a.tag() + self.b.tag() } }",
+        "type Ex[T] \{ v: T }",
+        "impl[V: Tag] Eq for Ex[V] \{ fn eq(self, o: Ex[V]) -> Bool \{ self.v.tag() == o.v.tag() } }",
+        "fn g[T: Tag](a: Ex[Pr[T, Str]]) -> Bool \{ a == a }",
+    ].join("\n"))
+    assert_eq(errs, ["E0300 18:45 | write `impl Tag for Str`"])
+}
+
+test "an impl's bound on a user trait is met at a type argument whose parts all meet it" {
+    assert_eq(errors_for("user_need_met", [
+        "type Pr[X, Y] \{ a: X, b: Y }",
+        "impl[X: Tag, Y: Tag] Tag for Pr[X, Y] \{ fn tag(self) -> Int \{ self.a.tag() + self.b.tag() } }",
+        "type Ex[T] \{ v: T }",
+        "impl[V: Tag] Eq for Ex[V] \{ fn eq(self, o: Ex[V]) -> Bool \{ self.v.tag() == o.v.tag() } }",
+        "fn g[T: Tag](a: Ex[Pr[T, Int]]) -> Bool \{ a == a }",
+        "fn s[T](x: T) -> Int \{ Bx.shown(Bx \{ v: 1 }) }",
+    ].join("\n")), [])
+}
+
+// The report names the impl that wrote the bound, with its location (section 3.6).
+
+test "an impl bound missed at a parameter names the impl and where it declares the bound" {
+    let _ = errors_for("note_rigid", "fn g[T](x: T) -> Int \{ Bx \{ v: x }.shown() }")
+    assert_eq(error_texts(), [
+        "`T` does not satisfy the Ord bound on type parameter T of `Bx`'s impl of Shown: `T` has no Ord bound",
+        "`Bx`'s impl of Shown declares `T: Ord` at build/tc_rigid_impl_bound_note_rigid.bl:8",
+    ])
+}
+
+test "an impl bound missed at a concrete type names the impl and where it declares the bound" {
+    let _ = errors_for("note_concrete", "fn g() -> Int \{ Bx \{ v: [1] }.shown() }")
+    let texts = error_texts()
+    assert_eq(texts.get(0).unwrap(), "`List[Int]` does not satisfy the Ord bound on type parameter T of `Bx`'s impl of Shown")
+    assert_eq(texts.get(1).unwrap(), "`Bx`'s impl of Shown declares `T: Ord` at build/tc_rigid_impl_bound_note_concrete.bl:8")
+}
+
+test "an impl bound on a user trait missed at a concrete type names the impl and where it declares the bound" {
+    let _ = errors_for("note_user", "fn g() -> Int \{ Cx \{ v: \"s\" }.shown() }")
+    let texts = error_texts()
+    assert_eq(texts.get(0).unwrap(), "`Str` does not satisfy the Tag bound on type parameter T of `Cx`'s impl of Shown: it has no impl of Tag")
+    assert_eq(texts.get(1).unwrap(), "`Cx`'s impl of Shown declares `T: Tag` at build/tc_rigid_impl_bound_note_user.bl:9")
+}
+
+test "an impl's where-clause bound missed at a parameter names the impl and where it declares the bound" {
+    let _ = errors_for("note_where", "fn g[T](x: T) -> Int \{ Dx \{ v: x }.shown() }")
+    assert_eq(error_texts(), [
+        "`T` does not satisfy the Eq bound on type parameter T of `Dx`'s impl of Shown: `T` has no Eq bound",
+        "`Dx`'s impl of Shown declares `T: Eq` at build/tc_rigid_impl_bound_note_where.bl:10",
+    ])
+}
+
+// Accepted: the parameter holds the bound.
+
+test "a bound written on the binder meets the impl's bound at each path" {
+    assert_eq(errors_for("met_inline", [
+        "fn g1[T: Ord](x: T) -> Int \{ Bx \{ v: x }.shown() }",
+        "fn g2[T: Tag](x: T) -> Int \{ Cx \{ v: x }.shown() }",
+        "fn g3[T: Eq](x: T) -> Int \{ Dx \{ v: x }.shown() }",
+        "fn g4[T: Ord](x: T) -> Int \{ Shown.shown(Bx \{ v: x }) }",
+        "fn all_same[X: Same](x: X) -> Bool \{ x.same() }",
+        "fn g5[T: Eq](x: List[T]) -> Bool \{ all_same(x) }",
+        "fn g6[U: Tag](u: U) \{ with Bx \{ v: u } \{ let _n = 0 } }",
+        "fn g7[U: Tag](u: U) \{ BlockHandler.exit(Bx \{ v: u }, true) }",
+        "fn g8[T: Ord](x: T) -> Int \{ Bx.shown(Bx \{ v: x }) }",
+    ].join("\n")), [])
+}
+
+test "a bound written in an impl's where clause meets the impl's bound at each path" {
+    assert_eq(errors_for("met_where", [
+        "trait Run \{ fn run(self) -> Int }",
+        "type W[T] \{ v: T, l: List[T] }",
+        "fn all_same[X: Same](x: X) -> Bool \{ x.same() }",
+        "impl[T] Run for W[T] where T: Ord + Tag \{",
+        "    fn run(self) -> Int \{",
+        "        let _s = all_same(self.l)",
+        "        with Bx \{ v: self.v } \{ let _n = 0 }",
+        "        Bx \{ v: self.v }.shown() + Cx \{ v: self.v }.shown() + Dx \{ v: self.v }.shown()",
+        "    }",
+        "}",
+    ].join("\n")), [])
+}
+
+test "a method of an impl whose binder has no bound is E0306 at a call that needs one" {
+    assert_eq(errors_for("impl_binder", [
+        "trait Run \{ fn run(self) -> Int }",
+        "type W[T] \{ v: T }",
+        "impl[T] Run for W[T] \{ fn run(self) -> Int \{ Bx \{ v: self.v }.shown() } }",
+    ].join("\n")), ["E0306 16:46 | write the bound on the binder: `[T: Ord]`"])
+}
+
+test "a bound that gives the impl's bound through a supertrait meets it at each path" {
+    assert_eq(errors_for("met_super", [
+        "fn g2[T: Loud](x: T) -> Int \{ Cx \{ v: x }.shown() }",
+        "fn g3[T: Ord](x: T) -> Int \{ Dx \{ v: x }.shown() }",
+        "fn all_same[X: Same](x: X) -> Bool \{ x.same() }",
+        "fn g5[T: Ord](x: List[T]) -> Bool \{ all_same(x) }",
+        "fn g6[U: Loud](u: U) \{ with Bx \{ v: u } \{ let _n = 0 } }",
+    ].join("\n")), [])
+}

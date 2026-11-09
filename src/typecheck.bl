@@ -3660,14 +3660,15 @@ fn tc_open_group_is_static_impl(g: Int) -> Bool {
 }
 
 // The binds of an impl's binders by name, as tc_check_impl_bounds reads them, at the types
-// `tids` give them in header order. A slot with no judgeable type is left out.
+// `tids` give them in header order. A slot with no judgeable type is left out. A type
+// parameter of the body being checked is judgeable: it has only the bounds its binders give.
 fn tc_impl_binds_by_name(im: Int, tids: List[Int]) -> Map[Str, Int] {
     let mut out: Map[Str, Int] = Map()
     let binders = node_impl_binders(im)
     if binders == -1 { return out }
     for i in 0..sublist_length(binders) {
         let t = tc_resolve(tids.get(i) ?? -1)
-        if t >= 0 && tc_tid_is_judgeable(t) != 0 { out.insert(node_name(sublist_get(binders, i)), t) }
+        if t >= 0 && tc_tid_is_judgeable_among(t, 1) { out.insert(node_name(sublist_get(binders, i)), t) }
     }
     out
 }
@@ -4220,7 +4221,7 @@ fn tc_check_fn_value_bounds(node: Int) ! TypeCheck.Resolve, Diag.Report {
 fn tc_check_typevar_meets_bounds(tid: Int, carrier: Int, enclosing: Int, sig: Int, node: Int) ! Diag.Report {
     let binder = ty_pool.get(tid).unwrap().inner1
     if binder == NO_BINDER_NODE { return }
-    let _ = tc_check_held_meets_bounds(tid, carrier, tc_er_binder_traits(enclosing, binder), sig, node)
+    let _ = tc_check_held_meets_bounds(tid, carrier, tc_er_binder_traits(enclosing, binder), fnsig_pool.get(sig).unwrap().decl, node)
 }
 
 // A bare type parameter of the body being checked, passed where a binder has bounds: inside
@@ -4230,28 +4231,34 @@ fn tc_check_typevar_meets_bounds(tid: Int, carrier: Int, enclosing: Int, sig: In
 // every frame of the binder are merged. A bound with trait arguments needs a bound of the
 // parameter at the same arguments.
 fn tc_check_active_typevar_meets_bounds(tid0: Int, carrier: Int, sig: Int, binds: Map[Str, Int], node: Int) -> Bool ! TypeCheck.Resolve, Diag.Report {
+    if tc_typevar_binds_here(tid0) == 0 { return false }
+    let decl = fnsig_pool.get(sig).unwrap().decl
+    let block = if decl >= 0 { tc_method_block.get(decl) ?? -1 } else { -1 }
+    let outer_sl = if block != -1 && node_kind(block) == NodeKind.ImplBlock { node_impl_binders(block) } else { -1 }
+    let own_sl = if decl >= 0 { node_type_params(decl) } else { -1 }
+    let _ = tc_rigid_typevar_misses_bounds(tid0, carrier, decl, outer_sl, own_sl, binds, node)
+    true
+}
+
+// Whether `tid0`, a type parameter the body being checked binds, misses a bound of `carrier`;
+// reports the first miss. `decl` wrote the bound (-1 for an impl, which a report does not
+// name), and `outer_sl` and `own_sl` are the binders its trait arguments are read under.
+fn tc_rigid_typevar_misses_bounds(tid0: Int, carrier: Int, decl: Int, outer_sl: Int, own_sl: Int, binds: Map[Str, Int], node: Int) -> Bool ! TypeCheck.Resolve, Diag.Report {
     let tid = tc_resolve(tid0)
-    if tc_typevar_binds_here(tid) == 0 { return false }
     let binder = ty_pool.get(tid).unwrap().inner1
     let held = tc_typevar_held_traits(tid)
-    if !tc_check_held_meets_bounds(tid, carrier, held, sig, node) {
-        tc_check_held_meets_bound_args(tid, binder, carrier, sig, binds, node)
-    }
-    true
+    if tc_check_held_meets_bounds(tid, carrier, held, decl, node) { return true }
+    tc_check_held_meets_bound_args(tid, binder, carrier, decl, outer_sl, own_sl, binds, node)
 }
 
 // The bounds of `carrier` that name trait arguments, read at the call's types, against the
 // argument lists the bounds of the parameter at `binder` give that trait. A list that is not
 // fixed, or a trait the parameter's bounds give through a supertrait at no arguments, is not
 // judged.
-fn tc_check_held_meets_bound_args(tid: Int, binder: Int, carrier: Int, sig: Int, binds: Map[Str, Int], node: Int) ! TypeCheck.Resolve, Diag.Report {
-    if carrier < 0 || node_kind(carrier) != NodeKind.TypeParam { return }
+fn tc_check_held_meets_bound_args(tid: Int, binder: Int, carrier: Int, decl: Int, outer_sl: Int, own_sl: Int, binds: Map[Str, Int], node: Int) -> Bool ! TypeCheck.Resolve, Diag.Report {
+    if carrier < 0 || node_kind(carrier) != NodeKind.TypeParam { return false }
     let bounds = node_elements(carrier)
-    if bounds == -1 { return }
-    let decl = fnsig_pool.get(sig).unwrap().decl
-    let block = if decl >= 0 { tc_method_block.get(decl) ?? -1 } else { -1 }
-    let outer_sl = if block != -1 && node_kind(block) == NodeKind.ImplBlock { node_impl_binders(block) } else { -1 }
-    let own_sl = if decl >= 0 { node_type_params(decl) } else { -1 }
+    if bounds == -1 { return false }
     let mut i = 0
     while i < sublist_length(bounds) {
         let bnode = sublist_get(bounds, i)
@@ -4267,22 +4274,22 @@ fn tc_check_held_meets_bound_args(tid: Int, binder: Int, carrier: Int, sig: Int,
             }
             if lists.len() > 0 && !tc_arg_lists_hold(lists, want) {
                 tc_report_held_misses_bound(tid, carrier, bnode, tc_trait_at_text(tc_trait_shown(want_trait), want), decl, node, true)
-                return
+                return true
             }
         }
         i = i + 1
     }
+    false
 }
 
 // The message, note and help take the shape that section 3 gives an E0306 on a declared bound.
 // The note gives no column: a bound node carries the column of the token after it.
 // The callee is named because its parameter may have the same name as the one passed.
 // Answers true when it reported.
-fn tc_check_held_meets_bounds(tid: Int, carrier: Int, held: Str, sig: Int, node: Int) -> Bool ! Diag.Report {
+fn tc_check_held_meets_bounds(tid: Int, carrier: Int, held: Str, decl: Int, node: Int) -> Bool ! Diag.Report {
     if carrier < 0 { return false }
     let bounds = node_elements(carrier)
     if bounds == -1 { return false }
-    let decl = fnsig_pool.get(sig).unwrap().decl
     let mut i = 0
     while i < sublist_length(bounds) {
         let bnode = sublist_get(bounds, i)
@@ -4298,22 +4305,58 @@ fn tc_check_held_meets_bounds(tid: Int, carrier: Int, held: Str, sig: Int, node:
 }
 
 fn tc_report_held_misses_bound(tid: Int, carrier: Int, bnode: Int, shown: Str, decl: Int, node: Int, help_add: Bool) ! Diag.Report {
+    let by_impl = decl >= 0 && node_kind(decl) == NodeKind.ImplBlock
+    let p = node_name(carrier)
     if tc_bound_trait(bnode) == "Display" {
-        let sig = if decl >= 0 { fnsig_by_decl.get(decl) ?? -1 } else { -1 }
-        let at = if sig >= 0 { tc_bound_arg_at(sig, node_name(carrier), node) } else { node }
+        let sig = if decl >= 0 && !by_impl { fnsig_by_decl.get(decl) ?? -1 } else { -1 }
+        let at = if sig >= 0 { tc_bound_arg_at(sig, p, node) } else { node }
         let mut dnotes: List[Str] = []
-        if decl >= 0 { dnotes.push("`{node_name(decl)}` declares `{node_name(carrier)}: Display` at {diag_file_for_node(carrier)}:{node_line(bnode)}") }
-        tc_report_missing_display(at, tid, tid, tc_bound_sink_name(decl), dnotes)
+        if decl >= 0 { dnotes.push("{tc_bound_writer(decl)} declares `{p}: Display` at {diag_file_for_node(carrier)}:{node_line(bnode)}") }
+        tc_report_missing_display(at, tid, tid, if by_impl { "" } else { tc_bound_sink_name(decl) }, dnotes)
         return
     }
-    let callee = if decl >= 0 { " of {node_name(decl)}" } else { "" }
+    let callee = if by_impl { tc_bound_writer_suffix(decl) } else if decl >= 0 { " of {node_name(decl)}" } else { "" }
     let t = type_to_str(tid)
-    let p = node_name(carrier)
     let help = if help_add { "write ` + {shown}` on the bound list of `{t}`" } else { "write the bound on the binder: `[{t}: {shown}]`" }
     let mut notes: List[Str] = []
-    if decl >= 0 { notes.push("`{node_name(decl)}` declares `{p}: {shown}` at {diag_file_for_node(carrier)}:{node_line(bnode)}") }
+    if decl >= 0 { notes.push("{tc_bound_writer(decl)} declares `{p}: {shown}` at {diag_file_for_node(carrier)}:{node_line(bnode)}") }
     diag_error_at_notes("TraitBoundNotSatisfied", TRAIT_BOUND_NOT_SATISFIED,
         "`{t}` does not satisfy the {shown} bound on type parameter {p}{callee}: `{t}` has no {shown} bound", node, help, notes)
+}
+
+// The declaration that wrote a bound, as a report names it: a fn by its name, an impl by its
+// type and its trait (section 3.6, "Trait Bounds").
+fn tc_bound_writer(decl: Int) -> Str {
+    if node_kind(decl) == NodeKind.ImplBlock {
+        return "`{strip_module_qualifier(node_name(decl))}`'s impl of {tc_trait_shown(tc_impl_trait_id(decl))}"
+    }
+    "`{node_name(decl)}`"
+}
+
+// The impl's parameter may have the same name as the one passed, so a report on it names the impl.
+fn tc_bound_writer_suffix(im: Int) -> Str {
+    if im < 0 { "" } else { " of {tc_bound_writer(im)}" }
+}
+
+// The note on an E0306 at an impl's bound on `carrier`: the bound that names `shown`, else
+// the bound list, which then gives `shown` through a supertrait.
+fn tc_impl_bound_note(im: Int, carrier: Int, shown: Str) -> Str {
+    let p = node_name(carrier)
+    let bounds = node_elements(carrier)
+    let mut written: List[Str] = []
+    let mut line = node_line(carrier)
+    let mut i = 0
+    while bounds != -1 && i < sublist_length(bounds) {
+        let b = sublist_get(bounds, i)
+        let bs = tc_trait_shown(tc_bound_trait(b))
+        if bs == shown || bs.starts_with("{shown}[") {
+            return "{tc_bound_writer(im)} declares `{p}: {bs}` at {diag_file_for_node(carrier)}:{node_line(b)}"
+        }
+        written.push(bs)
+        line = node_line(b)
+        i = i + 1
+    }
+    "{tc_bound_writer(im)} declares `{p}: {written.join(" + ")}` at {diag_file_for_node(carrier)}:{line}"
 }
 
 fn tc_report_fn_value_unfixed(node: Int) ! Diag.Report {
@@ -5983,7 +6026,7 @@ fn tc_check_bounds_for_binds(sig: Int, binds0: Map[Str, Int], node: Int) ! TypeC
                 let concrete = binds.get(name).unwrap()
                 let rigid = tc_check_active_typevar_meets_bounds(concrete, carrier, sig, binds, node)
                 let sink = tc_bound_sink_name(fs.decl)
-                if !rigid && bounds != "" && tc_check_one_bound(name, bounds, concrete, node, sink, tc_bound_arg_at(sig, name, node)) == 0 {
+                if !rigid && bounds != "" && tc_check_one_bound(name, bounds, concrete, node, sink, tc_bound_arg_at(sig, name, node), -1, -1) == 0 {
                     tc_check_user_bounds(fs.decl, idx, concrete, binds, node)
                 }
             }
@@ -6033,7 +6076,8 @@ fn tc_bound_sink_name(decl: Int) -> Str {
     "{strip_module_qualifier(node_name(im))}.{node_name(decl)}"
 }
 
-fn tc_check_one_bound(name: Str, bounds: Str, concrete: Int, node: Int, sink: Str, at: Int) -> Int ! TypeCheck.Resolve, Diag.Report {
+// `im` is the impl that wrote the bounds on `carrier`, or -1 for a fn, whose report names no writer.
+fn tc_check_one_bound(name: Str, bounds: Str, concrete: Int, node: Int, sink: Str, at: Int, carrier: Int, im: Int) -> Int ! TypeCheck.Resolve, Diag.Report {
     if tc_pipe_has(bounds, "Display") != 0 {
         let t = resolve_alias_tid(tc_resolve(concrete))
         // The body is still built at Never, and no Display call on Never has a C form.
@@ -6053,9 +6097,12 @@ fn tc_check_one_bound(name: Str, bounds: Str, concrete: Int, node: Int, sink: St
             let help = if fixes.len() > 0 { fixes.join("\n") } else {
                 "pass an argument whose type implements {tr}, or derive/implement {tr} for it; the arithmetic traits (Add/Sub/Mul/Div/Rem/Neg) are sealed to the built-in numeric types"
             }
+            let shown = tc_core_trait_shown(tr)
+            let mut notes: List[Str] = []
+            if im >= 0 { notes.push(tc_impl_bound_note(im, carrier, shown)) }
+            for n in tc_trait_need_notes(path, tr) { notes.push(n) }
             diag_error_at_notes("TraitBoundNotSatisfied", TRAIT_BOUND_NOT_SATISFIED,
-                "`{type_to_str(concrete)}` does not satisfy the {tc_core_trait_shown(tr)} bound on type parameter {name}", node, help,
-                tc_trait_need_notes(path, tr))
+                "`{type_to_str(concrete)}` does not satisfy the {shown} bound on type parameter {name}{tc_bound_writer_suffix(im)}", node, help, notes)
             return 1
         }
         if tc_pipe_has(bounds, tr) != 0 {
@@ -6084,7 +6131,7 @@ fn tc_check_user_bounds(decl: Int, idx: Int, concrete: Int, binds: Map[Str, Int]
     // A trait method's bound can name the trait's parameters, as `U: Got[A]` in `trait Tr[A]`;
     // a call through a bound puts their types in `binds`.
     let outer = if block == -1 { -1 } else if node_kind(block) == NodeKind.ImplBlock { node_impl_binders(block) } else if node_kind(block) == NodeKind.TraitDef { node_type_params(block) } else { -1 }
-    if tc_report_unmet_user_bound(tp, outer, node_type_params(decl), concrete, binds, node) != 0 { return }
+    if tc_report_unmet_user_bound(tp, outer, node_type_params(decl), concrete, binds, node, -1) != 0 { return }
     let _ = tc_report_user_bound_impl_bounds(tp, concrete, node, [])
 }
 
@@ -6121,8 +6168,14 @@ fn tc_judge_impl_bounds(im: Int, ibinds: Map[Str, Int], node: Int, seen: List[St
     for c in carriers {
         let concrete = ibinds.get(node_name(c)) ?? -1
         if concrete == -1 { continue }
-        if tc_check_one_bound(node_name(c), tparam_node_bound_traits(c), concrete, node, "", node) != 0 { return 1 }
-        if tc_report_unmet_user_bound(c, binders, -1, concrete, ibinds, node) != 0 { return 1 }
+        // A type parameter of the body being checked has only the bounds its binders give
+        // (§3.6 Trait Bounds), for every trait, so the impl's bound must be among them.
+        if tc_typevar_binds_here(concrete) != 0 {
+            if tc_rigid_typevar_misses_bounds(concrete, c, im, binders, -1, ibinds, node) { return 1 }
+            continue
+        }
+        if tc_check_one_bound(node_name(c), tparam_node_bound_traits(c), concrete, node, "", node, c, im) != 0 { return 1 }
+        if tc_report_unmet_user_bound(c, binders, -1, concrete, ibinds, node, im) != 0 { return 1 }
         if tc_report_user_bound_impl_bounds(c, concrete, node, seen) != 0 { return 1 }
     }
     0
@@ -6137,7 +6190,7 @@ fn tc_report_user_bound_impl_bounds(carrier: Int, concrete0: Int, node: Int, see
     let bounds = node_elements(carrier)
     if bounds == -1 { return 0 }
     let concrete = resolve_alias_tid(tc_resolve(concrete0))
-    if tc_tid_is_judgeable(concrete) == 0 { return 0 }
+    if !tc_tid_is_judgeable_here(concrete) { return 0 }
     let mut i = 0
     while i < sublist_length(bounds) {
         let trait_name = tc_bound_trait(sublist_get(bounds, i))
@@ -6171,7 +6224,7 @@ fn tc_report_user_bound_impl_bounds(carrier: Int, concrete0: Int, node: Int, see
 
 // E0306 for the first bound on `carrier` that tc_unmet_user_bound finds; answers 1 when it
 // reported.
-fn tc_report_unmet_user_bound(carrier: Int, outer_sl: Int, own_sl: Int, concrete0: Int, binds: Map[Str, Int], node: Int) -> Int ! TypeCheck.Resolve, Diag.Report {
+fn tc_report_unmet_user_bound(carrier: Int, outer_sl: Int, own_sl: Int, concrete0: Int, binds: Map[Str, Int], node: Int, im: Int) -> Int ! TypeCheck.Resolve, Diag.Report {
     let concrete = tc_resolve(concrete0)
     let u = tc_unmet_user_bound(carrier, outer_sl, own_sl, concrete, binds)
     if u.trait_name == "" { return 0 }
@@ -6182,6 +6235,7 @@ fn tc_report_unmet_user_bound(carrier: Int, outer_sl: Int, own_sl: Int, concrete
     // should pass, so the note says why it does not (sections/07 §10.6).
     let spelled = tc_trait_spelling(u.trait_name)
     let mut notes: List[Str] = []
+    if im >= 0 { notes.push(tc_impl_bound_note(im, carrier, shown)) }
     if u.trait_name != spelled && tc_trait_is_compiler_known(spelled) && tc_type_satisfies_bound(concrete, spelled) == 1 {
         notes.push("`{type_to_str(concrete)}` implements `{spelled} (blink.core)`, a different trait with the same name as `{shown}`")
     }
@@ -6200,7 +6254,7 @@ fn tc_report_unmet_user_bound(carrier: Int, outer_sl: Int, own_sl: Int, concrete
         "pass an argument whose type implements {bound_text}, or write `impl {tc_trait_at_text(spelled, u.want)} for {type_to_str(concrete)}`"
     }
     diag_error_at_notes("TraitBoundNotSatisfied", TRAIT_BOUND_NOT_SATISFIED,
-        "`{type_to_str(concrete)}` does not satisfy the {bound_text} bound on type parameter {node_name(carrier)}: {why}", node, help, notes)
+        "`{type_to_str(concrete)}` does not satisfy the {bound_text} bound on type parameter {node_name(carrier)}{tc_bound_writer_suffix(im)}: {why}", node, help, notes)
     1
 }
 
@@ -6222,7 +6276,7 @@ fn tc_unmet_user_bound(carrier: Int, outer_sl: Int, own_sl: Int, concrete: Int, 
     if carrier < 0 || node_kind(carrier) != NodeKind.TypeParam { return none }
     let bounds = node_elements(carrier)
     if bounds == -1 { return none }
-    if tc_tid_is_judgeable(concrete) == 0 { return none }
+    if !tc_tid_is_judgeable_here(concrete) { return none }
     let mut i = 0
     while i < sublist_length(bounds) {
         let b = sublist_get(bounds, i)
@@ -6358,12 +6412,24 @@ fn tc_surface_held(recv: Int, row: SurfaceRow) -> ImplArgsHeld ! TypeCheck.Resol
     ImplArgsHeld { verdict: 1, impls: 1, args: args }
 }
 
+// Whether a type that holds a type parameter is fixed enough to judge an impl against: no
+// unsolved metavariable, and each type parameter in it is one the body being checked binds,
+// which has only the bounds its binders give. A bare one is judged by those bounds, not by
+// impls, so it is not judgeable here.
+fn tc_tid_is_judgeable_here(tid: Int) -> Bool {
+    tc_tid_kind(tc_resolve(tid)) != TyKind.Typevar && tc_tid_is_judgeable_among(tid, 1)
+}
+
 // Whether a type is fixed enough to judge an impl against: no unsolved metavariable and no
 // type parameter anywhere in it.
 fn tc_tid_is_judgeable(tid: Int) -> Int {
-    if tc_tid_is_concrete(tid) == 0 { return 0 }
-    if tc_tid_has_unbound_metavar(tid) != 0 || tc_tid_has_bare_typevar(tid) != 0 { return 0 }
-    1
+    if tc_tid_is_judgeable_among(tid, 0) { 1 } else { 0 }
+}
+
+// foreign_only = 1 allows the type parameters the body being checked binds.
+fn tc_tid_is_judgeable_among(tid: Int, foreign_only: Int) -> Bool {
+    if tc_tid_is_concrete(tid) == 0 || tc_tid_has_unbound_metavar(tid) != 0 { return false }
+    tc_tid_has_typevar_among(tid, foreign_only) == 0
 }
 
 // A bound's trait arguments as types at this call, or a shorter list when one is not judgeable
@@ -6420,8 +6486,9 @@ fn tc_impl_trait_args_held(recv: Int, trait_name: Str) -> ImplArgsHeld ! TypeChe
         // A receiver of another kind (`List[T]` against a struct) cannot apply, pinned or not.
         if tc_tid_kind(at) != tc_tid_kind(recv) { continue }
         // A binder the receiver did not fill means the shapes differ (`List[List[T]]` against
-        // `List[Int]`), so that impl does not apply.
-        if tc_tid_has_bare_typevar(at) != 0 {
+        // `List[Int]`), so that impl does not apply. A type parameter of the body being checked
+        // is a type of its own, not an unfilled binder.
+        if tc_tid_has_foreign_typevar(at) != 0 {
             if !poly { verdict = 0 }
             continue
         }
@@ -6430,7 +6497,7 @@ fn tc_impl_trait_args_held(recv: Int, trait_name: Str) -> ImplArgsHeld ! TypeChe
         let mut heads: List[Int] = []
         for t in tc_impl_trait_arg_tids(im) {
             let ta = tc_resolve(substitute_typevar_tid(t, binds))
-            if tc_tid_has_bare_typevar(ta) != 0 { verdict = 0 }
+            if tc_tid_has_foreign_typevar(ta) != 0 { verdict = 0 }
             heads.push(ta)
         }
         for t in heads { args.push(t) }
@@ -25450,7 +25517,7 @@ pub fn tc_call_trait_head(node: Int) -> Option[Str] {
 // register no impl node, so the bound judgement answers for it.
 fn tc_trait_qualified_unanswered(trait_name: Str, method: Str, recv: Int) -> Bool ! TypeCheck.Resolve, Diag.Report {
     let tr = tc_trait_node_idx.get(trait_name) ?? -1
-    if tr == -1 || tc_tid_is_judgeable(recv) == 0 || tc_trait_declares_method(trait_name, method) == 0 {
+    if tr == -1 || !tc_tid_is_judgeable_here(recv) || tc_trait_declares_method(trait_name, method) == 0 {
         return false
     }
     let row = tc_surface_row(trait_name, tr)
@@ -30015,7 +30082,7 @@ fn tc_user_trait_need(tid0: Int, tr: Str, visiting: List[Int]) -> List[Int] {
     let trait_node = tc_trait_node_idx.get(tr) ?? -1
     if trait_node == -1 || node_source_module(trait_node).starts_with("std_") { return [] }
     let tid = resolve_alias_tid(tc_resolve(tid0))
-    if tc_tid_is_judgeable(tid) == 0 { return [] }
+    if !tc_tid_is_judgeable_here(tid) { return [] }
     let mut failed: List[Int] = []
     for im in tc_impl_recv_tids.keys() {
         if tc_impl_trait_id(im) != tr { continue }
@@ -30156,7 +30223,14 @@ fn tc_trait_need_fixes(leaf: Int, tr: Str) -> List[Str] {
         }
     }
     if k == TyKind.Typevar {
-        lines.push(tc_core_bound_fix(tr, type_to_str(leaf)))
+        // A parameter of this body that has bounds already gets the bound added to its list.
+        if tc_typevar_binds_here(leaf) != 0 && tc_pipe_joined(tc_typevar_held_traits(leaf)) != "" {
+            let imp = tc_core_import_in(tr, nr_current_module)
+            if imp != "" { lines.push(imp) }
+            lines.push("write ` + {tc_core_name_in(tr, nr_current_module)}` on the bound list of `{type_to_str(leaf)}`")
+        } else {
+            lines.push(tc_core_bound_fix(tr, type_to_str(leaf)))
+        }
     }
     lines
 }
