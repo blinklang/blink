@@ -1,0 +1,187 @@
+// A paren payload constructs only a variant declared with `( )` (sections/03_types.md §3.4 *The
+// payload form of a construction*). On a variant declared with `{ }` it is TypeError (E0300),
+// whether its arguments are positional, labelled or mixed, at any count, and `K.A()` on `A {}`
+// too. The span is the parentheses, and the payload gets this one error. The message names the
+// declared form, the note lists the fields in order (or says that the variant declares none),
+// and the help writes the brace literal from the arguments: one by position fills the field at
+// its index, and a label fills the field it names. The fix is machine-applicable only when each
+// argument fills exactly one field. The call has the poison type, so later uses of its binding
+// report nothing more. A bare head (`At(1, 2)`) is not this rule's site (§3.4 *Resolving a bare
+// name*).
+
+import std.fs
+import std.process.{ProcessResult, ChildEnd}
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_reset}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+import compile_test_helpers
+
+fn typecheck_probe(path: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    init_embedded_stdlib()
+    fs.write(path, src).unwrap()
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+}
+
+// Each error as "name line:col-end: message | help | fix | notes", in report order. The fix
+// reads "action `text` at line:col-line:col", or "-" when there is none.
+fn errors_of(src: Str) -> List[Str] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    typecheck_probe("build/test_typecheck_paren_payload_on_a_brace_variant_probe.bl", src)
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" {
+            let fix = if d.fix_action == "" { "-" } else { "{d.fix_action} `{d.fix_text}` at {d.fix_line}:{d.fix_col}-{d.fix_end_line}:{d.fix_end_col}" }
+            out.push("{d.name} {d.line}:{d.col}-{d.end_col}: {d.message} | {d.help} | {fix} | {d.notes.join("; ")}")
+        }
+    }
+    out
+}
+
+// The one error a source gets, or every error when it gets another count, so a failed assert
+// shows them.
+fn only_error(src: Str) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    let got = errors_of(src)
+    if got.len() != 1 { return "{got.len()} errors: {got.join(" || ")}" }
+    got.get(0).unwrap()
+}
+
+let SHAPE = "type Shape \{\n    At \{ x: Int, y: Int }\n    Pair(Int, Int)\n}\n"
+let K = "type K \{\n    A \{}\n    B\n}\n"
+let AT_MSG = "variant `At` is declared with braces, and the payload uses parentheses"
+let AT_NOTE = "fields of `Shape.At`, in order: x (Int), y (Int)"
+let A_MSG = "variant `A` is declared with braces, and the payload uses parentheses"
+let A_NOTE = "`K.A` declares no fields"
+
+fn in_main(decls: Str, line: Str) -> Str {
+    "{decls}fn main() \{\n    {line}\n}\n"
+}
+
+test "a positional paren payload on a brace variant is E0300 with a machine fix" {
+    assert_eq(only_error(in_main(SHAPE, "let _v = Shape.At(1, 2)")),
+        "TypeError 6:22-28: {AT_MSG} | write `Shape.At \{ x: 1, y: 2 }` | write a brace literal `Shape.At \{ x: 1, y: 2 }` at 6:14-6:28 | {AT_NOTE}")
+}
+
+test "a labelled paren payload in declared order is E0300 with a machine fix" {
+    assert_eq(only_error(in_main(SHAPE, "let _v = Shape.At(x: 1, y: 2)")),
+        "TypeError 6:22-34: {AT_MSG} | write `Shape.At \{ x: 1, y: 2 }` | write a brace literal `Shape.At \{ x: 1, y: 2 }` at 6:14-6:34 | {AT_NOTE}")
+}
+
+// A literal runs its fields in written order (sections/02_syntax.md §2.22), so the fix keeps
+// the order of the arguments and does not reorder the calls in them.
+test "a labelled paren payload out of declared order keeps the written order in the fix" {
+    assert_eq(only_error(in_main(SHAPE, "let _v = Shape.At(y: 2, x: 1)")),
+        "TypeError 6:22-34: {AT_MSG} | write `Shape.At \{ y: 2, x: 1 }` | write a brace literal `Shape.At \{ y: 2, x: 1 }` at 6:14-6:34 | {AT_NOTE}")
+}
+
+// The form is the one error: a positional argument after a label is no PositionalAfterKeyword
+// here. The position fills the field at its index.
+test "a mixed paren payload on a brace variant gets only the form error" {
+    assert_eq(only_error(in_main(SHAPE, "let _v = Shape.At(x: 1, 2)")),
+        "TypeError 6:22-31: {AT_MSG} | write `Shape.At \{ x: 1, y: 2 }` | write a brace literal `Shape.At \{ x: 1, y: 2 }` at 6:14-6:31 | {AT_NOTE}")
+}
+
+test "the help copies each argument as written" {
+    assert_eq(only_error(in_main(SHAPE, "let _v = Shape.At(1 + 2, \"ab\".len())")),
+        "TypeError 6:22-41: {AT_MSG} | write `Shape.At \{ x: 1 + 2, y: \"ab\".len() }` | write a brace literal `Shape.At \{ x: 1 + 2, y: \"ab\".len() }` at 6:14-6:41 | {AT_NOTE}")
+}
+
+test "too few arguments get the form error, and the help has no fix" {
+    assert_eq(only_error(in_main(SHAPE, "let _v = Shape.At(1)")),
+        "TypeError 6:22-25: {AT_MSG} | write `Shape.At \{ x: 1, y: ... }` | - | {AT_NOTE}")
+}
+
+test "too many arguments get the form error, and the help has no fix" {
+    assert_eq(only_error(in_main(SHAPE, "let _v = Shape.At(1, 2, 3)")),
+        "TypeError 6:22-31: {AT_MSG} | write `Shape.At \{ x: 1, y: 2 }` | - | {AT_NOTE}")
+}
+
+test "two arguments that fill one field get the form error, and the help has no fix" {
+    assert_eq(only_error(in_main(SHAPE, "let _v = Shape.At(1, x: 2)")),
+        "TypeError 6:22-31: {AT_MSG} | write `Shape.At \{ x: 1, y: ... }` | - | {AT_NOTE}")
+}
+
+test "a label that names no field gets the form error and no NoSuchField" {
+    assert_eq(only_error(in_main(SHAPE, "let _v = Shape.At(z: 1, y: 2)")),
+        "TypeError 6:22-34: {AT_MSG} | write `Shape.At \{ y: 2, x: ... }` | - | {AT_NOTE}")
+}
+
+// The help names each field that no argument fills, as `name: ...`, so it is never a fix.
+test "empty parentheses on a brace variant with fields get the form error, and the help names each field" {
+    assert_eq(only_error(in_main(SHAPE, "let _v = Shape.At()")),
+        "TypeError 6:22-24: {AT_MSG} | write `Shape.At \{ x: ..., y: ... }` | - | {AT_NOTE}")
+}
+
+test "empty parentheses on a variant declared with empty braces are E0300 with a fix" {
+    assert_eq(only_error(in_main(K, "let _v = K.A()")),
+        "TypeError 6:17-19: {A_MSG} | write `K.A \{ }` | write a brace literal `K.A \{ }` at 6:14-6:19 | {A_NOTE}")
+}
+
+test "an argument on a variant declared with empty braces gets the form error and no fix" {
+    assert_eq(only_error(in_main(K, "let _v = K.A(1)")),
+        "TypeError 6:17-20: {A_MSG} | write `K.A \{ }` | - | {A_NOTE}")
+}
+
+test "through a type alias the help writes the alias and the note the enum" {
+    assert_eq(only_error(in_main("{SHAPE}type SA = Shape\n", "let _v = SA.At(1, 2)")),
+        "TypeError 7:19-25: {AT_MSG} | write `SA.At \{ x: 1, y: 2 }` | write a brace literal `SA.At \{ x: 1, y: 2 }` at 7:14-7:25 | {AT_NOTE}")
+}
+
+test "a brace variant of a generic enum gets the form error" {
+    let g = "type G[T] \{\n    Rec \{ v: T }\n    Nil\n}\n"
+    assert_eq(only_error(in_main(g, "let _v: G[Int] = G.Rec(1)")),
+        "TypeError 6:27-30: variant `Rec` is declared with braces, and the payload uses parentheses | write `G.Rec \{ v: 1 }` | write a brace literal `G.Rec \{ v: 1 }` at 6:22-6:30 | fields of `G.Rec`, in order: v (T)")
+}
+
+test "empty parentheses on a generic variant declared with empty braces are E0300" {
+    let opt = "type Opt[T] \{\n    No \{}\n    Yes(T)\n}\n"
+    assert_eq(only_error(in_main(opt, "let _v: Opt[Int] = Opt.No()")),
+        "TypeError 6:30-32: variant `No` is declared with braces, and the payload uses parentheses | write `Opt.No \{ }` | write a brace literal `Opt.No \{ }` at 6:24-6:32 | `Opt.No` declares no fields")
+}
+
+test "the binding of a paren payload on a brace variant is poison and its uses report nothing" {
+    let src = "{SHAPE}fn main() \{\n    let v = Shape.At(1, 2)\n    let _n: Int = v\n    io.println(\"\{match v \{ Shape.At \{ x, .. } => x\n Shape.Pair(a, _) => a }}\")\n}\n"
+    assert_eq(only_error(src),
+        "TypeError 6:21-27: {AT_MSG} | write `Shape.At \{ x: 1, y: 2 }` | write a brace literal `Shape.At \{ x: 1, y: 2 }` at 6:13-6:27 | {AT_NOTE}")
+}
+
+// The payload is the one form error; a value in it is still checked as any expression is.
+test "an undefined name in an argument is still reported" {
+    let got = errors_of(in_main(SHAPE, "let _v = Shape.At(nope, 2)"))
+    assert_eq(got.len(), 2)
+    assert(got.join(" || ").contains("UndefinedVariable 6:23-"), got.join(" || "))
+    assert(got.join(" || ").contains("TypeError 6:22-31: {AT_MSG}"), got.join(" || "))
+}
+
+test "a paren payload on a variant declared with parentheses is still legal" {
+    assert_eq(errors_of(in_main(SHAPE, "let _v = Shape.Pair(1, 2)")), [])
+}
+
+test "a labelled paren payload on a variant declared with parentheses and names is still legal" {
+    let named = "type Fig \{\n    Circle(radius: Float, tag: Int)\n}\n"
+    assert_eq(errors_of(in_main(named, "let _v = Fig.Circle(radius: 1.0, tag: 3)")), [])
+}
+
+let DIR = "{compile_test_helpers.scratch_root()}/paren_payload_on_brace_variant_check_build"
+
+fn sh(cmd: Str) -> ProcessResult ! Process.Spawn {
+    process.run("sh", ["-c", cmd]).unwrap()
+}
+
+test "check and build stop at the same E0300 for parentheses on a brace variant, with no internal error" {
+    let _mk = sh("rm -rf {DIR} && mkdir -p {DIR}")
+    fs.write("{DIR}/main.bl", "type K \{\n    A \{}\n    B\n}\nfn main() \{\n    let v = K.A()\n    io.println(\"\{match v \{ K.A \{ } => 0\n K.B => 1 }}\")\n}\n").unwrap()
+    let env_of = "env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE"
+    let check = sh("B=$(pwd)/build/blink; cd {DIR} && {env_of} $B check main.bl < /dev/null")
+    let build = sh("B=$(pwd)/build/blink; cd {DIR} && {env_of} $B build main.bl < /dev/null")
+    let _rm = sh("rm -rf {DIR}")
+    let head = "error[TypeError]: {A_MSG}"
+    assert_eq(check.end, ChildEnd.Exited(1))
+    assert(check.out.concat(check.err_out).contains(head), check.out.concat(check.err_out))
+    assert_eq(build.end, ChildEnd.Exited(1))
+    let built = build.out.concat(build.err_out)
+    assert(built.contains(head), built)
+    assert(!built.contains("internal compiler error"), built)
+}

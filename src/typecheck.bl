@@ -24266,6 +24266,92 @@ fn tc_report_unit_variant_parens(var_idx: Int, vname: Str, node: Int) -> Bool ! 
     true
 }
 
+// §3.4 *The payload form of a construction*: a paren payload constructs only a variant declared
+// with `( )`. On one declared with `{ }` it is E0300, positional, labelled or mixed, at any
+// count, `K.A()` on `A {}` too. It is the payload's one error, so it comes before the count and
+// field rules, and the caller gives the call the poison type. The values are still inferred,
+// as any expression is. `written` is the head as the site writes it; the help writes the brace
+// literal after it, and the fix replaces the call as written with that literal.
+fn tc_report_brace_variant_parens(var_idx: Int, written: Str, node: Int) -> Bool ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    if tc_variant_decl_form(var_idx) != 2 { return false }
+    let vdecl = tc_variant_decl_node(var_idx)
+    let vname = node_name(vdecl)
+    let shown = "{tc_nominal_type_name(evar_pool.get(var_idx).unwrap().enum_decl)}.{vname}"
+    let fields = tc_variant_field_nodes(var_idx)
+    let note = if fields.len() == 0 { "`{shown}` declares no fields" } else { tc_fields_given_note(shown, fields, 0, []) }
+    let rewrite = tc_brace_rewrite_of_parens(node, fields)
+    let msg = "variant `{vname}` is declared with braces, and the payload uses parentheses"
+    let literal = "{written} {rewrite.text}"
+    let help = if rewrite.text == "" { "write a brace literal: `{written} \{ ... }`" } else { "write `{literal}`" }
+    tc_errors.push(msg)
+    let open = tc_open_col_after_head(node, 40)
+    let (start_line, start_col, end_line, end_col) = node_written_span(node)
+    if open == -1 || end_line <= 0 {
+        diag_error_at_notes("TypeError", TYPE_ERROR, msg, node, help, [note])
+    } else {
+        let before = diag_entry_count()
+        diag_error_in_file_label_notes("TypeError", TYPE_ERROR, msg, diag_file_for_node(node), node_line(node), open, end_line, end_col, "", help, [note])
+        if rewrite.exact && diag_entry_count() > before {
+            diag_set_last_fix_at("write a brace literal", literal, start_line, start_col, end_line, end_col)
+        }
+    }
+    let _ = tc_check_poisoned_call_args(node)
+    true
+}
+
+type BraceRewrite {
+    text: Str
+    exact: Bool
+}
+
+// The brace literal a paren payload means (§3.4): an argument by position fills the field at
+// its index, and a label fills the field it names. The fields keep the order of the arguments,
+// because a literal runs its fields in written order (§2.22), so the fix does not reorder the
+// calls in them. `exact` holds when each argument fills exactly one field and no two fill the
+// same one, so the literal has every field once. An argument that fills no field, or a field
+// that an earlier argument filled, is not written. A field that no argument fills is written
+// last, in declared order, as `name: ...`, so the help names what is missing; that literal is
+// never `exact`. The text is "" when the source of an argument it writes is not known.
+fn tc_brace_rewrite_of_parens(node: Int, fields: List[Int]) -> BraceRewrite {
+    let args = node_args(node)
+    let count = if args == -1 { 0 } else { sublist_length(args) }
+    let mut filled: List[Int] = []
+    let mut parts: List[Str] = []
+    let mut exact = count == fields.len()
+    let mut i = 0
+    while i < count {
+        let arg = sublist_get(args, i)
+        let labelled = node_kind(arg) == NodeKind.NamedArg
+        let value = if labelled { node_value(arg) } else { arg }
+        let mut slot = -1
+        if labelled {
+            let mut j = 0
+            while j < fields.len() {
+                if node_name(fields.get(j).unwrap()) == node_name(arg) { slot = j }
+                j = j + 1
+            }
+        } else if i < fields.len() {
+            slot = i
+        }
+        if slot == -1 || filled.contains(slot) {
+            exact = false
+        } else {
+            let text = tc_written_operand(value).text
+            if text == "" { return BraceRewrite { text: "", exact: false } }
+            filled.push(slot)
+            parts.push("{node_name(fields.get(slot).unwrap())}: {text}")
+        }
+        i = i + 1
+    }
+    i = 0
+    while i < fields.len() {
+        if !filled.contains(i) { parts.push("{node_name(fields.get(i).unwrap())}: ...") }
+        i = i + 1
+    }
+    let text = if parts.len() == 0 { "\{ }" } else { "\{ {parts.join(", ")} }" }
+    BraceRewrite { text: text, exact: exact }
+}
+
 // §3.4 *The payload form of a construction*: a brace literal constructs a variant declared
 // with `{ }`, or with `( )` and named fields. A unit variant is neither, so its brace literal
 // is E0300 on the braces, and the payload gets no other error. `written` is the head as the
@@ -24431,16 +24517,24 @@ fn tc_report_variant_arity(shown: Str, var_idx: Int, vname: Str, positional: Int
 
 // The note of a count error, or [] when the variant's declaration is not known.
 fn tc_variant_fields_note(shown: Str, var_idx: Int, positional: Int, labels: List[Int]) -> List[Str] {
+    let fields = tc_variant_field_nodes(var_idx)
+    if fields.len() == 0 { return [] }
+    [tc_fields_given_note(shown, fields, positional, labels)]
+}
+
+// The declared field nodes of a variant in order, or [] when it has none or its declaration
+// is not known.
+fn tc_variant_field_nodes(var_idx: Int) -> List[Int] {
+    let mut fields: List[Int] = []
     let vdecl = tc_variant_decl_node(var_idx)
     let decl_fields = if vdecl != -1 { node_fields(vdecl) } else { -1 }
-    if decl_fields == -1 || sublist_length(decl_fields) == 0 { return [] }
-    let mut fields: List[Int] = []
+    if decl_fields == -1 { return fields }
     let mut i = 0
     while i < sublist_length(decl_fields) {
         fields.push(sublist_get(decl_fields, i))
         i = i + 1
     }
-    [tc_fields_given_note(shown, fields, positional, labels)]
+    fields
 }
 
 // §3.4: the fields of a variant in order, each that an argument filled, by position or by
@@ -32263,6 +32357,7 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                         nr_note_call_decl(node, tc_variant_decl_node(cvar_idx))
                         let cargs_sl = node_args(node)
                         if tc_report_unit_variant_parens(cvar_idx, method, node) { return tc_error_recovery_tid() }
+                        if tc_report_brace_variant_parens(cvar_idx, "{cname}.{method}", node) { return tc_error_recovery_tid() }
                         tc_check_variant_paren_payload(cvar_idx, method, node)
                         if tc_alias_decl_of_written(cname) != -1 {
                             let _ = tc_check_variant_payload_values_at("{cname}.{method}", cvar_idx, cargs_sl, ctor_tid)
