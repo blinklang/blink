@@ -1,0 +1,330 @@
+// A type parameter of the body being checked has only the bounds its binders give (§3.6
+// Trait Bounds). A bound on a generic trait names the trait at its arguments, so `A: Conv[Int]`
+// gives `Conv[Int]` and not `Conv[K2]` or `Conv[Str]`. Where a callee's or an impl's bound
+// reads `V: Conv[K]` and the call fills `K` with a type parameter of the body, the bound is
+// judged at that parameter: at a call, a method call, a trait-qualified call and an operator.
+// A miss is E0306 at the call (E0300 at the operator), with a help that adds the bound at its
+// arguments. At an operator, a concrete type has the trait only at the arguments of its impls.
+// A bound written inline, in an impl's where clause, or given through a supertrait with
+// arguments meets it, and so does a call that fills `K` with a concrete type that matches. A
+// callee parameter the call leaves open is not judged, and a trait whose impls the compiler
+// supplies is judged at an operator as at a call.
+
+import std.fs
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_reset}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+
+fn probe(path: Str, src: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    init_embedded_stdlib()
+    fs.write(path, src).unwrap()
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+    program
+}
+
+// The code, line, column and help of each error.
+fn errors_reported() -> List[Str] {
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" { out.push("{d.code} {d.line}:{d.col} | {d.help}") }
+    }
+    out
+}
+
+// The message and notes of each error.
+fn error_texts() -> List[Str] {
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" {
+            out.push(d.message)
+            for n in d.notes { out.push(n) }
+        }
+    }
+    out
+}
+
+// The program shares one prelude, so the body under test is on line 15.
+fn errors_for(name: Str, body: Str) -> List[Str] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    let src = [
+        "trait Conv[A] \{ fn conv(self) -> Int }",
+        "trait Wide[K]: Conv[K] \{ fn wide(self) -> Int }",
+        "impl Conv[Int] for Int \{ fn conv(self) -> Int \{ 7 } }",
+        "type Tg[X] \{ x: X }",
+        "type Px[K, V] \{ k: K, v: V }",
+        "trait Shown \{ fn shown(self) -> Int }",
+        "impl[K, V: Conv[K]] Shown for Px[K, V] \{ fn shown(self) -> Int \{ self.v.conv() } }",
+        "type Wx[K, V] \{ k: K, v: V }",
+        "impl[K, V] Shown for Wx[K, V] where V: Conv[K] \{ fn shown(self) -> Int \{ self.v.conv() } }",
+        "impl[K, V: Conv[K]] Eq for Px[K, V] \{ fn eq(self, o: Px[K, V]) -> Bool \{ self.v.conv() == o.v.conv() } }",
+        "type Bx[T] \{ v: T }",
+        "impl[T: Conv[Int]] Eq for Bx[T] \{ fn eq(self, o: Bx[T]) -> Bool \{ self.v.conv() == o.v.conv() } }",
+        "fn need[K, V: Conv[K]](k: K, v: V) -> Int \{ v.conv() }",
+        "fn need_int[V: Conv[Int]](v: V) -> Int \{ v.conv() }",
+        body,
+        "fn main() \{ }",
+        "",
+    ].join("\n")
+    let _ = probe("build/tc_rigid_bound_args_{name}.bl", src)
+    errors_reported()
+}
+
+// Refused: the parameter holds the trait at other arguments.
+
+test "a call whose callee bound names a body parameter as the trait argument is E0306" {
+    assert_eq(errors_for("call", "fn f[K2, A: Conv[Int]](k: K2, a: A) -> Int \{ need(k, a) }"),
+        ["E0306 15:46 | write ` + Conv[K2]` on the bound list of `A`"])
+}
+
+test "a method call whose impl bound names a body parameter as the trait argument is E0306" {
+    assert_eq(errors_for("method", "fn g[K2, A: Conv[Int]](p: Px[K2, A]) -> Int \{ p.shown() }"),
+        ["E0306 15:47 | write ` + Conv[K2]` on the bound list of `A`"])
+}
+
+test "a method call whose impl where clause names a body parameter as the trait argument is E0306" {
+    assert_eq(errors_for("method_where", "fn g[K2, A: Conv[Int]](p: Wx[K2, A]) -> Int \{ p.shown() }"),
+        ["E0306 15:47 | write ` + Conv[K2]` on the bound list of `A`"])
+}
+
+test "a trait-qualified call whose impl bound names a body parameter as the trait argument is E0306" {
+    assert_eq(errors_for("qualified", "fn g[K2, A: Conv[Int]](p: Px[K2, A]) -> Int \{ Shown.shown(p) }"),
+        ["E0306 15:47 | write ` + Conv[K2]` on the bound list of `A`"])
+}
+
+test "== whose impl bound names a body parameter as the trait argument is E0300" {
+    assert_eq(errors_for("op", "fn g[K2, A: Conv[Int]](p: Px[K2, A]) -> Bool \{ p == p }"),
+        ["E0300 15:50 | write ` + Conv[K2]` on the bound list of `A`"])
+}
+
+test "a bound at one argument does not meet a callee bound at another" {
+    assert_eq(errors_for("held_other", "fn f[T: Conv[Str]](t: T) -> Int \{ need_int(t) }"),
+        ["E0306 15:35 | write ` + Conv[Int]` on the bound list of `T`"])
+}
+
+test "a bound at one argument does not meet an impl bound at another at an operator" {
+    assert_eq(errors_for("held_other_op", "fn g[T: Conv[Str]](a: Bx[T]) -> Bool \{ a == a }"),
+        ["E0300 15:42 | write ` + Conv[Int]` on the bound list of `T`"])
+}
+
+test "a supertrait at one argument does not meet a bound at another" {
+    assert_eq(errors_for("super_other", [
+        "fn f[T: Wide[Str]](t: T) -> Int \{ need_int(t) }",
+        "fn g[T: Wide[Str]](a: Bx[T]) -> Bool \{ a == a }",
+    ].join("\n")), [
+        "E0306 15:35 | write ` + Conv[Int]` on the bound list of `T`",
+        "E0300 16:42 | write ` + Conv[Int]` on the bound list of `T`",
+    ])
+}
+
+test "a concrete type whose impls give other arguments than a body parameter is E0306" {
+    assert_eq(errors_for("concrete", "fn h[K2](k: K2) -> Int \{ need(k, 1) }"),
+        ["E0306 15:26 | pass an argument whose type implements Conv[K2]"])
+}
+
+test "an impl whose trait argument follows its receiver does not meet a bound at another argument" {
+    assert_eq(errors_for("follows_other", [
+        "impl[X] Conv[X] for Tg[X] \{ fn conv(self) -> Int \{ 1 } }",
+        "fn h[K2](k: K2, t: Tg[Int]) -> Int \{ need(k, t) }",
+    ].join("\n")), ["E0306 16:38 | pass an argument whose type implements Conv[K2]"])
+}
+
+test "== on a concrete type whose impls give other arguments than the impl bound asks is E0300" {
+    assert_eq(errors_for("concrete_op", [
+        "fn h(p: Px[Str, Int]) -> Bool \{ p == p }",
+        "fn k[K2](p: Px[K2, Int]) -> Bool \{ p == p }",
+    ].join("\n")), [
+        "E0300 15:35 | write `impl Conv[Str] for Int`",
+        "E0300 16:38 | ",
+    ])
+}
+
+test "a bound at one argument does not meet an impl bound at another at a method call" {
+    assert_eq(errors_for("held_other_method", "fn g[T: Conv[Str]](p: Px[Int, T]) -> Int \{ p.shown() }"),
+        ["E0306 15:44 | write ` + Conv[Int]` on the bound list of `T`"])
+}
+
+test "< and assert_eq whose impl bound names a body parameter as the trait argument are refused" {
+    assert_eq(errors_for("ord_assert", [
+        "impl[K, V: Conv[K]] Ord for Px[K, V] \{ fn cmp(self, o: Px[K, V]) -> Ordering \{ self.v.conv().cmp(o.v.conv()) } }",
+        "fn g[K2, A: Conv[Int]](p: Px[K2, A]) -> Bool \{ p < p }",
+        "fn h[K2, A: Conv[Int]](p: Px[K2, A]) \{ assert_eq(p, p) }",
+    ].join("\n")), [
+        "E0300 16:50 | write ` + Conv[K2]` on the bound list of `A`",
+        "E0306 17:40 | write ` + Conv[K2]` on the bound list of `A`",
+    ])
+}
+
+test "the help gives the trait arguments for a parameter with other bounds or with none" {
+    assert_eq(errors_for("help_args", [
+        "fn f[K2, X: Shown](k: K2, x: X) -> Int \{ need(k, x) }",
+        "fn g[K2, X](k: K2, x: X) -> Int \{ need(k, x) }",
+    ].join("\n")), [
+        "E0306 15:42 | write ` + Conv[K2]` on the bound list of `X`",
+        "E0306 16:35 | write the bound on the binder: `[X: Conv[K2]]`",
+    ])
+}
+
+test "a trait whose impls are written is still judged by them at an operator" {
+    assert_eq(errors_for("written_still_judged", [
+        "trait Mk[A] \{ }",
+        "impl Mk[Int] for Int \{ }",
+        "type Mx[K, V] \{ k: K, v: V }",
+        "impl[K, V: Mk[K]] Eq for Mx[K, V] \{ fn eq(self, o: Mx[K, V]) -> Bool \{ true } }",
+        "fn h(p: Mx[Str, Int]) -> Bool \{ p == p }",
+    ].join("\n")), ["E0300 19:35 | write `impl Mk[Str] for Int`"])
+}
+
+test "the report gives the bound at the call's types and the note gives it as written" {
+    let _ = errors_for("texts", "fn f[K2, A: Conv[Int]](k: K2, a: A) -> Int \{ need(k, a) }")
+    assert_eq(error_texts(), [
+        "`A` does not satisfy the Conv[K2] bound on type parameter V of need: `A` has no Conv[K2] bound",
+        "`need` declares `V: Conv[K]` at build/tc_rigid_bound_args_texts.bl:13",
+    ])
+}
+
+test "the report on == gives the bound at its arguments in the chain" {
+    let _ = errors_for("op_texts", "fn g[K2, A: Conv[Int]](p: Px[K2, A]) -> Bool \{ p == p }")
+    assert_eq(error_texts(), [
+        "`Px[K2, A]` does not implement `Eq`",
+        "`Px[K2, A]` is `Eq` only if `A` is `Conv[K2]`",
+    ])
+}
+
+// A trait that shares its name with one of the file's own is named with its module, the same
+// at a call and at an operator, never by its internal key.
+test "the report names a trait from another module the same at a call and at ==" {
+    let pkg = "build/tc_rigid_bound_args_pkg"
+    let _mk = process.run("mkdir", ["-p", "{pkg}/src"]).unwrap()
+    fs.write("{pkg}/blink.toml", "[package]\nname = \"tcrigidargs\"\nversion = \"0.1.0\"\n").unwrap()
+    fs.write("{pkg}/src/cv.bl", [
+        "pub trait Conv[A] \{ fn conv(self) -> Int }",
+        "pub type Px[K, V] \{ k: K, v: V }",
+        "impl[K, V: Conv[K]] Eq for Px[K, V] \{ fn eq(self, o: Px[K, V]) -> Bool \{ self.v.conv() == o.v.conv() } }",
+        "pub fn need[K, V: Conv[K]](_k: K, v: V) -> Int \{ v.conv() }",
+        "",
+    ].join("\n")).unwrap()
+    init_embedded_stdlib()
+    fs.write("{pkg}/src/probe.bl", [
+        "import cv.\{Px, need}",
+        "trait Conv[A] \{ fn conv(self) -> Int }",
+        "fn f[K2, A: Conv[K2]](k: K2, a: A) -> Int \{ need(k, a) }",
+        "fn g[K2, A: Conv[K2]](p: Px[K2, A]) -> Bool \{ p == p }",
+        "fn main() \{ }",
+        "",
+    ].join("\n")).unwrap()
+    diag_reset()
+    check_types(compile_to_program("{pkg}/src/probe.bl", 1))
+    let got = errors_reported()
+    let _rm = process.run("rm", ["-rf", pkg]).unwrap()
+    assert_eq(got, [
+        "E0306 3:45 | write ` + Conv (cv)[K2]` on the bound list of `A`",
+        "E0300 4:49 | write ` + Conv (cv)[K2]` on the bound list of `A`",
+    ])
+}
+
+// Accepted: the parameter holds the trait at the bound's arguments.
+
+test "a bound written on the binder at a body parameter meets the bound at each path" {
+    assert_eq(errors_for("met_inline", [
+        "fn f[K2, A: Conv[K2]](k: K2, a: A) -> Int \{ need(k, a) }",
+        "fn g[K2, A: Conv[K2]](p: Px[K2, A]) -> Int \{ p.shown() + Shown.shown(p) }",
+        "fn w[K2, A: Conv[K2]](p: Wx[K2, A]) -> Int \{ p.shown() }",
+        "fn e[K2, A: Conv[K2]](p: Px[K2, A]) -> Bool \{ p == p && !(p != p) }",
+        "fn two[K2, A: Conv[Int] + Conv[K2]](k: K2, a: A) -> Int \{ need(k, a) + need_int(a) }",
+    ].join("\n")), [])
+}
+
+test "a bound written in an impl's where clause meets the bound at each path" {
+    assert_eq(errors_for("met_where", [
+        "trait Run \{ fn run(self) -> Int }",
+        "type Q[K, V] \{ k: K, v: V }",
+        "impl[K2, A] Run for Q[K2, A] where A: Conv[K2] \{",
+        "    fn run(self) -> Int \{",
+        "        let p = Px \{ k: self.k, v: self.v }",
+        "        need(self.k, self.v) + p.shown() + if p == p \{ 1 } else \{ 0 }",
+        "    }",
+        "}",
+    ].join("\n")), [])
+}
+
+test "a bound that gives the trait through a supertrait with arguments meets the bound at each path" {
+    assert_eq(errors_for("met_super", [
+        "fn f[K2, A: Wide[K2]](k: K2, a: A) -> Int \{ need(k, a) }",
+        "fn g[K2, A: Wide[K2]](p: Px[K2, A]) -> Int \{ p.shown() }",
+        "fn e[K2, A: Wide[K2]](p: Px[K2, A]) -> Bool \{ p == p }",
+        "fn i[T: Wide[Int]](t: T, a: Bx[T]) -> Bool \{ need_int(t) > 0 && a == a }",
+        "fn both[K2, A: Wide[K2] + Conv[Int]](k: K2, a: A) -> Int \{ need(k, a) + need_int(a) }",
+    ].join("\n")), [])
+}
+
+test "a call that fills the trait argument with a matching concrete type meets the bound" {
+    assert_eq(errors_for("met_concrete", [
+        "fn f[A: Conv[Int]](a: A) -> Int \{ need(1, a) }",
+        "fn g[A: Conv[Int]](p: Px[Int, A]) -> Int \{ p.shown() }",
+        "fn e[A: Conv[Int]](p: Px[Int, A], b: Bx[A]) -> Bool \{ p == p && b == b }",
+    ].join("\n")), [])
+}
+
+test "an impl whose trait argument follows its receiver meets a bound at a body parameter" {
+    assert_eq(errors_for("met_follows", [
+        "impl[X] Conv[X] for Tg[X] \{ fn conv(self) -> Int \{ 1 } }",
+        "fn h[K2](k: K2, t: Tg[K2]) -> Int \{ need(k, t) }",
+        "fn g[K2](p: Px[K2, Tg[K2]]) -> Bool \{ p == p && p.shown() > 0 }",
+        "fn s(p: Px[Str, Tg[Str]]) -> Bool \{ p == p && p.shown() > 0 }",
+    ].join("\n")), [])
+}
+
+test "a callee parameter the call leaves open is not judged at the call" {
+    assert_eq(errors_for("met_open_callee", [
+        "fn need_k[K, V: Conv[K]](_v: V) -> List[K] \{ [] }",
+        "fn f[A: Conv[Int]](a: A) -> Int \{",
+        "    let xs: List[Int] = need_k(a)",
+        "    let ys: List[Int] = need_k(3)",
+        "    xs.len() + ys.len()",
+        "}",
+    ].join("\n")), [])
+}
+
+test "a trait method bound that names the trait's parameter is judged at the receiver's argument" {
+    assert_eq(errors_for("met_trait_method", [
+        "type Hold[K] \{ k: K }",
+        "trait Mk[K] \{ fn mk[A: Conv[K]](self, a: A) -> Int }",
+        "impl[K] Mk[K] for Hold[K] \{ fn mk[A: Conv[K]](self, a: A) -> Int \{ a.conv() } }",
+        "fn caller_ok[K2, B: Conv[K2]](h: Hold[K2], b: B) -> Int \{ h.mk(b) }",
+        "fn concrete() -> Int \{ Hold \{ k: 1 }.mk(2) }",
+    ].join("\n")), [])
+}
+
+test "an impl the compiler supplies meets an impl bound at an operator" {
+    assert_eq(errors_for("met_supplied", [
+        "type Fx[K, V] \{ k: K, v: V }",
+        "impl[K, V: From[K]] Eq for Fx[K, V] \{ fn eq(self, o: Fx[K, V]) -> Bool \{ true } }",
+        "type Ix[K, V] \{ k: K, v: V }",
+        "impl[K, V: Into[K]] Eq for Ix[K, V] \{ fn eq(self, o: Ix[K, V]) -> Bool \{ true } }",
+        "type Cx[K, V] \{ k: K, v: V }",
+        "impl[K, V: Contains[K]] Eq for Cx[K, V] \{ fn eq(self, o: Cx[K, V]) -> Bool \{ true } }",
+        "fn h(f: Fx[Int, Int], i: Ix[Int, I8], c: Cx[Int, List[Int]]) -> Bool \{ f == f && i == i && c == c }",
+    ].join("\n")), [])
+}
+
+test "an impl of a generic trait with no methods meets an impl bound at an operator" {
+    assert_eq(errors_for("met_no_methods", [
+        "trait Mk[A] \{ }",
+        "impl Mk[Int] for Int \{ }",
+        "type Mx[K, V] \{ k: K, v: V }",
+        "impl[K, V: Mk[K]] Eq for Mx[K, V] \{ fn eq(self, o: Mx[K, V]) -> Bool \{ true } }",
+        "fn h(p: Mx[Int, Int]) -> Bool \{ p == p }",
+    ].join("\n")), [])
+}
+
+test "a supertrait that names Self as its argument gives the trait at the parameter itself" {
+    assert_eq(errors_for("met_super_self", [
+        "trait Selfy: Conv[Self] \{ fn s(self) -> Int }",
+        "impl Selfy for Int \{ fn s(self) -> Int \{ 1 } }",
+        "fn needs[V: Conv[V]](v: V) -> Int \{ v.conv() }",
+        "fn ok2[A: Selfy](a: A) -> Int \{ needs(a) }",
+    ].join("\n")), [])
+}
