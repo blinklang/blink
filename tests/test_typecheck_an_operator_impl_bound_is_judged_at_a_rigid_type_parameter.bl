@@ -1,0 +1,191 @@
+// A type parameter of the body being checked has only the bounds its binders give (§3.6
+// Trait Bounds), and a polymorphic impl covers only the instances that meet its bounds (§3.6
+// Polymorphic Trait Implementations). So `==`, `!=` and the ordering operators at an instance
+// that holds such a parameter judge the Eq or Ord impl's bounds by the parameter's own bounds,
+// for every trait the impl names. A miss is E0300 at the operator, with the chain to the
+// parameter and a help that adds the bound to it. A bound written inline, in an impl's where
+// clause, or one a written bound gives through a supertrait meets the impl's bound. A
+// Closeable bound gives BlockHandler, as each Closeable type is a scoped value (§4.7.2).
+
+import std.fs
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_reset}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+
+fn probe(path: Str, src: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    init_embedded_stdlib()
+    fs.write(path, src).unwrap()
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+    program
+}
+
+// The code, line, column and help of each error.
+fn errors_reported() -> List[Str] {
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" { out.push("{d.code} {d.line}:{d.col} | {d.help}") }
+    }
+    out
+}
+
+// The message and notes of each error.
+fn error_texts() -> List[Str] {
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" {
+            out.push(d.message)
+            for n in d.notes { out.push(n) }
+        }
+    }
+    out
+}
+
+// The program shares one prelude, so the body under test is on line 14.
+fn errors_for(name: Str, body: Str) -> List[Str] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    let src = [
+        "trait Sh \{ fn sh(self) -> Int }",
+        "trait Loud: Sh \{ fn loud(self) -> Int }",
+        "impl Sh for Int \{ fn sh(self) -> Int \{ self } }",
+        "impl[V: Sh] Sh for List[V] \{ fn sh(self) -> Int \{ self.len() } }",
+        "type Bx[T] \{ v: T }",
+        "impl[T: Sh] Eq for Bx[T] \{ fn eq(self, o: Bx[T]) -> Bool \{ self.v.sh() == o.v.sh() } }",
+        "impl[T: Sh] Ord for Bx[T] \{ fn cmp(self, o: Bx[T]) -> Ordering \{ self.v.sh().cmp(o.v.sh()) } }",
+        "type Ex[T] \{ v: T }",
+        "impl[T: Eq] Eq for Ex[T] \{ fn eq(self, o: Ex[T]) -> Bool \{ self.v == o.v } }",
+        "type Dx[T] \{ v: T }",
+        "impl[T: Display] Eq for Dx[T] \{ fn eq(self, o: Dx[T]) -> Bool \{ \"\{self.v}\" == \"\{o.v}\" } }",
+        "type Ax[T] \{ v: T }",
+        "impl[T: Add + Eq] Eq for Ax[T] \{ fn eq(self, o: Ax[T]) -> Bool \{ self.v + o.v == o.v + self.v } }",
+        body,
+        "fn main() \{ }",
+        "",
+    ].join("\n")
+    let _ = probe("build/tc_rigid_op_bound_{name}.bl", src)
+    errors_reported()
+}
+
+// Refused: each operator, with no bound on the parameter.
+
+test "== at an instance whose Eq impl needs a user trait at an unbounded parameter is E0300" {
+    assert_eq(errors_for("eq_user", "fn g[T](a: Bx[T]) -> Bool \{ a == a }"),
+        ["E0300 14:31 | add the bound `[T: Sh]`"])
+}
+
+test "!= at an instance whose Eq impl needs a user trait at an unbounded parameter is E0300" {
+    assert_eq(errors_for("ne_user", "fn g[T](a: Bx[T]) -> Bool \{ a != a }"),
+        ["E0300 14:31 | add the bound `[T: Sh]`"])
+}
+
+test "each ordering operator at an instance whose Ord impl needs a user trait at an unbounded parameter is E0300" {
+    assert_eq(errors_for("ord_user", "fn g[T](a: Bx[T]) -> Bool \{ a < a || a <= a || a > a || a >= a }"),
+        [
+            "E0300 14:31 | add the bound `[T: Sh]`",
+            "E0300 14:40 | add the bound `[T: Sh]`",
+            "E0300 14:50 | add the bound `[T: Sh]`",
+            "E0300 14:59 | add the bound `[T: Sh]`",
+        ])
+}
+
+test "== at an instance whose impl bound is met through another impl at a parameter is E0300" {
+    assert_eq(errors_for("eq_nested", "fn g[T](a: Bx[List[T]]) -> Bool \{ a == a }"),
+        ["E0300 14:37 | add the bound `[T: Sh]`"])
+}
+
+test "== whose Eq impl needs Display at an unbounded parameter is E0300" {
+    assert_eq(errors_for("eq_display", "fn g[T](a: Dx[T]) -> Bool \{ a == a }"),
+        ["E0300 14:31 | add the bound `[T: Display]`"])
+}
+
+test "== whose Eq impl needs an arithmetic trait at an unbounded parameter is E0300" {
+    assert_eq(errors_for("eq_arith", "fn g[T: Eq](a: Ax[T]) -> Bool \{ a == a }"),
+        ["E0300 14:35 | write ` + Add` on the bound list of `T`"])
+}
+
+test "== at a parameter with another bound gets a help that extends its bound list" {
+    assert_eq(errors_for("eq_other", "fn g[T: Ord](a: Bx[T]) -> Bool \{ a == a }"),
+        ["E0300 14:36 | write ` + Sh` on the bound list of `T`"])
+}
+
+test "assert_eq at an instance whose Eq impl needs a user trait at an unbounded parameter is E0306" {
+    assert_eq(errors_for("assert_eq_user", "fn k[T](a: Bx[T]) \{ assert_eq(a, a) }"),
+        ["E0306 14:21 | add the bound `[T: Sh]`"])
+}
+
+test "a Closeable bound does not meet an impl bound on a trait that only a written impl gives" {
+    assert_eq(errors_for("closeable_other", "fn g[T: Closeable](a: Bx[T]) -> Bool \{ a == a }"),
+        ["E0300 14:42 | write ` + Sh` on the bound list of `T`"])
+}
+
+test "a method of an impl whose binder has no bound is E0300 at == that needs one" {
+    assert_eq(errors_for("impl_binder", [
+        "trait Run \{ fn run(self) -> Bool }",
+        "type W[T] \{ v: T }",
+        "impl[T] Run for W[T] \{ fn run(self) -> Bool \{ Bx \{ v: self.v } == Bx \{ v: self.v } } }",
+    ].join("\n")), ["E0300 16:64 | add the bound `[T: Sh]`"])
+}
+
+test "the report on == gives the chain from the instance to the parameter" {
+    let _ = errors_for("chain", "fn g[T](a: Bx[List[T]]) -> Bool \{ a == a }")
+    assert_eq(error_texts(), [
+        "`Bx[List[T]]` does not implement `Eq`",
+        "`Bx[List[T]]` is `Eq` only if `List[T]` is `Sh`",
+        "`List[T]` is `Sh` only if `T` is `Sh`",
+    ])
+}
+
+// Accepted: the parameter holds the bound.
+
+test "a bound written on the binder meets the impl's bound at each operator" {
+    assert_eq(errors_for("met_inline", [
+        "fn g1[T: Sh](a: Bx[T]) -> Bool \{ a == a && !(a != a) }",
+        "fn g2[T: Sh](a: Bx[T]) -> Bool \{ a < a || a <= a || a > a || a >= a }",
+        "fn g3[T: Sh](a: Bx[List[T]]) -> Bool \{ a == a }",
+        "fn g4[T: Display](a: Dx[T]) -> Bool \{ a == a }",
+        "fn g5[T: Add + Eq](a: Ax[T]) -> Bool \{ a == a }",
+    ].join("\n")), [])
+}
+
+test "a bound written in an impl's where clause meets the impl's bound at each operator" {
+    assert_eq(errors_for("met_where", [
+        "trait Run \{ fn run(self) -> Bool }",
+        "type W[T] \{ v: T }",
+        "impl[T] Run for W[T] where T: Sh \{",
+        "    fn run(self) -> Bool \{",
+        "        let b = Bx \{ v: self.v }",
+        "        b == b && b <= b",
+        "    }",
+        "}",
+    ].join("\n")), [])
+}
+
+test "a bound that gives the impl's bound through a supertrait meets it at each operator" {
+    assert_eq(errors_for("met_super", [
+        "fn g1[T: Loud](a: Bx[T]) -> Bool \{ a == a && a < a }",
+        "fn g2[T: Ord](a: Ex[T]) -> Bool \{ a == a }",
+        "fn g3[T: Hash](a: Ex[T]) -> Bool \{ a != a }",
+    ].join("\n")), [])
+}
+
+test "a Closeable bound meets a BlockHandler impl bound and gives the BlockHandler methods" {
+    assert_eq(errors_for("met_closeable", [
+        "type Cx[T] \{ v: T }",
+        "impl[T: BlockHandler] Eq for Cx[T] \{ fn eq(self, o: Cx[T]) -> Bool \{ true } }",
+        "trait Shown \{ fn shown(self) -> Int }",
+        "impl[T: BlockHandler] Shown for Cx[T] \{ fn shown(self) -> Int \{ 7 } }",
+        "fn g[T: Closeable](a: Cx[T]) -> Bool \{ a == a && !(a != a) }",
+        "fn h[T: Closeable](a: Cx[T]) -> Int \{ a.shown() }",
+        "fn q[T: Closeable](a: Cx[T]) -> Int \{ Shown.shown(a) }",
+        "fn e[T: Closeable](t: T) ! _ \{ t.exit(true) }",
+    ].join("\n")), [])
+}
+
+test "== in the impl's own body meets the impl's bound" {
+    assert_eq(errors_for("met_own", [
+        "type Own[T] \{ v: T }",
+        "impl[T: Sh] Eq for Own[T] \{ fn eq(self, o: Own[T]) -> Bool \{ Bx \{ v: self.v } == Bx \{ v: o.v } } }",
+    ].join("\n")), [])
+}

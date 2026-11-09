@@ -8086,7 +8086,7 @@ fn tc_display_missing_leaf(t0: Int) -> Int ! TypeCheck.Resolve, Diag.Report {
     if k == TyKind.Unknown || k == TyKind.Never { return -1 }
     if k == TyKind.Typevar {
         if tc_typevar_binds_here(t) == 0 { return -1 }
-        if tc_pipe_has(tc_typevar_held_traits(t), "Display") != 0 { return -1 }
+        if tc_typevar_holds(t, "Display") { return -1 }
         return t
     }
     if k == TyKind.Tuple {
@@ -8166,6 +8166,10 @@ fn tc_typevar_held_traits(tid: Int) -> Str {
         if f.binder == binder { held = tc_pipe_merge(held, f.traits) }
     }
     held
+}
+
+fn tc_typevar_holds(tid: Int, tr: Str) -> Bool {
+    tc_pipe_has(tc_typevar_held_traits(tid), tr) != 0
 }
 
 // `io.print_raw` and `io.eprint_raw` take `Str` only (sections/04_effects.md §4.4). The help
@@ -11648,9 +11652,18 @@ fn builtin_trait_methods(name: Str) -> Str {
     ""
 }
 
+// A trait whose every impl the compiler also provides as an impl of another trait. Not a
+// supertrait: an impl of the first is not obliged to write the second.
+fn builtin_trait_provides(name: Str) -> Str {
+    // §4.7.2: a Closeable type is a scoped value, and that impl counts for trait bounds.
+    if name == "Closeable" { return "BlockHandler" }
+    ""
+}
+
 // The traits a bound on trait `key` guarantees, each by identity: the trait and every
-// supertrait, transitively (§3 "Operations on `Self` in a Default Body"). A built-in
-// supertrait (Ord: Eq) lives in the compiler, a declared one in the trait's own clause.
+// supertrait, transitively (§3 "Operations on `Self` in a Default Body"), and each trait
+// the compiler provides for it. A built-in supertrait (Ord: Eq) lives in the compiler, a
+// declared one in the trait's own clause.
 fn tc_trait_guarantee_set(key: Str) -> Str {
     let mut set = "|"
     let mut work: List[Str] = [key]
@@ -11660,6 +11673,8 @@ fn tc_trait_guarantee_set(key: Str) -> Str {
         set = tc_pipe_add(set, t)
         let builtin_super = builtin_trait_supers(t)
         if !builtin_super.is_empty() { work.push(builtin_super) }
+        let provided = builtin_trait_provides(t)
+        if !provided.is_empty() { work.push(provided) }
         let tr = tc_trait_node_idx.get(t) ?? -1
         if tr == -1 { continue }
         let sup = node_supertraits(tr)
@@ -30064,6 +30079,13 @@ fn tc_carrier_failed_bound(carrier: Int, arg: Int, visiting: List[Int]) -> Optio
 // ones. A bound read as held on a type without the trait sends the impl's body to mono at a
 // type that body cannot compile against.
 fn tc_bound_need(arg: Int, tr: Str, visiting: List[Int]) -> List[Int] {
+    // A type parameter of the body being checked has only the bounds its binders give
+    // (§3.6 Trait Bounds), for every trait, so no impl and no fail-open answer stands in.
+    let rigid = tc_resolve(arg)
+    if tc_typevar_binds_here(rigid) != 0 {
+        if tc_typevar_holds(rigid, tr) { return [] }
+        return [rigid]
+    }
     let need = tc_trait_need(arg, tr, visiting)
     if need.len() > 0 { return need }
     if tc_bound_fact(arg, tr) == -1 { return [arg] }
@@ -37764,10 +37786,11 @@ fn tc_tm_check_with_item(item: Int, assigns: Map[Int, List[Int]]) ! TypeCheck.Re
 // at the same index of `rows`.
 fn tc_tm_with_rows(tid: Int, tname: Str, ran: List[Str], rows: List[Str]) ! TypeCheck.Resolve, Diag.Report {
     if tc_tid_kind(tid) == TyKind.Typevar {
-        // The item stands for every impl of its bound, whose enter and exit, or close, have
-        // the row `_`.
+        // The item stands for every impl of its bound, whose close, or enter and exit, have
+        // the row `_`. Closeable goes first: its bound also holds BlockHandler, whose
+        // provided enter has no row and whose exit has the row of close (§4.7.2).
         let traits = tparam_node_bound_traits(tc_tid_binder(tid))
-        let names = if tc_pipe_has(traits, "BlockHandler") != 0 { ["enter", "exit"] } else if tc_pipe_has(traits, "Closeable") != 0 { ["close"] } else { [] }
+        let names = if tc_pipe_has(traits, "Closeable") != 0 { ["close"] } else if tc_pipe_has(traits, "BlockHandler") != 0 { ["enter", "exit"] } else { [] }
         for mn in names {
             ran.push("`{tname}.{mn}`")
             rows.push("_")
@@ -44672,7 +44695,8 @@ fn tc_er_check_with_item(program: Int, item: Int, tid0: Int, held: List[Str], ow
         if tc_er_satisfied(program, held, "_") { return }
         let traits = tc_er_binder_traits(owner.decl, tc_tid_binder(tid))
         let tname = type_to_str(tid)
-        let mn = if tc_pipe_has(traits, "BlockHandler") != 0 { "enter` and `{tname}.exit" } else if tc_pipe_has(traits, "Closeable") != 0 { "close" } else { "" }
+        // A Closeable bound also holds BlockHandler; its `_` is the row of close (§4.7.2).
+        let mn = if tc_pipe_has(traits, "Closeable") != 0 { "close" } else if tc_pipe_has(traits, "BlockHandler") != 0 { "enter` and `{tname}.exit" } else { "" }
         if mn == "" { return }
         if owner.default_body {
             diag_error_at("UndeclaredEffect", UNDECLARED_EFFECT,
