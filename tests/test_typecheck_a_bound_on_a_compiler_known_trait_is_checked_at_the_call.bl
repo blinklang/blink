@@ -1,0 +1,215 @@
+// A bound on a compiler-known trait is judged at the call, as a bound on a user trait is
+// (sections/03_types.md §3.6 *Trait Bounds*): `k(1)` with `k[T: Sized]` is E0306 at the call,
+// since `Int` does not implement `Sized`. The built-in method-surface traits apply to the types
+// of the §3.2.2 *Trait Summary* table and to no other type, and no impl of them can be written,
+// so the help names those types. A std trait that impl blocks implement, such as `Closeable`,
+// is judged by its impls.
+
+import std.fs
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_reset}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+import compile_test_helpers
+
+fn probe(name: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO, Process.Spawn {
+    init_embedded_stdlib()
+    let path = "{compile_test_helpers.scratch_root()}/_tc_known_bound_{name}.bl"
+    fs.write(path, src).unwrap()
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+}
+
+// Each error as "CODE@line:col@message@help".
+fn errors_of(name: Str, src: Str) -> List[Str] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO, Process.Spawn {
+    probe(name, src)
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" { out.push("{d.code}@{d.line}:{d.col}@{d.message}@{d.help}") }
+    }
+    out
+}
+
+// `decl` on line 1, then `fn main() {` on line 2 and `call` on line 3.
+fn called(decl: Str, call: Str) -> Str {
+    "{decl}\nfn main() \{\n    let _ = {call}\n}\n"
+}
+
+fn expect_one(name: Str, src: Str, want: Str) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO, Process.Spawn {
+    let errs = errors_of(name, src)
+    if errs.len() == 1 && errs.get(0).unwrap() == want { return "" }
+    "{name}: want one error\n  {want}\ngot {errs.len()}:\n  {errs.join("\n  ")}"
+}
+
+fn expect_none(name: Str, src: Str) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO, Process.Spawn {
+    let errs = errors_of(name, src)
+    if errs.len() == 0 { return "" }
+    "{name}: want no error, got:\n  {errs.join("\n  ")}"
+}
+
+fn report(problems: List[Str]) ! IO.Eprint {
+    let mut bad = false
+    for p in problems {
+        if p != "" {
+            io.eprintln(p)
+            bad = true
+        }
+    }
+    assert(!bad)
+}
+
+fn sealed(ty: Str, bound: Str, has: Str, types: Str) -> Str {
+    "E0306@3:13@`{ty}` does not satisfy the {bound} bound on type parameter T: {has}@pass an argument whose type implements {bound}; {bound.split("[").get(0).unwrap()} is sealed to {types}, and no impl of it can be written"
+}
+
+// A type of a kind the trait applies to, refused for its element or argument types.
+fn unmet(ty: Str, bound: Str, has: Str) -> Str {
+    "E0306@3:13@`{ty}` does not satisfy the {bound} bound on type parameter T: {has}@pass an argument whose type implements {bound}"
+}
+
+let SIZED_TYPES = "Str, List, Map, Set, Bytes and StringBuilder"
+
+test "an Int passed to a Sized bound is refused at the call" {
+    let decl = "fn k[T: Sized](x: T) -> Int \{ x.len() }"
+    report([expect_one("sized_int", called(decl, "k(1)"), sealed("Int", "Sized", "it has no impl of Sized", SIZED_TYPES))])
+}
+
+test "each built-in type the spec lists meets a Sized bound" {
+    let decl = "fn k[T: Sized](x: T) -> Int \{ x.len() }"
+    report([
+        expect_none("sized_str", called(decl, "k(\"ab\")")),
+        expect_none("sized_list", called(decl, "k([1])")),
+        expect_none("sized_map", called(decl, "k(Map.new[Int, Int]())")),
+        expect_none("sized_set", called(decl, "k(Set.new[Int]())")),
+        expect_none("sized_bytes", called(decl, "k(Bytes.new())")),
+        expect_none("sized_sb", called(decl, "k(StringBuilder.new())")),
+    ])
+}
+
+test "a struct passed to a Sized bound is refused at the call" {
+    let src = "type SizedNone \{ a: Int }\nfn main() \{\n    let _ = k(SizedNone \{ a: 1 })\n}\nfn k[T: Sized](x: T) -> Int \{ x.len() }\n"
+    report([expect_one("sized_struct", src, sealed("SizedNone", "Sized", "it has no impl of Sized", SIZED_TYPES))])
+}
+
+test "each single-type method surface admits only its own type" {
+    report([
+        expect_one("strops_int", called("fn k[T: StrOps](x: T) -> Int \{ x.byte_len() }", "k(1)"), sealed("Int", "StrOps", "it has no impl of StrOps", "Str")),
+        expect_none("strops_str", called("fn k[T: StrOps](x: T) -> Int \{ x.byte_len() }", "k(\"a\")")),
+        expect_one("bytesops_str", called("fn k[T: BytesOps](x: T) -> Str \{ x.to_hex() }", "k(\"a\")"), sealed("Str", "BytesOps", "it has no impl of BytesOps", "Bytes")),
+        expect_none("bytesops_bytes", called("fn k[T: BytesOps](x: T) -> Str \{ x.to_hex() }", "k(Bytes.new())")),
+        expect_one("sbops_int", called("fn k[T: StringBuildOps](x: T) -> Str \{ x.to_str() }", "k(1)"), sealed("Int", "StringBuildOps", "it has no impl of StringBuildOps", "StringBuilder")),
+        expect_none("sbops_sb", called("fn k[T: StringBuildOps](x: T) -> Str \{ x.to_str() }", "k(StringBuilder.new())")),
+    ])
+}
+
+test "a collection surface is read at the bound's arguments" {
+    report([
+        expect_one("listops_int", called("fn k[T: ListOps[Int]](x: T) -> Option[Int] \{ x.get(0) }", "k(1)"), sealed("Int", "ListOps[Int]", "it has no impl of ListOps", "List")),
+        expect_one("listops_strs", called("fn k[T: ListOps[Int]](x: T) -> Option[Int] \{ x.get(0) }", "k([\"a\"])"), unmet("List[Str]", "ListOps[Int]", "it implements ListOps[Str]")),
+        expect_none("listops_ints", called("fn k[T: ListOps[Int]](x: T) -> Option[Int] \{ x.get(0) }", "k([1])")),
+        expect_one("mapops_list", called("fn k[T: MapOps[Int, Str]](x: T) -> List[Int] \{ x.keys() }", "k([1])"), sealed("List[Int]", "MapOps[Int, Str]", "it has no impl of MapOps", "Map")),
+        expect_none("mapops_map", called("fn k[T: MapOps[Int, Str]](x: T) -> List[Int] \{ x.keys() }", "k(Map.new[Int, Str]())")),
+        expect_one("setops_list", called("fn k[T: SetOps[Int]](x: T) -> Bool \{ x.insert(1) }", "k([1])"), sealed("List[Int]", "SetOps[Int]", "it has no impl of SetOps", "Set")),
+        expect_none("setops_set", called("fn k[T: SetOps[Int]](x: T) -> Bool \{ x.insert(1) }", "k(Set.new[Int]())")),
+        expect_one("joinable_ints", called("fn k[T: Joinable](x: T) -> Str \{ x.join(\",\") }", "k([1])"), unmet("List[Int]", "Joinable", "a List implements Joinable only where its element is Str")),
+        expect_none("joinable_strs", called("fn k[T: Joinable](x: T) -> Str \{ x.join(\",\") }", "k([\"a\"])")),
+    ])
+}
+
+test "Contains is met by a List, Set or Map at its element or key type" {
+    let decl = "fn k[T: Contains[Int]](x: T) -> Bool \{ x.contains(1) }"
+    let types = "Set, List and Map"
+    report([
+        expect_one("contains_int", called(decl, "k(1)"), sealed("Int", "Contains[Int]", "it has no impl of Contains", types)),
+        expect_one("contains_strs", called(decl, "k([\"a\"])"), unmet("List[Str]", "Contains[Int]", "it implements Contains[Str]")),
+        expect_one("contains_str", called(decl, "k(\"a\")"), sealed("Str", "Contains[Int]", "it has no impl of Contains", types)),
+        expect_none("contains_list", called(decl, "k([1])")),
+        expect_none("contains_set", called(decl, "k(Set.new[Int]())")),
+        expect_none("contains_map", called(decl, "k(Map.new[Int, Str]())")),
+    ])
+}
+
+test "Contains on a List names the element's missing Eq" {
+    let src = "type P \{ a: Int }\nfn k[T: Contains[P]](x: T) -> Bool \{ x.contains(P \{ a: 1 }) }\nfn main() \{\n    let _ = k([P \{ a: 1 }])\n}\n"
+    report([expect_one("contains_no_eq", src,
+        "E0306@4:13@`List[P]` does not satisfy the Contains[P] bound on type parameter T: a List implements Contains only where its element implements Eq@pass an argument whose type implements Contains[P]")])
+}
+
+test "a Closeable or BlockHandler bound is refused for a type with no impl" {
+    let q = "type Q \{ n: Int }\n"
+    report([
+        expect_one("closeable_none", "{q}fn main() \{\n    need(Q \{ n: 1 })\n}\nfn need[T: Closeable](_t: T) \{ }\n",
+            "E0306@3:5@`Q` does not satisfy the Closeable bound on type parameter T: it has no impl of Closeable@pass an argument whose type implements Closeable, or write `impl Closeable for Q`"),
+        expect_one("blockhandler_none", "{q}fn main() \{\n    nb(Q \{ n: 1 })\n}\nfn nb[T: BlockHandler](_t: T) \{ }\n",
+            "E0306@3:5@`Q` does not satisfy the BlockHandler bound on type parameter T: it has no impl of BlockHandler@pass an argument whose type implements BlockHandler, or write `impl BlockHandler for Q`"),
+    ])
+}
+
+test "an impl of Closeable meets a Closeable bound and a BlockHandler bound" {
+    let src = "type Q \{ n: Int }\nimpl Closeable for Q \{\n    fn close(self) \{ let _ = self.n }\n}\nfn need[T: Closeable](_t: T) \{ }\nfn nb[T: BlockHandler](_t: T) \{ }\nfn main() \{\n    need(Q \{ n: 1 })\n    nb(Q \{ n: 1 })\n}\n"
+    report([expect_none("closeable_impl", src)])
+}
+
+test "a generic impl of Closeable meets a BlockHandler bound and its qualified exit" {
+    let src = "type Bx[T] \{ v: T }\nimpl[T] Closeable for Bx[T] \{\n    fn close(self) \{ let _ = self.v }\n}\nfn nb[T: BlockHandler](_t: T) \{ }\nfn main() \{\n    nb(Bx \{ v: 1 })\n    BlockHandler.exit(Bx \{ v: 1 }, true)\n}\n"
+    report([expect_none("closeable_generic", src)])
+}
+
+test "an impl of BlockHandler meets a BlockHandler bound" {
+    let src = "type Q \{ n: Int }\nimpl BlockHandler for Q \{\n    type Context = Int\n    fn enter(self) -> Int \{ self.n }\n    fn exit(self, ok: Bool) \{ let _ = ok }\n}\nfn nb[T: BlockHandler](_t: T) \{ }\nfn main() \{\n    nb(Q \{ n: 1 })\n}\n"
+    report([expect_none("blockhandler_impl", src)])
+}
+
+test "a bound on a trait the compiler supplies impls for still holds for the built-in types" {
+    report([
+        expect_none("ord_int", called("fn k[T: Ord](x: T) -> Bool \{ x < x }", "k(1)")),
+        expect_none("eq_str", called("fn k[T: Eq](x: T) -> Bool \{ x == x }", "k(\"a\")")),
+        expect_none("hash_int", called("fn k[T: Hash](x: T) -> U64 \{ x.hash() }", "k(1)")),
+        expect_none("debug_list", called("fn k[T: Debug](x: T) -> Str \{ x.debug() }", "k([1])")),
+        expect_none("clone_int", called("fn k[T: Clone](x: T) -> T \{ x.clone() }", "k(1)")),
+        expect_none("display_int", called("fn k[T: Display](x: T) -> Str \{ \"\{x}\" }", "k(1)")),
+        expect_none("sbpure_sb", called("fn k[T: StringBuilderPure](x: T) -> Str \{ x.to_str() }", "k(StringBuilder.new())")),
+    ])
+}
+
+// ListPure, MapPure and SetPure have impls in lib/std over List, Map and Set, and a user type may
+// implement StringBuilderPure, so a bound on one of them is not judged as a sealed surface.
+test "a bound on a pure std trait holds for the types its impls name" {
+    report([
+        expect_none("listpure_list", "import std.list.\{ListPure}\nfn main() \{\n    let _ = k([1])\n}\nfn k[T: ListPure](x: T) -> Int \{ 1 }\n"),
+        expect_none("mappure_map", "import std.map.\{MapPure}\nfn main() \{\n    let _ = k(Map.new[Str, Int]())\n}\nfn k[T: MapPure](x: T) -> Int \{ 1 }\n"),
+        expect_none("setpure_set", "import std.set.\{SetPure}\nfn main() \{\n    let _ = k(Set.new[Int]())\n}\nfn k[T: SetPure](x: T) -> Int \{ 1 }\n"),
+        expect_none("sbpure_user", "type My \{ n: Int }\nimpl StringBuilderPure for My \{\n    fn write_char(self, ch: Char) \{ let _ = ch }\n    fn to_str(self) -> Str \{ \"\{self.n}\" }\n    fn capacity(self) -> Int \{ self.n }\n    fn clear(self) \{ let _ = self.n }\n}\nfn k[T: StringBuilderPure](x: T) -> Int \{ 1 }\nfn main() \{\n    let _ = k(My \{ n: 1 })\n}\n"),
+    ])
+}
+
+let INTO_ITER_TYPES = "List, Map, Set, Str, Range, Channel, Bytes and Iterator"
+
+test "an Iterator bound takes an iterator of the bound element and nothing else" {
+    let decl = "fn k[T: Iterator[Int]](x: T) -> Int \{ x.count() }"
+    report([
+        expect_one("iter_int", called(decl, "k(1)"), sealed("Int", "Iterator[Int]", "it has no impl of Iterator", "Iterator")),
+        expect_one("iter_list", called(decl, "k([1])"), sealed("List[Int]", "Iterator[Int]", "it has no impl of Iterator", "Iterator")),
+        expect_one("iter_str_elem", called(decl, "k([\"a\"].into_iter())"), unmet("Iterator[Str]", "Iterator[Int]", "it implements Iterator[Str]")),
+        expect_none("iter_ok", called(decl, "k([1].into_iter())")),
+    ])
+}
+
+test "an IntoIterator bound takes each type the spec lists, with the for-loop element" {
+    let decl = "fn k[T: IntoIterator[Int]](x: T) -> Int \{ 0 }"
+    report([
+        expect_one("into_int", called(decl, "k(1)"), sealed("Int", "IntoIterator[Int]", "it has no impl of IntoIterator", INTO_ITER_TYPES)),
+        expect_one("into_list_str", called(decl, "k([\"a\"])"), unmet("List[Str]", "IntoIterator[Int]", "it implements IntoIterator[Str]")),
+        expect_one("into_map_int", called(decl, "k(Map.new[Int, Int]())"), unmet("Map[Int, Int]", "IntoIterator[Int]", "it implements IntoIterator[(Int, Int)]")),
+        expect_none("into_list", called(decl, "k([1])")),
+        expect_none("into_set", called(decl, "k(Set.new[Int]())")),
+        expect_none("into_range", called(decl, "k(0..3)")),
+        expect_none("into_iter", called(decl, "k([1].into_iter())")),
+        expect_none("into_str", called("fn k[T: IntoIterator[Char]](x: T) -> Int \{ 0 }", "k(\"ab\")")),
+        expect_none("into_bytes", called("fn k[T: IntoIterator[U8]](x: T) -> Int \{ 0 }", "k(Bytes.new())")),
+        expect_none("into_map", called("fn k[T: IntoIterator[(Int, Str)]](x: T) -> Int \{ 0 }", "k(Map.new[Int, Str]())")),
+        expect_one("into_bytes_int", called(decl, "k(Bytes.new())"), unmet("Bytes", "IntoIterator[Int]", "it implements IntoIterator[U8]")),
+    ])
+}

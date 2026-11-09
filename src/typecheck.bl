@@ -6142,7 +6142,7 @@ fn tc_report_user_bound_impl_bounds(carrier: Int, concrete0: Int, node: Int, see
     while i < sublist_length(bounds) {
         let trait_name = tc_bound_trait(sublist_get(bounds, i))
         let tr = tc_trait_node_idx.get(trait_name) ?? -1
-        if tr != -1 && !node_source_module(tr).starts_with("std_") {
+        if tr != -1 && tc_trait_judged_by_impls(tr) {
             let mut hits = 0
             let mut hit = -1
             let mut hit_binds: Map[Str, Int] = Map()
@@ -6185,10 +6185,22 @@ fn tc_report_unmet_user_bound(carrier: Int, outer_sl: Int, own_sl: Int, concrete
     if u.trait_name != spelled && tc_trait_is_compiler_known(spelled) && tc_type_satisfies_bound(concrete, spelled) == 1 {
         notes.push("`{type_to_str(concrete)}` implements `{spelled} (blink.core)`, a different trait with the same name as `{shown}`")
     }
+    let row = tc_surface_row(u.trait_name, tc_trait_node_idx.get(u.trait_name) ?? -1)
+    let surface = row.kinds.len() > 0
+    let kind_fits = surface && tc_surface_kind_fits(concrete, row)
+    // Only a List can fit a row and fail it, by its element (Contains, Joinable). It is not
+    // refused for its kind, so neither line says it is sealed out.
+    let elem_rule = if row.elem_str { "is Str" } else { "implements Eq" }
+    let why = if kind_fits && u.held.impls == 0 { "a List implements {shown} only where its element {elem_rule}" } else { has }
+    let help = if surface && !kind_fits {
+        "pass an argument whose type implements {bound_text}; {shown} is sealed to {row.shown}, and no impl of it can be written"
+    } else if surface {
+        "pass an argument whose type implements {bound_text}"
+    } else {
+        "pass an argument whose type implements {bound_text}, or write `impl {tc_trait_at_text(spelled, u.want)} for {type_to_str(concrete)}`"
+    }
     diag_error_at_notes("TraitBoundNotSatisfied", TRAIT_BOUND_NOT_SATISFIED,
-        "`{type_to_str(concrete)}` does not satisfy the {bound_text} bound on type parameter {node_name(carrier)}: {has}", node,
-        "pass an argument whose type implements {bound_text}, or write `impl {tc_trait_at_text(spelled, u.want)} for {type_to_str(concrete)}`",
-        notes)
+        "`{type_to_str(concrete)}` does not satisfy the {bound_text} bound on type parameter {node_name(carrier)}: {why}", node, help, notes)
     1
 }
 
@@ -6202,11 +6214,9 @@ type UnmetBound {
 }
 
 // The first bound on `carrier` (a TypeParam, or an impl's `where` constraint, which has the
-// same shape) whose trait a program module declares and which `concrete` provably does not
-// meet at the bound's arguments. The arguments are read under `outer_sl` and `own_sl`, the
-// binders in scope where the bound is written, then `binds` replaces them. A trait a std
-// module declares is left to the modeled checks, as its impls include ones no impl block
-// writes (the sealed Ops surfaces, From's identity rule).
+// same shape) whose trait has a §3.2.2 row or is judged by its impls, and which `concrete`
+// provably does not meet at the bound's arguments. The arguments are read under `outer_sl`
+// and `own_sl`, the binders in scope where the bound is written, then `binds` replaces them.
 fn tc_unmet_user_bound(carrier: Int, outer_sl: Int, own_sl: Int, concrete: Int, binds: Map[Str, Int]) -> UnmetBound ! TypeCheck.Resolve, Diag.Report {
     let none = UnmetBound { trait_name: "", want: [], held: ImplArgsHeld { verdict: 0, impls: 0, args: [] } }
     if carrier < 0 || node_kind(carrier) != NodeKind.TypeParam { return none }
@@ -6220,12 +6230,16 @@ fn tc_unmet_user_bound(carrier: Int, outer_sl: Int, own_sl: Int, concrete: Int, 
         let tr = tc_trait_node_idx.get(trait_name) ?? -1
         let args_sl = node_elements(b)
         let got = if args_sl == -1 { 0 } else { sublist_length(args_sl) }
-        // A wrong count is reported where the bound is written.
-        let arity_ok = got == (tc_trait_tparam_count_idx.get(trait_name) ?? -1)
-        if tr != -1 && arity_ok && !node_source_module(tr).starts_with("std_") {
+        // A wrong count is reported where the bound is written. A trait with no declaration
+        // node (Iterator, IntoIterator) is judged only from its §3.2.2 row.
+        let row = tc_surface_row(trait_name, tr)
+        let surface = row.kinds.len() > 0
+        let arity = if tr == -1 { tc_surface_arity(row) } else { tc_trait_tparam_count_idx.get(trait_name) ?? -1 }
+        let judged = surface || (tr != -1 && tc_trait_judged_by_impls(tr))
+        if arity == got && judged {
             let want = tc_bound_args_at_call(outer_sl, own_sl, args_sl, binds)
             if want.len() == got {
-                let held = tc_impl_trait_args_held(concrete, trait_name)
+                let held = tc_trait_held(concrete, trait_name, tr, row)
                 if held.verdict == 1 && tc_impl_args_held_has(held, want) == 0 {
                     return UnmetBound { trait_name: trait_name, want: want, held: held }
                 }
@@ -6234,6 +6248,115 @@ fn tc_unmet_user_bound(carrier: Int, outer_sl: Int, own_sl: Int, concrete: Int, 
         i = i + 1
     }
     none
+}
+
+// Whether a bound on the trait declared at `tr` is judged by the impl blocks the program
+// writes: every trait a program module declares, and of the std traits only Closeable and
+// BlockHandler, the ones a type meets through an impl it writes (§5.5). Other std traits get
+// impls no impl block states (the derivable traits, From's identity impl), or are met by a poly
+// impl over a built-in generic that the impl match does not see yet, so they keep the modeled
+// checks.
+fn tc_trait_judged_by_impls(tr: Int) -> Bool {
+    if !node_source_module(tr).starts_with("std_") { return true }
+    let name = node_name(tr)
+    name == "Closeable" || name == "BlockHandler"
+}
+
+// The impls of the trait `trait_name` (declared at `tr`, or -1, with §3.2.2 row `row`) that
+// apply to `recv`, with their trait arguments.
+fn tc_trait_held(recv: Int, trait_name: Str, tr: Int, row: SurfaceRow) -> ImplArgsHeld ! TypeCheck.Resolve, Diag.Report {
+    if row.kinds.len() > 0 { return tc_surface_held(recv, row) }
+    let held = tc_impl_trait_args_held(recv, trait_name)
+    // A Closeable type is a scoped value (§5.5), and the parser writes its BlockHandler impl
+    // only for a type with no binders.
+    if held.impls == 0 && trait_name == "BlockHandler" && tr != -1 && node_source_module(tr).starts_with("std_") {
+        let closeable = tc_impl_trait_args_held(recv, "Closeable")
+        if closeable.impls > 0 { return ImplArgsHeld { verdict: held.verdict * closeable.verdict, impls: closeable.impls, args: [] } }
+    }
+    held
+}
+
+// How a §3.2.2 row reads its trait arguments from the type.
+// IterElem is the element a `for` loop yields (tc_tid_iter_elem).
+type SurfaceArgs {
+    NoArgs, Elem, KeyValue, IterElem
+}
+
+// One row of the sections/03_types.md §3.2.2 *Trait Summary* table: a sealed method-surface
+// trait, the built-in types it applies to, and how its trait arguments are read from the type.
+// The table is the only place the compiler states which built-in types implement these traits:
+// no impl block can be written for them, and lib/std writes one for few of them.
+type SurfaceRow {
+    kinds: List[TyKind]
+    shown: Str
+    args: SurfaceArgs
+    // Joinable: a List only of Str.
+    elem_str: Bool
+    // Contains: a List only where `.contains()` accepts its element (tc_list_scan_elem_need).
+    list_elem_eq: Bool
+}
+
+// The §3.2.2 row of the trait `trait_name` declared at `tr`, or a row with no kinds when it is
+// not a sealed method-surface trait. A std declaration answers by name. Iterator and
+// IntoIterator have no declaration (tr is -1). IntoIterator also applies to Bytes (§3.2
+// *Bytes*: `IntoIterator[U8]`) and to Iterator itself (sections/03c_protocols.md §3c.1), which
+// the summary table leaves out.
+fn tc_surface_row(trait_name: Str, tr: Int) -> SurfaceRow {
+    let none = SurfaceRow { kinds: [], shown: "", args: SurfaceArgs.NoArgs, elem_str: false, list_elem_eq: false }
+    if tr == -1 {
+        if trait_name == "Iterator" { return SurfaceRow { kinds: [TyKind.Iterator], shown: "Iterator", args: SurfaceArgs.IterElem, elem_str: false, list_elem_eq: false } }
+        if trait_name == "IntoIterator" { return SurfaceRow { kinds: [TyKind.List, TyKind.Map, TyKind.Set, TyKind.Str, TyKind.Range, TyKind.Channel, TyKind.Bytes, TyKind.Iterator], shown: "List, Map, Set, Str, Range, Channel, Bytes and Iterator", args: SurfaceArgs.IterElem, elem_str: false, list_elem_eq: false } }
+        return none
+    }
+    if !node_source_module(tr).starts_with("std_") { return none }
+    match node_name(tr) {
+        "Sized" => SurfaceRow { kinds: [TyKind.Str, TyKind.List, TyKind.Map, TyKind.Set, TyKind.Bytes, TyKind.StringBuilder], shown: "Str, List, Map, Set, Bytes and StringBuilder", args: SurfaceArgs.NoArgs, elem_str: false, list_elem_eq: false }
+        "Contains" => SurfaceRow { kinds: [TyKind.Set, TyKind.List, TyKind.Map], shown: "Set, List and Map", args: SurfaceArgs.Elem, elem_str: false, list_elem_eq: true }
+        "StrOps" => SurfaceRow { kinds: [TyKind.Str], shown: "Str", args: SurfaceArgs.NoArgs, elem_str: false, list_elem_eq: false }
+        "BytesOps" => SurfaceRow { kinds: [TyKind.Bytes], shown: "Bytes", args: SurfaceArgs.NoArgs, elem_str: false, list_elem_eq: false }
+        "StringBuildOps" => SurfaceRow { kinds: [TyKind.StringBuilder], shown: "StringBuilder", args: SurfaceArgs.NoArgs, elem_str: false, list_elem_eq: false }
+        "ListOps" => SurfaceRow { kinds: [TyKind.List], shown: "List", args: SurfaceArgs.Elem, elem_str: false, list_elem_eq: false }
+        "MapOps" => SurfaceRow { kinds: [TyKind.Map], shown: "Map", args: SurfaceArgs.KeyValue, elem_str: false, list_elem_eq: false }
+        "SetOps" => SurfaceRow { kinds: [TyKind.Set], shown: "Set", args: SurfaceArgs.Elem, elem_str: false, list_elem_eq: false }
+        "Joinable" => SurfaceRow { kinds: [TyKind.List], shown: "List[Str]", args: SurfaceArgs.NoArgs, elem_str: true, list_elem_eq: false }
+        _ => none
+    }
+}
+
+// The number of trait arguments a §3.2.2 row reads from the type.
+fn tc_surface_arity(row: SurfaceRow) -> Int {
+    match row.args {
+        SurfaceArgs.NoArgs => 0
+        SurfaceArgs.Elem => 1
+        SurfaceArgs.KeyValue => 2
+        SurfaceArgs.IterElem => 1
+    }
+}
+
+// Whether `recv` is of a built-in type `row` applies to. Its element can still fail the row.
+fn tc_surface_kind_fits(recv: Int, row: SurfaceRow) -> Bool {
+    row.kinds.contains(type_kind(resolve_alias_tid(tc_resolve(recv))))
+}
+
+// The one impl of the sealed method-surface trait of `row` that `recv` has, with its trait
+// arguments, or none. A type the checker could not resolve is not judged.
+fn tc_surface_held(recv: Int, row: SurfaceRow) -> ImplArgsHeld ! TypeCheck.Resolve, Diag.Report {
+    let none = ImplArgsHeld { verdict: 1, impls: 0, args: [] }
+    let t = resolve_alias_tid(tc_resolve(recv))
+    let k = type_kind(t)
+    if !row.kinds.contains(k) { return none }
+    if row.elem_str && type_kind(resolve_alias_tid(tc_resolve(tc_tid_child(t, 0)))) != TyKind.Str { return none }
+    if row.list_elem_eq && k == TyKind.List && tc_list_scan_elem_need(tc_resolve(tc_tid_child(t, 0))).len() > 0 { return none }
+    let args: List[Int] = match row.args {
+        SurfaceArgs.NoArgs => []
+        SurfaceArgs.Elem => [tc_resolve(tc_tid_child(t, 0))]
+        SurfaceArgs.KeyValue => [tc_resolve(tc_tid_child(t, 0)), tc_resolve(tc_tid_child(t, 1))]
+        SurfaceArgs.IterElem => [tc_resolve(tc_tid_iter_elem(t))]
+    }
+    for a in args {
+        if tc_tid_has_unknown(a) != 0 { return ImplArgsHeld { verdict: 0, impls: 0, args: [] } }
+    }
+    ImplArgsHeld { verdict: 1, impls: 1, args: args }
 }
 
 // Whether a type is fixed enough to judge an impl against: no unsolved metavariable and no
@@ -25307,8 +25430,9 @@ fn tc_trait_qualified_unanswered(trait_name: Str, method: Str, recv: Int) -> Boo
     if tr == -1 || tc_tid_is_judgeable(recv) == 0 || tc_trait_declares_method(trait_name, method) == 0 {
         return false
     }
-    if node_source_module(tr).starts_with("std_") { return tc_type_satisfies_bound(recv, trait_name) == -1 }
-    let held = tc_impl_trait_args_held(recv, trait_name)
+    let row = tc_surface_row(trait_name, tr)
+    if row.kinds.len() == 0 && !tc_trait_judged_by_impls(tr) { return tc_type_satisfies_bound(recv, trait_name) == -1 }
+    let held = tc_trait_held(recv, trait_name, tr, row)
     held.verdict == 1 && held.impls == 0
 }
 

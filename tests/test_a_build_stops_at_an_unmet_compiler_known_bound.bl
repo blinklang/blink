@@ -1,0 +1,59 @@
+// A call that does not meet a bound on a compiler-known trait stops `blink build` at the check
+// error (TraitBoundNotSatisfied, E0306, at the call), so lowering never sees a `T: Sized` body
+// run on an `Int`.
+
+import std.process.{ProcessResult, ChildEnd}
+import compile_test_helpers
+
+let DIR = "{compile_test_helpers.scratch_root()}/a_build_stops_at_an_unmet_compiler_known_bound"
+
+fn sh(cmd: Str) -> ProcessResult ! Process.Spawn {
+    process.run("sh", ["-c", cmd]).unwrap()
+}
+
+// The corpus variables would point the child at the corpus's own archive and module set.
+fn blink_in_dir(args: Str) -> ProcessResult ! Process.Spawn {
+    sh("B=$(pwd)/build/blink; cd {DIR} && env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE timeout 120 $B {args}")
+}
+
+fn expect_build_stops(name: Str, src: Str, at: Str) -> Str ! FS.Write, Process.Spawn {
+    fs.write("{DIR}/{name}.bl", src).unwrap()
+    let r = blink_in_dir("build {name}.bl")
+    let out = "{r.out}{r.err_out}"
+    let mut problems: List[Str] = []
+    if r.end != ChildEnd.Exited(1) { problems.push("{name}: want exit 1, got {r.end}") }
+    if !out.contains("error[TraitBoundNotSatisfied]") { problems.push("{name}: want error[TraitBoundNotSatisfied]") }
+    if !out.contains("{name}.bl:{at}") { problems.push("{name}: want the error at {at}") }
+    if out.contains("internal compiler error") { problems.push("{name}: want no internal compiler error") }
+    if problems.len() > 0 { problems.push(out) }
+    problems.join("\n")
+}
+
+fn report(problems: List[Str]) ! IO.Eprint {
+    let mut bad = false
+    for p in problems {
+        if p != "" {
+            io.eprintln(p)
+            bad = true
+        }
+    }
+    assert(!bad)
+}
+
+test "an Int passed to a Sized bound stops the build at the call" {
+    let _ = sh("rm -rf {DIR}; mkdir -p {DIR}")
+    let src = "fn g[T: Sized](x: T) -> Int \{ x.len() }\nfn main() \{ io.println(\"\{g(1)}\") }\n"
+    report([expect_build_stops("sized_int", src, "2:26")])
+}
+
+test "a type with no Closeable impl passed to a Closeable bound stops the build at the call" {
+    let _ = sh("rm -rf {DIR}; mkdir -p {DIR}")
+    let src = "type Q \{ n: Int }\nfn need[T: Closeable](t: T) ! _ \{ t.close() }\nfn main() \{\n    need(Q \{ n: 1 })\n}\n"
+    report([expect_build_stops("closeable_none", src, "4:5")])
+}
+
+test "an Int passed to an Iterator bound stops the build at the call" {
+    let _ = sh("rm -rf {DIR}; mkdir -p {DIR}")
+    let src = "fn k[T: Iterator[Int]](x: T) -> Int \{ x.count() }\nfn main() \{ io.println(\"\{k(1)}\") }\n"
+    report([expect_build_stops("iterator_int", src, "2:26")])
+}
