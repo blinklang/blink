@@ -1,0 +1,264 @@
+// A method that takes `self`, named through its type with no argument list (`Str.len`), is no
+// function value: it is MethodThroughTypeName (E0567) with the head and span of the call form
+// (sections/03_types.md §3.4 *A read with no call*). The help writes a closure and there is no
+// fix. The closure's parameter carries the type. For a generic head, an expected function type,
+// as at `map`, types the parameter where the closure is pasted, so the closure has no
+// annotation. Else the closure names the instance a later use gives; when nothing does, it has
+// no annotation and the `let` that holds the read is CannotInferType (E0301). A type-scoped
+// function stays a function value, and a name that is no method stays E0505.
+
+import std.fs
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_reset}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+
+fn typecheck_probe(path: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    init_embedded_stdlib()
+    fs.write(path, src).unwrap()
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+}
+
+// Each error as "name line:col-end: message | help | label | fix | notes", in report order.
+// The fix reads "action `text` at line:col-end_line:end_col", or "-" when there is none.
+fn errors_of(src: Str) -> List[Str] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    typecheck_probe("build/test_typecheck_method_named_through_type_probe.bl", src)
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" {
+            let fix = if d.fix_action == "" { "-" } else { "`{d.fix_text}` at {d.fix_line}:{d.fix_col}-{d.fix_end_line}:{d.fix_end_col}" }
+            out.push("{d.name} {d.line}:{d.col}-{d.end_col}: {d.message} | {d.help} | {d.label} | {fix} | {d.notes.join("; ")}")
+        }
+    }
+    out
+}
+
+// The one error a source gets, or every error when it gets another count, so a failed assert
+// shows them.
+fn only_error(src: Str) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    let got = errors_of(src)
+    if got.len() != 1 { return "{got.len()} errors: {got.join(" || ")}" }
+    got.get(0).unwrap()
+}
+
+// The first error, with the count of MethodThroughTypeName reports, for a site where an error
+// in a call argument also leaves the call's result type open. That second report is not
+// E0567's, and every bad argument gets it.
+fn first_error(src: Str) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    let got = errors_of(src)
+    if got.len() == 0 { return "0 errors" }
+    let mut n = 0
+    for e in got { if e.starts_with("MethodThroughTypeName") { n += 1 } }
+    "{n} x E0567, first: {got.get(0).unwrap()}"
+}
+
+fn no_errors(src: Str) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    errors_of(src).join(" || ")
+}
+
+let SH = "@derive(Clone)\ntype P \{ v: Int }\ntrait Sh \{\n    fn sh(self) -> Int\n}\nimpl Sh for P \{\n    fn sh(self) -> Int \{ self.v }\n}\n"
+
+test "a built-in method named through its type is e0567 with a typed closure in the help" {
+    let src = "fn main() \{\n    let _f = Str.len\n}\n"
+    assert_eq(only_error(src), "MethodThroughTypeName 2:18-21: `len` is a method of `Str`, not a function of the type | use a closure: `fn(s: Str) \{ s.len() }` | `len` takes its receiver before the dot | - | ")
+}
+
+test "a built-in method passed to map through its type is reported once" {
+    let src = "fn main() \{\n    let words = [\"a\", \"bcd\"]\n    let ns = words.map(Str.len)\n    let _n = ns.len()\n}\n"
+    assert_eq(first_error(src), "1 x E0567, first: MethodThroughTypeName 3:28-31: `len` is a method of `Str`, not a function of the type | use a closure: `fn(s: Str) \{ s.len() }` | `len` takes its receiver before the dot | - | ")
+}
+
+// The expected function type gives the parameter its type where the closure is pasted, so the
+// closure has no annotation.
+test "a method of a generic type passed to map gets a closure with no annotation" {
+    let src = "fn main() \{\n    let lens = [[1, 2], [3]].map(List.len)\n    let _n = lens.len()\n}\n"
+    assert_eq(first_error(src), "1 x E0567, first: MethodThroughTypeName 2:39-42: `len` is a method of `List`, not a function of the type | use a closure: `fn(xs) \{ xs.len() }` | `len` takes its receiver before the dot | - | ")
+    let pasted = "fn main() \{\n    let lens = [[1, 2], [3]].map(fn(xs) \{ xs.len() })\n    let _n = lens.len()\n}\n"
+    assert_eq(no_errors(pasted), "")
+}
+
+test "a built-in method with no std trait named through its type is e0567 not e0505" {
+    let src = "fn main() \{\n    let xs = [1, -2].map(Int.abs)\n    let _n = xs.len()\n}\n"
+    assert_eq(first_error(src), "1 x E0567, first: MethodThroughTypeName 2:30-33: `abs` is a method of `Int`, not a function of the type | use a closure: `fn(x: Int) \{ x.abs() }` | `abs` takes its receiver before the dot | - | ")
+}
+
+test "a user trait method named through its type is e0567" {
+    let src = SH.concat("fn main() \{\n    let _g = P.sh\n}\n")
+    assert_eq(only_error(src), "MethodThroughTypeName 10:16-18: `sh` is a method of `P`, not a function of the type | use a closure: `fn(p: P) \{ p.sh() }` | `sh` takes its receiver before the dot | - | ")
+}
+
+test "a derived method named through its type at an expected function type is e0567" {
+    let src = SH.concat("fn main() \{\n    let _c: fn(P) -> P = P.clone\n}\n")
+    assert_eq(only_error(src), "MethodThroughTypeName 10:28-33: `clone` is a method of `P`, not a function of the type | use a closure: `fn(p: P) \{ p.clone() }` | `clone` takes its receiver before the dot | - | ")
+}
+
+test "a method named through a type parameter is e0567" {
+    let src = "fn dup[T: Clone](x: T) -> T \{\n    let c = T.clone\n    c(x)\n}\nfn main() \{\n}\n"
+    assert_eq(only_error(src), "MethodThroughTypeName 2:15-20: `clone` is a method of `T`, not a function of the type | use a closure: `fn(x: T) \{ x.clone() }` | `clone` takes its receiver before the dot | - | ")
+}
+
+test "a type-scoped function named through its type stays a function value" {
+    let src = "type Level \{ n: Int }\nfn Level_parse(s: Str) -> Level \{ Level \{ n: s.len() } }\nfn main() \{\n    let p = Level.parse\n    let _l = p(\"ab\")\n}\n"
+    assert_eq(no_errors(src), "")
+}
+
+test "a name that is no method of the type stays e0505" {
+    let r = no_errors("fn main() \{\n    let _f = Str.lenn\n}\n")
+    assert(!r.contains("MethodThroughTypeName") && r.contains("UnresolvedMethod"), r)
+}
+
+test "another member through a type parameter names no value" {
+    let r = no_errors("fn dup[T: Clone](x: T) -> T \{\n    let _c = T.zork\n    x\n}\nfn main() \{\n}\n")
+    assert_eq(r, "UndefinedVariable 2:14-0: undefined variable `T` |  |  | - | ")
+}
+
+test "a display method the compiler makes from fmt gets a closure" {
+    let src = "type P \{ v: Int }\nimpl Display for P \{\n    fn fmt(self, sb: StringBuilder) \{ sb.write(\"p\") }\n}\nfn main() \{\n    let _d = P.display\n}\n"
+    assert_eq(only_error(src), "MethodThroughTypeName 6:16-23: `display` is a method of `P`, not a function of the type | use a closure: `fn(p: P) \{ p.display() }` | `display` takes its receiver before the dot | - | ")
+}
+
+// A built-in method's parameter types live only in the checker's rules for a call, so a
+// built-in with a parameter past `self` gets no closure.
+test "a built-in method with a parameter past self gets a call with the receiver before the dot" {
+    let src = "fn main() \{\n    let _m = Int.max\n}\n"
+    assert_eq(only_error(src), "MethodThroughTypeName 2:18-21: `max` is a method of `Int`, not a function of the type | call the method on an `Int` value, as `x.max(...)` | `max` takes its receiver before the dot | - | ")
+    assert_eq(only_error("fn main() \{\n    let _r = Str.replace\n}\n"), "MethodThroughTypeName 2:18-25: `replace` is a method of `Str`, not a function of the type | call the method on a `Str` value, as `s.replace(...)` | `replace` takes its receiver before the dot | - | ")
+}
+
+test "a built-in method with a parameter past self through an alias head gets a call with the receiver before the dot" {
+    let src = "type Ages = Map[Str, Int]\nfn main() \{\n    let _i = Ages.insert\n}\n"
+    assert_eq(only_error(src), "MethodThroughTypeName 3:19-25: `insert` is a method of `Ages`, not a function of the type | call the method on a `Map` value, as `x.insert(...)` | `insert` takes its receiver before the dot | - | ")
+}
+
+test "a built-in method with a parameter past self at an expected function type gets a call with the receiver before the dot" {
+    let src = "fn use_get(f: fn(List[Int], Int) -> Option[Int]) -> Int \{ 0 }\nfn main() \{\n    let _n = use_get(List.get)\n}\n"
+    assert_eq(first_error(src), "1 x E0567, first: MethodThroughTypeName 3:27-30: `get` is a method of `List`, not a function of the type | call the method on a `List` value, as `xs.get(...)` | `get` takes its receiver before the dot | - | ")
+}
+
+test "a built-in method with a parameter past self on a generic head gets a call with the receiver before the dot" {
+    let src = "fn main() \{\n    let _p = List.push\n}\n"
+    assert_eq(only_error(src), "MethodThroughTypeName 2:19-23: `push` is a method of `List`, not a function of the type | call the method on a `List` value, as `xs.push(...)` | `push` takes its receiver before the dot | - | ")
+}
+
+test "a built-in parameter that is a function gets a call with the receiver before the dot" {
+    let src = "fn main() \{\n    let _m = List.map\n}\n"
+    assert_eq(only_error(src), "MethodThroughTypeName 2:19-22: `map` is a method of `List`, not a function of the type | call the method on a `List` value, as `xs.map(...)` | `map` takes its receiver before the dot | - | ")
+}
+
+let PUT = "type P \{ v: Int }\ntrait Put \{\n    fn put(self, a: Int, -- by: Int = 1) -> Int\n}\nimpl Put for P \{\n    fn put(self, a: Int, -- by: Int = 1) -> Int \{ self.v + a * by }\n}\n"
+
+test "a method with parameters past self gets a closure that types each and keeps the keyword labels" {
+    let src = PUT.concat("fn main() \{\n    let _f = P.put\n}\n")
+    assert_eq(only_error(src), "MethodThroughTypeName 9:16-19: `put` is a method of `P`, not a function of the type | use a closure: `fn(p: P, a: Int, by: Int) \{ p.put(a, by: by) }` | `put` takes its receiver before the dot | - | ")
+}
+
+// The closure in the help of `read`, which `decls` and then `fn main` around it hold.
+fn help_closure(decls: Str, read: Str) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    let e = only_error(decls.concat("fn main() \{\n    let _f = {read}\n}\n"))
+    let head = "use a closure: `"
+    let at = e.byte_index_of(head, 0) ?? -1
+    if at < 0 { return "no closure in: {e}" }
+    let from = at + head.byte_len()
+    let end = e.byte_index_of("` | ", from) ?? -1
+    if end < 0 { return "no closure in: {e}" }
+    e.byte_slice(from, end)
+}
+
+// Each help closure is taken from the report itself and pasted where the read was, so a change
+// to the help that stops it compiling fails here.
+test "the closure in each help compiles where the read was" {
+    let lst = "type IntList = List[Int]\ntype Ages = Map[Str, Int]\n"
+    let cases = [
+        (PUT, "P.put", "(P \{ v: 1 }, 2, 3)"),
+        (SH, "P.sh", "(P \{ v: 1 })"),
+        (SH, "P.clone", "(P \{ v: 1 })"),
+        ("", "Str.len", "(\"ab\")"),
+        ("", "Int.abs", "(-3)"),
+        ("", "Bytes.len", "(Bytes.new())"),
+        (lst, "IntList.len", "([1, 2])"),
+        (lst, "Ages.len", "(Map())"),
+    ]
+    for c in cases {
+        let (decls, read, args) = c
+        let closure = help_closure(decls, read)
+        let pasted = decls.concat("fn main() \{\n    let f = {closure}\n    let _n = f{args}\n}\n")
+        assert_eq("{read}: {no_errors(pasted)}", "{read}: ")
+    }
+}
+
+test "a parameter typed by a type parameter of the trait gets a call with the receiver before the dot" {
+    let src = "type P \{ v: Int }\ntrait Conv[K] \{\n    fn conv(self, k: K) -> Int\n}\nimpl Conv[Int] for P \{\n    fn conv(self, k: Int) -> Int \{ self.v + k }\n}\nfn main() \{\n    let _f = P.conv\n}\n"
+    assert_eq(only_error(src), "MethodThroughTypeName 9:16-20: `conv` is a method of `P`, not a function of the type | call the method on a `P` value, as `p.conv(...)` | `conv` takes its receiver before the dot | - | ")
+}
+
+test "a generic head that nothing fixes gets a closure with no annotation and its let is e0301" {
+    let src = "fn main() \{\n    let _f = List.len\n}\n"
+    assert_eq(errors_of(src).join(" || "), "CannotInferType 2:5-0: cannot infer a type for `_f`: it is never given one by an annotation or a later use | give the closure's receiver its type, as in `let _f = fn(xs: List[T]) \{ xs.len() }` (replace the placeholder with the intended type) |  | - |  || MethodThroughTypeName 2:19-22: `len` is a method of `List`, not a function of the type | use a closure: `fn(xs) \{ xs.len() }` | `len` takes its receiver before the dot | - | ")
+}
+
+// The read takes a function type at the head's fresh arguments, so a later call gives them the
+// instance, and the check reports the read where it used to leave a node with no type.
+test "a generic head that a later call fixes gets a closure on that instance and no other error" {
+    let src = "fn main() \{\n    let f = List.len\n    let _n = f([1, 2])\n}\n"
+    assert_eq(only_error(src), "MethodThroughTypeName 2:18-21: `len` is a method of `List`, not a function of the type | use a closure: `fn(xs: List[Int]) \{ xs.len() }` | `len` takes its receiver before the dot | - | ")
+    let pasted = "fn main() \{\n    let f = fn(xs: List[Int]) \{ xs.len() }\n    let _n = f([1, 2])\n}\n"
+    assert_eq(no_errors(pasted), "")
+}
+
+test "an alias head names its instance on the closure parameter" {
+    let src = "type IntList = List[Int]\nfn main() \{\n    let _f = IntList.len\n}\n"
+    assert_eq(only_error(src), "MethodThroughTypeName 3:22-25: `len` is a method of `IntList`, not a function of the type | use a closure: `fn(xs: IntList) \{ xs.len() }` | `len` takes its receiver before the dot | - | ")
+}
+
+test "a method two traits give gets one closure for each that names its trait" {
+    let src = "type P \{ v: Int }\ntrait A1 \{\n    fn nm(self) -> Int\n}\ntrait A2 \{\n    fn nm(self) -> Int\n}\nimpl A1 for P \{\n    fn nm(self) -> Int \{ 1 }\n}\nimpl A2 for P \{\n    fn nm(self) -> Int \{ 2 }\n}\nfn main() \{\n    let _d = P.nm\n}\n"
+    assert_eq(only_error(src), "MethodThroughTypeName 15:16-18: `nm` is a method of `P`, not a function of the type | use a closure that names the owner:\n  fn(p: P) \{ A1.nm(p) }\n  fn(p: P) \{ A2.nm(p) } | `nm` takes its receiver before the dot | - | ")
+    let pasted = "type P \{ v: Int }\ntrait A1 \{\n    fn nm(self) -> Int\n}\ntrait A2 \{\n    fn nm(self) -> Int\n}\nimpl A1 for P \{\n    fn nm(self) -> Int \{ 1 }\n}\nimpl A2 for P \{\n    fn nm(self) -> Int \{ 2 }\n}\nfn main() \{\n    let f = fn(p: P) \{ A1.nm(p) }\n    let _n = f(P \{ v: 0 })\n}\n"
+    assert_eq(no_errors(pasted), "")
+}
+
+test "a method with type parameters of its own gets a call with the receiver before the dot" {
+    let src = "type P \{ v: Int }\ntrait M \{\n    fn m[U](self) -> Int\n}\nimpl M for P \{\n    fn m[U](self) -> Int \{ 0 }\n}\nfn main() \{\n    let _a = P.m\n}\n"
+    assert_eq(only_error(src), "MethodThroughTypeName 9:16-17: `m` is a method of `P`, not a function of the type | call the method on a `P` value, as `p.m(...)` | `m` takes its receiver before the dot | - | ")
+}
+
+test "a trait static with no self named through its type stays a function value" {
+    assert_eq(no_errors("type P \{ v: Int }\ntrait Mk \{\n    fn mk() -> Self\n}\nimpl Mk for P \{\n    fn mk() -> P \{ P \{ v: 1 } }\n}\nfn main() \{\n    let f = P.mk\n    let _p = f()\n}\n"), "")
+}
+
+test "a local that shadows a type name is a value, not a type head" {
+    let r = no_errors("fn main() \{\n    let Str = 5\n    let _n = Str.len\n}\n")
+    assert(!r.contains("MethodThroughTypeName") && r != "", r)
+}
+
+test "a type parameter head with a parameter past self gets a typed closure" {
+    let src = "trait Ad \{\n    fn add(self, n: Int) -> Int\n}\nfn f[T: Ad](x: T) -> Int \{\n    let _g = T.add\n    x.add(1)\n}\nfn main() \{\n}\n"
+    assert_eq(only_error(src), "MethodThroughTypeName 5:16-19: `add` is a method of `T`, not a function of the type | use a closure: `fn(x: T, n: Int) \{ x.add(n) }` | `add` takes its receiver before the dot | - | ")
+}
+
+test "a read with spaces around the dot puts the span on the member" {
+    let src = "fn main() \{\n    let _f = Str . len\n}\n"
+    assert_eq(only_error(src), "MethodThroughTypeName 2:20-23: `len` is a method of `Str`, not a function of the type | use a closure: `fn(s: Str) \{ s.len() }` | `len` takes its receiver before the dot | - | ")
+}
+
+test "an alias of a declared type names the alias in the message and on the closure parameter" {
+    let src = SH.concat("type Al = P\nfn main() \{\n    let _g = Al.sh\n}\n")
+    assert_eq(only_error(src), "MethodThroughTypeName 11:17-19: `sh` is a method of `Al`, not a function of the type | use a closure: `fn(p: Al) \{ p.sh() }` | `sh` takes its receiver before the dot | - | ")
+}
+
+test "a read through Self in an impl names Self on the closure parameter" {
+    let src = "type P \{ v: Int }\ntrait Sh \{\n    fn sh(self) -> Int\n    fn tw(self) -> Int\n}\nimpl Sh for P \{\n    fn sh(self) -> Int \{ self.v }\n    fn tw(self) -> Int \{\n        let g = Self.sh\n        g(self)\n    }\n}\nfn main() \{\n}\n"
+    assert_eq(only_error(src), "MethodThroughTypeName 9:22-24: `sh` is a method of `Self`, not a function of the type | use a closure: `fn(p: Self) \{ p.sh() }` | `sh` takes its receiver before the dot | - | ")
+}
+
+let BX = "type Bx[T] \{ v: T }\ntrait Sz \{\n    fn same(self, o: Self) -> Bool\n}\nimpl[T] Sz for Bx[T] \{\n    fn same(self, _o: Self) -> Bool \{ true }\n}\n"
+
+test "a generic user type that a later call fixes names the instance on a Self parameter too" {
+    let src = BX.concat("fn main() \{\n    let g = Bx.same\n    let _b = g(Bx \{ v: \"a\" }, Bx \{ v: \"b\" })\n}\n")
+    assert_eq(only_error(src), "MethodThroughTypeName 9:16-20: `same` is a method of `Bx`, not a function of the type | use a closure: `fn(b: Bx[Str], o: Bx[Str]) \{ b.same(o) }` | `same` takes its receiver before the dot | - | ")
+    let pasted = BX.concat("fn main() \{\n    let g = fn(b: Bx[Str], o: Bx[Str]) \{ b.same(o) }\n    let _b = g(Bx \{ v: \"a\" }, Bx \{ v: \"b\" })\n}\n")
+    assert_eq(no_errors(pasted), "")
+}

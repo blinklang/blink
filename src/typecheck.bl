@@ -1,7 +1,7 @@
 import ast.{NodeKind, node_kind_name, is_block_bearing, trace_gate_on, nk_is_typed, phase_trace, trace_mode}
 import std.str.{str_to_lower}
 import pkg.manifest.{manifest_name, manifest_header_is_declared}
-import unparse.{type_ann_text, unparse_expr, unparse_binop_with_lhs, unparse_range_membership, unparse_coalesce_start}
+import unparse.{type_ann_text, type_ann_text_renamed, unparse_expr, unparse_binop_with_lhs, unparse_range_membership, unparse_coalesce_start}
 import formatter.{effect_op_sig_text, fn_sig_text, fn_sig_text_renamed, type_param_list_text, format_type_param_binder}
 import import_edit.{ImportEdit, ImportNeed, import_aliased_edit, import_module_edit, import_need}
 import parser.{
@@ -3280,6 +3280,10 @@ type CallFacts {
     // type leaves open (the `U` of `fn() -> U`) is tied to the closure's own slot, so the body
     // walk cannot tell it from no expected type by the slot alone.
     under_fn_type: Map[Int, Int]
+    // Each read `T.m` of a method through a generic head (tc_note_method_read_again), in the order
+    // first walked, so the flush reports in source order.
+    method_reads: Map[Int, MethodRead]
+    method_read_order: List[Int]
 }
 // The impl a call reached, its binder tids in header order, the type `Self` reads as (a method
 // call's receiver, a conversion's target), and the fn whose body made the call.
@@ -3291,7 +3295,7 @@ type ImplBoundCall {
 }
 
 fn new_call_facts() -> CallFacts {
-    CallFacts { open_calls: [], open_group: Map(), open_tids: [], reported: Map(), self_views: Map(), view_sigs: Map(), hash_aliases_above: [], derive_facts_above: [], derive_facts_low: 0, derive_facts_open: [], derive_facts_open_low: Map(), debug_unbuilt_seen: Map(), hash_by_bounds: false, static_head_insts: Map(), static_head_binders: Map(), impl_bound_calls: [], impl_bound_binds: Map(), static_owners: Map(), trait_heads: Map(), closure_expected_at: Map(), ret_ann: -1, missing_else: Map(), walk_returns: [], written_names: Map(), under_fn_type: Map() }
+    CallFacts { open_calls: [], open_group: Map(), open_tids: [], reported: Map(), self_views: Map(), view_sigs: Map(), hash_aliases_above: [], derive_facts_above: [], derive_facts_low: 0, derive_facts_open: [], derive_facts_open_low: Map(), debug_unbuilt_seen: Map(), hash_by_bounds: false, static_head_insts: Map(), static_head_binders: Map(), impl_bound_calls: [], impl_bound_binds: Map(), static_owners: Map(), trait_heads: Map(), closure_expected_at: Map(), ret_ann: -1, missing_else: Map(), walk_returns: [], written_names: Map(), under_fn_type: Map(), method_reads: Map(), method_read_order: [] }
 }
 let mut tc_calls: CallFacts = new_call_facts()
 
@@ -4701,6 +4705,8 @@ fn tc_drop_open_calls() {
     tc_calls.open_tids = []
     tc_calls.impl_bound_calls = []
     tc_calls.impl_bound_binds.clear()
+    tc_calls.method_reads.clear()
+    tc_calls.method_read_order = []
 }
 
 // Report a binding whose type is under-determined — HM finished the region with a
@@ -4721,6 +4727,10 @@ fn tc_report_under_determined(vname: Str, tid: Int, decl_node: Int) ! Diag.Repor
     let val = if dk == NodeKind.LetBinding { node_value(decl_node) } else { -1 }
     if val != -1 && (tc_fn_value_group(val) >= 0 || tc_type_path_value_impl_open(val)) {
         tc_report_value_unfixed(val)
+        return
+    }
+    if val != -1 && tc_method_read_waits(val) {
+        tc_hold_method_read_binding(val, vname, decl_node, tid)
         return
     }
     let (source, slot) = tc_ud_open_slot(tid, val)
@@ -27168,8 +27178,7 @@ fn tc_method_through_type_report(node: Int, qual: Str, name: Str, mt: MethodType
     let first = if n_args > 0 { sublist_get(args, 0) } else { -1 }
     let has_recv = first != -1 && node_kind(first) != NodeKind.NamedArg && node_kind(first) != NodeKind.SpreadExpr && tc_written_operand(first).text != ""
     let first_t = if has_recv { arg_tids.get(0) ?? -1 } else { -1 }
-    let alias_t = if head.alias >= 0 { tc_head_decl_tid(qual) } else { -1 }
-    let exact = if tparam { -1 } else if head.inst >= 0 { resolve_alias_tid(head.inst) } else if alias_t >= 0 && !tc_tid_holds_typevar(alias_t) { alias_t } else { -1 }
+    let exact = if tparam { -1 } else { tc_head_instance(head, qual) }
     let fits = has_recv && tc_arg_is_head_type(first_t, tparam, qual, subject, exact)
     let first_unknown = has_recv && tc_tid_is_no_info(resolve_alias_tid(tc_resolve(first_t))) != 0
     let mut out = MethodTypeReport { notes: [], helps: [], fix_text: "", wait: false }
@@ -27225,6 +27234,22 @@ fn tc_method_through_type_report(node: Int, qual: Str, name: Str, mt: MethodType
     out
 }
 
+// Whether `obj` is a type parameter head (`T.clone(x)`, `T.clone`). It is a type path, which
+// typecheck decides once the bounds are known, so name resolution leaves it alone.
+fn nr_names_tparam_head(obj: Int) -> Bool {
+    node_kind(obj) == NodeKind.Ident && nr_receiver_has_binding(node_name(obj)) == 0 && tc_name_is_tparam_in_scope(node_name(obj)) != 0
+}
+
+// Name resolution leaves a type parameter head to typecheck, and a member through it that is
+// no method of a bound names no value. True when it reported.
+fn tc_report_tparam_head_not_value(head_node: Int) -> Bool ! TypeCheck.Report, Diag.Report {
+    let head = node_name(head_node)
+    if tc_name_is_tparam_in_scope(head) == 0 { return false }
+    tc_errors.push("undefined variable `{head}`")
+    diag_error_at("UndefinedVariable", UNDEFINED_VARIABLE, "undefined variable `{head}`", head_node, tc_undefined_name_help(head))
+    true
+}
+
 // error[MethodThroughTypeName] for the call `qual.name(args)` (§3.4 *A method called through
 // its type name*). True when it reported, or left the report to the body walk; the caller then
 // has nothing more to type.
@@ -27247,6 +27272,258 @@ fn tc_report_method_through_type_name(node: Int, qual: Str, name: Str) -> Bool !
         if site.text != "" { tc_attach_fix(before, r.helps.get(0).unwrap(), [tc_replace_written(site, r.fix_text)]) }
     }
     true
+}
+
+// One parameter past `self` of a method, as the closure in a help writes it.
+type ClosureParam {
+    name: Str
+    ty: Str
+    keyword: Bool
+}
+
+// The instance the head `qual` names in full (`Self` in an impl, an alias with no open
+// argument), or -1.
+fn tc_head_instance(head: StaticHead, qual: Str) -> Int {
+    if head.inst >= 0 { return resolve_alias_tid(head.inst) }
+    let alias_t = if head.alias >= 0 { tc_head_decl_tid(qual) } else { -1 }
+    if alias_t >= 0 && !tc_tid_holds_typevar(alias_t) { alias_t } else { -1 }
+}
+
+// The parameters past `self` of the method `name` that `o` gives, with each type written as the
+// head `qual` reads it, or None when a type is not known where the help is pasted. A built-in
+// method, sealed or not, has its parameter types only in the checker's own rules for a call, so
+// one with a parameter past `self` gets None; so does a parameter typed by a type parameter of
+// the trait or of the method.
+fn tc_closure_params_past_self(o: SelfMethodOwner, subject: Int, name: Str, qual: Str) -> Option[List[ClosureParam]] {
+    // Display's `display` has no declaration: the compiler makes it from `fmt`.
+    if o.key == "Display" && name == "display" { return Some([]) }
+    let decl = if o.key == "" { -1 } else { tc_trait_method_decl(o.key, name) }
+    if o.key == "" || (o.sealed && decl < 0) {
+        let k = if subject >= 0 { type_kind(resolve_alias_tid(subject)) } else { TyKind.Unknown }
+        return if subject >= 0 && tc_builtin_method_arity(k, name) == 0 { Some([]) } else { None }
+    }
+    if decl < 0 { return None }
+    // Nothing in a pasted closure gives the method's own type parameters a type.
+    if node_type_params(decl) != -1 { return None }
+    let ps = node_params(decl)
+    let mut out: List[ClosureParam] = []
+    if ps == -1 || sublist_length(ps) <= 1 { return Some(out) }
+    if o.sealed { return None }
+    let trait_node = tc_trait_node_idx.get(o.key) ?? -1
+    let tps = if trait_node >= 0 { node_type_params(trait_node) } else { -1 }
+    let mut renames: Map[Str, Str] = Map()
+    renames.insert("Self", qual)
+    for i in 1..sublist_length(ps) {
+        let p = sublist_get(ps, i)
+        let ann = node_type_ann(p)
+        let ty = if ann != -1 { type_ann_text_renamed(ann, renames) } else { renames.get(node_type_name(p)) ?? node_type_name(p) }
+        if ty == "" { return None }
+        if tps != -1 {
+            for j in 0..sublist_length(tps) {
+                if nr_whole_word_at(ty, node_name(sublist_get(tps, j)), 0).is_some() { return None }
+            }
+        }
+        out.push(ClosureParam { name: node_name(p), ty: ty, keyword: node_int_val(p) == 1 })
+    }
+    Some(out)
+}
+
+// The closure for the read `qual.name` with the parameters `ps` past the receiver `recv`, and
+// `call` before the dot: the receiver, or the trait that names one owner of several.
+fn tc_read_closure(ps: List[ClosureParam], recv: Str, recv_ty: Str, call: Str, name: Str) -> Str {
+    let mut params: List[Str] = [if recv_ty == "" { recv } else { "{recv}: {recv_ty}" }]
+    let mut args: List[Str] = []
+    if call != recv { args.push(recv) }
+    for p in ps {
+        params.push(if p.ty == "" { p.name } else { "{p.name}: {p.ty}" })
+        args.push(if p.keyword { "{p.name}: {p.name}" } else { p.name })
+    }
+    "fn({params.join(", ")}) \{ {call}.{name}({args.join(", ")}) }"
+}
+
+// error[MethodThroughTypeName] for the read `qual.name` with no argument list (§3.4 *A read with
+// no call*). The help writes a closure that compiles where it is pasted, so the receiver and
+// every parameter have their types. A generic head names no instance, so the read takes the
+// type `fn(Head[..]) -> ?` at fresh arguments (tc_note_method_read_again): an expected function
+// type types the closure where it is pasted, so that closure has no annotation; else the report
+// names the instance a later use gives. With two owners the receiver
+// form is ambiguous, so each closure names its trait. A method with a parameter whose type is
+// not known at the site gets a call with the receiver before the dot. There is no fix, since the
+// fix would have to choose the parameter names. None when the read is no such method; else the
+// type the read has.
+fn tc_report_method_read_through_type_name(node: Int, qual: Str, name: Str) -> Option[Int] ! TypeCheck.Resolve, Diag.Report {
+    match tc_calls.method_reads.get(node) {
+        Some(r) => return Some(tc_note_method_read_again(node, r))
+        None => {}
+    }
+    let mt = tc_method_through_type_head(node, qual, name)
+    if mt.owners.len() == 0 { return None }
+    trace.log("blink.tc.methodtype", "read `{qual}.{name}`: {mt.owners.len()} owner(s), tparam {mt.tparam}")
+    let shown = if mt.tparam { qual } else { mt.head.owner }
+    let ph = tc_receiver_placeholder(shown, mt.tparam, mt.subject)
+    let inst = if mt.tparam { -1 } else { tc_head_instance(mt.head, qual) }
+    let generic = !mt.tparam && inst < 0 && tc_ctor_arity(qual) > 0
+    let several = mt.owners.len() >= 2
+    let mut owners: List[SelfMethodOwner] = []
+    for o in mt.owners {
+        if several && (o.key == "" || !tc_trait_nameable_here(o.key)) { continue }
+        owners.push(o)
+    }
+    let col = tc_qualified_name_col(node, qual, name)
+    let start = if col == -1 { node_col(node) } else { col }
+    let closures = tc_read_closures(owners, mt.subject, name, qual, ph, several)
+    if generic && closures.len() > 0 {
+        let head = tc_static_head_instance(-1, qual, node)
+        let mut params: List[Int] = [head]
+        for _p in closures.get(0).unwrap().ps { params.push(TYPE_UNKNOWN) }
+        let r = MethodRead { qual: qual, name: name, inst: head, fn_tid: make_fn_type(TYPE_UNKNOWN, params), shown: shown, ph: ph, owners: owners, subject: mt.subject, several: several, start: start, reported: false, binding: -1, vname: "" }
+        tc_calls.method_reads.insert(node, r)
+        tc_calls.method_read_order.push(node)
+        return Some(tc_note_method_read_again(node, r))
+    }
+    let texts = tc_read_closure_texts(closures, if generic { "" } else { qual }, name)
+    tc_emit_method_read(node, qual, name, start, tc_read_help(texts, several, shown, ph, name))
+    Some(tc_error_recovery_tid())
+}
+
+// One closure in the help for a read: the parameters past `self`, the receiver's name, and what
+// stands before the dot (the receiver, or the trait that names one owner of several).
+type ReadClosure {
+    ps: List[ClosureParam]
+    recv: Str
+    call: Str
+}
+
+// A read `qual.name` through a generic head (tc_note_method_read_again): the head at fresh
+// arguments, the function type the read has, and what its report needs once they are known.
+// `binding` is the `let` that holds the read when nothing fixed the head, else -1.
+type MethodRead {
+    qual: Str
+    name: Str
+    inst: Int
+    fn_tid: Int
+    shown: Str
+    ph: Str
+    owners: List[SelfMethodOwner]
+    subject: Int
+    several: Bool
+    start: Int
+    reported: Bool
+    binding: Int
+    vname: Str
+}
+
+// The closures the read of `name` gets from `owners`, with `Self` in a parameter type written
+// `self_text`.
+fn tc_read_closures(owners: List[SelfMethodOwner], subject: Int, name: Str, self_text: Str, ph: Str, several: Bool) -> List[ReadClosure] {
+    let mut out: List[ReadClosure] = []
+    for o in owners {
+        match tc_closure_params_past_self(o, subject, name, self_text) {
+            Some(ps) => {
+                let mut recv = ph
+                for p in ps {
+                    if p.name == ph { recv = "{ph}0" }
+                }
+                out.push(ReadClosure { ps: ps, recv: recv, call: if several { tc_trait_shown(o.key) } else { recv } })
+            }
+            None => {}
+        }
+    }
+    out
+}
+
+fn tc_read_closure_texts(closures: List[ReadClosure], recv_ty: Str, name: Str) -> List[Str] {
+    let mut out: List[Str] = []
+    for c in closures { out.push(tc_read_closure(c.ps, c.recv, recv_ty, c.call, name)) }
+    out
+}
+
+fn tc_read_help(closures: List[Str], several: Bool, shown: Str, ph: Str, name: Str) -> Str {
+    if closures.len() == 0 { return "call the method on {tc_article_for(shown)} `{shown}` value, as `{ph}.{name}(...)`" }
+    if !several { return "use a closure: `{closures.get(0).unwrap()}`" }
+    let mut lines = ["use a closure that names the owner:"]
+    for c in closures { lines.push("  {c}") }
+    lines.join("\n")
+}
+
+fn tc_emit_method_read(node: Int, qual: Str, name: Str, start: Int, help: Str) ! Diag.Report {
+    diag_error_span_label_at_notes("MethodThroughTypeName", METHOD_THROUGH_TYPE_NAME, "`{name}` is a method of `{qual}`, not a function of the type", node, node_line(node), start, start + name.byte_len(), "`{name}` takes its receiver before the dot", help, [])
+}
+
+// A read through a generic head, at each walk of it. At an expected function type the report is
+// made at once, with no annotation (§3.4 *A read with no call*), since that type gives the
+// pasted closure's parameters theirs; the read still takes the expected type. Else it waits for
+// the flush, which a later use may have given the instance by then.
+// A node is walked more than once, so a read is reported once and keeps its first type.
+fn tc_note_method_read_again(node: Int, r: MethodRead) -> Int ! Diag.Report {
+    if r.reported { return r.fn_tid }
+    if tc_construct_hint >= 0 {
+        let want = resolve_alias_tid(tc_construct_hint)
+        if type_kind(want) == TyKind.Fn {
+            let _ = tc_unify(r.fn_tid, want)
+            tc_report_method_read(node, r, false)
+            return r.fn_tid
+        }
+    }
+    if tc_tid_has_unbound_metavar(r.inst) != 0 { return r.fn_tid }
+    tc_report_method_read(node, r, true)
+    r.fn_tid
+}
+
+// `annotate` is false at an expected function type, where every parameter is left bare.
+fn tc_report_method_read(node: Int, r: MethodRead, annotate: Bool) ! Diag.Report {
+    let fixed = annotate && tc_tid_has_unbound_metavar(r.inst) == 0
+    let self_text = if fixed { type_to_str(r.inst) } else { r.qual }
+    let mut closures = tc_read_closures(r.owners, r.subject, r.name, self_text, r.ph, r.several)
+    if !annotate {
+        let mut bare: List[ReadClosure] = []
+        for c in closures {
+            let mut ps: List[ClosureParam] = []
+            for p in c.ps { ps.push(ClosureParam { name: p.name, ty: "", keyword: p.keyword }) }
+            bare.push(ReadClosure { ps: ps, recv: c.recv, call: c.call })
+        }
+        closures = bare
+    }
+    let texts = tc_read_closure_texts(closures, if fixed { self_text } else { "" }, r.name)
+    tc_emit_method_read(node, r.qual, r.name, r.start, tc_read_help(texts, r.several, r.shown, r.ph, r.name))
+    let mut done = r
+    done.reported = true
+    tc_calls.method_reads.insert(node, done)
+}
+
+// Whether `val` is a read through a generic head whose report waits for the flush.
+fn tc_method_read_waits(val: Int) -> Bool {
+    match tc_calls.method_reads.get(val) {
+        Some(r) => !r.reported
+        None => false
+    }
+}
+
+// The `let` that holds a waiting read whose head nothing fixed: the flush reports it with the
+// read, as the repair is the closure, not an annotation on the binding.
+fn tc_hold_method_read_binding(val: Int, vname: Str, decl_node: Int, tid: Int) {
+    let mut r = tc_calls.method_reads.get(val).unwrap()
+    r.binding = decl_node
+    r.vname = vname
+    tc_calls.method_reads.insert(val, r)
+    tc_ud_mark_blamed(tid)
+}
+
+// Report each read through a generic head that waited, once every use has run: the closure
+// names the instance a use gave the head, else it has no annotation, and a `let` that holds
+// the read cannot be given a type (E0301).
+fn tc_flush_method_reads() ! Diag.Report {
+    for node in tc_calls.method_read_order {
+        let r = tc_calls.method_reads.get(node).unwrap()
+        if r.reported { continue }
+        if r.binding >= 0 {
+            let closures = tc_read_closures(r.owners, r.subject, r.name, r.qual, r.ph, r.several)
+            let hint = tc_infer_annotation_hint(r.inst)
+            let typed = tc_read_closure_texts(closures, hint.byte_slice(2, hint.byte_len()), r.name).get(0) ?? ""
+            diag_error_at("CannotInferType", CANNOT_INFER_TYPE, "cannot infer a type for `{r.vname}`: it is never given one by an annotation or a later use", r.binding, "give the closure's receiver its type, as in `let {r.vname} = {typed}` (replace the placeholder with the intended type)")
+        }
+        tc_report_method_read(node, r, true)
+    }
 }
 
 // The functions a static call on `head` resolves to: the type-scoped functions and the trait
@@ -28936,10 +29213,7 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
             // A namespace receiver names no value, so the Ident walk has nothing to check on it.
             // Skipping it leaves that walk to report a namespace in a value position.
             let ue_handle_recv = node_kind(obj) == NodeKind.Ident && nr_names_ue_handle(node_name(obj))
-            // A type parameter head is a type path (`T.clone(x)`): typecheck decides it once the
-            // bounds are known, so E0567 is its one report.
-            let tparam_head = node_kind(obj) == NodeKind.Ident && nr_receiver_has_binding(node_name(obj)) == 0 && tc_name_is_tparam_in_scope(node_name(obj)) != 0
-            if !ue_handle_recv && !tparam_head && (node_kind(obj) != NodeKind.Ident || is_builtin_namespace(node_name(obj)) == 0 || (nr_top_index(node_name(obj)) != -1 && !nr_namespace_binding_out_of_scope(node_name(obj)))) {
+            if !ue_handle_recv && !nr_names_tparam_head(obj) && (node_kind(obj) != NodeKind.Ident || is_builtin_namespace(node_name(obj)) == 0 || (nr_top_index(node_name(obj)) != -1 && !nr_namespace_binding_out_of_scope(node_name(obj)))) {
                 let receiver_diags = diag_entry_count()
                 nr_check_node(obj)
                 if diag_any_errors_since(receiver_diags) > 0 { tc_method_calls.receiver_failed.insert(node, 1) }
@@ -29050,7 +29324,7 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                     }
                 }
             }
-            if is_mod_fa == 0 {
+            if is_mod_fa == 0 && !nr_names_tparam_head(obj) {
                 nr_check_node(obj)
             }
         }
@@ -33798,14 +34072,7 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                 tc_method_calls.hard.insert(node, 1)
                 return tc_error_recovery_tid()
             }
-            // Name resolution left a type parameter head to this check; any other member
-            // through it names no value.
-            let head = node_name(obj_node)
-            if tc_name_is_tparam_in_scope(head) != 0 {
-                tc_errors.push("undefined variable `{head}`")
-                diag_error_at("UndefinedVariable", UNDEFINED_VARIABLE, "undefined variable `{head}`", obj_node, tc_undefined_name_help(head))
-                tc_method_calls.receiver_failed.insert(node, 1)
-            }
+            if tc_report_tparam_head_not_value(obj_node) { tc_method_calls.receiver_failed.insert(node, 1) }
         }
 
         // A sealed ops trait's qualified call `StrOps.len(s)` is the same call as `s.len()`
@@ -35561,6 +35828,11 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
             }
             if head_is_type {
                 if tc_report_bad_variant_value(node, obj_name, fname, 0) { return tc_error_recovery_tid() }
+                match tc_report_method_read_through_type_name(node, obj_name, fname) {
+                    Some(t) => return t
+                    None => {}
+                }
+                if tc_report_tparam_head_not_value(obj_node) { return tc_error_recovery_tid() }
                 if tc_type_path_member_unknown(obj_name, fname, node) {
                     tc_report_unknown_member(node, obj_name, tc_static_head(obj_name), fname, 0)
                     return tc_error_recovery_tid()
@@ -42040,16 +42312,32 @@ fn tc_pattern_fault(pat: Int, hint: Int) -> PatternFault ! TypeCheck.Resolve, Di
     PatternFault.Clean
 }
 
-// The column `name` starts at in `qual.name` on the node's line, so a span can cover the
-// variant alone. -1 when the line does not hold that spelling (`K\n    .Name`): the caller
-// then has no span it can rewrite.
+// The column `name` starts at in `qual.name` (or `qual . name`) on the node's line, so a span
+// can cover the member alone. -1 when the line does not hold that spelling
+// (`K\n    .Name`): the caller then has no span it can rewrite.
 fn tc_qualified_name_col(node: Int, qual: Str, name: Str) -> Int {
     let text = diag_source_line(diag_file_for_node(node), node_line(node))
     let back = node_col(node) - 2 - qual.byte_len()
     match text.byte_index_of("{qual}.{name}", if back > 0 { back } else { 0 }) {
-        Some(i) => i + qual.byte_len() + 2
-        None => -1
+        Some(i) => return i + qual.byte_len() + 2
+        None => {}
     }
+    // Spaces may stand around the dot (`Str . len`), and the node's column then says nothing
+    // about where the head starts, so each written head on the line is tried.
+    let mut from = 0
+    while from < text.byte_len() {
+        let at = text.byte_index_of(qual, from) ?? -1
+        if at < 0 { return -1 }
+        let mut i = at + qual.byte_len()
+        while i < text.byte_len() && text.byte_slice(i, i + 1) == " " { i = i + 1 }
+        if i < text.byte_len() && text.byte_slice(i, i + 1) == "." {
+            i = i + 1
+            while i < text.byte_len() && text.byte_slice(i, i + 1) == " " { i = i + 1 }
+            if i + name.byte_len() <= text.byte_len() && text.byte_slice(i, i + name.byte_len()) == name { return i + 1 }
+        }
+        from = at + 1
+    }
+    -1
 }
 
 // The note names the one other visible enum that declares a bare `name`. It is found only to
@@ -43346,6 +43634,7 @@ fn tc_flush_program_deferrals(program: Bool) ! TypeCheck.Resolve, TypeCheck.Repo
     tc_ud_flush_calls()
     tc_flush_impl_bound_calls()
     tc_ud_flush_fn_values()
+    tc_flush_method_reads()
     tc_refuse_deferred_conversions()
     tc_ud_flush_open_variants()
     tc_drop_open_calls()
