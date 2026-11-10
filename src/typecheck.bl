@@ -3068,27 +3068,46 @@ fn tc_infer_annotation_hint(tid0: Int) -> Str {
     if k == TyKind.Struct || k == TyKind.Enum {
         return ": {strip_module_qualifier(e.name)}[...]"
     }
-    // A function value's repair is the annotation that fixes its binders, so the hint keeps the
-    // arity the reference already settled and leaves a placeholder only where nothing is known.
-    if k == TyKind.Fn {
-        let mut ps = ""
-        let mut i = 0
-        while i < e.params_count {
-            if i > 0 { ps = "{ps}, " }
-            ps = "{ps}{tc_hint_slot_str(ty_param_list.get(e.params_start + i).unwrap())}"
-            i = i + 1
-        }
-        return ": fn({ps}) -> {tc_hint_slot_str(e.inner1)}"
-    }
+    if k == TyKind.Fn { return tc_fn_annotation_hint(tid, Map()) }
     ": T"
+}
+
+// A function value's repair is the annotation that fixes its binders, so the hint keeps the
+// arity the reference already settled and leaves a placeholder only where nothing is known.
+// A placeholder is the binder's own name where `named` gives one for its metavariable, so two
+// binders left open read as two: `fn(U, T) -> Bx[T]`, not `fn(T, T) -> Bx[T]`.
+fn tc_fn_annotation_hint(tid: Int, named: Map[Int, Str]) -> Str {
+    let e = ty_pool.get(tc_resolve(tid)).unwrap()
+    let mut ps: List[Str] = []
+    for i in 0..e.params_count { ps.push(tc_hint_slot_str(ty_param_list.get(e.params_start + i).unwrap(), named)) }
+    ": fn({ps.join(", ")}) -> {tc_hint_slot_str(e.inner1, named)}"
 }
 
 // One slot of an annotation hint: its own spelling when the slot is settled, a placeholder
 // when it is the thing nothing determined.
-fn tc_hint_slot_str(tid: Int) -> Str {
+fn tc_hint_slot_str(tid: Int, named: Map[Int, Str]) -> Str {
     if tc_tid_is_no_info(tid) != 0 { return "T" }
-    if tc_tid_has_unbound_metavar(tid) != 0 { return "T" }
-    type_to_str(tid)
+    if tc_tid_has_unbound_metavar(tid) == 0 { return type_to_str(tid) }
+    // A type whose arguments are open keeps its own name, so the hint says what to fill:
+    // `fn() -> Stack[T]`, not `fn() -> T`.
+    let t = tc_resolve(tid)
+    if t < 0 || t >= ty_pool.len() { return "T" }
+    match named.get(t) {
+        Some(name) => return name
+        None => {}
+    }
+    let e = ty_pool.get(t).unwrap()
+    if (e.kind == TyKind.Struct || e.kind == TyKind.Enum) && e.params_count > 0 {
+        let mut args: List[Str] = []
+        for i in 0..e.params_count { args.push(tc_hint_slot_str(ty_param_list.get(e.params_start + i).unwrap(), named)) }
+        return "{strip_module_qualifier(e.name)}[{args.join(", ")}]"
+    }
+    if e.kind == TyKind.List { return "List[{tc_hint_slot_str(e.inner1, named)}]" }
+    if e.kind == TyKind.Set { return "Set[{tc_hint_slot_str(e.inner1, named)}]" }
+    if e.kind == TyKind.Option { return "Option[{tc_hint_slot_str(e.inner1, named)}]" }
+    if e.kind == TyKind.Map { return "Map[{tc_hint_slot_str(e.inner1, named)}, {tc_hint_slot_str(e.inner2, named)}]" }
+    if e.kind == TyKind.Result { return "Result[{tc_hint_slot_str(e.inner1, named)}, {tc_hint_slot_str(e.inner2, named)}]" }
+    "T"
 }
 
 // The arguments after the receiver of a sealed ops trait's qualified call `StrOps.len(s)`,
@@ -3681,6 +3700,43 @@ fn tc_open_group_is_static_impl(g: Int) -> Bool {
     tc_calls.open_tids.get(g).unwrap() == -6
 }
 
+// The fields of a static impl group (tc_note_static_impl_call): one binder tid per impl binder.
+type StaticImplGroup {
+    im: Int
+    tids: List[Int]
+    call: Int
+    recv: Int
+}
+
+fn tc_static_impl_group(g: Int) -> StaticImplGroup {
+    let n = tc_calls.open_tids.get(g + 2).unwrap()
+    let mut tids: List[Int] = []
+    for pi in 0..n { tids.push(tc_calls.open_tids.get(g + 3 + pi).unwrap()) }
+    StaticImplGroup { im: tc_calls.open_tids.get(g + 1).unwrap(), tids: tids, call: tc_calls.open_tids.get(g + 3 + n).unwrap(), recv: tc_calls.open_tids.get(g + 4 + n).unwrap() }
+}
+
+// The static impl group of an associated function named as a value through a generic impl
+// (`Bx.wrap`), or -1. It is keyed by the value's head.
+fn tc_value_impl_group(val: Int) -> Int {
+    if val < 0 || node_kind(val) != NodeKind.FieldAccess { return -1 }
+    let head = node_obj(val)
+    if head < 0 { return -1 }
+    let g = tc_calls.open_group.get(head) ?? -1
+    if g < 0 || !tc_open_group_is_static_impl(g) || tc_static_impl_group(g).call != val { return -1 }
+    g
+}
+
+// Whether `val` is an associated function named as a value through a generic impl that left
+// an impl binder open.
+fn tc_type_path_value_impl_open(val: Int) -> Bool {
+    let g = tc_value_impl_group(val)
+    if g < 0 { return false }
+    for tid in tc_static_impl_group(g).tids {
+        if tid >= 0 && tc_tid_has_unbound_metavar(tid) != 0 { return true }
+    }
+    false
+}
+
 // The bounds of the impl a method call reached, on its binders and in its `where` clause, at
 // the binder types its receiver gives (§3.6 Trait Bounds; sections/05_memory_compile_errors.md,
 // "Checked at the call"), by the rule of a call: a type parameter of the body has only the
@@ -3834,17 +3890,22 @@ fn tc_impl_binds_by_name(im: Int, tids: List[Int]) -> Map[Str, Int] {
 // supplies. The impl's bounds at a binder that inference filled are judged with the other
 // calls through an impl (tc_flush_impl_bound_calls), with `Self` read as the head's instance.
 fn tc_ud_flush_static_impl_call(head: Int, g: Int) ! TypeCheck.Resolve, Diag.Report {
-    let im = tc_calls.open_tids.get(g + 1).unwrap()
+    let grp = tc_static_impl_group(g)
+    let im = grp.im
     let binders = node_impl_binders(im)
-    let n = tc_calls.open_tids.get(g + 2).unwrap()
-    let call_node = tc_calls.open_tids.get(g + 3 + n).unwrap()
-    let recv = tc_calls.open_tids.get(g + 4 + n).unwrap()
+    let call_node = grp.call
+    let recv = grp.recv
+    // A value names no call, so its binders are reported with its own at the reference.
+    if node_kind(call_node) == NodeKind.FieldAccess {
+        if tc_type_path_value_impl_open(call_node) { tc_report_value_unfixed(call_node) }
+        return
+    }
     let call_t = if tc_node_judged_as_value(call_node) { tc_lookup_node_tid(call_node) } else { -1 }
     let recv_t = if tc_node_judged_as_value(recv) { tc_lookup_node_tid(recv) } else { -1 }
     let mut names: List[Str] = []
     let mut tids: List[Int] = []
-    for pi in 0..n {
-        let tid = tc_calls.open_tids.get(g + 3 + pi).unwrap()
+    for pi in 0..grp.tids.len() {
+        let tid = grp.tids.get(pi).unwrap()
         if tid >= 0 && tc_tid_has_unbound_metavar(tid) != 0 && tc_ud_already_blamed(tid) == 0 {
             let r = tc_resolve(tid)
             if (call_t < 0 || tc_occurs_in(r, call_t) == 0) && (recv_t < 0 || tc_occurs_in(r, recv_t) == 0) {
@@ -3855,17 +3916,23 @@ fn tc_ud_flush_static_impl_call(head: Int, g: Int) ! TypeCheck.Resolve, Diag.Rep
     }
     if names.len() == 0 { return }
     tc_calls.reported.insert(head, 1)
-    let trait_args = tc_impl_trait_args(im)
-    let mut shown_args: List[Str] = []
-    for t in trait_args { shown_args.push(tc_type_str(t)) }
-    let args_str = if shown_args.len() == 0 { "" } else { "[{shown_args.join(", ")}]" }
-    let impl_head = "impl {tc_trait_shown(tc_impl_trait_id(im))}{args_str} for {tc_type_str(tc_impl_recv_tids.get(im) ?? -1)}"
-    let mut msg = "type parameter {tc_ticked_names(names)} of `{impl_head}` is unbound at this call and nothing supplies it"
-    if names.len() > 1 {
-        msg = "type parameters {tc_ticked_names(names)} of `{impl_head}` are unbound at this call and nothing supplies them"
-    }
+    let msg = tc_unbound_binders_msg(["{tc_ticked_names(names)} of `{tc_impl_head_shown(im)}`"], names.len(), "at this call")
     diag_error_at("CannotInferType", CANNOT_INFER_TYPE, msg, head, "call the function through a type alias that names the type's arguments, such as `type Named = {tc_type_str(tc_impl_recv_tids.get(im) ?? -1)}` with each parameter written")
     for t in tids { tc_ud_mark_blamed(t) }
+}
+
+// "type parameter `T` of `f` is unbound at this call and nothing supplies it", where each of
+// `owned` names some binders and what declares them, and `count` is how many binders in all.
+fn tc_unbound_binders_msg(owned: List[Str], count: Int, at: Str) -> Str {
+    if count > 1 { return "type parameters {owned.join(" and ")} are unbound {at} and nothing supplies them" }
+    "type parameter {owned.join(" and ")} is unbound {at} and nothing supplies it"
+}
+
+fn tc_impl_head_shown(im: Int) -> Str {
+    let mut shown_args: List[Str] = []
+    for t in tc_impl_trait_args(im) { shown_args.push(tc_type_str(t)) }
+    let args_str = if shown_args.len() == 0 { "" } else { "[{shown_args.join(", ")}]" }
+    "impl {tc_trait_shown(tc_impl_trait_id(im))}{args_str} for {tc_type_str(tc_impl_recv_tids.get(im) ?? -1)}"
 }
 
 // A conversion whose impl is chosen once inference is done (tc_defer_conversion). The flush
@@ -4375,7 +4442,7 @@ fn tc_ud_flush_fn_values() ! TypeCheck.Resolve, Diag.Report {
         if tc_fn_value_group(node) < 0 || tc_calls.reported.contains_key(node) { continue }
         let end_line = if node_end_line(node) > node_line(node) { node_end_line(node) } else { node_line(node) }
         if diag_errors_in_lines(diag_file_for_node(node), node_line(node), end_line) > 0 { continue }
-        tc_report_fn_value_unfixed(node)
+        tc_report_value_unfixed(node)
         if !tc_calls.reported.contains_key(node) { tc_check_fn_value_bounds(node) }
     }
 }
@@ -4545,40 +4612,79 @@ fn tc_impl_bound_note(im: Int, carrier: Int, shown: Str) -> Str {
     "{tc_bound_writer(im)} declares `{p}: {written.join(" + ")}` at {diag_file_for_node(carrier)}:{line}"
 }
 
-fn tc_report_fn_value_unfixed(node: Int) ! Diag.Report {
-    let g = tc_fn_value_group(node)
-    let fs = fnsig_pool.get(tc_calls.open_tids.get(g + 1).unwrap()).unwrap()
-    let val_tid = tc_calls.open_tids.get(g + 2).unwrap()
-    let mut names: List[Str] = []
+// A function named as a value whose binders nothing fixed, reported once at the reference,
+// where the annotation that fixes them attaches (§3.4 "A generic function named as a value",
+// "A type-scoped or associated function named as a value"): the function's own binders and,
+// for an associated function of a generic impl, the impl's, in one report.
+fn tc_report_value_unfixed(node: Int) ! Diag.Report {
+    if tc_calls.reported.contains_key(node) { return }
+    let callee = tc_written_callee(node)
+    let mut owned: List[Str] = []
     let mut tids: List[Int] = []
-    let mut pi = 0
-    while pi < fs.type_params_count {
-        let tid = tc_calls.open_tids.get(g + 4 + pi).unwrap()
-        if tc_tid_has_unbound_metavar(tid) != 0 && tc_ud_already_blamed(tid) == 0 {
-            names.push(fnsig_type_param_names.get(fs.type_params_start + pi).unwrap())
-            tids.push(tid)
+    let mut named: Map[Int, Str] = Map()
+    let mut val_tid = tc_lookup_node_tid(node)
+    let g = tc_fn_value_group(node)
+    if g >= 0 {
+        let fs = fnsig_pool.get(tc_calls.open_tids.get(g + 1).unwrap()).unwrap()
+        val_tid = tc_calls.open_tids.get(g + 2).unwrap()
+        let mut names: List[Str] = []
+        for pi in 0..fs.type_params_count {
+            let tid = tc_calls.open_tids.get(g + 4 + pi).unwrap()
+            if tc_tid_has_unbound_metavar(tid) != 0 && tc_ud_already_blamed(tid) == 0 {
+                let name = fnsig_type_param_names.get(fs.type_params_start + pi).unwrap()
+                names.push(name)
+                tids.push(tid)
+                named.insert(tc_resolve(tid), name)
+            }
         }
-        pi = pi + 1
+        if names.len() > 0 { owned.push("{tc_ticked_names(names)} of `{callee}`") }
     }
-    if names.len() == 0 { return }
+    let own_open = owned.len() > 0
+    let ig = tc_value_impl_group(node)
+    if ig >= 0 {
+        let grp = tc_static_impl_group(ig)
+        let binders = node_impl_binders(grp.im)
+        let mut names: List[Str] = []
+        for pi in 0..grp.tids.len() {
+            let tid = grp.tids.get(pi).unwrap()
+            if tid >= 0 && tc_tid_has_unbound_metavar(tid) != 0 && tc_ud_already_blamed(tid) == 0 {
+                let name = node_name(sublist_get(binders, pi))
+                names.push(name)
+                tids.push(tid)
+                named.insert(tc_resolve(tid), name)
+            }
+        }
+        if names.len() > 0 { owned.push("{tc_ticked_names(names)} of `{tc_impl_head_shown(grp.im)}`") }
+    }
+    if tids.len() == 0 { return }
     tc_calls.reported.insert(node, 1)
-    let callee = node_name(fs.decl)
-    let mut msg = "type parameter {tc_ticked_names(names)} of `{callee}` is unbound at this reference and nothing supplies it"
-    if names.len() > 1 {
-        msg = "type parameters {tc_ticked_names(names)} of `{callee}` are unbound at this reference and nothing supplies them"
-    }
+    if ig >= 0 { tc_calls.reported.insert(node_obj(node), 1) }
+    // An impl's binders alone keep the callee in the message, since the impl head does not name it.
+    let at = if own_open { "at this reference" } else { "at this reference to `{callee}`" }
+    let msg = tc_unbound_binders_msg(owned, tids.len(), at)
     let val_roots = tc_ud_metavar_roots(val_tid)
     let mut mentioned = true
     for t in tids {
         if !tc_ud_shares_root(val_roots, t) { mentioned = false }
     }
     let help = if mentioned {
-        "annotate the binding with its function type, as in `let f{tc_infer_annotation_hint(val_tid)} = {callee}` (replace each placeholder with the intended type)"
+        let hint = if type_kind(tc_resolve(val_tid)) == TyKind.Fn { tc_fn_annotation_hint(val_tid, named) } else { tc_infer_annotation_hint(val_tid) }
+        "annotate the binding with its function type, as in `let f{hint} = {callee}` (replace each placeholder with the intended type)"
     } else {
         "the function type does not mention this type parameter, so no annotation can fix it; call the function in a closure and write the type arguments at that call"
     }
     diag_error_at("CannotInferType", CANNOT_INFER_TYPE, msg, node, help)
     for t in tids { tc_ud_mark_blamed(t) }
+}
+
+// How a function value is written at its reference: `f`, or `Stack.empty` for a type path.
+fn tc_written_callee(node: Int) -> Str {
+    if node_kind(node) == NodeKind.Ident { return node_name(node) }
+    if node_kind(node) == NodeKind.FieldAccess {
+        let obj = node_obj(node)
+        if obj != -1 && node_kind(obj) == NodeKind.Ident { return "{node_name(obj)}.{node_name(node)}" }
+    }
+    "f"
 }
 
 // The recorded calls once every flush has read them.
@@ -4606,8 +4712,8 @@ fn tc_report_under_determined(vname: Str, tid: Int, decl_node: Int) ! Diag.Repor
     // keeps its resource EXPRESSION in the same slot, and calling that "the empty
     // construction" would be a false claim about the user's code.
     let val = if dk == NodeKind.LetBinding { node_value(decl_node) } else { -1 }
-    if val != -1 && tc_fn_value_group(val) >= 0 {
-        tc_report_fn_value_unfixed(val)
+    if val != -1 && (tc_fn_value_group(val) >= 0 || tc_type_path_value_impl_open(val)) {
+        tc_report_value_unfixed(val)
         return
     }
     let (source, slot) = tc_ud_open_slot(tid, val)
@@ -6039,29 +6145,59 @@ fn unify_typevar_binds(ptid: Int, atid: Int, binds: Map[Str, Int]) {
 }
 
 // The type of a function named as a value, bare or qualified.
-fn tc_fn_value_type(node: Int, fn_sig: Int) -> Int {
+fn tc_fn_value_type(node: Int, fn_sig: Int) -> Int ! Diag.Report {
+    tc_fn_value_type_at(node, fn_sig, -1, "")
+}
+
+// The value of `fn_sig` named through a head whose type is `head_type` (-1 for none). What the
+// function builds as the head's type holds to the head's arguments, as the call's result does,
+// and that is fixed before the expected type is read, so a wrong expectation is the binding's
+// mismatch and not the function's.
+fn tc_fn_value_type_at(node: Int, fn_sig: Int, head_type: Int, head_help: Str) -> Int ! Diag.Report {
     let fs = fnsig_pool.get(fn_sig).unwrap()
     // A function its module declares twice (E1016) may have meant either signature.
     if tc_value_decl_poisoned(fs.decl) { return tc_error_recovery_tid() }
-    let mut fn_param_types: List[Int] = []
-    let mut fpi = 0
-    while fpi < fs.params_count {
-        fn_param_types.push(fnsig_param_list.get(fs.params_start + fpi).unwrap())
-        fpi = fpi + 1
-    }
-    let decl_tid = make_fn_type(fs.ret, fn_param_types)
-    if fs.type_params_count == 0 { return decl_tid }
+    // Naming a deprecated function uses it as a call does.
+    check_deprecated_fn(tc_written_callee(node), fs.decl, node)
+    let decl_tid = tc_sig_fn_tid(fn_sig)
+    if fs.type_params_count == 0 { return tc_fn_value_holds_head(node, decl_tid, head_type, head_help) }
     // A generic function's NAME is a value, and its binders are open at the reference:
     // `apply(identity, 3)` and `let f = identity` name the same value, and what fixes T
     // is the type expected where the name stands. Each binder becomes a metavar so the
     // expectation can solve it, because a bare typevar is invisible to every part of the
     // solving machinery and would reach codegen unsolved with nothing reported.
-    let val_tid = tc_generic_fn_value_tid(node, fn_sig, decl_tid)
+    let val_tid = tc_fn_value_holds_head(node, tc_generic_fn_value_tid(node, fn_sig, decl_tid), head_type, head_help)
+    if val_tid == tc_error_recovery_tid() { return val_tid }
     if tc_construct_hint >= 0 {
         let want = resolve_alias_tid(tc_construct_hint)
         if type_kind(want) == TyKind.Fn { tc_unify(val_tid, want) }
     }
     val_tid
+}
+
+fn tc_fn_value_holds_head(node: Int, val_tid: Int, head_type: Int, head_help: Str) -> Int ! Diag.Report {
+    if head_type == -1 { return val_tid }
+    let f = resolve_alias_tid(tc_resolve(val_tid))
+    if type_kind(f) != TyKind.Fn { return val_tid }
+    let ret = tc_tid_child(f, 0)
+    if tc_tid_decl_node(ret) < 0 || tc_tid_decl_node(ret) != tc_tid_decl_node(head_type) { return val_tid }
+    // Asked before the unify, which takes the function's own binders as open.
+    if types_compatible(ret, head_type) == 0 || tc_unify(ret, head_type) == 0 {
+        diag_error_at("TypeError", TYPE_ERROR, "`{tc_written_callee(node)}` builds `{type_to_str(head_type)}`, but it returns `{type_to_str(ret)}`", node, head_help)
+        return tc_error_recovery_tid()
+    }
+    val_tid
+}
+
+// The declared type of a signature as a function type, `fn(P1, ..., Pn) -> R`.
+fn tc_sig_fn_tid(sig: Int) -> Int {
+    tc_fs_fn_tid(fnsig_pool.get(sig).unwrap())
+}
+
+fn tc_fs_fn_tid(fs: FnSigEntry) -> Int {
+    let mut fn_param_types: List[Int] = []
+    for i in 0..fs.params_count { fn_param_types.push(fnsig_param_list.get(fs.params_start + i).unwrap()) }
+    make_fn_type(fs.ret, fn_param_types)
 }
 
 // Build a typevar-name → concrete-tid map from the call's args by structurally
@@ -11129,7 +11265,7 @@ fn tc_error_at_code(msg: Str, node_id: Int, name: Str, code: Str, help: Str) ! T
 // §4.4.9, "Migration").
 fn tc_value_mismatch_at(msg: Str, at: Int, val: Int, want: Int, got: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     if tc_report_bool_int_value(msg, val, want, got) { return }
-    if !tc_read_line_used_as_str(val, want) { return tc_mismatch_at_help(msg, at, tc_accept_timeout_help(val, want, got), want, got) }
+    if !tc_read_line_used_as_str(val, want) { return tc_mismatch_at_help(msg, at, tc_value_help(val, want, got), want, got) }
     tc_errors.push(msg)
     diag_error_at_notes("TypeError", TYPE_ERROR, msg, at, tc_read_line_match_help(), [tc_read_line_note()])
 }
@@ -11210,7 +11346,13 @@ fn tc_arg_mismatch(callee: Str, pos: Int, node: Int, want: Int, got: Int) ! Type
         tc_errors.push("mismatched types")
         return diag_error_at_notes("TypeError", TYPE_ERROR, "mismatched types", node, "", ["expected `{want_s}`, found `{got_s}`"])
     }
-    tc_type_error_naming(msg, node, tc_accept_timeout_help(node, want, got), [want, got])
+    tc_type_error_naming(msg, node, tc_value_help(node, want, got), [want, got])
+}
+
+// The help a value given where another type is expected gets from what the value is.
+fn tc_value_help(val: Int, want: Int, got: Int) -> Str {
+    let accept_help = tc_accept_timeout_help(val, want, got)
+    if accept_help != "" { accept_help } else { tc_fn_value_call_help(val, want, got) }
 }
 
 fn tc_read_line_used_as_str(val: Int, want: Int) -> Bool ! TypeCheck.Resolve {
@@ -11265,9 +11407,21 @@ fn tc_report_declared_mismatch(msg: Str, at: Int, val: Int, declared: Int, got: 
     if tc_report_bool_int_value(msg, val, declared, got) { return }
     let recv_help = tc_recv_option_help(val, declared, got)
     if recv_help == "" && tc_read_line_used_as_str(val, declared) { return tc_value_mismatch_at(msg, at, val, declared, got) }
-    let accept_help = tc_accept_timeout_help(val, declared, got)
-    let help = if recv_help != "" { recv_help } else if accept_help != "" { accept_help } else { tc_hidden_variant_help(val, declared) }
+    let value_help = tc_value_help(val, declared, got)
+    let help = if recv_help != "" { recv_help } else if value_help != "" { value_help } else { tc_hidden_variant_help(val, declared) }
     tc_type_error_naming(msg, at, help, [declared, got])
+}
+
+// A function named as a value where its result is expected (`let s: Stack[Int] = Stack.empty`):
+// the name and the call are different terms (§3.4 "The call and the value"), and a call with
+// no arguments is the one the program meant.
+fn tc_fn_value_call_help(val0: Int, declared: Int, got: Int) -> Str {
+    let val = if val0 >= 0 && node_kind(val0) == NodeKind.Return { node_value(val0) } else { val0 }
+    if val < 0 || tc_fn_value_decl_node(val) < 0 { return "" }
+    let g = resolve_alias_tid(tc_resolve(got))
+    if type_kind(g) != TyKind.Fn || tc_tid_child_count(g) != 1 { return "" }
+    if types_compatible(declared, tc_tid_child(g, 0)) == 0 { return "" }
+    "call it: `{tc_written_callee(val)}()`"
 }
 
 const NO_TRUTHINESS_NOTE = "Blink has no truthiness"
@@ -25759,17 +25913,9 @@ fn tc_bound_instance_ambiguity(node: Int, call: Str, tp: Str, trait_key: Str, me
 }
 
 fn tc_report_instance_ambiguity(node: Int, call: Str, owner: Str, held: Str, trait_key: Str, method: Str, insts: List[Str]) -> Int ! Diag.Report {
-    let mut params: List[Str] = []
-    let decl = tc_trait_method_decl(trait_key, method)
-    let psl = if decl >= 0 { node_params(decl) } else { -1 }
-    let mut i = 0
-    while psl != -1 && i < sublist_length(psl) {
-        let pn = node_name(sublist_get(psl, i))
-        params.push(if pn == "self" { "receiver" } else { pn })
-        i = i + 1
-    }
-    let mut lines: List[Str] = []
-    for inst in insts { lines.push("`({inst} for {owner}).{method}({params.join(", ")})`") }
+    let mut keys: List[Str] = []
+    for _ in insts { keys.push(trait_key) }
+    let lines = tc_impl_qualified_calls(keys, insts, owner, method, false)
     diag_error_at("AmbiguousMethodCall", AMBIGUOUS_METHOD_CALL, "ambiguous method call: `{call}` is defined in more than one instance of `{tc_trait_shown(trait_key)}` {held} ({insts.join(" and ")})", node, "use an impl-qualified call to choose one: {lines.join(" or ")}")
     tc_error_recovery_tid()
 }
@@ -26541,6 +26687,158 @@ fn tc_path_fn_sig(head: StaticHead, name: Str) -> Int {
     if own != -1 { return own }
     if tc_method_trait_count(head.owner, name) != 1 { return -1 }
     lookup_fnsig(tc_impl_method_stem(head.owner, tc_method_trait_names(head.owner, name), name))
+}
+
+// `qual.name` with no argument list, where `name` is a function in the `qual.` namespace
+// (§3.4 "A type-scoped or associated function named as a value"): its type is the
+// declaration's, with `Self` read as the head type. None leaves the read to the arms below
+// it: a variant, a module qualifier, a type parameter head, or a method that takes `self`.
+fn tc_type_path_fn_value(node: Int, obj_node: Int, qual: Str, name: Str) -> Option[Int] ! TypeCheck.Resolve, Diag.Report {
+    if name.byte_len() == 0 || tc_name_is_upper(name) { return None }
+    if tc_name_is_tparam_in_scope(qual) != 0 || tc_head_names_trait(qual) || tc_type_name_poisoned(qual) { return None }
+    if is_import_module_name(qual) != 0 || is_builtin_namespace(qual) != 0 || tc_site_qualifier_module(qual, node) != "" { return None }
+    if qual != "Self" && !tc_names_a_type(qual) { return None }
+    let head = tc_static_head(qual)
+    // A trait's default body does not know what `Self` is.
+    if qual == "Self" && head.owner == "Self" { return None }
+    let own = tc_static_head_sig(head, name)
+    if own != -1 { return tc_type_path_own_value(node, head, own) }
+    let head_type = tc_static_head_type(head)
+    let owners = tc_path_name_owners(head.owner, name, if head_type != -1 { head_type } else { lookup_named_type(head.owner) })
+    if owners.keys.len() == 0 { return None }
+    for key in owners.keys {
+        let decl = tc_trait_method_decl(key, name)
+        if decl >= 0 && tc_fn_decl_takes_self(decl) { return None }
+    }
+    if owners.keys.len() >= 2 || owners.ims.len() >= 2 {
+        return Some(tc_report_ambiguous_static(node, "{qual}.{name}", qual, name, owners, true))
+    }
+    tc_type_path_impl_value(node, obj_node, head, head_type, qual, name, owners)
+}
+
+// A type-scoped function, or the target's own function under an alias: the function's own
+// binders are open for the expected type to solve, as a generic function's name is. What the
+// function builds as the alias's target holds to the alias's arguments, as at a call.
+fn tc_type_path_own_value(node: Int, head: StaticHead, own: Int) -> Option[Int] ! TypeCheck.Resolve, Diag.Report {
+    let decl = fnsig_pool.get(own).unwrap().decl
+    if tc_fn_decl_takes_self(decl) { return None }
+    if head.decl >= 0 && decl >= 0 && node_is_pub(decl) == 0 && !tc_same_module(node_module(decl), nr_current_module) {
+        diag_error_at("PrivateItemAccess", PRIVATE_ITEM_ACCESS, "cannot access private function `{node_name(decl)}` from another module", node, "mark the function as `pub` in its module")
+        return Some(tc_error_recovery_tid())
+    }
+    nr_note_fn_value_decl(node, decl)
+    let help = if head.inst != -1 { "name a function that builds the type `Self` names in this impl" } else { "name the function through the type it returns, or change the alias to match it" }
+    Some(tc_fn_value_type_at(node, own, tc_static_head_type(head), help))
+}
+
+// An associated function that one impl gives the type: its own binders are open, as a generic
+// function's name is; the impl's binders are the head's arguments, which the expected type fills
+// too, and the impl's bounds are judged at them by the rule of a static call through the impl.
+fn tc_type_path_impl_value(node: Int, obj_node: Int, head: StaticHead, head_type: Int, qual: Str, name: Str, owners: PathNameOwners) -> Option[Int] ! TypeCheck.Resolve, Diag.Report {
+    let trait_key = owners.keys.get(0).unwrap()
+    trace.log("blink.tc.pathvalue", "`{qual}.{name}`: owner {head.owner}, trait `{trait_key}`")
+    // A conversion impl keys its signature by the impl, since one target has several.
+    let sig = if !tc_is_conversion_trait(trait_key) { lookup_fnsig(tc_impl_method_stem(head.owner, trait_key, name)) } else if owners.ims.len() == 1 { tc_conversion_method_sig(owners.ims.get(0).unwrap(), name) } else { -1 }
+    if sig == -1 { return None }
+    let decl = fnsig_pool.get(sig).unwrap().decl
+    if tc_fn_decl_takes_self(decl) { return None }
+    let self_tid = tc_static_head_instance(head_type, qual, node)
+    if self_tid < 0 { return None }
+    nr_note_fn_value_decl(node, decl)
+    check_deprecated_fn("{qual}.{name}", decl, node)
+    let binds = tc_static_impl_binds(sig, self_tid, node)
+    let im = tc_method_block.get(decl) ?? -1
+    if im != -1 { tc_note_static_impl_call(obj_node, im, node, -1, binds) }
+    let decl_tid = substitute_typevar_tid(tc_sig_fn_tid(sig), binds)
+    let val_tid = if tc_decl_has_own_type_params(decl) != 0 { tc_generic_fn_value_tid(node, sig, decl_tid) } else { decl_tid }
+    if tc_construct_hint >= 0 {
+        let want = resolve_alias_tid(tc_construct_hint)
+        if type_kind(want) == TyKind.Fn { let _ = tc_unify(val_tid, want) }
+    }
+    tc_check_static_impl_bounds(im, self_tid, node)
+    Some(val_tid)
+}
+
+// The owners of an associated function `name` that the type `owner` (the type `on`) is given
+// by impls: the traits that declare it, and, for one trait, its impls on `on`. Two traits, or
+// two impls of one trait, give the name no one declaration (§3c.4). A call and a value read
+// the name by this one rule.
+type PathNameOwners {
+    keys: List[Str]
+    ims: List[Int]
+}
+
+fn tc_path_name_owners(owner: Str, name: Str, on: Int) -> PathNameOwners {
+    let distinct = tc_method_distinct_trait_count(owner, name)
+    if distinct == 0 { return PathNameOwners { keys: [], ims: [] } }
+    let names = tc_method_distinct_trait_names(owner, name)
+    if distinct >= 2 { return PathNameOwners { keys: names.split(" and "), ims: [] } }
+    // Only a trait with two impls on the type, or a conversion, which keys each impl apart,
+    // asks which impls they are.
+    let asks = on != -1 && (tc_method_trait_count(owner, name) >= 2 || tc_is_conversion_trait(names))
+    PathNameOwners { keys: [names], ims: if asks { tc_impls_of_trait_on(names, on, []) } else { [] } }
+}
+
+// §3c.4: two impls give `qual` the associated function `name`, so `call` names no one function.
+// The help gives the impl-qualified call of each owner; `(Trait for T).name` with no call is no
+// value, so for a function value it gives a closure that makes that call.
+fn tc_report_ambiguous_static(node: Int, call: Str, qual: Str, name: Str, owners: PathNameOwners, as_value: Bool) -> Int ! Diag.Report {
+    let mut keys: List[Str] = []
+    let mut insts: List[Str] = []
+    if owners.keys.len() >= 2 {
+        for k in owners.keys {
+            keys.push(k)
+            insts.push(tc_trait_shown(k))
+        }
+    } else {
+        let key = owners.keys.get(0).unwrap()
+        for im in owners.ims {
+            keys.push(key)
+            insts.push(tc_trait_instance_shown(key, tc_impl_trait_args(im)))
+        }
+    }
+    let lines = tc_impl_qualified_calls(keys, insts, qual, name, as_value)
+    if !as_value {
+        if owners.keys.len() >= 2 {
+            diag_error_at("AmbiguousMethodCall", AMBIGUOUS_METHOD_CALL, "ambiguous static call: `{call}` is declared by multiple traits implemented by {qual} ({tc_traits_shown(owners.keys.join(" and "))})", node, "use an impl-qualified call to choose one: {lines.join(" or ")}")
+            return tc_error_recovery_tid()
+        }
+        return tc_report_instance_ambiguity(node, call, qual, "for {qual}", keys.get(0).unwrap(), name, insts)
+    }
+    let mut shown: List[Str] = []
+    for inst in insts { shown.push("`{inst}`") }
+    diag_error_at("AmbiguousMethodCall", AMBIGUOUS_METHOD_CALL, "ambiguous function value: `{name}` is in {shown.join(" and ")} for `{qual}`", node, "write a closure that names one impl: {lines.join(" or ")}")
+    // A function of the first owner's arity, over the recovery type, so a call that takes
+    // the value reads nothing open from it and reports nothing more.
+    let decl = tc_trait_method_decl(keys.get(0).unwrap(), name)
+    let psl = if decl >= 0 { node_params(decl) } else { -1 }
+    let mut rec_params: List[Int] = []
+    if psl != -1 {
+        for _ in 0..sublist_length(psl) { rec_params.push(tc_error_recovery_tid()) }
+    }
+    make_fn_type(tc_error_recovery_tid(), rec_params)
+}
+
+// The impl-qualified call `(Inst for owner).method(params)` of each instance, whose trait is
+// the key at the same index, with `self` written as `receiver`; as a closure that makes the
+// call when `closure`.
+fn tc_impl_qualified_calls(keys: List[Str], insts: List[Str], owner: Str, method: Str, closure: Bool) -> List[Str] {
+    let mut lines: List[Str] = []
+    for i in 0..keys.len() {
+        let decl = tc_trait_method_decl(keys.get(i).unwrap(), method)
+        let psl = if decl >= 0 { node_params(decl) } else { -1 }
+        let mut params: List[Str] = []
+        if psl != -1 {
+            for p in 0..sublist_length(psl) {
+                let pn = node_name(sublist_get(psl, p))
+                params.push(if pn == "self" { "receiver" } else { pn })
+            }
+        }
+        let ps = params.join(", ")
+        let qcall = "({insts.get(i).unwrap()} for {owner}).{method}({ps})"
+        lines.push(if closure { "`fn({ps}) \{ {qcall} \}`" } else { "`{qcall}`" })
+    }
+    lines
 }
 
 // Whether a read `qual.name` (§3.4 *Member case*) names no member of the type `qual`: `name`
@@ -28372,7 +28670,7 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
         if tc_index_is_type_application(node) != 0 {
             let ty_name = node_name(node_index(node))
             let obj = node_obj(node)
-            let fn_text = if node_kind(obj) == NodeKind.Ident { node_name(obj) } else { "f" }
+            let fn_text = tc_written_callee(obj)
             tc_bracket_sites.insert(node, BRACKET_TYPE_ARGS)
             tc_errors.push("type arguments with no call")
             diag_error_at("TypeArgsWithoutCall", TYPE_ARGS_WITHOUT_CALL, "type argument `[{ty_name}]` has no call to apply to", node, "type arguments belong to a call, as in `{fn_text}[{ty_name}]()`; to keep the function as a value, annotate the binding with its function type")
@@ -34714,28 +35012,13 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
             // (sections/03c_protocols.md:758): `pub fn Duration_seconds(s: Int)`
             // (lib/std/time.bl:3) IS `Duration.seconds(2)`.
             if obj_is_value == 0 {
-                // §3c rule-3 ambiguity at the static rung. Two different traits declare this
-                // associated function for this type, so the call names no one declaration. The
-                // rung just below is gated on exactly one owner, and a trait method keeps no
-                // bare `{Type}_{method}` signature, so without this the call resolved to
-                // nothing and was accepted anyway.
-                //
-                // The help cannot offer the qualified call §3c:671 documents for the ambiguous
-                // INSTANCE call: `Trait.method(receiver)` names the trait by passing the
-                // receiver as the first argument, and an associated function has no receiver to
-                // pass. So the fixes it can offer are both in the declarations.
-                if tc_method_distinct_trait_count(obj_name, method) >= 2 {
-                    let amb_traits = tc_traits_shown(tc_method_distinct_trait_names(obj_name, method))
-                    diag_error_at("AmbiguousMethodCall", AMBIGUOUS_METHOD_CALL, "ambiguous static call: `{obj_name}.{method}` is declared by multiple traits implemented by {obj_name} ({amb_traits})", node, "rename one of the methods, or drop one of the impls: a qualified call names the trait by passing the receiver first, and an associated function has no receiver to pass")
-                    return tc_error_recovery_tid()
-                }
-                if tc_method_trait_count(obj_name, method) >= 2 && tc_method_distinct_trait_count(obj_name, method) == 1 {
-                    let st_key = tc_method_distinct_trait_names(obj_name, method)
-                    let st_tid = if head_type != -1 { head_type } else { lookup_named_type(obj_name) }
-                    if !tc_is_conversion_trait(st_key) && st_tid != -1 {
-                        let st_ims = tc_impls_of_trait_on(st_key, st_tid, [])
-                        if st_ims.len() >= 2 { return tc_instance_ambiguity(node, "{obj_name}.{method}", obj_name, st_key, method, st_ims) }
-                    }
+                // §3c.4 at the static rung: two traits declare this associated function for
+                // this type, or two impls of one trait give it, so the call names no one
+                // declaration. A conversion's argument picks its impl. A function value reads
+                // the name by the same rule (tc_type_path_fn_value).
+                let st_owners = tc_path_name_owners(obj_name, method, if head_type != -1 { head_type } else { lookup_named_type(obj_name) })
+                if st_owners.keys.len() >= 2 || (st_owners.ims.len() >= 2 && !tc_is_conversion_trait(st_owners.keys.get(0).unwrap())) {
+                    return tc_report_ambiguous_static(node, "{obj_name}.{method}", obj_name, method, st_owners, false)
                 }
                 let static_trait = tc_method_trait_names(obj_name, method)
                 if static_trait != "" && tc_method_trait_count(obj_name, method) == 1 {
@@ -34867,6 +35150,10 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                 if tc_type_path_member_unknown(obj_name, fname, node) {
                     tc_report_unknown_member(node, obj_name, tc_static_head(obj_name), fname, 0)
                     return tc_error_recovery_tid()
+                }
+                match tc_type_path_fn_value(node, obj_node, obj_name, fname) {
+                    Some(t) => return t
+                    None => {}
                 }
             }
             let tid = if head_is_type { tc_value_head_tid(obj_name) } else { -1 }
@@ -44781,13 +45068,7 @@ fn tc_er_fn_value_binds(value: Int, fs: FnSigEntry) -> Map[Str, Int] {
     let arg = if node_kind(value) == NodeKind.NamedArg { node_value(value) } else { value }
     let got = resolve_alias_tid(tc_resolve(tc_lookup_node_tid(arg)))
     if got < 0 || tc_tid_kind(got) != TyKind.Fn { return binds }
-    let mut params: List[Int] = []
-    let mut i = 0
-    while i < fs.params_count {
-        params.push(fnsig_param_list.get(fs.params_start + i).unwrap())
-        i = i + 1
-    }
-    unify_typevar_binds(make_fn_type(fs.ret, params), got, binds)
+    unify_typevar_binds(tc_fs_fn_tid(fs), got, binds)
     binds
 }
 

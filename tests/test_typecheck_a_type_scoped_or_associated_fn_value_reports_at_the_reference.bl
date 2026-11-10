@@ -1,0 +1,306 @@
+// `T.name` with no argument list names a function value (sections/03_types.md §3.4 "A
+// type-scoped or associated function named as a value"). Each refused form is one report at
+// the reference: a binder that nothing fixes is E0301 with a note that names the reference and
+// the binder and a help that shows an annotation; type arguments with no call are E0314; a
+// value where its result was meant is E0300 with the help that calls it; a name that two impls
+// give is E0522 with one closure per owner; and through a generic impl the value holds the
+// impl's bounds, E0306 at the reference. A bound on the binder, in an impl's where clause or
+// through a supertrait meets them. A trace message that calls such a value through a write is
+// E0566.
+
+import std.fs
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_reset}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+
+fn probe(path: Str, src: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    init_embedded_stdlib()
+    fs.write(path, src).unwrap()
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+    program
+}
+
+// Each error as "code line:col-end | message | help | notes", in report order.
+fn errors_reported() -> List[Str] {
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" {
+            out.push("{d.code} {d.line}:{d.col}-{d.end_col} | {d.message} | {d.help} | {d.notes.join("; ")}")
+        }
+    }
+    out
+}
+
+// Each warning in the same form.
+fn warnings_reported() -> List[Str] {
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "warning" { out.push("{d.code} {d.line}:{d.col}-{d.end_col} | {d.message} | {d.help} | {d.notes.join("; ")}") }
+    }
+    out
+}
+
+fn warnings_for(name: Str, body: Str) -> List[Str] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    let _ = errors_for(name, body)
+    warnings_reported()
+}
+
+// The program shares one prelude, so the body under test starts on line 24.
+fn errors_for(name: Str, body: Str) -> List[Str] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    let src = [
+        "import std.time.\{Duration}",
+        "type Stack[T] \{ items: List[T] }",
+        "fn Stack_empty[T]() -> Stack[T] \{ Stack \{ items: [] } }",
+        "fn Stack_one[T](x: T) -> Stack[T] \{ Stack \{ items: [x] } }",
+        "trait Alpha \{ fn make(n: Int) -> Self }",
+        "trait Beta \{ fn make(k: Int) -> Self }",
+        "type Widget \{ v: Int }",
+        "impl Alpha for Widget \{ fn make(n: Int) -> Widget \{ Widget \{ v: n } } }",
+        "impl Beta for Widget \{ fn make(k: Int) -> Widget \{ Widget \{ v: k } } }",
+        "trait Wrap[A] \{ fn wrap(a: A) -> Self }",
+        "type Bx[T] \{ v: List[T] }",
+        "impl[T: Eq] Wrap[T] for Bx[T] \{ fn wrap(a: T) -> Bx[T] \{ Bx \{ v: [a] } } }",
+        "type Cx[T] \{ v: T }",
+        "impl[T] Wrap[T] for Cx[T] where T: Eq \{ fn wrap(a: T) -> Cx[T] \{ Cx \{ v: a } } }",
+        "trait Loud: Eq \{ fn loud(self) -> Int }",
+        "trait Conv[A] \{ fn conv(a: A) -> Self }",
+        "type Two \{ n: Int }",
+        "impl Conv[Int] for Two \{ fn conv(a: Int) -> Two \{ Two \{ n: a } } }",
+        "impl Conv[Str] for Two \{ fn conv(a: Str) -> Two \{ Two \{ n: 0 } } }",
+        "type NoEq \{ n: Int }",
+        "trait Mk \{ fn mk(n: Int) -> Self }",
+        "type W \{ v: Int }",
+        "impl Mk for W \{ fn mk(n: Int) -> W \{ W \{ v: n } } }",
+        body,
+        "fn main() \{ }",
+        "",
+    ].join("\n")
+    let _ = probe("build/tc_type_path_fn_value_{name}.bl", src)
+    errors_reported()
+}
+
+// Refused.
+
+test "a binder of a function on a generic type that nothing fixes is E0301 at the reference" {
+    assert_eq(errors_for("unfixed", "fn f() \{ let _e = Stack.empty }"), [
+        "E0301 24:19-0 | type parameter `T` of `Stack.empty` is unbound at this reference and nothing supplies it | annotate the binding with its function type, as in `let f: fn() -> Stack[T] = Stack.empty` (replace each placeholder with the intended type) | ",
+    ])
+}
+
+test "a binder of a generic impl that nothing fixes is E0301 at the reference" {
+    assert_eq(errors_for("impl_unfixed", "fn f() \{ let _g = Bx.wrap }"), [
+        "E0301 24:19-0 | type parameter `T` of `impl Wrap[T] for Bx[T]` is unbound at this reference to `Bx.wrap` and nothing supplies it | annotate the binding with its function type, as in `let f: fn(T) -> Bx[T] = Bx.wrap` (replace each placeholder with the intended type) | ",
+    ])
+}
+
+test "type arguments on a function value with no call are E0314" {
+    assert_eq(errors_for("targs", "fn f() \{ let _e = Stack.empty[Int] }"), [
+        "E0314 24:19-0 | type argument `[Int]` has no call to apply to | type arguments belong to a call, as in `Stack.empty[Int]()`; to keep the function as a value, annotate the binding with its function type | ",
+    ])
+}
+
+test "a function value where its result is declared is E0300 with the help that calls it" {
+    assert_eq(errors_for("call_it", "fn f() \{ let _s: Stack[Int] = Stack.empty }"), [
+        "E0300 24:10-0 | variable `_s`: declared type Stack[Int] but got Fn() -> Stack[?] | call it: `Stack.empty()` | ",
+    ])
+}
+
+test "an associated function that two traits give the type is E0522 with a closure per owner" {
+    assert_eq(errors_for("two_traits", "fn f() \{ let _ws = [1].map(Widget.make) }"), [
+        "E0522 24:28-0 | ambiguous function value: `make` is in `Alpha` and `Beta` for `Widget` | write a closure that names one impl: `fn(n) \{ (Alpha for Widget).make(n) }` or `fn(k) \{ (Beta for Widget).make(k) }` | ",
+    ])
+}
+
+test "an associated function that two impls of one trait give the type is E0522" {
+    assert_eq(errors_for("two_impls", "fn f() \{ let _c = Two.conv }"), [
+        "E0522 24:19-0 | ambiguous function value: `conv` is in `Conv[Int]` and `Conv[Str]` for `Two` | write a closure that names one impl: `fn(a) \{ (Conv[Int] for Two).conv(a) }` or `fn(a) \{ (Conv[Str] for Two).conv(a) }` | ",
+    ])
+}
+
+test "a value through a generic impl at a type that misses its bound is E0306 at the reference" {
+    assert_eq(errors_for("concrete_miss", "fn f() \{ let _w: fn(NoEq) -> Bx[NoEq] = Bx.wrap }"), [
+        "E0306 24:41-0 | `NoEq` does not satisfy the Eq bound on type parameter T of `Bx`'s impl of Wrap | add `@derive(Eq)` to `type NoEq` | `Bx`'s impl of Wrap declares `T: Eq` at build/tc_type_path_fn_value_concrete_miss.bl:12",
+    ])
+}
+
+test "a value through a generic impl is E0306 in a body whose binder lacks the bound" {
+    assert_eq(errors_for("body_miss", "fn h[T](x: T) -> Bx[T] \{ let w: fn(T) -> Bx[T] = Bx.wrap\n w(x) }"), [
+        "E0306 24:50-0 | `T` does not satisfy the Eq bound on type parameter T of `Bx`'s impl of Wrap: `T` has no Eq bound | write the bound on the binder: `[T: Eq]` | `Bx`'s impl of Wrap declares `T: Eq` at build/tc_type_path_fn_value_body_miss.bl:12",
+    ])
+}
+
+test "a value through an impl whose where clause holds the bound is E0306 in a body that lacks it" {
+    assert_eq(errors_for("where_miss", "fn h[T](x: T) -> Cx[T] \{ let w: fn(T) -> Cx[T] = Cx.wrap\n w(x) }"), [
+        "E0306 24:50-0 | `T` does not satisfy the Eq bound on type parameter T of `Cx`'s impl of Wrap: `T` has no Eq bound | write the bound on the binder: `[T: Eq]` | `Cx`'s impl of Wrap declares `T: Eq` at build/tc_type_path_fn_value_where_miss.bl:14",
+    ])
+}
+
+test "binders of an associated function and of its generic impl that nothing fixes are one E0301" {
+    assert_eq(errors_for("both_unfixed", [
+        "trait Wrap2[A] \{ fn wrap2[U](u: U, a: A) -> Self }",
+        "impl[T] Wrap2[T] for Bx[T] \{ fn wrap2[U](u: U, a: T) -> Bx[T] \{ Bx \{ v: [a] } } }",
+        "fn f() \{ let _g = Bx.wrap2 }",
+    ].join("\n")), [
+        "E0301 26:19-0 | type parameters `U` of `Bx.wrap2` and `T` of `impl Wrap2[T] for Bx[T]` are unbound at this reference and nothing supplies them | annotate the binding with its function type, as in `let f: fn(U, T) -> Bx[T] = Bx.wrap2` (replace each placeholder with the intended type) | ",
+    ])
+}
+
+test "a binder of the one conversion impl of a type that nothing fixes is E0301 at the reference" {
+    assert_eq(errors_for("conv_unfixed", [
+        "impl[T] From[List[T]] for Bx[T] \{ fn from(v: List[T]) -> Bx[T] \{ Bx \{ v: v } } }",
+        "fn f() \{ let _b = Bx.from }",
+    ].join("\n")), [
+        "E0301 25:19-0 | type parameter `T` of `impl From[List[T]] for Bx[T]` is unbound at this reference to `Bx.from` and nothing supplies it | annotate the binding with its function type, as in `let f: fn(List[T]) -> Bx[T] = Bx.from` (replace each placeholder with the intended type) | ",
+    ])
+}
+
+test "a binder of a generic conversion impl from the binder itself that nothing fixes is E0301 at the reference" {
+    assert_eq(errors_for("conv_self_unfixed", [
+        "impl[T] From[T] for Bx[T] \{ fn from(v: T) -> Bx[T] \{ Bx \{ v: [v] } } }",
+        "fn f() \{ let _b = Bx.from }",
+    ].join("\n")), [
+        "E0301 25:19-0 | type parameter `T` of `impl From[T] for Bx[T]` is unbound at this reference to `Bx.from` and nothing supplies it | annotate the binding with its function type, as in `let f: fn(T) -> Bx[T] = Bx.from` (replace each placeholder with the intended type) | ",
+    ])
+}
+
+test "an annotation fixes the binder of a generic conversion impl at the reference" {
+    assert_eq(errors_for("conv_self_fixed", [
+        "impl[T] From[T] for Bx[T] \{ fn from(v: T) -> Bx[T] \{ Bx \{ v: [v] } } }",
+        "fn f() \{ let _b: fn(Int) -> Bx[Int] = Bx.from }",
+    ].join("\n")), [])
+}
+
+test "a function value given where its result is an argument is E0300 with the help that calls it" {
+    assert_eq(errors_for("call_it_arg", "fn take(s: Stack[Int]) -> Int \{ s.items.len() }\nfn f() \{ let _n = take(Stack.empty) }"), [
+        "E0300 25:24-0 | argument 1 of `take` expects Stack[Int], got Fn() -> Stack[?] | call it: `Stack.empty()` | ",
+    ])
+}
+
+test "a function value returned where its result is is E0300 with the help that calls it" {
+    assert_eq(errors_for("call_it_ret", "fn g() -> Stack[Int] \{ Stack.empty }"), [
+        "E0300 24:24-0 | return value type Fn() -> Stack[?] does not match function `g` return type Stack[Int] | call it: `Stack.empty()` | ",
+    ])
+}
+
+test "an alias head gives a function value the alias's arguments as the call takes them" {
+    assert_eq(errors_for("alias_agree", [
+        "type IS = Stack[Int]",
+        "fn f() \{ let _a: Stack[Str] = IS.empty()\n let _b: fn() -> Stack[Str] = IS.empty }",
+    ].join("\n")), [
+        "E0300 25:10-0 | variable `_a`: declared type Stack[Str] but got Stack[Int] |  | ",
+        "E0300 26:2-0 | variable `_b`: declared type Fn() -> Stack[Str] but got Fn() -> Stack[Int]: return type expects Stack[Str], got Stack[Int] |  | ",
+    ])
+}
+
+test "a function an alias head names that builds another instance of the type is E0300 at the value as at the call" {
+    assert_eq(errors_for("alias_builds", [
+        "type IS = Stack[Int]",
+        "fn Stack_strs() -> Stack[Str] \{ Stack \{ items: [] } }",
+        "fn f() \{ let _a = IS.strs()\n let _b = IS.strs }",
+    ].join("\n")), [
+        "E0300 26:19-0 | `IS.strs` builds `Stack[Int]`, but its arguments say `Stack[Str]` | change the arguments to match the alias | ",
+        "E0300 27:11-0 | `IS.strs` builds `Stack[Int]`, but it returns `Stack[Str]` | name the function through the type it returns, or change the alias to match it | ",
+    ])
+}
+
+test "a value and a call of an associated function that two traits give name the same impl-qualified calls" {
+    assert_eq(errors_for("value_call_agree", "fn f() \{ let _a = Widget.make\n let _b = Widget.make(1) }"), [
+        "E0522 25:11-0 | ambiguous static call: `Widget.make` is declared by multiple traits implemented by Widget (Alpha and Beta) | use an impl-qualified call to choose one: `(Alpha for Widget).make(n)` or `(Beta for Widget).make(k)` | ",
+        "E0522 24:19-0 | ambiguous function value: `make` is in `Alpha` and `Beta` for `Widget` | write a closure that names one impl: `fn(n) \{ (Alpha for Widget).make(n) }` or `fn(k) \{ (Beta for Widget).make(k) }` | ",
+    ])
+}
+
+// Two impls of From give the name, so an annotated value is E0522 as an unannotated one is.
+test "an associated function that two conversion impls give the type is E0522 at an expected type" {
+    assert_eq(errors_for("two_conv", [
+        "type Cel \{ v: Int }",
+        "impl From[Int] for Cel \{ fn from(v: Int) -> Cel \{ Cel \{ v: v } } }",
+        "impl From[Str] for Cel \{ fn from(v: Str) -> Cel \{ Cel \{ v: 0 } } }",
+        "fn f() \{ let _c: fn(Int) -> Cel = Cel.from }",
+    ].join("\n")), [
+        "E0522 27:35-0 | ambiguous function value: `from` is in `From[Int]` and `From[Str]` for `Cel` | write a closure that names one impl: `fn(value) \{ (From[Int] for Cel).from(value) }` or `fn(value) \{ (From[Str] for Cel).from(value) }` | ",
+    ])
+}
+
+test "a method that two traits give the type is no function value and its report shows no closure over self" {
+    let errs = errors_for("two_self", [
+        "trait Sa \{ fn size(self) -> Int }",
+        "trait Sb \{ fn size(self) -> Int }",
+        "type K \{ n: Int }",
+        "impl Sa for K \{ fn size(self) -> Int \{ 1 } }",
+        "impl Sb for K \{ fn size(self) -> Int \{ 2 } }",
+        "fn f() \{ let _s = K.size }",
+    ].join("\n"))
+    for e in errs { assert(!e.contains("fn(self")) }
+}
+
+test "a deprecated type-scoped function named as a value warns at the reference" {
+    let ws = warnings_for("deprecated", "@deprecated(\"use W.mk\")\nfn W_old(n: Int) -> W \{ W \{ v: n } }\nfn f() \{ let _o = W.old }")
+    assert(ws.contains("W2000 26:19-0 | use of deprecated function `W.old` |  | "))
+}
+
+test "a trace message that calls a type-scoped value through a write is E0566" {
+    assert_eq(errors_for("trace", [
+        "let mut count = 0",
+        "fn W_bump(n: Int) -> W \{ count = count + 1\n W \{ v: n } }",
+        "fn f() \{ let b = W.bump\n trace.log(\"x\", \"\{b(1).v}\") }",
+    ].join("\n")), [
+        "E0566 28:19-0 | `msg` calls `W_bump`, which writes `count` | compute the value before the `trace.log` call, and read it in `msg` | ",
+    ])
+}
+
+// Accepted.
+
+test "a type-scoped function and one on a generic type are values at their expected types" {
+    assert_eq(errors_for("ok_scoped", [
+        "fn f() \{",
+        "    let _d = Duration.ms",
+        "    let _e: fn() -> Stack[Int] = Stack.empty",
+        "    let _ss = [1, 2].map(Stack.one)",
+        "    let _ms = [3].map(W.mk)",
+        "}",
+    ].join("\n")), [])
+}
+
+test "a value through a generic impl at a type that has its bound reports nothing" {
+    assert_eq(errors_for("ok_concrete", "fn f() \{ let _w: fn(Int) -> Bx[Int] = Bx.wrap\n let _xs = [3].map(Bx.wrap) }"), [])
+}
+
+test "a bound written on the binder meets the bound of a generic impl value" {
+    assert_eq(errors_for("ok_inline", "fn h[T: Eq](x: T) -> Bx[T] \{ let w: fn(T) -> Bx[T] = Bx.wrap\n w(x) }"), [])
+}
+
+test "a bound written in the where clause of the enclosing impl meets the bound of a generic impl value" {
+    assert_eq(errors_for("ok_where", [
+        "trait Use[T] \{ fn use_it(self, x: T) -> Int }",
+        "impl[T] Use[T] for List[T] where T: Eq \{ fn use_it(self, x: T) -> Int \{ let w: fn(T) -> Bx[T] = Bx.wrap\n w(x).v.len() } }",
+    ].join("\n")), [])
+}
+
+test "a bound on the binder meets the bound that a generic impl writes in its where clause" {
+    assert_eq(errors_for("ok_impl_where", "fn h[T: Eq](x: T) -> Cx[T] \{ let w: fn(T) -> Cx[T] = Cx.wrap\n w(x) }"), [])
+}
+
+test "a bound given through a supertrait meets the bound of a generic impl value" {
+    assert_eq(errors_for("ok_super", "fn h[T: Loud](x: T) -> Bx[T] \{ let w: fn(T) -> Bx[T] = Bx.wrap\n w(x) }"), [])
+}
+
+test "an alias head and the one conversion impl of a type give function values at their expected types" {
+    assert_eq(errors_for("ok_alias_conv", [
+        "type IS = Stack[Int]",
+        "type Cel \{ v: Int }",
+        "impl From[Int] for Cel \{ fn from(v: Int) -> Cel \{ Cel \{ v: v } } }",
+        "fn f() \{ let _e = IS.empty\n let _s: Stack[Int] = _e()\n let _c: fn(Int) -> Cel = Cel.from }",
+    ].join("\n")), [])
+}
+
+test "Self names the impl's type in an associated function value inside the impl" {
+    assert_eq(errors_for("ok_self", [
+        "type V \{ v: Int }",
+        "impl Mk for V \{ fn mk(n: Int) -> V \{ let f: fn(Int) -> V = Self.mk\n if n > 0 \{ f(n - 1) } else \{ V \{ v: 0 } } } }",
+    ].join("\n")), [])
+}

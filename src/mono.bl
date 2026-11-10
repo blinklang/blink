@@ -1094,11 +1094,26 @@ fn discover_call(ctx: Int, node: Int) ! Diag.Report {
 // this answers nothing for the name a call is written with.
 fn discover_fn_value(ctx: Int, node: Int) ! Diag.Report {
     let gfn = tc_fn_value_decl_node(node)
-    if gfn < 0 || !generic_fn_nodes.contains_key(gfn) { return }
-    let tid = ctx_node_tid(ctx, node)
-    if tc_tid_is_no_info(tid) != 0 || tc_tid_kind(tid) != TyKind.Fn { return }
+    if gfn < 0 { return }
+    if discover_static_head_poly(ctx, gfn, node) { return }
+    if own_generic_methods.impl_of.contains_key(gfn) {
+        note_call_target(ctx, node, register_own_generic_method(gfn, binder_args(ctx, gfn, node, reference_binds(ctx, gfn, node, []))))
+        return
+    }
+    if !generic_fn_nodes.contains_key(gfn) { return }
+    note_call_target(ctx, node, register_fn(gfn, binder_args(ctx, gfn, node, reference_binds(ctx, gfn, node, []))))
+}
+
+// The binds of `gfn`'s binders at a reference: a call solves them from its arguments and its
+// own type, and a function named as a value from its fn type, whose child 0 is the return
+// and whose params start at 1.
+fn reference_binds(ctx: Int, gfn: Int, node: Int, lead: List[Int]) -> Map[Str, Int] {
+    if node_kind(node) == NodeKind.MethodCall || node_kind(node) == NodeKind.Call {
+        return solve_call_binds(ctx, gfn, node, lead, node_args(node))
+    }
     let binds: Map[Str, Int] = Map()
-    // Child 0 of a Fn is its return; the params start at 1.
+    let tid = ctx_node_tid(ctx, node)
+    if tc_tid_is_no_info(tid) != 0 || tc_tid_kind(tid) != TyKind.Fn { return binds }
     let params_sl = node_params(gfn)
     let mut i = 0
     while i < sl_len(params_sl) {
@@ -1107,7 +1122,7 @@ fn discover_fn_value(ctx: Int, node: Int) ! Diag.Report {
     }
     let ret_ann = node_type_ann(gfn)
     if ret_ann != -1 { unify(tc_lookup_node_tid(ret_ann), tc_tid_child(tid, 0), binds) }
-    note_call_target(ctx, node, register_fn(gfn, binder_args(ctx, gfn, node, binds)))
+    binds
 }
 
 // `mod.f(args)` parses as a MethodCall on a module Ident; it is a free-fn call.
@@ -1213,8 +1228,7 @@ fn register_poly_instance(ctx: Int, m: Int, lead: List[Int], impl_tids: List[Int
         }
     }
     if has_type_params(m) {
-        let binds = solve_call_binds(ctx, m, call_node, lead, node_args(call_node))
-        let own = binder_args(ctx, m, call_node, binds)
+        let own = binder_args(ctx, m, call_node, reference_binds(ctx, m, call_node, lead))
         note_call_target(ctx, call_node, register_poly_own_generic_method(m, impl_tids, own))
         return
     }
@@ -1231,10 +1245,15 @@ fn discover_static_head_call(ctx: Int, node: Int, obj: Int) -> Bool ! Diag.Repor
         discover_generic_call(ctx, gfn, node, [], node_args(node))
         return true
     }
+    discover_static_head_poly(ctx, tc_call_decl_node(node), node)
+}
+
+// A call or value through a type head that reaches method `m` of a per-instance impl, at the
+// binders typecheck settled from the head, the arguments and the expected type.
+fn discover_static_head_poly(ctx: Int, m: Int, node: Int) -> Bool ! Diag.Report {
+    if m < 0 || !poly_methods.block_of.contains_key(m) { return false }
     let binders = tc_static_head_binders(node)
     if binders.len() == 0 { return false }
-    let m = tc_call_decl_node(node)
-    if m < 0 || !poly_methods.block_of.contains_key(m) { return false }
     let mut impl_tids: List[Int] = []
     for t in binders { impl_tids.push(tid_in_instance(ctx, t)) }
     register_poly_instance(ctx, m, [], impl_tids, node)
