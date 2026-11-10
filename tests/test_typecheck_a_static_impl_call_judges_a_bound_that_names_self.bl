@@ -1,0 +1,190 @@
+// A static call through a generic impl (`Bx.mk(b)`) holds that impl's bounds at the type the
+// head names, with `Self` read as that type (§3.6 Trait Bounds, "Polymorphic Trait
+// Implementations"), by the same rule as a method call through the same impl. A bound such as
+// `T: Conv[Self]` or a `where Self: Sh` clause that the head's type misses is E0306 at the
+// call, for a head named bare and through an alias, in a body whose type parameter the head
+// holds, and when a use after the call fills the head's arguments. A trait-qualified call to a
+// method written with `self` holds the same bounds. A miss is one report. A bound written on the
+// binder, in an impl's where clause, or given through a supertrait meets it, and so does a
+// concrete type that has the trait. Inside an impl whose `where Self: Sh` clause gives `Sh`, an
+// impl of `Sh` reached at that impl's own type meets its bounds, and only at that type. An
+// `@allow` on the body silences the miss there.
+
+import std.fs
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_reset}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+
+fn probe(path: Str, src: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    init_embedded_stdlib()
+    fs.write(path, src).unwrap()
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+    program
+}
+
+fn errors_reported() -> List[Str] {
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" { out.push("{d.code} {d.line}:{d.col} | {d.help}") }
+    }
+    out
+}
+
+// The program shares one prelude, so the body under test starts on line 17.
+fn errors_for(name: Str, body: Str) -> List[Str] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    let src = [
+        "trait Conv[A] \{ fn conv(self) -> Int }",
+        "trait Big[A]: Conv[A] \{ fn big(self) -> Int }",
+        "impl Conv[Int] for Str \{ fn conv(self) -> Int \{ 1 } }",
+        "type Bx[T] \{ v: T }",
+        "impl Conv[Bx[Int]] for Int \{ fn conv(self) -> Int \{ 2 } }",
+        "trait Mk \{ fn mk(s: Self) -> Int }",
+        "trait Tot \{ fn tot(self) -> Int }",
+        "impl[T: Conv[Self]] Mk for Bx[T] \{ fn mk(s: Self) -> Int \{ s.v.conv() } }",
+        "impl[T: Conv[Self]] Tot for Bx[T] \{ fn tot(self) -> Int \{ self.v.conv() } }",
+        "trait Sh \{ fn sh(self) -> Int }",
+        "type Sw[T] \{ v: T }",
+        "impl[T: Eq] Sh for Sw[T] \{ fn sh(self) -> Int \{ 1 } }",
+        "impl[T] Mk for Sw[T] where Self: Sh \{ fn mk(_s: Self) -> Int \{ 3 } }",
+        "type NoEq \{ a: Int }",
+        "type Named = Bx[Str]",
+        "trait Ck \{ fn chk(self) -> Int }",
+        body,
+        "fn main() \{ }",
+        "",
+    ].join("\n")
+    let _ = probe("build/tc_static_impl_self_bound_{name}.bl", src)
+    errors_reported()
+}
+
+// Refused: a bound that names Self, which the head's type misses.
+
+test "a static call to an associated function is E0306 at a bound that names Self" {
+    assert_eq(errors_for("assoc", "fn k() -> Int \{ Bx.mk(Bx \{ v: \"a\" }) }"),
+        ["E0306 17:17 | pass an argument whose type implements Conv[Bx[Str]], or write `impl Conv[Bx[Str]] for Str`"])
+}
+
+test "a trait-qualified call to a method written with self is E0306 at a bound that names Self" {
+    assert_eq(errors_for("method", "fn k() -> Int \{ Tot.tot(Bx \{ v: \"a\" }) }"),
+        ["E0306 17:17 | pass an argument whose type implements Conv[Bx[Str]], or write `impl Conv[Bx[Str]] for Str`"])
+}
+
+test "a static call through an alias head is E0306 at a bound that names Self" {
+    assert_eq(errors_for("alias", "fn k() -> Int \{ Named.mk(Bx \{ v: \"a\" }) }"),
+        ["E0306 17:17 | pass an argument whose type implements Conv[Bx[Str]], or write `impl Conv[Bx[Str]] for Str`"])
+}
+
+test "a static call in a generic body is E0306 with the bound that names Self as help" {
+    assert_eq(errors_for("generic", [
+        "fn k[T](b: Bx[T]) -> Int \{ Tot.tot(b) }",
+        "fn g[T](b: Bx[T]) -> Int \{ Bx.mk(b) }",
+    ].join("\n")), [
+        "E0306 17:28 | write the bound on the binder: `[T: Conv[Bx[T]]]`",
+        "E0306 18:28 | write the bound on the binder: `[T: Conv[Bx[T]]]`",
+    ])
+}
+
+test "each static call on one line is judged at the call and reported once" {
+    assert_eq(errors_for("same_line", "fn k[T](b: Bx[T]) -> Int \{ Bx.mk(b) + Tot.tot(b) }"), [
+        "E0306 17:28 | write the bound on the binder: `[T: Conv[Bx[T]]]`",
+        "E0306 17:39 | write the bound on the binder: `[T: Conv[Bx[T]]]`",
+    ])
+}
+
+test "a static call is E0306 at a bound that names Self when a use after the call fills the head" {
+    assert_eq(errors_for("late", [
+        "fn k() -> Int \{",
+        "    let mut l = []",
+        "    let r = Bx.mk(Bx \{ v: l })",
+        "    l.push(\"a\")",
+        "    r",
+        "}",
+    ].join("\n")), ["E0306 19:13 | pass an argument whose type implements Conv[Bx[List[Str]]], or write `impl Conv[Bx[List[Str]]] for List[Str]`"])
+}
+
+test "a static call is E0306 at a where clause on Self the head's type does not meet" {
+    assert_eq(errors_for("self_where", [
+        "fn k() -> Int \{ Sw.mk(Sw \{ v: NoEq \{ a: 1 } }) }",
+        "fn g[T](b: Sw[T]) -> Int \{ Sw.mk(b) }",
+    ].join("\n")), [
+        "E0306 17:17 | add `@derive(Eq)` to `type NoEq`",
+        "E0306 18:28 | write the bound on the binder: `[T: Eq]`",
+    ])
+}
+
+test "a static call in a field default is E0306 when a later use fills the head" {
+    assert_eq(errors_for("default", [
+        "type Df \{",
+        "    n: Int = \{",
+        "        let mut l = []",
+        "        let r = Bx.mk(Bx \{ v: l })",
+        "        l.push(\"a\")",
+        "        r",
+        "    }",
+        "}",
+    ].join("\n")), ["E0306 20:17 | pass an argument whose type implements Conv[Bx[List[Str]]], or write `impl Conv[Bx[List[Str]]] for List[Str]`"])
+}
+
+test "an allow on the body silences the static call there and nowhere else" {
+    assert_eq(errors_for("allowed", [
+        "@allow(TraitBoundNotSatisfied)",
+        "fn h() -> Int \{ Bx.mk(Bx \{ v: \"a\" }) }",
+        "fn g() -> Int \{ Bx.mk(Bx \{ v: \"a\" }) }",
+    ].join("\n")), ["E0306 19:17 | pass an argument whose type implements Conv[Bx[Str]], or write `impl Conv[Bx[Str]] for Str`"])
+}
+
+// Accepted: the bound written, in each form.
+
+test "a where Self clause meets the impl it names at the impl's own type in its body" {
+    assert_eq(errors_for("self_given", [
+        "impl[T] Tot for Sw[T] where Self: Sh \{ fn tot(self) -> Int \{ self.sh() } }",
+        "impl[T] Ck for Sw[T] where Self: Sh \{ fn chk(self) -> Int \{ Sw.mk(self) + self.tot() + self.sh() } }",
+    ].join("\n")), [])
+}
+
+test "a where Self clause does not meet the impl it names at another type" {
+    assert_eq(errors_for("self_given_other", [
+        "impl[T] Ck for Sw[T] where Self: Sh \{ fn chk(self) -> Int \{ Sw.mk(Sw \{ v: NoEq \{ a: 1 } }) } }",
+    ].join("\n")), ["E0306 17:61 | add `@derive(Eq)` to `type NoEq`"])
+}
+
+test "a bound on the binder meets the bound that names Self at a static call" {
+    assert_eq(errors_for("met_inline", [
+        "fn k[T: Conv[Bx[T]]](b: Bx[T]) -> Int \{ Bx.mk(b) + Tot.tot(b) }",
+        "fn g[T: Eq](b: Sw[T]) -> Int \{ Sw.mk(b) }",
+    ].join("\n")), [])
+}
+
+test "a bound in an impl's where clause meets the bound that names Self at a static call" {
+    assert_eq(errors_for("met_where", [
+        "impl[T] Ck for Bx[T] where T: Conv[Bx[T]] \{",
+        "    fn chk(self) -> Int \{",
+        "        let b = Bx \{ v: self.v }",
+        "        Bx.mk(b) + Tot.tot(b)",
+        "    }",
+        "}",
+        "impl[T] Ck for Sw[T] where T: Eq \{ fn chk(self) -> Int \{ Sw.mk(self) } }",
+    ].join("\n")), [])
+}
+
+test "a bound given through a supertrait meets the bound that names Self at a static call" {
+    assert_eq(errors_for("met_super", [
+        "fn k[T: Big[Bx[T]]](b: Bx[T]) -> Int \{ Bx.mk(b) + Tot.tot(b) }",
+        "fn g[T: Ord](b: Sw[T]) -> Int \{ Sw.mk(b) }",
+    ].join("\n")), [])
+}
+
+test "a concrete type that has the trait meets the bound that names Self at a static call" {
+    assert_eq(errors_for("met_concrete", [
+        "fn k() -> Int \{",
+        "    let mut l = []",
+        "    let r = Sw.mk(Sw \{ v: l })",
+        "    l.push(1)",
+        "    r + Bx.mk(Bx \{ v: 1 }) + Tot.tot(Bx \{ v: 1 }) + Sw.mk(Sw \{ v: 1 })",
+        "}",
+    ].join("\n")), [])
+}
