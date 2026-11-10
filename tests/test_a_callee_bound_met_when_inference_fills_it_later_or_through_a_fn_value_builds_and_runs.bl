@@ -1,0 +1,176 @@
+// A callee's bound holds at the type its binder takes when a use after the call fills that type
+// (`let mut l = []` then `l.push(x)`), when the callee is named as a fn value whose type an
+// annotation fills, or when the call names the impl's type (`List.same(l)`) (§3.6 Trait
+// Bounds). A bound met through a generic impl and a bound on a generic trait at its trait
+// arguments are met by a bound written on the binder, by one in an impl's where clause, by one
+// given through a supertrait, and by a concrete type that has the trait. Each form builds and
+// runs.
+
+trait Same {
+    fn same(self) -> Bool
+}
+
+impl[T: Eq] Same for List[T] {
+    fn same(self) -> Bool { self.len() < 2 || self.get(0).unwrap() == self.get(1).unwrap() }
+}
+
+fn all_same[X: Same](x: X) -> Bool { x.same() }
+
+trait Conv[A] {
+    fn conv(self) -> Int
+}
+
+trait Wide[K]: Conv[K] {
+    fn wide(self) -> Int
+}
+
+impl Conv[Int] for Int {
+    fn conv(self) -> Int { self * 10 }
+}
+
+impl Wide[Int] for Int {
+    fn wide(self) -> Int { self }
+}
+
+type Px[K, V] { k: K, v: V }
+
+trait Shown {
+    fn shown(self) -> Int
+}
+
+impl[K, V: Conv[K]] Shown for Px[K, V] {
+    fn shown(self) -> Int { self.v.conv() }
+}
+
+fn show_it[X: Shown](x: X) -> Int { x.shown() }
+
+fn need_list[K, V: Conv[K]](_k: K, vs: List[V]) -> Int {
+    let mut total = 0
+    for v in vs { total = total + v.conv() }
+    total
+}
+
+fn late_inline[T: Eq](x: T, y: T) -> Bool {
+    let mut l = []
+    l.push(x)
+    l.push(y)
+    let r = all_same(l)
+    let mut m = []
+    let s = all_same(m)
+    m.push(x)
+    let mut n = []
+    let t = List.same(n)
+    n.push(x)
+    r && s && t
+}
+
+// The call comes before the push in the text, so inference fills the element type after the
+// call, but at run time the call sees the two values the earlier turns pushed.
+fn late_filled_values[T: Eq](x: T, y: T) -> Bool {
+    let mut l = []
+    let mut m = []
+    let mut r = false
+    let mut s = false
+    for i in 0..3 {
+        if i == 2 {
+            r = all_same(l)
+            s = List.same(m)
+        }
+        l.push(if i == 0 { x } else { y })
+        m.push(if i == 0 { x } else { y })
+    }
+    r && s
+}
+
+fn fn_value_inline[T: Eq](x: List[T]) -> Bool {
+    let f: fn(List[T]) -> Bool = all_same
+    f(x)
+}
+
+fn late_super[T: Ord](x: T) -> Bool {
+    let mut l = []
+    let r = all_same(l)
+    l.push(x)
+    let f: fn(List[T]) -> Bool = all_same
+    r && f([x, x])
+}
+
+fn args_inline[K2, A: Conv[K2]](k: K2, a: A, p: Px[K2, A]) -> Int {
+    let mut l = []
+    let r = need_list(k, l)
+    l.push(a)
+    let f: fn(K2, List[A]) -> Int = need_list
+    let g: fn(Px[K2, A]) -> Int = show_it
+    r + f(k, [a]) + g(p)
+}
+
+fn args_super[K2, A: Wide[K2]](k: K2, a: A, p: Px[K2, A]) -> Int {
+    let mut l = []
+    let r = need_list(k, l)
+    l.push(a)
+    let f: fn(K2, List[A]) -> Int = need_list
+    let g: fn(Px[K2, A]) -> Int = show_it
+    r + f(k, [a]) + g(p)
+}
+
+fn concrete() -> Int {
+    let mut l = []
+    let r = all_same(l)
+    l.push(1)
+    let f: fn(List[Str]) -> Bool = all_same
+    let g: fn(Px[Int, Int]) -> Int = show_it
+    let mut m = []
+    let n = need_list(1, m)
+    m.push(2)
+    (if r && f(["a", "a"]) { 1 } else { 0 }) + g(Px { k: 1, v: 2 }) + n
+}
+
+type Hd[T] { v: T }
+
+trait Ck {
+    fn chk(self) -> Bool
+}
+
+impl[T] Ck for Hd[T] where T: Eq {
+    fn chk(self) -> Bool {
+        let mut l = []
+        let r = all_same(l)
+        l.push(self.v)
+        let f: fn(List[T]) -> Bool = all_same
+        let mut m = []
+        let s = List.same(m)
+        m.push(self.v)
+        r && f([self.v, self.v]) && s
+    }
+}
+
+test "a call whose type inference fills later judges the values it sees" {
+    assert(late_filled_values(1, 1))
+    assert(!late_filled_values(1, 2))
+    assert(late_filled_values("a", "a"))
+    assert(!late_filled_values("a", "b"))
+}
+
+test "a bound written on the binder meets a bound the inference fills later or a fn value reaches" {
+    assert(late_inline(1, 1))
+    assert(!late_inline("a", "b"))
+    assert(fn_value_inline([2, 2]))
+    assert(!fn_value_inline([2, 3]))
+}
+
+test "a bound given through a supertrait meets the bound at each deferred path" {
+    assert(late_super(4))
+    assert_eq(args_super(1, 3, Px { k: 1, v: 5 }), 80)
+}
+
+test "a bound on a trait argument written on the binder meets the bound at each deferred path" {
+    assert_eq(args_inline(1, 3, Px { k: 1, v: 5 }), 80)
+}
+
+test "a bound in an impl's where clause meets the bound at each deferred path" {
+    assert(Hd { v: 7 }.chk())
+}
+
+test "a concrete type that has the trait meets the bound at each deferred path" {
+    assert_eq(concrete(), 21)
+}
