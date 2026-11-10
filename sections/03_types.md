@@ -2360,6 +2360,90 @@ A type alias is not a newtype. `type Errno = Int` gives a second name to `Int`: 
 
 An alias creates no type, so `@derive`, `@where`, `@invariant`, `@ffi.struct` and `@ffi.opaque` are E1110 on it, and `@src`, `@deprecated` and `@allow` stay legal (§11.1 *Annotations on a Type Alias*).
 
+**A cycle of aliases (E0327).** An alias creates no type, so the compiler replaces an alias with its right-hand side until no alias is left. That replacement must end. An alias whose expansion reaches itself is `error[CyclicTypeAlias]` (E0327). The path can go through other aliases, type arguments, tuples, fn types and generic aliases. A struct or enum name stops the walk, because a struct or enum is a type with its own name. To make a type that holds itself, declare a struct or an enum.
+
+```blink
+type A = A                       // error[CyclicTypeAlias] (E0327): `A` names `A`
+type B = C                       // error[CyclicTypeAlias] (E0327): `B` names `C`
+type C = B
+type L = List[L]                 // error[CyclicTypeAlias] (E0327): `L` names `L`, inside `List[...]`
+type F = fn(Int) -> F            // error[CyclicTypeAlias] (E0327): `F` names `F`
+type Pair[T] = (T, T)
+type PP = Pair[PP]               // error[CyclicTypeAlias] (E0327): `PP` names `PP`, through the generic alias `Pair`
+type G[T] = G[List[T]]           // error[CyclicTypeAlias] (E0327), not E0324 (*Limit on Generic Instances*)
+type H[T] = List[H[T]]           // error[CyclicTypeAlias] (E0327), not E0324
+```
+
+The check reads the declarations of the aliases. It does not read the type arguments of a use. `type P[X] = List[X]` has no cycle, so `P[P[Int]]` is legal. A struct or enum stops the walk, so a recursive type that goes through one is legal:
+
+```blink
+type P[X] = List[X]
+let grid: P[P[Int]] = [[1, 2], [3]]   // legal: `P[P[Int]]` is `List[List[Int]]`
+
+type Node { kids: Kids }              // legal: the walk stops at the struct `Node`
+type Kids = List[Node]
+```
+
+The compiler checks each alias declaration, used or not. `blink check` reports the error.
+
+**One error for each cycle.** The compiler reports one error for each strongly connected component of aliases, not one for each alias. With `type A = (B, C)`, `type B = A` and `type C = A`, the three aliases are one component and give one error. The first alias of the component, in a fixed order, holds the error: the path of its file, then its position in the file. The order does not change between runs, machines or the CLI and the LSP.
+
+**The span.** The primary span is the reference in the right-hand side of that first alias that leads round the cycle. Its label reads "`A` names `B`". For `type A = A`, it reads "`A` names `A`". The other aliases of the cycle get no label. A note lists the chain. It gives every link in a fixed order that starts at the alias with the primary span. It writes the `path:line` of each link, and the qualified name of an alias in another module:
+
+```text
+error[CyclicTypeAlias] (E0327): type alias `A` expands to itself
+ --> a.bl:1:10
+1 | type A = geo.B
+  |          ^ `A` names `geo.B`
+  = note: the chain is `A` (a.bl:1) -> `geo.B` (geo.bl:4) -> `A`
+```
+
+The `--json` form holds the edge list (`alias`, `names`, `span`), with a span for each edge. An editor can use these spans to mark each alias of the cycle.
+
+**The help.** The help is text only. It has no fix that a tool can apply, because each repair changes what the program means. It has two shapes. The compiler picks the shape from the edges of the cycle. An edge goes through a type constructor when the name it follows sits inside a list, an option, a tuple, a fn type, a generic type or a generic alias. If no edge of the cycle goes through a type constructor, the user did not ask for a recursive type, so the help does not offer a struct. It does not name a type to use, because the compiler does not know which one is right:
+
+```text
+error[CyclicTypeAlias] (E0327): type alias `B` expands to itself
+ --> b.bl:1:10
+1 | type B = C
+  |          ^ `B` names `C`
+  = note: the chain is `B` (b.bl:1) -> `C` (b.bl:2) -> `B`
+  = help: an alias gives a second name to a type; point one alias in the chain at a type that is not in the chain
+```
+
+If any edge goes through a type constructor, the user asked for a recursive type. The help writes the struct form whole, with a field name:
+
+```text
+error[CyclicTypeAlias] (E0327): type alias `L` expands to itself
+ --> l.bl:1:15
+1 | type L = List[L]
+  |               ^ `L` names `L`, inside `List[...]`
+  = note: the chain is `L` (l.bl:1) -> `L`
+  = help: an alias creates no type, so it cannot hold itself; to make a recursive type, declare a struct: `type L { items: List[L] }`
+```
+
+**Poison.** One rule covers every alias whose right-hand side does not resolve to a type: the alias has the poison type (§6.3.5). A use of the alias gets no second error. This covers:
+
+- each alias in a cycle;
+- each alias that leads into a cycle: with `type C = A` and the cycle `A`, `B`, the alias `C` gets no error of its own, because the repair is in the cycle;
+- an alias whose right-hand side has another error.
+
+```blink
+type A = Nope                 // error[UnknownType] (E0507): at `Nope`, once
+fn f(x: A) -> Int { x.len() } // no second error: `x` has the poison type
+```
+
+The poison covers only the errors that the alias causes. It does not hide an unrelated error at a use: a wrong argument count in a call that takes `x: A` is still reported. An `impl` on an alias that has the poison type is dropped with no error, and its methods leave method lookup. So this program gives exactly one error, E0327, and it does not reach the C compiler:
+
+```blink
+trait Sh { fn n(self) -> Int }
+type A = A2
+type A2 = A                   // the one error: error[CyclicTypeAlias] (E0327)
+impl Sh for A { fn n(self) -> Int { 1 } }   // dropped, no error
+
+fn main() { io.println("x") }
+```
+
 Blink has no tuple structs and no `newtype` keyword. A single-variant enum is an ordinary enum, not a newtype. To wrap a foreign type so that you can write an impl for it, see *Orphan Rule* (§3.6). For why `(T)` is not a 1-tuple, see *No 1-Tuples* (§3.8).
 
 A form from another language gets an error that names the Blink form. No help line offers an enum form:
@@ -4108,7 +4192,7 @@ Both errors follow §8.16.1 *Rollout of a new error*.
 
 A method call on a value whose type is a type parameter, through a bound (`x.m()` with `x: T`), is not an edge. The impl is not known until `T` has a type, and a declaration check does not look there. Growth through a bound is stopped by the budget below.
 
-An edge **grows** when its type argument holds a type parameter of `D` inside a type constructor, as in `List[T]`, `(T, T)`, `Option[T]` or `Box[T]`. A type argument that is a type parameter alone does not grow: `T`, or another parameter of `D` (a swap). A cycle of edges with at least one growing edge is E0324.
+An edge **grows** when its type argument holds a type parameter of `D` inside a type constructor, as in `List[T]`, `(T, T)`, `Option[T]` or `Box[T]`. A type argument that is a type parameter alone does not grow: `T`, or another parameter of `D` (a swap). A cycle of edges with at least one growing edge is E0324. A cycle that goes through type aliases only, such as `type G[T] = G[List[T]]`, is not a cycle of edges: an alias creates no type, and it is E0327 (§3.4 *Newtypes*).
 
 The check reads declarations only:
 
