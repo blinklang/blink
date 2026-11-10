@@ -1,0 +1,224 @@
+// A std trait method (`display`, `debug`, `clone`, `eq`, `hash`, `cmp`) called on a receiver
+// that is not a named place, such as `l.get(0).unwrap()`, and the qualified form
+// `Trait.method(x)` on it, build and run at the type a later use fills where that type has the
+// trait (§3.6 Trait Bounds): a bound on the body's binder, one in its impl's where clause, one
+// given through a supertrait, or a concrete type that has the trait. A program whose generic
+// bodies live in another module prints the same text in the one-unit and the per-module build.
+
+import std.fs
+import std.process.{ProcessResult}
+import compile_test_helpers.{scratch_root}
+
+@derive(Clone, Debug, Eq, Hash)
+type Q { a: Int }
+
+@derive(Clone)
+type R { a: Int }
+
+impl Display for R {
+    fn fmt(self, sb: StringBuilder) { sb.write("R{self.a}") }
+}
+
+trait Shown: Display { }
+
+impl Shown for R { }
+
+type W { a: Int }
+
+impl Debug for W {
+    fn debug(self) -> Str { "W!{self.a}" }
+}
+
+impl Eq for W {
+    fn eq(self, other: W) -> Bool { self.a == other.a }
+}
+
+impl Hash for W {
+    fn hash(self) -> U64 { self.a.hash() }
+}
+
+type Box[T] { v: T }
+
+impl[T] Display for Box[T] where T: Display {
+    fn fmt(self, sb: StringBuilder) { sb.write("Box({self.v})") }
+}
+
+fn inline_bound[T: Display + Clone](x: T) -> Str {
+    let mut l = []
+    let mut out = ""
+    for _ in 0..2 {
+        if l.len() > 0 {
+            out = "{l.get(0).unwrap().display()}/{Display.display(l.get(0).unwrap().clone())}"
+        }
+        l.push(x)
+    }
+    out
+}
+
+fn clone_then_push[T: Clone](x: T) -> Int {
+    let mut l = []
+    for _ in 0..2 {
+        if l.len() > 0 { l.push(l.get(0).unwrap().clone()) }
+        l.push(x)
+    }
+    l.len()
+}
+
+fn where_bound[T: Display](x: T) -> Str {
+    let mut l = []
+    let mut out = ""
+    for _ in 0..2 {
+        if l.len() > 0 { out = "{l.get(0).unwrap().display()} {Display.display(l.get(0).unwrap())}" }
+        l.push(Box { v: x })
+    }
+    out
+}
+
+fn super_bound[T: Shown](x: T) -> Str {
+    let mut l = []
+    let mut out = ""
+    for _ in 0..2 {
+        if l.len() > 0 { out = l.get(0).unwrap().display() }
+        l.push(x)
+    }
+    out
+}
+
+test "a bound on the body's binder meets each later-filled method call" {
+    assert_eq(inline_bound(R { a: 9 }), "R9/R9")
+    assert_eq(inline_bound(5), "5/5")
+    assert_eq(inline_bound("s"), "s/s")
+    assert_eq(clone_then_push(R { a: 1 }), 3)
+}
+
+test "a bound in an impl's where clause meets each later-filled method call" {
+    assert_eq(where_bound(R { a: 4 }), "Box(R4) Box(R4)")
+}
+
+test "a bound given through a supertrait meets each later-filled method call" {
+    assert_eq(super_bound(R { a: 5 }), "R5")
+}
+
+test "a concrete type that has each trait meets each later-filled method call" {
+    let mut li = []
+    let mut lq = []
+    let mut lr = []
+    let mut out: List[Str] = []
+    for i in 0..2 {
+        if li.len() > 0 {
+            out.push(li.get(0).unwrap().debug())
+            out.push(li.get(0).unwrap().display())
+            out.push("{li.get(0).unwrap().clone()} {li.get(0).unwrap().eq(7)} {li.get(0).unwrap().hash() == 7.hash()}")
+            out.push("{li.get(0).unwrap().cmp(8) == Ordering.Less}")
+            out.push(lq.get(0).unwrap().debug())
+            out.push("{lq.get(0).unwrap().clone().eq(Q { a: 3 })} {lq.get(0).unwrap().hash() == Q { a: 3 }.hash()}")
+            out.push("{Eq.eq(lq.get(0).unwrap(), Q { a: 4 })} {Hash.hash(lq.get(0).unwrap()) == Q { a: 3 }.hash()}")
+            out.push(lr.get(0).unwrap().display())
+            out.push(Display.display(lr.get(0).unwrap()))
+            out.push(Debug.debug(lq.get(0).unwrap()))
+        }
+        li.push(7)
+        lq.push(Q { a: 3 })
+        lr.push(R { a: i })
+    }
+    assert_eq(out, ["7", "7", "7 true true", "true", "Q \{ a: 3 }", "true true", "false true", "R0", "R0", "Q \{ a: 3 }"])
+}
+
+test "a written impl answers each later-filled method call in both spellings" {
+    let mut l = []
+    let mut out = ""
+    for _ in 0..2 {
+        if l.len() > 0 {
+            out = "{l.get(0).unwrap().debug()} {Debug.debug(l.get(0).unwrap())} {l.get(0).unwrap().hash() == 4.hash()} {Hash.hash(l.get(0).unwrap()) == 4.hash()}"
+        }
+        l.push(W { a: 4 })
+    }
+    assert_eq(out, "W!4 W!4 true true")
+}
+
+test "a qualified call after an argument filled the receiver reads the filled type" {
+    let mut l = []
+    let mut out = ""
+    for _ in 0..2 {
+        if l.len() > 0 {
+            let same = l.get(0).unwrap().clone().eq(Q { a: 3 })
+            out = "{same} {Debug.debug(l.get(0).unwrap())}"
+        }
+        l.push(Q { a: 3 })
+    }
+    assert_eq(out, "true Q \{ a: 3 }")
+}
+
+test "a trait-qualified display on a scalar prints its text, written in place or filled later" {
+    let mut l = []
+    let mut out = "{Display.display(5)} {Display.display("s")} {Display.display(1.5)} {Display.display(true)} {Display.display('c')}"
+    for _ in 0..2 {
+        if l.len() > 0 { out = "{out} {Display.display(l.get(0).unwrap())}" }
+        l.push(6)
+    }
+    assert_eq(out, "5 s 1.5 true c 6")
+}
+
+fn sh(cmd: Str) -> ProcessResult ! Process.Spawn {
+    process.run("sh", ["-c", cmd]).unwrap()
+}
+
+let late_src = [
+    "pub fn late_show[T: Display + Clone](x: T) -> Str \{",
+    "    let mut l = []",
+    "    let mut out = \"\"",
+    "    for _ in 0..2 \{",
+    "        if l.len() > 0 \{ out = \"\{l.get(0).unwrap().display()}/\{Display.display(l.get(0).unwrap().clone())}\" }",
+    "        l.push(x)",
+    "    }",
+    "    out",
+    "}",
+    "pub fn qualified_scalars() -> Str \{",
+    "    let mut l = []",
+    "    let mut out = \"\{Display.display(5)} \{Display.display(\"s\")}\"",
+    "    for _ in 0..2 \{",
+    "        if l.len() > 0 \{ out = \"\{out} \{Display.display(l.get(0).unwrap())}\" }",
+    "        l.push(7)",
+    "    }",
+    "    out",
+    "}",
+    "pub fn late_debug[T: Debug + Eq + Hash](x: T) -> Str \{",
+    "    let mut l = []",
+    "    let mut out = \"\"",
+    "    for _ in 0..2 \{",
+    "        if l.len() > 0 \{ out = \"\{l.get(0).unwrap().debug()} \{Debug.debug(l.get(0).unwrap())} \{l.get(0).unwrap().eq(x)} \{l.get(0).unwrap().hash() == x.hash()}\" }",
+    "        l.push(x)",
+    "    }",
+    "    out",
+    "}",
+    "",
+].join("\n")
+
+let main_src = [
+    "import late.\{late_show, late_debug, qualified_scalars}",
+    "fn main() \{",
+    "    io.println(late_show(5))",
+    "    io.println(late_show(\"s\"))",
+    "    io.println(late_debug(6))",
+    "    io.println(late_debug(\"t\"))",
+    "    io.println(qualified_scalars())",
+    "}",
+    "",
+].join("\n")
+
+test "generic bodies in another module whose method calls a later fill types print the same in each build" {
+    let root = "{scratch_root()}/late_recv_method_pkg_{getpid()}"
+    let _ = sh("rm -rf {root} && mkdir -p {root}/src")
+    fs.write("{root}/blink.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\n").unwrap()
+    fs.write("{root}/src/late.bl", late_src).unwrap()
+    fs.write("{root}/src/main.bl", main_src).unwrap()
+    let blink = sh("readlink -f build/blink").out.trim()
+    let want = "5/5\ns/s\n6 6 true true\n\"t\" \"t\" true true\n5 s 7\n"
+    let mut failed: List[Str] = []
+    for mode in ["--no-per-module", "--per-module"] {
+        let r = sh("cd {root} && env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE timeout 300 {blink} run {mode} src/main.bl < /dev/null 2>&1")
+        if !r.success() || !r.out.ends_with(want) { failed.push("blink run {mode}: {r.end}\n{r.out}") }
+    }
+    let _ = sh("rm -rf {root}")
+    assert_eq(failed, [])
+}

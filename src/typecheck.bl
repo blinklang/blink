@@ -8600,14 +8600,24 @@ fn tc_deferred_use_open(t: Int, t2: Int) -> Bool {
 // judge the use runs when its type is known at once. An error the walk left on the use's lines
 // is the first report; one this flush gave another use on those lines is not, as a written type
 // would get both. A type inference left open is not judged: the binding that holds it answers for
-// it (E0301). The judges compare type names, so each gets the types inference settled on.
+// it (E0301); a std trait method has no binding of its own to hold the type, so its judge gives
+// that report. The judges compare type names, so each gets the types inference settled on.
 fn tc_flush_deferred_uses() ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     let walk_diags = diag_entry_count()
-    for i in 0..tc_calls.deferred_uses.len() {
-        let key = tc_calls.deferred_uses.get(i).unwrap()
-        let rec = tc_calls.deferred_use_at.get(key).unwrap()
+    // A judge can note or drop a use, so the flush walks the list as the walk left it.
+    let mut keys: List[Int] = []
+    for key in tc_calls.deferred_uses { keys.push(key) }
+    // A call the flush refused gives the call made on its result nothing to judge, as an
+    // error type does with the type in place.
+    let mut refused: Map[Int, Bool] = Map()
+    for key in keys {
+        let rec = match tc_calls.deferred_use_at.get(key) {
+            Some(r) => r
+            None => { continue }
+        }
         let node = tc_deferred_use_node(key)
-        if tc_deferred_use_open(rec.tid, rec.tid2) { continue }
+        if !tc_use_judges_open_type(rec.judge) && tc_deferred_use_open(rec.tid, rec.tid2) { continue }
+        if tc_late_receiver_refused(node, rec.judge, refused) { continue }
         let end_line = if node_end_line(node) > node_line(node) { node_end_line(node) } else { node_line(node) }
         if diag_errors_in_lines_before(walk_diags, diag_file_for_node(node), node_line(node), end_line) > 0 { continue }
         let tid = tc_resolve(rec.tid)
@@ -8618,7 +8628,9 @@ fn tc_flush_deferred_uses() ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                 let leaf = tc_display_missing_leaf(tid)
                 if leaf >= 0 { tc_report_missing_display(node, tid, leaf, sink, []) }
             }
-            StdMethod(tr, method, self_offset) => { let _ = tc_judge_std_trait_method(node, tid, tr, method, self_offset) }
+            StdMethod(tr, method, self_offset) => {
+                if !tc_judge_late_std_method(node, tid, tr, method, self_offset) { refused.insert(node, true) }
+            }
             Comparison(op) => tc_check_comparison_operands(node, op, tid, tid2)
             AssertEq => reject_eq_less_assert_args(tid, tid2, node)
             ListScan(method) => {
@@ -8628,6 +8640,25 @@ fn tc_flush_deferred_uses() ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
             Sort(recv) => { let _ = tc_refuse_unordered_sort(node, recv, tid) }
         }
         tc_leave_body_frames(frames)
+    }
+}
+
+// A std trait method has no binding to hold its type, so its own judge reports a type left open.
+fn tc_use_judges_open_type(judge: UseJudge) -> Bool {
+    match judge {
+        StdMethod(_, _, _) => true
+        _ => false
+    }
+}
+
+// Whether the receiver of the std trait method at `node` is a call the flush already refused.
+fn tc_late_receiver_refused(node: Int, judge: UseJudge, refused: Map[Int, Bool]) -> Bool {
+    match judge {
+        StdMethod(_, _, self_offset) => {
+            let recv = if self_offset == 1 { tc_mc_receiver(node) } else { tc_arg_value_at(tc_mc_call_args(node), 0) }
+            refused.contains_key(recv)
+        }
+        _ => false
     }
 }
 
@@ -31145,6 +31176,11 @@ fn tc_clone_need(tid0: Int, visiting: List[Int]) -> List[Int] {
 fn tc_builtin_std_trait(k: TyKind, method: Str) -> Option[Str] {
     if k == TyKind.Struct || k == TyKind.Enum || k == TyKind.Typevar || k == TyKind.Unknown { return None }
     if !tc_kind_has_std_traits(k) { return None }
+    tc_std_trait_of_method(method)
+}
+
+// The std trait that declares `method` among those every built-in type holds, or None.
+fn tc_std_trait_of_method(method: Str) -> Option[Str] {
     match method {
         "clone" => Some("Clone")
         "debug" => Some("Debug")
@@ -31327,19 +31363,179 @@ fn tc_std_trait_call(node: Int, obj_t: Int, recv_node: Int, tr: Str, shown_trait
         tc_warn_negative_zero_method(obj_t, recv_node, args_sl, 1 - self_offset, family)
     }
     // The compiler builds the method for one type, so a receiver of no known type has none
-    // to build. A named place may be pinned later, and its binding is judged then.
-    if tc_tid_has_unbound_metavar(obj_t) != 0 {
-        if tc_scrut_is_named_place(recv_node) == 0 && tc_ud_already_blamed(obj_t) == 0 {
-            tc_report_under_determined_at(recv_node, obj_t,
-                "`{method}` is built for one type, and nothing here says which type this value has")
-            return tc_error_recovery_tid()
-        }
-        tc_note_deferred_use(node, obj_t, -1, UseJudge.StdMethod(tr, method, self_offset))
-        return tc_std_trait_ret(obj_t, method)
-    }
+    // to build yet. A later use may fill it, and the flush judges the call then: at the type
+    // it filled, or as E0301 when nothing did (tc_judge_late_std_method).
     tc_note_deferred_use(node, obj_t, -1, UseJudge.StdMethod(tr, method, self_offset))
-    if !tc_judge_std_trait_method(node, obj_t, tr, method, self_offset) { return tc_error_recovery_tid() }
+    if tc_tid_has_unbound_metavar(obj_t) != 0 { return tc_std_trait_ret(obj_t, method) }
+    // An argument can fill an open receiver (`x.eq(P { .. })`), so the type closed here may be
+    // one the dispatch never saw; the judge reports it as a call on that type written in place.
+    if !tc_judge_late_std_method(node, obj_t, tr, method, self_offset) { return tc_error_recovery_tid() }
     tc_std_trait_ret(obj_t, method)
+}
+
+// `x.method(..)` on an `x` of no type yet, for a method every type answers through one std
+// trait: `display` (Display) and the methods tc_builtin_std_trait names. -1 for any other method,
+// which has no signature to judge the call by until the type is known.
+fn tc_open_receiver_std_call(node: Int, obj_t: Int, recv_node: Int, method: Str, args_sl: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    // A trait this module can see may give the filled type a method of the same name with its
+    // own signature, so the std signature cannot type the call before the type is known.
+    if tc_user_trait_declares_here(method) { return -1 }
+    if method == "display" {
+        if args_sl != -1 && sublist_length(args_sl) != 0 { return -1 }
+        tc_note_deferred_use(node, obj_t, -1, UseJudge.StdMethod("Display", "display", 1))
+        return TYPE_STR
+    }
+    match tc_std_trait_of_method(method) {
+        Some(tr) => tc_std_trait_call(node, obj_t, recv_node, tr, tc_core_trait_shown(tr), method, args_sl, 1)
+        None => -1
+    }
+}
+
+// Whether a trait other than a compiler-known one, that this module can name, declares `method`.
+fn tc_user_trait_declares_here(method: Str) -> Bool {
+    let mut users: List[Str] = []
+    for tr in tc_traits_declaring(method) {
+        if !tc_trait_is_compiler_known(tr) { users.push(tr) }
+    }
+    tc_trait_names_visible_here(users.join(" and ")) != ""
+}
+
+// The flush half of tc_std_trait_call, once inference is done with the receiver's type.
+// A type still open is E0301 at the receiver, unless the binding that holds it has that report.
+// A type with the compiler's own method is judged as the call is at the walk. Another type
+// answers the method through its own impl or derive, and one with neither gets the report a
+// call on that type gets at the walk.
+fn tc_judge_late_std_method(node: Int, tid: Int, tr: Str, method: Str, self_offset: Int) -> Bool ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    let recv_node = if self_offset == 1 { tc_mc_receiver(node) } else { tc_arg_value_at(tc_mc_call_args(node), 0) }
+    if tc_tid_has_unbound_metavar(tid) != 0 {
+        if tc_ud_already_blamed(tid) == 0 {
+            tc_report_under_determined_at(recv_node, tid,
+                "`{method}` is built for one type, and nothing here says which type this value has")
+        }
+        return false
+    }
+    if tr == "Display" {
+        return tc_judge_display_method(node, tid, recv_node)
+    }
+    let t = resolve_alias_tid(tc_resolve(tid))
+    if type_kind(t) == TyKind.Typevar && tc_late_tparam_refused(node, t, tr, method, self_offset) { return false }
+    let k = type_kind(t)
+    match tc_std_trait_owner(tid, method) {
+        Some(_) => {
+            if self_offset == 1 {
+                let users = tc_std_method_user_owners(tid, tr, method)
+                if users.len() > 0 && tc_instance_has_trait(tid, tr) {
+                    let _ = tc_std_method_ambiguity(node, tid, recv_node, tc_mc_call_args(node), tr, method, users)
+                    return false
+                }
+            }
+        }
+        None => {
+            if k == TyKind.Struct || k == TyKind.Enum {
+                // A written impl answers the call as it does with the type in place, though the
+                // trait's bound reads only a derive for some traits.
+                let base = if k == TyKind.Struct { tc_struct_base_tid(t) } else { tc_enum_base_tid(t) }
+                if tc_type_writes_trait_method(strip_module_qualifier(tc_type_name(base)), method, tr) { return true }
+                if tc_trait_need(tid, tr, []).len() > 0 && (self_offset == 1 || tc_trait_qualified_unanswered(tr, method, t)) {
+                    tc_method_calls.hard.insert(node, 1)
+                    tc_report_unresolved_method(node, t, if self_offset == 1 { type_to_str(t) } else { tc_type_str(t) }, method)
+                    return false
+                }
+            }
+        }
+    }
+    tc_judge_std_trait_method(node, tid, tr, method, self_offset)
+}
+
+// The late judge's refusal of a std trait method on a type parameter its binders do not give the
+// trait, as the call is refused with the parameter written in place. false when not refused.
+fn tc_late_tparam_refused(node: Int, t: Int, tr: Str, method: Str, self_offset: Int) -> Bool ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    if tc_trait_need(t, tr, []).len() == 0 { return false }
+    if self_offset == 1 {
+        return tc_refuse_unlicensed_self_method(node, t, method) || tc_refuse_tparam_method(node, t, method)
+    }
+    if tc_tparam_bound_traits(type_to_str(t)) == "" { return false }
+    tc_report_tparam_not_bound_by(node, type_to_str(t), tc_core_trait_shown(tr), method)
+    true
+}
+
+// E0305 for `x.method()` on `Self` in a trait default body whose guarantee set does not have the
+// method: its own methods and its supertraits' are the whole licence. Reported at the trait.
+fn tc_refuse_unlicensed_self_method(node: Int, obj_t: Int, method: Str) -> Bool ! TypeCheck.Resolve, Diag.Report {
+    if type_kind(obj_t) != TyKind.Typevar || type_to_str(obj_t) != "Self" { return false }
+    let gm = tc_tparam_bound_methods("Self")
+    if gm == "" || tc_pipe_has(gm, method) != 0 { return false }
+    diag_error_at("UnlicensedSelfOperation", UNLICENSED_SELF_OP,
+        "method `.{method}` on `Self` is not licensed by `{tc_current_self_trait}`", node,
+        "`{tc_current_self_trait}` does not declare `{method}`, and no supertrait it names provides it; declare the method on `{tc_current_self_trait}` (or a supertrait that has it) so every implementor supplies it")
+    true
+}
+
+// `x.method(..)` on a type parameter whose bound licenses no method of that name, refused in the
+// generic body (section 6.3.3), whether or not a caller reaches it. A bound refuses it only when
+// the method lists of all its traits are known. false when the call is not refused here.
+fn tc_refuse_tparam_method(node: Int, obj_t: Int, method: Str) -> Bool ! TypeCheck.Resolve, Diag.Report {
+    let tv_name = type_to_str(obj_t)
+    let tv_traits = tc_tparam_bound_traits(tv_name)
+    if tc_pipe_joined(tv_traits) != "" {
+        if !tc_guarantee_lists_all_methods(tv_traits) || tc_pipe_has(tc_guarantee_methods(tv_traits), method) != 0 { return false }
+        tc_method_calls.hard.insert(node, 1)
+        diag_error_at("UnresolvedMethod", UNRESOLVED_METHOD, "type parameter `{tv_name}` is bounded by {tc_traits_shown(tc_pipe_joined(tv_traits))}, and none of them declares method `{method}`", node, "correct the method name, or add a bound whose trait declares `{method}`")
+        return true
+    }
+    if tv_name == "Self" || tc_tparam_in_scope(tv_name) == 0 { return false }
+    tc_method_calls.hard.insert(node, 1)
+    let owners = tc_traits_declaring(method)
+    let example = if owners.len() == 1 { ", such as `[{tv_name}: {tc_trait_shown(owners.get(0).unwrap())}]`" } else { "" }
+    diag_error_at("UnresolvedMethod", UNRESOLVED_METHOD, "type parameter `{tv_name}` has no bound, so it has no method `{method}`", node, "add a bound whose trait declares `{method}`{example}")
+    true
+}
+
+// `Tr.method(x)` on a type parameter whose bound does not name `Tr`: the qualifier selects one
+// trait, and on a type parameter the bound is the whole licence.
+fn tc_report_tparam_not_bound_by(node: Int, tv_name: Str, tr_shown: Str, method: Str) ! Diag.Report {
+    tc_method_calls.hard.insert(node, 1)
+    diag_error_at("TraitBoundNotSatisfied", TRAIT_BOUND_NOT_SATISFIED, "type parameter `{tv_name}` is not bound by trait `{tr_shown}`, so `{tr_shown}.{method}` is not available on it", node, "add the bound: `{tv_name}: {tr_shown}`")
+}
+
+// `Display.display(x)` is `x.display()` (sections/03c_protocols.md *Qualified Method Calls*), so
+// the qualified call takes the dotted call's judge and its report.
+fn tc_qualified_display(node: Int, recv_t: Int, args: Int, n: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    if n != 1 {
+        tc_error_at("qualified trait call `Display.display` expects 1 argument(s) including the receiver, got {n}", node)
+        return tc_error_recovery_tid()
+    }
+    if tc_judge_display_method(node, recv_t, tc_arg_value_at(args, 0)) { return TYPE_STR }
+    tc_error_recovery_tid()
+}
+
+// The kinds whose `display()` tc_judge_display_method answers in full. Any other kind keeps the
+// qualified call's general path.
+fn tc_is_display_judged_kind(k: TyKind) -> Bool {
+    k == TyKind.Int || k == TyKind.Float || k == TyKind.Bool || k == TyKind.Str || k == TyKind.Char || k == TyKind.Struct || k == TyKind.Enum
+}
+
+// `x.display()` judged as the method dispatch judges it when the type is written in place, also
+// once a later use fills the type of `x`: a builtin scalar and a bound type parameter answer it, a
+// struct or enum with a Display impl answers it with that impl's bounds, and any other type has
+// no such method.
+fn tc_judge_display_method(node: Int, tid: Int, recv_node: Int) -> Bool ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    if tc_tid_has_unknown(tid) != 0 { return false }
+    let t = resolve_alias_tid(tc_resolve(tid))
+    let k = type_kind(t)
+    if k == TyKind.Int || k == TyKind.Float || k == TyKind.Bool || k == TyKind.Str || k == TyKind.Char { return true }
+    if k == TyKind.Typevar {
+        if tc_typevar_holds(t, "Display") { return true }
+        if tc_refuse_tparam_method(node, t, "display") { return false }
+    }
+    let tname = ty_pool.get(t).unwrap().name
+    if (k == TyKind.Struct || k == TyKind.Enum) && (tc_type_has_display_impl(tname) != 0 || tc_type_has_display_impl(strip_module_qualifier(tname)) != 0) {
+        tc_check_shown_value(recv_node, t, "Display.display")
+        return true
+    }
+    tc_method_calls.hard.insert(node, 1)
+    tc_report_unresolved_method(node, t, type_to_str(t), "display")
+    false
 }
 
 // Whether the compiler builds the std trait method `method` of `tr` for `obj_t`, a type with no
@@ -31485,6 +31681,8 @@ fn tc_std_trait_qualified_call(node: Int, shown: Str, tr: Str, method: Str, args
         Some(_) => { return tc_std_trait_call(node, recv, tc_arg_value_at(args_sl, 0), tr, shown, method, args_sl, 0) }
         None => {}
     }
+    // A receiver of no type yet is judged once a later use fills it, as `x.method(..)` is.
+    if tc_is_unbound_metavar(recv) != 0 { return tc_std_trait_call(node, recv, tc_arg_value_at(args_sl, 0), tr, shown, method, args_sl, 0) }
     if k != TyKind.Struct && k != TyKind.Enum { return -1 }
     // A derive registers its method under the type's own key, with no declaration.
     let sig = lookup_fnsig("{ty_pool.get(recv).unwrap().name}_{method}")
@@ -34371,19 +34569,19 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
         }
         tc_note_open_receiver(recv_node)
 
+        // A std trait method on a receiver of no type yet. A later use may fill the type
+        // (sections/03_types.md *Under-Determined Types*), and every type answers these methods
+        // with one signature, so the flush judges the call at the type inference settles on.
+        if qualified == -1 && tc_is_unbound_metavar(obj_t) != 0 {
+            let open_answer = tc_open_receiver_std_call(node, obj_t, recv_node, method, args_sl)
+            if open_answer != -1 { return open_answer }
+        }
+
         // A plain method call on `Self` in a trait default body is licensed only when the
         // method is in the trait's guarantee set (its own methods + the supertrait
         // closure's). Reported at the trait definition (E0305). Fires only for a `Self`
         // receiver with an active `Self` frame, so ordinary calls are untouched.
-        if obj_k == TyKind.Typevar && type_to_str(obj_t) == "Self" {
-            let gm = tc_tparam_bound_methods("Self")
-            if gm != "" && tc_pipe_has(gm, method) == 0 {
-                diag_error_at("UnlicensedSelfOperation", UNLICENSED_SELF_OP,
-                    "method `.{method}` on `Self` is not licensed by `{tc_current_self_trait}`", node,
-                    "`{tc_current_self_trait}` does not declare `{method}`, and no supertrait it names provides it; declare the method on `{tc_current_self_trait}` (or a supertrait that has it) so every implementor supplies it")
-                return tc_error_recovery_tid()
-            }
-        }
+        if tc_refuse_unlicensed_self_method(node, obj_t, method) { return tc_error_recovery_tid() }
 
         // §3c rule-3 on a List receiver: an unqualified call to a method
         // defined by two or more owners is ambiguous. Owners are the user
@@ -35354,19 +35552,8 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                 // The bound is the whole licence, so a method none of its traits declares is
                 // refused here, in the generic body, not at each instance. Only a guarantee
                 // set whose method lists are all known can say a method is absent.
-                if tc_guarantee_lists_all_methods(tv_traits) && tc_pipe_has(tc_guarantee_methods(tv_traits), method) == 0 {
-                    tc_method_calls.hard.insert(node, 1)
-                    diag_error_at("UnresolvedMethod", UNRESOLVED_METHOD, "type parameter `{tv_name}` is bounded by {tc_traits_shown(tc_pipe_joined(tv_traits))}, and none of them declares method `{method}`", node, "correct the method name, or add a bound whose trait declares `{method}`")
-                    return tc_error_recovery_tid()
-                }
-            } else if type_to_str(obj_t) != "Self" && tc_tparam_in_scope(type_to_str(obj_t)) != 0 {
-                // An unbounded parameter licenses no method, so each call on it is refused in
-                // the generic body (section 6.3.3), whether or not a caller reaches it.
-                tc_method_calls.hard.insert(node, 1)
-                let tv_name = type_to_str(obj_t)
-                let owners = tc_traits_declaring(method)
-                let example = if owners.len() == 1 { ", such as `[{tv_name}: {tc_trait_shown(owners.get(0).unwrap())}]`" } else { "" }
-                diag_error_at("UnresolvedMethod", UNRESOLVED_METHOD, "type parameter `{tv_name}` has no bound, so it has no method `{method}`", node, "add a bound whose trait declares `{method}`{example}")
+                if tc_refuse_tparam_method(node, obj_t, method) { return tc_error_recovery_tid() }
+            } else if tc_refuse_tparam_method(node, obj_t, method) {
                 return tc_error_recovery_tid()
             }
         }
@@ -35798,7 +35985,8 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                     tc_error_at("qualified trait call `{obj_name}.{method}` expects the receiver as its first argument, got none", node)
                     return tc_error_recovery_tid()
                 }
-                let qt_recv = infer_type(tc_arg_value_at(qt_args, 0))
+                // Resolved as the dotted receiver is: an earlier use may have filled its metavar.
+                let qt_recv = tc_resolve(infer_type(tc_arg_value_at(qt_args, 0)))
                 let qt_k = type_kind(qt_recv)
                 // A receiver that is a BOUNDED type parameter — the spec's own
                 // `fn show[T: Describe](v: T) { Describe.describe(v) }` form (:706). No impl
@@ -35816,6 +36004,7 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                     // scope this arm is not inside — answers "" and keeps its old path: this
                     // rule speaks only where the bound list is known.
                     if qt_bounds != "" && tc_pipe_has(qt_bounds, qt_trait) == 0 {
+                        if obj_name == "Display" && method == "display" { return tc_qualified_display(node, qt_recv, qt_args, qt_n) }
                         // The qualifier selects ONE trait (§3c:668-682; the resolution table
                         // at :748 resolves the form by "Explicit trait + method"). On a type
                         // parameter the bound is the whole licence, so a trait the bound does
@@ -35827,8 +36016,7 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                             diag_error_at("UnresolvedMethod", UNRESOLVED_METHOD, "trait `{obj_name}` does not define method `{method}`", node, "")
                             return tc_error_recovery_tid()
                         }
-                        tc_method_calls.hard.insert(node, 1)
-                        diag_error_at("TraitBoundNotSatisfied", TRAIT_BOUND_NOT_SATISFIED, "type parameter `{qt_tp}` is not bound by trait `{obj_name}`, so `{obj_name}.{method}` is not available on it", node, "add the bound: `{qt_tp}: {obj_name}`")
+                        tc_report_tparam_not_bound_by(node, qt_tp, obj_name, method)
                         return tc_error_recovery_tid()
                     }
                     if tc_pipe_has(qt_bounds, qt_trait) != 0 {
@@ -35867,6 +36055,18 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                 } else {
                     tc_builtin_receiver_name(qt_recv)
                 }
+                // A receiver of no type yet is shown at the type a later use fills.
+                if obj_name == "Display" && method == "display" && tc_is_unbound_metavar(qt_recv) != 0 {
+                    if qt_n != 1 {
+                        tc_error_at("qualified trait call `Display.display` expects 1 argument(s) including the receiver, got {qt_n}", node)
+                        return tc_error_recovery_tid()
+                    }
+                    tc_note_deferred_use(node, qt_recv, -1, UseJudge.StdMethod("Display", "display", 0))
+                    return TYPE_STR
+                }
+                if obj_name == "Display" && method == "display" && tc_is_display_judged_kind(qt_k) {
+                    return tc_qualified_display(node, qt_recv, qt_args, qt_n)
+                }
                 if qt_tname != "" {
                     let qt_sig = tc_call_view_sig(lookup_fnsig(tc_impl_method_stem(qt_tname, qt_trait, method)))
                     // A type that holds the trait at two instances registers no plain key, and
@@ -35895,16 +36095,6 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                             return substitute_typevar_tid(instantiate_return_type(qt_sig, qt_tids, node, 0), qt_ibinds)
                         }
                         return substitute_typevar_tid(qt_fs.ret, qt_ibinds)
-                    }
-                    // The synthesized sealed `Display.display` has no user fnsig anywhere
-                    // — and §3c:712 names it as THE qualified call to write.
-                    // Same answer as the instance arm at the Struct/Enum receiver block.
-                    if obj_name == "Display" && method == "display" && tc_type_has_display_impl(qt_tname) != 0 {
-                        if qt_n != 1 {
-                            tc_error_at("qualified trait call `Display.display` expects 1 argument(s) including the receiver, got {qt_n}", node)
-                        }
-                        if qt_n >= 1 { tc_check_shown_value(tc_arg_value_at(qt_args, 0), qt_recv, "Display.display") }
-                        return TYPE_STR
                     }
                     // The named trait does not define this method at all. Without this,
                     // `B.go(p)` where only `A` defines `go` silently dispatched to

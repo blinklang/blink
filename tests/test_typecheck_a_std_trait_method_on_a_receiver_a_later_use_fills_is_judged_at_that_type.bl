@@ -1,0 +1,364 @@
+// A std trait method (`display`, `debug`, `clone`, `eq`, `hash`, `cmp`) called on a receiver
+// that is not a named place, such as `l.get(0).unwrap()`, and the qualified form
+// `Trait.method(x)` on it, are judged at the type a later use fills (sections/03_types.md
+// *Under-Determined Types*). The report is the one the call gets when the type is written in
+// place, at the call, once. A bound written on the binder, in an impl's where clause or given
+// through a supertrait meets the call, and so does a type that has the trait. A type nothing
+// fills is one E0301 and the call adds no report.
+
+import std.fs
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_reset}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+
+fn probe(path: Str, src: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    init_embedded_stdlib()
+    fs.write(path, src).unwrap()
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+    program
+}
+
+fn errors_reported() -> List[Str] {
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" { out.push("{d.code} {d.line}:{d.col} | {d.notes.join(" / ")} | {d.help}") }
+    }
+    out
+}
+
+// The program shares one prelude, so the body under test starts on line 10.
+fn errors_for(name: Str, body: List[Str]) -> List[Str] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    let mut lines = [
+        "trait Tag \{ fn tag(self) -> Int }",
+        "trait Sh: Display \{ fn sh(self) -> Int }",
+        "impl Tag for Int \{ fn tag(self) -> Int \{ self } }",
+        "type Cx[T] \{ v: T }",
+        "impl[T: Tag] Display for Cx[T] \{ fn fmt(self, sb: StringBuilder) \{ sb.write(\"cx\{self.v.tag()}\") } }",
+        "type NoShow \{ a: Int }",
+        "type NoTag \{ a: Int }",
+        "@derive(Clone, Debug, Eq, Hash)",
+        "type Dv \{ a: Int }",
+    ]
+    for l in body { lines.push(l) }
+    lines.push("fn main() \{ }")
+    lines.push("")
+    let _ = probe("build/tc_late_recv_{name}.bl", lines.join("\n"))
+    errors_reported()
+}
+
+// Refused: the type a later use fills has no such method.
+
+test "display on a receiver a later push fills with a type without Display is the unresolved method at the call" {
+    assert_eq(errors_for("display_noshow", [
+        "fn bad() -> Str \{",
+        "    let mut l = []",
+        "    let mut s = \"\"",
+        "    if l.len() > 0 \{ s = l.get(0).unwrap().display() }",
+        "    l.push(NoShow \{ a: 1 })",
+        "    s",
+        "}",
+    ]), ["E0505 13:26 |  | add an `impl Display for NoShow` (with `fn fmt(self, sb: StringBuilder)`)"])
+}
+
+test "display on a receiver a later push fills with an instance whose Display impl bound fails is E0523 with the bound note" {
+    assert_eq(errors_for("display_impl_bound", [
+        "fn bad() -> Str \{",
+        "    let mut l = []",
+        "    let mut s = \"\"",
+        "    if l.len() > 0 \{ s = l.get(0).unwrap().display() }",
+        "    l.push(Cx \{ v: NoTag \{ a: 1 } })",
+        "    s",
+        "}",
+    ]), ["E0523 13:26 | `Cx`'s impl of Display declares `T: Tag` at build/tc_late_recv_display_impl_bound.bl:5 / `NoTag` does not implement Tag | write `impl Tag for NoTag`, or show a value whose type implements Tag"])
+}
+
+test "debug, clone and hash on a receiver a later push fills with a type without them each get one report" {
+    assert_eq(errors_for("derive_methods_noshow", [
+        "fn bad() -> Bool \{",
+        "    let mut l = []",
+        "    let mut r = false",
+        "    if l.len() > 0 \{",
+        "        let s = l.get(0).unwrap().debug()",
+        "        l.push(l.get(0).unwrap().clone())",
+        "        r = l.get(0).unwrap().hash() == 0 && s == \"\"",
+        "    }",
+        "    l.push(NoShow \{ a: 1 })",
+        "    r",
+        "}",
+    ]), [
+        "E0505 14:17 |  | ",
+        "E0505 15:16 |  | ",
+        "E0505 16:13 |  | ",
+    ])
+}
+
+test "eq whose argument fills the receiver with a type without Eq is the unresolved method at the call" {
+    assert_eq(errors_for("eq_arg_fills", [
+        "fn bad() -> Bool \{",
+        "    let mut l = []",
+        "    let mut r = false",
+        "    if l.len() > 0 \{ r = l.get(0).unwrap().eq(NoShow \{ a: 1 }) }",
+        "    r",
+        "}",
+    ]), ["E0505 13:26 |  | "])
+}
+
+test "a trait-qualified debug on a receiver a later push fills with a type without Debug is the unresolved method" {
+    assert_eq(errors_for("qualified_debug_noshow", [
+        "fn bad() -> Str \{",
+        "    let mut l = []",
+        "    let mut s = \"\"",
+        "    if l.len() > 0 \{ s = Debug.debug(l.get(0).unwrap()) }",
+        "    l.push(NoShow \{ a: 1 })",
+        "    s",
+        "}",
+    ]), ["E0505 13:26 |  | "])
+}
+
+test "debug and display in a generic body on a receiver a later push fills with an unbounded type parameter name the missing bound" {
+    assert_eq(errors_for("tparam_unbounded", [
+        "fn bad[T](x: T) -> Str \{",
+        "    let mut l = []",
+        "    let mut s = \"\"",
+        "    if l.len() > 0 \{ s = \"\{l.get(0).unwrap().debug()}\{l.get(0).unwrap().display()}\" }",
+        "    l.push(x)",
+        "    s",
+        "}",
+    ]), [
+        "E0505 13:28 |  | add a bound whose trait declares `debug`, such as `[T: Debug]`",
+        "E0505 13:55 |  | add a bound whose trait declares `display`",
+    ])
+}
+
+test "cmp in a generic body on a receiver a later push fills with a type parameter bound by Eq only is refused" {
+    assert_eq(errors_for("tparam_eq_cmp", [
+        "fn bad[T: Eq](x: T) -> Bool \{",
+        "    let mut l = []",
+        "    let mut r = false",
+        "    if l.len() > 0 \{ r = l.get(0).unwrap().cmp(x) == Ordering.Less }",
+        "    l.push(x)",
+        "    r",
+        "}",
+    ]), ["E0505 13:26 |  | correct the method name, or add a bound whose trait declares `cmp`"])
+}
+
+test "a trait-qualified clone in a generic body on a receiver a later push fills with an unbounded type parameter is E0306" {
+    assert_eq(errors_for("tparam_qualified_clone", [
+        "fn bad[T](x: T) -> Int \{",
+        "    let mut l = []",
+        "    if l.len() > 0 \{ let _ = Clone.clone(l.get(0).unwrap()) }",
+        "    l.push(x)",
+        "    0",
+        "}",
+    ]), ["E0306 12:30 |  | add the bound: `T: Clone`"])
+}
+
+test "a chain of std trait methods on a receiver a later push fills with a type without the first is one report per chain" {
+    assert_eq(errors_for("chain_once", [
+        "fn bad() -> Str \{",
+        "    let mut l = []",
+        "    let mut s = \"\"",
+        "    if l.len() > 0 \{ s = l.get(0).unwrap().clone().debug() }",
+        "    if l.len() > 0 \{ s = Debug.debug(Clone.clone(l.get(0).unwrap())) }",
+        "    l.push(NoShow \{ a: 1 })",
+        "    s",
+        "}",
+    ]), ["E0505 13:26 |  | ", "E0505 14:38 |  | "])
+}
+
+test "a method on Self in a trait default body on a receiver a later push fills is E0305 when the trait does not declare it" {
+    assert_eq(errors_for("self_unlicensed", [
+        "trait Tr \{",
+        "    fn tg(self) -> Int",
+        "    fn late(self) -> Str \{",
+        "        let mut l = []",
+        "        let mut s = \"\"",
+        "        if l.len() > 0 \{ s = l.get(0).unwrap().debug() }",
+        "        l.push(self)",
+        "        s",
+        "    }",
+        "}",
+    ]), ["E0305 15:30 |  | `Tr` does not declare `debug`, and no supertrait it names provides it; declare the method on `Tr` (or a supertrait that has it) so every implementor supplies it"])
+}
+
+// Refused: nothing fills the type.
+
+test "debug on a receiver nothing fills is one E0301 at its binding" {
+    assert_eq(errors_for("debug_never", [
+        "fn bad() -> Str \{",
+        "    let mut l = []",
+        "    let mut s = \"\"",
+        "    if l.len() > 0 \{ s = l.get(0).unwrap().debug() }",
+        "    s",
+        "}",
+    ]), ["E0301 11:5 | the empty construction here has no element type to infer at line 11 | add a type annotation, e.g. `let l: List[T] = ...` (replace the placeholder with the intended element type)"])
+}
+
+test "display and a trait-qualified debug on a receiver nothing fills add no report to E0301" {
+    assert_eq(errors_for("display_qualified_never", [
+        "fn bad() -> Str \{",
+        "    let mut l = []",
+        "    let mut s = \"\"",
+        "    if l.len() > 0 \{ s = l.get(0).unwrap().display() }",
+        "    if l.len() > 0 \{ s = Debug.debug(l.get(0).unwrap()) }",
+        "    s",
+        "}",
+    ]), ["E0301 11:5 | the empty construction here has no element type to infer at line 11 | add a type annotation, e.g. `let l: List[T] = ...` (replace the placeholder with the intended element type)"])
+}
+
+test "debug on a value no binding holds and nothing fills is one E0301 at the value" {
+    assert_eq(errors_for("debug_unbound_value", [
+        "fn bad() -> Str \{",
+        "    [].get(0).unwrap().debug()",
+        "}",
+    ]), ["E0301 11:5 | `debug` is built for one type, and nothing here says which type this value has | add a type annotation on a binding for this value, e.g. `let x: T = ...` (replace each placeholder with the intended type)"])
+}
+
+test "a trait-qualified display on a value no binding holds and nothing fills is one E0301 at the value" {
+    assert_eq(errors_for("qualified_display_unbound_value", [
+        "fn bad() -> Str \{",
+        "    Display.display([].get(0).unwrap())",
+        "}",
+    ]), ["E0301 11:21 | `display` is built for one type, and nothing here says which type this value has | add a type annotation on a binding for this value, e.g. `let x: T = ...` (replace each placeholder with the intended type)"])
+}
+
+// Accepted: the type the later use fills has the method.
+
+test "a written Debug, Eq and Hash impl meets each later-filled method call in both spellings" {
+    assert_eq(errors_for("written_impl_ok", [
+        "type W \{ a: Int }",
+        "impl Debug for W \{ fn debug(self) -> Str \{ \"w\{self.a}\" } }",
+        "impl Eq for W \{ fn eq(self, other: W) -> Bool \{ self.a == other.a } }",
+        "impl Hash for W \{ fn hash(self) -> U64 \{ self.a.hash() } }",
+        "fn ok() -> Bool \{",
+        "    let mut l = []",
+        "    let mut r = false",
+        "    if l.len() > 0 \{",
+        "        let s = \"\{l.get(0).unwrap().debug()}\{Debug.debug(l.get(0).unwrap())}\"",
+        "        r = s != \"\" && l.get(0).unwrap().hash() == Hash.hash(l.get(0).unwrap())",
+        "    }",
+        "    l.push(W \{ a: 1 })",
+        "    r",
+        "}",
+    ]), [])
+}
+
+
+test "a trait-qualified display reads as the dotted call on a scalar, written in place or filled later" {
+    assert_eq(errors_for("qualified_display_scalar_ok", [
+        "fn ok() -> Str \{",
+        "    let mut l = []",
+        "    let mut s = \"\{Display.display(5)}\{Display.display(\"s\")}\{Display.display(1.5)}\{Display.display(true)}\{Display.display('c')}\"",
+        "    if l.len() > 0 \{ s = Display.display(l.get(0).unwrap()) }",
+        "    l.push(5)",
+        "    s",
+        "}",
+    ]), [])
+}
+
+test "a trait-qualified display on a type without Display gets the dotted report, written in place or filled later" {
+    assert_eq(errors_for("qualified_display_noshow", [
+        "fn bad[T](x: T) -> Str \{",
+        "    let mut l = []",
+        "    let mut s = \"\{Display.display(NoShow \{ a: 1 })}\{Display.display(x)}\"",
+        "    if l.len() > 0 \{ s = Display.display(l.get(0).unwrap()) }",
+        "    l.push(NoShow \{ a: 2 })",
+        "    s",
+        "}",
+    ]), [
+        "E0505 12:19 |  | add an `impl Display for NoShow` (with `fn fmt(self, sb: StringBuilder)`)",
+        "E0505 12:53 |  | add a bound whose trait declares `display`",
+        "E0505 13:26 |  | add an `impl Display for NoShow` (with `fn fmt(self, sb: StringBuilder)`)",
+    ])
+}
+
+test "a later fill with a type that has each trait is accepted in both spellings" {
+    assert_eq(errors_for("concrete_ok", [
+        "type Shown \{ a: Int }",
+        "impl Display for Shown \{ fn fmt(self, sb: StringBuilder) \{ sb.write(\"s\") } }",
+        "fn ok() -> Bool \{",
+        "    let mut li = []",
+        "    let mut ld = []",
+        "    let mut ls = []",
+        "    let mut lc = []",
+        "    let mut r = false",
+        "    if li.len() > 0 \{",
+        "        let a = \"\{li.get(0).unwrap().display()}\{li.get(0).unwrap().debug()}\{li.get(0).unwrap().clone()}\"",
+        "        let b = li.get(0).unwrap().eq(1) && li.get(0).unwrap().hash() == 1.hash() && li.get(0).unwrap().cmp(2) == Ordering.Less",
+        "        let c = \"\{ld.get(0).unwrap().debug()}\{ld.get(0).unwrap().clone().debug()}\{Debug.debug(ld.get(0).unwrap())}\"",
+        "        let d = ld.get(0).unwrap().eq(Dv \{ a: 1 }) && Eq.eq(ld.get(0).unwrap(), Dv \{ a: 1 }) && Hash.hash(ld.get(0).unwrap()) == 0",
+        "        let e = \"\{ls.get(0).unwrap().display()}\{Display.display(ls.get(0).unwrap())}\{lc.get(0).unwrap().display()}\"",
+        "        r = b && d && a != c && e != \"\"",
+        "    }",
+        "    li.push(1)",
+        "    ld.push(Dv \{ a: 1 })",
+        "    ls.push(Shown \{ a: 1 })",
+        "    lc.push(Cx \{ v: 2 })",
+        "    r",
+        "}",
+    ]), [])
+}
+
+test "a qualified call after an argument filled the receiver reads the filled type" {
+    assert_eq(errors_for("qualified_after_fill_ok", [
+        "fn ok() -> Str \{",
+        "    let mut l = []",
+        "    let mut s = \"\"",
+        "    if l.len() > 0 \{",
+        "        let same = l.get(0).unwrap().clone().eq(Dv \{ a: 3 })",
+        "        s = \"\{same} \{Debug.debug(l.get(0).unwrap())}\"",
+        "    }",
+        "    s",
+        "}",
+    ]), [])
+}
+
+test "a bound written on the binder meets each later-filled method call" {
+    assert_eq(errors_for("inline_ok", [
+        "fn ok[T: Display + Debug + Clone + Hash + Ord](x: T) -> Bool \{",
+        "    let mut l = []",
+        "    let mut r = false",
+        "    if l.len() > 0 \{",
+        "        let s = \"\{l.get(0).unwrap().display()}\{l.get(0).unwrap().debug()}\{Display.display(l.get(0).unwrap().clone())}\"",
+        "        r = s != \"\" && l.get(0).unwrap().eq(x) && l.get(0).unwrap().cmp(x) == Ordering.Equal && Hash.hash(l.get(0).unwrap()) == x.hash()",
+        "    }",
+        "    l.push(x)",
+        "    r",
+        "}",
+    ]), [])
+}
+
+test "a bound written in an impl's where clause meets each later-filled method call" {
+    assert_eq(errors_for("where_ok", [
+        "trait Ck \{ fn chk(self) -> Bool }",
+        "type Hold[T] \{ v: T }",
+        "impl[T] Ck for Hold[T] where T: Display + Debug + Clone + Ord \{",
+        "    fn chk(self) -> Bool \{",
+        "        let mut l = []",
+        "        let mut r = false",
+        "        if l.len() > 0 \{",
+        "            let s = \"\{l.get(0).unwrap().display()}\{Debug.debug(l.get(0).unwrap().clone())}\"",
+        "            r = s != \"\" && l.get(0).unwrap().cmp(self.v) == Ordering.Equal",
+        "        }",
+        "        l.push(self.v)",
+        "        r",
+        "    }",
+        "}",
+    ]), [])
+}
+
+test "a bound given through a supertrait meets each later-filled method call" {
+    assert_eq(errors_for("super_ok", [
+        "fn ok[T: Sh](x: T) -> Str \{",
+        "    let mut l = []",
+        "    let mut s = \"\"",
+        "    if l.len() > 0 \{ s = \"\{l.get(0).unwrap().display()}\{Display.display(l.get(0).unwrap())}\" }",
+        "    l.push(x)",
+        "    s",
+        "}",
+    ]), [])
+}
