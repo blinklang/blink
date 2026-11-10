@@ -1,0 +1,132 @@
+// A method with `self` called through its type name is E0567 (sections/03_types.md §3.4). When
+// the first argument is a value of that type and one owner gives the method, the fix moves the
+// argument before the dot: `blink fix` writes the file this test expects, and `blink check` of
+// that file then reports nothing. A first argument of another type, or a method that two owners
+// give, has help and no fix, and `blink fix` leaves the file as it is.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> ProcessResult ! Process.Spawn {
+    process.run("sh", ["-c", cmd]).unwrap()
+}
+
+// The child runs outside the corpus harness, so it must not read the corpus variables.
+fn blink_in(dir: Str, args: Str) -> ProcessResult ! Process.Spawn {
+    sh("B=$(pwd)/build/blink; cd {dir} && env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE timeout 120 $B {args}")
+}
+
+fn package(stem: Str, src: Str) -> Str ! Process.Spawn, IO, FS.Write {
+    let dir = sh("mktemp -d /tmp/blink_e0567_{stem}.XXXXXX").out.trim()
+    fs.write("{dir}/blink.toml", "[package]\nname = \"calc\"\nversion = \"0.1.0\"\n").unwrap()
+    let _ = sh("mkdir -p {dir}/src")
+    fs.write("{dir}/src/calc.bl", src).unwrap()
+    dir
+}
+
+fn fix_then_check(stem: Str, src: Str, want: Str, fixes: Int) ! Process.Spawn, IO, FS.Read, FS.Write {
+    let dir = package(stem, src)
+    let fix = blink_in(dir, "fix src/calc.bl")
+    let fixed = fix.out.concat(fix.err_out)
+    let got = fs.read("{dir}/src/calc.bl").unwrap()
+    let check = blink_in(dir, "check src/calc.bl")
+    let checked = check.out.concat(check.err_out)
+    let good = got == want && fixed.contains("{fixes} fix(es) applied") && check.success() && checked.trim() == "ok: src/calc.bl"
+    if !good { io.eprintln("got file:\n{got}\nfix:\n{fixed}\ncheck:\n{checked}") }
+    let _ = sh("rm -rf {dir}")
+    assert(good)
+}
+
+fn no_fix(stem: Str, src: Str, help: Str) ! Process.Spawn, IO, FS.Read, FS.Write {
+    let dir = package(stem, src)
+    let fix = blink_in(dir, "fix src/calc.bl")
+    let fixed = fix.out.concat(fix.err_out)
+    let got = fs.read("{dir}/src/calc.bl").unwrap()
+    let check = blink_in(dir, "check src/calc.bl")
+    let checked = check.out.concat(check.err_out)
+    let good = got == src && fixed.contains("0 fix(es) applied") && checked.contains("error[MethodThroughTypeName]") && checked.contains(help) && !checked.contains("  fix: ")
+    if !good { io.eprintln("got file:\n{got}\nfix:\n{fixed}\ncheck:\n{checked}") }
+    let _ = sh("rm -rf {dir}")
+    assert(good)
+}
+
+fn fix_then_run(stem: Str, src: Str, want: Str, printed: Str) ! Process.Spawn, IO, FS.Read, FS.Write {
+    let dir = package(stem, src)
+    let fix = blink_in(dir, "fix src/calc.bl")
+    let fixed = fix.out.concat(fix.err_out)
+    let got = fs.read("{dir}/src/calc.bl").unwrap()
+    let run = blink_in(dir, "run src/calc.bl")
+    let ran = run.out.concat(run.err_out)
+    let _ = sh("rm -rf {dir}")
+    let good = got == want && fixed.contains("1 fix(es) applied") && run.success() && run.out.trim() == printed
+    if !good { io.eprintln("got file:\n{got}\nfix:\n{fixed}\nrun:\n{ran}") }
+    assert(good)
+}
+
+fn wrap(body: Str) -> Str {
+    "fn main() \{\n{body}}\n"
+}
+
+test "a negative literal receiver moves before the dot in parentheses" {
+    fix_then_check("neg", wrap("    io.println(\"\{Int.abs(-3)}\")\n"), wrap("    io.println(\"\{(-3).abs()}\")\n"), 1)
+}
+
+test "a binary receiver moves before the dot in parentheses and the other arguments stay" {
+    let src = wrap("    let a = 1\n    let b = 2\n    let c = 3\n    io.println(\"\{Int.max(a + b, c)}\")\n")
+    let want = wrap("    let a = 1\n    let b = 2\n    let c = 3\n    io.println(\"\{(a + b).max(c)}\")\n")
+    fix_then_check("binop", src, want, 1)
+}
+
+test "a name receiver moves before the dot as it is" {
+    let src = wrap("    let s = \"abc\"\n    let n = Str.len(s)\n    io.println(\"\{n}\")\n")
+    let want = wrap("    let s = \"abc\"\n    let n = s.len()\n    io.println(\"\{n}\")\n")
+    fix_then_check("name", src, want, 1)
+}
+
+test "a user method moves its receiver before the dot" {
+    let decls = "trait Sh \{\n    fn sh(self) -> Int\n}\n\ntype T \{\n    x: Int\n}\n\nimpl Sh for T \{\n    fn sh(self) -> Int \{\n        self.x\n    }\n}\n\n"
+    let src = decls.concat(wrap("    let t = T \{ x: 4 }\n    io.println(\"\{T.sh(t)}\")\n"))
+    let want = decls.concat(wrap("    let t = T \{ x: 4 }\n    io.println(\"\{t.sh()}\")\n"))
+    fix_then_check("user", src, want, 1)
+}
+
+test "a string receiver written with escaped quotes inside an interpolation keeps them" {
+    fix_then_check("escaped", wrap("    io.println(\"\{Str.len(\\\"ab\\\")}\")\n"), wrap("    io.println(\"\{\\\"ab\\\".len()}\")\n"), 1)
+}
+
+test "a first argument of another type has help and no fix" {
+    no_fix("wrong_type", wrap("    let xs = [1, 2]\n    io.println(\"\{Str.len(xs)}\")\n"), "the first argument `xs` has type `List[Int]`, not `Str`")
+}
+
+test "a method that two owners give has help and no fix" {
+    let decls = "trait Shape \{\n    fn size(self) -> Int\n}\n\ntrait Box2 \{\n    fn size(self) -> Int\n}\n\ntype K \{\n    x: Int\n}\n\nimpl Shape for K \{\n    fn size(self) -> Int \{\n        1\n    }\n}\n\nimpl Box2 for K \{\n    fn size(self) -> Int \{\n        2\n    }\n}\n\n"
+    no_fix("two_owners", decls.concat(wrap("    let k = K \{ x: 1 }\n    io.println(\"\{K.size(k)}\")\n")), "use qualified syntax to choose an owner:")
+}
+
+test "a keyword argument keeps its label when the receiver moves" {
+    let decls = "trait Put \{\n    fn put(self, a: Int, -- by: Int = 1) -> Int\n}\n\ntype P \{\n    v: Int\n}\n\nimpl Put for P \{\n    fn put(self, a: Int, -- by: Int = 1) -> Int \{\n        self.v + a * by\n    }\n}\n\n"
+    let src = decls.concat(wrap("    let p = P \{ v: 0 }\n    io.println(\"\{P.put(p, 2, by: 3)}\")\n"))
+    let want = decls.concat(wrap("    let p = P \{ v: 0 }\n    io.println(\"\{p.put(2, by: 3)}\")\n"))
+    fix_then_check("keyword", src, want, 1)
+}
+
+test "a call that is the receiver of another call moves its own receiver" {
+    let src = wrap("    let a = -2\n    io.println(Int.abs(a).to_string())\n")
+    let want = wrap("    let a = -2\n    io.println(a.abs().to_string())\n")
+    fix_then_check("chain", src, want, 1)
+}
+
+test "a keyword argument in a call that is the receiver of another call keeps its label and the value" {
+    let decls = "trait Put \{\n    fn put(self, a: Int, -- by: Int = 1) -> Int\n}\n\ntype P \{\n    v: Int\n}\n\nimpl Put for P \{\n    fn put(self, a: Int, -- by: Int = 1) -> Int \{\n        self.v + a * by\n    }\n}\n\n"
+    let src = decls.concat(wrap("    let p = P \{ v: 0 }\n    io.println(P.put(p, 2, by: 3).to_string())\n"))
+    let want = decls.concat(wrap("    let p = P \{ v: 0 }\n    io.println(p.put(2, by: 3).to_string())\n"))
+    fix_then_run("keyword_chain", src, want, "6")
+}
+
+test "the trait line is left out when the file does not import the trait" {
+    let dir = package("unimported", "import shapes\nimport shapes.\{Bx}\n\nfn main() \{\n    let b = Bx \{ v: 2 }\n    io.println(\"\{Bx.sh(b)}\")\n}\n")
+    fs.write("{dir}/src/shapes.bl", "pub type Bx \{\n    v: Int\n}\n\npub trait Sh \{\n    fn sh(self) -> Int\n}\n\nimpl Sh for Bx \{\n    fn sh(self) -> Int \{\n        self.v\n    }\n}\n").unwrap()
+    let check = blink_in(dir, "check src/calc.bl")
+    let checked = check.out.concat(check.err_out)
+    let _ = sh("rm -rf {dir}")
+    assert(checked.contains("error[MethodThroughTypeName]") && checked.contains("call the method on the value: `b.sh()`") && !checked.contains("or name the trait"), checked)
+}

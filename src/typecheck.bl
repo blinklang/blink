@@ -34,7 +34,7 @@ import diagnostics.{
     UNSOLVED_TYPEVAR_AT_CODEGEN, SEALED_OPS_REWRITE_INVARIANT, VARIANT_WITHOUT_ENUM,
     NO_SUCH_VARIANT, TYPE_ERROR, TEMPLATE_MISMATCH, UNEXPECTED_ANNOTATION, MISSING_RETURN, NO_CONVERSION_IMPL, CANNOT_INFER_TYPE, NOT_ITERABLE, MISSING_ELSE, UNLICENSED_SELF_OP, TRAIT_BOUND_NOT_SATISFIED, CAPABILITY_BUDGET, QM_INVALID_OPERAND, UNDEFINED_FUNCTION,
     UNRESOLVED_METHOD, AMBIGUOUS_METHOD_CALL, MISSING_DISPLAY_IMPL,
-    MUTATION_REQUIRES_MUT, MUT_ON_PATTERN, NOT_A_PLACE, PARAM_ASSIGN, diag_error_label_at_notes, diag_add_note_at_spots_since, diag_error_span_label_at_notes, diag_warn_label_at_notes, EMPTY_ROW_OUTSIDE_FFI, PANIC_HOOK_PLACEMENT, TRACE_MESSAGE_EFFECT, EFFECTS_ANNOTATION_REMOVED, UNKNOWN_EFFECT, diag_fix_before_starts_with, diag_drop_fix_over_others, diag_drop_fix_at,
+    MUTATION_REQUIRES_MUT, MUT_ON_PATTERN, NOT_A_PLACE, PARAM_ASSIGN, diag_error_label_at_notes, diag_add_note_at_spots_since, diag_error_span_label_at_notes, diag_warn_label_at_notes, EMPTY_ROW_OUTSIDE_FFI, PANIC_HOOK_PLACEMENT, TRACE_MESSAGE_EFFECT, METHOD_THROUGH_TYPE_NAME, EFFECTS_ANNOTATION_REMOVED, UNKNOWN_EFFECT, diag_fix_before_starts_with, diag_drop_fix_over_others, diag_drop_fix_at,
     UNDEFINED_VARIABLE, UNKNOWN_TYPE, QM_RESULT_IN_NON_RESULT,
     QM_OPTION_IN_NON_OPTION, QM_ERROR_MISMATCH,
     QM_TEST_DISPLAY_REQUIRED, TEST_ANNOTATED_RETURN, SKIP_OUTSIDE_TEST,
@@ -3694,6 +3694,13 @@ fn tc_note_static_impl_call(head: Int, im: Int, call_node: Int, recv: Int, binds
     for t in tc_impl_binder_tids_of(im, binds) { tc_calls.open_tids.push(t) }
     tc_calls.open_tids.push(call_node)
     tc_calls.open_tids.push(recv)
+}
+
+// A method of a generic type runs on one instance, so a receiver that no binding holds and
+// nothing pins names none to build. The flush judges it as an open construction.
+fn tc_note_open_method_receiver(recv: Int, recv_t: Int) {
+    if recv < 0 || tc_scrut_is_named_place(recv) != 0 { return }
+    let _ = tc_note_open_variant(recv, recv_t)
 }
 
 fn tc_open_group_is_static_impl(g: Int) -> Bool {
@@ -7452,11 +7459,10 @@ fn tc_call_arg_parts(call: Int, expected: Int) -> List[ExpectedPart] {
     }
     let mut sig = -1
     let recorded = tc_call_decl_node(call)
-    if recorded >= 0 {
-        sig = fnsig_by_decl.get(recorded) ?? -1
-    } else if k == NodeKind.MethodCall {
-        sig = tc_receiver_method_sig(call)
-    }
+    if recorded >= 0 { sig = fnsig_by_decl.get(recorded) ?? -1 }
+    // A trait head records the trait's declaration, which has no signature; the impl the
+    // receiver picks has.
+    if sig == -1 && k == NodeKind.MethodCall { sig = tc_receiver_method_sig(call) }
     if sig == -1 { return parts }
     let fs = fnsig_pool.get(sig).unwrap()
     let decl = fs.decl
@@ -7508,13 +7514,54 @@ fn tc_call_arg_param_index(fs: FnSigEntry, self_offset: Int, arg: Int, i: Int) -
     i + self_offset
 }
 
-// The signature a method call on a struct or enum value, or on the type's name, reaches
-// before the call is inferred, read from the receiver's type as the MethodCall arm of
-// infer_type_uncached reads it. -1 when the receiver's type is not known yet or two traits
-// declare the method.
+// The type a receiver node has before the call is inferred: its recorded type, else the type
+// of the local it names. -1 when neither is known yet.
+fn tc_receiver_tid_so_far(recv: Int) -> Int {
+    if recv == -1 { return -1 }
+    let t = tc_lookup_node_tid(recv)
+    if t < 0 && node_kind(recv) == NodeKind.Ident { return nr_get_type(node_name(recv)) }
+    t
+}
+
+// A place's type is seeded into a call's arguments before the walk types the call's receiver
+// (a fn body's tail is seeded before the body is walked), so a method call's own type
+// parameters miss it then. Once the receiver is typed, the arguments take it.
+fn tc_seed_method_args_at_typed_receiver(call: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    let want = tc_method_calls.seeded_expected.get(call) ?? -1
+    let obj = node_obj(call)
+    if want < 0 || obj == -1 { return }
+    let head = node_kind(obj) == NodeKind.Ident && nr_receiver_has_binding(node_name(obj)) == 0
+    // A type or module head names no receiver to type: the seed read the type from its name.
+    if head && is_trait_name(node_name(obj)) == 0 { return }
+    let recv = if head { tc_arg_value_at(node_args(call), 0) } else { obj }
+    if recv == -1 { return }
+    let mut root = recv
+    while node_kind(root) == NodeKind.FieldAccess { root = node_obj(root) }
+    // A path through a module or a type is the arm's to read, not a value to infer here.
+    if node_kind(root) == NodeKind.Ident && nr_receiver_has_binding(node_name(root)) == 0 { return }
+    // Typed as the arm types it, so the walk keeps one answer for the node.
+    let _ = if head { infer_type(recv) } else { tc_infer_receiver(recv) }
+    for p in tc_call_arg_parts(call, want) {
+        tc_seed_expected_into_value(p.value, p.expected)
+    }
+}
+
+// The signature a method call on a struct or enum value, on the type's name, or through a
+// trait (`Tr.m(recv, ..)`) reaches before the call is inferred, read from the receiver's type
+// as the MethodCall arm of infer_type_uncached reads it. -1 when the receiver's type is not
+// known yet or two traits declare the method.
 fn tc_receiver_method_sig(call: Int) -> Int {
     let obj = node_obj(call)
     if obj == -1 { return -1 }
+    if node_kind(obj) == NodeKind.Ident && nr_receiver_has_binding(node_name(obj)) == 0 && is_trait_name(node_name(obj)) != 0 {
+        let rt = tc_receiver_tid_so_far(tc_arg_value_at(node_args(call), 0))
+        if tc_tid_is_no_info(rt) != 0 { return -1 }
+        let r = resolve_alias_tid(tc_resolve(rt))
+        let rk = tc_tid_kind(r)
+        let tname = if rk == TyKind.Struct || rk == TyKind.Enum { ty_pool.get(r).unwrap().name } else { tc_builtin_receiver_name(r) }
+        if tname == "" { return -1 }
+        return lookup_fnsig(tc_impl_method_stem(tname, tc_trait_ref_key(node_name(obj), nr_current_module), node_method(call)))
+    }
     let mut t = tc_lookup_node_tid(obj)
     if t < 0 && node_kind(obj) == NodeKind.Ident { t = nr_get_type(node_name(obj)) }
     // A name that binds no value is the type's own: `S.m(s, x)` passes the receiver first.
@@ -18699,7 +18746,7 @@ fn init_types() ! TypeCheck.Register {
     ty_param_list.clear()
     // The method-call facts span all three phases of one check_types, so they are cleared
     // here rather than in resolve_names with the registries that feed them.
-    tc_method_calls = MethodCallFacts { unresolved: [], hard: Map(), receiver_failed: Map(), seeded_expected: Map(), dropped: Map(), helper_fixes: Map(), bound_args: Map(), type_qualified: Map() }
+    tc_method_calls = new_method_call_facts()
     // Load-bearing for the daemon/LSP (long-lived processes, daemon.bl / lsp.bl): a
     // surviving intern map would hand out tids keyed against the PREVIOUS, since-cleared
     // pool on the next check_types() call — out-of-bounds unwrap panic or a silently
@@ -26188,6 +26235,10 @@ type MethodCallFacts {
     // §6.3.5). Recorded in Phase 1, the only phase that knows which names a scope binds.
     // Each call whose head names a type, to the `Self` type where it is written, or -1.
     type_qualified: Map[Int, Int]
+    // True while name resolution infers a `let` value ahead of the body walk. That walk has
+    // not typed a local bound to a literal yet, so a check that needs an argument's type waits
+    // for the body walk.
+    let_value_first_walk: Bool
 }
 
 type HelperFix {
@@ -26195,7 +26246,11 @@ type HelperFix {
     sig: Int
 }
 
-let mut tc_method_calls: MethodCallFacts = MethodCallFacts { unresolved: [], hard: Map(), receiver_failed: Map(), seeded_expected: Map(), dropped: Map(), helper_fixes: Map(), bound_args: Map(), type_qualified: Map() }
+let mut tc_method_calls: MethodCallFacts = new_method_call_facts()
+
+fn new_method_call_facts() -> MethodCallFacts {
+    MethodCallFacts { unresolved: [], hard: Map(), receiver_failed: Map(), seeded_expected: Map(), dropped: Map(), helper_fixes: Map(), bound_args: Map(), type_qualified: Map(), let_value_first_walk: false }
+}
 
 // Mark a method call the inference pass could not type and did not report on: the name
 // resolves somewhere in the program, so name resolution let it pass, but no arm here claims
@@ -26585,7 +26640,8 @@ fn tc_report_unknown_member(node: Int, written: Str, head: StaticHead, member: S
     let help = if near != "" {
         "did you mean the {kind} `{written}.{near}`?"
     } else if (member == "display" || member == "to_string") && tc_type_has_display_impl(head.owner) != 0 {
-        // Display's methods take a receiver, so the call is on a value or names the trait.
+        // Display's methods take a receiver, so the call is on a value or names the trait. A
+        // call `T.display(x)` is E0567 before it gets here, so only a read reaches this help.
         "`{member}` takes a receiver: call it on a value, as `x.{member}()`, or as `Display.display(x)`"
     } else {
         tc_path_members_listed(written, members)
@@ -26843,8 +26899,8 @@ fn tc_impl_qualified_calls(keys: List[Str], insts: List[Str], owner: Str, method
 
 // Whether a read `qual.name` (§3.4 *Member case*) names no member of the type `qual`: `name`
 // does not start with an uppercase letter, and no type-scoped function, associated function,
-// method, constant or built-in static of that type takes it. A method that takes `self` is
-// left out here as a call is: a call through the type name accepts it today.
+// method, constant or built-in static of that type takes it. A method that takes `self` counts
+// as a member here: a read of one is no call, so E0567 does not reach it.
 fn tc_type_path_member_unknown(qual: Str, name: Str, node: Int) -> Bool {
     if name.byte_len() == 0 || tc_name_is_upper(name) { return false }
     if tc_name_is_tparam_in_scope(qual) != 0 || tc_head_names_trait(qual) || tc_type_name_poisoned(qual) { return false }
@@ -26860,6 +26916,335 @@ fn tc_type_path_member_unknown(qual: Str, name: Str, node: Int) -> Bool {
     match tc_qualifier_owner(qual) {
         Some(o) => if tc_owner_has_variant(o, name) { return false }
         None => {}
+    }
+    true
+}
+
+// One owner of a method that takes `self` (§3.4 *A method called through its type name*):
+// `key` is the trait's identity key, or "" for a built-in method that no declared trait names,
+// such as `Int.abs`. `sealed` says that no program can write the trait.
+type SelfMethodOwner {
+    key: Str
+    sealed: Bool
+}
+
+fn tc_self_owner_listed(owners: List[SelfMethodOwner], key: Str) -> Bool {
+    for o in owners {
+        if o.key == key { return true }
+    }
+    false
+}
+
+// Whether `name` is a member of the `qual.` namespace (§2.12.3 *One `T.` namespace*): a
+// type-scoped function, an associated function, a conversion, a built-in static or a variant.
+// A method that takes `self` is not one.
+fn tc_type_path_names_member(qual: Str, head: StaticHead, name: Str) -> Bool {
+    let sig = tc_static_head_sig(head, name)
+    if sig != -1 && !tc_fnsig_takes_receiver(fnsig_pool.get(sig).unwrap(), head.owner) { return true }
+    if tc_conversion_trait_of(name) != "" { return true }
+    if tc_builtin_static_names(qual, head).contains(name) { return true }
+    let names = tc_method_distinct_trait_names(head.owner, name)
+    if names != "" {
+        for key in names.split(" and ") {
+            let decl = tc_trait_method_decl(key, name)
+            if decl >= 0 && !tc_fn_decl_takes_self(decl) { return true }
+        }
+    }
+    match tc_qualifier_owner(qual) {
+        Some(o) => tc_owner_has_variant(o, name)
+        None => false
+    }
+}
+
+// The owners that give the type `subject`, named `owner`, the method `name` with `self`: the
+// traits `x.name()` searches for a value `x` of that type (§3c.4 *Trait Method Lookup*). The
+// built-in owners come first, in the order E0522 lists them.
+fn tc_self_method_owners_of(subject: Int, owner: Str, name: Str) -> List[SelfMethodOwner] {
+    let mut out: List[SelfMethodOwner] = []
+    let k = if subject >= 0 { type_kind(subject) } else { TyKind.Unknown }
+    let user_kind = k == TyKind.Struct || k == TyKind.Enum || k == TyKind.Unknown
+    let mut sealed_named = false
+    if !user_kind {
+        for t in ["Sized", "Contains", "StrOps", "ListOps", "MapOps", "SetOps", "BytesOps", "StringBuildOps", "Joinable"] {
+            let tr = tc_trait_node_idx.get(t) ?? -1
+            if tr != -1 && tc_surface_row(t, tr).kinds.contains(k) && tc_fn_decl_takes_self(tc_trait_method_decl(t, name)) {
+                out.push(SelfMethodOwner { key: t, sealed: true })
+                sealed_named = true
+            }
+        }
+    }
+    let std_tr = tc_builtin_std_trait(k, name) ?? ""
+    if std_tr != "" && !tc_self_owner_listed(out, std_tr) { out.push(SelfMethodOwner { key: std_tr, sealed: false }) }
+    // A built-in method that no declared trait names still has an owner, as `x.abs()` finds it.
+    if !user_kind && !sealed_named && std_tr == "" && tc_builtin_method_arity(k, name) >= 0 && is_builtin_method_on_receiver(k, name) != 0 {
+        out.push(SelfMethodOwner { key: "", sealed: true })
+    }
+    let decl = if subject >= 0 { tc_tid_decl_node(subject) } else { -1 }
+    if decl >= 0 {
+        let derived = if name == "clone" { "Clone" } else { tc_derived_method_trait(name) }
+        if derived != "" && tc_decl_derives(decl, derived) != 0 && !tc_self_owner_listed(out, derived) {
+            out.push(SelfMethodOwner { key: derived, sealed: false })
+        }
+    }
+    // Display's `display` has no declaration: the compiler makes it from `fmt`.
+    if name == "display" && tc_type_has_display_impl(owner) != 0 && !tc_self_owner_listed(out, "Display") {
+        out.push(SelfMethodOwner { key: "Display", sealed: false })
+    }
+    let names = tc_trait_names_visible_here(tc_method_distinct_trait_names(owner, name))
+    if names != "" {
+        for key in names.split(" and ") {
+            let takes = tc_fn_decl_takes_self(tc_trait_method_decl(key, name)) || (key == "Display" && name == "display")
+            let sealed = is_sealed_builtin_trait(key) != 0
+            // `x.name()` on a built-in type finds the built-in method before a prelude trait
+            // that restates it, such as `SetPure`'s `contains`, so that trait is no owner there.
+            let tr = tc_trait_node_idx.get(key) ?? -1
+            let restated = tr != -1 && tc_prelude_modules.contains_key(node_module(tr))
+            let hidden = !user_kind && !sealed && key != std_tr && restated && out.len() > 0
+            if takes && !hidden && !tc_self_owner_listed(out, key) {
+                out.push(SelfMethodOwner { key: key, sealed: sealed })
+            }
+        }
+    }
+    out
+}
+
+// Whether a help may write the trait `key` by its name here: a trait the compiler knows, a
+// prelude trait, or one that this file's imports reach.
+fn tc_trait_nameable_here(key: Str) -> Bool {
+    if key.contains("@") { return false }
+    let tr = tc_trait_node_idx.get(key) ?? -1
+    if tr == -1 || tc_prelude_modules.contains_key(node_module(tr)) { return true }
+    is_builtin_name(key) != 0 || nr_bare_name_in_scope_here(key, nr_current_module) != 0
+}
+
+// The owners that the bounds of the type parameter `tp` give it for the method `name` with
+// `self`: a bound written inline, in a where clause, or reached through a supertrait.
+fn tc_self_method_owners_of_tparam(tp: Str, name: Str) -> List[SelfMethodOwner] {
+    let mut out: List[SelfMethodOwner] = []
+    let traits = tc_tparam_bound_traits(tp)
+    if tc_pipe_joined(traits) == "" { return out }
+    if name == "display" && tc_pipe_has(traits, "Display") != 0 { out.push(SelfMethodOwner { key: "Display", sealed: false }) }
+    for tm in tc_tmsig_pool {
+        if tm.method == name && tc_pipe_has(traits, tm.trait_name) != 0 && !tc_self_owner_listed(out, tm.trait_name) && tc_fn_decl_takes_self(tc_trait_method_decl(tm.trait_name, name)) {
+            out.push(SelfMethodOwner { key: tm.trait_name, sealed: is_sealed_builtin_trait(tm.trait_name) != 0 })
+        }
+    }
+    out
+}
+
+// Whether a value of type `arg_t` is a receiver of the type the head names: any instance of a
+// generic type, the type parameter itself, or the instance `exact` when the head names one in
+// full, as an alias does.
+fn tc_arg_is_head_type(arg_t: Int, tparam: Bool, qual: Str, subject: Int, exact: Int) -> Bool {
+    let t = resolve_alias_tid(tc_resolve(arg_t))
+    if tc_tid_is_no_info(t) != 0 { return false }
+    if tparam { return type_kind(t) == TyKind.Typevar && type_to_str(t) == qual }
+    if exact >= 0 { return tc_tid_same_type_at(t, exact, true, Map()) }
+    if subject < 0 { return false }
+    let k = type_kind(subject)
+    if type_kind(t) != k { return false }
+    if k == TyKind.Struct || k == TyKind.Enum { return tc_type_name(t) == tc_type_name(subject) }
+    true
+}
+
+// The receiver as written before a dot: a primary or postfix expression stays, any other gets
+// parentheses, as `(-3).abs()` and `(a + b).max(c)`.
+fn tc_receiver_text(arg: Int, text: Str) -> Str {
+    if tc_text_is_one_paren(text) { return text }
+    let k = node_kind(arg)
+    let literal = (k == NodeKind.IntLit || k == NodeKind.FloatLit) && !text.starts_with("-")
+    let postfix = k == NodeKind.Ident || k == NodeKind.Call || k == NodeKind.MethodCall || k == NodeKind.FieldAccess || k == NodeKind.IndexExpr
+    let primary = k == NodeKind.BoolLit || k == NodeKind.CharLit || k == NodeKind.InterpString || k == NodeKind.TupleLit || k == NodeKind.ListLit || k == NodeKind.StructLit
+    if literal || postfix || primary { text } else { "({text})" }
+}
+
+// An argument as written, a keyword argument with its label, or "" when its place is not known.
+fn tc_written_arg_text(arg: Int) -> Str {
+    if node_kind(arg) != NodeKind.NamedArg { return tc_written_operand(arg).text }
+    let v = tc_written_operand(node_value(arg)).text
+    if v == "" { "" } else { "{node_name(arg)}: {v}" }
+}
+
+// Where the call `head.name(args)` was written, from the head to its `)`, or a text of "" when
+// that is not known. A call that is the receiver of another call has no written span of its
+// own, so the `)` is read from the source after the last argument.
+fn tc_type_head_call_site(node: Int, head: Str, last_arg: Int) -> WrittenOperand {
+    let none = WrittenOperand { line: node_line(node), col: node_col(node), end_line: 0, end_col: 0, text: "" }
+    let obj = node_obj(node)
+    let v = if node_kind(last_arg) == NodeKind.NamedArg { node_value(last_arg) } else { last_arg }
+    let last = tc_written_operand(v)
+    if obj == -1 || last.text == "" { return none }
+    let file = diag_file_for_node(node)
+    let src = diag_source_line(file, last.end_line)
+    let mut i = last.end_col - 1
+    while i < src.byte_len() && src.byte_slice(i, i + 1) == " " { i = i + 1 }
+    if i < src.byte_len() && src.byte_slice(i, i + 1) == "," {
+        i = i + 1
+        while i < src.byte_len() && src.byte_slice(i, i + 1) == " " { i = i + 1 }
+    }
+    if i >= src.byte_len() || src.byte_slice(i, i + 1) != ")" { return none }
+    let text = tc_source_text(file, node_line(obj), node_col(obj), last.end_line, i + 2)
+    if !text.starts_with("{head}.") { return none }
+    WrittenOperand { line: node_line(obj), col: node_col(obj), end_line: last.end_line, end_col: i + 2, text: text }
+}
+
+// The name a help gives a value of the type `shown`: `s` for a `Str`, `xs` for a `List`, the
+// first letter of a type of the program, else `x`.
+fn tc_receiver_placeholder(shown: Str, tparam: Bool, subject: Int) -> Str {
+    if shown == "Str" { return "s" }
+    if shown == "List" { return "xs" }
+    if tparam || subject < 0 || tc_tid_decl_node(subject) < 0 { return "x" }
+    shown.byte_slice(0, 1).to_lower()
+}
+
+// The article as the type name is spoken: a `U8` and a `Unit` (a "you" sound), an `F32` (a
+// letter name before a digit).
+fn tc_article_for(word: Str) -> Str {
+    let c = word.byte_slice(0, 1)
+    let d = word.byte_slice(1, 2)
+    let letter_name = c == "F" && d >= "0" && d <= "9"
+    if c == "A" || c == "E" || c == "I" || c == "O" || letter_name { "an" } else { "a" }
+}
+
+// The owners a call `qual.name(args)` reaches when `name` is no member of the `qual.` namespace
+// but is a method with `self` that some owner gives the type, as resolution of `x.name()` sees
+// them; an empty list when the call is not MethodThroughTypeName.
+type MethodTypeHead {
+    head: StaticHead
+    tparam: Bool
+    subject: Int
+    owners: List[SelfMethodOwner]
+}
+
+fn tc_method_through_type_head(node: Int, qual: Str, name: Str) -> MethodTypeHead ! TypeCheck.Resolve, Diag.Report {
+    let none = MethodTypeHead { head: tc_static_head(qual), tparam: false, subject: -1, owners: [] }
+    if name.byte_len() == 0 || tc_name_is_upper(name) { return none }
+    if tc_head_names_trait(qual) || tc_type_name_poisoned(qual) { return none }
+    if is_import_module_name(qual) != 0 || is_builtin_namespace(qual) != 0 || tc_site_qualifier_module(qual, node) != "" { return none }
+    let head = none.head
+    // A trait's default body leaves `Self` a type parameter.
+    let tparam = tc_name_is_tparam_in_scope(qual) != 0 || (qual == "Self" && head.owner == "Self")
+    if !tparam && qual != "Self" && !tc_names_a_type(qual) { return none }
+    if tc_type_path_names_member(qual, head, name) { return none }
+    let subject = if tparam { -1 } else if head.inst >= 0 { resolve_alias_tid(head.inst) } else { resolve_alias_tid(resolve_type_name(head.owner)) }
+    let all_owners = if tparam { tc_self_method_owners_of_tparam(qual, name) } else { tc_self_method_owners_of(subject, head.owner, name) }
+    if all_owners.len() == 0 { return none }
+    // Two sealed traits that give a built-in type one method, as `Sized` and `BytesOps` give
+    // `Bytes` its `len`, are one built-in method: `by.len()` is not ambiguous.
+    let mut user_owned = false
+    for o in all_owners {
+        if o.key != "" && !o.sealed { user_owned = true }
+    }
+    let owners = if user_owned { all_owners } else { [all_owners.get(0).unwrap()] }
+    MethodTypeHead { head: head, tparam: tparam, subject: subject, owners: owners }
+}
+
+// What an E0567 report says: its notes, its help lines, and the call its fix writes ("" for no
+// fix). `wait` is true when the first argument has no type yet and the body walk reports it.
+type MethodTypeReport {
+    notes: List[Str]
+    helps: List[Str]
+    fix_text: Str
+    wait: Bool
+}
+
+fn tc_method_through_type_report(node: Int, qual: Str, name: Str, mt: MethodTypeHead) -> MethodTypeReport ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    let head = mt.head
+    let tparam = mt.tparam
+    let subject = mt.subject
+    let owners = mt.owners
+    let shown = if tparam { qual } else { head.owner }
+    let args = node_args(node)
+    let arg_tids = tc_infer_arg_tids(args)
+    let n_args = if args == -1 { 0 } else { sublist_length(args) }
+    // An argument whose place is not known is `...` in a help, and the call gets no fix.
+    let mut arg_texts: List[Str] = []
+    let mut texts_known = true
+    for i in 0..n_args {
+        let t = tc_written_arg_text(sublist_get(args, i))
+        if t == "" { texts_known = false }
+        arg_texts.push(if t == "" { "..." } else { t })
+    }
+    let first = if n_args > 0 { sublist_get(args, 0) } else { -1 }
+    let has_recv = first != -1 && node_kind(first) != NodeKind.NamedArg && node_kind(first) != NodeKind.SpreadExpr && tc_written_operand(first).text != ""
+    let first_t = if has_recv { arg_tids.get(0) ?? -1 } else { -1 }
+    let alias_t = if head.alias >= 0 { tc_head_decl_tid(qual) } else { -1 }
+    let exact = if tparam { -1 } else if head.inst >= 0 { resolve_alias_tid(head.inst) } else if alias_t >= 0 && !tc_tid_holds_typevar(alias_t) { alias_t } else { -1 }
+    let fits = has_recv && tc_arg_is_head_type(first_t, tparam, qual, subject, exact)
+    let first_unknown = has_recv && tc_tid_is_no_info(resolve_alias_tid(tc_resolve(first_t))) != 0
+    let mut out = MethodTypeReport { notes: [], helps: [], fix_text: "", wait: false }
+    // The body walk reaches this call again with the argument typed, and reports it then.
+    if first_unknown && tc_method_calls.let_value_first_walk {
+        out.wait = true
+        return out
+    }
+    let mut rest: List[Str] = []
+    for i in 1..n_args { rest.push(arg_texts.get(i).unwrap()) }
+    if has_recv && !fits && !first_unknown {
+        let want = if exact >= 0 { type_to_str(exact) } else { shown }
+        out.notes.push("the first argument `{arg_texts.get(0).unwrap()}` has type `{type_to_str(first_t)}`, not `{want}`")
+    }
+    if owners.len() >= 2 {
+        let std_tr = if subject >= 0 { tc_builtin_std_trait(type_kind(subject), name) ?? "" } else { "" }
+        let mut any_builtin = false
+        let mut named: List[Str] = []
+        let mut others: List[Str] = []
+        for o in owners {
+            if o.key == "" {
+                any_builtin = true
+            } else if o.sealed || o.key == std_tr {
+                any_builtin = true
+                named.push("`{tc_trait_shown(o.key)}`")
+            } else {
+                others.push("`{tc_trait_shown(o.key)}`")
+            }
+        }
+        if any_builtin && others.len() > 0 {
+            let what = if named.len() == 0 { "a built-in method" } else { "a built-in {named.join(" and ")} method" }
+            out.notes.push("`{name}` is {what} of `{shown}` and is also defined by {others.join(" and ")}")
+        }
+        let mut lines = ["use qualified syntax to choose an owner:"]
+        let all = arg_texts.join(", ")
+        for o in owners {
+            if o.key != "" { lines.push("  {tc_trait_shown(o.key)}.{name}({all})") }
+        }
+        out.helps.push(lines.join("\n"))
+    } else if fits {
+        let recv = tc_receiver_text(first, arg_texts.get(0).unwrap())
+        let call = "{recv}.{name}({rest.join(", ")})"
+        if texts_known { out.fix_text = call }
+        out.helps.push("call the method on the value: `{call}`")
+        let o = owners.get(0).unwrap()
+        if o.key != "" && !o.sealed && (tc_trait_node_idx.get(o.key) ?? -1) != -1 && tc_trait_nameable_here(o.key) {
+            out.helps.push("or name the trait: `{tc_trait_shown(o.key)}.{name}({arg_texts.join(", ")})`")
+        }
+    } else {
+        let ph = tc_receiver_placeholder(shown, tparam, subject)
+        out.helps.push("call the method on {tc_article_for(shown)} `{shown}` value, as `{ph}.{name}({rest.join(", ")})`")
+    }
+    out
+}
+
+// error[MethodThroughTypeName] for the call `qual.name(args)` (§3.4 *A method called through
+// its type name*). True when it reported, or left the report to the body walk; the caller then
+// has nothing more to type.
+fn tc_report_method_through_type_name(node: Int, qual: Str, name: Str) -> Bool ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    let mt = tc_method_through_type_head(node, qual, name)
+    if mt.owners.len() == 0 { return false }
+    trace.log("blink.tc.methodtype", "`{qual}.{name}`: {mt.owners.len()} owner(s), tparam {mt.tparam}")
+    let r = tc_method_through_type_report(node, qual, name, mt)
+    if r.wait { return true }
+    let line = node_line(node)
+    let col = tc_qualified_name_col(node, qual, name)
+    let start = if col == -1 { node_col(node) } else { col }
+    let end = start + name.byte_len()
+    let before = diag_entry_count()
+    // The head is named as it is written (`Self`, an alias), since the fix edits that text.
+    diag_error_span_label_at_notes("MethodThroughTypeName", METHOD_THROUGH_TYPE_NAME, "`{name}` is a method of `{qual}`, not a function of the type", node, line, start, end, "`{name}` takes its receiver before the dot", r.helps.join("\n"), r.notes)
+    if r.fix_text != "" {
+        let args = node_args(node)
+        let site = tc_type_head_call_site(node, qual, sublist_get(args, sublist_length(args) - 1))
+        if site.text != "" { tc_attach_fix(before, r.helps.get(0).unwrap(), [tc_replace_written(site, r.fix_text)]) }
     }
     true
 }
@@ -28220,7 +28605,10 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                     // the first check of them.
                     if vk != NodeKind.Ident { tc_seed_expected_into_value(val, ann_tid) }
                 }
+                let saved_first_walk = tc_method_calls.let_value_first_walk
+                tc_method_calls.let_value_first_walk = true
                 let inferred = infer_type(val)
+                tc_method_calls.let_value_first_walk = saved_first_walk
                 tc_construct_hint = saved_nr_hint
                 tc_ffi_scope_binder = saved_nr_binder
                 // The recorded type goes on the entry THIS let just defined, which is the
@@ -28548,7 +28936,10 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
             // A namespace receiver names no value, so the Ident walk has nothing to check on it.
             // Skipping it leaves that walk to report a namespace in a value position.
             let ue_handle_recv = node_kind(obj) == NodeKind.Ident && nr_names_ue_handle(node_name(obj))
-            if !ue_handle_recv && (node_kind(obj) != NodeKind.Ident || is_builtin_namespace(node_name(obj)) == 0 || (nr_top_index(node_name(obj)) != -1 && !nr_namespace_binding_out_of_scope(node_name(obj)))) {
+            // A type parameter head is a type path (`T.clone(x)`): typecheck decides it once the
+            // bounds are known, so E0567 is its one report.
+            let tparam_head = node_kind(obj) == NodeKind.Ident && nr_receiver_has_binding(node_name(obj)) == 0 && tc_name_is_tparam_in_scope(node_name(obj)) != 0
+            if !ue_handle_recv && !tparam_head && (node_kind(obj) != NodeKind.Ident || is_builtin_namespace(node_name(obj)) == 0 || (nr_top_index(node_name(obj)) != -1 && !nr_namespace_binding_out_of_scope(node_name(obj)))) {
                 let receiver_diags = diag_entry_count()
                 nr_check_node(obj)
                 if diag_any_errors_since(receiver_diags) > 0 { tc_method_calls.receiver_failed.insert(node, 1) }
@@ -33316,6 +33707,8 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
             }
         }
 
+        if tc_method_calls.seeded_expected.contains_key(node) { tc_seed_method_args_at_typed_receiver(node) }
+
         // `Option.Some(x)` and `Result.Err(e)` name the carrier directly (§3.4 resolution
         // step 1), so neither the expected type nor a user enum's namesake variant is asked.
         if obj_node != -1 && node_kind(obj_node) == NodeKind.Ident && nr_receiver_has_binding(node_name(obj_node)) == 0 {
@@ -33393,6 +33786,25 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                     }
                     return type_stringbuilder()
                 }
+            }
+        }
+
+        // `T.m(x)` for a method with `self` is no call the language has (§3.4 *A method called
+        // through its type name*). It is decided before the receiver is inferred as a value,
+        // where a type parameter's name reads as an undefined variable.
+        if obj_node != -1 && node_kind(obj_node) == NodeKind.Ident && nr_receiver_has_binding(node_name(obj_node)) == 0 {
+            if tc_report_method_through_type_name(node, node_name(obj_node), method) {
+                // Reported here, so the method-resolution flush adds no second report.
+                tc_method_calls.hard.insert(node, 1)
+                return tc_error_recovery_tid()
+            }
+            // Name resolution left a type parameter head to this check; any other member
+            // through it names no value.
+            let head = node_name(obj_node)
+            if tc_name_is_tparam_in_scope(head) != 0 {
+                tc_errors.push("undefined variable `{head}`")
+                diag_error_at("UndefinedVariable", UNDEFINED_VARIABLE, "undefined variable `{head}`", obj_node, tc_undefined_name_help(head))
+                tc_method_calls.receiver_failed.insert(node, 1)
             }
         }
 
@@ -34484,6 +34896,7 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
             let sole_trait = tc_method_trait_names(tname, method)
             let sig = tc_call_view_sig(tc_type_method_sig(tname, method))
             if sig != -1 {
+                tc_note_open_method_receiver(recv_node, obj_t)
                 // Before the argument check: an argument typed by an impl binder takes the
                 // receiver's type argument as its hint, as a List poly-impl argument does.
                 // A parameter that spells `Self` takes the receiver's type, so an argument
@@ -34921,6 +35334,7 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                         if qt_ims.len() >= 2 { return tc_instance_ambiguity(node, "{obj_name}.{method}", tc_type_str(qt_recv), qt_trait, method, qt_ims) }
                     }
                     if qt_sig != -1 {
+                        tc_note_open_method_receiver(tc_arg_value_at(qt_args, 0), qt_recv)
                         let qt_fs = fnsig_pool.get(qt_sig).unwrap()
                         // The receiver's type arguments answer a per-instance impl's binders,
                         // as on the instance path.

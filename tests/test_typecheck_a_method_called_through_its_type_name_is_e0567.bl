@@ -1,0 +1,202 @@
+// A call `T.m(recv, args)`, where `m` is a method that takes `self` and that some owner gives
+// `T`, is MethodThroughTypeName (E0567) on every type: a built-in type, a user type and a type
+// parameter (sections/03_types.md §3.4 *A method called through its type name*). The head is
+// "`m` is a method of `T`, not a function of the type" and the span is the method name. The fix
+// writes `recv.m(rest)`, and it is machine-applicable only when a first argument exists, its
+// type is `T`, and one owner gives the method. With one owner the help names a trait only when a
+// program can write it and it is not sealed; with two or more owners the help lists the
+// qualified call of every owner and there is no fix. Each failed lowercase `T.name` gets E0567
+// or E0505, never both: an exact method name is E0567 and no nearest-name search runs for it.
+// The trait-qualified call stays legal, with the bound written inline, in a where clause or
+// through a supertrait.
+
+import std.fs
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_reset}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+
+fn typecheck_probe(path: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    init_embedded_stdlib()
+    fs.write(path, src).unwrap()
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+}
+
+// Each error as "name line:col-end: message | help | label | fix | notes", in report order.
+// The fix reads "action `text` at line:col-end_line:end_col", or "-" when there is none.
+fn errors_of(src: Str) -> List[Str] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    typecheck_probe("build/test_typecheck_method_through_type_name_probe.bl", src)
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" {
+            let fix = if d.fix_action == "" { "-" } else { "`{d.fix_text}` at {d.fix_line}:{d.fix_col}-{d.fix_end_line}:{d.fix_end_col}" }
+            out.push("{d.name} {d.line}:{d.col}-{d.end_col}: {d.message} | {d.help} | {d.label} | {fix} | {d.notes.join("; ")}")
+        }
+    }
+    out
+}
+
+// The one error a source gets, or every error when it gets another count, so a failed assert
+// shows them.
+fn only_error(src: Str) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    let got = errors_of(src)
+    if got.len() != 1 { return "{got.len()} errors: {got.join(" || ")}" }
+    got.get(0).unwrap()
+}
+
+fn no_errors(src: Str) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    errors_of(src).join(" || ")
+}
+
+let SHOUT = "type Level \{ n: Int }\ntrait Shout \{\n    fn shout(self) -> Str\n}\nimpl Shout for Level \{\n    fn shout(self) -> Str \{ \"L\" }\n}\nfn Level_parse(s: Str) -> Level \{ Level \{ n: s.len() } }\nfn Level_shouts() -> Level \{ Level \{ n: 0 } }\n"
+
+let MEASURE = "trait Measure \{\n    fn len(self) -> Int\n}\n@allow(SealedMethodNameCollision)\nimpl Measure for Str \{\n    fn len(self) -> Int \{ 0 }\n}\n"
+
+test "a built-in method called through its type is e0567 with the receiver moved before the dot" {
+    let src = "fn main() \{\n    let _n = Int.abs(-3)\n}\n"
+    assert_eq(only_error(src), "MethodThroughTypeName 2:18-21: `abs` is a method of `Int`, not a function of the type | call the method on the value: `(-3).abs()` | `abs` takes its receiver before the dot | `(-3).abs()` at 2:14-2:25 | ")
+}
+
+test "a receiver that is not a primary expression gets parentheses and the other arguments stay" {
+    let src = "fn main() \{\n    let a = 1\n    let b = 2\n    let c = 3\n    let _n = Int.max(a + b, c)\n}\n"
+    assert_eq(only_error(src), "MethodThroughTypeName 5:18-21: `max` is a method of `Int`, not a function of the type | call the method on the value: `(a + b).max(c)` | `max` takes its receiver before the dot | `(a + b).max(c)` at 5:14-5:31 | ")
+}
+
+test "a method one sealed trait gives a built-in type has the fix and names no trait" {
+    let src = "fn main() \{\n    let _n = Str.len(\"abc\")\n}\n"
+    assert_eq(only_error(src), "MethodThroughTypeName 2:18-21: `len` is a method of `Str`, not a function of the type | call the method on the value: `\"abc\".len()` | `len` takes its receiver before the dot | `\"abc\".len()` at 2:14-2:28 | ")
+}
+
+test "a method of a generic built-in type takes any instance as its receiver" {
+    let src = "fn main() \{\n    let xs = [1, 2]\n    let _n = List.len(xs)\n}\n"
+    assert_eq(only_error(src), "MethodThroughTypeName 3:19-22: `len` is a method of `List`, not a function of the type | call the method on the value: `xs.len()` | `len` takes its receiver before the dot | `xs.len()` at 3:14-3:26 | ")
+}
+
+test "a method that a sealed trait and a user trait both give lists both owners and has no fix" {
+    let src = "{MEASURE}fn main() \{\n    let _n = Str.len(\"abc\")\n}\n"
+    assert_eq(only_error(src), "MethodThroughTypeName 9:18-21: `len` is a method of `Str`, not a function of the type | use qualified syntax to choose an owner:\n  Sized.len(\"abc\")\n  Measure.len(\"abc\") | `len` takes its receiver before the dot | - | `len` is a built-in `Sized` method of `Str` and is also defined by `Measure`")
+}
+
+test "a method that two user traits give lists both owners in place of e0522" {
+    let src = "trait Shape \{ fn size(self) -> Int }\ntrait Box2 \{ fn size(self) -> Int }\ntype K \{ x: Int }\nimpl Shape for K \{ fn size(self) -> Int \{ 1 } }\nimpl Box2 for K \{ fn size(self) -> Int \{ 2 } }\nfn main() \{\n    let k = K \{ x: 1 }\n    let _q = K.size(k)\n}\n"
+    assert_eq(only_error(src), "MethodThroughTypeName 8:16-20: `size` is a method of `K`, not a function of the type | use qualified syntax to choose an owner:\n  Shape.size(k)\n  Box2.size(k) | `size` takes its receiver before the dot | - | ")
+}
+
+test "a derived method called through its type has the fix and the trait line" {
+    let src = "@derive(Clone)\ntype P \{ v: Int }\nfn main() \{\n    let a = P \{ v: 1 }\n    let _b = P.clone(a)\n}\n"
+    assert_eq(only_error(src), "MethodThroughTypeName 5:16-21: `clone` is a method of `P`, not a function of the type | call the method on the value: `a.clone()`\nor name the trait: `Clone.clone(a)` | `clone` takes its receiver before the dot | `a.clone()` at 5:14-5:24 | ")
+}
+
+test "an exact method name is e0567 and its help does not name a near type-scoped function" {
+    let src = "{SHOUT}fn main() \{\n    let u = Level.parse(\"hi\")\n    let _a = Level.shout(u)\n}\n"
+    assert_eq(only_error(src), "MethodThroughTypeName 12:20-25: `shout` is a method of `Level`, not a function of the type | call the method on the value: `u.shout()`\nor name the trait: `Shout.shout(u)` | `shout` takes its receiver before the dot | `u.shout()` at 12:14-12:28 | ")
+}
+
+test "a name that is no method of the type stays e0505 with its nearest-name search" {
+    let src = "{SHOUT}fn main() \{\n    let _b = Level.parsr(\"hi\")\n}\n"
+    assert_eq(only_error(src), "UnresolvedMethod 11:20-25: no member `parsr` on type `Level` | did you mean the function `Level.parse`? | `Level` has no member `parsr` | `parse` at 11:20-11:25 | ")
+}
+
+test "a first argument of another type gets a note and no fix" {
+    let src = "fn main() \{\n    let xs = [1, 2, 3]\n    let _n = Str.len(xs)\n}\n"
+    assert_eq(only_error(src), "MethodThroughTypeName 3:18-21: `len` is a method of `Str`, not a function of the type | call the method on a `Str` value, as `s.len()` | `len` takes its receiver before the dot | - | the first argument `xs` has type `List[Int]`, not `Str`")
+}
+
+test "a call with no argument has no receiver to move and gets the form with no fix" {
+    let src = "fn main() \{\n    let _n = Int.abs()\n}\n"
+    assert_eq(only_error(src), "MethodThroughTypeName 2:18-21: `abs` is a method of `Int`, not a function of the type | call the method on an `Int` value, as `x.abs()` | `abs` takes its receiver before the dot | - | ")
+}
+
+test "the help names the type with the article it is spoken with" {
+    let src = "trait Sz \{ fn sz(self) -> Int }\nimpl Sz for U8 \{ fn sz(self) -> Int \{ 1 } }\nimpl Sz for F64 \{ fn sz(self) -> Int \{ 2 } }\nfn main() \{\n    let _a = U8.sz()\n    let _b = F64.sz()\n}\n"
+    let got = no_errors(src)
+    assert(got.contains("call the method on a `U8` value, as `x.sz()`"), got)
+    assert(got.contains("call the method on an `F64` value, as `x.sz()`"), got)
+}
+
+test "a string literal of another type is written in the note as the source has it" {
+    let src = "fn main() \{\n    let _n = Int.abs(\"s\")\n}\n"
+    assert_eq(only_error(src), "MethodThroughTypeName 2:18-21: `abs` is a method of `Int`, not a function of the type | call the method on an `Int` value, as `x.abs()` | `abs` takes its receiver before the dot | - | the first argument `\"s\"` has type `Str`, not `Int`")
+}
+
+test "a receiver written with escaped quotes inside an interpolation keeps them in the fix" {
+    let src = "fn main() \{\n    io.println(\"\{Str.len(\\\"ab\\\")}\")\n}\n"
+    assert_eq(only_error(src), "MethodThroughTypeName 2:22-25: `len` is a method of `Str`, not a function of the type | call the method on the value: `\\\"ab\\\".len()` | `len` takes its receiver before the dot | `\\\"ab\\\".len()` at 2:18-2:33 | ")
+}
+
+test "a method of a type parameter bound inline is e0567 with the fix" {
+    let src = "fn dup[T: Clone](x: T) -> T \{\n    T.clone(x)\n}\nfn main() \{\n    let _a = dup(1)\n}\n"
+    assert_eq(only_error(src), "MethodThroughTypeName 2:7-12: `clone` is a method of `T`, not a function of the type | call the method on the value: `x.clone()`\nor name the trait: `Clone.clone(x)` | `clone` takes its receiver before the dot | `x.clone()` at 2:5-2:15 | ")
+}
+
+test "a method of a type parameter bound in a where clause is e0567 with the fix" {
+    let src = "trait Dupe \{\n    fn dupe(self) -> Self\n}\ntype Bx[T] \{ v: T }\nimpl[T] Dupe for Bx[T] where T: Clone \{\n    fn dupe(self) -> Bx[T] \{\n        let w = self.v\n        Bx \{ v: T.clone(w) }\n    }\n}\nfn main() \{\n}\n"
+    assert_eq(only_error(src), "MethodThroughTypeName 8:19-24: `clone` is a method of `T`, not a function of the type | call the method on the value: `w.clone()`\nor name the trait: `Clone.clone(w)` | `clone` takes its receiver before the dot | `w.clone()` at 8:17-8:27 | ")
+}
+
+test "a method a supertrait of the bound gives a type parameter is e0567 with the fix" {
+    let src = "trait Named \{\n    fn name(self) -> Str\n}\ntrait Greeter: Named \{\n    fn greet(self) -> Str\n}\nfn hi[T: Greeter](x: T) -> Str \{\n    T.name(x)\n}\nfn main() \{\n}\n"
+    assert_eq(only_error(src), "MethodThroughTypeName 8:7-11: `name` is a method of `T`, not a function of the type | call the method on the value: `x.name()`\nor name the trait: `Named.name(x)` | `name` takes its receiver before the dot | `x.name()` at 8:5-8:14 | ")
+}
+
+test "a method called through Self in an impl is e0567 with the fix" {
+    let src = "{SHOUT}trait Twice \{\n    fn twice(self) -> Str\n}\nimpl Twice for Level \{\n    fn twice(self) -> Str \{ Self.shout(self) }\n}\nfn main() \{\n}\n"
+    assert_eq(only_error(src), "MethodThroughTypeName 14:34-39: `shout` is a method of `Self`, not a function of the type | call the method on the value: `self.shout()`\nor name the trait: `Shout.shout(self)` | `shout` takes its receiver before the dot | `self.shout()` at 14:29-14:45 | ")
+}
+
+test "the trait-qualified call stays legal for a built-in, a user and a derived method" {
+    let src = "{SHOUT}{MEASURE}@derive(Clone)\ntype P \{ v: Int }\nfn main() \{\n    let u = Level.parse(\"hi\")\n    let _a = Shout.shout(u)\n    let _n = Sized.len(\"abc\")\n    let _m = Measure.len(\"abc\")\n    let _c = Clone.clone(P \{ v: 1 })\n    let _l = Level.shouts()\n}\n"
+    assert_eq(no_errors(src), "")
+}
+
+test "the trait-qualified call stays legal on a type parameter bound inline, in a where clause or through a supertrait" {
+    let src = "trait Named \{\n    fn name(self) -> Str\n}\ntrait Greeter: Named \{\n    fn greet(self) -> Str\n}\nfn a[T: Clone](x: T) -> T \{ Clone.clone(x) }\ntype Bx[T] \{ v: T }\ntrait Dupe \{\n    fn dupe(self) -> Self\n}\nimpl[T] Dupe for Bx[T] where T: Clone \{\n    fn dupe(self) -> Bx[T] \{ Bx \{ v: Clone.clone(self.v) } }\n}\nfn c[T: Greeter](x: T) -> Str \{ Named.name(x) }\nfn main() \{\n    let _x = a(1)\n    let _y = Bx \{ v: 2 }.dupe()\n}\n"
+    assert_eq(no_errors(src), "")
+}
+
+test "a keyword argument stays in the fix with its label" {
+    let src = "trait Put \{\n    fn put(self, a: Int, -- by: Int = 1) -> Int\n}\ntype P \{ v: Int }\nimpl Put for P \{\n    fn put(self, a: Int, -- by: Int = 1) -> Int \{ self.v + a * by }\n}\nfn main() \{\n    let p = P \{ v: 0 }\n    let _n = P.put(p, 2, by: 3)\n}\n"
+    assert_eq(only_error(src), "MethodThroughTypeName 10:16-19: `put` is a method of `P`, not a function of the type | call the method on the value: `p.put(2, by: 3)`\nor name the trait: `Put.put(p, 2, by: 3)` | `put` takes its receiver before the dot | `p.put(2, by: 3)` at 10:14-10:32 | ")
+}
+
+test "a call that is the receiver of another call gets the fix" {
+    let src = "fn main() \{\n    let a = -2\n    let _s = Int.abs(a).to_string()\n}\n"
+    assert_eq(only_error(src), "MethodThroughTypeName 3:18-21: `abs` is a method of `Int`, not a function of the type | call the method on the value: `a.abs()` | `abs` takes its receiver before the dot | `a.abs()` at 3:14-3:24 | ")
+}
+
+test "an alias head takes only a receiver of the type it names" {
+    let src = "type IntList = List[Int]\nfn main() \{\n    let ys = [\"a\"]\n    let _n = IntList.len(ys)\n}\n"
+    assert_eq(only_error(src), "MethodThroughTypeName 4:22-25: `len` is a method of `IntList`, not a function of the type | call the method on a `List` value, as `xs.len()` | `len` takes its receiver before the dot | - | the first argument `ys` has type `List[Str]`, not `List[Int]`")
+}
+
+test "a method that two sealed traits give a built-in type is one owner and has the fix" {
+    let src = "fn main() \{\n    let by = Bytes.new()\n    let _n = Bytes.len(by)\n}\n"
+    assert_eq(only_error(src), "MethodThroughTypeName 3:20-23: `len` is a method of `Bytes`, not a function of the type | call the method on the value: `by.len()` | `len` takes its receiver before the dot | `by.len()` at 3:14-3:27 | ")
+}
+
+test "a std trait the file cannot name is no owner of a built-in method" {
+    let src = "fn main() \{\n    let st = Set.new[Int]()\n    let _b = Set.contains(st, 1)\n}\n"
+    assert_eq(only_error(src), "MethodThroughTypeName 3:18-26: `contains` is a method of `Set`, not a function of the type | call the method on the value: `st.contains(1)` | `contains` takes its receiver before the dot | `st.contains(1)` at 3:14-3:33 | ")
+}
+
+test "a method called through Self in a trait default body is e0567 with the fix" {
+    let src = "trait Sh \{\n    fn sh(self) -> Int\n    fn twice(self) -> Int \{ Self.sh(self) * 2 }\n}\nfn main() \{\n}\n"
+    assert_eq(only_error(src), "MethodThroughTypeName 3:34-36: `sh` is a method of `Self`, not a function of the type | call the method on the value: `self.sh()`\nor name the trait: `Sh.sh(self)` | `sh` takes its receiver before the dot | `self.sh()` at 3:29-3:42 | ")
+}
+
+test "the fix is labelled with the call on the value alone" {
+    typecheck_probe("build/test_typecheck_method_through_type_name_probe.bl", "@derive(Clone)\ntype P \{ v: Int }\nfn main() \{\n    let a = P \{ v: 1 }\n    let _b = P.clone(a)\n}\n")
+    let mut actions: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" { actions.push(d.fix_action) }
+    }
+    assert_eq(actions, ["call the method on the value: `a.clone()`"])
+}
+
+test "a string opened by an escaped quote inside an interpolation starts at the backslash" {
+    let src = "fn main() \{\n    let _s = \"\{Str.len(\\\"ab\\\")}\"\n}\n"
+    assert_eq(only_error(src), "MethodThroughTypeName 2:20-23: `len` is a method of `Str`, not a function of the type | call the method on the value: `\\\"ab\\\".len()` | `len` takes its receiver before the dot | `\\\"ab\\\".len()` at 2:16-2:31 | ")
+}
