@@ -3232,6 +3232,11 @@ type CallFacts {
     // tids that call settled. Mono reads the binders, so they stay after the walk.
     static_head_insts: Map[Int, Int]
     static_head_binders: Map[Int, List[Int]]
+    // Each instance or trait-qualified method call through an impl with binders that a later
+    // use may fill, in the order first walked (a Map does not keep it), with the impl binder
+    // tids its receiver gave (tc_note_method_impl_call).
+    method_impl_calls: List[Int]
+    method_impl_binds: Map[Int, MethodImplBinds]
     // The owner each static call's head names. Its spelling may not say it, as `Self` does not.
     static_owners: Map[Int, Str]
     // The trait each trait-qualified call's head names. A type of the same spelling in a
@@ -3257,8 +3262,17 @@ type CallFacts {
     // walk cannot tell it from no expected type by the slot alone.
     under_fn_type: Map[Int, Int]
 }
+// The impl a method call reached, its binder tids in header order, the receiver's type (what
+// `Self` reads as), and the fn whose body made the call.
+type MethodImplBinds {
+    im: Int
+    tids: List[Int]
+    recv: Int
+    enclosing: Int
+}
+
 fn new_call_facts() -> CallFacts {
-    CallFacts { open_calls: [], open_group: Map(), open_tids: [], reported: Map(), self_views: Map(), view_sigs: Map(), hash_aliases_above: [], derive_facts_above: [], derive_facts_low: 0, derive_facts_open: [], derive_facts_open_low: Map(), debug_unbuilt_seen: Map(), hash_by_bounds: false, static_head_insts: Map(), static_head_binders: Map(), static_owners: Map(), trait_heads: Map(), closure_expected_at: Map(), ret_ann: -1, missing_else: Map(), walk_returns: [], written_names: Map(), under_fn_type: Map() }
+    CallFacts { open_calls: [], open_group: Map(), open_tids: [], reported: Map(), self_views: Map(), view_sigs: Map(), hash_aliases_above: [], derive_facts_above: [], derive_facts_low: 0, derive_facts_open: [], derive_facts_open_low: Map(), debug_unbuilt_seen: Map(), hash_by_bounds: false, static_head_insts: Map(), static_head_binders: Map(), method_impl_calls: [], method_impl_binds: Map(), static_owners: Map(), trait_heads: Map(), closure_expected_at: Map(), ret_ann: -1, missing_else: Map(), walk_returns: [], written_names: Map(), under_fn_type: Map() }
 }
 let mut tc_calls: CallFacts = new_call_facts()
 
@@ -3676,6 +3690,84 @@ fn tc_open_group_is_static_impl(g: Int) -> Bool {
     tc_calls.open_tids.get(g).unwrap() == -6
 }
 
+// The bounds of the impl a method call reached, on its binders and in its `where` clause, at
+// the binder types its receiver gives (§3.6 Trait Bounds; sections/05_memory_compile_errors.md,
+// "Checked at the call"), by the rule of a call: a type parameter of the body has only the
+// bounds its binders give. A binder that inference fills after the call (`let mut l = []`,
+// `l.same()`, `l.push(x)`) is judged again once inference is done, against the binders of
+// the body that made the call. Reports at most one bound.
+fn tc_check_method_impl_bounds(sig: Int, recv: Int, node: Int) ! TypeCheck.Resolve, Diag.Report {
+    let im = tc_method_block.get(fnsig_pool.get(sig).unwrap().decl) ?? -1
+    if im == -1 || node_kind(im) != NodeKind.ImplBlock { return }
+    let binders = node_impl_binders(im)
+    if binders == -1 || sublist_length(binders) == 0 { return }
+    let tids = tc_impl_binder_tids_at(im, recv)
+    tc_check_impl_bounds(im, tc_impl_binds_with_self(im, tids, recv), node)
+    tc_note_method_impl_call(node, im, tids, recv)
+}
+
+// The impl's binder tids in header order, as the receiver type `recv` answers them, or -1 for
+// a binder it does not reach. A read only: unifying the impl's receiver type with `recv` would
+// fix a metavariable of the caller's receiver to the impl's shape, and the call has already
+// chosen the impl. A binder a metavariable answers keeps it, and the flush reads its solution.
+fn tc_impl_binder_tids_at(im: Int, recv: Int) -> List[Int] {
+    let binders = node_impl_binders(im)
+    let mut binds: Map[Str, Int] = Map()
+    let head = tc_impl_recv_tids.get(im) ?? -1
+    if head >= 0 { unify_typevar_binds(head, tc_resolve(recv), binds) }
+    let mut tids: List[Int] = []
+    for i in 0..sublist_length(binders) {
+        let tp = sublist_get(binders, i)
+        tids.push(binds.get(tc_binder_key(tp, node_name(tp))) ?? -1)
+    }
+    tids
+}
+
+// The binds tc_check_impl_bounds reads for impl `im` at binder `tids`, with `Self` read as the
+// receiver's type `self_tid` (-1: none), so a bound such as `T: Conv[Self]` or a `where Self: Sh`
+// clause is judged at it.
+fn tc_impl_binds_with_self(im: Int, tids: List[Int], self_tid: Int) -> Map[Str, Int] {
+    let mut binds = tc_impl_binds_by_name(im, tids)
+    if self_tid >= 0 {
+        for (k, v) in tc_self_binds(self_tid) {
+            if !binds.contains_key(k) { binds.insert(k, v) }
+        }
+    }
+    binds
+}
+
+// Only a call whose binders inference may still fill has anything left for the flush. A walk
+// of the call again replaces its record: the last walk's metavariables are the ones inference
+// fills.
+fn tc_note_method_impl_call(node: Int, im: Int, tids: List[Int], recv: Int) {
+    if tc_boundary_check_active == 0 || node < 0 { return }
+    let mut open = false
+    for t in tids {
+        if t >= 0 && tc_tid_has_unbound_metavar(t) != 0 { open = true }
+    }
+    if !open { return }
+    if !tc_calls.method_impl_binds.contains_key(node) { tc_calls.method_impl_calls.push(node) }
+    tc_calls.method_impl_binds.insert(node, MethodImplBinds { im: im, tids: tids, recv: recv, enclosing: tc_current_fn_node })
+}
+
+// The flush half of tc_check_method_impl_bounds. A binder still open is not judged: the
+// binding that holds it answers for it (E0301).
+fn tc_flush_method_impl_calls() ! TypeCheck.Resolve, Diag.Report {
+    for i in 0..tc_calls.method_impl_calls.len() {
+        let node = tc_calls.method_impl_calls.get(i).unwrap()
+        let rec = tc_calls.method_impl_binds.get(node).unwrap()
+        tc_judge_deferred_in_body(-1, rec.im, rec.tids, rec.recv, rec.enclosing, node)
+    }
+}
+
+// A deferred bound check of the call at `node`, in the body that made it. An error already on
+// the call's lines is the first report, such as a bound judged at the call.
+fn tc_judge_deferred_in_body(sig: Int, im: Int, tids: List[Int], self_tid: Int, enclosing: Int, node: Int) ! TypeCheck.Resolve, Diag.Report {
+    let end_line = if node_end_line(node) > node_line(node) { node_end_line(node) } else { node_line(node) }
+    if diag_errors_in_lines(diag_file_for_node(node), node_line(node), end_line) > 0 { return }
+    tc_check_bounds_in_body(sig, im, tids, self_tid, enclosing, node)
+}
+
 // The binds of an impl's binders by name, as tc_check_impl_bounds reads them, at the types
 // `tids` give them in header order. A slot with no judgeable type is left out. A type
 // parameter of the body being checked is judgeable: it has only the bounds its binders give.
@@ -3685,7 +3777,13 @@ fn tc_impl_binds_by_name(im: Int, tids: List[Int]) -> Map[Str, Int] {
     if binders == -1 { return out }
     for i in 0..sublist_length(binders) {
         let t = tc_resolve(tids.get(i) ?? -1)
-        if t >= 0 && tc_tid_is_judgeable_among(t, 1) { out.insert(node_name(sublist_get(binders, i)), t) }
+        // Keyed by name for the bound check and by binder for a bound's trait arguments, as
+        // a call's argument binds are (unify_typevar_binds).
+        if t >= 0 && tc_tid_is_judgeable_among(t, 1) {
+            let tp = sublist_get(binders, i)
+            out.insert(node_name(tp), t)
+            out.insert(tc_binder_key(tp, node_name(tp)), t)
+        }
     }
     out
 }
@@ -3716,9 +3814,7 @@ fn tc_ud_flush_static_impl_call(head: Int, g: Int) ! TypeCheck.Resolve, Diag.Rep
         }
     }
     if names.len() == 0 {
-        let end_line = if node_end_line(call_node) > node_line(call_node) { node_end_line(call_node) } else { node_line(call_node) }
-        if diag_errors_in_lines(diag_file_for_node(call_node), node_line(call_node), end_line) > 0 { return }
-        tc_check_bounds_in_body(-1, im, all, enclosing, call_node)
+        tc_judge_deferred_in_body(-1, im, all, -1, enclosing, call_node)
         return
     }
     tc_calls.reported.insert(head, 1)
@@ -4144,8 +4240,6 @@ fn tc_check_open_call_bounds(call_node: Int, g: Int) ! TypeCheck.Resolve, Diag.R
         pi = pi + 1
     }
     if !any_open { return }
-    let end_line = if node_end_line(call_node) > node_line(call_node) { node_end_line(call_node) } else { node_line(call_node) }
-    if diag_errors_in_lines(diag_file_for_node(call_node), node_line(call_node), end_line) > 0 { return }
     let enclosing = tc_calls.open_tids.get(g + 3 + 2 * n).unwrap()
     let mut tids: List[Int] = []
     pi = 0
@@ -4153,14 +4247,14 @@ fn tc_check_open_call_bounds(call_node: Int, g: Int) ! TypeCheck.Resolve, Diag.R
         tids.push(tc_calls.open_tids.get(g + 3 + pi).unwrap())
         pi = pi + 1
     }
-    tc_check_bounds_in_body(sig, -1, tids, enclosing, call_node)
+    tc_judge_deferred_in_body(sig, -1, tids, -1, enclosing, call_node)
 }
 
 // Judges a callee's bounds (fn `sig`, or impl `im` when sig is -1) at the types inference gave
 // its binders, by the rule of a call: a type parameter of the body that made the call has only
 // the bounds its binders give (§3.6). No frame is active at the flush, so this pushes that
 // body's frames and allow set again. A binder with no fixed type is not judged.
-fn tc_check_bounds_in_body(sig: Int, im: Int, tids: List[Int], enclosing: Int, node: Int) ! TypeCheck.Resolve, Diag.Report {
+fn tc_check_bounds_in_body(sig: Int, im: Int, tids: List[Int], self_tid: Int, enclosing: Int, node: Int) ! TypeCheck.Resolve, Diag.Report {
     let block = if enclosing >= 0 { tc_method_block.get(enclosing) ?? -1 } else { -1 }
     let in_impl = block != -1 && node_kind(block) == NodeKind.ImplBlock
     let in_trait = block != -1 && node_kind(block) == NodeKind.TraitDef
@@ -4177,7 +4271,7 @@ fn tc_check_bounds_in_body(sig: Int, im: Int, tids: List[Int], enclosing: Int, n
     tc_push_tparam_scope(impl_binders)
     tc_push_where_frames(impl_where)
     tc_push_tparam_scope(own_tps)
-    if sig >= 0 { tc_check_fn_bounds_at(sig, tids, node) } else { tc_check_impl_bounds(im, tc_impl_binds_by_name(im, tids), node) }
+    if sig >= 0 { tc_check_fn_bounds_at(sig, tids, node) } else { tc_check_impl_bounds(im, tc_impl_binds_with_self(im, tids, self_tid), node) }
     tc_pop_tparam_scope(own_tps)
     tc_pop_arith_frames(impl_where)
     tc_pop_tparam_scope(impl_binders)
@@ -4262,7 +4356,7 @@ fn tc_check_fn_value_bounds(node: Int) ! TypeCheck.Resolve, Diag.Report {
         tids.push(tc_calls.open_tids.get(g + 4 + pi).unwrap())
         pi = pi + 1
     }
-    tc_check_bounds_in_body(sig, -1, tids, enclosing, node)
+    tc_check_bounds_in_body(sig, -1, tids, -1, enclosing, node)
 }
 
 // A bare type parameter of the body being checked, passed where a binder has bounds: inside
@@ -4455,6 +4549,8 @@ fn tc_drop_open_calls() {
     tc_calls.open_calls = []
     tc_calls.open_group.clear()
     tc_calls.open_tids = []
+    tc_calls.method_impl_calls = []
+    tc_calls.method_impl_binds.clear()
 }
 
 // Report a binding whose type is under-determined — HM finished the region with a
@@ -6188,16 +6284,6 @@ fn tc_check_user_bounds(decl: Int, idx: Int, concrete: Int, binds: Map[Str, Int]
     let outer = if block == -1 { -1 } else if node_kind(block) == NodeKind.ImplBlock { node_impl_binders(block) } else if node_kind(block) == NodeKind.TraitDef { node_type_params(block) } else { -1 }
     if tc_report_unmet_user_bound(tp, outer, node_type_params(decl), concrete, binds, node, -1) != 0 { return }
     let _ = tc_report_user_bound_impl_bounds(tp, concrete, node, [])
-}
-
-// The bounds of the impl a method call reached, on its binders and in its `where` clause,
-// read at the receiver instance's arguments (sections/05_memory_compile_errors.md, "Checked
-// at the call"). Empty `ibinds` means the impl's binders are not read off the receiver, so
-// there is nothing to judge. Reports at most one bound.
-fn tc_check_impl_bounds_at_call(decl: Int, ibinds: Map[Str, Int], node: Int) ! TypeCheck.Resolve, Diag.Report {
-    let im = tc_method_block.get(decl) ?? -1
-    if im == -1 || node_kind(im) != NodeKind.ImplBlock { return }
-    tc_check_impl_bounds(im, ibinds, node)
 }
 
 fn tc_check_impl_bounds(im: Int, ibinds: Map[Str, Int], node: Int) ! TypeCheck.Resolve, Diag.Report {
@@ -33398,6 +33484,7 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                 let sig_name = tc_impl_method_stem("List", sole_trait, method)
                 let sig = tc_call_view_sig(lookup_fnsig(sig_name))
                 if sig != -1 {
+                    tc_check_method_impl_bounds(sig, obj_t, node)
                     let im = tc_poly_list_impl_node.get(sig_name) ?? -1
                     // The registry only ever holds nodes that passed the
                     // canonical single-binder gate at registration, so binders
@@ -33982,6 +34069,7 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                 if btrait != "" {
                     let bsig = lookup_fnsig(tc_impl_method_stem(bname, btrait, method))
                     if bsig != -1 {
+                        tc_check_method_impl_bounds(bsig, obj_t, node)
                         let bview = tc_call_view_sig(bsig)
                         let btids = check_arg_shapes("{bname}.{method}", bview, node_args(node), 1, node)
                         // Which declaration this call reached. Phase 1 could not say: it has
@@ -34036,7 +34124,7 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                 for (k, v) in tc_self_binds(obj_t) {
                     if !ibinds.contains_key(k) { ibinds.insert(k, v) }
                 }
-                tc_check_impl_bounds_at_call(fnsig_pool.get(sig).unwrap().decl, ibinds, node)
+                tc_check_method_impl_bounds(sig, obj_t, node)
                 if sole_trait == "" && fnsig_pool.get(sig).unwrap().decl < 0 {
                     tc_refuse_derived_method_at(obj_t, method, node)
                 }
@@ -34470,7 +34558,7 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                         for (k, v) in tc_self_binds(qt_recv) {
                             if !qt_ibinds.contains_key(k) { qt_ibinds.insert(k, v) }
                         }
-                        tc_check_impl_bounds_at_call(qt_fs.decl, qt_ibinds, node)
+                        tc_check_method_impl_bounds(qt_sig, qt_recv, node)
                         nr_note_call_decl(node, qt_fs.decl)
                         if node_type_params(node) != -1 {
                             return tc_call_with_type_args("{obj_name}.{method}", qt_sig, node, 0, qt_ibinds)
@@ -42474,6 +42562,7 @@ fn tc_infer_program_body(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Di
     tc_recheck_operators()
     tc_ud_flush_pending()
     tc_ud_flush_calls()
+    tc_flush_method_impl_calls()
     tc_ud_flush_fn_values()
     tc_refuse_deferred_conversions()
     tc_ud_flush_open_variants()
@@ -43424,6 +43513,8 @@ fn tc_stamp_type_field_defaults(td: Int, seen: List[Int]) ! TypeCheck.Resolve, T
     }
     // The program's flush has already run, and a default is a value no binding holds, so its
     // open constructions are judged here, where its walk ends.
+    tc_ud_flush_calls()
+    tc_flush_method_impl_calls()
     tc_ud_flush_fn_values()
     tc_ud_flush_open_variants()
     tc_drop_open_calls()
