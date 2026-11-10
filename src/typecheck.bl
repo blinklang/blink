@@ -3232,11 +3232,11 @@ type CallFacts {
     // tids that call settled. Mono reads the binders, so they stay after the walk.
     static_head_insts: Map[Int, Int]
     static_head_binders: Map[Int, List[Int]]
-    // Each instance or trait-qualified method call through an impl with binders that a later
-    // use may fill, in the order first walked (a Map does not keep it), with the impl binder
-    // tids its receiver gave (tc_note_method_impl_call).
-    method_impl_calls: List[Int]
-    method_impl_binds: Map[Int, MethodImplBinds]
+    // Each method call, trait-qualified call or conversion through an impl with binders that a
+    // later use may fill, in the order first walked (a Map does not keep it), with the impl
+    // binder tids the call gave (tc_note_impl_bound_call).
+    impl_bound_calls: List[Int]
+    impl_bound_binds: Map[Int, ImplBoundCall]
     // The owner each static call's head names. Its spelling may not say it, as `Self` does not.
     static_owners: Map[Int, Str]
     // The trait each trait-qualified call's head names. A type of the same spelling in a
@@ -3262,17 +3262,17 @@ type CallFacts {
     // walk cannot tell it from no expected type by the slot alone.
     under_fn_type: Map[Int, Int]
 }
-// The impl a method call reached, its binder tids in header order, the receiver's type (what
-// `Self` reads as), and the fn whose body made the call.
-type MethodImplBinds {
+// The impl a call reached, its binder tids in header order, the type `Self` reads as (a method
+// call's receiver, a conversion's target), and the fn whose body made the call.
+type ImplBoundCall {
     im: Int
     tids: List[Int]
-    recv: Int
+    self_tid: Int
     enclosing: Int
 }
 
 fn new_call_facts() -> CallFacts {
-    CallFacts { open_calls: [], open_group: Map(), open_tids: [], reported: Map(), self_views: Map(), view_sigs: Map(), hash_aliases_above: [], derive_facts_above: [], derive_facts_low: 0, derive_facts_open: [], derive_facts_open_low: Map(), debug_unbuilt_seen: Map(), hash_by_bounds: false, static_head_insts: Map(), static_head_binders: Map(), method_impl_calls: [], method_impl_binds: Map(), static_owners: Map(), trait_heads: Map(), closure_expected_at: Map(), ret_ann: -1, missing_else: Map(), walk_returns: [], written_names: Map(), under_fn_type: Map() }
+    CallFacts { open_calls: [], open_group: Map(), open_tids: [], reported: Map(), self_views: Map(), view_sigs: Map(), hash_aliases_above: [], derive_facts_above: [], derive_facts_low: 0, derive_facts_open: [], derive_facts_open_low: Map(), debug_unbuilt_seen: Map(), hash_by_bounds: false, static_head_insts: Map(), static_head_binders: Map(), impl_bound_calls: [], impl_bound_binds: Map(), static_owners: Map(), trait_heads: Map(), closure_expected_at: Map(), ret_ann: -1, missing_else: Map(), walk_returns: [], written_names: Map(), under_fn_type: Map() }
 }
 let mut tc_calls: CallFacts = new_call_facts()
 
@@ -3655,12 +3655,7 @@ fn tc_note_conversion_call(im: Int, call_node: Int, binds: Map[Str, Int]) {
     tc_calls.open_tids.push(-1)
     tc_calls.open_tids.push(im)
     tc_calls.open_tids.push(sublist_length(binders))
-    let mut i = 0
-    while i < sublist_length(binders) {
-        let tp = sublist_get(binders, i)
-        tc_calls.open_tids.push(binds.get(tc_binder_key(tp, node_name(tp))) ?? -1)
-        i = i + 1
-    }
+    for t in tc_impl_binder_tids_of(im, binds) { tc_calls.open_tids.push(t) }
 }
 
 // A static call through a type head whose impl has binders, as the group
@@ -3677,10 +3672,7 @@ fn tc_note_static_impl_call(head: Int, im: Int, call_node: Int, recv: Int, binds
     tc_calls.open_tids.push(-6)
     tc_calls.open_tids.push(im)
     tc_calls.open_tids.push(sublist_length(binders))
-    for i in 0..sublist_length(binders) {
-        let tp = sublist_get(binders, i)
-        tc_calls.open_tids.push(binds.get(tc_binder_key(tp, node_name(tp))) ?? -1)
-    }
+    for t in tc_impl_binder_tids_of(im, binds) { tc_calls.open_tids.push(t) }
     tc_calls.open_tids.push(call_node)
     tc_calls.open_tids.push(recv)
     tc_calls.open_tids.push(tc_current_fn_node)
@@ -3701,9 +3693,52 @@ fn tc_check_method_impl_bounds(sig: Int, recv: Int, node: Int) ! TypeCheck.Resol
     if im == -1 || node_kind(im) != NodeKind.ImplBlock { return }
     let binders = node_impl_binders(im)
     if binders == -1 || sublist_length(binders) == 0 { return }
-    let tids = tc_impl_binder_tids_at(im, recv)
-    tc_check_impl_bounds(im, tc_impl_binds_with_self(im, tids, recv), node)
-    tc_note_method_impl_call(node, im, tids, recv)
+    tc_check_impl_bounds_at_call(im, tc_impl_binder_tids_at(im, recv), recv, node)
+}
+
+// The impl's binder types in header order, as `binds` holds them by binder key, or -1 for a
+// binder it does not hold.
+fn tc_impl_binder_tids_of(im: Int, binds: Map[Str, Int]) -> List[Int] {
+    let mut tids: List[Int] = []
+    let binders = node_impl_binders(im)
+    if binders == -1 { return tids }
+    for i in 0..sublist_length(binders) {
+        let tp = sublist_get(binders, i)
+        tids.push(binds.get(tc_binder_key(tp, node_name(tp))) ?? -1)
+    }
+    tids
+}
+
+// The binds a conversion through impl `im` from `source` to `target` gives the impl's binders:
+// what the two sides fill, and a fresh metavariable for each binder they leave open, which a
+// later use may fill.
+fn tc_conversion_binds(im: Int, source: Int, target: Int) -> Map[Str, Int] {
+    let mut binds = tc_impl_fresh_binders(im)
+    let matched = tc_conversion_match_binds(im, source, target) ?? Map()
+    for key in matched.keys() { binds.insert(key, matched.get(key).unwrap()) }
+    binds
+}
+
+// A conversion reached impl `im` (`Wr.from(l)`, `Wr.try_from(l)`, `l.into()`) at `binds`.
+// Records it for the under-determined check, and judges the impl's bounds at it by the rule
+// of a method call, with `Self` read as the target the impl gives. Answers that target.
+fn tc_conversion_reached(im: Int, node: Int, binds: Map[Str, Int], target: Int) -> Int ! TypeCheck.Resolve, Diag.Report {
+    if tc_impl_is_poly_conversion(im) { tc_note_conversion_call(im, node, binds) }
+    let self_tid = substitute_typevar_tid(tc_impl_recv_tids.get(im) ?? target, binds)
+    if tc_impl_has_binders(im) { tc_check_impl_bounds_at_call(im, tc_impl_binder_tids_of(im, binds), self_tid, node) }
+    self_tid
+}
+
+fn tc_impl_has_binders(im: Int) -> Bool {
+    let binders = node_impl_binders(im)
+    binders != -1 && sublist_length(binders) != 0
+}
+
+// Judges impl `im`'s bounds at binder `tids` now, and records the call for
+// tc_flush_impl_bound_calls when inference may still fill a binder.
+fn tc_check_impl_bounds_at_call(im: Int, tids: List[Int], self_tid: Int, node: Int) ! TypeCheck.Resolve, Diag.Report {
+    tc_check_impl_bounds(im, tc_impl_binds_with_self(im, tids, self_tid), node)
+    tc_note_impl_bound_call(node, im, tids, self_tid)
 }
 
 // The impl's binder tids in header order, as the receiver type `recv` answers them, or -1 for
@@ -3711,16 +3746,10 @@ fn tc_check_method_impl_bounds(sig: Int, recv: Int, node: Int) ! TypeCheck.Resol
 // fix a metavariable of the caller's receiver to the impl's shape, and the call has already
 // chosen the impl. A binder a metavariable answers keeps it, and the flush reads its solution.
 fn tc_impl_binder_tids_at(im: Int, recv: Int) -> List[Int] {
-    let binders = node_impl_binders(im)
     let mut binds: Map[Str, Int] = Map()
     let head = tc_impl_recv_tids.get(im) ?? -1
     if head >= 0 { unify_typevar_binds(head, tc_resolve(recv), binds) }
-    let mut tids: List[Int] = []
-    for i in 0..sublist_length(binders) {
-        let tp = sublist_get(binders, i)
-        tids.push(binds.get(tc_binder_key(tp, node_name(tp))) ?? -1)
-    }
-    tids
+    tc_impl_binder_tids_of(im, binds)
 }
 
 // The binds tc_check_impl_bounds reads for impl `im` at binder `tids`, with `Self` read as the
@@ -3738,25 +3767,31 @@ fn tc_impl_binds_with_self(im: Int, tids: List[Int], self_tid: Int) -> Map[Str, 
 
 // Only a call whose binders inference may still fill has anything left for the flush. A walk
 // of the call again replaces its record: the last walk's metavariables are the ones inference
-// fills.
-fn tc_note_method_impl_call(node: Int, im: Int, tids: List[Int], recv: Int) {
+// fills, and a last walk that left none open was judged whole at the call.
+fn tc_note_impl_bound_call(node: Int, im: Int, tids: List[Int], self_tid: Int) {
     if tc_boundary_check_active == 0 || node < 0 { return }
     let mut open = false
     for t in tids {
         if t >= 0 && tc_tid_has_unbound_metavar(t) != 0 { open = true }
     }
-    if !open { return }
-    if !tc_calls.method_impl_binds.contains_key(node) { tc_calls.method_impl_calls.push(node) }
-    tc_calls.method_impl_binds.insert(node, MethodImplBinds { im: im, tids: tids, recv: recv, enclosing: tc_current_fn_node })
+    if !open {
+        if tc_calls.impl_bound_binds.remove(node).is_some() {
+            let at = tc_calls.impl_bound_calls.index_of(node) ?? -1
+            if at >= 0 { let _ = tc_calls.impl_bound_calls.remove(at) }
+        }
+        return
+    }
+    if !tc_calls.impl_bound_binds.contains_key(node) { tc_calls.impl_bound_calls.push(node) }
+    tc_calls.impl_bound_binds.insert(node, ImplBoundCall { im: im, tids: tids, self_tid: self_tid, enclosing: tc_current_fn_node })
 }
 
-// The flush half of tc_check_method_impl_bounds. A binder still open is not judged: the
+// The flush half of tc_check_impl_bounds_at_call. A binder still open is not judged: the
 // binding that holds it answers for it (E0301).
-fn tc_flush_method_impl_calls() ! TypeCheck.Resolve, Diag.Report {
-    for i in 0..tc_calls.method_impl_calls.len() {
-        let node = tc_calls.method_impl_calls.get(i).unwrap()
-        let rec = tc_calls.method_impl_binds.get(node).unwrap()
-        tc_judge_deferred_in_body(-1, rec.im, rec.tids, rec.recv, rec.enclosing, node)
+fn tc_flush_impl_bound_calls() ! TypeCheck.Resolve, Diag.Report {
+    for i in 0..tc_calls.impl_bound_calls.len() {
+        let node = tc_calls.impl_bound_calls.get(i).unwrap()
+        let rec = tc_calls.impl_bound_binds.get(node).unwrap()
+        tc_judge_deferred_in_body(-1, rec.im, rec.tids, rec.self_tid, rec.enclosing, node)
     }
 }
 
@@ -4125,7 +4160,7 @@ fn tc_choose_deferred_conversion(call_node: Int) -> Bool ! TypeCheck.Resolve, Di
         let sig = tc_conversion_method_sig(im, node_method(call_node))
         if sig != -1 { nr_note_call_decl(call_node, fnsig_pool.get(sig).unwrap().decl) }
     }
-    if tc_impl_is_poly_conversion(im) { tc_note_conversion_call(im, call_node, binds) }
+    let _ = tc_conversion_reached(im, call_node, binds, d.target)
     true
 }
 
@@ -4549,8 +4584,8 @@ fn tc_drop_open_calls() {
     tc_calls.open_calls = []
     tc_calls.open_group.clear()
     tc_calls.open_tids = []
-    tc_calls.method_impl_calls = []
-    tc_calls.method_impl_binds.clear()
+    tc_calls.impl_bound_calls = []
+    tc_calls.impl_bound_binds.clear()
 }
 
 // Report a binding whose type is under-determined — HM finished the region with a
@@ -34276,7 +34311,9 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
             let found = tc_conversion_impl_for("From", obj_t, target)
             if tc_defer_conversion(node, found, obj_t, target) { return target }
             let im = tc_judge_conversion(node, "`.into()`", "", "From", obj_t, target, found)
-            if im >= 0 && tc_impl_is_poly_conversion(im) { tc_note_conversion_call(im, node, tc_conversion_match_binds(im, obj_t, target) ?? Map()) }
+            if im >= 0 && (tc_impl_is_poly_conversion(im) || tc_impl_has_binders(im)) {
+                let _ = tc_conversion_reached(im, node, tc_conversion_binds(im, obj_t, target), target)
+            }
             return target
         }
 
@@ -35458,11 +35495,8 @@ fn tc_static_conversion(node: Int, obj_name: Str, named: Int, method: Str, src_t
     let sig = tc_conversion_method_sig(im, method)
     if sig == -1 { return -1 }
     nr_note_call_decl(node, fnsig_pool.get(sig).unwrap().decl)
-    let matched = tc_conversion_match_binds(im, src_t, target) ?? Map()
-    let mut binds = tc_impl_fresh_binders(im)
-    for key in matched.keys() { binds.insert(key, matched.get(key).unwrap()) }
-    if tc_impl_is_poly_conversion(im) { tc_note_conversion_call(im, node, binds) }
-    let self_t = substitute_typevar_tid(tc_impl_recv_tids.get(im) ?? target, binds)
+    let mut binds = tc_conversion_binds(im, src_t, target)
+    let self_t = tc_conversion_reached(im, node, binds, target)
     binds.insert("Self", self_t)
     binds.insert(tc_binder_key(SELF_BINDER_NODE, "Self"), self_t)
     substitute_typevar_tid(fnsig_pool.get(sig).unwrap().ret, binds)
@@ -35544,7 +35578,9 @@ fn tc_fresh_instance_tid(tid: Int) -> Int {
 // the target when it names the qualifier's own type and an impl answers for it there, or
 // when the source is still open and so cannot rule the annotation out yet.
 fn tc_static_conversion_target(trait_name: Str, src_t: Int, named: Int) -> Int {
-    let hint = if tc_construct_hint < 0 { -1 } else { tc_conversion_target_of(trait_name, tc_construct_hint) }
+    // A generic callee's parameter (`take[U](w: Wr[U])`) is filled by this call, so its
+    // binders are metavariables the chosen impl solves, as at `.into()`.
+    let hint = if tc_construct_hint < 0 { -1 } else { tc_conversion_target_of(trait_name, tc_with_foreign_typevars_fresh(tc_construct_hint)) }
     let decl = tc_tid_decl_node(named)
     if hint < 0 || decl < 0 || tc_tid_decl_node(hint) != decl { return named }
     // A head an alias closed leaves no argument for the annotation to name.
@@ -42555,14 +42591,22 @@ fn tc_infer_program_body(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Di
     nr_pop_scope()
     // Last: every constraining use in the program has now run, so a deferred alias blame
     // whose metavar is still unbound is genuinely under-determined. A deferred conversion
-    // no definition chose (a module-scope one has no definition) is chosen first, since the
-    // impl it chooses can settle what the others judge, and refused last, so a binding or call
-    // that names the open type answers for it.
+    // no definition chose (a module-scope one has no definition) is chosen here.
+    tc_flush_program_deferrals(true)
+}
+
+// The checks a walk leaves until its last use has run: at the end of the program, and at
+// the end of a field default's walk, since a default is a value no body holds. A deferred
+// conversion is chosen first, since the impl it chooses can settle what the others judge,
+// and refused late, so a binding or call that names the open type answers for it. Only the
+// program's flush re-walks the operators (`program`): that walk covers every node the parser
+// kept, not the one default.
+fn tc_flush_program_deferrals(program: Bool) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     tc_flush_deferred_conversions()
-    tc_recheck_operators()
+    if program { tc_recheck_operators() }
     tc_ud_flush_pending()
     tc_ud_flush_calls()
-    tc_flush_method_impl_calls()
+    tc_flush_impl_bound_calls()
     tc_ud_flush_fn_values()
     tc_refuse_deferred_conversions()
     tc_ud_flush_open_variants()
@@ -43513,11 +43557,7 @@ fn tc_stamp_type_field_defaults(td: Int, seen: List[Int]) ! TypeCheck.Resolve, T
     }
     // The program's flush has already run, and a default is a value no binding holds, so its
     // open constructions are judged here, where its walk ends.
-    tc_ud_flush_calls()
-    tc_flush_method_impl_calls()
-    tc_ud_flush_fn_values()
-    tc_ud_flush_open_variants()
-    tc_drop_open_calls()
+    tc_flush_program_deferrals(false)
     tc_boundary_check_active = saved_boundary
     nr_current_module = saved_module
     tc_pop_tparam_scope(tparams)

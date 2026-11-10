@@ -1,0 +1,196 @@
+// A conversion through a generic From or TryFrom impl holds that impl's bounds at the type
+// arguments the call gives its binders (§3.6 Trait Bounds, §3c.2). A bound written on the
+// binder, one in an impl's where clause, one given through a supertrait, a bound that names
+// `Self`, a bound on a generic trait at its trait arguments, and a concrete type that has the
+// trait each meet it, for `Type.from(x)`, `Type.try_from(x)` and `x.into()`, and for an
+// argument a use after the call fills. Each form builds and runs, and the impl's body uses
+// the bound it asks for.
+
+type Wr[T] { v: List[T] }
+
+// Keeps the list only when its first two items differ, so the result shows `==` ran.
+impl[T: Eq] From[List[T]] for Wr[T] {
+    fn from(v: List[T]) -> Wr[T] {
+        if v.len() > 1 && v.get(0).unwrap() == v.get(1).unwrap() { Wr { v: [] } } else { Wr { v: v } }
+    }
+}
+
+type Tw[T] { v: List[T] }
+
+impl[T: Eq] TryFrom[List[T]] for Tw[T] {
+    fn try_from(v: List[T]) -> Result[Tw[T], ConversionError] {
+        if v.len() > 1 && v.get(0).unwrap() == v.get(1).unwrap() { Err(ConversionError { message: "same", source_type: "List", target_type: "Tw" }) } else { Ok(Tw { v: v }) }
+    }
+}
+
+trait Conv[A] {
+    fn conv(self) -> Int
+}
+
+trait Wide[K]: Conv[K] {
+    fn wide(self) -> Int
+}
+
+impl Conv[Int] for Int {
+    fn conv(self) -> Int { self * 10 }
+}
+
+impl Wide[Int] for Int {
+    fn wide(self) -> Int { self }
+}
+
+type Pc[K, V] { total: Int }
+
+impl[K, V: Conv[K]] From[List[V]] for Pc[K, V] {
+    fn from(v: List[V]) -> Pc[K, V] {
+        let mut t = 0
+        for x in v { t = t + x.conv() }
+        Pc { total: t }
+    }
+}
+
+type Sb[T] { n: Int }
+
+impl[T: Conv[Self]] From[List[T]] for Sb[T] {
+    fn from(v: List[T]) -> Sb[T] {
+        let mut t = 0
+        for x in v { t = t + x.conv() }
+        Sb { n: t }
+    }
+}
+
+impl Conv[Sb[Int]] for Int {
+    fn conv(self) -> Int { self + 1 }
+}
+
+trait Ck {
+    fn chk(self) -> Int
+}
+
+type Bx[T] { v: T }
+
+impl[T] Ck for Bx[T] where T: Eq {
+    fn chk(self) -> Int {
+        let mut l = []
+        let w = Wr.from(l)
+        l.push(self.v)
+        let u: Wr[T] = [self.v, self.v].into()
+        w.v.len() + u.v.len() + Wr.from([self.v]).v.len() + Tw.try_from([self.v]).unwrap().v.len()
+    }
+}
+
+fn inline[T: Eq](x: T, y: List[T]) -> Int {
+    let mut l = []
+    let w = Wr.from(l)
+    l.push(x)
+    let mut m = []
+    let t = Tw.try_from(m)
+    m.push(x)
+    let v: Wr[T] = y.into()
+    let r = match Tw.try_from(y) {
+        Ok(tw) => tw.v.len()
+        Err(_) => 100
+    }
+    w.v.len() + v.v.len() + Wr.from(y).v.len() + r + t.unwrap().v.len()
+}
+
+fn through_super[T: Ord](y: List[T]) -> Int {
+    let u: Wr[T] = y.into()
+    u.v.len() + Wr.from(y).v.len()
+}
+
+fn at_args[K2, A: Wide[K2]](l: List[A]) -> Int {
+    let p: Pc[K2, A] = Pc.from(l)
+    let q: Pc[K2, A] = l.into()
+    p.total + q.total
+}
+
+fn at_self[T: Conv[Sb[T]]](l: List[T]) -> Int {
+    let s: Sb[T] = l.into()
+    Sb.from(l).n + s.n
+}
+
+fn concrete() -> Int {
+    let mut l = []
+    let w = Wr.from(l)
+    l.push(1)
+    let u: Wr[Str] = ["a", "b"].into()
+    w.v.len() + u.v.len() + Tw.try_from([1]).unwrap().v.len()
+}
+
+test "a bound on the binder meets a conversion's bound" {
+    // A list is shared, not copied (§3.6), so `w` and `t` hold the `x` pushed after the call.
+    assert_eq(inline(3, [1, 2]), 1 + 2 + 2 + 2 + 1)
+    assert_eq(inline(3, [4, 4]), 1 + 0 + 0 + 100 + 1)
+}
+
+test "a bound in an impl's where clause meets a conversion's bound" {
+    assert_eq(Bx { v: 5 }.chk(), 1 + 0 + 1 + 1)
+}
+
+test "a bound given through a supertrait meets a conversion's bound" {
+    assert_eq(through_super(["x", "y"]), 4)
+    assert_eq(through_super(["x", "x"]), 0)
+}
+
+test "a bound on a generic trait at its trait arguments meets a conversion's bound" {
+    assert_eq(at_args[Int, Int]([1, 2]), 60)
+}
+
+test "a bound that names Self meets a conversion's bound" {
+    assert_eq(at_self([1, 2]), 10)
+}
+
+test "a concrete type that has the trait meets a conversion's bound" {
+    assert_eq(concrete(), 1 + 2 + 1)
+}
+
+type Sd[T: Eq] { w: Wr[T] = Wr.from([]), u: Wr[T] = [].into(), n: Int = 1 }
+
+test "a bound on the type's parameter meets a conversion's bound in a field default" {
+    let s: Sd[Int] = Sd {}
+    assert_eq(s.w.v.len() + s.u.v.len() + s.n, 1)
+}
+
+fn take[U](w: Wr[U]) -> Int { w.v.len() }
+
+fn tk2[U](r: Result[Tw[U], ConversionError]) -> Int {
+    match r {
+        Ok(t) => t.v.len()
+        Err(_) => 100
+    }
+}
+
+fn at_callee[T: Eq](l: List[T]) -> Int {
+    take(Wr.from(l)) + tk2(Tw.try_from(l)) + take(l.into())
+}
+
+test "a conversion a generic callee's argument holds meets its bound" {
+    assert_eq(at_callee([1, 2]), 6)
+    assert_eq(at_callee([4, 4]), 100)
+}
+
+type Nb[T] { v: List[T] }
+
+impl[T] From[List[T]] for Nb[T] {
+    fn from(v: List[T]) -> Nb[T] { Nb { v: v } }
+}
+
+type Nt[T] { v: List[T] }
+
+impl[T] TryFrom[List[T]] for Nt[T] {
+    fn try_from(v: List[T]) -> Result[Nt[T], ConversionError] { Ok(Nt { v: v }) }
+}
+
+fn take_nb[U](w: Nb[U]) -> Int { w.v.len() }
+
+fn take_nt[U](r: Result[Nt[U], ConversionError]) -> Int { r.unwrap().v.len() }
+
+fn at_callee_unbound[T](l: List[T]) -> Int {
+    take_nb(Nb.from(l)) + take_nt(Nt.try_from(l)) + take_nb(l.into())
+}
+
+test "a conversion a generic callee's argument holds through an impl with no bound builds and runs" {
+    assert_eq(at_callee_unbound([1, 2]), 6)
+    assert_eq(at_callee_unbound(["a"]), 3)
+}
