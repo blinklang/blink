@@ -1,0 +1,205 @@
+// A value shown through Display, in an interpolation hole, at a print sink, through
+// `.display()` or at a `T: Display` bound, calls the `fmt` of the Display impl its type reaches,
+// so that impl's bounds hold at the value's type (§3.6 Trait Bounds, "Polymorphic Trait
+// Implementations"). An instance where a bound of its only Display impl does not hold does not
+// implement Display, and a failed Display bound is E0523 at every call (§3.6). The report is at
+// the shown value: in a body whose type parameter the value holds, at a concrete type, inside a
+// tuple, one type down, and when a use after the hole fills the value's type. A note names the
+// impl's bound, and the help writes the bound on the body's binder or the impl of the trait. A
+// miss is one report. A bound written on the body's binder, in its impl's where clause, or given
+// through a supertrait meets it, and so does a concrete type that has the trait.
+
+import std.fs
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_reset}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+
+fn probe(path: Str, src: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    init_embedded_stdlib()
+    fs.write(path, src).unwrap()
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+    program
+}
+
+fn errors_reported() -> List[Str] {
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" { out.push("{d.code} {d.line}:{d.col} | {d.help}") }
+    }
+    out
+}
+
+// The program shares one prelude, so the body under test starts on line 11.
+fn errors_for(name: Str, body: Str) -> List[Str] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    let src = [
+        "trait Tag \{ fn tag(self) -> Int }",
+        "trait Big: Tag \{ fn big(self) -> Int }",
+        "impl Tag for Int \{ fn tag(self) -> Int \{ self } }",
+        "type Bx[T] \{ v: T }",
+        "impl[T] Display for Bx[T] where T: Tag \{ fn fmt(self, sb: StringBuilder) \{ sb.write(\"bx\{self.v.tag()}\") } }",
+        "type Cx[T] \{ v: T }",
+        "impl[T: Tag] Display for Cx[T] \{ fn fmt(self, sb: StringBuilder) \{ sb.write(\"cx\{self.v.tag()}\") } }",
+        "type NoTag \{ a: Int }",
+        "trait Ck \{ fn chk(self) -> Str }",
+        "type Hold[T] \{ v: T }",
+        body,
+        "fn main() \{ }",
+        "",
+    ].join("\n")
+    let _ = probe("build/tc_display_impl_bound_{name}.bl", src)
+    errors_reported()
+}
+
+// Refused: a bound of the Display impl that the shown value's type misses.
+
+test "an interpolation hole is E0523 at a where bound of the Display impl a type parameter misses" {
+    assert_eq(errors_for("hole_where", "fn bad[U](u: U) -> Str \{ \"\{Bx \{ v: u }}\" }"),
+        ["E0523 11:28 | write the bound on the binder: `[U: Tag]`"])
+}
+
+test "an interpolation hole is E0523 at a binder bound of the Display impl a type parameter misses" {
+    assert_eq(errors_for("hole_binder", "fn bad[U](u: U) -> Str \{ \"\{Cx \{ v: u }}\" }"),
+        ["E0523 11:28 | write the bound on the binder: `[U: Tag]`"])
+}
+
+test "an interpolation hole is E0523 at a binder bound of the Display impl a concrete type misses" {
+    assert_eq(errors_for("hole_concrete", "fn bad() -> Str \{ \"\{Cx \{ v: NoTag \{ a: 1 } }}\" }"),
+        ["E0523 11:21 | write `impl Tag for NoTag`, or show a value whose type implements Tag"])
+}
+
+test "a tuple hole is E0523 at a bound of the Display impl of its element" {
+    assert_eq(errors_for("hole_tuple", "fn bad[U](u: U) -> Str \{ \"\{(1, Bx \{ v: u })}\" }"),
+        ["E0523 11:28 | write the bound on the binder: `[U: Tag]`"])
+}
+
+test "a print sink is E0523 at a bound of the Display impl a type parameter misses" {
+    assert_eq(errors_for("sink", [
+        "fn bad[U](u: U) ! IO \{ io.println(Bx \{ v: u }) }",
+        "fn bad2[U](u: U, sb: StringBuilder) \{ sb.write(Cx \{ v: u }) }",
+    ].join("\n")), [
+        "E0523 11:35 | write the bound on the binder: `[U: Tag]`",
+        "E0523 12:48 | write the bound on the binder: `[U: Tag]`",
+    ])
+}
+
+test "a display call is E0523 at a bound of the Display impl a type parameter misses" {
+    assert_eq(errors_for("display_call", "fn bad[U](u: U) -> Str \{ Bx \{ v: u }.display() }"),
+        ["E0523 11:26 | write the bound on the binder: `[U: Tag]`"])
+}
+
+test "a qualified display call is E0523 at its argument at a bound of the Display impl it misses" {
+    assert_eq(errors_for("qual_display", "fn bad[U](u: U) -> Str \{ Display.display(Bx \{ v: u }) }"),
+        ["E0523 11:42 | write the bound on the binder: `[U: Tag]`"])
+}
+
+test "a Display bound of a call is E0523 at an argument whose Display impl misses a bound" {
+    assert_eq(errors_for("call_bound", [
+        "fn p[T: Display](x: T) -> Str \{ \"\{x}\" }",
+        "fn bad() -> Str \{ p(Cx \{ v: NoTag \{ a: 1 } }) }",
+    ].join("\n")), ["E0523 12:21 | write `impl Tag for NoTag`, or show a value whose type implements Tag"])
+}
+
+test "a hole is E0523 at a bound of the Display impl of a type one level down" {
+    assert_eq(errors_for("nested", [
+        "type Pl[T] \{ v: T }",
+        "impl[T: Display] Display for Pl[T] \{ fn fmt(self, sb: StringBuilder) \{ sb.write(\"pl\{self.v}\") } }",
+        "fn bad[U](u: U) -> Str \{ \"\{Pl \{ v: Bx \{ v: u } }}\" }",
+    ].join("\n")), ["E0523 13:28 | write the bound on the binder: `[U: Tag]`"])
+}
+
+test "an interpolation hole is E0523 at a bound of the Display impl when a use after it fills the type" {
+    assert_eq(errors_for("late", [
+        "fn bad() -> Str \{",
+        "    let mut l = []",
+        "    let s = \"\{Bx \{ v: l }}\"",
+        "    l.push(NoTag \{ a: 1 })",
+        "    s",
+        "}",
+    ].join("\n")), ["E0523 13:15 | write `impl Tag for List[NoTag]`, or show a value whose type implements Tag"])
+}
+
+test "a tuple hole is E0523 at its first element when a use after it fills that element's type" {
+    assert_eq(errors_for("late_tuple", [
+        "fn bad() -> Str \{",
+        "    let mut l = []",
+        "    let s = \"\{(Bx \{ v: l }, Bx \{ v: 5 })}\"",
+        "    l.push(NoTag \{ a: 1 })",
+        "    s",
+        "}",
+    ].join("\n")), ["E0523 13:15 | write `impl Tag for List[NoTag]`, or show a value whose type implements Tag"])
+}
+
+test "a method call in a hole keeps its own impl's bound when a use after it fills the type" {
+    assert_eq(errors_for("late_call", [
+        "type Bare[T] \{ v: T }",
+        "impl[T] Display for Bare[T] \{ fn fmt(self, sb: StringBuilder) \{ sb.write(\"b\") } }",
+        "trait Mk \{ fn mk(self) -> Bare[Int] }",
+        "impl[T] Mk for Hx[T] where T: Tag \{ fn mk(self) -> Bare[Int] \{ Bare \{ v: 1 } } }",
+        "type Hx[T] \{ v: T }",
+        "fn bad() -> Str \{",
+        "    let mut l = []",
+        "    let s = \"\{Hx \{ v: l }.mk()}\"",
+        "    l.push(NoTag \{ a: 1 })",
+        "    s",
+        "}",
+    ].join("\n")), ["E0306 18:15 | pass an argument whose type implements Tag, or write `impl Tag for List[NoTag]`"])
+}
+
+test "each hole on one line is judged and reported once" {
+    assert_eq(errors_for("same_line", "fn bad[U](u: U) -> Str \{ \"\{Bx \{ v: u }} \{Cx \{ v: u }}\" }"), [
+        "E0523 11:28 | write the bound on the binder: `[U: Tag]`",
+        "E0523 11:42 | write the bound on the binder: `[U: Tag]`",
+    ])
+}
+
+// Accepted: the bound written, in each form.
+
+test "a bound on the body's binder meets the bounds of the Display impl" {
+    assert_eq(errors_for("met_inline", [
+        "fn ok[U: Tag](u: U) -> Str \{ \"\{Bx \{ v: u }}\{Cx \{ v: u }}\{(1, Bx \{ v: u })}\" }",
+        "fn ok2[U: Tag](u: U) ! IO \{ io.println(Bx \{ v: u }) }",
+        "fn ok3[U: Tag](u: U) -> Str \{ \"\{Bx \{ v: u }.display()}\{Display.display(Cx \{ v: u })}\" }",
+    ].join("\n")), [])
+}
+
+test "a bound in an impl's where clause meets the bounds of the Display impl" {
+    assert_eq(errors_for("met_where",
+        "impl[T] Ck for Hold[T] where T: Tag \{ fn chk(self) -> Str \{ \"\{Bx \{ v: self.v }}\" } }"), [])
+}
+
+test "a bound given through a supertrait meets the bounds of the Display impl" {
+    assert_eq(errors_for("met_super", "fn ok[U: Big](u: U) -> Str \{ \"\{Bx \{ v: u }}\{Cx \{ v: u }}\" }"), [])
+}
+
+test "a Display bound of a call is met by an instance whose Display impl holds" {
+    assert_eq(errors_for("met_call_bound", [
+        "fn p[T: Display](x: T) -> Str \{ \"\{x}\" }",
+        "fn ok() -> Str \{ p(Cx \{ v: 2 }) }",
+    ].join("\n")), [])
+}
+
+test "a use after the hole that fills the type with one that has the trait meets the bounds" {
+    assert_eq(errors_for("met_late", [
+        "fn ok(seed: Int) -> Str \{",
+        "    let mut l = []",
+        "    l.push(seed)",
+        "    let mut m = []",
+        "    let s = \"\{Bx \{ v: m.get(0).unwrap() }}\{(Bx \{ v: m.get(0).unwrap() }, l.len())}\"",
+        "    m.push(seed)",
+        "    s",
+        "}",
+    ].join("\n")), [])
+}
+
+test "a concrete type that has the trait meets the bounds of the Display impl" {
+    assert_eq(errors_for("met_concrete", [
+        "fn ok() -> Str \{",
+        "    let s = \"\{Cx \{ v: 1 }}\"",
+        "    \"\{s}\{Bx \{ v: 3 }}\{(2, Cx \{ v: 4 })}\"",
+        "}",
+    ].join("\n")), [])
+}

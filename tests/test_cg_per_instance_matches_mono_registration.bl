@@ -13,13 +13,13 @@
 
 import std.io
 import layout.{layout_reset}
-import cname.{cname_reset, c_display_dispatch_name, c_impl_method_name}
+import cname.{cname_reset, c_display_dispatch_name, c_display_dispatch_instance_name, c_impl_method_name}
 import cg_test_helpers.{cg_probe_compile, cg_probe_compile_but, cg_probe_ices_saying}
 import cg.{CgConfig, generate}
 import cg_reg.{cg_reg_impl_methods, cg_reg_impl_of}
 import mono.{has_own_binders, run_mono, instances, is_poly_impl, poly_impl_is_element_agnostic}
 import parser.{node_name}
-import diagnostics.{CODEGEN_STAGE_NOT_BUILT_NAME, DiagEntry, diag_entries}
+import diagnostics.{DiagEntry, diag_entries}
 
 fn standalone_cfg() -> CgConfig {
     CgConfig { debug_mode: 0, trace_codegen: 0, deterministic: 0, emit_only_module: "",
@@ -114,9 +114,6 @@ fn instance_symbol(mname: Str) -> Str ! IO.Print {
     assert(false)
     ""
 }
-
-// What the Display site says when it stops.
-let DISPLAY_STOP = "Display through a `fmt` with one body per instance"
 
 // A definition is written at file scope, so its line is unindented and opens a brace.
 fn definitions_of(text: Str, symbol: Str) -> Int {
@@ -301,10 +298,23 @@ fn main() {
     assert(!text.contains(method_symbol("unreached")))
 }
 
-// An interpolation reaches the dispatcher beside `fmt`, by a name that takes no instance.
-// The pass registers no instance for that site. With no body to call, the site itself must
-// stop, because the body stage reads "no row" as "no call" and writes nothing.
-test "a site that names a dispatcher with no instance stops at that site" {
+// The dispatcher beside each instance of a per-instance `fmt`, named from the row the pass
+// registered, so the claim reads the same producer the call site and the body stage read.
+fn display_instance_dispatchers() -> List[Str] {
+    let mut out: List[Str] = []
+    for m in cg_reg_impl_methods() {
+        if node_name(m) != "fmt" { continue }
+        for mi in instances() {
+            if mi.base_decl_node == m { out.push(c_display_dispatch_instance_name(cg_reg_impl_of(m), mi.arg_tids)) }
+        }
+    }
+    out
+}
+
+// An interpolation reaches no call node of `fmt`, so the type's instance registers it, and the
+// body stage writes a dispatcher beside that instance, which the site calls. Without that
+// row the body stage reads "no row" as "no call" and writes nothing for the site to call.
+test "a site that shows a per-instance Display calls the dispatcher beside its instance" {
     let stem = "cg_pim_display_reached"
     let program = probe(stem, #"type Box[T] {
     v: T
@@ -320,9 +330,49 @@ fn main() {
     assert(s == "box")
 }
 "#)
-    generate(program, standalone_cfg())
-    assert_eq(cg_probe_ices_saying(CODEGEN_STAGE_NOT_BUILT_NAME, DISPLAY_STOP), 1)
+    let text = generate(program, standalone_cfg())
+    assert_eq(stops(), 0)
+    let dispatchers = display_instance_dispatchers()
+    assert_eq(dispatchers.len(), 1)
+    let d = dispatchers.get(0).unwrap()
+    assert_eq(definitions_of(text, d), 1)
+    let start = text.byte_index_of("{d}(", 0) ?? -1
+    assert(start >= 0)
+    assert(text.byte_slice(start, text.byte_len()).contains("{instance_symbol("fmt")}("))
+}
+
+// A shown value at an instance the pass registered no `fmt` for has no dispatcher to call, so
+// the site stops instead of naming a symbol nothing defines. The type checker does not yet
+// judge a hole whose type a later use fills, so this program reaches codegen with the
+// impl's bound failing at Cx[NoTag].
+test "a shown value at an instance with no registered fmt stops at the site" {
+    let stem = "cg_pim_display_unregistered"
+    let program = probe(stem, #"trait Tag {
+    fn tag(self) -> Int
+}
+
+type NoTag {
+    a: Int
+}
+
+type Cx[T] {
+    v: T
+}
+
+impl[T: Tag] Display for Cx[T] {
+    fn fmt(self, sb: StringBuilder) { sb.write("cx{self.v.tag()}") }
+}
+
+fn main() {
+    let mut l = []
+    if l.len() > 0 { io.println("{l.get(0).unwrap()}") }
+    l.push(Cx { v: NoTag { a: 1 } })
+}
+"#)
+    let _ = generate(program, standalone_cfg())
+    assert_eq(cg_probe_ices_saying("MonoInstanceNotRegistered", "`fmt` of `Cx[NoTag]` has no monomorphised instance here"), 1)
     assert_eq(stops(), 1)
+    assert_eq(display_instance_dispatchers().len(), 0)
 }
 
 test "an impl fmt that adds a binder is E0906 at check and never reaches the body stage" {
@@ -343,14 +393,20 @@ fn main() {
 }
 
 // A message that only names a value has a placeholder for a type it cannot show, so it takes
-// that over a stop: the program is valid, and only its failure text is plainer.
+// that over a stop: the program is valid, and only its failure text is plainer. The impl's
+// bound fails at W[Int], so the pass registers no instance of `fmt` and there is no
+// dispatcher to call.
 test "assert_eq and unwrap name a value by its type when its Display has no dispatcher" {
     let stem = "cg_pim_message_placeholder"
-    let program = probe(stem, #"type W[T] {
+    let program = probe(stem, #"trait Tag {
+    fn tag(self) -> Int
+}
+
+type W[T] {
     v: T
 }
 
-impl[T] Display for W[T] {
+impl[T: Tag] Display for W[T] {
     fn fmt(_self, sb: StringBuilder) { sb.write("w") }
 }
 
@@ -374,15 +430,51 @@ fn main() {
     assert(text.contains("<W"))
 }
 
-// A traced build reads each value it records, with no call in the source. It has a Debug and
-// a placeholder route for a value it cannot show, so a program that runs must also trace.
-test "a traced value whose Display has no dispatcher takes the route below it" {
-    let stem = "cg_pim_trace_display"
+// Where the impl holds at the instance, the message shows the value through the dispatcher
+// beside that instance, as an interpolation hole does.
+test "assert_eq and unwrap show a value through the dispatcher beside its Display instance" {
+    let stem = "cg_pim_message_shown"
     let program = probe(stem, #"type W[T] {
     v: T
 }
 
 impl[T] Display for W[T] {
+    fn fmt(_self, sb: StringBuilder) { sb.write("w") }
+}
+
+impl[T] Eq for W[T] {
+    fn eq(_self, _o: W[T]) -> Bool { true }
+}
+
+fn f() -> Result[Int, W[Int]] { Ok(1) }
+
+fn main() {
+    assert_eq(W { v: 1 }, W { v: 1 })
+    assert_eq(f().unwrap(), 1)
+}
+"#)
+    let text = generate(program, standalone_cfg())
+    assert_eq(stops(), 0)
+    assert(!text.contains("<W"))
+    let dispatchers = display_instance_dispatchers()
+    assert_eq(dispatchers.len(), 1)
+    assert_eq(definitions_of(text, dispatchers.get(0).unwrap()), 1)
+}
+
+// A traced build reads each value it records, with no call in the source. It has a Debug and
+// a placeholder route for a value it cannot show, so a program that runs must also trace.
+// The impl's bound fails at W[Int], so there is no dispatcher at that instance.
+test "a traced value whose Display has no dispatcher takes the route below it" {
+    let stem = "cg_pim_trace_display"
+    let program = probe(stem, #"trait Tag {
+    fn tag(self) -> Int
+}
+
+type W[T] {
+    v: T
+}
+
+impl[T: Tag] Display for W[T] {
     fn fmt(_self, sb: StringBuilder) { sb.write("w") }
 }
 

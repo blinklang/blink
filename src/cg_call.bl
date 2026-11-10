@@ -52,11 +52,11 @@ import layout.{
     tid_holds_tag_member, spawn_pair_spelling, task_entry_spelling, pool_spelling,
     async_scope_handles_spelling, list_slots_hold_no_pointer,
 }
-import mono.{has_own_binders, instances, instance_for_call, tid_in_instance, iterator_route_name, iterator_route_module, mark_instance_named}
+import mono.{has_own_binders, instances, instance_for_call, instance_of_poly_method, tid_in_instance, iterator_route_name, iterator_route_module, mark_instance_named}
 import cg_reg.{cg_reg_fn_decls, cg_reg_builtin_op_decl, cg_reg_fns_named, cg_reg_impl_decls, cg_reg_impl_of, cg_reg_tid_for_decl}
 import cname.{
     c_fn_decl_name, c_impl_method_name,
-    c_display_dispatch_name, c_derive_method_name, c_derived_method_symbol,
+    c_display_dispatch_name, c_display_dispatch_instance_name, c_derive_method_name, c_derived_method_symbol,
     c_runtime_helper, c_int_min_macro, c_sited_fault_symbol, c_panic_dispatcher, c_ffi_symbol, c_mint_local, c_is_minted_temp, c_str_const, c_field_name,
     cname_ffi_struct_mirror, c_local_name,
     c_variant_discriminant, c_variant_member_name, c_variant_field_path,
@@ -860,20 +860,20 @@ pub fn lower_display_call(part: Int) -> Int ! Diag.Report {
     if tid < 0 { return -1 }
     // The impl is found before the hole is lowered, so a type that cannot be shown is
     // refused having built nothing.
-    let im = cc_display_impl(part, tid)
-    if im < 0 { return -1 }
+    let symbol = cc_display_symbol(part, tid)
+    if symbol == "" { return -1 }
     let value = lower_expr(part)
     if value < 0 { return -1 }
-    cc_display_call(part, im, value)
+    cc_display_call(part, symbol, value)
 }
 
 // The same rendering for a value this stage built rather than read from an expression: the
 // value a panic names is taken out of a carrier, so there is no node left to lower. The
 // route is the impl lookup and the call, which is why they are two functions and not one.
 pub fn lower_display_of_value(node: Int, tid: Int, value: Int) -> Int ! Diag.Report {
-    let im = cc_display_impl(node, tid)
-    if im < 0 { return -1 }
-    cc_display_call(node, im, value)
+    let symbol = cc_display_symbol(node, tid)
+    if symbol == "" { return -1 }
+    cc_display_call(node, symbol, value)
 }
 
 // Whether a value of this type has a Debug text for a reader that takes it when the type
@@ -917,41 +917,61 @@ fn cc_debug_symbol(node: Int, tid: Int) -> Str ! Diag.Report {
 // Asked by a renderer before it lowers the value, so a type that cannot be shown is
 // refused having built nothing. A refusal is reported here.
 pub fn cg_call_display_resolves(node: Int, tid: Int) -> Bool ! Diag.Report {
-    cc_display_impl(node, tid) >= 0
+    cc_display_symbol(node, tid) != ""
 }
 
 // The same question, asked where a type with no impl is not an error, so it reports nothing.
 pub fn cg_call_has_display_impl(node: Int, tid: Int) -> Bool ! Diag.Report {
     let im = cc_impl_for(node, tid, trait_display)
-    im >= 0 && cc_impl_has_dispatch(im)
+    im >= 0 && cc_impl_has_dispatch(im, tid)
 }
 
-fn cc_display_impl(node: Int, tid: Int) -> Int ! Diag.Report {
+// The dispatcher a value of this type renders through, or "" once the refusal is reported.
+fn cc_display_symbol(node: Int, tid: Int) -> Str ! Diag.Report {
     let im = cc_impl_for(node, tid, trait_display)
-    if im == IMPL_REFUSED { return -1 }
-    if im >= 0 {
-        if cc_impl_has_dispatch(im) { return im }
-        diag_ice_stage_not_built("cg_call Display through a `fmt` with one body per instance", node)
-        return -1
+    if im == IMPL_REFUSED { return "" }
+    if im < 0 {
+        diag_ice_at("DisplayImplNotFound", UNSOLVED_TYPEVAR_AT_CODEGEN,
+            "a {tk_name(cc_kind(tid))} value has no Display impl to call", node,
+            "typecheck must reject a value whose type cannot be shown; this is a compiler bug")
+        return ""
     }
-    diag_ice_at("DisplayImplNotFound", UNSOLVED_TYPEVAR_AT_CODEGEN,
-        "a {tk_name(cc_kind(tid))} value has no Display impl to call", node,
-        "typecheck must reject a value whose type cannot be shown; this is a compiler bug")
-    -1
+    let symbol = cc_display_dispatch_at(im, tid)
+    if symbol != "" { return symbol }
+    diag_ice_at("MonoInstanceNotRegistered", UNSOLVED_TYPEVAR_AT_CODEGEN,
+        "`fmt` of `{tc_type_str(tid)}` has no monomorphised instance here", node,
+        "the pass registers Display.fmt at each instance of the type where the impl holds, and typecheck refuses a value shown where it does not")
+    ""
 }
 
-// The dispatcher takes no instance in its name, and the body stage writes it only beside a
-// `fmt` with one name. Over any other `fmt` it does not exist, so every caller of
-// cc_display_call asks here first.
-fn cc_impl_has_dispatch(im: Int) -> Bool ! Diag.Report {
+// The body stage writes a dispatcher beside a `fmt` with one name, and one beside each
+// instance of a `fmt` with one body per instance. A per-instance `fmt` the pass did not
+// register at this type has none. This asks without naming the instance, so a caller that
+// only asks does not make a unit write a copy.
+fn cc_impl_has_dispatch(im: Int, tid: Int) -> Bool ! Diag.Report {
     let fmt = cc_method_of(im, display_method)
-    fmt >= 0 && cg_decl_has_display_dispatch(fmt)
+    if fmt < 0 { return false }
+    if cg_decl_has_display_dispatch(fmt) { return true }
+    cg_decl_is_per_instance(fmt) && instance_of_poly_method(fmt, tid) >= 0
 }
 
-fn cc_display_call(node: Int, im: Int, value: Int) -> Int ! Diag.Report {
+// Names the instance it reaches, so a per-module unit writes its private copy.
+fn cc_display_dispatch_at(im: Int, tid: Int) -> Str ! Diag.Report {
+    let fmt = cc_method_of(im, display_method)
+    if fmt < 0 { return "" }
+    if cg_decl_has_display_dispatch(fmt) { return c_display_dispatch_name(im) }
+    if !cg_decl_is_per_instance(fmt) { return "" }
+    let at = cg_eff_impl_method_at(im, fmt, tid)
+    match instances().get(at.row) {
+        Some(inst) => c_display_dispatch_instance_name(im, inst.arg_tids)
+        None => ""
+    }
+}
+
+fn cc_display_call(node: Int, symbol: Str, value: Int) -> Int ! Diag.Report {
     let rec = cc_local(TYPE_STR, node)
     if cc_stopped(rec) { return -1 }
-    ir_call_direct(TYPE_STR, node, rec.c_spelling, c_display_dispatch_name(im), rec.slot_form, [value])
+    ir_call_direct(TYPE_STR, node, rec.c_spelling, symbol, rec.slot_form, [value])
 }
 
 // The five kinds typecheck's builtin Display block covers on top of Struct/Enum
@@ -1063,7 +1083,8 @@ fn cc_scalar_fmt(node: Int, obj: Int, kind: TyKind) -> Int ! Diag.Report {
 pub fn cc_display_or_placeholder(node: Int, tid: Int, value: Int) -> Int ! Diag.Report {
     let im = cc_impl_for(node, tid, trait_display)
     if im == IMPL_REFUSED { return -1 }
-    if im >= 0 && cc_impl_has_dispatch(im) { return cc_display_call(node, im, value) }
+    let symbol = if im >= 0 { cc_display_dispatch_at(im, tid) } else { "" }
+    if symbol != "" { return cc_display_call(node, symbol, value) }
     let rec = cc_local(TYPE_STR, node)
     if cc_stopped(rec) { return -1 }
     ir_const(TYPE_STR, node, rec.c_spelling, c_str_const("<{tc_tid_name(tid)}>"))
@@ -5796,7 +5817,7 @@ type PanicRender {
     tid: Int
     arm: Str
     spec: Str
-    display: Int
+    display: Str
     member: LayoutRecord
     held: LayoutRecord
 }
@@ -5807,13 +5828,13 @@ fn cc_panic_stopped(r: PanicRender) -> Bool { r.say == PanicSay.Refused }
 // layout answers for a type there is none of; nothing on this road reads it.
 fn cc_panic_plain(say: PanicSay, what: Str) -> PanicRender {
     let none = layout_of(-1, Position.Local)
-    PanicRender { say: say, what: what, tid: -1, arm: "", spec: "", display: -1,
+    PanicRender { say: say, what: what, tid: -1, arm: "", spec: "", display: "",
         member: none, held: none }
 }
 
 fn cc_panic_refused() -> PanicRender { cc_panic_plain(PanicSay.Refused, "") }
 
-fn cc_panic_on_road(plan: PanicRender, say: PanicSay, spec: Str, display: Int) -> PanicRender {
+fn cc_panic_on_road(plan: PanicRender, say: PanicSay, spec: Str, display: Str) -> PanicRender {
     PanicRender { say: say, what: plan.what, tid: plan.tid, arm: plan.arm, spec: spec,
         display: display, member: plan.member, held: plan.held }
 }
@@ -5836,7 +5857,7 @@ fn cc_panic_render(node: Int, carrier: Int, kind: TyKind, method: Str) -> PanicR
     let held = cc_local(tid, node)
     if cc_stopped(held) { return cc_panic_refused() }
     cc_panic_road(node, PanicRender { say: PanicSay.Refused, what: what, tid: tid,
-        arm: cc_arm_member(kind, slot), spec: "", display: -1, member: member, held: held })
+        arm: cc_arm_member(kind, slot), spec: "", display: "", member: member, held: held })
 }
 
 // Which way the value reaches the message. A type codegen cannot spell has already stopped
@@ -5844,15 +5865,15 @@ fn cc_panic_render(node: Int, carrier: Int, kind: TyKind, method: Str) -> PanicR
 // that layout declined it.
 fn cc_panic_road(node: Int, plan: PanicRender) -> PanicRender ! Diag.Report {
     let k = cc_kind(plan.tid)
-    if k == TyKind.Bytes { return cc_panic_on_road(plan, PanicSay.DebugText, format_spec_of(TYPE_STR), -1) }
+    if k == TyKind.Bytes { return cc_panic_on_road(plan, PanicSay.DebugText, format_spec_of(TYPE_STR), "") }
     let spec = format_spec_of(plan.tid)
     if spec == "" { return cc_panic_shown(node, plan) }
-    if k == TyKind.Char { return cc_panic_on_road(plan, PanicSay.Text, format_spec_of(TYPE_STR), -1) }
+    if k == TyKind.Char { return cc_panic_on_road(plan, PanicSay.Text, format_spec_of(TYPE_STR), "") }
     if k == TyKind.Bool {
         cc_panic_text_form(node, k)
         return cc_panic_refused()
     }
-    cc_panic_on_road(plan, PanicSay.Printed, spec, -1)
+    cc_panic_on_road(plan, PanicSay.Printed, spec, "")
 }
 
 // No conversion prints this value, so the message shows it the way an interpolation hole
@@ -5862,8 +5883,9 @@ fn cc_panic_shown(node: Int, plan: PanicRender) -> PanicRender ! Diag.Report {
     if k != TyKind.Struct && k != TyKind.Enum { return cc_panic_placeholder(plan) }
     let im = cc_impl_for(node, plan.tid, trait_display)
     if im == IMPL_REFUSED { return cc_panic_refused() }
-    if im < 0 || !cc_impl_has_dispatch(im) { return cc_panic_placeholder(plan) }
-    cc_panic_on_road(plan, PanicSay.Shown, format_spec_of(TYPE_STR), im)
+    let symbol = if im >= 0 { cc_display_dispatch_at(im, plan.tid) } else { "" }
+    if symbol == "" { return cc_panic_placeholder(plan) }
+    cc_panic_on_road(plan, PanicSay.Shown, format_spec_of(TYPE_STR), symbol)
 }
 
 // `.unwrap()` does not require the arm it panics on to be showable, so an arm with no

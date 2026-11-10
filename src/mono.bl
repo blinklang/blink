@@ -37,7 +37,7 @@ import typecheck.{
     tc_impl_is_poly_conversion, tc_conversion_impl_for, tc_check_conversion, tc_conversion_trait_of, tc_conversion_target_of, tc_is_conversion_trait, tc_is_into_method, tc_is_default_fill, tc_call_user_effect, tc_field_tid_at_instance,
     tc_lookup_node_tid, tc_fn_value_decl_node, tc_mc_obj_is_value, tc_call_is_trace_log, tc_is_sealed_list_hof, tc_is_list_generic_adapter, tc_map_generic_adapter, tc_map_generic_adapter_module, tc_list_generic_module, tc_is_iterator_method, tc_resolve,
     tc_ret_mint_at, tc_tid_child, tc_tid_child_count,
-    tc_tid_decl_node, tc_tid_kind, tc_impl_is_poly_user, tc_poly_user_impl_decl, tc_instance_has_trait, tc_written_impl_holds,
+    tc_tid_decl_node, tc_tid_kind, tc_impl_is_poly_user, tc_poly_user_impl_decl, tc_instance_has_trait, tc_written_impl_holds, tc_trait_has_need_rule,
     tc_tid_is_no_info, tc_tid_list_elem, tc_tid_name, tc_tid_resolved, tc_tid_struct, tc_type_str,
     tc_declared_field_tids, tc_ptr_pointee_is_valid, tc_decl_tid, tc_type_arg_grows,
     tc_void_tid, tc_requires_preds_of, tc_ensures_preds_of, tc_source_text, tc_module_display_name,
@@ -959,11 +959,12 @@ fn register_type_instance(tid: Int) ! Diag.Report {
 }
 
 fn operator_methods() -> List[(Str, Str)] {
-    [("Eq", "eq"), ("Ord", "cmp"), ("Clone", "clone")]
+    [("Eq", "eq"), ("Ord", "cmp"), ("Clone", "clone"), ("Display", "fmt")]
 }
 
-// `==`, `<` and a range's clone reach a written Eq, Ord or Clone impl with no call node to
-// discover it by, so an instance of the type registers the impl's method itself.
+// `==`, `<`, a range's clone and an interpolation hole reach a written Eq, Ord, Clone or
+// Display impl with no call node to discover it by, so an instance of the type registers the
+// impl's method itself.
 fn register_operator_methods(td: Int, ct: Int) {
     for pair in operator_methods() {
         register_method_where_it_holds(td, ct, pair.0, pair.1)
@@ -972,14 +973,21 @@ fn register_operator_methods(td: Int, ct: Int) {
 
 // Only where the impl holds at this instance: a bounded body at an argument without the bound
 // has nothing to compile against. The bound check of Debug reads the derive alone, so the
-// written impl is asked as well. A method with its own binders is left out: a type instance
-// gives no argument for them, so its body has unsolved types.
+// written impl is asked as well. A trait the type checker has no rule for (Display,
+// BlockHandler) holds by that rule at any instance, so only the written impl is asked. A
+// method with its own binders is left out: a type instance gives no argument for them, so its
+// body has unsolved types.
 fn register_method_where_it_holds(td: Int, ct: Int, trait_name: Str, method: Str) {
     for m in poly_methods.by_recv.get(poly_user_key(td, "{trait_name}.{method}")) ?? [] {
-        if !has_own_binders(m) && (tc_instance_has_trait(ct, trait_name) || tc_written_impl_holds(ct, trait_name, method)) {
+        if !has_own_binders(m) && impl_method_holds(ct, trait_name, method) {
             register_poly_method(m, type_args_of(ct))
         }
     }
+}
+
+fn impl_method_holds(ct: Int, trait_name: Str, method: Str) -> Bool {
+    if tc_written_impl_holds(ct, trait_name, method) { return true }
+    tc_trait_has_need_rule(trait_name) && tc_instance_has_trait(ct, trait_name)
 }
 
 // Walks the body and the items. A with-item reaches the enter and exit of its type's
@@ -1937,7 +1945,8 @@ fn tid_holds_unknown(tid0: Int) -> Bool {
     false
 }
 
-// A type also reaches the written Eq, Ord and Clone of its declaration (register_operator_methods).
+// A type also reaches the written Eq, Ord, Clone and Display of its declaration
+// (register_operator_methods).
 fn note_type_edges(tid: Int) {
     let td = tc_tid_decl_node(tid)
     if td < 0 { return }

@@ -3256,6 +3256,11 @@ type CallFacts {
     // binder tids the call gave (tc_note_impl_bound_call).
     impl_bound_calls: List[Int]
     impl_bound_binds: Map[Int, ImplBoundCall]
+    // Each value shown through Display (a hole, a print sink, `.display()`) whose type inference
+    // may still fill, in the order first walked (tc_note_shown_value). Apart from the calls
+    // through an impl: a hole that holds such a call has both on one node.
+    shown_values: List[Int]
+    shown_value_at: Map[Int, ShownValue]
     // The owner each static call's head names. Its spelling may not say it, as `Self` does not.
     static_owners: Map[Int, Str]
     // The trait each trait-qualified call's head names. A type of the same spelling in a
@@ -3294,8 +3299,16 @@ type ImplBoundCall {
     enclosing: Int
 }
 
+// The type a value is shown at, the sink that shows it ("" for a hole), and the fn whose body
+// shows it.
+type ShownValue {
+    tid: Int
+    sink: Str
+    enclosing: Int
+}
+
 fn new_call_facts() -> CallFacts {
-    CallFacts { open_calls: [], open_group: Map(), open_tids: [], reported: Map(), self_views: Map(), view_sigs: Map(), hash_aliases_above: [], derive_facts_above: [], derive_facts_low: 0, derive_facts_open: [], derive_facts_open_low: Map(), debug_unbuilt_seen: Map(), hash_by_bounds: false, static_head_insts: Map(), static_head_binders: Map(), impl_bound_calls: [], impl_bound_binds: Map(), static_owners: Map(), trait_heads: Map(), closure_expected_at: Map(), ret_ann: -1, missing_else: Map(), walk_returns: [], written_names: Map(), under_fn_type: Map(), method_reads: Map(), method_read_order: [] }
+    CallFacts { open_calls: [], open_group: Map(), open_tids: [], reported: Map(), self_views: Map(), view_sigs: Map(), hash_aliases_above: [], derive_facts_above: [], derive_facts_low: 0, derive_facts_open: [], derive_facts_open_low: Map(), debug_unbuilt_seen: Map(), hash_by_bounds: false, static_head_insts: Map(), static_head_binders: Map(), impl_bound_calls: [], impl_bound_binds: Map(), shown_values: [], shown_value_at: Map(), static_owners: Map(), trait_heads: Map(), closure_expected_at: Map(), ret_ann: -1, missing_else: Map(), walk_returns: [], written_names: Map(), under_fn_type: Map(), method_reads: Map(), method_read_order: [] }
 }
 let mut tc_calls: CallFacts = new_call_facts()
 
@@ -4370,6 +4383,25 @@ fn tc_check_open_call_bounds(call_node: Int, g: Int) ! TypeCheck.Resolve, Diag.R
 // the bounds its binders give (§3.6). No frame is active at the flush, so this pushes that
 // body's frames and allow set again. A binder with no fixed type is not judged.
 fn tc_check_bounds_in_body(sig: Int, im: Int, tids: List[Int], self_tid: Int, enclosing: Int, node: Int) ! TypeCheck.Resolve, Diag.Report {
+    let frames = tc_enter_body_frames(enclosing)
+    if sig >= 0 { tc_check_fn_bounds_at(sig, tids, node) } else { tc_check_impl_bounds(im, tc_impl_binds_with_self(im, tids, self_tid), node) }
+    tc_leave_body_frames(frames)
+}
+
+// The frames, allow set and module a body's walk had, pushed again for a flush that judges a
+// check the body left open. tc_leave_body_frames pops them.
+type BodyFrames {
+    enclosing: Int
+    in_trait: Bool
+    trait_tps: Int
+    impl_binders: Int
+    impl_where: Int
+    own_tps: Int
+    saved_fn_node: Int
+    saved_module: Str
+}
+
+fn tc_enter_body_frames(enclosing: Int) -> BodyFrames ! TypeCheck.Resolve, Diag.Report {
     let block = if enclosing >= 0 { tc_method_block.get(enclosing) ?? -1 } else { -1 }
     let in_impl = block != -1 && node_kind(block) == NodeKind.ImplBlock
     let in_trait = block != -1 && node_kind(block) == NodeKind.TraitDef
@@ -4386,15 +4418,18 @@ fn tc_check_bounds_in_body(sig: Int, im: Int, tids: List[Int], self_tid: Int, en
     tc_push_tparam_scope(impl_binders)
     tc_push_where_frames(impl_where)
     tc_push_tparam_scope(own_tps)
-    if sig >= 0 { tc_check_fn_bounds_at(sig, tids, node) } else { tc_check_impl_bounds(im, tc_impl_binds_with_self(im, tids, self_tid), node) }
-    tc_pop_tparam_scope(own_tps)
-    tc_pop_arith_frames(impl_where)
-    tc_pop_tparam_scope(impl_binders)
-    tc_pop_tparam_scope(trait_tps)
-    if in_trait { tc_pop_self_frame() }
-    if enclosing >= 0 { diag_exit_allows() }
-    tc_current_fn_node = saved_fn_node
-    tc_leave_body_module(saved_module)
+    BodyFrames { enclosing: enclosing, in_trait: in_trait, trait_tps: trait_tps, impl_binders: impl_binders, impl_where: impl_where, own_tps: own_tps, saved_fn_node: saved_fn_node, saved_module: saved_module }
+}
+
+fn tc_leave_body_frames(f: BodyFrames) {
+    tc_pop_tparam_scope(f.own_tps)
+    tc_pop_arith_frames(f.impl_where)
+    tc_pop_tparam_scope(f.impl_binders)
+    tc_pop_tparam_scope(f.trait_tps)
+    if f.in_trait { tc_pop_self_frame() }
+    if f.enclosing >= 0 { diag_exit_allows() }
+    tc_current_fn_node = f.saved_fn_node
+    tc_leave_body_module(f.saved_module)
 }
 
 fn tc_check_fn_bounds_at(sig: Int, tids: List[Int], node: Int) ! TypeCheck.Resolve, Diag.Report {
@@ -4554,7 +4589,7 @@ fn tc_first_unheld_bound(carrier: Int, held: Str) -> Int {
 // The message, note and help take the shape that section 3 gives an E0306 on a declared bound.
 // The note gives no column: a bound node carries the column of the token after it.
 // The callee is named because its parameter may have the same name as the one passed.
-fn tc_report_held_misses_bound(tid: Int, carrier: Int, bnode: Int, shown: Str, decl: Int, node: Int, help_add: Bool) ! Diag.Report {
+fn tc_report_held_misses_bound(tid: Int, carrier: Int, bnode: Int, shown: Str, decl: Int, node: Int, help_add: Bool) ! TypeCheck.Resolve, Diag.Report {
     let by_impl = decl >= 0 && node_kind(decl) == NodeKind.ImplBlock
     let p = node_name(carrier)
     if tc_bound_trait(bnode) == "Display" {
@@ -4705,6 +4740,8 @@ fn tc_drop_open_calls() {
     tc_calls.open_tids = []
     tc_calls.impl_bound_calls = []
     tc_calls.impl_bound_binds.clear()
+    tc_calls.shown_values = []
+    tc_calls.shown_value_at.clear()
     tc_calls.method_reads.clear()
     tc_calls.method_read_order = []
 }
@@ -8475,10 +8512,53 @@ fn tc_raw_reject_display_sink(arg: Int, t: Int) -> Bool ! Diag.Report {
 // Protocol*). A Raw is RawOutsideTemplate and not a missing Display, so it is asked first.
 fn tc_check_display_sink_arg(arg: Int, t: Int, sink: Str) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     if tc_raw_reject_display_sink(arg, t) { return }
+    tc_check_shown_value(arg, t, sink)
+}
+
+// The Display bound of a value a hole, a sink or `.display()` shows at `arg`, with the label
+// naming `sink` ("" for a hole). A type inference may still fill is judged again at the flush.
+fn tc_check_shown_value(arg: Int, t: Int, sink: Str) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     let leaf = tc_display_missing_leaf(t)
-    if leaf < 0 { return }
+    if leaf < 0 {
+        tc_note_shown_value(arg, t, sink)
+        return
+    }
     tc_errors.push("type `{type_to_str(t)}` does not implement `Display`")
     tc_report_missing_display(arg, t, leaf, sink, [])
+}
+
+// Only a value whose type has a known shape (a tuple, an instance of a generic type) and an
+// argument inference may still fill is left for the flush. A walk of the node again replaces
+// its record, as tc_note_impl_bound_call does.
+fn tc_note_shown_value(arg: Int, t0: Int, sink: Str) {
+    if tc_boundary_check_active == 0 || arg < 0 { return }
+    let t = resolve_alias_tid(tc_resolve(t0))
+    let k = type_kind(t)
+    let shaped = k == TyKind.Tuple || ((k == TyKind.Struct || k == TyKind.Enum) && tc_tid_struct_arg_count(t) > 0)
+    if !shaped || tc_tid_has_unbound_metavar(t) == 0 {
+        if tc_calls.shown_value_at.remove(arg).is_some() {
+            let at = tc_calls.shown_values.index_of(arg) ?? -1
+            if at >= 0 { let _ = tc_calls.shown_values.remove(at) }
+        }
+        return
+    }
+    if !tc_calls.shown_value_at.contains_key(arg) { tc_calls.shown_values.push(arg) }
+    tc_calls.shown_value_at.insert(arg, ShownValue { tid: t, sink: sink, enclosing: tc_current_fn_node })
+}
+
+// The flush half of tc_check_shown_value, in the body that shows the value. An error already
+// on the value's lines is the first report.
+fn tc_flush_shown_values() ! TypeCheck.Resolve, Diag.Report {
+    for i in 0..tc_calls.shown_values.len() {
+        let arg = tc_calls.shown_values.get(i).unwrap()
+        let rec = tc_calls.shown_value_at.get(arg).unwrap()
+        let end_line = if node_end_line(arg) > node_line(arg) { node_end_line(arg) } else { node_line(arg) }
+        if diag_errors_in_lines(diag_file_for_node(arg), node_line(arg), end_line) > 0 { continue }
+        let frames = tc_enter_body_frames(rec.enclosing)
+        let leaf = tc_display_missing_leaf(rec.tid)
+        if leaf >= 0 { tc_report_missing_display(arg, rec.tid, leaf, rec.sink, []) }
+        tc_leave_body_frames(frames)
+    }
 }
 
 // The part of `t0` that has no Display, or -1 when Display holds or cannot be known yet.
@@ -8507,10 +8587,12 @@ fn tc_display_missing_leaf(t0: Int) -> Int ! TypeCheck.Resolve, Diag.Report {
 }
 
 // An instance of a generic type has Display when one of its Display impls matches it and
-// every Display bound of that impl holds at its argument. The bound is judged by
-// tc_display_missing_leaf, so a rigid type parameter that has no Display fails it, and the
-// part reported is the argument that lacks Display, not the instance: the repair goes on
-// that argument, and an impl for the instance would overlap the one that exists.
+// every bound of that impl holds at its arguments (§3.6: a failed Display bound is E0523 at
+// every call). A Display bound is judged by tc_display_missing_leaf, so a rigid type parameter
+// that has no Display fails it, and the part reported is the argument that lacks Display, not
+// the instance: the repair goes on that argument, and an impl for the instance would overlap
+// the one that exists. Any other bound that fails leaves the instance itself as the part, and
+// tc_display_impl_miss names the bound for the report.
 fn tc_display_instance_missing_leaf(t: Int) -> Int ! TypeCheck.Resolve, Diag.Report {
     let base = strip_module_qualifier(ty_pool.get(t).unwrap().name)
     if tc_type_has_display_impl(base) == 0 { return t }
@@ -8527,9 +8609,40 @@ fn tc_display_instance_missing_leaf(t: Int) -> Int ! TypeCheck.Resolve, Diag.Rep
             if miss == t { miss = inner }
             continue
         }
-        if tc_impl_where_bounds_hold(im, binds) != -1 { return -1 }
+        if tc_impl_where_bounds_hold(im, binds) == -1 { continue }
+        if tc_display_impl_other_bound(im, t, binds).is_none() { return -1 }
     }
     miss
+}
+
+// The first bound of Display impl `im`, other than a Display bound, that does not hold at the
+// instance `t`. An instance inference has not fixed is judged when it is (tc_note_shown_value).
+fn tc_display_impl_other_bound(im: Int, t: Int, binds: Map[Str, Int]) -> Option[TcFailedBound] ! TypeCheck.Resolve, Diag.Report {
+    if !tc_tid_is_judgeable_among(t, 1) { return None }
+    tc_impl_failed_bound(im, binds, [], "Display")
+}
+
+// The written Display impl that matches the instance `t` and the bound of it that fails there,
+// when no Display bound does: what keeps `t` from Display, for the E0523 note and help.
+type TcDisplayImplMiss {
+    im: Int
+    failed: TcFailedBound
+}
+
+fn tc_display_impl_miss(t: Int) -> Option[TcDisplayImplMiss] ! TypeCheck.Resolve, Diag.Report {
+    let k = type_kind(t)
+    if (k != TyKind.Struct && k != TyKind.Enum) || tc_tid_struct_arg_count(t) == 0 { return None }
+    let base = strip_module_qualifier(ty_pool.get(t).unwrap().name)
+    for im in tc_display_impl_nodes.get(base) ?? [] {
+        if tc_impl_matches_instance(im, t) == 0 { continue }
+        let binds = tc_impl_binds_for_instance(im, t)
+        if tc_display_bound_missing_leaf(im, binds) >= 0 { continue }
+        match tc_impl_failed_bound(im, binds, [], "Display") {
+            Some(failed) => { return Some(TcDisplayImplMiss { im: im, failed: failed }) }
+            None => { }
+        }
+    }
+    None
 }
 
 // The first argument of an impl that fails a Display bound its binders or its `where`
@@ -8608,7 +8721,7 @@ fn tc_read_line_note() -> Str {
 // sink (none for an interpolation hole), and the help repairs the part with no Display. A
 // value from io.read_line gets the match help in place of the `.debug()` note
 // (sections/04_effects.md §4.4.9, "Migration").
-fn tc_report_missing_display(arg: Int, t: Int, leaf: Int, sink: Str, notes: List[Str]) ! Diag.Report {
+fn tc_report_missing_display(arg: Int, t: Int, leaf: Int, sink: Str, notes: List[Str]) ! TypeCheck.Resolve, Diag.Report {
     let ts = type_to_str(t)
     let ls = type_to_str(leaf)
     let msg = "type `{ts}` does not implement `Display`"
@@ -8625,6 +8738,13 @@ fn tc_report_missing_display(arg: Int, t: Int, leaf: Int, sink: Str, notes: List
         if ls == "Self" && tc_current_self_trait != "" { help = "make `Display` a supertrait: `trait {tc_current_self_trait}: Display`" }
         diag_error_label_at_notes("MissingDisplayImpl", MISSING_DISPLAY_IMPL, msg, arg, label, help, notes)
         return
+    }
+    match tc_display_impl_miss(leaf) {
+        Some(m) => {
+            tc_report_display_impl_miss(arg, msg, label, m, notes)
+            return
+        }
+        None => { }
     }
     let text = tc_index_text(arg)
     let shown = if text != "" { "{text}.debug()" } else { ".debug()" }
@@ -8646,6 +8766,35 @@ fn tc_report_missing_display(arg: Int, t: Int, leaf: Int, sink: Str, notes: List
     }
     diag_error_label_at_notes("MissingDisplayImpl", MISSING_DISPLAY_IMPL, msg, arg, label,
         "`{ls}` has no `Display`; render its parts, or {debug_note}", [])
+}
+
+// E0523 at an instance whose written Display impl has a bound that fails there. The repair goes
+// on the argument of that bound: a type parameter of the body takes the bound on its binder, as
+// E0306 gives it, and another type takes an impl of the trait.
+fn tc_report_display_impl_miss(arg: Int, msg: Str, label: Str, m: TcDisplayImplMiss, notes0: List[Str]) ! TypeCheck.Resolve, Diag.Report {
+    let failed = m.failed
+    let a = tc_resolve(failed.need.get(0) ?? -1)
+    let shown = tc_trait_shown(failed.tr)
+    let text = tc_trait_at_text(shown, failed.args)
+    let at = type_to_str(a)
+    let mut notes: List[Str] = []
+    for n in notes0 { notes.push(n) }
+    notes.push(tc_impl_bound_note(m.im, failed.carrier, shown))
+    if a >= 0 && tc_typevar_binds_here(a) != 0 {
+        let held = tc_pipe_joined(tc_typevar_held_traits(a))
+        let help = if held != "" { "write ` + {text}` on the bound list of `{at}`" } else { "write the bound on the binder: `[{at}: {text}]`" }
+        notes.push("`{at}` has no {text} bound")
+        diag_error_label_at_notes("MissingDisplayImpl", MISSING_DISPLAY_IMPL, msg, arg, label, help, notes)
+        return
+    }
+    notes.push("`{at}` does not implement {text}")
+    let row = tc_surface_row(failed.tr, tc_trait_node_idx.get(failed.tr) ?? -1)
+    let help = if row.kinds.len() > 0 || tc_args_name_a_body_tparam(failed.args) {
+        "show a value whose type implements {text}"
+    } else {
+        "write `impl {tc_trait_at_text(tc_trait_spelling(failed.tr), failed.args)} for {at}`, or show a value whose type implements {text}"
+    }
+    diag_error_label_at_notes("MissingDisplayImpl", MISSING_DISPLAY_IMPL, msg, arg, label, help, notes)
 }
 
 // A call of a free function whose signature is settled: a bare `f(..)` or a module-qualified
@@ -30792,6 +30941,7 @@ fn tc_need_visiting(visiting: List[Int], tid: Int) -> List[Int] {
 // innermost type without the trait, or empty when `tid` has it. A trait this has no rule
 // for asks nothing, so no caller refuses on it.
 fn tc_trait_need(tid: Int, tr: Str, visiting: List[Int]) -> List[Int] {
+    if !tc_trait_has_need_rule(tr) { return [] }
     match tr {
         "Eq" => tc_eq_need(tid, visiting)
         "Ord" => tc_ord_need(tid, visiting)
@@ -30801,6 +30951,15 @@ fn tc_trait_need(tid: Int, tr: Str, visiting: List[Int]) -> List[Int] {
         "Deserialize" => tc_derive_only_need(tid, tr)
         "Clone" => tc_clone_need(tid, visiting)
         _ => []
+    }
+}
+
+// Whether tc_trait_need has a rule for `tr`. Where it has none, only a written impl's own
+// bounds say at which instances the trait holds.
+pub fn tc_trait_has_need_rule(tr: Str) -> Bool {
+    match tr {
+        "Eq" | "Ord" | "Hash" | "Debug" | "Serialize" | "Deserialize" | "Clone" => true
+        _ => false
     }
 }
 
@@ -31351,6 +31510,8 @@ pub fn tc_written_impl_holds(tid0: Int, tr: Str, method: Str) -> Bool {
 
 // A written bound that does not hold: the trait it names, and the chain from its argument.
 type TcFailedBound {
+    // The binder or `where` constraint that writes the bound.
+    carrier: Int
     tr: Str
     need: List[Int]
     // The trait's arguments at the impl's instance, or [] when the bound names none or they
@@ -31361,18 +31522,19 @@ type TcFailedBound {
 // What an impl's binder bounds and `where` bounds need of the arguments `binds` gives its
 // binders: the first bound that does not hold, as tc_trait_need answers it.
 fn tc_impl_bounds_need(im: Int, binds: Map[Str, Int], visiting: List[Int]) -> List[Int] {
-    match tc_impl_failed_bound(im, binds, visiting) {
+    match tc_impl_failed_bound(im, binds, visiting, "") {
         Some(failed) => failed.need
         None => []
     }
 }
 
-fn tc_impl_failed_bound(im: Int, binds: Map[Str, Int], visiting: List[Int]) -> Option[TcFailedBound] {
+// `skip` names a trait whose bounds another judge answers for, or is "".
+fn tc_impl_failed_bound(im: Int, binds: Map[Str, Int], visiting: List[Int], skip: Str) -> Option[TcFailedBound] {
     let binders = node_impl_binders(im)
     let mut i = 0
     while binders != -1 && i < sublist_length(binders) {
         let tp = sublist_get(binders, i)
-        let failed = tc_carrier_failed_bound(tp, binds.get(tc_binder_key(tp, node_name(tp))) ?? -1, binds, visiting)
+        let failed = tc_carrier_failed_bound(tp, binds.get(tc_binder_key(tp, node_name(tp))) ?? -1, binds, visiting, skip)
         if failed.is_some() { return failed }
         i = i + 1
     }
@@ -31380,7 +31542,7 @@ fn tc_impl_failed_bound(im: Int, binds: Map[Str, Int], visiting: List[Int]) -> O
     let mut j = 0
     while wb != -1 && j < sublist_length(wb) {
         let cons = sublist_get(wb, j)
-        let failed = tc_carrier_failed_bound(cons, binds.get(node_name(cons)) ?? -1, binds, visiting)
+        let failed = tc_carrier_failed_bound(cons, binds.get(node_name(cons)) ?? -1, binds, visiting, skip)
         if failed.is_some() { return failed }
         j = j + 1
     }
@@ -31390,17 +31552,21 @@ fn tc_impl_failed_bound(im: Int, binds: Map[Str, Int], visiting: List[Int]) -> O
 // The first of the bounds written on `carrier` (a binder or a `where` constraint) that the
 // type `arg` does not have. An argument nothing binds is not judged. `binds` gives the impl's
 // binders at the instance, which a bound's trait arguments are read at.
-fn tc_carrier_failed_bound(carrier: Int, arg: Int, binds: Map[Str, Int], visiting: List[Int]) -> Option[TcFailedBound] {
+fn tc_carrier_failed_bound(carrier: Int, arg: Int, binds: Map[Str, Int], visiting: List[Int], skip: Str) -> Option[TcFailedBound] {
     let bounds = node_elements(carrier)
     if arg == -1 || bounds == -1 { return None }
     let mut i = 0
     while i < sublist_length(bounds) {
         let b = sublist_get(bounds, i)
         let tr = tc_bound_trait(b)
+        if tr == skip {
+            i = i + 1
+            continue
+        }
         let want = tc_bound_args_at_instance(b, binds)
         let need = tc_bound_need(arg, tr, visiting)
-        if need.len() > 0 { return Some(TcFailedBound { tr: tr, need: need, args: want }) }
-        if want.len() > 0 && tc_bound_args_missed(arg, tr, want, visiting) { return Some(TcFailedBound { tr: tr, need: [arg], args: want }) }
+        if need.len() > 0 { return Some(TcFailedBound { carrier: carrier, tr: tr, need: need, args: want }) }
+        if want.len() > 0 && tc_bound_args_missed(arg, tr, want, visiting) { return Some(TcFailedBound { carrier: carrier, tr: tr, need: [arg], args: want }) }
         i = i + 1
     }
     None
@@ -31760,7 +31926,7 @@ fn tc_step_asks(outer: Int, inner: Int, asked: TcAsk) -> TcAsk {
             Some(b) => b
             None => { continue }
         }
-        match tc_impl_failed_bound(im, binds, []) {
+        match tc_impl_failed_bound(im, binds, [], "") {
             Some(failed) => {
                 if tc_tid_same_type(tc_resolve(failed.need.get(0).unwrap()), inner) {
                     let text = tc_trait_at_text(tc_trait_shown(failed.tr), failed.args)
@@ -33483,11 +33649,7 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                     if pk == TyKind.Raw {
                         tc_raw_note_part(node, part)
                     } else {
-                        let miss = tc_display_missing_leaf(ptid)
-                        if miss >= 0 {
-                            tc_errors.push("type `{type_to_str(ptid)}` does not implement `Display`")
-                            tc_report_missing_display(part, ptid, miss, "", [])
-                        }
+                        tc_check_shown_value(part, ptid, "")
                     }
                 }
                 pi = pi + 1
@@ -35266,6 +35428,7 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
             // The synthesized sealed Display.display() has no user-written fnsig; it
             // always returns Str.
             if method == "display" && tc_type_has_display_impl(tname) != 0 {
+                tc_check_shown_value(recv_node, obj_t, "Display.display")
                 return TYPE_STR
             }
             // Synthesized @derive(Eq)/@derive(Ord) methods have no user
@@ -35648,6 +35811,7 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                         if qt_n != 1 {
                             tc_error_at("qualified trait call `Display.display` expects 1 argument(s) including the receiver, got {qt_n}", node)
                         }
+                        if qt_n >= 1 { tc_check_shown_value(tc_arg_value_at(qt_args, 0), qt_recv, "Display.display") }
                         return TYPE_STR
                     }
                     // The named trait does not define this method at all. Without this,
@@ -43653,6 +43817,7 @@ fn tc_flush_program_deferrals(program: Bool) ! TypeCheck.Resolve, TypeCheck.Repo
     tc_ud_flush_pending()
     tc_ud_flush_calls()
     tc_flush_impl_bound_calls()
+    tc_flush_shown_values()
     tc_ud_flush_fn_values()
     tc_flush_method_reads()
     tc_refuse_deferred_conversions()

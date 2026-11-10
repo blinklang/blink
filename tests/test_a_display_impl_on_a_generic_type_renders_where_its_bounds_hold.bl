@@ -1,0 +1,160 @@
+// A written Display impl over a generic type has one `fmt` body per instance of the type, and
+// a value of each instance renders through it (§3.6 Trait Bounds, "Polymorphic Trait
+// Implementations"): in an interpolation hole, a tuple hole, `.display()`,
+// `Display.display(x)`, a print sink and an `assert_eq` message. A bound of the impl on its binder or in its `where` clause, met by a
+// bound on the body's binder, one in its impl's where clause, one given through a supertrait, or a
+// concrete type that has the trait, builds and runs. A program whose generic type and impl
+// live in another module prints the same text in the one-unit and the per-module build.
+
+import std.fs
+import std.process.{ProcessResult}
+import compile_test_helpers.{scratch_root}
+
+trait Tag {
+    fn tag(self) -> Int
+}
+
+trait Big: Tag {
+    fn big(self) -> Int
+}
+
+impl Tag for Int {
+    fn tag(self) -> Int { self }
+}
+
+impl Big for Int {
+    fn big(self) -> Int { self * 100 }
+}
+
+type Bx[T] { v: T }
+
+impl[T] Display for Bx[T] where T: Tag {
+    fn fmt(self, sb: StringBuilder) { sb.write("bx{self.v.tag()}") }
+}
+
+type Cx[T] { v: T }
+
+impl[T: Tag] Display for Cx[T] {
+    fn fmt(self, sb: StringBuilder) { sb.write("cx{self.v.tag()}") }
+}
+
+@derive(Eq)
+type Pl[T] { v: T }
+
+impl[T: Display] Display for Pl[T] {
+    fn fmt(self, sb: StringBuilder) { sb.write("pl({self.v})") }
+}
+
+@derive(Eq)
+type Only[T] { v: T }
+
+impl[T: Tag] Display for Only[T] {
+    fn fmt(self, sb: StringBuilder) { sb.write("only{self.v.tag()}") }
+}
+
+type Bare[T] { v: T }
+
+impl[T] Display for Bare[T] {
+    fn fmt(self, sb: StringBuilder) { sb.write("bare") }
+}
+
+trait Ck {
+    fn chk(self) -> Str
+}
+
+type Hold[T] { v: T }
+
+impl[T] Ck for Hold[T] where T: Tag {
+    fn chk(self) -> Str { "{Bx { v: self.v }}" }
+}
+
+fn inline[U: Tag](u: U) -> Str { "{Bx { v: u }}/{Cx { v: u }}" }
+
+fn through_super[U: Big](u: U) -> Str { "{Bx { v: u }}/{Cx { v: u }}" }
+
+fn in_tuple[U: Tag](u: U) -> Str { "{(1, Bx { v: u })}" }
+
+fn by_display[U: Tag](u: U) -> Str { Bx { v: u }.display() }
+
+fn by_qualified_display[U: Tag](u: U) -> Str { Display.display(Cx { v: u }) }
+
+fn into_builder[U: Tag](u: U) -> Str {
+    let sb = StringBuilder.new()
+    sb.write(Cx { v: u })
+    sb.to_str()
+}
+
+test "a bound on the body's binder meets the bounds of the Display impl" {
+    assert_eq(inline(5), "bx5/cx5")
+}
+
+test "a bound in an impl's where clause meets the bounds of the Display impl" {
+    assert_eq(Hold { v: 7 }.chk(), "bx7")
+}
+
+test "a bound given through a supertrait meets the bounds of the Display impl" {
+    assert_eq(through_super(8), "bx8/cx8")
+}
+
+test "a concrete type that has the trait meets the bounds of the Display impl" {
+    let s = "{Cx { v: 1 }}"
+    assert_eq("{s} {Bx { v: 3 }} {Bare { v: "x" }}", "cx1 bx3 bare")
+}
+
+test "a tuple hole, display and a builder render through the Display impl" {
+    assert_eq(in_tuple(4), "(1, bx4)")
+    assert_eq(by_display(9), "bx9")
+    assert_eq(by_qualified_display(6), "cx6")
+    assert_eq(into_builder(2), "cx2")
+}
+
+test "a Display impl whose bound is Display renders a nested instance" {
+    assert_eq("{Pl { v: Pl { v: 3 } }}", "pl(pl(3))")
+    assert_eq("{Pl { v: Bx { v: 4 } }}", "pl(bx4)")
+    assert_eq(Pl { v: 1 }, Pl { v: 1 })
+}
+
+test "a type whose Display impl does not hold at an instance builds where nothing shows that instance" {
+    assert_eq(Only { v: "s" }, Only { v: "s" })
+    assert_eq("{Only { v: 2 }}", "only2")
+}
+
+fn sh(cmd: Str) -> ProcessResult ! Process.Spawn {
+    process.run("sh", ["-c", cmd]).unwrap()
+}
+
+let shapes_src = [
+    "pub trait Tag \{ fn tag(self) -> Int }",
+    "impl Tag for Int \{ fn tag(self) -> Int \{ self } }",
+    "pub type Bx[T] \{ v: T }",
+    "impl[T] Display for Bx[T] where T: Tag \{ fn fmt(self, sb: StringBuilder) \{ sb.write(\"bx\{self.v.tag()}\") } }",
+    "pub fn shown[U: Tag](u: U) -> Str \{ \"\{Bx \{ v: u }}\" }",
+    "",
+].join("\n")
+
+let main_src = [
+    "import shapes.\{Bx, Tag, shown}",
+    "fn ok[U: Tag](u: U) -> Str \{ \"\{Bx \{ v: u }}\" }",
+    "fn main() \{",
+    "    io.println(ok(5))",
+    "    io.println(Bx \{ v: 6 })",
+    "    io.println(shown(7))",
+    "}",
+    "",
+].join("\n")
+
+test "a Display impl on a generic type in another module prints the same in each build" {
+    let root = "{scratch_root()}/display_generic_impl_pkg_{getpid()}"
+    let _ = sh("rm -rf {root} && mkdir -p {root}/src")
+    fs.write("{root}/blink.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\n").unwrap()
+    fs.write("{root}/src/shapes.bl", shapes_src).unwrap()
+    fs.write("{root}/src/main.bl", main_src).unwrap()
+    let blink = sh("readlink -f build/blink").out.trim()
+    let mut failed: List[Str] = []
+    for mode in ["--no-per-module", "--per-module"] {
+        let r = sh("cd {root} && env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE timeout 300 {blink} run {mode} src/main.bl < /dev/null 2>&1")
+        if !r.success() || !r.out.ends_with("bx5\nbx6\nbx7\n") { failed.push("blink run {mode}: {r.end}\n{r.out}") }
+    }
+    let _ = sh("rm -rf {root}")
+    assert_eq(failed, [])
+}
