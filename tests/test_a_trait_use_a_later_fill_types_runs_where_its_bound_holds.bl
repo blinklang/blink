@@ -1,0 +1,182 @@
+// A use that needs a trait of a value's type (a Display hole, `.debug()`, `==`, `assert_eq`,
+// a list's `contains`, `index_of` and `sort`) whose type a later use fills builds and runs where the type has the trait (§3.6 Trait
+// Bounds): a bound on the body's binder, one in its impl's where clause, one given through a
+// supertrait, or a concrete type that has the trait. A program whose generic body lives in
+// another module prints the same text in the one-unit and the per-module build.
+
+import std.fs
+import std.process.{ProcessResult}
+import compile_test_helpers.{scratch_root}
+
+trait Sh: Display {
+    fn sh(self) -> Int
+}
+
+impl Sh for Int {
+    fn sh(self) -> Int { self }
+}
+
+trait Ck {
+    fn chk(self) -> Str
+}
+
+type Hold[T] { v: T }
+
+impl[T] Ck for Hold[T] where T: Display + Debug + Ord {
+    fn chk(self) -> Str {
+        let mut l = []
+        let mut shown = ""
+        let mut seen = ""
+        let mut has = false
+        let mut sorted = 0
+        for _ in 0..2 {
+            if l.len() > 0 {
+                shown = "{l.get(0).unwrap()}"
+                seen = l.debug()
+                has = l.contains(l.get(0).unwrap())
+                sorted = l.sort().len()
+            }
+            l.push(self.v)
+        }
+        assert_eq(l, l)
+        "{shown} {seen} {l == l} {has} {sorted}"
+    }
+}
+
+fn inline[T: Display + Debug + Eq](x: T) -> Str {
+    let mut l = []
+    let mut shown = ""
+    let mut seen = ""
+    for _ in 0..2 {
+        if l.len() > 0 {
+            shown = "{l.get(0).unwrap()}"
+            seen = l.debug()
+        }
+        l.push(x)
+    }
+    assert_eq(l, l)
+    "{shown} {seen} {l == l}"
+}
+
+fn through_super[T: Sh + Ord](x: T) -> Str {
+    let mut l = []
+    let mut shown = ""
+    let mut at = -1
+    let mut sorted = 0
+    for _ in 0..2 {
+        if l.len() > 0 {
+            shown = "{l.get(0).unwrap()}"
+            at = l.index_of(l.get(0).unwrap()) ?? -1
+            sorted = l.sort().len()
+        }
+        l.push(x)
+    }
+    "{shown} {l == l} {x < x} {at} {sorted}"
+}
+
+test "a bound on the body's binder meets each use a later fill types" {
+    assert_eq(inline(5), "5 [5] true")
+    assert_eq(inline("s"), "s [\"s\"] true")
+}
+
+test "a bound in an impl's where clause meets each use a later fill types" {
+    assert_eq(Hold { v: 7 }.chk(), "7 [7] true true 1")
+}
+
+test "a bound given through a supertrait meets each use a later fill types" {
+    assert_eq(through_super(8), "8 true false 0 1")
+}
+
+test "a concrete type that has each trait meets each use a later fill types" {
+    let mut l = []
+    let mut t = []
+    let mut shown = ""
+    let mut seen = ""
+    let mut has = false
+    let mut sorted = 0
+    for _ in 0..2 {
+        if l.len() > 0 {
+            shown = "{l.get(0).unwrap()} {t.get(0).unwrap()}"
+            seen = l.debug()
+            has = l.contains(l.get(0).unwrap())
+            sorted = l.sort().len()
+        }
+        l.push(1)
+        t.push((2, "a"))
+    }
+    assert_eq(l, l)
+    assert_eq("{shown} {seen} {l == l} {has} {sorted}", "1 (2, a) [1] true true 1")
+}
+
+type Col { Red, Blue }
+
+@derive(Eq, Ord)
+type Pt { a: Int }
+
+fn compare_late(y: Col, p: Pt) -> Str {
+    let mut l = []
+    let mut m = []
+    let mut same = false
+    let mut less = false
+    for _ in 0..2 {
+        if l.len() > 0 {
+            same = l.get(0).unwrap() == y
+            less = m.get(0).unwrap() < p
+        }
+        l.push(Col.Red)
+        m.push(Pt { a: 1 })
+    }
+    "{same} {less}"
+}
+
+test "a later fill with an enum or a struct compares as the written type does" {
+    assert_eq(compare_late(Col.Red, Pt { a: 2 }), "true true")
+    assert_eq(compare_late(Col.Blue, Pt { a: 1 }), "false false")
+}
+
+fn sh(cmd: Str) -> ProcessResult ! Process.Spawn {
+    process.run("sh", ["-c", cmd]).unwrap()
+}
+
+let late_src = [
+    "pub fn late[T: Display + Debug + Eq](x: T) -> Str \{",
+    "    let mut l = []",
+    "    let mut shown = \"\"",
+    "    let mut seen = \"\"",
+    "    for _ in 0..2 \{",
+    "        if l.len() > 0 \{",
+    "            shown = \"\{l.get(0).unwrap()}\"",
+    "            seen = l.debug()",
+    "        }",
+    "        l.push(x)",
+    "    }",
+    "    assert_eq(l, l)",
+    "    \"\{shown} \{seen} \{l == l}\"",
+    "}",
+    "",
+].join("\n")
+
+let main_src = [
+    "import late.\{late}",
+    "fn main() \{",
+    "    io.println(late(5))",
+    "    io.println(late(\"s\"))",
+    "}",
+    "",
+].join("\n")
+
+test "a generic body in another module whose uses a later fill types prints the same in each build" {
+    let root = "{scratch_root()}/late_fill_judge_pkg_{getpid()}"
+    let _ = sh("rm -rf {root} && mkdir -p {root}/src")
+    fs.write("{root}/blink.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\n").unwrap()
+    fs.write("{root}/src/late.bl", late_src).unwrap()
+    fs.write("{root}/src/main.bl", main_src).unwrap()
+    let blink = sh("readlink -f build/blink").out.trim()
+    let mut failed: List[Str] = []
+    for mode in ["--no-per-module", "--per-module"] {
+        let r = sh("cd {root} && env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE timeout 300 {blink} run {mode} src/main.bl < /dev/null 2>&1")
+        if !r.success() || !r.out.ends_with("5 [5] true\ns [\"s\"] true\n") { failed.push("blink run {mode}: {r.end}\n{r.out}") }
+    }
+    let _ = sh("rm -rf {root}")
+    assert_eq(failed, [])
+}

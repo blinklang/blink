@@ -26,7 +26,7 @@ import diagnostics.{
     diag_set_last_fix, diag_set_last_fix_at, diag_add_label_since, diag_release_repeat_key_since, diag_add_last_fix_edit, diag_set_fix_edits_at, DiagEntry, DiagFixEdit, diag_source_lines, diag_entries, UNDECLARED_EFFECT, UNSOURCED_EFFECT_WILDCARD, DERIVED_OP_FOREIGN_EFFECT,
     diag_push_allows, diag_enter_allows, diag_exit_allows, NON_CONST_EXPR,
     diag_warn_at, diag_warn_at_notes, diag_warn_span_at_notes, PARTIAL_HANDLER, diag_truncate, diag_entry_count, diag_any_errors_since, diag_ice_at, diag_ice, diag_ice_abort, PRELUDE_TYPE_NOT_LOADED, diag_count, diag_emit_in_file, diag_file_for_node, diag_file_node_range,
-    diag_is_audit_gated, diag_audit_gated_help, AUDIT_GATED_SUPPRESSION, diag_normalize_path, diag_source_line, diag_errors_in_lines,
+    diag_is_audit_gated, diag_audit_gated_help, AUDIT_GATED_SUPPRESSION, diag_normalize_path, diag_source_line, diag_errors_in_lines, diag_errors_in_lines_before,
     POSITIONAL_PARAM_DEFAULT, NON_CONST_PARAM_DEFAULT, FOREIGN_CONST_FORM, FOREIGN_CONST_NO_HEADER, RANGE_BOUND_NOT_CONST, NON_INIT_EXPR,
     ICE_SEG_UNSOLVED_TYPEVAR, ICE_SEG_UNHANDLED_KIND, ICE_SEG_TID_OUT_OF_RANGE,
     ICE_SEG_ERASED_SLOT, diag_is_ice_seg,
@@ -3256,11 +3256,12 @@ type CallFacts {
     // binder tids the call gave (tc_note_impl_bound_call).
     impl_bound_calls: List[Int]
     impl_bound_binds: Map[Int, ImplBoundCall]
-    // Each value shown through Display (a hole, a print sink, `.display()`) whose type inference
-    // may still fill, in the order first walked (tc_note_shown_value). Apart from the calls
-    // through an impl: a hole that holds such a call has both on one node.
-    shown_values: List[Int]
-    shown_value_at: Map[Int, ShownValue]
+    // Each use that needs a trait of a type inference may still fill (a value shown through
+    // Display, a std trait method, a comparison, an assertion), in the order first walked
+    // (tc_note_deferred_use). Keyed by node and judge (tc_deferred_use_key): a hole whose value
+    // is a `.clone()` call has two uses on one node. Apart from the calls through an impl.
+    deferred_uses: List[Int]
+    deferred_use_at: Map[Int, DeferredUse]
     // The owner each static call's head names. Its spelling may not say it, as `Self` does not.
     static_owners: Map[Int, Str]
     // The trait each trait-qualified call's head names. A type of the same spelling in a
@@ -3299,16 +3300,32 @@ type ImplBoundCall {
     enclosing: Int
 }
 
-// The type a value is shown at, the sink that shows it ("" for a hole), and the fn whose body
-// shows it.
-type ShownValue {
+// A use whose trait is judged once inference is done: the type it needs the trait of, the
+// second operand's type for a comparison or an assertion or the list's type for a list scan
+// (else -1), how the use judges it, and the fn whose body has the use.
+type DeferredUse {
     tid: Int
-    sink: Str
+    tid2: Int
+    judge: UseJudge
     enclosing: Int
 }
 
+// How a deferred use is judged, by the judge the use runs when its type is known at once.
+type UseJudge {
+    // A value shown through Display, at the sink that shows it ("" for a hole).
+    Shown(sink: Str)
+    // A std trait method the compiler answers (tc_std_trait_call).
+    StdMethod(tr: Str, method: Str, self_offset: Int)
+    Comparison(op: Str)
+    AssertEq
+    // A list's `contains` or `index_of`, which compare elements with `==`.
+    ListScan(method: Str)
+    // A list's `sort`, at the node of its receiver.
+    Sort(recv: Int)
+}
+
 fn new_call_facts() -> CallFacts {
-    CallFacts { open_calls: [], open_group: Map(), open_tids: [], reported: Map(), self_views: Map(), view_sigs: Map(), hash_aliases_above: [], derive_facts_above: [], derive_facts_low: 0, derive_facts_open: [], derive_facts_open_low: Map(), debug_unbuilt_seen: Map(), hash_by_bounds: false, static_head_insts: Map(), static_head_binders: Map(), impl_bound_calls: [], impl_bound_binds: Map(), shown_values: [], shown_value_at: Map(), static_owners: Map(), trait_heads: Map(), closure_expected_at: Map(), ret_ann: -1, missing_else: Map(), walk_returns: [], written_names: Map(), under_fn_type: Map(), method_reads: Map(), method_read_order: [] }
+    CallFacts { open_calls: [], open_group: Map(), open_tids: [], reported: Map(), self_views: Map(), view_sigs: Map(), hash_aliases_above: [], derive_facts_above: [], derive_facts_low: 0, derive_facts_open: [], derive_facts_open_low: Map(), debug_unbuilt_seen: Map(), hash_by_bounds: false, static_head_insts: Map(), static_head_binders: Map(), impl_bound_calls: [], impl_bound_binds: Map(), deferred_uses: [], deferred_use_at: Map(), static_owners: Map(), trait_heads: Map(), closure_expected_at: Map(), ret_ann: -1, missing_else: Map(), walk_returns: [], written_names: Map(), under_fn_type: Map(), method_reads: Map(), method_read_order: [] }
 }
 let mut tc_calls: CallFacts = new_call_facts()
 
@@ -4399,6 +4416,8 @@ type BodyFrames {
     own_tps: Int
     saved_fn_node: Int
     saved_module: Str
+    saved_self_trait: Str
+    saved_self_tid: Int
 }
 
 fn tc_enter_body_frames(enclosing: Int) -> BodyFrames ! TypeCheck.Resolve, Diag.Report {
@@ -4411,6 +4430,15 @@ fn tc_enter_body_frames(enclosing: Int) -> BodyFrames ! TypeCheck.Resolve, Diag.
     let own_tps = if enclosing >= 0 { node_type_params(enclosing) } else { -1 }
     let saved_fn_node = tc_current_fn_node
     tc_current_fn_node = enclosing
+    // A judge that names `Self` or its trait in a report reads these, as the body's walk set them.
+    let saved_self_trait = tc_current_self_trait
+    let saved_self_tid = tc_current_self_tid
+    if in_trait {
+        tc_current_self_trait = node_name(block)
+        tc_current_self_tid = make_typevar_bound("Self", SELF_BINDER_NODE)
+    } else if in_impl {
+        tc_current_self_tid = tc_impl_recv_tid(block)
+    }
     let saved_module = if enclosing >= 0 { tc_enter_body_module(enclosing) } else { nr_current_module }
     if enclosing >= 0 { diag_enter_allows(enclosing) }
     if in_trait { tc_push_self_frame(block) }
@@ -4418,7 +4446,7 @@ fn tc_enter_body_frames(enclosing: Int) -> BodyFrames ! TypeCheck.Resolve, Diag.
     tc_push_tparam_scope(impl_binders)
     tc_push_where_frames(impl_where)
     tc_push_tparam_scope(own_tps)
-    BodyFrames { enclosing: enclosing, in_trait: in_trait, trait_tps: trait_tps, impl_binders: impl_binders, impl_where: impl_where, own_tps: own_tps, saved_fn_node: saved_fn_node, saved_module: saved_module }
+    BodyFrames { enclosing: enclosing, in_trait: in_trait, trait_tps: trait_tps, impl_binders: impl_binders, impl_where: impl_where, own_tps: own_tps, saved_fn_node: saved_fn_node, saved_module: saved_module, saved_self_trait: saved_self_trait, saved_self_tid: saved_self_tid }
 }
 
 fn tc_leave_body_frames(f: BodyFrames) {
@@ -4429,6 +4457,8 @@ fn tc_leave_body_frames(f: BodyFrames) {
     if f.in_trait { tc_pop_self_frame() }
     if f.enclosing >= 0 { diag_exit_allows() }
     tc_current_fn_node = f.saved_fn_node
+    tc_current_self_trait = f.saved_self_trait
+    tc_current_self_tid = f.saved_self_tid
     tc_leave_body_module(f.saved_module)
 }
 
@@ -4740,8 +4770,8 @@ fn tc_drop_open_calls() {
     tc_calls.open_tids = []
     tc_calls.impl_bound_calls = []
     tc_calls.impl_bound_binds.clear()
-    tc_calls.shown_values = []
-    tc_calls.shown_value_at.clear()
+    tc_calls.deferred_uses = []
+    tc_calls.deferred_use_at.clear()
     tc_calls.method_reads.clear()
     tc_calls.method_read_order = []
 }
@@ -8520,45 +8550,91 @@ fn tc_check_display_sink_arg(arg: Int, t: Int, sink: Str) ! TypeCheck.Resolve, T
 fn tc_check_shown_value(arg: Int, t: Int, sink: Str) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     let leaf = tc_display_missing_leaf(t)
     if leaf < 0 {
-        tc_note_shown_value(arg, t, sink)
+        tc_note_deferred_use(arg, t, -1, UseJudge.Shown(sink))
         return
     }
     tc_errors.push("type `{type_to_str(t)}` does not implement `Display`")
     tc_report_missing_display(arg, t, leaf, sink, [])
 }
 
-// Only a value whose type has a known shape (a tuple, an instance of a generic type) and an
-// argument inference may still fill is left for the flush. A walk of the node again replaces
-// its record, as tc_note_impl_bound_call does.
-fn tc_note_shown_value(arg: Int, t0: Int, sink: Str) {
-    if tc_boundary_check_active == 0 || arg < 0 { return }
-    let t = resolve_alias_tid(tc_resolve(t0))
-    let k = type_kind(t)
-    let shaped = k == TyKind.Tuple || ((k == TyKind.Struct || k == TyKind.Enum) && tc_tid_struct_arg_count(t) > 0)
-    if !shaped || tc_tid_has_unbound_metavar(t) == 0 {
-        if tc_calls.shown_value_at.remove(arg).is_some() {
-            let at = tc_calls.shown_values.index_of(arg) ?? -1
-            if at >= 0 { let _ = tc_calls.shown_values.remove(at) }
+// A use is left for the flush only when its type, or its second operand's, has a part inference
+// may still fill. A walk of the node again replaces its record, as tc_note_impl_bound_call does,
+// and a walk that finds both types closed drops it: that walk judged the use whole.
+fn tc_note_deferred_use(node: Int, t: Int, t2: Int, judge: UseJudge) {
+    if tc_boundary_check_active == 0 || node < 0 { return }
+    let key = tc_deferred_use_key(node, judge)
+    if !tc_deferred_use_open(t, t2) {
+        if tc_calls.deferred_use_at.remove(key).is_some() {
+            let at = tc_calls.deferred_uses.index_of(key) ?? -1
+            if at >= 0 { let _ = tc_calls.deferred_uses.remove(at) }
         }
         return
     }
-    if !tc_calls.shown_value_at.contains_key(arg) { tc_calls.shown_values.push(arg) }
-    tc_calls.shown_value_at.insert(arg, ShownValue { tid: t, sink: sink, enclosing: tc_current_fn_node })
+    if !tc_calls.deferred_use_at.contains_key(key) { tc_calls.deferred_uses.push(key) }
+    tc_calls.deferred_use_at.insert(key, DeferredUse { tid: t, tid2: t2, judge: judge, enclosing: tc_current_fn_node })
 }
 
-// The flush half of tc_check_shown_value, in the body that shows the value. An error already
-// on the value's lines is the first report.
-fn tc_flush_shown_values() ! TypeCheck.Resolve, Diag.Report {
-    for i in 0..tc_calls.shown_values.len() {
-        let arg = tc_calls.shown_values.get(i).unwrap()
-        let rec = tc_calls.shown_value_at.get(arg).unwrap()
-        let end_line = if node_end_line(arg) > node_line(arg) { node_end_line(arg) } else { node_line(arg) }
-        if diag_errors_in_lines(diag_file_for_node(arg), node_line(arg), end_line) > 0 { continue }
+// Two judges can wait on one node (a hole that also compares), so each variant needs its own key:
+// this must be greater than the largest slot in tc_deferred_use_key.
+const DEFERRED_USE_SLOTS = 6
+
+fn tc_deferred_use_key(node: Int, judge: UseJudge) -> Int {
+    let slot = match judge {
+        Shown(_) => 0
+        StdMethod(_, _, _) => 1
+        Comparison(_) => 2
+        AssertEq => 3
+        ListScan(_) => 4
+        Sort(_) => 5
+    }
+    node * DEFERRED_USE_SLOTS + slot
+}
+
+fn tc_deferred_use_node(key: Int) -> Int { key / DEFERRED_USE_SLOTS }
+
+fn tc_deferred_use_open(t: Int, t2: Int) -> Bool {
+    (t >= 0 && tc_tid_has_unbound_metavar(t) != 0) || (t2 >= 0 && tc_tid_has_unbound_metavar(t2) != 0)
+}
+
+// The flush half of tc_note_deferred_use: each use is judged in the body that has it, by the
+// judge the use runs when its type is known at once. An error the walk left on the use's lines
+// is the first report; one this flush gave another use on those lines is not, as a written type
+// would get both. A type inference left open is not judged: the binding that holds it answers for
+// it (E0301). The judges compare type names, so each gets the types inference settled on.
+fn tc_flush_deferred_uses() ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    let walk_diags = diag_entry_count()
+    for i in 0..tc_calls.deferred_uses.len() {
+        let key = tc_calls.deferred_uses.get(i).unwrap()
+        let rec = tc_calls.deferred_use_at.get(key).unwrap()
+        let node = tc_deferred_use_node(key)
+        if tc_deferred_use_open(rec.tid, rec.tid2) { continue }
+        let end_line = if node_end_line(node) > node_line(node) { node_end_line(node) } else { node_line(node) }
+        if diag_errors_in_lines_before(walk_diags, diag_file_for_node(node), node_line(node), end_line) > 0 { continue }
+        let tid = tc_resolve(rec.tid)
+        let tid2 = if rec.tid2 >= 0 { tc_resolve(rec.tid2) } else { -1 }
         let frames = tc_enter_body_frames(rec.enclosing)
-        let leaf = tc_display_missing_leaf(rec.tid)
-        if leaf >= 0 { tc_report_missing_display(arg, rec.tid, leaf, rec.sink, []) }
+        match rec.judge {
+            Shown(sink) => {
+                let leaf = tc_display_missing_leaf(tid)
+                if leaf >= 0 { tc_report_missing_display(node, tid, leaf, sink, []) }
+            }
+            StdMethod(tr, method, self_offset) => { let _ = tc_judge_std_trait_method(node, tid, tr, method, self_offset) }
+            Comparison(op) => tc_check_comparison_operands(node, op, tid, tid2)
+            AssertEq => reject_eq_less_assert_args(tid, tid2, node)
+            ListScan(method) => {
+                let need = tc_list_scan_elem_need(tid)
+                if need.len() > 0 { let _ = tc_refuse_list_scan(node, tid2, need, method) }
+            }
+            Sort(recv) => { let _ = tc_refuse_unordered_sort(node, recv, tid) }
+        }
         tc_leave_body_frames(frames)
     }
+}
+
+// Whether the walk left a comparison at `node` for tc_flush_deferred_uses, which judges it in
+// its body's frames.
+fn tc_comparison_is_deferred(node: Int) -> Bool {
+    tc_calls.deferred_use_at.contains_key(tc_deferred_use_key(node, UseJudge.Comparison("")))
 }
 
 // The part of `t0` that has no Display, or -1 when Display holds or cannot be known yet.
@@ -8616,7 +8692,7 @@ fn tc_display_instance_missing_leaf(t: Int) -> Int ! TypeCheck.Resolve, Diag.Rep
 }
 
 // The first bound of Display impl `im`, other than a Display bound, that does not hold at the
-// instance `t`. An instance inference has not fixed is judged when it is (tc_note_shown_value).
+// instance `t`. An instance inference has not fixed is judged when it is (tc_note_deferred_use).
 fn tc_display_impl_other_bound(im: Int, t: Int, binds: Map[Str, Int]) -> Option[TcFailedBound] ! TypeCheck.Resolve, Diag.Report {
     if !tc_tid_is_judgeable_among(t, 1) { return None }
     tc_impl_failed_bound(im, binds, [], "Display")
@@ -26649,9 +26725,8 @@ fn tc_suggest_method(obj_k: TyKind, tname: Str, method: Str) -> Str {
 // `Contains` Trait* and *The `ListOps` Trait*). The answer is the same chain `==` reports,
 // empty when the element is `Eq`.
 //
-// An element nothing has chosen yet is not refused. There is no type to name as lacking the
-// comparison, and the instance the call is monomorphised to meets this same gate once its
-// element is decided.
+// An element nothing has chosen yet is not refused here: there is no type to name as lacking
+// the comparison. The call is judged again once inference fills it (tc_note_deferred_use).
 fn tc_list_scan_elem_need(elem: Int) -> List[Int] {
     let k = type_kind(elem)
     if k == TyKind.Unknown { return [] }
@@ -31259,10 +31334,20 @@ fn tc_std_trait_call(node: Int, obj_t: Int, recv_node: Int, tr: Str, shown_trait
                 "`{method}` is built for one type, and nothing here says which type this value has")
             return tc_error_recovery_tid()
         }
+        tc_note_deferred_use(node, obj_t, -1, UseJudge.StdMethod(tr, method, self_offset))
         return tc_std_trait_ret(obj_t, method)
     }
+    tc_note_deferred_use(node, obj_t, -1, UseJudge.StdMethod(tr, method, self_offset))
+    if !tc_judge_std_trait_method(node, obj_t, tr, method, self_offset) { return tc_error_recovery_tid() }
+    tc_std_trait_ret(obj_t, method)
+}
+
+// Whether the compiler builds the std trait method `method` of `tr` for `obj_t`, a type with no
+// part inference may still fill; a report at `node` when it does not. tc_std_trait_call runs it at
+// the call, and tc_flush_deferred_uses runs it once a later use fills the receiver's type.
+fn tc_judge_std_trait_method(node: Int, obj_t: Int, tr: Str, method: Str, self_offset: Int) -> Bool ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     // A hole is what an earlier error left, and that error already speaks for this value.
-    if tc_tid_has_unknown(obj_t) != 0 { return tc_error_recovery_tid() }
+    if tc_tid_has_unknown(obj_t) != 0 { return false }
     let need = tc_trait_need(obj_t, tr, [])
     if need.len() > 0 {
         // A dotted call finds a method only through an impl for the receiver's type
@@ -31276,17 +31361,17 @@ fn tc_std_trait_call(node: Int, obj_t: Int, recv_node: Int, tr: Str, shown_trait
         } else {
             tc_report_trait_need(need, tr, node)
         }
-        return tc_error_recovery_tid()
+        return false
     }
     match tc_std_trait_unbuilt(obj_t, tr) {
         Some(why) => {
             tc_error_at_code(tc_not_built_text("`{method}` on `{type_to_str(obj_t)}`", "", why), node, "TypeError", TYPE_ERROR,
                 tc_std_trait_unbuilt_help(method))
-            return tc_error_recovery_tid()
+            return false
         }
         None => {}
     }
-    tc_std_trait_ret(obj_t, method)
+    true
 }
 
 // The traits this module can see that give the type of `obj_t` a method `method`, other than
@@ -32391,7 +32476,10 @@ fn tc_recheck_operator(node: Int, k: NodeKind) ! TypeCheck.Resolve, TypeCheck.Re
         return
     }
     let op = node_op(node)
-    if is_comparison_op(op) != 0 { return tc_check_comparison_operands(node, op, lt, rt) }
+    if is_comparison_op(op) != 0 {
+        if tc_comparison_is_deferred(node) { return }
+        return tc_check_comparison_operands(node, op, lt, rt)
+    }
     if op == "+" || op == "-" || op == "*" || op == "/" || op == "%" {
         if tc_check_str_plus(node, op, lt, rt) { return }
         let _ = tc_check_arith_operands(node, op, lt, rt)
@@ -32553,6 +32641,7 @@ fn tc_infer_comparison(node: Int, op: Str) -> Int ! TypeCheck.Resolve, TypeCheck
     // A comparison passes no expected type to its operands, so a literal settles one at Int.
     tc_settle_literal_operands(node, lt, rt, -1)
     tc_check_comparison_operands(node, op, lt, rt)
+    tc_note_deferred_use(node, lt, rt, UseJudge.Comparison(op))
     if cmp_is_enum_int_pair(lt, rt) == 0 { tc_join_agreeing_values(lt, rt) }
     return TYPE_BOOL
 }
@@ -32888,6 +32977,7 @@ fn tc_check_assert_eq_args(tids: List[Int], node: Int) ! TypeCheck.Resolve, Type
     if tc_tid_has_unbound_metavar(t0) != 0 { let _ = tc_unify(t0, t1) }
     if tc_tid_has_unbound_metavar(t1) != 0 { let _ = tc_unify(t1, t0) }
     reject_eq_less_assert_args(t0, t1, node)
+    tc_note_deferred_use(node, t0, t1, UseJudge.AssertEq)
 }
 
 fn infer_carrier_arg(arg_node: Int, carrier: Str) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
@@ -34494,6 +34584,7 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
             // the comparator a `sort_by` takes is checked here when it is annotated or a fn
             // value, and by tc_check_sort_by_body once an unannotated one is walked.
             if method == "sort" {
+                tc_note_deferred_use(node, elem, -1, UseJudge.Sort(recv_node))
                 if tc_refuse_unordered_sort(node, recv_node, elem) != 0 { return tc_error_recovery_tid() }
                 return obj_t
             }
@@ -34662,6 +34753,7 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                 return obj_t
             }
             if method == "contains" || method == "index_of" {
+                tc_note_deferred_use(node, elem, obj_t, UseJudge.ListScan(method))
                 let need = tc_list_scan_elem_need(elem)
                 if need.len() > 0 { return tc_refuse_list_scan(node, obj_t, need, method) }
                 check_builtin_arg(method, 0, elem, args_sl, "List")
@@ -43817,7 +43909,7 @@ fn tc_flush_program_deferrals(program: Bool) ! TypeCheck.Resolve, TypeCheck.Repo
     tc_ud_flush_pending()
     tc_ud_flush_calls()
     tc_flush_impl_bound_calls()
-    tc_flush_shown_values()
+    tc_flush_deferred_uses()
     tc_ud_flush_fn_values()
     tc_flush_method_reads()
     tc_refuse_deferred_conversions()

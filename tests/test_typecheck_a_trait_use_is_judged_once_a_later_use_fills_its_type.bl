@@ -1,0 +1,394 @@
+// A use that needs a trait of a value's type (a Display hole or print sink, `.debug()`, `==`,
+// `assert_eq`, a list's `contains`, `index_of` and `sort`) is judged at the type the value has once inference is done, so a use whose type a
+// later use fills reads as it would if the type were written there (§3.6 Trait Bounds: a failed
+// Display bound is E0523 at every call). The report is the one the written type gets, at the
+// use, once. A bound written on the body's binder, in a where clause or through a supertrait
+// meets it, and so does a type that has the trait. A type nothing fills is E0301 at its binding
+// and the use adds no report.
+
+import std.fs
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_reset}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+
+fn probe(path: Str, src: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    init_embedded_stdlib()
+    fs.write(path, src).unwrap()
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+    program
+}
+
+fn errors_reported() -> List[Str] {
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" { out.push("{d.code} {d.line}:{d.col} | {d.notes.join(" / ")} | {d.help}") }
+    }
+    out
+}
+
+// The program shares one prelude, so the body under test starts on line 9.
+fn errors_for(name: Str, body: List[Str]) -> List[Str] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    let mut lines = [
+        "trait Tag \{ fn tag(self) -> Int }",
+        "trait Sh: Display \{ fn sh(self) -> Int }",
+        "impl Tag for Int \{ fn tag(self) -> Int \{ self } }",
+        "type Cx[T] \{ v: T }",
+        "impl[T: Tag] Display for Cx[T] \{ fn fmt(self, sb: StringBuilder) \{ sb.write(\"cx\{self.v.tag()}\") } }",
+        "type NoShow \{ a: Int }",
+        "type NoDbg \{ a: Int }",
+        "type NoEq \{ a: Int }",
+    ]
+    for l in body { lines.push(l) }
+    lines.push("fn main() \{ }")
+    lines.push("")
+    let _ = probe("build/tc_late_fill_judge_{name}.bl", lines.join("\n"))
+    errors_reported()
+}
+
+// Refused: the type a later use fills lacks the trait the use needs.
+
+test "a hole whose type a later push fills with a type without Display is E0523 at the hole" {
+    assert_eq(errors_for("hole_bare", [
+        "fn bad() ! IO \{",
+        "    let mut l = []",
+        "    if l.len() > 0 \{ io.println(\"\{l.get(0).unwrap()}\") }",
+        "    l.push(NoShow \{ a: 1 })",
+        "}",
+    ]), ["E0523 11:35 | use `l.get(0).unwrap().debug()` for structural representation | implement `Display` for `NoShow` with an `impl Display for NoShow` block"])
+}
+
+test "a hole whose type a later push fills with an instance whose Display impl bound fails is E0523 with the bound note" {
+    assert_eq(errors_for("hole_impl_bound", [
+        "fn bad() ! IO \{",
+        "    let mut l = []",
+        "    if l.len() > 0 \{ io.println(\"\{l.get(0).unwrap()}\") }",
+        "    l.push(Cx \{ v: NoTag \{ a: 1 } })",
+        "}",
+        "type NoTag \{ a: Int }",
+    ]), ["E0523 11:35 | `Cx`'s impl of Display declares `T: Tag` at build/tc_late_fill_judge_hole_impl_bound.bl:5 / `NoTag` does not implement Tag | write `impl Tag for NoTag`, or show a value whose type implements Tag"])
+}
+
+test "a print sink whose argument type a later push fills without Display is E0523 at the argument" {
+    assert_eq(errors_for("sink_bare", [
+        "fn bad() ! IO \{",
+        "    let mut l = []",
+        "    if l.len() > 0 \{ io.println(l.get(0).unwrap()) }",
+        "    l.push(NoShow \{ a: 1 })",
+        "}",
+    ]), ["E0523 11:33 | use `l.get(0).unwrap().debug()` for structural representation | implement `Display` for `NoShow` with an `impl Display for NoShow` block"])
+}
+
+test "a hole in a generic body whose type a later push fills with an unbounded type parameter is E0523" {
+    assert_eq(errors_for("hole_tparam", [
+        "fn bad[T](x: T) ! IO \{",
+        "    let mut l = []",
+        "    if l.len() > 0 \{ io.println(\"\{l.get(0).unwrap()}\") }",
+        "    l.push(x)",
+        "}",
+    ]), ["E0523 11:35 |  | write the bound on the binder: `[T: Display]`"])
+}
+
+test "debug on a list a later push fills with a tuple is the not-built error" {
+    assert_eq(errors_for("debug_tuple", [
+        "fn bad() ! IO \{",
+        "    let mut xs = []",
+        "    io.println(xs.debug())",
+        "    xs.push((1, 2))",
+        "}",
+    ]), ["E0300 11:16 |  | build the text from the parts of the value whose `debug` is built"])
+}
+
+test "debug on a list a later push fills with a type without Debug is E0300 at the call" {
+    assert_eq(errors_for("debug_nodbg", [
+        "fn bad() -> Str \{",
+        "    let mut xs = []",
+        "    let s = xs.debug()",
+        "    xs.push(NoDbg \{ a: 1 })",
+        "    s",
+        "}",
+    ]), ["E0300 11:13 | `List[NoDbg]` is `Debug` only if `NoDbg` is `Debug` | add `@derive(Debug)` to `type NoDbg`"])
+}
+
+test "debug in a generic body on a list a later push fills with an unbounded type parameter is E0300" {
+    assert_eq(errors_for("debug_tparam", [
+        "fn bad[T](x: T) -> Str \{",
+        "    let mut xs = []",
+        "    let s = xs.debug()",
+        "    xs.push(x)",
+        "    s",
+        "}",
+    ]), ["E0300 11:13 | `List[T]` is `Debug` only if `T` is `Debug` | add the bound `[T: Debug]`"])
+}
+
+test "equality on a list a later push fills with a type without Eq is E0300 at the operator" {
+    assert_eq(errors_for("eq_noeq", [
+        "fn bad() -> Bool \{",
+        "    let mut l = []",
+        "    let r = l == l",
+        "    l.push(NoEq \{ a: 1 })",
+        "    r",
+        "}",
+    ]), ["E0300 11:15 | `List[NoEq]` is `Eq` only if `NoEq` is `Eq` | add `@derive(Eq)` to `type NoEq`"])
+}
+
+test "equality in a generic body on a list a later push fills with an unbounded type parameter is E0300" {
+    assert_eq(errors_for("eq_tparam", [
+        "fn bad[T](x: T) -> Bool \{",
+        "    let mut l = []",
+        "    let r = l == l",
+        "    l.push(x)",
+        "    r",
+        "}",
+    ]), ["E0300 11:15 | `List[T]` is `Eq` only if `T` is `Eq` | add the bound `[T: Eq]`"])
+}
+
+test "assert_eq in a generic body on a list a later push fills with an unbounded type parameter is E0306" {
+    assert_eq(errors_for("assert_tparam", [
+        "fn bad[T](x: T) \{",
+        "    let mut l = []",
+        "    assert_eq(l, l)",
+        "    l.push(x)",
+        "}",
+    ]), ["E0306 11:5 | `List[T]` is `Eq` only if `T` is `Eq` | add the bound `[T: Eq]`"])
+}
+
+test "contains on a list a later push fills with a type without Eq is refused at the call" {
+    assert_eq(errors_for("contains_noeq", [
+        "fn bad() -> Bool \{",
+        "    let mut l = []",
+        "    let r = l.contains(NoEq \{ a: 1 })",
+        "    l.push(NoEq \{ a: 1 })",
+        "    r",
+        "}",
+    ]), ["E0505 11:13 |  | `.contains` compares elements with `==`, and `NoEq` does not implement `Eq`; add `@derive(Eq)` to `type NoEq`"])
+}
+
+test "index_of in a generic body on a list a later push fills with an unbounded type parameter is refused at the call" {
+    assert_eq(errors_for("index_of_tparam", [
+        "fn bad[T](x: T) -> Option[Int] \{",
+        "    let mut l = []",
+        "    let r = l.index_of(x)",
+        "    l.push(x)",
+        "    r",
+        "}",
+    ]), ["E0505 11:13 |  | `.index_of` compares elements with `==`, and `T` does not implement `Eq`; add the bound `[T: Eq]`"])
+}
+
+test "sort on a list a later push fills with a type without Ord is E0306 at the call" {
+    assert_eq(errors_for("sort_noord", [
+        "fn bad() -> Int \{",
+        "    let mut l = []",
+        "    let s = l.sort()",
+        "    l.push(NoEq \{ a: 1 })",
+        "    s.len()",
+        "}",
+    ]), ["E0306 11:13 |  | implement `Ord` for `NoEq`, or sort with a comparator: `l.sort_by(fn(a, b) \{ a.a.cmp(b.a) })`"])
+}
+
+test "sort in a generic body on a list a later push fills with an unbounded type parameter is E0306" {
+    assert_eq(errors_for("sort_tparam", [
+        "fn bad[T](x: T) -> Int \{",
+        "    let mut l = []",
+        "    let s = l.sort()",
+        "    l.push(x)",
+        "    s.len()",
+        "}",
+    ]), ["E0306 11:13 |  | add the bound `[T: Ord]`, or pass a comparator that returns `Ordering` to `l.sort_by`"])
+}
+
+test "sort on a list a later push fills with a tuple is the not-built error" {
+    assert_eq(errors_for("sort_tuple", [
+        "fn bad() -> Int \{",
+        "    let mut l = []",
+        "    let s = l.sort()",
+        "    l.push((1, 2))",
+        "    s.len()",
+        "}",
+    ]), ["E0300 11:13 |  | sort by one element instead, or sort with a comparator: `l.sort_by(fn(a, b) \{ a.0.cmp(b.0) })`"])
+}
+
+test "equality in a trait default body on a list a later push fills with Self names the trait" {
+    assert_eq(errors_for("eq_self_default", [
+        "trait Bar \{",
+        "    fn late(self) -> Bool \{",
+        "        let mut l = []",
+        "        let r = l.get(0).unwrap() == l.get(0).unwrap()",
+        "        l.push(self)",
+        "        r",
+        "    }",
+        "}",
+    ]), ["E0305 12:35 |  | declare the supertrait so every implementor provides `==`: trait Bar: Eq \{ ... }"])
+}
+
+test "a hole in a trait default body on a list a later push fills with Self names the trait" {
+    assert_eq(errors_for("hole_self_default", [
+        "trait Bar \{",
+        "    fn late(self) -> Str \{",
+        "        let mut l = []",
+        "        let s = \"\{l.get(0).unwrap()}\"",
+        "        l.push(self)",
+        "        s",
+        "    }",
+        "}",
+    ]), ["E0523 12:19 |  | make `Display` a supertrait: `trait Bar: Display`"])
+}
+
+test "two later-filled uses on one line each get their own report" {
+    assert_eq(errors_for("two_on_a_line", [
+        "fn bad() ! IO \{",
+        "    let mut l = []",
+        "    let mut s = []",
+        "    if l.len() > 0 \{ io.println(\"\{l.get(0).unwrap()} \{s == s}\") }",
+        "    l.push(NoShow \{ a: 1 })",
+        "    s.push(NoEq \{ a: 1 })",
+        "}",
+    ]), [
+        "E0523 12:35 | use `l.get(0).unwrap().debug()` for structural representation | implement `Display` for `NoShow` with an `impl Display for NoShow` block",
+        "E0300 12:57 | `List[NoEq]` is `Eq` only if `NoEq` is `Eq` | add `@derive(Eq)` to `type NoEq`",
+    ])
+}
+
+// A type nothing fills is E0301 at its binding, and the use adds no report.
+
+test "a hole on a list nothing fills is one E0301" {
+    let errs = errors_for("hole_open", [
+        "fn bad() ! IO \{",
+        "    let l = []",
+        "    if l.len() > 0 \{ io.println(\"\{l.get(0).unwrap()}\") }",
+        "}",
+    ])
+    assert_eq(errs.len(), 1)
+    assert(errs.get(0).unwrap().starts_with("E0301 10:5"))
+}
+
+test "debug on a list nothing fills is one E0301" {
+    let errs = errors_for("debug_open", [
+        "fn bad() ! IO \{",
+        "    let xs = []",
+        "    io.println(xs.debug())",
+        "}",
+    ])
+    assert_eq(errs.len(), 1)
+    assert(errs.get(0).unwrap().starts_with("E0301 10:5"))
+}
+
+test "equality on a list nothing fills is one E0301" {
+    let errs = errors_for("eq_open", [
+        "fn bad() -> Bool \{",
+        "    let l = []",
+        "    l == l",
+        "}",
+    ])
+    assert_eq(errs.len(), 1)
+    assert(errs.get(0).unwrap().starts_with("E0301 10:5"))
+}
+
+test "sort on a list nothing fills adds no report to E0301" {
+    let errs = errors_for("sort_open", [
+        "fn bad() -> Int \{",
+        "    let l = []",
+        "    let s = l.sort()",
+        "    s.len()",
+        "}",
+    ])
+    assert(errs.len() > 0)
+    for e in errs { assert(e.starts_with("E0301 ")) }
+}
+
+// Accepted: the type the later use fills has the trait.
+
+test "a later fill with a type that has each trait is accepted" {
+    assert_eq(errors_for("concrete_ok", [
+        "fn ok() -> Bool ! IO \{",
+        "    let mut l = []",
+        "    let mut c = []",
+        "    if l.len() > 0 \{ io.println(\"\{l.get(0).unwrap()} \{c.get(0).unwrap()}\") }",
+        "    let s = l.debug()",
+        "    assert_eq(l, l)",
+        "    let r = l == l && s != \"\" && l.contains(1) && l.sort().len() == l.len()",
+        "    l.push(1)",
+        "    c.push(Cx \{ v: 2 })",
+        "    r",
+        "}",
+    ]), [])
+}
+
+test "a bound written on the binder meets each later-filled use" {
+    assert_eq(errors_for("inline_ok", [
+        "fn ok[T: Display + Debug + Eq](x: T) -> Bool ! IO \{",
+        "    let mut l = []",
+        "    if l.len() > 0 \{ io.println(\"\{l.get(0).unwrap()}\") }",
+        "    let s = l.debug()",
+        "    assert_eq(l, l)",
+        "    let r = l == l && s != \"\"",
+        "    l.push(x)",
+        "    r",
+        "}",
+    ]), [])
+}
+
+test "a bound written in an impl's where clause meets each later-filled use" {
+    assert_eq(errors_for("where_ok", [
+        "trait Ck \{ fn chk(self) -> Bool ! IO }",
+        "type Hold[T] \{ v: T }",
+        "impl[T] Ck for Hold[T] where T: Display + Debug + Ord \{",
+        "    fn chk(self) -> Bool ! IO \{",
+        "        let mut l = []",
+        "        if l.len() > 0 \{ io.println(\"\{l.get(0).unwrap()}\") }",
+        "        let s = l.debug()",
+        "        assert_eq(l, l)",
+        "        let r = l == l && s != \"\" && l.contains(self.v) && l.sort().len() == l.len()",
+        "        l.push(self.v)",
+        "        r",
+        "    }",
+        "}",
+    ]), [])
+}
+
+test "a bound given through a supertrait meets each later-filled use" {
+    assert_eq(errors_for("super_ok", [
+        "fn ok[T: Sh + Ord](x: T) -> Bool ! IO \{",
+        "    let mut l = []",
+        "    if l.len() > 0 \{ io.println(\"\{l.get(0).unwrap()}\") }",
+        "    let r = l == l && l.index_of(x).is_some() && l.sort().len() == l.len()",
+        "    l.push(x)",
+        "    r",
+        "}",
+    ]), [])
+}
+
+test "a later fill with an enum, a struct or a Str compares as the written type does" {
+    assert_eq(errors_for("compare_named_ok", [
+        "type Col \{ Red, Blue }",
+        "@derive(Eq, Ord)",
+        "type P \{ a: Int }",
+        "fn ok(y: Col, p: P, t: Str) -> Bool \{",
+        "    let mut l = []",
+        "    let mut m = []",
+        "    let mut n = []",
+        "    let r = l.get(0).unwrap() == y && m.get(0).unwrap() < p && t == n.get(0).unwrap()",
+        "    l.push(Col.Red)",
+        "    m.push(P \{ a: 1 })",
+        "    n.push(\"s\")",
+        "    r",
+        "}",
+    ]), [])
+}
+
+test "a bound given through the trait meets each later-filled use in its default body" {
+    assert_eq(errors_for("self_default_ok", [
+        "trait Bar: Display + Eq \{",
+        "    fn late(self) -> Bool \{",
+        "        let mut l = []",
+        "        let s = \"\{l.get(0).unwrap()}\"",
+        "        let r = l.get(0).unwrap() == l.get(0).unwrap()",
+        "        l.push(self)",
+        "        r && s != \"\"",
+        "    }",
+        "}",
+    ]), [])
+}
