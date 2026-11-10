@@ -846,6 +846,23 @@ fn main() ! IO {
 }
 ```
 
+**The trait-qualified name with no call.** `Display.display` with no argument list is a function value. A method that takes `self` has the type `fn(Self, ..) -> R`, and the expected type fixes `Self` through the receiver parameter. With nothing to fix it, the name is E0301, and with a fixed `Self` that has no impl of the trait, it is E0306. A name that is an associated function is an error (*Impl-Qualified Calls* below). The rule and its examples are in §3.4 *A trait-qualified method named as a value*.
+
+```blink
+type User { name: Str }
+
+impl Display for User {
+    fn fmt(self, mut sb: StringBuilder) { sb.write(self.name) }
+}
+
+fn main() ! IO {
+    let users = [User { name: "Ada" }]
+    let names = users.map(Display.display)   // OK: Self = User, names: List[Str]
+    let show = Display.display               // COMPILE ERROR E0301: nothing fixes `Self`
+    io.println("{names.len()}")
+}
+```
+
 #### Impl-Qualified Calls
 
 `Trait.method(receiver, args)` gets `Self` from its receiver. An associated function has no receiver, so that form cannot say which type's impl to call. When two traits give one type an associated function with the same name, the unqualified call `Type.fn()` is E0522, and the program needs a form that names both the trait and the type. That form is the **impl-qualified call**:
@@ -861,7 +878,7 @@ impl Beta for Widget { fn make() -> Self { Widget { v: 2 } } }
 
 fn main() {
     let a = Widget.make()                // COMPILE ERROR E0522: `make` is in Alpha and Beta
-    let b = Alpha.make()                 // COMPILE ERROR: no receiver, so no `Self`
+    let b = Alpha.make()                 // COMPILE ERROR E0568: no receiver, so no `Self`
     let c = (Alpha for Widget).make()    // OK: Widget { v: 1 }
     let d = (Beta for Widget).make()     // OK: Widget { v: 2 }
 }
@@ -903,6 +920,8 @@ error[TypeNotTrait]: the left side of `for` must name a trait
 ```
 
 **A method with a receiver.** The head also works on a method that takes `self`, and then the receiver is the first argument: `(Display for User).display(u)` is the same call as `Display.display(u)`. The rule is one rule for every method: select the impl, then call the method with its declared parameters. The shorter `Trait.method(x)` stays the normal form for a call with a receiver. Help text and documentation print that form, and `blink fmt` never rewrites either form to the other.
+
+**An associated function through its trait.** `Alpha.make()` and `From.from(3)` are `AssociatedFnThroughTrait` (E0568). The head is "`From.from` takes no `self`, so the call names no type whose impl to run", and the span is the call. The name with no call, `Alpha.make` or `xs.map(From.from)`, is the same error at the reference (§3.4 *A trait-qualified method named as a value*). The code is not TypeError (E0300). The head `(Alpha for Widget).make` with no call is not this error: it stays "not a value", as the *Only a callee head* rule above says.
 
 **No inference of `Self`.** `Alpha.make()` stays an error even when an expected type is present, as in `let w: Widget = Alpha.make()`. The error's help gives the impl-qualified form. Inference of `Self` from the expected type is not part of the language. A later version can add it without a change to the meaning of any program that compiles today.
 

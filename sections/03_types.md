@@ -2885,13 +2885,20 @@ fn dup[T: Clone](x: T) -> T {
 
 **A read with no call.** A `T.m` with no argument list, where `m` meets points 1 to 3, is the same code and the same head. A method with `self` is not a function value through its type. The help writes a closure and there is no machine fix, because the fix would have to choose a parameter name. The closure in the help compiles where the user pastes it. When `T` is not generic, the parameter carries the annotation `T`, because a closure with no context cannot type its parameter. When `T` is generic and an expected function type reaches the reference, as the argument of `map` does, the closure has no annotation, and the expected type gives the parameter its type.
 
+The trait-qualified name is a function value (*A trait-qualified method named as a value*, below), so the help adds one more line, `Trait.m`, next to the closure. It follows the owner rule of the call help: one owner, a trait that a program can write, and not sealed. The line is a help and not a fix. A sealed owner gets no such line, so `words.map(Str.len)` gets no `Sized.len`.
+
 ```blink
+@derive(Clone)
+type U { n: Int }
+
 fn main() ! IO {
     let words = ["a", "bcd"]
     let f = Str.len               // error[MethodThroughTypeName], help: `fn(s: Str) { s.len() }`, no fix
-    let ns = words.map(Str.len)   // error[MethodThroughTypeName], help: `fn(s: Str) { s.len() }`, no fix
+    let ns = words.map(Str.len)   // error[MethodThroughTypeName], help: `fn(s: Str) { s.len() }`, no fix, no `Sized.len` line
     let lens = [[1, 2], [3]].map(List.len)   // error[MethodThroughTypeName], help: `fn(xs) { xs.len() }`, no fix
-    io.println("{ns.len()} {lens.len()} {f("abc")}")
+    let us = [U { n: 1 }]
+    let cs = us.map(U.clone)      // error[MethodThroughTypeName], help: `fn(u: U) { u.clone() }` and `Clone.clone`, no fix
+    io.println("{ns.len()} {lens.len()} {cs.len()} {f("abc")}")
 }
 ```
 
@@ -3677,7 +3684,7 @@ error[TypeError]: variant `Shape.Circle` has named fields and is not a function 
 
 *Rationale.* `Some` and `fn(x) { Some(x) }` are the same term, so the rationale above applies word for word: a rule that refused `xs.map(Some)` would refuse one spelling of an identical program. A brace payload has no call form, so no one closure is equal to it. A variant with no payload is a value, not a function: `Color.Red` and `fn() { Color.Red }` are different terms.
 
-**A type-scoped or associated function named as a value.** `T.name`, written with no argument list, is a function value when `name` is a function in the `T.` namespace (§2.12.3). It may stand wherever a function value is expected, as a generic function's name may. The rule covers four forms: a type-scoped function (`Duration.ms`), a type-scoped function on a generic type (`Stack.empty`), an associated function that a trait impl gives `T` (`W.make`, `Int.default`), and an associated function reached through a type parameter (`T.from`). Method syntax does not reach it (§2.12.3). A method that takes `self` is not a function value through its type: `Str.len` is E0567 (*A method called through its type name*, above).
+**A type-scoped or associated function named as a value.** `T.name`, written with no argument list, is a function value when `name` is a function in the `T.` namespace (§2.12.3). It may stand wherever a function value is expected, as a generic function's name may. The rule covers four forms: a type-scoped function (`Duration.ms`), a type-scoped function on a generic type (`Stack.empty`), an associated function that a trait impl gives `T` (`W.make`, `Int.default`), and an associated function reached through a type parameter (`T.from`). Method syntax does not reach it (§2.12.3). A method that takes `self` is not a function value through its type: `Str.len` is E0567 (*A method called through its type name*, above). It is a function value through its trait (*A trait-qualified method named as a value*, below).
 
 The type is the declaration's type, `fn(P1, ..., Pn) -> R`. A trait associated function reads `Self` as the head type: `W.make` is `fn(Int) -> W`. Through a type parameter `T`, the name `T` is the parameter itself, not a binder: `T.from` in a function with the bound `T: From[U8]` is `fn(U8) -> T`, and nothing is left to solve. The binders of a function are its own list after the name (§2.12.3 *Functions on a generic type declare their own binders*) and no other: `fn Stack.empty[T]()` has the binder `T`, and the type head gives none. The rule above solves them. The expected type fixes them, and a reference whose binders nothing fixes is `error[CannotInferType]` (E0301) at the reference. The note names the reference and the binder. Brackets with no call, as in `Stack.empty[Int]`, are `error[TypeArgsWithoutCall]` (E0314).
 
@@ -3749,6 +3756,67 @@ fn main() {
 ```
 
 *Rationale.* `Duration.ms` and `fn(n) { Duration.ms(n) }` are the same term, so the rationale above applies word for word: a rule that refused `xs.map(Duration.ms)` would refuse one spelling of an identical program, and the repair it prescribed would be a closure. No new rule is needed: the §3.4 rule that types a top-level function's name types `T.name`.
+
+**A trait-qualified method named as a value.** `Trait.m`, written with no argument list, depends on the method. The rule is the one for `Some` above: the name is legal exactly when its closure form is legal at that place, and it then has the type of that closure.
+
+- **A method that takes `self` is a function value.** Its type is the declared type of the method with the receiver as the first parameter: `fn(Self, P2, ..., Pn) -> R`, with the effect row of the method. `Same.same` is `fn(Self, Self) -> Bool`, `Display.display` is `fn(Self) -> Str`, and `Clone.clone` is `fn(Self) -> Self`. `Self`, the type parameters of the trait and the type parameters of the method are the binders of the reference. The expected type fixes them. `Self` comes from the receiver parameter of the expected function type, which is the place that the receiver argument fills in the call `Same.same(x, y)`. The value never takes more type information than the call takes.
+- **Nothing fixes a binder.** The error is `error[CannotInferType]` (E0301) at the reference. The help names an annotation.
+- **The fixed `Self` has no impl of the trait.** The error is `error[TraitBoundNotSatisfied]` (E0306) at the reference.
+- **An associated function has no `self`.** `From.from` and `Alpha.make`, named with no call, are `error[AssociatedFnThroughTrait]` (E0568) at the reference. It is the code of the call `From.from(3)` (§3c.4 *Impl-Qualified Calls*). The trait names no type whose impl to run, and `Self` never comes from a return slot or from an expected type. The closure `fn(n) { From.from(n) }` is the same error, so the name is not a value.
+
+```blink
+trait Same {
+    fn same(self, o: Self) -> Bool
+}
+
+impl Same for Int {
+    fn same(self, o: Self) -> Bool { self == o }
+}
+
+@derive(Clone)
+type U { n: Int }
+
+impl Display for U {
+    fn fmt(self, mut sb: StringBuilder) { sb.write("U({self.n})") }
+}
+
+type W { v: Int }
+
+impl From[Int] for W {
+    fn from(x: Int) -> W { W { v: x } }
+}
+
+fn main() ! IO {
+    let f: fn(Int, Int) -> Bool = Same.same   // OK -- Self = Int
+    let xs = [U { n: 1 }, U { n: 2 }]
+    let ys = xs.map(Clone.clone)              // OK -- map's fn(U) -> R fixes Self = U, so R = U
+    let ss = xs.map(Display.display)          // OK -- ss: List[Str]
+    let ok = [1, 2].map(W.from)               // OK -- a type-scoped value, as above
+    io.println("{f(1, 1)} {ys.len()} {ss.len()} {ok.len()}")   // prints: true 2 2 2
+}
+```
+
+```blink
+fn main() {
+    let g = Same.same                           // error[CannotInferType] -- intentional-error example
+                                                //   `Self` of `Same.same` is unbound at this reference and nothing supplies it
+                                                // help: annotate the binding:
+                                                //   `let g: fn(Int, Int) -> Bool = Same.same`
+    let h: fn(Str, Str) -> Bool = Same.same     // error[TraitBoundNotSatisfied] -- `Str` does not implement `Same`
+    let ws: List[W] = [1, 2].map(From.from)     // error[AssociatedFnThroughTrait]
+                                                // help: name it through the type: `W.from`
+}
+```
+
+The help of E0568 names the type-scoped value when the expected type fixes `Self`: `W.from` is a legal value that names its own type, so the fixed program takes its meaning from its text and not from inference. The help is a machine-applicable fix only when all of these are true:
+
+1. the expected type fixes `Self` to one type;
+2. that type has one impl that gives the name, so the site is not E0522;
+3. the rewritten site passes the checker and adds no diagnostic (the rule of E0505).
+
+When one condition is false, the help writes `Type.from` with `Type` as a placeholder, and there is no fix. No help names the form `(Trait for T).m`.
+
+*Rationale.* `Same.same` and `fn(a, b) { Same.same(a, b) }` are the same term, as `Some` and `fn(x) { Some(x) }` are. A rule that refused `xs.map(Clone.clone)` would refuse one spelling of a program that compiles, as the rule for a generic function would. Each shape follows the call: `Clone.clone(a)` is legal, so `Clone.clone` is a value. `Str.len` is E0567 as a call and as a read (*A method called through its type name*, above), so it stays an error. `From.from(3)` is an error, so `From.from` is an error. `(Alpha for Widget).make` with no call stays "not a value" (§3c.4 *Impl-Qualified Calls*), and this rule does not change it.
 
 **Where the error is reported.** `error[CannotInferType]` (E0301) is reported **where its repair attaches**. For an under-determined *binding* that is the `let` (§3.4 *Under-Determined Types*). For a type parameter with no source it is the call's type-argument position, because that is where the brackets go — including when the call stands alone as a statement and there is no binding to annotate:
 
