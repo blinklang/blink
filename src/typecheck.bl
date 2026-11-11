@@ -2861,6 +2861,10 @@ fn bind_metavar(a0: Int, sol0: Int) -> Int {
     if tc_occurs_in(a, sol) != 0 { return 0 }
     let e = ty_pool.get(a).unwrap()
     ty_pool.set(a, TypePoolEntry { inner1: sol, ..e })
+    if tc_calls.late_watch.len() > 0 {
+        tc_watch_late_bind(a, sol)
+        tc_calls.late_roots_valid = false
+    }
     1
 }
 
@@ -3262,6 +3266,27 @@ type CallFacts {
     // is a `.clone()` call has two uses on one node. Apart from the calls through an impl.
     deferred_uses: List[Int]
     deferred_use_at: Map[Int, DeferredUse]
+    // The MethodCall, ForElem and FieldRead uses, in the order first walked. They live apart from
+    // deferred_uses, since tc_settle_late_types runs them ahead of every other judge.
+    late_keys: List[Int]
+    // The metavariables a late use's type holds, built once for each run of binders the
+    // E0301 flush judges (tc_ud_late_call_may_settle); empty when a bind or a record stales it.
+    late_roots: Map[Int, Bool]
+    late_roots_valid: Bool
+    // The calls a flush refused or could not run, by node. A call made on the result of one
+    // has nothing to be judged at, as on an error type in place.
+    late_refused: Map[Int, Bool]
+    // The late method calls and field reads whose receiver nothing filled, with that receiver's type. The E0301
+    // flush runs first, so a binding that holds the receiver has the report by then.
+    late_open: List[(Int, Int)]
+    // The late method call or field read tc_replay_late_call walks again, or -1.
+    late_replay: Int
+    // The type a late use waits on, by the metavariable it now resolves to, and the node that
+    // first gave it a type: a conflict at the flush names that use (bind_metavar).
+    late_watch: Map[Int, Int]
+    late_fixed_at: Map[Int, Int]
+    // The node the walk is at, for late_fixed_at.
+    infer_at: Int
     // The owner each static call's head names. Its spelling may not say it, as `Self` does not.
     static_owners: Map[Int, Str]
     // The trait each trait-qualified call's head names. A type of the same spelling in a
@@ -3322,10 +3347,20 @@ type UseJudge {
     ListScan(method: Str)
     // A list's `sort`, at the node of its receiver.
     Sort(recv: Int)
+    // A method call on a receiver of no type yet that no std trait answers, typed `ret` until
+    // the flush runs the dispatch at the type a later use fills (tc_settle_late_types).
+    // A bare name as the receiver keeps its binding's `mut` and declaration for that dispatch.
+    MethodCall(ret: Int, recv_mut: Int, recv_decl: Int)
+    // A `for` over a late method call's result, its element typed `elem` until the flush knows
+    // the type it walks.
+    ForElem(elem: Int)
+    // A field read on a receiver of no type yet, typed `ret` until the flush reads the field at
+    // the type a later use fills; the receiver keeps its binding as for MethodCall.
+    FieldRead(ret: Int, recv_mut: Int, recv_decl: Int)
 }
 
 fn new_call_facts() -> CallFacts {
-    CallFacts { open_calls: [], open_group: Map(), open_tids: [], reported: Map(), self_views: Map(), view_sigs: Map(), hash_aliases_above: [], derive_facts_above: [], derive_facts_low: 0, derive_facts_open: [], derive_facts_open_low: Map(), debug_unbuilt_seen: Map(), hash_by_bounds: false, static_head_insts: Map(), static_head_binders: Map(), impl_bound_calls: [], impl_bound_binds: Map(), deferred_uses: [], deferred_use_at: Map(), static_owners: Map(), trait_heads: Map(), closure_expected_at: Map(), ret_ann: -1, missing_else: Map(), walk_returns: [], written_names: Map(), under_fn_type: Map(), method_reads: Map(), method_read_order: [] }
+    CallFacts { open_calls: [], open_group: Map(), open_tids: [], reported: Map(), self_views: Map(), view_sigs: Map(), hash_aliases_above: [], derive_facts_above: [], derive_facts_low: 0, derive_facts_open: [], derive_facts_open_low: Map(), debug_unbuilt_seen: Map(), hash_by_bounds: false, static_head_insts: Map(), static_head_binders: Map(), impl_bound_calls: [], impl_bound_binds: Map(), deferred_uses: [], deferred_use_at: Map(), late_keys: [], late_roots: Map(), late_roots_valid: false, late_refused: Map(), late_open: [], late_replay: -1, late_watch: Map(), late_fixed_at: Map(), infer_at: -1, static_owners: Map(), trait_heads: Map(), closure_expected_at: Map(), ret_ann: -1, missing_else: Map(), walk_returns: [], written_names: Map(), under_fn_type: Map(), method_reads: Map(), method_read_order: [] }
 }
 let mut tc_calls: CallFacts = new_call_facts()
 
@@ -3416,7 +3451,7 @@ fn tc_ud_already_blamed(tid: Int) -> Int {
 fn tc_ud_judge_binder(vname: Str, tid: Int, decl_node: Int) ! Diag.Report {
     if decl_node == -1 { return }
     if vname == "self" { return }
-    if node_kind(decl_node) == NodeKind.LetBinding && !tc_ud_conversion_may_settle(tid) && !tc_ud_param_may_settle(tid) {
+    if node_kind(decl_node) == NodeKind.LetBinding && !tc_ud_conversion_may_settle(tid) && !tc_ud_param_may_settle(tid) && !tc_ud_late_call_may_settle(tid) {
         tc_report_under_determined(vname, tid, decl_node)
         return
     }
@@ -3432,6 +3467,34 @@ fn tc_ud_conversion_may_settle(tid: Int) -> Bool {
         let (source, target) = tc_deferred_conversion_sides(call_node)
         if tc_ud_shares_root(roots, source) || tc_ud_shares_root(roots, target) { return true }
     }
+    false
+}
+
+// Whether a late method call's result or a late loop's element is one of `tid`'s
+// metavariables: the dispatch at the type a later use fills types it (tc_settle_late_types).
+fn tc_ud_late_call_may_settle(tid: Int) -> Bool {
+    let roots = tc_ud_metavar_roots(tid)
+    if roots.len() == 0 || tc_calls.late_keys.len() == 0 { return false }
+    // A scope pop judges each of its binders with no bind between them, so one set serves all.
+    if !tc_calls.late_roots_valid {
+        tc_calls.late_roots.clear()
+        for key in tc_calls.late_keys {
+            match tc_calls.deferred_use_at.get(key) {
+                Some(r) => {
+                    let t = match r.judge {
+                        MethodCall(ret, _, _) => ret
+                        ForElem(elem) => elem
+                        FieldRead(ret, _, _) => ret
+                        _ => -1
+                    }
+                    if t >= 0 { for root in tc_ud_metavar_roots(t) { tc_calls.late_roots.insert(root, true) } }
+                }
+                None => {}
+            }
+        }
+        tc_calls.late_roots_valid = true
+    }
+    for root in roots { if tc_calls.late_roots.contains_key(root) { return true } }
     false
 }
 
@@ -4183,17 +4246,25 @@ fn tc_flush_open_keys_of(call_node: Int, g: Int) ! Diag.Report {
 // Each definition flushes before its type parameters leave scope, so a chosen impl may bind
 // a binder to one of them. The flush at the end of the program has none in scope.
 fn tc_flush_deferred_conversions() ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    tc_settle_late_types()
+    for r in tc_calls.open_calls {
+        let group = tc_calls.open_group.get(r).unwrap()
+        if tc_calls.open_tids.get(group).unwrap() == -5 { tc_report_value_returned_as_void(r, tc_calls.open_tids.get(group + 1).unwrap()) }
+    }
+}
+
+// Whether a pass chose a conversion, each choice repeated while one settles another.
+fn tc_choose_deferred_conversions() -> Bool ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    let mut any = false
     let mut chose = true
     while chose {
         chose = false
         for call_node in tc_deferred_conversion_calls() {
             if tc_choose_deferred_conversion(call_node) { chose = true }
         }
+        if chose { any = true }
     }
-    for r in tc_calls.open_calls {
-        let group = tc_calls.open_group.get(r).unwrap()
-        if tc_calls.open_tids.get(group).unwrap() == -5 { tc_report_value_returned_as_void(r, tc_calls.open_tids.get(group + 1).unwrap()) }
-    }
+    any
 }
 
 // Refuse each conversion no use settled: more than one impl fits, or none. This runs after
@@ -4772,6 +4843,13 @@ fn tc_drop_open_calls() {
     tc_calls.impl_bound_binds.clear()
     tc_calls.deferred_uses = []
     tc_calls.deferred_use_at.clear()
+    tc_calls.late_keys = []
+    tc_calls.late_roots.clear()
+    tc_calls.late_roots_valid = false
+    tc_calls.late_refused.clear()
+    tc_calls.late_open = []
+    tc_calls.late_watch.clear()
+    tc_calls.late_fixed_at.clear()
     tc_calls.method_reads.clear()
     tc_calls.method_read_order = []
 }
@@ -8563,20 +8641,34 @@ fn tc_check_shown_value(arg: Int, t: Int, sink: Str) ! TypeCheck.Resolve, TypeCh
 fn tc_note_deferred_use(node: Int, t: Int, t2: Int, judge: UseJudge) {
     if tc_boundary_check_active == 0 || node < 0 { return }
     let key = tc_deferred_use_key(node, judge)
+    let late = tc_use_is_late(judge)
     if !tc_deferred_use_open(t, t2) {
-        if tc_calls.deferred_use_at.remove(key).is_some() {
+        if tc_calls.deferred_use_at.remove(key).is_some() && !late {
             let at = tc_calls.deferred_uses.index_of(key) ?? -1
             if at >= 0 { let _ = tc_calls.deferred_uses.remove(at) }
         }
         return
     }
-    if !tc_calls.deferred_use_at.contains_key(key) { tc_calls.deferred_uses.push(key) }
+    if !tc_calls.deferred_use_at.contains_key(key) {
+        if late { tc_calls.late_keys.push(key) } else { tc_calls.deferred_uses.push(key) }
+    }
+    if late { tc_calls.late_roots_valid = false }
     tc_calls.deferred_use_at.insert(key, DeferredUse { tid: t, tid2: t2, judge: judge, enclosing: tc_current_fn_node })
+}
+
+// A late use types a node the other judges read, so tc_settle_late_types runs it first.
+fn tc_use_is_late(judge: UseJudge) -> Bool {
+    match judge {
+        MethodCall(_, _, _) => true
+        ForElem(_) => true
+        FieldRead(_, _, _) => true
+        _ => false
+    }
 }
 
 // Two judges can wait on one node (a hole that also compares), so each variant needs its own key:
 // this must be greater than the largest slot in tc_deferred_use_key.
-const DEFERRED_USE_SLOTS = 6
+const DEFERRED_USE_SLOTS = 9
 
 fn tc_deferred_use_key(node: Int, judge: UseJudge) -> Int {
     let slot = match judge {
@@ -8586,6 +8678,9 @@ fn tc_deferred_use_key(node: Int, judge: UseJudge) -> Int {
         AssertEq => 3
         ListScan(_) => 4
         Sort(_) => 5
+        MethodCall(_, _, _) => 6
+        ForElem(_) => 7
+        FieldRead(_, _, _) => 8
     }
     node * DEFERRED_USE_SLOTS + slot
 }
@@ -8607,9 +8702,6 @@ fn tc_flush_deferred_uses() ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     // A judge can note or drop a use, so the flush walks the list as the walk left it.
     let mut keys: List[Int] = []
     for key in tc_calls.deferred_uses { keys.push(key) }
-    // A call the flush refused gives the call made on its result nothing to judge, as an
-    // error type does with the type in place.
-    let mut refused: Map[Int, Bool] = Map()
     for key in keys {
         let rec = match tc_calls.deferred_use_at.get(key) {
             Some(r) => r
@@ -8617,7 +8709,7 @@ fn tc_flush_deferred_uses() ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
         }
         let node = tc_deferred_use_node(key)
         if !tc_use_judges_open_type(rec.judge) && tc_deferred_use_open(rec.tid, rec.tid2) { continue }
-        if tc_late_receiver_refused(node, rec.judge, refused) { continue }
+        if tc_late_receiver_refused(node, rec.judge) { continue }
         let end_line = if node_end_line(node) > node_line(node) { node_end_line(node) } else { node_line(node) }
         if diag_errors_in_lines_before(walk_diags, diag_file_for_node(node), node_line(node), end_line) > 0 { continue }
         let tid = tc_resolve(rec.tid)
@@ -8629,7 +8721,9 @@ fn tc_flush_deferred_uses() ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                 if leaf >= 0 { tc_report_missing_display(node, tid, leaf, sink, []) }
             }
             StdMethod(tr, method, self_offset) => {
-                if !tc_judge_late_std_method(node, tid, tr, method, self_offset) { refused.insert(node, true) }
+                // A call the flush refused gives the call made on its result nothing to judge,
+                // as an error type does with the type in place.
+                if !tc_judge_late_std_method(node, tid, tr, method, self_offset) { tc_calls.late_refused.insert(node, true) }
             }
             Comparison(op) => tc_check_comparison_operands(node, op, tid, tid2)
             AssertEq => reject_eq_less_assert_args(tid, tid2, node)
@@ -8638,6 +8732,10 @@ fn tc_flush_deferred_uses() ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                 if need.len() > 0 { let _ = tc_refuse_list_scan(node, tid2, need, method) }
             }
             Sort(recv) => { let _ = tc_refuse_unordered_sort(node, recv, tid) }
+            // Kept on late_keys, never on this list: tc_settle_late_types runs them.
+            MethodCall(_, _, _) => {}
+            ForElem(_) => {}
+            FieldRead(_, _, _) => {}
         }
         tc_leave_body_frames(frames)
     }
@@ -8652,14 +8750,280 @@ fn tc_use_judges_open_type(judge: UseJudge) -> Bool {
 }
 
 // Whether the receiver of the std trait method at `node` is a call the flush already refused.
-fn tc_late_receiver_refused(node: Int, judge: UseJudge, refused: Map[Int, Bool]) -> Bool {
+fn tc_late_receiver_refused(node: Int, judge: UseJudge) -> Bool {
     match judge {
         StdMethod(_, _, self_offset) => {
             let recv = if self_offset == 1 { tc_mc_receiver(node) } else { tc_arg_value_at(tc_mc_call_args(node), 0) }
-            refused.contains_key(recv)
+            tc_calls.late_refused.contains_key(recv)
         }
         _ => false
     }
+}
+
+// A method call the walk met on a receiver of no type yet, that no std trait answers with one
+// signature: a user trait's method, or a builtin one such as `len`. Its arguments are walked, and
+// the call is typed by a fresh variable until tc_settle_late_types runs the dispatch at the type
+// a later use fills. A walk of the node again keeps that variable, so what the first walk tied to
+// it stays tied. -1 outside the inference walk, which gives no type to the call.
+fn tc_defer_open_receiver_call(node: Int, obj_t: Int, args_sl: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    // A receiver a closure's walk has yet to type is not late: its statement is inferred again
+    // after that walk (tc_value_awaits_closure_ret).
+    if tc_boundary_check_active == 0 || tc_value_awaits_closure_ret(tc_late_receiver(node)) { return -1 }
+    if args_sl != -1 {
+        let mut i = 0
+        while i < sublist_length(args_sl) {
+            infer_type(sublist_get(args_sl, i))
+            i = i + 1
+        }
+    }
+    let key = tc_deferred_use_key(node, UseJudge.MethodCall(-1, 0, -1))
+    let ret = match tc_calls.deferred_use_at.get(key) {
+        Some(r) => match r.judge {
+            MethodCall(t, _, _) => t
+            _ => tc_new_late_var()
+        }
+        None => tc_new_late_var()
+    }
+    let (recv_mut, recv_decl) = tc_late_receiver_entry(tc_late_receiver(node))
+    tc_note_deferred_use(node, obj_t, -1, UseJudge.MethodCall(ret, recv_mut, recv_decl))
+    ret
+}
+
+// The `mut` flag and declaration of the binding a bare-name receiver names, or (0, -1): the
+// flush asks the scope whether a bare name is a value and whether it is `mut`, and that scope
+// is gone by then.
+fn tc_late_receiver_entry(recv: Int) -> (Int, Int) {
+    if recv == -1 || node_kind(recv) != NodeKind.Ident { return (0, -1) }
+    let idx = nr_top_index(node_name(recv))
+    if idx == -1 { return (0, -1) }
+    (nr_scope_muts.get(idx).unwrap(), nr_scope_nodes.get(idx).unwrap())
+}
+
+// A field read the walk met on a receiver of no type yet: a fresh variable types it until
+// tc_settle_late_types reads the field at the type a later use fills. A walk of the node again
+// keeps that variable. -1 outside the inference walk, which gives no type to the read.
+fn tc_defer_field_read(node: Int, obj_t: Int) -> Int {
+    if tc_boundary_check_active == 0 || tc_value_awaits_closure_ret(node_obj(node)) { return -1 }
+    let key = tc_deferred_use_key(node, UseJudge.FieldRead(-1, 0, -1))
+    let ret = match tc_calls.deferred_use_at.get(key) {
+        Some(r) => match r.judge {
+            FieldRead(t, _, _) => t
+            _ => tc_new_late_var()
+        }
+        None => tc_new_late_var()
+    }
+    let (recv_mut, recv_decl) = tc_late_receiver_entry(node_obj(node))
+    tc_note_deferred_use(node, obj_t, -1, UseJudge.FieldRead(ret, recv_mut, recv_decl))
+    ret
+}
+
+// The value a late use is found at: a field read's object, a trait-qualified call's first
+// argument (`Tr.m(x)`), or a dotted call's receiver.
+fn tc_late_receiver(node: Int) -> Int {
+    if node_kind(node) == NodeKind.FieldAccess { return node_obj(node) }
+    if tc_late_call_is_qualified(node) { return tc_arg_value_at(node_args(node), 0) }
+    tc_mc_receiver(node)
+}
+
+fn tc_late_call_is_qualified(node: Int) -> Bool {
+    node_kind(node) == NodeKind.MethodCall && tc_calls.trait_heads.contains_key(node)
+}
+
+// A variable a late use types, watched by bind_metavar for the use that first fixes it.
+fn tc_new_late_var() -> Int {
+    let v = make_metavar()
+    tc_calls.late_watch.insert(v, v)
+    v
+}
+
+// The element of a `for` over a late call's result: a fresh variable until tc_settle_late_types
+// knows the type the loop walks, or -1 when the iterable is no such result.
+fn tc_defer_for_elem(node: Int, iter_t: Int) -> Int {
+    if tc_boundary_check_active == 0 || tc_is_unbound_metavar(iter_t) == 0 { return -1 }
+    if !tc_ud_late_call_may_settle(iter_t) { return -1 }
+    let key = tc_deferred_use_key(node, UseJudge.ForElem(-1))
+    let elem = match tc_calls.deferred_use_at.get(key) {
+        Some(r) => match r.judge {
+            ForElem(t) => t
+            _ => tc_new_late_var()
+        }
+        None => tc_new_late_var()
+    }
+    tc_note_deferred_use(node, iter_t, -1, UseJudge.ForElem(elem))
+    elem
+}
+
+// Runs each late use whose type a later use filled, in the frames of the body that has it, and
+// chooses each deferred conversion, until a pass does neither: a use or a conversion can fill
+// the type another one waits on, whichever the walk met first. A use whose type stays open is
+// left for tc_give_up_late_uses.
+fn tc_settle_late_types() ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    let mut moved = true
+    while moved {
+        moved = tc_choose_deferred_conversions()
+        if tc_run_late_uses() { moved = true }
+    }
+}
+
+fn tc_run_late_uses() -> Bool ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    let keys = tc_calls.late_keys
+    tc_calls.late_keys = []
+    let mut kept: List[Int] = []
+    let mut moved = false
+    for key in keys {
+        let rec = match tc_calls.deferred_use_at.get(key) {
+            Some(r) => r
+            None => { continue }
+        }
+        if tc_is_unbound_metavar(tc_resolve(rec.tid)) != 0 {
+            kept.push(key)
+            continue
+        }
+        let _ = tc_calls.deferred_use_at.remove(key)
+        moved = true
+        let frames = tc_enter_body_frames(rec.enclosing)
+        tc_run_late_use(tc_deferred_use_node(key), rec)
+        tc_leave_body_frames(frames)
+    }
+    for key in tc_calls.late_keys { kept.push(key) }
+    tc_calls.late_keys = kept
+    tc_calls.late_roots_valid = false
+    moved
+}
+
+// A late method call is walked again with its receiver at the type inference filled: the method
+// dispatch judges it there as it judges the call with that type written in place, gives the
+// reports it gives there, and records the method for mono and codegen. A `for` over one takes
+// its element from that type, as the loop does with the type in place.
+fn tc_run_late_use(node: Int, rec: DeferredUse) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    match rec.judge {
+        MethodCall(ret, recv_mut, recv_decl) => {
+            let t = tc_replay_late_call(node, recv_mut, recv_decl)
+            if t < 0 || tc_tid_is_no_info(t) != 0 {
+                tc_calls.late_refused.insert(node, true)
+                tc_ud_mark_blamed(ret)
+            } else if tc_unify(ret, t) == 0 {
+                tc_report_late_conflict(node, ret, "method `.{node_method(node)}` returns {type_to_str(t)}, but its use expects {type_to_str(ret)}")
+            }
+        }
+        FieldRead(ret, recv_mut, recv_decl) => {
+            let t = tc_replay_late_call(node, recv_mut, recv_decl)
+            if t < 0 || tc_tid_is_no_info(t) != 0 {
+                tc_calls.late_refused.insert(node, true)
+                tc_ud_mark_blamed(ret)
+            } else if tc_unify(ret, t) == 0 {
+                tc_report_late_conflict(node, ret, "field `{node_name(node)}` has type {type_to_str(t)}, but its use expects {type_to_str(ret)}")
+            }
+        }
+        ForElem(elem) => {
+            let iter = node_iterable(node)
+            let elem_t = tc_check_for_iterable(iter, tc_resolve(rec.tid))
+            if tc_tid_is_no_info(elem_t) != 0 {
+                tc_ud_mark_blamed(elem)
+            } else if tc_unify(elem, elem_t) == 0 {
+                tc_report_late_conflict(iter, elem, "this loop walks {type_to_str(tc_resolve(rec.tid))}, whose elements are {type_to_str(elem_t)}, but its body uses them as {type_to_str(elem)}")
+            }
+        }
+        _ => {}
+    }
+}
+
+// A late use whose type nothing filled. A call on the result of a refused one has nothing to be
+// judged at; any other waits on a receiver that its binding, or tc_report_late_open_calls,
+// answers for with E0301, and its result and a loop's element are no second report.
+fn tc_give_up_late_uses() {
+    for key in tc_calls.late_keys {
+        let rec = match tc_calls.deferred_use_at.get(key) {
+            Some(r) => r
+            None => { continue }
+        }
+        let _ = tc_calls.deferred_use_at.remove(key)
+        let node = tc_deferred_use_node(key)
+        match rec.judge {
+            MethodCall(ret, _, _) => tc_give_up_late_result(node, ret, rec.tid)
+            FieldRead(ret, _, _) => tc_give_up_late_result(node, ret, rec.tid)
+            ForElem(elem) => tc_ud_mark_blamed(elem)
+            _ => {}
+        }
+    }
+    tc_calls.late_keys = []
+    tc_calls.late_roots_valid = false
+}
+
+fn tc_give_up_late_result(node: Int, ret: Int, recv_t: Int) {
+    tc_calls.late_refused.insert(node, true)
+    tc_ud_mark_blamed(ret)
+    if !tc_calls.late_refused.contains_key(tc_late_receiver(node)) { tc_calls.late_open.push((node, recv_t)) }
+}
+
+// E0301 at the receiver of a late call or field read that nothing filled, when no binding that
+// holds the receiver has that report, as for an open value that no binding holds.
+fn tc_report_late_open_calls() ! TypeCheck.Resolve, Diag.Report {
+    for pair in tc_calls.late_open {
+        let (node, tid) = pair
+        if tc_is_unbound_metavar(tc_resolve(tid)) != 0 && tc_ud_already_blamed(tid) == 0 {
+            let what = if node_kind(node) == NodeKind.FieldAccess {
+                "field `{node_name(node)}` is found at the type of its receiver"
+            } else if tc_late_call_is_qualified(node) {
+                "`{node_name(node_obj(node))}.{node_method(node)}` runs the impl for the type of its first argument"
+            } else {
+                "method `.{node_method(node)}` is found at the type of its receiver"
+            }
+            tc_report_under_determined_at(tc_late_receiver(node), tid, "{what}, and nothing here says which type this value has")
+        }
+    }
+    tc_calls.late_open = []
+}
+
+// The type a late use was given against the one an earlier use gave it in the walk. The error
+// is at the late use, and a note names the use that gave the other type first, as for a template
+// literal whose context two uses set (sections/03b_safety.md).
+fn tc_report_late_conflict(at: Int, var: Int, msg: Str) ! TypeCheck.Report, Diag.Report {
+    let fixed = tc_calls.late_fixed_at.get(var) ?? -1
+    let mut notes: List[Str] = []
+    if fixed >= 0 && fixed != at {
+        notes.push("the use at {node_line(fixed)}:{node_col(fixed)} first gave it the type {type_to_str(var)}")
+    }
+    tc_errors.push(msg)
+    diag_error_at_notes("TypeError", TYPE_ERROR, msg, at, "", notes)
+}
+
+// bind_metavar's half of late_watch: a watched variable bound to another open one is watched
+// there, and one bound to a type records the node the walk is at as the use that fixed it.
+fn tc_watch_late_bind(a: Int, sol: Int) {
+    let var = match tc_calls.late_watch.get(a) {
+        Some(v) => v
+        None => { return }
+    }
+    let _ = tc_calls.late_watch.remove(a)
+    if tc_is_unbound_metavar(sol) != 0 {
+        if !tc_calls.late_watch.contains_key(sol) { tc_calls.late_watch.insert(sol, var) }
+        return
+    }
+    if !tc_calls.late_fixed_at.contains_key(var) && tc_calls.infer_at >= 0 { tc_calls.late_fixed_at.insert(var, tc_calls.infer_at) }
+}
+
+// The call or field read at `node` walked again with every node under it answering the type its
+// walk gave it, so only the dispatch runs a second time. A bare name as the receiver is bound
+// again as the walk found it, as the dispatch asks the scope whether a name is a value and
+// whether it is `mut`.
+fn tc_replay_late_call(node: Int, recv_mut: Int, recv_decl: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    let recv = tc_late_receiver(node)
+    let bind_recv = recv != -1 && node_kind(recv) == NodeKind.Ident
+    if bind_recv {
+        nr_push_scope()
+        nr_scope_push_entry(node_name(recv), recv_mut, tc_lookup_node_tid(recv), recv_decl)
+    }
+    let saved = tc_calls.late_replay
+    tc_calls.late_replay = node
+    let t = infer_type(node)
+    tc_calls.late_replay = saved
+    // The walk's mutation check (tc_check_body) saw an open receiver and could not judge it. It
+    // reads a dotted call only, as in place.
+    let dotted = node_kind(node) == NodeKind.MethodCall && !tc_late_call_is_qualified(node)
+    if bind_recv && dotted { tc_check_mutating_method(node, recv, tc_resolve(tc_lookup_node_tid(recv))) }
+    if bind_recv { nr_pop_scope() }
+    t
 }
 
 // Whether the walk left a comparison at `node` for tc_flush_deferred_uses, which judges it in
@@ -33681,6 +34045,16 @@ fn tc_check_lit_field_values(node: Int, lit_t: Int) ! TypeCheck.Resolve, TypeChe
 }
 
 pub fn infer_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    // A late method call walked again (tc_replay_late_call) runs only its own dispatch, as a
+    // second walk of a child could report again. The walk leaves a child with no type only
+    // where it reported an error there.
+    if tc_calls.late_replay >= 0 && node != tc_calls.late_replay && node >= 0 {
+        let memo = tc_lookup_node_tid(node)
+        if memo < 0 { return tc_error_recovery_tid() }
+        return memo
+    }
+    let outer_at = tc_calls.infer_at
+    tc_calls.infer_at = node
     // §2.9: the walk runs with tc_if_value_ctx at 1, because most child descents use their
     // value. Restore it on return so a walk does not change the flag its caller set; a
     // discarded statement relies on it staying 0 across statements.
@@ -33711,6 +34085,7 @@ pub fn infer_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.
             tc_node_tid.set(node, tid)
         }
     }
+    tc_calls.infer_at = outer_at
     tid
 }
 
@@ -34575,6 +34950,8 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
         if qualified == -1 && tc_is_unbound_metavar(obj_t) != 0 {
             let open_answer = tc_open_receiver_std_call(node, obj_t, recv_node, method, args_sl)
             if open_answer != -1 { return open_answer }
+            let late = tc_defer_open_receiver_call(node, obj_t, args_sl)
+            if late != -1 { return late }
         }
 
         // A plain method call on `Self` in a trait default body is licensed only when the
@@ -36064,6 +36441,12 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                     tc_note_deferred_use(node, qt_recv, -1, UseJudge.StdMethod("Display", "display", 0))
                     return TYPE_STR
                 }
+                // A user trait's method on a receiver of no type yet runs at the type a later use
+                // fills, as the dotted call does.
+                if tc_is_unbound_metavar(qt_recv) != 0 && !tc_is_std_trait_method(qt_trait, method) {
+                    let late = tc_defer_open_receiver_call(node, qt_recv, qt_args)
+                    if late != -1 { return late }
+                }
                 if obj_name == "Display" && method == "display" && tc_is_display_judged_kind(qt_k) {
                     return tc_qualified_display(node, qt_recv, qt_args, qt_n)
                 }
@@ -36499,6 +36882,11 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
             let help = if str_to_tuple_index(fname) >= 0 { "a numeric field is a tuple index, and {recv} is not a tuple" } else { "{recv} has no fields; call a method instead" }
             tc_error_naming_types("NoSuchField", NO_SUCH_FIELD, "`{recv}` has no field `{fname}`", node, help, [obj_t])
             return tc_error_recovery_tid()
+        }
+        // A later use may fill the receiver (sections/03_types.md *Under-Determined Types*).
+        if tc_is_unbound_metavar(obj_t) != 0 {
+            let late = tc_defer_field_read(node, obj_t)
+            if late != -1 { return late }
         }
         // Nothing above claimed this node, so nothing has typed it — an absence.
         return -1
@@ -41788,11 +42176,14 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
         // checked against Void, so only a named function's Void body drops its tail.
         let drops_tail = is_fn_body != 0 && !value_fn_body && tc_current_fn_name != "closure"
         let last_stmt = tc_block_tail_stmt(node)
+        let outer_at = tc_calls.infer_at
         if stmts_sl != -1 {
             let mut i = 0
             let mut _found_terminal = 0
             while i < sublist_length(stmts_sl) {
                 let stmt = sublist_get(stmts_sl, i)
+                // An assignment unifies outside infer_type, and a late use names it as the use.
+                tc_calls.infer_at = stmt
                 // A binder named for the block's value names its tail, not a statement before it.
                 let block_binder = tc_ffi_scope_binder
                 tc_ffi_scope_binder = if stmt == last_stmt { block_binder } else { "" }
@@ -41828,6 +42219,7 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                 i = i + 1
             }
         }
+        tc_calls.infer_at = outer_at
         // ORDERING CONTRACT: this must run BEFORE nr_pop_scope. The pin
         // inside tc_check_returned_value binds metavars in place — bind_metavar mutates
         // the α slot itself, and the tail's instance tid and the scope entry for a local
@@ -42000,37 +42392,9 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     if kind == NodeKind.ForIn {
         nr_push_scope()
         let iter_t = tc_resolve(tc_check_nested_value(node_iterable(node)))
-        let iter_tk = type_kind(iter_t)
-        let elem_t = tc_tid_iter_elem(iter_t)
-        // Gated on the KIND, not on `elem_t == TYPE_UNKNOWN`. A List/Set/Map is iterable whatever
-        // its element turns out to be, and `List[?]` — an element that is still an unbound
-        // metavar — must not be diagnosed here: only E0301's region boundary decides whether an
-        // under-determined type is an error. Testing the element instead of the kind would put a
-        // NotIterable on a list, which is the one thing this arm must never say.
-        let has_elem_rule = iter_tk == TyKind.List || iter_tk == TyKind.Set || iter_tk == TyKind.Map || iter_tk == TyKind.Range
-        // §2.10 walks a range of an integer type (its `U8` example) and does not say how to step
-        // any other element type, so any other bound is refused here rather than miscompiled.
-        let elem_k = type_kind(resolve_alias_tid(tc_resolve(elem_t)))
-        if iter_tk == TyKind.Range && !is_integer_type(resolve_alias_tid(tc_resolve(elem_t))) && elem_k != TyKind.Unknown {
-            diag_error_at("NotIterable", NOT_ITERABLE, "cannot iterate over type `{type_to_str(iter_t)}` with a `for` loop -- only a range of an integer type can be walked", node_iterable(node), "iterate a range of an integer type instead")
-        }
-        if !has_elem_rule {
-            // TyKind.Unknown here means iter_t is still an unbound metavar (e.g. a lazy-adapter
-            // chain like `.enumerate()`/`.zip()` not yet pinned at this point in checking) --
-            // under-determined, not known to be non-iterable. Leave it to E0301's
-            // region-boundary check rather than misdiagnosing it here. Set/Map/Str/Bytes/
-            // Iterator/Channel ARE spec-legal iterables (sections/03c_protocols.md
-            // IntoIterator table, sections/03_types.md:656 for Bytes' IntoIterator[U8],
-            // plus the Channel receive extension) so they pass through even where codegen's
-            // emit_for_in has no arm yet -- that gap is I0002, an internal compiler error,
-            // never a user-facing NotIterable.
-            // TyKind.Map is no longer listed: the kind gate above answers it, so naming it here
-            // would be an unreachable claim that a Map still has no element type.
-            let is_deferred_iterable = iter_tk == TyKind.Unknown || iter_tk == TyKind.Str || iter_tk == TyKind.Bytes || iter_tk == TyKind.Iterator || iter_tk == TyKind.Channel
-            if !is_deferred_iterable {
-                diag_error_at("NotIterable", NOT_ITERABLE, "cannot iterate over type `{type_to_str(iter_t)}` with a `for` loop -- only List, Set, Map, Range, Str, Bytes, Channel, and Iterator implement iteration", node_iterable(node), "iterate a List, Set, Map, Range, Str, Bytes, Channel, or Iterator instead")
-            }
-        }
+        // A late call's result has no type to walk yet; its element waits for the flush.
+        let late_elem = tc_defer_for_elem(node, iter_t)
+        let elem_t = if late_elem != -1 { late_elem } else { tc_check_for_iterable(node_iterable(node), iter_t) }
         // A `for` binder aliases an element it did not materialize, so its blame is
         // deferred to the end-of-pass flush like every other alias binder — that is what
         // lets `for x in xs { } xs.push(1)` pin the element AFTER this scope closes without
@@ -44076,6 +44440,8 @@ fn tc_infer_program_body(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Di
         }
     }
 
+    // A late call's method has its effects, and the row check reads the method each call ran.
+    tc_settle_late_types()
     // The row check skips what a trace.log `msg` runs, which this check finds first.
     let msg_ran = tc_check_trace_messages()
     tc_check_effect_rows(program, msg_ran)
@@ -44094,9 +44460,13 @@ fn tc_infer_program_body(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Di
 // program's flush re-walks the operators (`program`): that walk covers every node the parser
 // kept, not the one default.
 fn tc_flush_program_deferrals(program: Bool) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    // Runs the late uses too, ahead of the E0301 flush: a late call's result can settle a
+    // binding that holds it, and the operators re-walked next read that result.
     tc_flush_deferred_conversions()
+    tc_give_up_late_uses()
     if program { tc_recheck_operators() }
     tc_ud_flush_pending()
+    tc_report_late_open_calls()
     tc_ud_flush_calls()
     tc_flush_impl_bound_calls()
     tc_flush_deferred_uses()
@@ -44466,6 +44836,43 @@ pub fn tc_tid_struct(tid: Int) -> Str {
     let t = ty_pool.get(tid).unwrap()
     if t.kind == TyKind.Struct || t.kind == TyKind.Enum { return strip_module_qualifier(t.name) }
     ""
+}
+
+// The element a `for` over `iter`, of type `iter_t`, binds: the walk's judge and the late
+// one's (tc_run_late_use), so both refuse what one refuses.
+fn tc_check_for_iterable(iter: Int, iter_t: Int) -> Int ! Diag.Report {
+    let iter_tk = type_kind(iter_t)
+    let elem_t = tc_tid_iter_elem(iter_t)
+    // Gated on the KIND, not on `elem_t == TYPE_UNKNOWN`. A List/Set/Map is iterable whatever
+    // its element turns out to be, and `List[?]` — an element that is still an unbound
+    // metavar — must not be diagnosed here: only E0301's region boundary decides whether an
+    // under-determined type is an error. Testing the element instead of the kind would put a
+    // NotIterable on a list, which is the one thing this arm must never say.
+    let has_elem_rule = iter_tk == TyKind.List || iter_tk == TyKind.Set || iter_tk == TyKind.Map || iter_tk == TyKind.Range
+    // §2.10 walks a range of an integer type (its `U8` example) and does not say how to step
+    // any other element type, so any other bound is refused here rather than miscompiled.
+    let elem_k = type_kind(resolve_alias_tid(tc_resolve(elem_t)))
+    if iter_tk == TyKind.Range && !is_integer_type(resolve_alias_tid(tc_resolve(elem_t))) && elem_k != TyKind.Unknown {
+        diag_error_at("NotIterable", NOT_ITERABLE, "cannot iterate over type `{type_to_str(iter_t)}` with a `for` loop -- only a range of an integer type can be walked", iter, "iterate a range of an integer type instead")
+    }
+    if !has_elem_rule {
+        // TyKind.Unknown here means iter_t is still an unbound metavar (e.g. a lazy-adapter
+        // chain like `.enumerate()`/`.zip()` not yet pinned at this point in checking) --
+        // under-determined, not known to be non-iterable. Leave it to E0301's
+        // region-boundary check rather than misdiagnosing it here. Set/Map/Str/Bytes/
+        // Iterator/Channel ARE spec-legal iterables (sections/03c_protocols.md
+        // IntoIterator table, sections/03_types.md:656 for Bytes' IntoIterator[U8],
+        // plus the Channel receive extension) so they pass through even where codegen's
+        // emit_for_in has no arm yet -- that gap is I0002, an internal compiler error,
+        // never a user-facing NotIterable.
+        // TyKind.Map is no longer listed: the kind gate above answers it, so naming it here
+        // would be an unreachable claim that a Map still has no element type.
+        let is_deferred_iterable = iter_tk == TyKind.Unknown || iter_tk == TyKind.Str || iter_tk == TyKind.Bytes || iter_tk == TyKind.Iterator || iter_tk == TyKind.Channel
+        if !is_deferred_iterable {
+            diag_error_at("NotIterable", NOT_ITERABLE, "cannot iterate over type `{type_to_str(iter_t)}` with a `for` loop -- only List, Set, Map, Range, Str, Bytes, Channel, and Iterator implement iteration", iter, "iterate a List, Set, Map, Range, Str, Bytes, Channel, or Iterator instead")
+        }
+    }
+    elem_t
 }
 
 // What a `for` loop binds when it iterates `iter_t` — the one definition of an iterable's

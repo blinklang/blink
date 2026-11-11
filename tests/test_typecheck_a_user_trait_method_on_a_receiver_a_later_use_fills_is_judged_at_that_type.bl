@@ -1,0 +1,527 @@
+// A method of a user trait called on a receiver that is not a named place, such as
+// `l.get(0).unwrap()`, whose type a later use fills, is judged at that type by the same dispatch
+// that judges the call with the type written in place (sections/03_types.md *Under-Determined
+// Types*). A user method named like a std one (`debug -> Int`) keeps its own return type. A bound
+// written on the binder, in an impl's where clause or given through a supertrait meets the call.
+// The report on a type without the method is the in-place one, at the call, once, and so are the
+// effect, `for` and mutation checks on the call. A result that a use fixes to another type is one
+// conflict at the call, with a note at that use. A type nothing fills is one E0301 and the call
+// adds no report.
+
+import std.fs
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_reset}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+
+fn probe(path: Str, src: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    init_embedded_stdlib()
+    fs.write(path, src).unwrap()
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+    program
+}
+
+fn errors_reported() -> List[Str] {
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" { out.push("{d.code} {d.line}:{d.col} | {d.message} | {d.help}") }
+    }
+    out
+}
+
+fn errors_with_notes() -> List[Str] {
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" { out.push("{d.code} {d.line}:{d.col} | {d.message} | {d.help} | {d.notes.join("; ")}") }
+    }
+    out
+}
+
+// The program shares one prelude, so the body under test starts on line 13.
+fn check_body(name: Str, body: List[Str]) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    let mut lines = [
+        "trait Tag \{ fn tag(self) -> Int }",
+        "impl Tag for Int \{ fn tag(self) -> Int \{ self * 2 } }",
+        "trait Dbg \{ fn debug(self) -> Int }",
+        "trait Pretty \{ fn pretty(self) -> Str }",
+        "trait Fancy: Pretty \{ fn fancy(self) -> Int }",
+        "trait Dup \{ fn clone(self) -> Self }",
+        "type S \{ a: Int }",
+        "impl Dbg for S \{ fn debug(self) -> Int \{ self.a } }",
+        "impl Pretty for S \{ fn pretty(self) -> Str \{ \"s\{self.a}\" } }",
+        "impl Fancy for S \{ fn fancy(self) -> Int \{ self.a + 1 } }",
+        "impl Dup for S \{ fn clone(self) -> S \{ S \{ a: self.a } } }",
+        "type NoTag \{ a: Int }",
+    ]
+    for l in body { lines.push(l) }
+    lines.push("fn main() \{ }")
+    lines.push("")
+    let _ = probe("build/tc_late_user_{name}.bl", lines.join("\n"))
+}
+
+fn errors_for(name: Str, body: List[Str]) -> List[Str] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    check_body(name, body)
+    errors_reported()
+}
+
+fn errors_with_notes_for(name: Str, body: List[Str]) -> List[Str] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    check_body(name, body)
+    errors_with_notes()
+}
+
+// Refused: the type a later use fills has no such method.
+
+test "a user trait method on a receiver a later push fills with a type without it is the unresolved method at the call, written in place or filled later" {
+    assert_eq(errors_for("notag", [
+        "fn bad() -> Int \{",
+        "    let mut l = []",
+        "    let mut r = 0",
+        "    if r > 0 \{ r = NoTag \{ a: 1 }.tag() }",
+        "    if l.len() > 0 \{ r = l.get(0).unwrap().tag() }",
+        "    l.push(NoTag \{ a: 1 })",
+        "    r",
+        "}",
+    ]), [
+        "E0505 16:20 | unresolved method `.tag` on type NoTag | ",
+        "E0505 17:26 | unresolved method `.tag` on type NoTag | ",
+    ])
+}
+
+test "a user trait method on a receiver a later push fills with an unbounded type parameter asks for a bound, written in place or filled later" {
+    assert_eq(errors_for("tparam_unbounded", [
+        "fn bad[T](x: T) -> Int \{",
+        "    let mut l = []",
+        "    let mut r = 0",
+        "    if r > 0 \{ r = x.tag() }",
+        "    if l.len() > 0 \{ r = l.get(0).unwrap().tag() }",
+        "    l.push(x)",
+        "    r",
+        "}",
+    ]), [
+        "E0505 16:20 | type parameter `T` has no bound, so it has no method `tag` | add a bound whose trait declares `tag`, such as `[T: Tag]`",
+        "E0505 17:26 | type parameter `T` has no bound, so it has no method `tag` | add a bound whose trait declares `tag`, such as `[T: Tag]`",
+    ])
+}
+
+test "a user trait method on a receiver a later push fills with a type parameter whose bound does not declare it names the bound, written in place or filled later" {
+    assert_eq(errors_for("tparam_wrong_bound", [
+        "fn bad[T: Pretty](x: T) -> Int \{",
+        "    let mut l = []",
+        "    let mut r = 0",
+        "    if r > 0 \{ r = x.tag() }",
+        "    if l.len() > 0 \{ r = l.get(0).unwrap().tag() }",
+        "    l.push(x)",
+        "    r",
+        "}",
+    ]), [
+        "E0505 16:20 | type parameter `T` is bounded by Pretty, and none of them declares method `tag` | correct the method name, or add a bound whose trait declares `tag`",
+        "E0505 17:26 | type parameter `T` is bounded by Pretty, and none of them declares method `tag` | correct the method name, or add a bound whose trait declares `tag`",
+    ])
+}
+
+test "a chain of user trait methods on a receiver a later push fills with a type without the first is one report per chain" {
+    assert_eq(errors_for("chain_once", [
+        "fn bad() -> Int \{",
+        "    let mut l = []",
+        "    let mut r = 0",
+        "    if r > 0 \{ r = NoTag \{ a: 1 }.tag().tag() }",
+        "    if l.len() > 0 \{ r = l.get(0).unwrap().tag().tag() }",
+        "    l.push(NoTag \{ a: 1 })",
+        "    r",
+        "}",
+    ]), [
+        "E0505 16:20 | unresolved method `.tag` on type NoTag | ",
+        "E0505 17:26 | unresolved method `.tag` on type NoTag | ",
+    ])
+}
+
+test "a user debug that returns Int keeps its own return type: filled later, the conflict is at the call with a note at the use that fixed the type" {
+    assert_eq(errors_with_notes_for("user_debug_ret", [
+        "fn bad() -> Str \{",
+        "    let mut l = []",
+        "    let mut s = \"\"",
+        "    if s != \"\" \{ s = S \{ a: 1 }.debug() }",
+        "    if l.len() > 0 \{ s = l.get(0).unwrap().debug() }",
+        "    l.push(S \{ a: 1 })",
+        "    s",
+        "}",
+    ]), [
+        "E0300 16:18 | assignment: cannot assign Int to Str |  | ",
+        "E0300 17:26 | method `.debug` returns Int, but its use expects Str |  | the use at 17:22 first gave it the type Str",
+    ])
+}
+
+test "a later-filled user method whose result a later statement fixes to another type is one conflict at the call with a note at that statement" {
+    assert_eq(errors_with_notes_for("user_debug_later_stmt", [
+        "fn bad() -> Int \{",
+        "    let mut l = []",
+        "    let mut r = 0",
+        "    if l.len() > 0 \{",
+        "        let s = l.get(0).unwrap().debug()",
+        "        r = takes(s)",
+        "    }",
+        "    l.push(S \{ a: 1 })",
+        "    r",
+        "}",
+        "fn takes(x: Str) -> Int \{ x.len() }",
+    ]), [
+        "E0300 17:17 | method `.debug` returns Int, but its use expects Str |  | the use at 18:13 first gave it the type Str",
+    ])
+}
+
+test "a later-filled user method with an effect the caller does not declare is the undeclared effect, written in place or filled later" {
+    assert_eq(errors_for("effect", [
+        "trait Say \{ fn say(self) -> Int ! IO }",
+        "impl Say for Int \{ fn say(self) -> Int ! IO \{ self } }",
+        "fn bad() -> Int \{",
+        "    let mut l = []",
+        "    let mut r = 0",
+        "    if r > 0 \{ r = 3.say() }",
+        "    if l.len() > 0 \{ r = l.get(0).unwrap().say() }",
+        "    l.push(3)",
+        "    r",
+        "}",
+    ]), [
+        "E0500 18:20 | call to `say` needs effect `IO`, which `bad` does not declare | add `IO` to the `!` list of `bad`, or make the call inside a `with` block that provides it",
+        "E0500 19:26 | call to `say` needs effect `IO`, which `bad` does not declare | add `IO` to the `!` list of `bad`, or make the call inside a `with` block that provides it",
+    ])
+}
+
+test "a for loop over a later-filled user method's result that is not iterable is not iterable, written in place or filled later" {
+    assert_eq(errors_for("for_not_iterable", [
+        "fn bad() -> Int \{",
+        "    let mut l = []",
+        "    let mut r = 0",
+        "    if r > 0 \{ for x in 3.tag() \{ r = r + x } }",
+        "    if l.len() > 0 \{ for x in l.get(0).unwrap().tag() \{ r = r + x } }",
+        "    l.push(1)",
+        "    r",
+        "}",
+    ]), [
+        "E0302 16:25 | cannot iterate over type `Int` with a `for` loop -- only List, Set, Map, Range, Str, Bytes, Channel, and Iterator implement iteration | iterate a List, Set, Map, Range, Str, Bytes, Channel, or Iterator instead",
+        "E0302 17:31 | cannot iterate over type `Int` with a `for` loop -- only List, Set, Map, Range, Str, Bytes, Channel, and Iterator implement iteration | iterate a List, Set, Map, Range, Str, Bytes, Channel, or Iterator instead",
+    ])
+}
+
+test "a for loop over a later-filled user method's result whose body uses the element as another type is one conflict at the iterable with a note" {
+    assert_eq(errors_with_notes_for("for_elem_conflict", [
+        "trait Ls \{ fn ls(self) -> List[Int] }",
+        "impl Ls for Int \{ fn ls(self) -> List[Int] \{ [self] } }",
+        "fn bad() -> Str \{",
+        "    let mut l = []",
+        "    let mut s = \"\"",
+        "    if s != \"\" \{ for x in 3.ls() \{ s = x } }",
+        "    if l.len() > 0 \{ for x in l.get(0).unwrap().ls() \{ s = x } }",
+        "    l.push(1)",
+        "    s",
+        "}",
+    ]), [
+        "E0300 18:36 | assignment: cannot assign Int to Str |  | ",
+        "E0300 19:31 | this loop walks List[Int], whose elements are Int, but its body uses them as Str |  | the use at 19:56 first gave it the type Str",
+    ])
+}
+
+test "a mutating method on an immutable loop binder a later push fills is the mutation error, written in place or filled later" {
+    assert_eq(errors_for("immut_binder", [
+        "fn bad() -> Int \{",
+        "    let mut l = []",
+        "    let mut w: List[Set[Int]] = []",
+        "    let mut r = 0",
+        "    for _ in 0..2 \{",
+        "        for e in w \{ e.insert(5) }",
+        "        for e in l \{ e.insert(5) }",
+        "        let s: Set[Int] = Set()",
+        "        l.push(s)",
+        "    }",
+        "    r",
+        "}",
+    ]), [
+        "E0610 18:22 | cannot call mutating method `.insert` on immutable binding `e` | declare it `mut` where the pattern binds it: `for mut e in w`",
+        "E0610 19:22 | cannot call mutating method `.insert` on immutable binding `e` | declare it `mut` where the pattern binds it: `for mut e in l`",
+    ])
+}
+
+// Refused: nothing fills the type.
+
+test "a user trait method on a receiver nothing fills is one E0301 at its binding" {
+    assert_eq(errors_for("never", [
+        "fn bad() -> Int \{",
+        "    let mut l = []",
+        "    let mut r = 0",
+        "    if l.len() > 0 \{ r = l.get(0).unwrap().tag() + l.get(0).unwrap().pretty().len() }",
+        "    r",
+        "}",
+    ]), ["E0301 14:5 | cannot infer a type for `l`: it is never given one by an annotation or a later use | add a type annotation, e.g. `let l: List[T] = ...` (replace the placeholder with the intended element type)"])
+}
+
+test "a user trait method on an open value no binding holds is one E0301 at that value" {
+    assert_eq(errors_for("never_unbound", [
+        "fn bad() -> Int \{",
+        "    let n = [].get(0).unwrap().tag()",
+        "    n + 1",
+        "}",
+    ]), ["E0301 14:13 | cannot infer a type for this value: it is left under-determined | add a type annotation on a binding for this value, e.g. `let x: T = ...` (replace each placeholder with the intended type)"])
+}
+
+test "a field read on a receiver a later push fills, whose use fixes another type, is one conflict at the read with a note, written in place or filled later" {
+    assert_eq(errors_with_notes_for("field_conflict", [
+        "fn bad() -> Str \{",
+        "    let mut l = []",
+        "    let mut s = \"\"",
+        "    if s != \"\" \{ s = S \{ a: 1 }.a }",
+        "    if l.len() > 0 \{ s = l.get(0).unwrap().a }",
+        "    l.push(S \{ a: 1 })",
+        "    s",
+        "}",
+    ]), [
+        "E0300 16:18 | assignment: cannot assign Int to Str |  | ",
+        "E0300 17:26 | field `a` has type Int, but its use expects Str |  | the use at 17:22 first gave it the type Str",
+    ])
+}
+
+test "a field read on a receiver a later push fills with a type without that field is no such field, written in place or filled later" {
+    assert_eq(errors_for("field_absent", [
+        "fn bad() -> Int \{",
+        "    let mut l = []",
+        "    let mut r = 0",
+        "    if r > 0 \{ r = S \{ a: 1 }.b }",
+        "    if l.len() > 0 \{ r = l.get(0).unwrap().b }",
+        "    l.push(S \{ a: 1 })",
+        "    r",
+        "}",
+    ]), [
+        "E0525 16:20 | `S` has no field `b` | use a declared field, or add the field to the type",
+        "E0525 17:26 | `S` has no field `b` | use a declared field, or add the field to the type",
+    ])
+}
+
+test "a field read on the result of a later-filled method the filled type lacks is one report, at the call" {
+    assert_eq(errors_for("field_on_refused", [
+        "fn bad() -> Int \{",
+        "    let mut l = []",
+        "    let mut r = 0",
+        "    if l.len() > 0 \{ r = l.get(0).unwrap().pretty().a }",
+        "    l.push(NoTag \{ a: 1 })",
+        "    r",
+        "}",
+    ]), ["E0505 16:26 | unresolved method `.pretty` on type NoTag | "])
+}
+
+test "a field read on a receiver nothing fills is one E0301, at its binding or at the value no binding holds" {
+    assert_eq(errors_for("field_never", [
+        "fn bad() -> Int \{",
+        "    let mut l = []",
+        "    let mut r = 0",
+        "    if l.len() > 0 \{ r = l.get(0).unwrap().a }",
+        "    r + [].get(0).unwrap().a",
+        "}",
+    ]), [
+        "E0301 14:5 | cannot infer a type for `l`: it is never given one by an annotation or a later use | add a type annotation, e.g. `let l: List[T] = ...` (replace the placeholder with the intended element type)",
+        "E0301 17:9 | cannot infer a type for this value: it is left under-determined | add a type annotation on a binding for this value, e.g. `let x: T = ...` (replace each placeholder with the intended type)",
+    ])
+}
+
+test "a trait-qualified user method on a receiver a later push fills with a type without the impl is the unresolved method at the call, written in place or filled later" {
+    assert_eq(errors_for("qualified_notag", [
+        "fn bad() -> Int \{",
+        "    let mut l = []",
+        "    let mut r = 0",
+        "    if r > 0 \{ r = Tag.tag(NoTag \{ a: 1 }) }",
+        "    if l.len() > 0 \{ r = Tag.tag(l.get(0).unwrap()) }",
+        "    l.push(NoTag \{ a: 1 })",
+        "    r",
+        "}",
+    ]), [
+        "E0505 16:20 | unresolved method `.tag` on type NoTag | ",
+        "E0505 17:26 | unresolved method `.tag` on type NoTag | ",
+    ])
+}
+
+test "a trait-qualified user method with a wrong argument on a receiver a later push fills is the argument error, written in place or filled later" {
+    assert_eq(errors_for("qualified_arg", [
+        "trait Mix \{ fn mix(self, k: Int) -> Int }",
+        "impl Mix for Int \{ fn mix(self, k: Int) -> Int \{ self * k } }",
+        "fn bad() -> Int \{",
+        "    let mut l = []",
+        "    let mut r = 0",
+        "    if r > 0 \{ r = Mix.mix(2, \"x\") }",
+        "    if l.len() > 0 \{ r = Mix.mix(l.get(0).unwrap(), \"x\") }",
+        "    l.push(1)",
+        "    r",
+        "}",
+    ]), [
+        "E0300 18:31 | argument 2 of `Mix.mix` expects Int, got Str | ",
+        "E0300 19:53 | argument 2 of `Mix.mix` expects Int, got Str | ",
+    ])
+}
+
+test "a trait-qualified user method on a value nothing fills is one E0301 at that value" {
+    assert_eq(errors_for("qualified_never", [
+        "fn bad() -> Int \{",
+        "    Tag.tag([].get(0).unwrap()) + 1",
+        "}",
+    ]), ["E0301 14:13 | cannot infer a type for this value: it is left under-determined | add a type annotation on a binding for this value, e.g. `let x: T = ...` (replace each placeholder with the intended type)"])
+}
+
+// sections/03_types.md 3.2 governs this row: the call's result is an unsolved variable when the
+// literal meets it, so the literal gives it Int, and the I32 the method returns is one conflict.
+test "a later-filled user method whose result an integer literal meets first takes Int from the literal, so another integer return is one conflict at the call" {
+    assert_eq(errors_with_notes_for("literal_first", [
+        "trait Wd \{ fn wd(self) -> I32 }",
+        "impl Wd for Int \{ fn wd(self) -> I32 \{ 3 } }",
+        "fn bad() -> Bool \{",
+        "    let mut l = []",
+        "    let mut out = false",
+        "    if l.len() > 0 \{ out = l.get(0).unwrap().wd() == 3 }",
+        "    l.push(5)",
+        "    out",
+        "}",
+    ]), ["E0300 18:28 | method `.wd` returns I32, but its use expects Int |  | the use at 18:51 first gave it the type Int"])
+}
+
+// Accepted: the type the later use fills has the method.
+
+test "a user trait method on a receiver a later push fills with a type that has it is accepted" {
+    assert_eq(errors_for("concrete_ok", [
+        "fn ok() -> Int \{",
+        "    let mut li = []",
+        "    let mut ls = []",
+        "    let mut r = 0",
+        "    if li.len() > 0 \{ r = li.get(0).unwrap().tag() + 1 }",
+        "    if ls.len() > 0 \{",
+        "        r = ls.get(0).unwrap().debug() + ls.get(0).unwrap().fancy() + ls.get(0).unwrap().pretty().len()",
+        "        r = r + ls.get(0).unwrap().clone().debug()",
+        "    }",
+        "    li.push(1)",
+        "    ls.push(S \{ a: 1 })",
+        "    r",
+        "}",
+    ]), [])
+}
+
+test "a bound written on the binder meets each later-filled user trait method call" {
+    assert_eq(errors_for("inline_ok", [
+        "fn ok[T: Pretty + Dbg + Dup](x: T) -> Int \{",
+        "    let mut l = []",
+        "    let mut r = 0",
+        "    if l.len() > 0 \{",
+        "        r = l.get(0).unwrap().pretty().len() + l.get(0).unwrap().debug() + 1",
+        "        l.push(l.get(0).unwrap().clone())",
+        "    }",
+        "    l.push(x)",
+        "    r",
+        "}",
+    ]), [])
+}
+
+test "a bound written in an impl's where clause meets each later-filled user trait method call" {
+    assert_eq(errors_for("where_ok", [
+        "trait Ck \{ fn chk(self) -> Int }",
+        "type Hold[T] \{ v: T }",
+        "impl[T] Ck for Hold[T] where T: Pretty + Dbg \{",
+        "    fn chk(self) -> Int \{",
+        "        let mut l = []",
+        "        let mut r = 0",
+        "        if l.len() > 0 \{ r = l.get(0).unwrap().pretty().len() + l.get(0).unwrap().debug() }",
+        "        l.push(self.v)",
+        "        r",
+        "    }",
+        "}",
+    ]), [])
+}
+
+test "a bound given through a supertrait meets each later-filled user trait method call" {
+    assert_eq(errors_for("super_ok", [
+        "fn ok[T: Fancy](x: T) -> Int \{",
+        "    let mut l = []",
+        "    let mut r = 0",
+        "    if l.len() > 0 \{ r = l.get(0).unwrap().pretty().len() + l.get(0).unwrap().fancy() }",
+        "    l.push(x)",
+        "    r",
+        "}",
+    ]), [])
+}
+
+test "a for loop over a later-filled user method's result is accepted" {
+    assert_eq(errors_for("for_ok", [
+        "trait Ls \{ fn ls(self) -> List[Int] }",
+        "impl Ls for Int \{ fn ls(self) -> List[Int] \{ [self, self] } }",
+        "fn ok() -> Int \{",
+        "    let mut l = []",
+        "    let mut r = 0",
+        "    for _ in 0..2 \{",
+        "        if l.len() > 0 \{ for x in l.get(0).unwrap().ls() \{ r = r + x } }",
+        "        l.push(3)",
+        "    }",
+        "    r",
+        "}",
+    ]), [])
+}
+
+test "a later-filled user method call whose receiver only a call met after it fills is accepted" {
+    assert_eq(errors_for("order_ok", [
+        "fn ok() -> Int \{",
+        "    let mut l = []",
+        "    let mut m = []",
+        "    let mut r = 0",
+        "    for _ in 0..3 \{",
+        "        if m.len() > 0 \{ r = m.get(0).unwrap().tag() }",
+        "        if l.len() > 0 \{ m.push(l.get(0).unwrap().tag()) }",
+        "        l.push(10)",
+        "    }",
+        "    r",
+        "}",
+    ]), [])
+}
+
+test "a field read on a receiver a later push fills is accepted: on the value, on a later-filled method's result, on a loop binder, chained, by tuple index and as an assignment target" {
+    assert_eq(errors_for("field_ok", [
+        "type In \{ v: Int }",
+        "type Out \{ i: In }",
+        "fn ok() -> Int \{",
+        "    let mut l = []",
+        "    let mut o = []",
+        "    let mut t = []",
+        "    let mut r = 0",
+        "    if l.len() > 0 \{ r = l.get(0).unwrap().a + l.get(0).unwrap().clone().a }",
+        "    for mut e in l \{",
+        "        e.a = 5",
+        "        r = r + e.a",
+        "    }",
+        "    if o.len() > 0 \{ r = r + o.get(0).unwrap().i.v }",
+        "    if t.len() > 0 \{ r = r + t.get(0).unwrap().1 }",
+        "    l.push(S \{ a: 1 })",
+        "    o.push(Out \{ i: In \{ v: 2 } })",
+        "    t.push((1, 7))",
+        "    r",
+        "}",
+    ]), [])
+}
+
+test "a trait-qualified user method on a receiver a later push fills with a type that has the impl is accepted" {
+    assert_eq(errors_for("qualified_ok", [
+        "fn ok() -> Int \{",
+        "    let mut l = []",
+        "    let mut r = 0",
+        "    if l.len() > 0 \{ r = Tag.tag(l.get(0).unwrap()) }",
+        "    for x in l \{ r = r + Tag.tag(x) }",
+        "    l.push(10)",
+        "    r",
+        "}",
+    ]), [])
+}
+
+test "a builtin method on a receiver a later push fills is accepted" {
+    assert_eq(errors_for("builtin_ok", [
+        "fn ok() -> Int \{",
+        "    let mut l = []",
+        "    let mut n = 0",
+        "    if l.len() > 0 \{ n = l.get(0).unwrap().len() }",
+        "    l.push(\"abc\")",
+        "    n",
+        "}",
+    ]), [])
+}

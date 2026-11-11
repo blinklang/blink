@@ -1,0 +1,254 @@
+// A method of a user trait called on a receiver that is not a named place, such as
+// `l.get(0).unwrap()`, builds and runs at the type a later use fills where that type has the
+// method (§3.6 Trait Bounds): a bound on the body's binder, one in its impl's where clause, one
+// given through a supertrait, or a concrete type with an impl. A user method named like a std one
+// (`debug -> Int`, `clone -> Self`) runs the user method. A `for` over such a call's result walks it,
+// and a call whose receiver only a later-met call fills runs. A trait-qualified call such as
+// `Tag.tag(l.get(0).unwrap())` runs the impl of the type the later use fills, and a field read on
+// such a receiver reads the field of that type. A program whose generic bodies live in
+// another module prints the same text in the one-unit and the per-module build.
+
+import std.fs
+import std.process.{ProcessResult}
+import compile_test_helpers.{scratch_root}
+
+trait Tag { fn tag(self) -> Int }
+
+impl Tag for Int {
+    fn tag(self) -> Int { self * 2 }
+}
+
+trait Dbg { fn debug(self) -> Int }
+
+trait Pretty { fn pretty(self) -> Str }
+
+trait Fancy: Pretty { fn fancy(self) -> Int }
+
+trait Dup { fn clone(self) -> Self }
+
+type S { a: Int }
+
+impl Dbg for S {
+    fn debug(self) -> Int { self.a * 10 }
+}
+
+impl Pretty for S {
+    fn pretty(self) -> Str { "s{self.a}" }
+}
+
+impl Fancy for S {
+    fn fancy(self) -> Int { self.a + 1 }
+}
+
+impl Dup for S {
+    fn clone(self) -> S { S { a: self.a + 100 } }
+}
+
+type Hold[T] { v: T }
+
+trait Ck { fn chk(self) -> Str }
+
+impl[T] Ck for Hold[T] where T: Pretty + Dbg {
+    fn chk(self) -> Str {
+        let mut l = []
+        let mut out = ""
+        for _ in 0..2 {
+            if l.len() > 0 { out = "{l.get(0).unwrap().pretty()}:{l.get(0).unwrap().debug()}" }
+            l.push(self.v)
+        }
+        out
+    }
+}
+
+fn inline_bound[T: Pretty + Dbg + Dup](x: T) -> Str {
+    let mut l = []
+    let mut out = ""
+    for _ in 0..2 {
+        if l.len() > 0 {
+            out = "{l.get(0).unwrap().pretty()}:{l.get(0).unwrap().debug() + 1}"
+            l.push(l.get(0).unwrap().clone())
+        }
+        l.push(x)
+    }
+    "{out}:{l.len()}:{l.get(1).unwrap().debug()}"
+}
+
+fn super_bound[T: Fancy](x: T) -> Str {
+    let mut l = []
+    let mut out = ""
+    for _ in 0..2 {
+        if l.len() > 0 { out = "{l.get(0).unwrap().pretty()}:{l.get(0).unwrap().fancy()}" }
+        l.push(x)
+    }
+    out
+}
+
+test "a bound on the body's binder meets each later-filled user trait method call" {
+    assert_eq(inline_bound(S { a: 2 }), "s2:21:3:1020")
+}
+
+test "a bound in an impl's where clause meets each later-filled user trait method call" {
+    assert_eq(Hold { v: S { a: 3 } }.chk(), "s3:30")
+}
+
+test "a bound given through a supertrait meets each later-filled user trait method call" {
+    assert_eq(super_bound(S { a: 5 }), "s5:6")
+}
+
+test "a concrete type with an impl meets each later-filled user trait method call" {
+    let mut li = []
+    let mut ls = []
+    let mut out: List[Str] = []
+    for i in 0..2 {
+        if li.len() > 0 {
+            out.push("{li.get(0).unwrap().tag() + 1}")
+            out.push("{ls.get(0).unwrap().debug() + ls.get(0).unwrap().fancy()}")
+            out.push("{ls.get(0).unwrap().clone().debug()} {ls.get(0).unwrap().pretty()}")
+        }
+        li.push(7)
+        ls.push(S { a: i + 4 })
+    }
+    assert_eq(out, ["15", "45", "1040 s4"])
+}
+
+trait Ls { fn ls(self) -> List[Int] }
+
+impl Ls for Int {
+    fn ls(self) -> List[Int] { [self, self + 1] }
+}
+
+test "a for loop over a later-filled user trait method's result walks its elements" {
+    let mut l = []
+    let mut r = 0
+    for _ in 0..2 {
+        if l.len() > 0 { for x in l.get(0).unwrap().ls() { r = r + x } }
+        l.push(3)
+    }
+    assert_eq(r, 7)
+}
+
+test "a later-filled user trait method call whose receiver a call met after it fills runs" {
+    let mut l = []
+    let mut m = []
+    let mut r = 0
+    for _ in 0..3 {
+        if m.len() > 0 { r = m.get(0).unwrap().tag() }
+        if l.len() > 0 { m.push(l.get(0).unwrap().tag()) }
+        l.push(10)
+    }
+    assert_eq(r, 40)
+}
+
+type In { v: Int }
+
+type Out { i: In }
+
+test "a trait-qualified user trait method call on a receiver a later fill types runs that type's impl" {
+    let mut l = []
+    let mut r = 0
+    for _ in 0..2 {
+        if l.len() > 0 {
+            r = Tag.tag(l.get(0).unwrap())
+            for x in l { r = r + Tag.tag(x) }
+        }
+        l.push(10)
+    }
+    assert_eq(r, 40)
+}
+
+test "a field read on a receiver a later fill types reads that type's field" {
+    let mut l = []
+    let mut o = []
+    let mut t = []
+    let mut out: List[Int] = []
+    for _ in 0..2 {
+        if l.len() > 0 {
+            out.push(l.get(0).unwrap().a)
+            out.push(l.get(0).unwrap().clone().a)
+            out.push(o.get(0).unwrap().i.v)
+            out.push(t.get(0).unwrap().1)
+            for mut e in l {
+                e.a = e.a + 1
+                out.push(e.a)
+            }
+        }
+        l.push(S { a: 4 })
+        o.push(Out { i: In { v: 9 } })
+        t.push((1, 7))
+    }
+    assert_eq(out, [4, 104, 9, 7, 5])
+}
+
+test "a builtin method on a receiver a later fill types runs at that type" {
+    let mut l = []
+    let mut n = 0
+    for _ in 0..2 {
+        if l.len() > 0 { n = l.get(0).unwrap().len() }
+        l.push("abc")
+    }
+    assert_eq(n, 3)
+}
+
+fn sh(cmd: Str) -> ProcessResult ! Process.Spawn {
+    process.run("sh", ["-c", cmd]).unwrap()
+}
+
+let late_src = [
+    "pub trait Dbg \{ fn debug(self) -> Int }",
+    "pub trait Dup \{ fn clone(self) -> Self }",
+    "pub trait Tag \{ fn tag(self) -> Int }",
+    "impl Tag for Int \{ fn tag(self) -> Int \{ self * 2 } }",
+    "pub fn late_user[T: Dbg + Dup](x: T) -> Str \{",
+    "    let mut l = []",
+    "    let mut out = \"\"",
+    "    for _ in 0..2 \{",
+    "        if l.len() > 0 \{",
+    "            out = \"\{l.get(0).unwrap().debug() + 1}\"",
+    "            l.push(l.get(0).unwrap().clone())",
+    "        }",
+    "        l.push(x)",
+    "    }",
+    "    \"\{out} \{l.len()} \{l.get(1).unwrap().debug()}\"",
+    "}",
+    "pub fn late_tag() -> Int \{",
+    "    let mut l = []",
+    "    let mut t = []",
+    "    let mut r = 0",
+    "    for _ in 0..2 \{",
+    "        if l.len() > 0 \{ r = l.get(0).unwrap().tag() + Tag.tag(l.get(0).unwrap()) + t.get(0).unwrap().1 }",
+    "        l.push(21)",
+    "        t.push((0, 3))",
+    "    }",
+    "    r",
+    "}",
+    "",
+].join("\n")
+
+let main_src = [
+    "import late.\{Dbg, Dup, late_user, late_tag}",
+    "type P \{ a: Int }",
+    "impl Dbg for P \{ fn debug(self) -> Int \{ self.a } }",
+    "impl Dup for P \{ fn clone(self) -> P \{ P \{ a: self.a + 5 } } }",
+    "fn main() \{",
+    "    io.println(late_user(P \{ a: 2 }))",
+    "    io.println(\"\{late_tag()}\")",
+    "}",
+    "",
+].join("\n")
+
+test "generic bodies in another module whose user trait method calls a later fill types print the same in each build" {
+    let root = "{scratch_root()}/late_user_method_pkg_{getpid()}"
+    let _ = sh("rm -rf {root} && mkdir -p {root}/src")
+    fs.write("{root}/blink.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\n").unwrap()
+    fs.write("{root}/src/late.bl", late_src).unwrap()
+    fs.write("{root}/src/main.bl", main_src).unwrap()
+    let blink = sh("readlink -f build/blink").out.trim()
+    let want = "3 3 7\n87\n"
+    let mut failed: List[Str] = []
+    for mode in ["--no-per-module", "--per-module"] {
+        let r = sh("cd {root} && env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE timeout 300 {blink} run {mode} src/main.bl < /dev/null 2>&1")
+        if !r.success() || !r.out.ends_with(want) { failed.push("blink run {mode}: {r.end}\n{r.out}") }
+    }
+    let _ = sh("rm -rf {root}")
+    assert_eq(failed, [])
+}
