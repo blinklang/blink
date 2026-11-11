@@ -18,9 +18,9 @@ and what the orchestrator must respect.
 
 Stdlib functions emit with names derived from the source file path.
 `pub fn parse(...)` in `lib/std/json.bl` emits as
-`blink_std_json_parse`. The module prefix is auto-applied via
-`c_fn_name` (driven by `node_source_module()` in
-`src/codegen_types.bl`).
+`blink_3std_1json_parse`: class digit 3, then the escaped module key and
+name (see docs/codegen-rewrite/cname.md). `c_fn_decl_name` in `src/cname.bl`
+adds the module from `node_source_module()`.
 
 Bridges to runtime C helpers use `@ffi("blink_<name>")` to route a
 Blink-source declaration to a bare runtime symbol — e.g. `lib/std/str.bl`'s
@@ -28,7 +28,7 @@ Blink-source declaration to a bare runtime symbol — e.g. `lib/std/str.bl`'s
 `blink_str_len` defined in `bootstrap/runtime_core.h`.
 
 All Blink-source pub fns emit with **external C linkage** (no
-`static`). Trait/impl methods follow the same rules via `c_fn_name`.
+`static`). Trait/impl methods follow the same rules via `c_impl_method_name`.
 The archive does nothing special — it simply collects the same
 symbols the whole-program build would have produced. The orchestrator
 runs `nm libblink_std.a | sort | uniq -c` and fails the build if any
@@ -44,7 +44,8 @@ into the monolith's emitted symbols.
 
 Why: the alternative (each peeled `.o` emits the generics it uses)
 produces guaranteed duplicate-symbol link errors, since two peeled
-modules would both emit `blink_list_get__int_t`. The "central
+modules would both emit the same instance symbol (a name with `_0`
+arguments from `c_mono_fn_name`). The "central
 monomorphization" idea was raised in the original plan and rejected
 because monolith ownership is simpler and collision-free.
 

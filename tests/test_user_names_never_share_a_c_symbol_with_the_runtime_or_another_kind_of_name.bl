@@ -1,0 +1,171 @@
+// Every legal identifier is a legal module, fn and type name, so no name a program writes may
+// meet a name the runtime declares, or a name the compiler makes for a different kind of
+// declaration, in the generated C. Each package below once failed in cc or with
+// TwoDeclarationsOneCSymbol; each must build and run, in the one-unit and the per-module build.
+
+import std.fs
+import std.process.{ProcessResult}
+import compile_test_helpers.{scratch_root}
+
+fn sh(cmd: Str) -> ProcessResult ! Process.Spawn {
+    process.run("sh", ["-c", cmd]).unwrap()
+}
+
+fn src(lines: List[Str]) -> Str { "{lines.join("\n")}\n" }
+
+// Builds the package from (path under src/, text) pairs and runs src/main.bl in each build mode.
+// Returns one line per mode whose run failed or printed other text.
+fn run_package(tag: Str, files: List[(Str, Str)], expected: Str) -> List[Str] ! Env.Read, Process.Spawn, FS.Write {
+    let root = "{scratch_root()}/c_symbol_{tag}_{getpid()}"
+    let _ = sh("rm -rf {root} && mkdir -p {root}/src")
+    fs.write("{root}/blink.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\n").unwrap()
+    for f in files { fs.write("{root}/src/{f.0}", f.1).unwrap() }
+    let blink = sh("readlink -f build/blink").out.trim()
+    let mut failed: List[Str] = []
+    for mode in ["--no-per-module", "--per-module"] {
+        let r = sh("cd {root} && env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE timeout 300 {blink} run {mode} src/main.bl < /dev/null 2>&1")
+        if !r.success() || !r.out.ends_with(expected) { failed.push("{tag} {mode}: {r.end}\n{r.out}") }
+    }
+    let _ = sh("rm -rf {root}")
+    failed
+}
+
+test "a module fn may take the name of a runtime function" {
+    let files = [
+        ("list.bl", src(["pub fn new() -> Int \{ 1 }"])),
+        ("bytes.bl", src(["pub fn new() -> Int \{ 2 }"])),
+        ("map.bl", src(["pub fn new() -> Int \{ 3 }"])),
+        ("child.bl", src(["pub fn run() -> Int \{ 4 }", "pub fn spawn() -> Int \{ 5 }", "pub fn exec() -> Int \{ 6 }"])),
+        ("record.bl", src(["pub fn case() -> Int \{ 7 }"])),
+        ("set.bl", src(["pub fn case_label() -> Int \{ 8 }"])),
+        ("main.bl", src([
+            "import list",
+            "import bytes",
+            "import map",
+            "import child",
+            "import record.\{case}",
+            "import set",
+            "fn main() \{",
+            "    io.println(\"\{list.new()} \{bytes.new()} \{map.new()} \{child.run()} \{child.spawn()} \{child.exec()} \{case()} \{set.case_label()}\")",
+            "    let xs = [1, 2]",
+            "    io.println(\"\{xs.len()}\")",
+            "}",
+        ])),
+    ]
+    assert_eq(run_package("runtime_names", files, "1 2 3 4 5 6 7 8\n2\n").join("\n"), "")
+}
+
+test "an impl method and a module fn whose module key spells its stem keep apart" {
+    let files = [
+        ("a.bl", src([
+            "pub trait Tr \{ fn go(self) -> Int }",
+            "pub type T \{ x: Int }",
+            "impl Tr for T \{ fn go(self) -> Int \{ self.x } }",
+        ])),
+        ("a_T_Tr.bl", src(["pub fn go() -> Int \{ 5 }"])),
+        ("main.bl", src([
+            "import a.\{T, Tr}",
+            "import a_T_Tr",
+            "fn main() \{",
+            "    let t = T \{ x: 4 }",
+            "    io.println(\"\{t.go()} \{a_T_Tr.go()}\")",
+            "}",
+        ])),
+    ]
+    assert_eq(run_package("impl_vs_module_fn", files, "4 5\n").join("\n"), "")
+}
+
+test "a module named u keeps apart from the main module's own fns" {
+    let files = [
+        ("u.bl", src(["pub fn foo() -> Int \{ 1 }"])),
+        ("main.bl", src([
+            "import u",
+            "fn foo() -> Int \{ 2 }",
+            "fn main() \{",
+            "    io.println(\"\{u.foo()} \{foo()}\")",
+            "}",
+        ])),
+    ]
+    assert_eq(run_package("module_u", files, "1 2\n").join("\n"), "")
+}
+
+test "two tuple types whose element names join to one spelling stay two types" {
+    let files = [
+        ("a.bl", src(["pub type X \{ v: Int }"])),
+        ("b_c.bl", src(["pub type D \{ v: Int }"])),
+        ("a_X.bl", src(["pub type b \{ w: Str }"])),
+        ("c.bl", src(["pub type D \{ s: Str }"])),
+        ("main.bl", src([
+            "import a",
+            "import b_c",
+            "import a_X",
+            "import c",
+            "fn main() \{",
+            "    let p = (a.X \{ v: 1 }, b_c.D \{ v: 2 })",
+            "    let q = (a_X.b \{ w: \"w\" }, c.D \{ s: \"s\" })",
+            "    io.println(\"\{p.0.v} \{p.1.v} \{q.0.w} \{q.1.s}\")",
+            "}",
+        ])),
+    ]
+    assert_eq(run_package("carrier_tags", files, "1 2 w s\n").join("\n"), "")
+}
+
+test "a type helper and a module fn whose module key spells the helper keep apart" {
+    let files = [
+        ("eq_List.bl", src(["pub fn x() -> Int \{ 6 }"])),
+        ("promote_Option.bl", src(["pub fn x() -> Int \{ 5 }"])),
+        ("main.bl", src([
+            "import eq_List",
+            "import promote_Option",
+            "@derive(Eq, Clone)",
+            "type x \{ v: Int }",
+            "fn main() \{",
+            "    let a = [x \{ v: 1 }]",
+            "    let b = [x \{ v: 1 }]",
+            "    let o: Option[x] = Some(x \{ v: 4 })",
+            "    let f = fn() -> Int \{ o.unwrap().v }",
+            "    io.println(\"\{a == b} \{f()} \{promote_Option.x()} \{eq_List.x()}\")",
+            "}",
+        ])),
+    ]
+    assert_eq(run_package("helpers", files, "true 4 5 6\n").join("\n"), "")
+}
+
+test "a main-module type may take the name of a builtin type's C spelling" {
+    let files = [
+        ("main.bl", src([
+            "type list \{ x: Int }",
+            "type int \{ y: Int }",
+            "fn main() \{",
+            "    let a = list \{ x: 1 }",
+            "    let t = (int \{ y: 2 }, 3)",
+            "    let o: Option[int] = Some(int \{ y: 5 })",
+            "    let n: Option[Int] = Some(6)",
+            "    io.println(\"\{a.x} \{t.0.y} \{o.unwrap().y} \{n.unwrap()}\")",
+            "}",
+        ])),
+    ]
+    assert_eq(run_package("builtin_spellings", files, "1 2 5 6\n").join("\n"), "")
+}
+
+test "a derived method and a variant of the same name keep apart" {
+    let files = [
+        ("main.bl", src([
+            "@derive(Eq, Clone)",
+            "type C \{ eq, clone, b }",
+            "fn name(c: C) -> Str \{",
+            "    match c \{",
+            "        C.eq => \"e\"",
+            "        C.clone => \"c\"",
+            "        C.b => \"b\"",
+            "    }",
+            "}",
+            "fn main() \{",
+            "    let x = C.b",
+            "    let y = x.clone()",
+            "    io.println(\"\{x == y} \{name(y)}\")",
+            "}",
+        ])),
+    ]
+    assert_eq(run_package("derive_vs_variant", files, "true b\n").join("\n"), "")
+}

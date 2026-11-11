@@ -8,17 +8,14 @@
 // any future mangling-scheme change breaks the same tests again for no semantic reason.
 //
 // mono_typedef_names(c, base) reads the STRUCTURE of a typedef's closing line
-// (`} blink_<name>;`) rather than a specific mangling scheme's spelling: it finds every
-// distinct typedef whose name is exactly `blink_{base}` or starts with `blink_{base}_`,
-// with no assumption about how the tail after that is mangled. Callers use it for
-// presence ("at least one instance exists": has_mono_instance) and distinctness ("two
-// different instantiations produced two different C types": compare the returned names).
+// (`} <name>;`) rather than a specific mangling scheme's spelling: it finds every distinct
+// typedef whose name, after the class digit, is `base` or `base` followed by the `_0` that
+// starts the mono arguments. Callers use it for presence ("at least one instance exists":
+// has_mono_instance) and distinctness ("two different instantiations produced two different
+// C types": compare the returned names).
 //
-// mono_fn_names is the function-symbol twin, scheme-agnostic via underscore-stripping.
-// poly_impl_fn_names is a THIRD, narrower helper for poly-impl-on-builtin bases whose name
-// already contains '_' before mangling (e.g. "List_Echoable_echo") — underscore-stripping
-// can't disambiguate escaped digits from real characters for that shape, so it is the one
-// helper here that knowingly couples to today's _0/_1 escape scheme. See its doc comment.
+// mono_fn_names and poly_impl_fn_names apply the same rule to function definitions. `base` is
+// always the escaped name, so an impl stem such as "List_Echoable_echo" works as is.
 
 import compile_test_helpers
 import std.io
@@ -35,7 +32,7 @@ test "mono_typedef_names: finds a single bare struct typedef" {
     )
     let names = compile_test_helpers.mono_typedef_names(c, "Box")
     assert_true(names.len() == 1, "exactly one Box instance found")
-    assert_true(names.get(0).unwrap().starts_with("blink_Box"), "found name starts with blink_Box")
+    assert_true(names.get(0).unwrap().starts_with("blink_4Box"), "found name starts with blink_4Box")
 }
 
 test "mono_typedef_names: two sibling instantiations produce two distinct names" {
@@ -82,7 +79,34 @@ test "mono_typedef_names: a base name that is a PREFIX of another base's name is
     let c = compile_test_helpers.compile_and_emit_c(s, "monomorphized_typedef_names_helper_helper_prefix")
     let box_names = compile_test_helpers.mono_typedef_names(c, "Box")
     assert_true(box_names.len() == 1, "Box scan finds exactly its own instance, not BoxOfBoxes's")
-    assert_true(box_names.get(0).unwrap().starts_with("blink_Box_"), "Box's own instance name")
+    assert_true(box_names.get(0).unwrap().starts_with("blink_4Box_"), "Box's own instance name")
+}
+
+test "mono_typedef_names: a base does not match a longer name that goes on with an underscore" {
+    // Box_x's instance is `blink_4Box_1x_0Str`: it starts with `blink_4Box_`, but its name is
+    // Box_x, not Box. Only `;` or the `_0` that starts the mono arguments may follow the base.
+    let mut s = "type Box[T] \{ v: T }\n"
+    s = s.concat("type Box_x[T] \{ w: T }\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let a = Box \{ v: 3 }\n")
+    s = s.concat("    let b = Box_x \{ w: \"s\" }\n")
+    s = s.concat("    assert_eq(a.v, 3)\n")
+    s = s.concat("    assert(b.w == \"s\")\n")
+    s = s.concat("}\n")
+    let c = compile_test_helpers.compile_and_emit_c(s, "monomorphized_typedef_names_helper_helper_underscore_tail")
+    let box_names = compile_test_helpers.mono_typedef_names(c, "Box")
+    assert_true(box_names.len() == 1, "Box scan finds only Box's instance, not Box_x's")
+    assert_true(compile_test_helpers.mono_typedef_names(c, "Box_1x").len() == 1, "the escaped base finds Box_x")
+}
+
+test "mono_fn_names: a base matches the escaped name exactly, not with its underscores dropped" {
+    // fn a_b is `blink_2a_1b_0Int`. A fn named a1b would be `blink_2a1b_0Int`, so the base
+    // "a1b" must not find a_b, though both read "a1b" with the underscores dropped.
+    let mut s = "fn a_b[T](x: T) -> T \{ x }\n"
+    s = s.concat("fn main() \{ assert_eq(a_b(3), 3) }\n")
+    let c = compile_test_helpers.compile_and_emit_c(s, "monomorphized_typedef_names_helper_helper_fn_exact")
+    assert_true(compile_test_helpers.mono_fn_names(c, "a1b").len() == 0, "a1b does not find a_b")
+    assert_true(compile_test_helpers.mono_fn_names(c, "a_1b").len() == 1, "the escaped base finds a_b")
 }
 
 test "has_mono_instance: true when present, false when absent" {
@@ -95,10 +119,10 @@ test "has_mono_instance: true when present, false when absent" {
 }
 
 test "mono_fn_names: a monomorphized struct return type does not shadow the fn name" {
-    // fn mk[T]() -> RGT[T] emits e.g. `blink_RGT_0Int blink_mk_0Int(void) {` — the
+    // fn mk[T]() -> RGT[T] emits e.g. `blink_4RGT_0Int blink_2mk_0Int(void) {` — the
     // RETURN TYPE also spells "blink_" and comes first on the line. mono_fn_names must
-    // find the function's own "blink_mk_..." name, not misidentify the return type's
-    // "blink_RGT_..." as the function name and then miss "mk" entirely.
+    // find the function's own "blink_2mk_..." name, not misidentify the return type's
+    // "blink_4RGT_..." as the function name and then miss "mk" entirely.
     let mut s = "type RGT[T] \{ v: T }\n"
     s = s.concat("fn mk[T](x: T) -> RGT[T] \{ RGT \{ v: x } }\n")
     s = s.concat("fn main() \{\n")

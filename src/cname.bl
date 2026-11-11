@@ -20,7 +20,7 @@ import typecheck.{
     tc_resolve_transparent_alias_of_decl, tc_tid_decl_node, DECL_NODE_AMBIGUOUS, ty_param_list, ty_pool,
     tc_tid_handler_effect, tc_handler_effect_root, is_user_effect_handle_name, builtin_op_roots,
     tc_enum_has_payload, tc_impl_trait_args, tc_impl_trait_id, tc_impl_method_stem,
-    tc_impl_instance_stem, tc_impl_recv_spelling, tc_is_shadowable_type_name, tc_sym_escape, tc_tid_kind,
+    tc_impl_instance_stem, tc_impl_recv_spelling, tc_sym_escape, tc_tid_kind,
     range_repr_tid,
 }
 import parser.{
@@ -28,30 +28,16 @@ import parser.{
     node_str_val, node_type_params, positional_str_arg,
     positional_str_arg_count, sublist_get, sublist_length,
 }
+import cname_class.{
+    C_CLASS_DERIVED, C_CLASS_MAIN_IMPL, C_CLASS_MAIN_TYPE, C_CLASS_MAIN_VALUE, C_CLASS_MODULE_IMPL,
+    C_CLASS_MODULE_TYPE, C_CLASS_MODULE_VALUE, C_CLASS_TYPE_HELPER,
+}
 import diagnostics.{
     ICE_SEG_AMBIGUOUS_DECL, ICE_SEG_NO_DECL, ICE_SEG_TID_OUT_OF_RANGE, ICE_SEG_UNHANDLED_KIND,
     ICE_SEG_UNSOLVED_TYPEVAR, diag_is_ice_seg,
 }
 
 let mut runtime_owned_decls: Map[Int, Int] = Map()
-
-// The lib/std types that runtime.h defines as `blink_<Name>`. layout marks each one's
-// declaration runtime-owned from this list, and a main-file namesake must stay off the
-// name even when the std module is not in the program, so both read the one list.
-pub type RuntimeHeaderType {
-    module_name: Str
-    type_name: Str
-}
-
-pub let RUNTIME_HEADER_TYPES: List[RuntimeHeaderType] = [
-    RuntimeHeaderType { module_name: "std_traits", type_name: "ConversionError" },
-    RuntimeHeaderType { module_name: "std_process", type_name: "ProcessResult" },
-    RuntimeHeaderType { module_name: "std_process", type_name: "ChildEnd" },
-    RuntimeHeaderType { module_name: "std_process", type_name: "LimitKind" },
-    RuntimeHeaderType { module_name: "std_time", type_name: "Instant" },
-    RuntimeHeaderType { module_name: "std_time", type_name: "Duration" },
-    RuntimeHeaderType { module_name: "std_time", type_name: "Monotonic" },
-]
 let mut transparent_decls: Map[Int, Int] = Map()
 let mut c_mint_seq: Int = 0
 
@@ -62,13 +48,6 @@ let C_BLINK_NAME_PREFIX: Str = "b_"
 let C_MINTED_PREFIX: Str = "_cg_"
 let C_ENSURES_RESULT_STEM: Str = "__ens_rv_"
 let C_OLD_SNAPSHOT_STEM: Str = "__old_"
-
-// Runtime C symbols that a user function must not shadow.
-let blink_reserved: List[Str] = [
-    "list", "map", "set", "bytes", "sb", "closure", "ctx", "task", "threadpool",
-    "handle", "channel", "alloc", "strdup", "ProcessResult", "duration_struct",
-    "instant_struct",
-]
 
 pub fn cname_reset() {
     runtime_owned_decls.clear()
@@ -96,15 +75,6 @@ pub fn cname_is_runtime_owned(td: Int) -> Bool {
     runtime_owned_decls.contains_key(td)
 }
 
-fn is_reserved(name: Str) -> Bool {
-    let mut i = 0
-    while i < blink_reserved.len() {
-        if blink_reserved.get(i).unwrap() == name { return true }
-        i = i + 1
-    }
-    false
-}
-
 // The module segment of a symbol, or "" for the program's own module.
 fn named_module(node: Int) -> Str {
     let m = node_source_module(node)
@@ -115,6 +85,19 @@ fn named_module(node: Int) -> Str {
 fn strip_blink(c_name: Str) -> Str {
     if c_name.starts_with("blink_") { return c_name.byte_slice(6, c_name.byte_len()) }
     c_name
+}
+
+// A name after `blink_`: the class digit for module `m`, the escaped module, then `rest`; or
+// the main-file class digit then `rest` when `m` is the program's own module. A module key is
+// escaped like a name, so module `a_b`'s `c` and module `a`'s `b_c` cannot meet.
+fn classed(m: Str, module_class: Str, main_class: Str, rest: Str) -> Str {
+    if m != "" { return "{module_class}{tc_sym_escape(m)}_{rest}" }
+    "{main_class}{rest}"
+}
+
+// A function or global's name after `blink_`: its class, its module, its name.
+fn value_payload(m: Str, name: Str) -> Str {
+    classed(m, C_CLASS_MODULE_VALUE, C_CLASS_MAIN_VALUE, tc_sym_escape(name))
 }
 
 // ── Functions and globals ────────────────────────────────────────────────────────
@@ -133,15 +116,17 @@ pub fn c_ffi_symbol(fn_node: Int) -> Str {
     node_name(fn_node)
 }
 
-// A user function in the program's own module takes `u_` so it cannot collide with a
-// runtime export; `main` is the C entry point and stays `blink_main`.
+// The program's `main` is the C entry point the runtime calls, so it stays `blink_main`.
+//
+// A foreign binding whose symbol is already `blink_<name>` needs no wrapper: the call goes
+// straight to the symbol, so the binding takes that name. Any other binding is a wrapper this
+// compiler defines, and it takes its class name like any other function.
 pub fn c_fn_decl_name(fn_node: Int) -> Str {
     let name = node_name(fn_node)
-    if get_annotation(fn_node, "ffi") != -1 { return "blink_{name}" }
     let m = named_module(fn_node)
-    if m != "" { return "blink_{m}_{tc_sym_escape(name)}" }
-    if name != "main" { return "blink_u_{tc_sym_escape(name)}" }
-    "blink_{name}"
+    if get_annotation(fn_node, "ffi") != -1 && c_ffi_symbol(fn_node) == "blink_{name}" { return "blink_{name}" }
+    if m == "" && name == "main" { return "blink_main" }
+    "blink_{value_payload(m, name)}"
 }
 
 // A top-level `let` is a C global, and it carries its module the same way a function
@@ -150,10 +135,7 @@ pub fn c_fn_decl_name(fn_node: Int) -> Str {
 // macro stops the unit compiling, and two modules' same-named private globals would be
 // one symbol defined twice.
 pub fn c_global_name(let_node: Int) -> Str {
-    let name = node_name(let_node)
-    let m = named_module(let_node)
-    if m != "" { return "blink_{m}_{tc_sym_escape(name)}" }
-    "blink_u_{tc_sym_escape(name)}"
+    "blink_{value_payload(named_module(let_node), node_name(let_node))}"
 }
 
 // The C function one test block becomes. Nothing outside the unit refers to it: the
@@ -207,21 +189,11 @@ fn is_upper_hex_digit(ch: Int) -> Bool {
     (ch >= 48 && ch <= 57) || (ch >= 65 && ch <= 70)
 }
 
-// The identifier-safe stem of a function: what a mono instance name embeds. The module
-// rides it for the same reason it rides a type's stem — two modules may declare the same
-// generic name, and one C symbol cannot stand for both instances. No `u_` guard, unlike
-// c_fn_decl_name: every mono name carries at least one `_0` argument segment, which no
-// runtime export spells.
-fn c_fn_decl_tag(fn_node: Int) -> Str {
-    let m = named_module(fn_node)
-    if m != "" { return "{m}_{tc_sym_escape(node_name(fn_node))}" }
-    tc_sym_escape(node_name(fn_node))
-}
-
 // A mono instance of a generic function. `args_tid` is the interned tuple of the
-// concrete type arguments; its slots are spelled at TOP position.
+// concrete type arguments; its slots are spelled at TOP position. The module rides the
+// name for the same reason it rides a type's: two modules may declare one generic name.
 pub fn c_mono_fn_name(fn_node: Int, args_tid: Int) -> Str {
-    let stem = tuple_stem(c_fn_decl_tag(fn_node), args_tid)
+    let stem = tuple_stem(value_payload(named_module(fn_node), node_name(fn_node)), args_tid)
     if diag_is_ice_seg(stem) { return stem }
     "blink_{stem}"
 }
@@ -280,39 +252,29 @@ pub fn c_ffi_struct_ptr_name(td: Int) -> Str {
 
 // An @ffi.opaque type is the foreign incomplete type itself, as a pointer.
 pub fn c_type_decl_name(td: Int) -> Str {
-    let name = node_name(td)
     let oc = opaque_c_name(td)
     if oc != "" { return "{oc}*" }
-    if runtime_owned_decls.contains_key(td) { return "blink_{name}" }
-    let m = named_module(td)
-    if m != "" { return "blink_{m}_{tc_sym_escape(name)}" }
-    if takes_builtin_name(name) { return "blink_{tc_sym_escape(name)}_3" }
-    "blink_{tc_sym_escape(name)}"
+    if runtime_owned_decls.contains_key(td) { return "blink_{node_name(td)}" }
+    "blink_{nominal_tag(td)}"
 }
 
-// A main-file type has no module segment, so one that shadows a compiler-known type would
-// otherwise spell the builtin's segment (`Raw`, `Bytes`), and one named like a runtime-owned
-// type would spell that type's runtime.h name. runtime.h is in every unit, so the name is
-// taken whether or not the std module that declares the type is in the program.
-fn takes_builtin_name(name: Str) -> Bool {
-    if tc_is_shadowable_type_name(name) { return true }
-    for t in RUNTIME_HEADER_TYPES {
-        if t.type_name == name { return true }
-    }
-    false
+// A declared type's name after `blink_`. It starts with a digit, which no builtin's segment
+// (`int`, `List`, `Option_str`) does, so a type may take any name a builtin has.
+fn nominal_tag(td: Int) -> Str {
+    classed(named_module(td), C_CLASS_MODULE_TYPE, C_CLASS_MAIN_TYPE, tc_sym_escape(node_name(td)))
 }
 
 // The identifier-safe stem of a type: what a carrier or a mono name embeds. An opaque
-// type's C name holds `*`, so its stem is the escaped Blink name.
+// type's C name holds `*`, so its stem is the one a declared type of its name would take.
 pub fn c_type_decl_tag(td: Int) -> Str {
-    if opaque_c_name(td) != "" { return tc_sym_escape(node_name(td)) }
-    strip_blink(c_type_decl_name(td))
+    if opaque_c_name(td) == "" && runtime_owned_decls.contains_key(td) { return node_name(td) }
+    nominal_tag(td)
 }
 
-// An opaque type's C name is a pointer, so the stem answers here instead. The prefix the
-// stem strips goes back on, which keeps every non-opaque symbol byte-identical.
+// A derived method takes its own class: a variant's discriminant is `<typedef>_<Variant>`,
+// and a variant may be named `eq`.
 pub fn c_derive_method_name(td: Int, method: Str) -> Str {
-    "blink_{c_type_decl_tag(td)}_{tc_sym_escape(method)}"
+    "blink_{C_CLASS_DERIVED}{c_type_decl_tag(td)}_{tc_sym_escape(method)}"
 }
 
 // The same two methods for a key that has no declaration to be named from. A tuple is
@@ -322,38 +284,38 @@ pub fn c_derive_method_name(td: Int, method: Str) -> Str {
 pub fn c_tid_derive_method_name(tid: Int, method: Str) -> Str {
     let name = c_typedef_name(tid)
     if diag_is_ice_seg(name) { return name }
-    "{name}_{tc_sym_escape(method)}"
+    "blink_{C_CLASS_DERIVED}{strip_blink(name)}_{tc_sym_escape(method)}"
+}
+
+// A function this compiler writes for a type, under one word that names its job. No word
+// holds `_`, so the word ends at the first one and no two jobs can share a name.
+fn type_helper_name(word: Str, tid: Int) -> Str {
+    let s = spellable(seg_at(tid, TAGPOS_SYMBOL))
+    if diag_is_ice_seg(s) { return s }
+    "blink_{C_CLASS_TYPE_HELPER}{word}_{s}"
 }
 
 // The walker that copies a value of this type out of an arena. The symbol segment keeps
 // element types, so `List[Int]` and `List[Str]` get two walkers with two bodies.
 pub fn c_promote_walker_name(tid: Int) -> Str {
-    let s = spellable(seg_at(tid, TAGPOS_SYMBOL))
-    if diag_is_ice_seg(s) { return s }
-    "blink_promote_{s}"
+    type_helper_name("promote", tid)
 }
 
 // The function that answers the collector descriptor of a boxed struct. Two instances of
 // one generic struct have two field layouts, so the segment keeps the type arguments.
 pub fn c_gc_layout_name(tid: Int) -> Str {
-    let s = spellable(seg_at(tid, TAGPOS_SYMBOL))
-    if diag_is_ice_seg(s) { return s }
-    "blink_gc_layout_{s}"
+    type_helper_name("gclayout", tid)
 }
 
 // The function that renders a range in its source form. The name keeps the bound type, so
 // `Range[Int]` and `Range[Str]` get two bodies.
 pub fn c_range_debug_name(tid: Int) -> Str {
-    let s = spellable(seg_at(tid, TAGPOS_SYMBOL))
-    if diag_is_ice_seg(s) { return s }
-    "blink_range_debug_{s}"
+    type_helper_name("rangedebug", tid)
 }
 
 // The function that clones a range whose bound type has a written `clone`.
 pub fn c_range_clone_name(tid: Int) -> Str {
-    let s = spellable(seg_at(tid, TAGPOS_SYMBOL))
-    if diag_is_ice_seg(s) { return s }
-    "blink_range_clone_{s}"
+    type_helper_name("rangeclone", tid)
 }
 
 // The first line of a layout function's definition. The per-module declaration scan reads a
@@ -366,31 +328,23 @@ pub fn c_gc_layout_head(name: Str) -> Str {
 // tuple, or an enum that derives nothing. The name keeps element types, so `List[Int]` and
 // `List[Str]` get two bodies, and its prefix keeps it apart from a tuple key's derived eq.
 pub fn c_values_eq_name(tid: Int) -> Str {
-    let s = spellable(seg_at(tid, TAGPOS_SYMBOL))
-    if diag_is_ice_seg(s) { return s }
-    "blink_eq_{s}"
+    type_helper_name("eq", tid)
 }
 
 // A closure's walker is per signature (§5.2.1 clause 7): every closure of one type is
 // copied by the same walk over its own capture descriptors.
 pub fn c_promote_closure_walker_name(tid: Int) -> Str {
-    let s = spellable(seg_at(tid, TAGPOS_SYMBOL))
-    if diag_is_ice_seg(s) { return s }
-    "blink_promote_closure_{s}"
+    type_helper_name("promoteclosure", tid)
 }
 
 // The two per-type entries a capture descriptor names: one moves a capture word that holds
 // the value or its box, the other fills a copied `let mut` cell.
 pub fn c_capture_word_walker_name(tid: Int) -> Str {
-    let s = spellable(seg_at(tid, TAGPOS_SYMBOL))
-    if diag_is_ice_seg(s) { return s }
-    "blink_capture_word_{s}"
+    type_helper_name("captureword", tid)
 }
 
 pub fn c_capture_cell_fill_name(tid: Int) -> Str {
-    let s = spellable(seg_at(tid, TAGPOS_SYMBOL))
-    if diag_is_ice_seg(s) { return s }
-    "blink_capture_cell_{s}"
+    type_helper_name("capturecell", tid)
 }
 
 // One closure literal's capture descriptor table, named after the thunk it describes.
@@ -472,9 +426,7 @@ fn impl_symbol(im: Int, stem: Str) -> Str {
 }
 
 fn impl_symbol_in(m: Str, stem: Str) -> Str {
-    if m != "" { return "blink_{m}_{stem}" }
-    if is_reserved(stem) { return "blink_u_{stem}" }
-    "blink_{stem}"
+    "blink_{classed(m, C_CLASS_MODULE_IMPL, C_CLASS_MAIN_IMPL, stem)}"
 }
 
 pub fn c_impl_method_name(im: Int, mname: Str) -> Str {
@@ -507,11 +459,12 @@ pub fn c_display_dispatch_instance_name(im: Int, args_tid: Int) -> Str {
 
 // ── Mono instances and carriers ──────────────────────────────────────────────────
 
-// THE mono-name producer: escaped base, then `_0` + escaped TOP segment per slot.
+// THE mono-name producer: the base, then `_0` + escaped TOP segment per slot. The base is
+// already a symbol stem, every `_` in it escaped or a separator, so no base holds `_0`.
 // Both a fn instance (slots in a tuple tid) and a struct/enum instance (slots in the
 // instance tid) read their arguments from ty_param_list, so both come here.
 fn mono_stem(base: Str, args_start: Int, args_count: Int, tagpos: Int) -> Str {
-    let mut result = tc_sym_escape(base)
+    let mut result = base
     let mut i = 0
     while i < args_count {
         let seg = spellable(seg_at(ty_param_list.get(args_start + i).unwrap(), tagpos))
@@ -749,14 +702,16 @@ fn handler_tag(t: TypePoolEntry, tid: Int, tagpos: Int) -> Str {
     let root = effect_root_of(tid)
     if diag_is_ice_seg(root) { return root }
     let base = if top_cased(tagpos) { "Handler" } else { "handler" }
-    "{base}_{effect_path_seg(t.name)}"
+    "{base}{effect_path_seg(t.name)}"
 }
 
+// The part count leads, so a reader knows where the path ends when another segment follows
+// it inside a carrier: `Handler1_A_B` is one effect then a type `B`, `Handler2_A_B` is `A.B`.
 fn effect_path_seg(name: Str) -> Str {
-    let mut seg = ""
-    for part in name.split(".") {
-        let esc = tc_sym_escape(part)
-        seg = if seg == "" { esc } else { "{seg}_{esc}" }
+    let parts = name.split(".")
+    let mut seg = "{parts.len()}"
+    for part in parts {
+        seg = "{seg}_{tc_sym_escape(part)}"
     }
     seg
 }
@@ -769,7 +724,7 @@ fn template_tag(t: TypePoolEntry, tagpos: Int) -> Str {
     let ctx = tc_resolve(t.inner1)
     if ctx < 0 || ctx >= ty_pool.len() { return ICE_SEG_TID_OUT_OF_RANGE }
     let c = ty_pool.get(ctx).unwrap()
-    if c.kind == TyKind.Typevar && c.name != "" { return "{base}_{effect_path_seg(c.name)}" }
+    if c.kind == TyKind.Typevar && c.name != "" { return "{base}{effect_path_seg(c.name)}" }
     let inner = seg_at(ctx, child_pos(tagpos))
     if diag_is_ice_seg(inner) { return inner }
     "{base}_{inner}"
@@ -941,13 +896,19 @@ fn effect_root_of(handler_tid: Int) -> Str {
 
 // The vtable struct of a Handler tid. A builtin effect has a runtime-declared vtable, or
 // `blink_<root>_ops_vtable` when this compiler emits it; a user effect gets
-// `blink_ue_<root>_vtable`.
+// `blink_9ue_<root>_vtable`.
 pub fn c_vtable_type_name(handler_tid: Int) -> Str {
     let root = effect_root_of(handler_tid)
     if diag_is_ice_seg(root) { return root }
     if is_compiled_builtin_root(root) { return "blink_{root.to_lower()}_ops_vtable" }
     if is_builtin_effect_root(root) { return "blink_{root.to_lower()}_vtable" }
-    "blink_ue_{root.to_lower()}_vtable"
+    "blink_{user_effect_stem(root)}_vtable"
+}
+
+// A user effect's vtable and its default bodies are helpers this compiler writes, keyed on
+// the root, so they take the type-helper class.
+fn user_effect_stem(root: Str) -> Str {
+    "{C_CLASS_TYPE_HELPER}ue_{tc_sym_escape(root)}"
 }
 
 // The runtime function that promotes a builtin root's vtable. The runtime declares that
@@ -983,7 +944,7 @@ pub fn c_effect_default_op_name(handler_tid: Int, op: Str) -> Str {
     if diag_is_ice_seg(root) { return root }
     if is_compiled_builtin_root(root) { return "blink_{root.to_lower()}_ops_default_{op}" }
     if is_builtin_effect_root(root) { return ICE_SEG_UNHANDLED_KIND }
-    "blink_ue_{root.to_lower()}_default_{op}"
+    "blink_{user_effect_stem(root)}_default_{tc_sym_escape(op)}"
 }
 
 // The slot body of a derived operation of a builtin root whose vtable the runtime declares:

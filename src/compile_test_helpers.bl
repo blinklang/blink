@@ -1,6 +1,7 @@
 import std.path.{path_join, path_basename}
 import std.process.{ProcessResult, ChildEnd}
 import std.fs.{FsErrorExt}
+import cname_class.{C_CLASS_MAIN_IMPL, C_CLASS_MAIN_TYPE, C_CLASS_MAIN_VALUE}
 
 // Whether there is anything at path. A stat that fails for another reason than a missing
 // entry counts as there, so the read that follows reports that error.
@@ -304,76 +305,41 @@ pub fn verify_catalog_entry(code: Str, short_name: Str) ! Process.Spawn {
     assert(res.out.contains(short_name))
 }
 
-// Scan emitted C for struct/enum typedef names beginning with `blink_{base}`
-// (an exact match on `base` itself, or `base` followed by `_`) and return
-// every distinct one found, in first-seen order. Each typedef's closing line
-// has the shape `} blink_<name>;` (see emit_mono_struct_typedef /
-// emit_mono_enum_typedef, src/codegen_stmt.bl) regardless of how <name>'s
-// tail is mangled — this reads the STRUCTURE of that line, not a specific
-// mangling scheme's spelling, so it survives future mangler changes
-// without every caller needing to hardcode an exact mangled name.
-//
-// Deliberately does not care WHAT comes after `blink_{base}` — that is
-// exactly the part a caller should assert about relationally (distinct
-// instantiations produce distinct entries here) rather than by literal
-// spelling.
+// The C name of a declaration in the program's own file is `blink_`, its class digit
+// (src/cname_class.bl) and its escaped name. A monomorphized instance goes on with its
+// arguments at `_0`, which no escaped name holds. So the name after the class digit is an
+// instance of `base` only when it is `base` or starts with `base` and `_0`. `base` is the
+// escaped name: "sum_1list" for a fn `sum_list`, "List_Echoable_echo" for an impl stem.
+fn is_instance_of(name: Str, base: Str) -> Bool {
+    name == base || name.starts_with("{base}_0")
+}
+
+// Every distinct struct or enum typedef that is an instance of the program's own type `base`,
+// in first-seen order, read from each typedef's closing line `} <name>;`. A caller asserts
+// what follows `base` relationally (distinct instances give distinct entries), never by its
+// spelling, so a change to how mono arguments are spelled does not break it.
 pub fn mono_typedef_names(c: Str, base: Str) -> List[Str] {
-    let prefix = "} blink_{base}"
-    let prefix_len = prefix.byte_len()
-    let lines = c.lines()
+    let prefix = "} blink_{C_CLASS_MAIN_TYPE}"
     let mut out: List[Str] = []
-    let mut i = 0
-    while i < lines.len() {
-        let line = lines.get(i).unwrap()
+    for line in c.lines() {
         let trimmed = line.trim()
-        if trimmed.starts_with(prefix) {
-            // trimmed = "} blink_{base}<tail>;" — the char right after the
-            // prefix must be end-of-name (';', an exact match) or '_' (a
-            // separator into the mangled tail); anything else means `base`
-            // is only a PREFIX of some other base's name (e.g. "Box" vs
-            // "BoxOfBoxes") and this line must be skipped.
-            let next_byte = trimmed.byte_at(prefix_len)
-            if next_byte == 59 || next_byte == 95 {
-                let name_start = 2
-                match trimmed.byte_index_of(";", 0) {
-                    Some(semi) => {
-                        if semi > name_start {
-                            let name = trimmed.byte_slice(name_start, semi)
-                            if !out.contains(name) {
-                                out.push(name)
-                            }
-                        }
-                    }
-                    None => {}
-                }
+        if trimmed.starts_with(prefix) && trimmed.ends_with(";") {
+            let end = trimmed.byte_len() - 1
+            let name = trimmed.byte_slice(2, end)
+            if is_instance_of(trimmed.byte_slice(prefix.byte_len(), end), base) && !out.contains(name) {
+                out.push(name)
             }
         }
-        i = i + 1
     }
     out
 }
 
-// True iff at least one typedef named `blink_{base}...` was emitted for `base`.
+// True iff at least one typedef is an instance of the program's own type `base`.
 pub fn has_mono_instance(c: Str, base: Str) -> Int {
     if mono_typedef_names(c, base).len() > 0 { 1 } else { 0 }
 }
 
-// Every byte of `s` except '_' (95), concatenated. Used to compare a `base` against a
-// mangled candidate name while being agnostic to any underscore-escaping scheme the
-// mangler applies — an escape scheme only ever inserts/rewrites '_' bytes, so stripping
-// them from both sides before comparing survives a scheme change without knowing what
-// the scheme is.
-fn strip_underscores(s: Str) -> Str {
-    s.replace("_", "")
-}
-
-// The last occurrence of `needle` in `s` at or before byte offset `before` (exclusive),
-// or -1 if none. Used to find the `blink_` that starts the FUNCTION NAME on a definition
-// line, as opposed to one that starts the RETURN TYPE — a monomorphized struct/enum return
-// type (`blink_RGT_0Int blink_mk_0Int(void) {`) also spells `blink_`, and it comes first,
-// so the naive "first blink_ before the paren" scan picks the return type's name instead
-// of the function's own name. The function name is always the LAST `blink_` immediately
-// preceding the parameter list's `(`, so scanning from the right is unambiguous.
+// The last occurrence of `needle` in `s` that ends at or before byte offset `before`, or -1.
 fn last_index_of_before(s: Str, needle: Str, before: Int) -> Int {
     let needle_len = needle.byte_len()
     if needle_len == 0 { return before }
@@ -392,113 +358,51 @@ fn last_index_of_before(s: Str, needle: Str, before: Int) -> Int {
     result
 }
 
-// The function-symbol twin of mono_typedef_names, for a monomorphized generic FN or
-// poly-impl method (e.g. a `impl[T] Trait[T] for List[T]` method, whose base is itself
-// a compound name like "List_Echoable_echo" — already containing "_" before any
-// mangling happens at all, so a literal "blink_{base}" prefix match would miss it the
-// moment the mangler escapes those pre-existing underscores). A definition line has the
-// shape `<ret-type> blink_<mangled-name>(<params>) {` (see e.g. emit_fn_def /
-// emit_poly_impl_call, src/codegen_stmt.bl / codegen_methods.bl) — this reads that
-// structure, comparing underscore-STRIPPED names, so it survives future mangler changes
-// without needing to know what escaping scheme (if any) is in play.
-//
-// Uses the LAST `blink_` before the paren, not the first — a monomorphized-struct return
-// type (e.g. `blink_RGT_0Int blink_mk_0Int(void) {`) also spells `blink_`, and it precedes
-// the function name's own `blink_`, so the first-match scan a prior version of this
-// function used would misidentify the return type as the function name and never find
-// the real one (a real, reproduced defect — see tests/test_monomorphized_typedef_names_helper.bl's
-// "mono_fn_names: a monomorphized struct return type does not shadow the fn name" row).
-pub fn mono_fn_names(c: Str, base: Str) -> List[Str] {
-    let stripped_base = strip_underscores(base)
-    let lines = c.lines()
+// Every distinct function of class `class` that is DEFINED (not only declared) as an instance
+// of `base`, in first-seen order. A definition line is `<ret-type> <name>(<params>) {`. The
+// name is the LAST class-prefixed `blink_` before the paren, because a monomorphized struct
+// return type comes first on the line and also starts `blink_`.
+fn defined_fn_names(c: Str, class: Str, base: Str) -> List[Str] {
+    let prefix = "blink_{class}"
     let mut out: List[Str] = []
-    let mut i = 0
-    while i < lines.len() {
-        let line = lines.get(i).unwrap()
+    for line in c.lines() {
         let trimmed = line.trim()
-        match trimmed.byte_index_of("(", 0) {
-            Some(paren) => {
-                if paren > 0 && trimmed.ends_with(") \{") {
-                    let blink_at = last_index_of_before(trimmed, "blink_", paren)
-                    if blink_at >= 0 && blink_at < paren {
-                        let name = trimmed.byte_slice(blink_at, paren)
-                        let tail = trimmed.byte_slice(blink_at + 6, paren)
-                        let stripped_tail = strip_underscores(tail)
-                        if stripped_tail.starts_with(stripped_base) {
-                            if !out.contains(name) {
-                                out.push(name)
-                            }
+        if trimmed.ends_with(") \{") {
+            match trimmed.byte_index_of("(", 0) {
+                Some(paren) => {
+                    let at = last_index_of_before(trimmed, prefix, paren)
+                    if at >= 0 {
+                        let name = trimmed.byte_slice(at, paren)
+                        if is_instance_of(trimmed.byte_slice(at + prefix.byte_len(), paren), base) && !out.contains(name) {
+                            out.push(name)
                         }
                     }
                 }
+                None => {}
             }
-            None => {}
         }
-        i = i + 1
     }
     out
 }
 
-// True iff at least one function named `blink_{base}...` was DEFINED (not merely
-// declared/prototyped) for `base`.
+// Every distinct instance of the program's own generic fn `base` (see is_instance_of).
+pub fn mono_fn_names(c: Str, base: Str) -> List[Str] {
+    defined_fn_names(c, C_CLASS_MAIN_VALUE, base)
+}
+
+// True iff at least one instance of the program's own generic fn `base` is defined.
 pub fn has_mono_fn_instance(c: Str, base: Str) -> Int {
     if mono_fn_names(c, base).len() > 0 { 1 } else { 0 }
 }
 
-// KNOWN COUPLING: unlike mono_typedef_names/mono_fn_names, this helper DOES
-// assume today's _0/_1 escape scheme (src/cname.bl:mono_stem).
-// It exists only because a poly-impl-on-builtin base (e.g. "List_Echoable_echo")
-// already contains '_' before mangling, and underscore-stripping alone can't
-// disambiguate escaped digits from real name characters. If mono_stem's
-// scheme changes, THIS helper (and only this one) needs a matching update.
-// `base` is the generic's C stem, whose name parts are already escaped: a fn
-// `sum_list` is "sum_1list".
-//
-// Rather than reverse-engineer the mangled tail, this forward-applies the same
-// escape (`_` -> `_1`) to `base` locally, then does a literal `blink_{escaped}`
-// prefix match on a function-definition line — the same line shape mono_fn_names
-// scans. It copies typecheck's tc_sym_escape rather than importing it, so that a
-// test using these helpers does not compile the whole checker.
-fn escape_mono_seg_for_test(s: Str) -> Str {
-    s.replace("_", "_1")
-}
-
+// Every distinct instance of the impl method whose C stem is `base`, for an impl in the
+// program's own file. The stem holds the receiver, trait and method names, each escaped and
+// joined by `_` ("List_Echoable_echo").
 pub fn poly_impl_fn_names(c: Str, base: Str) -> List[Str] {
-    let prefix = "blink_{escape_mono_seg_for_test(base)}"
-    let prefix_len = prefix.byte_len()
-    let lines = c.lines()
-    let mut out: List[Str] = []
-    let mut i = 0
-    while i < lines.len() {
-        let line = lines.get(i).unwrap()
-        let trimmed = line.trim()
-        match trimmed.byte_index_of("(", 0) {
-            Some(paren) => {
-                if paren > 0 && trimmed.ends_with(") \{") {
-                    // Same shadow hazard mono_fn_names has: a monomorphized-struct return
-                    // type can also match `prefix` and precede the fn name on the line, so
-                    // find the LAST match before the paren, not the first.
-                    let blink_at = last_index_of_before(trimmed, prefix, paren)
-                    if blink_at >= 0 && blink_at < paren {
-                        let after = trimmed.byte_at(blink_at + prefix_len)
-                        if after == 40 || after == 95 {
-                            let name = trimmed.byte_slice(blink_at, paren)
-                            if !out.contains(name) {
-                                out.push(name)
-                            }
-                        }
-                    }
-                }
-            }
-            None => {}
-        }
-        i = i + 1
-    }
-    out
+    defined_fn_names(c, C_CLASS_MAIN_IMPL, base)
 }
 
-// True iff at least one function named `blink_{escaped base}...` was DEFINED
-// for `base`, under today's _0/_1 escape scheme. See poly_impl_fn_names.
+// True iff at least one instance of the impl method whose C stem is `base` is defined.
 pub fn has_poly_impl_fn_instance(c: Str, base: Str) -> Int {
     if poly_impl_fn_names(c, base).len() > 0 { 1 } else { 0 }
 }

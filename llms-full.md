@@ -1910,7 +1910,7 @@ Timeline for `with h1, arena, h2 { body }`:
 3. `h2.enter()`
 4. `body` executes; produces `tail` allocated inside the inner arena
 5. `h2.exit(ok)` — **pre-promotion**: `tail` still points into the inner arena
-6. `blink_promote_<T>(tail, snapshot_target)` — deep-copies `tail` into the
+6. `blink_9promote_<T>(tail, snapshot_target)` — deep-copies `tail` into the
    allocator captured at step 2
 7. `arena.exit(ok)` — restores TLS, destroys the inner arena
 8. `h1.exit(ok)` — **post-promotion**: observes the promoted `tail`
@@ -1952,7 +1952,7 @@ GC heap. No handler-stack walk, no extra TLS slots — see spec §5.2.1 pt 4.
 Closure-typed tails whose captures include other closures (or arena-allocated
 values reachable through those closures) now promote correctly. Each
 `blink_closure` carries a per-capture type-descriptor table; the generated
-`blink_promote_closure_<Mangled>` walks it and recurses structurally, so a
+`blink_9promoteclosure_<Mangled>` walks it and recurses structurally, so a
 closure capturing a closure capturing a list-of-records deep-copies in one
 pass. See `decisions/arena-nested-closure-capture-promotion.md`.
 

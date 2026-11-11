@@ -1,0 +1,64 @@
+// Every C name the compiler makes for a user declaration is `blink_` plus one class digit
+// (src/cname.bl). A user name can never collide with a runtime name only while no runtime name
+// starts `blink_<digit>`: the runtime headers, the vendored C in lib/native, and the names the
+// compiler spells by hand in src/. Only src/cname.bl may build a class-digit name.
+
+import compile_test_helpers
+
+// Each `file:line:name` hit for `pattern` in `paths`. A grep that fails to run shows up as a
+// line too, so the check cannot pass unrun.
+fn grep_hits(pattern: Str, paths: Str) -> List[Str] ! Process.Spawn {
+    let out = compile_test_helpers.sh("grep -rHnoE '{pattern}' {paths}; rc=$?; [ $rc -le 1 ] || echo \"grep failed: $rc\"")
+    if out == "" { [] } else { out.split("\n") }
+}
+
+// A `blink_` name built by interpolation: `blink_`, a hole, and the rest of the name.
+let INTERPOLATED_NAME: Str = "blink_[\{][^}]*[}][A-Za-z0-9_]*"
+
+fn class_digit_names(paths: Str) -> List[Str] ! Process.Spawn {
+    grep_hits("\\bblink_[0-9][A-Za-z0-9_]*", paths)
+}
+
+test "no runtime header spells a class-digit name" {
+    assert_eq(class_digit_names("bootstrap/runtime*.h"), [])
+}
+
+test "no vendored C in lib spells a class-digit name" {
+    assert_eq(class_digit_names("--include=*.c --include=*.h lib/"), [])
+}
+
+test "no compiler source but cname.bl spells a class-digit name as a literal" {
+    assert_eq(class_digit_names("--include=*.bl --exclude=cname.bl src/"), [])
+}
+
+// A name built as "blink_\{x}" can take any class digit x holds, so only cname.bl may build
+// one. compile_test_helpers.bl builds such names only to find them in emitted C. The one other
+// site is `blink shim init`, which writes the user's own C symbol into a new shim and never
+// declares it in the program the compiler emits.
+test "no compiler source but cname.bl builds a blink_ name by interpolation" {
+    let hits = grep_hits(INTERPOLATED_NAME, "--include=*.bl --exclude=cname.bl --exclude=compile_test_helpers.bl src/")
+    let others = hits.filter(fn(h) { !h.starts_with("src/cli.bl:") || !h.ends_with(":blink_\{name}_hello") })
+    assert_eq(others, [])
+}
+
+test "the check sees a class-digit name when a file spells one" {
+    let dir = compile_test_helpers.scratch_root()
+    fs.write("{dir}/r.h", "int blink_3list_new(void);\nint blink_list_new(void);\n").unwrap()
+    let found = class_digit_names("{dir}/r.h")
+    assert_eq(found.len(), 1)
+    assert(found.get(0).unwrap().ends_with(":1:blink_3list_new"))
+}
+
+test "the check sees an interpolated blink_ name when a file builds one" {
+    let dir = compile_test_helpers.scratch_root()
+    fs.write("{dir}/r.bl", "fn f(x: Str) -> Str \{ \"blink_\{x}_y\" }\n").unwrap()
+    let found = grep_hits(INTERPOLATED_NAME, "{dir}/r.bl")
+    assert_eq(found.len(), 1)
+    assert(found.get(0).unwrap().ends_with(":1:blink_\{x}_y"))
+}
+
+test "the check reports a grep that cannot run" {
+    let found = class_digit_names("/nonexistent/blink_classdigit_dir")
+    assert_eq(found.len(), 1)
+    assert(found.get(0).unwrap().starts_with("grep failed"))
+}
