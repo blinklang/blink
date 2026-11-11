@@ -1,0 +1,171 @@
+// An empty `[]`, a `Map()` or a struct literal whose type parameter no field reaches builds and
+// runs when a later use, an annotation, a parameter or a return type gives it its type
+// (sections/03_types.md §3.4 *Under-Determined Types*: "Later use still determines the type").
+// A hole whose Display impl has a bound, written inline, in a where clause or through a
+// supertrait, prints at the type a later push fills. A program whose generic types live in
+// another module prints the same text in the one-unit and the per-module build.
+
+import std.fs
+import std.process.{ProcessResult}
+import compile_test_helpers.{scratch_root}
+
+trait Tag { fn tag(self) -> Int }
+
+impl Tag for Int {
+    fn tag(self) -> Int { self * 2 }
+}
+
+trait Tag2: Tag { fn two(self) -> Int }
+
+impl Tag2 for Int {
+    fn two(self) -> Int { self }
+}
+
+type W[T] { n: Int }
+
+type B[X] { xs: List[X] }
+
+type Cx[T] { v: List[T] }
+
+impl[T: Tag] Display for Cx[T] {
+    fn fmt(self, sb: StringBuilder) { sb.write("cx{self.v.get(0).unwrap().tag()}") }
+}
+
+type Cw[T] { v: List[T] }
+
+impl[T] Display for Cw[T] where T: Tag {
+    fn fmt(self, sb: StringBuilder) { sb.write("cw{self.v.get(0).unwrap().tag()}") }
+}
+
+type Cs[T] { v: List[T] }
+
+impl[T: Tag2] Display for Cs[T] {
+    fn fmt(self, sb: StringBuilder) { sb.write("cs{self.v.get(0).unwrap().two()}") }
+}
+
+fn empty_ints() -> List[Int] { [] }
+
+fn count(xs: List[Int]) -> Int { xs.len() }
+
+fn wint() -> W[Int] { W { n: 4 } }
+
+fn pick[T](_w: W[T], x: T) -> T { x }
+
+fn usew[T](w: W[T]) -> Int { w.n }
+
+test "a hole a later push fills prints when its Display bound is inline, in a where clause or through a supertrait" {
+    let mut xs = []
+    let mut ys = []
+    let mut zs = []
+    let mut out = ""
+    for i in 0..2 {
+        if i > 0 {
+            out = "{Cx { v: xs }} {Cw { v: ys }} {Cs { v: zs }}"
+        }
+        xs.push(1)
+        ys.push(2)
+        zs.push(3)
+    }
+    assert_eq(out, "cx2 cw4 cs3")
+}
+
+test "an empty list an annotation, a parameter or a return type types runs" {
+    let typed: List[Int] = []
+    assert_eq("{typed == []} {[] == typed} {empty_ints().len()} {count([])}", "true true 0 0")
+}
+
+test "an empty list argument the receiver types runs" {
+    let nested: List[List[Int]] = [[1]]
+    assert_eq(nested.contains([]), false)
+    assert_eq(nested.contains([1]), true)
+}
+
+test "a Map construction with its type arguments written runs" {
+    assert_eq(Map[Str, Int]().len() + Map.new[Str, Int]().len(), 0)
+}
+
+test "an empty list and a Map a later use fills run" {
+    let mut xs = []
+    xs.push(5)
+    let mut m = Map()
+    m.insert("k", 1)
+    assert_eq("{xs.len()} {m.len()} {m.get("k").unwrap()}", "1 1 1")
+}
+
+test "a struct literal an annotation or a return type types runs" {
+    let w: W[Str] = W { n: 2 }
+    let mut b = B { xs: [] }
+    let c: B[Int] = b
+    assert_eq("{w.n} {wint().n} {c.xs.len()}", "2 4 0")
+}
+
+test "an empty List.new a later push fills runs" {
+    let mut l = List.new()
+    l.push("a")
+    let mut c = List.with_capacity(2)
+    c.push(7)
+    assert_eq("{l.len()} {c.get(0).unwrap()}", "1 7")
+}
+
+test "a struct literal whose type parameter another argument of a generic call fills runs" {
+    assert_eq(pick(W { n: 1 }, 5), 5)
+    assert_eq(pick(W { n: 1 }, "s"), "s")
+    let w: W[Int] = W { n: 6 }
+    assert_eq(usew(w), 6)
+}
+
+fn sh(cmd: Str) -> ProcessResult ! Process.Spawn {
+    process.run("sh", ["-c", cmd]).unwrap()
+}
+
+let shapes_src = [
+    "pub trait Tag \{ fn tag(self) -> Int }",
+    "impl Tag for Int \{ fn tag(self) -> Int \{ self * 2 } }",
+    "pub type W[T] \{ n: Int }",
+    "pub type Cx[T] \{ v: List[T] }",
+    "impl[T] Display for Cx[T] where T: Tag \{",
+    "    fn fmt(self, sb: StringBuilder) \{ sb.write(\"cx\{self.v.get(0).unwrap().tag()}\") }",
+    "}",
+    "pub fn wint() -> W[Int] \{ W \{ n: 4 } }",
+    "pub fn empty_ints() -> List[Int] \{ [] }",
+    "pub fn pick[T](_w: W[T], x: T) -> T \{ x }",
+    "",
+].join("\n")
+
+let main_src = [
+    "import shapes.\{W, Cx, wint, empty_ints, pick}",
+    "fn main() \{",
+    "    let mut xs = []",
+    "    let mut out = \"\"",
+    "    for i in 0..2 \{",
+    "        if i > 0 \{ out = \"\{Cx \{ v: xs }}\" }",
+    "        xs.push(5)",
+    "    }",
+    "    let w: W[Str] = W \{ n: 2 }",
+    "    let typed: List[Int] = []",
+    "    let mut m = Map()",
+    "    m.insert(\"k\", 1)",
+    "    let mut l = List.new()",
+    "    l.push(9)",
+    "    io.println(out)",
+    "    io.println(\"\{w.n} \{wint().n} \{typed == []} \{empty_ints().len()} \{m.len()} \{pick(W \{ n: 1 }, 5)} \{l.len()}\")",
+    "}",
+    "",
+].join("\n")
+
+test "values typed by a later use or an annotation across modules print the same in each build" {
+    let root = "{scratch_root()}/later_typed_value_pkg_{getpid()}"
+    let _ = sh("rm -rf {root} && mkdir -p {root}/src")
+    fs.write("{root}/blink.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\n").unwrap()
+    fs.write("{root}/src/shapes.bl", shapes_src).unwrap()
+    fs.write("{root}/src/main.bl", main_src).unwrap()
+    let blink = sh("readlink -f build/blink").out.trim()
+    let want = "cx10\n2 4 true 0 1 5 1\n"
+    let mut failed: List[Str] = []
+    for mode in ["--no-per-module", "--per-module"] {
+        let r = sh("cd {root} && env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE timeout 300 {blink} run {mode} src/main.bl < /dev/null 2>&1")
+        if !r.success() || !r.out.ends_with(want) { failed.push("blink run {mode}: {r.end}\n{r.out}") }
+    }
+    let _ = sh("rm -rf {root}")
+    assert_eq(failed, [])
+}

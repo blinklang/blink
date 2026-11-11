@@ -3221,7 +3221,7 @@ let mut tc_ud_blamed: Map[Int, Int] = Map()
 // record of a node is the one that counts. A group in tc_calls.open_tids is one of
 // [sig, self_offset, n, tid..., open...] (tc_note_generic_call),
 // [-1, im, n, tid...] (tc_note_conversion_call), [-1, -1, 1, ctor] (tc_note_open_ctor_key),
-// [-2, -1, 0] (tc_note_deferred_conversion), [-3, -1, 0] (tc_note_open_variant),
+// [-1, -1, 1, -1] (tc_drop_deferred_conversion), [-2, -1, 0] (tc_note_deferred_conversion), [-3, -1, 0] (tc_note_open_value),
 // [-4, sig, tid, n, binder..., enclosing fn] (tc_note_fn_value),
 // [-5, owner, 0] (tc_note_void_return) or
 // [-6, im, n, tid..., call, receiver] (tc_note_static_impl_call).
@@ -3777,7 +3777,7 @@ fn tc_note_conversion_call(im: Int, call_node: Int, binds: Map[Str, Int]) {
 // A static call through a type head whose impl has binders, as the group
 // [-6, im, n, tid..., call, receiver]. The head is no value, so it is the key,
 // and the call node keeps its own group. A binder that the call's value or its receiver
-// carries is judged with that value (tc_note_open_variant); the flush blames the head for any
+// carries is judged with that value (tc_note_open_value); the flush blames the head for any
 // other binder.
 fn tc_note_static_impl_call(head: Int, im: Int, call_node: Int, recv: Int, binds: Map[Str, Int]) {
     if tc_boundary_check_active == 0 || head < 0 { return }
@@ -3797,7 +3797,7 @@ fn tc_note_static_impl_call(head: Int, im: Int, call_node: Int, recv: Int, binds
 // nothing pins names none to build. The flush judges it as an open construction.
 fn tc_note_open_method_receiver(recv: Int, recv_t: Int) {
     if recv < 0 || tc_scrut_is_named_place(recv) != 0 { return }
-    let _ = tc_note_open_variant(recv, recv_t)
+    let _ = tc_note_open_value(recv, recv_t)
 }
 
 fn tc_open_group_is_static_impl(g: Int) -> Bool {
@@ -4068,11 +4068,12 @@ fn tc_open_group_is_deferred_conversion(g: Int) -> Bool {
     tc_calls.open_tids.get(g).unwrap() == -2
 }
 
-// A variant construction whose instance has a slot open here, as the group [-3, -1, 0]. Its
-// value may go where no binding holds it (a method receiver, a statement, `let _`), so the
-// construction itself is what the flush judges. The flush reads the type off the node, the
+// A construction whose type has a slot open here (a variant, an empty `[]`, a generic struct
+// literal), as the group [-3, -1, 0]. Its value may go where no binding holds it (a receiver, a
+// field base, an operand, an argument, a hole, a statement, `let _`), so the construction itself
+// is what the flush judges. The flush reads the type off the node, the
 // one codegen reads, since a later walk of the node mints fresh metavariables.
-fn tc_note_open_variant(node: Int, tid: Int) -> Int {
+fn tc_note_open_value(node: Int, tid: Int) -> Int {
     if tc_boundary_check_active == 0 || node < 0 { return tid }
     if tc_tid_has_unbound_metavar(tid) == 0 { return tid }
     let g = tc_calls.open_group.get(node) ?? -1
@@ -4116,13 +4117,13 @@ fn tc_returns_since(mark: Int) -> List[Int] {
     out
 }
 
-fn tc_open_group_is_variant(g: Int) -> Bool {
+fn tc_open_group_is_open_value(g: Int) -> Bool {
     tc_calls.open_tids.get(g).unwrap() == -3
 }
 
 fn tc_node_judged_as_value(node: Int) -> Bool {
     let g = if node < 0 { -1 } else { tc_calls.open_group.get(node) ?? -1 }
-    g >= 0 && tc_open_group_is_variant(g)
+    g >= 0 && tc_open_group_is_open_value(g)
 }
 
 // A reference to a generic function's name, with the type it has as a value and the metavars
@@ -4182,8 +4183,9 @@ fn tc_ud_flush_conversion_call(call_node: Int, g: Int) ! Diag.Report {
 }
 
 // A Map()/Set() construction that names no type arguments, as a group of its own:
-// [-1, -1, 1, ctor] when the key is open here, else [-1, -1, 1, -1], so a walk that found it
-// closed clears an earlier record. The flush judges the key once inference is done.
+// [-1, -1, 1, ctor] when the key is open here, else [-1, -1, 1, -1], so a walk that found
+// it closed clears an earlier record. The flush judges the key, and the value as a whole, once
+// inference is done.
 fn tc_note_open_ctor_key(node: Int, ctor: Int) {
     if tc_boundary_check_active == 0 || node < 0 || ctor < 0 { return }
     let t = tc_resolve(ctor)
@@ -4196,15 +4198,6 @@ fn tc_note_open_ctor_key(node: Int, ctor: Int) {
     tc_calls.open_tids.push(-1)
     tc_calls.open_tids.push(1)
     tc_calls.open_tids.push(if tc_tid_has_unbound_metavar(ty_pool.get(t).unwrap().inner1) != 0 { t } else { -1 })
-    tc_calls.open_tids.push(if tc_open_group_is_receiver(g) { 1 } else { 0 })
-}
-// A receiver has no later binding or parameter to give its key a type, so the flush judges it.
-fn tc_note_open_receiver(node: Int) {
-    let g = tc_calls.open_group.get(node) ?? -1
-    if tc_open_group_has_open_key(g) { tc_calls.open_tids.set(g + 4, 1) }
-}
-fn tc_open_group_is_receiver(g: Int) -> Bool {
-    tc_open_group_has_open_key(g) && tc_calls.open_tids.get(g + 4).unwrap() == 1
 }
 
 // The Hash judgment of a recorded group, made once inference is done (see
@@ -4553,20 +4546,39 @@ fn tc_check_fn_bounds_at(sig: Int, tids: List[Int], node: Int) ! TypeCheck.Resol
     tc_check_bounds_for_binds(sig, binds, node)
 }
 
-// Report each recorded variant construction whose type is still open once inference is
-// done and no binding, call or scrutinee has answered for it. This runs after those reports,
+// Report each recorded construction whose type is still open once inference is done and no
+// binding, call or scrutinee has answered for it. This runs after those reports,
 // so a `let` that holds the value keeps the blame, as the spec places it (§3.4 *What pins
 // `E`*), and only a value no binding holds is blamed at its constructor.
-fn tc_ud_flush_open_variants() ! Diag.Report {
+fn tc_ud_flush_open_values() ! Diag.Report {
+    let mut unclaimed_operands: Map[Int, Int] = Map()
+    let mut scanned = false
     for node in tc_calls.open_calls {
         let g = tc_calls.open_group.get(node).unwrap()
-        if tc_open_group_is_variant(g) || tc_open_group_is_receiver(g) { tc_ud_judge_open_value(node) }
+        // A Map()/Set() construction is a value like any other, so it is judged wherever it goes.
+        let is_ctor = tc_calls.open_tids.get(g).unwrap() == -1 && tc_node_is_empty_ctor(node)
+        if !tc_open_group_is_open_value(g) && !is_ctor { continue }
+        // A call no method answers is reported after this flush, and that report is the one
+        // its receiver and arguments get.
+        if !scanned {
+            unclaimed_operands = tc_unclaimed_call_operands()
+            scanned = true
+        }
+        if unclaimed_operands.contains_key(node) { continue }
+        tc_ud_judge_open_value(node)
     }
 }
 
-// A key the group's walk left open has no operations for codegen to choose, whatever reads it.
-fn tc_open_group_has_open_key(g: Int) -> Bool {
-    g >= 0 && tc_calls.open_tids.get(g).unwrap() == -1 && tc_calls.open_tids.get(g + 1).unwrap() == -1 && tc_calls.open_tids.get(g + 3).unwrap() >= 0
+fn tc_unclaimed_call_operands() -> Map[Int, Int] {
+    let mut out: Map[Int, Int] = Map()
+    for uc in tc_unclaimed_call_nodes() {
+        if node_kind(uc) != NodeKind.MethodCall { continue }
+        out.insert(node_obj(uc), 1)
+        let args = node_args(uc)
+        if args == -1 { continue }
+        for i in 0..sublist_length(args) { out.insert(sublist_get(args, i), 1) }
+    }
+    out
 }
 
 fn tc_ud_judge_open_value(node: Int) ! Diag.Report {
@@ -10636,7 +10648,7 @@ fn tc_bind_hof_result(node: Int, cls: Int, method: Str, recv_kind: TyKind, diag_
     // here is reported at the end if no expected type fills it (sections/03_types.md: inference
     // never chooses `Never` for a slot the program left open).
     if ret >= 0 && tc_resolve(ret) == TYPE_NEVER {
-        let _ = tc_note_open_variant(node, tc_lookup_node_tid(node))
+        let _ = tc_note_open_value(node, tc_lookup_node_tid(node))
         return
     }
     let mut produced = ret
@@ -10661,7 +10673,7 @@ fn tc_bind_hof_result(node: Int, cls: Int, method: Str, recv_kind: TyKind, diag_
     }
     if tc_is_unbound_metavar(tc_resolve(slot)) != 0 {
         bind_metavar(slot, produced)
-        let _ = tc_note_open_variant(node, tc_lookup_node_tid(node))
+        let _ = tc_note_open_value(node, tc_lookup_node_tid(node))
         return
     }
     if types_compatible(tc_resolve(slot), produced) == 0 {
@@ -14316,13 +14328,15 @@ fn tc_bind_struct_lit_fields(stid: Int, bare: Str, flds_sl: Int, tparams_sl: Int
 // Each parameter unifies its field bind with its expected-instance bind, which solves the
 // metavars of an empty `Map()`/`Set()` field. A failed unify is a concrete clash, so the
 // field bind stays and the let, argument or return comparison reports the mismatch.
+// A hint that names another declaration's parameter (a generic callee's `W[T]`, an outer
+// literal's field type) gives no type here, so that parameter stays unreached.
 fn tc_fill_binds_from_hint(bare: Str, hint: Int, tparams_sl: Int, binds: Map[Str, Int]) {
     let mut hbinds: Map[Str, Int] = Map()
     tc_bind_tparams_from_instance(bare, hint, tparams_sl, hbinds)
     for key in hbinds.keys() {
         let h = hbinds.get(key) ?? -1
         let prev = binds.get(key) ?? -1
-        if h < 0 { continue }
+        if h < 0 || tc_tid_has_foreign_typevar(h) != 0 { continue }
         if prev < 0 {
             binds.insert(key, h)
         } else if tc_unify(prev, h) != 0 && tc_bind_has_hole(prev) != 0 && tc_bind_has_hole(h) == 0 {
@@ -14365,8 +14379,8 @@ fn tc_struct_lit_instance_tid(stid: Int, node: Int) -> Int ! TypeCheck.Resolve, 
         tc_fill_binds_from_hint(bare, resolve_alias_tid(tc_construct_hint), tparams_sl, binds)
     }
     // Decide whether any type-param bound to a concrete type BEFORE building the
-    // arg list, so the no-concrete fallback does not mint throwaway pool entries on
-    // the hot inference path — it returns the bare tid untouched. "Concrete" here
+    // arg list, so a literal whose params are all bound to unknown does not mint
+    // throwaway pool entries on the hot inference path. "Concrete" here
     // excludes BOTH a typevar AND TYPE_UNKNOWN: an empty `Map()`/`Set()` field binds
     // its param to TYPE_UNKNOWN (make_map_type(TYPE_UNKNOWN,..)), and an instance
     // whose args are all unknown carries no more information than the bare tid.
@@ -14389,20 +14403,24 @@ fn tc_struct_lit_instance_tid(stid: Int, node: Int) -> Int ! TypeCheck.Resolve, 
     // inside `fn wrap_and_build[T](...)`). A bare-head instance has no param slot
     // for wrap_and_build's OWN monomorphization (T:=Int) to substitute into, so
     // the callee's mono symbol permanently erases to the undeclared generic head
-    // (blink_Box instead of blink_Box_Int). Minting with the raw typevar in the
-    // slot (make_typevar(tpname), below) is safe: get_struct_field_tid/
+    // (blink_Box instead of blink_Box_Int). Minting with the bound typevar in the
+    // slot is safe: get_struct_field_tid/
     // tc_struct_base_tid normalize any instance back to its base decl tid by
     // name regardless of slot contents.
     let mut has_bare_typevar = 0
+    // A parameter no field value and no hint reaches is open, as an empty field's is: only an
+    // annotation or a later use determines it (sections/03_types.md *Under-Determined Types*).
+    let mut has_unreached = 0
     let mut ci = 0
     while ci < sublist_length(tparams_sl) {
         let bound = binds.get(node_name(sublist_get(tparams_sl, ci))) ?? -1
         if bound != -1 && type_kind(bound) != TyKind.Typevar && type_kind(bound) != TyKind.Unknown { has_concrete = 1 }
         if bound != -1 && tc_tid_has_unbound_metavar(bound) != 0 { has_open_metavar = 1 }
         if bound != -1 && type_kind(bound) == TyKind.Typevar { has_bare_typevar = 1 }
+        if bound == -1 { has_unreached = 1 }
         ci = ci + 1
     }
-    if has_concrete == 0 && has_open_metavar == 0 && has_bare_typevar == 0 { return stid }
+    if has_concrete == 0 && has_open_metavar == 0 && has_bare_typevar == 0 && has_unreached == 0 { return stid }
     let mut arg_tids: List[Int] = []
     let mut ti = 0
     while ti < sublist_length(tparams_sl) {
@@ -14412,7 +14430,7 @@ fn tc_struct_lit_instance_tid(stid: Int, node: Int) -> Int ! TypeCheck.Resolve, 
         if bound != -1 {
             arg_tids.push(bound)
         } else {
-            arg_tids.push(make_typevar_bound(tpname, tp))
+            arg_tids.push(make_metavar())
         }
         ti = ti + 1
     }
@@ -24975,13 +24993,13 @@ fn tc_alias_carrier_call_tid(head: Int, spelled: Str, variant: Str, args_sl: Int
     } else if variant == "Ok" && tc_unify(slot, TYPE_VOID) == 0 {
         tc_report_declared_mismatch("{spelled}: expected {type_to_str(slot)} but got ()", node, node, slot, TYPE_VOID)
     }
-    tc_note_open_variant(node, head)
+    tc_note_open_value(node, head)
 }
 
 // A carrier variant named with no argument list, bare (`None`) or qualified (`Option.None`).
 // Only None is a value on its own. `spelled` is the name as written.
 fn tc_carrier_nullary_tid(variant: Str, spelled: Str, node: Int) -> Int ! TypeCheck.Report, Diag.Report {
-    if variant == "None" { return tc_note_open_variant(node, make_option_type(tc_carrier_slot_from_hint(TyKind.Option, 1))) }
+    if variant == "None" { return tc_note_open_value(node, make_option_type(tc_carrier_slot_from_hint(TyKind.Option, 1))) }
     let (fewest, most) = tc_carrier_arity(variant)
     let want = if fewest == most { "{most}" } else { "{fewest} or {most}" }
     tc_report_payload_variant_value(variant, want, "fn(x) \{ {spelled}(x) \}", node)
@@ -24993,7 +25011,7 @@ fn tc_carrier_nullary_tid(variant: Str, spelled: Str, node: Int) -> Int ! TypeCh
 // (E0320) has no settled field list to offer, so its uses report nothing more.
 fn tc_declared_variant_value_tid(enum_tid: Int, var_idx: Int, spelled: Str, node: Int) -> Int ! TypeCheck.Report, Diag.Report {
     let n = variant_field_count(var_idx)
-    if n == 0 { return tc_note_open_variant(node, tc_nullary_variant_tid(enum_tid, var_idx)) }
+    if n == 0 { return tc_note_open_value(node, tc_nullary_variant_tid(enum_tid, var_idx)) }
     if tc_variant_mixes_fields(var_idx) { return tc_error_recovery_tid() }
     let mut params: List[Str] = []
     let mut names: List[Str] = []
@@ -25072,7 +25090,7 @@ fn tc_check_carrier_payload(variant: Str, args_sl: Int, call_node: Int) -> Bool 
 // that constrains it; an unconstrained one trips the E0301 region boundary. The singleton is
 // excluded from that boundary check, so it must not stand in for an inferable slot.
 fn tc_carrier_call_tid(variant: Str, args_sl: Int, call_node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
-    tc_note_open_variant(call_node, tc_carrier_call_instance_tid(variant, args_sl, call_node))
+    tc_note_open_value(call_node, tc_carrier_call_instance_tid(variant, args_sl, call_node))
 }
 
 fn tc_carrier_call_instance_tid(variant: Str, args_sl: Int, call_node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
@@ -25324,7 +25342,7 @@ fn tc_infer_bare_variant_call(node: Int, fn_name: Str, vpick: BareVariantPick) -
             // A generic-enum variant (`Leaf(1)`) reverse-infers its concrete
             // instance tid (`Tree[Int]`) from the ctor args so codegen mono's
             // it; a non-generic enum keeps the bare tid.
-            Some(tc_note_open_variant(node, tc_enum_ctor_instance_tid(venum, var_idx, node_args(node), payload_tids)))
+            Some(tc_note_open_value(node, tc_enum_ctor_instance_tid(venum, var_idx, node_args(node), payload_tids)))
         }
         BareVariantPick.Ambiguous(carrier, enums) => {
             tc_report_ambiguous_construction(fn_name, carrier, enums, node)
@@ -33879,9 +33897,9 @@ fn tc_infer_struct_lit_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Rep
                     if tc_report_unit_variant_braces(qvar, sname, node) { return tc_error_recovery_tid() }
                     tc_check_brace_literal(tc_variant_literal_owner(qvar), node)
                     if tc_alias_decl_of_written(qual) != -1 {
-                        return tc_note_open_variant(node, tc_alias_brace_variant_tid(qtid, vname, node_fields(node)))
+                        return tc_note_open_value(node, tc_alias_brace_variant_tid(qtid, vname, node_fields(node)))
                     }
-                    return tc_note_open_variant(node, tc_enum_structlit_instance_tid(qtid, vname, node_fields(node)))
+                    return tc_note_open_value(node, tc_enum_structlit_instance_tid(qtid, vname, node_fields(node)))
                 }
                 if tc_report_bad_variant_value(node, qual, vname, 2) {
                     tc_infer_orphan_field_values(node_fields(node))
@@ -33924,7 +33942,7 @@ fn tc_infer_struct_lit_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Rep
                         if tc_tid_has_bare_typevar(hint_t) != 0 {
                             let base = tc_enum_base_tid(hint_t)
                             let inst = tc_enum_structlit_instance_tid(base, sname, node_fields(node))
-                            if inst != base { return tc_note_open_variant(node, inst) }
+                            if inst != base { return tc_note_open_value(node, inst) }
                             return site_t
                         }
                         // The hint answers the literal's own type without looking inside it, so the
@@ -33972,7 +33990,7 @@ fn tc_infer_struct_lit_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Rep
                         // A generic-enum struct-style ctor (`Leaf { value: 1 }`) reverse-
                         // infers its concrete instance tid; non-generic keeps bare.
                         tc_check_brace_literal(tc_variant_literal_owner(var_idx), node)
-                        return tc_note_open_variant(node, tc_enum_structlit_instance_tid(venum, sname, node_fields(node)))
+                        return tc_note_open_value(node, tc_enum_structlit_instance_tid(venum, sname, node_fields(node)))
                     }
                     BareVariantPick.Ambiguous(carrier, enums) => {
                         tc_report_ambiguous_construction(sname, carrier, enums, node)
@@ -34858,13 +34876,13 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                         tc_check_variant_paren_payload(cvar_idx, method, node)
                         if tc_alias_decl_of_written(cname) != -1 {
                             let _ = tc_check_variant_payload_values_at("{cname}.{method}", cvar_idx, cargs_sl, ctor_tid)
-                            return tc_note_open_variant(node, ctor_tid)
+                            return tc_note_open_value(node, ctor_tid)
                         }
                         let payload_tids = tc_check_variant_payload_values("{cname}.{method}", cvar_idx, cargs_sl)
                         // A generic-enum qualified ctor (`Tree.Leaf(1)`) reverse-infers
                         // its concrete instance tid; a non-generic enum keeps the bare
                         // ctor_tid.
-                        return tc_note_open_variant(node, tc_enum_ctor_instance_tid(ctor_tid, cvar_idx, cargs_sl, payload_tids))
+                        return tc_note_open_value(node, tc_enum_ctor_instance_tid(ctor_tid, cvar_idx, cargs_sl, payload_tids))
                     }
                 }
                 if tc_report_bad_variant_value(node, cname, method, 1) {
@@ -34938,11 +34956,6 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
         let obj_t = tc_resolve(tc_infer_receiver(recv_node))
         if diag_any_errors_since(receiver_diags) > 0 { tc_method_calls.receiver_failed.insert(node, 1) }
         let obj_k = type_kind(obj_t)
-        // An open iterator has no generic fns to call, where `[].len()` reads no element at all.
-        if obj_k == TyKind.List && method == "into_iter" && tc_node_is_empty_ctor(recv_node) {
-            let _ = tc_note_open_variant(recv_node, obj_t)
-        }
-        tc_note_open_receiver(recv_node)
 
         // A std trait method on a receiver of no type yet. A later use may fill the type
         // (sections/03_types.md *Under-Determined Types*), and every type answers these methods
@@ -36515,8 +36528,8 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
             // They sit above every declaration rung, as the builtin constructors below do, so a
             // program that declares `List_new` cannot type this call as its own function.
             let head_type = tc_static_head_type(static_head)
-            if obj_name == "List" && obj_is_value == 0 && method == "new" { return tc_static_ctor_answer(head_type, node, "{obj_written}.{method}", tc_list_new_ctor(node)) }
-            if obj_name == "List" && obj_is_value == 0 && method == "with_capacity" { return tc_static_ctor_answer(head_type, node, "{obj_written}.{method}", tc_list_with_capacity_ctor(node)) }
+            if obj_name == "List" && obj_is_value == 0 && method == "new" { return tc_note_open_value(node, tc_static_ctor_answer(head_type, node, "{obj_written}.{method}", tc_list_new_ctor(node))) }
+            if obj_name == "List" && obj_is_value == 0 && method == "with_capacity" { return tc_note_open_value(node, tc_static_ctor_answer(head_type, node, "{obj_written}.{method}", tc_list_with_capacity_ctor(node))) }
             // Only the namespaced `channel.new[T]` builds a channel, so the static spelling gets
             // the bare call's refusal. The recovery type keeps the uses of the value quiet.
             if obj_name == "Channel" && obj_is_value == 0 && method == "new" && tc_names_type_without_call_form(obj_name) {
@@ -36574,7 +36587,7 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                         }
                         // A receiver whose type nothing settles leaves the impl's binders open,
                         // and no binding receives it, so the flush blames the receiver itself.
-                        if q_recv != -1 { let _ = tc_note_open_variant(q_recv, tc_lookup_node_tid(q_recv)) }
+                        if q_recv != -1 { let _ = tc_note_open_value(q_recv, tc_lookup_node_tid(q_recv)) }
                         let q_im = tc_method_block.get(q_decl) ?? -1
                         if q_im != -1 { tc_note_static_impl_call(obj_node, q_im, node, q_recv, q_binds) }
                         // Judged after the arguments, which fill the head's open arguments
@@ -36590,7 +36603,7 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                             tc_check_bounds_for_binds(q_sig, build_typevar_binds(q_sig, q_tids, 0), node)
                             return substitute_typevar_tid(instantiate_return_type(q_sig, q_tids, node, 0), q_binds)
                         }
-                        return tc_note_open_variant(node, substitute_typevar_tid(fnsig_pool.get(q_sig).unwrap().ret, q_binds))
+                        return tc_note_open_value(node, substitute_typevar_tid(fnsig_pool.get(q_sig).unwrap().ret, q_binds))
                     }
                 }
                 let static_sig = tc_call_view_sig(tc_static_head_sig(static_head, method))
@@ -36671,7 +36684,7 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
             let head_is_type = nr_receiver_has_binding(obj_name) == 0
             if head_is_type && tc_qualified_carrier(obj_name, fname).is_some() {
                 if fname == "None" && tc_alias_decl_of_written(obj_name) != -1 {
-                    return tc_note_open_variant(node, tc_value_head_tid(obj_name))
+                    return tc_note_open_value(node, tc_value_head_tid(obj_name))
                 }
                 return tc_carrier_nullary_tid(fname, "{obj_name}.{fname}", node)
             }
@@ -36695,8 +36708,8 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
             if tid != -1 && type_kind(tid) == TyKind.Enum {
                 let vi = get_variant_by_name(tc_enum_base_tid(tid), fname)
                 if vi != -1 && variant_field_count(vi) != 0 { return tc_declared_variant_value_tid(tid, vi, "{obj_name}.{fname}", node) }
-                if tc_alias_decl_of_written(obj_name) != -1 { return tc_note_open_variant(node, tid) }
-                return tc_note_open_variant(node, tc_nullary_variant_tid(tid, vi))
+                if tc_alias_decl_of_written(obj_name) != -1 { return tc_note_open_value(node, tid) }
+                return tc_note_open_value(node, tc_nullary_variant_tid(tid, vi))
             }
             // A MODULE qualifier. This arm covers an enum type qualifier, a struct
             // field, a tuple index, and this fourth case for `module.name` — without
@@ -36946,13 +36959,13 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
         // which matters because a metavar minted here would overwrite an already-solved stamp
         // on re-inference. Where nothing expects a List the helper mints, so a later
         // constraining use (xs.push(1)) still pins it, and an unpinned one is still E0301.
-        return make_list_type(tc_carrier_slot_from_hint(TyKind.List, 1))
+        return tc_note_open_value(node, make_list_type(tc_carrier_slot_from_hint(TyKind.List, 1)))
     }
 
     if kind == NodeKind.StructLit {
         let lit_t = tc_infer_struct_lit_type(node)
         tc_check_lit_field_values(node, lit_t)
-        return lit_t
+        return tc_note_open_value(node, lit_t)
     }
 
     if kind == NodeKind.TupleLit {
@@ -44099,6 +44112,16 @@ fn tc_register_module_let_pattern(l: Int, l_tid: Int) {
     }
 }
 
+// The type a module-level `let` writes for itself, or UNKNOWN when it writes none.
+fn tc_module_let_written_tid(l: Int) -> Int ! TypeCheck.Resolve, Diag.Report {
+    if node_target(l) != -1 { return resolve_type_ann(node_target(l)) }
+    if node_type_name(l) != "" {
+        let rt = resolve_type_name(node_type_name(l))
+        if rt != -1 { return rt }
+    }
+    TYPE_UNKNOWN
+}
+
 // Types an ANNOTATED module-level global's initializer for its node tids alone.
 //
 // The first pass already registered the declared type on the binding, so this walk decides
@@ -44114,7 +44137,9 @@ fn tc_register_module_let_pattern(l: Int, l_tid: Int) {
 // The declared type drives the walk — construct hint, closure expected fn type, and the metavar
 // pin — so `let m: Map[Str, Int] = Map()` records `Map[Str, Int]` on the ctor and not `Map[?, ?]`.
 fn tc_stamp_annotated_global_init(l: Int, l_val: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
-    let declared = tc_lookup_node_tid(l)
+    // A binding its module declares twice (E1016) is read as the recovery type, but its own
+    // initializer still answers to its own annotation, so an empty `[]` there is not open.
+    let declared = if tc_value_decl_poisoned(l) { tc_module_let_written_tid(l) } else { tc_lookup_node_tid(l) }
     tc_seed_expected_into_value(l_val, declared)
     let hint = if tc_tid_is_no_info(declared) == 0 { resolve_alias_tid(declared) } else { tc_construct_hint }
     let v_tid = tc_infer_walked_let_value(l_val, node_name(l), hint)
@@ -44292,13 +44317,8 @@ fn tc_infer_program_body(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Di
             } else if l_type_str != "" {
                 nr_check_type_ref(l_type_str, l)
             }
-            let mut l_tid = TYPE_UNKNOWN
-            if l_ann != -1 {
-                l_tid = resolve_type_ann(l_ann)
-            } else if l_type_str != "" {
-                let rt = resolve_type_name(l_type_str)
-                if rt != -1 { l_tid = rt }
-            } else {
+            let mut l_tid = tc_module_let_written_tid(l)
+            if l_ann == -1 && l_type_str == "" {
                 let l_val = node_value(l)
                 if l_val != -1 {
                     let vk = node_kind(l_val)
@@ -44473,7 +44493,7 @@ fn tc_flush_program_deferrals(program: Bool) ! TypeCheck.Resolve, TypeCheck.Repo
     tc_ud_flush_fn_values()
     tc_flush_method_reads()
     tc_refuse_deferred_conversions()
-    tc_ud_flush_open_variants()
+    tc_ud_flush_open_values()
     tc_drop_open_calls()
     tc_flush_untyped_type_args()
 }

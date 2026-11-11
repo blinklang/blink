@@ -1,0 +1,395 @@
+// An empty `[]`, a `Map()` or a struct literal whose type parameter nothing reaches is
+// under-determined wherever its value goes, not only at a `let` (sections/03_types.md §3.4
+// *Under-Determined Types*: "The judgment is a property of the type, not of the syntactic
+// position"). When no binding holds the value, as for a statement, `let _`, a temporary
+// receiver or field base, an operand, an argument or an interpolation hole, the error is one
+// E0301 at the open value, and the help is an annotated binding for it. A value that a later
+// use fills, or that an annotation, a parameter or a return type types, stays accepted.
+//
+// Each row checks the exact set of diagnostics a program gets, so an extra error, a missing
+// one or an internal error fails it as surely as a wrong message.
+
+import typecheck.{check_types}
+import compiler.{compile_to_program}
+import diagnostics.{diag_entries, diag_reset}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+import std.fs
+import std.io
+
+// Every error, warning and internal error the program gets: span, code, message and help.
+fn diags_of(src: Str) -> List[Str] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    let path = "build/tc_open_value_no_binding_src.bl"
+    init_embedded_stdlib()
+    fs.write(path, src).unwrap()
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        out.push("{d.line}:{d.col}-{d.end_col}: {d.code} {d.message} | help: {d.help}")
+    }
+    out
+}
+
+fn line_of(src: Str, marker: Str) -> Int ! IO.Eprint {
+    let lines = src.split("\n")
+    let mut i = 0
+    while i < lines.len() {
+        if lines.get(i).unwrap().contains(marker) { return i + 1 }
+        i = i + 1
+    }
+    io.eprintln("FAIL: probe has no line marked '{marker}'")
+    assert(false)
+    -1
+}
+
+// "line:col-0" at the first `word` on the line marked `marker`: the caret is a point at the
+// start of the open value, since an expression node records no end column.
+fn span(src: Str, marker: Str, word: Str) -> Str ! IO.Eprint {
+    let line = line_of(src, marker)
+    let col = src.split("\n").get(line - 1).unwrap().index_of(word).unwrap() + 1
+    "{line}:{col}-0"
+}
+
+fn assert_diags(src: Str, want: List[Str]) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    let got = diags_of(src)
+    let mut ok = got.len() == want.len()
+    for w in want {
+        if !got.contains(w) { ok = false }
+    }
+    if !ok {
+        io.eprintln("FAIL: want:")
+        for w in want { io.eprintln("    {w}") }
+        io.eprintln("  got:")
+        for g in got { io.eprintln("    {g}") }
+    }
+    assert(ok)
+}
+
+fn open_at(src: Str, marker: Str, word: Str, hint: Str) -> Str ! IO.Eprint {
+    "{span(src, marker, word)}: E0301 cannot infer a type for this value: it is left under-determined | help: add a type annotation on a binding for this value, e.g. `let x{hint} = ...` (replace each placeholder with the intended type)"
+}
+
+test "an empty list statement is E0301 at the list" {
+    let src = #"fn main() {
+    []  // STMT
+}
+"#
+    assert_diags(src, [open_at(src, "STMT", "[]", ": List[T]")])
+}
+
+test "an empty list bound to the wildcard is E0301 at the list" {
+    let src = #"fn main() {
+    let _ = []  // WILD
+}
+"#
+    assert_diags(src, [open_at(src, "WILD", "[]", ": List[T]")])
+}
+
+test "a Map construction statement is E0301 at the construction" {
+    let src = #"fn main() {
+    Map()  // STMT
+}
+"#
+    assert_diags(src, [open_at(src, "STMT", "Map()", ": Map[K, V]")])
+}
+
+test "a Map construction bound to the wildcard is E0301 at the construction" {
+    let src = #"fn main() {
+    let _ = Map()  // WILD
+}
+"#
+    assert_diags(src, [open_at(src, "WILD", "Map()", ": Map[K, V]")])
+}
+
+test "a Map construction as a temporary receiver is E0301 at the construction" {
+    let src = #"fn main() {
+    let k = Map().len()  // RECV
+    io.println("{k}")
+}
+"#
+    assert_diags(src, [open_at(src, "RECV", "Map()", ": Map[K, V]")])
+}
+
+test "an empty list in a tuple whose other field is read is E0301 at the list" {
+    let src = #"fn main() {
+    let k = ([], 1).1  // TUPLE
+    io.println("{k}")
+}
+"#
+    assert_diags(src, [open_at(src, "TUPLE", "[]", ": List[T]")])
+}
+
+test "a struct literal no field reaches the type parameter of is E0301 when a field is read" {
+    let src = #"type W[T] { n: Int }
+
+fn main() {
+    let k = W { n: 1 }.n  // FIELD
+    io.println("{k}")
+}
+"#
+    assert_diags(src, [open_at(src, "FIELD", "W", ": W[...]")])
+}
+
+test "a struct literal statement no field reaches the type parameter of is E0301" {
+    let src = #"type W[T] { n: Int }
+
+fn main() {
+    W { n: 1 }  // STMT
+}
+"#
+    assert_diags(src, [open_at(src, "STMT", "W", ": W[...]")])
+}
+
+test "a struct literal no field reaches the type parameter of is reported once, at its binding" {
+    let src = #"type W[T] { n: Int }
+
+fn main() {
+    let w = W { n: 1 }  // LET
+    io.println("{w.n}")
+}
+"#
+    let line = line_of(src, "LET")
+    let got = diags_of(src)
+    assert_eq(got.len(), 1)
+    assert(got.get(0).unwrap().starts_with("{line}:5-"))
+    assert(got.get(0).unwrap().contains("E0301 cannot infer a type for `w`"))
+}
+
+test "an empty list field read through a temporary struct is E0301 at the list" {
+    let src = #"type B[X] { xs: List[X] }
+
+fn main() {
+    io.println("{B { xs: [] }.xs.len()}")  // FIELD
+}
+"#
+    assert_diags(src, [open_at(src, "FIELD", "[]", ": List[T]")])
+}
+
+test "the length of an empty list in a hole is E0301 at the list" {
+    let src = #"fn main() {
+    io.println("{[].len()}")  // HOLE
+}
+"#
+    assert_diags(src, [open_at(src, "HOLE", "[]", ": List[T]")])
+}
+
+test "two empty lists compared are one E0301 at the first" {
+    let src = #"fn main() {
+    io.println("{[] == []}")  // EQ
+}
+"#
+    assert_diags(src, [open_at(src, "EQ", "[]", ": List[T]")])
+}
+
+test "two Map constructions compared are one E0301 at the first" {
+    let src = #"fn main() {
+    io.println("{Map() == Map()}")  // EQ
+}
+"#
+    assert_diags(src, [open_at(src, "EQ", "Map()", ": Map[K, V]")])
+}
+
+test "an empty list passed to a method of an empty list is one E0301 at the receiver" {
+    let src = #"fn main() {
+    io.println("{[].contains([])}")  // ARG
+}
+"#
+    assert_diags(src, [open_at(src, "ARG", "[]", ": List[T]")])
+}
+
+test "a struct with an empty list field in a hole whose Display impl has a bound is E0301 at the list" {
+    let src = #"trait Tag { fn tag(self) -> Int }
+impl Tag for Int { fn tag(self) -> Int { self } }
+type Cx[T] { v: T }
+impl[T: Tag] Display for Cx[T] { fn fmt(self, sb: StringBuilder) { sb.write("cx{self.v.tag()}") } }
+
+fn main() {
+    io.println("{Cx { v: [] }}")  // HOLE
+}
+"#
+    assert_diags(src, [open_at(src, "HOLE", "[]", ": List[T]")])
+}
+
+test "the length of an empty list is E0301 although it reads no element" {
+    let src = #"fn main() {
+    let n = [].len()  // LEN
+    let e = [].is_empty()  // EMPTY
+    io.println("{n} {e}")
+}
+"#
+    assert_diags(src, [open_at(src, "LEN", "[]", ": List[T]"), open_at(src, "EMPTY", "[]", ": List[T]")])
+}
+
+test "an empty List.new or List.with_capacity no binding holds is E0301 at the construction" {
+    let src = #"fn main() {
+    List.new()  // STMT
+    let _ = List.new()  // WILD
+    let n = List.new().len()  // LEN
+    let e = List.new().is_empty()  // EMPTY
+    let k = (List.new(), 1).1  // TUPLE
+    let c = List.with_capacity(4).len()  // CAP
+    io.println("{n} {e} {k} {c}")
+}
+"#
+    let h = ": List[T]"
+    assert_diags(src, [open_at(src, "STMT", "List", h), open_at(src, "WILD", "List", h), open_at(src, "LEN", "List", h),
+        open_at(src, "EMPTY", "List", h), open_at(src, "TUPLE", "List", h), open_at(src, "CAP", "List", h)])
+}
+
+test "a struct literal inside a struct literal that reaches no type parameter is E0301 at the inner literal" {
+    let src = #"type W[T] { n: Int }
+type O[T] { w: W[T] }
+
+fn main() {
+    let k = O { w: W { n: 2 } }.w.n  // NESTED
+    io.println("{k}")
+    O { w: W { n: 3 } }.w.n  // STMT
+}
+"#
+    assert_diags(src, [open_at(src, "NESTED", "W", ": W[...]"), open_at(src, "STMT", "W", ": W[...]")])
+}
+
+test "a struct literal passed where a generic parameter names its type parameter is one E0301" {
+    let src = #"type W[T] { n: Int }
+
+fn f[T](w: W[T]) -> Int { w.n }
+
+fn main() {
+    io.println("{f(W { n: 1 })}")  // ARG
+}
+"#
+    let line = line_of(src, "ARG")
+    let got = diags_of(src)
+    if got.len() != 1 { for g in got { io.eprintln("got: {g}") } }
+    assert_eq(got.len(), 1)
+    assert(got.get(0).unwrap().starts_with("{line}:"))
+    assert(got.get(0).unwrap().contains("E0301"))
+}
+
+test "a method no type answers is one E0505 for an open receiver or argument" {
+    for body in ["let a = [].foo()", "let a = Map().foo()", "let a = [1].concat([])", "let a = 3.trim([])", "let a = 3.concat(None)"] {
+        let got = diags_of("fn main() \{\n    {body}\n    io.println(\"\{a\}\")\n\}\n")
+        if got.len() != 1 { for g in got { io.eprintln("{body}: {g}") } }
+        assert_eq(got.len(), 1)
+        assert(got.get(0).unwrap().contains("E0505 unresolved method"))
+    }
+}
+
+test "the note on an open value names what would fix it" {
+    let _ = diags_of(#"fn main() {
+    let _ = []
+}
+"#)
+    assert_eq(diag_entries.len(), 1)
+    assert_eq(diag_entries.get(0).unwrap().notes, ["no annotation, parameter type or return type gives this value its type"])
+}
+
+test "an empty list that a later push fills is not E0301" {
+    assert_diags(#"fn main() {
+    let mut xs = []
+    xs.push(1)
+    let mut m = Map()
+    m.insert("k", 1)
+    io.println("{xs.len()} {m.len()}")
+}
+"#, [])
+}
+
+test "an empty list that an annotation, a parameter or a return type types is not E0301" {
+    assert_diags(#"fn empty_ints() -> List[Int] { [] }
+
+fn count(xs: List[Int]) -> Int { xs.len() }
+
+fn main() {
+    let typed: List[Int] = []
+    io.println("{typed == []} {[] == typed} {empty_ints().len()} {count([])}")
+}
+"#, [])
+}
+
+test "an empty list argument the receiver types is not E0301" {
+    assert_diags(#"fn main() {
+    let nested: List[List[Int]] = [[1]]
+    io.println("{nested.contains([])}")
+}
+"#, [])
+}
+
+test "an empty List.new or List.with_capacity a later push fills is not E0301" {
+    assert_diags(#"fn main() {
+    let mut l = List.new()
+    l.push(1)
+    let mut c = List.with_capacity(4)
+    c.push("a")
+    io.println("{l.len()} {c.len()}")
+}
+"#, [])
+}
+
+test "a struct literal whose type parameter another argument of a generic call fills is not E0301" {
+    assert_diags(#"type W[T] { n: Int }
+
+fn f[T](_w: W[T], x: T) -> T { x }
+
+fn usew[T](w: W[T]) -> Int { w.n }
+
+fn main() {
+    let w: W[Int] = W { n: 2 }
+    io.println("{f(W { n: 1 }, 5)} {usew(w)}")
+}
+"#, [])
+}
+
+test "a Map construction with its type arguments written is not E0301" {
+    assert_diags(#"fn main() {
+    io.println("{Map[Str, Int]().len()} {Map.new[Str, Int]().len()}")
+}
+"#, [])
+}
+
+test "a struct literal an annotation or a return type types is not E0301" {
+    assert_diags(#"type W[T] { n: Int }
+type B[X] { xs: List[X] }
+
+fn wint() -> W[Int] { W { n: 4 } }
+
+fn main() {
+    let w: W[Str] = W { n: 2 }
+    let mut b = B { xs: [] }
+    let c: B[Int] = b
+    io.println("{w.n} {wint().n} {c.xs.len()}")
+}
+"#, [])
+}
+
+test "a hole a later push fills is not E0301 when its Display bound is inline, in a where clause or through a supertrait" {
+    assert_diags(#"trait Tag { fn tag(self) -> Int }
+impl Tag for Int { fn tag(self) -> Int { self * 2 } }
+trait Tag2: Tag { fn two(self) -> Int }
+impl Tag2 for Int { fn two(self) -> Int { self } }
+type Cx[T] { v: List[T] }
+impl[T: Tag] Display for Cx[T] { fn fmt(self, sb: StringBuilder) { sb.write("cx{self.v.get(0).unwrap().tag()}") } }
+type Cw[T] { v: List[T] }
+impl[T] Display for Cw[T] where T: Tag { fn fmt(self, sb: StringBuilder) { sb.write("cw{self.v.get(0).unwrap().tag()}") } }
+type Cs[T] { v: List[T] }
+impl[T: Tag2] Display for Cs[T] { fn fmt(self, sb: StringBuilder) { sb.write("cs{self.v.get(0).unwrap().two()}") } }
+
+fn main() {
+    let mut xs = []
+    let mut ys = []
+    let mut zs = []
+    let mut out = ""
+    for i in 0..2 {
+        if i > 0 {
+            out = "{Cx { v: xs }} {Cw { v: ys }} {Cs { v: zs }}"
+        }
+        xs.push(1)
+        ys.push(2)
+        zs.push(3)
+    }
+    io.println(out)
+}
+"#, [])
+}
