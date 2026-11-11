@@ -1,0 +1,67 @@
+// Before the unit compile, `blink build` tests each header that an `@ffi` declaration of the
+// program names (section 9.1, the header test). A user module named `std_util` is user code, not
+// the standard library, so its `@ffi` headers are tested as a module of another name's are.
+
+import std.process.{ChildEnd, ChildLimits, ProcessResult}
+import std.time.{Duration}
+
+let MISSING = "blink_std_prefix_no_such_header.h"
+
+fn sh(cmd: Str) -> ProcessResult ! Process.Spawn {
+    process.run("sh", ["-c", cmd], limits: ChildLimits { timeout: Some(Duration.seconds(300)) }).unwrap()
+}
+
+// A fresh package whose src/<mod_name>.bl binds `abs` with header `header`, and whose
+// src/main.bl calls it.
+fn project(mod_name: Str, header: Str) -> Str ! FS.Write, Process.Spawn {
+    let dir = sh("mktemp -d /tmp/blink_std_prefix_hdr.XXXXXX").out.trim()
+    let _ = sh("mkdir -p {dir}/src")
+    fs.write("{dir}/blink.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\n").unwrap()
+    fs.write("{dir}/blink.lock", "[metadata]\nlockfile-version = 1\n").unwrap()
+    fs.write("{dir}/src/{mod_name}.bl", "@ffi(\"c\", \"abs\", header: \"{header}\")\n@trusted(audit: \"test\")\npub fn my_abs(x: I32) -> I32 ! ()\n").unwrap()
+    fs.write("{dir}/src/main.bl", "import {mod_name}.\{my_abs}\n\nfn main() \{\n    io.println(\"\{my_abs(-3)}\")\n}\n").unwrap()
+    dir
+}
+
+// Runs `$B <cmd>` in dir. The corpus exports module filters that make each build one unit,
+// so the run drops them: --per-module must reach the per-module path.
+fn blink_in(dir: Str, cmd: Str) -> ProcessResult ! Process.Spawn {
+    sh("B=$(pwd)/build/blink; cd {dir} && env -u BLINK_PER_MODULE -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE BLINK_CACHE_DIR={dir}/cache BLINK_BIN=$B $B {cmd}")
+}
+
+fn diag(r: ProcessResult) -> Str {
+    "exit {r.end}\nstdout:\n{r.out}\nstderr:\n{r.err_out}"
+}
+
+// What is wrong with how a build of the module `mod_name` stopped on the missing header, or "".
+fn header_stop_error(mod_name: Str, path_flag: Str) -> Str ! FS.Write, Process.Spawn {
+    let dir = project(mod_name, MISSING)
+    let r = blink_in(dir, "build {path_flag} src/main.bl")
+    let built = sh("test -e {dir}/build/main && echo yes").out.trim()
+    let _ = sh("rm -rf {dir}")
+    let what = "{mod_name} {path_flag}"
+    if r.end != ChildEnd.Exited(1) { return "{what}: ended with {r.end}, not 1\n{diag(r)}" }
+    if !r.err_out.contains("error[ForeignHeaderNotFound]: header `{MISSING}` was not found by the C compiler on this host") { return "{what}: no E0859\n{diag(r)}" }
+    if !r.err_out.contains("--> src/{mod_name}.bl:1:1") { return "{what}: the span is not the @ffi line\n{diag(r)}" }
+    if r.err_out.split("ForeignHeaderNotFound").len() != 2 { return "{what}: not one E0859\n{diag(r)}" }
+    if built != "" { return "{what}: a binary was built\n{diag(r)}" }
+    ""
+}
+
+test "a missing @ffi header in a user module named std_util stops blink build with E0859, on both build paths" {
+    for flag in ["--per-module", "--no-per-module"] {
+        assert_eq(header_stop_error("std_util", flag), "")
+        assert_eq(header_stop_error("myutil", flag), "")
+    }
+}
+
+test "a present @ffi header in a user module named std_util builds and runs, on both build paths" {
+    for flag in ["--per-module", "--no-per-module"] {
+        let dir = project("std_util", "stdlib.h")
+        let b = blink_in(dir, "build {flag} -o {dir}/app src/main.bl")
+        let r = sh("{dir}/app")
+        let _ = sh("rm -rf {dir}")
+        assert_eq(b.end, ChildEnd.Exited(0), "{flag}\n{diag(b)}")
+        assert_eq(r.out.trim(), "3", "{flag}\n{diag(r)}")
+    }
+}

@@ -1,0 +1,132 @@
+// A user module whose name starts with `std_` (src/std_x.bl, `import std_x`) is user code. Only
+// a module that a `std.*` import loads is the standard library (section 10.7). So
+// such a module gets every check that a user module gets, with the report that a module of
+// another name gets, and the standard library keeps its own exemptions.
+
+import std.process.{ChildEnd, ChildLimits, ProcessResult}
+import std.time.{Duration}
+
+fn sh(cmd: Str) -> ProcessResult ! Process.Spawn {
+    process.run("sh", ["-c", cmd], limits: ChildLimits { timeout: Some(Duration.seconds(300)) }).unwrap()
+}
+
+// A fresh package with src/main.bl and, when `helper` is not "", src/<mod_name>.bl. `@M@` in
+// either text is the helper module's name.
+fn project(mod_name: Str, helper: Str, main: Str) -> Str ! FS.Write, Process.Spawn {
+    let dir = sh("mktemp -d /tmp/blink_std_prefix.XXXXXX").out.trim()
+    let _ = sh("mkdir -p {dir}/src")
+    fs.write("{dir}/blink.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\n").unwrap()
+    fs.write("{dir}/blink.lock", "[metadata]\nlockfile-version = 1\n").unwrap()
+    if helper != "" { fs.write("{dir}/src/{mod_name}.bl", helper.replace("@M@", mod_name)).unwrap() }
+    fs.write("{dir}/src/main.bl", main.replace("@M@", mod_name)).unwrap()
+    dir
+}
+
+// Runs `$B <cmd>` in dir. The corpus exports module filters that make each build one unit,
+// so the run drops them: --per-module must reach the per-module path.
+fn blink_in(dir: Str, cmd: Str) -> ProcessResult ! Process.Spawn {
+    sh("B=$(pwd)/build/blink; cd {dir} && env -u BLINK_PER_MODULE -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE BLINK_CACHE_DIR={dir}/cache BLINK_BIN=$B $B {cmd}")
+}
+
+fn diag(r: ProcessResult) -> Str {
+    "exit {r.end}\nstdout:\n{r.out}\nstderr:\n{r.err_out}"
+}
+
+// What `blink check` prints for the package, with the helper module's name written as `M`, so
+// the reports for two module names compare equal when they are the same report.
+fn check_as(mod_name: Str, helper: Str, main: Str) -> ProcessResult ! FS.Write, Process.Spawn {
+    let dir = project(mod_name, helper, main)
+    let r = blink_in(dir, "check src/main.bl")
+    let _ = sh("rm -rf {dir}")
+    ProcessResult { end: r.end, out: r.out.replace(mod_name, "M"), err_out: r.err_out.replace(mod_name, "M") }
+}
+
+// Builds the package on one build path and runs it, or gives the failure.
+fn build_and_run(mod_name: Str, helper: Str, main: Str, path_flag: Str) -> ProcessResult ! FS.Write, Process.Spawn {
+    let dir = project(mod_name, helper, main)
+    let b = blink_in(dir, "build {path_flag} -o {dir}/app src/main.bl")
+    if b.end != ChildEnd.Exited(0) {
+        let _ = sh("rm -rf {dir}")
+        return b
+    }
+    let r = sh("{dir}/app")
+    let _ = sh("rm -rf {dir}")
+    r
+}
+
+let OPAQUE_HELPER = "@ffi.opaque(header: \"blink_std_prefix_x.h\")\npub type T\n"
+let OPAQUE_MAIN = "import @M@\n\nfn main() \{ }\n"
+
+test "an @ffi.opaque header in a user module named std_x gets W0812, as in a module of another name" {
+    let named_std = check_as("std_x", OPAQUE_HELPER, OPAQUE_MAIN)
+    let other = check_as("own_x", OPAQUE_HELPER, OPAQUE_MAIN)
+    assert_eq(named_std.end, ChildEnd.Exited(0), diag(named_std))
+    assert(named_std.err_out.contains("warning[MissingCanonicalHeader]: @ffi.opaque 'T' declares header 'blink_std_prefix_x.h'"), diag(named_std))
+    assert(named_std.err_out.contains("--> src/M.bl:2:5"), diag(named_std))
+    assert_eq(named_std.err_out.split("warning[MissingCanonicalHeader]").len(), 2, diag(named_std))
+    assert(named_std.err_out.contains("help: add the header to blink.toml"), diag(named_std))
+    assert_eq(diag(named_std), diag(other))
+}
+
+// A user trait with the name of a std trait that the compiler answers itself. In a module of
+// another name, its qualified call on a receiver with no impl is E0505 at check.
+let TRAIT_HELPER = "pub trait Debug \{ fn sh(self) -> Int }\n"
+let TRAIT_MAIN = "import @M@.\{Debug}\ntype W \{ n: Int }\nimpl Debug for W \{ fn sh(self) -> Int \{ self.n } }\nfn main() \{ io.println(\"\{Debug.sh(1)}\") }\n"
+
+test "a qualified call of a user trait from a module named std_x with no impl is E0505 at check, as in a module of another name" {
+    let named_std = check_as("std_x", TRAIT_HELPER, TRAIT_MAIN)
+    let other = check_as("own_x", TRAIT_HELPER, TRAIT_MAIN)
+    assert_eq(named_std.end, ChildEnd.Exited(1), diag(named_std))
+    assert(named_std.err_out.contains("error[UnresolvedMethod]: unresolved method `.sh` on type Int"), diag(named_std))
+    assert(named_std.err_out.contains("--> src/main.bl:4:26"), diag(named_std))
+    assert(named_std.err_out.contains("1 error(s) found"), diag(named_std))
+    assert(!named_std.err_out.contains("internal compiler error"), diag(named_std))
+    assert_eq(diag(named_std), diag(other))
+}
+
+test "a qualified call of a user trait from a module named std_x runs its impl on both build paths" {
+    let main = "import @M@.\{Debug}\ntype W \{ n: Int }\nimpl Debug for W \{ fn sh(self) -> Int \{ self.n } }\nfn main() \{ io.println(\"\{Debug.sh(W \{ n: 3 })}\") }\n"
+    for flag in ["--per-module", "--no-per-module"] {
+        let r = build_and_run("std_x", TRAIT_HELPER, main, flag)
+        assert_eq(r.end, ChildEnd.Exited(0), "{flag}\n{diag(r)}")
+        assert_eq(r.out.trim(), "3", "{flag}\n{diag(r)}")
+    }
+}
+
+// A std body sees only std enums for a bare variant name. A body in a user module named
+// std_x, in a fn or in an impl method, sees the program's enums, as a user body does.
+let BARE_HELPER = "import shapes.\{Shape}\n\npub type W \{ n: Int }\n\npub trait Get \{\n    fn get(self) -> Int\n}\n\nimpl Get for W \{\n    fn get(self) -> Int \{\n        let s = Pt \{ x: self.n }\n        match s \{\n            Shape.Pt(x) => x\n            Shape.Empty => 0\n        }\n    }\n}\n\npub fn top() -> Int \{\n    let s = Pt \{ x: 4 }\n    match s \{\n        Shape.Pt(x) => x\n        Shape.Empty => 0\n    }\n}\n"
+let BARE_MAIN = "import @M@.\{W, Get, top}\n\nfn main() \{\n    io.println(\"\{W \{ n: 3 }.get()} \{top()}\")\n}\n"
+let SHAPES = "pub type Shape \{\n    Pt(x: Int)\n    Empty\n}\n"
+
+test "a bare variant in a fn and an impl method of a user module named std_x picks the program's enum, on both build paths" {
+    for flag in ["--per-module", "--no-per-module"] {
+        let dir = project("std_x", BARE_HELPER, BARE_MAIN)
+        fs.write("{dir}/src/shapes.bl", SHAPES).unwrap()
+        let b = blink_in(dir, "build {flag} -o {dir}/app src/main.bl")
+        let r = sh("{dir}/app")
+        let _ = sh("rm -rf {dir}")
+        assert_eq(b.end, ChildEnd.Exited(0), "{flag}\n{diag(b)}")
+        assert_eq(r.out.trim(), "3 4", "{flag}\n{diag(r)}")
+    }
+}
+
+// The standard library keeps what it is given: its @ffi.opaque types name headers of native
+// dependencies that the compiler manages, and the compiler answers its traits on built-in types.
+// std.libc's pollfd names the header poll.h, which no package declares.
+test "a std module's @ffi header gets no W0812 in a package" {
+    let main = "import std.libc\n\nfn main() \{ }\n"
+    let r = check_as("unused", "", main)
+    assert_eq(r.end, ChildEnd.Exited(0), diag(r))
+    assert(!r.err_out.contains("MissingCanonicalHeader"), diag(r))
+    assert(!r.out.contains("MissingCanonicalHeader"), diag(r))
+}
+
+test "a qualified call of a std trait on a built-in type runs on both build paths" {
+    let main = "fn main() \{\n    io.println(\"\{Debug.debug(5)} \{Eq.eq(2, 2)} \{Hash.hash(7) == Hash.hash(7)}\")\n}\n"
+    for flag in ["--per-module", "--no-per-module"] {
+        let r = build_and_run("unused", "", main, flag)
+        assert_eq(r.end, ChildEnd.Exited(0), "{flag}\n{diag(r)}")
+        assert_eq(r.out.trim(), "5 true true", "{flag}\n{diag(r)}")
+    }
+}

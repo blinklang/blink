@@ -6976,7 +6976,7 @@ fn tc_unmet_user_bound(carrier: Int, outer_sl: Int, own_sl: Int, concrete: Int, 
 // type), so the impl blocks would miss them and they keep the modeled checks. A sealed surface is
 // judged by its surface row (§3.2.2).
 fn tc_trait_judged_by_impls(tr: Int) -> Bool {
-    if !node_source_module(tr).starts_with("std_") { return true }
+    if !tc_decl_in_std(tr) { return true }
     let name = node_name(tr)
     if is_sealed_builtin_trait(name) != 0 { return false }
     match name {
@@ -7025,7 +7025,7 @@ fn tc_surface_row(trait_name: Str, tr: Int) -> SurfaceRow {
         if trait_name == "IntoIterator" { return SurfaceRow { kinds: [TyKind.List, TyKind.Map, TyKind.Set, TyKind.Str, TyKind.Range, TyKind.Channel, TyKind.Bytes, TyKind.Iterator], shown: "List, Map, Set, Str, Range, Channel, Bytes and Iterator", args: SurfaceArgs.IterElem, elem_str: false, list_elem_eq: false } }
         return none
     }
-    if !node_source_module(tr).starts_with("std_") { return none }
+    if !tc_decl_in_std(tr) { return none }
     match node_name(tr) {
         "Sized" => SurfaceRow { kinds: [TyKind.Str, TyKind.List, TyKind.Map, TyKind.Set, TyKind.Bytes, TyKind.StringBuilder], shown: "Str, List, Map, Set, Bytes and StringBuilder", args: SurfaceArgs.NoArgs, elem_str: false, list_elem_eq: false }
         "Contains" => SurfaceRow { kinds: [TyKind.Set, TyKind.List, TyKind.Map], shown: "Set, List and Map", args: SurfaceArgs.Elem, elem_str: false, list_elem_eq: true }
@@ -15492,7 +15492,7 @@ fn tc_warn_missing_canonical_header(td: Int, ann_name: Str) ! Diag.Report {
     if ann == -1 || manifest_name == "" { return }
     let header = get_str_named_arg(ann, "header")
     if header == "" || manifest_header_is_declared(header) != 0 { return }
-    if node_source_module(td).starts_with("std_") { return }
+    if tc_decl_in_std(td) { return }
     diag_warn_at(
         "MissingCanonicalHeader",
         MISSING_CANONICAL_HEADER,
@@ -21737,7 +21737,7 @@ fn builtin_stub_type_spellable(t: Int) -> Bool ! TypeCheck.Resolve, Diag.Report 
     if type_kind(t) == TyKind.Bytes { return named >= 0 && type_kind(named) == TyKind.Bytes }
     if named != t { return false }
     let decl = tc_tid_decl_node(t)
-    decl == -1 || (decl >= 0 && node_source_module(decl).starts_with("std_"))
+    decl == -1 || (decl >= 0 && tc_decl_in_std(decl))
 }
 
 // Raises W0545 on `he` for the omitted operations `names`, whose clauses are `stubs`, and
@@ -22320,14 +22320,25 @@ pub fn tc_module_in_std(m: Str) -> Bool {
 }
 
 fn tc_module_package(m: Str) -> Str {
-    let recorded = match nr_module_names.get(m) {
+    match nr_module_names.get(m) {
         Some(r) => r.package
         None => ""
     }
-    if recorded != "" { return recorded }
-    // A prelude module loaded with no import records no package. A user module may also take
-    // a std_ name, so the prefix is only a fallback.
-    if m.starts_with("std_") { "std" } else { "" }
+}
+
+// Whether the declaration `node` is in the standard library. That is the package its file was
+// loaded from, not its module's name: a user module may be named std_x.
+pub fn tc_decl_in_std(node: Int) -> Bool {
+    tc_module_in_std(tc_decl_module(node))
+}
+
+// The module a declaration is in. An impl or trait method, and a derived operation, carry no
+// module of their own, so they are in their block's.
+fn tc_decl_module(decl: Int) -> Str {
+    let own = node_module(decl)
+    if own != "" { return own }
+    let owner = tc_method_block.get(decl) ?? (tc_ue_op_root.get(decl) ?? -1)
+    if owner < 0 { "" } else { node_module(owner) }
 }
 
 // The declaration `mod_name` itself makes under `name`, or -1.
@@ -24931,7 +24942,7 @@ fn tc_declared_type_call_repair(name: Str, tid: Int) -> Str {
         // A std type's surface is its type-scoped constructors (sections/03_types.md); its
         // fields are representation, so the repair does not teach a literal of them.
         let decl = tc_tid_decl_node(tid)
-        if scoped != "" && decl >= 0 && node_source_module(decl).starts_with("std_") {
+        if scoped != "" && decl >= 0 && tc_decl_in_std(decl) {
             return "`{name}` has no constructor call; build a value with a function of `{name}`, such as {scoped}"
         }
         if scoped != "" {
@@ -25325,7 +25336,7 @@ fn tc_bare_variant_from_program(name: Str, site: Int, carrier: Option[TyKind]) -
     let std_site = tc_site_in_std(site)
     for i in evar_slots_by_name.get(name) ?? [] {
         let ev = evar_pool.get(i).unwrap()
-        if !std_site || node_source_module(ev.enum_decl).starts_with("std_") {
+        if !std_site || tc_decl_in_std(ev.enum_decl) {
             enums.push(ev.enum_decl)
             only = BareVariantPick.Declared(ev.enum_id, i)
         }
@@ -25337,8 +25348,8 @@ fn tc_bare_variant_from_program(name: Str, site: Int, carrier: Option[TyKind]) -
 
 // An expression node records no module of its own; the function around it does.
 fn tc_site_in_std(site: Int) -> Bool {
-    if tc_current_fn_node >= 0 { return node_source_module(tc_current_fn_node).starts_with("std_") }
-    node_source_module(site).starts_with("std_")
+    if tc_current_fn_node >= 0 { return tc_decl_in_std(tc_current_fn_node) }
+    tc_decl_in_std(site)
 }
 
 // A range yields its elements by stepping from the start, and §2.10 steps only an integer
@@ -32192,7 +32203,7 @@ fn tc_check_qualified_trait_args(shown: Str, sig: Int, args_sl: Int, node: Int, 
 // built-in value or through a derive.
 fn tc_is_std_trait_method(tr: Str, method: Str) -> Bool {
     let t = tc_trait_node_idx.get(tr) ?? -1
-    t != -1 && node_source_module(t).starts_with("std_") && tc_trait_method(tr) == method
+    t != -1 && tc_decl_in_std(t) && tc_trait_method(tr) == method
 }
 
 // `Tr.method(x, ..)` over a std trait that no written impl answers: the compiler's own impl on a
@@ -32265,7 +32276,7 @@ pub fn tc_call_reaches_user_trait(call_node: Int) -> Bool {
     match tc_call_trait(call_node) {
         Some(key) => {
             let tr = tc_trait_node_idx.get(key) ?? -1
-            tr != -1 && !node_source_module(tr).starts_with("std_")
+            tr != -1 && !tc_decl_in_std(tr)
         }
         None => false
     }
@@ -32478,7 +32489,7 @@ fn tc_bound_need(arg: Int, tr: Str, visiting: List[Int]) -> List[Int] {
 // the arguments.
 fn tc_user_trait_need(tid0: Int, tr: Str, visiting: List[Int]) -> List[Int] {
     let trait_node = tc_trait_node_idx.get(tr) ?? -1
-    if trait_node == -1 || node_source_module(trait_node).starts_with("std_") { return [] }
+    if trait_node == -1 || tc_decl_in_std(trait_node) { return [] }
     let tid = resolve_alias_tid(tc_resolve(tid0))
     if !tc_tid_is_judgeable_here(tid) { return [] }
     let mut failed: List[Int] = []
