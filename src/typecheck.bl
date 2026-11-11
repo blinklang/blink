@@ -846,10 +846,85 @@ fn tc_collect_namesake_type_names(types_sl: Int) {
                     }
                 }
             }
-            None => first_module.insert(bare, m)
+            None => {
+                first_module.insert(bare, m)
+                // The builtin holds the bare name (sections/07 §10.6), so a lone declaration
+                // that shadows it takes its module like a second declarer does.
+                if tc_is_shadowable_type_name(bare) && !tc_module_is_prelude_std(m) {
+                    tc_namesake_type_modules.insert(bare, "|{m}|")
+                }
+            }
         }
         i = i + 1
     }
+}
+
+// Whether `m` is a prelude module of the standard library, by the package it was loaded from:
+// a user module may take a prelude module's name. Its Ordering and ConversionError are the
+// builtins themselves, not shadows.
+fn tc_module_is_prelude_std(m: Str) -> Bool {
+    tc_prelude_modules.contains_key(m) && tc_module_in_std(m)
+}
+
+// THE pool name of a namesake `bare` declared in module `m`. The main file keeps the bare
+// spelling, except for a name that shadows a compiler-known type: the builtin holds that
+// spelling, so the shadow is `{m}.{bare}` in every module. The main module is `__main__`
+// in both build modes, so a single-file build and a package build give one pool name, and
+// strip_module_qualifier reads it like any other qualified name.
+fn tc_namesake_pool_name(bare: Str, m: Str) -> Str {
+    if tc_module_key_is_main(m) == 0 { return "{m}.{bare}" }
+    if !tc_is_shadowable_type_name(bare) { return bare }
+    "__main__.{bare}"
+}
+
+// Whether a pool name is a declaration that shadows a compiler-known type, which then has
+// a module in its name, outside the standard library's prelude.
+fn tc_is_shadow_pool_name(name: Str) -> Bool {
+    let at = tc_name_last_dot(name)
+    if at < 0 { return false }
+    let bare = name.byte_slice(at + 1, name.byte_len())
+    tc_is_shadowable_type_name(bare) && tc_is_namesake_type_name(bare) != 0 && !tc_module_is_prelude_std(name.byte_slice(0, at))
+}
+
+// The byte offset of the last dot in a name, or -1. A module key may hold dots and a type
+// name never does, so a qualified name splits at its last dot. type_to_str reads every
+// type name through here, so it scans the bytes and builds no list.
+fn tc_name_last_dot(name: Str) -> Int {
+    let mut at = -1
+    let mut next = name.byte_index_of(".", 0)
+    while next.is_some() {
+        at = next ?? -1
+        next = name.byte_index_of(".", at + 1)
+    }
+    at
+}
+
+// The name after the last dot, or the whole name when it has none.
+fn tc_name_last_segment(name: Str) -> Str {
+    let at = tc_name_last_dot(name)
+    if at < 0 { name } else { name.byte_slice(at + 1, name.byte_len()) }
+}
+
+// The module key before the last dot of a pool name, or "" when it has none.
+fn tc_pool_name_module(name: Str) -> Str {
+    let at = tc_name_last_dot(name)
+    if at < 0 { "" } else { name.byte_slice(0, at) }
+}
+
+// THE spelling a user sees for a pool name: a shadow shows the name it was written with
+// (sections/07 §10.6 *Diagnostics that involve a shadowing name*). Every other name shows
+// as the pool holds it.
+pub fn tc_type_name_shown(name: Str) -> Str {
+    if tc_is_shadow_pool_name(name) { tc_name_last_segment(name) } else { name }
+}
+
+// The spelling a user sees for a declaration and for a nominal tid.
+fn tc_decl_shown(td: Int) -> Str {
+    tc_type_name_shown(tc_nominal_type_name(td))
+}
+
+pub fn tc_tid_shown(tid: Int) -> Str {
+    tc_type_name_shown(strip_module_qualifier(tc_type_name(tid)))
 }
 
 // A single-file build tags the program's own nodes "", a package build "__main__".
@@ -862,9 +937,7 @@ fn tc_module_key_is_main(m: Str) -> Int {
 fn tc_nominal_type_name(td: Int) -> Str {
     let bare = node_name(td)
     if tc_is_namesake_type_name(bare) == 0 { return bare }
-    let m = node_module(td)
-    if tc_module_key_is_main(m) != 0 { return bare }
-    "{m}.{bare}"
+    tc_namesake_pool_name(bare, node_module(td))
 }
 
 // The type declaration that a renamed import spells `name` in the module under check, or -1. Such
@@ -877,8 +950,7 @@ fn tc_type_renamed_here(name: Str) -> Int {
 // The pool key of a type name as WRITTEN in the module under check (`Point`, `alpha.Point`).
 // Only a namesake goes through lookup; every other name is its own key.
 fn tc_written_type_nominal(name: Str) -> Str {
-    let segs = name.split(".")
-    let bare = segs.get(segs.len() - 1) ?? name
+    let bare = tc_name_last_segment(name)
     let renamed = tc_type_renamed_here(name)
     if renamed != -1 { return tc_nominal_type_name(renamed) }
     if tc_is_namesake_type_name(bare) == 0 { return name }
@@ -896,18 +968,24 @@ fn tc_nominal_type_name_in(bare: Str, reader: Str) -> Str {
         None => return bare
     }
     if tc_module_key_is_main(reader) != 0 {
-        if mods.contains("|__main__|") || mods.contains("||") { return bare }
+        if mods.contains("|__main__|") { return tc_namesake_pool_name(bare, "__main__") }
+        if mods.contains("||") { return tc_namesake_pool_name(bare, "") }
     } else if mods.contains("|{reader}|") {
-        return "{reader}.{bare}"
+        return tc_namesake_pool_name(bare, reader)
     }
     for source_mod in mods.split("|") {
         if source_mod == "" { continue }
-        if is_selected_import(bare, reader, source_mod) != 0 { return "{source_mod}.{bare}" }
+        if is_selected_import(bare, reader, source_mod) != 0 { return tc_namesake_pool_name(bare, source_mod) }
+    }
+    // A name selected from a facade (`pub import`) is selected from no declaring module.
+    let via = nr_resolve_bare_decl(bare, reader)
+    if via >= 0 && node_kind(via) == NodeKind.TypeDef && node_name(via) == bare && mods.contains("|{node_module(via)}|") {
+        return tc_namesake_pool_name(bare, node_module(via))
     }
     // A prelude module's type is in every module's scope (sections/07 §10.6); a namesake
     // another module declares, the main file's included, is not.
     for source_mod in mods.split("|") {
-        if tc_prelude_modules.contains_key(source_mod) { return "{source_mod}.{bare}" }
+        if tc_prelude_modules.contains_key(source_mod) { return tc_namesake_pool_name(bare, source_mod) }
     }
     bare
 }
@@ -1050,6 +1128,12 @@ fn tc_impl_target_name(im: Int) -> Str {
     let written = node_name(im)
     let spelled = tc_impl_recv_spelling(im)
     if spelled != written { return spelled }
+    tc_impl_declared_target_name(im)
+}
+
+// The pool name of the declaration or alias target an impl header names.
+fn tc_impl_declared_target_name(im: Int) -> Str {
+    let written = node_name(im)
     let target = tc_impl_alias_target(im)
     if target != -1 { return tc_tid_name(target) }
     // A renamed import is the declared type under another spelling. A binder shadows it.
@@ -1071,7 +1155,22 @@ pub fn tc_impl_recv_spelling(im: Int) -> Str {
     if core != "" { return core }
     let target = tc_impl_alias_target(im)
     if target != -1 && type_kind(target) != TyKind.Struct && type_kind(target) != TyKind.Enum { return tk_name(type_kind(target)) }
+    // A declaration that shadows a builtin is spelled as the builtin is, so its impls are
+    // keyed by its pool name, which holds its module; an impl on the builtin stays bare.
+    if tc_is_shadowable_type_name(written) || target != -1 || tc_type_renamed_in_impl(im) {
+        let declared = tc_impl_declared_target_name(im)
+        if tc_is_shadow_pool_name(declared) { return declared }
+    }
     written
+}
+
+// Whether the impl header writes a name a renamed import binds, read in the impl's module.
+fn tc_type_renamed_in_impl(im: Int) -> Bool {
+    if impl_binder_declared(node_impl_binders(im), node_name(im)) != 0 { return false }
+    let saved = tc_enter_body_module(im)
+    let renamed = tc_type_renamed_here(node_name(im))
+    tc_leave_body_module(saved)
+    renamed != -1
 }
 
 // The type an impl header means when it names an alias, read in the impl's own module, or -1.
@@ -3070,7 +3169,7 @@ fn tc_infer_annotation_hint(tid0: Int) -> Str {
     if k == TyKind.Map { return ": Map[K, V]" }
     if k == TyKind.Result { return ": Result[T, E]" }
     if k == TyKind.Struct || k == TyKind.Enum {
-        return ": {strip_module_qualifier(e.name)}[...]"
+        return ": {tc_type_name_shown(strip_module_qualifier(e.name))}[...]"
     }
     if k == TyKind.Fn { return tc_fn_annotation_hint(tid, Map()) }
     // A tuple keeps each slot a value already fixed, so the repair names only what is open.
@@ -3106,7 +3205,7 @@ fn tc_hint_slot_str(tid: Int, named: Map[Int, Str]) -> Str {
     if (e.kind == TyKind.Struct || e.kind == TyKind.Enum) && e.params_count > 0 {
         let mut args: List[Str] = []
         for i in 0..e.params_count { args.push(tc_hint_slot_str(ty_param_list.get(e.params_start + i).unwrap(), named)) }
-        return "{strip_module_qualifier(e.name)}[{args.join(", ")}]"
+        return "{tc_type_name_shown(strip_module_qualifier(e.name))}[{args.join(", ")}]"
     }
     if e.kind == TyKind.List { return "List[{tc_hint_slot_str(e.inner1, named)}]" }
     if e.kind == TyKind.Set { return "Set[{tc_hint_slot_str(e.inner1, named)}]" }
@@ -4996,7 +5095,7 @@ fn tc_pattern_annotation(pat: Int, tid: Int) -> Option[Str] {
     if k == NodeKind.StructPattern && !open {
         let t = tc_resolve(tid)
         let e = ty_pool.get(t).unwrap()
-        if e.kind != TyKind.Struct || strip_module_qualifier(e.name) != strip_module_qualifier(node_type_name(pat)) { return None }
+        if e.kind != TyKind.Struct || tc_type_name_shown(strip_module_qualifier(e.name)) != strip_module_qualifier(node_type_name(pat)) { return None }
     }
     Some(tc_hint_slot_str(tid, Map()))
 }
@@ -10465,8 +10564,9 @@ fn register_derive_method_sigs(program: Int) {
     let mut i = 0
     while i < sublist_length(types_sl) {
         let td = sublist_get(types_sl, i)
-        let tname = node_name(td)
-        let ttid = lookup_named_type(tname)
+        // By the declaration's pool name: its spelling may be a namesake's or a builtin's.
+        let tname = tc_nominal_type_name(td)
+        let ttid = tc_decl_tid(td)
         if ttid != -1 {
             let self_t = derive_self_tid(td, ttid)
             if tc_decl_derives(td, "Serialize") != 0 {
@@ -14005,6 +14105,12 @@ pub fn tc_poly_user_impl_decl(im: Int) -> Int {
     tc_poly_user_impls.get(im) ?? -1
 }
 
+// The declaration of the type an impl's receiver resolved to in the impl's own module, -1 for a
+// builtin or a binder, or DECL_NODE_AMBIGUOUS.
+pub fn tc_impl_recv_decl(im: Int) -> Int {
+    tc_tid_decl_node(tc_impl_recv_tids.get(im) ?? -1)
+}
+
 // The receiver tid typecheck recorded for the impl block `im`; pure, so lowering can read it.
 // -1 for a node that is not an impl block and for a header with no `for` clause: neither has
 // a receiver, which is a different claim from "a receiver nobody could type". An impl block
@@ -14716,9 +14822,9 @@ fn tc_report_unhashable(role: HashRole, why: HashRefusal, shown: Str, name: Str,
                 "derive `{tc_core_trait_shown("Hash")}` and `{tc_core_trait_shown("Eq")}`"
             }
             diag_error_at_notes("MapKeyNotHashable", MAP_KEY_NOT_HASHABLE, "{w.title} type `{shown}` does not implement {tc_core_trait_shown("Hash")} — user types used as {w.plural} must {must}", node,
-                "{tc_derive_fix_imports(["Hash", "Eq"], name)}add @derive({args}) to the `{name}` type definition", tc_shadowed_trait_notes("Hash"))
+                "{tc_derive_fix_imports(["Hash", "Eq"], name)}add @derive({args}) to the `{tc_type_name_shown(name)}` type definition", tc_shadowed_trait_notes("Hash"))
         }
-        HashRefusal.NoImpl => diag_error_at("MapKeyNotHashable", MAP_KEY_NOT_HASHABLE, "{w.title} type `{shown}` does not implement Hash — {name} has no Hash implementation and cannot gain one (containers, ranges, Bytes, StringBuilder, and fn types cannot be {w.plural})", node, "use a hashable scalar (Int/sized-int/Bool/Char/Str), a tuple of hashable types, or a @derive(Hash, Eq) struct/enum as the {w.noun} instead")
+        HashRefusal.NoImpl => diag_error_at("MapKeyNotHashable", MAP_KEY_NOT_HASHABLE, "{w.title} type `{shown}` does not implement Hash — {tc_type_name_shown(name)} has no Hash implementation and cannot gain one (containers, ranges, Bytes, StringBuilder, and fn types cannot be {w.plural})", node, "use a hashable scalar (Int/sized-int/Bool/Char/Str), a tuple of hashable types, or a @derive(Hash, Eq) struct/enum as the {w.noun} instead")
         HashRefusal.Instance => diag_error_at("MapKeyNotHashable", MAP_KEY_NOT_HASHABLE, "{w.title} type `{shown}` does not implement Hash — a derived Hash holds only where each type argument its fields use is Hash", node, "use type arguments that are Hash, or derive Hash on the argument types")
     }
 }
@@ -15803,7 +15909,7 @@ fn tc_derive_field_help(leaf: Int, tr: Str) -> Str {
     if tc_tid_base_derives(leaf, tr) { return generic_help }
     let base = if k == TyKind.Struct { tc_struct_base_tid(leaf) } else { tc_enum_base_tid(leaf) }
     let bname = strip_module_qualifier(tc_type_name(base))
-    "{tc_derive_fix_imports([tr], bname)}add `@derive({tc_derive_arg_for(tr, bname)})` to `type {bname}`"
+    "{tc_derive_fix_imports([tr], bname)}add `@derive({tc_derive_arg_for(tr, bname)})` to `type {tc_type_name_shown(bname)}`"
 }
 
 // The declared tid of the struct field `f`, or of the `fi`th field of variant `v`; -1 when
@@ -16069,7 +16175,7 @@ fn tc_struct_decls_named(bare: Str) -> List[Int] {
     match tc_namesake_type_modules.get(bare) {
         Some(mods) => {
             for m in mods.split("|") {
-                keys.push(if tc_module_key_is_main(m) != 0 { bare } else { "{m}.{bare}" })
+                keys.push(tc_namesake_pool_name(bare, m))
             }
         }
         None => keys.push(bare)
@@ -17573,7 +17679,16 @@ fn tc_trait_segment(key: Str) -> Str {
 // The signature key of a trait impl's method, which is also the stem of its C symbol, so the
 // two cannot name different methods.
 pub fn tc_impl_method_stem(impl_type: Str, trait_key: Str, mname: Str) -> Str {
-    "{tc_sym_escape(impl_type)}_{tc_trait_segment(trait_key)}_{tc_sym_escape(mname)}"
+    "{tc_recv_segment(impl_type)}_{tc_trait_segment(trait_key)}_{tc_sym_escape(mname)}"
+}
+
+// The receiver segment of an impl method's key and C stem. A type that shadows a builtin has
+// the builtin's spelling, so it carries its module after `_2`, as a shared trait does; the
+// main module of a single-file build is "", which leaves `_2` and the separator. The builtin
+// and every other type is its escaped name alone.
+fn tc_recv_segment(impl_type: Str) -> Str {
+    if !tc_is_shadow_pool_name(impl_type) { return tc_sym_escape(impl_type) }
+    "{tc_sym_escape(tc_name_last_segment(impl_type))}_2{tc_sym_escape(tc_pool_name_module(impl_type))}"
 }
 
 // The stem of an impl method of a generic trait, with each trait argument spelled the way the
@@ -17744,6 +17859,23 @@ pub fn tc_static_owner(written: Str) -> Str {
     tc_static_head(written).owner
 }
 
+// The type an owner from tc_static_call_owner names. The owner is already a pool name, so a
+// bare compiler-known spelling is the builtin even in a module that declares a shadow of it:
+// lookup_named_type would read that spelling as written and answer with the shadow.
+pub fn tc_owner_tid(owner: Str) -> Int {
+    match named_type_map.get(owner) {
+        Some(v) => return v
+        None => {}
+    }
+    if tc_is_shadowable_type_name(owner) { return -1 }
+    lookup_named_type(owner)
+}
+
+// tc_head_decl_tid for an owner from tc_static_call_owner.
+pub fn tc_owner_head_tid(owner: Str) -> Int {
+    tc_enum_base_tid(resolve_alias_tid(tc_owner_tid(owner)))
+}
+
 // The owner typecheck read for the static call `node`. A head such as `Self` means a type
 // only in the impl it is written in, and a head's spelling can mean another type in another
 // module, so codegen reads the answer and not the spelling.
@@ -17841,6 +17973,15 @@ fn tc_static_head_sig(head: StaticHead, method: Str) -> Int {
         None => -1
     }
     let sig = if own == -1 { fnsig_map.get(name) ?? -1 } else { own }
+    let pool = tc_nominal_type_name(head.decl)
+    if pool != node_name(head.decl) {
+        // A signature the compiler makes for the declaration, such as a derive's, is keyed by
+        // its pool name. One made under the bare spelling is another type's: the builtin's, or
+        // the main file's namesake.
+        let made = fnsig_map.get("{pool}_{method}") ?? -1
+        if made != -1 { return made }
+        if sig != -1 && fnsig_pool.get(sig).unwrap().decl < 0 { return -1 }
+    }
     if sig == -1 { return -1 }
     let fdecl = fnsig_pool.get(sig).unwrap().decl
     if fdecl >= 0 && !tc_same_module(node_module(fdecl), home) { return -1 }
@@ -18984,7 +19125,8 @@ fn validate_trait_impls_in_own_modules(program: Int) ! TypeCheck.Register, TypeC
         let impl_type = tc_impl_target_name(im)
         tc_record_impl_recv_tid(im)
         if is_trait_name(trait_name) == 0 {
-            if is_sealed_builtin_type(trait_name) != 0 && is_user_sourced(im) != 0 {
+            // A type that shadows the builtin here is not the sealed builtin: it is just no trait.
+            if is_sealed_builtin_type(trait_name) != 0 && is_user_sourced(im) != 0 && tc_compiler_known_type_meant(trait_name, -1) != "" {
                 diag_error_at("TraitContractSealedBuiltin", TRAIT_CONTRACT_907, "`{tc_trait_shown(trait_name)}` is a sealed built-in type and cannot be implemented for user types", im, "`{tc_trait_shown(trait_name)}` is a closed built-in; define your own trait with the methods you need and impl that instead")
                 ii = ii + 1
                 continue
@@ -20229,7 +20371,7 @@ fn tc_flush_unresolved_methods(type_qualified: Bool) ! Diag.Report {
 // call is written.
 fn tc_report_unknown_type_qualified_call(n: Int, method: Str) ! Diag.Report {
     let written = node_name(node_obj(n))
-    let site_module = tc_site_module(n)
+    let site_module = tc_method_calls.type_qualified_module.get(n) ?? tc_site_module(n)
     let site_self = tc_method_calls.type_qualified.get(n) ?? -1
     let saved_module = nr_current_module
     let saved_self = tc_current_self_tid
@@ -25762,14 +25904,14 @@ fn tc_struct_literal_owner(stid: Int) -> Option[LitOwner] {
     let name = if target != -1 { tc_instance_base_name(target) } else { written }
     let decl = tc_struct_decl_nodes.get(name) ?? -1
     if decl == -1 { return None }
-    Some(LitOwner { shown: tc_nominal_type_name(decl), decl: decl, rows: tc_lit_rows(node_fields(decl)), is_struct: true })
+    Some(LitOwner { shown: tc_decl_shown(decl), decl: decl, rows: tc_lit_rows(node_fields(decl)), is_struct: true })
 }
 
 fn tc_variant_literal_owner(var_idx: Int) -> Option[LitOwner] {
     let vdecl = tc_variant_decl_node(var_idx)
     if vdecl == -1 { return None }
     let edecl = evar_pool.get(var_idx).unwrap().enum_decl
-    Some(LitOwner { shown: "{tc_nominal_type_name(edecl)}.{node_name(vdecl)}", decl: edecl, rows: tc_lit_rows(node_fields(vdecl)), is_struct: false })
+    Some(LitOwner { shown: "{tc_decl_shown(edecl)}.{node_name(vdecl)}", decl: edecl, rows: tc_lit_rows(node_fields(vdecl)), is_struct: false })
 }
 
 // Option and Result are not in evar_pool, and their fields have no names.
@@ -27035,6 +27177,9 @@ type MethodCallFacts {
     // §6.3.5). Recorded in Phase 1, the only phase that knows which names a scope binds.
     // Each call whose head names a type, to the `Self` type where it is written, or -1.
     type_qualified: Map[Int, Int]
+    // The module each of those calls is written in, as the body walk read it. The flush runs
+    // after every body, when the current function and module are the last body's.
+    type_qualified_module: Map[Int, Str]
     // True while name resolution infers a `let` value ahead of the body walk. That walk has
     // not typed a local bound to a literal yet, so a check that needs an argument's type waits
     // for the body walk.
@@ -27049,7 +27194,7 @@ type HelperFix {
 let mut tc_method_calls: MethodCallFacts = new_method_call_facts()
 
 fn new_method_call_facts() -> MethodCallFacts {
-    MethodCallFacts { unresolved: [], hard: Map(), receiver_failed: Map(), seeded_expected: Map(), dropped: Map(), helper_fixes: Map(), bound_args: Map(), type_qualified: Map(), let_value_first_walk: false }
+    MethodCallFacts { unresolved: [], hard: Map(), receiver_failed: Map(), seeded_expected: Map(), dropped: Map(), helper_fixes: Map(), bound_args: Map(), type_qualified: Map(), type_qualified_module: Map(), let_value_first_walk: false }
 }
 
 // Mark a method call the inference pass could not type and did not report on: the name
@@ -27313,7 +27458,7 @@ fn tc_refuse_list_scan(node: Int, obj_t: Int, need: List[Int], method: Str) -> I
         let bname = strip_module_qualifier(tc_type_name(base))
         let imps = tc_derive_fix_imports(["Eq"], bname)
         let sep = if imps == "" { "; " } else { "\n" }
-        help = "{help}{sep}{imps}add `@derive({tc_derive_arg_for("Eq", bname)})` to `type {bname}`"
+        help = "{help}{sep}{imps}add `@derive({tc_derive_arg_for("Eq", bname)})` to `type {tc_type_name_shown(bname)}`"
     }
     if k == TyKind.Typevar {
         let fix = tc_core_bound_fix("Eq", type_to_str(leaf))
@@ -27332,7 +27477,7 @@ fn tc_report_unresolved_method(node: Int, recv: Int, tname: Str, method: Str) ! 
     tc_type_args_unresolved.insert(node, 1)
     let k = type_kind(recv)
     if k == TyKind.Bool && method == "to_int" { return tc_report_bool_to_int(node) }
-    tc_error_naming_types("UnresolvedMethod", UNRESOLVED_METHOD, "unresolved method `.{method}` on type {tname}", node, tc_unresolved_method_help(k, tname, method, node), [recv])
+    tc_error_naming_types("UnresolvedMethod", UNRESOLVED_METHOD, "unresolved method `.{method}` on type {tc_type_name_shown(tname)}", node, tc_unresolved_method_help(k, tname, method, node), [recv])
 }
 
 // A member a type path `K.x` can name (§3.4 *An unknown member of a type path*): `kind` is
@@ -28338,7 +28483,7 @@ fn tc_flush_method_reads() ! Diag.Report {
 // The functions a static call on `head` resolves to: the type-scoped functions and the trait
 // statics of its impls. Each name is kept only when a call on the head would reach it.
 fn tc_static_names(head: StaticHead) -> List[Str] {
-    let owner = if head.decl >= 0 { node_name(head.decl) } else { head.owner }
+    let owner = if head.decl >= 0 { tc_nominal_type_name(head.decl) } else { head.owner }
     let prefix = "{owner}_"
     let mut out: List[Str] = []
     for fs in fnsig_pool {
@@ -28368,7 +28513,7 @@ fn tc_unresolved_method_help(obj_k: TyKind, tname: Str, method: Str, node: Int) 
     if method == "display" {
         // No impl can name an open slot.
         if tname.contains("?") { return "" }
-        return "add an `impl Display for {tname}` (with `fn fmt(self, sb: StringBuilder)`)"
+        return "add an `impl Display for {tc_type_name_shown(tname)}` (with `fn fmt(self, sb: StringBuilder)`)"
     }
     if method == "to_bool" && (obj_k == TyKind.Int || is_sized_int(obj_k)) { return "compare with 0: `n != 0`" }
     if obj_k == TyKind.List {
@@ -31769,7 +31914,7 @@ fn tc_debug_unbuilt_in(tid0: Int, top: Bool) -> Option[Str] {
             if tc_tid_base_derives(tid, "Debug") { return tc_debug_fields_unbuilt(tid) }
             if top { return None }
             let base = if t.kind == TyKind.Struct { tc_struct_base_tid(tid) } else { tc_enum_base_tid(tid) }
-            Some("call the written `debug` of `{strip_module_qualifier(tc_type_name(base))}` inside another value")
+            Some("call the written `debug` of `{tc_tid_shown(base)}` inside another value")
         }
         TyKind.List | TyKind.Option | TyKind.Range => tc_debug_unbuilt_in(t.inner1, false)
         TyKind.Map => {
@@ -31824,7 +31969,7 @@ fn tc_clone_unbuilt(tid0: Int, top: Bool) -> Option[Str] {
         let base = if k == TyKind.Struct { tc_struct_base_tid(tid) } else { tc_enum_base_tid(tid) }
         let bname = strip_module_qualifier(tc_type_name(base))
         if tc_type_name_derives(bname, "Clone") != 0 || !tc_type_writes_trait_method(bname, "clone", "Clone") { return None }
-        return Some("call the written `clone` of `{bname}` inside another value")
+        return Some("call the written `clone` of `{tc_type_name_shown(bname)}` inside another value")
     }
     if k == TyKind.Range { return tc_clone_unbuilt(tc_tid_child(tid, 0), top) }
     let parts = if k == TyKind.Tuple { tc_tuple_elem_tids(tid) } else if k == TyKind.Option || k == TyKind.Result {
@@ -32634,14 +32779,14 @@ fn tc_trait_need_fixes(leaf: Int, ask: TcAsk) -> List[Str] {
         let bname = strip_module_qualifier(tc_type_name(base))
         // Debug is read from the derive alone, so a written impl of it is not what is missing.
         if tr == "Debug" && tc_type_writes_trait_method(bname, "debug", tr) {
-            lines.push("a written `impl Debug for {bname}` does not count as `Debug` here yet")
-            lines.push("{tc_derive_fix_imports([tr], bname)}add `@derive({tc_derive_arg_for(tr, bname)})` to `type {bname}` in its place")
+            lines.push("a written `impl Debug for {tc_type_name_shown(bname)}` does not count as `Debug` here yet")
+            lines.push("{tc_derive_fix_imports([tr], bname)}add `@derive({tc_derive_arg_for(tr, bname)})` to `type {tc_type_name_shown(bname)}` in its place")
         } else if tc_type_writes_trait_method(bname, tc_trait_method(tr), tr) {
             let imp = tc_core_import_in(tr, nr_current_module)
             if imp != "" { lines.push(imp) }
             lines.push("write `impl {tc_core_name_in(tr, nr_current_module)} for {type_to_str(leaf)}`")
         } else if tc_type_name_derives(bname, tr) == 0 {
-            lines.push("{tc_derive_fix_imports([tr], bname)}add `@derive({tc_derive_arg_for(tr, bname)})` to `type {bname}`")
+            lines.push("{tc_derive_fix_imports([tr], bname)}add `@derive({tc_derive_arg_for(tr, bname)})` to `type {tc_type_name_shown(bname)}`")
         }
     }
     if k == TyKind.Typevar {
@@ -32951,9 +33096,9 @@ fn tc_refuse_unordered_sort(node: Int, recv: Int, elem: Int) -> Int ! TypeCheck.
         let leaf = path.get(path.len() - 1).unwrap()
         let lk = type_kind(leaf)
         let lead = if lk == TyKind.Struct {
-            "implement `Ord` for `{strip_module_qualifier(tc_type_name(tc_struct_base_tid(leaf)))}`"
+            "implement `Ord` for `{tc_tid_shown(tc_struct_base_tid(leaf))}`"
         } else if lk == TyKind.Enum {
-            "implement `Ord` for `{strip_module_qualifier(tc_type_name(tc_enum_base_tid(leaf)))}`"
+            "implement `Ord` for `{tc_tid_shown(tc_enum_base_tid(leaf))}`"
         } else if lk == TyKind.Typevar {
             "add the bound `[{type_to_str(leaf)}: Ord]`"
         } else {
@@ -32986,7 +33131,7 @@ fn tc_refuse_unordered_sort(node: Int, recv: Int, elem: Int) -> Int ! TypeCheck.
     } else {
         let ename = strip_module_qualifier(tc_type_name(tc_enum_base_tid(unbuilt)))
         tc_error_at_code("`sort` on `{type_to_str(elem)}` is not built yet: the compiler cannot order a fieldless enum with no `@derive(Ord)`", node, "TypeError", TYPE_ERROR,
-            "{tc_derive_fix_imports(["Ord"], ename)}add `@derive({tc_derive_arg_for("Ord", ename)})` to `type {ename}`, which gives it the same declaration order")
+            "{tc_derive_fix_imports(["Ord"], ename)}add `@derive({tc_derive_arg_for("Ord", ename)})` to `type {tc_type_name_shown(ename)}`, which gives it the same declaration order")
     }
     1
 }
@@ -34172,8 +34317,7 @@ fn tc_check_lit_field_values(node: Int, lit_t: Int) ! TypeCheck.Resolve, TypeChe
     let mut vname = ""
     let mut var_idx = -1
     if k == TyKind.Enum {
-        let segs = node_type_name(node).split(".")
-        vname = segs.get(segs.len() - 1) ?? ""
+        vname = tc_name_last_segment(node_type_name(node))
         var_idx = get_variant_by_name(tc_enum_base_tid(r), vname)
         if var_idx == -1 { return }
     }
@@ -36155,9 +36299,9 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                 // (sections/04_effects.md §4.7.2), so the note names the impl that was written.
                 let mut notes: List[Str] = []
                 if tc_type_writes_trait_method(tname, method, "BlockHandler") && tc_type_writes_trait_method(tname, "close", "Closeable") {
-                    notes.push("`impl Closeable for {tname}` provides `BlockHandler` for `{tname}`")
+                    notes.push("`impl Closeable for {tc_type_name_shown(tname)}` provides `BlockHandler` for `{tc_type_name_shown(tname)}`")
                 }
-                diag_error_at_notes("AmbiguousMethodCall", AMBIGUOUS_METHOD_CALL, "ambiguous method call: `.{method}` is defined in multiple traits implemented by {tname} ({names})", node, "use a qualified call to disambiguate, e.g. `Trait.{method}(receiver)`", notes)
+                diag_error_at_notes("AmbiguousMethodCall", AMBIGUOUS_METHOD_CALL, "ambiguous method call: `.{method}` is defined in multiple traits implemented by {tc_type_name_shown(tname)} ({names})", node, "use a qualified call to disambiguate, e.g. `Trait.{method}(receiver)`", notes)
                 return tc_error_recovery_tid()
             }
             // Resolve through the trait-qualified fnsig key. From/TryFrom register
@@ -36295,7 +36439,7 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
             if obj_k == TyKind.Struct {
                 let fld_tid = get_struct_field_tid(obj_t, method)
                 if fld_tid != -1 && type_kind(fld_tid) == TyKind.Fn {
-                    return tc_check_call_against_fn_tid(fld_tid, node_args(node), "closure field `{tname}.{method}`", node)
+                    return tc_check_call_against_fn_tid(fld_tid, node_args(node), "closure field `{tc_type_name_shown(tname)}.{method}`", node)
                 }
             }
             // The receiver type is KNOWN, but no resolution path matched. Emit E0505
@@ -36338,7 +36482,10 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
             let obj_written = node_name(obj_node)
             // The flush reports the call after its impl is checked, under the `Self` it is
             // written in.
-            if tc_method_calls.type_qualified.contains_key(node) { tc_method_calls.type_qualified.insert(node, tc_current_self_tid) }
+            if tc_method_calls.type_qualified.contains_key(node) {
+                tc_method_calls.type_qualified.insert(node, tc_current_self_tid)
+                tc_method_calls.type_qualified_module.insert(node, tc_site_module(node))
+            }
             let static_head = if nr_receiver_has_binding(obj_written) != 0 { StaticHead { owner: obj_written, alias: -1, decl: -1, builtin: false, inst: -1 } } else { tc_static_head(obj_written) }
             let obj_name = static_head.owner
             if nr_receiver_has_binding(obj_written) == 0 { tc_calls.static_owners.insert(node, obj_name) }
@@ -39403,7 +39550,7 @@ fn tc_check_match_exhaustive(node: Int, scrut_tid: Int, arms_sl: Int) ! TypeChec
     }
     if missing.len() == 0 { return }
 
-    let ename = strip_module_qualifier(ty_pool.get(base).unwrap().name)
+    let ename = tc_tid_shown(base)
     let mut list_str = ""
     let mut mi = 0
     while mi < missing.len() {
@@ -43077,6 +43224,11 @@ fn tc_owner_decl(o: VariantOwner) -> Int {
 
 // The owner's name as the diagnostics write it.
 fn tc_owner_shown(o: VariantOwner) -> Str {
+    tc_type_name_shown(tc_owner_name(o))
+}
+
+// The owner's name in the type pool, which keys its static methods.
+fn tc_owner_name(o: VariantOwner) -> Str {
     if o.base < 0 { return tc_prelude_carrier_name(o.carrier) }
     let decl = tc_owner_decl(o)
     if decl != -1 { return tc_nominal_type_name(decl) }
@@ -43125,7 +43277,7 @@ fn tc_same_owner(a: VariantOwner, b: VariantOwner) -> Bool {
 // namesake shadowed by a local type, or reached only through a renamed import, has none.
 fn tc_owner_site_name(o: VariantOwner) -> Option[Str] {
     let decl = if o.base < 0 { -1 } else { tc_owner_decl(o) }
-    let name = if decl == -1 { tc_owner_shown(o) } else { node_name(decl) }
+    let name = if decl == -1 { tc_owner_name(o) } else { node_name(decl) }
     match tc_qualifier_owner(name) {
         Some(s) => if tc_same_owner(s, o) { Some(name) } else { None }
         None => None
@@ -43356,7 +43508,7 @@ fn tc_other_enum_note(name: Str, owner: VariantOwner, subject: Str, site: Int) -
     }
     let own = tc_owner_decl(owner)
     for d in decls {
-        if d != own { others.push(tc_nominal_type_name(d)) }
+        if d != own { others.push(tc_decl_shown(d)) }
     }
     let shown = tc_owner_shown(owner)
     // A user enum that spells its name like the owner would make the note contradict itself.
@@ -43395,7 +43547,7 @@ fn tc_value_missing_variant(qual: Str, name: Str) -> Option[VariantOwner] {
         Some(o) => {
             if tc_owner_has_variant(o, name) || tc_static_method_named(qual, name) { return None }
             // Through an alias the static methods are declared on the enum itself.
-            if o.base >= 0 && tc_static_method_named(tc_owner_shown(o), name) { return None }
+            if o.base >= 0 && tc_static_method_named(tc_owner_name(o), name) { return None }
             Some(o)
         }
         None => None
@@ -44749,9 +44901,9 @@ fn type_to_str(tid0: Int) -> Str {
                 targs = targs.concat(type_to_str(ty_param_list.get(start + i).unwrap()))
                 i = i + 1
             }
-            return "{strip_module_qualifier(name)}[{targs}]"
+            return "{tc_type_name_shown(strip_module_qualifier(name))}[{targs}]"
         }
-        return name
+        return tc_type_name_shown(name)
     }
     if k == TyKind.Fn {
         let start = t.params_start
@@ -46405,7 +46557,8 @@ pub fn tc_stamp_program(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Dia
 // codegen_types.bl only because that file was compiled into every program; the
 // answers were never a storage fact and nothing in codegen consumed them.
 
-// `std.db.row.Row` → `db.row.Row`. Strips one leading segment, not all of them. A namesake
+// `std.db.row.Row` → `db.row.Row`. Strips one leading segment, not all of them: a written
+// qualifier is one segment, while a pool name splits at its last dot (tc_name_last_dot). A namesake
 // keeps its qualifier: `alpha.Point` IS the nominal name when another module also declares
 // `Point`, so stripping it would collapse the two types every comparison keeps apart.
 pub fn strip_module_qualifier(name: Str) -> Str {

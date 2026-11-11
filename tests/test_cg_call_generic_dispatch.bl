@@ -5,12 +5,12 @@
 // an impl header carries `[T]` in both cases, so the binders cannot tell them apart.
 
 import lower_test_helpers.{
-    probe, rhs_of, assert_kind, assert_eq_str, assert_shape, assert_verifies,
-    assert_ice_saying,
+    probe, probe_but, rhs_of, assert_kind, assert_eq_str, assert_shape, assert_verifies,
 }
 import ir.{IrKind, ir_c_name}
 import cg_call.{lower_call}
 import mono.{run_mono, instances}
+import diagnostics.{diag_entries}
 
 // An impl over `List[T]` that names T nowhere in a signature. Its C reads no element, so
 // one body serves every element and the mono pass registers no instance of it.
@@ -59,8 +59,7 @@ fn main() {
 
 // The same element-agnostic impl, in a program that also declares a type called `List`. That
 // declaration takes the name in this module, so the header names the container by the alias
-// its home exports it under. Both receivers are written, because the header answers for one
-// of them and not the other.
+// its home exports it under.
 fn src_namesake() -> Str {
     #"import blink.core.{List as CoreList}
 
@@ -76,8 +75,28 @@ fn main() {
     let ys = [1, 2, 3]
     let tallied = ys.tally_from(4)
     let p = List { n: 1 }
+    let _keep = [tallied, p.n]
+}
+"#
+}
+
+// The same header with the call written on the declaration too. The header answers for the
+// container only, so that call has no method behind it.
+fn src_namesake_shadowed_call() -> Str {
+    #"import blink.core.{List as CoreList}
+
+type List { n: Int }
+
+trait Tally { fn tally_from(self, base: Int) -> Int }
+
+impl[T] Tally for CoreList[T] {
+    fn tally_from(self, base: Int) -> Int { base }
+}
+
+fn main() {
+    let p = List { n: 1 }
     let shadowed = p.tally_from(5)
-    let _keep = [tallied, shadowed]
+    let _keep = shadowed
 }
 "#
 }
@@ -165,12 +184,15 @@ test "a container method reaches its body while a namesake declaration shares th
 
 // The other half of the same header, and the one that has to refuse: the declaration named
 // `List` has no impl of its own, and the container's body reads a list. Calling it with a
-// struct would compile C that reads the wrong bytes, so the call is refused instead.
+// struct would compile C that reads the wrong bytes, so type checking refuses the call
+// before codegen sees it (sections/07 §10.6).
 test "a declaration sharing a container's name does not inherit the container's impl" {
-    let program = probe("cg_call_shadowed", src_namesake())
-    run_mono(program)
-    assert_ice_saying("shadowed", lower_call(rhs_of("shadowed")),
-        "CodegenStageNotBuilt", "cg_call methods: Struct.tally_from")
+    let _program = probe_but("cg_call_shadowed", src_namesake_shadowed_call(), "UnresolvedMethod")
+    let mut found: List[Str] = []
+    for d in diag_entries {
+        if d.name == "UnresolvedMethod" { found.push("{d.line}:{d.col} {d.message}") }
+    }
+    assert_eq(found.join(" | "), "13:20 unresolved method `.tally_from` on type List")
 }
 
 test "a plain impl method still reaches the body under its own name" {

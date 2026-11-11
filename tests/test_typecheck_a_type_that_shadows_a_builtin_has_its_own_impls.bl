@@ -1,0 +1,786 @@
+// A type declared with the name of a compiler-known type shadows it (sections/07 §10.6
+// *Shadowing Rules*): it is a type of its own, and `import blink.core.{X as Y}` still reaches the
+// builtin. So an impl on one is never an impl on the other. The program's `Bytes` and the
+// builtin Bytes each take their own impl of one trait, and a method or a qualified call on each
+// reaches its own. A builtin impl does not answer for the program's type, and the program's impl
+// does not answer for the builtin. Check, the one-unit build and the per-module build agree.
+
+import std.process.{ChildEnd, ChildLimits, ProcessResult}
+import std.time.{Duration}
+
+fn sh(cmd: Str) -> ProcessResult ! Process.Spawn {
+    process.run("sh", ["-c", cmd], limits: ChildLimits { timeout: Some(Duration.seconds(300)) }).unwrap()
+}
+
+// A package whose src/ holds `files`, each a (name, text) pair; src/main.bl is its main file.
+fn project_with(files: List[(Str, Str)]) -> Str ! FS.Write, Process.Spawn {
+    let dir = sh("mktemp -d /tmp/blink_shadow_impls.XXXXXX").out.trim()
+    let _ = sh("mkdir -p {dir}/src/geo")
+    fs.write("{dir}/blink.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\n").unwrap()
+    fs.write("{dir}/blink.lock", "[metadata]\nlockfile-version = 1\n").unwrap()
+    for (name, text) in files {
+        fs.write("{dir}/src/{name}", text).unwrap()
+    }
+    dir
+}
+
+fn project(main: Str) -> Str ! FS.Write, Process.Spawn {
+    project_with([("main.bl", main)])
+}
+
+// Runs `$B <cmd>` in dir. The corpus exports module filters that make each build one unit,
+// so the run drops them: --per-module must reach the per-module path.
+fn blink_in(dir: Str, cmd: Str) -> ProcessResult ! Process.Spawn {
+    sh("B=$(pwd)/build/blink; cd {dir} && env -u BLINK_PER_MODULE -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE BLINK_CACHE_DIR={dir}/cache BLINK_BIN=$B $B {cmd}")
+}
+
+fn diag(r: ProcessResult) -> Str {
+    "exit {r.end}\nstdout:\n{r.out}\nstderr:\n{r.err_out}"
+}
+
+fn check_with(files: List[(Str, Str)]) -> ProcessResult ! FS.Write, Process.Spawn {
+    let dir = project_with(files)
+    let r = blink_in(dir, "check src/main.bl")
+    let _ = sh("rm -rf {dir}")
+    r
+}
+
+fn check(main: Str) -> ProcessResult ! FS.Write, Process.Spawn {
+    check_with([("main.bl", main)])
+}
+
+// Check passes with no error, then each build path builds the program and it prints `want`.
+fn expect_runs(main: Str, want: Str) ! FS.Write, Process.Spawn {
+    expect_runs_with([("main.bl", main)], want)
+}
+
+fn expect_runs_with(files: List[(Str, Str)], want: Str) ! FS.Write, Process.Spawn {
+    let c = check_with(files)
+    assert_eq(c.end, ChildEnd.Exited(0), diag(c))
+    assert(!c.err_out.contains("error"), diag(c))
+    for flag in ["--per-module", "--no-per-module"] {
+        let dir = project_with(files)
+        let b = blink_in(dir, "build {flag} -o {dir}/app src/main.bl")
+        let r = if b.end == ChildEnd.Exited(0) { sh("{dir}/app") } else { b }
+        let _ = sh("rm -rf {dir}")
+        assert_eq(b.end, ChildEnd.Exited(0), "{flag}\n{diag(b)}")
+        assert_eq(r.out.trim(), want, "{flag}\n{diag(r)}")
+    }
+}
+
+// Check fails with exactly one error, `report`, at `at`, and no internal compiler error.
+fn expect_one_error(main: Str, report: Str, at: Str) ! FS.Write, Process.Spawn {
+    let r = check(main)
+    assert_eq(r.end, ChildEnd.Exited(1), diag(r))
+    assert(r.err_out.contains(report), diag(r))
+    assert(r.err_out.contains("--> {at}"), diag(r))
+    assert(r.err_out.contains("1 error(s) found"), diag(r))
+    assert(!r.err_out.contains("internal compiler error"), diag(r))
+}
+
+// A program with no package: main.bl and its sibling modules, built as one file's program, so
+// the main module is the unnamed one.
+fn expect_single_file_runs(files: List[(Str, Str)], want: Str) ! FS.Write, Process.Spawn {
+    for flag in ["--per-module", "--no-per-module"] {
+        let dir = sh("mktemp -d /tmp/blink_shadow_impls.XXXXXX").out.trim()
+        for (name, text) in files {
+            fs.write("{dir}/{name}", text).unwrap()
+        }
+        let c = blink_in(dir, "check main.bl")
+        let b = blink_in(dir, "build {flag} -o {dir}/app main.bl")
+        let r = if b.end == ChildEnd.Exited(0) { sh("{dir}/app") } else { b }
+        let _ = sh("rm -rf {dir}")
+        assert_eq(c.end, ChildEnd.Exited(0), diag(c))
+        assert_eq(b.end, ChildEnd.Exited(0), "{flag}\n{diag(b)}")
+        assert_eq(r.out.trim(), want, "{flag}\n{diag(r)}")
+    }
+}
+
+let SZ_BOTH = "import blink.core.\{Bytes as CoreBytes}
+
+type Bytes \{ n: Int }
+
+trait Sz \{
+    fn sz(self) -> Int
+}
+
+impl Sz for Bytes \{
+    fn sz(self) -> Int \{ self.n }
+}
+
+impl Sz for CoreBytes \{
+    fn sz(self) -> Int \{ self.len() + 100 }
+}
+"
+
+test "a qualified call reaches the impl on the program's Bytes and the impl on the builtin Bytes" {
+    expect_runs("{SZ_BOTH}
+fn main() \{
+    let b = Bytes \{ n: 3 }
+    let c = CoreBytes.new()
+    io.println(\"\{Sz.sz(b)} \{Sz.sz(c)}\")
+}
+", "3 100")
+}
+
+test "a method call reaches the impl on the program's Bytes and the impl on the builtin Bytes" {
+    expect_runs("{SZ_BOTH}
+fn main() \{
+    let b = Bytes \{ n: 3 }
+    let c = CoreBytes.new()
+    io.println(\"\{b.sz()} \{c.sz()}\")
+}
+", "3 100")
+}
+
+test "a bound written inline, in an impl's where clause and through a supertrait picks each type's own impl" {
+    expect_runs("{SZ_BOTH}
+trait Big: Sz \{
+    fn big(self) -> Bool
+}
+
+impl Big for Bytes \{
+    fn big(self) -> Bool \{ self.n > 1 }
+}
+
+impl Big for CoreBytes \{
+    fn big(self) -> Bool \{ self.len() > 1 }
+}
+
+type Hold[T] \{ v: T }
+
+trait Measure \{
+    fn measure(self) -> Int
+}
+
+impl[T] Measure for Hold[T] where T: Sz \{
+    fn measure(self) -> Int \{ self.v.sz() }
+}
+
+fn inline[T: Sz](x: T) -> Int \{ x.sz() }
+
+fn through_super[T: Big](x: T) -> Int \{ x.sz() }
+
+fn main() \{
+    let b = Bytes \{ n: 3 }
+    let c = CoreBytes.new()
+    io.println(\"\{inline(b)} \{inline(c)}\")
+    io.println(\"\{Hold \{ v: b }.measure()} \{Hold \{ v: c }.measure()}\")
+    io.println(\"\{through_super(b)} \{through_super(c)}\")
+}
+", "3 100\n3 100\n3 100")
+}
+
+test "a generic impl on the program's List and one on the builtin List each answer their own type" {
+    expect_runs("import blink.core.\{List as CoreList}
+
+trait Tally \{
+    fn tally(self) -> Int
+}
+
+type List[T] \{ v: T }
+
+impl[T] Tally for List[T] \{
+    fn tally(self) -> Int \{ 1 }
+}
+
+impl[T] Tally for CoreList[T] \{
+    fn tally(self) -> Int \{ self.len() + 10 }
+}
+
+fn main() \{
+    let a: CoreList[Int] = [1, 2]
+    let u = List \{ v: 5 }
+    io.println(\"\{a.tally()} \{u.tally()} \{Tally.tally(a)} \{Tally.tally(u)}\")
+}
+", "12 1 12 1")
+}
+
+test "the builtin Bytes impl of Sized does not answer for the program's Bytes" {
+    expect_one_error("type Bytes \{ v: Int }
+
+fn main() \{
+    let b = Bytes \{ v: 3 }
+    io.println(\"\{b.len()}\")
+}
+", "error[UnresolvedMethod]: unresolved method `.len` on type Bytes", "src/main.bl:5:18")
+}
+
+test "the program's impl on its List does not answer for a list literal" {
+    expect_one_error("trait Tally \{
+    fn tally(self) -> Int
+}
+
+type List[T] \{ v: T }
+
+impl[T] Tally for List[T] \{
+    fn tally(self) -> Int \{ 1 }
+}
+
+fn main() \{
+    let u = List \{ v: 5 }
+    io.println(\"\{u.tally()} \{[1, 2].tally()}\")
+}
+", "error[UnresolvedMethod]: unresolved method `.tally` on type List[Int]", "src/main.bl:13:30")
+}
+
+test "an impl on the builtin Bytes is judged by the builtin's traits, not by the program's Bytes" {
+    expect_runs("import blink.core.\{Bytes as CoreBytes}
+
+trait Big: Eq \{
+    fn big(self) -> Bool
+}
+
+type Bytes \{ n: Int }
+
+impl Big for CoreBytes \{
+    fn big(self) -> Bool \{ self.len() > 1 }
+}
+
+fn main() \{
+    let b = Bytes \{ n: 3 }
+    io.println(\"\{CoreBytes.new().big()} \{b.n}\")
+}
+", "false 3")
+}
+
+test "the program's derived Debug and Eq answer for its Bytes, and the builtin's for the builtin" {
+    expect_runs("import blink.core.\{Bytes as CoreBytes}
+
+@derive(Debug, Eq)
+type Bytes \{ n: Int }
+
+fn main() \{
+    let b = Bytes \{ n: 3 }
+    io.println(b.debug())
+    io.println(CoreBytes.from_str(\"hi\").debug())
+    io.println(\"\{b == Bytes \{ n: 3 }} \{b == Bytes \{ n: 4 }}\")
+}
+", "Bytes \{ n: 3 }\nBytes(6869)\ntrue false")
+}
+
+test "a Hash derived on the program's Bytes does not make the builtin Bytes Hash" {
+    expect_one_error("import blink.core.\{Bytes as CoreBytes}
+
+@derive(Eq, Hash)
+type Bytes \{ n: Int }
+
+fn h[K: Hash](k: K) -> Int \{ 1 }
+
+fn main() \{
+    io.println(\"\{h(Bytes \{ n: 1 })} \{h(CoreBytes.new())}\")
+}
+", "error[TraitBoundNotSatisfied]: `Bytes` does not satisfy the Hash bound on type parameter K", "src/main.bl:9:38")
+}
+
+test "a type error names the program's Bytes and the builtin Bytes by name and module" {
+    expect_one_error("import blink.core.\{Bytes as CoreBytes}
+
+type Bytes \{ n: Int }
+
+fn main() \{
+    let x: Bytes = CoreBytes.new()
+    io.println(\"\{x.n}\")
+}
+", "error[TypeError]: variable `x`: declared type Bytes (main) but got Bytes (blink.core)", "src/main.bl:6:5")
+}
+
+test "a type that shadows a builtin gets one W1010, however many impls and derives it has" {
+    let r = check("@derive(Debug, Eq)
+type Bytes \{ n: Int }
+
+trait Sz \{
+    fn sz(self) -> Int
+}
+
+impl Sz for Bytes \{
+    fn sz(self) -> Int \{ self.n }
+}
+
+@derive(Debug)
+type Wrap \{ b: Bytes }
+
+fn main() \{
+    let b = Bytes \{ n: 3 }
+    io.println(\"\{b.sz()} \{Sz.sz(b)} \{Wrap \{ b: b }.debug()} \{b == b}\")
+}
+")
+    assert_eq(r.end, ChildEnd.Exited(0), diag(r))
+    assert_eq(r.err_out.split("warning[ShadowedPreludeName]").len(), 2, diag(r))
+    assert(r.err_out.contains("warning[ShadowedPreludeName]: name shadows compiler-known type"), diag(r))
+    assert(r.err_out.contains("--> src/main.bl:2:1"), diag(r))
+    assert(!r.err_out.contains(".Bytes"), diag(r))
+}
+
+let ALPHA = "import blink.core.\{Bytes as CoreBytes}
+
+pub type Bytes \{ n: Int }
+
+pub trait Sz \{
+    fn sz(self) -> Int
+}
+
+impl Sz for Bytes \{
+    fn sz(self) -> Int \{ self.n }
+}
+
+impl Sz for CoreBytes \{
+    fn sz(self) -> Int \{ self.len() + 100 }
+}
+"
+
+test "a Bytes declared in another module, and the main module's own Bytes, each take their own impl" {
+    expect_runs_with([("alpha.bl", ALPHA), ("main.bl", "import alpha.\{Bytes as AB, Sz}
+
+type Bytes \{ n: Int }
+
+impl Sz for Bytes \{
+    fn sz(self) -> Int \{ self.n + 50 }
+}
+
+fn main() \{
+    let a = AB \{ n: 3 }
+    let m = Bytes \{ n: 4 }
+    let c = Bytes \{ n: 0 }
+    io.println(\"\{a.sz()} \{m.sz()} \{Sz.sz(a)} \{Sz.sz(m)} \{c.n}\")
+}
+")], "3 54 3 54 0")
+}
+
+test "a builtin's impl in another module answers for the builtin in the main module" {
+    expect_runs_with([("alpha.bl", ALPHA), ("main.bl", "import alpha.\{Sz}
+
+fn main() \{
+    let c = Bytes.new()
+    io.println(\"\{c.sz()} \{Sz.sz(c)}\")
+}
+")], "100 100")
+}
+
+// Two modules each declare Bytes and Sz. The impl of one module's Sz for the other module's
+// Bytes, and the impl the other way round, spell the same four names in swapped places, so
+// their methods must still have names of their own.
+test "impls that name the same type and trait spellings from swapped modules stay apart" {
+    expect_runs_with([
+        ("ma.bl", "pub type Bytes \{ n: Int }\n\npub trait Sz \{\n    fn sz(self) -> Int\n}\n"),
+        ("mb.bl", "import ma.\{Bytes as AB, Sz as ASz}
+
+pub type Bytes \{ n: Int }
+
+pub trait Sz \{
+    fn sz(self) -> Int
+}
+
+impl Sz for AB \{
+    fn sz(self) -> Int \{ self.n + 10 }
+}
+
+impl ASz for Bytes \{
+    fn sz(self) -> Int \{ self.n + 20 }
+}
+
+pub fn both(a: AB, b: Bytes) -> Str \{
+    \"\{Sz.sz(a)} \{ASz.sz(b)}\"
+}
+"),
+        ("main.bl", "import ma.\{Bytes as AB}
+import mb.\{Bytes as BB, both}
+
+fn main() \{
+    io.println(both(AB \{ n: 1 }, BB \{ n: 2 }))
+}
+"),
+    ], "11 22")
+}
+
+// With no package the main module key is empty, so a file of its own is the one form that
+// proves the main module's Bytes is told apart from the builtin without a package name.
+test "with no package, the main file's Bytes and the builtin Bytes each take their own impl" {
+    expect_single_file_runs([("main.bl", "{SZ_BOTH}
+fn main() \{
+    let b = Bytes \{ n: 3 }
+    let c = CoreBytes.new()
+    io.println(\"\{b.sz()} \{c.sz()} \{Sz.sz(b)} \{Sz.sz(c)}\")
+}
+")], "3 100 3 100")
+}
+
+// The main file's shadowing Bytes has a name of its own beside the builtin's. A file named
+// __main__.bl is the main module, so it cannot bring a second Bytes under that name.
+test "a file named __main__.bl cannot declare a second main-module Bytes" {
+    let r = check_with([
+        ("__main__.bl", "pub type Bytes \{ n: Int }\n\npub fn mk() -> Bytes \{ Bytes \{ n: 7 } }\n"),
+        ("main.bl", "import __main__.\{mk}\n\ntype Bytes \{ n: Int }\n\nfn main() \{\n    io.println(\"\{Bytes \{ n: 3 }.n} \{mk().n}\")\n}\n"),
+    ])
+    assert_eq(r.end, ChildEnd.Exited(1), diag(r))
+    assert(r.err_out.contains("error[DuplicateModuleBinding]: `Bytes` is declared twice in module `main`"), diag(r))
+    assert(!r.err_out.contains("internal compiler error"), diag(r))
+}
+
+// The report names the program's List as written, never by the name its module gives it inside
+// the compiler.
+test "a builtin's generic impl does not answer for the program's List, and the report says List" {
+    let r = check("import blink.core.\{List as CoreList}
+
+type List \{ n: Int }
+
+trait Tally \{ fn tally_from(self, base: Int) -> Int }
+
+impl[T] Tally for CoreList[T] \{
+    fn tally_from(self, base: Int) -> Int \{ base }
+}
+
+fn main() \{
+    let p = List \{ n: 1 }
+    io.println(\"\{p.tally_from(5)}\")
+}
+")
+    assert_eq(r.end, ChildEnd.Exited(1), diag(r))
+    assert(r.err_out.contains("error[UnresolvedMethod]: unresolved method `.tally_from` on type List"), diag(r))
+    assert(r.err_out.contains("--> src/main.bl:13:18"), diag(r))
+    assert(!r.err_out.contains("__main__"), diag(r))
+    assert(!r.err_out.contains(".List"), diag(r))
+}
+
+// A `pub import` passes the declaration on, so the reader that selects the name from the facade
+// reaches the shadowing declaration and its impl, not the builtin.
+test "a Bytes selected through a facade is the declaring module's Bytes" {
+    expect_runs_with([
+        ("geo/m.bl", "pub type Bytes \{ n: Int }
+
+pub trait Sz \{ fn sz(self) -> Int }
+
+impl Sz for Bytes \{
+    fn sz(self) -> Int \{ self.n + 40 }
+}
+"),
+        ("geo/r.bl", "pub import geo.m.\{Bytes, Sz}\n"),
+        ("main.bl", "import geo.r.\{Bytes, Sz}
+
+fn main() \{
+    let b = Bytes \{ n: 2 }
+    io.println(\"\{b.sz()} \{Sz.sz(b)}\")
+}
+"),
+    ], "42 42")
+}
+
+// The main module's `List[T]` is the builtin, because the List another module declares is not
+// selected. So an element-agnostic impl on it is one shared body, as on any builtin List.
+test "a generic impl on the builtin List builds beside a List another module declares" {
+    expect_runs_with([
+        ("alpha.bl", "pub type List[T] \{ v: T }\n\npub fn one() -> Int \{ 1 }\n"),
+        ("main.bl", "import alpha.\{one}
+
+trait Q \{ fn q(self) -> Int }
+
+impl[T] Q for List[T] \{
+    fn q(self) -> Int \{ self.len() + 10 }
+}
+
+fn main() \{
+    io.println(\"\{[one()].q()}\")
+}
+"),
+    ], "11")
+}
+
+test "a static call through the builtin's import name reaches the builtin's impl" {
+    expect_runs("import blink.core.\{Bytes as CoreBytes}
+
+type Bytes \{ n: Int }
+
+trait Make \{ fn make() -> Self }
+
+impl Make for Bytes \{
+    fn make() -> Bytes \{ Bytes \{ n: 7 } }
+}
+
+impl Make for CoreBytes \{
+    fn make() -> CoreBytes \{ CoreBytes.from_str(\"abc\") }
+}
+
+fn main() \{
+    io.println(\"\{Bytes.make().n} \{CoreBytes.make().len()}\")
+}
+", "7 3")
+}
+
+// Each module's derived methods belong to its own Point, though both spell the type alike.
+test "two modules that derive the same traits on a Point of the same name each get their own" {
+    expect_runs_with([
+        ("ma.bl", "@derive(Debug, Eq, Hash, Ord, Clone)\npub type Point \{ x: Int }\n"),
+        ("mb.bl", "@derive(Debug, Eq, Hash, Ord, Clone)
+pub type Point \{ y: Str }
+
+pub fn mk() -> Point \{ Point \{ y: \"q\" } }
+
+pub fn show(p: Point) -> Str \{ \"\{p.debug()} \{p == p.clone()} \{p < p}\" }
+"),
+        ("main.bl", "import ma.\{Point}
+import mb.\{Point as BP, mk, show}
+
+@derive(Debug, Eq)
+type Pair \{ p: Point, q: BP }
+
+fn main() \{
+    let a = Point \{ x: 1 }
+    let b = mk()
+    let mut m: Map[BP, Int] = Map()
+    m.insert(b.clone(), 3)
+    io.println(\"\{a.debug()} \{b.debug()} \{a == a} \{b == mk()} \{a < Point \{ x: 2 }} \{m.get(mk()) ?? 0}\")
+    io.println(show(b))
+    io.println(Pair \{ p: a, q: b }.debug())
+}
+"),
+    ], "Point \{ x: 1 } Point \{ y: \"q\" } true true true 3\nPoint \{ y: \"q\" } true false\nPair \{ p: Point \{ x: 1 }, q: Point \{ y: \"q\" } }")
+}
+
+// Each `List` answers with its own impl: the one another module declares with that module's
+// impl, and the builtin with the main module's impl.
+test "a generic impl on another module's List and one on the builtin List each answer their own" {
+    expect_runs_with([
+        ("alpha.bl", "pub trait Q \{ fn q(self) -> Int }
+
+pub type List[T] \{ v: T }
+
+impl[T] Q for List[T] \{
+    fn q(self) -> Int \{ 5 }
+}
+
+pub fn mk() -> List[Int] \{ List \{ v: 1 } }
+"),
+        ("main.bl", "import alpha.\{Q, mk}
+
+impl[T] Q for List[T] \{
+    fn q(self) -> Int \{ self.len() + 10 }
+}
+
+fn main() \{
+    io.println(\"\{[1, 2].q()} \{mk().q()} \{Q.q(mk())}\")
+}
+"),
+    ], "12 5 5")
+}
+
+// The help lists the members of the program's Bytes, never the builtin's statics.
+test "a member the program's Bytes does not declare is reported on it, and the help lists only its own" {
+    let plain = check("type Bytes \{ n: Int }
+
+fn main() \{
+    let b = Bytes.nope()
+    io.println(\"\{b}\")
+}
+")
+    assert_eq(plain.end, ChildEnd.Exited(1), diag(plain))
+    assert(plain.err_out.contains("error[UnresolvedMethod]: no member `nope` on type `Bytes`"), diag(plain))
+    assert(plain.err_out.contains("--> src/main.bl:4:19"), diag(plain))
+    assert(!plain.err_out.contains("from_str"), diag(plain))
+    assert(!plain.err_out.contains("declares:"), diag(plain))
+    let derived = check("import std.json
+
+@derive(Serialize, Deserialize)
+type Bytes \{ n: Int }
+
+fn main() \{
+    let b = Bytes.nope()
+    io.println(\"\{b}\")
+}
+")
+    assert_eq(derived.end, ChildEnd.Exited(1), diag(derived))
+    assert(derived.err_out.contains("help: `Bytes` declares: functions from_json\n"), diag(derived))
+}
+
+// Blink has no impl without a trait. On the program's Bytes such an impl reads as it does on
+// any other type: the builtin's sealing is not about this type.
+test "an impl with no trait on the program's Bytes reports an undefined trait, as on any type" {
+    let r = check("type Bytes \{ n: Int }
+impl Bytes \{
+    fn mk() -> Bytes \{ Bytes \{ n: 7 } }
+}
+fn main() \{
+    let x = Bytes.mk()
+    io.println(\"\{x.n}\")
+}
+")
+    assert_eq(r.end, ChildEnd.Exited(1), diag(r))
+    assert(r.err_out.contains("error[TraitContract]: trait `Bytes` is not defined\n  --> src/main.bl:2:1"), diag(r))
+    assert(!r.err_out.contains("TraitContractSealedBuiltin"), diag(r))
+    assert(!r.err_out.contains("internal compiler error"), diag(r))
+}
+
+// The name the compiler files the main module's Bytes under is not a name the program can
+// write to reach anything else: with no Bytes of its own, `__main__.Bytes` names no type.
+test "a written __main__.Bytes does not reach the builtin Bytes" {
+    let r = check("fn main() \{
+    let x: __main__.Bytes = Bytes.new()
+    io.println(\"\{x.len()}\")
+}
+")
+    assert_eq(r.end, ChildEnd.Exited(1), diag(r))
+    assert(r.err_out.contains("error[UnknownType]: unknown type `__main__.Bytes`: module `__main__` declares no `Bytes`"), diag(r))
+    assert(r.err_out.contains("1 error(s) found"), diag(r))
+    assert(!r.err_out.contains("internal compiler error"), diag(r))
+}
+
+test "a type written with a leading dot is a parse error" {
+    let r = check("type Bytes \{ n: Int }
+
+fn main() \{
+    let x: .Bytes = Bytes \{ n: 1 }
+    io.println(\"\{x.n}\")
+}
+")
+    assert_eq(r.end, ChildEnd.Exited(1), diag(r))
+    assert(r.err_out.contains("error[UnexpectedToken]: expected IDENT, got .\n  --> src/main.bl:4:12"), diag(r))
+    assert(!r.err_out.contains("internal compiler error"), diag(r))
+}
+
+test "a module that imports a Bytes and declares one reports the second name" {
+    let r = check_with([
+        ("alpha.bl", "pub type Bytes \{ n: Int }\n"),
+        ("main.bl", "import alpha.\{Bytes}
+type Bytes \{ n: Int }
+
+fn main() \{
+    let x = Bytes \{ n: 1 }
+    io.println(\"\{x.n}\")
+}
+"),
+    ])
+    assert_eq(r.end, ChildEnd.Exited(1), diag(r))
+    assert(r.err_out.contains("error[DuplicateSymbol]: `Bytes` is both imported and declared in module `main`\n  --> src/main.bl:2:6"), diag(r))
+    assert(r.err_out.contains("1 error(s) found"), diag(r))
+    assert(!r.err_out.contains("internal compiler error"), diag(r))
+}
+
+// An enum that shadows Ordering in the main module, and a generic Option in another module
+// reached through a bound, run in each build mode. A build reports each shadow once.
+test "an enum Ordering and another module's generic Option run, and a build warns once for each" {
+    let files = [
+        ("alpha.bl", "pub type Option[T] \{ v: T }
+
+pub trait Get \{ fn get_or(self, d: Int) -> Int }
+
+impl[T: Into[Int]] Get for Option[T] \{
+    fn get_or(self, d: Int) -> Int \{ self.v.into() + d }
+}
+
+pub fn wrap(n: Int) -> Option[Int] \{ Option \{ v: n } }
+
+pub fn total[T: Get](x: T) -> Int \{ x.get_or(1) }
+"),
+        ("main.bl", "import alpha.\{Get, wrap, total}
+
+type Ordering \{ Less, Same, More }
+
+fn cmp(a: Int, b: Int) -> Ordering \{
+    if a < b \{ Ordering.Less } else if a == b \{ Ordering.Same } else \{ Ordering.More }
+}
+
+fn name(o: Ordering) -> Str \{
+    match o \{
+        Less => \"less\"
+        Same => \"same\"
+        More => \"more\"
+    }
+}
+
+fn main() \{
+    let w = wrap(4)
+    let s: Option[Int] = Some(2)
+    io.println(\"\{name(cmp(1, 2))} \{name(cmp(2, 2))} \{w.get_or(10)} \{total(w)} \{s ?? 0} \{1 < 2}\")
+}
+"),
+    ]
+    expect_runs_with(files, "less same 14 5 2 true")
+    for flag in ["--per-module", "--no-per-module"] {
+        let dir = project_with(files)
+        let b = blink_in(dir, "build {flag} -o {dir}/app src/main.bl")
+        let _ = sh("rm -rf {dir}")
+        assert_eq(b.end, ChildEnd.Exited(0), "{flag}\n{diag(b)}")
+        assert_eq(b.err_out.split("warning[ShadowedPreludeName]").len(), 3, "{flag}\n{diag(b)}")
+        assert_eq(b.err_out.split("--> src/alpha.bl:1:5").len(), 2, "{flag}\n{diag(b)}")
+        assert_eq(b.err_out.split("--> src/main.bl:3:1").len(), 2, "{flag}\n{diag(b)}")
+    }
+}
+
+// The lines of a report the compiler writes, without the source lines it quotes.
+fn report_lines(err: Str) -> List[Str] {
+    let mut out: List[Str] = []
+    for line in err.split("\n") {
+        if !line.contains(" |") { out.push(line) }
+    }
+    out
+}
+
+// Every report on a shadowing type, in the main module or another, names the type as the
+// program writes it. The name the compiler files it under never shows.
+test "reports on shadowing types in the main module and another module never show an internal name" {
+    let r = check_with([
+        ("alpha.bl", "pub type Bytes \{ n: Int }\n\npub type Option \{ Yes(Int), No }\n"),
+        ("main.bl", "import alpha
+
+type List \{ n: Int }
+
+type Result \{ Good, Bad, Odd }
+
+fn h[K: Hash](k: K) -> Int \{ 1 }
+
+fn main() \{
+    let a: alpha.Bytes = List \{ n: 1 }
+    let b = alpha.Bytes \{ m: 2 }
+    let c = List.nope()
+    let d = List \{ n: 1 }.zap()
+    let e = match Result.Good \{
+        Good => 1
+    }
+    let f = h(List \{ n: 1 })
+    let g = match alpha.Option.No \{
+        No => 2
+    }
+    let i = alpha.Bytes.nope()
+    let j = List \{ n: 1 } < List \{ n: 2 }
+    let k: alpha.Option = 3
+    io.println(\"\{a} \{b} \{c} \{d} \{e} \{f} \{g} \{i} \{j} \{k}\")
+}
+"),
+    ])
+    assert_eq(r.end, ChildEnd.Exited(1), diag(r))
+    assert(r.err_out.contains("13 error(s) found"), diag(r))
+    assert(r.err_out.contains("error[TypeError]: variable `a`: declared type Bytes but got List"), diag(r))
+    assert(r.err_out.contains("error[NonExhaustiveMatch]: non-exhaustive match: missing patterns `Bad`, `Odd`"), diag(r))
+    assert(r.err_out.contains("error[TraitBoundNotSatisfied]: `List` does not satisfy the Eq bound on type parameter K"), diag(r))
+    assert(!r.err_out.contains("internal compiler error"), diag(r))
+    for line in report_lines(r.err_out) {
+        assert(!line.contains("__main__"), "{line}\n{diag(r)}")
+        assert(!line.contains("alpha.Bytes") && !line.contains("alpha.Option"), "{line}\n{diag(r)}")
+    }
+}
+
+test "with no package, reports on the main file's shadowing types never show an internal name" {
+    let dir = sh("mktemp -d /tmp/blink_shadow_impls.XXXXXX").out.trim()
+    fs.write("{dir}/main.bl", "type List \{ n: Int }
+
+type Result \{ Good, Bad }
+
+fn main() \{
+    let a: Int = List \{ n: 1 }
+    let c = List.nope()
+    let d = List \{ n: 1 }.zap()
+    let e = match Result.Good \{
+        Good => 1
+    }
+    io.println(\"\{a} \{c} \{d} \{e} \{List \{ n: 1 }}\")
+}
+").unwrap()
+    let r = blink_in(dir, "check main.bl")
+    let _ = sh("rm -rf {dir}")
+    assert_eq(r.end, ChildEnd.Exited(1), diag(r))
+    assert(r.err_out.contains("error[TypeError]: variable `a`: declared type Int but got List"), diag(r))
+    assert(r.err_out.contains("error[MissingDisplayImpl]: type `List` does not implement `Display`"), diag(r))
+    assert(!r.err_out.contains("internal compiler error"), diag(r))
+    for line in report_lines(r.err_out) {
+        assert(!line.contains("__main__"), "{line}\n{diag(r)}")
+    }
+}

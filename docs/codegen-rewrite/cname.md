@@ -41,7 +41,10 @@ user name part of a symbol goes through `tc_sym_escape` (typecheck.bl), which wr
 
 - `_0` opens a mono argument, or the source type of a `From` or `TryFrom` method.
 - `_1` is an escaped `_`.
-- `_2` opens the module of a trait that more than one module declares.
+- `_2` opens the module of a trait that more than one module declares. In an impl
+  method stem it also opens the module of a receiver type that has the name of a
+  compiler-known type (`type Bytes` in `alpha` -> receiver `Bytes_2alpha`), so the
+  user type and the builtin get different symbols.
 
 A name with no `_` keeps its spelling. A module key is escaped like a name. These parts
 stay verbatim: the `blink_{name}` symbol of an `@ffi` function whose foreign symbol is
