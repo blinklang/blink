@@ -169,6 +169,126 @@ test "an empty list in Some bound to the wildcard is E0301 at the list" {
     assert_diags(src, [open_at(src, "SOME", "[]", ": List[T]")])
 }
 
+// The one E0301 a destructuring `let` gets: at the `let`, naming the pattern as written, with
+// the whole pattern annotated as the repair. No internal binder name reaches the text.
+fn assert_pattern_open(src: Str, marker: Str, pattern: Str, ann: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    let line = line_of(src, marker)
+    let got = diags_of(src).filter(fn(d) { d.contains(" E0301 ") })
+    let want = "E0301 cannot infer a type for the pattern `{pattern}`: it is never given one by an annotation or a later use | help: add a type annotation, e.g. `let {pattern}: {ann} = ...` (replace each placeholder with the intended type)"
+    let ok = got.len() == 1 && got.get(0).unwrap().starts_with("{line}:5-") && got.get(0).unwrap().ends_with(want)
+    if !ok {
+        io.eprintln("FAIL: want {line}:5-..: {want}")
+        for g in got { io.eprintln("  got: {g}") }
+    }
+    assert(ok)
+}
+
+test "an empty list in a destructured tuple is one E0301 at the let that names the pattern" {
+    let src = #"fn main() {
+    let (_, b) = ([], 1)  // LET
+    io.println("{b}")
+}
+"#
+    assert_eq(diags_of(src).len(), 1)
+    assert_pattern_open(src, "LET", "(_, b)", "(List[T], Int)")
+}
+
+test "a nested destructured tuple names the nested pattern and the nested annotation" {
+    let src = #"fn main() {
+    let (a, (_b, c)) = (1, ([], 2))  // LET
+    io.println("{a} {c}")
+}
+"#
+    assert_eq(diags_of(src).len(), 1)
+    assert_pattern_open(src, "LET", "(a, (_b, c))", "(Int, (List[T], Int))")
+}
+
+test "an open Map and an open list in one destructured tuple get distinct placeholders" {
+    let src = #"fn main() {
+    let ((_a, _b), c) = (([], Map()), 1)  // LET
+    io.println("{c}")
+}
+"#
+    assert_eq(diags_of(src).len(), 1)
+    assert_pattern_open(src, "LET", "((_a, _b), c)", "((List[T], Map[K, V]), Int)")
+}
+
+test "a mutable binder keeps its mut in the annotated pattern" {
+    let src = #"fn main() {
+    let (mut _a, b) = ([], 1)  // LET
+    io.println("{b}")
+}
+"#
+    assert_eq(diags_of(src).len(), 1)
+    assert_pattern_open(src, "LET", "(mut _a, b)", "(List[T], Int)")
+}
+
+test "a destructured None and a destructured struct literal no field types name their own slots" {
+    let none_src = #"fn main() {
+    let (_, b) = (None, 1)  // LET
+    io.println("{b}")
+}
+"#
+    assert_eq(diags_of(none_src).len(), 1)
+    assert_pattern_open(none_src, "LET", "(_, b)", "(Option[T], Int)")
+    let w_src = #"type W[T] { n: Int }
+
+fn main() {
+    let (_w, b) = (W { n: 1 }, 1)  // LET
+    io.println("{b}")
+}
+"#
+    assert_eq(diags_of(w_src).len(), 1)
+    assert_pattern_open(w_src, "LET", "(_w, b)", "(W[T], Int)")
+}
+
+test "mut before a destructured tuple is E0613 and the E0301 names the pattern its fix writes" {
+    let src = #"fn main() {
+    let mut (_a, b) = ([], 1)  // LET
+    io.println("{b}")
+}
+"#
+    let got = diags_of(src)
+    assert_eq(got.len(), 2)
+    assert(got.filter(fn(d) { d.contains(" E0613 ") }).len() == 1)
+    assert_pattern_open(src, "LET", "(mut _a, mut b)", "(List[T], Int)")
+}
+
+test "other reports on a destructuring let name the pattern, never an internal binder" {
+    let mismatch = #"fn main() {
+    let (a, b): (Int, Int) = ("s", 1)  // LET
+    io.println("{a}{b}")
+}
+"#
+    let got = diags_of(mismatch)
+    assert_eq(got.len(), 1)
+    assert(got.get(0).unwrap().contains("the pattern `(a, b)`: declared type (Int, Int) but got (Str, Int)"), got.get(0).unwrap())
+    let scope_src = #"import blink.ffi
+
+fn main() {
+    let (_s, x) = (ffi.scope(), 1)
+    io.println("{x}")
+}
+"#
+    let scoped = diags_of(scope_src).filter(fn(d) { d.contains(" E0819 ") })
+    assert_eq(scoped.len(), 1)
+    assert(scoped.get(0).unwrap().contains("`with ffi.scope() as <name> \{ ... \}`"), scoped.get(0).unwrap())
+    for d in [..got, ..diags_of(scope_src)] { assert(!d.contains("_destructure"), d) }
+}
+
+test "a tuple binding that nothing types gets the tuple annotation, open slots only" {
+    let src = #"fn main() {
+    let t = ([], 1)  // LET
+}
+"#
+    let line = line_of(src, "LET")
+    let got = diags_of(src).filter(fn(d) { d.contains(" E0301 ") })
+    assert_eq(got.len(), 1)
+    assert(got.get(0).unwrap().starts_with("{line}:5-"), got.get(0).unwrap())
+    assert(got.get(0).unwrap().contains("E0301 cannot infer a type for `t`"), got.get(0).unwrap())
+    assert(got.get(0).unwrap().contains("e.g. `let t: (List[T], Int) = ...`"), got.get(0).unwrap())
+}
+
 test "a struct literal no field reaches the type parameter of is E0301 when a field is read" {
     let src = #"type W[T] { n: Int }
 

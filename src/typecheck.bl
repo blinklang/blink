@@ -3073,6 +3073,8 @@ fn tc_infer_annotation_hint(tid0: Int) -> Str {
         return ": {strip_module_qualifier(e.name)}[...]"
     }
     if k == TyKind.Fn { return tc_fn_annotation_hint(tid, Map()) }
+    // A tuple keeps each slot a value already fixed, so the repair names only what is open.
+    if k == TyKind.Tuple { return ": {tc_hint_slot_str(tid, Map())}" }
     ": T"
 }
 
@@ -3109,9 +3111,23 @@ fn tc_hint_slot_str(tid: Int, named: Map[Int, Str]) -> Str {
     if e.kind == TyKind.List { return "List[{tc_hint_slot_str(e.inner1, named)}]" }
     if e.kind == TyKind.Set { return "Set[{tc_hint_slot_str(e.inner1, named)}]" }
     if e.kind == TyKind.Option { return "Option[{tc_hint_slot_str(e.inner1, named)}]" }
-    if e.kind == TyKind.Map { return "Map[{tc_hint_slot_str(e.inner1, named)}, {tc_hint_slot_str(e.inner2, named)}]" }
-    if e.kind == TyKind.Result { return "Result[{tc_hint_slot_str(e.inner1, named)}, {tc_hint_slot_str(e.inner2, named)}]" }
+    if e.kind == TyKind.Map { return "Map[{tc_hint_slot_named(e.inner1, named, "K")}, {tc_hint_slot_named(e.inner2, named, "V")}]" }
+    if e.kind == TyKind.Result { return "Result[{tc_hint_slot_str(e.inner1, named)}, {tc_hint_slot_named(e.inner2, named, "E")}]" }
+    if e.kind == TyKind.Tuple {
+        let mut els: List[Str] = []
+        for i in 0..e.params_count { els.push(tc_hint_slot_str(ty_param_list.get(e.params_start + i).unwrap(), named)) }
+        return "({els.join(", ")})"
+    }
     "T"
+}
+
+// A slot whose placeholder has a conventional name, so two open slots of one type do not read
+// as one: `Map[K, V]`, not `Map[T, T]`.
+fn tc_hint_slot_named(tid: Int, named: Map[Int, Str], placeholder: Str) -> Str {
+    let shown = tc_hint_slot_str(tid, named)
+    let open = tc_tid_is_no_info(tid) != 0 || tc_tid_has_unbound_metavar(tid) != 0
+    if shown == "T" && open && named.get(tc_resolve(tid)).is_none() { return placeholder }
+    shown
 }
 
 // The arguments after the receiver of a sealed ops trait's qualified call `StrOps.len(s)`,
@@ -4877,6 +4893,10 @@ fn tc_drop_open_calls() {
 fn tc_report_under_determined(vname: Str, tid: Int, decl_node: Int) ! Diag.Report {
     let hint = tc_infer_annotation_hint(tid)
     let dk = node_kind(decl_node)
+    if dk == NodeKind.LetBinding && node_elements(decl_node) != -1 {
+        tc_report_under_determined_pattern(hint, tid, decl_node)
+        return
+    }
     // Only a `let` holds its initializer in the value slot, so only there does the
     // value node name the construction that failed to fill the slot. A `with` binder
     // keeps its resource EXPRESSION in the same slot, and calling that "the empty
@@ -4910,6 +4930,85 @@ fn tc_report_under_determined(vname: Str, tid: Int, decl_node: Int) ! Diag.Repor
         help = "annotate the value this binder destructures — a pattern binder takes no annotation of its own"
     }
     diag_error_at_notes("CannotInferType", CANNOT_INFER_TYPE, "cannot infer a type for `{vname}`: it is never given one by an annotation or a later use", decl_node, help, notes)
+}
+
+// A destructuring `let` has no name of its own, so the report names its pattern as written and
+// the repair annotates the whole pattern.
+fn tc_report_under_determined_pattern(hint: Str, tid: Int, decl_node: Int) ! Diag.Report {
+    let val = node_value(decl_node)
+    let mut notes: List[Str] = []
+    if val != -1 {
+        let (source, slot) = tc_ud_open_slot(tid, val)
+        notes.push("{source} has no {slot} to infer at line {node_line(val)}")
+    }
+    tc_ud_mark_blamed(tid)
+    let pt = tc_let_pattern_text(node_elements(decl_node))
+    if pt == "" {
+        diag_error_at_notes("CannotInferType", CANNOT_INFER_TYPE, "cannot infer a type for this pattern: it is never given one by an annotation or a later use", decl_node, "add a type annotation after the pattern, e.g. `{hint.byte_slice(2, hint.byte_len())}` (replace each placeholder with the intended type)", notes)
+        return
+    }
+    diag_error_at_notes("CannotInferType", CANNOT_INFER_TYPE, "cannot infer a type for the pattern `{pt}`: it is never given one by an annotation or a later use", decl_node, "add a type annotation, e.g. `let {pt}{hint} = ...` (replace each placeholder with the intended type)", notes)
+}
+
+// The name a report may give a `let`'s binder: "" for a destructuring `let`, whose node name is
+// the parser's internal one and not a name the program can write.
+fn tc_let_binder_name(node: Int) -> Str {
+    if node_elements(node) != -1 { return "" }
+    node_name(node)
+}
+
+// What a report about a `let`'s declared type calls its binder: the variable, or the pattern as
+// written.
+fn tc_let_subject(node: Int) -> Str {
+    if node_elements(node) == -1 { return "variable `{node_name(node)}`" }
+    let pt = tc_let_pattern_text(node_elements(node))
+    if pt == "" { "this pattern" } else { "the pattern `{pt}`" }
+}
+
+// A `let` pattern spelled as a program writes it, or "" for a form this does not spell.
+fn tc_let_pattern_text(pat: Int) -> Str {
+    if pat < 0 { return "" }
+    let k = node_kind(pat)
+    if k == NodeKind.WildcardPattern { return "_" }
+    if k == NodeKind.IdentPattern {
+        let name = node_name(pat)
+        if name == "" { return "" }
+        if node_is_mut(pat) != 0 { return "mut {name}" }
+        return name
+    }
+    if k == NodeKind.TuplePattern {
+        let els = node_elements(pat)
+        let mut parts: List[Str] = []
+        let mut i = 0
+        while i < sublist_length(els) {
+            let part = tc_let_pattern_text(sublist_get(els, i))
+            if part == "" { return "" }
+            parts.push(part)
+            i = i + 1
+        }
+        return "({parts.join(", ")})"
+    }
+    if k == NodeKind.StructPattern {
+        let flds = node_fields(pat)
+        let mut parts: List[Str] = []
+        let mut i = 0
+        while i < sublist_length(flds) {
+            let f = sublist_get(flds, i)
+            let sub = node_pattern(f)
+            if sub == -1 {
+                parts.push(if node_is_mut(f) != 0 { "mut {node_name(f)}" } else { node_name(f) })
+            } else {
+                let part = tc_let_pattern_text(sub)
+                if part == "" { return "" }
+                parts.push("{node_name(f)}: {part}")
+            }
+            i = i + 1
+        }
+        if node_inclusive(pat) != 0 { parts.push("..") }
+        if parts.len() == 0 { return "{node_type_name(pat)} \{ }" }
+        return "{node_type_name(pat)} \{ {parts.join(", ")} }"
+    }
+    ""
 }
 
 // What an under-determined binding's value is, and which of its type's slots nothing filled,
@@ -29526,7 +29625,7 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                 // one a reader sees; the binder has to be in scope here too, not only at the
                 // body walk below.
                 let saved_nr_binder = tc_ffi_scope_binder
-                tc_ffi_scope_binder = node_name(node)
+                tc_ffi_scope_binder = tc_let_binder_name(node)
                 // A bare variant name resolves from the annotation (§3.4), and so do the
                 // receiver's arguments of a static conversion; without it here, the first
                 // inference would find either ambiguous before the body walk hints it.
@@ -42291,14 +42390,14 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
             // A let binding is expression context (§2.9): infer in value context so an else-less
             // `if` as its value (no value on the false path) is rejected regardless of the
             // declared/inferred type, so `let x = if c { 1 }` fails even when x is unused.
-            inferred_tid = tc_infer_walked_let_value(val, vname, let_hint)
+            inferred_tid = tc_infer_walked_let_value(val, tc_let_binder_name(node), let_hint)
         }
 
         if tc_tid_is_no_info(declared_tid) == 0 && tc_tid_is_no_info(inferred_tid) == 0 {
             if assignment_types_compatible(declared_tid, inferred_tid, val) == 0 {
                 if !tc_closure_checked_against(val, declared_tid) {
                     let (declared_s, got_s) = tc_type_pair_strs(declared_tid, inferred_tid)
-                    tc_report_declared_mismatch("variable `{vname}`: declared type {declared_s} but got {got_s}{tc_fn_mismatch_suffix(declared_tid, inferred_tid)}", node, val, declared_tid, inferred_tid)
+                    tc_report_declared_mismatch("{tc_let_subject(node)}: declared type {declared_s} but got {got_s}{tc_fn_mismatch_suffix(declared_tid, inferred_tid)}", node, val, declared_tid, inferred_tid)
                 }
             } else {
                 // A declared let type is an expected-type source for the value's
