@@ -107,6 +107,30 @@ test "an unknown static call on a built-in type is E0505 on the member" {
     assert(got.starts_with("UnresolvedMethod 2:20-24: no member `nope` on type `Bytes` | "), got)
 }
 
+// The member `nope` of a body on the 4-space-indented line `line`: "line:start-end".
+fn nope_span(line: Int, body: Str) -> Str {
+    let col = body.index_of(".nope").unwrap() + 6
+    "{line}:{col}-{col + 4}"
+}
+
+test "an unknown static call on a built-in type is E0505 on the member, bound to the wildcard or as a statement" {
+    for ty in ["List", "Map", "Set", "Str", "Int", "Option"] {
+        for body in ["let _ = {ty}.nope()", "{ty}.nope()"] {
+            let got = only_error("fn main() \{\n    {body}\n}\n")
+            assert(got.starts_with("UnresolvedMethod {nope_span(2, body)}: no member `nope` on type `{ty}` | "), "{body}: {got}")
+        }
+    }
+}
+
+test "an unknown static call on a user struct or enum is E0505 on the member, bound to the wildcard or as a statement" {
+    for ty in ["P", "E"] {
+        for body in ["let _ = {ty}.nope()", "{ty}.nope()"] {
+            let got = only_error("type P \{ x: Int }\ntype E \{ A, B }\nfn main() \{\n    {body}\n}\n")
+            assert(got.starts_with("UnresolvedMethod {nope_span(4, body)}: no member `nope` on type `{ty}` | "), "{body}: {got}")
+        }
+    }
+}
+
 test "the binding of an unknown member is poison and its later uses report nothing" {
     let src = "type K \{ A(Int), B }\nfn main() \{\n    let k = K.zed\n    let _n: Int = k\n    let _m = k.anything()\n    let c = K.zed(1)\n    let _s: Str = c\n}\n"
     let got = errors_of(src)
@@ -235,6 +259,23 @@ test "check and build stop at the same report for an unknown member read, with n
     let head = "error[UnresolvedMethod]: no member `zed` on type `K`"
     assert_eq(check.end, ChildEnd.Exited(1))
     assert(check.out.concat(check.err_out).contains(head), check.out.concat(check.err_out))
+    assert_eq(build.end, ChildEnd.Exited(1))
+    let built = build.out.concat(build.err_out)
+    assert(built.contains(head), built)
+    assert(!built.contains("internal compiler error") && !built.contains("NoTypeForNode"), built)
+}
+
+test "check and build stop at the same report for an unknown static call on a built-in type, with no internal error" {
+    let _mk = sh("rm -rf {DIR}_builtin && mkdir -p {DIR}_builtin")
+    fs.write("{DIR}_builtin/main.bl", "fn main() \{\n    let _ = List.nope()\n    io.println(\"built\")\n}\n").unwrap()
+    let env_of = "env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE"
+    let check = sh("B=$(pwd)/build/blink; cd {DIR}_builtin && {env_of} $B check main.bl < /dev/null")
+    let build = sh("B=$(pwd)/build/blink; cd {DIR}_builtin && {env_of} $B build main.bl < /dev/null")
+    let _rm = sh("rm -rf {DIR}_builtin")
+    let head = "error[UnresolvedMethod]: no member `nope` on type `List`"
+    let checked = check.out.concat(check.err_out)
+    assert_eq(check.end, ChildEnd.Exited(1))
+    assert(checked.contains(head) && !checked.contains("UnknownMethod"), checked)
     assert_eq(build.end, ChildEnd.Exited(1))
     let built = build.out.concat(build.err_out)
     assert(built.contains(head), built)

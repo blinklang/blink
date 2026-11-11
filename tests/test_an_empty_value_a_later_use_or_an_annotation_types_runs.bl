@@ -6,7 +6,7 @@
 // another module prints the same text in the one-unit and the per-module build.
 
 import std.fs
-import std.process.{ProcessResult}
+import std.process.{ProcessResult, ChildEnd}
 import compile_test_helpers.{scratch_root}
 
 trait Tag { fn tag(self) -> Int }
@@ -114,6 +114,17 @@ test "a struct literal whose type parameter another argument of a generic call f
     assert_eq(usew(w), 6)
 }
 
+test "an empty list in a tuple that a later use or an annotation types runs" {
+    let (mut a, b) = ([], 1)
+    a.push(2)
+    let t = ([], 1)
+    let x: List[Int] = t.0
+    let (c, d): (List[Str], Int) = ([], 3)
+    let e: (List[Int], Int) = ([], 4)
+    let o: List[Int]? = Some([])
+    assert_eq("{a.len()} {b} {x.len()} {c.len()} {d} {e.1} {o.unwrap().len()}", "1 1 0 0 3 4 0")
+}
+
 fn sh(cmd: Str) -> ProcessResult ! Process.Spawn {
     process.run("sh", ["-c", cmd]).unwrap()
 }
@@ -147,8 +158,10 @@ let main_src = [
     "    m.insert(\"k\", 1)",
     "    let mut l = List.new()",
     "    l.push(9)",
+    "    let (mut ta, tb) = ([], 7)",
+    "    ta.push(\"t\")",
     "    io.println(out)",
-    "    io.println(\"\{w.n} \{wint().n} \{typed == []} \{empty_ints().len()} \{m.len()} \{pick(W \{ n: 1 }, 5)} \{l.len()}\")",
+    "    io.println(\"\{w.n} \{wint().n} \{typed == []} \{empty_ints().len()} \{m.len()} \{pick(W \{ n: 1 }, 5)} \{l.len()} \{ta.len()} \{tb}\")",
     "}",
     "",
 ].join("\n")
@@ -160,7 +173,7 @@ test "values typed by a later use or an annotation across modules print the same
     fs.write("{root}/src/shapes.bl", shapes_src).unwrap()
     fs.write("{root}/src/main.bl", main_src).unwrap()
     let blink = sh("readlink -f build/blink").out.trim()
-    let want = "cx10\n2 4 true 0 1 5 1\n"
+    let want = "cx10\n2 4 true 0 1 5 1 1 7\n"
     let mut failed: List[Str] = []
     for mode in ["--no-per-module", "--per-module"] {
         let r = sh("cd {root} && env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE timeout 300 {blink} run {mode} src/main.bl < /dev/null 2>&1")
@@ -168,4 +181,21 @@ test "values typed by a later use or an annotation across modules print the same
     }
     let _ = sh("rm -rf {root}")
     assert_eq(failed, [])
+}
+
+test "check and build stop at one E0301 for an empty list in a tuple no binding holds, with no internal error" {
+    let dir = "{scratch_root()}/open_tuple_check_build_{getpid()}"
+    let _mk = sh("rm -rf {dir} && mkdir -p {dir}")
+    fs.write("{dir}/main.bl", "fn main() \{\n    let _ = ([], 1)\n    io.println(\"built\")\n}\n").unwrap()
+    let env_of = "env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE"
+    let blink = sh("readlink -f build/blink").out.trim()
+    let check = sh("cd {dir} && {env_of} {blink} check main.bl < /dev/null 2>&1")
+    let build = sh("cd {dir} && {env_of} {blink} build main.bl < /dev/null 2>&1")
+    let _rm = sh("rm -rf {dir}")
+    let head = "error[CannotInferType]: cannot infer a type for this value"
+    assert_eq(check.end, ChildEnd.Exited(1))
+    assert(check.out.contains(head) && check.out.contains("main.bl:2:14"), check.out)
+    assert_eq(build.end, ChildEnd.Exited(1))
+    assert(build.out.contains(head), build.out)
+    assert(!build.out.contains("internal compiler error") && !build.out.contains("UnspellableExprType"), build.out)
 }
