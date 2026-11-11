@@ -242,16 +242,124 @@ fn main() {
     assert_pattern_open(w_src, "LET", "(_w, b)", "(W[T], Int)")
 }
 
-test "mut before a destructured tuple is E0613 and the E0301 names the pattern its fix writes" {
+test "a destructured struct literal with an open field and a pointer name their own slots" {
+    let box_src = #"type Box[T] { v: Option[T] }
+
+fn main() {
+    let (_bx, n) = (Box { v: None }, 1)  // LET
+    io.println("{n}")
+}
+"#
+    assert_eq(diags_of(box_src).len(), 1)
+    assert_pattern_open(box_src, "LET", "(_bx, n)", "(Box[T], Int)")
+    let ptr_src = #"fn main() {
+    let (_p, q) = (null_ptr(), 1)  // LET
+    io.println("{q}")
+}
+"#
+    assert_eq(diags_of(ptr_src).len(), 1)
+    assert_pattern_open(ptr_src, "LET", "(_p, q)", "(Ptr[T], Int)")
+}
+
+test "a destructured value whose whole type is open gets a placeholder in the pattern's own shape" {
+    let src = #"fn mk[T]() -> T { panic("never") }
+
+fn main() {
+    let (_a, (_b, _c)) = mk()  // LET
+}
+"#
+    assert_eq(diags_of(src).len(), 1)
+    assert_pattern_open(src, "LET", "(_a, (_b, _c))", "(T, (T, T))")
+}
+
+// A pattern the value's type cannot take gets no annotation on the pattern: the repair binds the
+// whole value to one name.
+fn assert_pattern_unfit(src: Str, marker: Str, pattern: Str, name: Str, ty: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    let line = line_of(src, marker)
+    let got = diags_of(src).filter(fn(d) { d.contains(" E0301 ") })
+    let want = "E0301 cannot infer a type for the pattern `{pattern}`: it is never given one by an annotation or a later use | help: the pattern does not fit a value of type `{ty}`; bind the value to one name with an annotation, e.g. `let {name}: {ty} = ...` (replace each placeholder with the intended type)"
+    let ok = got.len() == 1 && got.get(0).unwrap().starts_with("{line}:5-") && got.get(0).unwrap().ends_with(want)
+    if !ok {
+        io.eprintln("FAIL: want {line}:5-..: {want}")
+        for g in got { io.eprintln("  got: {g}") }
+    }
+    assert(ok)
+}
+
+test "a tuple pattern over a value that is not a tuple of its arity gets no annotation on the pattern" {
+    let opt = #"fn main() {
+    let (_x, _y) = (None, 1).0  // LET
+}
+"#
+    assert_pattern_unfit(opt, "LET", "(_x, _y)", "value", "Option[T]")
+    let list = #"fn main() {
+    let (_e, _f) = List.new()  // LET
+}
+"#
+    assert_pattern_unfit(list, "LET", "(_e, _f)", "value", "List[T]")
+    let paren = #"fn main() {
+    let (_b) = []  // LET
+}
+"#
+    assert_pattern_unfit(paren, "LET", "(_b)", "_b", "List[T]")
+    let nested = #"fn main() {
+    let ((_c)) = []  // LET
+}
+"#
+    assert_pattern_unfit(nested, "LET", "((_c))", "_c", "List[T]")
+}
+
+test "a parse error in a destructuring let is the one report on that let" {
+    let src = #"fn main() {
+    let (_a,) = ([],)
+    let (_d, ..) = ([], 1)
+}
+"#
+    let got = diags_of(src)
+    assert(got.len() > 0)
+    for d in got { assert(!d.contains(" E0301 "), d) }
+}
+
+test "a report after a parse error names the pattern, never an internal binder" {
+    let src = #"fn main() {
+    let S { x, y } = 3
+    let ((a1, _), mut c): (Int, Int) = ((1, 2), 3)
+}
+"#
+    let got = diags_of(src)
+    assert(got.filter(fn(d) { d.contains("the pattern `((a1, _), mut c)`: declared type (Int, Int) but got ((Int, Int), Int)") }).len() == 1)
+    for d in got { assert(!d.contains("_destructure"), d) }
+}
+
+test "a module-level destructuring let names its pattern in a mismatch and an ffi scope report" {
+    let mismatch = #"let (ga, gb): (Int, Int) = ("s", 1)
+
+fn main() { }
+"#
+    let got = diags_of(mismatch)
+    assert_eq(got.len(), 1)
+    assert(got.get(0).unwrap().contains("the pattern `(ga, gb)`: declared type (Int, Int) but got (Str, Int)"), got.get(0).unwrap())
+    let scope_src = #"import blink.ffi
+
+let (gc, gd) = (ffi.scope(), 1)
+
+fn main() { }
+"#
+    let scoped = diags_of(scope_src).filter(fn(d) { d.contains(" E0819 ") })
+    assert_eq(scoped.len(), 1)
+    assert(scoped.get(0).unwrap().contains("`with ffi.scope() as <name> \{ ... \}`"), scoped.get(0).unwrap())
+    for d in [..got, ..diags_of(scope_src)] { assert(!d.contains("_destructure"), d) }
+}
+
+test "mut before a destructured tuple is one E0613 and no E0301 over the rewritten pattern" {
     let src = #"fn main() {
     let mut (_a, b) = ([], 1)  // LET
     io.println("{b}")
 }
 "#
     let got = diags_of(src)
-    assert_eq(got.len(), 2)
-    assert(got.filter(fn(d) { d.contains(" E0613 ") }).len() == 1)
-    assert_pattern_open(src, "LET", "(mut _a, mut b)", "(List[T], Int)")
+    assert_eq(got.len(), 1)
+    assert(got.get(0).unwrap().contains(" E0613 "), got.get(0).unwrap())
 }
 
 test "other reports on a destructuring let name the pattern, never an internal binder" {

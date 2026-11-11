@@ -2,7 +2,7 @@ import ast.{NodeKind, node_kind_name, is_block_bearing, trace_gate_on, nk_is_typ
 import std.str.{str_to_lower}
 import pkg.manifest.{manifest_name, manifest_header_is_declared}
 import unparse.{type_ann_text, type_ann_text_renamed, unparse_expr, unparse_binop_with_lhs, unparse_range_membership, unparse_coalesce_start}
-import formatter.{effect_op_sig_text, fn_sig_text, fn_sig_text_renamed, type_param_list_text, format_type_param_binder}
+import formatter.{effect_op_sig_text, fn_sig_text, fn_sig_text_renamed, type_param_list_text, format_type_param_binder, format_pattern}
 import import_edit.{ImportEdit, ImportNeed, import_aliased_edit, import_module_edit, import_need}
 import parser.{
     node_written_span, effect_derived_ops, node_load_rank, parser_load_order_moved, parser_live_ranges,
@@ -3111,6 +3111,15 @@ fn tc_hint_slot_str(tid: Int, named: Map[Int, Str]) -> Str {
     if e.kind == TyKind.List { return "List[{tc_hint_slot_str(e.inner1, named)}]" }
     if e.kind == TyKind.Set { return "Set[{tc_hint_slot_str(e.inner1, named)}]" }
     if e.kind == TyKind.Option { return "Option[{tc_hint_slot_str(e.inner1, named)}]" }
+    if e.kind == TyKind.Channel { return "Channel[{tc_hint_slot_str(e.inner1, named)}]" }
+    if e.kind == TyKind.Iterator { return "Iterator[{tc_hint_slot_str(e.inner1, named)}]" }
+    if e.kind == TyKind.Range { return "Range[{tc_hint_slot_str(e.inner1, named)}]" }
+    if e.kind == TyKind.Handle { return "Handle[{tc_hint_slot_str(e.inner1, named)}]" }
+    if e.kind == TyKind.Ptr { return "Ptr[{tc_hint_slot_str(e.inner1, named)}]" }
+    if e.kind == TyKind.Fn {
+        let f = tc_fn_annotation_hint(t, named)
+        return f.byte_slice(2, f.byte_len())
+    }
     if e.kind == TyKind.Map { return "Map[{tc_hint_slot_named(e.inner1, named, "K")}, {tc_hint_slot_named(e.inner2, named, "V")}]" }
     if e.kind == TyKind.Result { return "Result[{tc_hint_slot_str(e.inner1, named)}, {tc_hint_slot_named(e.inner2, named, "E")}]" }
     if e.kind == TyKind.Tuple {
@@ -4894,7 +4903,7 @@ fn tc_report_under_determined(vname: Str, tid: Int, decl_node: Int) ! Diag.Repor
     let hint = tc_infer_annotation_hint(tid)
     let dk = node_kind(decl_node)
     if dk == NodeKind.LetBinding && node_elements(decl_node) != -1 {
-        tc_report_under_determined_pattern(hint, tid, decl_node)
+        tc_report_under_determined_pattern(tid, decl_node)
         return
     }
     // Only a `let` holds its initializer in the value slot, so only there does the
@@ -4933,82 +4942,115 @@ fn tc_report_under_determined(vname: Str, tid: Int, decl_node: Int) ! Diag.Repor
 }
 
 // A destructuring `let` has no name of its own, so the report names its pattern as written and
-// the repair annotates the whole pattern.
-fn tc_report_under_determined_pattern(hint: Str, tid: Int, decl_node: Int) ! Diag.Report {
+// the repair annotates the whole pattern. A pattern that parse recovery rewrote already has its
+// E0613, and the text this would show is not what the program wrote, so it gets no second report.
+fn tc_report_under_determined_pattern(tid: Int, decl_node: Int) ! Diag.Report {
+    tc_ud_mark_blamed(tid)
+    let pat = node_elements(decl_node)
+    if tc_pattern_was_recovered(pat) { return }
+    // A parse error on the `let` (as `(a,)` or `(d, ..)`) leaves a recovered pattern whose
+    // shape the user did not write; that error is the one report.
+    let end_line = if node_end_line(decl_node) > node_line(decl_node) { node_end_line(decl_node) } else { node_line(decl_node) }
+    if diag_errors_in_lines(diag_file_for_node(decl_node), node_line(decl_node), end_line) > 0 { return }
     let val = node_value(decl_node)
     let mut notes: List[Str] = []
     if val != -1 {
         let (source, slot) = tc_ud_open_slot(tid, val)
         notes.push("{source} has no {slot} to infer at line {node_line(val)}")
     }
-    tc_ud_mark_blamed(tid)
-    let pt = tc_let_pattern_text(node_elements(decl_node))
-    if pt == "" {
-        diag_error_at_notes("CannotInferType", CANNOT_INFER_TYPE, "cannot infer a type for this pattern: it is never given one by an annotation or a later use", decl_node, "add a type annotation after the pattern, e.g. `{hint.byte_slice(2, hint.byte_len())}` (replace each placeholder with the intended type)", notes)
-        return
+    let pt = tc_let_pattern_text(pat)
+    let msg = "cannot infer a type for the pattern `{pt}`: it is never given one by an annotation or a later use"
+    // The repair has to fit: an annotation on the pattern only when the pattern can take the
+    // value's type, else one name for the whole value.
+    let help = match tc_pattern_annotation(pat, tid) {
+        Some(ann) => "add a type annotation, e.g. `let {pt}: {ann} = ...` (replace each placeholder with the intended type)"
+        None => {
+            let shown = tc_hint_slot_str(tid, Map())
+            "the pattern does not fit a value of type `{shown}`; bind the value to one name with an annotation, e.g. `let {tc_one_name_for(pat)}: {shown} = ...` (replace each placeholder with the intended type)"
+        }
     }
-    diag_error_at_notes("CannotInferType", CANNOT_INFER_TYPE, "cannot infer a type for the pattern `{pt}`: it is never given one by an annotation or a later use", decl_node, "add a type annotation, e.g. `let {pt}{hint} = ...` (replace each placeholder with the intended type)", notes)
+    diag_error_at_notes("CannotInferType", CANNOT_INFER_TYPE, msg, decl_node, help, notes)
 }
+
+// The annotation a `let` pattern takes for a value of this type, with a placeholder in each open
+// slot, or None when the pattern cannot take the type: a tuple pattern needs a tuple of its
+// arity, a struct pattern its struct. An open slot takes any pattern, spelled in its shape.
+fn tc_pattern_annotation(pat: Int, tid: Int) -> Option[Str] {
+    let k = node_kind(pat)
+    let open = tc_tid_is_no_info(tid) != 0 || tc_is_unbound_metavar(tc_resolve(tid)) != 0
+    if k == NodeKind.TuplePattern {
+        let els = node_elements(pat)
+        let n = sublist_length(els)
+        let t = tc_resolve(tid)
+        if !open && (ty_pool.get(t).unwrap().kind != TyKind.Tuple || ty_pool.get(t).unwrap().params_count != n) { return None }
+        let mut parts: List[Str] = []
+        for i in 0..n {
+            let sub = if open { -1 } else { ty_param_list.get(ty_pool.get(t).unwrap().params_start + i).unwrap() }
+            match tc_pattern_annotation(sublist_get(els, i), sub) {
+                Some(part) => parts.push(part)
+                None => return None
+            }
+        }
+        return Some("({parts.join(", ")})")
+    }
+    if k == NodeKind.StructPattern && !open {
+        let t = tc_resolve(tid)
+        let e = ty_pool.get(t).unwrap()
+        if e.kind != TyKind.Struct || strip_module_qualifier(e.name) != strip_module_qualifier(node_type_name(pat)) { return None }
+    }
+    Some(tc_hint_slot_str(tid, Map()))
+}
+
+// The name a repair binds a whole value to when the pattern cannot take it: the one binder of a
+// parenthesised name, as `(b)`, else a neutral name.
+fn tc_one_name_for(pat: Int) -> Str {
+    let els = node_elements(pat)
+    if node_kind(pat) == NodeKind.TuplePattern && els != -1 && sublist_length(els) == 1 {
+        let only = sublist_get(els, 0)
+        if node_kind(only) == NodeKind.IdentPattern { return format_pattern(only) }
+        return tc_one_name_for(only)
+    }
+    "value"
+}
+
+fn tc_is_destructuring_let(node: Int) -> Bool { node_elements(node) != -1 }
 
 // The name a report may give a `let`'s binder: "" for a destructuring `let`, whose node name is
 // the parser's internal one and not a name the program can write.
 fn tc_let_binder_name(node: Int) -> Str {
-    if node_elements(node) != -1 { return "" }
+    if tc_is_destructuring_let(node) { return "" }
     node_name(node)
 }
 
 // What a report about a `let`'s declared type calls its binder: the variable, or the pattern as
 // written.
 fn tc_let_subject(node: Int) -> Str {
-    if node_elements(node) == -1 { return "variable `{node_name(node)}`" }
+    if !tc_is_destructuring_let(node) { return "variable `{node_name(node)}`" }
     let pt = tc_let_pattern_text(node_elements(node))
     if pt == "" { "this pattern" } else { "the pattern `{pt}`" }
 }
 
-// A `let` pattern spelled as a program writes it, or "" for a form this does not spell.
-fn tc_let_pattern_text(pat: Int) -> Str {
-    if pat < 0 { return "" }
+// Whether parse recovery after an E0613 marked a binder of this pattern `mut`.
+fn tc_pattern_was_recovered(pat: Int) -> Bool {
+    if pat < 0 { return false }
+    if node_is_mut(pat) == BINDER_MUT_RECOVERED { return true }
     let k = node_kind(pat)
-    if k == NodeKind.WildcardPattern { return "_" }
-    if k == NodeKind.IdentPattern {
-        let name = node_name(pat)
-        if name == "" { return "" }
-        if node_is_mut(pat) != 0 { return "mut {name}" }
-        return name
+    if k == NodeKind.StructLitField { return tc_pattern_was_recovered(node_pattern(pat)) }
+    let children = if k == NodeKind.TuplePattern { node_elements(pat) } else if k == NodeKind.StructPattern { node_fields(pat) } else { -1 }
+    if children == -1 { return false }
+    let mut i = 0
+    while i < sublist_length(children) {
+        if tc_pattern_was_recovered(sublist_get(children, i)) { return true }
+        i = i + 1
     }
-    if k == NodeKind.TuplePattern {
-        let els = node_elements(pat)
-        let mut parts: List[Str] = []
-        let mut i = 0
-        while i < sublist_length(els) {
-            let part = tc_let_pattern_text(sublist_get(els, i))
-            if part == "" { return "" }
-            parts.push(part)
-            i = i + 1
-        }
-        return "({parts.join(", ")})"
-    }
-    if k == NodeKind.StructPattern {
-        let flds = node_fields(pat)
-        let mut parts: List[Str] = []
-        let mut i = 0
-        while i < sublist_length(flds) {
-            let f = sublist_get(flds, i)
-            let sub = node_pattern(f)
-            if sub == -1 {
-                parts.push(if node_is_mut(f) != 0 { "mut {node_name(f)}" } else { node_name(f) })
-            } else {
-                let part = tc_let_pattern_text(sub)
-                if part == "" { return "" }
-                parts.push("{node_name(f)}: {part}")
-            }
-            i = i + 1
-        }
-        if node_inclusive(pat) != 0 { parts.push("..") }
-        if parts.len() == 0 { return "{node_type_name(pat)} \{ }" }
-        return "{node_type_name(pat)} \{ {parts.join(", ")} }"
-    }
-    ""
+    false
+}
+
+// A `let` pattern spelled as the formatter writes it, or "" when parse recovery rewrote a binder
+// and the text would show a `mut` the program did not write.
+fn tc_let_pattern_text(pat: Int) -> Str {
+    if pat < 0 || tc_pattern_was_recovered(pat) { return "" }
+    format_pattern(pat)
 }
 
 // What an under-determined binding's value is, and which of its type's slots nothing filled,
@@ -44241,14 +44283,14 @@ fn tc_stamp_annotated_global_init(l: Int, l_val: Int) ! TypeCheck.Resolve, TypeC
     let declared = if tc_value_decl_poisoned(l) { tc_module_let_written_tid(l) } else { tc_lookup_node_tid(l) }
     tc_seed_expected_into_value(l_val, declared)
     let hint = if tc_tid_is_no_info(declared) == 0 { resolve_alias_tid(declared) } else { tc_construct_hint }
-    let v_tid = tc_infer_walked_let_value(l_val, node_name(l), hint)
+    let v_tid = tc_infer_walked_let_value(l_val, tc_let_binder_name(l), hint)
     if tc_tid_is_no_info(declared) == 0 && tc_tid_is_no_info(v_tid) == 0 {
         // Behind the compare, for the reason the LetBinding arm gives at its own pin: a pin
         // ahead of the compare can turn a mismatch into a silent success.
         if assignment_types_compatible(declared, v_tid, l_val) == 0 {
             if !tc_closure_checked_against(l_val, declared) {
                 let (declared_s, got_s) = tc_type_pair_strs(declared, v_tid)
-                tc_report_declared_mismatch("variable `{node_name(l)}`: declared type {declared_s} but got {got_s}{tc_fn_mismatch_suffix(declared, v_tid)}", l, l_val, declared, v_tid)
+                tc_report_declared_mismatch("{tc_let_subject(l)}: declared type {declared_s} but got {got_s}{tc_fn_mismatch_suffix(declared, v_tid)}", l, l_val, declared, v_tid)
             }
         } else {
             tc_pin_declared_into_value(declared, l_val, v_tid)
@@ -44300,7 +44342,7 @@ fn tc_infer_global_initializers(lets_sl: Int) ! TypeCheck.Resolve, TypeCheck.Rep
                 if vk != NodeKind.IntLit && vk != NodeKind.FloatLit && vk != NodeKind.BoolLit {
                     nr_current_module = node_module(l)
                     let saved = diag_entry_count()
-                    let l_tid = tc_infer_walked_let_value(l_val, node_name(l), tc_construct_hint)
+                    let l_tid = tc_infer_walked_let_value(l_val, tc_let_binder_name(l), tc_construct_hint)
                     let clean = diag_any_errors_since(saved) == 0
                     if clean && tc_tid_is_no_info(l_tid) == 0 {
                         if tc_tid_has_unbound_metavar(l_tid) != 0 {
