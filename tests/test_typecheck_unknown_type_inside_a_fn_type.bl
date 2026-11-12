@@ -1,0 +1,310 @@
+// A type name nothing declares is `error[UnknownType]` at check wherever a fn type writes it:
+// as a parameter or as the return, at any depth, in every place a type can be written. The
+// return of a fn type was not checked, so `blink check` was clean and the build either stopped
+// with an internal error or ran with a free type variable.
+//
+// A type parameter in scope and `Self` in a trait are types, so a fn type that names them
+// checks clean, and the valid forms build and run in each build mode.
+
+import cg_test_helpers.{cg_probe_begin}
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_ice_count}
+import std.fs
+import std.io
+import std.process.{ProcessResult}
+import compile_test_helpers.{scratch_root}
+
+// Every row reads this one probe. Its names are unique, because the typecheck name tables are
+// process-global, and the line numbers the rows assert are the probe's own.
+let PROBE = #"type ZqE[T] {
+    L(T)
+    N
+}
+fn zq_param(_g: fn() -> ZqParam) -> Int { 1 }
+fn zq_return() -> fn() -> ZqReturn { panic("x") }
+type ZqS {
+    g: fn() -> ZqField
+}
+type ZqV {
+    A(fn() -> ZqPayload)
+    B
+}
+type ZqF = fn() -> ZqAlias
+fn zq_id[T](x: T) -> T { x }
+trait ZqSig {
+    fn m(self) -> fn() -> ZqTraitSig
+}
+trait ZqWants {
+    fn m(self, g: fn() -> Int) -> Int
+}
+type ZqA {
+    x: Int
+}
+impl ZqWants for ZqA {
+    fn m(self, _g: fn() -> ZqImplSig) -> Int { self.x }
+}
+trait ZqPlain {
+    fn m(self) -> Int
+}
+type ZqB {
+    x: Int
+}
+impl ZqPlain for ZqB {
+    fn m(self) -> Int {
+        let _g: Option[fn() -> ZqImplBody] = None
+        self.x
+    }
+}
+fn zq_nest_param(_g: fn(fn() -> ZqNestParam) -> Int) -> Int { 1 }
+fn zq_nest_list(_g: fn() -> List[ZqNestList]) -> Int { 1 }
+fn zq_nest_tuple(_g: fn() -> (Int, ZqNestTuple)) -> Int { 1 }
+fn zq_nest_ret(_g: fn() -> fn() -> ZqNestRet) -> Int { 1 }
+fn zq_tparam[T](g: fn(T) -> T, x: T) -> fn() -> T {
+    fn() -> T { g(x) }
+}
+fn main() {
+    let _a: ZqE[fn() -> ZqEnumArg] = ZqE.N
+    let _b: Option[fn() -> ZqOptionArg] = None
+    let _c: Option[fn(ZqFnParam) -> Int] = None
+    let _d: fn() -> ZqLet = fn() { panic("x") }
+    let _e = zq_id[fn() -> ZqTypeArg](fn() { panic("x") })
+    let _f = fn(_g: fn() -> ZqClosureParam) -> Int { 1 }
+    let _k = fn() -> fn() -> ZqClosureRet { panic("x") }
+    let _t = zq_tparam(fn(n: Int) -> Int { n + 1 }, 1)
+}
+"#
+
+fn compile_the_probe() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Env.Exit, Env.Read, FS.Read, IO, FS.Write, Env.Write, Process.Spawn {
+    env.set_var("BLINK_ROOT", process.run("pwd", []).unwrap().out.trim())
+    let path = "build/unknown_type_in_fn_type_probe.bl"
+    cg_probe_begin(path)
+    fs.write(path, PROBE).unwrap()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _rm = process.run("rm", ["-f", path]).unwrap()
+    assert_eq(diag_ice_count, 0)
+}
+
+fn report_names() -> Str {
+    let mut out = ""
+    for d in diag_entries {
+        if d.severity == "error" { out = out.concat("{d.name} at {d.line}: {d.message}\n") }
+    }
+    out
+}
+
+fn errors_at(name: Str, text: Str, line: Int) -> Int {
+    let mut n = 0
+    for d in diag_entries {
+        if d.severity == "error" && d.name == name && d.message.contains(text) && d.line == line { n = n + 1 }
+    }
+    n
+}
+
+// The report has the same wording as a bare `let a: Name = ...`, on the line that writes it,
+// and is given once.
+fn assert_unknown(label: Str, name: Str, line: Int) ! IO.Print {
+    let n = errors_at("UnknownType", "unknown type `{name}`", line)
+    if n != 1 {
+        io.println("FAIL: {label}: want one UnknownType for `{name}` on line {line}, got {n}. Reports:\n{report_names()}")
+    }
+    assert_eq(n, 1)
+}
+
+test "an unknown name as the return of a fn type in a generic enum argument is refused" {
+    compile_the_probe()
+    assert_unknown("enum arg", "ZqEnumArg", 48)
+}
+
+test "an unknown name as the return of a fn type in an Option annotation is refused" {
+    compile_the_probe()
+    assert_unknown("option arg", "ZqOptionArg", 49)
+}
+
+test "an unknown name as a parameter of a fn type is refused" {
+    compile_the_probe()
+    assert_unknown("fn type param", "ZqFnParam", 50)
+}
+
+test "an unknown name as the return of a fn type in a let annotation is refused" {
+    compile_the_probe()
+    assert_unknown("let", "ZqLet", 51)
+}
+
+test "an unknown name as the return of a fn type in a fn-typed parameter is refused" {
+    compile_the_probe()
+    assert_unknown("fn param", "ZqParam", 5)
+}
+
+test "an unknown name as the return of a fn type in a fn-typed return is refused" {
+    compile_the_probe()
+    assert_unknown("fn return", "ZqReturn", 6)
+}
+
+test "an unknown name as the return of a fn type in a struct field is refused" {
+    compile_the_probe()
+    assert_unknown("struct field", "ZqField", 8)
+}
+
+test "an unknown name as the return of a fn type in an enum payload is refused" {
+    compile_the_probe()
+    assert_unknown("enum payload", "ZqPayload", 11)
+}
+
+test "an unknown name as the return of a fn type in a type alias is refused" {
+    compile_the_probe()
+    assert_unknown("type alias", "ZqAlias", 14)
+}
+
+test "an unknown name as the return of a fn type in a call's type argument is refused" {
+    compile_the_probe()
+    assert_unknown("call type arg", "ZqTypeArg", 52)
+}
+
+test "an unknown name as the return of a fn type in a closure parameter is refused" {
+    compile_the_probe()
+    assert_unknown("closure param", "ZqClosureParam", 53)
+}
+
+test "an unknown name as the return of a fn type in a closure return is refused" {
+    compile_the_probe()
+    assert_unknown("closure return", "ZqClosureRet", 54)
+}
+
+test "an unknown name as the return of a fn type in a trait method signature is refused" {
+    compile_the_probe()
+    assert_unknown("trait sig", "ZqTraitSig", 17)
+}
+
+test "an unknown name as the return of a fn type in a trait impl method's parameter is refused" {
+    compile_the_probe()
+    assert_unknown("impl sig", "ZqImplSig", 26)
+}
+
+test "an unknown name as the return of a fn type in a trait impl method body is refused" {
+    compile_the_probe()
+    assert_unknown("impl body", "ZqImplBody", 36)
+}
+
+test "an unknown name as the return of a fn type in a fn type's fn-typed parameter is refused" {
+    compile_the_probe()
+    assert_unknown("nested param", "ZqNestParam", 40)
+}
+
+test "an unknown name as the return of a fn type in a list in a fn type's return is refused" {
+    compile_the_probe()
+    assert_unknown("nested list", "ZqNestList", 41)
+}
+
+test "an unknown name as the return of a fn type in a tuple in a fn type's return is refused" {
+    compile_the_probe()
+    assert_unknown("nested tuple", "ZqNestTuple", 42)
+}
+
+test "an unknown name as the return of a fn type in a fn type's fn-typed return is refused" {
+    compile_the_probe()
+    assert_unknown("nested return", "ZqNestRet", 43)
+}
+
+// The impl row also breaks the trait's contract, as a bare unknown name there does. Every
+// other error is a row above, so the type parameter forms on lines 15, 44-46 and 55 give none.
+test "a fn type that names a type parameter checks clean" {
+    compile_the_probe()
+    let contract = errors_at("TraitContractParamMismatch", "", 26)
+    let mut total = 0
+    for d in diag_entries {
+        if d.severity == "error" { total = total + 1 }
+    }
+    if contract != 1 || total != 20 {
+        io.println("FAIL: want the 19 rows above plus one TraitContractParamMismatch, got {total}. Reports:\n{report_names()}")
+    }
+    assert_eq(contract, 1)
+    assert_eq(total, 20)
+}
+
+fn sh(cmd: Str) -> ProcessResult ! Process.Spawn {
+    process.run("sh", ["-c", cmd]).unwrap()
+}
+
+fn valid_src() -> Str {
+    #"type E[T] {
+    L(T)
+    N
+}
+type Holder {
+    g: fn(Int) -> Str
+}
+type Cb {
+    Run(fn() -> Int)
+    Skip
+}
+type IntFn = fn(Int) -> Int
+trait Make {
+    fn make(self) -> fn() -> Self
+}
+type S {
+    x: Int
+}
+impl Make for S {
+    fn make(self) -> fn() -> S {
+        let v = self.x
+        fn() -> S { S { x: v + 1 } }
+    }
+}
+fn twice[T](g: fn(T) -> T, x: T) -> T {
+    g(g(x))
+}
+fn wrap[T](x: T) -> fn() -> T {
+    fn() -> T { x }
+}
+fn nested[T](g: fn(fn() -> T) -> List[T], x: T) -> List[T] {
+    g(fn() -> T { x })
+}
+fn main() {
+    let a: E[fn() -> Int] = E.L(fn() -> Int { 3 })
+    match a {
+        E.L(f) => io.println("{f()}")
+        E.N => io.println("n")
+    }
+    let h = Holder { g: fn(n: Int) -> Str { "h{n}" } }
+    io.println(h.g(4))
+    match Cb.Run(fn() -> Int { 5 }) {
+        Cb.Run(f) => io.println("{f()}")
+        Cb.Skip => io.println("s")
+    }
+    let inc: IntFn = fn(n: Int) -> Int { n + 1 }
+    io.println("{inc(5)}")
+    io.println("{twice(fn(n: Int) -> Int { n * 2 }, 2)}")
+    io.println(wrap("w")())
+    let s = S { x: 6 }
+    io.println("{s.make()().x}")
+    let ls = nested(fn(f: fn() -> Int) -> List[Int] { [f(), f()] }, 9)
+    io.println("{ls.len()}")
+    let o: Option[fn() -> (Int, Str)] = Some(fn() -> (Int, Str) { (1, "t") })
+    match o {
+        Some(f) => {
+            let (i, t) = f()
+            io.println("{i}{t}")
+        }
+        None => io.println("none")
+    }
+}
+"#
+}
+
+test "each valid fn type form builds and runs in each build mode" {
+    let root = "{scratch_root()}/unknown_type_in_fn_type_valid_{getpid()}"
+    let _ = sh("rm -rf {root} && mkdir -p {root}")
+    fs.write("{root}/main.bl", valid_src()).unwrap()
+    let blink = sh("readlink -f build/blink").out.trim()
+    let clean_env = "env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE"
+    let want = "3\nh4\n5\n6\n8\nw\n7\n2\n1t\n"
+    let mut failed: List[Str] = []
+    for mode in ["--no-per-module", "--per-module"] {
+        let r = sh("cd {root} && {clean_env} timeout 300 {blink} run {mode} main.bl < /dev/null")
+        if !r.success() || r.out != want { failed.push("blink run {mode}: {r.end}\n{r.out}\n{r.err_out}") }
+    }
+    let _ = sh("rm -rf {root}")
+    assert_eq(failed, [])
+}
