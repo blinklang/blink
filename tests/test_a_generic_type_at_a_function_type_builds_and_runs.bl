@@ -1,0 +1,239 @@
+// A user generic type may take a function type as its argument, at the top or nested in an
+// Option, a List or a tuple. Two instances that differ only in the function's signature are
+// two instances, also when the signature sits under a carrier in a generic fn or impl. Each
+// form builds and runs, in the one-unit and the per-module build, and from a module other
+// than the one that declares the type.
+
+import std.fs
+import std.process.{ProcessResult}
+import compile_test_helpers.{scratch_root}
+
+type E[T] {
+    L(T)
+    N
+}
+
+type Bx[T] { v: T }
+
+trait Sh {
+    fn sh(self) -> Int
+}
+
+impl[T] Sh for Bx[T] {
+    fn sh(self) -> Int { 1 }
+}
+
+fn get[T](b: Bx[T]) -> T { b.v }
+
+fn ident[T](x: T) -> T { x }
+
+fn inc(x: Int) -> Int { x + 1 }
+
+fn slen(s: Str) -> Int { s.len() }
+
+fn call_int(e: E[fn(Int) -> Int], x: Int) -> Int {
+    match e {
+        E.L(f) => f(x)
+        E.N => 0
+    }
+}
+
+fn sum_ints(l: List[Int]) -> Int {
+    let mut n = 0
+    for x in l {
+        n = n + x
+    }
+    n
+}
+
+fn sum_lens(l: List[Str]) -> Int {
+    let mut n = 0
+    for x in l {
+        n = n + x.len()
+    }
+    n
+}
+
+fn call_list[T](e: E[fn(List[T]) -> Int], l: List[T]) -> Int {
+    match e {
+        E.L(f) => f(l)
+        E.N => 0
+    }
+}
+
+fn call_str(e: E[fn(Str) -> Int], s: Str) -> Int {
+    match e {
+        E.L(f) => f(s)
+        E.N => 0
+    }
+}
+
+test "an enum at a function type holds the function and calls it" {
+    let a: E[fn(Int) -> Int] = E.L(inc)
+    assert_eq(call_int(a, 1), 2)
+    assert_eq(call_int(E.N, 1), 0)
+}
+
+test "two instances that differ only in the function signature are two types" {
+    let a: E[fn(Int) -> Int] = E.L(inc)
+    let b: E[fn(Str) -> Int] = E.L(slen)
+    assert_eq(call_int(a, 1) + call_str(b, "abc"), 5)
+}
+
+test "two instances that differ only inside an erased type in the signature are two types" {
+    let a: E[fn(List[Int]) -> Int] = E.L(sum_ints)
+    let b: E[fn(List[Str]) -> Int] = E.L(sum_lens)
+    assert_eq(call_list(a, [1, 2]) + call_list(b, ["abc", "defg"]), 10)
+}
+
+test "a struct at a function type takes a generic impl and a generic fn" {
+    let b = Bx { v: fn(x: Int) -> Int { x + 1 } }
+    let c = Bx { v: slen }
+    assert_eq(b.sh() + c.sh(), 2)
+    let f = get(b)
+    let g = get(c)
+    assert_eq(f(4) + g("ab"), 7)
+}
+
+test "a function type nested in an option, a list or a tuple argument builds" {
+    let a: E[Option[fn(Int) -> Int]] = E.L(Some(inc))
+    let b: E[List[fn(Int) -> Int]] = E.L([inc, inc])
+    let c: E[(Int, fn(Int) -> Int)] = E.L((5, inc))
+    let x = match a {
+        E.L(o) => o.unwrap()(1)
+        E.N => 0
+    }
+    let y = match b {
+        E.L(l) => l.get(1).unwrap()(2)
+        E.N => 0
+    }
+    let z = match c {
+        E.L(t) => {
+            let g = t.1
+            g(t.0)
+        }
+        E.N => 0
+    }
+    assert_eq("{x} {y} {z}", "2 3 6")
+}
+
+test "two signatures nested in a carrier are two instances of a generic fn and impl" {
+    let a = Bx { v: Some(inc) }
+    let b = Bx { v: Some(slen) }
+    assert_eq(a.sh() + b.sh(), 2)
+    let c = Bx { v: [inc] }
+    let d = Bx { v: [slen] }
+    assert_eq(get(c).get(0).unwrap()(1) + get(d).get(0).unwrap()("ab"), 4)
+    let e = ident(Some(inc))
+    let f = ident(Some(slen))
+    assert_eq(e.unwrap()(1) + f.unwrap()("abc"), 5)
+    let g = ident((2, inc))
+    let h = ident(("abcd", slen))
+    let gf = g.1
+    let hf = h.1
+    assert_eq(gf(g.0) + hf(h.0), 7)
+}
+
+fn sh(cmd: Str) -> ProcessResult ! Process.Spawn {
+    process.run("sh", ["-c", cmd]).unwrap()
+}
+
+fn single_src() -> Str {
+    #"type E[T] {
+    L(T)
+    N
+}
+type Bx[T] { v: T }
+trait Sh {
+    fn sh(self) -> Int
+}
+impl[T] Sh for Bx[T] {
+    fn sh(self) -> Int { 1 }
+}
+fn inc(x: Int) -> Int { x + 1 }
+fn slen(s: Str) -> Int { s.len() }
+fn get[T](b: Bx[T]) -> T { b.v }
+fn ident[T](x: T) -> T { x }
+fn sum_ints(l: List[Int]) -> Int { l.len() + l.get(0).unwrap() }
+fn sum_lens(l: List[Str]) -> Int { l.len() + l.get(0).unwrap().len() }
+fn main() {
+    let a: E[fn(Int) -> Int] = E.L(inc)
+    io.println("{match a { E.L(f) => f(1)
+        E.N => 0 }}")
+    let b = Bx { v: fn(x: Int) -> Int { x + 1 } }
+    io.println(b.sh())
+    let s: E[fn(Str) -> Int] = E.L(slen)
+    io.println("{match s { E.L(f) => f("abc")
+        E.N => 0 }}")
+    let o: E[Option[fn(Int) -> Int]] = E.L(Some(inc))
+    io.println("{match o { E.L(g) => g.unwrap()(5)
+        E.N => 0 }}")
+    let li: E[fn(List[Int]) -> Int] = E.L(sum_ints)
+    io.println("{match li { E.L(f) => f([4, 5])
+        E.N => 0 }}")
+    let ls: E[fn(List[Str]) -> Int] = E.L(sum_lens)
+    io.println("{match ls { E.L(f) => f(["abc"])
+        E.N => 0 }}")
+    let n1 = Bx { v: Some(inc) }
+    let n2 = Bx { v: Some(slen) }
+    io.println(n1.sh() + n2.sh())
+    let l1 = Bx { v: [inc] }
+    let l2 = Bx { v: [slen] }
+    io.println(get(l1).get(0).unwrap()(1) + get(l2).get(0).unwrap()("ab"))
+    let i1 = ident(Some(inc))
+    let i2 = ident(Some(slen))
+    io.println(i1.unwrap()(1) + i2.unwrap()("abc"))
+}
+"#
+}
+
+fn lib_src() -> Str {
+    #"pub type E[T] {
+    L(T)
+    N
+}
+pub fn mk() -> E[fn(Int) -> Int] { E.L(fn(x: Int) -> Int { x * 3 }) }
+pub fn run(e: E[fn(Int) -> Int]) -> Int {
+    match e {
+        E.L(f) => f(2)
+        E.N => 0
+    }
+}
+"#
+}
+
+fn pkg_main_src() -> Str {
+    #"import lib
+import lib.{E}
+fn main() {
+    io.println(lib.run(lib.mk()))
+    let local: E[fn(Int) -> Int] = E.L(fn(x: Int) -> Int { x + 10 })
+    io.println(lib.run(local))
+}
+"#
+}
+
+fn run_modes(dir: Str, file: Str, want: Str) -> List[Str] ! Process.Spawn {
+    let blink = sh("readlink -f build/blink").out.trim()
+    let mut failed: List[Str] = []
+    for mode in ["--no-per-module", "--per-module"] {
+        let r = sh("cd {dir} && env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE timeout 300 {blink} run {mode} {file} < /dev/null")
+        if !r.success() || r.out != want { failed.push("blink run {mode} {file}: {r.end}\n{r.out}\n{r.err_out}") }
+    }
+    failed
+}
+
+test "a generic type at a function type builds and runs in each build mode" {
+    let root = "{scratch_root()}/fn_type_instance_{getpid()}"
+    let _ = sh("rm -rf {root} && mkdir -p {root}/pkg/src")
+    fs.write("{root}/main.bl", single_src()).unwrap()
+    fs.write("{root}/pkg/blink.toml", "[package]\nname = \"m\"\nversion = \"0.1.0\"\n").unwrap()
+    fs.write("{root}/pkg/src/lib.bl", lib_src()).unwrap()
+    fs.write("{root}/pkg/src/main.bl", pkg_main_src()).unwrap()
+    let mut failed = run_modes(root, "main.bl", "2\n1\n3\n6\n6\n4\n2\n4\n5\n")
+    for f in run_modes("{root}/pkg", "src/main.bl", "6\n12\n") {
+        failed.push(f)
+    }
+    let _ = sh("rm -rf {root}")
+    assert_eq(failed, [])
+}
