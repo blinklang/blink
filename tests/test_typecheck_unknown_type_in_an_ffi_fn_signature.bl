@@ -1,0 +1,275 @@
+// A type name nothing declares is `error[UnknownType]` at check when an @ffi fn's signature writes
+// it, as it is for any other fn: as a parameter, as the return, and at any depth, such as in
+// `Option[...]`, `Ptr[...]` or a fn type. The parameters of an @ffi fn were not checked, so
+// `blink check` was clean and the build stopped with an internal error.
+//
+// The valid signature types check clean, and they still build and run in each build mode.
+
+import cg_test_helpers.{cg_probe_begin}
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_ice_count}
+import std.fs
+import std.io
+import std.process.{ProcessResult}
+import compile_test_helpers.{scratch_root}
+
+// Every row reads this one probe. Its names are unique, because the typecheck name tables are
+// process-global, and the line numbers the rows assert are the probe's own.
+let PROBE = #"@ffi.struct(header: "poll.h", name: "pollfd")
+type ZfPollfd {
+    fd: I32
+    events: I16
+    revents: I16
+}
+@ffi.opaque(header: "stdio.h", name: "FILE")
+type ZfFile
+@ffi("c", "labs")
+fn zf_bare(x: ZfBare) -> Int ! ()
+@ffi("c", "labs")
+fn zf_second(x: Int, y: ZfSecond) -> Int ! ()
+@ffi("c", "labs")
+fn zf_ret(x: Int) -> ZfRet ! ()
+@ffi("c", "labs")
+fn zf_option(x: Option[ZfOption]) -> Int ! ()
+@ffi("c", "labs")
+fn zf_ptr(x: Ptr[ZfPtr]) -> Int ! ()
+@ffi("c", "labs")
+fn zf_ptr_ptr(x: Ptr[Ptr[ZfPtrPtr]]) -> Int ! ()
+@ffi("c", "labs")
+fn zf_fn_param(x: fn(ZfFnParam) -> Int) -> Int ! ()
+@ffi("c", "labs")
+fn zf_fn_ret(x: fn(Int) -> ZfFnRet) -> Int ! ()
+@ffi("c", "labs")
+fn zf_with_body(x: ZfWithBody) -> Int ! () { }
+@ffi("c", "labs")
+fn zf_ok_int(x: Int) -> Int ! ()
+@ffi("c", "strlen")
+fn zf_ok_ptr(s: Ptr[U8]) -> Int ! ()
+@ffi("c", "poll")
+fn zf_ok_struct(fds: Ptr[ZfPollfd], n: U64, timeout: I32) -> I32 ! IO
+@ffi("c", "fflush")
+fn zf_ok_opaque(f: Option[ZfFile]) -> I32 ! IO
+@ffi("c", "free")
+fn zf_ok_void(p: Ptr[Void]) -> () ! ()
+fn main() {
+    io.println("x")
+}
+"#
+
+fn compile_the_probe() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Env.Exit, Env.Read, FS.Read, IO, FS.Write, Env.Write, Process.Spawn {
+    env.set_var("BLINK_ROOT", process.run("pwd", []).unwrap().out.trim())
+    let path = "build/unknown_type_in_ffi_fn_signature_probe.bl"
+    cg_probe_begin(path)
+    fs.write(path, PROBE).unwrap()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _rm = process.run("rm", ["-f", path]).unwrap()
+    assert_eq(diag_ice_count, 0)
+}
+
+fn report_names() -> Str {
+    let mut out = ""
+    for d in diag_entries {
+        if d.severity == "error" { out = out.concat("{d.name} at {d.line}: {d.message}\n") }
+    }
+    out
+}
+
+fn errors_at(name: Str, text: Str, line: Int) -> Int {
+    let mut n = 0
+    for d in diag_entries {
+        if d.severity == "error" && d.name == name && d.message.contains(text) && d.line == line { n = n + 1 }
+    }
+    n
+}
+
+// The report has the same wording as for the parameter of a fn with a body, on the line that
+// writes it, and is given once.
+fn assert_unknown(label: Str, name: Str, line: Int) ! IO.Print {
+    let n = errors_at("UnknownType", "unknown type `{name}`", line)
+    if n != 1 {
+        io.println("FAIL: {label}: want one UnknownType for `{name}` on line {line}, got {n}. Reports:\n{report_names()}")
+    }
+    assert_eq(n, 1)
+}
+
+test "an unknown name as a parameter of an @ffi fn is refused" {
+    compile_the_probe()
+    assert_unknown("bare param", "ZfBare", 10)
+}
+
+test "an unknown name as a later parameter of an @ffi fn is refused" {
+    compile_the_probe()
+    assert_unknown("second param", "ZfSecond", 12)
+}
+
+test "an unknown name as the return of an @ffi fn is refused" {
+    compile_the_probe()
+    assert_unknown("return", "ZfRet", 14)
+}
+
+test "an unknown name in an Option parameter of an @ffi fn is refused" {
+    compile_the_probe()
+    assert_unknown("option param", "ZfOption", 16)
+}
+
+test "an unknown name as the pointee of a Ptr parameter of an @ffi fn is refused" {
+    compile_the_probe()
+    assert_unknown("ptr param", "ZfPtr", 18)
+}
+
+test "an unknown name in a nested Ptr parameter of an @ffi fn is refused" {
+    compile_the_probe()
+    assert_unknown("ptr ptr param", "ZfPtrPtr", 20)
+}
+
+test "an unknown name as a parameter of a fn type in an @ffi fn is refused" {
+    compile_the_probe()
+    assert_unknown("fn type param", "ZfFnParam", 22)
+}
+
+test "an unknown name as the return of a fn type in an @ffi fn is refused" {
+    compile_the_probe()
+    assert_unknown("fn type return", "ZfFnRet", 24)
+}
+
+test "an unknown name as a parameter of an @ffi fn written with an empty body is refused" {
+    compile_the_probe()
+    assert_unknown("with body", "ZfWithBody", 26)
+}
+
+// A later check, such as one for a type with no C form, may add errors on the lines above, so
+// this row reads only the lines of the valid signatures.
+test "an @ffi fn whose signature names only valid types checks clean" {
+    compile_the_probe()
+    let mut n = 0
+    for d in diag_entries {
+        if d.severity == "error" && d.line >= 27 && d.line <= 36 { n = n + 1 }
+    }
+    if n != 0 {
+        io.println("FAIL: want no error on lines 27-36, got {n}. Reports:\n{report_names()}")
+    }
+    assert_eq(n, 0)
+}
+
+// The body of an @ffi fn is not walked, so its parameters give no unused warning.
+test "the parameters of an @ffi fn give no unused-variable warning" {
+    compile_the_probe()
+    let mut n = 0
+    for d in diag_entries {
+        if d.name == "UnusedVariable" { n = n + 1 }
+    }
+    if n != 0 { io.println("FAIL: want no UnusedVariable. Reports:\n{report_names()}") }
+    assert_eq(n, 0)
+}
+
+fn sh(cmd: Str) -> ProcessResult ! Process.Spawn {
+    process.run("sh", ["-c", cmd]).unwrap()
+}
+
+let CLEAN_ENV = "env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE"
+
+fn valid_src() -> Str {
+    #"@ffi.struct(header: "poll.h", name: "pollfd")
+type Pollfd {
+    fd: I32
+    events: I16
+    revents: I16
+}
+
+@ffi.opaque(header: "stdio.h", name: "FILE")
+type CFile
+
+@ffi("c", "labs")
+fn c_labs(n: Int) -> Int ! ()
+
+@ffi("c", "strlen")
+fn c_strlen(s: Ptr[U8]) -> Int ! ()
+
+@ffi("c", "poll")
+fn c_poll(fds: Ptr[Pollfd], n: U64, timeout: I32) -> I32 ! IO
+
+@ffi("c", "fflush")
+fn c_fflush(f: Option[CFile]) -> I32 ! IO
+
+fn main() ! IO {
+    io.println("{c_labs(-7)}")
+    with ffi.scope() as scope {
+        io.println("{c_strlen(scope.cstr("hello"))}")
+        let fds: Ptr[Pollfd] = scope.alloc_n(1)
+        io.println("{c_poll(fds, 0, 0)}")
+    }
+    io.println("{c_fflush(None)}")
+}
+"#
+}
+
+test "an @ffi fn with valid signature types builds and runs in each build mode" {
+    let root = "{scratch_root()}/unknown_type_in_ffi_fn_signature_valid_{getpid()}"
+    let _ = sh("rm -rf {root} && mkdir -p {root}")
+    fs.write("{root}/main.bl", valid_src()).unwrap()
+    let blink = sh("readlink -f build/blink").out.trim()
+    let want = "7\n5\n0\n0\n"
+    let mut failed: List[Str] = []
+    for mode in ["--no-per-module", "--per-module"] {
+        let r = sh("cd {root} && {CLEAN_ENV} timeout 300 {blink} run {mode} main.bl < /dev/null")
+        if !r.success() || r.out != want { failed.push("blink run {mode}: {r.end}\n{r.out}\n{r.err_out}") }
+    }
+    let _ = sh("rm -rf {root}")
+    assert_eq(failed, [])
+}
+
+// A parameter type of an @ffi fn passes the same visibility and import checks as any other
+// written type, and it counts as a use of the import that brings it in. Each needs a second
+// module, so these rows check a package.
+let HID_SRC = #"@ffi.opaque(header: "stdio.h", name: "FILE")
+pub type PubFile
+
+@ffi.opaque(header: "stdio.h", name: "FILE")
+type PrivFile
+"#
+
+let PRIVATE_SRC = #"import hid
+@ffi("c", "fflush")
+fn ff(f: Option[hid.PrivFile]) -> I32 ! IO
+fn main() { io.println("{ff(None)}") }
+"#
+
+let SELECTED_SRC = #"import hid.{PubFile}
+@ffi("c", "fflush")
+fn ff(f: Option[PubFile]) -> I32 ! IO
+fn main() { io.println("{ff(None)}") }
+"#
+
+let NOT_SELECTED_SRC = #"import hid
+@ffi("c", "fflush")
+fn ff(f: Option[PubFile]) -> I32 ! IO
+fn main() { io.println("{ff(None)}") }
+"#
+
+test "an @ffi parameter type is checked for visibility and import, and uses its import" {
+    let root = "{scratch_root()}/unknown_type_in_ffi_fn_signature_pkg_{getpid()}"
+    let _ = sh("rm -rf {root} && mkdir -p {root}/src")
+    fs.write("{root}/blink.toml", "[package]\nname = \"ffipkg\"\nversion = \"0.1.0\"\n").unwrap()
+    fs.write("{root}/src/hid.bl", HID_SRC).unwrap()
+    fs.write("{root}/src/private.bl", PRIVATE_SRC).unwrap()
+    fs.write("{root}/src/selected.bl", SELECTED_SRC).unwrap()
+    fs.write("{root}/src/not_selected.bl", NOT_SELECTED_SRC).unwrap()
+    let blink = sh("readlink -f build/blink").out.trim()
+    let mut failed: List[Str] = []
+    let priv_r = sh("cd {root} && {CLEAN_ENV} timeout 300 {blink} check src/private.bl < /dev/null 2>&1")
+    if priv_r.success() || !priv_r.out.contains("error[PrivateItemAccess]: cannot access private type `PrivFile`") {
+        failed.push("private type: want PrivateItemAccess, got {priv_r.end}\n{priv_r.out}")
+    }
+    let selected = sh("cd {root} && {CLEAN_ENV} timeout 300 {blink} check src/selected.bl < /dev/null 2>&1")
+    if !selected.success() || selected.out.contains("UnusedImport") {
+        failed.push("selected import: want a clean check with no UnusedImport, got {selected.end}\n{selected.out}")
+    }
+    let not_selected = sh("cd {root} && {CLEAN_ENV} timeout 300 {blink} check src/not_selected.bl < /dev/null 2>&1")
+    if not_selected.success() || !not_selected.out.contains("error[ImportNotSelected]: `PubFile` is not in scope") {
+        failed.push("type not imported: want ImportNotSelected, got {not_selected.end}\n{not_selected.out}")
+    }
+    let _ = sh("rm -rf {root}")
+    assert_eq(failed, [])
+}
