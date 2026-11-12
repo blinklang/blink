@@ -1175,17 +1175,59 @@ fn tc_type_renamed_in_impl(im: Int) -> Bool {
 
 // The type an impl header means when it names an alias, read in the impl's own module, or -1.
 // Impl lookup tests the resolved type (sections/07_trust_modules_metadata.md), so an impl on an
-// alias is an impl on its target. Only a target with no type arguments: E0908 refuses an impl
-// on an alias of an instance as it refuses one on the instance, and a generic alias or a tuple
-// or function target has no receiver a header can write.
+// alias is an impl on its target. A non-generic alias counts only when its target has no type
+// arguments, because E0908 refuses an impl on an instance however it is spelled; a tuple or
+// function target has no receiver a header can write.
 fn tc_impl_alias_target(im: Int) -> Int {
-    let t = tc_impl_alias_resolved(im)
-    if t < 0 || !tc_impl_alias_target_is_bare(t) { -1 } else { t }
+    let decl = tc_impl_header_alias_decl(im)
+    if decl == -1 { return -1 }
+    if tc_alias_is_generic(decl) { return tc_generic_alias_target(decl) }
+    let t = tc_impl_alias_resolved(im, decl)
+    if t >= 0 && tc_impl_alias_target_is_bare(t) { t } else { -1 }
+}
+
+// The base type a generic alias means in an impl header, or -1. The header's arguments fill
+// the alias's parameters, so only a target that takes those parameters as its own arguments,
+// each once and in order, reads the header's arguments as its own; a reordering or dropping
+// alias (`Sw[A, B] = Pr[B, A]`, `Fx[T] = Bx[Int]`) is left to the alias. The header's own
+// arguments are not read here: E0908 refuses a header whose arguments are not the impl's
+// binders in order. That order is also what tc_impl_binds_for_instance relies on: it binds
+// the header's argument i to the instance's slot i.
+fn tc_generic_alias_target(decl: Int) -> Int {
+    let tps = node_type_params(decl)
+    let u = tc_alias_underlying.get(tc_nominal_type_name(decl)) ?? -1
+    if u < 0 || !tc_type_has_receiver(u) { return -1 }
+    if tc_tid_child_count(u) != sublist_length(tps) { return -1 }
+    let mut i = 0
+    while i < sublist_length(tps) {
+        let tp = sublist_get(tps, i)
+        if tc_tid_typevar_key(tc_tid_child(u, i)) != tc_binder_key(tp, node_name(tp)) { return -1 }
+        i = i + 1
+    }
+    let k = type_kind(u)
+    if k != TyKind.Struct && k != TyKind.Enum { return u }
+    let target_decl = tc_tid_decl_node(u)
+    if target_decl < 0 { -1 } else { tc_decl_tid(target_decl) }
+}
+
+// The alias declaration an impl header names, read in the impl's own module, or -1. A binder
+// shadows a type of the same name in its header, and a compiler-known name is never an alias.
+fn tc_impl_header_alias_decl(im: Int) -> Int {
+    let name = node_name(im)
+    if name == "" || impl_binder_declared(node_impl_binders(im), name) != 0 { return -1 }
+    let saved = tc_enter_body_module(im)
+    let decl = if tc_compiler_known_type_meant(name, -1) != "" { -1 } else { tc_alias_decl_of_written(name) }
+    tc_leave_body_module(saved)
+    decl
+}
+
+fn tc_alias_is_generic(decl: Int) -> Bool {
+    node_type_params(decl) != -1 && sublist_length(node_type_params(decl)) > 0
 }
 
 // Whether the impl header names an alias of a type with type arguments, as `type L = List[Int]`.
 fn tc_impl_names_alias_of_instance(im: Int) -> Bool {
-    let t = tc_impl_alias_resolved(im)
+    let t = tc_impl_alias_resolved(im, tc_impl_header_alias_decl(im))
     t >= 0 && tc_type_has_receiver(t) && !tc_impl_alias_target_is_bare(t)
 }
 
@@ -1202,14 +1244,11 @@ fn tc_type_has_receiver(t: Int) -> Bool {
     k != TyKind.Tuple && k != TyKind.Fn && k != TyKind.Typevar && k != TyKind.Unknown
 }
 
-fn tc_impl_alias_resolved(im: Int) -> Int {
-    let name = node_name(im)
-    // A binder shadows a type of the same name in its header.
-    if name == "" || impl_binder_declared(node_impl_binders(im), name) != 0 { return -1 }
+// The type a non-generic alias `decl`, named by the header of `im`, resolves to, or -1.
+fn tc_impl_alias_resolved(im: Int, decl: Int) -> Int {
+    if decl == -1 || tc_alias_is_generic(decl) { return -1 }
     let saved = tc_enter_body_module(im)
-    let decl = if tc_compiler_known_type_meant(name, -1) != "" { -1 } else { tc_alias_decl_of_written(name) }
-    let generic = decl != -1 && node_type_params(decl) != -1 && sublist_length(node_type_params(decl)) > 0
-    let t = if decl == -1 || generic { -1 } else { resolve_alias_tid(lookup_named_type(name)) }
+    let t = resolve_alias_tid(lookup_named_type(node_name(im)))
     tc_leave_body_module(saved)
     t
 }

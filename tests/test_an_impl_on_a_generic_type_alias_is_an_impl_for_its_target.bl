@@ -1,0 +1,218 @@
+// An alias has the identity of the type it names and no impls of its own
+// (sections/07_trust_modules_metadata.md, sections/03_types.md §3.4). So `impl ... for A[T]`
+// where `type A[T] = Bx[T]` is the impl for `Bx[T]`: a method call, a bound, a `with` item and
+// a direct `BlockHandler.exit` on a `Bx` value all find it. Each program is built both ways,
+// because a per-module build and a whole-program build each lower the impl from its receiver.
+
+import compile_test_helpers
+
+// The corpus exports BLINK_COMPILER_ARCHIVE, which, like the module filters, makes a build
+// one unit, so the build drops them and a per-module build really writes its units.
+fn build_and_run(src: Str, stem: Str, flag: Str) -> Str ! FS.Read, FS.Write, Process.Spawn, Env.Read {
+    let dir = "{compile_test_helpers.scratch_root()}/{stem}_{getpid()}"
+    compile_test_helpers.sh("rm -rf {dir} && mkdir -p {dir}")
+    let path = "{dir}/{stem}.bl"
+    let bin = "{dir}/{stem}_bin"
+    fs.write(path, src).unwrap()
+    let b = process.run("sh", ["-c", "env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE BLINK_CACHE_DIR={dir}/objcache build/blink build {flag} {path} -o {bin}"]).unwrap()
+    assert(b.success(), "build failed: {b.out}{b.err_out}")
+    let r = process.run(bin, []).unwrap()
+    compile_test_helpers.sh("rm -rf {dir}")
+    assert(r.success(), r.err_out)
+    r.out
+}
+
+// A package with `files` under src/, built from src/main.bl.
+fn build_and_run_package(files: List[(Str, Str)], stem: Str, flag: Str) -> Str ! FS.Read, FS.Write, Process.Spawn, Env.Read {
+    let dir = "{compile_test_helpers.scratch_root()}/{stem}_{getpid()}"
+    compile_test_helpers.sh("rm -rf {dir} && mkdir -p {dir}/src")
+    fs.write("{dir}/blink.toml", "[package]\nname = \"{stem}\"\nversion = \"0.1.0\"\n").unwrap()
+    for f in files { fs.write("{dir}/src/{f.0}", f.1).unwrap() }
+    let bin = "{dir}/{stem}_bin"
+    let b = process.run("sh", ["-c", "env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE BLINK_CACHE_DIR={dir}/objcache build/blink build {flag} {dir}/src/main.bl -o {bin}"]).unwrap()
+    assert(b.success(), "build failed: {b.out}{b.err_out}")
+    let r = process.run(bin, []).unwrap()
+    compile_test_helpers.sh("rm -rf {dir}")
+    assert(r.success(), r.err_out)
+    r.out
+}
+
+fn both_modes(src: Str, stem: Str, want: Str) ! FS.Read, FS.Write, Process.Spawn, Env.Read {
+    assert_eq(build_and_run(src, "{stem}_pm", "--per-module"), want)
+    assert_eq(build_and_run(src, "{stem}_wp", "--no-per-module"), want)
+}
+
+fn both_modes_package(files: List[(Str, Str)], stem: Str, want: Str) ! FS.Read, FS.Write, Process.Spawn, Env.Read {
+    assert_eq(build_and_run_package(files, "{stem}_pm", "--per-module"), want)
+    assert_eq(build_and_run_package(files, "{stem}_wp", "--no-per-module"), want)
+}
+
+test "a Closeable impl on a generic alias closes a with item of the target type" {
+    both_modes(#"
+type Bx[T] { v: T }
+type A[T] = Bx[T]
+impl[T: Display] Closeable for A[T] {
+    fn close(self) ! IO.Print { io.println("close {self.v}") }
+}
+fn main() ! IO.Print {
+    with Bx { v: 1 } as b { io.println("in {b.v}") }
+    with Bx { v: "s" } as b { io.println("in {b.v}") }
+}
+"#, "generic_alias_closeable", "in 1\nclose 1\nin s\nclose s\n")
+}
+
+test "BlockHandler.exit runs a Closeable impl written on a generic alias" {
+    both_modes(#"
+type Bx[T] { v: T }
+type A[T] = Bx[T]
+impl[T: Display] Closeable for A[T] {
+    fn close(self) ! IO.Print { io.println("close {self.v}") }
+}
+fn main() ! IO.Print {
+    BlockHandler.exit(Bx { v: "s" }, true)
+}
+"#, "generic_alias_block_exit", "close s\n")
+}
+
+test "a method from an impl on a generic alias reaches a value of the target type" {
+    both_modes(#"
+type Bx[T] { v: T }
+type A[T] = Bx[T]
+trait Sh { fn sh(self) -> Str }
+impl[T: Display] Sh for A[T] {
+    fn sh(self) -> Str { "sh {self.v}" }
+}
+fn via[X: Sh](x: X) -> Str { x.sh() }
+fn main() ! IO.Print {
+    io.println(Bx { v: 1 }.sh())
+    let a: A[Str] = Bx { v: "a" }
+    io.println(a.sh())
+    io.println(via(Bx { v: true }))
+    io.println(Sh.sh(Bx { v: 2 }))
+}
+"#, "generic_alias_method", "sh 1\nsh a\nsh true\nsh 2\n")
+}
+
+test "an impl on a chain of generic aliases is the impl for the last target" {
+    both_modes(#"
+type Bx[T] { v: T }
+type A[T] = Bx[T]
+type C[T] = A[T]
+trait Sh { fn sh(self) -> Str }
+impl[T: Display] Sh for C[T] {
+    fn sh(self) -> Str { "sh {self.v}" }
+}
+fn main() ! IO.Print {
+    io.println(Bx { v: 1 }.sh())
+}
+"#, "generic_alias_chain", "sh 1\n")
+}
+
+test "an impl on a generic alias of a generic enum is the enum's impl" {
+    both_modes(#"
+type Mb[T] {
+    Has(T)
+    Empty
+}
+type M[T] = Mb[T]
+trait Sh { fn sh(self) -> Str }
+impl[T: Display] Sh for M[T] {
+    fn sh(self) -> Str {
+        match self {
+            Mb.Has(v) => "has {v}"
+            Mb.Empty => "empty"
+        }
+    }
+}
+fn main() ! IO.Print {
+    io.println(Mb.Has(3).sh())
+    let e: Mb[Int] = Mb.Empty
+    io.println(e.sh())
+}
+"#, "generic_alias_enum", "has 3\nempty\n")
+}
+
+test "an impl on a generic alias of List is the impl for List" {
+    both_modes(#"
+type L[T] = List[T]
+trait Sh { fn sh(self) -> Str }
+impl[T] Sh for L[T] {
+    fn sh(self) -> Str { "len {self.len()}" }
+}
+fn main() ! IO.Print {
+    io.println([1, 2].sh())
+    let xs: List[Str] = ["a"]
+    io.println(xs.sh())
+}
+"#, "generic_alias_list", "len 2\nlen 1\n")
+}
+
+test "an impl on a generic alias of Map or Set is the impl for Map or Set" {
+    both_modes(#"
+trait Sz { fn sz(self) -> Int }
+type Mp[K, V] = Map[K, V]
+impl[K, V] Sz for Mp[K, V] { fn sz(self) -> Int { self.len() } }
+type St[T] = Set[T]
+impl[T] Sz for St[T] { fn sz(self) -> Int { self.len() } }
+fn via[T: Sz](x: T) -> Int { x.sz() }
+fn main() ! IO.Print {
+    let mut m: Map[Str, Int] = Map()
+    m.insert("a", 1)
+    let mut s: Set[Int] = Set()
+    s.insert(1)
+    s.insert(2)
+    io.println("m {m.sz()} s {s.sz()} v {via(m)}")
+}
+"#, "generic_alias_map_set", "m 1 s 2 v 1\n")
+}
+
+test "an impl on a generic alias in another module answers a whole or a selective import" {
+    let e = #"
+pub type Bx[T] { v: T }
+pub type A[T] = Bx[T]
+pub trait Sh { fn sh(self) -> Str }
+impl[T: Display] Sh for A[T] {
+    fn sh(self) -> Str { "sh {self.v}" }
+}
+impl[T: Display] Closeable for A[T] {
+    fn close(self) ! IO.Print { io.println("close {self.v}") }
+}
+"#
+    both_modes_package([("e.bl", e), ("main.bl", #"
+import e
+fn main() ! IO.Print {
+    io.println(e.Bx { v: 1 }.sh())
+    with e.Bx { v: 2 } as b { io.println("in {b.v}") }
+}
+"#)], "generic_alias_xmod_whole", "sh 1\nin 2\nclose 2\n")
+    both_modes_package([("e.bl", e), ("main.bl", #"
+import e.{Bx, Sh}
+fn main() ! IO.Print {
+    io.println(Bx { v: 1 }.sh())
+    with Bx { v: 2 } as b { io.println("in {b.v}") }
+}
+"#)], "generic_alias_xmod_selective", "sh 1\nin 2\nclose 2\n")
+}
+
+// Guard: the same programs with the impl written on the target itself.
+test "an impl on the generic type itself still answers a method, a bound and a with item" {
+    both_modes(#"
+type Bx[T] { v: T }
+type A[T] = Bx[T]
+trait Sh { fn sh(self) -> Str }
+impl[T: Display] Sh for Bx[T] {
+    fn sh(self) -> Str { "sh {self.v}" }
+}
+impl[T: Display] Closeable for Bx[T] {
+    fn close(self) ! IO.Print { io.println("close {self.v}") }
+}
+fn via[X: Sh](x: X) -> Str { x.sh() }
+fn main() ! IO.Print {
+    io.println(Bx { v: 1 }.sh())
+    let a: A[Int] = Bx { v: 2 }
+    io.println(a.sh())
+    io.println(via(Bx { v: 3 }))
+    with Bx { v: 4 } as b { io.println("in {b.v}") }
+}
+"#, "generic_alias_plain_guard", "sh 1\nsh 2\nsh 3\nin 4\nclose 4\n")
+}

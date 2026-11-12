@@ -1,0 +1,75 @@
+// An impl on a generic alias is the impl for the alias's target (sections/07_trust_modules_metadata.md,
+// sections/03_types.md §3.4 *Identity, not spelling, selects behavior*): method lookup, the
+// overlap check and a bound check all see the target type. The bound row and the reorder row
+// are guards: they already held before an impl on a generic alias was keyed under its target.
+
+import compile_test_helpers.{compile_and_capture, expect_compile_error}
+
+fn clean(src: Str, tag: Str) ! FS.Delete, FS.Write, Process.Spawn, FS.Read, Env.Read {
+    let r = compile_and_capture(src, tag)
+    assert(!r.contains("\"severity\":\"error\""), r)
+    assert(!r.contains("\"severity\":\"ice\""), r)
+}
+
+// The overlap is reported against the target, whichever impl comes second.
+fn overlaps_on_target(src: Str, tag: Str) ! FS.Delete, FS.Write, Process.Spawn, FS.Read, Env.Read {
+    let r = compile_and_capture(src, tag)
+    assert(r.contains("impl of `Sh` for `Bx` overlaps"), r)
+}
+
+test "a method from an impl on a generic alias resolves on the target type" {
+    clean(#"
+type Bx[T] { v: T }
+type A[T] = Bx[T]
+trait Sh { fn sh(self) -> Str }
+impl[T: Display] Sh for A[T] {
+    fn sh(self) -> Str { "sh {self.v}" }
+}
+fn main() ! IO.Print { io.println(Bx { v: 1 }.sh()) }
+"#, "_tc_generic_alias_method")
+}
+
+test "an impl on a generic alias and one on its target overlap as impls for the target, in either order" {
+    overlaps_on_target(#"
+type Bx[T] { v: T }
+type A[T] = Bx[T]
+trait Sh { fn sh(self) -> Str }
+impl[T: Display] Sh for A[T] { fn sh(self) -> Str { "a" } }
+impl[T: Display] Sh for Bx[T] { fn sh(self) -> Str { "b" } }
+fn main() ! IO.Print { io.println(Bx { v: 1 }.sh()) }
+"#, "_tc_generic_alias_overlap_alias_first")
+    overlaps_on_target(#"
+type Bx[T] { v: T }
+type A[T] = Bx[T]
+trait Sh { fn sh(self) -> Str }
+impl[T: Display] Sh for Bx[T] { fn sh(self) -> Str { "b" } }
+impl[T: Display] Sh for A[T] { fn sh(self) -> Str { "a" } }
+fn main() ! IO.Print { io.println(Bx { v: 1 }.sh()) }
+"#, "_tc_generic_alias_overlap_target_first")
+}
+
+test "a bound on an impl written on a generic alias is checked at the target type" {
+    expect_compile_error(#"
+type Bx[T] { v: T }
+type A[T] = Bx[T]
+type N { x: Int }
+trait Sh { fn sh(self) -> Str }
+impl[T: Display] Sh for A[T] {
+    fn sh(self) -> Str { "sh {self.v}" }
+}
+fn via[X: Sh](x: X) -> Str { x.sh() }
+fn main() ! IO.Print { io.println(via(Bx { v: N { x: 1 } })) }
+"#, "_tc_generic_alias_bound", "MissingDisplayImpl")
+}
+
+test "an impl on a generic alias that reorders its arguments is refused as on the reordered target" {
+    expect_compile_error(#"
+type Pr[A, B] { a: A, b: B }
+type Sw[A, B] = Pr[B, A]
+trait Sh { fn sh(self) -> Str }
+impl[X: Display, Y: Display] Sh for Sw[X, Y] {
+    fn sh(self) -> Str { "sh {self.a}" }
+}
+fn main() ! IO.Print { io.println(Pr { a: 1, b: "s" }.sh()) }
+"#, "_tc_generic_alias_reordered", "E0908")
+}
