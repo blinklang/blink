@@ -1937,6 +1937,27 @@ let mut tc_current_self_tid: Int = -1
 // The receiver tid of every impl block that has a `for` clause, keyed by impl node. Written
 // once, while validate_trait_impls checks the header; read through tc_impl_recv_tid.
 let mut tc_impl_recv_tids: Map[Int, Int] = Map()
+
+// A projection `S.Item`: an associated type of the type parameter `S`, which a call through
+// `S`'s bound gives when the trait declares `-> Self.Item`. It is a typevar spelled `S.Item`
+// with a binder of its own, so it is distinct from S and from any other parameter's
+// projection. Nothing bounds it, so a reader of the frames by name answers for it as for a
+// frame with no bounds, and the body may only pass it on (6.3.3, 6.7.5). A written `S.Item`
+// is still an unknown type: annotation lookup does not see projections. It is rigid while
+// S's binder is active.
+// Projection binders count down from PROJECTION_BINDER_BASE, below every node, every named
+// binder and every self-call twin (tc_twin_binder); the projection at binder b is at index
+// PROJECTION_BINDER_BASE - b of tc_trait_args.projections. `args` are the bound's trait
+// arguments, which pick the impl when one type has the trait at two instances.
+type TcProjection {
+    name: Str
+    owner: Str
+    owner_binder: Int
+    trait_key: Str
+    args: List[Int]
+    assoc: Str
+}
+let PROJECTION_BINDER_BASE: Int = -1000000000000000
 // One trait at its arguments, as a bound gives it to a type parameter.
 type BoundInst {
     tr: Str
@@ -1950,11 +1971,21 @@ type BoundInst {
 // under the binders of the declaration that writes the bound. An operator's impl bounds are
 // judged where the resolver is not at hand, so an impl's bounds are read with its header, and a
 // body's own bounds when the body is checked. Written through tc_bound_insts_of.
+// impl_assoc: each associated type an impl binds, by name, keyed by impl node, resolved with
+// the impl's binders in scope. Written with the impl's receiver tid; mono reads it to put an
+// instance's type in for a projection.
+// projections: each projection a call through a bound has minted, in binder order.
 type TraitArgMemos {
     impl_args: Map[Int, List[Int]]
     bound_insts: Map[Int, List[BoundInst]]
+    impl_assoc: Map[Int, Map[Str, Int]]
+    projections: List[TcProjection]
 }
-let mut tc_trait_args: TraitArgMemos = TraitArgMemos { impl_args: Map(), bound_insts: Map() }
+let mut tc_trait_args: TraitArgMemos = new_trait_arg_memos()
+
+fn new_trait_arg_memos() -> TraitArgMemos {
+    TraitArgMemos { impl_args: Map(), bound_insts: Map(), impl_assoc: Map(), projections: [] }
+}
 // The impls over a user generic type that are checked and emitted per instance: impl node to
 // the receiver type's declaration. Written beside the receiver tid; read through
 // tc_poly_user_impl_decl.
@@ -4839,7 +4870,7 @@ fn tc_report_held_misses_bound(tid: Int, carrier: Int, bnode: Int, shown: Str, d
     }
     let callee = if by_impl { tc_bound_writer_suffix(decl) } else if decl >= 0 { " of {node_name(decl)}" } else { "" }
     let t = type_to_str(tid)
-    let help = if help_add { "write ` + {shown}` on the bound list of `{t}`" } else { "write the bound on the binder: `[{t}: {shown}]`" }
+    let help = tc_add_bound_help(tid, t, shown, help_add, "pass it to a function that needs {shown}")
     let mut notes: List[Str] = []
     if decl >= 0 { notes.push("{tc_bound_writer(decl)} declares `{p}: {tc_bound_written(bnode)}` at {diag_file_for_node(carrier)}:{node_line(bnode)}") }
     diag_error_at_notes("TraitBoundNotSatisfied", TRAIT_BOUND_NOT_SATISFIED,
@@ -5316,6 +5347,12 @@ fn tc_typevar_binds_here(tid0: Int) -> Int {
 // by a method's own `T` is still substituted once per instance of the method body.
 fn tc_binder_is_active(binder: Int) -> Int {
     if binder == NO_BINDER_NODE { return 0 }
+    if binder <= PROJECTION_BINDER_BASE {
+        return match tc_projection_at(binder) {
+            Some(p) => tc_binder_is_active(p.owner_binder)
+            None => 0
+        }
+    }
     for f in tc_tp_frames {
         if f.binder == binder { return 1 }
     }
@@ -5405,6 +5442,10 @@ fn tc_typevar_is_rigid(tid: Int) -> Int {
 // readable on it in its own body (§3 Parametricity), whatever it is instantiated at.
 fn tc_reject_type_parameter_field(tid: Int, fname: Str, node: Int) -> Int ! Diag.Report {
     let tp = type_to_str(tid)
+    if tc_is_projection(tid) {
+        diag_error_at("NoSuchField", NO_SUCH_FIELD, tc_projection_refusal(tid, "it has no field `{fname}`"), node, tc_projection_use_help(tp, "read `.{fname}`"))
+        return tc_error_recovery_tid()
+    }
     diag_error_at("NoSuchField", NO_SUCH_FIELD, "type parameter {tp} has no field `{fname}`", node, "a type parameter has no fields; bound {tp} by a trait with a method that returns the value, and call it")
     tc_error_recovery_tid()
 }
@@ -9457,7 +9498,7 @@ fn tc_report_missing_display(arg: Int, t: Int, leaf: Int, sink: Str, notes: List
     if lk == TyKind.Typevar {
         let held = tc_pipe_joined(tc_typevar_held_traits(leaf))
         // `Self` has no binder to write on; its bounds are the trait's supertraits.
-        let mut help = if held != "" { "write ` + Display` on the bound list of `{ls}`" } else { "write the bound on the binder: `[{ls}: Display]`" }
+        let mut help = tc_add_bound_help(leaf, ls, "Display", held != "", "render it")
         if ls == "Self" && tc_current_self_trait != "" { help = "make `Display` a supertrait: `trait {tc_current_self_trait}: Display`" }
         diag_error_label_at_notes("MissingDisplayImpl", MISSING_DISPLAY_IMPL, msg, arg, label, help, notes)
         return
@@ -9505,7 +9546,7 @@ fn tc_report_display_impl_miss(arg: Int, msg: Str, label: Str, m: TcDisplayImplM
     notes.push(tc_impl_bound_note(m.im, failed.carrier, shown))
     if a >= 0 && tc_typevar_binds_here(a) != 0 {
         let held = tc_pipe_joined(tc_typevar_held_traits(a))
-        let help = if held != "" { "write ` + {text}` on the bound list of `{at}`" } else { "write the bound on the binder: `[{at}: {text}]`" }
+        let help = tc_add_bound_help(a, at, text, held != "", "render it")
         notes.push("`{at}` has no {text} bound")
         diag_error_label_at_notes("MissingDisplayImpl", MISSING_DISPLAY_IMPL, msg, arg, label, help, notes)
         return
@@ -13069,6 +13110,7 @@ fn tc_tparam_bound_traits(name: Str) -> Str {
         if f.name == name { return f.traits }
         i = i - 1
     }
+    if tc_active_projection_named(name) { return "|" }
     ""
 }
 
@@ -13087,6 +13129,7 @@ fn tc_tparam_in_scope(name: Str) -> Int {
     for f in tc_tp_frames {
         if f.name == name { return 1 }
     }
+    if tc_active_projection_named(name) { return 1 }
     0
 }
 
@@ -13097,6 +13140,7 @@ fn tc_tparam_bound_methods(name: Str) -> Str {
         if f.name == name { return f.methods }
         i = i - 1
     }
+    if tc_active_projection_named(name) { return "|" }
     ""
 }
 
@@ -13355,6 +13399,10 @@ fn reject_unlicensed_comparison(op: Str, tid: Int, node: Int) ! TypeCheck.Report
             "`{op}` on `Self` is not licensed by `{tc_current_self_trait}` (`{op}` desugars to {bm}, but `{tc_current_self_trait}` does not require {tc_core_trait_shown(bt)})", node,
             "{lead}declare the supertrait so every implementor provides `{op}`: trait {tc_current_self_trait}: {tc_core_name_in(bt, nr_current_module)} \{ ... \}",
             tc_shadowed_trait_notes(bt))
+        return
+    }
+    if tc_is_projection(tid) {
+        diag_error_at("TypeError", TYPE_ERROR, tc_projection_refusal(tid, "comparison `{op}` is not defined on it"), node, tc_projection_use_help(name, "use `{op}`"))
         return
     }
     if tc_report_shadowed_operator_bound(op, name, bt, bt, traits, node) { return }
@@ -13980,6 +14028,25 @@ fn tc_settle_alias_decl(atd: Int) ! TypeCheck.Resolve, Diag.Report {
     nr_current_module = saved_module
 }
 
+// Each associated type impl `im` binds, by name. The caller has the impl's binders in scope
+// and annotation checks suppressed.
+fn tc_impl_assoc_tids(im: Int) -> Map[Str, Int] ! TypeCheck.Resolve, Diag.Report {
+    let assoc_sl = node_assoc_types(im)
+    let mut assoc: Map[Str, Int] = Map()
+    let mut ai = 0
+    while assoc_sl != -1 && ai < sublist_length(assoc_sl) {
+        let at_node = sublist_get(assoc_sl, ai)
+        assoc.insert(node_name(at_node), resolve_type_ann(node_type_ann(at_node)))
+        ai = ai + 1
+    }
+    assoc
+}
+
+// Mono reads these to put an instance's type in for a projection (tc_projection_binds).
+fn tc_record_impl_assoc_types(im: Int) ! TypeCheck.Resolve, Diag.Report {
+    tc_trait_args.impl_assoc.insert(im, tc_impl_assoc_tids(im))
+}
+
 // The one write of an impl block's receiver tid — i.e. what `self` is — made while the header
 // is checked.
 //
@@ -14028,6 +14095,7 @@ fn tc_record_impl_recv_tid(im: Int) ! TypeCheck.Resolve, Diag.Report {
     let saved_suppress = tc_suppress_ann_validation
     tc_suppress_ann_validation = 1
     let t = tc_impl_recv_structural(resolve_type_parts(resolved, node_recv_type_args(im), -1), node_recv_type_args(im))
+    tc_record_impl_assoc_types(im)
     tc_suppress_ann_validation = saved_suppress
     tc_read_impl_bound_insts(im)
     tc_pop_tparam_scope(binders_sl)
@@ -18473,17 +18541,11 @@ fn subst_trait_type_tid(type_tid: Int, impl_recv_tid: Int, tmsig_idx: Int, impl_
             k = k + 1
         }
     }
-    let assoc_sl = node_assoc_types(impl_node)
-    if assoc_sl != -1 {
-        let mut ai = 0
-        while ai < sublist_length(assoc_sl) {
-            let at_node = sublist_get(assoc_sl, ai)
-            let at_name = "Self.{node_name(at_node)}"
-            let at_tid = resolve_type_ann(node_type_ann(at_node))
-            binds.insert(at_name, at_tid)
-            binds.insert(tc_binder_key(NO_BINDER_NODE, at_name), at_tid)
-            ai = ai + 1
-        }
+    let assoc = tc_impl_assoc_tids(impl_node)
+    for name in assoc.keys() {
+        let at_tid = assoc.get(name).unwrap()
+        binds.insert("Self.{name}", at_tid)
+        binds.insert(tc_binder_key(NO_BINDER_NODE, "Self.{name}"), at_tid)
     }
     substitute_typevar_tid(type_tid, binds)
 }
@@ -18498,6 +18560,7 @@ fn tc_bound_call_binds(recv_tid: Int, tmsig_idx: Int, arg_tids: List[Int]) -> Ma
     binds.insert("Self", recv_tid)
     binds.insert(tc_binder_key(SELF_BINDER_NODE, "Self"), recv_tid)
     let tm = tc_tmsig_pool.get(tmsig_idx).unwrap()
+    tc_bind_projections(recv_tid, tm.trait_name, arg_tids, binds)
     if tm.tparams_count == 0 { return binds }
     let mut k = 0
     while k < tm.tparams_count && k < arg_tids.len() {
@@ -18509,6 +18572,153 @@ fn tc_bound_call_binds(recv_tid: Int, tmsig_idx: Int, arg_tids: List[Int]) -> Ma
         k = k + 1
     }
     binds
+}
+
+// Bind each `Self.A` of `trait_key` to the projection `S.A` of the receiver type parameter `S`,
+// so a call through S's bound types as S's own associated type. `args` are the bound's trait
+// arguments. A receiver that is not a declared type parameter (`Self` in a trait default
+// body) binds nothing.
+fn tc_bind_projections(recv_tid: Int, trait_key: Str, args: List[Int], binds: Map[Str, Int]) {
+    let recv = tc_resolve(recv_tid)
+    if recv < 0 || recv >= ty_pool.len() { return }
+    let e = ty_pool.get(recv).unwrap()
+    if e.kind != TyKind.Typevar || e.inner1 < 0 { return }
+    for assoc in tc_trait_assoc_of(trait_key) {
+        let name = tc_projection_name(recv, trait_key, assoc)
+        let proj = make_typevar_bound(name, tc_projection_binder(name, e.name, e.inner1, trait_key, args, assoc))
+        binds.insert("Self.{assoc}", proj)
+        binds.insert(tc_binder_key(NO_BINDER_NODE, "Self.{assoc}"), proj)
+    }
+}
+
+// The associated types `trait_key` declares, by name.
+fn tc_trait_assoc_of(trait_key: Str) -> List[Str] {
+    let prefix = "{trait_key}."
+    let mut out: List[Str] = []
+    for full in tc_trait_assoc_names {
+        if full.starts_with(prefix) { out.push(full.byte_slice(prefix.byte_len(), full.byte_len())) }
+    }
+    out
+}
+
+// `S.Item`, or `S.Item (of Shape)` when another trait that bounds S, or a supertrait of one,
+// declares an `Item` too, so a message can tell the two apart.
+fn tc_projection_name(owner: Int, trait_key: Str, assoc: Str) -> Str {
+    let base = "{ty_pool.get(owner).unwrap().name}.{assoc}"
+    let mut todo: List[Str] = []
+    for tr in tc_typevar_held_traits(owner).split("|") {
+        if tr != "" { todo.push(tr) }
+    }
+    let mut seen = "|"
+    while todo.len() > 0 {
+        let tr = todo.pop().unwrap()
+        if tc_pipe_has(seen, tr) != 0 { continue }
+        seen = tc_pipe_add(seen, tr)
+        if tr != trait_key && tc_trait_assoc_of(tr).contains(assoc) { return "{base} (of {tc_trait_shown(trait_key)})" }
+        for sup in tc_trait_direct_supers(tr).split("|") {
+            if sup != "" { todo.push(sup) }
+        }
+    }
+    base
+}
+
+fn tc_projection_binder(name: Str, owner: Str, owner_binder: Int, trait_key: Str, args: List[Int], assoc: Str) -> Int {
+    let projs = tc_trait_args.projections
+    let mut i = 0
+    while i < projs.len() {
+        let p = projs.get(i).unwrap()
+        if p.owner_binder == owner_binder && p.trait_key == trait_key && p.assoc == assoc && tc_tid_lists_same(p.args, args) { return PROJECTION_BINDER_BASE - i }
+        i = i + 1
+    }
+    tc_trait_args.projections.push(TcProjection { name: name, owner: owner, owner_binder: owner_binder, trait_key: trait_key, args: args, assoc: assoc })
+    PROJECTION_BINDER_BASE - i
+}
+
+// The projection a projection binder stands for.
+fn tc_projection_at(binder: Int) -> Option[TcProjection] {
+    if binder > PROJECTION_BINDER_BASE { return None }
+    tc_trait_args.projections.get(PROJECTION_BINDER_BASE - binder)
+}
+
+fn tc_projection_of(tid: Int) -> Option[TcProjection] {
+    tc_projection_at(tc_tid_binder(tid))
+}
+
+// Whether `tid` is a projection `S.A` of a type parameter.
+fn tc_is_projection(tid: Int) -> Bool {
+    tc_projection_of(tid).is_some()
+}
+
+// Whether `name` spells a projection of a type parameter whose binder is active. A projection
+// is minted mid-body, at a call, so it has no frame on the stack; the readers of the frames by
+// name answer for it as for a frame with no bounds. A match by name is safe, as each projection
+// gives the same answer.
+fn tc_active_projection_named(name: Str) -> Bool {
+    for p in tc_trait_args.projections {
+        if p.name == name && tc_binder_is_active(p.owner_binder) != 0 { return true }
+    }
+    false
+}
+
+// The text of an error for a use of a projection that needs a bound: `what` is the use.
+fn tc_projection_refusal(tid: Int, what: Str) -> Str {
+    let owner = match tc_projection_of(tid) {
+        Some(p) => p.owner
+        None => ""
+    }
+    "`{type_to_str(tid)}` is an associated type of type parameter `{owner}`, and nothing bounds it, so {what}"
+}
+
+// Blink has no syntax to bound an associated type, so the help cannot offer a bound.
+fn tc_projection_use_help(name: Str, what: Str) -> Str {
+    "a generic body may only pass a value of `{name}` on; {what} where code knows its type, such as in the impl"
+}
+
+// The help for a type parameter `t` that lacks the bound `shown`: add it to the bound list
+// when `t` has bounds already, else write it on the binder. A projection cannot be bounded,
+// so it gets the use help with `what`.
+fn tc_add_bound_help(tid: Int, t: Str, shown: Str, has_bounds: Bool, what: Str) -> Str {
+    if tc_is_projection(tid) { return tc_projection_use_help(t, what) }
+    if has_bounds { return "write ` + {shown}` on the bound list of `{t}`" }
+    "write the bound on the binder: `[{t}: {shown}]`"
+}
+
+// `binds` with each projection whose type parameter it binds to a declared type put in at the
+// type that type's impl binds the associated type to: `S.Item` at `Int` where `S` is `Sq` and
+// `impl Shape for Sq` has `type Item = Int`. The bound's trait arguments, read under `binds`,
+// pick the impl. A projection whose impl this cannot pick stays unbound, and the instance
+// reports it.
+pub fn tc_projection_binds(binds: Map[Str, Int]) -> Map[Str, Int] {
+    let projs = tc_trait_args.projections
+    if projs.len() == 0 { return binds }
+    let mut out: Map[Str, Int] = Map()
+    for k in binds.keys() { out.insert(k, binds.get(k).unwrap()) }
+    let mut i = 0
+    while i < projs.len() {
+        let p = projs.get(i).unwrap()
+        let key = tc_binder_key(PROJECTION_BINDER_BASE - i, p.name)
+        i = i + 1
+        if out.contains_key(key) { continue }
+        let owner = match binds.get(tc_binder_key(p.owner_binder, p.owner)) {
+            Some(t) => t
+            None => continue
+        }
+        let mut want: List[Int] = []
+        for a in p.args { want.push(substitute_typevar_tid(a, binds)) }
+        let ims = tc_impls_of_trait_on(p.trait_key, owner, want)
+        if ims.len() != 1 { continue }
+        let im = ims.get(0).unwrap()
+        let at = match tc_trait_args.impl_assoc.get(im) {
+            Some(m) => m.get(p.assoc) ?? -1
+            None => -1
+        }
+        if at < 0 { continue }
+        match tc_impl_instance_binds(im, owner, want) {
+            Some(ibinds) => out.insert(key, substitute_typevar_tid(at, ibinds))
+            None => continue
+        }
+    }
+    out
 }
 
 // Each distinct argument list the bounds of the type parameter at `binder` name `trait_name`
@@ -19431,28 +19641,22 @@ fn validate_trait_impls_in_own_modules(program: Int) ! TypeCheck.Register, TypeC
             }
         }
         let impl_assoc_sl = node_assoc_types(im)
-        let mut ati = 0
-        while ati < tc_trait_assoc_names.len() {
-            let full_name = tc_trait_assoc_names.get(ati).unwrap()
-            if full_name.starts_with("{trait_name}.") {
-                let expected_assoc = full_name.byte_slice(trait_name.byte_len() + 1, full_name.byte_len())
-                let mut found_assoc = 0
-                if impl_assoc_sl != -1 {
-                    let mut aj = 0
-                    while aj < sublist_length(impl_assoc_sl) {
-                        let at_node = sublist_get(impl_assoc_sl, aj)
-                        if node_name(at_node) == expected_assoc {
-                            found_assoc = 1
-                            break
-                        }
-                        aj = aj + 1
+        for expected_assoc in tc_trait_assoc_of(trait_name) {
+            let mut found_assoc = 0
+            if impl_assoc_sl != -1 {
+                let mut aj = 0
+                while aj < sublist_length(impl_assoc_sl) {
+                    let at_node = sublist_get(impl_assoc_sl, aj)
+                    if node_name(at_node) == expected_assoc {
+                        found_assoc = 1
+                        break
                     }
-                }
-                if found_assoc == 0 {
-                    diag_error_at("TraitContract", TRAIT_CONTRACT_905, "impl {tc_trait_shown(trait_name)} for {impl_type} is missing associated type `{expected_assoc}`", im, "add `type {expected_assoc} = ...` to the impl block")
+                    aj = aj + 1
                 }
             }
-            ati = ati + 1
+            if found_assoc == 0 {
+                diag_error_at("TraitContract", TRAIT_CONTRACT_905, "impl {tc_trait_shown(trait_name)} for {impl_type} is missing associated type `{expected_assoc}`", im, "add `type {expected_assoc} = ...` to the impl block")
+            }
         }
         if is_poly != 0 && poly_supported == 0 {
             diag_error_at("PolyImplUnsupported", POLY_IMPL_UNSUPPORTED, "polymorphic impls are not yet compiled", im, "spec §3.6 defines `impl[T] {tc_trait_shown(trait_name)}[T] for Recv[T]`, but compiled support is still in progress; write a separate impl per concrete type for now")
@@ -19738,7 +19942,7 @@ fn init_types() ! TypeCheck.Register {
     tc_type_decl_ambiguous_names = Map()
     tc_namesake_type_modules = Map()
     tc_impl_recv_tids = Map()
-    tc_trait_args = TraitArgMemos { impl_args: Map(), bound_insts: Map() }
+    tc_trait_args = new_trait_arg_memos()
     tc_poly_user_impls = Map()
     tc_method_block = Map()
     tc_active_tparams.clear()
@@ -31631,6 +31835,10 @@ fn reject_non_numeric_arith_operand(op: Str, tid: Int, node: Int, is_unary: Int)
                     "{bt} is a sealed arithmetic trait — only built-in numeric types implement it, so no user type could satisfy it; make this a required method (drop the default body) so each implementor defines it, or use a concrete numeric type instead of `Self`")
                 return
             }
+            if tc_is_projection(tid) {
+                diag_error_at("TypeError", TYPE_ERROR, tc_projection_refusal(tid, "arithmetic `{op}` is not defined on it"), node, tc_projection_use_help(tpname, "use `{op}`"))
+                return
+            }
             if tc_report_shadowed_operator_bound(op, tpname, bt, bt, traits, node) { return }
             let sealed = "the arithmetic traits (Add/Sub/Mul/Div/Rem/Neg) are sealed to the built-in numeric types"
             let help = if tc_shadowing_trait_key(bt, nr_current_module) == "" {
@@ -32160,7 +32368,7 @@ fn tc_late_tparam_refused(node: Int, t: Int, tr: Str, method: Str, self_offset: 
         return tc_refuse_unlicensed_self_method(node, t, method) || tc_refuse_tparam_method(node, t, method)
     }
     if tc_tparam_bound_traits(type_to_str(t)) == "" { return false }
-    tc_report_tparam_not_bound_by(node, type_to_str(t), tc_core_trait_shown(tr), method)
+    tc_report_tparam_not_bound_by(node, t, tc_core_trait_shown(tr), method)
     true
 }
 
@@ -32188,6 +32396,11 @@ fn tc_refuse_tparam_method(node: Int, obj_t: Int, method: Str) -> Bool ! TypeChe
         diag_error_at("UnresolvedMethod", UNRESOLVED_METHOD, "type parameter `{tv_name}` is bounded by {tc_traits_shown(tc_pipe_joined(tv_traits))}, and none of them declares method `{method}`", node, "correct the method name, or add a bound whose trait declares `{method}`")
         return true
     }
+    if tc_is_projection(obj_t) {
+        tc_method_calls.hard.insert(node, 1)
+        diag_error_at("UnresolvedMethod", UNRESOLVED_METHOD, tc_projection_refusal(obj_t, "it has no method `{method}`"), node, tc_projection_use_help(tv_name, "call `.{method}()`"))
+        return true
+    }
     if tv_name == "Self" || tc_tparam_in_scope(tv_name) == 0 { return false }
     tc_method_calls.hard.insert(node, 1)
     let owners = tc_traits_declaring(method)
@@ -32198,8 +32411,13 @@ fn tc_refuse_tparam_method(node: Int, obj_t: Int, method: Str) -> Bool ! TypeChe
 
 // `Tr.method(x)` on a type parameter whose bound does not name `Tr`: the qualifier selects one
 // trait, and on a type parameter the bound is the whole licence.
-fn tc_report_tparam_not_bound_by(node: Int, tv_name: Str, tr_shown: Str, method: Str) ! Diag.Report {
+fn tc_report_tparam_not_bound_by(node: Int, t: Int, tr_shown: Str, method: Str) ! Diag.Report {
     tc_method_calls.hard.insert(node, 1)
+    let tv_name = type_to_str(t)
+    if tc_is_projection(t) {
+        diag_error_at("TraitBoundNotSatisfied", TRAIT_BOUND_NOT_SATISFIED, tc_projection_refusal(t, "it does not implement `{tr_shown}`"), node, tc_projection_use_help(tv_name, "call `{tr_shown}.{method}`"))
+        return
+    }
     diag_error_at("TraitBoundNotSatisfied", TRAIT_BOUND_NOT_SATISFIED, "type parameter `{tv_name}` is not bound by trait `{tr_shown}`, so `{tr_shown}.{method}` is not available on it", node, "add the bound: `{tv_name}: {tr_shown}`")
 }
 
@@ -32819,7 +33037,9 @@ fn tc_trait_need_fixes(leaf: Int, ask: TcAsk) -> List[Str] {
         // A parameter of this body that has bounds already gets the bound added to its list.
         // A trait at arguments is a program trait, which no local trait shadows.
         let at_args = ask.text != tc_trait_shown(tr)
-        if tc_typevar_binds_here(leaf) != 0 && tc_pipe_joined(tc_typevar_held_traits(leaf)) != "" {
+        if tc_is_projection(leaf) {
+            lines.push(tc_projection_use_help(type_to_str(leaf), "use it as {ask.text}"))
+        } else if tc_typevar_binds_here(leaf) != 0 && tc_pipe_joined(tc_typevar_held_traits(leaf)) != "" {
             let imp = if at_args { "" } else { tc_core_import_in(tr, nr_current_module) }
             if imp != "" { lines.push(imp) }
             let shown = if at_args { ask.text } else { tc_core_name_in(tr, nr_current_module) }
@@ -36731,7 +36951,7 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                             diag_error_at("UnresolvedMethod", UNRESOLVED_METHOD, "trait `{obj_name}` does not define method `{method}`", node, "")
                             return tc_error_recovery_tid()
                         }
-                        tc_report_tparam_not_bound_by(node, qt_tp, obj_name, method)
+                        tc_report_tparam_not_bound_by(node, qt_recv, obj_name, method)
                         return tc_error_recovery_tid()
                     }
                     if tc_pipe_has(qt_bounds, qt_trait) != 0 {
@@ -39656,6 +39876,14 @@ fn tc_pattern_covers_type_param(pat: Int) -> Bool {
 // no Context, a Context naming a type that does not resolve (a typevar on a generic handler) — falls
 // back to the resource tid, which is exactly what every caller got before.
 fn tc_with_binder_tid(res_tid: Int) -> Int ! TypeCheck.Resolve, Diag.Report {
+    // A type parameter bounded by BlockHandler binds its own Context: the projection `H.Context`.
+    // A Closeable resource binds itself.
+    let res = tc_resolve(res_tid)
+    if type_kind(res) == TyKind.Typevar && tc_binder_is_active(tc_tid_binder(res)) != 0 && tc_typevar_holds(res, "BlockHandler") && !tc_typevar_holds(res, "Closeable") {
+        let mut binds: Map[Str, Int] = Map()
+        tc_bind_projections(res, "BlockHandler", [], binds)
+        return binds.get("Self.Context") ?? res_tid
+    }
     let rname = tc_tid_struct(res_tid)
     if rname == "" { return res_tid }
     let ctx_node = nr_bh_context.get(rname) ?? -1

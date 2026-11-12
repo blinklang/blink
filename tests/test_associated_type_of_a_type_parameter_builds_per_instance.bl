@@ -1,0 +1,236 @@
+// A call through a bound whose trait declares `-> Self.Item` gives, in each instance of the
+// generic body, the type the instance's impl binds `Item` to. The body may bind the value,
+// pass it to a generic function, keep it in a list, and give it back to a trait method that
+// takes `Self.Item`. Each of these builds and runs, in the one-unit and the per-module build.
+
+import std.fs
+import std.process.{ProcessResult}
+import compile_test_helpers.{scratch_root}
+
+type Pt { x: Int }
+
+trait Shape {
+    type Item
+    fn first(self) -> Self.Item
+    fn show(self, it: Self.Item) -> Str
+}
+
+type Sq { s: Int }
+
+impl Shape for Sq {
+    type Item = Int
+    fn first(self) -> Int { self.s }
+    fn show(self, it: Int) -> Str { "sq{it}" }
+}
+
+type Dot { s: Int }
+
+impl Shape for Dot {
+    type Item = Pt
+    fn first(self) -> Pt { Pt { x: self.s } }
+    fn show(self, it: Pt) -> Str { "dot{it.x}" }
+}
+
+type Bx[T] { v: T }
+
+impl[T] Shape for Bx[T] {
+    type Item = T
+    fn first(self) -> T { self.v }
+    fn show(self, it: T) -> Str { "bx" }
+}
+
+fn keep[T](x: T) -> T { x }
+
+fn bound_only[S: Shape](s: S) -> Int {
+    let _it = s.first()
+    1
+}
+
+fn round_trip[S: Shape](s: S) -> Str { s.show(keep(s.first())) }
+
+fn in_list[S: Shape](s: S) -> Str {
+    let items = [s.first(), s.first()]
+    "{items.len()}{s.show(items.get(1).unwrap())}"
+}
+
+trait Deeper: Shape {
+    fn tag(self) -> Int
+}
+
+impl Deeper for Sq {
+    fn tag(self) -> Int { 9 }
+}
+
+fn through_super[S: Deeper](s: S) -> Str { "{s.tag()}{s.show(s.first())}" }
+
+trait Other {
+    type Item
+    fn get(self) -> Self.Item
+    fn put(self, it: Self.Item) -> Str
+}
+
+impl Other for Sq {
+    type Item = Str
+    fn get(self) -> Str { "o{self.s}" }
+    fn put(self, it: Str) -> Str { "{it}!" }
+}
+
+fn both[S: Shape + Other](s: S) -> Str { "{s.show(keep(s.first()))}/{s.put(keep(s.get()))}" }
+
+fn bare_let[S: Shape](s: S) -> Str {
+    let it = s.first()
+    s.show(it)
+}
+
+trait Conv[T] {
+    type Out
+    fn conv(self, t: T) -> Self.Out
+    fn back(self, o: Self.Out) -> Str
+}
+
+type X { a: Int }
+
+impl Conv[Int] for X {
+    type Out = Str
+    fn conv(self, t: Int) -> Str { "i{t}{self.a}" }
+    fn back(self, o: Str) -> Str { o }
+}
+
+impl Conv[Str] for X {
+    type Out = Int
+    fn conv(self, t: Str) -> Int { t.len() + self.a }
+    fn back(self, o: Int) -> Str { "n{o}" }
+}
+
+fn by_int[S: Conv[Int]](s: S) -> Str { s.back(keep(s.conv(1))) }
+
+fn by_str[S: Conv[Str]](s: S) -> Str { s.back(keep(s.conv("abc"))) }
+
+test "an associated type value bound in a generic body builds" {
+    assert_eq(bound_only(Sq { s: 2 }), 1)
+    assert_eq(bound_only(Dot { s: 2 }), 1)
+}
+
+test "an associated type value goes through a generic function and back to the trait" {
+    assert_eq(round_trip(Sq { s: 2 }), "sq2")
+    assert_eq(round_trip(Dot { s: 5 }), "dot5")
+    assert_eq(round_trip(Bx { v: "s" }), "bx")
+}
+
+test "a list of associated type values builds per instance" {
+    assert_eq(in_list(Sq { s: 3 }), "2sq3")
+    assert_eq(in_list(Dot { s: 4 }), "2dot4")
+}
+
+test "an associated type reached through a supertrait builds" {
+    assert_eq(through_super(Sq { s: 6 }), "9sq6")
+}
+
+test "two bounds that declare one associated type name keep each impl's type" {
+    assert_eq(both(Sq { s: 4 }), "sq4/o4!")
+}
+
+test "a bare let of an associated type value builds" {
+    assert_eq(bare_let(Sq { s: 7 }), "sq7")
+    assert_eq(bare_let(Dot { s: 8 }), "dot8")
+}
+
+test "the trait arguments of a bound pick the impl of an associated type" {
+    assert_eq(by_int(X { a: 2 }), "i12")
+    assert_eq(by_str(X { a: 2 }), "n5")
+}
+
+test "a concrete receiver reads the impl's associated type" {
+    let n: Int = Sq { s: 2 }.first()
+    let p = Dot { s: 3 }.first()
+    assert_eq(n + p.x, 5)
+}
+
+fn sh(cmd: Str) -> ProcessResult ! Process.Spawn {
+    process.run("sh", ["-c", cmd]).unwrap()
+}
+
+let prog_src = [
+    "type Pt \{ x: Int }",
+    "trait Shape \{",
+    "    type Item",
+    "    fn first(self) -> Self.Item",
+    "    fn show(self, it: Self.Item) -> Str",
+    "}",
+    "type Sq \{ s: Int }",
+    "impl Shape for Sq \{",
+    "    type Item = Int",
+    "    fn first(self) -> Int \{ self.s }",
+    "    fn show(self, it: Int) -> Str \{ \"sq\{it}\" }",
+    "}",
+    "type Dot \{ s: Int }",
+    "impl Shape for Dot \{",
+    "    type Item = Pt",
+    "    fn first(self) -> Pt \{ Pt \{ x: self.s } }",
+    "    fn show(self, it: Pt) -> Str \{ \"dot\{it.x}\" }",
+    "}",
+    "trait Other \{",
+    "    type Item",
+    "    fn get(self) -> Self.Item",
+    "    fn put(self, it: Self.Item) -> Str",
+    "}",
+    "impl Other for Sq \{",
+    "    type Item = Str",
+    "    fn get(self) -> Str \{ \"o\{self.s}\" }",
+    "    fn put(self, it: Str) -> Str \{ \"\{it}!\" }",
+    "}",
+    "type Conn \{ id: Int }",
+    "type Tx \{ tag: Str }",
+    "impl BlockHandler for Conn \{",
+    "    type Context = Tx",
+    "    fn enter(self) -> Tx \{ Tx \{ tag: \"t\{self.id}\" } }",
+    "    fn exit(self, _ok: Bool) ! IO.Print \{ io.println(\"exit\") }",
+    "}",
+    "type Mark \{ n: Int }",
+    "impl BlockHandler for Mark \{",
+    "    type Context = ()",
+    "    fn enter(self) -> () ! IO.Print \{ io.println(\"m-in\") }",
+    "    fn exit(self, _ok: Bool) ! IO.Print \{ io.println(\"m-exit\") }",
+    "}",
+    "fn keep[T](x: T) -> T \{ x }",
+    "fn bound_only[S: Shape](s: S) -> Int \{",
+    "    let _it = s.first()",
+    "    1",
+    "}",
+    "fn round_trip[S: Shape](s: S) -> Str \{ s.show(keep(s.first())) }",
+    "fn both[S: Shape + Other](s: S) -> Str \{ \"\{s.show(keep(s.first()))}/\{s.put(keep(s.get()))}\" }",
+    "fn enter_exit[H: BlockHandler](h: H) ! _ \{",
+    "    let _c = h.enter()",
+    "    h.exit(true)",
+    "}",
+    "fn with_as[H: BlockHandler](h: H) ! IO.Print, _ \{",
+    "    with h as c \{",
+    "        let _k = keep(c)",
+    "        io.println(\"in\")",
+    "    }",
+    "}",
+    "fn main() \{",
+    "    io.println(\"\{bound_only(Sq \{ s: 2 })}\{bound_only(Dot \{ s: 2 })}\")",
+    "    io.println(round_trip(Sq \{ s: 2 }))",
+    "    io.println(round_trip(Dot \{ s: 5 }))",
+    "    io.println(both(Sq \{ s: 4 }))",
+    "    enter_exit(Conn \{ id: 1 })",
+    "    with_as(Conn \{ id: 2 })",
+    "    with_as(Mark \{ n: 1 })",
+    "}",
+    "",
+].join("\n")
+
+test "an associated type of a type parameter builds and runs in each build mode" {
+    let root = "{scratch_root()}/assoc_type_per_instance_{getpid()}"
+    let _ = sh("rm -rf {root} && mkdir -p {root}")
+    fs.write("{root}/main.bl", prog_src).unwrap()
+    let blink = sh("readlink -f build/blink").out.trim()
+    let mut failed: List[Str] = []
+    for mode in ["--no-per-module", "--per-module"] {
+        let r = sh("cd {root} && env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE timeout 300 {blink} run {mode} main.bl < /dev/null 2>&1")
+        if !r.success() || !r.out.ends_with("11\nsq2\ndot5\nsq4/o4!\nexit\nin\nexit\nm-in\nin\nm-exit\n") { failed.push("blink run {mode}: {r.end}\n{r.out}") }
+    }
+    let _ = sh("rm -rf {root}")
+    assert_eq(failed, [])
+}

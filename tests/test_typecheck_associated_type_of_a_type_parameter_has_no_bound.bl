@@ -1,0 +1,228 @@
+// Inside `fn f[S: Shape](s: S)`, a call through the bound such as `s.first()` that the trait
+// declares as `-> Self.Item` gives a value of the associated type `S.Item`. A generic body is
+// typed once, at its definition (§6.7.5), and Blink has no syntax to bound an associated
+// type, so `S.Item` has no methods, no fields and no operators (§6.3.3). Each use is refused
+// in the generic body, whether or not a caller reaches it, and whatever impl a caller picks.
+// The value can still be bound, passed to a generic function, and given back to a method of
+// the trait that takes `Self.Item`.
+
+import std.fs
+import std.io
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_reset}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+
+fn probe(stem: Str, src: Str) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete, Env.Exit, Env.Read, FS.Read, IO, FS.Write {
+    init_embedded_stdlib()
+    let path = "/tmp/zz_assocproj_{stem}.bl"
+    fs.write(path, src).unwrap()
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+    let mut out = ""
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" {
+            out = out.concat("{d.code} {d.name}: {d.message}\n")
+        }
+    }
+    out
+}
+
+fn assert_has(stem: Str, errs: Str, want: Str) ! IO.Print {
+    if !errs.contains(want) { io.println("FAIL: {stem}: want '{want}', got:\n{errs}") }
+    assert(errs.contains(want))
+}
+
+fn assert_accepted(stem: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete, Env.Exit, Env.Read, FS.Read, IO, FS.Write {
+    let errs = probe(stem, src)
+    if errs != "" { io.println("FAIL: {stem}: unexpected diagnostics:\n{errs}") }
+    assert(errs == "")
+}
+
+fn decls() -> Str {
+    #"type Pt { x: Int }
+
+trait Shape {
+    type Item
+    fn first(self) -> Self.Item
+    fn show(self, it: Self.Item) -> Str
+    fn area(self) -> Int
+}
+
+type Sq { s: Int }
+
+impl Shape for Sq {
+    type Item = Int
+    fn first(self) -> Int { self.s }
+    fn show(self, it: Int) -> Str { "sq{it}" }
+    fn area(self) -> Int { self.s * self.s }
+}
+
+type Dot { s: Int }
+
+impl Shape for Dot {
+    type Item = Pt
+    fn first(self) -> Pt { Pt { x: self.s } }
+    fn show(self, it: Pt) -> Str { "dot{it.x}" }
+    fn area(self) -> Int { 0 }
+}
+
+fn keep[T](x: T) -> T { x }
+
+"#
+}
+
+fn with_body(ret: Str, body: Str, call: Bool) -> Str {
+    let main_body = if call { "    let _r = f(Sq \{ s: 2 })\n    let _d = f(Dot \{ s: 3 })\n" } else { "    io.println(\"x\")\n" }
+    "{decls()}fn f[S: Shape](s: S) -> {ret} \{\n    let it = s.first()\n    {body}\n}\n\nfn main() \{\n{main_body}}\n"
+}
+
+test "a method on an associated type of a type parameter is E0505" {
+    let errs = probe("method", with_body("Int", "it.area()", true))
+    assert_has("method", errs, "E0505 UnresolvedMethod: `S.Item` is an associated type of type parameter `S`, and nothing bounds it, so it has no method `area`")
+}
+
+test "a method on an associated type is E0505 in a generic function that no code calls" {
+    let errs = probe("method_uncalled", with_body("Int", "it.area()", false))
+    assert_has("method_uncalled", errs, "E0505 UnresolvedMethod: `S.Item` is an associated type of type parameter `S`, and nothing bounds it, so it has no method `area`")
+}
+
+test "a field read on an associated type of a type parameter is refused" {
+    let errs = probe("field", with_body("Int", "it.x", true))
+    assert_has("field", errs, "NoSuchField: `S.Item` is an associated type of type parameter `S`, and nothing bounds it, so it has no field `x`")
+}
+
+test "an operator on an associated type of a type parameter is refused" {
+    let errs = probe("op", with_body("Int", "it + 1", true))
+    assert_has("op", errs, "`S.Item` is an associated type of type parameter `S`, and nothing bounds it, so arithmetic `+` is not defined on it")
+}
+
+test "an interpolation of an associated type of a type parameter is refused" {
+    let errs = probe("interp", with_body("Str", "\"\{it}\"", true))
+    assert_has("interp", errs, "MissingDisplayImpl: type `S.Item` does not implement `Display`")
+}
+
+test "a comparison of an associated type of a type parameter is refused" {
+    let errs = probe("eq", with_body("Bool", "it == it", true))
+    assert_has("eq", errs, "`S.Item` is an associated type of type parameter `S`, and nothing bounds it, so comparison `==` is not defined on it")
+}
+
+test "an associated type value can be bound, passed to a generic function and given back to the trait" {
+    assert_accepted("pass", with_body("Str", "s.show(keep(it))", true))
+}
+
+test "the bounds of a type parameter do not reach its associated type" {
+    let src = "{decls()}fn f[S: Shape + Display](s: S) -> Str \{\n    \"\{s.first()}\"\n}\n\nfn main() \{\n    io.println(\"x\")\n}\n"
+    let errs = probe("held_display", src)
+    assert_has("held_display", errs, "MissingDisplayImpl: type `S.Item` does not implement `Display`")
+}
+
+test "an associated type does not meet the bound of a generic callee" {
+    let src = "{decls()}fn g[T: Shape](x: T) -> Int \{ x.area() }\n\nfn f[S: Shape](s: S) -> Int \{\n    g(s.first())\n}\n\nfn main() \{\n    io.println(\"x\")\n}\n"
+    let errs = probe("held_bound", src)
+    assert_has("held_bound", errs, "TraitBoundNotSatisfied: `S.Item` does not satisfy the Shape bound on type parameter T of g")
+}
+
+test "two type parameters keep their associated types apart" {
+    let src = "{decls()}fn f[A: Shape, B: Shape](a: A, b: B) -> Str \{\n    a.show(b.first())\n}\n\nfn main() \{\n    io.println(f(Sq \{ s: 1 }, Sq \{ s: 2 }))\n}\n"
+    let errs = probe("apart", src)
+    assert_has("apart", errs, "B.Item")
+}
+
+test "a concrete receiver reads the impl's associated type" {
+    assert_accepted("concrete", "{decls()}fn main() \{\n    let n: Int = Sq \{ s: 2 }.first()\n    let p = Dot \{ s: 4 }.first()\n    io.println(\"\{n + p.x}\")\n}\n")
+}
+
+// A builtin use that needs a bound gives an associated type the verdict of an unbounded `T`.
+test "assert_eq on an associated type needs Eq" {
+    let errs = probe("assert_eq", with_body("Int", "assert_eq(it, it)\n    1", true))
+    assert_has("assert_eq", errs, "TraitBoundNotSatisfied: `S.Item` does not implement `Eq`")
+}
+
+test "contains on a list of an associated type is refused" {
+    let errs = probe("contains", with_body("Bool", "[it].contains(it)", true))
+    assert_has("contains", errs, "UnresolvedMethod: unresolved method `.contains` on type List[S.Item]")
+}
+
+test "index_of on a list of an associated type is refused" {
+    let errs = probe("index_of", with_body("Int", "[it].index_of(it) ?? 0", true))
+    assert_has("index_of", errs, "UnresolvedMethod: unresolved method `.index_of` on type List[S.Item]")
+}
+
+test "a comparison of Options of an associated type needs Eq" {
+    let errs = probe("opt_eq", with_body("Bool", "Some(it) == Some(it)", true))
+    assert_has("opt_eq", errs, "`Option[S.Item]` does not implement `Eq`")
+}
+
+test "sort on a list of an associated type needs Ord" {
+    let errs = probe("sort", with_body("Int", "let mut l = [it, it]\n    l.sort()\n    1", true))
+    assert_has("sort", errs, "TraitBoundNotSatisfied: `S.Item` does not implement `Ord`")
+}
+
+test "debug on a list of an associated type needs Debug" {
+    let errs = probe("debug", with_body("Str", "[it].debug()", true))
+    assert_has("debug", errs, "`List[S.Item]` does not implement `Debug`")
+}
+
+test "a trait-qualified call on an associated type is refused" {
+    let errs = probe("qualified", with_body("Int", "Shape.area(it)", true))
+    assert_has("qualified", errs, "`S.Item` is an associated type of type parameter `S`, and nothing bounds it, so it does not implement `Shape`")
+}
+
+// Only a call result has the type `S.Item`; Blink has no syntax that names it.
+test "a written S.Item is an unknown type" {
+    let ret = probe("written_ret", "{decls()}fn f[S: Shape](s: S) -> S.Item \{ s.first() }\n\nfn main() \{\n    io.println(\"x\")\n}\n")
+    assert_has("written_ret", ret, "UnknownType: unknown type `S.Item`")
+    let ann = probe("written_let", with_body("Int", "let x: S.Item = s.first()\n    1", true))
+    assert_has("written_let", ann, "UnknownType: unknown type `S.Item`")
+}
+
+fn deeper() -> Str {
+    "trait Deeper: Shape \{\n    fn deep(self) -> Int\n}\n\nimpl Deeper for Sq \{\n    fn deep(self) -> Int \{ 9 }\n}\n\n"
+}
+
+test "an associated type a supertrait declares has no bound" {
+    let src = "{decls()}{deeper()}fn f[S: Deeper](s: S) -> Int \{\n    let it = s.first()\n    it.area()\n}\n\nfn main() \{\n    io.println(\"x\")\n}\n"
+    let errs = probe("super_method", src)
+    assert_has("super_method", errs, "`S.Item` is an associated type of type parameter `S`, and nothing bounds it, so it has no method `area`")
+}
+
+test "an associated type a supertrait declares can be passed back to the trait" {
+    assert_accepted("super_pass", "{decls()}{deeper()}fn f[S: Deeper](s: S) -> Str \{ s.show(keep(s.first())) }\n\nfn main() \{\n    io.println(f(Sq \{ s: 3 }))\n}\n")
+}
+
+test "two bounds that declare one associated type name name the trait" {
+    let other = "trait Other \{\n    type Item\n    fn get(self) -> Self.Item\n}\n\nimpl Other for Sq \{\n    type Item = Str\n    fn get(self) -> Str \{ \"o\" }\n}\n\n"
+    let src = "{decls()}{other}fn f[S: Shape + Other](s: S) -> Str \{ s.show(s.get()) }\n\nfn main() \{\n    io.println(f(Sq \{ s: 1 }))\n}\n"
+    let errs = probe("namesake", src)
+    assert_has("namesake", errs, "expects S.Item (of Shape), got S.Item (of Other)")
+}
+
+test "a with-as binder over a BlockHandler type parameter has the Context type" {
+    let src = "type Tx \{ tag: Str }\n\ntype Conn \{ id: Int }\n\nimpl BlockHandler for Conn \{\n    type Context = Tx\n    fn enter(self) -> Tx \{ Tx \{ tag: \"t\" } }\n    fn exit(self, _ok: Bool) \{}\n}\n\nfn f[H: BlockHandler](h: H) ! _ \{\n    with h as c \{\n        let _k = c.tag\n    }\n}\n\nfn main() \{\n    f(Conn \{ id: 1 })\n}\n"
+    let errs = probe("with_as_field", src)
+    assert_has("with_as_field", errs, "`H.Context` is an associated type of type parameter `H`, and nothing bounds it, so it has no field `tag`")
+}
+
+fn other_put() -> Str {
+    "trait Other \{\n    type Item\n    fn get(self) -> Self.Item\n    fn put(self, it: Self.Item) -> Str\n}\n\nimpl Other for Sq \{\n    type Item = Str\n    fn get(self) -> Str \{ \"o\" }\n    fn put(self, it: Str) -> Str \{ it }\n}\n\n"
+}
+
+test "two bounds that declare one associated type name each go back to their own trait" {
+    assert_accepted("namesake_ok", "{decls()}{other_put()}fn f[S: Shape + Other](s: S) -> Str \{ \"\{s.show(s.first())}\{s.put(s.get())}\" }\n\nfn main() \{\n    io.println(f(Sq \{ s: 1 }))\n}\n")
+}
+
+test "two bounds that declare one associated type name each refuse a use on their own" {
+    let src = "{decls()}{other_put()}fn f[S: Shape + Other](s: S) -> Int \{\n    let a = s.first()\n    let b = s.get()\n    a.area() + b.len()\n}\n\nfn main() \{\n    io.println(\"x\")\n}\n"
+    let errs = probe("namesake_each", src)
+    assert_has("namesake_each", errs, "`S.Item (of Shape)` is an associated type of type parameter `S`, and nothing bounds it, so it has no method `area`")
+    assert_has("namesake_each", errs, "`S.Item (of Other)` is an associated type of type parameter `S`, and nothing bounds it, so it has no method `len`")
+}
+
+test "two bounds that declare one associated type name do not cross over" {
+    let src = "{decls()}{other_put()}fn f[S: Shape + Other](s: S) -> Str \{ s.put(s.first()) }\n\nfn main() \{\n    io.println(f(Sq \{ s: 1 }))\n}\n"
+    let errs = probe("namesake_cross", src)
+    assert_has("namesake_cross", errs, "expects S.Item (of Other), got S.Item (of Shape)")
+}

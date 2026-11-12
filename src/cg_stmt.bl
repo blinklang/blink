@@ -3037,9 +3037,12 @@ fn wrap_block_handler(node: Int, items: Int, n: Int, i: Int, bh: Int, tail: Int,
     let held = bind_temp("bh", tid, item, value)
     let enter = cg_eff_block_handler_enter(calls, held.ref, item)
     if enter < 0 { return -1 }
-    // An enter returning Void gives an `as` binder nothing, and typecheck then types the
-    // binder as the handler itself, so that is what it holds.
+    // An enter returning Void gives an `as` binder nothing, and typecheck then types a
+    // concrete item's binder as the handler itself, so that is what it holds. In a generic
+    // body the binder has the type `H.Context`, so in an instance whose Context is Void it
+    // holds the unit value.
     let void_enter = tc_tid_kind(calls.context_tid) == TyKind.Void
+    let binds_handler = void_enter && binds && tc_tid_kind(stmt_tid(item)) != TyKind.Void
     let installs = tc_tid_kind(calls.context_tid) == TyKind.Handler && !item_type_is_abstract(expr)
     let mut stmts: List[Int] = [held.stmt]
     let mut installed = -1
@@ -3051,7 +3054,7 @@ fn wrap_block_handler(node: Int, items: Int, n: Int, i: Int, bh: Int, tail: Int,
         stmts.push(ir_expr_stmt(item, enter))
     }
     let _ = open_scope()
-    let bind = if !binds { 0 } else if void_enter { bind_context(item, held.ref) } else { bind_context(item, enter) }
+    let bind = if !binds { 0 } else if binds_handler { bind_context(item, held.ref) } else if void_enter { bind_unit_context(item) } else { bind_context(item, enter) }
     if installs && binds && bind >= 0 { installed = binder_ref(item) }
     let rest = if bind < 0 { -1 } else { wrap_with_items(node, items, n, i + 1, tail, dest, dest_tid) }
     close_scope()
@@ -3091,6 +3094,19 @@ fn bind_context(item: Int, init: Int) -> Int ! Diag.Report {
             "typecheck types the binder as the Context enter returns; the two must agree")
         return -1
     }
+    declare_binder(item, tid, init)
+}
+
+// A Void Context binder holds the unit value, as a Void `let` does; enter already ran.
+fn bind_unit_context(item: Int) -> Int ! Diag.Report {
+    let tid = stmt_tid(item)
+    if tid < 0 { return -1 }
+    let unit = int_const(item, "0")
+    if unit < 0 { return -1 }
+    declare_binder(item, tid, unit)
+}
+
+fn declare_binder(item: Int, tid: Int, init: Int) -> Int ! Diag.Report {
     let rec = layout_at(tid, Position.Local, item)
     let _ = ensure_typedef_for(tid)
     let name = node_name(item)
