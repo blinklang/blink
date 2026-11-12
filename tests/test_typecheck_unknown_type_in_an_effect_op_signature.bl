@@ -1,0 +1,345 @@
+// A type name nothing declares is `error[UnknownType]` at check when an effect operation's
+// signature writes it, as it is for any fn: as a parameter, as the return, and at any depth, such
+// as in `List[...]`, `Option[(...)]` or a fn type. The signature of an operation with no body was
+// not checked, so `blink check` was clean and the build stopped with an internal error.
+//
+// The valid signature types check clean, and an effect with a handler still builds and runs in
+// each build mode.
+
+import cg_test_helpers.{cg_probe_begin}
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_ice_count}
+import std.fs
+import std.io
+import std.process.{ProcessResult}
+import compile_test_helpers.{scratch_root}
+
+// Every row reads this one probe. Its names are unique, because the typecheck name tables are
+// process-global, and the line numbers the rows assert are the probe's own.
+let PROBE = #"type ZoPt { x: Int, y: Int }
+effect ZoEf {
+    effect Bad {
+        fn zo_bare(x: ZoBare) -> Int
+        fn zo_second(x: Int, y: ZoSecond) -> Int
+        fn zo_ret(x: Int) -> ZoRet
+        fn zo_list(x: List[ZoList]) -> Int
+        fn zo_fn_param(f: fn(ZoFnParam) -> Int) -> Int
+        fn zo_fn_ret(f: fn(Int) -> ZoFnRet) -> Int
+        fn zo_tuple(x: Int) -> Option[(Int, ZoTuple)]
+    }
+    effect More {
+        fn zo_more(x: ZoMore)
+        fn zo_derived(_x: ZoDerived) -> Int { 1 }
+    }
+}
+effect ZoGood {
+    effect Fine {
+        fn zg_a(p: ZoPt, xs: List[Int], s: Str) -> Option[(Int, Str)]
+        fn zg_b(f: fn(Int) -> Int) -> Bool
+        fn zg_c()
+    }
+}
+fn main() {
+    io.println("x")
+}
+effect ZoDef {
+    effect Dflt {
+        fn zo_dflt(x: Int = zo_no_such_value) -> Int
+        fn zo_dflt_ok(x: Int = 5) -> Int
+    }
+}
+trait ZoTr {
+    fn zo_tm(self, x: Int) -> Int
+}
+"#
+
+fn compile_the_probe() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Env.Exit, Env.Read, FS.Read, IO, FS.Write, Env.Write, Process.Spawn {
+    env.set_var("BLINK_ROOT", process.run("pwd", []).unwrap().out.trim())
+    let path = "build/unknown_type_in_effect_op_signature_probe.bl"
+    cg_probe_begin(path)
+    fs.write(path, PROBE).unwrap()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _rm = process.run("rm", ["-f", path]).unwrap()
+    assert_eq(diag_ice_count, 0)
+}
+
+fn report_names() -> Str {
+    let mut out = ""
+    for d in diag_entries {
+        if d.severity == "error" { out = out.concat("{d.name} at {d.line}:{d.col}: {d.message}\n") }
+    }
+    out
+}
+
+fn errors_at(name: Str, text: Str, line: Int) -> Int {
+    let mut n = 0
+    for d in diag_entries {
+        if d.severity == "error" && d.name == name && d.message.contains(text) && d.line == line { n = n + 1 }
+    }
+    n
+}
+
+// The report has the same wording as for the parameter of a fn, on the line that writes it, and is
+// given once.
+fn assert_unknown(label: Str, name: Str, line: Int) ! IO.Print {
+    let n = errors_at("UnknownType", "unknown type `{name}`", line)
+    if n != 1 {
+        io.println("FAIL: {label}: want one UnknownType for `{name}` on line {line}, got {n}. Reports:\n{report_names()}")
+    }
+    assert_eq(n, 1)
+}
+
+test "an unknown name as a parameter of an effect operation is refused" {
+    compile_the_probe()
+    assert_unknown("bare param", "ZoBare", 4)
+}
+
+test "an unknown name as a later parameter of an effect operation is refused" {
+    compile_the_probe()
+    assert_unknown("second param", "ZoSecond", 5)
+}
+
+test "an unknown name as the return of an effect operation is refused" {
+    compile_the_probe()
+    assert_unknown("return", "ZoRet", 6)
+}
+
+test "an unknown name in a List parameter of an effect operation is refused" {
+    compile_the_probe()
+    assert_unknown("list param", "ZoList", 7)
+}
+
+test "an unknown name as a parameter of a fn type in an effect operation is refused" {
+    compile_the_probe()
+    assert_unknown("fn type param", "ZoFnParam", 8)
+}
+
+test "an unknown name as the return of a fn type in an effect operation is refused" {
+    compile_the_probe()
+    assert_unknown("fn type return", "ZoFnRet", 9)
+}
+
+test "an unknown name in a tuple inside an Option return of an effect operation is refused" {
+    compile_the_probe()
+    assert_unknown("option tuple return", "ZoTuple", 10)
+}
+
+test "an unknown name in an operation of a later sub-effect with no return is refused" {
+    compile_the_probe()
+    assert_unknown("later sub-effect", "ZoMore", 13)
+}
+
+// A derived operation is checked as a function, so its signature is reported once, not once more
+// by the walk over operations with no body.
+test "an unknown name as a parameter of a derived operation is refused once" {
+    compile_the_probe()
+    assert_unknown("derived op", "ZoDerived", 14)
+}
+
+test "an effect whose operations name only valid types checks clean" {
+    compile_the_probe()
+    let mut n = 0
+    for d in diag_entries {
+        if d.severity == "error" && d.line >= 17 && d.line <= 23 { n = n + 1 }
+    }
+    if n != 0 {
+        io.println("FAIL: want no error on lines 17-23, got {n}. Reports:\n{report_names()}")
+    }
+    assert_eq(n, 0)
+}
+
+// The parameters of an operation with no body are never read, so they give no unused warning.
+test "the parameters of an operation with no body give no unused-variable warning" {
+    compile_the_probe()
+    let mut n = 0
+    for d in diag_entries {
+        if d.name == "UnusedVariable" { n = n + 1 }
+    }
+    if n != 0 { io.println("FAIL: want no UnusedVariable. Reports:\n{report_names()}") }
+    assert_eq(n, 0)
+}
+
+// A default is read where it is written, as for any fn, whether the operation has a body or not.
+test "an undefined name in the default of an operation with no body is refused" {
+    compile_the_probe()
+    let n = errors_at("UndefinedVariable", "undefined variable `zo_no_such_value`", 29)
+    if n != 1 {
+        io.println("FAIL: want one UndefinedVariable on line 29, got {n}. Reports:\n{report_names()}")
+    }
+    assert_eq(n, 1)
+}
+
+test "a valid default of an operation and a trait method signature check clean" {
+    compile_the_probe()
+    let mut n = 0
+    for d in diag_entries {
+        if d.line >= 30 && d.line <= 35 { n = n + 1 }
+    }
+    if n != 0 {
+        io.println("FAIL: want no report on lines 30-35, got {n}. Reports:\n{report_names()}")
+    }
+    assert_eq(n, 0)
+}
+
+fn sh(cmd: Str) -> ProcessResult ! Process.Spawn {
+    process.run("sh", ["-c", cmd]).unwrap()
+}
+
+let CLEAN_ENV = "env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE"
+
+fn valid_src() -> Str {
+    #"type Pt { x: Int, y: Int }
+
+effect Shapes {
+    effect Measure {
+        fn measure(p: Pt, xs: List[Int], scale: fn(Int) -> Int) -> Option[(Int, Str)]
+        fn note(s: Str)
+    }
+}
+
+fn use_it() -> Option[(Int, Str)] ! Shapes.Measure {
+    shapes.note("go")
+    shapes.measure(Pt { x: 1, y: 2 }, [1, 2], fn(n: Int) -> Int { n * 10 })
+}
+
+fn main() {
+    with handler Shapes.Measure {
+        fn measure(p: Pt, xs: List[Int], scale: fn(Int) -> Int) -> Option[(Int, Str)] {
+            Some((scale(p.x + p.y + xs.len()), "ok"))
+        }
+        fn note(s: Str) {
+            io.println("note {s}")
+        }
+    } {
+        match use_it() {
+            Some((n, s)) => io.println("{n} {s}")
+            None => io.println("none")
+        }
+    }
+}
+"#
+}
+
+test "an effect with valid operation types builds and runs with a handler in each build mode" {
+    let root = "{scratch_root()}/unknown_type_in_effect_op_signature_valid_{getpid()}"
+    let _ = sh("rm -rf {root} && mkdir -p {root}")
+    fs.write("{root}/main.bl", valid_src()).unwrap()
+    let blink = sh("readlink -f build/blink").out.trim()
+    let want = "note go\n50 ok\n"
+    let mut failed: List[Str] = []
+    for mode in ["--no-per-module", "--per-module"] {
+        let r = sh("cd {root} && {CLEAN_ENV} timeout 300 {blink} run {mode} main.bl < /dev/null")
+        if !r.success() || r.out != want { failed.push("blink run {mode}: {r.end}\n{r.out}\n{r.err_out}") }
+    }
+    let _ = sh("rm -rf {root}")
+    assert_eq(failed, [])
+}
+
+// A type in an operation signature passes the same visibility and import checks as any other
+// written type, and it counts as a use of the import that brings it in. Each needs a second
+// module, so these rows check a package.
+let HID_SRC = #"pub type PubT { v: Int }
+type PrivT { v: Int }
+"#
+
+let PRIVATE_SRC = #"import hid
+effect Ef {
+    effect Op {
+        fn op(x: Option[hid.PrivT]) -> Int
+    }
+}
+fn main() { io.println("x") }
+"#
+
+let SELECTED_SRC = #"import hid.{PubT}
+effect Ef {
+    effect Op {
+        fn op(x: Int) -> Option[PubT]
+    }
+}
+fn main() { io.println("x") }
+"#
+
+let NOT_SELECTED_SRC = #"import hid
+effect Ef {
+    effect Op {
+        fn op(x: Option[PubT]) -> Int
+    }
+}
+fn main() { io.println("x") }
+"#
+
+// An effect declared in a module that is not the entry reads its names in that module: its own
+// private type and a type it imports are in scope there.
+let DEP_SRC = #"pub type DepT { v: Int }
+"#
+
+let STORE_SRC = #"import dep.{DepT}
+type Secret { v: Int }
+pub effect Store {
+    effect Put {
+        fn put(s: Option[Secret], d: DepT) -> Int
+    }
+}
+pub fn run_it() -> Int ! Store.Put { store.put(None, DepT { v: 4 }) }
+pub fn go() -> Int {
+    with handler Store.Put {
+        fn put(_s: Option[Secret], d: DepT) -> Int { d.v + 1 }
+    } {
+        run_it()
+    }
+}
+"#
+
+let STORE_MAIN_SRC = #"import store
+fn main() { io.println("{store.go()}") }
+"#
+
+test "an effect operation type is checked for visibility and import, and uses its import" {
+    let root = "{scratch_root()}/unknown_type_in_effect_op_signature_pkg_{getpid()}"
+    let _ = sh("rm -rf {root} && mkdir -p {root}/src")
+    fs.write("{root}/blink.toml", "[package]\nname = \"effoppkg\"\nversion = \"0.1.0\"\n").unwrap()
+    fs.write("{root}/src/hid.bl", HID_SRC).unwrap()
+    fs.write("{root}/src/private.bl", PRIVATE_SRC).unwrap()
+    fs.write("{root}/src/selected.bl", SELECTED_SRC).unwrap()
+    fs.write("{root}/src/not_selected.bl", NOT_SELECTED_SRC).unwrap()
+    let blink = sh("readlink -f build/blink").out.trim()
+    let mut failed: List[Str] = []
+    let priv_r = sh("cd {root} && {CLEAN_ENV} timeout 300 {blink} check src/private.bl < /dev/null 2>&1")
+    if priv_r.success() || !priv_r.out.contains("error[PrivateItemAccess]: cannot access private type `PrivT`") {
+        failed.push("private type: want PrivateItemAccess, got {priv_r.end}\n{priv_r.out}")
+    }
+    let selected = sh("cd {root} && {CLEAN_ENV} timeout 300 {blink} check src/selected.bl < /dev/null 2>&1")
+    if !selected.success() || selected.out.contains("UnusedImport") {
+        failed.push("selected import: want a clean check with no UnusedImport, got {selected.end}\n{selected.out}")
+    }
+    let not_selected = sh("cd {root} && {CLEAN_ENV} timeout 300 {blink} check src/not_selected.bl < /dev/null 2>&1")
+    if not_selected.success() || !not_selected.out.contains("error[ImportNotSelected]: `PubT` is not in scope") {
+        failed.push("type not imported: want ImportNotSelected, got {not_selected.end}\n{not_selected.out}")
+    }
+    let _ = sh("rm -rf {root}")
+    assert_eq(failed, [])
+}
+
+test "an effect declared in another module reads its operation types in that module" {
+    let root = "{scratch_root()}/unknown_type_in_effect_op_signature_dep_{getpid()}"
+    let _ = sh("rm -rf {root} && mkdir -p {root}/src")
+    fs.write("{root}/blink.toml", "[package]\nname = \"effopdep\"\nversion = \"0.1.0\"\n").unwrap()
+    fs.write("{root}/src/dep.bl", DEP_SRC).unwrap()
+    fs.write("{root}/src/store.bl", STORE_SRC).unwrap()
+    fs.write("{root}/src/main.bl", STORE_MAIN_SRC).unwrap()
+    let blink = sh("readlink -f build/blink").out.trim()
+    let mut failed: List[Str] = []
+    let chk = sh("cd {root} && {CLEAN_ENV} timeout 300 {blink} check src/main.bl < /dev/null 2>&1")
+    if !chk.success() || chk.out.contains("error[") || chk.out.contains("warning[") {
+        failed.push("check: want clean, got {chk.end}\n{chk.out}")
+    }
+    for mode in ["--no-per-module", "--per-module"] {
+        let r = sh("cd {root} && {CLEAN_ENV} timeout 300 {blink} run {mode} src/main.bl < /dev/null")
+        if !r.success() || r.out != "5\n" { failed.push("blink run {mode}: {r.end}\n{r.out}\n{r.err_out}") }
+    }
+    let _ = sh("rm -rf {root}")
+    assert_eq(failed, [])
+}

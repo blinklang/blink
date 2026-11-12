@@ -5,7 +5,7 @@ import unparse.{type_ann_text, type_ann_text_renamed, unparse_expr, unparse_bino
 import formatter.{effect_op_sig_text, fn_sig_text, fn_sig_text_renamed, type_param_list_text, format_type_param_binder, format_pattern}
 import import_edit.{ImportEdit, ImportNeed, import_aliased_edit, import_module_edit, import_need}
 import parser.{
-    node_written_span, effect_derived_ops, node_load_rank, parser_load_order_moved, parser_live_ranges,
+    node_written_span, effect_derived_ops, effect_ops, effect_decl_ops, node_load_rank, parser_load_order_moved, parser_live_ranges,
     ann_str_val, positional_str_arg, positional_str_arg_count, impl_provided_by_closeable, closeable_impl_of, sublist_remove_members, get_annotation, get_str_named_arg, has_annotation, is_literal_string_part,
     node_args, node_assoc_types, node_arms, node_body, node_captures, node_col, node_condition,
     node_effects, node_elements, node_else_body, node_end, node_fields, node_for_binder, node_guard,
@@ -20919,25 +20919,6 @@ fn tc_report_not_a_handle_op(node: Int, root: Str, name: Str) -> Int ! TypeCheck
 // buries the error.
 let UE_OPS_LISTED_MAX = 8
 
-// cg_reg_effect_ops walks the same order, but the codegen layer imports this module, so this
-// one cannot import it. The help needs the op nodes, for their parameter names.
-fn tc_ue_ops(ed: Int) -> List[Int] {
-    let mut ops: List[Int] = []
-    let children_sl = node_elements(ed)
-    if children_sl == -1 { return ops }
-    let mut ci = 0
-    while ci < sublist_length(children_sl) {
-        let ops_sl = node_methods(sublist_get(children_sl, ci))
-        let mut oi = 0
-        while ops_sl != -1 && oi < sublist_length(ops_sl) {
-            ops.push(sublist_get(ops_sl, oi))
-            oi = oi + 1
-        }
-        ci = ci + 1
-    }
-    ops
-}
-
 fn tc_ue_op_call_text(handle: Str, op: Int) -> Str {
     let mut names: List[Str] = []
     let params_sl = node_params(op)
@@ -20973,7 +20954,7 @@ fn tc_report_unknown_ue_op(node: Int, handle: Str, method: Str) -> Int ! TypeChe
         let _ = tc_infer_unhinted(sublist_get(args, i))
         i = i + 1
     }
-    let ops = tc_ue_ops(ed)
+    let ops = effect_decl_ops(ed)
     let mut notes: List[Str] = []
     if ops.len() > 0 && ops.len() <= UE_OPS_LISTED_MAX {
         let mut names: List[Str] = []
@@ -21029,7 +21010,7 @@ fn nr_fn_reserves_ue_handle(handle: Str) -> Bool {
 // give for the same read.
 fn nr_report_ue_handle_value(node: Int, handle: Str, member: Str) ! Diag.Report {
     let ed = tc_ue_handle_decl(handle)
-    let ops = tc_ue_ops(ed)
+    let ops = effect_decl_ops(ed)
     let what = "`{handle}` is the handle of effect `{node_name(ed)}`, not a value"
     let op_named = if member == "" { -1 } else { tc_ue_op_named(ops, member) }
     let help = if op_named != -1 { "{what}: call the operation, as in `{tc_ue_op_call_text(handle, op_named)}`" } else { tc_ue_help_with_a_call(what, handle, ops) }
@@ -29235,9 +29216,10 @@ fn resolve_names(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repor
 
     nr_check_trait_method_defaults(node_arms(program))
 
-    // A derived operation's body is a function of its own (§4.7.1). It names no handler of
-    // its own, so `default` does not resolve in it.
-    for op in effect_derived_ops(program) {
+    // An operation is a function of its own (§4.7.1), read in the module that declares its
+    // effect. One with no body still has a signature of written types. It names no handler of
+    // its own, so `default` does not resolve in a derived operation's body.
+    for op in effect_ops(program) {
         nr_current_module = tc_body_module(op)
         nr_check_fn(op)
     }
@@ -29400,6 +29382,8 @@ fn nr_check_fn_scope(fn_node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.R
     tc_push_tparam_scope(fn_tparams)
     nr_check_binder_bounds(fn_tparams)
     let nr_is_ffi = has_annotation(fn_node, "ffi")
+    let is_primitive_op = node_body(fn_node) == -1 && (tc_ue_op_root.get(fn_node) ?? -1) != -1
+    let binds_params = nr_is_ffi == 0 && !is_primitive_op
     let params_sl = node_params(fn_node)
     // A default is read where it is written, before any parameter is in scope: a call that
     // leaves the argument out has none of them to give it.
@@ -29414,9 +29398,9 @@ fn nr_check_fn_scope(fn_node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.R
         let mut i = 0
         while i < sublist_length(params_sl) {
             let p = sublist_get(params_sl, i)
-            // The body of an @ffi fn is not walked, so its parameters are not bound, but
-            // their types are written types all the same.
-            if nr_is_ffi == 0 { nr_define_at(node_name(p), p) }
+            // The body of an @ffi fn is not walked, and a primitive operation has none, so
+            // their parameters are not bound, but their types are written types all the same.
+            if binds_params { nr_define_at(node_name(p), p) }
             let ptype_ann = node_type_ann(p)
             if ptype_ann != -1 {
                 nr_check_type_ann_visibility(ptype_ann)
@@ -29426,7 +29410,7 @@ fn nr_check_fn_scope(fn_node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.R
             // A LetBinding below eagerly infers its value's type, and a Call there
             // needs a typed local to see a closure param shadowing a same-named
             // global fn, or it falls through to the global's arity instead.
-            if nr_is_ffi == 0 { nr_set_last_type(resolve_param_type(p)) }
+            if binds_params { nr_set_last_type(resolve_param_type(p)) }
             i = i + 1
         }
     }
