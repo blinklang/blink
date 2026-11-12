@@ -1,0 +1,170 @@
+// A signature with no body is legal in three places only: a trait method with no default
+// (sections/03_types.md 3.6), an effect operation (sections/04_effects.md, `op_sig`) and an
+// `@ffi` fn (sections/07_trust_modules_metadata.md 9.1). Every other fn declaration has a
+// block, so a fn without one is a parse error (E1100) at check, not a build that has nothing
+// to compile for it.
+
+import compile_test_helpers
+
+fn count_of(output: Str, needle: Str) -> Int {
+    output.split(needle).len() - 1
+}
+
+// Exactly one diagnostic is an error, it is E1100 about a missing body, and it starts at
+// `line`:`col`.
+fn expect_one_missing_body_at(output: Str, line: Int, col: Int) {
+    assert_eq(count_of(output, "\"severity\":\"error\""), 1, "got: {output}")
+    assert_eq(count_of(output, "\"code\":\"E1100\""), 1, "got: {output}")
+    assert(output.contains("has no body"), "got: {output}")
+    assert(output.contains("\"line\":{line},\"col\":{col}"), "got: {output}")
+}
+
+fn refused(src: Str, tag: Str, line: Int, col: Int) ! FS.Delete, FS.Write, Process.Spawn, FS.Read, Env.Read {
+    let out = compile_test_helpers.compile_and_capture(src, tag)
+    expect_one_missing_body_at(out, line, col)
+}
+
+fn clean(src: Str, tag: Str) ! FS.Delete, FS.Write, Process.Spawn, FS.Read, Env.Read {
+    let out = compile_test_helpers.compile_and_capture(src, tag)
+    assert_eq(count_of(out, "\"severity\":\"error\""), 0, "got: {out}")
+}
+
+test "a top-level fn with no body is E1100" {
+    refused("fn f(x: Int) -> Int\nfn main() \{ io.println(\"x\") }\n", "_fnb_top", 1, 1)
+}
+
+test "a top-level fn with no body that main calls is E1100" {
+    refused("fn f(x: Int) -> Int\nfn main() \{ io.println(\"\{f(1)}\") }\n", "_fnb_called", 1, 1)
+}
+
+test "a pub fn with no body is E1100" {
+    refused("pub fn f(x: Int) -> Int\nfn main() \{ io.println(\"x\") }\n", "_fnb_pub", 1, 5)
+}
+
+test "a generic fn with no body is E1100" {
+    refused("fn f[T](x: T) -> T\nfn main() \{ io.println(\"x\") }\n", "_fnb_generic", 1, 1)
+}
+
+test "a fn with an effect row and no body is E1100" {
+    refused("fn g() -> Int ! IO\nfn main() \{ io.println(\"x\") }\n", "_fnb_row", 1, 1)
+}
+
+test "a fn whose signature runs onto a second line and has no body is E1100" {
+    refused("fn f(\n    x: Int,\n) -> Int\nfn main() \{ io.println(\"x\") }\n", "_fnb_multiline", 1, 1)
+}
+
+test "a fn with no body on the last line of the file is E1100" {
+    refused("fn main() \{ io.println(\"x\") }\nfn f(x: Int) -> Int", "_fnb_last_line", 2, 1)
+}
+
+test "a @trusted fn with no @ffi and no body is E1100" {
+    refused("@trusted(audit: \"FNB-TRUSTED\")\nfn f(x: Int) -> Int\nfn main() \{ io.println(\"x\") }\n", "_fnb_trusted", 2, 1)
+}
+
+test "a method of a trait impl with no body is E1100" {
+    refused("trait Tr \{ fn m(self) -> Int }\ntype Foo \{ a: Int }\nimpl Tr for Foo \{ fn m(self) -> Int }\nfn main() \{ io.println(\"x\") }\n", "_fnb_trait_impl", 3, 19)
+}
+
+test "a handler method with no body is E1100" {
+    let src = "effect Ef \{\n    effect Op \{\n        fn z(x: Int) -> Int\n    }\n}\nfn main() \{\n    with handler Ef.Op \{\n        fn z(x: Int) -> Int\n    } \{\n        io.println(\"\{ef.z(1)}\")\n    }\n}\n"
+    refused(src, "_fnb_handler", 8, 9)
+}
+
+// A signature that already failed to parse keeps its own error and gets no second one.
+
+fn no_missing_body_error(src: Str, tag: Str) ! FS.Delete, FS.Write, Process.Spawn, FS.Read, Env.Read {
+    let out = compile_test_helpers.compile_and_capture(src, tag)
+    assert(count_of(out, "\"severity\":\"error\"") > 0, "got: {out}")
+    assert(!out.contains("has no body"), "got: {out}")
+}
+
+test "a signature with a missing ) and a body gets no missing-body error" {
+    no_missing_body_error("fn f(x: Int -> Int \{\n    x\n}\nfn main() \{ io.println(\"x\") }\n", "_fnb_bad_paren")
+}
+
+test "a bare pub fn at the end of the file gets no missing-body error" {
+    no_missing_body_error("fn main() \{ io.println(\"x\") }\npub fn", "_fnb_bare_pub_eof")
+}
+
+// Guards: the three bodiless forms the spec allows, and the brace placements that are a body.
+
+test "a trait method with no default has no body and is clean" {
+    clean("trait Tr \{\n    fn m(self) -> Int\n}\ntype Foo \{ a: Int }\nimpl Tr for Foo \{ fn m(self) -> Int \{ self.a } }\nfn main() \{ io.println(\"\{Foo \{ a: 2 }.m()}\") }\n", "_fnb_ok_trait")
+}
+
+test "a primitive effect operation has no body and is clean" {
+    clean("effect Ef \{\n    effect Op \{\n        fn z(x: Int) -> Int\n    }\n}\nfn main() \{\n    with handler Ef.Op \{\n        fn z(x: Int) -> Int \{ x + 1 }\n    } \{\n        io.println(\"\{ef.z(1)}\")\n    }\n}\n", "_fnb_ok_op")
+}
+
+test "an @ffi fn with no body, or with an empty body, is clean" {
+    clean("@ffi(\"labs\")\n@trusted(audit: \"FNB-LABS\")\nfn c_labs(x: Int) -> Int ! ()\n@ffi(\"llabs\")\n@trusted(audit: \"FNB-LLABS\")\nfn c_llabs(x: Int) -> Int ! () \{}\nfn main() \{ io.println(\"\{c_labs(-5)} \{c_llabs(-6)}\") }\n", "_fnb_ok_ffi")
+}
+
+test "a body whose brace is on the next line is a body" {
+    clean("fn f(x: Int) -> Int\n\{\n    x\n}\nfn main() \{ io.println(\"\{f(1)}\") }\n", "_fnb_ok_next_line")
+}
+
+fn valid_program() -> Str {
+    #"trait Tr {
+    fn m(self) -> Int
+}
+type Foo { a: Int }
+impl Tr for Foo { fn m(self) -> Int { self.a } }
+effect Ef {
+    effect Op {
+        fn z(x: Int) -> Int
+    }
+}
+@ffi("labs")
+@trusted(audit: "FNB-LABS")
+fn c_labs(x: Int) -> Int ! ()
+@ffi("llabs")
+@trusted(audit: "FNB-LLABS")
+fn c_llabs(x: Int) -> Int ! () {}
+fn f(x: Int) -> Int
+{
+    x + 10
+}
+fn main() {
+    io.println("{Foo { a: 3 }.m()}")
+    with handler Ef.Op {
+        fn z(x: Int) -> Int { x + 1 }
+    } {
+        io.println("{ef.z(1)}")
+    }
+    io.println("{c_labs(-5)} {c_llabs(-6)} {f(1)}")
+}
+"#
+}
+
+fn run_check_text(dir: Str, blink_root: Str, file: Str) -> Str ! Process.Spawn {
+    let r = process.run("sh", ["-c", "cd {dir} && env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE {blink_root}/build/blink check {file} 2>&1"]).unwrap()
+    "{r.out}{r.err_out}"
+}
+
+test "the missing-body error marks a one-line signature whole" {
+    let blink_root = process.run("sh", ["-c", "pwd -P"])?.out.trim_right()
+    let dir = "{compile_test_helpers.scratch_root()}/fn_body_span"
+    process.run("sh", ["-c", "rm -rf {dir} && mkdir -p {dir}"])?
+    fs.write("{dir}/span.bl", "fn f(x: Int) -> Int\nfn main() \{ io.println(\"x\") }\n").unwrap()
+    let out = run_check_text(dir, blink_root, "span.bl")
+    assert(out.contains("1 | fn f(x: Int) -> Int\n  | ^^^^^^^^^^^^^^^^^^^\n"), "got: {out}")
+    process.run("sh", ["-c", "rm -rf {dir}"])?
+}
+
+fn run_mode(dir: Str, blink_root: Str, flag: Str) -> Str ! Process.Spawn {
+    let r = process.run("sh", ["-c", "cd {dir} && env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE {blink_root}/build/blink run {flag} valid.bl 2>&1"]).unwrap()
+    assert(r.success(), "`blink run {flag}` failed:\n{r.out}{r.err_out}")
+    r.out
+}
+
+test "the bodiless forms the spec allows build and run, per module and in one unit" {
+    let blink_root = process.run("sh", ["-c", "pwd -P"])?.out.trim_right()
+    let dir = "{compile_test_helpers.scratch_root()}/fn_body_forms"
+    process.run("sh", ["-c", "rm -rf {dir} && mkdir -p {dir}"])?
+    fs.write("{dir}/valid.bl", valid_program()).unwrap()
+    let expected = "3\n2\n5 6 11\n"
+    assert_eq(run_mode(dir, blink_root, "--per-module"), expected)
+    assert_eq(run_mode(dir, blink_root, "--no-per-module"), expected)
+    process.run("sh", ["-c", "rm -rf {dir}"])?
+}

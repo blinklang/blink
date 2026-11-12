@@ -4,7 +4,7 @@ import lexer.{tokens}
 import std.path.{path_dirname}
 import diagnostics.{
     Diag, diag_error, diag_error_range, diag_source_file, diag_ice_abort, PARSER_INTERNAL_LIMIT, PARSER_INTERNAL_LIMIT_NAME,
-    diag_count, diag_entry_count, diag_errors_since, diag_truncate, diag_file_for_node,
+    diag_count, diag_entry_count, diag_errors_since, diag_any_errors_since, diag_truncate, diag_file_for_node,
     INLINE_MODULE_NOT_SUPPORTED, UNEXPECTED_ANNOTATION, UNEXPECTED_TOKEN,
     UNEXPECTED_TOKEN_STRING, UNEXPECTED_TOKEN_PATTERN, KEYWORD_AS_IDENTIFIER,
     diag_error_span, diag_set_last_fix_at, MUT_ON_PATTERN,
@@ -3101,10 +3101,13 @@ pub fn parse_program() -> Int ! Parse, Diag.Report, Env.Read, IO.Eprint {
             skip_newlines_and_comments()
             if at(TokenKind.Fn) {
                 let anns = pending_annotation_names()
+                let diags_before = diag_entry_count()
                 let f = parse_fn_def()
+                let sig_failed = diag_any_errors_since(diags_before) != 0
                 mark_fn_item(item_at, f, anns, ann_items)
                 node_set_is_pub(f, 1)
                 attach_pending_annotations(f)
+                require_fn_body(f, sig_failed)
                 maybe_desugar_expect_panic(f)
                 fn_nodes.push(f)
             } else if at(TokenKind.Type) {
@@ -3186,9 +3189,12 @@ pub fn parse_program() -> Int ! Parse, Diag.Report, Env.Read, IO.Eprint {
             }
         } else if at(TokenKind.Fn) {
             let anns = pending_annotation_names()
+            let diags_before = diag_entry_count()
             let f = parse_fn_def()
+            let sig_failed = diag_any_errors_since(diags_before) != 0
             mark_fn_item(item_at, f, anns, ann_items)
             attach_pending_annotations(f)
+            require_fn_body(f, sig_failed)
             maybe_desugar_expect_panic(f)
             fn_nodes.push(f)
         } else if at(TokenKind.Mod) {
@@ -4129,6 +4135,20 @@ fn parse_fn_def() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
     nd
 }
 
+// Only a trait method, an effect operation and an `@ffi` fn are a signature with no body
+// (sections/03_types.md 3.6, sections/04_effects.md `op_sig`,
+// sections/07_trust_modules_metadata.md 9.1); any other bodiless fn has no code to emit.
+// A signature that already failed to parse lost its body to recovery, so a second error
+// there would be false.
+fn require_fn_body(f: Int, sig_failed: Bool) ! Diag.Report {
+    if sig_failed || node_body(f) != -1 || get_annotation(f, "ffi") != -1 { return }
+    let line = node_line(f)
+    let col = node_col(f)
+    // A signature on one line is marked whole; one that runs on marks its `fn`.
+    let end_col = if node_end_line(f) == line { node_end_col(f) } else { col + 2 }
+    diag_error_range("UnexpectedToken", UNEXPECTED_TOKEN, "`fn {node_name(f)}` has no body", line, col, end_col, "write its body after the signature: `\{ ... }`. Only a trait method, an effect operation and an `@ffi` fn have no body")
+}
+
 // An effect name in a row: `IO` or `Net.Connect`. A name that does not parse is "", so the
 // parse error is its one report.
 fn parse_effect_name() -> Str ! Parse.Advance, Diag.Report {
@@ -4541,8 +4561,11 @@ fn parse_impl_block() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
         if at(TokenKind.At) {
             annotations.item.push(parse_annotation())
         } else if at(TokenKind.Fn) {
+            let diags_before = diag_entry_count()
             let fn_node = parse_fn_def()
+            let sig_failed = diag_any_errors_since(diags_before) != 0
             attach_pending_annotations(fn_node)
+            require_fn_body(fn_node, sig_failed)
             sublist_push(methods, fn_node)
         } else if at(TokenKind.Type) {
             advance()
@@ -4603,7 +4626,11 @@ fn parse_handler_expr() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
     let methods = new_sublist()
     while !at(TokenKind.RBrace) && !at(TokenKind.EOF) {
         if at(TokenKind.Fn) {
-            sublist_push(methods, parse_fn_def())
+            let diags_before = diag_entry_count()
+            let m = parse_fn_def()
+            let sig_failed = diag_any_errors_since(diags_before) != 0
+            require_fn_body(m, sig_failed)
+            sublist_push(methods, m)
         } else {
             advance()
         }
