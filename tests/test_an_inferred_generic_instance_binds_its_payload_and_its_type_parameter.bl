@@ -1,0 +1,315 @@
+// A pattern on a generic enum or struct binds each payload at the instance the scrutinee has,
+// also when that instance is inferred: from a closure's tail or `return`, or from the values
+// pushed into a list. A generic fn called with such a value solves its type parameter from it.
+// Each form builds and runs, in the one-unit and the per-module build.
+
+import std.fs
+import std.process.{ProcessResult}
+import compile_test_helpers.{scratch_root}
+
+type E[T] {
+    L(T)
+    N
+}
+
+type S[T] {
+    P { x: T }
+    Q
+}
+
+type Bx[T] { v: T }
+
+fn ap[A](f: fn() -> A) -> A {
+    f()
+}
+
+fn get[T](b: Bx[T]) -> T {
+    b.v
+}
+
+fn shown(e: E[Bool]) -> Str {
+    match e {
+        E.L(b) => "{b}"
+        E.N => "n"
+    }
+}
+
+test "a closure tail of a payload variant binds the payload at its instance" {
+    let c = fn() { E.L(true) }
+    let got = match c() {
+        E.L(b) => "{b}"
+        E.N => "n"
+    }
+    assert_eq(got, "true")
+    let v = c()
+    let again = match v {
+        E.L(b) => if b { 1 } else { 0 }
+        E.N => 2
+    }
+    assert_eq(again, 1)
+}
+
+test "a closure return of a payload variant binds the payload at its instance" {
+    let c = fn() { return E.L(7) }
+    let got = match c() {
+        E.L(n) => n + 1
+        E.N => 0
+    }
+    assert_eq(got, 8)
+}
+
+test "a closure whose arms give a payload and a bare variant binds the payload" {
+    let k = true
+    let c = fn() { if k { E.L(1) } else { E.N } }
+    let got = match c() {
+        E.L(n) => n * 10
+        E.N => 0
+    }
+    assert_eq(got, 10)
+}
+
+test "a closure with a parameter binds the payload at each call" {
+    let c = fn(x: Int) { E.L(x) }
+    let mut sum = 0
+    for i in [1, 2] {
+        match c(i) {
+            E.L(n) => sum = sum + n
+            E.N => {}
+        }
+    }
+    assert_eq(sum, 3)
+}
+
+test "a closure passed to a generic fn or held in a list binds the payload" {
+    let got = match ap(fn() { E.L("a") }) {
+        E.L(s) => s.len()
+        E.N => 0
+    }
+    assert_eq(got, 1)
+    let fs = [fn() { E.L(true) }]
+    let f = fs.get(0).unwrap()
+    assert_eq(shown(f()), "true")
+}
+
+test "a list built by push binds the payload of its element" {
+    let mut xs = []
+    xs.push(E.L(true))
+    let got = match xs.get(0).unwrap() {
+        E.L(b) => "{b}"
+        E.N => "n"
+    }
+    assert_eq(got, "true")
+}
+
+test "a struct variant and a struct pattern bind the field at the inferred instance" {
+    let c = fn() { S.P { x: 5 } }
+    let got = match c() {
+        S.P { x } => x + 1
+        S.Q => 0
+    }
+    assert_eq(got, 6)
+    let d = fn() { Bx { v: 4 } }
+    let w = match d() {
+        Bx { v: w } => w * 2
+    }
+    assert_eq(w, 8)
+}
+
+test "a tuple payload of an inferred instance binds each element" {
+    let c = fn() { E.L((1, "a")) }
+    let got = match c() {
+        E.L((i, s)) => "{i} {s}"
+        E.N => "n"
+    }
+    assert_eq(got, "1 a")
+}
+
+test "a generic fn solves its type parameter from an inferred instance" {
+    let e = fn() { Bx { v: "q" } }
+    assert_eq(get(e()), "q")
+    let v = e()
+    let s = get(v)
+    assert_eq(s.len(), 1)
+    let n = fn() { Bx { v: Bx { v: 5 } } }
+    assert_eq(get(get(n())) + 1, 6)
+    let mut xs = []
+    xs.push(Bx { v: "ab" })
+    assert_eq(get(xs.get(0).unwrap()).len(), 2)
+}
+
+test "a list pattern binds each element of an inferred list" {
+    let mut ls = []
+    ls.push([1, 2])
+    let got = match ls.get(0).unwrap() {
+        [x, y] => x + y
+        _ => 0
+    }
+    assert_eq(got, 3)
+    let cl = fn() { [E.L(5), E.N] }
+    let first = match cl() {
+        [E.L(x), _] => x
+        _ => 0
+    }
+    assert_eq(first, 5)
+}
+
+test "an or-pattern, an as binder and a let tuple bind at the inferred instance" {
+    let c = fn() { E.L(true) }
+    let o = match c() {
+        E.L(true) | E.N => "y"
+        E.L(false) => "n"
+    }
+    assert_eq(o, "y")
+    let mut xs = []
+    xs.push(E.L(4))
+    let a = match xs.get(0).unwrap() {
+        whole as E.L(n) => {
+            let m = match whole {
+                E.L(k) => k
+                E.N => 0
+            }
+            n + m
+        }
+        E.N => 0
+    }
+    assert_eq(a, 8)
+    let d = fn() { (E.L("s"), Bx { v: 3 }) }
+    let (p, q) = d()
+    let lp = match p {
+        E.L(s) => s.len()
+        E.N => 0
+    }
+    assert_eq(lp + q.v, 4)
+}
+
+fn sh(cmd: Str) -> ProcessResult ! Process.Spawn {
+    process.run("sh", ["-c", cmd]).unwrap()
+}
+
+fn src() -> Str {
+    #"type E[T] {
+    L(T)
+    N
+}
+type S[T] {
+    P { x: T }
+    Q
+}
+type Bx[T] { v: T }
+fn get[T](b: Bx[T]) -> T {
+    b.v
+}
+fn ap[A](f: fn() -> A) -> A {
+    f()
+}
+fn main() {
+    let c = fn() { E.L(true) }
+    match c() {
+        E.L(b) => io.println("{b}")
+        E.N => io.println("n")
+    }
+    let r = fn() { return E.L(7) }
+    match r() {
+        E.L(n) => io.println("{n}")
+        E.N => io.println("n")
+    }
+    let k = true
+    let a = fn() { if k { E.L(1) } else { E.N } }
+    match a() {
+        E.L(n) => io.println("{n}")
+        E.N => io.println("n")
+    }
+    let p = fn(x: Int) { E.L(x) }
+    match p(2) {
+        E.L(n) => io.println("{n}")
+        E.N => io.println("n")
+    }
+    match p(3) {
+        E.L(n) => io.println("{n}")
+        E.N => io.println("n")
+    }
+    match ap(fn() { E.L("s") }) {
+        E.L(s) => io.println(s)
+        E.N => io.println("n")
+    }
+    let fs = [fn() { E.L(false) }]
+    match fs.get(0).unwrap()() {
+        E.L(b) => io.println("{b}")
+        E.N => io.println("n")
+    }
+    let mut xs = []
+    xs.push(E.L(4))
+    match xs.get(0).unwrap() {
+        E.L(n) => io.println("{n}")
+        E.N => io.println("n")
+    }
+    let sv = fn() { S.P { x: 5 } }
+    match sv() {
+        S.P { x } => io.println("{x}")
+        S.Q => io.println("q")
+    }
+    let bx = fn() { Bx { v: 6 } }
+    match bx() {
+        Bx { v: w } => io.println("{w}")
+    }
+    let t = fn() { E.L((1, "a")) }
+    match t() {
+        E.L((i, s)) => io.println("{i} {s}")
+        E.N => io.println("n")
+    }
+    let g = fn() { Bx { v: "g" } }
+    io.println(get(g()))
+    let gv = g()
+    let gs = get(gv)
+    io.println(gs)
+    let nn = fn() { Bx { v: Bx { v: 7 } } }
+    io.println("{get(get(nn()))}")
+    let mut bs = []
+    bs.push(Bx { v: "p" })
+    io.println(get(bs.get(0).unwrap()))
+    let mut ls = []
+    ls.push([1, 2])
+    match ls.get(0).unwrap() {
+        [x, y] => io.println("{x + y}")
+        _ => io.println("0")
+    }
+    let cl = fn() { [E.L(5), E.N] }
+    match cl() {
+        [E.L(x), _] => io.println("{x}")
+        _ => io.println("0")
+    }
+    match c() {
+        E.L(true) | E.N => io.println("y")
+        E.L(false) => io.println("n")
+    }
+    match xs.get(0).unwrap() {
+        whole as E.L(n) => match whole {
+            E.L(m) => io.println("{n + m}")
+            E.N => io.println("n")
+        }
+        E.N => io.println("n")
+    }
+    let d = fn() { (E.L("s"), Bx { v: 3 }) }
+    let (dp, dq) = d()
+    match dp {
+        E.L(s) => io.println("{s} {dq.v}")
+        E.N => io.println("n")
+    }
+}
+"#
+}
+
+test "each inferred instance form builds and runs in each build mode" {
+    let root = "{scratch_root()}/inferred_instance_pattern_{getpid()}"
+    let _ = sh("rm -rf {root} && mkdir -p {root}")
+    fs.write("{root}/main.bl", src()).unwrap()
+    let blink = sh("readlink -f build/blink").out.trim()
+    let want = "true\n7\n1\n2\n3\ns\nfalse\n4\n5\n6\n1 a\ng\ng\n7\np\n3\n5\ny\n8\ns 3\n"
+    let mut failed: List[Str] = []
+    for mode in ["--no-per-module", "--per-module"] {
+        let r = sh("cd {root} && env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE timeout 300 {blink} run {mode} main.bl < /dev/null")
+        if !r.success() || r.out != want { failed.push("blink run {mode}: {r.end}\n{r.out}\n{r.err_out}") }
+    }
+    let _ = sh("rm -rf {root}")
+    assert_eq(failed, [])
+}
