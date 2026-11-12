@@ -1,0 +1,57 @@
+// A module may declare a type that takes a prelude type's name (sections/07_trust_modules_metadata.md
+// §10.6). The declaration shadows the prelude type in that module only: the std modules that read
+// the prelude `Ordering` (std.traits, std.list) still find their own. Check, the one-unit build
+// and the per-module build agree.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> ProcessResult ! Process.Spawn {
+    process.run("sh", ["-c", cmd]).unwrap()
+}
+
+// The corpus sets these for its own builds; the child must build the package as a user would.
+fn blink_in(dir: Str, args: Str) -> ProcessResult ! Process.Spawn {
+    let clear = "env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE"
+    sh("B=$(pwd)/build/blink; cd {dir} && {clear} BLINK_BIN=$B timeout 120 $B {args} src/main.bl < /dev/null 2>&1")
+}
+
+let ALPHA = #"
+pub type Ordering {
+    Up
+    Down
+}
+
+pub fn make_a() -> Int {
+    match Ordering.Up {
+        Up => 1
+        Down => 2
+    }
+}
+"#
+
+let MAIN = #"
+import alpha.{make_a}
+
+fn main() {
+    io.println("{make_a()}")
+}
+"#
+
+test "a user module's own Ordering leaves std the prelude Ordering" {
+    let dir = sh("mktemp -d /tmp/blink_user_ordering.XXXXXX").out.trim()
+    let _ = sh("mkdir -p {dir}/src")
+    fs.write("{dir}/blink.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\n").unwrap()
+    fs.write("{dir}/src/alpha.bl", ALPHA).unwrap()
+    fs.write("{dir}/src/main.bl", MAIN).unwrap()
+    let mut ok = true
+    for args in ["check", "run --no-per-module", "run --per-module"] {
+        let r = blink_in(dir, args)
+        let good = r.success() && !r.out.contains("error") && (args == "check" || r.out.trim().ends_with("1"))
+        if !good {
+            io.eprintln("blink {args}: {r.end}\n{r.out}")
+            ok = false
+        }
+    }
+    let _ = sh("rm -rf {dir}")
+    assert(ok)
+}

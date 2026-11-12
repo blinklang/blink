@@ -1,0 +1,245 @@
+// `import blink.core.{Bytes as CoreBytes}` binds the alias to the compiler-known type
+// (sections/07_trust_modules_metadata.md §10.6), so a Map key or Set element written through the
+// alias is hashable exactly when the builtin is (sections/03_types.md, *Hash Contract and
+// Seeding*: Bytes, StringBuilder and every container have no Hash and cannot gain one, E1400).
+// The key check read the written name, which spells no builtin, no declaration and no alias, so
+// it passed the key and the build then had no key operations for it.
+import std.fs
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_reset}
+import std.io
+
+let PROBE = "build/tc_renamed_core_key_probe.bl"
+
+fn probe(src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    fs.write(PROBE, src).unwrap()
+    diag_reset()
+    let program = compile_to_program(PROBE, 1)
+    check_types(program)
+    let _ = fs.delete(PROBE)
+}
+
+fn entries() -> List[Str] {
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" {
+            out.push("{d.name} {d.code} {d.line}:{d.col}: {d.message} | help: {d.help}")
+        }
+    }
+    out
+}
+
+fn show(label: Str) ! IO.Eprint {
+    io.eprintln("FAIL: {label}: got:")
+    for e in entries() { io.eprintln("  {e}") }
+}
+
+let KEY = "MapKeyNotHashable E1400"
+let ELEM_HELP = "help: use a hashable scalar (Int/sized-int/Bool/Char/Str), a tuple of hashable types, or a @derive(Hash, Eq) struct/enum as the element instead"
+let KEY_HELP = "help: use a hashable scalar (Int/sized-int/Bool/Char/Str), a tuple of hashable types, or a @derive(Hash, Eq) struct/enum as the key instead"
+
+// Exactly one error: E1400 at line:col, its message names what the source wrote and the builtin
+// it means, and its help is the one the written builtin gets.
+fn expect_one(label: Str, line: Int, col: Int, written: Str, builtin: Str, help: Str) ! IO.Eprint {
+    let errs = entries()
+    let mut ok = errs.len() == 1
+    if ok {
+        let e = errs.get(0).unwrap()
+        let named = e.contains("`{written}` does not implement Hash") && e.contains("{builtin} has no Hash")
+        ok = e.starts_with("{KEY} {line}:{col}: ") && named && e.ends_with(help)
+    }
+    if !ok {
+        io.eprintln("want: {KEY} {line}:{col}: ...`{written}`...{builtin} has no Hash...")
+        show(label)
+    }
+    assert(ok)
+}
+
+fn expect_clean(label: Str) ! IO.Eprint {
+    let ok = entries().len() == 0
+    if !ok { show(label) }
+    assert(ok)
+}
+
+// ── Refused: the builtin the alias names has no Hash ──────────────────────────────────
+
+test "a Set element written through a renamed Bytes import is refused" {
+    probe("import blink.core.\{Bytes as CoreBytes}\nfn main() \{\n    let s: Set[CoreBytes] = Set()\n    io.println(\"\{s.len()}\")\n}\n")
+    expect_one("Set[CoreBytes]", 3, 25, "CoreBytes", "Bytes", ELEM_HELP)
+}
+
+test "a Map key written through a renamed Bytes import is refused" {
+    probe("import blink.core.\{Bytes as CoreBytes}\nfn main() \{\n    let mut m: Map[CoreBytes, Int] = Map()\n    m.insert(CoreBytes.new(), 1)\n    io.println(\"\{m.len()}\")\n}\n")
+    expect_one("Map[CoreBytes, Int]", 3, 29, "CoreBytes", "Bytes", KEY_HELP)
+}
+
+test "a renamed Bytes import inside a tuple key is refused" {
+    probe("import blink.core.\{Bytes as CoreBytes}\nfn main() \{\n    let s: Set[(Int, CoreBytes)] = Set()\n    io.println(\"\{s.len()}\")\n}\n")
+    expect_one("Set[(Int, CoreBytes)]", 3, 31, "CoreBytes", "Bytes", ELEM_HELP)
+}
+
+test "a renamed Option import is refused as a Set element" {
+    probe("import blink.core.\{Option as CoreOption}\nfn main() \{\n    let s: Set[CoreOption[Int]] = Set()\n    io.println(\"\{s.len()}\")\n}\n")
+    expect_one("Set[CoreOption[Int]]", 3, 31, "CoreOption", "Option", ELEM_HELP)
+}
+
+test "a renamed StringBuilder import is refused as a Map key" {
+    probe("import blink.core.\{StringBuilder as SB}\nfn main() \{\n    let m: Map[SB, Int] = Map()\n    io.println(\"\{m.len()}\")\n}\n")
+    expect_one("Map[SB, Int]", 3, 18, "SB", "StringBuilder", KEY_HELP)
+}
+
+test "a renamed List import is refused as a Map key" {
+    probe("import blink.core.\{List as CoreList}\nfn main() \{\n    let m: Map[CoreList[Int], Int] = Map()\n    io.println(\"\{m.len()}\")\n}\n")
+    expect_one("Map[CoreList[Int], Int]", 3, 29, "CoreList", "List", KEY_HELP)
+}
+
+test "a renamed Bytes import is refused in a parameter, a field and a constructor" {
+    probe("import blink.core.\{Bytes as CoreBytes}\nfn f(s: Set[CoreBytes]) -> Int \{ s.len() }\nfn main() \{ io.println(\"x\") }\n")
+    expect_one("fn f(s: Set[CoreBytes])", 2, 22, "CoreBytes", "Bytes", ELEM_HELP)
+    probe("import blink.core.\{Bytes as CoreBytes}\ntype W \{ s: Set[CoreBytes] }\nfn main() \{ io.println(\"x\") }\n")
+    expect_one("type W \{ s: Set[CoreBytes] }", 2, 26, "CoreBytes", "Bytes", ELEM_HELP)
+    probe("import blink.core.\{Bytes as CoreBytes}\nfn main() \{\n    let s = Set[CoreBytes]()\n    io.println(\"\{s.len()}\")\n}\n")
+    expect_one("Set[CoreBytes]()", 3, 26, "CoreBytes", "Bytes", ELEM_HELP)
+}
+
+// The alias names the builtin even where the module declares the plain name, so the local
+// declaration does not answer for the key (§10.6 *Shadowing Rules*).
+test "a renamed Bytes import is the builtin next to a local type Bytes" {
+    probe("import blink.core.\{Bytes as CoreBytes}\n@derive(Hash, Eq)\ntype Bytes \{ x: Int }\nfn main() \{\n    let s: Set[CoreBytes] = Set()\n    let t: Set[Bytes] = Set()\n    io.println(\"\{s.len()} \{t.len()}\")\n}\n")
+    expect_one("Set[CoreBytes] beside a local Bytes", 5, 25, "CoreBytes", "Bytes", ELEM_HELP)
+}
+
+// ── Refused: a renamed Map or Set in a type argument or in a generic declaration ─────
+
+let FLOAT_KEY = "help: round the key to an Int (or another integer width) before inserting"
+let FLOAT_ELEM = "help: round the value to an Int (or another integer width) before inserting"
+
+// Exactly one error: E1400 at line:col for a Float key, with the written builtin's help.
+fn expect_float(label: Str, line: Int, col: Int, help: Str) ! IO.Eprint {
+    let errs = entries()
+    let mut ok = errs.len() == 1
+    if ok {
+        let e = errs.get(0).unwrap()
+        ok = e.starts_with("{KEY} {line}:{col}: ") && e.contains("`Float` is not hashable") && e.ends_with(help)
+    }
+    if !ok {
+        io.eprintln("want: {KEY} {line}:{col}: ...`Float` is not hashable...")
+        show(label)
+    }
+    assert(ok)
+}
+
+let BOX_MAP = "type Box[T] \{ v: T }\nfn main() \{\n    let b: Box[X[Float, Int]] = Box \{ v: Map() }\n    io.println(\"\{b.v.len()}\")\n}\n"
+let BOX_SET = "type Box[T] \{ v: T }\nfn main() \{\n    let b: Box[X[Float]] = Box \{ v: Set() }\n    io.println(\"\{b.v.len()}\")\n}\n"
+let HOLDER_SET = "type Holder[T] \{ items: X[T] }\nfn main() \{\n    let h: Holder[Float] = Holder \{ items: Set() }\n    io.println(\"\{h.items.len()}\")\n}\n"
+
+test "a renamed Map or Set as a type argument of a user generic is refused" {
+    probe("import blink.core.\{Map as CMap}\n{BOX_MAP.replace("X", "CMap")}")
+    expect_float("Box[CMap[Float, Int]]", 4, 26, FLOAT_KEY)
+    probe("import blink.core.\{Set as CSet}\n{BOX_SET.replace("X", "CSet")}")
+    expect_float("Box[CSet[Float]]", 4, 26, FLOAT_ELEM)
+}
+
+test "a generic type that holds its parameter in a renamed Map or Set refuses a Float argument" {
+    probe("import blink.core.\{Set as CSet}\n{HOLDER_SET.replace("X", "CSet")}")
+    expect_float("Holder[Float] over items: CSet[T]", 4, 24, FLOAT_ELEM)
+    probe("import blink.core.\{Map as CMap}\ntype MH[T] \{ m: CMap[T, Int] }\nfn main() \{\n    let g: MH[Float] = MH \{ m: Map() }\n    io.println(\"\{g.m.len()}\")\n}\n")
+    expect_float("MH[Float] over m: CMap[T, Int]", 4, 20, FLOAT_KEY)
+    probe("import blink.core.\{Set as CSet}\ntype W[T] = CSet[T]\nfn main() \{\n    let w: W[Float] = Set()\n    io.println(\"\{w.len()}\")\n}\n")
+    expect_float("W[Float] over type W[T] = CSet[T]", 4, 19, FLOAT_ELEM)
+}
+
+// ── Accepted: a hashable key in a module that renames a core import ───────────────────
+
+test "a renamed core import as a Map value next to a hashable key is clean" {
+    probe("import blink.core.\{Bytes as CoreBytes}\nimport blink.core.\{List as CoreList}\nfn main() \{\n    let mut m: Map[Str, CoreBytes] = Map()\n    m.insert(\"a\", CoreBytes.new())\n    let n: Map[(Int, Str), CoreList[Int]] = Map()\n    io.println(\"\{m.len()} \{n.len()}\")\n}\n")
+    expect_clean("Map[Str, CoreBytes], Map[(Int, Str), CoreList[Int]]")
+}
+
+let BOUNDS = #"
+import blink.core.{Bytes as CoreBytes}
+trait Key: Hash + Eq {}
+impl Key for Str {}
+trait Cnt { fn cnt(self) -> Int }
+type Hold[K] { m: List[K] }
+fn a[K: Hash + Eq](m: Map[K, CoreBytes]) -> Int { m.len() }
+impl[K] Cnt for Hold[K] where K: Hash + Eq {
+    fn cnt(self) -> Int {
+        let s: Map[K, CoreBytes] = Map()
+        s.len()
+    }
+}
+fn c[K: Key](m: Map[K, CoreBytes]) -> Int { m.len() }
+fn main() {
+    let m: Map[Str, CoreBytes] = Map()
+    let h = Hold { m: [1] }
+    io.println("{a(m)} {c(m)} {h.cnt()}")
+}
+"#
+
+test "a key type parameter bound inline, in a where clause or through a supertrait is clean" {
+    probe(BOUNDS)
+    expect_clean("inline, where and supertrait bounds")
+}
+
+// ── Property: the alias gives what the written builtin gives ──────────────────────────
+
+// Each report as name, code, line, message and help; the column is left out because the two
+// spellings differ in length. The alias report reads the builtin's name where it shows the alias.
+fn reports(alias: Str, builtin: Str) -> List[Str] {
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" {
+            let msg = d.message.replace("`{alias}`", "`{builtin}`")
+            out.push("{d.name} {d.code} {d.line}: {msg} | help: {d.help}")
+        }
+    }
+    out
+}
+
+// `body` is a program with `X` where the type name goes. The written form imports nothing, and
+// the alias form imports on the line a comment fills in the other, so every report has the same
+// line in both. The two must agree, refused or accepted.
+fn same_as_written_in(label: Str, body: Str, alias: Str, builtin: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    probe("// no import\n{body.replace("X", builtin)}")
+    let written = reports(alias, builtin)
+    probe("import blink.core.\{{builtin} as {alias}}\n{body.replace("X", alias)}")
+    let renamed = reports(alias, builtin)
+    let ok = renamed == written
+    if !ok {
+        io.eprintln("FAIL: {label} with X = {alias} vs {builtin}")
+        io.eprintln("  written:")
+        for e in written { io.eprintln("    {e}") }
+        io.eprintln("  renamed:")
+        for e in renamed { io.eprintln("    {e}") }
+    }
+    assert(ok)
+}
+
+// `ty` is the key type with `X` where the type name goes, as `Set[(Int, X)]`.
+fn same_as_written(ty: Str, alias: Str, builtin: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    same_as_written_in(ty, "fn main() \{\n    let s: {ty} = {ty}()\n    io.println(\"\{s.len()}\")\n}\n", alias, builtin)
+}
+
+test "a key through a renamed core import gets what the written builtin gets" {
+    same_as_written("Set[X]", "CoreBytes", "Bytes")
+    same_as_written("Set[X[Int]]", "CoreOption", "Option")
+    same_as_written("Map[X, Int]", "SB", "StringBuilder")
+    same_as_written("Set[X]", "CoreNever", "Never")
+    same_as_written("Map[X[Int], Int]", "CoreList", "List")
+    same_as_written("Set[(Int, X)]", "CoreBytes", "Bytes")
+}
+
+// Ordering and ConversionError are declared by the prelude, so the alias reaches that
+// declaration, as the written name does.
+test "a renamed prelude-declared type gets what the written name gets" {
+    same_as_written("Set[X]", "Ord", "Ordering")
+    same_as_written("Map[X, Int]", "CE", "ConversionError")
+}
+
+test "a renamed Map or Set as a type argument gets what the written builtin gets" {
+    same_as_written_in("Box[X[Float, Int]]", BOX_MAP, "CMap", "Map")
+    same_as_written_in("Box[X[Float]]", BOX_SET, "CSet", "Set")
+    same_as_written_in("type Holder[T] \{ items: X[T] }", HOLDER_SET, "CSet", "Set")
+}
