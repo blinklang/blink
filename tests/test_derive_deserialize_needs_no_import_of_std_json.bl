@@ -1,0 +1,208 @@
+// Serialize and Deserialize are compiler-known traits, so @derive(Deserialize) needs no
+// import (sections/03_types.md 3.6.2, sections/07_trust_modules_metadata.md 10.6 and 10.7.1).
+// std.json is a layer on top of the derive: a program that derives Deserialize builds and
+// runs with or without `import std.json`, in the one-unit and the per-module build, and in a
+// package where no module imports it. Loading std.json for the derive does not import it, so
+// a bare `json.` call still needs the import.
+
+import std.fs
+import std.process.{ProcessResult}
+import compile_test_helpers.{scratch_root}
+
+fn sh(cmd: Str) -> ProcessResult ! Process.Spawn {
+    process.run("sh", ["-c", cmd]).unwrap()
+}
+
+fn clean_env() -> Str {
+    "env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE"
+}
+
+fn blink_path() -> Str ! Process.Spawn {
+    sh("readlink -f build/blink").out.trim()
+}
+
+// `blink check` and `blink run` in each build mode; each failure is one line of the answer.
+fn check_and_run(blink: Str, dir: Str, file: Str, want: Str) -> List[Str] ! Process.Spawn {
+    let mut failed: List[Str] = []
+    let c = sh("cd {dir} && {clean_env()} timeout 300 {blink} check {file} < /dev/null")
+    if !c.success() { failed.push("blink check {file}: {c.end}\n{c.out}\n{c.err_out}") }
+    for mode in ["--no-per-module", "--per-module"] {
+        let r = sh("cd {dir} && {clean_env()} timeout 300 {blink} run {mode} {file} < /dev/null")
+        if !r.success() || r.out != want { failed.push("blink run {mode} {file}: {r.end}\n{r.out}\n{r.err_out}") }
+    }
+    failed
+}
+
+fn expect_none(failed: List[Str]) {
+    assert(failed.len() == 0, failed.join("\n---\n"))
+}
+
+fn fresh_dir(name: Str) -> Str ! Process.Spawn, Env.Read {
+    let root = "{scratch_root()}/derive_de_no_import_{name}_{getpid()}"
+    let _ = sh("rm -rf {root} && mkdir -p {root}")
+    root
+}
+
+fn one_file(name: Str, src: Str, want: Str) -> List[Str] ! Process.Spawn, Env.Read, FS.Write {
+    let root = fresh_dir(name)
+    fs.write("{root}/main.bl", src).unwrap()
+    let failed = check_and_run(blink_path(), root, "main.bl", want)
+    let _ = sh("rm -rf {root}")
+    failed
+}
+
+fn struct_decl() -> Str {
+    "@derive(Deserialize)\ntype Pl \{ x: Int }\n"
+}
+
+fn read_main() -> Str {
+    #"fn main() {
+    match Pl.from_json("\{\"x\": 7}") {
+        Ok(p) => io.println("{p.x}")
+        Err(e) => io.println("err {e}")
+    }
+}
+"#
+}
+
+test "a derive of Deserialize with no import and no call builds and runs" {
+    let src = "{struct_decl()}fn main() \{ io.println(\"n\") }\n"
+    expect_none(one_file("nocall", src, "n\n"))
+}
+
+test "a derived from_json with no import reads a value" {
+    expect_none(one_file("call", "{struct_decl()}{read_main()}", "7\n"))
+}
+
+test "a struct that derives both traits round-trips with no import" {
+    let src = #"@derive(Serialize, Deserialize)
+type Pl { x: Int, name: Str }
+fn main() {
+    let j = Pl { x: 3, name: "a" }.to_json()
+    io.println(j)
+    match Pl.from_json(j) {
+        Ok(p) => io.println("{p.x} {p.name}")
+        Err(e) => io.println("err {e}")
+    }
+}
+"#
+    expect_none(one_file("both", src, "\{\"x\":3,\"name\":\"a\"}\n3 a\n"))
+}
+
+test "an enum that derives both traits round-trips with no import" {
+    let src = #"@derive(Serialize, Deserialize)
+type Sh {
+    Circle(r: Int)
+    Dot
+}
+fn main() {
+    match Sh.from_json(Sh.Circle(4).to_json()) {
+        Ok(Sh.Circle(r)) => io.println("circle {r}")
+        Ok(Sh.Dot) => io.println("dot")
+        Err(e) => io.println("err {e}")
+    }
+    match Sh.from_json(Sh.Dot.to_json()) {
+        Ok(Sh.Circle(r)) => io.println("circle {r}")
+        Ok(Sh.Dot) => io.println("dot")
+        Err(e) => io.println("err {e}")
+    }
+}
+"#
+    expect_none(one_file("enum", src, "circle 4\ndot\n"))
+}
+
+test "a derived from_json still reads a value with a whole, a selective or an aliased import" {
+    let mut failed = one_file("whole", "import std.json\n{struct_decl()}{read_main()}", "7\n")
+    for f in one_file("selective", "import std.json.\{json_parse}\n{struct_decl()}{read_main()}", "7\n") { failed.push(f) }
+    for f in one_file("aliased", "import std.json as j\n{struct_decl()}{read_main()}", "7\n") { failed.push(f) }
+    expect_none(failed)
+}
+
+test "a derive of Deserialize through an alias reads a value with no import of std.json" {
+    let src = "import blink.core.\{Deserialize as De}\n@derive(De)\ntype Pl \{ x: Int }\n{read_main()}"
+    expect_none(one_file("alias_derive", src, "7\n"))
+}
+
+// The import gives Deserialize the name of another derivable trait, so the derive argument
+// alone does not show that the program reads JSON.
+test "a derive of Deserialize through an alias named like another derivable trait reads a value" {
+    let src = "import blink.core.\{Deserialize as Eq}\n@derive(Eq)\ntype Pl \{ x: Int }\n{read_main()}"
+    expect_none(one_file("alias_other", src, "7\n"))
+}
+
+test "a derive spelled Deserialize that an alias makes Eq still derives Eq" {
+    let src = #"import blink.core.{Eq as Deserialize}
+@derive(Deserialize)
+type Pl { x: Int }
+fn main() {
+    let b = Pl { x: 1 } == Pl { x: 1 }
+    io.println("{b}")
+}
+"#
+    expect_none(one_file("alias_eq", src, "true\n"))
+}
+
+test "a derive of Serialize alone builds and runs with no import" {
+    let src = "@derive(Serialize)\ntype Pl \{ x: Int }\nfn main() \{ io.println(Pl \{ x: 3 }.to_json()) }\n"
+    expect_none(one_file("ser", src, "\{\"x\":3}\n"))
+}
+
+fn lib_src() -> Str {
+    #"@derive(Deserialize)
+pub type Pl { x: Int }
+pub fn read(s: Str) -> Int {
+    match Pl.from_json(s) {
+        Ok(p) => p.x
+        Err(_) => -1
+    }
+}
+"#
+}
+
+fn package_run(name: Str, main_src: Str, want: Str) -> List[Str] ! Process.Spawn, Env.Read, FS.Write {
+    let root = fresh_dir(name)
+    let _ = sh("mkdir -p {root}/src")
+    fs.write("{root}/blink.toml", "[package]\nname = \"m\"\nversion = \"0.1.0\"\n").unwrap()
+    fs.write("{root}/src/lib.bl", lib_src()).unwrap()
+    fs.write("{root}/src/main.bl", main_src).unwrap()
+    let failed = check_and_run(blink_path(), root, "src/main.bl", want)
+    let _ = sh("rm -rf {root}")
+    failed
+}
+
+test "a package module that derives Deserialize builds when no module imports std.json" {
+    let main_src = #"import lib
+fn main() {
+    let n = lib.read("\{\"x\": 9}")
+    io.println("{n}")
+}
+"#
+    expect_none(package_run("pkg_none", main_src, "9\n"))
+}
+
+test "a package module that derives Deserialize builds when only main imports std.json" {
+    let main_src = #"import std.json
+import lib
+fn main() {
+    let n = lib.read("\{\"x\": 9}")
+    let root = json.json_parse("1")
+    io.println("{n} {root}")
+}
+"#
+    expect_none(package_run("pkg_main", main_src, "9 2\n"))
+}
+
+test "a derive of Deserialize does not put the json module in scope" {
+    let root = fresh_dir("scope")
+    let src = #"fn main() {
+    let r = json.json_parse("1")
+    io.println("{r}")
+}
+"#
+    fs.write("{root}/main.bl", "{struct_decl()}{src}").unwrap()
+    let c = sh("cd {root} && {clean_env()} timeout 300 {blink_path()} check main.bl < /dev/null")
+    let _ = sh("rm -rf {root}")
+    let text = "{c.out}{c.err_out}"
+    assert(!c.success(), text)
+    assert(text.contains("error[UndefinedVariable]: undefined variable `json`"), text)
+}
