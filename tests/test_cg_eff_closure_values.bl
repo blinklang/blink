@@ -20,12 +20,13 @@ import cg_test_helpers.{
     cg_ice_count, cg_ices_mentioning, cg_probe_compile, cg_report_ices,
 }
 import ast.{NodeKind}
-import parser.{node_value}
+import parser.{node_params, node_value}
 import layout.{bind_binder_mut, binder_scope_pop, binder_scope_push, current_binder_scope, layout_reset, tid_of_binder}
 import ir.{IrKind, ir_c_name, ir_kid_count, ir_kind, ir_reset, ir_verify}
 import cg_reg.{cg_reg_build}
 import cg_expr.{cg_expr_reset}
-import cg_stmt.{cg_local_c_name, cg_stmt_reset, lower_block_returning}
+import cg_stmt.{cg_stmt_reset, lower_block_returning}
+import cname.{c_local_name, c_local_name_nth, c_param_name}
 import cg_eff.{
     cg_eff_lower_closure, cg_eff_pending_thunks, cg_eff_reset, cg_eff_thunk_body_node,
     cg_eff_thunk_close, cg_eff_thunk_open, cg_eff_thunk_params, cg_eff_thunk_ret,
@@ -104,6 +105,11 @@ fn two_params() -> Int {
     g_two(7, "ab")
 }
 
+fn blank_params() -> Int {
+    let g_blanks = fn(_: Int, _: Int) -> Int { 9 }
+    g_blanks(1, 2)
+}
+
 fn no_result() -> Int ! IO.Print {
     let g_void = fn(x: Int) { io.println("{x}") }
     g_void(8)
@@ -140,6 +146,7 @@ fn main() {
     io.println("{body_with()}")
     io.println("{body_nested()}")
     io.println("{two_params()}")
+    io.println("{blank_params()}")
     io.println("{no_result()}")
     io.println("{reads_enclosing()}")
     io.println("{shadows_enclosing()}")
@@ -343,8 +350,21 @@ test "the thunk signature is spelled from the closure's own type" {
     assert_eq(ps.len(), 2)
     // The body reads a parameter through the expression stage, which spells a local one
     // way only, so the declaration has to spell it the same way.
-    assert_eq_str("first param", ps.get(0).unwrap(), "int64_t {cg_local_c_name("a")}")
-    assert_eq_str("second param", ps.get(1).unwrap(), "const char* {cg_local_c_name("b")}")
+    assert_eq_str("first param", ps.get(0).unwrap(), "int64_t {c_local_name("a")}")
+    assert_eq_str("second param", ps.get(1).unwrap(), "const char* {c_local_name("b")}")
+}
+
+test "each underscore parameter of a thunk takes a C local of its own" {
+    setup()
+    let lit = closure_of("g_blanks")
+    let _ = cg_eff_lower_closure(lit)
+    let ps = cg_eff_thunk_params(0)
+    assert_eq(ps.len(), 2)
+    // `_` binds no name the body reads, but C declares each parameter, and one name twice
+    // is a redefinition.
+    assert_eq_str("first blank", ps.get(0).unwrap(), "int64_t {c_local_name("_")}")
+    assert_eq_str("second blank", ps.get(1).unwrap(), "int64_t {c_local_name_nth("_", 1)}")
+    assert_eq_str("the name the binder takes", c_param_name(node_params(lit), 1), c_local_name_nth("_", 1))
 }
 
 test "a closure that declares no result returns nothing" {

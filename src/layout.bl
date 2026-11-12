@@ -23,12 +23,12 @@ import parser.{
 }
 import ast.{NodeKind}
 import mono.{instances, node_tid_for_inst}
-import diagnostics.{diag_ice_at, diag_is_ice_seg, UNSOLVED_TYPEVAR_AT_CODEGEN}
+import diagnostics.{diag_ice_at, diag_is_ice_seg, POISONED_IR_AT_SEAM, UNSOLVED_TYPEVAR_AT_CODEGEN}
 import cname.{
     c_typedef_name, c_type_decl_name, c_seg_inner, c_tuple_member, c_vtable_type_name, c_kops_table_name,
     td_guard_open_lines, td_guard_close_line, td_forward_guard_name, td_forward_decl_lines, cname_reset, cname_mark_transparent_newtype,
     cname_mark_runtime_owned, cname_is_transparent_newtype, cname_is_runtime_owned, c_gc_layout_name,
-    c_gc_layout_head, c_field_name,
+    c_gc_layout_head, c_field_name, c_local_name_nth,
 }
 
 pub type Position { Local, Field, Param, Return, ContainerSlot, VtableSlot, TupleElem }
@@ -75,10 +75,21 @@ let mut binder_frame_alive: List[Int] = []
 let mut binder_frame_start: List[Int] = []
 let mut binder_frame_stack: List[Int] = []
 let mut binder_entries: List[BinderEntry] = []
-// The newest live entry with each name. With BinderEntry.prev it makes each name's live
-// entries a chain, newest first, so a lookup reads only the entries that carry its name:
-// it costs the name's shadow count rather than every live entry of every frame it walks.
-let mut binder_name_top: Map[Str, Int] = Map()
+let mut binder_names: BinderNames = BinderNames { top: Map(), c_uses: Map() }
+
+// `top` holds the newest live entry with each name. With BinderEntry.prev it makes each
+// name's live entries a chain, newest first, so a lookup reads only the entries that carry
+// its name: it costs the name's shadow count rather than every live entry of every frame
+// it walks.
+//
+// `c_uses` holds how many binders of each name the C function being lowered has declared.
+// Dead frames count too: C scopes are not Blink scopes (a sibling block, a loop body
+// printed once and a `let` whose initialiser reads the name it shadows all meet in one C
+// function), so a C name is never given twice in one function.
+type BinderNames {
+    top: Map[Str, Int]
+    c_uses: Map[Str, Int]
+}
 
 // `acyclic` holds lo_acyclic per resolved tid; `embeds` holds lo_embeds_tid per
 // "owner field" pair of resolved tids.
@@ -146,6 +157,8 @@ type BinderEntry {
     cell: Int
     // The next older live entry with the same name, or -1.
     prev: Int
+    // The C local this binder is declared and read as. Unique within its C function.
+    c_name: Str
 }
 
 // check_types rebuilds the type pool, so every cached answer is stale after it. The
@@ -162,7 +175,7 @@ pub fn layout_reset() {
     binder_frame_start = []
     binder_frame_stack = []
     binder_entries = []
-    binder_name_top = Map()
+    binder_names = BinderNames { top: Map(), c_uses: Map() }
     lo_current_inst = -1
 }
 
@@ -628,21 +641,22 @@ fn lo_spec_is_unsigned(k: TyKind) -> Bool {
 // ── Binder scopes ─────────────────────────────────────────────────────────
 
 pub fn binder_scope_push() -> Int {
-    let id = binder_frame_parent.len()
-    let parent = if binder_frame_stack.len() > 0 { binder_frame_stack.get(binder_frame_stack.len() - 1).unwrap() } else { -1 }
-    binder_frame_parent.push(parent)
-    binder_frame_start.push(binder_entries.len())
-    binder_frame_alive.push(1)
-    binder_frame_stack.push(id)
-    id
+    binder_scope_push_under(current_binder_scope())
 }
 
 // A frame that sees no binder of the frames around it, for an expression written somewhere
 // else, such as a default, whose names must not read the locals where it is lowered. It is
 // popped with binder_scope_pop like any other frame.
 pub fn binder_scope_push_detached() -> Int {
+    binder_scope_push_under(-1)
+}
+
+// A frame that sees the binders of `parent` and the frames around it, but none of the
+// frames opened inside `parent` since. A contract check at a return reads the parameters
+// this way and never a body local that shadows one. It is popped like any other frame.
+pub fn binder_scope_push_under(parent: Int) -> Int {
     let id = binder_frame_parent.len()
-    binder_frame_parent.push(-1)
+    binder_frame_parent.push(parent)
     binder_frame_start.push(binder_entries.len())
     binder_frame_alive.push(1)
     binder_frame_stack.push(id)
@@ -659,9 +673,9 @@ pub fn binder_scope_pop() {
     while binder_entries.len() > start {
         let e = binder_entries.get(binder_entries.len() - 1).unwrap()
         if e.prev < 0 {
-            binder_name_top.remove(e.name)
+            binder_names.top.remove(e.name)
         } else {
-            binder_name_top.insert(e.name, e.prev)
+            binder_names.top.insert(e.name, e.prev)
         }
         binder_entries.pop()
     }
@@ -695,14 +709,53 @@ pub fn bind_binder_cell(scope: Int, name: Str, tid: Int) {
 fn lo_bind(scope: Int, name: Str, tid: Int, m: BinderMut, cell: Int) {
     if scope < 0 || scope >= binder_frame_alive.len() { return }
     if binder_frame_alive.get(scope).unwrap() == 0 { return }
-    let prev = binder_name_top.get(name) ?? -1
-    binder_name_top.insert(name, binder_entries.len())
-    binder_entries.push(BinderEntry { frame: scope, name: name, tid: tid, mutability: m, cell: cell, prev: prev })
+    let prev = binder_names.top.get(name) ?? -1
+    let uses = binder_names.c_uses.get(name) ?? 0
+    binder_names.c_uses.insert(name, uses + 1)
+    binder_names.top.insert(name, binder_entries.len())
+    binder_entries.push(BinderEntry {
+        frame: scope, name: name, tid: tid, mutability: m, cell: cell, prev: prev,
+        c_name: c_local_name_nth(name, uses),
+    })
+}
+
+// A new C function starts: its binders count from zero, so its first binder of each name
+// takes the bare C name. Each caller is the root of one C function's lowering. The answer
+// is the count of the function this one interrupts, for binder_c_names_resume: the module
+// init function lowers the closures of one global before the next global's initialiser.
+pub fn binder_c_names_begin() -> Map[Str, Int] {
+    let outer = binder_names.c_uses
+    binder_names.c_uses = Map()
+    outer
+}
+
+pub fn binder_c_names_resume(outer: Map[Str, Int]) {
+    binder_names.c_uses = outer
+}
+
+// The C local of the binder this name resolves to from this scope, or "" if none does.
+// Every declaration and every read of a binder spells it through here, so the two agree.
+pub fn binder_c_name_of(scope: Int, name: Str) -> Str {
+    let entry = lo_binder_entry(scope, name)
+    if entry < 0 { return "" }
+    binder_entries.get(entry).unwrap().c_name
+}
+
+// binder_c_name_of for a name the caller holds is a local: a miss is a compiler bug,
+// reported here, and the answer is "" for the caller to stop on or step past.
+pub fn binder_c_local_name(scope: Int, name: Str, at: Int) -> Str ! Diag.Report {
+    let c = binder_c_name_of(scope, name)
+    if c.is_empty() {
+        diag_ice_at("BinderHasNoCName", POISONED_IR_AT_SEAM,
+            "`{name}` is read or declared as a local, but no binder in scope answers for it", at,
+            "every local is bound in an open frame before it is declared or read; this is a compiler bug")
+    }
+    c
 }
 
 // The entry a name resolves to from this scope, or -1.
 fn lo_binder_entry(scope: Int, name: Str) -> Int {
-    let newest = binder_name_top.get(name) ?? -1
+    let newest = binder_names.top.get(name) ?? -1
     let mut frame = scope
     while frame >= 0 && frame < binder_frame_parent.len() {
         if binder_frame_alive.get(frame).unwrap() == 0 { return -1 }

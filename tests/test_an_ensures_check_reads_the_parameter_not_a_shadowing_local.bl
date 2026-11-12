@@ -1,0 +1,103 @@
+// An `@ensures` predicate reads `result` and the parameters (sections/02_syntax.md §2.17).
+// A body may bind a parameter's name again (§2.2), but the check at each exit still reads
+// the parameter, never the body's local of that name. Both builds must run each program.
+
+import compile_test_helpers
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> ProcessResult ! Process.Spawn {
+    process.run("sh", ["-c", cmd]).unwrap()
+}
+
+fn run_both(tag: Str, lines: List[Str]) -> List[ProcessResult] ! FS.Write, Process.Spawn, Env.Read {
+    let dir = "{compile_test_helpers.scratch_root()}/ensures_{tag}"
+    let _ = sh("rm -rf {dir} && mkdir -p {dir}")
+    fs.write("{dir}/x.bl", lines.join("\n").concat("\n")).unwrap()
+    let mut out: List[ProcessResult] = []
+    for mode in ["--per-module", "--no-per-module"] {
+        out.push(sh("B=$(pwd)/build/blink; cd {dir} && env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE timeout 120 $B run {mode} x.bl < /dev/null"))
+    }
+    let _ = sh("rm -rf {dir}")
+    out
+}
+
+fn expect_prints(tag: Str, lines: List[Str], want: Str) ! IO, FS.Write, Process.Spawn, Env.Read {
+    let mut bad = 0
+    for r in run_both(tag, lines) {
+        if !r.success() || r.out.trim() != want {
+            io.eprintln("{tag}: ended {r.end}, printed [{r.out.trim()}], want [{want}]\n{r.err_out}")
+            bad = bad + 1
+        }
+    }
+    assert_eq(bad, 0)
+}
+
+fn expect_contract_panic(tag: Str, lines: List[Str]) ! IO, FS.Write, Process.Spawn, Env.Read {
+    let mut bad = 0
+    for r in run_both(tag, lines) {
+        if r.success() || !r.err_out.contains("postcondition failed") {
+            io.eprintln("{tag}: ended {r.end}, printed [{r.out.trim()}], want a failed postcondition\n{r.err_out}")
+            bad = bad + 1
+        }
+    }
+    assert_eq(bad, 0)
+}
+
+test "a check that fails on the parameter panics though a shadowing local would pass it" {
+    expect_contract_panic("fails", [
+        "@verify(fallback: \"runtime\")",
+        "@ensures(result > x)",
+        "fn f(x: Int) -> Int \{",
+        "    let x = x - 100",
+        "    return x + 1",
+        "}",
+        "fn main() \{",
+        "    io.println(\"\{f(5)}\")",
+        "}",
+    ])
+}
+
+test "a check that holds on the parameter passes though a shadowing local would fail it" {
+    expect_prints("holds", [
+        "@verify(fallback: \"runtime\")",
+        "@ensures(result > x)",
+        "fn f(x: Int) -> Int \{",
+        "    let x = x + 100",
+        "    return x",
+        "}",
+        "fn main() \{",
+        "    io.println(\"\{f(5)}\")",
+        "}",
+    ], "105")
+}
+
+test "a return inside a nested block that shadows the parameter is checked against the parameter" {
+    expect_prints("nested", [
+        "@verify(fallback: \"runtime\")",
+        "@ensures(result > x)",
+        "fn f(x: Int) -> Int \{",
+        "    if x > 0 \{",
+        "        let x = x + 100",
+        "        return x",
+        "    }",
+        "    x + 1",
+        "}",
+        "fn main() \{",
+        "    io.println(\"\{f(5)} \{f(-3)}\")",
+        "}",
+    ], "105 -2")
+}
+
+test "the check at the end of a fn with no result reads the parameter" {
+    expect_prints("void", [
+        "@verify(fallback: \"runtime\")",
+        "@ensures(x > 0)",
+        "fn g(x: Int) ! IO \{",
+        "    let x = -1",
+        "    io.println(\"\{x}\")",
+        "}",
+        "fn main() \{",
+        "    g(4)",
+        "}",
+    ], "-1")
+}

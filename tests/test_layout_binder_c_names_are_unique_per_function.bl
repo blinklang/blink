@@ -1,0 +1,123 @@
+// The C local each binder takes. A C function may bind one Blink name many times: a
+// shadow in one block, a nested block, a parameter copy. C refuses a second declaration
+// in one scope and puts a name in scope inside its own initialiser, so each binder takes
+// a C local no other binder of the function takes, in a sibling block too.
+
+import std.io
+import layout.{
+    bind_binder, bind_binder_cell, binder_c_local_name, binder_c_name_of, binder_c_names_begin,
+    binder_c_names_resume, binder_scope_pop, binder_scope_push, binder_scope_push_under, layout_reset,
+}
+import cname.{c_local_name, c_local_name_nth}
+
+let TYPE_INT = 10
+
+fn assert_c_name(label: Str, scope: Int, name: Str, want: Str) ! IO.Print {
+    let got = binder_c_name_of(scope, name)
+    if got != want { io.println("FAIL: {label}: got {got} want {want}") }
+    assert_eq(got, want)
+}
+
+test "the first binder of a name takes the base spelling and each later one its own" {
+    assert_eq(c_local_name_nth("a", 0), c_local_name("a"))
+    assert(c_local_name_nth("a", 1) != c_local_name("a"))
+    assert(c_local_name_nth("a", 1) != c_local_name_nth("a", 2))
+    // A Blink name never starts with a digit, so the count cannot run into the name.
+    assert(c_local_name_nth("a", 11) != c_local_name_nth("a1", 1))
+}
+
+test "a shadow in one frame takes a new C local and the reads after it resolve to it" {
+    layout_reset()
+    let _ = binder_c_names_begin()
+    let s = binder_scope_push()
+    bind_binder(s, "a", TYPE_INT)
+    assert_c_name("first", s, "a", c_local_name("a"))
+    bind_binder(s, "a", TYPE_INT)
+    assert_c_name("shadow", s, "a", c_local_name_nth("a", 1))
+    binder_scope_pop()
+}
+
+test "an inner frame's binder does not reuse a name, and the outer one keeps its own" {
+    layout_reset()
+    let _ = binder_c_names_begin()
+    let outer = binder_scope_push()
+    bind_binder(outer, "a", TYPE_INT)
+    let inner = binder_scope_push()
+    bind_binder(inner, "a", TYPE_INT)
+    assert_c_name("inner", inner, "a", c_local_name_nth("a", 1))
+    assert_c_name("outer while inner is open", outer, "a", c_local_name("a"))
+    binder_scope_pop()
+    let sibling = binder_scope_push()
+    bind_binder(sibling, "a", TYPE_INT)
+    assert_c_name("a sibling frame counts on", sibling, "a", c_local_name_nth("a", 2))
+    binder_scope_pop()
+    binder_scope_pop()
+}
+
+test "a celled binder takes its own C local too" {
+    layout_reset()
+    let _ = binder_c_names_begin()
+    let s = binder_scope_push()
+    bind_binder_cell(s, "a", TYPE_INT)
+    bind_binder_cell(s, "a", TYPE_INT)
+    assert_c_name("second cell", s, "a", c_local_name_nth("a", 1))
+    binder_scope_pop()
+}
+
+test "an unbound name has no C local" {
+    layout_reset()
+    let s = binder_scope_push()
+    assert_c_name("unbound", s, "nope", "")
+    binder_scope_pop()
+}
+
+test "a new C function counts from zero and the one it interrupted resumes its count" {
+    layout_reset()
+    let _ = binder_c_names_begin()
+    let body = binder_scope_push()
+    bind_binder(body, "a", TYPE_INT)
+    binder_scope_pop()
+    let saved = binder_c_names_begin()
+    let thunk = binder_scope_push()
+    bind_binder(thunk, "a", TYPE_INT)
+    assert_c_name("the interrupting function", thunk, "a", c_local_name("a"))
+    binder_scope_pop()
+    binder_c_names_resume(saved)
+    let rest = binder_scope_push()
+    bind_binder(rest, "a", TYPE_INT)
+    assert_c_name("the resumed function", rest, "a", c_local_name_nth("a", 1))
+    binder_scope_pop()
+}
+
+test "a frame pushed under the parameters reads a parameter past a body shadow" {
+    layout_reset()
+    let _ = binder_c_names_begin()
+    let params = binder_scope_push()
+    bind_binder(params, "x", TYPE_INT)
+    let body = binder_scope_push()
+    bind_binder(body, "x", TYPE_INT)
+    let nested = binder_scope_push()
+    bind_binder(nested, "x", TYPE_INT)
+    // A check at a return lowers here: it names the parameter, and the binders it makes go
+    // when it closes.
+    let check = binder_scope_push_under(params)
+    assert_c_name("parameter past both shadows", check, "x", c_local_name("x"))
+    bind_binder(check, "result", TYPE_INT)
+    assert_c_name("the check's own binder", check, "result", c_local_name("result"))
+    binder_scope_pop()
+    assert_c_name("the shadow after the check", nested, "x", c_local_name_nth("x", 2))
+    assert_c_name("the check's binder is gone", nested, "result", "")
+    binder_scope_pop()
+    binder_scope_pop()
+    binder_scope_pop()
+}
+
+test "a local's C name is the one its binder took" {
+    layout_reset()
+    let _ = binder_c_names_begin()
+    let s = binder_scope_push()
+    bind_binder(s, "a", TYPE_INT)
+    bind_binder(s, "a", TYPE_INT)
+    assert_eq(binder_c_local_name(s, "a", -1), c_local_name_nth("a", 1))
+    binder_scope_pop()
+}

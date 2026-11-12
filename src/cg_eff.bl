@@ -21,7 +21,8 @@ import typecheck.{
 }
 import layout.{
     BinderMut, LayoutRecord, Position, Slot, SlotForm, async_scope_handles_spelling,
-    bind_binder_cell, bind_binder_mut, binder_is_celled, binder_mutability_of, binder_scope_pop, binder_scope_push,
+    bind_binder_cell, bind_binder_mut, binder_c_local_name, binder_c_name_of, binder_c_names_begin, binder_c_names_resume,
+    binder_is_celled, binder_mutability_of, binder_scope_pop, binder_scope_push,
     child_tid, closure_self_spelling, container_slot_spelling, current_binder_scope, ensure_typedef_for,
     layout_of, pointer_spelling, tid_of_binder, tid_of_node, spawn_pair_spelling,
 }
@@ -29,7 +30,7 @@ import cname.{
     c_builtin_derived_op_name, c_builtin_effect_slot, c_cell_name, c_effect_default_op_name, c_effect_vtable_slot_name, c_ev_field_name, c_ev_global_name,
     c_vtable_userdata_member,
     c_ev_type_name,
-    c_impl_method_name, c_local_name, c_mint_local, c_runtime_helper,
+    c_impl_method_name, c_local_name, c_mint_local, c_param_name, c_runtime_helper,
 }
 import ir.{
     ir_assign, ir_block, ir_box, ir_call_direct, ir_call_runtime, ir_cast,
@@ -39,7 +40,8 @@ import ir.{
 }
 import cg_print.{
     DefaultSlot, print_closure_thunk, print_handler_builder, print_resource_guard_support, print_spawn_pair_typedef,
-    print_spawn_task_wrapper, print_vtable_slot_fn, print_vtable_slot_fn_decl, vtable_slot_self_spelling,
+    print_report_body_not_lowered, print_spawn_task_wrapper, print_vtable_slot_fn, print_vtable_slot_fn_decl,
+    vtable_slot_self_spelling,
 }
 import mono.{instance_of_poly_method, instances, mark_instance_named, tid_in_instance}
 import cg_reg.{cg_reg_effect_root_decl, cg_reg_impl_decls, cg_reg_io_derived_decl}
@@ -391,9 +393,15 @@ let mut eff_thunks: List[PendingThunk] = []
 // after the first reuses the same typedef rather than printing its own copy.
 let mut eff_spawn_pair_printed: Bool = false
 
-// The frame cg_eff_thunk_open pushed, or -1 between thunks, so a close with nothing open
-// cannot pop a frame that belongs to someone else.
-let mut eff_thunk_scope: Int = -1
+let mut eff_open_thunk: OpenThunk = OpenThunk { scope: -1, outer_c_names: Map() }
+
+// `scope` is the frame cg_eff_thunk_open pushed, or -1 between thunks, so a close with
+// nothing open cannot pop a frame that belongs to someone else. `outer_c_names` holds the
+// C-name counts of the function the open thunk interrupted, put back at its close.
+type OpenThunk {
+    scope: Int
+    outer_c_names: Map[Str, Int]
+}
 
 // While a handler operation's body lowers: the local its prologue binds the copied-from
 // handler to, and the evidence field of the root that operation handles. Both empty outside
@@ -405,7 +413,7 @@ pub fn cg_eff_reset() {
     eff_thunks = []
     eff_shared_names = []
     eff_frame_written = []
-    eff_thunk_scope = -1
+    eff_open_thunk = OpenThunk { scope: -1, outer_c_names: Map() }
     eff_op_outer_name = ""
     eff_op_field = ""
     eff_spawn_pair_printed = false
@@ -527,6 +535,11 @@ fn capture_words(node: Int, free: List[Str], tids: List[Int], celled: List[Int])
     for nm in free {
         let ntid = tid_of_binder(current_binder_scope(), nm)
         let is_cell = binder_is_celled(current_binder_scope(), nm)
+        // The word reads the binder the literal sees, which a later shadow of the name in
+        // the same C function does not change.
+        // A miss is reported; the base spelling keeps the word list whole until the build stops.
+        let found = binder_c_local_name(current_binder_scope(), nm, node)
+        let c_name = if found.is_empty() { c_local_name(nm) } else { found }
         celled.push(if is_cell { 1 } else { 0 })
         tids.push(ntid)
         if is_cell {
@@ -534,13 +547,13 @@ fn capture_words(node: Int, free: List[Str], tids: List[Int], celled: List[Int])
             // already a word. A copy here, boxed or punned, would be a second storage the
             // frame never writes to, and every write on either side would go unseen.
             let cell = layout_of(ntid, Position.Local)
-            out.push(ir_var_ref(ntid, node, pointer_spelling(cell.c_spelling), c_cell_name(nm),
+            out.push(ir_var_ref(ntid, node, pointer_spelling(cell.c_spelling), c_cell_name(c_name),
                 SlotForm.InlineWord))
             continue
         }
         let slot = layout_of(ntid, Position.ContainerSlot)
         let loc = layout_of(ntid, Position.Local)
-        let read = ir_var_ref(ntid, node, loc.c_spelling, c_local_name(nm), loc.slot_form)
+        let read = ir_var_ref(ntid, node, loc.c_spelling, c_name, loc.slot_form)
         if slot.slot_form == SlotForm.PointerBoxed {
             // Too wide for the word, so the word holds the address of a heap copy. The
             // binding is not assignable -- the gate above refused it otherwise -- so the
@@ -902,7 +915,7 @@ fn handler_op_params(op: Int) -> List[Str] ! Diag.Report {
         let p = sublist_get(ps, k)
         let spelling = thunk_spelling(tid_of_node(p), Position.Param, p)
         if spelling == "" { return [] }
-        out.push("{spelling} {c_local_name(node_name(p))}")
+        out.push("{spelling} {c_param_name(ps, k)}")
         k = k + 1
     }
     out
@@ -1035,7 +1048,7 @@ pub fn cg_eff_thunk_params(i: Int) -> List[Str] ! Diag.Report {
         let p = sublist_get(ps, k)
         let spelling = thunk_spelling(child_tid(th.fn_tid, Slot.Param(k)), Position.Param, p)
         if spelling == "" { return [] }
-        out.push("{spelling} {c_local_name(node_name(p))}")
+        out.push("{spelling} {c_param_name(ps, k)}")
         k = k + 1
     }
     out
@@ -1059,6 +1072,36 @@ pub fn cg_eff_thunk_trace_enter(i: Int) -> List[Int] ! Diag.Report {
     cg_trace_thunk_enter(sig, th.trace_at, th.trace_name, th.trace_module, tids, th.trace_in_std)
 }
 
+// The locals a thunk's body reads that the body does not declare: its parameters, and the
+// names the capture prologue declares in front of it. The receiver word is read only by
+// the prologue.
+pub fn cg_eff_thunk_frame(i: Int) -> List[Str] ! Diag.Report {
+    let mut out: List[Str] = []
+    let t = thunk_at(i)
+    if t < 0 { return out }
+    let th = eff_thunks.get(t).unwrap()
+    let ps = node_params(thunk_sig_node(th))
+    let mut k = 0
+    while ps != -1 && k < sublist_length(ps) {
+        out.push(c_param_name(ps, k))
+        k = k + 1
+    }
+    if th.handler_tid >= 0 { out.push(th.outer_name) }
+    let mut c = 0
+    while c < th.cap_names.len() {
+        out.push(capture_c_name(th, c))
+        c = c + 1
+    }
+    out
+}
+
+// The C name capture i is declared under in the thunk: the cell pointer for a shared
+// binding, else the local. Bound first in a fresh count, each is its name's base spelling.
+fn capture_c_name(th: PendingThunk, i: Int) -> Str {
+    let local = c_local_name(th.cap_names.get(i).unwrap())
+    if th.cap_celled.get(i).unwrap() == 1 { c_cell_name(local) } else { local }
+}
+
 // The node whose parameters the thunk takes: the forwarded-to function's for a function
 // named as a value, else the literal's own.
 fn thunk_sig_node(th: PendingThunk) -> Int {
@@ -1078,12 +1121,11 @@ pub fn cg_eff_forwarding_body(i: Int) -> Option[Int] ! Diag.Report {
     let ps = node_params(th.forward_to)
     let mut k = 0
     while ps != -1 && k < sublist_length(ps) {
-        let p = sublist_get(ps, k)
         let ptid = child_tid(th.fn_tid, Slot.Param(k))
         if ptid < 0 { return Some(-1) }
         let rec = layout_or_ice(ptid, Position.Local, span, "UnspellableThunkSlot", "forwarded parameter")
         if rec.c_spelling == "" { return Some(-1) }
-        args.push(ir_var_ref(ptid, span, rec.c_spelling, c_local_name(node_name(p)), rec.slot_form))
+        args.push(ir_var_ref(ptid, span, rec.c_spelling, c_param_name(ps, k), rec.slot_form))
         k = k + 1
     }
     if th.forward_ev { args.push(cg_eff_ev_argument(span)) }
@@ -1134,7 +1176,11 @@ pub fn cg_eff_print_thunk(i: Int, body: Int) ! Diag.Report {
         if task_ret != "" { print_spawn_task_wrapper_for(i, th, task_ret) }
         return
     }
-    if body < 0 { return }
+    // A thunk whose body stopped is not defined, so the C fails to link.
+    if body < 0 {
+        print_report_body_not_lowered(th.symbol, th.closure)
+        return
+    }
     let ret = cg_eff_thunk_ret(i)
     if ret == "" { return }
     let params = cg_eff_thunk_params(i)
@@ -1242,7 +1288,7 @@ fn capture_let(th: PendingThunk, i: Int, index: Int, index_spelling: Str) -> Int
         // taken as it stands. Reading through it here would bind a copy of the value,
         // which compiles and then drops every write the thunk makes.
         let cell_spelling = pointer_spelling(loc.c_spelling)
-        return ir_let(ntid, th.closure, cell_spelling, c_cell_name(nm), SlotForm.InlineWord,
+        return ir_let(ntid, th.closure, cell_spelling, capture_c_name(th, i), SlotForm.InlineWord,
             ir_cast(ntid, th.closure, cell_spelling, raw))
     }
     // The pun the word was built through, undone in the same order.
@@ -1255,7 +1301,7 @@ fn capture_let(th: PendingThunk, i: Int, index: Int, index_spelling: Str) -> Int
     } else {
         ir_cast(ntid, th.closure, loc.c_spelling, punned)
     }
-    ir_let(ntid, th.closure, loc.c_spelling, c_local_name(nm), loc.slot_form, init)
+    ir_let(ntid, th.closure, loc.c_spelling, capture_c_name(th, i), loc.slot_form, init)
 }
 
 // Opens the thunk's own binder frame with its parameters bound at their types, and answers
@@ -1274,8 +1320,12 @@ pub fn cg_eff_thunk_open(i: Int) -> Int ! Diag.Report {
             "the driver drains the thunk queue after the enclosing body has closed its frame")
         return -1
     }
+    // A thunk is a C function of its own, so its locals are named afresh. Global
+    // initialisers drain thunks between globals that share one C function, so the
+    // enclosing count comes back at the close.
+    let outer_c_names = binder_c_names_begin()
     let scope = binder_scope_push()
-    eff_thunk_scope = scope
+    eff_open_thunk = OpenThunk { scope: scope, outer_c_names: outer_c_names }
     // The thunk's body is its own frame, so the bindings its own closures share are its
     // own. The enclosing frame's answer closed with that frame.
     cg_eff_scan_shared_binders(th.closure)
@@ -1294,19 +1344,22 @@ pub fn cg_eff_thunk_open(i: Int) -> Int ! Diag.Report {
 // body's frame still above the thunk's, is a caller that lost track of its frames, and
 // popping there would take a frame that belongs to someone else.
 pub fn cg_eff_thunk_close() ! Diag.Report {
-    if eff_thunk_scope < 0 {
+    if eff_open_thunk.scope < 0 {
         diag_ice("ThunkNotOpen", POISONED_IR_AT_SEAM, "a closure thunk was closed but none is open", 0, 0,
             "the driver pairs every cg_eff_thunk_close with the cg_eff_thunk_open before it")
         return
     }
-    if current_binder_scope() != eff_thunk_scope {
+    if current_binder_scope() != eff_open_thunk.scope {
         diag_ice("ThunkFrameUnbalanced", POISONED_IR_AT_SEAM,
             "a closure thunk was closed while a frame opened inside its body is still open", 0, 0,
             "every frame the body lowering opens must close before the thunk does")
+        // The outer function's names still count, whatever frames this leaves open.
+        binder_c_names_resume(eff_open_thunk.outer_c_names)
         return
     }
     binder_scope_pop()
-    eff_thunk_scope = -1
+    binder_c_names_resume(eff_open_thunk.outer_c_names)
+    eff_open_thunk = OpenThunk { scope: -1, outer_c_names: Map() }
     eff_shared_names = []
     eff_frame_written = []
     eff_op_outer_name = ""
@@ -1333,6 +1386,7 @@ fn bind_thunk_params(th: PendingThunk, scope: Int) -> Bool ! Diag.Report {
         // honor it yet, but the thunk's own rebind of its closure's param must not bake
         // that gap in and silently copy a param that becomes reassignable the day it does.
         bind_binder_mut(scope, node_name(p), tid, node_is_mut(p) == 1)
+        if !thunk_local_is_declared(scope, node_name(p), c_param_name(ps, k), p) { return false }
         k = k + 1
     }
     // A capture is a local of the thunk, at the type it was bound at where the literal was
@@ -1351,9 +1405,21 @@ fn bind_thunk_params(th: PendingThunk, scope: Int) -> Bool ! Diag.Report {
             // with; the thunk's copy of it stays immutable too.
             bind_binder_mut(scope, nm, ctid, false)
         }
+        if !thunk_local_is_declared(scope, nm, c_local_name(nm), th.closure) { return false }
         c = c + 1
     }
     true
+}
+
+// The signature and the capture prologue declare each parameter and capture under `declared`,
+// so its binder must carry that name. Any other name here would be a parameter list or
+// capture set that names a local twice.
+fn thunk_local_is_declared(scope: Int, name: Str, declared: Str, at: Int) -> Bool ! Diag.Report {
+    if binder_c_name_of(scope, name) == declared { return true }
+    diag_ice_at("ThunkLocalNotBaseName", POISONED_IR_AT_SEAM,
+        "parameter or capture `{name}` of a closure thunk is bound twice in its frame", at,
+        "a thunk's parameters and captures are distinct names; this is a compiler bug")
+    false
 }
 
 // ── Captures ──────────────────────────────────────────────────────────────────────

@@ -26,7 +26,7 @@ import parser.{
 }
 import layout.{
     LayoutTypedefMarks, Position, layout_of, layout_reset, layout_start_from, layout_typedef_marks, set_current_inst,
-    layout_take_typedefs, layout_queued_typedef_tids,
+    layout_take_typedefs, layout_queued_typedef_tids, binder_c_names_begin,
 }
 import cg_print.{
     print_ev_default_decl, print_ev_storage, print_fn, print_fn_decl, print_guard_open, print_include, print_main_shim, print_reset, print_scope_restore_support,
@@ -38,7 +38,7 @@ import cg_reg.{
     cg_reg_test_decls, cg_reg_type_decls,
 }
 import cg_decl.{
-    BodySite, cg_decl_body_site, cg_decl_is_per_instance, cg_decl_c_name, cg_decl_takes_ev, cg_decl_emit_epilogue, cg_decl_emit_foreign_const_defs, cg_decl_emit_ev, cg_decl_emit_ev_owned_by_archive, cg_decl_emit_ev_typedef, cg_decl_emit_io_derived_bodies,
+    BodySite, cg_decl_body_site, cg_decl_is_per_instance, cg_decl_c_name, cg_decl_param_c_names, cg_decl_takes_ev, cg_decl_emit_epilogue, cg_decl_emit_foreign_const_defs, cg_decl_emit_ev, cg_decl_emit_ev_owned_by_archive, cg_decl_emit_ev_typedef, cg_decl_emit_io_derived_bodies,
     cg_decl_emit_fn_decl, cg_decl_emit_fn_def, cg_decl_emit_foreign_wrapper,
     cg_decl_emit_impl_method_decl, cg_decl_emit_display_dispatch_instance_decl, cg_decl_emit_display_dispatch_instance_def,
     cg_decl_emit_globals, cg_decl_emit_signature_decl, cg_decl_emit_signature_def,
@@ -49,7 +49,7 @@ import cg_derive.{
     cg_derive_emit_bodies, cg_derive_emit_decls, cg_derive_emit_key_tables, cg_derive_key_table_keys,
     cg_derive_key_table_names, cg_derive_key_table_uses, cg_derive_reset, KeyTableUse,
 }
-import ir.{ir_begin_body, ir_block, ir_note_source, ir_pos_begin, ir_pos_take, ir_reset, ir_sources_pause, ir_sources_resume, ir_span, ir_verify}
+import ir.{ir_begin_body, ir_block, ir_note_source, ir_pos_begin, ir_pos_take, ir_reset, ir_sources_pause, ir_sources_resume, ir_span, ir_verify_in_frame}
 import mono.{instances, named_instance_rows, program_calls_trace_log, program_spawns, set_named_instance_rows}
 import typecheck.{TYPE_INT, TYPE_VOID, TyKind, tc_enter_body_module, tc_program_has_panic_hook, tc_leave_body_module, tc_resolve, tc_tid_kind}
 import cg_stmt.{
@@ -64,7 +64,7 @@ import cg_trace.{cg_trace_arm, cg_trace_arm_default, cg_trace_body_leave, cg_tra
 import cg_expr.{cg_expr_frame_clear, cg_expr_reset, cg_expr_set_return_type, cg_expr_set_test_body}
 import cg_eff.{
     cg_eff_forwarding_body, cg_eff_pending_thunks, cg_eff_print_thunk, cg_eff_register_async_scope_guard_support,
-    cg_eff_register_ffi_scope_guard_support, cg_eff_reset, cg_eff_thunk_body_node, cg_eff_thunk_close, cg_eff_thunk_trace_enter,
+    cg_eff_register_ffi_scope_guard_support, cg_eff_reset, cg_eff_thunk_body_node, cg_eff_thunk_frame, cg_eff_thunk_close, cg_eff_thunk_trace_enter,
     cg_eff_thunk_has_body, cg_eff_thunk_open, cg_eff_thunk_ret_tid, cg_eff_thunks_drained, cg_eff_lowered_thunks,
     cg_eff_thunk_set_body, cg_eff_thunk_body,
 }
@@ -352,12 +352,14 @@ fn instance_is_private_copy(cfg: CgConfig, decl: Int) -> Bool {
 // and wait in the queue for the definition half to print them.
 fn lower_global_inits(globals: List[Int]) -> Map[Int, Int] ! Diag.Report {
     set_current_inst(-1)
+    // Every initializer prints into one C function, so their locals share one count.
+    let _ = binder_c_names_begin()
     let mut out: Map[Int, Int] = Map()
     for g in globals {
         let init = node_value(g)
         if init < 0 { continue }
         let saved_module = tc_enter_body_module(g)
-        out.insert(g, verify_lowered_unit(lower_global_init(g), g))
+        out.insert(g, verify_lowered_unit(lower_global_init(g), g, []))
         lower_queued_thunks()
         tc_leave_body_module(saved_module)
     }
@@ -621,17 +623,18 @@ fn emit_derived_op_bodies() ! Diag.Report {
 // here, and the answer is the tree itself so a caller cannot take the shortcut of
 // printing the tree it already has.
 //
-// The shape form, not the frame form: a body reads its parameters and the globals of
-// every module it imports, and this stage enumerates neither, so the scope rule would
-// report a name that is in fact declared.
+// The frame form: `frame` is each local the C function declares outside the tree, from
+// the same source its signature or prologue is printed from. A global is a GlobalRef and
+// is not in it. So a read of a local nothing declares, and a second declaration of one
+// local, both fail here and not in the C compiler.
 //
 // Nothing is checked once a stage has reported. A stage that stopped answered a tree it
 // never finished, and that tree failing the shape rules is the consequence of the failure
 // already named rather than a second fault -- which is the same count every caller of
 // this driver reads before it uses the output at all.
-pub fn verify_lowered_unit(root: Int, at_node: Int) -> Int ! Diag.Report {
+pub fn verify_lowered_unit(root: Int, at_node: Int, frame: List[Str]) -> Int ! Diag.Report {
     if diag_ice_count > 0 { return root }
-    let problems = ir_verify(root)
+    let problems = ir_verify_in_frame(root, frame)
     if problems.len() > 0 {
         diag_ice_at("UnverifiedIrAtPrint", UNVERIFIED_IR_AT_PRINT,
             "lowering produced a tree the verifier refuses: {problems.get(0).unwrap()}", at_node,
@@ -659,17 +662,17 @@ fn lower_body_in_module(decl: Int) -> Int ! Diag.Report {
     if adapter.body >= 0 {
         print_fn(true, layout_of(TYPE_VOID, Position.Return).c_spelling, PANIC_HOOK_ADAPTER, adapter.params, false, adapter.body)
     }
-    verify_lowered_unit(body, decl)
+    verify_lowered_unit(body, decl, cg_decl_param_c_names(decl))
 }
 
 // The adapter of the hook main holds, lowered with main's body so the typedefs it spells
 // print with the thunks, ahead of it. Its body is -1 when `decl` holds no hook.
 fn lower_panic_hook_adapter(decl: Int) -> PanicHookAdapter ! Diag.Report {
     if decl != cg_reg_entry_point() || !tc_program_has_panic_hook() {
-        return PanicHookAdapter { params: [], body: -1 }
+        return PanicHookAdapter { params: [], frame: [], body: -1 }
     }
     let a = cg_stmt_panic_hook_adapter(decl)
-    if a.body >= 0 { let _ = verify_lowered_unit(a.body, decl) }
+    if a.body >= 0 { let _ = verify_lowered_unit(a.body, decl, a.frame) }
     a
 }
 
@@ -727,8 +730,9 @@ fn print_queued_thunks() ! Diag.Report {
 // `void` in C, and C rejects a value on a return out of it, so its tail is a statement
 // like any other. This is the test lower_fn makes for the same reason, on the same fact.
 fn lower_thunk_body(n: Int) -> Int ! Diag.Report {
+    let frame = cg_eff_thunk_frame(n)
     match cg_eff_forwarding_body(n) {
-        Some(fwd) => return if fwd < 0 { -1 } else { verify_lowered_unit(fwd, ir_span(fwd)) }
+        Some(fwd) => return if fwd < 0 { -1 } else { verify_lowered_unit(fwd, ir_span(fwd), frame) }
         None => {}
     }
     let body_node = cg_eff_thunk_body_node(n)
@@ -753,11 +757,11 @@ fn lower_thunk_body(n: Int) -> Int ! Diag.Report {
     cg_trace_body_leave()
     cg_promote_body_exit()
     cg_expr_set_return_type(-1)
-    if body < 0 || enter.len() == 0 { return verify_lowered_unit(body, body_node) }
+    if body < 0 || enter.len() == 0 { return verify_lowered_unit(body, body_node, frame) }
     let mut stmts = enter
     stmts.push(body)
     for s in leave { stmts.push(s) }
-    verify_lowered_unit(ir_block(body_node, stmts), body_node)
+    verify_lowered_unit(ir_block(body_node, stmts), body_node, frame)
 }
 
 // The definition half. Test blocks are not here: they are written beside the entry shim,
@@ -935,7 +939,7 @@ fn emit_global_init_fn(cfg: CgConfig, program: Int, deferred: List[Int]) -> List
     if deferred.len() == 0 && !is_archive { return [] }
     let decls = cg_reg_global_decls()
     let span = if decls.len() > 0 { decls.get(0).unwrap() } else { program }
-    let body = verify_lowered_unit(ir_block(span, deferred), span)
+    let body = verify_lowered_unit(ir_block(span, deferred), span, [])
     let mut name = "__blink_init_globals"
     if is_archive {
         name = archive_init_globals_name(cfg)
@@ -1243,7 +1247,7 @@ fn emit_module_head(module_key: Str, self_header: Str, cfg: CgConfig, facts: Pro
     let deferred = cg_decl_emit_globals(false, own_globals, inits)
     // Built before the first body, whose start would release the nodes of anything later.
     let span = if own_globals.len() > 0 { own_globals.get(0).unwrap() } else { -1 }
-    let init_body = if deferred.len() > 0 { verify_lowered_unit(ir_block(span, deferred), span) } else { -1 }
+    let init_body = if deferred.len() > 0 { verify_lowered_unit(ir_block(span, deferred), span, []) } else { -1 }
     print_scope_restore_support()
     cg_eff_register_ffi_scope_guard_support()
     // Only the entry module reaches emit_entry, where a test body would lower; scanning

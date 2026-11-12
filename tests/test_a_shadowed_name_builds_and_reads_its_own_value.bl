@@ -1,0 +1,333 @@
+// A `let` opens a new scope, so a name may be bound again in the same block, in a nested
+// block, over a parameter, in a closure, a loop or a match arm (sections/02_syntax.md §2.2).
+// Each binder is its own variable: a read sees the newest binder in scope, and a closure
+// that captured an older one keeps seeing that one. Both builds must run each program and
+// print what the binders hold. The C each binder becomes is the compiler's own business, so
+// this test only reads the printed values.
+
+import compile_test_helpers
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> ProcessResult ! Process.Spawn {
+    process.run("sh", ["-c", cmd]).unwrap()
+}
+
+// Runs `src` in both build modes; answers each mode whose output is not `want`.
+fn mismatches(tag: Str, src: Str, want: Str) -> List[Str] ! FS.Write, Process.Spawn, Env.Read {
+    let dir = "{compile_test_helpers.scratch_root()}/shadow_{tag}"
+    let _ = sh("rm -rf {dir} && mkdir -p {dir}")
+    fs.write("{dir}/x.bl", src).unwrap()
+    let mut bad: List[Str] = []
+    for mode in ["--per-module", "--no-per-module"] {
+        let r = sh("B=$(pwd)/build/blink; cd {dir} && env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE timeout 120 $B run {mode} x.bl < /dev/null")
+        if !r.success() || r.out.trim() != want {
+            bad.push("{tag} {mode}: ended {r.end}, printed [{r.out.trim()}], want [{want}]\n{r.err_out}")
+        }
+    }
+    let _ = sh("rm -rf {dir}")
+    bad
+}
+
+fn expect_prints(tag: Str, lines: List[Str], want: Str) ! IO, FS.Write, Process.Spawn, Env.Read {
+    let bad = mismatches(tag, lines.join("\n").concat("\n"), want)
+    for b in bad { io.eprintln(b) }
+    assert_eq(bad.len(), 0)
+}
+
+test "a nested let that reads the name it shadows reads the outer value" {
+    expect_prints("self_init", [
+        "fn main() \{",
+        "    let a = 41",
+        "    if a > 0 \{",
+        "        let a = a",
+        "        io.println(\"\{a}\")",
+        "    }",
+        "}",
+    ], "41")
+}
+
+test "a nested let of a string that reads the name it shadows reads the outer value" {
+    expect_prints("self_init_str", [
+        "fn main() \{",
+        "    let s = \"outer\"",
+        "    for _ in 0..1 \{",
+        "        let s = s",
+        "        io.println(s)",
+        "    }",
+        "}",
+    ], "outer")
+}
+
+test "a second let of one name in one block" {
+    expect_prints("same_block", [
+        "fn main() \{",
+        "    let a = 1",
+        "    let a = 2",
+        "    io.println(\"\{a}\")",
+        "}",
+    ], "2")
+}
+
+test "a let mut that copies a parameter of the same name" {
+    expect_prints("param_mut", [
+        "fn f(a: Int) -> Int \{",
+        "    let mut a = a",
+        "    a = a + 1",
+        "    a",
+        "}",
+        "fn main() \{ io.println(\"\{f(1)}\") }",
+    ], "2")
+}
+
+test "a let that shadows a string parameter of the same name" {
+    expect_prints("param_str", [
+        "fn norm(name: Str) -> Str \{",
+        "    let name = name.concat(\"!\")",
+        "    name",
+        "}",
+        "fn main() \{ io.println(norm(\"a\")) }",
+    ], "a!")
+}
+
+test "a let in a closure body that shadows the closure's parameter" {
+    expect_prints("closure_param", [
+        "fn main() \{",
+        "    let x = 10",
+        "    let f = fn(x: Int) -> Int \{",
+        "        let x = x + 1",
+        "        x",
+        "    }",
+        "    io.println(\"\{f(1)} \{x}\")",
+        "}",
+    ], "2 10")
+}
+
+test "two lets of one name in a nested block leave the outer binder alone" {
+    expect_prints("nested_block", [
+        "fn main() \{",
+        "    let a = 1",
+        "    \{",
+        "        let a = 2",
+        "        let a = a + 1",
+        "        io.println(\"\{a}\")",
+        "    }",
+        "    io.println(\"\{a}\")",
+        "}",
+    ], "3\n1")
+}
+
+test "tuple lets that bind the same names again" {
+    expect_prints("tuple_let", [
+        "fn main() \{",
+        "    let a = 1",
+        "    let (a, b) = (a + 1, a + 2)",
+        "    let (a, b) = (b, a)",
+        "    io.println(\"\{a} \{b}\")",
+        "}",
+    ], "3 2")
+}
+
+test "a closure that captured a name keeps the first binder after a shadow" {
+    expect_prints("capture_then_shadow", [
+        "fn main() \{",
+        "    let a = 1",
+        "    let f = fn() -> Int \{ a }",
+        "    let a = 2",
+        "    io.println(\"\{f()} \{a}\")",
+        "}",
+    ], "1 2")
+}
+
+test "a shared let mut shadowed by a second shared let mut keeps two cells" {
+    expect_prints("shared_cells", [
+        "fn main() \{",
+        "    let mut a = 1",
+        "    let inc = fn() \{ a = a + 1 }",
+        "    inc()",
+        "    let mut a = a * 10",
+        "    let inc2 = fn() \{ a = a + 1 }",
+        "    inc2()",
+        "    inc()",
+        "    io.println(\"\{a}\")",
+        "}",
+    ], "21")
+}
+
+test "a closure inside a closure reads the binder it captured past a shadow" {
+    expect_prints("nested_closure", [
+        "fn main() \{",
+        "    let a = 3",
+        "    let outer = fn() -> Int \{",
+        "        let inner = fn() -> Int \{ a * 2 }",
+        "        let a = 100",
+        "        inner() + a",
+        "    }",
+        "    let a = 0",
+        "    io.println(\"\{outer()} \{a}\")",
+        "}",
+    ], "106 0")
+}
+
+test "a for binder and a let in its body shadow an outer name" {
+    expect_prints("for_binder", [
+        "fn main() \{",
+        "    let i = 100",
+        "    for i in 0..3 \{",
+        "        let i = i * 2",
+        "        io.println(\"\{i}\")",
+        "    }",
+        "    io.println(\"\{i}\")",
+        "}",
+    ], "0\n2\n4\n100")
+}
+
+test "a shadow inside a while body is fresh on each turn" {
+    expect_prints("while_body", [
+        "fn main() \{",
+        "    let mut i = 0",
+        "    while i < 2 \{",
+        "        i += 1",
+        "        let i = i * 10",
+        "        io.println(\"\{i}\")",
+        "    }",
+        "    io.println(\"\{i}\")",
+        "}",
+    ], "10\n20\n2")
+}
+
+test "a match arm binder and a let in the arm shadow an outer name" {
+    expect_prints("match_arm", [
+        "fn main() \{",
+        "    let a = 1",
+        "    let o: Option[Int] = Some(7)",
+        "    match o \{",
+        "        Some(a) => \{",
+        "            let a = a + 1",
+        "            io.println(\"\{a}\")",
+        "        }",
+        "        None => \{}",
+        "    }",
+        "    io.println(\"\{a}\")",
+        "}",
+    ], "8\n1")
+}
+
+test "two match arms bind one name" {
+    expect_prints("two_arms", [
+        "fn pick(r: Result[Int, Int]) -> Int \{",
+        "    match r \{",
+        "        Ok(v) => v + 1",
+        "        Err(v) => v - 1",
+        "    }",
+        "}",
+        "fn main() \{",
+        "    let v = 50",
+        "    io.println(\"\{pick(Ok(1))} \{pick(Err(9))} \{v}\")",
+        "}",
+    ], "2 8 50")
+}
+
+test "a with-as binder shadows an outer name" {
+    expect_prints("with_as", [
+        "import std.traits",
+        "type Res \{ v: Int }",
+        "impl Closeable for Res \{",
+        "    fn close(self) \{}",
+        "}",
+        "fn main() \{",
+        "    let r = 5",
+        "    with Res \{ v: 7 } as r \{",
+        "        let r = r.v + 1",
+        "        io.println(\"\{r}\")",
+        "    }",
+        "    io.println(\"\{r}\")",
+        "}",
+    ], "8\n5")
+}
+
+test "an or-pattern binder and a let in its arm shadow an outer name" {
+    expect_prints("or_pattern", [
+        "type Ev \{",
+        "    Click(x: Int)",
+        "    Touch(x: Int)",
+        "}",
+        "fn main() \{",
+        "    let x = 100",
+        "    let e = Ev.Touch(4)",
+        "    match e \{",
+        "        Click(x) | Touch(x) => \{",
+        "            let x = x * 2",
+        "            io.println(\"\{x}\")",
+        "        }",
+        "    }",
+        "    io.println(\"\{x}\")",
+        "}",
+    ], "8\n100")
+}
+
+test "a range for binder and a let in its body shadow an outer name" {
+    expect_prints("range_for", [
+        "fn main() \{",
+        "    let i = 9",
+        "    let mut sum = 0",
+        "    for i in 0..3 \{",
+        "        let i = i * 10",
+        "        sum = sum + i",
+        "    }",
+        "    io.println(\"\{sum} \{i}\")",
+        "}",
+    ], "30 9")
+}
+
+test "a mut for binder and a let in its body shadow an outer name" {
+    expect_prints("mut_for", [
+        "fn main() \{",
+        "    let x = 7",
+        "    let mut total = 0",
+        "    for mut x in [1, 2] \{",
+        "        x = x + 10",
+        "        let x = x * 2",
+        "        total = total + x",
+        "    }",
+        "    io.println(\"\{total} \{x}\")",
+        "}",
+    ], "46 7")
+}
+
+test "a let in a handler operation shadows the operation's parameter" {
+    expect_prints("handler_op", [
+        "effect Calc \{",
+        "    effect Ops \{",
+        "        fn bump(n: Int) -> Int",
+        "    }",
+        "}",
+        "fn run() -> Int ! Calc.Ops \{",
+        "    calc.bump(5)",
+        "}",
+        "fn main() \{",
+        "    let n = 1000",
+        "    with handler Calc \{",
+        "        fn bump(n: Int) -> Int \{",
+        "            let n = n + 1",
+        "            n * 2",
+        "        }",
+        "    } \{",
+        "        io.println(\"\{run()}\")",
+        "    }",
+        "    io.println(\"\{n}\")",
+        "}",
+    ], "12\n1000")
+}
+
+test "a global initializer that shadows a name keeps a closure's capture" {
+    expect_prints("global_init", [
+        "let TOTAL: Int = \{",
+        "    let a = 1",
+        "    let a = a + 1",
+        "    let f = fn() -> Int \{ a * 10 }",
+        "    let a = 100",
+        "    f() + a",
+        "}",
+        "fn main() \{ io.println(\"\{TOTAL}\") }",
+    ], "120")
+}

@@ -1205,15 +1205,15 @@ pub fn ir_volatile_let(tid: Int, span: Int, c_spelling: Str, c_name: Str, slot_f
 // the initialiser into it, so the value is in the cell from the first statement that can
 // read it. The node carries the pointer's spelling and the cell's name, which is all the
 // printer needs -- the size comes off the pointer itself.
-pub fn ir_cell_let(tid: Int, span: Int, value_spelling: Str, name: Str, slot_form: SlotForm, init: Int) -> Int {
-    if init < 0 { return node0(IrKind.CellLet, tid, span, pointer_spelling(value_spelling), c_cell_name(name), slot_form) }
-    node1(IrKind.CellLet, tid, span, pointer_spelling(value_spelling), c_cell_name(name), slot_form, init)
+pub fn ir_cell_let(tid: Int, span: Int, value_spelling: Str, c_local: Str, slot_form: SlotForm, init: Int) -> Int {
+    if init < 0 { return node0(IrKind.CellLet, tid, span, pointer_spelling(value_spelling), c_cell_name(c_local), slot_form) }
+    node1(IrKind.CellLet, tid, span, pointer_spelling(value_spelling), c_cell_name(c_local), slot_form, init)
 }
 
 // The value inside a cell. It is a place, so one node serves a read and the target of an
 // assignment, which is what keeps the two from spelling the same binding differently.
-pub fn ir_cell_ref(tid: Int, span: Int, value_spelling: Str, name: Str, slot_form: SlotForm) -> Int {
-    node0(IrKind.CellRef, tid, span, value_spelling, c_cell_name(name), slot_form)
+pub fn ir_cell_ref(tid: Int, span: Int, value_spelling: Str, c_local: Str, slot_form: SlotForm) -> Int {
+    node0(IrKind.CellRef, tid, span, value_spelling, c_cell_name(c_local), slot_form)
 }
 
 pub fn ir_assign(span: Int, target: Int, value: Int) -> Int {
@@ -1314,9 +1314,11 @@ pub fn ir_verify(root: Int) -> List[Str] {
     verify_root(root, no_frame, false)
 }
 
-// The whole-body form. `declared` is the frame the tree sits in: its parameter names
-// and the module globals it may read. Every VarRef must resolve to an enclosing Let or
-// to that frame, so a read of a name nothing declares is a failure rather than a pass.
+// The whole-body form. `declared` is the frame the tree sits in: the locals its C
+// function declares outside the tree, such as its parameters. Every VarRef must resolve
+// to an enclosing Let or to that frame, so a read of a name nothing declares is a failure
+// rather than a pass. A module global is a GlobalRef and needs no entry. No two
+// declarations in the tree or the frame may share a C name either.
 pub fn ir_verify_in_frame(root: Int, declared: List[Str]) -> List[Str] {
     verify_root(root, declared, true)
 }
@@ -1336,14 +1338,54 @@ fn verify_root(root: Int, declared: List[Str], scoped: Bool) -> List[Str] {
     let mut blocks: List[Int] = [-1]
     let mut scope: List[Str] = []
     verify_node(root, blocks, errs, scope, declared, scoped)
-    // Both forms run it, as the driver verifies whole units through ir_verify. The walk
-    // needs a tree without cycles, which the pass above proved.
+    // Both forms run it, as a fragment can hold a PanicCatch too. The walk needs a tree
+    // without cycles, which the pass above proved.
     if errs.len() == 0 {
         verify_frame_exits(root, "", 0, errs)
         let mut decls: List[FrameDecl] = []
         verify_frame_writes(root, decls, 0, errs)
     }
+    if errs.len() == 0 && scoped { verify_one_declaration_per_name(root, declared, errs) }
     errs
+}
+
+// Each local of one C function is declared once, by one binder. A second declaration of a
+// name is an error in a C scope that already holds it, and in a nested scope it hides the
+// first: an initialiser that reads the name, or a later read meant for the first binder,
+// then reads the second. The rule is per function and not per scope, so neither can occur.
+fn verify_one_declaration_per_name(root: Int, declared: List[Str], errs: List[Str]) {
+    let mut seen: Map[Str, Int] = Map()
+    for name in declared {
+        if seen.contains_key(name) {
+            errs.push("frame: declares `{name}` twice")
+        } else {
+            seen.insert(name, -1)
+        }
+    }
+    // A materialised value can be reached from two places; it declares nothing twice.
+    let mut visited: Set[Int] = Set()
+    let mut stack: List[Int] = [root]
+    while stack.len() > 0 {
+        let id = stack.pop().unwrap()
+        if visited.contains(id) { continue }
+        visited.insert(id)
+        if declares_a_name(ir_kind(id)) {
+            let name = ir_c_name(id)
+            match seen.get(name) {
+                Some(first) => {
+                    let where = if first < 0 { "the frame" } else { node_label(first) }
+                    errs.push("{node_label(id)}: declares `{name}`, which {where} declares in the same C function")
+                }
+                None => seen.insert(name, id)
+            }
+        }
+        let n = ir_kid_count(id)
+        let mut i = 0
+        while i < n {
+            stack.push(ir_kid(id, i))
+            i += 1
+        }
+    }
 }
 
 // What one verify_root call has learnt about each node id, two words per id at its

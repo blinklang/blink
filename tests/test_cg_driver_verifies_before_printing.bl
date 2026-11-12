@@ -4,9 +4,10 @@ import ir.{
     ir_var_ref, ir_expr_stmt,
 }
 import layout.{SlotForm}
-import diagnostics.{diag_reset, diag_ice_count, UNVERIFIED_IR_AT_PRINT}
+import diagnostics.{diag_reset, diag_ice_count, POISONED_IR_AT_SEAM, UNVERIFIED_IR_AT_PRINT}
 import lower_test_helpers.{assert_eq_str, last_ice, last_ice_code, last_ice_message}
 import cg.{verify_lowered_unit}
+import cg_print.{print_reset, print_take, print_fn}
 // lexer and parser read the trace globals that compiler.bl owns, so a test that imports
 // typecheck through layout must load compiler as well.
 import compiler.{compile_to_program}
@@ -28,7 +29,7 @@ test "a unit the verifier accepts passes through and raises nothing" {
     diag_reset()
     ir_reset()
     let unit = good_unit()
-    assert_eq_int("the driver answers the tree it was given", verify_lowered_unit(unit, -1), unit)
+    assert_eq_int("the driver answers the tree it was given", verify_lowered_unit(unit, -1, []), unit)
     assert_eq_int("raises nothing", diag_ice_count, 0)
 }
 
@@ -39,7 +40,7 @@ test "a unit with a defect is refused before the printer reads it" {
     ir_reset()
     let short = ir_new(IrKind.Binary, 1, 0, "int64_t", "+", SlotForm.InlineWord, [int_const("1")])
     let unit = ir_block(0, [ir_expr_stmt(0, short)])
-    let _ = verify_lowered_unit(unit, -1)
+    let _ = verify_lowered_unit(unit, -1, [])
     assert_eq_int("raises one internal error", diag_ice_count, 1)
     assert_eq_str("under the unverified-IR name", last_ice(), "UnverifiedIrAtPrint")
     assert_eq_str("under the unverified-IR code", last_ice_code(), UNVERIFIED_IR_AT_PRINT)
@@ -52,7 +53,7 @@ test "a cyclic unit is refused" {
     diag_reset()
     ir_reset()
     let unit = ir_new(IrKind.Block, 0, 0, "", "", SlotForm.Inline, [ir_node_count()])
-    let _ = verify_lowered_unit(unit, -1)
+    let _ = verify_lowered_unit(unit, -1, [])
     assert_eq_int("raises one internal error", diag_ice_count, 1)
     assert(last_ice_message().contains("cycle"), "the report names the cycle: {last_ice_message()}")
 }
@@ -65,7 +66,7 @@ test "the report names the first defect and no other" {
     let bad_a = ir_new(IrKind.Const, 1, 0, "int64_t", "1", SlotForm.InlineWord, [int_const("2")])
     let bad_b = ir_new(IrKind.Binary, 1, 0, "", "", SlotForm.InlineWord, [int_const("3"), int_const("4")])
     let unit = ir_block(0, [ir_expr_stmt(0, bad_a), ir_expr_stmt(0, bad_b)])
-    let _ = verify_lowered_unit(unit, -1)
+    let _ = verify_lowered_unit(unit, -1, [])
     assert_eq_int("raises one internal error", diag_ice_count, 1)
     assert(last_ice_message().contains("expects 0 kids"), "names the first defect: {last_ice_message()}")
     assert(!last_ice_message().contains("empty c_spelling"), "and not the second: {last_ice_message()}")
@@ -77,11 +78,11 @@ test "a unit lowered after an internal error is not reported a second time" {
     diag_reset()
     ir_reset()
     let first = ir_new(IrKind.Binary, 1, 0, "int64_t", "+", SlotForm.InlineWord, [int_const("1")])
-    let _ = verify_lowered_unit(ir_block(0, [ir_expr_stmt(0, first)]), -1)
+    let _ = verify_lowered_unit(ir_block(0, [ir_expr_stmt(0, first)]), -1, [])
     assert_eq_int("the first defect is reported", diag_ice_count, 1)
     let second = ir_new(IrKind.Binary, 1, 0, "int64_t", "+", SlotForm.InlineWord, [int_const("2")])
     let unit = ir_block(0, [ir_expr_stmt(0, second)])
-    assert_eq_int("the tree still passes through", verify_lowered_unit(unit, -1), unit)
+    assert_eq_int("the tree still passes through", verify_lowered_unit(unit, -1, []), unit)
     assert_eq_int("and raises nothing further", diag_ice_count, 1)
 }
 
@@ -90,7 +91,70 @@ test "a unit lowered after an internal error is not reported a second time" {
 test "a unit that never lowered is refused" {
     diag_reset()
     ir_reset()
-    let _ = verify_lowered_unit(-1, -1)
+    let _ = verify_lowered_unit(-1, -1, [])
     assert_eq_int("raises one internal error", diag_ice_count, 1)
     assert(last_ice_message().contains("out of range"), "names the missing root: {last_ice_message()}")
+}
+
+// A body reads its parameters, which its signature declares and the tree does not. The
+// driver checks the body against that frame, so a read of a local nothing declares is
+// refused here and not left for the C compiler.
+test "a unit that reads a local its frame does not declare is refused" {
+    diag_reset()
+    ir_reset()
+    let read = ir_block(0, [ir_return(0, ir_var_ref(1, 0, "int64_t", "p", SlotForm.InlineWord))])
+    assert_eq_int("the tree passes through", verify_lowered_unit(read, -1, ["p"]), read)
+    assert_eq_int("a parameter in the frame raises nothing", diag_ice_count, 0)
+    let stray = ir_block(0, [ir_return(0, ir_var_ref(1, 0, "int64_t", "q", SlotForm.InlineWord))])
+    let _ = verify_lowered_unit(stray, -1, ["p"])
+    assert_eq_int("a read outside the frame raises one internal error", diag_ice_count, 1)
+    assert(last_ice_message().contains("reads `q`"), "names the read: {last_ice_message()}")
+}
+
+// Two binders of one Blink name in one C function each take their own C local, so a
+// second declaration of one C name is a lowering defect, in a nested block too.
+test "a unit that declares one local twice is refused" {
+    diag_reset()
+    ir_reset()
+    let first = ir_let(1, 0, "int64_t", "x", SlotForm.InlineWord, int_const("1"))
+    let second = ir_let(1, 0, "int64_t", "x", SlotForm.InlineWord, int_const("2"))
+    let _ = verify_lowered_unit(ir_block(0, [first, ir_block(0, [second])]), -1, [])
+    assert_eq_int("raises one internal error", diag_ice_count, 1)
+    assert(last_ice_message().contains("declares `x`"), "names the local: {last_ice_message()}")
+}
+
+test "a unit that declares a local its frame already declares is refused" {
+    diag_reset()
+    ir_reset()
+    let shadow = ir_let(1, 0, "int64_t", "p", SlotForm.InlineWord, int_const("1"))
+    let _ = verify_lowered_unit(ir_block(0, [shadow]), -1, ["p"])
+    assert_eq_int("raises one internal error", diag_ice_count, 1)
+    assert(last_ice_message().contains("the frame declares"), "names the frame: {last_ice_message()}")
+}
+
+// A stopped lowering answers -1, not a tree. The printer must never print it as an empty
+// body: C would take that for a function that returns garbage.
+test "the printer refuses a stopped body nothing reported" {
+    diag_reset()
+    ir_reset()
+    print_reset()
+    print_fn(true, "int64_t", "stopped_fn", [], false, -1)
+    let c = print_take()
+    if !c.contains("BLINK_I0005_body_not_lowered;") { io.println("FAIL: no poison token in:\n{c}") }
+    assert(c.contains("BLINK_I0005_body_not_lowered;"))
+    assert_eq_int("an unreported stop raises one internal error", diag_ice_count, 1)
+    assert_eq_str("under the body-not-lowered name", last_ice(), "BodyNotLowered")
+    assert_eq_str("under the poisoned-seam code", last_ice_code(), POISONED_IR_AT_SEAM)
+}
+
+test "a stopped body that a stage reported prints the token and adds no second report" {
+    diag_reset()
+    ir_reset()
+    print_reset()
+    let short = ir_new(IrKind.Binary, 1, 0, "int64_t", "+", SlotForm.InlineWord, [int_const("1")])
+    let _ = verify_lowered_unit(ir_block(0, [ir_expr_stmt(0, short)]), -1, [])
+    assert_eq_int("the first report", diag_ice_count, 1)
+    print_fn(true, "int64_t", "stopped_fn", [], false, -1)
+    assert(print_take().contains("BLINK_I0005_body_not_lowered;"))
+    assert_eq_int("no second report", diag_ice_count, 1)
 }

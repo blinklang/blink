@@ -28,8 +28,9 @@ import typecheck.{
 }
 import layout.{
     Position, Slot, SlotForm, LayoutRecord, async_scope_handles_spelling, bind_binder_cell,
-    bind_binder_mut, binder_is_celled,
-    binder_scope_pop, binder_scope_push, carrier_member_layout, child_tid,
+    bind_binder_mut, binder_c_local_name, binder_c_names_begin, binder_is_celled,
+    binder_scope_pop, binder_scope_push_under, carrier_member_layout, child_tid,
+    current_binder_scope,
     ensure_typedef_for, field_layout_of, fn_pointer_spelling_of,
     layout_of, tid_holds_tag_member, tid_of_binder,
     tid_of_node, varargs_spelling,
@@ -50,8 +51,8 @@ import ir.{
     ir_call_closure, ir_panic_hook, ir_select, ir_struct_new,
 }
 import diagnostics.{
-    Diag, diag_file_for_node, diag_ice_at, diag_ice_stage_not_built, diag_is_ice_seg,
-    CODEGEN_STAGE_NOT_BUILT, UNSOLVED_TYPEVAR_AT_CODEGEN,
+    Diag, diag_file_for_node, diag_ice_at, diag_ice_count, diag_ice_stage_not_built, diag_is_ice_seg,
+    CODEGEN_STAGE_NOT_BUILT, POISONED_IR_AT_SEAM, UNSOLVED_TYPEVAR_AT_CODEGEN,
 }
 import cg_expr.{
     cg_expr_async_scope_close, cg_expr_async_scope_open, cg_expr_drain_pending, cg_expr_drop_values,
@@ -135,16 +136,22 @@ let mut cs_current_fn_name: Str = ""
 
 // What every value exit of the function being lowered checks: the @ensures predicates of a
 // runtime-fallback contract, and the alias declarations whose @where the returned value must
-// meet. Saved and restored around a function's own body, the same as its name.
-let mut cs_exit_ensures: List[Int] = []
-let mut cs_exit_where: List[Int] = []
+// meet. Saved and restored around a function's own body, the same as its name. `scope` is
+// the frame that holds the parameters: a check names a parameter, never a body local that
+// shadows it at the exit.
+type ExitChecks {
+    ensures: List[Int]
+    where_decls: List[Int]
+    scope: Int
+}
+
+let mut cs_exit: ExitChecks = ExitChecks { ensures: [], where_decls: [], scope: -1 }
 
 pub fn cg_stmt_reset() {
     scope_stack = []
     mv_work = []
     cs_current_fn_name = ""
-    cs_exit_ensures = []
-    cs_exit_where = []
+    cs_exit = ExitChecks { ensures: [], where_decls: [], scope: -1 }
 }
 
 // ── Types, spellings and names ────────────────────────────────────────────
@@ -175,14 +182,20 @@ fn int_form(span: Int) -> SlotForm ! Diag.Report {
     layout_at(TYPE_INT, Position.Local, span).slot_form
 }
 
-// The C identifier of a local, parameter or pattern binder. Shared with the expression
-// stage so a binder and every read of it spell the same identifier.
-pub fn cg_local_c_name(name: Str) -> Str {
-    c_local_name(name)
+// The C local of the binder `name` resolves to from the current scope. A declaration reads
+// it right after its bind, and a read reads it from the same entry its type comes from, so
+// the two spell one identifier and a shadow never reuses the one it hides.
+fn binder_c_local(name: Str, at: Int) -> Str ! Diag.Report {
+    let c = binder_c_local_name(cur_scope(), name, at)
+    if c.is_empty() { c_local_name(name) } else { c }
 }
 
 fn open_scope() -> Int {
-    let id = binder_scope_push()
+    open_scope_under(current_binder_scope())
+}
+
+fn open_scope_under(parent: Int) -> Int {
+    let id = binder_scope_push_under(parent)
     scope_stack.push(id)
     id
 }
@@ -289,8 +302,10 @@ fn lower_global_assign(g: Int, hoisted: List[Int], value: Int) -> Int ! Diag.Rep
 // not bind, and the lowering after it must not run, because a read of that name would
 // otherwise walk out to an outer declaration of the same name and answer its type.
 //
-// lower_fn turns a stopped body into an empty block, so the driver seam always answers
-// a node. The driver reads diag_ice_count, never this number.
+// lower_fn passes a stopped body on as -1 too, never as an empty block: an empty body
+// prints as a function that returns garbage, and nothing after the printer can tell it
+// from a real one. The printer refuses the -1. The driver reads diag_ice_count, never
+// this number.
 
 // A value node that stands in for one an ICE has already reported. It is well formed so
 // the verifier and the dump still work on the surrounding tree; it is never a spelling
@@ -306,6 +321,7 @@ fn poison_value(node: Int) -> Int ! Diag.Report {
 // declared type, and the body's tail value becomes the function's return.
 pub fn lower_fn(fn_node: Int) -> Int ! Diag.Report {
     ir_note_source(fn_node)
+    let _ = binder_c_names_begin()
     let scope = open_scope()
     // A binding a closure of this body shares is stored in one heap cell, and the cell is
     // allocated where the binding is declared. So which names are shared has to be settled
@@ -323,15 +339,15 @@ pub fn lower_fn(fn_node: Int) -> Int ! Diag.Report {
     // The enter event comes before the entry checks, so a call that fails its @requires
     // shows in the trace.
     let enter = if bound { cg_trace_body_enter(fn_node) } else { [] }
-    let (entry, block, falls_off) = lower_fn_body_as_current(fn_node, bound, tail, body)
+    let (entry, block, falls_off) = lower_fn_body_as_current(fn_node, bound, tail, body, scope)
     let leave = if block >= 0 && tail != TAIL_RETURN { cg_trace_exit_void(fn_node) } else { [] }
     cg_trace_body_leave()
     cg_expr_clear_old_snapshots()
     cg_expr_set_return_type(-1)
     close_scope()
     // A stopped body, a parameter with no type and a declaration with no body all leave
-    // nothing worth printing, and the seam still answers a node.
-    if block < 0 { return ir_block(fn_node, []) }
+    // nothing worth printing; see The stop above.
+    if block < 0 { return -1 }
     let mut stmts = enter
     for s in entry { stmts.push(s) }
     if stmts.len() == 0 && falls_off.len() == 0 && leave.len() == 0 { return block }
@@ -344,18 +360,15 @@ pub fn lower_fn(fn_node: Int) -> Int ! Diag.Report {
 // The body's exit checks name this function and read its own @ensures and `where`
 // predicates, so the caller's come back once the body has lowered. The body starts with no
 // exit checks. contract_entry sets this function's own after the parameter @where checks,
-// so an exit inside one of those checks runs none.
-fn lower_fn_body_as_current(fn_node: Int, bound: Bool, tail: Int, body: Int) -> (List[Int], Int, List[Int]) ! Diag.Report {
+// so an exit inside one of those checks runs none. `params` is the frame of the parameters.
+fn lower_fn_body_as_current(fn_node: Int, bound: Bool, tail: Int, body: Int, params: Int) -> (List[Int], Int, List[Int]) ! Diag.Report {
     let fn_name = node_name(fn_node)
     let saved_fn_name = cs_current_fn_name
     cs_current_fn_name = fn_name
-    let saved_ensures = cs_exit_ensures
-    let saved_where = cs_exit_where
-    cs_exit_ensures = []
-    cs_exit_where = []
+    let saved_exit = cs_exit
+    cs_exit = ExitChecks { ensures: [], where_decls: [], scope: params }
     let lowered = lower_fn_body_with_contracts(fn_node, bound, tail, body)
-    cs_exit_ensures = saved_ensures
-    cs_exit_where = saved_where
+    cs_exit = saved_exit
     cs_current_fn_name = saved_fn_name
     lowered
 }
@@ -384,21 +397,21 @@ fn contract_entry(fn_node: Int, returns_value: Bool) -> List[Int] ! Diag.Report 
     let mut i = 0
     while params != -1 && i < sublist_length(params) {
         let p = sublist_get(params, i)
-        let source = c_local_name(node_name(p))
+        let source = binder_c_local(node_name(p), p)
         for td in where_decls_of(node_type_ann(p)) {
-            stmts.push(contract_check(node_condition(td), where_failure(td), "self", stmt_tid(p), source))
+            stmts.push(contract_check(node_condition(td), where_failure(td), "self", stmt_tid(p), source, cs_exit.scope))
         }
         i = i + 1
     }
-    cs_exit_ensures = []
-    cs_exit_where = if returns_value { where_decls_of(node_type_ann(fn_node)) } else { [] }
+    let where_decls = if returns_value { where_decls_of(node_type_ann(fn_node)) } else { [] }
+    cs_exit = ExitChecks { ensures: [], where_decls: where_decls, scope: cs_exit.scope }
     if !contract_runtime(fn_node) { return stmts }
     for pred in tc_requires_preds_of(fn_node) {
-        stmts.push(contract_check(pred, "precondition failed: @requires in {node_name(fn_node)}", "", -1, ""))
+        stmts.push(contract_check(pred, "precondition failed: @requires in {node_name(fn_node)}", "", -1, "", cs_exit.scope))
     }
     let ensures = tc_ensures_preds_of(fn_node)
     for pred in ensures { snapshot_olds(pred, stmts) }
-    cs_exit_ensures = ensures
+    cs_exit = ExitChecks { ensures: ensures, where_decls: where_decls, scope: cs_exit.scope }
     stmts
 }
 
@@ -463,20 +476,18 @@ fn snapshot_olds(node: Int, out: List[Int]) ! Diag.Report {
 
 // `if (!pred) panic`, with `binder` bound to the C local `source` of type `tid` while the
 // predicate lowers. A tid below zero binds nothing. The predicate is one AST lowered at
-// every exit, so the temps it names are forgotten once its check is built.
-fn contract_check(pred: Int, what: Str, binder: Str, tid: Int, source: Str) -> Int ! Diag.Report {
-    let scope = open_scope()
+// every exit, so the temps it names are forgotten once its check is built. It lowers in a
+// frame under `params`, so a name in it reads the parameter even where a body local
+// shadows that name at the exit.
+fn contract_check(pred: Int, what: Str, binder: Str, tid: Int, source: Str, params: Int) -> Int ! Diag.Report {
+    let scope = open_scope_under(params)
     let mut stmts: List[Int] = []
     if tid >= 0 {
         bind_binder_mut(scope, binder, tid, false)
-        // `T self = self;` would read the new declarator, not the parameter: C puts a
-        // name in scope before its own initializer. A parameter already spelled like the
-        // binder is read as it stands.
-        if source != c_local_name(binder) {
-            let rec = layout_at(tid, Position.Local, pred)
-            let read = ir_var_ref(tid, pred, rec.c_spelling, source, rec.slot_form)
-            stmts.push(ir_let(tid, pred, rec.c_spelling, c_local_name(binder), rec.slot_form, read))
-        }
+        let bound = binder_c_local(binder, pred)
+        let rec = layout_at(tid, Position.Local, pred)
+        let read = ir_var_ref(tid, pred, rec.c_spelling, source, rec.slot_form)
+        stmts.push(ir_let(tid, pred, rec.c_spelling, bound, rec.slot_form, read))
     }
     let values = cg_expr_value_count()
     let mark = cg_expr_pending_count()
@@ -496,8 +507,8 @@ fn contract_check(pred: Int, what: Str, binder: Str, tid: Int, source: Str) -> I
 // The @ensures checks at an exit with no value. `result` is not bound: there is none.
 fn contract_void_exit() -> List[Int] ! Diag.Report {
     let mut out: List[Int] = []
-    for pred in cs_exit_ensures {
-        out.push(contract_check(pred, ensures_failure(), "", -1, ""))
+    for pred in cs_exit.ensures {
+        out.push(contract_check(pred, ensures_failure(), "", -1, "", cs_exit.scope))
     }
     out
 }
@@ -512,7 +523,7 @@ fn ensures_failure() -> Str {
 pub fn cg_stmt_return_value(node: Int, value: Int) -> Int ! Diag.Report {
     let rt = cg_expr_return_type()
     let traced = cg_trace_body_traced()
-    if cs_exit_ensures.len() == 0 && cs_exit_where.len() == 0 && !traced {
+    if cs_exit.ensures.len() == 0 && cs_exit.where_decls.len() == 0 && !traced {
         let out = cg_promote_on_exit(rt, value, node)
         if out < 0 { return -1 }
         return ir_return(node, out)
@@ -520,11 +531,11 @@ pub fn cg_stmt_return_value(node: Int, value: Int) -> Int ! Diag.Report {
     let rec = layout_at(rt, Position.Local, node)
     let rv = c_ensures_result_name()
     let mut stmts = [ir_let(rt, node, rec.c_spelling, rv, rec.slot_form, value)]
-    for pred in cs_exit_ensures {
-        stmts.push(contract_check(pred, ensures_failure(), "result", rt, rv))
+    for pred in cs_exit.ensures {
+        stmts.push(contract_check(pred, ensures_failure(), "result", rt, rv, cs_exit.scope))
     }
-    for td in cs_exit_where {
-        stmts.push(contract_check(node_condition(td), where_failure(td), "self", rt, rv))
+    for td in cs_exit.where_decls {
+        stmts.push(contract_check(node_condition(td), where_failure(td), "self", rt, rv, cs_exit.scope))
     }
     for s in cg_trace_exit_value(node, rt, ir_var_ref(rt, node, rec.c_spelling, rv, rec.slot_form)) { stmts.push(s) }
     let out = cg_promote_on_exit(rt, ir_var_ref(rt, node, rec.c_spelling, rv, rec.slot_form), node)
@@ -1365,13 +1376,14 @@ fn bind_and_declare_let(node: Int, tid: Int, rec: LayoutRecord, name: Str, value
     let is_mut = node_is_mut(node) == 1
     if is_mut && cg_eff_binder_is_shared(name) {
         bind_binder_cell(cur_scope(), name, tid)
-        return ir_cell_let(tid, node, rec.c_spelling, name, rec.slot_form, value)
+        return ir_cell_let(tid, node, rec.c_spelling, binder_c_local(name, node), rec.slot_form, value)
     }
     bind_binder_mut(cur_scope(), name, tid, is_mut)
+    let c_name = binder_c_local(name, node)
     if is_mut && cg_eff_frame_written(node) {
-        return ir_volatile_let(tid, node, rec.c_spelling, cg_local_c_name(name), rec.slot_form, value)
+        return ir_volatile_let(tid, node, rec.c_spelling, c_name, rec.slot_form, value)
     }
-    ir_let(tid, node, rec.c_spelling, cg_local_c_name(name), rec.slot_form, value)
+    ir_let(tid, node, rec.c_spelling, c_name, rec.slot_form, value)
 }
 
 fn bind_unit_let(node: Int, tid: Int, init: Int, rec: LayoutRecord, name: Str, discard: Bool) -> Int ! Diag.Report {
@@ -1503,15 +1515,16 @@ fn bind_sub_pattern(sub: Int, tid: Int, value: Int, rec: LayoutRecord, out: List
 fn bind_pattern_binder(span: Int, decl: Int, name: Str, tid: Int, rec: LayoutRecord, value: Int, out: List[Int], is_mut: Bool) ! Diag.Report {
     if is_mut && cg_eff_binder_is_shared(name) {
         bind_binder_cell(cur_scope(), name, tid)
-        out.push(ir_cell_let(tid, span, rec.c_spelling, name, rec.slot_form, value))
+        out.push(ir_cell_let(tid, span, rec.c_spelling, binder_c_local(name, span), rec.slot_form, value))
         return
     }
     bind_binder_mut(cur_scope(), name, tid, is_mut)
+    let c_name = binder_c_local(name, span)
     if is_mut && cg_eff_frame_written(decl) {
-        out.push(ir_volatile_let(tid, span, rec.c_spelling, cg_local_c_name(name), rec.slot_form, value))
+        out.push(ir_volatile_let(tid, span, rec.c_spelling, c_name, rec.slot_form, value))
         return
     }
-    out.push(ir_let(tid, span, rec.c_spelling, cg_local_c_name(name), rec.slot_form, value))
+    out.push(ir_let(tid, span, rec.c_spelling, c_name, rec.slot_form, value))
 }
 
 fn lower_assign(node: Int) -> Int ! Diag.Report {
@@ -1640,9 +1653,9 @@ fn lower_target(node: Int) -> Int ! Diag.Report {
         // The place a shared binding names is its cell's value. A write to a local of the
         // same spelling would land in storage the closure sharing it never reads.
         if binder_is_celled(cur_scope(), name) {
-            return ir_cell_ref(tid, node, rec.c_spelling, name, rec.slot_form)
+            return ir_cell_ref(tid, node, rec.c_spelling, binder_c_local(name, node), rec.slot_form)
         }
-        return ir_var_ref(tid, node, rec.c_spelling, cg_local_c_name(name), rec.slot_form)
+        return ir_var_ref(tid, node, rec.c_spelling, binder_c_local(name, node), rec.slot_form)
     }
     let decl = tc_global_decl_node(node)
     if decl >= 0 {
@@ -2423,16 +2436,27 @@ fn lower_loop(node: Int) -> Int ! Diag.Report {
 // all, Cursor pulls from a fresh cursor of an Iterator's recipe, and Stepped decodes one
 // Char of a Str per turn. The match is exhaustive, so a strategy added to ForInStrategy without
 // an arm here fails to compile rather than falling through to a silent wrong walk.
+// A stop that no stage reported yet is named here, so the build does not end on the
+// verifier's bare complaint about a -1 root.
+fn for_in_has_no_element_type(node: Int, what: Str) -> Int ! Diag.Report {
+    if diag_ice_count == 0 {
+        diag_ice_at("ForInHasNoElementType", UNSOLVED_TYPEVAR_AT_CODEGEN,
+            "this for-in's {what} where codegen reads it", node,
+            "typecheck stamps the iterable and for_in_iteration_of reports any iterable it cannot walk; this is a compiler bug")
+    }
+    -1
+}
+
 fn lower_for_in(node: Int) -> Int ! Diag.Report {
     let iter = node_iterable(node)
     if node_kind(iter) == NodeKind.RangeLit { return lower_for_range(node, iter) }
     let container = tid_of_node(iter)
-    if container < 0 { return ir_block(node, []) }
+    if container < 0 { return for_in_has_no_element_type(node, "iterable has no type") }
     if tc_tid_kind(container) == TyKind.Range { return lower_for_range_value(node, iter, container) }
     let walk = for_in_iteration_of(container, node)
     // The producer reports the iterables it has no entry points for, and answers a shape
     // with no element. Reporting again here would name one gap twice.
-    if walk.element_tid < 0 { return ir_block(node, []) }
+    if walk.element_tid < 0 { return for_in_has_no_element_type(node, "element has no type") }
     match walk.strategy {
         ForInStrategy.Indexed => lower_for_indexed(node, iter, walk)
         ForInStrategy.Materialized => lower_for_materialized(node, iter, walk)
@@ -2790,14 +2814,20 @@ fn lower_for_range_value(node: Int, iter: Int, range_tid: Int) -> Int ! Diag.Rep
 fn lower_counted(node: Int, iter: Int, tid: Int, rec: LayoutRecord, lo: Int, hi: Int, pre: List[Int], flag: Option[Str]) -> Int ! Diag.Report {
     let binder = node_for_binder(node)
     let binder_mut = node_is_mut(binder) == 1
-    let name = if binder_mut { c_mint_local("counter") } else { cg_local_c_name(node_name(binder)) }
+    // An immutable binder is the counter itself, so it binds before the counter's
+    // declaration takes its C name. lo and hi were lowered already and read the outer one.
+    let name = if binder_mut {
+        c_mint_local("counter")
+    } else {
+        bind_binder_mut(cur_scope(), node_name(binder), tid, false)
+        binder_c_local(node_name(binder), binder)
+    }
     let init = ir_let(tid, node, rec.c_spelling, name, rec.slot_form, lo)
     let end_name = c_mint_local("end")
     let end_let = ir_let(tid, iter, rec.c_spelling, end_name, rec.slot_form, hi)
     let first = c_mint_local("first")
     let first_let = ir_let(TYPE_INT, node, int_spelling(node), first, int_form(node), int_const(node, "1"))
     let mut turn: List[Int] = []
-    if !binder_mut { bind_binder_mut(cur_scope(), node_name(binder), tid, false) }
     let advance = ir_assign(node, ir_var_ref(tid, node, rec.c_spelling, name, rec.slot_form),
         ir_binary(tid, node, rec.c_spelling, "+",
             ir_var_ref(tid, node, rec.c_spelling, name, rec.slot_form),
@@ -2948,7 +2978,7 @@ fn wrap_resource(node: Int, items: Int, n: Int, i: Int, tail: Int, dest: Str, de
     // A with-resource binder has no `mut` form to write, so it is immutable as a
     // matter of syntax, and a closure capturing one may copy it.
     bind_binder_mut(cur_scope(), name, tid, false)
-    let bound_name = cg_local_c_name(name)
+    let bound_name = binder_c_local(name, item)
     let bind = ir_let(tid, item, rec.c_spelling, bound_name, rec.slot_form, value)
     let cleanup = cg_eff_resource_cleanup(item)
     let rest = wrap_with_items(node, items, n, i + 1, tail, dest, dest_tid)
@@ -3047,7 +3077,7 @@ fn item_type_is_abstract(expr: Int) -> Bool {
 fn binder_ref(item: Int) -> Int ! Diag.Report {
     let tid = stmt_tid(item)
     let rec = layout_at(tid, Position.Local, item)
-    ir_var_ref(tid, item, rec.c_spelling, cg_local_c_name(node_name(item)), rec.slot_form)
+    ir_var_ref(tid, item, rec.c_spelling, binder_c_local(node_name(item), item), rec.slot_form)
 }
 
 // The binder's type is typecheck's answer and the value's is the handler's own, so a
@@ -3065,7 +3095,7 @@ fn bind_context(item: Int, init: Int) -> Int ! Diag.Report {
     let _ = ensure_typedef_for(tid)
     let name = node_name(item)
     bind_binder_mut(cur_scope(), name, tid, false)
-    ir_let(tid, item, rec.c_spelling, cg_local_c_name(name), rec.slot_form, init)
+    ir_let(tid, item, rec.c_spelling, binder_c_local(name, item), rec.slot_form, init)
 }
 
 // `on_panic(f)` holds no value of its own: the item is f, held by the runtime for the body.
@@ -3090,12 +3120,19 @@ pub let PANIC_HOOK_ADAPTER = "__blink_main_panic_hook"
 
 pub type PanicHookAdapter {
     params: List[Str]
+    // The C names of `params`, which are all the body reads that it does not declare.
+    frame: List[Str]
     body: Int
 }
 
+let PH_HOOK = "__ph_hook"
+let PH_MESSAGE = "__ph_message"
+let PH_FILE = "__ph_file"
+let PH_LINE = "__ph_line"
+
 // No source line is 0 or less, so the runtime's line of a node the compiler built is None.
 pub fn cg_stmt_panic_hook_adapter(at: Int) -> PanicHookAdapter ! Diag.Report {
-    let none = PanicHookAdapter { params: [], body: -1 }
+    let none = PanicHookAdapter { params: [], frame: [], body: -1 }
     let hook_t = tc_panic_hook_fn_type()
     let info_t = tc_panic_info_type()
     let line_t = make_option_type(TYPE_INT)
@@ -3111,13 +3148,13 @@ pub fn cg_stmt_panic_hook_adapter(at: Int) -> PanicHookAdapter ! Diag.Report {
     let fn_type = fn_pointer_spelling_of(hook_t, at)
     if fn_type == "" { return none }
     ensure_typedef_for(info_t)
-    let hook = ir_var_ref(hook_t, at, hook_rec.c_spelling, "__ph_hook", hook_rec.slot_form)
-    let message = ir_var_ref(TYPE_STR, at, str_rec.c_spelling, "__ph_message", str_rec.slot_form)
-    let file = ir_var_ref(TYPE_STR, at, str_rec.c_spelling, "__ph_file", str_rec.slot_form)
+    let hook = ir_var_ref(hook_t, at, hook_rec.c_spelling, PH_HOOK, hook_rec.slot_form)
+    let message = ir_var_ref(TYPE_STR, at, str_rec.c_spelling, PH_MESSAGE, str_rec.slot_form)
+    let file = ir_var_ref(TYPE_STR, at, str_rec.c_spelling, PH_FILE, str_rec.slot_form)
     let known = ir_binary(TYPE_BOOL, at, bool_rec.c_spelling, ">",
-        ir_var_ref(TYPE_INT, at, int_rec.c_spelling, "__ph_line", int_rec.slot_form), ir_const(TYPE_INT, at, int_rec.c_spelling, "0"))
+        ir_var_ref(TYPE_INT, at, int_rec.c_spelling, PH_LINE, int_rec.slot_form), ir_const(TYPE_INT, at, int_rec.c_spelling, "0"))
     let some = cg_expr_option_some(line_t, at, line_rec,
-        ir_var_ref(TYPE_INT, at, int_rec.c_spelling, "__ph_line", int_rec.slot_form))
+        ir_var_ref(TYPE_INT, at, int_rec.c_spelling, PH_LINE, int_rec.slot_form))
     let absent = cg_expr_option_none(line_t, at, line_rec)
     if some < 0 || absent < 0 { return none }
     let line = ir_select(line_t, at, line_rec.c_spelling, line_rec.slot_form, known, some, absent)
@@ -3126,9 +3163,10 @@ pub fn cg_stmt_panic_hook_adapter(at: Int) -> PanicHookAdapter ! Diag.Report {
     let call = ir_call_closure(TYPE_NEVER, at, never_rec.c_spelling, fn_type, never_rec.slot_form, hook, [info])
     PanicHookAdapter {
         params: [
-            "{hook_rec.c_spelling} __ph_hook", "{str_rec.c_spelling} __ph_message",
-            "{str_rec.c_spelling} __ph_file", "{int_rec.c_spelling} __ph_line",
+            "{hook_rec.c_spelling} {PH_HOOK}", "{str_rec.c_spelling} {PH_MESSAGE}",
+            "{str_rec.c_spelling} {PH_FILE}", "{int_rec.c_spelling} {PH_LINE}",
         ]
+        frame: [PH_HOOK, PH_MESSAGE, PH_FILE, PH_LINE]
         body: ir_block(at, [ir_expr_stmt(at, call), ir_unreachable(at)])
     }
 }
@@ -3913,9 +3951,9 @@ fn or_alt_branch(ctx: MatchCtx, alt: Int, names: List[Str], holders: List[Str], 
         let target = ir_var_ref(tid, alt, rec.c_spelling, holders.get(i).unwrap(), rec.slot_form)
         // A `mut` binder a closure shares is a cell in the branch too.
         let value = if binder_is_celled(cur_scope(), name) {
-            ir_cell_ref(tid, alt, rec.c_spelling, name, rec.slot_form)
+            ir_cell_ref(tid, alt, rec.c_spelling, binder_c_local(name, alt), rec.slot_form)
         } else {
-            ir_var_ref(tid, alt, rec.c_spelling, cg_local_c_name(name), rec.slot_form)
+            ir_var_ref(tid, alt, rec.c_spelling, binder_c_local(name, alt), rec.slot_form)
         }
         out.push(ir_assign(alt, target, value))
         i = i + 1
