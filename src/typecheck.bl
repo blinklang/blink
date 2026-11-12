@@ -2255,9 +2255,7 @@ fn tc_mark_call_used(name: Str, decl: Int) {
 }
 
 // An alias is known only to the import index of the file that writes it, so no symbol table
-// maps its spelling to a module: the entries that bind it are what it uses. When an alias and
-// a plain selection bind one spelling, the clash is the one report, so neither entry is
-// called unused on top of it.
+// maps its spelling to a module: the entries that bind it are what it uses.
 fn tc_mark_alias_used(name: Str) -> Bool {
     let binds = nr_module_import_index(nr_current_module).get(name) ?? []
     let mut renames = false
@@ -20236,8 +20234,7 @@ pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report, IO.Eprint {
         }
     }
 
-    tc_check_namesake_import_ambiguity()
-    tc_check_renamed_import_conflicts()
+    tc_check_import_binding_clashes()
 
     validate_capabilities_budget(program, fns_sl)
 
@@ -22149,10 +22146,13 @@ let mut tc_qualifier_to_module: Map[Str, Str] = Map()
 let mut tc_import_modules_idx: Map[Str, Int] = Map()
 let mut tc_import_qualifiers_set: Map[Str, Int] = Map()
 
-// One name a selective import selects: the module it is selected from and its spelling there.
+// One name an import binds in its file: an entry of a selective list, with the module it is
+// selected from and its spelling there, or the qualifier of an import (`item` -1, `member` "").
 type ImportBinding {
     source_mod: Str
     member: Str
+    item: Int
+    stmt: Int
 }
 
 // `imp_node` is -1 for a whole import that does not rename its qualifier; `stmt` is its node all
@@ -22187,7 +22187,8 @@ fn nr_drop_import_index(consuming_mod: Str) {
                 r.imports.clear()
                 r.selects.clear()
                 r.qualifiers.clear()
-                nr_module_names.insert(consuming_mod, ModuleNames { decls: r.decls, sigs: r.sigs, imports: r.imports, selects: r.selects, qualifiers: r.qualifiers, imports_built: false, unselected: r.unselected, private_access: r.private_access, bare_decl: r.bare_decl, package: r.package, poisoned: r.poisoned, clash: r.clash })
+                r.qualifier_binds.clear()
+                nr_module_names.insert(consuming_mod, ModuleNames { decls: r.decls, sigs: r.sigs, imports: r.imports, selects: r.selects, qualifiers: r.qualifiers, qualifier_binds: r.qualifier_binds, imports_built: false, unselected: r.unselected, private_access: r.private_access, bare_decl: r.bare_decl, package: r.package, poisoned: r.poisoned, clash: r.clash })
             }
         }
         None => {}
@@ -22205,6 +22206,15 @@ fn nr_module_imports_built(consuming_mod: Str) -> ModuleNames {
     let mut idx = r.imports
     let mut selects = r.selects
     let mut quals = r.qualifiers
+    let mut qual_binds = r.qualifier_binds
+    // Read from the statements: per_module_imports keeps a whole import that does not rename
+    // its qualifier as -1.
+    for stmt in r.clash.import_stmts.keys() {
+        let qual = nr_import_qualifier(stmt)
+        let mut binds = qual_binds.get(qual) ?? []
+        binds.push(ImportBinding { source_mod: r.clash.import_stmts.get(stmt).unwrap(), member: "", item: -1, stmt: stmt })
+        qual_binds.insert(qual, binds)
+    }
     match per_module_imports.get(consuming_mod) {
         Some(imports) => {
             for source_mod in imports.keys() {
@@ -22232,7 +22242,7 @@ fn nr_module_imports_built(consuming_mod: Str) -> ModuleNames {
                         let alias = node_str_val(name_node)
                         let bound = if alias != "" { alias } else { node_name(name_node) }
                         let mut binds = idx.get(bound) ?? []
-                        binds.push(ImportBinding { source_mod: source_mod, member: node_name(name_node) })
+                        binds.push(ImportBinding { source_mod: source_mod, member: node_name(name_node), item: name_node, stmt: imp_node })
                         idx.insert(bound, binds)
                         // An alias replaces the original name in this file (sections/07, the
                         // alias rules): only the spelling the import binds is selected.
@@ -22244,7 +22254,7 @@ fn nr_module_imports_built(consuming_mod: Str) -> ModuleNames {
         }
         None => {}
     }
-    let built = ModuleNames { decls: r.decls, sigs: r.sigs, imports: idx, selects: selects, qualifiers: quals, imports_built: true, unselected: r.unselected, private_access: r.private_access, bare_decl: r.bare_decl, package: r.package, poisoned: r.poisoned, clash: r.clash }
+    let built = ModuleNames { decls: r.decls, sigs: r.sigs, imports: idx, selects: selects, qualifiers: quals, qualifier_binds: qual_binds, imports_built: true, unselected: r.unselected, private_access: r.private_access, bare_decl: r.bare_decl, package: r.package, poisoned: r.poisoned, clash: r.clash }
     nr_module_names.insert(consuming_mod, built)
     built
 }
@@ -22486,11 +22496,13 @@ fn nr_check_selective_access_at(name: Str, node: Int, idx: Int) -> Int ! Diag.Re
     // the builtin test, which costs a string compare ladder, since most reads are of locals.
     if nr_index_is_local(idx) { return 0 }
     // Two imports of this file bind the spelling to different declarations, which
-    // tc_check_renamed_import_conflicts has reported. One mistake, one report, even when a
+    // tc_check_import_binding_clashes has reported. One mistake, one report, even when a
     // third module's declaration of the spelling sits in the shared frame. The read uses
     // both imports, so neither is reported unused either.
-    if nr_renamed_import_clash(nr_current_module, name).0 != "" {
-        tc_mark_alias_used(name)
+    if nr_imports_disagree(nr_current_module, name).0 != "" {
+        for b in nr_module_import_index(nr_current_module).get(name) ?? [] {
+            tc_used_modules.insert(b.source_mod, 1)
+        }
         return 1
     }
     let mut answers = nr_module_names_of(nr_current_module).unselected
@@ -22586,7 +22598,6 @@ type PrivacyFacts {
 
 let mut nr_privacy: PrivacyFacts = PrivacyFacts { private: Map(), space: Map(), variant_owner: Map() }
 let mut nr_current_module: Str = ""
-let mut nr_name_source_module: Map[Str, Str] = Map()
 // What one module's bare names mean inside it. Filed by module and then by bare name because
 // name resolution asks these per name reference, and building a "module|name" key there cost
 // an allocation and a hash of the longer key on each question. Each table keeps the lifetime
@@ -22615,6 +22626,10 @@ type ModuleNames {
     // name in the module: another module's import loads a module into the program and binds
     // nothing here. Built and dropped with `imports`.
     qualifiers: Map[Str, Str]
+    // The qualifier each import statement binds → the statements that bind it, so that
+    // tc_check_import_binding_clashes judges qualifiers and listed names in one table. Built and
+    // dropped with `imports`.
+    qualifier_binds: Map[Str, List[ImportBinding]]
     imports_built: Bool
     // The answers resolve gives a spelling the module reads that no local binding holds, kept
     // because it asks them again at every read: nr_unselected_source, nr_private_access_here
@@ -22666,7 +22681,7 @@ fn nr_module_names_of(mod_name: Str) -> ModuleNames {
     match nr_module_names.get(mod_name) {
         Some(r) => r
         None => {
-            let r = ModuleNames { decls: Map(), sigs: Map(), imports: Map(), selects: Map(), qualifiers: Map(), imports_built: false, unselected: Map(), private_access: Map(), bare_decl: Map(), package: "", poisoned: Map(), clash: ModuleClash { import_stmts: Map(), nodes: Map(), qualifiers: Map(), rejected_literals: Map() } }
+            let r = ModuleNames { decls: Map(), sigs: Map(), imports: Map(), selects: Map(), qualifiers: Map(), qualifier_binds: Map(), imports_built: false, unselected: Map(), private_access: Map(), bare_decl: Map(), package: "", poisoned: Map(), clash: ModuleClash { import_stmts: Map(), nodes: Map(), qualifiers: Map(), rejected_literals: Map() } }
             nr_module_names.insert(mod_name, r)
             r
         }
@@ -22675,7 +22690,7 @@ fn nr_module_names_of(mod_name: Str) -> ModuleNames {
 
 pub fn tc_record_module_package(mod_name: Str, package: Str) {
     let r = nr_module_names_of(mod_name)
-    nr_module_names.insert(mod_name, ModuleNames { decls: r.decls, sigs: r.sigs, imports: r.imports, selects: r.selects, qualifiers: r.qualifiers, imports_built: r.imports_built, unselected: r.unselected, private_access: r.private_access, bare_decl: r.bare_decl, package: package, poisoned: r.poisoned, clash: r.clash })
+    nr_module_names.insert(mod_name, ModuleNames { decls: r.decls, sigs: r.sigs, imports: r.imports, selects: r.selects, qualifiers: r.qualifiers, qualifier_binds: r.qualifier_binds, imports_built: r.imports_built, unselected: r.unselected, private_access: r.private_access, bare_decl: r.bare_decl, package: package, poisoned: r.poisoned, clash: r.clash })
 }
 
 // Whether two modules sit in one package. A module is always in its own, and the standard
@@ -22868,11 +22883,16 @@ fn nr_find_import_collisions(program: Int) -> List[ImportCollision] {
     found
 }
 
-// `q.y` on a name that both an import and a declaration bind. Which of the two the compiler went
-// on with is its own choice, so a member that choice does not have was not the user's mistake.
+// `q.y` on a name that both an import and a declaration bind (E1012), or that two imports bind
+// to different items (E1005). Which of the two the compiler went on with is its own choice, so a
+// member that choice does not have was not the user's mistake.
 fn nr_is_call_on_collided_qualifier(call: Int) -> Bool {
     let obj = node_obj(call)
-    node_kind(obj) == NodeKind.Ident && nr_clash_of(node_module(call)).qualifiers.contains_key(node_name(obj))
+    if node_kind(obj) != NodeKind.Ident { return false }
+    let q = node_name(obj)
+    // An expression in a body carries no module of its own; the body's declaration does.
+    let m = if node_module(call) != "" { node_module(call) } else { nr_current_module }
+    nr_clash_of(m).qualifiers.contains_key(q) || nr_imports_disagree(nr_main_key(m), q).0 != ""
 }
 
 // The program's own file goes by two module keys.
@@ -22932,32 +22952,36 @@ fn nr_report_import_collisions(collisions: List[ImportCollision]) ! Diag.Report 
 }
 
 fn nr_item_collision_help(c: ImportCollision) -> Str {
-    let member = node_name(c.item)
-    let qual = nr_import_qualifier(c.stmt)
+    "drop `{nr_item_bound(c.item)}` from the import list and use `{nr_entry_qualified(c.stmt, c.item)}`,\nor import it under another name: {nr_entry_renamed_import(c.stmt, c.item)}"
+}
+
+// A name to import `member` of module `qual` under: `DbError` for `Error` of `db`, else
+// `qual_member`.
+fn nr_renamed_member(qual: Str, member: Str) -> Str {
     let first = qual.byte_at(0).to_int()
-    let renamed = if member.byte_at(0).to_int() >= 65 && member.byte_at(0).to_int() <= 90 && first >= 97 && first <= 122 {
+    if member.byte_at(0).to_int() >= 65 && member.byte_at(0).to_int() <= 90 && first >= 97 && first <= 122 {
         "{qual.byte_slice(0, 1).to_upper()}{qual.byte_slice(1, qual.byte_len())}{member}"
     } else {
         "{qual}_{member}"
     }
-    let as_qual = if node_name(c.stmt) != "" { " as {qual}" } else { "" }
-    "drop `{nr_item_bound(c.item)}` from the import list and use `{qual}.{member}`,\nor import it under another name: import {node_str_val(c.stmt)}{as_qual}.\{{member} as {renamed}}"
 }
 
 fn nr_qualifier_collision_help(stmt: Int) -> Str {
-    let mut list = ""
+    "import the module under another name: import {node_str_val(stmt)} as {nr_import_qualifier(stmt)}_mod{nr_import_list_text(stmt)}\nor rename the declaration"
+}
+
+// The list an import writes, as `.{P, Q as R}`, or "" for a whole import.
+fn nr_import_list_text(stmt: Int) -> Str {
     let items = node_args(stmt)
-    if items != -1 {
-        let mut written: List[Str] = []
-        let mut i = 0
-        while i < sublist_length(items) {
-            let item = sublist_get(items, i)
-            written.push(if node_str_val(item) != "" { "{node_name(item)} as {node_str_val(item)}" } else { node_name(item) })
-            i = i + 1
-        }
-        list = ".\{{written.join(", ")}}"
+    if items == -1 { return "" }
+    let mut written: List[Str] = []
+    let mut i = 0
+    while i < sublist_length(items) {
+        let item = sublist_get(items, i)
+        written.push(if node_str_val(item) != "" { "{node_name(item)} as {node_str_val(item)}" } else { node_name(item) })
+        i = i + 1
     }
-    "import the module under another name: import {node_str_val(stmt)} as {nr_import_qualifier(stmt)}_mod{list}\nor rename the declaration"
+    ".\{{written.join(", ")}}"
 }
 
 // Where an import statement writes the qualifier it binds: the name after `as`, or the leaf of
@@ -23594,80 +23618,154 @@ fn nr_note_local_binder_at(ident_node: Int, idx: Int) {
     tc_local_binder.insert(ident_node, binder)
 }
 
-// A bare type name that two of a file's selective imports both answer for. A file that
-// selects the same name from two declaring modules has written nothing that says which
-// declaration it means, so binding one makes the meaning depend on registration order
-// (spec sections/07_trust_modules_metadata.md, ambiguous import). Reported per READING
-// module, not against the entry file, because the file that selected both owns the choice.
-fn tc_check_namesake_import_ambiguity() ! Diag.Report {
-    if tc_namesake_type_modules.len() == 0 { return }
-    for reader in per_module_imports.keys() {
-        for bare in tc_namesake_type_modules.keys() {
-            let mods = tc_namesake_type_modules.get(bare) ?? ""
-            // A module's own declaration wins outright, so it is never asked to choose.
-            if mods.contains("|{reader}|") { continue }
-            let mut hits = 0
-            let mut first = ""
-            let mut second = ""
-            for source_mod in mods.split("|") {
-                if source_mod == "" { continue }
-                if is_selected_import(bare, reader, source_mod) == 0 { continue }
-                hits = hits + 1
-                if hits == 1 { first = source_mod } else { second = source_mod }
-            }
-            if hits > 1 {
-                let site = if tc_module_key_is_main(reader) != 0 { "" } else { " in module `{reader}`" }
-                diag_error_no_loc("AmbiguousImport", AMBIGUOUS_IMPORT, "type `{bare}` is ambiguous{site} — selected from both `{first}` and `{second}`", "name the declaration you mean, e.g. `{first}.{bare}`")
+// Two imports in one file that bind one name to different items (sections/07, "Imported
+// Names"). Each file has its own binding table, and listed names and qualifiers share it, so
+// every file is checked, whether or not it uses the name. Items are compared after `pub import`
+// chains are followed, so two entries that reach one item agree.
+fn tc_check_import_binding_clashes() ! Diag.Report {
+    for reader in nr_module_names.keys() {
+        if nr_module_names_of(reader).clash.import_stmts.len() == 0 { continue }
+        let r = nr_module_imports_built(reader)
+        let mut spellings = r.imports.keys()
+        for q in r.qualifier_binds.keys() {
+            if !r.imports.contains_key(q) { spellings.push(q) }
+        }
+        for spelling in spellings {
+            for pair in nr_import_binding_clashes(reader, spelling) {
+                nr_report_import_binding_clash(reader, spelling, pair.0, pair.1)
             }
         }
     }
 }
 
-// Two selective imports in one file that bind one spelling to different declarations, where
-// at least one of them renames (sections/07, "Imported Names": the check uses the name after
-// `as`). An alias is bound only in its own file, so no program-wide table sees the clash;
-// two plain selections of one spelling are reported by nr_check_ambiguity instead.
-fn tc_check_renamed_import_conflicts() ! Diag.Report {
-    for reader in per_module_imports.keys() {
-        for spelling in nr_module_import_index(reader).keys() {
-            let clash = nr_renamed_import_clash(reader, spelling)
-            if clash.0 == "" { continue }
-            let site = if tc_module_key_is_main(reader) != 0 { "" } else { " in module `{reader}`" }
-            diag_error_no_loc("AmbiguousImport", AMBIGUOUS_IMPORT, "`{spelling}` is imported twice{site}, from `{clash.0}` and from `{clash.1}`", "import one under another name, or drop it from the list and use the qualified path")
+// Each binding of `spelling` in `reader` that names another item than the first binding in
+// source order, paired with that first one. An entry that E1012 took out of the table, or that
+// names nothing, has its own report and takes no part.
+fn nr_import_binding_clashes(reader: Str, spelling: Str) -> List[(ImportBinding, ImportBinding)] {
+    let r = nr_module_imports_built(reader)
+    let mut binds: List[ImportBinding] = []
+    for b in r.qualifier_binds.get(spelling) ?? [] { binds.push(b) }
+    let mut qualified: Set[Str] = Set.new()
+    for b in binds { qualified.insert(b.source_mod) }
+    for b in r.imports.get(spelling) ?? [] {
+        // A listed name that equals the qualifier of its own module (`import m.{m}`) is not
+        // ruled a clash yet: the spec writes this shape as valid, and the panel has not ruled.
+        if !qualified.contains(b.source_mod) { binds.push(b) }
+    }
+    let mut out: List[(ImportBinding, ImportBinding)] = []
+    if binds.len() < 2 { return out }
+    let ordered = binds.sort_by(fn(a: ImportBinding, b: ImportBinding) -> Ordering {
+        tc_er_source_order(nr_binding_site(a)).cmp(tc_er_source_order(nr_binding_site(b)))
+    })
+    let mut first_target = ""
+    let mut first = ordered.get(0).unwrap()
+    // An entry that names an item already reported is W0602 against that entry, not a new clash.
+    let mut reported: Set[Str] = Set.new()
+    for b in ordered {
+        let target = nr_binding_target(b)
+        if target == "" { continue }
+        if first_target == "" {
+            first_target = target
+            first = b
+        } else if target != first_target && !reported.contains(target) {
+            reported.insert(target)
+            out.push((first, b))
         }
     }
+    out
 }
 
-// The two source modules of the first pair of `reader`'s imports that bind `spelling` to
-// different declarations when one of them renames, else ("", "").
-fn nr_renamed_import_clash(reader: Str, spelling: Str) -> (Str, Str) {
-    let binds = nr_module_import_index(reader).get(spelling) ?? []
-    let mut renames = false
-    for b in binds {
-        if b.member != spelling { renames = true }
+fn nr_binding_site(b: ImportBinding) -> Int {
+    if b.item != -1 { b.item } else { b.stmt }
+}
+
+// What a binding names: the module of a qualifier, else the declaration an entry reaches; ""
+// for an entry that names nothing.
+fn nr_binding_target(b: ImportBinding) -> Str {
+    if b.item == -1 { return "module {b.source_mod}" }
+    let decl = nr_resolve_decl_in_module(b.source_mod, b.member, 0)
+    if decl == -1 { return "" }
+    // An entry that selects a private item is E1003, its own report. Read from the declaration,
+    // as resolve_names fills nr_privacy.private only after this check runs.
+    if (nr_privacy.space.get(decl) ?? "") != "variant" && node_is_pub(decl) == 0 { return "" }
+    "decl {decl}"
+}
+
+// E1005 at the later binding, with a label on the first.
+fn nr_report_import_binding_clash(reader: Str, bound: Str, first: ImportBinding, later: ImportBinding) ! Diag.Report {
+    let module = tc_module_display_name(reader)
+    let path = node_str_val(later.stmt)
+    let first_path = node_str_val(first.stmt)
+    let both_qualifiers = first.item == -1 && later.item == -1
+    let message = if both_qualifiers { "the qualifier `{bound}` is imported twice in module `{module}`" } else { "`{bound}` is imported twice in module `{module}`" }
+    let (line, col, end_col) = nr_binding_span(later)
+    let before = diag_entry_count()
+    if later.item != -1 {
+        diag_error_span_label_at_notes("AmbiguousImport", AMBIGUOUS_IMPORT, message,
+            later.item, line, col, end_col, "imported again from `{path}` here",
+            "import one under another name: {nr_entry_renamed_import(later.stmt, later.item)}\nor drop it from the list and use `{nr_entry_qualified(later.stmt, later.item)}`", [])
+    } else {
+        diag_error_span_label_at_notes("AmbiguousImport", AMBIGUOUS_IMPORT, message,
+            later.stmt, line, col, end_col, "this import binds `{bound}` again, to `{path}`",
+            nr_qualifier_rebind_help(later.stmt), [])
     }
-    if !renames { return ("", "") }
-    nr_imports_disagree(reader, spelling)
+    // The clash is the one report on both imports, so neither is also called unused.
+    tc_used_modules.insert(first.source_mod, 1)
+    tc_used_modules.insert(later.source_mod, 1)
+    let (first_line, first_col, first_end) = nr_binding_span(first)
+    let first_label = if first.item != -1 { "first imported from `{first_path}` here" } else { "this import binds the qualifier `{bound}` to `{first_path}`" }
+    diag_add_label_since(before, first_line, first_col, first_end, first_label)
 }
 
-// The two source modules of the first pair of `reader`'s imports that bind `spelling` to
-// different declarations, else ("", "").
+// Where a binding is written: a list entry, the name after `as` of a renaming import, or else
+// the module path.
+fn nr_binding_span(b: ImportBinding) -> (Int, Int, Int) {
+    if b.item != -1 { return (node_line(b.item), node_col(b.item), nr_item_end_col(b.item)) }
+    if node_name(b.stmt) != "" {
+        let (line, col) = nr_import_qualifier_at(b.stmt)
+        return (line, col, col + node_name(b.stmt).byte_len())
+    }
+    let (line, col) = tc_import_path_at(b.stmt)
+    (line, col, col + node_str_val(b.stmt).byte_len())
+}
+
+// The help for a second import of a qualifier: rename the module with `as`, under its path
+// with the dots taken out (`b.x` as `bx`), and keep each name the list binds.
+fn nr_qualifier_rebind_help(stmt: Int) -> Str {
+    let path = node_str_val(stmt)
+    let renamed = path.replace(".", "")
+    let list = nr_import_list_text(stmt)
+    if list == "" { return "import the module under another name: import {path} as {renamed}" }
+    let mut kept: List[Str] = []
+    let items = node_args(stmt)
+    let mut i = 0
+    while i < sublist_length(items) {
+        kept.push("`{nr_item_bound(sublist_get(items, i))}`")
+        i = i + 1
+    }
+    "import the module under another name and keep {kept.join(", ")}: import {path} as {renamed}{list}"
+}
+
+// The import text that binds `item` of `stmt` under another name, and the qualified access
+// that needs no entry: `import db.{Error as DbError}` and `db.Error`.
+fn nr_entry_renamed_import(stmt: Int, item: Int) -> Str {
+    let member = node_name(item)
+    let qual = nr_import_qualifier(stmt)
+    let as_qual = if node_name(stmt) != "" { " as {qual}" } else { "" }
+    "import {node_str_val(stmt)}{as_qual}.\{{member} as {nr_renamed_member(qual, member)}}"
+}
+
+fn nr_entry_qualified(stmt: Int, item: Int) -> Str {
+    "{nr_import_qualifier(stmt)}.{node_name(item)}"
+}
+
+// The two source modules of the first pair of `reader`'s bindings of `spelling` that name
+// different items, else ("", "").
 fn nr_imports_disagree(reader: Str, spelling: Str) -> (Str, Str) {
-    let binds = nr_module_import_index(reader).get(spelling) ?? []
-    if binds.len() < 2 { return ("", "") }
-    let mut first = -1
-    let mut first_mod = ""
-    for b in binds {
-        let hit = nr_resolve_decl_in_module(b.source_mod, b.member, 0)
-        if hit == -1 { continue }
-        if first == -1 {
-            first = hit
-            first_mod = b.source_mod
-        } else if hit != first {
-            return (first_mod, b.source_mod)
-        }
+    match nr_import_binding_clashes(reader, spelling).get(0) {
+        Some(pair) => (pair.0.source_mod, pair.1.source_mod)
+        None => ("", "")
     }
-    ("", "")
 }
 
 // The declaration a selective import in `consuming_mod` binds to the spelling `name`: the
@@ -23861,18 +23959,6 @@ fn nr_bare_name_in_scope_here(name: Str, consuming_mod: Str) -> Int {
     0
 }
 
-// A name is ambiguous only where two declarations of it are both in a file's bare scope. A
-// selective import names one of them, which settles the question the clash was asking.
-fn nr_ambiguity_settled_by_import(name: Str) -> Int {
-    let cands = nr_decls_by_name.get(name) ?? []
-    if cands.len() == 0 { return 0 }
-    let mut hits = 0
-    for c in cands {
-        if !is_filtered_for_module(name, node_module(c), "__main__") { hits = hits + 1 }
-    }
-    if hits <= 1 { 1 } else { 0 }
-}
-
 // True when `source_mod` declares `name` in namespace `space` ("value", "type", "variant",
 // or "any" for all three) without `pub`, so no import can select it and no qualifier can reach
 // it there, whatever other modules or other namespaces declare under the name.
@@ -23945,20 +24031,6 @@ fn nr_decl_owner(decl: Int) -> Str ! Diag.Report {
 fn nr_decl_fits(decl: Int, space: Str) -> Bool {
     let d = nr_privacy.space.get(decl) ?? ""
     if space == "value" { d == "value" || d == "variant" } else { d == space }
-}
-
-fn nr_check_ambiguity(name: Str, mod_name: Str, local_names: Map[Str, Int]) ! Diag.Report {
-    if mod_name == "" || mod_name == "__main__" { return }
-    if nr_is_private_in("value", name, mod_name) != 0 { return }
-    if local_names.contains_key(name) { return }
-    match nr_name_source_module.get(name) {
-        Some(existing_mod) => {
-            if existing_mod != mod_name && existing_mod != "__main__" && nr_ambiguity_settled_by_import(name) == 0 {
-                diag_error_no_loc("AmbiguousImport", AMBIGUOUS_IMPORT, "name `{name}` is ambiguous — imported from both `{existing_mod}` and `{mod_name}`", "use selective imports to disambiguate, e.g. import {existing_mod}.\{name}")
-            }
-        }
-        None => nr_name_source_module.insert(name, mod_name)
-    }
 }
 
 // Whether a QUALIFIED access in namespace `space` reaches a private declaration. The question
@@ -27704,6 +27776,8 @@ fn tc_refuse_list_scan(node: Int, obj_t: Int, need: List[Int], method: Str) -> I
 // A call with no method behind it has no binders for its list to count, so the list gets no
 // second report.
 fn tc_report_unresolved_method(node: Int, recv: Int, tname: Str, method: Str) ! Diag.Report {
+    // The clash of the qualifier is the one report.
+    if node_kind(node) == NodeKind.MethodCall && nr_is_call_on_collided_qualifier(node) { return }
     tc_type_args_unresolved.insert(node, 1)
     let k = type_kind(recv)
     if k == TyKind.Bool && method == "to_int" { return tc_report_bool_to_int(node) }
@@ -28914,7 +28988,6 @@ fn resolve_names(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repor
     nr_impl_method_names = []
     nr_bh_context = Map()
     nr_privacy.private.clear()
-    nr_name_source_module = Map()
     // Bare-name answers cached by the passes before this one may predate the prelude's
     // free-function table, so they are asked again here.
     nr_forget_answers()
@@ -28997,43 +29070,16 @@ fn resolve_names(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repor
 
     tc_check_values_named_like_variants(program)
 
-    // Pre-collect __main__ names to suppress ambiguity when local defs shadow
-    let mut main_names: Map[Str, Int] = Map()
-    let pre_fns = node_params(program)
-    if pre_fns != -1 {
-        let mut i = 0
-        while i < sublist_length(pre_fns) {
-            let fn_node = sublist_get(pre_fns, i)
-            if node_module(fn_node) == "__main__" {
-                main_names.insert(node_name(fn_node), 1)
-            }
-            i = i + 1
-        }
-    }
-    let pre_lets = node_stmts(program)
-    if pre_lets != -1 {
-        let mut i = 0
-        while i < sublist_length(pre_lets) {
-            let l = sublist_get(pre_lets, i)
-            if node_module(l) == "__main__" {
-                main_names.insert(node_name(l), 1)
-            }
-            i = i + 1
-        }
-    }
-
     // Register all top-level let binding names
     let lets_sl = node_stmts(program)
     if lets_sl != -1 {
         let mut i = 0
         while i < sublist_length(lets_sl) {
             let l = sublist_get(lets_sl, i)
-            let l_mod = node_module(l)
             let bound = tc_module_let_bound_names(l)
             let mut bi = 0
             while bi < bound.len() {
                 let l_name = bound.get(bi).unwrap()
-                nr_check_ambiguity(l_name, l_mod, main_names)
                 nr_define(l_name)
                 bi = bi + 1
             }
@@ -29048,8 +29094,6 @@ fn resolve_names(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repor
         while i < sublist_length(fns_sl) {
             let fn_node = sublist_get(fns_sl, i)
             let fn_name = node_name(fn_node)
-            let fn_mod = node_module(fn_node)
-            nr_check_ambiguity(fn_name, fn_mod, main_names)
             nr_define(fn_name)
             i = i + 1
         }

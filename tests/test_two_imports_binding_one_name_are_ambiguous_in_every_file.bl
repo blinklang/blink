@@ -1,0 +1,165 @@
+// Each file has its own binding table, and two imports in one file that bind one name to
+// different items are AmbiguousImport (E1005), in every file of the program, whether or not the
+// file uses the name (sections/07_trust_modules_metadata.md §10.5, "Imported Names"). Two
+// imports that bind one name to the same item are legal. Check and both build modes agree.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> ProcessResult ! Process.Spawn {
+    process.run("sh", ["-c", cmd]).unwrap()
+}
+
+// The child must judge the compiler's defaults, not the settings of a corpus run around it.
+fn blink_in(dir: Str, args: Str) -> ProcessResult ! Process.Spawn {
+    sh("B=$(pwd)/build/blink; cd {dir} && env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE timeout 120 $B {args} src/main.bl < /dev/null 2>&1")
+}
+
+// A package of the given (path, source) files.
+fn new_package(files: List[(Str, Str)]) -> Str ! FS.Write, Process.Spawn {
+    let dir = sh("mktemp -d /tmp/blink_import_twice.XXXXXX").out.trim()
+    let _ = sh("mkdir -p {dir}/src")
+    fs.write("{dir}/blink.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\n").unwrap()
+    for f in files {
+        let _ = sh("mkdir -p $(dirname {dir}/src/{f.0}.bl)")
+        fs.write("{dir}/src/{f.0}.bl", f.1).unwrap()
+    }
+    dir
+}
+
+fn cleanup(dir: Str) ! Process.Spawn {
+    let _ = sh("rm -rf {dir}")
+}
+
+fn expect_runs(files: List[(Str, Str)], want: Str) ! IO, FS.Write, Process.Spawn {
+    let dir = new_package(files)
+    let mut ok = true
+    for args in ["check", "run --no-per-module", "run --per-module"] {
+        let r = blink_in(dir, args)
+        let good = r.success() && (args == "check" || r.out.trim().ends_with(want))
+        if !good {
+            io.eprintln("blink {args}: {r.end}\n{r.out}")
+            ok = false
+        }
+    }
+    cleanup(dir)
+    assert(ok)
+}
+
+// Check and both build modes stop with E1005 at `site`, and with no internal compiler error.
+fn expect_ambiguous(files: List[(Str, Str)], site: Str) ! IO, FS.Write, Process.Spawn {
+    let dir = new_package(files)
+    let mut ok = true
+    for args in ["check", "build --no-per-module", "build --per-module"] {
+        let r = blink_in(dir, args)
+        let good = !r.success() && r.out.contains("error[AmbiguousImport]") && r.out.contains(site) && !r.out.contains("internal compiler error")
+        if !good {
+            io.eprintln("blink {args}: {r.end}\n{r.out}")
+            ok = false
+        }
+    }
+    cleanup(dir)
+    assert(ok)
+}
+
+let alpha = ("alpha", "pub fn x() -> Int \{ 1 }\npub fn y() -> Int \{ 3 }\n")
+let beta = ("beta", "pub fn x() -> Int \{ 2 }\n")
+let facade = ("facade", "pub import alpha.\{x}\n")
+let main_a = ("main", "import a\nfn main() \{ io.println(\"\{a.r()}\") }\n")
+let gamma = ("gamma", "pub fn x() -> Int \{ 4 }\npub fn alpha() -> Int \{ 5 }\n")
+let p_alpha = ("p/alpha", "pub fn x() -> Int \{ 6 }\n")
+let q_alpha = ("q/alpha", "pub fn x() -> Int \{ 7 }\n")
+
+// Two imports that bind the qualifier or name `alpha` to different items are E1005 at the
+// second, in main and in another module, whether `reading` reads the name or not.
+fn expect_ambiguous_in_each_file(imports: Str, reading: Str) ! IO, FS.Write, Process.Spawn {
+    let mods = [alpha, beta, gamma, p_alpha, q_alpha]
+    for body in [reading, "0"] {
+        let mut in_main = mods.clone()
+        in_main.push(("main", "{imports}fn main() \{ io.println(\"\{{body}}\") }\n"))
+        expect_ambiguous(in_main, "src/main.bl:2:")
+        let mut in_a = mods.clone()
+        in_a.push(main_a)
+        in_a.push(("a", "{imports}pub fn r() -> Int \{ {body} }\n"))
+        expect_ambiguous(in_a, "src/a.bl:2:")
+    }
+}
+
+test "two selections of one name in a module that is not main are E1005" {
+    expect_ambiguous([alpha, beta, main_a,
+        ("a", "import alpha.\{x}\nimport beta.\{x}\npub fn r() -> Int \{ x() }\n")], "src/a.bl:2:")
+}
+
+test "the name need not be used for E1005" {
+    expect_ambiguous([alpha, beta, main_a,
+        ("a", "import alpha.\{x}\nimport beta.\{x}\npub fn r() -> Int \{ 0 }\n")], "src/a.bl:2:")
+}
+
+test "two pub imports that bind one name are E1005 too" {
+    expect_ambiguous([alpha, beta, main_a,
+        ("a", "pub import alpha.\{x}\npub import beta.\{x}\npub fn r() -> Int \{ 0 }\n")], "src/a.bl:2:")
+}
+
+test "a module two levels below main is checked as well" {
+    expect_ambiguous([alpha, beta, main_a,
+        ("a", "import d\npub fn r() -> Int \{ d.r() }\n"),
+        ("d", "import alpha.\{x}\nimport beta.\{x}\npub fn r() -> Int \{ x() }\n")], "src/d.bl:2:")
+}
+
+test "two selections of one name in main are E1005" {
+    expect_ambiguous([alpha, beta,
+        ("main", "import alpha.\{x}\nimport beta.\{x}\nfn main() \{ io.println(\"\{x()}\") }\n")], "src/main.bl:2:")
+}
+
+test "one item selected twice in a module that is not main builds" {
+    expect_runs([alpha, main_a,
+        ("a", "import alpha.\{x}\nimport alpha.\{x}\npub fn r() -> Int \{ x() }\n")], "1")
+}
+
+test "one item selected directly and through a facade builds" {
+    expect_runs([alpha, facade, main_a,
+        ("a", "import alpha.\{x}\nimport facade.\{x}\npub fn r() -> Int \{ x() }\n")], "1")
+}
+
+test "one item under two names builds" {
+    expect_runs([alpha, main_a,
+        ("a", "import alpha.\{x, x as one}\npub fn r() -> Int \{ x() + one() }\n")], "2")
+}
+
+test "two files may each select one name from different modules" {
+    expect_runs([alpha, beta,
+        ("a", "import alpha.\{x}\npub fn r() -> Int \{ x() }\n"),
+        ("b", "import beta.\{x}\npub fn r() -> Int \{ x() }\n"),
+        ("main", "import a\nimport b\nfn main() \{ io.println(\"\{a.r()} \{b.r()}\") }\n")], "1 2")
+}
+
+test "two module paths that end in one qualifier are E1005" {
+    expect_ambiguous_in_each_file("import p.alpha\nimport q.alpha\n", "alpha.x()")
+}
+
+test "a module renamed to the qualifier of another is E1005" {
+    expect_ambiguous_in_each_file("import alpha\nimport beta as alpha\n", "alpha.x()")
+}
+
+test "a selected name that is the qualifier of another import is E1005" {
+    expect_ambiguous_in_each_file("import alpha\nimport gamma.\{alpha}\n", "alpha.x()")
+}
+
+test "a qualifier bound twice to one module builds" {
+    expect_runs([alpha, main_a,
+        ("a", "import alpha\nimport alpha.\{x}\nimport alpha as al\npub fn r() -> Int \{ x() + alpha.y() + al.y() }\n")], "7")
+}
+
+test "two modules of one leaf name under different qualifiers build" {
+    expect_runs([p_alpha, q_alpha,
+        ("main", "import p.alpha.\{x}\nimport q.alpha as qa\nfn main() \{ io.println(\"\{x() + qa.x()}\") }\n")], "13")
+}
+
+// The panel has not ruled whether a listed name that equals its own module's qualifier binds
+// two items. Until it does, this shape keeps building, as the spec writes it in an example.
+test "a listed name that equals its own module's qualifier builds" {
+    let greet = ("greet", "pub fn greet() -> Int \{ 8 }\n")
+    expect_runs([greet,
+        ("main", "import greet.\{greet}\nfn main() \{ io.println(\"\{greet()}\") }\n")], "8")
+    expect_runs([greet, main_a,
+        ("a", "import greet.\{greet}\npub fn r() -> Int \{ greet() }\n")], "8")
+}

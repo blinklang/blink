@@ -1,0 +1,233 @@
+// Two imports in one file that bind one name to different items are AmbiguousImport (E1005),
+// in each file of the program, at the second entry (sections/07_trust_modules_metadata.md
+// §10.5, "Imported Names"). It covers both namespaces, and one mistake gives one diagnostic.
+import typecheck.{check_types}
+import compiler.{compile_to_program}
+import diagnostics.{diag_entries, diag_reset, DiagEntry}
+import std.io
+
+let PKG = "build/tc_import_twice_pkg"
+
+fn compile_probe(files: List[(Str, Str)]) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Env.Exit, Env.Read, FS.Read, IO, FS.Write, Process.Spawn {
+    let _rm = process.run("rm", ["-rf", PKG]).unwrap()
+    let _mk = process.run("mkdir", ["-p", "{PKG}/src"]).unwrap()
+    fs.write("{PKG}/blink.toml", "[package]\nname = \"tcimptwice\"\nversion = \"0.1.0\"\n").unwrap()
+    fs.write("{PKG}/src/alpha.bl", "pub fn x() -> Int \{ 1 \}\npub fn y() -> Int \{ 3 \}\npub type P \{ a: Int \}\npub type V \{ v: Int \}\n").unwrap()
+    fs.write("{PKG}/src/beta.bl", "pub fn x() -> Int \{ 2 \}\npub type P \{ b: Int \}\npub let V: Int = 2\nfn y() -> Int \{ 8 \}\n").unwrap()
+    fs.write("{PKG}/src/facade.bl", "pub import alpha.\{x\}\n").unwrap()
+    fs.write("{PKG}/src/gamma.bl", "pub fn x() -> Int \{ 4 \}\npub fn alpha() -> Int \{ 5 \}\n").unwrap()
+    let _mkpq = process.run("mkdir", ["-p", "{PKG}/src/p", "{PKG}/src/q"]).unwrap()
+    fs.write("{PKG}/src/p/alpha.bl", "pub fn x() -> Int \{ 6 \}\n").unwrap()
+    fs.write("{PKG}/src/q/alpha.bl", "pub fn x() -> Int \{ 7 \}\n").unwrap()
+    for f in files {
+        fs.write("{PKG}/src/{f.0}.bl", f.1).unwrap()
+    }
+    diag_reset()
+    let program = compile_to_program("{PKG}/src/main.bl", 1)
+    check_types(program)
+}
+
+fn cleanup() ! Process.Spawn {
+    let _rm = process.run("rm", ["-rf", PKG]).unwrap()
+}
+
+fn errors() -> List[DiagEntry] {
+    let mut out: List[DiagEntry] = []
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" { out.push(d) }
+    }
+    out
+}
+
+// Exactly one error, AmbiguousImport, on line `line` of `file`. Failures report on stderr: a
+// failing assert aborts, and an abort drops whatever stdout has buffered.
+fn assert_one_e1005_at(label: Str, file: Str, line: Int) ! IO.Eprint {
+    let got = errors()
+    let ok = got.len() == 1 && got.get(0).unwrap().name == "AmbiguousImport" && got.get(0).unwrap().file.ends_with("/{file}") && got.get(0).unwrap().line == line
+    if !ok {
+        io.eprintln("FAIL: {label}: want one AmbiguousImport at {file}:{line}, got:")
+        for e in got { io.eprintln("    {e.name} {e.file}:{e.line}: {e.message}") }
+    }
+    assert(ok)
+}
+
+fn assert_message(label: Str, want: Str) ! IO.Eprint {
+    let got = errors()
+    let ok = got.len() == 1 && got.get(0).unwrap().message == want
+    if !ok {
+        io.eprintln("FAIL: {label}: want the message `{want}`, got:")
+        for e in got { io.eprintln("    {e.name} {e.file}:{e.line}: {e.message}") }
+    }
+    assert(ok)
+}
+
+// The imports bind the qualifier or name `alpha` twice: E1005 at the second, with `message`,
+// in main and in module a, whether `reading` reads the name or not.
+fn assert_clash_in_each_file(label: Str, imports: Str, reading: Str, message: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Env.Exit, Env.Read, FS.Read, IO, FS.Write, Process.Spawn {
+    for body in [reading, "0"] {
+        compile_probe([("main", "{imports}fn main() \{ assert({body} >= 0) \}\n")])
+        assert_one_e1005_at("{label}, in main, reading {body}", "main.bl", 2)
+        assert_message("{label}, in main", message.replace("MODULE", "main"))
+        compile_probe([main_a, ("a", "{imports}pub fn r() -> Int \{ {body} \}\n")])
+        assert_one_e1005_at("{label}, in a, reading {body}", "a.bl", 2)
+        assert_message("{label}, in a", message.replace("MODULE", "a"))
+    }
+    cleanup()
+}
+
+fn assert_no_errors(label: Str) ! IO.Eprint {
+    let got = errors()
+    if got.len() != 0 {
+        io.eprintln("FAIL: {label}: want no errors, got:")
+        for e in got { io.eprintln("    {e.name} {e.file}:{e.line}: {e.message}") }
+    }
+    assert(got.len() == 0)
+}
+
+let main_a = ("main", "import a\nfn main() \{ assert(a.r() >= 0) \}\n")
+
+fn test_a_function_selected_twice_in_another_module() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Env.Exit, Env.Read, FS.Read, IO, FS.Write, Process.Spawn {
+    compile_probe([main_a, ("a", "import alpha.\{x\}\nimport beta.\{x\}\npub fn r() -> Int \{ x() \}\n")])
+    assert_one_e1005_at("x from alpha and beta in a, used", "a.bl", 2)
+    cleanup()
+}
+
+fn test_an_unused_name_selected_twice_in_another_module() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Env.Exit, Env.Read, FS.Read, IO, FS.Write, Process.Spawn {
+    compile_probe([main_a, ("a", "import alpha.\{x\}\nimport beta.\{x\}\npub fn r() -> Int \{ 0 \}\n")])
+    assert_one_e1005_at("x from alpha and beta in a, unused", "a.bl", 2)
+    cleanup()
+}
+
+fn test_a_name_selected_twice_by_pub_imports() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Env.Exit, Env.Read, FS.Read, IO, FS.Write, Process.Spawn {
+    compile_probe([main_a, ("a", "pub import alpha.\{x\}\npub import beta.\{x\}\npub fn r() -> Int \{ 0 \}\n")])
+    assert_one_e1005_at("pub import of x from alpha and beta in a", "a.bl", 2)
+    cleanup()
+}
+
+fn test_a_function_selected_twice_in_main() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Env.Exit, Env.Read, FS.Read, IO, FS.Write, Process.Spawn {
+    compile_probe([("main", "import alpha.\{x\}\nimport beta.\{x\}\nfn main() \{ assert(x() > 0) \}\n")])
+    assert_one_e1005_at("x from alpha and beta in main", "main.bl", 2)
+    cleanup()
+}
+
+fn test_a_renamed_entry_that_binds_a_name_twice() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Env.Exit, Env.Read, FS.Read, IO, FS.Write, Process.Spawn {
+    compile_probe([main_a, ("a", "import alpha.\{x\}\nimport alpha.\{y as x\}\npub fn r() -> Int \{ x() \}\n")])
+    assert_one_e1005_at("x and y as x from alpha in a", "a.bl", 2)
+    cleanup()
+}
+
+fn test_a_type_selected_twice_in_another_module() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Env.Exit, Env.Read, FS.Read, IO, FS.Write, Process.Spawn {
+    compile_probe([main_a, ("a", "import alpha.\{P\}\nimport beta.\{P\}\npub fn r() -> Int \{ 0 \}\n")])
+    assert_one_e1005_at("type P from alpha and beta in a", "a.bl", 2)
+    cleanup()
+}
+
+fn test_a_type_selected_twice_in_main() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Env.Exit, Env.Read, FS.Read, IO, FS.Write, Process.Spawn {
+    compile_probe([("main", "import alpha.\{P\}\nimport beta.\{P\}\nfn main() \{ \}\n")])
+    assert_one_e1005_at("type P from alpha and beta in main", "main.bl", 2)
+    cleanup()
+}
+
+fn test_a_type_and_a_value_of_one_name() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Env.Exit, Env.Read, FS.Read, IO, FS.Write, Process.Spawn {
+    compile_probe([main_a, ("a", "import alpha.\{V\}\nimport beta.\{V\}\npub fn r() -> Int \{ 0 \}\n")])
+    assert_one_e1005_at("type V from alpha and let V from beta in a", "a.bl", 2)
+    cleanup()
+}
+
+fn test_one_item_twice_is_not_ambiguous() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Env.Exit, Env.Read, FS.Read, IO, FS.Write, Process.Spawn {
+    compile_probe([main_a, ("a", "import alpha.\{x\}\nimport facade.\{x\}\nimport alpha.\{x as x\}\npub fn r() -> Int \{ x() \}\n")])
+    assert_no_errors("x from alpha, through facade, and as itself")
+    cleanup()
+}
+
+fn test_two_module_paths_that_end_in_one_qualifier() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Env.Exit, Env.Read, FS.Read, IO, FS.Write, Process.Spawn {
+    assert_clash_in_each_file("p.alpha and q.alpha", "import p.alpha\nimport q.alpha\n", "alpha.x()", "the qualifier `alpha` is imported twice in module `MODULE`")
+}
+
+fn test_a_module_renamed_to_the_qualifier_of_another() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Env.Exit, Env.Read, FS.Read, IO, FS.Write, Process.Spawn {
+    assert_clash_in_each_file("alpha and beta as alpha", "import alpha\nimport beta as alpha\n", "alpha.x()", "the qualifier `alpha` is imported twice in module `MODULE`")
+}
+
+fn test_a_selected_name_that_is_the_qualifier_of_another_import() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Env.Exit, Env.Read, FS.Read, IO, FS.Write, Process.Spawn {
+    assert_clash_in_each_file("alpha and gamma.\{alpha\}", "import alpha\nimport gamma.\{alpha\}\n", "alpha.x()", "`alpha` is imported twice in module `MODULE`")
+}
+
+fn test_a_qualifier_bound_twice_to_one_module_is_not_ambiguous() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Env.Exit, Env.Read, FS.Read, IO, FS.Write, Process.Spawn {
+    compile_probe([main_a, ("a", "import alpha\nimport alpha.\{x\}\nimport alpha as al\npub fn r() -> Int \{ x() + alpha.y() + al.y() \}\n")])
+    assert_no_errors("alpha, alpha.\{x\} and alpha as al")
+    compile_probe([("main", "import p.alpha.\{x\}\nimport q.alpha as qa\nfn main() \{ assert(x() + qa.x() > 0) \}\n")])
+    assert_no_errors("p.alpha.\{x\} and q.alpha as qa")
+    cleanup()
+}
+
+fn assert_no_e1005(label: Str) ! IO.Eprint {
+    let mut n = 0
+    for e in errors() {
+        if e.name == "AmbiguousImport" {
+            io.eprintln("FAIL: {label}: want no AmbiguousImport, got {e.file}:{e.line}: {e.message}")
+            n = n + 1
+        }
+    }
+    assert(n == 0)
+}
+
+fn test_a_third_entry_for_an_item_already_reported_adds_no_report() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Env.Exit, Env.Read, FS.Read, IO, FS.Write, Process.Spawn {
+    compile_probe([main_a, ("a", "import alpha.\{x\}\nimport beta.\{x\}\nimport beta.\{x\}\npub fn r() -> Int \{ x() \}\n")])
+    assert_one_e1005_at("alpha.\{x\}, beta.\{x\} and beta.\{x\}", "a.bl", 2)
+    cleanup()
+}
+
+fn test_a_third_entry_for_a_third_item_is_its_own_report() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Env.Exit, Env.Read, FS.Read, IO, FS.Write, Process.Spawn {
+    compile_probe([main_a, ("a", "import alpha.\{x\}\nimport beta.\{x\}\nimport gamma.\{x\}\npub fn r() -> Int \{ x() \}\n")])
+    let got = errors()
+    let ok = got.len() == 2 && got.get(0).unwrap().name == "AmbiguousImport" && got.get(0).unwrap().line == 2 && got.get(1).unwrap().name == "AmbiguousImport" && got.get(1).unwrap().line == 3
+    if !ok {
+        io.eprintln("FAIL: alpha, beta and gamma: want AmbiguousImport at a.bl:2 and a.bl:3, got:")
+        for e in got { io.eprintln("    {e.name} {e.file}:{e.line}: {e.message}") }
+    }
+    assert(ok)
+    cleanup()
+}
+
+// A declaration of the name takes the imports out of the table (E1012), so they do not clash.
+fn test_imports_that_a_declaration_shadows_do_not_clash() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Env.Exit, Env.Read, FS.Read, IO, FS.Write, Process.Spawn {
+    compile_probe([main_a, ("a", "import alpha.\{x\}\nimport beta.\{x\}\nfn x() -> Int \{ 5 \}\npub fn r() -> Int \{ x() \}\n")])
+    assert_no_e1005("alpha.\{x\}, beta.\{x\} and fn x")
+    cleanup()
+}
+
+// An entry that selects a private item is its own error (E1003), not a clash.
+fn test_an_entry_that_selects_a_private_item_does_not_clash() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Env.Exit, Env.Read, FS.Read, IO, FS.Write, Process.Spawn {
+    compile_probe([main_a, ("a", "import alpha.\{y\}\nimport beta.\{y\}\npub fn r() -> Int \{ y() \}\n")])
+    assert_no_e1005("alpha.\{y\} and private beta.\{y\}")
+    cleanup()
+}
+
+fn test_a_variant_selected_from_two_enums_is_ambiguous() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Env.Exit, Env.Read, FS.Read, IO, FS.Write, Process.Spawn {
+    compile_probe([main_a, ("hue", "pub type Color \{ Red, Green \}\n"), ("lamp", "pub type Light \{ Red, Amber \}\n"),
+        ("a", "import hue.\{Red\}\nimport lamp.\{Red\}\npub fn r() -> Int \{ 0 \}\n")])
+    assert_one_e1005_at("hue.\{Red\} and lamp.\{Red\}", "a.bl", 2)
+    cleanup()
+}
+
+fn main() {
+    test_a_function_selected_twice_in_another_module()
+    test_an_unused_name_selected_twice_in_another_module()
+    test_a_name_selected_twice_by_pub_imports()
+    test_a_function_selected_twice_in_main()
+    test_a_renamed_entry_that_binds_a_name_twice()
+    test_a_type_selected_twice_in_another_module()
+    test_a_type_selected_twice_in_main()
+    test_a_type_and_a_value_of_one_name()
+    test_one_item_twice_is_not_ambiguous()
+    test_two_module_paths_that_end_in_one_qualifier()
+    test_a_module_renamed_to_the_qualifier_of_another()
+    test_a_selected_name_that_is_the_qualifier_of_another_import()
+    test_a_qualifier_bound_twice_to_one_module_is_not_ambiguous()
+    test_a_third_entry_for_an_item_already_reported_adds_no_report()
+    test_a_third_entry_for_a_third_item_is_its_own_report()
+    test_imports_that_a_declaration_shadows_do_not_clash()
+    test_an_entry_that_selects_a_private_item_does_not_clash()
+    test_a_variant_selected_from_two_enums_is_ambiguous()
+    io.println("two imports binding one name give one E1005 at the second: ok")
+}
