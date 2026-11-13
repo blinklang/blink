@@ -5868,6 +5868,63 @@ A `Map` or `Set` made from other values is built by inserts in this order:
 
 **Non-hashable keys and elements in general.** Only builtin scalars (`Int`, sized ints, `Bool`, `Char`, `Str`), `Never` (§3.2), a tuple whose elements are all hashable, and a user `struct`/`enum` that implements `Hash` and `Eq` implement `Hash`. `Never` is the only type outside these groups on the list; it gives no container a way in. A user type gets the two impls from `@derive(Hash, Eq)` or from a written `impl` (§3.6, *Trait Coherence*). A fieldless enum is `Eq` already (*Container Equality*), so it needs only `@derive(Hash)` or an `impl Hash`. Every other type — every container (`List`, `Map`, `Set`, `Option`, `Result`), `Range`, `Bytes`, `StringBuilder`, and any `fn`/closure type — has no `Hash` impl and cannot gain one, so using one as a `Map` key or `Set` element is rejected at type-check as `E1400 MapKeyNotHashable`, the same code as the Float case above. A tuple is hashable **if and only if** every one of its elements is; `(Int, Option[Int])` is rejected because its second element is not, even though `(Int, Str)` is accepted.
 
+**A type parameter as a key or element.** A generic body is checked once, from its written bounds (*No implied bounds*, §3.6). A type parameter with no `Hash` bound is not known to be hashable. So a body that uses such a parameter, or a type that contains it, as a `Map` key or a `Set` element is `error[E1400] MapKeyNotHashable` at that use, in `blink check`, whatever the caller passes. The help and the fix add `T: Hash` (`Hash: Eq`, so no `Eq` bound is needed). The compiler never adds the bound itself.
+
+- **A fn or an impl:** the bound goes on the binder of the parameter, on the fn (`fn f[T: Hash]`) or on the impl (`impl[T: Hash] Cnt for Box[T]`).
+- **A trait method:** the bound goes on the trait method (`fn m[U: Hash](self, u: U) -> Int`). An impl method repeats it (§3.6 *Method Type Parameters*). A caller that holds only `X: Tr` then sees the bound in the trait signature, so a call through the trait is checked against it.
+- **A call:** a caller that passes a type with no `Hash` impl for a `T: Hash` parameter gets the unmet-bound error at the call (E0306), not E1400.
+
+```blink
+type Pt { x: Int }
+
+fn count[T](xs: List[T]) -> Int {
+    let mut s = Set.new()
+    for x in xs { s.insert(x) }        // error[MapKeyNotHashable] (E1400) at `x`
+    s.len()                            // help: add `T: Hash`
+}
+
+fn count_ok[T: Hash](xs: List[T]) -> Int {
+    let mut s = Set.new()
+    for x in xs { s.insert(x) }        // OK: `T: Hash`
+    s.len()
+}
+
+fn pairs[K](k: K) -> Int {
+    let mut m: Map[(K, Int), Int] = Map.new()   // error[MapKeyNotHashable] (E1400): `(K, Int)` holds `K`
+    m.len()
+}
+
+trait Tr {
+    fn m[U: Hash](self, u: U) -> Int   // the bound is on the trait method
+}
+
+type Foo { a: Int }
+
+impl Tr for Foo {
+    fn m[U: Hash](self, u: U) -> Int { // the impl repeats the bound
+        let mut s = Set.new()
+        s.insert(u)                    // OK
+        s.len()
+    }
+}
+
+fn outer[X: Tr](x: X) -> Int { x.m(Pt { x: 1 }) }   // error[E0306] at the call: `Pt` has no `Hash`
+```
+
+An impl whose method keys a parameter that its trait signature leaves unbounded gets E1400 at the key, in the impl body, with the help to put the bound on the trait method. The impl cannot add the bound alone: the type parameters of an impl method must match those of its trait method, bounds included (E0906, §3.6 *Method Type Parameters*).
+
+```blink
+trait Cnt { fn cnt[U](self, u: U) -> Int }
+
+impl Cnt for Foo {
+    fn cnt[U](self, u: U) -> Int {
+        let mut s = Set.new()
+        s.insert(u)                    // error[MapKeyNotHashable] (E1400): put `U: Hash` on the trait method `Cnt.cnt`
+        s.len()
+    }
+}
+```
+
 #### The `final` Modifier
 
 A trait may declare a default method as `final` to seal it against override. The `final` keyword is a method-level modifier on trait default methods only — it appears nowhere else in the language.

@@ -598,6 +598,7 @@ Decided by expert panel vote. See [OPEN_QUESTIONS.md](OPEN_QUESTIONS.md) for ful
 | A trait-qualified method named with no call (§3.4, §3c.4, E0568) | **Q1**: `Trait.m` with no call depends on the method: a method with `self` is a function value `fn(Self, ..) -> R` whose `Self` the expected type fixes through the receiver parameter (`xs.map(Clone.clone)`), E0301 at the reference when nothing fixes it, E0306 when the fixed `Self` has no impl; an associated function (`From.from`) with no call is an error with the code of its call. **Q2**: one new code, E0568 `AssociatedFnThroughTrait`, for the call `From.from(3)` and the reference, in place of TypeError E0300. **Q3**: the `W.from` help is a machine fix only when the expected type fixes `Self` to one type with one impl of the name and the rewritten site passes the checker. **Q4**: the E0567 no-call help adds a `Trait.m` line for one writable, unsealed owner. **Q5**: no change for `(Alpha for Widget).make` with no call; a separate chore gives it a code with the impl-qualified head. 6-0 (Q2 6-0 after 4-2, Q5 6-0 after 4-2). §3.4, §3c.4, catalog E0568, E0567, E0301, E0306 |
 | A mutable parameter captured by a spawned closure (§2.8, §3.5, E0650) | **Q1 (6-0)**: E0650 `MutableCaptureInSpawn` covers every mutable root: a `let mut` binding, a `mut` pattern binder, a `mut` parameter, a `mut` binder in a parameter pattern and `mut self`. The error is at the capture, in `blink check`, with a note at the `mut` of the parameter | 6-0 |
 | A user `@ffi` on a `blink_*` symbol (§9.1, E0849) | **Q1 (6-0)**: E0849 `InvalidRuntimeBinding` widens: a symbol that starts with `blink_` and is bound by anything other than `@runtime` in `lib/std` is E0849 at the symbol string, in `blink check`, for `@ffi` in the one- and the two-argument form. **Q2 (6-0)**: `@ffi let` too. **Q3 (6-0)**: the `__blink_` prefix too | 6-0 |
+| A type parameter as a `Map` key or `Set` element (§3.6, E1400) | **Q1 (6-0)**: a generic body that uses an unbounded type parameter as a `Map` key or `Set` element is E1400 `MapKeyNotHashable` at that site, in `blink check`, with a help and fix that add `T: Hash`. In a trait method the bound goes on the trait method | 6-0 |
 
 ---
 
@@ -967,6 +968,7 @@ Full deliberation records for each decision. Each file contains expert votes, re
 | A Trait-Qualified Method Named With No Call (E0568) | [decisions/trait-qualified-method-as-value.md](decisions/trait-qualified-method-as-value.md) |
 | Mutable Roots Under E0650 | [decisions/mut-parameter-spawn-capture.md](decisions/mut-parameter-spawn-capture.md) |
 | The `blink_` Symbol Prefix Is Reserved | [decisions/blink-prefix-reserved.md](decisions/blink-prefix-reserved.md) |
+| A Type Parameter as a Map Key or Set Element | [decisions/generic-body-hash-key.md](decisions/generic-body-hash-key.md) |
 
 ---
 
