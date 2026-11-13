@@ -7596,9 +7596,15 @@ fn tc_trait_heads_text(trait_name: Str, args: List[Int], n: Int) -> Str {
     heads.join(" and ")
 }
 
-// The metavars minted for `call_node`'s return-only type params, as a full-arity
-// group (-1 where nothing was minted), minting them on first visit and returning the
-// SAME ones on every later visit. See tc_ret_mint_start's declaration for why the
+// The metavars minted for `call_node`'s open type params, as a full-arity group (-1
+// where nothing was minted), minting them on first visit and returning the SAME ones on
+// every later visit. A param is open when it is return-only, or when no argument binds
+// it in `binds`: an unannotated closure whose return is still a metavar binds nothing in
+// `fn(T) -> List[U]`, and its body is what solves U, so the closure must be seeded with
+// a U the body can bind (sections/03_types.md 3.3). When an argument's type is lost to an
+// earlier error (`args_lost`), what it would have bound is unknown, so only a return-only
+// param is minted: a metavar for the others would add an under-determined report to that
+// error. See tc_ret_mint_start's declaration for why the
 // per-node memo is required rather than merely nice.
 //
 // Each returned tid is passed through tc_resolve, so a caller reads the SOLUTION once
@@ -7612,7 +7618,7 @@ fn tc_trait_heads_text(trait_name: Str, args: List[Int], n: Int) -> Str {
 // tc_mono_tids_core from the AST (sublist_length(node_type_params(fn_node))), and
 // lookup_fnsig keys on a name — two fns of the same name with different arities would
 // otherwise silently share a slot and mint one fn's α into the other's mono name.
-fn tc_ret_only_metavars(sig: Int, call_node: Int) -> List[Int] {
+fn tc_call_binder_metavars(sig: Int, call_node: Int, binds: Map[Str, Int], args_lost: Bool) -> List[Int] {
     let fs = fnsig_pool.get(sig).unwrap()
     let n = fs.type_params_count
     let mut out: List[Int] = []
@@ -7634,13 +7640,10 @@ fn tc_ret_only_metavars(sig: Int, call_node: Int) -> List[Int] {
     let mut minted = 0
     let mut pi = 0
     while pi < n {
-        let ro_idx = fs.type_params_start + pi
         let mut tid = -1
-        if ro_idx < fnsig_tparam_ret_only.len() {
-            if fnsig_tparam_ret_only.get(ro_idx).unwrap() != 0 {
-                tid = make_metavar()
-                minted = minted + 1
-            }
+        if tc_binder_left_open(fs.type_params_start + pi, binds, args_lost) {
+            tid = make_metavar()
+            minted = minted + 1
         }
         tc_ret_mint_tids.push(tid)
         out.push(tid)
@@ -7659,6 +7662,40 @@ fn tc_ret_only_metavars(sig: Int, call_node: Int) -> List[Int] {
     }
     tc_ret_mint_start.set(call_node, start)
     out
+}
+
+fn tc_binder_left_open(nidx: Int, binds: Map[Str, Int], args_lost: Bool) -> Bool {
+    if nidx < fnsig_tparam_ret_only.len() && fnsig_tparam_ret_only.get(nidx).unwrap() != 0 { return true }
+    !args_lost && nidx < fnsig_type_param_names.len() && !binds.contains_key(fnsig_type_param_names.get(nidx).unwrap())
+}
+
+// `binds` with each open type param of the call bound to its minted metavar. Both the
+// return type and the closure seed read the call's binds through here, so the U a closure
+// body solves is the U the call returns.
+fn tc_bind_call_mints(sig: Int, call_node: Int, binds: Map[Str, Int], arg_tids: List[Int]) {
+    let fs = fnsig_pool.get(sig).unwrap()
+    let mut args_lost = false
+    for t in arg_tids {
+        if tc_tid_has_unknown(t) != 0 { args_lost = true }
+    }
+    let mints = tc_call_binder_metavars(sig, call_node, binds, args_lost)
+    let mut pi = 0
+    while pi < mints.len() {
+        let a = mints.get(pi).unwrap()
+        let nidx = fs.type_params_start + pi
+        if a >= 0 && nidx < fnsig_type_param_names.len() {
+            let tpn = fnsig_type_param_names.get(nidx).unwrap()
+            if !binds.contains_key(tpn) {
+                binds.insert(tpn, a)
+                if nidx < fnsig_tparam_nodes.len() {
+                    let tpnode = fnsig_tparam_nodes.get(nidx).unwrap()
+                    binds.insert(tc_binder_key(tpnode, tpn), a)
+                    binds.insert(tc_binder_key(tc_twin_binder(tpnode), tpn), a)
+                }
+            }
+        }
+        pi = pi + 1
+    }
 }
 
 // The metavar minted for slot `pi` of `call_node`'s return-only group, RESOLVED, or -1
@@ -7687,7 +7724,7 @@ fn tc_node_has_ret_mint(n: Int) -> Int {
 }
 
 // A generic call's return type, with its type params substituted from the call's
-// arguments — and, for a RETURN-ONLY type param, from a freshly minted metavariable.
+// arguments — and, for a type param no argument binds, from a freshly minted metavariable.
 //
 // The mint is the whole point. build_typevar_binds infers exclusively from ARGUMENT
 // types, so `fn mk[T]() -> RGT[T]` called as `mk()` gets empty binds,
@@ -7711,30 +7748,8 @@ fn instantiate_return_type(sig: Int, arg_tids: List[Int], call_node: Int, self_o
     let ret = fs.ret
     if ret < 0 || ret >= ty_pool.len() { return ret }
     tc_report_unsourced_binders(sig, call_node, self_offset)
-    let mut binds = build_typevar_binds(sig, arg_tids, self_offset)
-    let mints = tc_ret_only_metavars(sig, call_node)
-    let mut pi = 0
-    while pi < mints.len() {
-        let a = mints.get(pi).unwrap()
-        if a >= 0 {
-            let nidx = fs.type_params_start + pi
-            if nidx < fnsig_type_param_names.len() {
-                let tpn = fnsig_type_param_names.get(nidx).unwrap()
-                // An argument bind wins: a param annotation naming the tparam means it
-                // is not return-only and no α was minted for it, so this can only be a
-                // belt-and-braces guard against a future producer inserting both.
-                if !binds.contains_key(tpn) {
-                    binds.insert(tpn, a)
-                    if nidx < fnsig_tparam_nodes.len() {
-                        let tpnode = fnsig_tparam_nodes.get(nidx).unwrap()
-                        binds.insert(tc_binder_key(tpnode, tpn), a)
-                        binds.insert(tc_binder_key(tc_twin_binder(tpnode), tpn), a)
-                    }
-                }
-            }
-        }
-        pi = pi + 1
-    }
+    let binds = build_typevar_binds(sig, arg_tids, self_offset)
+    tc_bind_call_mints(sig, call_node, binds, arg_tids)
     tc_note_generic_call(sig, call_node, self_offset, binds)
     substitute_typevar_tid(ret, binds)
 }
@@ -7748,12 +7763,13 @@ fn instantiate_return_type(sig: Int, arg_tids: List[Int], call_node: Int, self_o
 // supplies it), substitution leaves it a typevar, unify leaves the arg's α unbound,
 // and E0301 fires at the arg's own binding boundary. Runs only for metavar-carrying
 // args — concrete args and the no-generic path are untouched.
-fn tc_pin_generic_args_from_binds(sig: Int, args_sl: Int, arg_tids: List[Int], self_offset: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+fn tc_pin_generic_args_from_binds(sig: Int, call_node: Int, args_sl: Int, arg_tids: List[Int], self_offset: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     if args_sl == -1 { return }
     let fs = fnsig_pool.get(sig).unwrap()
     let param_start = fs.params_start
     let param_count = fs.params_count
     let binds = build_typevar_binds(sig, arg_tids, self_offset)
+    tc_bind_call_mints(sig, call_node, binds, arg_tids)
     let tids = tc_seed_closure_args_with_binds(sig, args_sl, arg_tids, self_offset, binds)
     let mut i = 0
     while i < tids.len() {
@@ -9858,7 +9874,7 @@ fn tc_check_free_call(fn_name: Str, sig0: Int, node: Int) -> Int ! TypeCheck.Res
     // a typevar is genuinely unbound (no arg pins it), the arg's α stays unbound and E0301
     // fires at its own binding/boundary.
     let ret_t = instantiate_return_type(sig, arg_tids, node, 0)
-    tc_pin_generic_args_from_binds(sig, args_sl, arg_tids, 0)
+    tc_pin_generic_args_from_binds(sig, node, args_sl, arg_tids, 0)
     ret_t
 }
 
@@ -39308,7 +39324,7 @@ fn tc_explicit_type_binds(decl: Int, call_node: Int) -> Map[Str, Int] ! TypeChec
     binds
 }
 
-// Writes a full group for `call_node` in the layout tc_ret_only_metavars reads, once. A
+// Writes a full group for `call_node` in the layout tc_call_binder_metavars reads, once. A
 // later walk of the same call reads the group back rather than minting over it.
 fn tc_seed_mint_group(call_node: Int, tids: List[Int]) {
     if call_node < 0 || call_node >= tc_ret_mint_start.len() { return }
