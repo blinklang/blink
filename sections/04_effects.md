@@ -210,7 +210,7 @@ error[UnknownEffect]: unknown effect `FFI`
 
 No fix is machine-applicable: an effect row on an `@ffi` decl is a claim about foreign code, and no tool writes that claim for the author.
 
-**A built-in effect name is reserved.** A top-level `effect` declaration may not take the name of a built-in effect: `FS`, `Net`, `DB`, `IO`, `Env`, `Time`, `Rand`, `Crypto`, `Process`, `State` or `Async`. The error is `ReservedEffectName` (E0559). It holds in every module, `pub` or not, with or without sub-effects. So `Time` in a row, in `with`, in a handler and in a `time.x()` call is always the built-in effect, in every module, and no import is needed to reach it. The rule covers the top-level name only. A sub-effect may have the name of a built-in effect, because its handle is the handle of its parent. The rule reserves the `effect` declaration only. A `type` with a built-in effect name is legal, and in a type position the user type is the one named in its module.
+**A built-in effect name is reserved.** A top-level `effect` declaration may not take the name of a built-in effect: `FS`, `Net`, `DB`, `IO`, `Env`, `Time`, `Rand`, `Crypto`, `Process`, `State` or `Async`. The error is `ReservedEffectName` (E0559). It holds in every module, `pub` or not, with or without sub-effects. So `Time` in a row, in `with`, in a handler and in a `time.x()` call is always the built-in effect, in every module, and no import is needed to reach it. The rule compares the lowercase form of the name, because the handle is the lowercase form (§4.4): `Io` has the handle `io`, which is the handle of `IO`, so `effect Io` is an error at its name, as are `Fs`, `NET` and `TIME`. The message says that the handle is reserved (``the handle `io` is reserved for the built-in effect `IO` ``), and a note lists the reserved handles. The rule covers the top-level name only. A sub-effect may have the name of a built-in effect, because its handle is the handle of its parent. The rule reserves the `effect` declaration only. A `type` with a built-in effect name is legal, and in a type position the user type is the one named in its module.
 
 ```blink
 effect Clock {
@@ -228,6 +228,9 @@ fn stamp() -> Int ! Clock.Time {
 fn wall() -> Instant ! Time.Read {     // `Time` is the built-in effect
     time.read()
 }
+
+effect Io { effect Say { fn say(msg: Str) } }     // error[E0559]: `Io` has the handle `io`, the handle of the built-in `IO`
+effect TIME { effect Now { fn now() -> Int } }    // error[E0559]: `TIME` has the handle `time`, the handle of the built-in `Time`
 ```
 
 ```
@@ -538,6 +541,20 @@ error[UndeclaredEffect]: insufficient effect capability
   |
 1 | fn read_only() ! FS.Read, FS.Write {
   |                         +++++++++
+```
+
+**The effects available at a site.** A handle use `h.op(...)` finds the effects that have the handle `h` among the effects available at the use. The effects available at a site are the effects in the row of the enclosing fn, and the effect of each `with` item that encloses the site (§4.7). One effect that the row and a `with` both name counts once. If one available effect has the handle `h`, the use goes to it. If none has it, the use is `UndeclaredEffect` (E0500). If two or more have it, the use is `EffectHandleCollision` (E0562), and §4.12 *One handle for two effects* gives the fix. Handles compare in lowercase, so the handle of `Ab` and the handle of `AB` are the same.
+
+```blink
+effect Log { effect Emit { fn log(msg: Str) } }
+
+fn f() ! Log { log.log("x") }          // OK: one available effect has the handle `log`
+
+fn g() ! Log {
+    with handler Log.Emit { fn log(msg: Str) { } } {
+        log.log("y")                   // OK: the row and the `with` name one effect, `Log`
+    }
+}
 ```
 
 **Why handles instead of free functions:**
@@ -5007,27 +5024,53 @@ fn note() ! lib.Log {
 }
 ```
 
-**One handle for two effects.** A row can hold two effects that have the same handle, such as `a.Log` and `b.Log`. The compiler rejects the row with `EffectHandleCollision` (E0562). The error names both effects. To fix it, put each use in its own function, or rename one effect.
+**One handle for two effects.** Two effects can have one handle, such as `a.Log` and `b.Log`, or `Ab` and `AB`. A row may hold both. A `with` may add one to the other. The error is at a handle use where two or more available effects have that handle (*The effects available at a site*, §4.4). It is `EffectHandleCollision` (E0562). It is not an error at the row, because a row is passed up to every caller, and two libraries that each declare `Log` must be able to meet on one call path. The use is where the name has two answers.
 
 ```blink
 import a
 import b
 
-fn both() ! a.Log, b.Log {    // E0562: both effects have the handle `log`
-    log.log("x")
+fn la() ! a.Log { log.log("a") }                // OK: one available effect has the handle `log`
+fn lb() ! b.Log { log.log("b") }                // OK
+
+fn both() ! a.Log, b.Log { la()  lb() }         // OK: a row with two effects of one handle is legal, and no use is ambiguous
+
+fn bad() ! a.Log, b.Log {
+    log.log("x")                                // error[E0562]: `a.Log` and `b.Log` both have the handle `log`
+}
+
+fn added() ! a.Log {
+    with handler b.Log.Emit { fn log(msg: Str) { } } {
+        lb()                                    // OK: the `with` is legal, and the call has no handle use
+        log.log("y")                            // error[E0562]: the row holds `a.Log`, the `with` adds `b.Log`
+    }
 }
 ```
 
+The error has one primary span, the handle use. It lists the declaration of each available effect as a related span, so a reader can tell which `log` is which. The help says to move the call into a fn whose row names one of the effects.
+
 ```
-error[EffectHandleCollision]: effects `a.Log` and `b.Log` have the same handle `log`
- --> app.bl:4:12
-  |
-4 | fn both() ! a.Log, b.Log {
-  |             -----  ^^^^^ `b.Log` also has the handle `log`
-  |             |
-  |             `a.Log` has the handle `log`
-  |
-  = help: put each use in its own function, or rename one of the effects
+error[EffectHandleCollision]: the handle `log` names more than one available effect
+ --> app.bl:10:5
+   |
+10 |     log.log("x")
+   |     ^^^ `a.Log` and `b.Log` both have the handle `log`
+   |
+note: `a.Log` is declared here
+ --> a.bl:1:8
+note: `b.Log` is declared here
+ --> b.bl:1:8
+   = help: put the call in a fn whose row names one of the effects, as `la` does, or rename one effect
+```
+
+**Two effects of one module with one handle.** A module may not declare two top-level effects whose lowercase names are equal. The error is `EffectHandleCollision` (E0562) at the name of the second declaration, with a note at the first. The help says to rename one effect. This is a rule about declarations, so it holds also when no use of the handle exists.
+
+```blink
+effect Ab { effect Go { fn ping() -> Int } }
+effect AB { effect Go { fn ping() -> Int } }    // error[E0562]: `AB` has the handle `ab`, the handle of `Ab` (note at `Ab`)
+effect Cd { effect Go { fn ping() -> Int } }    // OK: the handle is `cd`
+
+fn f() -> Int ! Ab.Go { ab.ping() }
 ```
 
 **A handle wins over a module qualifier.** In an expression, a reserved handle wins over a module qualifier of the same spelling (§3c.4 *Effect Handle Operations*). Suppose a function declares `! Log` and the file has `import util.log`. Then `log.format(...)` is a call on the handle `log`, not a call into the module. So the handle hides the qualifier in that function, and a call of a function of `util.log` through it is E0505. The help says that the handle hides the qualifier, and the fix follows the walk in §4.4.7 *The fix for a module function called through a handle*. When the function name is free, the fix is `import util.log.{format}` and `format("x")`. The alias import, `import util.log as logging`, is only the help, for the case where no candidate gives a fix. The same name outside a function that declares the effect is the module qualifier.

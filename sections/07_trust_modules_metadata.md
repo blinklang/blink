@@ -3439,7 +3439,7 @@ impl Sh for lib.Pt {                // the receiver slot
 fn show[U: lib.Tr](u: U) -> Str { u.name() }    // a bound
 ```
 
-- A qualified effect name works in every slot that takes the bare effect name: an effect row, `handler`, `with handler`, `Handler[...]`, `@capabilities(...)` and `Template[...]`. The qualifier is the import's leaf name or its alias, as for a type. The qualifier does not change the handle that the effect gives. The handle is the lowercase form of the declared effect name, so `lib.Log` gives `log` and not `lib.log` (§4.12 *Qualified effect names*). A qualified and a bare spelling of one effect name the same effect (§4.3 *A qualified effect name*).
+- A qualified effect name works in every slot that takes the bare effect name: an effect row, `handler`, `with handler`, `Handler[...]`, `@capabilities(...)` and `Template[...]`. The qualifier is the import's leaf name or its alias, as for a type. The qualifier does not change the handle that the effect gives. The handle is the lowercase form of the declared effect name, so `lib.Log` gives `log` and not `lib.log` (§4.12 *Qualified effect names*). Two effects from two modules, such as `a.Log` and `b.Log`, give one handle. A row may hold both. A handle use where both are available is E0562 (§4.12 *One handle for two effects*). A qualified and a bare spelling of one effect name the same effect (§4.3 *A qualified effect name*).
 
 ```blink
 import lib

@@ -602,6 +602,7 @@ Decided by expert panel vote. See [OPEN_QUESTIONS.md](OPEN_QUESTIONS.md) for ful
 | Handler clause parameter and result types (§3.3, §4.7, E0328, E0548) | **Q1 (6-0)**: a clause is a signature. An untyped clause parameter is E0328 `MissingParamType` (the row widens to handler clauses; the fix takes the type from the operation). A clause that leaves out `-> R` has the result type `()`, and is E0548 `HandlerClauseMismatch` when the operation's result is not `()` | 6-0 |
 | `@ffi` on a method (§9.1, §11.1, §3b.2, E1110, E0803) | **Q1 (6-0)**: `@ffi` targets a module-level fn only. An `@ffi` on a fn in an `impl` or `trait` block (with or without a receiver) or on a type-scoped `fn T.name` is E1110 `UnexpectedAnnotation` at the `@ffi`, in `blink check`, with a help to declare a module-level `@ffi fn` and call it from the method. E0803 drops its "directly implement a trait method" clause | 6-0 |
 | A program with no `fn main` (§6.7.7, §6.6, §8.14, §2.2) | **Q1 (5-1, DevOps dissented)**: `blink check` and `blink test` do not change. `blink build` with no `fn main` compiles every module, writes no binary, prints `note: no fn main; compiled as a library, no binary written` and exits `0`, for a file, an empty file and a package alike; a name one edit from `main` adds a did-you-mean. **Q2 (6-0)**: `blink run` with no `fn main` is a usage error before any compile, exit `2`, with the same did-you-mean and a stable `--json` shape | 5-1 |
+| Two effects with one handle (§4.4, §4.3, §4.12, E0559, E0562) | **Q1 (6-0)**: a row may hold two effects with one handle (`! a.Log, b.Log`), and a `with` may add one. E0562 `EffectHandleCollision` is at a handle use where two or more available effects (the row of the fn and each `with` in force) have that handle. Handles compare in lowercase. The use-site error lists both declarations as related spans. **Q2 (5-1, Minimalism dissented)**: two top-level effects of one module with equal lowercase names are E0562 at the second declaration, with a note at the first. **Q3 (6-0)**: E0559 `ReservedEffectName` compares lowercase forms, so `effect Io` is an error at its name | 6-0, 5-1, 6-0 |
 
 ---
 
@@ -975,6 +976,7 @@ Full deliberation records for each decision. Each file contains expert votes, re
 | Handler Clause Parameter Types | [decisions/handler-clause-param-types.md](decisions/handler-clause-param-types.md) |
 | `@ffi` Targets a Module-Level Function Only | [decisions/ffi-module-level-fn-only.md](decisions/ffi-module-level-fn-only.md) |
 | A Program With No `fn main` | [decisions/no-entry-point-build-and-run.md](decisions/no-entry-point-build-and-run.md) |
+| Two Effects With One Handle | [decisions/effect-handle-collision-at-use.md](decisions/effect-handle-collision-at-use.md) |
 
 ---
 
