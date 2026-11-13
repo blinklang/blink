@@ -3557,10 +3557,13 @@ type CallFacts {
     method_read_order: List[Int]
     // The roles a body gives its type parameters through a Map or Set whose key inference
     // solved, or by passing them on to a callee's keyed parameter, by fn declaration, then
-    // parameter name. They are known only once inference is done, after every call has been
+    // parameter name, and the roles an impl method's written keys give its impl's binders. They
+    // are known only once inference is done, after every call has been
     // checked against tc_hash_oblig, so late_hash_binds holds the calls those could not
     // refuse, and the end of the program judges them again.
     inferred_hash_roles: Map[Int, Map[Str, HashRole]]
+    // The impl methods whose written keys on an impl binder inferred_hash_roles holds.
+    impl_binder_roles_read: Map[Int, Bool]
     // The fn whose body holds each open Map()/Set() construction, by construction node.
     open_ctor_owner: Map[Int, Int]
     late_hash_binds: List[LateHashBind]
@@ -3609,7 +3612,7 @@ type UseJudge {
 }
 
 fn new_call_facts() -> CallFacts {
-    CallFacts { open_calls: [], open_group: Map(), open_tids: [], reported: Map(), self_views: Map(), view_sigs: Map(), hash_aliases_above: [], derive_facts_above: [], derive_facts_low: 0, derive_facts_open: [], derive_facts_open_low: Map(), debug_unbuilt_seen: Map(), hash_by_bounds: false, static_head_insts: Map(), static_head_binders: Map(), impl_bound_calls: [], impl_bound_binds: Map(), deferred_uses: [], deferred_use_at: Map(), late_keys: [], late_roots: Map(), late_roots_valid: false, late_refused: Map(), late_open: [], late_replay: -1, late_watch: Map(), late_fixed_at: Map(), infer_at: -1, static_owners: Map(), trait_heads: Map(), closure_expected_at: Map(), ret_ann: -1, missing_else: Map(), walk_returns: [], written_names: Map(), under_fn_type: Map(), method_reads: Map(), method_read_order: [], inferred_hash_roles: Map(), open_ctor_owner: Map(), late_hash_binds: [] }
+    CallFacts { open_calls: [], open_group: Map(), open_tids: [], reported: Map(), self_views: Map(), view_sigs: Map(), hash_aliases_above: [], derive_facts_above: [], derive_facts_low: 0, derive_facts_open: [], derive_facts_open_low: Map(), debug_unbuilt_seen: Map(), hash_by_bounds: false, static_head_insts: Map(), static_head_binders: Map(), impl_bound_calls: [], impl_bound_binds: Map(), deferred_uses: [], deferred_use_at: Map(), late_keys: [], late_roots: Map(), late_roots_valid: false, late_refused: Map(), late_open: [], late_replay: -1, late_watch: Map(), late_fixed_at: Map(), infer_at: -1, static_owners: Map(), trait_heads: Map(), closure_expected_at: Map(), ret_ann: -1, missing_else: Map(), walk_returns: [], written_names: Map(), under_fn_type: Map(), method_reads: Map(), method_read_order: [], inferred_hash_roles: Map(), impl_binder_roles_read: Map(), open_ctor_owner: Map(), late_hash_binds: [] }
 }
 let mut tc_calls: CallFacts = new_call_facts()
 
@@ -4101,7 +4104,7 @@ fn tc_check_method_impl_bounds(sig: Int, recv: Int, node: Int) ! TypeCheck.Resol
     if im == -1 || node_kind(im) != NodeKind.ImplBlock { return }
     let binders = node_impl_binders(im)
     if binders == -1 || sublist_length(binders) == 0 { return }
-    tc_check_impl_bounds_at_call(im, tc_impl_binder_tids_at(im, recv), recv, node)
+    tc_check_impl_bounds_at_call(im, sig, tc_impl_binder_tids_at(im, recv), recv, node)
 }
 
 // The impl's binder types in header order, as `binds` holds them by binder key, or -1 for a
@@ -4130,19 +4133,23 @@ fn tc_conversion_binds(im: Int, source: Int, target: Int) -> Map[Str, Int] {
 // A conversion reached impl `im` (`Wr.from(l)`, `Wr.try_from(l)`, `l.into()`) at `binds`.
 // Records it for the under-determined check, and judges the impl's bounds at it by the rule
 // of a method call, with `Self` read as the target the impl gives. Answers that target.
-fn tc_conversion_reached(im: Int, node: Int, binds: Map[Str, Int], target: Int) -> Int ! TypeCheck.Resolve, Diag.Report {
+// `sig` is the impl method the call names, or -1 for `into()`, which runs the impl's `from`.
+fn tc_conversion_reached(im: Int, sig: Int, node: Int, binds: Map[Str, Int], target: Int) -> Int ! TypeCheck.Resolve, Diag.Report {
     if tc_impl_is_poly_conversion(im) { tc_note_conversion_call(im, node, binds) }
     let self_tid = substitute_typevar_tid(tc_impl_recv_tids.get(im) ?? target, binds)
-    if tc_impl_has_binders(im) { tc_check_impl_bounds_at_call(im, tc_impl_binder_tids_of(im, binds), self_tid, node) }
+    if tc_impl_has_binders(im) {
+        let run = if sig != -1 { sig } else { tc_conversion_method_sig(im, "from") }
+        tc_check_impl_bounds_at_call(im, run, tc_impl_binder_tids_of(im, binds), self_tid, node)
+    }
     self_tid
 }
 
 // The bounds of the impl a static call through a type head reached (`Bx.mk(b)`), at the
 // binder types the head settled, with `Self` read as the head's instance, by the rule of a
 // method call through the same impl.
-fn tc_check_static_impl_bounds(im: Int, self_tid: Int, node: Int) ! TypeCheck.Resolve, Diag.Report {
+fn tc_check_static_impl_bounds(im: Int, sig: Int, self_tid: Int, node: Int) ! TypeCheck.Resolve, Diag.Report {
     if im == -1 || node_kind(im) != NodeKind.ImplBlock || !tc_impl_has_binders(im) { return }
-    tc_check_impl_bounds_at_call(im, tc_static_head_binders(node), self_tid, node)
+    tc_check_impl_bounds_at_call(im, sig, tc_static_head_binders(node), self_tid, node)
 }
 
 fn tc_impl_has_binders(im: Int) -> Bool {
@@ -4151,10 +4158,52 @@ fn tc_impl_has_binders(im: Int) -> Bool {
 }
 
 // Judges impl `im`'s bounds at binder `tids` now, and records the call for
-// tc_flush_impl_bound_calls when inference may still fill a binder.
-fn tc_check_impl_bounds_at_call(im: Int, tids: List[Int], self_tid: Int, node: Int) ! TypeCheck.Resolve, Diag.Report {
+// tc_flush_impl_bound_calls when inference may still fill a binder. `sig` is the method the
+// call reached, or -1.
+fn tc_check_impl_bounds_at_call(im: Int, sig: Int, tids: List[Int], self_tid: Int, node: Int) ! TypeCheck.Resolve, Diag.Report {
     tc_check_impl_bounds(im, tc_impl_binds_with_self(im, tids, self_tid), node)
     tc_note_impl_bound_call(node, im, tids, self_tid)
+    tc_note_impl_binder_key_binds(im, sig, tids, node)
+}
+
+// A method may key a Map or Set by a binder of its impl, written or through inference, as a
+// generic fn keys its own type parameter, and nothing in the impl's header says so (§3.6 *No
+// implied bounds*). So each call's binder types are judged as a generic fn's call is, by
+// tc_flush_late_hash_binds once every body's keys are known, which also passes the role on to a
+// type parameter of the calling fn.
+fn tc_note_impl_binder_key_binds(im: Int, sig: Int, tids: List[Int], node: Int) {
+    if sig < 0 { return }
+    let decl = fnsig_pool.get(sig).unwrap().decl
+    if decl < 0 { return }
+    let binders = node_impl_binders(im)
+    if binders == -1 { return }
+    tc_read_impl_binder_roles(decl, binders)
+    let mut i = 0
+    while i < tids.len() && i < sublist_length(binders) {
+        let t = tids.get(i).unwrap()
+        // A hashable type with nothing left to fill can neither be refused nor pass a role on.
+        let settled = t >= 0 && tc_tid_has_bare_typevar(t) == 0 && tc_tid_has_unbound_metavar(t) == 0 && tc_tid_hash_fact(t) == 1
+        if t >= 0 && !settled { tc_record_late_bind(sig, node_name(sublist_get(binders, i)), t, node, tc_current_fn_node, HashRole.Free) }
+        i = i + 1
+    }
+}
+
+// The roles the written keys of method `decl` give its impl's binders, by binder name, among
+// the roles its body gives through inference. A written role wins, as it does for a fn's own
+// type parameter, which is judged by the written role first.
+fn tc_read_impl_binder_roles(decl: Int, binders: Int) {
+    if tc_calls.impl_binder_roles_read.contains_key(decl) { return }
+    tc_calls.impl_binder_roles_read.insert(decl, true)
+    let names = tc_binder_names(binders)
+    let roles = tc_hash_roles_written_in(decl, names)
+    let mut by_name = tc_calls.inferred_hash_roles.get(decl) ?? Map()
+    let mut j = 0
+    while j < names.len() {
+        let role = tc_hash_oblig_mark(roles, j)
+        if role != HashRole.Free { by_name.insert(names.get(j).unwrap(), role) }
+        j = j + 1
+    }
+    tc_calls.inferred_hash_roles.insert(decl, by_name)
 }
 
 // The impl's binder tids in header order, as the receiver type `recv` answers them, or -1 for
@@ -4587,11 +4636,9 @@ fn tc_choose_deferred_conversion(call_node: Int) -> Bool ! TypeCheck.Resolve, Di
         tc_refuse_chosen_conversion(call_node, d)
         return true
     }
-    if !d.into {
-        let sig = tc_conversion_method_sig(im, node_method(call_node))
-        if sig != -1 { nr_note_call_decl(call_node, fnsig_pool.get(sig).unwrap().decl) }
-    }
-    let _ = tc_conversion_reached(im, call_node, binds, d.target)
+    let sig = if d.into { -1 } else { tc_conversion_method_sig(im, node_method(call_node)) }
+    if sig != -1 { nr_note_call_decl(call_node, fnsig_pool.get(sig).unwrap().decl) }
+    let _ = tc_conversion_reached(im, sig, call_node, binds, d.target)
     true
 }
 
@@ -15527,13 +15574,21 @@ fn tc_fn_hash_obligations(sig: Int) -> List[HashRole] {
         names.push(if idx < fnsig_type_param_names.len() { fnsig_type_param_names.get(idx).unwrap() } else { "" })
         i = i + 1
     }
-    let decl_module = node_module(fs.decl)
+    let roles = tc_hash_roles_written_in(fs.decl, names)
+    tc_hash_oblig.insert(fs.decl, roles)
+    roles
+}
+
+// The roles every annotation in the signature and body of fn `decl` gives the type parameters
+// `names`, in their order.
+fn tc_hash_roles_written_in(decl: Int, names: List[Str]) -> List[HashRole] {
+    let none: List[HashRole] = []
+    let decl_module = node_module(decl)
     let saved_module = nr_current_module
     nr_current_module = decl_module
     let roles = tc_hash_roles_from(names, none)
-    tc_hash_oblig_walk_tree(fs.decl, names, roles)
+    tc_hash_oblig_walk_tree(decl, names, roles)
     nr_current_module = saved_module
-    tc_hash_oblig.insert(fs.decl, roles)
     roles
 }
 
@@ -15752,9 +15807,21 @@ fn tc_flush_late_hash_binds() ! Diag.Report {
 
 fn tc_report_unhashable_bind(sig: Int, name: Str, role: HashRole, bound: Int, node: Int) ! Diag.Report {
     let fs = fnsig_pool.get(sig).unwrap()
+    let whose = if tc_sig_has_type_param(sig, name) { "its" } else { "its impl's" }
     diag_error_at("MapKeyNotHashable", MAP_KEY_NOT_HASHABLE,
-        "`{type_to_str(tc_resolve(bound))}` does not implement Hash — `{node_name(fs.decl)}` uses its type parameter {name} as a {tc_hash_role_words(role).title}", node,
+        "`{type_to_str(tc_resolve(bound))}` does not implement Hash — `{node_name(fs.decl)}` uses {whose} type parameter {name} as a {tc_hash_role_words(role).title}", node,
         "use a hashable scalar (Int/sized-int/Bool/Char/Str), a tuple of hashable types, or a @derive(Hash, Eq) struct/enum for {name}")
+}
+
+fn tc_sig_has_type_param(sig: Int, name: Str) -> Bool {
+    let fs = fnsig_pool.get(sig).unwrap()
+    let mut i = 0
+    while i < fs.type_params_count {
+        let idx = fs.type_params_start + i
+        if idx < fnsig_type_param_names.len() && fnsig_type_param_names.get(idx).unwrap() == name { return true }
+        i = i + 1
+    }
+    false
 }
 
 // Does deriving `listed` oblige `tr`: the trait itself, or one its built-in supertraits
@@ -28286,7 +28353,7 @@ fn tc_type_path_impl_value(node: Int, obj_node: Int, head: StaticHead, head_type
         let want = resolve_alias_tid(tc_construct_hint)
         if type_kind(want) == TyKind.Fn { let _ = tc_unify(val_tid, want) }
     }
-    tc_check_static_impl_bounds(im, self_tid, node)
+    tc_check_static_impl_bounds(im, sig, self_tid, node)
     Some(val_tid)
 }
 
@@ -37002,7 +37069,7 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
             if tc_defer_conversion(node, found, obj_t, target) { return target }
             let im = tc_judge_conversion(node, "`.into()`", "", "From", obj_t, target, found)
             if im >= 0 && (tc_impl_is_poly_conversion(im) || tc_impl_has_binders(im)) {
-                let _ = tc_conversion_reached(im, node, tc_conversion_binds(im, obj_t, target), target)
+                let _ = tc_conversion_reached(im, -1, node, tc_conversion_binds(im, obj_t, target), target)
             }
             return target
         }
@@ -37422,11 +37489,11 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                         // when no `self` receiver did.
                         if node_type_params(node) != -1 {
                             let q_ta = tc_call_with_type_args("{obj_written}.{method}", q_sig, node, 0, q_binds)
-                            tc_check_static_impl_bounds(q_im, self_tid, node)
+                            tc_check_static_impl_bounds(q_im, q_sig, self_tid, node)
                             return q_ta
                         }
                         let q_tids = check_arg_shapes_with_binds("{obj_written}.{method}", q_sig, q_args, 0, node, q_binds)
-                        tc_check_static_impl_bounds(q_im, self_tid, node)
+                        tc_check_static_impl_bounds(q_im, q_sig, self_tid, node)
                         if tc_decl_has_own_type_params(q_decl) != 0 {
                             tc_check_bounds_for_binds(q_sig, build_typevar_binds(q_sig, q_tids, 0), node)
                             return substitute_typevar_tid(instantiate_return_type(q_sig, q_tids, node, 0), q_binds)
@@ -38201,7 +38268,7 @@ fn tc_static_conversion(node: Int, obj_name: Str, named: Int, method: Str, src_t
     if sig == -1 { return -1 }
     nr_note_call_decl(node, fnsig_pool.get(sig).unwrap().decl)
     let mut binds = tc_conversion_binds(im, src_t, target)
-    let self_t = tc_conversion_reached(im, node, binds, target)
+    let self_t = tc_conversion_reached(im, sig, node, binds, target)
     binds.insert("Self", self_t)
     binds.insert(tc_binder_key(SELF_BINDER_NODE, "Self"), self_t)
     substitute_typevar_tid(fnsig_pool.get(sig).unwrap().ret, binds)

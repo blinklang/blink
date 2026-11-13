@@ -1,0 +1,85 @@
+// An impl method that keys a Map or Set by a type parameter of its impl (written or inferred,
+// bare, in a tuple, in a @derive(Hash, Eq) type, or passed on to a keyed generic fn) builds and
+// runs at each call whose type argument has Hash: a scalar, a string, a derived type, and any
+// type through an `impl[T: Hash + Eq]` bound. So does a call through a generic fn, through
+// another impl method, through the trait name, and an associated fn. The check that refuses
+// such a call where the argument lacks Hash (§3.6 "Non-hashable keys and elements in general")
+// must not refuse these. The program prints the same text in the one-unit and the per-module
+// build.
+
+import std.fs
+import std.process.{ProcessResult}
+import compile_test_helpers.{scratch_root}
+
+let program_src = [
+    "@derive(Hash, Eq)",
+    "type Pt \{ x: Int }",
+    "@derive(Hash, Eq)",
+    "type W[A] \{ a: A }",
+    "type Box[T] \{ v: T }",
+    "type Bag[T] \{ v: T }",
+    "trait Cnt \{ fn cnt(self) -> Int }",
+    "trait Two \{ fn two(self) -> Int }",
+    "trait Mk \{ fn mk(xs: List[Self]) -> Int }",
+    "fn wrap[K](k: K) -> Int \{",
+    "    let mut s = Set()",
+    "    s.insert(k)",
+    "    s.len()",
+    "}",
+    "impl[T] Cnt for Box[T] \{",
+    "    fn cnt(self) -> Int \{",
+    "        let mut s = Set()",
+    "        s.insert(self.v)",
+    "        s.insert(self.v)",
+    "        let mut m: Map[T, Int] = Map()",
+    "        m.insert(self.v, 4)",
+    "        let mut t = Set()",
+    "        t.insert((self.v, 1))",
+    "        let mut u = Set()",
+    "        u.insert(W \{ a: (self.v, 2) })",
+    "        s.len() * t.len() * u.len() + (m.get(self.v) ?? 0) * 10 + wrap(self.v) * 100",
+    "    }",
+    "}",
+    "impl[T] Two for Box[T] \{",
+    "    fn two(self) -> Int \{ self.cnt() + 1000 }",
+    "}",
+    "impl[T] Mk for Box[T] \{",
+    "    fn mk(xs: List[Box[T]]) -> Int \{",
+    "        let mut s: Set[T] = Set()",
+    "        for b in xs \{ s.insert(b.v) }",
+    "        s.len()",
+    "    }",
+    "}",
+    "impl[T: Hash + Eq] Cnt for Bag[T] \{",
+    "    fn cnt(self) -> Int \{",
+    "        let mut s = Set()",
+    "        s.insert(self.v)",
+    "        s.len() + 5",
+    "    }",
+    "}",
+    "fn outer[U](b: Box[U]) -> Int \{ b.cnt() }",
+    "fn main() \{",
+    "    io.println(\"\{Box \{ v: 3 }.cnt()} \{Box \{ v: \"a\" }.cnt()} \{Box \{ v: Pt \{ x: 1 } }.cnt()} \{Box \{ v: (1, 'c') }.cnt()}\")",
+    "    io.println(\"\{Cnt.cnt(Box \{ v: Pt \{ x: 2 } })} \{outer(Box \{ v: Pt \{ x: 3 } })} \{Box \{ v: Pt \{ x: 4 } }.two()}\")",
+    "    io.println(\"\{Box.mk([Box \{ v: Pt \{ x: 5 } }, Box \{ v: Pt \{ x: 5 } }, Box \{ v: Pt \{ x: 6 } }])} \{Bag \{ v: Pt \{ x: 7 } }.cnt()}\")",
+    "}",
+    "",
+].join("\n")
+
+fn sh(cmd: Str) -> ProcessResult ! Process.Spawn {
+    process.run("sh", ["-c", cmd]).unwrap()
+}
+
+test "an impl type parameter as a key builds and runs at Hash arguments in each build" {
+    let root = "{scratch_root()}/impl_key_role_{getpid()}"
+    let _ = sh("rm -rf {root} && mkdir -p {root}")
+    fs.write("{root}/main.bl", program_src).unwrap()
+    let blink = sh("readlink -f build/blink").out.trim()
+    let mut failed: List[Str] = []
+    for mode in ["--no-per-module", "--per-module"] {
+        let r = sh("cd {root} && env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE timeout 300 {blink} run {mode} main.bl < /dev/null 2>&1")
+        if !r.success() || r.out != "141 141 141 141\n141 141 1141\n2 6\n" { failed.push("blink run {mode}: {r.end}\n{r.out}") }
+    }
+    let _ = sh("rm -rf {root}")
+    assert_eq(failed, [])
+}
