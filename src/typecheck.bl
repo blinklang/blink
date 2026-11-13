@@ -2945,24 +2945,33 @@ pub fn make_raw_type(inner: Int) -> Int {
 // §9.1.1: an `FfiScope` may occur only as the resource of a `with ... as` block. The rule is
 // stated over the TYPE, not over the `ffi.scope()` call, because the hazard belongs to the
 // value: every excluded position is one the libc arena outlives the block that frees it,
-// however the value arrived there. Two reports, one per position the type can appear in.
+// however the value arrived there. One report, with a first repair for each place the type
+// can appear: a value, a type annotation, or a read of a `with` binder.
 fn tc_ffi_scope_alloc_help() -> Str {
     "for one plain allocation with GC cleanup, use `alloc_ptr[T]()` instead of a scope"
 }
 
-// The `let` -> `with ... as` rewrite is deliberately NOT machine-applicable: no fixer can
-// decide where the block should end.
-fn tc_report_ffi_scope_value(node: Int, binder: Str) ! Diag.Report {
-    let shown = if binder == "" { "<name>" } else { binder }
+// Each repair is deliberately NOT machine-applicable: no fixer can decide where a block
+// should end or what the value was meant to do.
+fn tc_report_ffi_scope(node: Int, repair: Str) ! Diag.Report {
     diag_error_at("FfiScopeNotWithResource", FFI_SCOPE_NOT_WITH_RESOURCE,
         "an `FfiScope` may occur only as a `with ... as` resource", node,
-        "bind it as a `with` resource: `with ffi.scope() as {shown} \{ ... \}`\n{tc_ffi_scope_alloc_help()}")
+        "{repair}\n{tc_ffi_scope_alloc_help()}")
 }
 
-fn tc_report_ffi_scope_ann(node: Int) ! Diag.Report {
-    diag_error_at("FfiScopeNotWithResource", FFI_SCOPE_NOT_WITH_RESOURCE,
-        "an `FfiScope` may occur only as a `with ... as` resource", node,
-        "drop the annotation: a scope is reachable only inside `with ffi.scope() as <name> \{ ... \}`\n{tc_ffi_scope_alloc_help()}")
+fn tc_ffi_scope_value_repair(binder: Str) -> Str {
+    let shown = if binder == "" { "<name>" } else { binder }
+    "bind it as a `with` resource: `with ffi.scope() as {shown} \{ ... \}`"
+}
+
+fn tc_ffi_scope_ann_repair() -> Str {
+    "drop the annotation: a scope is reachable only inside `with ffi.scope() as <name> \{ ... \}`"
+}
+
+// A read of a `with` binder: the value already is a resource, so the repair is to use it
+// where the rule leaves it open, as the receiver of a scope operation.
+fn tc_ffi_scope_read_repair(shown: Str) -> Str {
+    "inside the block, use `{shown}` only as the receiver of its operations: `{shown}.alloc[T]()`, `{shown}.alloc_n[T](n)`, `{shown}.cstr(text)`, `{shown}.take(p)`"
 }
 
 // ── Metavariables (Hindley-Milner inference discipline) ─────────────
@@ -13839,7 +13848,7 @@ fn tc_resolve_compiler_known_type(name: Str, elems_sl: Int, ann_node: Int) -> In
     // annotation — is already the mistake: the one position the type may occupy is a
     // `with ... as` resource, whose binder is never annotated.
     if name == "FfiScope" {
-        if ann_node != -1 { tc_report_ffi_scope_ann(ann_node) }
+        if ann_node != -1 { tc_report_ffi_scope(ann_node, tc_ffi_scope_ann_repair()) }
         return make_ffi_scope_type()
     }
     if name == "Raw" {
@@ -37160,7 +37169,7 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                     // panics the compiler instead of reporting anything.
                     let _ = check_arg_shapes("{obj_name}.{method}", nsi, node_args(node), 0, node)
                     if type_kind(nsi_fs.ret) == TyKind.FfiScope && node != tc_with_resource_node {
-                        tc_report_ffi_scope_value(node, tc_ffi_scope_binder)
+                        tc_report_ffi_scope(node, tc_ffi_scope_value_repair(tc_ffi_scope_binder))
                     }
                     return nsi_fs.ret
                 }
@@ -46788,6 +46797,39 @@ fn tc_unclaimed_receiver_is_named(tid: Int) -> Int {
     1
 }
 
+// §9.1.1 over the reads of a value: once a scope is a `with` binder, the one place it may
+// appear is the receiver of a method call. Every other read (an argument, an element, a field
+// value, a `let` initializer, a block or branch value) puts it where the block's arena does not
+// reach, and a generic one has no layout to lower to. Asked after the walk, from the memo:
+// the receiver test needs the form that holds the read.
+//
+// Only a read of a `with` binder reports. A scope bound any other way already has its one
+// report, at the `ffi.scope()` call, the annotation or the `let t = s` read, and a report at
+// each later read of that name would repeat the same mistake.
+//
+// The memo is read directly, not through tc_node_is_ffi_scope_value: its fallback looks the
+// name up in the scope that is open now, which after the walk is not the read's scope.
+//
+// `order` is pre-order, so the call or `with` that holds a receiver is seen before it. It is
+// not source order (an `if` puts its else branch first), so the reports go out sorted by node,
+// which is.
+fn tc_report_ffi_scope_reads(order: List[Int]) ! Diag.Report {
+    let mut open: Set[Int] = Set()
+    let mut found: List[Int] = []
+    for n in order {
+        let k = node_kind(n)
+        if k == NodeKind.MethodCall && node_obj(n) != -1 { open.insert(node_obj(n)) }
+        if k == NodeKind.WithResource && node_value(n) != -1 { open.insert(node_value(n)) }
+        if k != NodeKind.Ident || open.contains(n) { continue }
+        let binder = tc_ident_binder_node(n)
+        if binder == -1 || node_kind(binder) != NodeKind.WithResource { continue }
+        let t = tc_lookup_node_tid(n)
+        if t < 0 { continue }
+        if type_kind(tc_resolve(t)) == TyKind.FfiScope { found.push(n) }
+    }
+    for n in found.sort() { tc_report_ffi_scope(n, tc_ffi_scope_read_repair(node_name(n))) }
+}
+
 // A literal no expected type reached is Int (sections/03_types.md §3.2 *Integer literal
 // range*). Its type is final only once every pass that can give it one has run, so the range
 // check of a literal that is Int by default waits for the whole walk. A literal that another
@@ -47108,6 +47150,7 @@ pub fn tc_stamp_program(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Dia
     // After the unclaimed calls, so a call one of them reported gets no second report.
     tc_flush_unresolved_methods(false)
     tc_report_literals_out_of_range(order)
+    tc_report_ffi_scope_reads(order)
     // A program that already has an error has nodes inference deliberately never typed: the
     // arm that would have typed them reported instead and returned. Asserting there turns
     // every ordinary type error into an internal-compiler-error cascade, so the total-stamp

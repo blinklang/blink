@@ -1,0 +1,71 @@
+// A `with ffi.scope() as s` binder may be the receiver of its own operations (§9.1.1), and
+// nothing else. The check that refuses every other read of `s` must leave these programs
+// alone: each row builds and runs on both build paths and checks what the program prints.
+
+import std.process.{ChildEnd, ProcessResult, ChildLimits}
+import std.time.{Duration}
+
+fn sh(cmd: Str) -> ProcessResult ! Process.Spawn {
+    process.run("sh", ["-c", cmd], limits: ChildLimits { timeout: Some(Duration.seconds(300)) }).unwrap()
+}
+
+fn project(source: Str) -> Str ! FS.Write, Process.Spawn {
+    let dir = sh("mktemp -d /tmp/blink_ffi_scope_receiver.XXXXXX").out.trim()
+    let _ = sh("mkdir -p {dir}/src")
+    fs.write("{dir}/blink.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\n").unwrap()
+    fs.write("{dir}/blink.lock", "[metadata]\nlockfile-version = 1\n").unwrap()
+    fs.write("{dir}/src/main.bl", source).unwrap()
+    dir
+}
+
+// The corpus exports module filters that make each build one unit, so the run drops them:
+// --per-module must reach the per-module path.
+fn blink_in(dir: Str, cmd: Str) -> ProcessResult ! Process.Spawn {
+    sh("B=$(pwd)/build/blink; cd {dir} && env -u BLINK_PER_MODULE -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE BLINK_CACHE_DIR={dir}/cache BLINK_BIN=$B $B {cmd} < /dev/null")
+}
+
+fn diag(r: ProcessResult) -> Str {
+    "exit {r.end}\nstdout:\n{r.out}\nstderr:\n{r.err_out}"
+}
+
+fn runs_and_prints(source: Str, want: Str) ! FS.Write, Process.Spawn, IO.Print {
+    let dir = project(source)
+    let pm = blink_in(dir, "run --per-module src/main.bl")
+    let one = blink_in(dir, "run --no-per-module src/main.bl")
+    let _ = sh("rm -rf {dir}")
+    assert_eq(pm.end, ChildEnd.Exited(0), "--per-module: {diag(pm)}")
+    assert_eq(pm.out.trim(), want, "--per-module: {diag(pm)}")
+    assert_eq(one.end, ChildEnd.Exited(0), "--no-per-module: {diag(one)}")
+    assert_eq(one.out.trim(), want, "--no-per-module: {diag(one)}")
+}
+
+test "every scope operation on the binder builds and runs" {
+    runs_and_prints(#"fn main() {
+    with ffi.scope() as s {
+        let p = s.alloc[Int]()
+        p.write(41)
+        let q = s.alloc_n[Int](3)
+        q.offset(2).write(7)
+        let c = s.cstr("hi")
+        let k = s.take(s.alloc[Int]())
+        k.write(5)
+        io.println("{p.deref() + 1} {q.offset(2).deref()} {c.to_str().unwrap()} {k.deref()}")
+    }
+}
+"#, "42 7 hi 5")
+}
+
+test "two nested scopes each used as a receiver build and run" {
+    runs_and_prints(#"fn main() {
+    with ffi.scope() as s {
+        with ffi.scope() as t {
+            let p = s.alloc[Int]()
+            let q = t.alloc[Int]()
+            p.write(2)
+            q.write(3)
+            io.println("{p.deref() * q.deref()}")
+        }
+    }
+}
+"#, "6")
+}

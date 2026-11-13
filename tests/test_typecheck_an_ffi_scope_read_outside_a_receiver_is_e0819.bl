@@ -1,0 +1,159 @@
+// §9.1.1: an `FfiScope` may occur only as the resource of a `with ... as` block. Inside the
+// block its binder may be the receiver of a scope operation and nothing else: passed, stored,
+// bound by `let` or made a type argument, the value reaches a position the block's arena does
+// not outlive. The rule is over the type, so a binder that reaches a generic constructor is
+// the same mistake as `let s = ffi.scope()`, and must be reported by `blink check` rather
+// than left for the back end, which has no layout for a scope inside another type.
+//
+// Each refusal is one report, at the binder's own read.
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_reset}
+import std.io
+
+fn run_probe(stem: Str, src: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO, Process.Spawn {
+    let path = "build/{stem}_probe.bl"
+    fs.write(path, src).unwrap()
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _rm = process.run("rm", ["-f", path]).unwrap()
+    0
+}
+
+// Each error as `name@line:col`, joined, so a row states where every report lands and how
+// many there are.
+fn probe_errors(stem: Str, src: Str) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO, Process.Spawn {
+    let _r = run_probe(stem, src)
+    let mut out = ""
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" { out = "{out}{d.name}@{d.line}:{d.col} " }
+    }
+    out.trim()
+}
+
+fn assert_errors(label: Str, got: Str, want: Str) ! IO.Print {
+    if got != want { io.println("FAIL: {label}: drew '{got}', want '{want}'") }
+    assert(got == want)
+}
+
+let E0819 = "FfiScopeNotWithResource"
+
+fn in_scope(body: Str) -> Str {
+    "type E[T] \{\n    L(T)\n    N\n\}\n\ntype Box[T] \{ v: T \}\n\nfn id[T](x: T) -> Int \{ 1 \}\n\nfn main() \{\n    with ffi.scope() as s \{\n{body}\n    \}\n\}\n"
+}
+
+// Line 11 is the `with` line, so the first body line is 12.
+
+test "a scope binder passed to a generic variant constructor is E0819 at the binder" {
+    assert_errors("variant ctor",
+        probe_errors("tc_fs_ctor", in_scope("        let a = E.L(s)\n        let n = match a \{ E.L(_) => 1\n            E.N => 0 \}\n        io.println(\"\{n\}\")")),
+        "{E0819}@12:21")
+}
+
+test "a scope binder stored in a struct literal field is E0819" {
+    assert_errors("struct field",
+        probe_errors("tc_fs_struct", in_scope("        let b = Box \{ v: s \}\n        io.println(\"ok\")")),
+        "{E0819}@12:26")
+}
+
+test "a scope binder passed to a generic function is E0819" {
+    assert_errors("generic fn arg",
+        probe_errors("tc_fs_genfn", in_scope("        io.println(\"\{id(s)\}\")")),
+        "{E0819}@12:25")
+}
+
+test "a scope binder wrapped in Some or Ok is E0819" {
+    assert_errors("Some",
+        probe_errors("tc_fs_some", in_scope("        let o = Some(s)\n        io.println(\"\{o.is_some()\}\")")),
+        "{E0819}@12:22")
+    assert_errors("Ok",
+        probe_errors("tc_fs_ok", in_scope("        let r = if true \{ Ok(s) \} else \{ Err(\"x\") \}\n        io.println(\"\{r.is_ok()\}\")")),
+        "{E0819}@12:30")
+}
+
+test "a scope binder in a list or tuple literal is E0819" {
+    assert_errors("list",
+        probe_errors("tc_fs_list", in_scope("        let xs = [s]\n        io.println(\"\{xs.len()\}\")")),
+        "{E0819}@12:19")
+    assert_errors("tuple",
+        probe_errors("tc_fs_tuple", in_scope("        let t = (s, 1)\n        io.println(\"\{t.1\}\")")),
+        "{E0819}@12:18")
+}
+
+test "a scope binder passed to a method of another value is E0819" {
+    assert_errors("push arg",
+        probe_errors("tc_fs_push", in_scope("        let mut xs = []\n        xs.push(s)\n        io.println(\"\{xs.len()\}\")")),
+        "{E0819}@13:17")
+}
+
+test "a scope binder as a block or branch value that is passed is E0819 once per read" {
+    assert_errors("block value",
+        probe_errors("tc_fs_block", in_scope("        io.println(\"\{id(\{ s \})\}\")")),
+        "{E0819}@12:27")
+    assert_errors("if branches",
+        probe_errors("tc_fs_if", in_scope("        let n = id(if true \{ s \} else \{ s \})\n        io.println(\"\{n\}\")")),
+        "{E0819}@12:30 {E0819}@12:41")
+}
+
+test "a scope binder bound by let is E0819" {
+    assert_errors("let alias",
+        probe_errors("tc_fs_let", in_scope("        let t = s\n        io.println(\"ok\")")),
+        "{E0819}@12:17")
+}
+
+// One mistake, one report: a name a `let` binds to a scope already has its report where the
+// scope reached the `let`, so its later reads do not repeat it.
+test "a let chain from a scope binder is one E0819, at the binder" {
+    assert_errors("let chain",
+        probe_errors("tc_fs_let_chain", in_scope("        let t = s\n        let u = t\n        io.println(\"\{id(u)\}\")")),
+        "{E0819}@12:17")
+}
+
+test "a scope bound by let is one E0819, at the call, not again at its read" {
+    assert_errors("let scope then read",
+        probe_errors("tc_fs_let_read", "fn id[T](x: T) -> Int \{ 1 \}\n\nfn main() \{\n    let t = ffi.scope()\n    io.println(\"\{id(t)\}\")\n\}\n"),
+        "{E0819}@4:13")
+}
+
+test "a scope binder as a match scrutinee or a block value is E0819" {
+    assert_errors("match",
+        probe_errors("tc_fs_match", in_scope("        let n = match s \{ _ => 1 \}\n        io.println(\"\{n\}\")")),
+        "{E0819}@12:23")
+    assert_errors("with tail",
+        probe_errors("tc_fs_tail", in_scope("        s")),
+        "{E0819}@12:9")
+}
+
+// The read keeps its own report next to the type error at the same place: each names a
+// different fault.
+test "a scope binder in interpolation is E0819 next to the missing Display" {
+    assert_errors("interp",
+        probe_errors("tc_fs_interp", in_scope("        io.println(\"\{s\}\")")),
+        "MissingDisplayImpl@12:22 {E0819}@12:22")
+}
+
+test "a closure that passes a captured scope binder is E0819 at the read" {
+    assert_errors("closure arg",
+        probe_errors("tc_fs_clo_arg", in_scope("        let f = fn() -> Int \{ id(s) \}\n        io.println(\"\{f()\}\")")),
+        "{E0819}@12:34")
+}
+
+// Guards: the receiver of a scope operation is the one use the rule leaves open.
+test "a closure that uses a captured scope binder only as a receiver is accepted" {
+    assert_errors("closure receiver",
+        probe_errors("tc_fs_clo_recv", in_scope("        let f = fn() -> Int \{\n            let p = s.alloc[Int]()\n            p.write(3)\n            p.deref()\n        \}\n        io.println(\"\{f()\}\")")),
+        "")
+}
+
+test "scope operations on the binder are accepted" {
+    assert_errors("receivers",
+        probe_errors("tc_fs_recv", in_scope("        let p = s.alloc[Int]()\n        p.write(41)\n        let q = s.alloc_n[Int](3)\n        q.offset(2).write(7)\n        let c = s.cstr(\"hi\")\n        let k = s.take(s.alloc[Int]())\n        io.println(\"\{p.deref() + q.offset(2).deref()\} \{c.is_null()\} \{k.is_null()\}\")")),
+        "")
+}
+
+test "nested scopes used as receivers are accepted" {
+    assert_errors("nested",
+        probe_errors("tc_fs_nested", in_scope("        with ffi.scope() as t \{\n            let p = s.alloc[Int]()\n            let q = t.alloc[Int]()\n            p.write(2)\n            q.write(3)\n            io.println(\"\{p.deref() * q.deref()\}\")\n        \}")),
+        "")
+}
