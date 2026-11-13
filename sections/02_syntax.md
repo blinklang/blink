@@ -2420,7 +2420,7 @@ This is `UnhandledEffect` (E0539). `main` is the other root, and the same code r
 
 ```blink
 @trusted(audit: "SODIUM-1")
-@ffi("blink_randombytes_fill", header: "blink_sodium_shim.h")
+@ffi("sodium", "shim_randombytes_fill", header: "shim_sodium.h")
 fn randombytes(mut buf: Bytes) ! Rand {}
 
 fn make_token() -> Bytes ! Rand {

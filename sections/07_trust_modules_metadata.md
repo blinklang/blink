@@ -45,7 +45,7 @@ The library argument is a key of `[native-dependencies]` in `blink.toml`, or one
 fn c_cos(x: Float) -> Float ! ()
 ```
 
-Prefer the two-argument form. It names the library that supplies the symbol, so a reader and `blink audit` can see where the symbol comes from. The one-argument form does not make a third-party symbol legal: a symbol that is not in `c` or `m` must use the two-argument form with a declared library. The one-argument form binds only `c` and `m` symbols. It does not bind a `blink_*` runtime symbol; `lib/std` binds those with `@runtime` (*`@runtime` — The Runtime Bridge*). Every `@ffi` declaration, in either form, follows the rules of *Signature Types*.
+Prefer the two-argument form. It names the library that supplies the symbol, so a reader and `blink audit` can see where the symbol comes from. The one-argument form does not make a third-party symbol legal: a symbol that is not in `c` or `m` must use the two-argument form with a declared library. The one-argument form binds only `c` and `m` symbols. It does not bind a `blink_*` runtime symbol. No `@ffi` form binds one (*A `blink_` Symbol Belongs to the Runtime*); `lib/std` binds those with `@runtime` (*`@runtime` — The Runtime Bridge*). Every `@ffi` declaration, in either form, follows the rules of *Signature Types*.
 
 **The header test.** `blink check` does not look at the C headers. `blink build` and `blink test` do. Before the unit compile, each of them tests every header that an `@ffi` declaration names. The test uses the same C compiler, target, include paths and vendored native directories as the unit compile, so it gives no error for a program that builds. It reads only pass or fail, and it does not read the text of the C compiler. A header that the test cannot find is `ForeignHeaderNotFound` (E0859) at the `@ffi` line, and the command exits `1`. The unit compile does not start (§6.7.3).
 
@@ -72,7 +72,7 @@ pub let SIGBUS: Int
 pub let CURLE_OPERATION_TIMEDOUT: Int
 ```
 
-The arguments are those of `@ffi` on a function. The one-argument form names a C macro or constant of the runtime libraries `c` and `m`. The two-argument form names a library key of `[native-dependencies]`, with the native-dependency rules of §9.1.2: a missing entry is `MissingNativeDep` (E0820). The type annotation is required.
+The arguments are those of `@ffi` on a function. A symbol that starts with `blink_` or `__blink_` is `InvalidRuntimeBinding` (E0849), as on a function (*A `blink_` Symbol Belongs to the Runtime*). The one-argument form names a C macro or constant of the runtime libraries `c` and `m`. The two-argument form names a library key of `[native-dependencies]`, with the native-dependency rules of §9.1.2: a missing entry is `MissingNativeDep` (E0820). The type annotation is required.
 
 **Rules.**
 
@@ -257,10 +257,10 @@ The test is one question. Does the call read state that no argument reaches, and
 **Order of calls.** A `! ()` call may not move across another call that can write what its arguments reach. A call with a non-empty row, a `mut` argument, or a `Ptr` or `@ffi.opaque` argument counts as writing everything that argument reaches.
 
 ```blink
-@ffi("blink_tcp_handle_fd")
+@ffi("shim", "shim_tcp_handle_fd")
 fn tcp_handle_fd(h: TcpHandle) -> Int ! () {}
 
-@ffi("blink_tcp_handle_take")
+@ffi("shim", "shim_tcp_handle_take")
 fn tcp_handle_take(h: TcpHandle) -> Int ! () {}
 
 let before = tcp_handle_fd(h)
@@ -275,7 +275,7 @@ let after = tcp_handle_fd(h)    // can differ from `before`
 **A write is not a read.** A write that no Blink code can read is not visible, so it does not disqualify `! ()`. No binding reads `errno`. A shim returns `-errno` on failure, and Blink code reads the result. So `strtod`, `cos`, `sqrt` and `atoi` are `! ()`, even though they can set `errno`:
 
 ```blink
-@ffi("blink_read")
+@ffi("shim", "shim_read")
 fn c_read(fd: I32, p: Ptr[U8], n: U64) -> I64 ! FS.Read {}   // <0 means -errno
 
 let rc = buf.with_ptr(fn(p) -> I64 { c_read(fd.to_i32(), p, max.to_u64()) })
@@ -294,20 +294,20 @@ When an `@ffi` decl reads state that no argument reaches, use the first of these
 
 ```blink
 // before: the reader depends on a buffer that the previous call filled
-@ffi("blink_fs_stat")
+@ffi("shim", "shim_fs_stat")
 fn c_fs_stat(path: Str) -> Int ! FS.Read {}
-@ffi("blink_fs_stat_size")
+@ffi("shim", "shim_fs_stat_size")
 fn c_fs_stat_size() -> Int ! () {}            // warning[ZeroArgPureForeign], and a false claim
 
 // after: the producer writes the data into an argument
-@ffi("blink_fs_stat")
+@ffi("shim", "shim_fs_stat")
 fn c_fs_stat(path: Str, mut out: Bytes) -> Int ! FS.Read {}   // out: kind, size, mtime_ns
 ```
 
 **2. Use the effect that names the resource.** A built-in effect names the current arena (`Arena`), a file (`FS.*`) and a socket (`Net.*`). A reader of the counters of the current arena takes `! Arena`. It is discharged inside `with arena` (§5.2) and costs nothing there:
 
 ```blink
-@ffi("blink_arena_bytes_used") fn arena_bytes_used_ffi() -> Int ! Arena {}
+@ffi("shim", "shim_arena_bytes_used") fn arena_bytes_used_ffi() -> Int ! Arena {}
 pub fn bytes_used() -> Int ! Arena { arena_bytes_used_ffi() }
 
 with arena { let a = bytes_used(); let _ = Bytes.new(n); bytes_used() - a }   // ok
@@ -582,20 +582,20 @@ test "session uses a fixed token" {
 **Handle operations are `! ()`.** The insides of a handle are data that the handle argument reaches, like the cells of a `List`. An op that reads or changes them takes `! ()`, as `List.len` and `List.push` do. Copies of a handle name one object, so a change through one copy shows through the others.
 
 ```blink
-@ffi("blink_tcp_handle_fd")   fn tcp_handle_fd(h: TcpHandle) -> Int ! () {}
-@ffi("blink_tcp_handle_take") fn tcp_handle_take(h: TcpHandle) -> Int ! () {}   // clears the slot of `h`
+@ffi("shim", "shim_tcp_handle_fd")   fn tcp_handle_fd(h: TcpHandle) -> Int ! () {}
+@ffi("shim", "shim_tcp_handle_take") fn tcp_handle_take(h: TcpHandle) -> Int ! () {}   // clears the slot of `h`
 ```
 
 An op that closes the OS file descriptor, or does other I/O, writes state outside the language. It keeps its effect row:
 
 ```blink
-@ffi("blink_close_socket") fn c_close_socket(fd: Int) -> Int ! Net.Connect {}
+@ffi("shim", "shim_close_socket") fn c_close_socket(fd: Int) -> Int ! Net.Connect {}
 ```
 
 **`mut` marks a Blink value, not a handle.** `mut` is required on an `@ffi` param of a Blink value type whose data the foreign side changes: `List`, `Set`, `Map`, `Bytes` and `StringBuilder`. A caller with an immutable root gets `MutationRequiresMut` (E0610), as for a Blink function (§3.6 *Foreign functions*). `mut` is not used on a `Ptr` param or an `@ffi.opaque` handle param. These are state outside the language; the row and the audit key cover them (§3.6 *What `mut self` covers*).
 
 ```blink
-@ffi("blink_bytes_push")
+@ffi("shim", "shim_bytes_push")
 fn bytes_push(mut b: Bytes, byte: Int) ! () {}
 
 fn fill(b: Bytes) { bytes_push(b, 1) }              // E0610: `b` is not mutable
@@ -620,7 +620,7 @@ warning[ZeroArgPureForeign]: foreign function `c_fs_stat_size` has no params and
 ```
 
 ```blink
-@ffi("blink_fs_stat_size") fn c_fs_stat_size() -> Int ! () {}   // warning
+@ffi("shim", "shim_fs_stat_size") fn c_fs_stat_size() -> Int ! () {}   // warning
 
 @allow(ZeroArgPureForeign)
 @ffi("getpagesize") fn c_pagesize() -> Int ! () {}              // a real constant: no warning
@@ -828,6 +828,7 @@ fn sb_write(mut sb: StringBuilder, s: Str)
 - **Only `lib/std` may use `@runtime`.** A `@runtime` declaration in any other package is the error `InvalidRuntimeBinding` (E0849).
 - **It binds only runtime symbols.** The symbol must start with `blink_`. A symbol that does not is E0849 too. A C function, in `lib/std` or elsewhere, uses `@ffi`.
 - **It is not under the signature rule.** *Signature Types* applies to every `@ffi` declaration, with no exception.
+- **It is the only binding of a `blink_` symbol.** *A `blink_` Symbol Belongs to the Runtime* below.
 
 ```
 error[E0849]: `@runtime` is reserved for `lib/std`
@@ -838,6 +839,46 @@ error[E0849]: `@runtime` is reserved for `lib/std`
   |
   = help: for a C function, use `@ffi("library", "symbol")`
 ```
+
+#### A `blink_` Symbol Belongs to the Runtime
+
+The prologue of every compiled program declares each `blink_*` and `__blink_*` symbol of the runtime. C has one flat namespace for symbols, so a user binding to such a symbol either clashes with the prototype of the runtime or reaches an interface that is private to the runtime. So the prefixes are reserved.
+
+A symbol that starts with `blink_` or `__blink_` is `InvalidRuntimeBinding` (E0849) when anything other than `@runtime` in `lib/std` binds it. This covers `@ffi` in the one-argument form, `@ffi` in the two-argument form (a C library that exports such a name is wrapped in C under another name; the help says so), and `@ffi let`. `@runtime` binds a `blink_` symbol only (above), so a `__blink_` symbol has no binding form at all. The compiler reports the error at the symbol string, in `blink check`, so a clean check promises the build (§6.7.1).
+
+```blink
+@ffi("blink_bytes_len")                      // ERROR E0849: one-argument form
+@trusted(audit: "P")
+fn plen(b: Bytes) -> Int ! ()
+
+@ffi("sodium", "blink_randombytes_fill")     // ERROR E0849: two-argument form
+@trusted(audit: "SODIUM-1")
+fn randombytes(mut buf: Bytes) ! Rand {}
+
+@ffi("blink_flags", header: "flags.h")       // ERROR E0849: `@ffi let`
+pub let FLAGS: Int
+
+@ffi("__blink_panic_dispatch")               // ERROR E0849: `__blink_` is reserved too
+@trusted(audit: "P")
+fn dispatch(msg: Str) ! ()
+
+@ffi("shim", "shim_bytes_len")            // OK: the symbol does not start with `blink_`
+@trusted(audit: "SHIM-1")
+fn plen_ok(b: Bytes) -> Int ! ()
+```
+
+```
+error[E0849]: `blink_bytes_len` is a runtime symbol; `@ffi` cannot bind it
+ --> app/len.bl:1:6
+  |
+1 | @ffi("blink_bytes_len")
+  |      ^^^^^^^^^^^^^^^^^ the prefix `blink_` belongs to the Blink runtime
+  |
+  = help: call the standard library function that wraps this symbol
+  = help: for a C library that exports a name with this prefix, wrap it in C under another name and bind that name
+```
+
+The error does not depend on the form of the declaration or on the library argument. Only `@runtime` in `lib/std` binds a `blink_` symbol.
 
 #### Audit-Gated Diagnostics — One Channel, Stated Once
 
