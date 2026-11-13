@@ -814,6 +814,8 @@ error[AmbiguousMethodCall]: ambiguous method call
 
 Any trait method can be called using qualified syntax: `TraitName.method(receiver, args)`. The receiver is passed explicitly as the first argument (the `self` parameter). A method without `self` (an associated function) has no receiver to pass; *Impl-Qualified Calls* below gives its form.
 
+The call resolves on the receiver's type, as `receiver.method(args)` does. When that type has no impl of the trait, the call is `UnresolvedMethod` (E0505). `Never` has only the impls that §3.2 *Built-in Types* lists for it, so `Clone.clone(panic("x"))` is valid, and `Sized.len(panic("x"))` is E0505, as `panic("x").len()` is.
+
 ```blink
 // Unqualified — works when unambiguous
 user.display()
