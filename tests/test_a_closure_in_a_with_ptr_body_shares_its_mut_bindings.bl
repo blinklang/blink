@@ -1,0 +1,163 @@
+// A Bytes.with_ptr closure is a closure like any other: its `mut` parameter and each
+// `let mut` in its body are bindings, and a closure written in that body shares each one it
+// captures (sections/02_syntax.md, Capture Semantics; sections/03_types.md §3.6 Mutable
+// Parameters). The build writes the with_ptr body in the caller's frame, not as a closure of
+// its own, so these rows hold that its bindings still get their cells, and that the caller's
+// own shared bindings keep theirs. Each program is built both ways, because a per-module
+// build and a whole-program build each lower the body.
+
+import compile_test_helpers
+import std.process.{ProcessResult}
+
+// The corpus exports BLINK_COMPILER_ARCHIVE, which, like the module filters, makes a build
+// one unit, so the build drops them and a per-module build really writes its units.
+fn run_built(src: Str, stem: Str, flag: Str) -> ProcessResult ! FS.Read, FS.Write, Process.Spawn, Env.Read {
+    let dir = "{compile_test_helpers.scratch_root()}/{stem}_{getpid()}"
+    compile_test_helpers.sh("rm -rf {dir} && mkdir -p {dir}")
+    let path = "{dir}/{stem}.bl"
+    let bin = "{dir}/{stem}_bin"
+    fs.write(path, src).unwrap()
+    let b = process.run("sh", ["-c", "env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE BLINK_CACHE_DIR={dir}/objcache build/blink build {flag} {path} -o {bin}"]).unwrap()
+    assert(b.success(), "build failed: {b.out}{b.err_out}")
+    let r = process.run(bin, []).unwrap()
+    compile_test_helpers.sh("rm -rf {dir}")
+    r
+}
+
+fn build_and_run(src: Str, stem: Str, flag: Str) -> Str ! FS.Read, FS.Write, Process.Spawn, Env.Read {
+    let r = run_built(src, stem, flag)
+    assert(r.success(), r.err_out)
+    r.out
+}
+
+fn both_modes(src: Str, stem: Str, want: Str) ! FS.Read, FS.Write, Process.Spawn, Env.Read {
+    assert_eq(build_and_run(src, "{stem}_pm", "--per-module"), want)
+    assert_eq(build_and_run(src, "{stem}_wp", "--no-per-module"), want)
+}
+
+test "a closure in a with_ptr body shares the with_ptr closure's mut parameter" {
+    both_modes(#"
+fn main() {
+    let mut b = Bytes.new()
+    b.push(1)
+    let r = b.with_ptr(fn(mut p) {
+        let g = fn() -> Bool { p.is_null() }
+        g()
+    })
+    io.println("{r}")
+}
+"#, "wp_mut_param", "false\n")
+}
+
+test "a closure in a with_ptr body shares a let mut of that body" {
+    both_modes(#"
+fn main() {
+    let mut b = Bytes.new()
+    b.push(1)
+    let r = b.with_ptr(fn(_p) {
+        let mut n = 0
+        let g = fn() { n += 1 }
+        g()
+        n
+    })
+    io.println("{r}")
+}
+"#, "wp_let_mut", "1\n")
+}
+
+test "closures in nested with_ptr bodies share the bindings of each body" {
+    both_modes(#"
+fn main() {
+    let mut b = Bytes.new()
+    b.push(1)
+    let mut c = Bytes.new()
+    c.push(2)
+    let r = b.with_ptr(fn(mut p) {
+        let mut n = 0
+        let s = c.with_ptr(fn(mut q) {
+            let mut m = 1
+            let g = fn() {
+                m += 1
+                n += 10
+            }
+            g()
+            let h = fn() -> Bool { p.is_null() || q.is_null() }
+            if h() { 0 } else { m }
+        })
+        let f = fn() { n += 100 }
+        f()
+        n + s
+    })
+    io.println("{r}")
+}
+"#, "wp_nested", "112\n")
+}
+
+test "a with_ptr body inside a closure shares its own bindings" {
+    both_modes(#"
+fn main() {
+    let f = fn() -> Int {
+        let mut b = Bytes.new()
+        b.push(1)
+        b.with_ptr(fn(mut p) {
+            let mut n = 0
+            let g = fn() -> Bool {
+                n += 1
+                p.is_null()
+            }
+            if g() { 0 } else { n }
+        })
+    }
+    io.println("{f()}")
+}
+"#, "wp_in_closure", "1\n")
+}
+
+test "a let mut after a with_ptr call stays shared with its closure" {
+    both_modes(#"
+fn main() {
+    let mut b = Bytes.new()
+    b.push(1)
+    let r = b.with_ptr(fn(_p) { 7 })
+    let mut k = 0
+    let g = fn() { k += 1 }
+    g()
+    io.println("{r} {k}")
+}
+"#, "wp_after", "7 1\n")
+}
+
+test "a closure in a with_ptr body shares a let mut of the enclosing function" {
+    both_modes(#"
+fn main() {
+    let mut b = Bytes.new()
+    b.push(1)
+    let mut k = 10
+    let r = b.with_ptr(fn(_p) {
+        let g = fn() { k += 1 }
+        g()
+        k
+    })
+    io.println("{r} {k}")
+}
+"#, "wp_outer", "11 11\n")
+}
+
+test "a let mut of a with_ptr body and a shared let mut it shadows keep apart" {
+    both_modes(#"
+fn main() {
+    let mut b = Bytes.new()
+    b.push(1)
+    let mut n = 10
+    let outer = fn() { n += 1 }
+    let r = b.with_ptr(fn(_p) {
+        let mut n = 0
+        let g = fn() { n += 5 }
+        g()
+        n
+    })
+    outer()
+    io.println("{r} {n}")
+}
+"#, "wp_shadow", "5 11\n")
+}

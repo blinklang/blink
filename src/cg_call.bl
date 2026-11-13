@@ -83,6 +83,7 @@ import cg_eff.{
     cg_eff_lower_builtin_default_perform, cg_eff_lower_builtin_op_perform,
     cg_eff_lower_spawn_closure, cg_eff_spawn_value_task, cg_eff_pending_thunks, cg_eff_thunk_task_symbol, cg_eff_lower_fn_value,
     cg_eff_lower_io_read_perform, cg_eff_impl_method_at,
+    cg_eff_enter_inline_frame, cg_eff_leave_inline_frame, cg_eff_binder_is_shared, cg_eff_declare_cell,
 }
 import cg_print.{vtable_slot_self_spelling}
 import cg_promote.{cg_promote_on_demand_claim, cg_promote_on_demand_settle, cg_promote_on_demand_queue}
@@ -5563,44 +5564,63 @@ fn cc_bytes_with_ptr(node: Int, obj: Int, kind: TyKind, method: Str) -> Int ! Di
     let params = node_params(cls)
     if params == -1 || sublist_length(params) != 1 { return cc_pointer_body_not_lowered(node) }
     let param = sublist_get(params, 0)
-    let pname = node_name(param)
     let ptid = tid_of_node(param)
     if ptid < 0 { return -1 }
     let precord = cc_local(ptid, param)
     if cc_stopped(precord) { return -1 }
-    let recv = lower_expr(obj)
-    if recv < 0 { return -1 }
-    // blink_bytes_ptr is just `return b->data;` (bootstrap/runtime_core.h), added to the
-    // runtime after gen0 was pinned, so gen1 building against gen0's runtime.h has no
-    // declaration for it. Read the field straight off the receiver instead of calling out.
-    // The receiver's own C type is already the pointer (blink_bytes*): FieldGet picks '.'
-    // or '->' from the object node's own slot_form, which for a Bytes local says Inline
-    // (the pointer value sits directly in the slot, nothing boxes it further), so an
-    // unwrapped FieldGet would print '.' where C needs '->'. Deref first so the field read
-    // goes through a value node and prints '.', same as the runtime helper's `b->data`.
-    let bytes_tid = tid_of_node(obj)
-    if bytes_tid < 0 { return -1 }
-    let deref = ir_unbox(bytes_tid, node, handle_pointee_spelling(bytes_tid), SlotForm.Inline, recv)
-    let ptr_init = ir_field_get(ptid, node, precord.c_spelling, "data", precord.slot_form, deref)
+    let ptr_init = cc_with_ptr_data(node, obj, ptid, precord)
+    if ptr_init < 0 { return -1 }
     let tid = tid_of_node(node)
     if tid < 0 { return -1 }
     let rec = cc_local(tid, node)
     if cc_stopped(rec) { return -1 }
     let scope = binder_scope_push()
-    // Reads the parsed `mut` keyword like any other parameter, not a hardcoded false:
-    // name resolution does not honor it yet, but this must not bake that gap in.
-    bind_binder_mut(scope, pname, ptid, node_is_mut(param) == 1)
-    // Bound before it is declared, so the declaration takes the binder's own C name and
-    // does not redeclare a local of that spelling in the enclosing body.
-    cg_expr_push_pending(node, ir_let(ptid, param, precord.c_spelling,
-        binder_c_name_of(scope, pname), precord.slot_form, ptr_init))
+    // The body declares its bindings in this frame, so the ones its own closures share are
+    // settled before the parameter binds, as at the head of any other body.
+    let outer = cg_eff_enter_inline_frame(cls)
+    cg_expr_push_pending(node, cc_with_ptr_bind_param(scope, param, ptid, precord, ptr_init))
     let dest = c_mint_local("wp")
     cg_expr_push_pending(node, ir_let(tid, node, rec.c_spelling, dest, rec.slot_form, -1))
     let body = lower_block_into(node_body(cls), dest, tid)
+    cg_eff_leave_inline_frame(outer)
     binder_scope_pop()
     if body < 0 { return -1 }
     cg_expr_push_pending(node, body)
     cc_temp_ref(node, tid, rec, dest)
+}
+
+// The buffer pointer a with_ptr body is handed, read off the receiver.
+// blink_bytes_ptr is just `return b->data;` (bootstrap/runtime_core.h), added to the
+// runtime after gen0 was pinned, so gen1 building against gen0's runtime.h has no
+// declaration for it. Read the field straight off the receiver instead of calling out.
+// The receiver's own C type is already the pointer (blink_bytes*): FieldGet picks '.'
+// or '->' from the object node's own slot_form, which for a Bytes local says Inline
+// (the pointer value sits directly in the slot, nothing boxes it further), so an
+// unwrapped FieldGet would print '.' where C needs '->'. Deref first so the field read
+// goes through a value node and prints '.', same as the runtime helper's `b->data`.
+fn cc_with_ptr_data(node: Int, obj: Int, ptid: Int, precord: LayoutRecord) -> Int ! Diag.Report {
+    let recv = lower_expr(obj)
+    if recv < 0 { return -1 }
+    let bytes_tid = tid_of_node(obj)
+    if bytes_tid < 0 { return -1 }
+    let deref = ir_unbox(bytes_tid, node, handle_pointee_spelling(bytes_tid), SlotForm.Inline, recv)
+    ir_field_get(ptid, node, precord.c_spelling, "data", precord.slot_form, deref)
+}
+
+// The declaration of a with_ptr closure's parameter in the caller's frame: a cell when a
+// closure in the body shares a `mut` parameter, else a plain local.
+fn cc_with_ptr_bind_param(scope: Int, param: Int, ptid: Int, precord: LayoutRecord, init: Int) -> Int ! Diag.Report {
+    let pname = node_name(param)
+    let is_mut = node_is_mut(param) == 1
+    if is_mut && cg_eff_binder_is_shared(pname) {
+        return cg_eff_declare_cell(scope, pname, ptid, param, precord, init)
+    }
+    // Reads the parsed `mut` keyword like any other parameter, not a hardcoded false:
+    // name resolution does not honor it yet, but this must not bake that gap in.
+    bind_binder_mut(scope, pname, ptid, is_mut)
+    // Bound before it is declared, so the declaration takes the binder's own C name and
+    // does not redeclare a local of that spelling in the enclosing body.
+    ir_let(ptid, param, precord.c_spelling, binder_c_name_of(scope, pname), precord.slot_form, init)
 }
 
 // ── Carriers ──────────────────────────────────────────────────────────────
