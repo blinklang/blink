@@ -1,0 +1,301 @@
+// A derived from_json on a generic type, like the from_str of a generic str-backed enum, is a
+// static fn: no receiver names the instance, so the
+// expected type or a later use fixes its type arguments (sections/03_types.md, Under-Determined
+// Types), and each instance gets its own reader. Each program must check clean, then build and run
+// in both modes and print the expected text. The guard rows hold shapes that built before.
+
+import compile_test_helpers
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> ProcessResult ! Process.Spawn {
+    process.run("sh", ["-c", cmd]).unwrap()
+}
+
+fn expect_prints(tag: Str, lines: List[Str], want: Str) ! IO, FS.Write, Process.Spawn, Env.Read {
+    let dir = "{compile_test_helpers.scratch_root()}/derived_from_json_generic_{tag}"
+    let _ = sh("rm -rf {dir} && mkdir -p {dir}")
+    fs.write("{dir}/x.bl", lines.join("\n").concat("\n")).unwrap()
+    let clear = "env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE"
+    let mut bad = 0
+    let c = sh("B=$(pwd)/build/blink; cd {dir} && {clear} timeout 120 $B check x.bl < /dev/null")
+    if !c.success() {
+        io.eprintln("{tag} check: ended {c.end}\n{c.out}{c.err_out}")
+        bad = bad + 1
+    }
+    for mode in ["--per-module", "--no-per-module"] {
+        let r = sh("B=$(pwd)/build/blink; cd {dir} && {clear} timeout 120 $B run {mode} x.bl < /dev/null")
+        if !r.success() || r.out.trim() != want {
+            io.eprintln("{tag} {mode}: ended {r.end}, printed [{r.out.trim()}], want [{want}]\n{r.err_out}")
+            bad = bad + 1
+        }
+    }
+    let _ = sh("rm -rf {dir}")
+    assert_eq(bad, 0)
+}
+
+test "a later use of the field fixes the instance" {
+    expect_prints("later_use", [
+        "@derive(Deserialize)",
+        "type Box[T] \{ v: T }",
+        "fn ds() -> Int \{",
+        "    let r = Box.from_json(#\"\{\"v\":9}\"#)",
+        "    match r \{",
+        "        Ok(b) => b.v",
+        "        Err(_) => -1",
+        "    }",
+        "}",
+        "fn main() \{",
+        "    io.println(\"\{ds()}\")",
+        "}",
+    ], "9")
+}
+
+test "an annotation on the binding fixes the instance" {
+    expect_prints("annotated", [
+        "@derive(Deserialize)",
+        "type Box[T] \{ v: T }",
+        "fn main() \{",
+        "    let r: Result[Box[Str], Str] = Box.from_json(#\"\{\"v\":\"hi\"}\"#)",
+        "    match r \{",
+        "        Ok(b) => io.println(b.v)",
+        "        Err(e) => io.println(\"err \{e}\")",
+        "    }",
+        "}",
+    ], "hi")
+}
+
+test "two instances in one program each get their own reader" {
+    expect_prints("two_instances", [
+        "@derive(Deserialize)",
+        "type Box[T] \{ v: T }",
+        "fn main() \{",
+        "    let a: Result[Box[Int], Str] = Box.from_json(#\"\{\"v\":9}\"#)",
+        "    let b: Result[Box[Str], Str] = Box.from_json(#\"\{\"v\":\"s\"}\"#)",
+        "    let c: Result[Box[Int], Str] = Box.from_json(#\"\{\"v\":\"s\"}\"#)",
+        "    match a \{",
+        "        Ok(x) => io.println(\"\{x.v}\")",
+        "        Err(e) => io.println(\"err \{e}\")",
+        "    }",
+        "    match b \{",
+        "        Ok(x) => io.println(x.v)",
+        "        Err(e) => io.println(\"err \{e}\")",
+        "    }",
+        "    io.println(\"\{c.is_ok()}\")",
+        "}",
+    ], "9\ns\nfalse")
+}
+
+test "a nested generic argument is read through its own reader" {
+    expect_prints("nested", [
+        "@derive(Deserialize)",
+        "type Box[T] \{ v: T }",
+        "fn main() \{",
+        "    let r: Result[Box[List[Int]], Str] = Box.from_json(#\"\{\"v\":[1,2,3]}\"#)",
+        "    match r \{",
+        "        Ok(b) => io.println(\"\{b.v.len()} \{b.v.get(2) ?? 0}\")",
+        "        Err(e) => io.println(\"err \{e}\")",
+        "    }",
+        "    let n: Result[Box[Box[Int]], Str] = Box.from_json(#\"\{\"v\":\{\"v\":4}}\"#)",
+        "    match n \{",
+        "        Ok(b) => io.println(\"\{b.v.v}\")",
+        "        Err(e) => io.println(\"err \{e}\")",
+        "    }",
+        "}",
+    ], "3 3\n4")
+}
+
+test "a generic enum round-trips at two instances" {
+    expect_prints("enum", [
+        "@derive(Serialize, Deserialize)",
+        "type Opt[T] \{",
+        "    Has(T)",
+        "    Nope",
+        "}",
+        "fn main() \{",
+        "    let a: Opt[Int] = Has(5)",
+        "    let r: Result[Opt[Int], Str] = Opt.from_json(a.to_json())",
+        "    match r \{",
+        "        Ok(Has(n)) => io.println(\"has \{n}\")",
+        "        Ok(Nope) => io.println(\"nope\")",
+        "        Err(e) => io.println(\"err \{e}\")",
+        "    }",
+        "    let s: Result[Opt[Str], Str] = Opt.from_json(Opt.Has(\"q\").to_json())",
+        "    match s \{",
+        "        Ok(Has(n)) => io.println(\"has \{n}\")",
+        "        Ok(Nope) => io.println(\"nope\")",
+        "        Err(e) => io.println(\"err \{e}\")",
+        "    }",
+        "}",
+    ], "has 5\nhas q")
+}
+
+test "a generic field of a plain derived type reads through its own instance" {
+    expect_prints("field", [
+        "@derive(Deserialize)",
+        "type Box[T] \{ v: T }",
+        "@derive(Deserialize)",
+        "type H \{ b: Box[Int], n: Int }",
+        "fn main() \{",
+        "    match H.from_json(#\"\{\"b\":\{\"v\":4},\"n\":2}\"#) \{",
+        "        Ok(h) => io.println(\"\{h.b.v} \{h.n}\")",
+        "        Err(e) => io.println(\"err \{e}\")",
+        "    }",
+        "}",
+    ], "4 2")
+}
+
+test "a two-parameter type's reader fixes both parameters" {
+    expect_prints("two_params", [
+        "@derive(Deserialize)",
+        "type Pair[A, B] \{ a: A, b: B }",
+        "fn main() \{",
+        "    let r: Result[Pair[Int, Str], Str] = Pair.from_json(#\"\{\"a\":1,\"b\":\"x\"}\"#)",
+        "    match r \{",
+        "        Ok(p) => io.println(\"\{p.a} \{p.b}\")",
+        "        Err(e) => io.println(\"err \{e}\")",
+        "    }",
+        "}",
+    ], "1 x")
+}
+
+test "the parameter type of a call argument fixes the instance" {
+    expect_prints("argument", [
+        "@derive(Deserialize)",
+        "type Box[T] \{ v: T }",
+        "fn show(r: Result[Box[Int], Str]) -> Str \{",
+        "    match r \{",
+        "        Ok(b) => \"\{b.v}\"",
+        "        Err(e) => \"err \{e}\"",
+        "    }",
+        "}",
+        "fn main() \{",
+        "    io.println(show(Box.from_json(#\"\{\"v\":8}\"#)))",
+        "    io.println(show(Box.from_json(#\"\{\"v\":\"no\"}\"#)))",
+        "}",
+    ], "8\nerr field 'v' is missing or holds the wrong JSON type")
+}
+
+test "a call in a generic function takes the instance of each call of it" {
+    expect_prints("generic_fn", [
+        "@derive(Deserialize)",
+        "type Box[T] \{ v: T }",
+        "fn rd[T](s: Str) -> Result[Box[T], Str] \{",
+        "    Box.from_json(s)",
+        "}",
+        "fn main() \{",
+        "    let a: Result[Box[Int], Str] = rd(#\"\{\"v\":7}\"#)",
+        "    let c: Result[Box[Str], Str] = rd(#\"\{\"v\":\"w\"}\"#)",
+        "    match a \{",
+        "        Ok(b) => io.println(\"\{b.v}\")",
+        "        Err(e) => io.println(\"err \{e}\")",
+        "    }",
+        "    match c \{",
+        "        Ok(b) => io.println(b.v)",
+        "        Err(e) => io.println(\"err \{e}\")",
+        "    }",
+        "}",
+    ], "7\nw")
+}
+
+test "Self in an impl over the generic type names the impl's instance" {
+    expect_prints("self_head", [
+        "@derive(Deserialize)",
+        "type Box[T] \{ v: T }",
+        "trait Rd \{",
+        "    fn rd(s: Str) -> Result[Self, Str]",
+        "}",
+        "impl[T] Rd for Box[T] \{",
+        "    fn rd(s: Str) -> Result[Self, Str] \{ Self.from_json(s) }",
+        "}",
+        "fn main() \{",
+        "    let r: Result[Box[Int], Str] = Box.rd(#\"\{\"v\":3}\"#)",
+        "    match r \{",
+        "        Ok(b) => io.println(\"\{b.v}\")",
+        "        Err(e) => io.println(\"err \{e}\")",
+        "    }",
+        "}",
+    ], "3")
+}
+
+test "guard: an alias of an instance names the instance, with no false CannotInferType" {
+    expect_prints("alias_head", [
+        "@derive(Deserialize)",
+        "type Box[T] \{ v: T }",
+        "type IntBox = Box[Int]",
+        "fn main() \{",
+        "    match IntBox.from_json(#\"\{\"v\":7}\"#) \{",
+        "        Ok(b) => io.println(\"\{b.v + 1}\")",
+        "        Err(e) => io.println(\"err \{e}\")",
+        "    }",
+        "}",
+    ], "8")
+}
+
+test "a later use of the field fixes the instance beside an unrelated instance literal" {
+    expect_prints("seed_later_use", [
+        "@derive(Serialize, Deserialize)",
+        "type Box[T] \{ v: T }",
+        "fn ds() -> Int \{",
+        "    let _seed = Box \{ v: 0 }",
+        "    let r = Box.from_json(#\"\{\"v\":9}\"#)",
+        "    match r \{",
+        "        Ok(b) => b.v",
+        "        Err(_) => -1",
+        "    }",
+        "}",
+        "fn main() \{",
+        "    io.println(\"\{ds()}\")",
+        "}",
+    ], "9")
+}
+
+test "a generic str-backed enum's from_str takes its instance from the annotation, argument or alias" {
+    expect_prints("from_str", [
+        "type Col[T] \{ Red = \"r\", Blue = \"b\" }",
+        "type IC = Col[Int]",
+        "fn name(c: Col[Int]) -> Str \{",
+        "    match c \{",
+        "        Col.Red => \"red\"",
+        "        Col.Blue => \"blue\"",
+        "    }",
+        "}",
+        "fn main() \{",
+        "    let c: Option[Col[Int]] = Col.from_str(\"b\")",
+        "    io.println(\"\{c.is_some()} \{name(c.unwrap())}\")",
+        "    io.println(name(Col.from_str(\"r\").unwrap()))",
+        "    let none: Option[Col[Str]] = Col.from_str(\"x\")",
+        "    io.println(\"\{none.is_some()}\")",
+        "    match IC.from_str(\"b\") \{",
+        "        Some(k) => io.println(name(k))",
+        "        None => io.println(\"none\")",
+        "    }",
+        "}",
+    ], "true blue\nred\nfalse\nblue")
+}
+
+test "guard: Deserialize on a type that is not generic" {
+    expect_prints("guard_plain", [
+        "@derive(Deserialize)",
+        "type P \{ a: Int, s: Str }",
+        "fn main() \{",
+        "    match P.from_json(#\"\{\"a\":1,\"s\":\"z\"}\"#) \{",
+        "        Ok(p) => io.println(\"\{p.a} \{p.s}\")",
+        "        Err(e) => io.println(\"err \{e}\")",
+        "    }",
+        "}",
+    ], "1 z")
+}
+
+test "guard: the other derives on a generic type still build and run" {
+    expect_prints("guard_others", [
+        "@derive(Eq, Ord, Hash, Debug, Clone, Serialize)",
+        "type Box[T] \{ v: T }",
+        "fn main() \{",
+        "    let a = Box \{ v: 1 }",
+        "    let b = a.clone()",
+        "    io.println(\"\{a == b} \{a.cmp(Box \{ v: 2 }) == Ordering.Less} \{a.hash() == b.hash()}\")",
+        "    io.println(a.debug())",
+        "    io.println(Box \{ v: \"s\" }.to_json())",
+        "}",
+    ], "true true true\nBox \{ v: 1 }\n\{\"v\":\"s\"}")
+}

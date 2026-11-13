@@ -4340,6 +4340,16 @@ fn tc_impl_binds_by_name(im: Int, tids: List[Int]) -> Map[Str, Int] {
 // The flush half of tc_note_static_impl_call: it blames the head for a binder that nothing
 // supplies. The impl's bounds at a binder that inference filled are judged with the other
 // calls through an impl (tc_flush_impl_bound_calls), with `Self` read as the head's instance.
+// The binders of a derived static are the type's, and a call cannot write them:
+// `Box[Int].from_json` is not a call head, so the repair is a head that names them, as for a
+// trait's static.
+fn tc_ud_report_derived_static(call_node: Int, sig: Int, owner: Int, names: List[Str], tids: List[Int]) ! TypeCheck.Resolve, Diag.Report {
+    let shown = tc_type_str(tc_derived_static_built(fnsig_pool.get(sig).unwrap().ret))
+    let msg = tc_unbound_binders_msg(["{tc_ticked_names(names)} of `{node_name(owner)}`"], names.len(), "at this call")
+    diag_error_at("CannotInferType", CANNOT_INFER_TYPE, msg, call_node, "give the result a type annotation, or call the function through a type alias that names the type's arguments, such as `type Named = {shown}` with each parameter written")
+    for t in tids { tc_ud_mark_blamed(t) }
+}
+
 fn tc_ud_flush_static_impl_call(head: Int, g: Int) ! TypeCheck.Resolve, Diag.Report {
     let grp = tc_static_impl_group(g)
     let im = grp.im
@@ -4774,6 +4784,11 @@ fn tc_ud_flush_calls() ! TypeCheck.Resolve, Diag.Report {
             continue
         }
         tc_calls.reported.insert(call_node, 1)
+        let owner = tc_derived_static_owner(sig)
+        if owner >= 0 {
+            tc_ud_report_derived_static(call_node, sig, owner, names, tids)
+            continue
+        }
         let callee = node_name(fs.decl)
         let mut msg = "type parameter {tc_ticked_names(names)} of `{callee}` is unbound at this call and nothing supplies it"
         if names.len() > 1 {
@@ -10581,19 +10596,19 @@ fn register_builtin_fn_sigs() {
         fnsig_param_names.set(at, "left")
         fnsig_param_names.set(at + 1, "right")
         fnsig_param_names.set(at + 2, "msg")
-        tc_add_builtin_sig_tparam("T", "|")
+        tc_add_sig_tparam("T", BUILTIN_BINDER_NODE, 0, "|")
     }
 }
 
 // Gives the newest fnsig one more type parameter, in every table parallel to
 // fnsig_type_param_names, so the readers indexing those tables by the same slot agree.
-fn tc_add_builtin_sig_tparam(name: Str, bounds: Str) {
+fn tc_add_sig_tparam(name: Str, node: Int, ret_only: Int, bounds: Str) {
     let sig = fnsig_pool.len() - 1
     let fs = fnsig_pool.get(sig).unwrap()
     let start = if fs.type_params_count == 0 { fnsig_type_param_names.len() } else { fs.type_params_start }
     fnsig_type_param_names.push(name)
-    fnsig_tparam_nodes.push(BUILTIN_BINDER_NODE)
-    fnsig_tparam_ret_only.push(0)
+    fnsig_tparam_nodes.push(node)
+    fnsig_tparam_ret_only.push(ret_only)
     fnsig_tparam_sourced.push(1)
     fnsig_tparam_bounds.push(bounds)
     fnsig_pool.set(sig, FnSigEntry { name: fs.name, ret: fs.ret, params_start: fs.params_start, params_count: fs.params_count, type_params_start: start, type_params_count: fs.type_params_count + 1, effects_start: fs.effects_start, effects_count: fs.effects_count, decl: fs.decl })
@@ -10817,11 +10832,29 @@ fn tc_is_str_backed_enum_decl(td: Int) -> Int {
 // trait impl (which keys `{Type}_{trait}_{method}` and is found through the method→traits
 // index) is left alone. A type that both derives and hand-writes a same-named method is a
 // duplicate-impl question, not this function's to answer.
-fn register_derive_method_sig(tname: Str, method: Str, params: List[Int], ret: Int) {
+fn register_derive_method_sig(tname: Str, method: Str, params: List[Int], ret: Int) -> Bool {
     let key = "{tname}_{method}"
-    if (fnsig_map.get(key) ?? -1) != -1 { return }
-    if tc_method_trait_count(tname, method) >= 1 { return }
+    if (fnsig_map.get(key) ?? -1) != -1 { return false }
+    if tc_method_trait_count(tname, method) >= 1 { return false }
     register_intrinsic_fn_sig(key, params, ret)
+    true
+}
+
+// A derived static (from_json, from_str) is called on the type, so no receiver names the
+// instance it builds. The declaration's own binders become the signature's, each one
+// return-only, so every call mints a metavariable for each of them as a generic fn call does:
+// the expected type or a later use then fixes it, and a call that nothing fixes is reported as
+// under-determined rather than reaching codegen with a free type variable.
+fn register_derived_static_sig(tname: Str, method: Str, params: List[Int], ret: Int, td: Int) {
+    if !register_derive_method_sig(tname, method, params, ret) { return }
+    let tps = node_type_params(td)
+    if tps == -1 { return }
+    let mut i = 0
+    while i < sublist_length(tps) {
+        let tp = sublist_get(tps, i)
+        tc_add_sig_tparam(node_name(tp), tp, 1, tparam_node_bound_traits(tp))
+        i = i + 1
+    }
 }
 
 // The signature of every method `@derive` synthesizes.
@@ -10881,7 +10914,7 @@ fn register_derive_method_sigs(program: Int) {
                 register_derive_method_sig(tname, "to_json", [ttid], TYPE_STR)
             }
             if tc_decl_derives(td, "Deserialize") != 0 {
-                register_derive_method_sig(tname, "from_json", [TYPE_STR], make_result_type(self_t, TYPE_STR))
+                register_derived_static_sig(tname, "from_json", [TYPE_STR], make_result_type(self_t, TYPE_STR), td)
             }
             if tc_decl_derives(td, "Clone") != 0 {
                 register_derive_method_sig(tname, "clone", [ttid], self_t)
@@ -10904,11 +10937,34 @@ fn register_derive_method_sigs(program: Int) {
             }
             if tc_is_str_backed_enum_decl(td) != 0 {
                 register_derive_method_sig(tname, "to_str", [ttid], TYPE_STR)
-                register_derive_method_sig(tname, "from_str", [TYPE_STR], make_option_type(self_t))
+                register_derived_static_sig(tname, "from_str", [TYPE_STR], make_option_type(self_t), td)
             }
         }
         i = i + 1
     }
+}
+
+// The type declaration whose binders a derived static fn's signature took, or -1 for any other
+// signature. It has no fn declaration, and it builds its type inside its result: the ok arm of
+// from_json's Result, or the Some arm of from_str's Option.
+fn tc_derived_static_owner(sig: Int) -> Int {
+    let fs = fnsig_pool.get(sig).unwrap()
+    if fs.decl >= 0 || fs.type_params_count == 0 { return -1 }
+    let built = tc_derived_static_built(fs.ret)
+    let td = if built < 0 { -1 } else { tc_tid_decl_node(built) }
+    if td < 0 { return -1 }
+    let kind = type_kind(tc_resolve(fs.ret))
+    if kind == TyKind.Result && tc_decl_derives(td, "Deserialize") != 0 { return td }
+    if kind == TyKind.Option && tc_is_str_backed_enum_decl(td) != 0 { return td }
+    -1
+}
+
+// The type a derived static builds: the arm of the Result or Option it answers, or -1.
+fn tc_derived_static_built(ret: Int) -> Int {
+    if ret < 0 { return -1 }
+    let r = tc_resolve(ret)
+    if type_kind(r) != TyKind.Result && type_kind(r) != TyKind.Option { return -1 }
+    tc_resolve(ty_pool.get(r).unwrap().inner1)
 }
 
 // The closure argument at `idx`, or -1 if absent. The closure validators below
@@ -37667,13 +37723,16 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                     // `B.mk(x)` is the call `B_mk(x)`, so its own binders are bound as a free
                     // generic call's are.
                     let static_ret = tc_check_free_call("{obj_name}.{method}", static_sig, node)
+                    // A derived static builds its type inside the Result or Option it answers, so
+                    // the head names that arm.
+                    let built = if tc_derived_static_owner(static_sig) >= 0 { tc_derived_static_built(static_ret) } else { static_ret }
                     // What the function builds as the alias's target holds to the alias's
                     // arguments, as a constructor's result does.
-                    if head_type != -1 && static_ret >= 0 && tc_tid_decl_node(static_ret) >= 0 && tc_tid_decl_node(static_ret) == tc_tid_decl_node(head_type) {
+                    if head_type != -1 && built >= 0 && tc_tid_decl_node(built) >= 0 && tc_tid_decl_node(built) == tc_tid_decl_node(head_type) {
                         // Asked before the unify, which takes the impl's own binders as open.
-                        if types_compatible(static_ret, head_type) == 0 || tc_unify(static_ret, head_type) == 0 {
+                        if types_compatible(built, head_type) == 0 || tc_unify(built, head_type) == 0 {
                             let builds_help = if static_head.inst != -1 { "change the arguments so that the call builds `{type_to_str(head_type)}`, the type `Self` names in this impl" } else { "change the arguments to match the alias" }
-                            tc_error_at_code("`{obj_written}.{method}` builds `{type_to_str(head_type)}`, but its arguments say `{type_to_str(static_ret)}`", node,
+                            tc_error_at_code("`{obj_written}.{method}` builds `{type_to_str(head_type)}`, but its arguments say `{type_to_str(built)}`", node,
                                 "TypeError", TYPE_ERROR, builds_help)
                             return tc_error_recovery_tid()
                         }

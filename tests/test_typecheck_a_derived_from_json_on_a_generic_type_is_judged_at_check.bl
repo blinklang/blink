@@ -1,0 +1,121 @@
+// A derived from_json on a generic type, like the from_str of a generic str-backed enum, is a
+// static fn whose binders are the type's: only the
+// expected type or a later use fixes them (sections/03_types.md, Under-Determined Types). A call
+// that nothing fixes is CannotInferType (E0301), and an instance the type's bounds or the expected
+// type refuse is an error, all at check. None of them may reach the build.
+
+import compile_test_helpers
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> ProcessResult ! Process.Spawn {
+    process.run("sh", ["-c", cmd]).unwrap()
+}
+
+fn expect_check_error(tag: Str, lines: List[Str], want: List[Str]) ! IO, FS.Write, Process.Spawn, Env.Read {
+    let dir = "{compile_test_helpers.scratch_root()}/derived_from_json_generic_error_{tag}"
+    let _ = sh("rm -rf {dir} && mkdir -p {dir}")
+    fs.write("{dir}/x.bl", lines.join("\n").concat("\n")).unwrap()
+    let clear = "env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE"
+    let r = sh("B=$(pwd)/build/blink; cd {dir} && {clear} timeout 120 $B check x.bl < /dev/null 2>&1")
+    let text = r.out.concat(r.err_out)
+    let mut bad = 0
+    if r.success() {
+        io.eprintln("{tag}: check passed, want an error")
+        bad = bad + 1
+    }
+    if text.contains("internal compiler error") {
+        io.eprintln("{tag}: check reported an internal compiler error")
+        bad = bad + 1
+    }
+    for w in want {
+        if !text.contains(w) {
+            io.eprintln("{tag}: output lacks [{w}]")
+            bad = bad + 1
+        }
+    }
+    if bad > 0 { io.eprintln(text) }
+    let _ = sh("rm -rf {dir}")
+    assert_eq(bad, 0)
+}
+
+
+test "a derived from_json whose result nothing fixes is one CannotInferType at the binding" {
+    expect_check_error("unfixed", [
+        "@derive(Deserialize)",
+        "type Box[T] \{ v: T }",
+        "",
+        "fn main() ! IO \{",
+        "    let r = Box.from_json(\"\\\{\\\"v\\\":9}\")",
+        "    io.println(\"\{r.is_ok()}\")",
+        "}",
+    ], ["error[CannotInferType]", "cannot infer a type for `r`", "--> x.bl:5:5", "1 error(s) found"])
+}
+
+test "a discarded derived from_json call is CannotInferType that names the type's binder" {
+    expect_check_error("discard", [
+        "@derive(Deserialize)",
+        "type Box[T] \{ v: T }",
+        "fn main() \{",
+        "    let _ = Box.from_json(#\"\{\"v\":9}\"#)",
+        "    io.println(\"x\")",
+        "}",
+    ], ["error[CannotInferType]", "type parameter `T` of `Box` is unbound at this call", "type Named = Box[T]", "--> x.bl:4:13", "1 error(s) found"])
+}
+
+test "a derived from_json call as a statement names every binder it leaves open" {
+    expect_check_error("statement", [
+        "@derive(Deserialize)",
+        "type Pair[A, B] \{ a: A, b: B }",
+        "fn main() \{",
+        "    Pair.from_json(#\"\{\"a\":1,\"b\":2}\"#)",
+        "    io.println(\"x\")",
+        "}",
+    ], ["error[CannotInferType]", "type parameters `A`, `B` of `Pair` are unbound", "--> x.bl:4:5", "1 error(s) found"])
+}
+
+test "an instance that breaks the type's bound is refused at the call" {
+    expect_check_error("bound", [
+        "@derive(Deserialize)",
+        "type Box[T: Eq] \{ v: T }",
+        "@derive(Deserialize)",
+        "type N \{ a: Int }",
+        "fn main() \{",
+        "    let r: Result[Box[N], Str] = Box.from_json(#\"\{\"v\":\{\"a\":1}}\"#)",
+        "    io.println(\"\{r.is_ok()}\")",
+        "}",
+    ], ["error[TraitBoundNotSatisfied]", "`N` does not satisfy the Eq bound on type parameter T"])
+}
+
+test "an alias head builds its own instance, so another expected instance is a type error" {
+    expect_check_error("alias_mismatch", [
+        "@derive(Deserialize)",
+        "type Box[T] \{ v: T }",
+        "",
+        "type IntBox = Box[Int]",
+        "",
+        "fn main() ! IO \{",
+        "    let r: Result[Box[Str], Str] = IntBox.from_json(\"\\\{\\\"v\\\":7}\")",
+        "    io.println(\"\{r.is_ok()}\")",
+        "}",
+    ], ["error[TypeError]", "declared type Result[Box[Str], Str] but got Result[Box[Int], Str]"])
+}
+
+test "a generic str-backed enum's from_str whose result nothing fixes is one CannotInferType at the binding" {
+    expect_check_error("from_str_unfixed", [
+        "type Col[T] \{ Red = \"r\", Blue = \"b\" }",
+        "fn main() \{",
+        "    let c = Col.from_str(\"r\")",
+        "    io.println(\"\{c.is_some()}\")",
+        "}",
+    ], ["error[CannotInferType]", "cannot infer a type for `c`", "--> x.bl:3:5", "1 error(s) found"])
+}
+
+test "a discarded from_str on a generic str-backed enum names the enum's binder" {
+    expect_check_error("from_str_discard", [
+        "type Col[T] \{ Red = \"r\", Blue = \"b\" }",
+        "fn main() \{",
+        "    let _ = Col.from_str(\"r\")",
+        "    io.println(\"x\")",
+        "}",
+    ], ["error[CannotInferType]", "type parameter `T` of `Col` is unbound at this call", "type Named = Col[T]", "--> x.bl:3:13", "1 error(s) found"])
+}
