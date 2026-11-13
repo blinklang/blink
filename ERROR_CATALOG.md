@@ -216,7 +216,7 @@ ICE codes use the `I` prefix. `@allow` and `[lints]` take warning names only, so
 | TypeNotTrait | E0740 | A name that resolves to a type stands where a trait is expected: a bound, a `where` constraint, the trait of an impl header, a supertrait clause, the argument of `@derive(...)`, or the left side of `for` in an impl-qualified call head `(Trait for Type)`. The name may carry a module qualifier. In a call head, when the left side is a type and the right side is a trait, the note says which side is the trait and the help gives the swapped head; otherwise the help suggests no swap | Method resolution | §3c.4, §10.1 |
 | FfiFunctionPublic | E0801 | FFI function cannot be `pub` | FFI | §9.1 |
 | FfiNoEffects | E0802 | `@ffi` function has no effect row. Primary span on the signature. The help names the choices: the effects the foreign code has (`IO`, `FS`, `Net`, ...); `State` if it changes process-wide C state no argument reaches (the fd table, errno, a C global); or `! ()` (the empty effect row) if it has none. The help also says that `! ()` claims no hidden state between calls. A decl that carries `@effects` gets E1139 alone. No machine-applicable fix: the row is a claim about foreign code | FFI | §9.1 |
-| ContractOnFfi | E0803 | `@requires`/`@ensures` not allowed on `@ffi` function, and an `@ffi` fn may not directly implement a trait method that has a contract | FFI | §9.1, §3b |
+| ContractOnFfi | E0803 | `@requires`/`@ensures` not allowed on `@ffi` function | FFI | §9.1, §3b |
 | InvalidPtrTypeParam | E0810 | Invalid `Ptr[T]` type parameter | FFI | §9.1.1 |
 | PtrOutsideFfiContext | E0811 | `Ptr[T]` used outside FFI context | FFI | §9.1.1 |
 | FfiStructGcField | E0812 | `@ffi.struct` field uses GC-managed or non-FFI type | FFI | §9.1.3 |
@@ -311,7 +311,7 @@ ICE codes use the `I` prefix. `@allow` and `[lints]` take warning names only, so
 | EmptyBraceExpr | E1107 | Empty `{}` used in expression position (use `Map.new()`) | Parser | §2 |
 | FileNotFound | E1108 | `#embed(...)` referenced a file that does not exist. A file that is there but cannot be read is E1025 `FileReadFailed`; the split is by errno (see E1025) | Parser | §2.20 |
 | MutFieldNotSupported | E1109 | `mut` keyword on struct field declaration | Parser | §2 |
-| UnexpectedAnnotation | E1110 | Annotation used in unsupported position. Includes `@derive`, `@where`, `@invariant`, `@ffi.struct` and `@ffi.opaque` on a type alias; the help names the declaration that takes the derive, when the alias names a struct or enum of this package (§11.1 *Annotations on a Type Alias*) | Parser | §2, §11.1 |
+| UnexpectedAnnotation | E1110 | Annotation used in unsupported position. Includes `@derive`, `@where`, `@invariant`, `@ffi.struct` and `@ffi.opaque` on a type alias, and `@ffi` on a fn in an `impl` or `trait` block (with or without a receiver) or on a type-scoped `fn T.name`, reported at the `@ffi` in `blink check`, with the help to declare a module-level `@ffi fn` and call it from the method (§9.1 *`@ffi` Binds a Module-Level Function*); the help names the declaration that takes the derive, when the alias names a struct or enum of this package (§11.1 *Annotations on a Type Alias*) | Parser | §2, §11.1 |
 | UnknownIntrinsic | E1111 | Unknown compile-time intrinsic (`#name`) | Parser | §2.20 |
 | UnexpectedCharacter | E1113 | The lexer found a character that starts no token | Lexer | §2 |
 | EmptyUnicodeEscape | E1114 | `\u{}` with no hex digits | Lexer | §2.4 |

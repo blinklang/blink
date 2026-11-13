@@ -600,6 +600,7 @@ Decided by expert panel vote. See [OPEN_QUESTIONS.md](OPEN_QUESTIONS.md) for ful
 | A user `@ffi` on a `blink_*` symbol (§9.1, E0849) | **Q1 (6-0)**: E0849 `InvalidRuntimeBinding` widens: a symbol that starts with `blink_` and is bound by anything other than `@runtime` in `lib/std` is E0849 at the symbol string, in `blink check`, for `@ffi` in the one- and the two-argument form. **Q2 (6-0)**: `@ffi let` too. **Q3 (6-0)**: the `__blink_` prefix too | 6-0 |
 | A type parameter as a `Map` key or `Set` element (§3.6, E1400) | **Q1 (6-0)**: a generic body that uses an unbounded type parameter as a `Map` key or `Set` element is E1400 `MapKeyNotHashable` at that site, in `blink check`, with a help and fix that add `T: Hash`. In a trait method the bound goes on the trait method | 6-0 |
 | Handler clause parameter and result types (§3.3, §4.7, E0328, E0548) | **Q1 (6-0)**: a clause is a signature. An untyped clause parameter is E0328 `MissingParamType` (the row widens to handler clauses; the fix takes the type from the operation). A clause that leaves out `-> R` has the result type `()`, and is E0548 `HandlerClauseMismatch` when the operation's result is not `()` | 6-0 |
+| `@ffi` on a method (§9.1, §11.1, §3b.2, E1110, E0803) | **Q1 (6-0)**: `@ffi` targets a module-level fn only. An `@ffi` on a fn in an `impl` or `trait` block (with or without a receiver) or on a type-scoped `fn T.name` is E1110 `UnexpectedAnnotation` at the `@ffi`, in `blink check`, with a help to declare a module-level `@ffi fn` and call it from the method. E0803 drops its "directly implement a trait method" clause | 6-0 |
 
 ---
 
@@ -971,6 +972,7 @@ Full deliberation records for each decision. Each file contains expert votes, re
 | The `blink_` Symbol Prefix Is Reserved | [decisions/blink-prefix-reserved.md](decisions/blink-prefix-reserved.md) |
 | A Type Parameter as a Map Key or Set Element | [decisions/generic-body-hash-key.md](decisions/generic-body-hash-key.md) |
 | Handler Clause Parameter Types | [decisions/handler-clause-param-types.md](decisions/handler-clause-param-types.md) |
+| `@ffi` Targets a Module-Level Function Only | [decisions/ffi-module-level-fn-only.md](decisions/ffi-module-level-fn-only.md) |
 
 ---
 

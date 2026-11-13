@@ -405,7 +405,7 @@ error[V0003]: contract unverifiable
 
 **Supertraits.** A subtrait may not redeclare a supertrait method to add or change its contract. This is `E0733 SubtraitMethodRedeclaration` (§3.6 *The `final` Modifier*), for the same coherence reason: `x.m()` would have two contracts, one through each bound.
 
-**`@ffi`.** A trait method that has a contract may not be implemented directly by an `@ffi` function. A safe wrapper implements it and carries the contract (E0803).
+**`@ffi`.** A contract on an `@ffi` function is E0803 (§9.1). An `@ffi` function is always a module-level function (§9.1 *`@ffi` Binds a Module-Level Function*), so it never implements a trait method itself. A wrapper method implements the trait method, calls the `@ffi` function and carries the contract.
 
 **Migration.** Before this rule, an impl method could carry `@requires`, and a trait method declaration could not carry contracts (E1110). An existing impl `@requires` is now E0912. To fix it, move the predicate to the trait method, give the parameter a refinement type in the trait's signature, or call a free function.
 

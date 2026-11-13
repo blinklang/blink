@@ -60,6 +60,59 @@ fn c_compress(src: Ptr[U8], n: Int) -> Int ! ()
 
 If the header is there and the C compiler still rejects the generated C, the stop is `GeneratedCDidNotCompile` (I0017). Its note names the `@ffi` declarations of the program and says that a wrong prototype can also cause it (§8.10.5).
 
+#### `@ffi` Binds a Module-Level Function
+
+`@ffi` on a function binds a C symbol to a function that is declared at the top level of a module. The symbol gets the C signature that the declaration gives (*Signature Types*). A function in an `impl` block or in a `trait` block is a method or an associated function of a type. Its first parameter can be a receiver, which has no C form, and the impl chooses its C name. So no such function is a target of `@ffi`, with or without a receiver. A type-scoped function `fn T.name(...)` (§2.12.3) is not a target either.
+
+`@ffi` on a function in an `impl` or `trait` block, or on a type-scoped function, is `UnexpectedAnnotation` (E1110) at the `@ffi`, in `blink check`. The help says to declare a module-level `@ffi` function and to call it from the method. A wrapper with the same body costs nothing at run time after inlining.
+
+```blink
+trait Tr { fn m(self) -> Int }
+type Foo { a: Int }
+type Bar { a: Int }
+
+@ffi("c", "labs")
+@trusted(audit: "LIBC-LABS")
+fn c_labs(x: Int) -> Int ! ()                // OK: a module-level `@ffi` fn
+
+impl Tr for Foo {
+    fn m(self) -> Int { c_labs(self.a) }     // OK: the method is a wrapper
+}
+
+impl Tr for Bar {
+    @ffi("c", "labs")                        // ERROR E1110: `@ffi` on an impl method
+    @trusted(audit: "LIBC-LABS")
+    fn m(self) -> Int ! ()
+}
+
+trait Abs {
+    @ffi("c", "labs")                        // ERROR E1110: `@ffi` on a trait method
+    fn abs(x: Int) -> Int ! ()
+}
+
+impl Abs for Foo {
+    @ffi("c", "labs")                        // ERROR E1110: an impl fn with no receiver is not a target
+    @trusted(audit: "LIBC-LABS")
+    fn abs(x: Int) -> Int ! ()
+}
+
+@ffi("c", "labs")                            // ERROR E1110: a type-scoped fn is not a target
+@trusted(audit: "LIBC-LABS")
+fn Foo.make(x: Int) -> Int ! ()
+
+fn Foo.abs_of(x: Int) -> Int { c_labs(x) }   // OK: a type-scoped fn that calls the `@ffi` fn
+```
+
+```
+error[E1110]: `@ffi` does not apply to a method
+ --> foo.bl:9:5
+  |
+9 |     @ffi("c", "labs")
+  |     ^^^^^^^^^^^^^^^^^ `@ffi` binds a module-level function
+  |
+  = help: declare a module-level `@ffi fn` and call it from the method
+```
+
 #### `@ffi let` — Foreign Constants
 
 Some integer constants have a different value on each host. `SIGBUS` is 7 on Linux and 10 on macOS. `ENOTSUP` is 95 on Linux and 45 on macOS. No Blink source can write the right number for every target, and Blink has no conditional compilation. A **foreign constant** is a module-level `let` with no initializer. The C compiler of the build target sets its value from the target's C headers.
@@ -4842,7 +4895,7 @@ In the Target column, `type` means a declaration that creates a type: a struct, 
 | `@invariant(expr)` | type | yes: all must hold | Must hold for every value of this type at all times. Checked statically, and at run time on construction and mutation. See §3b.2. | checked |
 | `@pure` | fn | no | The function's effective row is empty. A function whose row is not empty is `ImpureBodyForPureAnnotation` (E1307). See §3b.2, §4.16.3. | checked |
 | `@perf(constraint)` | fn | yes: all must hold | Performance contract. A benchmark assertion, not statically provable. See §11.2. | tool-checked (`blink bench --check-contracts`) |
-| `@ffi("lib", "sym")` | fn | no | Declares a foreign function binding. See §9.1. | checked |
+| `@ffi("lib", "sym")` | module-level fn; module-level `let` (§9.1 *`@ffi let` — Foreign Constants*) | no | Declares a foreign function binding. A fn in an `impl` or `trait` block, and a type-scoped `fn T.name`, is not a target (E1110). See §9.1. | checked |
 | `@ffi.struct(header, name)` | type | no | The type mirrors the named C struct from the named header. See §9.1.3. | checked |
 | `@ffi.opaque(header, name)` | type | no | The type is an opaque handle to the named C type. See §9.1.4. | checked |
 | `@trusted(audit: "ID")` | fn | no | Records a claim the compiler assumes: an FFI binding matches its foreign code, or an audit-gated diagnostic is safe to suppress. `audit:` is required, and `ID` must name a record in `audits.toml` (`AuditRecordNotFound`). Never makes an `@ffi` fn `pub` (E0801). | checked |
