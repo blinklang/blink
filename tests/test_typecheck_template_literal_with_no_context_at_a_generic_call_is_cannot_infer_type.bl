@@ -1,0 +1,65 @@
+// A template literal has type `Template[α]`. Passed to `fn ident[C](t: Template[C])` with no
+// expected type and no later use that names a context, α stays unsolved, and the spec makes
+// that `error[CannotInferType]` (E0301) at check, with the span at the literal (spec 03b, "The
+// Context Parameter C"). It must never reach the build as an unsolved type parameter.
+
+import compile_test_helpers
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> ProcessResult ! Process.Spawn {
+    process.run("sh", ["-c", cmd]).unwrap()
+}
+
+fn expect_check_error(tag: Str, lines: List[Str], want: List[Str]) ! IO, FS.Write, Process.Spawn, Env.Read {
+    let dir = "{compile_test_helpers.scratch_root()}/template_literal_no_context_{tag}"
+    let _ = sh("rm -rf {dir} && mkdir -p {dir}")
+    fs.write("{dir}/x.bl", lines.join("\n").concat("\n")).unwrap()
+    let clear = "env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE"
+    let r = sh("B=$(pwd)/build/blink; cd {dir} && {clear} timeout 120 $B check x.bl < /dev/null 2>&1")
+    let text = r.out.concat(r.err_out)
+    let mut bad = 0
+    if r.success() {
+        io.eprintln("{tag}: check passed, want an error")
+        bad = bad + 1
+    }
+    if text.contains("internal compiler error") {
+        io.eprintln("{tag}: check reported an internal compiler error")
+        bad = bad + 1
+    }
+    for w in want {
+        if !text.contains(w) {
+            io.eprintln("{tag}: output lacks [{w}]")
+            bad = bad + 1
+        }
+    }
+    if bad > 0 { io.eprintln(text) }
+    let _ = sh("rm -rf {dir}")
+    assert_eq(bad, 0)
+}
+
+test "a template literal passed straight to a generic context parameter is CannotInferType at the literal" {
+    expect_check_error("direct", [
+        "fn ident[C](t: Template[C]) -> Int \{ t.count() }",
+        "fn main() \{ io.println(\"\{ident(\"a \{1}\")}\") }",
+    ], [
+        "error[CannotInferType]: type parameter `C` of `ident` is unbound at this call",
+        "x.bl:2:32",
+        "help: write the type arguments at this call, as in `ident[C](...)`",
+        "1 error(s) found",
+    ])
+}
+
+test "a template a generic call returns, with no use that names a context, is CannotInferType at the literal" {
+    expect_check_error("binding", [
+        "fn ident[C](t: Template[C]) -> Template[C] \{ t }",
+        "fn main() \{",
+        "  let t = ident(\"a \{1}\")",
+        "  io.println(\"\{t.count()}\")",
+        "}",
+    ], [
+        "error[CannotInferType]: cannot infer a type for `t`",
+        "x.bl:3:17",
+        "let t: Template[C] = ...",
+        "1 error(s) found",
+    ])
+}

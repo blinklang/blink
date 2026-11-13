@@ -1,0 +1,288 @@
+// A type parameter that appears inside `Template[...]` is solved at the call like one inside
+// `List[...]`: from the argument's template type, from the type the site expects, or from a
+// later use (spec 03b, "The Context Parameter C"). An effect name in a context position is a
+// nominal type, so it is a concrete solution, not an open type variable. Each program must
+// check clean, then build and run in both modes and print the expected text.
+
+import compile_test_helpers
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> ProcessResult ! Process.Spawn {
+    process.run("sh", ["-c", cmd]).unwrap()
+}
+
+fn expect_prints(tag: Str, lines: List[Str], want: Str) ! IO, FS.Write, Process.Spawn, Env.Read {
+    let dir = "{compile_test_helpers.scratch_root()}/generic_template_context_{tag}"
+    let _ = sh("rm -rf {dir} && mkdir -p {dir}")
+    fs.write("{dir}/x.bl", lines.join("\n").concat("\n")).unwrap()
+    let clear = "env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE"
+    let mut bad = 0
+    let c = sh("B=$(pwd)/build/blink; cd {dir} && {clear} timeout 120 $B check x.bl < /dev/null")
+    if !c.success() {
+        io.eprintln("{tag} check: ended {c.end}\n{c.out}{c.err_out}")
+        bad = bad + 1
+    }
+    for mode in ["--per-module", "--no-per-module"] {
+        let r = sh("B=$(pwd)/build/blink; cd {dir} && {clear} timeout 120 $B run {mode} x.bl < /dev/null")
+        if !r.success() || r.out.trim() != want {
+            io.eprintln("{tag} {mode}: ended {r.end}, printed [{r.out.trim()}], want [{want}]\n{r.err_out}")
+            bad = bad + 1
+        }
+    }
+    let _ = sh("rm -rf {dir}")
+    assert_eq(bad, 0)
+}
+
+test "a generic identity over a template context returns the template it was given" {
+    expect_prints("ident", [
+        "effect DB \{}",
+        "fn ident[C](t: Template[C]) -> Template[C] \{ t }",
+        "fn take(t: Template[DB]) -> Int \{ ident(t).count() }",
+        "fn main() \{",
+        "  let x = 1",
+        "  io.println(\"\{take(\"q \{x}\")}\")",
+        "}",
+    ], "1")
+}
+
+test "a generic fn that takes a template and returns an Int solves the context" {
+    expect_prints("ret", [
+        "effect DB \{}",
+        "fn mk[C](t: Template[C]) -> Int \{ t.count() }",
+        "fn take(t: Template[DB]) -> Int \{ mk(t) }",
+        "fn main() \{",
+        "  let x = 1",
+        "  io.println(\"\{take(\"q \{x}\")}\")",
+        "}",
+    ], "1")
+}
+
+test "one generic fn serves two effect contexts in one program" {
+    expect_prints("two", [
+        "effect DB \{}",
+        "effect Shell \{}",
+        "fn ident[C](t: Template[C]) -> Template[C] \{ t }",
+        "fn a(t: Template[DB]) -> Int \{ ident(t).count() }",
+        "fn b(t: Template[Shell]) -> Int \{ ident(t).count() * 10 }",
+        "fn main() \{ io.println(\"\{a(\"x \{1}\")} \{b(\"y \{1} \{2}\")}\") }",
+    ], "1 20")
+}
+
+test "two template parameters that share a context accept two templates of that context" {
+    expect_prints("both", [
+        "effect DB \{}",
+        "fn both[C](a: Template[C], b: Template[C]) -> Int \{ a.count() + b.count() }",
+        "fn take(a: Template[DB], b: Template[DB]) -> Int \{ both(a, b) }",
+        "fn main() \{ io.println(\"\{take(\"a \{1}\", \"b \{2} \{3}\")}\") }",
+    ], "3")
+}
+
+test "a plain type parameter binds to a template type" {
+    expect_prints("plain_t", [
+        "effect DB \{}",
+        "fn id[T](x: T) -> T \{ x }",
+        "fn take(t: Template[DB]) -> Int \{ id(t).count() }",
+        "fn main() \{ io.println(\"\{take(\"a \{1}\")}\") }",
+    ], "1")
+}
+
+test "a built-in effect name is a template context a generic fn solves" {
+    expect_prints("builtin", [
+        "fn ident[C](t: Template[C]) -> Template[C] \{ t }",
+        "fn take(t: Template[DB]) -> Int \{ ident(t).count() }",
+        "fn main() \{ io.println(\"\{take(\"a \{1}\")}\") }",
+    ], "1")
+}
+
+test "a generic fn forwards its own context type parameter to another generic fn" {
+    expect_prints("fwd", [
+        "effect DB \{}",
+        "fn ident[C](t: Template[C]) -> Template[C] \{ t }",
+        "fn outer[D](t: Template[D]) -> Int \{ ident(t).count() }",
+        "fn take(t: Template[DB]) -> Int \{ outer(t) }",
+        "fn main() \{ io.println(\"\{take(\"a \{1} \{2}\")}\") }",
+    ], "2")
+}
+
+test "a generic trait method over a template context solves the context" {
+    expect_prints("method", [
+        "effect DB \{}",
+        "trait Go \{",
+        "  fn go[C](self, t: Template[C]) -> Int",
+        "}",
+        "impl Go for Int \{",
+        "  fn go[C](self, t: Template[C]) -> Int \{ t.count() + self }",
+        "}",
+        "fn take(t: Template[DB]) -> Int \{ 10.go(t) }",
+        "fn main() \{ io.println(\"\{take(\"a \{1}\")}\") }",
+    ], "11")
+}
+
+test "a template literal takes its context from a sibling template argument" {
+    expect_prints("lit_sib", [
+        "effect DB \{}",
+        "fn both[C](a: Template[C], b: Template[C]) -> Int \{ a.count() + b.count() }",
+        "fn take(t: Template[DB]) -> Int \{ both(\"a \{1}\", t) + both(t, \"c \{4} \{5} \{6}\") }",
+        "fn main() \{ io.println(\"\{take(\"b \{2} \{3}\")}\") }",
+    ], "8")
+}
+
+test "a template literal passed to a generic fn takes its context from the expected type" {
+    expect_prints("lit_exp", [
+        "effect DB \{}",
+        "fn ident[C](t: Template[C]) -> Template[C] \{ t }",
+        "fn take(t: Template[DB]) -> Int \{ t.count() }",
+        "fn main() \{",
+        "  let x: Template[DB] = ident(\"a \{1} \{2}\")",
+        "  io.println(\"\{take(x)} \{take(ident(\"b \{3}\"))}\")",
+        "}",
+    ], "2 1")
+}
+
+test "a template literal passed to a generic fn takes its context from the outer parameter" {
+    expect_prints("lit_arg", [
+        "effect DB \{}",
+        "fn ident[C](t: Template[C]) -> Template[C] \{ t }",
+        "fn take(t: Template[DB]) -> Int \{ t.count() }",
+        "fn main() \{ io.println(\"\{take(ident(\"b \{3}\"))}\") }",
+    ], "1")
+}
+
+test "a template literal passed to a generic fn takes its context from a later use" {
+    expect_prints("later", [
+        "effect DB \{}",
+        "fn ident[C](t: Template[C]) -> Template[C] \{ t }",
+        "fn take(t: Template[DB]) -> Int \{ t.count() }",
+        "fn main() \{",
+        "  let t = ident(\"a \{1} \{2}\")",
+        "  io.println(\"\{take(t)}\")",
+        "}",
+    ], "2")
+}
+
+test "a template literal takes its context from the outer generic fn's own context parameter" {
+    expect_prints("outer", [
+        "effect DB \{}",
+        "fn ident[C](t: Template[C]) -> Template[C] \{ t }",
+        "fn both[C](a: Template[C], b: Template[C]) -> Int \{ a.count() + b.count() }",
+        "fn outer[C](t: Template[C]) -> Int \{ both(t, \"x \{1} \{2}\") }",
+        "fn take(t: Template[DB]) -> Int \{ outer(t) }",
+        "fn main() \{ io.println(\"\{take(\"q \{1}\")}\") }",
+    ], "3")
+}
+
+test "a template a generic call returns takes its context from a use inside a closure" {
+    expect_prints("later_closure", [
+        "effect DB \{}",
+        "fn ident[C](t: Template[C]) -> Template[C] \{ t }",
+        "fn sink(t: Template[DB]) -> Int \{ t.count() }",
+        "fn main() \{",
+        "  let t = ident(\"a \{1} \{2}\")",
+        "  let f = fn() -> Int \{ sink(t) }",
+        "  io.println(\"\{f()}\")",
+        "}",
+    ], "2")
+}
+
+test "a template takes its context from a later use through a second generic call" {
+    expect_prints("later_generic", [
+        "effect DB \{}",
+        "fn ident[C](t: Template[C]) -> Template[C] \{ t }",
+        "fn sink(t: Template[DB]) -> Int \{ t.count() }",
+        "fn main() \{",
+        "  let t = ident(\"a \{1} \{2}\")",
+        "  let u = ident(t)",
+        "  io.println(\"\{sink(u)}\")",
+        "}",
+    ], "2")
+}
+
+test "an Option of the context type is a return value a match reads" {
+    expect_prints("v_opt", [
+        "effect DB \{}",
+        "fn mk[C](t: Template[C]) -> Option[C] \{ None }",
+        "fn take(t: Template[DB]) -> Int \{",
+        "  match mk(t) \{",
+        "    Some(_) => 1",
+        "    None => t.count()",
+        "  }",
+        "}",
+        "fn main() \{ io.println(\"\{take(\"q \{1} \{2}\")}\") }",
+    ], "2")
+}
+
+test "a struct field of an Option of the context type builds" {
+    expect_prints("v_field", [
+        "effect DB \{}",
+        "type Holder[C] \{",
+        "  t: Template[C]",
+        "  ctx: Option[C]",
+        "}",
+        "fn hold[C](t: Template[C]) -> Holder[C] \{ Holder \{ t: t, ctx: None } }",
+        "fn take(t: Template[DB]) -> Int \{",
+        "  let h = hold(t)",
+        "  if h.ctx.is_some() \{ 0 } else \{ h.t.count() }",
+        "}",
+        "fn main() \{ io.println(\"\{take(\"q \{1} \{2} \{3}\")}\") }",
+    ], "3")
+}
+
+test "a generic struct over the context type holds the template" {
+    expect_prints("v_box", [
+        "effect DB \{}",
+        "type Box[C] \{ t: Template[C] }",
+        "fn open[C](b: Box[C]) -> Int \{ b.t.count() }",
+        "fn take(t: Template[DB]) -> Int \{ open(Box \{ t: t }) }",
+        "fn main() \{ io.println(\"\{take(\"q \{1}\")}\") }",
+    ], "1")
+}
+
+test "a List of the context type passes to a generic fn over List of T" {
+    expect_prints("v_list", [
+        "effect DB \{}",
+        "fn h[T](xs: List[T]) -> Int \{ xs.len() }",
+        "fn mk[C](t: Template[C]) -> List[C] \{ [] }",
+        "fn take(t: Template[DB]) -> Int \{ h(mk(t)) + t.count() }",
+        "fn main() \{ io.println(\"\{take(\"q \{1}\")}\") }",
+    ], "1")
+}
+
+test "a value over the context type moves out of an arena block" {
+    expect_prints("v_arena", [
+        "effect DB \{}",
+        "type W[C] \{",
+        "  n: List[Int]",
+        "  c: Option[C]",
+        "}",
+        "fn mk[C](t: Template[C]) -> W[C] \{ W \{ n: [t.count()], c: None } }",
+        "fn opts[C](t: Template[C]) -> List[Option[C]] \{ [None, None] }",
+        "fn take(t: Template[DB]) -> Int \{",
+        "  let w = with arena \{",
+        "    mk(t)",
+        "  }",
+        "  let o = with arena \{",
+        "    opts(t)",
+        "  }",
+        "  w.n.len() + o.len()",
+        "}",
+        "fn main() \{ io.println(\"\{take(\"q \{1}\")}\") }",
+    ], "3")
+}
+
+test "guard: a template literal passed to a non-generic template parameter" {
+    expect_prints("guard_nongen", [
+        "effect DB \{}",
+        "fn take(t: Template[DB]) -> Int \{ t.count() }",
+        "fn main() \{",
+        "  let x = 1",
+        "  io.println(\"\{take(\"q \{x} \{x}\")}\")",
+        "}",
+    ], "2")
+}
+
+test "guard: a generic fn over a List still solves its element type" {
+    expect_prints("guard_list", [
+        "fn first[T](xs: List[T]) -> T \{ xs.get(0).unwrap() }",
+        "fn main() \{ io.println(\"\{first([4, 5])}\") }",
+    ], "4")
+}

@@ -1,0 +1,102 @@
+// An effect name in a type-argument position is a type with no values (spec 03b, "The Context
+// Parameter C"), so it implements no trait. A generic `Template[C]` parameter whose `C` has a
+// bound refuses an effect context at the call; a marker type with the impl meets it.
+
+import compile_test_helpers
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> ProcessResult ! Process.Spawn {
+    process.run("sh", ["-c", cmd]).unwrap()
+}
+
+fn expect_check_error(tag: Str, lines: List[Str], want: List[Str]) ! IO, FS.Write, Process.Spawn, Env.Read {
+    let dir = "{compile_test_helpers.scratch_root()}/effect_context_bound_{tag}"
+    let _ = sh("rm -rf {dir} && mkdir -p {dir}")
+    fs.write("{dir}/x.bl", lines.join("\n").concat("\n")).unwrap()
+    let clear = "env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE"
+    let r = sh("B=$(pwd)/build/blink; cd {dir} && {clear} timeout 120 $B check x.bl < /dev/null 2>&1")
+    let text = r.out.concat(r.err_out)
+    let mut bad = 0
+    if r.success() {
+        io.eprintln("{tag}: check passed, want an error")
+        bad = bad + 1
+    }
+    if text.contains("internal compiler error") {
+        io.eprintln("{tag}: check reported an internal compiler error")
+        bad = bad + 1
+    }
+    for w in want {
+        if !text.contains(w) {
+            io.eprintln("{tag}: output lacks [{w}]")
+            bad = bad + 1
+        }
+    }
+    if bad > 0 { io.eprintln(text) }
+    let _ = sh("rm -rf {dir}")
+    assert_eq(bad, 0)
+}
+
+fn expect_check_clean(tag: Str, lines: List[Str]) ! IO, FS.Write, Process.Spawn, Env.Read {
+    let dir = "{compile_test_helpers.scratch_root()}/effect_context_bound_{tag}"
+    let _ = sh("rm -rf {dir} && mkdir -p {dir}")
+    fs.write("{dir}/x.bl", lines.join("\n").concat("\n")).unwrap()
+    let clear = "env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE"
+    let r = sh("B=$(pwd)/build/blink; cd {dir} && {clear} timeout 120 $B check x.bl < /dev/null 2>&1")
+    if !r.success() { io.eprintln(r.out.concat(r.err_out)) }
+    let _ = sh("rm -rf {dir}")
+    assert(r.success())
+}
+
+test "an effect context does not meet a Debug bound" {
+    expect_check_error("debug", [
+        "effect DB \{}",
+        "fn f[C: Debug](t: Template[C]) -> Int \{ t.count() }",
+        "fn take(t: Template[DB]) -> Int \{ f(t) }",
+        "fn main() \{ io.println(\"\{take(\"a \{1}\")}\") }",
+    ], [
+        "error[TraitBoundNotSatisfied]: `DB` does not satisfy the Debug bound on type parameter C",
+        "x.bl:3:35",
+        "`DB` names an effect, a type with no values, so it implements no trait",
+        "1 error(s) found",
+    ])
+}
+
+test "an effect context does not meet a Display bound" {
+    expect_check_error("display", [
+        "effect DB \{}",
+        "fn f[C: Display](t: Template[C]) -> Int \{ t.count() }",
+        "fn take(t: Template[DB]) -> Int \{ f(t) }",
+        "fn main() \{ io.println(\"\{take(\"a \{1}\")}\") }",
+    ], [
+        "error[MissingDisplayImpl]: type `DB` does not implement `Display`",
+        "x.bl:3:35",
+        "`DB` names an effect, a type with no values, so it implements no trait",
+        "1 error(s) found",
+    ])
+}
+
+test "an effect context does not meet a user trait bound" {
+    expect_check_error("user", [
+        "effect DB \{}",
+        "trait Tag \{ fn tag(self) -> Int }",
+        "fn f[C: Tag](t: Template[C]) -> Int \{ t.count() }",
+        "fn take(t: Template[DB]) -> Int \{ f(t) }",
+        "fn main() \{ io.println(\"\{take(\"a \{1}\")}\") }",
+    ], [
+        "error[TraitBoundNotSatisfied]: `DB` does not satisfy the Tag bound on type parameter C: it has no impl of Tag",
+        "x.bl:4:35",
+        "`DB` names an effect, a type with no values, so it implements no trait",
+        "1 error(s) found",
+    ])
+}
+
+test "a marker type context with the impl meets a user trait bound" {
+    expect_check_clean("marker", [
+        "type Html \{}",
+        "trait Tag \{ fn tag(self) -> Int }",
+        "impl Tag for Html \{ fn tag(self) -> Int \{ 1 } }",
+        "fn f[C: Tag](t: Template[C]) -> Int \{ t.count() }",
+        "fn take(t: Template[Html]) -> Int \{ f(t) }",
+        "fn main() \{ io.println(\"\{take(\"a \{1}\")}\") }",
+    ])
+}

@@ -1649,6 +1649,8 @@ fn tc_is_arith_trait(tr: Str) -> Bool {
 
 fn tc_bound_fact(concrete_tid: Int, trait_name: Str) -> Int {
     let k = type_kind(concrete_tid)
+    // An effect context has no values, so it implements no trait (§3b.5).
+    if tc_typevar_is_effect_context(concrete_tid) { return -1 }
     // Unknowable for an unresolved/generic type — fail open, never reject.
     if k == TyKind.Unknown || k == TyKind.Typevar { return 0 }
     if trait_name == "Display" {
@@ -2612,6 +2614,25 @@ pub fn tc_tid_binder(tid0: Int) -> Int {
     e.inner1
 }
 
+// True when `tid0` is the typevar an effect name lowers to in a type position (the `DB` of
+// `Template[DB]`, §3b.5). It names one fixed context, so a type parameter bound to it is
+// solved: inference and mono must not read it as an open type parameter. This name test
+// stands in until an effect has identity by its declaration; a dotted name (`m.DB` or a
+// sub-effect) is left out, because a bare spelling cannot tell which one it is.
+pub fn tc_typevar_is_effect_context(tid0: Int) -> Bool {
+    let t = tc_resolve(tid0)
+    if t < 0 || t >= ty_pool.len() { return false }
+    let e = ty_pool.get(t).unwrap()
+    if e.kind != TyKind.Typevar || e.inner1 != NO_BINDER_NODE { return false }
+    if e.name.contains(".") { return false }
+    tc_is_undotted_effect_name(e.name)
+}
+
+// True when a name with no dot names a built-in effect root or a declared effect.
+fn tc_is_undotted_effect_name(name: Str) -> Bool {
+    builtin_effect_children(name).is_some() || tc_effect_decl_named(name) != -1
+}
+
 // `pub` FOR THE TEST ONLY — see make_option_type above.
 pub fn make_typevar(name: Str) -> Int {
     // `Self` is bound by the impl, which is not a type-parameter scope. Pinning it here
@@ -3104,7 +3125,9 @@ fn tc_tid_has_unbound_metavar(tid0: Int) -> Int {
     // not E0301, but that spelling lowers to TYPE_UNKNOWN — not a metavar — so it
     // does not reach this arm.
     // Ptr too: null_ptr()/alloc_ptr() return Ptr[α], and an unpinned binding of one is E0301.
-    if k == TyKind.List || k == TyKind.Option || k == TyKind.Set || k == TyKind.Channel || k == TyKind.Iterator || k == TyKind.Handle || k == TyKind.Ptr || k == TyKind.Range {
+    // Template too: a literal passed to a generic Template[C] parameter is Template[α], and an
+    // expected type must be able to pin α.
+    if k == TyKind.List || k == TyKind.Option || k == TyKind.Set || k == TyKind.Channel || k == TyKind.Iterator || k == TyKind.Handle || k == TyKind.Ptr || k == TyKind.Range || k == TyKind.Template {
         return tc_tid_has_unbound_metavar(e.inner1)
     }
     if k == TyKind.Result || k == TyKind.Map {
@@ -3282,6 +3305,7 @@ fn tc_infer_annotation_hint(tid0: Int) -> Str {
     if k == TyKind.Range { return ": Range[T]" }
     if k == TyKind.Handle { return ": Handle[T]" }
     if k == TyKind.Ptr { return ": Ptr[T]" }
+    if k == TyKind.Template { return ": Template[C]" }
     if k == TyKind.Map { return ": Map[K, V]" }
     if k == TyKind.Result { return ": Result[T, E]" }
     if k == TyKind.Struct || k == TyKind.Enum {
@@ -3576,6 +3600,11 @@ type CallFacts {
     // The fn whose body holds each open Map()/Set() construction, by construction node.
     open_ctor_owner: Map[Int, Int]
     late_hash_binds: List[LateHashBind]
+    // Each template literal a callee's open `Template[C]` gave a context metavar, as that
+    // metavar and the literal, at the same index: an unsolved context is reported at the
+    // literal (§3b.5).
+    tpl_ctx: List[Int]
+    tpl_lit: List[Int]
 }
 // The impl a call reached, its binder tids in header order, the type `Self` reads as (a method
 // call's receiver, a conversion's target), and the fn whose body made the call.
@@ -3621,7 +3650,7 @@ type UseJudge {
 }
 
 fn new_call_facts() -> CallFacts {
-    CallFacts { open_calls: [], open_group: Map(), open_tids: [], reported: Map(), self_views: Map(), view_sigs: Map(), hash_aliases_above: [], derive_facts_above: [], derive_facts_low: 0, derive_facts_open: [], derive_facts_open_low: Map(), debug_unbuilt_seen: Map(), hash_by_bounds: false, static_head_insts: Map(), static_head_binders: Map(), impl_bound_calls: [], impl_bound_binds: Map(), deferred_uses: [], deferred_use_at: Map(), late_keys: [], late_roots: Map(), late_roots_valid: false, late_refused: Map(), late_open: [], late_replay: -1, late_watch: Map(), late_fixed_at: Map(), infer_at: -1, static_owners: Map(), trait_heads: Map(), closure_expected_at: Map(), ret_ann: -1, missing_else: Map(), walk_returns: [], written_names: Map(), under_fn_type: Map(), method_reads: Map(), method_read_order: [], inferred_hash_roles: Map(), impl_binder_roles_read: Map(), open_ctor_owner: Map(), late_hash_binds: [] }
+    CallFacts { open_calls: [], open_group: Map(), open_tids: [], reported: Map(), self_views: Map(), view_sigs: Map(), hash_aliases_above: [], derive_facts_above: [], derive_facts_low: 0, derive_facts_open: [], derive_facts_open_low: Map(), debug_unbuilt_seen: Map(), hash_by_bounds: false, static_head_insts: Map(), static_head_binders: Map(), impl_bound_calls: [], impl_bound_binds: Map(), deferred_uses: [], deferred_use_at: Map(), late_keys: [], late_roots: Map(), late_roots_valid: false, late_refused: Map(), late_open: [], late_replay: -1, late_watch: Map(), late_fixed_at: Map(), infer_at: -1, static_owners: Map(), trait_heads: Map(), closure_expected_at: Map(), ret_ann: -1, missing_else: Map(), walk_returns: [], written_names: Map(), under_fn_type: Map(), method_reads: Map(), method_read_order: [], inferred_hash_roles: Map(), impl_binder_roles_read: Map(), open_ctor_owner: Map(), late_hash_binds: [], tpl_ctx: [], tpl_lit: [] }
 }
 let mut tc_calls: CallFacts = new_call_facts()
 
@@ -3638,7 +3667,7 @@ fn tc_ud_metavar_roots(tid0: Int) -> List[Int] {
     }
     let e = ty_pool.get(tid).unwrap()
     let k = e.kind
-    if k == TyKind.List || k == TyKind.Option || k == TyKind.Set || k == TyKind.Channel || k == TyKind.Iterator || k == TyKind.Handle || k == TyKind.Ptr || k == TyKind.Range {
+    if k == TyKind.List || k == TyKind.Option || k == TyKind.Set || k == TyKind.Channel || k == TyKind.Iterator || k == TyKind.Handle || k == TyKind.Ptr || k == TyKind.Range || k == TyKind.Template {
         return tc_ud_metavar_roots(e.inner1)
     }
     if k == TyKind.Result || k == TyKind.Map {
@@ -3681,6 +3710,17 @@ fn tc_ud_mark_blamed(tid: Int) {
         tc_ud_blamed.insert(roots.get(i).unwrap(), 1)
         i = i + 1
     }
+}
+
+// The template literal whose context leaves `tid` open, if one does.
+fn tc_ud_template_lit_of(tid: Int) -> Option[Int] {
+    let roots = tc_ud_metavar_roots(tid)
+    let mut i = 0
+    while i < tc_calls.tpl_ctx.len() {
+        if roots.contains(tc_resolve(tc_calls.tpl_ctx.get(i).unwrap())) { return tc_calls.tpl_lit.get(i) }
+        i = i + 1
+    }
+    None
 }
 
 fn tc_ud_already_blamed(tid: Int) -> Int {
@@ -4739,7 +4779,9 @@ fn tc_ud_flush_calls() ! TypeCheck.Resolve, Diag.Report {
         if names.len() > 1 {
             msg = "type parameters {tc_ticked_names(names)} of `{callee}` are unbound at this call and nothing supplies them"
         }
-        diag_error_at("CannotInferType", CANNOT_INFER_TYPE, msg, call_node, tc_call_type_args_help(sig, tc_calls.open_tids.get(g + 1).unwrap(), call_node, solved))
+        // A literal's context is under-determined at the literal itself (§3b.5).
+        let at = if tids.len() == 1 { tc_ud_template_lit_of(tids.get(0).unwrap()) ?? call_node } else { call_node }
+        diag_error_at("CannotInferType", CANNOT_INFER_TYPE, msg, at, tc_call_type_args_help(sig, tc_calls.open_tids.get(g + 1).unwrap(), call_node, solved))
         let mut ti = 0
         while ti < tids.len() {
             tc_ud_mark_blamed(tids.get(ti).unwrap())
@@ -5226,7 +5268,9 @@ fn tc_report_under_determined(vname: Str, tid: Int, decl_node: Int) ! Diag.Repor
     } else if dk != NodeKind.LetBinding {
         help = "annotate the value this binder destructures — a pattern binder takes no annotation of its own"
     }
-    diag_error_at_notes("CannotInferType", CANNOT_INFER_TYPE, "cannot infer a type for `{vname}`: it is never given one by an annotation or a later use", decl_node, help, notes)
+    // A literal's context is under-determined at the literal itself (§3b.5).
+    let at = tc_ud_template_lit_of(tid) ?? decl_node
+    diag_error_at_notes("CannotInferType", CANNOT_INFER_TYPE, "cannot infer a type for `{vname}`: it is never given one by an annotation or a later use", at, help, notes)
 }
 
 // A destructuring `let` has no name of its own, so the report names its pattern as written and
@@ -5349,6 +5393,7 @@ fn tc_ud_open_slot(tid: Int, val: Int) -> (Str, Str) {
     let k = tc_tid_kind(tc_resolve(tid))
     if k == TyKind.Ptr { return (tc_ud_call_source(val), "pointee type") }
     if k == TyKind.Handle { return (tc_ud_call_source(val), "result type") }
+    if k == TyKind.Template { return (tc_ud_call_source(val), "context type") }
     // A `map` or `flat_map` has a result slot that its closure fills. Any other method answers the
     // element of its receiver, and the receiver is what the note has to name.
     if val >= 0 && node_kind(val) == NodeKind.MethodCall && (node_method(val) == "map" || node_method(val) == "flat_map") {
@@ -5625,12 +5670,13 @@ pub fn tc_unify(a0: Int, b0: Int) -> Int {
     let ka0 = ty_pool.get(a).unwrap().kind
     let kb0 = ty_pool.get(b).unwrap().kind
     // The one typevar a hole binds to is a parameter of the declaration being checked: it is
-    // one type in each instance of the body, as `List[T]` is in the arm below.
+    // one type in each instance of the body, as `List[T]` is in the arm below. An effect
+    // context is one fixed type everywhere, so a hole binds to it too.
     if ka0 == TyKind.Typevar || kb0 == TyKind.Typevar {
-        if ka0 == TyKind.Typevar && tc_typevar_binds_here(a) != 0 && tc_is_unbound_metavar(b) != 0 {
+        if ka0 == TyKind.Typevar && tc_is_unbound_metavar(b) != 0 && (tc_typevar_binds_here(a) != 0 || tc_typevar_is_effect_context(a)) {
             return bind_metavar(b, a)
         }
-        if kb0 == TyKind.Typevar && tc_typevar_binds_here(b) != 0 && tc_is_unbound_metavar(a) != 0 {
+        if kb0 == TyKind.Typevar && tc_is_unbound_metavar(a) != 0 && (tc_typevar_binds_here(b) != 0 || tc_typevar_is_effect_context(b)) {
             return bind_metavar(a, b)
         }
         return 1
@@ -6649,6 +6695,7 @@ fn bind_target_is_concrete(tid: Int) -> Int {
     if tc_is_unbound_metavar(r) != 0 { return 0 }
     // The checked body's own parameter is one fixed type there (rigid, §3 Parametricity), so
     // it commits a binder as firmly as `Int` would. Another declaration's is still open.
+    if tc_typevar_is_effect_context(r) { return 1 }
     if ty_pool.get(r).unwrap().kind == TyKind.Typevar { return tc_typevar_is_rigid(r) }
     // The `?` hole is the third spelling of "nothing to commit to", and it arrives here from
     // a closure argument whose own seed left the type-parameter position open. Counting it as
@@ -7036,7 +7083,7 @@ fn tc_check_one_bound(name: Str, bounds: Str, concrete: Int, node: Int, sink: St
         if tc_pipe_has(bounds, tr) != 0 && tc_type_satisfies_bound(concrete, tr) == -1 {
             let path = tc_trait_need(concrete, tr, [])
             let fixes = if path.len() > 0 { tc_trait_need_fixes(path.get(path.len() - 1).unwrap(), tc_need_fix_trait(path, tr)) } else { [] }
-            let help = if fixes.len() > 0 { fixes.join("\n") } else {
+            let help = if tc_typevar_is_effect_context(concrete) { tc_effect_context_bound_help(type_to_str(concrete), tr) } else if fixes.len() > 0 { fixes.join("\n") } else {
                 "pass an argument whose type implements {tr}, or derive/implement {tr} for it; the arithmetic traits (Add/Sub/Mul/Div/Rem/Neg) are sealed to the built-in numeric types"
             }
             let shown = tc_core_trait_shown(tr)
@@ -7213,7 +7260,9 @@ fn tc_report_unmet_user_bound(carrier: Int, outer_sl: Int, own_sl: Int, concrete
     let why = if kind_fits && u.held.impls == 0 { "a List implements {shown} only where its element {elem_rule}" } else { has }
     // No impl can be written at a type parameter of the body being checked.
     let at_body = tc_args_name_a_body_tparam(u.want)
-    let help = if surface && !kind_fits {
+    let help = if tc_typevar_is_effect_context(concrete) {
+        tc_effect_context_bound_help(type_to_str(concrete), bound_text)
+    } else if surface && !kind_fits {
         "pass an argument whose type implements {bound_text}; {shown} is sealed to {row.shown}, and no impl of it can be written"
     } else if surface || at_body {
         "pass an argument whose type implements {bound_text}"
@@ -7407,6 +7456,8 @@ fn tc_surface_held(recv: Int, row: SurfaceRow) -> ImplArgsHeld {
 // which has only the bounds its binders give. A bare one is judged by those bounds, not by
 // impls, so it is not judgeable here.
 fn tc_tid_is_judgeable_here(tid: Int) -> Bool {
+    // An effect context is one fixed type with no impls (§3b.5).
+    if tc_typevar_is_effect_context(tid) { return true }
     tc_tid_kind(tc_resolve(tid)) != TyKind.Typevar && tc_tid_is_judgeable_among(tid, 1)
 }
 
@@ -7822,7 +7873,7 @@ fn tc_pin_admits_declared(d: Int) -> Int {
     // ty_param_list, so a declared Result[Int,Str] / Option[Int] must pin an
     // under-determined tail-bound carrier the same way — the Struct/Enum params_count
     // path below never sees them.
-    if dt.kind == TyKind.Option || dt.kind == TyKind.Result || dt.kind == TyKind.List || dt.kind == TyKind.Iterator || dt.kind == TyKind.Ptr { return 1 }
+    if dt.kind == TyKind.Option || dt.kind == TyKind.Result || dt.kind == TyKind.List || dt.kind == TyKind.Iterator || dt.kind == TyKind.Ptr || dt.kind == TyKind.Template { return 1 }
     if dt.kind == TyKind.Tuple { return 1 }
     // A declared `fn() -> Option[T]` fixes the open return of a closure built for it.
     if dt.kind == TyKind.Fn { return 1 }
@@ -8523,6 +8574,17 @@ fn tc_template_arg_ok(ptid: Int, arg_node: Int) -> Int {
     if type_kind(resolve_alias_tid(ptid)) != TyKind.Template { return 0 }
     if node_kind(arg_node) == NodeKind.InterpString { return 1 }
     0
+}
+
+// True when the template parameter `ptid` still names a callee's type parameter as its
+// context: no earlier argument fixed it, and it is not a parameter of the body being checked.
+fn tc_template_open_context(ptid: Int) -> Bool {
+    let p = tc_resolve(resolve_alias_tid(ptid))
+    if type_kind(p) != TyKind.Template { return false }
+    let ctx = tc_resolve(ty_pool.get(p).unwrap().inner1)
+    if ctx < 0 || ctx >= ty_pool.len() { return false }
+    if type_kind(ctx) != TyKind.Typevar { return false }
+    tc_tid_binder(ctx) != NO_BINDER_NODE && tc_typevar_is_rigid(ctx) == 0
 }
 
 // The laundering case, and the reason it is its own predicate rather than folded into the
@@ -9520,6 +9582,7 @@ fn tc_display_missing_leaf(t0: Int) -> Int ! TypeCheck.Resolve, Diag.Report {
     let k = type_kind(t)
     if k == TyKind.Unknown || k == TyKind.Never { return -1 }
     if k == TyKind.Typevar {
+        if tc_typevar_is_effect_context(t) { return t }
         if tc_typevar_binds_here(t) == 0 { return -1 }
         if tc_typevar_holds(t, "Display") { return -1 }
         return t
@@ -9681,6 +9744,10 @@ fn tc_report_missing_display(arg: Int, t: Int, leaf: Int, sink: Str, notes: List
         return
     }
     let lk = type_kind(leaf)
+    if tc_typevar_is_effect_context(leaf) {
+        diag_error_label_at_notes("MissingDisplayImpl", MISSING_DISPLAY_IMPL, msg, arg, label, tc_effect_context_bound_help(ls, "`Display`"), notes)
+        return
+    }
     if lk == TyKind.Typevar {
         let held = tc_pipe_joined(tc_typevar_held_traits(leaf))
         // `Self` has no binder to write on; its bounds are the trait's supertraits.
@@ -10075,6 +10142,18 @@ fn check_one_arg_shape(fn_name: Str, idx: Int, arg_node: Int, ptid: Int, project
             tc_raw_consume_template(arg_node)
             // Codegen builds a template value only where the literal's own stamp says
             // Template, so the coercion is recorded on the node, not only accepted.
+            let open_ctx = tc_template_open_context(ptid)
+            if open_ctx {
+                // A literal does not name its context (§3b.5): against the callee's own
+                // `Template[C]` it is `Template[α]`, which another argument or the expected
+                // type may solve, and which is E0301 when nothing does.
+                let ctx = make_metavar()
+                tc_calls.tpl_ctx.push(ctx)
+                tc_calls.tpl_lit.push(arg_node)
+                let lit_t = make_template_type(ctx)
+                tc_publish_node_tid(arg_node, lit_t)
+                return lit_t
+            }
             tc_publish_node_tid(arg_node, resolve_alias_tid(ptid))
             lit_to_int = 1
         } else if tc_template_launders_str(ptid, arg_t) != 0 {
@@ -19007,6 +19086,11 @@ fn tc_projection_refusal(tid: Int, what: Str) -> Str {
 // Blink has no syntax to bound an associated type, so the help cannot offer a bound.
 fn tc_projection_use_help(name: Str, what: Str) -> Str {
     "a generic body may only pass a value of `{name}` on; {what} where code knows its type, such as in the impl"
+}
+
+// The help for an effect context `t` that a bound `shown` asks for: no impl can give it one.
+fn tc_effect_context_bound_help(t: Str, shown: Str) -> Str {
+    "`{t}` names an effect, a type with no values, so it implements no trait; pass a template whose context implements {shown}, or drop the bound"
 }
 
 // The help for a type parameter `t` that lacks the bound `shown`: add it to the bound list
@@ -30059,7 +30143,7 @@ fn nr_check_effect_name(name: Str, at: Int) ! TypeCheck.Resolve, Diag.Report {
     match name.byte_index_of(".", 0) {
         Some(dot) => nr_check_dotted_effect_name(name, name.byte_slice(0, dot), name.byte_slice(dot + 1, name.byte_len()), at)
         None => {
-            if builtin_effect_children(name).is_some() || tc_effect_decl_named(name) != -1 { return }
+            if tc_is_undotted_effect_name(name) { return }
             let other = nr_decls_by_name.get(name) ?? []
             if other.len() > 0 {
                 nr_unknown_effect(at, node_end_col(at), "`{name}` is not an effect", "`{name}` is {nr_decl_kind_phrase(other.get(0).unwrap())}; an effect was expected", "", [])
