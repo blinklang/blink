@@ -5489,7 +5489,7 @@ error[MutOnPattern]: `mut` must come before a name, not a tuple pattern
   = help: put `mut` on each name in the pattern: `let (mut x, mut y) = pair`
 ```
 
-**A `mut` binder is a mutable root.** A `mut` binder follows every rule for a `let mut` binding. It can be the root of an assignment or a mutating method call (§3.2.2 *Construction and Mutability*). `async.spawn` cannot capture it (E0650, §2.8). `warning[UnusedMut]` fires on each `mut` binder that the body never mutates (§3.6 *Lints*). A mutation whose root is a binder with no `mut` is `error[E0610] MutationRequiresMut`, and the fix inserts `mut` before that binder.
+**A `mut` binder is a mutable root.** A `mut` binder follows every rule for a `let mut` binding. It can be the root of an assignment or a mutating method call (§3.2.2 *Construction and Mutability*). `async.spawn` cannot capture it (E0650, §2.8). This holds for a `mut` parameter, a `mut` binder in a parameter pattern and `mut self` as well: E0650 fires for every mutable root. `warning[UnusedMut]` fires on each `mut` binder that the body never mutates (§3.6 *Lints*). A mutation whose root is a binder with no `mut` is `error[E0610] MutationRequiresMut`, and the fix inserts `mut` before that binder.
 
 **A binder is a new local.** Binding copies the matched value into the binder, as `let` does. An assignment to a `mut` binder changes the binder only, never the matched value. A shared cell in the value stays shared (§3.6 *Shared cells*), so a mutating call on it shows through both names:
 

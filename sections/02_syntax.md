@@ -623,7 +623,7 @@ For a shared cell, a new `let` is a second name for the same cell, not a copy. `
 
 #### Closures and `async.spawn`
 
-Closures passed to `async.spawn` **cannot capture `let mut` bindings**. Mutable captures would create data races between the spawned task and the enclosing scope. This is a compile error:
+Closures passed to `async.spawn` **cannot capture a mutable root**. A mutable root is a name that can start a mutation (§3.2.2 *Construction and Mutability*): a `let mut` binding, a `mut` pattern binder (§3.5 *Mutable Binders*), a `mut` parameter, a `mut` binder in a parameter pattern, or `mut self`. A capture of any of them would create a data race between the spawned task and the enclosing scope. This is a compile error:
 
 ```blink
 let mut count = 0
@@ -648,6 +648,67 @@ error[MutableCaptureInSpawn]: mutable binding captured in spawned task
   | async.spawn(fn() { use(snapshot) })
   |
   = help: for a List, `xs.slice(0, xs.len())` makes a new list (one level only)
+```
+
+The rule is on the binder, not on the type or on how the binder was introduced. `mut` makes a parameter a mutable root for a mutating call (§3.6 *Mutable Parameters*), and a mutating call from the task races with the spawner. The compiler reports E0650 at the capture, in `blink check`. When the root is a parameter or a pattern binder, a note points at its `mut`:
+
+```blink
+fn plain(mut b: List[Int]) -> Int ! Async {
+    async.scope {
+        let h = async.spawn(fn() { b.push(1) })   // ERROR E0650: `b` is a `mut` parameter
+        h.await
+    }
+    b.len()
+}
+
+fn pattern((mut xs, n): (List[Int], Int)) -> Int ! Async {
+    async.scope {
+        let h = async.spawn(fn() { xs.len() + n })   // ERROR E0650: `xs` is a `mut` binder; the capture alone is the error
+        h.await
+    }
+}
+
+type Buf { data: Bytes }
+
+trait Run {
+    fn run(mut self) -> Int ! Async
+}
+
+impl Run for Buf {
+    fn run(mut self) -> Int ! Async {
+        async.scope {
+            let h = async.spawn(fn() { self.data.len() })   // ERROR E0650: `mut self` is a mutable root
+            h.await
+        }
+    }
+}
+
+fn ok(b: List[Int]) -> Int ! Async {
+    async.scope {
+        let h = async.spawn(fn() { b.len() })   // OK: `b` has no `mut`
+        h.await
+    }
+}
+
+fn copy_first(mut b: List[Int]) -> Int ! Async {
+    let snap = b.clone()                       // the fix: copy into a `let`
+    async.scope {
+        let h = async.spawn(fn() { snap.len() })   // OK: `snap` is not a mutable root
+        h.await
+    }
+}
+```
+
+```
+error[MutableCaptureInSpawn]: mutable binding captured in spawned task
+ --> run.bl:3:36
+  |
+1 | fn plain(mut b: List[Int]) -> Int ! Async {
+  |          --- `b` is a mutable parameter
+3 |         let h = async.spawn(fn() { b.push(1) })
+  |                                    ^ mutable capture not permitted in spawn
+  |
+  = help: bind an immutable copy before the spawn: `let b2 = b.clone()`, then use `b2` in the task
 ```
 
 An immutable capture of a value that reaches no shared cell is safe. The value cannot change while the task runs:
@@ -765,7 +826,7 @@ Same logic applies to arena-allocated values — closures capturing arena bindin
 - `let` captures: immutable. Equivalent to a copy, except that a change to a shared cell (§3.6) through another name shows through the capture
 - `let mut` captures: mutations visible across closure boundary
 - No explicit capture syntax (no `move`, no capture lists)
-- `async.spawn` closures: immutable captures only. A capture of a `let mut` binding or a `mut` pattern binder (§3.5 *Mutable Binders*) is compile error E0650
+- `async.spawn` closures: immutable captures only. A capture of a mutable root is compile error E0650: a `let mut` binding, a `mut` pattern binder (§3.5 *Mutable Binders*), a `mut` parameter, a `mut` binder in a parameter pattern, or `mut self`
 - A function value passed to `async.spawn` whose row contains `State`, closure or named function, is compile error E0651 (§4.16.6)
 - `async.spawn` freezes each shared cell its captures reach until the spawner joins the task; a write to a frozen cell panics
 - A handler in force at an `async.spawn` site whose captures reach a shared cell is homed: its ops run on the task that ran its `with`
