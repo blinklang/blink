@@ -1,0 +1,115 @@
+// A qualified variant pattern on an unannotated closure parameter fixes the parameter to that
+// enum. A closure has one type, not a generic one, so two calls at different instances, a call
+// with another type, and an arm that names another enum are each a type error at check. A
+// closure that nothing calls leaves the payload type open, which is CannotInferType (E0301,
+// sections/03_types.md Under-Determined Types). None of them may reach the build.
+
+import compile_test_helpers
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> ProcessResult ! Process.Spawn {
+    process.run("sh", ["-c", cmd]).unwrap()
+}
+
+fn expect_check_error(tag: Str, lines: List[Str], want: List[Str]) ! IO, FS.Write, Process.Spawn, Env.Read {
+    let dir = "{compile_test_helpers.scratch_root()}/closure_variant_pattern_error_{tag}"
+    let _ = sh("rm -rf {dir} && mkdir -p {dir}")
+    fs.write("{dir}/x.bl", lines.join("\n").concat("\n")).unwrap()
+    let clear = "env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE"
+    let r = sh("B=$(pwd)/build/blink; cd {dir} && {clear} timeout 120 $B check x.bl < /dev/null 2>&1")
+    let text = r.out.concat(r.err_out)
+    let mut bad = 0
+    if r.success() {
+        io.eprintln("{tag}: check passed, want an error")
+        bad = bad + 1
+    }
+    if text.contains("internal compiler error") {
+        io.eprintln("{tag}: check reported an internal compiler error")
+        bad = bad + 1
+    }
+    for w in want {
+        if !text.contains(w) {
+            io.eprintln("{tag}: output lacks [{w}]")
+            bad = bad + 1
+        }
+    }
+    if bad > 0 { io.eprintln(text) }
+    let _ = sh("rm -rf {dir}")
+    assert_eq(bad, 0)
+}
+
+fn enum_e() -> List[Str] {
+    ["type E[T] \{", "    L(T)", "    N", "}", "type F \{ X }"]
+}
+
+test "two calls of one closure at two instances of the enum are a type error" {
+    expect_check_error("two_instances", enum_e().append([
+        "fn main() \{",
+        "    let f = fn(e) \{",
+        "        match e \{",
+        "            E.L(_) => 1",
+        "            E.N => 0",
+        "        }",
+        "    }",
+        "    io.println(\"\{f(E.L(1))}\")",
+        "    io.println(\"\{f(E.L(\"a\"))}\")",
+        "}",
+    ]), [
+        "error[TypeError]: function `f` argument 0 expects E[Int], got E[Str]",
+        "x.bl:14:18",
+        "1 error(s) found",
+    ])
+}
+
+test "a call with a value of another type is a type error" {
+    expect_check_error("other_type", enum_e().append([
+        "fn main() \{",
+        "    let f = fn(e) \{",
+        "        match e \{",
+        "            E.L(b) => b",
+        "            E.N => 0",
+        "        }",
+        "    }",
+        "    io.println(\"\{f(F.X)}\")",
+        "}",
+    ]), [
+        "error[TypeError]: function `f` argument 0 expects E[Int], got F",
+        "x.bl:13:18",
+        "1 error(s) found",
+    ])
+}
+
+test "an arm that names another enum is a type error at that arm" {
+    expect_check_error("other_enum_arm", enum_e().append([
+        "fn main() \{",
+        "    let f = fn(e) \{",
+        "        match e \{",
+        "            E.L(b) => b",
+        "            F.X => 0",
+        "        }",
+        "    }",
+        "    io.println(\"\{f(E.L(1))}\")",
+        "}",
+    ]), [
+        "error[TypeError]: pattern of type `F` used on a value of type `E",
+        "x.bl:10:13",
+        "1 error(s) found",
+    ])
+}
+
+test "a closure that nothing calls leaves the payload type open" {
+    expect_check_error("never_called", enum_e().append([
+        "fn main() \{",
+        "    let _f = fn(e) \{",
+        "        match e \{",
+        "            E.L(_) => 1",
+        "            E.N => 0",
+        "        }",
+        "    }",
+        "}",
+    ]), [
+        "error[CannotInferType]: cannot infer a type for `_f`",
+        "x.bl:7:5",
+        "1 error(s) found",
+    ])
+}

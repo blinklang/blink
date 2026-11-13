@@ -1,0 +1,186 @@
+// A closure parameter with no annotation has an open type until a use fixes it. A qualified
+// variant pattern on it (`E.L(b)`) fixes the parameter to the enum at fresh type arguments, and
+// the payload binder takes those arguments, so a later call solves them (sections/03_types.md,
+// Under-Determined Types: a later use determines the type). Each program must check clean,
+// then build and run in both modes and print the expected text.
+
+import compile_test_helpers
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> ProcessResult ! Process.Spawn {
+    process.run("sh", ["-c", cmd]).unwrap()
+}
+
+fn expect_prints(tag: Str, lines: List[Str], want: Str) ! IO, FS.Write, Process.Spawn, Env.Read {
+    let dir = "{compile_test_helpers.scratch_root()}/closure_variant_pattern_{tag}"
+    let _ = sh("rm -rf {dir} && mkdir -p {dir}")
+    fs.write("{dir}/x.bl", lines.join("\n").concat("\n")).unwrap()
+    let clear = "env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE"
+    let mut bad = 0
+    let c = sh("B=$(pwd)/build/blink; cd {dir} && {clear} timeout 120 $B check x.bl < /dev/null")
+    if !c.success() {
+        io.eprintln("{tag} check: ended {c.end}\n{c.out}{c.err_out}")
+        bad = bad + 1
+    }
+    for mode in ["--per-module", "--no-per-module"] {
+        let r = sh("B=$(pwd)/build/blink; cd {dir} && {clear} timeout 120 $B run {mode} x.bl < /dev/null")
+        if !r.success() || r.out.trim() != want {
+            io.eprintln("{tag} {mode}: ended {r.end}, printed [{r.out.trim()}], want [{want}]\n{r.err_out}")
+            bad = bad + 1
+        }
+    }
+    let _ = sh("rm -rf {dir}")
+    assert_eq(bad, 0)
+}
+
+test "the payload binder takes the type argument a later call gives" {
+    expect_prints("int", [
+        "type E[T] \{",
+        "    L(T)",
+        "    N",
+        "}",
+        "fn main() \{",
+        "    let f = fn(e) \{",
+        "        match e \{",
+        "            E.L(b) => b",
+        "            E.N => 0",
+        "        }",
+        "    }",
+        "    io.println(\"\{f(E.L(1))}\")",
+        "}",
+    ], "1")
+}
+
+test "arithmetic on the payload binder with the result annotated Int" {
+    expect_prints("plus", [
+        "type E[T] \{",
+        "    L(T)",
+        "    N",
+        "}",
+        "fn main() \{",
+        "    let f = fn(e) \{",
+        "        match e \{",
+        "            E.L(b) => b + 1",
+        "            E.N => 0",
+        "        }",
+        "    }",
+        "    let r: Int = f(E.L(1))",
+        "    io.println(\"\{r}\")",
+        "}",
+    ], "2")
+}
+
+test "a method call on the payload binder of a Str instance" {
+    expect_prints("str", [
+        "type E[T] \{",
+        "    L(T)",
+        "    N",
+        "}",
+        "fn main() \{",
+        "    let f = fn(e) \{",
+        "        match e \{",
+        "            E.L(b) => b.len()",
+        "            E.N => 0",
+        "        }",
+        "    }",
+        "    io.println(\"\{f(E.L(\"ab\"))}\")",
+        "}",
+    ], "2")
+}
+
+test "a nested qualified variant pattern fixes both levels" {
+    expect_prints("nested", [
+        "type E[T] \{",
+        "    L(T)",
+        "    N",
+        "}",
+        "fn main() \{",
+        "    let f = fn(e) \{",
+        "        match e \{",
+        "            E.L(E.L(b)) => b",
+        "            E.L(E.N) => 7",
+        "            E.N => 0",
+        "        }",
+        "    }",
+        "    let x: E[E[Int]] = E.L(E.L(5))",
+        "    let y: E[E[Int]] = E.L(E.N)",
+        "    io.println(\"\{f(x)} \{f(y)}\")",
+        "}",
+    ], "5 7")
+}
+
+test "a brace payload variant pattern binds its field at the instance" {
+    expect_prints("brace", [
+        "type E[T] \{",
+        "    L \{ v: T }",
+        "    N",
+        "}",
+        "fn main() \{",
+        "    let f = fn(e) \{",
+        "        match e \{",
+        "            E.L \{ v } => v",
+        "            E.N => 0",
+        "        }",
+        "    }",
+        "    io.println(\"\{f(E.L \{ v: 4 })}\")",
+        "}",
+    ], "4")
+}
+
+test "a pattern headed by an alias of a generic enum fixes the parameter to that enum" {
+    expect_prints("alias", [
+        "type E[T] \{",
+        "    L(T)",
+        "    N",
+        "}",
+        "type A[T] = E[T]",
+        "fn main() \{",
+        "    let f = fn(e) \{",
+        "        match e \{",
+        "            A.L(b) => b",
+        "            A.N => 0",
+        "        }",
+        "    }",
+        "    io.println(\"\{f(E.L(1))} \{f(E.N)}\")",
+        "}",
+    ], "1 0")
+}
+
+test "a qualified variant of a non-generic enum on an unannotated parameter" {
+    expect_prints("plain", [
+        "type Ev \{ Click(Int), Other }",
+        "fn main() \{",
+        "    let f = fn(e) \{",
+        "        match e \{",
+        "            Ev.Click(c) => c",
+        "            Ev.Other => 0",
+        "        }",
+        "    }",
+        "    io.println(\"\{f(Ev.Click(2))} \{f(Ev.Other)}\")",
+        "}",
+    ], "2 0")
+}
+
+test "an annotated closure parameter and a generic named fn match the same enum" {
+    expect_prints("annotated", [
+        "type E[T] \{",
+        "    L(T)",
+        "    N",
+        "}",
+        "fn g[T](e: E[T], d: T) -> T \{",
+        "    match e \{",
+        "        E.L(b) => b",
+        "        E.N => d",
+        "    }",
+        "}",
+        "fn main() \{",
+        "    let f = fn(e: E[Int]) \{",
+        "        match e \{",
+        "            E.L(b) => b",
+        "            E.N => 0",
+        "        }",
+        "    }",
+        "    io.println(\"\{f(E.L(1))} \{g(E.L(\"s\"), \"d\")}\")",
+        "}",
+    ], "1 s")
+}
