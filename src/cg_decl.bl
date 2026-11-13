@@ -25,7 +25,7 @@ import cname.{
     c_ffi_symbol, c_field_name, c_variant_member_name,
     c_fn_decl_name, cname_ffi_struct_mirror,
     c_global_name, c_vtable_type_name, c_vtable_userdata_member,
-    c_impl_method_name, c_display_dispatch_name, c_display_dispatch_instance_name, c_local_name, c_param_name, c_runtime_helper,
+    c_impl_method_name, c_display_dispatch_name, c_display_dispatch_instance_name, c_local_name, c_mint_local, c_param_name, c_runtime_helper,
     c_typedef_name, c_variant_discriminant, c_string_literal,
     cname_is_runtime_owned, td_guard_name, c_enum_tag_member, c_enum_payload_member,
     c_builtin_derived_op_name,
@@ -939,20 +939,24 @@ pub fn cg_decl_emit_fn_def(fn_node: Int, is_static: Bool, body: Int) ! Diag.Repo
 // argument crosses unchanged unless C would read it as a different type.
 //
 // Which declaration the call is checked against decides the rest. A symbol the prologue
-// already declares is checked against the real header, so an @ffi.struct mirror has to be
-// cast to the C struct that header names. A symbol nothing declares is checked against the
-// prototype written here from the Blink signature, so the same argument crosses under the
-// mirror's own spelling and needs no cast.
+// already declares is checked against the real header, so a pointer to an @ffi.struct
+// mirror is cast to the C struct that mirror names (or `void*`, when it names none) on the
+// way in, and the answer is cast back to the mirror on the way out. A symbol nothing
+// declares is checked against the prototype written here from the Blink signature, so the
+// same value crosses under the mirror's own spelling and needs no cast.
 pub fn cg_decl_emit_foreign_wrapper(fn_node: Int) ! Diag.Report {
     let symbol = c_ffi_symbol(fn_node)
     let declared = print_prologue_declares(symbol)
-    if declared && !foreign_shapes_convertible(fn_node) { return }
+    let crossings: List[Crossing] = if declared { foreign_crossings(fn_node) } else { [] }
+    if declared && !foreign_shapes_convertible(fn_node, crossings) { return }
     let ret = fn_ret_spelling(fn_node)
     let params = fn_param_decls(fn_node)
     if !declared && !write_foreign_decl(fn_node, ret, symbol, params) { return }
-    let args = foreign_call_args(fn_node, declared)
+    let args = foreign_call_args(fn_node, crossings)
+    let last = crossings.len() - 1
+    let back = if declared { foreign_cast_name(crossings.get(last).unwrap()) } else { "" }
     print_fn(false, ret, cg_decl_c_name(fn_node), params, cg_decl_takes_ev(fn_node),
-        foreign_call_block(fn_node, symbol, ret, args))
+        foreign_call_block(fn_node, symbol, ret, args, back))
     emit_display_dispatch_def(fn_node, false)
 }
 
@@ -977,8 +981,10 @@ fn write_foreign_decl(site: Int, ret: Str, symbol: Str, params: List[Str]) -> Bo
 // A value-returning wrapper that drops the call's answer falls off the end of a function
 // whose signature promises one, so the return type decides the statement, not the call. The
 // test is the one layout uses to spell a return `void`, or the two could disagree.
-fn foreign_call_block(fn_node: Int, symbol: Str, ret: Str, args: List[Int]) -> Int ! Diag.Report {
+// `back` is the header's type for a mirror pointer the call returns, or "" for no cast.
+fn foreign_call_block(fn_node: Int, symbol: Str, ret: Str, args: List[Int], back: Str) -> Int ! Diag.Report {
     let tid = fn_ret_tid(fn_node)
+    if back != "" { return foreign_cast_back_block(fn_node, tid, symbol, ret, back, args) }
     let k = tc_tid_kind(tc_resolve(tid))
     let drops = k == TyKind.Void || k == TyKind.Never
     let direct = ir_call_direct(tid, fn_node, ret, symbol, SlotForm.Inline, args)
@@ -993,13 +999,26 @@ fn foreign_call_block(fn_node: Int, symbol: Str, ret: Str, args: List[Int]) -> I
     ir_block(fn_node, [stmt])
 }
 
+// A mirror pointer that comes back from a declared symbol arrives under the header's type.
+// The answer is first held in a local of the type the mirror names, so C checks the header's
+// return type against the binding by plain assignment; a cast straight on the call would
+// accept any return, even an integer. Only then is it cast to the mirror.
+fn foreign_cast_back_block(fn_node: Int, tid: Int, symbol: Str, ret: Str, header_type: Str, args: List[Int]) -> Int {
+    let held = c_mint_local("ffi_ret")
+    let call = ir_call_direct(tid, fn_node, header_type, symbol, SlotForm.Inline, args)
+    let answer = ir_var_ref(tid, fn_node, header_type, held, SlotForm.Inline)
+    ir_block(fn_node, [ir_let(tid, fn_node, header_type, held, SlotForm.Inline, call),
+        ir_return(fn_node, ir_cast(tid, fn_node, ret, answer))])
+}
+
 // The runtime's own functions answer real Strs, header and all; any other symbol answers a
 // plain C string.
 fn foreign_symbol_makes_strs(symbol: Str) -> Bool {
     symbol.starts_with("blink_") || symbol.starts_with("blinkrt_") || symbol.starts_with("__blink")
 }
 
-fn foreign_call_args(fn_node: Int, declared: Bool) -> List[Int] ! Diag.Report {
+// `crossings` is empty when no header declares the symbol: then no argument takes a cast.
+fn foreign_call_args(fn_node: Int, crossings: List[Crossing]) -> List[Int] ! Diag.Report {
     let mut out: List[Int] = []
     let sl = node_params(fn_node)
     if sl == -1 { return out }
@@ -1010,7 +1029,7 @@ fn foreign_call_args(fn_node: Int, declared: Bool) -> List[Int] ! Diag.Report {
         let rec = layout_of(tid, Position.Param)
         let arg = ir_var_ref(tid, p, spelling_or_ice(rec, tc_type_str(tid)),
             c_param_name(sl, i), rec.slot_form)
-        let cast_to = if declared { foreign_cast_name(tid) } else { "" }
+        let cast_to = if i < crossings.len() { foreign_cast_name(crossings.get(i).unwrap()) } else { "" }
         out.push(if cast_to != "" { ir_cast(tid, p, cast_to, arg) } else { arg })
         i = i + 1
     }
@@ -1018,9 +1037,9 @@ fn foreign_call_args(fn_node: Int, declared: Bool) -> List[Int] ! Diag.Report {
 }
 
 // What a type reaches on its way across: the @ffi.struct mirror behind its pointers, and
-// how many Ptr levels stand in front of it. C casts one level, so those two facts together
-// decide between a cast, a plain argument and a refusal. `decl` is -1 when the type reaches
-// no mirror at all.
+// how many Ptr levels stand in front of it. A pointer at any depth converts with a cast and
+// a mirror by value does not, so those two facts together decide between a cast, a plain
+// value and a refusal. `decl` is -1 when the type reaches no mirror at all.
 type Crossing {
     decl: Int
     ptr_depth: Int
@@ -1039,62 +1058,63 @@ fn crossing_of(tid: Int) -> Crossing {
     Crossing { decl: -1, ptr_depth: depth }
 }
 
-// The C struct an argument must be cast to, or "" when it crosses as the wrapper spells it.
-fn foreign_cast_name(tid: Int) -> Str {
-    let cross = crossing_of(tid)
-    if cross.decl < 0 || cross.ptr_depth != 1 { return "" }
-    c_ffi_struct_ptr_name(cross.decl)
+// One Crossing per position: the params in order, then the return last.
+fn foreign_crossings(fn_node: Int) -> List[Crossing] ! Diag.Report {
+    let mut out: List[Crossing] = []
+    let sl = node_params(fn_node)
+    let n = if sl == -1 { 0 } else { sublist_length(sl) }
+    let mut i = 0
+    while i < n {
+        out.push(crossing_of(tid_of_node(sublist_get(sl, i))))
+        i = i + 1
+    }
+    out.push(crossing_of(fn_ret_tid(fn_node)))
+    out
+}
+
+// The C type a value takes at the header's side of the call, or "" when it crosses as the
+// wrapper spells it. A named mirror becomes the struct the header names, at as many pointer
+// levels as the signature writes: a named cast, not `void*`, so C still checks the pointer
+// depth and the struct against the header. A mirror that names no C struct becomes `void*`,
+// which C converts to any pointer with no check, because the mirror's layout is the user's
+// @trusted claim: such a binding is only as right as its signature.
+fn foreign_cast_name(cross: Crossing) -> Str {
+    if cross.decl < 0 || cross.ptr_depth == 0 { return "" }
+    c_ffi_struct_ptr_name(cross.decl, cross.ptr_depth)
 }
 
 // Every position whose C shape this stage can write when the call is checked against the
 // real header. Each position refuses on its own, so one wrapper can name more than one
 // shape it has no conversion for.
-fn foreign_shapes_convertible(fn_node: Int) -> Bool ! Diag.Report {
+fn foreign_shapes_convertible(fn_node: Int, crossings: List[Crossing]) -> Bool ! Diag.Report {
     let mut ok = true
     let sl = node_params(fn_node)
-    let n = if sl == -1 { 0 } else { sublist_length(sl) }
+    let n = crossings.len() - 1
     let mut i = 0
     while i < n {
-        let p = sublist_get(sl, i)
-        if !shape_convertible(tid_of_node(p), p, false) { ok = false }
+        if !shape_convertible(crossings.get(i).unwrap(), sublist_get(sl, i), false) { ok = false }
         i = i + 1
     }
-    if !shape_convertible(fn_ret_tid(fn_node), fn_node, true) { ok = false }
+    if !shape_convertible(crossings.get(n).unwrap(), fn_node, true) { ok = false }
     ok
 }
 
-// A mirror crossing by value has no conversion: C forbids a cast between two struct types,
-// so the wrapper would hand the foreign function the wrong type under a name that compiles.
-// A cast reaches one pointer level, and a mirror that names no C struct cannot be spelled as
-// the original at all. An answer is stricter: it arrives under the foreign spelling and this
-// stage writes no conversion on the way out, so any mirror in the return is refused.
-fn shape_convertible(tid: Int, site: Int, is_return: Bool) -> Bool ! Diag.Report {
-    let cross = crossing_of(tid)
+// A mirror behind a pointer converts with a cast at any depth, in either direction. A mirror
+// crossing by value has no conversion: C forbids a cast between two struct types, so the
+// wrapper would hand the foreign function the wrong type under a name that compiles.
+fn shape_convertible(cross: Crossing, site: Int, is_return: Bool) -> Bool ! Diag.Report {
     if cross.decl == DECL_NODE_AMBIGUOUS {
         return refuse_foreign_shape(site, is_return, "a type whose name two modules declare")
     }
-    if cross.decl < 0 { return true }
-    let what = "the @ffi.struct type {node_name(cross.decl)}"
-    if cross.ptr_depth == 0 { return refuse_foreign_shape(site, is_return, "a value of {what}") }
-    if cross.ptr_depth > 1 {
-        return refuse_foreign_shape(site, is_return, "a pointer to a pointer to {what}")
-    }
-    if is_return { return refuse_foreign_shape(site, is_return, "a pointer to {what}") }
-    if c_ffi_struct_ptr_name(cross.decl) != "" { return true }
-    refuse_foreign_shape(site, is_return,
-        "a pointer to {what}, which names no C struct")
+    if cross.decl < 0 || cross.ptr_depth > 0 { return true }
+    refuse_foreign_shape(site, is_return, "a value of the @ffi.struct type {node_name(cross.decl)}")
 }
 
 fn refuse_foreign_shape(site: Int, is_return: Bool, what: Str) -> Bool ! Diag.Report {
     let position = if is_return { "returns" } else { "takes" }
-    let fix = if is_return {
-        "return an Int or a Ptr to a type no foreign header declares, and read the struct through a second binding"
-    } else {
-        "pass the type through a single Ptr and give its @ffi.struct annotation a name"
-    }
     diag_ice_at("ForeignShapeNotConvertible", CODEGEN_STAGE_NOT_BUILT,
         "cg foreign wrapper bodies cannot convert {what}, which this binding {position}, for a foreign function the prologue already declares",
-        site, fix)
+        site, "no @ffi.struct crosses by value to a C function the runtime headers declare")
     false
 }
 

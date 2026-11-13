@@ -1,0 +1,133 @@
+// An `@ffi` binding over a C symbol that the unit's prologue already declares is checked
+// against the real header, not against a prototype written from the Blink signature. An
+// `@ffi.struct` mirror behind a pointer must still cross: at any pointer depth, in a
+// parameter or in the return, and whether or not the mirror names its C struct. Each row
+// builds and runs on both build paths and checks what the program prints.
+//
+// The named mirror is struct pollfd: POSIX fixes its fields, their names and their order,
+// so the mirror's size and field asserts hold on every libc.
+
+import std.process.{ChildEnd, ProcessResult, ChildLimits}
+import std.time.{Duration}
+
+fn sh(cmd: Str) -> ProcessResult ! Process.Spawn {
+    process.run("sh", ["-c", cmd], limits: ChildLimits { timeout: Some(Duration.seconds(300)) }).unwrap()
+}
+
+fn project(source: Str) -> Str ! FS.Write, Process.Spawn {
+    let dir = sh("mktemp -d /tmp/blink_ffi_ptr_mirror.XXXXXX").out.trim()
+    let _ = sh("mkdir -p {dir}/src")
+    fs.write("{dir}/blink.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\n").unwrap()
+    fs.write("{dir}/blink.lock", "[metadata]\nlockfile-version = 1\n").unwrap()
+    fs.write("{dir}/src/main.bl", source).unwrap()
+    dir
+}
+
+// The corpus exports module filters that make each build one unit, so the run drops them:
+// --per-module must reach the per-module path.
+fn blink_in(dir: Str, cmd: Str) -> ProcessResult ! Process.Spawn {
+    sh("B=$(pwd)/build/blink; cd {dir} && env -u BLINK_PER_MODULE -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE BLINK_CACHE_DIR={dir}/cache BLINK_BIN=$B $B {cmd} < /dev/null")
+}
+
+fn diag(r: ProcessResult) -> Str {
+    "exit {r.end}\nstdout:\n{r.out}\nstderr:\n{r.err_out}"
+}
+
+// Runs `source` on both build paths and checks that each prints `want`.
+fn runs_and_prints(source: Str, want: Str) ! FS.Write, Process.Spawn, IO.Print {
+    let dir = project(source)
+    let pm = blink_in(dir, "run --per-module src/main.bl")
+    let one = blink_in(dir, "run --no-per-module src/main.bl")
+    let _ = sh("rm -rf {dir}")
+    assert_eq(pm.end, ChildEnd.Exited(0), "--per-module: {diag(pm)}")
+    assert_eq(pm.out.trim(), want, "--per-module: {diag(pm)}")
+    assert_eq(one.end, ChildEnd.Exited(0), "--no-per-module: {diag(one)}")
+    assert_eq(one.out.trim(), want, "--no-per-module: {diag(one)}")
+}
+
+// struct pollfd as POSIX defines it.
+fn pollfd_mirror() -> Str {
+    #"@ffi.struct(header: "poll.h", name: "pollfd")
+type Pollfd { fd: I32, events: I16, revents: I16 }
+"#
+}
+
+test "a pointer to a pointer to a named mirror crosses to memcpy and back" {
+    let src = pollfd_mirror().concat(#"
+@ffi("memcpy", header: "string.h")
+fn c_memcpy(dst: Ptr[Ptr[Pollfd]], src: Ptr[Ptr[Pollfd]], n: Int) -> Ptr[Ptr[Pollfd]] ! () {}
+
+fn main() {
+    with ffi.scope() as scope {
+        let p: Ptr[Pollfd] = scope.alloc[Pollfd]()
+        p.fd.write(7)
+        let from: Ptr[Ptr[Pollfd]] = scope.alloc[Ptr[Pollfd]]()
+        from.write(p)
+        let to: Ptr[Ptr[Pollfd]] = scope.alloc[Ptr[Pollfd]]()
+        let back = c_memcpy(to, from, 8)
+        io.println("{back.deref().fd.read()} {to.deref().fd.read()}")
+    }
+}
+"#)
+    runs_and_prints(src, "7 7")
+}
+
+test "a returned pointer to a named mirror crosses back from memcpy" {
+    let src = pollfd_mirror().concat(#"
+@ffi("memcpy", header: "string.h")
+fn c_memcpy(dst: Ptr[Pollfd], src: Ptr[Pollfd], n: Int) -> Ptr[Pollfd] ! () {}
+
+fn main() {
+    with ffi.scope() as scope {
+        let from: Ptr[Pollfd] = scope.alloc[Pollfd]()
+        from.fd.write(3)
+        from.events.write(5)
+        let to: Ptr[Pollfd] = scope.alloc[Pollfd]()
+        let back = c_memcpy(to, from, 8)
+        io.println("{back.fd.read()} {to.events.read()}")
+    }
+}
+"#)
+    runs_and_prints(src, "3 5")
+}
+
+test "a pointer to a mirror with no C name crosses to memcpy and back" {
+    let src = #"@ffi.struct
+type Pair { a: I32, b: I32 }
+
+@ffi("memcpy", header: "string.h")
+fn c_memcpy(dst: Ptr[Pair], src: Ptr[Pair], n: Int) -> Ptr[Pair] ! () {}
+
+fn main() {
+    with ffi.scope() as scope {
+        let from: Ptr[Pair] = scope.alloc[Pair]()
+        from.a.write(4)
+        from.b.write(9)
+        let to: Ptr[Pair] = scope.alloc[Pair]()
+        let back = c_memcpy(to, from, 8)
+        io.println("{back.a.read()} {to.b.read()}")
+    }
+}
+"#
+    runs_and_prints(src, "4 9")
+}
+
+// Guard: the one shape that crossed before, a single pointer to a named mirror in a
+// parameter. poll ignores an entry whose fd is negative and clears its revents.
+test "a pointer to a named mirror crosses to poll" {
+    let src = pollfd_mirror().concat(#"
+@ffi("poll", header: "poll.h")
+fn c_poll(fds: Ptr[Pollfd], n: U64, timeout: I32) -> I32 ! () {}
+
+fn main() {
+    with ffi.scope() as scope {
+        let p: Ptr[Pollfd] = scope.alloc[Pollfd]()
+        p.fd.write(-1)
+        p.revents.write(9)
+        let rc = c_poll(p, 1, 0)
+        io.println("{rc} {p.revents.read()}")
+    }
+}
+"#)
+    runs_and_prints(src, "0 0")
+}
