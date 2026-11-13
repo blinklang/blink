@@ -3690,6 +3690,8 @@ fn mock_db(data: List[Row]) -> Handler[DB] {
 - The clause writes `*,` where the operation does. After it, the clause writes the keyword names of the operation in the order of the operation. A missing or moved `*,`, or a different keyword name, is a mismatch. A caller picks a keyword argument by name, so the name is what says which value the clause gets. Without this rule, a clause that swaps two keyword parameters of one type would get the wrong values and show no error.
 - The clause writes no default on a parameter. A default value applies at the call site only (§4.4.8).
 - A clause for an operation declared `-> Never` writes `-> Never`, and its body diverges (§4.4.3). A clause that writes `-> Never` for an operation with another result type is a mismatch.
+- A clause is a signature (§3.3). Each parameter of a clause writes its type. A clause parameter with no type is `MissingParamType` (E0328) at its name, not E0548. The compiler does not take the type from the operation, as it does for a closure. The fix is machine-applicable: it writes the type that the operation gives that parameter. A receiver is not a parameter of a clause, because a clause has no `self`.
+- A clause that leaves out `-> R` has the result type `()`, as any fn does. When the operation has another result type, the clause is `HandlerClauseMismatch` (E0548) on the result. This includes `-> Never`. When the operation has no result type, or `-> ()`, the clause may leave it out.
 
 ```blink
 effect Shell {
@@ -3704,6 +3706,29 @@ fn quiet_shell() -> Handler[Shell] {
         fn read(file: Str) -> Str { "" }
         fn stop(code: Int) -> Never { panic("stop {code}") }
     }
+}
+
+effect Ee {
+    effect Op { fn op(x: Int) -> Int }
+    effect Note { fn note(msg: Str) }
+}
+
+fn clause_types() -> Int {
+    with handler Ee.Op {
+        fn op(x) -> Int { x + 1 }          // error[E0328]: `x` has no type; fix: `x: Int`
+    } { ee.op(1) }
+}
+
+fn clause_results() -> Int {
+    with handler Ee.Op {
+        fn op(x: Int) { }                  // error[E0548]: no `-> R` means `()`, the operation returns `Int`
+    } { ee.op(1) }
+}
+
+fn clause_unit() {
+    with handler Ee.Note {
+        fn note(msg: Str) { }              // OK: the operation has no result, so `()` matches
+    } { ee.note("hi") }
 }
 
 fn broken_shell() -> Handler[Shell] {

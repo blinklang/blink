@@ -2088,6 +2088,15 @@ let doubled = names.map(fn(n) {   // List[Str]
 
 **Why require annotations at function boundaries.** A function signature is a contract. It tells callers what to provide and what to expect. If the signature is inferred from the body, understanding the contract requires reading the implementation -- the exact opposite of locality of reasoning. An AI agent browsing an API surface gets complete type information from signatures alone. A human reviewing a PR reads signatures to understand the change. Inference at the boundary would save a few tokens per function at the cost of making every function opaque.
 
+**A signature parameter with no type.** A parameter of a function signature with no type is `error[E0328] MissingParamType`, at the name of the parameter. The rule covers a fn, a generic fn, a method in an impl or a trait, an `@ffi` fn, an effect operation and a handler clause (§4.7 *Clause signatures*). A closure is an expression, so its parameter may leave the type out. The receiver `self` of a method may leave its type out.
+
+```blink
+fn bad(x) -> Int { 1 }                      // error[E0328]: `x` has no type
+fn good(x: Int) -> Int { 1 }                // OK
+let f = fn(x) { x }                         // OK: a closure takes the type from its context
+effect Ee { effect Op { fn op(x) -> Int } } // error[E0328]: an operation is a signature
+```
+
 **Why infer everything else.** Inside a function body, types are implementation detail. `let x: Int = 42` carries no information that the compiler doesn't already know from `42`. Every redundant annotation is a token the AI had to generate and the human has to read. Inference reclaims those tokens for code that matters.
 
 **Bidirectional inference.** Type information flows both forward (from definitions to uses) and backward (from uses to definitions). This handles common patterns without annotation:
