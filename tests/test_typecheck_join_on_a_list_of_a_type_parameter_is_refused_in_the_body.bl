@@ -1,0 +1,107 @@
+// sections/03_types.md §3.2.1 gives `join` only through `impl Joinable for List[Str]`. A List
+// whose element is a type parameter of the body being checked is not `List[Str]`, and no bound
+// can make it one, so `join` on it is a TypeError in the generic body: for every call, at
+// `T = Str` too, and when nothing calls the fn. This holds for a fn's and an impl's type
+// parameter, for one with a bound such as `Display`, for a type that holds one such as an
+// associated type `S.Item`, and for the trait-qualified call. Each refusal, the concrete
+// `List[Int]` too, carries the help that names the fix. Each
+// refused row has an accepted control that joins a `List[Str]` in a generic body, so a check
+// that refuses every join in a generic body cannot pass.
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_reset}
+import std.fs
+import std.io
+
+// Every error as `Name@line: message (help)`, one per line, in report order.
+fn probe(stem: Str, src: Str) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO, Process.Spawn {
+    let path = "build/{stem}_probe.bl"
+    fs.write(path, src).unwrap()
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _rm = process.run("rm", ["-f", path]).unwrap()
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" { out.push("{d.name}@{d.line}: {d.message} ({d.help})") }
+    }
+    out.join("\n")
+}
+
+fn expect(label: Str, got: Str, want: Str) ! IO.Print {
+    if got != want { io.println("FAIL: {label}:\n  got:  {got}\n  want: {want}") }
+    assert(got == want)
+}
+
+fn words(shown: Str) -> Str { "List.join requires List[Str], got {shown} (map each element to Str first, then join)" }
+
+let pt = "type Pt \{ x: Int }\n"
+
+// A fn whose body joins a one-element list of its parameter, on line 3 of the program.
+let one_elem = "{pt}fn f[T](it: T) -> Int \{\n    let _s = [it].join(\",\")\n    1\n}\n"
+
+test "a join on a list of a type parameter is refused in the body at a struct argument" {
+    expect("tc_jtp_struct", probe("tc_jtp_struct", "{one_elem}fn main() \{ io.println(\"\{f(Pt \{ x: 1 })}\") }\n"), "TypeError@3: {words("List[T]")}")
+}
+
+test "a join on a list of a type parameter is refused when nothing calls the fn" {
+    expect("tc_jtp_uncalled", probe("tc_jtp_uncalled", "{one_elem}fn main() \{ io.println(\"x\") }\n"), "TypeError@3: {words("List[T]")}")
+}
+
+test "a join on a list of a type parameter is refused at an Int argument" {
+    expect("tc_jtp_int", probe("tc_jtp_int", "{one_elem}fn main() \{ io.println(\"\{f(1)}\") }\n"), "TypeError@3: {words("List[T]")}")
+}
+
+test "a join on a list of a type parameter is refused at a Str argument" {
+    expect("tc_jtp_str", probe("tc_jtp_str", "{one_elem}fn main() \{ io.println(\"\{f(\"a\")}\") }\n"), "TypeError@3: {words("List[T]")}")
+}
+
+test "a join on a List[T] parameter is refused" {
+    let src = "fn f[T](xs: List[T]) -> Str \{\n    xs.join(\",\")\n}\nfn main() \{ io.println(f([\"a\"])) }\n"
+    expect("tc_jtp_param", probe("tc_jtp_param", src), "TypeError@2: {words("List[T]")}")
+}
+
+test "a trait-qualified join on a List[T] parameter is refused" {
+    let src = "fn f[T](xs: List[T]) -> Str \{\n    Joinable.join(xs, \",\")\n}\nfn main() \{ io.println(f([\"a\"])) }\n"
+    expect("tc_jtp_qualified", probe("tc_jtp_qualified", src), "TypeError@2: {words("List[T]")}")
+}
+
+test "a join on a list of an impl type parameter is refused in the method" {
+    let src = "trait Show \{ fn show(self) -> Str }\ntype Box[T] \{ items: List[T] }\nimpl[T] Show for Box[T] \{\n    fn show(self) -> Str \{ self.items.join(\",\") }\n}\nfn main() \{ io.println(Box \{ items: [\"a\"] }.show()) }\n"
+    expect("tc_jtp_impl", probe("tc_jtp_impl", src), "TypeError@4: {words("List[T]")}")
+}
+
+test "a Display bound does not make a list of a type parameter joinable" {
+    let src = "fn f[U: Display](xs: List[U]) -> Str \{\n    xs.join(\",\")\n}\nfn main() \{ io.println(f([1, 2])) }\n"
+    expect("tc_jtp_display", probe("tc_jtp_display", src), "TypeError@2: {words("List[U]")}")
+}
+
+test "a join on a list of an associated type of a type parameter is refused" {
+    let src = "trait Src \{\n    type Item\n    fn items(self) -> List[Self.Item]\n}\nfn f[S: Src](s: S) -> Str \{\n    s.items().join(\",\")\n}\nfn main() \{ io.println(\"x\") }\n"
+    expect("tc_jtp_assoc", probe("tc_jtp_assoc", src), "TypeError@6: {words("List[S.Item]")}")
+}
+
+test "a join on a concrete List[Int] carries the same help" {
+    let src = "fn main() \{\n    let xs: List[Int] = [1, 2]\n    io.println(xs.join(\",\"))\n}\n"
+    expect("tc_jtp_concrete", probe("tc_jtp_concrete", src), "TypeError@3: {words("List[Int]")}")
+}
+
+test "a generic body that joins a List[Str] it builds is accepted" {
+    let src = "fn g[T](xs: List[T]) -> Str \{\n    let mut out: List[Str] = []\n    for _x in xs \{ out.push(\"e\") }\n    out.join(\"-\")\n}\nfn main() \{ io.println(g([1, 2])) }\n"
+    expect("tc_jtp_ok_built", probe("tc_jtp_ok_built", src), "")
+}
+
+test "a trait-qualified join on a List[Str] in a generic body is accepted" {
+    let src = "fn g[T](xs: List[T]) -> Str \{\n    let mut out: List[Str] = []\n    for _x in xs \{ out.push(\"e\") }\n    Joinable.join(out, \"-\")\n}\nfn main() \{ io.println(g([1, 2])) }\n"
+    expect("tc_jtp_ok_qualified", probe("tc_jtp_ok_qualified", src), "")
+}
+
+test "a generic body that maps its elements to Str before the join is accepted" {
+    let src = "fn f[T: Display](xs: List[T]) -> Str \{\n    xs.map(fn(x) \{ x.display() }).join(\",\")\n}\nfn main() \{ io.println(f([1, 2])) }\n"
+    expect("tc_jtp_ok_mapped", probe("tc_jtp_ok_mapped", src), "")
+}
+
+test "an impl method that maps its type parameter to Str before the join is accepted" {
+    let src = "trait Show \{ fn show(self) -> Str }\ntype Box[T] \{ items: List[T] }\nimpl[T: Display] Show for Box[T] \{\n    fn show(self) -> Str \{ self.items.map(fn(x) \{ x.display() }).join(\",\") }\n}\nfn main() \{ io.println(Box \{ items: [1] }.show()) }\n"
+    expect("tc_jtp_ok_impl", probe("tc_jtp_ok_impl", src), "")
+}

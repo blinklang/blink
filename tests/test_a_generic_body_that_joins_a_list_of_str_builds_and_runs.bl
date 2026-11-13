@@ -1,0 +1,49 @@
+// A generic body may join a `List[Str]` (sections/03_types.md §3.2.1, `impl Joinable for
+// List[Str]`): one it builds itself, one it gets by mapping its `List[T]` elements to Str, and
+// one in an impl method over `Box[T]`. The check that refuses a join on a list of a type
+// parameter must not refuse these. The program prints the same text in the one-unit and the
+// per-module build.
+
+import std.fs
+import std.process.{ProcessResult}
+import compile_test_helpers.{scratch_root}
+
+let program_src = [
+    "trait Show \{ fn show(self) -> Str }",
+    "type Box[T] \{ items: List[T] }",
+    "impl[T: Display] Show for Box[T] \{",
+    "    fn show(self) -> Str \{ self.items.map(fn(x) \{ x.display() }).join(\"+\") }",
+    "}",
+    "fn mapped[T: Display](xs: List[T]) -> Str \{",
+    "    xs.map(fn(x) \{ x.display() }).join(\",\")",
+    "}",
+    "fn built[T](xs: List[T]) -> Str \{",
+    "    let mut out: List[Str] = []",
+    "    for _x in xs \{ out.push(\"e\") }",
+    "    out.join(\"-\")",
+    "}",
+    "fn main() \{",
+    "    io.println([\"a\", \"b\"].join(\",\"))",
+    "    io.println(\"\{mapped([1, 2])} \{mapped([\"x\", \"y\"])}\")",
+    "    io.println(\"\{built([1, 2, 3])} \{Box \{ items: [4, 5] }.show()}\")",
+    "}",
+    "",
+].join("\n")
+
+fn sh(cmd: Str) -> ProcessResult ! Process.Spawn {
+    process.run("sh", ["-c", cmd]).unwrap()
+}
+
+test "a generic body that joins a List[Str] builds and runs in each build" {
+    let root = "{scratch_root()}/generic_join_str_{getpid()}"
+    let _ = sh("rm -rf {root} && mkdir -p {root}")
+    fs.write("{root}/main.bl", program_src).unwrap()
+    let blink = sh("readlink -f build/blink").out.trim()
+    let mut failed: List[Str] = []
+    for mode in ["--no-per-module", "--per-module"] {
+        let r = sh("cd {root} && env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE timeout 300 {blink} run {mode} main.bl < /dev/null 2>&1")
+        if !r.success() || r.out != "a,b\n1,2 x,y\ne-e-e 4+5\n" { failed.push("blink run {mode}: {r.end}\n{r.out}") }
+    }
+    let _ = sh("rm -rf {root}")
+    assert_eq(failed, [])
+}

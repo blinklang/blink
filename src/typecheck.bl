@@ -12387,6 +12387,19 @@ fn tc_check_call_against_fn_tid(fn_tid: Int, args_sl: Int, label: Str, node: Int
     fn_ty.inner1
 }
 
+// Whether a List with element `elem` has no `join`: only `impl Joinable for List[Str]` exists
+// (sections/03_types.md §3.2.1). An element still open (a `map` whose closure body is walked
+// after the call is typed) is pinned to Str, so a body that produces anything else conflicts
+// and is reported. A type parameter of the body being checked is rigid: it stands for every
+// type and no bound makes it Str, so the join is refused in the body, for every call. Only
+// Unknown and a typevar no active binder owns, which this body cannot judge, pass.
+fn tc_join_elem_refused(elem: Int) -> Bool ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    if tc_is_unbound_metavar(tc_resolve(elem)) != 0 { tc_unify(elem, TYPE_STR) }
+    let ek = type_kind(elem)
+    if ek == TyKind.Str || ek == TyKind.Unknown { return false }
+    ek != TyKind.Typevar || tc_typevar_binds_here(elem) != 0
+}
+
 // ── Error reporting ─────────────────────────────────────────────────
 
 fn tc_error(msg: Str) ! TypeCheck.Report, Diag.Report {
@@ -36152,35 +36165,16 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                 check_builtin_arg(method, 0, obj_t, args_sl, "List")
                 return obj_t
             }
-            // `join` must resolve to a real type, not TYPE_UNKNOWN: it is in
-            // is_builtin_method (:6299) — which is what lets it past the E0505
-            // gates — and codegen has always emitted
-            // `str_join(obj, delim) -> string` (codegen_methods.bl:1620), so an
-            // unresolved type here unifies with anything, lets a mistyped result
-            // through, and leaves a non-Str element receiver unchecked (`[1, 2].join(",")`
-            // reads int64 as `const char*` in str_join).
-            //
-            // sections/03_types.md:227-238 spells the impl header exactly —
-            // `impl Joinable for List[Str]`, `fn join(self, separator: Str) ->
-            // Str` — and the sealed-trait table at :521 reads
-            // `Joinable | List[Str] | join`. So BOTH the separator and the
-            // element type are pinned by the spec, not chosen here.
-            //
-            // The element check fails open on Unknown and Typevar. type_kind
-            // resolves a bound metavar, so a pinned α reads as its solution;
-            // what is left is a genuinely unresolved element — a typevar in a
-            // generic fn body (`fn f[T](xs: List[T]) -> Str { xs.join(",") }`)
-            // cannot be judged at the definition site, and whether that shape
-            // should require a bound is a spec question about generic bounds.
+            // `join` must resolve to a real type, not TYPE_UNKNOWN: is_builtin_method names it,
+            // which lets it past the E0505 gates, so an unresolved type here would unify with
+            // anything and let a mistyped result through. The separator and the element are
+            // both pinned by the impl header in sections/03_types.md §3.2.1
+            // (`impl Joinable for List[Str]`) and the Joinable row of the §3.2.2 Trait Summary.
             if method == "join" {
                 check_builtin_arg(method, 0, TYPE_STR, args_sl, "List")
-                // An element still open here (a `map` whose closure body is walked after this
-                // call is typed) is pinned to Str, so a body that produces anything else
-                // conflicts and is reported instead of passing through the fail-open below.
-                if tc_is_unbound_metavar(tc_resolve(elem)) != 0 { tc_unify(elem, TYPE_STR) }
-                let ek = type_kind(elem)
-                if ek != TyKind.Str && ek != TyKind.Unknown && ek != TyKind.Typevar {
-                    tc_error_at("List.join requires List[Str], got {type_to_str(obj_t)}", node)
+                if tc_join_elem_refused(elem) {
+                    tc_error_at_code("List.join requires List[Str], got {type_to_str(obj_t)}", node, "TypeError", TYPE_ERROR,
+                        "map each element to Str first, then join")
                 }
                 return TYPE_STR
             }
