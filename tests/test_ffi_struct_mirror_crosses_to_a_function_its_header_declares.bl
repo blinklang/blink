@@ -1,0 +1,278 @@
+// An @ffi.struct mirror and the C struct it names are two types to C. When the header the
+// mirror names also declares the foreign function, the unit sees the header's prototype, so a
+// second prototype that spells the mirror conflicts with it. The mirror must cross as the C
+// struct: behind a pointer, by value, in a parameter and in the return, with the binding's
+// `header:` and without it. A binding's own `header:` must not change what the unit reads.
+// Each row builds and runs on both build paths and checks what the program prints.
+import std.process.{ChildEnd, ProcessResult, ChildLimits}
+import std.time.{Duration}
+
+fn sh(cmd: Str) -> ProcessResult ! Process.Spawn {
+    process.run("sh", ["-c", cmd], limits: ChildLimits { timeout: Some(Duration.seconds(300)) }).unwrap()
+}
+
+let MANIFEST = "[package]\nname = \"wproto\"\nversion = \"0.1.0\"\n\n[native-dependencies]\nwidget = \{ type = \"vendored\", path = \"vendor/widget.c\", headers = [\"widget.h\", \"widget_ops.h\"] \}\n"
+
+// widget_cid takes a pointer to const, which no Blink signature can spell. widget_hidden is
+// declared only under a feature macro the runtime does not set.
+let HEADER = "#ifndef WIDGET_H\n#define WIDGET_H\nstruct widget \{ int id; int pad; };\nstruct box \{ struct widget w; int n; };\nint widget_id(struct widget *w);\nint widget_cid(const struct widget *w);\nstruct widget *widget_self(struct widget *w);\nint widget_val(struct widget w);\nstruct widget widget_make(int id);\nint box_n(struct box *b);\nint widget_twice(int x);\n#ifdef WIDGET_EXTRA\nint widget_hidden(struct widget *w);\n#endif\n#endif\n"
+
+// A second header that declares functions over the struct of the first, one with a type a
+// Blink signature spells another way (long long), and one over no mirror at all.
+let OPS_HEADER = "#ifndef WIDGET_OPS_H\n#define WIDGET_OPS_H\n#include \"widget.h\"\nint widget_ops_id(const struct widget *w);\nint widget_fill(struct widget *w, long long *out);\nint ops_len(const char *s);\n#endif\n"
+
+let SOURCE = "#define WIDGET_EXTRA\n#include \"widget.h\"\n#include \"widget_ops.h\"\nint widget_id(struct widget *w) \{ return w->id; }\nint widget_cid(const struct widget *w) \{ return w->id + 1; }\nstruct widget *widget_self(struct widget *w) \{ return w; }\nint widget_val(struct widget w) \{ return w.id * 10 + w.pad; }\nstruct widget widget_make(int id) \{ struct widget w = \{ id, id + 1 }; return w; }\nint box_n(struct box *b) \{ return b->n + b->w.id; }\nint widget_twice(int x) \{ return x * 2; }\nint widget_hidden(struct widget *w) \{ return w->id + 30; }\nint widget_ops_id(const struct widget *w) \{ return w->id + 100; }\nint widget_fill(struct widget *w, long long *out) \{ *out = w->id * 3; return 1; }\nint ops_len(const char *s) \{ int n = 0; while (s[n]) n++; return n; }\n"
+
+fn project(source: Str) -> Str ! FS.Write, Process.Spawn {
+    let dir = sh("mktemp -d /tmp/blink_ffi_mirror_proto.XXXXXX").out.trim()
+    let _ = sh("mkdir -p {dir}/src {dir}/vendor")
+    fs.write("{dir}/blink.toml", MANIFEST).unwrap()
+    fs.write("{dir}/blink.lock", "[metadata]\nlockfile-version = 1\n").unwrap()
+    fs.write("{dir}/vendor/widget.h", HEADER).unwrap()
+    fs.write("{dir}/vendor/widget_ops.h", OPS_HEADER).unwrap()
+    fs.write("{dir}/vendor/widget.c", SOURCE).unwrap()
+    fs.write("{dir}/src/main.bl", source).unwrap()
+    dir
+}
+
+// The corpus exports module filters that make each build one unit, so the run drops them:
+// --per-module must reach the per-module path.
+fn blink_in(dir: Str, cmd: Str) -> ProcessResult ! Process.Spawn {
+    sh("B=$(pwd)/build/blink; cd {dir} && env -u BLINK_PER_MODULE -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE BLINK_CACHE_DIR={dir}/cache BLINK_BIN=$B $B {cmd} < /dev/null")
+}
+
+fn diag(r: ProcessResult) -> Str {
+    "exit {r.end}\nstdout:\n{r.out}\nstderr:\n{r.err_out}"
+}
+
+// Runs `source` on both build paths and checks that each prints `want`.
+fn runs_and_prints(source: Str, want: Str) ! FS.Write, Process.Spawn, IO.Print {
+    let dir = project(source)
+    let pm = blink_in(dir, "run --per-module src/main.bl")
+    let one = blink_in(dir, "run --no-per-module src/main.bl")
+    let _ = sh("rm -rf {dir}")
+    assert_eq(pm.end, ChildEnd.Exited(0), "--per-module: {diag(pm)}")
+    assert_eq(pm.out.trim(), want, "--per-module: {diag(pm)}")
+    assert_eq(one.end, ChildEnd.Exited(0), "--no-per-module: {diag(one)}")
+    assert_eq(one.out.trim(), want, "--no-per-module: {diag(one)}")
+}
+
+fn mirrors() -> Str {
+    #"@ffi.struct(header: "widget.h", name: "widget")
+type Widget { id: I32, pad: I32 }
+
+@ffi.struct(header: "widget.h", name: "box")
+type Box { w: Widget, n: I32 }
+"#
+}
+
+// Reads a mirror pointer through each binding, so one program covers a param, a returned
+// pointer and a nested mirror.
+fn pointer_main() -> Str {
+    #"
+fn main() {
+    with ffi.scope() as s {
+        let w = s.alloc[Widget]()
+        w.id.write(7)
+        let b = s.alloc[Box]()
+        b.n.write(3)
+        io.println("{widget_id(w)} {widget_self(w).id.read()} {box_n(b)}")
+    }
+}
+"#
+}
+
+fn by_value_main() -> Str {
+    #"
+fn main() {
+    let made = widget_make(5)
+    io.println("{made.id} {made.pad} {widget_val(Widget { id: 4, pad: 2 })}")
+}
+"#
+}
+
+test "a pointer to a mirror crosses to functions its header declares, under header:" {
+    let src = mirrors().concat(#"
+@ffi("widget", "widget_id", header: "widget.h")
+@trusted(audit: "T1")
+fn widget_id(w: Ptr[Widget]) -> I32 ! () {}
+
+@ffi("widget", "widget_self", header: "widget.h")
+@trusted(audit: "T1")
+fn widget_self(w: Ptr[Widget]) -> Ptr[Widget] ! () {}
+
+@ffi("widget", "box_n", header: "widget.h")
+@trusted(audit: "T1")
+fn box_n(b: Ptr[Box]) -> I32 ! () {}
+"#).concat(pointer_main())
+    runs_and_prints(src, "7 7 3")
+}
+
+test "a mirror crosses by value to and from functions its header declares, under header:" {
+    let src = mirrors().concat(#"
+@ffi("widget", "widget_val", header: "widget.h")
+@trusted(audit: "T1")
+fn widget_val(w: Widget) -> I32 ! () {}
+
+@ffi("widget", "widget_make", header: "widget.h")
+@trusted(audit: "T1")
+fn widget_make(id: I32) -> Widget ! () {}
+"#).concat(by_value_main())
+    runs_and_prints(src, "5 6 42")
+}
+
+// No header: on the binding. The mirror's header is still in the unit and declares each
+// function, so the prototype the binding writes must spell the C struct.
+test "a pointer to a mirror crosses to functions the mirror's header declares, without header:" {
+    let src = mirrors().concat(#"
+@ffi("widget", "widget_id")
+@trusted(audit: "T1")
+fn widget_id(w: Ptr[Widget]) -> I32 ! () {}
+
+@ffi("widget", "widget_self")
+@trusted(audit: "T1")
+fn widget_self(w: Ptr[Widget]) -> Ptr[Widget] ! () {}
+
+@ffi("widget", "box_n")
+@trusted(audit: "T1")
+fn box_n(b: Ptr[Box]) -> I32 ! () {}
+"#).concat(pointer_main())
+    runs_and_prints(src, "7 7 3")
+}
+
+test "a mirror crosses by value to and from functions the mirror's header declares, without header:" {
+    let src = mirrors().concat(#"
+@ffi("widget", "widget_val")
+@trusted(audit: "T1")
+fn widget_val(w: Widget) -> I32 ! () {}
+
+@ffi("widget", "widget_make")
+@trusted(audit: "T1")
+fn widget_make(id: I32) -> Widget ! () {}
+"#).concat(by_value_main())
+    runs_and_prints(src, "5 6 42")
+}
+
+// The binding's header is not the mirror's, and the unit does not read it.
+test "a mirror crosses to a function that a header other than the mirror's declares" {
+    let src = mirrors().concat(#"
+@ffi("widget", "widget_ops_id", header: "widget_ops.h")
+@trusted(audit: "T1")
+fn widget_ops_id(w: Ptr[Widget]) -> I32 ! () {}
+
+fn main() {
+    with ffi.scope() as s {
+        let w = s.alloc[Widget]()
+        w.id.write(7)
+        io.println("{widget_ops_id(w)}")
+    }
+}
+"#)
+    runs_and_prints(src, "107")
+}
+
+// Guard: a binding with no mirror in its signature keeps the prototype its signature writes.
+test "a scalar binding beside the mirrors still builds, with header: and without it" {
+    let src = mirrors().concat(#"
+@ffi("widget", "widget_twice", header: "widget.h")
+@trusted(audit: "T1")
+fn twice_h(x: I32) -> I32 ! () {}
+
+@ffi("widget", "widget_twice")
+@trusted(audit: "T1")
+fn twice(x: I32) -> I32 ! () {}
+
+fn main() {
+    io.println("{twice_h(4)} {twice(5)}")
+}
+"#)
+    runs_and_prints(src, "8 10")
+}
+
+// Guard: the binding's header declares its symbol only under a feature macro the runtime does
+// not set, so the call needs the prototype the signature writes.
+test "a mirror crosses to a function its header hides behind a feature macro" {
+    let src = mirrors().concat(#"
+@ffi("widget", "widget_hidden", header: "widget.h")
+@trusted(audit: "T1")
+fn widget_hidden(w: Ptr[Widget]) -> I32 ! () {}
+
+fn main() {
+    with ffi.scope() as s {
+        let w = s.alloc[Widget]()
+        w.id.write(7)
+        io.println("{widget_hidden(w)}")
+    }
+}
+"#)
+    runs_and_prints(src, "37")
+}
+
+// Guard: the binding's header spells a parameter `long long *`, which `Ptr[I64]` writes as
+// `int64_t *`. The binding's `header:` does not put that header in the unit, and an unrelated
+// binding over another symbol it declares keeps its own prototype.
+test "a binding's header: puts no header in the unit that another binding would conflict with" {
+    let src = mirrors().concat(#"
+@ffi("widget", "widget_fill", header: "widget_ops.h")
+@trusted(audit: "T1")
+fn widget_fill(w: Ptr[Widget], out: Ptr[I64]) -> I32 ! () {}
+
+@ffi("widget", "ops_len")
+@trusted(audit: "T1")
+fn ops_len(s: Ptr[U8]) -> I32 ! () {}
+
+fn main() {
+    with ffi.scope() as s {
+        let w = s.alloc[Widget]()
+        w.id.write(7)
+        let out = s.alloc[I64]()
+        io.println("{widget_fill(w, out)} {out.deref()} {ops_len(s.cstr("abcd"))}")
+    }
+}
+"#)
+    runs_and_prints(src, "1 21 4")
+}
+
+// A pointer to const in the header's prototype conflicts with the prototype a Blink signature
+// writes; only a symbol the prologue declares is called through the header's own prototype.
+test.failing(
+    "a mirror crosses to a function its header declares over a pointer to const",
+    reason: "no Blink signature spells a pointer to const, so the prototype the binding writes conflicts with the header's",
+) {
+    let src = mirrors().concat(#"
+@ffi("widget", "widget_cid", header: "widget.h")
+@trusted(audit: "T1")
+fn widget_cid(w: Ptr[Widget]) -> I32 ! () {}
+
+fn main() {
+    with ffi.scope() as s {
+        let w = s.alloc[Widget]()
+        w.id.write(7)
+        io.println("{widget_cid(w)}")
+    }
+}
+"#)
+    runs_and_prints(src, "8")
+}
+
+// The libc shape the bug was found on: nanosleep takes a pointer to const struct timespec.
+test "a pointer to a mirror of struct timespec crosses to nanosleep" {
+    let src = #"@ffi.struct(header: "time.h", name: "timespec")
+type Timespec { tv_sec: I64, tv_nsec: I64 }
+
+@ffi("nanosleep", header: "time.h")
+@trusted(audit: "T1")
+fn c_nanosleep(req: Ptr[Timespec], rem: Ptr[Timespec]) -> I32 ! () {}
+
+fn main() {
+    with ffi.scope() as s {
+        let req = s.alloc[Timespec]()
+        let rem = s.alloc[Timespec]()
+        req.tv_sec.write(0)
+        req.tv_nsec.write(1000)
+        io.println("{c_nanosleep(req, rem)}")
+    }
+}
+"#
+    runs_and_prints(src, "0")
+}
