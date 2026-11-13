@@ -1,0 +1,165 @@
+// A function signature writes the type of each parameter (sections/03_types.md §3.3 Type
+// Inference): a free fn, a generic fn, an impl method, a trait method with or without a default
+// body, an `@ffi` fn and an effect operation. Each parameter with no type is MissingParamType
+// (E0328) at its name, once. A method's first parameter `self` is sugar for `self: Self` and
+// stays legal, and so does `_self` there; `self` anywhere else is E0328. A closure is a body
+// expression, so its parameters stay inferred. A refused parameter takes the error type, so its
+// uses and its call sites report nothing more, and it gets no UnusedVariable.
+
+import std.fs
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_reset}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+
+fn typecheck_probe(path: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    init_embedded_stdlib()
+    fs.write(path, src).unwrap()
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+}
+
+// Each error, internal error and warning as "name line:col-end: message | help", in report order.
+fn reports_of(src: Str) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    reports_at_least(src, true)
+}
+
+// As reports_of, with warnings left out when `warnings` is false.
+fn reports_at_least(src: Str, warnings: Bool) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    typecheck_probe("build/test_typecheck_a_signature_parameter_with_no_type_probe.bl", src)
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" || (warnings && d.severity == "warning") {
+            out.push("{d.name} {d.line}:{d.col}-{d.end_col}: {d.message} | {d.help}")
+        }
+    }
+    out.join(" || ")
+}
+
+// The error E0328 reports for the parameter `name` at line:col, as reports_of formats it.
+fn refused(name: Str, line: Int, col: Int) -> Str {
+    "MissingParamType {line}:{col}-{col + name.byte_len()}: parameter `{name}` has no type | write its type: `{name}: Type`"
+}
+
+test "a free fn parameter with no type is e0328 at its name" {
+    let src = "fn f(x) -> Int \{ 1 }\nfn main() \{\n    let _n = f(1)\n}\n"
+    assert_eq(reports_of(src), refused("x", 1, 6))
+}
+
+test "a parameter with no type that the body reads reports nothing more" {
+    let src = "fn f(x) -> Int \{ x + 1 }\nfn main() \{\n    let _n = f(\"a\")\n}\n"
+    assert_eq(reports_of(src), refused("x", 1, 6))
+}
+
+test "a parameter with no type in an interpolation reports nothing more" {
+    let src = "fn f(x) ! IO \{ io.println(\"\{x}\") }\nfn main() ! IO \{\n    f(1)\n}\n"
+    assert_eq(reports_of(src), refused("x", 1, 6))
+}
+
+test "each parameter with no type gets its own error" {
+    let src = "fn f(a, b: Int, c) -> Int \{ b }\nfn main() \{\n    let _n = f(1, 2, 3)\n}\n"
+    assert_eq(reports_of(src), "{refused("a", 1, 6)} || {refused("c", 1, 17)}")
+}
+
+test "a generic fn parameter with no type is e0328" {
+    let src = "fn f[T](a: T, x) -> T \{ a }\nfn main() \{\n    let _n = f(1, 2)\n}\n"
+    assert_eq(reports_of(src), refused("x", 1, 15))
+}
+
+test "a mut parameter with no type is e0328 at its name" {
+    let src = "fn f(mut x) -> Int \{ 1 }\nfn main() \{\n    let _n = f(1)\n}\n"
+    assert_eq(reports_of(src), refused("x", 1, 10))
+}
+
+test "a keyword parameter with no type is e0328" {
+    let src = "fn f(a: Int, -- k) -> Int \{ a }\nfn main() \{\n    let _n = f(1, k: 2)\n}\n"
+    assert_eq(reports_of(src), refused("k", 1, 17))
+}
+
+test "a keyword parameter with a default and no type is e0328" {
+    let src = "fn f(a: Int, -- k = 3) -> Int \{ a }\nfn main() \{\n    let _n = f(1)\n}\n"
+    assert_eq(reports_of(src), refused("k", 1, 17))
+}
+
+test "an impl method parameter with no type is e0328" {
+    let src = "trait Tr \{ fn m(self, x: Int) -> Int }\ntype P \{ a: Int }\nimpl Tr for P \{ fn m(self, x) -> Int \{ self.a } }\nfn main() \{\n    let _n = P \{ a: 1 }.m(2)\n}\n"
+    assert_eq(reports_of(src), refused("x", 3, 28))
+}
+
+test "a trait method with no body and a parameter with no type is e0328" {
+    let src = "trait Tr \{ fn g(self, y) -> Int }\ntype P \{ a: Int }\nimpl Tr for P \{ fn g(self, y: Int) -> Int \{ y + self.a } }\nfn main() \{\n    let _n = P \{ a: 1 }.g(2)\n}\n"
+    assert_eq(reports_of(src), refused("y", 1, 23))
+}
+
+test "a trait method with a default body and a parameter with no type is e0328 once" {
+    let src = "trait Tr \{ fn g(self, y) -> Int \{ 1 } }\ntype P \{ a: Int }\nimpl Tr for P \{ fn g(self, y: Int) -> Int \{ y + self.a } }\nfn main() \{\n    let _n = P \{ a: 1 }.g(2)\n}\n"
+    assert_eq(reports_of(src), refused("y", 1, 23))
+}
+
+// The warning an unaudited foreign function gets is not under test here.
+test "an ffi fn parameter with no type is e0328" {
+    let src = "@ffi(\"c\", \"labs\")\nfn f(x) -> Int ! ()\nfn main() \{\n    let _n = f(-1)\n}\n"
+    assert_eq(reports_at_least(src, false), refused("x", 2, 6))
+}
+
+test "an effect operation parameter with no type is e0328" {
+    let src = "effect Ee \{ effect Op \{ fn op(x) -> Int } }\nfn go() -> Int ! Ee.Op \{ ee.op(1) }\nfn main() \{\n    with handler Ee.Op \{ fn op(x: Int) -> Int \{ x } } \{\n        let _n = go()\n    }\n}\n"
+    assert_eq(reports_of(src), refused("x", 1, 31))
+}
+
+test "self with no type and closures with untyped parameters report nothing" {
+    let src = "trait Tr \{ fn g(self, y: Int) -> Int }\ntype P \{ a: Int }\nimpl Tr for P \{ fn g(self, y: Int) -> Int \{ y + self.a } }\nfn main() \{\n    let xs = [1, 2].map(fn(n) \{ n + 1 })\n    let f = fn(x) \{ x }\n    let _n = f(1) + xs.len() + P \{ a: 1 }.g(2)\n}\n"
+    assert_eq(reports_of(src), "")
+}
+
+test "a method receiver spelled _self with no type reports nothing" {
+    let src = "trait Tr \{ fn g(self, y: Int) -> Int }\ntype P \{ a: Int }\nimpl Tr for P \{ fn g(_self, y: Int) -> Int \{ y } }\nfn main() \{\n    let _n = P \{ a: 1 }.g(2)\n}\n"
+    assert_eq(reports_of(src), "")
+}
+
+test "a free fn parameter spelled _self with no type is e0328" {
+    let src = "fn f(_self) -> Int \{ 1 }\nfn main() \{\n    let _n = f(1)\n}\n"
+    assert_eq(reports_of(src), refused("_self", 1, 6))
+}
+
+test "a method parameter after the receiver spelled _self with no type is e0328" {
+    let src = "trait Tr \{ fn g(self, y: Int) -> Int }\ntype P \{ a: Int }\nimpl Tr for P \{ fn g(self, _self) -> Int \{ self.a } }\nfn main() \{\n    let _n = P \{ a: 1 }.g(2)\n}\n"
+    assert_eq(reports_of(src), refused("_self", 3, 28))
+}
+
+test "a free fn parameter spelled self with no type is e0328" {
+    let src = "fn f(self) -> Int \{ 1 }\nfn main() \{\n    let _n = f(1)\n}\n"
+    assert_eq(reports_of(src), refused("self", 1, 6))
+}
+
+test "a trait method parameter self after the first with no type is e0328" {
+    let src = "trait T3 \{ fn g(a: Int, self) -> Int \{ 1 } }\nfn main() \{\n}\n"
+    assert_eq(reports_of(src), refused("self", 1, 25))
+}
+
+test "an impl method parameter self after the first with no type is e0328" {
+    let src = "trait Tr \{ fn g(a: Int, s: Self) -> Int }\ntype P \{ a: Int }\nimpl Tr for P \{ fn g(a: Int, self) -> Int \{ a } }\nfn main() \{\n}\n"
+    assert_eq(reports_of(src), refused("self", 3, 30))
+}
+
+test "an effect operation parameter spelled self with no type is e0328" {
+    let src = "effect Ee \{ effect Op \{ fn o(self) -> Int } }\nfn main() \{\n}\n"
+    assert_eq(reports_of(src), refused("self", 1, 30))
+}
+
+test "a trait method receiver spelled _self with no type and no body reports nothing" {
+    let src = "trait Tr \{ fn g(_self, y: Int) -> Int }\ntype P \{ a: Int }\nimpl Tr for P \{ fn g(self, y: Int) -> Int \{ y + self.a } }\nfn main() \{\n    let _n = P \{ a: 1 }.g(2)\n}\n"
+    assert_eq(reports_of(src), "")
+}
+
+test "a trait method receiver spelled _self with no type and a default body reports nothing" {
+    let src = "trait Tr \{ fn g(_self, y: Int) -> Int \{ y } }\ntype P \{ a: Int }\nimpl Tr for P \{ fn g(self, y: Int) -> Int \{ y + self.a } }\nfn main() \{\n    let _n = P \{ a: 1 }.g(2)\n}\n"
+    assert_eq(reports_of(src), "")
+}
+
+test "a method first parameter with another name and no type is e0328" {
+    let src = "trait Tr \{ fn g(self, y: Int) -> Int }\ntype P \{ a: Int }\nimpl Tr for P \{ fn g(other, y: Int) -> Int \{ y } }\nfn main() \{\n}\n"
+    assert_eq(reports_of(src), refused("other", 3, 22))
+}

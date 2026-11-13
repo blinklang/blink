@@ -49,7 +49,7 @@ import diagnostics.{
     FFI_OFFSET_ON_SINGLETON, FFI_OFFSET_UNKNOWN_STRIDE, VOID_POINTEE_ACCESS, WITH_ITEM_NOT_A_HANDLER, INSUFFICIENT_HANDLER_COVERAGE,
     TRAIT_CONTRACT_900, TRAIT_CONTRACT_901, TRAIT_CONTRACT_902,
     TRAIT_CONTRACT_903, TRAIT_CONTRACT_904, TRAIT_CONTRACT_905, TRAIT_CONTRACT_906,
-    DUPLICATE_TYPE_PARAM,
+    DUPLICATE_TYPE_PARAM, MISSING_PARAM_TYPE,
     TRAIT_CONTRACT_907, SEALED_METHOD_OVERRIDE,
     POLY_IMPL_UNSUPPORTED, IMPL_BINDER_UNUSED, TRAIT_ARG_ARITY, MISSING_SUPERTRAIT_IMPL, TYPE_ARG_ARITY,
     TYPE_ARGS_WITHOUT_CALL, ELEMENT_ACCESS_HELP, ENUM_PATTERN_NON_ENUM, NO_INDEX_OPERATOR,
@@ -24752,8 +24752,11 @@ type NrWalkContext {
     // True inside a trait declaration or an impl block, the only places `Self` names a type
     // (sections/03_types.md, The `Self` Type).
     in_trait_or_impl: Bool
+    // The signature parameters MissingParamType refused, so the walk of the body reports
+    // nothing more about them.
+    untyped_params: Set[Int]
 }
-let mut nr_walk: NrWalkContext = NrWalkContext { loop_depth: 0, closure_depth: 0, with_ptr_depth: 0, in_trait_or_impl: false }
+let mut nr_walk: NrWalkContext = NrWalkContext { loop_depth: 0, closure_depth: 0, with_ptr_depth: 0, in_trait_or_impl: false, untyped_params: Set() }
 let mut nr_warn_unused: Int = 0
 // The E0301 region-boundary check must run ONLY in the type-inference
 // pass (tc_check_fn/tc_check_body), where annotations are honored (final_tid =
@@ -29391,7 +29394,7 @@ fn resolve_names(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repor
     nr_name_top.clear()
     nr_scope_frames = []
     nr_scope_depth = 0
-    nr_walk = NrWalkContext { loop_depth: 0, closure_depth: 0, with_ptr_depth: 0, in_trait_or_impl: false }
+    nr_walk = NrWalkContext { loop_depth: 0, closure_depth: 0, with_ptr_depth: 0, in_trait_or_impl: false, untyped_params: Set() }
     nr_warn_unused = 1
     nr_impl_type_names = []
     nr_impl_method_names = []
@@ -29608,6 +29611,7 @@ fn resolve_names(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repor
         while i < sublist_length(fns_sl) {
             let fn_node = sublist_get(fns_sl, i)
             nr_current_module = node_module(fn_node)
+            nr_refuse_untyped_params(fn_node, false)
             nr_check_fn(fn_node)
             i = i + 1
         }
@@ -29629,7 +29633,9 @@ fn resolve_names(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repor
             if methods_sl != -1 {
                 let mut j = 0
                 while j < sublist_length(methods_sl) {
-                    nr_check_fn(sublist_get(methods_sl, j))
+                    let m = sublist_get(methods_sl, j)
+                    nr_refuse_untyped_params(m, true)
+                    nr_check_fn(m)
                     j = j + 1
                 }
             }
@@ -29648,6 +29654,7 @@ fn resolve_names(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repor
     // its own, so `default` does not resolve in a derived operation's body.
     for op in effect_ops(program) {
         nr_current_module = tc_body_module(op)
+        nr_refuse_untyped_params(op, false)
         nr_check_fn(op)
     }
 
@@ -29690,6 +29697,7 @@ fn nr_check_trait_method_defaults(traits_sl: Int) ! TypeCheck.Resolve, TypeCheck
             let mut j = 0
             while j < sublist_length(methods_sl) {
                 let m = sublist_get(methods_sl, j)
+                nr_refuse_untyped_params(m, true)
                 nr_check_effect_row(m)
                 let params_sl = node_params(m)
                 if params_sl != -1 {
@@ -29783,6 +29791,27 @@ fn nr_check_field_defaults(td: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.
     tc_pop_tparam_scope(tparams)
 }
 
+// A signature writes the type of each parameter (§3.3); only a method's receiver, its first
+// parameter `self`, may leave it out. A closure's parameters and a handler clause's are not read here. Whether a method's
+// receiver may be spelled `_self` with no type is an open question, so it keeps its old reading.
+fn nr_refuse_untyped_params(fn_node: Int, is_method: Bool) ! Diag.Report {
+    let params_sl = node_params(fn_node)
+    if params_sl == -1 { return }
+    let mut i = 0
+    while i < sublist_length(params_sl) {
+        let p = sublist_get(params_sl, i)
+        let name = node_name(p)
+        let receiver = is_method && i == 0 && (name == "self" || name == "_self")
+        if node_type_ann(p) == -1 && node_type_name(p) == "" && !receiver && !nr_walk.untyped_params.contains(p) {
+            nr_walk.untyped_params.insert(p)
+            let msg = "parameter `{name}` has no type"
+            tc_errors.push(msg)
+            diag_error_span_at_notes("MissingParamType", MISSING_PARAM_TYPE, msg, p, node_line(p), node_col(p), node_col(p) + name.byte_len(), "write its type: `{name}: Type`", [])
+        }
+        i = i + 1
+    }
+}
+
 fn nr_check_fn(fn_node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     // Before the scope, because the warnings this walk raises are raised by CLOSING it.
     diag_enter_allows(fn_node)
@@ -29827,7 +29856,11 @@ fn nr_check_fn_scope(fn_node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.R
             let p = sublist_get(params_sl, i)
             // The body of an @ffi fn is not walked, and a primitive operation has none, so
             // their parameters are not bound, but their types are written types all the same.
-            if binds_params { nr_define_at(node_name(p), p) }
+            if binds_params {
+                nr_define_at(node_name(p), p)
+                // MissingParamType is the one report a refused parameter gets.
+                if nr_walk.untyped_params.contains(p) { nr_scope_reads.set(nr_scope_reads.len() - 1, 1) }
+            }
             let ptype_ann = node_type_ann(p)
             if ptype_ann != -1 {
                 nr_check_type_ann_visibility(ptype_ann)

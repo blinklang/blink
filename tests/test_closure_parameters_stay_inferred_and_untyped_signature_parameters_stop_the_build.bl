@@ -1,0 +1,106 @@
+// A closure is a body expression, so its parameters stay inferred (sections/03_types.md §3.3),
+// and a program that leans on that builds and runs both ways. A function signature writes the
+// type of each parameter, so a parameter with no type on a free fn, an `@ffi` fn or an effect
+// operation stops the build with MissingParamType and no internal error. A method's receiver
+// spelled `_self` with no type still builds and runs.
+
+import compile_test_helpers
+
+// The corpus exports BLINK_COMPILER_ARCHIVE, which, like the module filters, makes a build
+// one unit, so the build drops them and a per-module build really writes its units.
+// Whether the build passed, and its output.
+fn build(src: Str, stem: Str, flag: Str, dir: Str) -> (Bool, Str) ! FS.Read, FS.Write, Process.Spawn, Env.Read {
+    compile_test_helpers.sh("rm -rf {dir} && mkdir -p {dir}")
+    let path = "{dir}/{stem}.bl"
+    fs.write(path, src).unwrap()
+    let b = process.run("sh", ["-c", "env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE BLINK_CACHE_DIR={dir}/objcache build/blink build {flag} {path} -o {dir}/{stem}_bin 2>&1"]).unwrap()
+    (b.success(), "{b.out}{b.err_out}")
+}
+
+fn build_and_run(src: Str, stem: Str, flag: Str) -> Str ! FS.Read, FS.Write, Process.Spawn, Env.Read {
+    let dir = "{compile_test_helpers.scratch_root()}/{stem}_{getpid()}"
+    let b = build(src, stem, flag, dir)
+    assert(b.0, "build failed: {b.1}")
+    let r = process.run("{dir}/{stem}_bin", []).unwrap()
+    compile_test_helpers.sh("rm -rf {dir}")
+    assert(r.success(), r.err_out)
+    r.out
+}
+
+fn build_output_of_refused(src: Str, stem: Str, flag: Str) -> Str ! FS.Read, FS.Write, Process.Spawn, Env.Read {
+    let dir = "{compile_test_helpers.scratch_root()}/{stem}_{getpid()}"
+    let b = build(src, stem, flag, dir)
+    compile_test_helpers.sh("rm -rf {dir}")
+    assert(!b.0, "build passed: {b.1}")
+    b.1
+}
+
+fn both_modes(src: Str, stem: Str, want: Str) ! FS.Read, FS.Write, Process.Spawn, Env.Read {
+    assert_eq(build_and_run(src, "{stem}_pm", "--per-module"), want)
+    assert_eq(build_and_run(src, "{stem}_wp", "--no-per-module"), want)
+}
+
+fn refused_both_modes(src: Str, stem: Str) ! FS.Read, FS.Write, Process.Spawn, Env.Read {
+    for flag in ["--per-module", "--no-per-module"] {
+        let out = build_output_of_refused(src, "{stem}_{flag.len()}", "{flag} --json")
+        assert(out.contains("\"name\":\"MissingParamType\",\"code\":\"E0328\""), out)
+        assert_eq(out.split("\"severity\":\"error\"").len(), 2)
+        assert(!out.contains("\"severity\":\"ice\"") && !out.to_lower().contains("internal compiler error"), out)
+    }
+}
+
+test "closures with untyped parameters build and run" {
+    both_modes(#"
+trait Tr { fn g(self, y: Int) -> Int }
+type P { a: Int }
+impl Tr for P { fn g(self, y: Int) -> Int { y + self.a } }
+
+fn twice(f: fn(Int) -> Int, x: Int) -> Int { f(f(x)) }
+
+fn main() {
+    let xs = [1, 2, 3].map(fn(n) { n + 1 })
+    let id = fn(x) { x }
+    let add = fn(a, b) { a + b }
+    io.println("{xs.len()} {xs.get(2) ?? 0} {id(7)} {add(2, 3)} {twice(fn(v) { v * 3 }, 2)} {P { a: 1 }.g(2)}")
+}
+"#, "cl", "3 4 7 5 18 3\n")
+}
+
+test "a method receiver spelled _self with no type builds and runs" {
+    both_modes(#"
+trait Tr { fn g(self, y: Int) -> Int }
+type P { a: Int }
+impl Tr for P { fn g(_self, y: Int) -> Int { y * 2 } }
+
+fn main() {
+    io.println("{P { a: 1 }.g(21)}")
+}
+"#, "us", "42\n")
+}
+
+test "a free fn parameter with no type stops the build with no internal error" {
+    refused_both_modes(#"
+fn f(x) -> Int { 1 }
+fn main() { io.println("{f(1)}") }
+"#, "free")
+}
+
+test "an ffi fn parameter with no type stops the build with no internal error" {
+    refused_both_modes(#"
+@ffi("c", "labs")
+fn f(x) -> Int ! ()
+fn main() { io.println("{f(-1)}") }
+"#, "ffi")
+}
+
+test "an effect operation parameter with no type stops the build with no internal error" {
+    refused_both_modes(#"
+effect Ee { effect Op { fn op(x) -> Int } }
+fn go() -> Int ! Ee.Op { ee.op(1) }
+fn main() {
+    with handler Ee.Op { fn op(x: Int) -> Int { 5 } } {
+        io.println("{go()}")
+    }
+}
+"#, "op")
+}
