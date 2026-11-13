@@ -326,6 +326,7 @@ let mut tc_active_tparams: Map[Str, Int] = Map()
 // by declaration node, types and fns alike.
 type HashRole { Free, SetElement, MapKey }
 let mut tc_hash_oblig: Map[Int, List[HashRole]] = Map()
+type LateHashBind { sig: Int, name: Str, bound: Int, node: Int }
 // One active type-parameter binding. A frame per binder — not a per-name count — so an
 // inner binder that reuses an outer name shadows it: the innermost frame for a name wins.
 // A name absent from the stack is not a type parameter (e.g. Self, or an unmodeled builtin
@@ -3552,6 +3553,14 @@ type CallFacts {
     // first walked, so the flush reports in source order.
     method_reads: Map[Int, MethodRead]
     method_read_order: List[Int]
+    // The roles a body gives its type parameters through a Map or Set whose key inference
+    // solved, by fn declaration, then parameter name. They are known only once inference is
+    // done, after every call has been checked against tc_hash_oblig, so late_hash_binds holds
+    // the calls those could not refuse, and the end of the program judges them again.
+    inferred_hash_roles: Map[Int, Map[Str, HashRole]]
+    // The fn whose body holds each open Map()/Set() construction, by construction node.
+    open_ctor_owner: Map[Int, Int]
+    late_hash_binds: List[LateHashBind]
 }
 // The impl a call reached, its binder tids in header order, the type `Self` reads as (a method
 // call's receiver, a conversion's target), and the fn whose body made the call.
@@ -3597,7 +3606,7 @@ type UseJudge {
 }
 
 fn new_call_facts() -> CallFacts {
-    CallFacts { open_calls: [], open_group: Map(), open_tids: [], reported: Map(), self_views: Map(), view_sigs: Map(), hash_aliases_above: [], derive_facts_above: [], derive_facts_low: 0, derive_facts_open: [], derive_facts_open_low: Map(), debug_unbuilt_seen: Map(), hash_by_bounds: false, static_head_insts: Map(), static_head_binders: Map(), impl_bound_calls: [], impl_bound_binds: Map(), deferred_uses: [], deferred_use_at: Map(), late_keys: [], late_roots: Map(), late_roots_valid: false, late_refused: Map(), late_open: [], late_replay: -1, late_watch: Map(), late_fixed_at: Map(), infer_at: -1, static_owners: Map(), trait_heads: Map(), closure_expected_at: Map(), ret_ann: -1, missing_else: Map(), walk_returns: [], written_names: Map(), under_fn_type: Map(), method_reads: Map(), method_read_order: [] }
+    CallFacts { open_calls: [], open_group: Map(), open_tids: [], reported: Map(), self_views: Map(), view_sigs: Map(), hash_aliases_above: [], derive_facts_above: [], derive_facts_low: 0, derive_facts_open: [], derive_facts_open_low: Map(), debug_unbuilt_seen: Map(), hash_by_bounds: false, static_head_insts: Map(), static_head_binders: Map(), impl_bound_calls: [], impl_bound_binds: Map(), deferred_uses: [], deferred_use_at: Map(), late_keys: [], late_roots: Map(), late_roots_valid: false, late_refused: Map(), late_open: [], late_replay: -1, late_watch: Map(), late_fixed_at: Map(), infer_at: -1, static_owners: Map(), trait_heads: Map(), closure_expected_at: Map(), ret_ann: -1, missing_else: Map(), walk_returns: [], written_names: Map(), under_fn_type: Map(), method_reads: Map(), method_read_order: [], inferred_hash_roles: Map(), open_ctor_owner: Map(), late_hash_binds: [] }
 }
 let mut tc_calls: CallFacts = new_call_facts()
 
@@ -4430,6 +4439,7 @@ fn tc_note_open_ctor_key(node: Int, ctor: Int) {
     if k != TyKind.Map && k != TyKind.Set { return }
     let g = tc_calls.open_group.get(node) ?? -1
     if g < 0 { tc_calls.open_calls.push(node) }
+    if tc_current_fn_node >= 0 { tc_calls.open_ctor_owner.insert(node, tc_current_fn_node) }
     tc_calls.open_group.insert(node, tc_calls.open_tids.len())
     tc_calls.open_tids.push(-1)
     tc_calls.open_tids.push(-1)
@@ -4448,11 +4458,13 @@ fn tc_flush_open_keys_of(call_node: Int, g: Int) ! Diag.Report {
         if ctor < 0 { return }
         let t = tc_resolve(ctor)
         let key = ty_pool.get(t).unwrap().inner1
-        tc_refuse_unhashable_tid(key, if type_kind(t) == TyKind.Map { HashRole.MapKey } else { HashRole.SetElement }, call_node)
+        let role = if type_kind(t) == TyKind.Map { HashRole.MapKey } else { HashRole.SetElement }
+        tc_refuse_unhashable_tid(key, role, call_node)
+        let owner = tc_calls.open_ctor_owner.get(call_node) ?? -1
+        if owner >= 0 { tc_oblige_key_tparams(owner, key, role, []) }
         return
     }
     let oblig = tc_fn_hash_obligations(sig)
-    if oblig.len() == 0 { return }
     let n = tc_calls.open_tids.get(g + 2).unwrap()
     let fs = fnsig_pool.get(sig).unwrap()
     let mut pi = 0
@@ -4460,8 +4472,13 @@ fn tc_flush_open_keys_of(call_node: Int, g: Int) ! Diag.Report {
         let role = tc_hash_oblig_mark(oblig, pi)
         let tid = tc_calls.open_tids.get(g + 3 + pi).unwrap()
         let was_open = tc_calls.open_tids.get(g + 3 + n + pi).unwrap()
-        if role != HashRole.Free && was_open % 2 != 0 && tc_tid_hash_fact(tid) == -1 {
-            tc_report_unhashable_bind(sig, fnsig_type_param_names.get(fs.type_params_start + pi).unwrap(), role, tid, call_node)
+        if was_open % 2 != 0 {
+            let name = fnsig_type_param_names.get(fs.type_params_start + pi).unwrap()
+            if role == HashRole.Free {
+                tc_calls.late_hash_binds.push(LateHashBind { sig: sig, name: name, bound: tid, node: call_node })
+            } else if tc_tid_hash_fact(tid) == -1 {
+                tc_report_unhashable_bind(sig, name, role, tid, call_node)
+            }
         }
         pi = pi + 1
     }
@@ -15307,7 +15324,13 @@ fn tc_hash_oblig_walk(ann: Int, key_role: HashRole, names: List[Str], roles: Lis
 fn tc_hash_roles_at_key(name: Str, key_role: HashRole, visiting: List[Int]) -> List[HashRole] {
     let none: List[HashRole] = []
     if name == "" || tc_hash_role_is_free(key_role) != 0 { return none }
-    let decl = tc_written_type_decl(name)
+    tc_hash_roles_at_decl(tc_written_type_decl(name), key_role, visiting)
+}
+
+// tc_hash_roles_at_key for a declaration in hand, as a resolved key type gives it.
+fn tc_hash_roles_at_decl(decl: Int, key_role: HashRole, visiting: List[Int]) -> List[HashRole] {
+    let none: List[HashRole] = []
+    if tc_hash_role_is_free(key_role) != 0 { return none }
     if decl < 0 || visiting.contains(decl) { return none }
     if node_value(decl) == -1 && tc_decl_derives(decl, "Hash") == 0 { return none }
     let tps = node_type_params(decl)
@@ -15599,7 +15622,6 @@ fn tc_nominal_hash_fact(tid: Int) -> Int {
 // and is provably not hashable. Only a -1 verdict reports.
 fn tc_check_hash_obligations_for_binds(sig: Int, binds: Map[Str, Int], node: Int) ! TypeCheck.Resolve, Diag.Report {
     let oblig = tc_fn_hash_obligations(sig)
-    if oblig.len() == 0 { return }
     let fs = fnsig_pool.get(sig).unwrap()
     let mut i = 0
     while i < fs.type_params_count {
@@ -15613,9 +15635,74 @@ fn tc_check_hash_obligations_for_binds(sig: Int, binds: Map[Str, Int], node: Int
             if bound != -1 && tc_tid_hash_fact(bound) == -1 {
                 tc_report_unhashable_bind(sig, name, role, bound, node)
             }
+        } else if role == HashRole.Free && idx < fnsig_type_param_names.len() && fs.decl >= 0 {
+            // The body may still key a Map or Set by this parameter through inference.
+            let name = fnsig_type_param_names.get(idx).unwrap()
+            let bound = binds.get(name) ?? -1
+            if bound != -1 { tc_calls.late_hash_binds.push(LateHashBind { sig: sig, name: name, bound: bound, node: node }) }
         }
         i = i + 1
     }
+}
+
+// The type parameters of `owner` that a solved key type puts in a keyed role, read by the
+// rule a written key is: a bare parameter, a tuple element, and an argument of a type whose
+// Hash needs it. `visiting` holds the tuples above this one, as in tc_refuse_unhashable_tid_in.
+fn tc_oblige_key_tparams(owner: Int, tid0: Int, role: HashRole, visiting: List[Int]) {
+    let tid = resolve_alias_tid(tc_resolve(tid0))
+    let k = type_kind(tid)
+    if k == TyKind.Typevar {
+        let name = type_to_str(tid)
+        let mut roles = tc_calls.inferred_hash_roles.get(owner) ?? Map()
+        if !roles.contains_key(name) {
+            roles.insert(name, role)
+            tc_calls.inferred_hash_roles.insert(owner, roles)
+        }
+        return
+    }
+    if k == TyKind.Tuple {
+        if tc_need_visited(visiting, tid) { return }
+        let inner = tc_need_visiting(visiting, tid)
+        let te = ty_pool.get(tid).unwrap()
+        let mut i = 0
+        while i < te.params_count {
+            tc_oblige_key_tparams(owner, ty_param_list.get(te.params_start + i).unwrap(), role, inner)
+            i = i + 1
+        }
+        return
+    }
+    if k != TyKind.Struct && k != TyKind.Enum { return }
+    let n = tc_tid_struct_arg_count(tid)
+    if n == 0 { return }
+    let base = if k == TyKind.Struct { tc_struct_base_tid(tid) } else { tc_enum_base_tid(tid) }
+    let roles = tc_hash_roles_at_decl(tc_tid_decl_node(base), role, [])
+    let te = ty_pool.get(tid).unwrap()
+    let mut i = 0
+    while i < n {
+        let arg_role = tc_hash_oblig_mark(roles, i)
+        if tc_hash_role_is_free(arg_role) == 0 { tc_oblige_key_tparams(owner, ty_param_list.get(te.params_start + i).unwrap(), arg_role, visiting) }
+        i = i + 1
+    }
+}
+
+// Judge again, once every body's inferred keys are known, the calls at a parameter no written
+// key obliged. A bind is judged here at its final type.
+fn tc_flush_late_hash_binds() ! Diag.Report {
+    let mut seen: Map[Str, Int] = Map()
+    for b in tc_calls.late_hash_binds {
+        let decl = fnsig_pool.get(b.sig).unwrap().decl
+        if b.bound >= 0 && tc_calls.inferred_hash_roles.contains_key(decl) {
+            let role = tc_calls.inferred_hash_roles.get(decl).unwrap().get(b.name) ?? HashRole.Free
+            if role != HashRole.Free && tc_tid_hash_fact(b.bound) == -1 {
+                let at = "{b.node}:{b.name}"
+                if !seen.contains_key(at) {
+                    seen.insert(at, 1)
+                    tc_report_unhashable_bind(b.sig, b.name, role, b.bound, b.node)
+                }
+            }
+        }
+    }
+    tc_calls.late_hash_binds = []
 }
 
 fn tc_report_unhashable_bind(sig: Int, name: Str, role: HashRole, bound: Int, node: Int) ! Diag.Report {
@@ -45207,6 +45294,9 @@ fn tc_flush_program_deferrals(program: Bool) ! TypeCheck.Resolve, TypeCheck.Repo
     tc_ud_flush_open_values()
     tc_drop_open_calls()
     tc_flush_untyped_type_args()
+    // Last, since the flushes above walk calls (a fn value, a deferred use) that add binds.
+    // A field default flushes after the program, when every body's inferred key is known.
+    tc_flush_late_hash_binds()
 }
 
 // ── Debug / introspection ───────────────────────────────────────────

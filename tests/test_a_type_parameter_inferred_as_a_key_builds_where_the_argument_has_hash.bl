@@ -1,0 +1,62 @@
+// A generic body that leaves its Map key or Set element to inference, so that a type parameter
+// reaches the key through an insert or a lookup, builds and runs at each call whose argument has
+// Hash: a scalar, a tuple, a @derive(Hash, Eq) type, and any type through a `T: Hash` bound.
+// The check that refuses such a call where the argument lacks Hash (§3.6 "Non-hashable keys and
+// elements in general") must not refuse these. The program prints the same text in the one-unit
+// and the per-module build.
+
+import std.fs
+import std.process.{ProcessResult}
+import compile_test_helpers.{scratch_root}
+
+let program_src = [
+    "@derive(Hash, Eq)",
+    "type Pt \{ x: Int }",
+    "fn count[T](it: T) -> Int \{",
+    "    let mut m = Map()",
+    "    m.insert(it, 1)",
+    "    m.insert(it, 2)",
+    "    m.len() * 10 + (m.get(it) ?? 0)",
+    "}",
+    "fn members[T](a: T, b: T) -> Int \{",
+    "    let mut s = Set.new()",
+    "    s.insert(a)",
+    "    s.insert(b)",
+    "    if s.contains(a) \{ s.len() } else \{ 0 }",
+    "}",
+    "fn bounded[T: Hash](it: T) -> Int \{",
+    "    let mut m = Map()",
+    "    m.insert((it, 0), \"v\")",
+    "    m.len()",
+    "}",
+    "fn values_only[T](it: T) -> Int \{",
+    "    let mut m = Map()",
+    "    m.insert(1, it)",
+    "    m.len()",
+    "}",
+    "fn main() \{",
+    "    io.println(\"\{count(3)} \{count(\"a\")} \{count(Pt \{ x: 1 })} \{count((1, 'c'))}\")",
+    "    io.println(\"\{members(1, 2)} \{members(Pt \{ x: 1 }, Pt \{ x: 1 })}\")",
+    "    io.println(\"\{bounded(Pt \{ x: 2 })} \{bounded(true)}\")",
+    "    io.println(\"\{values_only([1.5])}\")",
+    "}",
+    "",
+].join("\n")
+
+fn sh(cmd: Str) -> ProcessResult ! Process.Spawn {
+    process.run("sh", ["-c", cmd]).unwrap()
+}
+
+test "an inferred key over a type parameter builds and runs at Hash arguments in each build" {
+    let root = "{scratch_root()}/tparam_inferred_key_{getpid()}"
+    let _ = sh("rm -rf {root} && mkdir -p {root}")
+    fs.write("{root}/main.bl", program_src).unwrap()
+    let blink = sh("readlink -f build/blink").out.trim()
+    let mut failed: List[Str] = []
+    for mode in ["--no-per-module", "--per-module"] {
+        let r = sh("cd {root} && env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE timeout 300 {blink} run {mode} main.bl < /dev/null 2>&1")
+        if !r.success() || r.out != "12 12 12 12\n2 1\n1 1\n1\n" { failed.push("blink run {mode}: {r.end}\n{r.out}") }
+    }
+    let _ = sh("rm -rf {root}")
+    assert_eq(failed, [])
+}
