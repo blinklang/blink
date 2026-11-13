@@ -3604,6 +3604,17 @@ type CallFacts {
     // literal (§3b.5).
     tpl_ctx: List[Int]
     tpl_lit: List[Int]
+    // The calls whose own inference reported an error. Only that error, not one that sits on
+    // the same lines, may stand for a binder the call left open.
+    errored: Map[Int, Int]
+    // The values typed in place of one an earlier pass reported, such as a call to an
+    // undefined function. Each is an error of the walk that reads it, though the walk adds
+    // no report.
+    answers_after_report: Int
+    // The metavariable roots a call's own error left open. A binder that holds one has that
+    // error as its report. This is apart from tc_ud_blamed: an E0301 marks its roots there
+    // too, and a second binder on a root an E0301 named keeps its own report.
+    lost_to_error: Map[Int, Int]
 }
 // The impl a call reached, its binder tids in header order, the type `Self` reads as (a method
 // call's receiver, a conversion's target), and the fn whose body made the call.
@@ -3649,9 +3660,19 @@ type UseJudge {
 }
 
 fn new_call_facts() -> CallFacts {
-    CallFacts { open_calls: [], open_group: Map(), open_tids: [], reported: Map(), self_views: Map(), view_sigs: Map(), hash_aliases_above: [], derive_facts_above: [], derive_facts_low: 0, derive_facts_open: [], derive_facts_open_low: Map(), debug_unbuilt_seen: Map(), hash_by_bounds: false, static_head_insts: Map(), static_head_binders: Map(), impl_bound_calls: [], impl_bound_binds: Map(), deferred_uses: [], deferred_use_at: Map(), late_keys: [], late_roots: Map(), late_roots_valid: false, late_refused: Map(), late_open: [], late_replay: -1, late_watch: Map(), late_fixed_at: Map(), infer_at: -1, static_owners: Map(), trait_heads: Map(), closure_expected_at: Map(), ret_ann: -1, missing_else: Map(), walk_returns: [], written_names: Map(), under_fn_type: Map(), method_reads: Map(), method_read_order: [], inferred_hash_roles: Map(), impl_binder_roles_read: Map(), open_ctor_owner: Map(), late_hash_binds: [], tpl_ctx: [], tpl_lit: [] }
+    CallFacts { open_calls: [], open_group: Map(), open_tids: [], reported: Map(), self_views: Map(), view_sigs: Map(), hash_aliases_above: [], derive_facts_above: [], derive_facts_low: 0, derive_facts_open: [], derive_facts_open_low: Map(), debug_unbuilt_seen: Map(), hash_by_bounds: false, static_head_insts: Map(), static_head_binders: Map(), impl_bound_calls: [], impl_bound_binds: Map(), deferred_uses: [], deferred_use_at: Map(), late_keys: [], late_roots: Map(), late_roots_valid: false, late_refused: Map(), late_open: [], late_replay: -1, late_watch: Map(), late_fixed_at: Map(), infer_at: -1, static_owners: Map(), trait_heads: Map(), closure_expected_at: Map(), ret_ann: -1, missing_else: Map(), walk_returns: [], written_names: Map(), under_fn_type: Map(), method_reads: Map(), method_read_order: [], inferred_hash_roles: Map(), impl_binder_roles_read: Map(), open_ctor_owner: Map(), late_hash_binds: [], tpl_ctx: [], tpl_lit: [], errored: Map(), answers_after_report: 0, lost_to_error: Map() }
 }
 let mut tc_calls: CallFacts = new_call_facts()
+
+// A mark of the reports so far, for tc_reported_since.
+fn tc_report_mark() -> (Int, Int) {
+    (diag_entry_count(), tc_calls.answers_after_report)
+}
+
+fn tc_reported_since(mark: (Int, Int)) -> Bool {
+    let (entries, answers) = mark
+    diag_any_errors_since(entries) > 0 || tc_calls.answers_after_report > answers
+}
 
 // Every unbound metavar reachable from `tid`, by pool id. Structural walk in lockstep
 // with tc_tid_has_unbound_metavar — that one answers WHETHER a tid is open, this one
@@ -3722,6 +3743,39 @@ fn tc_ud_template_lit_of(tid: Int) -> Option[Int] {
     None
 }
 
+// An error inside a generic call (an argument, the argument count, a label, a closure body)
+// is that call's report, and a binder the error left open is its consequence.
+// `walk_before` is the report count before the walk of the call's closure bodies.
+fn tc_ud_blame_call_after_error(call: Int, walk_before: (Int, Int)) {
+    if tc_boundary_check_active == 0 || call < 0 { return }
+    let g = tc_calls.open_group.get(call) ?? -1
+    if g < 0 || tc_calls.open_tids.get(g).unwrap() < 0 { return }
+    if !tc_calls.errored.contains_key(call) && !tc_reported_since(walk_before) { return }
+    let n = tc_calls.open_tids.get(g + 2).unwrap()
+    for pi in 0..n {
+        let tid = tc_calls.open_tids.get(g + 3 + pi).unwrap()
+        if tid >= 0 && tc_tid_has_unbound_metavar(tid) != 0 && !tc_ud_held_before(call, tid) {
+            tc_ud_mark_blamed(tid)
+            for root in tc_ud_metavar_roots(tid) { tc_calls.lost_to_error.insert(root, 1) }
+        }
+    }
+}
+
+// Whether a binding declared before `call` holds one of `tid`'s metavariables. That binding
+// was left open by its own source, not by the call's error, so it keeps its own report. The
+// parser numbers a node after its children, so a `let` that holds the call's result is
+// numbered after the call.
+fn tc_ud_held_before(call: Int, tid: Int) -> Bool {
+    let roots = tc_ud_metavar_roots(tid)
+    let mut i = 0
+    while i < nr_scope_types.len() {
+        let nd = nr_scope_nodes.get(i).unwrap()
+        if nd >= 0 && nd < call && tc_ud_shares_root(roots, nr_scope_types.get(i).unwrap()) { return true }
+        i = i + 1
+    }
+    false
+}
+
 fn tc_ud_already_blamed(tid: Int) -> Int {
     let roots = tc_ud_metavar_roots(tid)
     let mut i = 0
@@ -3751,6 +3805,7 @@ fn tc_ud_already_blamed(tid: Int) -> Int {
 fn tc_ud_judge_binder(vname: Str, tid: Int, decl_node: Int) ! Diag.Report {
     if decl_node == -1 { return }
     if vname == "self" { return }
+    for root in tc_ud_metavar_roots(tid) { if tc_calls.lost_to_error.contains_key(root) { return } }
     if node_kind(decl_node) == NodeKind.LetBinding && !tc_ud_conversion_may_settle(tid) && !tc_ud_param_may_settle(tid) && !tc_ud_late_call_may_settle(tid) {
         tc_report_under_determined(vname, tid, decl_node)
         return
@@ -35264,7 +35319,11 @@ pub fn infer_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.
     let earlier = tc_empty_ctor_stamp(node)
     let incoming = tc_if_value_ctx
     tc_if_value_ctx = 1
+    let infer_before = tc_report_mark()
     let tid = infer_type_uncached(node, incoming)
+    if node >= 0 && tc_reported_since(infer_before) && (node_kind(node) == NodeKind.Call || node_kind(node) == NodeKind.MethodCall) {
+        tc_calls.errored.insert(node, 1)
+    }
     if earlier != -1 && tc_tid_is_no_info(tid) == 0 { let _ = tc_unify(tid, earlier) }
     tc_if_value_ctx = incoming
     tc_infer_unclaimed_args(node)
@@ -35911,6 +35970,12 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                     }
                 }
             }
+        }
+        // A call to an undefined function has its report, and the value it stands for has no
+        // type to name; an absence here would build `List[<?>]` around it and a second error.
+        if diag_has_error_at(UNDEFINED_FUNCTION, node, node_col(node)) {
+            tc_calls.answers_after_report = tc_calls.answers_after_report + 1
+            return tc_error_recovery_tid()
         }
         // Nothing above claimed this node, so nothing has typed it — an absence.
         return -1
@@ -43959,6 +44024,7 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
         // reports two or three times. tc_check_body walks each node once, with the nr scope
         // frames live, which is the pair of facts the check needs.
         tc_check_mutating_method(node, recv, obj_t)
+        let walk_before = tc_report_mark()
         let args_sl = tc_mc_call_args(node)
         // The argument the List-HOF path walks itself, so the generic walk below does not
         // report its contents a second time.
@@ -44021,6 +44087,7 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
         // List, so its body still needs walking below.
         tc_check_callable_arg_bodies(args_sl, hof_arg)
         tc_check_mutating_in_args(args_sl)
+        tc_ud_blame_call_after_error(node, walk_before)
         return
     }
 
@@ -44037,8 +44104,10 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
         if cb_callee != -1 && node_kind(cb_callee) == NodeKind.Closure {
             tc_check_body(cb_callee)
         }
+        let walk_before = tc_report_mark()
         tc_check_callable_arg_bodies(node_args(node), -1)
         tc_check_mutating_in_args(node_args(node))
+        tc_ud_blame_call_after_error(node, walk_before)
         return
     }
 

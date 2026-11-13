@@ -1,0 +1,126 @@
+// A call whose argument already has an error reports only that error. A type parameter the bad
+// argument would have bound is left open by the error, not by the program, so it gets no second
+// report as under-determined (E0301), at the call or at the binding that holds its result.
+import std.fs
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_reset}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+
+fn check_src(path: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    init_embedded_stdlib()
+    fs.write(path, src).unwrap()
+    diag_reset()
+    let _program = compile_to_program(path, 1)
+    check_types(_program)
+    let _ = fs.delete(path)
+}
+
+fn errors() -> Str {
+    let mut out = ""
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" {
+            if out != "" { out = out.concat(", ") }
+            out = out.concat("{d.code} {d.line}:{d.col}")
+        }
+    }
+    out
+}
+
+fn with_main(decls: Str, body: Str) -> Str {
+    "{decls}\nfn main() \{\n{body}\n}\n"
+}
+
+test "an argument of the wrong type is the only report" {
+    check_src("build/tc_arg_error_wrong_type.bl", with_main("fn hd[T](xs: List[T]) -> Int \{ xs.len() }", "    let r = hd(5)\n    io.println(\"\{r}\")"))
+    assert_eq(errors(), "E0300 3:16")
+}
+
+test "a missing argument is the only report" {
+    check_src("build/tc_arg_error_arity.bl", with_main("fn two[T, U](x: T, y: U) -> Int \{ 1 }", "    let r = two(1)\n    io.println(\"\{r}\")"))
+    assert_eq(errors(), "E0300 3:13")
+}
+
+test "a missing keyword argument is the only report" {
+    check_src("build/tc_arg_error_missing_kw.bl", with_main("fn kw[U](x: Int, -- m: List[U]) -> List[U] \{ m }", "    let a = kw(1)\n    io.println(\"\{a.len()}\")"))
+    assert_eq(errors(), "E0510 3:13")
+}
+
+test "a label on a positional parameter is the only report" {
+    check_src("build/tc_arg_error_bad_label.bl", with_main("fn ap[T, U](x: T, f: fn(T) -> U) -> U \{ f(x) }", "    let r = ap(f: fn(v) \{ v + 1 }, x: 2)\n    io.println(\"\{r}\")"))
+    assert_eq(errors(), "E0511 3:16")
+}
+
+test "an error in a closure body is the only report" {
+    check_src("build/tc_arg_error_closure_body.bl", with_main("fn mk[U](f: fn() -> List[U]) -> List[U] \{ f() }", "    let r = mk(fn() \{ [1.nope()] })\n    io.println(\"\{r.len()}\")"))
+    assert_eq(errors(), "E0505 3:24")
+}
+
+test "an unknown function in a closure body is the only report" {
+    check_src("build/tc_arg_error_closure_unknown_fn.bl", with_main("fn mk[U](f: fn() -> List[U]) -> List[U] \{ f() }", "    let r = mk(fn() \{ [undefined_thing()] })\n    io.println(\"\{r.len()}\")"))
+    assert_eq(errors(), "E0504 3:24")
+}
+
+test "a closure where a value is wanted is the only report" {
+    check_src("build/tc_arg_error_not_a_closure.bl", with_main("fn fm[T, U](xs: List[T], f: fn(T) -> List[U]) -> List[U] \{ f(xs.get(0).unwrap()) }", "    let r = fm([1], 7)\n    io.println(\"\{r.len()}\")"))
+    assert_eq(errors(), "E0300 3:21")
+}
+
+test "an error in a closure body that returns an Option is the only report" {
+    check_src("build/tc_arg_error_closure_option.bl", with_main("fn wo[T, U](x: T, f: fn(T) -> Option[U]) -> Option[U] \{ f(x) }", "    let r = wo(1, fn(v) \{ Some(v.nope()) })\n    io.println(\"\{r.is_some()}\")"))
+    assert_eq(errors(), "E0505 3:32")
+}
+
+test "an argument of the wrong type to a method is the only report" {
+    check_src("build/tc_arg_error_method.bl", with_main("type Bx \{ v: Int }\ntrait Ml \{ fn mapl[U](self, f: fn(Int) -> List[U]) -> List[U] }\nimpl Ml for Bx \{ fn mapl[U](self, f: fn(Int) -> List[U]) -> List[U] \{ f(self.v) } }", "    let b = Bx \{ v: 1 }\n    let e = b.mapl(5)\n    io.println(\"\{e.len()}\")"))
+    assert_eq(errors(), "E0300 6:20")
+}
+
+test "an unknown function in a list a fn returns is the only report" {
+    check_src("build/tc_arg_error_unknown_fn_list.bl", with_main("fn f() -> List[Int] \{ [undefined_thing()] }", "    io.println(\"\{f().len()}\")"))
+    assert_eq(errors(), "E0504 1:24")
+}
+
+test "an unknown function in a variant a fn returns is the only report" {
+    check_src("build/tc_arg_error_unknown_fn_some.bl", with_main("fn g() -> Option[Int] \{ Some(undefined_thing()) }", "    io.println(\"\{g().is_some()}\")"))
+    assert_eq(errors(), "E0504 1:30")
+}
+
+test "a missing keyword argument of a generic method is the only report" {
+    let decls = "trait Mk \{ fn mk[U](self, x: Int, -- m: List[U]) -> List[U] }\ntype Bx \{ v: Int }\nimpl Mk for Bx \{ fn mk[U](self, x: Int, -- m: List[U]) -> List[U] \{ m } }"
+    check_src("build/tc_arg_error_method_missing_kw.bl", with_main(decls, "    let b = Bx \{ v: 1 }\n    let a = b.mk(1)\n    io.println(\"\{a.len()}\")"))
+    assert_eq(errors(), "E0510 6:13")
+}
+
+test "an error beside a call on its line does not hide the call's own open binder" {
+    check_src("build/tc_arg_error_beside_call.bl", with_main("fn mk[T]() -> List[T] \{ [] }", "    let p = (mk(), 1 + \"s\")\n    io.println(\"\{p.1}\")"))
+    assert_eq(errors().contains("E0301 3:5"), true)
+}
+
+test "a valid generic call has no report" {
+    check_src("build/tc_arg_error_valid_call.bl", with_main("fn hd[T](xs: List[T]) -> Int \{ xs.len() }", "    let r = hd([1, 2])\n    io.println(\"\{r}\")"))
+    assert_eq(errors(), "")
+}
+
+test "an argument error in a call over several lines is the only report" {
+    check_src("build/tc_arg_error_multiline_arg.bl", with_main("fn hd[T](xs: List[T]) -> List[T] \{ xs }", "    let r = hd(\n        5)\n    io.println(\"\{r.len()}\")"))
+    assert_eq(errors(), "E0300 4:9")
+}
+
+test "an error in a closure body over several lines is the only report" {
+    check_src("build/tc_arg_error_multiline_closure.bl", with_main("fn mk[U](f: fn() -> List[U]) -> List[U] \{ f() }", "    let r = mk(fn() \{\n        [1.nope()]\n    })\n    io.println(\"\{r.len()}\")"))
+    assert_eq(errors(), "E0505 4:10")
+}
+
+test "a binding left open before a call with an error keeps its own report" {
+    let decls = "fn mk[T]() -> List[T] \{ [] }\nfn hd[T](xs: List[T]) -> Int \{ 1 }"
+    check_src("build/tc_arg_error_open_before_call.bl", with_main(decls, "    let a = mk()\n    let n = hd(a, 5)\n    io.println(\"\{n}\")"))
+    assert_eq(errors().contains("E0301 4:5"), true)
+    assert_eq(errors().contains("E0301 5:5"), false)
+}
+
+test "a call with an error leaves its own open binder with no second report" {
+    check_src("build/tc_arg_error_blames_own_binder.bl", with_main("fn hd[T](xs: List[T]) -> List[T] \{ xs }", "    let r = hd(5)\n    io.println(\"\{r.len()}\")"))
+    assert_eq(errors().contains("E0300 3:16"), true)
+    assert_eq(errors().contains("E0301"), false)
+}
