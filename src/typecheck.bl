@@ -21173,6 +21173,7 @@ fn tc_flush_unresolved_methods(type_qualified: Bool) ! Diag.Report {
 // (§3.4 *An unknown member of a type path*), read in the module and under the `Self` where the
 // call is written.
 fn tc_report_unknown_type_qualified_call(n: Int, method: Str) ! Diag.Report {
+    if tc_report_reserved_head(node_obj(n)) { return }
     let written = node_name(node_obj(n))
     let site_module = tc_method_calls.type_qualified_module.get(n) ?? tc_site_module(n)
     let site_self = tc_method_calls.type_qualified.get(n) ?? -1
@@ -30483,6 +30484,17 @@ fn tc_report_reserved_unbuilt(name: Str, at: Int) -> Int ! Diag.Report {
     1
 }
 
+// A reserved type name as the head of `Q.m` or `Q.m(..)` is the same error as in a type
+// position: the type has no members while it is not built. A value, a type parameter or an
+// import alias of that name is not the type.
+fn tc_report_reserved_head(head: Int) -> Bool ! Diag.Report {
+    let name = node_name(head)
+    if nr_receiver_has_binding(name) != 0 || tc_name_is_tparam_in_scope(name) != 0 { return false }
+    if tc_site_qualifier_module(name, head) != "" { return false }
+    if diag_has_error_at(UNKNOWN_TYPE, head, node_col(head)) { return true }
+    tc_report_reserved_unbuilt(name, head) != 0
+}
+
 fn is_bytes_growth_method(name: Str) -> Int {
     if name == "push" { return 1 }
     if name == "append" { return 1 }
@@ -37437,6 +37449,14 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
             }
             let static_head = if nr_receiver_has_binding(obj_written) != 0 { StaticHead { owner: obj_written, alias: -1, decl: -1, builtin: false, inst: -1 } } else { tc_static_head(obj_written) }
             let obj_name = static_head.owner
+            if tc_report_reserved_head(obj_node) {
+                // The type has no members, so its type arguments name nothing to check.
+                tc_type_args_unresolved.insert(node, 1)
+                if args_sl != -1 {
+                    for a in 0..sublist_length(args_sl) { infer_type(sublist_get(args_sl, a)) }
+                }
+                return tc_error_recovery_tid()
+            }
             if nr_receiver_has_binding(obj_written) == 0 { tc_calls.static_owners.insert(node, obj_name) }
             if obj_name == "Char" {
                 if method == "from_code_point" {
@@ -37942,6 +37962,7 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                 return tc_carrier_nullary_tid(fname, "{obj_name}.{fname}", node)
             }
             if head_is_type {
+                if tc_report_reserved_head(obj_node) { return tc_error_recovery_tid() }
                 if tc_report_bad_variant_value(node, obj_name, fname, 0) { return tc_error_recovery_tid() }
                 match tc_report_method_read_through_type_name(node, obj_name, fname) {
                     Some(t) => return t
@@ -47361,7 +47382,7 @@ fn tc_unclaimed_call_modules(calls: List[Int], order: List[Int], mods: List[Str]
 // exist yet: an internal error, reported here so a clean check still promises the build
 // (section 6.7). One report, at the first call: a call that reads another's result fails
 // for the same reason.
-fn tc_report_unclaimed_left(calls: List[Int]) ! Diag.Report {
+pub fn tc_report_unclaimed_left(calls: List[Int]) ! Diag.Report {
     let mut faulted = false
     for uc in calls {
         let obj = node_obj(uc)

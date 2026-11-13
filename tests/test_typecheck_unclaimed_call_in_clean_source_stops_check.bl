@@ -4,8 +4,10 @@
 // the report is an internal error and not an error in the program.
 import std.fs
 import compiler.{compile_to_program}
-import typecheck.{check_types, tc_unresolved_call_count}
+import typecheck.{check_types, tc_report_unclaimed_left}
 import diagnostics.{diag_count, diag_entries, diag_ice_count, diag_reset, lint_set_override}
+import parser.{node_count, node_kind, node_method}
+import ast.{NodeKind}
 import embedded_stdlib_registry.{init_embedded_stdlib}
 
 fn check_src(path: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
@@ -48,28 +50,46 @@ fn assert_starts(got: List[Str], want: List[Str]) {
     }
 }
 
-// F32.from_bits is in the spec (section 3.2) and inference has no rule for it yet, so it
-// stands for any call the spec allows and the compiler cannot type.
-test "F32.from_bits with no rule to type it is internal error I0023 at check" {
-    let mut s = "fn main() \{\n"
-    s = s.concat("    let f = F32.from_bits(1)\n")
-    s = s.concat("    io.println(\"\{f}\")\n")
-    s = s.concat("}\n")
-    check_src("build/tc_unclaimed_spec_valid.bl", s)
-    assert(tc_unresolved_call_count() > 0)
-    assert_eq(diag_count, 0)
-    assert_eq(codes("ice"), ["I0023"])
-    assert_starts(sites("ice"), ["2:13 no rule of inference answered the call `from_bits`"])
+// The method calls named `method`, in node order.
+fn calls_named(method: Str) -> List[Int] {
+    let mut out: List[Int] = []
+    for n in 0..node_count() {
+        if node_kind(n) == NodeKind.MethodCall && node_method(n) == method { out.push(n) }
+    }
+    out
 }
 
-test "Sized.len of an unanswered F32.from_bits is one I0023, not one per call" {
-    let mut s = "fn main() \{\n"
-    s = s.concat("    let n = Sized.len(F32.from_bits(1))\n")
-    s = s.concat("    io.println(\"\{n}\")\n")
+fn valid_two_calls() -> Str {
+    let mut s = "type P \{ n: Int }\n"
+    s = s.concat("trait Gp \{\n    fn get(self) -> Int\n    fn put(self, k: Int) -> Int\n}\n")
+    s = s.concat("impl Gp for P \{\n    fn get(self) -> Int \{ self.n }\n    fn put(self, k: Int) -> Int \{ self.n + k }\n}\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let p = P \{ n: 1 }\n")
+    s = s.concat("    let v = p.put(p.get())\n")
+    s = s.concat("    io.println(\"\{v}\")\n")
     s = s.concat("}\n")
-    check_src("build/tc_unclaimed_nested.bl", s)
+    s
+}
+
+// Every call the spec gives a meaning has a rule of inference now, so no source reaches the
+// reporter for a call no rule answered. These rows hand it calls of a checked program, as the
+// stamp pass would hand it a call that no rule typed.
+test "a call no rule of inference answered is internal error I0023 at the call" {
+    check_src("build/tc_unclaimed_unit_one.bl", valid_two_calls())
+    assert_eq(diag_count, 0)
+    tc_report_unclaimed_left(calls_named("get"))
+    assert_eq(codes("ice"), ["I0023"])
+    assert_starts(sites("ice"), ["12:19 no rule of inference answered the call `get`"])
+}
+
+test "two unanswered calls, one inside the other, are one I0023 at the first" {
+    check_src("build/tc_unclaimed_unit_nested.bl", valid_two_calls())
+    let mut calls = calls_named("get")
+    for c in calls_named("put") { calls.push(c) }
+    tc_report_unclaimed_left(calls)
     assert_eq(diag_count, 0)
     assert_eq(codes("ice"), ["I0023"])
+    assert_starts(sites("ice"), ["12:19 no rule of inference answered the call `get`"])
 }
 
 test "Sized.len() with no argument is E0505 at check: it has no receiver" {
@@ -108,11 +128,13 @@ test "UnresolvedMethod set to warn under [lints] stays E0505 on a missing method
     assert_eq(diag_ice_count, 0)
 }
 
-test "UnresolvedMethod set to off under [lints] does not give a clean check on F32.from_bits" {
-    let mut s = "fn main() \{\n"
-    s = s.concat("    let f = F32.from_bits(1)\n")
-    s = s.concat("    io.println(\"\{f}\")\n")
+test "UnresolvedMethod set to off under [lints] stays E0505 on a missing static" {
+    let mut s = "type P \{ n: Int }\n"
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let v = P.nope(1)\n")
+    s = s.concat("    io.println(\"\{v}\")\n")
     s = s.concat("}\n")
     check_src_lint("build/tc_unclaimed_lint_off.bl", s, "UnresolvedMethod", "off")
-    assert_eq(codes("ice"), ["I0023"])
+    assert_eq(codes("error"), ["E0505"])
+    assert_eq(diag_ice_count, 0)
 }

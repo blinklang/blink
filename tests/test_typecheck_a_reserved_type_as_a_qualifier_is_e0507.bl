@@ -1,0 +1,92 @@
+// `F32` and `F64` are reserved type names the compiler does not build yet. As the qualifier of a
+// static call or of a member read they get the same E0507 as in a type position, at the
+// qualifier, and no other report.
+import std.fs
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_reset}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+
+fn check_src(path: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    init_embedded_stdlib()
+    fs.write(path, src).unwrap()
+    diag_reset()
+    let _program = compile_to_program(path, 1)
+    check_types(_program)
+    let _ = fs.delete(path)
+}
+
+fn reports() -> Str {
+    let mut out = ""
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" {
+            if out != "" { out = out.concat(", ") }
+            out = out.concat("{d.code} {d.line}:{d.col} {d.message}")
+        }
+    }
+    out
+}
+
+fn with_main(decls: Str, body: Str) -> Str {
+    "{decls}\nfn main() \{\n{body}\n}\n"
+}
+
+test "a static call on F32 is E0507 at the qualifier" {
+    check_src("build/tc_reserved_qual_f32_call.bl", with_main("", "    let f = F32.from_bits(1)\n    io.println(\"\{f}\")"))
+    assert_eq(reports(), "E0507 3:13 type `F32` is reserved but not yet supported")
+}
+
+test "a static call on F64 is E0507 at the qualifier" {
+    check_src("build/tc_reserved_qual_f64_call.bl", with_main("", "    let f = F64.parse(\"1\")\n    io.println(\"\{f}\")"))
+    assert_eq(reports(), "E0507 3:13 type `F64` is reserved but not yet supported")
+}
+
+test "a static read on F32 with no call is E0507 at the qualifier" {
+    check_src("build/tc_reserved_qual_f32_read.bl", with_main("", "    let f = F32.from_bits\n    io.println(\"\{f(1)}\")"))
+    assert_eq(reports(), "E0507 3:13 type `F32` is reserved but not yet supported")
+}
+
+test "a constant read on F32 is E0507 at the qualifier" {
+    check_src("build/tc_reserved_qual_f32_const.bl", with_main("", "    let f = F32.MAX\n    io.println(\"\{f}\")"))
+    assert_eq(reports(), "E0507 3:13 type `F32` is reserved but not yet supported")
+}
+
+test "a static call on F32 as an argument is one E0507" {
+    check_src("build/tc_reserved_qual_f32_arg.bl", with_main("fn take(x: Int) -> Int \{ x }", "    io.println(\"\{take(F32.from_bits(1))}\")"))
+    assert_eq(reports(), "E0507 3:23 type `F32` is reserved but not yet supported")
+}
+
+test "a trait-qualified call on an F32 static is one E0507" {
+    check_src("build/tc_reserved_qual_f32_sized.bl", with_main("", "    let n = Sized.len(F32.from_bits(1))\n    io.println(\"\{n}\")"))
+    assert_eq(reports(), "E0507 3:23 type `F32` is reserved but not yet supported")
+}
+
+test "a method on the result of an F32 static is one E0507" {
+    check_src("build/tc_reserved_qual_f32_chain.bl", with_main("", "    let b = F32.from_bits(1).to_bits()\n    io.println(\"\{b}\")"))
+    assert_eq(reports(), "E0507 3:13 type `F32` is reserved but not yet supported")
+}
+
+test "a value named F32 is not the reserved type" {
+    check_src("build/tc_reserved_qual_value.bl", with_main("type P \{ n: Int }\ntrait Gt \{\n    fn get(self) -> Int\n}\nimpl Gt for P \{ fn get(self) -> Int \{ self.n } }", "    let F32 = P \{ n: 3 }\n    io.println(\"\{F32.get()}\")"))
+    assert_eq(reports(), "")
+}
+
+test "type arguments on a static call on F32 are not a second report" {
+    check_src("build/tc_reserved_qual_targs.bl", with_main("", "    let f = F32.from_bits[Int](1)\n    io.println(\"\{f}\")"))
+    assert_eq(reports(), "E0507 3:13 type `F32` is reserved but not yet supported")
+}
+
+test "F32 and F64 in one call are one E0507 at each qualifier" {
+    check_src("build/tc_reserved_qual_two_heads.bl", with_main("", "    let f = F32.from_bits(F64.to_bits(1))\n    io.println(\"\{f}\")"))
+    assert_eq(reports(), "E0507 3:13 type `F32` is reserved but not yet supported, E0507 3:27 type `F64` is reserved but not yet supported")
+}
+
+test "a parameter named F32 is not the reserved type" {
+    check_src("build/tc_reserved_qual_param.bl", "fn g(F32: Int) -> Int \{ F32.abs() }\nfn main() \{\n    io.println(\"\{g(1)}\")\n}\n")
+    assert_eq(reports(), "")
+}
+
+test "an import alias named F32 is not the reserved type" {
+    check_src("build/tc_reserved_qual_alias.bl", with_main("import std.num as F32", "    let a = F32.parse_int(\"1\")\n    let f = F32.int_to_str\n    io.println(\"\{a}\{f(2)}\")"))
+    assert_eq(reports(), "")
+}
