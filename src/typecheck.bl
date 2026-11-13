@@ -3342,6 +3342,14 @@ fn tc_hint_slot_named(tid: Int, named: Map[Int, Str], placeholder: Str) -> Str {
     shown
 }
 
+// Whether a qualifier spelled like a sealed trait names a user type or trait instead. That
+// declaration is what the call reaches; E0907 reports a trait that takes the sealed name.
+fn tc_qualifier_is_user_decl(name: Str) -> Bool {
+    let d = nr_resolve_bare_decl(name, nr_current_module)
+    if d < 0 || tc_decl_in_std(d) { return false }
+    node_kind(d) == NodeKind.TypeDef || node_kind(d) == NodeKind.TraitDef
+}
+
 // The arguments after the receiver of a sealed ops trait's qualified call `StrOps.len(s)`,
 // or -1 when the call is not one. A local that shadows the trait's name makes the call an
 // instance call on that value (§3c.4), and a call with no argument has no receiver to take.
@@ -3352,6 +3360,7 @@ fn tc_sealed_ops_qualified_args(node: Int, obj_node: Int) -> Int {
     if obj_node == -1 || node_kind(obj_node) != NodeKind.Ident { return -1 }
     if is_sealed_builtin_trait(node_name(obj_node)) == 0 { return -1 }
     if tc_mc_obj_is_value(node) != 0 { return -1 }
+    if tc_qualifier_is_user_decl(node_name(obj_node)) { return -1 }
     if node >= tc_sealed_ops_call_marks.len() { return -1 }
     let args = node_args(node)
     if args == -1 || sublist_length(args) == 0 { return -1 }
@@ -7256,6 +7265,29 @@ fn tc_surface_row(trait_name: Str, tr: Int) -> SurfaceRow {
         "Joinable" => SurfaceRow { kinds: [TyKind.List], shown: "List[Str]", args: SurfaceArgs.NoArgs, elem_str: true, list_elem_eq: false }
         _ => none
     }
+}
+
+// Whether the sealed trait's qualified call `trait_name.method(recv, ..)` is refused, and
+// reported: a type parameter must be bound by the trait, and another receiver must be of a type
+// of the trait's §3.2.2 row, as for the qualified call of any trait (§3c.4). An element the row
+// refuses (`Joinable.join` on a `List[Int]`) gets the instance call's report.
+fn tc_sealed_qualified_call_refused(node: Int, trait_name: Str, method: Str, recv: Int) -> Bool ! TypeCheck.Resolve, Diag.Report {
+    let row = tc_surface_row(trait_name, tc_trait_node_idx.get(trait_name) ?? -1)
+    if row.kinds.len() == 0 { return false }
+    let t = resolve_alias_tid(tc_resolve(recv))
+    if type_kind(t) == TyKind.Typevar {
+        // A type parameter with no frame (`Self`) has no bound list to judge.
+        let bounds = tc_tparam_bound_traits(type_to_str(t))
+        if bounds == "" || tc_pipe_has(bounds, trait_name) != 0 { return false }
+        tc_report_tparam_not_bound_by(node, t, trait_name, method)
+        return true
+    }
+    // The spec does not yet say what the call gives on a Never receiver, so it is not judged.
+    if type_kind(t) == TyKind.Never { return false }
+    if !tc_tid_is_judgeable_here(recv) || tc_surface_kind_fits(recv, row) { return false }
+    tc_method_calls.hard.insert(node, 1)
+    tc_report_unresolved_method(node, recv, tc_type_str(recv), method)
+    true
 }
 
 // The number of trait arguments a §3.2.2 row reads from the type.
@@ -17683,15 +17715,6 @@ fn is_sealed_builtin_type(name: Str) -> Int {
     0
 }
 
-// A declaration is user-sourced when its module is empty or the synthetic
-// main module — the stdlib defs that legitimately back the sealed traits
-// carry their dotted module (e.g. "std.traits") during this pass.
-fn is_user_sourced(node: Int) -> Int {
-    let m = node_module(node)
-    if m == "" || m == "__main__" { return 1 }
-    0
-}
-
 // Whether a name written in a trait method signature resolves to anything. The impl
 // header's acceptance set (a declared type, a builtin, a trait name) plus what only a
 // trait has: `Self`, an associated type reached through it, the trait's own type
@@ -19453,7 +19476,7 @@ fn validate_trait_impls_in_own_modules(program: Int) ! TypeCheck.Register, TypeC
         tc_record_impl_recv_tid(im)
         if is_trait_name(trait_name) == 0 {
             // A type that shadows the builtin here is not the sealed builtin: it is just no trait.
-            if is_sealed_builtin_type(trait_name) != 0 && is_user_sourced(im) != 0 && tc_compiler_known_type_meant(trait_name, -1) != "" {
+            if is_sealed_builtin_type(trait_name) != 0 && !tc_decl_in_std(im) && tc_compiler_known_type_meant(trait_name, -1) != "" {
                 diag_error_at("TraitContractSealedBuiltin", TRAIT_CONTRACT_907, "`{tc_trait_shown(trait_name)}` is a sealed built-in type and cannot be implemented for user types", im, "`{tc_trait_shown(trait_name)}` is a closed built-in; define your own trait with the methods you need and impl that instead")
                 ii = ii + 1
                 continue
@@ -19462,7 +19485,7 @@ fn validate_trait_impls_in_own_modules(program: Int) ! TypeCheck.Register, TypeC
             ii = ii + 1
             continue
         }
-        if is_sealed_builtin_trait(trait_name) != 0 && is_user_sourced(im) != 0 {
+        if is_sealed_builtin_trait(trait_name) != 0 && !tc_decl_in_std(im) {
             diag_error_at("TraitContractSealedBuiltin", TRAIT_CONTRACT_907, "trait `{tc_trait_shown(trait_name)}` is a sealed built-in trait and cannot be implemented for user types", im, "define your own trait with the methods you need and impl that instead")
             ii = ii + 1
             continue
@@ -19705,7 +19728,7 @@ fn validate_trait_impls_in_own_modules(program: Int) ! TypeCheck.Register, TypeC
         // rule — a default body may call a supertrait method on `Self` only because
         // every implementor is guaranteed to provide it. Only user-sourced impls are
         // checked; the stdlib is trusted.
-        if is_user_sourced(im) != 0 {
+        if !tc_decl_in_std(im) {
             let supers = tc_trait_direct_supers(trait_name)
             let mut seg_start = 0
             let mut ci = 0
@@ -20395,7 +20418,7 @@ pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report, IO.Eprint {
                 i = i + 1
                 continue
             }
-            if is_sealed_builtin_trait(node_name(tr)) != 0 && is_user_sourced(tr) != 0 {
+            if is_sealed_builtin_trait(node_name(tr)) != 0 && !tc_decl_in_std(tr) {
                 diag_error_at("TraitContractSealedBuiltin", TRAIT_CONTRACT_907, "trait `{node_name(tr)}` is a sealed built-in trait and cannot be redefined", tr, "rename your trait, or define your own trait with the methods you need")
             } else if !in_prelude && (prelude_traits.contains(node_name(tr)) || tc_undeclared_trait_names().contains(node_name(tr))) {
                 tc_warn_shadowed_trait(tr)
@@ -35621,6 +35644,11 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
         let obj_t = tc_resolve(tc_infer_receiver(recv_node))
         if diag_any_errors_since(receiver_diags) > 0 { tc_method_calls.receiver_failed.insert(node, 1) }
         let obj_k = type_kind(obj_t)
+
+        // The receiver's type may have a method of this name that the named trait does not give it.
+        if qualified != -1 && tc_sealed_qualified_call_refused(node, node_name(obj_node), method, obj_t) {
+            return tc_error_recovery_tid()
+        }
 
         // A std trait method on a receiver of no type yet. A later use may fill the type
         // (sections/03_types.md *Under-Determined Types*), and every type answers these methods

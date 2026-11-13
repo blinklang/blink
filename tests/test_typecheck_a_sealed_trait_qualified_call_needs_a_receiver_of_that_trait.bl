@@ -1,0 +1,159 @@
+// A trait-qualified call `Trait.m(recv)` runs the method of the impl of `Trait` for the
+// receiver's type (§3c.4 *Qualified Method Calls*). A sealed trait has an impl only for the
+// built-in types of its §3.2 row, so a receiver of any other type has no method to run. That is
+// E0505 at check, as a user trait's qualified call on a receiver with no impl is, and a type
+// parameter that its bound does not give the trait is E0306. Neither is a clean check that the
+// build then cannot compile. The guard rows are the legal sealed calls.
+
+import std.fs
+import std.io
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_reset}
+
+fn probe_src(body: Str) -> Str {
+    let head = #"type Bites { v: Int }
+trait Tr { fn m(self) -> Int }
+fn main() {
+    let b = Bites { v: 3 }
+    let m: Map[Str, Int] = Map()
+    let xs: List[Int] = [1]
+    let ws: List[Str] = ["a"]
+    let by = Bytes.new()
+    let sb = StringBuilder.new()
+    let mut st: Set[Int] = Set()
+"#
+    "{head}    let _ = {body}\n    let _ = b.v + m.len() + xs.len() + ws.len() + by.len() + sb.len() + st.len()\n\}\n"
+}
+
+// Every error's name and message, in report order.
+fn errors_of(path: Str, src: Str) -> List[Str] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    fs.write(path, src).unwrap()
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" { out.push("{d.name}: {d.message}") }
+    }
+    out
+}
+
+fn refused_once(call: Str, want: Str) -> Bool ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    let errs = errors_of("build/tc_sealed_qual_recv_bad.bl", probe_src(call))
+    let ok = errs.len() == 1 && errs.get(0).unwrap() == want
+    if !ok {
+        io.println("FAIL: {call} wants exactly `{want}`, got:")
+        for e in errs { io.println("  {e}") }
+    }
+    ok
+}
+
+fn accepted(call: Str) -> Bool ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    let errs = errors_of("build/tc_sealed_qual_recv_ok.bl", probe_src(call))
+    for e in errs { io.println("FAIL: {call} unexpected: {e}") }
+    errs.len() == 0
+}
+
+test "a sealed trait's qualified call on a user type is E0505 at check" {
+    assert(refused_once("Sized.len(b)", "UnresolvedMethod: unresolved method `.len` on type Bites"))
+    assert(refused_once("Sized.is_empty(b)", "UnresolvedMethod: unresolved method `.is_empty` on type Bites"))
+    assert(refused_once(#"Joinable.join(b, ",")"#, "UnresolvedMethod: unresolved method `.join` on type Bites"))
+}
+
+test "a sealed trait's qualified call on a scalar is E0505 at check" {
+    assert(refused_once("Sized.len(1)", "UnresolvedMethod: unresolved method `.len` on type Int"))
+    assert(refused_once("StrOps.trim(1)", "UnresolvedMethod: unresolved method `.trim` on type Int"))
+}
+
+test "a sealed trait's qualified call on a built-in type outside the trait's row is E0505 at check" {
+    assert(refused_once("ListOps.len(m)", "UnresolvedMethod: unresolved method `.len` on type Map[Str, Int]"))
+    assert(refused_once("StrOps.len(xs)", "UnresolvedMethod: unresolved method `.len` on type List[Int]"))
+    assert(refused_once("Joinable.join(m, \",\")", "UnresolvedMethod: unresolved method `.join` on type Map[Str, Int]"))
+    assert(refused_once(#"Contains.contains("abc", "b")"#, "UnresolvedMethod: unresolved method `.contains` on type Str"))
+    assert(refused_once("BytesOps.to_hex(xs)", "UnresolvedMethod: unresolved method `.to_hex` on type List[Int]"))
+    assert(refused_once("StringBuildOps.len(xs)", "UnresolvedMethod: unresolved method `.len` on type List[Int]"))
+    assert(refused_once("MapOps.get(xs, 0)", "UnresolvedMethod: unresolved method `.get` on type List[Int]"))
+    assert(refused_once("SetOps.union(xs, st)", "UnresolvedMethod: unresolved method `.union` on type List[Int]"))
+    assert(refused_once("Sized.len(true)", "UnresolvedMethod: unresolved method `.len` on type Bool"))
+}
+
+test "guard: the legal sealed qualified calls stay accepted" {
+    assert(accepted(#"Sized.len("abc")"#))
+    assert(accepted("Sized.len([1])"))
+    assert(accepted("Sized.len(m)"))
+    assert(accepted(#"Sized.is_empty("")"#))
+    assert(accepted(#"Joinable.join(ws, ",")"#))
+    assert(accepted("ListOps.get(xs, 0)"))
+    assert(accepted("Sized.len(by)"))
+    assert(accepted("Sized.len(sb)"))
+    assert(accepted("Sized.len(st)"))
+    assert(accepted("Contains.contains(st, 1)"))
+    assert(accepted("Contains.contains(xs, 1)"))
+    assert(accepted(#"Contains.contains(m, "a")"#))
+    assert(accepted("BytesOps.to_hex(by)"))
+    assert(accepted("StringBuildOps.len(sb)"))
+    assert(accepted(#"MapOps.get(m, "a")"#))
+    assert(accepted("SetOps.insert(st, 2)"))
+}
+
+// Every error's name and message for a program whose generic fn `body` makes the call.
+fn generic_errors(path: Str, body: Str) -> List[Str] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    errors_of(path, "{body}\nfn main() \{\n    let _ = size(\"abc\")\n\}\n")
+}
+
+test "guard: a sealed qualified call on a bounded type parameter stays accepted" {
+    let errs = generic_errors("build/tc_sealed_qual_recv_bound.bl", "fn size[T: Sized](x: T) -> Int \{ Sized.len(x) }")
+    for e in errs { io.println("FAIL: unexpected: {e}") }
+    assert_eq(errs.len(), 0)
+}
+
+test "a sealed qualified call on a type parameter its bound does not name is E0306 at check" {
+    let want = "TraitBoundNotSatisfied: type parameter `T` is not bound by trait `Sized`, so `Sized.len` is not available on it"
+    for head in ["fn size[T](x: T)", "fn size[T: Display](x: T)"] {
+        let errs = generic_errors("build/tc_sealed_qual_recv_tparam.bl", "{head} -> Int \{ Sized.len(x) }")
+        for e in errs { if e != want { io.println("FAIL: {head}: {e}") } }
+        assert_eq(errs, [want])
+    }
+    let errs = generic_errors("build/tc_sealed_qual_recv_tparam.bl", "fn size[T: Sized](x: T) -> Int \{ StrOps.len(x) }")
+    for e in errs { io.println("got: {e}") }
+    assert_eq(errs, ["TraitBoundNotSatisfied: type parameter `T` is not bound by trait `StrOps`, so `StrOps.len` is not available on it"])
+}
+
+test "guard: a user trait's qualified call on a receiver with no impl is E0505 at check" {
+    assert(refused_once("Tr.m(1)", "UnresolvedMethod: unresolved method `.m` on type Int"))
+}
+
+// A user type or trait spelled like a sealed trait is what its qualifier names, so the call is
+// that declaration's own: a user type's static method runs, and a user trait is only E0907.
+test "guard: a qualifier that names a user type spelled like a sealed trait reaches that type" {
+    let src = #"type Sized { n: Int }
+trait Mk { fn mk(n: Int) -> Self }
+impl Mk for Sized { fn mk(n: Int) -> Sized { Sized { n: n } } }
+fn main() {
+    let s = Sized.mk(4)
+    let _ = s.n
+}
+"#
+    let errs = errors_of("build/tc_sealed_qual_user_type.bl", src)
+    for e in errs { io.println("FAIL: unexpected: {e}") }
+    assert_eq(errs.len(), 0)
+}
+
+test "an impl block named like a sealed trait is E0907 and its qualified call reads the user type" {
+    let src = #"type Joinable { n: Int }
+impl Joinable {
+    fn join(a: Int, b: Str) -> Str { "{a}{b}" }
+}
+fn main() {
+    let _ = Joinable.join(1, "x")
+}
+"#
+    let errs = errors_of("build/tc_sealed_qual_user_inherent.bl", src)
+    for e in errs { io.println("got: {e}") }
+    assert_eq(errs.len(), 2)
+    assert(errs.get(0).unwrap().starts_with("TraitContractSealedBuiltin: "))
+    // The refused impl leaves the type with no `join`, as for a trait name that is not defined.
+    assert_eq(errs.get(1).unwrap(), "UnresolvedMethod: no member `join` on type `Joinable`")
+}

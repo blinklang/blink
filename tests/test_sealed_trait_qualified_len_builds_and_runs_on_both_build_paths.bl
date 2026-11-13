@@ -1,0 +1,59 @@
+// `Sized.len(text)` and `Sized.len(xs)` are legal trait-qualified calls (§3c.4 *Built-in Type
+// Method Dispatch*). The check that refuses a receiver with no `Sized` must leave them building
+// and running on both build paths, with the instance call's answer. A qualifier that names a
+// user type spelled like a sealed trait is that type, and its calls build too.
+
+import std.process.{ChildEnd, ChildLimits, ProcessResult}
+import std.time.{Duration}
+
+fn sh(cmd: Str) -> ProcessResult ! Process.Spawn {
+    process.run("sh", ["-c", cmd], limits: ChildLimits { timeout: Some(Duration.seconds(300)) }).unwrap()
+}
+
+let SRC = #"fn main() {
+    let text = "hello"
+    let xs = [1, 2, 3]
+    let ws: List[Str] = ["a", "b"]
+    io.println("{Sized.len(text)} {Sized.len(xs)} {Sized.is_empty(xs)} {Joinable.join(ws, "-")}")
+}
+"#
+
+// The user's own types take the sealed traits' names here, so each qualified call reaches them.
+let USER_SRC = #"type Sized { n: Int }
+trait Mk { fn mk(n: Int) -> Self }
+impl Mk for Sized { fn mk(n: Int) -> Sized { Sized { n: n } } }
+type Joinable { Leaf(Int), Two(Int, Int) }
+fn main() {
+    io.println("{Sized.mk(4).n} {Joinable.Leaf(7) == Joinable.Two(7, 7)}")
+}
+"#
+
+// Builds and runs `src` with each build path, and asserts each run printed `want`.
+fn builds_and_prints(src: Str, want: Str) ! FS.Write, Process.Spawn {
+    let dir = sh("mktemp -d /tmp/blink_sized_len.XXXXXX").out.trim()
+    fs.write("{dir}/m.bl", src).unwrap()
+    let mut builds: List[ProcessResult] = []
+    let mut runs: List[ProcessResult] = []
+    let flags = ["--per-module", "--no-per-module"]
+    for flag in flags {
+        builds.push(sh("B=$(pwd)/build/blink; cd {dir} && env -u BLINK_PER_MODULE -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE BLINK_CACHE_DIR={dir}/cache BLINK_BIN=$B $B build {flag} -o {dir}/app m.bl"))
+        runs.push(sh("{dir}/app"))
+        let _ = sh("rm -f {dir}/app")
+    }
+    // Removed before the asserts, so a failed run leaves no temp dir behind.
+    let _ = sh("rm -rf {dir}")
+    for i in 0..flags.len() {
+        let b = builds.get(i).unwrap()
+        let r = runs.get(i).unwrap()
+        assert_eq(b.end, ChildEnd.Exited(0), "{flags.get(i).unwrap()}: {b.out}{b.err_out}")
+        assert_eq(r.out, want, "{flags.get(i).unwrap()}: {r.err_out}")
+    }
+}
+
+test "Sized.len on Str and List builds and runs on both build paths" {
+    builds_and_prints(SRC, "5 3 false a-b\n")
+}
+
+test "a user type named like a sealed trait builds and runs its own qualified calls on both build paths" {
+    builds_and_prints(USER_SRC, "4 false\n")
+}

@@ -1,0 +1,92 @@
+// User code may neither redefine nor implement a sealed method-surface trait (§3.2, §10.6),
+// whichever module of the package declares it: the trait is E0907 at its declaration, not a
+// W1010 shadow that the build then cannot compile. Only the standard library declares them.
+
+import std.process.{ChildEnd, ChildLimits, ProcessResult}
+import std.time.{Duration}
+
+fn sh(cmd: Str) -> ProcessResult ! Process.Spawn {
+    process.run("sh", ["-c", cmd], limits: ChildLimits { timeout: Some(Duration.seconds(300)) }).unwrap()
+}
+
+// A fresh package with src/main.bl and, when `helper` is not "", src/shx.bl.
+fn project(helper: Str, main: Str) -> Str ! FS.Write, Process.Spawn {
+    let dir = sh("mktemp -d /tmp/blink_sealed_name.XXXXXX").out.trim()
+    let _ = sh("mkdir -p {dir}/src")
+    fs.write("{dir}/blink.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\n").unwrap()
+    fs.write("{dir}/blink.lock", "[metadata]\nlockfile-version = 1\n").unwrap()
+    if helper != "" { fs.write("{dir}/src/shx.bl", helper).unwrap() }
+    fs.write("{dir}/src/main.bl", main).unwrap()
+    dir
+}
+
+// The corpus exports module filters that make each build one unit, so the run drops them.
+fn blink(verb: Str, helper: Str, main: Str) -> ProcessResult ! FS.Write, Process.Spawn {
+    let dir = project(helper, main)
+    let r = sh("B=$(pwd)/build/blink; cd {dir} && env -u BLINK_PER_MODULE -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE BLINK_CACHE_DIR={dir}/cache BLINK_BIN=$B $B {verb} src/main.bl")
+    let _ = sh("rm -rf {dir}")
+    r
+}
+
+fn check(helper: Str, main: Str) -> ProcessResult ! FS.Write, Process.Spawn {
+    blink("check", helper, main)
+}
+
+fn diag(r: ProcessResult) -> Str {
+    "exit {r.end}\nstdout:\n{r.out}\nstderr:\n{r.err_out}"
+}
+
+fn redefined(name: Str) -> Str {
+    "error[TraitContractSealedBuiltin]: trait `{name}` is a sealed built-in trait and cannot be redefined"
+}
+
+fn helper_of(name: Str) -> Str {
+    "pub trait {name} \{ fn sh(self) -> Int }\n"
+}
+
+fn main_of(import_line: Str, name: Str) -> Str {
+    "{import_line}\ntype W \{ n: Int }\nfn main() \{ io.println(\"\{W \{ n: 1 }.n}\") }\n".replace("@N@", name)
+}
+
+test "a sealed trait name declared in a user module that main imports by name is E0907" {
+    for name in ["Joinable", "Sized"] {
+        let r = check(helper_of(name), main_of("import shx.\{@N@}", name))
+        assert_eq(r.end, ChildEnd.Exited(1), diag(r))
+        assert(r.err_out.contains(redefined(name)), diag(r))
+        assert(r.err_out.contains("--> src/shx.bl:1:5"), diag(r))
+        assert(!r.err_out.contains("ShadowedPreludeName"), diag(r))
+    }
+}
+
+test "a sealed trait name declared in a user module that main imports whole is E0907" {
+    let r = check(helper_of("Joinable"), main_of("import shx", "Joinable"))
+    assert_eq(r.end, ChildEnd.Exited(1), diag(r))
+    assert(r.err_out.contains(redefined("Joinable")), diag(r))
+}
+
+test "a sealed trait name declared in a package's main module is E0907" {
+    let r = check("", "trait Sized \{ fn sh(self) -> Int }\nfn main() \{ io.println(\"x\") }\n")
+    assert_eq(r.end, ChildEnd.Exited(1), diag(r))
+    assert(r.err_out.contains(redefined("Sized")), diag(r))
+}
+
+test "an impl of a sealed trait in a user module that is not main is E0907" {
+    let helper = "pub type W \{ n: Int }\nimpl Sized for W \{ fn len(self) -> Int \{ self.n } fn is_empty(self) -> Bool \{ false } }\n"
+    let r = check(helper, "import shx.\{W}\nfn main() \{ io.println(\"\{W \{ n: 1 }.n}\") }\n")
+    assert_eq(r.end, ChildEnd.Exited(1), diag(r))
+    assert(r.err_out.contains("error[TraitContractSealedBuiltin]: trait `Sized` is a sealed built-in trait and cannot be implemented for user types"), diag(r))
+}
+
+test "the qualified call of the reported trait gets no build-only failure: the build stops at E0907" {
+    let helper = helper_of("Joinable")
+    let main = "import shx.\{Joinable}\ntype W \{ n: Int }\nimpl Joinable for W \{ fn sh(self) -> Int \{ self.n } }\nfn main() \{ io.println(\"\{Joinable.sh(1)}\") }\n"
+    let r = blink("build", helper, main)
+    assert_eq(r.end, ChildEnd.Exited(1), diag(r))
+    assert(r.err_out.contains(redefined("Joinable")), diag(r))
+    assert(!r.err_out.contains("internal compiler error"), diag(r))
+}
+
+test "guard: a user trait whose name is not sealed still declares in a user module" {
+    let r = check(helper_of("Joiner"), main_of("import shx.\{@N@}", "Joiner"))
+    assert_eq(r.end, ChildEnd.Exited(0), diag(r))
+}
