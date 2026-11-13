@@ -6925,17 +6925,17 @@ fn tc_decl_has_own_type_params(decl: Int) -> Int {
 // (self), so call argument `pi` ↔ fnsig param `1 + pi`. This binds only the callee's own
 // declared params, never self — matching check_arg_shapes' own self_offset discipline.
 // `arg_tids` is what check_arg_shapes read for each argument, so every step of one call
-// binds against the same metavariables.
-fn build_typevar_binds(sig: Int, arg_tids: List[Int], self_offset: Int) -> Map[Str, Int] ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+// binds against the same metavariables. A keyword argument binds the parameter it names.
+fn build_typevar_binds(sig: Int, args_sl: Int, arg_tids: List[Int], self_offset: Int) -> Map[Str, Int] ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     let fs = fnsig_pool.get(sig).unwrap()
     let param_start = fs.params_start
     let param_count = fs.params_count
     let mut binds: Map[Str, Int] = Map()
     let mut i = 0
     while i < arg_tids.len() {
-        let pidx = i + self_offset
+        let pidx = tc_arg_param_index(args_sl, i, param_start, param_count, self_offset)
         let arg_t = arg_tids.get(i).unwrap()
-        if pidx < param_count && arg_t >= 0 {
+        if pidx >= 0 && pidx < param_count && arg_t >= 0 && !tc_fill_at(args_sl, i) {
             let ptid = fnsig_param_list.get(param_start + pidx).unwrap()
             unify_typevar_binds(ptid, arg_t, binds)
         }
@@ -7743,12 +7743,12 @@ fn tc_node_has_ret_mint(n: Int) -> Int {
 // Minting HERE and not in build_typevar_binds: that function runs more than once per
 // call site (bounds, return type, pin), so it would produce unrelated α for one slot and
 // only one of them could ever be bound. `self_offset` as in build_typevar_binds.
-fn instantiate_return_type(sig: Int, arg_tids: List[Int], call_node: Int, self_offset: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+fn instantiate_return_type(sig: Int, args_sl: Int, arg_tids: List[Int], call_node: Int, self_offset: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     let fs = fnsig_pool.get(sig).unwrap()
     let ret = fs.ret
     if ret < 0 || ret >= ty_pool.len() { return ret }
     tc_report_unsourced_binders(sig, call_node, self_offset)
-    let binds = build_typevar_binds(sig, arg_tids, self_offset)
+    let binds = build_typevar_binds(sig, args_sl, arg_tids, self_offset)
     tc_bind_call_mints(sig, call_node, binds, arg_tids)
     tc_note_generic_call(sig, call_node, self_offset, binds)
     substitute_typevar_tid(ret, binds)
@@ -7768,14 +7768,14 @@ fn tc_pin_generic_args_from_binds(sig: Int, call_node: Int, args_sl: Int, arg_ti
     let fs = fnsig_pool.get(sig).unwrap()
     let param_start = fs.params_start
     let param_count = fs.params_count
-    let binds = build_typevar_binds(sig, arg_tids, self_offset)
+    let binds = build_typevar_binds(sig, args_sl, arg_tids, self_offset)
     tc_bind_call_mints(sig, call_node, binds, arg_tids)
     let tids = tc_seed_closure_args_with_binds(sig, args_sl, arg_tids, self_offset, binds)
     let mut i = 0
     while i < tids.len() {
-        let pidx = i + self_offset
+        let pidx = tc_arg_param_index(args_sl, i, param_start, param_count, self_offset)
         let arg_t = tids.get(i).unwrap()
-        if pidx < param_count && arg_t >= 0 && tc_tid_has_unbound_metavar(arg_t) != 0 {
+        if pidx >= 0 && pidx < param_count && arg_t >= 0 && tc_tid_has_unbound_metavar(arg_t) != 0 {
             let ptid = fnsig_param_list.get(param_start + pidx).unwrap()
             let concrete_ptid = substitute_typevar_tid(ptid, binds)
             let _ = tc_unify(concrete_ptid, arg_t)
@@ -7811,8 +7811,8 @@ fn tc_seed_closure_args_with_binds(sig: Int, args_sl: Int, arg_tids: List[Int], 
     let n = sublist_length(args_sl)
     let mut i = 0
     while i < n && i < tids.len() {
-        let pidx = i + self_offset
-        if pidx < param_count {
+        let pidx = tc_arg_param_index(args_sl, i, param_start, param_count, self_offset)
+        if pidx >= 0 && pidx < param_count {
             let arg = sublist_get(args_sl, i)
             let declared = fnsig_param_list.get(param_start + pidx).unwrap()
             let formal = substitute_typevar_tid(declared, binds)
@@ -7820,7 +7820,10 @@ fn tc_seed_closure_args_with_binds(sig: Int, args_sl: Int, arg_tids: List[Int], 
             // it made the variable is no type the program wrote, so it must not be range-checked
             // against that Int as if it were.
             let v = if node_kind(arg) == NodeKind.NamedArg { node_value(arg) } else { arg }
-            if !(is_literal_tree_node(v) && tc_tid_typevar_key(declared) != "") {
+            if tc_is_default_fill(arg) {
+                tc_publish_node_tid(arg, formal)
+                tids.set(i, formal)
+            } else if !(is_literal_tree_node(v) && tc_tid_typevar_key(declared) != "") {
                 tc_seed_expected_into_value(arg, formal)
                 if tc_formal_reaches_closure(formal) != 0 { tids.set(i, infer_type(arg)) }
             }
@@ -8205,7 +8208,7 @@ fn tc_call_arg_parts(call: Int, expected: Int) -> List[ExpectedPart] {
     let mut i = 0
     while i < sublist_length(args) {
         let arg = sublist_get(args, i)
-        let pidx = tc_call_arg_param_index(fs, self_offset, arg, i)
+        let pidx = tc_arg_param_index(args, i, fs.params_start, fs.params_count, self_offset)
         if pidx >= 0 && pidx < fs.params_count && !tc_is_default_fill(arg) {
             parts.push(ExpectedPart { value: arg, expected: substitute_typevar_tid(fnsig_param_list.get(fs.params_start + pidx).unwrap(), binds) })
         }
@@ -8223,12 +8226,6 @@ fn tc_call_self_offset(call: Int, fs: FnSigEntry) -> Int {
     let obj = node_obj(call)
     if obj != -1 && node_kind(obj) == NodeKind.Ident && nr_has_binding(node_name(obj)) == 0 && tc_ident_binder_node(obj) == -1 { return 0 }
     1
-}
-
-// The parameter index argument `arg`, at position `i`, fills: its label's, else its position's.
-fn tc_call_arg_param_index(fs: FnSigEntry, self_offset: Int, arg: Int, i: Int) -> Int {
-    if node_kind(arg) == NodeKind.NamedArg { return tc_fnsig_param_index_by_name(fs.params_start, fs.params_count, self_offset, node_name(arg)) }
-    i + self_offset
 }
 
 // The type a receiver node has before the call is inferred: its recorded type, else the type
@@ -8878,6 +8875,21 @@ fn tc_fnsig_param_index_by_name(param_start: Int, param_count: Int, self_offset:
         k = k + 1
     }
     -1
+}
+
+// The parameter call argument `i` fills: a keyword argument fills the one it names, wherever
+// it is written, and codegen reorders by that name. -1 for a keyword no parameter has.
+fn tc_arg_param_index(args_sl: Int, i: Int, param_start: Int, param_count: Int, self_offset: Int) -> Int {
+    if args_sl != -1 && i < sublist_length(args_sl) {
+        let arg = sublist_get(args_sl, i)
+        if node_kind(arg) == NodeKind.NamedArg { return tc_fnsig_param_index_by_name(param_start, param_count, self_offset, node_name(arg)) }
+    }
+    i + self_offset
+}
+
+// A default fill's type is its formal, so it tells the call nothing about a type parameter.
+fn tc_fill_at(args_sl: Int, i: Int) -> Bool {
+    args_sl != -1 && i < sublist_length(args_sl) && tc_is_default_fill(sublist_get(args_sl, i))
 }
 
 // The index of the first KEYWORD parameter — the first declared after `--` — or param_count
@@ -9866,14 +9878,14 @@ fn tc_check_free_call(fn_name: Str, sig0: Int, node: Int) -> Int ! TypeCheck.Res
     if fs.type_params_count == 0 { return fs.ret }
     // Enforce each type param's declared bound against the concrete type inferred for it
     // (E0306). Read-only: bind the args, check, diagnose.
-    tc_check_bounds_for_binds(sig, build_typevar_binds(sig, arg_tids, 0), node)
+    tc_check_bounds_for_binds(sig, build_typevar_binds(sig, args_sl, arg_tids, 0), node)
     // The return type is substituted, so a generic-struct return such as `Box[T]` carries
     // its concrete slots and codegen can spell the instance. Any metavar-carrying arg is
     // then pinned from the call's binds, so `fill(Map(), 256, "x")` (K→Int, V→Str from the
     // sibling args) codegens the Map() with the right kops instead of an erased default. If
     // a typevar is genuinely unbound (no arg pins it), the arg's α stays unbound and E0301
     // fires at its own binding/boundary.
-    let ret_t = instantiate_return_type(sig, arg_tids, node, 0)
+    let ret_t = instantiate_return_type(sig, args_sl, arg_tids, node, 0)
     tc_pin_generic_args_from_binds(sig, node, args_sl, arg_tids, 0)
     ret_t
 }
@@ -10059,14 +10071,9 @@ fn tc_check_arg_types_with_binds(fn_name: Str, sig: Int, args_sl: Int, self_offs
     let mut i = 0
     while i < n {
         let arg_node = sublist_get(args_sl, i)
-        let mut pidx = i + self_offset
-        if node_kind(arg_node) == NodeKind.NamedArg {
-            // A keyword argument names its parameter, and codegen reorders by that name, so
-            // this check has to follow the name too. -1 means no such parameter, which
-            // tc_check_keyword_args reports as InvalidKeywordArg; skipping leaves that one
-            // error standing.
-            pidx = tc_fnsig_param_index_by_name(param_start, param_count, self_offset, node_name(arg_node))
-        }
+        // -1 is a keyword no parameter has, which tc_check_keyword_args reports as
+        // InvalidKeywordArg; skipping leaves that one error standing.
+        let pidx = tc_arg_param_index(args_sl, i, param_start, param_count, self_offset)
         let mut arg_t = -1
         if pidx >= 0 && pidx < param_count {
             let formal = fnsig_param_list.get(param_start + pidx).unwrap()
@@ -10077,9 +10084,13 @@ fn tc_check_arg_types_with_binds(fn_name: Str, sig: Int, args_sl: Int, self_offs
             let ptid = substitute_typevar_tid(bound, concrete)
             if tc_is_default_fill(arg_node) {
                 // Inferring the default here would read its names in the caller's module
-                // and scope; it was held to this parameter at the declaration.
-                arg_t = ptid
+                // and scope; it was held to this parameter at the declaration. Its type is
+                // the formal, so it binds no type parameter: tc_seed_closure_args_with_binds
+                // gives it the formal again once the call's binds are complete.
                 tc_publish_node_tid(arg_node, ptid)
+                tids.push(ptid)
+                i = i + 1
+                continue
             } else if tc_tid_is_no_info(ptid) == 0 {
                 tc_note_closure_expected_at(arg_node, tc_decl_param_type_ann(fs.decl, pidx), ptid)
                 // A type parameter that an earlier argument fixed joins the two arguments, and
@@ -10089,8 +10100,8 @@ fn tc_check_arg_types_with_binds(fn_name: Str, sig: Int, args_sl: Int, self_offs
             }
             if arg_t >= 0 { unify_typevar_binds(formal, arg_t, seen) }
         }
-        // build_typevar_binds aligns by position, so a position with a parameter needs a
-        // tid even where the check above had no parameter type to hint it from.
+        // build_typevar_binds reads a tid for each argument, so a position with a parameter
+        // needs one even where the check above had no parameter type to hint it from.
         if arg_t < 0 && i + self_offset < param_count { arg_t = tc_infer_unhinted(arg_node) }
         tids.push(arg_t)
         i = i + 1
@@ -10646,7 +10657,7 @@ fn tc_check_builtin_sig_call(fn_name: Str, sig: Int, node: Int) -> Int ! TypeChe
     }
     let tids = tc_check_arg_types_with_binds(fn_name, sig, args_sl, 0, tc_no_binds)
     if fs.type_params_count > 0 {
-        tc_check_bounds_for_binds(sig, build_typevar_binds(sig, tids, 0), node)
+        tc_check_bounds_for_binds(sig, build_typevar_binds(sig, args_sl, tids, 0), node)
     }
     if fn_name == "assert_eq" || fn_name == "assert_ne" {
         tc_check_assert_eq_args(tids, node)
@@ -33197,13 +33208,13 @@ fn tc_bound_method_call(shown: Str, tmsig_idx: Int, node: Int, args_sl: Int, sel
     } else {
         check_arg_shapes_with_binds(shown, sig, args_sl, self_offset, node, binds)
     }
-    let mut mbinds = build_typevar_binds(sig, tids, self_offset)
+    let mut mbinds = build_typevar_binds(sig, args_sl, tids, self_offset)
     for (k, v) in binds {
         if !mbinds.contains_key(k) { mbinds.insert(k, v) }
     }
     tc_check_bounds_for_binds(sig, mbinds, node)
     tids = tc_seed_closure_args_with_binds(sig, args_sl, tids, self_offset, mbinds)
-    substitute_typevar_tid(instantiate_return_type(sig, tids, node, self_offset), binds)
+    substitute_typevar_tid(instantiate_return_type(sig, args_sl, tids, node, self_offset), binds)
 }
 
 // The arguments of `Tr.m(x, ..)`: the receiver is parameter 0 (`self`), so the declared
@@ -36579,10 +36590,10 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                         let mut ltids = check_arg_shapes_with_binds("List.{method}", sig, args_sl, 1, node, binds)
                         let lfs = fnsig_pool.get(sig).unwrap()
                         if tc_decl_has_own_type_params(lfs.decl) != 0 {
-                            let mbinds = build_typevar_binds(sig, ltids, 1)
+                            let mbinds = build_typevar_binds(sig, args_sl, ltids, 1)
                             tc_check_bounds_for_binds(sig, mbinds, node)
                             ltids = tc_seed_closure_args_with_binds(sig, args_sl, ltids, 1, mbinds)
-                            return substitute_typevar_tid(instantiate_return_type(sig, ltids, node, 1), binds)
+                            return substitute_typevar_tid(instantiate_return_type(sig, args_sl, ltids, node, 1), binds)
                         }
                         return substitute_typevar_tid(lfs.ret, binds)
                     }
@@ -37146,7 +37157,7 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                         // cannot see.
                         nr_note_call_decl(node, fnsig_pool.get(bsig).unwrap().decl)
                         if tc_decl_has_own_type_params(fnsig_pool.get(bsig).unwrap().decl) != 0 {
-                            return instantiate_return_type(bview, btids, node, 1)
+                            return instantiate_return_type(bview, node_args(node), btids, node, 1)
                         }
                         return fnsig_pool.get(bsig).unwrap().ret
                     }
@@ -37213,7 +37224,7 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                 // with tc_impl_where_bounds_hold. Additive: the return path is untouched.
                 let mfs = fnsig_pool.get(sig).unwrap()
                 if mfs.type_params_count > 0 {
-                    let mbinds = build_typevar_binds(sig, mtids, 1)
+                    let mbinds = build_typevar_binds(sig, node_args(node), mtids, 1)
                     tc_check_bounds_for_binds(sig, mbinds, node)
                     // A method declaring its own type parameter has the same closure-argument
                     // ordering problem a free function does, and the receiver does not answer it.
@@ -37225,7 +37236,7 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                 // impl over a generic type puts the impl's binders in the same count and
                 // those are answered by the receiver, not by the arguments.
                 if tc_decl_has_own_type_params(mfs.decl) != 0 {
-                    return substitute_typevar_tid(instantiate_return_type(sig, mtids, node, 1), ibinds)
+                    return substitute_typevar_tid(instantiate_return_type(sig, node_args(node), mtids, node, 1), ibinds)
                 }
                 // A return declared over the receiver type's own binders, as a derived clone
                 // is, stands for the receiver's instance. A no-op for a monomorphic receiver.
@@ -37659,8 +37670,8 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                         }
                         let qt_tids = tc_check_qualified_trait_args("{obj_name}.{method}", qt_sig, qt_args, node, qt_ibinds)
                         if tc_decl_has_own_type_params(qt_fs.decl) != 0 {
-                            tc_check_bounds_for_binds(qt_sig, build_typevar_binds(qt_sig, qt_tids, 0), node)
-                            return substitute_typevar_tid(instantiate_return_type(qt_sig, qt_tids, node, 0), qt_ibinds)
+                            tc_check_bounds_for_binds(qt_sig, build_typevar_binds(qt_sig, qt_args, qt_tids, 0), node)
+                            return substitute_typevar_tid(instantiate_return_type(qt_sig, qt_args, qt_tids, node, 0), qt_ibinds)
                         }
                         return substitute_typevar_tid(qt_fs.ret, qt_ibinds)
                     }
@@ -37774,8 +37785,8 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                         let q_tids = check_arg_shapes_with_binds("{obj_written}.{method}", q_sig, q_args, 0, node, q_binds)
                         tc_check_static_impl_bounds(q_im, q_sig, self_tid, node)
                         if tc_decl_has_own_type_params(q_decl) != 0 {
-                            tc_check_bounds_for_binds(q_sig, build_typevar_binds(q_sig, q_tids, 0), node)
-                            return substitute_typevar_tid(instantiate_return_type(q_sig, q_tids, node, 0), q_binds)
+                            tc_check_bounds_for_binds(q_sig, build_typevar_binds(q_sig, q_args, q_tids, 0), node)
+                            return substitute_typevar_tid(instantiate_return_type(q_sig, q_args, q_tids, node, 0), q_binds)
                         }
                         return tc_note_open_value(node, substitute_typevar_tid(fnsig_pool.get(q_sig).unwrap().ret, q_binds))
                     }
@@ -47632,7 +47643,7 @@ fn tc_call_literal_reaches_its_one_binder(call: Int, n: Int) -> Bool {
     let mut i = 0
     while i < sublist_length(args) {
         let arg = sublist_get(args, i)
-        let pidx = tc_call_arg_param_index(fs, self_offset, arg, i)
+        let pidx = tc_arg_param_index(args, i, fs.params_start, fs.params_count, self_offset)
         if pidx < 0 || pidx >= fs.params_count { return false }
         let labeled = node_kind(arg) == NodeKind.NamedArg
         if labeled && pidx < kw_start { return false }
