@@ -1181,33 +1181,53 @@ fn tc_type_renamed_in_impl(im: Int) -> Bool {
 fn tc_impl_alias_target(im: Int) -> Int {
     let decl = tc_impl_header_alias_decl(im)
     if decl == -1 { return -1 }
-    if tc_alias_is_generic(decl) { return tc_generic_alias_target(decl) }
+    if tc_alias_is_generic(decl) { return tc_generic_alias_target(im, decl) }
     let t = tc_impl_alias_resolved(im, decl)
     if t >= 0 && tc_impl_alias_target_is_bare(t) { t } else { -1 }
 }
 
-// The base type a generic alias means in an impl header, or -1. The header's arguments fill
-// the alias's parameters, so only a target that takes those parameters as its own arguments,
-// each once and in order, reads the header's arguments as its own; a reordering or dropping
-// alias (`Sw[A, B] = Pr[B, A]`, `Fx[T] = Bx[Int]`) is left to the alias. The header's own
-// arguments are not read here: E0908 refuses a header whose arguments are not the impl's
-// binders in order. That order is also what tc_impl_binds_for_instance relies on: it binds
-// the header's argument i to the instance's slot i.
-fn tc_generic_alias_target(decl: Int) -> Int {
+// The base type an impl header that names the generic alias `decl` means, or -1. The header
+// means its expansion, so it is an impl on the target when the expansion's arguments are the
+// impl's own binders, each once and in order: `impl[T] X for A[T]` with `type A[T] = Bx[T]` is
+// `impl[T] X for Bx[T]`, and `impl[X, Y] X for Sw[Y, X]` with `type Sw[A, B] = Pr[B, A]` is
+// `impl[X, Y] X for Pr[X, Y]`. Any other header (`Sw[X, Y]`, `A[Int]`) is left to the alias,
+// and E0908 refuses it as it refuses the same receiver written out.
+fn tc_generic_alias_target(im: Int, decl: Int) -> Int {
     let tps = node_type_params(decl)
+    let args = node_recv_type_args(im)
+    if args == -1 || sublist_length(args) != sublist_length(tps) { return -1 }
+    let binders = node_impl_binders(im)
+    let n = if binders == -1 { 0 } else { sublist_length(binders) }
     let u = tc_alias_underlying.get(tc_nominal_type_name(decl)) ?? -1
-    if u < 0 || !tc_type_has_receiver(u) { return -1 }
-    if tc_tid_child_count(u) != sublist_length(tps) { return -1 }
-    let mut i = 0
-    while i < sublist_length(tps) {
-        let tp = sublist_get(tps, i)
-        if tc_tid_typevar_key(tc_tid_child(u, i)) != tc_binder_key(tp, node_name(tp)) { return -1 }
-        i = i + 1
+    if n == 0 || u < 0 || !tc_type_has_receiver(u) || tc_tid_child_count(u) != n { return -1 }
+    let mut j = 0
+    while j < n {
+        let p = tc_alias_param_index(tps, tc_tid_child(u, j))
+        if p == -1 || !tc_ann_is_binder(sublist_get(args, p), sublist_get(binders, j)) { return -1 }
+        j = j + 1
     }
     let k = type_kind(u)
     if k != TyKind.Struct && k != TyKind.Enum { return u }
     let target_decl = tc_tid_decl_node(u)
     if target_decl < 0 { -1 } else { tc_decl_tid(target_decl) }
+}
+
+// The index of the alias parameter in `tps` that the typevar `t` is, or -1.
+fn tc_alias_param_index(tps: Int, t: Int) -> Int {
+    let key = tc_tid_typevar_key(t)
+    let mut i = 0
+    while i < sublist_length(tps) {
+        let tp = sublist_get(tps, i)
+        if key == tc_binder_key(tp, node_name(tp)) { return i }
+        i = i + 1
+    }
+    -1
+}
+
+// Whether the annotation `ann` is the bare name of `binder`, which shadows any type so named.
+fn tc_ann_is_binder(ann: Int, binder: Int) -> Bool {
+    let elems = node_elements(ann)
+    node_kind(ann) == NodeKind.TypeAnn && node_name(ann) == node_name(binder) && (elems == -1 || sublist_length(elems) == 0)
 }
 
 // The alias declaration an impl header names, read in the impl's own module, or -1. A binder
@@ -1851,8 +1871,13 @@ fn tc_impl_matches_instance(im: Int, tid: Int) -> Int ! TypeCheck.Resolve, Diag.
         let recv_tid = tc_impl_recv_tid(im)
         return if tc_tid_same_type(recv_tid, tid) { 1 } else { 0 }
     }
-    let recv_args = node_recv_type_args(im)
-    let nr = if recv_args == -1 { 0 } else { sublist_length(recv_args) }
+    // A generic alias header may reorder or drop parameters, so count the expansion's slots.
+    let nr = if tc_impl_alias_target(im) != -1 {
+        tc_tid_child_count(tc_impl_recv_tid(im))
+    } else {
+        let recv_args = node_recv_type_args(im)
+        if recv_args == -1 { 0 } else { sublist_length(recv_args) }
+    }
     if nr != tc_tid_struct_arg_count(tid) { return 0 }
     1
 }
@@ -1865,6 +1890,17 @@ fn tc_impl_binds_for_instance(im: Int, tid: Int) -> Map[Str, Int] ! TypeCheck.Re
     let mut binds: Map[Str, Int] = Map()
     let recv_args = node_recv_type_args(im)
     if recv_args == -1 { return binds }
+    // A header that names a generic alias does not line up with the target's slots: the alias
+    // may reorder or drop its parameters. The recorded receiver is its expansion, which does.
+    let expanded = if tc_impl_alias_target(im) == -1 { -1 } else { tc_impl_recv_tid(im) }
+    if expanded != -1 {
+        let mut j = 0
+        while j < tc_tid_child_count(expanded) {
+            unify_typevar_binds(tc_tid_child(expanded, j), tc_tid_struct_arg_tid(tid, j), binds)
+            j = j + 1
+        }
+        return binds
+    }
     let binders = node_impl_binders(im)
     let saved = tc_suppress_ann_validation
     tc_suppress_ann_validation = 1
@@ -14205,6 +14241,19 @@ fn tc_record_poly_user_impl(im: Int, recv: Int) {
     tc_poly_user_impls.insert(im, decl)
 }
 
+// Whether the type arguments of `t` are the binders `binders_sl`, each once and in order.
+fn tc_tid_args_are_binders(t: Int, binders_sl: Int) -> Bool {
+    let n = sublist_length(binders_sl)
+    if t < 0 || tc_tid_child_count(t) != n { return false }
+    let mut i = 0
+    while i < n {
+        let a = tc_tid_child(t, i)
+        if type_kind(a) != TyKind.Typevar || tc_tid_binder(a) != sublist_get(binders_sl, i) { return false }
+        i = i + 1
+    }
+    true
+}
+
 // Pure, so mono and codegen read the one decision typecheck made.
 pub fn tc_impl_is_poly_user(im: Int) -> Bool {
     tc_poly_user_impls.contains_key(im)
@@ -19512,12 +19561,10 @@ fn validate_trait_impls_in_own_modules(program: Int) ! TypeCheck.Register, TypeC
                         poly_supported = 1
                     }
                 }
-                if impl_type == "Map" && nb == 2 && nr == 2 {
-                    let k0 = node_name(sublist_get(binders_sl, 0))
-                    let v0 = node_name(sublist_get(binders_sl, 1))
-                    if k0 != "" && v0 != "" && node_name(sublist_get(recv_args_sl, 0)) == k0 && node_name(sublist_get(recv_args_sl, 1)) == v0 {
-                        poly_supported = 1
-                    }
+                // The recorded receiver, not the header: an alias may write Map's arguments in
+                // another order.
+                if impl_type == "Map" && tc_tid_args_are_binders(tc_impl_recv_tid(im), binders_sl) {
+                    poly_supported = 1
                 }
             }
         }
