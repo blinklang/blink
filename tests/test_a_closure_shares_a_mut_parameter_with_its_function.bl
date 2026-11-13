@@ -1,0 +1,377 @@
+// A parameter is a binding (sections/03_types.md §3.6 Mutable Parameters), and a closure
+// shares each binding it captures (sections/02_syntax.md, Capture Semantics). So a closure
+// that captures a `mut` parameter sees each change the function makes through it, and the
+// function sees each change the closure makes. Each program is built both ways, because a
+// per-module build and a whole-program build each lower the function and its closure.
+
+import compile_test_helpers
+import std.process.{ProcessResult}
+
+// The corpus exports BLINK_COMPILER_ARCHIVE, which, like the module filters, makes a build
+// one unit, so the build drops them and a per-module build really writes its units.
+fn run_built(src: Str, stem: Str, flag: Str, run_env: List[Str]) -> ProcessResult ! FS.Read, FS.Write, Process.Spawn, Env.Read {
+    let dir = "{compile_test_helpers.scratch_root()}/{stem}_{getpid()}"
+    compile_test_helpers.sh("rm -rf {dir} && mkdir -p {dir}")
+    let path = "{dir}/{stem}.bl"
+    let bin = "{dir}/{stem}_bin"
+    fs.write(path, src).unwrap()
+    let b = process.run("sh", ["-c", "env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE BLINK_CACHE_DIR={dir}/objcache build/blink build {flag} {path} -o {bin}"]).unwrap()
+    assert(b.success(), "build failed: {b.out}{b.err_out}")
+    let r = process.run("env", run_env.append([bin])).unwrap()
+    compile_test_helpers.sh("rm -rf {dir}")
+    r
+}
+
+fn build_and_run(src: Str, stem: Str, flag: Str) -> Str ! FS.Read, FS.Write, Process.Spawn, Env.Read {
+    let r = run_built(src, stem, flag, [])
+    assert(r.success(), r.err_out)
+    r.out
+}
+
+fn both_modes(src: Str, stem: Str, want: Str) ! FS.Read, FS.Write, Process.Spawn, Env.Read {
+    assert_eq(build_and_run(src, "{stem}_pm", "--per-module"), want)
+    assert_eq(build_and_run(src, "{stem}_wp", "--no-per-module"), want)
+}
+
+test "a closure sees a push to a mut List parameter, and the function sees the closure's push" {
+    both_modes(#"
+fn f(mut xs: List[Int]) -> Int {
+    let g = fn() -> Int { xs.len() }
+    xs.push(5)
+    g()
+}
+
+fn h(mut xs: List[Int]) -> Int {
+    let g = fn() { xs.push(9) }
+    g()
+    xs.len()
+}
+
+fn main() {
+    let mut a = [1]
+    let mut b = [1]
+    io.println("{f(a)} {h(b)} {a.len()} {b.len()}")
+}
+"#, "mut_param_list", "2 2 2 2\n")
+}
+
+test "a closure shares a mut Map, Set and StringBuilder parameter" {
+    both_modes(#"
+fn mp(mut m: Map[Str, Int]) -> Int {
+    let g = fn() { m.insert("b", 2) }
+    g()
+    m.len()
+}
+
+fn st(mut s: Set[Int]) -> Int {
+    let g = fn() -> Int { s.len() }
+    s.insert(7)
+    g()
+}
+
+fn sb(mut b: StringBuilder) -> Str {
+    let g = fn() { b.write("y") }
+    b.write("x")
+    g()
+    b.to_str()
+}
+
+fn main() {
+    io.println("{mp(Map())} {st(Set())} {sb(StringBuilder.new())}")
+}
+"#, "mut_param_cells", "1 1 xy\n")
+}
+
+// Only what the function itself sees: what a caller's Bytes holds after the call is the
+// Bytes value rule, not the capture rule.
+test "a closure shares a mut Bytes parameter with its function" {
+    both_modes(#"
+fn f(mut b: Bytes) -> Int {
+    let g = fn() -> Int { b.len() }
+    b.push(1)
+    g()
+}
+
+fn h(mut b: Bytes) -> Int {
+    let g = fn() { b.push(9) }
+    g()
+    g()
+    b.len()
+}
+
+fn main() {
+    io.println("{f(Bytes.new())} {h(Bytes.new())}")
+}
+"#, "mut_param_bytes", "1 2\n")
+}
+
+test "a closure inside a closure shares the outer function's mut parameter" {
+    both_modes(#"
+fn nest(mut xs: List[Int]) -> Int {
+    let outer = fn() -> Int {
+        let inner = fn() { xs.push(4) }
+        inner()
+        xs.len()
+    }
+    let n = outer()
+    n + xs.len()
+}
+
+fn main() {
+    io.println("{nest([1])}")
+}
+"#, "mut_param_nested", "4\n")
+}
+
+test "a closure shares the mut parameter of the closure it is written in" {
+    both_modes(#"
+fn own() -> Int {
+    let f = fn(mut ys: List[Int]) -> Int {
+        let g = fn() { ys.push(1) }
+        g()
+        ys.len()
+    }
+    f([7, 8])
+}
+
+fn main() {
+    io.println("{own()}")
+}
+"#, "mut_param_closure_own", "3\n")
+}
+
+test "a closure in a mut self method shares self" {
+    both_modes(#"
+type Stack {
+    items: List[Int]
+}
+
+trait Push {
+    fn push2(mut self, x: Int) -> Int
+}
+
+impl Push for Stack {
+    fn push2(mut self, x: Int) -> Int {
+        let g = fn() { self.items.push(x) }
+        g()
+        g()
+        self.items.len()
+    }
+}
+
+fn main() {
+    let mut s = Stack { items: [] }
+    let n = s.push2(3)
+    io.println("{n} {s.items.len()}")
+}
+"#, "mut_param_self", "2 2\n")
+}
+
+test "a closure shares a mut struct or enum parameter" {
+    both_modes(#"
+type Stack {
+    items: List[Int]
+}
+
+type Shape {
+    Circle(Int)
+    Square(Int)
+}
+
+trait Push {
+    fn push1(mut self, x: Int)
+}
+
+impl Push for Stack {
+    fn push1(mut self, x: Int) {
+        self.items.push(x)
+    }
+}
+
+fn up(mut s: Stack) -> Int {
+    let g = fn() -> Int { s.items.len() }
+    s.push1(2)
+    g()
+}
+
+fn area(mut s: Shape) -> Int {
+    let g = fn() -> Int {
+        match s {
+            Circle(r) => r * 3
+            Square(w) => w * w
+        }
+    }
+    g()
+}
+
+fn main() {
+    io.println("{up(Stack { items: [] })} {area(Square(4))}")
+}
+"#, "mut_param_user", "1 16\n")
+}
+
+test "a closure shares the mut parameter of the handler operation it is written in" {
+    both_modes(#"
+effect Sink {
+    effect Put {
+        fn put(xs: List[Int]) -> Int
+    }
+}
+
+fn use_sink(xs: List[Int]) -> Int ! Sink.Put {
+    sink.put(xs)
+}
+
+fn outer() -> Int {
+    with handler Sink.Put {
+        fn put(mut xs: List[Int]) -> Int {
+            let g = fn() { xs.push(1) }
+            g()
+            xs.len()
+        }
+    } {
+        use_sink([5, 6])
+    }
+}
+
+fn main() {
+    io.println("{outer()}")
+}
+"#, "mut_param_handler_op", "3\n")
+}
+
+test "a precondition reads a mut parameter a closure shares" {
+    both_modes(#"
+@requires(xs.len() > 0)
+@verify(fallback: "runtime")
+fn first_then_push(mut xs: List[Int]) -> Int {
+    let g = fn() { xs.push(xs.get(0).unwrap()) }
+    g()
+    xs.len()
+}
+
+fn main() {
+    io.println("{first_then_push([4])}")
+}
+"#, "mut_param_requires", "2\n")
+}
+
+test "a closure shares a mut parameter of a generic function" {
+    both_modes(#"
+fn add_twice[T](mut xs: List[T], x: T) -> Int {
+    let g = fn() { xs.push(x) }
+    g()
+    g()
+    xs.len()
+}
+
+fn main() {
+    io.println("{add_twice([1], 2)} {add_twice(["a"], "b")}")
+}
+"#, "mut_param_generic", "3 3\n")
+}
+
+// The enter event and the exit checks read the parameter through its cell, so the cell has
+// to hold the argument before either runs.
+test "a traced function and a traced closure name a shared mut parameter's argument" {
+    let src = #"
+fn h(mut xs: List[Int]) -> Int {
+    let g = fn() { xs.push(9) }
+    g()
+    xs.len()
+}
+
+fn own() -> Int {
+    let f = fn(mut ys: List[Int]) -> Int {
+        let g = fn() { ys.push(1) }
+        g()
+        ys.len()
+    }
+    f([7, 8])
+}
+
+fn main() {
+    io.println("{h([1])} {own()}")
+}
+"#
+    for mode in [("pm", "--per-module"), ("wp", "--no-per-module")] {
+        let (tag, flag) = mode
+        let r = run_built(src, "mut_param_trace_{tag}", "{flag} --trace", ["BLINK_TRACE=all"])
+        assert(r.success(), r.err_out)
+        assert_eq(r.out, "2 3\n")
+        assert(r.err_out.contains("\"args\":\{\"xs\":\"[1]\"\}"), r.err_out)
+        assert(r.err_out.contains("\"args\":\{\"ys\":\"[7, 8]\"\}"), r.err_out)
+    }
+}
+
+test "an ensures clause reads old() of a mut parameter a closure shares" {
+    both_modes(#"
+@ensures(xs.len() == old(xs.len()) + 1)
+@ensures(result == xs.len())
+@verify(fallback: "runtime")
+fn h(mut xs: List[Int]) -> Int {
+    let g = fn() { xs.push(9) }
+    g()
+    xs.len()
+}
+
+fn main() {
+    io.println("{h([1, 2])}")
+}
+"#, "mut_param_ensures_old", "3\n")
+}
+
+// Guard rows: the shapes that already built before a mut parameter could be shared.
+
+test "a closure captures a parameter that is not mut" {
+    both_modes(#"
+fn plain(xs: List[Int]) -> Int {
+    let g = fn() -> Int { xs.len() }
+    g()
+}
+
+fn main() {
+    io.println("{plain([1, 2])}")
+}
+"#, "plain_param", "2\n")
+}
+
+test "a closure shares a let mut local both ways" {
+    both_modes(#"
+fn locals() -> Str {
+    let mut xs = [1]
+    let g = fn() -> Int { xs.len() }
+    xs.push(5)
+    let h = fn() { xs.push(9) }
+    h()
+    let mut n = 0
+    let inc = fn() { n += 1 }
+    inc()
+    inc()
+    let outer = fn() {
+        let inner = fn() { n += 10 }
+        inner()
+    }
+    outer()
+    "{g()} {xs.len()} {n}"
+}
+
+fn main() {
+    io.println(locals())
+}
+"#, "let_mut_local", "3 3 12\n")
+}
+
+test "a mut parameter no closure captures keeps working" {
+    both_modes(#"
+fn k(mut xs: List[Int]) -> Int {
+    xs.push(3)
+    let g = fn(ys: List[Int]) -> Int { ys.len() }
+    g(xs)
+}
+
+fn main() {
+    io.println("{k([1])}")
+}
+"#, "mut_param_uncaptured", "2\n")
+}

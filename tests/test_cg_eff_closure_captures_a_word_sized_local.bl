@@ -30,7 +30,8 @@ import layout.{bind_binder_mut, binder_scope_pop, binder_scope_push, layout_rese
 import ir.{IrKind, ir_c_name, ir_capture_descs, ir_promoter, ir_kid_count, ir_kid, ir_kind, ir_reset, ir_verify}
 import cg_reg.{cg_reg_build}
 import cg_expr.{cg_expr_reset}
-import cg_print.{print_reset, print_take}
+import cg_print.{print_block_body, print_reset, print_take}
+import cname.{c_cell_name, c_local_name}
 import cg_stmt.{cg_stmt_reset, lower_block_returning, lower_fn}
 import cg_eff.{
     cg_eff_lower_closure, cg_eff_pending_thunks, cg_eff_print_thunk, cg_eff_reset,
@@ -105,9 +106,8 @@ fn no_capture_at_all() -> Int {
     g_none(1)
 }
 
-// `mut` on a param parses, though name resolution does not honor it yet -- see
-// bind_params in src/cg_stmt.bl. The capture must still refuse this the way a shared
-// `let mut` does, not copy it, because copying would go stale the day reassignment works.
+// A closure shares a `mut` parameter the way it shares a `let mut`, so the parameter
+// lives in a cell that the function and the closure both read.
 fn capture_mut_param(mut p: Int) -> Int {
     let g_mut_param = fn(x: Int) -> Int { x + p }
     g_mut_param(1)
@@ -419,18 +419,22 @@ test "a let records its own mutability, so a mut capture builds through a cell j
     assert_eq(cg_eff_pending_thunks(), 1)
 }
 
-test "a mut param records mutable and refuses the capture, not a silent copy" {
-    // Name resolution does not honor `mut` on a param yet, but bind_params records the
-    // parsed flag anyway. A mutable, non-celled binder hits the same refusal a shared
-    // `let mut` hits before its cell lands -- capturing it must not silently copy a
-    // value the day reassignment starts working. lower_fn swallows a stopped body into
-    // an empty block rather than a negative id, so the refusal is read off the ICE, not
-    // off lower_whole_fn's return.
+test "a mut param a closure captures builds through a cell, not a silent copy" {
+    // A `mut self` writer of a builtin value changes the parameter in place, and a copy
+    // taken by the closure would miss that write, so the parameter gets the cell a shared
+    // `let mut` gets. The cell starts from the C parameter, and the closure's capture
+    // word is the cell.
     setup()
-    lower_whole_fn("capture_mut_param")
-    assert(ices_mentioning("`p`") > 0)
-    assert(ices_mentioning("has no cell yet") > 0)
-    assert_eq(cg_eff_pending_thunks(), 0)
+    let body = lower_whole_fn("capture_mut_param")
+    if body < 0 || ices() != 0 { report_ices("capture_mut_param was refused") }
+    assert(body >= 0)
+    assert_eq(ices_mentioning("`p`"), 0)
+    assert_eq(ices_mentioning("shared"), 0)
+    assert_eq(cg_eff_pending_thunks(), 1)
+    print_reset()
+    print_block_body(body)
+    let text = print_take()
+    assert(cg_text_occurrences(text, "int64_t* {c_cell_name(c_local_name("p"))} =") == 1)
 }
 
 test "a mutable tuple-destructure leaf builds through a cell just like a plain mut local" {

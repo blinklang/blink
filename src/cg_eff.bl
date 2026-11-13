@@ -36,7 +36,7 @@ import ir.{
     ir_assign, ir_block, ir_box, ir_call_direct, ir_call_runtime, ir_cast,
     ir_closure_new, ir_const, ir_effect_perform, ir_evidence_address, ir_evidence_vector,
     ir_field_get, ir_handler_install, ir_if, ir_let, ir_struct_new, ir_unbox, ir_var_ref,
-    ir_expr_stmt, ir_return,
+    ir_expr_stmt, ir_return, ir_cell_let,
 }
 import cg_print.{
     DefaultSlot, print_closure_thunk, print_handler_builder, print_resource_guard_support, print_spawn_pair_typedef,
@@ -48,6 +48,7 @@ import cg_reg.{cg_reg_effect_root_decl, cg_reg_impl_decls, cg_reg_io_derived_dec
 import cg_promote.{cg_promote_capture_table}
 import cg_trace.{cg_trace_builtin_effect, cg_trace_closure_frame, cg_trace_effect, cg_trace_effect_path, cg_trace_frame_module, cg_trace_handler_frame, cg_trace_in_std, cg_trace_thunk_enter}
 import free_names.{closure_read_names}
+import escape.{spawn_mut_param_reads}
 import cg_decl.{cg_decl_is_per_instance, cg_decl_takes_ev}
 import cg_expr.{
     cg_expr_push_pending, lower_expr, lower_expr_as_value, lower_value_as_text, cg_expr_option_some, cg_expr_option_none,
@@ -384,6 +385,10 @@ type PendingThunk {
     trace_module: Str = ""
     trace_at: Int = -1
     trace_in_std: Bool = false
+    // The cell declarations of the `mut` parameters the thunk's own closures share, set at
+    // its open. They belong to this thunk, so the driver reads them by index, not from
+    // whichever thunk is open.
+    param_cells: List[Int] = []
 }
 
 let mut eff_thunks: List[PendingThunk] = []
@@ -1333,10 +1338,12 @@ pub fn cg_eff_thunk_open(i: Int) -> Int ! Diag.Report {
         eff_op_outer_name = th.outer_name
         eff_op_field = ev_field_of(th.handler_tid, th.closure)
     }
-    if !bind_thunk_params(th, scope) {
+    let mut cells: List[Int] = []
+    if !bind_thunk_params(th, scope, cells) {
         cg_eff_thunk_close()
         return -1
     }
+    eff_thunks.set(t, PendingThunk { param_cells: cells, ..th })
     scope
 }
 
@@ -1369,7 +1376,7 @@ pub fn cg_eff_thunk_close() ! Diag.Report {
 // The parameter types come from the Fn tid, the same source the signature is spelled
 // from, so a binder and its declaration cannot disagree. Answers false when a slot has no
 // type: a parameter left unbound would resolve to an outer name instead.
-fn bind_thunk_params(th: PendingThunk, scope: Int) -> Bool ! Diag.Report {
+fn bind_thunk_params(th: PendingThunk, scope: Int, mut cells: List[Int]) -> Bool ! Diag.Report {
     let ps = node_params(thunk_sig_node(th))
     if ps == -1 { return true }
     let mut k = 0
@@ -1382,10 +1389,7 @@ fn bind_thunk_params(th: PendingThunk, scope: Int) -> Bool ! Diag.Report {
                 "typecheck stamps one type per parameter of a closure and of a handler operation; this is a compiler bug")
             return false
         }
-        // Reads the parsed `mut` keyword, not a hardcoded false: name resolution does not
-        // honor it yet, but the thunk's own rebind of its closure's param must not bake
-        // that gap in and silently copy a param that becomes reassignable the day it does.
-        bind_binder_mut(scope, node_name(p), tid, node_is_mut(p) == 1)
+        if !cg_eff_bind_param(scope, ps, k, tid, cells) { return false }
         if !thunk_local_is_declared(scope, node_name(p), c_param_name(ps, k), p) { return false }
         k = k + 1
     }
@@ -1402,7 +1406,7 @@ fn bind_thunk_params(th: PendingThunk, scope: Int) -> Bool ! Diag.Report {
         } else {
             // captures_are_buildable already refused a mutable, non-celled capture
             // before this runs, so every name reaching here was immutable to begin
-            // with; the thunk's copy of it stays immutable too.
+            // with, a `mut` parameter included; the thunk's copy of it stays immutable too.
             bind_binder_mut(scope, nm, ctid, false)
         }
         if !thunk_local_is_declared(scope, nm, c_local_name(nm), th.closure) { return false }
@@ -1457,7 +1461,7 @@ let mut eff_shared_names: List[Str] = []
 // `fn_like` is the FnDef or Closure whose frame is about to lower, and the answer covers
 // that frame alone. A binding declared inside a nested closure belongs to the nested frame,
 // which is scanned again when its thunk opens.
-pub fn cg_eff_scan_shared_binders(fn_like: Int) {
+pub fn cg_eff_scan_shared_binders(fn_like: Int) ! Diag.Report {
     eff_shared_names = []
     eff_frame_written = []
     let body = node_body(fn_like)
@@ -1472,7 +1476,60 @@ pub fn cg_eff_scan_shared_binders(fn_like: Int) {
     if read.len() == 0 { return }
     let mut found: List[Str] = []
     collect_shared_muts(body, read, found, kids)
+    collect_shared_mut_params(fn_like, read, spawn_mut_param_reads(body), found)
     eff_shared_names = found
+}
+
+// A parameter is a binding like a `let` one (sections/03_types.md §3.6 Mutable Parameters),
+// and a closure shares every binding it captures, so a `mut` parameter a closure reads is
+// shared the way a `let mut` is. A `mut self` writer of a builtin value type, such as Bytes
+// (§3.2.3), changes the binding in place, and a copy taken by the closure would miss that
+// write. A user type cannot write a field of a parameter (E0612), so only a builtin can.
+// A parameter a spawned task reads gets no cell: the spec has not yet said whether a task may
+// share a `mut` parameter, so the build refuses it as it did before parameters had cells.
+fn collect_shared_mut_params(fn_like: Int, read: List[Str], spawned: List[Str], out: List[Str]) {
+    let ps = node_params(fn_like)
+    if ps == -1 { return }
+    let mut i = 0
+    while i < sublist_length(ps) {
+        let p = sublist_get(ps, i)
+        let nm = node_name(p)
+        if node_is_mut(p) == 1 && read.contains(nm) && !spawned.contains(nm) && !out.contains(nm) { out.push(nm) }
+        i += 1
+    }
+}
+
+// The cells of thunk `i`'s shared `mut` parameters, to declare ahead of its body.
+pub fn cg_eff_thunk_param_cells(i: Int) -> List[Int] ! Diag.Report {
+    let t = thunk_at(i)
+    if t < 0 { return [] }
+    eff_thunks.get(t).unwrap().param_cells
+}
+
+// Reads the parsed `mut` keyword, not the binder's mutability, since a parameter is bound
+// here first. The cell starts from the C parameter, named as the signature names it.
+pub fn cg_eff_bind_param(scope: Int, ps: Int, k: Int, tid: Int, mut cells: List[Int]) -> Bool ! Diag.Report {
+    let p = sublist_get(ps, k)
+    let name = node_name(p)
+    let is_mut = node_is_mut(p) == 1
+    if !is_mut || !cg_eff_binder_is_shared(name) {
+        bind_binder_mut(scope, name, tid, is_mut)
+        return true
+    }
+    let rec = layout_or_ice(tid, Position.Local, p, "UnspellableParamCell", "shared `mut` parameter")
+    if rec.c_spelling == "" { return false }
+    let param = ir_var_ref(tid, p, rec.c_spelling, c_param_name(ps, k), rec.slot_form)
+    cells.push(cg_eff_declare_cell(scope, name, tid, p, rec, param))
+    true
+}
+
+// Every shared binding, a `let mut`, a pattern binder or a `mut` parameter, is declared
+// here, so the frame's cell and the thunk prologue's read of it get one C name.
+pub fn cg_eff_declare_cell(scope: Int, name: Str, tid: Int, span: Int, rec: LayoutRecord, init: Int) -> Int ! Diag.Report {
+    bind_binder_cell(scope, name, tid)
+    let bound = binder_c_local_name(scope, name, span)
+    let c_name = if bound.is_empty() { c_local_name(name) } else { bound }
+    ir_cell_let(tid, span, rec.c_spelling, c_name, rec.slot_form, init)
 }
 
 // Whether the binding of this name in the frame now lowering is shared with a closure, and

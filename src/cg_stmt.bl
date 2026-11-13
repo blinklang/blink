@@ -27,7 +27,7 @@ import typecheck.{
     tc_is_panic_hook_item, tc_panic_hook_fn_type, tc_panic_info_type, make_option_type,
 }
 import layout.{
-    Position, Slot, SlotForm, LayoutRecord, async_scope_handles_spelling, bind_binder_cell,
+    Position, Slot, SlotForm, LayoutRecord, async_scope_handles_spelling,
     bind_binder_mut, binder_c_local_name, binder_c_names_begin, binder_is_celled,
     binder_scope_pop, binder_scope_push_under, carrier_member_layout, child_tid,
     current_binder_scope,
@@ -43,7 +43,7 @@ import cname.{
 }
 import ir.{
     ir_line_text, ir_note_source, ir_line, ir_col, IrKind, ir_assign, ir_binary, ir_block, ir_break, ir_call_runtime, ir_carrier_tag,
-    ir_call_direct, ir_cast, ir_cell_let, ir_cell_ref, ir_c_name, ir_c_spelling, ir_const, ir_continue,
+    ir_call_direct, ir_cast, ir_cell_ref, ir_c_name, ir_c_spelling, ir_const, ir_continue,
     ir_expr_stmt, ir_field_get, ir_global_ref, ir_if, ir_kid, ir_kid_count, ir_kids, ir_kind, ir_let,
     ir_loop, ir_mark_materialize, ir_new, ir_return, ir_slot_form, ir_span, ir_switch, ir_tid,
     ir_tuple_new, ir_unary, ir_unreachable, ir_var_ref, ir_with_scope,
@@ -69,7 +69,7 @@ import cg_eff.{
     cg_eff_async_scope_exit_symbol, cg_eff_binder_is_shared, cg_eff_block_handler_calls,
     cg_eff_block_handler_enter, cg_eff_block_handler_impl, cg_eff_frame_written, cg_eff_lower_handler_install, cg_eff_lower_handler_install_of,
     cg_eff_resource_cleanup,
-    cg_eff_scan_shared_binders,
+    cg_eff_scan_shared_binders, cg_eff_bind_param, cg_eff_declare_cell,
 }
 import cg_call.{
     AssertKind, ForInIteration, ForInStrategy, cc_assert_family_kind, cc_display_or_placeholder,
@@ -327,7 +327,8 @@ pub fn lower_fn(fn_node: Int) -> Int ! Diag.Report {
     // allocated where the binding is declared. So which names are shared has to be settled
     // before the first statement lowers: a declaration cannot ask a closure below it.
     cg_eff_scan_shared_binders(fn_node)
-    let bound = bind_params(fn_node, scope)
+    let mut cells: List[Int] = []
+    let bound = bind_params(fn_node, scope, cells)
     let tail = if fn_returns_value(fn_node) { TAIL_RETURN } else { TAIL_DISCARD }
     let body = node_body(fn_node)
     // `?` in the body returns the enclosing function's carrier on the failure arm, and `?`
@@ -348,7 +349,10 @@ pub fn lower_fn(fn_node: Int) -> Int ! Diag.Report {
     // A stopped body, a parameter with no type and a declaration with no body all leave
     // nothing worth printing; see The stop above.
     if block < 0 { return -1 }
-    let mut stmts = enter
+    // A shared parameter's cell holds its value before the trace and the entry checks
+    // read the name, since every read of the name goes through the cell.
+    let mut stmts = cells
+    for s in enter { stmts.push(s) }
     for s in entry { stmts.push(s) }
     if stmts.len() == 0 && falls_off.len() == 0 && leave.len() == 0 { return block }
     stmts.push(block)
@@ -572,8 +576,9 @@ fn fn_returns_value(fn_node: Int) -> Bool ! Diag.Report {
 }
 
 // Answers false when a parameter has no recorded type. The body reads its parameters, so
-// one left unbound is a name the body resolves somewhere else instead.
-fn bind_params(fn_node: Int, scope: Int) -> Bool ! Diag.Report {
+// one left unbound is a name the body resolves somewhere else instead. The cell of each
+// `mut` parameter a closure shares is declared onto `cells`.
+fn bind_params(fn_node: Int, scope: Int, mut cells: List[Int]) -> Bool ! Diag.Report {
     let params = node_params(fn_node)
     if params == -1 { return true }
     let mut i = 0
@@ -581,10 +586,7 @@ fn bind_params(fn_node: Int, scope: Int) -> Bool ! Diag.Report {
         let p = sublist_get(params, i)
         let tid = stmt_tid(p)
         if tid < 0 { return false }
-        // Reads the parsed `mut` keyword, not a hardcoded false: name resolution does not
-        // honor it yet, but codegen must not bake that gap in and silently copy a param
-        // that becomes reassignable the day it does.
-        bind_binder_mut(scope, node_name(p), tid, node_is_mut(p) == 1)
+        if !cg_eff_bind_param(scope, params, i, tid, cells) { return false }
         i = i + 1
     }
     true
@@ -1375,8 +1377,7 @@ fn bind_and_declare_let(node: Int, tid: Int, rec: LayoutRecord, name: Str, value
     }
     let is_mut = node_is_mut(node) == 1
     if is_mut && cg_eff_binder_is_shared(name) {
-        bind_binder_cell(cur_scope(), name, tid)
-        return ir_cell_let(tid, node, rec.c_spelling, binder_c_local(name, node), rec.slot_form, value)
+        return cg_eff_declare_cell(cur_scope(), name, tid, node, rec, value)
     }
     bind_binder_mut(cur_scope(), name, tid, is_mut)
     let c_name = binder_c_local(name, node)
@@ -1514,8 +1515,7 @@ fn bind_sub_pattern(sub: Int, tid: Int, value: Int, rec: LayoutRecord, out: List
 // writes must be volatile to keep its value across the longjmp back.
 fn bind_pattern_binder(span: Int, decl: Int, name: Str, tid: Int, rec: LayoutRecord, value: Int, out: List[Int], is_mut: Bool) ! Diag.Report {
     if is_mut && cg_eff_binder_is_shared(name) {
-        bind_binder_cell(cur_scope(), name, tid)
-        out.push(ir_cell_let(tid, span, rec.c_spelling, binder_c_local(name, span), rec.slot_form, value))
+        out.push(cg_eff_declare_cell(cur_scope(), name, tid, span, rec, value))
         return
     }
     bind_binder_mut(cur_scope(), name, tid, is_mut)

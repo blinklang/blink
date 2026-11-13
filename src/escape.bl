@@ -1238,10 +1238,23 @@ fn check_spawn_mut_captures(fn_node: Int) ! Diag.Report {
     let body = node_body(fn_node)
     if body == -1 { return }
     let mut kids: List[Int] = []
-    smc_walk(body, body, kids)
+    let mut unused: List[Str] = []
+    smc_walk(body, body, kids, false, unused)
 }
 
-fn smc_walk(node: Int, body: Int, kids: List[Int]) ! Diag.Report {
+// The names of the `mut` parameters that a closure sent to a task in `body` reads. The spec
+// does not yet say whether a spawned task may share a `mut` parameter with the function that
+// spawned it, so codegen gives such a parameter no cell and the build still stops there.
+pub fn spawn_mut_param_reads(body: Int) -> List[Str] ! Diag.Report {
+    let mut kids: List[Int] = []
+    let mut out: List[Str] = []
+    if body != -1 { smc_walk(body, body, kids, true, out) }
+    out
+}
+
+// With `params` false it reports each `let mut` a spawned closure reads (E0650); with
+// `params` true it reports nothing and collects the `mut` parameters such a closure reads.
+fn smc_walk(node: Int, body: Int, kids: List[Int], params: Bool, out: List[Str]) ! Diag.Report {
     if node == -1 { return }
     if node_kind(node) == NodeKind.MethodCall && is_async_spawn(node) {
         let args_sl = node_args(node)
@@ -1250,8 +1263,14 @@ fn smc_walk(node: Int, body: Int, kids: List[Int]) ! Diag.Report {
             let arg = sublist_get(args_sl, i)
             let mut reads: List[Int] = []
             let mut seen: List[Int] = []
-            mut_captures_reached(arg, body, reads, seen)
-            for read in reads { emit_spawn_mut_capture(arg, read) }
+            mut_captures_reached(arg, body, reads, seen, params)
+            for read in reads {
+                if !params {
+                    emit_spawn_mut_capture(arg, read)
+                } else if !out.contains(node_name(read)) {
+                    out.push(node_name(read))
+                }
+            }
             i = i + 1
         }
     }
@@ -1260,7 +1279,7 @@ fn smc_walk(node: Int, body: Int, kids: List[Int]) ! Diag.Report {
     let end = kids.len()
     let mut i = base
     while i < end {
-        smc_walk(kids.get(i).unwrap(), body, kids)
+        smc_walk(kids.get(i).unwrap(), body, kids, params, out)
         i = i + 1
     }
     drop_kids_to(kids, base)
@@ -1276,7 +1295,7 @@ fn drop_kids_to(kids: List[Int], base: Int) {
 
 // Collects one read per `let mut` binder the value of `node` captures. `seen` holds the
 // binders already visited, so a binder is reported once and a self-referencing let ends.
-fn mut_captures_reached(node: Int, body: Int, reads: List[Int], seen: List[Int]) {
+fn mut_captures_reached(node: Int, body: Int, reads: List[Int], seen: List[Int], params: Bool) {
     if node == -1 { return }
     let k = node_kind(node)
     if k == NodeKind.Closure {
@@ -1284,10 +1303,10 @@ fn mut_captures_reached(node: Int, body: Int, reads: List[Int], seen: List[Int])
             let binder = tc_ident_binder_node(read)
             if binder < 0 || seen.contains(binder) { continue }
             seen.push(binder)
-            if is_mut_binder(binder) {
+            if (params && is_mut_param(binder)) || (!params && is_mut_binder(binder)) {
                 reads.push(read)
             } else if is_fn_typed(read) {
-                closure_values_of(binder, body, reads, seen)
+                closure_values_of(binder, body, reads, seen, params)
             }
         }
         return
@@ -1296,42 +1315,42 @@ fn mut_captures_reached(node: Int, body: Int, reads: List[Int], seen: List[Int])
         let binder = tc_ident_binder_node(node)
         if binder < 0 || seen.contains(binder) { return }
         seen.push(binder)
-        closure_values_of(binder, body, reads, seen)
+        closure_values_of(binder, body, reads, seen, params)
         return
     }
     if k == NodeKind.IfExpr {
-        mut_captures_reached(node_then_body(node), body, reads, seen)
-        mut_captures_reached(node_else_body(node), body, reads, seen)
+        mut_captures_reached(node_then_body(node), body, reads, seen, params)
+        mut_captures_reached(node_else_body(node), body, reads, seen, params)
         return
     }
     if k == NodeKind.MatchExpr {
         let arms_sl = node_arms(node)
         let mut i = 0
         while arms_sl != -1 && i < sublist_length(arms_sl) {
-            mut_captures_reached(node_body(sublist_get(arms_sl, i)), body, reads, seen)
+            mut_captures_reached(node_body(sublist_get(arms_sl, i)), body, reads, seen, params)
             i = i + 1
         }
         return
     }
     if k == NodeKind.Block {
-        mut_captures_reached(block_tail_node(node), body, reads, seen)
+        mut_captures_reached(block_tail_node(node), body, reads, seen, params)
         return
     }
     if k == NodeKind.ExprStmt {
-        mut_captures_reached(node_value(node), body, reads, seen)
+        mut_captures_reached(node_value(node), body, reads, seen, params)
     }
 }
 
 // Every value a binder can hold: a `let`'s initializer and, for a mutable binder, each
 // value assigned to it in the body.
-fn closure_values_of(binder: Int, body: Int, reads: List[Int], seen: List[Int]) {
+fn closure_values_of(binder: Int, body: Int, reads: List[Int], seen: List[Int], params: Bool) {
     if node_kind(binder) == NodeKind.LetBinding {
-        mut_captures_reached(node_value(binder), body, reads, seen)
+        mut_captures_reached(node_value(binder), body, reads, seen, params)
     }
     if !is_mut_binder(binder) { return }
     let mut assigned: List[Int] = []
     assignments_to(body, binder, assigned)
-    for v in assigned { mut_captures_reached(v, body, reads, seen) }
+    for v in assigned { mut_captures_reached(v, body, reads, seen, params) }
 }
 
 fn assignments_to(node: Int, binder: Int, out: List[Int]) {
@@ -1356,6 +1375,10 @@ fn is_mut_binder(binder: Int) -> Bool {
     }
     let binds = k == NodeKind.LetBinding || k == NodeKind.IdentPattern || k == NodeKind.AsPattern || k == NodeKind.StructLitField
     binds && node_is_mut(binder) != 0
+}
+
+fn is_mut_param(binder: Int) -> Bool {
+    node_kind(binder) == NodeKind.Param && node_is_mut(binder) != 0
 }
 
 // Reported at the read when the spawned closure holds it, and at the argument when the
