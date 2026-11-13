@@ -1,0 +1,71 @@
+// A generic fn that passes its type parameter on to a fn that keys a Map or Set by it (bare,
+// in a tuple, in a @derive(Hash, Eq) type, through a fn value, or through recursion) builds
+// and runs at each call whose argument has Hash: a scalar, a string, a derived type, and any
+// type through a `T: Hash + Eq` bound. The check that refuses such a call where the argument
+// lacks Hash (§3.6 "Non-hashable keys and elements in general") must not refuse these. The
+// program prints the same text in the one-unit and the per-module build.
+
+import std.fs
+import std.process.{ProcessResult}
+import compile_test_helpers.{scratch_root}
+
+let program_src = [
+    "@derive(Hash, Eq)",
+    "type Pt \{ x: Int }",
+    "@derive(Hash, Eq)",
+    "type Boxed[A] \{ v: A }",
+    "fn wrap[K](k: K) -> Int \{",
+    "    let mut s = Set()",
+    "    s.insert(k)",
+    "    s.insert(k)",
+    "    s.len()",
+    "}",
+    "fn wrap_map[K](k: K) -> Int \{",
+    "    let mut m: Map[K, Int] = Map()",
+    "    m.insert(k, 1)",
+    "    m.insert(k, 2)",
+    "    m.len() * 10 + (m.get(k) ?? 0)",
+    "}",
+    "fn mid[U](u: U) -> Int \{ wrap(u) + wrap_map(u) }",
+    "fn outer[T](t: T) -> Int \{ mid(t) }",
+    "fn tup[T](t: T) -> Int \{ wrap((t, 1)) }",
+    "fn boxed[T](t: T) -> Int \{ wrap(Boxed \{ v: t }) }",
+    "fn by_value[T](t: T) -> Int \{",
+    "    let g = wrap",
+    "    g(t)",
+    "}",
+    "fn bounded[T: Hash + Eq](t: T) -> Int \{ outer(t) }",
+    "fn ping[A](a: A, n: Int) -> Int \{",
+    "    if n <= 0 \{ return 0 }",
+    "    pong(a, n - 1)",
+    "}",
+    "fn pong[B](b: B, n: Int) -> Int \{",
+    "    let mut s = Set()",
+    "    s.insert(b)",
+    "    s.len() + ping(b, n - 1)",
+    "}",
+    "fn main() \{",
+    "    io.println(\"\{outer(3)} \{outer(\"a\")} \{outer(Pt \{ x: 1 })} \{outer((1, 'c'))}\")",
+    "    io.println(\"\{tup(Pt \{ x: 2 })} \{boxed(\"b\")} \{by_value(Pt \{ x: 3 })}\")",
+    "    io.println(\"\{bounded(Pt \{ x: 4 })} \{ping(Pt \{ x: 5 }, 4)} \{ping(7, 3)}\")",
+    "}",
+    "",
+].join("\n")
+
+fn sh(cmd: Str) -> ProcessResult ! Process.Spawn {
+    process.run("sh", ["-c", cmd]).unwrap()
+}
+
+test "a key role through nested generic calls builds and runs at Hash arguments in each build" {
+    let root = "{scratch_root()}/nested_key_role_{getpid()}"
+    let _ = sh("rm -rf {root} && mkdir -p {root}")
+    fs.write("{root}/main.bl", program_src).unwrap()
+    let blink = sh("readlink -f build/blink").out.trim()
+    let mut failed: List[Str] = []
+    for mode in ["--no-per-module", "--per-module"] {
+        let r = sh("cd {root} && env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE timeout 300 {blink} run {mode} main.bl < /dev/null 2>&1")
+        if !r.success() || r.out != "13 13 13 13\n1 1 1\n13 2 2\n" { failed.push("blink run {mode}: {r.end}\n{r.out}") }
+    }
+    let _ = sh("rm -rf {root}")
+    assert_eq(failed, [])
+}
