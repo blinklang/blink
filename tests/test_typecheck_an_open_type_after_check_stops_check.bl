@@ -1,0 +1,174 @@
+// No open type leaves the type check (section 6.7, and the rule for under-determined types). A
+// node whose type is open below its top, or names a type parameter outside the declaration that
+// binds it, cannot be laid out by the build, so a clean `blink check` must not pass it. In a
+// program with no other error the fault is the compiler's, so the report is internal error I0024.
+// A type parameter is closed wherever the declaration that binds it holds the node: in its own
+// body, in a field default of its type, in a trait's default argument, and, through a projection
+// `S.Item`, wherever S is.
+import std.fs
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_count, diag_entries, diag_reset}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+
+fn check_src(path: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    init_embedded_stdlib()
+    fs.write(path, src).unwrap()
+    diag_reset()
+    let _program = compile_to_program(path, 1)
+    check_types(_program)
+    let _ = fs.delete(path)
+}
+
+fn ices() -> List[Str] {
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "ice" { out.push("{d.code} {d.line}:{d.col} {d.message}") }
+    }
+    out
+}
+
+// A closure that matches a generic variant under a pattern takes the variant's type from the
+// type's declaration, so its result keeps the declaration's own `T`.
+test "a closure result that keeps a generic type's own parameter is I0024 at check" {
+    let mut s = "type E[T] \{\n    L(T)\n    N\n}\n"
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let f = fn(p) \{\n")
+    s = s.concat("        match p \{\n")
+    s = s.concat("            Some(E.L(a)) => a\n")
+    s = s.concat("            _ => 0\n")
+    s = s.concat("        }\n")
+    s = s.concat("    }\n")
+    s = s.concat("    io.println(\"\{f(Some(E.L(3)))}\")\n")
+    s = s.concat("}\n")
+    check_src("build/tc_open_type_option_pattern.bl", s)
+    assert_eq(diag_count, 0)
+    assert_eq(ices(), ["I0024 7:9 a MatchExpr node reached the end of type checking with the open type T"])
+}
+
+test "the same closure under a list pattern is I0024 at check" {
+    let mut s = "type E[T] \{\n    L(T)\n    N\n}\n"
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let f = fn(p) \{\n")
+    s = s.concat("        match p \{\n")
+    s = s.concat("            [E.L(a), E.N] => a\n")
+    s = s.concat("            _ => 0\n")
+    s = s.concat("        }\n")
+    s = s.concat("    }\n")
+    s = s.concat("    io.println(\"\{f([E.L(3), E.N])}\")\n")
+    s = s.concat("}\n")
+    check_src("build/tc_open_type_list_pattern.bl", s)
+    assert_eq(diag_count, 0)
+    assert_eq(ices(), ["I0024 7:9 a MatchExpr node reached the end of type checking with the open type T"])
+}
+
+// `Self` is a parameter of a trait. An impl whose type is written `Self` has no trait around it.
+test "Self as the type of an impl is I0024 at check" {
+    let mut s = "trait Tr \{ fn f(self) -> Int }\n"
+    s = s.concat("impl Tr for Self \{ fn f(self) -> Int \{ 1 } }\n")
+    s = s.concat("fn main() \{ io.println(\"ok\") }\n")
+    check_src("build/tc_open_type_self_impl.bl", s)
+    assert_eq(diag_count, 0)
+    assert_eq(ices(), ["I0024 2:25 a Param node reached the end of type checking with the open type Self"])
+}
+
+test "a parameter in its own body, an impl's body and a method's own body is closed" {
+    let mut s = "type Bx[T] \{ v: T }\n"
+    s = s.concat("trait Holds \{\n    fn size(self) -> Int\n    fn pair[U](self, u: U) -> Int\n}\n")
+    s = s.concat("impl[T] Holds for Bx[T] \{\n")
+    s = s.concat("    fn size(self) -> Int \{\n        let xs: List[T] = [self.v]\n        xs.len()\n    }\n")
+    s = s.concat("    fn pair[U](self, u: U) -> Int \{\n        let t: (T, U) = (self.v, u)\n        let (_a, _b) = t\n        2\n    }\n")
+    s = s.concat("}\n")
+    s = s.concat("fn wrap[T](x: T) -> List[Option[T]] \{ [Some(x), None] }\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let b = Bx \{ v: 2 }\n")
+    s = s.concat("    io.println(\"\{b.size()} \{b.pair(\"s\")} \{wrap(1).len()}\")\n")
+    s = s.concat("}\n")
+    check_src("build/tc_open_type_own_body.bl", s)
+    assert_eq(diag_count, 0)
+    assert_eq(ices(), [])
+}
+
+test "a field default and a trait default argument of a parameter are closed" {
+    let mut s = "type Cell[T] \{\n    v: Option[T] = None\n}\n"
+    s = s.concat("trait Tr[T] \{\n    fn has(self, -- d: Option[T] = None) -> Bool\n}\n")
+    s = s.concat("trait Maker \{\n    fn same(self, -- other: Option[Self] = None) -> Bool\n}\n")
+    s = s.concat("type Pt \{ x: Int }\n")
+    s = s.concat("impl Tr[Int] for Pt \{\n    fn has(self, -- d: Option[Int] = None) -> Bool \{ d.is_some() }\n}\n")
+    s = s.concat("impl Maker for Pt \{\n    fn same(self, -- other: Option[Self] = None) -> Bool \{ other.is_none() }\n}\n")
+    s = s.concat("fn has_through[U: Tr[Int]](u: U) -> Bool \{ u.has() }\n")
+    s = s.concat("fn same_through[T: Maker](v: T) -> Bool \{ v.same() }\n")
+    s = s.concat("fn main() \{\n")
+    s = s.concat("    let c: Cell[Int] = Cell \{}\n")
+    s = s.concat("    let p = Pt \{ x: 1 }\n")
+    s = s.concat("    io.println(\"\{c.v.is_none()} \{has_through(p)} \{same_through(p)}\")\n")
+    s = s.concat("}\n")
+    check_src("build/tc_open_type_defaults.bl", s)
+    assert_eq(diag_count, 0)
+    assert_eq(ices(), [])
+}
+
+test "a projection of a bounded parameter is closed in the body that binds it" {
+    let mut s = "trait Shape \{\n    type Item\n    fn first(self) -> Self.Item\n}\n"
+    s = s.concat("type Sq \{ s: Int }\n")
+    s = s.concat("impl Shape for Sq \{\n    type Item = Int\n    fn first(self) -> Int \{ self.s }\n}\n")
+    s = s.concat("fn in_list[S: Shape](s: S) -> Int \{\n")
+    s = s.concat("    let xs = [s.first(), s.first()]\n")
+    s = s.concat("    xs.len()\n")
+    s = s.concat("}\n")
+    s = s.concat("fn main() \{ io.println(\"\{in_list(Sq \{ s: 3 })}\") }\n")
+    check_src("build/tc_open_type_projection.bl", s)
+    assert_eq(diag_count, 0)
+    assert_eq(ices(), [])
+}
+
+// A contract and a refinement sit outside the braces of their declaration but are part of it.
+test "a contract on a generic fn and on a method's own parameter is closed" {
+    let mut s = "@requires(xs.len() > 0)\n@ensures(result.len() == xs.len())\n@verify(fallback: \"runtime\")\n"
+    s = s.concat("fn dup[T](xs: List[T]) -> List[T] \{ xs }\n")
+    s = s.concat("type Bx[T] \{ v: T }\n")
+    s = s.concat("trait Pu \{ fn put[U](self, u: List[U]) -> Int }\n")
+    s = s.concat("impl[T] Pu for Bx[T] \{\n")
+    s = s.concat("    @requires(u.len() >= 0)\n    @verify(fallback: \"runtime\")\n")
+    s = s.concat("    fn put[U](self, u: List[U]) -> Int \{ u.len() }\n")
+    s = s.concat("}\n")
+    s = s.concat("fn main() \{ io.println(\"\{dup([1, 2]).len()} \{Bx \{ v: 1 }.put([2])}\") }\n")
+    check_src("build/tc_open_type_contract.bl", s)
+    assert_eq(diag_count, 0)
+    assert_eq(ices(), [])
+}
+
+test "the refinement of a generic alias is closed" {
+    let mut s = "type NonEmpty[T] = List[T] @where(self.len() > 0)\n"
+    s = s.concat("fn main() \{\n    let x: NonEmpty[Int] = [1]\n    io.println(\"\{x.len()}\")\n}\n")
+    check_src("build/tc_open_type_refinement.bl", s)
+    assert_eq(diag_count, 0)
+    assert_eq(ices(), [])
+}
+
+// The context of `Template[Rd.Read]` is one fixed type, as the context of `Template[Rd]` is.
+test "a template context named by a sub-effect is closed" {
+    let mut s = "pub effect Rd \{\n    effect Read \{\n        fn read(t: Template[Rd.Read]) -> Str\n    }\n}\n"
+    s = s.concat("fn parts(t: Template[Rd.Read]) -> Int \{ t.count() }\n")
+    s = s.concat("fn main() \{\n    let n = 7\n    io.println(\"\{parts(\"a \{n} b\")}\")\n}\n")
+    check_src("build/tc_open_type_sub_effect_template.bl", s)
+    assert_eq(diag_count, 0)
+    assert_eq(ices(), [])
+}
+
+// A node with no type spreads an open type to what reads it. The node is the fault, so it is
+// the one report.
+test "an open type read from a node with no type is not a second report" {
+    let mut s = "effect Ee \{ effect Op \{ fn op(x: Int) -> Int } }\n"
+    s = s.concat("fn main() \{\n    with handler Ee.Op \{\n        fn op(x) -> Int \{\n")
+    s = s.concat("            let ys = [x]\n            let zs = ys\n            zs.len()\n        }\n")
+    s = s.concat("    } \{ io.println(\"x\") }\n}\n")
+    check_src("build/tc_open_type_after_no_type.bl", s)
+    assert_eq(diag_count, 0)
+    let mut codes: List[Str] = []
+    for d in ices() {
+        if d.starts_with("I0024") { codes.push(d) }
+    }
+    assert_eq(codes, [])
+    assert(ices().len() > 0)
+}

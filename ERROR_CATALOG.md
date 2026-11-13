@@ -100,6 +100,7 @@ ICE codes use the `I` prefix. `@allow` and `[lints]` take warning names only, so
 | CompilerPanic | I0021 | The compiler panicked (an unwrap of `None`, an index out of bounds, a formatter with no layout for a node). The compiler stops as on any internal error: it prints what it reported so far in the run's format, the command's status line, and exits 101. A note names the place in the compiler source |
 | UnresolvedMethodAtCodegen | I0022 | A method call reached code generation with no method found for its receiver. The type check reports every such call as `UnresolvedMethod` (E0505) first, so a stop here is a compiler bug. Before, code generation reported E0505 itself; a code that only a build reports is a defect (§6.7) |
 | CallNotAnswered | I0023 | A method call that no rule of inference answers, in a program with no other error. The type check reports it at the call, so `blink check` stops; the build never sees a node with no type (§6.7). The spec gives the call a meaning the type check has no rule for, so it is a compiler bug |
+| OpenTypeAfterCheck | I0024 | A node whose type has an open part below its top (such as `List[?]`), or names a type parameter outside the declaration that binds it, in a program with no other error. The type check reports it at the node, so `blink check` stops; the build never sees an open type (§6.7). It is a compiler bug |
 
 ---
 

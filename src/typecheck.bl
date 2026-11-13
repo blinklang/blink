@@ -31,7 +31,7 @@ import diagnostics.{
     ICE_SEG_UNSOLVED_TYPEVAR, ICE_SEG_UNHANDLED_KIND, ICE_SEG_TID_OUT_OF_RANGE,
     ICE_SEG_ERASED_SLOT, diag_is_ice_seg,
     NON_EXHAUSTIVE_MATCH, INCONSISTENT_PATTERN_BINDINGS, DUPLICATE_MODULE_BINDING,
-    UNSOLVED_TYPEVAR_AT_CODEGEN, CALL_NOT_ANSWERED, SEALED_OPS_REWRITE_INVARIANT, VARIANT_WITHOUT_ENUM,
+    UNSOLVED_TYPEVAR_AT_CODEGEN, CALL_NOT_ANSWERED, OPEN_TYPE_AFTER_CHECK, SEALED_OPS_REWRITE_INVARIANT, VARIANT_WITHOUT_ENUM,
     NO_SUCH_VARIANT, TYPE_ERROR, TEMPLATE_MISMATCH, UNEXPECTED_ANNOTATION, MISSING_RETURN, NO_CONVERSION_IMPL, CANNOT_INFER_TYPE, NOT_ITERABLE, MISSING_ELSE, UNLICENSED_SELF_OP, TRAIT_BOUND_NOT_SATISFIED, CAPABILITY_BUDGET, QM_INVALID_OPERAND, UNDEFINED_FUNCTION,
     UNRESOLVED_METHOD, AMBIGUOUS_METHOD_CALL, MISSING_DISPLAY_IMPL,
     MUTATION_REQUIRES_MUT, MUT_ON_PATTERN, NOT_A_PLACE, PARAM_ASSIGN, diag_error_label_at_notes, diag_add_note_at_spots_since, diag_error_span_label_at_notes, diag_warn_label_at_notes, EMPTY_ROW_OUTSIDE_FFI, PANIC_HOOK_PLACEMENT, TRACE_MESSAGE_EFFECT, METHOD_THROUGH_TYPE_NAME, SELF_OUTSIDE_TRAIT_OR_IMPL, EFFECTS_ANNOTATION_REMOVED, UNKNOWN_EFFECT, diag_fix_before_starts_with, diag_drop_fix_over_others, diag_drop_fix_at,
@@ -46849,9 +46849,221 @@ pub fn tc_stamp_owner_of(index: List[Int], n: Int) -> Int {
     index.get(n).unwrap()
 }
 
+// The scope of a type parameter is the declaration that binds it (§3, under-determined types:
+// no open type leaves the type check): the declaration's node and everything the walk reaches
+// below it, its contracts and refinement too. A parameter is in scope at a node when its
+// declaration is one of the node's enclosing declarations.
+//
+// `scope_of[n]` is the nearest declaration that encloses node n, -1 at module level. `decl_of`
+// gives each parameter node the declaration that binds it. The memo lives as long as one stamp
+// pass.
+type TcTypeScope {
+    scope_of: List[Int]
+    decl_of: Map[Int, Int]
+    plain: Map[Int, Bool]
+}
+
+fn tc_is_scope_decl_kind(k: NodeKind) -> Bool {
+    k == NodeKind.FnDef || k == NodeKind.TypeDef || k == NodeKind.TraitDef || k == NodeKind.ImplBlock || k == NodeKind.EffectDecl
+}
+
+fn tc_bind_params_to(decl_of: Map[Int, Int], sl: Int, d: Int) {
+    if sl == -1 { return }
+    let mut i = 0
+    while i < sublist_length(sl) {
+        let tp = sublist_get(sl, i)
+        if tp != -1 { decl_of.insert(tp, d) }
+        i = i + 1
+    }
+}
+
+// Puts `v` in declaration `d` unless the walk's order put it somewhere already.
+fn tc_seed_scope(scope_of: List[Int], v: Int, d: Int, unset: Int) {
+    if v >= 0 && v < scope_of.len() && scope_of.get(v).unwrap() == unset { scope_of.set(v, d) }
+}
+
+// A declaration's default values belong to it: a field default, a parameter default and an
+// alias's refinement. A call or a literal that leaves the value out reaches the same node
+// through its fill, which may come first in the walk.
+fn tc_seed_defaults(scope_of: List[Int], d: Int, unset: Int) {
+    let ps = node_params(d)
+    if ps != -1 {
+        let mut i = 0
+        while i < sublist_length(ps) {
+            let p = sublist_get(ps, i)
+            if p != -1 { tc_seed_scope(scope_of, node_value(p), d, unset) }
+            i = i + 1
+        }
+    }
+    if node_kind(d) != NodeKind.TypeDef { return }
+    tc_seed_scope(scope_of, node_condition(d), d, unset)
+    let fs = node_fields(d)
+    if fs == -1 { return }
+    let mut i = 0
+    while i < sublist_length(fs) {
+        let f = sublist_get(fs, i)
+        if f != -1 { tc_seed_scope(scope_of, node_value(f), d, unset) }
+        i = i + 1
+    }
+}
+
+// The parameters a declaration binds, as the body frames push them: its own, and an impl's
+// binders and `where` constraints. A method the walk does not reach (a trait's signature with no
+// body) is still in its declaration and still binds its own parameters.
+fn tc_seed_decl(scope_of: List[Int], decl_of: Map[Int, Int], d: Int, unset: Int) {
+    tc_bind_params_to(decl_of, node_type_params(d), d)
+    if node_kind(d) == NodeKind.ImplBlock {
+        tc_bind_params_to(decl_of, node_impl_binders(d), d)
+        tc_bind_params_to(decl_of, node_impl_where_bounds(d), d)
+    }
+    tc_seed_defaults(scope_of, d, unset)
+    let ms = node_methods(d)
+    if ms == -1 { return }
+    let mut i = 0
+    while i < sublist_length(ms) {
+        let f = sublist_get(ms, i)
+        if f != -1 {
+            tc_seed_scope(scope_of, f, d, unset)
+            tc_bind_params_to(decl_of, node_type_params(f), f)
+            tc_seed_defaults(scope_of, f, unset)
+        }
+        i = i + 1
+    }
+}
+
+// `order` is the walk's: a node comes before every node below it.
+fn tc_type_scope_of(order: List[Int]) -> TcTypeScope {
+    let unset = -2
+    let mut scope_of: List[Int] = List.with_capacity(node_count())
+    while scope_of.len() < node_count() { scope_of.push(unset) }
+    let mut decl_of: Map[Int, Int] = Map()
+    for n in order {
+        if tc_is_scope_decl_kind(node_kind(n)) { tc_seed_decl(scope_of, decl_of, n, unset) }
+    }
+    let mut kids: List[Int] = []
+    for n in order {
+        if scope_of.get(n).unwrap() == unset { scope_of.set(n, -1) }
+        let inner = if tc_is_scope_decl_kind(node_kind(n)) { n } else { scope_of.get(n).unwrap() }
+        kids.clear()
+        node_push_value_child_ids(n, kids)
+        for kid in kids { tc_seed_scope(scope_of, kid, inner, unset) }
+    }
+    TcTypeScope { scope_of: scope_of, decl_of: decl_of, plain: Map() }
+}
+
+// The nearest declaration that encloses `n`, or -1. A node made after the walk has none.
+fn tc_scope_up(sc: TcTypeScope, n: Int) -> Int {
+    if n < 0 || n >= sc.scope_of.len() { return -1 }
+    let d = sc.scope_of.get(n).unwrap()
+    if d < 0 { -1 } else { d }
+}
+
+// Whether `d` is `n`'s declaration or one that encloses it.
+fn tc_scope_holds(sc: TcTypeScope, d: Int, n: Int) -> Bool {
+    let mut s = if tc_is_scope_decl_kind(node_kind(n)) { n } else { tc_scope_up(sc, n) }
+    while s != -1 {
+        if s == d { return true }
+        s = tc_scope_up(sc, s)
+    }
+    false
+}
+
+// Whether `a` starts before `b` in the source, by line and then column. A node the parser did
+// not place (line 0) comes after every placed node.
+fn tc_node_is_before(a: Int, b: Int) -> Bool {
+    if node_line(a) <= 0 { return false }
+    if node_line(b) <= 0 { return true }
+    if node_line(a) != node_line(b) { return node_line(a) < node_line(b) }
+    node_col(a) < node_col(b)
+}
+
+// The parameter node a binder stands for: a projection `S.Item` is in scope where S is, and a
+// self-call twin where the parameter it copies is.
+fn tc_binder_source(binder: Int) -> Int {
+    let mut b = binder
+    if b <= PROJECTION_BINDER_BASE {
+        b = match tc_projection_at(b) {
+            Some(p) => p.owner_binder
+            None => NO_BINDER_NODE
+        }
+        return tc_binder_source(b)
+    }
+    if b <= -1000 { return -1000 - b }
+    b
+}
+
+// True when a typevar with no binder is the context an effect name stands for in `Template[..]`,
+// under any spelling: `Rd`, a sub-effect `Rd.Read`, or a module's `lib.Log`. It is one fixed
+// type, not a parameter. tc_typevar_is_effect_context leaves the dotted spellings out because
+// inference must tell them apart; this test only asks whether one is a context at all, and
+// stands in until an effect has identity by its declaration.
+fn tc_typevar_names_effect_context(tv: Int) -> Bool {
+    if tc_typevar_is_effect_context(tv) { return true }
+    let name = tc_tid_name(tv)
+    let parts = name.split(".")
+    if parts.len() < 2 { return false }
+    tc_is_undotted_effect_name(parts.get(0).unwrap()) || tc_is_undotted_effect_name(parts.get(parts.len() - 1).unwrap())
+}
+
+// Whether the typevar `tv` is in scope at node `n`.
+fn tc_typevar_in_scope(sc: TcTypeScope, tv: Int, n: Int) -> Bool {
+    let b = tc_binder_source(tc_tid_binder(tv))
+    if b == NO_BINDER_NODE { return tc_typevar_names_effect_context(tv) }
+    if b == SELF_BINDER_NODE {
+        // `Self` is a parameter of the trait that names it, and of nothing else.
+        let mut s = tc_scope_up(sc, n)
+        if tc_is_scope_decl_kind(node_kind(n)) { s = n }
+        while s != -1 {
+            if node_kind(s) == NodeKind.TraitDef { return true }
+            s = tc_scope_up(sc, s)
+        }
+        return false
+    }
+    // A builtin signature's parameters are solved at each call, so one left on a node is open.
+    if b < 0 { return false }
+    match sc.decl_of.get(b) {
+        Some(d) => tc_scope_holds(sc, d, n)
+        None => false
+    }
+}
+
+// Whether a type has no open part at any depth and names no type parameter, so it is closed at
+// every node. Memoized by resolved tid: after inference no tid resolves further.
+fn tc_tid_is_plain(sc: TcTypeScope, tid: Int) -> Bool {
+    if tc_tid_is_no_info(tid) != 0 { return false }
+    let r = tc_tid_resolved(tid)
+    match sc.plain.get(r) {
+        Some(v) => { return v }
+        None => {}
+    }
+    let mut plain = tc_tid_is_no_info(r) == 0 && tc_is_unbound_metavar(r) == 0 && tc_tid_kind(r) != TyKind.Typevar
+    let mut i = 0
+    while plain && i < tc_tid_child_count(r) {
+        if !tc_tid_is_plain(sc, tc_tid_child(r, i)) { plain = false }
+        i = i + 1
+    }
+    sc.plain.insert(r, plain)
+    plain
+}
+
+// Whether `tid`, the type of node `n`, has an open part at any depth: no type, an unsolved
+// metavariable, or a type parameter used outside the declaration that binds it.
+fn tc_tid_open_at(sc: TcTypeScope, tid: Int, n: Int) -> Bool {
+    if tc_tid_is_plain(sc, tid) { return false }
+    if tc_tid_is_concrete(tid) == 0 { return true }
+    let r = tc_tid_resolved(tid)
+    if tc_tid_kind(r) == TyKind.Typevar { return !tc_typevar_in_scope(sc, r, n) }
+    let mut i = 0
+    while i < tc_tid_child_count(r) {
+        if tc_tid_open_at(sc, tc_tid_child(r, i), n) { return true }
+        i = i + 1
+    }
+    false
+}
+
 // `marks` is tc_stamp_assert's: a child marked 2 is excused as a name, so it is not a hole and
 // cannot be the cause of one above it.
-fn tc_stamp_is_cascade(n: Int, marks: List[Int]) -> Int {
+fn tc_stamp_is_cascade(sc: TcTypeScope, n: Int, marks: List[Int]) -> Int {
     // `.await` answers with the PAYLOAD of its operand's handle, so a handle whose payload is
     // still open leaves it nothing to read even though the operand itself has a type. The hole
     // is in whatever failed to pin the payload — the spawned closure's return.
@@ -46859,7 +47071,7 @@ fn tc_stamp_is_cascade(n: Int, marks: List[Int]) -> Int {
         let awaited = tc_tid_resolved(tc_lookup_node_tid(node_obj(n)))
         if tc_tid_kind(awaited) != TyKind.Handle { return 1 }
         if tc_tid_child_count(awaited) < 1 { return 1 }
-        if tc_tid_is_concrete(tc_tid_child(awaited, 0)) == 0 { return 1 }
+        if tc_tid_open_at(sc, tc_tid_child(awaited, 0), n) { return 1 }
         return 0
     }
     // A member reached THROUGH a type parameter — `v.x` where `v: T`, `x.m()` where `x: T` —
@@ -46885,7 +47097,7 @@ fn tc_stamp_is_cascade(n: Int, marks: List[Int]) -> Int {
     let tail = tc_scoped_tail_node(n, 0)
     if tail != -1 {
         if tc_stamp_is_excused(tail, marks) != 0 { return 0 }
-        if tc_tid_is_concrete(tc_lookup_node_tid(tail)) == 0 { return 1 }
+        if tc_tid_open_at(sc, tc_lookup_node_tid(tail), tail) { return 1 }
         return 0
     }
     let kids = node_value_child_ids(n)
@@ -46894,7 +47106,7 @@ fn tc_stamp_is_cascade(n: Int, marks: List[Int]) -> Int {
         let kid = kids.get(i).unwrap()
         if kid != -1 {
             if nk_is_typed(node_kind(kid)) != 0 && tc_stamp_is_excused(kid, marks) == 0 {
-                if tc_tid_is_concrete(tc_lookup_node_tid(kid)) == 0 { return 1 }
+                if tc_tid_open_at(sc, tc_lookup_node_tid(kid), kid) { return 1 }
             }
         }
         i = i + 1
@@ -46917,13 +47129,16 @@ fn tc_stamp_assert(order: List[Int], mods: List[Str], marks: List[Int]) ! Diag.R
     // name ladder runs for those alone. In a program that type checks they are the item names
     // in name positions, which leaves out the typed name positions (about three in ten).
     // Slot 1 marks a candidate, 2 a candidate excused as a name.
+    let sc = tc_type_scope_of(order)
     let mut cands: List[Int] = []
+    let mut cand_mods: List[Str] = []
     let mut ident_cand = false
     let mut i = 0
     while i < order.len() {
         let n = order.get(i).unwrap()
-        if nk_is_typed(node_kind(n)) != 0 && tc_tid_is_concrete(tc_lookup_node_tid(n)) == 0 {
+        if nk_is_typed(node_kind(n)) != 0 && tc_tid_open_at(sc, tc_lookup_node_tid(n), n) {
             cands.push(n)
+            cand_mods.push(mods.get(i).unwrap())
             marks.set(n, 1)
             if node_kind(n) == NodeKind.Ident { ident_cand = true }
         }
@@ -46947,19 +47162,46 @@ fn tc_stamp_assert(order: List[Int], mods: List[Str], marks: List[Int]) ! Diag.R
         }
     }
     let mut reported: Map[Str, Int] = Map()
-    for n in cands {
+    // A type with a top that is open below it, or names a parameter of another declaration,
+    // spreads to each node that reads it. The first in the source is the nearest to the cause,
+    // so it is the one report. Line and column order nodes of one module only; across modules
+    // the walk's order stands.
+    let mut open_at = -1
+    let mut open_mod = ""
+    let mut c = 0
+    while c < cands.len() {
+        let n = cands.get(c).unwrap()
+        let m = cand_mods.get(c).unwrap()
+        c = c + 1
         let mark = marks.get(n).unwrap()
-        let cascade = mark == 1 && tc_stamp_is_cascade(n, marks) != 0
+        let cascade = mark == 1 && tc_stamp_is_cascade(sc, n, marks) != 0
         if mark == 1 && !cascade {
-            let kn = node_kind_name(node_kind(n))
-            if reported.contains_key(kn) == false {
-                reported.insert(kn, 1)
-                diag_ice_at("NodeCarriesNoType", UNSOLVED_TYPEVAR_AT_CODEGEN,
-                    "a {kn} node reached the end of type checking with no type",
-                    n,
-                    "every node whose kind denotes or binds a value must carry a type by the end of inference; this is a compiler defect, not a program error")
+            if tc_tid_is_concrete(tc_lookup_node_tid(n)) != 0 {
+                if open_at == -1 || (m == open_mod && tc_node_is_before(n, open_at)) {
+                    open_at = n
+                    open_mod = m
+                }
+            } else {
+                let kn = node_kind_name(node_kind(n))
+                if reported.contains_key(kn) == false {
+                    reported.insert(kn, 1)
+                    diag_ice_at("NodeCarriesNoType", UNSOLVED_TYPEVAR_AT_CODEGEN,
+                        "a {kn} node reached the end of type checking with no type",
+                        n,
+                        "every node whose kind denotes or binds a value must carry a type by the end of inference; this is a compiler defect, not a program error")
+                }
             }
         }
+    }
+    // A node with no type spreads an open type to each node that reads it, so with one reported
+    // the open types are that same fault.
+    if open_at != -1 && reported.len() == 0 {
+        let kn = node_kind_name(node_kind(open_at))
+        let shown = type_to_str(tc_lookup_node_tid(open_at))
+        diag_ice_at("OpenTypeAfterCheck", OPEN_TYPE_AFTER_CHECK,
+            "a {kn} node reached the end of type checking with the open type {shown}",
+            open_at,
+            "every type must be closed by the end of inference: no unsolved part, and no type parameter outside the declaration that binds it; this is a compiler defect, not a program error")
     }
 }
 
