@@ -1,0 +1,135 @@
+// A binding declared outside a Bytes.with_ptr call and written inside an assert_panics frame
+// in its body, or written in a with_ptr body inside the frame, keeps the new value after the
+// catch (spec §2.20). The with_ptr body is written into the caller's C frame, and the catch
+// is a longjmp back to a setjmp there, so a changed local that is not volatile would be
+// indeterminate after it (C11 7.13.2.1p3). The with_ptr closure captures the binding, so the
+// build keeps it in a cell, whose pointer the frame never changes. Each program runs under
+// `blink test` per module and in one C unit, and in one C unit at -O2, where a value held in
+// a register would come back stale.
+
+import compile_test_helpers
+import std.process.{ChildEnd}
+
+fn program() -> Str {
+    #"fn boom() -> Int {
+    let r: Result[Int, Str] = Err("b")
+    r.unwrap()
+}
+
+type Sh { A(Int), B(Int) }
+
+test "frame in the with_ptr body" {
+    let mut b = Bytes.new()
+    b.push(1)
+    let mut x = 0
+    let r = b.with_ptr(fn(_p) {
+        assert_panics {
+            x += 1
+            let _ = boom()
+        }
+        x
+    })
+    assert_eq(r, 1)
+    assert_eq(x, 1)
+}
+
+test "with_ptr body in the frame" {
+    let mut b = Bytes.new()
+    b.push(1)
+    let mut y = 0
+    assert_panics {
+        let _r = b.with_ptr(fn(_p) {
+            y = 2
+            boom()
+        })
+    }
+    assert_eq(y, 2)
+}
+
+test "frame in a nested with_ptr body" {
+    let mut b = Bytes.new()
+    b.push(1)
+    let mut z = 0
+    let r = b.with_ptr(fn(_p) {
+        let mut w = 0
+        let _s = b.with_ptr(fn(_q) {
+            assert_panics {
+                z = 4
+                w = 5
+                let _ = boom()
+            }
+            0
+        })
+        w
+    })
+    assert_eq(z + r, 9)
+}
+
+test "destructured, for-in and match binders" {
+    let mut b = Bytes.new()
+    b.push(1)
+    let (mut da, mut db) = (0, 0)
+    let mut total = 0
+    let mut got = 0
+    for mut i in 0..2 {
+        let _r = b.with_ptr(fn(_p) {
+            assert_panics {
+                da = 3
+                db = 4
+                i += 10
+                let _ = boom()
+            }
+            0
+        })
+        total += i
+    }
+    match Sh.B(0) {
+        Sh.A(mut v) | Sh.B(mut v) => {
+            let _r = b.with_ptr(fn(_p) {
+                assert_panics {
+                    v = 100
+                    let _ = boom()
+                }
+                0
+            })
+            got = v
+        }
+    }
+    assert_eq(da, 3)
+    assert_eq(db, 4)
+    assert_eq(total, 21)
+    assert_eq(got, 100)
+}
+"#
+}
+
+let TESTS = 4
+
+// The corpus exports BLINK_COMPILER_ARCHIVE, which, like the module filters, makes a build
+// one unit, so the child drops them and a per-module run really writes its units.
+fn passes_under_blink_test(flag: Str) ! FS.Write, Process.Spawn, Env.Read {
+    let stem = "wp_outer_frame_{flag.replace("-", "_")}_{getpid()}"
+    let dir = "{compile_test_helpers.scratch_root()}/{stem}"
+    compile_test_helpers.sh("rm -rf {dir} && mkdir -p {dir}")
+    let path = "{dir}/{stem}.bl"
+    fs.write(path, program()).unwrap()
+    let r = process.run("sh", ["-c", "env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE BLINK_CACHE_DIR={dir}/objcache build/blink test --json {flag} {path}"]).unwrap()
+    compile_test_helpers.sh("rm -rf {dir} build/{stem} build/{stem}.c build/{stem}.units")
+    let diag = "{r.end}; captured:\n{r.out}{r.err_out}"
+    assert_eq(r.end, ChildEnd.Exited(0), diag)
+    assert(r.out.contains("\"passed\":{TESTS},\"failed\":0"), diag)
+}
+
+test "each binding keeps its write per module" {
+    passes_under_blink_test("--per-module")
+}
+
+test "each binding keeps its write in one C unit" {
+    passes_under_blink_test("--no-per-module")
+}
+
+test "each binding keeps its write at -O2" {
+    let r = compile_test_helpers.compile_and_run_test_json_opt(program(), "_wp_outer_frame_o2", "-O2")
+    let diag = "{r.out}{r.err_out}"
+    assert(r.out.contains("\"passed\":{TESTS},\"failed\":0"), diag)
+}
