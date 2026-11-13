@@ -31,7 +31,7 @@ import diagnostics.{
     ICE_SEG_UNSOLVED_TYPEVAR, ICE_SEG_UNHANDLED_KIND, ICE_SEG_TID_OUT_OF_RANGE,
     ICE_SEG_ERASED_SLOT, diag_is_ice_seg,
     NON_EXHAUSTIVE_MATCH, INCONSISTENT_PATTERN_BINDINGS, DUPLICATE_MODULE_BINDING,
-    UNSOLVED_TYPEVAR_AT_CODEGEN, SEALED_OPS_REWRITE_INVARIANT, VARIANT_WITHOUT_ENUM,
+    UNSOLVED_TYPEVAR_AT_CODEGEN, CALL_NOT_ANSWERED, SEALED_OPS_REWRITE_INVARIANT, VARIANT_WITHOUT_ENUM,
     NO_SUCH_VARIANT, TYPE_ERROR, TEMPLATE_MISMATCH, UNEXPECTED_ANNOTATION, MISSING_RETURN, NO_CONVERSION_IMPL, CANNOT_INFER_TYPE, NOT_ITERABLE, MISSING_ELSE, UNLICENSED_SELF_OP, TRAIT_BOUND_NOT_SATISFIED, CAPABILITY_BUDGET, QM_INVALID_OPERAND, UNDEFINED_FUNCTION,
     UNRESOLVED_METHOD, AMBIGUOUS_METHOD_CALL, MISSING_DISPLAY_IMPL,
     MUTATION_REQUIRES_MUT, MUT_ON_PATTERN, NOT_A_PLACE, PARAM_ASSIGN, diag_error_label_at_notes, diag_add_note_at_spots_since, diag_error_span_label_at_notes, diag_warn_label_at_notes, EMPTY_ROW_OUTSIDE_FFI, PANIC_HOOK_PLACEMENT, TRACE_MESSAGE_EFFECT, METHOD_THROUGH_TYPE_NAME, SELF_OUTSIDE_TRAIT_OR_IMPL, EFFECTS_ANNOTATION_REMOVED, UNKNOWN_EFFECT, diag_fix_before_starts_with, diag_drop_fix_over_others, diag_drop_fix_at,
@@ -3451,9 +3451,8 @@ fn tc_method_call_unanswered(node: Int, method: Str, obj_t: Int, args_sl: Int) -
         tc_report_unresolved_method(node, obj_t, tname, method)
         return tc_error_recovery_tid()
     }
-    // Nothing claimed this node, so nothing has typed it — an absence. Codegen's backstop is
-    // what names the receiver and the method, so the node says WHY it carries nothing and the
-    // stamp pass leaves that report standing.
+    // Nothing claimed this node, so nothing has typed it — an absence. The stamp pass reports
+    // it (tc_report_unclaimed_calls), so the node says WHY it carries nothing.
     if tc_boundary_check_active != 0 { tc_mark_unclaimed_call(node) }
     -1
 }
@@ -27971,9 +27970,8 @@ fn new_method_call_facts() -> MethodCallFacts {
 
 // Mark a method call the inference pass could not type and did not report on: the name
 // resolves somewhere in the program, so name resolution let it pass, but no arm here claims
-// this receiver-and-method pair. Codegen's backstop is what names them, and it needs the
-// program to reach it, so the total-stamp pass excuses these nodes rather than reporting a
-// hole over the top of the report that is coming.
+// this receiver-and-method pair. The total-stamp pass reports each one as E0505, and the holes
+// that follow from it are not reported a second time.
 //
 // Only an absence is marked. A node an earlier walk already typed keeps that type: the mark
 // says "no arm claimed this", and an arm did.
@@ -28015,13 +28013,6 @@ fn tc_unclaimed_call_nodes() -> List[Int] {
 }
 
 pub fn tc_unresolved_call_count() -> Int { tc_unclaimed_call_nodes().len() }
-
-// Marks a typed call as unclaimed. Source that type checks holds no unclaimed call, so a test of
-// the stand-down grafts one.
-pub fn tc_graft_unclaimed_call(node: Int) {
-    if node < 0 || node >= tc_node_tid.len() { return }
-    tc_node_tid.set(node, tc_unclaimed_call_tid())
-}
 
 // `with X as ctx` does not always bind X: for a BlockHandler the binder is what
 // `enter()` returns, i.e. the impl's `type Context`. Resource type name -> the impl's Context
@@ -32959,6 +32950,38 @@ fn tc_refuse_unlicensed_self_method(node: Int, obj_t: Int, method: Str) -> Bool 
     true
 }
 
+// `Self.f(..)` in a trait default body. `Self` there is the trait's type parameter, so the
+// trait's guarantee set answers the call from its declared signature, as it answers `self.f(..)`.
+// -1 when the head is not that `Self`.
+fn tc_trait_self_static_call(node: Int, head: Str, method: Str, args_sl: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    if head != "Self" || tc_current_self_trait == "" || type_kind(tc_current_self_tid) != TyKind.Typevar { return -1 }
+    let traits = tc_tparam_bound_traits("Self")
+    let mut found = -1
+    let mut owners: List[Str] = []
+    for i in 0..tc_tmsig_pool.len() {
+        let tm = tc_tmsig_pool.get(i).unwrap()
+        if tm.method == method && tc_pipe_has(traits, tm.trait_name) != 0 && !owners.contains(tm.trait_name) {
+            if found < 0 { found = i }
+            owners.push(tm.trait_name)
+        }
+    }
+    if owners.len() >= 2 {
+        diag_error_at("AmbiguousMethodCall", AMBIGUOUS_METHOD_CALL, "ambiguous call: `Self.{method}` is defined in multiple traits `Self` holds ({tc_traits_shown(owners.join(" and "))})", node, "name the trait: `Trait.{method}(..)`")
+        return tc_error_recovery_tid()
+    }
+    if found < 0 {
+        let gm = tc_tparam_bound_methods("Self")
+        if gm == "" || tc_pipe_has(gm, method) != 0 { return -1 }
+        diag_error_at("UnlicensedSelfOperation", UNLICENSED_SELF_OP,
+            "`Self.{method}` is not licensed by `{tc_current_self_trait}`", node,
+            "`{tc_current_self_trait}` does not declare `{method}`, and no supertrait it names provides it; declare it on `{tc_current_self_trait}` (or a supertrait that has it) so every implementor supplies it")
+        return tc_error_recovery_tid()
+    }
+    let tm = tc_tmsig_pool.get(found).unwrap()
+    nr_note_call_decl(node, tc_trait_method_decl(tm.trait_name, method))
+    tc_bound_method_call("Self.{method}", found, node, args_sl, 0, tc_bound_call_binds(tc_current_self_tid, found, []))
+}
+
 // `x.method(..)` on a type parameter whose bound licenses no method of that name, refused in the
 // generic body (section 6.3.3), whether or not a caller reaches it. A bound refuses it only when
 // the method lists of all its traits are known. false when the call is not refused here.
@@ -33121,24 +33144,26 @@ fn tc_trait_method_entry(tr: Str, method: Str) -> Option[TraitMethodSigEntry] {
 // A call that a bound answers: `t.m(..)` with `T: Tr`, or `Tr.m(t, ..)`. The trait method's
 // own binders are the call's to fix, by a written list or by the arguments, as on a concrete
 // receiver; `binds` holds `Self` and the trait's arguments. `self_offset` is 1 when the receiver
-// is not among `args_sl`.
+// is not among `args_sl`. With 0, a method takes its receiver as argument 0 (`Tr.m(t, ..)`), and
+// a function with no `self` (`Self.f(..)`) takes only its own arguments.
 fn tc_bound_method_call(shown: Str, tmsig_idx: Int, node: Int, args_sl: Int, self_offset: Int, binds: Map[Str, Int]) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     let tm = tc_tmsig_pool.get(tmsig_idx).unwrap()
     let sig = tc_call_view_sig(tm.sig)
     let decl = fnsig_pool.get(sig).unwrap().decl
+    let recv_in_args = self_offset == 0 && tc_fn_decl_takes_self(decl)
     if tc_decl_has_own_type_params(decl) == 0 {
-        if self_offset == 0 {
+        if recv_in_args {
             let _ = tc_check_qualified_trait_args(shown, sig, args_sl, node, binds)
         } else {
-            let _ = check_arg_shapes_with_binds(shown, sig, args_sl, 1, node, binds)
+            let _ = check_arg_shapes_with_binds(shown, sig, args_sl, self_offset, node, binds)
         }
         return substitute_typevar_tid(tm.ret_tid, binds)
     }
     if node_type_params(node) != -1 { return tc_call_with_type_args(shown, sig, node, self_offset, binds) }
-    let mut tids = if self_offset == 0 {
+    let mut tids = if recv_in_args {
         tc_check_qualified_trait_args(shown, sig, args_sl, node, binds)
     } else {
-        check_arg_shapes_with_binds(shown, sig, args_sl, 1, node, binds)
+        check_arg_shapes_with_binds(shown, sig, args_sl, self_offset, node, binds)
     }
     let mut mbinds = build_typevar_binds(sig, tids, self_offset)
     for (k, v) in binds {
@@ -37000,8 +37025,14 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
         }
 
         // Every arm a sealed ops trait owns is above. What follows answers from user impls,
-        // bounds and names, none of which a call naming the sealed trait can reach.
-        if qualified != -1 { return tc_method_call_unanswered(node, method, obj_t, args_sl) }
+        // bounds and names. Of those, a call naming the sealed trait reaches only a bound that
+        // names the same trait: `Sized.len(x)` with `x: T` and `T: Sized` is `x.len()`.
+        let qual_trait = if qualified != -1 { node_name(obj_node) } else { "" }
+        if qualified != -1 {
+            if obj_k != TyKind.Typevar || tc_pipe_has(tc_tparam_bound_traits(type_to_str(obj_t)), qual_trait) == 0 {
+                return tc_method_call_unanswered(node, method, obj_t, args_sl)
+            }
+        }
 
         // A method call on a BOUNDED type parameter (`fn show[T: Display](x: T) { x.fmt(sb) }`).
         // The bound is what licenses the call, so it is also what answers it: the trait's own
@@ -37018,7 +37049,8 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                 let mut tvi = 0
                 while tvi < tc_tmsig_pool.len() {
                     let tm = tc_tmsig_pool.get(tvi).unwrap()
-                    if tm.method == method && tc_pipe_has(tv_traits, tm.trait_name) != 0 && !owners.contains(tm.trait_name) {
+                    let named = qual_trait == "" || tm.trait_name == qual_trait
+                    if named && tm.method == method && tc_pipe_has(tv_traits, tm.trait_name) != 0 && !owners.contains(tm.trait_name) {
                         if found < 0 { found = tvi }
                         owners.push(tm.trait_name)
                     }
@@ -37034,7 +37066,9 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                     let tm = tc_tmsig_pool.get(found).unwrap()
                     // Each instance picks its impl by the trait that declares the method: the
                     // type may hold another trait of one spelling with a method of this name.
-                    nr_note_call_decl(node, tc_trait_method_decl(tm.trait_name, method))
+                    // A sealed ops call is rewritten to the method call before mono, and that
+                    // rewrite takes a recorded declaration as a defect.
+                    if qual_trait == "" { nr_note_call_decl(node, tc_trait_method_decl(tm.trait_name, method)) }
                     let bound_insts = tc_bound_trait_instances(tc_tid_binder(obj_t), tm.trait_name)
                     if bound_insts.len() >= 2 { return tc_bound_instance_ambiguity(node, ".{method}", tv_name, tm.trait_name, method, bound_insts) }
                     let bound_args = tc_bound_trait_arg_tids(tc_tid_binder(obj_t), tm.trait_name)
@@ -37661,6 +37695,8 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
             // (sections/03c_protocols.md:758): `pub fn Duration_seconds(s: Int)`
             // (lib/std/time.bl:3) IS `Duration.seconds(2)`.
             if obj_is_value == 0 {
+                let self_static = tc_trait_self_static_call(node, obj_written, method, args_sl)
+                if self_static != -1 { return self_static }
                 // §3c.4 at the static rung: two traits declare this associated function for
                 // this type, or two impls of one trait give it, so the call names no one
                 // declaration. A conversion's argument picks its impl. A function value reads
@@ -46831,50 +46867,25 @@ fn tc_stamp_is_cascade(n: Int) -> Int {
     0
 }
 
-// The bodies the stand-down covers: one entry per body that still holds an unclaimed call, and
-// -1 when a call sits at module level.
-//
-// A call no arm claimed carries nothing, and the absence spreads by DATA FLOW: the `let` it
-// initializes, then every read of that binding. A local binding lives no wider than the body
-// that declares it, and a body's result type is declared — an un-annotated signature returns
-// `()` — so the absence cannot cross the function or test block that holds the call. Standing
-// down for that body alone leaves every other body asserted. A closure is not a fence: its
-// result type may be inferred from its tail, so the absence flows out of it into the enclosing
-// body, which is why the owner is the nearest FnDef and not the nearest callable. A call at
-// module level has no fence at all — it types a global whose readers are the whole program.
-fn tc_stamp_standdown_bodies(owner_index: List[Int]) -> Map[Int, Int] {
-    let mut bodies: Map[Int, Int] = Map()
-    for uc in tc_unclaimed_call_nodes() {
-        // A call the walk never reached is fenced by nothing, as a module-level call is.
-        let o = tc_stamp_owner_of(owner_index, uc)
-        bodies.insert(if o == TC_STAMP_UNOWNED { -1 } else { o }, 1)
-    }
-    bodies
-}
-
 // Phase 5. Reports against the first offending node per kind, so a systemic hole reads as one
-// error naming its kind and not as thousands. Nodes inside a body `stood` names are passed
-// over: an unclaimed call there leaves holes the report coming from codegen already owns.
+// error naming its kind and not as thousands.
 //
 // `marks` is the walk's `seen` buffer: all zero, one slot per node the walk reached. Nothing
 // reads it after this pass, so the marks are left in it.
-fn tc_stamp_assert(order: List[Int], owners: List[Int], mods: List[Str], stood: Map[Int, Int], marks: List[Int]) ! Diag.Report {
+fn tc_stamp_assert(order: List[Int], mods: List[Str], marks: List[Int]) ! Diag.Report {
     // The untyped nodes first. Only a node that carries no type can need a name excuse, so the
     // name ladder runs for those alone. In a program that type checks they are the item names
     // in name positions, which leaves out the typed name positions (about three in ten).
     // Slot 1 marks a candidate, 2 a candidate excused as a name.
-    let check_stood = stood.len() > 0
     let mut cands: List[Int] = []
     let mut ident_cand = false
     let mut i = 0
     while i < order.len() {
         let n = order.get(i).unwrap()
-        if !check_stood || !stood.contains_key(owners.get(i).unwrap()) {
-            if nk_is_typed(node_kind(n)) != 0 && tc_tid_is_concrete(tc_lookup_node_tid(n)) == 0 {
-                cands.push(n)
-                marks.set(n, 1)
-                if node_kind(n) == NodeKind.Ident { ident_cand = true }
-            }
+        if nk_is_typed(node_kind(n)) != 0 && tc_tid_is_concrete(tc_lookup_node_tid(n)) == 0 {
+            cands.push(n)
+            marks.set(n, 1)
+            if node_kind(n) == NodeKind.Ident { ident_cand = true }
         }
         i = i + 1
     }
@@ -46897,7 +46908,9 @@ fn tc_stamp_assert(order: List[Int], owners: List[Int], mods: List[Str], stood: 
     }
     let mut reported: Map[Str, Int] = Map()
     for n in cands {
-        if marks.get(n).unwrap() == 1 && tc_stamp_is_cascade(n) == 0 {
+        let mark = marks.get(n).unwrap()
+        let cascade = mark == 1 && tc_stamp_is_cascade(n) != 0
+        if mark == 1 && !cascade {
             let kn = node_kind_name(node_kind(n))
             if reported.contains_key(kn) == false {
                 reported.insert(kn, 1)
@@ -46915,18 +46928,9 @@ fn tc_stamp_assert(order: List[Int], owners: List[Int], mods: List[Str], stood: 
 // out the value the call never had. A type parameter's methods are decided per instance.
 // `order` and `mods` are the stamp walk's nodes and the module each one is in: a report's help
 // is written for the module that holds the call.
-fn tc_report_unclaimed_calls(order: List[Int], mods: List[Str]) ! Diag.Report {
-    let calls = tc_unclaimed_call_nodes()
+fn tc_report_unclaimed_calls(calls: List[Int], order: List[Int], mods: List[Str]) ! Diag.Report {
     if calls.len() == 0 { return }
-    let mut unclaimed: Map[Int, Int] = Map()
-    for uc in calls { unclaimed.insert(uc, 1) }
-    let mut call_mod: Map[Int, Str] = Map()
-    let mut i = 0
-    while i < order.len() {
-        let n = order.get(i).unwrap()
-        if unclaimed.contains_key(n) { call_mod.insert(n, mods.get(i).unwrap()) }
-        i = i + 1
-    }
+    let call_mod = tc_unclaimed_call_modules(calls, order, mods)
     let outer_module = nr_current_module
     for uc in calls {
         // The flush of the calls on a type name has reported this one already.
@@ -46969,6 +46973,47 @@ fn tc_report_unclaimed_calls(order: List[Int], mods: List[Str]) ! Diag.Report {
         }
         if diag_any_errors_since(before) > 0 { tc_method_calls.hard.insert(uc, 1) }
         nr_current_module = saved_module
+    }
+}
+
+// The module each call in `calls` is written in, read off the stamp walk.
+fn tc_unclaimed_call_modules(calls: List[Int], order: List[Int], mods: List[Str]) -> Map[Int, Str] {
+    let mut unclaimed: Set[Int] = Set()
+    for uc in calls { unclaimed.insert(uc) }
+    let mut call_mod: Map[Int, Str] = Map()
+    let mut i = 0
+    while i < order.len() {
+        let n = order.get(i).unwrap()
+        if unclaimed.contains(n) { call_mod.insert(n, mods.get(i).unwrap()) }
+        i = i + 1
+    }
+    call_mod
+}
+
+// A call still unclaimed in a program with no other error. A trait-qualified call with no
+// argument has no receiver (section 3.6), so it is the program's mistake. Any other shape
+// the arms of tc_report_unclaimed_calls could not name is a rule of inference that does not
+// exist yet: an internal error, reported here so a clean check still promises the build
+// (section 6.7). One report, at the first call: a call that reads another's result fails
+// for the same reason.
+fn tc_report_unclaimed_left(calls: List[Int]) ! Diag.Report {
+    let mut faulted = false
+    for uc in calls {
+        let obj = node_obj(uc)
+        let args = node_args(uc)
+        let no_arg = args == -1 || sublist_length(args) == 0
+        if node_kind(obj) == NodeKind.Ident && tc_mc_obj_is_value(uc) == 0 && is_trait_name(node_name(obj)) != 0 && no_arg {
+            diag_error_at("UnresolvedMethod", UNRESOLVED_METHOD,
+                "`{node_name(obj)}.{node_method(uc)}` has no receiver", uc,
+                "a trait-qualified call takes the receiver as its first argument")
+            tc_method_calls.hard.insert(uc, 1)
+        } else if !faulted {
+            faulted = true
+            diag_ice_at("CallNotAnswered", CALL_NOT_ANSWERED,
+                "no rule of inference answered the call `{node_method(uc)}`",
+                uc,
+                "this is a compiler defect, not a program error")
+        }
     }
 }
 
@@ -47367,7 +47412,8 @@ pub fn tc_stamp_program(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Dia
     let mut seen: List[Int] = List.with_capacity(node_count())
     let order = tc_stamp_walk_sized(program, owners, mods, seen, node_count())
     tc_flush_unresolved_methods(true)
-    tc_report_unclaimed_calls(order, mods)
+    let calls = tc_unclaimed_call_nodes()
+    tc_report_unclaimed_calls(calls, order, mods)
     // After the unclaimed calls, so a call one of them reported gets no second report.
     tc_flush_unresolved_methods(false)
     tc_report_literals_out_of_range(order)
@@ -47377,45 +47423,13 @@ pub fn tc_stamp_program(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Dia
     // every ordinary type error into an internal-compiler-error cascade, so the total-stamp
     // claim only holds for a program that type checks.
     if diag_count > 0 { return }
-    // The same precondition, for a call left unclaimed on a receiver with no named type, which
-    // tc_report_unclaimed_calls cannot report. The absence spreads: the let it initializes
-    // carries nothing, and so does every read of that binding. Nothing here can tell those
-    // apart from a real hole — inside the BODY that holds the call. Every other body keeps its
-    // claim, so one unclaimed call buys silence for itself and not for the program.
-    // Traced rather than silent, so "the pass stood down" is a thing a build can be asked.
-    let mut stood: Map[Int, Int] = Map()
-    let live_unclaimed = tc_unresolved_call_count()
-    if live_unclaimed > 0 {
-        let owner_index = tc_stamp_owner_index(order, owners)
-        stood = tc_stamp_standdown_bodies(owner_index)
-        // The module-level pseudo-body is a key in `stood` but is not a body, so it is not
-        // counted as one.
-        let bodies = stood.len() - (if stood.contains_key(-1) { 1 } else { 0 })
-        trace.log("blink.stamp", "stood down: {live_unclaimed} call(s) left to the codegen backstop, in {bodies} body(ies)")
-        // The values are built with the channel off too, as a trace.log message can not read
-        // the node pool. A stand-down is rare, so that costs little.
-        for uc in tc_unclaimed_call_nodes() {
-            // A call the owner walk never reached is fenced by nothing, which stands the
-            // pass down everywhere — the same effect as a module-level call and a
-            // different cause, so the trace names them apart.
-            let ob = tc_stamp_owner_of(owner_index, uc)
-            let where_ = if ob == TC_STAMP_UNOWNED {
-                "<unowned: the whole program stands down>"
-            } else if ob == -1 {
-                "<module level>"
-            } else {
-                node_name(ob)
-            }
-            let method = node_method(uc)
-            let line = node_line(uc)
-            let col = node_col(uc)
-            trace.log("blink.stamp", "  .{method}() at {line}:{col} in {where_}")
-        }
-        // A module-level call has no body to be fenced by: it types a global, and a global's
-        // readers are the whole program. That one case still stands the pass down everywhere.
-        if stood.contains_key(-1) { return }
+    // A call no arm claimed has no type, and neither has what reads it, so the assert would
+    // report the same fault again at each reader.
+    if calls.len() > 0 {
+        tc_report_unclaimed_left(calls)
+        return
     }
-    tc_stamp_assert(order, owners, mods, stood, seen)
+    tc_stamp_assert(order, mods, seen)
 }
 
 // ── Name and impl-shape helpers ────────────────────────────────────────────────

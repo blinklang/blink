@@ -1,0 +1,56 @@
+// In a trait default body `Self` is the trait's type parameter, so `Self.f(..)` is answered from
+// the signature the trait, or a supertrait it names, declares for `f`, as `self.f(..)` is
+// (sections/03c_protocols.md). Its arguments and its result are checked against that signature,
+// and a name no trait in that set declares is UnlicensedSelfOperation (E0305).
+
+import std.fs
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_reset}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+
+fn typecheck_probe(path: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    init_embedded_stdlib()
+    fs.write(path, src).unwrap()
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+}
+
+// Each error and internal error as "name line:col: message", in report order.
+fn errors_of(src: Str) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    typecheck_probe("build/test_typecheck_static_self_in_trait_body_probe.bl", src)
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" {
+            out.push("{d.name} {d.line}:{d.col}: {d.message}")
+        }
+    }
+    out.join(" || ")
+}
+
+test "Self.f in a trait default body is answered from the trait's own signature" {
+    let src = "trait Mk \{\n    fn mk(side: Int) -> Self\n    fn one() -> Self \{ Self.mk(1) }\n}\nfn main() \{}\n"
+    assert_eq(errors_of(src), "")
+}
+
+test "Self.f in a trait default body is answered from a supertrait's signature" {
+    let src = "trait Base \{\n    fn mk(side: Int) -> Self\n}\ntrait Mk: Base \{\n    fn one() -> Self \{ Self.mk(1) }\n    fn two() -> Int \{\n        let _s: Self = Self.mk(2)\n        0\n    }\n}\nfn main() \{}\n"
+    assert_eq(errors_of(src), "")
+}
+
+test "an argument of Self.f is checked against the trait's signature" {
+    let src = "trait Mk \{\n    fn mk(side: Int) -> Self\n    fn one() -> Self \{ Self.mk(\"x\") }\n}\nfn main() \{}\n"
+    assert_eq(errors_of(src), "TypeError 3:32: argument 1 of `Self.mk` expects Int, got Str")
+}
+
+test "the result of Self.f is the trait's Self" {
+    let src = "trait Mk \{\n    fn mk(side: Int) -> Self\n    fn one() -> Int \{ Self.mk(1) }\n}\nfn main() \{}\n"
+    assert_eq(errors_of(src), "TypeError 3:23: return value type Self does not match function `one` return type Int")
+}
+
+test "Self.f that no trait in the guarantee set declares is e0305" {
+    let src = "trait Mk \{\n    fn mk(side: Int) -> Self\n    fn one() -> Self \{ Self.nope(1) }\n}\nfn main() \{}\n"
+    assert_eq(errors_of(src), "UnlicensedSelfOperation 3:24: `Self.nope` is not licensed by `Mk`")
+}

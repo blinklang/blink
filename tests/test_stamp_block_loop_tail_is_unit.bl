@@ -1,0 +1,92 @@
+// The total-stamp pass asserts that every block carries a type. A block whose tail is a loop
+// gets its type from that loop, which the row below pins.
+
+import std.fs
+import compiler.{compile_to_program}
+import typecheck.{check_types, tc_lookup_node_tid, tc_tid_is_concrete}
+import parser.{node_count, node_kind, node_name, node_body, node_value_child_ids}
+import ast.{NodeKind}
+import diagnostics.{diag_count, diag_ice_count, diag_reset}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+
+fn compile_probe(path: Str, src: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    init_embedded_stdlib()
+    fs.write(path, src).unwrap()
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+    program
+}
+
+fn fn_body_of(nm: Str) -> Int {
+    let mut i = 0
+    while i < node_count() {
+        if node_kind(i) == NodeKind.FnDef && node_name(i) == nm { return node_body(i) }
+        i = i + 1
+    }
+    -1
+}
+
+// Blocks under `root`, and the subset of them carrying no concrete type. The second count is
+// the claim; the first is its non-vacuity guard.
+fn blocks_in(root: Int) -> Int {
+    if root == -1 { return -1 }
+    let mut found = 0
+    let mut stack: List[Int] = [root]
+    while stack.len() > 0 {
+        let n = stack.pop().unwrap()
+        if node_kind(n) == NodeKind.Block { found = found + 1 }
+        let kids = node_value_child_ids(n)
+        let mut i = 0
+        while i < kids.len() {
+            stack.push(kids.get(i).unwrap())
+            i = i + 1
+        }
+    }
+    found
+}
+
+fn untyped_blocks_in(root: Int) -> Int {
+    if root == -1 { return -1 }
+    let mut bad = 0
+    let mut stack: List[Int] = [root]
+    while stack.len() > 0 {
+        let n = stack.pop().unwrap()
+        if node_kind(n) == NodeKind.Block {
+            if tc_tid_is_concrete(tc_lookup_node_tid(n)) == 0 { bad = bad + 1 }
+        }
+        let kids = node_value_child_ids(n)
+        let mut i = 0
+        while i < kids.len() {
+            stack.push(kids.get(i).unwrap())
+            i = i + 1
+        }
+    }
+    bad
+}
+
+// A block whose last statement is a loop produces no value, so the block holds `()`. §2.11: a
+// `for` and a `while` each evaluate to `()`. The tail is accepted as a value-bearing statement
+// by the block-tail rule, and its kind carries no type, so reading a type off it answered
+// "unknown" and left every enclosing block untyped.
+fn loop_tail_src() -> Str {
+    let mut s = "fn zzloopy(zzn: Int) -> Int \{\n"
+    s = s.concat("    let mut zzacc = 0\n")
+    s = s.concat("    match zzn \{\n")
+    s = s.concat("        0 => \{ while zzacc < 3 \{ zzacc = zzacc + 1 } }\n")
+    s = s.concat("        _ => \{ for zzi in [1, 2] \{ zzacc = zzacc + zzi } }\n")
+    s = s.concat("    }\n")
+    s = s.concat("    zzacc\n")
+    s = s.concat("}\n")
+    s = s.concat("fn main() \{ let _ = zzloopy(0) }\n")
+    s
+}
+
+test "a block whose tail is a loop carries the unit type" {
+    let _program = compile_probe("build/stamp_loop_tail.bl", loop_tail_src())
+    assert(diag_count == 0)
+    assert(diag_ice_count == 0)
+    assert(untyped_blocks_in(fn_body_of("zzloopy")) == 0)
+    assert(blocks_in(fn_body_of("zzloopy")) > 2)
+}
