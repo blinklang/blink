@@ -1,0 +1,215 @@
+// `Self` names the implementing type, so it is valid only in a trait declaration and in an impl
+// block (sections/03_types.md, The `Self` Type). Every other `Self` is SelfOutsideTraitOrImpl
+// (E0569), with one error at each `Self` token: in a type position (a signature, a local, a
+// field, a payload, an alias, an effect operation, a bound, a type argument) and in a value path
+// (`Self.x`, `Self(..)`, `Self { .. }`, a `Self.V` pattern). The refused `Self` takes the error
+// type, so no second error follows it.
+
+import std.fs
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_reset}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+
+fn typecheck_probe(path: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    init_embedded_stdlib()
+    fs.write(path, src).unwrap()
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+}
+
+// Each error as "name line:col-end: message | help | label", in report order.
+fn errors_of(src: Str) -> List[Str] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    typecheck_probe("build/test_typecheck_self_outside_a_trait_or_impl_probe.bl", src)
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" {
+            out.push("{d.name} {d.line}:{d.col}-{d.end_col}: {d.message} | {d.help} | {d.label}")
+        }
+    }
+    out
+}
+
+fn all_errors(src: Str) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    errors_of(src).join(" || ")
+}
+
+// The error E0569 reports at line:col, as errors_of formats it.
+fn refused_at(line: Int, col: Int) -> Str {
+    "SelfOutsideTraitOrImpl {line}:{col}-{col + 4}: `Self` outside trait or impl |  | `Self` is only valid inside trait declarations and impl blocks"
+}
+
+test "a free fn return type of Self is e0569 at the Self token" {
+    let src = "fn zzclone() -> Self \{ 42 }\nfn main() \{}\n"
+    assert_eq(all_errors(src), refused_at(1, 17))
+}
+
+test "each Self token in a free fn signature gets its own error" {
+    let src = "fn two(a: Self) -> Self \{ a }\nfn main() \{}\n"
+    assert_eq(all_errors(src), "{refused_at(1, 11)} || {refused_at(1, 20)}")
+}
+
+test "a local annotated Self is e0569 and its use reports nothing more" {
+    let src = "fn main() \{\n    let a: Self = 1\n    let _b = a == 1\n}\n"
+    assert_eq(all_errors(src), refused_at(2, 12))
+}
+
+test "a parameter of type Self compared with itself reports only e0569" {
+    let src = "fn f(a: Self) -> Bool \{ a == a }\nfn main() \{}\n"
+    assert_eq(all_errors(src), refused_at(1, 9))
+}
+
+test "a Self value path in a free fn is e0569" {
+    let src = "fn main() \{\n    let _s = Self.len\n}\n"
+    assert_eq(all_errors(src), refused_at(2, 14))
+}
+
+test "a static call on a Self head in a free fn is e0569" {
+    let src = "fn main() \{\n    let _s = Self.len()\n}\n"
+    assert_eq(all_errors(src), refused_at(2, 14))
+}
+
+test "a call of Self in a free fn is e0569" {
+    let src = "fn main() \{\n    let _s = Self(1)\n}\n"
+    assert_eq(all_errors(src), refused_at(2, 14))
+}
+
+test "a Self struct literal in a free fn is e0569" {
+    let src = "type P \{ a: Int }\nfn main() \{\n    let _p = Self \{ a: 1 }\n}\n"
+    assert_eq(all_errors(src), refused_at(3, 14))
+}
+
+test "a Self pattern in a free fn is e0569" {
+    let src = "type R \{ A, B }\nfn main() \{\n    let r = R.A\n    match r \{\n        Self.A => io.println(\"a\")\n        _ => io.println(\"b\")\n    }\n}\n"
+    assert_eq(all_errors(src), refused_at(5, 9))
+}
+
+test "a Self struct pattern in a free fn is e0569 and nothing more" {
+    let src = "type Pt \{ x: Int }\nfn main() \{\n    let p = Pt \{ x: 1 }\n    match p \{\n        Self \{ x } => io.println(\"\{x}\")\n    }\n}\n"
+    assert_eq(all_errors(src), refused_at(5, 9))
+}
+
+test "a Self key of a Map or a Set in a free fn is e0569 and nothing more" {
+    let src = "fn f(m: Map[Self, Int], s: Set[Self]) -> Int \{ 1 }\nfn main() \{}\n"
+    assert_eq(all_errors(src), "{refused_at(1, 13)} || {refused_at(1, 32)}")
+}
+
+test "a Self associated type outside a trait or impl is e0569" {
+    let src = "fn f(a: Self.Item) -> Int \{ 1 }\nfn main() \{}\n"
+    assert_eq(all_errors(src), refused_at(1, 9))
+}
+
+test "a Self value path in a global is e0569" {
+    let src = "let g = Self.foo\nfn main() \{}\n"
+    assert_eq(all_errors(src), refused_at(1, 9))
+}
+
+test "an effect operation parameter of type Self is e0569" {
+    let src = "effect Store \{\n    effect Put \{\n        fn put(x: Self) -> Int\n    }\n}\nfn main() \{}\n"
+    assert_eq(all_errors(src), refused_at(3, 19))
+}
+
+test "a Self in a fn type parameter is e0569" {
+    let src = "fn p(a: fn() -> Self) -> Int \{ 1 }\nfn main() \{}\n"
+    assert_eq(all_errors(src), refused_at(1, 17))
+}
+
+test "a Self in a fn type nested in a generic argument is e0569" {
+    let src = "fn q(a: List[fn() -> Self]) -> Int \{ 1 }\nfn main() \{}\n"
+    assert_eq(all_errors(src), refused_at(1, 22))
+}
+
+test "a top-level type alias of Self is e0569" {
+    let src = "type Al = Self\nfn main() \{}\n"
+    assert_eq(all_errors(src), refused_at(1, 11))
+}
+
+test "a struct field of type Self is e0569" {
+    let src = "type S \{ a: Self }\nfn main() \{}\n"
+    assert_eq(all_errors(src), refused_at(1, 13))
+}
+
+test "an enum payload of type Self is e0569" {
+    let src = "type E \{ A(Self), B }\nfn main() \{}\n"
+    assert_eq(all_errors(src), refused_at(1, 12))
+}
+
+test "a local annotated Self in a test block is e0569" {
+    let src = "fn main() \{}\ntest \"t\" \{\n    let a: Self = 1\n}\n"
+    assert_eq(all_errors(src), refused_at(3, 12))
+}
+
+test "a closure parameter of type Self in a free fn is e0569" {
+    let src = "fn main() \{\n    let _f = fn(a: Self) -> Int \{ 1 }\n}\n"
+    assert_eq(all_errors(src), refused_at(2, 20))
+}
+
+test "a Self type argument of a call in a free fn is e0569" {
+    let src = "fn id[T](x: T) -> T \{ x }\nfn main() \{\n    let _a = id[Self](1)\n}\n"
+    assert_eq(all_errors(src), refused_at(3, 17))
+}
+
+test "a Self argument of a bound on a free fn type parameter is e0569" {
+    let src = "trait Tr[X] \{\n    fn t(self, x: X) -> Int\n}\nfn h[T: Tr[Self]](t: T) -> Int \{ 1 }\nfn main() \{}\n"
+    assert_eq(all_errors(src), refused_at(4, 12))
+}
+
+test "a Self argument of a bound on a type's type parameter is e0569" {
+    let src = "trait Tr[X] \{\n    fn t(self, x: X) -> Int\n}\ntype K[T: Tr[Self]] \{ v: T }\nfn main() \{}\n"
+    assert_eq(all_errors(src), refused_at(4, 14))
+}
+
+test "a global annotated Self is e0569" {
+    let src = "let g: Self = 1\nfn main() \{}\n"
+    assert_eq(all_errors(src), refused_at(1, 8))
+}
+
+test "a Self field type that ends its line is e0569 at the Self token" {
+    let src = "type S \{\n    a: Int,\n    b: Self\n}\nfn main() \{}\n"
+    assert_eq(all_errors(src), refused_at(3, 8))
+}
+
+test "a Self parameter type that ends its line is e0569 at the Self token" {
+    let src = "fn f(\n    a: Int,\n    b: Self\n) -> Int \{ a }\nfn main() \{}\n"
+    assert_eq(all_errors(src), refused_at(3, 8))
+}
+
+// Guards: `Self` in a trait declaration and in an impl block stays legal.
+
+test "Self in a trait signature and a trait default body reports nothing" {
+    let src = "trait Mk \{\n    fn mk(side: Int) -> Self\n    fn twice(self, other: Self) -> Self \{\n        let o: Self = other\n        o\n    }\n    fn one() -> Self \{ Self.mk(1) }\n}\ntype Sq \{ side: Int }\nimpl Mk for Sq \{\n    fn mk(side: Int) -> Sq \{ Sq \{ side: side } }\n    fn twice(self, other: Self) -> Self \{ other }\n    fn one() -> Self \{ Self.mk(1) }\n}\nfn main() \{}\n"
+    assert_eq(all_errors(src), "")
+}
+
+test "Self in an impl signature, local, closure and static call reports nothing" {
+    let src = "trait Mk \{\n    fn mk(side: Int) -> Self\n    fn grow(self) -> Self\n}\ntype Sq \{ side: Int }\nimpl Mk for Sq \{\n    fn mk(side: Int) -> Self \{ Sq \{ side: side } }\n    fn grow(self) -> Self \{\n        let x: Self = Self.mk(self.side + 1)\n        let pick = fn(a: Self, b: Self) -> Self \{ if a.side > b.side \{ a } else \{ b } }\n        let fs: List[fn() -> Self] = []\n        let _n = fs.len()\n        pick(x, self)\n    }\n}\nfn main() \{}\n"
+    assert_eq(all_errors(src), "")
+}
+
+test "Self in a generic impl and a trait with a supertrait reports nothing" {
+    let src = "trait Base \{\n    fn base(self) -> Self\n}\ntrait Wrap: Base \{\n    fn wrap(self) -> Self\n}\ntype Bx[T] \{ v: T }\nimpl[T] Base for Bx[T] \{\n    fn base(self) -> Self \{ self }\n}\nimpl[T] Wrap for Bx[T] \{\n    fn wrap(self) -> Self \{\n        let s: Self = self.base()\n        s\n    }\n}\nfn main() \{}\n"
+    assert_eq(all_errors(src), "")
+}
+
+test "a Self variant pattern in an impl on an enum reports nothing" {
+    let src = "type Color \{ Red, Rgb(Int) }\ntrait Shown \{\n    fn shown(self) -> Str\n}\nimpl Shown for Color \{\n    fn shown(self) -> Str \{\n        match self \{\n            Self.Red => \"red\"\n            Self.Rgb(n) => \"rgb \{n}\"\n        }\n    }\n}\nfn main() \{}\n"
+    assert_eq(all_errors(src), "")
+}
+
+test "a Self associated type in a trait signature reports nothing" {
+    let src = "trait Bag \{\n    fn first(self) -> Self.Item\n}\nfn main() \{}\n"
+    assert_eq(all_errors(src), "")
+}
+
+// `Self { .. }` in an impl is refused by its own rule (Self is not a constructor), and a
+// `Self { x }` struct pattern has its own open question; neither may be E0569.
+test "a Self struct literal and a Self struct pattern in an impl are not e0569" {
+    let lit = "trait Mk \{\n    fn mk(side: Int) -> Self\n}\ntype Sq \{ side: Int }\nimpl Mk for Sq \{\n    fn mk(side: Int) -> Self \{ Self \{ side: side } }\n}\nfn main() \{}\n"
+    let lit_errors = all_errors(lit)
+    assert(!lit_errors.contains("SelfOutsideTraitOrImpl"), lit_errors)
+    let pat = "type Pt \{ x: Int }\ntrait Shown \{\n    fn shown(self) -> Str\n}\nimpl Shown for Pt \{\n    fn shown(self) -> Str \{\n        match self \{\n            Self \{ x } => \"pt \{x}\"\n        }\n    }\n}\nfn main() \{}\n"
+    let pat_errors = all_errors(pat)
+    assert(!pat_errors.contains("SelfOutsideTraitOrImpl"), pat_errors)
+}

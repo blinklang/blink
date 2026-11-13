@@ -34,7 +34,7 @@ import diagnostics.{
     UNSOLVED_TYPEVAR_AT_CODEGEN, SEALED_OPS_REWRITE_INVARIANT, VARIANT_WITHOUT_ENUM,
     NO_SUCH_VARIANT, TYPE_ERROR, TEMPLATE_MISMATCH, UNEXPECTED_ANNOTATION, MISSING_RETURN, NO_CONVERSION_IMPL, CANNOT_INFER_TYPE, NOT_ITERABLE, MISSING_ELSE, UNLICENSED_SELF_OP, TRAIT_BOUND_NOT_SATISFIED, CAPABILITY_BUDGET, QM_INVALID_OPERAND, UNDEFINED_FUNCTION,
     UNRESOLVED_METHOD, AMBIGUOUS_METHOD_CALL, MISSING_DISPLAY_IMPL,
-    MUTATION_REQUIRES_MUT, MUT_ON_PATTERN, NOT_A_PLACE, PARAM_ASSIGN, diag_error_label_at_notes, diag_add_note_at_spots_since, diag_error_span_label_at_notes, diag_warn_label_at_notes, EMPTY_ROW_OUTSIDE_FFI, PANIC_HOOK_PLACEMENT, TRACE_MESSAGE_EFFECT, METHOD_THROUGH_TYPE_NAME, EFFECTS_ANNOTATION_REMOVED, UNKNOWN_EFFECT, diag_fix_before_starts_with, diag_drop_fix_over_others, diag_drop_fix_at,
+    MUTATION_REQUIRES_MUT, MUT_ON_PATTERN, NOT_A_PLACE, PARAM_ASSIGN, diag_error_label_at_notes, diag_add_note_at_spots_since, diag_error_span_label_at_notes, diag_warn_label_at_notes, EMPTY_ROW_OUTSIDE_FFI, PANIC_HOOK_PLACEMENT, TRACE_MESSAGE_EFFECT, METHOD_THROUGH_TYPE_NAME, SELF_OUTSIDE_TRAIT_OR_IMPL, EFFECTS_ANNOTATION_REMOVED, UNKNOWN_EFFECT, diag_fix_before_starts_with, diag_drop_fix_over_others, diag_drop_fix_at,
     UNDEFINED_VARIABLE, UNKNOWN_TYPE, QM_RESULT_IN_NON_RESULT,
     QM_OPTION_IN_NON_OPTION, QM_ERROR_MISMATCH,
     QM_TEST_DISPLAY_REQUIRED, TEST_ANNOTATED_RETURN, SKIP_OUTSIDE_TEST,
@@ -6000,7 +6000,9 @@ fn tc_struct_head_in_scope(sname: Str) -> Bool {
 // accepted, minting a handle outside the FFI boundary. A builtin head has no tid, so -1 says
 // "not a handle" and the general refusal below answers.
 fn tc_report_unconstructible_head(stid: Int, sname: Str, node: Int) ! Diag.Report {
-    // The declaration that left the head with no type has its own report (E1016, UnknownType).
+    // The declaration that left the head with no type has its own report (E1016, UnknownType),
+    // and so does a `Self` outside a trait or impl (E0569).
+    if sname == "Self" && tc_current_self_tid == -1 { return }
     if tc_type_name_poisoned(sname) || (stid >= 0 && (tc_tid_is_no_info(stid) != 0 || type_kind(stid) == TyKind.Typevar)) { return }
     if stid >= 0 && ffi_opaque_type_set.contains_key(tc_resolve(stid)) {
         diag_error_at("TypeError", TYPE_ERROR, "cannot construct @ffi.opaque handle `{sname}` outside the FFI boundary", node, "an opaque handle has no user-callable constructor; it is produced only at the FFI boundary (section 9.1.4)")
@@ -15211,6 +15213,8 @@ fn validate_keyed_ann(key_ann: Int, key_tid: Option[Int], role: HashRole) ! Diag
     // `type Temp = Float` says "Map key type 'Temp'" and explains the Float hazard behind it.
     let decl_name = node_name(key_ann)
     if tc_name_is_tparam_in_scope(decl_name) != 0 { return }
+    // A `Self` outside a trait or impl has its own report (E0569).
+    if decl_name == "Self" && tc_current_self_tid == -1 { return }
     // A name imported from blink.core under another name is the builtin (§10.6), and is judged
     // as the written builtin is. It names no declaration, so no declaration may answer for it,
     // not even one in this module that takes the builtin's name.
@@ -24740,9 +24744,16 @@ let mut nr_scope_prev: List[Int] = []
 let mut nr_name_top: Map[Str, Int] = Map()
 let mut nr_scope_frames: List[Int] = []
 let mut nr_scope_depth: Int = 0
-let mut nr_loop_depth: Int = 0
-let mut nr_in_closure_depth: Int = 0
-let mut nr_with_ptr_depth: Int = 0
+// Where the name-resolution walk is, as one global so a new context is a field, not a global.
+type NrWalkContext {
+    loop_depth: Int
+    closure_depth: Int
+    with_ptr_depth: Int
+    // True inside a trait declaration or an impl block, the only places `Self` names a type
+    // (sections/03_types.md, The `Self` Type).
+    in_trait_or_impl: Bool
+}
+let mut nr_walk: NrWalkContext = NrWalkContext { loop_depth: 0, closure_depth: 0, with_ptr_depth: 0, in_trait_or_impl: false }
 let mut nr_warn_unused: Int = 0
 // The E0301 region-boundary check must run ONLY in the type-inference
 // pass (tc_check_fn/tc_check_body), where annotations are honored (final_tid =
@@ -25073,7 +25084,7 @@ fn nr_mark_read_at(i: Int) {
     // If the read happens inside a closure body, the capture may be
     // observed on a later call — don't let subsequent writes in the
     // enclosing scope cancel this read (W0601 false positive).
-    if nr_in_closure_depth > 0 {
+    if nr_walk.closure_depth > 0 {
         // Only mark entries in enclosing scopes (outside the closure
         // frame) as captured. Locals inside the closure are walked
         // the normal way.
@@ -25179,7 +25190,7 @@ fn nr_is_mut(name: Str) -> Int {
 fn nr_mark_written(name: Str, _node: Int) ! Diag.Report {
     let i = nr_top_index(name)
     if i == -1 { return }
-    if nr_loop_depth == 0 && nr_scope_captured.get(i).unwrap() == 0 {
+    if nr_walk.loop_depth == 0 && nr_scope_captured.get(i).unwrap() == 0 {
         nr_scope_reads.set(i, 0)
     }
     nr_scope_writes.set(i, nr_scope_writes.get(i).unwrap() + 1)
@@ -29380,9 +29391,7 @@ fn resolve_names(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repor
     nr_name_top.clear()
     nr_scope_frames = []
     nr_scope_depth = 0
-    nr_loop_depth = 0
-    nr_in_closure_depth = 0
-    nr_with_ptr_depth = 0
+    nr_walk = NrWalkContext { loop_depth: 0, closure_depth: 0, with_ptr_depth: 0, in_trait_or_impl: false }
     nr_warn_unused = 1
     nr_impl_type_names = []
     nr_impl_method_names = []
@@ -29610,6 +29619,7 @@ fn resolve_names(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repor
         while i < sublist_length(impls_sl) {
             let im = sublist_get(impls_sl, i)
             nr_current_module = node_module(im)
+            nr_walk.in_trait_or_impl = true
             nr_check_impl_trait_ref(im)
             let methods_sl = node_methods(im)
             let impl_binders_sl = node_impl_binders(im)
@@ -29624,11 +29634,14 @@ fn resolve_names(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repor
                 }
             }
             tc_pop_tparam_scope(impl_binders_sl)
+            nr_walk.in_trait_or_impl = false
             i = i + 1
         }
     }
 
+    nr_walk.in_trait_or_impl = true
     nr_check_trait_method_defaults(node_arms(program))
+    nr_walk.in_trait_or_impl = false
 
     // An operation is a function of its own (§4.7.1), read in the module that declares its
     // effect. One with no body still has a signature of written types. It names no handler of
@@ -29968,9 +29981,26 @@ fn nr_names_a_type(name: Str) -> Int {
     0
 }
 
+// A `Self` outside a trait declaration or an impl block names no type. The report is at the
+// `Self` token, which starts the name whether it is bare or qualifies one (`Self.Item`).
+fn nr_refuse_self_outside(name: Str, at: Int) -> Bool ! Diag.Report {
+    if nr_walk.in_trait_or_impl { return false }
+    if name != "Self" && !name.starts_with("Self.") { return false }
+    tc_errors.push("`Self` outside trait or impl")
+    // A type annotation's own line and col read after its last token; its written span
+    // starts at the name.
+    let (w_line, w_col, _, _) = node_written_span(at)
+    let written = node_kind(at) == NodeKind.TypeAnn && w_line != 0
+    let line = if written { w_line } else { node_line(at) }
+    let col = if written { w_col } else { node_col(at) }
+    diag_error_span_label_at_notes("SelfOutsideTraitOrImpl", SELF_OUTSIDE_TRAIT_OR_IMPL, "`Self` outside trait or impl", at, line, col, col + 4, "`Self` is only valid inside trait declarations and impl blocks", "", [])
+    true
+}
+
 // `at` is the node the report points at, or -1 when the caller has none.
 fn nr_check_type_ref(name: Str, at: Int) ! TypeCheck.Resolve, Diag.Report {
     if name == "" { return }
+    if nr_refuse_self_outside(name, at) { return }
     // A name is a type variable exactly where a generic binder in scope declares it. The
     // spelling carries nothing, so the length of the name is not part of the test.
     // Undeclared, the name is no type at all — fall through to the unknown-type check
@@ -30600,6 +30630,7 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     if kind == NodeKind.Ident {
         let name = node_name(node)
         if name == "true" || name == "false" || name == "None" { return }
+        if nr_refuse_self_outside(name, node) { return }
         if name == "on_panic" && !nr_on_panic_is_bound_here() {
             tc_report_panic_hook_not_with_item(node)
             return
@@ -30749,7 +30780,9 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                 // intrinsic: a user fn of that spelling, pub or not, is never in scope there, so
                 // it must not be reported as unselected or private, nor take the intrinsic's place.
                 let range_intrinsic = fn_name == "range_bounds" && tc_site_in_std(node) && nr_resolve_bare_decl(fn_name, nr_current_module) < 0
-                if fn_name == "on_panic" && !nr_on_panic_is_bound_here() {
+                if nr_refuse_self_outside(fn_name, callee) {
+                    tc_type_args_unresolved.insert(node, 1)
+                } else if fn_name == "on_panic" && !nr_on_panic_is_bound_here() {
                     tc_type_args_unresolved.insert(node, 1)
                     tc_report_panic_hook_not_with_item(callee)
                 } else if !range_intrinsic && nr_check_selective_access_at(fn_name, node, top) == 0 {
@@ -30899,7 +30932,7 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
         let args_sl = node_args(node)
         let obj_is_ident = if obj != -1 && node_kind(obj) == NodeKind.Ident { 1 } else { 0 }
         let is_with_ptr_call = if method_name == "with_ptr" && obj_is_ident != 0 { 1 } else { 0 }
-        if is_with_ptr_call != 0 { nr_with_ptr_depth = nr_with_ptr_depth + 1 }
+        if is_with_ptr_call != 0 { nr_walk.with_ptr_depth = nr_walk.with_ptr_depth + 1 }
         if args_sl != -1 {
             let mut i = 0
             while i < sublist_length(args_sl) {
@@ -30907,8 +30940,8 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                 i = i + 1
             }
         }
-        if is_with_ptr_call != 0 { nr_with_ptr_depth = nr_with_ptr_depth - 1 }
-        if method_name == "as_ptr" && nr_with_ptr_depth == 0 && obj_is_ident != 0 {
+        if is_with_ptr_call != 0 { nr_walk.with_ptr_depth = nr_walk.with_ptr_depth - 1 }
+        if method_name == "as_ptr" && nr_walk.with_ptr_depth == 0 && obj_is_ident != 0 {
             let recv_t = tc_infer_receiver(obj)
             if type_kind(recv_t) == TyKind.Bytes {
                 diag_error_at("BytesPtrCastForbidden", BYTES_PTR_CAST_FORBIDDEN, "cannot take a raw Ptr[U8] from Bytes outside a with_ptr closure — Bytes is GC-managed and may be relocated", node, "use Bytes.with_ptr(fn(p) \{ ... }) to pin the buffer for the FFI call")
@@ -31002,17 +31035,17 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
 
     if kind == NodeKind.WhileLoop {
         nr_check_node(node_condition(node))
-        nr_loop_depth = nr_loop_depth + 1
+        nr_walk.loop_depth = nr_walk.loop_depth + 1
         nr_check_node(node_body(node))
-        nr_loop_depth = nr_loop_depth - 1
+        nr_walk.loop_depth = nr_walk.loop_depth - 1
         nr_check_node(node_condition(node))
         return
     }
 
     if kind == NodeKind.LoopExpr {
-        nr_loop_depth = nr_loop_depth + 1
+        nr_walk.loop_depth = nr_walk.loop_depth + 1
         nr_check_node(node_body(node))
-        nr_loop_depth = nr_loop_depth - 1
+        nr_walk.loop_depth = nr_walk.loop_depth - 1
         return
     }
 
@@ -31024,9 +31057,9 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
         if for_pat_sl != -1 {
             nr_check_pattern(for_pat_sl, false)
         }
-        nr_loop_depth = nr_loop_depth + 1
+        nr_walk.loop_depth = nr_walk.loop_depth + 1
         nr_check_node(node_body(node))
-        nr_loop_depth = nr_loop_depth - 1
+        nr_walk.loop_depth = nr_walk.loop_depth - 1
         nr_pop_scope()
         return
     }
@@ -31081,9 +31114,9 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
         // against the closure's own (or enclosing fn's) return type.
         let saved_in_test = tc_in_test_body
         tc_in_test_body = 0
-        nr_in_closure_depth = nr_in_closure_depth + 1
+        nr_walk.closure_depth = nr_walk.closure_depth + 1
         nr_check_node(node_body(node))
-        nr_in_closure_depth = nr_in_closure_depth - 1
+        nr_walk.closure_depth = nr_walk.closure_depth - 1
         tc_in_test_body = saved_in_test
         nr_pop_scope()
         return
@@ -31091,7 +31124,7 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
 
     if kind == NodeKind.StructLit {
         let type_name = node_type_name(node)
-        if type_name != "" {
+        if type_name != "" && !nr_refuse_self_outside(type_name, node) {
             match type_name.byte_index_of(".", 0) {
                 Some(dot_pos) => {
                     let prefix = type_name.byte_slice(0, dot_pos)
@@ -31432,6 +31465,7 @@ fn nr_check_pattern(node: Int, refutable: Bool) ! TypeCheck.Resolve, Diag.Report
     }
 
     if kind == NodeKind.EnumPattern {
+        if node_name(node) == "Self" { let _ = nr_refuse_self_outside("Self", node) }
         let flds_sl = node_fields(node)
         if flds_sl != -1 {
             let is_struct_pat = node_int_val(node)
@@ -31456,6 +31490,7 @@ fn nr_check_pattern(node: Int, refutable: Bool) ! TypeCheck.Resolve, Diag.Report
     }
 
     if kind == NodeKind.StructPattern {
+        if node_type_name(node) == "Self" { let _ = nr_refuse_self_outside("Self", node) }
         let flds_sl = node_fields(node)
         if flds_sl != -1 {
             let mut i = 0
@@ -44345,6 +44380,8 @@ fn tc_report_pattern_fault(pat: Int, fault: PatternFault, hint: Int, subject: St
     let qualified = k == NodeKind.EnumPattern && node_type_name(pat) != ""
     let qual = if qualified { node_name(pat) } else { "" }
     let name = if k == NodeKind.StructPattern || qualified { node_type_name(pat) } else { node_name(pat) }
+    // A `Self` head outside a trait or impl has its own report (E0569).
+    if (if qualified { qual } else { name }) == "Self" && tc_current_self_tid == -1 { return }
     // `mut Name` starts at `mut`; the name ends where the node does.
     let ident_end = k == NodeKind.IdentPattern && node_end_col(pat) > 0 && node_end_line(pat) == node_line(pat)
     let col = if qualified { tc_qualified_name_col(pat, qual, name) } else if ident_end { node_end_col(pat) - name.byte_len() } else { node_col(pat) }
@@ -45235,7 +45272,7 @@ fn tc_infer_program(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Re
     nr_name_top.clear()
     nr_scope_frames = []
     nr_scope_depth = 0
-    nr_loop_depth = 0
+    nr_walk.loop_depth = 0
     nr_push_scope()
     tc_infer_program_with_boundary_check(program)
 }

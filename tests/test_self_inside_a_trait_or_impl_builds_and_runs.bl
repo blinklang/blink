@@ -1,0 +1,146 @@
+// `Self` is valid in a trait declaration and in an impl block (sections/03_types.md, The `Self`
+// Type), and a `Self` anywhere else is refused before a build starts. So a program that uses
+// `Self` in a trait signature and default body, in an impl signature, local, closure, static call
+// and variant pattern, and in a generic impl builds and runs both ways; a `Self` outside them
+// fails the build with SelfOutsideTraitOrImpl and no internal error.
+
+import compile_test_helpers
+
+// The corpus exports BLINK_COMPILER_ARCHIVE, which, like the module filters, makes a build
+// one unit, so the build drops them and a per-module build really writes its units.
+// Whether the build passed, and its output.
+fn build(src: Str, stem: Str, flag: Str, dir: Str) -> (Bool, Str) ! FS.Read, FS.Write, Process.Spawn, Env.Read {
+    compile_test_helpers.sh("rm -rf {dir} && mkdir -p {dir}")
+    let path = "{dir}/{stem}.bl"
+    fs.write(path, src).unwrap()
+    let b = process.run("sh", ["-c", "env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE BLINK_CACHE_DIR={dir}/objcache build/blink build {flag} {path} -o {dir}/{stem}_bin 2>&1"]).unwrap()
+    (b.success(), "{b.out}{b.err_out}")
+}
+
+fn build_and_run(src: Str, stem: Str, flag: Str) -> Str ! FS.Read, FS.Write, Process.Spawn, Env.Read {
+    let dir = "{compile_test_helpers.scratch_root()}/{stem}_{getpid()}"
+    let b = build(src, stem, flag, dir)
+    assert(b.0, "build failed: {b.1}")
+    let r = process.run("{dir}/{stem}_bin", []).unwrap()
+    compile_test_helpers.sh("rm -rf {dir}")
+    assert(r.success(), r.err_out)
+    r.out
+}
+
+fn build_output_of_refused(src: Str, stem: Str, flag: Str) -> Str ! FS.Read, FS.Write, Process.Spawn, Env.Read {
+    let dir = "{compile_test_helpers.scratch_root()}/{stem}_{getpid()}"
+    let b = build(src, stem, flag, dir)
+    compile_test_helpers.sh("rm -rf {dir}")
+    assert(!b.0, "build passed: {b.1}")
+    b.1
+}
+
+fn both_modes(src: Str, stem: Str, want: Str) ! FS.Read, FS.Write, Process.Spawn, Env.Read {
+    assert_eq(build_and_run(src, "{stem}_pm", "--per-module"), want)
+    assert_eq(build_and_run(src, "{stem}_wp", "--no-per-module"), want)
+}
+
+fn refused_both_modes(src: Str, stem: Str) ! FS.Read, FS.Write, Process.Spawn, Env.Read {
+    for flag in ["--per-module", "--no-per-module"] {
+        let out = build_output_of_refused(src, "{stem}_{flag.len()}", flag)
+        assert(out.contains("SelfOutsideTraitOrImpl"), out)
+        assert(!out.to_lower().contains("internal compiler error"), out)
+    }
+}
+
+test "Self in traits, impls, closures and a generic impl builds and runs" {
+    both_modes(#"
+trait Shape: Display {
+    fn area(self) -> Int
+    fn bigger(self, other: Self) -> Self
+    fn same(self, other: Self) -> Bool {
+        let o: Self = other
+        o.area() == self.area()
+    }
+}
+
+trait Mk {
+    fn mk(side: Int) -> Self
+    fn unit() -> Self
+}
+
+type Sq { side: Int }
+
+impl Display for Sq {
+    fn fmt(self, mut sb: StringBuilder) { sb.write("Sq({self.side})") }
+}
+
+impl Mk for Sq {
+    fn mk(side: Int) -> Self { Sq { side: side } }
+    fn unit() -> Self { Self.mk(1) }
+}
+
+impl Shape for Sq {
+    fn area(self) -> Int { self.side * self.side }
+    fn bigger(self, other: Self) -> Self {
+        let pick = fn(a: Self, b: Self) -> Self { if a.area() >= b.area() { a } else { b } }
+        let x: Self = pick(self, other)
+        x
+    }
+    fn same(self, other: Self) -> Bool {
+        let o: Self = other
+        o.area() == self.area()
+    }
+}
+
+type Bx[T] { v: T }
+
+trait Wrap[T] {
+    fn wrap(v: T) -> Self
+    fn get(self) -> T
+}
+
+impl[T] Wrap[T] for Bx[T] {
+    fn wrap(v: T) -> Self { Bx { v: v } }
+    fn get(self) -> T { self.v }
+}
+
+fn main() {
+    let a = Sq.mk(3)
+    let b = Sq.unit()
+    io.println("{a.bigger(b)} {a.same(b)}")
+    let bx: Bx[Int] = Bx.wrap(5)
+    io.println("{bx.get()}")
+}
+"#, "_self_legal", "Sq(3) false\n5\n")
+}
+
+test "a Self variant pattern in an impl on an enum builds and runs" {
+    both_modes(#"
+type Color { Red, Rgb(Int) }
+
+trait Shown {
+    fn shown(self) -> Str
+}
+
+impl Shown for Color {
+    fn shown(self) -> Str {
+        match self {
+            Self.Red => "red"
+            Self.Rgb(n) => "rgb {n}"
+        }
+    }
+}
+
+fn main() {
+    io.println("{Color.Rgb(4).shown()} {Color.Red.shown()}")
+}
+"#, "_self_pattern", "rgb 4 red\n")
+}
+
+test "a free fn that returns Self fails the build with e0569 and no internal error" {
+    refused_both_modes("fn zzclone() -> Self \{ 42 }\nfn main() \{ io.println(\"\{zzclone()}\") }\n", "_self_free_fn_return")
+}
+
+test "a Self value path in main fails the build with e0569 and no internal error" {
+    refused_both_modes("fn main() \{\n    let _s = Self.len\n}\n", "_self_value_path")
+}
+
+test "an effect operation of type Self fails the build with e0569 and no internal error" {
+    refused_both_modes("effect Store \{\n    effect Put \{\n        fn put(x: Self) -> Int\n    }\n}\nfn main() \{}\n", "_self_effect_op")
+}
