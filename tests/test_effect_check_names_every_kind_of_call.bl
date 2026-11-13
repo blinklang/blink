@@ -1,0 +1,282 @@
+// The effect check names what each call runs, both for the row of the fn that makes the call
+// and for a trace.log `msg`. A call it could not name would stop a clean check with an internal
+// error, so each shape below checks, builds and runs. A call whose callee has a row is charged
+// that row: the last rows give each kind such a callee, in a fn that does not declare the
+// effect (E0500) and in a `msg` (E0566), so a call taken as the wrong kind changes the report.
+import blink.core.{Bytes as CoreBytes}
+import compile_test_helpers
+
+@derive(Eq, Hash)
+type Pt { x: Int, y: Int }
+
+type Hooks { cb: fn(Int) -> Int }
+
+trait Sz {
+    fn sz(self) -> Int
+}
+
+impl Sz for Pt {
+    fn sz(self) -> Int { self.x + self.y }
+}
+
+trait Count {
+    fn count_of(self) -> Int
+}
+
+impl[T] Count for List[T] {
+    fn count_of(self) -> Int { self.len() }
+}
+
+let BUMP = fn(x: Int) -> Int { x + 1 }
+
+fn through_bound[T: Sz](t: T) -> Int { t.sz() }
+
+fn kinds() -> Int {
+    let p = Pt { x: 1, y: 2 }
+    let h = Hooks { cb: fn(x: Int) -> Int { x * 2 } }
+    let same = if p.eq(Pt { x: 1, y: 2 }) { 1 } else { 0 }
+    let hashed = if p.hash() == Pt { x: 1, y: 2 }.hash() { 1 } else { 0 }
+    let opt = (Some(3) ?? 0)
+    let b = CoreBytes.from_str("ab").len()
+    same + hashed + h.cb(1) + BUMP(1) + opt + b + Sz.sz(p) + p.sz() + through_bound(p) + [1, 2].count_of()
+}
+
+test "a pure fn makes each kind of call with no effect row" {
+    assert_eq(kinds(), 1 + 1 + 2 + 2 + 3 + 2 + 3 + 3 + 3 + 2)
+}
+
+test "a trace.log msg makes each kind of call" {
+    let p = Pt { x: 1, y: 2 }
+    let h = Hooks { cb: fn(x: Int) -> Int { x * 2 } }
+    trace.log("kinds", "{p.eq(p)} {p.hash() == p.hash()} {h.cb(1)} {BUMP(1)} {(Some(3) ?? 0)}")
+    trace.log("kinds", "{CoreBytes.from_str("ab").len()} {Sz.sz(p)} {p.sz()} {through_bound(p)} {[1, 2].count_of()}")
+    assert_eq(kinds(), 22)
+}
+
+fn through_default() -> Int ! Rand {
+    with handler Rand {
+        fn int(lo: Int, hi: Int) -> Int { default.int(lo, hi) }
+    } {
+        rand.int(1..=1)
+    }
+}
+
+test "a handler operation calls the handler it was installed over" {
+    assert_eq(through_default(), 1)
+}
+
+@derive(Deserialize)
+type Cfg { n: Int }
+
+type CfgA = Cfg
+
+@derive(Deserialize)
+type Bx[T] { v: T }
+
+type Color {
+    Red = "red"
+    Blue = "blue"
+}
+
+type ColorA = Color
+
+type Shape {
+    Dot
+    Sq(Int)
+}
+
+fn area(s: Shape) -> Int {
+    match s {
+        Shape.Dot => 0
+        Shape.Sq(n) => n * n
+    }
+}
+
+// A derive gives these statics with no declaration, so the call names its type.
+fn statics() -> Int {
+    let bx: Result[Bx[Int], Str] = Bx.from_json("1")
+    let flags = [Cfg.from_json("1").is_err(), CfgA.from_json("1").is_err(), bx.is_err(), Color.from_str("red").is_some(), ColorA.from_str("blue").is_some()]
+    flags.filter(fn(b: Bool) -> Bool { b }).len() + area(Shape.Sq(2))
+}
+
+test "a pure fn calls a derived static through its type, an alias and a generic type" {
+    assert_eq(statics(), 9)
+}
+
+test "a trace.log msg calls a derived static and a fn through a bound" {
+    let p = Pt { x: 1, y: 2 }
+    trace.log("statics", "{Cfg.from_json("1").is_err()} {ColorA.from_str("red").is_some()} {area(Shape.Sq(3))} {through_bound(p)} {statics()}")
+    assert_eq(statics(), 9)
+}
+
+type Cv { n: Int }
+
+impl[U] From[List[U]] for Cv {
+    fn from(xs: List[U]) -> Cv { Cv { n: xs.len() } }
+}
+
+impl[U] TryFrom[List[U]] for Cv {
+    fn try_from(xs: List[U]) -> Result[Cv, ConversionError] { Ok(Cv { n: xs.len() * 10 }) }
+}
+
+// A static conversion in a generic body takes its impl at each instance, so the call has no
+// declaration while the body is checked.
+fn conv[T](x: T) -> Int { Cv.from(x).n }
+
+fn try_conv[T](x: T) -> Int { Cv.try_from(x).unwrap().n }
+
+test "a pure fn makes a static conversion in a generic body" {
+    assert_eq(conv([1, 2]) + try_conv(["s"]), 12)
+}
+
+test "a trace.log msg makes a static conversion in a generic body" {
+    trace.log("conv", "{conv([1])} {try_conv([1, 2])}")
+    assert_eq(conv([1]), 1)
+}
+
+// std calls `List.with_capacity` in a module where `List` is the builtin, while this program
+// declares its own `List`. The check reads each static head in the module that writes it.
+test "a std static call on a builtin is a builtin where the program shadows its name" {
+    let src = #"type List[T] { v: T }
+trait Tally { fn tally(self) -> Int }
+impl[T] Tally for List[T] {
+    fn tally(self) -> Int { 1 }
+}
+fn pairs() -> Int {
+    let mut m = Map.new()
+    m.insert("a", 1)
+    m.entries().len()
+}
+fn main() {
+    trace.log("ch", "{pairs()}")
+    io.println("{List { v: 1 }.tally()} {pairs()}")
+}
+"#
+    let out = compile_test_helpers.compile_and_capture(src, "every_kind_shadowed_list")
+    compile_test_helpers.expect_compiles_clean(out, "every_kind_shadowed_list")
+    assert(!out.contains("\"severity\":\"ice\""))
+}
+
+fn expect_reports(src: Str, tag: Str, want: List[Str]) ! FS.Delete, FS.Write, Process.Spawn, FS.Read, Env.Read, IO.Print {
+    let out = compile_test_helpers.compile_and_capture(src, tag)
+    for w in want {
+        let code = if w.starts_with("call to") { "\"code\":\"E0500\"" } else { "\"code\":\"E0566\"" }
+        compile_test_helpers.expect_contains(out, code, tag)
+        compile_test_helpers.expect_contains(out, "\"message\":\"{w}\"", tag)
+    }
+    assert(!out.contains("CallRowUnknown"))
+}
+
+test "a fn call is charged the fn's row" {
+    let src = #"fn noisy() -> Int ! IO {
+    io.println("n")
+    1
+}
+fn quiet() -> Int {
+    noisy()
+}
+fn main() ! IO {
+    trace.log("ch", "{noisy()}")
+    io.println("{quiet()}")
+}
+"#
+    expect_reports(src, "every_kind_fn", [
+        "call to `noisy` needs effect `IO`, which `quiet` does not declare",
+        "`msg` calls `noisy`, which has a row",
+    ])
+}
+
+test "a call through a bound is charged the trait method's row" {
+    let src = #"trait Say {
+    fn say(self) -> Int ! IO
+}
+type A { n: Int }
+impl Say for A {
+    fn say(self) -> Int ! IO {
+        io.println("a")
+        self.n
+    }
+}
+fn through[T: Say](t: T) -> Int {
+    t.say()
+}
+fn traced[T: Say](t: T) -> Int ! IO {
+    trace.log("ch", "{t.say()}")
+    1
+}
+fn main() ! IO {
+    io.println("{through(A { n: 1 })} {traced(A { n: 1 })}")
+}
+"#
+    expect_reports(src, "every_kind_bound", [
+        "call to `T.say` needs effect `IO`, which `through` does not declare",
+        "`msg` calls `say`, which has a row",
+    ])
+}
+
+test "a trait-qualified call on a concrete receiver is charged the impl's row" {
+    let src = #"trait Say {
+    fn say(self) -> Int ! IO
+}
+type A { n: Int }
+impl Say for A {
+    fn say(self) -> Int ! IO {
+        io.println("a")
+        self.n
+    }
+}
+fn direct() -> Int {
+    Say.say(A { n: 1 })
+}
+fn main() ! IO {
+    trace.log("ch", "{Say.say(A { n: 2 })}")
+    io.println("{direct()}")
+}
+"#
+    expect_reports(src, "every_kind_impl", [
+        "call to `say` needs effect `IO`, which `direct` does not declare",
+        "`msg` calls `Say.say`, which has a row",
+    ])
+}
+
+test "an operation of a declared effect is charged its effect" {
+    let src = #"effect Log {
+    effect Write {
+        fn log(msg: Str) -> Int
+    }
+}
+fn quiet() -> Int {
+    log.log("x")
+}
+fn main() ! IO, Log {
+    trace.log("ch", "{log.log("y")}")
+    io.println("{quiet()}")
+}
+"#
+    expect_reports(src, "every_kind_user_op", [
+        "call to `Log.log` needs effect `Log.Write`, which `quiet` does not declare",
+        "`msg` calls `log.log`, a handler operation",
+    ])
+}
+
+test "a built-in operation and its default in a msg are handler operations" {
+    let src = #"fn roll() -> Int ! Rand, IO {
+    with handler Rand {
+        fn int(lo: Int, hi: Int) -> Int {
+            trace.log("ch", "{default.int(lo, hi)}")
+            lo
+        }
+    } {
+        rand.int(1..=1)
+    }
+}
+fn main() ! IO, Rand {
+    trace.log("ch", "{rand.int(1..=2)}")
+    io.println("{roll()}")
+}
+"#
+    expect_reports(src, "every_kind_default_op", [
+        "`msg` calls `default.int`, a handler operation",
+        "`msg` calls `rand.int`, a handler operation",
+    ])
+}
