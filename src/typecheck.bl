@@ -40354,8 +40354,7 @@ fn tc_stamp_where_predicate(td: Int, seen: List[Int]) ! TypeCheck.Resolve, TypeC
     nr_current_module = saved_module
     tc_pop_tparam_scope(tparams)
     // As with a field default, the walk recovered this subtree before it was typed.
-    let mut pred_owners: List[Int] = []
-    let _ = tc_stamp_walk(pred, pred_owners, seen)
+    let _ = tc_stamp_walk(pred, seen)
 }
 
 // The alias declaration an annotation names, keyed by the annotation node. An alias is
@@ -46779,8 +46778,7 @@ fn tc_stamp_type_field_defaults(td: Int, seen: List[Int]) ! TypeCheck.Resolve, T
                 // declaration, so a node that reads its type from a child — a closure body's
                 // block from its tail — had nothing to read then. Recover the subtree again now
                 // that the check above has typed it.
-                let mut dflt_owners: List[Int] = []
-                let _ = tc_stamp_walk(dflt, dflt_owners, seen)
+                let _ = tc_stamp_walk(dflt, seen)
             }
         }
         i = i + 1
@@ -46853,47 +46851,36 @@ fn tc_stamp_field_default(dflt: Int, ftid: Int) ! TypeCheck.Resolve, TypeCheck.R
 // Post-order over the value children of `node`. Explicitly iterative: the AST is as deep as
 // the source nests, and a recursive walk over the compiler's own longest functions is a
 // stack the recovery pass has no reason to spend.
-// The assert order, and `owners` filled in step with it: owners[i] is the body order[i] sits
-// in, the nearest enclosing function or test block, or -1 for a node at module level. Both
-// columns come off ONE descent, so a change to how children are enumerated cannot move one
-// and leave the other behind.
-//
-// A closure is not a body here. Its result type may be inferred from its tail, so an absence
-// inside it flows out into the function that holds it, and the fence has to be that function.
-//
 // `seen` holds one mark per node id and is all zero between walks. The walk grows it to the
 // node count, and clears its own marks once the descent is done. Recovery runs after that and
 // walks a field default or a @where predicate on its own; it reuses the same buffer, so those
 // walks cost their own subtree and not a pass over every node.
-pub fn tc_stamp_walk(root: Int, owners: List[Int], seen: List[Int]) -> List[Int] ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+pub fn tc_stamp_walk(root: Int, seen: List[Int]) -> List[Int] ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     let mut mods: List[Str] = []
-    tc_stamp_walk_sized(root, owners, mods, seen, 0)
+    tc_stamp_walk_sized(root, mods, seen, 0)
 }
 
 // The walk with room for `cap` nodes in its order: the whole-program walk reaches nearly every
 // node, and growing a list that size by doubling copies it again at each step.
 //
-// `mods` gets a third column: the module each node was checked in. Only a top-level
+// `mods` gets a second column: the module each node was checked in. Only a top-level
 // declaration carries its module, so a node below one reads it from the nearest ancestor that
 // does, which is the module tc_infer_program_body sets around that declaration's body.
-fn tc_stamp_walk_sized(root: Int, owners: List[Int], mods: List[Str], seen: List[Int], cap: Int) -> List[Int] ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+fn tc_stamp_walk_sized(root: Int, mods: List[Str], seen: List[Int], cap: Int) -> List[Int] ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     let mut order: List[Int] = List.with_capacity(cap)
     if root == -1 { return order }
     while seen.len() < node_count() { seen.push(0) }
     let mut stack: List[Int] = [root]
-    let mut pending: List[Int] = [-1]
     // A test block carries no module and is checked in the main file's, as tc_body_module reads it.
     let mut pending_mod: List[Str] = ["__main__"]
     let mut kids: List[Int] = []
     while stack.len() > 0 {
         let n = stack.pop().unwrap()
-        let o = pending.pop().unwrap()
         let outer_mod = pending_mod.pop().unwrap()
         if seen.get(n).unwrap() != 0 { continue }
         seen.set(n, 1)
         let own_mod = node_module(n)
         let m = if own_mod != "" { own_mod } else { outer_mod }
-        owners.push(o)
         mods.push(m)
         order.push(n)
         // An `@ffi` declaration's body is never checked — tc_check_fn skips it, and name
@@ -46906,8 +46893,6 @@ fn tc_stamp_walk_sized(root: Int, owners: List[Int], mods: List[Str], seen: List
         } else {
             -1
         }
-        let nk = node_kind(n)
-        let inner = if nk == NodeKind.FnDef || nk == NodeKind.TestBlock { n } else { o }
         kids.clear()
         node_push_value_child_ids(n, kids)
         let mut i = 0
@@ -46915,7 +46900,6 @@ fn tc_stamp_walk_sized(root: Int, owners: List[Int], mods: List[Str], seen: List
             let kid = kids.get(i).unwrap()
             if kid != skip_body {
                 stack.push(kid)
-                pending.push(inner)
                 pending_mod.push(m)
             }
             i = i + 1
@@ -46928,29 +46912,6 @@ fn tc_stamp_walk_sized(root: Int, owners: List[Int], mods: List[Str], seen: List
         j = j - 1
     }
     order
-}
-
-// The owner of a node the walk never reached. An owner is -1 or a node id, so this collides
-// with neither.
-pub let TC_STAMP_UNOWNED = -2
-
-// The owner column of a walk, indexed by node id instead of by walk position.
-pub fn tc_stamp_owner_index(order: List[Int], owners: List[Int]) -> List[Int] {
-    let mut index: List[Int] = List.with_capacity(node_count())
-    while index.len() < node_count() { index.push(TC_STAMP_UNOWNED) }
-    let mut i = 0
-    while i < order.len() {
-        index.set(order.get(i).unwrap(), owners.get(i).unwrap())
-        i = i + 1
-    }
-    index
-}
-
-// TC_STAMP_UNOWNED for an id the index does not cover: a node made after the walk, which the
-// walk cannot have reached.
-pub fn tc_stamp_owner_of(index: List[Int], n: Int) -> Int {
-    if n < 0 || n >= index.len() { return TC_STAMP_UNOWNED }
-    index.get(n).unwrap()
 }
 
 // The scope of a type parameter is the declaration that binds it (§3, under-determined types:
@@ -47792,11 +47753,9 @@ fn tc_skip_literal_tree(node: Int, skip: Set[Int]) {
 // harness reach the same pass by the same name.
 
 pub fn tc_stamp_program(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
-    let mut owners: List[Int] = List.with_capacity(node_count())
-    // tc_stamp_walk fills one slot per node.
     let mut mods: List[Str] = List.with_capacity(node_count())
     let mut seen: List[Int] = List.with_capacity(node_count())
-    let order = tc_stamp_walk_sized(program, owners, mods, seen, node_count())
+    let order = tc_stamp_walk_sized(program, mods, seen, node_count())
     tc_flush_unresolved_methods(true)
     let calls = tc_unclaimed_call_nodes()
     tc_report_unclaimed_calls(calls, order, mods)

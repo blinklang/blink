@@ -1,20 +1,12 @@
-// The total-stamp pass collects two columns over one tree: the order it asserts in, and the
-// body each node sits in. One descent produces both, so the columns cannot drift when the
-// child enumeration changes.
-//
-// Equality of the two key sets is true by construction once the walk is merged, so these rows
-// pin what a wrong merge would break instead: the owner VALUES, and the one place the two old
-// walks disagreed. The old owner walk descended into an `@ffi` body and the assert walk did
-// not. An `@ffi` body is never checked, so no node in it was ever given a type and no
-// unclaimed call can be recorded there; the merged walk skips it for both columns, and its
-// body node is deliberately absent from each.
+// The total-stamp pass asserts over one descent of the tree. The descent reaches each node once,
+// skips an `@ffi` body (it is never checked, so no node in it was given a type), and leaves the
+// shared `seen` buffer clear for the next walk.
 
 import std.fs
-import std.io
 import compiler.{compile_to_program}
-import typecheck.{check_types, tc_stamp_walk, tc_stamp_owner_index, tc_stamp_owner_of, TC_STAMP_UNOWNED}
-import parser.{node_count, node_kind, node_name, node_body, node_value_child_ids}
-import ast.{NodeKind, node_kind_name}
+import typecheck.{check_types, tc_stamp_walk}
+import parser.{node_count, node_kind, node_name, node_body}
+import ast.{NodeKind}
 import diagnostics.{diag_reset}
 import embedded_stdlib_registry.{init_embedded_stdlib}
 
@@ -41,7 +33,7 @@ fn stamp_probe_outer(n: Int) -> Int {
     bump(seed)
 }
 
-test "a body the stamp pass owns" {
+test "a test body the stamp pass walks" {
     let t = stamp_probe_outer(2)
     assert_eq(t > 0, true)
 }
@@ -57,93 +49,61 @@ fn node_named(kind: NodeKind, nm: Str) -> Int {
     -1
 }
 
-fn first_test_block() -> Int {
-    let mut i = 0
-    while i < node_count() {
-        if node_kind(i) == NodeKind.TestBlock { return i }
-        i = i + 1
-    }
-    -1
-}
-
-fn subtree_of(root: Int) -> List[Int] {
-    let mut out: List[Int] = []
-    if root == -1 { return out }
-    let mut stack: List[Int] = [root]
-    while stack.len() > 0 {
-        let n = stack.pop().unwrap()
-        out.push(n)
-        for kid in node_value_child_ids(n) { stack.push(kid) }
-    }
-    out
-}
-
-fn assert_all_owned_by(label: Str, sub: List[Int], owner: List[Int], want: Int) ! IO.Print {
-    let mut wrong = 0
-    let mut checked = 0
-    for n in sub {
-        let o = tc_stamp_owner_of(owner, n)
-        if o == TC_STAMP_UNOWNED {
-            if wrong == 0 { io.println("FAIL: {label}: node {n} ({node_kind_name(node_kind(n))}) has no owner") }
-            wrong = wrong + 1
-        } else {
-            checked = checked + 1
-            if o != want {
-                if wrong == 0 { io.println("FAIL: {label}: node {n} ({node_kind_name(node_kind(n))}) owned by {o}, want {want}") }
-                wrong = wrong + 1
-            }
-        }
-    }
-    if checked == 0 { io.println("FAIL: {label}: nothing checked, the row is vacuous") }
-    assert(checked > 0)
-    assert(wrong == 0)
-}
-
-test "one descent fills the assert order and the owner column over the same nodes" {
+test "one descent reaches each node once" {
     let program = compile_probe("build/stamp_descends_once_probe.bl", probe_src())
-    let mut owners: List[Int] = []
-    let order = tc_stamp_walk(program, owners, [])
+    let order = tc_stamp_walk(program, [])
     assert(order.len() > 20)
-    let owner = tc_stamp_owner_index(order, owners)
-    let mut missing = 0
+    let mut hits: List[Int] = []
+    while hits.len() < node_count() { hits.push(0) }
+    let mut twice = 0
     for n in order {
-        if tc_stamp_owner_of(owner, n) == TC_STAMP_UNOWNED { missing = missing + 1 }
+        if hits.get(n).unwrap() != 0 { twice = twice + 1 }
+        hits.set(n, 1)
     }
-    assert_eq(missing, 0)
-    assert_eq(owners.len(), order.len())
+    assert_eq(twice, 0)
 }
 
-test "the owner of a node is the nearest enclosing function, and a closure is not a fence" {
-    let program = compile_probe("build/stamp_owner_is_nearest_body_probe.bl", probe_src())
-    let mut owners: List[Int] = []
-    let order = tc_stamp_walk(program, owners, [])
-    let owner = tc_stamp_owner_index(order, owners)
-    let outer = node_named(NodeKind.FnDef, "stamp_probe_outer")
-    assert(outer != -1)
-    assert_all_owned_by("outer body", subtree_of(node_body(outer)), owner, outer)
-}
-
-test "a test block owns the nodes in its own body" {
-    let program = compile_probe("build/stamp_owner_test_block_probe.bl", probe_src())
-    let mut owners: List[Int] = []
-    let order = tc_stamp_walk(program, owners, [])
-    let owner = tc_stamp_owner_index(order, owners)
-    let tb = first_test_block()
+test "the walk reaches a test block body and a closure body" {
+    let program = compile_probe("build/stamp_reaches_bodies_probe.bl", probe_src())
+    let order = tc_stamp_walk(program, [])
+    let mut tb = -1
+    let mut closure = -1
+    for n in 0..node_count() {
+        if tb == -1 && node_kind(n) == NodeKind.TestBlock { tb = n }
+        if closure == -1 && node_kind(n) == NodeKind.Closure { closure = n }
+    }
     assert(tb != -1)
-    assert_all_owned_by("test block body", subtree_of(node_body(tb)), owner, tb)
+    assert(closure != -1)
+    assert(order.contains(node_body(tb)))
+    assert(order.contains(node_body(closure)))
 }
 
-test "an ffi body is absent from both columns while the declaration itself is in both" {
+test "an ffi body is absent from the walk while the declaration itself is in it" {
     let program = compile_probe("build/stamp_ffi_body_absent_probe.bl", probe_src())
-    let mut owners: List[Int] = []
-    let order = tc_stamp_walk(program, owners, [])
-    let owner = tc_stamp_owner_index(order, owners)
+    let order = tc_stamp_walk(program, [])
     let ffi_fn = node_named(NodeKind.FnDef, "stamp_probe_open")
     assert(ffi_fn != -1)
     assert(order.contains(ffi_fn))
-    assert(tc_stamp_owner_of(owner, ffi_fn) != TC_STAMP_UNOWNED)
     let ffi_body = node_body(ffi_fn)
     assert(ffi_body != -1)
     assert(order.contains(ffi_body) == false)
-    assert_eq(tc_stamp_owner_of(owner, ffi_body), TC_STAMP_UNOWNED)
+}
+
+// The walks share one seen buffer, as the program walk shares it with the field-default and
+// @where walks its recovery runs, so a mark one walk leaves behind would hide a node from the next.
+test "a later walk over the same seen buffer sees every node again" {
+    let program = compile_probe("build/stamp_rewalk_probe.bl", probe_src())
+    let mut seen: List[Int] = []
+    let all = tc_stamp_walk(program, seen)
+    let mut marked = 0
+    for m in seen { marked = marked + m }
+    assert_eq(marked, 0)
+    let outer = node_named(NodeKind.FnDef, "stamp_probe_outer")
+    assert(outer != -1)
+    let once = tc_stamp_walk(outer, seen)
+    let twice = tc_stamp_walk(outer, seen)
+    assert(once.len() > 5)
+    assert(once.len() < all.len())
+    assert_eq(twice.len(), once.len())
+    assert_eq(tc_stamp_walk(program, seen).len(), all.len())
 }
