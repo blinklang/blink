@@ -2417,9 +2417,9 @@ The AI gets structured feedback — result value, type, effects actually perform
 | Command | Description |
 |---------|-------------|
 | **Build & Run** | |
-| `blink build` | Compile to native binary |
+| `blink build` | Compile to native binary. With no `fn main`, write no binary and exit `0` (§6.7.7) |
 | `blink build --target wasm` | Compile to WebAssembly |
-| `blink run` | Compile and execute in one step |
+| `blink run` | Compile and execute in one step. With no `fn main`, exit `2` before any compile (§6.7.7) |
 | `blink run --trace` | Run with full execution tracing (NDJSON to stderr) |
 | `blink run --trace=<filter>` | Run with filtered tracing (see §8.15) |
 | `blink check` | Check the program. A clean result promises the build (§6.7) |

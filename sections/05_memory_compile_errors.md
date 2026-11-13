@@ -668,9 +668,9 @@ This loop is mechanical. The AI does not need to "understand" the error -- it ap
 
 | Command | Description | Output |
 |---------|-------------|--------|
-| `blink build` | AOT compile to native binary | `./myapp` static binary |
+| `blink build` | AOT compile to native binary. With no `fn main` it writes no binary and exits `0` (§6.7.7) | `./myapp` static binary |
 | `blink build --target arm64` | Cross-compile | `./myapp` for target arch |
-| `blink run` | Compile + execute in one step | Program output |
+| `blink run` | Compile + execute in one step. With no `fn main` it is a usage error, exit `2` (§6.7.7) | Program output |
 | `blink check` | Check the program; a clean result promises the build (§6.7) | Structured diagnostics (JSON) |
 | `blink check --format json` | Machine-readable type-check | JSON diagnostics with `fixes` |
 | `blink fix <file>` | Apply machine-applicable fixes | One line per applied fix; the rest as `check` prints them |
@@ -738,7 +738,7 @@ If a file changes between the two commands, the inputs are not the same, and the
 
 #### 6.7.3 Causes Outside the Blink Source
 
-A stop of `blink build` is outside the Blink source when the cause is in the host or in the C side of the program. The list is closed:
+A stop of `blink build` is outside the Blink source when the cause is in the host or in the C side of the program. The list is closed. A program with no `fn main` is not a stop: `blink build` compiles it and exits `0` (§6.7.7):
 
 | Cause | What `blink build` reports | Exit |
 |-------|----------------------------|------|
@@ -851,6 +851,89 @@ fn r[T](x: T, n: Int) -> Int {
 #### 6.7.6 What Keeps the Promise
 
 The test suite of the compiler holds the promise. Each file of the check-clean corpus must build, and a generic function in it needs at least one instance, so the build types the instance as well. A file that `blink check` accepts and `blink build` rejects for a cause outside §6.7.3 fails the suite. The known failures, each with its tracker entry, are kept in the gate and in the tracker, not in this specification. A known failure is a bug of the compiler. It does not narrow the promise.
+
+#### 6.7.7 A Program With No `fn main`
+
+A program has an entry point when its entry file declares `fn main` (§2.2). The entry file is the file that you give to `blink build` or `blink run`, or, for a package, the entry module `src/<name>.bl` (§10.5 *Package Entry Resolution*). A `fn main` in a module that the entry file imports is not the entry point. Whether `fn main` exists is a fact of the source, and `blink check` has seen it. The four commands treat it as follows:
+
+| Command | A file, an empty file or a package with no `fn main` |
+|---------|------------------------------------------------------|
+| `blink check` | No change. It reports the errors of the program. The missing `fn main` is not an error, so a clean check stays clean. |
+| `blink test` | No change. A test file needs no `fn main` (§8.10). |
+| `blink build` | It compiles every module, writes no binary, prints the note below on standard error, and exits `0`. |
+| `blink run` | A usage error. It stops before any compile and exits `2`. |
+
+**`blink build`.** The note is this line, with no code and no span:
+
+```
+note: no fn main; compiled as a library, no binary written
+```
+
+The build is not a stop. It ends with exit `0`, so the promise of §6.7.1 holds for it, and §6.7.3 does not list it. The note is not a warning, so `--strict` does not change the exit code. The rule is the same for a file, an empty file and a package. An empty file compiles no code, and it gets the same note and the same exit code. A loose file that gets this note is still never library code for `PanicInLibrary` (W0705): that lint reads the package rule of §2.20, not this note.
+
+**The did-you-mean.** When the entry file declares a top-level fn whose name is one edit from `main`, the note has a second line. One edit is one character added, removed or changed, or two adjacent characters swapped. This covers `mian` and `Main`:
+
+```
+note: no fn main; compiled as a library, no binary written
+  help: did you mean `main`? `mian` in typo.bl is one edit from `main`
+```
+
+**`blink run`.** There is nothing to run, so the command is used in a wrong way. It is the same class as `blink test` on a path with no test file (§8.10.7). The command prints the error as text on standard error and exits `2`. It does not compile anything first, and it writes no binary:
+
+```
+error: no fn main in typo.bl; nothing to run
+  help: did you mean `main`? `mian` in typo.bl is one edit from `main`
+```
+
+The `help` line is there only when a did-you-mean applies. The error has no code and no catalog row.
+
+**`--json`.** The two commands give the same information in a stable shape. Both shapes use the key `kind` with the value `"no_entry_point"`. This `kind` is not an error code, and it has no catalog entry. `help` is present only when a did-you-mean applies.
+
+`blink build --json` writes the note as one entry of `diagnostics` (§6.5) with `severity` `"note"`, and no `code` and no `span`. The note also goes to standard error as text:
+
+```json
+{"diagnostics": [{"severity": "note", "kind": "no_entry_point", "message": "no fn main; compiled as a library, no binary written", "help": "did you mean `main`? `mian` in typo.bl is one edit from `main`"}]}
+```
+
+`blink run --json` writes one object on standard output. The text of the error also goes to standard error, and the exit code is `2`. This differs from the usage errors of §8.10.7, which leave standard output empty under `--json`. A caller can then tell this stop from a failing program without reading text:
+
+```json
+{"usage_error": {"kind": "no_entry_point", "message": "no fn main in typo.bl; nothing to run", "help": "did you mean `main`? `mian` in typo.bl is one edit from `main`"}}
+```
+
+```blink
+// stats.bl
+fn mean(xs: [Int]) -> Int { xs.len() }
+// blink check stats.bl:  exit 0
+// blink test stats.bl:   unchanged
+// blink build stats.bl:  exit 0, no binary
+//   note: no fn main; compiled as a library, no binary written
+// blink run stats.bl:    exit 2, nothing compiled
+//   error: no fn main in stats.bl; nothing to run
+
+// typo.bl
+fn mian() { io.println("hi") }
+// blink build typo.bl:   exit 0, no binary, the note and the did-you-mean help
+// blink run typo.bl:     exit 2, the error and the did-you-mean help
+
+// empty.bl has no text
+// blink check empty.bl:  exit 0
+// blink build empty.bl:  exit 0, no binary, the note (no help)
+// blink run empty.bl:    exit 2, no help
+
+// app.bl
+import stats
+fn use_it() -> Int { stats.mean([1, 2]) }
+// blink build app.bl:    exit 0, no binary, the note: `app.bl` has no `fn main`, and a `fn main` in an imported module does not count
+// package `stats` with src/stats.bl and no `fn main`:
+// blink build:           exit 0, no binary, the note
+// blink run:             exit 2
+
+// ok.bl
+fn main() { io.println("hi") }
+// blink build ok.bl:     a binary, exit 0, no note
+// blink run ok.bl:       runs the program
+```
 
 ---
 
