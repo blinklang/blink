@@ -239,6 +239,104 @@ fn main() ! IO {
     ])
 }
 
+test "a user trait method on a builtin receiver is charged the trait method's row" {
+    let src = #"trait Loud {
+    fn loud(self) -> Int ! IO
+}
+impl[T] Loud for List[T] {
+    fn loud(self) -> Int ! IO {
+        io.println("l")
+        self.len()
+    }
+}
+impl Loud for Str {
+    fn loud(self) -> Int ! IO {
+        io.println("s")
+        self.len()
+    }
+}
+fn on_list(l: List[Int]) -> Int {
+    l.loud()
+}
+fn on_str(s: Str) -> Int {
+    s.loud()
+}
+fn on_any[T](l: List[T]) -> Int {
+    l.loud()
+}
+type Ints = List[Int]
+fn on_alias(l: Ints) -> Int {
+    l.loud()
+}
+fn in_closure() -> Int {
+    let f = fn(l: List[Int]) -> Int { l.loud() }
+    f([1])
+}
+fn main() ! IO {
+    trace.log("ch", "{[1].loud()}")
+    io.println("{on_list([1])} {on_str("ab")} {on_any(["a"])} {on_alias([2])} {in_closure()}")
+}
+"#
+    expect_reports(src, "every_kind_builtin_recv", [
+        "call to `loud` needs effect `IO`, which `on_list` does not declare",
+        "call to `loud` needs effect `IO`, which `on_str` does not declare",
+        "call to `loud` needs effect `IO`, which `on_any` does not declare",
+        "call to `loud` needs effect `IO`, which `on_alias` does not declare",
+        "call to `loud` needs effect `IO`, which `in_closure` does not declare",
+        "`msg` calls `loud`, which has a row",
+    ])
+}
+
+test "a user trait method on a List with an impl-chosen row is charged the impl's row" {
+    let src = #"trait Loud {
+    fn loud(self) -> Int ! _
+}
+impl[T] Loud for List[T] {
+    fn loud(self) -> Int ! IO {
+        io.println("l")
+        self.len()
+    }
+}
+fn on_list(l: List[Int]) -> Int {
+    l.loud()
+}
+fn main() ! IO {
+    trace.log("ch", "{[1].loud()}")
+    io.println("{on_list([1])}")
+}
+"#
+    expect_reports(src, "every_kind_builtin_recv_chosen", [
+        "call to `loud` needs effect `IO`, which `on_list` does not declare",
+        "`msg` calls `loud`, which has a row",
+    ])
+}
+
+test "a List impl of a trait from another module is charged the trait method's row" {
+    let lib = #"pub trait Loud {
+    fn loud(self) -> Int ! IO
+}
+impl[T] Loud for List[T] {
+    fn loud(self) -> Int ! IO {
+        io.println("l")
+        self.len()
+    }
+}
+"#
+    let entry = #"import loudlib.{Loud}
+fn on_list(l: List[Int]) -> Int {
+    l.loud()
+}
+fn main() ! IO {
+    trace.log("ch", "{[1].loud()}")
+    io.println("{on_list([1])}")
+}
+"#
+    let out = compile_test_helpers.compile_xmod_capture(entry, "loudlib", lib, "every_kind_builtin_recv_xmod")
+    compile_test_helpers.expect_contains(out, "\"message\":\"call to `loud` needs effect `IO`, which `on_list` does not declare\"", "xmod")
+    compile_test_helpers.expect_contains(out, "\"message\":\"`msg` calls `loud`, which has a row\"", "xmod")
+    assert(!out.contains("CallRowUnknown"))
+}
+
 test "an operation of a declared effect is charged its effect" {
     let src = #"effect Log {
     effect Write {
