@@ -1,0 +1,124 @@
+// A handler type or a handler literal may name its effect through a module qualifier
+// (sections/04_effects.md §4.3 "A qualified effect name"). The type is that of the declared
+// effect: `Handler[lib.Log]` and `Handler[Log]` are one type, a `with` of it provides `Log`, an
+// import used only there is used, and a report spells it the way the reading file writes it.
+
+import std.fs
+import std.process.{ProcessResult}
+import compiler.{compile_to_program, check_unused_imports}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_reset}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+
+fn sh(cmd: Str) -> ProcessResult ! Process.Spawn {
+    process.run("sh", ["-c", cmd]).unwrap()
+}
+
+let LOG_LIB: Str = "pub effect Log \{\n    effect Emit \{\n        fn log(msg: Str)\n    }\n}\n\npub effect Audit \{\n    effect Rec \{\n        fn rec(msg: Str)\n    }\n}\n\n@handle_all\npub effect Meter \{\n    effect Tick \{\n        fn tick()\n        fn warn(msg: Str)\n    }\n}\n\neffect Secret \{\n    effect Hide \{\n        fn hide(msg: Str)\n    }\n}\n\npub fn note() ! Log \{ log.log(\"lib\") }\n\npub fn take(h: Handler[Log]) \{ }\n\npub fn emit_h() -> Handler[Log.Emit] \{ handler Log.Emit \{ fn log(msg: Str) \{ } } }\n"
+
+let LIB2: Str = "pub import lib.\{Log, Audit, take}\n"
+
+fn main_reports(main_src: Str) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Process.Spawn, Env.Exit, Env.Read, IO {
+    package_reports([("lib", LOG_LIB)], main_src)
+}
+
+// Only src/main.bl's reports, and only the kinds these rows are about, so a row reads as the
+// one diagnostic it pins. Each is "code name line:col: message", and its help when it has one.
+fn package_reports(libs: List[(Str, Str)], main_src: Str) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Process.Spawn, Env.Exit, Env.Read, IO {
+    init_embedded_stdlib()
+    let dir = sh("mktemp -d /tmp/blink_qualified_handler.XXXXXX").out.trim()
+    let _ = sh("mkdir -p {dir}/src")
+    fs.write("{dir}/blink.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\n").unwrap()
+    for (name, src) in libs { fs.write("{dir}/src/{name}.bl", src).unwrap() }
+    let main_path = "{dir}/src/main.bl"
+    fs.write(main_path, main_src).unwrap()
+    diag_reset()
+    let program = compile_to_program(main_path, 1)
+    check_types(program)
+    check_unused_imports()
+    let mut out = ""
+    for d in diag_entries {
+        if d.file == main_path && (d.severity == "error" || d.name == "UnusedImport" || d.name == "PartialHandler") {
+            out = out.concat("{d.code} {d.name} {d.line}:{d.col}: {d.message}\n")
+            if d.help != "" { out = out.concat("  help: {d.help}\n") }
+        }
+    }
+    let _ = sh("rm -rf {dir}")
+    out
+}
+
+test "a qualified Handler type and a bare handler literal are one type" {
+    let got = main_reports("import lib\nimport lib.\{Log}\n\nfn main() \{\n    let h: Handler[lib.Log] = handler Log \{ fn log(msg: Str) \{ } }\n    let g: Handler[Log] = handler lib.Log \{ fn log(msg: Str) \{ } }\n    let _ = [h, g]\n}\n")
+    assert_eq(got, "")
+}
+
+test "a with of a qualified Handler param provides the effect a callee needs" {
+    let got = main_reports("import lib\n\nfn run(h: Handler[lib.Log]) \{\n    with h \{ lib.note() }\n}\n\nfn main() \{ }\n")
+    assert_eq(got, "")
+}
+
+test "a qualified handler projects onto a sub-effect" {
+    let got = main_reports("import lib\nimport lib.\{Log}\n\nfn emit(h: Handler[Log.Emit]) \{ }\n\nfn main() \{\n    emit(handler lib.Log \{ fn log(msg: Str) \{ } })\n}\n")
+    assert_eq(got, "")
+}
+
+test "a Handler type may name the effect by a selective import alias" {
+    let got = main_reports("import lib\nimport lib.\{Log as L}\n\nfn run(h: Handler[L]) \{\n    with h \{ lib.note() }\n}\n\nfn main() \{\n    let h: Handler[L] = handler lib.Log \{ fn log(msg: Str) \{ } }\n    run(h)\n}\n")
+    assert_eq(got, "")
+}
+
+test "an import used only in a Handler type is used" {
+    let got = main_reports("import lib\n\nfn take(h: Handler[lib.Log]) \{ }\n\nfn main() \{ }\n")
+    assert_eq(got, "")
+}
+
+test "an import alias used only in a Handler type is used" {
+    let got = main_reports("import lib as l\n\ntype H = Handler[l.Log]\n\nfn main() \{ }\n")
+    assert_eq(got, "")
+}
+
+test "an import used only in a handler literal is used" {
+    let got = main_reports("import lib\n\nfn main() \{\n    let h = handler lib.Log \{ fn log(msg: Str) \{ } }\n    let _ = h\n}\n")
+    assert_eq(got, "")
+}
+
+test "a selective import used only in a handler literal is used" {
+    let got = main_reports("import lib.\{Log}\n\nfn main() \{\n    let h = handler Log \{ fn log(msg: Str) \{ } }\n    let _ = h\n}\n")
+    assert_eq(got, "")
+}
+
+test "a Handler type written in another module prints through this file's qualifier" {
+    let got = main_reports("import lib\n\nfn main() \{\n    lib.take(handler lib.Audit \{ fn rec(msg: Str) \{ } })\n}\n")
+    assert_eq(got, "E0300 TypeError 4:14: argument 1 of `lib.take` expects Handler[lib.Log], got Handler[lib.Audit]\n")
+}
+
+test "a Handler type written in another module prints by this file's selective alias" {
+    let got = main_reports("import lib.\{Log as L, Audit, take}\n\nfn main() \{\n    take(handler Audit \{ fn rec(msg: Str) \{ } })\n}\n")
+    assert_eq(got, "E0300 TypeError 4:10: argument 1 of `take` expects Handler[L], got Handler[Audit]\n")
+}
+
+test "a Handler type written in another module prints through the module that re-exports it" {
+    let got = package_reports([("lib", LOG_LIB), ("lib2", LIB2)], "import lib2\n\nfn main() \{\n    lib2.take(handler lib2.Audit \{ fn rec(msg: Str) \{ } })\n}\n")
+    assert_eq(got, "E0300 TypeError 4:15: argument 1 of `lib2.take` expects Handler[lib2.Log], got Handler[lib2.Audit]\n")
+}
+
+test "an insufficient handler names the effect it needs the way this file writes it" {
+    let got = main_reports("import lib\n\nfn need_all(h: Handler[lib.Log]) \{ }\n\nfn main() \{\n    need_all(lib.emit_h())\n}\n")
+    assert_eq(got, "E0563 InsufficientHandlerCoverage 6:14: insufficient handler coverage\n  help: use a handler of `lib.Log`, which handles each of its operations\n")
+}
+
+test "a qualified handler of a handle_all effect that leaves out an operation warns" {
+    let got = main_reports("import lib\nimport lib as l\n\nfn main() \{\n    let a = handler lib.Meter \{ fn tick() \{ } }\n    let b = handler l.Meter \{ fn tick() \{ } }\n    let _ = [a, b]\n}\n")
+    assert_eq(got, "W0545 PartialHandler 5:13: handler for `lib.Meter` does not implement `warn`\n  help: implement it, or forward on purpose: `fn warn(msg: Str) \{ default.warn(msg) }`\nW0545 PartialHandler 6:13: handler for `l.Meter` does not implement `warn`\n  help: implement it, or forward on purpose: `fn warn(msg: Str) \{ default.warn(msg) }`\n")
+}
+
+test "a handler cannot name a private effect of another module" {
+    let got = main_reports("import lib\n\nfn f(h: Handler[lib.Secret]) \{\n    with h \{ secret.hide(\"x\") }\n}\n\nfn main() \{\n    f(handler lib.Secret \{ fn hide(msg: Str) \{ } })\n}\n")
+    assert_eq(got, "E0500 UndeclaredEffect 4:14: call to `Secret.hide` needs effect `lib.Secret.Hide`, which `f` does not declare\n  help: add `lib.Secret.Hide` to the `!` list of `f`, or make the call inside a `with` block that provides it\n")
+}
+
+test "an effect dropped as a duplicate declaration is not an effect" {
+    let lib = "pub type Log \{ x: Int }\n\npub effect Log \{\n    effect Emit \{\n        fn log(msg: Str)\n    }\n}\n"
+    let got = package_reports([("lib", lib)], "import lib\n\nfn f() ! lib.Log \{ }\n\nfn main() \{ }\n")
+    assert_eq(got, "E0538 UnknownEffect 3:10: `lib.Log` is not an effect\n")
+}

@@ -2335,6 +2335,12 @@ fn tc_mark_call_used(name: Str, decl: Int) {
     tc_mark_symbol_used(name)
 }
 
+// A selective import entry the file reads a name through.
+fn tc_mark_import_used(b: ImportBinding) {
+    if nr_current_module != "" && nr_current_module != "__main__" { return }
+    tc_used_modules.insert(b.source_mod, 1)
+}
+
 // An alias is known only to the import index of the file that writes it, so no symbol table
 // maps its spelling to a module: the entries that bind it are what it uses.
 fn tc_mark_alias_used(name: Str) -> Bool {
@@ -2863,7 +2869,7 @@ fn tc_report_handler_coverage(at: Int, want: Int, got: Int) ! TypeCheck.Report, 
         notes.push("`{got_s}` only provides: {have.join(", ")}")
     }
     diag_error_label_at_notes("InsufficientHandlerCoverage", INSUFFICIENT_HANDLER_COVERAGE, "insufficient handler coverage", at, label,
-        "use a handler of `{want_eff}`, which handles each of its operations", notes)
+        "use a handler of `{tc_effect_spelling_in(want_eff, nr_current_module)}`, which handles each of its operations", notes)
 }
 
 // The operations a handler of `eff` handles, in the order they are declared: a user effect's
@@ -14183,8 +14189,8 @@ fn tc_resolve_compiler_known_type(name: Str, elems_sl: Int, ann_node: Int) -> In
     // is the honest "no information" answer if some path reaches here anyway.
     if name == "Handler" {
         if elems_sl != -1 && sublist_length(elems_sl) >= 1 {
-            let eff = node_name(sublist_get(elems_sl, 0))
-            if eff != "" { return make_handler_type(eff) }
+            let eff_node = sublist_get(elems_sl, 0)
+            if node_name(eff_node) != "" { return make_handler_type(tc_handler_effect_at(eff_node)) }
         }
         return make_typevar(name)
     }
@@ -20483,7 +20489,7 @@ fn init_types() ! TypeCheck.Register {
     tc_type_walks = TypeWalkMemos { ptr_bearing: Map(), decl_grows: Map(), derive_facts: Map(), std_trait_built: Map() }
     // The merge, which runs before this, records the dropped effects; each compile starts with
     // clear_module_imports, which empties them.
-    tc_ue = UserEffects { handles: [], op_root: Map(), merge_dropped: tc_ue.merge_dropped, row_names: Map() }
+    tc_ue = UserEffects { handles: [], op_root: Map(), merge_dropped: tc_ue.merge_dropped, row_names: Map(), decls: -1 }
     tc_arg_binds_free.clear()
     ty_param_list.clear()
     // The method-call facts span all three phases of one check_types, so they are cleared
@@ -20714,6 +20720,7 @@ pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report, IO.Eprint {
     if trace_mode != "" { phase_trace("typecheck", "start") }
     init_types()
     nr_check_duplicate_declarations(program)
+    tc_ue.decls = node_args(program)
     nr_record_program_decls(program)
     let import_collisions = nr_find_import_collisions(program)
 
@@ -21232,14 +21239,18 @@ type UeHandle {
 // that name. A bare name cannot say which of the two a row means.
 // `row_names`: the declared name of the effect each module-qualified row or budget entry names,
 // by entry node, as name resolution reads it (§4.3 "A qualified effect name"). So `lib.Log`,
-// `l.Log` and lib's own `Log` give one name, and rows compare by it.
+// `l.Log` and lib's own `Log` give one name, and rows compare by it. A handler expression and the
+// argument of `Handler[E]` keep theirs here too (tc_handler_effect_at).
+// `decls`: the program's effect declarations (a sublist, or -1). Signatures and type
+// declarations name effects through a qualifier before `handles` is built.
 type UserEffects {
     handles: List[UeHandle]
     op_root: Map[Int, Int]
     merge_dropped: List[Int]
     row_names: Map[Int, Str]
+    decls: Int
 }
-let mut tc_ue: UserEffects = UserEffects { handles: [], op_root: Map(), merge_dropped: [], row_names: Map() }
+let mut tc_ue: UserEffects = UserEffects { handles: [], op_root: Map(), merge_dropped: [], row_names: Map(), decls: -1 }
 
 fn register_ue_handle(name: Str, ed: Int) {
     tc_ue.handles.push(UeHandle { handle: name, decl: ed })
@@ -22546,26 +22557,93 @@ fn tc_resolve_fnsig_effect_names() {
 }
 
 // How a report about `decl` spells the effect named `name` (a declared root and its sub-effect
-// path): as written when the bare root reaches that effect in the file of `decl`, else through
-// the qualifier that file binds for the declaring module, else through the module path. A fix
+// path): as written when the bare root reaches that effect in the file of `decl`, else by the
+// alias a selective import binds for it, else through the qualifier that file binds for the
+// declaring module or for a module that re-exports it, else through the module path. A fix
 // line must name the effect the way that file can write it (§4.3 "A qualified effect name").
 fn tc_effect_spelling_at(name: Str, decl: Int) -> Str {
-    let root = match name.byte_index_of(".", 0) {
-        Some(d) => name.byte_slice(0, d)
-        None => name
-    }
+    if decl < 0 { return name }
+    tc_effect_spelling_in(name, tc_decl_module(decl))
+}
+
+// How the module `reader` spells the effect named `name`, by the rules of tc_effect_spelling_at.
+fn tc_effect_spelling_in(name: Str, reader: Str) -> Str {
+    let root = tc_handler_effect_root(name)
     // Two modules declare the root, and the merge kept one, so its module may not be the one meant.
     if tc_effect_name_shared(root) { return name }
     let ed = tc_effect_decl_named(root)
-    if ed == -1 || decl < 0 { return name }
-    let reader = tc_decl_module(decl)
+    if ed == -1 { return name }
     let emod = node_module(ed)
-    if reader == "" || emod == reader { return name }
-    for b in nr_module_import_index(reader).get(root) ?? [] {
-        if nr_effect_decl_in_module(b.source_mod, b.member, 0) == ed { return name }
+    // No file imports the program's own file, so only its bare name reaches its effects.
+    if reader == "" || emod == reader || tc_module_key_is_main(emod) != 0 { return name }
+    let rest = name.byte_slice(root.byte_len(), name.byte_len())
+    let idx = nr_module_import_index(reader)
+    // A selective import binds the bare name, or the alias that replaces it in the file.
+    let mut bound: List[Str] = [root]
+    for k in idx.keys().sort() { if k != root { bound.push(k) } }
+    for k in bound {
+        for b in idx.get(k) ?? [] {
+            if b.member != "" && nr_effect_decl_in_module(b.source_mod, b.member, 0) == ed { return "{k}{rest}" }
+        }
     }
     let q = nr_qualifier_of_module_in(emod, reader)
-    if q != "" { "{q}.{name}" } else { "{tc_get_dotted_module_path(emod)}.{name}" }
+    if q != "" { return "{q}.{name}" }
+    // A module the file imports may re-export the effect.
+    let quals = nr_module_imports_built(reader).qualifiers
+    for k in quals.keys().sort() {
+        if nr_effect_decl_in_module(quals.get(k) ?? "", root, 0) == ed { return "{k}.{name}" }
+    }
+    "{tc_get_dotted_module_path(emod)}.{name}"
+}
+
+// The declared name and sub-effect path of the effect `spelling` names in the module under
+// check (§4.3 "A qualified effect name"): `lib.Log` and `l.Log` give lib's `Log`, and a
+// selective alias gives the name it renames, so a handler's type does not depend on how the
+// file writes its effect. The file's own effect, a built-in effect, a root two modules declare,
+// a private effect of another module, and a spelling that names no declared effect stay as
+// written. This reports nothing: an unknown effect is reported where it is read.
+fn tc_effect_path_here(spelling: Str) -> Str {
+    let head = tc_handler_effect_root(spelling)
+    let rest = spelling.byte_slice(head.byte_len(), spelling.byte_len())
+    let target = if rest != "" { nr_qualifier_module_here(head) } else { "" }
+    if target != "" {
+        let tail = rest.byte_slice(1, rest.byte_len())
+        let root = tc_handler_effect_root(tail)
+        let ed = nr_effect_decl_in_module(target, root, 0)
+        if ed == -1 { return spelling }
+        tc_mark_qualifier_used(head)
+        if !tc_effect_visible_here(ed) { return spelling }
+        return if tc_effect_name_shared(root) { spelling } else { tail }
+    }
+    // The file's own effect and a built-in effect keep their name, as a bare row name does.
+    if builtin_effect_children(head).is_some() || nr_effect_decl_in_module(nr_current_module, head, 0) != -1 { return spelling }
+    for b in nr_module_import_index(nr_current_module).get(head) ?? [] {
+        if b.member == "" { continue }
+        let ed = nr_effect_decl_in_module(b.source_mod, b.member, 0)
+        if ed == -1 { continue }
+        tc_mark_import_used(b)
+        if b.member == head || !tc_effect_visible_here(ed) || tc_effect_name_shared(b.member) { return spelling }
+        return "{b.member}{rest}"
+    }
+    spelling
+}
+
+// The effect the handler expression or `Handler[E]` argument `node` names, by tc_effect_path_here,
+// resolved once: the handler's type, its clause checks and its coverage check read one answer.
+fn tc_handler_effect_at(node: Int) -> Str {
+    match tc_ue.row_names.get(node) {
+        Some(n) => { return n }
+        None => {}
+    }
+    let n = tc_effect_path_here(node_name(node))
+    tc_ue.row_names.insert(node, n)
+    n
+}
+
+// A private effect stays as written outside its module, so the read that reports it still sees
+// the name the file wrote.
+fn tc_effect_visible_here(decl: Int) -> Bool {
+    node_module(decl) == nr_current_module || node_is_pub(decl) != 0
 }
 
 // The operation names the clauses of the handler expression `he` implement.
@@ -22583,7 +22661,8 @@ fn partial_handler_implemented(he: Int) -> Map[Str, Int] {
 }
 
 fn tc_check_partial_handler(he: Int) ! Diag.Report, TypeCheck.Resolve {
-    let eff = node_name(he)
+    let written = node_name(he)
+    let eff = tc_handler_effect_at(he)
     let root = tc_handler_effect_root(eff)
     let ed = tc_effect_decl_named(root)
     if ed == -1 {
@@ -22632,7 +22711,7 @@ fn tc_check_partial_handler(he: Int) ! Diag.Report, TypeCheck.Resolve {
         stubs.push(stub.text)
         fixable = fixable && stub.fixable
     }
-    partial_handler_warn(he, eff, names, stubs, fixable, marked)
+    partial_handler_warn(he, written, names, stubs, fixable, marked)
 }
 
 // W0545 on a handler for a builtin effect, which has no declaration: the operations come from
@@ -22750,7 +22829,7 @@ fn partial_handler_warn(he: Int, eff: Str, names: List[Str], stubs: List[Str], f
     let one = names.len() == 1
     let pronoun = if one { "it" } else { "them" }
     let mut notes: List[Str] = []
-    for m in marked { notes.push("`{m}` is marked `@handle_all`") }
+    for m in marked { notes.push("`{tc_effect_spelling_in(m, nr_current_module)}` is marked `@handle_all`") }
     notes.push("omitted operations go to the enclosing handler")
     let before = diag_entry_count()
     diag_warn_span_at_notes("PartialHandler", PARTIAL_HANDLER,
@@ -30513,8 +30592,13 @@ fn nr_backtick_list(names: List[Str]) -> Str {
 
 // The effect `member` names inside `target`, following any `pub import` that re-exports it.
 fn nr_effect_decl_in_module(target: Str, member: Str, depth: Int) -> Int {
-    for h in tc_ue.handles {
-        if node_name(h.decl) == member && node_module(h.decl) == target { return h.decl }
+    if tc_ue.decls != -1 && !tc_type_name_is_undeclarable(member) {
+        let mut i = 0
+        while i < sublist_length(tc_ue.decls) {
+            let ed = sublist_get(tc_ue.decls, i)
+            if node_name(ed) == member && node_module(ed) == target { return ed }
+            i = i + 1
+        }
     }
     if depth >= 8 { return -1 }
     for src in nr_reexport_sources(target, member) {
@@ -31522,7 +31606,7 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                 let m = sublist_get(methods_sl, i)
                 // An operation carries the handler it belongs to, which is what a `default`
                 // in its body names (nr_resolve_default_receiver).
-                if node_name(node) != "" { tc_publish_node_tid(m, make_handler_type(node_name(node))) }
+                if node_name(node) != "" { tc_publish_node_tid(m, make_handler_type(tc_handler_effect_at(node))) }
                 nr_check_fn(m)
                 i = i + 1
             }
@@ -35688,7 +35772,7 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
         // types as that handler. Either way the parser has reported; an absence here, not a
         // second diagnostic and not a crash.
         if he_eff == "" { return -1 }
-        return make_handler_type(he_eff)
+        return make_handler_type(tc_handler_effect_at(node))
     }
 
     if kind == NodeKind.Ident {
@@ -43976,7 +44060,7 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
         if hm_sl != -1 {
             let mut hi = 0
             while hi < sublist_length(hm_sl) {
-                tc_check_builtin_handler_clause(node_name(node), sublist_get(hm_sl, hi))
+                tc_check_builtin_handler_clause(tc_handler_effect_at(node), sublist_get(hm_sl, hi))
                 tc_check_handler_method(sublist_get(hm_sl, hi))
                 hi = hi + 1
             }
@@ -45956,9 +46040,9 @@ fn type_to_str(tid0: Int) -> Str {
         TyKind.Range => return "Range[{type_to_str(t.inner1)}]"
         TyKind.Handle => return "Handle[{type_to_str(t.inner1)}]"
         // The effect lives in the name slot, not in a child (make_handler_type), so this renders
-        // it directly instead of recursing. `Handler[IO]`, `Handler[IO.Print]`, `Handler[Metrics]`
-        // — the spelling a user wrote, which is what a diagnostic has to say back to them.
-        TyKind.Handler => return "Handler[{name}]"
+        // it directly instead of recursing. The slot holds the declared name, and a report
+        // spells it the way the module under check writes it (`Handler[lib.Log]`).
+        TyKind.Handler => return "Handler[{tc_effect_spelling_in(name, nr_current_module)}]"
         TyKind.Channel => return "Channel[{type_to_str(t.inner1)}]"
         TyKind.Ptr => {
             if type_kind(tc_resolve(t.inner1)) == TyKind.Void { return "Ptr[Void]" }
