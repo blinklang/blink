@@ -1,4 +1,5 @@
 import ast.{NodeKind, node_kind_name, is_block_bearing, trace_gate_on, nk_is_typed, phase_trace, trace_mode}
+import builtin_effects.{builtin_effect_children, builtin_effect_tree_roots, builtin_op_root_of_handle, builtin_op_roots, builtin_root_has_handler_ops, is_builtin_effect_handle, is_builtin_op_root}
 import std.str.{str_to_lower}
 import pkg.manifest.{manifest_name, manifest_header_is_declared}
 import unparse.{type_ann_text, type_ann_text_renamed, unparse_expr, unparse_binop_with_lhs, unparse_range_membership, unparse_coalesce_start}
@@ -2872,7 +2873,7 @@ fn tc_handler_op_names(eff: Str) -> List[Str] {
     let root = tc_handler_effect_root(eff)
     let sub = if root == eff { "" } else { eff.byte_slice(root.byte_len() + 1, eff.byte_len()) }
     let mut out: List[Str] = []
-    if builtin_op_roots().contains(root) {
+    if is_builtin_op_root(root) {
         for row in builtin_op_rows(root) {
             if sub == "" || row.sub_effect == sub { out.push(row.op) }
         }
@@ -12239,7 +12240,7 @@ fn tc_check_builtin_handler_clause(eff_name: Str, m: Int) ! TypeCheck.Resolve, T
     if m == -1 || node_kind(m) != NodeKind.FnDef { return }
     let root = tc_handler_effect_root(eff_name)
     let op = node_name(m)
-    if builtin_op_roots().contains(root) {
+    if is_builtin_op_root(root) {
         let sub = builtin_op_sub_effect(root, op)
         if !builtin_op_exists(root, op) || (eff_name != root && eff_name != "{root}.{sub}") {
             diag_error_at("UnresolvedMethod", UNRESOLVED_METHOD, "effect `{eff_name}` has no operation `{op}`", m,
@@ -22007,14 +22008,6 @@ fn tc_infer_default_perform(call: Int, root: Str, method: Str) -> Int ! TypeChec
     fnsig_pool.get(sig).unwrap().ret
 }
 
-// The builtin roots whose handler operations the spec names (§4.3): IO's three, which take
-// the rendered text, and the three IO.Read operations of §4.4.9; Time's two; and the five FS
-// operations of §4.4.5. Env's names differ between the spec and the runtime, so it has none
-// here until that is settled; the other builtin roots name none.
-fn builtin_root_has_handler_ops(root: Str) -> Bool {
-    root == "IO" || root == "Time" || builtin_op_roots().contains(root)
-}
-
 // The operations of the builtin roots whose vtable this compiler lays out from std defaults:
 // FS's of §4.4.5, Rand's of §4.4.7 and Process's of §4.4.8, each in the order its vtable lays
 // out its slots. Each row names the sub-effect that performs the operation (list_dir and stat
@@ -22027,8 +22020,6 @@ pub type BuiltinOpRow {
     sub_effect: Str
     default_fn: Str
 }
-
-pub fn builtin_op_roots() -> List[Str] { ["FS", "Process", "Rand"] }
 
 pub fn builtin_op_rows(root: Str) -> List[BuiltinOpRow] {
     match root {
@@ -22108,13 +22099,6 @@ pub fn builtin_op_surface_fn(root: Str, op: Str) -> Str {
 }
 
 // The handle spelling of a compiled builtin root, or "" for a name that is no such root.
-pub fn builtin_op_root_of_handle(handle: Str) -> Str {
-    for root in builtin_op_roots() {
-        if str_to_lower(root) == handle { return root }
-    }
-    ""
-}
-
 // What an unknown clause name is told: the root's operations and where the spec lists them.
 fn builtin_op_list_hint(root: Str) -> Str {
     let mut ops: List[Str] = []
@@ -22933,14 +22917,7 @@ pub fn is_import_module_name(name: Str) -> Int {
 // is_import_module_name does not know them, yet `io` in `io.println(..)` names a namespace
 // exactly as an imported qualifier does.
 pub fn is_builtin_namespace(name: Str) -> Int {
-    if name == "io" { return 1 }
-    if name == "fs" { return 1 }
-    if name == "process" { return 1 }
-    if name == "rand" { return 1 }
-    if name == "net" { return 1 }
-    if name == "env" { return 1 }
-    if name == "time" { return 1 }
-    if name == "async" { return 1 }
+    if is_builtin_effect_handle(name) { return 1 }
     if name == "channel" { return 1 }
     if name == "default" { return 1 }
     if name == "term" { return 1 }
@@ -30302,37 +30279,14 @@ fn nr_check_qualified_type_ref(name: Str, qualifier: Str, member: Str, at: Int) 
     tc_mark_symbol_used(member)
 }
 
-// The roots of builtin_effect_children, which answers None for any other name.
-let BUILTIN_EFFECT_ROOTS = ["Arena", "FS", "Net", "DB", "IO", "Env", "Time", "Rand", "Crypto", "Process", "State", "Async"]
-
 // Each built-in effect by its path: each root, and each sub-effect as `Root.Child`.
 pub fn tc_builtin_effect_paths() -> List[Str] {
     let mut out: List[Str] = []
-    for root in BUILTIN_EFFECT_ROOTS {
+    for root in builtin_effect_tree_roots() {
         out.push(root)
         for child in builtin_effect_children(root) ?? [] { out.push("{root}.{child}") }
     }
     out
-}
-
-// The built-in effect tree of §4.3 and `Arena` (§5.2): the sub-effects `root` declares, [] for
-// a leaf, or None when `root` is no built-in effect.
-fn builtin_effect_children(root: Str) -> Option[List[Str]] {
-    match root {
-        "Arena" => Some([])
-        "FS" => Some(["Read", "Write", "Delete", "Watch"])
-        "Net" => Some(["Connect", "Listen", "DNS"])
-        "DB" => Some(["Read", "Write"])
-        "IO" => Some(["Print", "Eprint", "Log", "Read"])
-        "Env" => Some(["Read", "Write", "Exit"])
-        "Time" => Some(["Read", "Sleep"])
-        "Rand" => Some([])
-        "Crypto" => Some(["Hash", "Sign", "Encrypt", "Decrypt"])
-        "Process" => Some(["Spawn", "Signal"])
-        "State" => Some([])
-        "Async" => Some([])
-        _ => None
-    }
 }
 
 // Every name in the effect row of `fn_node` must name an effect (§4.3): a built-in one, `Arena`

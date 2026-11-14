@@ -1,0 +1,140 @@
+// Every list of built-in effect roots comes from the one table in src/builtin_effects.bl.
+// The rows below pin each list to its contents and order, and hold the lists to each other,
+// so a row that moves, or a column that one list reads and another does not, fails here.
+
+import builtin_effects.{builtin_effect_tree_roots, builtin_effect_children, builtin_ev_roots, builtin_ev_slot, builtin_op_roots, builtin_op_place, is_builtin_op_root, builtin_op_root_of_handle, builtin_vector_performing_roots, builtin_root_has_handler_ops, is_builtin_effect_handle, builtin_effect_handle}
+import cname.{c_builtin_effect_roots, c_ev_field_name}
+import typecheck.{tc_builtin_effect_paths, is_builtin_namespace, builtin_op_rows, make_handler_type}
+import cname_test_helpers.{assert_eq_str}
+
+// The lists themselves are compared; the joined text only names a mismatch.
+fn assert_list(label: Str, got: List[Str], want: List[Str]) ! IO.Print {
+    if got != want { assert_eq_str(label, got.join(" | "), want.join(" | ")) }
+    assert_eq(got, want)
+}
+
+// The number of tree roots whose value in a column is not -1.
+fn count_placed(places: List[Int]) -> Int {
+    let mut n = 0
+    for p in places {
+        if p >= 0 { n = n + 1 }
+    }
+    n
+}
+
+// The archive is compiled against a shorter evidence vector than a user unit sees, so these
+// eight stay first and in this order; a new root may only follow them.
+test "the evidence vector order is the archive's prefix" {
+    let prefix = ["IO", "FS", "Net", "Crypto", "Rand", "Time", "Env", "Process"]
+    let ev = builtin_ev_roots()
+    assert(ev.len() >= prefix.len())
+    assert_list("ev prefix", ev.slice(0, prefix.len()), prefix)
+    assert_list("cname reads the table", c_builtin_effect_roots(), ev)
+}
+
+// A gap in a column would drop the roots after it from the generated order, and a repeat
+// would put two roots at one place; both fail here.
+test "each column numbers its roots 0, 1, 2 with no gap and no repeat" {
+    let mut slots: List[Int] = []
+    let mut places: List[Int] = []
+    for root in builtin_effect_tree_roots() {
+        slots.push(builtin_ev_slot(root))
+        places.push(builtin_op_place(root))
+    }
+    let ev = builtin_ev_roots()
+    assert_eq(ev.len(), count_placed(slots))
+    let mut i = 0
+    while i < ev.len() {
+        assert_eq(builtin_ev_slot(ev.get(i).unwrap()), i)
+        i = i + 1
+    }
+    let ops = builtin_op_roots()
+    assert_eq(ops.len(), count_placed(places))
+    i = 0
+    while i < ops.len() {
+        assert_eq(builtin_op_place(ops.get(i).unwrap()), i)
+        assert(is_builtin_op_root(ops.get(i).unwrap()))
+        i = i + 1
+    }
+}
+
+test "a name that is no built-in effect finds nothing" {
+    assert_eq(builtin_ev_slot("Nope"), -1)
+    assert_eq(builtin_op_place("Nope"), -1)
+    assert(!is_builtin_op_root("Nope"))
+    assert(builtin_effect_children("Nope").is_none())
+    assert(!builtin_root_has_handler_ops("Nope"))
+    assert_eq(builtin_effect_handle("Nope"), "")
+    assert(!is_builtin_effect_handle("Nope"))
+    assert(!is_builtin_effect_handle(""))
+    assert_eq(builtin_op_root_of_handle(""), "")
+    assert_eq(builtin_op_root_of_handle("nope"), "")
+    assert_eq(builtin_ev_slot("Arena"), -1)
+}
+
+test "the effect tree keeps the order of section 4.3" {
+    assert_list("tree roots", builtin_effect_tree_roots(), ["Arena", "FS", "Net", "DB", "IO", "Env", "Time", "Rand", "Crypto", "Process", "State", "Async"])
+    assert_list("paths", tc_builtin_effect_paths(), [
+        "Arena",
+        "FS", "FS.Read", "FS.Write", "FS.Delete", "FS.Watch",
+        "Net", "Net.Connect", "Net.Listen", "Net.DNS",
+        "DB", "DB.Read", "DB.Write",
+        "IO", "IO.Print", "IO.Eprint", "IO.Log", "IO.Read",
+        "Env", "Env.Read", "Env.Write", "Env.Exit",
+        "Time", "Time.Read", "Time.Sleep",
+        "Rand",
+        "Crypto", "Crypto.Hash", "Crypto.Sign", "Crypto.Encrypt", "Crypto.Decrypt",
+        "Process", "Process.Spawn", "Process.Signal",
+        "State",
+        "Async",
+    ])
+    assert_list("leaf", builtin_effect_children("Rand") ?? ["none"], [])
+}
+
+// The compiler emits the default bodies and vtables of these roots in this order, and loads
+// their operation modules by handle.
+test "the roots with compiler-laid-out operations keep their order" {
+    assert_list("op roots", builtin_op_roots(), ["FS", "Process", "Rand"])
+    assert_eq(builtin_op_root_of_handle("fs"), "FS")
+    assert_eq(builtin_op_root_of_handle("process"), "Process")
+    assert_eq(builtin_op_root_of_handle("rand"), "Rand")
+    assert_eq(builtin_op_root_of_handle("io"), "")
+}
+
+test "the roots with handler operations and the roots that perform through the vector" {
+    let mut with_ops: List[Str] = []
+    for root in builtin_effect_tree_roots() {
+        if builtin_root_has_handler_ops(root) { with_ops.push(root) }
+    }
+    assert_list("handler ops", with_ops, ["FS", "IO", "Time", "Rand", "Process"])
+    assert_list("vector", builtin_vector_performing_roots(), ["IO", "FS", "Time", "Env", "Process"])
+}
+
+test "the handles of the built-in effects" {
+    let mut handles: List[Str] = []
+    for root in builtin_effect_tree_roots() {
+        let h = builtin_effect_handle(root)
+        if h != "" { handles.push(h) }
+    }
+    assert_list("handles", handles, ["fs", "net", "io", "env", "time", "rand", "process", "async"])
+    for h in handles {
+        assert(is_builtin_effect_handle(h))
+        assert_eq(is_builtin_namespace(h), 1)
+    }
+    assert(!is_builtin_effect_handle("trace"))
+}
+
+test "the lists agree with each other" {
+    assert_eq(builtin_op_roots().len(), 3)
+    for root in builtin_op_roots() {
+        assert(builtin_ev_slot(root) >= 0)
+        assert(builtin_root_has_handler_ops(root))
+        assert(builtin_op_rows(root).len() > 0)
+        assert_eq(builtin_op_root_of_handle(builtin_effect_handle(root)), root)
+    }
+    assert_eq(builtin_vector_performing_roots().len(), 5)
+    for root in builtin_vector_performing_roots() {
+        assert(builtin_ev_slot(root) >= 0)
+        assert_eq_str("field of {root}", c_ev_field_name(make_handler_type(root)), builtin_effect_handle(root))
+    }
+}

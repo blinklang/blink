@@ -1,0 +1,157 @@
+// The built-in effects: the tree of §4.3, and `Arena` (§5.2). Every list of built-in roots
+// the compiler reads comes from these rows, so a new built-in effect is one row, and no two
+// lists can disagree about it. A list that has an order of its own reads it from a column,
+// never from a filter of another list's order.
+//
+// Some roots do not fit the pattern of the others, and the rows keep them as they are:
+// Crypto owns a vector slot but no handle, Net owns a slot but performs outside the vector,
+// and Env performs through the vector but names no handler operations yet.
+pub type BuiltinEffect {
+    root: Str
+    // The sub-effects §4.3 declares, [] for a leaf.
+    children: List[Str]
+    // The root's field in the evidence vector, or -1 for a root that owns none. The archive
+    // is compiled against a shorter vector than the user unit sees, so a slot can never
+    // move and none can be dropped: a new root takes the next free slot.
+    ev_slot: Int
+    // The namespace a program calls the root's operations through, or "".
+    handle: Str
+    // Whether a call through the handle performs through the evidence vector.
+    vector_performs: Bool
+    // The root's place in the order the compiler emits the vtables and default bodies it lays
+    // out from std functions (builtin_op_rows), or -1 for a root whose vtable the runtime owns.
+    compiled_ops: Int
+    // Whether a handler of the root may write the operations the spec names for it. Env's
+    // operation names differ between the spec and the runtime, so it has none until that is
+    // settled.
+    handler_ops: Bool
+}
+
+let BUILTIN_EFFECTS: List[BuiltinEffect] = [
+    BuiltinEffect { root: "Arena", children: [], ev_slot: -1, handle: "", vector_performs: false, compiled_ops: -1, handler_ops: false },
+    BuiltinEffect { root: "FS", children: ["Read", "Write", "Delete", "Watch"], ev_slot: 1, handle: "fs", vector_performs: true, compiled_ops: 0, handler_ops: true },
+    BuiltinEffect { root: "Net", children: ["Connect", "Listen", "DNS"], ev_slot: 2, handle: "net", vector_performs: false, compiled_ops: -1, handler_ops: false },
+    BuiltinEffect { root: "DB", children: ["Read", "Write"], ev_slot: -1, handle: "", vector_performs: false, compiled_ops: -1, handler_ops: false },
+    BuiltinEffect { root: "IO", children: ["Print", "Eprint", "Log", "Read"], ev_slot: 0, handle: "io", vector_performs: true, compiled_ops: -1, handler_ops: true },
+    BuiltinEffect { root: "Env", children: ["Read", "Write", "Exit"], ev_slot: 6, handle: "env", vector_performs: true, compiled_ops: -1, handler_ops: false },
+    BuiltinEffect { root: "Time", children: ["Read", "Sleep"], ev_slot: 5, handle: "time", vector_performs: true, compiled_ops: -1, handler_ops: true },
+    BuiltinEffect { root: "Rand", children: [], ev_slot: 4, handle: "rand", vector_performs: false, compiled_ops: 2, handler_ops: true },
+    BuiltinEffect { root: "Crypto", children: ["Hash", "Sign", "Encrypt", "Decrypt"], ev_slot: 3, handle: "", vector_performs: false, compiled_ops: -1, handler_ops: false },
+    BuiltinEffect { root: "Process", children: ["Spawn", "Signal"], ev_slot: 7, handle: "process", vector_performs: true, compiled_ops: 1, handler_ops: true },
+    BuiltinEffect { root: "State", children: [], ev_slot: -1, handle: "", vector_performs: false, compiled_ops: -1, handler_ops: false },
+    BuiltinEffect { root: "Async", children: [], ev_slot: -1, handle: "async", vector_performs: false, compiled_ops: -1, handler_ops: false },
+]
+
+// Each lookup by root below scans the rows itself: typecheck and the C-name producers call
+// them per node, so they must not build a list.
+
+// The roots in the order §4.3 lists them.
+pub fn builtin_effect_tree_roots() -> List[Str] {
+    let mut out: List[Str] = []
+    for row in BUILTIN_EFFECTS { out.push(row.root) }
+    out
+}
+
+// The sub-effects `root` declares, [] for a leaf, or None when `root` is no built-in effect.
+pub fn builtin_effect_children(root: Str) -> Option[List[Str]] {
+    for row in BUILTIN_EFFECTS {
+        if row.root == root { return Some(row.children) }
+    }
+    None
+}
+
+// The evidence-vector slot of `root`, or -1.
+pub fn builtin_ev_slot(root: Str) -> Int {
+    for row in BUILTIN_EFFECTS {
+        if row.root == root { return row.ev_slot }
+    }
+    -1
+}
+
+// The place of `root` in the order of builtin_op_roots, or -1.
+pub fn builtin_op_place(root: Str) -> Int {
+    for row in BUILTIN_EFFECTS {
+        if row.root == root { return row.compiled_ops }
+    }
+    -1
+}
+
+// Whether the compiler lays out the vtable and default bodies of `root`.
+pub fn is_builtin_op_root(root: Str) -> Bool { builtin_op_place(root) >= 0 }
+
+// The root whose vtable the compiler lays out and whose handle is `handle`, or "".
+pub fn builtin_op_root_of_handle(handle: Str) -> Str {
+    if handle == "" { return "" }
+    for row in BUILTIN_EFFECTS {
+        if row.handle == handle && row.compiled_ops >= 0 { return row.root }
+    }
+    ""
+}
+
+// The roots that own a slot, in slot order: the order the vector declares its fields.
+pub fn builtin_ev_roots() -> List[Str] { roots_in_column_order(true) }
+
+// The roots whose vtable and default bodies the compiler lays out, in the order it emits them.
+pub fn builtin_op_roots() -> List[Str] { roots_in_column_order(false) }
+
+// The roots whose value in the ev_slot column (`ev`) or the compiled_ops column is 0, 1, 2
+// and so on, in that order; a -1 leaves its root out. The test of this table holds each
+// column free of gaps and repeats, which this walk would not report.
+fn roots_in_column_order(ev: Bool) -> List[Str] {
+    let mut out: List[Str] = []
+    let mut at = 0
+    let mut found = true
+    while found {
+        found = false
+        for row in BUILTIN_EFFECTS {
+            let place = if ev { row.ev_slot } else { row.compiled_ops }
+            if place == at {
+                out.push(row.root)
+                found = true
+            }
+        }
+        at = at + 1
+    }
+    out
+}
+
+// The roots whose handle performs through the evidence vector, in slot order.
+pub fn builtin_vector_performing_roots() -> List[Str] {
+    let mut out: List[Str] = []
+    for root in builtin_ev_roots() {
+        if performs_through_vector(root) { out.push(root) }
+    }
+    out
+}
+
+fn performs_through_vector(root: Str) -> Bool {
+    for row in BUILTIN_EFFECTS {
+        if row.root == root { return row.vector_performs }
+    }
+    false
+}
+
+// Whether a handler of the built-in `root` may write the operations the spec names for it.
+pub fn builtin_root_has_handler_ops(root: Str) -> Bool {
+    for row in BUILTIN_EFFECTS {
+        if row.root == root { return row.handler_ops }
+    }
+    false
+}
+
+// The handle of the built-in `root`, or "".
+pub fn builtin_effect_handle(root: Str) -> Str {
+    for row in BUILTIN_EFFECTS {
+        if row.root == root { return row.handle }
+    }
+    ""
+}
+
+// Whether `name` is the handle of a built-in effect.
+pub fn is_builtin_effect_handle(name: Str) -> Bool {
+    if name == "" { return false }
+    for row in BUILTIN_EFFECTS {
+        if row.handle == name { return true }
+    }
+    false
+}
