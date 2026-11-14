@@ -18087,8 +18087,7 @@ fn validate_capabilities_budget(program: Int, fns_sl: Int) ! Diag.Report {
     if ann_args_sl != -1 {
         let mut ai = 0
         while ai < sublist_length(ann_args_sl) {
-            let arg_nd = sublist_get(ann_args_sl, ai)
-            budget_names.push(node_name(arg_nd))
+            budget_names.push(tc_row_effect_name(sublist_get(ann_args_sl, ai)))
             ai = ai + 1
         }
     }
@@ -18116,7 +18115,8 @@ fn validate_capabilities_budget(program: Int, fns_sl: Int) ! Diag.Report {
                         bi = bi + 1
                     }
                     if allowed == 0 {
-                        diag_error_at("CapabilityBudgetExceeded", CAPABILITY_BUDGET, "function `{fn_name}` uses effect `{eff}` which is not in @capabilities budget", fn_node, "add `{eff}` to @capabilities")
+                        let shown = tc_effect_spelling_at(eff, fn_node)
+                        diag_error_at("CapabilityBudgetExceeded", CAPABILITY_BUDGET, "function `{fn_name}` uses effect `{shown}` which is not in @capabilities budget", fn_node, "add `{shown}` to @capabilities")
                     }
                     ei = ei + 1
                 }
@@ -20481,6 +20481,9 @@ fn tc_impl_recv_args_fail(im: Int) -> Bool {
 fn init_types() ! TypeCheck.Register {
     ty_pool.clear()
     tc_type_walks = TypeWalkMemos { ptr_bearing: Map(), decl_grows: Map(), derive_facts: Map(), std_trait_built: Map() }
+    // The merge, which runs before this, records the dropped effects; each compile starts with
+    // clear_module_imports, which empties them.
+    tc_ue = UserEffects { handles: [], op_root: Map(), merge_dropped: tc_ue.merge_dropped, row_names: Map() }
     tc_arg_binds_free.clear()
     ty_param_list.clear()
     // The method-call facts span all three phases of one check_types, so they are cleared
@@ -20816,8 +20819,6 @@ pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report, IO.Eprint {
 
     tc_check_import_binding_clashes()
 
-    validate_capabilities_budget(program, fns_sl)
-
     // Build symbol-to-module map for unused import detection
     if types_sl != -1 {
         let mut i = 0
@@ -21024,8 +21025,8 @@ pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report, IO.Eprint {
     // they declare. The handle name alone only keeps the method flush from reporting
     // the call; without the signatures `db.query(..)` has no return type and its
     // arguments are compared against nothing.
-    tc_ue_handles = []
-    tc_ue_op_root = Map()
+    tc_ue.handles = []
+    tc_ue.op_root = Map()
     let effects_decl_sl = node_args(program)
     if effects_decl_sl != -1 {
         let mut ei = 0
@@ -21099,6 +21100,9 @@ pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report, IO.Eprint {
     // Phase 1: Name resolution
     resolve_names(program)
     nr_warn_unused = 0
+    // After name resolution, which reads each qualified effect name in a row or a budget.
+    tc_resolve_fnsig_effect_names()
+    validate_capabilities_budget(program, fns_sl)
 
     // Enforce @pure body constraints. After name resolution, since a callee is judged by the
     // declaration it reaches, and an import alias or a local decides which one that is.
@@ -21218,15 +21222,27 @@ type UeHandle {
     handle: Str
     decl: Int
 }
-let mut tc_ue_handles: List[UeHandle] = []
 
-// Effect operation declaration node -> the root effect declaring it. An operation is a
-// bodiless FnDef like any other, so this is what tells a call recorded against one apart
+// What the checker knows of the program's own effects.
+// `handles`: each root effect by its handle.
+// `op_root`: effect operation declaration node -> the root effect declaring it. An operation is
+// a bodiless FnDef like any other, so this is what tells a call recorded against one apart
 // from a call of a function.
-let mut tc_ue_op_root: Map[Int, Int] = Map()
+// `merge_dropped`: each effect the merge left out because an earlier module declares one of
+// that name. A bare name cannot say which of the two a row means.
+// `row_names`: the declared name of the effect each module-qualified row or budget entry names,
+// by entry node, as name resolution reads it (§4.3 "A qualified effect name"). So `lib.Log`,
+// `l.Log` and lib's own `Log` give one name, and rows compare by it.
+type UserEffects {
+    handles: List[UeHandle]
+    op_root: Map[Int, Int]
+    merge_dropped: List[Int]
+    row_names: Map[Int, Str]
+}
+let mut tc_ue: UserEffects = UserEffects { handles: [], op_root: Map(), merge_dropped: [], row_names: Map() }
 
 fn register_ue_handle(name: Str, ed: Int) {
-    tc_ue_handles.push(UeHandle { handle: name, decl: ed })
+    tc_ue.handles.push(UeHandle { handle: name, decl: ed })
 }
 
 // Register one fnsig per effect operation, keyed `{handle}.{op}` — the same
@@ -21327,7 +21343,7 @@ fn register_ue_op_sigs(ed: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.Re
                 let op = sublist_get(ops_sl, oi)
                 let op_name = node_name(op)
                 node_set_name(op, "{handle}.{op_name}")
-                tc_ue_op_root.insert(op, ed)
+                tc_ue.op_root.insert(op, ed)
                 register_fn_sig(op)
                 publish_ue_op_tids(op)
                 node_set_name(op, op_name)
@@ -21345,7 +21361,7 @@ fn register_ue_op_sigs(ed: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.Re
 pub fn tc_call_user_effect(call_node: Int) -> Int {
     let decl = tc_call_decl_node(call_node)
     if decl < 0 { return -1 }
-    tc_ue_op_root.get(decl) ?? -1
+    tc_ue.op_root.get(decl) ?? -1
 }
 
 // The handles a file can bind to a module of its own: process (section 4.4.8) and rand
@@ -21572,9 +21588,11 @@ fn nr_fn_reserves_ue_handle(handle: Str) -> Bool {
     let ed = tc_ue_handle_decl(handle)
     let mut i = 0
     while i < sublist_length(row) {
-        let parts = node_name(sublist_get(row, i)).split(".")
-        // `lib.Tag` names the effect through the qualifier of its module.
-        let root = if parts.len() > 1 && nr_qualifier_module_here(parts.get(0).unwrap()) != "" { parts.get(1).unwrap() } else { parts.get(0).unwrap() }
+        let name = tc_row_effect_name(sublist_get(row, i))
+        let root = match name.byte_index_of(".", 0) {
+            Some(d) => name.byte_slice(0, d)
+            None => name
+        }
         if tc_effect_decl_named(root) == ed { return true }
         i = i + 1
     }
@@ -22322,7 +22340,7 @@ pub fn is_user_effect_handle_name(name: Str) -> Int {
 
 // The root EffectDecl whose handle is `name`, or -1.
 fn tc_ue_handle_decl(name: Str) -> Int {
-    for h in tc_ue_handles {
+    for h in tc_ue.handles {
         if h.handle == name { return h.decl }
     }
     -1
@@ -22475,10 +22493,79 @@ fn partial_handler_span_end(he: Int, eff: Str) -> Int {
 // differ only in case share one, and the handle alone does not say which is meant.
 fn tc_effect_decl_named(root: Str) -> Int {
     let handle = str_to_lower(root)
-    for h in tc_ue_handles {
+    for h in tc_ue.handles {
         if h.handle == handle && node_name(h.decl) == root { return h.decl }
     }
     -1
+}
+
+// The block an impl or trait method is in, or the effect a derived operation belongs to; -1
+// for any other declaration.
+fn tc_decl_owner(decl: Int) -> Int {
+    tc_method_block.get(decl) ?? (tc_ue.op_root.get(decl) ?? -1)
+}
+
+pub fn tc_set_merge_dropped_effects(decls: List[Int]) {
+    tc_ue.merge_dropped = decls
+}
+
+// Whether two modules declare an effect named `name`, so the merge kept only one of them.
+fn tc_effect_name_shared(name: Str) -> Bool {
+    for d in tc_ue.merge_dropped {
+        if node_name(d) == name { return true }
+    }
+    false
+}
+
+// The name a row or budget entry gives its effect: the declared name when name resolution read
+// a module qualifier off it, else the entry as written.
+fn tc_row_effect_name(entry: Int) -> Str {
+    tc_ue.row_names.get(entry) ?? node_name(entry)
+}
+
+// The effect `target` declares as `member`, with `at` recorded under that declared name. A name
+// that another module declares too keeps the qualifier, so it never matches the other effect.
+fn nr_qualified_effect_decl(target: Str, member: Str, at: Int) -> Int {
+    let decl = nr_effect_decl_in_module(target, member, 0)
+    if decl != -1 && !tc_effect_name_shared(member) { tc_ue.row_names.insert(at, member) }
+    decl
+}
+
+// Signatures register before name resolution reads the rows, so each takes its names again.
+fn tc_resolve_fnsig_effect_names() {
+    for fs in fnsig_pool {
+        if fs.decl < 0 || fs.effects_count == 0 { continue }
+        let effs = node_effects(fs.decl)
+        if effs == -1 || sublist_length(effs) != fs.effects_count { continue }
+        let mut k = 0
+        while k < fs.effects_count {
+            fnsig_effect_names.set(fs.effects_start + k, tc_row_effect_name(sublist_get(effs, k)))
+            k = k + 1
+        }
+    }
+}
+
+// How a report about `decl` spells the effect named `name` (a declared root and its sub-effect
+// path): as written when the bare root reaches that effect in the file of `decl`, else through
+// the qualifier that file binds for the declaring module, else through the module path. A fix
+// line must name the effect the way that file can write it (§4.3 "A qualified effect name").
+fn tc_effect_spelling_at(name: Str, decl: Int) -> Str {
+    let root = match name.byte_index_of(".", 0) {
+        Some(d) => name.byte_slice(0, d)
+        None => name
+    }
+    // Two modules declare the root, and the merge kept one, so its module may not be the one meant.
+    if tc_effect_name_shared(root) { return name }
+    let ed = tc_effect_decl_named(root)
+    if ed == -1 || decl < 0 { return name }
+    let reader = tc_decl_module(decl)
+    let emod = node_module(ed)
+    if reader == "" || emod == reader { return name }
+    for b in nr_module_import_index(reader).get(root) ?? [] {
+        if nr_effect_decl_in_module(b.source_mod, b.member, 0) == ed { return name }
+    }
+    let q = nr_qualifier_of_module_in(emod, reader)
+    if q != "" { "{q}.{name}" } else { "{tc_get_dotted_module_path(emod)}.{name}" }
 }
 
 // The operation names the clauses of the handler expression `he` implement.
@@ -22715,6 +22802,7 @@ pub fn record_module_import(consuming_mod: Str, source_mod: Str, imp_node: Int, 
 
 pub fn clear_module_imports() {
     per_module_imports.clear()
+    tc_ue.merge_dropped = []
     for mod_name in nr_module_names.keys() {
         nr_module_names_of(mod_name).clash.import_stmts.clear()
         nr_drop_import_index(mod_name)
@@ -23262,7 +23350,7 @@ pub fn tc_decl_in_std(node: Int) -> Bool {
 fn tc_decl_module(decl: Int) -> Str {
     let own = node_module(decl)
     if own != "" { return own }
-    let owner = tc_method_block.get(decl) ?? (tc_ue_op_root.get(decl) ?? -1)
+    let owner = tc_decl_owner(decl)
     if owner < 0 { "" } else { node_module(owner) }
 }
 
@@ -29532,6 +29620,8 @@ fn resolve_names(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repor
     tc_call_decl = Map()
     tc_global_read_decl = Map()
     tc_local_binder = Map()
+    tc_ue.row_names = Map()
+    nr_read_budget_effects(program)
     nr_push_scope()
 
     // Register each non-pub declaration under its own module and namespace. Privacy is a fact
@@ -29964,7 +30054,7 @@ fn nr_check_fn_scope(fn_node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.R
     tc_push_tparam_scope(fn_tparams)
     nr_check_binder_bounds(fn_tparams)
     let nr_is_ffi = has_annotation(fn_node, "ffi")
-    let is_primitive_op = node_body(fn_node) == -1 && (tc_ue_op_root.get(fn_node) ?? -1) != -1
+    let is_primitive_op = node_body(fn_node) == -1 && (tc_ue.op_root.get(fn_node) ?? -1) != -1
     let binds_params = nr_is_ffi == 0 && !is_primitive_op
     let params_sl = node_params(fn_node)
     // A default is read where it is written, before any parameter is in scope: a call that
@@ -30289,6 +30379,28 @@ pub fn tc_builtin_effect_paths() -> List[Str] {
     out
 }
 
+// A `@capabilities` budget names effects as a row does, in the main file. Only the names a
+// module qualifier reads are recorded; the budget check reports the rest.
+fn nr_read_budget_effects(program: Int) {
+    let cap_node = get_annotation(program, "capabilities")
+    if cap_node == -1 { return }
+    let args = node_args(cap_node)
+    if args == -1 { return }
+    let mut i = 0
+    while i < sublist_length(args) {
+        let at = sublist_get(args, i)
+        let name = node_name(at)
+        match name.byte_index_of(".", 0) {
+            Some(dot) => {
+                let target = nr_qualifier_module_in(name.byte_slice(0, dot), "__main__")
+                if target != "" { let _ = nr_qualified_effect_decl(target, name.byte_slice(dot + 1, name.byte_len()), at) }
+            }
+            None => {}
+        }
+        i = i + 1
+    }
+}
+
 // Every name in the effect row of `fn_node` must name an effect (§4.3): a built-in one, `Arena`
 // (§5.2), or one the program declares (§4.12).
 fn nr_check_effect_row(fn_node: Int) ! TypeCheck.Resolve, Diag.Report {
@@ -30326,7 +30438,7 @@ fn nr_check_dotted_effect_name(name: Str, head: Str, tail: Str, at: Int) ! TypeC
     let target = nr_qualifier_module_here(head)
     if target != "" {
         tc_mark_qualifier_used(head)
-        let decl = nr_effect_decl_in_module(target, tail, 0)
+        let decl = nr_qualified_effect_decl(target, tail, at)
         if decl == -1 {
             let other = nr_resolve_decl_in_module(target, tail, 0)
             if other != -1 {
@@ -30401,7 +30513,7 @@ fn nr_backtick_list(names: List[Str]) -> Str {
 
 // The effect `member` names inside `target`, following any `pub import` that re-exports it.
 fn nr_effect_decl_in_module(target: Str, member: Str, depth: Int) -> Int {
-    for h in tc_ue_handles {
+    for h in tc_ue.handles {
         if node_name(h.decl) == member && node_module(h.decl) == target { return h.decl }
     }
     if depth >= 8 { return -1 }
@@ -46458,7 +46570,7 @@ fn tc_body_module(decl: Int) -> Str {
     let own = node_module(decl)
     if own != "" { return own }
     // A derived operation reads in the module that declares its effect.
-    let owner = tc_method_block.get(decl) ?? (tc_ue_op_root.get(decl) ?? -1)
+    let owner = tc_decl_owner(decl)
     if owner < 0 { return "__main__" }
     node_module(owner)
 }
@@ -48019,10 +48131,11 @@ fn tc_er_require(program: Int, site: Int, held: List[Str], owner: ErOwner, calle
         diag_set_last_fix("add effect", req)
         return
     }
+    let shown = tc_effect_spelling_at(req, owner.decl)
     diag_error_at("UndeclaredEffect", UNDECLARED_EFFECT,
-        "call to `{callee}` needs effect `{req}`, which `{owner.name}` does not declare", site,
-        "add `{req}` to the `!` list of `{owner.name}`, or make the call inside a `with` block that provides it")
-    diag_set_last_fix("add effect", req)
+        "call to `{callee}` needs effect `{shown}`, which `{owner.name}` does not declare", site,
+        "add `{shown}` to the `!` list of `{owner.name}`, or make the call inside a `with` block that provides it")
+    diag_set_last_fix("add effect", shown)
 }
 
 // A built-in op has no declaration to point to, so the report points to the row it misses (§4.4).
@@ -48677,7 +48790,8 @@ fn tc_er_fn_row(fn_node: Int) -> List[Str] {
     if effs != -1 {
         let mut i = 0
         while i < sublist_length(effs) {
-            out.push(node_name(sublist_get(effs, i)))
+            let e = sublist_get(effs, i)
+            out.push(tc_row_effect_name(e))
             i = i + 1
         }
     }
@@ -48796,10 +48910,11 @@ fn tc_er_check_with_item(program: Int, item: Int, tid0: Int, held: List[Str], ow
                 "add `! _` to `{owner.name}`, so each call is charged the row of the impls the type parameters of `{tname}` stand for")
             diag_set_last_fix("add effect", "_")
         } else {
+            let shown = tc_effect_spelling_at(req, owner.decl)
             diag_error_at("UndeclaredEffect", UNDECLARED_EFFECT,
-                "with item of type `{tname}` runs {ms_text}, which {verb} effect `{req}`, which `{owner.name}` does not declare", item,
-                "add `{req}` to the `!` list of `{owner.name}`, or put the `with` inside a `with` block that provides it")
-            diag_set_last_fix("add effect", req)
+                "with item of type `{tname}` runs {ms_text}, which {verb} effect `{shown}`, which `{owner.name}` does not declare", item,
+                "add `{shown}` to the `!` list of `{owner.name}`, or put the `with` inside a `with` block that provides it")
+            diag_set_last_fix("add effect", shown)
         }
         k = k + 1
     }
@@ -48987,7 +49102,7 @@ fn tc_er_check_impl_row(program: Int, m: Int, tm: Int, trait_name: Str) ! Diag.R
     let mut k = 0
     while k < sublist_length(effs) {
         let e = sublist_get(effs, k)
-        let en = node_name(e)
+        let en = tc_row_effect_name(e)
         // FFI is left out here for the reason tc_er_check_call gives.
         let ffi = en == "FFI" || en.starts_with("FFI.")
         if !ffi && (en == "_" || !tc_er_satisfied(program, rt, en)) { wide.push(e) }
@@ -48995,7 +49110,9 @@ fn tc_er_check_impl_row(program: Int, m: Int, tm: Int, trait_name: Str) ! Diag.R
     }
     if wide.len() == 0 { return }
     let tshown = "{trait_name}.{node_name(tm)}"
-    let row_shown = if rt.len() == 0 { "empty" } else { "`{rt.join(", ")}`" }
+    let mut rt_shown: List[Str] = []
+    for r in rt { rt_shown.push(tc_effect_spelling_at(r, m)) }
+    let row_shown = if rt.len() == 0 { "empty" } else { "`{rt_shown.join(", ")}`" }
     let mut named: List[Str] = []
     for e in wide {
         if node_name(e) != "_" { named.push(node_name(e)) }
@@ -49092,7 +49209,7 @@ fn tc_check_effect_rows(program: Int, msg_ran: Set[Int]) ! TypeCheck.Resolve, Di
     // A derived body runs at the call site, and that call needs only the effect that declares
     // the operation, so the body holds that effect and nothing more.
     for op in effect_derived_ops(program) {
-        match tc_ue_op_root.get(op) {
+        match tc_ue.op_root.get(op) {
             Some(ed) => tc_er_walk(program, node_body(op), [tc_er_op_effect(ed, op)], ErOwner { name: "{tc_er_op_effect(ed, op)}.{node_name(op)}", decl: -1, default_body: false, msg_ran: msg_ran, assigns: assigns }, kids)
             None => {}
         }

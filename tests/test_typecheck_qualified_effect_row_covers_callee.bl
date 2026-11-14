@@ -1,0 +1,130 @@
+// A row may name an effect with the qualifier of the module that declares it (§4.3 "A
+// qualified effect name"). `lib.Log`, `l.Log` with `import lib as l`, and `Log` inside lib all
+// name one effect, so a row that spells it one way covers a call that needs it spelled another.
+
+import std.fs
+import std.process.{ProcessResult}
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_reset}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+
+fn sh(cmd: Str) -> ProcessResult ! Process.Spawn {
+    process.run("sh", ["-c", cmd]).unwrap()
+}
+
+let LOG_LIB: Str = "pub effect Log \{\n    effect Emit \{\n        fn log(msg: Str)\n    }\n    effect Flush \{\n        fn flush()\n    }\n}\n\npub effect Audit \{\n    effect Rec \{\n        fn rec(msg: Str)\n    }\n}\n\npub fn note() ! Log \{ log.log(\"lib\") }\n\npub type R \{ n: Int }\n\nimpl Closeable for R \{\n    fn close(self) ! Log \{ log.log(\"close\") }\n}\n\npub trait Speaker \{\n    fn speak(self) ! Log\n}\n"
+
+// An effect named like lib's, and an effect-free module.
+let OTHER_LIB: Str = "pub effect Log \{\n    effect Emit \{\n        fn log(msg: Str)\n    }\n}\n\npub fn shout() ! Log \{ log.log(\"other\") }\n"
+let PLAIN_LIB: Str = "pub fn calm() -> Int \{ 1 }\n"
+
+fn main_errors(main_src: Str) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Process.Spawn, Env.Exit, Env.Read, IO {
+    main_errors_with(main_src, "")
+}
+
+// The errors in src/main.bl of a package of lib (LOG_LIB), plain (PLAIN_LIB), main, and other
+// (`other_src`, when not empty), one per line as "code name line:col: message".
+fn main_errors_with(main_src: Str, other_src: Str) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Process.Spawn, Env.Exit, Env.Read, IO {
+    init_embedded_stdlib()
+    let dir = sh("mktemp -d /tmp/blink_qualified_row.XXXXXX").out.trim()
+    let _ = sh("mkdir -p {dir}/src")
+    fs.write("{dir}/blink.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\n").unwrap()
+    fs.write("{dir}/src/lib.bl", LOG_LIB).unwrap()
+    fs.write("{dir}/src/plain.bl", PLAIN_LIB).unwrap()
+    if other_src != "" { fs.write("{dir}/src/other.bl", other_src).unwrap() }
+    let main_path = "{dir}/src/main.bl"
+    fs.write(main_path, main_src).unwrap()
+    diag_reset()
+    let program = compile_to_program(main_path, 1)
+    check_types(program)
+    let mut out = ""
+    for d in diag_entries {
+        if d.severity == "error" && d.file == main_path {
+            out = out.concat("{d.code} {d.name} {d.line}:{d.col}: {d.message}\n")
+        }
+    }
+    let _ = sh("rm -rf {dir}")
+    out
+}
+
+test "a module-qualified row covers a call to a fn whose row spells the effect bare" {
+    let got = main_errors("import lib\n\nfn twice() ! lib.Log \{\n    lib.note()\n}\n\nfn main() \{ }\n")
+    assert_eq(got, "")
+}
+
+test "a module-qualified row covers an operation of a sub-effect" {
+    let got = main_errors("import lib\n\nfn say() ! lib.Log \{\n    log.log(\"main\")\n}\n\nfn main() \{ }\n")
+    assert_eq(got, "")
+}
+
+test "an aliased qualifier names the same effect" {
+    let got = main_errors("import lib as l\n\nfn twice() ! l.Log \{\n    l.note()\n    log.log(\"main\")\n}\n\nfn main() \{ }\n")
+    assert_eq(got, "")
+}
+
+test "a module-qualified row covers the close of a with item and a call of close" {
+    let got = main_errors("import lib\n\nfn held() ! lib.Log \{\n    with lib.R \{ n: 1 } as _r \{ }\n    lib.R \{ n: 2 }.close()\n}\n\nfn main() \{ }\n")
+    assert_eq(got, "")
+}
+
+test "an impl method row and a bound call name the trait's effect through the qualifier" {
+    let got = main_errors("import lib\nimport lib.\{Speaker}\n\ntype P \{ n: Int }\n\nimpl Speaker for P \{\n    fn speak(self) ! lib.Log \{ log.log(\"p\") }\n}\n\nfn talk[T: Speaker](t: T) ! lib.Log \{\n    t.speak()\n}\n\nfn main() \{ }\n")
+    assert_eq(got, "")
+}
+
+test "a qualified row covers a call to a fn of the same file whose row is qualified too" {
+    let got = main_errors("import lib\n\nfn inner() ! lib.Log \{\n    lib.note()\n}\n\nfn outer() ! lib.Log \{\n    inner()\n}\n\nfn main() \{ }\n")
+    assert_eq(got, "")
+}
+
+test "a bare row from a selective import covers a call whose row is qualified" {
+    let got = main_errors("import lib\nimport lib.\{Log}\n\nfn inner() ! lib.Log \{\n    lib.note()\n}\n\nfn outer() ! Log \{\n    inner()\n}\n\nfn main() \{ }\n")
+    assert_eq(got, "")
+}
+
+test "a capabilities budget covers a qualified row, spelt bare or qualified" {
+    let fn_f = "\n\nfn f() ! lib.Log \{\n    lib.note()\n}\n\nfn main() \{ }\n"
+    assert_eq(main_errors("@capabilities(Log)\nimport lib\nimport lib.\{Log}{fn_f}"), "")
+    assert_eq(main_errors("@capabilities(lib.Log)\nimport lib{fn_f}"), "")
+}
+
+test "a capabilities report spells the effect the way the file can write it" {
+    let got = main_errors("@capabilities(IO)\nimport lib\n\nfn f() ! lib.Log \{\n    lib.note()\n}\n\nfn main() \{ }\n")
+    assert_eq(got, "E0501 CapabilityBudgetExceeded 4:1: function `f` uses effect `lib.Log` which is not in @capabilities budget\n")
+}
+
+test "a module-qualified row does not cover a call that needs another effect of that module" {
+    let got = main_errors("import lib\n\nfn other() ! lib.Audit \{\n    lib.note()\n}\n\nfn main() \{ }\n")
+    assert_eq(got, "E0500 UndeclaredEffect 4:5: call to `note` needs effect `lib.Log`, which `other` does not declare\n")
+}
+
+test "a report names the effect bare when a selective import binds it" {
+    let got = main_errors("import lib\nimport lib.\{Log}\n\nfn other() ! lib.Audit \{\n    lib.note()\n}\n\nfn main() \{ }\n")
+    assert_eq(got, "E0500 UndeclaredEffect 5:5: call to `note` needs effect `Log`, which `other` does not declare\n")
+}
+
+test "a report names the effect through the alias the file binds" {
+    let got = main_errors("import lib as l\n\nfn other() ! l.Audit \{\n    l.note()\n}\n\nfn main() \{ }\n")
+    assert_eq(got, "E0500 UndeclaredEffect 4:5: call to `note` needs effect `l.Log`, which `other` does not declare\n")
+}
+
+test "a module-qualified row covers the close of a main impl whose row is qualified" {
+    let got = main_errors("import lib\n\ntype R \{ n: Int }\n\nimpl Closeable for R \{\n    fn close(self) ! lib.Log \{ log.log(\"c\") }\n}\n\nfn held() ! lib.Log \{\n    with R \{ n: 1 } as _r \{ }\n}\n\nfn main() \{ }\n")
+    assert_eq(got, "")
+}
+
+test "a module-qualified row covers a call whose row spells the effect through an alias" {
+    let got = main_errors("import lib\nimport lib as l\n\nfn inner() ! l.Log \{\n    l.note()\n}\n\nfn outer() ! lib.Log \{\n    inner()\n}\n\nfn main() \{ }\n")
+    assert_eq(got, "")
+}
+
+test "a row that names one module's effect does not cover an effect of that name from another module" {
+    let got = main_errors_with("import lib\nimport other\n\nfn mixed() ! lib.Log \{\n    other.shout()\n}\n\nfn main() \{ }\n", OTHER_LIB)
+    assert_eq(got, "E0500 UndeclaredEffect 5:5: call to `shout` needs effect `Log`, which `mixed` does not declare\n")
+}
+
+test "a qualifier whose module declares no such effect is an unknown effect, and covers nothing" {
+    let got = main_errors("import lib\nimport plain\n\nfn f() ! plain.Log \{\n    lib.note()\n}\n\nfn main() \{ }\n")
+    assert_eq(got, "E0538 UnknownEffect 4:10: module `plain` does not export an effect `Log`\nE0500 UndeclaredEffect 5:5: call to `note` needs effect `lib.Log`, which `f` does not declare\n")
+}
