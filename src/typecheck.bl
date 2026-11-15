@@ -35,7 +35,7 @@ import diagnostics.{
     UNSOLVED_TYPEVAR_AT_CODEGEN, CALL_NOT_ANSWERED, OPEN_TYPE_AFTER_CHECK, CALL_ROW_UNKNOWN, SEALED_OPS_REWRITE_INVARIANT, VARIANT_WITHOUT_ENUM,
     NO_SUCH_VARIANT, TYPE_ERROR, TEMPLATE_MISMATCH, UNEXPECTED_ANNOTATION, MISSING_RETURN, NO_CONVERSION_IMPL, CANNOT_INFER_TYPE, NOT_ITERABLE, MISSING_ELSE, UNLICENSED_SELF_OP, TRAIT_BOUND_NOT_SATISFIED, CAPABILITY_BUDGET, QM_INVALID_OPERAND, UNDEFINED_FUNCTION,
     UNRESOLVED_METHOD, AMBIGUOUS_METHOD_CALL, MISSING_DISPLAY_IMPL,
-    MUTATION_REQUIRES_MUT, MUT_ON_PATTERN, NOT_A_PLACE, PARAM_ASSIGN, diag_error_label_at_notes, diag_add_note_at_spots_since, diag_error_span_label_at_notes, diag_warn_label_at_notes, EMPTY_ROW_OUTSIDE_FFI, PANIC_HOOK_PLACEMENT, TRACE_MESSAGE_EFFECT, METHOD_THROUGH_TYPE_NAME, SELF_OUTSIDE_TRAIT_OR_IMPL, EFFECTS_ANNOTATION_REMOVED, UNKNOWN_EFFECT, diag_fix_before_starts_with, diag_drop_fix_over_others, diag_drop_fix_at,
+    MUTATION_REQUIRES_MUT, MUT_ON_PATTERN, NOT_A_PLACE, PARAM_ASSIGN, diag_error_label_at_notes, diag_add_note_at_spots_since, diag_error_span_label_at_notes, diag_warn_label_at_notes, EMPTY_ROW_OUTSIDE_FFI, PANIC_HOOK_PLACEMENT, TRACE_MESSAGE_EFFECT, METHOD_THROUGH_TYPE_NAME, SELF_OUTSIDE_TRAIT_OR_IMPL, EFFECTS_ANNOTATION_REMOVED, UNKNOWN_EFFECT, SUB_EFFECT_AS_TYPE, diag_fix_before_starts_with, diag_drop_fix_over_others, diag_drop_fix_at,
     UNDEFINED_VARIABLE, UNKNOWN_TYPE, QM_RESULT_IN_NON_RESULT,
     QM_OPTION_IN_NON_OPTION, QM_ERROR_MISMATCH,
     QM_TEST_DISPLAY_REQUIRED, TEST_ANNOTATED_RETURN, SKIP_OUTSIDE_TEST,
@@ -97,7 +97,7 @@ effect TypeCheck {
 pub type TyKind {
     Int, Float, Bool, Str, Void,
     List, Option, Result, Fn, Struct, Enum,
-    Typevar, Unknown, Iterator, Handle, Channel, Ptr, Handler,
+    Typevar, Unknown, Iterator, Handle, Channel, Ptr, Handler, Effect,
     Tuple, Map, Bytes, Set, StringBuilder, Template, FfiScope, Raw,
     I8, I16, I32, U8, U16, U32, U64, Char,
     Never, Range
@@ -124,6 +124,7 @@ pub fn tk_name(k: TyKind) -> Str {
         TyKind.Iterator => "Iterator"
         TyKind.Handle => "Handle"
         TyKind.Handler => "Handler"
+        TyKind.Effect => "Effect"
         TyKind.Channel => "Channel"
         TyKind.Range => "Range"
         TyKind.Ptr => "Ptr"
@@ -1651,7 +1652,7 @@ fn tc_is_arith_trait(tr: Str) -> Bool {
 fn tc_bound_fact(concrete_tid: Int, trait_name: Str) -> Int {
     let k = type_kind(concrete_tid)
     // An effect context has no values, so it implements no trait (§3b.5).
-    if tc_typevar_is_effect_context(concrete_tid) { return -1 }
+    if k == TyKind.Effect { return -1 }
     // Unknowable for an unresolved/generic type — fail open, never reject.
     if k == TyKind.Unknown || k == TyKind.Typevar { return 0 }
     if trait_name == "Display" {
@@ -2621,20 +2622,6 @@ pub fn tc_tid_binder(tid0: Int) -> Int {
     e.inner1
 }
 
-// True when `tid0` is the typevar an effect name lowers to in a type position (the `DB` of
-// `Template[DB]`, §3b.5). It names one fixed context, so a type parameter bound to it is
-// solved: inference and mono must not read it as an open type parameter. This name test
-// stands in until an effect has identity by its declaration; a dotted name (`m.DB` or a
-// sub-effect) is left out, because a bare spelling cannot tell which one it is.
-pub fn tc_typevar_is_effect_context(tid0: Int) -> Bool {
-    let t = tc_resolve(tid0)
-    if t < 0 || t >= ty_pool.len() { return false }
-    let e = ty_pool.get(t).unwrap()
-    if e.kind != TyKind.Typevar || e.inner1 != NO_BINDER_NODE { return false }
-    if e.name.contains(".") { return false }
-    tc_is_undotted_effect_name(e.name)
-}
-
 // True when a name with no dot names a built-in effect root or a declared effect.
 fn tc_is_undotted_effect_name(name: Str) -> Bool {
     builtin_effect_children(name).is_some() || tc_effect_decl_named(name) != -1
@@ -2931,20 +2918,17 @@ pub fn make_ptr_type(pointee: Int) -> Int {
     ty_intern_simple(TyKind.Ptr, "Ptr", pointee, -1)
 }
 
-// The sixth case of the same shape as make_ptr_type above. `Template` is
-// claimed by is_primitive_type (:6866) so no user type could have taken the name, and
-// resolve_type_parts had no arm for it — so every `tpl: Template[DB]` resolved to
-// make_typevar("Template"), permissive at the RECEIVER, which is why the seven introspection
-// methods codegen has always emitted could have no return type no matter what arm was added.
-//
-// One inner = the phantom context (`DB` in `Template[DB]`), shaped like make_ptr_type so
-// tc_tid_child / tc_tid_child_count / the spellers / tk_to_ct reach it through arms they
-// already have. The phantom is CARRIED, not yet CHECKED: sections/03b_contracts.md:563 states
-// that `Template[Shell]` may not be passed where `Template[DB]` is expected, and today it can
-// be. That check needs the contexts to be comparable, and the spec's own contexts (`DB`,
-// `Shell`) are EFFECT names, which are not in the type namespace — so each resolves to a
-// typevar, and typevars unify with anything by design. Carrying the phantom is the
-// prerequisite for ever enforcing it; enforcing it is a spec question, filed separately.
+// The type an effect declaration gives (§3b.5 "An effect name denotes a type"): no values, no
+// constructor, a subtype of nothing. The name is its identity (tc_effect_context_name), so
+// two spellings of one declaration are one type. No slot holds the declaration node, because
+// walkers read inner1/inner2 as tids.
+pub fn make_effect_type(root: Str) -> Int {
+    ty_intern_simple(TyKind.Effect, root, -1, -1)
+}
+
+// `Template[C]`. Its one inner is the context C (§3b.5 *The Context Parameter C*), shaped like
+// make_ptr_type so the child accessors and spellers reach it through arms they already have.
+// A context is an effect type (make_effect_type), so `Template[Shell]` is not `Template[DB]`.
 pub fn make_template_type(context: Int) -> Int {
     ty_intern_simple(TyKind.Template, "Template", context, -1)
 }
@@ -5751,13 +5735,12 @@ pub fn tc_unify(a0: Int, b0: Int) -> Int {
     let ka0 = ty_pool.get(a).unwrap().kind
     let kb0 = ty_pool.get(b).unwrap().kind
     // The one typevar a hole binds to is a parameter of the declaration being checked: it is
-    // one type in each instance of the body, as `List[T]` is in the arm below. An effect
-    // context is one fixed type everywhere, so a hole binds to it too.
+    // one type in each instance of the body, as `List[T]` is in the arm below.
     if ka0 == TyKind.Typevar || kb0 == TyKind.Typevar {
-        if ka0 == TyKind.Typevar && tc_is_unbound_metavar(b) != 0 && (tc_typevar_binds_here(a) != 0 || tc_typevar_is_effect_context(a)) {
+        if ka0 == TyKind.Typevar && tc_is_unbound_metavar(b) != 0 && tc_typevar_binds_here(a) != 0 {
             return bind_metavar(b, a)
         }
-        if kb0 == TyKind.Typevar && tc_is_unbound_metavar(a) != 0 && (tc_typevar_binds_here(b) != 0 || tc_typevar_is_effect_context(b)) {
+        if kb0 == TyKind.Typevar && tc_is_unbound_metavar(a) != 0 && tc_typevar_binds_here(b) != 0 {
             return bind_metavar(a, b)
         }
         return 1
@@ -5787,6 +5770,8 @@ pub fn tc_unify(a0: Int, b0: Int) -> Int {
         TyKind.I8 | TyKind.I16 | TyKind.I32 | TyKind.U8 | TyKind.U16 | TyKind.U32 | TyKind.U64 => 1
         // Each of these answered above, before the kinds were compared; the arms repeat that answer.
         TyKind.Unknown | TyKind.Typevar => 1
+        // The name is the declaration (make_effect_type); two effects are one type only by it.
+        TyKind.Effect => if ta.name == tb.name { 1 } else { 0 }
         // One type argument, in inner1.
         TyKind.List | TyKind.Option | TyKind.Set | TyKind.Channel | TyKind.Iterator | TyKind.Raw | TyKind.Ptr | TyKind.Handle | TyKind.Template | TyKind.Range => tc_unify(ta.inner1, tb.inner1)
         // The effect is in the name slot, not in a child.
@@ -6778,7 +6763,6 @@ fn bind_target_is_concrete(tid: Int) -> Int {
     if tc_is_unbound_metavar(r) != 0 { return 0 }
     // The checked body's own parameter is one fixed type there (rigid, §3 Parametricity), so
     // it commits a binder as firmly as `Int` would. Another declaration's is still open.
-    if tc_typevar_is_effect_context(r) { return 1 }
     if ty_pool.get(r).unwrap().kind == TyKind.Typevar { return tc_typevar_is_rigid(r) }
     // The `?` hole is the third spelling of "nothing to commit to", and it arrives here from
     // a closure argument whose own seed left the type-parameter position open. Counting it as
@@ -7166,7 +7150,7 @@ fn tc_check_one_bound(name: Str, bounds: Str, concrete: Int, node: Int, sink: St
         if tc_pipe_has(bounds, tr) != 0 && tc_type_satisfies_bound(concrete, tr) == -1 {
             let path = tc_trait_need(concrete, tr, [])
             let fixes = if path.len() > 0 { tc_trait_need_fixes(path.get(path.len() - 1).unwrap(), tc_need_fix_trait(path, tr)) } else { [] }
-            let help = if tc_typevar_is_effect_context(concrete) { tc_effect_context_bound_help(type_to_str(concrete), tr) } else if fixes.len() > 0 { fixes.join("\n") } else {
+            let help = if tc_tid_kind(tc_resolve(concrete)) == TyKind.Effect { tc_effect_context_bound_help(type_to_str(concrete), tr) } else if fixes.len() > 0 { fixes.join("\n") } else {
                 "pass an argument whose type implements {tr}, or derive/implement {tr} for it; the arithmetic traits (Add/Sub/Mul/Div/Rem/Neg) are sealed to the built-in numeric types"
             }
             let shown = tc_core_trait_shown(tr)
@@ -7343,7 +7327,7 @@ fn tc_report_unmet_user_bound(carrier: Int, outer_sl: Int, own_sl: Int, concrete
     let why = if kind_fits && u.held.impls == 0 { "a List implements {shown} only where its element {elem_rule}" } else { has }
     // No impl can be written at a type parameter of the body being checked.
     let at_body = tc_args_name_a_body_tparam(u.want)
-    let help = if tc_typevar_is_effect_context(concrete) {
+    let help = if tc_tid_kind(tc_resolve(concrete)) == TyKind.Effect {
         tc_effect_context_bound_help(type_to_str(concrete), bound_text)
     } else if surface && !kind_fits {
         "pass an argument whose type implements {bound_text}; {shown} is sealed to {row.shown}, and no impl of it can be written"
@@ -7537,8 +7521,6 @@ fn tc_surface_held(recv: Int, row: SurfaceRow) -> ImplArgsHeld {
 // which has only the bounds its binders give. A bare one is judged by those bounds, not by
 // impls, so it is not judgeable here.
 fn tc_tid_is_judgeable_here(tid: Int) -> Bool {
-    // An effect context is one fixed type with no impls (§3b.5).
-    if tc_typevar_is_effect_context(tid) { return true }
     tc_tid_kind(tc_resolve(tid)) != TyKind.Typevar && tc_tid_is_judgeable_among(tid, 1)
 }
 
@@ -9690,8 +9672,9 @@ fn tc_display_missing_leaf(t0: Int) -> Int ! TypeCheck.Resolve, Diag.Report {
     let t = resolve_alias_tid(tc_resolve(t0))
     let k = type_kind(t)
     if k == TyKind.Unknown || k == TyKind.Never { return -1 }
+    // An effect context has no values, so it implements no trait (§3b.5).
+    if k == TyKind.Effect { return t }
     if k == TyKind.Typevar {
-        if tc_typevar_is_effect_context(t) { return t }
         if tc_typevar_binds_here(t) == 0 { return -1 }
         if tc_typevar_holds(t, "Display") { return -1 }
         return t
@@ -9853,7 +9836,7 @@ fn tc_report_missing_display(arg: Int, t: Int, leaf: Int, sink: Str, notes: List
         return
     }
     let lk = type_kind(leaf)
-    if tc_typevar_is_effect_context(leaf) {
+    if lk == TyKind.Effect {
         diag_error_label_at_notes("MissingDisplayImpl", MISSING_DISPLAY_IMPL, msg, arg, label, tc_effect_context_bound_help(ls, "`Display`"), notes)
         return
     }
@@ -14321,15 +14304,17 @@ fn resolve_type_parts(name: Str, elems_sl: Int, ann_node: Int) -> Int ! TypeChec
         return resolved
     }
 
+    // An effect name gives the effect's type (§3b.5), after every declaration in the type
+    // namespace, so a `type DB` in this module wins over the effect.
+    let effect_type = tc_effect_context_type(name, ann_node)
+    if effect_type != -1 { return effect_type }
     // An unresolved name here is NOT necessarily an unknown type: resolve_type_parts is
     // the shared low-level type-lowering path, reached for the trait `Self` (no concrete
-    // receiver yet), the primitive sentinels, and effect names used as phantom
-    // `Template[Effect]` arguments (types_compatible:9738 is normative that effects are
-    // not in the type namespace) — local AND imported. All of those legitimately lower to
-    // a typevar. Reporting UnknownType here would false-positive on every one of them, so
-    // the genuine "unknown type in a struct field / enum-variant payload / alias
-    // underlying" leak (the positions name-resolution does not walk) must be closed in the
-    // name-resolution walker with its full acceptance set, not in this fallback.
+    // receiver yet) and the primitive sentinels, which legitimately lower to a typevar.
+    // Reporting UnknownType here would false-positive on them, so the genuine "unknown type
+    // in a struct field / enum-variant payload / alias underlying" leak (the positions
+    // name-resolution does not walk) must be closed in the name-resolution walker with its
+    // full acceptance set, not in this fallback.
     make_typevar(name)
 }
 
@@ -21345,6 +21330,9 @@ fn register_ue_op_sigs(ed: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.Re
     if children_sl == -1 { return }
     let saved_suppress = tc_suppress_ann_validation
     tc_suppress_ann_validation = 1
+    // An operation's signature reads in the module that declares its effect, so a bare name
+    // there means that module's own declaration.
+    let saved_module = tc_enter_body_module(ed)
     let mut ci = 0
     while ci < sublist_length(children_sl) {
         let ops_sl = node_methods(sublist_get(children_sl, ci))
@@ -21363,6 +21351,7 @@ fn register_ue_op_sigs(ed: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.Re
         }
         ci = ci + 1
     }
+    tc_leave_body_module(saved_module)
     tc_suppress_ann_validation = saved_suppress
 }
 
@@ -22626,6 +22615,134 @@ fn tc_effect_path_here(spelling: Str) -> Str {
         return "{b.member}{rest}"
     }
     spelling
+}
+
+// The type an effect name written in a type position gives (§3b.5 *The Context Parameter C*),
+// or -1 when `name` names no effect. It resolves the name as tc_effect_path_here does: a module
+// qualifier, then a built-in, then the file's own effect, then a selective import. A
+// sub-effect gives no type: it is SubEffectAsType at `at`.
+fn tc_effect_context_type(name: Str, at: Int) -> Int ! Diag.Report {
+    let head = tc_handler_effect_root(name)
+    let rest = name.byte_slice(head.byte_len(), name.byte_len())
+    // The declared root that is the type's identity, and the sub-effect path written after it.
+    let mut root = ""
+    let mut sub = ""
+    let mut decl = -1
+    let target = if rest != "" { nr_qualifier_module_here(head) } else { "" }
+    if target != "" {
+        let tail = rest.byte_slice(1, rest.byte_len())
+        let troot = tc_handler_effect_root(tail)
+        decl = tc_effect_decl_of_module(target, troot)
+        if decl == -1 { return -1 }
+        tc_mark_qualifier_used(head)
+        root = tc_effect_context_name(decl, troot)
+        sub = tail.byte_slice(troot.byte_len(), tail.byte_len())
+    } else if builtin_effect_children(head).is_some() {
+        root = head
+        sub = rest
+    } else {
+        let (ed, member) = tc_effect_decl_here(head)
+        if ed == -1 { return -1 }
+        decl = ed
+        root = tc_effect_context_name(ed, member)
+        sub = rest
+    }
+    if sub == "" { return make_effect_type(root) }
+    let child = sub.byte_slice(1, sub.byte_len())
+    let kids = if decl == -1 { builtin_effect_children(head) ?? [] } else { nr_sub_effect_names(decl) }
+    if !kids.contains(tc_handler_effect_root(child)) { return -1 }
+    if at != -1 {
+        let parent = name.byte_slice(0, name.byte_len() - sub.byte_len())
+        let message = "`{name}` is a sub-effect, which gives no type"
+        tc_errors.push(message)
+        // A type annotation's own line and col read after its last token; its written span
+        // starts at the name.
+        let (w_line, w_col, _, _) = node_written_span(at)
+        let written = node_kind(at) == NodeKind.TypeAnn && w_line != 0
+        let line = if written { w_line } else { node_line(at) }
+        let col = if written { w_col } else { node_col(at) }
+        diag_error_span_label_at_notes("SubEffectAsType", SUB_EFFECT_AS_TYPE, message, at, line, col, col + name.byte_len(), "a sub-effect of `{parent}`", "name the parent effect: `{parent}`", [])
+    }
+    tc_error_recovery_tid()
+}
+
+// The name of the type the effect declaration `decl`, declared as `root`, gives. It is the
+// identity of the type, and two contexts are the same only when they name the same
+// declaration (§3b.5), so a name that two modules declare is the declaring module's key, a dot,
+// and the name. A declared name has no dot, so the name alone is never mistaken for one.
+fn tc_effect_context_name(decl: Int, root: Str) -> Str {
+    if tc_effect_name_shared(root) { "{node_module(decl)}.{root}" } else { root }
+}
+
+// How the module `reader` writes the effect type named `name` (tc_effect_context_name).
+fn tc_effect_context_spelling(name: Str, reader: Str) -> Str {
+    let mut dot = -1
+    let mut from = 0
+    while true {
+        match name.byte_index_of(".", from) {
+            Some(i) => {
+                dot = i
+                from = i + 1
+            }
+            None => { break }
+        }
+    }
+    if dot == -1 { return tc_effect_spelling_in(name, reader) }
+    let module = name.byte_slice(0, dot)
+    let root = name.byte_slice(dot + 1, name.byte_len())
+    let decl = tc_effect_decl_of_module(module, root)
+    if decl == -1 || module == reader { return root }
+    let idx = nr_module_import_index(reader)
+    for k in idx.keys().sort() {
+        for b in idx.get(k) ?? [] {
+            if b.member != "" && tc_effect_decl_of_module(b.source_mod, b.member) == decl { return k }
+        }
+    }
+    let q = nr_qualifier_of_module_in(module, reader)
+    if q != "" { return "{q}.{root}" }
+    // No file imports the program's own file, so its effect has no other spelling.
+    if tc_module_key_is_main(module) != 0 { return root }
+    name
+}
+
+// The effect `module` declares as `name`. The merge keeps one effect of each name, but a
+// module's own effect is still the one its name means there.
+fn tc_effect_decl_of_module(module: Str, name: Str) -> Int {
+    let decl = nr_effect_decl_in_module(module, name, 0)
+    if decl != -1 { return decl }
+    for d in tc_ue.merge_dropped {
+        if node_name(d) == name && node_module(d) == module { return d }
+    }
+    -1
+}
+
+// The effect a bare `head` names in the module under check, and the name its module declares
+// it under: the module's own effect, else one a selective import binds to `head`. A name no
+// declaration here binds is no effect, so an effect another module declares is reached only
+// through an import (§3b.5 "the module qualifies the name").
+fn tc_effect_decl_here(head: Str) -> (Int, Str) {
+    let own = tc_effect_decl_of_module(nr_current_module, head)
+    if own != -1 { return (own, head) }
+    for b in nr_module_import_index(nr_current_module).get(head) ?? [] {
+        if b.member == "" { continue }
+        let ed = tc_effect_decl_of_module(b.source_mod, b.member)
+        if ed == -1 { continue }
+        tc_mark_import_used(b)
+        return (ed, b.member)
+    }
+    (-1, "")
+}
+
+// The sub-effects of the effect a bare `parent` names here, built-in or declared; None when
+// `parent` names no effect here.
+fn tc_sub_effects_here(parent: Str) -> Option[List[Str]] {
+    match builtin_effect_children(parent) {
+        Some(k) => { return Some(k) }
+        None => {}
+    }
+    let (decl, _) = tc_effect_decl_here(parent)
+    if decl == -1 { return None }
+    Some(nr_sub_effect_names(decl))
 }
 
 // The effect the handler expression or `Handler[E]` argument `node` names, by tc_effect_path_here,
@@ -30256,7 +30373,13 @@ fn nr_check_type_ann_visibility(ann_node: Int) ! TypeCheck.Resolve, Diag.Report 
             while i < sublist_length(elems_sl) {
                 let child = sublist_get(elems_sl, i)
                 let child_name = node_name(child)
-                tc_mark_symbol_used(child_name)
+                // A template context that names no effect is read as any other type name, so
+                // a name that is nothing is UnknownType (§3b.5), never a type variable.
+                if core == "Template" && tc_effect_context_type(child_name, -1) == -1 {
+                    nr_check_type_ann_visibility(child)
+                } else {
+                    tc_mark_symbol_used(child_name)
+                }
                 i = i + 1
             }
         }
@@ -30338,6 +30461,19 @@ fn nr_check_type_ref(name: Str, at: Int) ! TypeCheck.Resolve, Diag.Report {
     match name.byte_index_of(".", 0) {
         Some(dot) => {
             let qualifier = name.byte_slice(0, dot)
+            // A sub-effect is SubEffectAsType, which resolve_type_parts reports.
+            if nr_qualifier_module_here(qualifier) == "" {
+                let tail = name.byte_slice(dot + 1, name.byte_len())
+                match tc_sub_effects_here(qualifier) {
+                    Some(kids) => {
+                        if kids.contains(tc_handler_effect_root(tail)) { return }
+                        // The head is an effect, so the name is a sub-effect it does not declare.
+                        nr_error("UnknownType", UNKNOWN_TYPE, "unknown type `{name}`: `{qualifier}` has no sub-effect `{tail}`", at, "")
+                        return
+                    }
+                    None => {}
+                }
+            }
             if nr_qualifier_names_a_type(qualifier) == 0 {
                 nr_check_qualified_type_ref(name, qualifier, name.byte_slice(dot + 1, name.byte_len()), at)
                 return
@@ -30549,6 +30685,11 @@ fn nr_check_dotted_effect_name(name: Str, head: Str, tail: Str, at: Int) ! TypeC
         }
     }
     if !kids.contains(tail) { nr_unknown_sub_effect(name, head, tail, kids.len() == 0, at) }
+}
+
+// Whether `parent.child` names a sub-effect of a built-in or declared effect `parent`.
+fn nr_names_sub_effect(parent: Str, child: Str) -> Bool {
+    (tc_sub_effects_here(parent) ?? []).contains(tc_handler_effect_root(child))
 }
 
 fn nr_sub_effect_names(decl: Int) -> List[Str] {
@@ -32067,6 +32208,9 @@ fn types_compatible(a0: Int, b0: Int) -> Int {
         // Each of these answered above, before the kinds were compared; the arms repeat that answer.
         TyKind.Unknown | TyKind.Never => 1
         TyKind.Typevar => tc_typevar_pair_compatible(a, b)
+        // The name is the declaration (make_effect_type), so a context is compatible only with
+        // itself (§3b.5 *The Context Parameter C*).
+        TyKind.Effect => if ta.name == tb.name { 1 } else { 0 }
         // One type argument in inner1, compared as is: there is no subtyping (§3.6 *Traits*),
         // so Channel[Int] is not a Channel[Str] and Handle[Int] is not a Handle[Str].
         TyKind.List | TyKind.Option | TyKind.Iterator | TyKind.Set | TyKind.Channel | TyKind.Handle | TyKind.Raw | TyKind.Range => tc_type_part_compatible(ta.inner1, tb.inner1)
@@ -32087,12 +32231,6 @@ fn types_compatible(a0: Int, b0: Int) -> Int {
         // `Template[Shell]` are distinct types. You cannot pass a `Template[Shell]` to a function
         // expecting `Template[DB]`." Without this arm two Templates matched on kind alone, which
         // is the cross-context confusion the phantom exists to prevent.
-        //
-        // It is VACUOUS for the spec's own examples, deliberately and unavoidably: `DB` and
-        // `Shell` there are EFFECT names, effect names are not in the type namespace, so each
-        // phantom resolves to a typevar and the typevar arm above already returned 1. So this
-        // arm bites only when the context is a real type. Making the effect spelling bite is a
-        // spec question (filed) and not something a compatibility arm can decide.
         TyKind.Template => tc_type_part_compatible(ta.inner1, tb.inner1)
         // The effect lives in the NAME slot rather than in a child (make_handler_type), so this
         // compares strings where the arms above recurse on tids: an effect is not a type.
@@ -32858,7 +32996,7 @@ fn tc_debug_need(tid0: Int, visiting: List[Int]) -> List[Int] {
             [t.inner1]
         }
         TyKind.Tuple => tc_tuple_elem_tids(tid)
-        TyKind.Void | TyKind.Fn | TyKind.Iterator | TyKind.Handle | TyKind.Channel | TyKind.Ptr | TyKind.Handler => { return [tid] }
+        TyKind.Void | TyKind.Fn | TyKind.Iterator | TyKind.Handle | TyKind.Channel | TyKind.Ptr | TyKind.Handler | TyKind.Effect => { return [tid] }
         TyKind.StringBuilder | TyKind.Template | TyKind.FfiScope | TyKind.Raw => { return [tid] }
     }
     for p in parts {
@@ -32989,7 +33127,7 @@ fn tc_debug_unbuilt_in(tid0: Int, top: Bool) -> Option[Str] {
         TyKind.Int | TyKind.Float | TyKind.Bool | TyKind.Str | TyKind.Char | TyKind.Bytes => None
         TyKind.I8 | TyKind.I16 | TyKind.I32 | TyKind.U8 | TyKind.U16 | TyKind.U32 | TyKind.U64 => None
         TyKind.Typevar | TyKind.Unknown => None
-        TyKind.Void | TyKind.Fn | TyKind.Iterator | TyKind.Handle | TyKind.Channel | TyKind.Ptr | TyKind.Handler => None
+        TyKind.Void | TyKind.Fn | TyKind.Iterator | TyKind.Handle | TyKind.Channel | TyKind.Ptr | TyKind.Handler | TyKind.Effect => None
         TyKind.StringBuilder | TyKind.Template | TyKind.FfiScope | TyKind.Raw => None
     }
 }
@@ -46043,6 +46181,8 @@ fn type_to_str(tid0: Int) -> Str {
         // it directly instead of recursing. The slot holds the declared name, and a report
         // spells it the way the module under check writes it (`Handler[lib.Log]`).
         TyKind.Handler => return "Handler[{tc_effect_spelling_in(name, nr_current_module)}]"
+        // Spelled as the Handler arm spells its effect: the declared name, as this module writes it.
+        TyKind.Effect => return tc_effect_context_spelling(name, nr_current_module)
         TyKind.Channel => return "Channel[{type_to_str(t.inner1)}]"
         TyKind.Ptr => {
             if type_kind(tc_resolve(t.inner1)) == TyKind.Void { return "Ptr[Void]" }
@@ -46212,6 +46352,7 @@ pub fn tc_tid_child_count(tid: Int) -> Int {
         TyKind.Bytes => 0
         TyKind.StringBuilder => 0
         TyKind.Typevar => 0
+        TyKind.Effect => 0
         TyKind.Unknown => 0
         // Channel/Handle/Iterator carry one inner each (element / result / element). Iterator is
         // the sealed opaque carrier of §3c.1:38, produced only by `.into_iter()` and the lazy
@@ -46285,6 +46426,7 @@ pub fn tc_tid_child(tid: Int, i: Int) -> Int {
         TyKind.Bytes => -1
         TyKind.StringBuilder => -1
         TyKind.Typevar => -1
+        TyKind.Effect => -1
         TyKind.Unknown => -1
         TyKind.Iterator => if i == 0 { t.inner1 } else { -1 }
         TyKind.Range => if i == 0 { t.inner1 } else { -1 }
@@ -46502,7 +46644,7 @@ fn tc_tid_same_type_at(a0: Int, b0: Int, open: Bool, holes: Map[Int, Int]) -> Bo
     // A match with no wildcard: a kind added to TyKind does not compile until it says whether
     // its name is part of its identity.
     let names_agree = match ta.kind {
-        TyKind.Struct | TyKind.Enum | TyKind.Typevar => ta.name == tb.name
+        TyKind.Struct | TyKind.Enum | TyKind.Typevar | TyKind.Effect => ta.name == tb.name
         TyKind.Handler => tc_handler_effects_agree(ta.name, tb.name)
         // The name is a spelling of the kind or of its children, which the slots below compare.
         TyKind.Int | TyKind.Bool | TyKind.Float | TyKind.Str | TyKind.Void | TyKind.Bytes | TyKind.StringBuilder | TyKind.FfiScope | TyKind.Char | TyKind.Never => true
@@ -47235,23 +47377,10 @@ fn tc_binder_source(binder: Int) -> Int {
     b
 }
 
-// True when a typevar with no binder is the context an effect name stands for in `Template[..]`,
-// under any spelling: `Rd`, a sub-effect `Rd.Read`, or a module's `lib.Log`. It is one fixed
-// type, not a parameter. tc_typevar_is_effect_context leaves the dotted spellings out because
-// inference must tell them apart; this test only asks whether one is a context at all, and
-// stands in until an effect has identity by its declaration.
-fn tc_typevar_names_effect_context(tv: Int) -> Bool {
-    if tc_typevar_is_effect_context(tv) { return true }
-    let name = tc_tid_name(tv)
-    let parts = name.split(".")
-    if parts.len() < 2 { return false }
-    tc_is_undotted_effect_name(parts.get(0).unwrap()) || tc_is_undotted_effect_name(parts.get(parts.len() - 1).unwrap())
-}
-
 // Whether the typevar `tv` is in scope at node `n`.
 fn tc_typevar_in_scope(sc: TcTypeScope, tv: Int, n: Int) -> Bool {
     let b = tc_binder_source(tc_tid_binder(tv))
-    if b == NO_BINDER_NODE { return tc_typevar_names_effect_context(tv) }
+    if b == NO_BINDER_NODE { return false }
     if b == SELF_BINDER_NODE {
         // `Self` is a parameter of the trait that names it, and of nothing else.
         let mut s = tc_scope_up(sc, n)

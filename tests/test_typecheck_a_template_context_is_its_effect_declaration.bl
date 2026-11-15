@@ -1,0 +1,126 @@
+// An effect name in `Template[C]` denotes that effect's type (sections/03b_contracts.md §3b.5
+// "The Context Parameter C"). Two contexts are the same only when they name the same
+// declaration: `Template[Shell]` is not `Template[DB]`, one context parameter cannot take both,
+// and a module qualifier or a selective alias names the declared effect.
+
+import std.fs
+import std.process.{ProcessResult}
+import compiler.{compile_to_program, check_unused_imports}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_reset}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+
+fn sh(cmd: Str) -> ProcessResult ! Process.Spawn {
+    process.run("sh", ["-c", cmd]).unwrap()
+}
+
+let LIB: Str = "pub effect Log \{ }\n\npub effect Q \{ }\n\neffect Secret \{ }\n\npub fn cnt(t: Template[Log]) -> Int \{ t.count() }\n"
+
+// Only src/main.bl's reports, and only errors, internal errors and unused imports, so a row
+// reads as the one diagnostic it pins. Each is "code name line:col: message".
+fn main_reports(main_src: Str) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Process.Spawn, Env.Exit, Env.Read, IO {
+    init_embedded_stdlib()
+    let dir = sh("mktemp -d /tmp/blink_template_context.XXXXXX").out.trim()
+    let _ = sh("mkdir -p {dir}/src")
+    fs.write("{dir}/blink.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\n").unwrap()
+    fs.write("{dir}/src/lib.bl", LIB).unwrap()
+    let main_path = "{dir}/src/main.bl"
+    fs.write(main_path, main_src).unwrap()
+    diag_reset()
+    let program = compile_to_program(main_path, 1)
+    check_types(program)
+    check_unused_imports()
+    let mut out = ""
+    for d in diag_entries {
+        if d.file == main_path && (d.severity == "error" || d.severity == "ice" || d.name == "UnusedImport") {
+            out = out.concat("{d.code} {d.name} {d.line}:{d.col}: {d.message}\n")
+        }
+    }
+    let _ = sh("rm -rf {dir}")
+    out
+}
+
+test "a template of one effect context passed where another is expected is a type error" {
+    let got = main_reports("effect DB \{ }\neffect Shell \{ }\n\nfn sink(t: Template[DB]) -> Int \{ t.count() }\n\nfn cross(t: Template[Shell]) -> Int \{ sink(t) }\n\nfn main() \{ }\n")
+    assert_eq(got, "E0300 TypeError 6:44: argument 1 of `sink` expects Template[DB], got Template[Shell]\n")
+}
+
+test "one context parameter given two effect contexts is a type error at the second" {
+    let got = main_reports("effect DB \{ }\neffect Shell \{ }\n\nfn both[C](a: Template[C], b: Template[C]) -> Int \{ a.count() + b.count() }\n\nfn run(x: Template[DB], y: Template[Shell]) -> Int \{ both(x, y) }\n\nfn main() \{ }\n")
+    assert_eq(got, "E0300 TypeError 6:62: argument 2 of `both` expects Template[DB], got Template[Shell]\n")
+}
+
+test "a template that one use sets to a context is a type error at a use of another" {
+    let got = main_reports("effect DB \{ }\neffect Shell \{ }\n\nfn ident[C](t: Template[C]) -> Template[C] \{ t }\n\nfn take(t: Template[DB]) -> Int \{ t.count() }\n\nfn shell(t: Template[Shell]) -> Int \{ t.count() }\n\nfn main() \{\n    let t = ident(\"a \{1}\")\n    let n = take(t) + shell(t)\n    let _ = n\n}\n")
+    assert_eq(got, "E0300 TypeError 12:29: argument 1 of `shell` expects Template[Shell], got Template[DB]\n")
+}
+
+test "a context named through the module qualifier is the declared effect" {
+    let got = main_reports("import lib\n\nfn take(t: Template[lib.Log]) -> Int \{ lib.cnt(t) }\n\nfn main() \{ }\n")
+    assert_eq(got, "")
+}
+
+test "an import used only in a Template context is used" {
+    let got = main_reports("import lib\n\nfn take(t: Template[lib.Q]) -> Int \{ t.count() }\n\nfn main() \{ }\n")
+    assert_eq(got, "")
+}
+
+test "a context named by a selective import alias is the declared effect" {
+    let got = main_reports("import lib\nimport lib.\{Log as L}\n\nfn q(t: Template[lib.Log]) -> Template[lib.Log] \{ t }\n\nfn main() \{\n    let t = q(\"x \{1}\")\n    let u: Template[L] = t\n    let _ = lib.cnt(u)\n}\n")
+    assert_eq(got, "")
+}
+
+test "a context named through the qualifier is not another module's effect of a different name" {
+    let got = main_reports("import lib\n\nfn take(t: Template[lib.Q]) -> Int \{ lib.cnt(t) }\n\nfn main() \{ }\n")
+    assert_eq(got, "E0300 TypeError 3:46: argument 1 of `lib.cnt` expects Template[lib.Log], got Template[lib.Q]\n")
+}
+
+test "a context that names no declaration is UnknownType" {
+    let got = main_reports("fn take(t: Template[Usr]) -> Int \{ t.count() }\n\nfn main() \{ }\n")
+    assert_eq(got, "E0507 UnknownType 1:24: unknown type `Usr`\n")
+}
+
+test "a context that names a sub-effect the effect does not declare is UnknownType" {
+    let got = main_reports("fn take(t: Template[IO.Bogus]) -> Int \{ t.count() }\n\nfn main() \{ }\n")
+    assert_eq(got, "E0507 UnknownType 1:29: unknown type `IO.Bogus`: `IO` has no sub-effect `Bogus`\n")
+}
+
+test "a private effect named through the module qualifier stays a context" {
+    let got = main_reports("import lib\n\nfn take(t: Template[lib.Secret]) -> Int \{ t.count() }\n\nfn main() \{ }\n")
+    assert_eq(got, "")
+}
+
+test "a context named through the qualifier is that module's effect when the file declares one of that name" {
+    let got = main_reports("import lib\n\neffect Log \{ }\n\nfn theirs(t: Template[lib.Log]) -> Int \{ lib.cnt(t) }\n\nfn main() \{ }\n")
+    assert_eq(got, "")
+}
+
+test "a selective alias names the other module's effect when the file declares one of that name" {
+    let got = main_reports("import lib\nimport lib.\{Log as L}\n\neffect Log \{ }\n\nfn a(t: Template[L]) -> Int \{ lib.cnt(t) }\n\nfn main() \{ }\n")
+    assert_eq(got, "")
+}
+
+test "a context named by the file's own effect is not another module's effect of that name" {
+    let got = main_reports("import lib\n\neffect Log \{ }\n\nfn mine(t: Template[Log]) -> Template[Log] \{ t }\n\nfn main() \{\n    let t = mine(\"x \{1}\")\n    let _ = lib.cnt(t)\n}\n")
+    assert_eq(got, "E0300 TypeError 9:21: argument 1 of `lib.cnt` expects Template[lib.Log], got Template[Log]\n")
+}
+
+test "a bare context that names another module's effect with no import of it is UnknownType" {
+    let got = main_reports("import lib\n\nfn take(t: Template[Q]) -> Int \{ t.count() }\n\nfn main() \{\n    let _ = lib.cnt(\"a\")\n}\n")
+    assert_eq(got, "E0507 UnknownType 3:22: unknown type `Q`\n")
+}
+
+test "a bare context that names another module's private effect is UnknownType" {
+    let got = main_reports("import lib\n\nfn take(t: Template[Secret]) -> Int \{ t.count() }\n\nfn main() \{\n    let _ = lib.cnt(\"a\")\n}\n")
+    assert_eq(got, "E0507 UnknownType 3:27: unknown type `Secret`\n")
+}
+
+test "a sub-effect of the file's own effect is SubEffectAsType when another module declares that name too" {
+    let got = main_reports("import lib\n\neffect Log \{\n    effect W \{ }\n}\n\nfn take(t: Template[Log.W]) -> Int \{ t.count() }\n\nfn main() \{\n    let _ = lib.cnt(\"a\")\n}\n")
+    assert_eq(got, "E0536 SubEffectAsType 7:21: `Log.W` is a sub-effect, which gives no type\n")
+}
+
+test "an operation's own template context names the effect it is declared in" {
+    let got = main_reports("pub effect Tpl \{\n    effect Go \{\n        fn run(t: Template[Tpl]) -> Int\n    }\n}\n\nfn use_it() -> Int ! Tpl \{\n    tpl.run(\"x \{1}\")\n}\n\nfn main() \{\n    let n = with handler Tpl \{\n        fn run(t: Template[Tpl]) -> Int \{ t.count() }\n    } \{\n        use_it()\n    }\n    io.println(\"\{n}\")\n}\n")
+    assert_eq(got, "")
+}
