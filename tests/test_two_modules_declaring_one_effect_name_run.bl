@@ -1,0 +1,183 @@
+// Two modules may each declare an effect of one name. Each declaration is its own effect: it
+// keeps its own operations, their signatures and default bodies, and its own handler slot.
+// A handle use reads among the effects available at the site (sections/04 §4.4), so a file's
+// own `Note` and an imported `zzsn_lib.Note` never stand in for each other.
+
+import std.process.{ProcessResult}
+
+fn run_fixture(cmd: Str, name: Str, flags: List[Str]) -> ProcessResult ! Process.Spawn {
+    let mut args = [cmd]
+    for f in flags { args.push(f) }
+    args.push("tests/zzsn_shared_effect_name/src/{name}.bl")
+    process.run("build/blink", args).unwrap()
+}
+
+fn assert_prints_with(name: Str, flags: List[Str], want: Str) ! IO.Print, Process.Spawn {
+    let r = run_fixture("run", name, flags)
+    if r.out != want { io.println("FAIL[{name}] want '{want}', got: {r.out}{r.err_out}") }
+    assert(r.success())
+    assert_eq(r.out, want)
+}
+
+// A one-unit build and a per-module build each keep the two effects apart.
+fn assert_prints_both(name: Str, want: Str) ! IO.Print, Process.Spawn {
+    assert_prints_with(name, [], want)
+    assert_prints_with(name, ["--no-per-module"], want)
+}
+
+test "a file's own effect keeps its own operation signatures beside a module's effect of one name" {
+    assert_prints_both("main_own_effect_differs_from_lib", "6 m!\n")
+}
+
+test "a file's own effect with the same operations as a module's effect has its own handler slot" {
+    assert_prints_both("main_own_effect_same_ops_as_lib", "6 20\n")
+}
+
+test "two imported modules' effects of one name are each handled through their qualifier" {
+    assert_prints_both("main_two_libs_one_effect_name", "6 70\n")
+}
+
+test "a default operation body runs the body its own effect declares" {
+    assert_prints_both("main_derived_op_runs_its_own_body", "3 110\n")
+}
+
+test "a row may hold two effects with one handle when no handle use reads it" {
+    assert_prints_both("main_row_holds_both_notes_with_no_handle_use", "76\n")
+}
+
+test "a sub-effect of a shared effect name is the sub-effect of the declaration it names" {
+    assert_prints_both("main_sub_effect_of_a_shared_name", "3 o?\n")
+}
+
+test "default in a handler reaches the outer handler of its own effect" {
+    assert_prints_both("main_default_reaches_the_outer_handler_of_its_own_effect", "12 <m!>\n")
+}
+
+fn check_text(name: Str) -> Str ! Process.Spawn {
+    let r = run_fixture("check", name, [])
+    "{r.out}{r.err_out}"
+}
+
+// A built-in effect name is reserved in every module (sections/04 §4.3), so a file's own
+// `effect DB` is an error at its name and std's `DB` keeps the bare name.
+// `Arena` is built in but not reserved (§5.2), so a file's own `effect Arena` takes the bare
+// name, beside a module's `Arena` and the built-in.
+test "a file's own effect Arena beside a module's Arena is the file's own" {
+    assert_prints_both("main_own_arena_beside_a_library_arena", "41 7\n")
+}
+
+test "a file's own effect named like a built-in effect is ReservedEffectName" {
+    let text = check_text("main_own_db_beside_std_db")
+    if !text.contains("ReservedEffectName") { io.println("FAIL want ReservedEffectName, got: {text}") }
+    assert(text.contains("error[ReservedEffectName]: effect `DB` is a built-in effect name"))
+    assert(text.contains("main_own_db_beside_std_db.bl:3:8"))
+    assert_eq(text.split("error[ReservedEffectName]").len(), 2)
+    assert(!text.contains("internal compiler error"))
+}
+
+// The library's `! DB` is the built-in effect whatever the importing file declares.
+test "a library's DB row beside a file's own effect DB reports only the file's declaration" {
+    let text = check_text("main_own_db_beside_a_library_db")
+    if !text.contains("ReservedEffectName") { io.println("FAIL want ReservedEffectName, got: {text}") }
+    assert(text.contains("error[ReservedEffectName]: effect `DB` is a built-in effect name"))
+    assert(text.contains("main_own_db_beside_a_library_db.bl:3:8"))
+    assert(text.contains("1 error(s) found"))
+    assert(!text.contains("UnknownEffect"))
+    assert(!text.contains("zzsn_dbuser.bl"))
+}
+
+// An effect event names its effect with the module and the sub-effect, and the filter matches
+// that name; a handler frame spells the effect path as declared (sections/06 §8.15.8).
+test "a trace names a shared effect with its module and sub-effect" {
+    for flags in [["--trace=effect:zzsn_lib.Note.Put"], ["--no-per-module", "--trace=effect:zzsn_lib.Note.Put"]] {
+        let r = run_fixture("run", "main_traces_a_shared_effect_path", flags)
+        if r.err_out.split("\"effect\":\"zzsn_lib.Note.Put\"").len() != 4 { io.println("FAIL want three zzsn_lib.Note.Put events, got: {r.err_out}") }
+        assert(r.success())
+        assert_eq(r.out, "3 70\n")
+        assert_eq(r.err_out.split("\"effect\":\"zzsn_lib.Note.Put\"").len(), 4)
+        assert(r.err_out.contains("\"fn\":\"zzsn_lib.Note.Put.twice\""))
+        assert(!r.err_out.contains("zzsn_twin"))
+        assert(!r.err_out.contains("@zzsn"))
+    }
+    let all = run_fixture("run", "main_traces_a_shared_effect_path", ["--trace"])
+    assert(all.err_out.contains("\"fn\":\"main_traces_a_shared_effect_path.main.handler@5:18.Note.Put.put\""))
+    assert(all.err_out.contains("\"fn\":\"main_traces_a_shared_effect_path.main.handler@10:18.Note.Put.put\""))
+    assert(all.err_out.contains("\"effect\":\"zzsn_twin.Note.Put\""))
+    assert(!all.err_out.contains("@zzsn"))
+}
+
+// A diagnostic names an effect the way the file that reads it spells it.
+test "an unknown operation names a shared effect the way the file spells it" {
+    let text = check_text("main_unknown_op_names_the_effect_as_written")
+    if !text.contains("UnresolvedMethod") { io.println("FAIL want UnresolvedMethod, got: {text}") }
+    assert(text.contains("error[UnresolvedMethod]: `nope` is not an operation of effect `zzsn_lib.Note`"))
+    assert(text.contains("main_unknown_op_names_the_effect_as_written.bl:10:5"))
+    assert(text.contains("`zzsn_lib.Note` operations are `put`, `twice`"))
+    assert(!text.contains("Note@"))
+}
+
+test "a handle_all warning names a module's effect the way the file spells it" {
+    let text = check_text("main_handle_all_of_a_module_effect")
+    if !text.contains("PartialHandler") { io.println("FAIL want PartialHandler, got: {text}") }
+    assert_eq(text.split("warning[PartialHandler]").len(), 2)
+    assert(text.contains("warning[PartialHandler]: handler for `zzsn_mark_all.Mark` does not implement `coin`"))
+    assert(text.contains("`zzsn_mark_all.Mark` is marked `@handle_all`"))
+    assert(!text.contains("Mark@"))
+}
+
+// A use that two effects answer has no one operation to check against, so the collision is
+// the one error: the argument is not also checked against either declaration's `put`.
+test "a handle collision is the only error at its use" {
+    let text = check_text("main_collision_is_the_only_error")
+    if !text.contains("EffectHandleCollision") { io.println("FAIL want EffectHandleCollision, got: {text}") }
+    assert(text.contains("error[EffectHandleCollision]: the handle `note` names more than one available effect"))
+    assert(text.contains("1 error(s) found"))
+    assert(!text.contains("TypeMismatch"))
+}
+
+test "a handle use where the row holds two effects with that handle is EffectHandleCollision" {
+    let text = check_text("main_one_row_holds_both_notes")
+    if !text.contains("EffectHandleCollision") { io.println("FAIL want EffectHandleCollision, got: {text}") }
+    assert(text.contains("error[EffectHandleCollision]: the handle `note` names more than one available effect"))
+    assert(text.contains("main_one_row_holds_both_notes.bl:4:"))
+    assert(text.contains("`zzsn_lib.Note` and `zzsn_twin.Note` both have the handle `note`"))
+    assert(text.contains("`zzsn_lib.Note` is declared here"))
+    assert(text.contains("zzsn_lib.bl:1:"))
+    assert(text.contains("`zzsn_twin.Note` is declared here"))
+    assert(text.contains("zzsn_twin.bl:1:"))
+    assert(!text.contains("UnknownEffect"))
+    assert(!text.contains("internal compiler error"))
+}
+
+// A whole import binds only its qualifier (§10.5), so a bare name two such modules declare
+// binds no effect here: neither declaration stands in for it.
+test "a bare effect name that two whole-imported modules declare is UnknownEffect" {
+    let r = run_fixture("check", "main_bare_name_through_two_whole_imports", [])
+    let text = "{r.out}{r.err_out}"
+    if !text.contains("UnknownEffect") { io.println("FAIL want UnknownEffect, got: {text}") }
+    assert(!r.success())
+    assert(text.contains("error[UnknownEffect]: unknown effect `Note`"))
+    assert(text.contains("main_bare_name_through_two_whole_imports.bl:4:24"))
+    assert(!text.contains("did you mean"))
+    assert(!text.contains("internal compiler error"))
+}
+
+test "a handle use where a with adds a second effect with that handle is EffectHandleCollision" {
+    let text = check_text("main_a_with_adds_the_other_note")
+    if !text.contains("EffectHandleCollision") { io.println("FAIL want EffectHandleCollision, got: {text}") }
+    assert(text.contains("error[EffectHandleCollision]: the handle `note` names more than one available effect"))
+    assert(text.contains("main_a_with_adds_the_other_note.bl:8:"))
+    assert(!text.contains("UndeclaredEffect"))
+    assert(!text.contains("internal compiler error"))
+}
+
+// Only the file's own `Mark` is @handle_all, so only its handler that omits `coin` warns.
+test "a handle_all mark warns only for handlers of the effect that carries it" {
+    let r = run_fixture("check", "main_handle_all_follows_its_own_effect", [])
+    let text = "{r.out}{r.err_out}"
+    if text.split("PartialHandler").len() != 2 { io.println("FAIL want one PartialHandler, got: {text}") }
+    assert_eq(text.split("warning[PartialHandler]").len(), 2)
+    assert(text.contains("main_handle_all_follows_its_own_effect.bl:19:"))
+    assert(!text.contains("internal compiler error"))
+    assert_prints_both("main_handle_all_follows_its_own_effect", "2 6\n")
+}

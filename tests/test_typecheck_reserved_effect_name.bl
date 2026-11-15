@@ -1,0 +1,81 @@
+// A top-level effect may not take the name of a built-in effect, and the compare is on the
+// lowercase form, because the handle is the lowercase form of the name (sections/04_effects.md
+// §4.3). A sub-effect and a type may take such a name. Arena is built in but not reserved
+// (§5.2), so a file may declare an effect Arena, and its bare name is the file's own.
+import lower_test_helpers.{probe_but, probe}
+import diagnostics.{diag_entries}
+import compile_test_helpers
+
+fn rows(stem: Str, source: Str) -> List[Str] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Env.Exit, Env.Read, FS.Read, FS.Write, IO, Env.Write, Process.Spawn {
+    let program = probe_but(stem, source, "ReservedEffectName")
+    assert(program >= 0)
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity != "error" { continue }
+        out.push("{d.name} {d.code} {d.line}:{d.col}: {d.message}")
+    }
+    out
+}
+
+test "an effect with a built-in effect's name is E0559 at its name" {
+    let got = rows("reserved_exact", #"effect Time {
+    effect Now { fn now() -> Int }
+}
+fn main() {}
+"#)
+    assert_eq(got, ["ReservedEffectName E0559 1:8: effect `Time` is a built-in effect name"])
+}
+
+test "an effect whose lowercase name is a built-in handle is E0559 that names the handle" {
+    let got = rows("reserved_case", #"effect Io {
+    effect Say { fn say(msg: Str) }
+}
+effect TIME {
+    effect Now { fn now() -> Int }
+}
+fn main() {}
+"#)
+    assert_eq(got, [
+        "ReservedEffectName E0559 1:8: the handle `io` is reserved for the built-in effect `IO`",
+        "ReservedEffectName E0559 4:8: the handle `time` is reserved for the built-in effect `Time`",
+    ])
+}
+
+// The declaration is dropped, so `io` stays the built-in handle and `io.println` checks.
+test "a rejected effect leaves its handle to the built-in" {
+    let got = rows("reserved_handle_stays", #"import std.io
+
+effect Io {
+    effect Say { fn say(msg: Str) }
+}
+fn main() {
+    io.println("x")
+}
+"#)
+    assert_eq(got, ["ReservedEffectName E0559 3:8: the handle `io` is reserved for the built-in effect `IO`"])
+}
+
+test "a sub-effect, a type and Arena may take a built-in effect name" {
+    let program = probe("reserved_free", #"effect Clock {
+    effect Time { fn now() -> Int }
+}
+effect Arena {
+    effect Grow { fn grow() -> Int }
+}
+type Fs { t: Int }
+fn stamp() -> Int ! Clock.Time { clock.now() }
+fn more() -> Int ! Arena.Grow { arena.grow() }
+fn main() {}
+"#)
+    assert(program >= 0)
+}
+
+test "E0559 has a help to rename and a help to replace the built-in in a test" {
+    let out = compile_test_helpers.compile_and_capture(#"effect Time {
+    effect Now { fn now() -> Int }
+}
+fn main() {}
+"#, "reserved_helps")
+    compile_test_helpers.expect_contains(out, "\"help\":\"rename the effect; its handle is the lowercase form of its name\\nto replace `Time` in a test, write `handler Time", "two helps")
+    compile_test_helpers.expect_contains(out, "\"notes\":[\"the reserved handles are fs, net, db, io", "handles note")
+}
