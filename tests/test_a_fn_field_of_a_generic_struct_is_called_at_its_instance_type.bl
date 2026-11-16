@@ -1,0 +1,125 @@
+// sections/03_types.md §3.3 and §3.4: a field of a generic struct has its declared type with
+// the struct's type parameters replaced by the arguments of the instance the receiver has.
+// A fn-typed field is called with the field-call form `(h.f)(x)` (§3c.4), so its parameter
+// and result types are the field's types at that instance, as they are for
+// `let g = h.f; g(x)`. Each program must check clean, then build and run and print the
+// expected text. An argument that does not fit the instance's parameter type is an error at
+// check, and the dot form `h.f(x)` is a method call that no method answers.
+
+import compile_test_helpers.{compile_and_run, expect_compile_error}
+
+fn expect_runs(tag: Str, src: Str, want: Str) ! IO, FS.Delete, FS.Write, Process.Spawn, FS.Read, Env.Read {
+    let r = compile_and_run(src, "_fn_field_instance_{tag}")
+    if r.exit_code != 0 || r.out != want { io.println("FAIL {tag}: exit {r.exit_code}\n{r.out}{r.err_out}") }
+    assert(r.exit_code == 0)
+    assert_eq(r.out, want)
+}
+
+test "a fn field whose result names no type parameter is called at a concrete instance" {
+    expect_runs("result_closed", #"type Holder[T] { v: T, f: fn(T) -> Int }
+fn main() {
+    let h = Holder { v: "abcd", f: fn(s: Str) -> Int { s.len() } }
+    io.println("{(h.f)(h.v)}")
+}
+"#, "4\n")
+}
+
+test "a fn field whose result is the type parameter is called at a concrete instance" {
+    expect_runs("result_param", #"type Box[T] { f: fn(T) -> T }
+fn main() {
+    let b = Box { f: fn(x: Int) -> Int { x + 1 } }
+    let y: Int = (b.f)(1)
+    io.println("{y}")
+    io.println("{(b.f)(5)}")
+}
+"#, "2\n6\n")
+}
+
+test "a fn field whose result holds the type parameter in a container" {
+    expect_runs("result_list", #"type Holder[T] { f: fn(T) -> List[T] }
+fn main() {
+    let h = Holder { f: fn(x: Int) -> List[Int] { [x, x, x] } }
+    io.println("{(h.f)(2).len()}")
+}
+"#, "3\n")
+}
+
+test "a fn field with two type parameters is called at a concrete instance" {
+    expect_runs("two_params", #"type Pair[A, B] { f: fn(A) -> B, g: fn(B) -> A }
+fn main() {
+    let p = Pair { f: fn(x: Int) -> Str { "n{x}" }, g: fn(s: Str) -> Int { s.len() } }
+    io.println((p.f)((p.g)("abc")))
+}
+"#, "n3\n")
+}
+
+test "a fn field is called inside a generic body at each instance of the body" {
+    expect_runs("generic_body", #"type Holder[U] { f: fn(Int) -> U }
+fn run[U](h: Holder[U]) -> U { (h.f)(1) }
+fn s(x: Int) -> Str { "s{x}" }
+fn n(x: Int) -> Int { x + 40 }
+fn main() {
+    io.println(run(Holder { f: s }))
+    io.println("{run(Holder { f: n })}")
+}
+"#, "s1\n41\n")
+}
+
+test "a fn field of a generic struct held in a field of another is called" {
+    expect_runs("nested_field", #"type Inner[T] { f: fn(T) -> T }
+type Outer[T] { i: Inner[T] }
+fn main() {
+    let o = Outer { i: Inner { f: fn(x: Int) -> Int { x * 2 } } }
+    io.println("{(o.i.f)(4)}")
+}
+"#, "8\n")
+}
+
+test "a nested fn field is called inside a generic body" {
+    expect_runs("nested_generic_body", #"type Inner[T] { f: fn(T) -> T }
+type Outer[T] { i: Inner[T] }
+fn run[T](o: Outer[T], x: T) -> T { (o.i.f)(x) }
+fn main() {
+    let o = Outer { i: Inner { f: fn(s: Str) -> Str { s.concat("!") } } }
+    io.println(run(o, "hi"))
+}
+"#, "hi!\n")
+}
+
+test "a fn field is called on a receiver that a call returns" {
+    expect_runs("call_receiver", #"type Holder[T] { f: fn(T) -> T }
+fn main() {
+    let o = Some(Holder { f: fn(x: Int) -> Int { x - 1 } })
+    io.println("{(o.unwrap().f)(10)}")
+}
+"#, "9\n")
+}
+
+test "a fn field called with the field-call form and read as a value give one answer" {
+    expect_runs("value_and_call", #"type Holder[T] { v: T, f: fn(T) -> T }
+fn main() {
+    let h = Holder { v: 3, f: fn(x: Int) -> Int { x * 5 } }
+    let g = h.f
+    io.println("{(h.f)(h.v)} {g(h.v)}")
+}
+"#, "15 15\n")
+}
+
+test "an argument that does not fit the instance's parameter type is an error at check" {
+    expect_compile_error(#"type Holder[T] { f: fn(T) -> T }
+fn main() {
+    let h = Holder { f: fn(x: Int) -> Int { x + 1 } }
+    let s = (h.f)("x")
+    io.println("{s}")
+}
+"#, "fn_field_wrong_arg", "E0300")
+}
+
+test "a fn field of a generic struct called with the dot form is an unresolved method" {
+    expect_compile_error(#"type Holder[T] { f: fn(T) -> T }
+fn main() {
+    let h = Holder { f: fn(x: Int) -> Int { x + 1 } }
+    io.println("{h.f(1)}")
+}
+"#, "fn_field_dot_form", "E0505")
+}

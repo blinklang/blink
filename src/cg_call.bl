@@ -4042,7 +4042,6 @@ fn cc_impl_method_call(node: Int, obj: Int, recv_tid: Int, kind: TyKind, mname: 
         if kind == TyKind.Struct && cc_is_instant_runtime_method(recv_tid, mname) {
             return cc_instant_runtime_method(node, obj, mname)
         }
-        if cc_is_closure_field(recv_tid, mname) { return cc_field_closure_call(node, obj, recv_tid, mname) }
         return cc_method_not_built(node, kind, mname)
     }
     let method = cc_method_of(im, node_method(node))
@@ -4360,70 +4359,6 @@ fn cc_instant_runtime_method(node: Int, obj: Int, mname: Str) -> Int ! Diag.Repo
     let dur_rec = cc_local(dur_tid, node)
     if cc_stopped(dur_rec) { return -1 }
     ir_call_runtime(dur_tid, node, dur_rec.c_spelling, c_runtime_helper("Instant_elapsed"), dur_rec.slot_form, [receiver])
-}
-
-// `route.callback(req)`, `srv.error_handler.on_error(req, msg)`: a struct field whose
-// declared type is `fn(...) -> T`, invoked like a method. The shape is recognised the same
-// way typecheck recognises it (src/typecheck.bl:16958-16988): a struct field of that exact
-// name whose own tid is TyKind.Fn. Guarded on TyKind.Struct because an enum has variants,
-// not fields.
-fn cc_is_closure_field(recv_tid: Int, mname: Str) -> Bool {
-    if cc_kind(recv_tid) != TyKind.Struct { return false }
-    let fld_tid = get_struct_field_tid(recv_tid, mname)
-    fld_tid != -1 && cc_kind(fld_tid) == TyKind.Fn
-}
-
-// The field is read as a place (cc_field, the same layout rule lower_struct_field in
-// cg_expr.bl reads a value field by), then called through the C function-pointer type its
-// Fn tid spells, the same way cc_closure_call reaches a closure named by an expression:
-// this call has no such expression, only a receiver and a field name, so the field read is
-// built here instead of handed to it.
-fn cc_field_closure_call(node: Int, obj: Int, recv_tid: Int, mname: Str) -> Int ! Diag.Report {
-    let field_tid = get_struct_field_tid(recv_tid, mname)
-    if field_tid < 0 { return cc_method_not_built(node, TyKind.Struct, mname) }
-    let tid = tid_of_node(node)
-    if tid < 0 { return -1 }
-    let rec = cc_local(tid, node)
-    if cc_stopped(rec) { return -1 }
-    let fn_type = fn_pointer_spelling_of(field_tid, node)
-    if fn_type == "" { return -1 }
-    let frec = cc_field(recv_tid, field_tid, node)
-    if cc_stopped(frec) { return -1 }
-    let target = lower_expr(obj)
-    if target < 0 { return -1 }
-    let closure = ir_field_get(field_tid, node, frec.c_spelling, c_field_name(recv_tid, mname), frec.slot_form, target)
-    let mut operands = [closure]
-    let mut ends = [cg_expr_pending_count()]
-    let written = node_args(node)
-    let mut i = 0
-    while i < sublist_length(written) {
-        let a = lower_expr_as_value(sublist_get(written, i))
-        if a < 0 { return -1 }
-        operands.push(a)
-        ends.push(cg_expr_pending_count())
-        i = i + 1
-    }
-    let held = cg_expr_sequence(operands, ends, false)
-    let mut args: List[Int] = []
-    let mut k = 1
-    while k < held.len() {
-        args.push(held.get(k).unwrap())
-        k = k + 1
-    }
-    ir_call_closure(tid, node, rec.c_spelling, fn_type, rec.slot_form, held.get(0).unwrap(), args)
-}
-
-// A field read takes the owner's stored form: a field whose type reaches its own owner by
-// value is held as a boxed word, which the field's own Local layout does not say. Mirrors
-// cg_expr.bl's x_field, which this stage cannot call (it is private to that file).
-fn cc_field(owner_tid: Int, field_tid: Int, node: Int) -> LayoutRecord ! Diag.Report {
-    let rec = field_layout_of(owner_tid, field_tid)
-    let why = "struct field has no C layout: {rec.decline_reason}"
-    if rec.decline_reason != "" {
-        diag_ice_at("UnspellableFieldType", UNSOLVED_TYPEVAR_AT_CODEGEN, why, node,
-            "monomorphisation must resolve every type codegen reads; this is a compiler bug")
-    }
-    rec
 }
 
 // ── Intrinsic methods ─────────────────────────────────────────────────────

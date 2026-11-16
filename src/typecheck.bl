@@ -1491,10 +1491,6 @@ fn tc_method_resolvable_on_type(obj_k: TyKind, tname: Str, method: Str) -> Int {
     // (c') str-backed enum intrinsics (to_str/from_str) are synthesized in
     //      codegen (codegen_stmt.bl:5983) and not modeled here → fail-open.
     if obj_k == TyKind.Enum && (method == "to_str" || method == "from_str") { return 1 }
-    // (d) closure-typed struct field invoked like a method. Closure fields lower
-    //     to TyKind.Typevar("Fn"), not a closure kind, so reuse the callable-field
-    //     name registry (the same signal that keeps the method flush from reporting it).
-    if obj_k == TyKind.Struct && is_callable_field_name(method) != 0 { return 1 }
     // (e) trait/stdlib methods whose receiver-type resolution is not modeled at
     //     typecheck: `.into()` (From-trait auto-conversion), stdlib-type methods
     //     like `Instant.to_rfc3339()`, channel ops, etc. This is the SAME name
@@ -16476,11 +16472,6 @@ fn resolve_struct_fields(td: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.
             let is_buf_field = is_ffi_struct != 0 && tc_compiler_known_type_meant(ftype_ann_name, ftype_ann) == "Buf"
             let ftype_id = if is_buf_field { TYPE_UNKNOWN } else { resolve_type_ann(ftype_ann) }
             sfield_pool.push(TcStructField { struct_id: tid, name: fname, type_id: ftype_id })
-            if ftype_ann_name == "Fn" {
-                if is_callable_field_name(fname) == 0 {
-                    nr_callable_field_names.push(fname)
-                }
-            }
             if is_buf_field {
                 diag_error_at("BufOutsideFfiSurface", BUF_OUTSIDE_FFI_SURFACE, "@ffi.struct field `{fname}` names `Buf` — a `Buf` is a `blink_buf_t*`, not the C pointer the field declares", f, "use `Ptr[T]` for a C pointer field")
             } else if is_ffi_struct != 0 {
@@ -20711,7 +20702,6 @@ fn init_types() ! TypeCheck.Register {
     tc_trait_sig_poisoned.clear()
     tc_alias_underlying = Map()
     sfield_pool.clear()
-    nr_callable_field_names.clear()
     evar_pool.clear()
     evar_decl_nodes.clear()
     evar_slots_by_name.clear()
@@ -28638,7 +28628,6 @@ fn tc_infer_receiver(recv: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Di
 // Impl method registry for name resolution
 let mut nr_impl_type_names: List[Str] = []
 let mut nr_impl_method_names: List[Str] = []
-let mut nr_callable_field_names: List[Str] = []
 
 // What one check_types records of method calls for the reports on them.
 type MethodCallFacts {
@@ -28749,15 +28738,6 @@ pub fn tc_unresolved_call_count() -> Int { tc_unclaimed_call_nodes().len() }
 // head of `Handler[DB]`.
 let mut nr_bh_context: Map[Str, Int] = Map()
 
-fn is_callable_field_name(name: Str) -> Int {
-    let mut i = 0
-    while i < nr_callable_field_names.len() {
-        if nr_callable_field_names.get(i).unwrap() == name { return 1 }
-        i = i + 1
-    }
-    0
-}
-
 // The two registry lists are index-parallel: entry i is the pair (type, method). Every push
 // must go through here, or a reader that walks one list and indexes another reads past the end.
 fn nr_register_impl_method(type_name: Str, method: Str) {
@@ -28777,14 +28757,13 @@ fn nr_has_impl_method(type_name: Str, method: Str) -> Int {
 }
 
 // Does this method NAME resolve to nothing anywhere in the program? A name-level fact,
-// so it holds for every receiver: a name no builtin, no impl, no derive and no callable
-// field supplies cannot be supplied by any type either. Phase 1 records the nodes that
+// so it holds for every receiver: a name no builtin, no impl and no derive supplies cannot
+// be supplied by any type either. A field is never a method (sections/03c_protocols.md §3c.4). Phase 1 records the nodes that
 // answer yes; Phase 2 reports the ones with a KNOWN receiver type, and the flush after
 // inference reports the rest.
 fn nr_method_name_unresolvable(method: Str) -> Int {
     if is_builtin_method(method) != 0 { return 0 }
     if is_variant_name(method) != 0 { return 0 }
-    if is_callable_field_name(method) != 0 { return 0 }
     let mut i = 0
     while i < nr_impl_method_names.len() {
         if nr_impl_method_names.get(i).unwrap() == method { return 0 }
@@ -28968,7 +28947,54 @@ fn tc_report_unresolved_method(node: Int, recv: Int, tname: Str, method: Str) ! 
     tc_type_args_unresolved.insert(node, 1)
     let k = type_kind(recv)
     if k == TyKind.Bool && method == "to_int" { return tc_report_bool_to_int(node) }
-    tc_error_naming_types("UnresolvedMethod", UNRESOLVED_METHOD, "unresolved method `.{method}` on type {tc_type_name_shown(tname)}", node, tc_unresolved_method_help(k, tname, method, node), [recv])
+    let field_call = tc_fn_field_call_help(node, recv, method)
+    let help = if field_call != "" { field_call } else { tc_unresolved_method_help(k, tname, method, node) }
+    tc_error_naming_types("UnresolvedMethod", UNRESOLVED_METHOD, "unresolved method `.{method}` on type {tc_type_name_shown(tname)}", node, help, [recv])
+}
+
+// `h.f(x)` on a struct whose field `f` holds a function. Dot means method, so the call never
+// reaches the field (sections/03c_protocols.md §3c.4); the help shows the field call
+// `(h.f)(x)`, or says it in words when the call cannot be read back from one source line.
+// "" when `method` is no fn field of the receiver.
+fn tc_fn_field_call_help(node: Int, recv: Int, method: Str) -> Str {
+    if type_kind(recv) != TyKind.Struct { return "" }
+    let fld = get_struct_field_tid(recv, method)
+    if fld == -1 || type_kind(fld) != TyKind.Fn { return "" }
+    let call = tc_fn_field_call_text(node, method)
+    if call == "" { return "`{method}` is a field, not a method; wrap the field access in parentheses before the call" }
+    "`{method}` is a field, not a method; call the field: `{call}`"
+}
+
+// The written call `r.f(args)` respelled as `(r.f)(args)`, or "" when the call spans more than
+// one line or its text does not end in `.f(...)`. The last `(` at depth 0 opens the argument
+// list, since the call's own `)` ends the text.
+fn tc_fn_field_call_text(node: Int, method: Str) -> Str {
+    if node_kind(node) != NodeKind.MethodCall || node_end_line(node) != node_line(node) { return "" }
+    let text = tc_source_text(diag_file_for_node(node), node_line(node), node_col(node), node_end_line(node), node_end_col(node))
+    if text == "" || !text.ends_with(")") { return "" }
+    let mut depth = 0
+    let mut quoted = false
+    let mut open = -1
+    let mut i = 0
+    while i < text.byte_len() {
+        let c = text.byte_slice(i, i + 1)
+        if quoted {
+            if c == "\\" { i = i + 1 } else if c == "\"" { quoted = false }
+        } else if c == "\"" {
+            quoted = true
+        } else if c == "(" || c == "[" || c == "\{" {
+            if depth == 0 && c == "(" { open = i }
+            depth = depth + 1
+        } else if c == ")" || c == "]" || c == "}" {
+            depth = depth - 1
+            if depth < 0 { return "" }
+        }
+        i = i + 1
+    }
+    let head = ".{method}"
+    if depth != 0 || quoted || open < head.byte_len() + 1 { return "" }
+    if text.byte_slice(open - head.byte_len(), open) != head { return "" }
+    "({text.byte_slice(0, open)}){text.byte_slice(open, text.byte_len())}"
 }
 
 // A member a type path `K.x` can name (§3.4 *An unknown member of a type path*): `kind` is
@@ -31759,7 +31785,7 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                 }
                 mi = mi + 1
             }
-            if found_in_impl == 0 && is_callable_field_name(method_name) == 0 {
+            if found_in_impl == 0 {
                 let mut is_ue_call = 0
                 if obj != -1 && node_kind(obj) == NodeKind.Ident {
                     if is_user_effect_handle_name(node_name(obj)) != 0 {
@@ -36588,7 +36614,10 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                 // callee is a closure value either way.
                 let fa_fn_t = infer_type(callee)
                 if type_kind(fa_fn_t) == TyKind.Fn {
-                    return tc_check_call_against_fn_tid(fa_fn_t, node_args(node), "field", node)
+                    // Name the field: a struct may hold several, and "field" alone does not say which.
+                    let owner_t = tc_lookup_node_tid(node_obj(callee))
+                    let label = if owner_t >= 0 && type_kind(owner_t) == TyKind.Struct { "field `{tc_tid_shown(owner_t)}.{node_name(callee)}`" } else { "field `{node_name(callee)}`" }
+                    return tc_check_call_against_fn_tid(fa_fn_t, node_args(node), label, node)
                 }
                 // Infer args so nested expressions in a module-qualified call
                 // (e.g. io.println(x.m())) are type-checked — otherwise this
@@ -38039,37 +38068,6 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                 // takes when it leaves `cmp` unregistered. An absence: the method's return
                 // type is a type this program does not have.
                 return -1
-            }
-            // A closure-typed struct field invoked like a method —
-            // `route.callback(req)`, `srv.error_handler.on_error(req, msg)`, the
-            // `handler: fn(Request) -> Response` field the spec puts inside `type Route`
-            // (sections/04_effects.md:453). Without an arm for it, the call would fall
-            // through to TYPE_UNKNOWN — and tc_method_resolvable_on_type clause (d)
-            // fail-opens on is_callable_field_name, a GLOBAL name list, so E0505 would stay
-            // silent too. Return type, arity and every argument type are all checked here:
-            // the only callable shape in the language that otherwise would not be.
-            //
-            // Nothing new is inferred here. resolve_type_ann's Fn arm (:2756)
-            // already gives every `fn(A) -> B` annotation a structured TyKind.Fn tid, and
-            // register_struct_type stores it as the field's sf.type_id — so this is the
-            // THIRD dispatch to tc_check_call_against_fn_tid, alongside the closure
-            // VARIABLE (:9012) and the immediately-invoked closure literal (:9086),
-            // against the same kind of tid.
-            //
-            // DELIBERATELY BELOW the fnsig lookup and above the E0505 gate, which mirrors
-            // codegen exactly: codegen_methods.bl tries synthesized display, then
-            // lookup_impl_method (:5323), then the closure field (:5333). A trait-impl
-            // method of the same name therefore wins in BOTH phases; typechecking the
-            // field instead would only move the miscompile.
-            //
-            // Guarded on TyKind.Struct — an enum has variants, not fields — and on the
-            // field tid actually being a Fn, so a non-callable field of the same name as
-            // some other struct's callable field still falls to E0505 as before.
-            if obj_k == TyKind.Struct {
-                let fld_tid = get_struct_field_tid(obj_t, method)
-                if fld_tid != -1 && type_kind(fld_tid) == TyKind.Fn {
-                    return tc_check_call_against_fn_tid(fld_tid, node_args(node), "closure field `{tc_type_name_shown(tname)}.{method}`", node)
-                }
             }
             // The receiver type is KNOWN, but no resolution path matched. Emit E0505
             // here (typecheck) instead of deferring to the codegen backstop — name
