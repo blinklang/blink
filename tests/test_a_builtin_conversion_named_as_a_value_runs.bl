@@ -1,0 +1,115 @@
+// A built-in type's `from` or `try_from` from its one From or TryFrom impl in the standard
+// library is a function in the type's `T.` namespace, so `Float.from` with no argument list is
+// a function value (sections/03_types.md §3.4 "A type-scoped or associated function named as a
+// value"), as `Celsius.from` of a user type with one such impl is. The value does what a direct
+// call does. Each program must check clean, then build and run in both build modes and print
+// the expected text.
+
+import compile_test_helpers
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> ProcessResult ! Process.Spawn {
+    process.run("sh", ["-c", cmd]).unwrap()
+}
+
+fn expect_prints_with(tag: Str, lines: List[Str], flags: Str, want: Str) ! IO, FS.Write, Process.Spawn, Env.Read {
+    let dir = "{compile_test_helpers.scratch_root()}/builtin_conversion_value_{tag}"
+    let _ = sh("rm -rf {dir} && mkdir -p {dir}")
+    fs.write("{dir}/x.bl", lines.join("\n").concat("\n")).unwrap()
+    let clear = "env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE"
+    let mut bad = 0
+    let c = sh("B=$(pwd)/build/blink; cd {dir} && {clear} timeout 120 $B check x.bl < /dev/null")
+    if !c.success() {
+        io.eprintln("{tag} check: ended {c.end}\n{c.out}{c.err_out}")
+        bad = bad + 1
+    }
+    for mode in ["--per-module", "--no-per-module"] {
+        let r = sh("B=$(pwd)/build/blink; cd {dir} && {clear} timeout 120 $B run {mode} {flags} x.bl 2>/dev/null < /dev/null")
+        if !r.success() || r.out.trim() != want {
+            let e = sh("B=$(pwd)/build/blink; cd {dir} && {clear} timeout 120 $B run {mode} {flags} x.bl < /dev/null")
+            io.eprintln("{tag} {mode} {flags}: ended {r.end}, printed [{r.out.trim()}], want [{want}]\n{e.err_out}")
+            bad = bad + 1
+        }
+    }
+    let _ = sh("rm -rf {dir}")
+    assert_eq(bad, 0)
+}
+
+fn expect_prints(tag: Str, lines: List[Str], want: Str) ! IO, FS.Write, Process.Spawn, Env.Read {
+    expect_prints_with(tag, lines, "", want)
+}
+
+fn main_of(body: List[Str]) -> List[Str] {
+    let mut out = [
+        "fn show(r: Result[Char, ConversionError]) -> Str \{",
+        "    match r \{",
+        "        Ok(c) => \"\{c}\"",
+        "        Err(_) => \"err\"",
+        "    }",
+        "}",
+        "fn main() \{",
+    ]
+    for l in body { out.push(l) }
+    out.push("}")
+    out
+}
+
+test "Float.from is a value with no expected type" {
+    expect_prints("float_plain_let", main_of([
+        "    let g = Float.from",
+        "    io.println(\"\{g(3) + 0.5}\")",
+    ]), "3.5")
+}
+
+test "Float.from is the function an annotation names" {
+    expect_prints("float_annotated", main_of([
+        "    let f: fn(Int) -> Float = Float.from",
+        "    io.println(\"\{f(2) + 0.5}\")",
+    ]), "2.5")
+}
+
+test "Float.from is the function a parameter type expects" {
+    expect_prints("float_as_argument", main_of([
+        "    let fs = [1, 2].map(Float.from)",
+        "    io.println(\"\{fs.get(1).unwrap() + 0.25}\")",
+    ]), "2.25")
+}
+
+test "a Float.from value and a direct call agree" {
+    expect_prints("float_value_and_call", main_of([
+        "    let g = Float.from",
+        "    io.println(\"\{g(7) + 0.5} \{Float.from(7) + 0.5}\")",
+    ]), "7.5 7.5")
+}
+
+test "Char.try_from is a value that keeps its error" {
+    expect_prints("char_try_from", main_of([
+        "    let c = Char.try_from",
+        "    io.println(\"\{show(c(65))} \{show(c(-1))}\")",
+    ]), "A err")
+}
+
+test "I32.try_from and U64.try_from are values" {
+    expect_prints("int_try_from", main_of([
+        "    let i = I32.try_from",
+        "    match i(7) \{",
+        "        Ok(v) => io.println(\"\{v}\")",
+        "        Err(_) => io.println(\"err\")",
+        "    }",
+        "    let u: fn(Int) -> Result[U64, ConversionError] = U64.try_from",
+        "    match u(-1) \{",
+        "        Ok(v) => io.println(\"\{v}\")",
+        "        Err(_) => io.println(\"neg\")",
+        "    }",
+    ]), "7\nneg")
+}
+
+test "a built-in conversion value runs under a trace and in a debug build" {
+    let lines = main_of([
+        "    let c = Char.try_from",
+        "    let g = Float.from",
+        "    io.println(\"\{show(c(66))} \{g(1) + 0.5}\")",
+    ])
+    expect_prints_with("traced", lines, "--trace", "B 1.5")
+    expect_prints_with("debug", lines, "--debug", "B 1.5")
+}
