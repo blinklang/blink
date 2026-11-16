@@ -1,0 +1,134 @@
+// sections/03_types.md §3.6 "Non-hashable keys and elements in general": a Map key or Set
+// element type that does not implement Hash is E1400 MapKeyNotHashable at type-check. A generic
+// body is checked once, from its written bounds, so a body that keys a Map or Set by an
+// unbounded `T` is refused at that use, whatever a call passes. A body that leaves the key to
+// inference, so that `T` reaches the key through an insert or a lookup, is refused the same way
+// as a written key. The calls into such a body add no second report. Each refused row has an
+// accepted control, so a check that refuses every inferred key cannot pass.
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_reset}
+import std.fs
+import std.io
+
+// Every error as `Name@line: message`, one per line, in report order.
+fn probe(stem: Str, src: Str) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO, Process.Spawn {
+    let path = "build/{stem}_probe.bl"
+    fs.write(path, src).unwrap()
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _rm = process.run("rm", ["-f", path]).unwrap()
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" { out.push("{d.name}@{d.line}: {d.message}") }
+    }
+    out.join("\n")
+}
+
+fn expect(label: Str, got: Str, want: Str) ! IO.Print {
+    if got != want { io.println("FAIL: {label}:\n  got:  {got}\n  want: {want}") }
+    assert(got == want)
+}
+
+// Lines 1-4. A body starts at line 5.
+let types_src = "type Widget \{ id: Int }\n@derive(Hash, Eq)\ntype HWidget \{ id: Int }\n@derive(Hash, Eq)\n"
+
+// `body` is the generic fn `f` at lines 5.., then `main` calls it with `arg` on the line after.
+fn src_of(body: Str, arg: Str) -> Str {
+    "{types_src}{body}fn main() \{ assert(f({arg}) >= 0) }\n"
+}
+
+fn map_key(ty: Str) -> Str { "Map key type `{ty}` is not known to be hashable — type parameter `T` has no Hash bound" }
+fn set_elem(ty: Str) -> Str { "Set element type `{ty}` is not known to be hashable — type parameter `T` has no Hash bound" }
+
+let by_insert = "fn f[T](it: T) -> Int \{\n    let mut m = Map()\n    m.insert(it, 1)\n    m.len()\n}\n"
+let by_set_insert = "fn f[T](it: T) -> Int \{\n    let mut s = Set()\n    s.insert(it)\n    s.len()\n}\n"
+
+test "a Map key a type parameter fills through an insert is refused in the body" {
+    expect("map", probe("tc_tpkey_map", src_of(by_insert, "Widget \{ id: 1 }")), "MapKeyNotHashable@7: {map_key("T")}")
+}
+
+test "a Set element a type parameter fills through an insert is refused in the body" {
+    expect("set", probe("tc_tpkey_set", src_of(by_set_insert, "Widget \{ id: 1 }")), "MapKeyNotHashable@7: {set_elem("T")}")
+}
+
+test "the written key is refused in the body in the same words" {
+    let written = "fn f[T](it: T) -> Int \{\n    let mut m: Map[T, Int] = Map()\n    m.insert(it, 1)\n    m.len()\n}\n"
+    expect("written", probe("tc_tpkey_written", src_of(written, "Widget \{ id: 1 }")), "MapKeyNotHashable@6: {map_key("T")}")
+}
+
+test "a Map.new key filled through an insert is refused in the body" {
+    let body = "fn f[T](it: T) -> Int \{\n    let mut m = Map.new()\n    m.insert(it, 1)\n    m.len()\n}\n"
+    expect("new", probe("tc_tpkey_new", src_of(body, "Widget \{ id: 1 }")), "MapKeyNotHashable@7: {map_key("T")}")
+}
+
+test "a Map key a type parameter fills through a lookup is refused in the body" {
+    let body = "fn f[T](it: T) -> Int \{\n    let m = Map()\n    let v: Option[Int] = m.get(it)\n    if m.contains_key(it) \{ 1 } else \{ v ?? 0 }\n}\n"
+    expect("lookup", probe("tc_tpkey_lookup", src_of(body, "Widget \{ id: 1 }")), "MapKeyNotHashable@7: {map_key("T")}")
+}
+
+test "a tuple key that holds a type parameter is refused in the body" {
+    let body = "fn f[T](it: T) -> Int \{\n    let mut m = Map()\n    m.insert((it, 1), 1)\n    m.len()\n}\n"
+    expect("tuple", probe("tc_tpkey_tuple", src_of(body, "Widget \{ id: 1 }")), "MapKeyNotHashable@7: {map_key("(T, Int)")}")
+}
+
+test "a derived Hash instance over a type parameter is refused in the body" {
+    let body = "fn f[T](it: T) -> Int \{\n    let mut s = Set()\n    s.insert(HKeyed \{ v: it })\n    s.len()\n}\n@derive(Hash, Eq)\ntype HKeyed[T] \{ v: T }\n"
+    expect("instance", probe("tc_tpkey_instance", src_of(body, "Widget \{ id: 1 }")), "MapKeyNotHashable@7: {set_elem("HKeyed[T]")}")
+}
+
+test "a key built in a closure of the body is refused in the body" {
+    let body = "fn f[T](it: T) -> Int \{\n    let mk = fn() -> Int \{\n        let mut s = Set()\n        s.insert(it)\n        s.len()\n    }\n    mk()\n}\n"
+    expect("closure", probe("tc_tpkey_closure", src_of(body, "Widget \{ id: 1 }")), "MapKeyNotHashable@8: {set_elem("T")}")
+}
+
+test "a call above the body it reaches adds no report" {
+    let src = "{types_src}fn main() \{ assert(f(Widget \{ id: 1 }) >= 0) }\n{by_insert}"
+    expect("order", probe("tc_tpkey_order", src), "MapKeyNotHashable@8: {map_key("T")}")
+}
+
+test "a call whose argument a later use solves adds no report" {
+    let src = "{types_src}{by_insert}fn main() \{\n    let mut xs = []\n    let n = f(xs)\n    xs.push(Widget \{ id: 1 })\n    assert(n == 1)\n}\n"
+    expect("later", probe("tc_tpkey_later", src), "MapKeyNotHashable@7: {map_key("T")}")
+}
+
+test "a generic fn used as a value adds no report" {
+    let typed = "{types_src}{by_insert}fn main() \{\n    let h: fn(Widget) -> Int = f\n    assert(h(Widget \{ id: 1 }) == 1)\n}\n"
+    expect("fn value", probe("tc_tpkey_fn_value", typed), "MapKeyNotHashable@7: {map_key("T")}")
+}
+
+test "a generic fn passed as a value to a method adds no report" {
+    let mapped = "{types_src}{by_insert}fn main() \{ assert([Widget \{ id: 1 }].map(f).len() == 1) }\n"
+    expect("map(f)", probe("tc_tpkey_map_fn", mapped), "MapKeyNotHashable@7: {map_key("T")}")
+}
+
+test "a call in a field default adds no report" {
+    let src = "{types_src}{by_insert}type S \{ n: Int = f(Widget \{ id: 1 }) }\nfn main() \{ assert(S \{}.n == 1) }\n"
+    expect("field default", probe("tc_tpkey_field_default", src), "MapKeyNotHashable@7: {map_key("T")}")
+}
+
+test "a Float and a container argument add no report" {
+    expect("float", probe("tc_tpkey_float", src_of(by_insert, "1.5")), "MapKeyNotHashable@7: {map_key("T")}")
+    expect("list", probe("tc_tpkey_list", src_of(by_set_insert, "[1]")), "MapKeyNotHashable@7: {set_elem("T")}")
+}
+
+test "Hash arguments build through the inferred key of a body with the bound written" {
+    let src = "{types_src}fn f[T: Hash](it: T) -> Int \{\n    let mut m = Map()\n    m.insert(it, 1)\n    m.len()\n}\nfn g[T: Hash](it: T) -> Int \{\n    let mut s = Set()\n    s.insert(it)\n    s.len()\n}\nfn main() \{ assert(f(HWidget \{ id: 1 }) + f(3) + f(\"a\") + f((1, \"b\")) + g(HWidget \{ id: 2 }) + g('c') == 6) }\n"
+    expect("hash args", probe("tc_tpkey_hash_args", src), "")
+}
+
+test "a Hash bound on the parameter admits the inferred key" {
+    let body = "fn f[T: Hash](it: T) -> Int \{\n    let mut m = Map()\n    m.insert(it, 1)\n    m.len()\n}\n"
+    expect("bound", probe("tc_tpkey_bound", src_of(body, "HWidget \{ id: 1 }")), "")
+}
+
+test "a body that is never called is still refused" {
+    let src = "{types_src}{by_insert}fn main() \{ assert(1 == 1) }\n"
+    expect("no call", probe("tc_tpkey_no_call", src), "MapKeyNotHashable@7: {map_key("T")}")
+}
+
+test "a type parameter used only as a value is not a key" {
+    let body = "fn f[T](it: T) -> Int \{\n    let mut m = Map()\n    m.insert(1, it)\n    m.len()\n}\n"
+    expect("value", probe("tc_tpkey_value", src_of(body, "Widget \{ id: 1 }")), "")
+}

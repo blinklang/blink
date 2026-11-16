@@ -1,0 +1,209 @@
+// sections/03_types.md §3.6 "Non-hashable keys and elements in general": a generic body is
+// checked once, from its written bounds. An impl method that keys a Map or Set by a type
+// parameter of its impl (`impl[T] Cnt for Box[T]`) with no Hash bound is refused at that key
+// use, as a generic fn is, whatever a call passes. This holds for a written or an inferred key,
+// bare, in a tuple, or in a @derive(Hash, Eq) type, for a binder a later use fills, for an
+// associated fn and a conversion. With `T: Hash` written on the impl, a call that passes a type
+// with no Hash is E0306, which names Hash, and a generic fn or another impl that reaches the
+// method with its own unbounded parameter is E0306 at that call. Each refused row has an
+// accepted control, so a check that refuses every impl key cannot pass.
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_reset}
+import std.fs
+import std.io
+
+// Every error as `Name@line: message`, one per line, in report order.
+fn probe(stem: Str, src: Str) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO, Process.Spawn {
+    let path = "build/{stem}_probe.bl"
+    fs.write(path, src).unwrap()
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _rm = process.run("rm", ["-f", path]).unwrap()
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" { out.push("{d.name}@{d.line}: {d.message}") }
+    }
+    out.join("\n")
+}
+
+fn expect(label: Str, got: Str, want: Str) ! IO.Print {
+    if got != want { io.println("FAIL: {label}:\n  got:  {got}\n  want: {want}") }
+    assert(got == want)
+}
+
+let types_src = "type Widget \{ id: Int }\n@derive(Hash, Eq)\ntype HWidget \{ id: Int }\ntype Box[T] \{ v: T }\ntrait Cnt \{ fn cnt(self) -> Int }\n"
+
+// The impl of Cnt for Box[T] whose body is `body`.
+fn cnt_impl(body: Str) -> Str { "impl[T] Cnt for Box[T] \{\n    fn cnt(self) -> Int \{\n{body}    }\n}\n" }
+
+let set_inferred = cnt_impl("        let mut s = Set()\n        s.insert(self.v)\n        s.len()\n")
+let set_written = cnt_impl("        let mut s: Set[T] = Set()\n        s.insert(self.v)\n        s.len()\n")
+let map_inferred = cnt_impl("        let mut m = Map()\n        m.insert(self.v, 1)\n        m.len()\n")
+let map_written = cnt_impl("        let mut m: Map[T, Int] = Map()\n        m.insert(self.v, 1)\n        m.len()\n")
+
+// The program `decls`, then a last line `main` that asserts on `call`, where `ARG` in `call`
+// reads as the argument.
+fn src_of(decls: Str, call: Str, arg: Str) -> Str {
+    "{types_src}{decls}fn main() \{ assert({call.replace("ARG", arg)} >= 0) }\n"
+}
+
+// The line of `main` in `src_of`, which is the last.
+fn main_line(src: Str) -> Int { src.lines().len() }
+
+fn body_words(ty: Str, tp: Str, set: Bool) -> Str {
+    let role = if set { "Set element" } else { "Map key" }
+    "{role} type `{ty}` is not known to be hashable — type parameter `{tp}` has no Hash bound"
+}
+
+let direct = "Box \{ v: ARG }.cnt()"
+
+fn bounded(decls: Str) -> Str { decls.replace("impl[T] ", "impl[T: Hash] ") }
+
+// The body of `decls` is refused at line `line` whatever `call` passes; with `T: Hash` on the
+// impl, a Hash argument is accepted.
+fn refused(stem: Str, decls: Str, call: Str, line: Int, words: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO, Process.Spawn {
+    expect(stem, probe(stem, src_of(decls, call, "HWidget \{ id: 1 }")), "MapKeyNotHashable@{line}: {words}")
+    expect("{stem} control", probe("{stem}_ok", src_of(bounded(decls), call, "HWidget \{ id: 1 }")), "")
+}
+
+test "an impl type parameter as an inferred Set element is refused in the body" {
+    refused("tc_ikey_set", set_inferred, direct, 9, body_words("T", "T", true))
+}
+
+test "an impl type parameter as a written Set element is refused in the body" {
+    refused("tc_ikey_set_written", set_written, direct, 8, body_words("T", "T", true))
+}
+
+test "an impl type parameter as an inferred Map key is refused in the body" {
+    refused("tc_ikey_map", map_inferred, direct, 9, body_words("T", "T", false))
+}
+
+test "an impl type parameter as a written Map key is refused in the body" {
+    refused("tc_ikey_map_written", map_written, direct, 8, body_words("T", "T", false))
+}
+
+test "an impl type parameter in a tuple key is refused in the body" {
+    let decls = cnt_impl("        let mut s = Set()\n        s.insert((self.v, 1))\n        s.len()\n")
+    refused("tc_ikey_tuple", decls, direct, 9, body_words("(T, Int)", "T", true))
+}
+
+test "an impl type parameter in a derived Hash key is refused in the body" {
+    let w = "@derive(Hash, Eq)\ntype W[A] \{ a: A }\n"
+    let decls = "{w}{cnt_impl("        let mut s = Set()\n        s.insert(W \{ a: self.v })\n        s.len()\n")}"
+    refused("tc_ikey_derived", decls, direct, 11, body_words("W[T]", "T", true))
+}
+
+test "an impl type parameter passed on to a keyed generic fn is refused at that call" {
+    let inferred = "fn wrap[K: Hash](k: K) -> Int \{\n    let mut s = Set()\n    s.insert(k)\n    s.len()\n}\n"
+    let written = "fn wrap[K: Hash](k: K) -> Int \{\n    let mut s: Set[K] = Set()\n    s.insert(k)\n    s.len()\n}\n"
+    let body = cnt_impl("        wrap(self.v)\n")
+    let want = "TraitBoundNotSatisfied@13: `T` does not satisfy the Hash bound on type parameter K of wrap: `T` has no Hash bound"
+    for wrap in [inferred, written] {
+        expect("wrap", probe("tc_ikey_wrap", src_of("{wrap}{body}", direct, "HWidget \{ id: 1 }")), want)
+        expect("wrap control", probe("tc_ikey_wrap_ok", src_of(bounded("{wrap}{body}"), direct, "HWidget \{ id: 1 }")), "")
+    }
+}
+
+test "a trait-qualified call adds no report to the body's" {
+    refused("tc_ikey_qualified", set_inferred, "Cnt.cnt(Box \{ v: ARG })", 9, body_words("T", "T", true))
+}
+
+let impl_bound_words = "`Widget` does not satisfy the Hash bound on type parameter T of `Box`'s impl of Cnt"
+
+test "a call that passes a type with no Hash to a bounded impl is refused naming Hash" {
+    let src = src_of(bounded(set_inferred), direct, "Widget \{ id: 1 }")
+    expect("bound call", probe("tc_ikey_bound_call", src), "TraitBoundNotSatisfied@{main_line(src)}: {impl_bound_words}")
+    let q = src_of(bounded(set_inferred), "Cnt.cnt(Box \{ v: ARG })", "Widget \{ id: 1 }")
+    expect("bound qualified", probe("tc_ikey_bound_qualified", q), "TraitBoundNotSatisfied@{main_line(q)}: {impl_bound_words}")
+}
+
+test "a generic fn that calls a bounded impl's method on its own parameter needs the bound" {
+    let outer = "fn outer[U](b: Box[U]) -> Int \{ b.cnt() }\n"
+    let outer_ok = "fn outer[U: Hash](b: Box[U]) -> Int \{ b.cnt() }\n"
+    for decls in [bounded(set_inferred), bounded(map_written)] {
+        let src = src_of("{decls}{outer}", "outer(Box \{ v: ARG })", "HWidget \{ id: 1 }")
+        expect("outer", probe("tc_ikey_outer", src), "TraitBoundNotSatisfied@{main_line(src) - 1}: `U` does not satisfy the Hash bound on type parameter T of `Box`'s impl of Cnt: `U` has no Hash bound")
+        expect("outer control", probe("tc_ikey_outer_ok", src_of("{decls}{outer_ok}", "outer(Box \{ v: ARG })", "HWidget \{ id: 1 }")), "")
+    }
+}
+
+test "an impl method that calls a bounded impl's method needs the bound on its own impl" {
+    let two = "trait Two \{ fn two(self) -> Int }\nimpl[T] Two for Box[T] \{\n    fn two(self) -> Int \{ self.cnt() + 1 }\n}\n"
+    let two_ok = "trait Two \{ fn two(self) -> Int }\nimpl[T: Hash] Two for Box[T] \{\n    fn two(self) -> Int \{ self.cnt() + 1 }\n}\n"
+    let want = "`T` does not satisfy the Hash bound on type parameter T of `Box`'s impl of Cnt: `T` has no Hash bound"
+    let fwd = src_of("{bounded(set_inferred)}{two}", "Box \{ v: ARG }.two()", "HWidget \{ id: 1 }")
+    expect("two", probe("tc_ikey_two", fwd), "TraitBoundNotSatisfied@{main_line(fwd) - 2}: {want}")
+    let rev = src_of("{two}{bounded(set_written)}", "Box \{ v: ARG }.two()", "HWidget \{ id: 1 }")
+    expect("two reversed", probe("tc_ikey_two_rev", rev), "TraitBoundNotSatisfied@8: {want}")
+    expect("two control", probe("tc_ikey_two_ok", src_of("{bounded(set_inferred)}{two_ok}", "Box \{ v: ARG }.two()", "HWidget \{ id: 1 }")), "")
+}
+
+test "an associated fn whose impl type parameter is a key is refused in the body" {
+    let mk = "trait Mk \{ fn mk(n: Int) -> Self }\nimpl[T] Mk for Box[T] \{\n    fn mk(n: Int) -> Box[T] \{\n        let s: Set[T] = Set()\n        panic(\"\{s.len() + n}\")\n    }\n}\nfn first[T](b: Box[T]) -> Int \{ 0 }\n"
+    let src = "{types_src}{mk}fn main() \{\n    let b: Box[Widget] = Box.mk(1)\n    assert(first(b) >= 0)\n}\n"
+    expect("assoc", probe("tc_ikey_assoc", src), "MapKeyNotHashable@9: {body_words("T", "T", true)}")
+    let ok = "{types_src}{bounded(mk)}fn main() \{\n    let b: Box[HWidget] = Box.mk(1)\n    assert(first(b) >= 0)\n}\n"
+    expect("assoc control", probe("tc_ikey_assoc_ok", ok), "")
+}
+
+test "a Hash bound on the impl type parameter admits the key and refuses a type without Hash" {
+    let decls = "impl[T: Hash + Eq] Cnt for Box[T] \{\n    fn cnt(self) -> Int \{\n        let mut s = Set()\n        s.insert(self.v)\n        s.len()\n    }\n}\n"
+    expect("bound", probe("tc_ikey_bound", src_of(decls, direct, "HWidget \{ id: 1 }")), "")
+    let bad = src_of(decls, direct, "Widget \{ id: 1 }")
+    expect("bound refused", probe("tc_ikey_bound_bad", bad), "TraitBoundNotSatisfied@{main_line(bad)}: {impl_bound_words}")
+}
+
+test "an impl type parameter used only as a Map value is not a key" {
+    let decls = cnt_impl("        let mut m = Map()\n        m.insert(1, self.v)\n        m.len()\n")
+    expect("value", probe("tc_ikey_value", src_of(decls, direct, "Widget \{ id: 1 }")), "")
+}
+
+test "a method of the impl that keys nothing adds no report to its sibling's" {
+    let decls = "trait Two \{ fn two(self) -> Int }\n{set_inferred}impl[T] Two for Box[T] \{\n    fn two(self) -> Int \{ 2 }\n}\n"
+    expect("sibling", probe("tc_ikey_sibling", src_of(decls, "Box \{ v: ARG }.two()", "Widget \{ id: 1 }")), "MapKeyNotHashable@10: {body_words("T", "T", true)}")
+}
+
+test "scalar, string and tuple arguments pass a bounded impl key" {
+    let src = "{types_src}{bounded(set_inferred)}fn main() \{ assert(Box \{ v: 1 }.cnt() + Box \{ v: \"a\" }.cnt() + Box \{ v: (1, 'c') }.cnt() == 3) }\n"
+    expect("scalars", probe("tc_ikey_scalars", src), "")
+}
+
+test "an impl type parameter a later use fills is judged in the body" {
+    let lst = "trait Cnt \{ fn cnt(self) -> Int }\nimpl[T] Cnt for List[T] \{\n    fn cnt(self) -> Int \{\n        let mut s\{ANN} = Set()\n        for x in self \{ s.insert(x) }\n        s.len()\n    }\n}\n"
+    let tys = "type Widget \{ id: Int }\n@derive(Hash, Eq)\ntype HWidget \{ id: Int }\n"
+    for row in [("", 8), (": Set[T]", 7)] {
+        let decls = "{tys}{lst.replace("\{ANN}", row.0)}"
+        let src = "{decls}fn main() \{\n    let mut l = []\n    assert(l.cnt() >= 0)\n    l.push(HWidget \{ id: 1 })\n}\n"
+        expect("open {row.0}", probe("tc_ikey_open", src), "MapKeyNotHashable@{row.1}: {body_words("T", "T", true)}")
+        let ok = "{bounded(decls)}fn main() \{\n    let mut l = []\n    assert(l.cnt() >= 0)\n    l.push(HWidget \{ id: 1 })\n}\n"
+        expect("open {row.0} control", probe("tc_ikey_open_ok", ok), "")
+    }
+}
+
+test "a method type parameter and an impl type parameter that both key are each refused" {
+    let decls = "trait Pick \{ fn pick[U](self, u: U) -> Int }\nimpl[T] Pick for Box[T] \{\n    fn pick[U](self, u: U) -> Int \{\n        let mut s: Set[U] = Set()\n        s.insert(u)\n        let mut t = Set()\n        t.insert(self.v)\n        s.len() + t.len()\n    }\n}\n"
+    let h = "HWidget \{ id: 1 }"
+    let src = src_of(decls, "Box \{ v: {h} }.pick(ARG)", h)
+    expect("pick", probe("tc_ikey_pick", src), "MapKeyNotHashable@9: {body_words("U", "U", true)}\nMapKeyNotHashable@12: {body_words("T", "T", true)}")
+    let ok = bounded(decls.replace("pick[U]", "pick[U: Hash]"))
+    expect("pick control", probe("tc_ikey_pick_ok", src_of(ok, "Box \{ v: {h} }.pick(ARG)", h)), "")
+}
+
+test "a derived Hash receiver as a key needs Hash of the impl type parameter" {
+    let tys = "type Widget \{ id: Int }\n@derive(Hash, Eq)\ntype HWidget \{ id: Int }\n@derive(Hash, Eq)\ntype Box[T] \{ v: T }\ntrait Cnt \{ fn cnt(self) -> Int }\n"
+    let decls = cnt_impl("        let mut s = Set()\n        s.insert(self)\n        s.len()\n")
+    let src = "{tys}{decls}fn main() \{ assert(Box \{ v: HWidget \{ id: 1 } }.cnt() >= 0) }\n"
+    expect("self", probe("tc_ikey_self", src), "MapKeyNotHashable@10: {body_words("Box[T]", "T", true)}")
+    let ok = "{tys}{bounded(decls)}fn main() \{ assert(Box \{ v: HWidget \{ id: 1 } }.cnt() >= 0) }\n"
+    expect("self control", probe("tc_ikey_self_ok", ok), "")
+}
+
+test "a conversion whose impl type parameter is a key is refused in the body" {
+    let conv = "type Wr[T] \{ n: Int }\nimpl[T] From[List[T]] for Wr[T] \{\n    fn from(l: List[T]) -> Wr[T] \{\n        let mut s = Set()\n        for x in l \{ s.insert(x) }\n        Wr \{ n: s.len() }\n    }\n}\n"
+    let src = "{types_src}{conv}fn main() \{\n    let w: Wr[HWidget] = Wr.from([HWidget \{ id: 1 }])\n    assert(w.n >= 0)\n}\n"
+    expect("conv", probe("tc_ikey_conv", src), "MapKeyNotHashable@10: {body_words("T", "T", true)}")
+    let ok = "{types_src}{bounded(conv)}fn main() \{\n    let w: Wr[HWidget] = Wr.from([HWidget \{ id: 1 }])\n    let v: Wr[Int] = [1, 2].into()\n    assert(w.n + v.n >= 0)\n}\n"
+    expect("conv control", probe("tc_ikey_conv_ok", ok), "")
+}

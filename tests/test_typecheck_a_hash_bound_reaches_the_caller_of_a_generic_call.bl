@@ -1,0 +1,118 @@
+// sections/03_types.md §3.6 "Non-hashable keys and elements in general": a generic body is
+// checked once, from its written bounds, so a fn that keys a Map or Set by its type parameter
+// writes `K: Hash`. A generic fn that passes its own type parameter on to such a fn (bare, in a
+// tuple, or in a @derive(Hash, Eq) type) must then write the bound too: its call is E0306, which
+// names Hash, and its own callers are not judged in its place. This holds through any depth of
+// calls and through recursion, in any declaration order. Each refused row has an accepted
+// control, so a check that refuses every nested key cannot pass.
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_reset}
+import std.fs
+import std.io
+
+// Every error as `Name@line: message`, one per line, in report order.
+fn probe(stem: Str, src: Str) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO, Process.Spawn {
+    let path = "build/{stem}_probe.bl"
+    fs.write(path, src).unwrap()
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _rm = process.run("rm", ["-f", path]).unwrap()
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" { out.push("{d.name}@{d.line}: {d.message}") }
+    }
+    out.join("\n")
+}
+
+fn expect(label: Str, got: Str, want: Str) ! IO.Print {
+    if got != want { io.println("FAIL: {label}:\n  got:  {got}\n  want: {want}") }
+    assert(got == want)
+}
+
+let types_src = "type Widget \{ id: Int }\n@derive(Hash, Eq)\ntype HWidget \{ id: Int }\n"
+
+let wrap_set = "fn wrap[K: Hash](k: K) -> Int \{\n    let mut s = Set()\n    s.insert(k)\n    s.len()\n}\n"
+let wrap_map = "fn wrap[K: Hash](k: K) -> Int \{\n    let mut m = Map()\n    m.insert(k, 1)\n    m.len()\n}\n"
+let wrap_written = "fn wrap[K: Hash](k: K) -> Int \{\n    let mut s: Set[K] = Set()\n    s.insert(k)\n    s.len()\n}\n"
+
+// The program `fns`, then a last line `main` that calls `outer` with `arg`.
+fn src_of(fns: Str, arg: Str) -> Str {
+    "{types_src}{fns}fn main() \{ assert(outer({arg}) >= 0) }\n"
+}
+
+fn unbound(tp: Str, f: Str) -> Str { "`{tp}` does not satisfy the Hash bound on type parameter K of {f}: `{tp}` has no Hash bound" }
+
+let outer_bare = "fn outer[T](t: T) -> Int \{ wrap(t) }\n"
+let outer_bound = "fn outer[T: Hash](t: T) -> Int \{ wrap(t) }\n"
+
+// `fns` is refused with `want` at any argument; `ok_fns`, with the bound written, is accepted.
+fn refused(stem: Str, fns: Str, want: Str, ok_fns: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO, Process.Spawn {
+    expect(stem, probe(stem, src_of(fns, "HWidget \{ id: 1 }")), want)
+    expect("{stem} control", probe("{stem}_ok", src_of(ok_fns, "HWidget \{ id: 1 }")), "")
+}
+
+test "a type parameter passed to an inferred Set element is refused at the outer body's call" {
+    refused("tc_nkey_set", "{wrap_set}{outer_bare}", "TraitBoundNotSatisfied@9: {unbound("T", "wrap")}", "{wrap_set}{outer_bound}")
+}
+
+test "a type parameter passed to an inferred Map key is refused at the outer body's call" {
+    refused("tc_nkey_map", "{wrap_map}{outer_bare}", "TraitBoundNotSatisfied@9: {unbound("T", "wrap")}", "{wrap_map}{outer_bound}")
+}
+
+test "a type parameter passed to a written Set element is refused at the outer body's call" {
+    refused("tc_nkey_written", "{wrap_written}{outer_bare}", "TraitBoundNotSatisfied@9: {unbound("T", "wrap")}", "{wrap_written}{outer_bound}")
+}
+
+test "a Hash bound reaches through three calls in either declaration order" {
+    let mid = "fn mid[U: Hash](u: U) -> Int \{ wrap(u) }\n"
+    let outer = "fn outer[T](t: T) -> Int \{ mid(t) }\n"
+    let outer_ok = "fn outer[T: Hash](t: T) -> Int \{ mid(t) }\n"
+    let want = "`T` does not satisfy the Hash bound on type parameter U of mid: `T` has no Hash bound"
+    refused("tc_nkey_depth", "{wrap_set}{mid}{outer}", "TraitBoundNotSatisfied@10: {want}", "{wrap_set}{mid}{outer_ok}")
+    refused("tc_nkey_depth_rev", "{outer}{mid}{wrap_set}", "TraitBoundNotSatisfied@4: {want}", "{outer_ok}{mid}{wrap_set}")
+}
+
+test "a type parameter passed in a tuple is refused at the outer body's call" {
+    refused("tc_nkey_tuple", "{wrap_set}fn outer[T](t: T) -> Int \{ wrap((t, 1)) }\n", "TraitBoundNotSatisfied@9: `(T, Int)` does not satisfy the Hash bound on type parameter K", "{wrap_set}fn outer[T: Hash](t: T) -> Int \{ wrap((t, 1)) }\n")
+}
+
+test "a type parameter passed in a derived Hash type is refused at the outer body's call" {
+    let boxed = "@derive(Hash, Eq)\ntype Boxed[A] \{ v: A }\n"
+    refused("tc_nkey_boxed", "{wrap_set}{boxed}fn outer[T](t: T) -> Int \{ wrap(Boxed \{ v: t }) }\n", "TraitBoundNotSatisfied@11: `Boxed[T]` does not satisfy the Hash bound on type parameter K", "{wrap_set}{boxed}fn outer[T: Hash](t: T) -> Int \{ wrap(Boxed \{ v: t }) }\n")
+}
+
+test "a type parameter passed through a local fn value is refused at the outer body's call" {
+    let outer = "fn outer[T](t: T) -> Int \{\n    let g = wrap\n    g(t)\n}\n"
+    let outer_ok = "fn outer[T: Hash](t: T) -> Int \{\n    let g = wrap\n    g(t)\n}\n"
+    refused("tc_nkey_fn_value", "{wrap_set}{outer}", "TraitBoundNotSatisfied@10: {unbound("T", "wrap")}", "{wrap_set}{outer_ok}")
+}
+
+test "a Hash bound reaches a recursive pair in either declaration order" {
+    let ping = "fn outer[A](a: A, n: Int) -> Int \{\n    if n <= 0 \{ return 0 }\n    pong(a, n - 1)\n}\n"
+    let ping_ok = "fn outer[A: Hash](a: A, n: Int) -> Int \{\n    if n <= 0 \{ return 0 }\n    pong(a, n - 1)\n}\n"
+    let pong = "fn pong[B: Hash](b: B, n: Int) -> Int \{\n    let mut s = Set()\n    s.insert(b)\n    s.len() + outer(b, n - 1)\n}\n"
+    let want = "`A` does not satisfy the Hash bound on type parameter B of pong: `A` has no Hash bound"
+    let fwd = "{types_src}{ping}{pong}fn main() \{ assert(outer(HWidget \{ id: 1 }, 3) >= 0) }\n"
+    expect("recursion", probe("tc_nkey_rec", fwd), "TraitBoundNotSatisfied@6: {want}")
+    let rev = "{types_src}{pong}{ping}fn main() \{ assert(outer(HWidget \{ id: 1 }, 3) >= 0) }\n"
+    expect("recursion reversed", probe("tc_nkey_rec_rev", rev), "TraitBoundNotSatisfied@11: {want}")
+    let ok = "{types_src}{ping_ok}{pong}fn main() \{ assert(outer(HWidget \{ id: 1 }, 3) + outer(1, 2) >= 0) }\n"
+    expect("recursion control", probe("tc_nkey_rec_ok", ok), "")
+}
+
+test "a type parameter passed on only as a value is not a key" {
+    let fns = "fn wrap[K: Hash, V](k: K, v: V) -> Int \{\n    let mut m = Map()\n    m.insert(k, v)\n    m.len()\n}\nfn outer[T](t: T) -> Int \{ wrap(1, t) }\n"
+    expect("value", probe("tc_nkey_value", src_of(fns, "Widget \{ id: 1 }")), "")
+}
+
+test "a Hash bound on the outer parameter admits the nested key" {
+    let fns = "{wrap_set}fn outer[T: Hash + Eq](t: T) -> Int \{ wrap(t) }\n"
+    expect("bound", probe("tc_nkey_bound", src_of(fns, "HWidget \{ id: 1 }")), "")
+}
+
+test "scalar, string and tuple arguments build through a nested key" {
+    let src = "{types_src}{wrap_set}{outer_bound}fn main() \{ assert(outer(1) + outer(\"a\") + outer((1, 'c')) == 3) }\n"
+    expect("scalars", probe("tc_nkey_scalars", src), "")
+}

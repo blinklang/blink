@@ -811,6 +811,8 @@ let first_two = names
 
 `K` may be `Str`, `Int`, `Bool`, `Char`, any sized-int (`I8`..`U64`), a tuple of hashable types, or a user `struct`/`enum` with `@derive(Hash, Eq)`. `Float`/`F32`/`F64` keys and user types without `@derive(Hash, Eq)` are rejected with `E1400 MapKeyNotHashable`. Tuples auto-derive `Hash`/`Eq` structurally.
 
+A type parameter used as a key needs a `Hash` bound: `fn count[K: Hash](xs: List[K]) -> Map[K, Int]`. A generic body is checked once, from its written bounds, so a key use of an unbounded `K` (`m.insert(k, v)`, `s.contains(k)`, a `Map[K, V]` or `Set[K]` annotation in the body) is `E1400` in the body, whether or not code calls it. The fix adds `K: Hash`; in an impl method, put the bound on the trait method and repeat it on the method.
+
 | Method | Returns | Purpose |
 |--------|---------|---------|
 | `Map.new()` / `Map.new[K, V]()` | Map[K,V] | Create empty map (NOT `{}`). Index assignment `m[k] = v` is an error; use `insert` |
@@ -1581,7 +1583,7 @@ show(42)          // "42"
 |--------|-----------|
 | `std.str` | `str_split`, `str_join`, `str_replace`, `str_lines`, `str_trim`, `str_to_upper`, `str_to_lower`, `json_escape_str` |
 | `std.list` | `list_map[T,U]`, `list_filter[T]`, `list_fold[T,U]`, `list_any[T]`, `list_all[T]`, `list_for_each[T]`, `list_concat[T]`, `list_slice[T]` |
-| `std.map` | `map_for_each[K,V]`, `map_filter[K,V]`, `map_fold[K,V,U]`, `map_map_values[K,V,U]`, `map_merge[K,V]` |
+| `std.map` | `map_for_each[K: Hash,V]`, `map_filter[K: Hash,V]`, `map_fold[K: Hash,V,U]`, `map_map_values[K: Hash,V,U]`, `map_merge[K: Hash,V]` |
 | `std.num` | `parse_int`, `parse_float`, `int_to_str`, `float_to_str` |
 | `std.sb` | StringBuilder extensions |
 | `std.bytes` | Bytes type operations |

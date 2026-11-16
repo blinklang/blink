@@ -1,0 +1,193 @@
+// sections/03_types.md §3.6 "A type parameter as a key or element": a generic body is checked
+// once, from its written bounds. A body that uses a type parameter with no `Hash` bound, or a
+// type that contains one, as a Map key or a Set element is E1400 MapKeyNotHashable at that use,
+// whatever a caller passes. The fix adds `T: Hash` on the binder: the fn, the impl, or for a
+// trait method the trait method, which the impl repeats. A caller that passes a type with no
+// Hash for a `T: Hash` parameter gets E0306 at the call. Each refused row has an accepted
+// control with the bound written, so a check that refuses every generic key cannot pass.
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_reset}
+import std.fs
+import std.io
+import std.process.{ProcessResult}
+
+// Each error as `Name@line:col: message | help | fix`, one per line, in report order. The fix
+// is `action @line:col-end_line:end_col "text"`, or empty when the error has none.
+fn probe(stem: Str, src: Str) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO, Process.Spawn {
+    let path = "build/{stem}_probe.bl"
+    fs.write(path, src).unwrap()
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _rm = process.run("rm", ["-f", path]).unwrap()
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" {
+            let fix = if d.fix_action == "" { "" } else { "{d.fix_action} @{d.fix_line}:{d.fix_col}-{d.fix_end_line}:{d.fix_end_col} \"{d.fix_text}\"" }
+            out.push("{d.name}@{d.line}:{d.col}: {d.message} | {d.help} | {fix}")
+        }
+    }
+    out.join("\n")
+}
+
+fn expect(label: Str, got: Str, want: Str) ! IO.Print {
+    if got != want { io.println("FAIL: {label}:\n  got:  {got}\n  want: {want}") }
+    assert(got == want)
+}
+
+fn expect_has(label: Str, got: Str, parts: List[Str]) ! IO.Print {
+    for p in parts {
+        if !got.contains(p) { io.println("FAIL: {label}: missing [{p}] in:\n  {got}") }
+        assert(got.contains(p))
+    }
+}
+
+fn unbounded(role: Str, ty: Str, p: Str) -> Str { "{role} type `{ty}` is not known to be hashable — type parameter `{p}` has no Hash bound" }
+
+let count_src = "fn count[T](xs: List[T]) -> Int \{\n    let mut s = Set.new()\n    for x in xs \{ s.insert(x) }\n    s.len()\n}\nfn main() \{ assert(count([1]) == 1) }\n"
+
+test "a fn body that keys an unbounded type parameter is refused at the key" {
+    let got = probe("tc_hk_fn", count_src)
+    expect("fn", got, "MapKeyNotHashable@3:28: {unbounded("Set element", "T", "T")} | write the bound on the binder: `[T: Hash]` | add `T: Hash` @1:11-1:11 \": Hash\"")
+}
+
+test "a fn body with the Hash bound written keys the type parameter" {
+    let ok = "fn count[T: Hash](xs: List[T]) -> Int \{\n    let mut s = Set.new()\n    for x in xs \{ s.insert(x) }\n    s.len()\n}\nfn main() \{ assert(count([1]) == 1) }\n"
+    expect("fn ok", probe("tc_hk_fn_ok", ok), "")
+}
+
+test "a bound whose trait has Hash as a supertrait admits the key" {
+    let ok = "trait Key: Hash \{ }\nimpl Key for Int \{ }\nfn count[T: Key](xs: List[T]) -> Int \{\n    let mut s = Set.new()\n    for x in xs \{ s.insert(x) }\n    s.len()\n}\nfn main() \{ assert(count([1]) == 1) }\n"
+    expect("super", probe("tc_hk_super", ok), "")
+}
+
+test "a where clause Hash bound on an impl admits the key" {
+    let ok = "type Box[T] \{ v: T }\ntrait Cnt \{ fn cnt(self) -> Int }\nimpl[T] Cnt for Box[T] where T: Hash \{\n    fn cnt(self) -> Int \{\n        let mut s = Set.new()\n        s.insert(self.v)\n        s.len()\n    }\n}\nfn main() \{ assert(Box \{ v: 1 }.cnt() == 1) }\n"
+    expect("where", probe("tc_hk_where", ok), "")
+}
+
+test "a binder with other bounds takes Hash at the end of its bound list" {
+    let src = "fn count[T: Eq](xs: List[T]) -> Int \{\n    let mut s = Set.new()\n    for x in xs \{ s.insert(x) }\n    s.len()\n}\nfn main() \{ assert(count([1]) == 1) }\n"
+    expect("bounded", probe("tc_hk_bounded", src), "MapKeyNotHashable@3:28: {unbounded("Set element", "T", "T")} | write ` + Hash` on the bound list of `T` | add `T: Hash` @1:15-1:15 \" + Hash\"")
+}
+
+test "two key uses of one type parameter are one report" {
+    let src = "fn two[T](a: T, b: T) -> Int \{\n    let mut s = Set.new()\n    s.insert(a)\n    let mut m: Map[T, Int] = Map.new()\n    m.insert(b, 1)\n    s.len() + m.len()\n}\nfn main() \{ assert(two(1, 2) == 2) }\n"
+    expect("twice", probe("tc_hk_twice", src), "MapKeyNotHashable@3:14: {unbounded("Set element", "T", "T")} | write the bound on the binder: `[T: Hash]` | add `T: Hash` @1:9-1:9 \": Hash\"")
+}
+
+test "a written tuple key that holds a type parameter is refused" {
+    let src = "fn pairs[K](k: K) -> Int \{\n    let mut m: Map[(K, Int), Int] = Map.new()\n    m.len()\n}\nfn main() \{ assert(pairs(1) == 0) }\n"
+    let got = probe("tc_hk_tuple", src)
+    expect_has("tuple", got, ["MapKeyNotHashable@2:", unbounded("Map key", "(K, Int)", "K"), "add `K: Hash` @1:11-1:11"])
+}
+
+test "an explicit type argument key is refused" {
+    let src = "fn mk[T](x: T) -> Int \{\n    let s = Set.new[T]()\n    s.len()\n}\nfn main() \{ assert(mk(1) == 0) }\n"
+    expect_has("type arg", probe("tc_hk_targ", src), ["MapKeyNotHashable@2:", unbounded("Set element", "T", "T"), "add `T: Hash` @1:8-1:8"])
+}
+
+test "a key method on a Map the signature names is a body use" {
+    let src = "fn add[K, V](m: Map[K, V], k: K, v: V) -> Map[K, V] \{\n    let mut n = m\n    n.insert(k, v)\n    n\n}\nfn main() \{ assert(add(Map.new(), 1, 2).len() == 1) }\n"
+    expect_has("sig map", probe("tc_hk_sigmap", src), ["MapKeyNotHashable@3:14: ", unbounded("Map key", "K", "K"), "add `K: Hash` @1:9-1:9"])
+}
+
+test "a Map the signature names that the body only measures is not a key use" {
+    let ok = "fn size[K, V](m: Map[K, V]) -> Int \{ m.len() }\nfn main() \{ assert(size(Map.new[Int, Int]()) == 0) }\n"
+    expect("size", probe("tc_hk_size", ok), "")
+}
+
+test "a type parameter used only as a Map value is not a key" {
+    let ok = "fn keyed[V](v: V) -> Int \{\n    let mut m = Map.new()\n    m.insert(1, v)\n    m.len()\n}\nfn main() \{ assert(keyed(1.5) == 1) }\n"
+    expect("value", probe("tc_hk_value", ok), "")
+}
+
+test "a key in a closure of the body is refused" {
+    let src = "fn f[T](x: T) -> Int \{\n    let g = fn(z: T) -> Int \{\n        let mut s = Set.new()\n        s.insert(z)\n        s.len()\n    }\n    g(x)\n}\nfn main() \{ assert(f(1) == 1) }\n"
+    expect_has("closure", probe("tc_hk_closure", src), ["MapKeyNotHashable@4:18: ", unbounded("Set element", "T", "T")])
+}
+
+// §3.6 does not yet say whether a Map or Set written in a closure's parameter or return type
+// is a key use; that is an open spec question. Until it is settled these rows pin today's
+// verdict, which accepts each one; only a key use in the closure body (above) is refused.
+test "a Map closure parameter over an unbounded type parameter is accepted for now" {
+    let src = "fn f[K](k: K) -> Int \{\n    let _g = fn(m: Map[K, Int]) -> Int \{ m.len() }\n    1\n}\nfn main() \{ assert(f(1) == 1) }\n"
+    expect("closure param", probe("tc_hk_closure_param", src), "")
+}
+
+test "a Map closure return type over an unbounded type parameter is accepted for now" {
+    let src = "fn f[K](k: K) -> Int \{\n    let _g = fn() -> Map[K, Int] \{ Map() }\n    1\n}\nfn main() \{ assert(f(1) == 1) }\n"
+    expect("closure return", probe("tc_hk_closure_ret", src), "")
+}
+
+test "an Option of a Map closure return type over an unbounded type parameter is accepted for now" {
+    let src = "fn f[K](k: K) -> Int \{\n    let _g = fn() -> Option[Map[K, Int]] \{ None }\n    1\n}\nfn main() \{ assert(f(1) == 1) }\n"
+    expect("closure option return", probe("tc_hk_closure_opt_ret", src), "")
+}
+
+test "a derived Hash instance over a type parameter is refused for that parameter" {
+    let src = "@derive(Hash, Eq)\ntype Box[T] \{ v: T }\nfn f[T](x: T) -> Int \{\n    let mut s = Set.new()\n    s.insert(Box \{ v: x })\n    s.len()\n}\nfn main() \{ assert(f(1) == 1) }\n"
+    expect_has("instance", probe("tc_hk_inst", src), ["MapKeyNotHashable@5:", unbounded("Set element", "Box[T]", "T"), "add `T: Hash` @3:7-3:7"])
+}
+
+let box_src = "type Box[T] \{ v: T }\ntrait Cnt \{ fn cnt(self) -> Int }\n"
+
+test "an impl method that keys the impl's type parameter puts the bound on the impl" {
+    let src = "{box_src}impl[T] Cnt for Box[T] \{\n    fn cnt(self) -> Int \{\n        let mut s = Set.new()\n        s.insert(self.v)\n        s.len()\n    }\n}\nfn main() \{ assert(Box \{ v: 1 }.cnt() == 1) }\n"
+    expect_has("impl", probe("tc_hk_impl", src), ["MapKeyNotHashable@6:18: ", unbounded("Set element", "T", "T"), "write the bound on the binder: `[T: Hash]`", "add `T: Hash` @3:7-3:7"])
+}
+
+test "an impl with the Hash bound written keys its type parameter" {
+    let ok = "{box_src}impl[T: Hash] Cnt for Box[T] \{\n    fn cnt(self) -> Int \{\n        let mut s = Set.new()\n        s.insert(self.v)\n        s.len()\n    }\n}\nfn main() \{ assert(Box \{ v: 1 }.cnt() == 1) }\n"
+    expect("impl ok", probe("tc_hk_impl_ok", ok), "")
+}
+
+test "an impl method that keys its trait method's type parameter names the trait method" {
+    let src = "type Foo \{ a: Int }\ntrait Cnt \{ fn cnt[U](self, u: U) -> Int }\nimpl Cnt for Foo \{\n    fn cnt[U](self, u: U) -> Int \{\n        let mut s = Set.new()\n        s.insert(u)\n        s.len()\n    }\n}\nfn main() \{ assert(Foo \{ a: 1 }.cnt(2) == 1) }\n"
+    expect_has("trait method", probe("tc_hk_tmethod", src), ["MapKeyNotHashable@6:18: ", unbounded("Set element", "U", "U"), "put `U: Hash` on the trait method `Cnt.cnt`"])
+}
+
+test "a trait default body that keys its type parameter is refused" {
+    let src = "type Foo \{ a: Int }\ntrait Cnt \{\n    fn cnt[U](self, u: U) -> Int \{\n        let mut s = Set.new()\n        s.insert(u)\n        s.len()\n    }\n}\nimpl Cnt for Foo \{ }\nfn main() \{ assert(Foo \{ a: 1 }.cnt(2) == 1) }\n"
+    expect_has("default", probe("tc_hk_default", src), ["MapKeyNotHashable@5:18: ", unbounded("Set element", "U", "U"), "add `U: Hash` @3:13-3:13"])
+}
+
+let tr_src = "type Pt \{ x: Int }\ntype Foo \{ a: Int }\ntrait Tr \{ fn m[U: Hash](self, u: U) -> Int }\nimpl Tr for Foo \{\n    fn m[U: Hash](self, u: U) -> Int \{\n        let mut s = Set.new()\n        s.insert(u)\n        s.len() + self.a\n    }\n}\n"
+
+test "a call through a trait bound passes a type with no Hash and is E0306 naming Hash" {
+    let src = "{tr_src}fn outer[X: Tr](x: X) -> Int \{ x.m(Pt \{ x: 1 }) }\nfn main() \{ assert(outer(Foo \{ a: 1 }) == 2) }\n"
+    expect_has("through", probe("tc_hk_through", src), ["TraitBoundNotSatisfied@11:", "`Pt` does not satisfy the Hash bound on type parameter U"])
+}
+
+test "a call through a trait bound passes a Hash type" {
+    let ok = "{tr_src}fn outer[X: Tr](x: X) -> Int \{ x.m(3) }\nfn main() \{ assert(outer(Foo \{ a: 1 }) == 2) }\n"
+    expect("through ok", probe("tc_hk_through_ok", ok), "")
+}
+
+test "a tuple that holds an unbounded parameter does not satisfy a Hash bound and names Hash" {
+    let src = "fn count_ok[T: Hash](xs: List[T]) -> Int \{ xs.len() }\nfn h[U](x: U) -> Int \{ count_ok([(x, 1)]) }\nfn main() \{ assert(h(1) == 1) }\n"
+    expect_has("tuple bound", probe("tc_hk_tuple_bound", src), ["TraitBoundNotSatisfied@2:", "`(U, Int)` does not satisfy the Hash bound on type parameter T"])
+}
+
+// A keyed body reached through a trait method, called on a type with no Hash. The key is in
+// `wrap`, so the report is there, and check refuses the program before a build starts.
+let wrap_src = "type Pt \{ x: Int }\ntype Foo \{ a: Int }\nfn wrap[K](k: K) -> Int \{\n    let mut s = Set.new()\n    s.insert(k)\n    s.len()\n}\ntrait Tr \{ fn m[U](self, u: U) -> Int }\nimpl Tr for Foo \{\n    fn m[U](self, u: U) -> Int \{ wrap(u) + self.a }\n}\nfn outer[X: Tr](x: X) -> Int \{ x.m(Pt \{ x: 1 }) }\nfn main() \{ io.println(\"\{outer(Foo \{ a: 1 })}\") }\n"
+
+test "a keyed body reached through a trait method is refused in that body" {
+    expect("wrap", probe("tc_hk_wrap", wrap_src), "MapKeyNotHashable@5:14: {unbounded("Set element", "K", "K")} | write the bound on the binder: `[K: Hash]` | add `K: Hash` @3:10-3:10 \": Hash\"")
+}
+
+fn sh(cmd: Str) -> ProcessResult ! Process.Spawn {
+    process.run("sh", ["-c", cmd]).unwrap()
+}
+
+test "the keyed body reached through a trait method builds and runs with the bounds written" {
+    let fixed = "type Pt \{ x: Int }\n@derive(Hash, Eq)\ntype Qt \{ x: Int }\ntype Foo \{ a: Int }\nfn wrap[K: Hash](k: K) -> Int \{\n    let mut s = Set.new()\n    s.insert(k)\n    s.len()\n}\ntrait Tr \{ fn m[U: Hash](self, u: U) -> Int }\nimpl Tr for Foo \{\n    fn m[U: Hash](self, u: U) -> Int \{ wrap(u) + self.a }\n}\nfn outer[X: Tr](x: X) -> Int \{ x.m(Qt \{ x: 1 }) }\nfn main() \{ io.println(\"\{outer(Foo \{ a: 1 })}\") }\n"
+    let path = "build/tc_hk_wrap_run.bl"
+    fs.write(path, fixed).unwrap()
+    let r = sh("timeout 120 build/blink run {path} < /dev/null")
+    let _rm = sh("rm -f {path}")
+    if r.out != "2\n" { io.println("FAIL: run: ended {r.end}, printed [{r.out}]\n{r.err_out}") }
+    assert_eq(r.out, "2\n")
+}
