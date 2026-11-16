@@ -1,0 +1,190 @@
+// A static function of a built-in type, such as `Char.from_code_point` or `List.new`, is a
+// function in its type's `T.` namespace, so `T.name` with no argument list is a function value
+// (sections/03_types.md §3.4 "A type-scoped or associated function named as a value"). No
+// declaration is written for it, and the value does what a direct call does. A generic one
+// takes its element types from the expected type or from a later use. Each program must check
+// clean, then build and run in both build modes and print the expected text.
+
+import compile_test_helpers
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> ProcessResult ! Process.Spawn {
+    process.run("sh", ["-c", cmd]).unwrap()
+}
+
+fn expect_prints_with(tag: Str, lines: List[Str], flags: Str, want: Str) ! IO, FS.Write, Process.Spawn, Env.Read {
+    let dir = "{compile_test_helpers.scratch_root()}/builtin_static_value_{tag}"
+    let _ = sh("rm -rf {dir} && mkdir -p {dir}")
+    fs.write("{dir}/x.bl", lines.join("\n").concat("\n")).unwrap()
+    let clear = "env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE"
+    let mut bad = 0
+    let c = sh("B=$(pwd)/build/blink; cd {dir} && {clear} timeout 120 $B check x.bl < /dev/null")
+    if !c.success() {
+        io.eprintln("{tag} check: ended {c.end}\n{c.out}{c.err_out}")
+        bad = bad + 1
+    }
+    for mode in ["--per-module", "--no-per-module"] {
+        let r = sh("B=$(pwd)/build/blink; cd {dir} && {clear} timeout 120 $B run {mode} {flags} x.bl 2>/dev/null < /dev/null")
+        if !r.success() || r.out.trim() != want {
+            let e = sh("B=$(pwd)/build/blink; cd {dir} && {clear} timeout 120 $B run {mode} {flags} x.bl < /dev/null")
+            io.eprintln("{tag} {mode} {flags}: ended {r.end}, printed [{r.out.trim()}], want [{want}]\n{e.err_out}")
+            bad = bad + 1
+        }
+    }
+    let _ = sh("rm -rf {dir}")
+    assert_eq(bad, 0)
+}
+
+fn expect_prints(tag: Str, lines: List[Str], want: Str) ! IO, FS.Write, Process.Spawn, Env.Read {
+    expect_prints_with(tag, lines, "", want)
+}
+
+fn main_lines(body: List[Str]) -> List[Str] {
+    let mut out = [
+        "fn show(r: Result[Char, ConversionError]) -> Str \{",
+        "    match r \{",
+        "        Ok(c) => \"\{c}\"",
+        "        Err(_) => \"err\"",
+        "    }",
+        "}",
+        "fn main() \{",
+    ]
+    for l in body { out.push(l) }
+    out.push("}")
+    out
+}
+
+test "Char.from_code_point is a value with no expected type" {
+    expect_prints("code_point_plain_let", main_lines([
+        "    let f = Char.from_code_point",
+        "    io.println(show(f(65)))",
+        "    io.println(show(f(-1)))",
+    ]), "A\nerr")
+}
+
+test "Char.from_code_point is the function a parameter type expects" {
+    expect_prints("code_point_as_argument", main_lines([
+        "    let cs = [72, 105].map(Char.from_code_point)",
+        "    io.println(show(cs.get(1).unwrap()))",
+    ]), "i")
+}
+
+test "a Char.from_code_point value and a direct call agree" {
+    expect_prints("code_point_value_and_call", main_lines([
+        "    let f: fn(Int) -> Result[Char, ConversionError] = Char.from_code_point",
+        "    io.println(show(f(66)))",
+        "    io.println(show(Char.from_code_point(67)))",
+    ]), "B\nC")
+}
+
+test "Float.from_bits is a value" {
+    expect_prints("from_bits", main_lines([
+        "    let f = Float.from_bits",
+        "    let bits: U64 = 4609434218613702656",
+        "    io.println(\"\{f(bits)} \{Float.from_bits(bits)}\")",
+    ]), "1.5 1.5")
+}
+
+test "the Bytes statics are values" {
+    expect_prints("bytes", main_lines([
+        "    let n = Bytes.new",
+        "    let s = Bytes.from_str",
+        "    let z = Bytes.zeroed",
+        "    io.println(\"\{n().len()} \{s(\"hey\").len()} \{z(5).len()}\")",
+    ]), "0 3 5")
+}
+
+test "the StringBuilder statics are values" {
+    expect_prints("string_builder", main_lines([
+        "    let a = StringBuilder.new",
+        "    let b = StringBuilder.with_capacity",
+        "    let mut x = a()",
+        "    let mut y = b(16)",
+        "    x.write(\"hi\")",
+        "    y.write(\"yo\")",
+        "    io.println(\"\{x.to_str()} \{y.to_str()}\")",
+    ]), "hi yo")
+}
+
+test "the expected type fixes the element of a List.new value" {
+    expect_prints("list_new_annotated", main_lines([
+        "    let f: fn() -> List[Int] = List.new",
+        "    let g: fn() -> List[Str] = List.new",
+        "    let mut xs = f()",
+        "    let mut ys = g()",
+        "    xs.push(4)",
+        "    ys.push(\"s\")",
+        "    io.println(\"\{xs.get(0).unwrap()} \{ys.get(0).unwrap()} \{xs.len()}\")",
+    ]), "4 s 1")
+}
+
+test "a later use fixes the element of a List.with_capacity value" {
+    expect_prints("list_with_capacity_later_use", main_lines([
+        "    let f = List.with_capacity",
+        "    let mut xs: List[Str] = f(8)",
+        "    xs.push(\"a\")",
+        "    io.println(\"\{xs.len()} \{xs.get(0).unwrap()}\")",
+    ]), "1 a")
+}
+
+test "the expected type fixes the key and value of a Map.new value" {
+    expect_prints("map_new", main_lines([
+        "    let f: fn() -> Map[Str, Int] = Map.new",
+        "    let mut m = f()",
+        "    m.insert(\"k\", 7)",
+        "    io.println(\"\{m.get(\"k\").unwrap()} \{m.len()}\")",
+    ]), "7 1")
+}
+
+test "a later use fixes the element of a Set.new value" {
+    expect_prints("set_new", main_lines([
+        "    let f = Set.new",
+        "    let mut s: Set[Int] = f()",
+        "    s.insert(3)",
+        "    s.insert(3)",
+        "    io.println(\"\{s.len()} \{s.contains(3)}\")",
+    ]), "1 true")
+}
+
+test "a List.new value in a generic body takes each instance of the body" {
+    expect_prints("list_new_generic_body", [
+        "fn one[T](x: T) -> List[T] \{",
+        "    let f: fn() -> List[T] = List.new",
+        "    let mut xs = f()",
+        "    xs.push(x)",
+        "    xs",
+        "}",
+        "fn main() \{",
+        "    io.println(\"\{one(5).get(0).unwrap()} \{one(\"s\").get(0).unwrap()}\")",
+        "}",
+    ], "5 s")
+}
+
+// A module adds to the `T.` namespace only of a type it declares (§2.12.3), so a free fn spelled
+// `List_new` is no member of `List`: the value and the call both build the built-in, and the fn
+// is reached by its own name.
+test "a free fn spelled like a built-in static takes neither the value nor the call" {
+    expect_prints("declared_twin", [
+        "fn List_new() -> Int \{ 7 }",
+        "fn Bytes_zeroed(n: Int) -> Int \{ n }",
+        "fn main() \{",
+        "    let f: fn() -> List[Int] = List.new",
+        "    let z = Bytes.zeroed",
+        "    let mut xs: List[Int] = List.new()",
+        "    xs.push(1)",
+        "    io.println(\"\{f().len()} \{z(3).len()} \{Bytes.zeroed(2).len()} \{xs.len()} \{List_new()} \{Bytes_zeroed(9)}\")",
+        "}",
+    ], "0 3 2 1 7 9")
+}
+
+test "a built-in static value runs under a trace and in a debug build" {
+    let lines = main_lines([
+        "    let f = Char.from_code_point",
+        "    let g: fn() -> Map[Int, Str] = Map.new",
+        "    let mut m = g()",
+        "    m.insert(1, show(f(90)))",
+        "    io.println(m.get(1).unwrap())",
+    ])
+    expect_prints_with("traced", lines, "--trace", "Z")
+    expect_prints_with("debug", lines, "--debug", "Z")
+}

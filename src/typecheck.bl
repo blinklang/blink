@@ -3553,6 +3553,9 @@ type CallFacts {
     // The static calls whose head means a compiler-known type in the module that writes them.
     // A later pass cannot ask the name again, as a namesake elsewhere shadows it by module.
     builtin_heads: Set[Int]
+    // A built-in static named as a value (`List.new`), as "{owner}.{name}". It has no
+    // declaration for tc_global_read_decl to hold.
+    builtin_static_reads: Map[Int, Str]
     // The trait each trait-qualified call's head names. A type of the same spelling in a
     // module this one does not import must not take the call at a later stage.
     trait_heads: Map[Int, Str]
@@ -3652,7 +3655,7 @@ type UseJudge {
 }
 
 fn new_call_facts() -> CallFacts {
-    CallFacts { open_calls: [], open_group: Map(), open_tids: [], reported: Map(), self_views: Map(), view_sigs: Map(), hash_aliases_above: [], derive_facts_above: [], derive_facts_low: 0, derive_facts_open: [], derive_facts_open_low: Map(), debug_unbuilt_seen: Map(), hash_by_bounds: false, static_head_insts: Map(), static_head_binders: Map(), impl_bound_calls: [], impl_bound_binds: Map(), deferred_uses: [], deferred_use_at: Map(), late_keys: [], late_roots: Map(), late_roots_valid: false, late_refused: Map(), late_open: [], late_replay: -1, late_watch: Map(), late_fixed_at: Map(), infer_at: -1, static_owners: Map(), builtin_heads: Set(), trait_heads: Map(), closure_expected_at: Map(), ret_ann: -1, missing_else: Map(), walk_returns: [], written_names: Map(), under_fn_type: Map(), method_reads: Map(), method_read_order: [], impl_binder_key_roles: Map(), key_body: -1, key_binders_reported: Map(), tpl_ctx: [], tpl_lit: [], errored: Map(), answers_after_report: 0, lost_to_error: Map(), row_unknown_at: -1 }
+    CallFacts { open_calls: [], open_group: Map(), open_tids: [], reported: Map(), self_views: Map(), view_sigs: Map(), hash_aliases_above: [], derive_facts_above: [], derive_facts_low: 0, derive_facts_open: [], derive_facts_open_low: Map(), debug_unbuilt_seen: Map(), hash_by_bounds: false, static_head_insts: Map(), static_head_binders: Map(), impl_bound_calls: [], impl_bound_binds: Map(), deferred_uses: [], deferred_use_at: Map(), late_keys: [], late_roots: Map(), late_roots_valid: false, late_refused: Map(), late_open: [], late_replay: -1, late_watch: Map(), late_fixed_at: Map(), infer_at: -1, static_owners: Map(), builtin_heads: Set(), builtin_static_reads: Map(), trait_heads: Map(), closure_expected_at: Map(), ret_ann: -1, missing_else: Map(), walk_returns: [], written_names: Map(), under_fn_type: Map(), method_reads: Map(), method_read_order: [], impl_binder_key_roles: Map(), key_body: -1, key_binders_reported: Map(), tpl_ctx: [], tpl_lit: [], errored: Map(), answers_after_report: 0, lost_to_error: Map(), row_unknown_at: -1 }
 }
 let mut tc_calls: CallFacts = new_call_facts()
 
@@ -24733,6 +24736,11 @@ fn nr_note_call_decl(call_node: Int, decl_node: Int) {
 // tc_note_value_call).
 let mut tc_global_read_decl: Map[Int, Int] = Map()
 
+// The built-in static this `T.name` read names, as "{owner}.{name}", or "".
+pub fn tc_builtin_static_value_of(access_node: Int) -> Str {
+    tc_calls.builtin_static_reads.get(access_node) ?? ""
+}
+
 // The module-scope `let` this ident read resolved to, or -1 when the ident is not a read of
 // a global: a local, a parameter, a function name, a builtin.
 pub fn tc_global_decl_node(ident_node: Int) -> Int {
@@ -29055,6 +29063,51 @@ fn tc_builtin_static_names(written: Str, head: StaticHead) -> List[Str] {
     }
 }
 
+// The signature of the built-in static `owner.name`, one of tc_builtin_static_names, named as
+// a value, made on first use. It states what the call arm checks. The key is dotted, so no
+// program can declare it, and a free fn spelled `List_new` stays out of `List`'s namespace
+// (§2.12.3).
+// A generic one's binders appear only in its result, so the expected type or a later use
+// fixes them, as for a generic fn named as a value.
+fn tc_builtin_static_sig(owner: Str, name: Str) -> Int ! Diag.Report {
+    let key = "builtin.{owner}.{name}"
+    let found = fnsig_map.get(key) ?? -1
+    if found != -1 { return found }
+    let t = make_typevar_bound("T", BUILTIN_BINDER_NODE)
+    let k = make_typevar_bound("K", BUILTIN_BINDER_NODE)
+    let v = make_typevar_bound("V", BUILTIN_BINDER_NODE)
+    let key_ord = match "{owner}.{name}" {
+        "Char.from_code_point" => { register_intrinsic_fn_sig(key, [TYPE_INT], make_result_type(TYPE_CHAR, tc_conversion_error_type())) 0 }
+        "Float.from_bits" => { register_intrinsic_fn_sig(key, [TYPE_U64], TYPE_FLOAT) 0 }
+        "Bytes.new" => { register_intrinsic_fn_sig(key, [], get_builtin_fn_ret("Bytes")) 0 }
+        "Bytes.from_str" => { register_intrinsic_fn_sig(key, [TYPE_STR], get_builtin_fn_ret("Bytes")) 0 }
+        "Bytes.zeroed" => { register_intrinsic_fn_sig(key, [TYPE_INT], get_builtin_fn_ret("Bytes")) 0 }
+        "StringBuilder.new" => { register_intrinsic_fn_sig(key, [], type_stringbuilder()) 0 }
+        "StringBuilder.with_capacity" => { register_intrinsic_fn_sig(key, [TYPE_INT], type_stringbuilder()) 0 }
+        "List.new" => { register_intrinsic_fn_sig(key, [], make_list_type(t)) 1 }
+        "List.with_capacity" => { register_intrinsic_fn_sig(key, [TYPE_INT], make_list_type(t)) 1 }
+        "Set.new" => { register_intrinsic_fn_sig(key, [], make_set_type(t)) 1 }
+        "Map.new" => { register_intrinsic_fn_sig(key, [], make_map_type(k, v)) 2 }
+        _ => -1
+    }
+    if key_ord == -1 { return -1 }
+    if key_ord == 1 { tc_add_sig_tparam("T", BUILTIN_BINDER_NODE, 1, "|") }
+    if key_ord == 2 {
+        tc_add_sig_tparam("K", BUILTIN_BINDER_NODE, 1, "|")
+        tc_add_sig_tparam("V", BUILTIN_BINDER_NODE, 1, "|")
+    }
+    fnsig_map.get(key) ?? -1
+}
+
+// A built-in static named with no call: the value of its row, which codegen builds as a thunk
+// over the call's own lowering.
+fn tc_builtin_static_value(node: Int, owner: Str, name: Str) -> Int ! TypeCheck.Resolve, Diag.Report {
+    let sig = tc_builtin_static_sig(owner, name)
+    if sig == -1 { return tc_error_recovery_tid() }
+    tc_calls.builtin_static_reads.insert(node, "{owner}.{name}")
+    tc_fn_value_type_at(node, sig, -1, "")
+}
+
 // The associated functions one trait impl gives `owner`, sorted: a name two traits give it is
 // no single member.
 fn tc_assoc_fn_names(owner: Str) -> List[Str] {
@@ -29226,8 +29279,10 @@ fn tc_type_path_fn_value(node: Int, obj_node: Int, qual: Str, name: Str) -> Opti
     if name.byte_len() == 0 || tc_name_is_upper(name) { return None }
     if tc_name_is_tparam_in_scope(qual) != 0 || tc_head_names_trait(qual) || tc_type_name_poisoned(qual) { return None }
     if is_import_module_name(qual) != 0 || is_builtin_namespace(qual) != 0 || tc_site_qualifier_module(qual, node) != "" { return None }
-    if qual != "Self" && !tc_names_a_type(qual) { return None }
     let head = tc_static_head(qual)
+    // Above every declared rung, as its call arm is.
+    if tc_builtin_static_names(qual, head).contains(name) { return Some(tc_builtin_static_value(node, head.owner, name)) }
+    if qual != "Self" && !tc_names_a_type(qual) { return None }
     // A trait's default body does not know what `Self` is.
     if qual == "Self" && head.owner == "Self" { return None }
     let own = tc_static_head_sig(head, name)

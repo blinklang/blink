@@ -2193,6 +2193,45 @@ pub fn lower_derived_from_str_body(span: Int, enum_tid: Int, ret: Int, params: L
     ir_block(span, stmts)
 }
 
+// The body of a thunk for the built-in static `key` ("{owner}.{name}") named as a value: what
+// a direct call with `params` as its arguments lowers to, returned.
+pub fn lower_builtin_static_body(span: Int, key: Str, ret: Int, params: List[Int]) -> Int ! Diag.Report {
+    let mark = cg_expr_pending_count()
+    let result = cc_builtin_static_of(span, key, ret, params)
+    let mut stmts = cg_expr_take_pending(mark)
+    if result < 0 { return -1 }
+    stmts.push(ir_return(span, result))
+    ir_block(span, stmts)
+}
+
+fn cc_builtin_static_of(span: Int, key: Str, ret: Int, params: List[Int]) -> Int ! Diag.Report {
+    if key == "Char.from_code_point" && params.len() == 1 {
+        let plan = match cc_char_result_plan(span, ret, TYPE_INT) {
+            Some(p) => p
+            None => return -1
+        }
+        let _td = ensure_typedef_for(ret)
+        return cc_char_result(span, plan, params.get(0).unwrap())
+    }
+    if key == "List.new" || key == "Map.new" || key == "Set.new" {
+        if params.len() == 0 { return cc_container_new_of(span, ret, cc_kind(ret)) }
+    }
+    let ctor = if key == "List.with_capacity" {
+        CtorRow { symbol: cc_list_with_capacity_symbol(ret), arity: 1 }
+    } else if key == "Float.from_bits" {
+        CtorRow { symbol: c_runtime_helper("float_from_bits"), arity: 1 }
+    } else {
+        cc_runtime_ctor(cc_kind(ret), key.split(".").get(1) ?? "")
+    }
+    if ctor.symbol == "" || ctor.arity != params.len() {
+        diag_ice_stage_not_built("cg_call body of the built-in static `{key}` named as a value", span)
+        return -1
+    }
+    let rec = cc_local(ret, span)
+    if cc_stopped(rec) { return -1 }
+    ir_call_runtime(ret, span, rec.c_spelling, ctor.symbol, rec.slot_form, params)
+}
+
 // The registered instance for a generic call, which must be an instance of the very
 // declaration this call resolved to. The pass walks every reachable call and records one,
 // so anything else is a compiler bug: the walk never reached this body, the driver has
@@ -3244,8 +3283,12 @@ fn cc_list_with_capacity(node: Int) -> Int ! Diag.Report {
     if cc_kind(answer) != TyKind.List { return cc_no_such_callee(node) }
     let given = sublist_length(node_args(node))
     if given != 1 { return cc_ctor_arity_wrong(node, list_type_name, list_with_capacity_method, 1, given) }
+    cc_build_call(node, cc_list_with_capacity_symbol(answer), NO_RECEIVER, CallForm.Runtime, false)
+}
+
+fn cc_list_with_capacity_symbol(answer: Int) -> Str {
     let op = if list_slots_hold_no_pointer(answer) { "list_with_capacity_atomic" } else { "list_with_capacity" }
-    cc_build_call(node, c_runtime_helper(op), NO_RECEIVER, CallForm.Runtime, false)
+    c_runtime_helper(op)
 }
 
 // A constructor of a type the compiler provides. Read BEFORE any declaration, because that
@@ -3780,7 +3823,10 @@ fn cc_container_ctor_not_built(node: Int, answer: TyKind) -> Int ! Diag.Report {
 // through; a key type that has none refuses the call by name instead of building it.
 // A list compares nothing, so it is built with no table.
 fn cc_container_new(node: Int, answer: TyKind) -> Int ! Diag.Report {
-    let tid = tid_of_node(node)
+    cc_container_new_of(node, tid_of_node(node), answer)
+}
+
+fn cc_container_new_of(node: Int, tid: Int, answer: TyKind) -> Int ! Diag.Report {
     if tid < 0 { return -1 }
     let rec = cc_local(tid, node)
     if cc_stopped(rec) { return -1 }
@@ -3839,23 +3885,33 @@ fn cc_char_from_code_point(node: Int) -> Int ! Diag.Report {
     if !cc_is_an_integer(cc_kind(from_tid)) { return cc_code_point_not_an_integer(node, from_tid) }
     // Every spelling and every refusal is settled before the argument is lowered, so a call
     // this stage cannot write leaves no statement hoisted behind it.
-    let carrier = cc_local(tid, node)
-    if cc_stopped(carrier) { return -1 }
-    let verdict = cc_local(TYPE_INT, node)
-    if cc_stopped(verdict) { return -1 }
-    let answered = cc_local(TYPE_BOOL, node)
-    if cc_stopped(answered) { return -1 }
-    let ok_mem = cc_member_layout(node, tid, Slot.Inner1)
-    if cc_stopped(ok_mem) { return -1 }
-    let err_mem = cc_member_layout(node, tid, Slot.Inner2)
-    if cc_stopped(err_mem) { return -1 }
-    let fault = cc_conversion_error_plan(node, child_tid(tid, Slot.Inner2), from_tid, child_tid(tid, Slot.Inner1))
-    if fault.texts.len() == 0 { return -1 }
+    let plan = match cc_char_result_plan(node, tid, from_tid) {
+        Some(p) => p
+        None => return -1
+    }
     let code = lower_expr(arg)
     if code < 0 { return -1 }
     let _td = ensure_typedef_for(tid)
-    cc_char_result(node, CharResultPlan { tid: tid, carrier: carrier, verdict: verdict,
-        answered: answered, ok_mem: ok_mem, err_mem: err_mem, fault: fault }, code)
+    cc_char_result(node, plan, code)
+}
+
+// The locals and texts Char.from_code_point answering `tid` from a `from_tid` code point
+// needs, or None once one is refused.
+fn cc_char_result_plan(node: Int, tid: Int, from_tid: Int) -> Option[CharResultPlan] ! Diag.Report {
+    let carrier = cc_local(tid, node)
+    if cc_stopped(carrier) { return None }
+    let verdict = cc_local(TYPE_INT, node)
+    if cc_stopped(verdict) { return None }
+    let answered = cc_local(TYPE_BOOL, node)
+    if cc_stopped(answered) { return None }
+    let ok_mem = cc_member_layout(node, tid, Slot.Inner1)
+    if cc_stopped(ok_mem) { return None }
+    let err_mem = cc_member_layout(node, tid, Slot.Inner2)
+    if cc_stopped(err_mem) { return None }
+    let fault = cc_conversion_error_plan(node, child_tid(tid, Slot.Inner2), from_tid, child_tid(tid, Slot.Inner1))
+    if fault.texts.len() == 0 { return None }
+    Some(CharResultPlan { tid: tid, carrier: carrier, verdict: verdict,
+        answered: answered, ok_mem: ok_mem, err_mem: err_mem, fault: fault })
 }
 
 // Every spelling the two arms are written with, settled before the argument is lowered.

@@ -1,0 +1,81 @@
+// A static function of a built-in type named with no call is a function value with the type a
+// call gives it (sections/03_types.md §3.4 "A type-scoped or associated function named as a
+// value"). A generic one opens its element types at the reference, so when no expected type and
+// no later use fixes them, the reference is CannotInferType (E0301), as an unfixed generic
+// function's name is. Type arguments with no call stay E0314, and an expected function type of
+// another shape is a mismatch at the binding.
+
+import std.fs
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_reset}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+
+fn typecheck_probe(path: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    init_embedded_stdlib()
+    fs.write(path, src).unwrap()
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+}
+
+// Each error as "name line:col-end: message | help | label | fix | notes", in report order.
+// The fix reads "action `text` at line:col-end_line:end_col", or "-" when there is none.
+fn errors_of(src: Str) -> List[Str] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    typecheck_probe("build/test_typecheck_builtin_static_value_probe.bl", src)
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" {
+            let fix = if d.fix_action == "" { "-" } else { "`{d.fix_text}` at {d.fix_line}:{d.fix_col}-{d.fix_end_line}:{d.fix_end_col}" }
+            out.push("{d.name} {d.line}:{d.col}-{d.end_col}: {d.message} | {d.help} | {d.label} | {fix} | {d.notes.join("; ")}")
+        }
+    }
+    out
+}
+
+// The one error a source gets, or every error when it gets another count, so a failed assert
+// shows them.
+fn only_error(src: Str) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    let got = errors_of(src)
+    if got.len() != 1 { return "{got.len()} errors: {got.join(" || ")}" }
+    got.get(0).unwrap()
+}
+
+fn no_errors(src: Str) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    errors_of(src).join(" || ")
+}
+
+test "an unannotated List.new that nothing fixes is e0301 at the reference" {
+    let got = only_error("fn main() \{\n    let _f = List.new\n}\n")
+    assert(got.starts_with("CannotInferType 2:14-"), got)
+}
+
+test "an unannotated Map.new that nothing fixes is e0301 at the reference" {
+    let got = only_error("fn main() \{\n    let _f = Map.new\n}\n")
+    assert(got.starts_with("CannotInferType 2:14-"), got)
+}
+
+test "an unannotated Set.new and List.with_capacity that nothing fixes are e0301" {
+    let got = errors_of("fn main() \{\n    let _f = Set.new\n    let _g = List.with_capacity\n}\n")
+    assert_eq(got.len(), 2)
+    for e in got { assert(e.starts_with("CannotInferType "), e) }
+}
+
+test "type arguments on a built-in static with no call stay e0314" {
+    let got = only_error("fn main() \{\n    let _f = List.new[Int]\n}\n")
+    assert(got.starts_with("TypeArgsWithoutCall "), got)
+}
+
+test "an expected function type of another shape is a mismatch and not an internal error" {
+    let got = only_error("fn main() \{\n    let _f: fn(Int) -> Char = Char.from_code_point\n}\n")
+    assert(got.starts_with("TypeMismatch ") || got.starts_with("TypeError "), got)
+}
+
+test "a later use that fixes the element leaves no error" {
+    assert_eq(no_errors("fn main() \{\n    let f = List.with_capacity\n    let _xs: List[Int] = f(4)\n    let g = Map.new\n    let mut m = g()\n    m.insert(\"a\", 1)\n}\n"), "")
+}
+
+test "a built-in static value passed where a function is expected checks clean" {
+    assert_eq(no_errors("fn main() \{\n    let _cs = [65, 66].map(Char.from_code_point)\n    let _bs = [1, 2].map(Bytes.zeroed)\n}\n"), "")
+}
