@@ -20710,6 +20710,7 @@ pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report, IO.Eprint {
     init_types()
     nr_check_duplicate_declarations(program)
     tc_reject_reserved_effect_names(program)
+    tc_reject_same_module_handle_clash(program)
     tc_ue.decls = node_args(program)
     tc_ue.shared = tc_shared_effect_names(tc_ue.decls)
     nr_record_program_decls(program)
@@ -21675,7 +21676,8 @@ fn tc_report_handle_collision(at: Int, handle: Str, decls: List[Int]) ! Diag.Rep
     for ed in decls {
         let name = tc_effect_spelling_in(tc_effect_ident(ed), nr_current_module)
         names.push(name)
-        notes.push("`{name}` is declared here: {diag_normalize_path(diag_file_for_node(ed))}:{node_line(ed)}:{node_col(ed)}")
+        let (line, col) = nr_decl_name_at(ModuleDeclName { namespace: "type", name: node_name(ed), decl: ed, binder: -1 })
+        notes.push("`{name}` is declared here: {diag_normalize_path(diag_file_for_node(ed))}:{line}:{col}")
     }
     let both = if names.len() == 2 { "both" } else { "all" }
     let message = "the handle `{handle}` names more than one available effect"
@@ -22636,8 +22638,10 @@ pub fn tc_effect_ident(ed: Int) -> Str {
 // The C key of the user effect `ed` declares: its escaped name, then, for an effect of a module
 // other than the program's own, its module after `_2`. The key comes from the declaration
 // alone, so a unit built in one module and a unit built in another give one effect one C name.
-pub fn tc_effect_c_key(ed: Int, lower: Bool) -> Str {
-    let name = if lower { node_name(ed).to_lower() } else { node_name(ed) }
+// The key is the declared name, not the handle, so C never relies on E0562 to keep two
+// effects apart.
+pub fn tc_effect_c_key(ed: Int) -> Str {
+    let name = node_name(ed)
     let module = node_module(ed)
     if tc_module_key_is_main(module) != 0 { return tc_sym_escape(name) }
     tc_sym_with_module(name, module)
@@ -24219,6 +24223,41 @@ fn nr_check_duplicate_declarations(program: Int) ! Diag.Report {
     node_set_fields(program, nr_sublist_without(node_fields(program), dropped))
     node_set_arms(program, nr_sublist_without(node_arms(program), dropped))
     node_set_args(program, nr_sublist_without(node_args(program), dropped))
+}
+
+// Reports E0562 at each top-level effect whose lowercase name, so its handle, is the handle of an
+// earlier effect of its module, with a note at the first (§4.12 *Two effects of one module with
+// one handle*), and drops it, as a duplicate declaration is dropped, so the handle has one
+// effect in that module.
+fn tc_reject_same_module_handle_clash(program: Int) ! Diag.Report {
+    let eds = node_args(program)
+    if eds == -1 { return }
+    let mut first_of: Map[Str, Int] = Map()
+    let mut dropped: Map[Int, Int] = Map()
+    let mut i = 0
+    while i < sublist_length(eds) {
+        let ed = sublist_get(eds, i)
+        i = i + 1
+        let name = node_name(ed)
+        let handle = name.to_lower()
+        let key = "{node_module(ed)}|{handle}"
+        let first = first_of.get(key) ?? -1
+        if first == -1 {
+            first_of.insert(key, ed)
+            continue
+        }
+        let first_name = node_name(first)
+        let (line, col) = nr_decl_name_at(ModuleDeclName { namespace: "type", name: name, decl: ed, binder: -1 })
+        let (first_line, first_col) = nr_decl_name_at(ModuleDeclName { namespace: "type", name: first_name, decl: first, binder: -1 })
+        diag_error_span_label_at_notes("EffectHandleCollision", EFFECT_HANDLE_COLLISION,
+            "`{name}` has the handle `{handle}`, the handle of `{first_name}`", ed, line, col, col + name.byte_len(),
+            "`{name}` and `{first_name}` both have the handle `{handle}`",
+            "rename one effect; its handle is the lowercase form of its name",
+            ["`{first_name}` is declared here: {diag_normalize_path(diag_file_for_node(first))}:{first_line}:{first_col}"])
+        dropped.insert(ed, 1)
+    }
+    if dropped.len() == 0 { return }
+    node_set_args(program, nr_sublist_without(eds, dropped))
 }
 
 // Reports E0559 at each top-level effect whose name is a reserved built-in root's in some case
