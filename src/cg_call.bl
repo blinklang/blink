@@ -31,7 +31,7 @@ import typecheck.{
     tc_scalar_has_eq, tc_scalar_has_ord, tc_std_trait_built, tc_std_trait_owner, tc_call_reaches_user_trait, tc_written_impl_holds, tc_is_default_fill, tc_is_float_from_bits,
     DECL_NODE_AMBIGUOUS,
     is_import_module_name, is_builtin_namespace, is_builtin_fn, is_intrinsic_method, tc_call_declared_name,
-    tc_type_str, tc_ptr_offset_stride_known, tc_arg_value_at,
+    tc_type_str, tc_ptr_offset_stride_known, tc_arg_value_at, tc_derived_static_value_owner,
     tc_enum_variant_slots, tc_evar_name, tc_tid_child_count, tc_tid_child,
     tc_evar_field_slots, tc_evfield_name, tc_evfield_tid, tc_member_tid_at_instance,
     tc_struct_field_slots, tc_sfield_name, get_struct_field_tid,
@@ -83,6 +83,7 @@ import cg_eff.{
     cg_eff_ev_argument, cg_eff_lower_builtin_perform, cg_eff_lower_time_perform, cg_eff_lower_user_perform,
     cg_eff_lower_builtin_default_perform, cg_eff_lower_builtin_op_perform,
     cg_eff_lower_spawn_closure, cg_eff_spawn_value_task, cg_eff_pending_thunks, cg_eff_thunk_task_symbol, cg_eff_lower_fn_value,
+    cg_eff_lower_derived_static_value,
     cg_eff_lower_io_read_perform, cg_eff_impl_method_at,
     cg_eff_enter_inline_frame, cg_eff_leave_inline_frame, cg_eff_binder_is_shared, cg_eff_declare_cell,
 }
@@ -2158,6 +2159,40 @@ pub fn lower_fn_value(node: Int, decl: Int) -> Int ! Diag.Report {
     cg_eff_lower_fn_value(node, decl, symbol, cg_decl_takes_ev(decl))
 }
 
+// A derived static named as a value (`P.from_json`, `Status.from_str`). No declaration
+// exists, so the value is a thunk with the body a direct call reaches: from_json forwards to
+// the reader the call names, read off the Result its Fn type answers, and from_str, which
+// has no C function, takes the variant tests a call inlines.
+pub fn lower_derived_static_value(node: Int) -> Int ! Diag.Report {
+    let decl = tc_derived_static_value_owner(node)
+    let tid = tid_of_node(node)
+    if tid < 0 { return -1 }
+    let ret = child_tid(tid, Slot.Inner1)
+    // The two derived statics answer disjoint types: from_str an Option, from_json a Result.
+    let enum_tid = cc_str_backed_option_enum(ret)
+    if enum_tid >= 0 { return cg_eff_lower_derived_static_value(node, enum_tid) }
+    let symbol = cc_derived_from_json_symbol(decl, ret)
+    if symbol != "" { return cg_eff_lower_fn_value(node, -1, symbol, false) }
+    diag_ice_stage_not_built("cg_call derived `{node_name(node_obj(node))}.{node_name(node)}` named as a value", node)
+    -1
+}
+
+// The body of a thunk for the from_str of the Str-backed enum `enum_tid`, which has no C
+// function: the inlined body of a direct call, reading `params` for its argument, and
+// returning its result of type `ret`.
+pub fn lower_derived_from_str_body(span: Int, enum_tid: Int, ret: Int, params: List[Int]) -> Int ! Diag.Report {
+    if enum_tid < 0 || params.len() != 1 {
+        diag_ice_stage_not_built("cg_call body of a derived from_str named as a value", span)
+        return -1
+    }
+    let mark = cg_expr_pending_count()
+    let result = cc_enum_from_str_of(span, ret, enum_tid, params.get(0).unwrap())
+    let mut stmts = cg_expr_take_pending(mark)
+    if result < 0 { return -1 }
+    stmts.push(ir_return(span, result))
+    ir_block(span, stmts)
+}
+
 // The registered instance for a generic call, which must be an instance of the very
 // declaration this call resolved to. The pass walks every reachable call and records one,
 // so anything else is a compiler bug: the walk never reached this body, the driver has
@@ -2920,7 +2955,11 @@ fn cc_is_enum_from_str(method: Str) -> Bool {
 // The enum a `from_str` call answers, read off the Option its call is typed as, when that
 // enum is str-backed; otherwise -1. Typecheck types the call only for that shape.
 fn cc_str_backed_from_str_enum(node: Int) -> Int ! Diag.Report {
-    let tid = tid_of_node(node)
+    cc_str_backed_option_enum(tid_of_node(node))
+}
+
+// The Str-backed enum an Option of it holds, or -1.
+fn cc_str_backed_option_enum(tid: Int) -> Int ! Diag.Report {
     if tid < 0 || cc_kind(tid) != TyKind.Option { return -1 }
     let enum_tid = child_tid(tid, Slot.Inner1)
     if cc_kind(enum_tid) != TyKind.Enum { return -1 }
@@ -2934,8 +2973,14 @@ fn cc_str_backed_from_str_enum(node: Int) -> Int ! Diag.Report {
 fn cc_lower_enum_from_str(node: Int) -> Int ! Diag.Report {
     let given = sublist_length(node_args(node))
     if given != 1 { return cc_intrinsic_arity_wrong(node, TyKind.Enum, "from_str", 1, given) }
-    let tid = tid_of_node(node)
-    let enum_tid = cc_str_backed_from_str_enum(node)
+    let arg = lower_expr(sublist_get(node_args(node), 0))
+    if arg < 0 { return -1 }
+    cc_enum_from_str_of(node, tid_of_node(node), cc_str_backed_from_str_enum(node), arg)
+}
+
+// The tests of `E.from_str` on the lowered text `arg`, filling an Option `tid` of `enum_tid`.
+// A call and a value of from_str share it, so the two cannot disagree.
+fn cc_enum_from_str_of(node: Int, tid: Int, enum_tid: Int, arg: Int) -> Int ! Diag.Report {
     let carrier = cc_local(tid, node)
     if cc_stopped(carrier) { return -1 }
     let member = cc_member_layout(node, tid, Slot.Inner1)
@@ -2944,8 +2989,6 @@ fn cc_lower_enum_from_str(node: Int) -> Int ! Diag.Report {
     if cc_stopped(text_rec) { return -1 }
     let bools = cc_local(TYPE_BOOL, node)
     if cc_stopped(bools) { return -1 }
-    let arg = lower_expr(sublist_get(node_args(node), 0))
-    if arg < 0 { return -1 }
     let _td = ensure_typedef_for(tid)
     let text = c_mint_local("ez")
     cg_expr_push_pending(node, ir_let(TYPE_STR, node, text_rec.c_spelling, text, text_rec.slot_form, arg))
@@ -4230,9 +4273,13 @@ fn cc_derived_static_symbol(node: Int, owner: Str, method: Str) -> Str ! Diag.Re
     if method != "from_json" { return "" }
     let tid = tc_owner_tid(owner)
     if tid < 0 { return "" }
-    let decl = tc_tid_decl_node(tid)
+    cc_derived_from_json_symbol(tc_tid_decl_node(tid), tid_of_node(node))
+}
+
+// The from_json that `decl` derives and that answers the Result `res`, which the call and
+// the value both spell by, or "".
+fn cc_derived_from_json_symbol(decl: Int, res: Int) -> Str ! Diag.Report {
     if decl < 0 || !decl_has_derive(decl, "Deserialize") { return "" }
-    let res = tid_of_node(node)
     if res < 0 || cc_kind(res) != TyKind.Result { return "" }
     let built = child_tid(res, Slot.Inner1)
     if built < 0 || tc_tid_decl_node(tc_resolve(built)) != decl { return "" }

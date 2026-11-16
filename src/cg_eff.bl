@@ -17,7 +17,7 @@ import parser.{
 }
 import typecheck.{
     TyKind, TYPE_INT, TYPE_STR, TYPE_VOID, make_ffi_scope_type, make_fn_type, make_handler_type, tc_resolve, tc_type_str,
-    tc_impl_is_poly_user, tc_impl_owner_decl, tc_tid_decl_node, tc_tid_handler_effect, tc_tid_kind, tc_void_tid, tk_name, ty_pool,
+    tc_tid_child_count, tc_impl_is_poly_user, tc_impl_owner_decl, tc_tid_decl_node, tc_tid_handler_effect, tc_tid_kind, tc_void_tid, tk_name, ty_pool,
     tc_call_decl_node, tc_call_user_effect, tc_decl_ret_tid, tc_effect_ident, tc_handler_effect_root, tc_impl_trait_id, io_read_ops, is_io_read_derived_op, IO_READ_PRIMITIVE, handles_io_read,
 }
 import layout.{
@@ -31,7 +31,7 @@ import cname.{
     c_builtin_derived_op_name, c_builtin_effect_slot, c_cell_name, c_effect_default_op_name, c_effect_vtable_slot_name, c_ev_field_name, c_ev_global_name,
     c_vtable_userdata_member,
     c_ev_type_name,
-    c_impl_method_name, c_local_name, c_mint_local, c_param_name, c_runtime_helper,
+    c_impl_method_name, c_local_name, c_local_name_nth, c_mint_local, c_param_name, c_runtime_helper,
 }
 import ir.{
     ir_assign, ir_block, ir_box, ir_call_direct, ir_call_runtime, ir_cast,
@@ -51,6 +51,7 @@ import cg_trace.{cg_trace_builtin_effect, cg_trace_closure_frame, cg_trace_effec
 import free_names.{closure_read_names}
 import escape.{spawn_mut_param_reads}
 import cg_decl.{cg_decl_is_per_instance, cg_decl_takes_ev}
+import cg_call.{lower_derived_from_str_body}
 import cg_expr.{
     cg_expr_push_pending, lower_expr, lower_expr_as_value, lower_value_as_text, cg_expr_option_some, cg_expr_option_none,
     cg_expr_pending_count, cg_expr_sequence, x_site_args,
@@ -366,13 +367,18 @@ type PendingThunk {
     // runs on the pool thread and stashes the closure's result into the handle spawn
     // answered — minted beside the closure's own symbol so both exist before either prints.
     task_symbol: Str
-    // -1 for a thunk with a written body. For a top-level function named as a value, that
-    // function's declaration: the thunk's parameters are its parameters, and its body is one
-    // call to forward_symbol, passing the evidence vector when forward_ev says the function
-    // takes one.
+    // "" for a thunk with a written body. For a function named as a value, the symbol its
+    // body calls once, passing each parameter through and the evidence vector when
+    // forward_ev says the function takes one. forward_to is that function's declaration,
+    // whose parameters the thunk takes, or -1 for one the compiler makes with no
+    // declaration, such as a derived from_json: its parameters are then read off fn_tid.
     forward_to: Int
     forward_symbol: Str
     forward_ev: Bool
+    // The Str-backed enum whose from_str this thunk is, named as a value, or -1. from_str
+    // has no C function to forward to, so the body is the one a direct call inlines, and
+    // its parameters are read off fn_tid.
+    from_str_enum: Int = -1
     // Set once the driver has lowered the thunk's body, which is `body` (-1 for none). A
     // global initializer's thunks are lowered under the root with the initializer, and
     // printed later, after the signatures they call.
@@ -519,6 +525,7 @@ fn closure_layout(tid: Int, node: Int) -> LayoutRecord ! Diag.Report {
 // A top-level function named as a value. A closure is called with its own record in front
 // of the arguments and a plain function takes no record, so the value is a thunk that
 // forwards to the function rather than the function's own symbol. It captures nothing.
+// `decl` is -1 for a function the compiler makes with no declaration.
 pub fn cg_eff_lower_fn_value(node: Int, decl: Int, symbol: Str, takes_ev: Bool) -> Int ! Diag.Report {
     let tid = tid_of_node(node)
     if tid < 0 { return -1 }
@@ -529,6 +536,22 @@ pub fn cg_eff_lower_fn_value(node: Int, decl: Int, symbol: Str, takes_ev: Bool) 
         closure: node, symbol: thunk, fn_tid: tid, cap_names: [], cap_tids: [], cap_celled: [],
         handler_tid: -1, outer_name: "", task_symbol: "", forward_to: decl, forward_symbol: symbol,
         forward_ev: takes_ev, lowered: false, body: -1,
+    })
+    ir_closure_new(tid, node, rec.c_spelling, thunk, "", "", [])
+}
+
+// A derived from_str named as a value, which has no C function: a thunk that captures
+// nothing, whose body lower_derived_from_str_body writes.
+pub fn cg_eff_lower_derived_static_value(node: Int, enum_tid: Int) -> Int ! Diag.Report {
+    let tid = tid_of_node(node)
+    if tid < 0 { return -1 }
+    let rec = closure_layout(tid, node)
+    if rec.c_spelling == "" { return -1 }
+    let thunk = c_mint_local("fn_value")
+    eff_thunks.push(PendingThunk {
+        closure: node, symbol: thunk, fn_tid: tid, cap_names: [], cap_tids: [], cap_celled: [],
+        handler_tid: -1, outer_name: "", task_symbol: "", forward_to: -1, forward_symbol: "",
+        forward_ev: false, lowered: false, body: -1, from_str_enum: enum_tid,
     })
     ir_closure_new(tid, node, rec.c_spelling, thunk, "", "", [])
 }
@@ -1047,17 +1070,35 @@ pub fn cg_eff_thunk_params(i: Int) -> List[Str] ! Diag.Report {
     if t < 0 { return out }
     let th = eff_thunks.get(t).unwrap()
     if th.handler_tid >= 0 { return handler_op_params(th.closure) }
-    let ps = node_params(thunk_sig_node(th))
-    if ps == -1 { return out }
     let mut k = 0
-    while k < sublist_length(ps) {
-        let p = sublist_get(ps, k)
-        let spelling = thunk_spelling(child_tid(th.fn_tid, Slot.Param(k)), Position.Param, p)
+    while k < thunk_param_count(th) {
+        let spelling = thunk_spelling(child_tid(th.fn_tid, Slot.Param(k)), Position.Param, thunk_param_span(th, k))
         if spelling == "" { return [] }
-        out.push("{spelling} {c_param_name(ps, k)}")
+        out.push("{spelling} {thunk_param_c_name(th, k)}")
         k = k + 1
     }
     out
+}
+
+// A forward to a function with no declaration, or a derived static's body, has no
+// parameter nodes, so its parameters are the Fn type's slots, and each takes a minted name.
+fn forwards_undeclared(th: PendingThunk) -> Bool {
+    (th.forward_symbol != "" || th.from_str_enum >= 0) && th.forward_to < 0
+}
+
+fn thunk_param_count(th: PendingThunk) -> Int {
+    if forwards_undeclared(th) { return tc_tid_child_count(tc_resolve(th.fn_tid)) - 1 }
+    declared_param_count(thunk_sig_node(th))
+}
+
+fn thunk_param_c_name(th: PendingThunk, k: Int) -> Str {
+    if forwards_undeclared(th) { return c_local_name_nth("arg", k) }
+    c_param_name(node_params(thunk_sig_node(th)), k)
+}
+
+fn thunk_param_span(th: PendingThunk, k: Int) -> Int {
+    if forwards_undeclared(th) { return th.closure }
+    sublist_get(node_params(thunk_sig_node(th)), k)
 }
 
 // The push and the enter event that open the body of the thunk, which the frame name it was
@@ -1069,7 +1110,7 @@ pub fn cg_eff_thunk_trace_enter(i: Int) -> List[Int] ! Diag.Report {
     let sig = thunk_sig_node(th)
     let mut tids: List[Int] = []
     let ps = node_params(sig)
-    let n = if ps == -1 { 0 } else { sublist_length(ps) }
+    let n = thunk_param_count(th)
     let mut k = 0
     while k < n {
         tids.push(if th.handler_tid >= 0 { tid_of_node(sublist_get(ps, k)) } else { child_tid(th.fn_tid, Slot.Param(k)) })
@@ -1086,10 +1127,9 @@ pub fn cg_eff_thunk_frame(i: Int) -> List[Str] ! Diag.Report {
     let t = thunk_at(i)
     if t < 0 { return out }
     let th = eff_thunks.get(t).unwrap()
-    let ps = node_params(thunk_sig_node(th))
     let mut k = 0
-    while ps != -1 && k < sublist_length(ps) {
-        out.push(c_param_name(ps, k))
+    while k < thunk_param_count(th) {
+        out.push(thunk_param_c_name(th, k))
         k = k + 1
     }
     if th.handler_tid >= 0 { out.push(th.outer_name) }
@@ -1116,27 +1156,28 @@ fn thunk_sig_node(th: PendingThunk) -> Int {
 
 // The body of a thunk that forwards to a function, built here because no written body
 // exists to lower: one call passing each parameter through, returned unless the result is
-// void. None for a thunk with a written body, which the driver lowers itself.
+// void, or the inlined body of a derived static. None for a thunk with a written body,
+// which the driver lowers itself.
 pub fn cg_eff_forwarding_body(i: Int) -> Option[Int] ! Diag.Report {
     let t = thunk_at(i)
     if t < 0 { return Some(-1) }
     let th = eff_thunks.get(t).unwrap()
-    if th.forward_to < 0 { return None }
+    if th.forward_symbol == "" && th.from_str_enum < 0 { return None }
     let span = th.closure
     let mut args: List[Int] = []
-    let ps = node_params(th.forward_to)
     let mut k = 0
-    while ps != -1 && k < sublist_length(ps) {
+    while k < thunk_param_count(th) {
         let ptid = child_tid(th.fn_tid, Slot.Param(k))
         if ptid < 0 { return Some(-1) }
         let rec = layout_or_ice(ptid, Position.Local, span, "UnspellableThunkSlot", "forwarded parameter")
         if rec.c_spelling == "" { return Some(-1) }
-        args.push(ir_var_ref(ptid, span, rec.c_spelling, c_param_name(ps, k), rec.slot_form))
+        args.push(ir_var_ref(ptid, span, rec.c_spelling, thunk_param_c_name(th, k), rec.slot_form))
         k = k + 1
     }
-    if th.forward_ev { args.push(cg_eff_ev_argument(span)) }
     let ret_tid = cg_eff_thunk_ret_tid(i)
     if ret_tid < 0 { return Some(-1) }
+    if th.from_str_enum >= 0 { return Some(lower_derived_from_str_body(span, th.from_str_enum, ret_tid, args)) }
+    if th.forward_ev { args.push(cg_eff_ev_argument(span)) }
     let ret = layout_or_ice(ret_tid, Position.Local, span, "UnspellableThunkSlot", "forwarded result")
     if ret.c_spelling == "" { return Some(-1) }
     let call = ir_call_direct(ret_tid, span, ret.c_spelling, th.forward_symbol, ret.slot_form, args)
@@ -1190,7 +1231,7 @@ pub fn cg_eff_print_thunk(i: Int, body: Int) ! Diag.Report {
     let ret = cg_eff_thunk_ret(i)
     if ret == "" { return }
     let params = cg_eff_thunk_params(i)
-    if params.len() != declared_param_count(thunk_sig_node(th)) { return }
+    if params.len() != thunk_param_count(th) { return }
     let whole = with_capture_prologue(th, body)
     if whole < 0 { return }
     // A handler operation is reached through a vtable slot, which passes the slot's userdata
@@ -1378,6 +1419,8 @@ pub fn cg_eff_thunk_close() ! Diag.Report {
 // from, so a binder and its declaration cannot disagree. Answers false when a slot has no
 // type: a parameter left unbound would resolve to an outer name instead.
 fn bind_thunk_params(th: PendingThunk, scope: Int, mut cells: List[Int]) -> Bool ! Diag.Report {
+    // The forwarding body reads each parameter by its C name, and no source name binds one.
+    if forwards_undeclared(th) { return true }
     let ps = node_params(thunk_sig_node(th))
     if ps == -1 { return true }
     let mut k = 0

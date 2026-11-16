@@ -11022,8 +11022,15 @@ fn register_derive_method_sigs(program: Int) {
 // signature. It has no fn declaration, and it builds its type inside its result: the ok arm of
 // from_json's Result, or the Some arm of from_str's Option.
 fn tc_derived_static_owner(sig: Int) -> Int {
+    if fnsig_pool.get(sig).unwrap().type_params_count == 0 { return -1 }
+    tc_derived_static_decl(sig)
+}
+
+// The type declaration a derived static fn's signature builds, generic or not, or -1 for any
+// other signature.
+fn tc_derived_static_decl(sig: Int) -> Int {
     let fs = fnsig_pool.get(sig).unwrap()
-    if fs.decl >= 0 || fs.type_params_count == 0 { return -1 }
+    if fs.decl >= 0 { return -1 }
     let built = tc_derived_static_built(fs.ret)
     let td = if built < 0 { -1 } else { tc_tid_decl_node(built) }
     if td < 0 { return -1 }
@@ -24549,7 +24556,8 @@ fn nr_note_call_decl(call_node: Int, decl_node: Int) {
 // the same record: the declaration's kind tells the two apart, and a reader of the global
 // answer takes the name for a C global, which a function is not.
 // Three key kinds share the record and never meet: an ident (a bare read), a field access
-// (a `module.name` read) and a call through a value, which reads that value (see
+// (a `module.name` read, or a `T.name` read of a derived static, keyed to its type's
+// declaration) and a call through a value, which reads that value (see
 // tc_note_value_call).
 let mut tc_global_read_decl: Map[Int, Int] = Map()
 
@@ -24588,6 +24596,16 @@ fn nr_note_fn_value_decl(ident_node: Int, decl_node: Int) {
     if decl_node < 0 { return }
     if node_kind(decl_node) != NodeKind.FnDef { return }
     tc_global_read_decl.insert(ident_node, decl_node)
+}
+
+// The type declaration whose derived static this `T.name` read names as a value, or -1.
+// A derived static (`P.from_json`) has no function declaration for a later pass to name, so
+// the record holds the type declaration it builds, which no other key kind stores.
+pub fn tc_derived_static_value_owner(access_node: Int) -> Int {
+    if node_kind(access_node) != NodeKind.FieldAccess { return -1 }
+    let decl = tc_global_read_decl.get(access_node) ?? -1
+    if decl < 0 || node_kind(decl) != NodeKind.TypeDef { return -1 }
+    decl
 }
 
 // ── The local binder a read resolved to ─────────────────────────────
@@ -29025,6 +29043,8 @@ fn tc_type_path_fn_value(node: Int, obj_node: Int, qual: Str, name: Str) -> Opti
 fn tc_type_path_own_value(node: Int, head: StaticHead, own: Int) -> Option[Int] ! TypeCheck.Resolve, Diag.Report {
     let decl = fnsig_pool.get(own).unwrap().decl
     if tc_fn_decl_takes_self(decl) { return None }
+    let derived = tc_derived_static_decl(own)
+    if derived >= 0 { tc_global_read_decl.insert(node, derived) }
     if head.decl >= 0 && decl >= 0 && node_is_pub(decl) == 0 && !tc_same_module(node_module(decl), nr_current_module) {
         diag_error_at("PrivateItemAccess", PRIVATE_ITEM_ACCESS, "cannot access private function `{node_name(decl)}` from another module", node, "mark the function as `pub` in its module")
         return Some(tc_error_recovery_tid())

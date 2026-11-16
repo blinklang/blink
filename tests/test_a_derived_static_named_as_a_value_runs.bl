@@ -1,0 +1,214 @@
+// A derived static, `from_json` of a type that derives Deserialize or `from_str` of a
+// Str-backed enum, is a function in its type's `T.` namespace, so `T.from_json` with no
+// argument list is a function value (sections/03_types.md §3.4 "A type-scoped or associated
+// function named as a value"), as `Duration.ms` is. No declaration is written for it, and the
+// value still does what a direct call does. Each program must check clean, then build and
+// run in both build modes and print the expected text.
+
+import compile_test_helpers
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> ProcessResult ! Process.Spawn {
+    process.run("sh", ["-c", cmd]).unwrap()
+}
+
+fn expect_prints_with(tag: Str, lines: List[Str], flags: Str, want: Str) ! IO, FS.Write, Process.Spawn, Env.Read {
+    let dir = "{compile_test_helpers.scratch_root()}/derived_static_value_{tag}"
+    let _ = sh("rm -rf {dir} && mkdir -p {dir}")
+    fs.write("{dir}/x.bl", lines.join("\n").concat("\n")).unwrap()
+    let clear = "env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE"
+    let mut bad = 0
+    let c = sh("B=$(pwd)/build/blink; cd {dir} && {clear} timeout 120 $B check x.bl < /dev/null")
+    if !c.success() {
+        io.eprintln("{tag} check: ended {c.end}\n{c.out}{c.err_out}")
+        bad = bad + 1
+    }
+    for mode in ["--per-module", "--no-per-module"] {
+        let r = sh("B=$(pwd)/build/blink; cd {dir} && {clear} timeout 120 $B run {mode} {flags} x.bl 2>/dev/null < /dev/null")
+        if !r.success() || r.out.trim() != want {
+            let e = sh("B=$(pwd)/build/blink; cd {dir} && {clear} timeout 120 $B run {mode} {flags} x.bl < /dev/null")
+            io.eprintln("{tag} {mode} {flags}: ended {r.end}, printed [{r.out.trim()}], want [{want}]\n{e.err_out}")
+            bad = bad + 1
+        }
+    }
+    let _ = sh("rm -rf {dir}")
+    assert_eq(bad, 0)
+}
+
+fn expect_prints(tag: Str, lines: List[Str], want: Str) ! IO, FS.Write, Process.Spawn, Env.Read {
+    expect_prints_with(tag, lines, "", want)
+}
+
+fn p_lines(body: List[Str]) -> List[Str] {
+    let mut out = [
+        "@derive(Deserialize)",
+        "type P \{ v: Int }",
+        "fn show(r: Result[P, Str]) -> Str \{",
+        "    match r \{",
+        "        Ok(p) => \"\{p.v}\"",
+        "        Err(_) => \"err\"",
+        "    }",
+        "}",
+        "fn main() \{",
+    ]
+    for l in body { out.push(l) }
+    out.push("}")
+    out
+}
+
+test "a derived from_json is a value with no expected type" {
+    expect_prints("plain_let", p_lines([
+        "    let f = P.from_json",
+        "    io.println(show(f(#\"\{\"v\":3}\"#)))",
+        "    io.println(show(f(\"nope\")))",
+    ]), "3\nerr")
+}
+
+test "a derived from_json is the function a parameter type expects" {
+    expect_prints("as_argument", p_lines([
+        "    let rs = [#\"\{\"v\":1}\"#, #\"\{\"v\":2}\"#].map(P.from_json)",
+        "    io.println(show(rs.get(1).unwrap()))",
+    ]), "2")
+}
+
+test "a derived from_json value and a direct call build one reader" {
+    expect_prints("value_and_call", p_lines([
+        "    let f: fn(Str) -> Result[P, Str] = P.from_json",
+        "    io.println(show(f(#\"\{\"v\":4}\"#)))",
+        "    io.println(show(P.from_json(#\"\{\"v\":5}\"#)))",
+    ]), "4\n5")
+}
+
+test "the expected type fixes the instance of a generic type's from_json value" {
+    expect_prints("generic_annotated", [
+        "@derive(Deserialize)",
+        "type Box[T] \{ v: T }",
+        "fn main() \{",
+        "    let f: fn(Str) -> Result[Box[Int], Str] = Box.from_json",
+        "    let g: fn(Str) -> Result[Box[Str], Str] = Box.from_json",
+        "    match f(#\"\{\"v\":8}\"#) \{",
+        "        Ok(b) => io.println(\"\{b.v}\")",
+        "        Err(e) => io.println(\"err \{e}\")",
+        "    }",
+        "    match g(#\"\{\"v\":\"s\"}\"#) \{",
+        "        Ok(b) => io.println(b.v)",
+        "        Err(e) => io.println(\"err \{e}\")",
+        "    }",
+        "}",
+    ], "8\ns")
+}
+
+test "a later use fixes the instance of a generic type's from_json value" {
+    expect_prints("generic_later_use", [
+        "@derive(Deserialize)",
+        "type Box[T] \{ v: T }",
+        "fn main() \{",
+        "    let f = Box.from_json",
+        "    let r: Result[Box[Int], Str] = f(#\"\{\"v\":3}\"#)",
+        "    match r \{",
+        "        Ok(b) => io.println(\"\{b.v}\")",
+        "        Err(e) => io.println(\"err \{e}\")",
+        "    }",
+        "}",
+    ], "3")
+}
+
+test "a from_json value in a generic body takes each instance of the body" {
+    expect_prints("generic_body", [
+        "@derive(Deserialize)",
+        "type Box[T] \{ v: T }",
+        "fn first[T](s: Str) -> Result[Box[T], Str] \{",
+        "    let f: fn(Str) -> Result[Box[T], Str] = Box.from_json",
+        "    f(s)",
+        "}",
+        "fn main() \{",
+        "    let a: Result[Box[Int], Str] = first(#\"\{\"v\":4}\"#)",
+        "    let b: Result[Box[Str], Str] = first(#\"\{\"v\":\"s\"}\"#)",
+        "    match a \{",
+        "        Ok(x) => io.println(\"\{x.v}\")",
+        "        Err(e) => io.println(\"err \{e}\")",
+        "    }",
+        "    match b \{",
+        "        Ok(x) => io.println(x.v)",
+        "        Err(e) => io.println(\"err \{e}\")",
+        "    }",
+        "}",
+    ], "4\ns")
+}
+
+test "a from_json value runs under a trace and in a debug build" {
+    let lines = p_lines([
+        "    let f = P.from_json",
+        "    io.println(show(f(#\"\{\"v\":6}\"#)))",
+    ])
+    expect_prints_with("traced", lines, "--trace", "6")
+    expect_prints_with("debug", lines, "--debug", "6")
+}
+
+fn status_lines(body: List[Str]) -> List[Str] {
+    let mut out = [
+        "type Status \{",
+        "    Open = \"open\"",
+        "    Done = \"done\"",
+        "}",
+        "fn show(o: Option[Status]) -> Str \{",
+        "    match o \{",
+        "        Some(s) => s.to_str()",
+        "        None => \"none\"",
+        "    }",
+        "}",
+        "fn main() \{",
+    ]
+    for l in body { out.push(l) }
+    out.push("}")
+    out
+}
+
+test "a Str-backed enum's from_str is a value with no expected type" {
+    expect_prints("from_str_plain_let", status_lines([
+        "    let g = Status.from_str",
+        "    io.println(show(g(\"done\")))",
+        "    io.println(show(g(\"Done\")))",
+    ]), "done\nnone")
+}
+
+test "a Str-backed enum's from_str is the function a parameter type expects" {
+    expect_prints("from_str_as_argument", status_lines([
+        "    let os = [\"x\", \"open\"].map(Status.from_str)",
+        "    io.println(show(os.get(0).unwrap()))",
+        "    io.println(show(os.get(1).unwrap()))",
+    ]), "none\nopen")
+}
+
+test "a from_str value and a direct call agree" {
+    expect_prints("from_str_value_and_call", status_lines([
+        "    let g: fn(Str) -> Option[Status] = Status.from_str",
+        "    io.println(show(g(\"open\")))",
+        "    io.println(show(Status.from_str(\"done\")))",
+    ]), "open\ndone")
+}
+
+test "a from_str value runs under a trace and in a debug build" {
+    let lines = status_lines([
+        "    let g = Status.from_str",
+        "    io.println(show(g(\"open\")))",
+    ])
+    expect_prints_with("from_str_traced", lines, "--trace", "open")
+    expect_prints_with("from_str_debug", lines, "--debug", "open")
+}
+
+fn run_fixture(name: Str, flags: List[Str]) -> ProcessResult ! Process.Spawn {
+    let mut args = ["run"]
+    for f in flags { args.push(f) }
+    args.push("tests/zzds_derived_static_value/src/{name}.bl")
+    process.run("build/blink", args).unwrap()
+}
+
+test "a type imported from another module is named with its derived statics as values" {
+    for flags in [[], ["--no-per-module"]] {
+        let r = run_fixture("main_imported_type_names_its_derived_statics", flags)
+        if r.out != "5\n7\ndark\n" { io.println("FAIL {flags.join(" ")} got: {r.out}{r.err_out}") }
+        assert(r.success())
+        assert_eq(r.out, "5\n7\ndark\n")
+    }
+}
