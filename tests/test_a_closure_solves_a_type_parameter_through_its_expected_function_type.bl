@@ -1,0 +1,176 @@
+// sections/03_types.md §3.3 "Bidirectional inference" and "Closures": a closure takes its
+// parameter and return types from its expected function type, and its body solves what that
+// type leaves open. When the expected type holds a type parameter of the callee or of the
+// struct being built, the closure solves it: through a closure nested in the return, and
+// through a struct field whose type parameter another field fixes. Each program must build
+// and run and print the expected text.
+
+import compile_test_helpers.{compile_and_run}
+
+fn expect_runs(tag: Str, src: Str, want: Str) ! IO, FS.Delete, FS.Write, Process.Spawn, FS.Read, Env.Read {
+    let r = compile_and_run(src, "_closure_solves_{tag}")
+    if r.exit_code != 0 || r.out != want { io.println("FAIL {tag}: exit {r.exit_code}\n{r.out}{r.err_out}") }
+    assert(r.exit_code == 0)
+    assert_eq(r.out, want)
+}
+
+test "a closure returned by a closure solves the callee's type parameter" {
+    expect_runs("nested_str", #"fn mkf[U](f: fn(Int) -> fn() -> U) -> U { f(5)() }
+fn main() {
+    let r = mkf(fn(n) { fn() { "{n}" } })
+    io.println(r)
+}
+"#, "5\n")
+}
+
+test "a closure returned by a closure solves the type parameter as Int" {
+    expect_runs("nested_int", #"fn mkf[U](f: fn(Int) -> fn() -> U) -> U { f(5)() }
+fn main() {
+    let r = mkf(fn(n) { fn() { n * 2 } })
+    io.println("{r + 1}")
+}
+"#, "11\n")
+}
+
+test "a closure two levels down solves the callee's type parameter" {
+    expect_runs("nested_two", #"fn mkg[U](f: fn(Int) -> fn() -> fn() -> U) -> U { f(3)()() }
+fn main() {
+    let r = mkg(fn(n) { fn() { fn() { [n, n] } } })
+    io.println("{r.len()}")
+}
+"#, "2\n")
+}
+
+test "a struct fn field closure takes the type parameter another field fixes" {
+    expect_runs("field_after", #"type W[T] { v: T, f: fn(T) -> Int }
+fn main() {
+    let w = W { v: 3, f: fn(x) { x + 1 } }
+    let g = w.f
+    io.println("{g(w.v)}")
+}
+"#, "4\n")
+}
+
+test "a struct fn field closure written before the field that fixes the type parameter" {
+    expect_runs("field_before", #"type W[T] { f: fn(T) -> Int, v: T }
+fn main() {
+    let w = W { f: fn(x) { x.len() }, v: "abc" }
+    let g = w.f
+    io.println("{g(w.v)}")
+}
+"#, "3\n")
+}
+
+test "a struct fn field closure solves a type parameter only its return names" {
+    expect_runs("field_ret", #"type Mk[T] { mk: fn() -> T }
+fn main() {
+    let m = Mk { mk: fn() { 7 } }
+    let g = m.mk
+    io.println("{g() + 1}")
+}
+"#, "8\n")
+}
+
+test "a struct field closure that returns a closure solves the type parameter" {
+    expect_runs("field_nested", #"type Mk[T] { mk: fn() -> fn() -> T }
+fn main() {
+    let m = Mk { mk: fn() { fn() { "hi" } } }
+    let g = m.mk
+    io.println(g()())
+}
+"#, "hi\n")
+}
+
+test "a later use fixes the type parameter a struct fn field closure leaves open" {
+    expect_runs("field_later_use", #"type W[T] { f: fn(T) -> Int }
+fn main() {
+    let w = W { f: fn(x) { 1 } }
+    let g = w.f
+    io.println("{g(4)}")
+}
+"#, "1\n")
+}
+
+test "a struct fn field closure in a generic body takes the body's type parameter" {
+    expect_runs("field_generic_body", #"type W[T] { v: T, f: fn(T) -> Int }
+fn build[T](v: T, k: Int) -> W[T] { W { f: fn(x) { k }, v: v } }
+fn main() {
+    let w = build("s", 6)
+    let g = w.f
+    io.println("{g(w.v)}")
+}
+"#, "6\n")
+}
+
+test "one struct fn field closure solves the type parameter another closure takes" {
+    expect_runs("field_chain", #"type P[A, B] { a: A, f: fn(A) -> B, g: fn(B) -> Int }
+fn main() {
+    let p = P { g: fn(y) { y.len() }, a: 2, f: fn(x) { "{x}{x}" } }
+    let f = p.f
+    let g = p.g
+    io.println("{g(f(p.a))}")
+}
+"#, "2\n")
+}
+
+test "a type parameter nothing fixes is a check error, not a compiler defect" {
+    let r = compile_and_run(#"type W[T] { f: fn(T) -> Int }
+fn main() {
+    let w = W { f: fn(x) { 1 } }
+    io.println("x")
+}
+"#, "_closure_solves_field_open")
+    let text = "{r.out}{r.err_out}"
+    if !text.contains("CannotInferType") || text.contains("internal compiler error") { io.println("FAIL field_open: exit {r.exit_code}\n{text}") }
+    assert(r.exit_code != 0)
+    assert(text.contains("CannotInferType"))
+    assert(!text.contains("internal compiler error"))
+}
+
+test "a closure argument of a generic method solves the method's type parameter" {
+    expect_runs("method_nested", #"type B { k: Int }
+trait Mk {
+    fn mk[U](self, f: fn(Int) -> fn() -> U) -> U
+}
+impl Mk for B {
+    fn mk[U](self, f: fn(Int) -> fn() -> U) -> U { f(self.k)() }
+}
+fn main() {
+    let r = B { k: 7 }.mk(fn(n) { fn() { "{n}" } })
+    io.println(r)
+}
+"#, "7\n")
+}
+
+test "a closure passed by keyword solves the callee's type parameter" {
+    expect_runs("keyword_nested", #"fn mkf[U](base: Int, -- f: fn(Int) -> fn() -> U) -> U { f(base)() }
+fn main() {
+    let r = mkf(9, f: fn(n) { fn() { n + 1 } })
+    io.println("{r}")
+}
+"#, "10\n")
+}
+
+test "a later use fixes the type parameter a struct fn field closure calls a method on" {
+    expect_runs("field_method_later_use", #"type W[T] { f: fn(T) -> Int }
+fn main() {
+    let w = W { f: fn(x) { x.len() } }
+    let g = w.f
+    io.println("{g("ab")}")
+}
+"#, "2\n")
+}
+
+test "a type parameter nothing fixes under a method call is a check error, not a compiler defect" {
+    let r = compile_and_run(#"type W[T] { f: fn(T) -> Int }
+fn main() {
+    let w = W { f: fn(x) { x.len() } }
+    io.println("x")
+}
+"#, "_closure_solves_field_method_open")
+    let text = "{r.out}{r.err_out}"
+    if !text.contains("CannotInferType") || text.contains("internal compiler error") { io.println("FAIL field_method_open: exit {r.exit_code}\n{text}") }
+    assert(r.exit_code != 0)
+    assert(text.contains("CannotInferType"))
+    assert(!text.contains("internal compiler error"))
+}

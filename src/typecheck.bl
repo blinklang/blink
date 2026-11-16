@@ -3257,20 +3257,21 @@ fn tc_tid_has_typevar_among(tid0: Int, foreign_only: Int) -> Int {
         if foreign_only != 0 && tc_typevar_binds_here(tid) != 0 { return 0 }
         return 1
     }
-    if k == TyKind.List || k == TyKind.Option || k == TyKind.Set || k == TyKind.Channel || k == TyKind.Iterator || k == TyKind.Range {
+    if k == TyKind.List || k == TyKind.Option || k == TyKind.Set || k == TyKind.Channel || k == TyKind.Iterator || k == TyKind.Handle || k == TyKind.Ptr || k == TyKind.Range || k == TyKind.Template {
         return tc_tid_has_typevar_among(e.inner1, foreign_only)
     }
     if k == TyKind.Result || k == TyKind.Map {
         if tc_tid_has_typevar_among(e.inner1, foreign_only) != 0 { return 1 }
         return tc_tid_has_typevar_among(e.inner2, foreign_only)
     }
-    if k == TyKind.Tuple || k == TyKind.Struct || k == TyKind.Enum {
+    if k == TyKind.Tuple || k == TyKind.Struct || k == TyKind.Enum || k == TyKind.Fn {
         let mut i = 0
         while i < e.params_count {
             let c = ty_param_list.get(e.params_start + i).unwrap()
             if tc_tid_has_typevar_among(c, foreign_only) != 0 { return 1 }
             i = i + 1
         }
+        if k == TyKind.Fn { return tc_tid_has_typevar_among(e.inner1, foreign_only) }
         return 0
     }
     0
@@ -7696,6 +7697,30 @@ fn tc_call_binder_metavars(sig: Int, call_node: Int, binds: Map[Str, Int], args_
     out
 }
 
+// Whether argument `i` has a type an earlier error lost. A closure parameter written with no
+// type is a hole the formal fills when the closure is seeded, not a loss: `fn(n) { fn() { .. } }`
+// passed to `f: fn(Int) -> fn() -> U` has an open `n` until then, and its body is what solves U.
+fn tc_arg_type_lost(args_sl: Int, i: Int, t: Int) -> Bool {
+    if tc_tid_has_unknown(t) == 0 { return false }
+    if args_sl == -1 || i >= sublist_length(args_sl) { return true }
+    let mut a = sublist_get(args_sl, i)
+    if node_kind(a) == NodeKind.NamedArg { a = node_value(a) }
+    if a == -1 || node_kind(a) != NodeKind.Closure { return true }
+    let r = tc_tid_resolved(t)
+    if tc_tid_kind(r) != TyKind.Fn { return true }
+    if tc_tid_has_unknown(tc_tid_child(r, 0)) != 0 { return true }
+    let params_sl = node_params(a)
+    let n = if params_sl == -1 { 0 } else { sublist_length(params_sl) }
+    if n != tc_tid_child_count(r) - 1 { return true }
+    let mut k = 0
+    while k < n {
+        let written = node_type_ann(sublist_get(params_sl, k)) != -1
+        if written && tc_tid_has_unknown(tc_tid_child(r, k + 1)) != 0 { return true }
+        k = k + 1
+    }
+    false
+}
+
 fn tc_binder_left_open(nidx: Int, binds: Map[Str, Int], args_lost: Bool) -> Bool {
     if nidx < fnsig_tparam_ret_only.len() && fnsig_tparam_ret_only.get(nidx).unwrap() != 0 { return true }
     !args_lost && nidx < fnsig_type_param_names.len() && !binds.contains_key(fnsig_type_param_names.get(nidx).unwrap())
@@ -7704,11 +7729,13 @@ fn tc_binder_left_open(nidx: Int, binds: Map[Str, Int], args_lost: Bool) -> Bool
 // `binds` with each open type param of the call bound to its minted metavar. Both the
 // return type and the closure seed read the call's binds through here, so the U a closure
 // body solves is the U the call returns.
-fn tc_bind_call_mints(sig: Int, call_node: Int, binds: Map[Str, Int], arg_tids: List[Int]) {
+fn tc_bind_call_mints(sig: Int, call_node: Int, args_sl: Int, binds: Map[Str, Int], arg_tids: List[Int]) {
     let fs = fnsig_pool.get(sig).unwrap()
     let mut args_lost = false
-    for t in arg_tids {
-        if tc_tid_has_unknown(t) != 0 { args_lost = true }
+    let mut i = 0
+    while i < arg_tids.len() {
+        if tc_arg_type_lost(args_sl, i, arg_tids.get(i).unwrap()) { args_lost = true }
+        i = i + 1
     }
     let mints = tc_call_binder_metavars(sig, call_node, binds, args_lost)
     let mut pi = 0
@@ -7781,9 +7808,20 @@ fn instantiate_return_type(sig: Int, args_sl: Int, arg_tids: List[Int], call_nod
     if ret < 0 || ret >= ty_pool.len() { return ret }
     tc_report_unsourced_binders(sig, call_node, self_offset)
     let binds = build_typevar_binds(sig, args_sl, arg_tids, self_offset)
-    tc_bind_call_mints(sig, call_node, binds, arg_tids)
+    tc_bind_call_mints(sig, call_node, args_sl, binds, arg_tids)
     tc_note_generic_call(sig, call_node, self_offset, binds)
     substitute_typevar_tid(ret, binds)
+}
+
+// A generic call's type, with its metavar-carrying arguments then pinned from the same binds:
+// a method call's closure argument solves the method's own type parameter as a free call's
+// does (sections/03_types.md §3.3).
+// `outer` holds what the receiver fixed (an impl's or a trait's binders), which the arguments
+// do not bind.
+fn tc_instantiate_generic_call(sig: Int, args_sl: Int, arg_tids: List[Int], call_node: Int, self_offset: Int, outer: Map[Str, Int]) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    let ret_t = instantiate_return_type(sig, args_sl, arg_tids, call_node, self_offset)
+    tc_pin_generic_args_from_binds(sig, call_node, args_sl, arg_tids, self_offset, outer)
+    ret_t
 }
 
 // Pin a generic call's metavar-carrying arguments from the resolved typevar binds.
@@ -7795,13 +7833,16 @@ fn instantiate_return_type(sig: Int, args_sl: Int, arg_tids: List[Int], call_nod
 // supplies it), substitution leaves it a typevar, unify leaves the arg's α unbound,
 // and E0301 fires at the arg's own binding boundary. Runs only for metavar-carrying
 // args — concrete args and the no-generic path are untouched.
-fn tc_pin_generic_args_from_binds(sig: Int, call_node: Int, args_sl: Int, arg_tids: List[Int], self_offset: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+fn tc_pin_generic_args_from_binds(sig: Int, call_node: Int, args_sl: Int, arg_tids: List[Int], self_offset: Int, outer: Map[Str, Int]) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     if args_sl == -1 { return }
     let fs = fnsig_pool.get(sig).unwrap()
     let param_start = fs.params_start
     let param_count = fs.params_count
-    let binds = build_typevar_binds(sig, args_sl, arg_tids, self_offset)
-    tc_bind_call_mints(sig, call_node, binds, arg_tids)
+    let mut binds = build_typevar_binds(sig, args_sl, arg_tids, self_offset)
+    tc_bind_call_mints(sig, call_node, args_sl, binds, arg_tids)
+    for (k, v) in outer {
+        if !binds.contains_key(k) { binds.insert(k, v) }
+    }
     let tids = tc_seed_closure_args_with_binds(sig, args_sl, arg_tids, self_offset, binds)
     let mut i = 0
     while i < tids.len() {
@@ -9918,9 +9959,7 @@ fn tc_check_free_call(fn_name: Str, sig0: Int, node: Int) -> Int ! TypeCheck.Res
     // sibling args) codegens the Map() with the right kops instead of an erased default. If
     // a typevar is genuinely unbound (no arg pins it), the arg's α stays unbound and E0301
     // fires at its own binding/boundary.
-    let ret_t = instantiate_return_type(sig, args_sl, arg_tids, node, 0)
-    tc_pin_generic_args_from_binds(sig, node, args_sl, arg_tids, 0)
-    ret_t
+    tc_instantiate_generic_call(sig, args_sl, arg_tids, node, 0, Map())
 }
 
 // A call of a function its module declares twice (E1016) may have meant either declaration,
@@ -12081,7 +12120,19 @@ fn tc_check_closure_tail(cls: Int, ret: Int, tail_t: Int) ! TypeCheck.Resolve, T
         return tc_mismatch_at("return value type {type_to_str(tail_t)} does not match function `closure` return type {type_to_str(ret)}", cls, ret, tail_t)
     }
     // The bound return fixes an open slot of the tail, as a written `-> R` would.
-    tc_join_agreeing_values(ret, tail_t)
+    tc_join_closure_ret(ret, tail_t)
+}
+
+// A closure's return and a value it hands back are one type, so an open slot of either is fixed
+// from the other. A function value is joined too, unlike two sibling values: the context's
+// `fn() -> U` is solved by the closure the body returns (sections/03_types.md §3.3).
+fn tc_join_closure_ret(ret: Int, v: Int) {
+    let fn_ret = tc_tid_kind(tc_tid_resolved(ret)) == TyKind.Fn
+    if !fn_ret || tc_tid_kind(tc_tid_resolved(v)) != TyKind.Fn { return tc_join_agreeing_values(ret, v) }
+    if tc_boundary_check_active == 0 { return }
+    if tc_tid_has_unknown(ret) != 0 || tc_tid_has_unknown(v) != 0 { return }
+    if types_compatible(ret, v) == 0 { return }
+    let _ = tc_unify(ret, v)
 }
 
 fn tc_check_closure_returns(ret: Int, returns: List[Int]) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
@@ -12100,7 +12151,7 @@ fn tc_check_closure_returns(ret: Int, returns: List[Int]) ! TypeCheck.Resolve, T
             tc_calls.reported.insert(r, 1)
             tc_mismatch_at("return value type {type_to_str(vt)} does not match function `closure` return type {type_to_str(ret)}", r, ret, vt)
         } else {
-            tc_join_agreeing_values(ret, vt)
+            tc_join_closure_ret(ret, vt)
         }
     }
 }
@@ -14955,7 +15006,7 @@ fn tc_check_struct_lit_field_closures(stid: Int, node: Int) ! TypeCheck.Resolve,
             let declared = resolve_alias_tid(get_struct_field_tid(stid, node_name(f)))
             if type_kind(declared) == TyKind.Fn {
                 tc_note_closure_expected_at(v, tc_struct_field_type_ann(stid, node_name(f)), declared)
-                tc_check_struct_lit_fn_field(v, declared)
+                if !tc_closure_field_waits(v, declared) { tc_check_struct_lit_fn_field(v, declared) }
             }
             if vk == NodeKind.HandlerExpr {
                 tc_check_body(v)
@@ -14963,6 +15014,20 @@ fn tc_check_struct_lit_field_closures(stid: Int, node: Int) ! TypeCheck.Resolve,
         }
         fi = fi + 1
     }
+}
+
+// A closure whose parameter has the struct's own type parameter waits for the other fields:
+// `W { f: fn(x) { x.len() }, v: "abc" }` gives `x` the `T` that `v` fixes, in either order.
+fn tc_closure_field_waits(v: Int, declared: Int) -> Bool {
+    if v == -1 || node_kind(v) != NodeKind.Closure { return false }
+    let r = resolve_alias_tid(declared)
+    if type_kind(r) != TyKind.Fn { return false }
+    let mut k = 1
+    while k < tc_tid_child_count(r) {
+        if tc_tid_has_bare_typevar(tc_tid_child(r, k)) != 0 { return true }
+        k = k + 1
+    }
+    false
 }
 
 // A closure written as a function-typed field's value takes its parameter hints from the
@@ -15046,32 +15111,16 @@ fn tc_bind_tparams_from_instance(bare: Str, src: Int, tparams_sl: Int, binds: Ma
 // is still inferred under its type at the expected instance, which is how an empty
 // `Map()`/`Set()` field learns its element types.
 fn tc_bind_struct_lit_fields(stid: Int, bare: Str, flds_sl: Int, tparams_sl: Int, binds: Map[Str, Int]) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    let mut waiting: List[Int] = []
     let mut fi = 0
     while fi < sublist_length(flds_sl) {
         let f = sublist_get(flds_sl, fi)
         let fname = node_name(f)
         let declared = get_struct_field_tid(stid, fname)
-        if declared != -1 {
-            // The field type read AT THIS INSTANCE, which is also the field value's expected
-            // type. An empty `Map()`/`Set()` field has no other source for its element types:
-            // the value mints its own metavariables and names nothing that could ever solve
-            // them, and a keyed container chooses its key operations from the key type, so an
-            // unbound key answers no table. The bind map still reads the UNSUBSTITUTED
-            // declared type, which is the one carrying the parameters a sibling field or a
-            // spread may yet determine.
-            let at_inst = tc_field_target_hint(bare, declared)
-            tc_seed_declared_field(declared, at_inst, node_value(f))
-            let ftid = tc_infer_field_value_under(at_inst, node_value(f))
-            // A field type still naming the struct's own parameter is only half solved, so the
-            // walk must not carry it into the value's tails and pin each arm from it. A value
-            // that is itself a return-only call or an empty container still meets it at the
-            // top, which links its open binder to the parameter that the binds below solve.
-            if tc_tid_has_bare_typevar(at_inst) == 0 {
-                tc_pin_declared_into_value(at_inst, node_value(f), ftid)
-            } else if tc_pin_field_carries_value_type(node_value(f), at_inst) != 0 {
-                tc_pin_tail_ret_generic(at_inst, ftid)
-            }
-            unify_typevar_binds(declared, ftid, binds)
+        if declared != -1 && tc_closure_field_waits(node_value(f), declared) {
+            waiting.push(f)
+        } else if declared != -1 {
+            tc_bind_struct_lit_field(bare, f, declared, binds)
         } else {
             // A spread entry (`..base()`) has no field name, and so no declared type to unify
             // against, but the value it spreads is an instance of this same struct — and when
@@ -15082,6 +15131,59 @@ fn tc_bind_struct_lit_fields(stid: Int, bare: Str, flds_sl: Int, tparams_sl: Int
         }
         fi = fi + 1
     }
+    // A parameter no other field fixed is open, and one open type for the whole literal: the
+    // closure and the instance share it, so a later use or the end-of-region check settles it
+    // (sections/03_types.md *Under-Determined Types*).
+    for f in waiting { tc_open_unbound_typevars(get_struct_field_tid(stid, node_name(f)), binds) }
+    for f in waiting {
+        let declared = get_struct_field_tid(stid, node_name(f))
+        let fixed = substitute_typevar_tid(tc_field_target_hint(bare, declared), binds)
+        tc_check_struct_lit_fn_field(node_value(f), resolve_alias_tid(fixed))
+        tc_bind_struct_lit_field(bare, f, declared, binds)
+    }
+}
+
+// Each typevar in `tid` that `binds` has no entry for gets a fresh metavariable, under both
+// keys unify_typevar_binds writes.
+fn tc_open_unbound_typevars(tid0: Int, binds: Map[Str, Int]) {
+    let tid = tc_resolve(tid0)
+    if tid < 0 || tid >= ty_pool.len() { return }
+    if type_kind(tid) == TyKind.Typevar {
+        let key = tc_tid_typevar_key(tid)
+        if binds.contains_key(key) { return }
+        let m = make_metavar()
+        binds.insert(key, m)
+        binds.insert(ty_pool.get(tid).unwrap().name, m)
+        return
+    }
+    let mut i = 0
+    while i < tc_tid_child_count(tid) {
+        tc_open_unbound_typevars(tc_tid_child(tid, i), binds)
+        i = i + 1
+    }
+}
+
+fn tc_bind_struct_lit_field(bare: Str, f: Int, declared: Int, binds: Map[Str, Int]) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    // The field type read AT THIS INSTANCE, which is also the field value's expected
+    // type. An empty `Map()`/`Set()` field has no other source for its element types:
+    // the value mints its own metavariables and names nothing that could ever solve
+    // them, and a keyed container chooses its key operations from the key type, so an
+    // unbound key answers no table. The bind map still reads the UNSUBSTITUTED
+    // declared type, which is the one carrying the parameters a sibling field or a
+    // spread may yet determine.
+    let at_inst = tc_field_target_hint(bare, declared)
+    tc_seed_declared_field(declared, at_inst, node_value(f))
+    let ftid = tc_infer_field_value_under(at_inst, node_value(f))
+    // A field type still naming the struct's own parameter is only half solved, so the
+    // walk must not carry it into the value's tails and pin each arm from it. A value
+    // that is itself a return-only call or an empty container still meets it at the
+    // top, which links its open binder to the parameter that the binds below solve.
+    if tc_tid_has_bare_typevar(at_inst) == 0 {
+        tc_pin_declared_into_value(at_inst, node_value(f), ftid)
+    } else if tc_pin_field_carries_value_type(node_value(f), at_inst) != 0 {
+        tc_pin_tail_ret_generic(at_inst, ftid)
+    }
+    unify_typevar_binds(declared, ftid, binds)
 }
 
 // Each parameter unifies its field bind with its expected-instance bind, which solves the
@@ -33848,7 +33950,7 @@ fn tc_bound_method_call(shown: Str, tmsig_idx: Int, node: Int, args_sl: Int, sel
     }
     tc_check_bounds_for_binds(sig, mbinds, node)
     tids = tc_seed_closure_args_with_binds(sig, args_sl, tids, self_offset, mbinds)
-    substitute_typevar_tid(instantiate_return_type(sig, args_sl, tids, node, self_offset), binds)
+    substitute_typevar_tid(tc_instantiate_generic_call(sig, args_sl, tids, node, self_offset, binds), binds)
 }
 
 // The arguments of `Tr.m(x, ..)`: the receiver is parameter 0 (`self`), so the declared
@@ -37236,7 +37338,7 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                             let mbinds = build_typevar_binds(sig, args_sl, ltids, 1)
                             tc_check_bounds_for_binds(sig, mbinds, node)
                             ltids = tc_seed_closure_args_with_binds(sig, args_sl, ltids, 1, mbinds)
-                            return substitute_typevar_tid(instantiate_return_type(sig, args_sl, ltids, node, 1), binds)
+                            return substitute_typevar_tid(tc_instantiate_generic_call(sig, args_sl, ltids, node, 1, binds), binds)
                         }
                         return substitute_typevar_tid(lfs.ret, binds)
                     }
@@ -37800,7 +37902,7 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                         // cannot see.
                         nr_note_call_decl(node, fnsig_pool.get(bsig).unwrap().decl)
                         if tc_decl_has_own_type_params(fnsig_pool.get(bsig).unwrap().decl) != 0 {
-                            return instantiate_return_type(bview, node_args(node), btids, node, 1)
+                            return tc_instantiate_generic_call(bview, node_args(node), btids, node, 1, Map())
                         }
                         return fnsig_pool.get(bsig).unwrap().ret
                     }
@@ -37879,7 +37981,7 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                 // impl over a generic type puts the impl's binders in the same count and
                 // those are answered by the receiver, not by the arguments.
                 if tc_decl_has_own_type_params(mfs.decl) != 0 {
-                    return substitute_typevar_tid(instantiate_return_type(sig, node_args(node), mtids, node, 1), ibinds)
+                    return substitute_typevar_tid(tc_instantiate_generic_call(sig, node_args(node), mtids, node, 1, ibinds), ibinds)
                 }
                 // A return declared over the receiver type's own binders, as a derived clone
                 // is, stands for the receiver's instance. A no-op for a monomorphic receiver.
@@ -38335,7 +38437,7 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                         let qt_tids = tc_check_qualified_trait_args("{obj_name}.{method}", qt_sig, qt_args, node, qt_ibinds)
                         if tc_decl_has_own_type_params(qt_fs.decl) != 0 {
                             tc_check_bounds_for_binds(qt_sig, build_typevar_binds(qt_sig, qt_args, qt_tids, 0), node)
-                            return substitute_typevar_tid(instantiate_return_type(qt_sig, qt_args, qt_tids, node, 0), qt_ibinds)
+                            return substitute_typevar_tid(tc_instantiate_generic_call(qt_sig, qt_args, qt_tids, node, 0, qt_ibinds), qt_ibinds)
                         }
                         return substitute_typevar_tid(qt_fs.ret, qt_ibinds)
                     }
@@ -38450,7 +38552,7 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                         tc_check_static_impl_bounds(q_im, q_sig, self_tid, node)
                         if tc_decl_has_own_type_params(q_decl) != 0 {
                             tc_check_bounds_for_binds(q_sig, build_typevar_binds(q_sig, q_args, q_tids, 0), node)
-                            return substitute_typevar_tid(instantiate_return_type(q_sig, q_args, q_tids, node, 0), q_binds)
+                            return substitute_typevar_tid(tc_instantiate_generic_call(q_sig, q_args, q_tids, node, 0, q_binds), q_binds)
                         }
                         return tc_note_open_value(node, substitute_typevar_tid(fnsig_pool.get(q_sig).unwrap().ret, q_binds))
                     }
