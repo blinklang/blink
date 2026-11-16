@@ -381,6 +381,10 @@ type FnSigEntry {
     // several impls over one type, and several source-typed `from` impls share both the
     // type and the method name.
     decl: Int
+    // A signature the compiler makes for a method, as `to_int` of an enum or a derived `clone`:
+    // it has no declaration to say that it takes `self`, so this says it. Its first parameter
+    // is the receiver.
+    made_method: Bool
 }
 let mut fnsig_pool: List[FnSigEntry] = []
 // The signature each declaration registered, so a reader holding the declaration gets its
@@ -5659,7 +5663,7 @@ fn tc_call_view_sig(sig: Int) -> Int {
         pi = pi + 1
     }
     let view = fnsig_pool.len()
-    fnsig_pool.push(FnSigEntry { name: fs.name, ret: substitute_typevar_tid(fs.ret, twins), params_start: start, params_count: fs.params_count, type_params_start: fs.type_params_start, type_params_count: fs.type_params_count, effects_start: fs.effects_start, effects_count: fs.effects_count, decl: fs.decl })
+    fnsig_pool.push(FnSigEntry { name: fs.name, ret: substitute_typevar_tid(fs.ret, twins), params_start: start, params_count: fs.params_count, type_params_start: fs.type_params_start, type_params_count: fs.type_params_count, effects_start: fs.effects_start, effects_count: fs.effects_count, decl: fs.decl , made_method: fs.made_method })
     tc_calls.self_views.insert(sig, view)
     tc_calls.view_sigs.insert(view, sig)
     view
@@ -10656,7 +10660,7 @@ fn register_named_intrinsic_fn_sig(key: Str, params: List[Int], names: List[Str]
         i = i + 1
     }
     fnsig_map.insert(key, fnsig_pool.len())
-    fnsig_pool.push(FnSigEntry { name: key, ret: ret, params_start: start, params_count: params.len(), type_params_start: fnsig_type_param_names.len(), type_params_count: 0, effects_start: fnsig_effect_names.len(), effects_count: 0, decl: -1 })
+    fnsig_pool.push(FnSigEntry { name: key, ret: ret, params_start: start, params_count: params.len(), type_params_start: fnsig_type_param_names.len(), type_params_count: 0, effects_start: fnsig_effect_names.len(), effects_count: 0, decl: -1 , made_method: false })
 }
 
 // The bare builtins whose call is checked like a declared fn's (sections/02_syntax.md §2.20
@@ -10714,7 +10718,7 @@ fn tc_add_sig_tparam(name: Str, node: Int, ret_only: Int, bounds: Str) {
     fnsig_tparam_ret_only.push(ret_only)
     fnsig_tparam_sourced.push(1)
     fnsig_tparam_bounds.push(bounds)
-    fnsig_pool.set(sig, FnSigEntry { name: fs.name, ret: fs.ret, params_start: fs.params_start, params_count: fs.params_count, type_params_start: start, type_params_count: fs.type_params_count + 1, effects_start: fs.effects_start, effects_count: fs.effects_count, decl: fs.decl })
+    fnsig_pool.set(sig, FnSigEntry { name: fs.name, ret: fs.ret, params_start: fs.params_start, params_count: fs.params_count, type_params_start: start, type_params_count: fs.type_params_count + 1, effects_start: fs.effects_start, effects_count: fs.effects_count, decl: fs.decl , made_method: fs.made_method })
 }
 
 // A bare builtin call against its tc_builtin_sig_key signature, with the wording a declared
@@ -10936,10 +10940,18 @@ fn tc_is_str_backed_enum_decl(td: Int) -> Int {
 // index) is left alone. A type that both derives and hand-writes a same-named method is a
 // duplicate-impl question, not this function's to answer.
 fn register_derive_method_sig(tname: Str, method: Str, params: List[Int], ret: Int) -> Bool {
-    let key = "{tname}_{method}"
+    register_made_sig(tname, method, params, ret, true)
+}
+
+// As register_derive_method_sig; `method` is false for a static, which takes no receiver.
+fn register_made_sig(tname: Str, name: Str, params: List[Int], ret: Int, method: Bool) -> Bool {
+    let key = "{tname}_{name}"
     if (fnsig_map.get(key) ?? -1) != -1 { return false }
-    if tc_method_trait_count(tname, method) >= 1 { return false }
+    if tc_method_trait_count(tname, name) >= 1 { return false }
     register_intrinsic_fn_sig(key, params, ret)
+    let sig = fnsig_pool.len() - 1
+    let fs = fnsig_pool.get(sig).unwrap()
+    fnsig_pool.set(sig, FnSigEntry { name: fs.name, ret: fs.ret, params_start: fs.params_start, params_count: fs.params_count, type_params_start: fs.type_params_start, type_params_count: fs.type_params_count, effects_start: fs.effects_start, effects_count: fs.effects_count, decl: fs.decl, made_method: method })
     true
 }
 
@@ -10949,7 +10961,7 @@ fn register_derive_method_sig(tname: Str, method: Str, params: List[Int], ret: I
 // the expected type or a later use then fixes it, and a call that nothing fixes is reported as
 // under-determined rather than reaching codegen with a free type variable.
 fn register_derived_static_sig(tname: Str, method: Str, params: List[Int], ret: Int, td: Int) {
-    if !register_derive_method_sig(tname, method, params, ret) { return }
+    if !register_made_sig(tname, method, params, ret, false) { return }
     let tps = node_type_params(td)
     if tps == -1 { return }
     let mut i = 0
@@ -17166,7 +17178,7 @@ fn register_fn_sig(fn_node: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.R
             ei = ei + 1
         }
     }
-    fnsig_pool.push(FnSigEntry { name: name, ret: ret_tid, params_start: start, params_count: count, type_params_start: tp_start, type_params_count: tp_count, effects_start: eff_start, effects_count: eff_count, decl: fn_node })
+    fnsig_pool.push(FnSigEntry { name: name, ret: ret_tid, params_start: start, params_count: count, type_params_start: tp_start, type_params_count: tp_count, effects_start: eff_start, effects_count: eff_count, decl: fn_node , made_method: false })
 
     tc_pop_tparam_scope(fn_tparams)
 }
@@ -19101,7 +19113,7 @@ fn tc_register_trait_method_sig(key: Str, m: Int, ptids: List[Int], ret: Int) ->
         }
     }
     let sig = fnsig_pool.len()
-    fnsig_pool.push(FnSigEntry { name: key, ret: ret, params_start: start, params_count: count, type_params_start: tp_start, type_params_count: tp_count, effects_start: fnsig_effect_names.len(), effects_count: 0, decl: m })
+    fnsig_pool.push(FnSigEntry { name: key, ret: ret, params_start: start, params_count: count, type_params_start: tp_start, type_params_count: tp_count, effects_start: fnsig_effect_names.len(), effects_count: 0, decl: m , made_method: false })
     sig
 }
 
@@ -29237,8 +29249,9 @@ fn tc_type_path_fn_value(node: Int, obj_node: Int, qual: Str, name: Str) -> Opti
 // binders are open for the expected type to solve, as a generic function's name is. What the
 // function builds as the alias's target holds to the alias's arguments, as at a call.
 fn tc_type_path_own_value(node: Int, head: StaticHead, own: Int) -> Option[Int] ! TypeCheck.Resolve, Diag.Report {
-    let decl = fnsig_pool.get(own).unwrap().decl
-    if tc_fn_decl_takes_self(decl) { return None }
+    let fs = fnsig_pool.get(own).unwrap()
+    let decl = fs.decl
+    if tc_fnsig_takes_receiver(fs) { return None }
     let derived = tc_derived_static_decl(own)
     if derived >= 0 { tc_global_read_decl.insert(node, derived) }
     if head.decl >= 0 && decl >= 0 && node_is_pub(decl) == 0 && !tc_same_module(node_module(decl), nr_current_module) {
@@ -29403,7 +29416,7 @@ fn tc_self_owner_listed(owners: List[SelfMethodOwner], key: Str) -> Bool {
 // A method that takes `self` is not one.
 fn tc_type_path_names_member(qual: Str, head: StaticHead, name: Str) -> Bool {
     let sig = tc_static_head_sig(head, name)
-    if sig != -1 && !tc_fnsig_takes_receiver(fnsig_pool.get(sig).unwrap(), head.owner) { return true }
+    if sig != -1 && !tc_fnsig_takes_receiver(fnsig_pool.get(sig).unwrap()) { return true }
     if tc_conversion_trait_of(name) != "" { return true }
     if tc_builtin_static_names(qual, head).contains(name) { return true }
     let names = tc_method_distinct_trait_names(head.owner, name)
@@ -29447,6 +29460,10 @@ fn tc_self_method_owners_of(subject: Int, owner: Str, name: Str) -> List[SelfMet
         let derived = if name == "clone" { "Clone" } else { tc_derived_method_trait(name) }
         if derived != "" && tc_decl_derives(decl, derived) != 0 && !tc_self_owner_listed(out, derived) {
             out.push(SelfMethodOwner { key: derived, sealed: false })
+        }
+        // A method the compiler makes with no trait, as `to_int` of an enum, is built in.
+        if out.len() == 0 && tc_made_method_sig(subject, name) != -1 {
+            out.push(SelfMethodOwner { key: "", sealed: true })
         }
     }
     // Display's `display` has no declaration: the compiler makes it from `fmt`.
@@ -29751,6 +29768,9 @@ fn tc_closure_params_past_self(o: SelfMethodOwner, subject: Int, name: Str, qual
     // Display's `display` has no declaration: the compiler makes it from `fmt`.
     if o.key == "Display" && name == "display" { return Some([]) }
     let decl = if o.key == "" { -1 } else { tc_trait_method_decl(o.key, name) }
+    // A method the compiler makes, as `to_int` of an enum, takes nothing past `self`.
+    let made = tc_made_method_sig(subject, name)
+    if o.key == "" && made != -1 && fnsig_pool.get(made).unwrap().params_count == 1 { return Some([]) }
     if o.key == "" || (o.sealed && decl < 0) {
         let k = if subject >= 0 { type_kind(resolve_alias_tid(subject)) } else { TyKind.Unknown }
         return if subject >= 0 && tc_builtin_method_arity(k, name) == 0 { Some([]) } else { None }
@@ -30006,7 +30026,7 @@ fn tc_static_names(head: StaticHead) -> List[Str] {
     let prefix = "{owner}_"
     let mut out: List[Str] = []
     for fs in fnsig_pool {
-        if fs.name.starts_with(prefix) && !tc_fnsig_takes_receiver(fs, owner) {
+        if fs.name.starts_with(prefix) && !tc_fnsig_takes_receiver(fs) {
             let own = if fs.decl >= 0 { node_name(fs.decl) } else { fs.name }
             let short = if own != fs.name { own } else { fs.name.byte_slice(prefix.byte_len(), fs.name.byte_len()) }
             let reached = tc_static_head_sig(head, short) != -1 || tc_method_trait_count(head.owner, short) == 1
@@ -30016,11 +30036,19 @@ fn tc_static_names(head: StaticHead) -> List[Str] {
     out
 }
 
-// Whether a signature of type `owner` takes a receiver. A signature the compiler makes, such as
-// a derived `clone`, has no declaration, and its first parameter is the type itself.
-fn tc_fnsig_takes_receiver(fs: FnSigEntry, owner: Str) -> Bool {
+// The signature the compiler made for the method `name` of the declared type `subject`, or -1.
+fn tc_made_method_sig(subject: Int, name: Str) -> Int {
+    let decl = if subject >= 0 { tc_tid_decl_node(subject) } else { -1 }
+    if decl < 0 { return -1 }
+    let sig = lookup_fnsig("{tc_nominal_type_name(decl)}_{name}")
+    if sig != -1 && fnsig_pool.get(sig).unwrap().made_method { sig } else { -1 }
+}
+
+// Whether a signature takes a receiver: its declaration's first parameter is `self`, or the
+// compiler made it for a method.
+fn tc_fnsig_takes_receiver(fs: FnSigEntry) -> Bool {
     if fs.decl >= 0 { return tc_fn_decl_takes_self(fs.decl) }
-    fs.params_count > 0 && tc_type_name(fnsig_param_list.get(fs.params_start).unwrap()) == owner
+    fs.made_method
 }
 
 // The help line for an unresolved method, first match wins: the note for a binding that hides
