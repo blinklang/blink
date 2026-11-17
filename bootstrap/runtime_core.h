@@ -4212,6 +4212,9 @@ typedef struct {
     blink_bytes*     (*read_bytes)(void* __self, int64_t n);
     blink_Option_str (*read_line)(void* __self);
     const char*      (*read_all)(void* __self);
+    void  (*print_raw)(void* __self, const char* s);
+    void  (*print_raw_bytes)(void* __self, blink_bytes* b);
+    void  (*eprint_raw)(void* __self, const char* s);
     /* One userdata word per op, passed back as the op's first argument. A
      * handler expression stores in it the closure object of each op it
      * defines: the handler it was copied from, then the op's captures. Per
@@ -4228,6 +4231,9 @@ typedef struct {
     void* __userdata_read_bytes;
     void* __userdata_read_line;
     void* __userdata_read_all;
+    void* __userdata_print_raw;
+    void* __userdata_print_raw_bytes;
+    void* __userdata_eprint_raw;
 } blink_io_vtable;
 
 /* A handler value is a heap copy of its root's vtable, so a closure tail of
@@ -4249,6 +4255,9 @@ BLINK_RT_FN blink_io_vtable* blink_io_vtable_promote(blink_promote_ctx* ctx, bli
     out->__userdata_read_bytes = blink_closure_promote(ctx, (blink_closure*)out->__userdata_read_bytes);
     out->__userdata_read_line = blink_closure_promote(ctx, (blink_closure*)out->__userdata_read_line);
     out->__userdata_read_all = blink_closure_promote(ctx, (blink_closure*)out->__userdata_read_all);
+    out->__userdata_print_raw = blink_closure_promote(ctx, (blink_closure*)out->__userdata_print_raw);
+    out->__userdata_print_raw_bytes = blink_closure_promote(ctx, (blink_closure*)out->__userdata_print_raw_bytes);
+    out->__userdata_eprint_raw = blink_closure_promote(ctx, (blink_closure*)out->__userdata_eprint_raw);
     return out;
 }
 #endif
@@ -4285,6 +4294,43 @@ BLINK_RT_FN void blink_io_default_eprint_no_nl(void* __self, const char* msg);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN void blink_io_default_eprint_no_nl(void* __self, const char* msg) {
     fprintf(stderr, "%s", msg);
+}
+#endif
+
+/* The byte contract of the _raw operations (sections/04_effects.md §4.4): every byte goes
+ * out, then the stream is flushed before the operation returns. The bytes go through the
+ * same FILE buffer as the print defaults, so the output keeps call order. */
+BLINK_RT_FN void blink_io_write_all(FILE* out, const uint8_t* data, int64_t len);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void blink_io_write_all(FILE* out, const uint8_t* data, int64_t len) {
+    int64_t done = 0;
+    while (done < len) {
+        size_t n = fwrite(data + done, 1, (size_t)(len - done), out);
+        if (n == 0) break;
+        done += (int64_t)n;
+    }
+    fflush(out);
+}
+#endif
+
+BLINK_RT_FN void blink_io_default_print_raw(void* __self, const char* s);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void blink_io_default_print_raw(void* __self, const char* s) {
+    blink_io_write_all(stdout, (const uint8_t*)s, (int64_t)strlen(s));
+}
+#endif
+
+BLINK_RT_FN void blink_io_default_print_raw_bytes(void* __self, blink_bytes* b);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void blink_io_default_print_raw_bytes(void* __self, blink_bytes* b) {
+    blink_io_write_all(stdout, b->data, b->len);
+}
+#endif
+
+BLINK_RT_FN void blink_io_default_eprint_raw(void* __self, const char* s);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void blink_io_default_eprint_raw(void* __self, const char* s) {
+    blink_io_write_all(stderr, (const uint8_t*)s, (int64_t)strlen(s));
 }
 #endif
 
@@ -4368,7 +4414,10 @@ BLINK_UNUSED static blink_io_vtable blink_io_vtable_default = {
     blink_io_default_eprint_no_nl,
     blink_io_default_read_bytes,
     blink_io_default_read_line,
-    blink_io_default_read_all
+    blink_io_default_read_all,
+    blink_io_default_print_raw,
+    blink_io_default_print_raw_bytes,
+    blink_io_default_eprint_raw
 };
 
 /* ── FS ─────────────────────────────────────────────────────────────── */
