@@ -1,0 +1,72 @@
+// A label on an io print call is InvalidKeywordArg (E0511) at check (§2.13).
+//
+// The io print family (println, print, print_raw, eprintln, eprint, eprint_raw, log) declares
+// no keyword parameter (§4.4), and a label resolves only in a callee's keyword parameters. A
+// label that names the operation's positional parameter is the spec's `transfer(amount: 300)`
+// case; any other label names nothing. Each call is one mistake, so it gets one error and no
+// arity error on top. Without the check, the call checked clean and the build stopped on a
+// NamedArg node that the lowering cannot take.
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_reset}
+import std.io
+
+fn probe(stem: Str, body: Str) -> List[Str] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO, Process.Spawn {
+    let path = "build/{stem}_probe.bl"
+    fs.write(path, "fn main() \{\n    {body}\n}\n").unwrap()
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _rm = process.run("rm", ["-f", path]).unwrap()
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" { out.push("{d.name}: {d.message} | {d.help}") }
+    }
+    out
+}
+
+fn expect_one(label: Str, got: List[Str], want: Str) ! IO.Print {
+    let ok = got.len() == 1 && got.get(0).unwrap() == want
+    if !ok { io.println("FAIL: {label}: drew {got.join(" ; ")}, want [{want}]") }
+    assert(ok)
+}
+
+test "a label naming the positional parameter of an io print call is refused" {
+    expect_one("print_raw(s:)", probe("tc_lio_raw", #"io.print_raw(s: "k")"#),
+        "InvalidKeywordArg: `s` is a positional parameter of `io.print_raw` | pass it without a label")
+    expect_one("eprint_raw(s:)", probe("tc_lio_eraw", #"io.eprint_raw(s: "k")"#),
+        "InvalidKeywordArg: `s` is a positional parameter of `io.eprint_raw` | pass it without a label")
+    expect_one("println(msg:)", probe("tc_lio_ln", #"io.println(msg: "k")"#),
+        "InvalidKeywordArg: `msg` is a positional parameter of `io.println` | pass it without a label")
+    expect_one("print(msg:)", probe("tc_lio_p", #"io.print(msg: "k")"#),
+        "InvalidKeywordArg: `msg` is a positional parameter of `io.print` | pass it without a label")
+    expect_one("eprintln(msg:)", probe("tc_lio_eln", #"io.eprintln(msg: "k")"#),
+        "InvalidKeywordArg: `msg` is a positional parameter of `io.eprintln` | pass it without a label")
+    expect_one("eprint(msg:)", probe("tc_lio_ep", #"io.eprint(msg: "k")"#),
+        "InvalidKeywordArg: `msg` is a positional parameter of `io.eprint` | pass it without a label")
+    expect_one("log(msg:)", probe("tc_lio_log", #"io.log(msg: "k")"#),
+        "InvalidKeywordArg: `msg` is a positional parameter of `io.log` | pass it without a label")
+}
+
+test "a label naming no parameter of an io print call is refused" {
+    expect_one("println(zz:)", probe("tc_lio_zz", #"io.println(zz: "k")"#),
+        "InvalidKeywordArg: `zz` names no keyword parameter of `io.println` | `io.println` declares no keyword parameters")
+}
+
+test "a labelled io print call with a second argument is one error" {
+    expect_one("println(\"a\", msg:)", probe("tc_lio_two", #"io.println("a", msg: "k")"#),
+        "InvalidKeywordArg: `msg` is a positional parameter of `io.println` | pass it without a label")
+}
+
+test "a mistake inside a labelled argument is still reported" {
+    let got = probe("tc_lio_inner", #"io.println(msg: nope)"#)
+    let names = got.map(fn(e: Str) -> Str { e.split(":").get(0).unwrap() })
+    if names != ["UndefinedVariable", "InvalidKeywordArg"] { io.println("FAIL: inner: drew {got.join(" ; ")}") }
+    assert(names == ["UndefinedVariable", "InvalidKeywordArg"])
+}
+
+test "an io print call without a label stays clean" {
+    let got = probe("tc_lio_clean", #"io.println("k")"#)
+    if got.len() != 0 { io.println("FAIL: clean: drew {got.join(" ; ")}") }
+    assert(got.len() == 0)
+}

@@ -39238,11 +39238,16 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                     // by the arg's own inference, which the fall-through used to do.
                     let pf_args = node_args(node)
                     let mut pf_got = 0
+                    let mut pf_labelled = false
                     if pf_args != -1 {
                         pf_got = sublist_length(pf_args)
                         let mut pf_i = 0
                         while pf_i < sublist_length(pf_args) {
                             let pf_arg = sublist_get(pf_args, pf_i)
+                            if !pf_labelled && node_kind(pf_arg) == NodeKind.NamedArg {
+                                tc_report_io_print_label(method, pf_arg)
+                                pf_labelled = true
+                            }
                             let pf_t = infer_type(pf_arg)
                             if method == "print_raw" || method == "eprint_raw" {
                                 tc_check_raw_print_arg(obj_name, method, pf_arg, pf_t)
@@ -39256,7 +39261,7 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                     // checks it: each of these emits ONE C statement from argument 0,
                     // so a second argument is dropped along with its side effects and a
                     // missing one prints nothing. Only the PARAMETER TYPE is open.
-                    if pf_got != 1 {
+                    if pf_got != 1 && !pf_labelled {
                         tc_error_at("function `{obj_name}.{method}` expects 1 argument(s), got {pf_got}", node)
                     }
                     return TYPE_VOID
@@ -40433,16 +40438,25 @@ fn tc_static_conversion_target(trait_name: Str, src_t: Int, named: Int) -> Int {
     hint
 }
 
-// The io.* methods that print and answer `()`. Kept separate from the
-// is_intrinsic_method list, which also names io.debug — no codegen arm emits that one,
-// so it must keep reaching the loud unresolved-method backstop instead of gaining a
-// type that would say a call which cannot be built is fine.
+// The io.* methods that print and answer `()`: the io writes with no intrinsic signature.
+// Kept separate from the is_intrinsic_method list, which also names io.debug — no codegen
+// arm emits that one, so it must keep reaching the loud unresolved-method backstop instead
+// of gaining a type that would say a call which cannot be built is fine.
 fn tc_io_is_print_method(ns: Str, method: Str) -> Int {
-    if ns != "io" { return 0 }
-    if method == "println" || method == "print" || method == "print_raw" { return 1 }
-    if method == "eprintln" || method == "eprint" || method == "eprint_raw" { return 1 }
-    if method == "log" { return 1 }
-    0
+    if ns == "io" && io_caller_op(method) != "" && io_op_renders_its_argument(method) { 1 } else { 0 }
+}
+
+// A label on an io print call (§2.13). The print family declares no keyword parameter, so a
+// label is InvalidKeywordArg: one that names the operation's parameter is a positional
+// parameter given a label, as `transfer(amount: 300)` is. One report per call.
+fn tc_report_io_print_label(method: Str, arg: Int) ! Diag.Report {
+    let label = node_name(arg)
+    let params = builtin_effect_op_params("IO", io_caller_op(method)) ?? []
+    if params.contains(label) {
+        diag_error_at("InvalidKeywordArg", INVALID_KEYWORD_ARG, "`{label}` is a positional parameter of `io.{method}`", arg, "pass it without a label")
+    } else {
+        diag_error_at("InvalidKeywordArg", INVALID_KEYWORD_ARG, "`{label}` names no keyword parameter of `io.{method}`", arg, "`io.{method}` declares no keyword parameters")
+    }
 }
 
 // Whether this `loop` provably diverges: no `break` anywhere in its body targets it.
