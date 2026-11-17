@@ -1,0 +1,143 @@
+// A handler clause matches the header of the operation it names: the same count of parameters,
+// the same type at each place after alias expansion, and no default on a parameter
+// (sections/04_effects.md §4.7 *Clause signatures*). A clause that differs is
+// error[HandlerClauseMismatch] (E0548) in `blink check`, and the message names the part that
+// differs. Before, such a clause checked clean, and then the build stopped in the C compiler or
+// the program ignored the default. The rule is the same for a builtin effect.
+//
+// Two fixes are machine-applicable: delete a default, and add the one missing parameter when
+// only one place fits it and its name is not free in the clause body. Each other row has the
+// help only.
+
+import typecheck.{check_types}
+import compiler.{compile_to_program}
+import diagnostics.{DiagEntry, diag_entries, diag_reset, diag_fix_edits}
+import fix_edits.{FixEdit, fix_apply, fix_byte_offset}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+import std.fs
+import std.io
+
+const PATH = "build/tc_handler_clause_header_matches_operation_src.bl"
+
+// Each error and each internal error of the program.
+fn front_errors(src: Str) -> List[DiagEntry] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    init_embedded_stdlib()
+    fs.write(PATH, src).unwrap()
+    diag_reset()
+    let program = compile_to_program(PATH, 1)
+    check_types(program)
+    let _ = fs.delete(PATH)
+    let mut out: List[DiagEntry] = []
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" { out.push(d) }
+    }
+    for d in out { io.println("  diag: {d.name} at {d.line}:{d.col}: {d.message} | help: {d.help}") }
+    out
+}
+
+fn apply_fix(src: Str, d: DiagEntry) -> Str {
+    let mut edits: List[FixEdit] = []
+    for e in diag_fix_edits(d) {
+        edits.push(FixEdit { file: PATH, start: fix_byte_offset(src, e.line, e.col), end: fix_byte_offset(src, e.end_line, e.end_col), text: e.text, diag: 0 })
+    }
+    fix_apply(src, edits)
+}
+
+// The effects the rows handle, on lines 1 to 7. A row's code starts on line 8.
+const EFF = "type Count = Int\nconst x = 5\neffect Ee \{\n    effect Op \{ fn op(x: Int) -> Int }\n    effect Two \{ fn two(a: Int, s: Str) -> Int }\n    effect Pair \{ fn pair(a: Int, b: Int) -> Int }\n}\n"
+
+// The program has one error, E0548 on line 8, with `message` and the help that prints
+// `header`. It returns the error so a row can test its fix.
+fn mismatch(code: Str, message: Str, header: Str) -> DiagEntry ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    let errs = front_errors("{EFF}{code}")
+    assert_eq(errs.len(), 1)
+    let d = errs.get(0).unwrap()
+    assert_eq(d.name, "HandlerClauseMismatch")
+    assert_eq(d.code, "E0548")
+    assert_eq(d.line, 8)
+    assert_eq(d.message, message)
+    assert_eq(d.help, "write the header of the operation: `{header}`")
+    d
+}
+
+// The error has no fix.
+fn help_only(code: Str, message: Str, header: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    let d = mismatch(code, message, header)
+    assert_eq(diag_fix_edits(d).len(), 0)
+}
+
+// The fix of the error writes `want` in the clause, and the fixed file checks clean.
+fn fixed_by(code: Str, message: Str, header: Str, want: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    let d = mismatch(code, message, header)
+    assert(diag_fix_edits(d).len() > 0)
+    let fixed = apply_fix("{EFF}{code}", d)
+    assert(fixed.contains(want))
+    assert_eq(front_errors(fixed).len(), 0)
+}
+
+fn clean(code: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    assert_eq(front_errors("{EFF}{code}").len(), 0)
+}
+
+test "a clause with an extra parameter is E0548 on the count" {
+    help_only("fn main() \{ with handler Ee.Op \{ fn op(x: Int, y: Int) -> Int \{ x + y } } \{ io.println(\"\{ee.op(1)}\") } }\n",
+        "handler clause `op` takes 2 parameters, but `Ee.Op.op` takes 1", "fn op(x: Int) -> Int")
+}
+
+test "a clause with a parameter missing gets the parameter when one place fits it" {
+    fixed_by("fn main() \{ with handler Ee.Op \{ fn op() -> Int \{ 7 } } \{ io.println(\"\{ee.op(1)}\") } }\n",
+        "handler clause `op` takes 0 parameters, but `Ee.Op.op` takes 1", "fn op(x: Int) -> Int", "fn op(x: Int) -> Int \{ 7 }")
+    fixed_by("fn main() \{ with handler Ee.Two \{ fn two(s: Str) -> Int \{ s.byte_len() } } \{ io.println(\"\{ee.two(1, \"ab\")}\") } }\n",
+        "handler clause `two` takes 1 parameter, but `Ee.Two.two` takes 2", "fn two(a: Int, s: Str) -> Int", "fn two(a: Int, s: Str) -> Int \{ s.byte_len() }")
+}
+
+test "a missing last parameter goes after the parameters the clause writes" {
+    fixed_by("fn main() \{ with handler Ee.Two \{ fn two(a: Int) -> Int \{ a } } \{ io.println(\"\{ee.two(1, \"ab\")}\") } }\n",
+        "handler clause `two` takes 1 parameter, but `Ee.Two.two` takes 2", "fn two(a: Int, s: Str) -> Int", "fn two(a: Int, s: Str) -> Int \{ a }")
+}
+
+test "a missing parameter whose place is not clear has the help only" {
+    help_only("fn main() \{ with handler Ee.Pair \{ fn pair(a: Int) -> Int \{ a } } \{ io.println(\"\{ee.pair(1, 2)}\") } }\n",
+        "handler clause `pair` takes 1 parameter, but `Ee.Pair.pair` takes 2", "fn pair(a: Int, b: Int) -> Int")
+}
+
+test "a missing parameter whose name the body reads has the help only" {
+    help_only("fn main() \{ with handler Ee.Op \{ fn op() -> Int \{ x } } \{ io.println(\"\{ee.op(1)}\") } }\n",
+        "handler clause `op` takes 0 parameters, but `Ee.Op.op` takes 1", "fn op(x: Int) -> Int")
+    help_only("fn main() \{ with handler Ee.Two \{ fn two(s: Str) -> Int \{ let f = fn() -> Int \{ a() } \n f() + s.byte_len() } } \{ io.println(\"\{ee.two(1, \"ab\")}\") } }\nfn a() -> Int \{ 1 }\n",
+        "handler clause `two` takes 1 parameter, but `Ee.Two.two` takes 2", "fn two(a: Int, s: Str) -> Int")
+}
+
+test "a clause parameter of another type is E0548 on that parameter" {
+    help_only("fn main() \{ with handler Ee.Op \{ fn op(x: Str) -> Int \{ x.byte_len() } } \{ io.println(\"\{ee.op(1)}\") } }\n",
+        "parameter 1 of handler clause `op` is `Str`, but `Ee.Op.op` takes `Int`", "fn op(x: Int) -> Int")
+    help_only("fn main() \{ with handler Ee.Two \{ fn two(a: Int, s: Float) -> Int \{ a } } \{ io.println(\"\{ee.two(1, \"ab\")}\") } }\n",
+        "parameter 2 of handler clause `two` is `Float`, but `Ee.Two.two` takes `Str`", "fn two(a: Int, s: Str) -> Int")
+}
+
+test "a default on a clause parameter is E0548, and the fix deletes it" {
+    fixed_by("fn main() \{ with handler Ee.Op \{ fn op(x: Int = 3) -> Int \{ x } } \{ io.println(\"\{ee.op(1)}\") } }\n",
+        "parameter 1 of handler clause `op` writes a default; a default applies at the call site only", "fn op(x: Int) -> Int", "fn op(x: Int) -> Int \{ x }")
+}
+
+test "a clause in a handler a factory returns is checked the same way" {
+    help_only("fn mk() -> Handler[Ee.Op] \{ handler Ee.Op \{ fn op(x: Int, y: Int) -> Int \{ x + y } } }\nfn main() \{ with mk() \{ io.println(\"\{ee.op(1)}\") } }\n",
+        "handler clause `op` takes 2 parameters, but `Ee.Op.op` takes 1", "fn op(x: Int) -> Int")
+}
+
+test "a builtin effect's clause is checked the same way" {
+    help_only("fn main() \{ with handler IO.Print \{ fn print(_s: Int) \{ } } \{ io.println(\"x\") } }\n",
+        "parameter 1 of handler clause `print` is `Int`, but `IO.Print.print` takes `Str`", "fn print(msg: Str)")
+    fixed_by("fn main() \{ with handler IO.Print \{ fn print() \{ } } \{ io.println(\"x\") } }\n",
+        "handler clause `print` takes 0 parameters, but `IO.Print.print` takes 1", "fn print(msg: Str)", "fn print(msg: Str) \{ }")
+}
+
+test "a clause that renames a parameter or writes an alias of its type checks clean" {
+    clean("fn main() \{ with handler Ee.Op \{ fn op(n: Count) -> Int \{ n } } \{ io.println(\"\{ee.op(1)}\") } }\n")
+    clean("fn main() \{ with handler Ee.Two \{ fn two(n: Int, t: Str) -> Int \{ n + t.byte_len() } } \{ io.println(\"\{ee.two(1, \"ab\")}\") } }\n")
+}
+
+test "only the first clause for an operation is matched against its header" {
+    let errs = front_errors("\{EFF}fn main() \{ with handler Ee.Op \{\n fn op(x: Int) -> Int \{ x }\n fn op(x: Str) -> Int \{ 0 }\n } \{ io.println(\"\{ee.op(1)}\") } }\n")
+    for d in errs { assert(d.code != "E0548") }
+}
