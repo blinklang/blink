@@ -3515,6 +3515,7 @@ fn handle_login(req: Request) -> Response ! IO, DB, Crypto {
 - Selective imports do NOT restrict qualified access. `import auth.{login}` restricts bare `Token` but `auth.Token` still works. So a selective import binds its qualifier too: `import auth.{login}` binds `login` and `auth`, and `import auth as a.{login}` binds `login` and `a`.
 - A whole-module import binds only its qualifier. If `import foo` and `import bar` both export `helper`, nothing collides: call `foo.helper()` or `bar.helper()`. Two imports that bind one name, bare name or qualifier, are E1005 (*Imported Names*, §10.5). A module-level declaration that takes a qualifier's name is E1012 (*Imported and Declared Names*, §10.5).
 - A local binding hides a module qualifier for its scope. If `let auth = 5` is in scope, `auth.login()` is a method call on the integer, not a module-qualified call. Inside that scope `auth.y` resolves against the local binding only. There is no fallback to the qualifier, also when the local's type has no member `y`. Every local binding form in §2.2 *Local bindings* hides a qualifier this way. This is a shadow between nested scopes (§10.6 *Shadowing Rules*), so it is legal and gets no warning at the binding. A diagnostic that a hidden qualifier causes names the hidden module (§10.6 *Diagnostics that involve a shadowing name*).
+- A listed name that equals its own qualifier hides the qualifier. In `import m.{m}`, the entry binds the name `m` to the item `m` of module `m` and binds `m` as a qualifier too. The item wins, as a local binding wins over a qualifier, so in that file `m` is the item and `m.x` is a member of the item, not an item of the module. This is not E1005, for every kind of item (fn, type, trait, const). Another entry in the file that binds the qualifier `m` is E1005 (*Imported Names*, §10.5). To reach both the item and the module, give the module an alias: `import m as k.{m}` binds `m` to the item and `k` to the module.
 - A qualified trait or type name works in every slot that takes the bare name. The qualifier is the one that this section already gives: the import's leaf name or its alias. The spelling does not change scope or the orphan check. The orphan rule, impl lookup, duplicate-impl detection and bound checks test the resolved trait and the resolved type (§3.4 *Identity, not spelling, selects behavior*). These are the slots:
   - a bound (`U: lib.Tr`) and a `where` constraint (`where U: lib.Tr`)
   - both names of an impl header (`impl lib.Tr for lib.Pt`)
@@ -4257,7 +4258,7 @@ When several import entries collide with one declaration, each entry gets its ow
 
 #### Imported Names
 
-Each file has its own binding table. A selective import binds each listed name and its qualifier, and a whole-module import binds only its qualifier. The qualifier is the leaf name of the module path, or the name after the `as` that follows the path (*Import Aliases*). Bare names and qualifiers share one table, because `X.y` can be qualified access or access through a type. Two imports in one file that bind one name to different items are a compile error, `AmbiguousImport` (E1005). The check uses the name that each import binds, which is the name after `as` when there is one. It covers both namespaces and applies to `import` and `pub import` alike. Every check on an import entry runs when the compiler reads the import, whether or not the file uses the name. This holds for E1003 (import form), E1005 and E1023. Two `pub import` entries can also give one name to different items of the export set without binding it in this file's table. That is E1005 too, at the second entry (*Re-exports*, *Export set*).
+Each file has its own binding table. A selective import binds each listed name and its qualifier, and a whole-module import binds only its qualifier. The qualifier is the leaf name of the module path, or the name after the `as` that follows the path (*Import Aliases*). Bare names and qualifiers share one table, because `X.y` can be qualified access or access through a type. Two imports in one file that bind one name to different items are a compile error, `AmbiguousImport` (E1005). One entry never collides with itself: when an entry lists a name equal to its own qualifier, the listed item hides the qualifier (*A listed name that equals its own qualifier*, below). The check uses the name that each import binds, which is the name after `as` when there is one. It covers both namespaces and applies to `import` and `pub import` alike. Every check on an import entry runs when the compiler reads the import, whether or not the file uses the name. This holds for E1003 (import form), E1005 and E1023. Two `pub import` entries can also give one name to different items of the export set without binding it in this file's table. That is E1005 too, at the second entry (*Re-exports*, *Export set*).
 
 ```blink
 import auth.{Error}
@@ -4324,6 +4325,69 @@ The alias before the list keeps every listed name bare:
 ```blink
 import a.x.{P}
 import b.x as bx.{Q}          // OK: binds `Q` and `bx`
+```
+
+**A listed name that equals its own qualifier.** A selective entry binds each listed name and its qualifier (§10.1 *Qualified Access*). When a listed name has the spelling of the entry's own qualifier, the entry binds that name to the item and the item hides the qualifier. This holds for each kind of item: a fn, a type, a trait and a const. The comparison is case-sensitive, so `import shape.{Shape}` is not this case: `shape` and `Shape` are two names. The entry is not E1005. In the rest of the file, `m` means the item, and `m.x` is resolved against the item, as `m.x` is resolved against a local binding named `m` (§10.1 *Qualified Access*, §10.6 *Shadowing Rules*):
+
+```blink
+// src/m.bl
+pub fn m() -> Int { 1 }
+pub fn x() -> Int { 2 }
+
+// src/main.bl
+import m.{m}                  // OK: binds `m` to the fn `m`; the qualifier `m` is hidden
+
+fn main() {
+    let a = m()               // OK: calls the fn `m`
+    let b = m.x()             // error: `m` is the fn `m`, which has no member `x`
+}
+```
+
+The error for `m.x` names the hidden module and gives both repairs:
+
+```
+error: `m` has no member `x`
+ --> src/main.bl:7:13
+  |
+1 | import m.{m}
+  |           - `m` is the fn `m` of module `m`; the item hides the qualifier `m`
+  |
+7 |     let b = m.x()
+  |             ^^^ the fn `m` has no member `x`
+  |
+  = help: to use `x` from module `m`, list it: import m.{m, x}
+  = help: to reach the module by a qualifier, give it an alias: import m as k.{m}, then write k.x
+```
+
+The error code is the one that a member use on that kind of item gives. The note on the hidden module and the two helps are part of the diagnostic for every kind.
+
+An entry with an alias gives the qualifier another name, so it has no hidden qualifier and no conflict:
+
+```blink
+import m as k.{m}             // OK: `m` is the fn, `k` is the module
+fn main() {
+    let a = m()               // OK: the fn
+    let b = k.x()             // OK: the fn `x` of module `m`
+}
+```
+
+Another entry in the same file that binds the qualifier `m` is E1005 at the later entry, because `m` would then name the item and the module. The error has a label at the first entry. Its help says to merge the entries or to alias the module:
+
+```blink
+import m.{m}
+import m                      // error[E1005]: `m` is imported twice
+
+import m.{m}
+import m.{x}                  // error[E1005]: the qualifier `m` binds the module, and `m` is the item
+                              // help: merge the entries: import m.{m, x}
+                              // help: or alias the module: import m as k.{x}
+```
+
+A `pub import` of such an entry re-exports the item. The hidden qualifier is not part of the export set, which holds names of items only (*Export set*, above):
+
+```blink
+// src/auth.bl
+pub import auth.login.{login, AuthError}   // OK: re-exports the fn `login` and the type `AuthError`
 ```
 
 Two imports that bind one name to the **same** item are not E1005. The compiler compares the items that name resolution reaches after it follows `pub import` chains, not the import paths. The later entry gets W0602 (unused import), with a machine-applicable fix that deletes it (§8.6). One item under two names binds no name twice, so it is legal:
