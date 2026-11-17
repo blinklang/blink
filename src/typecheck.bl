@@ -22785,24 +22785,44 @@ fn builtin_op_list_hint(root: Str) -> Str {
 // the handler that omits it.
 pub type IoOpRow {
     op: Str
+    // The io handle method that performs the operation: io.println performs print.
+    caller: Str
     sub_effect: Str
     primitive: Bool
 }
 
 pub fn io_op_rows() -> List[IoOpRow] {
     [
-        IoOpRow { op: "print", sub_effect: "Print", primitive: true },
-        IoOpRow { op: "print_no_nl", sub_effect: "Print", primitive: true },
-        IoOpRow { op: "print_raw", sub_effect: "Print", primitive: false },
-        IoOpRow { op: "print_raw_bytes", sub_effect: "Print", primitive: true },
-        IoOpRow { op: "eprint", sub_effect: "Eprint", primitive: true },
-        IoOpRow { op: "eprint_no_nl", sub_effect: "Eprint", primitive: true },
-        IoOpRow { op: "eprint_raw", sub_effect: "Eprint", primitive: false },
-        IoOpRow { op: "log", sub_effect: "Log", primitive: true },
-        IoOpRow { op: IO_READ_PRIMITIVE, sub_effect: "Read", primitive: true },
-        IoOpRow { op: "read_line", sub_effect: "Read", primitive: false },
-        IoOpRow { op: "read_all", sub_effect: "Read", primitive: false },
+        IoOpRow { op: "print", caller: "println", sub_effect: "Print", primitive: true },
+        IoOpRow { op: "print_no_nl", caller: "print", sub_effect: "Print", primitive: true },
+        IoOpRow { op: "print_raw", caller: "print_raw", sub_effect: "Print", primitive: false },
+        IoOpRow { op: "print_raw_bytes", caller: "print_raw_bytes", sub_effect: "Print", primitive: true },
+        IoOpRow { op: "eprint", caller: "eprintln", sub_effect: "Eprint", primitive: true },
+        IoOpRow { op: "eprint_no_nl", caller: "eprint", sub_effect: "Eprint", primitive: true },
+        IoOpRow { op: "eprint_raw", caller: "eprint_raw", sub_effect: "Eprint", primitive: false },
+        IoOpRow { op: "log", caller: "log", sub_effect: "Log", primitive: true },
+        IoOpRow { op: IO_READ_PRIMITIVE, caller: IO_READ_PRIMITIVE, sub_effect: "Read", primitive: true },
+        IoOpRow { op: "read_line", caller: "read_line", sub_effect: "Read", primitive: false },
+        IoOpRow { op: "read_all", caller: "read_all", sub_effect: "Read", primitive: false },
     ]
+}
+
+// The IO operation that the io handle method `caller` performs, or "" for a name that
+// performs none. Each operation is also the runtime vtable slot of that name.
+pub fn io_caller_op(caller: Str) -> Str {
+    for row in io_op_rows() {
+        if row.caller == caller { return row.op }
+    }
+    ""
+}
+
+// The io handle method that performs the IO operation `op`, or "" for a name that is no IO
+// operation.
+pub fn io_op_caller(op: Str) -> Str {
+    for row in io_op_rows() {
+        if row.op == op { return row.caller }
+    }
+    ""
 }
 
 // The sub-effect that performs an IO operation, or "" for a name that is no IO operation.
@@ -22946,9 +22966,10 @@ fn builtin_handler_op_sig(root: Str, op: Str) -> Int ! Diag.Report {
     let found = lookup_fnsig(key)
     if found != -1 { return found }
     let io_sub = if root == "IO" { io_op_sub_effect(op) } else { "" }
-    if op == "print_raw_bytes" {
+    let io_caller = if root == "IO" { io_op_caller(op) } else { "" }
+    if io_caller != "" && !io_op_renders_its_argument(io_caller) {
         // The handle call's own signature, so a clause and the call it answers cannot differ.
-        return lookup_fnsig("io.{op}")
+        return lookup_fnsig("io.{io_caller}")
     } else if io_sub == "Print" || io_sub == "Eprint" || io_sub == "Log" {
         register_named_intrinsic_fn_sig(key, [TYPE_STR], builtin_effect_op_params(root, op) ?? ["msg"], TYPE_VOID)
     } else if root == "Time" && op == "read" {
@@ -22960,8 +22981,6 @@ fn builtin_handler_op_sig(root: Str, op: Str) -> Int ! Diag.Report {
     } else if builtin_op_exists(root, op) {
         // The handle call's own signature, so a clause and the call it answers cannot differ.
         return lookup_fnsig("{str_to_lower(root)}.{op}")
-    } else if io_sub == "Read" {
-        return lookup_fnsig("io.{op}")
     } else {
         return -1
     }
@@ -26801,14 +26820,9 @@ fn is_builtin_method(name: Str) -> Int {
     if name == "set_i32_le" { return 1 }
     if name == "set_i64_le" { return 1 }
     // Effect handle methods (io, fs, net, time, async, env)
-    if name == "println" { return 1 }
-    if name == "print" { return 1 }
-    if name == "eprintln" { return 1 }
-    if name == "eprint" { return 1 }
-    if name == "log" { return 1 }
-    if name == "print_raw" { return 1 }
-    if name == "eprint_raw" { return 1 }
-    if name == "print_raw_bytes" { return 1 }
+    // The io writes. The io reads are listed with the stream methods of the same name.
+    let io_op = io_caller_op(name)
+    if io_op != "" && io_op_sub_effect(io_op) != "Read" { return 1 }
     if name == "read" { return 1 }
     if name == "write" { return 1 }
     if name == "list_dir" { return 1 }
@@ -49530,7 +49544,7 @@ pub fn is_intrinsic_method(namespace: Str, method: Str) -> Int {
         }
     }
     if namespace == "io" {
-        if method == "println" || method == "print" || method == "print_raw" || method == "eprintln" || method == "eprint" || method == "eprint_raw" || method == "print_raw_bytes" || method == "log" || method == "debug" || method == "read_line" || method == "read_bytes" || method == "read_all" || method == "write" || method == "write_bytes" {
+        if io_caller_op(method) != "" || method == "debug" || method == "write" || method == "write_bytes" {
             return 1
         }
     }
