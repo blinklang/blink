@@ -22707,6 +22707,20 @@ fn partial_handler_stub(op: Int, decl_mod: Str, here: Str) -> HandlerStub {
         }
         args.push(a)
     }
+    let spell = handler_type_spelling(names, decl_mod, here)
+    let text = "{effect_op_sig_text(op, spell.renames, args, false)} \{ default.{node_name(op)}({args.join(", ")}) }"
+    HandlerStub { text: text, fixable: spell.fixable }
+}
+
+// How module `here` spells the type names `names` that module `decl_mod` declares an operation
+// with: `renames` qualifies a name `here` reaches only through a qualifier, and `fixable` is
+// false when `here` cannot spell one of them.
+type HandlerTypeSpelling {
+    renames: Map[Str, Str]
+    fixable: Bool
+}
+
+fn handler_type_spelling(names: List[Str], decl_mod: Str, here: Str) -> HandlerTypeSpelling {
     let mut renames: Map[Str, Str] = Map()
     let mut fixable = true
     if decl_mod != here {
@@ -22718,8 +22732,55 @@ fn partial_handler_stub(op: Int, decl_mod: Str, here: Str) -> HandlerStub {
             }
         }
     }
-    let text = "{effect_op_sig_text(op, renames, args, false)} \{ default.{node_name(op)}({args.join(", ")}) }"
-    HandlerStub { text: text, fixable: fixable }
+    HandlerTypeSpelling { renames: renames, fixable: fixable }
+}
+
+// The operation the clause named `op` of a handler for `eff` implements, or -1. `ed` declares
+// the root effect `root` of `eff`.
+fn handler_clause_op(ed: Int, eff: Str, root: Str, op: Str) -> Int {
+    let mut ops: List[Int] = []
+    if eff == root {
+        ops = effect_decl_ops(ed)
+    } else {
+        let child = partial_handler_child(ed, eff.byte_slice(root.byte_len() + 1, eff.byte_len()))
+        let sl = if child == -1 { -1 } else { node_methods(child) }
+        let mut i = 0
+        while sl != -1 && i < sublist_length(sl) {
+            ops.push(sublist_get(sl, i))
+            i = i + 1
+        }
+    }
+    for o in ops {
+        if node_name(o) == op { return o }
+    }
+    -1
+}
+
+// The type, spelled for the current module, that the operation clause `m` of the handler
+// expression `he` implements gives its parameter `idx`; "" when there is no such operation or
+// parameter, or the module cannot spell the type.
+fn handler_clause_param_type_text(he: Int, m: Int, idx: Int) -> Str ! Diag.Report {
+    let eff = tc_handler_effect_at(he)
+    let root = tc_handler_effect_root(eff)
+    let ed = tc_effect_decl_named(root)
+    if ed == -1 {
+        let sig_idx = builtin_handler_op_sig(root, node_name(m))
+        if sig_idx == -1 { return "" }
+        let sig = fnsig_pool.get(sig_idx).unwrap()
+        if idx >= sig.params_count { return "" }
+        return type_to_str(fnsig_param_list.get(sig.params_start + idx).unwrap())
+    }
+    let op = handler_clause_op(ed, eff, root, node_name(m))
+    let params = if op == -1 { -1 } else { node_params(op) }
+    if params == -1 || idx >= sublist_length(params) { return "" }
+    let p = sublist_get(params, idx)
+    let ann = node_type_ann(p)
+    let mut names: List[Str] = []
+    if ann != -1 { tc_collect_type_ann_names(ann, names) } else { names.push(node_type_name(p)) }
+    let spell = handler_type_spelling(names, node_module(ed), nr_current_module)
+    if !spell.fixable { return "" }
+    if ann != -1 { return type_ann_text_renamed(ann, spell.renames) }
+    spell.renames.get(node_type_name(p)) ?? node_type_name(p)
 }
 
 fn leading_whitespace(line: Str) -> Str {
@@ -31119,7 +31180,7 @@ fn nr_check_field_defaults(td: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.
 }
 
 // A signature writes the type of each parameter (§3.3); only a method's receiver, its first
-// parameter `self`, may leave it out. A closure's parameters and a handler clause's are not read here. Whether a method's
+// parameter `self`, may leave it out. A closure's parameters are not read here. Whether a method's
 // receiver may be spelled `_self` with no type is an open question, so it keeps its old reading.
 fn nr_refuse_untyped_params(fn_node: Int, is_method: Bool) ! Diag.Report {
     let params_sl = node_params(fn_node)
@@ -31129,12 +31190,38 @@ fn nr_refuse_untyped_params(fn_node: Int, is_method: Bool) ! Diag.Report {
         let p = sublist_get(params_sl, i)
         let name = node_name(p)
         let receiver = is_method && i == 0 && (name == "self" || name == "_self")
-        if node_type_ann(p) == -1 && node_type_name(p) == "" && !receiver && !nr_walk.untyped_params.contains(p) {
-            nr_walk.untyped_params.insert(p)
-            let msg = "parameter `{name}` has no type"
-            tc_errors.push(msg)
-            diag_error_span_at_notes("MissingParamType", MISSING_PARAM_TYPE, msg, p, node_line(p), node_col(p), node_col(p) + name.byte_len(), "write its type: `{name}: Type`", [])
-        }
+        if !receiver && nr_param_is_untyped(p) { nr_report_untyped_param(p, "") }
+        i = i + 1
+    }
+}
+
+fn nr_param_is_untyped(p: Int) -> Bool {
+    node_type_ann(p) == -1 && node_type_name(p) == "" && !nr_walk.untyped_params.contains(p)
+}
+
+// E0328 at the name of `p`. When `want` names the type the parameter must have, the help names
+// it and the fix writes it.
+fn nr_report_untyped_param(p: Int, want: Str) ! Diag.Report {
+    nr_walk.untyped_params.insert(p)
+    let name = node_name(p)
+    let msg = "parameter `{name}` has no type"
+    tc_errors.push(msg)
+    let end = node_col(p) + name.byte_len()
+    let help = if want == "" { "write its type: `{name}: Type`" } else { "write the type the operation gives it: `{name}: {want}`" }
+    diag_error_span_at_notes("MissingParamType", MISSING_PARAM_TYPE, msg, p, node_line(p), node_col(p), end, help, [])
+    if want != "" { diag_set_last_fix_at("write the type", ": {want}", node_line(p), end, node_line(p), end) }
+}
+
+// A clause is a signature (§4.7 *Clause signatures*), so each of its parameters writes its
+// type, and a clause has no receiver, so a parameter named `self` does too. The fix writes the
+// type the operation gives the parameter; the parameter does not take it.
+fn nr_refuse_untyped_clause_params(he: Int, m: Int) ! Diag.Report {
+    let params_sl = node_params(m)
+    if params_sl == -1 { return }
+    let mut i = 0
+    while i < sublist_length(params_sl) {
+        let p = sublist_get(params_sl, i)
+        if nr_param_is_untyped(p) { nr_report_untyped_param(p, handler_clause_param_type_text(he, m, i)) }
         i = i + 1
     }
 }
@@ -32676,6 +32763,7 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                 // An operation carries the handler it belongs to, which is what a `default`
                 // in its body names (nr_resolve_default_receiver).
                 if node_name(node) != "" { tc_publish_node_tid(m, make_handler_type(tc_handler_effect_at(node))) }
+                if node_kind(m) == NodeKind.FnDef { nr_refuse_untyped_clause_params(node, m) }
                 nr_check_fn(m)
                 i = i + 1
             }

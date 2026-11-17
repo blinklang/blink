@@ -1,0 +1,118 @@
+// A handler clause is a signature (sections/04_effects.md §4.7 *Clause signatures*), so each
+// of its parameters writes its type. An untyped clause parameter is error[MissingParamType]
+// (E0328) at its name, in `blink check`, and not E0548. The compiler does not take the type from
+// the operation, as it does for a closure, but the fix writes that type, and the fix is
+// machine-applicable. A clause has no receiver, so a clause parameter named `self` is covered
+// too. Before, the clause stopped the check with an internal error, or took its type from use
+// and passed. Each row has exactly one error, and applying the fix leaves a file that checks.
+
+import typecheck.{check_types}
+import compiler.{compile_to_program}
+import diagnostics.{DiagEntry, diag_entries, diag_reset, diag_fix_edits}
+import fix_edits.{FixEdit, fix_apply, fix_byte_offset}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+import std.fs
+import std.io
+
+const PATH = "build/tc_handler_clause_param_needs_type_src.bl"
+
+// Each error and each internal error of the program.
+fn front_errors(src: Str) -> List[DiagEntry] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    init_embedded_stdlib()
+    fs.write(PATH, src).unwrap()
+    diag_reset()
+    let program = compile_to_program(PATH, 1)
+    check_types(program)
+    let _ = fs.delete(PATH)
+    let mut out: List[DiagEntry] = []
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" { out.push(d) }
+    }
+    for d in out { io.println("  diag: {d.name} at {d.line}:{d.col}: {d.message} | help: {d.help}") }
+    out
+}
+
+fn apply_fix(src: Str, d: DiagEntry) -> Str {
+    let mut edits: List[FixEdit] = []
+    for e in diag_fix_edits(d) {
+        edits.push(FixEdit { file: PATH, start: fix_byte_offset(src, e.line, e.col), end: fix_byte_offset(src, e.end_line, e.end_col), text: e.text, diag: 0 })
+    }
+    fix_apply(src, edits)
+}
+
+// The 1-based column of the parameter `name` in the clause that `marker` starts on `line`.
+fn param_col(src: Str, line: Int, marker: Str, name: Str) -> Int {
+    let text = src.split("\n").get(line - 1).unwrap()
+    let at = text.byte_index_of(marker, 0) ?? -1
+    (text.byte_index_of(name, at + marker.byte_len()) ?? -1) + 1
+}
+
+// The effects the rows handle, on lines 1 to 5. A row's code starts on line 6.
+const EFF = "effect Ee \{\n    effect Op \{ fn op(x: Int) -> Int }\n    effect Two \{ fn two(a: Str, n: Int) -> Int }\n    effect Note \{ fn note(msg: Str) }\n}\n"
+
+// The program has one error, E0328 at `name` in the clause `marker` on line 6, with the help
+// `write its type: `{want}``. Its fix writes `want`, and the fixed file checks clean.
+fn untyped_at(code: Str, marker: Str, name: Str, want: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    let src = "{EFF}{code}"
+    let errs = front_errors(src)
+    assert_eq(errs.len(), 1)
+    let d = errs.get(0).unwrap()
+    assert_eq(d.name, "MissingParamType")
+    assert_eq(d.code, "E0328")
+    assert_eq(d.line, 6)
+    assert_eq(d.col, param_col(src, 6, marker, name))
+    assert_eq(d.message, "parameter `{name}` has no type")
+    assert_eq(d.help, "write the type the operation gives it: `{want}`")
+    let fixed = apply_fix(src, d)
+    assert(fixed.contains(want))
+    assert_eq(front_errors(fixed).len(), 0)
+}
+
+test "an untyped parameter of a with-handler clause is E0328 at its name" {
+    untyped_at("fn main() \{ with handler Ee.Op \{ fn op(x) -> Int \{ x + 1 } } \{ io.println(\"\{ee.op(1)}\") } }\n", "fn op(", "x", "x: Int")
+}
+
+test "an untyped parameter of a handler expression a factory returns is E0328" {
+    untyped_at("fn mk() -> Handler[Ee.Two] \{ handler Ee.Two \{ fn two(a, n: Int) -> Int \{ a.byte_len() + n } } }\nfn main() \{ with mk() \{ io.println(\"\{ee.two(\"ab\", 1)}\") } }\n", "fn two(", "a", "a: Str")
+}
+
+test "an untyped second parameter after a typed one is E0328 at the second" {
+    untyped_at("fn main() \{ with handler Ee.Two \{ fn two(a: Str, n) -> Int \{ a.byte_len() + n } } \{ io.println(\"\{ee.two(\"ab\", 1)}\") } }\n", "fn two(a: Str, ", "n", "n: Int")
+}
+
+test "an untyped mut parameter of a clause is E0328" {
+    untyped_at("fn main() \{ with handler Ee.Op \{ fn op(mut x) -> Int \{ x = x + 1\n x } } \{ io.println(\"\{ee.op(1)}\") } }\n", "fn op(mut ", "x", "x: Int")
+}
+
+test "an untyped parameter the body never reads is E0328" {
+    untyped_at("fn main() \{ with handler Ee.Note \{ fn note(_msg) \{ } } \{ ee.note(\"hi\") } }\n", "fn note(", "_msg", "_msg: Str")
+}
+
+test "a clause parameter named self with no type is E0328, since a clause has no receiver" {
+    untyped_at("fn main() \{ with handler Ee.Op \{ fn op(self) -> Int \{ self + 1 } } \{ io.println(\"\{ee.op(1)}\") } }\n", "fn op(", "self", "self: Int")
+}
+
+test "an untyped parameter of a builtin effect's clause is E0328 with the operation's type" {
+    untyped_at("fn main() \{ with handler IO.Print \{ fn print(_s) \{ } } \{ io.println(\"x\") } }\n", "fn print(", "_s", "_s: Str")
+}
+
+test "an untyped parameter of a clause that names no operation has no fix" {
+    let src = "{EFF}fn main() \{ with handler Ee.Op \{ fn op(x: Int) -> Int \{ x }\n fn nope(y) -> Int \{ 0 } } \{ io.println(\"\{ee.op(1)}\") } }\n"
+    let errs = front_errors(src)
+    let mut seen = 0
+    for d in errs {
+        assert(d.severity != "ice")
+        if d.code == "E0328" {
+            seen = seen + 1
+            assert_eq(d.line, 7)
+            assert_eq(d.help, "write its type: `y: Type`")
+            assert_eq(diag_fix_edits(d).len(), 0)
+        }
+    }
+    assert_eq(seen, 1)
+}
+
+test "a clause whose parameters write their types checks clean" {
+    let errs = front_errors("{EFF}fn main() \{ with handler Ee.Two \{ fn two(a: Str, n: Int) -> Int \{ a.byte_len() + n } } \{ io.println(\"\{ee.two(\"ab\", 1)}\") } }\n")
+    assert_eq(errs.len(), 0)
+}

@@ -1395,6 +1395,8 @@ with handler Metrics {
 
 Handlers nest — inner handlers shadow outer ones for the same effect.
 
+A clause is a signature: it writes the type of each parameter, and the types match the operation's. An untyped clause parameter, `fn op(x) -> Int`, is `MissingParamType` (E0328) at `x`; the type is not taken from the operation, and the fix writes it. A clause with no `-> R` returns `()`, as any fn does, so a clause for an operation that returns a value writes `-> R`.
+
 A handler of a sub-effect handles only that sub-effect's operations. A `Handler[E.Sub]` where a `Handler[E]` is expected (an argument, an annotated `let`, a return value, a struct field or an assignment) is `E0563 InsufficientHandlerCoverage`.
 
 An effect and an effect operation take no type parameters (`fn put[T](x: T)` and `effect Cell[T]` are `EffectOpTypeParams`, E0558). Declare the operation with concrete types and write a generic `fn` that calls it, as `io.println` does.
