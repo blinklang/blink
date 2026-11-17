@@ -4131,6 +4131,58 @@ fn g() {
 }
 ```
 
+**A late fill is checked as if its type were written at the binding.** When a later use fixes the type of `[]`, `None` or `Map.new()`, every earlier use of the value is checked as if that type had been written on the `let`. An error in an earlier use goes where the written type would put it, at the expression that does not fit. The error has a `note:` at the use that fixed the type, which gives the type and the line (`l` is `List[S]` because of `l.push(...)` at line N). The note is required: without it the message does not say why the type is `S`.
+
+```blink
+trait Dbg { fn debug(self) -> Int }
+type S { a: Int }
+impl Dbg for S { fn debug(self) -> Int { self.a } }
+fn takes(x: Str) {}
+
+// intentional-error example
+fn early() {
+    let mut l = []
+    if l.len() > 0 {
+        let s = l.get(0).unwrap().debug()
+        takes(s)             // error[TypeError] (E0300): `takes` expects Str, got Int
+                             // note: `l` is List[S] because of `l.push(S { a: 1 })` at line N
+    }
+    l.push(S { a: 1 })
+}
+```
+
+Each edge case has the same answer:
+
+```blink
+// intentional-error example
+fn push_first() {
+    let mut l = []
+    l.push(S { a: 1 })       // fixes `l` as List[S]
+    let s = l.get(0).unwrap().debug()
+    takes(s)                 // error[E0300] at `takes(s)`, with the same note: the line order does not move it
+}
+
+// intentional-error example
+fn written() {
+    let mut l: List[S] = []
+    let s = l.get(0).unwrap().debug()
+    takes(s)                 // error[E0300] at `takes(s)`: a written type does not move the site
+                             //   (there is no later use that fixes the type, so there is no note)
+}
+
+// intentional-error example
+fn two_fills() {
+    let mut l = []
+    l.push(S { a: 1 })       // fixes `l` as List[S]
+    l.push("x")              // error[E0300] at this push: expects S, got Str
+                             // note: `l` is List[S] because of `l.push(S { a: 1 })` at line N
+}
+```
+
+The error is at the use that consumes the value (`takes(s)`), never at the call whose result type was not known yet (`.debug()`). That call is correct for the type that the later use fixes. The compiler may choose how it finds this site. Only the site and the note are part of the rule.
+
+When two later uses fix the type itself to different types, the error is at the second use and its note names the first. This is the rule for a template literal (§3b.5 *The Context Parameter `C`*: "If two uses need different contexts, the error is at the second use, and a `note:` names the use that set `C`"), and it is the same rule for every late fill.
+
 A use that does *not* constrain the type parameter does not rescue the binding. `.len()`, `.is_empty()`, and `.is_none()` observe the container, not its element, so a binding used only through them stays under-determined and is an error:
 
 ```blink
