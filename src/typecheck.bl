@@ -10842,6 +10842,8 @@ fn register_ns_intrinsic_sigs() {
     register_intrinsic_fn_sig("io.read_all", [], TYPE_STR)
     register_intrinsic_fn_sig("io.write", [TYPE_STR], TYPE_VOID)
     register_intrinsic_fn_sig("io.write_bytes", [bytes_t], TYPE_VOID)
+    // Named as the §4.4 table names it, so a print_raw_bytes clause matches the call it answers.
+    register_named_intrinsic_fn_sig("io.print_raw_bytes", [bytes_t], ["b"], TYPE_VOID)
 
     // fs.* — the public filesystem surface returns Result[T, FsError] per
     // sections/04_effects.md:800-867; codegen redirects each to the fs_do_* wrapper. When the
@@ -12339,8 +12341,7 @@ fn tc_user_clause_header(he: Int, op: Str) -> Option[ClauseHeader] ! TypeCheck.R
 // The header of the operation `op` of the builtin root `root`, as the call that it answers
 // takes it, for the clause `m` of a handler for `eff`. A clause of an FS, Process, Rand or IO
 // handler fills the vtable slot of its operation, and the slot's C type is that operation's
-// signature. None for the raw IO operations, which no handler can write yet, and for the roots
-// whose clauses typecheck does not match.
+// signature. None for the roots whose clauses typecheck does not match.
 fn tc_builtin_clause_header(eff: Str, root: Str, op: Str, m: Int) -> Option[ClauseHeader] ! TypeCheck.Resolve, Diag.Report {
     if !is_builtin_op_root(root) && (root != "IO" || io_op_sub_effect(op) == "") { return None }
     let sig_idx = builtin_handler_op_sig(root, op)
@@ -12375,8 +12376,7 @@ fn tc_clause_header(he: Int, op: Str, m: Int) -> Option[ClauseHeader] ! TypeChec
 }
 
 // The operations of the builtin `root` as a clause names them, or None for a root whose
-// operations typecheck does not list. The IO list holds the raw operations, which no handler
-// can write yet but which are operations of IO all the same (§4.4). Env has no list: its
+// operations typecheck does not list. Env has no list: its
 // handler clauses still fill the runtime's vtable slots by their C names (`read`, `write`),
 // not the operations of §4.4.3, and the spec names do not build yet.
 fn builtin_root_op_names(root: Str) -> Option[List[Str]] {
@@ -12388,9 +12388,6 @@ fn builtin_root_op_names(root: Str) -> Option[List[Str]] {
     match root {
         "IO" => {
             for row in io_op_rows() { out.push(row.op) }
-            out.push("print_raw")
-            out.push("print_raw_bytes")
-            out.push("eprint_raw")
             Some(out)
         }
         "Time" => Some(["read", "monotonic", "sleep"])
@@ -12399,9 +12396,9 @@ fn builtin_root_op_names(root: Str) -> Option[List[Str]] {
 }
 
 // The names a clause of a handler for `eff`, a root or one sub-effect of it, may take: the
-// operations of `eff` in declaration order, the raw IO operations included, which
-// tc_handler_op_names leaves out. None when typecheck cannot list them: an effect that does
-// not resolve, or a builtin root that builtin_root_op_names has no list for, such as Env.
+// operations of `eff` in declaration order. None when typecheck cannot list them: an effect
+// that does not resolve, or a builtin root that builtin_root_op_names has no list for, such as
+// Env.
 fn tc_handler_clause_names(eff: Str) -> Option[List[Str]] {
     let root = tc_handler_effect_root(eff)
     let ed = tc_effect_decl_named(root)
@@ -22779,14 +22776,13 @@ fn builtin_op_list_hint(root: Str) -> Str {
     "the {root} operations are {head} and {ops.get(last).unwrap()} ({section})"
 }
 
-// The IO handler operations of the §4.4 table, each with the sub-effect that performs it.
-// Typecheck reads the rows for the clauses a handler may write, for the signature of each
-// operation and for the operations a coverage error names; codegen reads the IO.Read rows. The
-// IO.Read rows are in the order the IO vtable lays out their slots. read_bytes is the primitive
-// and the one operation whose count the perform checks. read_line and read_all are derived:
-// std.io_read holds the spec's body of each under the operation's own name, and it runs over
-// the read_bytes of the handler that omits it. The rows leave out print_raw, print_raw_bytes
-// and eprint_raw, which no handler can write yet.
+// The IO handler operations of the §4.4 table, in its order, each with the sub-effect that
+// performs it. Typecheck reads the rows for the clauses a handler may write, for the signature
+// of each operation and for the operations a coverage error names; codegen reads them for the
+// derived operations. read_bytes is the one operation whose count the perform checks. The
+// derived operations are print_raw, eprint_raw, read_line and read_all: std.io_derived holds
+// the spec's body of each under the operation's own name, and it runs over the operations of
+// the handler that omits it.
 pub type IoOpRow {
     op: Str
     sub_effect: Str
@@ -22797,8 +22793,11 @@ pub fn io_op_rows() -> List[IoOpRow] {
     [
         IoOpRow { op: "print", sub_effect: "Print", primitive: true },
         IoOpRow { op: "print_no_nl", sub_effect: "Print", primitive: true },
+        IoOpRow { op: "print_raw", sub_effect: "Print", primitive: false },
+        IoOpRow { op: "print_raw_bytes", sub_effect: "Print", primitive: true },
         IoOpRow { op: "eprint", sub_effect: "Eprint", primitive: true },
         IoOpRow { op: "eprint_no_nl", sub_effect: "Eprint", primitive: true },
+        IoOpRow { op: "eprint_raw", sub_effect: "Eprint", primitive: false },
         IoOpRow { op: "log", sub_effect: "Log", primitive: true },
         IoOpRow { op: IO_READ_PRIMITIVE, sub_effect: "Read", primitive: true },
         IoOpRow { op: "read_line", sub_effect: "Read", primitive: false },
@@ -22815,16 +22814,10 @@ pub fn io_op_sub_effect(op: Str) -> Str {
 }
 
 // The sub-effect of the built-in effect `root` that declares `op`, or "" when no sub-effect
-// of `root` declares it (§4.4). The IO handler rows leave out the raw operations, and Env and
-// Time have no rows.
+// of `root` declares it (§4.4). Env and Time have no rows.
 pub fn builtin_effect_op_sub(root: Str, op: Str) -> Str {
     match root {
-        "IO" => match op {
-            "print_raw" => "Print"
-            "print_raw_bytes" => "Print"
-            "eprint_raw" => "Eprint"
-            _ => io_op_sub_effect(op)
-        }
+        "IO" => io_op_sub_effect(op)
         "Env" => env_time_op_sub(op)
         "Time" => env_time_op_sub(op)
         _ => builtin_op_sub_effect(root, op)
@@ -22896,19 +22889,49 @@ pub let IO_READ_PRIMITIVE = "read_bytes"
 
 pub fn is_io_read_op(op: Str) -> Bool { io_op_sub_effect(op) == "Read" }
 
-pub fn is_io_read_derived_op(op: Str) -> Bool {
+pub fn is_io_read_derived_op(op: Str) -> Bool { is_io_derived_op(op) && is_io_read_op(op) }
+
+// Whether a call of io `op` renders its argument as text. The print family takes any value
+// Display renders, so it has no intrinsic signature; an op with one takes the types it declares.
+pub fn io_op_renders_its_argument(op: Str) -> Bool {
+    !fnsig_map.contains_key("io.{op}")
+}
+
+// Whether `op` is an IO operation whose omission runs its std.io_derived body (§4.4).
+pub fn is_io_derived_op(op: Str) -> Bool {
     for row in io_op_rows() {
-        if row.op == op { return row.sub_effect == "Read" && !row.primitive }
+        if row.op == op { return !row.primitive }
     }
     false
 }
 
+// The derived IO operations, in the order of the §4.4 table.
+pub fn io_derived_ops() -> List[Str] {
+    let mut out: List[Str] = []
+    for row in io_op_rows() {
+        if !row.primitive { out.push(row.op) }
+    }
+    out
+}
+
 // The module that holds the derived bodies. The loader loads it and codegen finds the bodies
 // in it, so both read the name here.
-pub fn io_read_module() -> Str { "std.io_read" }
+pub fn io_derived_module() -> Str { "std.io_derived" }
 
-// Whether a handler of `eff` writes IO.Read's operations: a handler of the root or of IO.Read.
-pub fn handles_io_read(eff: Str) -> Bool { eff == "IO" || eff == "IO.Read" }
+// Whether a handler of `eff` writes the IO operation `op`: a handler of the root or of the
+// sub-effect that performs `op`.
+pub fn handles_io_op(eff: Str, op: Str) -> Bool {
+    let sub = io_op_sub_effect(op)
+    sub != "" && (eff == "IO" || eff == "IO.{sub}")
+}
+
+// Whether a handler of `eff` writes one or more derived IO operations.
+pub fn handles_io_derived(eff: Str) -> Bool {
+    for op in io_derived_ops() {
+        if handles_io_op(eff, op) { return true }
+    }
+    false
+}
 
 // No source spelling reaches this key, so no declaration can take it over.
 fn builtin_handler_op_key(root: Str, op: Str) -> Str {
@@ -22923,8 +22946,11 @@ fn builtin_handler_op_sig(root: Str, op: Str) -> Int ! Diag.Report {
     let found = lookup_fnsig(key)
     if found != -1 { return found }
     let io_sub = if root == "IO" { io_op_sub_effect(op) } else { "" }
-    if io_sub == "Print" || io_sub == "Eprint" || io_sub == "Log" {
-        register_named_intrinsic_fn_sig(key, [TYPE_STR], ["msg"], TYPE_VOID)
+    if op == "print_raw_bytes" {
+        // The handle call's own signature, so a clause and the call it answers cannot differ.
+        return lookup_fnsig("io.{op}")
+    } else if io_sub == "Print" || io_sub == "Eprint" || io_sub == "Log" {
+        register_named_intrinsic_fn_sig(key, [TYPE_STR], builtin_effect_op_params(root, op) ?? ["msg"], TYPE_VOID)
     } else if root == "Time" && op == "read" {
         register_intrinsic_fn_sig(key, [], runtime_instant_tid())
     } else if root == "Time" && op == "monotonic" {
@@ -25894,8 +25920,8 @@ fn nr_default_body_op(name: Str, decl: Int) -> Option[(Str, Str)] {
             if row.default_fn == name { return Some((root.to_lower(), row.op)) }
         }
     }
-    let io_key = io_read_module().replace(".", "_")
-    if is_io_read_derived_op(name) && nr_module_decl(io_key, name) == decl { return Some(("io", name)) }
+    let io_key = io_derived_module().replace(".", "_")
+    if is_io_derived_op(name) && nr_module_decl(io_key, name) == decl { return Some(("io", name)) }
     None
 }
 
@@ -26782,6 +26808,7 @@ fn is_builtin_method(name: Str) -> Int {
     if name == "log" { return 1 }
     if name == "print_raw" { return 1 }
     if name == "eprint_raw" { return 1 }
+    if name == "print_raw_bytes" { return 1 }
     if name == "read" { return 1 }
     if name == "write" { return 1 }
     if name == "list_dir" { return 1 }
@@ -49503,7 +49530,7 @@ pub fn is_intrinsic_method(namespace: Str, method: Str) -> Int {
         }
     }
     if namespace == "io" {
-        if method == "println" || method == "print" || method == "print_raw" || method == "eprintln" || method == "eprint" || method == "eprint_raw" || method == "log" || method == "debug" || method == "read_line" || method == "read_bytes" || method == "read_all" || method == "write" || method == "write_bytes" {
+        if method == "println" || method == "print" || method == "print_raw" || method == "eprintln" || method == "eprint" || method == "eprint_raw" || method == "print_raw_bytes" || method == "log" || method == "debug" || method == "read_line" || method == "read_bytes" || method == "read_all" || method == "write" || method == "write_bytes" {
             return 1
         }
     }

@@ -1,13 +1,16 @@
-// `io.print_raw` and `io.eprint_raw` are operations, so each call writes an `effect` event
-// whose `args` key is the declared parameter `s` (§8.15.10). Under the default handler the
-// call is one dispatch. A handler of `IO.Print` with no `print_raw` sends the call to the
-// default body, which calls `print_no_nl`: a second dispatch with a second event.
+// `io.print_raw`, `io.eprint_raw` and `io.print_raw_bytes` are operations, so each call
+// writes an `effect` event whose `args` key is the declared parameter, `s` or `b`
+// (§8.15.10). Under the default handler the call is one dispatch. A handler of `IO.Print` with
+// no `print_raw` sends the call to the default body, which calls `print_no_nl`: a second
+// dispatch with a second event. The same holds for `IO.Eprint` and `eprint_raw`.
 
 import compile_test_helpers
 import std.json.{json_clear, json_parse, json_get, json_as_str, json_obj_child_at, json_key_at}
 
 let DEFAULT_SRC = #"fn main() ! IO {
     io.print_raw("c")
+    io.print_raw_bytes(Bytes.from_str("e"))
+    // Last: its text has no newline, so an event written after it would not start a line.
     io.eprint_raw("d")
 }
 "#
@@ -17,6 +20,15 @@ let HANDLED_SRC = #"fn main() ! IO {
         fn print_no_nl(_msg: Str) { }
     } {
         io.print_raw("c")
+    }
+}
+"#
+
+let EPRINT_HANDLED_SRC = #"fn main() ! IO {
+    with handler IO.Eprint {
+        fn eprint_no_nl(_msg: Str) { }
+    } {
+        io.eprint_raw("d")
     }
 }
 "#
@@ -40,19 +52,24 @@ fn effects(text: Str) -> Str {
 test "a raw print under the default handler writes one effect event" {
     let bin = compile_test_helpers.build_bin(DEFAULT_SRC, "trace_raw_default", ["--trace"])
     let r = process.run("env", ["BLINK_TRACE=all", bin]).unwrap()
-    assert_eq(r.out, "c")
+    assert_eq(r.out, "ce")
     assert(r.success())
-    assert_eq(effects(r.err_out), "IO.Print io.print_raw s=c\nIO.Eprint io.eprint_raw s=d")
+    assert_eq(effects(r.err_out), "IO.Print io.print_raw s=c\nIO.Print io.print_raw_bytes b=Bytes(65)\nIO.Eprint io.eprint_raw s=d")
     compile_test_helpers.clean_bin("trace_raw_default")
 }
 
-test.failing(
-    "the default body of print_raw is a second dispatch with its own effect event",
-    reason: "io.print_raw goes to the default writer, not to the handler in force",
-) {
+test "the default body of print_raw is a second dispatch with its own effect event" {
     let bin = compile_test_helpers.build_bin(HANDLED_SRC, "trace_raw_handled", ["--trace"])
     let r = process.run("env", ["BLINK_TRACE=all", bin]).unwrap()
     compile_test_helpers.clean_bin("trace_raw_handled")
     assert_eq(r.out, "")
     assert_eq(effects(r.err_out), "IO.Print io.print_raw s=c\nIO.Print io.print msg=c")
+}
+
+test "the default body of eprint_raw is a second dispatch with its own effect event" {
+    let bin = compile_test_helpers.build_bin(EPRINT_HANDLED_SRC, "trace_eraw_handled", ["--trace"])
+    let r = process.run("env", ["BLINK_TRACE=all", bin]).unwrap()
+    compile_test_helpers.clean_bin("trace_eraw_handled")
+    assert(r.success())
+    assert_eq(effects(r.err_out), "IO.Eprint io.eprint_raw s=d\nIO.Eprint io.eprint msg=d")
 }

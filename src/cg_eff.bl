@@ -18,7 +18,8 @@ import parser.{
 import typecheck.{
     TyKind, TYPE_INT, TYPE_STR, TYPE_VOID, make_ffi_scope_type, make_fn_type, make_handler_type, tc_resolve, tc_type_str,
     tc_tid_child_count, tc_impl_is_poly_user, tc_impl_owner_decl, tc_tid_decl_node, tc_tid_handler_effect, tc_tid_kind, tc_void_tid, tk_name, ty_pool,
-    tc_call_decl_node, tc_call_user_effect, tc_decl_ret_tid, tc_effect_ident, tc_handler_effect_root, tc_impl_trait_id, io_read_ops, is_io_read_derived_op, IO_READ_PRIMITIVE, handles_io_read,
+    tc_call_decl_node, tc_call_user_effect, tc_decl_ret_tid, tc_effect_ident, tc_handler_effect_root, tc_impl_trait_id, io_derived_ops, is_io_read_derived_op, IO_READ_PRIMITIVE, handles_io_op,
+    io_op_renders_its_argument,
 }
 import layout.{
     BinderMut, LayoutRecord, Position, Slot, SlotForm, async_scope_handles_spelling,
@@ -781,28 +782,27 @@ pub fn cg_eff_lower_handler_expr(node: Int) -> Int ! Diag.Report {
     ir_call_direct(tid, node, rec.c_spelling, symbol, rec.slot_form, words)
 }
 
-// The loader brings in std.io_read whenever a module writes a handler of IO or IO.Read, so a
-// derived operation with no body means the loader and this stage disagree.
+// The loader brings in std.io_derived whenever a module writes a handler that holds a derived
+// IO operation, so a derived operation with no body means the loader and this stage disagree.
 fn io_derived_bodies_loaded(tid: Int, written: List[Int], node: Int) -> Bool ! Diag.Report {
-    for op in omitted_io_read_derived_ops(tc_tid_handler_effect(tid), written) {
+    for op in omitted_io_derived_ops(tc_tid_handler_effect(tid), written) {
         if cg_reg_io_derived_decl(op) >= 0 { continue }
         diag_ice_at("IoDerivedBodyNotLoaded", UNSOLVED_TYPEVAR_AT_CODEGEN,
-            "no body for IO.Read operation `{op}`: std.io_read is not loaded", node,
-            "the loader loads std.io_read for every handler of IO or IO.Read; this is a compiler bug")
+            "no body for IO operation `{op}`: std.io_derived is not loaded", node,
+            "the loader loads std.io_derived for every handler that holds a derived IO operation; this is a compiler bug")
         return false
     }
     true
 }
 
-// The derived IO.Read operations a handler literal of `eff` does not write; none unless the
-// literal handles IO.Read.
-fn omitted_io_read_derived_ops(eff: Str, written: List[Int]) -> List[Str] {
+// The derived IO operations that a handler literal of `eff` holds and does not write: those of
+// the sub-effect the literal names, or all of them for a literal of the root.
+fn omitted_io_derived_ops(eff: Str, written: List[Int]) -> List[Str] {
     let mut out: List[Str] = []
-    if !handles_io_read(eff) { return out }
     let mut names: List[Str] = []
     for w in written { names.push(node_name(w)) }
-    for op in io_read_ops() {
-        if is_io_read_derived_op(op) && !names.contains(op) { out.push(op) }
+    for op in io_derived_ops() {
+        if handles_io_op(eff, op) && !names.contains(op) { out.push(op) }
     }
     out
 }
@@ -820,7 +820,7 @@ fn omitted_derived_ops(tid: Int, written: List[Int]) -> List[DefaultSlot] {
     let children = if decl == -1 { -1 } else { node_elements(decl) }
     let mut names: List[Str] = []
     for w in written { names.push(node_name(w)) }
-    for op in omitted_io_read_derived_ops(eff, written) {
+    for op in omitted_io_derived_ops(eff, written) {
         let slot = c_effect_vtable_slot_name(tid, op)
         out.push(DefaultSlot { slot: slot, userdata: c_vtable_userdata_member(slot), symbol: c_builtin_derived_op_name(tid, op) })
     }
@@ -1973,11 +1973,12 @@ fn lower_args(node: Int) -> Option[List[Int]] ! Diag.Report {
 
 // An operation of the io or env namespace, reached through the runtime's vtable for it.
 //
-// The io slots take text, and the surface accepts any value the Display trait renders, so
-// an io argument is rendered first: text passes as it is, a struct or enum through its
+// The io print slots take text, and the surface accepts any value the Display trait renders,
+// so their argument is rendered first: text passes as it is, a struct or enum through its
 // Display impl, and a kind whose rendering is private to the expression stage is refused
-// before anything is built. The env slots take what their signatures declare, which
-// typecheck has already checked, so an env argument passes as it is.
+// before anything is built. An io op with an intrinsic signature (print_raw_bytes) and the
+// env slots take what their signatures declare, which typecheck has already checked, so
+// such an argument passes as it is.
 pub fn cg_eff_lower_builtin_perform(node: Int, ns: Str, method: Str) -> Int ! Diag.Report {
     let slot = c_builtin_effect_slot(ns, method)
     if diag_is_ice_seg(slot) {
@@ -1995,7 +1996,7 @@ pub fn cg_eff_lower_builtin_perform(node: Int, ns: Str, method: Str) -> Int ! Di
     let tid = if wraps { TYPE_STR } else { call_tid }
     let rec = perform_layout(tid, Position.Local, node)
     if rec.c_spelling == "" { return -1 }
-    let args = if ns == NS_IO { lower_text_args(node) } else { lower_args(node) }
+    let args = if ns == NS_IO && io_op_renders_its_argument(method) { lower_text_args(node) } else { lower_args(node) }
     match args {
         None => -1
         Some(lowered) => {

@@ -1,13 +1,12 @@
-// io.print_raw and io.eprint_raw lower today to a direct call of the runtime's default
-// writer. The spec makes them operations of IO.Print and IO.Eprint (sections/04_effects.md
-// §4.4), which a handler can intercept; the codegen does not route them through a handler
-// yet, and these rows pin the call that it builds now. Each takes a `Str`, so a value is
-// rendered first by an interpolation.
+// io.print_raw and io.print_raw_bytes are operations of IO.Print, and io.eprint_raw is an
+// operation of IO.Eprint (sections/04_effects.md §4.4), so each performs through its own slot
+// of the io vector, which an installed handler fills. print_raw and eprint_raw take a `Str`,
+// so a value is rendered first by an interpolation; print_raw_bytes passes its Bytes as it is.
 
 import lower_test_helpers.{probe, let_node_of, assert_kind, assert_eq_str, assert_shape, assert_verifies}
 import parser.{node_count, node_kind, node_method}
 import ast.{NodeKind}
-import ir.{IrKind, ir_c_name, ir_kids}
+import ir.{IrKind, ir_c_name, ir_kid}
 import cg_expr.{lower_expr}
 import std.io
 
@@ -31,25 +30,27 @@ fn src_raw() -> Str {
     io.eprint_raw("err")
     io.print_raw("{count}")
     io.eprint_raw("n={count}")
+    let buffer = Bytes.from_str("b")
+    io.print_raw_bytes(buffer)
 }
 "#
 }
 
-test "io.print_raw passes its text to the runtime's default stdout writer" {
+test "io.print_raw performs through the print_raw slot of the io vector" {
     probe("cg_call_raw_print", src_raw())
     let built = lower_expr(call_after("count", "print_raw"))
-    assert_kind("kind", built, IrKind.CallRuntime)
-    assert_shape("shape", built, "CallRuntime(Const, Const)")
-    assert_eq_str("symbol", ir_c_name(built), "blink_io_default_print_no_nl")
+    assert_kind("kind", built, IrKind.EffectPerform)
+    assert_shape("shape", built, "EffectPerform(FieldGet(EvidenceVector), Const)")
+    assert_eq_str("slot", ir_c_name(built), "print_raw")
     assert_verifies("print_raw", built)
 }
 
-test "io.eprint_raw passes its text to the runtime's default stderr writer" {
+test "io.eprint_raw performs through the eprint_raw slot of the io vector" {
     probe("cg_call_raw_eprint", src_raw())
     let built = lower_expr(call_after("count", "eprint_raw"))
-    assert_kind("kind", built, IrKind.CallRuntime)
-    assert_shape("shape", built, "CallRuntime(Const, Const)")
-    assert_eq_str("symbol", ir_c_name(built), "blink_io_default_eprint_no_nl")
+    assert_kind("kind", built, IrKind.EffectPerform)
+    assert_shape("shape", built, "EffectPerform(FieldGet(EvidenceVector), Const)")
+    assert_eq_str("slot", ir_c_name(built), "eprint_raw")
     assert_verifies("eprint_raw", built)
 }
 
@@ -57,8 +58,8 @@ test "io.print_raw passes an interpolation hole as the text it formats" {
     probe("cg_call_raw_print_int", src_raw())
     let first = call_after("count", "print_raw")
     let built = lower_expr(call_after_node(first, "print_raw"))
-    assert_eq_str("symbol", ir_c_name(built), "blink_io_default_print_no_nl")
-    let text = ir_kids(built).get(1).unwrap()
+    assert_eq_str("slot", ir_c_name(built), "print_raw")
+    let text = ir_kid(built, 1)
     assert_kind("text kind", text, IrKind.CallRuntime)
     assert_eq_str("text symbol", ir_c_name(text), "blink_str_format")
     assert_verifies("print_raw int", built)
@@ -68,10 +69,19 @@ test "io.eprint_raw passes an interpolation as the one text it formats" {
     probe("cg_call_raw_eprint_interp", src_raw())
     let first = call_after("count", "eprint_raw")
     let built = lower_expr(call_after_node(first, "eprint_raw"))
-    assert_eq_str("symbol", ir_c_name(built), "blink_io_default_eprint_no_nl")
-    let text = ir_kids(built).get(1).unwrap()
+    assert_eq_str("slot", ir_c_name(built), "eprint_raw")
+    let text = ir_kid(built, 1)
     assert_eq_str("text symbol", ir_c_name(text), "blink_str_format")
     assert_verifies("eprint_raw interp", built)
+}
+
+test "io.print_raw_bytes passes its Bytes as it is through the print_raw_bytes slot" {
+    probe("cg_call_raw_print_bytes", src_raw())
+    let built = lower_expr(call_after("buffer", "print_raw_bytes"))
+    assert_kind("kind", built, IrKind.EffectPerform)
+    assert_shape("shape", built, "EffectPerform(FieldGet(EvidenceVector), VarRef)")
+    assert_eq_str("slot", ir_c_name(built), "print_raw_bytes")
+    assert_verifies("print_raw_bytes", built)
 }
 
 // The second call of a name: the first match's node id bounds the search from below.

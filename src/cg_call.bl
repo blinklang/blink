@@ -87,7 +87,6 @@ import cg_eff.{
     cg_eff_lower_io_read_perform, cg_eff_impl_method_at,
     cg_eff_enter_inline_frame, cg_eff_leave_inline_frame, cg_eff_binder_is_shared, cg_eff_declare_cell,
 }
-import cg_print.{vtable_slot_self_spelling}
 import cg_promote.{cg_promote_on_demand_claim, cg_promote_on_demand_settle, cg_promote_on_demand_queue}
 import cg_decl.{BodySite, cg_decl_body_site, cg_decl_c_name, cg_decl_has_display_dispatch, cg_decl_is_per_instance, cg_decl_takes_ev, display_method}
 import cg_derive.{cg_derive_range_debug_fn, cg_derive_range_clone_fn, cg_derive_debug_text, cg_derive_container_debug_text, cg_derive_hash_of}
@@ -2416,7 +2415,7 @@ let ns_trace = "trace"
 // The io names a handler can replace, and the env names it can. Both lists are written
 // under the names a caller writes, not under the vtable slots they reach, because the
 // slot is only needed by a lowering that builds the dispatch.
-let io_handler_ops: List[Str] = ["println", "print", "eprintln", "eprint", "log"]
+let io_handler_ops: List[Str] = ["println", "print", "print_raw", "print_raw_bytes", "eprintln", "eprint", "eprint_raw", "log"]
 let env_effect_ops: List[Str] = ["var", "cwd", "pid", "set_var", "remove_var", "exit"]
 
 
@@ -2702,8 +2701,6 @@ fn lower_ffi_call(node: Int, method: Str) -> Int ! Diag.Report {
 fn lower_io_call(node: Int, method: Str) -> Int ! Diag.Report {
     if io_handler_ops.contains(method) { return cg_eff_lower_builtin_perform(node, ns_io, method) }
     if is_io_read_op(method) { return cg_eff_lower_io_read_perform(node, method) }
-    let raw_writer = io_raw_writer(method)
-    if raw_writer != "" { return cc_raw_print(node, method, raw_writer) }
     let op = io_stream_op(method)
     if op == "" { return cc_ns_not_built(node, ns_io, method) }
     cc_build_call(node, c_runtime_helper(op), NO_RECEIVER, CallForm.Runtime, false)
@@ -2751,34 +2748,6 @@ fn lower_time_call(node: Int, method: Str) -> Int ! Diag.Report {
     }
     if time_vtable_ops.contains(method) { return cg_eff_lower_time_perform(node, method) }
     cc_ns_not_built(node, ns_time, method)
-}
-
-// The two io names the spec holds outside the handler system. Each reaches the runtime's
-// default writer directly, never the vtable slot, so no handler sees it. Each is still an
-// operation, so it writes its effect event (§8.15.10).
-fn io_raw_writer(method: Str) -> Str {
-    let mut table: Map[Str, Str] = Map()
-    table.insert("print_raw", "io_default_print_no_nl")
-    table.insert("eprint_raw", "io_default_eprint_no_nl")
-    table.get(method) ?? ""
-}
-
-// The writer takes text, so the value is rendered first by the seam an interpolation
-// hole uses, and a raw write and a "{x}" of the same value print alike. The writer is a
-// vtable slot's default body, so it takes a userdata word first, which it never reads.
-fn cc_raw_print(node: Int, method: Str, writer: Str) -> Int ! Diag.Report {
-    let written = node_args(node)
-    let given = if written == -1 { 0 } else { sublist_length(written) }
-    if given != 1 { return cc_free_arity_wrong(node, "io.{method}", 1, given) }
-    let tid = tid_of_node(node)
-    if tid < 0 { return -1 }
-    let rec = cc_local(tid, node)
-    if cc_stopped(rec) { return -1 }
-    let text = lower_value_as_text(sublist_get(written, 0))
-    if text < 0 { return -1 }
-    let traced = cg_trace_builtin_effect(node, "IO", method, [text])
-    let no_userdata = ir_const(TYPE_VOID, node, vtable_slot_self_spelling(), "NULL")
-    ir_call_runtime(tid, node, rec.c_spelling, c_runtime_helper(writer), rec.slot_form, [no_userdata, traced.get(0).unwrap()])
 }
 
 // The runtime builds the whole list in one call, so no loop reaches the call seam, which

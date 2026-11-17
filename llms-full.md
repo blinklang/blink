@@ -546,7 +546,8 @@ io.read_all()                   // -> Str: the rest of stdin
 io.read_bytes(n)                // -> Bytes: exactly n bytes, fewer only at end of input; n <= 0 panics
 io.write(s)                     // write string to stdout (no newline)
 io.write_bytes(b)               // write Bytes to stdout
-io.print_raw("text")            // raw printf (bypasses vtable)
+io.print_raw("text")            // stdout, no newline, flushed (IO.Print op: handler-dispatched)
+io.print_raw_bytes(b)           // every byte of b to stdout, flushed (IO.Print op)
 io.eprint_raw("error")          // stderr, no newline, flushed (IO.Eprint op: rowed, handler-dispatched)
 
 // Filesystem (effect: FS) — the signed surface returns Result[T, FsError];
