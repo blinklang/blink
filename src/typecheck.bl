@@ -22857,13 +22857,8 @@ fn env_time_op_sub(op: Str) -> Str {
 // The call that a program writes for operation `op` of the built-in effect `root` (§4.4).
 pub fn builtin_effect_op_call(root: Str, op: Str) -> Str {
     if root != "IO" { return "{root.to_lower()}.{op}" }
-    match op {
-        "print" => "io.println"
-        "print_no_nl" => "io.print"
-        "eprint" => "io.eprintln"
-        "eprint_no_nl" => "io.eprint"
-        _ => "io.{op}"
-    }
+    let caller = io_op_caller(op)
+    if caller == "" { "io.{op}" } else { "io.{caller}" }
 }
 
 // The declared parameter names of operation `op` of the built-in effect `root`, or None for a
@@ -22896,25 +22891,17 @@ fn env_time_op_params(op: Str) -> List[Str] {
     }
 }
 
-// The operations of IO.Read (§4.4.9), in the order the IO vtable lays out their slots.
-pub fn io_read_ops() -> List[Str] {
-    let mut out: List[Str] = []
-    for row in io_op_rows() {
-        if row.sub_effect == "Read" { out.push(row.op) }
-    }
-    out
-}
-
 pub let IO_READ_PRIMITIVE = "read_bytes"
 
 pub fn is_io_read_op(op: Str) -> Bool { io_op_sub_effect(op) == "Read" }
 
 pub fn is_io_read_derived_op(op: Str) -> Bool { is_io_derived_op(op) && is_io_read_op(op) }
 
-// Whether a call of io `op` renders its argument as text. The print family takes any value
-// Display renders, so it has no intrinsic signature; an op with one takes the types it declares.
-pub fn io_op_renders_its_argument(op: Str) -> Bool {
-    !fnsig_map.contains_key("io.{op}")
+// Whether a call of the io handle method `method` renders its argument as text: whether it has
+// no io. intrinsic signature. The print family takes any value Display renders, so it has none;
+// a method with one takes the types it declares.
+pub fn io_op_renders_its_argument(method: Str) -> Bool {
+    !fnsig_map.contains_key("io.{method}")
 }
 
 // Whether `op` is an IO operation whose omission runs its std.io_derived body (§4.4).
@@ -22938,17 +22925,16 @@ pub fn io_derived_ops() -> List[Str] {
 // in it, so both read the name here.
 pub fn io_derived_module() -> Str { "std.io_derived" }
 
-// Whether a handler of `eff` writes the IO operation `op`: a handler of the root or of the
-// sub-effect that performs `op`.
-pub fn handles_io_op(eff: Str, op: Str) -> Bool {
-    let sub = io_op_sub_effect(op)
-    sub != "" && (eff == "IO" || eff == "IO.{sub}")
+// Whether a handler of `eff` holds the IO operation of `row`: a handler of the root or of the
+// sub-effect that performs it.
+pub fn handles_io_row(eff: Str, row: IoOpRow) -> Bool {
+    eff == "IO" || eff == "IO.{row.sub_effect}"
 }
 
-// Whether a handler of `eff` writes one or more derived IO operations.
+// Whether a handler of `eff` holds one or more derived IO operations.
 pub fn handles_io_derived(eff: Str) -> Bool {
-    for op in io_derived_ops() {
-        if handles_io_op(eff, op) { return true }
+    for row in io_op_rows() {
+        if !row.primitive && handles_io_row(eff, row) { return true }
     }
     false
 }
@@ -22971,7 +22957,7 @@ fn builtin_handler_op_sig(root: Str, op: Str) -> Int ! Diag.Report {
         // The handle call's own signature, so a clause and the call it answers cannot differ.
         return lookup_fnsig("io.{io_caller}")
     } else if io_sub == "Print" || io_sub == "Eprint" || io_sub == "Log" {
-        register_named_intrinsic_fn_sig(key, [TYPE_STR], builtin_effect_op_params(root, op) ?? ["msg"], TYPE_VOID)
+        register_named_intrinsic_fn_sig(key, [TYPE_STR], builtin_effect_op_params(root, op).unwrap(), TYPE_VOID)
     } else if root == "Time" && op == "read" {
         register_intrinsic_fn_sig(key, [], runtime_instant_tid())
     } else if root == "Time" && op == "monotonic" {
