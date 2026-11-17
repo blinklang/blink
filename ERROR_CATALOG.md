@@ -80,7 +80,7 @@ ICE codes use the `I` prefix. `@allow` and `[lints]` take warning names only, so
 | UnsolvedTypeVarAtCodegen | I0001 | An unsolved type variable reached monomorphization — the front end should have reported `CannotInferType` (E0301) first |
 | UnhandledIterableAtCodegen | I0002 | A `for` loop's iterable passed the front-end check but code generation has no emitter for its type |
 | MisplacedIrKindAtPrint | I0003 | An IR node of the wrong class reached the C printer — a statement where a value is required, or the reverse |
-| CodegenStageNotBuilt | I0004 | A code-generation stage this build does not contain was reached |
+| CodegenStageNotBuilt | I0004 | A code-generation stage this build does not contain was reached. A valid construct that the compiler knows it cannot build, such as a method of a sealed trait other than `Sized` named as a value, is reported at check, so `blink check` stops (§6.7) |
 | PoisonedIrAtSeam | I0005 | A negative IR node id was handed to a producer that must embed it — the caller ignored a stop it had already been told about |
 | NoSourceTextForExpression | I0006 | An expression reached the source-text rebuilder (the condition text of a failing assert) with no rendering for its kind |
 | UnverifiedIrAtPrint | I0007 | The C printer was about to read a lowered function that the IR verifier refuses |

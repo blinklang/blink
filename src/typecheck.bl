@@ -32,7 +32,7 @@ import diagnostics.{
     ICE_SEG_UNSOLVED_TYPEVAR, ICE_SEG_UNHANDLED_KIND, ICE_SEG_TID_OUT_OF_RANGE,
     ICE_SEG_ERASED_SLOT, diag_is_ice_seg,
     NON_EXHAUSTIVE_MATCH, INCONSISTENT_PATTERN_BINDINGS, DUPLICATE_MODULE_BINDING,
-    UNSOLVED_TYPEVAR_AT_CODEGEN, CALL_NOT_ANSWERED, OPEN_TYPE_AFTER_CHECK, CALL_ROW_UNKNOWN, SEALED_OPS_REWRITE_INVARIANT, VARIANT_WITHOUT_ENUM,
+    UNSOLVED_TYPEVAR_AT_CODEGEN, CODEGEN_STAGE_NOT_BUILT, CODEGEN_STAGE_NOT_BUILT_NAME, CALL_NOT_ANSWERED, OPEN_TYPE_AFTER_CHECK, CALL_ROW_UNKNOWN, SEALED_OPS_REWRITE_INVARIANT, VARIANT_WITHOUT_ENUM,
     NO_SUCH_VARIANT, TYPE_ERROR, TEMPLATE_MISMATCH, UNEXPECTED_ANNOTATION, MISSING_RETURN, NO_CONVERSION_IMPL, CANNOT_INFER_TYPE, NOT_ITERABLE, MISSING_ELSE, UNLICENSED_SELF_OP, TRAIT_BOUND_NOT_SATISFIED, CAPABILITY_BUDGET, QM_INVALID_OPERAND, UNDEFINED_FUNCTION,
     UNRESOLVED_METHOD, AMBIGUOUS_METHOD_CALL, MISSING_DISPLAY_IMPL,
     MUTATION_REQUIRES_MUT, MUT_ON_PATTERN, NOT_A_PLACE, PARAM_ASSIGN, diag_error_label_at_notes, diag_add_note_at_spots_since, diag_error_span_label_at_notes, diag_warn_label_at_notes, EMPTY_ROW_OUTSIDE_FFI, PANIC_HOOK_PLACEMENT, TRACE_MESSAGE_EFFECT, METHOD_THROUGH_TYPE_NAME, ASSOCIATED_FN_THROUGH_TRAIT, SELF_OUTSIDE_TRAIT_OR_IMPL, EFFECTS_ANNOTATION_REMOVED, UNKNOWN_EFFECT, SUB_EFFECT_AS_TYPE, diag_fix_before_starts_with, diag_drop_fix_over_others, diag_drop_fix_at,
@@ -29437,6 +29437,36 @@ fn tc_report_assoc_fn_through_trait(node: Int, obj_node: Int, written: Str, trai
     tc_emit_assoc_fn_through_trait(node, obj_node, written, trait_key, name, call, want, self_tid, arg_tids)
 }
 
+// A sealed trait's method is a function value only through `Sized`, whose impls lib/std
+// writes. The other sealed traits' methods are compiler intrinsics with no function for a
+// value to name, so the legal value stops `blink check` as a limit of this compiler, not as
+// an error in the program (§3.4 *A trait-qualified method named as a value*).
+fn tc_sealed_value_not_built(trait_key: Str) -> Bool {
+    is_sealed_builtin_trait(trait_key) == 1 && trait_key != "Sized"
+}
+
+// `decl` is the trait's declaration of `name`, or -1 when the trait does not declare it.
+fn tc_report_sealed_value_not_built(node: Int, written: Str, name: Str, decl: Int) -> Int ! TypeCheck.Resolve, Diag.Report {
+    let mut closure = "a closure that calls `.{name}` on its receiver"
+    let params = if decl >= 0 { node_params(decl) } else { -1 }
+    if params != -1 {
+        let mut names: List[Str] = []
+        for i in 0..sublist_length(params) { names.push(if i == 0 { "x" } else { "a{i}" }) }
+        let ps = names.join(", ")
+        closure = "a closure that makes the call, such as `fn({ps}) \{ {written}.{name}({ps}) }`"
+    }
+    diag_ice_at(CODEGEN_STAGE_NOT_BUILT_NAME, CODEGEN_STAGE_NOT_BUILT,
+        "`{written}.{name}` named as a value is not built in this compiler", node,
+        "the program is valid, but this compiler builds a sealed trait's method as a value only for `Sized`; use {closure}")
+    // A function over the recovery type, as E0568 gives, so no place that takes the value
+    // reports a second fault. Its arity is the declaration's, or else the expected type's.
+    let want = if tc_construct_hint >= 0 { resolve_alias_tid(tc_resolve(tc_construct_hint)) } else { -1 }
+    let arity = if params != -1 { sublist_length(params) } else if want >= 0 && type_kind(want) == TyKind.Fn { tc_fn_tid_param_hints(want).len() } else { 1 }
+    let mut rec_params: List[Int] = []
+    for _ in 0..arity { rec_params.push(tc_error_recovery_tid()) }
+    make_fn_type(tc_error_recovery_tid(), rec_params)
+}
+
 // The report itself, once `self_tid` is known (-1 when nothing fixes `Self`). `want` is the
 // type the place expects, and `arg_tids` the call's argument types.
 fn tc_emit_assoc_fn_through_trait(node: Int, obj_node: Int, written: Str, trait_key: Str, name: Str, call: Bool, want: Int, self_tid: Int, arg_tids: List[Int]) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
@@ -39149,9 +39179,10 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                 }
                 // The read names the function a trait-qualified call would run, and the call
                 // has the error, so the read does too (§3c.4).
-                if tc_head_names_trait(obj_name) && is_sealed_builtin_trait(obj_name) == 0 {
+                if tc_head_names_trait(obj_name) {
                     let rt_trait = tc_trait_ref_key(obj_name, nr_current_module)
                     let rt_decl = tc_trait_method_decl(rt_trait, fname)
+                    if tc_sealed_value_not_built(rt_trait) { return tc_report_sealed_value_not_built(node, obj_name, fname, rt_decl) }
                     if rt_decl >= 0 && !tc_fn_decl_takes_self(rt_decl) {
                         return tc_report_assoc_fn_through_trait(node, obj_node, obj_name, rt_trait, fname, false)
                     }
@@ -48973,8 +49004,9 @@ pub fn tc_stamp_program(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Dia
     // A program that already has an error has nodes inference deliberately never typed: the
     // arm that would have typed them reported instead and returned. Asserting there turns
     // every ordinary type error into an internal-compiler-error cascade, so the total-stamp
-    // claim only holds for a program that type checks.
-    if diag_count > 0 { return }
+    // claim only holds for a program that type checks. An internal error reported already
+    // stops the check the same way, and its node carries only the recovery type.
+    if diag_count > 0 || diag_ice_count > 0 { return }
     // A call no arm claimed has no type, and neither has what reads it, so the assert would
     // report the same fault again at each reader.
     if calls.len() > 0 {

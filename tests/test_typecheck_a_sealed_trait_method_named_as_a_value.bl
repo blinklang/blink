@@ -1,0 +1,124 @@
+// A method of a sealed built-in trait named with no argument list is a function value of type
+// `fn(Self, P2, ..., Pn) -> R`, as a method of any other trait is (sections/03_types.md §3.4
+// *A trait-qualified method named as a value*). For `Sized` the expected type fixes `Self`;
+// when nothing fixes it, it is error[CannotInferType] at the reference, and when `Self` does
+// not implement `Sized` it is error[TraitBoundNotSatisfied] at the reference. This compiler
+// builds no such value for the other sealed traits, so each one stops the check with the
+// internal error CodegenStageNotBuilt at the reference, and with no error that calls the
+// program wrong.
+
+import std.fs
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_reset}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+import std.io
+
+fn typecheck_probe(path: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    init_embedded_stdlib()
+    fs.write(path, src).unwrap()
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+}
+
+// Each error as "name at line:col: message | note | help: help".
+fn errors_of(src: Str) -> List[Str] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    typecheck_probe("build/test_typecheck_a_sealed_trait_method_value_probe.bl", src)
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" {
+            let mut line = "{d.name} at {d.line}:{d.col}: {d.message}"
+            for n in d.notes { line = "{line} | {n}" }
+            line = "{line} | help: {d.help}"
+            out.push(line)
+        }
+    }
+    for e in out { io.println("  diag: {e}") }
+    out
+}
+
+// The declarations take lines 1-2, so the first statement of `main` is line 4.
+let DECLS = "type SvNoEq \{ n: Int }\ntype SvBox \{ n: Int }\n"
+
+fn with_main(stmts: Str) -> Str {
+    "{DECLS}fn main() \{\n{stmts}}\n"
+}
+
+fn clean(src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    assert_eq(errors_of(src).len(), 0)
+}
+
+fn one_error(src: Str) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    let errs = errors_of(src)
+    assert_eq(errs.len(), 1)
+    errs.get(0).unwrap()
+}
+
+test "the expected type of a binding fixes Self of a Sized value" {
+    clean(with_main("    let h: fn(Str) -> Int = Sized.len\n    let e: fn(List[Int]) -> Bool = Sized.is_empty\n    let _ = h(\"a\")\n    let _ = e([])\n"))
+}
+
+test "the receiver of an unannotated map fixes Self of a Sized value" {
+    clean(with_main("    let ns = [\"ab\"].map(Sized.len)\n    let n: Int = ns.get(0).unwrap()\n    let _ = n\n"))
+}
+
+test "a later call fixes Self of a Sized value with no expected type" {
+    clean(with_main("    let g = Sized.len\n    let _ = g(\"a\")\n"))
+}
+
+test "a Sized value with nothing to fix Self is refused at the reference" {
+    let e = one_error(with_main("    let f = Sized.len\n"))
+    assert(e.starts_with("CannotInferType at 4:13: "), e)
+    assert(e.contains("Sized.len"), e)
+}
+
+test "a user type as Self of Sized is refused at the reference" {
+    let e = one_error(with_main("    let h: fn(SvBox) -> Int = Sized.len\n    let _ = h\n"))
+    assert(e.starts_with("TraitBoundNotSatisfied at 4:31: "), e)
+    assert(e.contains("SvBox"), e)
+    assert(e.contains("Sized"), e)
+}
+
+test "a user type as Self of Sized through a map is refused at the reference" {
+    let e = one_error(with_main("    let ns: List[Int] = [SvBox \{ n: 1 }].map(Sized.len)\n    let _ = ns\n"))
+    assert(e.starts_with("TraitBoundNotSatisfied at 4:46: "), e)
+}
+
+test "a Sized value in a generic body is judged by the bounds of its type parameter" {
+    clean("fn size[T: Sized](x: T) -> Int \{\n    let h: fn(T) -> Int = Sized.len\n    h(x)\n}\nfn main() \{\n    let _ = size(\"a\")\n}\n")
+    let e = one_error("fn size[T](x: T) -> Int \{\n    let h: fn(T) -> Int = Sized.len\n    h(x)\n}\nfn main() \{\n    let _ = size(\"a\")\n}\n")
+    assert(e.starts_with("TraitBoundNotSatisfied at 2:27: "), e)
+}
+
+// The one report for a value of a sealed trait other than `Sized`: an internal error at the
+// reference that names the method and says the program is valid.
+fn expect_not_built(src: Str, at: Str, shown: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    let e = one_error(src)
+    assert(e.starts_with("CodegenStageNotBuilt at {at}: `{shown}` named as a value is not built in this compiler"), e)
+    assert(e.contains("the program is valid"), e)
+}
+
+test "a declared StrOps method named as a value stops the check as a compiler limit" {
+    expect_not_built(with_main("    let t: fn(Str) -> Str = StrOps.trim\n    let _ = t\n"), "4:29", "StrOps.trim")
+}
+
+test "a ListOps method that traits.bl does not declare stops the check as a compiler limit" {
+    expect_not_built(with_main("    let s: fn(List[Int]) -> List[Int] = ListOps.sort\n    let _ = s\n"), "4:41", "ListOps.sort")
+}
+
+test "a sealed value with nothing to fix Self gets no CannotInferType beside the limit" {
+    expect_not_built(with_main("    let f = StrOps.to_upper\n    let _ = f\n"), "4:13", "StrOps.to_upper")
+    expect_not_built(with_main("    let ps = [[1]].map(ListOps.pop)\n    let _ = ps\n"), "4:24", "ListOps.pop")
+}
+
+test "a sealed value at a type the trait does not cover gets no bound error beside the limit" {
+    expect_not_built(with_main("    let k: fn(Set[Int]) -> List[Int] = MapOps.keys\n    let _ = k\n"), "4:40", "MapOps.keys")
+    expect_not_built(with_main("    let c: fn(List[SvNoEq], SvNoEq) -> Bool = Contains.contains\n    let _ = c\n"), "4:47", "Contains.contains")
+    expect_not_built(with_main("    let j: fn(List[Int], Str) -> Str = Joinable.join\n    let _ = j\n"), "4:40", "Joinable.join")
+}
+
+test "a sealed method the type does not answer yet stops the check as a compiler limit" {
+    expect_not_built(with_main("    let g: fn(Map[Str, Int], Str, Int) -> Int = MapOps.get_or_default\n    let _ = g\n"), "4:49", "MapOps.get_or_default")
+}

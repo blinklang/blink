@@ -1,0 +1,119 @@
+// `Sized.len` and `Sized.is_empty` named with no argument list are function values, as a method
+// of any other trait is (sections/03_types.md §3.4 *A trait-qualified method named as a value*).
+// The value does what the trait-qualified call does, for each built-in type that implements
+// `Sized`. Each program must check clean, then build and run in both build modes and print the
+// text its closure form prints.
+
+import compile_test_helpers
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> ProcessResult ! Process.Spawn {
+    process.run("sh", ["-c", cmd]).unwrap()
+}
+
+fn expect_prints_with(tag: Str, lines: List[Str], flags: Str, want: Str) ! IO, FS.Write, Process.Spawn, Env.Read {
+    let dir = "{compile_test_helpers.scratch_root()}/sealed_method_value_{tag}"
+    let _ = sh("rm -rf {dir} && mkdir -p {dir}")
+    fs.write("{dir}/x.bl", lines.join("\n").concat("\n")).unwrap()
+    let clear = "env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE"
+    let mut bad = 0
+    let c = sh("B=$(pwd)/build/blink; cd {dir} && {clear} timeout 120 $B check x.bl < /dev/null")
+    if !c.success() {
+        io.eprintln("{tag} check: ended {c.end}\n{c.out}{c.err_out}")
+        bad = bad + 1
+    }
+    for mode in ["--per-module", "--no-per-module"] {
+        let r = sh("B=$(pwd)/build/blink; cd {dir} && {clear} timeout 120 $B run {mode} {flags} x.bl 2>/dev/null < /dev/null")
+        if !r.success() || r.out.trim() != want {
+            let e = sh("B=$(pwd)/build/blink; cd {dir} && {clear} timeout 120 $B run {mode} {flags} x.bl < /dev/null")
+            io.eprintln("{tag} {mode} {flags}: ended {r.end}, printed [{r.out.trim()}], want [{want}]\n{e.err_out}")
+            bad = bad + 1
+        }
+    }
+    let _ = sh("rm -rf {dir}")
+    assert_eq(bad, 0)
+}
+
+fn expect_prints(tag: Str, lines: List[Str], want: Str) ! IO, FS.Write, Process.Spawn, Env.Read {
+    expect_prints_with(tag, lines, "", want)
+}
+
+fn program(body: List[Str]) -> List[Str] {
+    program_with([], body)
+}
+
+// `decls` ahead of a `main` that runs `body`.
+fn program_with(decls: List[Str], body: List[Str]) -> List[Str] {
+    let mut out: List[Str] = []
+    for d in decls { out.push(d) }
+    out.push("fn main() \{")
+    for l in body { out.push(l) }
+    out.push("}")
+    out
+}
+
+test "a Sized method is the function a parameter type expects" {
+    expect_prints("sized_argument", program([
+        "    let ns: List[Int] = [\"ab\", \"c\"].map(Sized.len)",
+        "    let es = [[1], []].map(Sized.is_empty)",
+        "    let h: fn(Str) -> Int = Sized.len",
+        "    io.println(\"\{ns.get(0).unwrap()} \{es.get(1).unwrap()} \{h(\"xyz\")}\")",
+    ]), "2 true 3")
+}
+
+test "the receiver of an unannotated map fixes Self of a Sized value" {
+    expect_prints("sized_unannotated", program([
+        "    let ns = [\"ab\", \"c\"].map(Sized.len)",
+        "    let ms = [[1, 2, 3]].map(Sized.len)",
+        "    io.println(\"\{ns.get(0).unwrap()} \{ms.get(0).unwrap()}\")",
+    ]), "2 3")
+}
+
+test "a Sized method value covers each built-in type that implements Sized" {
+    expect_prints("sized_each_type", program([
+        "    let a: fn(List[Int]) -> Int = Sized.len",
+        "    let b: fn(Map[Str, Int]) -> Bool = Sized.is_empty",
+        "    let c: fn(Set[Int]) -> Int = Sized.len",
+        "    let d: fn(Bytes) -> Int = Sized.len",
+        "    let e: fn(StringBuilder) -> Bool = Sized.is_empty",
+        "    let sb = StringBuilder.new()",
+        "    sb.write(\"hi\")",
+        "    let m: Map[Str, Int] = Map.new()",
+        "    let mut s: Set[Int] = Set.new()",
+        "    s.insert(4)",
+        "    io.println(\"\{a([1, 2, 3])} \{b(m)} \{c(s)} \{d(Bytes.from_str(\"xyz\"))} \{e(sb)}\")",
+    ]), "3 true 1 3 false")
+}
+
+test "a Sized method value in a generic body runs at each instance" {
+    expect_prints("generic_body", program_with([
+        "fn size[T: Sized](x: T) -> Int \{",
+        "    let h: fn(T) -> Int = Sized.len",
+        "    h(x)",
+        "}",
+        "fn empties[T: Sized](xs: List[T]) -> List[Bool] \{",
+        "    xs.map(Sized.is_empty)",
+        "}",
+    ], [
+        "    let es = empties([\"\", \"x\"])",
+        "    io.println(\"\{size(\"abc\")} \{size([1, 2])} \{es.get(0).unwrap()} \{es.get(1).unwrap()}\")",
+    ]), "3 2 true false")
+}
+
+test "a Sized method value and its trait-qualified call agree" {
+    expect_prints("value_and_call", program([
+        "    let n: fn(Str) -> Int = Sized.len",
+        "    let e = [\"\", \"q\"].map(Sized.is_empty)",
+        "    io.println(\"\{n(\"qq\")} \{Sized.len(\"qq\")} \{e.get(1).unwrap()} \{Sized.is_empty(\"q\")}\")",
+    ]), "2 2 false false")
+}
+
+test "a Sized method value runs under a trace and in a debug build" {
+    let lines = program([
+        "    let h: fn(List[Int]) -> Int = Sized.len",
+        "    let ns = [\"a\", \"bc\"].map(Sized.len)",
+        "    io.println(\"\{h([1, 2])} \{ns.get(1).unwrap()}\")",
+    ])
+    expect_prints_with("traced", lines, "--trace", "2 2")
+    expect_prints_with("debug", lines, "--debug", "2 2")
+}
