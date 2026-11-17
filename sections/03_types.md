@@ -3560,9 +3560,9 @@ fn d[T](xs: List[T], n: Int) -> Int {
     d(ys, n - 1)
 }
 
-fn m[K, V](mp: Map[K, V], n: Int) -> Int {
+fn m[K: Hash, V](mp: Map[K, V], n: Int) -> Int {
     if n <= 0 { return mp.len() }
-    m(Map(), n - 1)              // error[CannotInferType] (E0301): write `m[K, V](Map(), n - 1)`
+    m(Map.new(), n - 1)          // error[CannotInferType] (E0301): write `m[K, V](Map.new(), n - 1)`
 }
 
 fn o[T](xs: Option[T], n: Int) -> Int {
@@ -4147,7 +4147,7 @@ There is no exception for a value that is "never used in a way that would expose
 **Under-determination flows through construction.** An under-constrained generic construction is the same error, reported at the binding, with the enclosing constructor's parameters named:
 
 ```blink
-type GKV[K, V] {
+type GKV[K: Hash, V] {
     m: Map[K, V]
 }
 
@@ -5934,6 +5934,44 @@ impl Cnt for Foo {
 }
 ```
 
+**A type parameter as a key or element in a written type.** `Map` and `Set` act as if their declarations were `type Map[K: Hash, V]` and `type Set[T: Hash]`. A written type is under that bound as a written type is under any bound on a type declaration (§3.6 *Bounds on a Type Declaration*). The compiler never adds a bound for the user (*No implied bounds*). So a `Map` key or a `Set` element that a program writes in a type must be hashable under the `Hash` bounds that the program writes. `blink check` reports it at the type, and no body or call is needed.
+
+- **Where.** A parameter type, a return type, a field type, an enum payload, the target of a type alias, a type inside a `fn` type, a local annotation, an `impl` header, a parameter or return type of a trait method, and a type argument nested in any of these.
+- **A concrete key.** A key with no `Hash` impl (`Map[Float, Int]`, `Set[List[Int]]`) is E1400 at the key in each of these places (*Float keys*, *Non-hashable keys and elements in general*).
+- **A type parameter.** A type parameter with no `Hash` bound, or a key that holds one, is E1400 at the key. The help is a machine-applicable fix that adds `: Hash` to the exact binder of that parameter: the fn, the impl, the trait method, the type declaration or the alias.
+- **The count of reports.** One declaration gives one E1400 for each binder. The error is at the first keyed use of the binder in source order. Each other keyed use of that binder in the same declaration is a label on that error.
+- **A type that holds the key.** It writes the bound: `type Bag[T: Hash] { s: Set[T] }`. A type that does not write it is E1400 at the field, and the compiler does not give its `T` a `Hash` bound from the field. The bound of `Bag` is a bound that the declaration wrote, so `Bag[Float]` is E0306 at `Float`, and `fn f[U](b: Bag[U])` is E0306 at `U` until `f` writes `U: Hash`.
+
+```blink
+type Bag[T: Hash] { s: Set[T] }                           // OK
+type Bad[T] { s: Set[T] }                                 // error[MapKeyNotHashable] (E1400) at `T`: write `type Bad[T: Hash]`
+type Tagged[T] { One(Set[T]), Two }                       // E1400 at `T` in the payload
+type M[K] = Map[K, Int]                                   // E1400 at `K` in the alias target
+type M2[K: Hash] = Map[K, Int]                            // OK
+
+fn size[K, V](m: Map[K, V]) -> Int { m.len() }            // E1400 at `K`; help: add `K: Hash`
+fn size_ok[K: Hash, V](m: Map[K, V]) -> Int { m.len() }   // OK: `V` needs no bound
+fn mk[T]() -> Set[T] { Set.new() }                        // E1400 at `T` in the return type
+fn app[T](f: fn(Set[T]) -> Int) -> Int { 0 }              // E1400 at `T` in the `fn` type
+fn loc[T](x: T) -> Int {
+    let s: Set[T] = Set.new()                             // E1400 at `T` in the local annotation
+    s.len()
+}
+fn pk[T](m: Map[(T, Int), Int]) -> Int { m.len() }        // E1400 at the key `(T, Int)`: it holds `T`
+fn two[K](a: Map[K, Int], b: Set[K]) -> Map[K, Int] { a } // one E1400, at `K` in `a`; labels at `Set[K]` and at the return type
+fn flt(m: Map[Float, Int], s: Set[Float]) -> Int { 0 }    // E1400 at each `Float`
+
+fn use_bag(b: Bag[Float]) -> Int { 0 }                    // error[TraitBoundNotSatisfied] (E0306) at `Float`
+fn pass[U](b: Bag[U]) -> Int { 0 }                        // E0306 at `U`: write `U: Hash`
+fn pass_ok[U: Hash](b: Bag[U]) -> Int { b.s.len() }       // OK
+
+trait Pk { fn pk[U](self, s: Set[U]) -> Int }             // E1400 at `U`: put `U: Hash` on the trait method
+trait Pk2 { fn pk[U: Hash](self, s: Set[U]) -> Int }      // OK
+type Holder[X] { x: X }
+impl[T] Pk2 for Holder[Set[T]] { fn pk[U: Hash](self, s: Set[U]) -> Int { 0 } }       // E1400 at `T` in the header
+impl[T: Hash] Pk2 for Holder[Set[T]] { fn pk[U: Hash](self, s: Set[U]) -> Int { 0 } } // OK
+```
+
 #### The `final` Modifier
 
 A trait may declare a default method as `final` to seal it against override. The `final` keyword is a method-level modifier on trait default methods only — it appears nowhere else in the language.
@@ -7329,6 +7367,8 @@ A bound written on a type declaration restricts the type. In `type S[T: Tr] { v:
 
 The rule is for a bound that a declaration writes. It adds no bound that nobody wrote.
 
+`Map` and `Set` are two type declarations that write a bound: they act as `Map[K: Hash, V]` and `Set[T: Hash]`. A key or element that a program writes in a type is checked against the `Hash` bounds in scope, and a failed bound there is `error[MapKeyNotHashable]` (E1400), not E0306 (§3.6 *Hash Contract and Seeding*).
+
 **Where the compiler checks.** Two kinds of place count:
 
 - **A written type.** An annotation, a parameter type, a return type, a field type, an alias target, an `impl` header, a type argument written at a call, and a type argument nested in another type (`List[S[Bad]]`). The check does not need a value or a call: a function that nobody calls, and a phantom parameter that no field holds, are checked too.
@@ -7704,7 +7744,7 @@ error[MissingSupertraitImpl]: impl Ord for H[T] requires H[T] to also implement 
 
 The help is machine-applicable. It adds only the bounds that the impl's own bounds do not already give, in the form the impl already uses: `: Eq` after a bare parameter, ` + Eq` on a bound list, or an item in the `where` clause. If the receiver type has no impl of the supertrait at all, the help is to derive it or to write it (`@derive(Eq)` on the type, or a hand-written `impl Eq`).
 
-**No implied bounds.** The compiler never adds a bound that the user did not write. `impl[T] Ord for H[T]` does not mean `impl[T: Eq] Ord for H[T]`. A polymorphic impl varies behavior only through the bounds it writes. The same holds for a bound written on a type declaration: `fn f[U](s: S[U])` with `type S[T: Tr]` is E0306 until the function writes `fn f[U: Tr]`, and `s.v.m()` gets no method from the bound of `S` (*Bounds on a Type Declaration*).
+**No implied bounds.** The compiler never adds a bound that the user did not write. `impl[T] Ord for H[T]` does not mean `impl[T: Eq] Ord for H[T]`. A polymorphic impl varies behavior only through the bounds it writes. The same holds for a bound written on a type declaration: `fn f[U](s: S[U])` with `type S[T: Tr]` is E0306 until the function writes `fn f[U: Tr]`, and `s.v.m()` gets no method from the bound of `S` (*Bounds on a Type Declaration*). The same holds for a key: `type Bag[T] { s: Set[T] }` does not mean `type Bag[T: Hash]`. It is E1400 at the field until `Bag` writes `T: Hash` (*Hash Contract and Seeding*).
 
 **A derived supertrait impl.** The supertrait impl can come from `@derive`. The rule, the code, the message and the help are the same as for a hand-written pair, and a label or note points at the `@derive(...)` attribute. With `@derive(Eq)` on `H[T]`, the hand-written `impl[T] Ord for H[T]` is E0911, and the help is `impl[T: Eq] Ord for H[T]`. For the bounds of a derived impl, see *Supertrait Auto-Derivation*.
 
