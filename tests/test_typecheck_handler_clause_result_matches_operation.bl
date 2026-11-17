@@ -1,0 +1,88 @@
+// A handler clause's result type equals the result type of the operation it names, after alias
+// expansion (sections/04_effects.md §4.7 *Clause signatures*). A clause that leaves out `-> R`
+// has the result type `()`, as any fn does, so for an operation with another result type,
+// `-> Never` included, it is error[HandlerClauseMismatch] (E0548) in `blink check`, with the
+// operation's header in the help. Before, such a clause checked clean and the build stopped in
+// the C compiler. A written result that differs is E0548 too; an alias of the right type, and
+// an omitted result for an operation that has none, check clean.
+
+import typecheck.{check_types}
+import compiler.{compile_to_program}
+import diagnostics.{DiagEntry, diag_entries, diag_reset, diag_fix_edits}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+import std.fs
+import std.io
+
+const PATH = "build/tc_handler_clause_result_matches_operation_src.bl"
+
+// Each error and each internal error of the program.
+fn front_errors(src: Str) -> List[DiagEntry] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    init_embedded_stdlib()
+    fs.write(PATH, src).unwrap()
+    diag_reset()
+    let program = compile_to_program(PATH, 1)
+    check_types(program)
+    let _ = fs.delete(PATH)
+    let mut out: List[DiagEntry] = []
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" { out.push(d) }
+    }
+    for d in out { io.println("  diag: {d.name} at {d.line}:{d.col}: {d.message} | help: {d.help}") }
+    out
+}
+
+// The effects the rows handle, on lines 1 to 7. A row's code starts on line 8.
+const EFF = "type Count = Int\neffect Ee \{\n    effect Op \{ fn op(x: Int) -> Int }\n    effect Cnt \{ fn cnt() -> Count }\n    effect Stop \{ fn stop(code: Int) -> Never }\n    effect Note \{ fn note(msg: Str) }\n}\n"
+
+// The program has one error, E0548 on line 8, whose message says the clause `op` gives `got`
+// where the operation `Ee.{sub}.{op}` gives `want`, and whose help prints `header`. The fix is
+// not machine-applicable, so the error carries none.
+fn mismatch(code: Str, sub: Str, op: Str, got: Str, want: Str, header: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    let errs = front_errors("{EFF}{code}")
+    assert_eq(errs.len(), 1)
+    let d = errs.get(0).unwrap()
+    assert_eq(d.name, "HandlerClauseMismatch")
+    assert_eq(d.code, "E0548")
+    assert_eq(d.line, 8)
+    assert_eq(d.message, "handler clause `{op}` returns `{got}`, but `Ee.{sub}.{op}` returns `{want}`")
+    assert_eq(d.help, "write the header of the operation: `{header}`")
+    assert_eq(diag_fix_edits(d).len(), 0)
+}
+
+fn clean(code: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    assert_eq(front_errors("{EFF}{code}").len(), 0)
+}
+
+test "a clause with no result for an operation that returns Int is E0548" {
+    mismatch("fn main() \{ with handler Ee.Op \{ fn op(_x: Int) \{ } } \{ io.println(\"\{ee.op(1)}\") } }\n", "Op", "op", "()", "Int", "fn op(x: Int) -> Int")
+}
+
+test "a clause that writes a result other than the operation's is E0548" {
+    mismatch("fn main() \{ with handler Ee.Op \{ fn op(x: Int) -> Str \{ \"\{x}\" } } \{ io.println(\"\{ee.op(1)}\") } }\n", "Op", "op", "Str", "Int", "fn op(x: Int) -> Int")
+}
+
+test "a clause with no result for a Never operation is E0548" {
+    mismatch("fn main() \{ with handler Ee.Stop \{ fn stop(_code: Int) \{ } } \{ ee.stop(1) } }\n", "Stop", "stop", "()", "Never", "fn stop(code: Int) -> Never")
+}
+
+test "a Never clause for an operation that returns Int is E0548" {
+    mismatch("fn main() \{ with handler Ee.Op \{ fn op(x: Int) -> Never \{ panic(\"\{x}\") } } \{ io.println(\"\{ee.op(1)}\") } }\n", "Op", "op", "Never", "Int", "fn op(x: Int) -> Int")
+}
+
+test "a clause in a handler a factory returns is checked the same way" {
+    mismatch("fn mk() -> Handler[Ee.Op] \{ handler Ee.Op \{ fn op(_x: Int) \{ } } }\nfn main() \{ with mk() \{ io.println(\"\{ee.op(1)}\") } }\n", "Op", "op", "()", "Int", "fn op(x: Int) -> Int")
+}
+
+test "a clause whose result is an alias of the operation's checks clean" {
+    clean("fn main() \{ with handler Ee.Op \{ fn op(x: Int) -> Count \{ x } } \{ io.println(\"\{ee.op(1)}\") } }\n")
+    clean("fn main() \{ with handler Ee.Cnt \{ fn cnt() -> Int \{ 3 } } \{ io.println(\"\{ee.cnt()}\") } }\n")
+}
+
+test "a Never clause for a Never operation checks clean" {
+    clean("fn main() \{ with handler Ee.Stop \{ fn stop(code: Int) -> Never \{ panic(\"\{code}\") } } \{ ee.stop(1) } }\n")
+}
+
+test "a clause may leave out the result of an operation that has none" {
+    clean("fn main() \{ with handler Ee.Note \{ fn note(_msg: Str) \{ } } \{ ee.note(\"hi\") } }\n")
+    clean("fn main() \{ with handler Ee.Op \{ fn op(x: Int) -> Int \{ x + 1 } } \{ io.println(\"\{ee.op(1)}\") } }\n")
+}

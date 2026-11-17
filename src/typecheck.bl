@@ -67,7 +67,7 @@ import diagnostics.{
     UNUSED_VARIABLE, SET_BUT_NOT_READ, SHADOWED_VARIABLE, SHADOWED_PRELUDE_NAME, DUPLICATE_SYMBOL,
     DISCARDED_COLLECTION_COPY, TODO_IN_CODE, NEGATIVE_ZERO_COMPARISON, diag_warn_span_label_at_notes,
     UNREACHABLE_CODE, UNAUDITED_FFI, DEPRECATED_USAGE,
-    NAME_COLLISION, AMBIGUOUS_CONSTRUCTION, RESERVED_TYPE_NAME, RESERVED_EFFECT_NAME, NOT_DERIVABLE,
+    NAME_COLLISION, AMBIGUOUS_CONSTRUCTION, RESERVED_TYPE_NAME, RESERVED_EFFECT_NAME, HANDLER_CLAUSE_MISMATCH, NOT_DERIVABLE,
     NO_SUCH_FIELD, MISSING_FIELD, DUPLICATE_FIELD, VARIANT_SPREAD, PATTERN_MISSING_REST, MIXED_VARIANT_FIELDS, diag_set_last_assist_at,
     INT_LITERAL_OUT_OF_RANGE, diag_has_error_at,
     OVERLAPPING_IMPLS, DUPLICATE_EFFECT_OP,
@@ -12292,6 +12292,39 @@ fn tc_check_handler_method(m: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.R
     tc_closure_held_by = prev_held_by
     tc_current_fn_name = prev_fn_name
     tc_current_fn_ret = prev_fn_ret
+}
+
+// A clause's result type equals the result type of the operation it names, after alias
+// expansion; a clause with no `-> R` has the result type `()` (§4.7 *Clause signatures*). The
+// operation's signature is the one its calls are typed by, so the two cannot read it apart.
+fn tc_check_user_clause_result(he: Int, m: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    if node_kind(m) != NodeKind.FnDef { return }
+    let eff = tc_handler_effect_at(he)
+    let root = tc_handler_effect_root(eff)
+    let ed = tc_effect_decl_named(root)
+    if ed == -1 { return }
+    let op = handler_clause_op(ed, eff, root, node_name(m))
+    if op == -1 { return }
+    let sig_idx = lookup_fnsig(tc_ue_op_key(ed, node_name(m)))
+    if sig_idx == -1 { return }
+    let want = fnsig_pool.get(sig_idx).unwrap().ret
+    let got = tc_closure_declared_ret(m)
+    if tc_tid_is_no_info(got) != 0 || tc_tid_is_no_info(want) != 0 || tc_tid_same_type(got, want) { return }
+    let mut names: List[Str] = []
+    let params = node_params(op)
+    let mut i = 0
+    while params != -1 && i < sublist_length(params) {
+        let p = sublist_get(params, i)
+        if node_type_ann(p) != -1 { tc_collect_type_ann_names(node_type_ann(p), names) } else { names.push(node_type_name(p)) }
+        i = i + 1
+    }
+    if node_type_ann(op) != -1 { tc_collect_type_ann_names(node_type_ann(op), names) } else { names.push(node_return_type(op)) }
+    let spell = handler_type_spelling(names, node_module(ed), nr_current_module)
+    let header = effect_op_sig_text(op, spell.renames, [], false)
+    let at = if node_type_ann(m) != -1 { node_type_ann(m) } else { m }
+    diag_error_at("HandlerClauseMismatch", HANDLER_CLAUSE_MISMATCH,
+        "handler clause `{node_name(m)}` returns `{type_to_str(got)}`, but `{node_name(he)}.{node_name(m)}` returns `{type_to_str(want)}`", at,
+        "write the header of the operation: `{header}`")
 }
 
 // A clause of an FS handler or an IO.Read clause fills the vtable slot of the operation it
@@ -45214,10 +45247,17 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
         tc_check_partial_handler(node)
         let hm_sl = node_methods(node)
         if hm_sl != -1 {
+            let mut checked: Set[Str] = Set()
             let mut hi = 0
             while hi < sublist_length(hm_sl) {
-                tc_check_builtin_handler_clause(tc_handler_effect_at(node), sublist_get(hm_sl, hi))
-                tc_check_handler_method(sublist_get(hm_sl, hi))
+                let m = sublist_get(hm_sl, hi)
+                // Only the first clause for an operation is matched against it (§4.7).
+                if !checked.contains(node_name(m)) {
+                    checked.insert(node_name(m))
+                    tc_check_user_clause_result(node, m)
+                }
+                tc_check_builtin_handler_clause(tc_handler_effect_at(node), m)
+                tc_check_handler_method(m)
                 hi = hi + 1
             }
         }
