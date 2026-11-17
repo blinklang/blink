@@ -1,0 +1,167 @@
+// Each clause of a handler names one operation of the handled effect, and no two clauses name
+// the same one (sections/04_effects.md §4.7 *Clause signatures*). A clause that names no
+// operation is error[UnknownHandlerOp] (E0549), and its note lists the operations of the
+// effect. A second or later clause for one operation is error[DuplicateHandlerClause] (E0550),
+// with a note at the first clause. Before, such a handler checked clean: an unknown clause of a
+// user effect stopped the build later, and of two clauses for one operation the last one won.
+// The rule is the same for a builtin effect.
+//
+// The rename to the nearest operation is machine-applicable only when the clause already
+// matches the header of that operation and no other clause names it. E0550 has no fix.
+
+import typecheck.{check_types}
+import compiler.{compile_to_program}
+import diagnostics.{DiagEntry, diag_entries, diag_reset, diag_fix_edits}
+import fix_edits.{FixEdit, fix_apply, fix_byte_offset}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+import std.fs
+import std.io
+
+const PATH = "build/tc_handler_clause_names_one_operation_src.bl"
+
+// Each error and each internal error of the program.
+fn front_errors(src: Str) -> List[DiagEntry] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    init_embedded_stdlib()
+    fs.write(PATH, src).unwrap()
+    diag_reset()
+    let compiled = compile_to_program(PATH, 1)
+    check_types(compiled)
+    let _ = fs.delete(PATH)
+    let mut out: List[DiagEntry] = []
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" { out.push(d) }
+    }
+    for d in out { io.println("  diag: {d.name} at {d.line}:{d.col}: {d.message} | help: {d.help} | notes: {d.notes.join(" / ")}") }
+    out
+}
+
+fn apply_fix(src: Str, d: DiagEntry) -> Str {
+    let mut edits: List[FixEdit] = []
+    for e in diag_fix_edits(d) {
+        edits.push(FixEdit { file: PATH, start: fix_byte_offset(src, e.line, e.col), end: fix_byte_offset(src, e.end_line, e.end_col), text: e.text, diag: 0 })
+    }
+    fix_apply(src, edits)
+}
+
+// The effect the rows handle, on lines 1 to 4. A row's code starts on line 5, and its clauses
+// start on line 7.
+const EFF = "effect Ee \{\n    effect Op \{ fn op(x: Int) -> Int }\n    effect Two \{ fn two(a: Int, s: Str) -> Int }\n}\n"
+
+// A program whose handler for `eff` has the clauses `clauses`, one per line from line 7.
+fn program(eff: Str, clauses: List[Str], body: Str) -> Str {
+    "{EFF}fn main() \{\n    with handler {eff} \{\n{clauses.join("\n")}\n    } \{ {body} }\n}\n"
+}
+
+fn op_program(clauses: List[Str]) -> Str {
+    program("Ee.Op", clauses, "io.println(\"\{ee.op(1)}\")")
+}
+
+// The one error of the program, with `code` on line `line`.
+fn only_error(src: Str, code: Str, line: Int) -> DiagEntry ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    let errs = front_errors(src)
+    assert_eq(errs.len(), 1)
+    let d = errs.get(0).unwrap()
+    assert_eq(d.code, code)
+    assert_eq(d.line, line)
+    d
+}
+
+test "a clause that names no operation is E0549 and its note lists the operations" {
+    let d = only_error(op_program(["        fn nope(x: Int) -> Int \{ x }"]), "E0549", 7)
+    assert_eq(d.name, "UnknownHandlerOp")
+    assert_eq(d.message, "effect `Ee.Op` has no operation `nope`")
+    assert_eq(d.col, 12)
+    assert_eq(d.notes, ["`Ee.Op` declares: op"])
+    assert_eq(diag_fix_edits(d).len(), 0)
+}
+
+test "a clause of the parent effect lists the operations of every sub-effect" {
+    let d = only_error(program("Ee", ["        fn nope(x: Int) -> Int \{ x }"], "io.println(\"\{ee.op(1)}\")"), "E0549", 7)
+    assert_eq(d.message, "effect `Ee` has no operation `nope`")
+    assert_eq(d.notes, ["`Ee` declares: op, two"])
+}
+
+test "a clause for an operation of another sub-effect names that sub-effect" {
+    let d = only_error(op_program(["        fn two(a: Int, s: Str) -> Int \{ a }"]), "E0549", 7)
+    assert_eq(d.message, "effect `Ee.Op` has no operation `two`")
+    assert_eq(d.help, "`two` is an operation of `Ee.Two`")
+}
+
+test "the rename to the nearest operation is a machine fix when the clause matches its header" {
+    let src = op_program(["        fn opp(x: Int) -> Int \{ x }"])
+    let d = only_error(src, "E0549", 7)
+    assert_eq(d.help, "did you mean `op`?")
+    assert_eq(diag_fix_edits(d).len(), 1)
+    let fixed = apply_fix(src, d)
+    assert(fixed.contains("        fn op(x: Int) -> Int \{ x }"))
+    assert_eq(front_errors(fixed).len(), 0)
+}
+
+test "the rename is no fix when the clause differs from the header, and no E0548 fires" {
+    let d = only_error(op_program(["        fn opp(x: Str) -> Int \{ 0 }"]), "E0549", 7)
+    assert_eq(d.help, "did you mean `op`?")
+    assert_eq(diag_fix_edits(d).len(), 0)
+}
+
+test "the rename is no fix when another clause names the operation" {
+    let d = only_error(op_program(["        fn op(x: Int) -> Int \{ x }", "        fn opp(x: Int) -> Int \{ x }"]), "E0549", 8)
+    assert_eq(d.help, "did you mean `op`?")
+    assert_eq(diag_fix_edits(d).len(), 0)
+}
+
+test "a second clause for one operation is E0550 with a note at the first" {
+    let d = only_error(op_program(["        fn op(x: Int) -> Int \{ x }", "        fn op(x: Int) -> Int \{ x + 1 }"]), "E0550", 8)
+    assert_eq(d.name, "DuplicateHandlerClause")
+    assert_eq(d.col, 12)
+    assert_eq(d.message, "`op` already has a clause in this handler")
+    assert_eq(d.notes.len(), 1)
+    assert(d.notes.get(0).unwrap().starts_with("the first clause for `op` is at "))
+    assert(d.notes.get(0).unwrap().contains(":7:"))
+    assert_eq(diag_fix_edits(d).len(), 0)
+}
+
+test "each later clause for one operation is E0550 and none of them is matched against the header" {
+    let errs = front_errors(op_program([
+        "        fn op(x: Int) -> Int \{ x }",
+        "        fn op(x: Str) -> Int \{ 0 }",
+        "        fn op(x: Int) \{ }",
+    ]))
+    assert_eq(errs.len(), 2)
+    for d in errs { assert_eq(d.code, "E0550") }
+    assert_eq(errs.get(0).unwrap().line, 8)
+    assert_eq(errs.get(1).unwrap().line, 9)
+}
+
+test "two clauses with one name that is no operation are E0549 each and not E0550" {
+    let errs = front_errors(op_program([
+        "        fn op(x: Int) -> Int \{ x }",
+        "        fn nope(x: Int) -> Int \{ x }",
+        "        fn nope(x: Int) -> Int \{ x }",
+    ]))
+    assert_eq(errs.len(), 2)
+    for d in errs { assert_eq(d.code, "E0549") }
+}
+
+test "a builtin effect refuses a clause that names none of its operations" {
+    let io = only_error(program("IO", ["        fn printlnx(msg: Str) \{ }"], "io.println(\"x\")"), "E0549", 7)
+    assert_eq(io.message, "effect `IO` has no operation `printlnx`")
+    let time = only_error(program("Time", ["        fn nope() -> Int \{ 1 }"], "io.println(\"x\")"), "E0549", 7)
+    assert_eq(time.notes, ["`Time` declares: read, monotonic, sleep"])
+    let fs_read = only_error(program("FS.Read", ["        fn delete(path: Str) \{ }"], "io.println(\"x\")"), "E0549", 7)
+    assert_eq(fs_read.help, "`delete` is an operation of `FS.Delete`")
+}
+
+// Env clauses still fill the runtime's vtable slots by their C names (`read`, not the spec's
+// `var`), so typecheck does not hold an Env clause to the operations of section 4.4.3 yet.
+test "a clause of an Env handler is not yet checked against the Env operations" {
+    for d in front_errors(program("Env", ["        fn nope() -> Int \{ 1 }"], "io.println(\"x\")")) { assert(d.code != "E0549") }
+}
+
+test "the raw IO operations are operations of IO" {
+    for d in front_errors(program("IO", ["        fn print_raw(s: Str) \{ }"], "io.println(\"x\")")) { assert(d.code != "E0549") }
+}
+
+test "a second clause for a builtin operation is E0550" {
+    let d = only_error(program("IO", ["        fn print(msg: Str) \{ }", "        fn print(msg: Str) \{ }"], "io.println(\"x\")"), "E0550", 8)
+    assert_eq(d.message, "`print` already has a clause in this handler")
+}

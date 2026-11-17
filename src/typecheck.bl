@@ -68,7 +68,7 @@ import diagnostics.{
     UNUSED_VARIABLE, SET_BUT_NOT_READ, SHADOWED_VARIABLE, SHADOWED_PRELUDE_NAME, DUPLICATE_SYMBOL,
     DISCARDED_COLLECTION_COPY, TODO_IN_CODE, NEGATIVE_ZERO_COMPARISON, diag_warn_span_label_at_notes,
     UNREACHABLE_CODE, UNAUDITED_FFI, DEPRECATED_USAGE,
-    NAME_COLLISION, AMBIGUOUS_CONSTRUCTION, RESERVED_TYPE_NAME, RESERVED_EFFECT_NAME, HANDLER_CLAUSE_MISMATCH, NOT_DERIVABLE,
+    NAME_COLLISION, AMBIGUOUS_CONSTRUCTION, RESERVED_TYPE_NAME, RESERVED_EFFECT_NAME, HANDLER_CLAUSE_MISMATCH, UNKNOWN_HANDLER_OP, DUPLICATE_HANDLER_CLAUSE, NOT_DERIVABLE,
     NO_SUCH_FIELD, MISSING_FIELD, DUPLICATE_FIELD, VARIANT_SPREAD, PATTERN_MISSING_REST, MIXED_VARIANT_FIELDS, diag_set_last_assist_at,
     INT_LITERAL_OUT_OF_RANGE, diag_has_error_at,
     OVERLAPPING_IMPLS, DUPLICATE_EFFECT_OP,
@@ -12305,27 +12305,26 @@ type ClauseHeader {
     text: Str
 }
 
-// The first clause for a user effect's operation against the header of that operation. A
-// clause that names no operation is not checked here.
-fn tc_check_user_clause_header(he: Int, m: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
-    if node_kind(m) != NodeKind.FnDef { return }
+// The header of the operation `op` of the user effect that the handler expression `he`
+// handles, spelled for the current module; None when the effect declares no such operation.
+fn tc_user_clause_header(he: Int, op: Str) -> Option[ClauseHeader] ! TypeCheck.Resolve, Diag.Report {
     let eff = tc_handler_effect_at(he)
     let root = tc_handler_effect_root(eff)
     let ed = tc_effect_decl_named(root)
-    if ed == -1 { return }
-    let op = handler_clause_op(ed, eff, root, node_name(m))
-    if op == -1 { return }
-    let sig_idx = lookup_fnsig(tc_ue_op_key(ed, node_name(m)))
-    if sig_idx == -1 { return }
+    if ed == -1 { return None }
+    let opd = handler_clause_op(ed, eff, root, op)
+    if opd == -1 { return None }
+    let sig_idx = lookup_fnsig(tc_ue_op_key(ed, op))
+    if sig_idx == -1 { return None }
     let mut names: List[Str] = []
-    let params = node_params(op)
+    let params = node_params(opd)
     let mut i = 0
     while params != -1 && i < sublist_length(params) {
         let p = sublist_get(params, i)
         if node_type_ann(p) != -1 { tc_collect_type_ann_names(node_type_ann(p), names) } else { names.push(node_type_name(p)) }
         i = i + 1
     }
-    if node_type_ann(op) != -1 { tc_collect_type_ann_names(node_type_ann(op), names) } else { names.push(node_return_type(op)) }
+    if node_type_ann(opd) != -1 { tc_collect_type_ann_names(node_type_ann(opd), names) } else { names.push(node_return_type(opd)) }
     let spell = handler_type_spelling(names, node_module(ed), nr_current_module)
     let mut texts: List[Str] = []
     i = 0
@@ -12334,51 +12333,18 @@ fn tc_check_user_clause_header(he: Int, m: Int) ! TypeCheck.Resolve, TypeCheck.R
         texts.push(format_param_renamed(p, spell.renames, node_name(p), false))
         i = i + 1
     }
-    let header = ClauseHeader { eff: node_name(he), sig: sig_idx, params: texts, text: effect_op_sig_text(op, spell.renames, [], false) }
-    tc_check_clause_header(header, m)
+    Some(ClauseHeader { eff: eff, sig: sig_idx, params: texts, text: effect_op_sig_text(opd, spell.renames, [], false) })
 }
 
-// A clause of an FS handler or an IO.Read clause fills the vtable slot of the operation it
-// names, and the slot's C type is that operation's signature, so a clause must name an
-// operation its effect has (§4.4.5, §4.4.9). The print and log slots are typed the same way.
-// Only the first clause for an operation is matched against its header (§4.7).
-fn tc_check_builtin_handler_clause(eff_name: Str, m: Int, first: Bool) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
-    if m == -1 || node_kind(m) != NodeKind.FnDef { return }
-    let root = tc_handler_effect_root(eff_name)
-    let op = node_name(m)
-    if is_builtin_op_root(root) {
-        let sub = builtin_op_sub_effect(root, op)
-        if !builtin_op_exists(root, op) || (eff_name != root && eff_name != "{root}.{sub}") {
-            diag_error_at("UnresolvedMethod", UNRESOLVED_METHOD, "effect `{eff_name}` has no operation `{op}`", m,
-                builtin_op_list_hint(root))
-            return
-        }
-        if first { tc_check_builtin_clause_sig(eff_name, root, op, m) }
-        return
-    }
-    if root != "IO" { return }
-    let sub = io_op_sub_effect(op)
-    if sub == "" && eff_name == "IO.Read" {
-        diag_error_at("UnresolvedMethod", UNRESOLVED_METHOD, "effect `{eff_name}` has no operation `{op}`", m,
-            "the IO.Read operations are {io_read_ops().join(", ")} (§4.4.9)")
-        return
-    }
-    // A name in no row (print_raw, eprint_raw, and any other) stays unchecked: no handler can
-    // write the raw operations yet.
-    if sub == "" { return }
-    if eff_name != "IO" && eff_name != "IO.{sub}" {
-        diag_error_at("UnresolvedMethod", UNRESOLVED_METHOD, "effect `{eff_name}` has no operation `{op}`", m,
-            "`{op}` is an operation of IO.{sub} (§4.4)")
-        return
-    }
-    if first { tc_check_builtin_clause_sig(eff_name, "IO", op, m) }
-}
-
-// The clause `m` for operation `op` of builtin root `root` against the signature of the
-// call that it answers.
-fn tc_check_builtin_clause_sig(eff_name: Str, root: Str, op: Str, m: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+// The header of the operation `op` of the builtin root `root`, as the call that it answers
+// takes it, for the clause `m` of a handler for `eff`. A clause of an FS, Process, Rand or IO
+// handler fills the vtable slot of its operation, and the slot's C type is that operation's
+// signature. None for the raw IO operations, which no handler can write yet, and for the roots
+// whose clauses typecheck does not match.
+fn tc_builtin_clause_header(eff: Str, root: Str, op: Str, m: Int) -> Option[ClauseHeader] ! TypeCheck.Resolve, Diag.Report {
+    if !is_builtin_op_root(root) && (root != "IO" || io_op_sub_effect(op) == "") { return None }
     let sig_idx = builtin_handler_op_sig(root, op)
-    if sig_idx == -1 { return }
+    if sig_idx == -1 { return None }
     let sig = fnsig_pool.get(sig_idx).unwrap()
     let kw_start = tc_fnsig_kw_start(sig.params_start, sig.params_count, 0)
     let clause_params = node_params(m)
@@ -12396,26 +12362,236 @@ fn tc_check_builtin_clause_sig(eff_name: Str, root: Str, op: Str, m: Int) ! Type
         i = i + 1
     }
     let ret = if sig.ret == TYPE_VOID { "" } else { " -> {type_to_str(sig.ret)}" }
-    let header = ClauseHeader { eff: eff_name, sig: sig_idx, params: texts, text: "fn {op}({written.join(", ")}){ret}" }
-    tc_check_clause_header(header, m)
+    Some(ClauseHeader { eff: eff, sig: sig_idx, params: texts, text: "fn {op}({written.join(", ")}){ret}" })
 }
 
-// One E0548 for the first part of the clause `m` that differs from `h`: the count of
-// parameters, a parameter's type, its keyword form, a default on it, then the result type.
-// Types are equal after alias expansion, and positional names are free (§4.7).
-fn tc_check_clause_header(h: ClauseHeader, m: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+// The header of the operation `op` of the effect that the handler expression `he` handles,
+// for its clause `m`; None when typecheck has no header for it.
+fn tc_clause_header(he: Int, op: Str, m: Int) -> Option[ClauseHeader] ! TypeCheck.Resolve, Diag.Report {
+    let eff = tc_handler_effect_at(he)
+    let root = tc_handler_effect_root(eff)
+    if tc_effect_decl_named(root) != -1 { return tc_user_clause_header(he, op) }
+    tc_builtin_clause_header(eff, root, op, m)
+}
+
+// The operations of the builtin `root` as a clause names them, or None for a root whose
+// operations typecheck does not list. The IO list holds the raw operations, which no handler
+// can write yet but which are operations of IO all the same (§4.4). Env has no list: its
+// handler clauses still fill the runtime's vtable slots by their C names (`read`, `write`),
+// not the operations of §4.4.3, and the spec names do not build yet.
+fn builtin_root_op_names(root: Str) -> Option[List[Str]] {
+    let mut out: List[Str] = []
+    if is_builtin_op_root(root) {
+        for row in builtin_op_rows(root) { out.push(row.op) }
+        return Some(out)
+    }
+    match root {
+        "IO" => {
+            for row in io_op_rows() { out.push(row.op) }
+            out.push("print_raw")
+            out.push("print_raw_bytes")
+            out.push("eprint_raw")
+            Some(out)
+        }
+        "Time" => Some(["read", "monotonic", "sleep"])
+        _ => None
+    }
+}
+
+// The names a clause of a handler for `eff`, a root or one sub-effect of it, may take: the
+// operations of `eff` in declaration order, raw IO operations and Env included, which
+// tc_handler_op_names leaves out. None when typecheck cannot list them, as for an effect that
+// does not resolve.
+fn tc_handler_clause_names(eff: Str) -> Option[List[Str]] {
+    let root = tc_handler_effect_root(eff)
+    let ed = tc_effect_decl_named(root)
+    let mut out: List[Str] = []
+    if ed != -1 {
+        if eff == root {
+            for o in effect_decl_ops(ed) { out.push(node_name(o)) }
+            return Some(out)
+        }
+        let child = partial_handler_child(ed, eff.byte_slice(root.byte_len() + 1, eff.byte_len()))
+        if child == -1 { return None }
+        let sl = node_methods(child)
+        let mut i = 0
+        while sl != -1 && i < sublist_length(sl) {
+            out.push(node_name(sublist_get(sl, i)))
+            i = i + 1
+        }
+        return Some(out)
+    }
+    let all = builtin_root_op_names(root)?
+    if eff == root { return Some(all) }
+    let sub = eff.byte_slice(root.byte_len() + 1, eff.byte_len())
+    for op in all {
+        if builtin_effect_op_sub(root, op) == sub { out.push(op) }
+    }
+    Some(out)
+}
+
+// The sub-effect of the root of `eff`, spelled `Root.Sub`, that declares `op`; "" when none
+// does or `eff` is that root.
+fn tc_handler_op_owner(eff: Str, op: Str) -> Str {
+    let root = tc_handler_effect_root(eff)
+    if eff == root { return "" }
+    let ed = tc_effect_decl_named(root)
+    if ed != -1 {
+        let children = node_elements(ed)
+        let mut ci = 0
+        while children != -1 && ci < sublist_length(children) {
+            let c = sublist_get(children, ci)
+            let sl = node_methods(c)
+            let mut i = 0
+            while sl != -1 && i < sublist_length(sl) {
+                if node_name(sublist_get(sl, i)) == op { return "{root}.{node_name(c)}" }
+                i = i + 1
+            }
+            ci = ci + 1
+        }
+        return ""
+    }
+    let all = builtin_root_op_names(root) ?? []
+    if !all.contains(op) { return "" }
+    let sub = builtin_effect_op_sub(root, op)
+    if sub == "" { "" } else { "{root}.{sub}" }
+}
+
+// The column of the name of the clause `m` on its line, or -1 when the source does not show
+// `fn name(` or `fn name[` there.
+fn tc_clause_name_col(m: Int) -> Int {
+    let line = node_line(m)
+    if line < 1 { return -1 }
+    let src = diag_source_line(diag_file_for_node(m), line)
+    let name = node_name(m)
+    let mut s = if node_col(m) > 0 { node_col(m) - 1 } else { 0 }
+    while s + name.byte_len() < src.byte_len() {
+        let after = src.byte_slice(s + name.byte_len(), s + name.byte_len() + 1)
+        if s > 0 && src.byte_slice(s - 1, s) == " " && src.byte_slice(s, s + name.byte_len()) == name && (after == "(" || after == "[") { return s + 1 }
+        s = s + 1
+    }
+    -1
+}
+
+// Each clause of the handler expression `he` names one operation of the handled effect, and
+// no other clause names it (§4.7 *Clause signatures*). A clause that names no operation is
+// E0549 and is not matched against a header, so it never also gets E0548 or E0550. Of the
+// clauses for one operation, the first is matched against its header and each later one is
+// E0550. Each clause's body is checked after its header, so the diagnostics keep source order.
+fn tc_check_handler_clauses(he: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    let sl = node_methods(he)
+    if sl == -1 { return }
+    let eff = tc_handler_effect_at(he)
+    let ops = tc_handler_clause_names(eff)
+    let mut names: List[Str] = []
+    let mut i = 0
+    while i < sublist_length(sl) {
+        names.push(node_name(sublist_get(sl, i)))
+        i = i + 1
+    }
+    let mut firsts: Map[Str, Int] = Map()
+    i = 0
+    while i < sublist_length(sl) {
+        let m = sublist_get(sl, i)
+        let op = node_name(m)
+        let known = ops ?? []
+        if node_kind(m) == NodeKind.FnDef && ops.is_some() && !known.contains(op) {
+            tc_report_unknown_handler_op(he, eff, known, names, m)
+        } else if node_kind(m) == NodeKind.FnDef {
+            match firsts.get(op) {
+                Some(first) => tc_report_duplicate_handler_clause(first, m)
+                None => {
+                    firsts.insert(op, m)
+                    match tc_clause_header(he, op, m) {
+                        Some(h) => tc_check_clause_header(h, m)
+                        None => {}
+                    }
+                }
+            }
+        }
+        tc_check_handler_method(m)
+        i = i + 1
+    }
+}
+
+// error[DuplicateHandlerClause] at the clause `m`, a later clause for the operation that the
+// clause `first` names. No fix: a tool cannot know which body to keep.
+fn tc_report_duplicate_handler_clause(first: Int, m: Int) ! Diag.Report {
+    let op = node_name(m)
+    let col = tc_clause_name_col(m)
+    let first_col = tc_clause_name_col(first)
+    let notes = ["the first clause for `{op}` is at {diag_file_for_node(first)}:{node_line(first)}:{if first_col == -1 { node_col(first) } else { first_col }}"]
+    let message = "`{op}` already has a clause in this handler"
+    let help = "delete one of the clauses for `{op}`"
+    if col == -1 {
+        diag_error_at_notes("DuplicateHandlerClause", DUPLICATE_HANDLER_CLAUSE, message, m, help, notes)
+        return
+    }
+    diag_error_span_at_notes("DuplicateHandlerClause", DUPLICATE_HANDLER_CLAUSE, message, m, node_line(m), col, col + op.byte_len(), help, notes)
+}
+
+// error[UnknownHandlerOp] at the clause `m` of `he`, which names none of the operations
+// `known` of `eff`. `names` are the names of every clause of `he`. The rename to the nearest
+// operation is a machine fix only when the clause already matches that operation's header
+// and no other clause names it (§4.7 *Fixes for a clause*).
+fn tc_report_unknown_handler_op(he: Int, eff: Str, known: List[Str], names: List[Str], m: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    let op = node_name(m)
+    let owner = tc_handler_op_owner(eff, op)
+    let sugg = if owner == "" { nearest_name(op, known) } else { "" }
+    let help = if owner != "" {
+        "`{op}` is an operation of `{owner}`"
+    } else if sugg != "" {
+        "did you mean `{sugg}`?"
+    } else {
+        "name an operation of `{eff}`, or delete the clause"
+    }
+    let notes = [if known.len() == 0 { "`{eff}` declares no operations" } else { "`{eff}` declares: {known.join(", ")}" }]
+    let message = "effect `{eff}` has no operation `{op}`"
+    let col = tc_clause_name_col(m)
+    if col == -1 {
+        diag_error_at_notes("UnknownHandlerOp", UNKNOWN_HANDLER_OP, message, m, help, notes)
+        return
+    }
+    let line = node_line(m)
+    diag_error_span_at_notes("UnknownHandlerOp", UNKNOWN_HANDLER_OP, message, m, line, col, col + op.byte_len(), help, notes)
+    if sugg == "" || names.contains(sugg) { return }
+    match tc_clause_header(he, sugg, m) {
+        Some(h) => if tc_clause_header_fault(h, m).at == -1 { diag_set_last_fix_at("rename to", sugg, line, col, line, col + op.byte_len()) }
+        None => {}
+    }
+}
+
+// The first part of the clause `m` that differs from the header `h`, or `at` -1 when none
+// does.
+type ClauseFault {
+    at: Int
+    message: Str
+    // The parameter the clause misses one of, so the fix may add it.
+    missing_one: Bool
+    // The default a clause parameter writes, or -1.
+    dflt: Int
+}
+
+fn no_clause_fault() -> ClauseFault {
+    ClauseFault { at: -1, message: "", missing_one: false, dflt: -1 }
+}
+
+fn clause_fault_at(at: Int, message: Str) -> ClauseFault {
+    ClauseFault { at: at, message: message, missing_one: false, dflt: -1 }
+}
+
+// The first part of the clause `m` that differs from `h`: the count of parameters, a
+// parameter's type, its keyword form, a default on it, then the result type. Types are equal
+// after alias expansion, and positional names are free (§4.7).
+fn tc_clause_header_fault(h: ClauseHeader, m: Int) -> ClauseFault ! TypeCheck.Resolve, Diag.Report {
     let sig = fnsig_pool.get(h.sig).unwrap()
     let op = node_name(m)
     let call = "{h.eff}.{op}"
-    let help = "write the header of the operation: `{h.text}`"
     let params_sl = node_params(m)
     let n = if params_sl == -1 { 0 } else { sublist_length(params_sl) }
     if n != sig.params_count {
         let noun = if n == 1 { "parameter" } else { "parameters" }
-        diag_error_at("HandlerClauseMismatch", HANDLER_CLAUSE_MISMATCH,
-            "handler clause `{op}` takes {n} {noun}, but `{call}` takes {sig.params_count}", m, help)
-        if n + 1 == sig.params_count { tc_set_missing_clause_param_fix(h, m) }
-        return
+        return ClauseFault { at: m, message: "handler clause `{op}` takes {n} {noun}, but `{call}` takes {sig.params_count}", missing_one: n + 1 == sig.params_count, dflt: -1 }
     }
     let kw_start = tc_fnsig_kw_start(sig.params_start, sig.params_count, 0)
     let mut j = 0
@@ -12425,32 +12601,33 @@ fn tc_check_clause_header(h: ClauseHeader, m: Int) ! TypeCheck.Resolve, TypeChec
         let wtid = fnsig_param_list.get(sig.params_start + j).unwrap()
         let at = if node_type_ann(p) != -1 { node_type_ann(p) } else { p }
         if tc_tid_is_no_info(ptid) == 0 && tc_tid_is_no_info(wtid) == 0 && !tc_tid_same_type(ptid, wtid) {
-            diag_error_at("HandlerClauseMismatch", HANDLER_CLAUSE_MISMATCH,
-                "parameter {j + 1} of handler clause `{op}` is `{type_to_str(ptid)}`, but `{call}` takes `{type_to_str(wtid)}`", at, help)
-            return
+            return clause_fault_at(at, "parameter {j + 1} of handler clause `{op}` is `{type_to_str(ptid)}`, but `{call}` takes `{type_to_str(wtid)}`")
         }
         // A call names a keyword argument by the operation's header, so the clause must take
         // it as the same keyword in the same place.
         let wname = fnsig_param_names.get(sig.params_start + j) ?? ""
         if (node_int_val(p) == 1) != (j >= kw_start) || (j >= kw_start && node_name(p) != wname) {
             let want_form = if j >= kw_start { "the keyword `{wname}`" } else { "a positional parameter" }
-            diag_error_at("HandlerClauseMismatch", HANDLER_CLAUSE_MISMATCH,
-                "parameter {j + 1} of handler clause `{op}` must be {want_form}, as in `{call}`", p, help)
-            return
+            return clause_fault_at(p, "parameter {j + 1} of handler clause `{op}` must be {want_form}, as in `{call}`")
         }
         if node_value(p) != -1 {
-            diag_error_at("HandlerClauseMismatch", HANDLER_CLAUSE_MISMATCH,
-                "parameter {j + 1} of handler clause `{op}` writes a default; a default applies at the call site only", node_value(p), help)
-            tc_set_delete_default_fix(node_value(p))
-            return
+            return ClauseFault { at: node_value(p), message: "parameter {j + 1} of handler clause `{op}` writes a default; a default applies at the call site only", missing_one: false, dflt: node_value(p) }
         }
         j = j + 1
     }
     let got = tc_closure_declared_ret(m)
-    if tc_tid_is_no_info(got) != 0 || tc_tid_is_no_info(sig.ret) != 0 || tc_tid_same_type(got, sig.ret) { return }
+    if tc_tid_is_no_info(got) != 0 || tc_tid_is_no_info(sig.ret) != 0 || tc_tid_same_type(got, sig.ret) { return no_clause_fault() }
     let at = if node_type_ann(m) != -1 { node_type_ann(m) } else { m }
-    diag_error_at("HandlerClauseMismatch", HANDLER_CLAUSE_MISMATCH,
-        "handler clause `{op}` returns `{type_to_str(got)}`, but `{call}` returns `{type_to_str(sig.ret)}`", at, help)
+    clause_fault_at(at, "handler clause `{op}` returns `{type_to_str(got)}`, but `{call}` returns `{type_to_str(sig.ret)}`")
+}
+
+// One E0548 for the first part of the clause `m` that differs from `h`.
+fn tc_check_clause_header(h: ClauseHeader, m: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    let f = tc_clause_header_fault(h, m)
+    if f.at == -1 { return }
+    diag_error_at("HandlerClauseMismatch", HANDLER_CLAUSE_MISMATCH, f.message, f.at, "write the header of the operation: `{h.text}`")
+    if f.missing_one { tc_set_missing_clause_param_fix(h, m) }
+    if f.dflt != -1 { tc_set_delete_default_fix(f.dflt) }
 }
 
 // The fix that deletes ` = value`, the default `dflt` of a clause parameter, when the source
@@ -12538,14 +12715,10 @@ fn tc_set_missing_clause_param_fix(h: ClauseHeader, m: Int) ! TypeCheck.Resolve,
     // `(`, each top-level comma, and its `)`.
     let line = node_line(m)
     let src = diag_source_line(diag_file_for_node(m), line)
-    let key = "{node_name(m)}("
-    let mut open = -1
-    let mut s = if node_col(m) > 0 { node_col(m) - 1 } else { 0 }
-    while open == -1 && s + key.byte_len() <= src.byte_len() {
-        if src.byte_slice(s, s + key.byte_len()) == key { open = s + key.byte_len() }
-        s = s + 1
-    }
-    if open == -1 { return }
+    let name_col = tc_clause_name_col(m)
+    if name_col == -1 { return }
+    let open = name_col + node_name(m).byte_len()
+    if src.byte_slice(open - 1, open) != "(" { return }
     let mut commas: List[Int] = []
     let mut close = -1
     let mut depth = 0
@@ -45403,23 +45576,7 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     // above already routes an inline handler here, so this arm is what actually walks it.
     if kind == NodeKind.HandlerExpr {
         tc_check_partial_handler(node)
-        let hm_sl = node_methods(node)
-        if hm_sl != -1 {
-            let mut checked: Set[Str] = Set()
-            let mut hi = 0
-            while hi < sublist_length(hm_sl) {
-                let m = sublist_get(hm_sl, hi)
-                // Only the first clause for an operation is matched against it (§4.7).
-                let first = !checked.contains(node_name(m))
-                if first {
-                    checked.insert(node_name(m))
-                    tc_check_user_clause_header(node, m)
-                }
-                tc_check_builtin_handler_clause(tc_handler_effect_at(node), m, first)
-                tc_check_handler_method(m)
-                hi = hi + 1
-            }
-        }
+        tc_check_handler_clauses(node)
         return
     }
 
