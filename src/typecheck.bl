@@ -29942,6 +29942,12 @@ fn tc_self_method_owners_of(subject: Int, owner: Str, name: Str) -> List[SelfMet
     out
 }
 
+// A help names the owner `o` as `Trait.m` only when a program can write that trait and it is not
+// sealed: with one owner, `x.m()` finds the same method, so a sealed name tells the user nothing.
+fn tc_owner_gets_trait_line(o: SelfMethodOwner) -> Bool {
+    o.key != "" && !o.sealed && (tc_trait_node_idx.get(o.key) ?? -1) != -1 && tc_trait_nameable_here(o.key)
+}
+
 // Whether a help may write the trait `key` by its name here: a trait the compiler knows, a
 // prelude trait, or one that this file's imports reach.
 fn tc_trait_nameable_here(key: Str) -> Bool {
@@ -30148,7 +30154,7 @@ fn tc_method_through_type_report(node: Int, qual: Str, name: Str, mt: MethodType
         if texts_known { out.fix_text = call }
         out.helps.push("call the method on the value: `{call}`")
         let o = owners.get(0).unwrap()
-        if o.key != "" && !o.sealed && (tc_trait_node_idx.get(o.key) ?? -1) != -1 && tc_trait_nameable_here(o.key) {
+        if tc_owner_gets_trait_line(o) {
             out.helps.push("or name the trait: `{tc_trait_shown(o.key)}.{name}({arg_texts.join(", ")})`")
         }
     } else {
@@ -30309,7 +30315,7 @@ fn tc_report_method_read_through_type_name(node: Int, qual: Str, name: Str) -> O
         return Some(tc_note_method_read_again(node, r))
     }
     let texts = tc_read_closure_texts(closures, if generic { "" } else { qual }, name)
-    tc_emit_method_read(node, qual, name, start, tc_read_help(texts, several, shown, ph, name))
+    tc_emit_method_read(node, qual, name, start, tc_read_help(texts, owners, several, shown, ph, name))
     if closures.len() == 0 { return Some(tc_error_recovery_tid()) }
     Some(tc_read_value_tid(mt, owners, name, closures.get(0).unwrap().ps.len()))
 }
@@ -30385,9 +30391,15 @@ fn tc_read_closure_texts(closures: List[ReadClosure], recv_ty: Str, name: Str) -
     out
 }
 
-fn tc_read_help(closures: List[Str], several: Bool, shown: Str, ph: Str, name: Str) -> Str {
+fn tc_read_help(closures: List[Str], owners: List[SelfMethodOwner], several: Bool, shown: Str, ph: Str, name: Str) -> Str {
     if closures.len() == 0 { return "call the method on {tc_article_for(shown)} `{shown}` value, as `{ph}.{name}(...)`" }
-    if !several { return "use a closure: `{closures.get(0).unwrap()}`" }
+    if !several {
+        let help = "use a closure: `{closures.get(0).unwrap()}`"
+        // The trait-qualified name is a function value (§3.4), so the one owner the call help
+        // names is named here too, as a help and not a fix.
+        if owners.len() != 1 || !tc_owner_gets_trait_line(owners.get(0).unwrap()) { return help }
+        return "{help}\nor name the trait: `{tc_trait_shown(owners.get(0).unwrap().key)}.{name}`"
+    }
     let mut lines = ["use a closure that names the owner:"]
     for c in closures { lines.push("  {c}") }
     lines.join("\n")
@@ -30432,7 +30444,7 @@ fn tc_report_method_read(node: Int, r: MethodRead, annotate: Bool) ! Diag.Report
         closures = bare
     }
     let texts = tc_read_closure_texts(closures, if fixed { self_text } else { "" }, r.name)
-    tc_emit_method_read(node, r.qual, r.name, r.start, tc_read_help(texts, r.several, r.shown, r.ph, r.name))
+    tc_emit_method_read(node, r.qual, r.name, r.start, tc_read_help(texts, r.owners, r.several, r.shown, r.ph, r.name))
     let mut done = r
     done.reported = true
     tc_calls.method_reads.insert(node, done)
