@@ -1,7 +1,11 @@
 // `Trait.method(receiver, args)` gets `Self` from its receiver. A method with no `self` (an
 // associated function) has no receiver, so `Trait.method(..)` cannot say which type's impl to
-// run, and the call is a compile error at check, also when the first argument has a type with
-// an impl of the trait (sections/03c_protocols.md *Qualified Calls*, *Impl-Qualified Calls*).
+// run, and the call is error[AssociatedFnThroughTrait] at check, also when the first argument
+// has a type with an impl of the trait. The name with no call, `From.from`, is the same error at
+// the reference. When the expected type fixes `Self`, the help names the type-scoped form, and
+// it is a fix only when that type has one impl of the name and the rewritten site checks
+// (sections/03c_protocols.md *Impl-Qualified Calls*, sections/03_types.md §3.4 *A
+// trait-qualified method named as a value*).
 
 import std.fs
 import compiler.{compile_to_program}
@@ -27,7 +31,9 @@ fn errors_of(src: Str) -> List[Str] ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
         if d.severity == "error" || d.severity == "ice" {
             let mut line = "{d.name}: {d.message}"
             for n in d.notes { line = "{line} | {n}" }
-            out.push("{line} | help: {d.help}")
+            line = "{line} | help: {d.help}"
+            if d.fix_action != "" { line = "{line} | fix: `{d.fix_text}` at {d.fix_line}:{d.fix_col}-{d.fix_end_line}:{d.fix_end_col}" }
+            out.push(line)
         }
     }
     for e in out { io.println("  diag: {e}") }
@@ -50,7 +56,7 @@ let NO_ARGS = "trait NsAlpha \{\n    fn make() -> Self\n}\ntype NsW \{\n    v: I
 
 test "an associated function called through its trait is refused" {
     let e = one_error(body(MAKER, "    let _ = NsMk.make(3)\n"))
-    assert(e.starts_with("TypeError: "), e)
+    assert(e.starts_with("AssociatedFnThroughTrait: "), e)
     assert(e.contains("`NsMk.make` takes no `self`, so the call names no type whose impl to run"), e)
     assert(e.contains("help: call it through the type: `Type.make(..)`"), e)
 }
@@ -59,8 +65,13 @@ test "an associated function with no parameters called through its trait is refu
     let e = one_error(body(NO_ARGS, "    let _ = NsAlpha.make()\n"))
     assert(e.contains("`NsAlpha.make` takes no `self`"), e)
     assert(e.contains("help: call it through the type: `Type.make()`"), e)
+    assert(!e.contains("fix:"), e)
+}
+
+test "the expected type names the type in the help and the fix" {
     let typed = one_error(body(NO_ARGS, "    let _w: NsW = NsAlpha.make()\n"))
-    assert(typed.contains("`NsAlpha.make` takes no `self`"), typed)
+    assert(typed.starts_with("AssociatedFnThroughTrait: `NsAlpha.make` takes no `self`"), typed)
+    assert(typed.contains("help: call it through the type: `NsW.make()` | fix: `NsW` at 11:19-11:26"), typed)
 }
 
 test "a generic associated function called through its trait is refused" {
@@ -72,14 +83,45 @@ test "a generic associated function called through its trait is refused" {
 test "an associated function called through its trait in a generic body is refused" {
     let decls = "{NO_ARGS}fn ns_build[T: NsAlpha]() -> T \{\n    NsAlpha.make()\n}\n"
     let e = one_error(body(decls, "    let _w: NsW = ns_build()\n"))
-    assert(e.contains("`NsAlpha.make` takes no `self`"), e)
+    assert(e.starts_with("AssociatedFnThroughTrait: `NsAlpha.make` takes no `self`"), e)
+    // `T.make()` names the function through the type parameter, which the checker does not
+    // take yet, so the help has no fix.
+    assert(e.contains("help: call it through the type: `T.make()`"), e)
+    assert(!e.contains("fix:"), e)
 }
 
 test "a conversion called through its trait is refused" {
     let from = one_error(body("", "    let _x: Int = From.from(3)\n"))
-    assert(from.contains("`From.from` takes no `self`"), from)
+    assert(from.starts_with("AssociatedFnThroughTrait: `From.from` takes no `self`"), from)
     let try_from = one_error(body("", "    let _c: Result[U8, ConversionError] = TryFrom.try_from(65)\n"))
-    assert(try_from.contains("`TryFrom.try_from` takes no `self`"), try_from)
+    assert(try_from.starts_with("AssociatedFnThroughTrait: `TryFrom.try_from` takes no `self`"), try_from)
+}
+
+let WRAP = "type NsWr \{\n    v: Int\n}\nimpl From[Int] for NsWr \{\n    fn from(x: Int) -> NsWr \{ NsWr \{ v: x } }\n}\n"
+
+test "a conversion through its trait at a type with one impl gets the fix" {
+    let e = one_error(body(WRAP, "    let _w: NsWr = From.from(3)\n"))
+    assert(e.starts_with("AssociatedFnThroughTrait: `From.from` takes no `self`"), e)
+    assert(e.contains("help: call it through the type: `NsWr.from(3)` | fix: `NsWr` at 8:20-8:24"), e)
+}
+
+test "a conversion through its trait at a type with several impls gets no fix" {
+    let decls = "{WRAP}impl From[Str] for NsWr \{\n    fn from(s: Str) -> NsWr \{ NsWr \{ v: s.len() } }\n}\n"
+    let e = one_error(body(decls, "    let _w: NsWr = From.from(3)\n"))
+    assert(e.contains("help: call it through the type: `NsWr.from(3)`"), e)
+    assert(!e.contains("fix:"), e)
+}
+
+test "an associated function named through its trait with no call is refused at the reference" {
+    let e = one_error(body(WRAP, "    let ws: List[NsWr] = [1, 2].map(From.from)\n    let _ = ws\n"))
+    assert(e.starts_with("AssociatedFnThroughTrait: `From.from` takes no `self`"), e)
+    assert(e.contains("help: name it through the type: `NsWr.from` | fix: `NsWr` at 8:37-8:41"), e)
+    let bare = one_error(body(NO_ARGS, "    let f = NsAlpha.make\n    let _ = f\n"))
+    assert(bare.starts_with("AssociatedFnThroughTrait: `NsAlpha.make` takes no `self`"), bare)
+    assert(bare.contains("help: name it through the type: `Type.make`"), bare)
+    assert(!bare.contains("fix:"), bare)
+    let typed = one_error(body(NO_ARGS, "    let f: fn() -> NsW = NsAlpha.make\n    let _ = f\n"))
+    assert(typed.contains("help: name it through the type: `NsW.make` | fix: `NsW` at 11:26-11:33"), typed)
 }
 
 test "a method with self called through its trait still checks" {

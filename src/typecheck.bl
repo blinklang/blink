@@ -35,7 +35,7 @@ import diagnostics.{
     UNSOLVED_TYPEVAR_AT_CODEGEN, CALL_NOT_ANSWERED, OPEN_TYPE_AFTER_CHECK, CALL_ROW_UNKNOWN, SEALED_OPS_REWRITE_INVARIANT, VARIANT_WITHOUT_ENUM,
     NO_SUCH_VARIANT, TYPE_ERROR, TEMPLATE_MISMATCH, UNEXPECTED_ANNOTATION, MISSING_RETURN, NO_CONVERSION_IMPL, CANNOT_INFER_TYPE, NOT_ITERABLE, MISSING_ELSE, UNLICENSED_SELF_OP, TRAIT_BOUND_NOT_SATISFIED, CAPABILITY_BUDGET, QM_INVALID_OPERAND, UNDEFINED_FUNCTION,
     UNRESOLVED_METHOD, AMBIGUOUS_METHOD_CALL, MISSING_DISPLAY_IMPL,
-    MUTATION_REQUIRES_MUT, MUT_ON_PATTERN, NOT_A_PLACE, PARAM_ASSIGN, diag_error_label_at_notes, diag_add_note_at_spots_since, diag_error_span_label_at_notes, diag_warn_label_at_notes, EMPTY_ROW_OUTSIDE_FFI, PANIC_HOOK_PLACEMENT, TRACE_MESSAGE_EFFECT, METHOD_THROUGH_TYPE_NAME, SELF_OUTSIDE_TRAIT_OR_IMPL, EFFECTS_ANNOTATION_REMOVED, UNKNOWN_EFFECT, SUB_EFFECT_AS_TYPE, diag_fix_before_starts_with, diag_drop_fix_over_others, diag_drop_fix_at,
+    MUTATION_REQUIRES_MUT, MUT_ON_PATTERN, NOT_A_PLACE, PARAM_ASSIGN, diag_error_label_at_notes, diag_add_note_at_spots_since, diag_error_span_label_at_notes, diag_warn_label_at_notes, EMPTY_ROW_OUTSIDE_FFI, PANIC_HOOK_PLACEMENT, TRACE_MESSAGE_EFFECT, METHOD_THROUGH_TYPE_NAME, ASSOCIATED_FN_THROUGH_TRAIT, SELF_OUTSIDE_TRAIT_OR_IMPL, EFFECTS_ANNOTATION_REMOVED, UNKNOWN_EFFECT, SUB_EFFECT_AS_TYPE, diag_fix_before_starts_with, diag_drop_fix_over_others, diag_drop_fix_at,
     UNDEFINED_VARIABLE, UNKNOWN_TYPE, QM_RESULT_IN_NON_RESULT,
     QM_OPTION_IN_NON_OPTION, QM_ERROR_MISMATCH,
     QM_TEST_DISPLAY_REQUIRED, TEST_ANNOTATED_RETURN, SKIP_OUTSIDE_TEST,
@@ -3484,8 +3484,9 @@ let mut tc_ud_blamed: Map[Int, Int] = Map()
 // [-1, im, n, tid...] (tc_note_conversion_call), [-1, -1, 1, ctor] (tc_note_open_ctor_key),
 // [-1, -1, 1, -1] (tc_drop_deferred_conversion), [-2, -1, 0] (tc_note_deferred_conversion), [-3, -1, 0] (tc_note_open_value),
 // [-4, sig, tid, n, binder..., enclosing fn] (tc_note_fn_value),
-// [-5, owner, 0] (tc_note_void_return) or
-// [-6, im, n, tid..., call, receiver] (tc_note_static_impl_call).
+// [-5, owner, 0] (tc_note_void_return),
+// [-6, im, n, tid..., call, receiver] (tc_note_static_impl_call) or
+// [-7, self, fn] (tc_defer_assoc_fn_ref).
 // self_views maps a signature to its view for calls in its own body, and view_sigs maps back
 // (tc_call_view_sig).
 type CallFacts {
@@ -22174,6 +22175,12 @@ type HelperCallCheck {
 // judged, and the call is then not proven. `want` is the type the call's place expects, or -1
 // when the place sets none. `dropped` says the place drops the result.
 fn tc_helper_call_check(callee: Str, sig: Int, args: Int, arg_tids: List[Int], want: Int, dropped: Bool) -> HelperCallCheck {
+    tc_helper_call_check_in(callee, sig, args, arg_tids, want, dropped, Map())
+}
+
+// The same check with `binds` already holding what the callee's head fixes, such as `Self`
+// of a type-scoped call.
+fn tc_helper_call_check_in(callee: Str, sig: Int, args: Int, arg_tids: List[Int], want: Int, dropped: Bool, binds: Map[Str, Int]) -> HelperCallCheck {
     let fs = fnsig_pool.get(sig).unwrap()
     let kw_start = tc_fnsig_kw_start(fs.params_start, fs.params_count, 0)
     let got = if args == -1 { 0 } else { sublist_length(args) }
@@ -22181,7 +22188,6 @@ fn tc_helper_call_check(callee: Str, sig: Int, args: Int, arg_tids: List[Int], w
         let noun = if fs.params_count == 1 { "argument" } else { "arguments" }
         return HelperCallCheck { mismatch: "`{callee}` takes {fs.params_count} {noun}, found {got}", proven: false }
     }
-    let mut binds: Map[Str, Int] = Map()
     let mut all_judged = true
     let mut i = 0
     while i < got {
@@ -29372,6 +29378,190 @@ fn tc_path_name_owners(owner: Str, name: Str, on: Int) -> PathNameOwners {
     // asks which impls they are.
     let asks = on != -1 && (tc_method_trait_count(owner, name) >= 2 || tc_is_conversion_trait(names))
     PathNameOwners { keys: [names], ims: if asks { tc_impls_of_trait_on(names, on, []) } else { [] } }
+}
+
+// §3c.4: `trait.name(..)` or `trait.name` for a trait function with no `self`. The trait names
+// no type whose impl to run, so the call and the reference are one error, E0568. When the
+// expected type fixes `Self`, the help names the type-scoped form, and it is a fix only when
+// that form checks where it is written (§3.4 *A trait-qualified method named as a value*).
+// A reference whose expected function type leaves `Self` open is judged once inference is
+// done, since a later use, such as the annotation `List[W]` of `[1, 2].map(From.from)`, can
+// fix it (tc_flush_assoc_fn_refs).
+fn tc_report_assoc_fn_through_trait(node: Int, obj_node: Int, written: Str, trait_key: Str, name: Str, call: Bool) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    let want = if tc_method_calls.seeded_expected.contains_key(node) { tc_method_calls.seeded_expected.get(node) ?? -1 } else { tc_construct_hint }
+    let args = if call { node_args(node) } else { -1 }
+    let mut arg_tids: List[Int] = []
+    if args != -1 {
+        let saved_hint = tc_construct_hint
+        tc_construct_hint = -1
+        for i in 0..sublist_length(args) { arg_tids.push(infer_type(sublist_get(args, i))) }
+        tc_construct_hint = saved_hint
+    }
+    let tm_idx = tc_trait_fn_tmsig(trait_key, name)
+    let self_tid = tc_assoc_fn_self_from_want(tm_idx, want, call)
+    // A private gate: the message reads the type pool, which a trace.log message can not.
+    if trace_gate_on("blink.tc.assocfn") {
+        let want_shown = if want < 0 { "none" } else { tc_type_str(want) }
+        trace.log("blink.tc.assocfn", "`{written}.{name}` call={call}: want {want_shown}, Self {self_tid}, boundary {tc_boundary_check_active}")
+    }
+    let want_is_fn = want >= 0 && type_kind(resolve_alias_tid(tc_resolve(want))) == TyKind.Fn
+    if !call && self_tid < 0 && want_is_fn && tm_idx >= 0 {
+        tc_calls.trait_heads.insert(node, trait_key)
+        return tc_defer_assoc_fn_ref(node, tm_idx)
+    }
+    tc_emit_assoc_fn_through_trait(node, obj_node, written, trait_key, name, call, want, self_tid, arg_tids)
+}
+
+// The report itself, once `self_tid` is known (-1 when nothing fixes `Self`). `want` is the
+// type the place expects, and `arg_tids` the call's argument types.
+fn tc_emit_assoc_fn_through_trait(node: Int, obj_node: Int, written: Str, trait_key: Str, name: Str, call: Bool, want: Int, self_tid: Int, arg_tids: List[Int]) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    let args = if call { node_args(node) } else { -1 }
+    let n_args = if args != -1 { sublist_length(args) } else { 0 }
+    let self_is_tparam = self_tid >= 0 && type_kind(self_tid) == TyKind.Typevar
+    let shown = if self_tid < 0 { "" } else if self_is_tparam { ty_pool.get(self_tid).unwrap().name } else { tc_type_str(self_tid) }
+    // A type with arguments is named by its base, and the place's type fills them, as at
+    // any type-scoped value.
+    let type_name = if shown == "" { "Type" } else { shown.split("[").get(0) ?? shown }
+    let mut site = "{type_name}.{name}"
+    if call {
+        site = "{type_name}.{name}{if n_args == 0 { "()" } else { "(..)" }}"
+        if self_tid >= 0 && n_args > 0 {
+            let written_call = tc_type_head_call_site(node, written, sublist_get(args, n_args - 1)).text
+            if written_call != "" { site = "{type_name}{written_call.byte_slice(written.byte_len(), written_call.byte_len())}" }
+        }
+    }
+    let help = if call { "call it through the type: `{site}`" } else { "name it through the type: `{site}`" }
+    let before = diag_entry_count()
+    tc_error_at_code("`{written}.{name}` takes no `self`, so the call names no type whose impl to run", node, "AssociatedFnThroughTrait", ASSOCIATED_FN_THROUGH_TRAIT, help)
+    let line = node_line(obj_node)
+    let col = node_col(obj_node)
+    let head_text = tc_source_text(diag_file_for_node(node), line, col, line, col + written.byte_len())
+    let fixable = self_tid >= 0 && !self_is_tparam && !shown.contains("[") && head_text == written
+    if fixable && tc_assoc_fn_fix_checks(node, type_name, self_tid, trait_key, name, call, want, args, arg_tids) {
+        tc_attach_fix(before, help, [DiagFixEdit { line: line, col: col, end_line: line, end_col: col + written.byte_len(), text: type_name }])
+    }
+    if call { return tc_error_recovery_tid() }
+    // A function of the declared arity over the recovery type, so a call that takes the value
+    // reads nothing open from it and reports nothing more.
+    let decl = tc_trait_method_decl(trait_key, name)
+    let psl = if decl >= 0 { node_params(decl) } else { -1 }
+    let mut rec_params: List[Int] = []
+    if psl != -1 {
+        for _ in 0..sublist_length(psl) { rec_params.push(tc_error_recovery_tid()) }
+    }
+    make_fn_type(tc_error_recovery_tid(), rec_params)
+}
+
+// The declared signature of the trait function `trait_key.name`, as a tc_tmsig_pool index, or -1.
+fn tc_trait_fn_tmsig(trait_key: Str, name: Str) -> Int {
+    for i in 0..tc_tmsig_pool.len() {
+        let tm = tc_tmsig_pool.get(i).unwrap()
+        if tm.trait_name == trait_key && tm.method == name { return i }
+    }
+    -1
+}
+
+// The type the expected type `want` fixes `Self` of the trait function `tm_idx` to: through
+// its return type at a call, through its whole type at a reference. A type parameter of the
+// body counts, since it is one fixed type there. -1 when nothing fixes it.
+fn tc_assoc_fn_self_from_want(tm_idx: Int, want: Int, call: Bool) -> Int {
+    if tm_idx < 0 || want < 0 || tc_tid_is_no_info(want) != 0 { return -1 }
+    let tm = tc_tmsig_pool.get(tm_idx).unwrap()
+    let pattern = if call { tm.ret_tid } else { tc_sig_fn_tid(tm.sig) }
+    let binds: Map[Str, Int] = Map()
+    unify_typevar_binds(pattern, resolve_alias_tid(tc_resolve(want)), binds)
+    tc_assoc_fn_fixed_self(binds.get(tc_binder_key(SELF_BINDER_NODE, "Self")) ?? (binds.get("Self") ?? -1))
+}
+
+// `s` as a type that fixes `Self`, or -1 when it fixes nothing yet.
+fn tc_assoc_fn_fixed_self(s: Int) -> Int {
+    if s < 0 || bind_target_is_concrete(s) == 0 { return -1 }
+    let r = resolve_alias_tid(tc_resolve(s))
+    if tc_tid_has_unknown(r) != 0 { -1 } else { r }
+}
+
+// The reference typed as the trait function with `Self` and each trait type parameter open,
+// recorded as the group [-7, self, fn] for tc_flush_assoc_fn_refs. A walk before the
+// program's check records nothing, and a later walk of the node records over an earlier one.
+fn tc_defer_assoc_fn_ref(node: Int, tm_idx: Int) -> Int {
+    let tm = tc_tmsig_pool.get(tm_idx).unwrap()
+    let self_mv = make_metavar()
+    let mut binds: Map[Str, Int] = Map()
+    binds.insert("Self", self_mv)
+    binds.insert(tc_binder_key(SELF_BINDER_NODE, "Self"), self_mv)
+    for k in 0..tm.tparams_count {
+        let tp_name = tc_trait_tparam_names.get(tm.tparams_start + k).unwrap()
+        let tp_node = tc_trait_tparam_nodes.get(tm.tparams_start + k) ?? NO_BINDER_NODE
+        let mv = make_metavar()
+        binds.insert(tp_name, mv)
+        binds.insert(tc_binder_key(tp_node, tp_name), mv)
+    }
+    let fn_tid = substitute_typevar_tid(tc_sig_fn_tid(tm.sig), binds)
+    if tc_boundary_check_active == 0 { return fn_tid }
+    match tc_calls.open_group.get(node) {
+        Some(g) => {
+            tc_calls.open_tids.set(g + 1, self_mv)
+            tc_calls.open_tids.set(g + 2, fn_tid)
+        }
+        None => {
+            tc_calls.open_calls.push(node)
+            tc_calls.open_group.insert(node, tc_calls.open_tids.len())
+            tc_calls.open_tids.push(-7)
+            tc_calls.open_tids.push(self_mv)
+            tc_calls.open_tids.push(fn_tid)
+        }
+    }
+    fn_tid
+}
+
+// Each deferred reference `trait.name` (group -7), reported once inference is done, with the
+// help that the type inference gave `Self` names. Ahead of the E0301 flush, which would
+// otherwise blame a binding for the `Self` this report leaves open.
+fn tc_flush_assoc_fn_refs() ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    for node in tc_calls.open_calls {
+        let g = tc_calls.open_group.get(node).unwrap()
+        if tc_calls.open_tids.get(g).unwrap() != -7 || tc_calls.reported.contains_key(node) { continue }
+        tc_calls.reported.insert(node, 1)
+        let self_mv = tc_calls.open_tids.get(g + 1).unwrap()
+        let fn_tid = tc_calls.open_tids.get(g + 2).unwrap()
+        let obj_node = node_obj(node)
+        let trait_key = tc_calls.trait_heads.get(node) ?? ""
+        let _ = tc_emit_assoc_fn_through_trait(node, obj_node, node_name(obj_node), trait_key, node_name(node), false, fn_tid, tc_assoc_fn_fixed_self(self_mv), [])
+        tc_ud_mark_blamed(fn_tid)
+    }
+}
+
+// Whether `type_name.name` in place of the trait head checks at `node` (§3.4, the E0568 help):
+// the name is the type `self_tid` where it is written, one impl gives that type the function,
+// and the place takes the rewritten call or value, by the rule of E0505.
+fn tc_assoc_fn_fix_checks(node: Int, type_name: Str, self_tid: Int, trait_key: Str, name: Str, call: Bool, want: Int, args: Int, arg_tids: List[Int]) -> Bool ! TypeCheck.Resolve, Diag.Report {
+    if tc_name_is_tparam_in_scope(type_name) != 0 || nr_receiver_has_binding(type_name) != 0 || !tc_names_a_type(type_name) { return false }
+    let head = tc_static_head(type_name)
+    let named = tc_path_head_named_type(head)
+    if named < 0 { return false }
+    let at = resolve_alias_tid(named)
+    if types_compatible(at, self_tid) == 0 || types_compatible(self_tid, at) == 0 { return false }
+    let owners = tc_path_name_owners(head.owner, name, at)
+    if owners.keys.len() != 1 || owners.keys.get(0).unwrap() != trait_key || owners.ims.len() >= 2 { return false }
+    let sig = if !tc_is_conversion_trait(trait_key) {
+        if tc_method_trait_count(head.owner, name) != 1 { -1 } else { lookup_fnsig(tc_impl_method_stem(head.owner, trait_key, name)) }
+    } else if owners.ims.len() == 1 { tc_conversion_method_sig(owners.ims.get(0).unwrap(), name) } else { -1 }
+    if sig == -1 { return false }
+    let decl = fnsig_pool.get(sig).unwrap().decl
+    if decl < 0 || tc_fn_decl_takes_self(decl) || tc_decl_has_own_type_params(decl) != 0 { return false }
+    // An impl with binders takes them from the place, which this check does not solve.
+    let im = tc_method_block.get(decl) ?? -1
+    let binders = if im != -1 { node_impl_binders(im) } else { -1 }
+    if binders != -1 && sublist_length(binders) > 0 { return false }
+    let binds = tc_self_binds(self_tid)
+    if call {
+        let dropped = tc_method_calls.dropped.contains(node)
+        let r = tc_helper_call_check_in("{type_name}.{name}", sig, args, arg_tids, want, dropped || tc_want_sets_no_type(want), binds)
+        return r.mismatch == "" && r.proven
+    }
+    if tc_want_sets_no_type(want) || tc_tid_has_unknown(want) != 0 || tc_tid_has_bare_typevar(want) != 0 { return false }
+    let val = substitute_typevar_tid(tc_sig_fn_tid(sig), binds)
+    tc_tid_has_bare_typevar(val) == 0 && types_compatible(resolve_alias_tid(tc_resolve(want)), val) != 0
 }
 
 // §3c.4: two impls give `qual` the associated function `name`, so `call` names no one function.
@@ -38404,10 +38594,7 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                 // first argument must not pick the impl (sections/03c_protocols.md
                 // *Impl-Qualified Calls*).
                 if qt_decl >= 0 && !tc_fn_decl_takes_self(qt_decl) {
-                    let qt_shape = if qt_n == 0 { "()" } else { "(..)" }
-                    tc_error_at_code("`{obj_name}.{method}` takes no `self`, so the call names no type whose impl to run", node, "TypeError", TYPE_ERROR,
-                        "call it through the type: `Type.{method}{qt_shape}`")
-                    return tc_error_recovery_tid()
+                    return tc_report_assoc_fn_through_trait(node, node_obj(node), obj_name, qt_trait, method, true)
                 }
                 if qt_n == 0 {
                     tc_error_at("qualified trait call `{obj_name}.{method}` expects the receiver as its first argument, got none", node)
@@ -38746,6 +38933,15 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                 match tc_type_path_fn_value(node, obj_node, obj_name, fname) {
                     Some(t) => return t
                     None => {}
+                }
+                // The read names the function a trait-qualified call would run, and the call
+                // has the error, so the read does too (§3c.4).
+                if tc_head_names_trait(obj_name) && is_sealed_builtin_trait(obj_name) == 0 {
+                    let rt_trait = tc_trait_ref_key(obj_name, nr_current_module)
+                    let rt_decl = tc_trait_method_decl(rt_trait, fname)
+                    if rt_decl >= 0 && !tc_fn_decl_takes_self(rt_decl) {
+                        return tc_report_assoc_fn_through_trait(node, obj_node, obj_name, rt_trait, fname, false)
+                    }
                 }
             }
             let tid = if head_is_type { tc_value_head_tid(obj_name) } else { -1 }
@@ -46593,6 +46789,7 @@ fn tc_flush_program_deferrals(program: Bool) ! TypeCheck.Resolve, TypeCheck.Repo
     tc_flush_deferred_conversions()
     tc_give_up_late_uses()
     if program { tc_recheck_operators() }
+    tc_flush_assoc_fn_refs()
     tc_ud_flush_pending()
     tc_report_late_open_calls()
     tc_ud_flush_calls()
