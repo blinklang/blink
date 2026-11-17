@@ -4,7 +4,7 @@ import lexer.{tokens}
 import std.path.{path_dirname}
 import diagnostics.{
     Diag, diag_error, diag_error_range, diag_source_file, diag_ice_abort, PARSER_INTERNAL_LIMIT, PARSER_INTERNAL_LIMIT_NAME,
-    diag_count, diag_entry_count, diag_errors_since, diag_any_errors_since, diag_truncate, diag_file_for_node,
+    diag_error_span_label_at_notes, diag_count, diag_entry_count, diag_errors_since, diag_any_errors_since, diag_truncate, diag_file_for_node,
     INLINE_MODULE_NOT_SUPPORTED, UNEXPECTED_ANNOTATION, UNEXPECTED_TOKEN,
     UNEXPECTED_TOKEN_STRING, UNEXPECTED_TOKEN_PATTERN, KEYWORD_AS_IDENTIFIER,
     diag_error_span, diag_set_last_fix_at, MUT_ON_PATTERN,
@@ -2549,6 +2549,22 @@ fn check_let_has_initializer(lb: Int) ! Diag.Report {
         "write `= <value>`, or add `@ffi(\"NAME\", header: \"...\")` for a constant from a C header")
 }
 
+// A fn in an `impl` or `trait` block is no `@ffi` target: its first parameter can be a receiver,
+// which has no C form, and the impl chooses its C name (§9.1 *`@ffi` Binds a Module-Level
+// Function*). The annotation stays on the fn, so no later stage reads the bodiless signature as
+// a second fault.
+fn reject_ffi_on_method() ! Diag.Report {
+    for ann in annotations.item {
+        if node_name(ann) == "ffi" {
+            let line = node_line(ann)
+            let col = node_col(ann)
+            let end_col = if node_end_line(ann) == line { node_end_col(ann) } else { col + 1 }
+            diag_error_span_label_at_notes("UnexpectedAnnotation", UNEXPECTED_ANNOTATION, "`@ffi` does not apply to a method", ann, line, col, end_col,
+                "`@ffi` binds a module-level function", "declare a module-level `@ffi fn` and call it from the method", [])
+        }
+    }
+}
+
 // Clearing the list keeps a rejected annotation off the next item that attaches pending ones.
 fn reject_pending_annotations(what: Str, help: Str) ! Parse.Build, Diag.Report {
     for ann in annotations.item {
@@ -4456,6 +4472,7 @@ fn parse_trait_def() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
             annotations.item.push(parse_annotation())
         } else if at(TokenKind.Fn) {
             let fn_node = parse_fn_def()
+            reject_ffi_on_method()
             attach_pending_annotations(fn_node)
             sublist_push(methods, fn_node)
         } else if at(TokenKind.Type) {
@@ -4564,6 +4581,7 @@ fn parse_impl_block() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
             let diags_before = diag_entry_count()
             let fn_node = parse_fn_def()
             let sig_failed = diag_any_errors_since(diags_before) != 0
+            reject_ffi_on_method()
             attach_pending_annotations(fn_node)
             require_fn_body(fn_node, sig_failed)
             sublist_push(methods, fn_node)

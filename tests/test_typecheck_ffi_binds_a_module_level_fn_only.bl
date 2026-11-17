@@ -1,0 +1,78 @@
+// `@ffi` binds a C symbol to a module-level function only (sections/07_trust_modules_metadata.md
+// §9.1 *`@ffi` Binds a Module-Level Function*). On a function in an `impl` or `trait` block, with
+// or without a receiver and with or without a body, it is error[UnexpectedAnnotation] at the
+// `@ffi`, in `blink check`, with the help to declare a module-level `@ffi fn` and call it from the
+// method. Before, an impl method passed the check and the build passed the receiver struct to
+// the C symbol, or gave a generic impl's method an empty C body. A module-level `@ffi fn` that a
+// method wraps checks clean.
+
+import std.fs
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_reset}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+import std.io
+
+fn typecheck_probe(path: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    init_embedded_stdlib()
+    fs.write(path, src).unwrap()
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+}
+
+// Each error as "name at line:col: message | help: help".
+fn errors_of(src: Str) -> List[Str] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    typecheck_probe("build/test_typecheck_ffi_binds_a_module_level_fn_only_probe.bl", src)
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" {
+            out.push("{d.name} at {d.line}:{d.col}: {d.message} | help: {d.help}")
+        }
+    }
+    for e in out { io.println("  diag: {e}") }
+    out
+}
+
+fn refusal_at(at: Str) -> Str {
+    "UnexpectedAnnotation at {at}: `@ffi` does not apply to a method | help: declare a module-level `@ffi fn` and call it from the method"
+}
+
+// The program has exactly one error, the refusal at `at`.
+fn refused_at(src: Str, at: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    let errs = errors_of(src)
+    assert_eq(errs.len(), 1)
+    assert_eq(errs.get(0).unwrap(), refusal_at(at))
+}
+
+let TR = "trait FbTr \{ fn m(self) -> Int }\ntype FbFoo \{ a: Int }\n"
+
+test "@ffi on an impl method with a receiver and no body is refused at the @ffi" {
+    refused_at("{TR}impl FbTr for FbFoo \{\n    @ffi(\"c\", \"labs\")\n    @trusted(audit: \"LIBC-LABS\")\n    fn m(self) -> Int ! ()\n}\nfn main() \{ io.println(\"\{FbFoo \{ a: 1 }.m()}\") }\n", "4:5")
+}
+
+test "@ffi on an impl method with an empty body is refused at the @ffi" {
+    refused_at("{TR}impl FbTr for FbFoo \{\n    @ffi(\"labs\")\n    @trusted(audit: \"LIBC-LABS\")\n    fn m(self) -> Int ! () \{}\n}\nfn main() \{ io.println(\"\{FbFoo \{ a: 1 }.m()}\") }\n", "4:5")
+}
+
+test "@ffi on an impl fn with no receiver is refused at the @ffi" {
+    refused_at("trait FbAbs \{ fn abs(x: Int) -> Int }\ntype FbFoo \{ a: Int }\nimpl FbAbs for FbFoo \{\n    @trusted(audit: \"LIBC-LABS\")\n    @ffi(\"c\", \"labs\")\n    fn abs(x: Int) -> Int ! ()\n}\nfn main() \{ io.println(\"\{FbFoo.abs(-3)}\") }\n", "5:5")
+}
+
+test "@ffi on a method of a generic impl is refused at the @ffi" {
+    refused_at("type FbBox[T] \{ v: T }\ntrait FbPid \{ fn pid(self) -> I32 }\nimpl[T] FbPid for FbBox[T] \{\n    @ffi(\"__libc_current_sigrtmin\")\n    @trusted(audit: \"LIBC-SIGRT\")\n    fn pid(self) -> I32 ! ()\n}\nfn main() \{ io.println(\"\{FbBox \{ v: 1 }.pid()}\") }\n", "4:5")
+}
+
+test "@ffi on a trait method declaration is refused at the @ffi" {
+    refused_at("trait FbAbs \{\n    @ffi(\"c\", \"labs\")\n    fn abs(x: Int) -> Int ! ()\n}\nfn main() \{ }\n", "2:5")
+}
+
+test "@ffi on a trait method with a default body is refused at the @ffi" {
+    refused_at("trait FbAbs \{\n    @ffi(\"c\", \"labs\")\n    fn abs(self) -> Int ! () \{}\n}\nfn main() \{ }\n", "2:5")
+}
+
+test "a method that wraps a module-level @ffi fn checks clean" {
+    let errs = errors_of("{TR}@ffi(\"c\", \"labs\")\n@trusted(audit: \"LIBC-LABS\")\nfn fb_labs(x: Int) -> Int ! ()\nimpl FbTr for FbFoo \{\n    fn m(self) -> Int \{ fb_labs(self.a) }\n}\nfn main() \{ io.println(\"\{FbFoo \{ a: -1 }.m()}\") }\n")
+    assert_eq(errs.len(), 0)
+}

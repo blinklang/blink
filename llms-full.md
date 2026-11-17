@@ -41,6 +41,8 @@ fn sqlite3_open(filename: Ptr[Int], db: Ptr[Ptr[Int]]) -> Int ! IO
 
 `@ffi("library", "symbol")` — first arg is library name, second is C symbol name.
 
+`@ffi` binds a module-level function only. On a fn in an `impl` or `trait` block, with or without `self` or a body, it is `E1110 UnexpectedAnnotation` at the `@ffi`, in `blink check`. Declare a module-level `@ffi fn` and call it from the method.
+
 An `@ffi` decl must have an effect row: the Blink effects the foreign code has (`! IO`, `! Net`). There is no `FFI` effect. If the foreign code has no effects, write the empty row `! ()`: `fn c_strlen(s: Ptr[U8]) -> Int ! ()`. A decl with no row is `E0802`. `! ()` anywhere else is `E0564 EmptyRowOutsideFfi`, and the `@effects(...)` annotation is gone (`E1139 EffectsAnnotationRemoved`).
 
 ### @ffi let (foreign constant)
@@ -1301,7 +1303,7 @@ Selective imports (`import mod.{a, b}`) restrict which *unqualified* items are v
 | `@invariant(expr)` | type | Type invariant |
 | `@pure` | fn | No effects, no mutation, no FFI; may only call other `@pure` fns. Recursion allowed. A handle operation (`io.println`, `fs.write`, ...) in a `@pure` fn is E1307. A derived operation body may call only operations of its own leaf effect (E0557). |
 | `@modifies(...)` | fn | Reserves syntax for the future SMT backend (parses-and-validates only) |
-| `@ffi("lib", "sym")` | fn | FFI binding — link to C function |
+| `@ffi("lib", "sym")` | module-level fn | FFI binding — link to C function; not on an impl or trait method (`E1110`) |
 | `@trusted` | fn | FFI audit marker — function reviewed for safety |
 | `@verify(fallback: "runtime" \| "trust")` | fn | What to do with a `@requires`/`@ensures` the compiler cannot prove (today: every one). `"runtime"` checks it and panics on violation; `"trust"` accepts it unchecked |
 | `@allow(UnusedVariable)` | fn, type, test block | Suppress specific diagnostic warning, by name. On a test block it covers the whole body, closures and `assert_panics` blocks included; it does not reach a helper fn the test calls |
