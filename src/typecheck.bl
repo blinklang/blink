@@ -3583,6 +3583,10 @@ type CallFacts {
     // first walked, so the flush reports in source order.
     method_reads: Map[Int, MethodRead]
     method_read_order: List[Int]
+    // Each method of a trait named as a value (`Same.same`), in the order first walked, with what
+    // the flush judges it by once inference has fixed its binders.
+    method_values: Map[Int, MethodValueRef]
+    method_value_order: List[Int]
     // The roles the written keys of each impl method, by method declaration, give its impl's
     // binders, in header order.
     impl_binder_key_roles: Map[Int, List[HashRole]]
@@ -3656,7 +3660,7 @@ type UseJudge {
 }
 
 fn new_call_facts() -> CallFacts {
-    CallFacts { open_calls: [], open_group: Map(), open_tids: [], reported: Map(), self_views: Map(), view_sigs: Map(), hash_aliases_above: [], derive_facts_above: [], derive_facts_low: 0, derive_facts_open: [], derive_facts_open_low: Map(), debug_unbuilt_seen: Map(), hash_by_bounds: false, static_head_insts: Map(), static_head_binders: Map(), impl_bound_calls: [], impl_bound_binds: Map(), deferred_uses: [], deferred_use_at: Map(), late_keys: [], late_roots: Map(), late_roots_valid: false, late_refused: Map(), late_open: [], late_replay: -1, late_watch: Map(), late_fixed_at: Map(), infer_at: -1, static_owners: Map(), builtin_heads: Set(), builtin_static_reads: Map(), trait_heads: Map(), closure_expected_at: Map(), ret_ann: -1, missing_else: Map(), walk_returns: [], written_names: Map(), under_fn_type: Map(), method_reads: Map(), method_read_order: [], impl_binder_key_roles: Map(), key_body: -1, key_binders_reported: Map(), tpl_ctx: [], tpl_lit: [], errored: Map(), answers_after_report: 0, lost_to_error: Map(), row_unknown_at: -1 }
+    CallFacts { open_calls: [], open_group: Map(), open_tids: [], reported: Map(), self_views: Map(), view_sigs: Map(), hash_aliases_above: [], derive_facts_above: [], derive_facts_low: 0, derive_facts_open: [], derive_facts_open_low: Map(), debug_unbuilt_seen: Map(), hash_by_bounds: false, static_head_insts: Map(), static_head_binders: Map(), impl_bound_calls: [], impl_bound_binds: Map(), deferred_uses: [], deferred_use_at: Map(), late_keys: [], late_roots: Map(), late_roots_valid: false, late_refused: Map(), late_open: [], late_replay: -1, late_watch: Map(), late_fixed_at: Map(), infer_at: -1, static_owners: Map(), builtin_heads: Set(), builtin_static_reads: Map(), trait_heads: Map(), closure_expected_at: Map(), ret_ann: -1, missing_else: Map(), walk_returns: [], written_names: Map(), under_fn_type: Map(), method_reads: Map(), method_read_order: [], method_values: Map(), method_value_order: [], impl_binder_key_roles: Map(), key_body: -1, key_binders_reported: Map(), tpl_ctx: [], tpl_lit: [], errored: Map(), answers_after_report: 0, lost_to_error: Map(), row_unknown_at: -1 }
 }
 let mut tc_calls: CallFacts = new_call_facts()
 
@@ -5273,6 +5277,8 @@ fn tc_drop_open_calls() {
     tc_calls.late_fixed_at.clear()
     tc_calls.method_reads.clear()
     tc_calls.method_read_order = []
+    tc_calls.method_values.clear()
+    tc_calls.method_value_order = []
 }
 
 // Report a binding whose type is under-determined — HM finished the region with a
@@ -5299,6 +5305,9 @@ fn tc_report_under_determined(vname: Str, tid: Int, decl_node: Int) ! Diag.Repor
         tc_report_value_unfixed(val)
         return
     }
+    // A method value's only open parts are its binders, which tc_flush_method_values reports
+    // at the reference.
+    if val != -1 && tc_calls.method_values.contains_key(val) { return }
     if val != -1 && tc_method_read_waits(val) {
         tc_hold_method_read_binding(val, vname, decl_node, tid)
         return
@@ -28321,7 +28330,11 @@ pub fn tc_call_bound_trait_args(call_node: Int) -> List[Int] {
 // The bound's trait arguments when the call reached a method of `trait_key`, else []: the
 // Display impl of the value `x.conv()` returns is not picked by Conv's arguments.
 pub fn tc_call_bound_args_of(call_node: Int, trait_key: Str) -> List[Int] {
-    if (tc_call_trait(call_node) ?? "") != trait_key { return [] }
+    let reached = match tc_call_trait(call_node) {
+        Some(k) => k
+        None => tc_method_value_trait(call_node)
+    }
+    if reached != trait_key { return [] }
     tc_call_bound_trait_args(call_node)
 }
 
@@ -28508,6 +28521,18 @@ fn tc_head_names_trait(name: Str) -> Bool {
     if nr_current_module == "" { return true }
     let d = nr_resolve_bare_decl(name, nr_current_module)
     d < 0 || node_kind(d) != NodeKind.TypeDef
+}
+
+// The trait of `Trait.m` named as a value, for a method `m` that takes `self`, or "". The
+// sealed `display` has no declaration, and only the method-value reference records a head
+// for a name the trait does not declare.
+pub fn tc_method_value_trait(node: Int) -> Str {
+    if node_kind(node) != NodeKind.FieldAccess { return "" }
+    let key = tc_calls.trait_heads.get(node) ?? ""
+    if key == "" { return "" }
+    let m = tc_trait_method_decl(key, node_name(node))
+    if m < 0 { return if node_name(node) == "display" { key } else { "" } }
+    if tc_fn_decl_takes_self(m) { key } else { "" }
 }
 
 // The trait the head of the trait-qualified call `node` names, or None when typecheck read the
@@ -29529,6 +29554,182 @@ fn tc_flush_assoc_fn_refs() ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
         let _ = tc_emit_assoc_fn_through_trait(node, obj_node, node_name(obj_node), trait_key, node_name(node), false, fn_tid, tc_assoc_fn_fixed_self(self_mv), [])
         tc_ud_mark_blamed(fn_tid)
     }
+}
+
+// One method of a trait named as a value. `binders` holds the metavariable of `Self`, then one
+// for each type parameter of the trait (`trait_args`, in declared order), then one for each of
+// the method's own. `frames` are the type-parameter frames at the reference, so the flush
+// reads the bounds that were in scope there.
+type MethodValueRef {
+    written: Str
+    trait_key: Str
+    name: Str
+    fn_tid: Int
+    binders: List[Int]
+    trait_args: List[Int]
+    frames: List[TpFrame]
+    module: Str
+}
+
+// `Trait.m` with no call, for a method that takes `self` (§3.4 *A trait-qualified method named
+// as a value*): the method's type with the receiver first, `Self` and each type parameter of the
+// trait and of the method open, so the place's expected type fixes them as it fixes a closure's
+// parameters. tc_flush_method_values judges the reference once inference is done.
+fn tc_method_value_ref(node: Int, written: Str, trait_key: Str, name: Str) -> Int {
+    // A node is walked more than once, and what one walk fixed must hold in the next.
+    match tc_calls.method_values.get(node) {
+        Some(r) => return r.fn_tid
+        None => {}
+    }
+    let self_mv = make_metavar()
+    let mut binds: Map[Str, Int] = Map()
+    binds.insert("Self", self_mv)
+    binds.insert(tc_binder_key(SELF_BINDER_NODE, "Self"), self_mv)
+    let mut binders: List[Int] = [self_mv]
+    let mut trait_args: List[Int] = []
+    let tm_idx = tc_trait_fn_tmsig(trait_key, name)
+    let mut fn_tid = -1
+    if tm_idx < 0 {
+        // The sealed `display` has no declaration: it is `fn(Self) -> Str`.
+        fn_tid = make_fn_type(TYPE_STR, [self_mv])
+    } else {
+        let tm = tc_tmsig_pool.get(tm_idx).unwrap()
+        for k in 0..tm.tparams_count {
+            let tp_name = tc_trait_tparam_names.get(tm.tparams_start + k).unwrap()
+            let tp_node = tc_trait_tparam_nodes.get(tm.tparams_start + k) ?? NO_BINDER_NODE
+            let mv = make_metavar()
+            binds.insert(tp_name, mv)
+            binds.insert(tc_binder_key(tp_node, tp_name), mv)
+            trait_args.push(mv)
+            binders.push(mv)
+        }
+        // The declared receiver slot is the `self` parameter, which is `Self` by definition.
+        let fs = fnsig_pool.get(tm.sig).unwrap()
+        let mut params: List[Int] = [self_mv]
+        for i in 1..fs.params_count { params.push(fnsig_param_list.get(fs.params_start + i).unwrap()) }
+        let sig_tid = make_fn_type(fs.ret, params)
+        tc_fresh_method_binders(sig_tid, binds, binders)
+        fn_tid = substitute_typevar_tid(sig_tid, binds)
+    }
+    // Mono and codegen pick the impl by this trait, as they do for a trait-qualified call.
+    tc_calls.trait_heads.insert(node, trait_key)
+    if tc_boundary_check_active == 0 { return fn_tid }
+    let mut frames: List[TpFrame] = []
+    for f in tc_tp_frames { frames.push(f) }
+    if !tc_calls.method_values.contains_key(node) { tc_calls.method_value_order.push(node) }
+    tc_calls.method_values.insert(node, MethodValueRef { written: written, trait_key: trait_key, name: name, fn_tid: fn_tid, binders: binders, trait_args: trait_args, frames: frames, module: nr_current_module })
+    fn_tid
+}
+
+// A fresh metavariable in `binds` for each type variable of `tid` that `binds` does not
+// already key: the method's own type parameters, once `Self` and the trait's are keyed.
+fn tc_fresh_method_binders(tid0: Int, binds: Map[Str, Int], binders: List[Int]) {
+    let tid = tc_resolve(tid0)
+    if tid < 0 || tid >= ty_pool.len() { return }
+    if type_kind(tid) == TyKind.Typevar {
+        let key = tc_tid_typevar_key(tid)
+        let name = ty_pool.get(tid).unwrap().name
+        if binds.contains_key(key) || binds.contains_key(name) { return }
+        let mv = make_metavar()
+        binds.insert(key, mv)
+        binders.push(mv)
+        return
+    }
+    for i in 0..tc_tid_child_count(tid) { tc_fresh_method_binders(tc_tid_child(tid, i), binds, binders) }
+}
+
+// Each method value, judged with the type-parameter frames and the module of its reference.
+// Ahead of the E0301 flush, which would otherwise blame a binding for a binder this report
+// leaves open.
+fn tc_flush_method_values() ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    for node in tc_calls.method_value_order {
+        if tc_calls.reported.contains_key(node) { continue }
+        tc_calls.reported.insert(node, 1)
+        let r = tc_calls.method_values.get(node).unwrap()
+        let saved_frames = tc_tp_frames
+        let saved_module = nr_current_module
+        tc_tp_frames = r.frames
+        nr_current_module = r.module
+        tc_judge_method_value(node, r)
+        tc_tp_frames = saved_frames
+        nr_current_module = saved_module
+    }
+}
+
+// The verdict the call `Trait.m(x, ..)` gets for a receiver of the type inference gave `Self`,
+// reported at the reference: E0301 when a binder is still open, E0306 when `Self` has no impl
+// of the trait.
+fn tc_judge_method_value(node: Int, r: MethodValueRef) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    let shown = "{r.written}.{r.name}"
+    for i in 0..r.binders.len() {
+        if tc_method_value_fixed(r.binders.get(i).unwrap()) >= 0 { continue }
+        let what = if i == 0 { "`Self`" } else { "a type parameter" }
+        diag_error_at("CannotInferType", CANNOT_INFER_TYPE, "{what} of `{shown}` is unbound at this reference and nothing supplies it", node, "annotate the place with the function type it has, with a type that implements `{tc_trait_shown(r.trait_key)}` as its first parameter")
+        tc_ud_mark_blamed(r.fn_tid)
+        return
+    }
+    let self_tid = tc_method_value_fixed(r.binders.get(0).unwrap())
+    let trait_shown = tc_trait_shown(r.trait_key)
+    if type_kind(self_tid) == TyKind.Typevar {
+        let bounds = tc_tparam_bound_traits(type_to_str(self_tid))
+        let bound_name = if r.written == "Display" && r.name == "display" { "Display" } else { r.trait_key }
+        if bounds != "" && tc_pipe_has(bounds, bound_name) == 0 {
+            tc_report_tparam_not_bound_by(node, self_tid, r.written, r.name)
+            return
+        }
+        if bounds == "" || r.trait_args.len() == 0 { return }
+        let binder = tc_tid_binder(self_tid)
+        let insts = tc_bound_trait_instances(binder, r.trait_key)
+        if insts.len() >= 2 {
+            let _ = tc_bound_instance_ambiguity(node, shown, type_to_str(self_tid), r.trait_key, r.name, insts)
+            return
+        }
+        let bound_args = tc_bound_trait_arg_tids(binder, r.trait_key)
+        if bound_args.len() != r.trait_args.len() { return }
+        for i in 0..bound_args.len() {
+            if tc_unify(r.trait_args.get(i).unwrap(), bound_args.get(i).unwrap()) == 0 {
+                tc_report_method_value_no_impl(node, shown, self_tid, trait_shown)
+                return
+            }
+        }
+        tc_method_calls.bound_args.insert(node, bound_args)
+        return
+    }
+    if r.written == "Display" && r.name == "display" {
+        if tc_type_satisfies_bound(self_tid, "Display") == -1 { tc_report_method_value_no_impl(node, shown, self_tid, trait_shown) }
+        return
+    }
+    if tc_is_std_trait_method(r.trait_key, r.name) {
+        if tc_type_satisfies_bound(self_tid, r.trait_key) == -1 { tc_report_method_value_no_impl(node, shown, self_tid, trait_shown) }
+        return
+    }
+    let mut want: List[Int] = []
+    for a in r.trait_args { want.push(tc_method_value_fixed(a)) }
+    let ims = tc_impls_of_trait_on(r.trait_key, self_tid, want)
+    if ims.len() == 0 {
+        tc_report_method_value_no_impl(node, shown, self_tid, tc_trait_instance_shown(r.trait_key, want))
+        return
+    }
+    if ims.len() >= 2 {
+        let _ = tc_instance_ambiguity(node, shown, tc_type_str(self_tid), r.trait_key, r.name, ims)
+        return
+    }
+    let im = ims.get(0).unwrap()
+    let binds: Map[Str, Int] = Map()
+    unify_typevar_binds(tc_impl_recv_tids.get(im) ?? -1, self_tid, binds)
+    if tc_impl_bounds_rule_out(im, binds) { tc_report_method_value_no_impl(node, shown, self_tid, trait_shown) }
+}
+
+// `b` once inference has given it a type with nothing open, or -1. A type parameter of the
+// body is one fixed type there.
+fn tc_method_value_fixed(b: Int) -> Int {
+    let r = resolve_alias_tid(tc_resolve(b))
+    if r < 0 || tc_tid_has_unbound_metavar(r) != 0 || tc_tid_has_unknown(r) != 0 { -1 } else { r }
+}
+
+fn tc_report_method_value_no_impl(node: Int, shown: Str, self_tid: Int, trait_shown: Str) ! Diag.Report {
+    let ty = tc_type_str(self_tid)
+    diag_error_at("TraitBoundNotSatisfied", TRAIT_BOUND_NOT_SATISFIED, "`{ty}` does not implement `{trait_shown}`, so `{shown}` has no function to name for it", node, "name `{shown}` where its first parameter is a type that implements `{trait_shown}`")
 }
 
 // Whether `type_name.name` in place of the trait head checks at `node` (§3.4, the E0568 help):
@@ -38942,6 +39143,9 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                     if rt_decl >= 0 && !tc_fn_decl_takes_self(rt_decl) {
                         return tc_report_assoc_fn_through_trait(node, obj_node, obj_name, rt_trait, fname, false)
                     }
+                    if rt_decl >= 0 || (obj_name == "Display" && fname == "display") {
+                        return tc_method_value_ref(node, obj_name, rt_trait, fname)
+                    }
                 }
             }
             let tid = if head_is_type { tc_value_head_tid(obj_name) } else { -1 }
@@ -46790,6 +46994,7 @@ fn tc_flush_program_deferrals(program: Bool) ! TypeCheck.Resolve, TypeCheck.Repo
     tc_give_up_late_uses()
     if program { tc_recheck_operators() }
     tc_flush_assoc_fn_refs()
+    tc_flush_method_values()
     tc_ud_flush_pending()
     tc_report_late_open_calls()
     tc_ud_flush_calls()

@@ -1,0 +1,291 @@
+// `Trait.m` with no argument list, for a method that takes `self`, is a function value of type
+// `fn(Self, P2, ..., Pn) -> R` (sections/03_types.md §3.4 *A trait-qualified method named as a
+// value*). It runs the method a trait-qualified call with the same receiver type runs: a
+// written impl, a derive, or the compiler's own answer for a built-in type. Each program must
+// check clean, then build and run in both build modes and print the expected text, and so
+// must the same program with each value written as its closure form.
+
+import compile_test_helpers
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> ProcessResult ! Process.Spawn {
+    process.run("sh", ["-c", cmd]).unwrap()
+}
+
+fn expect_prints_with(tag: Str, lines: List[Str], flags: Str, want: Str) ! IO, FS.Write, Process.Spawn, Env.Read {
+    let dir = "{compile_test_helpers.scratch_root()}/trait_method_value_{tag}"
+    let _ = sh("rm -rf {dir} && mkdir -p {dir}")
+    fs.write("{dir}/x.bl", lines.join("\n").concat("\n")).unwrap()
+    let clear = "env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE"
+    let mut bad = 0
+    let c = sh("B=$(pwd)/build/blink; cd {dir} && {clear} timeout 120 $B check x.bl < /dev/null")
+    if !c.success() {
+        io.eprintln("{tag} check: ended {c.end}\n{c.out}{c.err_out}")
+        bad = bad + 1
+    }
+    for mode in ["--per-module", "--no-per-module"] {
+        let r = sh("B=$(pwd)/build/blink; cd {dir} && {clear} timeout 120 $B run {mode} {flags} x.bl 2>/dev/null < /dev/null")
+        if !r.success() || r.out.trim() != want {
+            let e = sh("B=$(pwd)/build/blink; cd {dir} && {clear} timeout 120 $B run {mode} {flags} x.bl < /dev/null")
+            io.eprintln("{tag} {mode} {flags}: ended {r.end}, printed [{r.out.trim()}], want [{want}]\n{e.err_out}")
+            bad = bad + 1
+        }
+    }
+    let _ = sh("rm -rf {dir}")
+    assert_eq(bad, 0)
+}
+
+fn expect_prints(tag: Str, lines: List[Str], want: Str) ! IO, FS.Write, Process.Spawn, Env.Read {
+    expect_prints_with(tag, lines, "", want)
+}
+
+// The method values in `values` and their closure forms in `closures` print the same text.
+fn expect_pair(tag: Str, values: List[Str], closures: List[Str], want: Str) ! IO, FS.Write, Process.Spawn, Env.Read {
+    expect_prints(tag, program(values), want)
+    expect_prints("{tag}_closure", program(closures), want)
+}
+
+// The traits and types each program names, then `main` with `body`.
+fn program(body: List[Str]) -> List[Str] {
+    let mut out = [
+        "trait Same \{",
+        "    fn same(self, o: Self) -> Bool",
+        "}",
+        "impl Same for Int \{",
+        "    fn same(self, o: Self) -> Bool \{ self == o }",
+        "}",
+        "impl Same for Str \{",
+        "    fn same(self, o: Self) -> Bool \{ self.len() == o.len() }",
+        "}",
+        "trait Show \{",
+        "    fn show(self) -> Str",
+        "}",
+        "type Bx[T] \{ v: T }",
+        "impl[T: Display] Show for Bx[T] \{",
+        "    fn show(self) -> Str \{ \"<\{self.v}>\" }",
+        "}",
+        "trait Conv[T] \{",
+        "    fn conv(self) -> T",
+        "}",
+        "impl Conv[Str] for Int \{",
+        "    fn conv(self) -> Str \{ \"c\{self}\" }",
+        "}",
+        "trait Pick \{",
+        "    fn pick[X](self, a: X, b: X) -> X",
+        "}",
+        "impl Pick for Bool \{",
+        "    fn pick[X](self, a: X, b: X) -> X \{ if self \{ a } else \{ b } }",
+        "}",
+        "trait Say \{",
+        "    fn say(self) ! IO",
+        "}",
+        "impl Say for Int \{",
+        "    fn say(self) ! IO \{ io.println(\"say \{self}\") }",
+        "}",
+        "@derive(Clone, Eq, Debug)",
+        "type U \{ n: Int }",
+        "impl Display for U \{",
+        "    fn fmt(self, mut sb: StringBuilder) \{ sb.write(\"U(\{self.n})\") }",
+        "}",
+        "@derive(Debug, Eq, Ord)",
+        "type Pt \{ x: Int }",
+        "impl Clone for Pt \{",
+        "    fn clone(self) -> Pt \{ Pt \{ x: self.x + 1 } }",
+        "}",
+        "type W \{ v: Int }",
+        "impl From[Int] for W \{",
+        "    fn from(x: Int) -> W \{ W \{ v: x } }",
+        "}",
+        "fn main() \{",
+    ]
+    for l in body { out.push(l) }
+    out.push("}")
+    out
+}
+
+test "the spec example runs" {
+    expect_pair("spec_example", [
+        "    let f: fn(Int, Int) -> Bool = Same.same",
+        "    let xs = [U \{ n: 1 }, U \{ n: 2 }]",
+        "    let ys = xs.map(Clone.clone)",
+        "    let ss = xs.map(Display.display)",
+        "    let ok = [1, 2].map(W.from)",
+        "    io.println(\"\{f(1, 1)} \{ys.len()} \{ss.len()} \{ok.len()}\")",
+        "    io.println(ss.join(\",\"))",
+    ], [
+        "    let f: fn(Int, Int) -> Bool = fn(a, b) \{ Same.same(a, b) }",
+        "    let xs = [U \{ n: 1 }, U \{ n: 2 }]",
+        "    let ys = xs.map(fn(a) \{ Clone.clone(a) })",
+        "    let ss = xs.map(fn(a) \{ Display.display(a) })",
+        "    let ok = [1, 2].map(fn(a) \{ W.from(a) })",
+        "    io.println(\"\{f(1, 1)} \{ys.len()} \{ss.len()} \{ok.len()}\")",
+        "    io.println(ss.join(\",\"))",
+    ], "true 2 2 2\nU(1),U(2)")
+}
+
+test "a method value runs the written impl, also a generic one" {
+    expect_pair("written_impl", [
+        "    let f: fn(Int, Int) -> Bool = Same.same",
+        "    let g: fn(Str, Str) -> Bool = Same.same",
+        "    io.println(\"\{f(1, 1)} \{f(1, 2)} \{g(\"ab\", \"cd\")}\")",
+        "    io.println([Bx \{ v: 1 }, Bx \{ v: 2 }].map(Show.show).join(\",\"))",
+    ], [
+        "    let f: fn(Int, Int) -> Bool = fn(a, b) \{ Same.same(a, b) }",
+        "    let g: fn(Str, Str) -> Bool = fn(a, b) \{ Same.same(a, b) }",
+        "    io.println(\"\{f(1, 1)} \{f(1, 2)} \{g(\"ab\", \"cd\")}\")",
+        "    io.println([Bx \{ v: 1 }, Bx \{ v: 2 }].map(fn(b) \{ Show.show(b) }).join(\",\"))",
+    ], "true false true\n<1>,<2>")
+}
+
+test "a method value runs a derive" {
+    expect_pair("derived", [
+        "    let e: fn(U, U) -> Bool = Eq.eq",
+        "    let d: fn(U) -> Str = Debug.debug",
+        "    let c: fn(U) -> U = Clone.clone",
+        "    io.println(\"\{e(U \{ n: 1 }, U \{ n: 1 })} \{e(U \{ n: 1 }, U \{ n: 2 })} \{c(U \{ n: 4 }).n}\")",
+        "    io.println(d(U \{ n: 5 }))",
+    ], [
+        "    let e: fn(U, U) -> Bool = fn(a, b) \{ Eq.eq(a, b) }",
+        "    let d: fn(U) -> Str = fn(a) \{ Debug.debug(a) }",
+        "    let c: fn(U) -> U = fn(a) \{ Clone.clone(a) }",
+        "    io.println(\"\{e(U \{ n: 1 }, U \{ n: 1 })} \{e(U \{ n: 1 }, U \{ n: 2 })} \{c(U \{ n: 4 }).n}\")",
+        "    io.println(d(U \{ n: 5 }))",
+    ], "true false 4\nU \{ n: 5 }")
+}
+
+test "a method value runs the compiler's own answer for a built-in type" {
+    expect_pair("builtin", [
+        "    let ie: fn(Int, Int) -> Bool = Eq.eq",
+        "    let se: fn(Str, Str) -> Bool = Eq.eq",
+        "    let ic: fn(Int, Int) -> Ordering = Ord.cmp",
+        "    let h: fn(Int) -> U64 = Hash.hash",
+        "    io.println(\"\{ie(3, 3)} \{se(\"a\", \"b\")} \{ic(1, 2) == Ordering.Less} \{h(7) == h(7)}\")",
+        "    io.println([\"a\", \"b\"].map(Clone.clone).join(\",\"))",
+        "    let ls: List[List[Int]] = [[1], [2, 3]].map(Clone.clone)",
+        "    io.println(\"\{ls.len()} \{ls.get(1).unwrap().len()}\")",
+        "    let ds: fn(Int) -> Str = Debug.debug",
+        "    io.println(ds(9))",
+    ], [
+        "    let ie: fn(Int, Int) -> Bool = fn(a, b) \{ Eq.eq(a, b) }",
+        "    let se: fn(Str, Str) -> Bool = fn(a, b) \{ Eq.eq(a, b) }",
+        "    let ic: fn(Int, Int) -> Ordering = fn(a, b) \{ Ord.cmp(a, b) }",
+        "    let h: fn(Int) -> U64 = fn(a) \{ Hash.hash(a) }",
+        "    io.println(\"\{ie(3, 3)} \{se(\"a\", \"b\")} \{ic(1, 2) == Ordering.Less} \{h(7) == h(7)}\")",
+        "    io.println([\"a\", \"b\"].map(fn(a) \{ Clone.clone(a) }).join(\",\"))",
+        "    let ls: List[List[Int]] = [[1], [2, 3]].map(fn(a) \{ Clone.clone(a) })",
+        "    io.println(\"\{ls.len()} \{ls.get(1).unwrap().len()}\")",
+        "    let ds: fn(Int) -> Str = fn(a) \{ Debug.debug(a) }",
+        "    io.println(ds(9))",
+    ], "true false true true\na,b\n2 2\n9")
+}
+
+test "a method value runs the debug and the clone of a range" {
+    expect_pair("range", [
+        "    let rd: fn(Range[Int]) -> Str = Debug.debug",
+        "    let rc: fn(Range[Int]) -> Range[Int] = Clone.clone",
+        "    let pc: fn(Range[Pt]) -> Range[Pt] = Clone.clone",
+        "    io.println(\"\{rd(0..3)} \{rd(0..=2)} \{rd(rc(1..4))}\")",
+        "    io.println(pc(Pt \{ x: 1 }..Pt \{ x: 5 }).debug())",
+    ], [
+        "    let rd: fn(Range[Int]) -> Str = fn(r) \{ Debug.debug(r) }",
+        "    let rc: fn(Range[Int]) -> Range[Int] = fn(r) \{ Clone.clone(r) }",
+        "    let pc: fn(Range[Pt]) -> Range[Pt] = fn(r) \{ Clone.clone(r) }",
+        "    io.println(\"\{rd(0..3)} \{rd(0..=2)} \{rd(rc(1..4))}\")",
+        "    io.println(pc(Pt \{ x: 1 }..Pt \{ x: 5 }).debug())",
+    ], "0..3 0..=2 1..4\nPt \{ x: 2 }..Pt \{ x: 6 }")
+}
+
+test "Display.display is a value over each scalar kind and a struct" {
+    expect_pair("scalar_display", [
+        "    io.println([1, 2].map(Display.display).join(\",\"))",
+        "    io.println([\"s\"].map(Display.display).join(\",\"))",
+        "    io.println([true, false].map(Display.display).join(\",\"))",
+        "    io.println(['c'].map(Display.display).join(\",\"))",
+        "    io.println([1.5].map(Display.display).join(\",\"))",
+        "    let b: fn(Bool) -> Str = Display.display",
+        "    let u: fn(U) -> Str = Display.display",
+        "    io.println(\"\{b(true)} \{u(U \{ n: 3 })}\")",
+    ], [
+        "    io.println([1, 2].map(fn(a) \{ Display.display(a) }).join(\",\"))",
+        "    io.println([\"s\"].map(fn(a) \{ Display.display(a) }).join(\",\"))",
+        "    io.println([true, false].map(fn(a) \{ Display.display(a) }).join(\",\"))",
+        "    io.println(['c'].map(fn(a) \{ Display.display(a) }).join(\",\"))",
+        "    io.println([1.5].map(fn(a) \{ Display.display(a) }).join(\",\"))",
+        "    let b: fn(Bool) -> Str = fn(a) \{ Display.display(a) }",
+        "    let u: fn(U) -> Str = fn(a) \{ Display.display(a) }",
+        "    io.println(\"\{b(true)} \{u(U \{ n: 3 })}\")",
+    ], "1,2\ns\ntrue,false\nc\n1.5\ntrue U(3)")
+}
+
+// `program` with the generic fns `eqs` and `sames`, whose bodies name the method as `form`
+// gives it.
+fn bounded(eq_form: Str, same_form: Str) -> List[Str] {
+    let mut out: List[Str] = [
+        "fn eqs[T: Eq](a: T, b: T) -> Bool \{",
+        "    let f: fn(T, T) -> Bool = {eq_form}",
+        "    f(a, b)",
+        "}",
+        "fn sames[T: Same](a: T, b: T) -> Bool \{",
+        "    let f: fn(T, T) -> Bool = {same_form}",
+        "    f(a, b)",
+        "}",
+    ]
+    for l in program(["    io.println(\"\{eqs(1, 1)} \{eqs(\"a\", \"b\")} \{sames(2, 3)} \{sames(\"ab\", \"cd\")}\")"]) { out.push(l) }
+    out
+}
+
+test "a bounded type parameter names the method of each instance" {
+    expect_prints("bounded", bounded("Eq.eq", "Same.same"), "true false false true")
+    expect_prints("bounded_closure", bounded("fn(x, y) \{ Eq.eq(x, y) }", "fn(x, y) \{ Same.same(x, y) }"), "true false false true")
+}
+
+test "a method value with type parameters of the trait and of the method" {
+    expect_pair("tparams", [
+        "    let cv: fn(Int) -> Str = Conv.conv",
+        "    let p: fn(Bool, Int, Int) -> Int = Pick.pick",
+        "    io.println(\"\{cv(4)} \{p(true, 1, 2)} \{p(false, 1, 2)}\")",
+    ], [
+        "    let cv: fn(Int) -> Str = fn(a) \{ Conv.conv(a) }",
+        "    let p: fn(Bool, Int, Int) -> Int = fn(s, a, b) \{ Pick.pick(s, a, b) }",
+        "    io.println(\"\{cv(4)} \{p(true, 1, 2)} \{p(false, 1, 2)}\")",
+    ], "c4 1 2")
+}
+
+test "a method value carries the effects of its method" {
+    expect_pair("effects", ["    [9].for_each(Say.say)"], ["    [9].for_each(fn(a) \{ Say.say(a) })"], "say 9")
+}
+
+test "a later call fixes Self of a method value" {
+    expect_pair("later_call", [
+        "    let g = Same.same",
+        "    io.println(\"\{g(2, 2)}\")",
+    ], [
+        "    let g = fn(a, b) \{ Same.same(a, b) }",
+        "    io.println(\"\{g(2, 2)}\")",
+    ], "true")
+}
+
+test "a method value runs under a trace and in a debug build" {
+    let lines = program([
+        "    let f: fn(Int, Int) -> Bool = Same.same",
+        "    io.println(\"\{f(1, 1)} \{[U \{ n: 1 }].map(Display.display).join(\",\")}\")",
+    ])
+    expect_prints_with("traced", lines, "--trace", "true U(1)")
+    expect_prints_with("debug", lines, "--debug", "true U(1)")
+}
+
+fn run_fixture(name: Str, flags: List[Str]) -> ProcessResult ! Process.Spawn {
+    let mut args = ["run"]
+    for f in flags { args.push(f) }
+    args.push("tests/zztv_trait_method_value/src/{name}.bl")
+    process.run("build/blink", args).unwrap()
+}
+
+test "a trait imported from another module is named with its methods as values" {
+    for flags in [[], ["--no-per-module"]] {
+        let r = run_fixture("main_trait_method_from_another_module", flags)
+        if r.out != "true false true\n" { io.println("FAIL {flags.join(" ")} got: {r.out}{r.err_out}") }
+        assert(r.success())
+        assert_eq(r.out, "true false true\n")
+    }
+}

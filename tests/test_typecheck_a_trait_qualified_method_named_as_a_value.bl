@@ -1,0 +1,120 @@
+// `Trait.m` with no argument list, for a method that takes `self`, is a function value of type
+// `fn(Self, P2, ..., Pn) -> R`. The expected type fixes `Self`, the trait's type parameters and
+// the method's type parameters, and the value is legal exactly where its closure form is legal.
+// When nothing fixes a binder it is error[CannotInferType] at the reference, and when the fixed
+// `Self` has no impl of the trait it is error[TraitBoundNotSatisfied] at the reference
+// (sections/03_types.md §3.4 *A trait-qualified method named as a value*).
+
+import std.fs
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_reset}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+import std.io
+
+fn typecheck_probe(path: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    init_embedded_stdlib()
+    fs.write(path, src).unwrap()
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+}
+
+// Each error as "name at line:col: message | note | help: help".
+fn errors_of(src: Str) -> List[Str] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    typecheck_probe("build/test_typecheck_a_trait_qualified_method_value_probe.bl", src)
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" {
+            let mut line = "{d.name} at {d.line}:{d.col}: {d.message}"
+            for n in d.notes { line = "{line} | {n}" }
+            line = "{line} | help: {d.help}"
+            out.push(line)
+        }
+    }
+    for e in out { io.println("  diag: {e}") }
+    out
+}
+
+// The declarations take lines 1-25, so the first statement of `main` is line 27.
+let DECLS = "trait TvSame \{\n    fn same(self, o: Self) -> Bool\n}\nimpl TvSame for Int \{\n    fn same(self, o: Self) -> Bool \{ self == o }\n}\ntrait TvConv[T] \{\n    fn conv(self) -> T\n}\nimpl TvConv[Str] for Int \{\n    fn conv(self) -> Str \{ \"c\{self}\" }\n}\ntrait TvPick \{\n    fn pick[X](self, a: X, b: X) -> X\n}\nimpl TvPick for Bool \{\n    fn pick[X](self, a: X, b: X) -> X \{ if self \{ a } else \{ b } }\n}\n@derive(Clone, Eq)\ntype TvU \{ n: Int }\nimpl Display for TvU \{\n    fn fmt(self, mut sb: StringBuilder) \{ sb.write(\"U\") }\n}\nfn tv_ap[A](f: fn(A) -> TvU) -> Int \{ let _ = f\n 1 }\n"
+
+fn with_main(stmts: Str) -> Str {
+    "{DECLS}fn main() \{\n{stmts}}\n"
+}
+
+fn with_fns(fns: Str, stmts: Str) -> Str {
+    "{DECLS}{fns}fn main() \{\n{stmts}}\n"
+}
+
+fn clean(src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    assert_eq(errors_of(src).len(), 0)
+}
+
+fn one_error(src: Str) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    let errs = errors_of(src)
+    assert_eq(errs.len(), 1)
+    errs.get(0).unwrap()
+}
+
+test "the expected type of a binding fixes Self of a method value" {
+    clean(with_main("    let f: fn(Int, Int) -> Bool = TvSame.same\n    let _ = f(1, 2)\n"))
+}
+
+test "a parameter type fixes Self of a std trait method value" {
+    clean(with_main("    let xs = [TvU \{ n: 1 }]\n    let _ys: List[TvU] = xs.map(Clone.clone)\n    let _ss: List[Str] = xs.map(Display.display)\n"))
+}
+
+test "std trait method values on a built-in type check" {
+    clean(with_main("    let e: fn(Int, Int) -> Bool = Eq.eq\n    let d: fn(Int) -> Str = Display.display\n    let _ = e(1, 1)\n    let _ = d(1)\n"))
+}
+
+test "a derived Eq is a method value" {
+    clean(with_main("    let e: fn(TvU, TvU) -> Bool = Eq.eq\n    let _ = e(TvU \{ n: 1 }, TvU \{ n: 1 })\n"))
+}
+
+test "a later call fixes Self of a method value with no expected type" {
+    clean(with_main("    let g = TvSame.same\n    let _ = g(2, 2)\n"))
+}
+
+test "a method value with nothing to fix Self is refused at the reference" {
+    let e = one_error(with_main("    let g = TvSame.same\n"))
+    assert(e.starts_with("CannotInferType at 27:13: "), e)
+    assert(e.contains("TvSame.same"), e)
+}
+
+test "a fixed Self with no impl of the trait is refused at the reference" {
+    let e = one_error(with_main("    let h: fn(Str, Str) -> Bool = TvSame.same\n    let _ = h\n"))
+    assert(e.starts_with("TraitBoundNotSatisfied at 27:35: "), e)
+    assert(e.contains("Str"), e)
+    assert(e.contains("TvSame"), e)
+}
+
+test "a want that fixes Self through the return slot of the same binder checks" {
+    clean(with_main("    let _ = tv_ap(Clone.clone)\n"))
+}
+
+test "a bounded type parameter fixes Self in a generic body" {
+    let fns = "fn tv_eqs[T: TvSame](a: T, b: T) -> Bool \{\n    let f: fn(T, T) -> Bool = TvSame.same\n    f(a, b)\n}\n"
+    clean(with_fns(fns, "    let _ = tv_eqs(1, 2)\n"))
+}
+
+test "an unbounded type parameter as Self is refused at the reference" {
+    let fns = "fn tv_eqs[T](a: T, b: T) -> Bool \{\n    let f: fn(T, T) -> Bool = TvSame.same\n    f(a, b)\n}\n"
+    let e = one_error(with_fns(fns, "    let _ = tv_eqs(1, 2)\n"))
+    assert(e.starts_with("TraitBoundNotSatisfied at 27:31: "), e)
+}
+
+test "the expected type fixes the type parameter of the trait" {
+    clean(with_main("    let cv: fn(Int) -> Str = TvConv.conv\n    let _ = cv(4)\n"))
+}
+
+test "a trait type parameter with no impl for Self is refused at the reference" {
+    let e = one_error(with_main("    let cv: fn(Int) -> Int = TvConv.conv\n    let _ = cv\n"))
+    assert(e.starts_with("TraitBoundNotSatisfied at 27:30: "), e)
+}
+
+test "the expected type fixes the type parameter of the method" {
+    clean(with_main("    let p: fn(Bool, Int, Int) -> Int = TvPick.pick\n    let _ = p(true, 1, 2)\n"))
+}

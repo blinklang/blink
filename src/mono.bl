@@ -35,7 +35,7 @@ import typecheck.{
     substitute_typevar_tid, tc_binder_key, tc_tid_typevar_key, tc_call_bound_trait_args, tc_impl_takes_trait_args, tc_projection_binds,
     tc_call_declared_name, tc_call_decl_node, tc_static_head_binders, tc_call_trait, tc_call_reaches_trait_method, tc_impl_answers_call, tc_impl_trait_id, tc_impl_conv_source, tc_impl_trait_args, tc_impl_recv_spelling,
     tc_impl_is_poly_conversion, tc_conversion_impl_for, tc_check_conversion, tc_conversion_trait_of, tc_conversion_target_of, tc_is_conversion_trait, tc_is_into_method, tc_is_default_fill, tc_call_user_effect, tc_field_tid_at_instance,
-    tc_lookup_node_tid, tc_fn_value_decl_node, tc_mc_obj_is_value, tc_call_is_trace_log, tc_is_sealed_list_hof, tc_is_list_generic_adapter, tc_map_generic_adapter, tc_map_generic_adapter_module, tc_list_generic_module, tc_is_iterator_method, tc_resolve,
+    tc_lookup_node_tid, tc_fn_value_decl_node, tc_method_value_trait, tc_mc_obj_is_value, tc_call_is_trace_log, tc_is_sealed_list_hof, tc_is_list_generic_adapter, tc_map_generic_adapter, tc_map_generic_adapter_module, tc_list_generic_module, tc_is_iterator_method, tc_resolve,
     tc_ret_mint_at, tc_tid_child, tc_tid_child_count,
     tc_tid_decl_node, tc_tid_kind, tc_impl_is_poly_user, tc_poly_user_impl_decl, tc_instance_has_trait, tc_written_impl_holds, tc_trait_has_need_rule,
     tc_tid_is_no_info, tc_tid_list_elem, tc_tid_name, tc_type_name_shown, tc_tid_resolved, tc_tid_struct, tc_type_str,
@@ -1102,6 +1102,11 @@ fn discover_call(ctx: Int, node: Int) ! Diag.Report {
 // this reference does the same job. An item callee carries no stamp (discover_call), so
 // this answers nothing for the name a call is written with.
 fn discover_fn_value(ctx: Int, node: Int) ! Diag.Report {
+    let trait_key = tc_method_value_trait(node)
+    if !trait_key.is_empty() {
+        discover_method_value(ctx, node, trait_key)
+        return
+    }
     let gfn = tc_fn_value_decl_node(node)
     if gfn < 0 { return }
     if discover_static_head_poly(ctx, gfn, node) { return }
@@ -1111,6 +1116,29 @@ fn discover_fn_value(ctx: Int, node: Int) ! Diag.Report {
     }
     if !generic_fn_nodes.contains_key(gfn) { return }
     note_call_target(ctx, node, register_fn(gfn, binder_args(ctx, gfn, node, reference_binds(ctx, gfn, node, []))))
+}
+
+// `Trait.m` named as a value. The first parameter of its Fn type at this reference is the
+// receiver, which picks the impl as the receiver of `Trait.m(recv, ..)` does.
+fn discover_method_value(ctx: Int, node: Int, trait_key: Str) ! Diag.Report {
+    let tid = ctx_node_tid(ctx, node)
+    if tc_tid_is_no_info(tid) != 0 || tc_tid_kind(tid) != TyKind.Fn { return }
+    let recv_tid = tc_tid_child(tid, 1)
+    if recv_tid < 0 { return }
+    let method = node_name(node)
+    if decl_check.walking < 0 {
+        let m = own_generic_method_for(ctx, node, method, recv_tid, Some(trait_key))
+        if m >= 0 {
+            note_call_target(ctx, node, register_own_generic_method(m, binder_args(ctx, m, node, reference_binds(ctx, m, node, []))))
+            return
+        }
+    }
+    let key = "{trait_key}.{method}"
+    if discover_poly_user_at(ctx, node, recv_tid, key, true) { return }
+    match poly_methods.by_qualified.get(key) {
+        Some(m) => register_poly_elem(ctx, m, recv_tid, node, true)
+        None => {}
+    }
 }
 
 // The binds of `gfn`'s binders at a reference: a call solves them from its arguments and its
@@ -1182,7 +1210,10 @@ fn discover_poly_impl_call(ctx: Int, node: Int, obj: Int) ! Diag.Report {
 // The receiver's declaration picks the impl: inside a bounded body (`self.value.show()`)
 // the receiver is a type parameter to typecheck, and only the instance says which type it is.
 fn discover_poly_user_call(ctx: Int, node: Int, obj: Int, method: Str, qualified: Bool) -> Bool ! Diag.Report {
-    let recv_tid = ctx_node_tid(ctx, obj)
+    discover_poly_user_at(ctx, node, ctx_node_tid(ctx, obj), method, qualified)
+}
+
+fn discover_poly_user_at(ctx: Int, node: Int, recv_tid: Int, method: Str, qualified: Bool) -> Bool ! Diag.Report {
     if recv_tid < 0 { return false }
     let decl = tc_tid_decl_node(recv_tid)
     if decl < 0 { return false }
@@ -1218,7 +1249,10 @@ fn recv_lead(recv_tid: Int, qualified: Bool) -> List[Int] {
 }
 
 fn register_poly_recv(ctx: Int, m: Int, recv_node: Int, call_node: Int, qualified: Bool) ! Diag.Report {
-    let recv_tid = ctx_node_tid(ctx, recv_node)
+    register_poly_elem(ctx, m, ctx_node_tid(ctx, recv_node), call_node, qualified)
+}
+
+fn register_poly_elem(ctx: Int, m: Int, recv_tid: Int, call_node: Int, qualified: Bool) ! Diag.Report {
     if recv_tid < 0 { return }
     let elem_tid = tc_tid_list_elem(recv_tid)
     if elem_tid < 0 { return }
@@ -1381,7 +1415,13 @@ fn own_generic_method_at(ctx: Int, node: Int, obj: Int, qualified: Bool) -> Int 
     // A receiver may stay open past its base: in an impl over `List[T]` that does not use
     // `T`, `self` is `List[T]` in every instance, and its base alone picks the impl.
     if recv_tid < 0 { return -1 }
-    let call_trait = tc_call_trait(node)
+    own_generic_method_for(ctx, node, node_method(node), recv_tid, tc_call_trait(node))
+}
+
+// The method `mname` with its own type parameters of the one impl that answers `recv_tid`
+// under `call_trait`, or -1.
+fn own_generic_method_for(ctx: Int, node: Int, mname: Str, recv_tid: Int, call_trait: Option[Str]) -> Int {
+    let ms = own_generic_methods.by_name.get(mname) ?? []
     let mut want: List[Int] = []
     for t in tc_call_bound_trait_args(node) { want.push(tid_in_instance(ctx, t)) }
     let mut found = -1

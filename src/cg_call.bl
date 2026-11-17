@@ -82,7 +82,7 @@ import cg_stmt.{enum_tag_word, lower_block_into, cg_stmt_materialise_where_run}
 import cg_eff.{
     cg_eff_ev_argument, cg_eff_lower_builtin_perform, cg_eff_lower_time_perform, cg_eff_lower_user_perform,
     cg_eff_lower_builtin_default_perform, cg_eff_lower_builtin_op_perform,
-    cg_eff_lower_spawn_closure, cg_eff_spawn_value_task, cg_eff_pending_thunks, cg_eff_thunk_task_symbol, cg_eff_lower_fn_value,
+    cg_eff_lower_spawn_closure, cg_eff_spawn_value_task, cg_eff_pending_thunks, cg_eff_thunk_task_symbol, cg_eff_lower_fn_value, cg_eff_lower_inlined_method_value,
     cg_eff_lower_derived_static_value,
     cg_eff_lower_io_read_perform, cg_eff_impl_method_at,
     cg_eff_enter_inline_frame, cg_eff_leave_inline_frame, cg_eff_binder_is_shared, cg_eff_declare_cell,
@@ -1020,6 +1020,10 @@ fn cc_scalar_display_via_stdlib(node: Int, obj: Int, name: Str, kind: TyKind) ->
 fn cc_bool_display(node: Int, obj: Int) -> Int ! Diag.Report {
     let cond = lower_expr(obj)
     if cond < 0 { return -1 }
+    cc_bool_display_of(node, cond)
+}
+
+fn cc_bool_display_of(node: Int, cond: Int) -> Int ! Diag.Report {
     let rec = cc_local(TYPE_STR, node)
     if cc_stopped(rec) { return -1 }
     let held = c_mint_local("bd")
@@ -2175,6 +2179,109 @@ pub fn lower_derived_static_value(node: Int) -> Int ! Diag.Report {
     if symbol != "" { return cg_eff_lower_fn_value(node, -1, symbol, false) }
     diag_ice_stage_not_built("cg_call derived `{node_name(node_obj(node))}.{node_name(node)}` named as a value", node)
     -1
+}
+
+// `Trait.m` named as a value, for a method that takes `self`. The first parameter of its Fn
+// type is the receiver type, and the value runs what `Trait.m(recv, ..)` runs over it, read
+// through the same rungs in the same order as lower_trait_qualified_call: a written impl, the
+// sealed display, a built-in type's own answer, then a derive. A rung with a C function is a
+// thunk that forwards to it, and one the compiler inlines is a thunk with that inlined body.
+pub fn lower_method_value(node: Int, trait_name: Str) -> Int ! Diag.Report {
+    let method = node_name(node)
+    let tid = tid_of_node(node)
+    if tid < 0 { return -1 }
+    let recv_tid = child_tid(tid, Slot.Param(0))
+    if recv_tid < 0 { return -1 }
+    let im = cc_impl_for(node, recv_tid, trait_name)
+    if im == IMPL_REFUSED { return -1 }
+    if im >= 0 && cc_method_index(im, method) >= 0 {
+        let decl = cc_method_of(im, method)
+        if decl < 0 { return -1 }
+        let symbol = cc_call_symbol(node, decl, c_impl_method_name(im, method))
+        if symbol == "" { return -1 }
+        return cg_eff_lower_fn_value(node, decl, symbol, cg_decl_takes_ev(decl))
+    }
+    let kind = cc_kind(recv_tid)
+    if cc_is_sealed_display(trait_name, method, kind) { return cc_forward_value(node, cc_display_symbol(node, recv_tid)) }
+    if cc_is_display_display(trait_name, method) && cc_is_scalar_display_kind(kind) {
+        if kind == TyKind.Int || kind == TyKind.Float { return cc_scalar_display_value(node, kind) }
+        return cg_eff_lower_inlined_method_value(node, trait_name, method)
+    }
+    if cc_is_std_trait_answer(recv_tid, method) {
+        let r = tc_resolve(recv_tid)
+        if kind == TyKind.Range && cc_is_range_debug(method) { return cc_forward_value(node, cc_debug_symbol(node, r)) }
+        if kind == TyKind.Range && cc_is_range_clone(method) {
+            let bound = tc_resolve(tc_tid_child(r, 0))
+            let copy = cc_clone_is_copy(node, bound)
+            if copy == CLONE_REFUSED { return -1 }
+            if copy != CLONE_COPIES { return cc_forward_value(node, cc_range_clone_symbol(node, r, bound, copy)) }
+        }
+        if builtin_std_method_of(r, method) == BuiltinStdMethod.Clone && !cc_clone_copies(node, r) { return -1 }
+        return cg_eff_lower_inlined_method_value(node, trait_name, method)
+    }
+    let derived = cc_derived_method_symbol(recv_tid, method)
+    if derived != "" { return cg_eff_lower_fn_value(node, -1, derived, false) }
+    cc_trait_impl_not_found(node, trait_name, method, recv_tid)
+}
+
+// A value that forwards to a function the compiler writes with no declaration, which takes no
+// evidence vector. "" is a refusal already reported.
+fn cc_forward_value(node: Int, symbol: Str) -> Int ! Diag.Report {
+    if symbol == "" { return -1 }
+    cg_eff_lower_fn_value(node, -1, symbol, false)
+}
+
+// `Display.display` over an Int or a Float named as a value forwards to the std_num function
+// the call reaches.
+fn cc_scalar_display_value(node: Int, kind: TyKind) -> Int ! Diag.Report {
+    let name = if kind == TyKind.Int { "int_to_str" } else { "float_to_str" }
+    let decl = cc_stdlib_fn_named(node, "std_num", name)
+    if decl == DECL_REFUSED { return -1 }
+    if decl < 0 { return cc_intrinsic_undeclared(node, kind, "display", "std_num", name) }
+    let symbol = cc_call_symbol(node, decl, c_fn_decl_name(decl))
+    if symbol == "" { return -1 }
+    cg_eff_lower_fn_value(node, -1, symbol, cg_decl_takes_ev(decl))
+}
+
+// The body of a thunk for the std trait method `method` named as a value over a built-in
+// type, which lower_method_value queued: what the trait-qualified call inlines, with `params`
+// as its arguments, returned. The receiver type is the first parameter of the value's Fn type.
+pub fn lower_method_value_body(span: Int, trait_name: Str, method: Str, params: List[Int]) -> Int ! Diag.Report {
+    let tid = tid_of_node(span)
+    if tid < 0 { return -1 }
+    let recv_tid = child_tid(tid, Slot.Param(0))
+    if recv_tid < 0 || params.len() == 0 {
+        diag_ice_stage_not_built("cg_call body of `{method}` named as a value with no receiver", span)
+        return -1
+    }
+    let mark = cg_expr_pending_count()
+    let result = cc_method_value_of(span, recv_tid, trait_name, method, params)
+    let mut stmts = cg_expr_take_pending(mark)
+    if result < 0 { return -1 }
+    stmts.push(ir_return(span, result))
+    ir_block(span, stmts)
+}
+
+// What a trait-qualified call of `method` inlines over the built-in type `recv_tid`, on the
+// values `params` rather than on written arguments. lower_method_value queued a clone only
+// where it is the value itself.
+fn cc_method_value_of(span: Int, recv_tid: Int, trait_name: Str, method: Str, params: List[Int]) -> Int ! Diag.Report {
+    let value = params.get(0).unwrap()
+    let other = params.get(1) ?? -1
+    let kind = cc_kind(recv_tid)
+    if cc_is_display_display(trait_name, method) {
+        if kind == TyKind.Str { return value }
+        if kind == TyKind.Char {
+            let rec = cc_local(TYPE_STR, span)
+            if cc_stopped(rec) { return -1 }
+            return cc_char_text_of_value(span, rec.c_spelling, rec.slot_form, value)
+        }
+        if kind == TyKind.Bool { return cc_bool_display_of(span, value) }
+    }
+    if kind == TyKind.Range && cc_is_range_clone(method) { return value }
+    if cc_is_scalar_compare(kind, method) { return cc_scalar_compare_of(span, recv_tid, kind, method, value, other) }
+    let tid = tc_resolve(recv_tid)
+    cc_builtin_std_of(span, tid, method, builtin_std_method_of(tid, method), value, other)
 }
 
 // The body of a thunk for the from_str of the Str-backed enum `enum_tid`, which has no C
@@ -4139,21 +4246,27 @@ fn cc_range_clone(node: Int, obj: Int, recv_tid: Int) -> Int ! Diag.Report {
     let copy = cc_clone_is_copy(node, bound)
     if copy == CLONE_REFUSED { return -1 }
     if copy == CLONE_COPIES { return lower_expr(obj) }
-    if copy == CLONE_NOT_BUILT {
-        diag_ice_stage_not_built("cg_call methods: the clone of a {tc_type_str(r)}, whose bound holds a type with a written `clone`", node)
-        return -1
-    }
-    let im = cc_impl_for(node, bound, trait_clone)
-    if im < 0 { return -1 }
-    let bound_clone = cc_impl_operator_symbol(node, im, method_clone, bound)
-    if bound_clone == "" { return -1 }
-    let symbol = cg_derive_range_clone_fn(r, bound_clone, node)
+    let symbol = cc_range_clone_symbol(node, r, bound, copy)
     if symbol == "" { return -1 }
     let value = lower_expr(obj)
     if value < 0 { return -1 }
     let rec = cc_local(r, node)
     if cc_stopped(rec) { return -1 }
     ir_call_direct(r, node, rec.c_spelling, symbol, rec.slot_form, [value])
+}
+
+// The function the clone of the range `r` calls when its bound `bound` has a written `clone`,
+// by `copy`, or "" once a refusal is reported.
+fn cc_range_clone_symbol(node: Int, r: Int, bound: Int, copy: Int) -> Str ! Diag.Report {
+    if copy == CLONE_NOT_BUILT {
+        diag_ice_stage_not_built("cg_call methods: the clone of a {tc_type_str(r)}, whose bound holds a type with a written `clone`", node)
+        return ""
+    }
+    let im = cc_impl_for(node, bound, trait_clone)
+    if im < 0 { return "" }
+    let bound_clone = cc_impl_operator_symbol(node, im, method_clone, bound)
+    if bound_clone == "" { return "" }
+    cg_derive_range_clone_fn(r, bound_clone, node)
 }
 
 // The std trait methods a built-in value or a fieldless enum answers with no impl to call
@@ -4192,34 +4305,31 @@ fn cc_std_trait_answer(node: Int, obj: Int, other: Int, recv_tid: Int, mname: St
 // Typecheck refuses each shape this cannot build, so a refusal here is a compiler fault.
 fn cc_builtin_std_trait_method(node: Int, obj: Int, other: Int, recv_tid: Int, mname: Str) -> Int ! Diag.Report {
     let tid = tc_resolve(recv_tid)
-    match builtin_std_method_of(tid, mname) {
-        BuiltinStdMethod.Clone => cc_builtin_clone(node, obj, tid)
-        BuiltinStdMethod.Eq => {
-            let pair = cg_expr_lower_pair(obj, other)
-            if pair.len() != 2 { return -1 }
-            let lhs = pair.get(0).unwrap()
-            let rhs = pair.get(1).unwrap()
-            if lhs < 0 || rhs < 0 { return -1 }
-            cc_values_equal(node, tid, lhs, rhs)
-        }
-        BuiltinStdMethod.Cmp => {
-            let pair = cg_expr_lower_pair(obj, other)
-            if pair.len() != 2 { return -1 }
-            let lhs = pair.get(0).unwrap()
-            let rhs = pair.get(1).unwrap()
-            if lhs < 0 || rhs < 0 { return -1 }
-            cc_scalar_order(node, tid, lhs, rhs)
-        }
-        BuiltinStdMethod.Debug => {
-            let value = lower_expr(obj)
-            if value < 0 { return -1 }
-            cg_derive_debug_text(tid, value, node)
-        }
-        BuiltinStdMethod.Hash => {
-            let value = lower_expr(obj)
-            if value < 0 { return -1 }
-            cg_derive_hash_of(tid, value, node)
-        }
+    let which = builtin_std_method_of(tid, mname)
+    if which == BuiltinStdMethod.Clone { return cc_builtin_clone(node, obj, tid) }
+    if which == BuiltinStdMethod.NotOne { return cc_builtin_std_of(node, tid, mname, which, -1, -1) }
+    if which == BuiltinStdMethod.Eq || which == BuiltinStdMethod.Cmp {
+        let pair = cg_expr_lower_pair(obj, other)
+        if pair.len() != 2 { return -1 }
+        let lhs = pair.get(0).unwrap()
+        let rhs = pair.get(1).unwrap()
+        if lhs < 0 || rhs < 0 { return -1 }
+        return cc_builtin_std_of(node, tid, mname, which, lhs, rhs)
+    }
+    let value = lower_expr(obj)
+    if value < 0 { return -1 }
+    cc_builtin_std_of(node, tid, mname, which, value, -1)
+}
+
+// The std trait method `which` over `tid` on lowered values: `other` is the value an `eq` or a
+// `cmp` compares `value` with. A clone reaches here only where it is the value itself.
+fn cc_builtin_std_of(node: Int, tid: Int, mname: Str, which: BuiltinStdMethod, value: Int, other: Int) -> Int ! Diag.Report {
+    match which {
+        BuiltinStdMethod.Clone => value
+        BuiltinStdMethod.Eq => cc_values_equal(node, tid, value, other)
+        BuiltinStdMethod.Cmp => cc_scalar_order(node, tid, value, other)
+        BuiltinStdMethod.Debug => cg_derive_debug_text(tid, value, node)
+        BuiltinStdMethod.Hash => cg_derive_hash_of(tid, value, node)
         BuiltinStdMethod.NotOne => {
             diag_ice_stage_not_built("cg_call methods: `{mname}` on a {tc_type_str(tid)} as a std trait method", node)
             -1
@@ -4228,13 +4338,19 @@ fn cc_builtin_std_trait_method(node: Int, obj: Int, other: Int, recv_tid: Int, m
 }
 
 fn cc_builtin_clone(node: Int, obj: Int, tid: Int) -> Int ! Diag.Report {
+    if !cc_clone_copies(node, tid) { return -1 }
+    lower_expr(obj)
+}
+
+// Whether the clone of a value of `tid` is the value itself. A refusal is reported.
+fn cc_clone_copies(node: Int, tid: Int) -> Bool ! Diag.Report {
     let copy = cc_clone_is_copy(node, tid)
-    if copy == CLONE_REFUSED { return -1 }
+    if copy == CLONE_REFUSED { return false }
     if copy != CLONE_COPIES {
         diag_ice_stage_not_built("cg_call methods: the clone of a {tc_type_str(tid)}, which typecheck should have refused", node)
-        return -1
+        return false
     }
-    lower_expr(obj)
+    true
 }
 
 // How the `clone` of a value of `tid` copies it. A derived `clone` and the clone of every
@@ -5324,6 +5440,10 @@ fn cc_scalar_compare_pair(node: Int, obj: Int, other: Int, recv_tid: Int, kind: 
     let recv = pair.get(0).unwrap()
     let rhs = pair.get(1).unwrap()
     if recv < 0 || rhs < 0 { return -1 }
+    cc_scalar_compare_of(node, recv_tid, kind, method, recv, rhs)
+}
+
+fn cc_scalar_compare_of(node: Int, recv_tid: Int, kind: TyKind, method: Str, recv: Int, rhs: Int) -> Int ! Diag.Report {
     match scalar_compare_of(kind, method) {
         ScalarCompare.Cmp => cc_scalar_order(node, recv_tid, recv, rhs)
         ScalarCompare.Eq => cc_values_equal(node, recv_tid, recv, rhs)
