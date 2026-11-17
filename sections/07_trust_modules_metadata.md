@@ -2027,6 +2027,7 @@ with ffi.scope() as scope {
 | Operation | Signature | Description |
 |-----------|-----------|-------------|
 | `scope.alloc[T]()` | `fn alloc[T](self) -> Ptr[T]` | Allocate zero-initialized memory, tracked by scope |
+| `scope.alloc_n[T](n)` | `fn alloc_n[T](self, n: Int) -> Ptr[T]` | Allocate zero-initialized memory for `n` values, tracked by scope |
 | `scope.cstr(s)` | `fn cstr(self, s: Str) -> Ptr[U8]` | Create scoped null-terminated C string copy |
 | `scope.take(ptr)` | `fn take[T](self, ptr: Ptr[T]) -> Ptr[T]` | Transfer pointer ownership out of scope (not freed at scope exit) |
 
@@ -2036,6 +2037,11 @@ with ffi.scope() as scope {
 - Scope-allocated pointers that escape the scope without `.take()` trigger a compile error (reusing E0601 from `Closeable` diagnostics). The compiler finds these by inferring a scope tag for each pointer; see *Scope tags*, below.
 
 **The `FfiScope` type.** `ffi.scope()` returns a value of type `FfiScope`. `FfiScope` is **scope-bound**: a value of this type may occur only as the resource of a `with ... as` block, **and nowhere else**. It may not be bound by a `let`, passed as an argument, returned, stored in a field, or written as a type argument.
+
+Only a call to `ffi.scope()` may be the resource of such a block. The binder of that block (`s` in `with ffi.scope() as s`) holds the scope, and it has two limits:
+
+- The binder may be the receiver of `alloc`, `alloc_n`, `cstr` and `take`, and no other use is allowed. That includes a use inside a closure literal that the block holds.
+- The binder may not be the resource of another `with`. `with s as t` and `with (s) as t` are E0819 at `s`. One scope has one `with` block and one free; a second block on the same scope would free it twice. To get a second scope, open a new one: `with ffi.scope() as t`. Nested `with ffi.scope()` blocks are legal. Each has its own binder and its own tag.
 
 ```blink
 import blink.ffi
@@ -2059,12 +2065,53 @@ fn leaks() ! IO {
 }
 ```
 
+Each use of the binder that is not a receiver is E0819 at that use. Each case has its own example:
+
+```blink
+import blink.ffi
+
+fn first(xs: List[Str]) ! IO {
+    with ffi.scope() as s {
+        let p = s.alloc[U8]()                   // OK -- `s` is the receiver of `alloc`
+        let q = s.alloc_n[U8](16)               // OK
+        let c = s.cstr("a")                     // OK
+        let t = s.take(p)                       // OK
+        let all = xs.map(fn(x) { s.cstr(x) })   // OK -- the closure uses `s` as a receiver
+        with ffi.scope() as inner {             // OK -- a new scope with its own binder
+            let r = inner.alloc[U8]()
+        }
+    }
+}
+
+// intentional-error example
+fn second(xs: List[Str]) ! IO {
+    with ffi.scope() as s {
+        with s as t { }               // error[FfiScopeNotWithResource] (E0819) at `s`:
+                                      //   `s` already belongs to the `with ffi.scope() as s` above
+                                      // help: open a new scope with `with ffi.scope() as t`
+        with (s) as u { }             // error[E0819] at `s`: same message and help
+        let a = s                     // error[E0819] at `s`: a scope binder may be used only
+                                      //   as the receiver of `alloc`, `alloc_n`, `cstr` or `take`
+        keep(s)                       // error[E0819] at `s`
+        id(s)                         // error[E0819] at `s`
+    }
+}
+
+// intentional-error example
+fn third() ! IO {
+    with ffi.scope() as s {
+        s                             // error[E0819] at `s`: the block would yield its own scope
+    }
+}
+```
+
 The rule is stated over the **type**, not over the `ffi.scope()` call, because the hazard belongs to the value. A scope owns memory whose extent must be lexical, and every position the rule excludes is a position from which that memory outlives the block that frees it — however the value arrived there. A rule stated over the call site would test how the call is *written*, so any binding or indirection walks past it while the hazard is unchanged, and it would need a fresh clause for every future function that produces a scope.
 
 **Why this is an error where the `Closeable`-without-scope rule is a warning.** A `Closeable` value used outside `with ... as` is still reclaimed; that warning reports a resource released late and non-deterministically. An `FfiScope` used outside `with ... as` releases **nothing** — every allocation made through it leaks for the life of the process. The two rules differ in severity because they differ in outcome, not in strictness. (See §5.5, *`Closeable` values and `with ... as`*, named here rather than cited by code number.)
 
 **Message conditions** (normative, per §3.1 *Diagnostic Discipline*):
 - The shown repair carries the **author's own binder**, not a hardcoded `scope`.
+- Each E0819 site has its own help. A `let` or a plain `ffi.scope()` call gets the `with ... as` rewrite. A binder used as a `with` resource names the `with` that already owns it (its line) and says "open a new scope with `with ffi.scope() as t`", where `t` is the author's name. Any other use of a binder says that the binder may be the receiver of `alloc`, `alloc_n`, `cstr` and `take` only, and that the pointer, not the scope, is what to pass on. The `let` rewrite help is never given for a binder.
 - The `let` → `with ... as` rewrite is **not** machine-applicable, and must not be offered as one: no fixer can decide where the block should end.
 - A second `help:` names `alloc_ptr[T]()`, so a writer who wanted one plain allocation is not taught to wrap a `with` block around the rest of the function.
 - Where `.take()` is named in a repair it is explained in the same breath — it removes a pointer from the scope's cleanup list and transfers that pointer's lifetime to the caller (see *Scope rules*, above).
@@ -2118,7 +2165,7 @@ The compiler gives each value that can carry a pointer a **scope tag**: the `ffi
 
 **Notation.** In this spec, `Ptr[T]^σ` and `Buf[T]^σ` are meta-notation for "a `Ptr[T]` (or `Buf[T]`) whose scope tag is σ". They are not source syntax: in source, `^` is only bitwise XOR. Hover and diagnostics print a tag as `(scope: outer)`, never as `^σ`.
 
-**Pointer-bearing types.** A type is *pointer-bearing* when `Ptr` or `Buf` occurs anywhere in it, including through the fields of an `@ffi.struct` at any depth (`Ptr[U8]`, `Option[Ptr[T]]`, `List[Ptr[T]]`, an `@ffi.struct` with a `Ptr` field). Only values of pointer-bearing types, and closures that capture them, carry a tag.
+**Pointer-bearing types.** A type is *pointer-bearing* when `Ptr` or `Buf` occurs anywhere in it, including through the fields of an `@ffi.struct` at any depth (`Ptr[U8]`, `Option[Ptr[T]]`, `List[Ptr[T]]`, an `@ffi.struct` with a `Ptr` field). Only values of pointer-bearing types, and closures that capture them, carry a tag. One more value carries a tag: the binder of `with ffi.scope() as s` has tag `s`, although `FfiScope` is not pointer-bearing. The binder can only be a receiver (*The `FfiScope` type*, above), so the tag matters for a closure that uses it.
 
 **Tag identity.** A tag is the binder of one `with ffi.scope() as s` block — the syntax node, not its name. Two nested blocks that both bind `s` give two different tags. When two live binders have the same name, diagnostics and hover print the name with its line: `s (line 4)`.
 
@@ -2131,10 +2178,11 @@ The compiler gives each value that can carry a pointer a **scope tag**: the `ffi
 | `s.alloc[T]()`, `s.alloc_n[T](n)`, `s.cstr(str)` | `s` |
 | `libc.copy_to_buf(b)` | the innermost `ffi.scope` block around the call |
 | `s.take(p)` | unscoped |
+| The binder `s` of `with ffi.scope() as s`, used as a receiver | `s` |
 | `alloc_ptr[T]()`, `null_ptr[T]()` | unscoped |
 | `p.offset(i)`; `p.deref()` or `p.field.read()`, at any embedded depth, that gives a pointer-bearing value | the tag of `p` |
 | A struct literal, tuple, `Some(v)`, `Ok(v)` or `Err(v)` | the innermost tag of its parts; unscoped if none has a tag |
-| A closure literal | the innermost tag of the values it captures; unscoped if none has a tag |
+| A closure literal | the innermost tag of the values it captures, and of each scope binder it uses as a receiver; unscoped if none has a tag |
 | A pointer-bearing parameter of a closure literal (e.g. the `p` in `bs.with_ptr(fn(p) { ... })`) | a fresh tag whose block is the closure body: it encloses every scope block the body opens, and every tag live around the literal encloses it |
 | Any other call whose result type is pointer-bearing | the innermost tag of its pointer-bearing arguments (a method receiver is an argument); unscoped if there are none |
 
@@ -2150,11 +2198,70 @@ A **cell** is a place that holds a value after the expression that puts it there
 **`E0601 (tag-mismatch)`.** A value with tag `v` stored into a cell with tag `c` is an error unless `v` encloses `c`. There are exactly four ways to store a value into a cell:
 
 1. **Write.** `c.write(v)` or `c.field.write(v)`, at any embedded depth, which stores into the pointee; or an assignment `place = v` or `place op= v` to a place (§2.22 *Assignment places*). The cell of an assignment is the place's root `let mut` binding. A store into `x.f.g` or `x.0` is a store into `x`.
-2. **Capture.** A closure that captures a value with tag `s` follows the escape rules of a closure that captures a `Closeable` bound by block `s` (§2, *Closures and Scoped Resources*; §5.5): it may not be returned from block `s` or stored in a cell that `s` does not enclose.
+2. **Capture.** A closure that captures a value with tag `s` follows the escape rules of a closure that captures a `Closeable` bound by block `s` (§2, *Closures and Scoped Resources*; §5.5): it may not be returned from block `s` or stored in a cell that `s` does not enclose. A closure that uses the binder `s` as a receiver has tag `s` and follows the same rules.
 3. **Effect argument.** Passing a tagged value as an argument to an effect operation stores it into the handler that receives it. A handler installed inside block `s` may receive a value with tag `s`; a handler installed outside `s` may not.
-4. **Call beside a pointer-holding argument.** At a call, a tagged value passed next to an argument whose declared parameter type is *pointer-holding* counts as stored into that argument. A parameter type is pointer-holding when a callee can store a pointer through it that the caller can reach after the call: `Ptr[P]` for a pointer-bearing `P` (`Ptr[Ptr[T]]`, or `Ptr[S]` for an `@ffi.struct S` with a `Ptr` field at any depth), or a `List`, `Map` or `Set` whose element type is pointer-bearing. `Ptr[U8]`, `Ptr[Void]` and `Ptr[S]` for a struct with no `Ptr` field are not pointer-holding. So `memcpy(dst, src)` with `dst` and `src` from different scopes is legal, and `c_writev(fd, iov, 2)` (one pointer argument) never pairs anything.
+4. **Call beside a pointer-holding argument.** At a call, a tagged value passed next to an argument whose declared parameter type is *pointer-holding* counts as stored into that argument. A parameter type is pointer-holding when a callee can store a pointer through it that the caller can reach after the call: `Ptr[P]` for a pointer-bearing `P` (`Ptr[Ptr[T]]`, or `Ptr[S]` for an `@ffi.struct S` with a `Ptr` field at any depth), or a `List`, `Map` or `Set` whose element type is pointer-bearing. For a closure that has a tag, a `List`, `Map` or `Set` whose element type is a function type is also pointer-holding. `Ptr[U8]`, `Ptr[Void]` and `Ptr[S]` for a struct with no `Ptr` field are not pointer-holding. So `memcpy(dst, src)` with `dst` and `src` from different scopes is legal, and `c_writev(fd, iov, 2)` (one pointer argument) never pairs anything.
 
 An element write (`xs.set(i, v)`, `m.insert(k, v)`) is a method call, so rule 4 covers it. Blink has no index assignment (§2.22).
+
+**A closure that uses a scope binder.** The closure has tag `s`, so it may not outlive block `s`. Each way out is E0601:
+
+```blink
+effect Hook {
+    effect Run {
+        fn run(f: fn() -> Int)
+    }
+}
+
+fn inside(xs: List[Str]) ! IO {
+    with ffi.scope() as s {
+        let all = xs.map(fn(x) { s.cstr(x) })        // OK -- the closure ends in the block
+        let f = fn() -> Int { s.alloc[Int]().deref() }   // OK
+        let n = f()                                   // OK -- called inside block `s`
+    }
+}
+
+// intentional-error example
+fn returned() -> fn() -> Int {
+    with ffi.scope() as s {
+        return fn() -> Int { s.alloc[Int]().deref() }    // error[E0601] value-escape: return
+    }
+}
+
+// intentional-error example
+fn tail() -> fn() -> Int {
+    with ffi.scope() as s {
+        fn() -> Int { s.alloc[Int]().deref() }           // error[E0601] value-escape: tail expression
+    }
+}
+
+// intentional-error example
+fn to_cell() {
+    let mut keep = fn() -> Int { 0 }
+    with ffi.scope() as s {
+        keep = fn() -> Int { s.alloc[Int]().deref() }    // error[E0601] tag-mismatch: assignment
+    }
+}
+
+// intentional-error example
+fn to_list() {
+    let mut fs: List[fn() -> Int] = []
+    with ffi.scope() as s {
+        fs.push(fn() -> Int { s.alloc[Int]().deref() })  // error[E0601] tag-mismatch: call
+    }
+}
+
+// intentional-error example
+fn to_handler() {
+    with handler Hook {
+        fn run(_f: fn() -> Int) { }
+    } {
+        with ffi.scope() as s {
+            hook.run(fn() -> Int { s.alloc[Int]().deref() })   // error[E0601] tag-mismatch: effect argument
+        }
+    }
+}
+```
 
 This list is **closed and exhaustive**. A language change that adds a new way to store a value must add a row to it.
 
@@ -2246,6 +2353,7 @@ error[E0601]: pointer from a shorter-lived scope passed beside a pointer contain
 - A tag-mismatch error names the store form: write (`.write()`), assignment (`=` or `op=`), capture, effect argument, or call. Write and assignment are both rule 1; the two labels tell a store into a pointee from a store into a binding. For an assignment, the error names the full place (`w.0.iov_base`) and its root `let mut` binding with the scope around that binding's declaration. For a call, it names the pointer-holding parameter and, for an `@ffi.struct` pointee, the `Ptr` field that makes it pointer-holding.
 - When a tag came from the call rule, the error names the argument that set it.
 - The repair ("allocate from `outer`") is not machine-applicable: the allocation site may be far from the store.
+- When the escaping value is a closure that uses a scope binder, the error names the use of the binder in the closure. It does not say "wrap in `s.take(...)`", because `take` moves a pointer and cannot move a scope. Its help says that the closure uses scope `s` after block `s` ends, and gives two repairs: call the closure inside block `s`, or do the work with `s` inside the block and move out only a result (`s.take(p)` for a pointer, or a plain value).
 - `blink explain E0601` gives one example per store form and states the C-side retention limit.
 
 `blink audit` includes pointer allocations alongside FFI call sites and `Raw()` query sites:
@@ -3005,7 +3113,7 @@ For C surfaces β cannot reach (varargs, signal handlers, glibc-version-conditio
 
 `E0601` (existing) gains two sub-kinds for the scope-tag interactions raised by `Ptr` aliasing across `ffi.scope` boundaries. Both are defined by the inferred scope tags of §9.1.1, *Scope tags*:
 
-- `E0601 (value-escape)`: a `Ptr[T]` value escapes its allocating `ffi.scope`.
+- `E0601 (value-escape)`: a `Ptr[T]` value, or a closure that uses the scope binder, escapes its allocating `ffi.scope`.
 - `E0601 (tag-mismatch)`: a scope-tagged Ptr/Buf stored, by write, assignment, capture, effect argument, or a call beside a pointer-holding argument, into a cell whose scope it does not enclose. (A value of any pointer-bearing type counts as a Ptr here.)
 
 Diagnostic codes `W0811` (init-flow analysis), `W0813` (zero-len Buf), and `E0818` (endian-tag tracking) considered during deliberation are **not** shipped — see decision rationale.
