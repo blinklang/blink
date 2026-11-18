@@ -8677,7 +8677,7 @@ A derived implementation satisfies these laws. A hand-written implementation of 
 - **`Eq`**: `==` is reflexive, symmetric and transitive.
 - **`Hash` agrees with `Eq`**: if `a == b`, then `a.hash() == b.hash()`.
 - **`Ord` is total and agrees with `Eq`**: for each `a` and `b`, exactly one of `a < b`, `a == b` and `a > b` holds, and `a.cmp(b)` is `Equal` exactly when `a == b`.
-- **`Serialize` and `Deserialize` round-trip**: for a value `x` of type `T` that holds no NaN or infinite `Float`, and no `Some(v)` where `v.to_json()` is `JsonValue.Null`, `T.from_json(x.to_json())` is `Ok` of a value equal to `x`. A non-finite `Float` does not survive the round trip (§3.6.2 *NaN and Infinity*). A `Some(v)` where `v.to_json()` is `JsonValue.Null` does not survive it either: that position decodes as `None` (§3.6.2 *Option and Result in JSON*).
+- **`Serialize` and `Deserialize` round-trip**: for a value `x` of type `T` that holds no NaN or infinite `Float` or `F32`, and no `Some(v)` where `v.to_json()` is `JsonValue.Null`, `T.from_json(x.to_json())` is `Ok` of a value equal to `x`. A non-finite `Float` does not survive the round trip (§3.6.2 *NaN and Infinity*). A `Some(v)` where `v.to_json()` is `JsonValue.Null` does not survive it either: that position decodes as `None` (§3.6.2 *Option and Result in JSON*).
 
 ##### Error Reporting
 
@@ -8869,6 +8869,10 @@ unknown value "closed" for Status at $.status; expected one of: "open", "in_prog
 | `Option[T]` | `JsonValue.Null` for `None`, `T.to_json()` for `Some(v)`. Decode: `JsonValue.Null` is `None`, any other value is `T.from_json(j)` wrapped in `Some` |
 | `Result[T, E]` | `{"Ok": v}` for `Ok(v)` and `{"Err": e}` for `Err(e)`. Decode: an object with exactly one entry, with the key `"Ok"` or `"Err"` |
 | `List[T]` | `JsonValue.Array` |
+| `Char` | `JsonValue.Str` of one scalar value. Decode: a `JsonValue.Str` of exactly one scalar value (*Built-in Types in JSON*) |
+| `I8`, `I16`, `I32`, `U8`, `U16`, `U32` | `JsonValue.Int`. Decode: a `JsonValue.Int` in the range of the type (*Built-in Types in JSON*) |
+| `F32` | `JsonValue.Float` that holds the shortest text form of the `F32`. Decode: `JsonValue.Int` or `JsonValue.Float`, rounded to the nearest `F32` (*Built-in Types in JSON*) |
+| `U64`, `Bytes`, `Range[T]` | No `Serialize` and no `Deserialize` impl: E1401 at a derive field, E0306 at a bound (*Built-in Types in JSON*) |
 | Struct with `@derive(Serialize)` | `JsonValue.Object` |
 | Enum with `@derive(Serialize)`, not Str-backed | Tagged object: `{"variant": "Name", "fields": {...}}` |
 | Str-backed enum with `@derive(Serialize)` | `JsonValue.Str` of its backing literal: `"in_progress"` |
@@ -8959,6 +8963,154 @@ expected an object with exactly one key, "Ok" or "Err" (case matters), at $.outc
 ```
 
 A consumer that reads this JSON from another language checks the `"Ok"` key first: if `outcome` has the key `"Ok"`, the call succeeded and the value is the payload; otherwise it has the key `"Err"`.
+
+##### Built-in Types in JSON
+
+**One list.** The built-in `Serialize` and `Deserialize` impls are the rows of *Type Mapping* and the rows in this subsection. The list is closed. Four parts of the compiler read this one list: the bound check (E0306), the derive field check (E1401), method lookup and code generation. A built-in type with no row has no impl. The compiler refuses it at check: E0306 at a bound, E1401 at a derive field. A missing impl never shows up as a build failure. `Never` keeps its prelude impls: `Serialize` yes, `Deserialize` no (§3.2). This subsection gives no row to `Map`, `Set` or a tuple.
+
+**`Char`.** `to_json` gives `JsonValue.Str` of a string that holds the one scalar value. `from_json` accepts a `JsonValue.Str` `s` when `s.len() == 1` (§3.2.1: `len` counts scalar values). It gives `Err(JsonError)` for any other `Str`, and for every other variant.
+
+```blink
+let a = 'é'.to_json()                          // JsonValue.Str("é")
+let b = Char.from_json(JsonValue.Str("é"))     // Ok('é')
+let c = Char.from_json(JsonValue.Str("ab"))    // Err(JsonError): two scalar values
+let d = Char.from_json(JsonValue.Str(""))      // Err(JsonError): no scalar value
+let e = Char.from_json(JsonValue.Int(107))     // Err(JsonError): a number is not a Str, although 107 is 'k'
+```
+
+**Sized integers.** `I8`, `I16`, `I32`, `U8`, `U16` and `U32` write `JsonValue.Int` of their value. `from_json` accepts only a `JsonValue.Int` in the range of the type:
+
+| Type | Range |
+|------|-------|
+| `I8` | -128 to 127 |
+| `I16` | -32768 to 32767 |
+| `I32` | -2147483648 to 2147483647 |
+| `U8` | 0 to 255 |
+| `U16` | 0 to 65535 |
+| `U32` | 0 to 4294967295 |
+
+An `Int` outside the range is `Err(JsonError)`. The `message` names the type, its range, the value and the `path` (*JsonError*). Every `JsonValue.Float` is `Err(JsonError)`, also one that holds a whole number such as `3.0`, as for an `Int` field (*Numbers*). `JsonValue.Str`, `JsonValue.Bool` and `JsonValue.Null` are `Err(JsonError)` too. No input wraps or truncates.
+
+```blink
+@derive(Serialize, Deserialize)
+type Person {
+    age: U8
+}
+
+let a: U8 = 200
+let b = a.to_json()                                // JsonValue.Int(200)
+let c = json.decode[Person]("{\"age\": 200}")      // Ok(Person { age: 200 })
+let d = json.decode[Person]("{\"age\": 300}")      // Err: expected U8 (0 to 255), got 300 at $.age
+let e = json.decode[Person]("{\"age\": -1}")       // Err: expected U8 (0 to 255), got -1 at $.age
+let f = json.decode[Person]("{\"age\": 3.0}")      // Err: expected U8 (0 to 255), got 3.0 at $.age
+```
+
+The wording of the `message` is not fixed. Its content is: the type, the range and the path.
+
+**`F32`.** `to_json` gives `JsonValue.Float(d)`. The `Float` `d` is the nearest `Float` to a decimal `s`, and `s` is the shortest decimal that gives back `x` through both of these steps: round `s` to binary64, then round that value to binary32 (each step rounds to nearest, ties to even). When more than one decimal of that length gives `x`, take the one nearest the exact value of `x`. When two are equally near, take the one whose last digit is even. Both steps belong to the definition: a decimal that rounds in binary64 onto the midpoint of two `F32` values, and from there to the other neighbor of `x`, does not give `x`, so it is not `s`.
+
+These are the digits of the `F32` text form (§3.6 *Float Text Form*, rule **F32**) that `"{x}"` writes. The two rules choose different digits only when a decimal of the length in question rounds in binary64 onto the exact midpoint of two `F32` values. A NaN or an infinite `F32` gives a `JsonValue.Float` that holds NaN or an infinity, and the rules of *NaN and Infinity* apply.
+
+`x.to_json()` is not `JsonValue.Float(x.to_float())`. For an `F32` `x` that holds 0.1, the widened `Float` is `0.10000000149011612`, and `x.to_json()` holds `0.1`.
+
+`from_json` accepts `JsonValue.Int` and `JsonValue.Float`. It rounds the value to the nearest `F32`, ties to even. A finite value that would round to an infinity is `Err(JsonError)`. `JsonValue.Null` is `Err(JsonError)`, and so is every other variant. `JsonValue` does not change.
+
+```blink
+@derive(Serialize, Deserialize)
+type Layer {
+    scale: F32
+}
+
+let a = Layer { scale: F32.from(0.1) }
+let b = json.encode(a)                            // {"scale":0.1}
+let c = a.scale.to_float().display()              // "0.10000000149011612"
+let d = json.decode[Layer]("{\"scale\": 1}")      // Ok(Layer { scale: 1.0 })
+let e = json.decode[Layer]("{\"scale\": 1e39}")   // Err: expected F32, got 1.0e39 (too large) at $.scale
+let f = json.decode[Layer]("{\"scale\": null}")   // Err: expected F32, got null at $.scale
+```
+
+**Types with no impl.** Three built-in types have no `Serialize` and no `Deserialize` impl. Each refusal has a help that names the repair for that type. The help is not the generic text.
+
+- **`U64`.** A JSON number holds the `Int` range, and `U64` has values above it. The compiler picks no string form for a `U64`.
+- **`Bytes`.** `Bytes` is raw data, and JSON holds text. Hex, base64 and an array of numbers are all in use, and the program chooses.
+- **`Range[T]`.** A `Range[T]` has no JSON form.
+
+```blink
+@derive(Serialize)
+type Cached {
+    h: U64
+}
+```
+
+```
+error[NonDerivableTrait]: cannot derive `Serialize` for `Cached`
+ --> cache.bl:3:5
+  |
+3 |     h: U64
+  |     ^^^^^^ `U64` does not implement `Serialize`
+  |
+  = help: write the value as text: make the field `h: Str` and store `"{h}"`
+  = help: or make the field an `Int` and store `h.to_int_checked()`. That call fails when `h` is above 2^63 - 1, which is true of half of all `U64` values
+  = note: `Hash.hash` gives a `U64`, and the hash seed is different in each process (§3.6 *Hash Contract and Seeding*). A `hash()` value is not stable between processes. For a stable digest use `Sha256`
+```
+
+The bound check gives the same help at the call:
+
+```blink
+fn store[T: Serialize](x: T) -> JsonValue {
+    x.to_json()
+}
+
+fn keep(h: U64) -> JsonValue {
+    store(h)    // error[TraitBoundNotSatisfied] (E0306): `U64` does not implement `Serialize`, with the same help
+}
+```
+
+`Deserialize` on a `U64` field is refused the same way, with the same help lines.
+
+```blink
+@derive(Serialize)
+type Blob {
+    data: Bytes
+}
+```
+
+```
+error[NonDerivableTrait]: cannot derive `Serialize` for `Blob`
+ --> blob.bl:3:5
+  |
+3 |     data: Bytes
+  |     ^^^^^^^^^^^ `Bytes` does not implement `Serialize`
+  |
+  = help: make the field a `Str` and store `data.to_hex()`, which writes the bytes as lower-case hex text
+```
+
+The help for `Bytes` names no way back to `Bytes`. It names no base64 method either.
+
+```blink
+@derive(Serialize)
+type Window {
+    span: Range[Int]
+}
+```
+
+```
+error[NonDerivableTrait]: cannot derive `Serialize` for `Window`
+ --> window.bl:3:5
+  |
+3 |     span: Range[Int]
+  |     ^^^^^^^^^^^^^^^^ `Range[Int]` does not implement `Serialize`
+  |
+  = help: write a struct with `start` and `end` fields:
+            @derive(Serialize, Deserialize)
+            type Span {
+                start: Int
+                end: Int
+            }
+          and write the field as `span: Span`
+```
+
+A later row for `U64` is a change that cannot alter a program that checks today. This holds while code cannot observe that an impl is absent: Blink has no negative bound, and a derive that fails is an error and never a silent skip. If either rule changes, the refusal of `U64` needs a new look.
 
 ##### Map and Set Order
 
