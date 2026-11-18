@@ -5,6 +5,7 @@ import pkg.manifest.{manifest_name, manifest_header_is_declared}
 import unparse.{type_ann_text, type_ann_text_renamed, unparse_expr, unparse_binop_with_lhs, unparse_range_membership, unparse_coalesce_start}
 import free_names.{closure_read_names}
 import formatter.{effect_op_sig_text, format_param_renamed, fn_sig_text, fn_sig_text_renamed, type_param_list_text, format_type_param_binder, format_pattern}
+import layout.{tid_has_c_shape}
 import import_edit.{ImportEdit, ImportNeed, import_aliased_edit, import_module_edit, import_need}
 import parser.{
     node_written_span, effect_derived_ops, effect_ops, effect_decl_ops, node_load_rank, parser_load_order_moved, parser_live_ranges,
@@ -2067,10 +2068,16 @@ let mut tc_trait_args: TraitArgMemos = new_trait_arg_memos()
 fn new_trait_arg_memos() -> TraitArgMemos {
     TraitArgMemos { impl_args: Map(), bound_insts: Map(), impl_assoc: Map(), projections: [] }
 }
-// The impls over a user generic type that are checked and emitted per instance: impl node to
-// the receiver type's declaration. Written beside the receiver tid; read through
-// tc_poly_user_impl_decl.
-let mut tc_poly_user_impls: Map[Int, Int] = Map()
+// Which generic impls are checked and emitted per instance, keyed by impl node.
+// user_decl: an impl over a user generic type, to the receiver type's declaration. Written
+// beside the receiver tid; read through tc_poly_user_impl_decl.
+// body_binder: an impl over a List, Map or Set whose method body needs one body per receiver
+// instance (tc_mark_body_binder_impls); read through impl_is_element_agnostic.
+type PolyImplFacts {
+    user_decl: Map[Int, Int]
+    body_binder: Map[Int, Int]
+}
+let mut tc_poly_impls: PolyImplFacts = PolyImplFacts { user_decl: Map(), body_binder: Map() }
 // The impl or trait block that declares each method, keyed by method node. A call knows its
 // method's declaration, and only the block says what module it reads in and, for an impl,
 // what the method's type variables stand for.
@@ -15063,7 +15070,7 @@ fn tc_record_poly_user_impl(im: Int, recv: Int) {
         if type_kind(a) != TyKind.Typevar || tc_tid_binder(a) != sublist_get(binders_sl, i) { return }
         i = i + 1
     }
-    tc_poly_user_impls.insert(im, decl)
+    tc_poly_impls.user_decl.insert(im, decl)
 }
 
 // Whether the type arguments of `t` are the binders `binders_sl`, each once and in order.
@@ -15081,12 +15088,12 @@ fn tc_tid_args_are_binders(t: Int, binders_sl: Int) -> Bool {
 
 // Pure, so mono and codegen read the one decision typecheck made.
 pub fn tc_impl_is_poly_user(im: Int) -> Bool {
-    tc_poly_user_impls.contains_key(im)
+    tc_poly_impls.user_decl.contains_key(im)
 }
 
 // The receiver type's declaration of a per-instance user impl, or -1 for any other impl.
 pub fn tc_poly_user_impl_decl(im: Int) -> Int {
-    tc_poly_user_impls.get(im) ?? -1
+    tc_poly_impls.user_decl.get(im) ?? -1
 }
 
 // The declaration of the type an impl's receiver resolved to in the impl's own module, -1 for a
@@ -20653,7 +20660,8 @@ fn validate_trait_impls_in_own_modules(program: Int) ! TypeCheck.Register, TypeC
         //     `impl for Set`/`impl for Map`), so they route to the same eager
         //     path. A TYPE-DEPENDENT Set/Map poly impl (a binder in a method
         //     signature) would need per-element monomorphization that is not
-        //     built yet, so it must still trip E0908.
+        //     built yet, so it must still trip E0908. Bodies are not typed yet
+        //     here, so tc_mark_body_binder_impls reports the body form later.
         //  3. A user generic struct or enum whose receiver arguments are the
         //     binders in order (`impl[T] X for Box[T]`, `impl[A, B] X for
         //     Pair[A, B]`): monomorphized per receiver instance.
@@ -21155,7 +21163,7 @@ fn init_types() ! TypeCheck.Register {
     tc_namesake_type_modules = Map()
     tc_impl_recv_tids = Map()
     tc_trait_args = new_trait_arg_memos()
-    tc_poly_user_impls = Map()
+    tc_poly_impls = PolyImplFacts { user_decl: Map(), body_binder: Map() }
     tc_method_block = Map()
     tc_active_tparams.clear()
     tc_hash_oblig = Map()
@@ -49737,6 +49745,9 @@ pub fn tc_stamp_program(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Dia
     tc_flush_unresolved_methods(false)
     tc_report_literals_out_of_range(order)
     tc_report_ffi_scope_reads(order)
+    // Before mono and codegen read the rule, and after inference, since a body's types are
+    // what decide it.
+    tc_mark_body_binder_impls(program)
     // A program that already has an error has nodes inference deliberately never typed: the
     // arm that would have typed them reported instead and returned. Asserting there turns
     // every ordinary type error into an internal-compiler-error cascade, so the total-stamp
@@ -49862,14 +49873,17 @@ fn tc_collect_type_ann_names(ann: Int, out: List[Str]) {
     }
 }
 
-// True when no impl binder is bounded and neither a binder name nor `Self` appears in any
-// method signature, its own binders' bounds included. Such an impl cannot materialize an element by value nor operate on
-// one, so it is accepted where a per-element poly impl would not be.
+// True when no impl binder is bounded, neither a binder name nor `Self` appears in any
+// method signature (its own binders' bounds included), and no method body needs one body
+// per receiver instance (tc_mark_body_binder_impls). Such an impl cannot materialize an
+// element by value nor operate on one, so it is accepted where a per-element poly impl
+// would not be. The body part is known only after tc_stamp_program.
 pub fn impl_is_element_agnostic(im: Int) -> Int {
     let binders_sl = node_impl_binders(im)
     if binders_sl == -1 { return 1 }
     let nb = sublist_length(binders_sl)
     if nb == 0 { return 1 }
+    if tc_poly_impls.body_binder.contains_key(im) { return 0 }
     // A where-clause bounds a binder just as an inline `[T: Bound]` does.
     let where_sl = node_impl_where_bounds(im)
     if where_sl != -1 && sublist_length(where_sl) != 0 { return 0 }
@@ -49928,6 +49942,218 @@ pub fn impl_is_element_agnostic(im: Int) -> Int {
         j = j + 1
     }
     1
+}
+
+// A method body of an agnostic impl over a List, Map or Set can still need one body per
+// receiver instance: it holds a value whose C type names a binder (a local, loop variable,
+// match binding or closure parameter of type `T`, or `Some(self)`), or it calls generic code
+// that mono must instance at a binder (`self.skip(1)`, `cnt(self)`, or a method of a
+// per-instance impl). Such an impl is not agnostic. A List impl then gets one body per
+// instance; a Map or Set impl has no per-instance bodies yet, so it is E0908, as the same
+// mention in its signature is. Marking an impl makes it per instance, which can make the
+// impls that call it per instance too, so the walk repeats until no impl changes.
+fn tc_mark_body_binder_impls(program: Int) ! TypeCheck.Resolve, Diag.Report {
+    let impls_sl = node_methods(program)
+    if impls_sl == -1 { return }
+    let mut cands: List[Int] = []
+    let mut ii = 0
+    while ii < sublist_length(impls_sl) {
+        let im = sublist_get(impls_sl, ii)
+        ii = ii + 1
+        let binders_sl = node_impl_binders(im)
+        if binders_sl == -1 || sublist_length(binders_sl) == 0 { continue }
+        if impl_is_element_agnostic(im) == 0 { continue }
+        let rk = tc_tid_kind(tc_resolve(tc_impl_recv_tid(im)))
+        if rk == TyKind.List || rk == TyKind.Map || rk == TyKind.Set { cands.push(im) }
+    }
+    let mut changed = true
+    while changed {
+        changed = false
+        let per_inst = tc_per_instance_list_methods(impls_sl)
+        for im in cands {
+            if tc_poly_impls.body_binder.contains_key(im) { continue }
+            if !tc_impl_body_needs_instances(im, per_inst) { continue }
+            tc_poly_impls.body_binder.insert(im, 1)
+            changed = true
+        }
+    }
+    for im in cands {
+        if !tc_poly_impls.body_binder.contains_key(im) { continue }
+        let rk = tc_tid_kind(tc_resolve(tc_impl_recv_tid(im)))
+        trace.log("blink.tc_body_binder", "impl at node {im} over {tk_name(rk)}: a method body needs one body per receiver type")
+        if rk != TyKind.List {
+            diag_error_at("PolyImplUnsupported", POLY_IMPL_UNSUPPORTED, "polymorphic impls are not yet compiled", im, "a method body here holds a value of a binder's type, such as a key, an element or `Some(self)`, or passes one to generic code, which needs one body per receiver type; write a separate impl per concrete type for now")
+        }
+    }
+}
+
+// The method names of the List impls mono emits per instance. Typecheck records no decl for
+// a call of one, and mono finds it by its name alone (poly_methods.by_name), so a call by that
+// name on a List reaches it unless a built-in List method takes the name.
+fn tc_per_instance_list_methods(impls_sl: Int) -> Map[Str, Int] ! TypeCheck.Resolve, Diag.Report {
+    let mut out: Map[Str, Int] = Map()
+    let mut ii = 0
+    while ii < sublist_length(impls_sl) {
+        let im = sublist_get(impls_sl, ii)
+        ii = ii + 1
+        let binders_sl = node_impl_binders(im)
+        if binders_sl == -1 || sublist_length(binders_sl) == 0 { continue }
+        if tc_tid_kind(tc_resolve(tc_impl_recv_tid(im))) != TyKind.List { continue }
+        if impl_is_element_agnostic(im) != 0 { continue }
+        let methods_sl = node_methods(im)
+        if methods_sl == -1 { continue }
+        let mut mi = 0
+        while mi < sublist_length(methods_sl) {
+            out.insert(node_name(sublist_get(methods_sl, mi)), 1)
+            mi = mi + 1
+        }
+    }
+    out
+}
+
+fn tc_impl_body_needs_instances(im: Int, per_inst: Map[Str, Int]) -> Bool {
+    let binders_sl = node_impl_binders(im)
+    let methods_sl = node_methods(im)
+    if methods_sl == -1 { return false }
+    let mut kids: List[Int] = []
+    let mut mi = 0
+    while mi < sublist_length(methods_sl) {
+        let body = node_body(sublist_get(methods_sl, mi))
+        mi = mi + 1
+        if body == -1 { continue }
+        let mut stack: List[Int] = [body]
+        while stack.len() > 0 {
+            let n = stack.pop().unwrap()
+            let t = tc_lookup_node_tid(n)
+            if t >= 0 {
+                let r = tc_resolve(t)
+                if tc_tid_needs_binder_c(r, binders_sl) { return true }
+                // A closure's own C function takes and returns its parameter and result types,
+                // though the Fn value itself is one pointer.
+                if node_kind(n) == NodeKind.Closure && tc_tid_kind(r) == TyKind.Fn {
+                    let mut ci = 0
+                    while ci < tc_tid_child_count(r) {
+                        if tc_tid_needs_binder_c(tc_resolve(tc_tid_child(r, ci)), binders_sl) { return true }
+                        ci = ci + 1
+                    }
+                }
+            }
+            if tc_reaches_instanced_code(n, per_inst) && tc_call_names_binder(n, binders_sl) { return true }
+            // A spread copies each element of its source into the new list, so the element
+            // type needs a C layout, as a local of that type does.
+            if node_kind(n) == NodeKind.SpreadExpr {
+                let src = tc_resolve(tc_lookup_node_tid(node_value(n)))
+                if src >= 0 && tc_tid_child_count(src) > 0 && tc_tid_needs_binder_c(tc_resolve(tc_tid_child(src, 0)), binders_sl) { return true }
+            }
+            kids.clear()
+            node_push_value_child_ids(n, kids)
+            for k in kids { stack.push(k) }
+        }
+    }
+    false
+}
+
+// Whether node `n` reaches code that mono instances per call: a generic fn or method, a
+// method of a per-instance impl, or a std generic that a builtin method stands for. The
+// routes are those mono's discover_* steps take; a shared body cannot give such code a
+// binder, since the binder has no type there.
+fn tc_reaches_instanced_code(n: Int, per_inst: Map[Str, Int]) -> Bool {
+    let k = node_kind(n)
+    if k == NodeKind.Ident { return tc_decl_is_instanced(tc_fn_value_decl_node(n)) }
+    if k != NodeKind.Call && k != NodeKind.MethodCall { return false }
+    if tc_decl_is_instanced(tc_call_decl_node(n)) { return true }
+    if k != NodeKind.MethodCall { return false }
+    let obj = node_obj(n)
+    if obj == -1 { return false }
+    let method = node_method(n)
+    let rk = tc_tid_kind(tc_resolve(tc_lookup_node_tid(obj)))
+    if rk == TyKind.List && (tc_is_sealed_list_hof(method) != 0 || tc_is_list_generic_adapter(method) != 0) { return true }
+    // A built-in List method answers its own name before any impl does.
+    let builtin = tc_builtin_method_arity(rk, method) >= 0 && is_builtin_method_on_receiver(rk, method) != 0
+    if rk == TyKind.List && !builtin && per_inst.contains_key(method) { return true }
+    if tc_map_generic_adapter(rk, method) != "" { return true }
+    iterator_route_name(tc_lookup_node_tid(obj), method) != ""
+}
+
+// The std.iter fn a method call on this receiver stands for, or "". An Iterator method is
+// `iter_<method>`; `into_iter` on a List, Set or Str builds the recipe over it, and on an
+// Iterator it is the receiver itself, so it names nothing. Only an integer bound has a
+// RangeStep impl, so a range of any other bound names nothing.
+pub fn iterator_route_name(recv_tid: Int, method: Str) -> Str {
+    let tid = tc_resolve(recv_tid)
+    let kind = tc_tid_kind(tid)
+    if kind == TyKind.Iterator && tc_is_iterator_method(method) == 1 { return "iter_{method}" }
+    if method != "into_iter" { return "" }
+    if kind == TyKind.List { return "iter_from_list" }
+    if kind == TyKind.Set { return "iter_from_set" }
+    if kind == TyKind.Str { return "iter_from_str" }
+    if kind == TyKind.Range && range_bound_steps(tc_tid_kind(tc_resolve(tc_tid_child(tid, 0)))) { return "iter_from_range" }
+    ""
+}
+
+fn range_bound_steps(bound: TyKind) -> Bool {
+    match bound {
+        TyKind.Int | TyKind.I8 | TyKind.I16 | TyKind.I32 => true
+        TyKind.U8 | TyKind.U16 | TyKind.U32 | TyKind.U64 => true
+        _ => false
+    }
+}
+
+fn tc_decl_is_instanced(d: Int) -> Bool {
+    if d < 0 { return false }
+    let own = node_type_params(d)
+    // An FFI-bridged generic is one type-erased C symbol, never an instance.
+    if own != -1 && sublist_length(own) != 0 { return get_annotation(d, "ffi") == -1 }
+    let block = tc_method_block.get(d) ?? -1
+    if block < 0 || node_kind(block) != NodeKind.ImplBlock { return false }
+    let binders_sl = node_impl_binders(block)
+    if binders_sl == -1 || sublist_length(binders_sl) == 0 { return false }
+    tc_impl_is_poly_user(block) || impl_is_element_agnostic(block) == 0
+}
+
+// Whether the call or fn value at `n` gives the code it reaches a type that names a binder,
+// at any depth: the callee is instanced at that type, so a pointer container does not hide it.
+fn tc_call_names_binder(n: Int, binders_sl: Int) -> Bool {
+    if tc_tid_names_binder(tc_lookup_node_tid(n), binders_sl) { return true }
+    if node_kind(n) == NodeKind.MethodCall && tc_tid_names_binder(tc_lookup_node_tid(node_obj(n)), binders_sl) { return true }
+    if node_kind(n) == NodeKind.Ident { return false }
+    // A type parameter that only an explicit type argument fills (`touch[T]()`) shows in no
+    // argument or result; mono reads it from the call's minted slots.
+    let d = tc_call_decl_node(n)
+    let own = if d >= 0 { node_type_params(d) } else { -1 }
+    if own != -1 {
+        let mut pi = 0
+        while pi < sublist_length(own) {
+            if tc_tid_names_binder(tc_ret_mint_at(n, sublist_length(own), pi), binders_sl) { return true }
+            pi = pi + 1
+        }
+    }
+    let args_sl = node_args(n)
+    if args_sl == -1 { return false }
+    let mut i = 0
+    while i < sublist_length(args_sl) {
+        let mut arg = sublist_get(args_sl, i)
+        if node_kind(arg) == NodeKind.NamedArg { arg = node_value(arg) }
+        if tc_tid_names_binder(tc_lookup_node_tid(arg), binders_sl) { return true }
+        i = i + 1
+    }
+    false
+}
+
+// Whether a value of `tid` needs C that differs per binder value. Layout answers the shape
+// question, so a binder held under a pointer container shares one body.
+fn tc_tid_needs_binder_c(tid: Int, binders_sl: Int) -> Bool {
+    tc_tid_names_binder(tid, binders_sl) && !tid_has_c_shape(tid)
+}
+
+fn tc_tid_names_binder(tid: Int, binders_sl: Int) -> Bool {
+    if tid < 0 { return false }
+    let mut i = 0
+    while i < sublist_length(binders_sl) {
+        if tc_tid_mentions_binder(tid, sublist_get(binders_sl, i)) { return true }
+        i = i + 1
+    }
+    false
 }
 
 // ── Effect rows (E0500) ──────────────────────────────────────────────

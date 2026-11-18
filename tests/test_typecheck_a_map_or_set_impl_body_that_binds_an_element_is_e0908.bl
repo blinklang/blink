@@ -1,0 +1,97 @@
+// A Map or Set impl whose body binds a value of a binder's type, such as a key in
+// `for k in self.keys()` or `Some(self)`, has C that differs per receiver instance, as a
+// binder in a signature does. Only a List receiver compiles one body per instance today, so
+// check refuses it with E0908 at the impl. A body that passes a binder's type to generic
+// code, such as `cnt(self.keys())`, is refused the same way, since that code is instanced at
+// the binder. A body that names a binder only under a List, Map
+// or Set, such as `self.keys().len()`, keeps one shared body and is admitted.
+
+import std.fs
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_reset}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+import compile_test_helpers
+
+fn probe(name: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO, Process.Spawn {
+    init_embedded_stdlib()
+    let path = "{compile_test_helpers.scratch_root()}/_tc_body_poly_builtin_{name}.bl"
+    fs.write(path, src).unwrap()
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+}
+
+// Each error as "CODE@line:col".
+fn errors_of(name: Str, src: Str) -> List[Str] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO, Process.Spawn {
+    probe(name, src)
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" { out.push("{d.code}@{d.line}:{d.col}") }
+    }
+    out
+}
+
+// The trait on line 1, the impl on line 2.
+fn impl_of(recv: Str, binders: Str, body: Str) -> Str {
+    "trait Tr \{ fn n(self) -> Int }\nimpl[{binders}] Tr for {recv} \{ fn n(self) -> Int \{\n{body}\n} }\nfn main() \{}\n"
+}
+
+fn expect_e0908(name: Str, src: Str) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO, Process.Spawn {
+    let errs = errors_of(name, src)
+    if errs.len() == 1 && errs.get(0).unwrap() == "E0908@2:1" { return "" }
+    "{name}: want one error E0908@2:1, got {errs.len()}:\n  {errs.join("\n  ")}"
+}
+
+fn expect_none(name: Str, src: Str) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO, Process.Spawn {
+    let errs = errors_of(name, src)
+    if errs.len() == 0 { return "" }
+    "{name}: want no error, got:\n  {errs.join("\n  ")}"
+}
+
+fn report(problems: List[Str]) ! IO.Eprint {
+    let mut bad = false
+    for p in problems {
+        if p != "" {
+            io.eprintln(p)
+            bad = true
+        }
+    }
+    assert(!bad)
+}
+
+test "a Map impl body that binds a key, a value or Some(self) is refused" {
+    report([
+        expect_e0908("map_key_loop", impl_of("Map[K, V]", "K, V", "let mut c = 0\nfor _k in self.keys() \{ c = c + 1 }\nc")),
+        expect_e0908("map_value_local", impl_of("Map[K, V]", "K, V", "let vs = self.values()\nlet v = vs.get(0)\nif v.is_some() \{ 1 } else \{ 0 }")),
+        expect_e0908("map_some_self", impl_of("Map[K, V]", "K, V", "let x = Some(self)\nx.unwrap().len()")),
+        expect_e0908("map_opt_self", impl_of("Map[K, V]", "K, V", "let o: Option[Self] = Some(self)\no.unwrap().len()")),
+    ])
+}
+
+test "a Map or Set impl body that calls generic code at a binder is refused" {
+    let cnt = "fn cnt[U](l: List[U]) -> Int \{ l.len() }\n"
+    report([
+        expect_e0908("map_generic_keys", "{impl_of("Map[K, V]", "K, V", "cnt(self.keys())")}{cnt}"),
+        expect_e0908("set_generic_id", "{impl_of("Set[T]", "T", "id(self).len()")}fn id[U](u: U) -> U \{ u }\n"),
+    ])
+}
+
+test "a Set impl body that binds an element is refused" {
+    report([
+        expect_e0908("set_loop", impl_of("Set[T]", "T", "let mut c = 0\nfor _e in self \{ c = c + 1 }\nc")),
+        expect_e0908("set_tuple", impl_of("Set[T]", "T", "let p = (self, 1)\np.1")),
+    ])
+}
+
+test "a Map or Set impl body that names a binder only under a List, Map or Set is admitted" {
+    report([
+        expect_none("map_keys_len", impl_of("Map[K, V]", "K, V", "self.keys().len()")),
+        expect_none("map_values_len", impl_of("Map[K, V]", "K, V", "let vs = self.values()\nvs.len()")),
+        expect_none("map_self_local", impl_of("Map[K, V]", "K, V", "let s: Self = self\ns.len()")),
+        expect_none("set_len", impl_of("Set[T]", "T", "self.len()")),
+        expect_none("map_builtin_named_like_list_impl", "{impl_of("Map[K, V]", "K, V", "self.keys().take(1).len()")}trait Ext \{ fn take(self, n: Int) -> Option[Self] }\nimpl[T] Ext for List[T] \{ fn take(self, _n: Int) -> Option[Self] \{ Some(self) } }\n"),
+        expect_none("map_generic_at_int", "{impl_of("Map[K, V]", "K, V", "cnt([1, 2]) + self.len()")}fn cnt[U](l: List[U]) -> Int \{ l.len() }\n"),
+    ])
+}
