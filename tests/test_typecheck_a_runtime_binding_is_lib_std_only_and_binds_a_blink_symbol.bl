@@ -1,0 +1,132 @@
+// `@runtime("blink_symbol")` binds a function of the Blink runtime (§9.1 *`@runtime` — The
+// Runtime Bridge*). Only `lib/std` may write it, and its symbol starts with `blink_`; anything
+// else is InvalidRuntimeBinding (E0849) at the symbol string. It is a signature with no body,
+// it writes its real effect row (so `! ()` is E0564), it can be `pub`, and it binds a
+// module-level fn only (E1110 on a method, §11.1).
+//
+// A module is in `lib/std` when it is loaded as `std.*`. Each std row writes its module under
+// a root of its own and reaches it through BLINK_ROOT, which the compiler reads for a std
+// module its own lib/ lacks.
+
+import std.fs
+import std.process.{ProcessResult}
+import std.json.{json_clear, json_parse, json_get, json_as_str, json_as_int}
+import compile_test_helpers
+
+fn sh(cmd: Str) -> ProcessResult ! Process.Spawn {
+    process.run("sh", ["-c", cmd]).unwrap()
+}
+
+// Each diagnostic of `severity` in a file whose path holds `file_part`, as
+// "CODE@line:col-end_col".
+fn rows(r: ProcessResult, severity: Str, file_part: Str) -> List[Str] {
+    let mut out: List[Str] = []
+    for line in "{r.out}\n{r.err_out}".split("\n") {
+        if !line.starts_with("\{\"severity\"") { continue }
+        json_clear()
+        let row = json_parse(line)
+        if json_as_str(json_get(row, "severity")) != severity { continue }
+        let span = json_get(row, "span")
+        if !json_as_str(json_get(span, "file")).contains(file_part) { continue }
+        out.push("{json_as_str(json_get(row, "code"))}@{json_as_int(json_get(span, "line"))}:{json_as_int(json_get(span, "col"))}-{json_as_int(json_get(span, "end_col"))}")
+    }
+    out
+}
+
+// Checks `src` as a plain program file: a module of the user's own package.
+fn check_user(tag: Str, src: Str) -> ProcessResult ! FS.Write, Process.Spawn, Env.Read {
+    let dir = "{compile_test_helpers.scratch_root()}/rtb_user_{tag}"
+    sh("rm -rf {dir} && mkdir -p {dir}")
+    fs.write("{dir}/zz_user.bl", src).unwrap()
+    let me = sh("pwd").out.trim()
+    sh("cd {dir} && env -u BLINK_ROOT {me}/build/blink check --json zz_user.bl")
+}
+
+// Checks a program that imports `std.zz_rt_<tag>`, whose text is `src`.
+fn check_std(tag: Str, src: Str) -> ProcessResult ! FS.Write, Process.Spawn, Env.Read {
+    let dir = "{compile_test_helpers.scratch_root()}/rtb_std_{tag}"
+    sh("rm -rf {dir} && mkdir -p {dir}/root/lib/std {dir}/app")
+    fs.write("{dir}/root/lib/std/zz_rt_{tag}.bl", src).unwrap()
+    fs.write("{dir}/app/main.bl", "import std.zz_rt_{tag}\n\nfn main() \{\n    zz_rt_{tag}.touch()\n}\n").unwrap()
+    let me = sh("pwd").out.trim()
+    sh("cd {dir}/app && BLINK_ROOT={dir}/root {me}/build/blink check --json main.bl")
+}
+
+// The std module of a row: its declarations, then the `touch` the program calls.
+fn std_module(decls: Str) -> Str {
+    "{decls}\npub fn touch() \{}\n"
+}
+
+fn expect(label: Str, got: List[Str], want: List[Str]) -> Str {
+    if got.join(",") == want.join(",") { return "" }
+    "{label}: want [{want.join(", ")}], got [{got.join(", ")}]"
+}
+
+fn report(problems: List[Str]) ! IO.Eprint {
+    let mut bad = false
+    for p in problems {
+        if p != "" {
+            io.eprintln(p)
+            bad = true
+        }
+    }
+    assert(!bad)
+}
+
+test "@runtime outside lib/std is E0849 at the symbol string" {
+    let r = check_user("outside", "@runtime(\"blink_sb_write\")\nfn sb_write(s: Str)\n\nfn main() \{}\n")
+    report([expect("outside", rows(r, "error", "zz_user"), ["E0849@1:10-26"])])
+}
+
+test "@runtime in lib/std on a symbol without the blink_ prefix is E0849 at the symbol string" {
+    let r = check_std("off", std_module("@runtime(\"strlen\")\nfn zz_len(s: Str) -> Int\n"))
+    let u = check_std("under", std_module("@runtime(\"__blink_x\")\nfn zz_x()\n"))
+    report([
+        expect("strlen", rows(r, "error", "zz_rt_off"), ["E0849@1:10-18"]),
+        expect("__blink_", rows(u, "error", "zz_rt_under"), ["E0849@1:10-21"]),
+    ])
+}
+
+test "@runtime in lib/std on a blink_ symbol checks clean, with a real effect row, pub or not" {
+    let src = "@runtime(\"blink_rand_int\")\nfn rand_int(lo: Int, hi: Int) -> Int ! Rand\n\n@runtime(\"blink_rand_float\")\npub fn rand_float() -> Float ! Rand\n\npub fn pick(n: Int) -> Int ! Rand \{\n    rand_int(n, n)\n}\n"
+    let r = check_std("clean", std_module(src))
+    report([
+        expect("errors", rows(r, "error", "zz_rt_clean"), []),
+        expect("warnings", rows(r, "warning", "zz_rt_clean"), []),
+        if r.success() && r.out.contains("\"status\":\"ok\"") { "" } else { "clean: check did not pass\nout: {r.out}\nerr: {r.err_out}" },
+    ])
+}
+
+test "@runtime with the empty row ! () is E0564" {
+    let r = check_std("empty_row", std_module("@runtime(\"blink_rand_int\")\nfn rand_int(lo: Int, hi: Int) -> Int ! ()\n"))
+    let codes = rows(r, "error", "zz_rt_empty_row").map(fn(s: Str) -> Str { s.split("@").get(0) ?? "" })
+    report([expect("empty row", codes, ["E0564"])])
+}
+
+test "@runtime on a method is E1110 at the annotation" {
+    let r = check_std("method", std_module("trait Rr \{\n    fn r(self, lo: Int, hi: Int) -> Int ! Rand\n}\n\ntype Zz \{ n: Int }\n\nimpl Rr for Zz \{\n    @runtime(\"blink_rand_int\")\n    fn r(self, lo: Int, hi: Int) -> Int ! Rand\n}\n"))
+    let codes = rows(r, "error", "zz_rt_method").map(fn(s: Str) -> Str { s.split("@").get(0) ?? "" })
+    let says = "{r.out}{r.err_out}".contains("`@runtime` does not apply to a method")
+    report([
+        expect("method", codes, ["E1110"]),
+        if says { "" } else { "method: the E1110 message does not name `@runtime`\nout: {r.out}" },
+    ])
+}
+
+test "@runtime with no symbol or two arguments is E1134" {
+    let bare = check_std("bare", std_module("@runtime\nfn zz_a()\n"))
+    let two = check_std("two", std_module("@runtime(\"blink_a\", \"blink_b\")\nfn zz_b()\n"))
+    report([
+        expect("bare", rows(bare, "error", "zz_rt_bare"), ["E1134@1:1-9"]),
+        expect("two", rows(two, "error", "zz_rt_two"), ["E1134@1:21-30"]),
+    ])
+}
+
+test "@runtime on a type or a let is E1110 at the annotation" {
+    let r = check_std("non_fn", std_module("@runtime(\"blink_x\")\ntype Tq \{ a: Int }\n\n@runtime(\"blink_y\")\nlet zy: Int = 3\n"))
+    let u = check_user("non_fn", "@runtime(\"blink_x\")\ntype Tq \{ a: Int }\n\nfn main() \{}\n")
+    report([
+        expect("std", rows(r, "error", "zz_rt_non_fn"), ["E1110@1:1-0", "E1110@4:1-0"]),
+        expect("user", rows(u, "error", "zz_user"), ["E1110@1:1-0"]),
+    ])
+}

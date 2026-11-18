@@ -1507,6 +1507,19 @@ pub fn has_annotation(node: Int, name: Str) -> Int {
     if get_annotation(node, name) != -1 { 1 } else { 0 }
 }
 
+// The annotation that binds a fn to a symbol defined outside Blink: `@ffi` for a C function,
+// `@runtime` for a function of the Blink runtime (§9.1). Either one makes the fn a signature
+// whose body is that symbol. -1 when it is neither. A rule about C bindings reads `@ffi` alone.
+pub fn foreign_binding_annotation(fn_node: Int) -> Int {
+    let ffi = get_annotation(fn_node, "ffi")
+    if ffi != -1 { return ffi }
+    get_annotation(fn_node, "runtime")
+}
+
+pub fn is_foreign_binding(fn_node: Int) -> Bool {
+    foreign_binding_annotation(fn_node) != -1
+}
+
 pub fn is_literal_string_part(part: Int) -> Int {
     if node_kind(part) == NodeKind.Ident && node_str_val(part) == node_name(part) { 1 } else { 0 }
 }
@@ -2473,6 +2486,7 @@ fn maybe_newline() ! Parse.Advance {
 fn annotation_sole_target(name: Str) -> Option[(NodeKind, Str)] {
     match name {
         "handle_all" => Some((NodeKind.EffectDecl, "an effect declaration"))
+        "runtime" => Some((NodeKind.FnDef, "a module-level function"))
         _ => None
     }
 }
@@ -2549,18 +2563,19 @@ fn check_let_has_initializer(lb: Int) ! Diag.Report {
         "write `= <value>`, or add `@ffi(\"NAME\", header: \"...\")` for a constant from a C header")
 }
 
-// A fn in an `impl` or `trait` block is no `@ffi` target: its first parameter can be a receiver,
-// which has no C form, and the impl chooses its C name (§9.1 *`@ffi` Binds a Module-Level
-// Function*). The annotation stays on the fn, so no later stage reads the bodiless signature as
-// a second fault.
-fn reject_ffi_on_method() ! Diag.Report {
+// A fn in an `impl` or `trait` block is no `@ffi` or `@runtime` target: its first parameter can
+// be a receiver, which has no C form, and the impl chooses its C name (§9.1 *`@ffi` Binds a
+// Module-Level Function*, §11.1). The annotation stays on the fn, so no later stage reads the
+// bodiless signature as a second fault.
+fn reject_binding_on_method() ! Diag.Report {
     for ann in annotations.item {
-        if node_name(ann) == "ffi" {
+        let name = node_name(ann)
+        if name == "ffi" || name == "runtime" {
             let line = node_line(ann)
             let col = node_col(ann)
             let end_col = if node_end_line(ann) == line { node_end_col(ann) } else { col + 1 }
-            diag_error_span_label_at_notes("UnexpectedAnnotation", UNEXPECTED_ANNOTATION, "`@ffi` does not apply to a method", ann, line, col, end_col,
-                "`@ffi` binds a module-level function", "declare a module-level `@ffi fn` and call it from the method", [])
+            diag_error_span_label_at_notes("UnexpectedAnnotation", UNEXPECTED_ANNOTATION, "`@{name}` does not apply to a method", ann, line, col, end_col,
+                "`@{name}` binds a module-level function", "declare a module-level `@{name} fn` and call it from the method", [])
         }
     }
 }
@@ -2962,6 +2977,7 @@ fn parse_annotation() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
             while !at(TokenKind.RParen) && !at(TokenKind.EOF) {
                 if at(TokenKind.StringStart) {
                     let str_nd = parse_interp_string()
+                    end_annotation_string(str_nd)
                     ann_arg_nodes.push(str_nd)
                 } else {
                     let arg_name = expect_value(TokenKind.Ident)
@@ -2971,6 +2987,7 @@ fn parse_annotation() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
                         skip_newlines_and_comments()
                         if at(TokenKind.StringStart) {
                             let val_nd = parse_interp_string()
+                            end_annotation_string(val_nd)
                             node_set_name(val_nd, full_arg)
                             ann_arg_nodes.push(val_nd)
                         } else {
@@ -3024,6 +3041,14 @@ fn parse_annotation() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
         end_line: ann_end_l, end_col: ann_end_c,
     })
     ann_nd
+}
+
+// A check that refuses an annotation's string argument reports at that string, so the string
+// keeps its end when it sits on one line.
+fn end_annotation_string(str_nd: Int) {
+    if tokens.lines.get(pos - 1).unwrap() == node_line(str_nd) {
+        node_set_end_pos(str_nd, node_line(str_nd), tokens.end_cols.get(pos - 1).unwrap())
+    }
 }
 
 // ── Top-level ───────────────────────────────────────────────────────
@@ -4151,18 +4176,18 @@ fn parse_fn_def() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
     nd
 }
 
-// Only a trait method, an effect operation and an `@ffi` fn are a signature with no body
-// (sections/03_types.md 3.6, sections/04_effects.md `op_sig`,
+// Only a trait method, an effect operation, an `@ffi` fn and a `@runtime` fn are a signature
+// with no body (sections/03_types.md 3.6, sections/04_effects.md `op_sig`,
 // sections/07_trust_modules_metadata.md 9.1); any other bodiless fn has no code to emit.
 // A signature that already failed to parse lost its body to recovery, so a second error
 // there would be false.
 fn require_fn_body(f: Int, sig_failed: Bool) ! Diag.Report {
-    if sig_failed || node_body(f) != -1 || get_annotation(f, "ffi") != -1 { return }
+    if sig_failed || node_body(f) != -1 || is_foreign_binding(f) { return }
     let line = node_line(f)
     let col = node_col(f)
     // A signature on one line is marked whole; one that runs on marks its `fn`.
     let end_col = if node_end_line(f) == line { node_end_col(f) } else { col + 2 }
-    diag_error_range("UnexpectedToken", UNEXPECTED_TOKEN, "`fn {node_name(f)}` has no body", line, col, end_col, "write its body after the signature: `\{ ... }`. Only a trait method, an effect operation and an `@ffi` fn have no body")
+    diag_error_range("UnexpectedToken", UNEXPECTED_TOKEN, "`fn {node_name(f)}` has no body", line, col, end_col, "write its body after the signature: `\{ ... }`. Only a trait method, an effect operation, an `@ffi` fn and a `@runtime` fn have no body")
 }
 
 // An effect name in a row: `IO` or `Net.Connect`. A name that does not parse is "", so the
@@ -4472,7 +4497,7 @@ fn parse_trait_def() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
             annotations.item.push(parse_annotation())
         } else if at(TokenKind.Fn) {
             let fn_node = parse_fn_def()
-            reject_ffi_on_method()
+            reject_binding_on_method()
             attach_pending_annotations(fn_node)
             sublist_push(methods, fn_node)
         } else if at(TokenKind.Type) {
@@ -4581,7 +4606,7 @@ fn parse_impl_block() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
             let diags_before = diag_entry_count()
             let fn_node = parse_fn_def()
             let sig_failed = diag_any_errors_since(diags_before) != 0
-            reject_ffi_on_method()
+            reject_binding_on_method()
             attach_pending_annotations(fn_node)
             require_fn_body(fn_node, sig_failed)
             sublist_push(methods, fn_node)

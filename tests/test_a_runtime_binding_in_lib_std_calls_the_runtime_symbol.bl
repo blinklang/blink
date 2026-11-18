@@ -1,0 +1,46 @@
+// A `@runtime("blink_symbol")` declaration in `lib/std` is a signature with no body; a call to
+// it reaches the runtime function of that symbol (§9.1 *`@runtime` — The Runtime Bridge*). It
+// writes its real effect row, so a caller needs that effect, and the runtime function takes no
+// evidence of it.
+//
+// The std module here is one the shipped lib/std lacks, so the test builds a root that holds
+// the shipped lib/std plus that module, beside a copy of the compiler and its share/ (the
+// install root comes from realpath(argv[0])), and points BLINK_ROOT at it.
+
+import std.fs
+import std.process.{ProcessResult}
+import compile_test_helpers
+
+fn sh(cmd: Str) -> ProcessResult ! Process.Spawn {
+    process.run("sh", ["-c", cmd]).unwrap()
+}
+
+// A root at `tree` with bin/blink, share/ and lib/std of the compiler that runs the test, and
+// `module` as lib/std/zz_rt.bl.
+fn runtime_tree(tree: Str, module: Str) ! Process.Spawn, FS.Write {
+    let blink = sh("readlink -f build/blink").out.trim()
+    let bindir = sh("dirname {blink}").out.trim()
+    let home = sh("dirname {bindir}").out.trim()
+    sh("rm -rf {tree} && mkdir -p {tree}/bin {tree}/lib/std {tree}/app")
+    sh("cp {blink} {tree}/bin/blink")
+    // The archive and runtime.h sit in share/blink of an install, or beside the binary in a dev build/.
+    sh("if [ -d {home}/share ]; then cp -rL {home}/share {tree}/share; else mkdir -p {tree}/share/blink && for f in runtime.h libblink_std.a libblink_std.h skip_modules.txt .archive-id monolith.c; do [ -e {bindir}/$f ] && cp -L {bindir}/$f {tree}/share/blink/$f; done; fi")
+    // Every shipped std module is on disk, so none comes from the embedded copy and is compiled
+    // a second time beside the archive that already holds it.
+    let lib = sh("if [ -d {home}/lib/std ]; then echo {home}/lib; else echo $(pwd)/lib; fi").out.trim()
+    sh("for f in {lib}/std/*; do ln -s $(readlink -f $f) {tree}/lib/std/; done")
+    sh("[ -e {lib}/pkg ] && ln -s $(readlink -f {lib}/pkg) {tree}/lib/pkg")
+    fs.write("{tree}/lib/std/zz_rt.bl", module).unwrap()
+    fs.write("{tree}/app/main.bl", "import std.zz_rt\n\nfn main() \{\n    io.println(\"\{zz_rt.pick(5)}\")\n}\n").unwrap()
+}
+
+fn run_in(tree: Str) -> ProcessResult ! Process.Spawn {
+    sh("cd {tree}/app && env -u BLINK_PER_MODULE -u BLINK_COMPILER_ARCHIVE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE BLINK_ROOT={tree} BLINK_CACHE_DIR={tree}/cache ../bin/blink run main.bl")
+}
+
+test "a call to a lib/std @runtime declaration runs the runtime function" {
+    let tree = "{compile_test_helpers.scratch_root()}/runtime_binding_tree"
+    runtime_tree(tree, "@runtime(\"blink_rand_int\")\nfn rand_int(lo: Int, hi: Int) -> Int ! Rand\n\npub fn pick(n: Int) -> Int ! Rand \{\n    rand_int(n, n)\n}\n")
+    let r = run_in(tree)
+    assert_eq(r.out.trim(), "5", "out: {r.out}\nerr: {r.err_out}")
+}
