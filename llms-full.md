@@ -117,6 +117,17 @@ fn c_fopen(path: Ptr[U8], mode: Ptr[U8]) -> Option[CFile] ! IO { }
 
 `@ffi.opaque(header, name)` declares a nominal type for a C handle such as `FILE*` or `sqlite3*`. It lowers to a bare pointer. It has no deref, `==`, fields or arithmetic, and `Option[CFile]` uses `NULL` for `None`. `blink audit --ffi` lists it as `opaque-ffi-handle`. A struct literal whose head is an `@ffi.opaque` type is `E0300`.
 
+Write both `header` and `name`, in every package. Without one of them it is `E1134 AnnotationArguments` at the argument list, "`@ffi.opaque` needs both `header` and `name`", and the help prints the form `@ffi.opaque(header: "h.h", name: "c_type")`. A `name` that starts with `blink_` or `__blink_` is a C type of the Blink runtime, so it is `E0849 InvalidRuntimeBinding` at the name string, in `lib/std` too.
+
+`lib/std` declares a handle to a C type that the runtime owns with `@runtime` on a type with no body:
+
+```blink
+@runtime("blink_tcp_handle")
+pub type TcpHandle
+```
+
+It names no header: the runtime declares the C type. It follows the `@runtime` fn rules: only `lib/std`, and only a `blink_` symbol (`E0849`). It has no literal and no fields, as an `@ffi.opaque` type has none. A value comes from a `@runtime` fn that returns it, or from a `Ptr` cell read in an FFI region. `blink audit --ffi` does not list it. `@runtime` on a type with a body or on an alias is `E1110`.
+
 #### Closed state for a wrapper over a C handle
 
 A `Closeable` or `BlockHandler` wrapper over a C handle must make a second `close()` or `exit()` do nothing, and a call after close return an error. Keep the closed state behind the handle, not in a `Bool` field: values are copied, so a field flag in one copy goes stale in the others. Point the opaque type at a small C box that your shim allocates (GC memory, so it outlives the C resource). Close frees the resource and clears the box. Every shim checks the box first:

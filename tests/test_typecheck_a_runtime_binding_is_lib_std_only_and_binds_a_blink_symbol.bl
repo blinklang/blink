@@ -4,6 +4,12 @@
 // it writes its real effect row (so `! ()` is E0564), it can be `pub`, and it binds a
 // module-level fn only (E1110 on a method, §11.1).
 //
+// `@runtime("blink_x")` on a type with no body declares a handle to a C type the runtime owns
+// (§9.1.4 *A Runtime-Owned Handle*). The same gates apply, so a user package or a symbol
+// without the `blink_` prefix is E0849. The handle is inert, as an `@ffi.opaque` handle is,
+// and has no literal. A runtime-owned C type is never an `@ffi.opaque` name: a `blink_` name
+// there is E0849 in every package.
+//
 // A module is in `lib/std` when it is loaded as `std.*`. Each std row writes its module under
 // a root of its own and reaches it through BLINK_ROOT, which the compiler reads for a std
 // module its own lib/ lacks.
@@ -128,5 +134,70 @@ test "@runtime on a type or a let is E1110 at the annotation" {
     report([
         expect("std", rows(r, "error", "zz_rt_non_fn"), ["E1110@1:1-0", "E1110@4:1-0"]),
         expect("user", rows(u, "error", "zz_user"), ["E1110@1:1-0"]),
+    ])
+}
+
+test "a bodiless @runtime type in lib/std on a blink_ symbol checks clean, minted by a @runtime fn" {
+    let src = "@runtime(\"blink_tcp_handle\")\npub type ZzHandle\n\n@runtime(\"blink_tcp_handle_new\")\nfn zz_new(fd: Int) -> ZzHandle\n\n@runtime(\"blink_tcp_handle_fd\")\nfn zz_fd(h: ZzHandle) -> Int\n\npub fn zz_round(fd: Int) -> Int \{\n    let h = zz_new(fd)\n    zz_fd(h)\n}\n"
+    let r = check_std("handle", std_module(src))
+    report([
+        expect("errors", rows(r, "error", "zz_rt_handle"), []),
+        expect("warnings", rows(r, "warning", "zz_rt_handle"), []),
+        if r.success() && r.out.contains("\"status\":\"ok\"") { "" } else { "handle: check did not pass\nout: {r.out}\nerr: {r.err_out}" },
+    ])
+}
+
+test "a bodiless @runtime type outside lib/std is E0849 at the symbol string" {
+    let r = check_user("handle_outside", "@runtime(\"blink_tcp_handle\")\ntype ZzHandle\n\nfn main() \{}\n")
+    report([expect("outside", rows(r, "error", "zz_user"), ["E0849@1:10-28"])])
+}
+
+test "a bodiless @runtime type in lib/std on a symbol without the blink_ prefix is E0849" {
+    let r = check_std("handle_off", std_module("@runtime(\"tcp_handle\")\ntype ZzHandle\n"))
+    report([expect("off", rows(r, "error", "zz_rt_handle_off"), ["E0849@1:10-22"])])
+}
+
+test "a bodiless @runtime type with no symbol is E1134" {
+    let r = check_std("handle_bare", std_module("@runtime\ntype ZzHandle\n"))
+    report([expect("bare", rows(r, "error", "zz_rt_handle_bare"), ["E1134@1:1-9"])])
+}
+
+// The row form is `@runtime("symbol")` for a type as for a fn, and a handle names no header.
+test "a bodiless @runtime type with a second argument or a header is E1134 at the extra argument" {
+    let two = check_std("handle_two", std_module("@runtime(\"blink_tcp_handle\", \"blink_b\")\ntype ZzHandle\n"))
+    let hdr = check_std("handle_hdr", std_module("@runtime(\"blink_tcp_handle\", header: \"h.h\")\ntype ZzHandle\n"))
+    report([
+        expect("two", rows(two, "error", "zz_rt_handle_two"), ["E1134@1:30-39"]),
+        expect("hdr", rows(hdr, "error", "zz_rt_handle_hdr"), ["E1134@1:38-43"]),
+    ])
+}
+
+test "@runtime on a type alias is E1110 at the annotation" {
+    let r = check_std("alias", std_module("@runtime(\"blink_tcp_handle\")\ntype ZzAlias = Int\n"))
+    report([expect("alias", rows(r, "error", "zz_rt_alias"), ["E1110@1:1-0"])])
+}
+
+test "a bodiless @runtime type has no literal and no fields" {
+    let src = "@runtime(\"blink_tcp_handle\")\npub type ZzHandle\n\npub fn forge() -> ZzHandle \{ ZzHandle \{} }\n\npub fn peek(h: ZzHandle) -> Int \{ h.fd }\n"
+    let r = check_std("handle_inert", std_module(src))
+    let codes = rows(r, "error", "zz_rt_handle_inert").map(fn(s: Str) -> Str { s.split("@").get(0) ?? "" })
+    report([expect("inert", codes, ["E0300", "E0525"])])
+}
+
+test "an @ffi.opaque that names a blink_ C type is E0849 at the name string, in lib/std too" {
+    let decl = "@ffi.opaque(header: \"stdio.h\", name: \"blink_tcp_handle\")\npub type ZzHandle\n"
+    let s = check_std("opaque_blink", std_module(decl))
+    let u = check_user("opaque_blink", "{decl}\nfn main() \{}\n")
+    report([
+        expect("std", rows(s, "error", "zz_rt_opaque_blink"), ["E0849@1:38-56"]),
+        expect("user", rows(u, "error", "zz_user"), ["E0849@1:38-56"]),
+    ])
+}
+
+test "an @ffi.opaque that names a __blink_ C type is E0849, and the help says it has no binding form" {
+    let r = check_user("opaque_dunder", "@ffi.opaque(header: \"stdio.h\", name: \"__blink_box\")\ntype ZzBox\n\nfn main() \{}\n")
+    report([
+        expect("dunder", rows(r, "error", "zz_user"), ["E0849@1:38-51"]),
+        if "{r.out}\n{r.err_out}".contains("has no binding form") { "" } else { "dunder: help does not say a __blink_ symbol has no binding form\nout: {r.out}\nerr: {r.err_out}" },
     ])
 }

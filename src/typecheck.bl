@@ -9,7 +9,7 @@ import layout.{tid_has_c_shape}
 import import_edit.{ImportEdit, ImportNeed, import_aliased_edit, import_module_edit, import_need}
 import parser.{
     node_written_span, effect_derived_ops, effect_ops, effect_decl_ops, node_load_rank, parser_load_order_moved, parser_live_ranges,
-    ann_str_val, positional_str_arg, positional_str_arg_count, impl_provided_by_closeable, closeable_impl_of, sublist_remove_members, get_annotation, is_foreign_binding, get_str_named_arg, has_annotation, is_literal_string_part,
+    ann_str_val, positional_str_arg, positional_str_arg_count, impl_provided_by_closeable, closeable_impl_of, sublist_remove_members, get_annotation, is_foreign_binding, is_handle_type, runtime_handle_annotation, get_str_named_arg, has_annotation, is_literal_string_part,
     node_args, node_assoc_types, node_arms, node_body, node_captures, node_col, node_condition,
     node_effects, node_elements, node_else_body, node_end, node_fields, node_for_binder, node_guard,
     node_count, node_binder_col, node_handlers, node_index, node_int_val, node_is_compiler_known_type_ann, node_is_mut, node_is_const, node_is_pub, node_iterable, node_kind,
@@ -6218,7 +6218,7 @@ fn tc_report_unconstructible_head(stid: Int, sname: Str, node: Int) ! Diag.Repor
     if sname == "Self" && tc_current_self_tid == -1 { return }
     if tc_type_name_poisoned(sname) || (stid >= 0 && (tc_tid_is_no_info(stid) != 0 || type_kind(stid) == TyKind.Typevar)) { return }
     if stid >= 0 && ffi_opaque_type_set.contains_key(tc_resolve(stid)) {
-        diag_error_at("TypeError", TYPE_ERROR, "cannot construct @ffi.opaque handle `{sname}` outside the FFI boundary", node, "an opaque handle has no user-callable constructor; it is produced only at the FFI boundary (section 9.1.4)")
+        diag_error_at("TypeError", TYPE_ERROR, "cannot construct handle `{sname}` outside the FFI boundary", node, "a handle type (`@ffi.opaque`, or a `@runtime` type with no body) has no user-callable constructor; it is produced only at the FFI boundary (section 9.1.4)")
         return
     }
     diag_error_at("TypeError", TYPE_ERROR, "`{sname}` is not a constructible struct type", node, "struct-literal syntax Name \{ ... } requires Name to name a struct type")
@@ -16991,9 +16991,10 @@ fn register_struct_type(td: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.R
         ffi_struct_type_set.insert(tid, 1)
     }
 
-    if has_annotation(td, "ffi.opaque") != 0 {
+    if is_handle_type(td) {
         ffi_opaque_type_set.insert(tid, 1)
     }
+    validate_runtime_handle(td)
     if tc_check_ffi_struct_names_its_header_and_c_struct(td) {
         tc_warn_missing_canonical_header(td, "ffi.struct")
     }
@@ -17006,19 +17007,57 @@ fn register_struct_type(td: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.R
     }
 }
 
-// E1134 (§9.1.4, §11.1): `name` is the C type an @ffi.opaque handle points at, so without it
-// the type has no C spelling. The annotation is then invalid, and its header is not checked.
+// E1134 (§9.1.4, §11.1): `name` is the C type an @ffi.opaque handle points at and `header`
+// declares it, in every package, so without either the type has no C spelling. The annotation
+// is then invalid, and its header is not checked. E0849 (§9.1): a `blink_` C type belongs to
+// the runtime, whose handle is a bodiless `@runtime` type.
 fn tc_check_ffi_opaque_names_its_c_type(td: Int) -> Bool ! Diag.Report {
     let ann = get_annotation(td, "ffi.opaque")
-    if ann == -1 || get_str_named_arg(ann, "name") != "" { return true }
-    tc_report_annotation_arguments(
-        ann,
-        "@ffi.opaque '{node_name(td)}' does not name its C type",
-        "this names no C type",
-        "@ffi.opaque(header, name)",
-        "`name` is the C type the handle points at: `@ffi.opaque(header: \"stdio.h\", name: \"FILE\")`"
-    )
+    if ann == -1 { return true }
+    let no_header = get_str_named_arg(ann, "header") == ""
+    let no_name = get_str_named_arg(ann, "name") == ""
+    if no_header || no_name {
+        let absent = if no_header && no_name { "`header` and `name` are missing" } else if no_header { "`header` is missing" } else { "`name` is missing" }
+        tc_report_annotation_arguments(
+            ann,
+            "`@ffi.opaque` needs both `header` and `name`",
+            absent,
+            "@ffi.opaque(header: \"h.h\", name: \"c_type\")",
+            "`header` is the C header that declares the type and `name` is the C type the handle points at"
+        )
+        return false
+    }
+    let c_type = get_str_named_arg(ann, "name")
+    if !tc_is_runtime_symbol(c_type) { return true }
+    let name_arg = tc_named_ann_arg(ann, "name")
+    let line = node_line(name_arg)
+    let end_col = if node_end_line(name_arg) == line { node_end_col(name_arg) } else { 0 }
+    let help = if c_type.starts_with("__blink_") {
+        "a `__blink_` symbol is private to the runtime and has no binding form; for a C library type with such a name, wrap it in C under another name"
+    } else {
+        "a handle to a runtime type is `@runtime(\"blink_x\")` on a type with no body, in `lib/std`; for a C library type with such a name, wrap it in C under another name"
+    }
+    diag_error_span_label_at_notes("InvalidRuntimeBinding", INVALID_RUNTIME_BINDING,
+        "a `blink_` or `__blink_` C type belongs to the Blink runtime", name_arg, line, node_col(name_arg), end_col,
+        "this names a C type of the runtime", help, [])
     false
+}
+
+// The argument of annotation `ann` labelled `label`, or -1.
+fn tc_named_ann_arg(ann: Int, label: Str) -> Int {
+    let args = node_args(ann)
+    if args == -1 { return -1 }
+    for i in 0..sublist_length(args) {
+        let arg = sublist_get(args, i)
+        if node_name(arg) == label { return arg }
+    }
+    -1
+}
+
+// Whether `symbol` is in the namespace the runtime reserves (§9.1 *A `blink_` Symbol Belongs to
+// the Runtime*).
+fn tc_is_runtime_symbol(symbol: Str) -> Bool {
+    symbol.starts_with("blink_") || symbol.starts_with("__blink_")
 }
 
 // E1134 (§9.1.3, §11.1): an @ffi.struct mirrors the C struct `name` that `header` declares.
@@ -17423,7 +17462,7 @@ fn tc_check_derive_opaque_handle() ! Diag.Report {
                 if tc_derive_arg_trait(a) == "" { continue }
                 let tr = node_name(a)
                 diag_error_at("NonDerivableTrait", NON_DERIVABLE_TRAIT,
-                    "@derive({tr}) on `{tname}`: an @ffi.opaque handle exposes no fields, so {tr} cannot be synthesized for it",
+                    "@derive({tr}) on `{tname}`: a handle type exposes no fields, so {tr} cannot be synthesized for it",
                     a, "remove the derive, or implement {tr} by hand")
             }
         }
@@ -18838,10 +18877,25 @@ fn ffi_signature_end_col(fn_node: Int) -> Int {
 fn validate_runtime_fn(fn_node: Int) ! Diag.Report {
     let ann = get_annotation(fn_node, "runtime")
     if ann == -1 { return }
+    validate_runtime_binding(fn_node, ann, "function", "`@runtime(\"blink_rand_int\")`", "for a C function, use `@ffi(\"library\", \"symbol\")`")
+}
+
+// `@runtime("blink_x")` on a type with no body declares a handle to a C type that the runtime
+// owns (§9.1.4 *A Runtime-Owned Handle*). The gates of a `@runtime` fn apply to it; a C library
+// type goes through `@ffi.opaque`.
+fn validate_runtime_handle(td: Int) ! Diag.Report {
+    let ann = runtime_handle_annotation(td)
+    if ann == -1 { return }
+    validate_runtime_binding(td, ann, "type", "`@runtime(\"blink_tcp_handle\")`", "for a C type, use `@ffi.opaque(header: \"h.h\", name: \"c_type\")`")
+}
+
+// The checks every `@runtime` declaration shares: one symbol string (E1134), and only in
+// `lib/std`, on a `blink_` symbol (E0849). `what` names what the symbol is in the runtime.
+fn validate_runtime_binding(decl: Int, ann: Int, what: Str, example: Str, help: Str) ! Diag.Report {
     let args = node_args(ann)
     let count = if args == -1 { 0 } else { sublist_length(args) }
     if count == 0 {
-        tc_report_annotation_arguments(ann, "@runtime on '{node_name(fn_node)}' names no symbol", "this names no symbol", "@runtime(\"symbol\")", "`symbol` is the runtime function it binds: `@runtime(\"blink_rand_int\")`")
+        tc_report_annotation_arguments(ann, "@runtime on '{node_name(decl)}' names no symbol", "this names no symbol", "@runtime(\"symbol\")", "`symbol` is the runtime {what} it binds: {example}")
         return
     }
     let sym = sublist_get(args, 0)
@@ -18850,23 +18904,22 @@ fn validate_runtime_fn(fn_node: Int) ! Diag.Report {
     if bad != -1 {
         let line = node_line(bad)
         let end_col = if node_end_line(bad) == line { node_end_col(bad) } else { 0 }
-        diag_error_span_label_at_notes("AnnotationArguments", ANNOTATION_ARGUMENTS, "@runtime on '{node_name(fn_node)}' takes one symbol string", bad, line, node_col(bad), end_col,
+        diag_error_span_label_at_notes("AnnotationArguments", ANNOTATION_ARGUMENTS, "@runtime on '{node_name(decl)}' takes one symbol string", bad, line, node_col(bad), end_col,
             if bad == sym { "this is not a symbol string" } else { "this is an extra argument" },
-            "the form is `@runtime(\"symbol\")`, where `symbol` is the runtime function it binds: `@runtime(\"blink_rand_int\")`", [])
+            "the form is `@runtime(\"symbol\")`, where `symbol` is the runtime {what} it binds: {example}", [])
         return
     }
     let symbol = ann_str_val(sym)
-    let in_std = tc_decl_in_std(fn_node)
+    let in_std = tc_decl_in_std(decl)
     if in_std && symbol.starts_with("blink_") { return }
     let line = node_line(sym)
     let end_col = if node_end_line(sym) == line { node_end_col(sym) } else { 0 }
     let (message, label) = if !in_std {
         ("`@runtime` is reserved for `lib/std`", "this binds the Blink runtime, not a C library")
     } else {
-        ("`@runtime` binds only a `blink_` symbol of the runtime", "this symbol is not a `blink_` runtime function")
+        ("`@runtime` binds only a `blink_` symbol of the runtime", "this symbol is not a `blink_` runtime {what}")
     }
-    diag_error_span_label_at_notes("InvalidRuntimeBinding", INVALID_RUNTIME_BINDING, message, sym, line, node_col(sym), end_col, label,
-        "for a C function, use `@ffi(\"library\", \"symbol\")`", [])
+    diag_error_span_label_at_notes("InvalidRuntimeBinding", INVALID_RUNTIME_BINDING, message, sym, line, node_col(sym), end_col, label, help, [])
 }
 
 fn validate_ffi_fn(fn_node: Int) ! Diag.Report {
