@@ -882,6 +882,7 @@ fn sb_write(mut sb: StringBuilder, s: Str)
 - **It binds only runtime symbols.** The symbol must start with `blink_`. A symbol that does not is E0849 too. A C function, in `lib/std` or elsewhere, uses `@ffi`.
 - **It is not under the signature rule.** *Signature Types* applies to every `@ffi` declaration, with no exception.
 - **It is the only binding of a `blink_` symbol.** *A `blink_` Symbol Belongs to the Runtime* below.
+- **It declares a fn or a bodiless type.** `@runtime` on a fn binds a runtime function. `@runtime` on a type with no body declares a handle to a C type that the runtime owns (§9.1.4 *A Runtime-Owned Handle*). The same gates apply to both. `@runtime` on any other target is `UnexpectedAnnotation` (E1110, §11.1).
 
 ```
 error[E0849]: `@runtime` is reserved for `lib/std`
@@ -897,7 +898,7 @@ error[E0849]: `@runtime` is reserved for `lib/std`
 
 The prologue of every compiled program declares each `blink_*` and `__blink_*` symbol of the runtime. C has one flat namespace for symbols, so a user binding to such a symbol either clashes with the prototype of the runtime or reaches an interface that is private to the runtime. So the prefixes are reserved.
 
-A symbol that starts with `blink_` or `__blink_` is `InvalidRuntimeBinding` (E0849) when anything other than `@runtime` in `lib/std` binds it. This covers `@ffi` in the one-argument form, `@ffi` in the two-argument form (a C library that exports such a name is wrapped in C under another name; the help says so), and `@ffi let`. `@runtime` binds a `blink_` symbol only (above), so a `__blink_` symbol has no binding form at all. The compiler reports the error at the symbol string, in `blink check`, so a clean check promises the build (§6.7.1).
+A symbol that starts with `blink_` or `__blink_` is `InvalidRuntimeBinding` (E0849) when anything other than `@runtime` in `lib/std` binds it. This covers `@ffi` in the one-argument form, `@ffi` in the two-argument form (a C library that exports such a name is wrapped in C under another name; the help says so), `@ffi let`, and `@ffi.opaque` with a `name` that starts with `blink_` (§9.1.4). A runtime-owned C type is declared with `@runtime` on a bodiless type, not with `@ffi.opaque`. `@runtime` binds a `blink_` symbol only (above), so a `__blink_` symbol has no binding form at all. The compiler reports the error at the symbol string, in `blink check`, so a clean check promises the build (§6.7.1).
 
 ```blink
 @ffi("blink_bytes_len")                      // ERROR E0849: one-argument form
@@ -914,6 +915,9 @@ pub let FLAGS: Int
 @ffi("__blink_panic_dispatch")               // ERROR E0849: `__blink_` is reserved too
 @trusted(audit: "P")
 fn dispatch(msg: Str) ! ()
+
+@ffi.opaque(header: "runtime_tcp.h", name: "blink_tcp_handle")   // ERROR E0849: `@ffi.opaque` names a `blink_` type
+type Tcp
 
 @ffi("shim", "shim_bytes_len")            // OK: the symbol does not start with `blink_`
 @trusted(audit: "SHIM-1")
@@ -3130,9 +3134,22 @@ type Sqlite3
 
 @ffi.opaque(header: "sqlite3.h", name: "sqlite3_stmt")
 type Sqlite3Stmt
+
+@ffi.opaque(name: "sqlite3_blob")                       // ERROR E1134: `header` is missing
+type Sqlite3Blob
 ```
 
-`@ffi.opaque(header, name)` declares a **bare nominal, arity-0** handle type that mirrors a named, possibly-incomplete C type. The type has **no body** — no fields, no variants (a body is rejected). `header` is resolved against `[native-dependencies].headers` exactly as for `@ffi.struct` (§9.1.3). `name` is the C type the handle points at; the Blink type maps to the C pointer type `name *`. Because the pointee is incomplete, **no size or offset check applies** (the deliberate contrast with `@ffi.struct`, whose whole purpose is a known layout).
+```
+error[E1134]: `@ffi.opaque` needs both `header` and `name`
+ --> app/db.bl:7:1
+  |
+7 | @ffi.opaque(name: "sqlite3_blob")
+  |            ^^^^^^^^^^^^^^^^^^^^^^ `header` is missing
+  |
+  = help: write `@ffi.opaque(header: "sqlite3.h", name: "sqlite3_blob")`
+```
+
+`@ffi.opaque(header, name)` declares a **bare nominal, arity-0** handle type that mirrors a named, possibly-incomplete C type. The type has **no body** — no fields, no variants (a body is rejected). `header` and `name` are both required, in every package, `lib/std` included. A missing `header` or a missing `name` is `AnnotationArguments` (E1134) at `blink check`, and the help prints the full form `@ffi.opaque(header: "h.h", name: "c_type")`. A `name` that starts with `blink_` is E0849 (§9.1, *A `blink_` Symbol Belongs to the Runtime*): the handle to a runtime-owned C type uses `@runtime` (*A Runtime-Owned Handle*, below). `header` is resolved against `[native-dependencies].headers` exactly as for `@ffi.struct` (§9.1.3). `name` is the C type the handle points at; the Blink type maps to the C pointer type `name *`. Because the pointee is incomplete, **no size or offset check applies** (the deliberate contrast with `@ffi.struct`, whose whole purpose is a known layout).
 
 Each `@ffi.opaque` declaration is its own **nominal type**. `Sqlite3` and `Sqlite3Stmt` are distinct and never interchangeable, even though both are C pointers at the boundary — the nominal distinctness `Ptr[Void]` could not provide.
 
@@ -3187,9 +3204,42 @@ pub fn open(path: Str) -> Option[Connection] ! FS.Read, FS.Write, FS.Delete {
 
 `out.deref()` returns a bare `Sqlite3` (deref on a non-`Void` pointer is legal — E0825 rejects only `Ptr[Void]`, §9.1.1). Round-tripping a handle *back* to a raw pointer to hand to another C call is likewise confined to an FFI region (E0811, §9.1.1): you store the handle into a `Ptr` cell with `.write(h)`, and the C call takes the cell. The `.write` is the crossing. The C call that then takes the cell is an ordinary consume, which the declaration's audit record already covers. Because the handle has no `.addr()` in ordinary code, it cannot be fabricated or re-crossed outside the boundary.
 
+#### A Runtime-Owned Handle — `@runtime` on a Bodiless Type
+
+A handle to a C type that the Blink runtime defines, such as the TCP handle of `lib/std/net_tcp.bl`, has no header that a user can include. The compiler puts the runtime text into the C itself (§9.1, *A `blink_` Symbol Belongs to the Runtime*). So `lib/std` declares such a handle with `@runtime`, on a type with no body, and not with `@ffi.opaque`.
+
+```blink
+// lib/std/net_tcp.bl
+@runtime("blink_tcp_handle")
+pub type TcpHandle                                  // a runtime-owned C type, held as a pointer
+
+@runtime("blink_tcp_handle_new")
+fn tcp_handle_new(fd: Int) -> TcpHandle             // mints a `TcpHandle`
+
+@ffi.opaque(header: "sqlite3.h", name: "sqlite3")   // a C library type: `@ffi.opaque`
+pub type Sqlite3
+```
+
+A bodiless `@runtime` type is a pointer handle: a bare nominal type of arity 0, held as a pointer to the C type `blink_x`. These rules hold:
+
+- **The `@runtime` gates apply.** Only `lib/std` may write it, and the symbol must start with `blink_`. Another package, or a symbol with another prefix, is `InvalidRuntimeBinding` (E0849), as for a `@runtime` fn (§9.1, *`@runtime` — The Runtime Bridge*).
+- **The compiler emits no `#include` for it.** The runtime text in the C declares the type. There is no `header` argument and no header lookup, so E0859 does not apply.
+- **No `@ffi` signature check applies.** The declaration is outside the signature rule, as a `@runtime` fn is (E0848 names `@ffi` declarations only).
+- **Each type is its own nominal type.** Two `@runtime` handle types are never interchangeable.
+- **It flows and it is inert as an `@ffi.opaque` handle is.** The rules *Flows freely in non-FFI code* and *Inert — no operations* above hold for it. It is not a `Ptr[T]`, so E0811 does not apply to it.
+
+**Where a runtime handle value comes from.** The rule of *Construction — sealed to the FFI boundary* holds for a `@runtime` handle, with one more source. A value of a `@runtime` handle type comes only from:
+
+- the return value of a `@runtime` fn; and
+- a read from a `Ptr` cell wherever a `Ptr[T]` may legally appear, an FFI region in the sense of E0811 (§9.1.1, *Pointer Operations*), as for an `@ffi.opaque` handle.
+
+There is no literal and no user-callable constructor. A user cannot write `@runtime`, so a user gets such a handle from a `lib/std` function that returns it. Code that builds or coerces the value anywhere else gets the existing construction and type-mismatch diagnostics. No new error code.
+
+**`blink audit` leaves a runtime handle out.** A `@runtime` handle is not tagged `opaque-ffi-handle` (next subsection). It is part of the runtime ABI, as a `@runtime` fn is, and the runtime's own review covers it. The audit inventory lists the foreign code of the program, so it does not list the standard library internals that every program shares. This is on purpose.
+
 #### Audit category `opaque-ffi-handle`
 
-Every boundary crossing that produces or consumes an opaque handle is tagged with the `blink audit` category **`opaque-ffi-handle`**, so the FFI inventory (§9.1, *`blink audit`*) lists them alongside pointer allocations and `Raw()` sites. The audit records two kinds of crossing.
+Every boundary crossing that produces or consumes an opaque handle is tagged with the `blink audit` category **`opaque-ffi-handle`**, so the FFI inventory (§9.1, *`blink audit`*) lists them alongside pointer allocations and `Raw()` sites. The tag covers `@ffi.opaque` handles only. A `@runtime` handle (*A Runtime-Owned Handle*, above) is not tagged. The audit records two kinds of crossing.
 
 **Declaration records.** For each `@ffi` declaration, a parameter whose type contains `H` (defined below) is a **consume** crossing, and a return type that contains `H`, or a `Ptr` out-cell parameter whose pointee contains `H`, is a **produce** crossing. The audit records these once per declaration, not once per call. Passing a handle by value to an `@ffi` function is therefore not a body site: the handle is the C pointer, so nothing goes back to raw memory, and the call may sit in ordinary code.
 
@@ -3232,7 +3282,7 @@ Use `@ffi.opaque` for a named handle whose innards C hides from you and that you
 
 #### Diagnostic codes added by §9.1.4
 
-**None.** This is a deliberate design point: an opaque handle reuses the ordinary nominal-type machinery end to end. A bad method access reuses the existing "no method on `<Type>`" and a bad field access reuses the general field-existence diagnostic E0525 (`NoSuchField`) — a bodiless handle declares zero fields — neither of which is opaque-specific; construction outside the boundary reuses the existing construction / type-mismatch diagnostics; a malformed `@ffi.opaque` declaration (a body, or a missing `header`/`name`) reuses the existing malformed-annotation diagnostics. The only new artifact is the `blink audit` category `opaque-ffi-handle`. A dedicated code (`E0826`, *opaque handle constructed outside FFI*) was considered for the boundary-construction violation and deferred — the existing diagnostics carry the message, and adding a code remains available to the implementation if the reused error proves unclear in practice.
+**None.** This is a deliberate design point: an opaque handle reuses the ordinary nominal-type machinery end to end. A bad method access reuses the existing "no method on `<Type>`" and a bad field access reuses the general field-existence diagnostic E0525 (`NoSuchField`) — a bodiless handle declares zero fields — neither of which is opaque-specific; construction outside the boundary reuses the existing construction / type-mismatch diagnostics; a malformed `@ffi.opaque` declaration (a body, or a missing `header` or `name`) reuses the existing malformed-annotation diagnostics, and a missing `header` or `name` is E1134 in every package; a `@runtime` handle reuses E0849 and the same construction diagnostics. The only new artifact is the `blink audit` category `opaque-ffi-handle`. A dedicated code (`E0826`, *opaque handle constructed outside FFI*) was considered for the boundary-construction violation and deferred — the existing diagnostics carry the message, and adding a code remains available to the implementation if the reused error proves unclear in practice.
 
 ### 9.2 System Boundary — Runtime Validation
 
