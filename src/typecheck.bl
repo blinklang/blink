@@ -49282,8 +49282,11 @@ fn tc_binder_source(binder: Int) -> Int {
 // Whether the typevar `tv` is in scope at node `n`.
 fn tc_typevar_in_scope(sc: TcTypeScope, tv: Int, n: Int) -> Bool {
     let b = tc_binder_source(tc_tid_binder(tv))
-    if b == NO_BINDER_NODE { return false }
-    if b == SELF_BINDER_NODE {
+    // A trait's signatures write its associated type as a binderless `Self.A`, which each
+    // impl and each bound substitutes, so it is the trait's parameter as `Self` is.
+    let self_assoc = b == NO_BINDER_NODE && tc_tid_name(tv).starts_with("Self.")
+    if b == NO_BINDER_NODE && !self_assoc { return false }
+    if b == SELF_BINDER_NODE || self_assoc {
         // `Self` is a parameter of the trait that names it, and of nothing else.
         let mut s = tc_scope_up(sc, n)
         if tc_is_scope_decl_kind(node_kind(n)) { s = n }
@@ -49338,34 +49341,6 @@ fn tc_tid_open_at(sc: TcTypeScope, tid: Int, n: Int) -> Bool {
 // `marks` is tc_stamp_assert's: a child marked 2 is excused as a name, so it is not a hole and
 // cannot be the cause of one above it.
 fn tc_stamp_is_cascade(sc: TcTypeScope, n: Int, marks: List[Int]) -> Int {
-    // `.await` answers with the PAYLOAD of its operand's handle, so a handle whose payload is
-    // still open leaves it nothing to read even though the operand itself has a type. The hole
-    // is in whatever failed to pin the payload — the spawned closure's return.
-    if node_kind(n) == NodeKind.AwaitExpr {
-        let awaited = tc_tid_resolved(tc_lookup_node_tid(node_obj(n)))
-        if tc_tid_kind(awaited) != TyKind.Handle { return 1 }
-        if tc_tid_child_count(awaited) < 1 { return 1 }
-        if tc_tid_open_at(sc, tc_tid_child(awaited, 0), n) { return 1 }
-        return 0
-    }
-    // A member reached THROUGH a type parameter — `v.x` where `v: T`, `x.m()` where `x: T` —
-    // names no type at this site. The field or method belongs to whatever T stands for, so the
-    // answer exists only once T is bound, which is monomorphization: the mono pass records this
-    // node's tid per instance. The receiver is typed (it is T), so the hole is not the
-    // receiver's own — it is the parameter's, one level up at the call that binds it. A BOUNDED
-    // parameter does not reach here: the bound licenses the member and the trait's own
-    // signature answers it, so a hole under a bound is a real hole and still reports.
-    let member_recv = if node_kind(n) == NodeKind.FieldAccess || node_kind(n) == NodeKind.MethodCall {
-        node_obj(n)
-    } else {
-        -1
-    }
-    if member_recv != -1 {
-        let recv_t = tc_tid_resolved(tc_lookup_node_tid(member_recv))
-        if tc_tid_kind(recv_t) == TyKind.Typevar {
-            if tc_tparam_bound_traits(tc_tid_name(recv_t)) == "" { return 1 }
-        }
-    }
     // A block-bearing form reads its type from its TAIL and from nothing else, so the tail is
     // the only child that can be its hole — its other statements are typed on their own.
     let tail = tc_scoped_tail_node(n, 0)
