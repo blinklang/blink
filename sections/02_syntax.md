@@ -1351,7 +1351,7 @@ let mode = if retries > 3 { 1 } else { 0 }  // `if` expression
 let parsed = { parse("8080")? }  // block
 ```
 
-The compiler reports `NonInitExpr` (E1129). There is one diagnostic for each initializer. The primary span is on the first part that is not static, in left-to-right order, and its label names the kind of that part: "function call", "method call", "`if` expression", "`match` expression", "block", "`with` expression", "string interpolation", "read of module `let` `x`", or "`?` has no enclosing function" (also for `return`). Each other part of the same initializer that is not static gets a secondary label, so one fix pass can repair them all. The diagnostic does not use `NonConstExpr` (E1101) or E0508/E0509, because those name a different rule.
+The compiler reports `NonInitExpr` (E1129). There is one diagnostic for each initializer. The primary span is on the first part that is not static, in left-to-right order, and its label names the kind of that part: "function call", "method call", "`if` expression", "`match` expression", "block", "`with` expression", "string interpolation", "read of module `let` `x`", or "`?` has no enclosing function" (also for `return`). Each other part of the same initializer that is not static gets a secondary label, so one fix pass can repair them all. The diagnostic does not use `NonConstExpr` (E0533) or E0508/E0509, because those name a different rule.
 
 ```
 error[NonInitExpr]: the initializer of module-level `table` is not static
@@ -3978,11 +3978,10 @@ The compiler folds const expressions at compile time. Arithmetic like `1024 * 64
 
 | Name | Code | Description |
 |------|------|-------------|
-| `NonConstExpr` | E1101 | Expression is not a compile-time constant |
+| `NonConstExpr` | E0533 | A `const` right-hand side, a struct field default, or an expression inside a keyword default is not a compile-time constant |
 | `ConstMutForbidden` | E1102 | `const` binding cannot be `mut` |
-| `NonConstStructDefault` | E1103 | Struct field default is not a const expression |
-| `NonConstKeywordDefault` | E1104 | Keyword argument default is not a const expression |
-| `NonConstRangeBound` | E1105 | Range pattern bound is not a const expression |
+| `NonConstParamDefault` | E0532 | A parameter default is not a const expression |
+| `RangeBoundNotConst` | E0323 | A range pattern bound is not a const expression |
 | `ConstEvalPanic` | E0546 | Evaluation of a const expression would panic: integer `/` or `%` by zero, signed `MIN / -1`, or overflow |
 | `NonInitExpr` | E1129 | Initializer of a module-level `let` or `let mut` is not a static expression (§2.12.1) |
 

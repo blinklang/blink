@@ -1,0 +1,149 @@
+// A `const` struct literal that leaves a field out takes the field's default, so a default is
+// a const expression (§2.14, §2.21): the same set a `const` right-hand side allows. Anything
+// outside the set is NonConstExpr (E0533) at the default, with the reason and a fix in the
+// help. Each legal form checks clean.
+
+import std.fs
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_reset}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+
+// Three lines, so the type under test is always on line 4.
+const PRELUDE: Str = "fn mk() -> Int \{ 7 }\nlet seed = 5\nconst K: Int = 3\n"
+
+fn default_probe(path: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    init_embedded_stdlib()
+    fs.write(path, src).unwrap()
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+}
+
+// The errors reported in the probe file itself, one per line: code, name, line:col,
+// message and help.
+fn errors_in(path: Str) -> Str {
+    let mut out = ""
+    for d in diag_entries {
+        if d.severity == "error" && d.file == path {
+            out = out.concat("{d.code} {d.name} {d.line}:{d.col}: {d.message} | help: {d.help}\n")
+        }
+    }
+    out
+}
+
+// The type on line 4 has one field `v: <ty> = <dflt>`, and main builds it with no fields.
+fn field_default_errors(tag: Str, ty: Str, dflt: Str) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    let path = "/tmp/zz_fdc_{tag}.bl"
+    default_probe(path, "{PRELUDE}type Spot \{ v: {ty} = {dflt} }\n\nfn main() \{ let _ = Spot \{} }\n")
+    errors_in(path)
+}
+
+// `type Spot { v: ` is 15 bytes, so a default after `<ty> = ` starts at 15 + len(ty) + 4.
+fn assert_non_const(tag: Str, ty: Str, dflt: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+    let got = field_default_errors(tag, ty, dflt)
+    let col = 15 + ty.byte_len() + 4
+    let want = "E0533 NonConstExpr 4:{col}: the default for field `v` is not a compile-time constant"
+    assert(got.starts_with(want), "{tag}: want a line that starts with: {want}\ngot: {got}")
+    assert(got.split("\n").len() == 2, "{tag}: want one error, got: {got}")
+}
+
+test "a call in a field default is NonConstExpr with the reason and the fix" {
+    let got = field_default_errors("call_full", "Int", "mk()")
+    let want = "E0533 NonConstExpr 4:22: the default for field `v` is not a compile-time constant: a field default must be const, because `const X = Spot \{}` fills it | help: compute the value in a constructor fn: `fn spot() -> Spot \{ Spot \{ v: ... } }`, or make the field `Option[Int]`\n"
+    assert(got == want, "want: {want}got: {got}")
+}
+
+test "the fix for a generic type names its type parameters" {
+    let path = "/tmp/zz_fdc_generic.bl"
+    default_probe(path, "{PRELUDE}type Pair[A, B] \{ a: Option[A] = None, n: Int = mk(), b: Option[B] = None }\n\nfn main() \{ let _: Pair[Int, Str] = Pair \{} }\n")
+    let got = errors_in(path)
+    let want = "E0533 NonConstExpr 4:49: the default for field `n` is not a compile-time constant: a field default must be const, because `const X = Pair \{}` fills it | help: compute the value in a constructor fn: `fn pair[A, B]() -> Pair[A, B] \{ Pair \{ n: ... } }`, or make the field `Option[Int]`\n"
+    assert(got == want, "want: {want}got: {got}")
+}
+
+test "a method call in a field default is NonConstExpr" {
+    assert_non_const("method", "Int", "\"ab\".byte_len()")
+}
+
+test "a module let in a field default is NonConstExpr" {
+    assert_non_const("module_let", "Int", "seed")
+}
+
+test "an operator over a module let in a field default is NonConstExpr at the operator" {
+    let got = field_default_errors("module_let_op", "Int", "K + seed")
+    assert(got.starts_with("E0533 NonConstExpr 4:24: the default for field `v` is not a compile-time constant"), "got: {got}")
+}
+
+test "a closure in a field default is NonConstExpr" {
+    assert_non_const("closure", "fn(Int) -> Int", "fn(x: Int) -> Int \{ x }")
+}
+
+test "a Map constructor in a field default is NonConstExpr" {
+    assert_non_const("map_new", "Map[Str, Int]", "Map.new()")
+}
+
+test "a List constructor in a field default is NonConstExpr" {
+    assert_non_const("list_new", "List[Int]", "List.new()")
+}
+
+test "a string interpolation in a field default is NonConstExpr" {
+    assert_non_const("interp", "Str", "\"k=\{K}\"")
+}
+
+test "a block in a field default is NonConstExpr" {
+    assert_non_const("block", "Int", "\{ let a = 1\n a + 1 }")
+}
+
+test "a generic call in a field default is NonConstExpr" {
+    let path = "/tmp/zz_fdc_generic.bl"
+    default_probe(path, "fn cnt[T](l: List[T]) -> Int \{ l.len() }\n\n\ntype Spot \{ v: Int = cnt([]) }\n\nfn main() \{ let _ = Spot \{} }\n")
+    let got = errors_in(path)
+    assert(got.starts_with("E0533 NonConstExpr 4:22: the default for field `v` is not a compile-time constant"), "got: {got}")
+}
+
+test "a call inside a variant payload in a field default is NonConstExpr" {
+    assert_non_const("payload_call", "Option[Int]", "Some(mk())")
+}
+
+test "a call inside a list literal in a field default is NonConstExpr" {
+    assert_non_const("list_call", "List[Int]", "[1, mk()]")
+}
+
+test "a Map() call in a field default is NonConstExpr" {
+    assert_non_const("map_call", "Map[Int, Int]", "Map()")
+}
+
+test "a conversion call in a field default is NonConstExpr, through the type or through into" {
+    let path = "/tmp/zz_fdc_conversion.bl"
+    let src = [
+        "type Wr[T] \{ v: List[T] }",
+        "impl[T: Eq] From[List[T]] for Wr[T] \{ fn from(v: List[T]) -> Wr[T] \{ Wr \{ v: v } } }",
+        "",
+        "type Sd[T: Eq] \{ w: Wr[T] = Wr.from([]), u: Wr[T] = [].into(), n: Int = 1 }",
+        "",
+        "fn main() \{ let _: Sd[Int] = Sd \{} }",
+    ].join("\n")
+    default_probe(path, "{src}\n")
+    let got = errors_in(path)
+    assert(got.contains("E0533 NonConstExpr 4:29: the default for field `w`"), "got: {got}")
+    assert(got.contains("E0533 NonConstExpr 4:53: the default for field `u`"), "got: {got}")
+}
+
+test "each non-const default in one type gets its own error" {
+    let path = "/tmp/zz_fdc_three.bl"
+    default_probe(path, "{PRELUDE}type Spot \{ n: Int = mk()\n  m: Int = seed\n  f: fn(Int) -> Int = fn(x: Int) -> Int \{ x } }\n\nfn main() \{ let _ = Spot \{} }\n")
+    let got = errors_in(path)
+    assert(got.contains("E0533 NonConstExpr 4:22: the default for field `n`"), "got: {got}")
+    assert(got.contains("E0533 NonConstExpr 5:12: the default for field `m`"), "got: {got}")
+    assert(got.contains("E0533 NonConstExpr 6:23: the default for field `f`"), "got: {got}")
+}
+
+test "the const forms check clean as field defaults" {
+    let path = "/tmp/zz_fdc_legal.bl"
+    let src = "{PRELUDE}type Pt \{ x: Int = K\n  y: Int = 0 }\ntype Level \{ Low\n  High(Int) }\ntype Spot \{\n  a: Int = 1\n  b: Int = -2\n  c: Float = 1.5\n  d: Bool = true\n  e: Char = 'q'\n  f: Str = \"plain\"\n  g: Int = K * 2 + 1\n  h: Bool = K > 2 && true\n  i: Int = K\n  j: Pt = Pt \{ x: K, y: 1 }\n  k: Level = Level.High(K)\n  l: Level = Level.Low\n  m: Option[Int] = None\n  n: Option[Int] = Some(K)\n  o: List[Int] = []\n  p: List[Int] = [1, K]\n  q: (Int, Str) = (K, \"t\")\n}\n\nfn main() \{ let _ = Spot \{} }\n"
+    default_probe(path, src)
+    let got = errors_in(path)
+    assert(got == "", "a const default needs no error, got: {got}")
+}

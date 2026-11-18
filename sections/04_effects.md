@@ -816,7 +816,7 @@ type Request {
     method: Str
     url: Str
     body: Str = ""
-    headers: Map[Str, Str] = Map.new()
+    headers: Map[Str, Str]
     timeout_ms: Int = 30000
 }
 ```
@@ -2323,7 +2323,7 @@ pub type LimitKind {
 
 pub type ChildLimits {
     timeout: Duration? = None
-    grace: Duration = Duration.seconds(2)
+    grace: Duration = Duration { nanos: 2000000000 }
     memory: Int? = None
     processes: Int? = None
 }
@@ -2486,7 +2486,7 @@ pub type ChildLimits {
     /// the leftovers of a child whose leader has exited, and program exit. `memory` and
     /// `processes` end the tree at once. `Duration.seconds(0)` sends SIGKILL at once, with no
     /// SIGTERM. It has no effect when none of `timeout`, `memory` and `processes` is set.
-    grace: Duration = Duration.seconds(2)
+    grace: Duration = Duration { nanos: 2000000000 }
 
     /// Memory of the whole tree of the child, in bytes. `None`: no limit.
     memory: Int? = None
