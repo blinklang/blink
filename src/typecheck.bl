@@ -4323,24 +4323,25 @@ fn tc_impl_binds_read_off(im: Int, recv: Int) -> Map[Str, Int] {
 // *The `Self` Type*).
 fn tc_builtin_recv_call_binds(sig: Int, recv: Int) -> Map[Str, Int] {
     let im = tc_method_block.get(fnsig_pool.get(sig).unwrap().decl) ?? -1
-    let mut binds: Map[Str, Int] = if im == -1 { Map() } else { tc_impl_binds_read_off(im, recv) }
+    tc_with_self_binds(if im == -1 { Map() } else { tc_impl_binds_read_off(im, recv) }, recv)
+}
+
+// `binds` with `Self` read as the receiver `recv`, where `binds` does not already answer it.
+fn tc_with_self_binds(binds: Map[Str, Int], recv: Int) -> Map[Str, Int] {
+    let mut out = binds
     for (k, v) in tc_self_binds(recv) {
-        if !binds.contains_key(k) { binds.insert(k, v) }
+        if !out.contains_key(k) { out.insert(k, v) }
     }
-    binds
+    out
 }
 
 // The binds tc_check_impl_bounds reads for impl `im` at binder `tids`, with `Self` read as the
 // receiver's type `self_tid` (-1: none), so a bound such as `T: Conv[Self]` or a `where Self: Sh`
 // clause is judged at it.
 fn tc_impl_binds_with_self(im: Int, tids: List[Int], self_tid: Int) -> Map[Str, Int] {
-    let mut binds = tc_impl_binds_by_name(im, tids)
-    if self_tid >= 0 {
-        for (k, v) in tc_self_binds(self_tid) {
-            if !binds.contains_key(k) { binds.insert(k, v) }
-        }
-    }
-    binds
+    let binds = tc_impl_binds_by_name(im, tids)
+    if self_tid < 0 { return binds }
+    tc_with_self_binds(binds, self_tid)
 }
 
 // Only a call whose binders inference may still fill has anything left for the flush. A walk
@@ -35149,10 +35150,7 @@ fn tc_std_trait_qualified_call(node: Int, shown: Str, tr: Str, method: Str, args
     let sig = tc_derived_sig(recv, method)
     if sig == -1 { return -1 }
     let fs = fnsig_pool.get(sig).unwrap()
-    let mut binds = tc_impl_binds_at_call(sig, recv)
-    for (bk, bv) in tc_self_binds(recv) {
-        if !binds.contains_key(bk) { binds.insert(bk, bv) }
-    }
+    let binds = tc_with_self_binds(tc_impl_binds_at_call(sig, recv), recv)
     let _ = tc_check_qualified_trait_args("{shown}.{method}", sig, args_sl, node, binds)
     tc_refuse_derived_method_at(recv, method, node)
     substitute_typevar_tid(tc_member_tid_at_instance(fs.ret, recv), binds)
@@ -39105,10 +39103,7 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                 // receiver's type argument as its hint, as a List poly-impl argument does.
                 // A parameter that spells `Self` takes the receiver's type, so an argument
                 // for it is checked against the receiver.
-                let mut ibinds = tc_impl_binds_at_call(sig, obj_t)
-                for (k, v) in tc_self_binds(obj_t) {
-                    if !ibinds.contains_key(k) { ibinds.insert(k, v) }
-                }
+                let ibinds = tc_with_self_binds(tc_impl_binds_at_call(sig, obj_t), obj_t)
                 tc_check_method_impl_bounds(sig, obj_t, node)
                 if sole_trait == "" && fnsig_pool.get(sig).unwrap().decl < 0 {
                     tc_refuse_derived_method_at(obj_t, method, node)
@@ -39557,10 +39552,7 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                         let qt_fs = fnsig_pool.get(qt_sig).unwrap()
                         // The receiver's type arguments answer a per-instance impl's binders,
                         // as on the instance path.
-                        let mut qt_ibinds = tc_impl_binds_at_call(qt_sig, qt_recv)
-                        for (k, v) in tc_self_binds(qt_recv) {
-                            if !qt_ibinds.contains_key(k) { qt_ibinds.insert(k, v) }
-                        }
+                        let qt_ibinds = tc_with_self_binds(tc_impl_binds_at_call(qt_sig, qt_recv), qt_recv)
                         tc_check_method_impl_bounds(qt_sig, qt_recv, node)
                         nr_note_call_decl(node, qt_fs.decl)
                         if node_type_params(node) != -1 {
@@ -49871,7 +49863,7 @@ fn tc_collect_type_ann_names(ann: Int, out: List[Str]) {
 }
 
 // True when no impl binder is bounded and neither a binder name nor `Self` appears in any
-// method signature. Such an impl cannot materialize an element by value nor operate on
+// method signature, its own binders' bounds included. Such an impl cannot materialize an element by value nor operate on
 // one, so it is accepted where a per-element poly impl would not be.
 pub fn impl_is_element_agnostic(im: Int) -> Int {
     let binders_sl = node_impl_binders(im)
@@ -49896,6 +49888,23 @@ pub fn impl_is_element_agnostic(im: Int) -> Int {
         let m = sublist_get(methods_sl, j)
         let mut names: List[Str] = []
         tc_collect_type_ann_names(node_type_ann(m), names)
+        // A bound on the method's own binder is in the signature too: `fn m[U: Cv[Self]]`
+        // dispatches through the receiver's type.
+        let own_sl = node_type_params(m)
+        if own_sl != -1 {
+            let mut oi = 0
+            while oi < sublist_length(own_sl) {
+                let bounds_sl = node_elements(sublist_get(own_sl, oi))
+                if bounds_sl != -1 {
+                    let mut bj = 0
+                    while bj < sublist_length(bounds_sl) {
+                        tc_collect_type_ann_names(sublist_get(bounds_sl, bj), names)
+                        bj = bj + 1
+                    }
+                }
+                oi = oi + 1
+            }
+        }
         let params_sl = node_params(m)
         if params_sl != -1 {
             let mut pi = 0
