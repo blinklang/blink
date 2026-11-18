@@ -13,7 +13,7 @@ import std.io
 import layout.{layout_reset}
 import cname.{cname_reset, c_ffi_struct_original, c_ffi_struct_ptr_name, cname_ffi_struct_mirror}
 import cg.{CgConfig, generate}
-import cg_test_helpers.{cg_probe_compile, cg_probe_ices_named, cg_probe_ices_naming, cg_text_occurrences}
+import cg_test_helpers.{cg_probe_compile, cg_probe_compile_but, cg_probe_errors_named, cg_probe_ices_named, cg_probe_ices_naming, cg_text_occurrences}
 import mono.{run_mono}
 import cg_reg.{cg_reg_type_decls}
 
@@ -46,6 +46,15 @@ fn build_probe(src: Str, name: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, D
     cname_reset()
     let _ = fs.delete(path)
     program
+}
+
+// A mirror that names no C struct never reaches this stage: check refuses it with E1134
+// (sections 9.1.3 and 11.1), because there is no C struct to cross as.
+fn refused_at_check(src: Str, name: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete, Env.Exit, Env.Read, FS.Read, FS.Write, IO {
+    let path = "build/{name}.bl"
+    let _ = cg_probe_compile_but(path, src, "AnnotationArguments")
+    let _ = fs.delete(path)
+    cg_probe_errors_named("AnnotationArguments")
 }
 
 fn standalone_cfg() -> CgConfig {
@@ -186,9 +195,8 @@ fn first_mirror_decl() -> Int {
     -1
 }
 
-// A mirror passed by value has no conversion: C forbids a cast between two struct types,
-// so the wrapper would hand the foreign function a struct of the wrong type under a name
-// that compiles. The gap is named rather than emitted.
+// A mirror passed by value is copied into the C struct it names. One that names none has
+// no type to copy into, and C forbids a cast between two struct types, so check refuses it.
 fn by_value_src(ann: Str) -> Str {
     let head = #"@ffi.struct("#.concat(ann).concat(#")
 pub type Pollfd { fd: I32, events: I16, revents: I16 }
@@ -202,11 +210,9 @@ fn main() { assert(true) }
     head
 }
 
-test "an @ffi.struct mirror that names no C struct, passed by value, refuses by name" {
-    let program = build_probe(by_value_src(#"header: "poll.h""#), "cg_fw_byvalue_probe")
-    let _text = generate(program, standalone_cfg())
-    assert_eq_int("the shape that cannot be converted is named once",
-        cg_probe_ices_named("ForeignShapeNotConvertible"), 1)
+test "an @ffi.struct mirror that names no C struct, passed by value, is refused at check" {
+    assert_eq_int("one E1134 for the mirror",
+        refused_at_check(by_value_src(#"header: "poll.h""#), "cg_fw_byvalue_probe"), 1)
 }
 
 test "an @ffi.struct mirror that names its C struct, passed by value, is copied into that struct" {
@@ -217,8 +223,7 @@ test "an @ffi.struct mirror that names its C struct, passed by value, is copied 
     assert_has(text, "memcpy")
 }
 
-// A mirror that names no C original has no spelling but its own, so the argument crosses as
-// `void*`, the one pointer type C converts to whatever the header declares.
+// A mirror that names no C original has no spelling to cross as, so check refuses it.
 fn unnamed_mirror_src() -> Str {
     #"@ffi.struct(header: "poll.h")
 pub type Pollfd { fd: I32, events: I16, revents: I16 }
@@ -231,20 +236,14 @@ fn main() { assert(true) }
 "#
 }
 
-test "a pointer to a mirror that names no C original crosses as void*" {
-    let program = build_probe(unnamed_mirror_src(), "cg_fw_unnamed_probe")
-    let text = generate(program, standalone_cfg())
-    assert_eq_int("no refusal", cg_probe_ices_named("ForeignShapeNotConvertible"), 0)
-    assert_lacks(text, "extern int32_t poll(")
-    assert_has(text, "poll(((void*)(b_fds)), b_nfds, b_t)")
-    let decl = first_mirror_decl()
-    assert(c_ffi_struct_ptr_name(decl, 1) == "void*")
-    assert(c_ffi_struct_ptr_name(decl, 2) == "void*")
+test "a pointer to a mirror that names no C original is refused at check" {
+    assert_eq_int("one E1134 for the mirror",
+        refused_at_check(unnamed_mirror_src(), "cg_fw_unnamed_probe"), 1)
 }
 
 // An answer arrives under the header's pointer type. It is held in a local of that type first,
 // so C checks the header's return against the binding by assignment, and only the local is
-// cast back to the mirror the wrapper returns, whether or not the mirror names a C struct.
+// cast back to the mirror the wrapper returns. A mirror that names no C struct is refused at check.
 fn mirror_return_src(ann: Str) -> Str {
     let head = #"@ffi.struct("#.concat(ann).concat(#")
 pub type Pollfd { fd: I32, events: I16, revents: I16 }
@@ -269,14 +268,9 @@ test "a returned pointer to a named mirror is cast back to the mirror" {
     assert_eq_int("one cast of the held answer, to the mirror", cg_text_occurrences(text, "Pollfd*)(_cg_ffi_ret"), 1)
 }
 
-test "a returned pointer to a mirror that names no C original is cast back to the mirror" {
-    let program = build_probe(mirror_return_src(#"header: "poll.h""#), "cg_fw_ret_unnamed_probe")
-    let text = generate(program, standalone_cfg())
-    assert_eq_int("no refusal", cg_probe_ices_named("ForeignShapeNotConvertible"), 0)
-    assert_has(text, "void* _cg_ffi_ret")
-    assert_has(text, " = poll(b_x);")
-    assert_lacks(text, ")(poll(b_x))")
-    assert_eq_int("one cast of the held answer, to the mirror", cg_text_occurrences(text, "Pollfd*)(_cg_ffi_ret"), 1)
+test "a returned pointer to a mirror that names no C original is refused at check" {
+    assert_eq_int("one E1134 for the mirror",
+        refused_at_check(mirror_return_src(#"header: "poll.h""#), "cg_fw_ret_unnamed_probe"), 1)
 }
 
 // A cast reaches every pointer level, so a pointer to a pointer to a mirror crosses as a

@@ -4156,7 +4156,7 @@ s.p.f = v      // fix: s.p.f.write(v)          (`s` is a value; `s.p` is a `Ptr`
 ```blink
 import blink.ffi
 
-@ffi.struct
+@ffi.struct(header: "sys/uio.h", name: "iovec")
 type IoVec {
     iov_base: Int
     iov_len: U64
@@ -4213,7 +4213,7 @@ error[NotAPlace]: cannot assign through a `Ptr`
 ```
 
 ```blink
-@ffi.struct
+@ffi.struct(header: "poll.h", name: "pollfd")
 type PollFd { fd: I32, events: I16, revents: I16 }
 ```
 

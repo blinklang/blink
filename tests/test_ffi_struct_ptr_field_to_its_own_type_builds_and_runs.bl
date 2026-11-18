@@ -1,19 +1,42 @@
 // A C struct that points at its own type (a list node, struct addrinfo's ai_next) or at
 // a struct that points back must build: the mirror names the pointee before its typedef.
+//
+// Each mirror names the C struct its header declares, so each row runs as `blink test` in a
+// package that vendors that header.
 
-@ffi.struct
+import compile_test_helpers.{vendored_header_project, blink_in_project}
+
+let HEADER = #"#include <stdint.h>
+struct list_node { int32_t v; struct list_node *next; };
+struct cycle_right;
+struct cycle_left { int32_t x; struct cycle_right *right; };
+struct cycle_right { int32_t y; struct cycle_left *left; };
+struct node_slot { int32_t v; struct node_slot **cell; };
+"#
+
+let TYPES = #"@ffi.struct(header: "nodes.h", name: "list_node")
 type ListNode { v: I32, next: Ptr[ListNode] }
 
-@ffi.struct
+@ffi.struct(header: "nodes.h", name: "cycle_left")
 type CycleLeft { x: I32, right: Ptr[CycleRight] }
 
-@ffi.struct
+@ffi.struct(header: "nodes.h", name: "cycle_right")
 type CycleRight { y: I32, left: Ptr[CycleLeft] }
 
-@ffi.struct
+@ffi.struct(header: "nodes.h", name: "node_slot")
 type NodeSlot { v: I32, cell: Ptr[Ptr[NodeSlot]] }
+"#
+
+// `row` with the mirrors, as `blink test` in its own package, passes.
+fn passes(tag: Str, row: Str) ! FS.Write, Process.Spawn, Env.Read {
+    let dir = vendored_header_project(tag, "nodes.h", HEADER, TYPES.concat("\n").concat(row))
+    let r = blink_in_project(dir, "test src/main.bl")
+    assert(r.success(), "{r.out}{r.err_out}")
+    assert(r.out.contains("1 passed, 0 failed"), "{r.out}{r.err_out}")
+}
 
 test "a Ptr field to its own struct links two nodes" {
+    passes("ptr_field_own_list", #"test "a Ptr field to its own struct links two nodes" {
     with ffi.scope() as scope {
         let a: Ptr[ListNode] = scope.alloc[ListNode]()
         let b: Ptr[ListNode] = scope.alloc[ListNode]()
@@ -25,8 +48,11 @@ test "a Ptr field to its own struct links two nodes" {
         assert(a.next.read().next.read().is_null())
     }
 }
+"#)
+}
 
 test "two structs that point at each other" {
+    passes("ptr_field_own_cycle", #"test "two structs that point at each other" {
     with ffi.scope() as scope {
         let l: Ptr[CycleLeft] = scope.alloc[CycleLeft]()
         let r: Ptr[CycleRight] = scope.alloc[CycleRight]()
@@ -38,8 +64,11 @@ test "two structs that point at each other" {
         assert_eq(r.left.read().x.read(), 5)
     }
 }
+"#)
+}
 
 test "a Ptr[Ptr] field to its own struct" {
+    passes("ptr_field_own_ptr_ptr", #"test "a Ptr[Ptr] field to its own struct" {
     with ffi.scope() as scope {
         let n: Ptr[NodeSlot] = scope.alloc[NodeSlot]()
         let cell: Ptr[Ptr[NodeSlot]] = scope.alloc[Ptr[NodeSlot]]()
@@ -48,4 +77,6 @@ test "a Ptr[Ptr] field to its own struct" {
         n.cell.write(cell)
         assert_eq(n.cell.read().deref().v.read(), 9)
     }
+}
+"#)
 }

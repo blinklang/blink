@@ -1,5 +1,6 @@
 import std.path.{path_join, path_basename}
-import std.process.{ProcessResult, ChildEnd}
+import std.process.{ProcessResult, ChildEnd, ChildLimits}
+import std.time.{Duration}
 import std.fs.{FsErrorExt}
 import cname_class.{C_CLASS_MAIN_IMPL, C_CLASS_MAIN_TYPE, C_CLASS_MAIN_VALUE}
 
@@ -676,4 +677,35 @@ pub fn trace_enter_fns(text: Str) -> Str {
         names.push(parts.get(0).unwrap())
     }
     names.join(" ")
+}
+
+// An @ffi.struct names the header that declares its C struct, and the unit #includes that
+// header, so a mirror of a struct that only a test defines needs a header the build can
+// reach. This stages a package under <scratch>/<tag>/ whose one native dependency is
+// vendored: vendor/<header> holds `header_text`, a C file that only includes it stands in
+// for the library, and src/main.bl is `main`. Gives the package directory.
+pub fn vendored_header_project(tag: Str, header: Str, header_text: Str, main: Str) -> Str ! FS.Write, Process.Spawn, Env.Read {
+    let root = "{scratch_root()}/{tag}"
+    let _ = sh("rm -rf {root} && mkdir -p {root}/src {root}/vendor")
+    fs.write("{root}/blink.toml", "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\n\n[native-dependencies]\nfixture = \{ type = \"vendored\", path = \"vendor/fixture.c\", headers = [\"{header}\"] }\n").unwrap()
+    fs.write("{root}/blink.lock", "[metadata]\nlockfile-version = 1\n").unwrap()
+    fs.write("{root}/vendor/{header}", header_text).unwrap()
+    fs.write("{root}/vendor/fixture.c", "#include \"{header}\"\n").unwrap()
+    fs.write("{root}/src/main.bl", main).unwrap()
+    root
+}
+
+// `blink <cmd>` in the package at dir, with the blink of the tree under test. The corpus
+// exports module filters that make each build one unit, so the run drops them: a
+// --per-module build must reach the per-module path.
+pub fn blink_in_project(dir: Str, cmd: Str) -> ProcessResult ! Process.Spawn {
+    let script = "B=$(pwd)/build/blink; cd {dir} && env -u BLINK_PER_MODULE -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE BLINK_CACHE_DIR={dir}/cache BLINK_BIN=$B $B {cmd} < /dev/null"
+    process.run("sh", ["-c", script], limits: ChildLimits { timeout: Some(Duration.seconds(300)) }).unwrap()
+}
+
+// `src` built and run with `blink run` in a package that vendors `header`, as compile_and_run
+// does for a file: a mirror that names its C struct needs a header the build can reach.
+pub fn compile_and_run_vendored(src: Str, tag: Str, header: Str, header_text: Str) -> RunResult ! FS.Write, Process.Spawn, Env.Read {
+    let r = blink_in_project(vendored_header_project(tag, header, header_text, src), "run src/main.bl")
+    RunResult { exit_code: run_code(r.end), out: r.out, err_out: r.err_out }
 }

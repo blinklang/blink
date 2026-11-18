@@ -1,0 +1,103 @@
+// `@ffi.struct(header, name)` is the one form of the annotation (§9.1.3, §11.1). `header` is the
+// C header that declares the struct and `name` is the C struct, so a mirror without either has
+// no C struct to check its layout against or to copy into. Check refuses it with
+// AnnotationArguments (E1134) at the argument list, or at the annotation name when there is no
+// list. One diagnostic only, even when both are missing.
+
+import std.fs
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_reset}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+import compile_test_helpers
+
+fn probe(name: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO, Process.Spawn {
+    init_embedded_stdlib()
+    let path = "{compile_test_helpers.scratch_root()}/_tc_struct_args_{name}.bl"
+    fs.write(path, src).unwrap()
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+}
+
+// Each error as "CODE@line:col-end_col".
+fn errors_of(name: Str, src: Str) -> List[Str] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO, Process.Spawn {
+    probe(name, src)
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" { out.push("{d.code}@{d.line}:{d.col}-{d.end_col}") }
+    }
+    out
+}
+
+// The annotation on line 1, then a mirror, a fn that takes and returns it, and main.
+fn decl(ann: Str) -> Str {
+    "{ann}\ntype Q \{ a: I32, b: I32 }\nfn g(q: Q) -> Q \{ q }\nfn main() \{}\n"
+}
+
+fn expect(name: Str, src: Str, want: List[Str]) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO, Process.Spawn {
+    let errs = errors_of(name, src)
+    if errs.join(",") == want.join(",") { return "" }
+    "{name}: want [{want.join(", ")}], got [{errs.join(", ")}]"
+}
+
+fn report(problems: List[Str]) ! IO.Eprint {
+    let mut bad = false
+    for p in problems {
+        if p != "" {
+            io.eprintln(p)
+            bad = true
+        }
+    }
+    assert(!bad)
+}
+
+fn e1134_help(name: Str, ann: Str) -> List[Str] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO, Process.Spawn {
+    probe(name, decl(ann))
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.code == "E1134" { out.push("{d.message} | {d.help}") }
+    }
+    out
+}
+
+test "an @ffi.struct with no argument list is E1134 at the annotation name" {
+    report([expect("bare", decl("@ffi.struct"), ["E1134@1:1-12"])])
+}
+
+test "an @ffi.struct argument list with no name or no header is E1134 at the list" {
+    report([
+        expect("header_only", decl("@ffi.struct(header: \"stdlib.h\")"), ["E1134@1:12-32"]),
+        expect("name_only", decl("@ffi.struct(name: \"div_t\")"), ["E1134@1:12-27"]),
+        expect("empty_list", decl("@ffi.struct()"), ["E1134@1:12-14"]),
+    ])
+}
+
+test "an empty header or name names nothing, so it is E1134" {
+    report([
+        expect("empty_header", decl("@ffi.struct(header: \"\", name: \"div_t\")"), ["E1134@1:12-39"]),
+        expect("empty_name", decl("@ffi.struct(header: \"stdlib.h\", name: \"\")"), ["E1134@1:12-42"]),
+    ])
+}
+
+test "an @ffi.struct on a sum type with no argument list is E1134 too" {
+    report([expect("on_enum", "@ffi.struct\ntype E \{ A, B }\nfn main() \{}\n", ["E1134@1:1-12"])])
+}
+
+test "an @ffi.struct that names its header and its C struct is not E1134" {
+    report([expect("full", decl("@ffi.struct(header: \"stdlib.h\", name: \"div_t\")"), [])])
+}
+
+test "the E1134 for an @ffi.struct says what is missing and prints the form of the annotation" {
+    let no_name = e1134_help("text_no_name", "@ffi.struct(header: \"stdlib.h\")")
+    assert_eq(no_name.len(), 1)
+    assert(no_name.get(0).unwrap().contains("does not name its C struct"))
+    assert(no_name.get(0).unwrap().contains("@ffi.struct(header, name)"))
+    let no_header = e1134_help("text_no_header", "@ffi.struct(name: \"div_t\")")
+    assert_eq(no_header.len(), 1)
+    assert(no_header.get(0).unwrap().contains("does not name its header"))
+    let neither = e1134_help("text_neither", "@ffi.struct")
+    assert_eq(neither.len(), 1)
+    assert(neither.get(0).unwrap().contains("does not name its header or C struct"))
+}
