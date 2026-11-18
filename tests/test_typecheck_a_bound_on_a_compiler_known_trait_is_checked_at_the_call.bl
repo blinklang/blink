@@ -190,13 +190,20 @@ let INTO_ITER_TYPES = "List, Map, Set, Str, Range, Channel, Bytes and Iterator"
 // `Iterator[T]` is a sealed type, not a trait (sections/03c_protocols.md §3c.1), and a type in a
 // bound is E0740 where it is written (§3c.4). The call is not judged again, and a method call
 // through the bound has no second report.
-fn type_not_trait(at: Str, name: Str, article: Str, ty: Str) -> Str {
-    "E0740@{at}@`{name}` is a type, not a trait@a bound names a trait; to take {article}, give the parameter the type `{ty}` in place of the type parameter"
+fn type_not_trait(at: Str, name: Str, ty: Str) -> Str {
+    "E0740@{at}@`{name}` is a type, not a trait@a bound names a trait; give the parameter the type `{ty}` in place of the type parameter"
+}
+
+// One error, with this code at this place.
+fn expect_one_code(name: Str, src: Str, code_at: Str) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO, Process.Spawn {
+    let errs = errors_of(name, src)
+    if errs.len() == 1 && errs.get(0).unwrap().starts_with("{code_at}@") { return "" }
+    "{name}: want one error at {code_at}\ngot {errs.len()}:\n  {errs.join("\n  ")}"
 }
 
 test "an Iterator bound is refused where it is written, whatever the call passes" {
     let decl = "fn k[T: Iterator[Int]](x: T) -> Int \{ x.count() }"
-    let want = type_not_trait("1:9", "Iterator", "an iterator", "Iterator[Int]")
+    let want = type_not_trait("1:9", "Iterator", "Iterator[Int]")
     report([
         expect_one("iter_ok", called(decl, "k([1].into_iter())"), want),
         expect_one("iter_int", called(decl, "k(1)"), want),
@@ -208,16 +215,30 @@ test "an Iterator bound is refused where it is written, whatever the call passes
 
 test "a bare Iterator bound is refused where it is written" {
     let decl = "fn k[T: Iterator](x: T) -> Int \{ x.count() }"
-    report([expect_one("iter_bare", called(decl, "k([1].into_iter())"), type_not_trait("1:9", "Iterator", "an iterator", "Iterator[...]"))])
+    report([expect_one("iter_bare", called(decl, "k([1].into_iter())"), type_not_trait("1:9", "Iterator", "Iterator[...]"))])
 }
 
 test "a bound that names a user type is refused where it is written" {
     let src = "type Widget \{ n: Int }\nfn k[T: Widget](x: T) -> Int \{ 0 }\nfn main() \{\n    let _ = k(Widget \{ n: 1 })\n}\n"
     let in_where = "type Widget \{ n: Int }\ntype Box[T] \{ v: T }\ntrait Pt \{ fn p(self) -> Int }\nimpl[T] Pt for Box[T] where T: Widget \{ fn p(self) -> Int \{ 1 } }\nfn main() \{ }\n"
     report([
-        expect_one("widget_bound", src, type_not_trait("2:9", "Widget", "a `Widget`", "Widget")),
-        expect_one("widget_where", in_where, type_not_trait("4:32", "Widget", "a `Widget`", "Widget")),
+        expect_one("widget_bound", src, type_not_trait("2:9", "Widget", "Widget")),
+        expect_one("widget_where", in_where, type_not_trait("4:32", "Widget", "Widget")),
     ])
+}
+
+// A program may declare its own trait `Iterator`; it shadows the prelude name, and a bound on it
+// names that trait.
+test "a bound on a trait the program names Iterator is a trait bound" {
+    let src = "trait Iterator \{ fn nxt(self) -> Int }\ntype A \{ n: Int }\nimpl Iterator for A \{ fn nxt(self) -> Int \{ self.n } }\nfn k[T: Iterator](x: T) -> Int \{ x.nxt() }\nfn main() \{\n    let _ = k(A \{ n: 1 })\n}\n"
+    report([expect_none("user_iterator_trait", src)])
+}
+
+// Only a bound written on the type parameter is refused with E0740, so only that bound
+// silences a method call through it. A supertrait that names a type does not.
+test "a method call through a trait whose supertrait names a type is still judged" {
+    let src = "type Widget \{ n: Int }\ntrait W2: Widget \{ fn extra(self) -> Int }\nfn k[T: W2](x: T) -> Int \{ x.bogus() }\nfn main() \{ }\n"
+    report([expect_one_code("supertrait_type", src, "E0505@3:28")])
 }
 
 test "a bound on a compiler-known trait still checks clean" {

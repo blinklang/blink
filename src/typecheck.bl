@@ -23506,12 +23506,7 @@ fn tc_effect_context_type(name: Str, at: Int) -> Int ! Diag.Report {
         let parent = name.byte_slice(0, name.byte_len() - sub.byte_len())
         let message = "`{name}` is a sub-effect, which gives no type"
         tc_errors.push(message)
-        // A type annotation's own line and col read after its last token; its written span
-        // starts at the name.
-        let (w_line, w_col, _, _) = node_written_span(at)
-        let written = node_kind(at) == NodeKind.TypeAnn && w_line != 0
-        let line = if written { w_line } else { node_line(at) }
-        let col = if written { w_col } else { node_col(at) }
+        let (line, col) = tc_written_name_start(at)
         diag_error_span_label_at_notes("SubEffectAsType", SUB_EFFECT_AS_TYPE, message, at, line, col, col + name.byte_len(), "a sub-effect of `{parent}`", "name the parent effect: `{parent}`", [])
     }
     tc_error_recovery_tid()
@@ -31783,16 +31778,43 @@ fn nr_check_binder_bounds(binders_sl: Int) ! TypeCheck.Resolve, Diag.Report {
 }
 
 // A bare bound name that names a type and no trait. `Iterator` is a sealed type (sections/03c_protocols.md
-// §3c.1), though the compiler keeps its method surface under that name. A qualified name is
-// left to its own resolution.
+// §3c.1), though the compiler keeps its method surface under that name; a trait the program
+// declares under that name shadows it and is a trait. A qualified name is left to its own
+// resolution.
 fn nr_bound_names_a_type(written: Str, trait_name: Str) -> Bool {
-    if written.byte_index_of(".", 0).is_some() { return false }
-    if written == "Iterator" { return true }
-    is_trait_name(trait_name) == 0 && !tc_undeclared_trait_names().contains(trait_name) && tc_names_a_type(written)
+    if written.byte_index_of(".", 0).is_some() || is_trait_name(trait_name) != 0 { return false }
+    written == "Iterator" || (!tc_undeclared_trait_names().contains(trait_name) && tc_names_a_type(written))
 }
 
-fn tc_bound_type_article(written: Str) -> Str {
-    if written == "Iterator" { "an iterator" } else { "a `{written}`" }
+// A type annotation's own line and col read after its last token; its written span starts at
+// the name.
+fn tc_written_name_start(node: Int) -> (Int, Int) {
+    let (w_line, w_col, _, _) = node_written_span(node)
+    if node_kind(node) == NodeKind.TypeAnn && w_line != 0 { return (w_line, w_col) }
+    (node_line(node), node_col(node))
+}
+
+// true when a bound written on the type parameter `name`, at its binder or in a `where`, names
+// a type. Only the written bounds count: those are the ones refused with E0740, and a
+// supertrait reached through them is not.
+fn tc_tparam_has_type_bound(name: Str) -> Bool {
+    let mut binder = NO_BINDER_NODE
+    let mut i = tc_tp_frames.len() - 1
+    while i >= 0 {
+        let f = tc_tp_frames.get(i).unwrap()
+        if f.name == name && (binder == NO_BINDER_NODE || f.binder == binder) {
+            binder = f.binder
+            let bounds = if f.bounds_node >= 0 { node_elements(f.bounds_node) } else { -1 }
+            let mut j = 0
+            while bounds != -1 && j < sublist_length(bounds) {
+                let b = sublist_get(bounds, j)
+                if nr_bound_names_a_type(node_name(b), tc_bound_trait(b)) { return true }
+                j = j + 1
+            }
+        }
+        i = i - 1
+    }
+    false
 }
 
 fn nr_check_bound_args(bound: Int) ! TypeCheck.Resolve, Diag.Report {
@@ -31801,13 +31823,10 @@ fn nr_check_bound_args(bound: Int) ! TypeCheck.Resolve, Diag.Report {
     // A bound names a trait, so a name no trait declares gets the impl header's error.
     let undeclared = tc_undeclared_trait_names().contains(trait_name)
     if nr_bound_names_a_type(written, trait_name) {
-        // A type annotation's own line and col read after its last token; its written span
-        // starts at the name.
-        let (w_line, w_col, _, _) = node_written_span(bound)
-        let line = if w_line != 0 { w_line } else { node_line(bound) }
-        let col = if w_line != 0 { w_col } else { node_col(bound) }
+        let (line, col) = tc_written_name_start(bound)
+        let shown = if node_elements(bound) == -1 && written == "Iterator" { "Iterator[...]" } else { type_ann_text(bound) }
         diag_error_span_at_notes("TypeNotTrait", TYPE_NOT_TRAIT, "`{written}` is a type, not a trait", bound, line, col, col + written.len(),
-            "a bound names a trait; to take {tc_bound_type_article(written)}, give the parameter the type `{if node_elements(bound) == -1 && written == "Iterator" { "Iterator[...]" } else { type_ann_text(bound) }}` in place of the type parameter", [])
+            "a bound names a trait; give the parameter the type `{shown}` in place of the type parameter", [])
         return
     }
     if is_trait_name(trait_name) == 0 && !undeclared {
@@ -31919,12 +31938,7 @@ fn nr_refuse_self_outside(name: Str, at: Int) -> Bool ! Diag.Report {
     if nr_walk.in_trait_or_impl { return false }
     if name != "Self" && !name.starts_with("Self.") { return false }
     tc_errors.push("`Self` outside trait or impl")
-    // A type annotation's own line and col read after its last token; its written span
-    // starts at the name.
-    let (w_line, w_col, _, _) = node_written_span(at)
-    let written = node_kind(at) == NodeKind.TypeAnn && w_line != 0
-    let line = if written { w_line } else { node_line(at) }
-    let col = if written { w_col } else { node_col(at) }
+    let (line, col) = tc_written_name_start(at)
     diag_error_span_label_at_notes("SelfOutsideTraitOrImpl", SELF_OUTSIDE_TRAIT_OR_IMPL, "`Self` outside trait or impl", at, line, col, col + 4, "`Self` is only valid inside trait declarations and impl blocks", "", [])
     true
 }
@@ -34886,11 +34900,9 @@ fn tc_refuse_tparam_method(node: Int, obj_t: Int, method: Str) -> Bool ! TypeChe
     let tv_traits = tc_tparam_bound_traits(tv_name)
     // A bound that names a type was refused where it is written (E0740), and it licenses no
     // method, so a call through it has no second report.
-    for t in tv_traits.split("|") {
-        if !t.is_empty() && nr_bound_names_a_type(t, t) {
-            tc_method_calls.hard.insert(node, 1)
-            return true
-        }
+    if tc_tparam_has_type_bound(tv_name) {
+        tc_method_calls.hard.insert(node, 1)
+        return true
     }
     if tc_pipe_joined(tv_traits) != "" {
         if !tc_guarantee_lists_all_methods(tv_traits) || tc_pipe_has(tc_guarantee_methods(tv_traits), method) != 0 { return false }
