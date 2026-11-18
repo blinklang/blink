@@ -6157,7 +6157,7 @@ Flipping a sealed default to open is non-breaking and requires no migration.
 `Self` is a built-in type alias that refers to the implementing type. It is valid in exactly two contexts:
 
 1. **Trait declarations** — `Self` refers to whichever type will implement the trait. The whole declaration is in scope, header included: a supertrait clause and a `where` clause can write `Self`.
-2. **`impl` bodies** — `Self` refers to the type being implemented. The `Self` of an impl binds at the `{` of its body. The impl header is outside the body (see *`Self` in an impl header* below).
+2. **`impl` bodies** — `Self` refers to the type being implemented. The `Self` of an impl binds at the `{` of its body. The impl header is outside the body (see *`Self` in an impl header* below). In an impl body, `Self` names the target type in every position, a value path and a pattern too (see *`Self` as the head of a value path or a pattern* below).
 
 Outside these contexts, `Self` is a compile error.
 
@@ -6242,17 +6242,124 @@ trait Combiner {
 let merged = Combiner.combine(left, right)
 ```
 
-**`Self` is a type-position alias, not a constructor.** You cannot write `Self { field: value }` or `Self(args)` to construct values. Use the concrete type name.
+**`Self` as the head of a value path or a pattern.** In an impl body, `Self` is the target type in every position. A value path or a pattern that `Self` heads compiles exactly as the same text with the type name does. In a trait default body, `Self` is abstract, and a build form or a pattern that `Self` heads is `SelfShapeInDefaultBody` (E0570).
+
+```blink
+type Color {
+    Red
+    Rgb(Int)
+}
+
+type Point {
+    x: Int
+    y: Int
+}
+
+fn Color.parse(s: Str) -> Color { if s == "red" { Color.Red } else { Color.Rgb(0) } }
+
+trait Mk {
+    fn make(n: Int) -> Self
+    fn bump(self) -> Self
+}
+
+impl Mk for Color {
+    fn make(n: Int) -> Self {
+        if n == 0 { Self.parse("red") } else { Self.Rgb(n) }   // OK: a type-scoped fn of Color, and Color.Rgb(n)
+    }
+    fn bump(self) -> Self {
+        match self {
+            Self.Rgb(k) => Self.make(k + 1)                    // OK: a pattern and a static call
+            Self.Red => Self.Red                               // OK: the same as Color.Red, as a pattern and as a value
+        }
+    }
+}
+
+impl Mk for Point {
+    fn make(n: Int) -> Self { Self { x: n, y: n } }            // OK: the same as Point { x: n, y: n }
+    fn bump(self) -> Self {
+        let Self { x, y } = self                               // OK: the same as Point { x, y }
+        Self { x: y, y: x }
+    }
+}
+```
+
+These are the rules for an impl body. Each rule has its own line:
+
+- `Self.V` and `Self.V(..)` build a variant of the target enum, as `Color.V` and `Color.V(..)` do.
+- `Self { x: 1, y: 2 }` builds the target struct, as `Point { x: 1, y: 2 }` does. A struct literal with no labels follows the same rule as the type name.
+- `Self(..)` is a call. It compiles when `Point(..)` compiles, and it gives the code that `Point(..)` gives when that fails.
+- `Self.f(..)` calls a type-scoped fn of the target type, as `Color.f(..)` does. It needs no trait.
+- The patterns `Self.V`, `Self.V(..)` and `Self { x, y }` match as `Color.V`, `Color.V(..)` and `Point { x, y }` do.
+- A form that the type name refuses gets the code that the type name gets. `Self.Blue` on `Color`, which has no `Blue`, is E0547, as `Color.Blue` is. `Self { z: 1 }` on `Point` is E0525, as `Point { z: 1 }` is.
+- The impl of a trait and the plain impl of a type follow the same rules.
+- Where `Self` names the type, the type name names it too. Neither spelling is an error.
+
+```blink
+impl Mk for Color {
+    fn make(n: Int) -> Self { Self.Blue }                      // E0547: `Color` has no variant `Blue`, the same as `Color.Blue`
+    fn bump(self) -> Self { self }
+}
+
+impl Mk for Point {
+    fn make(n: Int) -> Self { Self { x: n, y: n, z: n } }      // E0525: `Point` has no field `z`, the same as `Point { x: n, y: n, z: n }`
+    fn bump(self) -> Self { self }
+}
+```
+
+In a trait default body, `Self` is abstract: the trait does not know the fields or the variants of the type that implements it. So every one of these forms is `SelfShapeInDefaultBody` (E0570), one error at the `Self` token:
+
+- a variant build, `Self.V` and `Self.V(..)`;
+- a struct build, `Self { .. }`, with labels or with none;
+- a call `Self(..)`;
+- a pattern `Self.V`, `Self.V(..)` and `Self { x }`.
+
+The label says that `Self` is abstract in a trait default body, and that it has no fields or variants to build or match. The label also says that the same form compiles in an impl body. The help says to declare a trait fn that returns `Self` and to call it as `Self.make()`.
+
+```blink
+type Level {
+    Low
+    High
+}
+
+trait Mk {
+    fn make() -> Self
+    fn twice() -> List[Self] { [Self.make(), Self.make()] }   // OK: `make` is in the guarantee set
+    fn origin() -> Self { Self.Low }                           // E0570
+    fn pair() -> Self { Self { x: 0 } }                        // E0570
+    fn blank() -> Self { Self {} }                             // E0570
+    fn wrap() -> Self { Self(1) }                              // E0570
+    fn is_low(self) -> Bool {
+        match self {
+            Self.Low => true                                   // E0570
+            _ => false
+        }
+    }
+    fn has_x(self) -> Bool {
+        match self {
+            Self { x } => x == 0                               // E0570
+        }
+    }
+}
+
+impl Mk for Level {
+    fn make() -> Self { Self.Low }                             // OK: in an impl body `Self` is Level
+}
+```
 
 ```
-error[SelfNotConstructor]: `Self` is not a constructor
- --> shapes.bl:12:9
+error[SelfShapeInDefaultBody]: `Self` is abstract in a trait default body
+ --> mk.bl:9:30
   |
-12|         Self { x: 0, y: 0 }
-  |         ^^^^ cannot construct with `Self`
+9 |     fn origin() -> Self { Self.Low }
+  |                           ^^^^ `Self` is abstract in a trait default body; it has no fields or variants to build or match
   |
-  = help: use the concrete type name: `Point { x: 0, y: 0 }`
+  = note: the same form compiles in an impl body, where `Self` is the target type
+  = help: declare `fn make() -> Self` in the trait and call `Self.make()`
 ```
+
+A static call through `Self` in a default body follows the guarantee set of *Operations on `Self` in a Default Body*. `Self.f()` is legal when `f` is a function in the guarantee set, as `T.zero()` is for a type parameter with that bound. Any other `f` is E0305 `UnlicensedSelfOperation`. `Self.make()` above is legal because the trait declares `make`.
+
+`Self` outside a trait declaration and an impl body is E0569, with no change: `Self.x`, `Self(..)`, `Self { .. }` and a `Self.V` pattern in a free fn are `SelfOutsideTraitOrImpl`.
 
 **`self` is always passed by value.** Blink has no by-reference vs by-move distinction. The `self` parameter is a value like any other parameter. No `&self`, `&mut self`, or `self: Box[Self]` forms exist. `mut self` is a mutable parameter (see *Mutable Parameters* below), not a reference.
 
