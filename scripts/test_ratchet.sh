@@ -141,6 +141,8 @@ fn collect() {
 }
 EOF
   mkdir -p "$dir/tests" "$dir/lib/std"
+  # One old-form runtime bridge: lib_std_ffi_bridge_decls counts these down to 0.
+  printf '%s\n' '@ffi("blink_old_len")' 'fn old_len(s: Str) -> Int ! FFI {}' > "$dir/lib/std/bridge.bl"
   cat > "$dir/tests/test_pool_reader.bl" <<'EOF'
 import parser.{
     nodes,
@@ -503,6 +505,52 @@ check_pool_write parser-column-push src/parser.bl 'fn scratch() { columns.child_
 check_pool_write parser-column-set src/parser.bl 'fn scratch() { columns.child_at.set(0, 1) }'
 check_pool_write parser-column-slot src/parser.bl 'fn scratch() { columns.kinds[0] = 3 }'
 
+# lib_std_ffi_bridge_decls counts `@ffi` decls in lib/std that bind a runtime
+# symbol, the form `@runtime` replaces. One more must fail on that row; a
+# `@runtime` decl or an `@ffi` to a C symbol must not count.
+check_bridge() {
+  label="$1"; want="$2"; extra="$3"
+  d="$WORK/bridge_$label"
+  rm -rf "$d"
+  cp -r "$BASE" "$d"
+  printf '%s\n' "$extra" >> "$d/lib/std/bridge.bl"
+  out=$(RATCHET_SRC_DIR="$d" RATCHET_BASELINE="$BASELINE" RATCHET_HEAD1_DIR="$BASE" ./scripts/ratchet.sh 2>&1)
+  rc=$?
+  if [ "$want" = fail ]; then
+    if [ $rc = 0 ]; then
+      echo "FAIL lib_std_ffi_bridge_decls-$label: ratchet.sh passed"
+      fail=1
+    elif ! printf '%s\n' "$out" | rg -q '^lib_std_ffi_bridge_decls .*UP'; then
+      echo "FAIL lib_std_ffi_bridge_decls-$label: the run failed, but not on this row"
+      printf '%s\n' "$out"
+      fail=1
+    else
+      echo "PASS lib_std_ffi_bridge_decls-$label: failed on this row"
+    fi
+  elif [ $rc != 0 ]; then
+    echo "FAIL lib_std_ffi_bridge_decls-$label: ratchet.sh failed"
+    printf '%s\n' "$out"
+    fail=1
+  elif ! printf '%s\n' "$out" | rg -q '^lib_std_ffi_bridge_decls +1 +1 +1$'; then
+    echo "FAIL lib_std_ffi_bridge_decls-$label: the row did not read the fixture's one bridge"
+    printf '%s\n' "$out"
+    fail=1
+  else
+    echo "PASS lib_std_ffi_bridge_decls-$label: passed"
+  fi
+}
+
+check_bridge blink fail '@ffi("blink_new_len")
+fn new_len(s: Str) -> Int ! () {}'
+check_bridge blinkrt fail '@ffi("blinkrt_new_len")
+fn new_len(s: Str) -> Int ! () {}'
+check_bridge private-runtime fail '@ffi("__blink_new_len")
+fn new_len(s: Str) -> Int ! () {}'
+check_bridge runtime-form pass '@runtime("blink_new_len")
+fn new_len(s: Str) -> Int'
+check_bridge c-symbol pass '@ffi("abs", header: "stdlib.h")
+fn c_abs(n: I32) -> I32 ! ()'
+
 # repo_tmp_in_tests_and_scripts is an absolute zero gate: a `.tmp/` path added to a
 # test or a script must fail on that row, inside a tree the file made itself too.
 check_repo_tmp() {
@@ -773,6 +821,53 @@ echo 'pub let mut a: Int = 0' > "$WALKWORK/src/codegen.bl"
     exit 1
   fi
   echo "PASS git-walk-merge: a merge rises only when it passes every parent"
+)
+if [ $? != 0 ]; then fail=1; fi
+
+# lib/ in the git-backed reference: the dirty-tree test must read lib/, and the
+# reference commit must hold lib/std, or a lib row is counted as 0 there.
+GITLIB="$WORK/gitlib"
+mkdir -p "$GITLIB/scripts" "$GITLIB/src" "$GITLIB/lib/std"
+cp ./scripts/ratchet.sh ./scripts/br_ids.sh "$GITLIB/scripts/"
+chmod +x "$GITLIB/scripts/ratchet.sh"
+echo 'pub let mut a: Int = 0' > "$GITLIB/src/codegen.bl"
+: > "$GITLIB/src/mono.bl"
+: > "$GITLIB/Taskfile.yml"
+: > "$GITLIB/lib/std/other.bl"
+(
+  cd "$GITLIB" || exit 1
+  git init -q .
+  git config user.email t@example.com
+  git config user.name t
+  git add -A
+  git commit -q -m one
+  # A regression lands in commit two, so a run that falls back to HEAD~1 fails.
+  printf '%s\n' 'pub let mut b: Int = 0' >> src/codegen.bl
+  git add -A
+  git commit -q -m two
+  ./scripts/ratchet.sh --update > /dev/null
+
+  printf '%s\n' '// a lib comment, no count change' >> lib/std/other.bl
+  lib_out=$(./scripts/ratchet.sh 2>&1)
+  if [ $? != 0 ]; then
+    echo "FAIL git-lib-dirty-picks-head: a lib/-only edit should compare against HEAD, not the older HEAD~1"
+    printf '%s\n' "$lib_out"
+    exit 1
+  fi
+  echo "PASS git-lib-dirty-picks-head: a lib/-only edit compared against HEAD"
+
+  printf '%s\n' '@ffi("blink_old_len")' 'fn old_len(s: Str) -> Int ! FFI {}' > lib/std/bridge.bl
+  git add -A
+  git commit -q -m three
+  ./scripts/ratchet.sh --update > /dev/null
+  printf '%s\n' '// a src comment, no count change' >> src/codegen.bl
+  lib_out=$(./scripts/ratchet.sh 2>&1)
+  if [ $? != 0 ] || ! printf '%s\n' "$lib_out" | rg -q '^lib_std_ffi_bridge_decls +1 +1 +1$'; then
+    echo "FAIL git-lib-in-reference: the reference commit must hold lib/std, so its bridge count is 1"
+    printf '%s\n' "$lib_out"
+    exit 1
+  fi
+  echo "PASS git-lib-in-reference: the reference commit counted lib/std"
 )
 if [ $? != 0 ]; then fail=1; fi
 

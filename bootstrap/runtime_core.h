@@ -2429,17 +2429,17 @@ BLINK_RT_FN void blinkrt_bytes_reserve(blink_bytes* b, int64_t extra) {
 
 /* ── Reads: big-endian ────────────────────────────────────────────────── */
 
-BLINK_RT_FN int64_t blinkrt_bytes_read_u16_be(blink_bytes* b, int64_t off);
+BLINK_RT_FN int64_t blink_bytes_read_u16_be(blink_bytes* b, int64_t off);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN int64_t blinkrt_bytes_read_u16_be(blink_bytes* b, int64_t off) {
+BLINK_RT_FN int64_t blink_bytes_read_u16_be(blink_bytes* b, int64_t off) {
     const uint8_t* p = b->data + off;
     return (int64_t)(((uint16_t)p[0] << 8) | (uint16_t)p[1]);
 }
 #endif
 
-BLINK_RT_FN int64_t blinkrt_bytes_read_u32_be(blink_bytes* b, int64_t off);
+BLINK_RT_FN int64_t blink_bytes_read_u32_be(blink_bytes* b, int64_t off);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN int64_t blinkrt_bytes_read_u32_be(blink_bytes* b, int64_t off) {
+BLINK_RT_FN int64_t blink_bytes_read_u32_be(blink_bytes* b, int64_t off) {
     const uint8_t* p = b->data + off;
     uint32_t v = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
                  ((uint32_t)p[2] << 8)  | (uint32_t)p[3];
@@ -2447,9 +2447,9 @@ BLINK_RT_FN int64_t blinkrt_bytes_read_u32_be(blink_bytes* b, int64_t off) {
 }
 #endif
 
-BLINK_RT_FN int64_t blinkrt_bytes_read_i32_be(blink_bytes* b, int64_t off);
+BLINK_RT_FN int64_t blink_bytes_read_i32_be(blink_bytes* b, int64_t off);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN int64_t blinkrt_bytes_read_i32_be(blink_bytes* b, int64_t off) {
+BLINK_RT_FN int64_t blink_bytes_read_i32_be(blink_bytes* b, int64_t off) {
     const uint8_t* p = b->data + off;
     uint32_t v = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
                  ((uint32_t)p[2] << 8)  | (uint32_t)p[3];
@@ -2457,9 +2457,9 @@ BLINK_RT_FN int64_t blinkrt_bytes_read_i32_be(blink_bytes* b, int64_t off) {
 }
 #endif
 
-BLINK_RT_FN int64_t blinkrt_bytes_read_i64_be(blink_bytes* b, int64_t off);
+BLINK_RT_FN int64_t blink_bytes_read_i64_be(blink_bytes* b, int64_t off);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN int64_t blinkrt_bytes_read_i64_be(blink_bytes* b, int64_t off) {
+BLINK_RT_FN int64_t blink_bytes_read_i64_be(blink_bytes* b, int64_t off) {
     const uint8_t* p = b->data + off;
     uint64_t v = ((uint64_t)p[0] << 56) | ((uint64_t)p[1] << 48) |
                  ((uint64_t)p[2] << 40) | ((uint64_t)p[3] << 32) |
@@ -2471,17 +2471,17 @@ BLINK_RT_FN int64_t blinkrt_bytes_read_i64_be(blink_bytes* b, int64_t off) {
 
 /* ── Reads: little-endian ─────────────────────────────────────────────── */
 
-BLINK_RT_FN int64_t blinkrt_bytes_read_u16_le(blink_bytes* b, int64_t off);
+BLINK_RT_FN int64_t blink_bytes_read_u16_le(blink_bytes* b, int64_t off);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN int64_t blinkrt_bytes_read_u16_le(blink_bytes* b, int64_t off) {
+BLINK_RT_FN int64_t blink_bytes_read_u16_le(blink_bytes* b, int64_t off) {
     const uint8_t* p = b->data + off;
     return (int64_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8));
 }
 #endif
 
-BLINK_RT_FN int64_t blinkrt_bytes_read_u32_le(blink_bytes* b, int64_t off);
+BLINK_RT_FN int64_t blink_bytes_read_u32_le(blink_bytes* b, int64_t off);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN int64_t blinkrt_bytes_read_u32_le(blink_bytes* b, int64_t off) {
+BLINK_RT_FN int64_t blink_bytes_read_u32_le(blink_bytes* b, int64_t off) {
     const uint8_t* p = b->data + off;
     uint32_t v = (uint32_t)p[0]         | ((uint32_t)p[1] << 8) |
                  ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
@@ -2489,9 +2489,9 @@ BLINK_RT_FN int64_t blinkrt_bytes_read_u32_le(blink_bytes* b, int64_t off) {
 }
 #endif
 
-BLINK_RT_FN int64_t blinkrt_bytes_read_i32_le(blink_bytes* b, int64_t off);
+BLINK_RT_FN int64_t blink_bytes_read_i32_le(blink_bytes* b, int64_t off);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN int64_t blinkrt_bytes_read_i32_le(blink_bytes* b, int64_t off) {
+BLINK_RT_FN int64_t blink_bytes_read_i32_le(blink_bytes* b, int64_t off) {
     const uint8_t* p = b->data + off;
     uint32_t v = (uint32_t)p[0]         | ((uint32_t)p[1] << 8) |
                  ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
@@ -2499,9 +2499,9 @@ BLINK_RT_FN int64_t blinkrt_bytes_read_i32_le(blink_bytes* b, int64_t off) {
 }
 #endif
 
-BLINK_RT_FN int64_t blinkrt_bytes_read_i64_le(blink_bytes* b, int64_t off);
+BLINK_RT_FN int64_t blink_bytes_read_i64_le(blink_bytes* b, int64_t off);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN int64_t blinkrt_bytes_read_i64_le(blink_bytes* b, int64_t off) {
+BLINK_RT_FN int64_t blink_bytes_read_i64_le(blink_bytes* b, int64_t off) {
     const uint8_t* p = b->data + off;
     uint64_t v = (uint64_t)p[0]         | ((uint64_t)p[1] << 8)  |
                  ((uint64_t)p[2] << 16) | ((uint64_t)p[3] << 24) |
@@ -2513,9 +2513,9 @@ BLINK_RT_FN int64_t blinkrt_bytes_read_i64_le(blink_bytes* b, int64_t off) {
 
 /* ── Writes: big-endian ───────────────────────────────────────────────── */
 
-BLINK_RT_FN void blinkrt_bytes_write_u16_be(blink_bytes* b, int64_t v);
+BLINK_RT_FN void blink_bytes_write_u16_be(blink_bytes* b, int64_t v);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN void blinkrt_bytes_write_u16_be(blink_bytes* b, int64_t v) {
+BLINK_RT_FN void blink_bytes_write_u16_be(blink_bytes* b, int64_t v) {
     blinkrt_bytes_reserve(b, 2);
     uint16_t u = (uint16_t)(v & 0xFFFF);
     b->data[b->len++] = (uint8_t)(u >> 8);
@@ -2523,9 +2523,9 @@ BLINK_RT_FN void blinkrt_bytes_write_u16_be(blink_bytes* b, int64_t v) {
 }
 #endif
 
-BLINK_RT_FN void blinkrt_bytes_write_u32_be(blink_bytes* b, int64_t v);
+BLINK_RT_FN void blink_bytes_write_u32_be(blink_bytes* b, int64_t v);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN void blinkrt_bytes_write_u32_be(blink_bytes* b, int64_t v) {
+BLINK_RT_FN void blink_bytes_write_u32_be(blink_bytes* b, int64_t v) {
     blinkrt_bytes_reserve(b, 4);
     uint32_t u = (uint32_t)(v & 0xFFFFFFFFLL);
     b->data[b->len++] = (uint8_t)(u >> 24);
@@ -2535,16 +2535,16 @@ BLINK_RT_FN void blinkrt_bytes_write_u32_be(blink_bytes* b, int64_t v) {
 }
 #endif
 
-BLINK_RT_FN void blinkrt_bytes_write_i32_be(blink_bytes* b, int64_t v);
+BLINK_RT_FN void blink_bytes_write_i32_be(blink_bytes* b, int64_t v);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN void blinkrt_bytes_write_i32_be(blink_bytes* b, int64_t v) {
-    blinkrt_bytes_write_u32_be(b, (int64_t)(uint32_t)(int32_t)v);
+BLINK_RT_FN void blink_bytes_write_i32_be(blink_bytes* b, int64_t v) {
+    blink_bytes_write_u32_be(b, (int64_t)(uint32_t)(int32_t)v);
 }
 #endif
 
-BLINK_RT_FN void blinkrt_bytes_write_i64_be(blink_bytes* b, int64_t v);
+BLINK_RT_FN void blink_bytes_write_i64_be(blink_bytes* b, int64_t v);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN void blinkrt_bytes_write_i64_be(blink_bytes* b, int64_t v) {
+BLINK_RT_FN void blink_bytes_write_i64_be(blink_bytes* b, int64_t v) {
     blinkrt_bytes_reserve(b, 8);
     uint64_t u = (uint64_t)v;
     b->data[b->len++] = (uint8_t)(u >> 56);
@@ -2560,9 +2560,9 @@ BLINK_RT_FN void blinkrt_bytes_write_i64_be(blink_bytes* b, int64_t v) {
 
 /* ── Writes: little-endian ────────────────────────────────────────────── */
 
-BLINK_RT_FN void blinkrt_bytes_write_u16_le(blink_bytes* b, int64_t v);
+BLINK_RT_FN void blink_bytes_write_u16_le(blink_bytes* b, int64_t v);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN void blinkrt_bytes_write_u16_le(blink_bytes* b, int64_t v) {
+BLINK_RT_FN void blink_bytes_write_u16_le(blink_bytes* b, int64_t v) {
     blinkrt_bytes_reserve(b, 2);
     uint16_t u = (uint16_t)(v & 0xFFFF);
     b->data[b->len++] = (uint8_t)(u & 0xFF);
@@ -2570,9 +2570,9 @@ BLINK_RT_FN void blinkrt_bytes_write_u16_le(blink_bytes* b, int64_t v) {
 }
 #endif
 
-BLINK_RT_FN void blinkrt_bytes_write_u32_le(blink_bytes* b, int64_t v);
+BLINK_RT_FN void blink_bytes_write_u32_le(blink_bytes* b, int64_t v);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN void blinkrt_bytes_write_u32_le(blink_bytes* b, int64_t v) {
+BLINK_RT_FN void blink_bytes_write_u32_le(blink_bytes* b, int64_t v) {
     blinkrt_bytes_reserve(b, 4);
     uint32_t u = (uint32_t)(v & 0xFFFFFFFFLL);
     b->data[b->len++] = (uint8_t)(u & 0xFF);
@@ -2582,16 +2582,16 @@ BLINK_RT_FN void blinkrt_bytes_write_u32_le(blink_bytes* b, int64_t v) {
 }
 #endif
 
-BLINK_RT_FN void blinkrt_bytes_write_i32_le(blink_bytes* b, int64_t v);
+BLINK_RT_FN void blink_bytes_write_i32_le(blink_bytes* b, int64_t v);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN void blinkrt_bytes_write_i32_le(blink_bytes* b, int64_t v) {
-    blinkrt_bytes_write_u32_le(b, (int64_t)(uint32_t)(int32_t)v);
+BLINK_RT_FN void blink_bytes_write_i32_le(blink_bytes* b, int64_t v) {
+    blink_bytes_write_u32_le(b, (int64_t)(uint32_t)(int32_t)v);
 }
 #endif
 
-BLINK_RT_FN void blinkrt_bytes_write_i64_le(blink_bytes* b, int64_t v);
+BLINK_RT_FN void blink_bytes_write_i64_le(blink_bytes* b, int64_t v);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN void blinkrt_bytes_write_i64_le(blink_bytes* b, int64_t v) {
+BLINK_RT_FN void blink_bytes_write_i64_le(blink_bytes* b, int64_t v) {
     blinkrt_bytes_reserve(b, 8);
     uint64_t u = (uint64_t)v;
     b->data[b->len++] = (uint8_t)(u & 0xFF);
@@ -2610,9 +2610,9 @@ BLINK_RT_FN void blinkrt_bytes_write_i64_le(blink_bytes* b, int64_t v) {
    invoking, so these are unchecked. Sets write in-place; they do NOT
    grow the buffer (that's what write_*_le/be is for). */
 
-BLINK_RT_FN void blinkrt_bytes_set_u16_be(blink_bytes* b, int64_t off, int64_t v);
+BLINK_RT_FN void blink_bytes_set_u16_be(blink_bytes* b, int64_t off, int64_t v);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN void blinkrt_bytes_set_u16_be(blink_bytes* b, int64_t off, int64_t v) {
+BLINK_RT_FN void blink_bytes_set_u16_be(blink_bytes* b, int64_t off, int64_t v) {
     uint16_t u = (uint16_t)(v & 0xFFFF);
     uint8_t* p = b->data + off;
     p[0] = (uint8_t)(u >> 8);
@@ -2620,9 +2620,9 @@ BLINK_RT_FN void blinkrt_bytes_set_u16_be(blink_bytes* b, int64_t off, int64_t v
 }
 #endif
 
-BLINK_RT_FN void blinkrt_bytes_set_u16_le(blink_bytes* b, int64_t off, int64_t v);
+BLINK_RT_FN void blink_bytes_set_u16_le(blink_bytes* b, int64_t off, int64_t v);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN void blinkrt_bytes_set_u16_le(blink_bytes* b, int64_t off, int64_t v) {
+BLINK_RT_FN void blink_bytes_set_u16_le(blink_bytes* b, int64_t off, int64_t v) {
     uint16_t u = (uint16_t)(v & 0xFFFF);
     uint8_t* p = b->data + off;
     p[0] = (uint8_t)(u & 0xFF);
@@ -2630,23 +2630,23 @@ BLINK_RT_FN void blinkrt_bytes_set_u16_le(blink_bytes* b, int64_t off, int64_t v
 }
 #endif
 
-BLINK_RT_FN void blinkrt_bytes_set_i16_be(blink_bytes* b, int64_t off, int64_t v);
+BLINK_RT_FN void blink_bytes_set_i16_be(blink_bytes* b, int64_t off, int64_t v);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN void blinkrt_bytes_set_i16_be(blink_bytes* b, int64_t off, int64_t v) {
-    blinkrt_bytes_set_u16_be(b, off, (int64_t)(uint16_t)(int16_t)v);
+BLINK_RT_FN void blink_bytes_set_i16_be(blink_bytes* b, int64_t off, int64_t v) {
+    blink_bytes_set_u16_be(b, off, (int64_t)(uint16_t)(int16_t)v);
 }
 #endif
 
-BLINK_RT_FN void blinkrt_bytes_set_i16_le(blink_bytes* b, int64_t off, int64_t v);
+BLINK_RT_FN void blink_bytes_set_i16_le(blink_bytes* b, int64_t off, int64_t v);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN void blinkrt_bytes_set_i16_le(blink_bytes* b, int64_t off, int64_t v) {
-    blinkrt_bytes_set_u16_le(b, off, (int64_t)(uint16_t)(int16_t)v);
+BLINK_RT_FN void blink_bytes_set_i16_le(blink_bytes* b, int64_t off, int64_t v) {
+    blink_bytes_set_u16_le(b, off, (int64_t)(uint16_t)(int16_t)v);
 }
 #endif
 
-BLINK_RT_FN void blinkrt_bytes_set_u32_be(blink_bytes* b, int64_t off, int64_t v);
+BLINK_RT_FN void blink_bytes_set_u32_be(blink_bytes* b, int64_t off, int64_t v);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN void blinkrt_bytes_set_u32_be(blink_bytes* b, int64_t off, int64_t v) {
+BLINK_RT_FN void blink_bytes_set_u32_be(blink_bytes* b, int64_t off, int64_t v) {
     uint32_t u = (uint32_t)(v & 0xFFFFFFFFLL);
     uint8_t* p = b->data + off;
     p[0] = (uint8_t)(u >> 24);
@@ -2656,9 +2656,9 @@ BLINK_RT_FN void blinkrt_bytes_set_u32_be(blink_bytes* b, int64_t off, int64_t v
 }
 #endif
 
-BLINK_RT_FN void blinkrt_bytes_set_u32_le(blink_bytes* b, int64_t off, int64_t v);
+BLINK_RT_FN void blink_bytes_set_u32_le(blink_bytes* b, int64_t off, int64_t v);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN void blinkrt_bytes_set_u32_le(blink_bytes* b, int64_t off, int64_t v) {
+BLINK_RT_FN void blink_bytes_set_u32_le(blink_bytes* b, int64_t off, int64_t v) {
     uint32_t u = (uint32_t)(v & 0xFFFFFFFFLL);
     uint8_t* p = b->data + off;
     p[0] = (uint8_t)(u & 0xFF);
@@ -2668,23 +2668,23 @@ BLINK_RT_FN void blinkrt_bytes_set_u32_le(blink_bytes* b, int64_t off, int64_t v
 }
 #endif
 
-BLINK_RT_FN void blinkrt_bytes_set_i32_be(blink_bytes* b, int64_t off, int64_t v);
+BLINK_RT_FN void blink_bytes_set_i32_be(blink_bytes* b, int64_t off, int64_t v);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN void blinkrt_bytes_set_i32_be(blink_bytes* b, int64_t off, int64_t v) {
-    blinkrt_bytes_set_u32_be(b, off, (int64_t)(uint32_t)(int32_t)v);
+BLINK_RT_FN void blink_bytes_set_i32_be(blink_bytes* b, int64_t off, int64_t v) {
+    blink_bytes_set_u32_be(b, off, (int64_t)(uint32_t)(int32_t)v);
 }
 #endif
 
-BLINK_RT_FN void blinkrt_bytes_set_i32_le(blink_bytes* b, int64_t off, int64_t v);
+BLINK_RT_FN void blink_bytes_set_i32_le(blink_bytes* b, int64_t off, int64_t v);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN void blinkrt_bytes_set_i32_le(blink_bytes* b, int64_t off, int64_t v) {
-    blinkrt_bytes_set_u32_le(b, off, (int64_t)(uint32_t)(int32_t)v);
+BLINK_RT_FN void blink_bytes_set_i32_le(blink_bytes* b, int64_t off, int64_t v) {
+    blink_bytes_set_u32_le(b, off, (int64_t)(uint32_t)(int32_t)v);
 }
 #endif
 
-BLINK_RT_FN void blinkrt_bytes_set_u64_be(blink_bytes* b, int64_t off, int64_t v);
+BLINK_RT_FN void blink_bytes_set_u64_be(blink_bytes* b, int64_t off, int64_t v);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN void blinkrt_bytes_set_u64_be(blink_bytes* b, int64_t off, int64_t v) {
+BLINK_RT_FN void blink_bytes_set_u64_be(blink_bytes* b, int64_t off, int64_t v) {
     uint64_t u = (uint64_t)v;
     uint8_t* p = b->data + off;
     p[0] = (uint8_t)(u >> 56);
@@ -2698,9 +2698,9 @@ BLINK_RT_FN void blinkrt_bytes_set_u64_be(blink_bytes* b, int64_t off, int64_t v
 }
 #endif
 
-BLINK_RT_FN void blinkrt_bytes_set_u64_le(blink_bytes* b, int64_t off, int64_t v);
+BLINK_RT_FN void blink_bytes_set_u64_le(blink_bytes* b, int64_t off, int64_t v);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN void blinkrt_bytes_set_u64_le(blink_bytes* b, int64_t off, int64_t v) {
+BLINK_RT_FN void blink_bytes_set_u64_le(blink_bytes* b, int64_t off, int64_t v) {
     uint64_t u = (uint64_t)v;
     uint8_t* p = b->data + off;
     p[0] = (uint8_t)(u & 0xFF);
@@ -2714,17 +2714,17 @@ BLINK_RT_FN void blinkrt_bytes_set_u64_le(blink_bytes* b, int64_t off, int64_t v
 }
 #endif
 
-BLINK_RT_FN void blinkrt_bytes_set_i64_be(blink_bytes* b, int64_t off, int64_t v);
+BLINK_RT_FN void blink_bytes_set_i64_be(blink_bytes* b, int64_t off, int64_t v);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN void blinkrt_bytes_set_i64_be(blink_bytes* b, int64_t off, int64_t v) {
-    blinkrt_bytes_set_u64_be(b, off, v);
+BLINK_RT_FN void blink_bytes_set_i64_be(blink_bytes* b, int64_t off, int64_t v) {
+    blink_bytes_set_u64_be(b, off, v);
 }
 #endif
 
-BLINK_RT_FN void blinkrt_bytes_set_i64_le(blink_bytes* b, int64_t off, int64_t v);
+BLINK_RT_FN void blink_bytes_set_i64_le(blink_bytes* b, int64_t off, int64_t v);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN void blinkrt_bytes_set_i64_le(blink_bytes* b, int64_t off, int64_t v) {
-    blinkrt_bytes_set_u64_le(b, off, v);
+BLINK_RT_FN void blink_bytes_set_i64_le(blink_bytes* b, int64_t off, int64_t v) {
+    blink_bytes_set_u64_le(b, off, v);
 }
 #endif
 

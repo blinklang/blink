@@ -18,7 +18,7 @@
 #                            test names, fixture labels, scratch paths and audit
 #                            keys too, not only comments; absolute zero gate.
 #                            Counted in the live tree only: a historical ref is
-#                            materialized with src/ alone
+#                            materialized with src/ and lib/ alone
 #   module_let_mut           mutable module globals anywhere in src/: every
 #                            column-0 `let mut`, pub or not. A global need not be
 #                            pub to be shared state. Scoped to the whole surface on
@@ -74,8 +74,8 @@
 #                            `nodes` from parser or spells `parser.nodes`, the
 #                            name the pool had before it was split into
 #                            columns. A historical ref is
-#                            materialized with src/ alone, so its count leaves out
-#                            lib/ and tests/; the zero gate still holds the tree
+#                            materialized with src/ and lib/ alone, so its count
+#                            leaves out tests/; the zero gate still holds the tree
 #   str_substring_callers    a `.substring(` or `.substr(` call anywhere in src/,
 #                            or a `.substr(` call anywhere in lib/; absolute zero
 #                            gate. src/ reads text by byte offset, which
@@ -105,6 +105,12 @@
 #                            the checker's list, counts as 1, so a changed layout
 #                            cannot read as a clean 0, and so does a missing
 #                            spec file. A root with no typecheck.bl counts 0
+#   lib_std_ffi_bridge_decls
+#                            an `@ffi` decl in lib/std/*.bl whose symbol starts
+#                            `blink_`, `blinkrt_`, `__blink_` or `__blinkrt_`: a
+#                            binding to the
+#                            Blink runtime in the old form. `@runtime` (§9.1) is
+#                            the form for these, so the count only goes down, to 0
 #
 #   repo_tmp_in_tests_and_scripts
 #                            a `.tmp/` path in a tests/*.bl or scripts/*.sh file
@@ -117,14 +123,15 @@
 #                            script made counts the same. This script
 #                            and its self-test are not scanned, because they name
 #                            the pattern. Counted in the live tree only: a
-#                            historical ref is materialized with src/ alone
+#                            historical ref is materialized with src/ and lib/
+#                            alone
 #
 # After its own rows, this script runs scripts/lint_codegen.sh, the L1-L11
 # lint over the rewrite's files, and fails if that fails. RATCHET_NO_LINT=1
 # skips it (the self-test uses this; the lint has its own proofs).
 #
 # The "previous commit" reference is HEAD when the working tree has
-# uncommitted changes under src/ or Taskfile.yml (the normal case: this
+# uncommitted changes under src/, lib/ or Taskfile.yml (the normal case: this
 # script runs before a commit, so the commit-to-be's real parent is HEAD,
 # not HEAD~1), and HEAD~1 when the tree is clean (so a check run against an
 # already-landed commit still validates that commit against its own
@@ -159,7 +166,7 @@ cd "$(dirname "$0")/.."
 update_flag="${1:-}"
 baseline="${RATCHET_BASELINE:-scripts/ratchet_baseline.txt}"
 now_root="${RATCHET_SRC_DIR:-.}"
-if [ -z "$(git status --porcelain -- src Taskfile.yml 2>/dev/null)" ]; then
+if [ -z "$(git status --porcelain -- src lib Taskfile.yml 2>/dev/null)" ]; then
   default_head1_ref=HEAD~1
 else
   default_head1_ref=HEAD
@@ -351,18 +358,20 @@ str_substring_callers $(( $(cnt '\.(substring|substr)\(' "$allbl") + $(lib_subst
 str_len_in_byte_args $(len_in_byte_args "$root")
 primitive_type_names_outside_spec $(primitive_names_outside_spec "$root")
 repo_tmp_in_tests_and_scripts $(repo_tmp_uses "$root")
+lib_std_ffi_bridge_decls $(cnt '^@ffi\("(__)?blink(rt)?_' "$root/lib/std/*.bl")
 ROWS
 }
 
-# Writes a plain copy of every tracked .bl file, Taskfile.yml and the spec file
-# the type-name row reads, as they stood at $1, into $2. A file that does not exist at $1 is simply absent,
-# which compute_rows treats as a zero contribution.
+# Writes a plain copy of every tracked .bl file under src/ and lib/, Taskfile.yml
+# and the spec file the type-name row reads, as they stood at $1, into $2. A
+# file that does not exist at $1 is simply absent, which compute_rows treats as
+# a zero contribution.
 materialize_ref() {
   ref="$1"
   outdir="$2"
   rm -rf "$outdir"
   mkdir -p "$outdir"
-  git ls-tree -r --name-only "$ref" -- src Taskfile.yml "$SPEC_TYPES" 2>/dev/null | while IFS= read -r path; do
+  git ls-tree -r --name-only "$ref" -- src lib Taskfile.yml "$SPEC_TYPES" 2>/dev/null | while IFS= read -r path; do
     case "$path" in
       *.bl|Taskfile.yml|"$SPEC_TYPES") ;;
       *) continue ;;
