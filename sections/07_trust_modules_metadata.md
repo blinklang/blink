@@ -883,13 +883,16 @@ fn sb_write(mut sb: StringBuilder, s: Str)
 - **It is not under the signature rule.** *Signature Types* applies to every `@ffi` declaration, with no exception.
 - **It is the only binding of a `blink_` symbol.** *A `blink_` Symbol Belongs to the Runtime* below.
 - **It declares a fn or a bodiless type.** `@runtime` on a fn binds a runtime function. `@runtime` on a type with no body declares a handle to a C type that the runtime owns (§9.1.4 *A Runtime-Owned Handle*). The same gates apply to both. `@runtime` on any other target is `UnexpectedAnnotation` (E1110, §11.1).
+- **It writes its real effect row.** The row has the same meaning as on any Blink fn: no row means no effects (§4.2). A `@runtime` declaration is not an `@ffi` declaration, so `! ()` on it is `EmptyRowOutsideFfi` (E0564).
+- **It has no body.** The declaration is a signature, as for an `@ffi` fn. The runtime gives the body.
+- **It can be `pub`.** `FfiFunctionPublic` (E0801) applies to `@ffi` only. `lib/std` exports a runtime function directly or through a `pub` wrapper.
 
 ```
 error[E0849]: `@runtime` is reserved for `lib/std`
- --> app/io.bl:3:1
+ --> app/io.bl:3:10
   |
 3 | @runtime("blink_sb_write")
-  | ^^^^^^^^^^^^^^^^^^^^^^^^^^ this binds the Blink runtime, not a C library
+  |          ^^^^^^^^^^^^^^^^ this binds the Blink runtime, not a C library
   |
   = help: for a C function, use `@ffi("library", "symbol")`
 ```
@@ -5120,6 +5123,7 @@ In the Target column, `type` means a declaration that creates a type: a struct, 
 | `@ffi("lib", "sym")` | module-level fn; module-level `let` (§9.1 *`@ffi let` — Foreign Constants*) | no | Declares a foreign function binding. A fn in an `impl` or `trait` block, and a type-scoped `fn T.name`, is not a target (E1110). See §9.1. | checked |
 | `@ffi.struct(header, name)` | type | no | The type mirrors the named C struct from the named header. See §9.1.3. | checked |
 | `@ffi.opaque(header, name)` | type | no | The type is an opaque handle to the named C type. See §9.1.4. | checked |
+| `@runtime("symbol")` | module-level fn | no | `lib/std` only. Binds a function of the Blink runtime; the symbol starts with `blink_`. Any other package, or any other symbol, is `InvalidRuntimeBinding` (E0849). See §9.1 *`@runtime` — The Runtime Bridge*. | checked |
 | `@trusted(audit: "ID")` | fn | no | Records a claim the compiler assumes: an FFI binding matches its foreign code, or an audit-gated diagnostic is safe to suppress. `audit:` is required, and `ID` must name a record in `audits.toml` (`AuditRecordNotFound`). Never makes an `@ffi` fn `pub` (E0801). | checked |
 | `@alt("ID", "desc")` | fn | no | Marks an alternative implementation. See §8.7. | tool-checked (`blink alt`) |
 | `@verify(fallback: "runtime" \| "error" \| "trust")` | fn, trait method | no | What happens when the solver cannot prove or disprove a contract: a runtime check (the default), compile error V0003, or no check. A trait method takes `"runtime"` or `"error"` only (E0913). See §3b.4. | checked |
@@ -5270,7 +5274,7 @@ pub fn login(email: Str, pwd: Str) -> Result[Session, AuthError] ! DB, Crypto {
 }
 ```
 
-The order is the row order of the table in §11.1: `@capabilities` > `@derive` > `@handle_all` > `@src` > `@requires` > `@ensures` > `@where` > `@invariant` > `@pure` > `@perf` > `@ffi` > `@ffi.struct` > `@ffi.opaque` > `@trusted` > `@alt` > `@verify` > `@tags` > `@skip` > `@allow` > `@deprecated` > `@deprecate_override`.
+The order is the row order of the table in §11.1: `@capabilities` > `@derive` > `@handle_all` > `@src` > `@requires` > `@ensures` > `@where` > `@invariant` > `@pure` > `@perf` > `@ffi` > `@ffi.struct` > `@ffi.opaque` > `@runtime` > `@trusted` > `@alt` > `@verify` > `@tags` > `@skip` > `@allow` > `@deprecated` > `@deprecate_override`.
 
 The audit pin hash takes annotations in this order (§9.1 *Pins — What the Hash Covers*), so `blink fmt` never makes a pin stale. A change to this row order changes every hash and bumps the pin prefix.
 
