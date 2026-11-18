@@ -41360,19 +41360,18 @@ fn tc_name_is_const_binding(name: Str) -> Int {
     node_is_const(d)
 }
 
-fn tc_args_are_const(args_sl: Int, admit_foreign: Bool) -> Int {
+fn tc_args_are_const(args_sl: Int, admit_foreign: Bool, in_default: Bool) -> Int {
     if args_sl == -1 { return 1 }
     let mut i = 0
     while i < sublist_length(args_sl) {
-        if tc_is_const_expr_in(sublist_get(args_sl, i), admit_foreign) == 0 { return 0 }
+        if tc_is_const_expr_in(sublist_get(args_sl, i), admit_foreign, in_default) == 0 { return 0 }
         i = i + 1
     }
     1
 }
 
-// Enum-variant construction is const with const payloads; every other call is not, and the
-// two are written the same way. The variant table answers for a user enum, and the carriers
-// are named because they are variants the language declares rather than the program.
+// Whether a name spells a variant of any enum. A spelling is not a resolution: the const set
+// asks tc_callee_is_variant, which resolves the name.
 fn tc_name_is_variant_ctor(name: Str) -> Int {
     if name == "Some" || name == "Ok" || name == "Err" || name == "None" { return 1 }
     if tc_first_variant_slot(name) != -1 { return 1 }
@@ -41392,14 +41391,118 @@ fn tc_is_plain_string_literal(node: Int) -> Bool {
     true
 }
 
-fn tc_is_const_expr(e: Int) -> Int {
-    tc_is_const_expr_in(e, false)
+// `in_default` is set for a keyword default and a struct field default, the two places §2.21
+// admits `[]`.
+fn tc_is_const_expr(e: Int, in_default: Bool) -> Int {
+    tc_is_const_expr_in(e, false, in_default)
+}
+
+// The declaration `obj.member` names when `obj` is a module qualifier read in module `reader`,
+// or -1. A local binding of the qualifier's spelling is a value, not the module; the scopes in
+// force are those of nr_current_module, so another reader has none.
+fn tc_module_member_decl(obj: Int, member: Str, reader: Str) -> Int {
+    if obj == -1 || node_kind(obj) != NodeKind.Ident { return -1 }
+    let q = node_name(obj)
+    if reader == nr_current_module && nr_has_binding(q) != 0 { return -1 }
+    let here = nr_qualifier_module_in(q, reader)
+    if here == "" && !tc_qualifier_to_module.contains_key(q) { return -1 }
+    let target = if here != "" { here } else { tc_qualifier_to_module.get(q) ?? q }
+    nr_resolve_decl_in_module(target, member, 0)
+}
+
+// Whether a bare name is a binding of a scope in force where `reader` is read.
+fn tc_is_local_name_in(name: Str, reader: Str) -> Bool {
+    reader == nr_current_module && nr_has_binding(name) != 0 && nr_top_binding_is_global(name) == 0
+}
+
+// The type declaration `e` names (`Level`, `mod.Level`) read in module `reader`, or -1.
+fn tc_type_decl_named_by(e: Int, reader: Str) -> Int {
+    if e == -1 { return -1 }
+    let k = node_kind(e)
+    let mut d = -1
+    if k == NodeKind.Ident {
+        let name = node_name(e)
+        if tc_is_local_name_in(name, reader) { return -1 }
+        d = nr_resolve_bare_decl(name, reader)
+    } else if k == NodeKind.FieldAccess {
+        d = tc_module_member_decl(node_obj(e), node_name(e), reader)
+    }
+    if d < 0 || node_kind(d) != NodeKind.TypeDef { return -1 }
+    d
+}
+
+fn tc_is_carrier_variant(name: Str) -> Bool {
+    name == "Some" || name == "None" || name == "Ok" || name == "Err"
+}
+
+// Whether `obj.member` names a variant of a declared type: an arm of the type `obj` names, or a
+// variant a module qualifier reaches.
+fn tc_member_is_declared_variant(obj: Int, member: Str, reader: Str) -> Bool {
+    let td = tc_type_decl_named_by(obj, reader)
+    if td != -1 { return nr_same_named_arm(td, member) != -1 }
+    let d = tc_module_member_decl(obj, member, reader)
+    d >= 0 && node_kind(d) == NodeKind.TypeVariant
+}
+
+// Whether `obj.member` names a variant, a builtin carrier's (`Option.None`) included.
+fn tc_member_is_variant(obj: Int, member: Str) -> Bool {
+    if tc_member_is_declared_variant(obj, member, nr_current_module) { return true }
+    if obj == -1 || node_kind(obj) != NodeKind.Ident || !tc_is_carrier_variant(member) { return false }
+    let q = node_name(obj)
+    q == "Option" || q == "Result"
+}
+
+// Whether a call's callee is a variant. The declaration the name resolves to answers, not its
+// spelling: a fn may share its spelling with a variant of a type this scope does not see.
+fn tc_callee_is_variant(callee: Int) -> Bool {
+    if callee == -1 { return false }
+    let ck = node_kind(callee)
+    if ck == NodeKind.FieldAccess { return tc_member_is_variant(node_obj(callee), node_name(callee)) }
+    if ck != NodeKind.Ident { return false }
+    let name = node_name(callee)
+    if tc_is_local_name_in(name, nr_current_module) { return false }
+    let d = nr_resolve_bare_call_decl(name, nr_current_module)
+    if d >= 0 { return node_kind(d) == NodeKind.TypeVariant }
+    tc_is_carrier_variant(name)
+}
+
+// Whether `e`, read in module `reader`, is a value of a user type. Declarations answer, since
+// the walk runs before types are inferred. A carrier (`Some(Level.Lo)`) is a builtin type.
+fn tc_const_operand_is_user_typed(e: Int, reader: Str, depth: Int) -> Bool {
+    if e == -1 || depth > 16 { return false }
+    let k = node_kind(e)
+    if k == NodeKind.StructLit { return true }
+    if k == NodeKind.UnaryOp { return tc_const_operand_is_user_typed(node_left(e), reader, depth + 1) }
+    if k == NodeKind.MethodCall { return tc_member_is_declared_variant(node_obj(e), node_method(e), reader) }
+    let mut d = -1
+    if k == NodeKind.Call {
+        let callee = node_left(e)
+        if callee == -1 { return false }
+        if node_kind(callee) == NodeKind.FieldAccess { return tc_member_is_declared_variant(node_obj(callee), node_name(callee), reader) }
+        if node_kind(callee) != NodeKind.Ident || tc_is_local_name_in(node_name(callee), reader) { return false }
+        d = nr_resolve_bare_call_decl(node_name(callee), reader)
+        return d >= 0 && node_kind(d) == NodeKind.TypeVariant
+    }
+    if k == NodeKind.Ident {
+        let name = node_name(e)
+        d = if tc_is_local_name_in(name, reader) { nr_binding_node(name) } else { nr_resolve_bare_decl(name, reader) }
+    } else if k == NodeKind.FieldAccess {
+        if tc_member_is_declared_variant(node_obj(e), node_name(e), reader) { return true }
+        d = tc_module_member_decl(node_obj(e), node_name(e), reader)
+    } else {
+        return false
+    }
+    if d < 0 { return false }
+    if node_kind(d) == NodeKind.TypeVariant { return true }
+    if node_kind(d) != NodeKind.LetBinding || node_is_const(d) == 0 { return false }
+    // The const's value is written in its own module, so its names resolve there.
+    tc_const_operand_is_user_typed(node_value(d), node_module(d), depth + 1)
 }
 
 // `admit_foreign` counts a foreign constant as const. Only the question "is this const but for
 // its foreign constants?" sets it, so that a help can name the foreign constant as the one
 // cause.
-fn tc_is_const_expr_in(e: Int, admit_foreign: Bool) -> Int {
+fn tc_is_const_expr_in(e: Int, admit_foreign: Bool, in_default: Bool) -> Int {
     if e == -1 { return 0 }
     let k = node_kind(e)
     if k == NodeKind.IntLit { return 1 }
@@ -41414,45 +41517,50 @@ fn tc_is_const_expr_in(e: Int, admit_foreign: Bool) -> Int {
     // not by a list of collection names: what rules it out is that it is a call at all.
     // The callee is the left child, not the node's own name, which a Call leaves empty.
     if k == NodeKind.Call {
-        let callee = node_left(e)
-        if callee == -1 { return 0 }
-        let ck = node_kind(callee)
-        if ck != NodeKind.Ident && ck != NodeKind.FieldAccess { return 0 }
-        if tc_name_is_variant_ctor(node_name(callee)) == 0 { return 0 }
-        return tc_args_are_const(node_args(e), admit_foreign)
+        if !tc_callee_is_variant(node_left(e)) { return 0 }
+        return tc_args_are_const(node_args(e), admit_foreign, in_default)
     }
-    // `Level.Info` is a payload-free variant, and `mod.NAME` is a const named through its
-    // module. Both read as a field access, so anything that is not a variant is as const as
-    // the base it reads from.
+    // `Level.Info` is a payload-free variant, and `mod.NAME` names a module's binding, which
+    // is const only when it is a `const`. Anything else is as const as the base it reads from.
     if k == NodeKind.FieldAccess {
-        if tc_name_is_variant_ctor(node_name(e)) != 0 { return 1 }
+        if tc_member_is_variant(node_obj(e), node_name(e)) { return 1 }
         if tc_foreign_const_of(e) != -1 { return if admit_foreign { 1 } else { 0 } }
-        return tc_is_const_expr_in(node_obj(e), admit_foreign)
+        let d = tc_module_member_decl(node_obj(e), node_name(e), nr_current_module)
+        if d >= 0 && node_kind(d) == NodeKind.LetBinding { return node_is_const(d) }
+        return tc_is_const_expr_in(node_obj(e), admit_foreign, in_default)
     }
     // `Level.Info(1)` parses as a method call on the type, so a method name that is a variant
     // is construction and everything else is the method call §2.21 names.
     if k == NodeKind.MethodCall {
-        if tc_name_is_variant_ctor(node_method(e)) == 0 { return 0 }
-        return tc_args_are_const(node_args(e), admit_foreign)
+        if !tc_member_is_variant(node_obj(e), node_method(e)) { return 0 }
+        return tc_args_are_const(node_args(e), admit_foreign, in_default)
     }
-    if k == NodeKind.UnaryOp { return tc_is_const_expr_in(node_left(e), admit_foreign) }
+    if k == NodeKind.UnaryOp { return tc_is_const_expr_in(node_left(e), admit_foreign, in_default) }
+    // §2.21 admits operators over primitives. On a user type an operator runs the type's own
+    // trait impl, which is a call.
     if k == NodeKind.BinOp {
-        if tc_is_const_expr_in(node_left(e), admit_foreign) == 0 { return 0 }
-        return tc_is_const_expr_in(node_right(e), admit_foreign)
+        if tc_const_operand_is_user_typed(node_left(e), nr_current_module, 0) || tc_const_operand_is_user_typed(node_right(e), nr_current_module, 0) { return 0 }
+        if tc_is_const_expr_in(node_left(e), admit_foreign, in_default) == 0 { return 0 }
+        return tc_is_const_expr_in(node_right(e), admit_foreign, in_default)
     }
     if k == NodeKind.InterpString { return if tc_is_plain_string_literal(e) { 1 } else { 0 } }
-    // §2.21 enumerates a closed set and is silent on these three. `#embed` is read by the
-    // compiler and can be nothing else, and a bracket literal of const elements is written in
-    // the tree today, so refusing either would refuse correct code the section never rules out.
+    // §2.21 is silent on `#embed` and tuples. `#embed` is read by the compiler and can be
+    // nothing else, and a tuple of const elements is written in the tree today.
     if k == NodeKind.EmbedExpr { return 1 }
-    if k == NodeKind.ListLit { return tc_args_are_const(node_elements(e), admit_foreign) }
-    if k == NodeKind.TupleLit { return tc_args_are_const(node_elements(e), admit_foreign) }
+    // §2.21 admits `[]` in a keyword default and a field default only, and no list with
+    // elements anywhere.
+    if k == NodeKind.ListLit {
+        let elems = node_elements(e)
+        if elems != -1 && sublist_length(elems) > 0 { return 0 }
+        return if in_default { 1 } else { 0 }
+    }
+    if k == NodeKind.TupleLit { return tc_args_are_const(node_elements(e), admit_foreign, in_default) }
     if k == NodeKind.StructLit {
         let flds = node_fields(e)
         if flds == -1 { return 1 }
         let mut i = 0
         while i < sublist_length(flds) {
-            if tc_is_const_expr_in(node_value(sublist_get(flds, i)), admit_foreign) == 0 { return 0 }
+            if tc_is_const_expr_in(node_value(sublist_get(flds, i)), admit_foreign, in_default) == 0 { return 0 }
             i = i + 1
         }
         return 1
@@ -41467,8 +41575,13 @@ fn tc_check_const_decl(node: Int) ! Diag.Report {
     if node_is_const(node) == 0 { return }
     let v = node_value(node)
     if v == -1 { return }
-    if tc_is_const_expr(v) != 0 { return }
-    let fc = tc_foreign_const_blocking_const(v)
+    if tc_is_const_expr(v, false) != 0 { return }
+    if tc_is_const_expr(v, true) != 0 {
+        diag_error_at("NonConstExpr", NON_CONST_EXPR, "`[]` is a const expression only in a keyword default or a struct field default", v,
+            "bind the value with a module-level `let` in place of `const`")
+        return
+    }
+    let fc = tc_foreign_const_blocking_const(v, false)
     if fc != -1 {
         let nm = tc_foreign_const_spelling(fc)
         diag_error_at("NonConstExpr", NON_CONST_EXPR, "`{nm}` is a foreign constant: the target's C headers set its value", fc,
@@ -41477,7 +41590,7 @@ fn tc_check_const_decl(node: Int) ! Diag.Report {
     }
     diag_error_at("NonConstExpr", NON_CONST_EXPR,
         "the value of const `{node_name(node)}` is not a compile-time constant", v,
-        "const values are literals, arithmetic and boolean operators over them, other consts by name, struct literals with const fields, and enum variants; calls of any kind and `let` bindings are not")
+        "const values are literals, arithmetic and boolean operators over them, other consts by name, struct literals with const fields, and enum variants; calls of any kind, operators on a user type, lists and `let` bindings are not")
 }
 
 // The foreign-constant declaration `e` names, or -1. `e` is a bare name or a name qualified by
@@ -41491,12 +41604,7 @@ fn tc_foreign_const_of(e: Int) -> Int {
         if nr_has_binding(name) != 0 && nr_top_binding_is_global(name) == 0 { return -1 }
         d = nr_resolve_bare_decl(name, nr_current_module)
     } else if k == NodeKind.FieldAccess {
-        let obj = node_obj(e)
-        if obj == -1 || node_kind(obj) != NodeKind.Ident { return -1 }
-        let q = node_name(obj)
-        if nr_has_binding(q) != 0 { return -1 }
-        if nr_qualifier_module_here(q) == "" && !tc_qualifier_to_module.contains_key(q) { return -1 }
-        d = nr_resolve_qualified_decl(q, node_name(e))
+        d = tc_module_member_decl(node_obj(e), node_name(e), nr_current_module)
     } else {
         return -1
     }
@@ -41564,10 +41672,10 @@ fn tc_first_foreign_const_in_list(sl: Int) -> Int {
 
 // The foreign constant that alone keeps `e` from being const, or -1 when `e` has none or is
 // not const for another reason too. Only then is the foreign constant the cause to name.
-fn tc_foreign_const_blocking_const(e: Int) -> Int {
+fn tc_foreign_const_blocking_const(e: Int, in_default: Bool) -> Int {
     let fc = tc_first_foreign_const_in(e)
     if fc == -1 { return -1 }
-    if tc_is_const_expr_in(e, true) == 0 { return -1 }
+    if tc_is_const_expr_in(e, true, in_default) == 0 { return -1 }
     fc
 }
 
@@ -41696,10 +41804,10 @@ fn tc_check_param_defaults(fn_node: Int) ! Diag.Report {
                 diag_error_at("PositionalParamDefault", POSITIONAL_PARAM_DEFAULT,
                     "`{nm}` is a positional parameter and cannot carry a default value", pn,
                     "move it after the `--` separator, which also makes it keyword-required")
-            } else if tc_is_const_expr(dflt) == 0 {
+            } else if tc_is_const_expr(dflt, true) == 0 {
                 // A keyword default is filled at each call, so a foreign constant's bare name
                 // there needs no value now (§9.1). Anything built over one does.
-                let fc = tc_foreign_const_blocking_const(dflt)
+                let fc = tc_foreign_const_blocking_const(dflt, true)
                 if fc != -1 && fc != dflt {
                     let fcn = tc_foreign_const_spelling(fc)
                     let ty = if node_type_name(pn) == "" { "" } else { ": {node_type_name(pn)}" }
@@ -48527,7 +48635,7 @@ fn tc_stamp_type_field_defaults(td: Int, seen: List[Int]) ! TypeCheck.Resolve, T
 // a bare foreign constant, which a call fills. So only a default that a foreign constant alone
 // keeps from being const can move to a keyword default; any other needs a constructor fn body.
 fn tc_check_field_default_const(td: Int, f: Int, dflt: Int, field_tid: Int) ! Diag.Report {
-    if tc_is_const_expr(dflt) != 0 { return }
+    if tc_is_const_expr(dflt, true) != 0 { return }
     let tname = node_name(td)
     let tps = node_type_params(td)
     let binders = type_param_list_text(tps)
@@ -48537,7 +48645,7 @@ fn tc_check_field_default_const(td: Int, f: Int, dflt: Int, field_tid: Int) ! Di
     // An Option field already has a value for "not set", so wrapping it again helps nobody.
     let or_option = if tc_tid_kind(field_tid) == TyKind.Option { "" } else { ", or make the field `Option[{fty}]`" }
     let in_body = "compute the value in a constructor fn: `fn {tc_snake_case(tname)}{binders}() -> {ret} \{ {tname} \{ {fname}: ... } }`{or_option}"
-    let fc = tc_foreign_const_blocking_const(dflt)
+    let fc = tc_foreign_const_blocking_const(dflt, true)
     if fc != -1 {
         let fcn = tc_foreign_const_spelling(fc)
         // A keyword default admits the bare name only, so anything built over it, even

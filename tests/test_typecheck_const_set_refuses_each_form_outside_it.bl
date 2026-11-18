@@ -1,0 +1,126 @@
+// §2.21 lists the const expressions as a closed set, and the same set governs a `const`, a
+// keyword default and a struct field default. A module `let` named through its module, a list
+// literal with elements, an operator on a user type, and a call to a fn spelled like a variant
+// are outside it in all three places: NonConstExpr (E0533) for a `const` and a field default,
+// NonConstParamDefault (E0532) for a keyword default. `[]` is const only in a default.
+
+import std.fs
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_reset}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+
+const ROOT: Str = "build/zz_cset"
+
+// Seven lines, so the form under test is always on line 8. `Exited` shares its spelling with
+// the variant `process.ChildEnd.Exited`, but here it names a fn.
+const PRELUDE: Str = "import alpha\nimport std.process\n@derive(Eq)\ntype W \{ x: Int }\ntype Lv \{ Lo, Hi }\nconst A = W \{ x: 1 }\nfn Exited(n: Int) -> Int \{ n }\n"
+
+const ALPHA: Str = "pub let seed = 5\npub let mut ms = 9\npub const K = 3\npub type Mode \{ Fast, Slow }\npub const FAST = Fast\n"
+
+fn probe(tag: Str, src: Str) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO, Process.Spawn {
+    init_embedded_stdlib()
+    let root = "{ROOT}_{tag}"
+    let _clean = process.run("rm", ["-rf", root]).unwrap()
+    let _mk = process.run("mkdir", ["-p", "{root}/src"]).unwrap()
+    fs.write("{root}/blink.toml", "[package]\nname = \"zzcset\"\nversion = \"0.1.0\"\n").unwrap()
+    fs.write("{root}/src/alpha.bl", ALPHA).unwrap()
+    let path = "{root}/src/main.bl"
+    fs.write(path, src).unwrap()
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _rm = process.run("rm", ["-rf", root]).unwrap()
+    let mut out = ""
+    for d in diag_entries {
+        if d.severity == "error" && d.file == path {
+            out = out.concat("{d.code} {d.name} {d.line}:{d.col}: {d.message}\n")
+        }
+    }
+    out
+}
+
+// The form as a const, a keyword default and a field default, each on line 8 of its own file.
+// Each must be refused there with the code of that place, and by no second const error.
+fn assert_refused_everywhere(tag: Str, ty: Str, form: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO, Process.Spawn {
+    let places = [
+        ("const", "const C: {ty} = {form}\n\nfn main() \{ let _ = C }\n", "E0533 NonConstExpr 8:"),
+        ("kw", "fn f(-- v: {ty} = {form}) -> Int \{ 0 }\n\nfn main() \{ let _ = f() }\n", "E0532 NonConstParamDefault 8:"),
+        ("field", "type S \{ v: {ty} = {form} }\n\nfn main() \{ let _ = S \{} }\n", "E0533 NonConstExpr 8:"),
+    ]
+    for p in places {
+        let got = probe("{tag}_{p.0}", "{PRELUDE}{p.1}")
+        assert(got.starts_with(p.2), "{tag} as a {p.0}: want a first line that starts with {p.2}\ngot: {got}")
+        let const_errors = got.split("\n").filter(fn(l: Str) -> Bool { l.contains("E0533") || l.contains("E0532") }).len()
+        assert(const_errors == 1, "{tag} as a {p.0}: want one const error, got: {got}")
+    }
+}
+
+test "a module let named through its module is outside the const set" {
+    assert_refused_everywhere("qual_let", "Int", "alpha.seed")
+}
+
+test "an operator over a module let named through its module is outside the const set" {
+    assert_refused_everywhere("qual_let_op", "Int", "alpha.ms + 1")
+}
+
+test "a list literal with elements is outside the const set" {
+    assert_refused_everywhere("list", "List[Int]", "[1, alpha.K]")
+}
+
+test "an equality on a struct is outside the const set" {
+    assert_refused_everywhere("struct_eq", "Bool", "W \{ x: 1 } == W \{ x: 2 }")
+}
+
+test "an equality on a const of a user type is outside the const set" {
+    assert_refused_everywhere("const_eq", "Bool", "A == A")
+}
+
+// `FAST` is `Fast` in alpha, a name main does not see, so the operand is judged where it is
+// written.
+test "an equality on another module's const of a user type is outside the const set" {
+    assert_refused_everywhere("module_const_eq", "Bool", "alpha.FAST == alpha.FAST")
+}
+
+test "an inequality on an enum is outside the const set" {
+    assert_refused_everywhere("enum_ne", "Bool", "Lv.Lo != Lv.Hi")
+}
+
+test "a call to a fn spelled like a variant of another type is outside the const set" {
+    assert_refused_everywhere("variant_spelled_fn", "Int", "Exited(3)")
+}
+
+test "an empty list in a const is NonConstExpr that names the two places it is allowed" {
+    let got = probe("empty_const", "{PRELUDE}const E: List[Int] = []\n\nfn main() \{ let _ = E }\n")
+    let want = "E0533 NonConstExpr 8:22: `[]` is a const expression only in a keyword default or a struct field default\n"
+    assert(got == want, "want: {want}got: {got}")
+}
+
+test "an empty list inside a struct literal in a const is NonConstExpr" {
+    let got = probe("empty_nested", "{PRELUDE}type Bag \{ xs: List[Int] }\nconst E = Bag \{ xs: [] }\n\nfn main() \{ let _ = E }\n")
+    assert(got.starts_with("E0533 NonConstExpr 9:11: `[]` is a const expression only in a keyword default or a struct field default"), "got: {got}")
+}
+
+test "the forms inside the set check clean in all three places" {
+    let forms = [
+        ("Int", "alpha.K"),
+        ("Int", "alpha.K + 1"),
+        ("Option[Int]", "Some(alpha.K)"),
+        ("Lv", "Lv.Lo"),
+        ("W", "A"),
+        ("Bool", "alpha.K == 3"),
+        ("Option[Bool]", "Some(alpha.K < 3)"),
+        ("Bool", "Some(alpha.K) == Some(3)"),
+        ("Bool", "Some(Lv.Lo) == None"),
+    ]
+    for f in forms {
+        let src = "{PRELUDE}const C: {f.0} = {f.1}\nfn g(-- v: {f.0} = {f.1}) -> Int \{ 0 }\ntype S \{ v: {f.0} = {f.1} }\n\nfn main() \{ let _ = C\n let _ = g()\n let _ = S \{} }\n"
+        let got = probe("legal", src)
+        assert(got == "", "{f.1} is const, got: {got}")
+    }
+}
+
+test "an empty list checks clean as a keyword default and a field default" {
+    let got = probe("empty_default", "{PRELUDE}fn g(-- v: List[Int] = []) -> Int \{ v.len() }\ntype S \{ v: List[Int] = [] }\n\nfn main() \{ let _ = g()\n let _ = S \{} }\n")
+    assert(got == "", "got: {got}")
+}
