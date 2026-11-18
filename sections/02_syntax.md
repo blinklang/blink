@@ -1752,6 +1752,12 @@ type KillOpts { sig: Int = SIGTERM }    // error[NonConstExpr]: a field default 
                                         // help: use a keyword default on a constructor fn: `fn kill_opts(*, sig: Int = SIGTERM) -> KillOpts`, or make the field `Option[Int]`
 
 fn kill_opts(*, sig: Int = SIGTERM) -> KillOpts { KillOpts { sig: sig } }    // ok
+
+type Order { id: Int = next_id() }    // error[NonConstExpr]: the default for field `id` is not a compile-time constant:
+                                      //   a field default must be const, because `const X = Order {}` fills it
+                                      // help: compute the value in a constructor fn: `fn order() -> Order { Order { id: ... } }`, or make the field `Option[Int]`
+
+fn order() -> Order { Order { id: next_id() } }    // ok
 ```
 
 #### Checking a Literal's Fields

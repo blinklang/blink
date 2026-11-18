@@ -41347,11 +41347,6 @@ fn tc_check_missing_tail_value(body: Int, declared_ret: Int, owner_name: Str, at
 // `@allow` records nothing, so it does not reach an audit-gated diagnostic. Naming one
 // there is refused rather than dropped: an author who cannot tell a failed suppression
 // from a successful one learns nothing from either.
-// §2.21 defines a const expression as literals and arithmetic over them, plus `const`
-// bindings and struct literals whose fields are const. This answers that question for the
-// forms it can decide on the node alone. A bare identifier is ACCEPTED: deciding whether a
-// name is a `const` needs resolution this pass does not run, and rejecting every name would
-// refuse the `const DEFAULT_PORT` spelling the section names as correct.
 // Whether a NAME is const where it is written. §2.21 admits another `const` by name and
 // refuses a `let`, so the two have to be told apart, and only the declaration can tell them
 // apart: both are LetBinding nodes and the const flag is the difference. A name this scope
@@ -48528,32 +48523,37 @@ fn tc_stamp_type_field_defaults(td: Int, seen: List[Int]) ! TypeCheck.Resolve, T
 }
 
 // §2.21: a field default is const, because a `const` struct literal that leaves the field out
-// takes it. A foreign constant has no value at type check, so it cannot be one; a keyword
-// default on a constructor fn can, since a call fills it. Any other non-const value needs a
-// constructor fn body, because a keyword default must be const too.
+// takes it. A keyword default on a constructor fn must be const as well, with one exception:
+// a bare foreign constant, which a call fills. So only a default that a foreign constant alone
+// keeps from being const can move to a keyword default; any other needs a constructor fn body.
 fn tc_check_field_default_const(td: Int, f: Int, dflt: Int, field_tid: Int) ! Diag.Report {
     if tc_is_const_expr(dflt) != 0 { return }
     let tname = node_name(td)
-    let targs = tc_decl_type_param_list(td)
+    let tps = node_type_params(td)
+    let binders = type_param_list_text(tps)
+    let ret = "{tname}{tc_type_param_names(tps)}"
     let fname = node_name(f)
     let fty = type_to_str(field_tid)
-    let fc = tc_first_foreign_const_in(dflt)
+    // An Option field already has a value for "not set", so wrapping it again helps nobody.
+    let or_option = if tc_tid_kind(field_tid) == TyKind.Option { "" } else { ", or make the field `Option[{fty}]`" }
+    let in_body = "compute the value in a constructor fn: `fn {tc_snake_case(tname)}{binders}() -> {ret} \{ {tname} \{ {fname}: ... } }`{or_option}"
+    let fc = tc_foreign_const_blocking_const(dflt)
     if fc != -1 {
         let fcn = tc_foreign_const_spelling(fc)
+        // A keyword default admits the bare name only, so anything built over it, even
+        // `Some(SIGBUS)`, is computed in the body.
+        let help = if fc == dflt { "use a keyword default on a constructor fn: `fn {tc_snake_case(tname)}{binders}(-- {fname}: {fty} = {fcn}) -> {ret}`{or_option}" } else { in_body }
         diag_error_at("NonConstExpr", NON_CONST_EXPR,
-            "a field default must be const, because `const X = {tname} \{}` fills it. `{fcn}` is a foreign constant (the target's C headers set it)", fc,
-            "use a keyword default on a constructor fn: `fn {tc_snake_case(tname)}{targs}(-- {fname}: {fty} = {fcn}) -> {tname}{targs}`, or make the field `Option[{fty}]`")
+            "a field default must be const, because `const X = {tname} \{}` fills it. `{fcn}` is a foreign constant (the target's C headers set it)", fc, help)
         return
     }
     diag_error_at("NonConstExpr", NON_CONST_EXPR,
-        "the default for field `{fname}` is not a compile-time constant: a field default must be const, because `const X = {tname} \{}` fills it", dflt,
-        "compute the value in a constructor fn: `fn {tc_snake_case(tname)}{targs}() -> {tname}{targs} \{ {tname} \{ {fname}: ... } }`, or make the field `Option[{fty}]`")
+        "the default for field `{fname}` is not a compile-time constant: a field default must be const, because `const X = {tname} \{}` fills it", dflt, in_body)
 }
 
-// `type S[K, V]` -> `[K, V]`, and "" for a type with no parameters, so a suggested
-// constructor fn is generic over the same names as the type it builds.
-fn tc_decl_type_param_list(td: Int) -> Str {
-    let tps = node_type_params(td)
+// `[K, V]` for `type S[K: Hash, V]`, and "" for a type with no parameters: the type
+// arguments that name the declared type inside its own generic constructor fn.
+fn tc_type_param_names(tps: Int) -> Str {
     if tps == -1 || sublist_length(tps) == 0 { return "" }
     let mut names: List[Str] = []
     let mut i = 0
