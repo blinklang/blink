@@ -403,6 +403,7 @@ test "addition works" {
 - **A parameter is never assigned.** `c.at = 5` or `self.n += 1` on a parameter is `E0612 ParamAssign`, with or without `mut`: the write changes only this function's copy. Copy it with `let mut a = a` at the top of the body, or return a new value. `blink fix` inserts that line, except for a write to `self` and a write in `Scoped.enter()`, which get help only. W0603 does not fire on that line. In this release E0612 is a warning; it becomes an error in a later one.
 - **The left side of `=` or `op=` must be a place: a `let mut` name, or a field path from one.** Anything else is `E0611 NotAPlace`, with no fix: a call (`mk() = c`), a literal, an operator result (`a + b = 3`), and a path that starts in a tuple or struct literal (`(a, 2).0 = 5`). `mk() += 1` is one error. A name in parentheses, `(a) = 3`, is a place.
 - **Blink has no destructuring assignment.** `(a, b) = (b, a)` is `E0611`. `let (a, b) = (b, a)` is valid, but it declares two new names and swaps nothing. To swap, use a temporary: `let t = a`, then `a = b`, then `b = t`.
+- **A closure passed to `async.spawn` may not capture a mutable root: `E0650 MutableCaptureInSpawn`.** A mutable root is a `let mut`, a `mut` pattern binder, a `mut` parameter, a `mut` binder in a parameter pattern, or `mut self`. A read is an error too. `fn f(mut b: Bytes)` with `async.spawn(fn() { b.push(1) })` is `E0650` at `b`, and a label marks its `mut`. Copy it into a `let` before the spawn (`let snap = b`) and capture the copy, or send values over a channel.
 - **`mut` goes before a name, not before a pattern.** `let mut (x, y) = pair` and `for mut (k, v) in pairs` are `E0613 MutOnPattern`; write `let (mut x, mut y) = pair`. `blink fix` makes this edit.
 - **The alternatives of an OR-pattern must bind the same names, with the same types and the same `mut`** (`E0005 InconsistentPatternBindings`). `Click(mut x, y) | Touch(x, y)` is an error; write `mut x` in both.
 - **`for x in <non-iterable>` is `E0302`.**
@@ -590,6 +591,9 @@ choice(xs)                      // -> Option[T]: None for an empty list
 // Async (effect: Async)
 async.scope { ... }             // synchronous scope for spawned tasks
 async.spawn(fn() { ... })       // spawn task, returns Handle
+// The closure may not capture a mutable root, not even to read it (E0650): a `let mut`,
+// a `mut` pattern binder, a `mut` parameter, a `mut` binder in a parameter pattern, or `mut self`.
+// Fix: copy it into a `let` before the spawn (`let snap = b`), then capture `snap`
 
 // Channel[T]
 let ch = channel.new[Int](buffer: 8)  // bounded queue; the buffer size is required

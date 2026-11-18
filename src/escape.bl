@@ -5,12 +5,12 @@ import parser.{
     node_target, node_iterable, node_obj, node_method, node_params, node_args,
     node_stmts, node_arms, effect_derived_ops, node_fields, node_elements, node_handlers, node_methods, node_captures,
     node_type_name, node_effects, node_str_val, node_op, node_type_ann,
-    node_pattern, node_for_binder, node_value_child_ids, node_push_value_child_ids, node_is_mut, node_line, sublist_get, sublist_length,
+    node_pattern, node_for_binder, node_value_child_ids, node_push_value_child_ids, node_is_mut, node_line, node_col, node_binder_col, sublist_get, sublist_length,
     has_annotation,
 }
 import diagnostics.{
     Diag, diag_error_at, diag_warn_at, diag_set_last_fix,
-    diag_source_file, diag_file_for_node,
+    diag_source_file, diag_file_for_node, diag_error_label_at_notes, diag_add_label_since, diag_entry_count,
     diag_push_allows, diag_clear_allows,
     ARENA_VALUE_ESCAPES, ARENA_TYPE_CONTAINS_CYCLE, ARENA_EFFECT_REDUNDANT,
     ARENA_CLOSURE_TAIL_NONLITERAL, CLOSEABLE_ESCAPES_SCOPE, MUTABLE_CAPTURE_IN_SPAWN,
@@ -1226,10 +1226,9 @@ fn emit_spawn_scoped_capture(node: Int, binder: Int) ! Diag.Report {
     diag_source_file = saved
 }
 
-// ── E0650 a mutable binder captured by a spawned task (MutableCaptureInSpawn) ─────────
-// A task and the scope that spawned it would share one mutable binding with no order
-// between their accesses, so a spawned closure may not capture a mutable binder at all, even
-// to read it (§2.8). Copying a closure shares its captures, so the walk follows a binder
+// ── E0650 a mutable root captured by a spawned task (MutableCaptureInSpawn) ───────────
+// A task and the scope that spawned it would share one mutable root with no order between
+// their accesses, so a spawned closure may not capture one at all, even to read it (§2.8). Copying a closure shares its captures, so the walk follows a binder
 // whose value is a closure; copying any other value takes a snapshot, which is the fix.
 // The body is walked here, not from walk_expr, because a `let mut` closure's value may
 // come from any assignment in the body, before or after the spawn.
@@ -1238,23 +1237,10 @@ fn check_spawn_mut_captures(fn_node: Int) ! Diag.Report {
     let body = node_body(fn_node)
     if body == -1 { return }
     let mut kids: List[Int] = []
-    let mut unused: List[Str] = []
-    smc_walk(body, body, kids, false, unused)
+    smc_walk(body, body, kids)
 }
 
-// The names of the `mut` parameters that a closure sent to a task in `body` reads. The spec
-// does not yet say whether a spawned task may share a `mut` parameter with the function that
-// spawned it, so codegen gives such a parameter no cell and the build still stops there.
-pub fn spawn_mut_param_reads(body: Int) -> List[Str] ! Diag.Report {
-    let mut kids: List[Int] = []
-    let mut out: List[Str] = []
-    if body != -1 { smc_walk(body, body, kids, true, out) }
-    out
-}
-
-// With `params` false it reports each `let mut` a spawned closure reads (E0650); with
-// `params` true it reports nothing and collects the `mut` parameters such a closure reads.
-fn smc_walk(node: Int, body: Int, kids: List[Int], params: Bool, out: List[Str]) ! Diag.Report {
+fn smc_walk(node: Int, body: Int, kids: List[Int]) ! Diag.Report {
     if node == -1 { return }
     if node_kind(node) == NodeKind.MethodCall && is_async_spawn(node) {
         let args_sl = node_args(node)
@@ -1263,14 +1249,8 @@ fn smc_walk(node: Int, body: Int, kids: List[Int], params: Bool, out: List[Str])
             let arg = sublist_get(args_sl, i)
             let mut reads: List[Int] = []
             let mut seen: List[Int] = []
-            mut_captures_reached(arg, body, reads, seen, params)
-            for read in reads {
-                if !params {
-                    emit_spawn_mut_capture(arg, read)
-                } else if !out.contains(node_name(read)) {
-                    out.push(node_name(read))
-                }
-            }
+            mut_captures_reached(arg, body, reads, seen)
+            for read in reads { emit_spawn_mut_capture(arg, read) }
             i = i + 1
         }
     }
@@ -1279,7 +1259,7 @@ fn smc_walk(node: Int, body: Int, kids: List[Int], params: Bool, out: List[Str])
     let end = kids.len()
     let mut i = base
     while i < end {
-        smc_walk(kids.get(i).unwrap(), body, kids, params, out)
+        smc_walk(kids.get(i).unwrap(), body, kids)
         i = i + 1
     }
     drop_kids_to(kids, base)
@@ -1293,9 +1273,9 @@ fn drop_kids_to(kids: List[Int], base: Int) {
     }
 }
 
-// Collects one read per `let mut` binder the value of `node` captures. `seen` holds the
+// Collects one read per mutable root the value of `node` captures. `seen` holds the
 // binders already visited, so a binder is reported once and a self-referencing let ends.
-fn mut_captures_reached(node: Int, body: Int, reads: List[Int], seen: List[Int], params: Bool) {
+fn mut_captures_reached(node: Int, body: Int, reads: List[Int], seen: List[Int]) {
     if node == -1 { return }
     let k = node_kind(node)
     if k == NodeKind.Closure {
@@ -1303,10 +1283,10 @@ fn mut_captures_reached(node: Int, body: Int, reads: List[Int], seen: List[Int],
             let binder = tc_ident_binder_node(read)
             if binder < 0 || seen.contains(binder) { continue }
             seen.push(binder)
-            if (params && is_mut_param(binder)) || (!params && is_mut_binder(binder)) {
+            if is_mutable_root(binder) {
                 reads.push(read)
             } else if is_fn_typed(read) {
-                closure_values_of(binder, body, reads, seen, params)
+                closure_values_of(binder, body, reads, seen)
             }
         }
         return
@@ -1315,42 +1295,42 @@ fn mut_captures_reached(node: Int, body: Int, reads: List[Int], seen: List[Int],
         let binder = tc_ident_binder_node(node)
         if binder < 0 || seen.contains(binder) { return }
         seen.push(binder)
-        closure_values_of(binder, body, reads, seen, params)
+        closure_values_of(binder, body, reads, seen)
         return
     }
     if k == NodeKind.IfExpr {
-        mut_captures_reached(node_then_body(node), body, reads, seen, params)
-        mut_captures_reached(node_else_body(node), body, reads, seen, params)
+        mut_captures_reached(node_then_body(node), body, reads, seen)
+        mut_captures_reached(node_else_body(node), body, reads, seen)
         return
     }
     if k == NodeKind.MatchExpr {
         let arms_sl = node_arms(node)
         let mut i = 0
         while arms_sl != -1 && i < sublist_length(arms_sl) {
-            mut_captures_reached(node_body(sublist_get(arms_sl, i)), body, reads, seen, params)
+            mut_captures_reached(node_body(sublist_get(arms_sl, i)), body, reads, seen)
             i = i + 1
         }
         return
     }
     if k == NodeKind.Block {
-        mut_captures_reached(block_tail_node(node), body, reads, seen, params)
+        mut_captures_reached(block_tail_node(node), body, reads, seen)
         return
     }
     if k == NodeKind.ExprStmt {
-        mut_captures_reached(node_value(node), body, reads, seen, params)
+        mut_captures_reached(node_value(node), body, reads, seen)
     }
 }
 
 // Every value a binder can hold: a `let`'s initializer and, for a mutable binder, each
 // value assigned to it in the body.
-fn closure_values_of(binder: Int, body: Int, reads: List[Int], seen: List[Int], params: Bool) {
+fn closure_values_of(binder: Int, body: Int, reads: List[Int], seen: List[Int]) {
     if node_kind(binder) == NodeKind.LetBinding {
-        mut_captures_reached(node_value(binder), body, reads, seen, params)
+        mut_captures_reached(node_value(binder), body, reads, seen)
     }
     if !is_mut_binder(binder) { return }
     let mut assigned: List[Int] = []
     assignments_to(body, binder, assigned)
-    for v in assigned { mut_captures_reached(v, body, reads, seen, params) }
+    for v in assigned { mut_captures_reached(v, body, reads, seen) }
 }
 
 fn assignments_to(node: Int, binder: Int, out: List[Int]) {
@@ -1377,24 +1357,56 @@ fn is_mut_binder(binder: Int) -> Bool {
     binds && node_is_mut(binder) != 0
 }
 
+// A `mut` parameter, `mut self` included.
 fn is_mut_param(binder: Int) -> Bool {
     node_kind(binder) == NodeKind.Param && node_is_mut(binder) != 0
 }
 
+// A name that can start a mutation (§3.2.2): a `mut` binder of any kind or a `mut` parameter.
+fn is_mutable_root(binder: Int) -> Bool {
+    is_mut_binder(binder) || is_mut_param(binder)
+}
+
+// What the label at a mutable root's binder says it is.
+fn mutable_root_kind(binder: Int, name: Str) -> Str {
+    let k = node_kind(binder)
+    if k == NodeKind.Param {
+        return if name == "self" { "`mut self` is a mutable root" } else { "`{name}` is a `mut` parameter" }
+    }
+    if k == NodeKind.LetBinding { return "`{name}` is a `let mut` binding" }
+    "`{name}` is a `mut` pattern binder"
+}
+
+// Where the binder writes the name: a `for mut i` records the `for` node as the binder.
+fn mutable_root_site(binder: Int) -> Int {
+    if node_kind(binder) == NodeKind.ForIn { return node_for_binder(binder) }
+    binder
+}
+
 // Reported at the read when the spawned closure holds it, and at the argument when the
-// read sits in a closure written elsewhere and reached through a binder.
+// read sits in a closure written elsewhere and reached through a binder. A second label
+// marks the binder, whose `mut` is what makes the capture an error.
 @allow(UnrestoredMutation, IncompleteStateRestore)
 fn emit_spawn_mut_capture(arg: Int, read: Int) ! Diag.Report {
     let at = if node_encloses(arg, read) { read } else { arg }
     let saved = diag_source_file
     diag_source_file = diag_file_for_node(at)
     let name = node_name(read)
-    diag_error_at(
+    let binder = tc_ident_binder_node(read)
+    let site = mutable_root_site(binder)
+    let what = mutable_root_kind(binder, name)
+    let before = diag_entry_count()
+    diag_error_label_at_notes(
         "MutableCaptureInSpawn", MUTABLE_CAPTURE_IN_SPAWN,
         "mutable binding `{name}` is captured by a spawned task",
-        at,
-        "copy the value into a `let` before the spawn (`let snapshot = {name}`), or send it over a channel"
+        at, "captured here",
+        "copy the value into a `let` before the spawn (`let snapshot = {name}`), or send it over a channel",
+        if diag_file_for_node(site) == diag_source_file { [] } else { ["{what}, at line {node_line(site)}"] }
     )
+    if diag_file_for_node(site) == diag_source_file {
+        let col = if node_binder_col(site) > 0 { node_binder_col(site) } else { node_col(site) }
+        diag_add_label_since(before, node_line(site), col, col + name.byte_len(), what)
+    }
     diag_source_file = saved
 }
 

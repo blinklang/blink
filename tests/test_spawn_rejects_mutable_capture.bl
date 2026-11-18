@@ -264,3 +264,119 @@ test "a closure assigned to a mut binder is rejected when spawned for its let mu
 }
 "#, "_spawnmut_binder_reassigned", "counter")
 }
+
+// A `mut` parameter and `mut self` are mutable roots like a `let mut` (§2.8, §3.5): a mutating
+// call from the task races with the spawner, so the capture is refused in check, and the
+// report points at the binder's `mut`.
+
+test "a spawned closure that pushes to a mut Bytes parameter is rejected" {
+    let src = #"fn fill(mut b: Bytes) -> Int ! Async {
+    async.scope {
+        let h = async.spawn(fn() { b.push(1) })
+        h.await
+    }
+    b.len()
+}
+
+fn main() ! Async, IO {
+    io.println("{fill(Bytes.new())}")
+}
+"#
+    expect_rejected(src, "_spawnmut_param_bytes", "b")
+    let out = compile_test_helpers.compile_and_capture(src, "_spawnmut_param_bytes_note")
+    compile_test_helpers.expect_contains(out, "`b` is a `mut` parameter", "_spawnmut_param_bytes: the report points at the parameter's `mut`")
+}
+
+test "a spawned closure that only reads a mut List parameter is rejected" {
+    expect_rejected(#"fn count(mut xs: List[Int]) -> Int ! Async {
+    xs.push(3)
+    async.scope {
+        let h = async.spawn(fn() { xs.len() })
+        h.await
+    }
+}
+
+fn main() ! Async, IO {
+    io.println("{count([1, 2])}")
+}
+"#, "_spawnmut_param_read", "xs")
+}
+
+test "a spawned closure that reads mut self is rejected" {
+    let src = #"type Pack { data: Bytes }
+
+trait Run {
+    fn run(mut self) -> Int ! Async
+}
+
+impl Run for Pack {
+    fn run(mut self) -> Int ! Async {
+        self.data.push(1)
+        async.scope {
+            let h = async.spawn(fn() { self.data.len() })
+            h.await
+        }
+    }
+}
+
+fn main() ! Async, IO {
+    let p = Pack { data: Bytes.new() }
+    io.println("{p.run()}")
+}
+"#
+    expect_rejected(src, "_spawnmut_self", "self")
+    let out = compile_test_helpers.compile_and_capture(src, "_spawnmut_self_note")
+    compile_test_helpers.expect_contains(out, "`mut self` is a mutable root", "_spawnmut_self: the report points at the receiver's `mut`")
+}
+
+test "a let mut capture report points at the binding's mut" {
+    let out = compile_test_helpers.compile_and_capture(#"fn main() ! Async, IO {
+    let mut counter = 0
+    let h = async.spawn(fn() { counter + 1 })
+    io.println("{h.await}")
+}
+"#, "_spawnmut_let_note")
+    compile_test_helpers.expect_contains(out, "`counter` is a `let mut` binding", "_spawnmut_let_note: the report points at the `let mut`")
+}
+
+test "a mut pattern binder capture report points at the binder's mut" {
+    let out = compile_test_helpers.compile_and_capture(#"fn main() ! Async, IO {
+    let (mut a, b) = (1, 2)
+    a += b
+    let h = async.spawn(fn() { a + 1 })
+    io.println("{h.await}")
+}
+"#, "_spawnmut_pattern_note")
+    compile_test_helpers.expect_contains(out, "`a` is a `mut` pattern binder", "_spawnmut_pattern_note: the report points at the binder's `mut`")
+}
+
+test "a parameter with no mut may be spawned" {
+    expect_accepted(#"fn count(xs: List[Int]) -> Int ! Async {
+    async.scope {
+        let h = async.spawn(fn() { xs.len() })
+        h.await
+    }
+}
+
+fn main() ! Async, IO {
+    io.println("{count([1, 2])}")
+}
+"#, "_spawnmut_param_plain")
+}
+
+test "a copy of a mut parameter bound with let may be spawned" {
+    expect_accepted(#"fn fill(mut b: Bytes) -> Int ! Async {
+    let snap = b
+    let n = async.scope {
+        let h = async.spawn(fn() { snap.len() })
+        b.push(2)
+        h.await
+    }
+    n + b.len()
+}
+
+fn main() ! Async, IO {
+    io.println("{fill(Bytes.new())}")
+}
+"#, "_spawnmut_param_copy")
+}
