@@ -1,0 +1,107 @@
+// A trait name is a valid template context (sections/03b_contracts.md §3b.5 "The Context
+// Parameter C": C names any declaration in the type namespace, a trait among them). The
+// context is the trait declaration's type, so a generic fn over `Template[C]` solves C to it
+// and the program builds and runs like one whose context is an effect or a marker type.
+
+import compile_test_helpers
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> ProcessResult ! Process.Spawn {
+    process.run("sh", ["-c", cmd]).unwrap()
+}
+
+fn expect_prints(tag: Str, lines: List[Str], want: Str) ! IO, FS.Write, Process.Spawn, Env.Read {
+    let dir = "{compile_test_helpers.scratch_root()}/trait_template_context_{tag}"
+    let _ = sh("rm -rf {dir} && mkdir -p {dir}")
+    fs.write("{dir}/x.bl", lines.join("\n").concat("\n")).unwrap()
+    let clear = "env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE"
+    let mut bad = 0
+    let c = sh("B=$(pwd)/build/blink; cd {dir} && {clear} timeout 120 $B check x.bl < /dev/null")
+    if !c.success() {
+        io.eprintln("{tag} check: ended {c.end}\n{c.out}{c.err_out}")
+        bad = bad + 1
+    }
+    for mode in ["--per-module", "--no-per-module"] {
+        let r = sh("B=$(pwd)/build/blink; cd {dir} && {clear} timeout 120 $B run {mode} x.bl < /dev/null")
+        if !r.success() || r.out.trim() != want {
+            io.eprintln("{tag} {mode}: ended {r.end}, printed [{r.out.trim()}], want [{want}]\n{r.err_out}")
+            bad = bad + 1
+        }
+    }
+    let _ = sh("rm -rf {dir}")
+    assert_eq(bad, 0)
+}
+
+test "a template with a trait context passes to a non-generic fn" {
+    expect_prints("nongen", [
+        "trait Html \{ fn h(self) -> Int }",
+        "fn take(t: Template[Html]) -> Int \{ t.count() }",
+        "fn main() \{ io.println(\"\{take(\"q \{1}\")}\") }",
+    ], "1")
+}
+
+test "a generic identity over a trait context returns the template it was given" {
+    expect_prints("ident", [
+        "trait Html \{ fn h(self) -> Int }",
+        "fn ident[C](t: Template[C]) -> Template[C] \{ t }",
+        "fn take(t: Template[Html]) -> Int \{ ident(t).count() }",
+        "fn main() \{ io.println(\"\{take(\"q \{1}\")}\") }",
+    ], "1")
+}
+
+test "one generic fn serves a trait context and an effect context in one program" {
+    expect_prints("mixed", [
+        "trait Html \{ fn h(self) -> Int }",
+        "effect Store \{}",
+        "fn ident[C](t: Template[C]) -> Template[C] \{ t }",
+        "fn a(t: Template[Html]) -> Int \{ ident(t).count() }",
+        "fn b(t: Template[Store]) -> Int \{ ident(t).count() * 10 }",
+        "fn main() \{ io.println(\"\{a(\"x \{1}\")} \{b(\"y \{1} \{2}\")}\") }",
+    ], "1 20")
+}
+
+test "a template literal takes a trait context from a later use" {
+    expect_prints("later", [
+        "trait Html \{ fn h(self) -> Int }",
+        "fn ident[C](t: Template[C]) -> Template[C] \{ t }",
+        "fn take(t: Template[Html]) -> Int \{ t.count() }",
+        "fn main() \{",
+        "  let t = ident(\"a \{1} \{2}\")",
+        "  io.println(\"\{take(t)}\")",
+        "}",
+    ], "2")
+}
+
+test "a compiler-known trait names a context, under its name or an import alias" {
+    expect_prints("core", [
+        "import blink.core.\{Eq as CoreEq}",
+        "fn ident[C](t: Template[C]) -> Template[C] \{ t }",
+        "fn eq(t: Template[Eq]) -> Int \{ ident(t).count() }",
+        "fn aliased(t: Template[CoreEq]) -> Int \{ eq(t) }",
+        "fn shown(t: Template[Display]) -> Int \{ ident(t).count() }",
+        "fn main() \{ io.println(\"\{aliased(\"a \{1}\")} \{shown(\"b \{1} \{2}\")}\") }",
+    ], "1 2")
+}
+
+test "a trait written as the type argument of a context binder is that context" {
+    expect_prints("explicit", [
+        "trait Html \{ fn h(self) -> Int }",
+        "fn ident[C](t: Template[C]) -> Template[C] \{ t }",
+        "fn take(t: Template[Html]) -> Int \{ t.count() }",
+        "fn main() \{",
+        "    let t = ident[Html](\"a \{1} \{2}\")",
+        "    io.println(\"\{take(t)} \{ident[Html](\"b \{3}\").count()}\")",
+        "}",
+    ], "2 1")
+}
+
+test "an alias of a trait names the trait's context, inferred or written" {
+    expect_prints("alias", [
+        "trait Html \{ fn h(self) -> Int }",
+        "type H = Html",
+        "fn ident[C](t: Template[C]) -> Template[C] \{ t }",
+        "fn want(t: Template[Html]) -> Int \{ t.count() }",
+        "fn take(t: Template[H]) -> Int \{ want(t) }",
+        "fn main() \{ io.println(\"\{take(\"a \{1}\")} \{ident[H](\"b \{1} \{2}\").count()} \{want(ident[H](\"c\"))}\") }",
+    ], "1 2 0")
+}

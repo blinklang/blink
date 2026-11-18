@@ -99,7 +99,7 @@ effect TypeCheck {
 pub type TyKind {
     Int, Float, Bool, Str, Void,
     List, Option, Result, Fn, Struct, Enum,
-    Typevar, Unknown, Iterator, Handle, Channel, Ptr, Handler, Effect,
+    Typevar, Unknown, Iterator, Handle, Channel, Ptr, Handler, Effect, TraitContext,
     Tuple, Map, Bytes, Set, StringBuilder, Template, FfiScope, Raw,
     I8, I16, I32, U8, U16, U32, U64, Char,
     Never, Range
@@ -127,6 +127,7 @@ pub fn tk_name(k: TyKind) -> Str {
         TyKind.Handle => "Handle"
         TyKind.Handler => "Handler"
         TyKind.Effect => "Effect"
+        TyKind.TraitContext => "TraitContext"
         TyKind.Channel => "Channel"
         TyKind.Range => "Range"
         TyKind.Ptr => "Ptr"
@@ -1653,8 +1654,8 @@ fn tc_is_arith_trait(tr: Str) -> Bool {
 
 fn tc_bound_fact(concrete_tid: Int, trait_name: Str) -> Int {
     let k = type_kind(concrete_tid)
-    // An effect context has no values, so it implements no trait (§3b.5).
-    if k == TyKind.Effect { return -1 }
+    // An effect or trait context has no values, so it implements no trait (§3b.5).
+    if tk_is_valueless_context(k) { return -1 }
     // Unknowable for an unresolved/generic type — fail open, never reject.
     if k == TyKind.Unknown || k == TyKind.Typevar { return 0 }
     if trait_name == "Display" {
@@ -2935,9 +2936,23 @@ pub fn make_effect_type(root: Str) -> Int {
     ty_intern_simple(TyKind.Effect, root, -1, -1)
 }
 
+// The type a trait gives as a template context (§3b.5 *The Context Parameter C*): no values,
+// like an effect context, but its own kind, so nothing reads the trait as an effect. The name
+// is the trait's key (tc_trait_key_of), which is its identity.
+pub fn make_trait_context_type(key: Str) -> Int {
+    ty_intern_simple(TyKind.TraitContext, key, -1, -1)
+}
+
+// A kind whose type is a template context with no values: an effect or a trait (§3b.5). A
+// type such as `Int` or a marker `type Html {}` is a context too, but keeps its own kind.
+pub fn tk_is_valueless_context(k: TyKind) -> Bool {
+    k == TyKind.Effect || k == TyKind.TraitContext
+}
+
 // `Template[C]`. Its one inner is the context C (§3b.5 *The Context Parameter C*), shaped like
 // make_ptr_type so the child accessors and spellers reach it through arms they already have.
-// A context is an effect type (make_effect_type), so `Template[Shell]` is not `Template[DB]`.
+// A context named by an effect or a trait is that declaration's own type (make_effect_type,
+// make_trait_context_type), so `Template[Shell]` is not `Template[DB]`.
 pub fn make_template_type(context: Int) -> Int {
     ty_intern_simple(TyKind.Template, "Template", context, -1)
 }
@@ -5818,7 +5833,7 @@ pub fn tc_unify(a0: Int, b0: Int) -> Int {
         // Each of these answered above, before the kinds were compared; the arms repeat that answer.
         TyKind.Unknown | TyKind.Typevar => 1
         // The name is the declaration (make_effect_type); two effects are one type only by it.
-        TyKind.Effect => if ta.name == tb.name { 1 } else { 0 }
+        TyKind.Effect | TyKind.TraitContext => if ta.name == tb.name { 1 } else { 0 }
         // One type argument, in inner1.
         TyKind.List | TyKind.Option | TyKind.Set | TyKind.Channel | TyKind.Iterator | TyKind.Raw | TyKind.Ptr | TyKind.Handle | TyKind.Template | TyKind.Range => tc_unify(ta.inner1, tb.inner1)
         // The effect is in the name slot, not in a child.
@@ -7198,7 +7213,7 @@ fn tc_check_one_bound(name: Str, bounds: Str, concrete: Int, node: Int, sink: St
         if tc_pipe_has(bounds, tr) != 0 && tc_type_satisfies_bound(concrete, tr) == -1 {
             let path = tc_trait_need(concrete, tr, [])
             let fixes = if path.len() > 0 { tc_trait_need_fixes(path.get(path.len() - 1).unwrap(), tc_need_fix_trait(path, tr)) } else { [] }
-            let help = if tc_tid_kind(tc_resolve(concrete)) == TyKind.Effect { tc_effect_context_bound_help(type_to_str(concrete), tr) } else if fixes.len() > 0 { fixes.join("\n") } else {
+            let help = if tk_is_valueless_context(tc_tid_kind(tc_resolve(concrete))) { tc_context_bound_help(concrete, tr) } else if fixes.len() > 0 { fixes.join("\n") } else {
                 "pass an argument whose type implements {tr}, or derive/implement {tr} for it; the arithmetic traits (Add/Sub/Mul/Div/Rem/Neg) are sealed to the built-in numeric types"
             }
             let shown = tc_core_trait_shown(tr)
@@ -7375,8 +7390,8 @@ fn tc_report_unmet_user_bound(carrier: Int, outer_sl: Int, own_sl: Int, concrete
     let why = if kind_fits && u.held.impls == 0 { "a List implements {shown} only where its element {elem_rule}" } else { has }
     // No impl can be written at a type parameter of the body being checked.
     let at_body = tc_args_name_a_body_tparam(u.want)
-    let help = if tc_tid_kind(tc_resolve(concrete)) == TyKind.Effect {
-        tc_effect_context_bound_help(type_to_str(concrete), bound_text)
+    let help = if tk_is_valueless_context(tc_tid_kind(tc_resolve(concrete))) {
+        tc_context_bound_help(concrete, bound_text)
     } else if surface && !kind_fits {
         "pass an argument whose type implements {bound_text}; {shown} is sealed to {row.shown}, and no impl of it can be written"
     } else if surface || at_body {
@@ -9761,8 +9776,8 @@ fn tc_display_missing_leaf(t0: Int) -> Int ! TypeCheck.Resolve, Diag.Report {
     let t = resolve_alias_tid(tc_resolve(t0))
     let k = type_kind(t)
     if k == TyKind.Unknown || k == TyKind.Never { return -1 }
-    // An effect context has no values, so it implements no trait (§3b.5).
-    if k == TyKind.Effect { return t }
+    // An effect or trait context has no values, so it implements no trait (§3b.5).
+    if tk_is_valueless_context(k) { return t }
     if k == TyKind.Typevar {
         if tc_typevar_binds_here(t) == 0 { return -1 }
         if tc_typevar_holds(t, "Display") { return -1 }
@@ -9925,8 +9940,8 @@ fn tc_report_missing_display(arg: Int, t: Int, leaf: Int, sink: Str, notes: List
         return
     }
     let lk = type_kind(leaf)
-    if lk == TyKind.Effect {
-        diag_error_label_at_notes("MissingDisplayImpl", MISSING_DISPLAY_IMPL, msg, arg, label, tc_effect_context_bound_help(ls, "`Display`"), notes)
+    if tk_is_valueless_context(lk) {
+        diag_error_label_at_notes("MissingDisplayImpl", MISSING_DISPLAY_IMPL, msg, arg, label, tc_context_bound_help(leaf, "`Display`"), notes)
         return
     }
     if lk == TyKind.Typevar {
@@ -14621,15 +14636,15 @@ fn tc_resolve_compiler_known_type(name: Str, elems_sl: Int, ann_node: Int) -> In
         }
         return make_ptr_type(TYPE_UNKNOWN)
     }
-    // The fifth carrier and the same reason again — see make_template_type. The
-    // phantom recurses through resolve_type_ann like every other carrier's child, so a
-    // context that IS a real type resolves to it; the spec's own contexts are effect names,
-    // which are not types, so those land on a typevar named for the effect. Either way the
-    // context is kept rather than discarded with the whole type. A `type Template` declared
-    // in scope takes the name instead, and resolves below like any declared type.
+    // The fifth carrier and the same reason again — see make_template_type. The context
+    // resolves like any carrier's child, a type to itself and an effect to its effect type,
+    // but through resolve_type_parts_at with `at_context`, because only here does a trait name
+    // give a type: its trait context type (§3b.5). A `type Template` declared in scope takes
+    // the name instead, and resolves below like any declared type.
     if name == "Template" {
         if elems_sl != -1 && sublist_length(elems_sl) >= 1 {
-            return make_template_type(resolve_type_ann(sublist_get(elems_sl, 0)))
+            let c = sublist_get(elems_sl, 0)
+            return make_template_type(resolve_type_parts_at(node_name(c), node_elements(c), c, true))
         }
         return make_template_type(TYPE_UNKNOWN)
     }
@@ -14702,6 +14717,12 @@ fn tc_aliased_compiler_known_type(written: Str, core: Str, ann_node: Int) -> Int
 }
 
 fn resolve_type_parts(name: Str, elems_sl: Int, ann_node: Int) -> Int ! TypeCheck.Resolve, Diag.Report {
+    resolve_type_parts_at(name, elems_sl, ann_node, false)
+}
+
+// resolve_type_parts, with `at_context` true for the direct child of `Template[...]`, the one
+// position where a trait name names a type (§3b.5).
+fn resolve_type_parts_at(name: Str, elems_sl: Int, ann_node: Int, at_context: Bool) -> Int ! TypeCheck.Resolve, Diag.Report {
     // Arity is a property of a WRITTEN type position, so it keys on ann_node
     // alone — not on tc_suppress_ann_validation. That flag only silences
     // hashability re-reports the live path already emitted; arity has no such
@@ -14752,6 +14773,10 @@ fn resolve_type_parts(name: Str, elems_sl: Int, ann_node: Int) -> Int ! TypeChec
         tc_settle_alias_decl(written_alias)
         if tc_generic_alias_decl_applies(written_alias, elems_sl) { return tc_apply_generic_alias(written_alias, name, elems_sl, ann_node) }
     }
+    if at_context && written_alias != -1 {
+        let ctx = tc_alias_trait_context(written_alias)
+        if ctx != -1 { return ctx }
+    }
     let alias_name_tid = tc_resolve_transparent_alias_name(name)
     if alias_name_tid != -1 {
         // An alias its module declares twice (E1016) may have meant either type.
@@ -14793,6 +14818,12 @@ fn resolve_type_parts(name: Str, elems_sl: Int, ann_node: Int) -> Int ! TypeChec
     // namespace, so a `type DB` in this module wins over the effect.
     let effect_type = tc_effect_context_type(name, ann_node)
     if effect_type != -1 { return effect_type }
+    // A trait is a type-namespace declaration too, so it names a context (§3b.5); §3b.5 is
+    // what gives the name a type, so only the context position reads it.
+    if at_context {
+        let trait_type = tc_trait_context_type(name)
+        if trait_type != -1 { return trait_type }
+    }
     // An unresolved name here is NOT necessarily an unknown type: resolve_type_parts is
     // the shared low-level type-lowering path, reached for the trait `Self` (no concrete
     // receiver yet) and the primitive sentinels, which legitimately lower to a typevar.
@@ -14801,6 +14832,21 @@ fn resolve_type_parts(name: Str, elems_sl: Int, ann_node: Int) -> Int ! TypeChec
     // name-resolution does not walk) must be closed in the name-resolution walker with its
     // full acceptance set, not in this fallback.
     make_typevar(name)
+}
+
+// The trait context a settled, non-generic alias gives in the context position, or -1. An
+// alias is its target (§3.4 *Newtypes*), and a bare trait name as a target gives a type only there, so
+// the stored target (a type variable) is read again as the trait in the alias's own module.
+fn tc_alias_trait_context(atd: Int) -> Int {
+    let target = node_value(atd)
+    if target == -1 || node_elements(target) != -1 { return -1 }
+    let binders = node_type_params(atd)
+    if binders != -1 && sublist_length(binders) > 0 { return -1 }
+    let stored = tc_alias_underlying.get(tc_nominal_type_name(atd)) ?? -1
+    if stored == -1 || tc_tid_kind(tc_resolve(stored)) != TyKind.Typevar { return -1 }
+    let key = tc_trait_ref_key(node_name(target), node_module(atd))
+    if tc_trait_node_idx.contains_key(key) || tc_trait_is_compiler_known(key) { return make_trait_context_type(key) }
+    -1
 }
 
 // The declaration of the generic alias `name` means when `elems_sl` gives it an argument for
@@ -17306,7 +17352,7 @@ fn tc_deserialize_read_fact(tid: Int) -> Int {
         // §3.6.2 maps none of these and refuses none of them.
         TyKind.Char | TyKind.I8 | TyKind.I16 | TyKind.I32 | TyKind.U8 | TyKind.U16 | TyKind.U32 | TyKind.U64 => 0
         TyKind.Bytes | TyKind.Range | TyKind.Never => 0
-        TyKind.Void | TyKind.Fn | TyKind.Iterator | TyKind.Handle | TyKind.Channel | TyKind.Ptr | TyKind.Handler | TyKind.Effect => -1
+        TyKind.Void | TyKind.Fn | TyKind.Iterator | TyKind.Handle | TyKind.Channel | TyKind.Ptr | TyKind.Handler | TyKind.Effect | TyKind.TraitContext => -1
         TyKind.StringBuilder | TyKind.Template | TyKind.FfiScope | TyKind.Raw => -1
     }
 }
@@ -19895,6 +19941,14 @@ fn tc_projection_use_help(name: Str, what: Str) -> Str {
 // The help for an effect context `t` that a bound `shown` asks for: no impl can give it one.
 fn tc_effect_context_bound_help(t: Str, shown: Str) -> Str {
     "`{t}` names an effect, a type with no values, so it implements no trait; pass a template whose context implements {shown}, or drop the bound"
+}
+
+// The help for the template context `ctx` that lacks the bound `shown`, whether an effect or
+// a trait names it.
+fn tc_context_bound_help(ctx: Int, shown: Str) -> Str {
+    let t = type_to_str(ctx)
+    if tc_tid_kind(tc_resolve(ctx)) == TyKind.Effect { return tc_effect_context_bound_help(t, shown) }
+    "`{t}` names a trait as a template context, a type with no values, so it implements no trait; pass a template whose context implements {shown}, or drop the bound"
 }
 
 // The help for a type parameter `t` that lacks the bound `shown`: add it to the bound list
@@ -23381,7 +23435,7 @@ pub fn tc_effect_ident(ed: Int) -> Str {
     if tc_effect_name_shared(name) { "{name}@{node_module(ed)}" } else { name }
 }
 
-// The C key of the user effect `ed` declares: its escaped name, then, for an effect of a module
+// The C key of the user effect `ed` declares (or of any declaration, which tc_trait_c_key uses): its escaped name, then, for an effect of a module
 // other than the program's own, its module after `_2`. The key comes from the declaration
 // alone, so a unit built in one module and a unit built in another give one effect one C name.
 // The key is the declared name, not the handle, so C never relies on E0562 to keep two
@@ -23391,6 +23445,14 @@ pub fn tc_effect_c_key(ed: Int) -> Str {
     let module = node_module(ed)
     if tc_module_key_is_main(module) != 0 { return tc_sym_escape(name) }
     tc_sym_with_module(name, module)
+}
+
+// The C key of the trait a trait context names (make_trait_context_type), from its
+// declaration as tc_effect_c_key keys an effect, so two units give one context one C name. A
+// trait the compiler knows with no declaration (tc_undeclared_trait_names) keeps its name.
+pub fn tc_trait_c_key(key: Str) -> Str {
+    let decl = tc_trait_node_idx.get(key) ?? -1
+    if decl == -1 { tc_sym_escape(key) } else { tc_effect_c_key(decl) }
 }
 
 // The name a row or budget entry gives its effect: the declared name when name resolution read
@@ -23563,6 +23625,42 @@ fn tc_effect_context_spelling(name: Str, reader: Str) -> Str {
     // No file imports the program's own file, so its effect has no other spelling.
     if tc_module_key_is_main(module) != 0 { return root }
     name
+}
+
+// The type a trait name written as a template context gives (§3b.5 *The Context Parameter
+// C*), or -1 when `name` names no trait here. Asked only after every type, alias, type
+// parameter and effect of that name, so those keep the name.
+fn tc_trait_context_type(name: Str) -> Int {
+    let key = tc_trait_ref_key(name, nr_current_module)
+    if tc_trait_node_idx.contains_key(key) || tc_trait_is_compiler_known(key) { return make_trait_context_type(key) }
+    -1
+}
+
+// How the module `reader` writes the trait context keyed `key`, by the rules
+// tc_effect_spelling_in gives an effect: the bare name where it reaches the trait, else the
+// name a selective import binds for it, else a qualifier for its module or for a module that
+// re-exports it. A prelude trait is in scope everywhere under its name.
+fn tc_trait_context_spelling(key: Str, reader: Str) -> Str {
+    let decl = tc_trait_node_idx.get(key) ?? -1
+    if decl == -1 { return key }
+    let root = node_name(decl)
+    let module = node_module(decl)
+    if reader == "" || module == reader || tc_module_key_is_main(module) != 0 || tc_prelude_modules.contains_key(module) { return root }
+    let idx = nr_module_import_index(reader)
+    let mut bound: List[Str] = [root]
+    for k in idx.keys().sort() { if k != root { bound.push(k) } }
+    for k in bound {
+        for b in idx.get(k) ?? [] {
+            if b.member != "" && tc_trait_decl_in_module(b.source_mod, b.member, 0) == decl { return k }
+        }
+    }
+    let q = nr_qualifier_of_module_in(module, reader)
+    if q != "" { return "{q}.{root}" }
+    let quals = nr_module_imports_built(reader).qualifiers
+    for k in quals.keys().sort() {
+        if tc_trait_decl_in_module(quals.get(k) ?? "", root, 0) == decl { return "{k}.{root}" }
+    }
+    "{tc_get_dotted_module_path(module)}.{root}"
 }
 
 // The effect a bare `head` names in the module under check: the module's own effect, else one
@@ -31922,7 +32020,9 @@ fn nr_check_type_ann_visibility(ann_node: Int) ! TypeCheck.Resolve, Diag.Report 
                 let child_name = node_name(child)
                 // A template context that names no effect is read as any other type name, so
                 // a name that is nothing is UnknownType (§3b.5), never a type variable.
-                if core == "Template" && tc_effect_context_type(child_name, -1) == -1 {
+                // A trait the file imports from blink.core under another name is in no module
+                // the walk could look in, so it is in scope as the import says.
+                if core == "Template" && tc_effect_context_type(child_name, -1) == -1 && tc_core_alias_target(child_name, nr_current_module) == "" {
                     nr_check_type_ann_visibility(child)
                 } else {
                     tc_mark_symbol_used(child_name)
@@ -33766,7 +33866,7 @@ fn types_compatible(a0: Int, b0: Int) -> Int {
         TyKind.Typevar => tc_typevar_pair_compatible(a, b)
         // The name is the declaration (make_effect_type), so a context is compatible only with
         // itself (§3b.5 *The Context Parameter C*).
-        TyKind.Effect => if ta.name == tb.name { 1 } else { 0 }
+        TyKind.Effect | TyKind.TraitContext => if ta.name == tb.name { 1 } else { 0 }
         // One type argument in inner1, compared as is: there is no subtyping (§3.6 *Traits*),
         // so Channel[Int] is not a Channel[Str] and Handle[Int] is not a Handle[Str].
         TyKind.List | TyKind.Option | TyKind.Iterator | TyKind.Set | TyKind.Channel | TyKind.Handle | TyKind.Raw | TyKind.Range => tc_type_part_compatible(ta.inner1, tb.inner1)
@@ -34552,7 +34652,7 @@ fn tc_debug_need(tid0: Int, visiting: List[Int]) -> List[Int] {
             [t.inner1]
         }
         TyKind.Tuple => tc_tuple_elem_tids(tid)
-        TyKind.Void | TyKind.Fn | TyKind.Iterator | TyKind.Handle | TyKind.Channel | TyKind.Ptr | TyKind.Handler | TyKind.Effect => { return [tid] }
+        TyKind.Void | TyKind.Fn | TyKind.Iterator | TyKind.Handle | TyKind.Channel | TyKind.Ptr | TyKind.Handler | TyKind.Effect | TyKind.TraitContext => { return [tid] }
         TyKind.StringBuilder | TyKind.Template | TyKind.FfiScope | TyKind.Raw => { return [tid] }
     }
     for p in parts {
@@ -34683,7 +34783,7 @@ fn tc_debug_unbuilt_in(tid0: Int, top: Bool) -> Option[Str] {
         TyKind.Int | TyKind.Float | TyKind.Bool | TyKind.Str | TyKind.Char | TyKind.Bytes => None
         TyKind.I8 | TyKind.I16 | TyKind.I32 | TyKind.U8 | TyKind.U16 | TyKind.U32 | TyKind.U64 => None
         TyKind.Typevar | TyKind.Unknown => None
-        TyKind.Void | TyKind.Fn | TyKind.Iterator | TyKind.Handle | TyKind.Channel | TyKind.Ptr | TyKind.Handler | TyKind.Effect => None
+        TyKind.Void | TyKind.Fn | TyKind.Iterator | TyKind.Handle | TyKind.Channel | TyKind.Ptr | TyKind.Handler | TyKind.Effect | TyKind.TraitContext => None
         TyKind.StringBuilder | TyKind.Template | TyKind.FfiScope | TyKind.Raw => None
     }
 }
@@ -41274,7 +41374,15 @@ fn tc_explicit_type_binds(decl: Int, call_node: Int) -> Map[Str, Int] ! TypeChec
     let mut i = 0
     while i < sublist_length(binders) {
         let b = sublist_get(binders, i)
-        let t = resolve_type_ann(sublist_get(targs, i))
+        let arg = sublist_get(targs, i)
+        // A written argument for a binder the signature uses as a template context reads as
+        // that context, as the binder solves when inferred (§3b.5), so `ident[Html](t)` is
+        // `ident(t)` at a `Template[Html]`.
+        let t = if tc_decl_uses_binder_as_context(decl, node_name(b)) {
+            resolve_type_parts_at(node_name(arg), node_elements(arg), arg, true)
+        } else {
+            resolve_type_ann(arg)
+        }
         binds.insert(node_name(b), t)
         binds.insert(tc_binder_key(b, node_name(b)), t)
         binds.insert(tc_binder_key(tc_twin_binder(b), node_name(b)), t)
@@ -41283,6 +41391,35 @@ fn tc_explicit_type_binds(decl: Int, call_node: Int) -> Map[Str, Int] ! TypeChec
     }
     tc_seed_mint_group(call_node, tids)
     binds
+}
+
+// Whether a parameter or the return type of `decl` writes `Template[name]`.
+fn tc_decl_uses_binder_as_context(decl: Int, name: Str) -> Bool {
+    if tc_ann_uses_binder_as_context(node_type_ann(decl), name) { return true }
+    let params = node_params(decl)
+    if params == -1 { return false }
+    let mut i = 0
+    while i < sublist_length(params) {
+        if tc_ann_uses_binder_as_context(node_type_ann(sublist_get(params, i)), name) { return true }
+        i = i + 1
+    }
+    false
+}
+
+fn tc_ann_uses_binder_as_context(ann: Int, name: Str) -> Bool {
+    if ann == -1 { return false }
+    let elems = node_elements(ann)
+    if elems != -1 && sublist_length(elems) == 1 && tc_compiler_known_type_meant(node_name(ann), ann) == "Template" {
+        if node_name(sublist_get(elems, 0)) == name { return true }
+    }
+    if tc_ann_uses_binder_as_context(node_type_ann(ann), name) { return true }
+    if elems == -1 { return false }
+    let mut i = 0
+    while i < sublist_length(elems) {
+        if tc_ann_uses_binder_as_context(sublist_get(elems, i), name) { return true }
+        i = i + 1
+    }
+    false
 }
 
 // Writes a full group for `call_node` in the layout tc_call_binder_metavars reads, once. A
@@ -47874,6 +48011,7 @@ fn type_to_str(tid0: Int) -> Str {
         TyKind.Handler => return "Handler[{tc_effect_spelling_in(name, nr_current_module)}]"
         // Spelled as the Handler arm spells its effect: the declared name, as this module writes it.
         TyKind.Effect => return tc_effect_context_spelling(name, nr_current_module)
+        TyKind.TraitContext => return tc_trait_context_spelling(name, nr_current_module)
         TyKind.Channel => return "Channel[{type_to_str(t.inner1)}]"
         TyKind.Ptr => {
             if type_kind(tc_resolve(t.inner1)) == TyKind.Void { return "Ptr[Void]" }
@@ -48044,6 +48182,7 @@ pub fn tc_tid_child_count(tid: Int) -> Int {
         TyKind.StringBuilder => 0
         TyKind.Typevar => 0
         TyKind.Effect => 0
+        TyKind.TraitContext => 0
         TyKind.Unknown => 0
         // Channel/Handle/Iterator carry one inner each (element / result / element). Iterator is
         // the sealed opaque carrier of §3c.1:38, produced only by `.into_iter()` and the lazy
@@ -48118,6 +48257,7 @@ pub fn tc_tid_child(tid: Int, i: Int) -> Int {
         TyKind.StringBuilder => -1
         TyKind.Typevar => -1
         TyKind.Effect => -1
+        TyKind.TraitContext => -1
         TyKind.Unknown => -1
         TyKind.Iterator => if i == 0 { t.inner1 } else { -1 }
         TyKind.Range => if i == 0 { t.inner1 } else { -1 }
@@ -48335,7 +48475,7 @@ fn tc_tid_same_type_at(a0: Int, b0: Int, open: Bool, holes: Map[Int, Int]) -> Bo
     // A match with no wildcard: a kind added to TyKind does not compile until it says whether
     // its name is part of its identity.
     let names_agree = match ta.kind {
-        TyKind.Struct | TyKind.Enum | TyKind.Typevar | TyKind.Effect => ta.name == tb.name
+        TyKind.Struct | TyKind.Enum | TyKind.Typevar | TyKind.Effect | TyKind.TraitContext => ta.name == tb.name
         TyKind.Handler => tc_handler_effects_agree(ta.name, tb.name)
         // The name is a spelling of the kind or of its children, which the slots below compare.
         TyKind.Int | TyKind.Bool | TyKind.Float | TyKind.Str | TyKind.Void | TyKind.Bytes | TyKind.StringBuilder | TyKind.FfiScope | TyKind.Char | TyKind.Never => true
