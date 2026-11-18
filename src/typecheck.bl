@@ -4825,8 +4825,8 @@ fn tc_ud_flush_calls() ! TypeCheck.Resolve, Diag.Report {
             pi = pi + 1
         }
         if names.len() == 0 {
-            tc_judge_derived_from_json(sig, tc_lookup_node_tid(call_node), tc_calls.open_tids.get(g + 3 + 2 * n).unwrap(), call_node)
-            tc_check_open_call_bounds(call_node, g)
+            let refused = tc_judge_derived_from_json(sig, tc_lookup_node_tid(call_node), tc_calls.open_tids.get(g + 3 + 2 * n).unwrap(), call_node)
+            if !refused { tc_check_open_call_bounds(call_node, g) }
             continue
         }
         tc_calls.reported.insert(call_node, 1)
@@ -4854,16 +4854,17 @@ fn tc_ud_flush_calls() ! TypeCheck.Resolve, Diag.Report {
 // A generic type's from_json is its Deserialize derive at the instance it builds, `ret` being
 // the Result it returns, so it holds only where that derive does, as to_json does
 // (tc_refuse_derived_method_at). The instance is often fixed after the call or the name, so it
-// is judged at the flush, once inference is done.
-fn tc_judge_derived_from_json(sig: Int, ret: Int, enclosing: Int, node: Int) ! TypeCheck.Resolve, Diag.Report {
-    if tc_derived_static_owner(sig) < 0 { return }
-    if ret < 0 || type_kind(tc_resolve(ret)) != TyKind.Result { return }
+// is judged at the flush, once inference is done. It answers whether it refused.
+fn tc_judge_derived_from_json(sig: Int, ret: Int, enclosing: Int, node: Int) -> Bool ! TypeCheck.Resolve, Diag.Report {
+    if tc_derived_static_owner(sig) < 0 { return false }
+    if ret < 0 || type_kind(tc_resolve(ret)) != TyKind.Result { return false }
     let built = tc_derived_static_built(ret)
-    if built < 0 || tc_tid_has_unbound_metavar(built) != 0 { return }
+    if built < 0 || tc_tid_has_unbound_metavar(built) != 0 { return false }
     let frames = tc_enter_body_frames(enclosing)
     let path = tc_trait_need(built, "Deserialize", [])
     if path.len() > 0 { tc_report_trait_need(path, "Deserialize", node) }
     tc_leave_body_frames(frames)
+    path.len() > 0
 }
 
 // The bounds of a call's binders at the types inference gave them, for a call that had a binder
@@ -5050,9 +5051,10 @@ fn tc_check_fn_value_bounds(node: Int) ! TypeCheck.Resolve, Diag.Report {
         tids.push(tc_calls.open_tids.get(g + 4 + pi).unwrap())
         pi = pi + 1
     }
-    tc_check_bounds_in_body(sig, -1, tids, -1, enclosing, node)
+    // A refused instance already names the field to fix; its bounds would repeat that at this node.
     let fn_tid = tc_resolve(tc_lookup_node_tid(node))
-    if type_kind(fn_tid) == TyKind.Fn { tc_judge_derived_from_json(sig, tc_fn_tid_ret(fn_tid), enclosing, node) }
+    if type_kind(fn_tid) == TyKind.Fn && tc_judge_derived_from_json(sig, tc_fn_tid_ret(fn_tid), enclosing, node) { return }
+    tc_check_bounds_in_body(sig, -1, tids, -1, enclosing, node)
 }
 
 // A bare type parameter of the body being checked, passed where a binder has bounds: inside
@@ -17303,20 +17305,41 @@ fn tc_deserialize_parts(t: Int) -> List[Int] {
 }
 
 // The chain from `tid` to the innermost part that is not Deserialize, or empty when `tid` is
-// not refused.
-fn tc_deserialize_need(tid0: Int) -> List[Int] {
+// not refused. An instance of a type that derives Deserialize lacks it through a field read at
+// the instance, so the chain goes on to that field, and the fix names the type to change.
+fn tc_deserialize_need(tid0: Int, visiting: List[Int]) -> List[Int] {
     let t = resolve_alias_tid(tc_resolve(tid0))
     if tc_deserialize_read_fact(t) != -1 { return [] }
-    for part in tc_deserialize_parts(t) {
-        let need = tc_deserialize_need(part)
+    let parts = if tc_tid_base_derives(t, "Deserialize") { tc_derived_field_tids_at(t) } else { tc_deserialize_parts(t) }
+    if tc_need_visited(visiting, t) { return [] }
+    let inner = tc_need_visiting(visiting, t)
+    for part in parts {
+        let need = tc_deserialize_need(part, inner)
         if need.len() > 0 { return eq_need_through(t, need) }
     }
     [t]
 }
 
+// The type of each field of the struct or enum instance `t`, read at the instance.
+fn tc_derived_field_tids_at(t: Int) -> List[Int] {
+    let mut parts: List[Int] = []
+    if type_kind(t) == TyKind.Struct {
+        let base = tc_struct_base_tid(t)
+        let inst = if base == t { -1 } else { t }
+        for slot in tc_struct_field_slots(base) { parts.push(tc_member_tid_at_instance(tc_sfield_tid(slot), inst)) }
+        return parts
+    }
+    let base = tc_enum_base_tid(t)
+    let inst = if base == t { -1 } else { t }
+    for vslot in tc_enum_variant_slots(base) {
+        for fslot in tc_evar_field_slots(vslot) { parts.push(tc_member_tid_at_instance(tc_evfield_tid(fslot), inst)) }
+    }
+    parts
+}
+
 fn tc_check_one_deserialize_field(f: Int, variant: Int, ftid: Int, tname: Str) ! Diag.Report {
     if ftid < 0 { return }
-    let need = tc_deserialize_need(ftid)
+    let need = tc_deserialize_need(ftid, [])
     if need.len() == 0 { return }
     diag_error_at("NonDerivableTrait", NON_DERIVABLE_TRAIT, "@derive(Deserialize) on `{tname}`: field `{tc_derive_field_label(variant, f)}` has type `{type_ann_text(node_value(f))}` which does not implement Deserialize", f, tc_derive_field_help(need.get(need.len() - 1).unwrap(), "Deserialize"))
 }
@@ -34382,7 +34405,7 @@ fn tc_trait_need(tid: Int, tr: Str, visiting: List[Int]) -> List[Int] {
         "Hash" => tc_derive_only_need(tid, tr)
         "Debug" => tc_debug_need(tid, visiting)
         "Serialize" => tc_derive_only_need(tid, tr)
-        "Deserialize" => tc_deserialize_need(tid)
+        "Deserialize" => tc_deserialize_need(tid, visiting)
         "Clone" => tc_clone_need(tid, visiting)
         _ => []
     }
