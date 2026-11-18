@@ -1,7 +1,8 @@
 import compile_test_helpers
 
-// A closure handed to async.spawn may not capture a `let mut` binding (§2.8, E0650): the
-// task and the enclosing scope would share one mutable binding with no order between them.
+// A closure handed to async.spawn may not capture a mutable root (§2.8, E0650): a `let mut`,
+// a `mut` pattern binder, a `mut` parameter or `mut self`. The task and the enclosing scope
+// would share one mutable root with no order between them.
 // The rule is on the capture, not on a write, so a task that only reads the binding is
 // rejected too. Copying the value into a `let` first is the fix the spec names, and a
 // closure that captures a `let mut` but is never spawned is ordinary.
@@ -10,6 +11,12 @@ fn expect_rejected(src: Str, tag: Str, name: Str) ! FS.Delete, FS.Read, FS.Write
     let out = compile_test_helpers.compile_and_capture(src, tag)
     compile_test_helpers.expect_error(out, "E0650", "{tag}: spawn capturing `{name}` is E0650")
     compile_test_helpers.expect_contains(out, "`{name}`", "{tag}: the report names `{name}`")
+}
+
+// The second label of the report spans the `mut` keyword exactly: three columns on its line.
+fn expect_mut_label(out: Str, line: Int, col: Int, what: Str, label: Str) ! IO.Print {
+    let span = "\"line\":{line},\"col\":{col},\"end_line\":{line},\"end_col\":{col + 3}\}"
+    compile_test_helpers.expect_contains(out, "{span},\"message\":\"{what}\"", label)
 }
 
 fn expect_accepted(src: Str, tag: Str) ! FS.Delete, FS.Read, FS.Write, Process.Spawn, Env.Read, IO.Print {
@@ -284,7 +291,7 @@ fn main() ! Async, IO {
 "#
     expect_rejected(src, "_spawnmut_param_bytes", "b")
     let out = compile_test_helpers.compile_and_capture(src, "_spawnmut_param_bytes_note")
-    compile_test_helpers.expect_contains(out, "`b` is a `mut` parameter", "_spawnmut_param_bytes: the report points at the parameter's `mut`")
+    expect_mut_label(out, 1, 9, "`b` is a `mut` parameter", "_spawnmut_param_bytes: the report underlines the parameter's `mut`")
 }
 
 test "a spawned closure that only reads a mut List parameter is rejected" {
@@ -326,7 +333,7 @@ fn main() ! Async, IO {
 "#
     expect_rejected(src, "_spawnmut_self", "self")
     let out = compile_test_helpers.compile_and_capture(src, "_spawnmut_self_note")
-    compile_test_helpers.expect_contains(out, "`mut self` is a mutable root", "_spawnmut_self: the report points at the receiver's `mut`")
+    expect_mut_label(out, 8, 12, "`mut self` is a mutable root", "_spawnmut_self: the report underlines the receiver's `mut`")
 }
 
 test "a let mut capture report points at the binding's mut" {
@@ -336,7 +343,7 @@ test "a let mut capture report points at the binding's mut" {
     io.println("{h.await}")
 }
 "#, "_spawnmut_let_note")
-    compile_test_helpers.expect_contains(out, "`counter` is a `let mut` binding", "_spawnmut_let_note: the report points at the `let mut`")
+    expect_mut_label(out, 2, 9, "`counter` is a `let mut` binding", "_spawnmut_let_note: the report underlines the `mut` of the `let mut`")
 }
 
 test "a mut pattern binder capture report points at the binder's mut" {
@@ -347,7 +354,66 @@ test "a mut pattern binder capture report points at the binder's mut" {
     io.println("{h.await}")
 }
 "#, "_spawnmut_pattern_note")
-    compile_test_helpers.expect_contains(out, "`a` is a `mut` pattern binder", "_spawnmut_pattern_note: the report points at the binder's `mut`")
+    expect_mut_label(out, 2, 10, "`a` is a `mut` pattern binder", "_spawnmut_pattern_note: the report underlines the binder's `mut`")
+}
+
+test "a for mut binder capture report points at the binder's mut" {
+    let out = compile_test_helpers.compile_and_capture(#"fn main() ! Async, IO {
+    for mut i in [1, 2] {
+        i += 1
+        let h = async.spawn(fn() { i + 1 })
+        io.println("{h.await}")
+    }
+}
+"#, "_spawnmut_for_note")
+    expect_mut_label(out, 2, 9, "`i` is a `mut` pattern binder", "_spawnmut_for_note: the report underlines the binder's `mut`")
+}
+
+test "a mut parameter captured by a closure held in a let and then spawned is rejected" {
+    expect_rejected(#"fn fill(mut b: Bytes) -> Int ! Async {
+    let f = fn() { b.len() }
+    async.scope {
+        let h = async.spawn(f)
+        h.await
+    }
+}
+
+fn main() ! Async, IO {
+    io.println("{fill(Bytes.new())}")
+}
+"#, "_spawnmut_param_alias", "b")
+}
+
+test "a closure nested in a spawned closure is rejected for its mut parameter capture" {
+    expect_rejected(#"fn fill(mut b: Bytes) -> Int ! Async {
+    async.scope {
+        let h = async.spawn(fn() {
+            let g = fn() { b.len() }
+            g()
+        })
+        h.await
+    }
+}
+
+fn main() ! Async, IO {
+    io.println("{fill(Bytes.new())}")
+}
+"#, "_spawnmut_param_nested", "b")
+}
+
+test "a closure assigned to a mut parameter is rejected when spawned for its let mut capture" {
+    expect_rejected(#"fn run(mut g: fn() -> Int) -> Int ! Async {
+    let mut c = 0
+    g = fn() { c + 1 }
+    c = 5
+    let h = async.spawn(g)
+    h.await
+}
+
+fn main() ! Async, IO {
+    io.println("{run(fn() { 0 })}")
+}
+"#, "_spawnmut_param_reassigned", "c")
 }
 
 test "a parameter with no mut may be spawned" {

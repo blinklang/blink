@@ -590,10 +590,7 @@ choice(xs)                      // -> Option[T]: None for an empty list
 
 // Async (effect: Async)
 async.scope { ... }             // synchronous scope for spawned tasks
-async.spawn(fn() { ... })       // spawn task, returns Handle
-// The closure may not capture a mutable root, not even to read it (E0650): a `let mut`,
-// a `mut` pattern binder, a `mut` parameter, a `mut` binder in a parameter pattern, or `mut self`.
-// Fix: copy it into a `let` before the spawn (`let snap = b`), then capture `snap`
+async.spawn(fn() { ... })       // spawn task, returns Handle; see "Async Tasks and async.spawn"
 
 // Channel[T]
 let ch = channel.new[Int](buffer: 8)  // bounded queue; the buffer size is required
@@ -691,6 +688,38 @@ fn uniform(lo: Float, hi: Float) -> Float ! Rand {
 For a fixed stream in a test, install a handler: `handler Rand { fn int(lo: Int, hi: Int) -> Int { lo } ... }`
 implements the operations `int(lo, hi)` (closed range), `float()` and `bytes(n)`. `rand.int`
 checks each result of a handler and panics with `Rand handler contract violated` on a value out of range.
+
+## Async Tasks and async.spawn
+
+`async.spawn(f)` starts `f` as a task and returns a `Handle`; `h.await` gives its result.
+`async.scope { ... }` waits for every task spawned in it before it ends.
+
+The closure may not capture a mutable root, not even to read it (`E0650 MutableCaptureInSpawn`).
+The task and the scope that spawned it would share the root with no order between their reads
+and writes. The five mutable roots:
+
+- a `let mut` binding
+- a `mut` pattern binder (`let (mut a, b)`, `Some(mut v)`, `for mut i`)
+- a `mut` parameter
+- a `mut` binder in a parameter pattern
+- `mut self`
+
+A closure held in a `let` and then spawned carries its captures, so the rule applies to it too.
+The error points at the capture, and a label marks the `mut`. Copy the value into a `let`
+before the spawn and capture the copy, or send values over a channel:
+
+```blink
+fn fill(mut b: Bytes) -> Int ! Async {
+    let snap = b                                  // a copy; the task does not see b
+    let n = async.scope {
+        let h = async.spawn(fn() { snap.len() })  // OK
+        // async.spawn(fn() { b.push(1) })        // E0650: `b` is a `mut` parameter
+        h.await
+    }
+    b.push(2)
+    n + b.len()
+}
+```
 
 ## String Methods
 
