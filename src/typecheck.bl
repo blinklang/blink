@@ -46435,6 +46435,15 @@ fn tc_qualified_name_col(node: Int, qual: Str, name: Str) -> Int {
     -1
 }
 
+// The prelude carrier a bare variant pattern names when the scrutinee's type cannot say:
+// only when no visible enum also declares `name`, the same pick a bare value makes.
+fn tc_bare_carrier_pattern(name: Str, site: Int) -> Option[TyKind] {
+    match tc_bare_variant_from_program(name, site, tc_prelude_carrier_of(name)) {
+        BareVariantPick.Carrier(k) => Some(k)
+        _ => None
+    }
+}
+
 // The note names the one other visible enum that declares a bare `name`. It is found only to
 // write the note: the pattern still means a variant of `owner`, so nothing is typed from it.
 fn tc_other_enum_note(name: Str, owner: VariantOwner, subject: Str, site: Int) -> List[Str] {
@@ -46772,9 +46781,24 @@ fn tc_check_pattern_types(node: Int, subject: Str, poisoned: Bool, refutable: Bo
         // and the binder is typed one level too shallow (`Some(v)` over Option[Int] binds v as
         // Option[Int]). type_kind already resolves; the inner read must too. Identity on a
         // concrete scrutinee, so only the metavar case changes.
-        let pbt_resolved = if tc_pattern_binding_type >= 0 { tc_tid_resolved(tc_pattern_binding_type) } else { tc_pattern_binding_type }
+        let mut pbt_resolved = if tc_pattern_binding_type >= 0 { tc_tid_resolved(tc_pattern_binding_type) } else { tc_pattern_binding_type }
         // `Option.Some(v)` peels as `Some(v)` does; `Mode.Some(v)` names a user enum's variant.
         let carrier_spelled = tname == "" || tc_qualified_carrier(vname, tname).is_some()
+        // A carrier pattern on a scrutinee whose type is still open (an unannotated closure
+        // parameter) names that type's shape. Fix it to the carrier at fresh arguments so the
+        // payload binders live inside the scrutinee's type and a later use solves them.
+        if !bad && carrier_spelled && tc_is_unbound_metavar(pbt_resolved) != 0 {
+            let open_carrier = if tname != "" { tc_qualified_carrier(vname, tname) } else { tc_bare_carrier_pattern(short_name, node) }
+            let shape = match open_carrier {
+                Some(TyKind.Option) => make_option_type(make_metavar())
+                Some(TyKind.Result) => make_result_type(make_metavar(), make_metavar())
+                _ => -1
+            }
+            if shape >= 0 {
+                let _bound = bind_metavar(pbt_resolved, shape)
+                pbt_resolved = tc_tid_resolved(tc_pattern_binding_type)
+            }
+        }
         if bad {
             tc_pattern_binding_type = poison
         } else if carrier_spelled && short_name == "Some" && tc_pattern_binding_type >= 0 && type_kind(pbt_resolved) == TyKind.Option {
@@ -46985,6 +47009,12 @@ fn tc_check_pattern_types(node: Int, subject: Str, poisoned: Bool, refutable: Bo
         // typed as List[T] and any consumer that reads the binding's type
         // (e.g. the Display interpolation gate) sees the wrong type.
         let mut elem_t = if poisoned { poison } else { -1 }
+        // A list pattern matches only a List (section 3.5), so an open scrutinee (an
+        // unannotated closure parameter) is a List at a fresh element type that a later use
+        // solves, as the tuple arm above does for a tuple.
+        if !poisoned && saved_binding >= 0 && tc_is_unbound_metavar(tc_resolve(saved_binding)) != 0 {
+            let _bound = bind_metavar(saved_binding, make_list_type(make_metavar()))
+        }
         if !poisoned && saved_binding >= 0 && type_kind(saved_binding) == TyKind.List {
             // An inferred list (a closure's result, an element of a list built by push) is a bound
             // metavar, whose inner1 is its solution, not the element type.
