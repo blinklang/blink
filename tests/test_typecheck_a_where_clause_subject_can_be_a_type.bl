@@ -1,0 +1,167 @@
+// The subject of an impl's `where` constraint is a type, not only a binder name (§3.6, "The
+// `Self` Type"): `where Sw[T]: Sh` and `where Bx[T]: Sh` are bounds on those types. A use that
+// reaches the impl holds the bound at the instance, and a miss is E0306 there. A subject that is
+// a type gives its trait in the impl's body, at that type only. A subject that names
+// no type is an unknown name, and a binder that only the where clause names is still E0909.
+
+import std.fs
+import compiler.{compile_to_program}
+import typecheck.{check_types, TypeCheck}
+import diagnostics.{diag_entries, diag_reset, Diag}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+import lexer.{Lex}
+import parser.{Parse}
+
+fn probe(path: Str, src: Str) -> Int ! FS, Env.Exit, Env.Read, IO {
+    with handler Diag {}, handler Lex {}, handler Parse {}, handler TypeCheck {} {
+        init_embedded_stdlib()
+        fs.write(path, src).unwrap()
+        diag_reset()
+        let program = compile_to_program(path, 1)
+        check_types(program)
+        let _ = fs.delete(path)
+        program
+    }
+}
+
+fn errors_reported() -> List[Str] {
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" { out.push("{d.code} {d.line}:{d.col} | {d.help}") }
+    }
+    out
+}
+
+fn messages_reported() -> List[Str] {
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" { out.push("{d.code} {d.message}") }
+    }
+    out
+}
+
+// The program shares one prelude, so the body under test starts on line 10.
+fn errors_for(name: Str, body: Str) -> List[Str] ! FS, Env.Exit, Env.Read, IO {
+    let src = [
+        "trait Sh \{ fn sh(self) -> Int }",
+        "type Sw[T] \{ v: T }",
+        "impl[T: Eq] Sh for Sw[T] \{ fn sh(self) -> Int \{ 1 } }",
+        "type Bx[T] \{ v: T }",
+        "impl[T: Eq] Sh for Bx[T] \{ fn sh(self) -> Int \{ 2 } }",
+        "trait Mk \{ fn mk(s: Self) -> Int }",
+        "trait Tot \{ fn tot(self) -> Int }",
+        "type NoEq \{ a: Int }",
+        "trait Ck \{ fn chk(self) -> Int }",
+        body,
+        "fn main() \{ }",
+        "",
+    ].join("\n")
+    let _ = probe("build/tc_where_subject_type_{name}.bl", src)
+    errors_reported()
+}
+
+fn messages_for(name: Str, body: Str) -> List[Str] ! FS, Env.Exit, Env.Read, IO {
+    let _ = errors_for(name, body)
+    messages_reported()
+}
+
+// The impl's own type as the subject.
+
+test "a where clause on the impl's own type parses and checks" {
+    assert_eq(errors_for("own_parses", [
+        "impl[T] Mk for Sw[T] where Sw[T]: Sh \{ fn mk(_s: Self) -> Int \{ 2 } }",
+        "fn k() -> Int \{ Sw.mk(Sw \{ v: 1 }) }",
+    ].join("\n")), [])
+}
+
+test "a where clause on the impl's own type is E0306 at a call whose type misses it" {
+    assert_eq(errors_for("own_missed", [
+        "impl[T] Tot for Sw[T] where Sw[T]: Sh \{ fn tot(_self) -> Int \{ 2 } }",
+        "fn k() -> Int \{ Sw \{ v: NoEq \{ a: 1 } }.tot() }",
+    ].join("\n")), ["E0306 11:17 | add `@derive(Eq)` to `type NoEq`"])
+}
+
+test "a where clause on the impl's own type is E0306 at a use through a generic bound" {
+    assert_eq(errors_for("own_missed_generic", [
+        "impl[T] Tot for Sw[T] where Sw[T]: Sh \{ fn tot(_self) -> Int \{ 2 } }",
+        "fn f[U: Tot](u: U) -> Int \{ u.tot() }",
+        "fn k() -> Int \{ f(Sw \{ v: NoEq \{ a: 1 } }) }",
+    ].join("\n")), ["E0306 12:17 | add `@derive(Eq)` to `type NoEq`"])
+}
+
+test "a where clause on the impl's own type gives its trait in the impl's body" {
+    assert_eq(errors_for("own_given", [
+        "impl[T] Tot for Sw[T] where Sw[T]: Sh \{ fn tot(self) -> Int \{ self.sh() } }",
+        "impl[T] Ck for Sw[T] where Sw[T]: Sh \{ fn chk(self) -> Int \{ self.tot() + self.sh() } }",
+    ].join("\n")), [])
+}
+
+test "a where clause on the impl's own type gives nothing at another type in the body" {
+    assert_eq(errors_for("own_given_other", [
+        "impl[T] Tot for Sw[T] where Sw[T]: Sh \{ fn tot(_self) -> Int \{ 2 } }",
+        "impl[T] Ck for Sw[T] where Sw[T]: Sh \{ fn chk(_self) -> Int \{ Sw \{ v: NoEq \{ a: 1 } }.tot() } }",
+    ].join("\n")), ["E0306 11:63 | add `@derive(Eq)` to `type NoEq`"])
+}
+
+// Another type as the subject.
+
+test "a where clause on another type that the instance meets checks" {
+    assert_eq(errors_for("other_met", [
+        "impl[T] Ck for Sw[T] where Bx[T]: Sh \{ fn chk(_self) -> Int \{ 1 } }",
+        "fn k() -> Int \{ Sw \{ v: 1 }.chk() }",
+    ].join("\n")), [])
+}
+
+test "a where clause on another type is E0306 at a call whose instance misses it" {
+    assert_eq(errors_for("other_missed", [
+        "impl[T] Ck for Sw[T] where Bx[T]: Sh \{ fn chk(_self) -> Int \{ 1 } }",
+        "fn k() -> Int \{ Sw \{ v: NoEq \{ a: 1 } }.chk() }",
+    ].join("\n")), ["E0306 11:17 | add `@derive(Eq)` to `type NoEq`"])
+}
+
+test "a where clause on another type gives its trait at that type in the impl's body" {
+    assert_eq(errors_for("other_given", "impl[T] Ck for Sw[T] where Bx[T]: Sh \{ fn chk(self) -> Int \{ Bx \{ v: self.v }.sh() } }"), [])
+}
+
+test "a where clause on another type gives nothing at a third type in the body" {
+    assert_eq(errors_for("other_given_other", "impl[T] Ck for Sw[T] where Bx[T]: Sh \{ fn chk(self) -> Int \{ Sw \{ v: self.v }.sh() } }"),
+        ["E0306 10:62 | write the bound on the binder: `[T: Eq]`"])
+}
+
+test "an E0306 on a where clause names the subject as written" {
+    assert_eq(messages_for("other_missed_text", [
+        "impl[T] Ck for Sw[T] where Bx[T]: Hash \{ fn chk(_self) -> Int \{ 1 } }",
+        "fn k() -> Int \{ Sw \{ v: 1 }.chk() }",
+    ].join("\n")), ["E0306 `Bx[Int]` does not satisfy the Hash bound on `Bx[T]` of `Sw`'s impl of Ck"])
+}
+
+// A binder subject, as before.
+
+test "a where clause on a binder is judged as before" {
+    assert_eq(errors_for("binder", [
+        "impl[T] Ck for Sw[T] where T: Eq \{ fn chk(_self) -> Int \{ 1 } }",
+        "fn k() -> Int \{ Sw \{ v: NoEq \{ a: 1 } }.chk() }",
+    ].join("\n")), ["E0306 11:17 | add `@derive(Eq)` to `type NoEq`"])
+}
+
+// Refused at the declaration.
+
+test "a where subject that names no type is an unknown type" {
+    assert_eq(errors_for("unknown", "impl[T] Ck for Sw[T] where Nope[T]: Sh \{ fn chk(_self) -> Int \{ 1 } }"),
+        ["E0507 10:35 | "])
+}
+
+test "a where subject refused at the declaration adds no error at a use" {
+    assert_eq(errors_for("refused_subject", [
+        "impl[T] Ck for Sw[T] where Sw[T, T]: Sh \{ fn chk(_self) -> Int \{ 1 } }",
+        "fn k() -> Int \{ Sw \{ v: 1 }.chk() }",
+    ].join("\n")), ["E0303 10:36 | remove the extra type argument(s); `Sw` takes exactly 1"])
+}
+
+test "a binder that only a where subject names is still E0909" {
+    let mut e0909: List[Str] = []
+    for e in errors_for("unused_binder", "impl[T] Ck for NoEq where Bx[T]: Sh \{ fn chk(_self) -> Int \{ 1 } }") {
+        if e.starts_with("E0909") { e0909.push(e) }
+    }
+    assert_eq(e0909, ["E0909 10:1 | use `T` in the trait's or the receiver's type arguments, or remove the binder"])
+}
