@@ -1744,6 +1744,7 @@ let config = ServerConfig { port: 3000, debug: true }
 - Each construction that omits a field with a default builds a new value for that field
 - Fields without defaults are always required at construction
 - An omitted field takes its default value
+- A derived `from_json` also takes the default when the object has no entry for the field. An entry with `null` is not absent, so it does not take the default (§3.6.2 *Missing and Extra Keys*)
 - Struct field defaults do not interact with the type system: `ServerConfig` is the same type regardless of which fields were explicitly provided
 
 ```blink

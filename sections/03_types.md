@@ -8799,6 +8799,7 @@ When a derived `from_json` calls `from_json` for a field and gets `Err(e)`, it r
 
 - A parse error's `message` contains `line L, column C`. Both count from 1. Lines are split at `\n` (U+000A). The column counts bytes from the start of the line, the same unit as `Str.len()`.
 - A decode error whose `path` is not `""` has a `message` that contains `at <path>`, for example `at $.items[2].age`.
+- A *missing field* error (§3.6.2 *Missing and Extra Keys*) has a `message` of the form ``missing field `name` (Str) at $.name``.
 
 *NaN and Infinity* and *Str-Backed Enums* below add content rules for some errors. The rest of the wording is not fixed, except that `json.decode[T]` and its two-step form give the same text (§3.6.3 *Typed Decoding and Encoding*).
 
@@ -8834,6 +8835,103 @@ impl Deserialize for Forecast {
 ```
 
 A derived `from_json` reads each field from the first object entry with that field's name. It fills in the `path` of every error it returns.
+
+##### Missing and Extra Keys
+
+For each field of a struct, a derived `from_json` takes the first of these steps that fits. `F` is the type of the field.
+
+1. **The key is present.** The object has an entry with the field's name. The reader calls `F.from_json(value)`. This holds when the value is `JsonValue.Null`: a key with `null` is present, and a field default does not apply to it.
+2. **The key is absent and the field has a default** (§2.14). The field takes the default. Each decode builds a new value for it.
+3. **The key is absent and the field has no default.** The reader calls `F.from_json(JsonValue.Null)`. When the result is `Ok(v)`, the field is `v`. When the result is `Err`, the reader drops that `Err` and returns the *missing field* error.
+
+An object entry whose key names no field is skipped. It gives no error and no warning. Encode does not change: `None` still encodes as `null` (*Option and Result in JSON*), and `to_json` writes every field.
+
+The *missing field* error is a `JsonError` with `path` set to `$.name`, where `name` is the field, and a `message` of the form ``missing field `name` (Str) at $.name``. The text in the parentheses is the type of the field as the declaration writes it, before generic substitution. A derived reader of an outer type adds its own step to `path` as usual (`$.owner.name`).
+
+```blink
+@derive(Serialize, Deserialize)
+type UserUpdate {
+    id: Int
+    name: Str?
+    nickname: Str? = Some("anon")
+    tags: List[Str] = []
+}
+
+let a = json.decode[UserUpdate]("{\"id\": 1}")
+// Ok(UserUpdate { id: 1, name: None, nickname: Some("anon"), tags: [] })
+//   `name` has no default and no key: Option[Str].from_json(null) is Ok(None)
+//   `nickname` and `tags` take their defaults
+
+let b = json.decode[UserUpdate]("{\"id\": 1, \"nickname\": null}")
+// Ok(UserUpdate { id: 1, name: None, nickname: None, tags: [] })
+//   the key `nickname` is present, so the default does not apply and `null` reads as None
+
+let c = json.decode[UserUpdate]("{\"id\": 1, \"emial\": \"x\"}")
+// Ok(UserUpdate { id: 1, name: None, nickname: Some("anon"), tags: [] })
+//   `emial` names no field: it is skipped, and `name` stays None
+
+let d = json.decode[UserUpdate]("{\"name\": \"Ann\"}")
+// Err: missing field `id` (Int) at $.id      (path "$.id")
+```
+
+The rule goes through `F.from_json`, not through the written type, so each case below has the answer that its line gives:
+
+```blink
+@derive(Deserialize)
+type Box[T] { v: T }
+
+@derive(Deserialize)
+type Score { score: Int? = Some(0) }
+
+@derive(Deserialize)
+type Raw { body: JsonValue }
+
+json.decode[Box[Int?]]("{}")          // Ok(Box { v: None }): Int?.from_json(null) is Ok(None), the same as a plain `v: Int?`
+json.decode[Box[Int]]("{}")           // Err: missing field `v` (T) at $.v
+json.decode[Raw]("{}")                // Ok(Raw { body: JsonValue.Null })
+json.decode[Score]("{}")              // Ok(Score { score: Some(0) }): the default fills an absent key
+json.decode[Score]("{\"score\": null}")   // Ok(Score { score: None }): `null` is present, so the default does not apply
+```
+
+A hand-written `from_json` that accepts `JsonValue.Null` also accepts an absent key, when a derived reader reads a field of that type and the field has no default. The reader does not tell the two cases apart:
+
+```blink
+type Flag { on: Bool }
+
+impl Deserialize for Flag {
+    fn from_json(json: JsonValue) -> Result[Flag, JsonError] {
+        match json {
+            JsonValue.Null => Ok(Flag { on: false })
+            JsonValue.Bool(b) => Ok(Flag { on: b })
+            _ => Err(JsonError { message: "expected Bool or null", path: "" })
+        }
+    }
+}
+
+@derive(Deserialize)
+type Opts { flag: Flag }
+
+json.decode[Opts]("{}")               // Ok(Opts { flag: Flag { on: false } })
+```
+
+A type with a key that must be present but may hold `null` has no derived form. Its author writes `from_json` by hand and looks at the key with `JsonValue.get` (§3.6.3), which tells an absent key (`None`) from a present `null` (`Some(JsonValue.Null)`):
+
+```blink
+type Rename { name: Str? }    // the key `name` must be sent; `null` is allowed
+
+impl Deserialize for Rename {
+    fn from_json(j: JsonValue) -> Result[Rename, JsonError] {
+        match j.get("name") {
+            None => Err(JsonError { message: "missing field `name` (Str?) at $.name", path: "$.name" })
+            Some(JsonValue.Null) => Ok(Rename { name: None })
+            Some(JsonValue.Str(s)) => Ok(Rename { name: Some(s) })
+            Some(_) => Err(JsonError { message: "expected Str or null at $.name", path: "$.name" })
+        }
+    }
+}
+```
+
+A key that is spelled wrong is an absent key and an extra key at once. For an `Option` field it decodes as `None` with no error. v1 has no strict mode that refuses extra keys.
 
 ##### Numbers
 
@@ -8919,7 +9017,7 @@ unknown value "closed" for Status at $.status; expected one of: "open", "in_prog
 
 The *Type Mapping* rows and the text below are the whole JSON rule for these two types. The rule of *Option and Result instances* (§3.6) does not apply to `Serialize` and `Deserialize`.
 
-**`Option[T]`.** `Option[T]` is `Serialize` when `T: Serialize`, and `Deserialize` when `T: Deserialize`. `to_json` gives `JsonValue.Null` for `None` and `T.to_json()` for `Some(v)`. `from_json` gives `Ok(None)` for `JsonValue.Null`. For any other value `j`, it gives `T.from_json(j)` with `Ok(v)` changed to `Ok(Some(v))`. An `Err` from `T.from_json` is the result as it is; `Option` adds no step to its `path`. An `Option[Float]` field that reads `null` as `None` (*NaN and Infinity*) is one case of this rule.
+**`Option[T]`.** `Option[T]` is `Serialize` when `T: Serialize`, and `Deserialize` when `T: Deserialize`. `to_json` gives `JsonValue.Null` for `None` and `T.to_json()` for `Some(v)`. `from_json` gives `Ok(None)` for `JsonValue.Null`. For any other value `j`, it gives `T.from_json(j)` with `Ok(v)` changed to `Ok(Some(v))`. An `Err` from `T.from_json` is the result as it is; `Option` adds no step to its `path`. A derived `from_json` that finds no key for an `Option` field with no default reaches this rule through `JsonValue.Null`, so the field is `None` (*Missing and Extra Keys*). An `Option[Float]` field that reads `null` as `None` (*NaN and Infinity*) is one case of this rule.
 
 **`Option[Option[T]]`.** The instance stays parametric: `Option[T]` is `Serialize` for every `T: Serialize`, and `T` may be an `Option`. So `fn send[T: Serialize](x: T?) -> JsonValue { x.to_json() }` compiles for every `T`. `Some(None)` and `None` of type `Int??` both give `JsonValue.Null`, and `null` decodes as `None`. The round-trip law (§3.6.1 *Derive Laws*) states this loss. The same loss occurs for `Some(JsonValue.Null)` in an `Option[JsonValue]`, and for any `Some(v)` where a written `to_json` returns `JsonValue.Null`.
 
@@ -8961,10 +9059,10 @@ error[NonDerivableTrait]: cannot derive `Serialize` for `UserUpdate`
                 Clear
                 Replace(value: T)
             }
-          and write the field as `name: Patch[Str]`
+          and write the field as `name: Patch[Str] = Patch.Keep`, so that a body with no `name` key gives `Keep`
 ```
 
-`Patch[T]` derives with no error, and its JSON is the tagged-object row of the *Type Mapping* table. A PATCH body that must tell "absent" from "set to null" needs this enum.
+`Patch[T]` derives with no error, and its JSON is the tagged-object row of the *Type Mapping* table. A PATCH body that must tell "absent" from "set to null" needs this enum, and the field needs the default `= Patch.Keep`. With that default an absent key gives `Keep` (*Missing and Extra Keys*). A key that is present, `null` included, goes to `Patch[T].from_json`, which reads it by the tagged-object row. Without the default, an absent key is the *missing field* error.
 
 **`Result[T, E]`.** `Result[T, E]` is `Serialize` when `T: Serialize` and `E: Serialize`, and `Deserialize` when `T: Deserialize` and `E: Deserialize`. `to_json` gives a `JsonValue.Object` with one entry: the key `"Ok"` and the value `v.to_json()` for `Ok(v)`, or the key `"Err"` and the value `e.to_json()` for `Err(e)`. The keys are the variant names as Blink spells them; case matters.
 
