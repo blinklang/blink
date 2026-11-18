@@ -50,7 +50,7 @@ import diagnostics.{
     PINNED_BYTES_ESCAPE, BYTES_PTR_CAST_FORBIDDEN,
     FFI_OFFSET_ON_SINGLETON, FFI_OFFSET_UNKNOWN_STRIDE, VOID_POINTEE_ACCESS, WITH_ITEM_NOT_A_HANDLER, EFFECT_HANDLE_COLLISION, INSUFFICIENT_HANDLER_COVERAGE,
     TRAIT_CONTRACT_900, TRAIT_CONTRACT_901, TRAIT_CONTRACT_902,
-    TRAIT_CONTRACT_903, TRAIT_CONTRACT_904, TRAIT_CONTRACT_905, TRAIT_CONTRACT_906,
+    TRAIT_CONTRACT_903, TRAIT_CONTRACT_904, TRAIT_CONTRACT_905, TRAIT_CONTRACT_906, TYPE_NOT_TRAIT,
     DUPLICATE_TYPE_PARAM, MISSING_PARAM_TYPE,
     TRAIT_CONTRACT_907, SEALED_METHOD_OVERRIDE,
     POLY_IMPL_UNSUPPORTED, IMPL_BINDER_UNUSED, TRAIT_ARG_ARITY, MISSING_SUPERTRAIT_IMPL, TYPE_ARG_ARITY,
@@ -7389,11 +7389,12 @@ fn tc_unmet_user_bound(carrier: Int, outer_sl: Int, own_sl: Int, concrete: Int, 
         let args_sl = node_elements(b)
         let got = if args_sl == -1 { 0 } else { sublist_length(args_sl) }
         // A wrong count is reported where the bound is written. A trait with no declaration
-        // node (Iterator, IntoIterator) is judged only from its §3.2.2 row.
+        // node (IntoIterator) is judged only from its §3.2.2 row. A bound that names a type is
+        // refused where it is written, so no call judges it again.
         let row = tc_surface_row(trait_name, tr)
         let surface = row.kinds.len() > 0
         let arity = if tr == -1 { tc_surface_arity(row) } else { tc_trait_tparam_count_idx.get(trait_name) ?? -1 }
-        let judged = surface || (tr != -1 && tc_trait_judged_by_impls(tr))
+        let judged = (surface || (tr != -1 && tc_trait_judged_by_impls(tr))) && !nr_bound_names_a_type(node_name(b), trait_name)
         if arity == got && judged {
             let want = tc_bound_args_at_call(outer_sl, own_sl, args_sl, binds)
             if want.len() == got {
@@ -31781,11 +31782,34 @@ fn nr_check_binder_bounds(binders_sl: Int) ! TypeCheck.Resolve, Diag.Report {
     }
 }
 
+// A bare bound name that names a type and no trait. `Iterator` is a sealed type (sections/03c_protocols.md
+// §3c.1), though the compiler keeps its method surface under that name. A qualified name is
+// left to its own resolution.
+fn nr_bound_names_a_type(written: Str, trait_name: Str) -> Bool {
+    if written.byte_index_of(".", 0).is_some() { return false }
+    if written == "Iterator" { return true }
+    is_trait_name(trait_name) == 0 && !tc_undeclared_trait_names().contains(trait_name) && tc_names_a_type(written)
+}
+
+fn tc_bound_type_article(written: Str) -> Str {
+    if written == "Iterator" { "an iterator" } else { "a `{written}`" }
+}
+
 fn nr_check_bound_args(bound: Int) ! TypeCheck.Resolve, Diag.Report {
     let written = node_name(bound)
     let trait_name = tc_bound_trait(bound)
     // A bound names a trait, so a name no trait declares gets the impl header's error.
     let undeclared = tc_undeclared_trait_names().contains(trait_name)
+    if nr_bound_names_a_type(written, trait_name) {
+        // A type annotation's own line and col read after its last token; its written span
+        // starts at the name.
+        let (w_line, w_col, _, _) = node_written_span(bound)
+        let line = if w_line != 0 { w_line } else { node_line(bound) }
+        let col = if w_line != 0 { w_col } else { node_col(bound) }
+        diag_error_span_at_notes("TypeNotTrait", TYPE_NOT_TRAIT, "`{written}` is a type, not a trait", bound, line, col, col + written.len(),
+            "a bound names a trait; to take {tc_bound_type_article(written)}, give the parameter the type `{if node_elements(bound) == -1 && written == "Iterator" { "Iterator[...]" } else { type_ann_text(bound) }}` in place of the type parameter", [])
+        return
+    }
     if is_trait_name(trait_name) == 0 && !undeclared {
         diag_error_at("TraitContract", TRAIT_CONTRACT_904, "trait `{written}` is not defined", bound, "check the trait name or define `trait {strip_module_qualifier(written)} \{ ... }`")
         return
@@ -34860,6 +34884,14 @@ fn tc_trait_self_static_call(node: Int, head: Str, method: Str, args_sl: Int) ->
 fn tc_refuse_tparam_method(node: Int, obj_t: Int, method: Str) -> Bool ! TypeCheck.Resolve, Diag.Report {
     let tv_name = type_to_str(obj_t)
     let tv_traits = tc_tparam_bound_traits(tv_name)
+    // A bound that names a type was refused where it is written (E0740), and it licenses no
+    // method, so a call through it has no second report.
+    for t in tv_traits.split("|") {
+        if !t.is_empty() && nr_bound_names_a_type(t, t) {
+            tc_method_calls.hard.insert(node, 1)
+            return true
+        }
+    }
     if tc_pipe_joined(tv_traits) != "" {
         if !tc_guarantee_lists_all_methods(tv_traits) || tc_pipe_has(tc_guarantee_methods(tv_traits), method) != 0 { return false }
         tc_method_calls.hard.insert(node, 1)
