@@ -120,8 +120,10 @@ fn c_fopen(path: Ptr[U8], mode: Ptr[U8]) -> Option[CFile] ! IO { }
 A `Closeable` or `BlockHandler` wrapper over a C handle must make a second `close()` or `exit()` do nothing, and a call after close return an error. Keep the closed state behind the handle, not in a `Bool` field: values are copied, so a field flag in one copy goes stale in the others. Point the opaque type at a small C box that your shim allocates (GC memory, so it outlives the C resource). Close frees the resource and clears the box. Every shim checks the box first:
 
 ```c
+/* my_file.h, listed in [native-dependencies] headers */
 typedef struct { FILE* f; } my_file;          /* f is NULL once closed */
 
+/* my_file.c */
 int64_t my_file_close(my_file* b) {
     if (!b->f) return 0;                       /* second close: no-op */
     FILE* f = b->f;
@@ -132,7 +134,7 @@ int64_t my_file_is_closed(my_file* b) { return b->f ? 0 : 1; }
 ```
 
 ```blink
-@ffi.opaque(name: "my_file")
+@ffi.opaque(header: "my_file.h", name: "my_file")
 type File
 
 @ffi("my_file_is_closed")

@@ -98,7 +98,7 @@ Box[T] stay apart.
 | Function | `c_fn_decl_name(fn)` | fn decl node | `helper` in main -> `blink_2helper`; `main` -> `blink_main`; `@ffi("blink_getpid") fn getpid` -> `blink_getpid`; `@ffi("getpid") fn getpid` -> wrapper `blink_2getpid`; `ping` in `mymod` -> `blink_3mymod_ping` |
 | Global let | `c_global_name(let)` | let node | `counter` in main -> `blink_2counter`; `mod_counter` in `mymod` -> `blink_3mymod_mod_1counter` |
 | Mono fn instance | `c_mono_fn_name(fn, args_tid)` | fn decl node, interned tuple tid of the type args | `identity[Box[Int]]` -> `blink_2identity_04Box_10Int`; `my_fn[Int]` -> `blink_2my_1fn_0Int`; `wrap[Ngx]` from `mymod` -> `blink_3mymod_wrap_05mymod_1Ngx` |
-| Type | `c_type_decl_name(td)` | type decl node | `Point` -> `blink_4Point`; `Ngx` in `mymod` -> `blink_5mymod_Ngx`; opaque `@ffi.opaque(name: "FILE")` -> `FILE*`; marked runtime-owned `ConversionError` -> `blink_ConversionError` |
+| Type | `c_type_decl_name(td)` | type decl node | `Point` -> `blink_4Point`; `Ngx` in `mymod` -> `blink_5mymod_Ngx`; opaque `@ffi.opaque(header: "stdio.h", name: "FILE")` -> `FILE*`; marked runtime-owned `ConversionError` -> `blink_ConversionError` |
 | Type tag | `c_type_decl_tag(td)` | type decl node | `Ngx` in `mymod` -> `5mymod_Ngx`; opaque `CFile` -> `4CFile` |
 | Mono type instance | `c_mono_type_c_name(tid)` | struct or enum instance tid | `Box[Option[Int]]` -> `blink_4Box_0Option_1int`; `Box2[Int]` in `mymod` -> `blink_5mymod_Box2_0Int`; `My_Box[Int]` -> `blink_4My_1Box_0Int` |
 | Typedef | `c_typedef_name(tid)` | struct, enum, Option, Result or tuple tid | `Option[Int]` -> `blink_Option_int`; `Result[Void, Str]` -> `blink_Result_void_str`; `(Int, Str)` -> `blink_Tuple2_int_str` |

@@ -1,0 +1,91 @@
+// `@ffi.opaque(header, name)` is the one form of the annotation (§9.1.4, §11.1). `name` is the
+// C type the handle points at, so a declaration without it has no C type to lower to. Check
+// refuses it with AnnotationArguments (E1134) at the argument list, or at the annotation name
+// when there is no list. One diagnostic only: a use of the type adds no second error.
+
+import std.fs
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_reset}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+import compile_test_helpers
+
+fn probe(name: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO, Process.Spawn {
+    init_embedded_stdlib()
+    let path = "{compile_test_helpers.scratch_root()}/_tc_opaque_no_name_{name}.bl"
+    fs.write(path, src).unwrap()
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+}
+
+// Each error as "CODE@line:col-end_col".
+fn errors_of(name: Str, src: Str) -> List[Str] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO, Process.Spawn {
+    probe(name, src)
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" { out.push("{d.code}@{d.line}:{d.col}-{d.end_col}") }
+    }
+    out
+}
+
+// The annotation on line 1, then a type, a fn that takes and returns it, and main.
+fn decl(ann: Str) -> Str {
+    "{ann}\ntype Op\nfn g(h: Op) -> Op \{ h }\nfn main() \{}\n"
+}
+
+fn expect(name: Str, src: Str, want: List[Str]) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO, Process.Spawn {
+    let errs = errors_of(name, src)
+    if errs.join(",") == want.join(",") { return "" }
+    "{name}: want [{want.join(", ")}], got [{errs.join(", ")}]"
+}
+
+fn report(problems: List[Str]) ! IO.Eprint {
+    let mut bad = false
+    for p in problems {
+        if p != "" {
+            io.eprintln(p)
+            bad = true
+        }
+    }
+    assert(!bad)
+}
+
+test "an @ffi.opaque with no argument list is E1134 at the annotation name" {
+    report([expect("bare", decl("@ffi.opaque"), ["E1134@1:1-12"])])
+}
+
+test "an @ffi.opaque argument list with no name is E1134 at the list" {
+    report([
+        expect("header_only", decl("@ffi.opaque(header: \"stdio.h\")"), ["E1134@1:12-31"]),
+        expect("empty_list", decl("@ffi.opaque()"), ["E1134@1:12-14"]),
+    ])
+}
+
+// The parser keeps no end for a list over several lines, so the span marks its `(`.
+test "an @ffi.opaque argument list over several lines with no name is E1134 at the list" {
+    report([expect("multi_line", decl("@ffi.opaque(\n    header: \"stdio.h\",\n)"), ["E1134@1:12-0"])])
+}
+
+test "an @ffi.opaque enum with no name is E1134" {
+    report([expect("enum", "@ffi.opaque\ntype Op \{ A, B }\nfn main() \{}\n", ["E1134@1:1-12"])])
+}
+
+test "the E1134 for an @ffi.opaque with no name prints the form of the annotation" {
+    probe("text", decl("@ffi.opaque(header: \"stdio.h\")"))
+    let mut seen = 0
+    for d in diag_entries {
+        if d.code == "E1134" {
+            seen = seen + 1
+            assert(d.message.contains("@ffi.opaque"))
+            assert(d.message.contains("name"))
+            assert(d.help.contains("@ffi.opaque(header, name)"))
+        }
+    }
+    assert_eq(seen, 1)
+}
+
+test "an @ffi.opaque that names its header and its C type is not E1134" {
+    report([expect("full", decl("@ffi.opaque(header: \"stdio.h\", name: \"FILE\")"), [])])
+}
