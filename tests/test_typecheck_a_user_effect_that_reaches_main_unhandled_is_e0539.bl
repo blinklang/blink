@@ -1,0 +1,296 @@
+// `main` holds every built-in effect, and no user-declared effect: a user effect that reaches
+// the body of `main` with no `with` that discharges it is UnhandledEffect (E0539), with the
+// same discharge rule as `with` (sections/04_effects.md §4.6 *Unhandled user effects*).
+
+import compile_test_helpers
+
+// These assert with the label and print nothing: the file has a test.failing row, so the
+// corpus reads its --test-json report from stdout, and a printed line breaks that report.
+fn must_hold(output: Str, needle: Str, label: Str) {
+    assert(output.contains(needle), "{label}: expected '{needle}' in {output}")
+}
+
+fn must_be_clean(output: Str, label: Str) {
+    assert(!output.contains("\"severity\":\"error\""), "{label}: expected a clean compile, got {output}")
+}
+
+fn count(text: Str, part: Str) -> Int {
+    text.split(part).len() - 1
+}
+
+fn store_head() -> Str {
+    #"effect Store {
+    effect Kv { fn get(key: Str) -> Int }
+}
+
+fn load() -> Int ! Store {
+    store.get("count")
+}
+
+"#
+}
+
+fn store_src(main_src: Str) -> Str {
+    store_head().concat(main_src)
+}
+
+test "a call that needs a user effect in main with no handler is E0539" {
+    let out = compile_test_helpers.compile_and_capture(store_src(#"fn main() {
+    io.println("{load()}")
+}
+"#), "unhandled_main_call")
+    must_hold(out, "E0539", "nothing discharges Store")
+    must_hold(out, "unhandled effect `Store` in `main`", "the header names the effect and the root")
+    must_hold(out, "user-declared effects have no root handler", "the help says why")
+    must_hold(out, "\"line\":10,\"col\":18", "the error points at the call")
+    assert_eq(count(out, "\"code\":\"E0539\""), 1)
+    assert_eq(count(out, "\"code\":\"E0500\""), 0)
+}
+
+test "an operation of a nested user effect called in main with no handler is E0539" {
+    let src = #"effect Ee {
+    effect Op { fn op(x: Int) -> Int }
+}
+fn use_it() -> Int ! Ee.Op { ee.op(1) }
+fn main() {
+    io.println("{use_it()}")
+    io.println("{ee.op(2)}")
+}
+"#
+    let out = compile_test_helpers.compile_and_capture(src, "unhandled_main_nested")
+    must_hold(out, "E0539", "nothing discharges Ee.Op")
+    must_hold(out, "unhandled effect `Ee.Op` in `main`", "the header names the sub-effect")
+    assert_eq(count(out, "\"code\":\"E0539\""), 2)
+}
+
+test "a closure in main is charged to main" {
+    let out = compile_test_helpers.compile_and_capture(store_src(#"fn main() {
+    let f = fn() -> Int { load() }
+    io.println("{f()}")
+}
+"#), "unhandled_main_closure")
+    must_hold(out, "E0539", "the closure body runs in main")
+    assert_eq(count(out, "\"code\":\"E0539\""), 1)
+}
+
+test "a with that installs a handler discharges the effect" {
+    let out = compile_test_helpers.compile_and_capture(store_src(#"fn main() {
+    let h = handler Store.Kv { fn get(_key: Str) -> Int { 7 } }
+    with h {
+        io.println("{load()}")
+        let f = fn() -> Int { load() }
+        io.println("{f()}")
+    }
+}
+"#), "handled_main")
+    must_be_clean(out, "the handler discharges Store")
+}
+
+test "a handler of a parent effect discharges a nested effect" {
+    let src = #"effect Ee {
+    effect Op { fn op(x: Int) -> Int }
+}
+fn use_it() -> Int ! Ee.Op { ee.op(1) }
+fn main() {
+    let h = handler Ee.Op { fn op(x: Int) -> Int { x } }
+    with h {
+        io.println("{use_it()}")
+    }
+}
+"#
+    let out = compile_test_helpers.compile_and_capture(src, "handled_main_nested")
+    must_be_clean(out, "the handler of Ee.Op discharges it")
+}
+
+test "main holds every built-in effect" {
+    let src = #"fn roll() -> Int ! Rand { rand.int(1..6) }
+fn now_ms() -> Int ! Time.Read { 0 }
+fn main() {
+    io.println("{roll() + now_ms()}")
+    io.eprintln("done")
+}
+"#
+    let out = compile_test_helpers.compile_and_capture(src, "main_builtins")
+    must_be_clean(out, "built-in effects need no handler in main")
+}
+
+test "a fn other than main is still E0500 for an undeclared user effect" {
+    let out = compile_test_helpers.compile_and_capture(store_src(#"fn helper() -> Int {
+    load()
+}
+fn main() {
+    let h = handler Store.Kv { fn get(_key: Str) -> Int { 7 } }
+    with h {
+        io.println("{helper()}")
+    }
+}
+"#), "helper_e0500")
+    must_hold(out, "E0500", "helper declares no Store")
+    assert_eq(count(out, "\"code\":\"E0539\""), 0)
+}
+
+test "a row on main does not discharge a user effect" {
+    let out = compile_test_helpers.compile_and_capture(store_src(#"fn main() ! Store {
+    io.println("{load()}")
+}
+"#), "main_row_no_discharge")
+    must_hold(out, "E0539", "only a with discharges Store at the root")
+}
+
+test "an effect with no operations is discharged by an empty handler" {
+    let bad = compile_test_helpers.compile_and_capture(#"effect Mark
+fn marked() ! Mark { }
+fn main() {
+    marked()
+}
+"#, "marker_unhandled")
+    must_hold(bad, "E0539", "a marker effect needs a handler at the root too")
+    must_hold(bad, "unhandled effect `Mark` in `main`", "the header names the marker")
+    let good = compile_test_helpers.compile_and_capture(#"effect Mark
+fn marked() ! Mark { }
+fn main() {
+    with handler Mark {} {
+        marked()
+    }
+}
+"#, "marker_handled")
+    must_be_clean(good, "the empty handler discharges Mark")
+}
+
+test "a call through a bound whose impl row is _ is charged that impl's row" {
+    let src = store_head().concat(#"trait Src { fn pull(self) -> Int ! _ }
+type S { x: Int }
+impl Src for S { fn pull(self) -> Int ! Store { load() } }
+type Q { x: Int }
+impl Src for Q { fn pull(self) -> Int { self.x } }
+fn via[X: Src](x: X) -> Int ! _ { x.pull() }
+fn main() {
+    io.println("{via(Q { x: 1 })}")
+    io.println("{via(S { x: 1 })}")
+}
+"#)
+    let out = compile_test_helpers.compile_and_capture(src, "main_wild_row")
+    must_hold(out, "E0539", "via(S) runs the Store row of S.pull")
+    assert_eq(count(out, "\"code\":\"E0539\""), 1)
+}
+
+test "a closure panic hook in main is charged to main" {
+    let out = compile_test_helpers.compile_and_capture(store_src(#"fn main() {
+    with on_panic(fn(p) {
+        let _ = load()
+        env.exit(1)
+    }) {
+        io.println("a")
+    }
+}
+"#), "main_closure_hook")
+    must_hold(out, "E0539", "the hook body runs in main")
+    assert_eq(count(out, "\"code\":\"E0539\""), 1)
+}
+
+fn named_hook_src(items: Str) -> Str {
+    #"import std.panic.{PanicInfo}
+
+"#.concat(store_head()).concat(#"fn hook(_p: PanicInfo) -> Never ! Store, Env.Exit {
+    let _ = load()
+    env.exit(1)
+}
+
+fn main() {
+    let h = handler Store.Kv { fn get(_key: Str) -> Int { 7 } }
+    with "#).concat(items).concat(#" {
+        io.println("b")
+    }
+}
+"#)
+}
+
+test "a named panic hook is charged at the with that installs it, against the items to its left" {
+    let bare = compile_test_helpers.compile_and_capture(named_hook_src("on_panic(hook)"), "main_named_hook")
+    must_hold(bare, "E0539", "nothing discharges the hook's Store")
+    let left = compile_test_helpers.compile_and_capture(named_hook_src("h, on_panic(hook)"), "main_named_hook_left")
+    must_be_clean(left, "h is left of the hook, so it holds Store for it")
+    let right = compile_test_helpers.compile_and_capture(named_hook_src("on_panic(hook), h"), "main_named_hook_right")
+    must_hold(right, "E0539", "h is right of the hook, so it does not cover it")
+}
+
+test "a with item whose close needs a user effect is charged to main" {
+    let src = store_head().concat(#"type Res { id: Int }
+impl Closeable for Res {
+    fn close(self) ! Store { let _ = load() }
+}
+fn main() {
+    with Res { id: 1 } as r {
+        io.println("{r.id}")
+    }
+}
+"#)
+    let out = compile_test_helpers.compile_and_capture(src, "main_closeable_item")
+    must_hold(out, "E0539", "close runs at the root with no Store handler")
+    must_hold(out, "unhandled effect `Store` in `main`", "the header names the root")
+    assert_eq(count(out, "\"code\":\"E0500\""), 0)
+}
+
+// A user effect has no default handler: an op call in main with no `with` is refused at check,
+// not run (§4.12).
+test "a user effect op called in main with no handler installed is E0539, not a default handle" {
+    let src = #"effect Metrics {
+    effect Emit {
+        fn counter(name: Str, value: Int)
+        fn gauge(name: Str, value: Float)
+    }
+    effect Query {
+        fn get_counter(name: Str) -> Int
+    }
+}
+
+fn main() {
+    metrics.counter("requests", 1)
+}
+"#
+    let out = compile_test_helpers.compile_and_capture(src, "main_no_default_handle")
+    must_hold(out, "E0539", "no handler is installed for Metrics.Emit")
+    must_hold(out, "unhandled effect `Metrics.Emit` in `main`", "the header names the sub-effect")
+    assert_eq(count(out, "\"code\":\"E0539\""), 1)
+}
+
+fn let_handler_src(outer: Str) -> Str {
+    store_head().concat(#"effect Lg {
+    effect Out { fn note(s: Str) }
+}
+
+fn lgh() -> Handler[Lg.Out] ! IO.Print {
+    handler Lg.Out { fn note(s: Str) { io.println("note {s}") } }
+}
+
+fn main() {
+    let l = lgh()
+    let h = handler Store.Kv {
+        fn get(_key: Str) -> Int {
+            lg.note("get")
+            7
+        }
+    }
+    with "#).concat(outer).concat(#" {
+        io.println("{load()}")
+    }
+}
+"#)
+}
+
+// The clause row of `h` is charged at its `with`, where `l` to its left handles Lg.Out (§4.7.2).
+test "a let-held handler whose clause calls an effect handled to its left checks clean and runs" {
+    let out = compile_test_helpers.compile_and_capture(let_handler_src("l, h"), "main_let_handler_ok")
+    must_be_clean(out, "l handles the Lg.Out the clause of h calls")
+    let r = compile_test_helpers.compile_and_run(let_handler_src("l, h"), "main_let_handler_run")
+    assert_eq(r.exit_code, 0)
+    assert_eq(r.out, "note get\n7\n")
+}
+
+test.failing(
+    "a let-held handler whose clause calls an effect nothing handles is E0539",
+    reason: "the clause row of a handler held in a let is not charged at the with that installs it, so the root leaves that handler unchecked",
+) {
+    let out = compile_test_helpers.compile_and_capture(let_handler_src("h"), "main_let_handler_unhandled")
+    must_hold(out, "E0539", "nothing handles the Lg.Out the clause of h calls")
+}

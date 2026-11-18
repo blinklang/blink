@@ -26,7 +26,7 @@ import parser.{
 }
 import diagnostics.{
     Diag, diag_clear_allows, diag_error_at, diag_error_at_notes, diag_error_in_file_label_notes, diag_error_span_at_notes, diag_error_no_loc,
-    diag_set_last_fix, diag_set_last_fix_at, diag_add_label_since, diag_release_repeat_key_since, diag_add_last_fix_edit, diag_set_fix_edits_at, DiagEntry, DiagFixEdit, diag_source_lines, diag_entries, UNDECLARED_EFFECT, UNSOURCED_EFFECT_WILDCARD, DERIVED_OP_FOREIGN_EFFECT,
+    diag_set_last_fix, diag_set_last_fix_at, diag_add_label_since, diag_release_repeat_key_since, diag_add_last_fix_edit, diag_set_fix_edits_at, DiagEntry, DiagFixEdit, diag_source_lines, diag_entries, UNDECLARED_EFFECT, UNHANDLED_EFFECT, UNSOURCED_EFFECT_WILDCARD, DERIVED_OP_FOREIGN_EFFECT,
     diag_push_allows, diag_enter_allows, diag_exit_allows, NON_CONST_EXPR,
     diag_warn_at, diag_warn_at_notes, diag_warn_span_at_notes, PARTIAL_HANDLER, diag_truncate, diag_entry_count, diag_any_errors_since, diag_ice_count, diag_ice_at, diag_ice, diag_ice_abort, PRELUDE_TYPE_NOT_LOADED, diag_count, diag_emit_in_file, diag_file_for_node, diag_file_node_range,
     diag_is_audit_gated, diag_audit_gated_help, AUDIT_GATED_SUPPRESSION, diag_normalize_path, diag_source_line, diag_errors_in_lines, diag_errors_in_lines_before,
@@ -50460,6 +50460,18 @@ type ErOwner {
     msg_ran: Set[Int]
     // The values assigned to each `let mut`, so a fn value is charged for each fn it may hold.
     assigns: Map[Int, List[Int]]
+    // `main`, which holds every built-in effect and no user effect (§4.6).
+    root: Bool
+}
+
+// A root has no row to add an effect to, so the report asks for a handler (§4.6).
+fn tc_er_report_unhandled(site: Int, end_col: Int, owner: ErOwner, what: Str, missing: List[Str]) ! Diag.Report {
+    for shown in missing {
+        diag_error_span_label_at_notes("UnhandledEffect", UNHANDLED_EFFECT,
+            "unhandled effect `{shown}` in `{owner.name}`", site, node_line(site), node_col(site), end_col,
+            "`{what}` requires `! {shown}`",
+            "user-declared effects have no root handler; wrap the call in `with <handler> \{ ... \}` (§4.12)", [])
+    }
 }
 
 // The `_` of a default body holds nothing (see tc_er_walk_fn), so no `! _` can help it.
@@ -50487,6 +50499,11 @@ fn tc_er_require(program: Int, site: Int, held: List[Str], owner: ErOwner, calle
         return
     }
     let shown = tc_effect_spelling_at(req, owner.decl)
+    if owner.root {
+        let end_col = if tc_source_spells_at(site, callee) { node_col(site) + callee.byte_len() } else { 0 }
+        tc_er_report_unhandled(site, end_col, owner, callee, [shown])
+        return
+    }
     diag_error_at("UndeclaredEffect", UNDECLARED_EFFECT,
         "call to `{callee}` needs effect `{shown}`, which `{owner.name}` does not declare", site,
         "add `{shown}` to the `!` list of `{owner.name}`, or make the call inside a `with` block that provides it")
@@ -50535,6 +50552,10 @@ fn tc_er_require_op(program: Int, site: Int, held: List[Str], owner: ErOwner, op
     let reader = tc_er_reader(held, owner)
     let mut missing: List[Str] = []
     for req in unmet { missing.push(tc_effect_spelling_in(req, reader)) }
+    if owner.root {
+        tc_er_report_unhandled(site, end_col, owner, op, missing)
+        return
+    }
     if owner.decl >= 0 && has_annotation(owner.decl, "pure") != 0 {
         for req in missing {
             diag_error_span_label_at_notes("ImpureBodyForPureAnnotation", IMPURE_BODY_FOR_PURE_ANNOTATION,
@@ -51281,6 +51302,12 @@ fn tc_er_check_with_item(program: Int, item: Int, tid0: Int, held: List[Str], ow
                 "with item of type `{tname}` runs {ms_text}, which {verb} effect `_`, which `{owner.name}` does not declare", item,
                 "add `! _` to `{owner.name}`, so each call is charged the row of the impls the type parameters of `{tname}` stand for")
             diag_set_last_fix("add effect", "_")
+        } else if owner.root {
+            let shown = tc_effect_spelling_at(req, owner.decl)
+            diag_error_span_label_at_notes("UnhandledEffect", UNHANDLED_EFFECT,
+                "unhandled effect `{shown}` in `{owner.name}`", item, node_line(item), node_col(item), 0,
+                "with item of type `{tname}` runs {ms_text}, which {verb} `! {shown}`",
+                "user-declared effects have no root handler; put this `with` inside a `with` that installs a handler of `{shown}` (§4.12)", [])
         } else {
             let shown = tc_effect_spelling_at(req, owner.decl)
             diag_error_at("UndeclaredEffect", UNDECLARED_EFFECT,
@@ -51289,6 +51316,17 @@ fn tc_er_check_with_item(program: Int, item: Int, tid0: Int, held: List[Str], ow
             diag_set_last_fix("add effect", shown)
         }
         k = k + 1
+    }
+}
+
+// The row of the hook is charged to the `with` that installs it (§4.6). A closure hook is
+// walked where it is written; a named fn is charged here, as a fn value run is.
+fn tc_er_charge_panic_hook(program: Int, item: Int, held: List[Str], owner: ErOwner) ! TypeCheck.Resolve, Diag.Report {
+    let args = node_args(item)
+    if args == -1 || sublist_length(args) != 1 { return }
+    let f = sublist_get(args, 0)
+    for c in tc_tm_closures_of([f], owner.assigns) {
+        if node_kind(c) == NodeKind.FnDef { tc_er_require_sig_row(program, f, held, owner, c, f) }
     }
 }
 
@@ -51307,6 +51345,7 @@ fn tc_er_with_row(program: Int, node: Int, held: List[Str], owner: ErOwner, kids
         } else {
             let vn = if ik == NodeKind.WithResource { node_value(it) } else { it }
             tc_er_walk(program, vn, row, owner, kids)
+            if tc_is_panic_hook_item(vn) { tc_er_charge_panic_hook(program, vn, row, owner) }
             let vt = resolve_alias_tid(tc_lookup_node_tid(vn))
             tc_er_check_with_item(program, vn, vt, row, owner)
             let mut e = tc_tid_handler_effect(vt)
@@ -51375,6 +51414,10 @@ fn tc_er_walk(program: Int, node: Int, held: List[Str], owner: ErOwner, kids: Li
         tc_er_walk(program, node_body(node), tc_er_with_row(program, node, held, owner, kids), owner, kids)
         return
     }
+    // A handler held in a `let` has its clause rows charged where it is written, not at the
+    // `with` that installs it (§4.7.2), so at the root that would refuse a valid program; the
+    // root leaves such a handler unchecked until its rows are charged at install.
+    if owner.root && k == NodeKind.LetBinding && node_kind(node_value(node)) == NodeKind.HandlerExpr { return }
     if k == NodeKind.HandlerExpr {
         // An operation body runs over the handler this one was installed on, so its calls
         // through the effect it handles are answered there (§4.7.1).
@@ -51424,8 +51467,10 @@ fn tc_er_walk(program: Int, node: Int, held: List[Str], owner: ErOwner, kids: Li
 
 fn tc_er_walk_fn(program: Int, fn_node: Int, msg_ran: Set[Int], assigns: Map[Int, List[Int]], kids: List[Int]) ! TypeCheck.Resolve, Diag.Report {
     tc_er_check_wild_source(fn_node)
-    // `main` holds every effect (§4.6).
-    if node_name(fn_node) == "main" && node_source_module(fn_node) == "__main__" { return }
+    if tc_is_entry_main(fn_node) {
+        tc_er_walk(program, node_body(fn_node), builtin_effect_tree_roots(), ErOwner { name: node_name(fn_node), decl: fn_node, default_body: false, msg_ran: msg_ran, assigns: assigns, root: true }, kids)
+        return
+    }
     let block = tc_method_block.get(fn_node) ?? -1
     // A default body also runs for an impl that does not override it, and a call through
     // such an impl is charged nothing, so the body may not perform impl-chosen effects: its
@@ -51435,7 +51480,7 @@ fn tc_er_walk_fn(program: Int, fn_node: Int, msg_ran: Set[Int], assigns: Map[Int
     for e in tc_er_fn_row(fn_node) {
         if !(default_body && e == "_") { held.push(e) }
     }
-    tc_er_walk(program, node_body(fn_node), held, ErOwner { name: node_name(fn_node), decl: fn_node, default_body: default_body, msg_ran: msg_ran, assigns: assigns }, kids)
+    tc_er_walk(program, node_body(fn_node), held, ErOwner { name: node_name(fn_node), decl: fn_node, default_body: default_body, msg_ran: msg_ran, assigns: assigns, root: false }, kids)
 }
 
 // An impl method's row may narrow its trait method's row but not widen it, so a bound
@@ -51582,7 +51627,7 @@ fn tc_check_effect_rows(program: Int, msg_ran: Set[Int]) ! TypeCheck.Resolve, Di
     // the operation, so the body holds that effect and nothing more.
     for op in effect_derived_ops(program) {
         match tc_ue.op_root.get(op) {
-            Some(ed) => tc_er_walk(program, node_body(op), [tc_er_op_effect(ed, op)], ErOwner { name: "{tc_er_op_effect(ed, op)}.{node_name(op)}", decl: -1, default_body: false, msg_ran: msg_ran, assigns: assigns }, kids)
+            Some(ed) => tc_er_walk(program, node_body(op), [tc_er_op_effect(ed, op)], ErOwner { name: "{tc_er_op_effect(ed, op)}.{node_name(op)}", decl: -1, default_body: false, msg_ran: msg_ran, assigns: assigns, root: false }, kids)
             None => {}
         }
     }
