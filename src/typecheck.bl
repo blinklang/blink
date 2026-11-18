@@ -4308,10 +4308,26 @@ fn tc_impl_binder_key_roles(decl: Int, binders: Int) -> List[HashRole] {
 // fix a metavariable of the caller's receiver to the impl's shape, and the call has already
 // chosen the impl. A binder a metavariable answers keeps it, and the flush reads its solution.
 fn tc_impl_binder_tids_at(im: Int, recv: Int) -> List[Int] {
+    tc_impl_binder_tids_of(im, tc_impl_binds_read_off(im, recv))
+}
+
+fn tc_impl_binds_read_off(im: Int, recv: Int) -> Map[Str, Int] {
     let mut binds: Map[Str, Int] = Map()
     let head = tc_impl_recv_tids.get(im) ?? -1
     if head >= 0 { unify_typevar_binds(head, tc_resolve(recv), binds) }
-    tc_impl_binder_tids_of(im, binds)
+    binds
+}
+
+// The binds a call of impl method `sig` on a built-in receiver `recv` gives its signature: each
+// impl binder as the receiver answers it, and `Self` as the receiver (sections/03_types.md
+// *The `Self` Type*).
+fn tc_builtin_recv_call_binds(sig: Int, recv: Int) -> Map[Str, Int] {
+    let im = tc_method_block.get(fnsig_pool.get(sig).unwrap().decl) ?? -1
+    let mut binds: Map[Str, Int] = if im == -1 { Map() } else { tc_impl_binds_read_off(im, recv) }
+    for (k, v) in tc_self_binds(recv) {
+        if !binds.contains_key(k) { binds.insert(k, v) }
+    }
+    binds
 }
 
 // The binds tc_check_impl_bounds reads for impl `im` at binder `tids`, with `Self` read as the
@@ -38466,12 +38482,7 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                     // sublist_get on a -1 / empty binder list.
                     let im_binders = if im != -1 { node_impl_binders(im) } else { -1 }
                     if im != -1 && im_binders != -1 && sublist_length(im_binders) == 1 {
-                        let elem = ty_pool.get(obj_t).unwrap().inner1
-                        let binder_node = sublist_get(im_binders, 0)
-                        let binder = node_name(binder_node)
-                        let mut binds: Map[Str, Int] = Map()
-                        binds.insert(binder, elem)
-                        binds.insert(tc_binder_key(binder_node, binder), elem)
+                        let binds = tc_builtin_recv_call_binds(sig, obj_t)
                         // The effect check charges the trait's row, which bounds every impl's.
                         nr_note_call_decl(node, tc_trait_method_decl(sole_trait, method))
                         // binds must exist before this call: a bare-literal argument whose
@@ -39043,7 +39054,8 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                     if bsig != -1 {
                         tc_check_method_impl_bounds(bsig, obj_t, node)
                         let bview = tc_call_view_sig(bsig)
-                        let btids = check_arg_shapes("{bname}.{method}", bview, node_args(node), 1, node)
+                        let bbinds = tc_builtin_recv_call_binds(bsig, obj_t)
+                        let btids = check_arg_shapes_with_binds("{bname}.{method}", bview, node_args(node), 1, node, bbinds)
                         // Which declaration this call reached. Phase 1 could not say: it has
                         // no receiver type, and the receiver is the only thing that tells two
                         // impls of one method name apart. The signature names it: the first
@@ -39051,9 +39063,9 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                         // cannot see.
                         nr_note_call_decl(node, fnsig_pool.get(bsig).unwrap().decl)
                         if tc_decl_has_own_type_params(fnsig_pool.get(bsig).unwrap().decl) != 0 {
-                            return tc_instantiate_generic_call(bview, node_args(node), btids, node, 1, Map())
+                            return substitute_typevar_tid(tc_instantiate_generic_call(bview, node_args(node), btids, node, 1, bbinds), bbinds)
                         }
-                        return fnsig_pool.get(bsig).unwrap().ret
+                        return substitute_typevar_tid(fnsig_pool.get(bsig).unwrap().ret, bbinds)
                     }
                 }
             }
@@ -49858,8 +49870,8 @@ fn tc_collect_type_ann_names(ann: Int, out: List[Str]) {
     }
 }
 
-// True when no impl binder is bounded and no binder name appears in any method
-// signature. Such an impl cannot materialize an element by value nor operate on
+// True when no impl binder is bounded and neither a binder name nor `Self` appears in any
+// method signature. Such an impl cannot materialize an element by value nor operate on
 // one, so it is accepted where a per-element poly impl would not be.
 pub fn impl_is_element_agnostic(im: Int) -> Int {
     let binders_sl = node_impl_binders(im)
@@ -49895,6 +49907,8 @@ pub fn impl_is_element_agnostic(im: Int) -> Int {
         let mut ni = 0
         while ni < names.len() {
             let nm = names.get(ni).unwrap()
+            // `Self` is the receiver, which names every binder (sections/03_types.md *The `Self` Type*).
+            if nm == "Self" { return 0 }
             let mut bk = 0
             while bk < bnames.len() {
                 if nm == bnames.get(bk).unwrap() { return 0 }

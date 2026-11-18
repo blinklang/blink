@@ -1,0 +1,96 @@
+// `Self` in a method signature of `impl[..] Tr for Map[K, V]` or `for Set[T]` names the impl's
+// binders, since `Self` is the receiver (sections/03_types.md *The `Self` Type*). Such an impl
+// has one body per receiver instance, which only a List receiver compiles today, so check
+// refuses it with E0908 as it refuses the same signature that spells the binders out. A
+// signature that names neither a binder nor `Self` keeps one shared body and is admitted.
+
+import std.fs
+import compiler.{compile_to_program}
+import typecheck.{check_types}
+import diagnostics.{diag_entries, diag_reset}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+import compile_test_helpers
+
+fn probe(name: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO, Process.Spawn {
+    init_embedded_stdlib()
+    let path = "{compile_test_helpers.scratch_root()}/_tc_self_poly_builtin_{name}.bl"
+    fs.write(path, src).unwrap()
+    diag_reset()
+    let program = compile_to_program(path, 1)
+    check_types(program)
+    let _ = fs.delete(path)
+}
+
+// Each error as "CODE@line:col".
+fn errors_of(name: Str, src: Str) -> List[Str] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO, Process.Spawn {
+    probe(name, src)
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" { out.push("{d.code}@{d.line}:{d.col}") }
+    }
+    out
+}
+
+// The trait on line 1, the impl on line 2.
+fn impl_of(sig: Str, recv: Str, binders: Str, body: Str) -> Str {
+    spelled(sig, sig, recv, binders, body)
+}
+
+// The impl writes the receiver where the trait writes `Self`.
+fn spelled(trait_sig: Str, impl_sig: Str, recv: Str, binders: Str, body: Str) -> Str {
+    "trait Tr \{ {trait_sig} }\nimpl[{binders}] Tr for {recv} \{ {impl_sig} \{ {body} } }\nfn main() \{}\n"
+}
+
+fn expect_e0908(name: Str, src: Str) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO, Process.Spawn {
+    let errs = errors_of(name, src)
+    if errs.len() == 1 && errs.get(0).unwrap() == "E0908@2:1" { return "" }
+    "{name}: want one error E0908@2:1, got {errs.len()}:\n  {errs.join("\n  ")}"
+}
+
+fn expect_none(name: Str, src: Str) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO, Process.Spawn {
+    let errs = errors_of(name, src)
+    if errs.len() == 0 { return "" }
+    "{name}: want no error, got:\n  {errs.join("\n  ")}"
+}
+
+fn report(problems: List[Str]) ! IO.Eprint {
+    let mut bad = false
+    for p in problems {
+        if p != "" {
+            io.eprintln(p)
+            bad = true
+        }
+    }
+    assert(!bad)
+}
+
+test "Self in a Map impl signature is refused as its binders are" {
+    report([
+        expect_e0908("map_param", impl_of("fn same(self, -- other: Option[Self] = None) -> Bool", "Map[K, V]", "K, V", "other.is_none()")),
+        expect_e0908("map_ret", impl_of("fn me(self) -> Option[Self]", "Map[K, V]", "K, V", "Some(self)")),
+        expect_e0908("map_bare", impl_of("fn me(self) -> Self", "Map[K, V]", "K, V", "self")),
+        expect_e0908("map_binders", spelled("fn me(self) -> Option[Self]", "fn me(self) -> Option[Map[K, V]]", "Map[K, V]", "K, V", "Some(self)")),
+    ])
+}
+
+test "Self in a Set impl signature is refused as its binder is" {
+    report([
+        expect_e0908("set_tuple", impl_of("fn tagged(self) -> (Self, Int)", "Set[T]", "T", "(self, self.len())")),
+        expect_e0908("set_list", impl_of("fn twice(self) -> List[Self]", "Set[T]", "T", "[self, self]")),
+        expect_e0908("set_binder", spelled("fn me(self) -> Self", "fn me(self) -> Set[T]", "Set[T]", "T", "self")),
+    ])
+}
+
+test "a Map or Set impl whose signatures name no binder and no Self is admitted" {
+    report([
+        expect_none("map_agnostic", impl_of("fn n(self) -> Int", "Map[K, V]", "K, V", "self.len()")),
+        expect_none("set_agnostic", impl_of("fn n(self) -> Int", "Set[T]", "T", "self.len()")),
+    ])
+}
+
+test "Self in a List impl signature is admitted" {
+    report([
+        expect_none("list_param", impl_of("fn same(self, -- other: Option[Self] = None) -> Bool", "List[T]", "T", "other.is_none()")),
+        expect_none("list_ret", impl_of("fn me(self) -> Option[Self]", "List[T]", "T", "Some(self)")),
+    ])
+}
