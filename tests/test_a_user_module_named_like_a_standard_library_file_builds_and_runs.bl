@@ -1,0 +1,148 @@
+// The standard library reserves the module path prefix `std.`, not the name `std_`
+// (sections/07_trust_modules_metadata.md, import leaf names). So a package file src/std_fs.bl is
+// an ordinary module `std_fs`, apart from the library module `std.fs`: each keeps its own
+// functions and types, and a program that imports one or both builds and runs. Check, the
+// one-unit build and the per-module build agree.
+
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> ProcessResult ! Process.Spawn {
+    process.run("sh", ["-c", cmd]).unwrap()
+}
+
+fn blink_in(dir: Str, args: Str) -> ProcessResult ! Process.Spawn {
+    sh("B=$(pwd)/build/blink; cd {dir} && timeout 120 $B {args} src/main.bl < /dev/null 2>&1")
+}
+
+// A package of the given files, each `path=source`.
+fn new_package(files: List[(Str, Str)]) -> Str ! FS.Write, Process.Spawn {
+    let dir = sh("mktemp -d /tmp/blink_std_named_module.XXXXXX").out.trim()
+    let _ = sh("mkdir -p {dir}/src")
+    fs.write("{dir}/blink.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\n").unwrap()
+    for f in files {
+        fs.write("{dir}/src/{f.0}.bl", f.1).unwrap()
+    }
+    dir
+}
+
+fn cleanup(dir: Str) ! Process.Spawn {
+    let _ = sh("rm -rf {dir}")
+}
+
+fn expect_runs(files: List[(Str, Str)], want: Str) ! IO, FS.Write, Process.Spawn {
+    let dir = new_package(files)
+    let mut ok = true
+    for args in ["check", "run --no-per-module", "run --per-module"] {
+        let r = blink_in(dir, args)
+        let good = r.success() && (args == "check" || r.out.trim().ends_with(want))
+        if !good {
+            io.eprintln("blink {args}: {r.end}\n{r.out}")
+            ok = false
+        }
+    }
+    cleanup(dir)
+    assert(ok)
+}
+
+// Check fails, and its report holds `text`.
+fn expect_check_says(files: List[(Str, Str)], text: Str) ! IO, FS.Write, Process.Spawn {
+    let dir = new_package(files)
+    let r = blink_in(dir, "check")
+    if r.success() || !r.out.contains(text) { io.eprintln("blink check: {r.end}\n{r.out}") }
+    cleanup(dir)
+    assert(!r.success() && r.out.contains(text))
+}
+
+// Each build mode fails at run time, and its report holds `text` and no internal key.
+fn expect_run_fails_says(files: List[(Str, Str)], text: Str) ! IO, FS.Write, Process.Spawn {
+    let dir = new_package(files)
+    let mut ok = true
+    for args in ["run --no-per-module", "run --per-module"] {
+        let r = blink_in(dir, args)
+        if r.success() || !r.out.contains(text) || r.out.contains("0std") {
+            io.eprintln("blink {args}: {r.end}\n{r.out}")
+            ok = false
+        }
+    }
+    cleanup(dir)
+    assert(ok)
+}
+
+let std_fs = ("std_fs", "pub fn f() -> Int \{ 1 }\n")
+
+test "a module std_fs builds and runs" {
+    expect_runs([std_fs, ("main", "import std_fs\nfn main() \{ io.println(\"\{std_fs.f()}\") }\n")], "1")
+}
+
+test "a module std_fs and the library std.fs both run when std_fs is imported first" {
+    expect_runs([std_fs, ("main", "import std_fs\nimport std.fs\nfn main() \{ io.println(\"\{std_fs.f()} \{fs.read(\"/no/such/file\").is_err()}\") }\n")], "1 true")
+}
+
+test "a module std_fs and the library std.fs both run when std.fs is imported first" {
+    expect_runs([std_fs, ("main", "import std.fs\nimport std_fs\nfn main() \{ io.println(\"\{std_fs.f()} \{fs.read(\"/no/such/file\").is_err()}\") }\n")], "1 true")
+}
+
+test "a type and its trait impl in a module std_fs run" {
+    let m = ("std_fs", "pub type Disk \{\n    n: Int\n}\nimpl Display for Disk \{\n    fn fmt(self, sb: StringBuilder) \{ sb.write(\"disk\{self.n}\") }\n}\npub fn make(n: Int) -> Disk \{ Disk \{ n: n } }\n")
+    expect_runs([m, ("main", "import std_fs\nfn main() \{ io.println(\"\{std_fs.make(42)}\") }\n")], "disk42")
+}
+
+test "a selective import from a module std_fs runs" {
+    expect_runs([std_fs, ("main", "import std_fs.\{f}\nfn main() \{ io.println(\"\{f()}\") }\n")], "1")
+}
+
+test "a module that re-exports std_fs runs" {
+    expect_runs([std_fs, ("facade", "pub import std_fs\n"), ("main", "import facade\nfn main() \{ io.println(\"\{facade.f()}\") }\n")], "1")
+}
+
+test "a module std_num with a library function name runs beside string interpolation" {
+    let m = ("std_num", "pub fn int_to_str(n: Int) -> Str \{ \"n\" }\n")
+    expect_runs([m, ("main", "import std_num\nfn main() \{\n    let k = 5\n    io.println(\"\{std_num.int_to_str(k)} \{k}\")\n}\n")], "n 5")
+}
+
+test "a module named like a prelude library file runs" {
+    let m = ("std_list", "pub fn count() -> Int \{ 3 }\n")
+    expect_runs([m, ("main", "import std_list\nfn main() \{ io.println(\"\{std_list.count()} \{[1, 2].len()}\") }\n")], "3 2")
+}
+
+test "a function skip in a module std_testing is an ordinary function" {
+    let m = ("std_testing", "pub fn skip(reason: Str) -> Int \{ reason.len() }\n")
+    expect_runs([m, ("main", "import std_testing\nfn main() \{ io.println(\"\{std_testing.skip(\"abc\")}\") }\n")], "3")
+}
+
+test "a module that @module names std_fs runs beside the library std.fs" {
+    let m = ("helper", "@module(\"std_fs\")\npub fn f() -> Int \{ 1 }\n")
+    expect_runs([m, ("main", "import helper\nimport std.fs\nfn main() \{ io.println(\"\{std_fs.f()} \{fs.read(\"/no/such/file\").is_err()}\") }\n")], "1 true")
+}
+
+test "a type error names a type of module std_fs as std_fs" {
+    let m = ("std_fs", "pub type Box \{\n    n: Int\n}\npub fn mk() -> Box \{ Box \{ n: 1 } }\n")
+    let other = ("other", "pub type Box \{\n    n: Int\n}\n")
+    expect_check_says([m, other, ("main", "import std_fs\nimport other\nfn main() \{\n    let o = other.Box \{ n: 2 }\n    let s: Str = std_fs.mk()\n    io.println(\"\{s} \{o.n}\")\n}\n")], "got std_fs.Box")
+}
+
+test "the import help for a type member through module std_fs names std_fs, not std.fs" {
+    let m = ("std_fs", "pub type Tag \{ A, B }\n")
+    expect_check_says([m, ("main", "import std_fs\nimport std.fs\nfn main() \{\n    let _ = fs.read(\"x\")\n    io.println(\"\{std_fs.Tag.B}\")\n}\n")], "import std_fs.\{Tag}")
+}
+
+let std_testing = ("std_testing", "pub fn skip(reason: Str) -> Int \{ reason.len() }\n")
+
+test "the library testing.skip still skips a test beside a module std_testing" {
+    let main = ("main", "import std_testing\nimport std.testing\nfn main() \{ io.println(\"\{std_testing.skip(\"abc\")}\") }\ntest \"later\" \{\n    testing.skip(\"not yet\")\n    assert(false)\n}\n")
+    expect_runs([std_testing, main], "3")
+    let dir = new_package([std_testing, main])
+    let r = blink_in(dir, "test")
+    cleanup(dir)
+    if !r.success() || !r.out.contains("1 skipped") { io.eprintln("blink test: {r.end}\n{r.out}") }
+    assert(r.success() && r.out.contains("1 skipped"))
+}
+
+test "the library testing.skip outside a test is still an error beside a module std_testing" {
+    expect_check_says([std_testing, ("main", "import std_testing\nimport std.testing\nfn main() \{\n    testing.skip(\"x\")\n    io.println(\"\{std_testing.skip(\"abc\")}\")\n}\n")], "SkipOutsideTest")
+}
+
+test "a panic in a module std_fs reports its place in std_fs" {
+    let m = ("std_fs", "pub fn boom(n: Int) -> Int \{\n    if n > 0 \{ panic(\"bad disk\") }\n    n\n}\n")
+    expect_run_fails_says([m, ("main", "import std_fs\nimport std.fs\nfn main() \{\n    let _ = fs.read(\"x\")\n    io.println(\"\{std_fs.boom(1)}\")\n}\n")], "bad disk at src/std_fs.bl:2")
+}
