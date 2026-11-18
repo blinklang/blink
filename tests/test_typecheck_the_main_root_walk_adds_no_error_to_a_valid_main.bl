@@ -1,0 +1,101 @@
+// The effect-row walk reads the body of `main` as a root (sections/04_effects.md §4.6). Each
+// form here is a call or statement in `main` that the walk must take as the rest of the check
+// does: no internal error on a valid call, and no second error on a site another check refuses.
+
+import compile_test_helpers
+
+// These assert with the label and print nothing, so a failure names the row and its output.
+fn must_hold(output: Str, needle: Str, label: Str) {
+    assert(output.contains(needle), "{label}: expected '{needle}' in {output}")
+}
+
+fn must_be_clean(output: Str, label: Str) {
+    assert(!output.contains("\"severity\":\"error\""), "{label}: expected a clean compile, got {output}")
+    assert(!output_has_internal(output), "{label}: expected no internal error, got {output}")
+}
+
+fn output_has_internal(out: Str) -> Bool {
+    out.contains("internal compiler error") || out.contains("\"code\":\"I0")
+}
+
+fn count(text: Str, part: Str) -> Int {
+    text.split(part).len() - 1
+}
+
+test "into on a Map a From impl converts checks clean in main" {
+    let out = compile_test_helpers.compile_and_capture(#"type Tally { n: Int }
+impl From[Map[Str, Int]] for Tally {
+    fn from(m: Map[Str, Int]) -> Tally { Tally { n: m.len() } }
+}
+fn main() {
+    let mut m: Map[Str, Int] = Map()
+    m.insert("a", 1)
+    let b: Tally = m.into()
+    io.println("{b.n}")
+}
+"#, "root_walk_map_into")
+    must_be_clean(out, "Into answers on a Map receiver")
+}
+
+test "into on a Map a From impl converts checks clean in a fn other than main" {
+    let out = compile_test_helpers.compile_and_capture(#"type Tally { n: Int }
+impl From[Map[Str, Int]] for Tally {
+    fn from(m: Map[Str, Int]) -> Tally { Tally { n: m.len() } }
+}
+fn tally() -> Int {
+    let mut m: Map[Str, Int] = Map()
+    m.insert("a", 1)
+    let b: Tally = m.into()
+    b.n
+}
+fn main() {
+    io.println("{tally()}")
+}
+"#, "root_walk_map_into_other_fn")
+    must_be_clean(out, "Into answers on a Map receiver outside main")
+}
+
+test "a StringBuilder constructor through an alias checks clean in main" {
+    let out = compile_test_helpers.compile_and_capture(#"type SB = StringBuilder
+fn main() {
+    let b = SB.with_capacity(8)
+    b.write("hi")
+    let c = SB.new()
+    c.write("yo")
+    io.println("{b.to_str()} {c.to_str()}")
+}
+"#, "root_walk_sb_alias")
+    must_be_clean(out, "the alias names its target, which owns the call")
+}
+
+test "a let with no initializer in main gives its own error and no internal error" {
+    let out = compile_test_helpers.compile_and_capture(#"fn main() {
+    @ffi("SIGBUS", header: "signal.h")
+    let x: Int
+    let _ = x
+}
+"#, "root_walk_let_no_value")
+    must_hold(out, "\"code\":\"E0853\"", "the foreign constant form is refused")
+    assert(!output_has_internal(out), "the let with no value: expected no internal error, got {out}")
+}
+
+test "a hook outside main is refused once, with no error for its row" {
+    let out = compile_test_helpers.compile_and_capture(#"import std.panic.{PanicInfo}
+fn report(p: PanicInfo) -> Never ! IO.Eprint, Env.Exit {
+    io.eprintln("fatal: {p.message}")
+    env.exit(70)
+}
+fn run() ! IO {
+    io.println("run")
+}
+fn serve() ! IO {
+    with on_panic(report) { run() }
+}
+fn main() ! IO, Env {
+    serve()
+}
+"#, "root_walk_hook_outside_main")
+    must_hold(out, "\"code\":\"E0565\"", "the hook outside main is refused")
+    assert(count(out, "\"severity\":\"error\"") == 1, "the hook outside main: expected one error, got {out}")
+    assert(count(out, "\"code\":\"E0500\"") == 0, "the hook outside main: expected no E0500, got {out}")
+}

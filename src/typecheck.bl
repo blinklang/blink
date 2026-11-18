@@ -43043,9 +43043,10 @@ pub fn tc_panic_hook_fn_type() -> Int ! Diag.Report {
 
 // Where each `with on_panic(f)` stands (§2.20 *One hook, in `main`*). Only the body of the
 // entry `main` may hold one, and only one: a closure or nested fn there is a body of its own,
-// and a library's `main` is not the program's.
-fn tc_check_panic_hook_placement(program: Int) ! Diag.Report {
-    if !tc_program_has_panic_hook() { return }
+// and a library's `main` is not the program's. Gives the hook the program installs, or -1: a
+// hook this check refuses is not installed.
+fn tc_check_panic_hook_placement(program: Int) -> Int ! Diag.Report {
+    if !tc_program_has_panic_hook() { return -1 }
     let mut entry_main = -1
     let fns = node_params(program)
     if fns != -1 {
@@ -43057,8 +43058,10 @@ fn tc_check_panic_hook_placement(program: Int) ! Diag.Report {
         }
     }
     let mut kids: List[Int] = []
+    // The on_panic item `main` installs first, at most one.
     let mut first: List[Int] = []
     tc_ph_walk(program, PH_OUTSIDE_MAIN, entry_main, first, kids)
+    first.get(0) ?? -1
 }
 
 const PH_OUTSIDE_MAIN = 0
@@ -43089,7 +43092,7 @@ fn tc_ph_walk(node: Int, ctx0: Int, entry_main: Int, first: List[Int], kids: Lis
                     tc_ph_check_item(item, ctx, first)
                 } else if node_kind(item) == NodeKind.WithResource && tc_is_panic_hook_item(node_value(item)) {
                     tc_ph_report_as(item)
-                    if ctx == PH_MAIN_BODY && first.len() == 0 { first.push(node_left(node_value(item))) }
+                    if ctx == PH_MAIN_BODY && first.len() == 0 { first.push(node_value(item)) }
                 }
                 i = i + 1
             }
@@ -43131,9 +43134,9 @@ fn tc_ph_check_item(item: Int, ctx: Int, first: List[Int]) ! Diag.Report {
     } else if ctx == PH_TEST {
         tc_report_panic_hook_at(at, PANIC_HOOK_IN_TEST, "`main` does not run under the test runner; call the hook as a plain fn under mock_env and assert_panics", [])
     } else if first.len() == 0 {
-        first.push(at)
+        first.push(item)
     } else {
-        let prev = first.get(0).unwrap()
+        let prev = node_left(first.get(0).unwrap())
         let before = diag_entry_count()
         tc_report_panic_hook_at(at, PANIC_HOOK_SECOND, "a program has at most one hook; remove this one", [])
         diag_add_label_since(before, node_line(prev), node_col(prev), node_col(prev) + "on_panic".byte_len(), "the hook `main` installs first")
@@ -47978,8 +47981,9 @@ fn tc_infer_program_body(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Di
     tc_settle_late_types()
     // The row check skips what a trace.log `msg` runs, which this check finds first.
     let msg_ran = tc_check_trace_messages()
-    tc_check_effect_rows(program, msg_ran)
-    tc_check_panic_hook_placement(program)
+    // The row check charges only the hook that placement finds the program installs.
+    let hook = tc_check_panic_hook_placement(program)
+    tc_check_effect_rows(program, msg_ran, hook)
     nr_pop_scope()
     // Last: every constraining use in the program has now run, so a deferred alias blame
     // whose metavar is still unbound is genuinely under-determined. A deferred conversion
@@ -50462,6 +50466,8 @@ type ErOwner {
     assigns: Map[Int, List[Int]]
     // `main`, which holds every built-in effect and no user effect (§4.6).
     root: Bool
+    // The on_panic item the program installs, or -1 (see tc_check_panic_hook_placement).
+    hook: Int
 }
 
 // A root has no row to add an effect to, so the report asks for a handler (§4.6).
@@ -50700,13 +50706,15 @@ fn tc_call_kind_no_decl(node: Int) -> CallReach ! TypeCheck.Resolve {
         let method = node_method(node)
         if node_kind(obj) == NodeKind.Ident && tc_mc_obj_is_value(node) == 0 && tc_ident_binder_node(obj) < 0 && tc_global_decl_node(obj) < 0 {
             let head = node_name(obj)
-            if is_intrinsic_method(head, method) != 0 { return CallReach.Builtin }
-            if is_builtin_name(head) != 0 { return CallReach.Builtin }
+            // An alias head (`type SB = StringBuilder`) names its target, which owns the call.
+            let owner = tc_calls.static_owners.get(node) ?? ""
+            let named = if owner != "" { owner } else { head }
+            if is_intrinsic_method(named, method) != 0 { return CallReach.Builtin }
+            if is_builtin_name(named) != 0 { return CallReach.Builtin }
             if tc_call_builds_variant(node, method) { return CallReach.Variant }
             // The site's spelling of a core type can be an alias (`CoreBytes.from_str`); the
             // call recorded the type it named.
             if tc_calls.builtin_heads.contains(node) { return CallReach.Builtin }
-            let owner = tc_calls.static_owners.get(node) ?? ""
             if owner != "" && tc_derived_static_sig(owner, method) >= 0 { return CallReach.Derived }
             // A conversion with no declaration yet takes its impl at each instance of a generic
             // body (`X.from(x)`, x: T), and runs what its compiler-known trait declares.
@@ -50722,6 +50730,8 @@ fn tc_call_kind_no_decl(node: Int) -> CallReach ! TypeCheck.Resolve {
             if is_builtin_method_on_receiver(rk, method) != 0 { return CallReach.BuiltinMethod }
             if tc_builtin_std_trait(rk, method).is_some() { return CallReach.BuiltinMethod }
             if (rk == TyKind.Struct || rk == TyKind.Enum) && tc_field_tid_at_instance(recv, method) >= 0 { return CallReach.Value }
+            // Into is compiler-known on every receiver, a Map too, whose closed surface omits it.
+            if tc_is_into_method(method) { return CallReach.BuiltinMethod }
             if rk == TyKind.Struct || rk == TyKind.Enum || rk == TyKind.Typevar {
                 if tc_std_trait_of_method(method).is_some() || tc_derived_sig(recv, method) >= 0 { return CallReach.Derived }
             }
@@ -51345,7 +51355,7 @@ fn tc_er_with_row(program: Int, node: Int, held: List[Str], owner: ErOwner, kids
         } else {
             let vn = if ik == NodeKind.WithResource { node_value(it) } else { it }
             tc_er_walk(program, vn, row, owner, kids)
-            if tc_is_panic_hook_item(vn) { tc_er_charge_panic_hook(program, vn, row, owner) }
+            if owner.hook >= 0 && vn == owner.hook { tc_er_charge_panic_hook(program, vn, row, owner) }
             let vt = resolve_alias_tid(tc_lookup_node_tid(vn))
             tc_er_check_with_item(program, vn, vt, row, owner)
             let mut e = tc_tid_handler_effect(vt)
@@ -51407,7 +51417,7 @@ fn tc_er_walk(program: Int, node: Int, held: List[Str], owner: ErOwner, kids: Li
     if tc_is_default_fill(node) { return }
     let k = node_kind(node)
     if k == NodeKind.FnDef {
-        tc_er_walk_fn(program, node, owner.msg_ran, owner.assigns, kids)
+        tc_er_walk_fn(program, node, owner.msg_ran, owner.assigns, owner.hook, kids)
         return
     }
     if k == NodeKind.WithBlock {
@@ -51417,7 +51427,11 @@ fn tc_er_walk(program: Int, node: Int, held: List[Str], owner: ErOwner, kids: Li
     // A handler held in a `let` has its clause rows charged where it is written, not at the
     // `with` that installs it (§4.7.2), so at the root that would refuse a valid program; the
     // root leaves such a handler unchecked until its rows are charged at install.
-    if owner.root && k == NodeKind.LetBinding && node_kind(node_value(node)) == NodeKind.HandlerExpr { return }
+    if owner.root && k == NodeKind.LetBinding {
+        // A `let` with no initializer holds no handler.
+        let v = node_value(node)
+        if v >= 0 && node_kind(v) == NodeKind.HandlerExpr { return }
+    }
     if k == NodeKind.HandlerExpr {
         // An operation body runs over the handler this one was installed on, so its calls
         // through the effect it handles are answered there (§4.7.1).
@@ -51465,10 +51479,10 @@ fn tc_er_walk(program: Int, node: Int, held: List[Str], owner: ErOwner, kids: Li
     }
 }
 
-fn tc_er_walk_fn(program: Int, fn_node: Int, msg_ran: Set[Int], assigns: Map[Int, List[Int]], kids: List[Int]) ! TypeCheck.Resolve, Diag.Report {
+fn tc_er_walk_fn(program: Int, fn_node: Int, msg_ran: Set[Int], assigns: Map[Int, List[Int]], hook: Int, kids: List[Int]) ! TypeCheck.Resolve, Diag.Report {
     tc_er_check_wild_source(fn_node)
     if tc_is_entry_main(fn_node) {
-        tc_er_walk(program, node_body(fn_node), builtin_effect_tree_roots(), ErOwner { name: node_name(fn_node), decl: fn_node, default_body: false, msg_ran: msg_ran, assigns: assigns, root: true }, kids)
+        tc_er_walk(program, node_body(fn_node), builtin_effect_tree_roots(), ErOwner { name: node_name(fn_node), decl: fn_node, default_body: false, msg_ran: msg_ran, assigns: assigns, root: true, hook: hook }, kids)
         return
     }
     let block = tc_method_block.get(fn_node) ?? -1
@@ -51480,7 +51494,7 @@ fn tc_er_walk_fn(program: Int, fn_node: Int, msg_ran: Set[Int], assigns: Map[Int
     for e in tc_er_fn_row(fn_node) {
         if !(default_body && e == "_") { held.push(e) }
     }
-    tc_er_walk(program, node_body(fn_node), held, ErOwner { name: node_name(fn_node), decl: fn_node, default_body: default_body, msg_ran: msg_ran, assigns: assigns, root: false }, kids)
+    tc_er_walk(program, node_body(fn_node), held, ErOwner { name: node_name(fn_node), decl: fn_node, default_body: default_body, msg_ran: msg_ran, assigns: assigns, root: false, hook: hook }, kids)
 }
 
 // An impl method's row may narrow its trait method's row but not widen it, so a bound
@@ -51591,7 +51605,7 @@ fn tc_er_check_wild_source(fn_node: Int) ! Diag.Report {
 }
 
 // `owners` is a list of impl or trait nodes; each one's methods are walked.
-fn tc_er_walk_methods(program: Int, owners: Int, msg_ran: Set[Int], assigns: Map[Int, List[Int]], kids: List[Int]) ! TypeCheck.Resolve, Diag.Report {
+fn tc_er_walk_methods(program: Int, owners: Int, msg_ran: Set[Int], assigns: Map[Int, List[Int]], hook: Int, kids: List[Int]) ! TypeCheck.Resolve, Diag.Report {
     if owners == -1 { return }
     let mut i = 0
     while i < sublist_length(owners) {
@@ -51599,7 +51613,7 @@ fn tc_er_walk_methods(program: Int, owners: Int, msg_ran: Set[Int], assigns: Map
         if ms != -1 {
             let mut j = 0
             while j < sublist_length(ms) {
-                tc_er_walk_fn(program, sublist_get(ms, j), msg_ran, assigns, kids)
+                tc_er_walk_fn(program, sublist_get(ms, j), msg_ran, assigns, hook, kids)
                 j = j + 1
             }
         }
@@ -51609,25 +51623,25 @@ fn tc_er_walk_methods(program: Int, owners: Int, msg_ran: Set[Int], assigns: Map
 
 // Test blocks are not walked: whether a test body holds every effect, as `main` does, is
 // still open with the owner.
-fn tc_check_effect_rows(program: Int, msg_ran: Set[Int]) ! TypeCheck.Resolve, Diag.Report {
+fn tc_check_effect_rows(program: Int, msg_ran: Set[Int], hook: Int) ! TypeCheck.Resolve, Diag.Report {
     let mut kids: List[Int] = []
     let assigns = tc_tm_assigns()
     let fns = node_params(program)
     if fns != -1 {
         let mut i = 0
         while i < sublist_length(fns) {
-            tc_er_walk_fn(program, sublist_get(fns, i), msg_ran, assigns, kids)
+            tc_er_walk_fn(program, sublist_get(fns, i), msg_ran, assigns, hook, kids)
             i = i + 1
         }
     }
-    tc_er_walk_methods(program, node_methods(program), msg_ran, assigns, kids)
-    tc_er_walk_methods(program, node_arms(program), msg_ran, assigns, kids)
+    tc_er_walk_methods(program, node_methods(program), msg_ran, assigns, hook, kids)
+    tc_er_walk_methods(program, node_arms(program), msg_ran, assigns, hook, kids)
     tc_er_check_impl_rows(program)
     // A derived body runs at the call site, and that call needs only the effect that declares
     // the operation, so the body holds that effect and nothing more.
     for op in effect_derived_ops(program) {
         match tc_ue.op_root.get(op) {
-            Some(ed) => tc_er_walk(program, node_body(op), [tc_er_op_effect(ed, op)], ErOwner { name: "{tc_er_op_effect(ed, op)}.{node_name(op)}", decl: -1, default_body: false, msg_ran: msg_ran, assigns: assigns, root: false }, kids)
+            Some(ed) => tc_er_walk(program, node_body(op), [tc_er_op_effect(ed, op)], ErOwner { name: "{tc_er_op_effect(ed, op)}.{node_name(op)}", decl: -1, default_body: false, msg_ran: msg_ran, assigns: assigns, root: false, hook: hook }, kids)
             None => {}
         }
     }
