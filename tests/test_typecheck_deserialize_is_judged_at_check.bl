@@ -1,0 +1,126 @@
+// Deserialize is judged at check, so no program the checker passes reaches a reader the
+// compiler cannot build (sections/03_types.md §3.6.2 *Type Mapping*, ERROR_CATALOG.md E1401
+// and E0306). A function or a pointer has no JSON form, so a derive field of that type is
+// E1401, also inside a List, an Option, a Map or a tuple. A generic held at such a type
+// lacks the derive there, so `from_json` at that instance and a `T: Deserialize` bound are
+// refused, while the value itself stays legal. The types §3.6.2 maps are not refused.
+
+import compile_test_helpers
+
+fn de_src(body: Str) -> Str {
+    "import std.json\ntype NoDe \{ a: Int }\n@derive(Deserialize)\ntype DeOk \{ a: Int }\n@derive(Deserialize)\ntype B[T] \{ v: T }\n{body}\nfn main() \{\n    match W.from_json(\"x\") \{\n        Ok(_) => io.println(\"ok\")\n        Err(_) => io.println(\"err\")\n    }\n}\n"
+}
+
+fn count_of(out: Str, needle: Str) -> Int {
+    out.split(needle).len() - 1
+}
+
+fn assert_refused(field: Str, label: Str, tag: Str) ! FS.Write, Process.Spawn, FS.Delete, Env.Read {
+    let out = compile_test_helpers.check_via_cli(de_src("@derive(Deserialize)\ntype W \{ {field} }"), tag)
+    assert(out.contains("E1401"), "{field}: no E1401\n{out}")
+    assert(out.contains("@derive(Deserialize) on `W`: field `{label}`"), "{field}: no refusal of `{label}`\n{out}")
+    assert(out.contains("which does not implement Deserialize"), "{field}: refusal does not name the trait\n{out}")
+}
+
+fn assert_kept(field: Str, tag: Str) ! FS.Write, Process.Spawn, FS.Delete, Env.Read {
+    let out = compile_test_helpers.check_via_cli(de_src("@derive(Deserialize)\ntype W \{ {field} }"), tag)
+    assert(!out.contains("\"severity\":\"error\""), "{field}: refused\n{out}")
+}
+
+test "a function field is refused" {
+    assert_refused("f: fn(Int) -> Int", "f", "dj_fn")
+}
+
+test "a pointer field is refused" {
+    assert_refused("p: Ptr[Int]", "p", "dj_ptr")
+}
+
+test "a function inside a container field is refused" {
+    assert_refused("xs: List[fn(Int) -> Int]", "xs", "dj_list_fn")
+    assert_refused("o: Option[Ptr[Int]]", "o", "dj_option_ptr")
+    assert_refused("r: Result[Int, fn(Int) -> Int]", "r", "dj_result_fn")
+    assert_refused("m: Map[Str, fn(Int) -> Int]", "m", "dj_map_fn")
+    assert_refused("t: (fn(Int) -> Int, Int)", "t", "dj_tuple_fn")
+}
+
+test "a generic held at a function in a field is refused" {
+    assert_refused("b: B[fn(Int) -> Int]", "b", "dj_generic_fn")
+}
+
+test "a variant field of function type is refused" {
+    let out = compile_test_helpers.check_via_cli(de_src("@derive(Deserialize)\ntype W \{\n    V(f: fn(Int) -> Int)\n    U\n}"), "dj_variant_fn")
+    assert(out.contains("E1401"), "no E1401\n{out}")
+    assert(out.contains("@derive(Deserialize) on `W`: field `V.f`"), "no refusal of `V.f`\n{out}")
+}
+
+test "the types the spec maps are not refused" {
+    assert_kept("n: Int", "dj_kept_int")
+    assert_kept("x: Float", "dj_kept_float")
+    assert_kept("b: Bool", "dj_kept_bool")
+    assert_kept("s: Str", "dj_kept_str")
+    assert_kept("xs: List[Int]", "dj_kept_list")
+    assert_kept("d: DeOk", "dj_kept_nested")
+    assert_kept("ds: List[DeOk]", "dj_kept_list_nested")
+    assert_kept("o: Option[Int]", "dj_kept_option")
+    assert_kept("r: Result[Int, Str]", "dj_kept_result")
+    assert_kept("m: Map[Str, Int]", "dj_kept_map")
+    assert_kept("t: (Int, Str)", "dj_kept_tuple")
+    assert_kept("g: B[Int]", "dj_kept_generic_arg")
+}
+
+test "a generic deriving Deserialize builds when held at a function and never read" {
+    let src = "@derive(Deserialize)\ntype Box[T] \{ v: T }\nfn main() \{\n    let b = Box \{ v: fn(x: Int) -> Int \{ x + 1 } }\n    io.println(\"\{(b.v)(2)}\")\n}\n"
+    let r = compile_test_helpers.compile_and_run(src, "dj_generic_fn_value")
+    assert_eq(r.out.trim(), "3")
+}
+
+fn from_json_src(body: Str) -> Str {
+    "import std.json\ntype NoDe \{ x: Int }\n@derive(Deserialize)\ntype DeOk \{ x: Int }\n@derive(Deserialize)\ntype Box[T] \{ v: T }\nfn main() \{\n{body}\n}\n"
+}
+
+test "from_json at an instance with no Deserialize is refused when the type is known at the call" {
+    let out = compile_test_helpers.check_via_cli(from_json_src("    let r: Result[Box[NoDe], Str] = Box.from_json(\"x\")\n    io.println(\"\{r.is_ok()}\")"), "dj_from_json_known")
+    assert_eq(count_of(out, "`Box[NoDe]` does not implement `Deserialize`"), 1)
+}
+
+test "from_json at an instance with no Deserialize is refused when a later use fixes the type" {
+    let out = compile_test_helpers.check_via_cli(from_json_src("    let r = Box.from_json(\"x\")\n    let b: Box[NoDe] = r.unwrap()\n    io.println(\"\{b.v.x}\")"), "dj_from_json_later")
+    assert_eq(count_of(out, "`Box[NoDe]` does not implement `Deserialize`"), 1)
+}
+
+test "from_json at a function instance is refused" {
+    let out = compile_test_helpers.check_via_cli(from_json_src("    let r: Result[Box[fn(Int) -> Int], Str] = Box.from_json(\"x\")\n    io.println(\"\{r.is_ok()}\")"), "dj_from_json_fn")
+    assert_eq(count_of(out, "does not implement `Deserialize`"), 1)
+    assert(out.contains("`Box["), "the refusal does not name the instance\n{out}")
+}
+
+test "from_json named as a value is refused at an instance with no Deserialize" {
+    let out = compile_test_helpers.check_via_cli(from_json_src("    let f = Box.from_json\n    let r: Result[Box[NoDe], Str] = f(\"x\")\n    io.println(\"\{r.is_ok()}\")"), "dj_from_json_value")
+    assert_eq(count_of(out, "`Box[NoDe]` does not implement `Deserialize`"), 1)
+}
+
+test "from_json through an alias head is refused at an instance with no Deserialize" {
+    let out = compile_test_helpers.check_via_cli(from_json_src("    let r = BN.from_json(\"x\")\n    io.println(\"\{r.is_ok()}\")").replace("fn main", "type BN = Box[NoDe]\nfn main"), "dj_from_json_alias")
+    assert_eq(count_of(out, "`Box[NoDe]` does not implement `Deserialize`"), 1)
+}
+
+test "from_json at an instance with Deserialize is not refused" {
+    let out = compile_test_helpers.check_via_cli(from_json_src("    let r: Result[Box[DeOk], Str] = Box.from_json(\"x\")\n    let s = Box.from_json(\"x\")\n    let t: Box[Int] = s.unwrap()\n    io.println(\"\{r.is_ok()} \{t.v}\")"), "dj_from_json_kept")
+    assert(!out.contains("\"severity\":\"error\""), "refused\n{out}")
+}
+
+fn bound_src(body: Str) -> Str {
+    "import std.json\ntype N \{ a: Int }\n@derive(Deserialize)\ntype DeOk \{ a: Int }\nfn need[T: Deserialize](_x: T) -> Int \{ 1 }\nfn main() \{\n{body}\n}\n"
+}
+
+test "a Deserialize bound refuses a type with no Deserialize" {
+    let out = compile_test_helpers.check_via_cli(bound_src("    io.println(\"\{need(N \{ a: 1 })}\")\n    io.println(\"\{need([N \{ a: 1 }])}\")\n    io.println(\"\{need(fn(x: Int) -> Int \{ x })}\")"), "dj_bound_refused")
+    assert_eq(count_of(out, "E0306"), 3)
+    assert(out.contains("`N` does not satisfy the Deserialize bound"), "no refusal of `N`\n{out}")
+    assert(out.contains("`List[N]` does not satisfy the Deserialize bound"), "no refusal of `List[N]`\n{out}")
+}
+
+test "a Deserialize bound keeps a type with Deserialize" {
+    let out = compile_test_helpers.check_via_cli(bound_src("    io.println(\"\{need(DeOk \{ a: 1 })} \{need([DeOk \{ a: 1 }])} \{need(1)} \{need(\"s\")} \{need([1, 2])}\")"), "dj_bound_kept")
+    assert(!out.contains("\"severity\":\"error\""), "refused\n{out}")
+}
