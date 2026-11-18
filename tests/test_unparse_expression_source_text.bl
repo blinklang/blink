@@ -11,11 +11,12 @@
 // a pair nor invented one.
 
 import compiler.{compile_to_program}
-import parser.{node_count, node_kind, node_name, node_value}
+import parser.{node_count, node_kind, node_name, node_value, Parse}
 import ast.{NodeKind}
 import unparse.{unparse_expr}
-import diagnostics.{diag_reset, diag_ice_count}
+import diagnostics.{diag_reset, diag_ice_count, Diag}
 import std.io
+import lexer.{Lex}
 
 // The node pool grows across probes and every probe binds this same name, so an earlier
 // probe's binding would answer for a later one. The last one written is this probe's.
@@ -28,32 +29,38 @@ fn last_binding_value(name: Str) -> Int {
     -1
 }
 
-fn expr_node(stem: Str, text: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, Env.Exit, Env.Read, FS.Read, IO, FS.Write, Process.Spawn {
-    let path = "build/{stem}_probe.bl"
-    fs.write(path, "fn main() \{\n    let _unparse_subject = {text}\n}\n").unwrap()
-    let program = compile_to_program(path, 1)
-    let _rm = process.run("rm", ["-f", path]).unwrap()
-    let n = last_binding_value("_unparse_subject")
-    if n < 0 { io.println("FAIL: probe '{text}' bound no subject") }
-    assert(n >= 0)
-    n
+fn expr_node(stem: Str, text: Str) -> Int ! Env.Exit, Env.Read, FS.Read, IO, FS.Write, Process.Spawn {
+    with handler Diag {}, handler Lex {}, handler Parse {} {
+        let path = "build/{stem}_probe.bl"
+        fs.write(path, "fn main() \{\n    let _unparse_subject = {text}\n}\n").unwrap()
+        let program = compile_to_program(path, 1)
+        let _rm = process.run("rm", ["-f", path]).unwrap()
+        let n = last_binding_value("_unparse_subject")
+        if n < 0 { io.println("FAIL: probe '{text}' bound no subject") }
+        assert(n >= 0)
+        n
+    }
 }
 
-fn assert_unparses(stem: Str, written: Str, want: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, Env.Exit, Env.Read, FS.Read, IO, FS.Write, Process.Spawn {
-    let got = unparse_expr(expr_node(stem, written))
-    if got != want {
-        io.println("FAIL: '{written}' unparsed to '{got}', want '{want}'")
+fn assert_unparses(stem: Str, written: Str, want: Str) ! Env.Exit, Env.Read, FS.Read, IO, FS.Write, Process.Spawn {
+    with handler Diag {} {
+        let got = unparse_expr(expr_node(stem, written))
+        if got != want {
+            io.println("FAIL: '{written}' unparsed to '{got}', want '{want}'")
+        }
+        assert(got == want)
     }
-    assert(got == want)
 }
 
-fn assert_round_trips(stem: Str, written: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, Env.Exit, Env.Read, FS.Read, IO, FS.Write, Process.Spawn {
-    let once = unparse_expr(expr_node(stem, written))
-    let twice = unparse_expr(expr_node("{stem}_again", once))
-    if once != twice {
-        io.println("FAIL: '{written}' unparsed to '{once}', which unparsed to '{twice}'")
+fn assert_round_trips(stem: Str, written: Str) ! Env.Exit, Env.Read, FS.Read, IO, FS.Write, Process.Spawn {
+    with handler Diag {} {
+        let once = unparse_expr(expr_node(stem, written))
+        let twice = unparse_expr(expr_node("{stem}_again", once))
+        if once != twice {
+            io.println("FAIL: '{written}' unparsed to '{once}', which unparsed to '{twice}'")
+        }
+        assert(once == twice)
     }
-    assert(once == twice)
 }
 
 test "a literal reads back as it was written" {
@@ -170,11 +177,13 @@ test "unparsing is idempotent" {
 // A rendering invented for a kind nobody wrote would read, in a failure message, as text
 // the programmer had typed. The refusal is the feature.
 test "an expression kind with no rendering refuses instead of inventing text" {
-    let node = expr_node("u_refuse", "if flag \{ 1 } else \{ 2 }")
-    diag_reset()
-    let _t = unparse_expr(node)
-    if diag_ice_count <= 0 {
-        io.println("FAIL: an unsupported kind produced text instead of an internal error")
+    with handler Diag {} {
+        let node = expr_node("u_refuse", "if flag \{ 1 } else \{ 2 }")
+        diag_reset()
+        let _t = unparse_expr(node)
+        if diag_ice_count <= 0 {
+            io.println("FAIL: an unsupported kind produced text instead of an internal error")
+        }
+        assert(diag_ice_count > 0)
     }
-    assert(diag_ice_count > 0)
 }

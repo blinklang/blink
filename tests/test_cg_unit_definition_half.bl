@@ -4,9 +4,12 @@ import layout.{layout_reset}
 import cname.{c_str_const, cname_reset}
 import cg_test_helpers.{cg_probe_begin, cg_probe_compile, cg_probe_errors, cg_probe_errors_named,
     cg_probe_ices_named, cg_probe_ices_naming}
-import cg.{CgConfig, generate, generate_module_headers, generate_module_object}
+import cg.{CgConfig, generate, generate_module_headers, generate_module_object, Codegen}
 import mono.{run_mono, instances}
 import compiler.{compile_to_program}
+import diagnostics.{Diag}
+import lexer.{Lex}
+import parser.{Parse}
 
 fn assert_eq_int(label: Str, got: Int, want: Int) ! IO.Print {
     if got != want {
@@ -31,14 +34,16 @@ fn assert_lacks(text: Str, needle: Str) ! IO.Print {
 
 // The same order the real drivers use. The mono pass is not part of generate, so a probe
 // that skips it has no instance table and a generic base looks like a base with no uses.
-fn build_probe(src: Str, name: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete, Env.Exit, Env.Read, FS.Read, FS.Write, IO {
-    let path = "build/{name}.bl"
-    let program = cg_probe_compile(path, src)
-    run_mono(program)
-    layout_reset()
-    cname_reset()
-    let _ = fs.delete(path)
-    program
+fn build_probe(src: Str, name: Str) -> Int ! FS.Delete, Env.Exit, Env.Read, FS.Read, FS.Write, IO {
+    with handler Diag {} {
+        let path = "build/{name}.bl"
+        let program = cg_probe_compile(path, src)
+        run_mono(program)
+        layout_reset()
+        cname_reset()
+        let _ = fs.delete(path)
+        program
+    }
 }
 
 fn standalone_cfg() -> CgConfig {
@@ -57,15 +62,17 @@ fn main() { let x = 1 }
 }
 
 test "a module the front end cannot resolve is an error rather than a silent omission" {
-    let path = "build/cg_def_lost_import_probe.bl"
-    cg_probe_begin(path)
-    fs.write(path, lost_import_src()).unwrap()
-    let _program = compile_to_program(path, 1)
-    let _rm = fs.delete(path)
-    assert_eq_int("the module that could not be resolved is reported",
-        cg_probe_errors_named("ModuleNotFound"), 1)
-    assert_eq_int("and it is the only error, so the count a probe reads is this one",
-        cg_probe_errors(), 1)
+    with handler Diag {}, handler Lex {}, handler Parse {} {
+        let path = "build/cg_def_lost_import_probe.bl"
+        cg_probe_begin(path)
+        fs.write(path, lost_import_src()).unwrap()
+        let _program = compile_to_program(path, 1)
+        let _rm = fs.delete(path)
+        assert_eq_int("the module that could not be resolved is reported",
+            cg_probe_errors_named("ModuleNotFound"), 1)
+        assert_eq_int("and it is the only error, so the count a probe reads is this one",
+            cg_probe_errors(), 1)
+    }
 }
 
 // `plain` is a root body: every type in it is concrete, so it has one definition. `ident`
@@ -83,37 +90,43 @@ fn main() { let x = 1 }
 // A root body reaches the statement stage and comes back as a definition, not only the
 // prototype the declaration half already wrote.
 test "a root function body is emitted as a definition" {
-    let program = build_probe(root_src(), "cg_def_root_probe")
-    let text = generate(program, standalone_cfg())
-    assert_has(text, "int64_t blink_2plain(int64_t b_a);")
-    assert_has(text, "int64_t blink_2plain(int64_t b_a) \{")
+    with handler Codegen {}, handler Diag {} {
+        let program = build_probe(root_src(), "cg_def_root_probe")
+        let text = generate(program, standalone_cfg())
+        assert_has(text, "int64_t blink_2plain(int64_t b_a);")
+        assert_has(text, "int64_t blink_2plain(int64_t b_a) \{")
+    }
 }
 
 // The definition of a generic base is one per instance, so the base itself contributes
 // none. An empty body under the base's own name would be a function that returns nothing
 // where its signature promises a value.
 test "a generic base contributes no root definition" {
-    let program = build_probe(root_src(), "cg_def_generic_probe")
-    let text = generate(program, standalone_cfg())
-    assert_has(text, "int64_t blink_2plain(int64_t b_a) \{")
-    assert_lacks(text, "blink_2ident(")
-    assert_lacks(text, "blink_2ident;")
-    assert_lacks(text, "blink_2ident,")
-    assert_lacks(text, "blink_2ident)")
+    with handler Codegen {}, handler Diag {} {
+        let program = build_probe(root_src(), "cg_def_generic_probe")
+        let text = generate(program, standalone_cfg())
+        assert_has(text, "int64_t blink_2plain(int64_t b_a) \{")
+        assert_lacks(text, "blink_2ident(")
+        assert_lacks(text, "blink_2ident;")
+        assert_lacks(text, "blink_2ident,")
+        assert_lacks(text, "blink_2ident)")
+    }
 }
 
 // A generic base nobody used has no instances, so there is no body to write and no caller
 // left undefined. That is the one shape where a generic base contributes nothing and is
 // not a gap, so it must stay silent rather than report a stage it does not need.
 test "an unused generic base emits nothing and reports nothing" {
-    let program = build_probe(root_src(), "cg_def_unused_generic_probe")
-    let text = generate(program, standalone_cfg())
-    assert_lacks(text, "blink_2ident(")
-    assert_lacks(text, "blink_2ident;")
-    assert_lacks(text, "blink_2ident,")
-    assert_lacks(text, "blink_2ident)")
-    assert_eq_int("an unused generic base reports no stage",
-        cg_probe_ices_naming("is not built"), 0)
+    with handler Codegen {}, handler Diag {} {
+        let program = build_probe(root_src(), "cg_def_unused_generic_probe")
+        let text = generate(program, standalone_cfg())
+        assert_lacks(text, "blink_2ident(")
+        assert_lacks(text, "blink_2ident;")
+        assert_lacks(text, "blink_2ident,")
+        assert_lacks(text, "blink_2ident)")
+        assert_eq_int("an unused generic base reports no stage",
+            cg_probe_ices_naming("is not built"), 0)
+    }
 }
 
 // A foreign binding's Blink body is empty by construction, so the wrapper's body is not a
@@ -129,23 +142,27 @@ fn main() { assert(true) }
 }
 
 test "a foreign binding wrapper is never emitted as an empty body" {
-    let program = build_probe(ffi_src(), "cg_def_ffi_probe")
-    let text = generate(program, standalone_cfg())
-    assert_has(text, "int64_t blink_2wrapped(int64_t b_x) \{")
-    assert_has(text, "return foreign_thing(b_x);")
-    assert_eq_int("no foreign-wrapper refusal",
-        cg_probe_ices_naming("cg foreign wrapper bodies"), 0)
+    with handler Codegen {}, handler Diag {} {
+        let program = build_probe(ffi_src(), "cg_def_ffi_probe")
+        let text = generate(program, standalone_cfg())
+        assert_has(text, "int64_t blink_2wrapped(int64_t b_x) \{")
+        assert_has(text, "return foreign_thing(b_x);")
+        assert_eq_int("no foreign-wrapper refusal",
+            cg_probe_ices_naming("cg foreign wrapper bodies"), 0)
+    }
 }
 
 // The statement stage numbers its temporaries from zero in each unit. Two emits of one
 // program in one process must therefore agree, or the second is reading state the first
 // left behind.
 test "two emits of one program produce the same unit" {
-    let program = build_probe(root_src(), "cg_def_reset_probe")
-    let first = generate(program, standalone_cfg())
-    let second = generate(program, standalone_cfg())
-    assert_eq_int("the two emits are the same length", second.len(), first.len())
-    assert(first == second)
+    with handler Codegen {}, handler Diag {} {
+        let program = build_probe(root_src(), "cg_def_reset_probe")
+        let first = generate(program, standalone_cfg())
+        let second = generate(program, standalone_cfg())
+        assert_eq_int("the two emits are the same length", second.len(), first.len())
+        assert(first == second)
+    }
 }
 
 // A method's name carries its receiver type and trait, so the declaration and the definition
@@ -167,10 +184,12 @@ fn main() { assert(true) }
 }
 
 test "an impl method is declared and defined under one name" {
-    let program = build_probe(method_src(), "cg_def_method_probe")
-    let text = generate(program, standalone_cfg())
-    assert_has(text, "int64_t blink_6Box_Peek_peek(blink_4Box b_self);")
-    assert_has(text, "int64_t blink_6Box_Peek_peek(blink_4Box b_self) \{")
+    with handler Codegen {}, handler Diag {} {
+        let program = build_probe(method_src(), "cg_def_method_probe")
+        let text = generate(program, standalone_cfg())
+        assert_has(text, "int64_t blink_6Box_Peek_peek(blink_4Box b_self);")
+        assert_has(text, "int64_t blink_6Box_Peek_peek(blink_4Box b_self) \{")
+    }
 }
 
 // The acceptance shape for the definition half. Every value here is a leaf the expression
@@ -190,16 +209,18 @@ fn main() { let x = 1 }
 }
 
 test "a body of leaf values lowers end to end with no stage left unbuilt" {
-    let program = build_probe(leaf_src(), "cg_def_leaf_probe")
-    let text = generate(program, standalone_cfg())
-    assert_has(text, "void blink_2vals(void) \{")
-    assert_has(text, "int64_t b_a = 1;")
-    assert_has(text, "int b_b = 1;")
-    assert_has(text, "const char* b_c = ".concat(c_str_const("hi")).concat(";"))
-    assert_has(text, "int64_t b_d = b_a;")
-    assert_has(text, "void blink_main(blink_ev* __ev) \{")
-    assert_has(text, "int64_t b_x = 1;")
-    assert_eq_int("no stage is left unbuilt", cg_probe_ices_naming("is not built"), 0)
+    with handler Codegen {}, handler Diag {} {
+        let program = build_probe(leaf_src(), "cg_def_leaf_probe")
+        let text = generate(program, standalone_cfg())
+        assert_has(text, "void blink_2vals(void) \{")
+        assert_has(text, "int64_t b_a = 1;")
+        assert_has(text, "int b_b = 1;")
+        assert_has(text, "const char* b_c = ".concat(c_str_const("hi")).concat(";"))
+        assert_has(text, "int64_t b_d = b_a;")
+        assert_has(text, "void blink_main(blink_ev* __ev) \{")
+        assert_has(text, "int64_t b_x = 1;")
+        assert_eq_int("no stage is left unbuilt", cg_probe_ices_naming("is not built"), 0)
+    }
 }
 
 // A generic base has one body per instance, and each instance spells its own substituted
@@ -220,55 +241,60 @@ fn main() { let x = 1 }
 }
 
 test "a generic base with two instances emits one definition per instance" {
-    let program = build_probe(two_instance_src(), "cg_def_two_inst_probe")
-    assert_eq_int("the base has two instances", instances().len(), 2)
-    let text = generate(program, standalone_cfg())
+    with handler Codegen {}, handler Diag {} {
+        let program = build_probe(two_instance_src(), "cg_def_two_inst_probe")
+        assert_eq_int("the base has two instances", instances().len(), 2)
+        let text = generate(program, standalone_cfg())
 
-    // Each instance spells its own substituted types. Int is the machine word and Bool is
-    // C's int, so a body that still read the binder could not produce both.
-    assert_has(text, "int64_t blink_2ident_0Int(int64_t b_x) \{")
-    assert_has(text, "int blink_2ident_0Bool(int b_x) \{")
-    assert_has(text, "return b_x;")
+        // Each instance spells its own substituted types. Int is the machine word and Bool is
+        // C's int, so a body that still read the binder could not produce both.
+        assert_has(text, "int64_t blink_2ident_0Int(int64_t b_x) \{")
+        assert_has(text, "int blink_2ident_0Bool(int b_x) \{")
+        assert_has(text, "return b_x;")
 
-    // Declared as well as defined. A caller compiled before the definition needs the
-    // prototype, and the base itself is declared by neither half.
-    assert_has(text, "int64_t blink_2ident_0Int(int64_t b_x);")
-    assert_has(text, "int blink_2ident_0Bool(int b_x);")
-    assert_lacks(text, "blink_2ident(")
-    assert_lacks(text, "blink_2ident;")
-    assert_lacks(text, "blink_2ident,")
-    assert_lacks(text, "blink_2ident)")
+        // Declared as well as defined. A caller compiled before the definition needs the
+        // prototype, and the base itself is declared by neither half.
+        assert_has(text, "int64_t blink_2ident_0Int(int64_t b_x);")
+        assert_has(text, "int blink_2ident_0Bool(int b_x);")
+        assert_lacks(text, "blink_2ident(")
+        assert_lacks(text, "blink_2ident;")
+        assert_lacks(text, "blink_2ident,")
+        assert_lacks(text, "blink_2ident)")
+    }
 }
 
 // The instance walk makes an instance current and must put the root back. A declaration
 // node belongs to no instance, so a root left unrestored is refused by name rather than
 // answered, and the declarations after it would vanish from the unit.
 test "declarations still emit after an instance body has run" {
-    let program = build_probe(two_instance_src(), "cg_def_after_inst_probe")
-    let text = generate(program, standalone_cfg())
-    assert_has(text, "int64_t blink_2ident_0Int(int64_t b_x) \{")
-    // `after` is the discriminating one: it is emitted after the instance bodies and its
-    // param and return annotation are declaration nodes, so it is the first thing in the
-    // unit that reads a type through whatever the instance walk left current.
-    assert_has(text, "int64_t blink_2after(int64_t b_n);")
-    assert_has(text, "int64_t blink_2after(int64_t b_n) \{")
-    assert_has(text, "void blink_main(blink_ev* __ev) \{")
-    assert_eq_int("no declaration was read through an instance",
-        cg_probe_ices_named("MonoNodeNotInInstance"), 0)
+    with handler Codegen {}, handler Diag {} {
+        let program = build_probe(two_instance_src(), "cg_def_after_inst_probe")
+        let text = generate(program, standalone_cfg())
+        assert_has(text, "int64_t blink_2ident_0Int(int64_t b_x) \{")
+        // `after` is the discriminating one: it is emitted after the instance bodies and its
+        // param and return annotation are declaration nodes, so it is the first thing in the
+        // unit that reads a type through whatever the instance walk left current.
+        assert_has(text, "int64_t blink_2after(int64_t b_n);")
+        assert_has(text, "int64_t blink_2after(int64_t b_n) \{")
+        assert_has(text, "void blink_main(blink_ev* __ev) \{")
+        assert_eq_int("no declaration was read through an instance",
+            cg_probe_ices_named("MonoNodeNotInInstance"), 0)
+    }
 }
 
 // The per-module mode selects declarations by the module they were written in, and only
 // an imported file carries a module key of its own, so this shape needs a package: a
 // generic base in one module and the calls that instantiate it in another.
-fn pkg_probe(stem: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Env.Exit, Env.Read, FS.Read, FS.Write, IO, Process.Spawn {
-    let root = "build/{stem}_pkg"
-    let _clean = process.run("rm", ["-rf", root]).unwrap()
-    let _mk = process.run("mkdir", ["-p", "{root}/src"]).unwrap()
-    fs.write("{root}/blink.toml", "[package]\nname = \"{stem}\"\nversion = \"0.1.0\"\n").unwrap()
-    fs.write("{root}/src/mymod.bl", #"pub fn ident[T](x: T) -> T { x }
+fn pkg_probe(stem: Str) -> Int ! Env.Exit, Env.Read, FS.Read, FS.Write, IO, Process.Spawn {
+    with handler Diag {} {
+        let root = "build/{stem}_pkg"
+        let _clean = process.run("rm", ["-rf", root]).unwrap()
+        let _mk = process.run("mkdir", ["-p", "{root}/src"]).unwrap()
+        fs.write("{root}/blink.toml", "[package]\nname = \"{stem}\"\nversion = \"0.1.0\"\n").unwrap()
+        fs.write("{root}/src/mymod.bl", #"pub fn ident[T](x: T) -> T { x }
 "#).unwrap()
-    let path = "{root}/src/probe.bl"
-    let program = cg_probe_compile(path, #"import mymod.{ident}
+        let path = "{root}/src/probe.bl"
+        let program = cg_probe_compile(path, #"import mymod.{ident}
 
 fn use_both() {
     let _a = ident(1)
@@ -277,11 +303,12 @@ fn use_both() {
 
 fn main() { let _x = 1 }
 "#)
-    run_mono(program)
-    layout_reset()
-    cname_reset()
-    let _rm = process.run("rm", ["-rf", root]).unwrap()
-    program
+        run_mono(program)
+        layout_reset()
+        cname_reset()
+        let _rm = process.run("rm", ["-rf", root]).unwrap()
+        program
+    }
 }
 
 // The per-module mode splits one module into a header of declarations and an object of
@@ -292,17 +319,19 @@ fn main() { let _x = 1 }
 // come from the instance table rather than being written out here, so this proves the
 // symmetry and not one particular spelling.
 test "a module header declares every instance its object defines" {
-    let program = pkg_probe("cg_def_split")
-    assert_eq_int("the base has two instances", instances().len(), 2)
-    let header = generate_module_headers(program, "mymod", standalone_cfg()).internal
-    let object = generate_module_object(program, "mymod", "mymod.h", standalone_cfg())
-    for inst in instances() {
-        assert_has(object, "{inst.c_name}(")
-        assert_has(header, "{inst.c_name}(")
+    with handler Codegen {}, handler Diag {} {
+        let program = pkg_probe("cg_def_split")
+        assert_eq_int("the base has two instances", instances().len(), 2)
+        let header = generate_module_headers(program, "mymod", standalone_cfg()).internal
+        let object = generate_module_object(program, "mymod", "mymod.h", standalone_cfg())
+        for inst in instances() {
+            assert_has(object, "{inst.c_name}(")
+            assert_has(header, "{inst.c_name}(")
+        }
+        // The split stays a split: the bodies are in the object and in no header.
+        assert_has(object, "return b_x;")
+        assert_lacks(header, "return b_x;")
     }
-    // The split stays a split: the bodies are in the object and in no header.
-    assert_has(object, "return b_x;")
-    assert_lacks(header, "return b_x;")
 }
 
 // A function no other module can name belongs to this unit alone, so C is told so. In the
@@ -328,12 +357,14 @@ fn main() {
 }
 
 test "a module-private function is internal to the unit and a pub one is not" {
-    let program = build_probe(linkage_src(), "cg_def_linkage_probe")
-    let text = generate(program, standalone_cfg())
-    assert_has(text, "static void blink_2hidden(void);")
-    assert_has(text, "static void blink_2hidden(void) \{")
-    assert_lacks(text, "static void blink_2shared")
-    assert_lacks(text, "static void blink_main")
+    with handler Codegen {}, handler Diag {} {
+        let program = build_probe(linkage_src(), "cg_def_linkage_probe")
+        let text = generate(program, standalone_cfg())
+        assert_has(text, "static void blink_2hidden(void);")
+        assert_has(text, "static void blink_2hidden(void) \{")
+        assert_lacks(text, "static void blink_2shared")
+        assert_lacks(text, "static void blink_main")
+    }
 }
 
 // A unit linked against the stdlib archive declares the archive's module-private
@@ -363,11 +394,13 @@ fn archive_linked_cfg() -> CgConfig {
 }
 
 test "a function the archive defines is declared with external linkage" {
-    let program = build_probe(archive_linked_src(), "cg_def_archive_linkage_probe")
-    let text = generate(program, archive_linked_cfg())
-    assert_has(text, "blink_3std_1path_find_1last_1slash(")
-    assert_lacks(text, "static int64_t blink_3std_1path_find_1last_1slash")
-    assert_has(text, "static int64_t blink_2hidden_1here(void) \{")
+    with handler Codegen {}, handler Diag {} {
+        let program = build_probe(archive_linked_src(), "cg_def_archive_linkage_probe")
+        let text = generate(program, archive_linked_cfg())
+        assert_has(text, "blink_3std_1path_find_1last_1slash(")
+        assert_lacks(text, "static int64_t blink_3std_1path_find_1last_1slash")
+        assert_has(text, "static int64_t blink_2hidden_1here(void) \{")
+    }
 }
 
 
@@ -392,8 +425,10 @@ fn main() {
 }
 
 test "an impl method declares and defines itself with one linkage" {
-    let program = build_probe(impl_method_src(), "cg_def_impl_linkage_probe")
-    let text = generate(program, standalone_cfg())
-    assert_has(text, "static blink_4Celsius blink_6Celsius_From_from_0Int(")
-    assert_lacks(text, "\nblink_4Celsius blink_6Celsius_From_from_0Int(")
+    with handler Codegen {}, handler Diag {} {
+        let program = build_probe(impl_method_src(), "cg_def_impl_linkage_probe")
+        let text = generate(program, standalone_cfg())
+        assert_has(text, "static blink_4Celsius blink_6Celsius_From_from_0Int(")
+        assert_lacks(text, "\nblink_4Celsius blink_6Celsius_From_from_0Int(")
+    }
 }

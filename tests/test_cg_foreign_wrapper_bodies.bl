@@ -12,10 +12,11 @@ import std.fs
 import std.io
 import layout.{layout_reset}
 import cname.{cname_reset, c_ffi_struct_original, c_ffi_struct_ptr_name, cname_ffi_struct_mirror}
-import cg.{CgConfig, generate}
+import cg.{CgConfig, generate, Codegen}
 import cg_test_helpers.{cg_probe_compile, cg_probe_compile_but, cg_probe_errors_named, cg_probe_ices_named, cg_probe_ices_naming, cg_text_occurrences}
 import mono.{run_mono}
 import cg_reg.{cg_reg_type_decls}
+import diagnostics.{Diag}
 
 fn assert_eq_int(label: Str, got: Int, want: Int) ! IO.Print {
     if got != want {
@@ -38,19 +39,21 @@ fn assert_lacks(text: Str, needle: Str) ! IO.Print {
     assert(!text.contains(needle))
 }
 
-fn build_probe(src: Str, name: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete, Env.Exit, Env.Read, FS.Read, FS.Write, IO {
-    let path = "build/{name}.bl"
-    let program = cg_probe_compile(path, src)
-    run_mono(program)
-    layout_reset()
-    cname_reset()
-    let _ = fs.delete(path)
-    program
+fn build_probe(src: Str, name: Str) -> Int ! FS.Delete, Env.Exit, Env.Read, FS.Read, FS.Write, IO {
+    with handler Diag {} {
+        let path = "build/{name}.bl"
+        let program = cg_probe_compile(path, src)
+        run_mono(program)
+        layout_reset()
+        cname_reset()
+        let _ = fs.delete(path)
+        program
+    }
 }
 
 // A mirror that names no C struct never reaches this stage: check refuses it with E1134
 // (sections 9.1.3 and 11.1), because there is no C struct to cross as.
-fn refused_at_check(src: Str, name: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete, Env.Exit, Env.Read, FS.Read, FS.Write, IO {
+fn refused_at_check(src: Str, name: Str) -> Int ! FS.Delete, Env.Exit, Env.Read, FS.Read, FS.Write, IO {
     let path = "build/{name}.bl"
     let _ = cg_probe_compile_but(path, src, "AnnotationArguments")
     let _ = fs.delete(path)
@@ -91,63 +94,75 @@ fn main() { assert(true) }
 }
 
 test "a wrapper body calls the foreign symbol with the wrapper's own parameters" {
-    let program = build_probe(binding_src(), "cg_fw_call_probe")
-    let text = generate(program, standalone_cfg())
-    assert_has(text, "int64_t blink_2wrapped(int64_t b_x) \{")
-    assert_has(text, "return foreign_thing(b_x);")
-    assert_eq_int("no foreign-wrapper refusal", cg_probe_ices_naming("cg foreign wrapper bodies"), 0)
+    with handler Codegen {}, handler Diag {} {
+        let program = build_probe(binding_src(), "cg_fw_call_probe")
+        let text = generate(program, standalone_cfg())
+        assert_has(text, "int64_t blink_2wrapped(int64_t b_x) \{")
+        assert_has(text, "return foreign_thing(b_x);")
+        assert_eq_int("no foreign-wrapper refusal", cg_probe_ices_naming("cg foreign wrapper bodies"), 0)
+    }
 }
 
 // A value-returning wrapper that drops the call's answer would fall off the end of a
 // function whose signature promises one, so `return` is decided by the return type and
 // not by the fact that a call was written.
 test "a wrapper over a void-returning binding drops the return" {
-    let program = build_probe(binding_src(), "cg_fw_void_probe")
-    let text = generate(program, standalone_cfg())
-    assert_has(text, "void blink_2noisy(int64_t b_x) \{")
-    assert_has(text, "noisy_thing(b_x);")
-    assert_lacks(text, "return noisy_thing(b_x);")
+    with handler Codegen {}, handler Diag {} {
+        let program = build_probe(binding_src(), "cg_fw_void_probe")
+        let text = generate(program, standalone_cfg())
+        assert_has(text, "void blink_2noisy(int64_t b_x) \{")
+        assert_has(text, "noisy_thing(b_x);")
+        assert_lacks(text, "return noisy_thing(b_x);")
+    }
 }
 
 // C spells an empty parameter list `(void)`, in the wrapper and in the prototype alike,
 // or neither is a prototype and the call is unchecked.
 test "a no-parameter binding spells its empty parameter list void" {
-    let program = build_probe(binding_src(), "cg_fw_noparam_probe")
-    let text = generate(program, standalone_cfg())
-    assert_has(text, "extern int64_t tick_thing(void);")
-    assert_has(text, "int64_t blink_2tick(void) \{")
-    assert_has(text, "return tick_thing();")
+    with handler Codegen {}, handler Diag {} {
+        let program = build_probe(binding_src(), "cg_fw_noparam_probe")
+        let text = generate(program, standalone_cfg())
+        assert_has(text, "extern int64_t tick_thing(void);")
+        assert_has(text, "int64_t blink_2tick(void) \{")
+        assert_has(text, "return tick_thing();")
+    }
 }
 
 // The prototype is written for exactly the symbols the unit does not already have one
 // for. Writing a second `labs` from the Blink signature would declare `int64_t labs(int64_t)`
 // against stdlib.h's `long labs(long)`, and C rejects the pair.
 test "only a symbol the prologue does not declare gets a prototype" {
-    let program = build_probe(binding_src(), "cg_fw_proto_probe")
-    let text = generate(program, standalone_cfg())
-    assert_has(text, "extern int64_t foreign_thing(int64_t b_x);")
-    assert_lacks(text, "extern int64_t labs(")
-    assert_has(text, "return labs(b_v);")
+    with handler Codegen {}, handler Diag {} {
+        let program = build_probe(binding_src(), "cg_fw_proto_probe")
+        let text = generate(program, standalone_cfg())
+        assert_has(text, "extern int64_t foreign_thing(int64_t b_x);")
+        assert_lacks(text, "extern int64_t labs(")
+        assert_has(text, "return labs(b_v);")
+    }
 }
 
 // A binding whose wrapper would carry the foreign symbol's own name is not a wrapper: the
 // call goes straight to the foreign function. A body under that name would define the
 // runtime's own symbol a second time.
 test "a binding that needs no wrapper gets no body and no prototype" {
-    let program = build_probe(binding_src(), "cg_fw_nowrapper_probe")
-    let text = generate(program, standalone_cfg())
-    assert_lacks(text, "blink_bytes_len(blink_bytes b_b) \{")
-    assert_lacks(text, "extern int64_t blink_bytes_len(")
+    with handler Codegen {}, handler Diag {} {
+        let program = build_probe(binding_src(), "cg_fw_nowrapper_probe")
+        let text = generate(program, standalone_cfg())
+        assert_lacks(text, "blink_bytes_len(blink_bytes b_b) \{")
+        assert_lacks(text, "extern int64_t blink_bytes_len(")
+    }
 }
 
 // One symbol, one wrapper, however many times the unit walks the declaration.
 test "a binding is wrapped once" {
-    let program = build_probe(binding_src(), "cg_fw_once_probe")
-    let text = generate(program, standalone_cfg())
-    assert_eq_int("one prototype for the undeclared symbol",
-        cg_text_occurrences(text, "extern int64_t foreign_thing(int64_t b_x);"), 1)
-    assert_eq_int("one wrapper definition",
-        cg_text_occurrences(text, "int64_t blink_2wrapped(int64_t b_x) \{"), 1)
+    with handler Codegen {}, handler Diag {} {
+        let program = build_probe(binding_src(), "cg_fw_once_probe")
+        let text = generate(program, standalone_cfg())
+        assert_eq_int("one prototype for the undeclared symbol",
+            cg_text_occurrences(text, "extern int64_t foreign_thing(int64_t b_x);"), 1)
+        assert_eq_int("one wrapper definition",
+            cg_text_occurrences(text, "int64_t blink_2wrapped(int64_t b_x) \{"), 1)
+    }
 }
 
 // An @ffi.struct type is a Blink mirror of a C struct that a foreign header declares. The
@@ -166,26 +181,30 @@ fn main() { assert(true) }
 }
 
 test "a pointer to an @ffi.struct mirror crosses as the C struct the mirror names" {
-    let program = build_probe(mirror_src(), "cg_fw_mirror_probe")
-    let text = generate(program, standalone_cfg())
-    assert_lacks(text, "extern int32_t poll(")
-    assert_has(text, "(struct pollfd*)")
-    assert_eq_int("the other two arguments cross unchanged",
-        cg_text_occurrences(text, "b_nfds, b_t)"), 1)
+    with handler Codegen {}, handler Diag {} {
+        let program = build_probe(mirror_src(), "cg_fw_mirror_probe")
+        let text = generate(program, standalone_cfg())
+        assert_lacks(text, "extern int32_t poll(")
+        assert_has(text, "(struct pollfd*)")
+        assert_eq_int("the other two arguments cross unchanged",
+            cg_text_occurrences(text, "b_nfds, b_t)"), 1)
+    }
 }
 
 // The mirror's own C name reaches the boundary from one producer, so a reader that wants
 // the foreign original asks for it rather than assembling it from the annotation again.
 test "the mirror's foreign spelling comes from the name it declares" {
-    let program = build_probe(mirror_src(), "cg_fw_mirror_name_probe")
-    let _text = generate(program, standalone_cfg())
-    let decl = first_mirror_decl()
-    assert(decl >= 0)
-    assert(cname_ffi_struct_mirror(decl))
-    assert(c_ffi_struct_original(decl) == "struct pollfd")
-    assert(c_ffi_struct_ptr_name(decl, 1) == "struct pollfd*")
-    assert(c_ffi_struct_ptr_name(decl, 2) == "struct pollfd**")
-    assert(c_ffi_struct_ptr_name(decl, 0) == "")
+    with handler Codegen {}, handler Diag {} {
+        let program = build_probe(mirror_src(), "cg_fw_mirror_name_probe")
+        let _text = generate(program, standalone_cfg())
+        let decl = first_mirror_decl()
+        assert(decl >= 0)
+        assert(cname_ffi_struct_mirror(decl))
+        assert(c_ffi_struct_original(decl) == "struct pollfd")
+        assert(c_ffi_struct_ptr_name(decl, 1) == "struct pollfd*")
+        assert(c_ffi_struct_ptr_name(decl, 2) == "struct pollfd**")
+        assert(c_ffi_struct_ptr_name(decl, 0) == "")
+    }
 }
 
 fn first_mirror_decl() -> Int {
@@ -216,11 +235,13 @@ test "an @ffi.struct mirror that names no C struct, passed by value, is refused 
 }
 
 test "an @ffi.struct mirror that names its C struct, passed by value, is copied into that struct" {
-    let program = build_probe(by_value_src(#"header: "poll.h", name: "pollfd""#), "cg_fw_byvalue_named_probe")
-    let text = generate(program, standalone_cfg())
-    assert_eq_int("no refusal", cg_probe_ices_named("ForeignShapeNotConvertible"), 0)
-    assert_has(text, "struct pollfd")
-    assert_has(text, "memcpy")
+    with handler Codegen {}, handler Diag {} {
+        let program = build_probe(by_value_src(#"header: "poll.h", name: "pollfd""#), "cg_fw_byvalue_named_probe")
+        let text = generate(program, standalone_cfg())
+        assert_eq_int("no refusal", cg_probe_ices_named("ForeignShapeNotConvertible"), 0)
+        assert_has(text, "struct pollfd")
+        assert_has(text, "memcpy")
+    }
 }
 
 // A mirror that names no C original has no spelling to cross as, so check refuses it.
@@ -258,14 +279,16 @@ fn main() { assert(true) }
 }
 
 test "a returned pointer to a named mirror is cast back to the mirror" {
-    let program = build_probe(mirror_return_src(#"header: "poll.h", name: "pollfd""#),
-        "cg_fw_ret_named_probe")
-    let text = generate(program, standalone_cfg())
-    assert_eq_int("no refusal", cg_probe_ices_named("ForeignShapeNotConvertible"), 0)
-    assert_has(text, "struct pollfd* _cg_ffi_ret")
-    assert_has(text, " = poll(b_x);")
-    assert_lacks(text, ")(poll(b_x))")
-    assert_eq_int("one cast of the held answer, to the mirror", cg_text_occurrences(text, "Pollfd*)(_cg_ffi_ret"), 1)
+    with handler Codegen {}, handler Diag {} {
+        let program = build_probe(mirror_return_src(#"header: "poll.h", name: "pollfd""#),
+            "cg_fw_ret_named_probe")
+        let text = generate(program, standalone_cfg())
+        assert_eq_int("no refusal", cg_probe_ices_named("ForeignShapeNotConvertible"), 0)
+        assert_has(text, "struct pollfd* _cg_ffi_ret")
+        assert_has(text, " = poll(b_x);")
+        assert_lacks(text, ")(poll(b_x))")
+        assert_eq_int("one cast of the held answer, to the mirror", cg_text_occurrences(text, "Pollfd*)(_cg_ffi_ret"), 1)
+    }
 }
 
 test "a returned pointer to a mirror that names no C original is refused at check" {
@@ -288,10 +311,12 @@ fn main() { assert(true) }
 }
 
 test "a pointer to a pointer to a mirror crosses as two pointer levels of the C struct" {
-    let program = build_probe(mirror_ptr_ptr_src(), "cg_fw_ptr_ptr_probe")
-    let text = generate(program, standalone_cfg())
-    assert_eq_int("no refusal", cg_probe_ices_named("ForeignShapeNotConvertible"), 0)
-    assert_has(text, "poll(((struct pollfd**)(b_fds)))")
+    with handler Codegen {}, handler Diag {} {
+        let program = build_probe(mirror_ptr_ptr_src(), "cg_fw_ptr_ptr_probe")
+        let text = generate(program, standalone_cfg())
+        assert_eq_int("no refusal", cg_probe_ices_named("ForeignShapeNotConvertible"), 0)
+        assert_has(text, "poll(((struct pollfd**)(b_fds)))")
+    }
 }
 
 // C takes one declaration per symbol. Two bindings that ask for different prototypes over
@@ -311,12 +336,14 @@ fn main() { assert(true) }
 }
 
 test "two bindings over one symbol asking for different prototypes refuse by name" {
-    let program = build_probe(two_prototypes_src(), "cg_fw_two_protos_probe")
-    let text = generate(program, standalone_cfg())
-    assert_eq_int("the disagreement is named once",
-        cg_probe_ices_named("ForeignSymbolTwoPrototypes"), 1)
-    assert_eq_int("one prototype is written",
-        cg_text_occurrences(text, "extern int64_t foreign_thing("), 1)
+    with handler Codegen {}, handler Diag {} {
+        let program = build_probe(two_prototypes_src(), "cg_fw_two_protos_probe")
+        let text = generate(program, standalone_cfg())
+        assert_eq_int("the disagreement is named once",
+            cg_probe_ices_named("ForeignSymbolTwoPrototypes"), 1)
+        assert_eq_int("one prototype is written",
+            cg_text_occurrences(text, "extern int64_t foreign_thing("), 1)
+    }
 }
 
 // gc.h and stdlib.h declare these on every host, under C types a Blink signature cannot
@@ -337,10 +364,12 @@ fn main() { assert(true) }
 }
 
 test "a gc.h or realpath binding is called through the header prototype" {
-    let program = build_probe(header_typed_src(), "cg_fw_header_typed_probe")
-    let text = generate(program, standalone_cfg())
-    assert_lacks(text, "extern void GC_set_free_space_divisor(")
-    assert_lacks(text, "extern uint8_t* realpath(")
-    assert_has(text, "GC_set_free_space_divisor(b_d);")
-    assert_has(text, "return realpath(b_path, b_resolved);")
+    with handler Codegen {}, handler Diag {} {
+        let program = build_probe(header_typed_src(), "cg_fw_header_typed_probe")
+        let text = generate(program, standalone_cfg())
+        assert_lacks(text, "extern void GC_set_free_space_divisor(")
+        assert_lacks(text, "extern uint8_t* realpath(")
+        assert_has(text, "GC_set_free_space_divisor(b_d);")
+        assert_has(text, "return realpath(b_path, b_resolved);")
+    }
 }

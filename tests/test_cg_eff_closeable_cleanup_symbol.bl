@@ -30,7 +30,7 @@ import cg_eff.{
     cg_eff_reset, cg_eff_resource_cleanup, cg_eff_thunk_body_node, cg_eff_thunk_close,
     cg_eff_thunk_open, cg_eff_thunk_symbol,
 }
-import diagnostics.{diag_entries, diag_reset}
+import diagnostics.{diag_entries, diag_reset, Diag}
 import std.fs
 import std.io
 
@@ -92,7 +92,7 @@ fn report_ices(label: Str) ! IO.Print {
 
 // Every stage this file drives keeps process globals, so each test rebuilds the probe
 // rather than reading what the test before it left behind.
-fn setup() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete, Env.Exit, Env.Read, FS.Read, FS.Write, IO {
+fn setup() ! FS.Delete, Env.Exit, Env.Read, FS.Read, FS.Write, IO {
     diag_reset()
     ir_reset()
     print_reset()
@@ -116,90 +116,106 @@ fn item(binder: Str) -> Int ! IO.Print {
 
 // The C type the guard's state struct has to store the resource in, read the way every
 // other stage reads a tid's C type rather than written out here.
-fn resource_spelling(binder: Str) -> Str ! Diag.Report, IO.Print {
-    layout_of(tid_of_node(node_value(item(binder))), Position.Local).c_spelling
+fn resource_spelling(binder: Str) -> Str ! IO.Print {
+    with handler Diag {} {
+        layout_of(tid_of_node(node_value(item(binder))), Position.Local).c_spelling
+    }
 }
 
 // The impl the parser writes is an ordinary impl block, so the with stage finds it the way
 // it finds one the user wrote.
 test "a Closeable item's expression answers the BlockHandler impl the parser wrote for it" {
-    setup()
-    let bh = find_impl("Sock", "BlockHandler", "")
-    assert(bh >= 0)
-    let got = cg_eff_block_handler_impl(node_value(item("sock")))
-    if got != bh || ices() != 0 {
-        report_ices("a Closeable item does not answer its BlockHandler impl")
+    with handler Diag {} {
+        setup()
+        let bh = find_impl("Sock", "BlockHandler", "")
+        assert(bh >= 0)
+        let got = cg_eff_block_handler_impl(node_value(item("sock")))
+        if got != bh || ices() != 0 {
+            report_ices("a Closeable item does not answer its BlockHandler impl")
+        }
+        assert_eq(got, bh)
+        assert_eq(ices(), 0)
     }
-    assert_eq(got, bh)
-    assert_eq(ices(), 0)
 }
 
 test "a Closeable item's exit is the exit method of that impl, spelled as its definition is" {
-    setup()
-    let bh = find_impl("Sock", "BlockHandler", "")
-    let expr = node_value(item("sock"))
-    let calls = cg_eff_block_handler_calls(bh, tid_of_node(expr), item("sock"))
-    assert_eq(calls.impl_block, bh)
-    assert_eq(calls.exit_symbol, c_impl_method_name(bh, "exit"))
-    assert_eq(ices(), 0)
+    with handler Diag {} {
+        setup()
+        let bh = find_impl("Sock", "BlockHandler", "")
+        let expr = node_value(item("sock"))
+        let calls = cg_eff_block_handler_calls(bh, tid_of_node(expr), item("sock"))
+        assert_eq(calls.impl_block, bh)
+        assert_eq(calls.exit_symbol, c_impl_method_name(bh, "exit"))
+        assert_eq(ices(), 0)
+    }
 }
 
 // Context = Self, so the binder holds the value itself, at the spelling the value has at
 // the with-item: a binder spelled another way would not compile against the item.
 test "a Closeable item's Context is the resource itself, at the spelling the resource has" {
-    setup()
-    let bh = find_impl("Sock", "BlockHandler", "")
-    let expr = node_value(item("sock"))
-    let calls = cg_eff_block_handler_calls(bh, tid_of_node(expr), item("sock"))
-    assert_eq(layout_of(calls.context_tid, Position.Local).c_spelling, resource_spelling("sock"))
-    assert_eq(ices(), 0)
+    with handler Diag {} {
+        setup()
+        let bh = find_impl("Sock", "BlockHandler", "")
+        let expr = node_value(item("sock"))
+        let calls = cg_eff_block_handler_calls(bh, tid_of_node(expr), item("sock"))
+        assert_eq(layout_of(calls.context_tid, Position.Local).c_spelling, resource_spelling("sock"))
+        assert_eq(ices(), 0)
+    }
 }
 
 test "the guard support for a Closeable stores the resource at the spelling the resource value has" {
-    setup()
-    let spelling = resource_spelling("sock")
-    let bh = find_impl("Sock", "BlockHandler", "")
-    let _ = cg_eff_block_handler_calls(bh, tid_of_node(node_value(item("sock"))), item("sock"))
-    let text = print_take()
-    if cg_text_occurrences(text, "{spelling} resource;") != 1 {
-        io.println("FAIL: no '{spelling} resource;' in the guard state\n--- output ---\n{text}")
+    with handler Diag {} {
+        setup()
+        let spelling = resource_spelling("sock")
+        let bh = find_impl("Sock", "BlockHandler", "")
+        let _ = cg_eff_block_handler_calls(bh, tid_of_node(node_value(item("sock"))), item("sock"))
+        let text = print_take()
+        if cg_text_occurrences(text, "{spelling} resource;") != 1 {
+            io.println("FAIL: no '{spelling} resource;' in the guard state\n--- output ---\n{text}")
+        }
+        assert_eq(cg_text_occurrences(text, "{spelling} resource;"), 1)
+        assert_eq(ices(), 0)
     }
-    assert_eq(cg_text_occurrences(text, "{spelling} resource;"), 1)
-    assert_eq(ices(), 0)
 }
 
 test "asking twice for one Closeable type writes the guard support once" {
-    setup()
-    let spelling = resource_spelling("sock")
-    let bh = find_impl("Sock", "BlockHandler", "")
-    let expr = node_value(item("sock"))
-    let _ = cg_eff_block_handler_calls(bh, tid_of_node(expr), item("sock"))
-    let _ = cg_eff_block_handler_calls(bh, tid_of_node(expr), item("sock"))
-    let text = print_take()
-    assert_eq(cg_text_occurrences(text, "{spelling} resource;"), 1)
-    assert_eq(ices(), 0)
+    with handler Diag {} {
+        setup()
+        let spelling = resource_spelling("sock")
+        let bh = find_impl("Sock", "BlockHandler", "")
+        let expr = node_value(item("sock"))
+        let _ = cg_eff_block_handler_calls(bh, tid_of_node(expr), item("sock"))
+        let _ = cg_eff_block_handler_calls(bh, tid_of_node(expr), item("sock"))
+        let text = print_take()
+        assert_eq(cg_text_occurrences(text, "{spelling} resource;"), 1)
+        assert_eq(ices(), 0)
+    }
 }
 
 // The resource path has no guard for a Closeable type. Asked about one, it reports the
 // routing miss and writes no guard support at all.
 test "the resource path asked about a Closeable writes no guard support and reports the miss" {
-    setup()
-    let spelling = resource_spelling("sock")
-    let rc = cg_eff_resource_cleanup(item("sock"))
-    let text = print_take()
-    assert_eq(rc.protocol, CleanupProtocol.BlockHandler)
-    assert_eq(cg_text_occurrences(text, "{spelling} resource;"), 0)
-    assert_eq(ices_saying("BlockHandler"), 1)
+    with handler Diag {} {
+        setup()
+        let spelling = resource_spelling("sock")
+        let rc = cg_eff_resource_cleanup(item("sock"))
+        let text = print_take()
+        assert_eq(rc.protocol, CleanupProtocol.BlockHandler)
+        assert_eq(cg_text_occurrences(text, "{spelling} resource;"), 0)
+        assert_eq(ices_saying("BlockHandler"), 1)
+    }
 }
 
 // The binder of a BlockHandler resource holds what `enter` answers, not the resource, so
 // the guard cannot store it the way it stores a Closeable. This slice does not build it,
 // and a silent Plain answer here would leave a resource whose exit never runs.
 test "a BlockHandler resource still reports the stage that would build it" {
-    setup()
-    let rc = cg_eff_resource_cleanup(item("guarded"))
-    assert_eq(rc.protocol, CleanupProtocol.BlockHandler)
-    assert_eq(ices_saying("BlockHandler"), 1)
+    with handler Diag {} {
+        setup()
+        let rc = cg_eff_resource_cleanup(item("guarded"))
+        assert_eq(rc.protocol, CleanupProtocol.BlockHandler)
+        assert_eq(ices_saying("BlockHandler"), 1)
+    }
 }
 
 // The thunk queue carries closure bodies and nothing else. A capture is read back out of
@@ -207,27 +223,29 @@ test "a BlockHandler resource still reports the stage that would build it" {
 // arrived through this queue would need that prologue suppressed. Nothing arrives through
 // it, so the prologue stays unconditional and this row is what says so.
 test "a captured closure's thunk still prints the prologue that binds its capture" {
-    setup()
-    let binding = find_decl(NodeKind.LetBinding, "g_cap", "")
-    assert(binding >= 0)
-    // A name is a capture only against a frame that binds it, which is the enclosing
-    // function's frame at the literal's site.
-    let outer = binder_scope_push()
-    bind_binder_mut(outer, "n", TYPE_INT, false)
-    let _ = cg_eff_lower_closure(node_value(binding))
-    binder_scope_pop()
-    assert_eq(cg_eff_pending_thunks(), 1)
-    let symbol = cg_eff_thunk_symbol(0)
-    assert(cg_eff_thunk_open(0) >= 0)
-    let body = lower_block_returning(cg_eff_thunk_body_node(0))
-    cg_eff_thunk_close()
-    assert(body >= 0)
-    cg_eff_print_thunk(0, body)
-    let text = print_take()
-    if cg_text_occurrences(text, "closure_get_capture") != 1 {
-        report_ices("the thunk printed no capture prologue")
-        io.println(text)
+    with handler Diag {} {
+        setup()
+        let binding = find_decl(NodeKind.LetBinding, "g_cap", "")
+        assert(binding >= 0)
+        // A name is a capture only against a frame that binds it, which is the enclosing
+        // function's frame at the literal's site.
+        let outer = binder_scope_push()
+        bind_binder_mut(outer, "n", TYPE_INT, false)
+        let _ = cg_eff_lower_closure(node_value(binding))
+        binder_scope_pop()
+        assert_eq(cg_eff_pending_thunks(), 1)
+        let symbol = cg_eff_thunk_symbol(0)
+        assert(cg_eff_thunk_open(0) >= 0)
+        let body = lower_block_returning(cg_eff_thunk_body_node(0))
+        cg_eff_thunk_close()
+        assert(body >= 0)
+        cg_eff_print_thunk(0, body)
+        let text = print_take()
+        if cg_text_occurrences(text, "closure_get_capture") != 1 {
+            report_ices("the thunk printed no capture prologue")
+            io.println(text)
+        }
+        assert_eq(cg_text_occurrences(text, "{symbol}("), 1)
+        assert_eq(cg_text_occurrences(text, "closure_get_capture"), 1)
     }
-    assert_eq(cg_text_occurrences(text, "{symbol}("), 1)
-    assert_eq(cg_text_occurrences(text, "closure_get_capture"), 1)
 }

@@ -1,10 +1,11 @@
 import std.fs
 import std.io
-import typecheck.{check_types, tc_lookup_node_tid, tc_tid_child, tc_tid_child_count, tc_type_str}
+import typecheck.{check_types, tc_lookup_node_tid, tc_tid_child, tc_tid_child_count, tc_type_str, TypeCheck}
 import layout.{layout_of, layout_reset, Position}
-import parser.{node_count, nodes}
+import parser.{node_count, nodes, Parse}
 import compiler.{compile_to_program}
-import diagnostics.{diag_entries}
+import diagnostics.{diag_entries, Diag}
+import lexer.{Lex}
 
 // An annotated let whose declared type names a type parameter -- `let mut r: Map[K, V] =
 // Map()` inside `fn f[K, V]()` -- left the constructor's own element slots unbound
@@ -38,33 +39,35 @@ fn decline_under(tid: Int, depth: Int) -> Str {
     ""
 }
 
-fn probe(name: Str, src: Str) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete, Env.Exit, Env.Read, FS.Read, IO, FS.Write {
-    let path = "build/tc_generic_let_pin_{name}.bl"
-    fs.write(path, src).unwrap()
-    // The node pool is a whole-process table, so one probe's nodes stay behind for the next one.
-    // The rows below each answer about their own source, which is the nodes this call adds.
-    let first = node_count()
-    let program = compile_to_program(path, 1)
-    check_types(program)
-    layout_reset()
-    let _ = fs.delete(path)
-    let mut worst = ""
-    let mut idx = first
-    let n = node_count()
-    while idx < n {
-        let tid = tc_lookup_node_tid(idx)
-        if tid >= 0 {
-            let under = decline_under(tid, 0)
-            if under != "" {
-                if worst == "" { worst = "{tc_type_str(tid)} (slot {under})" }
+fn probe(name: Str, src: Str) -> Str ! FS.Delete, Env.Exit, Env.Read, FS.Read, IO, FS.Write {
+    with handler Diag {}, handler Lex {}, handler Parse {}, handler TypeCheck {} {
+        let path = "build/tc_generic_let_pin_{name}.bl"
+        fs.write(path, src).unwrap()
+        // The node pool is a whole-process table, so one probe's nodes stay behind for the next one.
+        // The rows below each answer about their own source, which is the nodes this call adds.
+        let first = node_count()
+        let program = compile_to_program(path, 1)
+        check_types(program)
+        layout_reset()
+        let _ = fs.delete(path)
+        let mut worst = ""
+        let mut idx = first
+        let n = node_count()
+        while idx < n {
+            let tid = tc_lookup_node_tid(idx)
+            if tid >= 0 {
+                let under = decline_under(tid, 0)
+                if under != "" {
+                    if worst == "" { worst = "{tc_type_str(tid)} (slot {under})" }
+                }
             }
+            idx = idx + 1
         }
-        idx = idx + 1
+        worst
     }
-    worst
 }
 
-fn assert_no_unbound(label: Str, name: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete, Env.Exit, Env.Read, FS.Read, IO, FS.Write {
+fn assert_no_unbound(label: Str, name: Str, src: Str) ! FS.Delete, Env.Exit, Env.Read, FS.Read, IO, FS.Write {
     let worst = probe(name, src)
     if worst != "" {
         io.println("FAIL: {label}: a node still has no layout, rendered '{worst}'")
@@ -145,24 +148,26 @@ fn main() {
 // diagnostic naming the rule. Turning it into a pin would move the report to the C
 // compiler, which is the failure mode the exclusion exists to prevent.
 test "a concrete element that derives no Hash still reports the rule" {
-    let path = "build/tc_generic_let_pin_nohash.bl"
-    fs.write(path, #"
+    with handler Diag {}, handler Lex {}, handler Parse {}, handler TypeCheck {} {
+        let path = "build/tc_generic_let_pin_nohash.bl"
+        fs.write(path, #"
 type QB { id: Int }
 fn main() {
     let s: Set[QB] = Set()
     assert(s.len() == 0)
 }
 "#).unwrap()
-    let program = compile_to_program(path, 1)
-    check_types(program)
-    layout_reset()
-    let _ = fs.delete(path)
-    let mut named = 0
-    for d in diag_entries {
-        if d.name == "MapKeyNotHashable" { named = named + 1 }
+        let program = compile_to_program(path, 1)
+        check_types(program)
+        layout_reset()
+        let _ = fs.delete(path)
+        let mut named = 0
+        for d in diag_entries {
+            if d.name == "MapKeyNotHashable" { named = named + 1 }
+        }
+        if named == 0 {
+            io.println("FAIL: a Set element deriving no Hash was accepted with no rule named")
+        }
+        assert(named > 0)
     }
-    if named == 0 {
-        io.println("FAIL: a Set element deriving no Hash was accepted with no rule named")
-    }
-    assert(named > 0)
 }

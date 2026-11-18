@@ -24,7 +24,7 @@ import cg_eff.{CleanupProtocol, cg_eff_block_handler_calls, cg_eff_block_handler
 import layout.{tid_of_node}
 import parser.{node_value}
 import typecheck.{TYPE_INT}
-import diagnostics.{diag_reset}
+import diagnostics.{diag_reset, Diag}
 import std.fs
 import std.io
 
@@ -126,7 +126,7 @@ fn main() {
 "#
 }
 
-fn compile(stem: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete, Env.Exit, Env.Read, FS.Read, FS.Write, IO {
+fn compile(stem: Str, src: Str) ! FS.Delete, Env.Exit, Env.Read, FS.Read, FS.Write, IO {
     let path = "build/{stem}.bl"
     let program = cg_probe_compile(path, src)
     let _ = fs.delete(path)
@@ -135,7 +135,7 @@ fn compile(stem: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report,
 
 // The same for a probe whose source the front end rejects by one named error, which the
 // probe expects and which must still be recorded.
-fn compile_expecting(stem: Str, src: Str, expected: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete, Env.Exit, Env.Read, FS.Read, FS.Write, IO {
+fn compile_expecting(stem: Str, src: Str, expected: Str) ! FS.Delete, Env.Exit, Env.Read, FS.Read, FS.Write, IO {
     let path = "build/{stem}.bl"
     let program = cg_probe_compile_but(path, src, expected)
     let _ = fs.delete(path)
@@ -144,12 +144,12 @@ fn compile_expecting(stem: Str, src: Str, expected: Str) ! Lex.Tokenize, Parse, 
 
 // The probe is compiled once per test: the registry and the diagnostics list are process
 // globals, so a test that read another test's leftovers would not be reading its own.
-fn setup() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete, Env.Exit, Env.Read, FS.Read, FS.Write, IO {
+fn setup() ! FS.Delete, Env.Exit, Env.Read, FS.Read, FS.Write, IO {
     diag_reset()
     compile("cg_eff_with_resource_cleanup_probe", probe_src())
 }
 
-fn setup_refused() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete, Env.Exit, Env.Read, FS.Read, FS.Write, IO {
+fn setup_refused() ! FS.Delete, Env.Exit, Env.Read, FS.Read, FS.Write, IO {
     diag_reset()
     compile_expecting("cg_eff_with_resource_refused_probe", refused_probe_src(), "NonHandlerWithItem")
 }
@@ -162,100 +162,118 @@ fn item(binder: Str) -> Int ! IO.Print {
 }
 
 test "a type that implements no protocol is a plain binding that runs nothing" {
-    setup_refused()
-    diag_reset()
-    let rc = cg_eff_resource_cleanup(item("plain"))
-    assert(rc.protocol == CleanupProtocol.Plain)
-    assert_eq(rc.impl_block, -1)
-    assert_eq(cg_ice_count(), 0)
+    with handler Diag {} {
+        setup_refused()
+        diag_reset()
+        let rc = cg_eff_resource_cleanup(item("plain"))
+        assert(rc.protocol == CleanupProtocol.Plain)
+        assert_eq(rc.impl_block, -1)
+        assert_eq(cg_ice_count(), 0)
+    }
 }
 
 // A generic type's instance shares its declaration with every other instance, and no impl
 // claims it, so this is the plain answer reached the long way: through the impl scan.
 test "an instance of a generic type with no impl is a plain binding" {
-    setup_refused()
-    diag_reset()
-    let rc = cg_eff_resource_cleanup(item("boxed"))
-    assert(rc.protocol == CleanupProtocol.Plain)
-    assert_eq(rc.impl_block, -1)
-    assert_eq(cg_ice_count(), 0)
+    with handler Diag {} {
+        setup_refused()
+        diag_reset()
+        let rc = cg_eff_resource_cleanup(item("boxed"))
+        assert(rc.protocol == CleanupProtocol.Plain)
+        assert_eq(rc.impl_block, -1)
+        assert_eq(cg_ice_count(), 0)
+    }
 }
 
 test "a Closeable struct takes the block handler protocol through the impl the parser writes" {
-    setup()
-    diag_reset()
-    let bh = find_impl("Logged", "BlockHandler", "")
-    assert(bh >= 0)
-    assert_eq(cg_eff_block_handler_impl(node_value(item("logged"))), bh)
-    assert_eq(cg_ice_count(), 0)
+    with handler Diag {} {
+        setup()
+        diag_reset()
+        let bh = find_impl("Logged", "BlockHandler", "")
+        assert(bh >= 0)
+        assert_eq(cg_eff_block_handler_impl(node_value(item("logged"))), bh)
+        assert_eq(cg_ice_count(), 0)
+    }
 }
 
 // An enum carries a declaration an impl block can be written for, exactly as a struct
 // does, so the protocol cannot be keyed on structs alone.
 test "a Closeable enum takes the block handler protocol through the impl the parser writes" {
-    setup()
-    diag_reset()
-    let bh = find_impl("Latch", "BlockHandler", "")
-    assert(bh >= 0)
-    assert_eq(cg_eff_block_handler_impl(node_value(item("latch"))), bh)
-    assert_eq(cg_ice_count(), 0)
+    with handler Diag {} {
+        setup()
+        diag_reset()
+        let bh = find_impl("Latch", "BlockHandler", "")
+        assert(bh >= 0)
+        assert_eq(cg_eff_block_handler_impl(node_value(item("latch"))), bh)
+        assert_eq(cg_ice_count(), 0)
+    }
 }
 
 // The binder of a BlockHandler resource holds the handler's Context, which for this probe
 // is `Int`. Reading the binder's type instead of the resource's would answer a plain
 // binding and never run exit(), so the seam takes the item and reads the resource itself.
 test "a BlockHandler resource takes the enter and exit protocol, not its Context's answer" {
-    setup()
-    diag_reset()
-    let rc = cg_eff_resource_cleanup(item("guarded"))
-    assert(rc.protocol == CleanupProtocol.BlockHandler)
-    assert_eq(rc.impl_block, find_impl("Guarded", "BlockHandler", ""))
+    with handler Diag {} {
+        setup()
+        diag_reset()
+        let rc = cg_eff_resource_cleanup(item("guarded"))
+        assert(rc.protocol == CleanupProtocol.BlockHandler)
+        assert_eq(rc.impl_block, find_impl("Guarded", "BlockHandler", ""))
+    }
 }
 
 // The with stage asks this of every item's expression before choosing a path, so an FFI
 // scope answering an impl here would lose its own cleanup.
 test "a BlockHandler item's expression answers its impl, and a resource's answers none" {
-    setup()
-    diag_reset()
-    let bh = find_impl("Guarded", "BlockHandler", "")
-    assert_eq(cg_eff_block_handler_impl(node_value(item("guarded"))), bh)
-    assert_eq(cg_eff_block_handler_impl(node_value(item("scope"))), -1)
-    assert_eq(cg_ice_count(), 0)
+    with handler Diag {} {
+        setup()
+        diag_reset()
+        let bh = find_impl("Guarded", "BlockHandler", "")
+        assert_eq(cg_eff_block_handler_impl(node_value(item("guarded"))), bh)
+        assert_eq(cg_eff_block_handler_impl(node_value(item("scope"))), -1)
+        assert_eq(cg_ice_count(), 0)
+    }
 }
 
 test "a BlockHandler's calls name its exit method and type its Context from enter" {
-    setup()
-    diag_reset()
-    let bh = find_impl("Guarded", "BlockHandler", "")
-    let expr = node_value(item("guarded"))
-    let calls = cg_eff_block_handler_calls(bh, tid_of_node(expr), item("guarded"))
-    assert_eq(calls.impl_block, bh)
-    assert_eq(calls.exit_symbol, c_impl_method_name(bh, "exit"))
-    assert_eq(calls.context_tid, TYPE_INT)
-    assert_eq(cg_ice_count(), 0)
+    with handler Diag {} {
+        setup()
+        diag_reset()
+        let bh = find_impl("Guarded", "BlockHandler", "")
+        let expr = node_value(item("guarded"))
+        let calls = cg_eff_block_handler_calls(bh, tid_of_node(expr), item("guarded"))
+        assert_eq(calls.impl_block, bh)
+        assert_eq(calls.exit_symbol, c_impl_method_name(bh, "exit"))
+        assert_eq(calls.context_tid, TYPE_INT)
+        assert_eq(cg_ice_count(), 0)
+    }
 }
 
 test "an FFI scope resource takes the scope protocol, not a plain binding" {
-    setup()
-    diag_reset()
-    let rc = cg_eff_resource_cleanup(item("scope"))
-    assert(rc.protocol == CleanupProtocol.FfiScope)
-    assert_eq(rc.impl_block, -1)
+    with handler Diag {} {
+        setup()
+        diag_reset()
+        let rc = cg_eff_resource_cleanup(item("scope"))
+        assert(rc.protocol == CleanupProtocol.FfiScope)
+        assert_eq(rc.impl_block, -1)
+    }
 }
 
 // A BlockHandler reaching this seam means the with stage failed to route it. It travels
 // with its impl block and one internal error, rather than degrading to a plain binding
 // that would never run exit().
 test "a BlockHandler resource reports exactly one internal error, naming what is missing" {
-    setup()
-    diag_reset()
-    let rc = cg_eff_resource_cleanup(item("guarded"))
-    assert(rc.protocol == CleanupProtocol.BlockHandler)
-    assert_eq(rc.exit_symbol, "")
-    if cg_ice_count() != 1 {
-        io.println("FAIL: guarded: {cg_ice_count()} internal errors, want 1")
+    with handler Diag {} {
+        setup()
+        diag_reset()
+        let rc = cg_eff_resource_cleanup(item("guarded"))
+        assert(rc.protocol == CleanupProtocol.BlockHandler)
+        assert_eq(rc.exit_symbol, "")
+        if cg_ice_count() != 1 {
+            io.println("FAIL: guarded: {cg_ice_count()} internal errors, want 1")
+        }
+        assert_eq(cg_ice_count(), 1)
     }
-    assert_eq(cg_ice_count(), 1)
 }
 
 // A Closeable's exit is the exit method of the impl the parser writes, and its Context is
@@ -263,57 +281,67 @@ test "a BlockHandler resource reports exactly one internal error, naming what is
 // different declaration shapes. The expected symbol is built by the producer the
 // definition is spelled with, never written out, so a rename moves both.
 test "a Closeable struct names the impl's exit symbol and takes itself as Context" {
-    setup()
-    diag_reset()
-    let bh = find_impl("Logged", "BlockHandler", "")
-    let expr = node_value(item("logged"))
-    let calls = cg_eff_block_handler_calls(bh, tid_of_node(expr), item("logged"))
-    assert_eq(calls.exit_symbol, c_impl_method_name(bh, "exit"))
-    assert_eq(calls.context_tid, tid_of_node(expr))
-    assert_eq(cg_ice_count(), 0)
+    with handler Diag {} {
+        setup()
+        diag_reset()
+        let bh = find_impl("Logged", "BlockHandler", "")
+        let expr = node_value(item("logged"))
+        let calls = cg_eff_block_handler_calls(bh, tid_of_node(expr), item("logged"))
+        assert_eq(calls.exit_symbol, c_impl_method_name(bh, "exit"))
+        assert_eq(calls.context_tid, tid_of_node(expr))
+        assert_eq(cg_ice_count(), 0)
+    }
 }
 
 test "a Closeable enum names the impl's exit symbol and takes itself as Context" {
-    setup()
-    diag_reset()
-    let bh = find_impl("Latch", "BlockHandler", "")
-    let expr = node_value(item("latch"))
-    let calls = cg_eff_block_handler_calls(bh, tid_of_node(expr), item("latch"))
-    assert_eq(calls.exit_symbol, c_impl_method_name(bh, "exit"))
-    assert_eq(calls.context_tid, tid_of_node(expr))
-    assert_eq(cg_ice_count(), 0)
+    with handler Diag {} {
+        setup()
+        diag_reset()
+        let bh = find_impl("Latch", "BlockHandler", "")
+        let expr = node_value(item("latch"))
+        let calls = cg_eff_block_handler_calls(bh, tid_of_node(expr), item("latch"))
+        assert_eq(calls.exit_symbol, c_impl_method_name(bh, "exit"))
+        assert_eq(calls.context_tid, tid_of_node(expr))
+        assert_eq(cg_ice_count(), 0)
+    }
 }
 
 // FfiScope is the one protocol here with a runner of its own: the runtime's
 // blink_ffi_scope_cleanup, so it reports no internal error.
 test "an FFI scope resource reports no internal error" {
-    setup()
-    diag_reset()
-    let rc = cg_eff_resource_cleanup(item("scope"))
-    assert_eq(rc.protocol, CleanupProtocol.FfiScope)
-    assert_eq(rc.exit_symbol, "blink_ffi_scope_cleanup")
-    assert_eq(cg_ice_count(), 0)
+    with handler Diag {} {
+        setup()
+        diag_reset()
+        let rc = cg_eff_resource_cleanup(item("scope"))
+        assert_eq(rc.protocol, CleanupProtocol.FfiScope)
+        assert_eq(rc.exit_symbol, "blink_ffi_scope_cleanup")
+        assert_eq(cg_ice_count(), 0)
+    }
 }
 
 // An unsubstituted binder cannot be asked which protocol it takes. Answering Plain would
 // leave a scoped value never exited with nothing said about it.
 test "an unsubstituted typevar resource is an internal error, not a plain binding" {
-    setup_refused()
-    diag_reset()
-    let rc = cg_eff_resource_cleanup(item("unsubstituted"))
-    assert(rc.protocol == CleanupProtocol.Plain)
-    assert(cg_ices_mentioning("unsubstituted") > 0)
+    with handler Diag {} {
+        setup_refused()
+        diag_reset()
+        let rc = cg_eff_resource_cleanup(item("unsubstituted"))
+        assert(rc.protocol == CleanupProtocol.Plain)
+        assert(cg_ices_mentioning("unsubstituted") > 0)
+    }
 }
 
 // The seam reads the resource expression off the item it is given, so a node that is not
 // a with-resource has no resource to read. It reports rather than answering the plain
 // binding, which would drop a cleanup that a real resource needed.
 test "a node that is not a with-resource item is an internal error, not a plain binding" {
-    setup()
-    diag_reset()
-    let rc = cg_eff_resource_cleanup(find_decl(NodeKind.WithBlock, "", ""))
-    assert(rc.protocol == CleanupProtocol.Plain)
-    assert(cg_ice_count() > 0)
+    with handler Diag {} {
+        setup()
+        diag_reset()
+        let rc = cg_eff_resource_cleanup(find_decl(NodeKind.WithBlock, "", ""))
+        assert(rc.protocol == CleanupProtocol.Plain)
+        assert(cg_ice_count() > 0)
+    }
 }
 
 // A receiver written with type arguments matches the generic's declaration, so the
@@ -323,29 +351,33 @@ test "a node that is not a with-resource item is an internal error, not a plain 
 // one an instance BlockHandler impl gets. E0908 rejects the shape at typecheck today, so the
 // probe is compiled on its own with that error expected.
 test "a Closeable impl written for one instance of a generic type is reported, not matched" {
-    diag_reset()
-    compile_expecting("cg_eff_generic_recv_probe", illegal_probe_src(), "PolyImplUnsupported")
-    let what = "one instance of a generic type"
-    for binder in ["ai", "bs"] {
+    with handler Diag {} {
         diag_reset()
-        assert_eq(cg_eff_block_handler_impl(node_value(item(binder))), -2)
-        if cg_ices_mentioning(what) != 1 {
-            io.println("FAIL: {binder}: {cg_ices_mentioning(what)} internal errors")
+        compile_expecting("cg_eff_generic_recv_probe", illegal_probe_src(), "PolyImplUnsupported")
+        let what = "one instance of a generic type"
+        for binder in ["ai", "bs"] {
+            diag_reset()
+            assert_eq(cg_eff_block_handler_impl(node_value(item(binder))), -2)
+            if cg_ices_mentioning(what) != 1 {
+                io.println("FAIL: {binder}: {cg_ices_mentioning(what)} internal errors")
+            }
+            assert_eq(cg_ices_mentioning(what), 1)
         }
-        assert_eq(cg_ices_mentioning(what), 1)
     }
 }
 
 test "a BlockHandler impl written for one instance of a generic type is reported, not matched" {
-    diag_reset()
-    compile_expecting("cg_eff_instance_bh_probe", instance_block_handler_src(), "PolyImplUnsupported")
-    let what = "one instance of a generic type"
-    for binder in ["ai", "bs"] {
+    with handler Diag {} {
         diag_reset()
-        assert_eq(cg_eff_block_handler_impl(node_value(item(binder))), -2)
-        if cg_ices_mentioning(what) != 1 {
-            io.println("FAIL: {binder}: {cg_ices_mentioning(what)} internal errors")
+        compile_expecting("cg_eff_instance_bh_probe", instance_block_handler_src(), "PolyImplUnsupported")
+        let what = "one instance of a generic type"
+        for binder in ["ai", "bs"] {
+            diag_reset()
+            assert_eq(cg_eff_block_handler_impl(node_value(item(binder))), -2)
+            if cg_ices_mentioning(what) != 1 {
+                io.println("FAIL: {binder}: {cg_ices_mentioning(what)} internal errors")
+            }
+            assert_eq(cg_ices_mentioning(what), 1)
         }
-        assert_eq(cg_ices_mentioning(what), 1)
     }
 }

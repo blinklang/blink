@@ -6,7 +6,8 @@ import cname.{cname_reset}
 import cg_print.{print_reset, print_take}
 import cg_reg.{cg_reg_reset, cg_reg_build}
 import cg_decl.{cg_decl_reset, cg_decl_emit_fn_decls}
-import cg.{CgConfig, generate}
+import cg.{CgConfig, generate, Codegen}
+import diagnostics.{Diag}
 
 fn assert_eq_int(label: Str, got: Int, want: Int) ! IO.Print {
     if got != want {
@@ -29,7 +30,7 @@ fn assert_lacks(text: Str, needle: Str) ! IO.Print {
     assert(!text.contains(needle))
 }
 
-fn build_probe(src: Str, name: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete, Env.Exit, Env.Read, FS.Read, FS.Write, IO {
+fn build_probe(src: Str, name: Str) -> Int ! FS.Delete, Env.Exit, Env.Read, FS.Read, FS.Write, IO {
     let path = "build/{name}.bl"
     let program = cg_probe_compile(path, src)
     layout_reset()
@@ -64,13 +65,15 @@ fn standalone_cfg() -> CgConfig {
 // signature, so spelling the base would ask the reading layer for the C type of a free
 // type variable and get a decline it must report as a compiler bug.
 test "a generic function base gets no C declaration" {
-    let _ = build_probe(generic_src(), "cg_decl_generic_base_probe")
-    cg_decl_emit_fn_decls()
-    let text = print_take()
-    assert_eq_int("the probe's own declarations report no stage",
-        cg_probe_ices_named("CodegenStageNotBuilt"), 0)
-    assert_has(text, "blink_2plain")
-    assert_lacks(text, "blink_2ident")
+    with handler Diag {} {
+        let _ = build_probe(generic_src(), "cg_decl_generic_base_probe")
+        cg_decl_emit_fn_decls()
+        let text = print_take()
+        assert_eq_int("the probe's own declarations report no stage",
+            cg_probe_ices_named("CodegenStageNotBuilt"), 0)
+        assert_has(text, "blink_2plain")
+        assert_lacks(text, "blink_2ident")
+    }
 }
 
 // A test block is a function body, and the entry shim of a unit that has one calls a
@@ -78,10 +81,12 @@ test "a generic function base gets no C declaration" {
 // the entry. A unit that emitted the bodies and left the entry out links against a name
 // nothing defines, so the two are proved together.
 test "a unit with test blocks defines the runner its entry shim calls" {
-    let program = build_probe(test_block_src(), "cg_decl_test_block_probe")
-    let text = generate(program, standalone_cfg())
-    assert_has(text, "static void __blink_run_tests(int argc, const char** argv)")
-    assert_has(text, "__blink_run_tests(argc, (const char**)argv)")
-    assert_eq_int("the test-body stage is built",
-        cg_probe_ices_naming("cg test bodies"), 0)
+    with handler Codegen {}, handler Diag {} {
+        let program = build_probe(test_block_src(), "cg_decl_test_block_probe")
+        let text = generate(program, standalone_cfg())
+        assert_has(text, "static void __blink_run_tests(int argc, const char** argv)")
+        assert_has(text, "__blink_run_tests(argc, (const char**)argv)")
+        assert_eq_int("the test-body stage is built",
+            cg_probe_ices_naming("cg test bodies"), 0)
+    }
 }

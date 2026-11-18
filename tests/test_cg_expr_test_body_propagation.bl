@@ -13,9 +13,10 @@ import std.fs
 import std.io
 import layout.{layout_reset}
 import cname.{cname_reset, c_str_const, c_test_propagate_name}
-import cg.{CgConfig, generate}
+import cg.{CgConfig, generate, Codegen}
 import cg_test_helpers.{cg_probe_compile, cg_probe_ices_named, cg_text_occurrences}
 import mono.{run_mono}
+import diagnostics.{Diag}
 
 fn assert_eq_int(label: Str, got: Int, want: Int) ! IO.Print {
     if got != want {
@@ -38,14 +39,16 @@ fn assert_lacks(text: Str, needle: Str) ! IO.Print {
     assert(!text.contains(needle))
 }
 
-fn build_probe(src: Str, name: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete, Env.Exit, Env.Read, FS.Read, FS.Write, IO {
-    let path = "build/{name}.bl"
-    let program = cg_probe_compile(path, src)
-    run_mono(program)
-    layout_reset()
-    cname_reset()
-    let _ = fs.delete(path)
-    program
+fn build_probe(src: Str, name: Str) -> Int ! FS.Delete, Env.Exit, Env.Read, FS.Read, FS.Write, IO {
+    with handler Diag {} {
+        let path = "build/{name}.bl"
+        let program = cg_probe_compile(path, src)
+        run_mono(program)
+        layout_reset()
+        cname_reset()
+        let _ = fs.delete(path)
+        program
+    }
 }
 
 // The symbol the emitted call must name, read from the one producer of it rather than
@@ -222,104 +225,126 @@ test "the runtime declares the function the producer names" {
 }
 
 test "a Str error in a test body passes the err binder to the runtime" {
-    let program = build_probe(str_error_src(), "cg_try_test_str")
-    let text = generate(program, standalone_cfg())
-    assert_eq_int("no ? refused for want of a return type",
-        cg_probe_ices_named("TryWithoutReturnType"), 0)
-    assert_has(text, propagate_call())
-    assert_has(text, ".err, ".concat(c_str_const("Str")).concat(", ")
-        .concat(c_str_const("build/cg_try_test_str.bl")).concat(", 6, 13);"))
-    assert_eq_int("one propagation call",
-        cg_text_occurrences(text, propagate_call()), 1)
+    with handler Codegen {}, handler Diag {} {
+        let program = build_probe(str_error_src(), "cg_try_test_str")
+        let text = generate(program, standalone_cfg())
+        assert_eq_int("no ? refused for want of a return type",
+            cg_probe_ices_named("TryWithoutReturnType"), 0)
+        assert_has(text, propagate_call())
+        assert_has(text, ".err, ".concat(c_str_const("Str")).concat(", ")
+            .concat(c_str_const("build/cg_try_test_str.bl")).concat(", 6, 13);"))
+        assert_eq_int("one propagation call",
+            cg_text_occurrences(text, propagate_call()), 1)
+    }
 }
 
 test "a Str error's propagation is followed by a bare return" {
-    let program = build_probe(str_error_src(), "cg_try_test_str_return")
-    let text = generate(program, standalone_cfg())
-    // The bare return is what runs the cleanup destructors of in-scope `with` bindings.
-    assert_has(text, c_str_const("build/cg_try_test_str_return.bl").concat(", 6, 13);\n        return;"))
+    with handler Codegen {}, handler Diag {} {
+        let program = build_probe(str_error_src(), "cg_try_test_str_return")
+        let text = generate(program, standalone_cfg())
+        // The bare return is what runs the cleanup destructors of in-scope `with` bindings.
+        assert_has(text, c_str_const("build/cg_try_test_str_return.bl").concat(", 6, 13);\n        return;"))
+    }
 }
 
 test "a test body's propagation builds no carrier to return" {
-    let program = build_probe(str_error_src(), "cg_try_test_str_no_carrier")
-    let text = generate(program, standalone_cfg())
-    // The other arm reads the enclosing return type to build the carrier it returns. A test
-    // body has no return type, so that arm refuses by this name. Silence proves the arm was
-    // never entered, which a check for the absence of a returned carrier cannot prove: the
-    // binder is minted and its spelling is not fixed here.
-    assert_eq_int("the carrier arm was not entered",
-        cg_probe_ices_named("TryResultInNonResultFn"), 0)
-    assert_has(text, propagate_call())
+    with handler Codegen {}, handler Diag {} {
+        let program = build_probe(str_error_src(), "cg_try_test_str_no_carrier")
+        let text = generate(program, standalone_cfg())
+        // The other arm reads the enclosing return type to build the carrier it returns. A test
+        // body has no return type, so that arm refuses by this name. Silence proves the arm was
+        // never entered, which a check for the absence of a returned carrier cannot prove: the
+        // binder is minted and its spelling is not fixed here.
+        assert_eq_int("the carrier arm was not entered",
+            cg_probe_ices_named("TryResultInNonResultFn"), 0)
+        assert_has(text, propagate_call())
+    }
 }
 
 test "an Option in a test body propagates the fixed None message" {
-    let program = build_probe(option_src(), "cg_try_test_option")
-    let text = generate(program, standalone_cfg())
-    assert_eq_int("no ? refused for want of a return type",
-        cg_probe_ices_named("TryWithoutReturnType"), 0)
-    assert_has(text, propagate_call().concat(c_str_const("None")).concat(", ")
-        .concat(c_str_const("Option")).concat(", ")
-        .concat(c_str_const("build/cg_try_test_option.bl")).concat(", 10, 13);"))
+    with handler Codegen {}, handler Diag {} {
+        let program = build_probe(option_src(), "cg_try_test_option")
+        let text = generate(program, standalone_cfg())
+        assert_eq_int("no ? refused for want of a return type",
+            cg_probe_ices_named("TryWithoutReturnType"), 0)
+        assert_has(text, propagate_call().concat(c_str_const("None")).concat(", ")
+            .concat(c_str_const("Option")).concat(", ")
+            .concat(c_str_const("build/cg_try_test_option.bl")).concat(", 10, 13);"))
+    }
 }
 
 test "an Option in a test body asks its inner type for no Display" {
-    let program = build_probe(option_src(), "cg_try_test_option_display")
-    let _ = generate(program, standalone_cfg())
-    // Row carries no Display impl. The Option arm must never reach the lookup.
-    assert_eq_int("no Display impl was looked for",
-        cg_probe_ices_named("DisplayImplNotFound"), 0)
+    with handler Codegen {}, handler Diag {} {
+        let program = build_probe(option_src(), "cg_try_test_option_display")
+        let _ = generate(program, standalone_cfg())
+        // Row carries no Display impl. The Option arm must never reach the lookup.
+        assert_eq_int("no Display impl was looked for",
+            cg_probe_ices_named("DisplayImplNotFound"), 0)
+    }
 }
 
 test "a struct error in a test body renders through its Display impl" {
-    let program = build_probe(display_error_src(), "cg_try_test_display")
-    let text = generate(program, standalone_cfg())
-    assert_eq_int("no ? refused for want of a return type",
-        cg_probe_ices_named("TryWithoutReturnType"), 0)
-    assert_has(text, "{propagate_call()}blink_6Boom_Display_display(")
-    assert_has(text, ", ".concat(c_str_const("Boom")).concat(", ")
-        .concat(c_str_const("build/cg_try_test_display.bl")).concat(", 16, 13);"))
+    with handler Codegen {}, handler Diag {} {
+        let program = build_probe(display_error_src(), "cg_try_test_display")
+        let text = generate(program, standalone_cfg())
+        assert_eq_int("no ? refused for want of a return type",
+            cg_probe_ices_named("TryWithoutReturnType"), 0)
+        assert_has(text, "{propagate_call()}blink_6Boom_Display_display(")
+        assert_has(text, ", ".concat(c_str_const("Boom")).concat(", ")
+            .concat(c_str_const("build/cg_try_test_display.bl")).concat(", 16, 13);"))
+    }
 }
 
 test "a function body's ? still returns the carrier it declares" {
-    let program = build_probe(plain_fn_src(), "cg_try_fn_body")
-    let text = generate(program, standalone_cfg())
-    assert_eq_int("no ? refused for want of a return type",
-        cg_probe_ices_named("TryWithoutReturnType"), 0)
-    assert_eq_int("the runtime is not called out of a function body",
-        cg_text_occurrences(text, propagate_call()), 0)
+    with handler Codegen {}, handler Diag {} {
+        let program = build_probe(plain_fn_src(), "cg_try_fn_body")
+        let text = generate(program, standalone_cfg())
+        assert_eq_int("no ? refused for want of a return type",
+            cg_probe_ices_named("TryWithoutReturnType"), 0)
+        assert_eq_int("the runtime is not called out of a function body",
+            cg_text_occurrences(text, propagate_call()), 0)
+    }
 }
 
 test "a closure inside a test body propagates on its own account" {
-    let program = build_probe(closure_in_test_src(), "cg_try_closure_in_test")
-    let text = generate(program, standalone_cfg())
-    assert_eq_int("no ? refused for want of a return type",
-        cg_probe_ices_named("TryWithoutReturnType"), 0)
-    assert_eq_int("the thunk returns its own None, it does not call the runtime",
-        cg_text_occurrences(text, propagate_call()), 0)
+    with handler Codegen {}, handler Diag {} {
+        let program = build_probe(closure_in_test_src(), "cg_try_closure_in_test")
+        let text = generate(program, standalone_cfg())
+        assert_eq_int("no ? refused for want of a return type",
+            cg_probe_ices_named("TryWithoutReturnType"), 0)
+        assert_eq_int("the thunk returns its own None, it does not call the runtime",
+            cg_text_occurrences(text, propagate_call()), 0)
+    }
 }
 
 test "a scalar error in a test body is refused for want of a rendering" {
-    let program = build_probe(scalar_error_src(), "cg_try_test_scalar")
-    let _ = generate(program, standalone_cfg())
-    // An Int error is neither the text itself nor a type that can render itself, so the
-    // Display route refuses it rather than printing a placeholder.
-    assert_eq_int("the missing Display impl is reported once",
-        cg_probe_ices_named("DisplayImplNotFound"), 1)
+    with handler Codegen {}, handler Diag {} {
+        let program = build_probe(scalar_error_src(), "cg_try_test_scalar")
+        let _ = generate(program, standalone_cfg())
+        // An Int error is neither the text itself nor a type that can render itself, so the
+        // Display route refuses it rather than printing a placeholder.
+        assert_eq_int("the missing Display impl is reported once",
+            cg_probe_ices_named("DisplayImplNotFound"), 1)
+    }
 }
 
 test "a ? written after a closure in the same test body still propagates" {
-    let program = build_probe(closure_then_try_src(), "cg_try_closure_then_try")
-    let text = generate(program, standalone_cfg())
-    assert_eq_int("no ? refused for want of a return type",
-        cg_probe_ices_named("TryWithoutReturnType"), 0)
-    // The closure's own `?` returns its carrier; only the body's `?` calls the runtime.
-    assert_eq_int("the body's ? calls the runtime and the closure's does not",
-        cg_text_occurrences(text, propagate_call()), 1)
+    with handler Codegen {}, handler Diag {} {
+        let program = build_probe(closure_then_try_src(), "cg_try_closure_then_try")
+        let text = generate(program, standalone_cfg())
+        assert_eq_int("no ? refused for want of a return type",
+            cg_probe_ices_named("TryWithoutReturnType"), 0)
+        // The closure's own `?` returns its carrier; only the body's `?` calls the runtime.
+        assert_eq_int("the body's ? calls the runtime and the closure's does not",
+            cg_text_occurrences(text, propagate_call()), 1)
+    }
 }
 
 test "the test-body mode is cleared between two bodies" {
-    let program = build_probe(two_bodies_src(), "cg_try_two_bodies")
-    let text = generate(program, standalone_cfg())
-    assert_eq_int("only the body that wrote a ? calls the runtime",
-        cg_text_occurrences(text, propagate_call()), 1)
+    with handler Codegen {}, handler Diag {} {
+        let program = build_probe(two_bodies_src(), "cg_try_two_bodies")
+        let text = generate(program, standalone_cfg())
+        assert_eq_int("only the body that wrote a ? calls the runtime",
+            cg_text_occurrences(text, propagate_call()), 1)
+    }
 }

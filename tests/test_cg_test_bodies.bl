@@ -10,8 +10,8 @@ import cname.{cname_reset, c_test_fn_name}
 import parser.{node_str_val}
 import cg_test_helpers.{cg_probe_compile, cg_probe_ices_naming, cg_probe_ices_saying,
     cg_text_occurrences}
-import diagnostics.{CODEGEN_STAGE_NOT_BUILT_NAME}
-import cg.{CgConfig, generate, generate_module_object}
+import diagnostics.{CODEGEN_STAGE_NOT_BUILT_NAME, Diag}
+import cg.{CgConfig, generate, generate_module_object, Codegen}
 import cg_expr.{cg_expr_pending_count}
 import cg_reg.{cg_reg_test_decls}
 import mono.{run_mono}
@@ -39,14 +39,16 @@ fn assert_lacks(text: Str, needle: Str) ! IO.Print {
 
 // The same order the real drivers use. The mono pass is not part of generate, so a probe
 // that skips it has no instance table and a generic base looks like a base with no uses.
-fn build_probe(src: Str, name: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete, Env.Exit, Env.Read, FS.Read, FS.Write, IO {
-    let path = "build/{name}.bl"
-    let program = cg_probe_compile(path, src)
-    run_mono(program)
-    layout_reset()
-    cname_reset()
-    let _ = fs.delete(path)
-    program
+fn build_probe(src: Str, name: Str) -> Int ! FS.Delete, Env.Exit, Env.Read, FS.Read, FS.Write, IO {
+    with handler Diag {} {
+        let path = "build/{name}.bl"
+        let program = cg_probe_compile(path, src)
+        run_mono(program)
+        layout_reset()
+        cname_reset()
+        let _ = fs.delete(path)
+        program
+    }
 }
 
 fn standalone_cfg() -> CgConfig {
@@ -85,13 +87,15 @@ test "keeps one binding" {
 }
 
 test "a test block is emitted as a body" {
-    let program = build_probe(one_test_src(), "cg_test_one_probe")
-    let text = generate(program, standalone_cfg())
-    let sym = symbol_of("keeps one binding")
-    assert_eq_int("the body is written once", definitions_of(text, sym), 1)
-    assert_has(text, "static void {sym}(void) \{")
-    assert_eq_int("a body that reaches no unbuilt stage reports none",
-        cg_probe_ices_naming("is not built"), 0)
+    with handler Codegen {}, handler Diag {} {
+        let program = build_probe(one_test_src(), "cg_test_one_probe")
+        let text = generate(program, standalone_cfg())
+        let sym = symbol_of("keeps one binding")
+        assert_eq_int("the body is written once", definitions_of(text, sym), 1)
+        assert_has(text, "static void {sym}(void) \{")
+        assert_eq_int("a body that reaches no unbuilt stage reports none",
+            cg_probe_ices_naming("is not built"), 0)
+    }
 }
 
 fn two_tests_src() -> Str {
@@ -108,26 +112,30 @@ test "second" {
 }
 
 test "two test blocks are emitted under two distinct symbols" {
-    let program = build_probe(two_tests_src(), "cg_test_two_probe")
-    let text = generate(program, standalone_cfg())
-    let first = symbol_of("first")
-    let second = symbol_of("second")
-    assert(first != second)
-    assert_eq_int("the first body is written once", definitions_of(text, first), 1)
-    assert_eq_int("the second body is written once", definitions_of(text, second), 1)
+    with handler Codegen {}, handler Diag {} {
+        let program = build_probe(two_tests_src(), "cg_test_two_probe")
+        let text = generate(program, standalone_cfg())
+        let first = symbol_of("first")
+        let second = symbol_of("second")
+        assert(first != second)
+        assert_eq_int("the first body is written once", definitions_of(text, first), 1)
+        assert_eq_int("the second body is written once", definitions_of(text, second), 1)
+    }
 }
 
 // The runner is the contract with the runtime: the shim calls __blink_run_tests, and the
 // runtime's blink_test_run reads a table of blink_test_entry. A unit that writes the
 // bodies and not the table links against a runner that does not exist.
 test "the table and the runner entry the runtime reads are emitted beside the bodies" {
-    let program = build_probe(two_tests_src(), "cg_test_table_probe")
-    let text = generate(program, standalone_cfg())
-    assert_has(text, "static const blink_test_entry __blink_tests[] = \{")
-    assert_has(text, "static void __blink_run_tests(int argc, const char** argv) \{")
-    assert_has(text, "blink_test_run(__blink_tests, 2, argc, argv);")
-    assert_has(text, #""first""#)
-    assert_has(text, #""second""#)
+    with handler Codegen {}, handler Diag {} {
+        let program = build_probe(two_tests_src(), "cg_test_table_probe")
+        let text = generate(program, standalone_cfg())
+        assert_has(text, "static const blink_test_entry __blink_tests[] = \{")
+        assert_has(text, "static void __blink_run_tests(int argc, const char** argv) \{")
+        assert_has(text, "blink_test_run(__blink_tests, 2, argc, argv);")
+        assert_has(text, #""first""#)
+        assert_has(text, #""second""#)
+    }
 }
 
 // Every name a filter or a tag selector matches is the test's own string, and the xfail
@@ -148,14 +156,16 @@ test.failing("known to fail", reason: "the shape is not built") {
 }
 
 test "a test row carries the tags and the expected-failure reason the runner prints" {
-    let program = build_probe(tagged_src(), "cg_test_tags_probe")
-    let text = generate(program, standalone_cfg())
-    let tagged = symbol_of("carries its tags")
-    assert_has(text, "static const char* {tagged}_tags[] = \{\"slow\", \"net\"};")
-    assert_has(text, "{tagged}_tags, 2, 0, NULL}")
-    // The flag, not just the sentence: it is what inverts the runner's verdict, so a row
-    // that carried the reason and a zero would read as an ordinary failing test.
-    assert_has(text, "NULL, 0, 1, \"the shape is not built\"}")
+    with handler Codegen {}, handler Diag {} {
+        let program = build_probe(tagged_src(), "cg_test_tags_probe")
+        let text = generate(program, standalone_cfg())
+        let tagged = symbol_of("carries its tags")
+        assert_has(text, "static const char* {tagged}_tags[] = \{\"slow\", \"net\"};")
+        assert_has(text, "{tagged}_tags, 2, 0, NULL}")
+        // The flag, not just the sentence: it is what inverts the runner's verdict, so a row
+        // that carried the reason and a zero would read as an ordinary failing test.
+        assert_has(text, "NULL, 0, 1, \"the shape is not built\"}")
+    }
 }
 
 // A test body is lowered through the same statement and expression producers a function
@@ -176,13 +186,15 @@ test "builds a call the stage now lowers" {
 }
 
 test "a test body whose statement now builds is refused zero times and leaves no pending statement" {
-    let program = build_probe(unbuilt_src(), "cg_test_unbuilt_probe")
-    let _text = generate(program, standalone_cfg())
-    assert_eq_int("the stage that used to refuse this call now builds it, zero times refused",
-        cg_probe_ices_saying(CODEGEN_STAGE_NOT_BUILT_NAME,
-            "cg_call closure values and compiler-provided calls"), 0)
-    assert_eq_int("and the pending buffer is left empty",
-        cg_expr_pending_count(), 0)
+    with handler Codegen {}, handler Diag {} {
+        let program = build_probe(unbuilt_src(), "cg_test_unbuilt_probe")
+        let _text = generate(program, standalone_cfg())
+        assert_eq_int("the stage that used to refuse this call now builds it, zero times refused",
+            cg_probe_ices_saying(CODEGEN_STAGE_NOT_BUILT_NAME,
+                "cg_call closure values and compiler-provided calls"), 0)
+        assert_eq_int("and the pending buffer is left empty",
+            cg_expr_pending_count(), 0)
+    }
 }
 
 // The per-module mode cuts one program into one C file per module, and the entry module's
@@ -190,13 +202,15 @@ test "a test body whose statement now builds is refused zero times and leaves no
 // the table it reads belong in that same file: a static the shim's own translation unit
 // does not define is a name the linker cannot resolve.
 test "the per-module entry unit carries the runner its own shim calls" {
-    let program = build_probe(two_tests_src(), "cg_test_permodule_probe")
-    let text = generate_module_object(program, "__main__", "mod___main__.h", standalone_cfg())
-    assert_has(text, "static void __blink_run_tests(int argc, const char** argv) \{")
-    assert_has(text, "blink_test_run(__blink_tests, 2, argc, argv);")
-    assert_has(text, "__blink_run_tests(argc, (const char**)argv)")
-    assert_eq_int("and the first body is written once beside it",
-        definitions_of(text, symbol_of("first")), 1)
+    with handler Codegen {}, handler Diag {} {
+        let program = build_probe(two_tests_src(), "cg_test_permodule_probe")
+        let text = generate_module_object(program, "__main__", "mod___main__.h", standalone_cfg())
+        assert_has(text, "static void __blink_run_tests(int argc, const char** argv) \{")
+        assert_has(text, "blink_test_run(__blink_tests, 2, argc, argv);")
+        assert_has(text, "__blink_run_tests(argc, (const char**)argv)")
+        assert_eq_int("and the first body is written once beside it",
+            definitions_of(text, symbol_of("first")), 1)
+    }
 }
 
 // A tag is written either quoted or bare, and the runner matches a selector against
@@ -213,25 +227,28 @@ test "carries a bare tag" {
 }
 
 test "a tag written without quotes reaches the row" {
-    let program = build_probe(bare_tag_src(), "cg_test_bare_tag_probe")
-    let text = generate(program, standalone_cfg())
-    let tagged = symbol_of("carries a bare tag")
-    assert_has(text, "static const char* {tagged}_tags[] = \{\"unit\"};")
-    assert_has(text, "{tagged}_tags, 1, 0, NULL}")
+    with handler Codegen {}, handler Diag {} {
+        let program = build_probe(bare_tag_src(), "cg_test_bare_tag_probe")
+        let text = generate(program, standalone_cfg())
+        let tagged = symbol_of("carries a bare tag")
+        assert_has(text, "static const char* {tagged}_tags[] = \{\"unit\"};")
+        assert_has(text, "{tagged}_tags, 1, 0, NULL}")
+    }
 }
 
 // A module that is not the entry module gets no shim, so it must get no table and no test
 // body either. Both are file-static and the table holds the address of every body, so a
 // copy in a second unit is either a runner nothing calls or a body the entry unit's table
 // cannot name.
-fn two_module_probe(stem: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Env.Exit, Env.Read, FS.Read, FS.Write, IO, Process.Spawn {
-    let root = "build/{stem}_pkg"
-    let _clean = process.run("rm", ["-rf", root]).unwrap()
-    let _mk = process.run("mkdir", ["-p", "{root}/src"]).unwrap()
-    fs.write("{root}/blink.toml", "[package]\nname = \"{stem}\"\nversion = \"0.1.0\"\n").unwrap()
-    fs.write("{root}/src/mymod.bl", #"pub fn helper(x: Int) -> Int { x }
+fn two_module_probe(stem: Str) -> Int ! Env.Exit, Env.Read, FS.Read, FS.Write, IO, Process.Spawn {
+    with handler Diag {} {
+        let root = "build/{stem}_pkg"
+        let _clean = process.run("rm", ["-rf", root]).unwrap()
+        let _mk = process.run("mkdir", ["-p", "{root}/src"]).unwrap()
+        fs.write("{root}/blink.toml", "[package]\nname = \"{stem}\"\nversion = \"0.1.0\"\n").unwrap()
+        fs.write("{root}/src/mymod.bl", #"pub fn helper(x: Int) -> Int { x }
 "#).unwrap()
-    let program = cg_probe_compile("{root}/src/probe.bl", #"import mymod.{helper}
+        let program = cg_probe_compile("{root}/src/probe.bl", #"import mymod.{helper}
 
 fn main() { let _x = helper(1) }
 
@@ -239,21 +256,24 @@ test "first" {
     let a = 1
 }
 "#)
-    run_mono(program)
-    layout_reset()
-    cname_reset()
-    let _rm = process.run("rm", ["-rf", root]).unwrap()
-    program
+        run_mono(program)
+        layout_reset()
+        cname_reset()
+        let _rm = process.run("rm", ["-rf", root]).unwrap()
+        program
+    }
 }
 
 test "a module that gets no shim gets no test table and no test body" {
-    let program = two_module_probe("cg_test_other_mod")
-    let other = generate_module_object(program, "mymod", "mymod.h", standalone_cfg())
-    assert_lacks(other, "__blink_tests")
-    assert_lacks(other, "__blink_run_tests")
-    assert_lacks(other, "static void blink_test__")
-    let entry = generate_module_object(program, "__main__", "mod___main__.h", standalone_cfg())
-    assert_has(entry, "blink_test_run(__blink_tests, 1, argc, argv);")
+    with handler Codegen {}, handler Diag {} {
+        let program = two_module_probe("cg_test_other_mod")
+        let other = generate_module_object(program, "mymod", "mymod.h", standalone_cfg())
+        assert_lacks(other, "__blink_tests")
+        assert_lacks(other, "__blink_run_tests")
+        assert_lacks(other, "static void blink_test__")
+        let entry = generate_module_object(program, "__main__", "mod___main__.h", standalone_cfg())
+        assert_has(entry, "blink_test_run(__blink_tests, 1, argc, argv);")
+    }
 }
 
 // The shape `blink test` links: a file of test blocks and no main. The shim then calls the
@@ -267,12 +287,14 @@ fn no_main_src() -> Str {
 }
 
 test "a file of tests and no main still gets the runner the shim calls" {
-    let program = build_probe(no_main_src(), "cg_test_no_main_probe")
-    let text = generate(program, standalone_cfg())
-    assert_has(text, "blink_test_run(__blink_tests, 1, argc, argv);")
-    assert_has(text, "__blink_run_tests(argc, (const char**)argv);")
-    assert_eq_int("the body is written once",
-        definitions_of(text, symbol_of("stands alone")), 1)
+    with handler Codegen {}, handler Diag {} {
+        let program = build_probe(no_main_src(), "cg_test_no_main_probe")
+        let text = generate(program, standalone_cfg())
+        assert_has(text, "blink_test_run(__blink_tests, 1, argc, argv);")
+        assert_has(text, "__blink_run_tests(argc, (const char**)argv);")
+        assert_eq_int("the body is written once",
+            definitions_of(text, symbol_of("stands alone")), 1)
+    }
 }
 
 // The runtime's header spells `blink_test_run` and `blink_test_entry`. A test named after
@@ -292,10 +314,12 @@ test "entry" {
 }
 
 test "a test named after the runtime's own function gets a different C name" {
-    let program = build_probe(runner_name_src(), "cg_test_runner_name_probe")
-    let text = generate(program, standalone_cfg())
-    assert(symbol_of("run") != "blink_test_run")
-    assert(symbol_of("entry") != "blink_test_entry")
-    assert_eq_int("the runner is still called once, under its own name",
-        cg_text_occurrences(text, "blink_test_run(__blink_tests"), 1)
+    with handler Codegen {}, handler Diag {} {
+        let program = build_probe(runner_name_src(), "cg_test_runner_name_probe")
+        let text = generate(program, standalone_cfg())
+        assert(symbol_of("run") != "blink_test_run")
+        assert(symbol_of("entry") != "blink_test_entry")
+        assert_eq_int("the runner is still called once, under its own name",
+            cg_text_occurrences(text, "blink_test_run(__blink_tests"), 1)
+    }
 }

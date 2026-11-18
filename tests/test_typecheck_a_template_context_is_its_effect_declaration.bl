@@ -6,9 +6,11 @@
 import std.fs
 import std.process.{ProcessResult}
 import compiler.{compile_to_program, check_unused_imports}
-import typecheck.{check_types}
-import diagnostics.{diag_entries, diag_reset}
+import typecheck.{check_types, TypeCheck}
+import diagnostics.{diag_entries, diag_reset, Diag}
 import embedded_stdlib_registry.{init_embedded_stdlib}
+import lexer.{Lex}
+import parser.{Parse}
 
 fn sh(cmd: Str) -> ProcessResult ! Process.Spawn {
     process.run("sh", ["-c", cmd]).unwrap()
@@ -18,26 +20,28 @@ let LIB: Str = "pub effect Log \{ }\n\npub effect Q \{ }\n\neffect Secret \{ }\n
 
 // Only src/main.bl's reports, and only errors, internal errors and unused imports, so a row
 // reads as the one diagnostic it pins. Each is "code name line:col: message".
-fn main_reports(main_src: Str) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Process.Spawn, Env.Exit, Env.Read, IO {
-    init_embedded_stdlib()
-    let dir = sh("mktemp -d /tmp/blink_template_context.XXXXXX").out.trim()
-    let _ = sh("mkdir -p {dir}/src")
-    fs.write("{dir}/blink.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\n").unwrap()
-    fs.write("{dir}/src/lib.bl", LIB).unwrap()
-    let main_path = "{dir}/src/main.bl"
-    fs.write(main_path, main_src).unwrap()
-    diag_reset()
-    let program = compile_to_program(main_path, 1)
-    check_types(program)
-    check_unused_imports()
-    let mut out = ""
-    for d in diag_entries {
-        if d.file == main_path && (d.severity == "error" || d.severity == "ice" || d.name == "UnusedImport") {
-            out = out.concat("{d.code} {d.name} {d.line}:{d.col}: {d.message}\n")
+fn main_reports(main_src: Str) -> Str ! FS, Process.Spawn, Env.Exit, Env.Read, IO {
+    with handler Diag {}, handler Lex {}, handler Parse {}, handler TypeCheck {} {
+        init_embedded_stdlib()
+        let dir = sh("mktemp -d /tmp/blink_template_context.XXXXXX").out.trim()
+        let _ = sh("mkdir -p {dir}/src")
+        fs.write("{dir}/blink.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\n").unwrap()
+        fs.write("{dir}/src/lib.bl", LIB).unwrap()
+        let main_path = "{dir}/src/main.bl"
+        fs.write(main_path, main_src).unwrap()
+        diag_reset()
+        let program = compile_to_program(main_path, 1)
+        check_types(program)
+        check_unused_imports()
+        let mut out = ""
+        for d in diag_entries {
+            if d.file == main_path && (d.severity == "error" || d.severity == "ice" || d.name == "UnusedImport") {
+                out = out.concat("{d.code} {d.name} {d.line}:{d.col}: {d.message}\n")
+            }
         }
+        let _ = sh("rm -rf {dir}")
+        out
     }
-    let _ = sh("rm -rf {dir}")
-    out
 }
 
 test "a template of one effect context passed where another is expected is a type error" {

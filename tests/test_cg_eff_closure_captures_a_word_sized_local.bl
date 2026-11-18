@@ -38,7 +38,7 @@ import cg_eff.{
     cg_eff_scan_shared_binders, cg_eff_thunk_body_node, cg_eff_thunk_close, cg_eff_thunk_open,
     cg_eff_thunks_drained,
 }
-import diagnostics.{diag_entries, diag_reset}
+import diagnostics.{diag_entries, diag_reset, Diag}
 import std.fs
 import std.io
 
@@ -161,7 +161,7 @@ fn report_ices(label: Str) ! IO.Eprint {
     }
 }
 
-fn setup() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete, Env.Exit, Env.Read, FS.Read, FS.Write, IO {
+fn setup() ! FS.Delete, Env.Exit, Env.Read, FS.Read, FS.Write, IO {
     diag_reset()
     ir_reset()
     layout_reset()
@@ -193,31 +193,37 @@ fn closure_of(let_name: Str) -> Int ! IO.Print {
 // Lowers one closure with `names` bound at `tid` in an enclosing frame, which is what
 // makes a name a capture rather than a module-level name the thunk reaches on its own.
 // The names bind immutable, because a binder whose mutability is not recorded is refused.
-fn lower_capturing(let_name: Str, names: List[Str], tid: Int) -> Int ! Diag.Report, IO.Print {
-    let outer = binder_scope_push()
-    for nm in names { bind_binder_mut(outer, nm, tid, false) }
-    let v = cg_eff_lower_closure(closure_of(let_name))
-    binder_scope_pop()
-    v
+fn lower_capturing(let_name: Str, names: List[Str], tid: Int) -> Int ! IO.Print {
+    with handler Diag {} {
+        let outer = binder_scope_push()
+        for nm in names { bind_binder_mut(outer, nm, tid, false) }
+        let v = cg_eff_lower_closure(closure_of(let_name))
+        binder_scope_pop()
+        v
+    }
 }
 
 // Lowers a whole function body through the statement stage, which is the only way the
 // binders a capture resolves against are recorded by the code that actually binds them.
 // The trailing call in each probe body is a closure call no stage builds yet, so a body
 // lowered this way reports that; these cases measure the capture, not the total.
-fn lower_body_of(fn_name: Str) -> Int ! Diag.Report, IO.Print {
-    let f = find_decl(NodeKind.FnDef, fn_name, "")
-    cg_eff_scan_shared_binders(f)
-    lower_block_returning(node_body(f))
+fn lower_body_of(fn_name: Str) -> Int ! IO.Print {
+    with handler Diag {} {
+        let f = find_decl(NodeKind.FnDef, fn_name, "")
+        cg_eff_scan_shared_binders(f)
+        lower_block_returning(node_body(f))
+    }
 }
 
 // Lowers a whole function through the driver's own lower_fn, which binds the function's
 // own parameters before the body lowers. lower_body_of skips straight to the body, which
 // is fine for the no-param probes above but leaves a parameter of the function itself
 // unbound -- this is the path a capture of one actually resolves against.
-fn lower_whole_fn(fn_name: Str) -> Int ! Diag.Report, IO.Print {
-    let f = find_decl(NodeKind.FnDef, fn_name, "")
-    lower_fn(f)
+fn lower_whole_fn(fn_name: Str) -> Int ! IO.Print {
+    with handler Diag {} {
+        let f = find_decl(NodeKind.FnDef, fn_name, "")
+        lower_fn(f)
+    }
 }
 
 test "a closure reading an immutable Int local answers a record instead of refusing" {
@@ -253,20 +259,22 @@ test "a capture list names its descriptor table and no per-closure promoter" {
 }
 
 test "the thunk body binds the captured name, so a read inside resolves without the enclosing frame" {
-    // The thunk is a separate C function. The enclosing function's local is not in scope
-    // there, so unless the prologue binds the name the body lowers a read of an identifier
-    // the thunk never declares.
-    setup()
-    let v = lower_capturing("g_int", ["n"], TYPE_INT)
-    assert(v >= 0)
-    assert_eq(cg_eff_pending_thunks(), 1)
-    assert(cg_eff_thunk_open(0) >= 0)
-    let body = lower_block_returning(cg_eff_thunk_body_node(0))
-    cg_eff_thunk_close()
-    if body < 0 || ices() != 0 { report_ices("the thunk body did not lower") }
-    assert(body >= 0)
-    assert_eq(ir_verify(body).len(), 0)
-    assert_eq(ices(), 0)
+    with handler Diag {} {
+        // The thunk is a separate C function. The enclosing function's local is not in scope
+        // there, so unless the prologue binds the name the body lowers a read of an identifier
+        // the thunk never declares.
+        setup()
+        let v = lower_capturing("g_int", ["n"], TYPE_INT)
+        assert(v >= 0)
+        assert_eq(cg_eff_pending_thunks(), 1)
+        assert(cg_eff_thunk_open(0) >= 0)
+        let body = lower_block_returning(cg_eff_thunk_body_node(0))
+        cg_eff_thunk_close()
+        if body < 0 || ices() != 0 { report_ices("the thunk body did not lower") }
+        assert(body >= 0)
+        assert_eq(ir_verify(body).len(), 0)
+        assert_eq(ices(), 0)
+    }
 }
 
 test "two reads of one captured name take one capture word" {
@@ -297,44 +305,48 @@ test "a pointer-shaped capture rides the slot without an integer pun" {
 }
 
 test "a capture of an outer closure's own parameter builds a copy, not a refusal" {
-    // The inner closure captures the outer thunk's parameter. A parameter cannot be
-    // reassigned, so bind_params records it immutable at the bind site, and the capture
-    // is an ordinary one: it builds and reads a copy, the same as any other capture.
-    setup()
-    let v = lower_capturing("g_outer", [], TYPE_INT)
-    assert(v >= 0)
-    assert_eq(cg_eff_pending_thunks(), 1)
-    assert(cg_eff_thunk_open(0) >= 0)
-    let body = lower_block_returning(cg_eff_thunk_body_node(0))
-    cg_eff_thunk_close()
-    if body < 0 || ices() != 0 { report_ices("g_outer's body did not lower") }
-    assert(body >= 0)
-    assert_eq(ices(), 0)
-    // The inner closure's own capture of `x` queued a second thunk.
-    assert_eq(cg_eff_pending_thunks(), 2)
-    print_reset()
-    assert(cg_eff_thunk_open(1) >= 0)
-    let inner_body = lower_block_returning(cg_eff_thunk_body_node(1))
-    cg_eff_thunk_close()
-    assert(inner_body >= 0)
-    cg_eff_print_thunk(1, inner_body)
-    let text = print_take()
-    if ices() != 0 { report_ices("inner's thunk did not print") }
-    assert_eq(ices(), 0)
-    assert(cg_text_occurrences(text, "blink_closure_get_capture") == 1)
+    with handler Diag {} {
+        // The inner closure captures the outer thunk's parameter. A parameter cannot be
+        // reassigned, so bind_params records it immutable at the bind site, and the capture
+        // is an ordinary one: it builds and reads a copy, the same as any other capture.
+        setup()
+        let v = lower_capturing("g_outer", [], TYPE_INT)
+        assert(v >= 0)
+        assert_eq(cg_eff_pending_thunks(), 1)
+        assert(cg_eff_thunk_open(0) >= 0)
+        let body = lower_block_returning(cg_eff_thunk_body_node(0))
+        cg_eff_thunk_close()
+        if body < 0 || ices() != 0 { report_ices("g_outer's body did not lower") }
+        assert(body >= 0)
+        assert_eq(ices(), 0)
+        // The inner closure's own capture of `x` queued a second thunk.
+        assert_eq(cg_eff_pending_thunks(), 2)
+        print_reset()
+        assert(cg_eff_thunk_open(1) >= 0)
+        let inner_body = lower_block_returning(cg_eff_thunk_body_node(1))
+        cg_eff_thunk_close()
+        assert(inner_body >= 0)
+        cg_eff_print_thunk(1, inner_body)
+        let text = print_take()
+        if ices() != 0 { report_ices("inner's thunk did not print") }
+        assert_eq(ices(), 0)
+        assert(cg_text_occurrences(text, "blink_closure_get_capture") == 1)
+    }
 }
 
 test "the queue still drains to zero once a captured closure is printed" {
-    setup()
-    let v = lower_capturing("g_int", ["n"], TYPE_INT)
-    assert(v >= 0)
-    assert(cg_eff_thunk_open(0) >= 0)
-    let body = lower_block_returning(cg_eff_thunk_body_node(0))
-    cg_eff_thunk_close()
-    cg_eff_print_thunk(0, body)
-    cg_eff_thunks_drained(1)
-    assert_eq(cg_eff_pending_thunks(), 0)
-    assert_eq(ices(), 0)
+    with handler Diag {} {
+        setup()
+        let v = lower_capturing("g_int", ["n"], TYPE_INT)
+        assert(v >= 0)
+        assert(cg_eff_thunk_open(0) >= 0)
+        let body = lower_block_returning(cg_eff_thunk_body_node(0))
+        cg_eff_thunk_close()
+        cg_eff_print_thunk(0, body)
+        cg_eff_thunks_drained(1)
+        assert_eq(cg_eff_pending_thunks(), 0)
+        assert_eq(ices(), 0)
+    }
 }
 
 test "a closure with no captures still answers no capture words and no descriptor table" {
@@ -364,21 +376,23 @@ test "a capture that does not fit the word rides a heap copy of the value" {
 }
 
 test "the thunk reads a boxed capture back through the pointer, not as the pointer" {
-    // The prologue binds the captured name at the value's own type. A prologue that bound
-    // the address instead would compile and then read a pointer as a Float.
-    setup()
-    print_reset()
-    let v = lower_capturing("g_float", ["f"], TYPE_FLOAT)
-    assert(v >= 0)
-    assert(cg_eff_thunk_open(0) >= 0)
-    let body = lower_block_returning(cg_eff_thunk_body_node(0))
-    cg_eff_thunk_close()
-    assert(body >= 0)
-    cg_eff_print_thunk(0, body)
-    let text = print_take()
-    if ices() != 0 { report_ices("the boxed thunk did not print") }
-    assert_eq(ices(), 0)
-    assert(cg_text_occurrences(text, "double b_f = (*(") == 1)
+    with handler Diag {} {
+        // The prologue binds the captured name at the value's own type. A prologue that bound
+        // the address instead would compile and then read a pointer as a Float.
+        setup()
+        print_reset()
+        let v = lower_capturing("g_float", ["f"], TYPE_FLOAT)
+        assert(v >= 0)
+        assert(cg_eff_thunk_open(0) >= 0)
+        let body = lower_block_returning(cg_eff_thunk_body_node(0))
+        cg_eff_thunk_close()
+        assert(body >= 0)
+        cg_eff_print_thunk(0, body)
+        let text = print_take()
+        if ices() != 0 { report_ices("the boxed thunk did not print") }
+        assert_eq(ices(), 0)
+        assert(cg_text_occurrences(text, "double b_f = (*(") == 1)
+    }
 }
 
 test "an oversized binding the enclosing function can assign builds through its cell, not a box" {
@@ -420,21 +434,23 @@ test "a let records its own mutability, so a mut capture builds through a cell j
 }
 
 test "a mut param a closure captures builds through a cell, not a silent copy" {
-    // A `mut self` writer of a builtin value changes the parameter in place, and a copy
-    // taken by the closure would miss that write, so the parameter gets the cell a shared
-    // `let mut` gets. The cell starts from the C parameter, and the closure's capture
-    // word is the cell.
-    setup()
-    let body = lower_whole_fn("capture_mut_param")
-    if body < 0 || ices() != 0 { report_ices("capture_mut_param was refused") }
-    assert(body >= 0)
-    assert_eq(ices_mentioning("`p`"), 0)
-    assert_eq(ices_mentioning("shared"), 0)
-    assert_eq(cg_eff_pending_thunks(), 1)
-    print_reset()
-    print_block_body(body)
-    let text = print_take()
-    assert(cg_text_occurrences(text, "int64_t* {c_cell_name(c_local_name("p"))} =") == 1)
+    with handler Diag {} {
+        // A `mut self` writer of a builtin value changes the parameter in place, and a copy
+        // taken by the closure would miss that write, so the parameter gets the cell a shared
+        // `let mut` gets. The cell starts from the C parameter, and the closure's capture
+        // word is the cell.
+        setup()
+        let body = lower_whole_fn("capture_mut_param")
+        if body < 0 || ices() != 0 { report_ices("capture_mut_param was refused") }
+        assert(body >= 0)
+        assert_eq(ices_mentioning("`p`"), 0)
+        assert_eq(ices_mentioning("shared"), 0)
+        assert_eq(cg_eff_pending_thunks(), 1)
+        print_reset()
+        print_block_body(body)
+        let text = print_take()
+        assert(cg_text_occurrences(text, "int64_t* {c_cell_name(c_local_name("p"))} =") == 1)
+    }
 }
 
 test "a mutable tuple-destructure leaf builds through a cell just like a plain mut local" {

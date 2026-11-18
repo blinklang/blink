@@ -22,7 +22,7 @@ import cg_reg.{cg_reg_build}
 import cg_expr.{cg_expr_reset}
 import cg_stmt.{cg_stmt_reset}
 import cg_eff.{cg_eff_lower_handler_install, cg_eff_reset}
-import diagnostics.{diag_reset}
+import diagnostics.{diag_reset, Diag}
 import std.fs
 import std.io
 
@@ -78,7 +78,7 @@ fn main() {
 
 // The registry, the IR table and the diagnostics list are process globals, so each test
 // compiles the probe for itself.
-fn setup() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete, Env.Exit, Env.Read, FS.Read, FS.Write, IO {
+fn setup() ! FS.Delete, Env.Exit, Env.Read, FS.Read, FS.Write, IO {
     diag_reset()
     ir_reset()
     layout_reset()
@@ -113,15 +113,19 @@ fn with_item_of(fn_name: Str) -> Int ! IO.Print {
 
 // A stand-in for the lowered handler value and the lowered body: the install carries
 // them and reads nothing off them.
-fn handler_stand_in(item: Int) -> Int ! Diag.Report {
-    ir_const(tid_of_node(item), item, "void*", "0")
+fn handler_stand_in(item: Int) -> Int {
+    with handler Diag {} {
+        ir_const(tid_of_node(item), item, "void*", "0")
+    }
 }
 
 fn body_stand_in(item: Int) -> Int { ir_block(item, []) }
 
-fn install_of(fn_name: Str) -> Int ! Diag.Report, IO.Print {
-    let item = with_item_of(fn_name)
-    cg_eff_lower_handler_install(item, handler_stand_in(item), body_stand_in(item))
+fn install_of(fn_name: Str) -> Int ! IO.Print {
+    with handler Diag {} {
+        let item = with_item_of(fn_name)
+        cg_eff_lower_handler_install(item, handler_stand_in(item), body_stand_in(item))
+    }
 }
 
 test "an inline handler for a builtin root installs into that root's field" {
@@ -151,56 +155,66 @@ test "a user effect handler installs behind the user prefix" {
 }
 
 test "the install carries the handler value first and the body second" {
-    setup()
-    let item = with_item_of("builtin_root")
-    let hv = handler_stand_in(item)
-    let body = body_stand_in(item)
-    let inst = cg_eff_lower_handler_install(item, hv, body)
-    assert_eq(cg_ice_count(), 0)
-    assert_eq(ir_kid_count(inst), 2)
-    assert_eq(ir_kid(inst, 0), hv)
-    assert_eq(ir_kid(inst, 1), body)
+    with handler Diag {} {
+        setup()
+        let item = with_item_of("builtin_root")
+        let hv = handler_stand_in(item)
+        let body = body_stand_in(item)
+        let inst = cg_eff_lower_handler_install(item, hv, body)
+        assert_eq(cg_ice_count(), 0)
+        assert_eq(ir_kid_count(inst), 2)
+        assert_eq(ir_kid(inst, 0), hv)
+        assert_eq(ir_kid(inst, 1), body)
+    }
 }
 
 test "the install is a well-formed statement inside a block" {
-    setup()
-    let item = with_item_of("user_effect")
-    let inst = cg_eff_lower_handler_install(item, handler_stand_in(item), body_stand_in(item))
-    let problems = ir_verify(ir_block(item, [inst]))
-    for p in problems { io.println("  verify: {p}") }
-    assert_eq(problems.len(), 0)
+    with handler Diag {} {
+        setup()
+        let item = with_item_of("user_effect")
+        let inst = cg_eff_lower_handler_install(item, handler_stand_in(item), body_stand_in(item))
+        let problems = ir_verify(ir_block(item, [inst]))
+        for p in problems { io.println("  verify: {p}") }
+        assert_eq(problems.len(), 0)
+    }
 }
 
 test "a with-item whose type is not a handler is a compiler error, not a guessed field" {
-    setup()
-    let binding = find_decl(NodeKind.LetBinding, "n", "")
-    let item = node_value(binding)
-    assert_eq(tid_of_node(item), TYPE_INT)
-    let inst = cg_eff_lower_handler_install(item, ir_const(TYPE_INT, item, "int64_t", "5"), body_stand_in(item))
-    assert_eq(inst, -1)
-    assert_eq(cg_ice_count(), 1)
-    assert_eq(cg_ices_named("WithItemNotAHandler"), 1)
+    with handler Diag {} {
+        setup()
+        let binding = find_decl(NodeKind.LetBinding, "n", "")
+        let item = node_value(binding)
+        assert_eq(tid_of_node(item), TYPE_INT)
+        let inst = cg_eff_lower_handler_install(item, ir_const(TYPE_INT, item, "int64_t", "5"), body_stand_in(item))
+        assert_eq(inst, -1)
+        assert_eq(cg_ice_count(), 1)
+        assert_eq(cg_ices_named("WithItemNotAHandler"), 1)
+    }
 }
 
 // `with arena` is typed as a handler like its siblings, but Arena is a marker effect with no
 // effect vector field: cg_stmt routes it to a scope before any install is asked for. An
 // install asked for anyway must fail loudly, since the field it would write does not exist.
 test "a handler type whose effect owns no field is a compiler error, not a guessed field" {
-    setup()
-    let item = with_item_of("arena_marker")
-    let inst = cg_eff_lower_handler_install(item, handler_stand_in(item), body_stand_in(item))
-    cg_report_ices("the install reported")
-    assert_eq(inst, -1)
-    assert_eq(cg_ice_count(), 1)
-    assert_eq(cg_ices_named("EffectSlotUnnamed"), 1)
+    with handler Diag {} {
+        setup()
+        let item = with_item_of("arena_marker")
+        let inst = cg_eff_lower_handler_install(item, handler_stand_in(item), body_stand_in(item))
+        cg_report_ices("the install reported")
+        assert_eq(inst, -1)
+        assert_eq(cg_ice_count(), 1)
+        assert_eq(cg_ices_named("EffectSlotUnnamed"), 1)
+    }
 }
 
 // A caller that already recorded an error hands in -1; recording it again would make one
 // bug read as two.
 test "a poisoned handler value or body answers -1 without a second report" {
-    setup()
-    let item = with_item_of("builtin_root")
-    assert_eq(cg_eff_lower_handler_install(item, -1, body_stand_in(item)), -1)
-    assert_eq(cg_eff_lower_handler_install(item, handler_stand_in(item), -1), -1)
-    assert_eq(cg_ice_count(), 0)
+    with handler Diag {} {
+        setup()
+        let item = with_item_of("builtin_root")
+        assert_eq(cg_eff_lower_handler_install(item, -1, body_stand_in(item)), -1)
+        assert_eq(cg_eff_lower_handler_install(item, handler_stand_in(item), -1), -1)
+        assert_eq(cg_ice_count(), 0)
+    }
 }

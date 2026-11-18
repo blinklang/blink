@@ -7,6 +7,7 @@ import cg_print.{print_reset, print_take}
 import cg_reg.{cg_reg_reset, cg_reg_build}
 import typecheck.{make_handler_type}
 import cg_decl.{cg_decl_reset, cg_decl_emit_prologue, cg_decl_emit_epilogue, cg_decl_emit_ev, cg_decl_emit_ev_owned_by_archive}
+import diagnostics.{Diag}
 
 fn assert_eq_int(label: Str, got: Int, want: Int) ! IO.Print {
     if got != want {
@@ -29,7 +30,7 @@ fn assert_lacks(text: Str, needle: Str) ! IO.Print {
     assert(!text.contains(needle))
 }
 
-fn build_probe(src: Str, name: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete, Env.Exit, Env.Read, FS.Read, FS.Write, IO {
+fn build_probe(src: Str, name: Str) -> Int ! FS.Delete, Env.Exit, Env.Read, FS.Read, FS.Write, IO {
     let path = "build/{name}.bl"
     let program = cg_probe_compile(path, src)
     layout_reset()
@@ -48,41 +49,49 @@ fn plain_src() -> Str {
 
 // A standalone unit owns the runtime outright.
 test "a standalone unit includes the runtime header and no archive header" {
-    let _ = build_probe(plain_src(), "cg_decl_prologue_plain_probe")
-    cg_decl_emit_prologue(false, false, false, false, "", "", false)
-    let text = print_take()
-    assert_has(text, "#include \"runtime.h\"")
-    assert_lacks(text, "libblink_std.h")
-    assert_lacks(text, "BLINK_USE_EXTERN_RUNTIME_STORAGE")
+    with handler Diag {} {
+        let _ = build_probe(plain_src(), "cg_decl_prologue_plain_probe")
+        cg_decl_emit_prologue(false, false, false, false, "", "", false)
+        let text = print_take()
+        assert_has(text, "#include \"runtime.h\"")
+        assert_lacks(text, "libblink_std.h")
+        assert_lacks(text, "BLINK_USE_EXTERN_RUNTIME_STORAGE")
+    }
 }
 
 // User code linked against the archive shares the archive's runtime storage rather than
 // defining a second copy of it.
 test "a unit linked against the archive shares the archive storage" {
-    let _ = build_probe(plain_src(), "cg_decl_prologue_user_probe")
-    cg_decl_emit_prologue(true, false, false, false, "", "", false)
-    let text = print_take()
-    assert_has(text, "#include \"libblink_std.h\"")
-    assert_has(text, "#define BLINK_USE_EXTERN_RUNTIME_STORAGE 1")
-    assert_lacks(text, "#define BLINK_RUNTIME_STORAGE_DEFINE 1")
+    with handler Diag {} {
+        let _ = build_probe(plain_src(), "cg_decl_prologue_user_probe")
+        cg_decl_emit_prologue(true, false, false, false, "", "", false)
+        let text = print_take()
+        assert_has(text, "#include \"libblink_std.h\"")
+        assert_has(text, "#define BLINK_USE_EXTERN_RUNTIME_STORAGE 1")
+        assert_lacks(text, "#define BLINK_RUNTIME_STORAGE_DEFINE 1")
+    }
 }
 
 test "the archive itself defines the runtime storage" {
-    let _ = build_probe(plain_src(), "cg_decl_prologue_archive_probe")
-    cg_decl_emit_prologue(false, false, true, false, "", "", false)
-    let text = print_take()
-    assert_has(text, "#define BLINK_RUNTIME_STORAGE_DEFINE 1")
+    with handler Diag {} {
+        let _ = build_probe(plain_src(), "cg_decl_prologue_archive_probe")
+        cg_decl_emit_prologue(false, false, true, false, "", "", false)
+        let text = print_take()
+        assert_has(text, "#define BLINK_RUNTIME_STORAGE_DEFINE 1")
+    }
 }
 
 // A header is included more than once, so it carries an include guard.
 test "a header opens and closes its include guard" {
-    let _ = build_probe(plain_src(), "cg_decl_prologue_header_probe")
-    cg_decl_emit_prologue(false, false, false, false, "BLINK_STD_H", "", false)
-    cg_decl_emit_epilogue("BLINK_STD_H")
-    let text = print_take()
-    assert_has(text, "#ifndef BLINK_STD_H")
-    assert_has(text, "#define BLINK_STD_H")
-    assert_has(text, "#endif")
+    with handler Diag {} {
+        let _ = build_probe(plain_src(), "cg_decl_prologue_header_probe")
+        cg_decl_emit_prologue(false, false, false, false, "BLINK_STD_H", "", false)
+        cg_decl_emit_epilogue("BLINK_STD_H")
+        let text = print_take()
+        assert_has(text, "#ifndef BLINK_STD_H")
+        assert_has(text, "#define BLINK_STD_H")
+        assert_has(text, "#endif")
+    }
 }
 
 fn sqlite_src() -> Str {
@@ -98,50 +107,60 @@ fn main() {
 // gate, and the link line pulls in the vendored sqlite only when the unit defines it. The
 // runtime header reads it, so it must come before the include.
 test "a program that uses std.db_sqlite defines the sqlite gate before the runtime include" {
-    let _ = build_probe(sqlite_src(), "cg_decl_prologue_sqlite_probe")
-    cg_decl_emit_prologue(false, false, false, false, "", "", false)
-    let text = print_take()
-    let gate = text.byte_index_of("#define BLINK_USE_SQLITE 1\n", 0) ?? -1
-    assert_has(text, "#define BLINK_USE_SQLITE 1\n")
-    assert(gate < (text.byte_index_of("#include \"runtime.h\"", 0) ?? -1))
+    with handler Diag {} {
+        let _ = build_probe(sqlite_src(), "cg_decl_prologue_sqlite_probe")
+        cg_decl_emit_prologue(false, false, false, false, "", "", false)
+        let text = print_take()
+        let gate = text.byte_index_of("#define BLINK_USE_SQLITE 1\n", 0) ?? -1
+        assert_has(text, "#define BLINK_USE_SQLITE 1\n")
+        assert(gate < (text.byte_index_of("#include \"runtime.h\"", 0) ?? -1))
+    }
 }
 
 // Every unit of a program carries every typedef, and a sqlite handle is spelled `sqlite3*`
 // in them, so a header and a module object need the gate as much as the entry unit does.
 test "a header and a unit linked against the archive both define the sqlite gate" {
-    let _ = build_probe(sqlite_src(), "cg_decl_prologue_sqlite_header_probe")
-    cg_decl_emit_prologue(false, false, false, false, "BLINK_MOD_H", "", false)
-    let header = print_take()
-    assert((header.byte_index_of("#define BLINK_USE_SQLITE 1\n", 0) ?? -1) > (header.byte_index_of("#define BLINK_MOD_H", 0) ?? -1))
-    cg_decl_emit_prologue(true, false, false, false, "", "", false)
-    let user = print_take()
-    assert(user.contains("#define BLINK_USE_SQLITE 1\n"))
-    assert((user.byte_index_of("#define BLINK_USE_SQLITE 1\n", 0) ?? -1) < (user.byte_index_of("#include \"libblink_std.h\"", 0) ?? -1))
+    with handler Diag {} {
+        let _ = build_probe(sqlite_src(), "cg_decl_prologue_sqlite_header_probe")
+        cg_decl_emit_prologue(false, false, false, false, "BLINK_MOD_H", "", false)
+        let header = print_take()
+        assert((header.byte_index_of("#define BLINK_USE_SQLITE 1\n", 0) ?? -1) > (header.byte_index_of("#define BLINK_MOD_H", 0) ?? -1))
+        cg_decl_emit_prologue(true, false, false, false, "", "", false)
+        let user = print_take()
+        assert(user.contains("#define BLINK_USE_SQLITE 1\n"))
+        assert((user.byte_index_of("#define BLINK_USE_SQLITE 1\n", 0) ?? -1) < (user.byte_index_of("#include \"libblink_std.h\"", 0) ?? -1))
+    }
 }
 
 // No archive holds a native dep's shims, so one unit of the program defines them and the
 // rest read prototypes. The marker must come before the runtime include that reads it.
 test "a unit that is not the entry declares the sqlite shims and does not define them" {
-    let _ = build_probe(sqlite_src(), "cg_decl_prologue_sqlite_decls_probe")
-    cg_decl_emit_prologue(true, false, false, false, "", "mod.h", true)
-    let unit = print_take()
-    let marker = unit.byte_index_of("#define BLINK_NATIVE_SHIMS_DECLS_ONLY 1\n", 0) ?? -1
-    assert(marker >= 0)
-    assert(marker < (unit.byte_index_of("#include \"libblink_std.h\"", 0) ?? -1))
-    cg_decl_emit_prologue(true, false, false, false, "", "main.h", false)
-    assert_lacks(print_take(), "BLINK_NATIVE_SHIMS_DECLS_ONLY")
+    with handler Diag {} {
+        let _ = build_probe(sqlite_src(), "cg_decl_prologue_sqlite_decls_probe")
+        cg_decl_emit_prologue(true, false, false, false, "", "mod.h", true)
+        let unit = print_take()
+        let marker = unit.byte_index_of("#define BLINK_NATIVE_SHIMS_DECLS_ONLY 1\n", 0) ?? -1
+        assert(marker >= 0)
+        assert(marker < (unit.byte_index_of("#include \"libblink_std.h\"", 0) ?? -1))
+        cg_decl_emit_prologue(true, false, false, false, "", "main.h", false)
+        assert_lacks(print_take(), "BLINK_NATIVE_SHIMS_DECLS_ONLY")
+    }
 }
 
 test "a program with no native dep writes no shim marker" {
-    let _ = build_probe(plain_src(), "cg_decl_prologue_no_shims_probe")
-    cg_decl_emit_prologue(true, false, false, false, "", "mod.h", true)
-    assert_lacks(print_take(), "BLINK_NATIVE_SHIMS_DECLS_ONLY")
+    with handler Diag {} {
+        let _ = build_probe(plain_src(), "cg_decl_prologue_no_shims_probe")
+        cg_decl_emit_prologue(true, false, false, false, "", "mod.h", true)
+        assert_lacks(print_take(), "BLINK_NATIVE_SHIMS_DECLS_ONLY")
+    }
 }
 
 test "a program that does not use sqlite defines no sqlite gate" {
-    let _ = build_probe(plain_src(), "cg_decl_prologue_no_sqlite_probe")
-    cg_decl_emit_prologue(false, false, false, false, "", "", false)
-    assert_lacks(print_take(), "BLINK_USE_SQLITE")
+    with handler Diag {} {
+        let _ = build_probe(plain_src(), "cg_decl_prologue_no_sqlite_probe")
+        cg_decl_emit_prologue(false, false, false, false, "", "", false)
+        assert_lacks(print_take(), "BLINK_USE_SQLITE")
+    }
 }
 
 // The builtin roots in evidence-vector order. The archive ABI fixes it, so the test writes
@@ -158,30 +177,34 @@ fn builtin_field(root: Str) -> Str {
 // The archive is compiled against a shorter evidence vector than a user unit sees, so the
 // builtin fields must stay first and in this order forever.
 test "the evidence vector keeps the builtin fields first and in order" {
-    let _ = build_probe(plain_src(), "cg_decl_ev_probe")
-    cg_decl_emit_ev("")
-    let text = print_take()
-    assert_eq(c_builtin_effect_roots(), builtin_roots())
-    let mut prev = -1
-    for root in builtin_roots() {
-        let f = builtin_field(root)
-        let at = text.byte_index_of(f, 0) ?? -1
-        if at < 0 { io.println("FAIL: no field '{f}'\n--- output ---\n{text}") }
-        assert(at > prev)
-        prev = at
+    with handler Diag {} {
+        let _ = build_probe(plain_src(), "cg_decl_ev_probe")
+        cg_decl_emit_ev("")
+        let text = print_take()
+        assert_eq(c_builtin_effect_roots(), builtin_roots())
+        let mut prev = -1
+        for root in builtin_roots() {
+            let f = builtin_field(root)
+            let at = text.byte_index_of(f, 0) ?? -1
+            if at < 0 { io.println("FAIL: no field '{f}'\n--- output ---\n{text}") }
+            assert(at > prev)
+            prev = at
+        }
+        assert_has(text, "} {c_ev_type_name()};")
+        assert_has(text, "{c_ev_type_name()} blink_ev_default(void)")
     }
-    assert_has(text, "} {c_ev_type_name()};")
-    assert_has(text, "{c_ev_type_name()} blink_ev_default(void)")
 }
 
 // A unit that only refers to the vector declares it and defines no default, so the
 // program keeps exactly one definition.
 test "a referring unit declares the evidence vector extern" {
-    let _ = build_probe(plain_src(), "cg_decl_ev_extern_probe")
-    cg_decl_emit_ev("extern ")
-    let text = print_take()
-    assert_has(text, "extern {c_ev_type_name()} __blink_ev;")
-    assert_lacks(text, "blink_ev_default(void)")
+    with handler Diag {} {
+        let _ = build_probe(plain_src(), "cg_decl_ev_extern_probe")
+        cg_decl_emit_ev("extern ")
+        let text = print_take()
+        assert_has(text, "extern {c_ev_type_name()} __blink_ev;")
+        assert_lacks(text, "blink_ev_default(void)")
+    }
 }
 
 fn user_effect_src() -> Str {
@@ -197,10 +220,12 @@ fn main() { assert(true) }
 // A user effect adds a vtable and an evidence field, and this stage writes both. A vector
 // missing the field would miscompile every handler for that effect.
 test "a user-declared effect reports no unbuilt stage" {
-    let _ = build_probe(user_effect_src(), "cg_decl_ev_user_effect_probe")
-    cg_decl_emit_ev("")
-    assert_eq_int("the probe's own effect reports no unbuilt stage",
-        cg_probe_ices_named("CodegenStageNotBuilt"), 0)
+    with handler Diag {} {
+        let _ = build_probe(user_effect_src(), "cg_decl_ev_user_effect_probe")
+        cg_decl_emit_ev("")
+        assert_eq_int("the probe's own effect reports no unbuilt stage",
+            cg_probe_ices_named("CodegenStageNotBuilt"), 0)
+    }
 }
 
 // The slot a user effect owns. Both names come from cname, which is what the handler
@@ -211,45 +236,53 @@ fn logger_field() -> Str { c_ev_field_name(make_handler_type("Logger")) }
 // A handler install writes one field of the vector, so an effect with no field of its own
 // has nowhere to install to.
 test "a user-declared effect gets a field of its own in the evidence vector" {
-    let _ = build_probe(user_effect_src(), "cg_decl_ev_user_field_probe")
-    cg_decl_emit_ev("")
-    let text = print_take()
-    assert_has(text, "{logger_vtable()}* {logger_field()};")
+    with handler Diag {} {
+        let _ = build_probe(user_effect_src(), "cg_decl_ev_user_field_probe")
+        cg_decl_emit_ev("")
+        let text = print_take()
+        assert_has(text, "{logger_vtable()}* {logger_field()};")
+    }
 }
 
 // The archive is compiled against a vector that stops after the builtin fields, so a user
 // field that moved ahead of one of them would read the archive's slot as its own.
 test "a user field sits after every builtin field" {
-    let _ = build_probe(user_effect_src(), "cg_decl_ev_user_order_probe")
-    cg_decl_emit_ev("")
-    let text = print_take()
-    let at = text.byte_index_of("{logger_vtable()}* {logger_field()};", 0) ?? -1
-    assert(at >= 0)
-    for root in builtin_roots() {
-        let b = text.byte_index_of(builtin_field(root), 0) ?? -1
-        assert(b >= 0)
-        assert(b < at)
+    with handler Diag {} {
+        let _ = build_probe(user_effect_src(), "cg_decl_ev_user_order_probe")
+        cg_decl_emit_ev("")
+        let text = print_take()
+        let at = text.byte_index_of("{logger_vtable()}* {logger_field()};", 0) ?? -1
+        assert(at >= 0)
+        for root in builtin_roots() {
+            let b = text.byte_index_of(builtin_field(root), 0) ?? -1
+            assert(b >= 0)
+            assert(b < at)
+        }
     }
 }
 
 // Every field of the vector starts at its default, or an effect nobody handles is read
 // through a pointer the program never set.
 test "the default vector initializes the user field too" {
-    let _ = build_probe(user_effect_src(), "cg_decl_ev_user_default_probe")
-    cg_decl_emit_ev("")
-    let text = print_take()
-    assert_has(text, "ev.{logger_field()} = &{logger_vtable()}_default;")
+    with handler Diag {} {
+        let _ = build_probe(user_effect_src(), "cg_decl_ev_user_default_probe")
+        cg_decl_emit_ev("")
+        let text = print_take()
+        assert_has(text, "ev.{logger_field()} = &{logger_vtable()}_default;")
+    }
 }
 
 // A program that links the archive layered over the stdlib archive calls the archive's
 // default, so the archive defines it external, from the vtables its own bodies use.
 test "the layered archive defines the default vector external and the vector extern" {
-    let _ = build_probe(user_effect_src(), "cg_decl_ev_layered_default_probe")
-    cg_decl_emit_ev_owned_by_archive()
-    let text = print_take()
-    assert_has(text, "{logger_vtable()}* {logger_field()};")
-    assert_has(text, "\n{c_ev_type_name()} blink_ev_default(void)")
-    assert_lacks(text, "static {c_ev_type_name()} blink_ev_default")
-    assert_has(text, "ev.{logger_field()} = &{logger_vtable()}_default;")
-    assert_has(text, "extern {c_ev_type_name()} __blink_ev;")
+    with handler Diag {} {
+        let _ = build_probe(user_effect_src(), "cg_decl_ev_layered_default_probe")
+        cg_decl_emit_ev_owned_by_archive()
+        let text = print_take()
+        assert_has(text, "{logger_vtable()}* {logger_field()};")
+        assert_has(text, "\n{c_ev_type_name()} blink_ev_default(void)")
+        assert_lacks(text, "static {c_ev_type_name()} blink_ev_default")
+        assert_has(text, "ev.{logger_field()} = &{logger_vtable()}_default;")
+        assert_has(text, "extern {c_ev_type_name()} __blink_ev;")
+    }
 }

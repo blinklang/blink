@@ -9,27 +9,30 @@
 
 import std.fs
 import compiler.{compile_to_program}
-import typecheck.{check_types, tc_unresolved_call_count, tc_lookup_node_tid, tc_tid_is_concrete, tc_tid_resolved, tc_stamp_program, tc_stamp_name_child, tc_name_is_item, tc_name_is_item_in, TYPE_INT, TYPE_STR, TYPE_CHAR, TYPE_U8, TYPE_BOOL, TYPE_FLOAT}
-import parser.{node_count, node_push, node_pop, node_kind, node_name, node_method, node_value, node_body, node_condition, node_unclaimed_child_field, node_value_child_ids}
+import typecheck.{check_types, tc_unresolved_call_count, tc_lookup_node_tid, tc_tid_is_concrete, tc_tid_resolved, tc_stamp_program, tc_stamp_name_child, tc_name_is_item, tc_name_is_item_in, TYPE_INT, TYPE_STR, TYPE_CHAR, TYPE_U8, TYPE_BOOL, TYPE_FLOAT, TypeCheck}
+import parser.{node_count, node_push, node_pop, node_kind, node_name, node_method, node_value, node_body, node_condition, node_unclaimed_child_field, node_value_child_ids, Parse}
 import ast.{NodeKind, AstNode, nk_bridge_gap, nk_is_typed}
-import diagnostics.{diag_count, diag_ice_count, diag_reset, diag_entries, NO_SUCH_FIELD, UNRESOLVED_METHOD}
+import diagnostics.{diag_count, diag_ice_count, diag_reset, diag_entries, NO_SUCH_FIELD, UNRESOLVED_METHOD, Diag}
 import std.io
 import embedded_stdlib_registry.{init_embedded_stdlib}
+import lexer.{Lex}
 
-fn stamp_probe(path: Str, src: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
-    // The prelude imports std modules, and this binary is not the CLI: nothing has told the
-    // resolver where lib/std lives. Register the embedded copies, the same source the CLI
-    // compiles against, so the probe does not depend on where the test binary was built.
-    init_embedded_stdlib()
-    fs.write(path, src).unwrap()
-    diag_reset()
-    let program = compile_to_program(path, 1)
-    check_types(program)
-    let _ = fs.delete(path)
-    // The stamp claim rests on the enumerator seeing every child, so every probe below also
-    // asserts that no node in the program it compiled holds a child field the table omits.
-    assert(unclaimed_child_fields() == 0)
-    diag_count + diag_ice_count
+fn stamp_probe(path: Str, src: Str) -> Int ! FS, Env.Exit, Env.Read, IO {
+    with handler Diag {}, handler Lex {}, handler Parse {}, handler TypeCheck {} {
+        // The prelude imports std modules, and this binary is not the CLI: nothing has told the
+        // resolver where lib/std lives. Register the embedded copies, the same source the CLI
+        // compiles against, so the probe does not depend on where the test binary was built.
+        init_embedded_stdlib()
+        fs.write(path, src).unwrap()
+        diag_reset()
+        let program = compile_to_program(path, 1)
+        check_types(program)
+        let _ = fs.delete(path)
+        // The stamp claim rests on the enumerator seeing every child, so every probe below also
+        // asserts that no node in the program it compiled holds a child field the table omits.
+        assert(unclaimed_child_fields() == 0)
+        diag_count + diag_ice_count
+    }
 }
 
 // The code of the one error the last probe raised, or "" when it raised none or several, so a
@@ -480,14 +483,16 @@ test "the child enumerator table covers every NodeKind" {
 // with no type and handed to the pass as its own root, which is what a stamping hole looks
 // like from the pass's side: one internal error, and no ordinary error.
 test "a value node with no type is an internal compiler error" {
-    diag_reset()
-    let orphan = node_count()
-    node_push(AstNode { kind: NodeKind.IntLit, line: 1, col: 1 })
-    tc_stamp_program(orphan)
-    assert(diag_ice_count == 1)
-    assert(diag_count == 0)
-    // The arena is shared with every other row in this file, so the orphan comes back off it.
-    node_pop()
+    with handler Diag {}, handler TypeCheck {} {
+        diag_reset()
+        let orphan = node_count()
+        node_push(AstNode { kind: NodeKind.IntLit, line: 1, col: 1 })
+        tc_stamp_program(orphan)
+        assert(diag_ice_count == 1)
+        assert(diag_count == 0)
+        // The arena is shared with every other row in this file, so the orphan comes back off it.
+        node_pop()
+    }
 }
 
 // A closure buried in a CALL ARGUMENT of a struct-literal FIELD VALUE — the carrier

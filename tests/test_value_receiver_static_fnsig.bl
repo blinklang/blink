@@ -36,11 +36,12 @@
 
 import std.fs
 import compiler.{compile_to_program}
-import typecheck.{check_types, tc_lookup_node_tid, tc_type_str}
-import parser.{node_count, node_kind, node_method}
+import typecheck.{check_types, tc_lookup_node_tid, tc_type_str, TypeCheck}
+import parser.{node_count, node_kind, node_method, Parse}
 import ast.{NodeKind}
-import diagnostics.{diag_entries, diag_entry_count, diag_truncate}
+import diagnostics.{diag_entries, diag_entry_count, diag_truncate, Diag}
 import std.io
+import lexer.{Lex}
 
 fn assert_eq_str(got: Str, want: Str, label: Str) ! IO.Print {
     if got != want { io.println("FAIL: {label} — got '{got}', want '{want}'") }
@@ -73,17 +74,19 @@ fn method_call_ty(method: Str) -> Str {
     "NONE"
 }
 
-fn type_of_first_call(path: Str, src: Str, method: Str) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
-    fs.write(path, src).unwrap()
-    let program = compile_to_program(path, 1)
-    let before = diag_entry_count()
-    check_types(program)
-    let _ = fs.delete(path)
-    // These probes deliberately contain unresolvable calls; leave the shared global diag
-    // buffer as it was found so an error here cannot read as a failure of whichever test
-    // happens to flush next.
-    diag_truncate(before)
-    method_call_ty(method)
+fn type_of_first_call(path: Str, src: Str, method: Str) -> Str ! FS, Env.Exit, Env.Read, IO {
+    with handler Diag {}, handler Lex {}, handler Parse {}, handler TypeCheck {} {
+        fs.write(path, src).unwrap()
+        let program = compile_to_program(path, 1)
+        let before = diag_entry_count()
+        check_types(program)
+        let _ = fs.delete(path)
+        // These probes deliberately contain unresolvable calls; leave the shared global diag
+        // buffer as it was found so an error here cannot read as a failure of whichever test
+        // happens to flush next.
+        diag_truncate(before)
+        method_call_ty(method)
+    }
 }
 
 // ── Half A — the defect: a value receiver adopts `{name}_{method}` ────────────
@@ -124,26 +127,28 @@ fn main() {
 }
 
 test "the annotation is not blamed for disagreeing with an invented type" {
-    let path = "build/value_receiver_static_fnsig_annotated.bl"
-    fs.write(path, annotated_src()).unwrap()
-    let program = compile_to_program(path, 1)
-    let before = diag_entry_count()
-    check_types(program)
-    let _ = fs.delete(path)
+    with handler Diag {}, handler Lex {}, handler Parse {}, handler TypeCheck {} {
+        let path = "build/value_receiver_static_fnsig_annotated.bl"
+        fs.write(path, annotated_src()).unwrap()
+        let program = compile_to_program(path, 1)
+        let before = diag_entry_count()
+        check_types(program)
+        let _ = fs.delete(path)
 
-    let mut blamed_annotation = false
-    let mut i = before
-    while i < diag_entries.len() {
-        let d = diag_entries.get(i).unwrap()
-        if d.name == "TypeError" && d.message.contains("got Str") {
-            blamed_annotation = true
+        let mut blamed_annotation = false
+        let mut i = before
+        while i < diag_entries.len() {
+            let d = diag_entries.get(i).unwrap()
+            if d.name == "TypeError" && d.message.contains("got Str") {
+                blamed_annotation = true
+            }
+            i = i + 1
         }
-        i = i + 1
+        diag_truncate(before)
+        // The user wrote `let s: Int` and a call that resolves to nothing. Telling them their
+        // Int "got Str" points at the one line in the program that is not the problem.
+        assert_true(!blamed_annotation, "no TypeError may claim the Int annotation 'got Str' — Str is typecheck's own invention here")
     }
-    diag_truncate(before)
-    // The user wrote `let s: Int` and a call that resolves to nothing. Telling them their
-    // Int "got Str" points at the one line in the program that is not the problem.
-    assert_true(!blamed_annotation, "no TypeError may claim the Int annotation 'got Str' — Str is typecheck's own invention here")
 }
 
 // ── Half C — the path this must NOT break: a real pseudo-static ───────────────

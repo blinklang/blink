@@ -32,7 +32,7 @@ import cg_eff.{
     cg_eff_thunk_body_node, cg_eff_thunk_close, cg_eff_thunk_open, cg_eff_thunk_params,
     cg_eff_thunk_ret, cg_eff_thunk_symbol,
 }
-import diagnostics.{diag_entries, diag_reset}
+import diagnostics.{diag_entries, diag_reset, Diag}
 import std.fs
 import std.io
 
@@ -134,7 +134,7 @@ fn report_ices() ! IO.Print {
 
 // The registry, the IR table and the diagnostics list are process globals, so each test
 // compiles the probe for itself.
-fn setup() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete, Env.Exit, Env.Read, FS.Read, FS.Write, IO {
+fn setup() ! FS.Delete, Env.Exit, Env.Read, FS.Read, FS.Write, IO {
     diag_reset()
     ir_reset()
     layout_reset()
@@ -184,45 +184,53 @@ fn find_perform(id: Int) -> Int {
 
 // One operation's body lowered inside the operation's own frame, which is where a perform
 // in it decides what to read.
-fn lower_op_body(i: Int) -> Int ! Diag.Report {
-    let scope = cg_eff_thunk_open(i)
-    if scope < 0 { return -1 }
-    let body = lower_block_returning(cg_eff_thunk_body_node(i))
-    cg_eff_thunk_close()
-    body
+fn lower_op_body(i: Int) -> Int {
+    with handler Diag {} {
+        let scope = cg_eff_thunk_open(i)
+        if scope < 0 { return -1 }
+        let body = lower_block_returning(cg_eff_thunk_body_node(i))
+        cg_eff_thunk_close()
+        body
+    }
 }
 
 test "a handler literal lowers to a value at the handler's own type" {
-    setup()
-    let node = handler_in("io_one")
-    let v = cg_eff_lower_handler_expr(node)
-    report_ices()
-    assert_eq(ices(), 0)
-    assert(v >= 0)
-    assert_eq_str("effect", tc_tid_handler_effect(tc_resolve(ir_tid(v))), "IO")
+    with handler Diag {} {
+        setup()
+        let node = handler_in("io_one")
+        let v = cg_eff_lower_handler_expr(node)
+        report_ices()
+        assert_eq(ices(), 0)
+        assert(v >= 0)
+        assert_eq_str("effect", tc_tid_handler_effect(tc_resolve(ir_tid(v))), "IO")
+    }
 }
 
 test "the expression stage answers a handler literal with that value" {
-    setup()
-    let node = handler_in("io_one")
-    let v = lower_expr(node)
-    report_ices()
-    assert_eq(ices(), 0)
-    assert(v >= 0)
-    assert_eq_str("effect", tc_tid_handler_effect(tc_resolve(ir_tid(v))), "IO")
+    with handler Diag {} {
+        setup()
+        let node = handler_in("io_one")
+        let v = lower_expr(node)
+        report_ices()
+        assert_eq(ices(), 0)
+        assert(v >= 0)
+        assert_eq_str("effect", tc_tid_handler_effect(tc_resolve(ir_tid(v))), "IO")
+    }
 }
 
 test "the value a handler literal lowers to is what the install takes" {
-    setup()
-    let node = handler_in("metrics_two")
-    let v = cg_eff_lower_handler_expr(node)
-    assert(v >= 0)
-    let inst = cg_eff_lower_handler_install(node, v, ir_block(node, []))
-    report_ices()
-    assert_eq(ices(), 0)
-    assert(inst >= 0)
-    assert(ir_kind(inst) == IrKind.HandlerInstall)
-    assert_eq_str("field", ir_c_name(inst), "ue_Metrics")
+    with handler Diag {} {
+        setup()
+        let node = handler_in("metrics_two")
+        let v = cg_eff_lower_handler_expr(node)
+        assert(v >= 0)
+        let inst = cg_eff_lower_handler_install(node, v, ir_block(node, []))
+        report_ices()
+        assert_eq(ices(), 0)
+        assert(inst >= 0)
+        assert(ir_kind(inst) == IrKind.HandlerInstall)
+        assert_eq_str("field", ir_c_name(inst), "ue_Metrics")
+    }
 }
 
 // The builder writes one vtable member per operation the literal carries. A builtin
@@ -230,68 +238,80 @@ test "the value a handler literal lowers to is what the install takes" {
 // declares it. `log` is a C library name, and escaping it to `_blink_log` names a member
 // blink_io_vtable does not have, which C rejects at the assignment.
 test "the builder writes the member name the runtime's vtable declares" {
-    setup()
-    em_reset()
-    let v = cg_eff_lower_handler_expr(handler_in("io_log"))
-    report_ices()
-    assert_eq(ices(), 0)
-    assert(v >= 0)
-    let text = em_take()
-    if cg_text_occurrences(text, "__h->log = ") != 1 { io.println("FAIL: builder wrote\n{text}") }
-    assert_eq(cg_text_occurrences(text, "__h->log = "), 1)
-    assert_eq(cg_text_occurrences(text, "_blink_log"), 0)
+    with handler Diag {} {
+        setup()
+        em_reset()
+        let v = cg_eff_lower_handler_expr(handler_in("io_log"))
+        report_ices()
+        assert_eq(ices(), 0)
+        assert(v >= 0)
+        let text = em_take()
+        if cg_text_occurrences(text, "__h->log = ") != 1 { io.println("FAIL: builder wrote\n{text}") }
+        assert_eq(cg_text_occurrences(text, "__h->log = "), 1)
+        assert_eq(cg_text_occurrences(text, "_blink_log"), 0)
+    }
 }
 
 test "a handler literal that writes no operation still lowers to a value" {
-    // A partial handler is a complete handler: the omitted operations answer through the
-    // handler this one was copied from. A literal with nothing written is the limit case,
-    // and refusing it would make "write one operation" a rule the language does not have.
-    setup()
-    let v = cg_eff_lower_handler_expr(handler_in("io_none"))
-    report_ices()
-    assert_eq(ices(), 0)
-    assert(v >= 0)
-    assert_eq(cg_eff_pending_thunks(), 0)
+    with handler Diag {} {
+        // A partial handler is a complete handler: the omitted operations answer through the
+        // handler this one was copied from. A literal with nothing written is the limit case,
+        // and refusing it would make "write one operation" a rule the language does not have.
+        setup()
+        let v = cg_eff_lower_handler_expr(handler_in("io_none"))
+        report_ices()
+        assert_eq(ices(), 0)
+        assert(v >= 0)
+        assert_eq(cg_eff_pending_thunks(), 0)
+    }
 }
 
 test "the lowered handler value is a well-formed value in a block" {
-    setup()
-    let node = handler_in("io_one")
-    let v = cg_eff_lower_handler_expr(node)
-    assert(v >= 0)
-    let problems = ir_verify(ir_block(node, [cg_eff_lower_handler_install(node, v, ir_block(node, []))]))
-    for p in problems { io.println("  verify: {p}") }
-    assert_eq(problems.len(), 0)
+    with handler Diag {} {
+        setup()
+        let node = handler_in("io_one")
+        let v = cg_eff_lower_handler_expr(node)
+        assert(v >= 0)
+        let problems = ir_verify(ir_block(node, [cg_eff_lower_handler_install(node, v, ir_block(node, []))]))
+        for p in problems { io.println("  verify: {p}") }
+        assert_eq(problems.len(), 0)
+    }
 }
 
 test "each operation of a handler literal is queued under its own symbol" {
-    setup()
-    let v = cg_eff_lower_handler_expr(handler_in("metrics_two"))
-    assert(v >= 0)
-    assert_eq(cg_eff_pending_thunks(), 2)
-    assert(cg_eff_thunk_symbol(0) != "")
-    assert(cg_eff_thunk_symbol(0) != cg_eff_thunk_symbol(1))
+    with handler Diag {} {
+        setup()
+        let v = cg_eff_lower_handler_expr(handler_in("metrics_two"))
+        assert(v >= 0)
+        assert_eq(cg_eff_pending_thunks(), 2)
+        assert(cg_eff_thunk_symbol(0) != "")
+        assert(cg_eff_thunk_symbol(0) != cg_eff_thunk_symbol(1))
+    }
 }
 
 test "a queued operation carries the operation's own body" {
-    setup()
-    let node = handler_in("io_one")
-    let v = cg_eff_lower_handler_expr(node)
-    assert(v >= 0)
-    assert_eq(cg_eff_pending_thunks(), 1)
-    let body = cg_eff_thunk_body_node(0)
-    assert(body >= 0)
-    assert(body != node)
+    with handler Diag {} {
+        setup()
+        let node = handler_in("io_one")
+        let v = cg_eff_lower_handler_expr(node)
+        assert(v >= 0)
+        assert_eq(cg_eff_pending_thunks(), 1)
+        let body = cg_eff_thunk_body_node(0)
+        assert(body >= 0)
+        assert(body != node)
+    }
 }
 
 test "an operation's signature is spelled from its own declaration" {
-    setup()
-    let v = cg_eff_lower_handler_expr(handler_in("metrics_two"))
-    assert(v >= 0)
-    assert_eq_str("counter result", cg_eff_thunk_ret(0), "void")
-    assert_eq(cg_eff_thunk_params(0).len(), 1)
-    assert_eq_str("total result", cg_eff_thunk_ret(1), "int64_t")
-    assert_eq(cg_eff_thunk_params(1).len(), 0)
+    with handler Diag {} {
+        setup()
+        let v = cg_eff_lower_handler_expr(handler_in("metrics_two"))
+        assert(v >= 0)
+        assert_eq_str("counter result", cg_eff_thunk_ret(0), "void")
+        assert_eq(cg_eff_thunk_params(0).len(), 1)
+        assert_eq_str("total result", cg_eff_thunk_ret(1), "int64_t")
+        assert_eq(cg_eff_thunk_params(1).len(), 0)
+    }
 }
 
 // An operation body runs outside the handler that holds it, so a perform of the root that
@@ -299,43 +319,49 @@ test "an operation's signature is spelled from its own declaration" {
 // there would reach this very operation, and the program would recurse until the stack ran
 // out — silently, because the C is well-formed.
 test "a perform of the handled root inside an operation does not read the effect vector" {
-    setup()
-    let v = cg_eff_lower_handler_expr(handler_in("io_one"))
-    assert(v >= 0)
-    let body = lower_op_body(0)
-    report_ices()
-    assert_eq(ices(), 0)
-    assert(body >= 0)
-    let perform = find_perform(body)
-    assert(perform >= 0)
-    assert(ir_kind(ir_kid(perform, 0)) != IrKind.FieldGet)
+    with handler Diag {} {
+        setup()
+        let v = cg_eff_lower_handler_expr(handler_in("io_one"))
+        assert(v >= 0)
+        let body = lower_op_body(0)
+        report_ices()
+        assert_eq(ices(), 0)
+        assert(body >= 0)
+        let perform = find_perform(body)
+        assert(perform >= 0)
+        assert(ir_kind(ir_kid(perform, 0)) != IrKind.FieldGet)
+    }
 }
 
 // The other half of the row above: an operation that performs a DIFFERENT root reads the
 // vector like every other perform, or a handler installed around this one would be missed.
 test "a perform of another root inside an operation reads the effect vector" {
-    setup()
-    let v = cg_eff_lower_handler_expr(handler_in("metrics_two"))
-    assert(v >= 0)
-    let body = lower_op_body(0)
-    report_ices()
-    assert_eq(ices(), 0)
-    assert(body >= 0)
-    let perform = find_perform(body)
-    assert(perform >= 0)
-    assert(ir_kind(ir_kid(perform, 0)) == IrKind.FieldGet)
+    with handler Diag {} {
+        setup()
+        let v = cg_eff_lower_handler_expr(handler_in("metrics_two"))
+        assert(v >= 0)
+        let body = lower_op_body(0)
+        report_ices()
+        assert_eq(ices(), 0)
+        assert(body >= 0)
+        let perform = find_perform(body)
+        assert(perform >= 0)
+        assert(ir_kind(ir_kid(perform, 0)) == IrKind.FieldGet)
+    }
 }
 
 // A capture rides the operation's userdata word, so the literal is built with the capture
 // rather than refused, and its one operation is queued.
 test "an operation that reads a local of the enclosing function is built, not refused" {
-    setup()
-    let outer = binder_scope_push()
-    bind_binder_mut(outer, "tag", TYPE_STR, false)
-    let v = cg_eff_lower_handler_expr(handler_in("io_capturing"))
-    binder_scope_pop()
-    report_ices()
-    assert(v >= 0)
-    assert_eq(ices_named("HandlerCaptureNotLowered"), 0)
-    assert_eq(cg_eff_pending_thunks(), 1)
+    with handler Diag {} {
+        setup()
+        let outer = binder_scope_push()
+        bind_binder_mut(outer, "tag", TYPE_STR, false)
+        let v = cg_eff_lower_handler_expr(handler_in("io_capturing"))
+        binder_scope_pop()
+        report_ices()
+        assert(v >= 0)
+        assert_eq(ices_named("HandlerCaptureNotLowered"), 0)
+        assert_eq(cg_eff_pending_thunks(), 1)
+    }
 }

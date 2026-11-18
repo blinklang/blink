@@ -26,11 +26,12 @@
 
 import std.fs
 import compiler.{compile_to_program}
-import typecheck.{check_types, tc_lookup_node_tid, tc_type_str, tc_tid_kind, TyKind}
-import parser.{node_count, node_kind, node_method}
+import typecheck.{check_types, tc_lookup_node_tid, tc_type_str, tc_tid_kind, TyKind, TypeCheck}
+import parser.{node_count, node_kind, node_method, Parse}
 import ast.{NodeKind}
-import diagnostics.{diag_entries, diag_entry_count, diag_truncate}
+import diagnostics.{diag_entries, diag_entry_count, diag_truncate, Diag}
 import std.io
+import lexer.{Lex}
 
 fn assert_eq_int(got: Int, want: Int, label: Str) ! IO.Print {
     if got != want { io.println("FAIL: {label} — got {got}, want {want}") }
@@ -143,35 +144,39 @@ fn main() {
 }
 
 test "StringBuilder is a representable type with one interned tid" {
-    let path = "build/stringbuilder_is_a_representable_type_sb_probe.bl"
-    fs.write(path, sb_probe_src()).unwrap()
-    let program = compile_to_program(path, 1)
-    check_types(program)
-    let _ = fs.delete(path)
+    with handler Diag {}, handler Lex {}, handler Parse {}, handler TypeCheck {} {
+        let path = "build/stringbuilder_is_a_representable_type_sb_probe.bl"
+        fs.write(path, sb_probe_src()).unwrap()
+        let program = compile_to_program(path, 1)
+        check_types(program)
+        let _ = fs.delete(path)
 
-    let tid = find_tid_by_str("StringBuilder")
-    assert_true(tid >= 0, "a StringBuilder tid is observed — typecheck must be able to name the type codegen emits as blink_sb*")
-    assert_true(tc_tid_kind(tid) == TyKind.StringBuilder, "the StringBuilder tid is its own kind, not a struct or a handle")
-    assert_eq_int(count_distinct_tids_by_str("StringBuilder"), 1, "the constructor, with_capacity, the param annotation and every binding share ONE interned tid")
-    // new() + its let, with_capacity() + its let, the param annotation, and the
-    // three receiver Idents (`buf.to_str()`, `take_sb(buf)`, `cap.is_empty()`).
-    assert_true(count_nodes_by_str("StringBuilder") >= 5, "the constructor call AND its let binding carry the type — a fix that types only the call leaves the chain erased")
+        let tid = find_tid_by_str("StringBuilder")
+        assert_true(tid >= 0, "a StringBuilder tid is observed — typecheck must be able to name the type codegen emits as blink_sb*")
+        assert_true(tc_tid_kind(tid) == TyKind.StringBuilder, "the StringBuilder tid is its own kind, not a struct or a handle")
+        assert_eq_int(count_distinct_tids_by_str("StringBuilder"), 1, "the constructor, with_capacity, the param annotation and every binding share ONE interned tid")
+        // new() + its let, with_capacity() + its let, the param annotation, and the
+        // three receiver Idents (`buf.to_str()`, `take_sb(buf)`, `cap.is_empty()`).
+        assert_true(count_nodes_by_str("StringBuilder") >= 5, "the constructor call AND its let binding carry the type — a fix that types only the call leaves the chain erased")
+    }
 }
 
 test "methods on a StringBuilder receiver type their returns" {
-    let path = "build/stringbuilder_is_a_representable_type_sb_methods_probe.bl"
-    fs.write(path, sb_probe_src()).unwrap()
-    let program = compile_to_program(path, 1)
-    check_types(program)
-    let _ = fs.delete(path)
+    with handler Diag {}, handler Lex {}, handler Parse {}, handler TypeCheck {} {
+        let path = "build/stringbuilder_is_a_representable_type_sb_methods_probe.bl"
+        fs.write(path, sb_probe_src()).unwrap()
+        let program = compile_to_program(path, 1)
+        check_types(program)
+        let _ = fs.delete(path)
 
-    assert_eq_str(method_call_ty("to_str"), "Str", "buf.to_str() is Str")
-    assert_eq_str(method_call_ty("len"), "Int", "buf.len() is Int")
-    assert_eq_str(method_call_ty("is_empty"), "Bool", "cap.is_empty() is Bool")
-    assert_eq_str(method_call_ty("capacity"), "Int", "cap.capacity() is Int")
-    assert_eq_str(method_call_ty("write"), "()", "buf.write(x) is ()")
-    assert_eq_str(method_call_ty("write_char"), "()", "buf.write_char(c) is ()")
-    assert_eq_str(method_call_ty("clear"), "()", "cap.clear() is ()")
+        assert_eq_str(method_call_ty("to_str"), "Str", "buf.to_str() is Str")
+        assert_eq_str(method_call_ty("len"), "Int", "buf.len() is Int")
+        assert_eq_str(method_call_ty("is_empty"), "Bool", "cap.is_empty() is Bool")
+        assert_eq_str(method_call_ty("capacity"), "Int", "cap.capacity() is Int")
+        assert_eq_str(method_call_ty("write"), "()", "buf.write(x) is ()")
+        assert_eq_str(method_call_ty("write_char"), "()", "buf.write_char(c) is ()")
+        assert_eq_str(method_call_ty("clear"), "()", "cap.clear() is ()")
+    }
 }
 
 // ── Half B — the declared type must not be a silent mismatch ─────────────────
@@ -189,25 +194,27 @@ fn mismatch_probe_src() -> Str {
 }
 
 test "a StringBuilder-derived value is checked against its declared type" {
-    let path = "build/stringbuilder_is_a_representable_type_sb_mismatch_probe.bl"
-    fs.write(path, mismatch_probe_src()).unwrap()
-    let program = compile_to_program(path, 1)
-    let before = diag_entry_count()
-    check_types(program)
-    let _ = fs.delete(path)
+    with handler Diag {}, handler Lex {}, handler Parse {}, handler TypeCheck {} {
+        let path = "build/stringbuilder_is_a_representable_type_sb_mismatch_probe.bl"
+        fs.write(path, mismatch_probe_src()).unwrap()
+        let program = compile_to_program(path, 1)
+        let before = diag_entry_count()
+        check_types(program)
+        let _ = fs.delete(path)
 
-    let mut saw_type_error = false
-    let mut i = before
-    while i < diag_entries.len() {
-        let d = diag_entries.get(i).unwrap()
-        if d.severity == "error" && d.name == "TypeError" { saw_type_error = true }
-        i = i + 1
+        let mut saw_type_error = false
+        let mut i = before
+        while i < diag_entries.len() {
+            let d = diag_entries.get(i).unwrap()
+            if d.severity == "error" && d.name == "TypeError" { saw_type_error = true }
+            i = i + 1
+        }
+        // Leave the buffer as it was found: this binary shares the compiler's global
+        // diag state with every other test in the file, and an unflushed error here
+        // would read as a failure of whichever test happens to flush.
+        diag_truncate(before)
+        assert_true(saw_type_error, "declaring `let s: Int = buf.to_str()` is a TypeError once to_str() is known to return Str")
     }
-    // Leave the buffer as it was found: this binary shares the compiler's global
-    // diag state with every other test in the file, and an unflushed error here
-    // would read as a failure of whichever test happens to flush.
-    diag_truncate(before)
-    assert_true(saw_type_error, "declaring `let s: Int = buf.to_str()` is a TypeError once to_str() is known to return Str")
 }
 
 // ── Half C — the runtime half, which was always right and must stay right ────

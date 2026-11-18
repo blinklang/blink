@@ -16,6 +16,7 @@ import lower_test_helpers.{
 import ir.{IrKind, ir_c_name, ir_c_spelling, ir_kid, ir_node_count}
 import layout.{container_slot_spelling}
 import cg_expr.{lower_expr}
+import diagnostics.{Diag}
 
 // The outermost conversion of every element. It is read from the producer the lowering
 // reads it from, because a test that spelled the cell for itself would still pass if the
@@ -46,82 +47,96 @@ fn main() {
 // integer and the cell is a pointer. The integer of the cell's width separates the two
 // conversions.
 test "an integer element is spelled as the cell's own integer before the cell" {
-    probe("cg_expr_slots", src_slots())
-    let id = lower_expr(rhs_of("ints"))
-    assert_kind("kind", id, IrKind.ContainerNew)
-    assert_shape("shape", id, "ContainerNew(Cast(Cast(Const)), Cast(Cast(Const)), Cast(Cast(Const)))")
-    let first = ir_kid(id, 0)
-    assert_reaches_the_cell("the cell", first)
-    assert_eq_str("the width between", ir_c_spelling(ir_kid(first, 0)), "intptr_t")
-    assert_eq_str("the element", ir_c_name(ir_kid(ir_kid(first, 0), 0)), "1")
-    assert_verifies("verify", id)
+    with handler Diag {} {
+        probe("cg_expr_slots", src_slots())
+        let id = lower_expr(rhs_of("ints"))
+        assert_kind("kind", id, IrKind.ContainerNew)
+        assert_shape("shape", id, "ContainerNew(Cast(Cast(Const)), Cast(Cast(Const)), Cast(Cast(Const)))")
+        let first = ir_kid(id, 0)
+        assert_reaches_the_cell("the cell", first)
+        assert_eq_str("the width between", ir_c_spelling(ir_kid(first, 0)), "intptr_t")
+        assert_eq_str("the element", ir_c_name(ir_kid(ir_kid(first, 0), 0)), "1")
+        assert_verifies("verify", id)
+    }
 }
 
 // A Str is a pointer and is already the cell's width, so an integer between the two would
 // convert a pointer to an integer and back to no effect.
 test "a pointer element is spelled as the cell once, with no integer between" {
-    probe("cg_expr_slots", src_slots())
-    let id = lower_expr(rhs_of("words"))
-    assert_shape("shape", id, "ContainerNew(Cast(Const), Cast(Const))")
-    assert_reaches_the_cell("the cell", ir_kid(id, 0))
-    assert_verifies("verify", id)
+    with handler Diag {} {
+        probe("cg_expr_slots", src_slots())
+        let id = lower_expr(rhs_of("words"))
+        assert_shape("shape", id, "ContainerNew(Cast(Const), Cast(Const))")
+        assert_reaches_the_cell("the cell", ir_kid(id, 0))
+        assert_verifies("verify", id)
+    }
 }
 
 // A double read back through an integer is a different number, so layout answers a pointer
 // for a Float and the literal copies the value to the heap.
 test "a float element is copied to the heap and the address enters the slot" {
-    probe("cg_expr_slots", src_slots())
-    let id = lower_expr(rhs_of("reals"))
-    assert_shape("shape", id, "ContainerNew(Box(Const), Box(Const))")
-    assert_eq_str("the slot's pointer", ir_c_spelling(ir_kid(id, 0)), "double*")
-    assert_verifies("verify", id)
+    with handler Diag {} {
+        probe("cg_expr_slots", src_slots())
+        let id = lower_expr(rhs_of("reals"))
+        assert_shape("shape", id, "ContainerNew(Box(Const), Box(Const))")
+        assert_eq_str("the slot's pointer", ir_c_spelling(ir_kid(id, 0)), "double*")
+        assert_verifies("verify", id)
+    }
 }
 
 // A struct is wider than one cell. The form is the one a Float takes, for the other reason:
 // a Float is word-sized and a struct is not.
 test "a struct element too wide for one cell is copied to the heap" {
-    probe("cg_expr_slots", src_slots())
-    let id = lower_expr(rhs_of("points"))
-    assert_shape("shape", id, "ContainerNew(Box(StructNew(Const, Const)))")
-    assert_eq_str("the slot's pointer", ir_c_spelling(ir_kid(id, 0)), "blink_4Point*")
-    assert_verifies("verify", id)
+    with handler Diag {} {
+        probe("cg_expr_slots", src_slots())
+        let id = lower_expr(rhs_of("points"))
+        assert_shape("shape", id, "ContainerNew(Box(StructNew(Const, Const)))")
+        assert_eq_str("the slot's pointer", ir_c_spelling(ir_kid(id, 0)), "blink_4Point*")
+        assert_verifies("verify", id)
+    }
 }
 
 // An Option over an Int holds a tag and a payload, which is wider than one cell. An Option
 // is not boxed for being an Option: one over an opaque handle is the handle itself and is
 // word-sized, so the form is read from the layout and not from the kind.
 test "a carrier element wider than one cell is copied to the heap" {
-    probe("cg_expr_slots", src_slots())
-    let id = lower_expr(rhs_of("opts"))
-    assert_shape("shape", id, "ContainerNew(Box(CarrierWrap(Const, Const)), Box(CarrierWrap(Const)))")
-    assert_eq_str("the slot's pointer", ir_c_spelling(ir_kid(id, 0)), "blink_Option_int*")
-    assert_verifies("verify", id)
+    with handler Diag {} {
+        probe("cg_expr_slots", src_slots())
+        let id = lower_expr(rhs_of("opts"))
+        assert_shape("shape", id, "ContainerNew(Box(CarrierWrap(Const, Const)), Box(CarrierWrap(Const)))")
+        assert_eq_str("the slot's pointer", ir_c_spelling(ir_kid(id, 0)), "blink_Option_int*")
+        assert_verifies("verify", id)
+    }
 }
 
 // A Bool and an ordinal variant are word-sized values that are not pointers, so both take
 // the integer. Naming them pins the form to the slot and not to the Int type.
 test "a bool and an ordinal variant take the same integer an Int takes" {
-    probe("cg_expr_slots", src_slots())
-    let flags = lower_expr(rhs_of("flags"))
-    assert_shape("bools", flags, "ContainerNew(Cast(Cast(Const)), Cast(Cast(Const)))")
-    assert_eq_str("the width between", ir_c_spelling(ir_kid(ir_kid(flags, 0), 0)), "intptr_t")
-    assert_verifies("verify bools", flags)
-    let hues = lower_expr(rhs_of("hues"))
-    assert_shape("ordinals", hues, "ContainerNew(Cast(Cast(Const)), Cast(Cast(Const)))")
-    assert_eq_str("the width between", ir_c_spelling(ir_kid(ir_kid(hues, 0), 0)), "intptr_t")
-    assert_verifies("verify ordinals", hues)
+    with handler Diag {} {
+        probe("cg_expr_slots", src_slots())
+        let flags = lower_expr(rhs_of("flags"))
+        assert_shape("bools", flags, "ContainerNew(Cast(Cast(Const)), Cast(Cast(Const)))")
+        assert_eq_str("the width between", ir_c_spelling(ir_kid(ir_kid(flags, 0), 0)), "intptr_t")
+        assert_verifies("verify bools", flags)
+        let hues = lower_expr(rhs_of("hues"))
+        assert_shape("ordinals", hues, "ContainerNew(Cast(Cast(Const)), Cast(Cast(Const)))")
+        assert_eq_str("the width between", ir_c_spelling(ir_kid(ir_kid(hues, 0), 0)), "intptr_t")
+        assert_verifies("verify ordinals", hues)
+    }
 }
 
 // A literal with no elements names the element type and fills no slot. The constructor is
 // still built, and it refuses nothing: a slot that is never filled cannot decline.
 test "an empty literal converts nothing and refuses nothing" {
-    probe("cg_expr_slots", src_slots())
-    let before = ice_count()
-    let id = lower_expr(rhs_of("empty"))
-    assert_kind("kind", id, IrKind.ContainerNew)
-    assert_shape("shape", id, "ContainerNew")
-    assert_eq(ice_count(), before)
-    assert_verifies("verify", id)
+    with handler Diag {} {
+        probe("cg_expr_slots", src_slots())
+        let before = ice_count()
+        let id = lower_expr(rhs_of("empty"))
+        assert_kind("kind", id, IrKind.ContainerNew)
+        assert_shape("shape", id, "ContainerNew")
+        assert_eq(ice_count(), before)
+        assert_verifies("verify", id)
+    }
 }
 
 fn src_unspellable_element() -> Str {
@@ -143,11 +158,13 @@ fn main() {
 // The count of arena nodes does not move. The slot is shaped before the element is lowered,
 // so a refusal leaves no operand behind that nothing names.
 test "an element with no slot form is refused by name and strands no node" {
-    probe("cg_expr_slots_unspellable", src_unspellable_element())
-    let before = ir_node_count()
-    assert_ice_saying("refused", lower_expr(rhs_of("xs")),
-        "UnspellableElementType", "container element has no C layout")
-    assert_eq(ir_node_count(), before)
+    with handler Diag {} {
+        probe("cg_expr_slots_unspellable", src_unspellable_element())
+        let before = ir_node_count()
+        assert_ice_saying("refused", lower_expr(rhs_of("xs")),
+            "UnspellableElementType", "container element has no C layout")
+        assert_eq(ir_node_count(), before)
+    }
 }
 
 fn src_two_unspellable_elements() -> Str {
@@ -166,7 +183,9 @@ fn main() {
 // first element it cannot build. A reader given the same sentence once per element cannot
 // tell one gap from several.
 test "a literal with two unspellable elements refuses once, not once per element" {
-    probe("cg_expr_slots_two_unspellable", src_two_unspellable_elements())
-    assert_ice_saying("refused once", lower_expr(rhs_of("xs")),
-        "UnspellableElementType", "container element has no C layout")
+    with handler Diag {} {
+        probe("cg_expr_slots_two_unspellable", src_two_unspellable_elements())
+        assert_ice_saying("refused once", lower_expr(rhs_of("xs")),
+            "UnspellableElementType", "container element has no C layout")
+    }
 }

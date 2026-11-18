@@ -7,8 +7,9 @@ import std.io
 import layout.{layout_reset}
 import cname.{cname_reset}
 import cg_test_helpers.{cg_probe_compile}
-import cg.{CgConfig, generate, generate_archive_header}
+import cg.{CgConfig, generate, generate_archive_header, Codegen}
 import mono.{run_mono}
+import diagnostics.{Diag}
 
 fn assert_lacks(text: Str, needle: Str) ! IO.Print {
     if text.contains(needle) {
@@ -24,14 +25,16 @@ fn assert_has(text: Str, needle: Str) ! IO.Print {
     assert(text.contains(needle))
 }
 
-fn build_probe(src: Str, name: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete, Env.Exit, Env.Read, FS.Read, FS.Write, IO {
-    let path = "build/{name}.bl"
-    let program = cg_probe_compile(path, src)
-    run_mono(program)
-    layout_reset()
-    cname_reset()
-    let _ = fs.delete(path)
-    program
+fn build_probe(src: Str, name: Str) -> Int ! FS.Delete, Env.Exit, Env.Read, FS.Read, FS.Write, IO {
+    with handler Diag {} {
+        let path = "build/{name}.bl"
+        let program = cg_probe_compile(path, src)
+        run_mono(program)
+        layout_reset()
+        cname_reset()
+        let _ = fs.delete(path)
+        program
+    }
 }
 
 fn archive_cfg() -> CgConfig {
@@ -63,45 +66,57 @@ fn main() {
 }
 
 test "an archive monolith over a program with fn main emits no main() shim" {
-    let program = build_probe(main_src(), "cg_archive_no_main_probe")
-    let text = generate(program, archive_cfg())
-    assert_lacks(text, "int main(")
+    with handler Codegen {}, handler Diag {} {
+        let program = build_probe(main_src(), "cg_archive_no_main_probe")
+        let text = generate(program, archive_cfg())
+        assert_lacks(text, "int main(")
+    }
 }
 
 // Every user TU calls __blink_init_stdlib_globals() unconditionally, so the archive
 // header must always promise it and the archive definition must always deliver it, or
 // linking a user program against the archive fails regardless of the program's content.
 test "an archive monolith with a deferred global emits a non-static stdlib globals init" {
-    let program = build_probe(deferred_global_src(), "cg_archive_deferred_init_probe")
-    let text = generate(program, archive_cfg())
-    assert_has(text, "void __blink_init_stdlib_globals(void)")
-    assert_lacks(text, "static void __blink_init_stdlib_globals")
+    with handler Codegen {}, handler Diag {} {
+        let program = build_probe(deferred_global_src(), "cg_archive_deferred_init_probe")
+        let text = generate(program, archive_cfg())
+        assert_has(text, "void __blink_init_stdlib_globals(void)")
+        assert_lacks(text, "static void __blink_init_stdlib_globals")
+    }
 }
 
 test "an archive monolith with no deferred globals still emits the stdlib globals init" {
-    let program = build_probe(main_src(), "cg_archive_empty_init_probe")
-    let text = generate(program, archive_cfg())
-    assert_has(text, "void __blink_init_stdlib_globals(void)")
+    with handler Codegen {}, handler Diag {} {
+        let program = build_probe(main_src(), "cg_archive_empty_init_probe")
+        let text = generate(program, archive_cfg())
+        assert_has(text, "void __blink_init_stdlib_globals(void)")
+    }
 }
 
 test "the archive header declares the stdlib globals init function" {
-    let program = build_probe(main_src(), "cg_archive_header_init_probe")
-    let text = generate_archive_header(program, archive_cfg())
-    assert_has(text, "void __blink_init_stdlib_globals(void);")
+    with handler Codegen {}, handler Diag {} {
+        let program = build_probe(main_src(), "cg_archive_header_init_probe")
+        let text = generate_archive_header(program, archive_cfg())
+        assert_has(text, "void __blink_init_stdlib_globals(void);")
+    }
 }
 
 test "plain program mode still emits a static globals init function, not the archive one" {
-    let program = build_probe(deferred_global_src(), "cg_plain_deferred_init_probe")
-    let text = generate(program, plain_cfg())
-    assert_has(text, "static void __blink_init_globals(void)")
-    assert_lacks(text, "__blink_init_stdlib_globals")
+    with handler Codegen {}, handler Diag {} {
+        let program = build_probe(deferred_global_src(), "cg_plain_deferred_init_probe")
+        let text = generate(program, plain_cfg())
+        assert_has(text, "static void __blink_init_globals(void)")
+        assert_lacks(text, "__blink_init_stdlib_globals")
+    }
 }
 
 // One archive serves many programs, so it never owns the evidence vector: the linking
 // program's own unit always defines it, and two definitions of one C global is a link
 // error the moment a program links against the archive.
 test "an archive monolith declares the evidence vector extern and defines no storage for it" {
-    let program = build_probe(main_src(), "cg_archive_ev_extern_probe")
-    let text = generate(program, archive_cfg())
-    assert_has(text, "extern blink_ev __blink_ev;")
+    with handler Codegen {}, handler Diag {} {
+        let program = build_probe(main_src(), "cg_archive_ev_extern_probe")
+        let text = generate(program, archive_cfg())
+        assert_has(text, "extern blink_ev __blink_ev;")
+    }
 }

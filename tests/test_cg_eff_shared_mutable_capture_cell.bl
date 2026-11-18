@@ -37,7 +37,7 @@ import cg_eff.{
     cg_eff_reset, cg_eff_scan_shared_binders, cg_eff_thunk_body_node, cg_eff_thunk_close,
     cg_eff_thunk_open,
 }
-import diagnostics.{diag_entries, diag_reset}
+import diagnostics.{diag_entries, diag_reset, Diag}
 import std.fs
 import std.io
 
@@ -110,7 +110,7 @@ fn report_ices(label: Str) ! IO.Eprint {
     }
 }
 
-fn setup() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete, Env.Exit, Env.Read, FS.Read, FS.Write, IO {
+fn setup() ! FS.Delete, Env.Exit, Env.Read, FS.Read, FS.Write, IO {
     diag_reset()
     ir_reset()
     layout_reset()
@@ -138,51 +138,59 @@ fn closure_of(let_name: Str) -> Int ! IO.Print {
 // A whole function body, lowered the way the driver lowers one: the body is scanned for
 // the names its closures share before any statement in it lowers, because the cell has
 // to exist at the declaration and a declaration lowers before the closure below it does.
-fn lower_body_of(fn_name: Str) -> Int ! Diag.Report, IO.Print {
-    let f = fn_node_of(fn_name)
-    cg_eff_scan_shared_binders(f)
-    lower_block_returning(node_body(f))
+fn lower_body_of(fn_name: Str) -> Int ! IO.Print {
+    with handler Diag {} {
+        let f = fn_node_of(fn_name)
+        cg_eff_scan_shared_binders(f)
+        lower_block_returning(node_body(f))
+    }
 }
 
 // The C a lowered body prints. The frame's own declaration and its own writes are what
 // this measures, so the statements are printed rather than read off the IR: the deref is
 // a spelling, and a spelling is only true once it is printed.
-fn body_text(fn_name: Str) -> Str ! Diag.Report, IO.Print {
-    let body = lower_body_of(fn_name)
-    assert(body >= 0)
-    print_reset()
-    print_block_body(body)
-    print_take()
+fn body_text(fn_name: Str) -> Str ! IO.Print {
+    with handler Diag {} {
+        let body = lower_body_of(fn_name)
+        assert(body >= 0)
+        print_reset()
+        print_block_body(body)
+        print_take()
+    }
 }
 
 // One closure lowered against a frame that already holds the shared binding in a cell,
 // which is the state the statement stage leaves behind for it.
-fn lower_capturing_cell(let_name: Str, name: Str, tid: Int) -> Int ! Diag.Report, IO.Print {
-    let outer = binder_scope_push()
-    bind_binder_cell(outer, name, tid)
-    let v = cg_eff_lower_closure(closure_of(let_name))
-    binder_scope_pop()
-    v
+fn lower_capturing_cell(let_name: Str, name: Str, tid: Int) -> Int ! IO.Print {
+    with handler Diag {} {
+        let outer = binder_scope_push()
+        bind_binder_cell(outer, name, tid)
+        let v = cg_eff_lower_closure(closure_of(let_name))
+        binder_scope_pop()
+        v
+    }
 }
 
 test "the scan names the mut bindings a closure in the body shares, and no others" {
-    // The scan is the only thing that tells a shared binding from a private one, and it
-    // has to answer before the declaration lowers. A scan that named every `let mut`
-    // would give a private binding heap storage nothing reads through.
-    setup()
-    cg_eff_scan_shared_binders(fn_node_of("shared_int"))
-    assert(cg_eff_binder_is_shared("total"))
-    // The closure's own parameter is not a binding of this frame.
-    assert(!cg_eff_binder_is_shared("n"))
+    with handler Diag {} {
+        // The scan is the only thing that tells a shared binding from a private one, and it
+        // has to answer before the declaration lowers. A scan that named every `let mut`
+        // would give a private binding heap storage nothing reads through.
+        setup()
+        cg_eff_scan_shared_binders(fn_node_of("shared_int"))
+        assert(cg_eff_binder_is_shared("total"))
+        // The closure's own parameter is not a binding of this frame.
+        assert(!cg_eff_binder_is_shared("n"))
 
-    setup()
-    cg_eff_scan_shared_binders(fn_node_of("plain_mut_nobody_captures"))
-    assert(!cg_eff_binder_is_shared("lone"))
+        setup()
+        cg_eff_scan_shared_binders(fn_node_of("plain_mut_nobody_captures"))
+        assert(!cg_eff_binder_is_shared("lone"))
 
-    // A plain `let` a closure reads is copied, so it is not shared and needs no cell.
-    setup()
-    cg_eff_scan_shared_binders(fn_node_of("plain_let_a_closure_reads"))
-    assert(!cg_eff_binder_is_shared("fixed"))
+        // A plain `let` a closure reads is copied, so it is not shared and needs no cell.
+        setup()
+        cg_eff_scan_shared_binders(fn_node_of("plain_let_a_closure_reads"))
+        assert(!cg_eff_binder_is_shared("fixed"))
+    }
 }
 
 test "a shared mut binding binds as celled, and a private one does not" {
@@ -266,40 +274,44 @@ test "a shared Float rides the same word, because a cell is already pointer-wide
 }
 
 test "the thunk holds the same cell and writes through it" {
-    // The thunk is its own C function, so the prologue is the only place the name can
-    // reach the cell. A prologue that bound a copy of the value would compile and drop
-    // every write the closure makes.
-    setup()
-    let v = lower_capturing_cell("bump_int", "total", TYPE_INT)
-    assert(v >= 0)
-    assert(cg_eff_thunk_open(0) >= 0)
-    let body = lower_block_returning(cg_eff_thunk_body_node(0))
-    cg_eff_thunk_close()
-    if body < 0 || ices() != 0 { report_ices("the thunk body did not lower") }
-    assert(body >= 0)
-    print_reset()
-    cg_eff_print_thunk(0, body)
-    let text = print_take()
-    assert_eq(ices(), 0)
-    assert(cg_text_occurrences(text, "int64_t* {c_cell_name(c_local_name("total"))} =") == 1)
-    assert(cg_text_occurrences(text, "(*{c_cell_name(c_local_name("total"))}) =") >= 1)
-    assert_eq(ir_verify(body).len(), 0)
+    with handler Diag {} {
+        // The thunk is its own C function, so the prologue is the only place the name can
+        // reach the cell. A prologue that bound a copy of the value would compile and drop
+        // every write the closure makes.
+        setup()
+        let v = lower_capturing_cell("bump_int", "total", TYPE_INT)
+        assert(v >= 0)
+        assert(cg_eff_thunk_open(0) >= 0)
+        let body = lower_block_returning(cg_eff_thunk_body_node(0))
+        cg_eff_thunk_close()
+        if body < 0 || ices() != 0 { report_ices("the thunk body did not lower") }
+        assert(body >= 0)
+        print_reset()
+        cg_eff_print_thunk(0, body)
+        let text = print_take()
+        assert_eq(ices(), 0)
+        assert(cg_text_occurrences(text, "int64_t* {c_cell_name(c_local_name("total"))} =") == 1)
+        assert(cg_text_occurrences(text, "(*{c_cell_name(c_local_name("total"))}) =") >= 1)
+        assert_eq(ir_verify(body).len(), 0)
+    }
 }
 
 test "the thunk reads the cell out of the capture word it was given" {
-    // The word and the prologue index the same position, so the pointer the prologue
-    // binds is the pointer the frame put in word 0 and not a fresh allocation.
-    setup()
-    let v = lower_capturing_cell("bump_int", "total", TYPE_INT)
-    assert(v >= 0)
-    assert(cg_eff_thunk_open(0) >= 0)
-    let body = lower_block_returning(cg_eff_thunk_body_node(0))
-    cg_eff_thunk_close()
-    print_reset()
-    cg_eff_print_thunk(0, body)
-    let text = print_take()
-    assert(cg_text_occurrences(text, "blink_closure_get_capture") == 1)
-    // The prologue takes the pointer as it stands. An unboxing read here would spell a
-    // deref of the word, read the cell's first bytes as the value, and write a copy.
-    assert_eq(cg_text_occurrences(text, "= (*("), 0)
+    with handler Diag {} {
+        // The word and the prologue index the same position, so the pointer the prologue
+        // binds is the pointer the frame put in word 0 and not a fresh allocation.
+        setup()
+        let v = lower_capturing_cell("bump_int", "total", TYPE_INT)
+        assert(v >= 0)
+        assert(cg_eff_thunk_open(0) >= 0)
+        let body = lower_block_returning(cg_eff_thunk_body_node(0))
+        cg_eff_thunk_close()
+        print_reset()
+        cg_eff_print_thunk(0, body)
+        let text = print_take()
+        assert(cg_text_occurrences(text, "blink_closure_get_capture") == 1)
+        // The prologue takes the pointer as it stands. An unboxing read here would spell a
+        // deref of the word, read the cell's first bytes as the value, and write a copy.
+        assert_eq(cg_text_occurrences(text, "= (*("), 0)
+    }
 }

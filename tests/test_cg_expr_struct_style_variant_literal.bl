@@ -25,7 +25,7 @@ import layout.{layout_reset}
 import ir.{ir_reset}
 import cg_test_helpers.{cg_ice_count, cg_probe_compile, cg_report_ices, cg_text_occurrences}
 import cg_reg.{cg_reg_build}
-import diagnostics.{diag_reset}
+import diagnostics.{diag_reset, Diag}
 import std.io
 import cg_stmt.{cg_stmt_reset, lower_fn}
 import cg_expr.{cg_expr_reset}
@@ -41,21 +41,23 @@ fn find_fn(name: Str) -> Int {
     -1
 }
 
-fn probe_fn(stem: Str, src: Str, name: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Env.Exit, Env.Read, FS.Read, FS.Write, IO, Process.Spawn {
-    let path = "build/{stem}_probe.bl"
-    let program = cg_probe_compile(path, src)
-    let _rm = process.run("rm", ["-f", path]).unwrap()
-    run_mono(program)
-    cg_reg_build(program)
-    layout_reset()
-    ir_reset()
-    cg_expr_reset()
-    cg_stmt_reset()
-    print_reset()
-    diag_reset()
-    let f = find_fn(name)
-    assert(f >= 0)
-    lower_fn(f)
+fn probe_fn(stem: Str, src: Str, name: Str) -> Int ! Env.Exit, Env.Read, FS.Read, FS.Write, IO, Process.Spawn {
+    with handler Diag {} {
+        let path = "build/{stem}_probe.bl"
+        let program = cg_probe_compile(path, src)
+        let _rm = process.run("rm", ["-f", path]).unwrap()
+        run_mono(program)
+        cg_reg_build(program)
+        layout_reset()
+        ir_reset()
+        cg_expr_reset()
+        cg_stmt_reset()
+        print_reset()
+        diag_reset()
+        let f = find_fn(name)
+        assert(f >= 0)
+        lower_fn(f)
+    }
 }
 
 // Point carries nothing, so the enum is a tagged struct and Rect's payload rides in it.
@@ -164,37 +166,41 @@ test "a struct-style variant literal builds the enum, not a struct of the enum's
 }
 
 test "the payload is written in declared order, whatever order the literal names it in" {
-    let declared = probe_fn("cg_expr_ssv_a", declared_order_src(), "make")
-    assert(declared >= 0)
-    print_reset()
-    print_block_body(declared)
-    let a = print_take()
-    let written = probe_fn("cg_expr_ssv_b", written_order_src(), "make")
-    assert(written >= 0)
-    print_reset()
-    print_block_body(written)
-    let b = print_take()
-    assert_eq_str("either order lowers to the same C", a, b)
-    // Both halves would also agree on a lowering that dropped the payload, so the values
-    // themselves are named: each is written exactly once, and width's comes first.
-    assert(cg_text_occurrences(a, #"{3, "#) == 1)
-    assert(cg_text_occurrences(a, #", 4}"#) == 1)
-    assert((a.byte_index_of(#"{3, "#, 0) ?? -1) < (a.byte_index_of(#", 4}"#, 0) ?? -1))
+    with handler Diag {} {
+        let declared = probe_fn("cg_expr_ssv_a", declared_order_src(), "make")
+        assert(declared >= 0)
+        print_reset()
+        print_block_body(declared)
+        let a = print_take()
+        let written = probe_fn("cg_expr_ssv_b", written_order_src(), "make")
+        assert(written >= 0)
+        print_reset()
+        print_block_body(written)
+        let b = print_take()
+        assert_eq_str("either order lowers to the same C", a, b)
+        // Both halves would also agree on a lowering that dropped the payload, so the values
+        // themselves are named: each is written exactly once, and width's comes first.
+        assert(cg_text_occurrences(a, #"{3, "#) == 1)
+        assert(cg_text_occurrences(a, #", 4}"#) == 1)
+        assert((a.byte_index_of(#"{3, "#, 0) ?? -1) < (a.byte_index_of(#", 4}"#, 0) ?? -1))
+    }
 }
 
 test "the bare spelling of a struct-style variant builds the same arm as the qualified one" {
-    let qualified = probe_fn("cg_expr_ssv_q", declared_order_src(), "make")
-    assert(qualified >= 0)
-    print_reset()
-    print_block_body(qualified)
-    let q = print_take()
-    let bare = probe_fn("cg_expr_ssv_bare", bare_order_src(), "make")
-    if cg_ice_count() != 0 { cg_report_ices("the bare literal was refused") }
-    assert_eq(cg_ice_count(), 0)
-    assert(bare >= 0)
-    print_reset()
-    print_block_body(bare)
-    assert_eq_str("both spellings lower to the same C", print_take(), q)
+    with handler Diag {} {
+        let qualified = probe_fn("cg_expr_ssv_q", declared_order_src(), "make")
+        assert(qualified >= 0)
+        print_reset()
+        print_block_body(qualified)
+        let q = print_take()
+        let bare = probe_fn("cg_expr_ssv_bare", bare_order_src(), "make")
+        if cg_ice_count() != 0 { cg_report_ices("the bare literal was refused") }
+        assert_eq(cg_ice_count(), 0)
+        assert(bare >= 0)
+        print_reset()
+        print_block_body(bare)
+        assert_eq_str("both spellings lower to the same C", print_take(), q)
+    }
 }
 
 test "a generic enum's struct-style variant builds the arm of its instance" {
@@ -206,33 +212,37 @@ test "a generic enum's struct-style variant builds the arm of its instance" {
 }
 
 test "a brace literal on a brace variant lowers to the same C as a paren payload on a paren variant with the same fields" {
-    let called = probe_fn("cg_expr_ssv_call", call_spelling_src(), "make")
-    assert(called >= 0)
-    print_reset()
-    print_block_body(called)
-    let c = print_take()
-    let braced = probe_fn("cg_expr_ssv_brace", declared_order_src(), "make")
-    if cg_ice_count() != 0 { cg_report_ices("the brace spelling was refused") }
-    assert_eq(cg_ice_count(), 0)
-    assert(braced >= 0)
-    print_reset()
-    print_block_body(braced)
-    assert_eq_str("brace literal matches the paren payload", print_take(), c)
+    with handler Diag {} {
+        let called = probe_fn("cg_expr_ssv_call", call_spelling_src(), "make")
+        assert(called >= 0)
+        print_reset()
+        print_block_body(called)
+        let c = print_take()
+        let braced = probe_fn("cg_expr_ssv_brace", declared_order_src(), "make")
+        if cg_ice_count() != 0 { cg_report_ices("the brace spelling was refused") }
+        assert_eq(cg_ice_count(), 0)
+        assert(braced >= 0)
+        print_reset()
+        print_block_body(braced)
+        assert_eq_str("brace literal matches the paren payload", print_take(), c)
+    }
 }
 
 test "on a generic enum, a brace variant and a paren variant with the same fields lower to the same C" {
-    let called = probe_fn("cg_expr_ssv_gcall", generic_call_spelling_src(), "make")
-    assert(called >= 0)
-    print_reset()
-    print_block_body(called)
-    let c = print_take()
-    let braced = probe_fn("cg_expr_ssv_gbrace", generic_variant_src(), "make")
-    if cg_ice_count() != 0 { cg_report_ices("the generic brace spelling was refused") }
-    assert_eq(cg_ice_count(), 0)
-    assert(braced >= 0)
-    print_reset()
-    print_block_body(braced)
-    assert_eq_str("brace literal matches the paren payload", print_take(), c)
+    with handler Diag {} {
+        let called = probe_fn("cg_expr_ssv_gcall", generic_call_spelling_src(), "make")
+        assert(called >= 0)
+        print_reset()
+        print_block_body(called)
+        let c = print_take()
+        let braced = probe_fn("cg_expr_ssv_gbrace", generic_variant_src(), "make")
+        if cg_ice_count() != 0 { cg_report_ices("the generic brace spelling was refused") }
+        assert_eq(cg_ice_count(), 0)
+        assert(braced >= 0)
+        print_reset()
+        print_block_body(braced)
+        assert_eq_str("brace literal matches the paren payload", print_take(), c)
+    }
 }
 
 test "a declared struct is still lowered as a struct literal" {

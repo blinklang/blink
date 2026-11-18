@@ -8,9 +8,9 @@
 // means, and the call-site table records that answer once so codegen never re-asks.
 
 import compiler.{compile_to_program}
-import typecheck.{check_types}
-import diagnostics.{diag_reset, diag_entries}
-import parser.{node_count, node_kind, node_name, node_left, node_obj, node_method, node_module}
+import typecheck.{check_types, TypeCheck}
+import diagnostics.{diag_reset, diag_entries, Diag}
+import parser.{node_count, node_kind, node_name, node_left, node_obj, node_method, node_module, Parse}
 import ast.{NodeKind}
 import layout.{layout_reset}
 import ir.{ir_reset, IrKind, ir_kind, ir_kind_name, ir_c_name}
@@ -21,6 +21,7 @@ import mono.{run_mono}
 import cname.{c_fn_decl_name}
 import cg_test_helpers.{cg_probe_begin, cg_probe_front_end_clean}
 import std.io
+import lexer.{Lex}
 
 fn dump_ice() ! IO.Print {
     for d in diag_entries {
@@ -30,19 +31,21 @@ fn dump_ice() ! IO.Print {
 
 // The fixture already exists on disk, so compiling it is the same walk every other
 // compile_to_program probe in this suite does, minus the write this one does not need.
-fn compile_fixture(path: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Env.Exit, Env.Read, FS.Read, IO {
-    diag_reset()
-    cg_probe_begin(path)
-    let program = compile_to_program(path, 1)
-    cg_probe_front_end_clean("import resolution")
-    check_types(program)
-    cg_probe_front_end_clean("type checking")
-    layout_reset()
-    ir_reset()
-    cg_expr_reset()
-    cg_reg_reset()
-    cg_reg_build(program)
-    program
+fn compile_fixture(path: Str) -> Int ! Env.Exit, Env.Read, FS.Read, IO {
+    with handler Diag {}, handler Lex {}, handler Parse {}, handler TypeCheck {} {
+        diag_reset()
+        cg_probe_begin(path)
+        let program = compile_to_program(path, 1)
+        cg_probe_front_end_clean("import resolution")
+        check_types(program)
+        cg_probe_front_end_clean("type checking")
+        layout_reset()
+        ir_reset()
+        cg_expr_reset()
+        cg_reg_reset()
+        cg_reg_build(program)
+        program
+    }
 }
 
 fn bare_call(name: Str) -> Int ! IO.Print {
@@ -104,42 +107,52 @@ fn assert_calls_symbol(label: Str, id: Int, want_module: Str, want_name: Str) ! 
 }
 
 test "a bare name two modules declare calls the declaration this file's import selected" {
-    let program = compile_fixture("tests/zzcd_calls/src/main_left.bl")
-    run_mono(program)
-    assert_calls_symbol("left", lower_call(bare_call("zzcd_pick")), "zzcd_left", "zzcd_pick")
+    with handler Diag {} {
+        let program = compile_fixture("tests/zzcd_calls/src/main_left.bl")
+        run_mono(program)
+        assert_calls_symbol("left", lower_call(bare_call("zzcd_pick")), "zzcd_left", "zzcd_pick")
+    }
 }
 
 // The same spelling, the other import: proves the answer follows the importing file rather
 // than being a fixed winner of a scan over every declaration named `zzcd_pick`.
 test "the same bare name in a second file's import calls the other module's declaration" {
-    let program = compile_fixture("tests/zzcd_calls/src/main_right.bl")
-    run_mono(program)
-    assert_calls_symbol("right", lower_call(bare_call("zzcd_pick")), "zzcd_right", "zzcd_pick")
+    with handler Diag {} {
+        let program = compile_fixture("tests/zzcd_calls/src/main_right.bl")
+        run_mono(program)
+        assert_calls_symbol("right", lower_call(bare_call("zzcd_pick")), "zzcd_right", "zzcd_pick")
+    }
 }
 
 // zzcd_user.bl aliases a different module's function to the name `zzcd_tag`. The qualifier
 // in main_qualified.bl settles the module before any name is read, so that alias — bound in
 // a file this program also loads — must not reach across into what the qualifier means.
 test "a module-qualified call reaches the qualifier's own declaration despite another file's alias" {
-    let program = compile_fixture("tests/zzcd_calls/src/main_qualified.bl")
-    run_mono(program)
-    assert_calls_symbol("qualified", lower_call(qualified_call("zzcd_tagger", "zzcd_tag")), "zzcd_tagger", "zzcd_tag")
+    with handler Diag {} {
+        let program = compile_fixture("tests/zzcd_calls/src/main_qualified.bl")
+        run_mono(program)
+        assert_calls_symbol("qualified", lower_call(qualified_call("zzcd_tagger", "zzcd_tag")), "zzcd_tagger", "zzcd_tag")
+    }
 }
 
 // zzcd_aliased.bl binds `zzcd_chosen` to `zzcd_left.zzcd_pick` and no other declaration in
 // the program shares that spelling: only the alias table says what the bare call means, so
 // a search of every declaration by name would find nothing here to fall back to.
 test "a bare call reachable only through an import alias calls the alias's own declaration" {
-    let program = compile_fixture("tests/zzcd_calls/src/main_alias_bare.bl")
-    run_mono(program)
-    assert_calls_symbol("alias-only", lower_call(bare_call("zzcd_chosen")), "zzcd_left", "zzcd_pick")
+    with handler Diag {} {
+        let program = compile_fixture("tests/zzcd_calls/src/main_alias_bare.bl")
+        run_mono(program)
+        assert_calls_symbol("alias-only", lower_call(bare_call("zzcd_chosen")), "zzcd_left", "zzcd_pick")
+    }
 }
 
 // zzcd_facade.bl declares nothing itself; it re-exports zzcd_tagger with `pub import`, so
 // the qualifier names a module that forwards the declaration rather than the module that
 // owns it. The call still has to reach zzcd_tagger's own declaration.
 test "a call qualified with a re-exporting facade reaches the declaration it forwards" {
-    let program = compile_fixture("tests/zzcd_calls/src/main_facade_qualified.bl")
-    run_mono(program)
-    assert_calls_symbol("facade", lower_call(qualified_call("zzcd_facade", "zzcd_tag")), "zzcd_tagger", "zzcd_tag")
+    with handler Diag {} {
+        let program = compile_fixture("tests/zzcd_calls/src/main_facade_qualified.bl")
+        run_mono(program)
+        assert_calls_symbol("facade", lower_call(qualified_call("zzcd_facade", "zzcd_tag")), "zzcd_tagger", "zzcd_tag")
+    }
 }

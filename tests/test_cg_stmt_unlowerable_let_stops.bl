@@ -10,11 +10,12 @@ import std.fs
 import typecheck.{TYPE_INT}
 import layout.{bind_binder, binder_scope_pop, binder_scope_push, layout_reset}
 import ir.{ir_reset}
-import parser.{node_count, node_body, node_kind, node_name}
+import parser.{node_count, node_body, node_kind, node_name, Parse}
 import ast.{NodeKind}
 import compiler.{compile_to_program}
-import diagnostics.{diag_entries, diag_reset}
+import diagnostics.{diag_entries, diag_reset, Diag}
 import cg_stmt.{cg_stmt_reset, lower_block}
+import lexer.{Lex}
 
 fn find_fn(name: Str) -> Int {
     let mut i = 0
@@ -26,17 +27,19 @@ fn find_fn(name: Str) -> Int {
 }
 
 // Parses one probe and answers its named function, with no types recorded for it.
-fn parse_probe(path: Str, src: Str, name: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, FS.Delete, Env.Exit, Env.Read, FS.Read, IO, FS.Write {
-    ir_reset()
-    layout_reset()
-    cg_stmt_reset()
-    diag_reset()
-    fs.write(path, src).unwrap()
-    let _program = compile_to_program(path, 1)
-    let _ = fs.delete(path)
-    let f = find_fn(name)
-    assert(f >= 0)
-    f
+fn parse_probe(path: Str, src: Str, name: Str) -> Int ! FS.Delete, Env.Exit, Env.Read, FS.Read, IO, FS.Write {
+    with handler Diag {}, handler Lex {}, handler Parse {} {
+        ir_reset()
+        layout_reset()
+        cg_stmt_reset()
+        diag_reset()
+        fs.write(path, src).unwrap()
+        let _program = compile_to_program(path, 1)
+        let _ = fs.delete(path)
+        let f = find_fn(name)
+        assert(f >= 0)
+        f
+    }
 }
 
 fn ice_mentioning(text: Str) -> Int {
@@ -48,50 +51,56 @@ fn ice_mentioning(text: Str) -> Int {
 }
 
 test "an inner let with no recorded type does not resolve to an outer binder" {
-    let f = parse_probe("build/cg_stmt_stop_shadow.bl", #"fn probe_shadow() {
+    with handler Diag {} {
+        let f = parse_probe("build/cg_stmt_stop_shadow.bl", #"fn probe_shadow() {
     let x = 1
     x = 2
 }
 fn main() { probe_shadow() }
 "#, "probe_shadow")
-    // An outer frame holds the same name at a type the inner declaration is not. If the
-    // inner `let` binds anyway, its entry answers nothing and the assignment below reads
-    // this outer type instead, which is the wrong type reported as if it were the right
-    // one. The lowering must stop at the `let` and build no assignment at all.
-    let outer = binder_scope_push()
-    bind_binder(outer, "x", TYPE_INT)
-    let block = lower_block(node_body(f))
-    binder_scope_pop()
-    assert(block < 0)
-    // The stop must be the `let`'s missing type, not a later statement declining for its
-    // own reason: a stop at the assignment would pass this file while the shadowing hole
-    // stayed open.
-    assert(ice_mentioning("no recorded type") > 0)
-    assert_eq(ice_mentioning("not a local"), 0)
+        // An outer frame holds the same name at a type the inner declaration is not. If the
+        // inner `let` binds anyway, its entry answers nothing and the assignment below reads
+        // this outer type instead, which is the wrong type reported as if it were the right
+        // one. The lowering must stop at the `let` and build no assignment at all.
+        let outer = binder_scope_push()
+        bind_binder(outer, "x", TYPE_INT)
+        let block = lower_block(node_body(f))
+        binder_scope_pop()
+        assert(block < 0)
+        // The stop must be the `let`'s missing type, not a later statement declining for its
+        // own reason: a stop at the assignment would pass this file while the shadowing hole
+        // stayed open.
+        assert(ice_mentioning("no recorded type") > 0)
+        assert_eq(ice_mentioning("not a local"), 0)
+    }
 }
 
 test "a let with no recorded type is reported once, not once per stage that reads it" {
-    let f = parse_probe("build/cg_stmt_stop_once.bl", #"fn probe_once() {
+    with handler Diag {} {
+        let f = parse_probe("build/cg_stmt_stop_once.bl", #"fn probe_once() {
     let y = 1
 }
 fn main() { probe_once() }
 "#, "probe_once")
-    let block = lower_block(node_body(f))
-    assert(block < 0)
-    assert(ice_mentioning("no recorded type") > 0)
-    // The missing type is the one error. Handing the missing type on to layout would
-    // report a declined layout on top of it, and the reader would meet that one first.
-    assert_eq(ice_mentioning("layout declined"), 0)
+        let block = lower_block(node_body(f))
+        assert(block < 0)
+        assert(ice_mentioning("no recorded type") > 0)
+        // The missing type is the one error. Handing the missing type on to layout would
+        // report a declined layout on top of it, and the reader would meet that one first.
+        assert_eq(ice_mentioning("layout declined"), 0)
+    }
 }
 
 test "a destructuring let with no recorded type stops the same way" {
-    let f = parse_probe("build/cg_stmt_stop_tuple.bl", #"fn probe_tuple() {
+    with handler Diag {} {
+        let f = parse_probe("build/cg_stmt_stop_tuple.bl", #"fn probe_tuple() {
     let (a, b) = (1, 2)
 }
 fn main() { probe_tuple() }
 "#, "probe_tuple")
-    let block = lower_block(node_body(f))
-    assert(block < 0)
-    assert(ice_mentioning("no recorded type") > 0)
-    assert_eq(ice_mentioning("layout declined"), 0)
+        let block = lower_block(node_body(f))
+        assert(block < 0)
+        assert(ice_mentioning("no recorded type") > 0)
+        assert_eq(ice_mentioning("layout declined"), 0)
+    }
 }

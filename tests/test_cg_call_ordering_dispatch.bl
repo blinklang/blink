@@ -7,6 +7,7 @@ import lower_test_helpers.{probe, rhs_of, assert_kind, assert_eq_str, assert_sha
 import ir.{IrKind, ir_c_name, ir_kid}
 import cg_call.{lower_operator_method}
 import cg_test_helpers.{cg_probe_begin, cg_probe_front_end_clean}
+import diagnostics.{Diag}
 
 fn src_ordering() -> Str {
     #"@derive(Ord)
@@ -30,7 +31,7 @@ fn main() {
 "#
 }
 
-fn clean_probe(stem: Str, src: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Env.Exit, Env.Read, FS.Read, FS.Write, IO, Env.Write, Process.Spawn {
+fn clean_probe(stem: Str, src: Str) -> Int ! Env.Exit, Env.Read, FS.Read, FS.Write, IO, Env.Write, Process.Spawn {
     cg_probe_begin("build/{stem}_probe.bl")
     let program = probe(stem, src)
     cg_probe_front_end_clean("the probe source")
@@ -39,17 +40,19 @@ fn clean_probe(stem: Str, src: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, D
 
 // The comparison bound to `name`, lowered as the expression stage hands it over, checked
 // to test the cmp call against the variant `answer` with the C operator `op`.
-fn assert_ordering(name: Str, op: Str, test_op: Str, answer: Str) ! Diag.Report, IO.Print {
-    let id = lower_operator_method(rhs_of(name), op)
-    assert_kind("kind", id, IrKind.Binary)
-    assert_shape("shape", id, "Binary(CallDirect(VarRef, VarRef), Const)")
-    assert_eq_str("test", ir_c_name(id), test_op)
-    assert_eq_str("symbol", ir_c_name(ir_kid(id, 0)), "blink_84Ranked_cmp")
-    // The Ordering declaration's own module prefixes the name, so only its tail is pinned.
-    let got = ir_c_name(ir_kid(id, 1))
-    if !got.ends_with("_Ordering_{answer}") { io.println("FAIL: answer: got '{got}', want Ordering.{answer}") }
-    assert(got.ends_with("_Ordering_{answer}"))
-    assert_verifies("verify", id)
+fn assert_ordering(name: Str, op: Str, test_op: Str, answer: Str) ! IO.Print {
+    with handler Diag {} {
+        let id = lower_operator_method(rhs_of(name), op)
+        assert_kind("kind", id, IrKind.Binary)
+        assert_shape("shape", id, "Binary(CallDirect(VarRef, VarRef), Const)")
+        assert_eq_str("test", ir_c_name(id), test_op)
+        assert_eq_str("symbol", ir_c_name(ir_kid(id, 0)), "blink_84Ranked_cmp")
+        // The Ordering declaration's own module prefixes the name, so only its tail is pinned.
+        let got = ir_c_name(ir_kid(id, 1))
+        if !got.ends_with("_Ordering_{answer}") { io.println("FAIL: answer: got '{got}', want Ordering.{answer}") }
+        assert(got.ends_with("_Ordering_{answer}"))
+        assert_verifies("verify", id)
+    }
 }
 
 test "a less-than asks the derived cmp whether the answer is Less" {
@@ -75,17 +78,20 @@ test "a greater-or-equal asks the derived cmp whether the answer is anything but
 }
 
 test "an ordering on a generic instance calls that instance's own cmp" {
-    clean_probe("cg_call_ordering", src_ordering())
-    let id = lower_operator_method(rhs_of("boxed_lt"), "<")
-    assert_kind("kind", id, IrKind.Binary)
-    assert_eq_str("symbol", ir_c_name(ir_kid(id, 0)), "blink_84Box_0Int_cmp")
-    assert_verifies("verify", id)
+    with handler Diag {} {
+        clean_probe("cg_call_ordering", src_ordering())
+        let id = lower_operator_method(rhs_of("boxed_lt"), "<")
+        assert_kind("kind", id, IrKind.Binary)
+        assert_eq_str("symbol", ir_c_name(ir_kid(id, 0)), "blink_84Box_0Int_cmp")
+        assert_verifies("verify", id)
+    }
 }
 
 // Typecheck refuses an ordering over a type with no cmp, so the lowering is put the question
 // directly: it reports the missing method rather than calling a symbol nothing defines.
 test "an ordering over an operand with no cmp is an internal error, not a call" {
-    clean_probe("cg_call_ordering_none", #"@derive(Eq)
+    with handler Diag {} {
+        clean_probe("cg_call_ordering_none", #"@derive(Eq)
 type Plain { x: Int }
 
 fn main() {
@@ -95,5 +101,6 @@ fn main() {
     let _keep = [same]
 }
 "#)
-    assert_ice("ord", lower_operator_method(rhs_of("same"), "<"), "OrderingMethodNotFound")
+        assert_ice("ord", lower_operator_method(rhs_of("same"), "<"), "OrderingMethodNotFound")
+    }
 }

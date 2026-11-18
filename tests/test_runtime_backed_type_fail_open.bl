@@ -9,9 +9,11 @@
 
 import std.fs
 import compiler.{compile_to_program}
-import typecheck.{check_types, tc_lookup_node_tid, tc_type_str, tc_tid_kind, tc_tid_decl_node, TyKind}
-import parser.{node_count, nodes, node_source_module}
+import typecheck.{check_types, tc_lookup_node_tid, tc_type_str, tc_tid_kind, tc_tid_decl_node, TyKind, TypeCheck}
+import parser.{node_count, nodes, node_source_module, Parse}
 import std.io
+import diagnostics.{Diag}
+import lexer.{Lex}
 
 fn assert_eq_int(got: Int, want: Int, label: Str) ! IO.Print {
     if got != want { io.println("FAIL: {label} — got {got}, want {want}") }
@@ -80,15 +82,17 @@ fn count_nodes_by_str(want: Str) -> Int {
 // a program WITH prelude in one harness mode and WITHOUT it in the other, with only an
 // unflushed ModuleNotFound to show for it. Filed separately; the halves below that need a
 // real declaration skip rather than assert a mode-dependent answer.
-fn stdlib_loadable() -> Bool ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete, Env.Exit, Env.Read, FS.Read, IO, FS.Write {
-    let path = "build/runtime_backed_type_fail_open_stdlib_probe.bl"
-    fs.write(path, "import std.time\n\nfn main() \{\n    assert(true)\n}\n").unwrap()
-    let program = compile_to_program(path, 1)
-    check_types(program)
-    let _ = fs.delete(path)
-    // Duration is declared ONLY in lib/std/time.bl — observing its tid proves the module
-    // was actually loaded and registered, not merely named in an import.
-    find_tid_by_str("Duration") >= 0
+fn stdlib_loadable() -> Bool ! FS.Delete, Env.Exit, Env.Read, FS.Read, IO, FS.Write {
+    with handler Diag {}, handler Lex {}, handler Parse {}, handler TypeCheck {} {
+        let path = "build/runtime_backed_type_fail_open_stdlib_probe.bl"
+        fs.write(path, "import std.time\n\nfn main() \{\n    assert(true)\n}\n").unwrap()
+        let program = compile_to_program(path, 1)
+        check_types(program)
+        let _ = fs.delete(path)
+        // Duration is declared ONLY in lib/std/time.bl — observing its tid proves the module
+        // was actually loaded and registered, not merely named in an import.
+        find_tid_by_str("Duration") >= 0
+    }
 }
 
 // ── Half A — the process handle operations, with NO `import std.process` ────────────
@@ -117,22 +121,24 @@ fn process_probe_src() -> Str {
 }
 
 test "process handle operations type as ProcessResult without import std.process" {
-    let path = "build/runtime_backed_type_fail_open_process_probe.bl"
-    fs.write(path, process_probe_src()).unwrap()
-    let program = compile_to_program(path, 1)
-    check_types(program)
-    let _ = fs.delete(path)
+    with handler Diag {}, handler Lex {}, handler Parse {}, handler TypeCheck {} {
+        let path = "build/runtime_backed_type_fail_open_process_probe.bl"
+        fs.write(path, process_probe_src()).unwrap()
+        let program = compile_to_program(path, 1)
+        check_types(program)
+        let _ = fs.delete(path)
 
-    let tid = find_tid_by_str("ProcessResult")
-    assert_true(tid >= 0, "process: a ProcessResult tid is observed — typecheck must not erase a runtime-backed type to Void")
-    assert_true(tc_tid_kind(tid) == TyKind.Struct, "process: the ProcessResult tid is a Struct kind")
-    assert_eq_int(count_distinct_tids_by_str("ProcessResult"), 1, "process: all three operations share ONE ProcessResult tid")
-    let decl = tc_tid_decl_node(tid)
-    assert_true(decl >= 0 && node_source_module(decl) == "std_process", "process: the tid is the one lib/std/process.bl declares")
-    // Six nodes must carry it: the three unwrapped calls and the three lets bound to them. A
-    // fix that typed only the call expression and left the let erased would satisfy the
-    // checks above.
-    assert_true(count_nodes_by_str("ProcessResult") >= 6, "process: both the call and its let binding carry the type, for all three operations")
+        let tid = find_tid_by_str("ProcessResult")
+        assert_true(tid >= 0, "process: a ProcessResult tid is observed — typecheck must not erase a runtime-backed type to Void")
+        assert_true(tc_tid_kind(tid) == TyKind.Struct, "process: the ProcessResult tid is a Struct kind")
+        assert_eq_int(count_distinct_tids_by_str("ProcessResult"), 1, "process: all three operations share ONE ProcessResult tid")
+        let decl = tc_tid_decl_node(tid)
+        assert_true(decl >= 0 && node_source_module(decl) == "std_process", "process: the tid is the one lib/std/process.bl declares")
+        // Six nodes must carry it: the three unwrapped calls and the three lets bound to them. A
+        // fix that typed only the call expression and left the let erased would satisfy the
+        // checks above.
+        assert_true(count_nodes_by_str("ProcessResult") >= 6, "process: both the call and its let binding carry the type, for all three operations")
+    }
 }
 
 // ── Half B — an imported declaration and the handle op share one tid ────────────────
@@ -157,18 +163,20 @@ fn main() ! Process.Spawn {
 }
 
 test "an imported ProcessResult and the handle op return type are ONE tid" {
-    if !stdlib_loadable() {
-        skip("harness cannot load std.* from this binary's directory — the declaration half needs a real lib/std/process.bl")
-    }
-    let path = "build/runtime_backed_type_fail_open_declared_probe.bl"
-    fs.write(path, declared_probe_src()).unwrap()
-    let program = compile_to_program(path, 1)
-    check_types(program)
-    let _ = fs.delete(path)
+    with handler Diag {}, handler Lex {}, handler Parse {}, handler TypeCheck {} {
+        if !stdlib_loadable() {
+            skip("harness cannot load std.* from this binary's directory — the declaration half needs a real lib/std/process.bl")
+        }
+        let path = "build/runtime_backed_type_fail_open_declared_probe.bl"
+        fs.write(path, declared_probe_src()).unwrap()
+        let program = compile_to_program(path, 1)
+        check_types(program)
+        let _ = fs.delete(path)
 
-    let tid = find_tid_by_str("ProcessResult")
-    assert_true(tid >= 0, "declared: a ProcessResult tid is observed")
-    assert_eq_int(count_distinct_tids_by_str("ProcessResult"), 1, "declared: the declaration and the handle op return share ONE tid")
+        let tid = find_tid_by_str("ProcessResult")
+        assert_true(tid >= 0, "declared: a ProcessResult tid is observed")
+        assert_eq_int(count_distinct_tids_by_str("ProcessResult"), 1, "declared: the declaration and the handle op return share ONE tid")
+    }
 }
 
 // ── Half C — the Instant twin, with NO `import std.time` ────────────────────────────
@@ -191,17 +199,19 @@ fn time_probe_src() -> Str {
 }
 
 test "time.read() types as Instant without import std.time" {
-    if !stdlib_loadable() {
-        skip("harness cannot load std.* from this binary's directory — see stdlib_loadable()")
-    }
-    let path = "build/runtime_backed_type_fail_open_time_probe.bl"
-    fs.write(path, time_probe_src()).unwrap()
-    let program = compile_to_program(path, 1)
-    check_types(program)
-    let _ = fs.delete(path)
+    with handler Diag {}, handler Lex {}, handler Parse {}, handler TypeCheck {} {
+        if !stdlib_loadable() {
+            skip("harness cannot load std.* from this binary's directory — see stdlib_loadable()")
+        }
+        let path = "build/runtime_backed_type_fail_open_time_probe.bl"
+        fs.write(path, time_probe_src()).unwrap()
+        let program = compile_to_program(path, 1)
+        check_types(program)
+        let _ = fs.delete(path)
 
-    let tid = find_tid_by_str("Instant")
-    assert_true(tid >= 0, "time: an Instant tid is observed — typecheck must not erase a runtime-backed type")
-    assert_true(tc_tid_kind(tid) == TyKind.Struct, "time: the Instant tid is a Struct kind")
-    assert_eq_int(count_distinct_tids_by_str("Instant"), 1, "time: one Instant tid")
+        let tid = find_tid_by_str("Instant")
+        assert_true(tid >= 0, "time: an Instant tid is observed — typecheck must not erase a runtime-backed type")
+        assert_true(tc_tid_kind(tid) == TyKind.Struct, "time: the Instant tid is a Struct kind")
+        assert_eq_int(count_distinct_tids_by_str("Instant"), 1, "time: one Instant tid")
+    }
 }

@@ -9,9 +9,9 @@
 // The import renames its qualifier, as `import tok.{make}` with a `tok` declaration is E1012.
 
 import compiler.{compile_to_program}
-import typecheck.{check_types}
-import diagnostics.{diag_reset, diag_entries}
-import parser.{node_count, node_kind, node_name, node_obj, node_method}
+import typecheck.{check_types, TypeCheck}
+import diagnostics.{diag_reset, diag_entries, Diag}
+import parser.{node_count, node_kind, node_name, node_obj, node_method, Parse}
 import ast.{NodeKind}
 import layout.{layout_reset}
 import ir.{ir_reset}
@@ -21,28 +21,31 @@ import cg_call.{lower_call}
 import mono.{run_mono}
 import cg_test_helpers.{cg_probe_begin, cg_probe_front_end_clean}
 import std.io
+import lexer.{Lex}
 
 let PKG = "build/cg_shadow_module_global_pkg"
 
-fn compile_probe() -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Env.Exit, Env.Read, FS.Read, IO, FS.Write, Process.Spawn {
-    let _mk = process.run("mkdir", ["-p", "{PKG}/src"]).unwrap()
-    fs.write("{PKG}/blink.toml", "[package]\nname = \"cgshadowmod\"\nversion = \"0.1.0\"\n").unwrap()
-    fs.write("{PKG}/src/tok.bl", "pub fn make() -> Int \{ 1 \}\n").unwrap()
-    fs.write("{PKG}/src/probe.bl",
-        "import tok as tok_mod.\{make}\n\npub let mut tok: List[Int] = []\n\nfn run() \{\n    tok.push(make())\n    let _n = tok.len()\n\}\n\nfn main() \{ run() \}\n").unwrap()
-    let path = "{PKG}/src/probe.bl"
-    diag_reset()
-    cg_probe_begin(path)
-    let program = compile_to_program(path, 1)
-    cg_probe_front_end_clean("import resolution")
-    check_types(program)
-    cg_probe_front_end_clean("type checking")
-    layout_reset()
-    ir_reset()
-    cg_expr_reset()
-    cg_reg_reset()
-    cg_reg_build(program)
-    program
+fn compile_probe() -> Int ! Env.Exit, Env.Read, FS.Read, IO, FS.Write, Process.Spawn {
+    with handler Diag {}, handler Lex {}, handler Parse {}, handler TypeCheck {} {
+        let _mk = process.run("mkdir", ["-p", "{PKG}/src"]).unwrap()
+        fs.write("{PKG}/blink.toml", "[package]\nname = \"cgshadowmod\"\nversion = \"0.1.0\"\n").unwrap()
+        fs.write("{PKG}/src/tok.bl", "pub fn make() -> Int \{ 1 \}\n").unwrap()
+        fs.write("{PKG}/src/probe.bl",
+            "import tok as tok_mod.\{make}\n\npub let mut tok: List[Int] = []\n\nfn run() \{\n    tok.push(make())\n    let _n = tok.len()\n\}\n\nfn main() \{ run() \}\n").unwrap()
+        let path = "{PKG}/src/probe.bl"
+        diag_reset()
+        cg_probe_begin(path)
+        let program = compile_to_program(path, 1)
+        cg_probe_front_end_clean("import resolution")
+        check_types(program)
+        cg_probe_front_end_clean("type checking")
+        layout_reset()
+        ir_reset()
+        cg_expr_reset()
+        cg_reg_reset()
+        cg_reg_build(program)
+        program
+    }
 }
 
 fn cleanup() ! Process.Spawn {
@@ -72,19 +75,21 @@ fn dump_ice() ! IO.Print {
 }
 
 test "a module-level global named like an imported module still dispatches its method calls as a value" {
-    let program = compile_probe()
-    run_mono(program)
-    let push_id = lower_call(tok_call("push"))
-    if push_id < 0 {
-        io.println("FAIL: tok.push(...) refused instead of dispatching to List.push")
-        dump_ice()
+    with handler Diag {} {
+        let program = compile_probe()
+        run_mono(program)
+        let push_id = lower_call(tok_call("push"))
+        if push_id < 0 {
+            io.println("FAIL: tok.push(...) refused instead of dispatching to List.push")
+            dump_ice()
+        }
+        assert(push_id >= 0)
+        let len_id = lower_call(tok_call("len"))
+        if len_id < 0 {
+            io.println("FAIL: tok.len() refused instead of dispatching to List.len")
+            dump_ice()
+        }
+        assert(len_id >= 0)
+        cleanup()
     }
-    assert(push_id >= 0)
-    let len_id = lower_call(tok_call("len"))
-    if len_id < 0 {
-        io.println("FAIL: tok.len() refused instead of dispatching to List.len")
-        dump_ice()
-    }
-    assert(len_id >= 0)
-    cleanup()
 }

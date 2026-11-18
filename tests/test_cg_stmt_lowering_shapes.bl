@@ -1,16 +1,17 @@
 import std.fs
 import std.io
-import typecheck.{check_types, TYPE_INT}
+import typecheck.{check_types, TYPE_INT, TypeCheck}
 import layout.{layout_reset}
 import mono.{run_mono}
 import ir.{ir_dump, ir_reset, ir_verify}
-import parser.{node_count, node_kind, node_name, node_body}
+import parser.{node_count, node_kind, node_name, node_body, Parse}
 import ast.{NodeKind}
 import compiler.{compile_to_program}
-import diagnostics.{diag_entries, diag_reset}
+import diagnostics.{diag_entries, diag_reset, Diag}
 import cg_stmt.{cg_stmt_reset, lower_fn, lower_block_into}
 import cname.{c_mint_local}
 import cg_reg.{cg_reg_reset, cg_reg_build}
+import lexer.{Lex}
 
 fn find_fn(name: Str) -> Int {
     let mut i = 0
@@ -21,31 +22,35 @@ fn find_fn(name: Str) -> Int {
     -1
 }
 
-fn run_probe(path: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete, Env.Exit, Env.Read, FS.Read, IO, FS.Write {
-    ir_reset()
-    layout_reset()
-    cg_stmt_reset()
-    diag_reset()
-    fs.write(path, src).unwrap()
-    let program = compile_to_program(path, 1)
-    check_types(program)
-    run_mono(program)
-    // The driver builds this registry before it lowers any body.
-    cg_reg_reset()
-    cg_reg_build(program)
-    let _ = fs.delete(path)
+fn run_probe(path: Str, src: Str) ! FS.Delete, Env.Exit, Env.Read, FS.Read, IO, FS.Write {
+    with handler Diag {}, handler Lex {}, handler Parse {}, handler TypeCheck {} {
+        ir_reset()
+        layout_reset()
+        cg_stmt_reset()
+        diag_reset()
+        fs.write(path, src).unwrap()
+        let program = compile_to_program(path, 1)
+        check_types(program)
+        run_mono(program)
+        // The driver builds this registry before it lowers any body.
+        cg_reg_reset()
+        cg_reg_build(program)
+        let _ = fs.delete(path)
+    }
 }
 
 // Lowers one named function of the probe and answers its dump. The expression stage is
 // not built yet, so every value in the tree is a placeholder; the statement shape around
 // those placeholders is what these tests read.
-fn dump_of(name: Str) -> Str ! Diag.Report, IO.Print {
-    let f = find_fn(name)
-    assert(f >= 0)
-    let root = lower_fn(f)
-    for err in ir_verify(root) { io.println("VERIFY: {err}") }
-    assert_eq(ir_verify(root).len(), 0)
-    ir_dump(root)
+fn dump_of(name: Str) -> Str ! IO.Print {
+    with handler Diag {} {
+        let f = find_fn(name)
+        assert(f >= 0)
+        let root = lower_fn(f)
+        for err in ir_verify(root) { io.println("VERIFY: {err}") }
+        assert_eq(ir_verify(root).len(), 0)
+        ir_dump(root)
+    }
 }
 
 fn count_of(text: Str, needle: Str) -> Int {
@@ -95,22 +100,24 @@ fn ice_count() -> Int {
 // by check_types and survives between tests, so a later unstamped parse would read the
 // stale stamps of an earlier one instead of finding nothing.
 test "a body whose types were never recorded is an internal error" {
-    ir_reset()
-    layout_reset()
-    cg_stmt_reset()
-    diag_reset()
-    fs.write("build/cg_stmt_unstamped.bl", #"fn probe() -> Int {
+    with handler Diag {}, handler Lex {}, handler Parse {} {
+        ir_reset()
+        layout_reset()
+        cg_stmt_reset()
+        diag_reset()
+        fs.write("build/cg_stmt_unstamped.bl", #"fn probe() -> Int {
     let a = 1
     a
 }
 fn main() { assert(probe() == 1) }
 "#).unwrap()
-    let _program = compile_to_program("build/cg_stmt_unstamped.bl", 1)
-    let _ = fs.delete("build/cg_stmt_unstamped.bl")
-    let f = find_fn("probe")
-    assert(f >= 0)
-    let _ = lower_fn(f)
-    assert(ice_mentioning("no recorded type") > 0)
+        let _program = compile_to_program("build/cg_stmt_unstamped.bl", 1)
+        let _ = fs.delete("build/cg_stmt_unstamped.bl")
+        let f = find_fn("probe")
+        assert(f >= 0)
+        let _ = lower_fn(f)
+        assert(ice_mentioning("no recorded type") > 0)
+    }
 }
 
 test "a let binding lowers to one Let under the binder's own C name" {
@@ -490,20 +497,22 @@ fn main() { assert(probe() == 1) }
 }
 
 test "a block lowered into a destination assigns its tail rather than returning it" {
-    run_probe("build/cg_stmt_block_into_dest.bl", #"fn probe(n: Int) -> Int {
+    with handler Diag {} {
+        run_probe("build/cg_stmt_block_into_dest.bl", #"fn probe(n: Int) -> Int {
     let d = n + 1
     d
 }
 fn main() { assert(probe(1) == 2) }
 "#)
-    let f = find_fn("probe")
-    assert(f >= 0)
-    let root = lower_block_into(node_body(f), "_cg_dest", TYPE_INT)
-    assert_eq(ir_verify(root).len(), 0)
-    let d = ir_dump(root)
-    assert_eq(count_of(d, "(Return "), 0)
-    assert_eq(count_of(d, "(Assign "), 1)
-    assert(d.contains("_cg_dest"))
+        let f = find_fn("probe")
+        assert(f >= 0)
+        let root = lower_block_into(node_body(f), "_cg_dest", TYPE_INT)
+        assert_eq(ir_verify(root).len(), 0)
+        let d = ir_dump(root)
+        assert_eq(count_of(d, "(Return "), 0)
+        assert_eq(count_of(d, "(Assign "), 1)
+        assert(d.contains("_cg_dest"))
+    }
 }
 
 test "a refutable tuple pattern is tested rather than taken as a catch-all" {

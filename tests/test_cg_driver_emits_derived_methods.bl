@@ -8,10 +8,11 @@ import std.io
 import layout.{Position, layout_of, layout_reset}
 import cname.{c_derive_method_name, cname_reset}
 import cg_test_helpers.{cg_probe_compile}
-import cg.{CgConfig, generate, generate_types_header, generate_module_object}
+import cg.{CgConfig, generate, generate_types_header, generate_module_object, Codegen}
 import cg_reg.{cg_reg_tid_for_decl, cg_reg_type_decls}
 import mono.{run_mono}
 import parser.{node_name}
+import diagnostics.{Diag}
 
 fn assert_has(text: Str, needle: Str) ! IO.Print {
     if !text.contains(needle) {
@@ -39,21 +40,23 @@ fn derive_decl_of(type_name: Str) -> Int {
     -1
 }
 
-fn eq_signature(type_name: Str) -> Str ! Diag.Report {
+fn eq_signature(type_name: Str) -> Str {
     let decl = derive_decl_of(type_name)
     assert(decl >= 0)
     let spelling = layout_of(cg_reg_tid_for_decl(decl), Position.Param).c_spelling
     "int {c_derive_method_name(decl, "eq")}({spelling} b_self, {spelling} b_other)"
 }
 
-fn single_file_probe(stem: Str, src: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete, Env.Exit, Env.Read, FS.Read, FS.Write, IO {
-    let path = "build/{stem}.bl"
-    let program = cg_probe_compile(path, src)
-    run_mono(program)
-    layout_reset()
-    cname_reset()
-    let _ = fs.delete(path)
-    program
+fn single_file_probe(stem: Str, src: Str) -> Int ! FS.Delete, Env.Exit, Env.Read, FS.Read, FS.Write, IO {
+    with handler Diag {} {
+        let path = "build/{stem}.bl"
+        let program = cg_probe_compile(path, src)
+        run_mono(program)
+        layout_reset()
+        cname_reset()
+        let _ = fs.delete(path)
+        program
+    }
 }
 
 fn eq_src() -> Str {
@@ -69,35 +72,40 @@ fn main() {
 }
 
 test "a whole-program unit defines the methods @derive asked for" {
-    let program = single_file_probe("cg_drv_derive_one", eq_src())
-    let text = generate(program, standalone_cfg())
-    assert_has(text, "{eq_signature("Point")} \{")
+    with handler Codegen {}, handler Diag {} {
+        let program = single_file_probe("cg_drv_derive_one", eq_src())
+        let text = generate(program, standalone_cfg())
+        assert_has(text, "{eq_signature("Point")} \{")
+    }
 }
 
 test "the derived method a body calls is declared before the body that calls it" {
-    let program = single_file_probe("cg_drv_derive_decl", eq_src())
-    let text = generate(program, standalone_cfg())
-    let sig = eq_signature("Point")
-    let decl = text.byte_index_of("{sig};", 0) ?? -1
-    let body = text.byte_index_of("{sig} \{", 0) ?? -1
-    if decl < 0 { io.println("FAIL: no prototype for the derived method\n--- output ---\n{text}") }
-    assert(decl >= 0)
-    assert(decl < body)
+    with handler Codegen {}, handler Diag {} {
+        let program = single_file_probe("cg_drv_derive_decl", eq_src())
+        let text = generate(program, standalone_cfg())
+        let sig = eq_signature("Point")
+        let decl = text.byte_index_of("{sig};", 0) ?? -1
+        let body = text.byte_index_of("{sig} \{", 0) ?? -1
+        if decl < 0 { io.println("FAIL: no prototype for the derived method\n--- output ---\n{text}") }
+        assert(decl >= 0)
+        assert(decl < body)
+    }
 }
 
 // A derived method belongs to the module its type was declared in, the same rule every
 // other definition follows. Emitting it wherever the type is merely used would define one
 // symbol in two objects, which the linker rejects.
-fn pkg_probe(stem: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Env.Exit, Env.Read, FS.Read, FS.Write, IO, Process.Spawn {
-    let root = "build/{stem}_pkg"
-    let _clean = process.run("rm", ["-rf", root]).unwrap()
-    let _mk = process.run("mkdir", ["-p", "{root}/src"]).unwrap()
-    fs.write("{root}/blink.toml", "[package]\nname = \"{stem}\"\nversion = \"0.1.0\"\n").unwrap()
-    fs.write("{root}/src/mymod.bl", #"@derive(Eq)
+fn pkg_probe(stem: Str) -> Int ! Env.Exit, Env.Read, FS.Read, FS.Write, IO, Process.Spawn {
+    with handler Diag {} {
+        let root = "build/{stem}_pkg"
+        let _clean = process.run("rm", ["-rf", root]).unwrap()
+        let _mk = process.run("mkdir", ["-p", "{root}/src"]).unwrap()
+        fs.write("{root}/blink.toml", "[package]\nname = \"{stem}\"\nversion = \"0.1.0\"\n").unwrap()
+        fs.write("{root}/src/mymod.bl", #"@derive(Eq)
 pub type Point { x: Int, y: Int }
 "#).unwrap()
-    let path = "{root}/src/probe.bl"
-    let program = cg_probe_compile(path, #"import mymod.{Point}
+        let path = "{root}/src/probe.bl"
+        let program = cg_probe_compile(path, #"import mymod.{Point}
 
 fn main() {
     let a = Point { x: 1, y: 2 }
@@ -105,27 +113,32 @@ fn main() {
     let _same = a == b
 }
 "#)
-    run_mono(program)
-    layout_reset()
-    cname_reset()
-    let _rm = process.run("rm", ["-rf", root]).unwrap()
-    program
+        run_mono(program)
+        layout_reset()
+        cname_reset()
+        let _rm = process.run("rm", ["-rf", root]).unwrap()
+        program
+    }
 }
 
 test "the module that declared the type is the one module that defines its derived method" {
-    let program = pkg_probe("cg_drv_derive_scope")
-    let owner = generate_module_object(program, "mymod", "mymod.h", standalone_cfg())
-    let sig = eq_signature("Point")
-    assert_has(owner, "{sig} \{")
-    let user = generate_module_object(program, "__main__", "probe.h", standalone_cfg())
-    assert_lacks(user, "{sig} \{")
+    with handler Codegen {}, handler Diag {} {
+        let program = pkg_probe("cg_drv_derive_scope")
+        let owner = generate_module_object(program, "mymod", "mymod.h", standalone_cfg())
+        let sig = eq_signature("Point")
+        assert_has(owner, "{sig} \{")
+        let user = generate_module_object(program, "__main__", "probe.h", standalone_cfg())
+        assert_lacks(user, "{sig} \{")
+    }
 }
 
 // The caller's unit still has to know the name it calls, so the declaration half is not
 // scoped the way the definition half is.
 test "a module that only uses a derived method still sees its declaration" {
-    let program = pkg_probe("cg_drv_derive_seen")
-    // Every module header includes the types header, which declares each derived method.
-    let header = generate_types_header(program, standalone_cfg())
-    assert_has(header, "{eq_signature("Point")};")
+    with handler Codegen {}, handler Diag {} {
+        let program = pkg_probe("cg_drv_derive_seen")
+        // Every module header includes the types header, which declares each derived method.
+        let header = generate_types_header(program, standalone_cfg())
+        assert_has(header, "{eq_signature("Point")};")
+    }
 }

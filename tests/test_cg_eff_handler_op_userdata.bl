@@ -27,7 +27,7 @@ import cg_eff.{
     cg_eff_lower_handler_expr, cg_eff_pending_thunks, cg_eff_print_thunk, cg_eff_reset,
     cg_eff_thunk_body_node, cg_eff_thunk_close, cg_eff_thunk_open,
 }
-import diagnostics.{diag_entries, diag_reset}
+import diagnostics.{diag_entries, diag_reset, Diag}
 import std.fs
 import std.io
 
@@ -98,7 +98,7 @@ fn report_ices() ! IO.Print {
     }
 }
 
-fn setup() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete, Env.Exit, Env.Read, FS.Read, FS.Write, IO {
+fn setup() ! FS.Delete, Env.Exit, Env.Read, FS.Read, FS.Write, IO {
     diag_reset()
     ir_reset()
     layout_reset()
@@ -147,33 +147,39 @@ fn find_perform(id: Int) -> Int {
 
 // The literal lowered inside a frame that binds the locals the enclosing function declares,
 // which is what makes them captures rather than module names.
-fn lower_in_frame(fn_name: Str, names: List[Str], tids: List[Int]) -> Int ! Diag.Report, IO.Print {
-    let outer = binder_scope_push()
-    let mut i = 0
-    while i < names.len() {
-        bind_binder_mut(outer, names.get(i).unwrap(), tids.get(i).unwrap(), false)
-        i = i + 1
+fn lower_in_frame(fn_name: Str, names: List[Str], tids: List[Int]) -> Int ! IO.Print {
+    with handler Diag {} {
+        let outer = binder_scope_push()
+        let mut i = 0
+        while i < names.len() {
+            bind_binder_mut(outer, names.get(i).unwrap(), tids.get(i).unwrap(), false)
+            i = i + 1
+        }
+        let v = cg_eff_lower_handler_expr(handler_in(fn_name))
+        binder_scope_pop()
+        v
     }
-    let v = cg_eff_lower_handler_expr(handler_in(fn_name))
-    binder_scope_pop()
-    v
 }
 
-fn lower_op_body(i: Int) -> Int ! Diag.Report {
-    let scope = cg_eff_thunk_open(i)
-    if scope < 0 { return -1 }
-    let body = lower_block_returning(cg_eff_thunk_body_node(i))
-    cg_eff_thunk_close()
-    body
+fn lower_op_body(i: Int) -> Int {
+    with handler Diag {} {
+        let scope = cg_eff_thunk_open(i)
+        if scope < 0 { return -1 }
+        let body = lower_block_returning(cg_eff_thunk_body_node(i))
+        cg_eff_thunk_close()
+        body
+    }
 }
 
 // The C text of operation i's definition.
-fn printed_op(i: Int) -> Str ! Diag.Report {
-    let body = lower_op_body(i)
-    assert(body >= 0)
-    print_reset()
-    cg_eff_print_thunk(i, body)
-    print_take()
+fn printed_op(i: Int) -> Str {
+    with handler Diag {} {
+        let body = lower_op_body(i)
+        assert(body >= 0)
+        print_reset()
+        cg_eff_print_thunk(i, body)
+        print_take()
+    }
 }
 
 // Lines that declare a variable at file scope: `static` with no parameter list.
@@ -282,17 +288,19 @@ test "each captured local adds one read of the operation's own word" {
 }
 
 test "a perform passes the handler's userdata word for that slot as its first argument" {
-    ir_reset()
-    print_reset()
-    let ev = ir_evidence_vector(0, "blink_ev*", "__ev", SlotForm.PointerBoxed)
-    let slot = ir_field_get(30, 0, "blink_io_vtable*", "io", SlotForm.PointerBoxed, ev)
-    let msg = ir_const(2, 0, "const char*", "\"hi\"")
-    let say = ir_effect_perform(0, 0, "void", "print", SlotForm.Inline, slot, [msg])
-    assert_eq(print_expr(say), "(__ev->io)->print((__ev->io)->__userdata_print, \"hi\")")
-    let ev2 = ir_evidence_vector(0, "blink_ev*", "__ev", SlotForm.PointerBoxed)
-    let slot2 = ir_field_get(30, 0, "blink_io_vtable*", "io", SlotForm.PointerBoxed, ev2)
-    let bare = ir_effect_perform(0, 0, "const char*", "cwd", SlotForm.InlineWord, slot2, [])
-    assert_eq(print_expr(bare), "(__ev->io)->cwd((__ev->io)->__userdata_cwd)")
+    with handler Diag {} {
+        ir_reset()
+        print_reset()
+        let ev = ir_evidence_vector(0, "blink_ev*", "__ev", SlotForm.PointerBoxed)
+        let slot = ir_field_get(30, 0, "blink_io_vtable*", "io", SlotForm.PointerBoxed, ev)
+        let msg = ir_const(2, 0, "const char*", "\"hi\"")
+        let say = ir_effect_perform(0, 0, "void", "print", SlotForm.Inline, slot, [msg])
+        assert_eq(print_expr(say), "(__ev->io)->print((__ev->io)->__userdata_print, \"hi\")")
+        let ev2 = ir_evidence_vector(0, "blink_ev*", "__ev", SlotForm.PointerBoxed)
+        let slot2 = ir_field_get(30, 0, "blink_io_vtable*", "io", SlotForm.PointerBoxed, ev2)
+        let bare = ir_effect_perform(0, 0, "const char*", "cwd", SlotForm.InlineWord, slot2, [])
+        assert_eq(print_expr(bare), "(__ev->io)->cwd((__ev->io)->__userdata_cwd)")
+    }
 }
 
 // The node carries the member, so the printer never spells it; a node of another kind has
@@ -308,11 +316,13 @@ test "a perform node names its slot's userdata member and no other node does" {
 }
 
 test "a vtable slot takes the userdata word in front of the operation's parameters" {
-    print_reset()
-    print_effect_vtable_typedef("", "blink_ue_x_vtable", ["get", "put"], ["__userdata_get", "__userdata_put"], ["int64_t", "void"], [["int64_t a"], []])
-    let c = print_take()
-    if !c.contains("    int64_t (*get)(void* __self, int64_t a);\n    void (*put)(void* __self);") {
-        io.println("FAIL: typedef\n{c}")
+    with handler Diag {} {
+        print_reset()
+        print_effect_vtable_typedef("", "blink_ue_x_vtable", ["get", "put"], ["__userdata_get", "__userdata_put"], ["int64_t", "void"], [["int64_t a"], []])
+        let c = print_take()
+        if !c.contains("    int64_t (*get)(void* __self, int64_t a);\n    void (*put)(void* __self);") {
+            io.println("FAIL: typedef\n{c}")
+        }
+        assert(c.contains("    int64_t (*get)(void* __self, int64_t a);\n    void (*put)(void* __self);"))
     }
-    assert(c.contains("    int64_t (*get)(void* __self, int64_t a);\n    void (*put)(void* __self);"))
 }

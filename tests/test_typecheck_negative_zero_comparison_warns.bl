@@ -10,34 +10,38 @@
 // `is_sign_negative()` with the other operand's text when that is a simple path, else it says
 // to bind the operand with `let` first. No machine fix.
 
-import typecheck.{check_types}
+import typecheck.{check_types, TypeCheck}
 import compiler.{compile_to_program}
-import diagnostics.{diag_entries, diag_reset, lint_set_override}
+import diagnostics.{diag_entries, diag_reset, lint_set_override, Diag}
 import embedded_stdlib_registry.{init_embedded_stdlib}
 import std.fs
 import std.io
+import lexer.{Lex}
+import parser.{Parse}
 
 // `level` is "" for the default, else the [lints] level set for W0706. A probe source that
 // fails to check would make every "no warning" row pass, so it must give no other error.
-fn probe_with(src: Str, level: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
-    let path = "build/tc_negzero_src.bl"
-    init_embedded_stdlib()
-    fs.write(path, src).unwrap()
-    diag_reset()
-    let program = compile_to_program(path, 1)
-    // After compile_to_program, which resets the [lints] table it loads from the manifest.
-    if level != "" { lint_set_override("W0706", level) }
-    check_types(program)
-    let _ = fs.delete(path)
-    let mut errors: List[Str] = []
-    for d in diag_entries {
-        if (d.severity == "error" || d.severity == "ice") && d.name != "NegativeZeroComparison" { errors.push("{d.line}:{d.col}: {d.code} {d.message}") }
+fn probe_with(src: Str, level: Str) ! FS, Env.Exit, Env.Read, IO {
+    with handler Diag {}, handler Lex {}, handler Parse {}, handler TypeCheck {} {
+        let path = "build/tc_negzero_src.bl"
+        init_embedded_stdlib()
+        fs.write(path, src).unwrap()
+        diag_reset()
+        let program = compile_to_program(path, 1)
+        // After compile_to_program, which resets the [lints] table it loads from the manifest.
+        if level != "" { lint_set_override("W0706", level) }
+        check_types(program)
+        let _ = fs.delete(path)
+        let mut errors: List[Str] = []
+        for d in diag_entries {
+            if (d.severity == "error" || d.severity == "ice") && d.name != "NegativeZeroComparison" { errors.push("{d.line}:{d.col}: {d.code} {d.message}") }
+        }
+        for e in errors { io.eprintln("FAIL: probe error {e}") }
+        assert_eq(errors.len(), 0)
     }
-    for e in errors { io.eprintln("FAIL: probe error {e}") }
-    assert_eq(errors.len(), 0)
 }
 
-fn probe(level: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+fn probe(level: Str) ! FS, Env.Exit, Env.Read, IO {
     probe_with(probe_src(), level)
 }
 
@@ -413,24 +417,26 @@ test.failing(
 // A method called through its type name is E0567, so the comparison never reaches W0706;
 // the help points at the receiver form, which does warn.
 test "a Float.eq or Float.cmp call through the type name is E0567 and points at the receiver form" {
-    let path = "build/tc_negzero_src.bl"
-    init_embedded_stdlib()
-    fs.write(path, "fn main() \{\n    let x = 1.0\n    let _ = Float.eq(x, -0.0)\n    let _ = Float.cmp(x, -0.0)\n}\n").unwrap()
-    diag_reset()
-    let program = compile_to_program(path, 1)
-    check_types(program)
-    let _ = fs.delete(path)
-    let mut got: List[Str] = []
-    for d in diag_entries {
-        if d.severity == "error" || d.severity == "ice" { got.push("{d.line} {d.name} | {d.help}") }
+    with handler Diag {}, handler Lex {}, handler Parse {}, handler TypeCheck {} {
+        let path = "build/tc_negzero_src.bl"
+        init_embedded_stdlib()
+        fs.write(path, "fn main() \{\n    let x = 1.0\n    let _ = Float.eq(x, -0.0)\n    let _ = Float.cmp(x, -0.0)\n}\n").unwrap()
+        diag_reset()
+        let program = compile_to_program(path, 1)
+        check_types(program)
+        let _ = fs.delete(path)
+        let mut got: List[Str] = []
+        for d in diag_entries {
+            if d.severity == "error" || d.severity == "ice" { got.push("{d.line} {d.name} | {d.help}") }
+        }
+        let shown = got.join(" || ")
+        assert(got.len() == 2, shown)
+        assert(got.get(0).unwrap().starts_with("3 MethodThroughTypeName | call the method on the value: `x.eq(-0.0)`"), shown)
+        assert(got.get(1).unwrap().starts_with("4 MethodThroughTypeName | call the method on the value: `x.cmp(-0.0)`"), shown)
+        assert_eq(nz_rows().len(), 0)
+        probe_with("fn main() \{\n    let x = 1.0\n    let _ = x.eq(-0.0)\n    let _ = x.cmp(-0.0)\n}\n", "")
+        assert_eq(nz_rows().len(), 2)
     }
-    let shown = got.join(" || ")
-    assert(got.len() == 2, shown)
-    assert(got.get(0).unwrap().starts_with("3 MethodThroughTypeName | call the method on the value: `x.eq(-0.0)`"), shown)
-    assert(got.get(1).unwrap().starts_with("4 MethodThroughTypeName | call the method on the value: `x.cmp(-0.0)`"), shown)
-    assert_eq(nz_rows().len(), 0)
-    probe_with("fn main() \{\n    let x = 1.0\n    let _ = x.eq(-0.0)\n    let _ = x.cmp(-0.0)\n}\n", "")
-    assert_eq(nz_rows().len(), 2)
 }
 
 test "a trait-qualified Eq.eq or Ord.cmp call on a Float warns on a written -0.0" {

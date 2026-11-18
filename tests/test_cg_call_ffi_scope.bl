@@ -23,6 +23,7 @@ import ir.{IrKind, ir_c_name, ir_c_spelling, ir_kid}
 import cg_call.{lower_call}
 import cg_expr.{cg_expr_take_pending}
 import std.io
+import diagnostics.{Diag}
 
 // A call written after `anchor`, named by the method it spells. The stdlib graph spells
 // `ffi.scope` in its own libc module, so a scan from the top of the program could answer
@@ -40,9 +41,11 @@ import std.io
 // stride rows below measure in the stage, so the shapes stay where they are and the one
 // expected name is allowed through rather than the rows losing their subject. The stage's
 // own ICE backstop, which those rows assert, is what a tid built by hand still reaches.
-fn probe_ffi() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Env.Exit, Env.Read, FS.Read, FS.Write, IO, Env.Write, Process.Spawn {
-    probe_but("cg_call_ffi_scope", src_ffi(), "FfiOffsetUnknownStride")
-    bind_binder(binder_scope_push(), "scope", tid_of_node(with_resource_of("scope")))
+fn probe_ffi() ! Env.Exit, Env.Read, FS.Read, FS.Write, IO, Env.Write, Process.Spawn {
+    with handler Diag {} {
+        probe_but("cg_call_ffi_scope", src_ffi(), "FfiOffsetUnknownStride")
+        bind_binder(binder_scope_push(), "scope", tid_of_node(with_resource_of("scope")))
+    }
 }
 
 fn with_resource_of(name: Str) -> Int ! IO.Print {
@@ -114,86 +117,104 @@ fn main() { go() }
 // ── The scope itself ──────────────────────────────────────────────────────
 
 test "ffi.scope opens the arena with the runtime call that answers one" {
-    probe_ffi()
-    let id = lower_call(call_after("anchor", "scope"))
-    assert_kind("kind", id, IrKind.CallRuntime)
-    assert_eq_str("symbol", ir_c_name(id), "blink_ffi_scope_new")
-    assert_shape("shape", id, "CallRuntime")
-    assert_verifies("verify", id)
+    with handler Diag {} {
+        probe_ffi()
+        let id = lower_call(call_after("anchor", "scope"))
+        assert_kind("kind", id, IrKind.CallRuntime)
+        assert_eq_str("symbol", ir_c_name(id), "blink_ffi_scope_new")
+        assert_shape("shape", id, "CallRuntime")
+        assert_verifies("verify", id)
+    }
 }
 
 test "the scope is spelled at the type its own tid carries, not at the pointer it holds" {
-    probe_ffi()
-    let id = lower_call(call_after("anchor", "scope"))
-    assert_eq_str("spelling", ir_c_spelling(id), "blink_list*")
+    with handler Diag {} {
+        probe_ffi()
+        let id = lower_call(call_after("anchor", "scope"))
+        assert_eq_str("spelling", ir_c_spelling(id), "blink_list*")
+    }
 }
 
 
 // ── The two operations that put a pointer under the scope ─────────────────
 
 test "scope.cstr copies the text into the arena through the runtime call" {
-    probe_ffi()
-    let id = lower_call(rhs_of("text"))
-    assert_kind("kind", id, IrKind.CallRuntime)
-    assert_eq_str("symbol", ir_c_name(id), "blink_ffi_scope_cstr")
-    assert_shape("shape", id, "CallRuntime(VarRef, Const)")
-    assert_eq_str("receiver", ir_c_name(ir_kid(id, 0)), "b_scope")
-    assert_verifies("verify", id)
+    with handler Diag {} {
+        probe_ffi()
+        let id = lower_call(rhs_of("text"))
+        assert_kind("kind", id, IrKind.CallRuntime)
+        assert_eq_str("symbol", ir_c_name(id), "blink_ffi_scope_cstr")
+        assert_shape("shape", id, "CallRuntime(VarRef, Const)")
+        assert_eq_str("receiver", ir_c_name(ir_kid(id, 0)), "b_scope")
+        assert_verifies("verify", id)
+    }
 }
 
 test "scope.cstr answers a pointer to bytes, which is what its tid says" {
-    probe_ffi()
-    assert_eq_str("spelling", ir_c_spelling(lower_call(rhs_of("text"))), "uint8_t*")
+    with handler Diag {} {
+        probe_ffi()
+        assert_eq_str("spelling", ir_c_spelling(lower_call(rhs_of("text"))), "uint8_t*")
+    }
 }
 
 test "scope.take releases the pointer from the arena and answers it back" {
-    probe_ffi()
-    let id = lower_call(rhs_of("kept"))
-    assert_kind("kind", id, IrKind.CallRuntime)
-    assert_eq_str("symbol", ir_c_name(id), "blink_ffi_scope_take")
-    assert_shape("shape", id, "CallRuntime(VarRef, VarRef)")
-    assert_verifies("verify", id)
+    with handler Diag {} {
+        probe_ffi()
+        let id = lower_call(rhs_of("kept"))
+        assert_kind("kind", id, IrKind.CallRuntime)
+        assert_eq_str("symbol", ir_c_name(id), "blink_ffi_scope_take")
+        assert_shape("shape", id, "CallRuntime(VarRef, VarRef)")
+        assert_verifies("verify", id)
+    }
 }
 
 test "take keeps the pointee its argument had, so its spelling is the argument's" {
-    probe_ffi()
-    assert_eq_str("spelling", ir_c_spelling(lower_call(rhs_of("kept"))), "uint8_t*")
+    with handler Diag {} {
+        probe_ffi()
+        assert_eq_str("spelling", ir_c_spelling(lower_call(rhs_of("kept"))), "uint8_t*")
+    }
 }
 
 // ── The two allocators ──────────────────────────────────────────────────────
 
 test "scope.alloc_n is a sized allocation of as many cells as its argument says" {
-    probe_ffi()
-    let id = lower_call(rhs_of("sized"))
-    assert_kind("kind", id, IrKind.SizedAlloc)
-    assert_eq_str("spelled at its own pointer type", ir_c_spelling(id), "blink_4Pollfd*")
-    assert_eq_str("element is the sizeof operand", ir_c_name(id), "blink_4Pollfd")
-    assert_shape("shape", id, "SizedAlloc(VarRef, Const)")
-    assert_eq_str("scope comes first", ir_c_name(ir_kid(id, 0)), "b_scope")
-    assert_eq_str("count is the argument", ir_c_name(ir_kid(id, 1)), "2")
-    assert_verifies("verify", id)
+    with handler Diag {} {
+        probe_ffi()
+        let id = lower_call(rhs_of("sized"))
+        assert_kind("kind", id, IrKind.SizedAlloc)
+        assert_eq_str("spelled at its own pointer type", ir_c_spelling(id), "blink_4Pollfd*")
+        assert_eq_str("element is the sizeof operand", ir_c_name(id), "blink_4Pollfd")
+        assert_shape("shape", id, "SizedAlloc(VarRef, Const)")
+        assert_eq_str("scope comes first", ir_c_name(ir_kid(id, 0)), "b_scope")
+        assert_eq_str("count is the argument", ir_c_name(ir_kid(id, 1)), "2")
+        assert_verifies("verify", id)
+    }
 }
 
 test "scope.alloc is a sized allocation of exactly one cell" {
-    probe_ffi()
-    let id = lower_call(rhs_of("one"))
-    assert_kind("kind", id, IrKind.SizedAlloc)
-    assert_eq_str("spelled at its own pointer type", ir_c_spelling(id), "blink_4Pollfd*")
-    assert_eq_str("element is the sizeof operand", ir_c_name(id), "blink_4Pollfd")
-    assert_shape("shape", id, "SizedAlloc(VarRef, Const)")
-    assert_eq_str("count is one cell", ir_c_name(ir_kid(id, 1)), "1")
-    assert_verifies("verify", id)
+    with handler Diag {} {
+        probe_ffi()
+        let id = lower_call(rhs_of("one"))
+        assert_kind("kind", id, IrKind.SizedAlloc)
+        assert_eq_str("spelled at its own pointer type", ir_c_spelling(id), "blink_4Pollfd*")
+        assert_eq_str("element is the sizeof operand", ir_c_name(id), "blink_4Pollfd")
+        assert_shape("shape", id, "SizedAlloc(VarRef, Const)")
+        assert_eq_str("count is one cell", ir_c_name(ir_kid(id, 1)), "1")
+        assert_verifies("verify", id)
+    }
 }
 
 // ── Pointer arithmetic ────────────────────────────────────────────────────
 
 test "Ptr.offset is arithmetic on the receiver's own pointer type" {
-    probe_ffi()
-    let id = lower_call(rhs_of("next"))
-    assert_kind("kind", id, IrKind.Binary)
-    assert_eq_str("operator", ir_c_name(id), "+")
-    assert_shape("shape", id, "Binary(VarRef, Const)")
-    assert_verifies("verify", id)
+    with handler Diag {} {
+        probe_ffi()
+        let id = lower_call(rhs_of("next"))
+        assert_kind("kind", id, IrKind.Binary)
+        assert_eq_str("operator", ir_c_name(id), "+")
+        assert_shape("shape", id, "Binary(VarRef, Const)")
+        assert_verifies("verify", id)
+    }
 }
 
 // C steps a pointer by the size of what it points at, so the pointee is the whole of what
@@ -201,17 +222,21 @@ test "Ptr.offset is arithmetic on the receiver's own pointer type" {
 // declares, not compared with the receiver's: the two come from one tid through one
 // memoized layout, so comparing them is an identity that no wrong spelling can fail.
 test "the step of the arithmetic is the pointee the foreign header declares" {
-    probe_ffi()
-    assert_eq_str("spelling", ir_c_spelling(lower_call(rhs_of("next"))), "blink_4Pollfd*")
+    with handler Diag {} {
+        probe_ffi()
+        assert_eq_str("spelling", ir_c_spelling(lower_call(rhs_of("next"))), "blink_4Pollfd*")
+    }
 }
 
 // The stride is the pointee's size, so a pointer at a type with no size has no stride C
 // can step by. `void*` has none: C refuses the arithmetic or steps by a byte, which is a
 // wrong answer written in the shape of a right one.
 test "Ptr.offset refuses when nothing declares the size of what the pointer addresses" {
-    probe_ffi()
-    assert_ice_saying("stride", lower_call(rhs_of("stepped_void")), "PointerStrideUnknown",
-        "no foreign header lays out")
+    with handler Diag {} {
+        probe_ffi()
+        assert_ice_saying("stride", lower_call(rhs_of("stepped_void")), "PointerStrideUnknown",
+            "no foreign header lays out")
+    }
 }
 
 // ── Reading through the pointer by itself ─────────────────────────────────
@@ -220,34 +245,42 @@ test "Ptr.offset refuses when nothing declares the size of what the pointer addr
 // with IS the pointee, so it is the same dereference `p.f` reads through, with nothing
 // wrapped around it.
 test "Ptr.deref reads the pointee by dereferencing the pointer" {
-    probe_ffi()
-    let id = lower_call(rhs_of("whole"))
-    assert_kind("kind", id, IrKind.Unbox)
-    assert_shape("shape", id, "Unbox(VarRef)")
-    assert_verifies("verify", id)
+    with handler Diag {} {
+        probe_ffi()
+        let id = lower_call(rhs_of("whole"))
+        assert_kind("kind", id, IrKind.Unbox)
+        assert_shape("shape", id, "Unbox(VarRef)")
+        assert_verifies("verify", id)
+    }
 }
 
 // The pointee's own width, not the pointer's: a foreign struct dereferences to its own
 // unstarred spelling, the same one a field read through it already reads at.
 test "a dereferenced foreign struct is spelled at its own type, not the pointer's" {
-    probe_ffi()
-    assert_eq_str("spelling", ir_c_spelling(lower_call(rhs_of("whole"))), "blink_4Pollfd")
+    with handler Diag {} {
+        probe_ffi()
+        assert_eq_str("spelling", ir_c_spelling(lower_call(rhs_of("whole"))), "blink_4Pollfd")
+    }
 }
 
 // A scalar pointee dereferences the same way: the value answered is the scalar itself,
 // not a pointer to it.
 test "a dereferenced scalar answers the scalar, not a pointer to it" {
-    probe_ffi()
-    assert_eq_str("spelling", ir_c_spelling(lower_call(rhs_of("byte"))), "uint8_t")
+    with handler Diag {} {
+        probe_ffi()
+        assert_eq_str("spelling", ir_c_spelling(lower_call(rhs_of("byte"))), "uint8_t")
+    }
 }
 
 // `deref` takes no argument (its whole answer comes from the receiver's own tid), so a
 // call written with one is refused twice over: typecheck's own arity table rejects it
 // before codegen ever runs, and codegen declines it by name rather than build it wrong if
 // it were ever reached anyway.
-fn probe_deref_wrong_arity() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Env.Exit, Env.Read, FS.Read, FS.Write, IO, Env.Write, Process.Spawn {
-    probe_but("cg_call_ffi_scope_deref_arity", src_deref_wrong_arity(), "TypeError")
-    bind_binder(binder_scope_push(), "scope", tid_of_node(with_resource_of("scope")))
+fn probe_deref_wrong_arity() ! Env.Exit, Env.Read, FS.Read, FS.Write, IO, Env.Write, Process.Spawn {
+    with handler Diag {} {
+        probe_but("cg_call_ffi_scope_deref_arity", src_deref_wrong_arity(), "TypeError")
+        bind_binder(binder_scope_push(), "scope", tid_of_node(with_resource_of("scope")))
+    }
 }
 
 fn src_deref_wrong_arity() -> Str {
@@ -261,9 +294,11 @@ fn src_deref_wrong_arity() -> Str {
 }
 
 test "p.deref with an argument is refused by name, not built silently" {
-    probe_deref_wrong_arity()
-    assert_ice_saying("deref arity", lower_call(rhs_of("bad")), "IntrinsicArityWrong",
-        "takes 0 argument(s)")
+    with handler Diag {} {
+        probe_deref_wrong_arity()
+        assert_ice_saying("deref arity", lower_call(rhs_of("bad")), "IntrinsicArityWrong",
+            "takes 0 argument(s)")
+    }
 }
 
 // An @ffi.opaque handle names a C type whose LAYOUT the header withholds, which is the
@@ -273,9 +308,11 @@ test "p.deref with an argument is refused by name, not built silently" {
 // pointee is spelled opaque rather than as a plain Blink record because a plain record is
 // not an FFI-compatible pointee at all, and the front end now says so first.
 test "a pointer at an opaque handle no header lays out has no stride either" {
-    probe_ffi()
-    assert_ice_saying("opaque stride", lower_call(rhs_of("stepped_home")), "PointerStrideUnknown",
-        "no foreign header lays out")
+    with handler Diag {} {
+        probe_ffi()
+        assert_ice_saying("opaque stride", lower_call(rhs_of("stepped_home")), "PointerStrideUnknown",
+            "no foreign header lays out")
+    }
 }
 
 // Every accepting call in the family, lowered in one probe, with the internal-error count
@@ -283,38 +320,44 @@ test "a pointer at an opaque handle no header lays out has no stride either" {
 // compiler bug, and a report raised while merely TESTING the shape of a receiver would be
 // a bug the program does not have: the count is what proves no test on this path reports.
 test "lowering the accepted FFI calls reports no internal error" {
-    probe_ffi()
-    let before = ice_count()
-    let _ = lower_call(call_after("anchor", "scope"))
-    let _ = lower_call(rhs_of("text"))
-    let _ = lower_call(rhs_of("kept"))
-    let _ = lower_call(rhs_of("sized"))
-    let _ = lower_call(rhs_of("one"))
-    let _ = lower_call(rhs_of("next"))
-    let _ = lower_call(rhs_of("got"))
-    let _ = lower_call(rhs_of("whole"))
-    let _ = lower_call(rhs_of("byte"))
-    let _ = lower_call(rhs_of("plain"))
-    let _ = lower_call(call_after("kept", "is_null"))
-    assert_eq_str("ice count", "{ice_count()}", "{before}")
+    with handler Diag {} {
+        probe_ffi()
+        let before = ice_count()
+        let _ = lower_call(call_after("anchor", "scope"))
+        let _ = lower_call(rhs_of("text"))
+        let _ = lower_call(rhs_of("kept"))
+        let _ = lower_call(rhs_of("sized"))
+        let _ = lower_call(rhs_of("one"))
+        let _ = lower_call(rhs_of("next"))
+        let _ = lower_call(rhs_of("got"))
+        let _ = lower_call(rhs_of("whole"))
+        let _ = lower_call(rhs_of("byte"))
+        let _ = lower_call(rhs_of("plain"))
+        let _ = lower_call(call_after("kept", "is_null"))
+        assert_eq_str("ice count", "{ice_count()}", "{before}")
+    }
 }
 
 // ── A field reached through a pointer ─────────────────────────────────────
 
 test "a field read through a pointer dereferences first and reads the field second" {
-    probe_ffi()
-    let id = lower_call(rhs_of("got"))
-    assert_kind("kind", id, IrKind.FieldGet)
-    assert_eq_str("field", ir_c_name(id), "b_fd")
-    assert_shape("shape", id, "FieldGet(Unbox(VarRef))")
-    assert_verifies("verify", id)
+    with handler Diag {} {
+        probe_ffi()
+        let id = lower_call(rhs_of("got"))
+        assert_kind("kind", id, IrKind.FieldGet)
+        assert_eq_str("field", ir_c_name(id), "b_fd")
+        assert_shape("shape", id, "FieldGet(Unbox(VarRef))")
+        assert_verifies("verify", id)
+    }
 }
 
 // The field's own width, not the pointer's and not the machine word's. A read spelled at
 // any other width would take the wrong bytes out of the struct the foreign header laid out.
 test "the read is spelled at the field's declared width" {
-    probe_ffi()
-    assert_eq_str("spelling", ir_c_spelling(lower_call(rhs_of("got"))), "int32_t")
+    with handler Diag {} {
+        probe_ffi()
+        assert_eq_str("spelling", ir_c_spelling(lower_call(rhs_of("got"))), "int32_t")
+    }
 }
 
 // A store is a statement. The IR says so itself: it refuses a statement in every slot that
@@ -322,9 +365,11 @@ test "the read is spelled at the field's declared width" {
 // store built here could only ever be C the printer has to reject, and the refusal names
 // the stage that holds the slot a store fits.
 test "a field written through a pointer refuses: a store is a statement, not a value" {
-    probe_ffi()
-    assert_ice_saying("write", lower_call(call_after("got", "write")), "FieldStoreNotAValue",
-        "a store is a statement")
+    with handler Diag {} {
+        probe_ffi()
+        assert_ice_saying("write", lower_call(call_after("got", "write")), "FieldStoreNotAValue",
+            "a store is a statement")
+    }
 }
 
 // A plain `p.write(v)` reaches the same offset/is_null dispatch as every other Ptr method,
@@ -332,27 +377,33 @@ test "a field written through a pointer refuses: a store is a statement, not a v
 // (test_cg_stmt_ptr_write.bl), so a value slot still has no lowering for it, under the
 // ordinary "not built" refusal rather than a name of its own.
 test "a plain pointer written through a value slot refuses: write has no lowering there either" {
-    probe_ffi()
-    assert_ice_saying("plain write", lower_call(call_after("plain", "write")), "CodegenStageNotBuilt",
-        "not built")
+    with handler Diag {} {
+        probe_ffi()
+        assert_ice_saying("plain write", lower_call(call_after("plain", "write")), "CodegenStageNotBuilt",
+            "not built")
+    }
 }
 
 // ── Ptr.is_null ────────────────────────────────────────────────────────────
 
 test "Ptr.is_null compares the pointer against the literal zero" {
-    probe_ffi()
-    let id = lower_call(call_after("kept", "is_null"))
-    assert_kind("kind", id, IrKind.Binary)
-    assert_eq_str("operator", ir_c_name(id), "==")
-    assert_shape("shape", id, "Binary(VarRef, Const)")
-    assert_verifies("verify", id)
+    with handler Diag {} {
+        probe_ffi()
+        let id = lower_call(call_after("kept", "is_null"))
+        assert_kind("kind", id, IrKind.Binary)
+        assert_eq_str("operator", ir_c_name(id), "==")
+        assert_shape("shape", id, "Binary(VarRef, Const)")
+        assert_verifies("verify", id)
+    }
 }
 
 test "is_null answers Bool regardless of what the pointer points at" {
-    probe_ffi()
-    // Bool's own local spelling is "int" (src/layout.bl:742), not C's `bool` — the same
-    // spelling every other TYPE_BOOL comparison in this codebase carries.
-    assert_eq_str("spelling", ir_c_spelling(lower_call(call_after("kept", "is_null"))), "int")
+    with handler Diag {} {
+        probe_ffi()
+        // Bool's own local spelling is "int" (src/layout.bl:742), not C's `bool` — the same
+        // spelling every other TYPE_BOOL comparison in this codebase carries.
+        assert_eq_str("spelling", ir_c_spelling(lower_call(call_after("kept", "is_null"))), "int")
+    }
 }
 
 // ── The one call whose body is inlined, not run through the runtime ───────
@@ -362,61 +413,67 @@ test "is_null answers Bool regardless of what the pointer points at" {
 // the body assigns into, and the body itself all go through the pending buffer ahead of
 // this expression, in that order, and the call reads back the destination the body filled.
 test "Bytes.with_ptr binds the pointer, then inlines the body into the destination it reads" {
-    probe_ffi()
-    let before = current_binder_scope()
-    let built = lower_call(rhs_of("seen"))
-    let after = current_binder_scope()
-    let stmts = cg_expr_take_pending(0)
-    assert_eq_str("hoisted count", "{stmts.len()}", "3")
+    with handler Diag {} {
+        probe_ffi()
+        let before = current_binder_scope()
+        let built = lower_call(rhs_of("seen"))
+        let after = current_binder_scope()
+        let stmts = cg_expr_take_pending(0)
+        assert_eq_str("hoisted count", "{stmts.len()}", "3")
 
-    let bind = stmts.get(0).unwrap()
-    // blink_bytes_ptr is `return b->data;` in the runtime (bootstrap/runtime_core.h), and
-    // that helper landed after gen0 was pinned, so gen1 building against gen0's runtime.h
-    // has no declaration for it. The field is read straight off the receiver instead, but
-    // the receiver's own C type is already the pointer (blink_bytes*), so it is dereferenced
-    // first through handle_pointee_spelling: an unwrapped FieldGet would print '.' where C
-    // needs '->'.
-    assert_shape("pointer bind", bind, "Let(FieldGet(Unbox(VarRef)))")
-    let read = ir_kid(bind, 0)
-    assert_eq_str("accessor", ir_c_name(read), "data")
-    assert_eq_str("accessor spelling", ir_c_spelling(bind), "uint8_t*")
-    assert_eq_str("dereferenced receiver spelling", ir_c_spelling(ir_kid(read, 0)), "blink_bytes")
+        let bind = stmts.get(0).unwrap()
+        // blink_bytes_ptr is `return b->data;` in the runtime (bootstrap/runtime_core.h), and
+        // that helper landed after gen0 was pinned, so gen1 building against gen0's runtime.h
+        // has no declaration for it. The field is read straight off the receiver instead, but
+        // the receiver's own C type is already the pointer (blink_bytes*), so it is dereferenced
+        // first through handle_pointee_spelling: an unwrapped FieldGet would print '.' where C
+        // needs '->'.
+        assert_shape("pointer bind", bind, "Let(FieldGet(Unbox(VarRef)))")
+        let read = ir_kid(bind, 0)
+        assert_eq_str("accessor", ir_c_name(read), "data")
+        assert_eq_str("accessor spelling", ir_c_spelling(bind), "uint8_t*")
+        assert_eq_str("dereferenced receiver spelling", ir_c_spelling(ir_kid(read, 0)), "blink_bytes")
 
-    let dest_decl = stmts.get(1).unwrap()
-    assert_shape("destination declared, not yet assigned", dest_decl, "Let")
+        let dest_decl = stmts.get(1).unwrap()
+        assert_shape("destination declared, not yet assigned", dest_decl, "Let")
 
-    let body = stmts.get(2).unwrap()
-    assert_shape("body assigns into the destination", body,
-        "Block(Let(VarRef), Assign(VarRef, Const))")
+        let body = stmts.get(2).unwrap()
+        assert_shape("body assigns into the destination", body,
+            "Block(Let(VarRef), Assign(VarRef, Const))")
 
-    assert_kind("result", built, IrKind.VarRef)
-    assert_eq_str("result reads the destination the body assigned",
-        ir_c_name(built), ir_c_name(dest_decl))
-    assert_verifies("bind", bind)
-    assert_verifies("body", body)
-    assert_verifies("result", built)
+        assert_kind("result", built, IrKind.VarRef)
+        assert_eq_str("result reads the destination the body assigned",
+            ir_c_name(built), ir_c_name(dest_decl))
+        assert_verifies("bind", bind)
+        assert_verifies("body", body)
+        assert_verifies("result", built)
 
-    // The pointer's own binder scope opened and closed around the body: the caller's
-    // scope is what is on top once the call returns, exactly as it was before the call.
-    assert_eq_str("binder scope balanced", "{after}", "{before}")
+        // The pointer's own binder scope opened and closed around the body: the caller's
+        // scope is what is on top once the call returns, exactly as it was before the call.
+        assert_eq_str("binder scope balanced", "{after}", "{before}")
+    }
 }
 
 // A closure literal is still what is inlined even at the wrong arity, but with_ptr's
 // pointer is the ONLY thing this stage has to bind, so a second parameter has nothing to
 // bind it to. Typecheck reports it first; the stage still refuses it.
 test "Bytes.with_ptr refuses the wrong arity: with_ptr binds exactly one parameter" {
-    probe_but("cg_call_ffi_scope_arity", src_wrong_arity_with_ptr(), "TypeError")
-    assert_ice_saying("with_ptr", lower_call(rhs_of("seen")), "PointerBodyNotLowered",
-        "one-parameter closure literal")
+    with handler Diag {} {
+        probe_but("cg_call_ffi_scope_arity", src_wrong_arity_with_ptr(), "TypeError")
+        assert_ice_saying("with_ptr", lower_call(rhs_of("seen")), "PointerBodyNotLowered",
+            "one-parameter closure literal")
+    }
 }
 
 // ── A call written with its own bracketed type argument ───────────────────
 
 // `scope.alloc[U8]()` carries its pointee in brackets rather than from an annotation, so it
 // is its own probe rather than a new let folded into the shared fixture.
-fn probe_ffi_type_arg() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Env.Exit, Env.Read, FS.Read, FS.Write, IO, Env.Write, Process.Spawn {
-    probe("cg_call_ffi_scope_type_arg", src_ffi_type_arg())
-    bind_binder(binder_scope_push(), "scope", tid_of_node(with_resource_of("scope")))
+fn probe_ffi_type_arg() ! Env.Exit, Env.Read, FS.Read, FS.Write, IO, Env.Write, Process.Spawn {
+    with handler Diag {} {
+        probe("cg_call_ffi_scope_type_arg", src_ffi_type_arg())
+        bind_binder(binder_scope_push(), "scope", tid_of_node(with_resource_of("scope")))
+    }
 }
 
 fn src_ffi_type_arg() -> Str {
@@ -432,14 +489,18 @@ fn main() { go() }
 }
 
 test "scope.alloc[U8]() builds the same sized allocation as the annotated form" {
-    probe_ffi_type_arg()
-    assert_kind("bracketed alloc", lower_call(rhs_of("bracketed")), IrKind.SizedAlloc)
+    with handler Diag {} {
+        probe_ffi_type_arg()
+        assert_kind("bracketed alloc", lower_call(rhs_of("bracketed")), IrKind.SizedAlloc)
+    }
 }
 
 // The plain, unbracketed call takes its pointee from the annotation and must build too.
 test "scope.alloc() with no bracket still builds" {
-    probe_ffi()
-    assert_kind("plain alloc", lower_call(rhs_of("one")), IrKind.SizedAlloc)
+    with handler Diag {} {
+        probe_ffi()
+        assert_kind("plain alloc", lower_call(rhs_of("one")), IrKind.SizedAlloc)
+    }
 }
 
 fn src_wrong_arity_with_ptr() -> Str {

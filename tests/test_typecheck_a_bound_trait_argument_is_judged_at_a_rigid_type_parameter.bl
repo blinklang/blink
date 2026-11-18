@@ -12,18 +12,22 @@
 
 import std.fs
 import compiler.{compile_to_program}
-import typecheck.{check_types}
-import diagnostics.{diag_entries, diag_reset}
+import typecheck.{check_types, TypeCheck}
+import diagnostics.{diag_entries, diag_reset, Diag}
 import embedded_stdlib_registry.{init_embedded_stdlib}
+import lexer.{Lex}
+import parser.{Parse}
 
-fn probe(path: Str, src: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
-    init_embedded_stdlib()
-    fs.write(path, src).unwrap()
-    diag_reset()
-    let program = compile_to_program(path, 1)
-    check_types(program)
-    let _ = fs.delete(path)
-    program
+fn probe(path: Str, src: Str) -> Int ! FS, Env.Exit, Env.Read, IO {
+    with handler Diag {}, handler Lex {}, handler Parse {}, handler TypeCheck {} {
+        init_embedded_stdlib()
+        fs.write(path, src).unwrap()
+        diag_reset()
+        let program = compile_to_program(path, 1)
+        check_types(program)
+        let _ = fs.delete(path)
+        program
+    }
 }
 
 // The code, line, column and help of each error.
@@ -48,7 +52,7 @@ fn error_texts() -> List[Str] {
 }
 
 // The program shares one prelude, so the body under test is on line 15.
-fn errors_for(name: Str, body: Str) -> List[Str] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+fn errors_for(name: Str, body: Str) -> List[Str] ! FS, Env.Exit, Env.Read, IO {
     let src = [
         "trait Conv[A] \{ fn conv(self) -> Int }",
         "trait Wide[K]: Conv[K] \{ fn wide(self) -> Int }",
@@ -196,33 +200,35 @@ test "the report on == gives the bound at its arguments in the chain" {
 // A trait that shares its name with one of the file's own is named with its module, the same
 // at a call and at an operator, never by its internal key.
 test "the report names a trait from another module the same at a call and at ==" {
-    let pkg = "build/tc_rigid_bound_args_pkg"
-    let _mk = process.run("mkdir", ["-p", "{pkg}/src"]).unwrap()
-    fs.write("{pkg}/blink.toml", "[package]\nname = \"tcrigidargs\"\nversion = \"0.1.0\"\n").unwrap()
-    fs.write("{pkg}/src/cv.bl", [
-        "pub trait Conv[A] \{ fn conv(self) -> Int }",
-        "pub type Px[K, V] \{ k: K, v: V }",
-        "impl[K, V: Conv[K]] Eq for Px[K, V] \{ fn eq(self, o: Px[K, V]) -> Bool \{ self.v.conv() == o.v.conv() } }",
-        "pub fn need[K, V: Conv[K]](_k: K, v: V) -> Int \{ v.conv() }",
-        "",
-    ].join("\n")).unwrap()
-    init_embedded_stdlib()
-    fs.write("{pkg}/src/probe.bl", [
-        "import cv.\{Px, need}",
-        "trait Conv[A] \{ fn conv(self) -> Int }",
-        "fn f[K2, A: Conv[K2]](k: K2, a: A) -> Int \{ need(k, a) }",
-        "fn g[K2, A: Conv[K2]](p: Px[K2, A]) -> Bool \{ p == p }",
-        "fn main() \{ }",
-        "",
-    ].join("\n")).unwrap()
-    diag_reset()
-    check_types(compile_to_program("{pkg}/src/probe.bl", 1))
-    let got = errors_reported()
-    let _rm = process.run("rm", ["-rf", pkg]).unwrap()
-    assert_eq(got, [
-        "E0306 3:45 | write ` + Conv (cv)[K2]` on the bound list of `A`",
-        "E0300 4:49 | write ` + Conv (cv)[K2]` on the bound list of `A`",
-    ])
+    with handler Diag {}, handler Lex {}, handler Parse {}, handler TypeCheck {} {
+        let pkg = "build/tc_rigid_bound_args_pkg"
+        let _mk = process.run("mkdir", ["-p", "{pkg}/src"]).unwrap()
+        fs.write("{pkg}/blink.toml", "[package]\nname = \"tcrigidargs\"\nversion = \"0.1.0\"\n").unwrap()
+        fs.write("{pkg}/src/cv.bl", [
+            "pub trait Conv[A] \{ fn conv(self) -> Int }",
+            "pub type Px[K, V] \{ k: K, v: V }",
+            "impl[K, V: Conv[K]] Eq for Px[K, V] \{ fn eq(self, o: Px[K, V]) -> Bool \{ self.v.conv() == o.v.conv() } }",
+            "pub fn need[K, V: Conv[K]](_k: K, v: V) -> Int \{ v.conv() }",
+            "",
+        ].join("\n")).unwrap()
+        init_embedded_stdlib()
+        fs.write("{pkg}/src/probe.bl", [
+            "import cv.\{Px, need}",
+            "trait Conv[A] \{ fn conv(self) -> Int }",
+            "fn f[K2, A: Conv[K2]](k: K2, a: A) -> Int \{ need(k, a) }",
+            "fn g[K2, A: Conv[K2]](p: Px[K2, A]) -> Bool \{ p == p }",
+            "fn main() \{ }",
+            "",
+        ].join("\n")).unwrap()
+        diag_reset()
+        check_types(compile_to_program("{pkg}/src/probe.bl", 1))
+        let got = errors_reported()
+        let _rm = process.run("rm", ["-rf", pkg]).unwrap()
+        assert_eq(got, [
+            "E0306 3:45 | write ` + Conv (cv)[K2]` on the bound list of `A`",
+            "E0300 4:49 | write ` + Conv (cv)[K2]` on the bound list of `A`",
+        ])
+    }
 }
 
 // Accepted: the parameter holds the trait at the bound's arguments.

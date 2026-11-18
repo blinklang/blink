@@ -18,7 +18,7 @@ import layout.{layout_reset}
 import ir.{ir_reset}
 import mono.{run_mono}
 import cg_reg.{cg_reg_build}
-import cg.{CgConfig, generate}
+import cg.{CgConfig, generate, Codegen}
 import cg_print.{print_reset, print_take}
 import cg_expr.{cg_expr_reset}
 import cg_stmt.{cg_stmt_reset, lower_block_returning}
@@ -27,7 +27,7 @@ import cg_eff.{
     cg_eff_thunk_body_node, cg_eff_thunk_close, cg_eff_thunk_open, cg_eff_thunk_symbol,
     cg_eff_thunks_drained,
 }
-import diagnostics.{diag_reset}
+import diagnostics.{diag_reset, Diag}
 import std.fs
 import std.io
 
@@ -59,14 +59,14 @@ fn reset_stages() {
     cg_eff_reset()
 }
 
-fn probe_program(name: Str, src: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete, Env.Exit, Env.Read, FS.Read, FS.Write, IO {
+fn probe_program(name: Str, src: Str) -> Int ! FS.Delete, Env.Exit, Env.Read, FS.Read, FS.Write, IO {
     let path = "build/{name}.bl"
     let program = cg_probe_compile(path, src)
     let _ = fs.delete(path)
     program
 }
 
-fn setup_closure_program() -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete, Env.Exit, Env.Read, FS.Read, FS.Write, IO {
+fn setup_closure_program() -> Int ! FS.Delete, Env.Exit, Env.Read, FS.Read, FS.Write, IO {
     reset_stages()
     let program = probe_program("cg_eff_thunk_drain_closure_probe", closure_src())
     cg_reg_build(program)
@@ -93,71 +93,81 @@ fn standalone_cfg() -> CgConfig {
 
 // The same steps the driver takes for one queued thunk: open its frame, lower its body
 // through the statement stage, close the frame, print the definition.
-fn drain_one(i: Int) ! Diag.Report {
-    assert(cg_eff_thunk_open(i) >= 0)
-    let body = lower_block_returning(cg_eff_thunk_body_node(i))
-    cg_eff_thunk_close()
-    assert(body >= 0)
-    cg_eff_print_thunk(i, body)
+fn drain_one(i: Int) {
+    with handler Diag {} {
+        assert(cg_eff_thunk_open(i) >= 0)
+        let body = lower_block_returning(cg_eff_thunk_body_node(i))
+        cg_eff_thunk_close()
+        assert(body >= 0)
+        cg_eff_print_thunk(i, body)
+    }
 }
 
 test "one non-capturing closure prints exactly one thunk definition and the drain records nothing" {
-    let _ = setup_closure_program()
-    let _ = cg_eff_lower_closure(closure_of("g_plain"))
-    assert_eq(cg_eff_pending_thunks(), 1)
-    let symbol = cg_eff_thunk_symbol(0)
-    drain_one(0)
-    let text = print_take()
-    if cg_text_occurrences(text, "{symbol}(") != 1 || cg_ice_count() != 0 {
-        io.println("FAIL: expected one definition of {symbol}:")
-        cg_report_ices("the drain reported")
-        io.println(text)
+    with handler Diag {} {
+        let _ = setup_closure_program()
+        let _ = cg_eff_lower_closure(closure_of("g_plain"))
+        assert_eq(cg_eff_pending_thunks(), 1)
+        let symbol = cg_eff_thunk_symbol(0)
+        drain_one(0)
+        let text = print_take()
+        if cg_text_occurrences(text, "{symbol}(") != 1 || cg_ice_count() != 0 {
+            io.println("FAIL: expected one definition of {symbol}:")
+            cg_report_ices("the drain reported")
+            io.println(text)
+        }
+        assert_eq(cg_text_occurrences(text, "{symbol}("), 1)
+        assert_eq(cg_text_occurrences(text, "{symbol}(const blink_closure* __self, int64_t"), 1)
+        cg_eff_thunks_drained(1)
+        assert_eq(cg_eff_pending_thunks(), 0)
+        assert_eq(cg_ice_count(), 0)
     }
-    assert_eq(cg_text_occurrences(text, "{symbol}("), 1)
-    assert_eq(cg_text_occurrences(text, "{symbol}(const blink_closure* __self, int64_t"), 1)
-    cg_eff_thunks_drained(1)
-    assert_eq(cg_eff_pending_thunks(), 0)
-    assert_eq(cg_ice_count(), 0)
 }
 
 test "two emits in one process start the second with an empty queue" {
-    let _ = setup_closure_program()
-    let _ = cg_eff_lower_closure(closure_of("g_plain"))
-    let stale = cg_eff_thunk_symbol(0)
-    assert_eq(cg_eff_pending_thunks(), 1)
-    let plain = probe_program("cg_eff_thunk_drain_plain_probe", plain_src())
-    run_mono(plain)
-    let text = generate(plain, standalone_cfg())
-    let stale_head = "{stale}(const blink_closure* __self, int64_t"
-    if cg_eff_pending_thunks() != 0 || text.contains(stale_head) {
-        io.println("FAIL: the stale thunk {stale} survived into the next unit:")
-        cg_report_ices("the second unit reported")
+    with handler Codegen {}, handler Diag {} {
+        let _ = setup_closure_program()
+        let _ = cg_eff_lower_closure(closure_of("g_plain"))
+        let stale = cg_eff_thunk_symbol(0)
+        assert_eq(cg_eff_pending_thunks(), 1)
+        let plain = probe_program("cg_eff_thunk_drain_plain_probe", plain_src())
+        run_mono(plain)
+        let text = generate(plain, standalone_cfg())
+        let stale_head = "{stale}(const blink_closure* __self, int64_t"
+        if cg_eff_pending_thunks() != 0 || text.contains(stale_head) {
+            io.println("FAIL: the stale thunk {stale} survived into the next unit:")
+            cg_report_ices("the second unit reported")
+        }
+        assert_eq(cg_eff_pending_thunks(), 0)
+        assert(!text.contains(stale_head))
+        assert_eq(cg_ices_named("ThunkQueueNotDrained"), 0)
+        assert_eq(cg_ices_named("NoSuchThunk"), 0)
+        assert_eq(cg_ices_named("ThunkFrameNested"), 0)
+        assert_eq(cg_ices_named("UnspellableThunkSlot"), 0)
+        assert_eq(cg_ices_named("ClosureTypeHasNoSlot"), 0)
     }
-    assert_eq(cg_eff_pending_thunks(), 0)
-    assert(!text.contains(stale_head))
-    assert_eq(cg_ices_named("ThunkQueueNotDrained"), 0)
-    assert_eq(cg_ices_named("NoSuchThunk"), 0)
-    assert_eq(cg_ices_named("ThunkFrameNested"), 0)
-    assert_eq(cg_ices_named("UnspellableThunkSlot"), 0)
-    assert_eq(cg_ices_named("ClosureTypeHasNoSlot"), 0)
 }
 
 test "a drain count that does not match the queue is an internal error and keeps the queue" {
-    let _ = setup_closure_program()
-    let _ = cg_eff_lower_closure(closure_of("g_plain"))
-    cg_eff_thunks_drained(0)
-    assert_eq(cg_ices_saying("ThunkQueueNotDrained", "the driver printed 0 thunks but 1 are queued"), 1)
-    assert_eq(cg_ice_count(), 1)
-    assert_eq(cg_eff_pending_thunks(), 1)
+    with handler Diag {} {
+        let _ = setup_closure_program()
+        let _ = cg_eff_lower_closure(closure_of("g_plain"))
+        cg_eff_thunks_drained(0)
+        assert_eq(cg_ices_saying("ThunkQueueNotDrained", "the driver printed 0 thunks but 1 are queued"), 1)
+        assert_eq(cg_ice_count(), 1)
+        assert_eq(cg_eff_pending_thunks(), 1)
+    }
 }
 
 test "printing a thunk the queue does not hold is an internal error and prints nothing" {
-    let _ = setup_closure_program()
-    let _ = cg_eff_lower_closure(closure_of("g_plain"))
-    drain_one(0)
-    let _ = print_take()
-    cg_eff_print_thunk(1, 0)
-    assert_eq(cg_ices_saying("NoSuchThunk", "thunk 1 is not in the queue of 1"), 1)
-    assert_eq(cg_ice_count(), 1)
-    assert_eq(cg_text_occurrences(print_take(), "closure"), 0)
+    with handler Diag {} {
+        let _ = setup_closure_program()
+        let _ = cg_eff_lower_closure(closure_of("g_plain"))
+        drain_one(0)
+        let _ = print_take()
+        cg_eff_print_thunk(1, 0)
+        assert_eq(cg_ices_saying("NoSuchThunk", "thunk 1 is not in the queue of 1"), 1)
+        assert_eq(cg_ice_count(), 1)
+        assert_eq(cg_text_occurrences(print_take(), "closure"), 0)
+    }
 }

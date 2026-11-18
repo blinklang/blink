@@ -11,10 +11,11 @@ import std.io
 import layout.{layout_reset}
 import cname.{cname_reset}
 import cg_test_helpers.{cg_probe_compile}
-import cg.{CgConfig, generate, generate_archive_header, generate_module_headers, generate_module_object}
+import cg.{CgConfig, generate, generate_archive_header, generate_module_headers, generate_module_object, Codegen}
 import cg_reg.{cg_reg_fn_decls}
 import mono.{instances, run_mono}
 import parser.{node_name}
+import diagnostics.{Diag}
 
 fn assert_has(text: Str, needle: Str) ! IO.Print {
     if !text.contains(needle) {
@@ -46,15 +47,16 @@ fn user_tu_cfg() -> CgConfig {
 // A package whose library module declares a generic and whose entry module instantiates
 // it at a type only the entry module declares. That is the instance the archive could not
 // have built: the type it is over did not exist when the archive was compiled.
-fn pkg_probe(stem: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Env.Exit, Env.Read, FS.Read, FS.Write, IO, Process.Spawn {
-    let root = "build/{stem}_pkg"
-    let _clean = process.run("rm", ["-rf", root]).unwrap()
-    let _mk = process.run("mkdir", ["-p", "{root}/src"]).unwrap()
-    fs.write("{root}/blink.toml", "[package]\nname = \"{stem}\"\nversion = \"0.1.0\"\n").unwrap()
-    fs.write("{root}/src/mymod.bl", #"pub fn ident[T](x: T) -> T { x }
+fn pkg_probe(stem: Str) -> Int ! Env.Exit, Env.Read, FS.Read, FS.Write, IO, Process.Spawn {
+    with handler Diag {} {
+        let root = "build/{stem}_pkg"
+        let _clean = process.run("rm", ["-rf", root]).unwrap()
+        let _mk = process.run("mkdir", ["-p", "{root}/src"]).unwrap()
+        fs.write("{root}/blink.toml", "[package]\nname = \"{stem}\"\nversion = \"0.1.0\"\n").unwrap()
+        fs.write("{root}/src/mymod.bl", #"pub fn ident[T](x: T) -> T { x }
 "#).unwrap()
-    let path = "{root}/src/probe.bl"
-    let program = cg_probe_compile(path, #"import mymod.{ident}
+        let path = "{root}/src/probe.bl"
+        let program = cg_probe_compile(path, #"import mymod.{ident}
 
 type Wrap { v: Int }
 
@@ -63,11 +65,12 @@ fn main() {
     let _r = ident(w)
 }
 "#)
-    run_mono(program)
-    layout_reset()
-    cname_reset()
-    let _rm = process.run("rm", ["-rf", root]).unwrap()
-    program
+        run_mono(program)
+        layout_reset()
+        cname_reset()
+        let _rm = process.run("rm", ["-rf", root]).unwrap()
+        program
+    }
 }
 
 // The symbol comes from the monomorphization pass that chose it, so these tests prove the
@@ -101,57 +104,65 @@ fn top_level_line(text: Str, needle: Str, tail: Str) -> Str {
 }
 
 test "the unit that needs an instance of an archive generic writes it" {
-    let program = pkg_probe("cg_drv_inst_need")
-    let whole = generate(program, standalone_cfg())
-    let iname = instance_name("ident")
-    let proto = top_level_line(whole, iname, ");")
-    let body = top_level_line(whole, iname, #"{"#)
-    assert(proto != "")
-    assert(body != "")
-    let user = generate(program, user_tu_cfg())
-    assert_has(user, proto)
-    assert_has(user, body)
+    with handler Codegen {}, handler Diag {} {
+        let program = pkg_probe("cg_drv_inst_need")
+        let whole = generate(program, standalone_cfg())
+        let iname = instance_name("ident")
+        let proto = top_level_line(whole, iname, ");")
+        let body = top_level_line(whole, iname, #"{"#)
+        assert(proto != "")
+        assert(body != "")
+        let user = generate(program, user_tu_cfg())
+        assert_has(user, proto)
+        assert_has(user, body)
+    }
 }
 
 // Two definitions of one external symbol do not link. The archive defines the instances
 // its own sources asked for, under names chosen the same way, so a unit that adds its own
 // must keep them to itself.
 test "an instance of an archive generic has internal linkage" {
-    let program = pkg_probe("cg_drv_inst_linkage")
-    let whole = generate(program, standalone_cfg())
-    let iname = instance_name("ident")
-    let proto = top_level_line(whole, iname, ");")
-    let body = top_level_line(whole, iname, #"{"#)
-    assert_lacks(whole, "static {proto}")
-    let user = generate(program, user_tu_cfg())
-    assert_has(user, "static {proto}")
-    assert_has(user, "static {body}")
+    with handler Codegen {}, handler Diag {} {
+        let program = pkg_probe("cg_drv_inst_linkage")
+        let whole = generate(program, standalone_cfg())
+        let iname = instance_name("ident")
+        let proto = top_level_line(whole, iname, ");")
+        let body = top_level_line(whole, iname, #"{"#)
+        assert_lacks(whole, "static {proto}")
+        let user = generate(program, user_tu_cfg())
+        assert_has(user, "static {proto}")
+        assert_has(user, "static {body}")
+    }
 }
 
 // The archive cannot offer an instance to the units linked against it: which instances a
 // program needs follows from that program's call sites, and the archive was compiled
 // without them. Declaring one would also collide with the copy the user's unit writes.
 test "the archive header exports no instance" {
-    let program = pkg_probe("cg_drv_inst_header")
-    let _whole = generate(program, standalone_cfg())
-    let iname = instance_name("ident")
-    let header = generate_archive_header(program, standalone_cfg())
-    assert_lacks(header, iname)
+    with handler Codegen {}, handler Diag {} {
+        let program = pkg_probe("cg_drv_inst_header")
+        let _whole = generate(program, standalone_cfg())
+        let iname = instance_name("ident")
+        let header = generate_archive_header(program, standalone_cfg())
+        assert_lacks(header, iname)
+    }
 }
 
 // Inside one program nothing is compiled ahead of the call sites, so the ordinary rule
 // holds and an instance keeps one home: the unit that declares the generic.
 test "inside one program an instance keeps one home" {
-    let program = pkg_probe("cg_drv_inst_home")
-    let whole = generate(program, standalone_cfg())
-    let iname = instance_name("ident")
-    let body = top_level_line(whole, iname, #"{"#)
-    assert(body != "")
-    let owner = generate_module_object(program, "mymod", "mymod.h", standalone_cfg())
-    assert_has(owner, body)
-    let user = generate_module_object(program, "__main__", "probe.h", standalone_cfg())
-    assert_lacks(user, body)
-    // The instance is the owner's to define, so its own private header declares it.
-    let owner_header = generate_module_headers(program, "mymod", standalone_cfg()).internal
-    assert_has(owner_header, top_level_line(whole, iname, ");"))
+    with handler Codegen {}, handler Diag {} {
+        let program = pkg_probe("cg_drv_inst_home")
+        let whole = generate(program, standalone_cfg())
+        let iname = instance_name("ident")
+        let body = top_level_line(whole, iname, #"{"#)
+        assert(body != "")
+        let owner = generate_module_object(program, "mymod", "mymod.h", standalone_cfg())
+        assert_has(owner, body)
+        let user = generate_module_object(program, "__main__", "probe.h", standalone_cfg())
+        assert_lacks(user, body)
+        // The instance is the owner's to define, so its own private header declares it.
+        let owner_header = generate_module_headers(program, "mymod", standalone_cfg()).internal
+        assert_has(owner_header, top_level_line(whole, iname, ");"))
+    }
 }

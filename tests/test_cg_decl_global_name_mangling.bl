@@ -15,10 +15,11 @@ import layout.{layout_reset}
 import mono.{run_mono}
 import cname.{cname_reset}
 import cg_test_helpers.{cg_probe_compile, cg_text_occurrences}
-import cg.{CgConfig, generate, generate_archive_header}
+import cg.{CgConfig, generate, generate_archive_header, Codegen}
 import cg_print.{print_reset, print_take}
 import cg_reg.{cg_reg_reset, cg_reg_build, cg_reg_global_decls}
 import cg_decl.{cg_decl_reset, cg_decl_emit_globals}
+import diagnostics.{Diag}
 
 // `SIGHUP` is a macro <signal.h> defines, `CH_0` is the name three stdlib modules each
 // declare privately, and `helper_flag` crosses a module boundary under a selective import.
@@ -43,16 +44,18 @@ test "read the globals" {
 "#
 }
 
-fn build_probe(entry_path: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete, Env.Exit, Env.Read, FS.Read, FS.Write, IO {
-    let helper_path = "src/cg_decl_gname_helper.bl"
-    fs.write(helper_path, helper_src()).unwrap()
-    let program = cg_probe_compile(entry_path, entry_src())
-    run_mono(program)
-    layout_reset()
-    cname_reset()
-    let _ = fs.delete(entry_path)
-    let _ = fs.delete(helper_path)
-    program
+fn build_probe(entry_path: Str) -> Int ! FS.Delete, Env.Exit, Env.Read, FS.Read, FS.Write, IO {
+    with handler Diag {} {
+        let helper_path = "src/cg_decl_gname_helper.bl"
+        fs.write(helper_path, helper_src()).unwrap()
+        let program = cg_probe_compile(entry_path, entry_src())
+        run_mono(program)
+        layout_reset()
+        cname_reset()
+        let _ = fs.delete(entry_path)
+        let _ = fs.delete(helper_path)
+        program
+    }
 }
 
 fn full_cfg() -> CgConfig {
@@ -61,14 +64,16 @@ fn full_cfg() -> CgConfig {
         test_build: 1 }
 }
 
-fn decl_text(entry_path: Str, is_extern: Bool) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete, Env.Exit, Env.Read, FS.Read, FS.Write, IO {
-    let program = build_probe(entry_path)
-    print_reset()
-    cg_reg_reset()
-    cg_reg_build(program)
-    cg_decl_reset()
-    let _ = cg_decl_emit_globals(is_extern, cg_reg_global_decls(), Map())
-    print_take()
+fn decl_text(entry_path: Str, is_extern: Bool) -> Str ! FS.Delete, Env.Exit, Env.Read, FS.Read, FS.Write, IO {
+    with handler Diag {} {
+        let program = build_probe(entry_path)
+        print_reset()
+        cg_reg_reset()
+        cg_reg_build(program)
+        cg_decl_reset()
+        let _ = cg_decl_emit_globals(is_extern, cg_reg_global_decls(), Map())
+        print_take()
+    }
 }
 
 fn assert_has(text: Str, needle: Str) ! IO.Print {
@@ -137,25 +142,31 @@ test "two modules declaring one global name emit two distinct symbols" {
 // definition declared. The entry module reads its own CH_0, so the name it emits is the
 // entry's, never the helper module's same-named private one.
 test "a read of a global spells the definition in the reader's own module" {
-    let program = build_probe("build/cg_decl_gname_read.bl")
-    let text = generate(program, full_cfg())
-    assert_count("own CH_0 defined and read", text, "blink_2CH_10", 2)
-    assert_has(text, "blink_2SIGHUP")
+    with handler Codegen {}, handler Diag {} {
+        let program = build_probe("build/cg_decl_gname_read.bl")
+        let text = generate(program, full_cfg())
+        assert_count("own CH_0 defined and read", text, "blink_2CH_10", 2)
+        assert_has(text, "blink_2SIGHUP")
+    }
 }
 
 // A read across a module boundary resolves to the module that declares it, which is what
 // keeps a selective import working once the name is no longer global to the program.
 test "a read of an imported global spells the declaring module's name" {
-    let program = build_probe("build/cg_decl_gname_cross.bl")
-    let text = generate(program, full_cfg())
-    assert_has(text, "blink_3cg_1decl_1gname_1helper_helper_1flag")
+    with handler Codegen {}, handler Diag {} {
+        let program = build_probe("build/cg_decl_gname_cross.bl")
+        let text = generate(program, full_cfg())
+        assert_has(text, "blink_3cg_1decl_1gname_1helper_helper_1flag")
+    }
 }
 
 // The archive header is the surface every user unit compiles against, so a stdlib global
 // reaching it bare would put the collision in every program, not only the one that
 // declared the name.
 test "the archive header declares globals under the mangled name" {
-    let program = build_probe("build/cg_decl_gname_archive.bl")
-    let text = generate_archive_header(program, full_cfg())
-    assert_missing(text, "extern int64_t SIGHUP;")
+    with handler Codegen {}, handler Diag {} {
+        let program = build_probe("build/cg_decl_gname_archive.bl")
+        let text = generate_archive_header(program, full_cfg())
+        assert_missing(text, "extern int64_t SIGHUP;")
+    }
 }

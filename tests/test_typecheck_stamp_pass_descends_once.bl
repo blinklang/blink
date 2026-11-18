@@ -4,20 +4,23 @@
 
 import std.fs
 import compiler.{compile_to_program}
-import typecheck.{check_types, tc_stamp_walk}
-import parser.{node_count, node_kind, node_name, node_body}
+import typecheck.{check_types, tc_stamp_walk, TypeCheck}
+import parser.{node_count, node_kind, node_name, node_body, Parse}
 import ast.{NodeKind}
-import diagnostics.{diag_reset}
+import diagnostics.{diag_reset, Diag}
 import embedded_stdlib_registry.{init_embedded_stdlib}
+import lexer.{Lex}
 
-fn compile_probe(path: Str, src: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
-    init_embedded_stdlib()
-    fs.write(path, src).unwrap()
-    diag_reset()
-    let program = compile_to_program(path, 1)
-    check_types(program)
-    let _ = fs.delete(path)
-    program
+fn compile_probe(path: Str, src: Str) -> Int ! FS, Env.Exit, Env.Read, IO {
+    with handler Diag {}, handler Lex {}, handler Parse {}, handler TypeCheck {} {
+        init_embedded_stdlib()
+        fs.write(path, src).unwrap()
+        diag_reset()
+        let program = compile_to_program(path, 1)
+        check_types(program)
+        let _ = fs.delete(path)
+        program
+    }
 }
 
 fn probe_src() -> Str {
@@ -50,60 +53,68 @@ fn node_named(kind: NodeKind, nm: Str) -> Int {
 }
 
 test "one descent reaches each node once" {
-    let program = compile_probe("build/stamp_descends_once_probe.bl", probe_src())
-    let order = tc_stamp_walk(program, [])
-    assert(order.len() > 20)
-    let mut hits: List[Int] = []
-    while hits.len() < node_count() { hits.push(0) }
-    let mut twice = 0
-    for n in order {
-        if hits.get(n).unwrap() != 0 { twice = twice + 1 }
-        hits.set(n, 1)
+    with handler Diag {}, handler TypeCheck {} {
+        let program = compile_probe("build/stamp_descends_once_probe.bl", probe_src())
+        let order = tc_stamp_walk(program, [])
+        assert(order.len() > 20)
+        let mut hits: List[Int] = []
+        while hits.len() < node_count() { hits.push(0) }
+        let mut twice = 0
+        for n in order {
+            if hits.get(n).unwrap() != 0 { twice = twice + 1 }
+            hits.set(n, 1)
+        }
+        assert_eq(twice, 0)
     }
-    assert_eq(twice, 0)
 }
 
 test "the walk reaches a test block body and a closure body" {
-    let program = compile_probe("build/stamp_reaches_bodies_probe.bl", probe_src())
-    let order = tc_stamp_walk(program, [])
-    let mut tb = -1
-    let mut closure = -1
-    for n in 0..node_count() {
-        if tb == -1 && node_kind(n) == NodeKind.TestBlock { tb = n }
-        if closure == -1 && node_kind(n) == NodeKind.Closure { closure = n }
+    with handler Diag {}, handler TypeCheck {} {
+        let program = compile_probe("build/stamp_reaches_bodies_probe.bl", probe_src())
+        let order = tc_stamp_walk(program, [])
+        let mut tb = -1
+        let mut closure = -1
+        for n in 0..node_count() {
+            if tb == -1 && node_kind(n) == NodeKind.TestBlock { tb = n }
+            if closure == -1 && node_kind(n) == NodeKind.Closure { closure = n }
+        }
+        assert(tb != -1)
+        assert(closure != -1)
+        assert(order.contains(node_body(tb)))
+        assert(order.contains(node_body(closure)))
     }
-    assert(tb != -1)
-    assert(closure != -1)
-    assert(order.contains(node_body(tb)))
-    assert(order.contains(node_body(closure)))
 }
 
 test "an ffi body is absent from the walk while the declaration itself is in it" {
-    let program = compile_probe("build/stamp_ffi_body_absent_probe.bl", probe_src())
-    let order = tc_stamp_walk(program, [])
-    let ffi_fn = node_named(NodeKind.FnDef, "stamp_probe_open")
-    assert(ffi_fn != -1)
-    assert(order.contains(ffi_fn))
-    let ffi_body = node_body(ffi_fn)
-    assert(ffi_body != -1)
-    assert(order.contains(ffi_body) == false)
+    with handler Diag {}, handler TypeCheck {} {
+        let program = compile_probe("build/stamp_ffi_body_absent_probe.bl", probe_src())
+        let order = tc_stamp_walk(program, [])
+        let ffi_fn = node_named(NodeKind.FnDef, "stamp_probe_open")
+        assert(ffi_fn != -1)
+        assert(order.contains(ffi_fn))
+        let ffi_body = node_body(ffi_fn)
+        assert(ffi_body != -1)
+        assert(order.contains(ffi_body) == false)
+    }
 }
 
 // The walks share one seen buffer, as the program walk shares it with the field-default and
 // @where walks its recovery runs, so a mark one walk leaves behind would hide a node from the next.
 test "a later walk over the same seen buffer sees every node again" {
-    let program = compile_probe("build/stamp_rewalk_probe.bl", probe_src())
-    let mut seen: List[Int] = []
-    let all = tc_stamp_walk(program, seen)
-    let mut marked = 0
-    for m in seen { marked = marked + m }
-    assert_eq(marked, 0)
-    let outer = node_named(NodeKind.FnDef, "stamp_probe_outer")
-    assert(outer != -1)
-    let once = tc_stamp_walk(outer, seen)
-    let twice = tc_stamp_walk(outer, seen)
-    assert(once.len() > 5)
-    assert(once.len() < all.len())
-    assert_eq(twice.len(), once.len())
-    assert_eq(tc_stamp_walk(program, seen).len(), all.len())
+    with handler Diag {}, handler TypeCheck {} {
+        let program = compile_probe("build/stamp_rewalk_probe.bl", probe_src())
+        let mut seen: List[Int] = []
+        let all = tc_stamp_walk(program, seen)
+        let mut marked = 0
+        for m in seen { marked = marked + m }
+        assert_eq(marked, 0)
+        let outer = node_named(NodeKind.FnDef, "stamp_probe_outer")
+        assert(outer != -1)
+        let once = tc_stamp_walk(outer, seen)
+        let twice = tc_stamp_walk(outer, seen)
+        assert(once.len() > 5)
+        assert(once.len() < all.len())
+        assert_eq(twice.len(), once.len())
+        assert_eq(tc_stamp_walk(program, seen).len(), all.len())
+    }
 }

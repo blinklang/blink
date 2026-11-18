@@ -20,11 +20,12 @@
 
 import std.fs
 import compiler.{compile_to_program}
-import typecheck.{check_types, tc_lookup_node_tid, tc_type_str}
-import parser.{node_count, node_kind, node_method}
+import typecheck.{check_types, tc_lookup_node_tid, tc_type_str, TypeCheck}
+import parser.{node_count, node_kind, node_method, Parse}
 import ast.{NodeKind}
-import diagnostics.{diag_entries, diag_entry_count, diag_truncate}
+import diagnostics.{diag_entries, diag_entry_count, diag_truncate, Diag}
 import std.io
+import lexer.{Lex}
 
 fn assert_eq_str(got: Str, want: Str, label: Str) ! IO.Print {
     if got != want { io.println("FAIL: {label} — got '{got}', want '{want}'") }
@@ -56,11 +57,13 @@ fn nth_method_call_ty(method: Str, n: Int) -> Str {
     "NONE"
 }
 
-fn typecheck_probe(path: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
-    fs.write(path, src).unwrap()
-    let program = compile_to_program(path, 1)
-    check_types(program)
-    let _ = fs.delete(path)
+fn typecheck_probe(path: Str, src: Str) ! FS, Env.Exit, Env.Read, IO {
+    with handler Diag {}, handler Lex {}, handler Parse {}, handler TypeCheck {} {
+        fs.write(path, src).unwrap()
+        let program = compile_to_program(path, 1)
+        check_types(program)
+        let _ = fs.delete(path)
+    }
 }
 
 // ── Half A — the return type, at three element shapes ─────────────────────────
@@ -136,26 +139,28 @@ fn mismatch_src() -> Str {
 }
 
 test "a popped value is checked against its declared type" {
-    let path = "build/list_pop_option_mismatch.bl"
-    fs.write(path, mismatch_src()).unwrap()
-    let program = compile_to_program(path, 1)
-    let before = diag_entry_count()
-    check_types(program)
-    let _ = fs.delete(path)
+    with handler Diag {}, handler Lex {}, handler Parse {}, handler TypeCheck {} {
+        let path = "build/list_pop_option_mismatch.bl"
+        fs.write(path, mismatch_src()).unwrap()
+        let program = compile_to_program(path, 1)
+        let before = diag_entry_count()
+        check_types(program)
+        let _ = fs.delete(path)
 
-    let mut saw_type_error = false
-    let mut i = before
-    while i < diag_entries.len() {
-        let d = diag_entries.get(i).unwrap()
-        if d.severity == "error" && d.name == "TypeError" { saw_type_error = true }
-        i = i + 1
+        let mut saw_type_error = false
+        let mut i = before
+        while i < diag_entries.len() {
+            let d = diag_entries.get(i).unwrap()
+            if d.severity == "error" && d.name == "TypeError" { saw_type_error = true }
+            i = i + 1
+        }
+        // Leave the shared global diag buffer as it was found: an unflushed error here would
+        // read as a failure of whichever test in this binary happens to flush next.
+        diag_truncate(before)
+        // `let n: Int = xs.pop()` is wrong — the user owes an `.unwrap()`. With pop typed Void
+        // this was accepted silently, which is the whole reason the mislabel was survivable.
+        assert_true(saw_type_error, "declaring `let n: Int = xs.pop()` is a TypeError once pop() is known to return Option[Int]")
     }
-    // Leave the shared global diag buffer as it was found: an unflushed error here would
-    // read as a failure of whichever test in this binary happens to flush next.
-    diag_truncate(before)
-    // `let n: Int = xs.pop()` is wrong — the user owes an `.unwrap()`. With pop typed Void
-    // this was accepted silently, which is the whole reason the mislabel was survivable.
-    assert_true(saw_type_error, "declaring `let n: Int = xs.pop()` is a TypeError once pop() is known to return Option[Int]")
 }
 
 // ── Half C — the runtime half, which was always right and must stay right ─────

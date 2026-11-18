@@ -7,9 +7,11 @@
 import std.fs
 import std.process.{ProcessResult}
 import compiler.{compile_to_program}
-import typecheck.{check_types}
-import diagnostics.{diag_entries, diag_reset, diag_explain, UNKNOWN_EFFECT}
+import typecheck.{check_types, TypeCheck}
+import diagnostics.{diag_entries, diag_reset, diag_explain, UNKNOWN_EFFECT, Diag}
 import embedded_stdlib_registry.{init_embedded_stdlib}
+import lexer.{Lex}
+import parser.{Parse}
 
 fn sh(cmd: Str) -> ProcessResult ! Process.Spawn {
     process.run("sh", ["-c", cmd]).unwrap()
@@ -17,24 +19,26 @@ fn sh(cmd: Str) -> ProcessResult ! Process.Spawn {
 
 // A package of the given (name, source) files, each written to src/<name>.bl, checked from
 // src/main.bl.
-fn package_probe(files: List[(Str, Str)]) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Process.Spawn, Env.Exit, Env.Read, IO {
-    init_embedded_stdlib()
-    let dir = sh("mktemp -d /tmp/blink_unknown_effect.XXXXXX").out.trim()
-    let _ = sh("mkdir -p {dir}/src")
-    fs.write("{dir}/blink.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\n").unwrap()
-    for f in files {
-        fs.write("{dir}/src/{f.0}.bl", f.1).unwrap()
+fn package_probe(files: List[(Str, Str)]) -> Str ! FS, Process.Spawn, Env.Exit, Env.Read, IO {
+    with handler Diag {}, handler Lex {}, handler Parse {}, handler TypeCheck {} {
+        init_embedded_stdlib()
+        let dir = sh("mktemp -d /tmp/blink_unknown_effect.XXXXXX").out.trim()
+        let _ = sh("mkdir -p {dir}/src")
+        fs.write("{dir}/blink.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\n").unwrap()
+        for f in files {
+            fs.write("{dir}/src/{f.0}.bl", f.1).unwrap()
+        }
+        let main_path = "{dir}/src/main.bl"
+        diag_reset()
+        let program = compile_to_program(main_path, 1)
+        check_types(program)
+        let got = errors_in(main_path)
+        let _ = sh("rm -rf {dir}")
+        got
     }
-    let main_path = "{dir}/src/main.bl"
-    diag_reset()
-    let program = compile_to_program(main_path, 1)
-    check_types(program)
-    let got = errors_in(main_path)
-    let _ = sh("rm -rf {dir}")
-    got
 }
 
-fn probe(src: Str) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Process.Spawn, Env.Exit, Env.Read, IO {
+fn probe(src: Str) -> Str ! FS, Process.Spawn, Env.Exit, Env.Read, IO {
     package_probe([("main", src)])
 }
 
@@ -56,7 +60,7 @@ fn errors_in(path: Str) -> Str {
 let LOG_LIB: Str = "pub effect Log \{\n    effect Write \{\n        fn log(msg: Str)\n    }\n}\n\neffect Hidden \{\n    effect Sub \{\n        fn h()\n    }\n}\n\npub type Pt \{ x: Int }\n"
 
 // The list gets its own let: a let-initializer call types a tuple that holds a name as `<?>`.
-fn lib_probe(main_src: Str) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Process.Spawn, Env.Exit, Env.Read, IO {
+fn lib_probe(main_src: Str) -> Str ! FS, Process.Spawn, Env.Exit, Env.Read, IO {
     let files = [("lib", LOG_LIB), ("main", main_src)]
     package_probe(files)
 }

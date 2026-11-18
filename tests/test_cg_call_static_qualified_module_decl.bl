@@ -14,9 +14,9 @@
 // answered.
 
 import compiler.{compile_to_program}
-import typecheck.{check_types, tc_call_decl_node}
-import diagnostics.{diag_reset, diag_entries}
-import parser.{node_count, node_kind, node_name, node_obj, node_method, node_module}
+import typecheck.{check_types, tc_call_decl_node, TypeCheck}
+import diagnostics.{diag_reset, diag_entries, Diag}
+import parser.{node_count, node_kind, node_name, node_obj, node_method, node_module, Parse}
 import ast.{NodeKind}
 import layout.{layout_reset}
 import ir.{ir_reset, IrKind, ir_kind, ir_kind_name, ir_c_name}
@@ -27,6 +27,7 @@ import mono.{run_mono}
 import cname.{c_fn_decl_name}
 import cg_test_helpers.{cg_probe_begin, cg_probe_front_end_clean}
 import std.io
+import lexer.{Lex}
 
 fn dump_ice() ! IO.Print {
     for d in diag_entries {
@@ -34,19 +35,21 @@ fn dump_ice() ! IO.Print {
     }
 }
 
-fn compile_fixture(path: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Env.Exit, Env.Read, FS.Read, IO {
-    diag_reset()
-    cg_probe_begin(path)
-    let program = compile_to_program(path, 1)
-    cg_probe_front_end_clean("import resolution")
-    check_types(program)
-    cg_probe_front_end_clean("type checking")
-    layout_reset()
-    ir_reset()
-    cg_expr_reset()
-    cg_reg_reset()
-    cg_reg_build(program)
-    program
+fn compile_fixture(path: Str) -> Int ! Env.Exit, Env.Read, FS.Read, IO {
+    with handler Diag {}, handler Lex {}, handler Parse {}, handler TypeCheck {} {
+        diag_reset()
+        cg_probe_begin(path)
+        let program = compile_to_program(path, 1)
+        cg_probe_front_end_clean("import resolution")
+        check_types(program)
+        cg_probe_front_end_clean("type checking")
+        layout_reset()
+        ir_reset()
+        cg_expr_reset()
+        cg_reg_reset()
+        cg_reg_build(program)
+        program
+    }
 }
 
 fn qualified_call(qualifier: Str, member: Str) -> Int ! IO.Print {
@@ -92,18 +95,22 @@ fn assert_calls_symbol(label: Str, id: Int, want_module: Str, want_name: Str) ! 
 }
 
 test "a static call to an independently-declared namesake reaches this file's own import" {
-    let program = compile_fixture("tests/zzst_calls/src/main_static_left.bl")
-    run_mono(program)
-    assert_calls_symbol("left", lower_call(qualified_call("ZzstBox", "make")), "zzst_left", "ZzstBox_make")
+    with handler Diag {} {
+        let program = compile_fixture("tests/zzst_calls/src/main_static_left.bl")
+        run_mono(program)
+        assert_calls_symbol("left", lower_call(qualified_call("ZzstBox", "make")), "zzst_left", "ZzstBox_make")
+    }
 }
 
 // The same associated-function spelling, an unrelated independent module: proves the answer
 // follows each file's own declaration rather than being a fixed winner of a scan over every
 // declaration named `ZzstBox_make`.
 test "the same associated function name in a second independent module reaches its own declaration" {
-    let program = compile_fixture("tests/zzst_calls/src/main_static_right.bl")
-    run_mono(program)
-    assert_calls_symbol("right", lower_call(qualified_call("ZzstBox", "make")), "zzst_right", "ZzstBox_make")
+    with handler Diag {} {
+        let program = compile_fixture("tests/zzst_calls/src/main_static_right.bl")
+        run_mono(program)
+        assert_calls_symbol("right", lower_call(qualified_call("ZzstBox", "make")), "zzst_right", "ZzstBox_make")
+    }
 }
 
 // The actual regression this retirement fixes: two declarations of the identical mangled
@@ -112,7 +119,9 @@ test "the same associated function name in a second independent module reaches i
 // apart; the call's own recorded declaration can, and lowering must follow it instead of
 // refusing a call typecheck already resolved.
 test "two declarations of the identical mangled name in one program still lower via the call's own resolved declaration" {
-    let program = compile_fixture("tests/zzst_calls/src/main_static_collision.bl")
-    run_mono(program)
-    assert_calls_symbol("collision", lower_call(qualified_call("ZzstCrate", "make")), "zzst_extra", "ZzstCrate_make")
+    with handler Diag {} {
+        let program = compile_fixture("tests/zzst_calls/src/main_static_collision.bl")
+        run_mono(program)
+        assert_calls_symbol("collision", lower_call(qualified_call("ZzstCrate", "make")), "zzst_extra", "ZzstCrate_make")
+    }
 }

@@ -4,25 +4,28 @@
 // the report is an internal error and not an error in the program.
 import std.fs
 import compiler.{compile_to_program}
-import typecheck.{check_types, tc_report_unclaimed_left}
-import diagnostics.{diag_count, diag_entries, diag_ice_count, diag_reset, lint_set_override}
-import parser.{node_count, node_kind, node_method}
+import typecheck.{check_types, tc_report_unclaimed_left, TypeCheck}
+import diagnostics.{diag_count, diag_entries, diag_ice_count, diag_reset, lint_set_override, Diag}
+import parser.{node_count, node_kind, node_method, Parse}
 import ast.{NodeKind}
 import embedded_stdlib_registry.{init_embedded_stdlib}
+import lexer.{Lex}
 
-fn check_src(path: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
+fn check_src(path: Str, src: Str) ! FS, Env.Exit, Env.Read, IO {
     check_src_lint(path, src, "", "")
 }
 
 // With one [lints] entry in force, as blink.toml would set it.
-fn check_src_lint(path: Str, src: Str, lint: Str, level: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
-    init_embedded_stdlib()
-    fs.write(path, src).unwrap()
-    diag_reset()
-    if lint != "" { lint_set_override(lint, level) }
-    let _program = compile_to_program(path, 1)
-    check_types(_program)
-    let _ = fs.delete(path)
+fn check_src_lint(path: Str, src: Str, lint: Str, level: Str) ! FS, Env.Exit, Env.Read, IO {
+    with handler Diag {}, handler Lex {}, handler Parse {}, handler TypeCheck {} {
+        init_embedded_stdlib()
+        fs.write(path, src).unwrap()
+        diag_reset()
+        if lint != "" { lint_set_override(lint, level) }
+        let _program = compile_to_program(path, 1)
+        check_types(_program)
+        let _ = fs.delete(path)
+    }
 }
 
 fn sites(severity: Str) -> List[Str] {
@@ -75,21 +78,25 @@ fn valid_two_calls() -> Str {
 // reporter for a call no rule answered. These rows hand it calls of a checked program, as the
 // stamp pass would hand it a call that no rule typed.
 test "a call no rule of inference answered is internal error I0023 at the call" {
-    check_src("build/tc_unclaimed_unit_one.bl", valid_two_calls())
-    assert_eq(diag_count, 0)
-    tc_report_unclaimed_left(calls_named("get"))
-    assert_eq(codes("ice"), ["I0023"])
-    assert_starts(sites("ice"), ["12:19 no rule of inference answered the call `get`"])
+    with handler Diag {} {
+        check_src("build/tc_unclaimed_unit_one.bl", valid_two_calls())
+        assert_eq(diag_count, 0)
+        tc_report_unclaimed_left(calls_named("get"))
+        assert_eq(codes("ice"), ["I0023"])
+        assert_starts(sites("ice"), ["12:19 no rule of inference answered the call `get`"])
+    }
 }
 
 test "two unanswered calls, one inside the other, are one I0023 at the first" {
-    check_src("build/tc_unclaimed_unit_nested.bl", valid_two_calls())
-    let mut calls = calls_named("get")
-    for c in calls_named("put") { calls.push(c) }
-    tc_report_unclaimed_left(calls)
-    assert_eq(diag_count, 0)
-    assert_eq(codes("ice"), ["I0023"])
-    assert_starts(sites("ice"), ["12:19 no rule of inference answered the call `get`"])
+    with handler Diag {} {
+        check_src("build/tc_unclaimed_unit_nested.bl", valid_two_calls())
+        let mut calls = calls_named("get")
+        for c in calls_named("put") { calls.push(c) }
+        tc_report_unclaimed_left(calls)
+        assert_eq(diag_count, 0)
+        assert_eq(codes("ice"), ["I0023"])
+        assert_starts(sites("ice"), ["12:19 no rule of inference answered the call `get`"])
+    }
 }
 
 test "Sized.len() with no argument is E0505 at check: it has no receiver" {

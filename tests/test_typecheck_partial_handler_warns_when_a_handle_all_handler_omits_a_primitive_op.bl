@@ -10,19 +10,23 @@
 
 import std.fs
 import compiler.{compile_to_program}
-import typecheck.{check_types}
-import diagnostics.{diag_entries, lint_set_override}
+import typecheck.{check_types, TypeCheck}
+import diagnostics.{diag_entries, lint_set_override, Diag}
 import std.io
+import lexer.{Lex}
+import parser.{Parse}
 
-fn probe(name: Str, src: Str, lint: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
-    // A path per row: the fix reads the handler's source lines, and they are cached by path.
-    let path = "build/w0545_{name}.bl"
-    fs.write(path, src).unwrap()
-    let program = compile_to_program(path, 1)
-    // After compile_to_program, which resets the [lints] table it loads from the manifest.
-    if lint != "" { lint_set_override(lint, "off") }
-    check_types(program)
-    let _ = fs.delete(path)
+fn probe(name: Str, src: Str, lint: Str) ! FS, Env.Exit, Env.Read, IO {
+    with handler Diag {}, handler Lex {}, handler Parse {}, handler TypeCheck {} {
+        // A path per row: the fix reads the handler's source lines, and they are cached by path.
+        let path = "build/w0545_{name}.bl"
+        fs.write(path, src).unwrap()
+        let program = compile_to_program(path, 1)
+        // After compile_to_program, which resets the [lints] table it loads from the manifest.
+        if lint != "" { lint_set_override(lint, "off") }
+        check_types(program)
+        let _ = fs.delete(path)
+    }
 }
 
 fn partial_warnings() -> List[Str] {
@@ -341,7 +345,8 @@ fn errors_named(name: Str) -> List[Str] {
 }
 
 test "@handle_all on anything but an effect is an UnexpectedAnnotation" {
-    fs.write("build/w0545_misplaced.bl", #"@handle_all
+    with handler Diag {}, handler Lex {}, handler Parse {} {
+        fs.write("build/w0545_misplaced.bl", #"@handle_all
 fn f() -> Int { 1 }
 
 @handle_all
@@ -351,19 +356,21 @@ fn main() {
     io.println("{f()}")
 }
 "#).unwrap()
-    let _ = compile_to_program("build/w0545_misplaced.bl", 1)
-    let _ = fs.delete("build/w0545_misplaced.bl")
-    let hits = errors_named("UnexpectedAnnotation")
-    if hits.len() != 2 {
-        for h in hits { io.println("  {h}") }
+        let _ = compile_to_program("build/w0545_misplaced.bl", 1)
+        let _ = fs.delete("build/w0545_misplaced.bl")
+        let hits = errors_named("UnexpectedAnnotation")
+        if hits.len() != 2 {
+            for h in hits { io.println("  {h}") }
+        }
+        assert_eq(hits.len(), 2)
+        expect_eq("on a fn", hits.get(0).unwrap(), "E1110 1:1 @handle_all is only allowed on an effect declaration")
+        expect_eq("on a type", hits.get(1).unwrap(), "E1110 4:1 @handle_all is only allowed on an effect declaration")
     }
-    assert_eq(hits.len(), 2)
-    expect_eq("on a fn", hits.get(0).unwrap(), "E1110 1:1 @handle_all is only allowed on an effect declaration")
-    expect_eq("on a type", hits.get(1).unwrap(), "E1110 4:1 @handle_all is only allowed on an effect declaration")
 }
 
 test "an annotation inside an effect body must precede a sub-effect" {
-    fs.write("build/w0545_dangling.bl", #"effect Kv {
+    with handler Diag {}, handler Lex {}, handler Parse {} {
+        fs.write("build/w0545_dangling.bl", #"effect Kv {
     effect Get {
         fn get(k: Str) -> Int
     }
@@ -372,11 +379,12 @@ test "an annotation inside an effect body must precede a sub-effect" {
 
 fn main() { }
 "#).unwrap()
-    let _ = compile_to_program("build/w0545_dangling.bl", 1)
-    let _ = fs.delete("build/w0545_dangling.bl")
-    let hits = errors_named("UnexpectedAnnotation")
-    assert_eq(hits.len(), 1)
-    expect_eq("dangling", hits.get(0).unwrap(), "E1110 5:5 @handle_all in effect `Kv` is not followed by a sub-effect")
+        let _ = compile_to_program("build/w0545_dangling.bl", 1)
+        let _ = fs.delete("build/w0545_dangling.bl")
+        let hits = errors_named("UnexpectedAnnotation")
+        assert_eq(hits.len(), 1)
+        expect_eq("dangling", hits.get(0).unwrap(), "E1110 5:5 @handle_all in effect `Kv` is not followed by a sub-effect")
+    }
 }
 
 fn fix_of(label: Str) -> Str ! IO.Print {
@@ -482,7 +490,8 @@ test "the caret ends at the end of the effect name, however far it is from handl
 }
 
 test "an annotation where no annotation belongs in an effect body is one UnexpectedAnnotation" {
-    fs.write("build/w0545_op_ann.bl", #"effect Kv {
+    with handler Diag {}, handler Lex {}, handler Parse {} {
+        fs.write("build/w0545_op_ann.bl", #"effect Kv {
     effect Get {
         @handle_all
         fn get(k: Str) -> Int
@@ -503,17 +512,18 @@ fn main() { }
 
 @handle_all
 "#).unwrap()
-    let _ = compile_to_program("build/w0545_op_ann.bl", 1)
-    let _ = fs.delete("build/w0545_op_ann.bl")
-    let errs = errors()
-    if errs.len() != 4 {
-        for e in errs { io.println("  {e}") }
+        let _ = compile_to_program("build/w0545_op_ann.bl", 1)
+        let _ = fs.delete("build/w0545_op_ann.bl")
+        let errs = errors()
+        if errs.len() != 4 {
+            for e in errs { io.println("  {e}") }
+        }
+        assert_eq(errs.len(), 4)
+        let hits = errors_named("UnexpectedAnnotation")
+        assert_eq(hits.len(), 4)
+        expect_eq("on an op", hits.get(0).unwrap(), "E1110 3:9 @handle_all is not allowed on an effect operation")
+        expect_eq("on a sub-effect", hits.get(1).unwrap(), "E1110 7:5 @requires is not allowed on a sub-effect")
+        expect_eq("on a field", hits.get(2).unwrap(), "E1110 14:5 @handle_all is only allowed on an effect declaration")
+        expect_eq("at the end of the file", hits.get(3).unwrap(), "E1110 20:1 @handle_all is only allowed on an effect declaration")
     }
-    assert_eq(errs.len(), 4)
-    let hits = errors_named("UnexpectedAnnotation")
-    assert_eq(hits.len(), 4)
-    expect_eq("on an op", hits.get(0).unwrap(), "E1110 3:9 @handle_all is not allowed on an effect operation")
-    expect_eq("on a sub-effect", hits.get(1).unwrap(), "E1110 7:5 @requires is not allowed on a sub-effect")
-    expect_eq("on a field", hits.get(2).unwrap(), "E1110 14:5 @handle_all is only allowed on an effect declaration")
-    expect_eq("at the end of the file", hits.get(3).unwrap(), "E1110 20:1 @handle_all is only allowed on an effect declaration")
 }

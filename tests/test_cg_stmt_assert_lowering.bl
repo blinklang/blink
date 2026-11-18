@@ -1,20 +1,21 @@
 import std.fs
 import std.io
-import typecheck.{check_types, TYPE_INT}
+import typecheck.{check_types, TYPE_INT, TypeCheck}
 import layout.{layout_reset}
 import mono.{run_mono}
 import ir.{ir_dump, ir_reset, ir_verify}
-import parser.{node_count, node_kind, node_name, node_body}
+import parser.{node_count, node_kind, node_name, node_body, Parse}
 import ast.{NodeKind}
 import compiler.{compile_to_program}
-import diagnostics.{diag_entries, diag_reset}
+import diagnostics.{diag_entries, diag_reset, Diag}
 import cg_stmt.{cg_stmt_reset, cg_stmt_set_debug_mode, lower_fn}
 import cg_test_helpers.{cg_probe_compile}
 import cname.{
     c_assert_fail_eq_name, c_assert_fail_intro_name, c_assert_fail_name,
     c_debug_assert_fail_name, cname_reset,
 }
-import cg.{CgConfig, generate}
+import cg.{CgConfig, generate, Codegen}
+import lexer.{Lex}
 
 fn find_fn(name: Str) -> Int {
     let mut i = 0
@@ -25,25 +26,29 @@ fn find_fn(name: Str) -> Int {
     -1
 }
 
-fn run_probe(path: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete, Env.Exit, Env.Read, FS.Read, IO, FS.Write {
-    ir_reset()
-    layout_reset()
-    cg_stmt_reset()
-    diag_reset()
-    fs.write(path, src).unwrap()
-    let program = compile_to_program(path, 1)
-    check_types(program)
-    run_mono(program)
-    let _ = fs.delete(path)
+fn run_probe(path: Str, src: Str) ! FS.Delete, Env.Exit, Env.Read, FS.Read, IO, FS.Write {
+    with handler Diag {}, handler Lex {}, handler Parse {}, handler TypeCheck {} {
+        ir_reset()
+        layout_reset()
+        cg_stmt_reset()
+        diag_reset()
+        fs.write(path, src).unwrap()
+        let program = compile_to_program(path, 1)
+        check_types(program)
+        run_mono(program)
+        let _ = fs.delete(path)
+    }
 }
 
-fn dump_of(name: Str) -> Str ! Diag.Report, IO.Print {
-    let f = find_fn(name)
-    assert(f >= 0)
-    let root = lower_fn(f)
-    for err in ir_verify(root) { io.println("VERIFY: {err}") }
-    assert_eq(ir_verify(root).len(), 0)
-    ir_dump(root)
+fn dump_of(name: Str) -> Str ! IO.Print {
+    with handler Diag {} {
+        let f = find_fn(name)
+        assert(f >= 0)
+        let root = lower_fn(f)
+        for err in ir_verify(root) { io.println("VERIFY: {err}") }
+        assert_eq(ir_verify(root).len(), 0)
+        ir_dump(root)
+    }
 }
 
 fn count_of(text: Str, needle: Str) -> Int {
@@ -158,9 +163,11 @@ fn main() { probe(1, 2) }
 
 // A struct's assertion calls the struct's own `==`, so the field walk lives in the derived
 // eq function, not in the asserting function; the full build shows it reads every field.
-fn derived_point_eq_c(path: Str, call: Str) -> Str ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete, Codegen, Env.Exit, Env.Read, FS.Read, FS.Write, IO {
-    let program = build_full_probe(path, "@derive(Eq)\ntype Point \{ x: Int, y: Int }\nfn probe(a: Point, b: Point) \{\n    {call}(a, b)\n}\nfn main() \{ probe(Point \{ x: 1, y: 2 }, Point \{ x: 1, y: 3 }) }\n")
-    generate(program, full_cfg(0))
+fn derived_point_eq_c(path: Str, call: Str) -> Str ! FS.Delete, Env.Exit, Env.Read, FS.Read, FS.Write, IO {
+    with handler Codegen {}, handler Diag {} {
+        let program = build_full_probe(path, "@derive(Eq)\ntype Point \{ x: Int, y: Int }\nfn probe(a: Point, b: Point) \{\n    {call}(a, b)\n}\nfn main() \{ probe(Point \{ x: 1, y: 2 }, Point \{ x: 1, y: 3 }) }\n")
+        generate(program, full_cfg(0))
+    }
 }
 
 test "assert_eq over a struct compares every field instead of refusing" {
@@ -267,13 +274,15 @@ fn main() { probe(1) }
 // the CLI's --debug flag and read inside generate(). This test goes through that whole
 // path instead, so a break in the cg.bl call site (or a config field that never reaches
 // it) fails here even though the two tests above would still pass.
-fn build_full_probe(path: Str, src: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete, Env.Exit, Env.Read, FS.Read, FS.Write, IO {
-    let program = cg_probe_compile(path, src)
-    run_mono(program)
-    layout_reset()
-    cname_reset()
-    let _ = fs.delete(path)
-    program
+fn build_full_probe(path: Str, src: Str) -> Int ! FS.Delete, Env.Exit, Env.Read, FS.Read, FS.Write, IO {
+    with handler Diag {} {
+        let program = cg_probe_compile(path, src)
+        run_mono(program)
+        layout_reset()
+        cname_reset()
+        let _ = fs.delete(path)
+        program
+    }
 }
 
 fn full_cfg(debug_mode: Int) -> CgConfig {
@@ -282,25 +291,29 @@ fn full_cfg(debug_mode: Int) -> CgConfig {
 }
 
 test "a CgConfig with debug_mode on threads through generate into the guarded fail call" {
-    let program = build_full_probe("build/cg_stmt_debug_assert_cfg_on.bl", #"fn probe(x: Int) {
+    with handler Codegen {}, handler Diag {} {
+        let program = build_full_probe("build/cg_stmt_debug_assert_cfg_on.bl", #"fn probe(x: Int) {
     debug_assert(x == 1)
 }
 fn main() { probe(1) }
 "#)
-    let text = generate(program, full_cfg(1))
-    cg_stmt_set_debug_mode(false)
-    assert_eq(count_of(text, "{c_assert_fail_intro_name()}("), 1)
+        let text = generate(program, full_cfg(1))
+        cg_stmt_set_debug_mode(false)
+        assert_eq(count_of(text, "{c_assert_fail_intro_name()}("), 1)
+    }
 }
 
 test "a CgConfig with debug_mode off drops debug_assert from the real build" {
-    let program = build_full_probe("build/cg_stmt_debug_assert_cfg_off.bl", #"fn probe(x: Int) {
+    with handler Codegen {}, handler Diag {} {
+        let program = build_full_probe("build/cg_stmt_debug_assert_cfg_off.bl", #"fn probe(x: Int) {
     debug_assert(x == 1)
 }
 fn main() { probe(1) }
 "#)
-    let text = generate(program, full_cfg(0))
-    cg_stmt_set_debug_mode(false)
-    assert_eq(count_of(text, "__blink_assert_fail"), 0)
+        let text = generate(program, full_cfg(0))
+        cg_stmt_set_debug_mode(false)
+        assert_eq(count_of(text, "__blink_assert_fail"), 0)
+    }
 }
 
 // cname.bl's own answers for the assert family's fail-path symbols. The lowering tests

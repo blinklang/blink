@@ -11,9 +11,10 @@ import std.fs
 import std.io
 import layout.{layout_reset}
 import cname.{cname_reset}
-import cg.{CgConfig, generate}
+import cg.{CgConfig, generate, Codegen}
 import cg_test_helpers.{cg_probe_compile, cg_probe_ices_named, cg_probe_ices_naming}
 import mono.{run_mono}
+import diagnostics.{Diag}
 
 fn assert_eq_int(label: Str, got: Int, want: Int) ! IO.Print {
     if got != want {
@@ -36,14 +37,16 @@ fn assert_lacks(text: Str, needle: Str) ! IO.Print {
     assert(!text.contains(needle))
 }
 
-fn build_probe(src: Str, name: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete, Env.Exit, Env.Read, FS.Read, FS.Write, IO {
-    let path = "build/{name}.bl"
-    let program = cg_probe_compile(path, src)
-    run_mono(program)
-    layout_reset()
-    cname_reset()
-    let _ = fs.delete(path)
-    program
+fn build_probe(src: Str, name: Str) -> Int ! FS.Delete, Env.Exit, Env.Read, FS.Read, FS.Write, IO {
+    with handler Diag {} {
+        let path = "build/{name}.bl"
+        let program = cg_probe_compile(path, src)
+        run_mono(program)
+        layout_reset()
+        cname_reset()
+        let _ = fs.delete(path)
+        program
+    }
 }
 
 fn standalone_cfg() -> CgConfig {
@@ -188,76 +191,88 @@ test "closure propagates on its own account" {
 }
 
 test "a closure body's ? propagates into the closure's own declared result" {
-    let program = build_probe(result_closure_src(), "cg_closure_ret_result")
-    let text = generate(program, standalone_cfg())
-    assert_eq_int("no ? refused for want of a return type",
-        cg_probe_ices_named("TryWithoutReturnType"), 0)
-    assert_eq_int("no stage refuses on the closure's result",
-        cg_probe_ices_named("TryResultInNonResultFn"), 0)
-    assert_eq_int("no closure result went unread",
-        cg_probe_ices_naming("closure result"), 0)
-    // The closure's own Ok arm, returned out of the thunk rather than out of `outer`.
-    assert_has(text, "return")
+    with handler Codegen {}, handler Diag {} {
+        let program = build_probe(result_closure_src(), "cg_closure_ret_result")
+        let text = generate(program, standalone_cfg())
+        assert_eq_int("no ? refused for want of a return type",
+            cg_probe_ices_named("TryWithoutReturnType"), 0)
+        assert_eq_int("no stage refuses on the closure's result",
+            cg_probe_ices_named("TryResultInNonResultFn"), 0)
+        assert_eq_int("no closure result went unread",
+            cg_probe_ices_naming("closure result"), 0)
+        // The closure's own Ok arm, returned out of the thunk rather than out of `outer`.
+        assert_has(text, "return")
+    }
 }
 
 test "a closure returning Option propagates None, not the enclosing function's error" {
-    let program = build_probe(option_closure_src(), "cg_closure_ret_option")
-    let _ = generate(program, standalone_cfg())
-    assert_eq_int("no ? refused for want of a return type",
-        cg_probe_ices_named("TryWithoutReturnType"), 0)
-    // The enclosing function returns a Result. A body lowered against it would take the
-    // Result arm for an Option operand and refuse there instead.
-    assert_eq_int("the Option arm is taken, not the enclosing Result arm",
-        cg_probe_ices_named("TryResultInNonResultFn"), 0)
-    assert_eq_int("no closure result went unread",
-        cg_probe_ices_naming("closure result"), 0)
+    with handler Codegen {}, handler Diag {} {
+        let program = build_probe(option_closure_src(), "cg_closure_ret_option")
+        let _ = generate(program, standalone_cfg())
+        assert_eq_int("no ? refused for want of a return type",
+            cg_probe_ices_named("TryWithoutReturnType"), 0)
+        // The enclosing function returns a Result. A body lowered against it would take the
+        // Result arm for an Option operand and refuse there instead.
+        assert_eq_int("the Option arm is taken, not the enclosing Result arm",
+            cg_probe_ices_named("TryResultInNonResultFn"), 0)
+        assert_eq_int("no closure result went unread",
+            cg_probe_ices_naming("closure result"), 0)
+    }
 }
 
 test "a closure nested in a closure reads its own result" {
-    let program = build_probe(nested_closure_src(), "cg_closure_ret_nested")
-    let _ = generate(program, standalone_cfg())
-    assert_eq_int("no ? refused for want of a return type",
-        cg_probe_ices_named("TryWithoutReturnType"), 0)
-    assert_eq_int("no stage refuses on a nested closure's result",
-        cg_probe_ices_named("TryResultInNonResultFn"), 0)
-    assert_eq_int("no closure result went unread",
-        cg_probe_ices_naming("closure result"), 0)
+    with handler Codegen {}, handler Diag {} {
+        let program = build_probe(nested_closure_src(), "cg_closure_ret_nested")
+        let _ = generate(program, standalone_cfg())
+        assert_eq_int("no ? refused for want of a return type",
+            cg_probe_ices_named("TryWithoutReturnType"), 0)
+        assert_eq_int("no stage refuses on a nested closure's result",
+            cg_probe_ices_named("TryResultInNonResultFn"), 0)
+        assert_eq_int("no closure result went unread",
+            cg_probe_ices_naming("closure result"), 0)
+    }
 }
 
 test "a closure that propagates nothing is lowered as before" {
-    let program = build_probe(plain_closure_src(), "cg_closure_ret_plain")
-    let text = generate(program, standalone_cfg())
-    assert_eq_int("no ? refused for want of a return type",
-        cg_probe_ices_named("TryWithoutReturnType"), 0)
-    assert_eq_int("no closure result went unread",
-        cg_probe_ices_naming("closure result"), 0)
-    // An Int result still returns its tail; only a void one discards.
-    assert_has(text, "return 5;")
+    with handler Codegen {}, handler Diag {} {
+        let program = build_probe(plain_closure_src(), "cg_closure_ret_plain")
+        let text = generate(program, standalone_cfg())
+        assert_eq_int("no ? refused for want of a return type",
+            cg_probe_ices_named("TryWithoutReturnType"), 0)
+        assert_eq_int("no closure result went unread",
+            cg_probe_ices_naming("closure result"), 0)
+        // An Int result still returns its tail; only a void one discards.
+        assert_has(text, "return 5;")
+    }
 }
 
 test "a closure in a test body reads its own result, not the body's absence of one" {
-    // The strongest form of "read, not re-derived": the thing the closure sits inside
-    // declares no result at all. A stage that reached outward for a type would find
-    // nothing here and refuse, though the closure named its result on its own line.
-    let program = build_probe(closure_in_test_src(), "cg_closure_ret_in_test")
-    let _ = generate(program, standalone_cfg())
-    assert_eq_int("no ? refused for want of a return type",
-        cg_probe_ices_named("TryWithoutReturnType"), 0)
-    assert_eq_int("the closure's own Option arm is taken",
-        cg_probe_ices_named("TryResultInNonResultFn"), 0)
-    assert_eq_int("no closure result went unread",
-        cg_probe_ices_naming("closure result"), 0)
+    with handler Codegen {}, handler Diag {} {
+        // The strongest form of "read, not re-derived": the thing the closure sits inside
+        // declares no result at all. A stage that reached outward for a type would find
+        // nothing here and refuse, though the closure named its result on its own line.
+        let program = build_probe(closure_in_test_src(), "cg_closure_ret_in_test")
+        let _ = generate(program, standalone_cfg())
+        assert_eq_int("no ? refused for want of a return type",
+            cg_probe_ices_named("TryWithoutReturnType"), 0)
+        assert_eq_int("the closure's own Option arm is taken",
+            cg_probe_ices_named("TryResultInNonResultFn"), 0)
+        assert_eq_int("no closure result went unread",
+            cg_probe_ices_naming("closure result"), 0)
+    }
 }
 
 test "a closure whose result is Void discards its tail instead of returning it" {
-    let program = build_probe(void_closure_src(), "cg_closure_ret_void")
-    let text = generate(program, standalone_cfg())
-    assert_eq_int("no ? refused for want of a return type",
-        cg_probe_ices_named("TryWithoutReturnType"), 0)
-    assert_eq_int("no closure result went unread",
-        cg_probe_ices_naming("closure result"), 0)
-    // The thunk's own line. A value returned out of a void function is a C error, so the
-    // call stands as a statement and the thunk falls off its end.
-    assert_has(text, "blink_2twice(b_x);")
-    assert_lacks(text, "return blink_2twice(b_x);")
+    with handler Codegen {}, handler Diag {} {
+        let program = build_probe(void_closure_src(), "cg_closure_ret_void")
+        let text = generate(program, standalone_cfg())
+        assert_eq_int("no ? refused for want of a return type",
+            cg_probe_ices_named("TryWithoutReturnType"), 0)
+        assert_eq_int("no closure result went unread",
+            cg_probe_ices_naming("closure result"), 0)
+        // The thunk's own line. A value returned out of a void function is a C error, so the
+        // call stands as a statement and the thunk falls off its end.
+        assert_has(text, "blink_2twice(b_x);")
+        assert_lacks(text, "return blink_2twice(b_x);")
+    }
 }

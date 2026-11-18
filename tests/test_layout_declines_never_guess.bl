@@ -1,10 +1,11 @@
 import std.fs
 import std.io
-import typecheck.{tc_type_str, tc_lookup_node_tid, check_types, lookup_named_type, make_metavar, tc_unknown_tid, make_struct_instance_type, make_map_type, make_ptr_type, make_option_type, make_list_type, make_tuple_type}
+import typecheck.{tc_type_str, tc_lookup_node_tid, check_types, lookup_named_type, make_metavar, tc_unknown_tid, make_struct_instance_type, make_map_type, make_ptr_type, make_option_type, make_list_type, make_tuple_type, TypeCheck}
 import layout.{layout_of, c_type_of, carrier_tag_of, ensure_typedef_for, nominal_name_of, tid_of_node, layout_reset, layout_take_typedefs, Position}
-import diagnostics.{diag_ice_count}
-import parser.{node_count, nodes}
+import diagnostics.{diag_ice_count, Diag}
+import parser.{node_count, nodes, Parse}
 import compiler.{compile_to_program}
+import lexer.{Lex}
 
 fn assert_eq_str(label: Str, got: Str, want: Str) ! IO.Print {
     if got != want {
@@ -113,24 +114,26 @@ fn main() {
 
 // The probe is deleted BEFORE any assertion so a red row never leaks the file.
 // check_types resets the type pool, so the layout memo must be reset with it.
-fn harvest_type_tids() -> Map[Str, Int] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete, Env.Exit, Env.Read, FS.Read, IO, FS.Write {
-    let path = "build/layout_decline_probe_src.bl"
-    fs.write(path, probe_src()).unwrap()
-    let program = compile_to_program(path, 1)
-    check_types(program)
-    layout_reset()
-    let _ = fs.delete(path)
-    let mut m: Map[Str, Int] = Map()
-    let mut idx = 0
-    let n = node_count()
-    while idx < n {
-        let tid = tc_lookup_node_tid(idx)
-        if tid >= 0 {
-            m.insert(tc_type_str(tid), tid)
+fn harvest_type_tids() -> Map[Str, Int] ! FS.Delete, Env.Exit, Env.Read, FS.Read, IO, FS.Write {
+    with handler Diag {}, handler Lex {}, handler Parse {}, handler TypeCheck {} {
+        let path = "build/layout_decline_probe_src.bl"
+        fs.write(path, probe_src()).unwrap()
+        let program = compile_to_program(path, 1)
+        check_types(program)
+        layout_reset()
+        let _ = fs.delete(path)
+        let mut m: Map[Str, Int] = Map()
+        let mut idx = 0
+        let n = node_count()
+        while idx < n {
+            let tid = tc_lookup_node_tid(idx)
+            if tid >= 0 {
+                m.insert(tc_type_str(tid), tid)
+            }
+            idx = idx + 1
         }
-        idx = idx + 1
+        m
     }
-    m
 }
 
 fn expect_tid(m: Map[Str, Int], key: Str) -> Int ! IO.Print {
@@ -209,33 +212,37 @@ test "an instance argument with a buried unbound metavar declines" {
 
 // A node with no recorded type is a compiler bug, reported as I0001, never as a default.
 test "tid_of_node raises I0001 on a node with no type" {
-    let m = harvest_type_tids()
-    let _ = expect_tid(m, "Int")
-    let mut bare = -1
-    let mut idx = 0
-    while idx < node_count() && bare == -1 {
-        if tc_lookup_node_tid(idx) == -1 { bare = idx }
-        idx = idx + 1
+    with handler Diag {} {
+        let m = harvest_type_tids()
+        let _ = expect_tid(m, "Int")
+        let mut bare = -1
+        let mut idx = 0
+        while idx < node_count() && bare == -1 {
+            if tc_lookup_node_tid(idx) == -1 { bare = idx }
+            idx = idx + 1
+        }
+        assert(bare != -1)
+        let before = diag_ice_count
+        let got = tid_of_node(bare)
+        assert_eq_int("miss answers -1", got, -1)
+        assert_eq_int("miss counts one ICE", diag_ice_count - before, 1)
     }
-    assert(bare != -1)
-    let before = diag_ice_count
-    let got = tid_of_node(bare)
-    assert_eq_int("miss answers -1", got, -1)
-    assert_eq_int("miss counts one ICE", diag_ice_count - before, 1)
 }
 
 // A stamped node answers its stamp and raises nothing.
 test "tid_of_node answers a stamped node without a diagnostic" {
-    let m = harvest_type_tids()
-    let want = expect_tid(m, "Point")
-    let mut node = -1
-    let mut idx = 0
-    while idx < node_count() && node == -1 {
-        if tc_lookup_node_tid(idx) == want { node = idx }
-        idx = idx + 1
+    with handler Diag {} {
+        let m = harvest_type_tids()
+        let want = expect_tid(m, "Point")
+        let mut node = -1
+        let mut idx = 0
+        while idx < node_count() && node == -1 {
+            if tc_lookup_node_tid(idx) == want { node = idx }
+            idx = idx + 1
+        }
+        assert(node != -1)
+        let before = diag_ice_count
+        assert_eq_int("hit answers stamp", tid_of_node(node), want)
+        assert_eq_int("hit raises nothing", diag_ice_count - before, 0)
     }
-    assert(node != -1)
-    let before = diag_ice_count
-    assert_eq_int("hit answers stamp", tid_of_node(node), want)
-    assert_eq_int("hit raises nothing", diag_ice_count - before, 0)
 }

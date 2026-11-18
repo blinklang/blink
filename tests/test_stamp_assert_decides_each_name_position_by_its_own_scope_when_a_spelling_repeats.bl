@@ -12,11 +12,12 @@
 
 import std.fs
 import compiler.{compile_to_program}
-import typecheck.{check_types, tc_stamp_program, tc_name_position_is_value}
-import parser.{node_count, node_push, node_kind, node_name, node_body, node_stmts, sublist_push, new_sublist, finalize_sublist}
+import typecheck.{check_types, tc_stamp_program, tc_name_position_is_value, TypeCheck}
+import parser.{node_count, node_push, node_kind, node_name, node_body, node_stmts, sublist_push, new_sublist, finalize_sublist, Parse}
 import ast.{NodeKind, AstNode}
-import diagnostics.{diag_count, diag_ice_count, diag_reset, diag_entries}
+import diagnostics.{diag_count, diag_ice_count, diag_reset, diag_entries, Diag}
 import embedded_stdlib_registry.{init_embedded_stdlib}
+import lexer.{Lex}
 
 fn clean_src() -> Str {
     let mut s = "type ZzShape \{ zzw: Int }\n"
@@ -27,14 +28,16 @@ fn clean_src() -> Str {
     s
 }
 
-fn compile_probe(path: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS, Env.Exit, Env.Read, IO {
-    init_embedded_stdlib()
-    fs.write(path, clean_src()).unwrap()
-    diag_reset()
-    let program = compile_to_program(path, 1)
-    check_types(program)
-    let _ = fs.delete(path)
-    program
+fn compile_probe(path: Str) -> Int ! FS, Env.Exit, Env.Read, IO {
+    with handler Diag {}, handler Lex {}, handler Parse {}, handler TypeCheck {} {
+        init_embedded_stdlib()
+        fs.write(path, clean_src()).unwrap()
+        diag_reset()
+        let program = compile_to_program(path, 1)
+        check_types(program)
+        let _ = fs.delete(path)
+        program
+    }
 }
 
 fn main_body() -> Int {
@@ -49,7 +52,7 @@ fn main_body() -> Int {
 // `<nm>.zzfield` on line `line`, the untyped qualifier at column 5 and the untyped access at
 // column 9. The access is a cascade only from a qualifier that is a hole; above an excused name
 // it reports on its own.
-fn access_on(nm: Str, line: Int) -> Int ! Parse.Build {
+fn access_on(nm: Str, line: Int) -> Int {
     let q = node_count()
     node_push(AstNode { kind: NodeKind.Ident, name: nm, line: line, col: 5 })
     let n = node_count()
@@ -59,7 +62,7 @@ fn access_on(nm: Str, line: Int) -> Int ! Parse.Build {
 
 // The same access, with its qualifier recorded as a value: a local bound under `nm` stands
 // between the spelling and the item.
-fn shadowed_access_on(nm: Str, line: Int) -> Int ! Parse.Build {
+fn shadowed_access_on(nm: Str, line: Int) -> Int {
     let n = access_on(nm, line)
     let q = n - 1
     while tc_name_position_is_value.len() <= q { tc_name_position_is_value.push(0) }
@@ -69,22 +72,24 @@ fn shadowed_access_on(nm: Str, line: Int) -> Int ! Parse.Build {
 
 // Append `stmts` to the body of `main`, run the pass, and answer the internal errors it raised
 // as "<message> @<line>:<col>" in report order.
-fn ices_with(program: Int, stmts: List[Int]) -> List[Str] ! Parse.Build, TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
-    let body = main_body()
-    assert(body != -1)
-    // sublist_push guards on an open sublist, which only the parser normally holds.
-    let scratch = new_sublist()
-    for s in stmts { sublist_push(node_stmts(body), s) }
-    finalize_sublist(scratch)
-    diag_reset()
-    tc_stamp_program(program)
-    assert_eq(diag_count, 0)
-    let mut out: List[Str] = []
-    for d in diag_entries {
-        if d.severity == "ice" { out.push("{d.name} {d.code}: {d.message} @{d.line}:{d.col}") }
+fn ices_with(program: Int, stmts: List[Int]) -> List[Str] {
+    with handler Diag {}, handler Parse {}, handler TypeCheck {} {
+        let body = main_body()
+        assert(body != -1)
+        // sublist_push guards on an open sublist, which only the parser normally holds.
+        let scratch = new_sublist()
+        for s in stmts { sublist_push(node_stmts(body), s) }
+        finalize_sublist(scratch)
+        diag_reset()
+        tc_stamp_program(program)
+        assert_eq(diag_count, 0)
+        let mut out: List[Str] = []
+        for d in diag_entries {
+            if d.severity == "ice" { out.push("{d.name} {d.code}: {d.message} @{d.line}:{d.col}") }
+        }
+        assert_eq(out.len(), diag_ice_count)
+        out
     }
-    assert_eq(out.len(), diag_ice_count)
-    out
 }
 
 fn ice(kind: Str, line: Int, col: Int) -> Str {

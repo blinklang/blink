@@ -15,11 +15,11 @@ import std.io
 import layout.{layout_reset}
 import cname.{cname_reset, c_display_dispatch_instance_name, c_impl_method_name}
 import cg_test_helpers.{cg_probe_compile, cg_probe_compile_but, cg_probe_ices_saying}
-import cg.{CgConfig, generate}
+import cg.{CgConfig, generate, Codegen}
 import cg_reg.{cg_reg_impl_methods, cg_reg_impl_of}
 import mono.{has_own_binders, run_mono, instances, is_poly_impl, poly_impl_is_element_agnostic}
 import parser.{node_name}
-import diagnostics.{DiagEntry, diag_entries}
+import diagnostics.{DiagEntry, diag_entries, Diag}
 
 fn standalone_cfg() -> CgConfig {
     CgConfig { debug_mode: 0, trace_codegen: 0, deterministic: 0, emit_only_module: "",
@@ -31,22 +31,26 @@ fn traced_cfg() -> CgConfig {
         skip_modules: Map(), user_tu_mode: 0, blink_ev_extern_only: 0, archive_build_mode: 0, archive_over_std: 0, compiler_archive_modules: Map() }
 }
 
-fn probe(stem: Str, src: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Env.Exit, Env.Read, FS.Read, FS.Write, IO {
-    let program = cg_probe_compile("build/{stem}.bl", src)
-    run_mono(program)
-    layout_reset()
-    cname_reset()
-    program
+fn probe(stem: Str, src: Str) -> Int ! Env.Exit, Env.Read, FS.Read, FS.Write, IO {
+    with handler Diag {} {
+        let program = cg_probe_compile("build/{stem}.bl", src)
+        run_mono(program)
+        layout_reset()
+        cname_reset()
+        program
+    }
 }
 
 // The same, for a program the type checker refuses with `expected` and nothing else, so a row
 // can drive the codegen stage on a shape no clean program reaches.
-fn probe_refused(stem: Str, expected: Str, src: Str) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Env.Exit, Env.Read, FS.Read, FS.Write, IO {
-    let program = cg_probe_compile_but("build/{stem}.bl", src, expected)
-    run_mono(program)
-    layout_reset()
-    cname_reset()
-    program
+fn probe_refused(stem: Str, expected: Str, src: Str) -> Int ! Env.Exit, Env.Read, FS.Read, FS.Write, IO {
+    with handler Diag {} {
+        let program = cg_probe_compile_but("build/{stem}.bl", src, expected)
+        run_mono(program)
+        layout_reset()
+        cname_reset()
+        program
+    }
 }
 
 // Every stop the probe recorded, whatever its name. A test that says nothing stops reads this,
@@ -72,7 +76,7 @@ fn prelude_stops(stem: Str) -> Int {
 
 // The trait methods these rows implement declare no binder, so an impl method that adds one is
 // E0906 at check, alone, at its binder list, and the program never reaches mono or codegen.
-fn only_e0906_at(stem: Str, method: Str, src: Str) ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Env.Exit, Env.Read, FS.Read, FS.Write, IO {
+fn only_e0906_at(stem: Str, method: Str, src: Str) ! Env.Exit, Env.Read, FS.Read, FS.Write, IO {
     let _ = cg_probe_compile_but("build/{stem}.bl", src, "TraitContractGenericMismatch")
     let mut errs: List[DiagEntry] = []
     for d in diag_entries {
@@ -141,8 +145,9 @@ fn definitions_of(text: Str, symbol: Str) -> Int {
 // its C does not depend on the element type. The mono pass registers no instance for it
 // and expects the one shared body instead, which is the body a call to it reaches.
 test "an element-agnostic container impl method is written once and reported never" {
-    let stem = "cg_pim_agnostic"
-    let program = probe(stem, #"trait Tally {
+    with handler Codegen {}, handler Diag {} {
+        let stem = "cg_pim_agnostic"
+        let program = probe(stem, #"trait Tally {
     fn tally(self) -> Int
 }
 
@@ -156,20 +161,22 @@ fn main() {
     assert(n == 7)
 }
 "#)
-    let text = generate(program, standalone_cfg())
-    let im = impl_of("tally")
-    assert(poly_impl_is_element_agnostic(im))
-    assert(!is_poly_impl(im))
-    assert_eq(stops(), 0)
-    assert_eq(definitions_of(text, method_symbol("tally")), 1)
+        let text = generate(program, standalone_cfg())
+        let im = impl_of("tally")
+        assert(poly_impl_is_element_agnostic(im))
+        assert(!is_poly_impl(im))
+        assert_eq(stops(), 0)
+        assert_eq(definitions_of(text, method_symbol("tally")), 1)
+    }
 }
 
 // The other side of the same predicate. A method signature names the binder, so the C
 // does depend on the element and the pass registers one instance per element. Here the
 // per-instance path is the right one and its rows are there, so nothing is reported.
 test "a per-element container impl method is written per instance" {
-    let stem = "cg_pim_per_element"
-    let program = probe(stem, #"trait Pick[T] {
+    with handler Codegen {}, handler Diag {} {
+        let stem = "cg_pim_per_element"
+        let program = probe(stem, #"trait Pick[T] {
     fn pick(self, d: T) -> T
 }
 
@@ -183,27 +190,30 @@ fn main() {
     assert(n == 4)
 }
 "#)
-    let text = generate(program, standalone_cfg())
-    assert(!poly_impl_is_element_agnostic(impl_of("pick")))
-    assert(is_poly_impl(impl_of("pick")))
-    assert_eq(stops(), 0)
-    assert_eq(definitions_of(text, instance_symbol("pick")), 1)
+        let text = generate(program, standalone_cfg())
+        assert(!poly_impl_is_element_agnostic(impl_of("pick")))
+        assert(is_poly_impl(impl_of("pick")))
+        assert_eq(stops(), 0)
+        assert_eq(definitions_of(text, instance_symbol("pick")), 1)
+    }
 }
 
 // The standard library's own container impls are element-agnostic in the same way, and a
 // whole-program unit lowers all of them. They are the standing measure of whether the two
 // stages agree: one report from any of them is the same disagreement, on prelude code.
 test "the prelude's container impl methods are reported never" {
-    let stem = "cg_pim_prelude"
-    let program = probe(stem, #"fn main() {
+    with handler Codegen {}, handler Diag {} {
+        let stem = "cg_pim_prelude"
+        let program = probe(stem, #"fn main() {
     let xs = [1, 2, 3]
     let n = xs.len()
     assert(n == 3)
 }
 "#)
-    let text = generate(program, standalone_cfg())
-    assert_eq(prelude_stops(stem), 0)
-    assert_eq(definitions_of(text, method_symbol("len")), 1)
+        let text = generate(program, standalone_cfg())
+        assert_eq(prelude_stops(stem), 0)
+        assert_eq(definitions_of(text, method_symbol("len")), 1)
+    }
 }
 
 // A method carrying its own type parameters is instantiated by the mono pass: it registers
@@ -211,8 +221,9 @@ test "the prelude's container impl methods are reported never" {
 // its stem. So the per-instance path has a row to write, and the body a call reaches is
 // written under that instance's name rather than reported as a gap.
 test "a generic method in a concrete impl is written per instance and by the prelude never" {
-    let stem = "cg_pim_generic_method"
-    let program = probe(stem, #"type Holder {
+    with handler Codegen {}, handler Diag {} {
+        let stem = "cg_pim_generic_method"
+        let program = probe(stem, #"type Holder {
     v: Int
 }
 
@@ -230,18 +241,20 @@ fn main() {
     assert(n == 7)
 }
 "#)
-    let text = generate(program, standalone_cfg())
-    assert_eq(stops(), 0)
-    assert_eq(definitions_of(text, instance_symbol("peek")), 1)
-    assert_eq(prelude_stops(stem), 0)
+        let text = generate(program, standalone_cfg())
+        assert_eq(stops(), 0)
+        assert_eq(definitions_of(text, instance_symbol("peek")), 1)
+        assert_eq(prelude_stops(stem), 0)
+    }
 }
 
 // A generic user type is a different C struct per argument and has no spelling at all
 // until one is chosen. So an impl over one has no single body either, however little its
 // methods say about the binder: each instance a call reaches gets its own body.
 test "a generic user type receiver gets one body per instance however agnostic its methods are" {
-    let stem = "cg_pim_user_generic_recv"
-    let program = probe(stem, #"type Box[T] {
+    with handler Codegen {}, handler Diag {} {
+        let stem = "cg_pim_user_generic_recv"
+        let program = probe(stem, #"type Box[T] {
     v: T
 }
 
@@ -258,13 +271,14 @@ fn main() {
     assert(Box { v: "a" }.sz() == 1)
 }
 "#)
-    let text = generate(program, standalone_cfg())
-    assert(poly_impl_is_element_agnostic(impl_of("sz")))
-    assert(is_poly_impl(impl_of("sz")))
-    assert_eq(stops(), 0)
-    let symbols = instance_symbols("sz")
-    assert_eq(symbols.len(), 2)
-    for s in symbols { assert_eq(definitions_of(text, s), 1) }
+        let text = generate(program, standalone_cfg())
+        assert(poly_impl_is_element_agnostic(impl_of("sz")))
+        assert(is_poly_impl(impl_of("sz")))
+        assert_eq(stops(), 0)
+        let symbols = instance_symbols("sz")
+        assert_eq(symbols.len(), 2)
+        for s in symbols { assert_eq(definitions_of(text, s), 1) }
+    }
 }
 
 // Every symbol the mono pass chose for an impl method's instances.
@@ -282,8 +296,9 @@ fn instance_symbols(mname: Str) -> List[Str] {
 // A method no call reaches has no row, and a body stage with no row has nothing to write.
 // It cannot ask for a row to make one, because no type argument exists to make it with.
 test "a generic impl method no call reaches is written nowhere and reported never" {
-    let stem = "cg_pim_unreached"
-    let program = probe(stem, #"type Box[T] {
+    with handler Codegen {}, handler Diag {} {
+        let stem = "cg_pim_unreached"
+        let program = probe(stem, #"type Box[T] {
     v: T
 }
 
@@ -301,11 +316,12 @@ fn main() {
     assert(Box { v: 1 }.sz() == 1)
 }
 "#)
-    let text = generate(program, standalone_cfg())
-    assert_eq(stops(), 0)
-    assert_eq(instance_symbols("sz").len(), 1)
-    assert_eq(instance_symbols("unreached").len(), 0)
-    assert(!text.contains(method_symbol("unreached")))
+        let text = generate(program, standalone_cfg())
+        assert_eq(stops(), 0)
+        assert_eq(instance_symbols("sz").len(), 1)
+        assert_eq(instance_symbols("unreached").len(), 0)
+        assert(!text.contains(method_symbol("unreached")))
+    }
 }
 
 // The dispatcher beside each instance of a per-instance `fmt`, named from the row the pass
@@ -325,8 +341,9 @@ fn display_instance_dispatchers() -> List[Str] {
 // body stage writes a dispatcher beside that instance, which the site calls. Without that
 // row the body stage reads "no row" as "no call" and writes nothing for the site to call.
 test "a site that shows a per-instance Display calls the dispatcher beside its instance" {
-    let stem = "cg_pim_display_reached"
-    let program = probe(stem, #"type Box[T] {
+    with handler Codegen {}, handler Diag {} {
+        let stem = "cg_pim_display_reached"
+        let program = probe(stem, #"type Box[T] {
     v: T
 }
 
@@ -340,15 +357,16 @@ fn main() {
     assert(s == "box")
 }
 "#)
-    let text = generate(program, standalone_cfg())
-    assert_eq(stops(), 0)
-    let dispatchers = display_instance_dispatchers()
-    assert_eq(dispatchers.len(), 1)
-    let d = dispatchers.get(0).unwrap()
-    assert_eq(definitions_of(text, d), 1)
-    let start = text.byte_index_of("{d}(", 0) ?? -1
-    assert(start >= 0)
-    assert(text.byte_slice(start, text.byte_len()).contains("{instance_symbol("fmt")}("))
+        let text = generate(program, standalone_cfg())
+        assert_eq(stops(), 0)
+        let dispatchers = display_instance_dispatchers()
+        assert_eq(dispatchers.len(), 1)
+        let d = dispatchers.get(0).unwrap()
+        assert_eq(definitions_of(text, d), 1)
+        let start = text.byte_index_of("{d}(", 0) ?? -1
+        assert(start >= 0)
+        assert(text.byte_slice(start, text.byte_len()).contains("{instance_symbol("fmt")}("))
+    }
 }
 
 // A shown value at an instance the pass registered no `fmt` for has no dispatcher to call, so
@@ -356,8 +374,9 @@ fn main() {
 // program (E0523: the impl's bound fails at Cx[NoTag]), so the row hands codegen the refused
 // program itself: the stop is what keeps a judge the checker misses from reaching the link.
 test "a shown value at an instance with no registered fmt stops at the site" {
-    let stem = "cg_pim_display_unregistered"
-    let program = probe_refused(stem, "MissingDisplayImpl", #"trait Tag {
+    with handler Codegen {}, handler Diag {} {
+        let stem = "cg_pim_display_unregistered"
+        let program = probe_refused(stem, "MissingDisplayImpl", #"trait Tag {
     fn tag(self) -> Int
 }
 
@@ -379,10 +398,11 @@ fn main() {
     l.push(Cx { v: NoTag { a: 1 } })
 }
 "#)
-    let _ = generate(program, standalone_cfg())
-    assert_eq(cg_probe_ices_saying("MonoInstanceNotRegistered", "`fmt` of `Cx[NoTag]` has no monomorphised instance here"), 1)
-    assert_eq(stops(), 1)
-    assert_eq(display_instance_dispatchers().len(), 0)
+        let _ = generate(program, standalone_cfg())
+        assert_eq(cg_probe_ices_saying("MonoInstanceNotRegistered", "`fmt` of `Cx[NoTag]` has no monomorphised instance here"), 1)
+        assert_eq(stops(), 1)
+        assert_eq(display_instance_dispatchers().len(), 0)
+    }
 }
 
 test "an impl fmt that adds a binder is E0906 at check and never reaches the body stage" {
@@ -407,8 +427,9 @@ fn main() {
 // bound fails at W[Int], so the pass registers no instance of `fmt` and there is no
 // dispatcher to call.
 test "assert_eq and unwrap name a value by its type when its Display has no dispatcher" {
-    let stem = "cg_pim_message_placeholder"
-    let program = probe(stem, #"trait Tag {
+    with handler Codegen {}, handler Diag {} {
+        let stem = "cg_pim_message_placeholder"
+        let program = probe(stem, #"trait Tag {
     fn tag(self) -> Int
 }
 
@@ -435,16 +456,18 @@ fn main() {
     assert_eq(f().unwrap(), 1)
 }
 "#)
-    let text = generate(program, standalone_cfg())
-    assert_eq(stops(), 0)
-    assert(text.contains("<W"))
+        let text = generate(program, standalone_cfg())
+        assert_eq(stops(), 0)
+        assert(text.contains("<W"))
+    }
 }
 
 // Where the impl holds at the instance, the message shows the value through the dispatcher
 // beside that instance, as an interpolation hole does.
 test "assert_eq and unwrap show a value through the dispatcher beside its Display instance" {
-    let stem = "cg_pim_message_shown"
-    let program = probe(stem, #"type W[T] {
+    with handler Codegen {}, handler Diag {} {
+        let stem = "cg_pim_message_shown"
+        let program = probe(stem, #"type W[T] {
     v: T
 }
 
@@ -463,20 +486,22 @@ fn main() {
     assert_eq(f().unwrap(), 1)
 }
 "#)
-    let text = generate(program, standalone_cfg())
-    assert_eq(stops(), 0)
-    assert(!text.contains("<W"))
-    let dispatchers = display_instance_dispatchers()
-    assert_eq(dispatchers.len(), 1)
-    assert_eq(definitions_of(text, dispatchers.get(0).unwrap()), 1)
+        let text = generate(program, standalone_cfg())
+        assert_eq(stops(), 0)
+        assert(!text.contains("<W"))
+        let dispatchers = display_instance_dispatchers()
+        assert_eq(dispatchers.len(), 1)
+        assert_eq(definitions_of(text, dispatchers.get(0).unwrap()), 1)
+    }
 }
 
 // A traced build reads each value it records, with no call in the source. It has a Debug and
 // a placeholder route for a value it cannot show, so a program that runs must also trace.
 // The impl's bound fails at W[Int], so there is no dispatcher at that instance.
 test "a traced value whose Display has no dispatcher takes the route below it" {
-    let stem = "cg_pim_trace_display"
-    let program = probe(stem, #"trait Tag {
+    with handler Codegen {}, handler Diag {} {
+        let stem = "cg_pim_trace_display"
+        let program = probe(stem, #"trait Tag {
     fn tag(self) -> Int
 }
 
@@ -494,9 +519,10 @@ fn main() {
     assert(gw(W { v: 1 }) == 1)
 }
 "#)
-    let text = generate(program, traced_cfg())
-    assert_eq(stops(), 0)
-    assert(text.contains("<W"))
+        let text = generate(program, traced_cfg())
+        assert_eq(stops(), 0)
+        assert(text.contains("<W"))
+    }
 }
 
 test "an impl debug that adds a binder is E0906 at check and never reaches the trace stage" {
@@ -542,8 +568,9 @@ fn main() {
 // The body of `eq` calls the bound's method. At an argument without the trait there is no
 // such method, so the pass must read that bound too before it asks for a copy.
 test "a type instance registers no operator method where a bound on a program trait fails" {
-    let stem = "cg_pim_operator_program_bound"
-    let program = probe(stem, #"trait Sh {
+    with handler Codegen {}, handler Diag {} {
+        let stem = "cg_pim_operator_program_bound"
+        let program = probe(stem, #"trait Sh {
     fn sh(self) -> Int
 }
 
@@ -567,15 +594,17 @@ fn main() {
     assert(B { v: NB { x: 1 } }.v.x == 1)
 }
 "#)
-    generate(program, standalone_cfg())
-    assert_eq(stops(), 0)
-    assert_eq(instance_symbols("eq").len(), 0)
-    assert_eq(instance_symbols("clone").len(), 0)
+        generate(program, standalone_cfg())
+        assert_eq(stops(), 0)
+        assert_eq(instance_symbols("eq").len(), 0)
+        assert_eq(instance_symbols("clone").len(), 0)
+    }
 }
 
 test "a type instance registers its operator method where the bound on a program trait holds" {
-    let stem = "cg_pim_operator_program_bound_met"
-    let program = probe(stem, #"trait Sh {
+    with handler Codegen {}, handler Diag {} {
+        let stem = "cg_pim_operator_program_bound_met"
+        let program = probe(stem, #"trait Sh {
     fn sh(self) -> Int
 }
 
@@ -600,9 +629,10 @@ fn main() {
     assert(a == a)
 }
 "#)
-    let text = generate(program, standalone_cfg())
-    assert_eq(stops(), 0)
-    assert_eq(definitions_of(text, instance_symbol("eq")), 1)
+        let text = generate(program, standalone_cfg())
+        assert_eq(stops(), 0)
+        assert_eq(definitions_of(text, instance_symbol("eq")), 1)
+    }
 }
 
 test "an impl eq on a generic type that adds a binder `==` reaches is E0906 at check" {
@@ -681,8 +711,9 @@ fn main() {
 
 // The impl's binder is not the method's own: it has an argument at each instance of the type.
 test "a method has its own binders only where it declares them" {
-    let stem = "cg_pim_own_binders"
-    let program = probe(stem, #"type Box[T] {
+    with handler Codegen {}, handler Diag {} {
+        let stem = "cg_pim_own_binders"
+        let program = probe(stem, #"type Box[T] {
     v: T
 }
 
@@ -700,19 +731,20 @@ fn main() {
     assert(Box { v: 1 }.v == 1)
 }
 "#)
-    generate(program, standalone_cfg())
-    let mut seen = 0
-    for m in cg_reg_impl_methods() {
-        if node_name(m) == "plain" {
-            assert(!has_own_binders(m))
-            seen = seen + 1
+        generate(program, standalone_cfg())
+        let mut seen = 0
+        for m in cg_reg_impl_methods() {
+            if node_name(m) == "plain" {
+                assert(!has_own_binders(m))
+                seen = seen + 1
+            }
+            if node_name(m) == "own" {
+                assert(has_own_binders(m))
+                seen = seen + 1
+            }
         }
-        if node_name(m) == "own" {
-            assert(has_own_binders(m))
-            seen = seen + 1
-        }
+        assert_eq(seen, 2)
     }
-    assert_eq(seen, 2)
 }
 
 // A type with two instances of one generic trait has one impl per instance, and a call
@@ -721,8 +753,9 @@ fn main() {
 // call the body stage writes must reach that row: a stage that chose the other impl would
 // call a symbol the pass never registered.
 test "a call through a bound on a type with two instances reaches the impl mono chose" {
-    let stem = "cg_pim_two_instances"
-    let program = probe(stem, #"trait Conv[U] {
+    with handler Codegen {}, handler Diag {} {
+        let stem = "cg_pim_two_instances"
+        let program = probe(stem, #"trait Conv[U] {
     fn conv(self) -> U
 }
 
@@ -746,20 +779,21 @@ fn main() {
     assert(as_strs(Box { v: "s" }).len() == 1)
 }
 "#)
-    let text = generate(program, standalone_cfg())
-    assert_eq(stops(), 0)
-    let mut impls = 0
-    for m in cg_reg_impl_methods() {
-        if node_name(m) != "conv" { continue }
-        impls = impls + 1
-        let mut rows: List[Str] = []
-        for mi in instances() {
-            if mi.base_decl_node == m { rows.push(mi.c_name) }
+        let text = generate(program, standalone_cfg())
+        assert_eq(stops(), 0)
+        let mut impls = 0
+        for m in cg_reg_impl_methods() {
+            if node_name(m) != "conv" { continue }
+            impls = impls + 1
+            let mut rows: List[Str] = []
+            for mi in instances() {
+                if mi.base_decl_node == m { rows.push(mi.c_name) }
+            }
+            assert_eq(rows.len(), 1)
+            let symbol = rows.get(0) ?? ""
+            assert_eq(definitions_of(text, symbol), 1)
+            assert(text.split("{symbol}(").len() > 2)
         }
-        assert_eq(rows.len(), 1)
-        let symbol = rows.get(0) ?? ""
-        assert_eq(definitions_of(text, symbol), 1)
-        assert(text.split("{symbol}(").len() > 2)
+        assert_eq(impls, 2)
     }
-    assert_eq(impls, 2)
 }

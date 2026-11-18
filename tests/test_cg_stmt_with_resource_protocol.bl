@@ -11,19 +11,20 @@
 
 import std.fs
 import std.io
-import typecheck.{check_types}
+import typecheck.{check_types, TypeCheck}
 import layout.{layout_reset}
 import mono.{run_mono}
 import ir.{IrKind, ir_c_name, ir_kid, ir_kid_count, ir_kind, ir_kind_name, ir_reset, ir_verify}
-import parser.{node_count, node_kind, node_name}
+import parser.{node_count, node_kind, node_name, Parse}
 import ast.{NodeKind}
 import compiler.{compile_to_program}
-import diagnostics.{diag_entries, diag_reset}
+import diagnostics.{diag_entries, diag_reset, Diag}
 import cg_test_helpers.{cg_probe_compile_but}
 import cname.{c_impl_method_name, c_local_name}
 import cname_test_helpers.{find_impl}
 import cg_stmt.{cg_stmt_reset, lower_fn}
 import cg_reg.{cg_reg_build}
+import lexer.{Lex}
 
 fn find_fn(name: Str) -> Int {
     let mut i = 0
@@ -90,18 +91,20 @@ fn main() {
 
 // Registry, IR and diagnostics are process globals, so each test rebuilds them from the
 // same probe rather than reading a sibling test's leftovers.
-fn run_probe() ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, FS.Delete, Env.Exit, Env.Read, FS.Read, IO, FS.Write {
-    ir_reset()
-    layout_reset()
-    cg_stmt_reset()
-    diag_reset()
-    let path = "build/cg_stmt_with_resource_probe.bl"
-    fs.write(path, probe_src()).unwrap()
-    let program = compile_to_program(path, 1)
-    check_types(program)
-    run_mono(program)
-    let _ = fs.delete(path)
-    cg_reg_build(program)
+fn run_probe() ! FS.Delete, Env.Exit, Env.Read, FS.Read, IO, FS.Write {
+    with handler Diag {}, handler Lex {}, handler Parse {}, handler TypeCheck {} {
+        ir_reset()
+        layout_reset()
+        cg_stmt_reset()
+        diag_reset()
+        let path = "build/cg_stmt_with_resource_probe.bl"
+        fs.write(path, probe_src()).unwrap()
+        let program = compile_to_program(path, 1)
+        check_types(program)
+        run_mono(program)
+        let _ = fs.delete(path)
+        cg_reg_build(program)
+    }
 }
 
 fn ices() -> Int {
@@ -150,59 +153,65 @@ test "a resource that implements no protocol is refused before it reaches loweri
 }
 
 test "an FFI scope resource binds, then wraps the rest of the block in a WithScope naming the runtime cleanup" {
-    run_probe()
-    diag_reset()
-    let root = lower_fn(find_fn("ffi_case"))
-    for err in ir_verify(root) { io.println("VERIFY: {err}") }
-    assert_eq(ir_verify(root).len(), 0)
-    let bind = find_kind(root, IrKind.Let)
-    assert(bind >= 0)
-    let scoped = find_kind(root, IrKind.WithScope)
-    assert(scoped >= 0)
-    assert_eq(ir_c_name(scoped), "blink_ffi_scope_cleanup")
-    // The scope's resource kid reads the very local the bind just declared.
-    assert_eq(ir_kid_count(scoped), 2)
-    assert_eq(ir_kind(ir_kid(scoped, 0)), IrKind.VarRef)
-    assert_eq(ir_c_name(ir_kid(scoped, 0)), ir_c_name(bind))
-    assert_eq(ices(), 0)
+    with handler Diag {} {
+        run_probe()
+        diag_reset()
+        let root = lower_fn(find_fn("ffi_case"))
+        for err in ir_verify(root) { io.println("VERIFY: {err}") }
+        assert_eq(ir_verify(root).len(), 0)
+        let bind = find_kind(root, IrKind.Let)
+        assert(bind >= 0)
+        let scoped = find_kind(root, IrKind.WithScope)
+        assert(scoped >= 0)
+        assert_eq(ir_c_name(scoped), "blink_ffi_scope_cleanup")
+        // The scope's resource kid reads the very local the bind just declared.
+        assert_eq(ir_kid_count(scoped), 2)
+        assert_eq(ir_kind(ir_kid(scoped, 0)), IrKind.VarRef)
+        assert_eq(ir_c_name(ir_kid(scoped, 0)), ir_c_name(bind))
+        assert_eq(ices(), 0)
+    }
 }
 
 // The exit of the BlockHandler impl the compiler provides is the exit runner, so the symbol
 // is built by the producer that spells its definition. A literal here would pass while the
 // definition moved, and the guard would then call a function the unit never defines.
 test "a Closeable resource binds its Context, then wraps the rest of the block in a WithScope naming its provided exit" {
-    run_probe()
-    diag_reset()
-    let root = lower_fn(find_fn("closeable_case"))
-    for err in ir_verify(root) { io.println("VERIFY: {err}") }
-    assert_eq(ir_verify(root).len(), 0)
-    assert(find_kind(root, IrKind.Let) >= 0)
-    let scoped = find_kind(root, IrKind.WithScope)
-    assert(scoped >= 0)
-    assert_eq(ir_c_name(scoped), c_impl_method_name(find_impl("Logged", "BlockHandler", ""), "exit"))
-    // The guard reads the hidden local enter() was called on, not the binder, which holds
-    // the Context enter() answered: one lowering for every scoped value.
-    assert_eq(ir_kid_count(scoped), 2)
-    assert_eq(ir_kind(ir_kid(scoped, 0)), IrKind.VarRef)
-    assert(ir_c_name(ir_kid(scoped, 0)) != c_local_name("logged"))
-    assert_eq(ices(), 0)
+    with handler Diag {} {
+        run_probe()
+        diag_reset()
+        let root = lower_fn(find_fn("closeable_case"))
+        for err in ir_verify(root) { io.println("VERIFY: {err}") }
+        assert_eq(ir_verify(root).len(), 0)
+        assert(find_kind(root, IrKind.Let) >= 0)
+        let scoped = find_kind(root, IrKind.WithScope)
+        assert(scoped >= 0)
+        assert_eq(ir_c_name(scoped), c_impl_method_name(find_impl("Logged", "BlockHandler", ""), "exit"))
+        // The guard reads the hidden local enter() was called on, not the binder, which holds
+        // the Context enter() answered: one lowering for every scoped value.
+        assert_eq(ir_kid_count(scoped), 2)
+        assert_eq(ir_kind(ir_kid(scoped, 0)), IrKind.VarRef)
+        assert(ir_c_name(ir_kid(scoped, 0)) != c_local_name("logged"))
+        assert_eq(ices(), 0)
+    }
 }
 
 // The handler sits in a hidden local that enter and the guard both read, and the binder
 // holds enter's Context, so the guard's resource is that hidden local, not the binder.
 test "a BlockHandler resource binds its Context, then wraps the rest of the block in a WithScope naming its own exit method" {
-    run_probe()
-    diag_reset()
-    let root = lower_fn(find_fn("block_handler_case"))
-    for err in ir_verify(root) { io.println("VERIFY: {err}") }
-    assert_eq(ir_verify(root).len(), 0)
-    assert(find_kind(root, IrKind.Let) >= 0)
-    let scoped = find_kind(root, IrKind.WithScope)
-    assert(scoped >= 0)
-    assert_eq(ir_c_name(scoped), c_impl_method_name(find_impl("Guarded", "BlockHandler", ""), "exit"))
-    assert_eq(ir_kid_count(scoped), 2)
-    assert_eq(ir_kind(ir_kid(scoped, 0)), IrKind.VarRef)
-    assert(ir_c_name(ir_kid(scoped, 0)) != c_local_name("guarded"))
-    assert_eq(ices(), 0)
-    assert_eq(ices_mentioning("BlockHandler"), 0)
+    with handler Diag {} {
+        run_probe()
+        diag_reset()
+        let root = lower_fn(find_fn("block_handler_case"))
+        for err in ir_verify(root) { io.println("VERIFY: {err}") }
+        assert_eq(ir_verify(root).len(), 0)
+        assert(find_kind(root, IrKind.Let) >= 0)
+        let scoped = find_kind(root, IrKind.WithScope)
+        assert(scoped >= 0)
+        assert_eq(ir_c_name(scoped), c_impl_method_name(find_impl("Guarded", "BlockHandler", ""), "exit"))
+        assert_eq(ir_kid_count(scoped), 2)
+        assert_eq(ir_kind(ir_kid(scoped, 0)), IrKind.VarRef)
+        assert(ir_c_name(ir_kid(scoped, 0)) != c_local_name("guarded"))
+        assert_eq(ices(), 0)
+        assert_eq(ices_mentioning("BlockHandler"), 0)
+    }
 }
