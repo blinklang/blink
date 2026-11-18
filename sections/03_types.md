@@ -6156,8 +6156,8 @@ Flipping a sealed default to open is non-breaking and requires no migration.
 
 `Self` is a built-in type alias that refers to the implementing type. It is valid in exactly two contexts:
 
-1. **Trait declarations** — `Self` refers to whichever type will implement the trait.
-2. **`impl` blocks** — `Self` refers to the type being implemented.
+1. **Trait declarations** — `Self` refers to whichever type will implement the trait. The whole declaration is in scope, header included: a supertrait clause and a `where` clause can write `Self`.
+2. **`impl` bodies** — `Self` refers to the type being implemented. The `Self` of an impl binds at the `{` of its body. The impl header is outside the body (see *`Self` in an impl header* below).
 
 Outside these contexts, `Self` is a compile error.
 
@@ -6183,6 +6183,44 @@ error[SelfOutsideTraitOrImpl]: `Self` outside trait or impl
 3 |     fn clone() -> Self {
   |                    ^^^^ `Self` is only valid inside trait declarations and impl blocks
 ```
+
+**`Self` in an impl header.** The header of an impl names the type that the impl is for. `Self` cannot name that type before the header names it. So the `Self` of an impl binds at the `{` of the body, and every `Self` in the header is an error. The header holds the trait, the target type, the type arguments of both, the binders with their bounds, and the `where` clause. No header position is an exception.
+
+```blink
+trait Tr { fn m(self) -> Int }
+type Point { x: Int }
+type Box[T] { v: T }
+
+impl Tr for Point {
+    fn m(self) -> Int { self.x }                       // OK: Self is Point in the body
+}
+
+impl Tr for Self { fn m(self) -> Int { 1 } }           // E0569: write `impl Tr for Point`
+impl Tr for Box[Self] { fn m(self) -> Int { 1 } }      // E0569: write `Box[Point]`
+impl Self for Point { fn m(self) -> Int { 1 } }        // E0569 at `Self`; no other error
+impl From[Self] for Point { /* ... */ }                // E0569: write `From[Point]`
+impl Tr for Point where Self: Eq { /* ... */ }         // E0569: write `where Point: Eq`
+impl[T: Tr[Self]] Tr for Box[T] { /* ... */ }          // E0569: a bound on a binder cannot write `Self`
+impl[T] Tr for Box[T] where Self: Eq { /* ... */ }     // E0569: write `where T: Eq` or `where Box[T]: Eq`
+```
+
+Each refused `Self` is one E0569 error at the `Self` token. The refused `Self` gets no second error. So `impl Self for Point` is E0569 only, and not also E0740 (E0740 is for a name that is not a trait).
+
+The error at a header site has a header-specific label and help. The label says that the header names the type. The help says what to write:
+
+```
+error[SelfOutsideTraitOrImpl]: `Self` in an impl header
+ --> shapes.bl:5:15
+  |
+5 | impl Tr for Self {
+  |             ^^^^ an impl header names its type, so `Self` is not bound here
+  |
+  = help: write the type: `impl Tr for Point`
+```
+
+For a type argument the help writes the type argument (`From[Point]`). For a `where` clause the help writes the clause again: `where Point: Eq`, or a bound on a binder such as `where T: Eq`. The spec fixes this content, not the wording.
+
+The rule is for impl headers only. A trait declaration binds `Self` itself, so its own header keeps `Self`: a supertrait clause and a `where` clause of a trait can write it.
 
 **`self` is sugar for `self: Self`.** The first parameter of a trait method can be written as bare `self`, which desugars to `self: Self`. Method-call syntax (`x.method()`) requires the first parameter to be literally `self` — a method with `self` renamed (e.g., `this: Self`) is callable only via qualified syntax `Trait.method(this)`.
 
