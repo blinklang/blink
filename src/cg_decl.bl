@@ -549,15 +549,28 @@ fn fn_ret_spelling(fn_node: Int) -> Str ! Diag.Report {
 }
 
 fn fn_param_decls(fn_node: Int) -> List[Str] ! Diag.Report {
+    param_decls(fn_param_spellings(fn_node), cg_decl_param_c_names(fn_node))
+}
+
+fn fn_param_spellings(fn_node: Int) -> List[Str] ! Diag.Report {
     let mut out: List[Str] = []
-    let names = cg_decl_param_c_names(fn_node)
     let sl = node_params(fn_node)
+    if sl == -1 { return out }
     let mut i = 0
-    while i < names.len() {
-        let p = sublist_get(sl, i)
-        flush_member_typedefs(tid_of_node(p))
-        let spelling = cg_decl_require_spelling(tid_of_node(p), Position.Param)
-        out.push("{spelling} {names.get(i).unwrap()}")
+    while i < sublist_length(sl) {
+        let tid = tid_of_node(sublist_get(sl, i))
+        flush_member_typedefs(tid)
+        out.push(cg_decl_require_spelling(tid, Position.Param))
+        i = i + 1
+    }
+    out
+}
+
+fn param_decls(types: List[Str], names: List[Str]) -> List[Str] {
+    let mut out: List[Str] = []
+    let mut i = 0
+    while i < types.len() {
+        out.push("{types.get(i).unwrap()} {names.get(i) ?? ""}")
         i = i + 1
     }
     out
@@ -965,12 +978,14 @@ pub fn cg_decl_emit_foreign_wrapper(fn_node: Int) ! Diag.Report {
     let mut sides: List[Str] = []
     for cross in crossings { sides.push(foreign_c_side(cross, declared)) }
     let ret = fn_ret_spelling(fn_node)
-    let params = fn_param_decls(fn_node)
+    let spellings = fn_param_spellings(fn_node)
+    let names = cg_decl_param_c_names(fn_node)
+    let params = param_decls(spellings, names)
     let back = sides.get(sides.len() - 1) ?? ""
     if !declared {
         let c_ret = if back != "" { back } else { ret }
         let guarded = same_call_if_declared(crossings, sides)
-        if !write_foreign_decl(fn_node, c_ret, symbol, foreign_c_params(fn_node, params, sides), guarded) { return }
+        if !write_foreign_decl(fn_node, c_ret, symbol, foreign_c_param_types(spellings, sides), names, guarded) { return }
     }
     let pass = foreign_call_args(fn_node, crossings, sides)
     print_fn(false, ret, cg_decl_c_name(fn_node), params, cg_decl_takes_ev(fn_node),
@@ -993,15 +1008,15 @@ fn same_call_if_declared(crossings: List[Crossing], sides: List[Str]) -> Bool {
     true
 }
 
-// The prototype's parameters: the wrapper's own, with each named mirror's spelling swapped
-// for the C struct the header names.
-fn foreign_c_params(fn_node: Int, params: List[Str], sides: List[Str]) -> List[Str] {
-    let names = cg_decl_param_c_names(fn_node)
+// The C type of each prototype parameter: the wrapper's own, with each named mirror's
+// spelling swapped for the C struct the header names and each pointer that names no C type
+// for `void *`.
+fn foreign_c_param_types(spellings: List[Str], sides: List[Str]) -> List[Str] {
     let mut out: List[Str] = []
     let mut i = 0
-    while i < params.len() {
+    while i < spellings.len() {
         let side = sides.get(i) ?? ""
-        out.push(if side != "" { "{side} {names.get(i) ?? ""}" } else { params.get(i) ?? "" })
+        out.push(if side != "" { side } else { spellings.get(i).unwrap() })
         i = i + 1
     }
     out
@@ -1010,12 +1025,14 @@ fn foreign_c_params(fn_node: Int, params: List[Str], sides: List[Str]) -> List[S
 // Whether the unit's prototype for `symbol` is the one this binding needs, writing it when
 // the unit has none yet. A second binding that asks for a different one is refused: C
 // rejects the pair, and picking either prototype makes one of the two wrappers call the
-// foreign function under a signature its own source never wrote.
-fn write_foreign_decl(site: Int, ret: Str, symbol: Str, params: List[Str], guarded: Bool) -> Bool ! Diag.Report {
-    let shape = ret.concat("(").concat(params.join(", ")).concat(")")
+// foreign function under a signature its own source never wrote. A C prototype is its
+// return and parameter types, so the parameter names do not count: the prototype written
+// keeps the names of the first binding.
+fn write_foreign_decl(site: Int, ret: Str, symbol: Str, types: List[Str], names: List[Str], guarded: Bool) -> Bool ! Diag.Report {
+    let shape = ret.concat("(").concat(types.join(", ")).concat(")")
     if !foreign_decls.contains_key(symbol) {
         foreign_decls.insert(symbol, shape)
-        print_foreign_decl(ret, symbol, params, guarded)
+        print_foreign_decl(ret, symbol, param_decls(types, names), guarded)
         return true
     }
     if foreign_decls.get(symbol).unwrap() == shape { return true }

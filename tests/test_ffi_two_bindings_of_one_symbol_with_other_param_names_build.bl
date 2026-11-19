@@ -1,0 +1,53 @@
+// §9.1.1, *A `Ptr` at an `@ffi` Call*: two `@ffi` bindings of one C symbol whose C types
+// agree build and run, whatever they name their parameters. A C prototype is its types, and
+// each `Ptr` to a scalar crosses as `void *`, so `Ptr[U8]` and `Ptr[I64]` agree.
+//
+// Without the rule, the parameter names made the two prototypes differ: `blink check` passed
+// and the build stopped with the internal error ForeignSymbolTwoPrototypes.
+
+import std.process.{ChildEnd, ProcessResult, ChildLimits}
+import std.time.{Duration}
+
+fn sh(cmd: Str) -> ProcessResult ! Process.Spawn {
+    process.run("sh", ["-c", cmd], limits: ChildLimits { timeout: Some(Duration.seconds(300)) }).unwrap()
+}
+
+fn diag(r: ProcessResult) -> Str {
+    "exit {r.end}\nstdout:\n{r.out}\nstderr:\n{r.err_out}"
+}
+
+// The corpus exports module filters that make each build one unit, so the run drops them:
+// --per-module must reach the per-module path.
+fn run_in(dir: Str, mode: Str) -> ProcessResult ! Process.Spawn {
+    sh("B=$(pwd)/build/blink; cd {dir} && env -u BLINK_PER_MODULE -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE BLINK_CACHE_DIR={dir}/cache BLINK_BIN=$B $B run {mode} src/main.bl < /dev/null")
+}
+
+test "getentropy bound twice with other param names and pointees builds and runs" {
+    let dir = sh("mktemp -d /tmp/blink_ffi_two_bindings.XXXXXX").out.trim()
+    let _ = sh("mkdir -p {dir}/src")
+    fs.write("{dir}/blink.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\n").unwrap()
+    fs.write("{dir}/blink.lock", "[metadata]\nlockfile-version = 1\n").unwrap()
+    fs.write("{dir}/src/main.bl", #"@ffi("getentropy", header: "unistd.h")
+@trusted(audit: "GETENTROPY")
+fn fill_bytes(buf: Ptr[U8], n: U64) -> I32 ! () {}
+
+@ffi("getentropy", header: "unistd.h")
+@trusted(audit: "GETENTROPY")
+fn fill_word(out: Ptr[I64], len: U64) -> I32 ! () {}
+
+fn main() {
+    with ffi.scope() as scope {
+        let a: Ptr[U8] = scope.alloc_n[U8](8)
+        let b: Ptr[I64] = scope.alloc[I64]()
+        io.println("{fill_bytes(a, 8.to_u64())} {fill_word(b, 8.to_u64())}")
+    }
+}
+"#).unwrap()
+    let pm = run_in(dir, "--per-module")
+    let one = run_in(dir, "--no-per-module")
+    let _ = sh("rm -rf {dir}")
+    for (label, r) in [("--per-module", pm), ("--no-per-module", one)] {
+        assert_eq(r.end, ChildEnd.Exited(0), "{label}: {diag(r)}")
+        assert_eq(r.out.trim(), "0 0", "{label}: {diag(r)}")
+    }
+}
