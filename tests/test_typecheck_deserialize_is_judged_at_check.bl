@@ -1,9 +1,11 @@
 // Deserialize is judged at check, so no program the checker passes reaches a reader the
 // compiler cannot build (sections/03_types.md §3.6.2 *Type Mapping*, ERROR_CATALOG.md E1401
 // and E0306). A function or a pointer has no JSON form, so a derive field of that type is
-// E1401, also inside a List, an Option, a Map or a tuple. A generic held at such a type
-// lacks the derive there, so `from_json` at that instance and a `T: Deserialize` bound are
-// refused, while the value itself stays legal. The types §3.6.2 maps are not refused.
+// E1401, also inside a List, an Option or a Result. A Map, a Set or a tuple has no row in
+// §3.6.2 *Built-in Types in JSON*, so it is refused whatever its parts are. A field declared
+// `T??` is E1401 (*Option and Result in JSON*). A generic held at a refused type lacks the
+// derive there, so `from_json` at that instance and a `T: Deserialize` bound are refused,
+// while the value itself stays legal. The types §3.6.2 maps are not refused.
 
 import compile_test_helpers
 
@@ -43,6 +45,51 @@ test "a function inside a container field is refused" {
     assert_refused("t: (fn(Int) -> Int, Int)", "t", "dj_tuple_fn")
 }
 
+// §3.6.2 *Built-in Types in JSON* gives no row to a Map, a Set or a tuple, so none of them
+// has a reader, whatever its parts are.
+test "a Map, a Set or a tuple field is refused" {
+    assert_refused("m: Map[Str, Int]", "m", "dj_map")
+    assert_refused("s: Set[Int]", "s", "dj_set")
+    assert_refused("t: (Int, Str)", "t", "dj_tuple")
+    assert_refused("xs: List[(Int, Str)]", "xs", "dj_list_tuple")
+    assert_refused("o: Option[Map[Str, Int]]", "o", "dj_option_map")
+}
+
+test "a refused Map, Set or tuple field gets help that names a form JSON has" {
+    let out = compile_test_helpers.check_via_cli(de_src("@derive(Deserialize)\ntype W \{ m: Map[Str, Int] }"), "dj_map_help")
+    assert(out.contains("hold the values in a struct, or in a `List` of a struct"), "no help toward a struct\n{out}")
+    assert(!out.contains("implement Deserialize by hand"), "help offers an impl the closed list forbids\n{out}")
+}
+
+// §3.6.2 *Option and Result in JSON*: `None` and `Some(None)` both write `null`, so a derive
+// refuses a field whose declared type is `T??`, read after alias expansion and before generic
+// substitution.
+test "a field declared as an Option of an Option is refused" {
+    let direct = compile_test_helpers.check_via_cli(de_src("@derive(Deserialize)\ntype W \{ v: Option[Int?] }"), "dj_option_option")
+    assert(direct.contains("E1401"), "no E1401\n{direct}")
+    assert(direct.contains("@derive(Deserialize) on `W`: field `v`"), "`v` not refused\n{direct}")
+    assert(direct.contains("`None` and `Some(None)` both encode as `null`"), "no reason for the refusal\n{direct}")
+    let out = compile_test_helpers.check_via_cli(de_src("type Maybe = Option[Str?]\n@derive(Deserialize)\ntype W \{ n: Maybe }"), "dj_option_option_alias")
+    assert(out.contains("@derive(Deserialize) on `W`: field `n`"), "alias of `T??` not refused\n{out}")
+    assert(out.contains("covers only a field whose declared type is `T??`"), "no note on the reach of the check\n{out}")
+    assert(out.contains("Replace(value: T)"), "no help that names each case\n{out}")
+}
+
+test "a generic field held at an Option is not an Option of an Option" {
+    assert_kept("b: B[Int?]", "dj_kept_generic_option")
+    assert_kept("b: B[Option[Int?]]", "dj_kept_generic_option_option")
+}
+
+test "a generic held at a Map or a tuple in a field is refused" {
+    assert_refused("b: B[Map[Str, Int]]", "b", "dj_generic_map")
+    assert_refused("b: B[(Int, Str)]", "b", "dj_generic_tuple")
+}
+
+test "from_json at a tuple instance is refused" {
+    let out = compile_test_helpers.check_via_cli(from_json_src("    let r: Result[Box[(Int, Str)], Str] = Box.from_json(\"x\")\n    io.println(\"\{r.is_ok()}\")"), "dj_from_json_tuple")
+    assert_eq(count_of(out, "does not implement `Deserialize`"), 1)
+}
+
 test "a generic held at a function in a field is refused" {
     assert_refused("b: B[fn(Int) -> Int]", "b", "dj_generic_fn")
 }
@@ -63,8 +110,6 @@ test "the types the spec maps are not refused" {
     assert_kept("ds: List[DeOk]", "dj_kept_list_nested")
     assert_kept("o: Option[Int]", "dj_kept_option")
     assert_kept("r: Result[Int, Str]", "dj_kept_result")
-    assert_kept("m: Map[Str, Int]", "dj_kept_map")
-    assert_kept("t: (Int, Str)", "dj_kept_tuple")
     assert_kept("g: B[Int]", "dj_kept_generic_arg")
 }
 
@@ -159,4 +204,12 @@ test "a Deserialize bound refuses a type with no Deserialize" {
 test "a Deserialize bound keeps a type with Deserialize" {
     let out = compile_test_helpers.check_via_cli(bound_src("    io.println(\"\{need(DeOk \{ a: 1 })} \{need([DeOk \{ a: 1 }])} \{need(1)} \{need(\"s\")} \{need([1, 2])}\")"), "dj_bound_kept")
     assert(!out.contains("\"severity\":\"error\""), "refused\n{out}")
+}
+
+test "a Deserialize bound refuses a Map, a Set and a tuple" {
+    let out = compile_test_helpers.check_via_cli(bound_src("    let m: Map[Str, Int] = \{\"a\": 1}\n    let s: Set[Int] = Set.new()\n    io.println(\"\{need(m)}\")\n    io.println(\"\{need(s)}\")\n    io.println(\"\{need((1, \"x\"))}\")"), "dj_bound_map_set_tuple")
+    assert_eq(count_of(out, "E0306"), 3)
+    assert(out.contains("`Map[Str, Int]` does not satisfy the Deserialize bound"), "no refusal of the Map\n{out}")
+    assert(out.contains("`Set[Int]` does not satisfy the Deserialize bound"), "no refusal of the Set\n{out}")
+    assert(out.contains("`(Int, Str)` does not satisfy the Deserialize bound"), "no refusal of the tuple\n{out}")
 }

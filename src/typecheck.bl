@@ -17781,15 +17781,15 @@ fn tc_check_one_serialize_field(f: Int, variant: Int, ftid: Int, tname: Str) ! D
 // Whether a value of type `tid` is Deserialize, tri-state as tc_derive_only_fact: Int,
 // Float, Bool and Str are, Option and List are when the element is, Result is when both
 // sides are, and a struct or enum is when it derives Deserialize at its arguments. A Map, a
-// Set or a tuple is refused only through a part, since its reader is not judged here. A kind
-// that holds no data JSON can carry is not. Each kind is named, so that a new one must get
-// its answer here.
+// Set or a tuple is not: §3.6.2 *Built-in Types in JSON* gives it no row. A kind that holds
+// no data JSON can carry is not. Each kind is named, so that a new one must get its answer
+// here.
 fn tc_deserialize_read_fact(tid: Int) -> Int {
     let t = resolve_alias_tid(tc_resolve(tid))
     match type_kind(t) {
         TyKind.Int | TyKind.Float | TyKind.Bool | TyKind.Str => 1
         TyKind.List | TyKind.Option | TyKind.Result => tc_deserialize_parts_fact(t, 1)
-        TyKind.Map | TyKind.Set | TyKind.Tuple => tc_deserialize_parts_fact(t, 0)
+        TyKind.Map | TyKind.Set | TyKind.Tuple => -1
         TyKind.Struct | TyKind.Enum => tc_derive_only_fact(t, "Deserialize")
         TyKind.Typevar | TyKind.Unknown => 0
         // §3.6.2 maps none of these and refuses none of them.
@@ -17811,12 +17811,12 @@ fn tc_deserialize_parts_fact(t: Int, whole: Int) -> Int {
     fact
 }
 
-// The parts a container's Deserialize rests on.
+// The parts a container's Deserialize rests on. A Map, a Set or a tuple rests on none, as
+// no part of it can make it Deserialize.
 fn tc_deserialize_parts(t: Int) -> List[Int] {
     match type_kind(t) {
-        TyKind.List | TyKind.Option | TyKind.Set => [tc_tid_child(t, 0)]
-        TyKind.Result | TyKind.Map => [tc_tid_child(t, 0), tc_tid_child(t, 1)]
-        TyKind.Tuple => tc_tuple_elem_tids(t)
+        TyKind.List | TyKind.Option => [tc_tid_child(t, 0)]
+        TyKind.Result => [tc_tid_child(t, 0), tc_tid_child(t, 1)]
         _ => []
     }
 }
@@ -17856,9 +17856,46 @@ fn tc_derived_field_tids_at(t: Int) -> List[Int] {
 
 fn tc_check_one_deserialize_field(f: Int, variant: Int, ftid: Int, tname: Str) ! Diag.Report {
     if ftid < 0 { return }
+    let label = tc_derive_field_label(variant, f)
+    let payload = tc_option_of_option_payload(ftid)
+    if payload >= 0 {
+        tc_report_option_of_option_field(f, label, payload, tname, "Deserialize")
+        return
+    }
     let need = tc_deserialize_need(ftid, [])
     if need.len() == 0 { return }
-    diag_error_at("NonDerivableTrait", NON_DERIVABLE_TRAIT, "@derive(Deserialize) on `{tname}`: field `{tc_derive_field_label(variant, f)}` has type `{type_ann_text(node_value(f))}` which does not implement Deserialize", f, tc_derive_field_help(need.get(need.len() - 1).unwrap(), "Deserialize"))
+    let leaf = need.get(need.len() - 1).unwrap()
+    // The list of §3.6.2 *Built-in Types in JSON* is closed, so no impl can give one of these
+    // a reader, and the help names a form JSON has.
+    let lk = type_kind(leaf)
+    let help = if lk == TyKind.Map || lk == TyKind.Set || lk == TyKind.Tuple {
+        "JSON has no form for a `Map`, a `Set` or a tuple (§3.6.2); hold the values in a struct, or in a `List` of a struct"
+    } else {
+        tc_derive_field_help(leaf, "Deserialize")
+    }
+    diag_error_at("NonDerivableTrait", NON_DERIVABLE_TRAIT, "@derive(Deserialize) on `{tname}`: field `{label}` has type `{type_ann_text(node_value(f))}` which does not implement Deserialize", f, help)
+}
+
+// The `T` of a declared field type `Option[Option[T]]`, read after alias expansion, else -1.
+// The declared type has its type parameters in place, so `v: T?` held at `Box[Int?]` is not
+// one (§3.6.2 *Option and Result in JSON*).
+fn tc_option_of_option_payload(ftid: Int) -> Int {
+    let t = resolve_alias_tid(tc_resolve(ftid))
+    if type_kind(t) != TyKind.Option { return -1 }
+    let inner = resolve_alias_tid(tc_resolve(tc_tid_child(t, 0)))
+    if type_kind(inner) != TyKind.Option { return -1 }
+    tc_tid_child(inner, 0)
+}
+
+// `None` and `Some(None)` both write `null`, so a derive refuses the field the user can
+// still change, and the help gives a type that keeps the two cases apart.
+fn tc_report_option_of_option_field(f: Int, label: Str, payload: Int, tname: Str, tr: Str) ! Diag.Report {
+    let note = "this check covers only a field whose declared type is `T??`. A generic field such as `Box[Int?]`, an `Option[JsonValue]` that holds `Some(JsonValue.Null)`, and a `to_json` that returns `null` still collapse under the round-trip law (§3.6.1 Derive Laws)"
+    let fname = node_name(f)
+    let help = "replace the field type with an enum that names each case:\n    @derive(Serialize, Deserialize)\n    type Patch[T] \{\n        Keep\n        Clear\n        Replace(value: T)\n    }\nand write the field as `{fname}: Patch[{type_to_str(payload)}] = Patch.Keep`, so that a body with no `{fname}` key gives `Keep`"
+    diag_error_at_notes("NonDerivableTrait", NON_DERIVABLE_TRAIT,
+        "@derive({tr}) on `{tname}`: field `{label}` has type `{type_ann_text(node_value(f))}`, and `None` and `Some(None)` both encode as `null`",
+        f, help, [note])
 }
 
 // Kind A collision: a struct type whose name equals an enum variant name. Two enums sharing

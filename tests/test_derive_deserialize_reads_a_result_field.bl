@@ -1,0 +1,113 @@
+// A derived from_json reads a Result field by §3.6.2 *Option and Result in JSON*: an object
+// with exactly one entry, with the key "Ok" or "Err", gives Ok or Err of the payload's read.
+// Any other value is an error that names both keys and says that case matters.
+
+@derive(Deserialize)
+type Reply {
+    outcome: Result[Int, Str]
+}
+
+@derive(Deserialize)
+type Inner {
+    x: Int
+}
+
+@derive(Deserialize)
+type Mixed {
+    a: Result[Inner, Str]
+    b: Result[Int?, Bool]
+    rs: List[Result[Int, Str]]
+}
+
+@derive(Deserialize)
+type Box[T] {
+    v: T
+}
+
+@derive(Deserialize)
+type Event {
+    Done(r: Result[Int, Str])
+    Idle
+}
+
+fn names_both_keys(r: Result[Reply, Str]) -> Bool {
+    match r {
+        Ok(_) => false
+        Err(m) => m.contains("\"Ok\"") && m.contains("\"Err\"") && m.contains("case matters")
+    }
+}
+
+test "an Ok key reads the ok payload" {
+    assert_eq(Reply.from_json(#"{"outcome": {"Ok": 7}}"#).unwrap().outcome, Ok(7))
+}
+
+test "an Err key reads the err payload" {
+    assert_eq(Reply.from_json(#"{"outcome": {"Err": "busy"}}"#).unwrap().outcome, Err("busy"))
+}
+
+test "a key in the wrong case is an error that names both keys" {
+    assert(names_both_keys(Reply.from_json(#"{"outcome": {"ok": 1}}"#)))
+    assert(names_both_keys(Reply.from_json(#"{"outcome": {"ERR": "x"}}"#)))
+}
+
+test "an object with no entry or with two entries is an error" {
+    assert(names_both_keys(Reply.from_json(#"{"outcome": {}}"#)))
+    assert(names_both_keys(Reply.from_json(#"{"outcome": {"Ok": 1, "Err": "x"}}"#)))
+    assert(names_both_keys(Reply.from_json(#"{"outcome": {"Ok": 1, "Ok": 2}}"#)))
+    assert(names_both_keys(Reply.from_json(#"{"outcome": {"Ok": 1, "extra": 2}}"#)))
+}
+
+test "a value that is not an object is an error" {
+    assert(names_both_keys(Reply.from_json(#"{"outcome": 5}"#)))
+    assert(names_both_keys(Reply.from_json(#"{"outcome": null}"#)))
+    assert(names_both_keys(Reply.from_json(#"{"outcome": [{"Ok": 1}]}"#)))
+}
+
+fn message_of(r: Result[Reply, Str]) -> Str {
+    match r {
+        Ok(_) => ""
+        Err(m) => m
+    }
+}
+
+test "a payload of the wrong JSON type is the payload's own error" {
+    assert_eq(message_of(Reply.from_json(#"{"outcome": {"Ok": "seven"}}"#)),
+        "the Ok value of field 'outcome' is missing or holds the wrong JSON type")
+    assert_eq(message_of(Reply.from_json(#"{"outcome": {"Err": 3}}"#)),
+        "the Err value of field 'outcome' is missing or holds the wrong JSON type")
+}
+
+test "an absent key is the missing-field error, not the error for a wrong shape" {
+    assert_eq(message_of(Reply.from_json("\{}")), "field 'outcome' is missing")
+}
+
+test "a Result of a struct, of an Option and in a List reads each payload" {
+    let m = Mixed.from_json(#"{"a": {"Ok": {"x": 4}}, "b": {"Ok": null}, "rs": [{"Ok": 1}, {"Err": "no"}]}"#).unwrap()
+    assert_eq(m.a.unwrap().x, 4)
+    assert_eq(m.b, Ok(None))
+    assert_eq(m.rs.len(), 2)
+    assert_eq(m.rs.get(0).unwrap(), Ok(1))
+    assert_eq(m.rs.get(1).unwrap(), Err("no"))
+    let n = Mixed.from_json(#"{"a": {"Err": "gone"}, "b": {"Err": true}, "rs": []}"#).unwrap()
+    assert_eq(n.a.is_err(), true)
+    assert_eq(n.b, Err(true))
+}
+
+test "an error inside the payload is passed up as it is" {
+    match Mixed.from_json(#"{"a": {"Ok": {"x": "four"}}, "b": {"Ok": 1}, "rs": []}"#) {
+        Ok(_) => assert(false, "read a wrong payload")
+        Err(m) => assert_eq(m, "field 'x' is missing or holds the wrong JSON type")
+    }
+}
+
+test "a generic held at a Result reads its field as a Result" {
+    let r: Result[Box[Result[Int, Str]], Str] = Box.from_json(#"{"v": {"Err": "e"}}"#)
+    assert_eq(r.unwrap().v, Err("e"))
+}
+
+test "a Result field of an enum variant reads the same way" {
+    match Event.from_json(#"{"type": "Done", "r": {"Ok": 2}}"#).unwrap() {
+        Event.Done(r) => assert_eq(r, Ok(2))
+        Event.Idle => assert(false, "read Idle")
+    }
+}

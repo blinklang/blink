@@ -34,7 +34,8 @@ import cg_promote.{
     cg_promote_has_pending, cg_promote_print_walkers, cg_promote_on_demand_claim, cg_promote_on_demand_settle,
     cg_promote_on_demand_queue,
 }
-import cg_expr.{cg_expr_field_value, cg_expr_field_stored, cg_expr_push_pending}
+import cg_expr.{cg_expr_field_value, cg_expr_field_stored, cg_expr_push_pending, cg_expr_option_none, cg_expr_option_wrap,
+    cg_expr_result_ok_wrap, cg_expr_result_err_wrap}
 import ir.{
     ir_assign, ir_binary, ir_block, ir_call_direct, ir_call_runtime, ir_cast, ir_const,
     ir_field_get, ir_if, ir_let, ir_panic, ir_return, ir_switch, ir_unary, ir_var_ref,
@@ -2500,6 +2501,9 @@ fn de_method(decl: Int, tid: Int, arg: Int, bodies: Bool) ! Diag.Report {
     if rbody < 0 { return }
     let ebody = de_entry_body(r, reader, arg)
     if ebody < 0 { return }
+    // Boxing a payload into its Option or a field queues the typedef of its box, which must
+    // print before the readers that use it.
+    print_typedef_blocks(layout_take_typedefs())
     print_fn(false, ret, reader, reader_params, false, rbody)
     print_fn(false, ret, entry, entry_params, false, ebody)
 }
@@ -2610,6 +2614,8 @@ fn de_read(r: DeReader, ftid: Int, node: Str, what: DeSubject, span: Int) -> DeR
     if k == TyKind.Float { return de_read_float(r, node, what, span) }
     if k == TyKind.Struct || k == TyKind.Enum { return de_read_nested(r, ftid, node, what, span) }
     if k == TyKind.List { return de_read_list(r, ftid, node, what, span) }
+    if k == TyKind.Option { return de_read_option(r, ftid, node, what, span) }
+    if k == TyKind.Result { return de_read_result(r, ftid, node, what, span) }
     not_built(span, "@derive(Deserialize) on {de_subject_code(what)} of kind {tk_name(k)}")
     de_refused()
 }
@@ -2687,6 +2693,94 @@ fn de_read_nested(r: DeReader, ftid: Int, node: Str, what: DeSubject, span: Int)
     let last = ir_var_ref(inner.result, span, inner.carrier.c_spelling, got, inner.carrier.slot_form)
     let value = ir_carrier_unwrap(ftid, span, okm.c_spelling, de_ok_member, okm.slot_form, last)
     DeRead { pre: [bind, pass_up], value: value, ok: true }
+}
+
+// An option reads `null` as None and any other value as the payload's read in Some
+// (§3.6.2 *Type Mapping*). An absent key is node -1, whose JSON type is -1, and it reads as
+// `null` (*Missing and Extra Keys*). The payload's guards run only when a value is present,
+// so a value of the wrong JSON type is an error, not None.
+fn de_read_option(r: DeReader, ftid: Int, node: Str, what: DeSubject, span: Int) -> DeRead ! Diag.Report {
+    let inner = child_tid(ftid, Slot.Inner1)
+    if inner < 0 {
+        derive_ice(span, "{de_subject_code(what)} is an option with no payload type")
+        return de_refused()
+    }
+    let crec = layout_of(ftid, Position.Local)
+    let cs = spelling_or_ice(crec, de_subject_code(what), span)
+    if cs == "" { return de_refused() }
+    let read = de_read(r, inner, node, what, span)
+    if !read.ok { return de_refused() }
+    let some = cg_expr_option_wrap(ftid, span, read.value)
+    let none = cg_expr_option_none(ftid, span, crec)
+    let t = de_json_call(r, "json_type", [de_int_local(r, node, span)], span)
+    let null_tag = de_json_tag(r, "JSON_NULL", span)
+    if some < 0 || none < 0 || t < 0 || null_tag < 0 { return de_refused() }
+    // std.json numbers `null` 0 and every value tag above it, and an absent node is -1, so
+    // one compare finds a value that is present and not `null`.
+    let present = ir_binary(TYPE_BOOL, span, r.bools, ">", t, null_tag)
+    let o = c_mint_local("jo")
+    let mut fill = read.pre
+    fill.push(ir_assign(span, ir_var_ref(ftid, span, cs, o, crec.slot_form), some))
+    let pre = [ir_let(ftid, span, cs, o, crec.slot_form, none), ir_if(span, present, ir_block(span, fill), -1)]
+    DeRead { pre: pre, value: ir_var_ref(ftid, span, cs, o, crec.slot_form), ok: true }
+}
+
+// A result is an object with exactly one entry, whose key is "Ok" or "Err" in that case
+// (§3.6.2 *Option and Result in JSON*). Two entries are an error even when the keys are
+// equal, so the count is checked before either key is looked up. Each arm's guards run
+// only on that arm, and an error from the payload is passed up as it is. An absent key is
+// the missing-field error (*Missing and Extra Keys*), not the error for a wrong shape.
+fn de_read_result(r: DeReader, ftid: Int, node: Str, what: DeSubject, span: Int) -> DeRead ! Diag.Report {
+    let ok_tid = child_tid(ftid, Slot.Inner1)
+    let err_tid = child_tid(ftid, Slot.Inner2)
+    if ok_tid < 0 || err_tid < 0 {
+        derive_ice(span, "{de_subject_code(what)} is a result with no ok or err type")
+        return de_refused()
+    }
+    let crec = layout_of(ftid, Position.Local)
+    let cs = spelling_or_ice(crec, de_subject_code(what), span)
+    if cs == "" { return de_refused() }
+    let refusal = "{de_subject_runtime(what)} expected an object with exactly one key, \"Ok\" or \"Err\" (case matters)"
+    let absent_t = de_json_call(r, "json_type", [de_int_local(r, node, span)], span)
+    let t = de_json_call(r, "json_type", [de_int_local(r, node, span)], span)
+    let object_tag = de_json_tag(r, "JSON_OBJECT", span)
+    let count = de_json_call(r, "json_len", [de_int_local(r, node, span)], span)
+    let ok_node = c_mint_local("jk")
+    let err_node = c_mint_local("jk")
+    let ok_get = de_json_call(r, "json_get", [de_int_local(r, node, span), de_str_const(r, "Ok", span)], span)
+    let err_get = de_json_call(r, "json_get", [de_int_local(r, node, span), de_str_const(r, "Err", span)], span)
+    let ok_read = de_read(r, ok_tid, ok_node, DeSubject { lead: "the Ok value of {what.lead}", name: what.name }, span)
+    if !ok_read.ok { return de_refused() }
+    let err_read = de_read(r, err_tid, err_node, DeSubject { lead: "the Err value of {what.lead}", name: what.name }, span)
+    if !err_read.ok { return de_refused() }
+    let ok_value = cg_expr_result_ok_wrap(ftid, span, ok_read.value)
+    let err_value = cg_expr_result_err_wrap(ftid, span, err_read.value)
+    if absent_t < 0 || t < 0 || object_tag < 0 || count < 0 || ok_get < 0 || err_get < 0 || ok_value < 0 || err_value < 0 {
+        return de_refused()
+    }
+    let absent = ir_binary(TYPE_BOOL, span, r.bools, "<", absent_t, ir_const(TYPE_INT, span, r.ints, "0"))
+    let not_one = ir_binary(TYPE_BOOL, span, r.bools, "||",
+        ir_binary(TYPE_BOOL, span, r.bools, "!=", t, object_tag),
+        ir_binary(TYPE_BOOL, span, r.bools, "!=", count, ir_const(TYPE_INT, span, r.ints, "1")))
+    let o = c_mint_local("jr")
+    let mut ok_fill = ok_read.pre
+    ok_fill.push(ir_assign(span, ir_var_ref(ftid, span, cs, o, crec.slot_form), ok_value))
+    let no_err = ir_binary(TYPE_BOOL, span, r.bools, "<", de_int_local(r, err_node, span), ir_const(TYPE_INT, span, r.ints, "0"))
+    let mut err_fill = [
+        ir_let(TYPE_INT, span, r.ints, err_node, int_form(), err_get),
+        ir_if(span, no_err, de_fail(r, refusal, span), -1),
+    ]
+    for s in err_read.pre { err_fill.push(s) }
+    err_fill.push(ir_assign(span, ir_var_ref(ftid, span, cs, o, crec.slot_form), err_value))
+    let has_ok = ir_binary(TYPE_BOOL, span, r.bools, ">=", de_int_local(r, ok_node, span), ir_const(TYPE_INT, span, r.ints, "0"))
+    let pre = [
+        ir_if(span, absent, de_fail(r, "{de_subject_runtime(what)} is missing", span), -1),
+        ir_if(span, not_one, de_fail(r, refusal, span), -1),
+        ir_let(ftid, span, cs, o, crec.slot_form, -1),
+        ir_let(TYPE_INT, span, r.ints, ok_node, int_form(), ok_get),
+        ir_if(span, has_ok, ir_block(span, ok_fill), ir_block(span, err_fill)),
+    ]
+    DeRead { pre: pre, value: ir_var_ref(ftid, span, cs, o, crec.slot_form), ok: true }
 }
 
 // A list is built from a JSON array one element at a time. Each element is stored through
