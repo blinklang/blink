@@ -10,7 +10,7 @@
 
 import parser.{get_annotation, get_str_named_arg, node_args, node_fields, node_params, positional_str_arg, positional_str_arg_count, node_binder_col, node_col, node_kind, node_line, node_name, node_stmts, node_value, sublist_get, sublist_length}
 import ast.{NodeKind}
-import cname.{c_ffi_symbol}
+import cname.{c_ffi_symbol, is_c_identifier}
 import typecheck.{TyKind, tc_decl_in_std, tc_lookup_node_tid, resolve_alias_tid, type_kind, tk_name}
 import diagnostics.{Diag, diag_error_span_at_notes, FOREIGN_CONST_INVALID, FOREIGN_HEADER_NOT_FOUND, MISSING_NATIVE_DEP}
 
@@ -204,19 +204,6 @@ pub fn text_verdict(fc: ForeignConst) -> ProbeVerdict {
     if !is_c_identifier(fc.c_name) { return ProbeVerdict.NotAName }
     if !is_header_name(fc.header) { return ProbeVerdict.NotAHeader }
     ProbeVerdict.Fine
-}
-
-fn is_c_identifier(s: Str) -> Bool {
-    if s.byte_len() == 0 { return false }
-    let mut i = 0
-    while i < s.byte_len() {
-        let b = s.byte_at(i).to_int()
-        let letter = (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || b == 95
-        let digit = b >= 48 && b <= 57
-        if !letter && !(digit && i > 0) { return false }
-        i = i + 1
-    }
-    true
 }
 
 // A name that fits between `<` and `>` on one line: printable ASCII with no `<`, `>`, `"` or
@@ -456,4 +443,79 @@ pub fn triple_of_machine(machine: Str) -> Str {
         }
     }
     parts.join("-")
+}
+
+// The C names of a program's own mirrors (§9.1.3) for the spelling probe, each once. A name
+// that is not one C identifier is a struct tag and is not probed.
+pub fn ffi_struct_names_in(headers: List[ForeignHeader]) -> List[Str] {
+    let mut out: List[Str] = []
+    for fh in headers {
+        if get_annotation(fh.decl, "ffi.struct") != fh.annotation { continue }
+        let n = get_str_named_arg(fh.annotation, "name")
+        if is_c_identifier(n) && !out.contains(n) { out.push(n) }
+    }
+    out
+}
+
+// A header can declare a mirror's name as a struct tag, as a typedef name, or as both. Two
+// lines per name follow the headers: the first is an error unless `struct <name>` is a
+// complete type, the second unless `<name>` is a complete type name. `first_line` is the
+// 1-based line of the first name's tag line.
+pub type SpellingProbe {
+    text: Str
+    first_line: Int
+}
+
+// `headers` are the headers of all the program's own foreign declarations, as the unit reads
+// them all: two mirrors of one name can name two headers, and a header can need a type that
+// an earlier one declares.
+pub fn spelling_probe_of(names: List[Str], headers: List[Str]) -> SpellingProbe {
+    let mut text: List[Str] = [
+        "#if !defined(_POSIX_C_SOURCE) && !defined(_GNU_SOURCE) && !defined(__APPLE__)",
+        "#define _POSIX_C_SOURCE 200809L",
+        "#endif",
+        "#include <stdint.h>",
+    ]
+    let mut seen: List[Str] = []
+    for h in headers {
+        if seen.contains(h) { continue }
+        seen.push(h)
+        // check_foreign_headers has already reported a missing header.
+        text.push("#if __has_include(<{h}>)")
+        text.push("#include <{h}>")
+        text.push("#endif")
+    }
+    let first_line = text.len() + 1
+    let mut i = 0
+    for n in names {
+        text.push("enum \{ blink_fs_tag_{i} = sizeof(struct {n}) };")
+        // Only a type name can follow `typedef`, so an object or a function named `<name>`
+        // fails here.
+        text.push("typedef {n} blink_fs_t{i}; enum \{ blink_fs_def_{i} = sizeof(blink_fs_t{i}) };")
+        i = i + 1
+    }
+    SpellingProbe { text: text.join("\n").concat("\n"), first_line: first_line }
+}
+
+// When both spellings compile, the tag wins, as `struct <name>` is the default. When neither
+// does, the default stays and the layout check of the program's compile reports it. A
+// compile that stopped at an error limit leaves later lines unread, so it answers none.
+pub fn typedef_names(names: List[Str], probe: SpellingProbe, cc_err: Str, file_name: Str) -> List[Str] {
+    let mut out: List[Str] = []
+    if cc_err.contains("too many errors") { return out }
+    let marker = "{file_name}:"
+    let mut failed: List[Int] = []
+    for raw in cc_err.split("\n") {
+        if !raw.contains(": error:") && !raw.contains(": fatal error:") { continue }
+        if !raw.starts_with(marker) && !raw.contains("/{marker}") { continue }
+        let line = probe_line_of(raw, marker)
+        if line > 0 && !failed.contains(line) { failed.push(line) }
+    }
+    let mut i = 0
+    for n in names {
+        let tag_line = probe.first_line + 2 * i
+        if failed.contains(tag_line) && !failed.contains(tag_line + 1) { out.push(n) }
+        i = i + 1
+    }
+    out
 }

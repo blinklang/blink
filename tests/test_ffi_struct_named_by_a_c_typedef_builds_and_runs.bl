@@ -1,0 +1,197 @@
+// An `@ffi.struct` name can be a C typedef name as well as a struct tag. C's div_t is a
+// typedef of an untagged struct on every libc, so `struct div_t` names no type: a mirror
+// that names it must still build, pass its layout check and cross by value and by pointer.
+// Each row builds and runs on both build paths and checks what the program prints.
+//
+// C fixes div_t's two fields, quot and rem, but not their order. The mirror puts quot
+// first, as glibc, musl and the BSDs do; on a libc with the other order the layout check
+// reports the field.
+
+import std.process.{ChildEnd, ProcessResult, ChildLimits}
+import std.time.{Duration}
+
+fn sh(cmd: Str) -> ProcessResult ! Process.Spawn {
+    process.run("sh", ["-c", cmd], limits: ChildLimits { timeout: Some(Duration.seconds(300)) }).unwrap()
+}
+
+fn project(source: Str) -> Str ! FS.Write, Process.Spawn {
+    let dir = sh("mktemp -d /tmp/blink_ffi_typedef_mirror.XXXXXX").out.trim()
+    let _ = sh("mkdir -p {dir}/src")
+    fs.write("{dir}/blink.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\n").unwrap()
+    fs.write("{dir}/blink.lock", "[metadata]\nlockfile-version = 1\n").unwrap()
+    fs.write("{dir}/src/main.bl", source).unwrap()
+    dir
+}
+
+// The corpus exports module filters that make each build one unit, so the run drops them:
+// --per-module must reach the per-module path.
+fn blink_in(dir: Str, cmd: Str) -> ProcessResult ! Process.Spawn {
+    sh("B=$(pwd)/build/blink; cd {dir} && env -u BLINK_PER_MODULE -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE BLINK_CACHE_DIR={dir}/cache BLINK_BIN=$B $B {cmd} < /dev/null")
+}
+
+fn diag(r: ProcessResult) -> Str {
+    "exit {r.end}\nstdout:\n{r.out}\nstderr:\n{r.err_out}"
+}
+
+// Runs `source` on both build paths and checks that each prints `want`.
+fn runs_and_prints(source: Str, want: Str) ! FS.Write, Process.Spawn, IO.Print {
+    let dir = project(source)
+    let pm = blink_in(dir, "run --per-module src/main.bl")
+    let one = blink_in(dir, "run --no-per-module src/main.bl")
+    let _ = sh("rm -rf {dir}")
+    assert_eq(pm.end, ChildEnd.Exited(0), "--per-module: {diag(pm)}")
+    assert_eq(pm.out.trim(), want, "--per-module: {diag(pm)}")
+    assert_eq(one.end, ChildEnd.Exited(0), "--no-per-module: {diag(one)}")
+    assert_eq(one.out.trim(), want, "--no-per-module: {diag(one)}")
+}
+
+fn div_mirror() -> Str {
+    #"@ffi.struct(header: "stdlib.h", name: "div_t")
+type DivT { quot: I32, rem: I32 }
+"#
+}
+
+test "a mirror of a typedef-only C struct comes back by value from div" {
+    let src = div_mirror().concat(#"
+@ffi("div", header: "stdlib.h")
+fn c_div(a: I32, b: I32) -> DivT ! () {}
+
+fn main() {
+    let d = c_div(7, 2)
+    io.println("{d.quot} {d.rem}")
+}
+"#)
+    runs_and_prints(src, "3 1")
+}
+
+test "a pointer to a mirror of a typedef-only C struct crosses to memcpy and back" {
+    let src = div_mirror().concat(#"
+@ffi("memcpy", header: "string.h")
+fn c_memcpy(dst: Ptr[DivT], src: Ptr[DivT], n: Int) -> Ptr[DivT] ! () {}
+
+fn main() {
+    with ffi.scope() as scope {
+        let from: Ptr[DivT] = scope.alloc[DivT]()
+        from.quot.write(5)
+        from.rem.write(6)
+        let to: Ptr[DivT] = scope.alloc[DivT]()
+        let back = c_memcpy(to, from, 8)
+        io.println("{back.quot.read()} {to.rem.read()}")
+    }
+}
+"#)
+    runs_and_prints(src, "5 6")
+}
+
+// Each mirror of a struct tag gives the probe one error, and clang, so also zig cc for each
+// cross target, stops after 20 errors by default. A probe that stops reads no verdict, so
+// the build must lift that limit for a program with more tag mirrors than that.
+fn tag_mirrors() -> Str {
+    #"@ffi.struct(header: "time.h", name: "timespec")
+type M1 { tv_sec: I64, tv_nsec: I64 }
+@ffi.struct(header: "sys/time.h", name: "timeval")
+type M2 { tv_sec: I64, tv_usec: I64 }
+@ffi.struct(header: "poll.h", name: "pollfd")
+type M3 { fd: I32, events: I16, revents: I16 }
+@ffi.struct(header: "sys/uio.h", name: "iovec")
+type M4 { iov_base: U64, iov_len: U64 }
+@ffi.struct(header: "sys/socket.h", name: "linger")
+type M5 { l_onoff: I32, l_linger: I32 }
+@ffi.struct(header: "netinet/in.h", name: "in_addr")
+type M6 { s_addr: U32 }
+@ffi.struct(header: "sys/resource.h", name: "rlimit")
+type M7 { rlim_cur: U64, rlim_max: U64 }
+@ffi.struct(header: "sys/ioctl.h", name: "winsize")
+type M8 { ws_row: U16, ws_col: U16, ws_xpixel: U16, ws_ypixel: U16 }
+@ffi.struct(header: "sys/times.h", name: "tms")
+type M9 { tms_utime: I64, tms_stime: I64, tms_cutime: I64, tms_cstime: I64 }
+@ffi.struct(header: "utime.h", name: "utimbuf")
+type M10 { actime: I64, modtime: I64 }
+@ffi.struct(header: "sched.h", name: "sched_param")
+type M11 { sched_priority: I32 }
+@ffi.struct(header: "fcntl.h", name: "flock")
+type M12 { l_type: I16, l_whence: I16, l_start: I64, l_len: I64, l_pid: I32 }
+@ffi.struct(header: "sys/socket.h", name: "msghdr")
+type M13 { msg_name: U64, msg_namelen: U32, msg_iov: U64, msg_iovlen: U64, msg_control: U64, msg_controllen: U64, msg_flags: I32 }
+@ffi.struct(header: "sys/socket.h", name: "cmsghdr")
+type M14 { cmsg_len: U64, cmsg_level: I32, cmsg_type: I32 }
+@ffi.struct(header: "netdb.h", name: "hostent")
+type M15 { h_name: U64, h_aliases: U64, h_addrtype: I32, h_length: I32, h_addr_list: U64 }
+@ffi.struct(header: "netdb.h", name: "servent")
+type M16 { s_name: U64, s_aliases: U64, s_port: I32, s_proto: U64 }
+@ffi.struct(header: "netdb.h", name: "protoent")
+type M17 { p_name: U64, p_aliases: U64, p_proto: I32 }
+@ffi.struct(header: "pwd.h", name: "passwd")
+type M18 { pw_name: U64, pw_passwd: U64, pw_uid: U32, pw_gid: U32, pw_gecos: U64, pw_dir: U64, pw_shell: U64 }
+@ffi.struct(header: "grp.h", name: "group")
+type M19 { gr_name: U64, gr_passwd: U64, gr_gid: U32, gr_mem: U64 }
+@ffi.struct(header: "netdb.h", name: "netent")
+type M20 { n_name: U64, n_aliases: U64, n_addrtype: I32, n_net: U32 }
+@ffi.struct(header: "sys/sem.h", name: "sembuf")
+type M21 { sem_num: U16, sem_op: I16, sem_flg: I16 }
+"#
+}
+
+fn many_mirrors_src() -> Str {
+    tag_mirrors().concat(div_mirror()).concat(#"
+@ffi("div", header: "stdlib.h")
+fn c_div(a: I32, b: I32) -> DivT ! () {}
+
+fn main() {
+    let d = c_div(7, 2)
+    io.println("{d.quot} {d.rem}")
+}
+"#)
+}
+
+test "a typedef mirror beside more than 20 tag mirrors runs" {
+    runs_and_prints(many_mirrors_src(), "3 1")
+}
+
+test "a typedef mirror beside more than 20 tag mirrors builds for a clang cross target" {
+    let dir = project(many_mirrors_src())
+    let pm = blink_in(dir, "build --per-module --target x86_64-linux-gnu src/main.bl")
+    let one = blink_in(dir, "build --no-per-module --target x86_64-linux-gnu src/main.bl")
+    let _ = sh("rm -rf {dir}")
+    assert_eq(pm.end, ChildEnd.Exited(0), "--per-module: {diag(pm)}")
+    assert_eq(one.end, ChildEnd.Exited(0), "--no-per-module: {diag(one)}")
+}
+
+// The unit C is the same whatever the probe finds, so only the -D flags tell two verdicts
+// apart. The second build runs a cc that answers the probe with no error, so it gets no -D.
+// It must compile the unit again and meet `struct div_t`, not reuse the first build's object.
+fn build_with_cc(dir: Str, cc_dir: Str, mode: Str) -> ProcessResult ! Process.Spawn {
+    sh("B=$(pwd)/build/blink; cd {dir} && env -u BLINK_PER_MODULE -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE PATH={cc_dir}$PATH BLINK_CACHE_DIR={dir}/cache BLINK_BIN=$B $B build {mode} src/main.bl < /dev/null")
+}
+
+fn object_key_holds_the_verdict(mode: Str) ! FS.Write, Process.Spawn {
+    let dir = project(div_mirror().concat(#"
+@ffi("div", header: "stdlib.h")
+fn c_div(a: I32, b: I32) -> DivT ! () {}
+
+fn main() {
+    let d = c_div(7, 2)
+    io.println("{d.quot} {d.rem}")
+}
+"#))
+    let real_cc = sh("command -v cc").out.trim()
+    let _ = sh("mkdir -p {dir}/cc")
+    fs.write("{dir}/cc/cc", "#!/bin/sh\nfor a in \"$@\"; do case \"$a\" in *ffi_struct_probe.c) exit 0;; esac; done\nexec {real_cc} \"$@\"\n").unwrap()
+    let _ = sh("chmod +x {dir}/cc/cc")
+    let first = build_with_cc(dir, "", mode)
+    let again = build_with_cc(dir, "", mode)
+    let no_define = build_with_cc(dir, "{dir}/cc:", mode)
+    let _ = sh("rm -rf {dir}")
+    assert_eq(first.end, ChildEnd.Exited(0), "{mode} first: {diag(first)}")
+    assert_eq(again.end, ChildEnd.Exited(0), "{mode} again: {diag(again)}")
+    assert(no_define.end != ChildEnd.Exited(0), "{mode}: a build with no -D reused the object: {diag(no_define)}")
+    assert(no_define.err_out.contains("struct div_t"), "{mode}: {diag(no_define)}")
+}
+
+test "the one-unit object key holds the spelling verdict" {
+    object_key_holds_the_verdict("--no-per-module")
+}
+
+test "the per-module object key holds the spelling verdict" {
+    object_key_holds_the_verdict("--per-module")
+}

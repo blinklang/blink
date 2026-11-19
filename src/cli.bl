@@ -54,7 +54,7 @@ import compiler.{
 }
 import cg.{Codegen, CgConfig, HeaderPreamble, ProgramFacts, generate, generate_archive_header, generate_types_header, generate_module_headers_from, generate_module_headers_with, header_preamble, generate_module_object_with, generate_module_chunks_with, program_facts, enumerate_program_modules, archive_unit_modules, module_instance_names, entry_unit_facts}
 import build_unit_headers.{HeaderIndex, index_headers, unit_declarations, splice_declarations}
-import cname.{c_ffi_symbol, c_module_header_name, c_module_private_header_name, c_program_types_header_name}
+import cname.{c_ffi_struct_macro, c_ffi_symbol, c_module_header_name, c_module_private_header_name, c_program_types_header_name}
 import ir.{ir_track_sources, ir_sources_read}
 import build_compiler_archive.{build_compiler_archive, compiler_archive_env, compiler_archive_link_args, compiler_archive_of_unit, compiler_archive_skip_keys}
 import build_stdlib.{build_stdlib_archive, build_stdlib_archive_in, list_stdlib_module_keys, resolve_runtime_h, stdlib_rebuild_forced}
@@ -75,7 +75,7 @@ import escape.{ffi_scope_resource_name}
 import check_pipeline.{check_source, run_build_analyses, check_exit_code, check_status_line, build_passed_check}
 import fix_edits.{FixEdit, fix_plan, fix_apply, fix_byte_offset}
 import foreign_decl_probe
-import foreign_const_probe.{ForeignConst, ForeignHeader, ProbeVerdict, foreign_const_header, foreign_consts_in, foreign_headers_in, own_ffi_note, report_header_not_found, is_runtime_lib, report_undeclared_lib, probe_of, probe_verdicts, report_verdicts, text_verdict, triple_of_machine}
+import foreign_const_probe.{ForeignConst, ForeignHeader, ProbeVerdict, ffi_struct_names_in, spelling_probe_of, typedef_names, foreign_const_header, foreign_consts_in, foreign_headers_in, own_ffi_note, report_header_not_found, is_runtime_lib, report_undeclared_lib, probe_of, probe_verdicts, report_verdicts, text_verdict, triple_of_machine}
 import symbol_index.{collect_effects}
 import query.{query_index_source, query_answer}
 import limit_values.{
@@ -1558,6 +1558,7 @@ fn cache_compile_snapshot(out: Str, snap: Str, c_path: Str, snap_dir: Str, debug
     let vendored_dirs = vendored_dirs_in(include_flags)
     let mut flags = cc_opt_flags(debug_mode, release_mode)
     for f in generated_c_flags() { flags.push(f) }
+    for f in defines_in(include_flags) { flags.push(f) }
     let paths = match recorded_paths(debug_mode, path_dirname(c_path), arc_dir) {
         Some(p) => p
         None => return ""
@@ -2185,11 +2186,7 @@ fn check_foreign_consts(foreign: List[ForeignConst], targets: List[Str], used_de
                 return 1
             }
         }
-        let mut inc_flags: List[Str] = []
-        for flag in vendored.split(" ") {
-            if flag.starts_with("-I") { inc_flags.push("-isystem {flag.byte_slice(2, flag.byte_len())}") } else { inc_flags.push(flag) }
-        }
-        let cmd = cc_command("-pedantic-errors -c {dir}/fc_probe.c -o {dir}/fc_probe.o {inc_flags.join(" ")}", 0, 0, target)
+        let cmd = cc_command("-pedantic-errors -c {dir}/fc_probe.c -o {dir}/fc_probe.o {system_includes(vendored)}", 0, 0, target)
         // No shell, or 127: the shell found no C compiler. The program's compile reports both.
         let r = match process.run("sh", ["-c", cmd]) {
             Ok(r) => r
@@ -2212,6 +2209,57 @@ fn check_foreign_consts(foreign: List[ForeignConst], targets: List[Str], used_de
         return 1
     }
     0
+}
+
+// §9.1.3: a mirror's `name` can be a struct tag or a typedef name in its header, and only the
+// target's C compiler can tell which. The program's units spell the original as a macro that
+// is `struct <name>` unless the build defines it first, so this asks the target's C compiler
+// and gives one `-D` flag for each name that is a typedef name and not a struct tag. A probe
+// that cannot run gives none, and the program's compile reports what is wrong.
+fn ffi_struct_defines(headers: List[ForeignHeader], target: Str, vendored: Str, output_path: Str) -> Str ! IO, FS.Read, FS.Write, FS.Delete, Process.Spawn, Env.Read {
+    let names = ffi_struct_names_in(headers)
+    if names.is_empty() { return "" }
+    let mut out_dir = path_dirname(output_path)
+    if out_dir == "" { out_dir = "." }
+    build_fs.reap_dead(out_dir, [".fsprobe"])
+    let dir = build_fs.private_dir(out_dir, ".fsprobe")
+    if dir == "" { return "" }
+    let mut header_names: List[Str] = []
+    for fh in headers { header_names.push(fh.header) }
+    let probe = spelling_probe_of(names, header_names)
+    let file_name = "ffi_struct_probe.c"
+    let mut defines: List[Str] = []
+    if build_fs.write_or_report("{dir}/{file_name}", probe.text) {
+        // The unit compile also reads the stdlib archive's directory. Each mirror that is not
+        // a typedef name has an error, so the probe lifts clang's limit on them. The verdicts
+        // read English diagnostics.
+        let incs = system_includes("-I{resolve_archive_dir()} {vendored}")
+        let cmd = "LC_ALL=C {cc_command("-c{cc_error_limit_flag(target)} {dir}/{file_name} -o {dir}/ffi_struct_probe.o {incs}", 0, 0, target)}"
+        match process.run("sh", ["-c", cmd]) {
+            Ok(r) => {
+                match r.end {
+                    ChildEnd.Exited(0) | ChildEnd.Exited(127) => {}
+                    ChildEnd.Exited(_) => {
+                        for n in typedef_names(names, probe, r.err_out, file_name) { defines.push("-D{c_ffi_struct_macro(n)}={n}") }
+                    }
+                    _ => {}
+                }
+            }
+            Err(_) => {}
+        }
+    }
+    let _ = build_fs.remove_tree(dir)
+    if defines.is_empty() { "" } else { " {defines.join(" ")}" }
+}
+
+// The `-D` flags among include_flags. A define changes the object, so each object key holds
+// them.
+fn defines_in(include_flags: Str) -> List[Str] {
+    let mut out: List[Str] = []
+    for part in include_flags.split(" ") {
+        if part.starts_with("-D") { out.push(part) }
+    }
+    out
 }
 
 // What a build prints on stdout once it links. `blink test --json` and a human `blink run` print
@@ -2307,7 +2355,7 @@ fn do_build(source_path: Str, output_path: Str, c_path: Str, debug_mode: Int, re
             None => return 1
         }
         let inc_flags = match resolve_vendored_includes(used_deps, target) {
-            Some(f) => f
+            Some(f) => "{f}{ffi_struct_defines(compiled.headers, target, f, output_path)}"
             None => return 1
         }
         let lrc = do_link_target(output_path, c_path, c_source, link_flags, obj_files, inc_flags, debug_mode, release_mode, target, compiler_archive, test_build, compiled.ffi_note, link)
@@ -2345,7 +2393,8 @@ fn do_build(source_path: Str, output_path: Str, c_path: Str, debug_mode: Int, re
         }
         let out = "{output_path}-{alias}"
         let _ = fs.delete(out)
-        let lrc = do_link_target(out, c_path, c_source, link_flags, obj_files, inc_flags, debug_mode, release_mode, triple, compiler_archive, test_build, compiled.ffi_note, link)
+        let target_inc_flags = "{inc_flags}{ffi_struct_defines(compiled.headers, triple, inc_flags, output_path)}"
+        let lrc = do_link_target(out, c_path, c_source, link_flags, obj_files, target_inc_flags, debug_mode, release_mode, triple, compiler_archive, test_build, compiled.ffi_note, link)
         if lrc != 0 {
             return lrc
         }
@@ -3138,7 +3187,7 @@ fn link_units_all_targets(source_path: Str, output_path: Str, work: Str, units_d
             None => return 1
         }
         let inc_flags = match resolve_vendored_includes(used_deps, target) {
-            Some(f) => f
+            Some(f) => "{f}{ffi_struct_defines(headers, target, f, output_path)}"
             None => return 1
         }
         let lrc = link_units(output_path, work, units_dir, units, shas, link_flags, obj_files, inc_flags, debug_mode, release_mode, target, unit_jobs, test_build, ffi_note, link)
@@ -3175,7 +3224,8 @@ fn link_units_all_targets(source_path: Str, output_path: Str, work: Str, units_d
         }
         let out = "{output_path}-{alias}"
         let _ = fs.delete(out)
-        let lrc = link_units(out, work, units_dir, units, shas, link_flags, obj_files, inc_flags, debug_mode, release_mode, triple, unit_jobs, test_build, ffi_note, link)
+        let target_inc_flags = "{inc_flags}{ffi_struct_defines(headers, triple, inc_flags, output_path)}"
+        let lrc = link_units(out, work, units_dir, units, shas, link_flags, obj_files, target_inc_flags, debug_mode, release_mode, triple, unit_jobs, test_build, ffi_note, link)
         if lrc != 0 {
             return lrc
         }
@@ -3444,6 +3494,22 @@ fn cc_is_clang() -> Bool ! IO, Process.Spawn {
     process_cc_id("").contains("clang")
 }
 
+// clang, and so zig cc for each target, stops after 20 errors by default. gcc has no such
+// limit and rejects the flag.
+fn cc_error_limit_flag(target: Str) -> Str ! IO, Process.Spawn {
+    if target != "" || cc_is_clang() { " -ferror-limit=0" } else { "" }
+}
+
+// A probe reads the dependency headers as system headers: the unit compile is not pedantic,
+// so a C extension that it accepts in them must be no error in the probe.
+fn system_includes(flags: Str) -> Str {
+    let mut out: List[Str] = []
+    for flag in flags.split(" ") {
+        if flag.starts_with("-I") { out.push("-isystem {flag.byte_slice(2, flag.byte_len())}") } else { out.push(flag) }
+    }
+    out.join(" ")
+}
+
 // The flags that drop each guarded foreign prototype in the C file `c_file` whose symbol a
 // header the file reads already declares, for its compile for `target`, or "" for none
 // (§9.1). A C file that guards no prototype runs no probe. The flags are a function of the
@@ -3458,9 +3524,8 @@ fn declared_guard_flags(c_file: Str, target: Str, includes: Str, debug_mode: Int
         let mut code = -1
         let text = foreign_decl_probe.probe_text(c_text, symbols)
         if fs.write(probe, text).is_ok() {
-            // clang stops after 20 errors by default, and a probe that stops declares nothing.
-            // gcc has no such limit and rejects the flag.
-            let limit = if target != "" || cc_is_clang() { " -ferror-limit=0" } else { "" }
+            // A probe that stops at clang's error limit declares nothing.
+            let limit = cc_error_limit_flag(target)
             // clang knows a library function such as cos with no header read, and that is not
             // a declaration the unit can call through. The probe reads English diagnostics.
             let cmd = "LC_ALL=C {cc_command("-c {unit_cc_flags().join(" ")}{limit} -fno-builtin -x c {probe} -o {probe}.o {includes}", debug_mode, release_mode, target)}"
@@ -3517,7 +3582,9 @@ fn link_units(out: Str, work: Str, units_dir: Str, units: List[emit_record.Emitt
         }
         match (vendored_headers, recorded_paths(debug_mode, units_dir, arc_dir)) {
             (Some(lines), Some(paths)) => {
-                keys = build_objcache.unit_keys_with_headers(shas.unwrap(), modules, unit_headers, arc_dir, lines, process_compiler_sha(), process_cc_id(target), unit_key_flags(debug_mode, release_mode), target, paths)
+                let mut key_flags = unit_key_flags(debug_mode, release_mode)
+                for f in defines_in(include_flags) { key_flags.push(f) }
+                keys = build_objcache.unit_keys_with_headers(shas.unwrap(), modules, unit_headers, arc_dir, lines, process_compiler_sha(), process_cc_id(target), key_flags, target, paths)
             }
             _ => {}
         }

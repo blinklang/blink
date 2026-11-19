@@ -1,0 +1,88 @@
+// A header can declare an @ffi.struct mirror's name as a struct tag, as a typedef name, or
+// as both. The build asks the target's C compiler with two probe lines per name, and reads
+// its errors back: only a name whose tag line fails and whose typedef line compiles is a
+// typedef name. The tag wins when both compile, and a name for which neither compiles keeps
+// the default spelling.
+
+import cname.{is_c_identifier}
+import foreign_const_probe.{spelling_probe_of, typedef_names}
+
+fn names() -> List[Str] {
+    ["tag_only", "typedef_only", "both", "neither"]
+}
+
+fn headers() -> List[Str] {
+    ["stdlib.h", "a.h", "stdlib.h", "b.h"]
+}
+
+fn line_of(text: Str, n: Int) -> Str {
+    text.split("\n").get(n - 1) ?? ""
+}
+
+test "the probe has a tag line and a typedef line per name, after the headers" {
+    let p = spelling_probe_of(names(), headers())
+    assert(p.text.contains("#include <stdlib.h>\n"))
+    assert(line_of(p.text, p.first_line).contains("sizeof(struct tag_only)"))
+    assert(line_of(p.text, p.first_line + 1).contains("typedef tag_only "))
+    assert(line_of(p.text, p.first_line + 6).contains("sizeof(struct neither)"))
+    assert(line_of(p.text, p.first_line + 7).contains("typedef neither "))
+}
+
+test "a header named twice is included once" {
+    let p = spelling_probe_of(names(), headers())
+    assert(p.text.split("#include <stdlib.h>").len() == 2)
+}
+
+// Two mirrors of one name can name two headers, and only one of them may declare it.
+test "the probe reads every header in order" {
+    let p = spelling_probe_of(["div_t"], ["a.h", "stdlib.h", "b.h"])
+    let want = "#include <a.h>\n#endif\n#if __has_include(<stdlib.h>)\n#include <stdlib.h>\n#endif\n#if __has_include(<b.h>)\n#include <b.h>\n"
+    assert(p.text.contains(want), "got: {p.text}")
+}
+
+test "only a name whose tag line fails and whose typedef line compiles is a typedef name" {
+    let p = spelling_probe_of(names(), headers())
+    let f = p.first_line
+    let err = [
+        "/tmp/x/ffi_struct_probe.c:{f + 1}:9: error: unknown type name 'tag_only'",
+        "/tmp/x/ffi_struct_probe.c:{f + 2}:30: error: invalid application of 'sizeof' to incomplete type 'struct typedef_only'",
+        "/tmp/x/ffi_struct_probe.c:{f + 6}:30: error: invalid application of 'sizeof' to incomplete type 'struct neither'",
+        "/tmp/x/ffi_struct_probe.c:{f + 7}:9: error: unknown type name 'neither'",
+    ].join("\n")
+    let got = typedef_names(names(), p, err, "ffi_struct_probe.c")
+    assert_eq(got.len(), 1)
+    assert_eq(got.get(0) ?? "", "typedef_only")
+}
+
+test "an error in a header or in another file names no probe line" {
+    let p = spelling_probe_of(names(), headers())
+    let f = p.first_line
+    let err = [
+        "/usr/include/stdlib.h:{f + 2}:1: error: something in the header",
+        "/tmp/x/other_probe.c:{f + 2}:1: error: something in another file",
+    ].join("\n")
+    assert(typedef_names(names(), p, err, "ffi_struct_probe.c").is_empty())
+}
+
+// A compile that stopped at its error limit did not read the later lines, and a line it
+// did not read looks as if it compiled.
+test "a compile that stopped at its error limit answers no typedef name" {
+    let p = spelling_probe_of(names(), headers())
+    let f = p.first_line
+    let err = [
+        "/tmp/x/ffi_struct_probe.c:{f + 2}:30: error: invalid application of 'sizeof' to incomplete type 'struct typedef_only'",
+        "fatal error: too many errors emitted, stopping now [-ferror-limit=]",
+    ].join("\n")
+    assert(typedef_names(names(), p, err, "ffi_struct_probe.c").is_empty())
+}
+
+// Only a C identifier can be a macro name or a typedef name, so only such a name gets a probe
+// line and a BLINK_FFI_STRUCT_ macro.
+test "only a C identifier gets a spelling macro" {
+    assert(is_c_identifier("div_t"))
+    assert(is_c_identifier("_Tag9"))
+    assert(!is_c_identifier(""))
+    assert(!is_c_identifier("9lives"))
+    assert(!is_c_identifier("struct div_t"))
+    assert(!is_c_identifier("a-b"))
+}
