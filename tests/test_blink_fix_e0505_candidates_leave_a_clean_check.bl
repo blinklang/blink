@@ -224,17 +224,19 @@ test "a function named random gets help with an alias and no fix" {
 
 let MIXED = "fn top(deck: List[Int]) -> Option[Int] ! Rand \{\n    rand.choice(deck)\n}\n\n{LOCAL_RANDOM}{MAIN}"
 
-// One fix adds `import std.random` and the other `import std.random.{shuffle}`, both at the top
-// of the file. `blink fix` applies neither of two different edits at one place.
-test "blink fix applies neither fix when one adds the whole import and one imports by name" {
-    let dir = package("mixed", MIXED, [])
-    let fix = blink_in(dir, "fix src/deal.bl")
-    let fixed = fix.out.concat(fix.err_out)
-    let got = fs.read("{dir}/src/deal.bl").unwrap()
-    let good = got == MIXED && fixed.contains("0 fix(es) applied, 2 diagnostic(s) left") && fixed.contains("its fix overlaps the different fix of the error at src/deal.bl:8:5") && fixed.contains("its fix overlaps the different fix of the error at src/deal.bl:2:5")
-    if !good { io.eprintln("got file:\n{got}\nfix:\n{fixed}") }
-    assert(good)
-    let _ = sh("rm -rf {dir}")
+// Without the merge, one fix would add `import std.random` and the other
+// `import std.random.{shuffle}`, both at the top of the file, and `blink fix` applies each insert
+// at one place. The import by name binds `random` too, so both fixes carry that one import.
+test "blink fix adds one import when one call goes through random and one imports by name" {
+    let top = "fn top(deck: List[Int]) -> Option[Int] ! Rand \{\n    random.choice(deck)\n}\n\n"
+    fix_then_check("mixed", MIXED, [], "import std.random.\{shuffle}\n\n{top}{LOCAL_RANDOM_FIXED}{MAIN}", 2)
+}
+
+test "two helpers that local randoms hide get both names in an empty import list" {
+    let pick = "fn pick(deck: List[Int]) -> Option[Int] ! Rand \{\n    let random = 7\n    if random > 9 \{ return None }\n    rand.choice(deck)\n}\n"
+    let picked = "fn pick(deck: List[Int]) -> Option[Int] ! Rand \{\n    let random = 7\n    if random > 9 \{ return None }\n    choice(deck)\n}\n"
+    let src = "import std.random.\{}\n\n{LOCAL_RANDOM}\n{pick}{MAIN}"
+    fix_then_check("empty_list", src, [], "import std.random.\{choice, shuffle}\n\n{LOCAL_RANDOM_FIXED}\n{picked}{MAIN}", 2)
 }
 
 fn lsp_msg(body: Str) -> Str {
@@ -245,7 +247,7 @@ fn code_action(id: Int, td: Str, line: Int) -> Str {
     lsp_msg("\{\"jsonrpc\":\"2.0\",\"id\":{id},\"method\":\"textDocument/codeAction\",\"params\":\{{td},\"range\":\{\"start\":\{\"line\":{line},\"character\":4},\"end\":\{\"line\":{line},\"character\":4}},\"context\":\{\"diagnostics\":[]}}}")
 }
 
-test "the LSP offers each fix of the two alone" {
+test "the LSP offers each fix of the two alone, each with the one import" {
     let dir = sh("mktemp -d /tmp/blink_e0505_mixed_lsp.XXXXXX").out.trim()
     fs.write("{dir}/deal.bl", MIXED).unwrap()
     let uri = "file://{dir}/deal.bl"
@@ -261,7 +263,7 @@ test "the LSP offers each fix of the two alone" {
     ].join("")
     fs.write("{dir}/input.bin", input).unwrap()
     let r = sh("B=$(pwd)/build/blink; cd {dir} && timeout 60 $B lsp < input.bin")
-    let top = "\"title\":\"add `import std.random` and call\",\"kind\":\"quickfix\",\"edit\":\{\"changes\":\{\"{uri}\":[".concat(#"{"range":{"start":{"line":1,"character":4},"end":{"line":1,"character":21}},"newText":"random.choice(deck)"},{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":0}},"newText":"import std.random\n\n"}]}}}"#)
+    let top = "\"title\":\"add `import std.random.\{shuffle}` and call\",\"kind\":\"quickfix\",\"edit\":\{\"changes\":\{\"{uri}\":[".concat(#"{"range":{"start":{"line":1,"character":4},"end":{"line":1,"character":21}},"newText":"random.choice(deck)"},{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":0}},"newText":"import std.random.{shuffle}\n\n"}]}}}"#)
     let deal = "\"title\":\"add `import std.random.\{shuffle}` and call\",\"kind\":\"quickfix\",\"edit\":\{\"changes\":\{\"{uri}\":[".concat(#"{"range":{"start":{"line":7,"character":4},"end":{"line":7,"character":22}},"newText":"shuffle(deck)"},{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":0}},"newText":"import std.random.{shuffle}\n\n"}]}}}"#)
     let good = r.out.contains(top) && r.out.contains(deal)
     if !good { io.eprintln("want:\n{top}\n{deal}\nstdout:\n{r.out}\nstderr:\n{r.err_out}") }

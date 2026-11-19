@@ -3,13 +3,15 @@
 // §3.6 *Mutable Parameters*). A parameter holds the callee's own copy, so the write never
 // reaches the caller. A bare name and a field path share one check, with or without `mut`,
 // for every kind of parameter. A `Ptr` step comes first (E0611), and a `let` that shadows the
-// parameter is judged as a `let`. ParamAssign ships first as a warning (§3.6 *Rollout*), so
-// check and build both pass and the program still runs.
+// parameter is judged as a `let`. Before 1.0 ParamAssign is an error in the first release that
+// has it (§3.6 *Rollout*, sections/06_tooling.md §8.16.1), so check and build both refuse it.
 
 import std.fs
 import compiler.{compile_to_program}
 import typecheck.{check_types, TypeCheck}
-import diagnostics.{diag_entries, diag_reset, Diag}
+import diagnostics.{diag_entries, diag_reset, diag_fix_edits, Diag}
+import fix_edits.{FixEdit, fix_plan, fix_apply, fix_byte_offset}
+import std.process.{ProcessResult, ChildEnd}
 import compile_test_helpers
 import std.io
 import lexer.{Lex}
@@ -38,6 +40,7 @@ fn entries() -> List[Str] {
 fn show(label: Str) ! IO.Print {
     io.println("FAIL: {label}: got:")
     for e in entries() { io.println("  {e}") }
+    for d in diag_entries { io.println("  span {d.name} {d.line}:{d.col}-{d.end_col}") }
 }
 
 fn error_count() -> Int {
@@ -56,19 +59,24 @@ fn param_assign_count() -> Int {
     n
 }
 
-// One ParamAssign, a warning at line:col, with the spec's text, help and note, no fix, and
-// no error beside it.
-fn expect_e0612(label: Str, line: Int, col: Int, name: Str, copy: Str) ! IO.Print {
-    let mut ok = param_assign_count() == 1 && error_count() == 0
+let NOTE = "a write to a parameter changes only this function's copy"
+let FIELD_NOTE = "a write to a parameter changes only this function's copy; to give the caller the new value, return it"
+let SELF_HELP = "build a new value and return it"
+
+fn shadow_help(name: Str) -> Str { "shadow it at the top of the body: `let mut {name} = {name}`" }
+
+// One ParamAssign and no other error: an error at line:col..end_col, under the whole target,
+// with the spec's message, label, help and note.
+fn expect_e0612(label: Str, line: Int, col: Int, end_col: Int, name: Str, help: Str, note: Str) ! IO.Print {
+    let mut ok = param_assign_count() == 1 && error_count() == 1
     for d in diag_entries {
         if d.name == "ParamAssign" {
-            if d.severity != "warning" || d.code != "E0612" { ok = false }
+            if d.severity != "error" || d.code != "E0612" { ok = false }
             if d.message != "cannot assign to parameter `{name}`" { ok = false }
-            if d.line != line || d.col != col { ok = false }
+            if d.line != line || d.col != col || d.end_col != end_col { ok = false }
             if d.label != "`{name}` is a parameter" { ok = false }
-            if d.help != "copy it to a new name: `let mut {copy} = {name}`" { ok = false }
-            if !d.notes.contains("a write to a parameter changes only this function's copy") { ok = false }
-            if d.fix_action != "" || d.fix_text != "" { ok = false }
+            if d.help != help { ok = false }
+            if d.notes != [note] { ok = false }
         }
     }
     if !ok { show(label) }
@@ -102,7 +110,7 @@ fn main() {
     let _ = c.step()
 }
 "#)
-    expect_e0612("self.at", 11, 9, "self", "x")
+    expect_e0612("self.at", 11, 9, 16, "self", SELF_HELP, FIELD_NOTE)
 }
 
 test "a field write to a plain parameter is E0612" {
@@ -115,7 +123,7 @@ fn bump(c: Counter) {
 
 fn main() { bump(Counter { at: 0 }) }
 "#)
-    expect_e0612("c.at", 5, 5, "c", "x")
+    expect_e0612("c.at", 5, 5, 9, "c", shadow_help("c"), FIELD_NOTE)
 }
 
 test "a nested field, a tuple field and a compound write to a parameter are E0612" {
@@ -129,7 +137,7 @@ fn deep(c: Counter) {
 
 fn main() { deep(Counter { inner: Inner { v: 0 } }) }
 "#)
-    expect_e0612("c.inner.v", 6, 5, "c", "x")
+    expect_e0612("c.inner.v", 6, 5, 14, "c", shadow_help("c"), FIELD_NOTE)
     probe("build/param_assign_tuple.bl", #"
 type Counter { pair: (Int, Int) }
 
@@ -139,7 +147,7 @@ fn tup(c: Counter) {
 
 fn main() { tup(Counter { pair: (0, 0) }) }
 "#)
-    expect_e0612("c.pair.0", 5, 5, "c", "x")
+    expect_e0612("c.pair.0", 5, 5, 13, "c", shadow_help("c"), FIELD_NOTE)
     probe("build/param_assign_compound.bl", #"
 type Counter { at: Int }
 
@@ -149,10 +157,10 @@ fn comp(c: Counter) {
 
 fn main() { comp(Counter { at: 0 }) }
 "#)
-    expect_e0612("c.at += 1", 5, 5, "c", "x")
+    expect_e0612("c.at += 1", 5, 5, 9, "c", shadow_help("c"), FIELD_NOTE)
 }
 
-test "a bare write to a parameter is E0612, and the copy's name is not one in scope" {
+test "a bare write and a compound write to a parameter are E0612, and the help keeps the name" {
     probe("build/param_assign_bare.bl", #"
 fn bump(a: Int, b: Int) -> Int {
     a = b
@@ -161,7 +169,7 @@ fn bump(a: Int, b: Int) -> Int {
 
 fn main() { let _ = bump(1, 2) }
 "#)
-    expect_e0612("a = b", 3, 5, "a", "x")
+    expect_e0612("a = b", 3, 5, 6, "a", shadow_help("a"), NOTE)
     probe("build/param_assign_bare_x.bl", #"
 fn bump(x: Int) -> Int {
     x += 1
@@ -170,7 +178,7 @@ fn bump(x: Int) -> Int {
 
 fn main() { let _ = bump(1) }
 "#)
-    expect_e0612("x += 1", 3, 5, "x", "x_1")
+    expect_e0612("x += 1", 3, 5, 6, "x", shadow_help("x"), NOTE)
 }
 
 test "a mut parameter and mut self are still E0612" {
@@ -183,7 +191,7 @@ fn reset(mut c: Counter) {
 
 fn main() { reset(Counter { at: 1 }) }
 "#)
-    expect_e0612("mut c", 5, 5, "c", "x")
+    expect_e0612("mut c", 5, 5, 9, "c", shadow_help("c"), FIELD_NOTE)
     probe("build/param_assign_mut_self.bl", #"
 type Counter { at: Int }
 
@@ -202,7 +210,7 @@ fn main() {
     c.reset()
 }
 "#)
-    expect_e0612("mut self", 10, 9, "self", "x")
+    expect_e0612("mut self", 10, 9, 16, "self", SELF_HELP, FIELD_NOTE)
 }
 
 test "a closure parameter, and a parameter a closure captures, are E0612" {
@@ -214,7 +222,7 @@ fn main() {
     f(Counter { at: 0 })
 }
 "#)
-    expect_e0612("closure param", 5, 30, "k", "x")
+    expect_e0612("closure param", 5, 30, 34, "k", shadow_help("k"), FIELD_NOTE)
     probe("build/param_assign_captured.bl", #"
 type Counter { at: Int }
 
@@ -225,7 +233,7 @@ fn outer(c: Counter) {
 
 fn main() { outer(Counter { at: 0 }) }
 "#)
-    expect_e0612("captured param", 5, 20, "c", "x")
+    expect_e0612("captured param", 5, 20, 24, "c", shadow_help("c"), FIELD_NOTE)
 }
 
 test "a parameter of a handler method is E0612" {
@@ -243,7 +251,7 @@ fn make() -> Handler[IO] {
 
 fn main() { let _ = make() }
 "#)
-    expect_e0612("handler param", 7, 13, "msg", "x")
+    expect_e0612("handler param", 7, 13, 16, "msg", shadow_help("msg"), NOTE)
 }
 
 test "a parameter of a generic fn and of a trait default method is E0612" {
@@ -255,7 +263,7 @@ fn pick[T](t: T, u: T) -> T {
 
 fn main() { let _ = pick(1, 2) }
 "#)
-    expect_e0612("generic param", 3, 5, "t", "x")
+    expect_e0612("generic param", 3, 5, 6, "t", shadow_help("t"), NOTE)
     probe("build/param_assign_default.bl", #"
 trait Doubler {
     fn dbl(self, n: Int) -> Int {
@@ -266,7 +274,7 @@ trait Doubler {
 
 fn main() { }
 "#)
-    expect_e0612("trait default param", 4, 9, "n", "x")
+    expect_e0612("trait default param", 4, 9, 10, "n", shadow_help("n"), NOTE)
 }
 
 test "a let that shadows a parameter is judged as a let" {
@@ -348,20 +356,371 @@ fn main() { }
 
 let MVCE = "trait Advance \{\n    fn step(self) -> Int\n}\n\ntype Counter \{ at: Int }\n\nimpl Advance for Counter \{\n    fn step(self) -> Int \{\n        let v = self.at\n        self.at = self.at + 1\n        v\n    }\n}\n\nfn main() \{\n    let c = Counter \{ at: 0 }\n    let a = c.step()\n    let b = c.step()\n    io.println(\"a=\{a} b=\{b}\")\n}\n"
 
-test "check and build both warn and pass, and the write stays in the callee" {
+// The JSON line that names E0612 with each `"file":"..."` taken out, since check and build
+// write the source to different paths. "" when no line names E0612.
+fn e0612_line(out: Str) -> Str {
+    for line in out.split("\n") {
+        if line.contains("\"code\":\"E0612\"") {
+            let mut rest = line
+            let mut kept = ""
+            while rest.contains("\"file\":\"") {
+                let at = rest.byte_index_of("\"file\":\"", 0).unwrap()
+                kept = kept.concat(rest.byte_slice(0, at))
+                let after = rest.byte_slice(at + 8, rest.byte_len())
+                let close = after.byte_index_of("\"", 0) ?? after.byte_len()
+                rest = after.byte_slice(close + 1, after.byte_len())
+            }
+            return kept.concat(rest)
+        }
+    }
+    ""
+}
+
+// §3.6 *Rollout*: before 1.0 there is no warning release, so check and build give the same
+// error and the build stops before code generation.
+test "check and build both report E0612 as an error" {
     let chk = compile_test_helpers.check_via_cli(MVCE, "param_assign_check")
-    compile_test_helpers.expect_warning(chk, "E0612", "check warns E0612")
-    compile_test_helpers.expect_compiles_clean(chk, "check has no error")
     let built = compile_test_helpers.compile_and_capture(MVCE, "param_assign_build")
-    compile_test_helpers.expect_warning(built, "E0612", "build warns E0612")
-    compile_test_helpers.expect_compiles_clean(built, "build has no error")
+    let chk_line = e0612_line(chk)
+    let ok = chk_line.contains("\"severity\":\"error\"") && chk_line == e0612_line(built)
+    if !ok { io.println("FAIL: check: {chk}\nbuild: {built}") }
+    assert(ok)
     let no_ice = !built.contains("\"severity\":\"ice\"")
     if !no_ice { io.println("FAIL: build ICE: {built}") }
     assert(no_ice)
-    let run = compile_test_helpers.compile_and_run(MVCE, "param_assign_run")
-    let ran = run.exit_code == 0 && run.out.contains("a=0 b=0")
-    if !ran { io.println("FAIL: run: exit {run.exit_code} out {run.out} err {run.err_out}") }
-    assert(ran)
+}
+
+// Lowering cannot build a closure that captures a parameter the body then writes, so check
+// must stop the write first.
+test "a write to a parameter that a closure captures is E0612 at check" {
+    probe("build/param_assign_captured_then_written.bl", #"
+fn f(mut a: Int) -> Int {
+    let g = fn() -> Int { a }
+    a = 5
+    g()
+}
+
+fn main() { let _ = f(1) }
+"#)
+    expect_e0612("captured then written", 4, 5, 6, "a", shadow_help("a"), NOTE)
+}
+
+// A write inside assert_panics to a closure's own parameter is a write to a parameter like any
+// other: check stops it before lowering.
+test "a write to a parameter inside assert_panics is E0612" {
+    probe("build/param_assign_in_assert_panics.bl", #"
+fn boom() -> Int {
+    let r: Result[Int, Str] = Err("b")
+    r.unwrap()
+}
+
+test "t" {
+    let f = fn(mut mq: Int) -> Int {
+        assert_panics {
+            mq = 9
+            let _ = boom()
+        }
+        mq
+    }
+    assert_eq(f(0), 9)
+}
+"#)
+    expect_e0612("assert_panics int", 10, 13, 15, "mq", shadow_help("mq"), NOTE)
+    probe("build/param_assign_in_assert_panics_ptr.bl", #"
+fn boom() -> Int {
+    let r: Result[Int, Str] = Err("b")
+    r.unwrap()
+}
+
+test "t" {
+    let mut b = Bytes.new()
+    b.push(1)
+    let r = b.with_ptr(fn(mut wp) {
+        assert_panics {
+            wp = wp
+            let _ = boom()
+        }
+        wp.is_null()
+    })
+    assert_eq(r, false)
+}
+"#)
+    expect_e0612("assert_panics ptr", 12, 13, 15, "wp", shadow_help("wp"), NOTE)
+}
+
+// §3.6: in `Scoped.enter()` a local copy never reaches `exit()`, so the note and help say to
+// build the value in the `with` item.
+test "a field write to self in Scoped.enter() gets the with-item help" {
+    probe("build/param_assign_scoped_enter.bl", #"
+type Timer { start: Int }
+
+impl BlockHandler for Timer {
+    type Context = Int
+    fn enter(self) -> Int {
+        self.start = 5
+        self.start
+    }
+    fn exit(self, ok: Bool) { }
+}
+
+fn main() {
+    with Timer { start: 0 } as t {
+        let _ = t
+    }
+}
+"#)
+    expect_e0612("Scoped.enter", 7, 9, 19, "self", "set `start` when the value is built, and build it in the `with` item (§4.7.2)", "`exit()` receives the value the `with` item built, not this copy")
+    assert_eq(fix_actions(), [""])
+}
+
+// §3.6 *The fix*: `src` after `blink fix` applies the fix of every E0612 of the last probe, the
+// way cmd_fix plans and applies them (§8.6).
+fn fixed(label: Str, src: Str) -> Str ! IO.Print {
+    let mut edits: List[FixEdit] = []
+    let mut i = 0
+    for d in diag_entries {
+        if d.code == "E0612" {
+            for e in diag_fix_edits(d) {
+                edits.push(FixEdit { file: "a.bl", start: fix_byte_offset(src, e.line, e.col), end: fix_byte_offset(src, e.end_line, e.end_col), text: e.text, diag: i, rank: e.rank })
+            }
+        }
+        i = i + 1
+    }
+    let plan = fix_plan(edits)
+    if plan.conflicts.len() != 0 { show(label) }
+    assert_eq(plan.conflicts.len(), 0)
+    fix_apply(src, plan.applied)
+}
+
+// The fixed text is `want`, and it checks with no error and no W0603.
+fn expect_fixed(label: Str, path: Str, src: Str, want: Str) ! FS, Env.Exit, Env.Read, IO {
+    probe(path, src)
+    let got = fixed(label, src)
+    if got != want { io.println("FAIL: {label}: fixed text:\n{got}\nwant:\n{want}") }
+    assert_eq(got, want)
+    probe(path, got)
+    let mut ok = error_count() == 0
+    for d in diag_entries {
+        if d.code == "W0603" { ok = false }
+    }
+    if !ok { show("{label} after the fix") }
+    assert(ok)
+}
+
+// The fix action of each ParamAssign of the last probe, "" for one with no fix.
+fn fix_actions() -> List[Str] {
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.code == "E0612" { out.push(d.fix_action) }
+    }
+    out
+}
+
+let GCD = #"
+fn gcd(a: Int, b: Int) -> Int {
+    while b != 0 {
+        let t = b
+        b = a % b
+        a = t
+    }
+    a
+}
+
+fn main() { let _ = gcd(12, 18) }
+"#
+
+let GCD_FIXED = #"
+fn gcd(a: Int, b: Int) -> Int {
+    let mut a = a
+    let mut b = b
+    while b != 0 {
+        let t = b
+        b = a % b
+        a = t
+    }
+    a
+}
+
+fn main() { let _ = gcd(12, 18) }
+"#
+
+// `b` is written first, yet `a` gets its line first: two lines at one place come in parameter
+// order, never in the order of the diagnostics.
+test "the fix copies each written parameter once, in parameter order" {
+    expect_fixed("gcd", "build/param_assign_fix_gcd.bl", GCD, GCD_FIXED)
+    probe("build/param_assign_fix_gcd.bl", GCD)
+    assert_eq(fix_actions(), ["shadow `b` at the top of the body", "shadow `a` at the top of the body"])
+}
+
+test "the fix for a field write copies the parameter, and a body on one line keeps its column" {
+    expect_fixed("field", "build/param_assign_fix_field.bl", #"
+type Counter { at: Int }
+
+fn bump(c: Counter) -> Counter {
+    c.at = c.at + 1
+    c
+}
+
+fn reset(c: Counter) { c.at = 0 }
+
+fn main() {
+    let _ = bump(Counter { at: 0 })
+    reset(Counter { at: 0 })
+}
+"#, #"
+type Counter { at: Int }
+
+fn bump(c: Counter) -> Counter {
+    let mut c = c
+    c.at = c.at + 1
+    c
+}
+
+fn reset(c: Counter) { let mut c = c
+                       c.at = 0 }
+
+fn main() {
+    let _ = bump(Counter { at: 0 })
+    reset(Counter { at: 0 })
+}
+"#)
+}
+
+test "the fix for a closure's own parameter goes in the closure body, for an outer one in the function body" {
+    expect_fixed("closure", "build/param_assign_fix_closure.bl", #"
+fn run(base: Int) -> Int {
+    let add = fn(step: Int) -> Int {
+        step = step + base
+        step
+    }
+    add(1)
+}
+
+fn count(n: Int) -> Int {
+    let bump = fn() { n = n + 1 }
+    bump()
+    n
+}
+
+fn main() {
+    let _ = run(1)
+    let _ = count(1)
+}
+"#, #"
+fn run(base: Int) -> Int {
+    let add = fn(step: Int) -> Int {
+        let mut step = step
+        step = step + base
+        step
+    }
+    add(1)
+}
+
+fn count(n: Int) -> Int {
+    let mut n = n
+    let bump = fn() { n = n + 1 }
+    bump()
+    n
+}
+
+fn main() {
+    let _ = run(1)
+    let _ = count(1)
+}
+"#)
+}
+
+// The parser puts a binary operation at its operator, so the place of the copy comes from the
+// text after `{`: here the operator is on the second line of the first statement.
+test "the copy goes above the first line of the body, past a comment and a blank line" {
+    expect_fixed("first line", "build/param_assign_fix_first_line.bl", #"
+fn same(n: Int) -> Bool { true }
+
+fn twice(n: Int) -> Int {
+    same(n) ==
+        same(n)
+    n = n * 2
+    n
+}
+
+fn halve(n: Int) -> Int { // the comment stays on the line of `{`
+
+	n = n / 2
+	n
+}
+
+fn main() {
+    let _ = twice(1)
+    let _ = halve(4)
+}
+"#, #"
+fn same(n: Int) -> Bool { true }
+
+fn twice(n: Int) -> Int {
+    let mut n = n
+    same(n) ==
+        same(n)
+    n = n * 2
+    n
+}
+
+fn halve(n: Int) -> Int { // the comment stays on the line of `{`
+	let mut n = n
+
+	n = n / 2
+	n
+}
+
+fn main() {
+    let _ = twice(1)
+    let _ = halve(4)
+}
+"#)
+}
+
+// `self` is no legal `let` name, and in `Scoped.enter()` a copy never reaches `exit()`, so
+// neither gets the fix.
+test "a write to self or a field of self has help and no fix" {
+    probe("build/param_assign_self_no_fix.bl", MVCE)
+    assert_eq(fix_actions(), [""])
+    probe("build/param_assign_self_bare_no_fix.bl", #"
+type Counter { at: Int }
+
+trait Reset {
+    fn reset(self) -> Counter
+}
+
+impl Reset for Counter {
+    fn reset(self) -> Counter {
+        self = Counter { at: 0 }
+        self
+    }
+}
+
+fn main() {
+    let c = Counter { at: 1 }
+    let _ = c.reset()
+}
+"#)
+    assert_eq(fix_actions(), [""])
+}
+
+fn sh(cmd: Str) -> ProcessResult ! Process.Spawn {
+    process.run("sh", ["-c", cmd]).unwrap()
+}
+
+test "blink fix writes the copies, and the fixed file checks clean with no W0603" {
+    let dir = sh("mktemp -d /tmp/blink_fix_e0612.XXXXXX").out.trim()
+    fs.write("{dir}/gcd.bl", GCD).unwrap()
+    let fix = sh("B=$(pwd)/build/blink; cd {dir} && timeout 120 $B fix gcd.bl")
+    let after = fs.read("{dir}/gcd.bl").unwrap()
+    if after != GCD_FIXED { io.println("FAIL: blink fix: {fix.out}{fix.err_out}\ngot:\n{after}") }
+    assert_eq(after, GCD_FIXED)
+    let chk = sh("B=$(pwd)/build/blink; cd {dir} && timeout 120 $B check gcd.bl")
+    let clean = chk.end == ChildEnd.Exited(0) && !chk.out.contains("W0603") && !chk.err_out.contains("ShadowedVariable")
+    if !clean { io.println("FAIL: check after fix: {chk.out}{chk.err_out}") }
+    assert(clean)
+    let _ = sh("rm -rf {dir}")
 }
 
 test "E0612 has a catalog entry and explain text" {

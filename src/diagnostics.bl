@@ -519,12 +519,14 @@ pub const VARIANT_FIELD_DEFAULT_HELP = "remove `=` and the value; a variant lite
 // ── Diagnostic struct ────────────────────────────────────────────────
 
 // One more edit of a fix, in the diagnostic's file. A fix applies all its edits or none.
+// `rank` orders inserts at one place from different fixes, lowest first (§8.6).
 pub type DiagFixEdit {
     line: Int
     col: Int
     end_line: Int
     end_col: Int
     text: Str
+    rank: Int = 0
 }
 
 // The JSON keys of an edge, which the spec fixes per error: `decl`, `param`, `becomes` for an
@@ -568,6 +570,8 @@ pub type DiagEntry {
     // The edits of the fix after the one above, such as the import that a rewritten call
     // needs. Only a fix with its own span has them.
     fix_more: List[DiagFixEdit] = []
+    // The rank of the fix's own edit, as DiagFixEdit.rank.
+    fix_rank: Int = 0
     notes: List[Str]
     // The chain of an instance error (§3.4), for the `--json` form.
     edges: List[DiagEdge] = []
@@ -874,7 +878,7 @@ pub fn diag_set_last_fix_at(action: Str, text: Str, line: Int, col: Int, end_lin
         let d = diag_entries.get(idx).unwrap()
         diag_entries.set(idx, DiagEntry {
             fix_action: action, fix_text: text,
-            fix_line: line, fix_col: col, fix_end_line: end_line, fix_end_col: end_col, fix_more: [],
+            fix_line: line, fix_col: col, fix_end_line: end_line, fix_end_col: end_col, fix_more: [], fix_rank: 0,
             ..d
         })
     }
@@ -891,6 +895,14 @@ pub fn diag_add_last_fix_edit(line: Int, col: Int, end_line: Int, end_col: Int, 
     diag_entries.set(idx, DiagEntry { fix_more: more, ..d })
 }
 
+// Sets the rank of the last diagnostic's own fix edit.
+pub fn diag_set_last_fix_rank(rank: Int) {
+    let idx = diag_entries.len() - 1
+    if idx < 0 { return }
+    let d = diag_entries.get(idx).unwrap()
+    diag_entries.set(idx, DiagEntry { fix_rank: rank, ..d })
+}
+
 // Sets the action of the fix of diagnostic `idx`, and the edits it makes after its own.
 pub fn diag_set_fix_edits_at(idx: Int, action: Str, more: List[DiagFixEdit]) {
     match diag_entries.get(idx) {
@@ -903,7 +915,7 @@ pub fn diag_set_fix_edits_at(idx: Int, action: Str, more: List[DiagFixEdit]) {
 // span of its own.
 pub fn diag_fix_edits(d: DiagEntry) -> List[DiagFixEdit] {
     if d.fix_action == "" || d.fix_line == 0 { return [] }
-    let mut out = [DiagFixEdit { line: d.fix_line, col: d.fix_col, end_line: d.fix_end_line, end_col: d.fix_end_col, text: d.fix_text }]
+    let mut out = [DiagFixEdit { line: d.fix_line, col: d.fix_col, end_line: d.fix_end_line, end_col: d.fix_end_col, text: d.fix_text, rank: d.fix_rank }]
     for m in d.fix_more { out.push(m) }
     out
 }
@@ -2450,7 +2462,7 @@ pub fn diag_explain(code: Str) -> Str {
         return "E0611 -- NotAPlace\n\nThe left side of `=` or `op=` is not a place: a step of the path goes\nthrough a `Ptr` (sections/02_syntax.md §2.22,\nsections/07_trust_modules_metadata.md §9.1.3). The `Ptr` can be the\nroot or a field in the middle of the path, and the root kind does not\nmatter: a `let`, a `let mut` and a parameter all give E0611.\nA field behind a `Ptr` is written with `.write()`.\n\n  let p = scope.alloc[PollFd]()\n  p.events = POLLIN            // E0611\n  p.events.write(POLLIN)       // OK\n  p.events += 1                // E0611\n  p.events.write(p.events.read() + 1)   // OK, a read and then a write\n\n`place = rhs` runs `rhs` before it reads the root, but `p.f.write(rhs)`\nreads `p` first. When `rhs` runs code, bind it to a name on the line\nbefore, then write the name."
     }
     if code == PARAM_ASSIGN {
-        return "E0612 -- ParamAssign\n\nAn assignment `=` or `op=` whose root is a parameter, `self` included,\nwith or without `mut`. A parameter holds this function's own copy of\nthe value, so the write never reaches the caller. A `mut` parameter is\na mutable root only for a call to a `mut self` method.\n\nFix: copy the parameter to a new `let mut` name and change the copy,\nor build a new value and return it.\n\n  fn bump(c: Counter) \{\n      c.at = 5                 // E0612 -- the caller never sees it\n  \}\n\n  fn bump(c: Counter) -> Counter \{\n      let mut x = c\n      x.at = 5                 // OK\n      x\n  \}\n\nParamAssign is a warning for one release, then an error."
+        return "E0612 -- ParamAssign\n\nAn assignment `=` or `op=` whose root is a parameter, `self` included,\nwith or without `mut`. A parameter holds this function's own copy of\nthe value, so the write never reaches the caller. A `mut` parameter is\na mutable root only for a call to a `mut self` method.\n\nFix: shadow the parameter at the top of the body with `let mut c = c`,\nthen change the copy. Each later use names the copy. To give the\ncaller the new value, return it.\n\n  fn bump(c: Counter) -> Counter \{\n      c.at = 5                 // E0612 -- the caller never sees it\n      c\n  \}\n\n  fn bump(c: Counter) -> Counter \{\n      let mut c = c\n      c.at = 5                 // OK\n      c\n  \}\n\n`self` is not a legal `let` name, so a write to `self` or to a field of\n`self` gets help only: build a new value and return it. In\n`Scoped.enter()`, `exit()` receives the value the `with` item built,\nnot this copy, so set the field when the value is built (§4.7.2)."
     }
     if code == MUT_ON_PATTERN {
         return "E0613 -- MutOnPattern\n\n`mut` marks the one name right after it. Before a pattern that is not a\nname -- a tuple, list, struct, constructor, variant, `_`, a literal or a\nrange -- it marks nothing. Before a field label it marks the label,\nwhich is not a name the pattern binds. After `with ... as` it would let\nthe name change, but `close()` runs on the value that `with` acquired.\n\nFix: put `mut` on each name inside the pattern, move it after the\ncolon of a field label, or remove it.\n\n  let (mut (a, b), c) = ((1, 2), 3)   // E0613\n  let ((mut a, mut b), c) = ((1, 2), 3)   // OK\n\n  match p \{ Point \{ mut x: px \} => px \}   // E0613\n  match p \{ Point \{ x: mut px \} => px \}   // OK\n\n  match o \{ mut None => 0, Some(v) => v \}   // E0613 -- None binds no name"

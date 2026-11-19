@@ -30,6 +30,8 @@ Key facts:
 - `io.println(...)` not `print(...)` — IO goes through effect handles
 - NO `+` or `+=` on strings (E0521) — use interpolation or `.concat()`
 - `mut` goes on each name in a pattern: `let (mut x, y) = pair`, `for (k, mut v) in pairs`, `Some(mut n) =>`. `let mut (x, y)` is `E0613`; `blink fix` rewrites it
+- An assignment to a parameter or to a field of one (`c.at = 5`, `self.n += 1`) is `E0612`, with or without `mut`: it changes only this function's copy. Shadow it at the top of the body, `let mut c = c`, or return a new value
+- Before 1.0 a new error is an error in the first release that has it; there is no warning release. An error that has a fix keeps it, and `blink fix` applies it. The warning-first rule applies from 1.0
 - The unit type is `()`. `Void` exists only in `Ptr[Void]`
 - No silent type defaults: an empty `[]`, a bare `None` or an unused `Map.new()` is `E0301`. Annotate it, or write `Map.new[K, V]()`, `Set.new[T]()`
 - One empty form per type: `[]` for `List`, `Map.new()`, `Set.new()`, `Bytes.new()`, `StringBuilder.new()`. `Map()`, `Set()`, `Bytes()` and `List.new()` do not exist: each is an error (E0504 or E0505) with a fix

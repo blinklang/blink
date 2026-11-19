@@ -158,6 +158,17 @@ test "Ok() through an alias of Result[(), Str] gets the fix, and through one of 
     assert(only_error(int).contains(" | - | "), only_error(int))
 }
 
+// The expected type reaches a closure's declared return and a match arm, so each gets the fix.
+test "Ok() as a closure body at Result[(), Str] is E0321 with the fix Ok(())" {
+    let src = "fn main() \{\n    let f = fn() -> Result[(), Str] \{ Ok() }\n    let _ = f()\n}\n"
+    assert_eq(only_error(src), "VariantArgumentCount 2:39: variant `Ok` takes 1 argument, got 0 | write `Ok(())` | write `Ok(())` `Ok(())` at 2:39-2:43 | fields of `Ok`, in order: T")
+}
+
+test "Ok() in a match arm at Result[(), Str] is E0321 with the fix Ok(())" {
+    let src = "fn arm(n: Int) -> Result[(), Str] \{\n    match n \{\n        0 => Ok()\n        _ => Err(\"x\")\n    }\n}\nfn main() \{ let _ = arm(0) }\n"
+    assert_eq(only_error(src), "VariantArgumentCount 3:14: variant `Ok` takes 1 argument, got 0 | write `Ok(())` | write `Ok(())` `Ok(())` at 3:14-3:18 | fields of `Ok`, in order: T")
+}
+
 // §3.4 and §8.16.1: `Ok()` at any other success type has no meaning, so it has no fix.
 test "Ok() at Result[Int, Str] is E0321 with no fix" {
     let src = "fn b() -> Result[Int, Str] \{ Ok() }\nfn main() \{ let _ = b() }\n"
@@ -216,4 +227,35 @@ test "blink fix rewrites Ok() at the success type () to Ok(()) and leaves the fi
     let _rm = sh("rm -rf {DIR}")
     assert_eq(fixed, "fn breaks() -> Result[(), Str] \{ Ok(()) }\nfn main() \{ let _ = breaks() }\n")
     assert_eq(check.end, ChildEnd.Exited(0))
+}
+
+let MODES_DIR = "{scratch_root()}/variant_count_modes"
+
+fn error_lines(out: Str) -> List[Str] {
+    let mut errs: List[Str] = []
+    for line in out.split("\n") {
+        if line.contains("\"severity\":\"error\"") { errs.push(line) }
+    }
+    errs
+}
+
+fn mode_errors(mode: Str) -> List[Str] ! Process.Spawn {
+    let env_of = "env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE"
+    error_lines(sh("B=$(pwd)/build/blink; cd {MODES_DIR} && {env_of} timeout 120 $B {mode} --json main.bl 2>&1 < /dev/null").out)
+}
+
+// The error is a typecheck error, so check, a per-module build and a one-unit build report the
+// same errors with the same fixes.
+test "check, a per-module build and a one-unit build report Ok() at () the same way" {
+    let _mk = sh("rm -rf {MODES_DIR} && mkdir -p {MODES_DIR}")
+    fs.write("{MODES_DIR}/main.bl", "fn breaks() -> Result[(), Str] \{ Ok() }\nfn never() -> Result[Int, Str] \{ Ok() }\nfn main() \{ let _ = (breaks(), never()) }\n").unwrap()
+    let check = mode_errors("check")
+    let per_module = mode_errors("build --per-module")
+    let one_unit = mode_errors("build --no-per-module")
+    let _rm = sh("rm -rf {MODES_DIR}")
+    assert_eq(check.len(), 2)
+    assert(check.get(0).unwrap().contains("\"fix\":\{\"action\":\"write `Ok(())`\""), check.join("\n"))
+    assert(!check.get(1).unwrap().contains("\"fix\":"), check.join("\n"))
+    assert_eq(per_module, check)
+    assert_eq(one_unit, check)
 }

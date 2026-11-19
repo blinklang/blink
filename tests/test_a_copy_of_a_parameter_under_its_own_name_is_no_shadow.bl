@@ -1,0 +1,132 @@
+// `let p = p` as a top-level statement of the body that owns parameter `p` gets no
+// warning[W0603] ShadowedVariable (sections/02_syntax.md §2.12.1 *Function-local shadowing*).
+// It is the line `blink fix` writes for E0612 ParamAssign. Any other `let` that reuses a
+// parameter name keeps W0603: an initializer that is not the bare name, a `let` in a nested
+// block, or a closure body that copies a parameter of the function around it.
+
+import std.fs
+import compiler.{compile_to_program}
+import typecheck.{check_types, TypeCheck}
+import diagnostics.{diag_entries, diag_reset, Diag}
+import std.io
+import lexer.{Lex}
+import parser.{Parse}
+
+fn probe(path: Str, src: Str) ! FS, Env.Exit, Env.Read, IO {
+    with handler Diag {}, handler Lex {}, handler Parse {}, handler TypeCheck {} {
+        fs.write(path, src).unwrap()
+        diag_reset()
+        let program = compile_to_program(path, 1)
+        check_types(program)
+        let _ = fs.delete(path)
+    }
+}
+
+// The line of each W0603, and FAIL lines for every diagnostic when `want` differs.
+fn expect_shadow_lines(label: Str, want: List[Int]) ! IO.Print {
+    let mut got: List[Int] = []
+    let mut errors = 0
+    for d in diag_entries {
+        if d.code == "W0603" { got.push(d.line) }
+        if d.severity == "error" || d.severity == "ice" { errors = errors + 1 }
+    }
+    let ok = got == want && errors == 0
+    if !ok {
+        io.println("FAIL: {label}: W0603 at lines {got.len()} {got.get(0) ?? 0}, want {want.len()} {want.get(0) ?? 0}, {errors} errors")
+        for d in diag_entries { io.println("  {d.severity} {d.name} {d.code} {d.line}:{d.col}: {d.message}") }
+    }
+    assert(ok)
+}
+
+test "a copy of each parameter at the top of a function body raises no W0603" {
+    probe("build/param_copy_no_shadow_gcd.bl", #"
+fn gcd(a: Int, b: Int) -> Int {
+    let mut a = a
+    let mut b = b
+    while b != 0 {
+        let t = b
+        b = a % b
+        a = t
+    }
+    a
+}
+
+fn main() { let _ = gcd(12, 18) }
+"#)
+    expect_shadow_lines("gcd", [])
+}
+
+test "a copy of a closure's own parameter at the top of its body raises no W0603" {
+    probe("build/param_copy_no_shadow_closure.bl", #"
+fn run(base: Int) -> Int {
+    let add = fn(step: Int) -> Int {
+        let mut step = step
+        step = step + base
+        step
+    }
+    add(1)
+}
+
+fn main() { let _ = run(2) }
+"#)
+    expect_shadow_lines("closure", [])
+}
+
+test "an initializer that is not the bare name keeps W0603" {
+    probe("build/param_copy_shadow_grow.bl", #"
+fn grow(a: Int) -> Int {
+    let a = a + 1
+    a
+}
+
+fn main() { let _ = grow(1) }
+"#)
+    expect_shadow_lines("grow", [3])
+}
+
+test "a copy in a nested block keeps W0603" {
+    probe("build/param_copy_shadow_pick.bl", #"
+fn pick(a: Int, flag: Bool) -> Int {
+    if flag {
+        let a = a
+        return a + 1
+    }
+    a
+}
+
+fn main() { let _ = pick(1, true) }
+"#)
+    expect_shadow_lines("pick", [4])
+}
+
+test "a closure body that copies a parameter of the function around it keeps W0603" {
+    probe("build/param_copy_shadow_outer.bl", #"
+fn outer(a: Int) -> Int {
+    let f = fn() -> Int {
+        let a = a
+        a + 1
+    }
+    f()
+}
+
+fn main() { let _ = outer(1) }
+"#)
+    expect_shadow_lines("outer", [4])
+}
+
+// The `let` is at the top of a body, but the name it copies is a loop binder, not a parameter.
+test "a copy of a loop binder at the top of the loop body keeps W0603" {
+    probe("build/param_copy_shadow_loop.bl", #"
+fn sum(xs: List[Int]) -> Int {
+    let mut t = 0
+    for x in xs {
+        let x = x
+        t = t + x
+    }
+    t
+}
+
+fn main() { let _ = sum([1]) }
+"#)
+    expect_shadow_lines("loop", [5])
+}

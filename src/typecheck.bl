@@ -26,7 +26,7 @@ import parser.{
 }
 import diagnostics.{
     Diag, diag_clear_allows, diag_error_at, diag_error_at_notes, diag_error_in_file_label_notes, diag_error_span_at_notes, diag_error_no_loc,
-    diag_set_last_fix, diag_set_last_fix_at, diag_add_label_since, diag_release_repeat_key_since, diag_add_last_fix_edit, diag_set_fix_edits_at, DiagEntry, DiagFixEdit, diag_source_lines, diag_entries, UNDECLARED_EFFECT, UNHANDLED_EFFECT, UNSOURCED_EFFECT_WILDCARD, DERIVED_OP_FOREIGN_EFFECT,
+    diag_set_last_fix, diag_set_last_fix_at, diag_set_last_fix_rank, diag_add_label_since, diag_release_repeat_key_since, diag_add_last_fix_edit, diag_set_fix_edits_at, DiagEntry, DiagFixEdit, diag_source_lines, diag_entries, UNDECLARED_EFFECT, UNHANDLED_EFFECT, UNSOURCED_EFFECT_WILDCARD, DERIVED_OP_FOREIGN_EFFECT,
     diag_push_allows, diag_enter_allows, diag_exit_allows, NON_CONST_EXPR,
     diag_warn_at, diag_warn_at_notes, diag_warn_span_at_notes, PARTIAL_HANDLER, diag_truncate, diag_entry_count, diag_any_errors_since, diag_ice_count, diag_ice_at, diag_ice, diag_ice_abort, PRELUDE_TYPE_NOT_LOADED, diag_count, diag_emit_in_file, diag_file_for_node, diag_file_node_range,
     diag_is_audit_gated, diag_audit_gated_help, AUDIT_GATED_SUPPRESSION, diag_normalize_path, diag_source_line, diag_errors_in_lines, diag_errors_in_lines_before,
@@ -23123,27 +23123,34 @@ fn tc_helper_call_args_text(node: Int, lines: List[Str]) -> Str {
     "(...)"
 }
 
-// Two E0505 fixes in one file that each import a helper by name would add two imports at one
-// place, and `blink fix` applies neither of two edits there. Each such fix gets the one edit
-// that imports every name the file's fixes need, in name order, so the edits are equal.
+// E0505 fixes in one file that import helpers of one module would add several import lines of
+// that module at one place, and `blink fix` applies each of them (§8.6). When one of them imports
+// by name, each such fix gets the one edit that imports every name the file's fixes need, in name
+// order, so the edits are equal and `blink fix` applies one. That import binds the module's
+// qualifier too, so a fix that calls through the qualifier needs no other line.
 fn tc_merge_helper_name_imports() {
     let mut groups: Map[Str, List[Str]] = Map()
+    let mut whole: List[Str] = []
     for d in diag_entries {
+        let key = "{d.file}|{tc_helper_module_import_of(d)}"
+        if !key.ends_with("|") && !whole.contains(key) { whole.push(key) }
         let (module, names) = tc_helper_name_import_of(d)
         if module == "" { continue }
-        let key = "{d.file}|{module}"
-        let mut have = groups.get(key) ?? []
+        let by_name = "{d.file}|{module}"
+        let mut have = groups.get(by_name) ?? []
         for name in names {
             if !have.contains(name) { have.push(name) }
         }
-        groups.insert(key, have)
+        groups.insert(by_name, have)
     }
     let mut i = 0
     while i < diag_entries.len() {
         let d = diag_entries.get(i).unwrap()
-        let (module, _) = tc_helper_name_import_of(d)
-        let names = (groups.get("{d.file}|{module}") ?? []).sort()
-        if module != "" && names.len() > 1 {
+        let (by_name, _) = tc_helper_name_import_of(d)
+        let module = if by_name != "" { by_name } else { tc_helper_module_import_of(d) }
+        let key = "{d.file}|{module}"
+        let names = (groups.get(key) ?? []).sort()
+        if module != "" && (names.len() > 1 || names.len() == 1 && whole.contains(key)) {
             match import_need(diag_source_lines(d.file), tc_import_lines_of_file(d.file), module, names) {
                 ImportNeed.Add(e) => diag_set_fix_edits_at(i, "add `import {module}.\{{names.join(", ")}}` and call", [DiagFixEdit { line: e.line, col: e.col, end_line: e.end_line, end_col: e.end_col, text: e.text }])
                 _ => {}
@@ -23151,6 +23158,17 @@ fn tc_merge_helper_name_imports() {
         }
         i = i + 1
     }
+}
+
+// The module of the whole-module import that the E0505 fix `d` adds to call a helper through its
+// qualifier, or "" for any other diagnostic.
+fn tc_helper_module_import_of(d: DiagEntry) -> Str {
+    let head = "add `import "
+    let tail = "` and call"
+    if d.code != "E0505" || !d.fix_action.starts_with(head) || !d.fix_action.ends_with(tail) { return "" }
+    let module = d.fix_action.byte_slice(head.byte_len(), d.fix_action.byte_len() - tail.byte_len())
+    if module.contains("\{") || module.contains(" ") { return "" }
+    module
 }
 
 // The module and names of the import that the E0505 fix `d` adds to call a helper by name, or
@@ -27004,6 +27022,23 @@ fn nr_define(name: Str) {
     nr_scope_push_entry(name, 0, TYPE_UNKNOWN, -1)
 }
 
+// §2.12.1: `let p = p` as a top-level statement of the body that owns parameter `p` is the
+// copy `blink fix` writes for E0612, not a shadow to warn about. A function or closure binds
+// its parameters in one frame and its body block opens the next, so the let sits in the frame
+// just above the one that holds the shadowed parameter.
+fn nr_is_param_copy_at_top(name: Str, node: Int, shadowed: Int) -> Bool {
+    if node == -1 || node_kind(node) != NodeKind.LetBinding { return false }
+    let val = node_value(node)
+    if val == -1 || node_kind(val) != NodeKind.Ident || node_name(val) != name { return false }
+    let decl = nr_scope_nodes.get(shadowed) ?? -1
+    if decl == -1 || node_kind(decl) != NodeKind.Param { return false }
+    let n = nr_scope_frames.len()
+    if n < 2 { return false }
+    let param_frame = nr_scope_frames.get(n - 2).unwrap()
+    let body_frame = nr_scope_frames.get(n - 1).unwrap()
+    shadowed >= param_frame && shadowed < body_frame
+}
+
 fn nr_check_shadow(name: Str, node: Int) ! Diag.Report {
     if nr_warn_unused == 0 { return }
     if name.len() == 0 { return }
@@ -27022,6 +27057,7 @@ fn nr_check_shadow(name: Str, node: Int) ! Diag.Report {
         idx = nr_scope_prev.get(idx).unwrap()
         if idx == -1 { return }
     }
+    if nr_is_param_copy_at_top(name, node, idx) { return }
     // A local binding that "shadows" a same-named top-level symbol from a
     // DIFFERENT module is not a real lexical shadow — it's a cross-module name
     // collision (e.g. a stdlib param colliding with a user's top-level free
@@ -45743,7 +45779,7 @@ fn tc_check_assign_root(node: Int, block: Int, at: Int) ! Diag.Report {
     let global = nr_index_is_global(idx) != 0
     let local = if global { -1 } else { nr_scope_nodes.get(idx).unwrap() }
     if local >= 0 && node_kind(local) == NodeKind.Param {
-        tc_report_param_assign(name, target)
+        tc_report_param_assign(name, target, root, local)
         return
     }
     let message = if root == target { "cannot assign to `{name}`, which is not `mut`" } else { "cannot assign to `{unparse_expr(target)}`, whose root `{name}` is not `mut`" }
@@ -45782,14 +45818,126 @@ fn tc_check_assign_root(node: Int, block: Int, at: Int) ! Diag.Report {
         "declare it `let mut {name}` only if it must change: `mut` adds `State` to the row of each function that reads or writes it (§4.16)", notes)
 }
 
-// §3.6 *Mutable Parameters*: `mut` on a parameter allows a mutating call, never `=`, so the
-// root's `mut` does not matter here. A warning for one release (§3.6 *Rollout*); help only,
-// since a copy means renaming every later use of the parameter.
-fn tc_report_param_assign(name: Str, target: Int) ! Diag.Report {
-    let copy = tc_name_not_in_scope("x")
-    diag_warn_label_at_notes("ParamAssign", PARAM_ASSIGN, "cannot assign to parameter `{name}`", target,
-        "`{name}` is a parameter", "copy it to a new name: `let mut {copy} = {name}`",
-        ["a write to a parameter changes only this function's copy"])
+// §3.6 *A parameter is never assigned*: `mut` on a parameter allows a mutating call, never `=`,
+// so the root's `mut` does not matter here. An error at once before 1.0 (§3.6 *Rollout*). The
+// label spans the whole target. `self` is no legal `let` name, so its help says to build a new
+// value; in `Scoped.enter()` a copy never reaches `exit()`, so the help names the `with` item.
+// Neither of those two gets the fix that copies the parameter.
+fn tc_report_param_assign(name: Str, target: Int, root: Int, param: Int) ! Diag.Report {
+    let field_write = root != target
+    let copy_note = "a write to a parameter changes only this function's copy"
+    let mut note = if field_write { "{copy_note}; to give the caller the new value, return it" } else { copy_note }
+    let mut help = "shadow it at the top of the body: `let mut {name} = {name}`"
+    if name == "self" {
+        help = "build a new value and return it"
+        let field = tc_first_field_of(target, root)
+        if field != "" && tc_in_block_handler_enter() {
+            note = "`exit()` receives the value the `with` item built, not this copy"
+            help = "set `{field}` when the value is built, and build it in the `with` item (§4.7.2)"
+        }
+    }
+    let w = tc_written_operand(target)
+    let end_col = if w.end_line == w.line { w.end_col } else { 0 }
+    let before = diag_entry_count()
+    diag_error_span_label_at_notes("ParamAssign", PARAM_ASSIGN, "cannot assign to parameter `{name}`", target,
+        w.line, w.col, end_col, "`{name}` is a parameter", help, [note])
+    if name == "self" || tc_in_block_handler_enter() || diag_entry_count() == before { return }
+    tc_attach_param_copy_fix(name, param)
+}
+
+// The fix of §3.6: `let mut p = p` as the first statement of the body that owns `p`. Every
+// write to `p` gets the same edit, so `blink fix` applies it once; its rank is the place of `p`
+// in the parameter list, so two such lines at one place come in parameter order (§8.6).
+fn tc_attach_param_copy_fix(name: Str, param: Int) ! Diag.Report {
+    let owner = tc_param_owner(param)
+    if owner == -1 { return }
+    let body = node_body(owner)
+    if body == -1 || node_kind(body) != NodeKind.Block { return }
+    let stmts = node_stmts(body)
+    if stmts == -1 || sublist_length(stmts) == 0 { return }
+    let first = sublist_get(stmts, 0)
+    let file = diag_file_for_node(body)
+    let brace_line = node_line(body)
+    let text = diag_source_line(file, brace_line)
+    // The place comes from the text after `{`, not from the first statement's node: a node
+    // such as a binary operation sits at its operator, which can be on a later line.
+    let mut col = node_col(body) + 1
+    while col <= text.byte_len() && (text.byte_at(col - 1) == 32 || text.byte_at(col - 1) == 9 || text.byte_at(col - 1) == 13) { col = col + 1 }
+    let rest = if col <= text.byte_len() { text.byte_slice(col - 1, text.byte_len()) } else { "" }
+    let mut line = brace_line
+    let mut fix = ""
+    if rest == "" || rest.starts_with("//") {
+        // The copy is a line of its own above the first line of the body, with the indent of
+        // the first non-blank line.
+        let mut n = brace_line + 1
+        while n < node_line(first) && diag_source_line(file, n).trim() == "" { n = n + 1 }
+        line = brace_line + 1
+        col = 1
+        fix = "{leading_whitespace(diag_source_line(file, n))}let mut {name} = {name}\n"
+    } else {
+        // A body on the line of its `{`: the copy takes the place of the first statement,
+        // and that statement moves to the next line at the same column.
+        fix = "let mut {name} = {name}\n{tc_blank_like(text.byte_slice(0, col - 1))}"
+    }
+    let rank = tc_param_index(owner, param)
+    diag_set_last_fix_at("shadow `{name}` at the top of the body", fix, line, col, line, col)
+    diag_set_last_fix_rank(rank)
+}
+
+// `text` with every byte but a tab turned into a space, so a line padded with it lines up below.
+fn tc_blank_like(text: Str) -> Str {
+    let mut out = ""
+    let mut i = 0
+    while i < text.byte_len() {
+        out = out.concat(if text.byte_at(i) == 9 { "\t" } else { " " })
+        i = i + 1
+    }
+    out
+}
+
+// The function or closure whose parameter list holds `param`. The parser pushes an owner after
+// its parameters and its body, so the search runs up from `param`.
+fn tc_param_owner(param: Int) -> Int {
+    let n = node_count()
+    let mut id = param + 1
+    while id < n {
+        if tc_param_index(id, param) != -1 { return id }
+        id = id + 1
+    }
+    -1
+}
+
+// The place of `param` in the parameter list of `owner`, or -1.
+fn tc_param_index(owner: Int, param: Int) -> Int {
+    let k = node_kind(owner)
+    if k != NodeKind.FnDef && k != NodeKind.Closure { return -1 }
+    let params = node_params(owner)
+    if params == -1 { return -1 }
+    let mut i = 0
+    while i < sublist_length(params) {
+        if sublist_get(params, i) == param { return i }
+        i = i + 1
+    }
+    -1
+}
+
+// The body being checked is `enter` of an impl of the `with` trait.
+fn tc_in_block_handler_enter() -> Bool {
+    let f = tc_current_fn_node
+    if f < 0 { return false }
+    let block = tc_method_block.get(f) ?? -1
+    if block == -1 || node_kind(block) != NodeKind.ImplBlock { return false }
+    (tc_calls.written_names.get(f) ?? node_name(f)) == "enter" && tc_impl_trait_id(block) == "BlockHandler"
+}
+
+// The field of `root` that the place `target` first steps through: `start` in `self.start.at`.
+fn tc_first_field_of(target: Int, root: Int) -> Str {
+    let mut at = target
+    while node_kind(at) == NodeKind.FieldAccess || node_kind(at) == NodeKind.IndexExpr {
+        if node_obj(at) == root { return if node_kind(at) == NodeKind.FieldAccess { node_name(at) } else { "" } }
+        at = node_obj(at)
+    }
+    ""
 }
 
 // §2.22 case 2: no name holds the value the path starts from, so the store is lost. Help only,
