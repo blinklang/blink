@@ -3540,7 +3540,7 @@ The LSP displays `main`'s actual effect set as an inlay hint, computed from the 
 
 #### Unhandled user effects
 
-A user-declared effect that reaches `main`'s body with no `with` that discharges it is a compile error, `UnhandledEffect` (E0539). The check uses the effect rows of the program (§4.5, §4.15), closures and `! _` rows included, and the same discharge rule as `with` (§4.7, and §4.7.2 *Scoped effect handlers* for a `Scoped` type whose `Context` is `Handler[E]`). Test blocks are the other root, and the same code reports them (§2.20). In a test, the hint changes when the effect comes only from foreign code (§2.20).
+A user-declared effect that reaches `main`'s body with no `with` that discharges it is a compile error, `UnhandledEffect` (E0539). The check uses the effect rows of the program (§4.5, §4.15), closures and `! _` rows included (a closure is charged at its call, §4.15.4), and the same discharge rule as `with` (§4.7, and §4.7.2 *Scoped effect handlers* for a `Scoped` type whose `Context` is `Handler[E]`). Test blocks are the other root, and the same code reports them (§2.20). In a test, the hint changes when the effect comes only from foreign code (§2.20).
 
 ```blink
 effect Store {
@@ -6081,6 +6081,49 @@ test "map with mock DB" {
 ```
 
 **Closures (§2.8):** Closures used as effectful callbacks follow the same capture rules. Effect annotations on the closure type describe what the closure *body* does, not what it captures.
+
+**A closure is charged at its call.** Making a closure charges nothing (§2.20). Its row stays on its type (§4.15.1). A call of the closure charges the row at that call, under the handlers in force there (§4.7), and a pass to a `! _` parameter charges it at that call (§4.15.2 rule 5). A closure that nothing calls is never charged. This holds for `UndeclaredEffect` (E0500) in every fn and for `UnhandledEffect` (E0539) at a root. No call is hidden, because the row travels with the value through a parameter, a field, a list element and a return type. A slot whose type is pure takes no effectful closure (`EffectMismatchInFnType`, §4.15.1).
+
+```blink
+effect Counter {
+    effect Inc { fn inc(n: Int) -> Int }
+}
+
+fn unused() {
+    let _f = fn(x: Int) -> Int { counter.inc(x) }  // OK: no call, no charge
+}
+
+fn make() -> (fn(Int) -> Int ! Counter.Inc) {      // `make` is pure
+    fn(x: Int) -> Int { counter.inc(x) }
+}
+
+fn main() {
+    let f = fn(x: Int) -> Int { counter.inc(x) }   // OK: no charge here
+    with handler Counter {
+        fn inc(n: Int) -> Int { n + 10 }
+    } {
+        io.println("{f(5)}")                       // OK: prints 15
+    }
+
+    let g = make()                                 // OK: no charge here
+    io.println("{g(1)}")                           // ERROR E0539: no `with` discharges `Counter.Inc`
+}
+```
+
+The error is at the call. A `note:` names the closure binding and the line of the operation that brings in the effect:
+
+```
+error[UnhandledEffect]: unhandled effect `Counter.Inc` in `main`
+  --> src/app.bl:22:19
+   |
+22 |     io.println("{g(1)}")
+   |                  ^^^^ `g` has the row `! Counter.Inc`
+   |
+   = note: `Counter.Inc` comes from `counter.inc` at src/app.bl:10:25, in the closure `make` returns
+   = help: wrap the call in `with <handler> { ... }` (§4.12)
+```
+
+In a fn that is not a root, the same call is E0500 at the call, and the `note:` names the same line.
 
 **async.spawn (§4.13):** `async.spawn` takes `fn() -> T ! _` — the spawned task inherits whatever effects the closure declares. The existing E0650 restriction on captures of a mutable root still applies, and so does the freeze of the shared cells its captures reach (§2.8 *Shared cells in a spawned task*). A handler in force at the spawn site whose captures reach a shared cell is homed (§2.8 *Handlers in a spawned task*). A function value whose row contains `State` cannot be spawned (E0651, §4.16.6).
 
