@@ -16,7 +16,7 @@ import parser.{
     sublist_length,
 }
 import typecheck.{
-    TyKind, TYPE_INT, TYPE_STR, TYPE_VOID, make_ffi_scope_type, make_fn_type, make_handler_type, tc_resolve, tc_type_str,
+    TyKind, TYPE_INT, TYPE_VOID, make_ffi_scope_type, make_fn_type, make_handler_type, tc_resolve, tc_type_str,
     tc_tid_child_count, tc_impl_is_poly_user, tc_impl_owner_decl, tc_tid_decl_node, tc_tid_handler_effect, tc_tid_kind, tc_void_tid, tk_name, ty_pool,
     tc_call_decl_node, tc_call_user_effect, tc_decl_ret_tid, tc_effect_ident, tc_handler_effect_root, tc_impl_trait_id, io_op_rows, handles_io_row, is_io_read_derived_op, IO_READ_PRIMITIVE,
     io_op_renders_its_argument,
@@ -35,9 +35,9 @@ import cname.{
     c_impl_method_name, c_local_name, c_local_name_nth, c_mint_local, c_param_name, c_runtime_helper,
 }
 import ir.{
-    ir_assign, ir_block, ir_box, ir_call_direct, ir_call_runtime, ir_cast,
+    ir_block, ir_box, ir_call_direct, ir_call_runtime, ir_cast,
     ir_closure_new, ir_const, ir_effect_perform, ir_evidence_address, ir_evidence_vector,
-    ir_field_get, ir_handler_install, ir_if, ir_let, ir_struct_new, ir_unbox, ir_var_ref,
+    ir_field_get, ir_handler_install, ir_let, ir_struct_new, ir_unbox, ir_var_ref,
     ir_expr_stmt, ir_return, ir_cell_let,
 }
 import cg_print.{
@@ -53,7 +53,7 @@ import free_names.{closure_read_names}
 import cg_decl.{cg_decl_is_per_instance, cg_decl_takes_ev}
 import cg_call.{lower_derived_from_str_body, lower_builtin_static_body, lower_method_value_body}
 import cg_expr.{
-    cg_expr_push_pending, lower_expr, lower_expr_as_value, lower_value_as_text, cg_expr_option_some, cg_expr_option_none,
+    cg_expr_push_pending, lower_expr, lower_expr_as_value, lower_value_as_text,
     cg_expr_pending_count, cg_expr_sequence, x_site_args,
 }
 import diagnostics.{
@@ -1899,12 +1899,9 @@ fn ev_field_of(handler_tid: Int, node: Int) -> Str ! Diag.Report {
 // is the innermost handler wherever the perform sits, inside a function that also holds a
 // vector parameter or not.
 
-// The builtin namespaces whose operations the runtime dispatches through a vtable, and
-// the one operation whose slot answers a nullable text where the call answers an Option.
+// The builtin namespaces whose operations the runtime dispatches through a vtable.
 let NS_IO = "io"
-let NS_ENV = "env"
 let NS_TIME = "time"
-let ENV_VAR = "var"
 let TIME_READ = "read"
 let TIME_MONOTONIC = "monotonic"
 
@@ -1989,10 +1986,7 @@ pub fn cg_eff_lower_builtin_perform(node: Int, ns: Str, method: Str) -> Int ! Di
     if handler_tid < 0 { return -1 }
     let call_tid = tid_of_node(node)
     if call_tid < 0 { return -1 }
-    let wraps = ns == NS_ENV && method == ENV_VAR
-    // The read slot answers a nullable text, not the Option the call holds.
-    let tid = if wraps { TYPE_STR } else { call_tid }
-    let rec = perform_layout(tid, Position.Local, node)
+    let rec = perform_layout(call_tid, Position.Local, node)
     if rec.c_spelling == "" { return -1 }
     let args = if ns == NS_IO && io_op_renders_its_argument(method) { lower_text_args(node) } else { lower_args(node) }
     match args {
@@ -2002,9 +1996,7 @@ pub fn cg_eff_lower_builtin_perform(node: Int, ns: Str, method: Str) -> Int ! Di
             let traced = cg_trace_builtin_effect(node, root, if ns == NS_IO { slot } else { method }, lowered)
             let read = slot_read(node, handler_tid)
             if read < 0 { return -1 }
-            let perform = ir_effect_perform(tid, node, rec.c_spelling, slot, rec.slot_form, read, traced)
-            if wraps { return cg_eff_wrap_nullable_text(node, call_tid, perform) }
-            perform
+            ir_effect_perform(call_tid, node, rec.c_spelling, slot, rec.slot_form, read, traced)
         }
     }
 }
@@ -2139,34 +2131,6 @@ fn lower_text_args(node: Int) -> Option[List[Int]] ! Diag.Report {
         i = i + 1
     }
     Some(out)
-}
-
-// The runtime's env read answers a text pointer that is null for an unset name, and the
-// call holds an Option. The read lands in a temp, the Option starts as None, and the Some is
-// written only when the temp holds text; the answer is a reference to the Option temp.
-fn cg_eff_wrap_nullable_text(node: Int, opt_tid: Int, perform: Int) -> Int ! Diag.Report {
-    if tc_tid_kind(tc_resolve(opt_tid)) != TyKind.Option {
-        diag_ice_at("NullableSlotAnswerNotOption", UNSOLVED_TYPEVAR_AT_CODEGEN,
-            "a nullable text read is typed {tk_name(tc_tid_kind(tc_resolve(opt_tid)))} where an Option is needed", node,
-            "typecheck signs env.var as Option[Str]; this is a compiler bug")
-        return -1
-    }
-    let text = perform_layout(TYPE_STR, Position.Local, node)
-    let opt = perform_layout(opt_tid, Position.Local, node)
-    if text.c_spelling == "" || opt.c_spelling == "" { return -1 }
-    let raw_name = c_mint_local("text_raw")
-    let opt_name = c_mint_local("text_opt")
-    let none = cg_expr_option_none(opt_tid, node, opt)
-    if none < 0 { return -1 }
-    let payload = ir_var_ref(TYPE_STR, node, text.c_spelling, raw_name, text.slot_form)
-    let some = cg_expr_option_some(opt_tid, node, opt, payload)
-    if some < 0 { return -1 }
-    let target = ir_var_ref(opt_tid, node, opt.c_spelling, opt_name, opt.slot_form)
-    let cond = ir_var_ref(TYPE_STR, node, text.c_spelling, raw_name, text.slot_form)
-    cg_expr_push_pending(node, ir_let(TYPE_STR, node, text.c_spelling, raw_name, text.slot_form, perform))
-    cg_expr_push_pending(node, ir_let(opt_tid, node, opt.c_spelling, opt_name, opt.slot_form, none))
-    cg_expr_push_pending(node, ir_if(node, cond, ir_block(node, [ir_assign(node, target, some)]), -1))
-    ir_var_ref(opt_tid, node, opt.c_spelling, opt_name, opt.slot_form)
 }
 
 // An operation of a user effect, written `handle.op(args)` on the lowered handle name of

@@ -1,5 +1,5 @@
 import ast.{NodeKind, node_kind_name, is_block_bearing, trace_gate_on, nk_is_typed, phase_trace, trace_mode}
-import builtin_effects.{builtin_effect_children, builtin_effect_tree_roots, reserved_effect_handles, reserved_effect_root_of, builtin_op_root_of_handle, builtin_op_roots, builtin_root_has_handler_ops, is_builtin_effect_handle, is_builtin_op_root}
+import builtin_effects.{env_op_for_old_slot, env_op_names, builtin_effect_children, builtin_effect_tree_roots, reserved_effect_handles, reserved_effect_root_of, builtin_op_root_of_handle, builtin_op_roots, builtin_root_has_handler_ops, is_builtin_effect_handle, is_builtin_op_root}
 import std.str.{str_to_lower}
 import pkg.manifest.{manifest_name, manifest_header_is_declared}
 import unparse.{type_ann_text, type_ann_text_renamed, unparse_expr, unparse_binop_with_lhs, unparse_range_membership, unparse_coalesce_start}
@@ -2940,8 +2940,7 @@ fn tc_report_handler_coverage(at: Int, want: Int, got: Int) ! TypeCheck.Report, 
 }
 
 // The operations a handler of `eff` handles, in the order they are declared: a user effect's
-// from its declaration, and FS's, IO's and Time's from their tables. [] for an effect whose
-// operations are in no table (Env), so the report then names none.
+// from its declaration, and FS's, IO's, Env's and Time's from their tables.
 fn tc_handler_op_names(eff: Str) -> List[Str] {
     let root = tc_handler_effect_root(eff)
     let sub = if root == eff { "" } else { eff.byte_slice(root.byte_len() + 1, eff.byte_len()) }
@@ -2955,6 +2954,12 @@ fn tc_handler_op_names(eff: Str) -> List[Str] {
     if root == "IO" {
         for row in io_op_rows() {
             if sub == "" || row.sub_effect == sub { out.push(row.op) }
+        }
+        return out
+    }
+    if root == "Env" {
+        for op in env_op_names() {
+            if sub == "" || builtin_effect_op_sub(root, op) == sub { out.push(op) }
         }
         return out
     }
@@ -10962,8 +10967,6 @@ fn tc_warn_todo_in_code(fn_name: Str, node: Int) ! Diag.Report {
 //     listed keeps them off the bare-name path.
 //   - `io.debug` — listed by is_intrinsic_method, emitted by no arm, so it reaches the loud
 //     E0505 codegen backstop. Signing it would claim a method that cannot be called works.
-//   - `env.vars` — spelled in sections/04_effects.md:209 and typed Map[Str, Str] at :752, with
-//     no codegen arm at all. Unimplemented, not mistyped.
 //
 // io.read_bytes, io.read_line and io.read_all are the IO.Read operations of
 // sections/04_effects.md §4.4.9. io.write/write_bytes and the five env.* below are not spelled
@@ -11063,12 +11066,15 @@ fn register_ns_intrinsic_sigs() {
     // escape: `let bad: Int = env.var("HOME")` compiled, linked, ran and printed `<value>`.
     // Option[Str] per sections/04_effects.md:705-716, where `env.var(...) ?? "8080"` and
     // `env.var("VERBOSE").is_some()` both appear.
-    register_intrinsic_fn_sig("env.var", [TYPE_STR], make_option_type(TYPE_STR))
+    // Each env signature is also the header of its handler clause (builtin_handler_op_sig),
+    // so it carries the parameter names of §4.4.3.
+    register_named_intrinsic_fn_sig("env.var", [TYPE_STR], env_time_op_params("var"), make_option_type(TYPE_STR))
+    register_intrinsic_fn_sig("env.vars", [], make_map_type(TYPE_STR, TYPE_STR))
     register_intrinsic_fn_sig("env.cwd", [], TYPE_STR)
     register_intrinsic_fn_sig("env.pid", [], TYPE_INT)
-    register_intrinsic_fn_sig("env.set_var", [TYPE_STR, TYPE_STR], TYPE_VOID)
-    register_intrinsic_fn_sig("env.remove_var", [TYPE_STR], TYPE_VOID)
-    register_intrinsic_fn_sig("env.exit", [TYPE_INT], TYPE_NEVER)
+    register_named_intrinsic_fn_sig("env.set_var", [TYPE_STR, TYPE_STR], env_time_op_params("set_var"), TYPE_VOID)
+    register_named_intrinsic_fn_sig("env.remove_var", [TYPE_STR], env_time_op_params("remove_var"), TYPE_VOID)
+    register_named_intrinsic_fn_sig("env.exit", [TYPE_INT], env_time_op_params("exit"), TYPE_NEVER)
 
     // ffi.scope() — the arena constructor. This table entry is what makes the
     // `with ffi.scope() as scope` binder typed: tc_bind_with_resource binds the binder to the
@@ -12491,9 +12497,11 @@ fn tc_user_clause_header(he: Int, op: Str) -> Option[ClauseHeader] ! TypeCheck.R
 // The header of the operation `op` of the builtin root `root`, as the call that it answers
 // takes it, for the clause `m` of a handler for `eff`. A clause of an FS, Process, Rand or IO
 // handler fills the vtable slot of its operation, and the slot's C type is that operation's
-// signature. None for the roots whose clauses typecheck does not match.
+// signature. An Env clause fills the runtime's slot for its operation, which the runtime
+// types as the call's own signature. None for the roots whose clauses typecheck does not match.
 fn tc_builtin_clause_header(eff: Str, root: Str, op: Str, m: Int) -> Option[ClauseHeader] ! TypeCheck.Resolve, Diag.Report {
-    if !is_builtin_op_root(root) && (root != "IO" || io_op_sub_effect(op) == "") { return None }
+    let env_op = root == "Env" && env_op_names().contains(op)
+    if !is_builtin_op_root(root) && !env_op && (root != "IO" || io_op_sub_effect(op) == "") { return None }
     let sig_idx = builtin_handler_op_sig(root, op)
     if sig_idx == -1 { return None }
     let sig = fnsig_pool.get(sig_idx).unwrap()
@@ -12526,9 +12534,7 @@ fn tc_clause_header(he: Int, op: Str, m: Int) -> Option[ClauseHeader] ! TypeChec
 }
 
 // The operations of the builtin `root` as a clause names them, or None for a root whose
-// operations typecheck does not list. Env has no list: its
-// handler clauses still fill the runtime's vtable slots by their C names (`read`, `write`),
-// not the operations of §4.4.3, and the spec names do not build yet.
+// operations typecheck does not list.
 fn builtin_root_op_names(root: Str) -> Option[List[Str]] {
     let mut out: List[Str] = []
     if is_builtin_op_root(root) {
@@ -12541,14 +12547,14 @@ fn builtin_root_op_names(root: Str) -> Option[List[Str]] {
             Some(out)
         }
         "Time" => Some(["read", "monotonic", "sleep"])
+        "Env" => Some(env_op_names())
         _ => None
     }
 }
 
 // The names a clause of a handler for `eff`, a root or one sub-effect of it, may take: the
 // operations of `eff` in declaration order. None when typecheck cannot list them: an effect
-// that does not resolve, or a builtin root that builtin_root_op_names has no list for, such as
-// Env.
+// that does not resolve, or a builtin root that builtin_root_op_names has no list for.
 fn tc_handler_clause_names(eff: Str) -> Option[List[Str]] {
     let root = tc_handler_effect_root(eff)
     let ed = tc_effect_decl_named(root)
@@ -12684,7 +12690,8 @@ fn tc_report_duplicate_handler_clause(first: Int, m: Int) ! Diag.Report {
 fn tc_report_unknown_handler_op(he: Int, eff: Str, known: List[Str], names: List[Str], m: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     let op = node_name(m)
     let owner = tc_handler_op_owner(eff, op)
-    let sugg = if owner == "" { nearest_name(op, known) } else { "" }
+    let renamed = if tc_handler_effect_root(eff) == "Env" { env_op_for_old_slot(op) } else { "" }
+    let sugg = if owner != "" { "" } else if renamed != "" && known.contains(renamed) { renamed } else { nearest_name(op, known) }
     let help = if owner != "" {
         "`{op}` is an operation of `{owner}`"
     } else if sugg != "" {
@@ -23361,7 +23368,7 @@ fn builtin_handler_op_sig(root: Str, op: Str) -> Int ! Diag.Report {
         register_intrinsic_fn_sig(key, [], runtime_monotonic_tid())
     } else if root == "Time" && op == "sleep" {
         register_named_intrinsic_fn_sig(key, [runtime_duration_tid()], ["d"], TYPE_VOID)
-    } else if builtin_op_exists(root, op) {
+    } else if builtin_op_exists(root, op) || (root == "Env" && env_op_names().contains(op)) {
         // The handle call's own signature, so a clause and the call it answers cannot differ.
         return lookup_fnsig("{str_to_lower(root)}.{op}")
     } else {
@@ -50523,9 +50530,7 @@ pub fn strip_module_qualifier(name: Str) -> Str {
 // behind it and STAYS: a listed-but-unsigned name gets no type from either arm
 // and falls to the loud codegen backstop, and being listed is what keeps it off
 // the bare-name path where a free fn named `debug` could answer for it.
-// `println` has always been in that state. `env.vars` is deliberately NOT listed:
-// it is spelled in the effects spec but no codegen arm emits it, so it must keep
-// reaching the backstop rather than being affirmed here.
+// `println` has always been in that state.
 pub fn is_intrinsic_method(namespace: Str, method: Str) -> Int {
     if namespace == "net" {
         if method == "connect" || method == "close" || method == "read" || method == "write" || method == "read_all" || method == "read_line" || method == "set_timeout" || method == "listen" || method == "accept" || method == "request" || method == "read_bytes" || method == "write_bytes" {
@@ -50559,9 +50564,7 @@ pub fn is_intrinsic_method(namespace: Str, method: Str) -> Int {
     }
     if namespace == "trace" && method == "log" { return 1 }
     if namespace == "env" {
-        if method == "args" || method == "var" || method == "cwd" || method == "pid" || method == "set_var" || method == "remove_var" || method == "exit" {
-            return 1
-        }
+        if env_op_names().contains(method) { return 1 }
     }
     if namespace == "time" {
         if method == "read" || method == "monotonic" || method == "sleep" {

@@ -5004,20 +5004,27 @@ BLINK_RT_FN int64_t blink_time_ms(void) {
 #endif
 
 /* ── Env ────────────────────────────────────────────────────────────── */
+/* One slot per operation of §4.4.3, each typed as the C of a handler clause for it, so a
+   `handler Env` clause fills its slot with no adapter, and each slot is named as its
+   operation. */
 typedef struct {
-    const char* (*read)(void* __self, const char* name);
-    int         (*write)(void* __self, const char* name, const char* value);
-    int         (*remove)(void* __self, const char* name);
-    const char* (*cwd)(void* __self);
-    void        (*exit_fn)(void* __self, int code);
-    int64_t     (*pid)(void* __self);
+    blink_list*      (*args)(void* __self);
+    blink_Option_str (*var)(void* __self, const char* name);
+    blink_map*       (*vars)(void* __self);
+    const char*      (*cwd)(void* __self);
+    int64_t          (*pid)(void* __self);
+    void             (*set_var)(void* __self, const char* name, const char* value);
+    void             (*remove_var)(void* __self, const char* name);
+    void             (*exit)(void* __self, int64_t code);
     /* per-op handler captures — see blink_io_vtable */
-    void* __userdata_read;
-    void* __userdata_write;
-    void* __userdata_remove;
+    void* __userdata_args;
+    void* __userdata_var;
+    void* __userdata_vars;
     void* __userdata_cwd;
-    void* __userdata_exit_fn;
     void* __userdata_pid;
+    void* __userdata_set_var;
+    void* __userdata_remove_var;
+    void* __userdata_exit;
 } blink_env_vtable;
 
 BLINK_RT_FN blink_env_vtable* blink_env_vtable_promote(blink_promote_ctx* ctx, blink_env_vtable* v);
@@ -5025,35 +5032,58 @@ BLINK_RT_FN blink_env_vtable* blink_env_vtable_promote(blink_promote_ctx* ctx, b
 BLINK_RT_FN blink_env_vtable* blink_env_vtable_promote(blink_promote_ctx* ctx, blink_env_vtable* v) {
     blink_env_vtable* out = (blink_env_vtable*)blink_promote_cell(ctx, v, sizeof(*v), NULL);
     if (out == v) return out;
-    out->__userdata_read = blink_closure_promote(ctx, (blink_closure*)out->__userdata_read);
-    out->__userdata_write = blink_closure_promote(ctx, (blink_closure*)out->__userdata_write);
-    out->__userdata_remove = blink_closure_promote(ctx, (blink_closure*)out->__userdata_remove);
+    out->__userdata_args = blink_closure_promote(ctx, (blink_closure*)out->__userdata_args);
+    out->__userdata_var = blink_closure_promote(ctx, (blink_closure*)out->__userdata_var);
+    out->__userdata_vars = blink_closure_promote(ctx, (blink_closure*)out->__userdata_vars);
     out->__userdata_cwd = blink_closure_promote(ctx, (blink_closure*)out->__userdata_cwd);
-    out->__userdata_exit_fn = blink_closure_promote(ctx, (blink_closure*)out->__userdata_exit_fn);
     out->__userdata_pid = blink_closure_promote(ctx, (blink_closure*)out->__userdata_pid);
+    out->__userdata_set_var = blink_closure_promote(ctx, (blink_closure*)out->__userdata_set_var);
+    out->__userdata_remove_var = blink_closure_promote(ctx, (blink_closure*)out->__userdata_remove_var);
+    out->__userdata_exit = blink_closure_promote(ctx, (blink_closure*)out->__userdata_exit);
     return out;
 }
 #endif
 
-BLINK_RT_FN const char* blink_env_default_read(void* __self, const char* name);
+BLINK_RT_FN blink_list* blink_env_default_args(void* __self);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN const char* blink_env_default_read(void* __self, const char* name) {
+BLINK_RT_FN blink_list* blink_env_default_args(void* __self) {
+    return blink_env_args();
+}
+#endif
+
+BLINK_RT_FN blink_Option_str blink_env_default_var(void* __self, const char* name);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN blink_Option_str blink_env_default_var(void* __self, const char* name) {
     const char* v = getenv(name);
-    return v ? blink_str_from_cstr_gc(v) : NULL;
+    if (v == NULL) return (blink_Option_str){.tag = 0};
+    return (blink_Option_str){.tag = 1, .value = blink_str_from_cstr_gc(v)};
 }
 #endif
 
-BLINK_RT_FN int blink_env_default_write(void* __self, const char* name, const char* value);
-#ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN int blink_env_default_write(void* __self, const char* name, const char* value) {
-    return setenv(name, value, 1);
-}
+/* macOS keeps environ out of reach of a library; _NSGetEnviron is its portable access. */
+#if defined(__APPLE__)
+#include <crt_externs.h>
+#define blink_env_environ (*_NSGetEnviron())
+#else
+extern char** environ;
+#define blink_env_environ environ
 #endif
 
-BLINK_RT_FN int blink_env_default_remove(void* __self, const char* name);
+/* A snapshot: later set_var and remove_var calls do not change the map it answers. An
+   entry with no `=` or with an empty name is not a variable, so it is left out. When a name
+   occurs twice, the first entry wins, so the map agrees with getenv and with `var`. */
+BLINK_RT_FN blink_map* blink_env_default_vars(void* __self);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN int blink_env_default_remove(void* __self, const char* name) {
-    return unsetenv(name);
+BLINK_RT_FN blink_map* blink_env_default_vars(void* __self) {
+    blink_map* m = blink_map_new(&blink_kops_str);
+    for (char** e = blink_env_environ; e != NULL && *e != NULL; e++) {
+        const char* eq = strchr(*e, '=');
+        if (eq == NULL || eq == *e) continue;
+        const char* key = blink_str_from_bytes_gc(*e, (int64_t)(eq - *e));
+        if (blink_map_has(m, key)) continue;
+        blink_map_set(m, key, (void*)blink_str_from_cstr_gc(eq + 1));
+    }
+    return m;
 }
 #endif
 
@@ -5067,13 +5097,6 @@ BLINK_RT_FN const char* blink_env_default_cwd(void* __self) {
 }
 #endif
 
-BLINK_RT_FN void blink_env_default_exit(void* __self, int code);
-#ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN void blink_env_default_exit(void* __self, int code) {
-    exit(code);
-}
-#endif
-
 BLINK_RT_FN int64_t blink_env_default_pid(void* __self);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN int64_t blink_env_default_pid(void* __self) {
@@ -5081,13 +5104,36 @@ BLINK_RT_FN int64_t blink_env_default_pid(void* __self) {
 }
 #endif
 
+BLINK_RT_FN void blink_env_default_set_var(void* __self, const char* name, const char* value);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void blink_env_default_set_var(void* __self, const char* name, const char* value) {
+    setenv(name, value, 1);
+}
+#endif
+
+BLINK_RT_FN void blink_env_default_remove_var(void* __self, const char* name);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void blink_env_default_remove_var(void* __self, const char* name) {
+    unsetenv(name);
+}
+#endif
+
+BLINK_RT_FN void blink_env_default_exit(void* __self, int64_t code);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void blink_env_default_exit(void* __self, int64_t code) {
+    exit((int)code);
+}
+#endif
+
 BLINK_UNUSED static blink_env_vtable blink_env_vtable_default = {
-    blink_env_default_read,
-    blink_env_default_write,
-    blink_env_default_remove,
+    blink_env_default_args,
+    blink_env_default_var,
+    blink_env_default_vars,
     blink_env_default_cwd,
-    blink_env_default_exit,
-    blink_env_default_pid
+    blink_env_default_pid,
+    blink_env_default_set_var,
+    blink_env_default_remove_var,
+    blink_env_default_exit
 };
 
 /* ── Debug assert ───────────────────────────────────────────────────── */

@@ -1,0 +1,116 @@
+// A `handler Env` clause implements an operation of §4.4.3 (sections/04_effects.md) with the
+// operation's own header. The runtime's former slot names (`read`, `write`, `remove`) are
+// not operations, so a clause that uses one is refused at check, as is a clause whose header
+// differs from the operation's.
+
+import compile_test_helpers
+
+test "clauses with the op signatures are clean" {
+    let out = compile_test_helpers.check_via_cli(#"
+fn main() ! Env, IO {
+    with handler Env {
+        fn args() -> List[Str] { [] }
+        fn var(name: Str) -> Option[Str] { default_var(name) }
+        fn vars() -> Map[Str, Str] { Map() }
+        fn cwd() -> Str { "/" }
+        fn pid() -> Int { 1 }
+        fn set_var(name: Str, value: Str) { }
+        fn remove_var(name: Str) { }
+        fn exit(code: Int) -> Never { panic("exit {code}") }
+    } {
+        io.println(env.var("HOME") ?? "none")
+    }
+}
+
+fn default_var(_name: Str) -> Option[Str] { None }
+"#, "env_clause_clean")
+    compile_test_helpers.expect_compiles_clean(out, "every Env op clause is clean")
+}
+
+test "a clause named for the old read slot is refused" {
+    let out = compile_test_helpers.check_via_cli(#"
+fn main() ! Env, IO {
+    with handler Env {
+        fn read(name: Str) -> Str { name }
+    } {
+        io.println(env.var("HOME") ?? "none")
+    }
+}
+"#, "env_clause_old_read")
+    compile_test_helpers.expect_contains(out, "effect `Env` has no operation `read`", "old read slot")
+    compile_test_helpers.expect_contains(out, "args, var, vars, cwd, pid, set_var, remove_var, exit", "Env lists its ops")
+    compile_test_helpers.expect_contains(out, "did you mean `var`?", "the help names the op the old slot became")
+}
+
+test "clauses named for the old write and remove slots name their ops" {
+    let out = compile_test_helpers.check_via_cli(#"
+fn main() ! Env, IO {
+    with handler Env {
+        fn write(name: Str, value: Str) { }
+        fn remove(name: Str) { }
+    } {
+        env.set_var("A", "b")
+    }
+}
+"#, "env_clause_old_write_remove")
+    compile_test_helpers.expect_contains(out, "effect `Env` has no operation `write`", "old write slot")
+    compile_test_helpers.expect_contains(out, "did you mean `set_var`?", "write became set_var")
+    compile_test_helpers.expect_contains(out, "effect `Env` has no operation `remove`", "old remove slot")
+    compile_test_helpers.expect_contains(out, "did you mean `remove_var`?", "remove became remove_var")
+}
+
+test "a clause for a name Env does not have is refused" {
+    let out = compile_test_helpers.check_via_cli(#"
+fn main() ! Env, IO {
+    with handler Env {
+        fn nope() { }
+    } {
+        io.println("t")
+    }
+}
+"#, "env_clause_nope")
+    compile_test_helpers.expect_contains(out, "effect `Env` has no operation `nope`", "unknown op")
+}
+
+test "a var clause that answers a Str is refused" {
+    let out = compile_test_helpers.check_via_cli(#"
+fn main() ! Env, IO {
+    with handler Env {
+        fn var(name: Str) -> Str { name }
+    } {
+        io.println(env.var("HOME") ?? "none")
+    }
+}
+"#, "env_clause_var_str")
+    compile_test_helpers.expect_contains(out, "handler clause `var` returns `Str`, but `Env.var` returns `Option[Str]`", "var result")
+}
+
+test "a set_var clause with one parameter is refused" {
+    let out = compile_test_helpers.check_via_cli(#"
+fn main() ! Env, IO {
+    with handler Env {
+        fn set_var(name: Str) { }
+    } {
+        env.set_var("A", "b")
+    }
+}
+"#, "env_clause_set_var_arity")
+    compile_test_helpers.expect_contains(out, "handler clause `set_var` takes 1 parameter, but `Env.set_var` takes 2", "set_var arity")
+}
+
+test "an Env.Read handler where an Env handler is needed names the ops of each" {
+    let out = compile_test_helpers.check_via_cli(#"
+fn rd() -> Handler[Env.Read] {
+    handler Env.Read {
+        fn var(_name: Str) -> Option[Str] { None }
+    }
+}
+
+fn want() -> Handler[Env] { rd() }
+
+fn main() { }
+"#, "env_handler_coverage_notes")
+    compile_test_helpers.expect_contains(out, "insufficient handler coverage", "Env.Read does not cover Env")
+    compile_test_helpers.expect_contains(out, "`Handler[Env]` requires operations: args, var, vars, cwd, pid, set_var, remove_var, exit", "names the ops Env needs")
+    compile_test_helpers.expect_contains(out, "`Handler[Env.Read]` only provides: args, var, vars, cwd, pid", "names the ops Env.Read has")
+}

@@ -1,0 +1,181 @@
+// A `handler Env` clause names an operation of §4.4.3 (sections/04_effects.md): args, var,
+// vars, cwd and pid of Env.Read, set_var and remove_var of Env.Write, exit of Env.Exit. Each
+// call through the `env` handle performs that operation through the handler in force, and a
+// handler that omits an operation delegates it to the enclosing handler (§4.7.1).
+
+import compile_test_helpers
+
+fn ops_src() -> Str {
+    #"
+fn args_of(tag: Str) -> Handler[Env] {
+    handler Env {
+        fn args() -> List[Str] { ["prog", tag] }
+    }
+}
+
+fn var_only() -> Handler[Env] {
+    handler Env {
+        fn var(name: Str) -> Option[Str] { Some("mock {name}") }
+    }
+}
+
+fn read_only() -> Handler[Env.Read] {
+    handler Env.Read {
+        fn var(name: Str) -> Option[Str] { None }
+    }
+}
+
+// The handler outlives the arena it was built in, so its captured value must be promoted
+// out of the arena with the vtable.
+fn built_in_arena(tag: Str) -> Handler[Env] {
+    with arena {
+        args_of(tag)
+    }
+}
+
+// Allocates after the arena closes, so a capture left in the arena's memory would be
+// overwritten before the handler reads it.
+fn churn() -> Int {
+    let mut total = 0
+    let mut i = 0
+    while i < 2000 {
+        let mut l: List[Int] = []
+        let mut j = 0
+        while j < 50 {
+            l.push(j + 99999)
+            j = j + 1
+        }
+        total = total + l.len()
+        i = i + 1
+    }
+    total
+}
+
+fn reading() -> Str ! Env.Read {
+    env.var("HOME") ?? "none"
+}
+
+fn main() {
+    let real_cwd = env.cwd()
+    let real_args = env.args().len()
+    env.set_var("BLINK_ENV_OPS_PROBE", "real")
+    env.set_var("BLINK_ENV_OPS_EMPTY", "")
+    env.remove_var("BLINK_ENV_OPS_UNSET")
+    io.println("default var of an empty value: {env.var("BLINK_ENV_OPS_EMPTY") == Some("")}")
+    io.println("default var of an unset name: {env.var("BLINK_ENV_OPS_UNSET").is_none()}")
+    io.println("default vars of an empty value: {env.vars().get("BLINK_ENV_OPS_EMPTY") == Some("")}")
+    io.println("real vars: {env.vars().get("BLINK_ENV_OPS_PROBE") ?? "missing"}")
+    with handler Env {
+        fn var(name: Str) -> Option[Str] { Some("mock") }
+    } {
+        io.println("var: {env.var("HOME") ?? "none"}")
+        io.println("through a fn: {reading()}")
+        io.println("omitted cwd: {env.cwd() == real_cwd}")
+        io.println("omitted args: {env.args().len() == real_args}")
+        with read_only() {
+            io.println("Env.Read handler: {env.var("HOME") ?? "none"}")
+        }
+    }
+    with var_only() {
+        io.println("captured name: {env.var("X") ?? "none"}")
+    }
+    with args_of("a1") {
+        io.println("args: {env.args().join(" ")}")
+    }
+    with handler Env {
+        fn vars() -> Map[Str, Str] {
+            let mut m: Map[Str, Str] = Map()
+            m.insert("ONLY", "one")
+            m
+        }
+    } {
+        let vs = env.vars()
+        io.println("vars: {vs.len()} {vs.get("ONLY") ?? "missing"}")
+    }
+    with handler Env {
+        fn cwd() -> Str { "/mock" }
+    } {
+        io.println("cwd: {env.cwd()}")
+    }
+    with handler Env {
+        fn set_var(name: Str, value: Str) { io.println("set {name}={value}") }
+        fn remove_var(name: Str) { io.println("remove {name}") }
+    } {
+        env.set_var("BLINK_ENV_OPS_SET", "v")
+        env.remove_var("BLINK_ENV_OPS_PROBE")
+    }
+    io.println("set reached the OS: {env.var("BLINK_ENV_OPS_SET").is_some()}")
+    io.println("remove reached the OS: {env.var("BLINK_ENV_OPS_PROBE").is_none()}")
+    let promoted = built_in_arena("arena 5")
+    let n = churn()
+    with promoted {
+        io.println("promoted out of an arena: {env.args().join(" ")} after {n}")
+    }
+}
+"#
+}
+
+fn expect_ops_output(out: Str) {
+    assert(out.contains("real vars: real\n"))
+    assert(out.contains("default var of an empty value: true\n"))
+    assert(out.contains("default var of an unset name: true\n"))
+    assert(out.contains("default vars of an empty value: true\n"))
+    assert(out.contains("var: mock\n"))
+    assert(out.contains("through a fn: mock\n"))
+    assert(out.contains("omitted cwd: true\n"))
+    assert(out.contains("omitted args: true\n"))
+    assert(out.contains("Env.Read handler: none\n"))
+    assert(out.contains("captured name: mock X\n"))
+    assert(out.contains("args: prog a1\n"))
+    assert(out.contains("vars: 1 one\n"))
+    assert(out.contains("cwd: /mock\n"))
+    assert(out.contains("set BLINK_ENV_OPS_SET=v\n"))
+    assert(out.contains("remove BLINK_ENV_OPS_PROBE\n"))
+    assert(out.contains("set reached the OS: false\n"))
+    assert(out.contains("remove reached the OS: false\n"))
+    assert(out.contains("promoted out of an arena: prog arena 5 after 100000\n"))
+}
+
+test "the spec example: a var clause answers env.var" {
+    let r = compile_test_helpers.compile_and_run(#"
+fn main() ! Env, IO {
+    with handler Env {
+        fn var(name: Str) -> Option[Str] { Some("mock") }
+    } {
+        io.println(env.var("HOME") ?? "none")
+    }
+}
+"#, "env_handler_spec_example")
+    if r.exit_code != 0 { io.eprintln(r.err_out) }
+    assert_eq(r.exit_code, 0)
+    assert_eq(r.out, "mock\n")
+}
+
+test "each Env operation is intercepted by its clause, and an omitted one delegates" {
+    let r = compile_test_helpers.compile_and_run(ops_src(), "env_handler_each_op")
+    if r.exit_code != 0 { io.eprintln(r.err_out) }
+    assert_eq(r.exit_code, 0)
+    expect_ops_output(r.out)
+}
+
+test "each Env operation gives the same answers under --per-module" {
+    let r = compile_test_helpers.run_via_cli(ops_src(), "env_handler_each_op_per_module", "--per-module")
+    if r.exit_code != 0 { io.eprintln(r.err_out) }
+    assert_eq(r.exit_code, 0)
+    expect_ops_output(r.out)
+}
+
+test "an exit clause intercepts env.exit before the process ends" {
+    let r = compile_test_helpers.compile_and_run(#"
+fn main() ! Env, IO {
+    with handler Env {
+        fn exit(code: Int) -> Never { panic("intercepted exit {code}") }
+    } {
+        env.exit(3)
+    }
+}
+"#, "env_handler_exit")
+    assert(r.exit_code != 0)
+    assert(r.exit_code != 3)
+    assert(r.err_out.contains("intercepted exit 3"))
+}
