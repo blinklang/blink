@@ -12,6 +12,9 @@
 // declares nothing, so the unit keeps the prototypes it has today.
 
 import cg_emit.{DECLARED_GUARD_PREFIX}
+import cc_flags.{unit_cc_flags, cc_error_limit_flag, probe_unsafe_cflag}
+import cname.{c_ffi_struct_macro}
+import foreign_const_probe.{SpellingProbe, SPELLING_PROBE_FILE, probe_failed_lines, spelling_ask, spelling_probe_of, typedef_names}
 
 // The file name the probe's own lines report under, after a `#line` directive.
 let PROBE_FILE = "__blink_decl_probe__"
@@ -87,4 +90,164 @@ pub fn guard_flags(declared: List[Str]) -> Str {
     let mut out = ""
     for s in declared { out = out.concat(" -D{DECLARED_GUARD_PREFIX}{s}") }
     out
+}
+
+// What one guard probe answered: the flags, and why it gave no verdict, or "" when it gave one.
+pub type GuardRun {
+    flags: Str
+    unanswered: Str
+}
+
+// Why the probe at `probe`, which the C compiler ended with `code`, gives no verdict, or ""
+// when `read` says the compiler's errors gave one.
+fn unanswered(probe: Str, write_err: Str, code: Int, cc_err: Str, read: Bool) -> Str {
+    if write_err != "" { return "cannot write the probe {probe}: {write_err}" }
+    if code < 0 || code == 127 { return "the C compiler did not run the probe {probe}" }
+    if read { return "" }
+    let first = cc_err.trim().split("\n").get(0) ?? ""
+    "the C compiler stopped before it read the probe {probe}: {first}"
+}
+
+// The guard flags for the C file `c_file`, whose text is `c_text` and whose guarded symbols
+// are `symbols`. `cc` is the compile command up to the probe's own flags, and `tail` follows
+// the probe file, as the includes do on a unit's compile. `limit` lifts the error limit of `cc`.
+// The probe sits beside `c_file`, so a header the file includes by a quoted name is found the
+// same way.
+pub fn probe_flags(c_file: Str, c_text: Str, symbols: List[Str], cc: Str, tail: Str, limit: Str, label: Str) -> Str ! FS.Write, FS.Delete, Process.Spawn {
+    guard_run(c_file, c_text, symbols, cc, tail, limit, label).flags
+}
+
+// probe_flags, and why the probe gave no verdict.
+pub fn guard_run(c_file: Str, c_text: Str, symbols: List[Str], cc: Str, tail: Str, limit: Str, label: Str) -> GuardRun ! FS.Write, FS.Delete, Process.Spawn {
+    let probe = "{c_file}.declprobe"
+    let mut code = -1
+    let mut flags = ""
+    let mut err_out = ""
+    let mut declared: List[Str] = []
+    let write_err = match fs.write(probe, probe_text(c_text, symbols)) {
+        Ok(_) => ""
+        Err(e) => "{e}"
+    }
+    if write_err == "" {
+        // clang knows a library function such as cos with no header read, and that is not
+        // a declaration the unit can call through. The probe reads English diagnostics.
+        let cmd = "LC_ALL=C {cc}{limit} -fno-builtin -x c {shell_word(probe)} -o {shell_word("{probe}.o")} {tail}"
+        match process.run("sh", ["-c", cmd]) {
+            Ok(r) => {
+                code = match r.end {
+                    ChildEnd.Exited(n) => n
+                    _ => -1
+                }
+                err_out = r.err_out
+                declared = declared_symbols(symbols, code, r.err_out)
+                flags = guard_flags(declared)
+            }
+            Err(_) => {}
+        }
+    }
+    let _ = fs.delete(probe)
+    let _ = fs.delete("{probe}.o")
+    trace.log("blink.build.units", "declared {c_file} for {label} (probe exit {code}):{flags}")
+    // A failed compile of the probe declares at least one symbol unless an error outside the
+    // symbols' lines stopped it.
+    GuardRun { flags: flags, unanswered: unanswered(probe, write_err, code, err_out, code == 0 || !declared.is_empty()) }
+}
+
+// What one spelling probe answered: the flags; when the compile failed as a probe with a
+// verdict fails, its errors; why the probe could not be written, or ""; and why it gave no
+// verdict, or "".
+pub type SpellingRun {
+    flags: Str
+    failed: Bool
+    err_out: Str
+    write_err: Str
+    unanswered: Str
+}
+
+// Runs the spelling probe `p` of `names` for the C file `c_file` (§9.1.3), with `extra` after
+// its lines. The flags spell each name that is a typedef name and not a struct tag, one
+// `-D<macro>=<name>` each. `cc`, `tail`, `limit` and `label` are as for probe_flags. The probe
+// is at `probe`, which must be beside `c_file` when the file's prefix includes a header by a
+// quoted name. A probe that cannot run, or that stops for its error limit, gives no flag, and
+// the unit's layout check reports a name it needed.
+pub fn spelling_run(c_file: Str, probe: Str, p: SpellingProbe, names: List[Str], extra: Str, cc: Str, tail: Str, limit: Str, label: Str) -> SpellingRun ! FS.Write, FS.Delete, Process.Spawn {
+    let mut code = -1
+    let mut flags = ""
+    let mut err_out = ""
+    let write_err = match fs.write(probe, p.text.concat(extra)) {
+        Ok(_) => ""
+        Err(e) => "{e}"
+    }
+    if write_err == "" {
+        let cmd = "LC_ALL=C {cc}{limit} -x c {shell_word(probe)} -o {shell_word("{probe}.o")} {tail}"
+        match process.run("sh", ["-c", cmd]) {
+            Ok(r) => {
+                code = match r.end {
+                    ChildEnd.Exited(n) => n
+                    _ => -1
+                }
+                // 127 is the shell's exit when it finds no cc.
+                if code > 0 && code != 127 {
+                    err_out = r.err_out
+                    for n in typedef_names(names, p, r.err_out, SPELLING_PROBE_FILE) { flags = flags.concat(" -D{c_ffi_struct_macro(n)}={n}") }
+                }
+            }
+            Err(_) => {}
+        }
+    }
+    let _ = fs.delete(probe)
+    let _ = fs.delete("{probe}.o")
+    trace.log("blink.build.units", "spelling {c_file} for {label} (probe exit {code}):{flags}")
+    // Each name has an error on its tag line or its typedef line unless it is both, so a failed
+    // compile with no error on the probe's lines stopped before it read them.
+    let read = code == 0 || (!err_out.contains("too many errors") && !probe_failed_lines(err_out, SPELLING_PROBE_FILE).is_empty())
+    SpellingRun { flags: flags, failed: code > 0 && code != 127, err_out: err_out, write_err: write_err, unanswered: unanswered(probe, write_err, code, err_out, read) }
+}
+
+// The flags blink build gives the C file `c_file` under the compile command `cc_words` (the
+// compiler and the flags a hand-written cc line passes), for `blinkc --build-probe-flags`: the
+// guard flags, then the spelling flags, as on a unit's compile line. Each probe adds the flags
+// blink build gives a unit, so both ask the same question of the same compiler. A cc that
+// cannot run, or a cflag that changes the errors a probe reads, is an error here: a hand cc
+// line has no other sign that a probe answered nothing, and it would keep each prototype a
+// header also declares. The cflag check runs for C that needs no probe too, so a cc line that
+// passes such a flag fails before a later C file needs one.
+pub fn hand_cc_flags(c_file: Str, c_text: Str, cc_words: List[Str]) -> Result[Str, Str] ! FS.Write, FS.Delete, Process.Spawn {
+    for w in cc_words {
+        match probe_unsafe_cflag(w) {
+            Some(why) => return Err("the cflag {w} {why}, so the probe cannot read which symbols a header declares")
+            None => {}
+        }
+    }
+    let symbols = guarded_symbols(c_text)
+    let ask = spelling_ask(c_text)
+    if symbols.is_empty() && ask.is_none() { return Ok("") }
+    let mut quoted: List[Str] = []
+    for w in cc_words { quoted.push(shell_word(w)) }
+    let cc = quoted.join(" ")
+    let version = match process.run("sh", ["-c", "LC_ALL=C {cc} --version 2>&1"]) {
+        Ok(r) => if r.success() { r.out } else { return Err("cannot run the C compiler {cc}: {r.out.trim()}") }
+        Err(e) => return Err("cannot run the C compiler {cc}: {e}")
+    }
+    let unit_cc = "{cc} -c {unit_cc_flags().join(" ")}"
+    let limit = cc_error_limit_flag(version)
+    // The guard probe reads the struct block, so it compiles with the spelling flags, as a
+    // unit does.
+    let defines = match ask {
+        Some(a) => {
+            let run = spelling_run(c_file, "{c_file}.ffi_struct_probe.c", spelling_probe_of(a), a.names, "", unit_cc, "", limit, "hand cc")
+            if run.unanswered != "" { return Err(run.unanswered) }
+            run.flags
+        }
+        None => ""
+    }
+    if symbols.is_empty() { return Ok(defines) }
+    let guards = guard_run(c_file, c_text, symbols, unit_cc, defines, limit, "hand cc")
+    if guards.unanswered != "" { return Err(guards.unanswered) }
+    Ok("{guards.flags}{defines}")
+}
+
+// `w` as one shell word.
+fn shell_word(w: Str) -> Str {
+    "'{w.replace("'", "'\\''")}'"
 }

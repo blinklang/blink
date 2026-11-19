@@ -1,0 +1,205 @@
+// The spelling probe of an `@ffi.struct` name (§9.1.3) asks the C compiler about the names and
+// headers the unit's C holds, as the unit compile reads them. A mirror in a lib/std module is in
+// the unit's C as a program's own mirror is, and the header of a foreign function is not in it.
+
+import std.fs
+import std.process.{ChildEnd, ProcessResult, ChildLimits}
+import std.time.{Duration}
+import compile_test_helpers
+import foreign_const_probe.{spelling_ask, spelling_probe_of}
+
+fn sh(cmd: Str) -> ProcessResult ! Process.Spawn {
+    process.run("sh", ["-c", cmd], limits: ChildLimits { timeout: Some(Duration.seconds(300)) }).unwrap()
+}
+
+fn diag(r: ProcessResult) -> Str {
+    "exit {r.end}\nstdout:\n{r.out}\nstderr:\n{r.err_out}"
+}
+
+// The corpus exports module filters that make each build one unit, so the run drops them:
+// --per-module must reach the per-module path.
+let CLEAN_ENV = "env -u BLINK_PER_MODULE -u BLINK_COMPILER_ARCHIVE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE"
+
+// A root at `tree` with bin/blink, share/ and lib/std of the compiler that runs the test, plus
+// `module` as lib/std/zz_div.bl. The install root comes from realpath(argv[0]).
+fn std_tree(tree: Str, module: Str) ! Process.Spawn, FS.Write {
+    let blink = sh("readlink -f build/blink").out.trim()
+    let bindir = sh("dirname {blink}").out.trim()
+    let home = sh("dirname {bindir}").out.trim()
+    let _ = sh("rm -rf {tree} && mkdir -p {tree}/bin {tree}/lib/std {tree}/app")
+    let _ = sh("cp {blink} {tree}/bin/blink")
+    // The archive and runtime.h sit in share/blink of an install, or beside the binary in a dev build/.
+    let _ = sh("if [ -d {home}/share ]; then cp -rL {home}/share {tree}/share; else mkdir -p {tree}/share/blink && for f in runtime.h libblink_std.a libblink_std.h skip_modules.txt .archive-id monolith.c; do [ -e {bindir}/$f ] && cp -L {bindir}/$f {tree}/share/blink/$f; done; fi")
+    // Every shipped std module is on disk, so none comes from the embedded copy.
+    let lib = sh("if [ -d {home}/lib/std ]; then echo {home}/lib; else echo $(pwd)/lib; fi").out.trim()
+    let _ = sh("for f in {lib}/std/*; do ln -s $(readlink -f $f) {tree}/lib/std/; done")
+    let _ = sh("[ -e {lib}/pkg ] && ln -s $(readlink -f {lib}/pkg) {tree}/lib/pkg")
+    fs.write("{tree}/lib/std/zz_div.bl", module).unwrap()
+    fs.write("{tree}/app/main.bl", APP_DIV).unwrap()
+}
+
+// The std module holds only the type: the binding and the call are the app's.
+let STD_DIV = #"@ffi.struct(header: "stdlib.h", name: "div_t")
+pub type DivT { quot: I32, rem: I32 }
+"#
+
+let APP_DIV = #"import std.zz_div
+
+@ffi("div", header: "stdlib.h")
+fn c_div(a: I32, b: I32) -> zz_div.DivT ! () {}
+
+fn main() {
+    let d = c_div(7, 2)
+    io.println("{d.quot} {d.rem}")
+}
+"#
+
+// div_t is a typedef of an untagged struct, so `struct div_t` names no type: the unit needs the
+// define, whichever module holds the mirror.
+test "a lib/std mirror of a typedef-only C struct builds and runs on both build paths" {
+    let tree = "{compile_test_helpers.scratch_root()}/ffi_struct_std_mirror_tree"
+    std_tree(tree, STD_DIV)
+    let pm = sh("cd {tree}/app && {CLEAN_ENV} BLINK_ROOT={tree} BLINK_CACHE_DIR={tree}/cache ../bin/blink run --per-module main.bl < /dev/null")
+    let one = sh("cd {tree}/app && {CLEAN_ENV} BLINK_ROOT={tree} BLINK_CACHE_DIR={tree}/cache ../bin/blink run --no-per-module main.bl < /dev/null")
+    let _ = sh("rm -rf {tree}")
+    assert_eq(pm.end, ChildEnd.Exited(0), "--per-module: {diag(pm)}")
+    assert_eq(pm.out.trim(), "3 1", "--per-module: {diag(pm)}")
+    assert_eq(one.end, ChildEnd.Exited(0), "--no-per-module: {diag(one)}")
+    assert_eq(one.out.trim(), "3 1", "--no-per-module: {diag(one)}")
+}
+
+// quot is a C int, so an I64 field has the wrong size. The layout check reads the mirrors the
+// unit's C names, a lib/std one too, and reports the field at the std module's mirror.
+test "a lib/std mirror is in the layout check" {
+    let tree = "{compile_test_helpers.scratch_root()}/ffi_struct_std_mirror_layout_tree"
+    std_tree(tree, #"@ffi.struct(header: "stdlib.h", name: "div_t")
+pub type DivT { quot: I64, rem: I32 }
+"#)
+    let pm = sh("cd {tree}/app && {CLEAN_ENV} BLINK_ROOT={tree} BLINK_CACHE_DIR={tree}/cache ../bin/blink build --per-module main.bl < /dev/null")
+    let one = sh("cd {tree}/app && {CLEAN_ENV} BLINK_ROOT={tree} BLINK_CACHE_DIR={tree}/cache ../bin/blink build --no-per-module main.bl < /dev/null")
+    let _ = sh("rm -rf {tree}")
+    for (label, r) in [("--per-module", pm), ("--no-per-module", one)] {
+        assert_eq(r.end, ChildEnd.Exited(101), "{label}: {diag(r)}")
+        assert(r.err_out.contains("GeneratedCDidNotCompile"), "{label}: {diag(r)}")
+        assert(r.err_out.contains("field `quot` has a different size"), "{label}: {diag(r)}")
+        assert(r.err_out.contains("zz_div.bl:1:"), "{label}: not at the std mirror: {diag(r)}")
+    }
+}
+
+fn project(source: Str) -> Str ! FS.Write, Process.Spawn {
+    let dir = sh("mktemp -d /tmp/blink_ffi_spelling_unit_c.XXXXXX").out.trim()
+    let _ = sh("mkdir -p {dir}/src")
+    fs.write("{dir}/blink.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\n").unwrap()
+    fs.write("{dir}/blink.lock", "[metadata]\nlockfile-version = 1\n").unwrap()
+    fs.write("{dir}/src/main.bl", source).unwrap()
+    dir
+}
+
+fn traced_build(dir: Str, mode: Str) -> ProcessResult ! Process.Spawn {
+    sh("B=$(pwd)/build/blink; cd {dir} && {CLEAN_ENV} -u BLINK_ROOT BLINK_CACHE_DIR={dir}/cache BLINK_TRACE_CHANNELS=blink.build.units BLINK_BIN=$B $B build {mode} src/main.bl -o out/app < /dev/null")
+}
+
+// The spelling trace lines of a build: one for each probe it ran.
+fn spelling_lines(r: ProcessResult) -> List[Str] {
+    let mut out: List[Str] = []
+    for line in r.err_out.split("\n") {
+        if line.contains("[trace:blink.build.units] spelling ") { out.push(line) }
+    }
+    out
+}
+
+// The mirror names stdio.h, which declares no glob_t; only glob.h, the header of the foreign
+// function, does. The unit reads stdio.h and not glob.h, so a define would give it a type name
+// it has no declaration for. The build keeps `struct glob_t`, and the layout check reports that
+// stdio.h declares no such name.
+test "a typedef that only a foreign function's header declares gets no define" {
+    let dir = project(#"
+@ffi.struct(header: "stdio.h", name: "glob_t")
+type GlobT { gl_pathc: U64, gl_pathv: U64, gl_offs: U64 }
+
+@ffi("globfree", header: "glob.h")
+fn c_globfree(g: Ptr[GlobT]) ! () {}
+
+fn main() {
+    with ffi.scope() as s {
+        c_globfree(s.alloc[GlobT]())
+    }
+}
+"#)
+    let r = traced_build(dir, "--no-per-module")
+    let _ = sh("rm -rf {dir}")
+    assert_eq(r.end, ChildEnd.Exited(101), diag(r))
+    assert(!r.err_out.contains("BLINK_FFI_STRUCT_glob_t=glob_t"), diag(r))
+    assert(r.err_out.contains("`stdio.h` declares no complete struct tag and no complete typedef name `glob_t`"), diag(r))
+    assert_eq(spelling_lines(r).len(), 1, diag(r))
+}
+
+let TWO_MODULES = #"
+import std.libc
+
+@ffi.struct(header: "stdlib.h", name: "div_t")
+type DivT { quot: I32, rem: I32 }
+
+@ffi("div", header: "stdlib.h")
+fn c_div(a: I32, b: I32) -> DivT ! () {}
+
+fn main() {
+    let d = c_div(7, 2)
+    io.println("{d.quot} {d.rem} {libc.ERR_INVAL > 0}")
+}
+"#
+
+// Each unit of a per-module build includes the program types header, which holds the
+// mirrors and the headers before them, so the build asks the C compiler once and not once
+// per unit.
+test "a per-module build runs one spelling probe, not one per unit" {
+    let dir = project(TWO_MODULES)
+    let r = traced_build(dir, "--per-module")
+    let run = sh("cd {dir} && ./out/app < /dev/null")
+    let _ = sh("rm -rf {dir}")
+    assert_eq(r.end, ChildEnd.Exited(0), diag(r))
+    assert_eq(run.out.trim(), "3 1 true", diag(run))
+    let mut compiles = 0
+    for line in r.err_out.split("\n") {
+        if line.contains("[trace:blink.build.units] compile ") { compiles = compiles + 1 }
+    }
+    assert(compiles >= 2, "the build must have two units: {diag(r)}")
+    let lines = spelling_lines(r)
+    assert_eq(lines.len(), 1, diag(r))
+    assert(lines.get(0).unwrap().ends_with(" -DBLINK_FFI_STRUCT_div_t=div_t"), diag(r))
+}
+
+// Two mirrors can name one header. The probe copies the include lines of the C it asks, so it
+// reads that header once, as the unit does.
+test "a header that two mirrors name is in the probe once" {
+    let dir = project(#"@ffi.struct(header: "stdlib.h", name: "div_t")
+type DivT { quot: I32, rem: I32 }
+@ffi.struct(header: "stdlib.h", name: "ldiv_t")
+type LDivT { quot: I64, rem: I64 }
+
+@ffi("div", header: "stdlib.h")
+fn c_div(a: I32, b: I32) -> DivT ! () {}
+
+fn main() {
+    let d = c_div(7, 2)
+    io.println("{d.quot} {d.rem}")
+}
+"#)
+    let r = sh("B=$(pwd)/build/blink; cd {dir} && {CLEAN_ENV} -u BLINK_ROOT BLINK_CACHE_DIR={dir}/cache $B build --no-per-module --emit c src/main.bl -o out/app < /dev/null")
+    let c = match fs.read("{dir}/out/app.c") {
+        Ok(t) => t
+        Err(_) => ""
+    }
+    let _ = sh("rm -rf {dir}")
+    assert_eq(r.end, ChildEnd.Exited(0), diag(r))
+    let ask = match spelling_ask(c) {
+        Some(a) => a
+        None => {
+            assert(false, "the C has no struct block: {diag(r)}")
+            return
+        }
+    }
+    assert_eq(ask.names, ["div_t", "ldiv_t"])
+    let text = spelling_probe_of(ask).text
+    assert_eq(text.split("#include <stdlib.h>\n").len(), 2, "got: {text}")
+}

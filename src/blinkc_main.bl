@@ -10,10 +10,42 @@ import check_pipeline.{run_build_analyses, build_passed_check}
 import std.path.{path_dirname, path_join}
 import ast_dump.{ast_to_json}
 import ast.{trace_gate_read, trace_mode}
+import foreign_decl_probe.{hand_cc_flags}
 
 fn print_usage() ! IO.Print {
     io.println("Usage: blinkc <source.bl> [output.c] [--format json|human] [--json] [--emit blink] [--stats] [--debug] [--test-build] [--dump-ast] [--blink-trace <phase>] [--link-archive <header-path>]")
     io.println("  Compiles a Blink source file to C.")
+    io.println("Usage: blinkc --build-probe-flags <file.c> <cc> [cflags...]")
+    io.println("  Prints the -D flags that blink build gives a compile of <file.c> with <cc> [cflags...]:")
+    io.println("  the guard flags, so that a header's own declaration of a foreign symbol takes the place")
+    io.println("  of the C file's prototype, then the spelling flags of each @ffi.struct whose C name is a")
+    io.println("  typedef name.")
+}
+
+// `blinkc --build-probe-flags <file.c> <cc> [cflags...]`: a cc line written by hand gets the
+// guard and spelling flags that blink build gives the same C under the same compiler (§9.1).
+// A hand cc line has no other sign that a probe gave no verdict, so bad usage, an unreadable
+// file, a cc that cannot run and a probe that gives no verdict exit 1.
+fn print_build_probe_flags(argv: List[Str]) ! IO, FS.Read, FS.Write, FS.Delete, Process.Spawn, Env.Exit {
+    if argv.len() < 4 {
+        io.eprintln("error: --build-probe-flags needs <file.c> <cc> [cflags...]")
+        env.exit(1)
+    }
+    let c_file = argv.get(2).unwrap()
+    let c_text = match fs.read(c_file) {
+        Ok(t) => t
+        Err(e) => {
+            io.eprintln("error: cannot read {c_file}: {e}")
+            env.exit(1)
+        }
+    }
+    match hand_cc_flags(c_file, c_text, argv.slice(3, argv.len())) {
+        Ok(flags) => io.println(flags.trim())
+        Err(e) => {
+            io.eprintln("error: {e}")
+            env.exit(1)
+        }
+    }
 }
 
 fn write_output(path: Str, text: Str) ! FS.Write, IO, Env.Exit {
@@ -42,6 +74,10 @@ fn main() {
 
         if argv.len() < 2 {
             print_usage()
+            return
+        }
+        if argv.get(1).unwrap() == "--build-probe-flags" {
+            print_build_probe_flags(argv)
             return
         }
 

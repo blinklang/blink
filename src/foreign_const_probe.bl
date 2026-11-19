@@ -10,7 +10,7 @@
 
 import parser.{get_annotation, get_str_named_arg, node_args, node_fields, node_params, positional_str_arg, positional_str_arg_count, node_binder_col, node_col, node_kind, node_line, node_name, node_stmts, node_value, sublist_get, sublist_length}
 import ast.{NodeKind}
-import cname.{c_ffi_symbol, is_c_identifier}
+import cname.{c_ffi_struct_c_name, c_ffi_struct_macro, c_ffi_symbol, is_c_identifier}
 import typecheck.{TyKind, tc_decl_in_std, tc_lookup_node_tid, resolve_alias_tid, type_kind, tk_name}
 import diagnostics.{Diag, diag_error_span_at_notes, FOREIGN_CONST_INVALID, FOREIGN_HEADER_NOT_FOUND, MISSING_NATIVE_DEP}
 
@@ -151,6 +151,41 @@ pub fn foreign_headers_in(program: Int) -> List[ForeignHeader] {
         if is_header_name(header) { out.push(ForeignHeader { decl: d, annotation: ann, header: header }) }
     }
     out
+}
+
+// Every `@ffi.struct` of the program whose name the units spell by a macro (§9.1.3), in a
+// stdlib module too, as each unit's C names them all. `header` is as the annotation gives it.
+pub fn ffi_struct_mirrors_in(program: Int) -> List[ForeignHeader] {
+    let mut out: List[ForeignHeader] = []
+    for decls in [node_params(program), node_fields(program), node_stmts(program)] {
+        if decls == -1 { continue }
+        let mut i = 0
+        while i < sublist_length(decls) {
+            let d = sublist_get(decls, i)
+            i = i + 1
+            if !is_c_identifier(c_ffi_struct_c_name(d)) { continue }
+            let ann = get_annotation(d, "ffi.struct")
+            out.push(ForeignHeader { decl: d, annotation: ann, header: get_str_named_arg(ann, "header") })
+        }
+    }
+    out
+}
+
+// The mirrors of `mirrors` that `names` name, in the order of `names`. A unit's C names only
+// the program's mirrors, so a name with none is a compiler fault: Err gives the first.
+pub fn mirrors_named(names: List[Str], mirrors: List[ForeignHeader]) -> Result[List[ForeignHeader], Str] {
+    let mut out: List[ForeignHeader] = []
+    for n in names {
+        let mut found = false
+        for fh in mirrors {
+            if get_str_named_arg(fh.annotation, "name") == n {
+                out.push(fh)
+                found = true
+            }
+        }
+        if !found { return Err(n) }
+    }
+    Ok(out)
 }
 
 pub fn report_header_not_found(fh: ForeignHeader) ! Diag.Report {
@@ -445,56 +480,69 @@ pub fn triple_of_machine(machine: Str) -> Str {
     parts.join("-")
 }
 
-// The C names of a program's own mirrors (§9.1.3) for the spelling probe, each once. A name
-// that is not one C identifier is a struct tag and is not probed.
-pub fn ffi_struct_names_in(headers: List[ForeignHeader]) -> List[Str] {
-    let mut out: List[Str] = []
-    for fh in headers {
-        if get_annotation(fh.decl, "ffi.struct") != fh.annotation { continue }
-        let n = get_str_named_arg(fh.annotation, "name")
-        if is_c_identifier(n) && !out.contains(n) { out.push(n) }
-    }
-    out
+// A header can declare a mirror's name as a struct tag, as a typedef name, or as both (§9.1.3).
+// The probe asks about the names in a unit's C, with the headers that the unit reads before
+// it spells them. A unit spells each name as `BLINK_FFI_STRUCT_<name>` in a block of
+// `#ifndef` lines; all the C before the block is the unit's prefix.
+pub type SpellingAsk {
+    // The preprocessor lines of the prefix, each with its continuation lines. The other lines
+    // are prototypes and declarations of Blink names, which name no C type.
+    prefix: Str
+    // Each C name that the block spells, once, in the order of the block.
+    names: List[Str]
 }
 
-// A header can declare a mirror's name as a struct tag, as a typedef name, or as both. Two
-// lines per name follow the headers: the first is an error unless `struct <name>` is a
+// The probe's own lines report under this file name, after a `#line` directive.
+pub let SPELLING_PROBE_FILE = "__blink_spelling_probe__"
+
+// What the spelling probe of the unit C `c_text` asks, or None when the text spells no
+// mirror name and needs no probe.
+pub fn spelling_ask(c_text: Str) -> Option[SpellingAsk] {
+    let open = "#ifndef {c_ffi_struct_macro("")}"
+    let at = if c_text.starts_with(open) { 0 } else {
+        match c_text.byte_index_of("\n{open}", 0) {
+            Some(n) => n + 1
+            None => return None
+        }
+    }
+    let mut names: List[Str] = []
+    for line in c_text.byte_slice(at, c_text.byte_len()).split("\n") {
+        if !line.starts_with(open) { continue }
+        let n = line.byte_slice(open.byte_len(), line.byte_len()).trim()
+        if is_c_identifier(n) && !names.contains(n) { names.push(n) }
+    }
+    if names.is_empty() { return None }
+    let mut kept: List[Str] = []
+    let mut continued = false
+    for line in c_text.byte_slice(0, at).split("\n") {
+        if continued || line.trim_left().starts_with("#") {
+            kept.push(line)
+            continued = line.ends_with("\\")
+        }
+    }
+    let prefix = if kept.is_empty() { "" } else { kept.join("\n").concat("\n") }
+    Some(SpellingAsk { prefix: prefix, names: names })
+}
+
+// Two lines per name follow the prefix: the first is an error unless `struct <name>` is a
 // complete type, the second unless `<name>` is a complete type name. `first_line` is the
-// 1-based line of the first name's tag line.
+// line of the first name's tag line, as the C compiler reports it under SPELLING_PROBE_FILE.
 pub type SpellingProbe {
     text: Str
     first_line: Int
 }
 
-// `headers` are the headers of all the program's own foreign declarations, as the unit reads
-// them all: two mirrors of one name can name two headers, and a header can need a type that
-// an earlier one declares.
-pub fn spelling_probe_of(names: List[Str], headers: List[Str]) -> SpellingProbe {
-    let mut text: List[Str] = [
-        "#if !defined(_POSIX_C_SOURCE) && !defined(_GNU_SOURCE) && !defined(__APPLE__)",
-        "#define _POSIX_C_SOURCE 200809L",
-        "#endif",
-        "#include <stdint.h>",
-    ]
-    let mut seen: List[Str] = []
-    for h in headers {
-        if seen.contains(h) { continue }
-        seen.push(h)
-        // check_foreign_headers has already reported a missing header.
-        text.push("#if __has_include(<{h}>)")
-        text.push("#include <{h}>")
-        text.push("#endif")
-    }
-    let first_line = text.len() + 1
+pub fn spelling_probe_of(ask: SpellingAsk) -> SpellingProbe {
+    let mut text: List[Str] = ["#line 1 \"{SPELLING_PROBE_FILE}\""]
     let mut i = 0
-    for n in names {
+    for n in ask.names {
         text.push("enum \{ blink_fs_tag_{i} = sizeof(struct {n}) };")
         // Only a type name can follow `typedef`, so an object or a function named `<name>`
         // fails here.
         text.push("typedef {n} blink_fs_t{i}; enum \{ blink_fs_def_{i} = sizeof(blink_fs_t{i}) };")
         i = i + 1
     }
-    SpellingProbe { text: text.join("\n").concat("\n"), first_line: first_line }
+    SpellingProbe { text: ask.prefix.concat(text.join("\n")).concat("\n"), first_line: 1 }
 }
 
 // When both spellings compile, the tag wins, as `struct <name>` is the default. When neither

@@ -5,75 +5,117 @@
 // the default spelling.
 
 import cname.{is_c_identifier}
-import foreign_const_probe.{spelling_probe_of, typedef_names}
+import foreign_const_probe.{SpellingAsk, SPELLING_PROBE_FILE, mirrors_named, spelling_ask, spelling_probe_of, typedef_names}
 
 fn names() -> List[Str] {
     ["tag_only", "typedef_only", "both", "neither"]
 }
 
-fn headers() -> List[Str] {
-    ["stdlib.h", "a.h", "stdlib.h", "b.h"]
+// A unit's C as codegen writes it: the prefix, then one block per mirror name.
+fn unit_c(prefix: List[Str], mirror_names: List[Str]) -> Str {
+    let mut lines = prefix
+    for n in mirror_names {
+        lines.push("#ifndef BLINK_FFI_STRUCT_{n}")
+        lines.push("#define BLINK_FFI_STRUCT_{n} struct {n}")
+        lines.push("#endif")
+    }
+    lines.push("")
+    lines.push("int blink_main(void);")
+    lines.join("\n").concat("\n")
+}
+
+fn ask() -> SpellingAsk {
+    spelling_ask(unit_c(["#include \"runtime.h\"", "", "#include <stdlib.h>"], names())).unwrap()
 }
 
 fn line_of(text: Str, n: Int) -> Str {
     text.split("\n").get(n - 1) ?? ""
 }
 
-test "the probe has a tag line and a typedef line per name, after the headers" {
-    let p = spelling_probe_of(names(), headers())
-    assert(p.text.contains("#include <stdlib.h>\n"))
-    assert(line_of(p.text, p.first_line).contains("sizeof(struct tag_only)"))
-    assert(line_of(p.text, p.first_line + 1).contains("typedef tag_only "))
-    assert(line_of(p.text, p.first_line + 6).contains("sizeof(struct neither)"))
-    assert(line_of(p.text, p.first_line + 7).contains("typedef neither "))
+// The probe's own lines report under the marker file from line 1, after the prefix.
+fn probe_line(text: Str, n: Int) -> Str {
+    let at = text.byte_index_of("#line 1 \"{SPELLING_PROBE_FILE}\"\n", 0) ?? 0
+    line_of(text.byte_slice(at, text.byte_len()), n + 1)
 }
 
-test "a header named twice is included once" {
-    let p = spelling_probe_of(names(), headers())
-    assert(p.text.split("#include <stdlib.h>").len() == 2)
+test "the probe has a tag line and a typedef line per name, after the prefix" {
+    let p = spelling_probe_of(ask())
+    assert(p.text.starts_with("#include \"runtime.h\"\n#include <stdlib.h>\n#line 1 \"{SPELLING_PROBE_FILE}\"\n"), "got: {p.text}")
+    assert(probe_line(p.text, p.first_line).contains("sizeof(struct tag_only)"))
+    assert(probe_line(p.text, p.first_line + 1).contains("typedef tag_only "))
+    assert(probe_line(p.text, p.first_line + 6).contains("sizeof(struct neither)"))
+    assert(probe_line(p.text, p.first_line + 7).contains("typedef neither "))
 }
 
-// Two mirrors of one name can name two headers, and only one of them may declare it.
-test "the probe reads every header in order" {
-    let p = spelling_probe_of(["div_t"], ["a.h", "stdlib.h", "b.h"])
-    let want = "#include <a.h>\n#endif\n#if __has_include(<stdlib.h>)\n#include <stdlib.h>\n#endif\n#if __has_include(<b.h>)\n#include <b.h>\n"
-    assert(p.text.contains(want), "got: {p.text}")
+// A per-module unit writes its own prototypes between the headers. They name no C type, and
+// each unit has others, so the units would not share one probe if the prefix kept them.
+test "the prefix keeps each preprocessor line in order and drops the other lines" {
+    let c = unit_c([
+        "#define BLINK_USE_EXTERN_RUNTIME_STORAGE 1",
+        "#include \"libblink_std.h\"",
+        "#include \"blink.types.h\"",
+        "int64_t blink_3std_1libc_errno(void);",
+        "",
+        "#include <stddef.h>",
+        "  #include <poll.h>",
+    ], ["div_t"])
+    let a = spelling_ask(c).unwrap()
+    assert_eq(a.prefix, "#define BLINK_USE_EXTERN_RUNTIME_STORAGE 1\n#include \"libblink_std.h\"\n#include \"blink.types.h\"\n#include <stddef.h>\n  #include <poll.h>\n")
+    assert_eq(a.names, ["div_t"])
+}
+
+test "a preprocessor line keeps its continuation lines" {
+    let a = spelling_ask(unit_c(["#define WIDE(x) \\", "    ((x) + 1)", "int skipped;"], ["div_t"])).unwrap()
+    assert_eq(a.prefix, "#define WIDE(x) \\\n    ((x) + 1)\n")
+}
+
+test "a name the block spells twice is asked once, in block order" {
+    let a = spelling_ask(unit_c([], ["b_t", "a_t", "b_t"])).unwrap()
+    assert_eq(a.names, ["b_t", "a_t"])
+    assert_eq(a.prefix, "")
+}
+
+// The struct block is the only sign that the unit needs a probe, so a C with none runs none.
+test "a C with no struct block asks nothing" {
+    assert(spelling_ask("#include \"runtime.h\"\nint main(void) \{ return 0; }\n").is_none())
+    assert(spelling_ask("").is_none())
 }
 
 test "only a name whose tag line fails and whose typedef line compiles is a typedef name" {
-    let p = spelling_probe_of(names(), headers())
+    let p = spelling_probe_of(ask())
     let f = p.first_line
     let err = [
-        "/tmp/x/ffi_struct_probe.c:{f + 1}:9: error: unknown type name 'tag_only'",
-        "/tmp/x/ffi_struct_probe.c:{f + 2}:30: error: invalid application of 'sizeof' to incomplete type 'struct typedef_only'",
-        "/tmp/x/ffi_struct_probe.c:{f + 6}:30: error: invalid application of 'sizeof' to incomplete type 'struct neither'",
-        "/tmp/x/ffi_struct_probe.c:{f + 7}:9: error: unknown type name 'neither'",
+        "{SPELLING_PROBE_FILE}:{f + 1}:9: error: unknown type name 'tag_only'",
+        "{SPELLING_PROBE_FILE}:{f + 2}:30: error: invalid application of 'sizeof' to incomplete type 'struct typedef_only'",
+        "{SPELLING_PROBE_FILE}:{f + 6}:30: error: invalid application of 'sizeof' to incomplete type 'struct neither'",
+        "{SPELLING_PROBE_FILE}:{f + 7}:9: error: unknown type name 'neither'",
     ].join("\n")
-    let got = typedef_names(names(), p, err, "ffi_struct_probe.c")
+    let got = typedef_names(names(), p, err, SPELLING_PROBE_FILE)
     assert_eq(got.len(), 1)
     assert_eq(got.get(0) ?? "", "typedef_only")
 }
 
 test "an error in a header or in another file names no probe line" {
-    let p = spelling_probe_of(names(), headers())
+    let p = spelling_probe_of(ask())
     let f = p.first_line
     let err = [
         "/usr/include/stdlib.h:{f + 2}:1: error: something in the header",
         "/tmp/x/other_probe.c:{f + 2}:1: error: something in another file",
+        "/tmp/x/app.c:{f + 2}:1: error: something in the unit's own header",
     ].join("\n")
-    assert(typedef_names(names(), p, err, "ffi_struct_probe.c").is_empty())
+    assert(typedef_names(names(), p, err, SPELLING_PROBE_FILE).is_empty())
 }
 
 // A compile that stopped at its error limit did not read the later lines, and a line it
 // did not read looks as if it compiled.
 test "a compile that stopped at its error limit answers no typedef name" {
-    let p = spelling_probe_of(names(), headers())
+    let p = spelling_probe_of(ask())
     let f = p.first_line
     let err = [
-        "/tmp/x/ffi_struct_probe.c:{f + 2}:30: error: invalid application of 'sizeof' to incomplete type 'struct typedef_only'",
+        "{SPELLING_PROBE_FILE}:{f + 2}:30: error: invalid application of 'sizeof' to incomplete type 'struct typedef_only'",
         "fatal error: too many errors emitted, stopping now [-ferror-limit=]",
     ].join("\n")
-    assert(typedef_names(names(), p, err, "ffi_struct_probe.c").is_empty())
+    assert(typedef_names(names(), p, err, SPELLING_PROBE_FILE).is_empty())
 }
 
 // Only a C identifier can be a macro name or a typedef name, so only such a name gets a probe
@@ -85,4 +127,15 @@ test "only a C identifier gets a spelling macro" {
     assert(!is_c_identifier("9lives"))
     assert(!is_c_identifier("struct div_t"))
     assert(!is_c_identifier("a-b"))
+}
+
+// A unit's C names only the program's mirrors, so the layout check maps each name back to a
+// declaration. A name with none must come back as an error, for the build to report as an
+// internal error, and never drop out of the check.
+test "a mirror name with no declaration is an error, not a skip" {
+    match mirrors_named(["div_t"], []) {
+        Ok(_) => assert(false, "a name with no mirror mapped")
+        Err(n) => assert_eq(n, "div_t")
+    }
+    assert(mirrors_named([], []).is_ok())
 }

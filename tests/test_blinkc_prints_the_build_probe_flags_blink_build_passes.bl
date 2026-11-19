@@ -1,0 +1,280 @@
+// A cc line written by hand, as in the compiler's own build, gets its guard and spelling flags
+// from `blinkc --build-probe-flags <file.c> <cc> [cflags...]`. Those flags must be the ones
+// blink build passes for the same C under the same compiler, or the two build paths drop
+// different prototypes and spell a mirror's C type differently. The program binds three symbols: unistd.h declares link, the vendored ops.h
+// declares ops_len only under its -I, and no header declares ops_count.
+import std.process.{ChildEnd, ProcessResult, ChildLimits}
+import std.time.{Duration}
+
+fn sh(cmd: Str) -> ProcessResult ! Process.Spawn {
+    process.run("sh", ["-c", cmd], limits: ChildLimits { timeout: Some(Duration.seconds(300)) }).unwrap()
+}
+
+fn diag(r: ProcessResult) -> Str {
+    "exit {r.end}\nstdout:\n{r.out}\nstderr:\n{r.err_out}"
+}
+
+let MAIN = #"
+@ffi.struct(header: "ops.h", name: "ops_cell")
+type Cell { n: I32 }
+
+@ffi("ops", "ops_count", header: "ops.h")
+@trusted(audit: "T1")
+fn c_count(s: Ptr[U8]) -> I32 ! () {}
+
+@ffi("ops", "ops_len", header: "ops.h")
+@trusted(audit: "T1")
+fn c_len(s: Ptr[U8]) -> I32 ! () {}
+
+@ffi("link", header: "unistd.h")
+@trusted(audit: "T1")
+fn c_link(old: Ptr[U8], new: Ptr[U8]) -> I32 ! () {}
+
+fn main() {
+    with ffi.scope() as s {
+        let c = s.alloc[Cell]()
+        c.n.write(c_count(s.cstr("abcde")) + c_len(s.cstr("ab")))
+        io.println("{c.n.read()} {c_link(s.cstr("no-such-a"), s.cstr("no-such-b"))}")
+    }
+}
+"#
+
+// Writes the project, builds it with the probe traced, and gives back its dir and the flags
+// the trace names for the program's C.
+fn build_traced() -> (Str, Str) ! FS.Write, Process.Spawn {
+    let dir = sh("mktemp -d /tmp/blink_hand_cc_flags.XXXXXX").out.trim()
+    let _ = sh("mkdir -p {dir}/src {dir}/vendor")
+    fs.write("{dir}/blink.toml", "[package]\nname = \"handcc\"\nversion = \"0.1.0\"\n\n[native-dependencies]\nops = \{ type = \"vendored\", path = \"vendor/ops.c\", headers = [\"ops.h\"] \}\n").unwrap()
+    fs.write("{dir}/blink.lock", "[metadata]\nlockfile-version = 1\n").unwrap()
+    fs.write("{dir}/vendor/ops.h", "#ifndef OPS_H\n#define OPS_H\nstruct ops_cell \{ int n; };\nint ops_len(const char *s);\n#endif\n").unwrap()
+    fs.write("{dir}/vendor/ops.c", "#include \"ops.h\"\nint ops_len(const char *s) \{ int n = 0; while (s[n]) n++; return n; }\nint ops_count(const char *s) \{ return ops_len(s); }\n").unwrap()
+    fs.write("{dir}/src/main.bl", MAIN).unwrap()
+    // The corpus exports module filters that make the build one unit; the run drops them so
+    // the build takes its own one-unit path.
+    let r = sh("B=$(pwd)/build/blink; cd {dir} && env -u BLINK_PER_MODULE -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE BLINK_CACHE_DIR={dir}/cache BLINK_TRACE_CHANNELS=blink.build.units BLINK_BIN=$B $B build --no-per-module src/main.bl -o out/app < /dev/null")
+    assert_eq(r.end, ChildEnd.Exited(0), "build: {diag(r)}")
+    let run = sh("cd {dir} && ./out/app < /dev/null")
+    assert_eq(run.out.trim(), "7 -1", "run: {diag(run)}")
+    (dir, traced_flags(r.err_out, "declared"))
+}
+
+// The flags the last `kind` probe in a build's trace gave. Each probe of the C here has an
+// error to read, so a probe that exits other than 1 did not run clean.
+fn traced_flags(err: Str, kind: Str) -> Str {
+    let marker = "(probe exit 1):"
+    let mut flags = "<no {kind} probe trace>"
+    for line in err.split("\n") {
+        if !line.contains("[trace:blink.build.units] {kind} ") { continue }
+        match line.byte_index_of(marker, 0) {
+            Some(n) => flags = line.byte_slice(n + marker.byte_len(), line.byte_len()).trim()
+            None => flags = "<probe did not run clean: {line}>"
+        }
+    }
+    flags
+}
+
+fn entry(dir: Str, includes: Str) -> ProcessResult ! Process.Spawn {
+    sh("build/blinkc --build-probe-flags {dir}/out/app.c cc -pipe -O1 {includes} -I$(pwd)/build")
+}
+
+test "blinkc prints the guard flags blink build passes for the same C and cc" {
+    let (dir, built) = build_traced()
+    let hand = entry(dir, "-I{dir}/vendor")
+    let _ = sh("rm -rf {dir}")
+    assert_eq(built, "-DBLINK_DECLARED_ops_len -DBLINK_DECLARED_link")
+    assert_eq(hand.end, ChildEnd.Exited(0), diag(hand))
+    assert_eq(hand.out.trim(), built, diag(hand))
+}
+
+let DIV = #"
+@ffi.struct(header: "stdlib.h", name: "div_t")
+type DivT { quot: I32, rem: I32 }
+
+@ffi("div", header: "stdlib.h")
+@trusted(audit: "T1")
+fn c_div(a: I32, b: I32) -> DivT ! () {}
+
+fn main() {
+    let d = c_div(7, 2)
+    io.println("{d.quot} {d.rem}")
+}
+"#
+
+// div_t is a typedef of an untagged struct, so the C needs the spelling flag as well as the
+// guard flag of div. The flags come on one line, in the order of blink build's unit compile.
+test "blinkc prints the guard and spelling flags blink build passes, and a hand cc builds with them" {
+    let dir = sh("mktemp -d /tmp/blink_hand_cc_flags.XXXXXX").out.trim()
+    let _ = sh("mkdir -p {dir}/src")
+    fs.write("{dir}/blink.toml", "[package]\nname = \"handdiv\"\nversion = \"0.1.0\"\n").unwrap()
+    fs.write("{dir}/blink.lock", "[metadata]\nlockfile-version = 1\n").unwrap()
+    fs.write("{dir}/src/main.bl", DIV).unwrap()
+    let r = sh("B=$(pwd)/build/blink; cd {dir} && env -u BLINK_PER_MODULE -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE BLINK_CACHE_DIR={dir}/cache BLINK_TRACE_CHANNELS=blink.build.units BLINK_BIN=$B $B build --no-per-module src/main.bl -o out/app < /dev/null")
+    let built = "{traced_flags(r.err_out, "declared")} {traced_flags(r.err_out, "spelling")}"
+    let hand = entry(dir, "")
+    let flags = hand.out.trim()
+    let cc = sh("cc -O1 {flags} -I$(pwd)/build {dir}/out/app.c -o {dir}/hand build/libblink_std.a -lm -lgc -pthread -Wl,--gc-sections")
+    let run = sh("{dir}/hand < /dev/null")
+    let _ = sh("rm -rf {dir}")
+    assert_eq(r.end, ChildEnd.Exited(0), "build: {diag(r)}")
+    assert_eq(built, "-DBLINK_DECLARED_div -DBLINK_FFI_STRUCT_div_t=div_t", diag(r))
+    assert_eq(hand.end, ChildEnd.Exited(0), diag(hand))
+    assert_eq(flags, built, diag(hand))
+    assert_eq(cc.end, ChildEnd.Exited(0), "hand cc: {diag(cc)}")
+    assert_eq(run.out.trim(), "3 1", diag(run))
+}
+
+// Without the vendored -I the probe stops at ops.h before it reads its own lines, so it gives
+// no verdict, and blinkc says so: the cflags a hand cc line passes reach the probe.
+test "the cflags given to blinkc reach the probe" {
+    let (dir, _built) = build_traced()
+    let hand = entry(dir, "")
+    let _ = sh("rm -rf {dir}")
+    assert_eq(hand.end, ChildEnd.Exited(1), diag(hand))
+    assert(hand.err_out.contains("ops.h"), diag(hand))
+    assert_eq(hand.out, "", diag(hand))
+}
+
+test "blinkc exits 1 and names the file it cannot read" {
+    let r = sh("build/blinkc --build-probe-flags /nonexistent/blink_hand_cc.c cc -O1")
+    assert_eq(r.end, ChildEnd.Exited(1), diag(r))
+    assert(r.err_out.contains("/nonexistent/blink_hand_cc.c"), diag(r))
+    assert_eq(r.out, "", diag(r))
+}
+
+test "blinkc exits 1 on --build-probe-flags with no cc" {
+    let r = sh("build/blinkc --build-probe-flags /nonexistent/blink_hand_cc.c")
+    assert_eq(r.end, ChildEnd.Exited(1), diag(r))
+    assert_eq(r.out, "", diag(r))
+}
+
+// A C file that guards no prototype runs no probe and needs no flag.
+test "blinkc prints an empty line for C that guards no prototype" {
+    let dir = sh("mktemp -d /tmp/blink_hand_cc_flags.XXXXXX").out.trim()
+    fs.write("{dir}/plain.c", "int main(void) \{ return 0; }\n").unwrap()
+    let r = sh("build/blinkc --build-probe-flags {dir}/plain.c cc -O1")
+    let _ = sh("rm -rf {dir}")
+    assert_eq(r.end, ChildEnd.Exited(0), diag(r))
+    assert_eq(r.out, "\n", diag(r))
+}
+
+// A cc that cannot run declares nothing, and a hand cc line would then keep each prototype a
+// header also declares. The entry says so in place of an empty line. One argument that holds a
+// whole cc line, as "$CC" gives, is a cc that cannot run.
+test "blinkc exits 1 and names a cc that cannot run" {
+    let dir = sh("mktemp -d /tmp/blink_hand_cc_flags.XXXXXX").out.trim()
+    fs.write("{dir}/guarded.c", "#include <unistd.h>\n#ifndef BLINK_DECLARED_link\nint link(const char *a, const char *b);\n#endif\n").unwrap()
+    let missing = sh("build/blinkc --build-probe-flags {dir}/guarded.c blink_no_such_cc -O1")
+    let one_word = sh("build/blinkc --build-probe-flags {dir}/guarded.c 'cc -O1'")
+    let _ = sh("rm -rf {dir}")
+    assert_eq(missing.end, ChildEnd.Exited(1), diag(missing))
+    assert(missing.err_out.contains("blink_no_such_cc"), diag(missing))
+    assert_eq(missing.out, "", diag(missing))
+    assert_eq(one_word.end, ChildEnd.Exited(1), diag(one_word))
+    assert(one_word.err_out.contains("cc -O1"), diag(one_word))
+    assert_eq(one_word.out, "", diag(one_word))
+}
+
+let MANY = ["puts", "printf", "fputs", "fopen", "fclose", "fread", "fwrite", "fflush", "malloc", "free", "calloc", "realloc", "abort", "exit", "atoi", "strlen", "strcmp", "strcpy", "strncpy", "strcat", "memcpy", "memset", "memcmp", "strchr"]
+
+// The probe has one error for each declared symbol, and clang stops after 20 errors unless
+// told not to. A probe that stops declares nothing, so 24 declared symbols need the limit off.
+test "blinkc gets every declared symbol from clang past its error limit" {
+    let dir = sh("mktemp -d /tmp/blink_hand_cc_flags.XXXXXX").out.trim()
+    let mut text = "#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n"
+    let mut want: List[Str] = []
+    for s in MANY {
+        text = text.concat("#ifndef BLINK_DECLARED_{s}\nint {s};\n#endif\n")
+        want.push("-DBLINK_DECLARED_{s}")
+    }
+    fs.write("{dir}/many.c", text).unwrap()
+    let mut ccs = ["cc"]
+    if sh("command -v clang").out.trim() != "" { ccs.push("clang") }
+    for cc in ccs {
+        let r = sh("build/blinkc --build-probe-flags {dir}/many.c {cc} -O1")
+        assert_eq(r.end, ChildEnd.Exited(0), "{cc}: {diag(r)}")
+        assert_eq(r.out.trim(), want.join(" "), "{cc}: {diag(r)}")
+    }
+    let _ = sh("rm -rf {dir}")
+}
+
+// The C file's path reaches the probe as one shell word.
+test "blinkc probes a C file whose path holds a space" {
+    let dir = sh("mktemp -d '/tmp/blink hand cc flags.XXXXXX'").out.trim()
+    fs.write("{dir}/guarded.c", "#include <unistd.h>\n#ifndef BLINK_DECLARED_link\nint link(const char *a, const char *b);\n#endif\n").unwrap()
+    let r = sh("build/blinkc --build-probe-flags '{dir}/guarded.c' cc -O1")
+    let _ = sh("rm -rf '{dir}'")
+    assert_eq(r.end, ChildEnd.Exited(0), diag(r))
+    assert_eq(r.out.trim(), "-DBLINK_DECLARED_link", diag(r))
+}
+
+// The probe reads each error the C compiler gives. blinkc refuses a cflag that can change which
+// errors come, how they read, or that writes output beside the probe, with or without guards in
+// the C file. A response file can hold such a flag where blinkc cannot see it.
+let UNREADABLE_CFLAGS = ["-fdiagnostics-color", "-fdiagnostics-color=always", "-fcolor-diagnostics", "-fansi-escape-codes", "-fdiagnostics-format=json", "-fdiagnostics-format=sarif-stderr", "-fdiagnostics-format=msvc", "-Wfatal-errors", "-Werror", "-Werror=redundant-decls", "-pedantic-errors", "--pedantic-errors", "-fmax-errors=1", "-ferror-limit=1", "-E", "--preprocess", "-###", "--dependencies", "--user-dependencies", "-M", "-MM", "-MD", "-MMD", "-MF", "-MT", "-MQ", "-MP", "@flags.rsp"]
+
+test "blinkc exits 1 and names a cflag that changes the errors the probe reads" {
+    let dir = sh("mktemp -d /tmp/blink_hand_cc_flags.XXXXXX").out.trim()
+    fs.write("{dir}/guarded.c", "#include <unistd.h>\n#ifndef BLINK_DECLARED_link\nint link(const char *a, const char *b);\n#endif\n").unwrap()
+    fs.write("{dir}/plain.c", "int main(void) \{ return 0; }\n").unwrap()
+    let mut results: List[(Str, ProcessResult)] = []
+    for flag in UNREADABLE_CFLAGS {
+        results.push((flag, sh("build/blinkc --build-probe-flags {dir}/guarded.c cc -O1 '{flag}'")))
+        results.push((flag, sh("build/blinkc --build-probe-flags {dir}/plain.c cc '{flag}'")))
+    }
+    let _ = sh("rm -rf {dir}")
+    for (flag, r) in results {
+        assert_eq(r.end, ChildEnd.Exited(1), "{flag}: {diag(r)}")
+        assert(r.err_out.contains(flag), "{flag}: {diag(r)}")
+        assert_eq(r.out, "", "{flag}: {diag(r)}")
+    }
+}
+
+// -Werror=implicit-function-declaration is a flag blink build gives each unit, and lowercase -m
+// flags pick the target machine: neither changes which errors name a prototype.
+test "blinkc keeps a cflag that does not change the errors the probe reads" {
+    let dir = sh("mktemp -d /tmp/blink_hand_cc_flags.XXXXXX").out.trim()
+    fs.write("{dir}/guarded.c", "#include <unistd.h>\n#ifndef BLINK_DECLARED_link\nint link(const char *a, const char *b);\n#endif\n").unwrap()
+    let r = sh("build/blinkc --build-probe-flags {dir}/guarded.c cc -O1 -Werror=implicit-function-declaration -m64 -Wall -fdiagnostics-color=never")
+    let _ = sh("rm -rf {dir}")
+    assert_eq(r.end, ChildEnd.Exited(0), diag(r))
+    assert_eq(r.out.trim(), "-DBLINK_DECLARED_link", diag(r))
+}
+
+let DIV_SPELLING = "#include <stdlib.h>\n#ifndef BLINK_FFI_STRUCT_div_t\n#define BLINK_FFI_STRUCT_div_t struct div_t\n#endif\n"
+
+// A cflag that blinkc cannot check, such as a second input file, can stop the compile before it
+// reads the probe. The probe then answers nothing, and blinkc says so in place of an empty line.
+test "blinkc exits 1 when the C compiler stops before it reads the probe" {
+    let dir = sh("mktemp -d /tmp/blink_hand_cc_flags.XXXXXX").out.trim()
+    fs.write("{dir}/guarded.c", "#include <unistd.h>\n#ifndef BLINK_DECLARED_link\nint link(const char *a, const char *b);\n#endif\n").unwrap()
+    fs.write("{dir}/div.c", DIV_SPELLING).unwrap()
+    fs.write("{dir}/other.c", "int other(void) \{ return 0; }\n").unwrap()
+    let guard = sh("build/blinkc --build-probe-flags {dir}/guarded.c cc -O1 {dir}/other.c")
+    let spelling = sh("build/blinkc --build-probe-flags {dir}/div.c cc -O1 {dir}/other.c")
+    let _ = sh("rm -rf {dir}")
+    assert_eq(guard.end, ChildEnd.Exited(1), diag(guard))
+    assert(guard.err_out.contains("probe"), diag(guard))
+    assert_eq(guard.out, "", diag(guard))
+    assert_eq(spelling.end, ChildEnd.Exited(1), diag(spelling))
+    assert(spelling.err_out.contains("probe"), diag(spelling))
+    assert_eq(spelling.out, "", diag(spelling))
+}
+
+// The probe is written beside the C file, so it finds a header the file includes by a quoted
+// name. When that dir is read-only the probe cannot run, and blinkc says so.
+test "blinkc exits 1 when it cannot write the probe beside the C file" {
+    let dir = sh("mktemp -d /tmp/blink_hand_cc_flags.XXXXXX").out.trim()
+    let _ = sh("mkdir {dir}/ro")
+    fs.write("{dir}/ro/guarded.c", "#include <unistd.h>\n#ifndef BLINK_DECLARED_link\nint link(const char *a, const char *b);\n#endif\n").unwrap()
+    fs.write("{dir}/ro/div.c", DIV_SPELLING).unwrap()
+    let _ = sh("chmod 555 {dir}/ro")
+    let guard = sh("build/blinkc --build-probe-flags {dir}/ro/guarded.c cc -O1")
+    let spelling = sh("build/blinkc --build-probe-flags {dir}/ro/div.c cc -O1")
+    let _ = sh("chmod 755 {dir}/ro; rm -rf {dir}")
+    assert_eq(guard.end, ChildEnd.Exited(1), diag(guard))
+    assert(guard.err_out.contains("guarded.c.declprobe"), diag(guard))
+    assert_eq(guard.out, "", diag(guard))
+    assert_eq(spelling.end, ChildEnd.Exited(1), diag(spelling))
+    assert(spelling.err_out.contains("div.c.ffi_struct_probe.c"), diag(spelling))
+    assert_eq(spelling.out, "", diag(spelling))
+}

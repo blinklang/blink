@@ -54,7 +54,7 @@ import compiler.{
 }
 import cg.{Codegen, CgConfig, HeaderPreamble, ProgramFacts, generate, generate_archive_header, generate_types_header, generate_module_headers_from, generate_module_headers_with, header_preamble, generate_module_object_with, generate_module_chunks_with, program_facts, enumerate_program_modules, archive_unit_modules, module_instance_names, entry_unit_facts}
 import build_unit_headers.{HeaderIndex, index_headers, unit_declarations, splice_declarations}
-import cname.{c_ffi_struct_macro, c_ffi_symbol, c_module_header_name, c_module_private_header_name, c_program_types_header_name}
+import cname.{c_ffi_symbol, c_module_header_name, c_module_private_header_name, c_program_types_header_guard, c_program_types_header_name}
 import ir.{ir_track_sources, ir_sources_read}
 import build_compiler_archive.{build_compiler_archive, compiler_archive_env, compiler_archive_link_args, compiler_archive_of_unit, compiler_archive_skip_keys}
 import build_stdlib.{build_stdlib_archive, build_stdlib_archive_in, list_stdlib_module_keys, resolve_runtime_h, stdlib_rebuild_forced}
@@ -76,7 +76,8 @@ import check_pipeline.{check_source, run_build_analyses, check_exit_code, check_
 import fix_edits.{FixEdit, fix_plan, fix_apply, fix_byte_offset}
 import foreign_decl_probe
 import ffi_layout_probe.{LayoutMismatch, layout_probe_of, layout_mismatches, layout_mismatch_text}
-import foreign_const_probe.{ForeignConst, ForeignHeader, ProbeVerdict, ffi_struct_names_in, spelling_probe_of, typedef_names, foreign_const_header, foreign_consts_in, foreign_headers_in, own_ffi_note, report_header_not_found, is_runtime_lib, report_undeclared_lib, probe_of, probe_verdicts, report_verdicts, text_verdict, triple_of_machine}
+import cc_flags.{unit_cc_flags, generated_c_flags, cc_error_limit_flag}
+import foreign_const_probe.{ForeignConst, ForeignHeader, ProbeVerdict, SPELLING_PROBE_FILE, ffi_struct_mirrors_in, mirrors_named, spelling_ask, spelling_probe_of, foreign_const_header, foreign_consts_in, foreign_headers_in, own_ffi_note, report_header_not_found, is_runtime_lib, report_undeclared_lib, probe_of, probe_verdicts, report_verdicts, text_verdict, triple_of_machine}
 import symbol_index.{collect_effects}
 import query.{query_index_source, query_answer}
 import limit_values.{
@@ -88,7 +89,7 @@ import diag_catalog.{diag_catalog_code}
 import diagnostics.{
     Diag, DiagEntry, diag_entries, diag_prepend, diag_fix_edits,
     diag_count, diag_warn_count, diag_ice_count, diag_flush, diag_mark_flushed, diag_reset, diag_entry_count,
-    diag_source_file, diag_file_for_node, diag_error_no_loc, diag_ice_at, diag_format, diag_explain, diag_set_abort_status_line,
+    diag_source_file, diag_file_for_node, diag_error_no_loc, diag_ice, diag_ice_at, diag_format, diag_explain, diag_set_abort_status_line,
     embedded_inner_key, diag_entry_text, diag_normalize_path, diag_usage_error_text, diag_register_source, json_escape,
     MISSING_NATIVE_DEP, NATIVE_DEP_UNAVAILABLE_CROSS, INCOMPATIBLE_STDLIB_ARCHIVE,
     TEST_RESULT_LOST, TEST_BINARY_DID_NOT_RUN, TEST_BUILD_ENDED_WITHOUT_DIAGNOSTIC, GENERATED_C_DID_NOT_COMPILE,
@@ -734,6 +735,8 @@ type CompiledText {
     c: Str
     foreign: List[ForeignConst]
     headers: List[ForeignHeader]
+    // Every mirror the units can name, stdlib ones too, for the layout check.
+    mirrors: List[ForeignHeader]
     // Made while the checked program is at hand: the C compile that may need it runs later.
     ffi_note: Str
     entry: EntryMain
@@ -936,7 +939,7 @@ fn compile_to_text(source_path: Str, debug_mode: Int, strict_mode: Int, test_bui
         }
     }
 
-    Ok(CompiledText { c: c_output, foreign: foreign, headers: foreign_headers_in(final_program), ffi_note: own_ffi_note(final_program), entry: entry_main_of(final_program) })
+    Ok(CompiledText { c: c_output, foreign: foreign, headers: foreign_headers_in(final_program), mirrors: ffi_struct_mirrors_in(final_program), ffi_note: own_ffi_note(final_program), entry: entry_main_of(final_program) })
 }
 
 // Whether the compiler archive's evidence vector has a slot for every effect `program`
@@ -1189,23 +1192,6 @@ fn cc_opt_flags(debug_mode: Int, release_mode: Int) -> List[Str] {
         return ["-O2"]
     }
     ["-O1"]
-}
-
-// Flags each per-module unit compiles with, on top of cc_opt_flags. A unit holds only the
-// declarations its scan found, so a missed one must stop the build: gcc before 14 only warns
-// on a call to an undeclared function and then guesses an int return.
-fn unit_cc_flags() -> List[Str] {
-    let mut flags = ["-Werror=implicit-function-declaration"]
-    for f in generated_c_flags() { flags.push(f) }
-    flags
-}
-
-// Flags for each compile of C that blink generates, and never for a user's C source. A call
-// through a header's prototype passes a Ptr[U8] as uint8_t * where C takes char *, and clang
-// warns on the sign of the pointer target by default. No change to the Blink source can stop
-// that warning, so it is noise to a user.
-fn generated_c_flags() -> List[Str] {
-    ["-Wno-pointer-sign"]
 }
 
 // The paths an object at this level records, for its key: the dir cc runs in, the dir its C
@@ -2208,51 +2194,61 @@ fn check_foreign_consts(foreign: List[ForeignConst], targets: List[Str], used_de
 }
 
 // §9.1.3: a mirror's `name` can be a struct tag or a typedef name in its header, and only the
-// target's C compiler can tell which. The program's units spell the original as a macro that
-// is `struct <name>` unless the build defines it first, so this asks the target's C compiler
-// and gives one `-D` flag for each name that is a typedef name and not a struct tag. The same
-// compile checks each mirror's layout against its C struct, and a mismatch stops the build
-// before any unit compiles (report_ffi_struct_mismatches), with the code it answers. A probe
-// that cannot run gives no flag and no verdict, and the program's compile reports what is
-// wrong.
-fn ffi_struct_defines(headers: List[ForeignHeader], target: Str, vendored: Str, output_path: Str) -> Result[Str, Int] ! IO, FS.Read, FS.Write, FS.Delete, Process.Spawn, Env.Read, Diag.Report {
-    let names = ffi_struct_names_in(headers)
-    if names.is_empty() { return Ok("") }
+// target's C compiler can tell which. The C spells each mirror's original as a macro that is
+// `struct <name>` unless the build defines it first, so this asks the target's C compiler about
+// the names and the prefix of the C `c_text` (the file `c_file`), and gives one `-D` flag for
+// each name that is a typedef name and not a struct tag. A per-module build asks once per
+// target, with the program types header. The same compile checks the layout of each mirror the
+// C names against its C struct, and a mismatch stops the build before any unit compiles
+// (report_ffi_struct_mismatches), with the code it answers. A probe that the C compiler cannot
+// run gives no flag and no verdict, and the program's compile reports what is wrong; a probe
+// that cannot be written is an error here. `probe_dir`, when not "", holds the probe in place
+// of the C file's own dir; `tail` is the include flags of the unit compile.
+fn ffi_struct_defines(c_file: Str, c_text: Str, probe_dir: Str, target: Str, tail: Str, debug_mode: Int, release_mode: Int, mirrors: List[ForeignHeader]) -> Result[Str, Int] ! IO, FS.Read, FS.Write, FS.Delete, Process.Spawn, Env.Read, Diag.Report {
+    let ask = match spelling_ask(c_text) {
+        Some(a) => a
+        None => return Ok("")
+    }
+    let named = match mirrors_named(ask.names, mirrors) {
+        Ok(m) => m
+        Err(n) => {
+            diag_ice("MirrorNameWithoutDecl", GENERATED_C_DID_NOT_COMPILE, "the generated C {c_file} spells the @ffi.struct name `{n}`, which no @ffi.struct of the program declares", 0, 0, "")
+            diag_flush()
+            return Err(101)
+        }
+    }
+    let label = if target == "" { "host" } else { target }
+    let sp = spelling_probe_of(ask)
+    let layout = layout_probe_of(named, ask.names, sp)
+    let probe = if probe_dir != "" { "{probe_dir}/ffi_struct_probe.c" } else { "{c_file}.ffi_struct_probe.c" }
+    let cc = cc_command("-c {unit_cc_flags().join(" ")}", debug_mode, release_mode, target)
+    let run = foreign_decl_probe.spelling_run(c_file, probe, sp, ask.names, layout.text, cc, tail, cc_error_limit_flag(process_cc_id(target)), label)
+    if run.write_err != "" {
+        io.eprintln("error: cannot write the probe {probe}: {run.write_err}")
+        return Err(1)
+    }
+    if run.failed {
+        let mismatches = layout_mismatches(layout, sp, run.err_out, SPELLING_PROBE_FILE)
+        if !mismatches.is_empty() { return Err(report_ffi_struct_mismatches(mismatches, target)) }
+    }
+    Ok(run.flags)
+}
+
+// The spelling flags of the one-unit C `c_source` at `c_path`. Its probe is in a private dir
+// beside the output, as the C has no quoted include of its own dir. A C with no mirror name
+// makes no dir and runs no probe.
+fn one_unit_struct_defines(c_path: Str, c_source: Str, target: Str, vendored: Str, compiler_archive: Str, debug_mode: Int, release_mode: Int, output_path: Str, mirrors: List[ForeignHeader]) -> Result[Str, Int] ! IO, FS.Read, FS.Write, FS.Delete, Process.Spawn, Env.Read, Diag.Report {
+    if spelling_ask(c_source).is_none() { return Ok("") }
     let mut out_dir = path_dirname(output_path)
     if out_dir == "" { out_dir = "." }
     build_fs.reap_dead(out_dir, [".fsprobe"])
     let dir = build_fs.private_dir(out_dir, ".fsprobe")
     if dir == "" { return Ok("") }
-    let mut header_names: List[Str] = []
-    for fh in headers { header_names.push(fh.header) }
-    let probe = spelling_probe_of(names, header_names)
-    let layout = layout_probe_of(headers, names, probe)
-    let file_name = "ffi_struct_probe.c"
-    let mut defines: List[Str] = []
-    let mut mismatches: List[LayoutMismatch] = []
-    if build_fs.write_or_report("{dir}/{file_name}", probe.text.concat(layout.text)) {
-        // The unit compile also reads the stdlib archive's directory. Each mirror that is not
-        // a typedef name has errors, so the probe lifts clang's limit on them. The verdicts
-        // read English diagnostics.
-        let incs = system_includes("-I{resolve_archive_dir()} {vendored}")
-        let cmd = "LC_ALL=C {cc_command("-c{cc_error_limit_flag(target)} {dir}/{file_name} -o {dir}/ffi_struct_probe.o {incs}", 0, 0, target)}"
-        match process.run("sh", ["-c", cmd]) {
-            Ok(r) => {
-                match r.end {
-                    ChildEnd.Exited(0) | ChildEnd.Exited(127) => {}
-                    ChildEnd.Exited(_) => {
-                        mismatches = layout_mismatches(layout, probe, r.err_out, file_name)
-                        for n in typedef_names(names, probe, r.err_out, file_name) { defines.push("-D{c_ffi_struct_macro(n)}={n}") }
-                    }
-                    _ => {}
-                }
-            }
-            Err(_) => {}
-        }
-    }
+    // The tail is the one the unit's guard probe in do_link_target gets.
+    let layer_inc = if compiler_archive != "" { " -I{compiler_archive}" } else { "" }
+    let flags = ffi_struct_defines(c_path, c_source, dir, target, "{vendored}{layer_inc} -I{resolve_archive_dir()}", debug_mode, release_mode, mirrors)
     let _ = build_fs.remove_tree(dir)
-    if !mismatches.is_empty() { return Err(report_ffi_struct_mismatches(mismatches, target)) }
-    if defines.is_empty() { Ok("") } else { Ok(" {defines.join(" ")}") }
+    flags
 }
 
 // The one report of a mirror that does not match its C struct (§9.1.3): one diagnostic at
@@ -2276,6 +2272,17 @@ fn target_triple_name(target: Str) -> Str ! Process.Spawn {
         Err(_) => ""
     }
     triple_of_machine(machine)
+}
+
+// The C of a per-module build's types header, as the spelling probe asks it. Each unit
+// includes the header before its own copy of the same includes and struct block, so the
+// header's prefix is what spells each mirror name, and the header's layout asserts use that
+// spelling. A probe of a unit's C would read those asserts with the default spelling. The
+// ask drops the header's include guard, which would leave a conditional open in the probe.
+fn types_header_spelling_text(text: Str) -> Str {
+    let guard = c_program_types_header_guard()
+    let open = "#ifndef {guard}\n#define {guard}\n"
+    if text.starts_with(open) { text.byte_slice(open.byte_len(), text.byte_len()) } else { text }
 }
 
 // The `-D` flags among include_flags. A define changes the object, so each object key holds
@@ -2381,7 +2388,7 @@ fn do_build(source_path: Str, output_path: Str, c_path: Str, debug_mode: Int, re
             None => return 1
         }
         let inc_flags = match resolve_vendored_includes(used_deps, target) {
-            Some(f) => match ffi_struct_defines(compiled.headers, target, f, output_path) {
+            Some(f) => match one_unit_struct_defines(c_path, c_source, target, f, compiler_archive, debug_mode, release_mode, output_path, compiled.mirrors) {
                 Ok(d) => "{f}{d}"
                 Err(rc) => return rc
             }
@@ -2422,7 +2429,7 @@ fn do_build(source_path: Str, output_path: Str, c_path: Str, debug_mode: Int, re
         }
         let out = "{output_path}-{alias}"
         let _ = fs.delete(out)
-        let target_inc_flags = match ffi_struct_defines(compiled.headers, triple, inc_flags, output_path) {
+        let target_inc_flags = match one_unit_struct_defines(c_path, c_source, triple, inc_flags, compiler_archive, debug_mode, release_mode, output_path, compiled.mirrors) {
             Ok(d) => "{inc_flags}{d}"
             Err(rc) => return rc
         }
@@ -2677,6 +2684,8 @@ type CompiledUnits {
     // Read from the checked program, so a build that reuses its units checks them too.
     foreign: List[ForeignConst]
     headers: List[ForeignHeader]
+    // Every mirror the units can name, stdlib ones too, for the layout check.
+    mirrors: List[ForeignHeader]
     // Made while the checked program is at hand: the C compile that may need it runs later.
     ffi_note: Str
     entry: EntryMain
@@ -2738,7 +2747,7 @@ fn do_compile_units(source_path: Str, dir: Str, last_dir: Str, debug_mode: Int, 
                 }
                 let wrc = units_flush_warnings(strict_mode)
                 if wrc != 0 { return Err(wrc) }
-                return Ok(CompiledUnits { units: r.units, inputs: inputs, shas: Some(r.shas), recordable: true, order: r.order, header_keys: r.header_keys, entry_key: r.entry_key, foreign: foreign, headers: foreign_headers_in(program), ffi_note: own_ffi_note(program), entry: entry_main_of(program) })
+                return Ok(CompiledUnits { units: r.units, inputs: inputs, shas: Some(r.shas), recordable: true, order: r.order, header_keys: r.header_keys, entry_key: r.entry_key, foreign: foreign, headers: foreign_headers_in(program), mirrors: ffi_struct_mirrors_in(program), ffi_note: own_ffi_note(program), entry: entry_main_of(program) })
             }
             None => {}
         }
@@ -2892,7 +2901,7 @@ fn do_compile_units(source_path: Str, dir: Str, last_dir: Str, debug_mode: Int, 
     let recordable = diag_entry_count() == entries_before && diag_ice_count == ice_before
     let wrc = units_flush_warnings(strict_mode)
     if wrc != 0 { return Err(wrc) }
-    Ok(CompiledUnits { units: out, inputs: inputs, shas: shas, recordable: recordable, order: hs.order.join(","), header_keys: hs.keys, entry_key: entry_key, foreign: foreign, headers: foreign_headers_in(program), ffi_note: own_ffi_note(program), entry: entry_main_of(program) })
+    Ok(CompiledUnits { units: out, inputs: inputs, shas: shas, recordable: recordable, order: hs.order.join(","), header_keys: hs.keys, entry_key: entry_key, foreign: foreign, headers: foreign_headers_in(program), mirrors: ffi_struct_mirrors_in(program), ffi_note: own_ffi_note(program), entry: entry_main_of(program) })
 }
 
 // BLINK_EMIT_REUSE_VERIFY=1 makes each per-module build emit the whole program again and fail
@@ -3149,7 +3158,7 @@ fn do_build_units(source_path: Str, output_path: Str, debug_mode: Int, release_m
     if shas.is_none() && cg_obj_cache_enabled != 0 && build_objcache.cache_enabled() {
         shas = build_objcache.unit_file_shas(work, resolve_archive_dir())
     }
-    let rc = link_units_all_targets(source_path, output_path, work, units_dir, compiled.units, compiled.foreign, compiled.headers, compiled.ffi_note, compiled.entry, shas, debug_mode, release_mode, targets, status_mode, unit_jobs, test_build)
+    let rc = link_units_all_targets(source_path, output_path, work, units_dir, compiled.units, compiled.foreign, compiled.headers, compiled.mirrors, compiled.ffi_note, compiled.entry, shas, debug_mode, release_mode, targets, status_mode, unit_jobs, test_build)
     // Written last, and into the directory that replaces units_dir only after this: a build
     // that stops before here leaves the last record beside the files it describes.
     if rc == 0 && compiled.inputs != "" && compiled.recordable {
@@ -3172,7 +3181,7 @@ fn do_build_units(source_path: Str, output_path: Str, debug_mode: Int, release_m
     rc
 }
 
-fn link_units_all_targets(source_path: Str, output_path: Str, work: Str, units_dir: Str, units: List[emit_record.EmittedUnit], foreign: List[ForeignConst], headers: List[ForeignHeader], ffi_note: Str, entry: EntryMain, shas: Option[Map[Str, Str]], debug_mode: Int, release_mode: Int, targets: List[Str], status_mode: Int, unit_jobs: Int, test_build: Bool) -> Int ! Diag.Report, IO, FS.Write, FS.Read, FS.Delete, Process.Spawn, Env.Exit, Env.Read, Time.Read {
+fn link_units_all_targets(source_path: Str, output_path: Str, work: Str, units_dir: Str, units: List[emit_record.EmittedUnit], foreign: List[ForeignConst], headers: List[ForeignHeader], mirrors: List[ForeignHeader], ffi_note: Str, entry: EntryMain, shas: Option[Map[Str, Str]], debug_mode: Int, release_mode: Int, targets: List[Str], status_mode: Int, unit_jobs: Int, test_build: Bool) -> Int ! Diag.Report, IO, FS.Write, FS.Read, FS.Delete, Process.Spawn, Env.Exit, Env.Read, Time.Read {
     // The scans below read what the one-unit build reads from its single C file: each unit
     // and each header a unit includes, which is all cc compiles. A marker the scans look
     // for starts a line, so each file starts one.
@@ -3190,6 +3199,8 @@ fn link_units_all_targets(source_path: Str, output_path: Str, work: Str, units_d
         }
     }
     let c_source = c_parts.join("\n")
+    let types_file = "{work}/{c_program_types_header_name()}"
+    let types_text = types_header_spelling_text(build_fs.read_or_empty(types_file))
     // A test binary's main runs the tests, so only a program build reads the entry point.
     let link = test_build || entry.has_main
     let has_async = detect_async(build_fs.read_or_empty(source_path))
@@ -3219,7 +3230,7 @@ fn link_units_all_targets(source_path: Str, output_path: Str, work: Str, units_d
             None => return 1
         }
         let inc_flags = match resolve_vendored_includes(used_deps, target) {
-            Some(f) => match ffi_struct_defines(headers, target, f, output_path) {
+            Some(f) => match ffi_struct_defines(types_file, types_text, "", target, "-I{resolve_archive_dir()} {f}", debug_mode, release_mode, mirrors) {
                 Ok(d) => "{f}{d}"
                 Err(rc) => return rc
             }
@@ -3259,7 +3270,7 @@ fn link_units_all_targets(source_path: Str, output_path: Str, work: Str, units_d
         }
         let out = "{output_path}-{alias}"
         let _ = fs.delete(out)
-        let target_inc_flags = match ffi_struct_defines(headers, triple, inc_flags, output_path) {
+        let target_inc_flags = match ffi_struct_defines(types_file, types_text, "", triple, "-I{resolve_archive_dir()} {inc_flags}", debug_mode, release_mode, mirrors) {
             Ok(d) => "{inc_flags}{d}"
             Err(rc) => return rc
         }
@@ -3532,12 +3543,6 @@ fn cc_is_clang() -> Bool ! IO, Process.Spawn {
     process_cc_id("").contains("clang")
 }
 
-// clang, and so zig cc for each target, stops after 20 errors by default. gcc has no such
-// limit and rejects the flag.
-fn cc_error_limit_flag(target: Str) -> Str ! IO, Process.Spawn {
-    if target != "" || cc_is_clang() { " -ferror-limit=0" } else { "" }
-}
-
 // A probe reads the dependency headers as system headers: the unit compile is not pedantic,
 // so a C extension that it accepts in them must be no error in the probe.
 fn system_includes(flags: Str) -> Str {
@@ -3551,38 +3556,13 @@ fn system_includes(flags: Str) -> Str {
 // The flags that drop each guarded foreign prototype in the C file `c_file` whose symbol a
 // header the file reads already declares, for its compile for `target`, or "" for none
 // (§9.1). A C file that guards no prototype runs no probe. The flags are a function of the
-// C text, the includes and the compiler, which the object keys hold already. The probe sits
-// beside `c_file`, so a header the file includes by a quoted name is found the same way.
+// C text, the includes and the compiler, which the object keys hold already.
 fn declared_guard_flags(c_file: Str, target: Str, includes: Str, debug_mode: Int, release_mode: Int) -> Str ! IO, FS.Read, FS.Write, FS.Delete, Process.Spawn, Env.Read {
     let c_text = build_fs.read_or_empty(c_file)
     let symbols = foreign_decl_probe.guarded_symbols(c_text)
-    let mut flags = ""
-    if !symbols.is_empty() {
-        let probe = "{c_file}.declprobe"
-        let mut code = -1
-        let text = foreign_decl_probe.probe_text(c_text, symbols)
-        if fs.write(probe, text).is_ok() {
-            // A probe that stops at clang's error limit declares nothing.
-            let limit = cc_error_limit_flag(target)
-            // clang knows a library function such as cos with no header read, and that is not
-            // a declaration the unit can call through. The probe reads English diagnostics.
-            let cmd = "LC_ALL=C {cc_command("-c {unit_cc_flags().join(" ")}{limit} -fno-builtin -x c {probe} -o {probe}.o {includes}", debug_mode, release_mode, target)}"
-            match process.run("sh", ["-c", cmd]) {
-                Ok(r) => {
-                    code = match r.end {
-                        ChildEnd.Exited(n) => n
-                        _ => -1
-                    }
-                    flags = foreign_decl_probe.guard_flags(foreign_decl_probe.declared_symbols(symbols, code, r.err_out))
-                }
-                Err(_) => {}
-            }
-        }
-        let _ = fs.delete(probe)
-        let _ = fs.delete("{probe}.o")
-        trace.log("blink.build.units", "declared {c_file} for {if target == "" { "host" } else { target }} (probe exit {code}):{flags}")
-    }
-    flags
+    if symbols.is_empty() { return "" }
+    let label = if target == "" { "host" } else { target }
+    foreign_decl_probe.probe_flags(c_file, c_text, symbols, cc_command("-c {unit_cc_flags().join(" ")}", debug_mode, release_mode, target), includes, cc_error_limit_flag(process_cc_id(target)), label)
 }
 
 // Compiles the units the cache cannot answer, largest first, then links every unit's object
