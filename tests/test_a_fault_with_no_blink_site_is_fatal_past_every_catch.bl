@@ -8,10 +8,16 @@ import compile_test_helpers.{compile_and_run, compile_and_run_test_json, compile
 fn foreign_null_src() -> Str {
     #"@ffi("getenv")
 @trusted(audit: "TEST-NULL-STR")
-fn null_str(name: Str) -> Str ! () {}
+fn c_getenv(name: Ptr[U8]) -> Ptr[U8] ! () {}
+
+@ffi("blink_str_len")
+@trusted(audit: "TEST-NULL-STR")
+fn raw_len(s: Ptr[U8]) -> Int ! () {}
 
 fn fault() -> Int {
-    null_str("BLINK_NO_SITE_SURELY_UNSET_VAR").len()
+    with ffi.scope() as scope {
+        raw_len(c_getenv(scope.cstr("BLINK_NO_SITE_SURELY_UNSET_VAR")))
+    }
 }
 "#
 }
@@ -51,20 +57,6 @@ fn raw_read_bytes(n: Int) -> Bytes ! () {}
 
 fn fault() -> Int {
     raw_read_bytes(0).len()
-}
-"#
-}
-
-// BLINK_DEBUG, which every `blink test` build has, checks the recorded count in len().
-fn wrong_count_src() -> Str {
-    #"@ffi("memset", header: "string.h")
-@trusted(audit: "TEST-WRONG-COUNT")
-fn poke(s: Str, c: I32, n: Int) ! () {}
-
-fn fault() -> Int {
-    let s = "abc".concat("def")
-    poke(s, 128.to_i32(), 1)
-    s.len()
 }
 "#
 }
@@ -111,26 +103,13 @@ fn fault() -> Int {
 }
 
 // Over the walk limit: 5000 continuation bytes, which fs.read, env.var and process output pass on
-// with no UTF-8 check. Their recorded count of 0 is right.
+// with no UTF-8 check. Their recorded count of 0 is right, so the BLINK_DEBUG check in len() lets
+// it pass. tests/runtime_c/ holds the counts that are wrong, which only a foreign write can make.
 fn invalid_bytes_src() -> Str {
     #"fn invalid() -> Str ! Process.Spawn {
     process.run("sh", ["-c", "head -c 5000 /dev/zero | tr '\\0' '\\200'"]).unwrap().out
 }
 "#
-}
-
-fn low_count_src() -> Str {
-    invalid_bytes_src().concat(#"
-@ffi("memset", header: "string.h")
-@trusted(audit: "TEST-WRONG-COUNT")
-fn poke(s: Str, c: I32, n: Int) ! () {}
-
-fn fault() -> Int ! Process.Spawn {
-    let s = invalid()
-    poke(s, 97.to_i32(), 5000)
-    s.len()
-}
-"#)
 }
 
 fn expect_fatal(r: RunResult) {
@@ -190,18 +169,6 @@ test "a stdin fault with no read call goes past assert_panics" {
 
 test "a bad read_bytes count with no read call goes past assert_panics" {
     expect_past_assert_panics(read_bytes_no_call_src(), "ns_count_catch_{getpid()}")
-}
-
-test "a Str whose recorded count is wrong goes past assert_panics" {
-    let r = compile_and_run_test_json_opt(catches_src(wrong_count_src()), "ns_wrong_count_catch_{getpid()}", "-DBLINK_DEBUG")
-    expect_fatal(r)
-    assert(!r.out.contains("runs after"), r.out)
-}
-
-test "a low recorded count over the walk limit goes past assert_panics" {
-    let r = compile_and_run_test_json_opt(catches_src(low_count_src()), "ns_low_count_catch_{getpid()}", "-DBLINK_DEBUG")
-    expect_fatal(r)
-    assert(!r.out.contains("runs after"), r.out)
 }
 
 test "the right count of 5000 invalid bytes is not a fault" {

@@ -62,7 +62,8 @@ fi
 # --- Gen 1: compile blinkc with Gen 0 ---
 echo "Self-compiling blinkc (Gen 1)..."
 "$GEN0" "$ROOT_DIR/src/blinkc_main.bl" "$BUILD_DIR/blinkc_gen1.c"
-cc -o "$BUILD_DIR/blinkc_gen1" "$BUILD_DIR/blinkc_gen1.c" -lm -lgc
+. "$ROOT_DIR/scripts/link_opt.sh"
+cc $BLINK_SRC_CFLAGS -o "$BUILD_DIR/blinkc_gen1" "$BUILD_DIR/blinkc_gen1.c" -lm -lgc
 
 # --- Gen 2: compile blinkc with Gen 1 ---
 echo "Verifying bootstrap chain (Gen 2)..."

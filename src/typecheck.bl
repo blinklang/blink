@@ -9,7 +9,7 @@ import layout.{tid_has_c_shape}
 import diag_catalog.{diag_catalog_name}
 import import_edit.{ImportEdit, ImportNeed, import_aliased_edit, import_module_edit, import_need}
 import parser.{
-    node_written_span, effect_derived_ops, effect_ops, effect_decl_ops, node_load_rank, parser_load_order_moved, parser_live_ranges,
+    node_written_span, type_ann_is_unit, effect_derived_ops, effect_ops, effect_decl_ops, node_load_rank, parser_load_order_moved, parser_live_ranges,
     ann_str_val, positional_str_arg, positional_str_arg_count, impl_provided_by_closeable, closeable_impl_of, sublist_remove_members, get_annotation, is_foreign_binding, is_handle_type, runtime_handle_annotation, get_str_named_arg, has_annotation, is_literal_string_part,
     node_args, node_assoc_types, node_arms, node_body, node_captures, node_col, node_condition,
     node_effects, node_elements, node_else_body, node_end, node_fields, node_for_binder, node_guard,
@@ -39,7 +39,7 @@ import diagnostics.{
     UNSOLVED_TYPEVAR_AT_CODEGEN, CODEGEN_STAGE_NOT_BUILT, CODEGEN_STAGE_NOT_BUILT_NAME, CALL_NOT_ANSWERED, OPEN_TYPE_AFTER_CHECK, CALL_ROW_UNKNOWN, SEALED_OPS_REWRITE_INVARIANT, VARIANT_WITHOUT_ENUM,
     NO_SUCH_VARIANT, TYPE_ERROR, TEMPLATE_MISMATCH, UNEXPECTED_ANNOTATION, MISSING_RETURN, NO_CONVERSION_IMPL, CANNOT_INFER_TYPE, NOT_ITERABLE, MISSING_ELSE, UNLICENSED_SELF_OP, TRAIT_BOUND_NOT_SATISFIED, CAPABILITY_BUDGET, QM_INVALID_OPERAND, UNDEFINED_FUNCTION,
     UNRESOLVED_METHOD, AMBIGUOUS_METHOD_CALL, MISSING_DISPLAY_IMPL,
-    MUTATION_REQUIRES_MUT, MUT_ON_PATTERN, NOT_A_PLACE, PARAM_ASSIGN, diag_error_label_at_notes, diag_add_note_at_spots_since, diag_error_span_label_at_notes, diag_warn_label_at_notes, EMPTY_ROW_OUTSIDE_FFI, PANIC_HOOK_PLACEMENT, TRACE_MESSAGE_EFFECT, METHOD_THROUGH_TYPE_NAME, ASSOCIATED_FN_THROUGH_TRAIT, SELF_OUTSIDE_TRAIT_OR_IMPL, SELF_SHAPE_IN_DEFAULT_BODY, EFFECTS_ANNOTATION_REMOVED, ANNOTATION_ARGUMENTS, INVALID_RUNTIME_BINDING, UNKNOWN_EFFECT, SUB_EFFECT_AS_TYPE, diag_fix_before_starts_with, diag_drop_fix_over_others, diag_drop_fix_at,
+    MUTATION_REQUIRES_MUT, MUT_ON_PATTERN, NOT_A_PLACE, PARAM_ASSIGN, diag_error_label_at_notes, diag_add_note_at_spots_since, diag_error_span_label_at_notes, diag_warn_label_at_notes, EMPTY_ROW_OUTSIDE_FFI, PANIC_HOOK_PLACEMENT, TRACE_MESSAGE_EFFECT, METHOD_THROUGH_TYPE_NAME, ASSOCIATED_FN_THROUGH_TRAIT, SELF_OUTSIDE_TRAIT_OR_IMPL, SELF_SHAPE_IN_DEFAULT_BODY, EFFECTS_ANNOTATION_REMOVED, ANNOTATION_ARGUMENTS, INVALID_RUNTIME_BINDING, FFI_INCOMPATIBLE_TYPE, UNKNOWN_EFFECT, SUB_EFFECT_AS_TYPE, diag_fix_before_starts_with, diag_drop_fix_over_others, diag_drop_fix_at,
     UNDEFINED_VARIABLE, UNKNOWN_TYPE, QM_RESULT_IN_NON_RESULT,
     QM_OPTION_IN_NON_OPTION, QM_ERROR_MISMATCH,
     QM_TEST_DISPLAY_REQUIRED, TEST_ANNOTATED_RETURN, SKIP_OUTSIDE_TEST,
@@ -18464,13 +18464,15 @@ pub fn tc_ptr_pointee_is_valid(pointee: Int) -> Int {
     if tc_tid_has_unbound_metavar(t) != 0 { return 1 }
     let k = type_kind(t)
     if k == TyKind.Unknown || k == TyKind.Typevar { return 1 }
-    if k == TyKind.Void || k == TyKind.Ptr { return 1 }
-    if k == TyKind.Int || k == TyKind.Float { return 1 }
-    if k == TyKind.I8 || k == TyKind.I16 || k == TyKind.I32 { return 1 }
-    if k == TyKind.U8 || k == TyKind.U16 || k == TyKind.U32 || k == TyKind.U64 { return 1 }
+    if k == TyKind.Void || k == TyKind.Ptr || tc_ffi_numeric_kind(k) { return 1 }
     if ffi_struct_type_set.contains_key(t) { return 1 }
     if ffi_opaque_type_set.contains_key(t) { return 1 }
     0
+}
+
+// A numeric scalar with a C type, which both a `Ptr` pointee and an `@ffi` signature take.
+fn tc_ffi_numeric_kind(k: TyKind) -> Bool {
+    k == TyKind.Int || k == TyKind.Float || is_sized_int(k)
 }
 
 fn check_ptr_in_type_name(type_name: Str, node: Int, in_ffi_region: Int) ! Diag.Report {
@@ -19287,6 +19289,184 @@ fn validate_runtime_binding(decl: Int, ann: Int, what: Str, example: Str, help: 
     diag_error_span_label_at_notes("InvalidRuntimeBinding", INVALID_RUNTIME_BINDING, message, sym, line, node_col(sym), end_col, label, help, [])
 }
 
+// E0848 does not check an `@ffi` on a `blink_` symbol yet: those decls bind runtime functions
+// with Blink types, and they move to `@runtime` before the check covers them. With no symbol
+// string, the fn name is the symbol.
+fn tc_ffi_binds_runtime_symbol(ffi_ann: Int, fn_name: Str) -> Bool {
+    let args = node_args(ffi_ann)
+    let n = positional_str_arg_count(args)
+    tc_is_runtime_symbol(if n >= 1 { positional_str_arg(args, n - 1) } else { fn_name })
+}
+
+// The tid behind every alias of `tid` (§9.1 *Signature Types*: aliases expand first).
+fn tc_ffi_expand(tid: Int) -> Int {
+    let mut t = tc_resolve(tid)
+    let mut hops = 0
+    while hops < 64 {
+        let u = tc_resolve(resolve_alias_tid(t))
+        if u == t { return t }
+        t = u
+        hops = hops + 1
+    }
+    t
+}
+
+// Whether the annotation `ann`, through the aliases it names, writes `Void` outside a `Ptr`.
+// `()` and `Void` share a tid, so only the written form tells E0828's `Void` from a `()`.
+fn tc_ffi_ann_writes_void(ann: Int, depth: Int) -> Bool {
+    if ann == -1 || depth > 64 || node_kind(ann) != NodeKind.TypeAnn || type_ann_is_unit(ann) { return false }
+    let name = node_name(ann)
+    if name == "Void" { return true }
+    if name == "Ptr" { return false }
+    let decl = tc_alias_decl_of_written(name)
+    if decl != -1 && tc_ffi_ann_writes_void(node_value(decl), depth + 1) { return true }
+    let els = node_elements(ann)
+    if els != -1 {
+        for i in 0..sublist_length(els) {
+            if tc_ffi_ann_writes_void(sublist_get(els, i), depth + 1) { return true }
+        }
+    }
+    tc_ffi_ann_writes_void(node_type_ann(ann), depth + 1)
+}
+
+// Whether another rule reports `tid`, or nothing can judge it yet, so that E0848 stays silent
+// and the type gets one report: a type not yet known, a name that names no type (UnknownType,
+// or the refusal of `Self` outside an impl), a type parameter of the fn (E0848 at its
+// declaration), a written `Void` (E0828) and a `Ptr` whose pointee E0810 refuses. A trait
+// name used as a type is a typevar too, but no other rule reports it here.
+fn tc_ffi_type_reported_elsewhere(tid: Int, top_return: Bool, void_is_e0828: Bool, tparams: List[Str]) -> Bool {
+    let t = tc_ffi_expand(tid)
+    if t < 0 || t >= ty_pool.len() { return true }
+    if tc_tid_has_unbound_metavar(t) != 0 { return true }
+    let k = type_kind(t)
+    if k == TyKind.Unknown { return true }
+    if k == TyKind.Typevar {
+        let n = type_to_str(t)
+        return tparams.contains(n) || !tc_name_declares_trait(n)
+    }
+    if k == TyKind.Void { return !top_return && void_is_e0828 }
+    if k == TyKind.Ptr {
+        let pointee = tc_tid_child(t, 0)
+        if tc_ptr_pointee_is_valid(pointee) == 0 { return true }
+        return type_kind(tc_ffi_expand(pointee)) != TyKind.Void && tc_ffi_type_reported_elsewhere(pointee, false, void_is_e0828, tparams)
+    }
+    for i in 0..tc_tid_child_count(t) {
+        let c = tc_tid_child(t, i)
+        if c != -1 && tc_ffi_type_reported_elsewhere(c, false, void_is_e0828, tparams) { return true }
+    }
+    false
+}
+
+fn tc_ffi_is_handle(tid: Int) -> Bool {
+    ffi_opaque_type_set.contains_key(tc_ffi_expand(tid))
+}
+
+// Whether `tid` is on the closed list of §9.1 *Signature Types*.
+fn tc_ffi_type_has_c_form(tid: Int, top_return: Bool) -> Bool {
+    let t = tc_ffi_expand(tid)
+    let k = type_kind(t)
+    if tc_ffi_numeric_kind(k) || k == TyKind.Bool || k == TyKind.Ptr { return true }
+    if k == TyKind.Void || k == TyKind.Never { return top_return }
+    if k == TyKind.Option { return tc_ffi_is_handle(tc_tid_child(t, 0)) }
+    ffi_struct_type_set.contains_key(t) || ffi_opaque_type_set.contains_key(t)
+}
+
+// The `help:` of E0848 for `tid`, by the shape the author wrote (§9.1 *Signature Types*), and
+// the `note:` lines that go before the common one. `pname` is the parameter, or "" for the return.
+fn tc_ffi_incompatible_help(tid: Int, pname: Str) -> (Str, List[Str]) {
+    let never_note = "`Never` is legal only as the whole return type of a foreign function"
+    let t = tc_ffi_expand(tid)
+    let k = type_kind(t)
+    if k == TyKind.Str {
+        if pname == "" { return ("return `Ptr[U8]`, and read it with `.to_str()`", []) }
+        return ("take `Ptr[U8]`, and pass `scope.cstr({pname})` inside `with ffi.scope() as scope`", [])
+    }
+    if k == TyKind.Bytes || (k == TyKind.List && type_kind(tc_ffi_expand(tc_tid_child(t, 0))) == TyKind.U8) {
+        return ("pass the bytes with `Bytes.with_ptr`, or take a `Buf[U8]`", [])
+    }
+    if k == TyKind.Never {
+        return ("remove the parameter", [never_note])
+    }
+    if k == TyKind.Void && pname != "" {
+        return ("remove the parameter: `()` is legal only as the return type, where it is C `void`", [])
+    }
+    if k == TyKind.Option {
+        let inner = tc_tid_child(t, 0)
+        let inner_kind = type_kind(tc_ffi_expand(inner))
+        if inner_kind == TyKind.Never {
+            return ("for a C function that does not return, write `-> Never`", [never_note])
+        }
+        if inner_kind == TyKind.Str && pname == "" { return tc_ffi_incompatible_help(inner, pname) }
+        let bare = type_to_str(inner)
+        let mut notes: List[Str] = []
+        if !tc_ffi_type_has_c_form(inner, pname == "") {
+            let (inner_help, _) = tc_ffi_incompatible_help(inner, pname)
+            notes.push("`{bare}` is not FFI-compatible either: {inner_help}")
+        }
+        return ("write the bare type `{bare}`: only an `@ffi.opaque` handle has an `Option` form, in which `None` is the C `NULL` pointer", notes)
+    }
+    if k == TyKind.Fn {
+        return ("a closure type has no C form, and passing a Blink closure to C is not supported", [])
+    }
+    if k == TyKind.Struct && tc_tid_child_count(t) == 0 {
+        return ("to pass a C struct by value, declare the type with `@ffi.struct`, which names the C header and the C struct it mirrors", [])
+    }
+    ("use a type that has a C form: a sized scalar, `Ptr[T]`, an `@ffi.opaque` handle `H` or `Option[H]`, or an `@ffi.struct`", [])
+}
+
+// E0848 (§9.1 *Signature Types*) for the type `ann` of an `@ffi` fn, whose type is `tid`.
+// `pname` is the parameter it types, or "" for the return.
+fn tc_check_ffi_signature_type(ann: Int, tid: Int, pname: Str, tparams: List[Str]) ! Diag.Report {
+    if ann == -1 || tid == -1 { return }
+    let top_return = pname == ""
+    if tc_ffi_type_has_c_form(tid, top_return) { return }
+    if tc_ffi_type_reported_elsewhere(tid, top_return, tc_ffi_ann_writes_void(ann, 0), tparams) { return }
+    let (line, col, end_line, end_col) = node_written_span(ann)
+    if line == 0 { return }
+    let written = type_ann_text(ann)
+    let (help, shape_notes) = tc_ffi_incompatible_help(tid, pname)
+    let mut notes: List[Str] = []
+    let expanded = type_to_str(tc_ffi_expand(tid))
+    if expanded != written && tc_alias_underlying_of_decl(node_name(ann)) != -1 {
+        notes.push("`{written}` is an alias of `{expanded}`")
+    }
+    for n in shape_notes { notes.push(n) }
+    notes.push("`@trusted` does not cover this error, and `@allow` does not suppress it")
+    let label = if top_return { "the return type of an `@ffi` fn needs a C type" } else { "a parameter of an `@ffi` fn needs a C type" }
+    diag_error_span_label_at_notes("FfiIncompatibleType", FFI_INCOMPATIBLE_TYPE, "`{written}` is not FFI-compatible",
+        ann, line, col, if end_line == line { end_col } else { 0 }, label, help, notes)
+}
+
+// E0848 for each type in the signature of the `@ffi` fn `fn_node`. A type parameter is
+// reported once, where it is declared, so the types that use it are not reported again.
+fn tc_check_ffi_signature_types(fn_node: Int) ! Diag.Report {
+    let tps = node_type_params(fn_node)
+    let mut tparams: List[Str] = []
+    if tps != -1 {
+        for i in 0..sublist_length(tps) {
+            let tp = sublist_get(tps, i)
+            let tname = node_name(tp)
+            tparams.push(tname)
+            diag_error_span_label_at_notes("FfiIncompatibleType", FFI_INCOMPATIBLE_TYPE, "`{tname}` is not FFI-compatible",
+                tp, node_line(tp), node_col(tp), node_col(tp) + tname.byte_len(),
+                "an `@ffi` fn has no type parameters", "a C symbol has one signature: write one declaration for each type",
+                ["`@trusted` does not cover this error, and `@allow` does not suppress it"])
+        }
+    }
+    let sig = fnsig_by_decl.get(fn_node) ?? -1
+    if sig == -1 { return }
+    let entry = fnsig_pool.get(sig).unwrap()
+    let params = node_params(fn_node)
+    if params != -1 {
+        for i in 0..sublist_length(params) {
+            if i >= entry.params_count { break }
+            let p = sublist_get(params, i)
+            tc_check_ffi_signature_type(node_type_ann(p), fnsig_param_list.get(entry.params_start + i) ?? -1, node_name(p), tparams)
+        }
+    }
+    tc_check_ffi_signature_type(node_type_ann(fn_node), entry.ret, "", tparams)
+}
+
 fn validate_ffi_fn(fn_node: Int) ! Diag.Report {
     let name = node_name(fn_node)
     let ffi_node = get_annotation(fn_node, "ffi")
@@ -19308,6 +19488,9 @@ fn validate_ffi_fn(fn_node: Int) ! Diag.Report {
     let has_ensures = if ensures_node != -1 { 1 } else { 0 }
 
     if has_ffi != 0 {
+        if !tc_ffi_binds_runtime_symbol(ffi_node, name) {
+            tc_check_ffi_signature_types(fn_node)
+        }
         if node_is_pub(fn_node) != 0 && has_trusted == 0 {
             diag_error_label_at_notes("FfiFunctionPublic", PUB_FFI, "FFI function cannot be public", ffi_node, "FFI functions must be wrapped in safe Blink functions", "make the FFI function private and create a pub wrapper", [])
         }
@@ -43376,15 +43559,12 @@ fn tc_check_fn(fn_node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report 
         }
     }
 
-    // The return twin of the param publish above: codegen's signature-return positions read
-    // the return-annotation node's tid, so stamp it here or those positions decline to the flat
-    // carrier. Resolution mirrors tc_closure_declared_ret (resolve + structural-instance lift so a
-    // generic-struct/enum return carries its type-arg slots). An unannotated (void) fn has no
-    // annotation node to stamp and the flat carrier already spells void, so the -1 case is skipped.
-    // Not gated on is_ffi: the param publish above is likewise ungated (only its nr_define_typed
-    // scope binding is), and an FFI carrier return must carry its authoritative tid too so its
-    // RetType stops declining to the pool fallback. The FFI extern signature C is unaffected —
-    // ffi_c_ret_type reads the flat annotation, not this memo.
+    // The return twin of the param publish above: codegen spells a fn's C return from the
+    // return-annotation node's tid (cg_decl's fn_ret_tid), so stamp it here. Resolution mirrors
+    // tc_closure_declared_ret (resolve + structural-instance lift so a generic-struct/enum return
+    // carries its type-arg slots). An unannotated fn has no annotation node; codegen spells it
+    // void. Not gated on is_ffi: an @ffi fn's extern prototype and its wrapper take their C
+    // return from this same tid.
     let ret_ann = node_type_ann(fn_node)
     let mut fn_ret_tid = TYPE_VOID
     if ret_ann != -1 {

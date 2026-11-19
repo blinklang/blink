@@ -1,0 +1,431 @@
+// The signature of an `@ffi` fn may use only the types that have a C form (§9.1 *Signature
+// Types*): a sized scalar, `Ptr[T]`, `Buf[T]` (not built yet), an `@ffi.opaque` handle `H` or
+// `Option[H]`, or an `@ffi.struct` by value. A return may also be `()`, or `Never` as the whole return. Every other
+// type is FfiIncompatibleType (E0848) at the type as written, once, with a `help:` that depends
+// on what the author wrote. Aliases expand first. Neither `@trusted` nor `@allow` removes it.
+//
+// Without the rule, each refused shape below reaches the C compiler with a prototype that does
+// not match the C function, or ends in an internal error.
+
+import std.fs
+import std.process.{ProcessResult}
+import std.json.{json_clear, json_parse, json_get, json_as_str, json_as_int, json_len, json_at}
+import compile_test_helpers
+
+fn sh(cmd: Str) -> ProcessResult ! Process.Spawn {
+    process.run("sh", ["-c", cmd]).unwrap()
+}
+
+// Each diagnostic of `severity` in a file whose path holds `file_part`, as
+// "CODE@line:col-end_col".
+fn rows(r: ProcessResult, severity: Str, file_part: Str) -> List[Str] {
+    let mut out: List[Str] = []
+    for line in "{r.out}\n{r.err_out}".split("\n") {
+        if !line.starts_with("\{\"severity\"") { continue }
+        json_clear()
+        let row = json_parse(line)
+        if json_as_str(json_get(row, "severity")) != severity { continue }
+        let span = json_get(row, "span")
+        if !json_as_str(json_get(span, "file")).contains(file_part) { continue }
+        out.push("{json_as_str(json_get(row, "code"))}@{json_as_int(json_get(span, "line"))}:{json_as_int(json_get(span, "col"))}-{json_as_int(json_get(span, "end_col"))}")
+    }
+    out
+}
+
+// The message, help and notes of each E0848 row, one text per row.
+fn e0848_texts(r: ProcessResult) -> List[Str] {
+    let mut out: List[Str] = []
+    for line in "{r.out}\n{r.err_out}".split("\n") {
+        if !line.starts_with("\{\"severity\"") { continue }
+        json_clear()
+        let row = json_parse(line)
+        if json_as_str(json_get(row, "code")) != "E0848" { continue }
+        let mut text = "message: {json_as_str(json_get(row, "message"))}\nhelp: {json_as_str(json_get(row, "help"))}"
+        let notes = json_get(row, "notes")
+        for i in 0..json_len(notes) { text = text.concat("\nnote: {json_as_str(json_at(notes, i))}") }
+        let labels = json_get(row, "labels")
+        for i in 0..json_len(labels) { text = text.concat("\nlabel: {json_as_str(json_get(json_at(labels, i), "message"))}") }
+        out.push(text)
+    }
+    out
+}
+
+// Checks `src` as a plain program file: a module of the user's own package.
+fn check_user(tag: Str, src: Str) -> ProcessResult ! FS.Write, Process.Spawn, Env.Read {
+    let dir = "{compile_test_helpers.scratch_root()}/e0848_user_{tag}"
+    sh("rm -rf {dir} && mkdir -p {dir}")
+    fs.write("{dir}/zz_user.bl", src).unwrap()
+    let me = sh("pwd").out.trim()
+    sh("cd {dir} && env -u BLINK_ROOT {me}/build/blink check --json zz_user.bl")
+}
+
+// Checks a program that imports `std.zz_sig_<tag>`, whose text is `src`.
+fn check_std(tag: Str, src: Str) -> ProcessResult ! FS.Write, Process.Spawn, Env.Read {
+    let dir = "{compile_test_helpers.scratch_root()}/e0848_std_{tag}"
+    sh("rm -rf {dir} && mkdir -p {dir}/root/lib/std {dir}/app")
+    fs.write("{dir}/root/lib/std/zz_sig_{tag}.bl", "{src}\npub fn touch() \{}\n").unwrap()
+    fs.write("{dir}/app/main.bl", "import std.zz_sig_{tag}\n\nfn main() \{\n    zz_sig_{tag}.touch()\n}\n").unwrap()
+    let me = sh("pwd").out.trim()
+    sh("cd {dir}/app && BLINK_ROOT={dir}/root {me}/build/blink check --json main.bl")
+}
+
+// A program whose line 3 is `sig`, the signature of one audited `@ffi` fn, and whose
+// declarations `after` follow `main`, so the rows read line 3 in every program.
+fn program(sig: Str, after: Str) -> Str {
+    "@ffi(\"c\", \"labs\")\n@trusted(audit: \"P\")\n{sig}\n\nfn main() \{}\n{after}"
+}
+
+let OPAQUE = "\n@ffi.opaque(header: \"stdio.h\", name: \"FILE\")\ntype CFile\n"
+let MIRROR = "\n@ffi.struct(header: \"time.h\", name: \"timespec\")\ntype Mirror \{\n    tv_sec: Int\n    tv_nsec: Int\n}\n"
+
+fn expect(label: Str, got: List[Str], want: List[Str]) -> Str {
+    if got.join(",") == want.join(",") { return "" }
+    "{label}: want [{want.join(", ")}], got [{got.join(", ")}]"
+}
+
+// "" when the one E0848 text of `r` holds each of `parts`.
+fn says(label: Str, r: ProcessResult, parts: List[Str]) -> Str {
+    let texts = e0848_texts(r)
+    if texts.len() != 1 { return "{label}: want one E0848, got {texts.len()}\nout: {r.out}\nerr: {r.err_out}" }
+    let text = texts.get(0).unwrap()
+    for p in parts {
+        if !text.contains(p) { return "{label}: the E0848 does not say `{p}`:\n{text}" }
+    }
+    ""
+}
+
+fn report(problems: List[Str]) ! IO.Eprint {
+    let mut bad = false
+    for p in problems {
+        if p != "" {
+            io.eprintln(p)
+            bad = true
+        }
+    }
+    assert(!bad)
+}
+
+// One refused shape: its rows, and the text of its one E0848.
+fn refused(tag: Str, sig: Str, after: Str, want: List[Str], parts: List[Str]) ! FS.Write, Process.Spawn, Env.Read, IO.Eprint {
+    let r = check_user(tag, program(sig, after))
+    report([expect(tag, rows(r, "error", "zz_user"), want), says(tag, r, parts)])
+}
+
+let PARAM_LABEL = "a parameter of an `@ffi` fn needs a C type"
+let RETURN_LABEL = "the return type of an `@ffi` fn needs a C type"
+let NOT_COVERED = "`@trusted` does not cover this error, and `@allow` does not suppress it"
+
+test "an Option[Int] parameter is E0848, and the help names the bare type" {
+    refused("opt_int", "fn zz(x: Option[Int]) -> Int ! ()", "", ["E0848@3:10-21"],
+        ["`Option[Int]` is not FFI-compatible", PARAM_LABEL, NOT_COVERED, "`Int`"])
+}
+
+test "a fn-typed parameter is E0848, and the help says a closure type is not supported" {
+    refused("fn_param", "fn zz(f: fn(Int) -> Int) -> Int ! ()", "", ["E0848@3:10-24"],
+        ["`fn(Int) -> Int` is not FFI-compatible", PARAM_LABEL, "not supported"])
+}
+
+test "an Option of a Ptr to an @ffi.struct is E0848, and the help names the bare Ptr" {
+    refused("opt_ptr", "fn zz(p: Option[Ptr[Mirror]]) -> Int ! ()", MIRROR, ["E0848@3:10-29"],
+        ["`Option[Ptr[Mirror]]` is not FFI-compatible", "`Ptr[Mirror]`"])
+}
+
+test "an Option[Str] return is E0848, and the help says to return Ptr[U8] and read it with to_str" {
+    refused("opt_str_ret", "fn zz(p: Ptr[U8]) -> Option[Str] ! ()", "", ["E0848@3:22-33"],
+        ["`Option[Str]` is not FFI-compatible", RETURN_LABEL, "`Ptr[U8]`", "`.to_str()`"])
+}
+
+test "a Str parameter is E0848, and the help passes scope.cstr of the parameter" {
+    refused("str_param", "fn zz(name: Str) -> Ptr[U8] ! ()", "", ["E0848@3:13-16"],
+        ["`Str` is not FFI-compatible", PARAM_LABEL, "`Ptr[U8]`", "`scope.cstr(name)`"])
+}
+
+test "a Str return is E0848, and the help says to return Ptr[U8]" {
+    refused("str_ret", "fn zz() -> Str ! ()", "", ["E0848@3:12-15"],
+        ["`Str` is not FFI-compatible", RETURN_LABEL, "`Ptr[U8]`", "`.to_str()`"])
+}
+
+test "a Bytes parameter is E0848, and the help names Bytes.with_ptr and Buf[U8]" {
+    refused("bytes", "fn zz(b: Bytes) -> Int ! ()", "", ["E0848@3:10-15"], ["`Bytes.with_ptr`", "`Buf[U8]`"])
+}
+
+test "a List[U8] parameter is E0848, and the help names Bytes.with_ptr and Buf[U8]" {
+    refused("list_u8", "fn zz(b: List[U8]) -> Int ! ()", "", ["E0848@3:10-18"], ["`Bytes.with_ptr`", "`Buf[U8]`"])
+}
+
+test "an Option[Never] return is E0848, and the help writes -> Never" {
+    refused("opt_never", "fn zz() -> Option[Never] ! ()", "", ["E0848@3:12-25"],
+        ["`Option[Never]` is not FFI-compatible", "legal only as the whole return type", "`-> Never`"])
+}
+
+test "a Never parameter is E0848, and the help removes the parameter" {
+    refused("never_param", "fn zz(n: Never) -> Int ! ()", "", ["E0848@3:10-15"],
+        ["`Never` is not FFI-compatible", "legal only as the whole return type", "remove the parameter"])
+}
+
+test "a plain struct parameter is E0848, and the help names @ffi.struct" {
+    refused("plain", "fn zz(p: Plain) -> Int ! ()", "\ntype Plain \{\n    a: Int\n}\n", ["E0848@3:10-15"],
+        ["`Plain` is not FFI-compatible", "`@ffi.struct`"])
+}
+
+test "a one-field struct that wraps a scalar is E0848" {
+    refused("newtype", "fn zz(fd: Fd) -> Int ! ()", "\ntype Fd \{\n    value: Int\n}\n", ["E0848@3:11-13"], ["`Fd` is not FFI-compatible"])
+}
+
+test "an enum parameter is E0848" {
+    refused("enum", "fn zz(c: Color) -> Int ! ()", "\ntype Color \{\n    Red\n    Green\n}\n", ["E0848@3:10-15"], ["`Color` is not FFI-compatible"])
+}
+
+test "a Result return is E0848" {
+    refused("result", "fn zz() -> Result[Int, Int] ! ()", "", ["E0848@3:12-28"], ["`Result[Int, Int]` is not FFI-compatible", RETURN_LABEL])
+}
+
+test "a tuple parameter is E0848" {
+    refused("tuple", "fn zz(t: (Int, Int)) -> Int ! ()", "", ["E0848@3:10-20"], ["`(Int, Int)` is not FFI-compatible"])
+}
+
+test "a Char parameter is E0848" {
+    refused("char", "fn zz(c: Char) -> Int ! ()", "", ["E0848@3:10-14"], ["`Char` is not FFI-compatible"])
+}
+
+test "an Option of an Option of a handle is E0848" {
+    refused("opt_opt", "fn zz(f: Option[Option[CFile]]) -> Int ! ()", OPAQUE, ["E0848@3:10-31"], ["`Option[Option[CFile]]` is not FFI-compatible"])
+}
+
+test "a List of a handle is E0848" {
+    refused("list_h", "fn zz(f: List[CFile]) -> Int ! ()", OPAQUE, ["E0848@3:10-21"], ["`List[CFile]` is not FFI-compatible"])
+}
+
+test "an alias expands first: an alias of Str is E0848 at the alias, and a note gives the expansion" {
+    refused("alias_str", "fn zz(s: Name) -> Int ! ()", "\ntype Name = Str\n", ["E0848@3:10-14"],
+        ["`Name` is not FFI-compatible", "`Name` is an alias of `Str`", "`scope.cstr(s)`"])
+}
+
+// The type parameter is reported where it is declared, so a type gets one report: the
+// parameter `x: T` is not reported again.
+test "a type parameter on an @ffi fn is E0848 at the type parameter, once" {
+    refused("generic", "fn zz[T](x: T) -> Int ! ()", "", ["E0848@3:7-8"], ["`T` is not FFI-compatible", "one declaration for each type"])
+}
+
+test "a () parameter is E0848, and the help removes the parameter" {
+    refused("unit_param", "fn zz(x: ()) -> Int ! ()", "", ["E0848@3:10-12"],
+        ["`()` is not FFI-compatible", PARAM_LABEL, "remove the parameter"])
+}
+
+test "an Option[()] parameter is E0848" {
+    refused("opt_unit", "fn zz(x: Option[()]) -> Int ! ()", "", ["E0848@3:10-20"], ["`Option[()]` is not FFI-compatible"])
+}
+
+test "an alias of () as a parameter is E0848 at the alias" {
+    refused("unit_alias", "fn zz(x: U) -> Int ! ()", "\ntype U = ()\n", ["E0848@3:10-11"], ["`U` is not FFI-compatible"])
+}
+
+test "an Option[Str] parameter is E0848, and the help names the bare type and why Str is refused too" {
+    refused("opt_str_param", "fn zz(x: Option[Str]) -> Int ! ()", "", ["E0848@3:10-21"],
+        ["`Option[Str]` is not FFI-compatible", "write the bare type `Str`", "`Str` is not FFI-compatible either"])
+}
+
+test "a trait used as a parameter type is E0848" {
+    refused("trait_param", "fn zz(x: Sh) -> Int ! ()", "\ntrait Sh \{\n    fn a(self) -> Int\n}\n", ["E0848@3:10-12"], ["`Sh` is not FFI-compatible"])
+}
+
+test "a bad type after a good parameter is E0848 at that type" {
+    refused("second", "fn zz(a: Int, s: Str) -> Int ! ()", "", ["E0848@3:18-21"], ["`Str` is not FFI-compatible"])
+}
+
+test "a bad parameter and a bad return are two reports" {
+    let r = check_user("two", program("fn zz(s: Str) -> Str ! ()", ""))
+    report([expect("two", rows(r, "error", "zz_user"), ["E0848@3:10-13", "E0848@3:18-21"])])
+}
+
+// A bad Ptr argument is E0810, and the type then gets no second report.
+test "an Option of a Ptr to Str is E0810 only" {
+    let r = check_user("opt_ptr_str", program("fn zz(p: Option[Ptr[Str]]) -> Int ! ()", ""))
+    let codes = rows(r, "error", "zz_user").map(fn(s: Str) -> Str { s.split("@").get(0) ?? "" })
+    report([expect("opt_ptr_str", codes, ["E0810"])])
+}
+
+// `()` and `Void` share a type, so the written form decides: a written `Void` belongs to E0828.
+test "a Void parameter, an Option[Void] and an alias of Void get no E0848" {
+    let r = check_user("void_e0828", program("fn zz(a: Void, b: Option[Void], c: V) -> Int ! ()", "\ntype V = Void\n"))
+    let e0848 = rows(r, "error", "zz_user").filter(fn(s: Str) -> Bool { s.starts_with("E0848") })
+    report([expect("void_e0828", e0848, [])])
+}
+
+// `@allow(FfiIncompatibleType)` names an error, so it is NotAWarningName (E0847, §4.16.8).
+// That refusal is its own rule; this row proves only that the `@allow` does not remove the E0848.
+test "@allow(FfiIncompatibleType) does not suppress E0848" {
+    let src = "@ffi(\"c\", \"labs\")\n@trusted(audit: \"P\")\n@allow(FfiIncompatibleType)\nfn zz(x: Str) -> Int ! ()\n\nfn main() \{}\n"
+    let r = check_user("allow", src)
+    let codes = rows(r, "error", "zz_user").map(fn(s: Str) -> Str { s.split("@").get(0) ?? "" })
+    report([expect("allow", codes.filter(fn(c: Str) -> Bool { c == "E0848" }), ["E0848"])])
+}
+
+test "an @ffi fn without @trusted gets E0848 too" {
+    let r = check_user("untrusted", "@ffi(\"c\", \"labs\")\nfn zz(x: Option[Int]) -> Int ! ()\n\nfn main() \{}\n")
+    report([expect("untrusted", rows(r, "error", "zz_user"), ["E0848@2:10-21"])])
+}
+
+test "an @ffi fn in lib/std on a C symbol gets E0848, with an FFI row too" {
+    let r = check_std("libc", "@ffi(\"c\", \"getenv\")\n@trusted(audit: \"P\")\nfn zz_getenv(name: Str) -> Ptr[U8] ! FFI \{}\n")
+    report([expect("std", rows(r, "error", "zz_sig_libc"), ["E0848@3:20-23"])])
+}
+
+// E0848 does not check an `@ffi` on a `blink_` symbol yet, in any module, form or row. When
+// these bindings move to `@runtime` and the check covers them, these rows change.
+test "a lib/std @ffi bridge in the one-argument form on a blink_ symbol with the row ! FFI checks clean" {
+    let src = "@ffi(\"blink_sqlite3_column_text\")\n@trusted(audit: \"P\")\nfn zz_text(stmt: Int, col: Int) -> Str ! FFI \{}\n\n@ffi(\"blink_test_run_case\")\n@trusted(audit: \"P\")\nfn zz_case(label: Str, body: fn() -> Void) ! FFI \{}\n\npub fn zz_use() -> Str ! FFI \{\n    zz_case(\"a\", fn() \{})\n    zz_text(0, 0)\n}\n"
+    let r = check_std("bridge", src)
+    report([expect("bridge", rows(r, "error", "zz_sig_bridge"), [])])
+}
+
+test "a lib/std @ffi on a blink_ symbol with a row other than ! FFI gets no E0848" {
+    let r = check_std("bridge_io", "@ffi(\"blink_sqlite3_column_text\")\n@trusted(audit: \"P\")\nfn zz_text(stmt: Int, col: Int) -> Str ! IO \{}\n")
+    report([expect("io", rows(r, "error", "zz_sig_bridge_io"), [])])
+}
+
+test "a lib/std @ffi in the two-argument form on a blink_ symbol gets no E0848" {
+    let r = check_std("bridge_two", "@ffi(\"c\", \"blink_sqlite3_column_text\")\n@trusted(audit: \"P\")\nfn zz_text(stmt: Int, col: Int) -> Str ! FFI \{}\n")
+    report([expect("two", rows(r, "error", "zz_sig_bridge_two"), [])])
+}
+
+test "an @ffi on a blink_ symbol with a Str parameter in a user package gets no E0848" {
+    let src = "@ffi(\"blink_str_debug\")\n@trusted(audit: \"P\")\nfn zz_one(s: Str) -> Str ! ()\n\n@ffi(\"c\", \"blink_str_debug\")\n@trusted(audit: \"P\")\nfn zz_two(s: Str) -> Str ! ()\n\nfn main() \{}\n"
+    let r = check_user("user_runtime", src)
+    let e0848 = rows(r, "error", "zz_user").filter(fn(s: Str) -> Bool { s.starts_with("E0848") })
+    report([expect("user_runtime", e0848, [])])
+}
+
+test "a bare @ffi on a fn named for a blink_ symbol gets no E0848" {
+    let src = "@ffi\n@trusted(audit: \"P\")\nfn blink_str_debug(s: Str) -> Str ! ()\n\nfn main() \{}\n"
+    let r = check_user("bare_runtime", src)
+    let e0848 = rows(r, "error", "zz_user").filter(fn(s: Str) -> Bool { s.starts_with("E0848") })
+    report([expect("bare_runtime", e0848, [])])
+}
+
+// A name that names no type gets its UnknownType and nothing more: E0848 cannot judge it.
+fn unknown_only(tag: Str, sig: Str) ! FS.Write, Process.Spawn, Env.Read, IO.Eprint {
+    let r = check_user(tag, program(sig, ""))
+    let all = rows(r, "error", "zz_user")
+    let e0848 = all.filter(fn(s: Str) -> Bool { s.starts_with("E0848") })
+    let mut problems = [expect(tag, e0848, [])]
+    if all.len() == 0 { problems.push("{tag}: want an UnknownType, got no error\nout: {r.out}\nerr: {r.err_out}") }
+    report(problems)
+}
+
+test "an unknown type name in an @ffi signature gets UnknownType and no E0848" {
+    unknown_only("unknown_bare", "fn zz(x: Foo) -> Int ! ()")
+}
+
+test "an unknown type name inside an Option in an @ffi signature gets UnknownType and no E0848" {
+    unknown_only("unknown_opt", "fn zz(x: Option[Foo]) -> Int ! ()")
+}
+
+test "an unknown generic type name in an @ffi return gets UnknownType and no E0848" {
+    unknown_only("unknown_ret", "fn zz(x: Int) -> Buf[U8] ! ()")
+}
+
+// Builds `src` as a plain program file in `mode`. The corpus exports module filters that make
+// each build one unit, so the run drops them: --per-module must reach the per-module path.
+fn build_user(tag: Str, mode: Str, src: Str) -> ProcessResult ! FS.Write, Process.Spawn, Env.Read {
+    let dir = "{compile_test_helpers.scratch_root()}/e0848_build_{tag}"
+    sh("rm -rf {dir} && mkdir -p {dir}")
+    fs.write("{dir}/zz_user.bl", src).unwrap()
+    let me = sh("pwd").out.trim()
+    let r = sh("cd {dir} && env -u BLINK_PER_MODULE -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE BLINK_CACHE_DIR={dir}/cache {me}/build/blink build --json {mode} zz_user.bl < /dev/null")
+    let _ = sh("rm -rf {dir}")
+    r
+}
+
+// A build stops at the E0848, in both modes, before codegen or the C compiler sees the
+// signature. `main` calls the fn, so no build path can drop it as unused.
+fn build_refuses(tag: Str, decl: Str, call: Str, want: List[Str]) ! FS.Write, Process.Spawn, Env.Read, IO.Eprint {
+    let src = "{decl}\n\nfn main() \{\n    {call}\n\}\n{MIRROR}"
+    let mut problems: List[Str] = []
+    for mode in ["--per-module", "--no-per-module"] {
+        let r = build_user(tag, mode, src)
+        let label = "{tag} {mode}"
+        if r.success() { problems.push("{label}: the build passed\nout: {r.out}\nerr: {r.err_out}") }
+        problems.push(expect(label, rows(r, "error", "zz_user"), want))
+        let all = "{r.out}\n{r.err_out}"
+        if all.contains("internal compiler error") || all.contains("This is a compiler bug") {
+            problems.push("{label}: the build went past typecheck\nout: {r.out}\nerr: {r.err_out}")
+        }
+    }
+    report(problems)
+}
+
+test "a build of an Option[Int] parameter stops at E0848 in both modes" {
+    build_refuses("b_opt_int", "@ffi(\"c\", \"labs\")\n@trusted(audit: \"P\")\nfn zz(x: Option[Int]) -> Int ! ()",
+        "let _ = zz(Some(1))", ["E0848@3:10-21"])
+}
+
+test "a build of an Option of a Ptr to an @ffi.struct parameter stops at E0848 in both modes" {
+    build_refuses("b_opt_ptr", "@ffi(\"c\", \"labs\")\n@trusted(audit: \"P\")\nfn zz(p: Option[Ptr[Mirror]]) -> Int ! ()",
+        "let _ = zz(None)", ["E0848@3:10-29"])
+}
+
+test "a build of an Option of a Ptr to an @ffi.struct return stops at E0848 in both modes" {
+    build_refuses("b_opt_ptr_ret", "@ffi(\"c\", \"labs\")\n@trusted(audit: \"P\")\nfn zz(n: Int) -> Option[Ptr[Mirror]] ! ()",
+        "let _ = zz(0)", ["E0848@3:18-37"])
+}
+
+test "a build of an Option[Str] return stops at E0848 in both modes" {
+    build_refuses("b_opt_str_ret", "@ffi(\"c\", \"labs\")\n@trusted(audit: \"P\")\nfn zz(n: Int) -> Option[Str] ! ()",
+        "let _ = zz(0)", ["E0848@3:18-29"])
+}
+
+let LEGAL = #"@ffi("c", "labs")
+@trusted(audit: "P")
+fn ok_scalars(a: I8, b: I16, c: I32, d: Int, e: U8, f: U16, g: U32, h: U64, j: Float, k: Bool) -> Int ! ()
+
+@ffi("c", "strlen")
+@trusted(audit: "P")
+fn ok_ptr(s: Ptr[U8], v: Ptr[Void], m: Ptr[Mirror], pp: Ptr[Ptr[U8]]) -> Ptr[U8] ! ()
+
+@ffi("c", "fflush")
+@trusted(audit: "P")
+fn ok_handle(f: CFile, g: Option[CFile]) -> Option[CFile] ! ()
+
+@ffi("c", "fclose")
+@trusted(audit: "P")
+fn ok_handle_ret(f: CFile) -> CFile ! ()
+
+@ffi("c", "nanosleep")
+@trusted(audit: "P")
+fn ok_struct(t: Mirror) -> Mirror ! ()
+
+@ffi("c", "free")
+@trusted(audit: "P")
+fn ok_unit(p: Ptr[Void]) -> () ! ()
+
+@ffi("c", "free")
+@trusted(audit: "P")
+fn ok_no_ret(p: Ptr[Void]) ! ()
+
+@ffi("c", "abort")
+@trusted(audit: "P")
+fn ok_never() -> Never ! ()
+
+@ffi("c", "labs")
+@trusted(audit: "P")
+fn ok_alias(n: Count) -> Count ! ()
+
+type Count = Int
+
+@ffi.opaque(header: "stdio.h", name: "FILE")
+type CFile
+
+@ffi.struct(header: "time.h", name: "timespec")
+type Mirror {
+    tv_sec: Int
+    tv_nsec: Int
+}
+
+fn main() {}
+"#
+
+test "every type on the list checks clean in an @ffi signature" {
+    let r = check_user("legal", LEGAL)
+    report([expect("legal", rows(r, "error", "zz_user"), [])])
+}

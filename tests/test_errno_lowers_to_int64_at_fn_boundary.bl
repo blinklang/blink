@@ -1,6 +1,7 @@
 // transparent-newtype Errno must lower to int64_t at EVERY function
-// boundary — return, parameter, and @ffi return — matching the already-correct
-// body/call-site/carrier lowering.
+// boundary — return and parameter — matching the already-correct
+// body/call-site/carrier lowering. An @ffi return is no such boundary: §9.1
+// refuses Errno there (row 6).
 //
 // The bug: bare-enum return/param sites mapped Errno via c_type_c_name(tag),
 // emitting `blink_Errno` in the C signature while the body/call-site used a bare
@@ -149,23 +150,19 @@ test "zip pairing a transparent-newtype element round-trips" {
     assert(r.out.contains("a 2 rc 20"))
 }
 
-// 6. @ffi fn declared -> Errno lowers the return type to int64_t at the
-// ffi_c_ret_type chokepoint — both the generated forward decl AND the extern
-// for the underlying symbol. A non-header symbol is used so the `extern` line
-// is actually emitted (a known libc symbol like `labs` would be elided).
-// White-box on emitted C. (The empty-body `void` wrapper that discards the
-// return is a separate, pre-existing FFI quirk — out of scope here.)
-test "@ffi fn returning bare Errno emits int64_t return, not blink_Errno" {
+// 6. An @ffi fn may not return Errno, though Errno lowers to int64_t everywhere else. §9.1
+// refuses a named type that is not on the list even when it wraps a scalar, so the C boundary
+// never sees Errno as its scalar.
+test "an @ffi fn returning Errno is E0848: a newtype is not its scalar at the C boundary" {
     let src = "import std.errno.\{Errno\}\n"
         .concat("@ffi(\"errno_lowers_to_int64_at_fn_boundary_ffi_err\")\n")
         .concat("@trusted(audit: \"TEST-ERRNO-BOUNDARY\")\n")
         .concat("fn c_err(n: Int) -> Errno ! () \{ \}\n")
         .concat("fn main() \{ let _ = c_err(-1) \}\n")
-    let c = compile_test_helpers.compile_and_emit_c(src, "_errno_lowers_to_int64_at_fn_boundary_ffi")
-    assert(c.contains("int64_t blink_2c_1err(int64_t b_n)"))
-    assert(c.contains("extern int64_t errno_lowers_to_int64_at_fn_boundary_ffi_err(int64_t b_n)"))
-    assert(!c.contains("Errno blink_2c_1err"))
-    assert(!c.contains("Errno errno_lowers_to_int64_at_fn_boundary_ffi_err"))
+    let out = compile_test_helpers.compile_and_capture(src, "_errno_lowers_to_int64_at_fn_boundary_ffi")
+    // The span is `Errno` in `-> Errno`.
+    assert(out.contains("\"code\":\"E0848\""), out)
+    assert(out.contains("\"span\":\{\"file\":\"{compile_test_helpers.scratch_root()}/_errno_lowers_to_int64_at_fn_boundary_ffi.bl\",\"line\":4,\"col\":21,\"end_line\":4,\"end_col\":26\}"), out)
 }
 
 // 7. Regression: a non-Errno single-variant Int-payload enum must STILL box

@@ -145,8 +145,11 @@ echo "gen0: bootstrapping $TAG @ $TAG_SHORT in $WT"
 stamp_version() {
     "$ROOT_DIR/scripts/stamp_cli_version.sh" "$1" "$STAMP"
 }
+# The tag's C goes through main's cc lines, so it takes main's src flags. A tag that guards
+# no `link` prototype ignores them.
+. "$ROOT_DIR/scripts/link_opt.sh"
 link_archived() {
-    cc -o "$1" "$2" -Ibuild build/libblink_std.a -lm -lgc -pthread -Wl,--gc-sections
+    cc $BLINK_SRC_CFLAGS -o "$1" "$2" -Ibuild build/libblink_std.a -lm -lgc -pthread -Wl,--gc-sections
 }
 
 # bootstrap.sh leaves a stdlib archive from the SEED compiler and a blinkc
@@ -160,7 +163,7 @@ link_archived() {
 echo "gen0: building CLI from the tag"
 build/blinkc src/cli.bl build/cli.c
 stamp_version build/cli.c
-cc -o build/blink build/cli.c -lm -lgc
+cc $BLINK_SRC_CFLAGS -o build/blink build/cli.c -lm -lgc
 echo "gen0: building the stdlib archive with the tag's compiler"
 BLINK_FORCE_STDLIB_REBUILD=1 build/blink __build-stdlib-archive
 build/blinkc --link-archive build/libblink_std.h src/blinkc_main.bl build/blinkc.c

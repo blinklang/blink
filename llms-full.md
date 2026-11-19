@@ -45,6 +45,8 @@ fn sqlite3_open(filename: Ptr[Int], db: Ptr[Ptr[Int]]) -> Int ! IO
 
 An `@ffi` decl must have an effect row: the Blink effects the foreign code has (`! IO`, `! Net`). There is no `FFI` effect. If the foreign code has no effects, write the empty row `! ()`: `fn c_strlen(s: Ptr[U8]) -> Int ! ()`. A decl with no row is `E0802`. `! ()` anywhere else is `E0564 EmptyRowOutsideFfi`, and the `@effects(...)` annotation is gone (`E1139 EffectsAnnotationRemoved`).
 
+An `@ffi` fn takes and returns only types with a C form: `I8`, `I16`, `I32`, `Int`, `U8`, `U16`, `U32`, `U64`, `Float`, `Bool`, `Ptr[T]`, `Buf[T]`, an `@ffi.opaque` handle or an `Option` of one, and an `@ffi.struct` by value; a return can also be `()`, or `Never` as the whole return. Any other type, an alias of one, and a type parameter are `E0848 FfiIncompatibleType` at the type; `@trusted` does not cover it. For a `Str`, take `Ptr[U8]` and pass `scope.cstr(s)` inside `with ffi.scope() as scope`.
+
 `@runtime("blink_symbol")` binds a function of the Blink runtime. Only `lib/std` writes it, and the symbol starts with `blink_`; anywhere else, or on another symbol, it is `E0849 InvalidRuntimeBinding` at the symbol string. A `@runtime` fn has no body, writes its real effect row (`! ()` is `E0564`), needs no `@trusted`, may be `pub`, and binds a module-level fn only (`E1110` on a method). A C function uses `@ffi`.
 
 ### @ffi let (foreign constant)
