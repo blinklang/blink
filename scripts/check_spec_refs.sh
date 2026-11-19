@@ -91,11 +91,13 @@ awk -F'\t' '
     }
 ' "$work/heads" >> "$work/problems" || { echo "spec-refs: the nesting check failed to run" >&2; exit 2; }
 
-# Three kinds of table. A `Name | Code | ...` table defines codes (live,
+# Four kinds of table. A `Name | Code | ...` table defines codes (live,
 # retired, ICE), and no code or name may appear twice across them. A
 # `Code | Name | Implementation` table lists defined codes again, so each of
 # its rows must match a defining row. A `Range | Category` table is the
-# legend. A table with any other header stops the gate with exit 2, so a new
+# legend. A `Name | Repair` table gives the E0847 help of a defined name, so
+# each of its names must have a defining row. A table with any other header
+# stops the gate with exit 2, so a new
 # kind of table cannot skip the checks without notice.
 awk -F'\t' -v f=ERROR_CATALOG.md -v bad="$work/unreadable" '
     $2 == "bare" {
@@ -109,6 +111,7 @@ awk -F'\t' -v f=ERROR_CATALOG.md -v bad="$work/unreadable" '
         if ($4 == "Name" && $5 == "Code") kind = "def"
         else if (hdr == "Code | Name | Implementation") kind = "list"
         else if (hdr == "Range | Category") kind = "legend"
+        else if (hdr == "Name | Repair") kind = "repair"
         else print f ":" $1 " -> a table header the gate does not know: " hdr > bad
         for (i = 1; i <= ncol; i++) {
             if (kind != "def") continue
@@ -123,6 +126,10 @@ awk -F'\t' -v f=ERROR_CATALOG.md -v bad="$work/unreadable" '
         next
     }
     $2 == "sep" || kind == "legend" { next }
+    kind == "repair" {
+        nr++; rline[nr] = $1; rname[nr] = $4
+        next
+    }
     kind == "list" {
         if ($4 in listed) print f ":" $1 " " $4 " -> also listed at " f ":" listed[$4]
         else listed[$4] = $1
@@ -150,6 +157,8 @@ awk -F'\t' -v f=ERROR_CATALOG.md -v bad="$work/unreadable" '
     }
     END {
         if (!nspec) print f " -> no table with a Spec ref column" > bad
+        for (i = 1; i <= nr; i++)
+            if (!(rname[i] in names)) print f ":" rline[i] " " rname[i] " -> a repair row whose name no defining table has"
         # A Retired row is a match too: the compiler can still emit a code
         # until the work that retires it lands.
         for (i = 1; i <= nl; i++) {

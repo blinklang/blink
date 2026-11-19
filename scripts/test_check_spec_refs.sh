@@ -194,6 +194,15 @@ expect 1 "a name used twice in the catalog goes red" "ERROR_CATALOG.md:25 Alpha 
 reset; append ERROR_CATALOG.md '| Gone | E0003 | x | Cat | §1.1 |'
 expect 1 "a code in a live and a retired table collides" "ERROR_CATALOG.md:25 E0003 -> code also at ERROR_CATALOG.md:17"
 
+reset; append ERROR_CATALOG.md ''; append ERROR_CATALOG.md '| Name | Repair |'; append ERROR_CATALOG.md '|------|--------|'
+append ERROR_CATALOG.md '| Alpha | change `x` |'
+expect 0 "a repair row that names a defined row passes" "spec-refs: ok"
+
+reset; append ERROR_CATALOG.md ''; append ERROR_CATALOG.md '| Name | Repair |'; append ERROR_CATALOG.md '|------|--------|'
+append ERROR_CATALOG.md '| Nobody | change `x` |'
+expect 1 "a repair row whose name no table defines goes red" \
+    "ERROR_CATALOG.md:28 Nobody -> a repair row whose name no defining table has"
+
 reset; append ERROR_CATALOG.md '| Delta | E0004 | x | Cat | see 1.1 |'
 expect 1 "a spec-ref cell that is not a list of refs goes red" \
     "ERROR_CATALOG.md:25 -> the Spec ref cell is not a comma-separated list of § refs: see 1.1"

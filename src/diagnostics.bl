@@ -1,5 +1,6 @@
 import lsp_protocol.{lsp_abort_frames}
 import parser.{node_args, node_name, node_module, node_line, node_col, node_count, sublist_length, sublist_get, get_annotation}
+import diag_catalog.{diag_catalog_kind, diag_catalog_name, diag_catalog_code, diag_catalog_repair}
 
 effect Diag {
     effect Report
@@ -189,6 +190,9 @@ pub const INCOMPATIBLE_STDLIB_ARCHIVE = "E0840"
 // A [lints] value that is not a level. A setting that could silence it could hide the very
 // typo it reports, so nothing changes its severity (spec §4.16.8).
 pub const INVALID_LINT_LEVEL = "E0843"
+// An @allow argument or [lints] key that names a live diagnostic that is not a warning (spec
+// §4.16.8). Like E0843, nothing changes its severity.
+pub const NOT_A_WARNING_NAME = "E0847"
 // `@runtime` outside lib/std, or on a symbol that is not `blink_` (spec §9.1).
 pub const INVALID_RUNTIME_BINDING = "E0849"
 
@@ -717,7 +721,10 @@ pub fn diag_push_allows(fn_node: Int) {
     let mut i = 0
     while i < sublist_length(args_sl) {
         let arg_name = node_name(sublist_get(args_sl, i))
-        diag_allow_set.insert(arg_name, 1)
+        // The type check reports such an argument as E0847; the error it names still fires.
+        if diag_non_warning_kind(arg_name) == "" {
+            diag_allow_set.insert(arg_name, 1)
+        }
         i = i + 1
     }
 }
@@ -771,7 +778,55 @@ pub fn lint_set_override(name: Str, level: Str) ! Diag.Report {
             diag_audit_gated_help(name))
         return
     }
+    // The manifest load reports such a key as E0847 at its span; the error it names still fires.
+    if diag_non_warning_kind(name) != "" { return }
     lint_overrides.insert(name, level)
+}
+
+// The section of a live name or code that is not under *Warning Names*: "error", "info" or
+// "ice"; "" for a warning and for a name in no section. @allow and [lints] reach only warnings
+// (spec §4.16.8). The catalog row decides, not the severity in effect, so a warning that
+// --strict or [lints] promotes to an error stays reachable.
+pub fn diag_non_warning_kind(key: Str) -> Str {
+    let kind = diag_catalog_kind(key)
+    if kind == "warning" { return "" }
+    kind
+}
+
+fn diag_kind_phrase(kind: Str) -> Str {
+    if kind == "error" { return "an error" }
+    if kind == "info" { return "an info diagnostic" }
+    "an internal compiler error"
+}
+
+// The E0847 message for one entry. `site` is "@allow" or "[lints]".
+pub fn diag_not_a_warning_message(key: Str, kind: Str, site: Str) -> Str {
+    let name = diag_catalog_name(key)
+    let what = if key == name { "`{key}` is {diag_kind_phrase(kind)}" } else { "`{key}` is the code of `{name}`, {diag_kind_phrase(kind)}" }
+    "{what}; `{site}` takes warning names only"
+}
+
+// The first line removes the entry. The second is the catalog repair of the named row when it
+// has one, else a generic line: the @allow site has no instance of the error to repair.
+// `removal` is "remove this argument" or "remove this key". It never proposes another @allow
+// argument (spec §4.16.8).
+pub fn diag_not_a_warning_help(key: Str, kind: Str, removal: Str) -> Str {
+    let name = diag_catalog_name(key)
+    let repair = diag_catalog_repair(name)
+    if repair != "" { return "{removal}\n{repair}" }
+    if kind == "error" { return "{removal}\nfix the code that `{name}` reports" }
+    if kind == "info" { return "{removal}\n`{name}` never fails a build, so nothing needs to suppress it" }
+    "{removal}\nan internal compiler error is a bug in the compiler; report it"
+}
+
+// The note that names `blink explain`, with the generic help only. It is left out when explain
+// has no text for the row, so the help never names a repair that does not exist (spec §3.1).
+pub fn diag_not_a_warning_notes(key: Str, kind: Str) -> List[Str] {
+    let name = diag_catalog_name(key)
+    if diag_catalog_repair(name) != "" { return [] }
+    if diag_explain(diag_catalog_code(key)) == "" { return [] }
+    let what = if kind == "error" { "its repair" } else { "what it reports" }
+    ["run `blink explain {name}` for {what}"]
 }
 
 // The [lints] levels in force, one "name=level" line each. A level decides whether a
@@ -785,9 +840,8 @@ pub fn lint_override_lines() -> List[Str] {
     out
 }
 
-// E1113-E1126. The spec lets no setting suppress or demote a lexer error (sections/02_syntax.md
-// §2.4, "Recovery"): the token the lexer recovers with is not the text the author wrote, so a
-// build that went on without the error would compile something else.
+// E1113-E1126, the lexer errors. A cutoff exists to hide what follows a lexer error, so it never
+// hides a lexer error itself (sections/02_syntax.md §2.4, "Recovery").
 pub fn diag_is_lexer_code(code: Str) -> Bool {
     if code.byte_len() != 5 || !code.starts_with("E11") { return false }
     let tens = code.byte_at(3).to_int() - 48
@@ -798,28 +852,25 @@ pub fn diag_is_lexer_code(code: Str) -> Bool {
 }
 
 fn lint_apply_override(severity: Str, name: Str, code: Str) -> Str {
-    if diag_is_lexer_code(code) { return severity }
-    // The literal has taken its type already, so a build that went on would run a value cut
-    // to the type's width (sections/03_types.md §3.2 *Integer literal range*).
-    if code == INT_LITERAL_OUT_OF_RANGE { return severity }
-    // The call it names has no type, so a build that went on would stop at the first node
-    // that reads it (sections/04_effects.md §4.16.8: only warnings take a level).
-    if code == UNRESOLVED_METHOD { return severity }
-    if code == INVALID_LINT_LEVEL { return severity }
     // Neither channel records anything, so neither reaches an audit-gated diagnostic. Both
     // write sites refuse one outright; this is the second half of the same rule, so a name
     // that arrives here by some other route still fails to silence it.
     if diag_is_audit_gated(name) != 0 { return severity }
-    if diag_allow_set.contains_key(name) {
-        return "off"
-    }
+    let allowed = diag_allow_set.contains_key(name)
     // [lints] keys may be PascalCase names or W-codes (spec §4.16.8).
     let mut level = lint_overrides.get(name) ?? ""
     if level == "" {
         level = lint_overrides.get(code) ?? ""
     }
-    if level == "" {
+    if !allowed && level == "" {
         return severity
+    }
+    // Only a warning row takes a level (sections/04_effects.md §4.16.8). The write sites
+    // refuse each live non-warning name, but a diagnostic emitted under a name and a code
+    // that no row lists would still pass them, so the catalog decides here, after a hit.
+    if diag_catalog_kind(name) != "warning" && diag_catalog_kind(code) != "warning" { return severity }
+    if allowed {
+        return "off"
     }
     if level == "off" {
         return "off"
@@ -2355,6 +2406,12 @@ pub fn diag_explain(code: Str) -> Str {
     }
     if code == INVALID_LINT_LEVEL {
         return "E0843 -- InvalidLintLevel\n\nA [lints] value in blink.toml is not one of the three levels:\n\"off\", \"warn\" or \"error\" (sections/04 §4.16.8).\n\n  [lints]\n  W0551 = \"loud\"              # E0843 -- invalid lint level `loud`\n  W0601 = \"warning\"           # E0843 -- the level is \"warn\"\n\nThe error is refused, not ignored: no @allow, [lints] entry or\n--strict changes it. A setting that silenced it could hide the very\ntypo it reports, and the lint it names would keep its default level\nwith no sign that the line did nothing.\n\nFix: write one of the three levels.\n\n  [lints]\n  W0551 = \"off\"              # OK"
+    }
+    if code == "V0001" {
+        return "V0001 -- ContractProven\n\nThe SMT solver proved that a contract holds for every input\n(sections/03b §3b.4). The compiler removes its runtime check, so the\ncontract costs nothing when the program runs.\n\n  @ensures(result == n + 1)         // V0001 -- proven for every n\n  fn next(n: Int) -> Int \{ n + 1 \}\n\nThis is information only: it never fails a build, and @allow and\n[lints] do not take its name (E0847). No change is needed."
+    }
+    if code == NOT_A_WARNING_NAME {
+        return "E0847 -- NotAWarningName\n\n`@allow` and `[lints]` take warning names only: the names under\n*Warning Names* in ERROR_CATALOG.md (sections/04 §4.16.8). An error,\nan info diagnostic or an internal compiler error is refused at each\nsuch argument and key, at every level, \"error\" included.\n\n  @allow(NonExhaustiveMatch)        // E0847 -- an error\n  fn name(c: Color) -> Str \{ ... \}\n\n  [lints]\n  E0004 = \"off\"                     # E0847 -- the code of an error\n\nAn error marks a program that is not correct, so a setting that\nsilenced it would let a clean build promise what it cannot keep. The\nerror still fires at its own site. An info diagnostic never fails a\nbuild, so nothing needs to suppress it. A warning that --strict or\n[lints] makes an error stays a warning name: the catalog row decides.\n\nFix: remove the argument or key, then fix the code that the error\nreports. `blink explain <Name>` gives its repair."
     }
     if code == INVALID_RUNTIME_BINDING {
         return "E0849 -- InvalidRuntimeBinding\n\n`@runtime(\"symbol\")` binds a function of the Blink runtime, which\nships with the toolchain (sections/07 §9.1). Only `lib/std` may use it,\nand only on a symbol that starts with `blink_`. Any other package, or\nany other symbol, is refused at the symbol string. The same holds for\n`@runtime(\"blink_x\")` on a type with no body, which declares a handle\nto a C type that the runtime owns. A `blink_` or `__blink_` C type is\nnever the `name` of an `@ffi.opaque`, in any package.\n\n  @runtime(\"blink_sb_write\")     // E0849 -- outside lib/std\n  fn sb_write(s: Str)\n\n  @ffi.opaque(header: \"h.h\", name: \"blink_tcp_handle\")  // E0849\n  type Tcp\n\nFix: a C function goes through `@ffi`, which names its library and\ncarries the audit. A C library type goes through `@ffi.opaque`; a C\nlibrary symbol with a `blink_` name is wrapped in C under another name.\n\n  @ffi(\"c\", \"strlen\")\n  @trusted(audit: \"LIBC-STRLEN\")\n  fn c_strlen(s: Ptr[U8]) -> Int ! ()"

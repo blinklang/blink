@@ -117,37 +117,53 @@ test "env.exit and a local binding named exit report nothing" {
     }
 }
 
-// The allowed bare exit records no entry, so its fix has no entry of its own to sit on.
-fn allowed_src() -> Str {
+// The bare exit's fix sits on its own entry, never on the entry the emit recorded before it.
+fn two_entries_src() -> Str {
     #"fn first() {
     nope(1)  // E_NOPE
 }
 
-@allow(UndefinedFunction)
 fn quiet() ! Env {
-    exit(1)
+    exit(1)  // E_EXIT
 }
 
 fn main() {}
 "#
 }
 
-test "an allowed bare exit leaves the fix of the entry before it alone" {
-    let _p = probe("build/tc_bare_exit_removed_allowed_src.bl", allowed_src())
-    let mut nope_line = -1
-    let lines = allowed_src().split("\n")
+// The 1-based line of the one line of two_entries_src() that holds `marker`.
+fn two_entries_line_of(marker: Str) -> Int ! IO.Print {
+    let lines = two_entries_src().split("\n")
     let mut i = 0
     while i < lines.len() {
-        if lines.get(i).unwrap().contains("E_NOPE") { nope_line = i + 1 }
+        if lines.get(i).unwrap().contains(marker) { return i + 1 }
         i = i + 1
     }
-    let errs = errors_on_line(nope_line)
-    if errs.len() != 1 { io.println("FAIL: want one error on the nope line; errors were:\n{all_errors()}") }
-    assert_eq(errs.len(), 1)
-    let d = errs.get(0).unwrap()
+    io.println("FAIL: two_entries_src() has no line marked '{marker}'")
+    assert(false)
+    -1
+}
+
+test "a bare exit after another error keeps its fix on its own entry" {
+    let _p = probe("build/tc_bare_exit_removed_two_entries_src.bl", two_entries_src())
+    let nope = errors_on_line(two_entries_line_of("E_NOPE"))
+    if nope.len() != 1 { io.println("FAIL: want one error on the nope line; errors were:\n{all_errors()}") }
+    assert_eq(nope.len(), 1)
+    let d = nope.get(0).unwrap()
     assert_eq(d.message, "undefined function `nope`")
     assert_eq(d.fix_action, "")
     assert_eq(d.fix_text, "")
+    let exit_line = two_entries_line_of("E_EXIT")
+    let ex = errors_on_line(exit_line)
+    if ex.len() != 1 { io.println("FAIL: want one error on the exit line; errors were:\n{all_errors()}") }
+    assert_eq(ex.len(), 1)
+    let e = ex.get(0).unwrap()
+    assert_eq(e.code, "E0504")
+    assert_eq(e.fix_action, "replace with")
+    assert_eq(e.fix_text, "env.exit")
+    assert_eq(e.fix_line, exit_line)
+    assert_eq(e.fix_col, 5)
+    assert_eq(e.fix_end_col, 9)
 }
 
 test "a program's own fn exit still compiles and is called" {

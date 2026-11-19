@@ -9,7 +9,8 @@ import diagnostics.{
     diag_source_file, diag_module_files, embedded_inner_key,
     diag_error_at, diag_file_for_node, diag_warn_in_file_notes, SHADOWED_DEPENDENCY,
     diag_emit_in_file, diag_error_in_file_label_notes, diag_error_no_loc_notes, diag_entries, diag_entry_count, diag_ice_count, diag_cutoff_count,
-    INVALID_LINT_LEVEL, UNKNOWN_MANIFEST_SECTION, UNKNOWN_MANIFEST_KEY, AUDIT_RECORD_UNKNOWN_KEY,
+    INVALID_LINT_LEVEL, UNKNOWN_MANIFEST_SECTION, NOT_A_WARNING_NAME,
+    diag_non_warning_kind, diag_not_a_warning_message, diag_not_a_warning_help, diag_not_a_warning_notes, UNKNOWN_MANIFEST_KEY, AUDIT_RECORD_UNKNOWN_KEY,
     CIRCULAR_DEPENDENCY, VERSION_CONFLICT, INVALID_MODULE_ANNOTATION,
     PACKAGE_ENTRY_NOT_FOUND, ORPHAN_FILE, MODULE_NOT_FOUND, UNUSED_IMPORT,
     FILE_NOT_FOUND,
@@ -17,7 +18,7 @@ import diagnostics.{
 import pkg.lockfile.{lockfile_load, lockfile_clear, lockfile_find_pkg, lockfile_pkg_count, lock_pkg_sources, lock_pkg_names, lock_pkg_versions}
 import pkg.manifest.{manifest_clear, manifest_load, manifest_has_dep, manifest_name, lint_names, lint_levels, manifest_print_warnings, manifest_issues, ManifestIssueKind}
 import std.path.{path_join, path_dirname, path_parent, path_basename, path_stem}
-import std.toml.{toml_read_value}
+import std.toml.{toml_read_value, toml_parse_doc}
 import comment_attach.{attach_comments_pass}
 import limit_values.{limit_kind_named, limit_key_help}
 import audit_records.{audit_records_parse, audit_records_empty, AuditRecords}
@@ -194,7 +195,7 @@ fn unknown_section_notes() -> List[Str] {
 // Sets the [lints] levels of the manifest that the last manifest_load read from path, then
 // reports its issues. The levels go first, so a [lints] entry governs W1001 whatever the order
 // of the sections.
-pub fn apply_manifest_lints(path: Str) ! Diag.Report, Env.Read {
+pub fn apply_manifest_lints(path: Str) ! Diag.Report, Env.Read, FS.Read {
     let mut i = 0
     while i < lint_names.len() {
         lint_set_override(lint_names.get(i).unwrap(), lint_levels.get(i).unwrap())
@@ -229,6 +230,31 @@ pub fn apply_manifest_lints(path: Str) ! Diag.Report, Env.Read {
                     unknown_key_help(issue.section, issue.key, issue.suggestion))
             }
         }
+    }
+    report_non_warning_lint_keys(path, file)
+}
+
+// E0847 at each [lints] key that names a live diagnostic that is not a warning (§4.16.8),
+// whatever its level. lint_set_override already left each one out. The manifest is parsed
+// again, since the key spans of the load may be gone by now, and an unreadable file was
+// reported by the load.
+fn report_non_warning_lint_keys(path: Str, file: Str) ! Diag.Report, FS.Read {
+    let content = match fs.read(path) {
+        Ok(text) => text
+        Err(_) => return
+    }
+    let prefix = "lints."
+    for e in toml_parse_doc(content).entries {
+        if !e.key.starts_with(prefix) { continue }
+        let name = e.key.byte_slice(prefix.byte_len(), e.key.byte_len())
+        let kind = diag_non_warning_kind(name)
+        if kind == "" { continue }
+        let sp = e.key_span
+        diag_error_in_file_label_notes("NotAWarningName", NOT_A_WARNING_NAME,
+            diag_not_a_warning_message(name, kind, "[lints]"),
+            file, sp.line, sp.col, sp.end_line, sp.end_col, "",
+            diag_not_a_warning_help(name, kind, "remove this key"),
+            diag_not_a_warning_notes(name, kind))
     }
 }
 

@@ -1,0 +1,190 @@
+// `@allow` and `[lints]` reach only the names under *Warning Names* (sections/04_effects.md
+// §4.16.8 *Only warnings*). Any other live name, an error, an info diagnostic or an internal
+// compiler error, is NotAWarningName (E0847) at each such argument and key, at every level.
+// The named error still fires at its own site, so a clean `blink check` keeps its promise.
+// The fixture lives under a fresh temporary directory, since the test tree itself sits inside a
+// project.
+
+import std.process.{ProcessResult, ChildEnd}
+import std.json.{json_clear, json_parse, json_get, json_as_str, json_as_int, json_at, json_len}
+
+let PACKAGE = "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n"
+
+fn sh(cmd: Str) -> ProcessResult ! Process.Spawn {
+    process.run("sh", ["-c", cmd]).unwrap()
+}
+
+fn check(toml: Str, main: Str, args: Str) -> ProcessResult ! FS.Write, Process.Spawn {
+    let dir = sh("mktemp -d /tmp/blink_not_a_warning_name.XXXXXX").out.trim()
+    let _ = sh("mkdir -p {dir}/src")
+    fs.write("{dir}/blink.toml", toml).unwrap()
+    // A lock no older than blink.toml keeps dependency resolution out of the check.
+    fs.write("{dir}/blink.lock", "[metadata]\nlockfile-version = 1\n").unwrap()
+    fs.write("{dir}/src/main.bl", main).unwrap()
+    let r = sh("B=$(pwd)/build/blink; cd {dir} && timeout 120 $B check --json {args} src/main.bl")
+    let _ = sh("rm -rf {dir}")
+    r
+}
+
+// One line per diagnostic row on stderr: `severity code file:line:col`.
+fn rows(r: ProcessResult) -> List[Str] {
+    let mut out: List[Str] = []
+    for line in r.err_out.lines() {
+        json_clear()
+        let row = json_parse(line)
+        if row < 0 { continue }
+        let code = json_as_str(json_get(row, "code"))
+        if code == "" { continue }
+        let span = json_get(row, "span")
+        out.push("{json_as_str(json_get(row, \"severity\"))} {code} {json_as_str(json_get(span, \"file\"))}:{json_as_int(json_get(span, \"line\"))}:{json_as_int(json_get(span, \"col\"))}")
+    }
+    out
+}
+
+// The message, help and notes of the E0847 rows, one string each.
+fn e0847_text(r: ProcessResult) -> List[Str] {
+    let mut out: List[Str] = []
+    for line in r.err_out.lines() {
+        json_clear()
+        let row = json_parse(line)
+        if row < 0 || json_as_str(json_get(row, "code")) != "E0847" { continue }
+        let mut text = "{json_as_str(json_get(row, \"message\"))} | help: {json_as_str(json_get(row, \"help\"))}"
+        let notes = json_get(row, "notes")
+        if notes >= 0 {
+            let mut i = 0
+            while i < json_len(notes) {
+                text = text.concat(" | note: {json_as_str(json_at(notes, i))}")
+                i = i + 1
+            }
+        }
+        out.push(text)
+    }
+    out
+}
+
+fn assert_fails(r: ProcessResult, want: List[Str]) {
+    assert_eq(r.end, ChildEnd.Exited(1), "stderr:\n{r.err_out}")
+    assert_eq(rows(r), want)
+}
+
+let NAME = "type Color \{ Red Green Blue }\n\n@allow(NonExhaustiveMatch)\nfn name(c: Color) -> Str \{\n    match c \{\n        Red => \"red\"\n        Green => \"green\"\n    }\n}\n\nfn main() \{ io.println(name(Color.Red)) }\n"
+
+let NAME_PLAIN = "type Color \{ Red Green Blue }\n\nfn name(c: Color) -> Str \{\n    match c \{\n        Red => \"red\"\n        Green => \"green\"\n    }\n}\n\nfn main() \{ io.println(name(Color.Red)) }\n"
+
+let EXPLAIN_ERROR = "fix the code that `NonExhaustiveMatch` reports | note: run `blink explain NonExhaustiveMatch` for its repair"
+
+test "@allow of an error name is E0847 at the argument, and the error still fires" {
+    let r = check(PACKAGE, NAME, "")
+    assert_fails(r, ["error E0847 src/main.bl:3:8", "error E0004 src/main.bl:5:5"])
+    assert_eq(e0847_text(r), ["`NonExhaustiveMatch` is an error; `@allow` takes warning names only | help: remove this argument\n{EXPLAIN_ERROR}"])
+}
+
+test "@allow(TypeError) does not let a type error reach the build" {
+    let main = "@allow(TypeError)\nfn f() -> Int \{ \"hello\" }\n\nfn main() \{ io.println(\"\{f()}\") }\n"
+    let r = check(PACKAGE, main, "")
+    assert_eq(r.end, ChildEnd.Exited(1), "stderr:\n{r.err_out}")
+    let got = rows(r)
+    assert(got.contains("error E0847 src/main.bl:1:8"), "{got.len()} rows:\n{r.err_out}")
+    assert(got.len() >= 2, r.err_out)
+}
+
+test "@allow(ParamAssign) leaves the write to a parameter an error" {
+    let main = "@allow(ParamAssign)\nfn f(a: Int) -> Int \{\n    a = a + 1\n    a\n}\n\nfn main() \{ io.println(\"\{f(1)}\") }\n"
+    assert_fails(check(PACKAGE, main, ""), ["error E0847 src/main.bl:1:8", "error E0612 src/main.bl:3:5"])
+}
+
+// A code given to `@allow` is UnknownDiagnosticName (E0842), checked before E0847 (§4.16.8
+// *Check order*), so it is never E0847. It silences nothing either way.
+test "@allow of an error code is not E0847, and the error still fires" {
+    let main = NAME.replace("@allow(NonExhaustiveMatch)", "@allow(E0004)")
+    let r = check(PACKAGE, main, "")
+    assert_eq(r.end, ChildEnd.Exited(1), "stderr:\n{r.err_out}")
+    let got = rows(r)
+    assert(!got.contains("error E0847 src/main.bl:3:8"), r.err_out)
+    assert(got.contains("error E0004 src/main.bl:5:5"), r.err_out)
+}
+
+// Only a name or code in a warning row takes a level. This error is emitted under a name and a
+// code that no catalog row lists, so no [lints] entry reaches it.
+test "a [lints] level cannot change an error whose name and code are in no warning row" {
+    let main = "effect Dup \{\n    effect A \{ fn same() }\n    effect B \{ fn same() }\n}\n\nfn main() \{ }\n"
+    for key in ["E0516", "DuplicateEffectOperation"] {
+        for level in ["off", "warn"] {
+            let r = check("{PACKAGE}[lints]\n{key} = \"{level}\"\n", main, "")
+            assert_eq(r.end, ChildEnd.Exited(1), "{key} = {level}, stderr:\n{r.err_out}")
+            assert(rows(r).contains("error E0516 src/main.bl:3:16"), "{key} = {level}:\n{r.err_out}")
+        }
+    }
+}
+
+test "a [lints] error name is E0847 at the key at each level" {
+    for level in ["off", "warn", "error"] {
+        let r = check("{PACKAGE}[lints]\nNonExhaustiveMatch = \"{level}\"\n", NAME_PLAIN, "")
+        assert_fails(r, ["error E0847 blink.toml:6:1", "error E0004 src/main.bl:4:5"])
+        assert_eq(e0847_text(r), ["`NonExhaustiveMatch` is an error; `[lints]` takes warning names only | help: remove this key\n{EXPLAIN_ERROR}"])
+    }
+}
+
+test "a [lints] key that is the code of an error is E0847" {
+    let r = check("{PACKAGE}[lints]\nE0004 = \"off\"\n", NAME_PLAIN, "")
+    assert_fails(r, ["error E0847 blink.toml:6:1", "error E0004 src/main.bl:4:5"])
+}
+
+test "an info name is E0847" {
+    let main = "@allow(ContractProven)\nfn main() \{ io.println(\"hi\") }\n"
+    let r = check(PACKAGE, main, "")
+    assert_fails(r, ["error E0847 src/main.bl:1:8"])
+    assert_eq(e0847_text(r), ["`ContractProven` is an info diagnostic; `@allow` takes warning names only | help: remove this argument\n`ContractProven` never fails a build, so nothing needs to suppress it | note: run `blink explain ContractProven` for what it reports"])
+}
+
+test "an internal compiler error name is E0847" {
+    let r = check("{PACKAGE}[lints]\nUnsolvedTypeVarAtCodegen = \"off\"\n", "fn main() \{ io.println(\"hi\") }\n", "")
+    assert_fails(r, ["error E0847 blink.toml:6:1"])
+    assert_eq(e0847_text(r), ["`UnsolvedTypeVarAtCodegen` is an internal compiler error; `[lints]` takes warning names only | help: remove this key\nan internal compiler error is a bug in the compiler; report it | note: run `blink explain UnsolvedTypeVarAtCodegen` for what it reports"])
+}
+
+test "every non-warning entry is reported, E0847 itself included" {
+    let main = "@allow(NotAWarningName, NonExhaustiveMatch)\nfn main() \{ io.println(\"hi\") }\n"
+    let r = check("{PACKAGE}[lints]\nNotAWarningName = \"off\"\nTypeError = \"warn\"\n", main, "")
+    assert_fails(r, ["error E0847 blink.toml:6:1", "error E0847 blink.toml:7:1", "error E0847 src/main.bl:1:8", "error E0847 src/main.bl:1:25"])
+}
+
+test "the help of ContractUnverifiable gives its own control" {
+    let r = check("{PACKAGE}[lints]\nContractUnverifiable = \"off\"\n", "fn main() \{ io.println(\"hi\") }\n", "")
+    assert_eq(e0847_text(r), ["`ContractUnverifiable` is an error; `[lints]` takes warning names only | help: remove this key\nchange `@verify(fallback: ...)`"])
+}
+
+test "the help of CapabilityBudgetExceeded gives its own control" {
+    let main = "@allow(CapabilityBudgetExceeded)\nfn main() \{ io.println(\"hi\") }\n"
+    let r = check(PACKAGE, main, "")
+    assert_eq(e0847_text(r), ["`CapabilityBudgetExceeded` is an error; `@allow` takes warning names only | help: remove this argument\nwiden `@capabilities`"])
+}
+
+test "a warning that --strict promotes stays reachable by @allow" {
+    let main = "@allow(UnusedVariable)\nfn main() \{\n    let x = 1\n    io.println(\"hi\")\n}\n"
+    let r = check(PACKAGE, main, "--strict")
+    assert_eq(r.end, ChildEnd.Exited(0), "stderr:\n{r.err_out}")
+    assert_eq(rows(r), [])
+}
+
+test "a warning that [lints] sets to error stays reachable by @allow" {
+    let main = "@allow(UnusedVariable)\nfn main() \{\n    let x = 1\n    io.println(\"hi\")\n}\n"
+    let r = check("{PACKAGE}[lints]\nUnusedVariable = \"error\"\n", main, "")
+    assert_eq(r.end, ChildEnd.Exited(0), "stderr:\n{r.err_out}")
+    assert_eq(rows(r), [])
+}
+
+test "an audit-gated warning stays E0837 and is not E0847" {
+    let main = "@allow(RawBypassesParam)\nfn main() \{ io.println(\"hi\") }\n"
+    assert_fails(check(PACKAGE, main, ""), ["error E0837 src/main.bl:1:8"])
+}
+
+test "blink explain takes a live name and explains NotAWarningName" {
+    let by_name = sh("timeout 60 $(pwd)/build/blink explain NonExhaustiveMatch")
+    assert(by_name.success(), by_name.out)
+    assert(by_name.out.starts_with("E0004 -- NonExhaustiveMatch\n"), by_name.out)
+    let own = sh("timeout 60 $(pwd)/build/blink explain NotAWarningName")
+    assert(own.success(), own.out)
+    assert(own.out.starts_with("E0847 -- NotAWarningName\n"), own.out)
+    assert(own.out.contains("warning names only"), own.out)
+}

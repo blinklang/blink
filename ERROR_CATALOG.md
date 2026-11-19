@@ -27,7 +27,7 @@ error[NonExhaustiveMatch]: non-exhaustive match
 - **Suppression** uses names: `@allow(UnusedVariable)`. `@allow` takes names only. Suppress a warning only when the code is correct as written; the usual repair for `UnusedVariable` is to remove or rename the binding.
 - **Nearest-name suggestion.** A diagnostic that suggests a name compares the written name with its candidate names after it ignores case, `_` and `-`. If exactly one candidate is nearest, and it is near enough, the `help:` line names it. If two or more candidates are equally near, or no candidate is near enough, there is no suggestion. The implementation sets how near is near enough. For one compiler version, the same input gives the same suggestion in the compiler, the language server and `blink explain`. Each row that suggests a name says which names are its candidates.
 - **Only warnings can be suppressed.** `@allow` and `[lints]` reach only names listed under *Warning Names* (§4.16.8). The catalog row decides, not the severity in effect, so a warning promoted to an error is still reachable. Any other live name is the error `NotAWarningName` (E0847). No `@allow` or `[lints]` entry suppresses E0847 or changes its severity, and every level is refused, `"error"` included. The named error still fires at its own site.
-  - **Help:** the first `help:` line says to remove the argument or key. The next line gives the named error's own primary help. Where a row has a better repair through its own control, that repair is catalog data, taken from the same source as the named error's help: `ContractUnverifiable` (V0003) → change `@verify(fallback: ...)`; `CapabilityBudgetExceeded` (E0501) → widen `@capabilities`. When no repair fits the `@allow` site, the help is generic and a `note:` names `blink explain <Name>`. The help never proposes another `@allow` argument and never proposes a `_ => panic(...)` arm.
+  - **Help:** the first `help:` line says to remove the argument or key. The next line gives the named error's own primary help. Where a row has a better repair through its own control, that repair is catalog data, taken from the same source as the named error's help: the table *Repairs at a suppression site* below. When no repair fits the `@allow` site, the help is generic and a `note:` names `blink explain <Name>`. The help never proposes another `@allow` argument and never proposes a `_ => panic(...)` arm.
   - **Check order:** E0842 is checked first. E0837 and E0847 cover separate name sets, because the audit-gated list holds warnings only (§9.1), so no order between them is given.
 - **Each `@allow` argument and each `[lints]` key must identify a live diagnostic** — one listed under *Error Names*, *Warning Names*, *Info Names* or *Internal Compiler Errors*, not under *Retired Codes*. Any other argument or key is the error `UnknownDiagnosticName` (E0842): a misspelled name, a retired name or code, or a code given to `@allow`. E0842 is an error, so no `@allow` or `[lints]` entry suppresses it or changes its severity. The compiler reports each such argument and key, not only the first. An audit-gated name is `AuditGatedSuppression` (E0837), and a live name that is not a warning name is `NotAWarningName` (E0847), not E0842.
   - **Retired name or code:** the `help:` line says to remove the argument or key. A `note:` lists the *Replaced by* cell of its *Retired Codes* row as information only. The help never proposes a replacement as an `@allow` argument.
@@ -36,6 +36,15 @@ error[NonExhaustiveMatch]: non-exhaustive match
   - No two live names are equal when case, `_` and `-` are ignored.
 - **`blink explain <name-or-code>`** prints a detailed explanation of a live diagnostic and exits 0. For a retired name or code, the first line says it is retired, the output shows the same *Replaced by* list as the E0842 note, and the exit status is 0. For any other string, it prints `no diagnostic named <string>`, a suggestion by the nearest-name rule if there is one, and exits with a non-zero status.
 - **Every entry in this catalog is bound by the three rules in §3.1 *Diagnostic Discipline*:** a diagnostic never prescribes a repair that does not exist, no rule is enforced only at codegen, and diagnostics firing at one program point must converge on a repair the first `help:` names.
+
+### Repairs at a suppression site
+
+The `help:` of `NotAWarningName` (E0847) gives the repair in this table on the line after the one that removes the entry. A name with no row here gets the generic help and the `blink explain <Name>` note. The compiler reads this table from this file.
+
+| Name | Repair |
+|------|--------|
+| ContractUnverifiable | change `@verify(fallback: ...)` |
+| CapabilityBudgetExceeded | widen `@capabilities` |
 
 ---
 
