@@ -52,7 +52,7 @@ import diagnostics.{
     FFI_OFFSET_ON_SINGLETON, FFI_OFFSET_UNKNOWN_STRIDE, VOID_POINTEE_ACCESS, WITH_ITEM_NOT_A_HANDLER, EFFECT_HANDLE_COLLISION, INSUFFICIENT_HANDLER_COVERAGE,
     TRAIT_CONTRACT_900, TRAIT_CONTRACT_901, TRAIT_CONTRACT_902,
     TRAIT_CONTRACT_903, TRAIT_CONTRACT_904, TRAIT_CONTRACT_905, TRAIT_CONTRACT_906, TYPE_NOT_TRAIT,
-    DUPLICATE_TYPE_PARAM, MISSING_PARAM_TYPE,
+    DUPLICATE_TYPE_PARAM, CYCLIC_TYPE_ALIAS, MISSING_PARAM_TYPE, DiagEdge, DiagEdgeKeys, diag_set_edges_since,
     TRAIT_CONTRACT_907, SEALED_METHOD_OVERRIDE,
     POLY_IMPL_UNSUPPORTED, IMPL_BINDER_UNUSED, TRAIT_ARG_ARITY, MISSING_SUPERTRAIT_IMPL, TYPE_ARG_ARITY,
     TYPE_ARGS_WITHOUT_CALL, ELEMENT_ACCESS_HELP, ENUM_PATTERN_NON_ENUM, NO_INDEX_OPERATOR,
@@ -1210,7 +1210,7 @@ fn tc_generic_alias_target(im: Int, decl: Int) -> Int {
     if args == -1 || sublist_length(args) != sublist_length(tps) { return -1 }
     let binders = node_impl_binders(im)
     let n = if binders == -1 { 0 } else { sublist_length(binders) }
-    let u = tc_alias_underlying.get(tc_nominal_type_name(decl)) ?? -1
+    let u = tc_aliases.underlying.get(tc_nominal_type_name(decl)) ?? -1
     if n == 0 || u < 0 || !tc_type_has_receiver(u) || tc_tid_child_count(u) != n { return -1 }
     let mut j = 0
     while j < n {
@@ -2218,10 +2218,16 @@ let mut ffi_struct_type_set: Map[Int, Int] = Map()
 // E0811 carve-out.
 let mut ffi_opaque_type_set: Map[Int, Int] = Map()
 
-// Maps a type-alias name (e.g. `type Port = Int`) to its underlying type id.
+// `underlying` maps a type-alias name (e.g. `type Port = Int`) to its underlying type id.
 // Consulted by types_compatible so refinement aliases stay compatible with their base type.
 // Keyed by name (not type id) because type ids are pass-dependent across the dual codegen passes.
-let mut tc_alias_underlying: Map[Str, Int] = Map()
+// `cyclic` holds the alias declarations in a cycle of aliases (E0327) or leading into one. Each
+// has the poison type (§6.3.5), so a use gets no second error and an impl on it is dropped.
+type AliasFacts {
+    underlying: Map[Str, Int]
+    cyclic: Set[Int]
+}
+let mut tc_aliases: AliasFacts = AliasFacts { underlying: Map(), cyclic: Set() }
 
 // The underlying tid of the alias that `name` means, or -1. Keyed by the DECLARATION, so a
 // namesake is asked for under the module the reading file selected: the bare key alone
@@ -2229,10 +2235,10 @@ let mut tc_alias_underlying: Map[Str, Int] = Map()
 // file that wrote the name. A name no module declares twice keeps the plain two-step lookup.
 fn tc_alias_underlying_of(name: Str) -> Int {
     let renamed = tc_type_renamed_here(name)
-    if renamed != -1 { return tc_alias_underlying.get(tc_nominal_type_name(renamed)) ?? -1 }
+    if renamed != -1 { return tc_aliases.underlying.get(tc_nominal_type_name(renamed)) ?? -1 }
     let bare = strip_module_qualifier(name)
     if tc_is_namesake_type_name(bare) != 0 {
-        return tc_alias_underlying.get(tc_written_type_nominal(name)) ?? -1
+        return tc_aliases.underlying.get(tc_written_type_nominal(name)) ?? -1
     }
     // An alias that shadows a compiler-known name shadows it only where it is declared or
     // imported (sections/07 §10.6), so every other module, std's included, reads the builtin.
@@ -2259,9 +2265,9 @@ fn tc_alias_underlying_of_decl(name: Str) -> Int {
 }
 
 fn tc_alias_underlying_by_name(name: Str) -> Int {
-    let u = tc_alias_underlying.get(name) ?? -1
+    let u = tc_aliases.underlying.get(name) ?? -1
     if u != -1 { return u }
-    tc_alias_underlying.get(strip_module_qualifier(name)) ?? -1
+    tc_aliases.underlying.get(strip_module_qualifier(name)) ?? -1
 }
 
 // ── Inferred type hints (for LSP inlayHint) ─────────────────────────
@@ -14863,6 +14869,8 @@ fn resolve_type_parts_at(name: Str, elems_sl: Int, ann_node: Int, at_context: Bo
     // type), and an alias-keyed map inside a compound carrier emitted a void key
     // temp. The annotation node still names what the user wrote for diagnostics.
     let written_alias = tc_alias_decl_of_written(name)
+    // A cyclic alias (E0327) has no expansion to settle or apply.
+    if written_alias != -1 && tc_aliases.cyclic.contains(written_alias) { return tc_error_recovery_tid() }
     if written_alias != -1 {
         // An alias that names a later generic alias settles it first, because applying it needs
         // its target: `type B[Y] = A[Y]` before `type A[X] = P[X]` has no other way to reach `P[Y]`.
@@ -14938,7 +14946,7 @@ fn tc_alias_trait_context(atd: Int) -> Int {
     if target == -1 || node_elements(target) != -1 { return -1 }
     let binders = node_type_params(atd)
     if binders != -1 && sublist_length(binders) > 0 { return -1 }
-    let stored = tc_alias_underlying.get(tc_nominal_type_name(atd)) ?? -1
+    let stored = tc_aliases.underlying.get(tc_nominal_type_name(atd)) ?? -1
     if stored == -1 || tc_tid_kind(tc_resolve(stored)) != TyKind.Typevar { return -1 }
     let key = tc_trait_ref_key(node_name(target), node_module(atd))
     if tc_trait_node_idx.contains_key(key) || tc_trait_is_compiler_known(key) { return make_trait_context_type(key) }
@@ -14949,7 +14957,7 @@ fn tc_alias_trait_context(atd: Int) -> Int {
 // each of its parameters, or -1. An alias still being settled also answers -1: a cycle of
 // aliases has no target to read yet.
 fn tc_generic_alias_applied(name: Str, elems_sl: Int) -> Int {
-    if elems_sl == -1 || tc_alias_underlying.len() == 0 { return -1 }
+    if elems_sl == -1 || tc_aliases.underlying.len() == 0 { return -1 }
     let decl = tc_alias_decl_of_written(name)
     if decl == -1 || !tc_generic_alias_decl_applies(decl, elems_sl) { return -1 }
     decl
@@ -14959,14 +14967,14 @@ fn tc_generic_alias_decl_applies(decl: Int, elems_sl: Int) -> Bool {
     if elems_sl == -1 { return false }
     let tparams = node_type_params(decl)
     if tparams == -1 || sublist_length(tparams) != sublist_length(elems_sl) { return false }
-    (tc_alias_underlying.get(tc_nominal_type_name(decl)) ?? -1) != -1
+    (tc_aliases.underlying.get(tc_nominal_type_name(decl)) ?? -1) != -1
 }
 
 // Whether alias `decl`'s target holds parameter `i`, after the alias's own aliases are flat.
 // `Fixed[X] = Box[Int]` holds none, so an argument in that place supplies nothing.
 fn tc_generic_alias_keeps_param(decl: Int, i: Int) -> Bool {
     let tp = sublist_get(node_type_params(decl), i)
-    let target = tc_alias_underlying.get(tc_nominal_type_name(decl)) ?? -1
+    let target = tc_aliases.underlying.get(tc_nominal_type_name(decl)) ?? -1
     let mut probe: Map[Str, Int] = Map()
     probe.insert(tc_binder_key(tp, node_name(tp)), TYPE_INT)
     substitute_typevar_tid(target, probe) != target
@@ -15008,7 +15016,7 @@ fn tc_apply_generic_alias(decl: Int, name: Str, elems_sl: Int, ann_node: Int) ->
 }
 
 fn tc_alias_target_at(decl: Int, args: List[Int]) -> Int {
-    let target = tc_alias_underlying.get(tc_nominal_type_name(decl)) ?? -1
+    let target = tc_aliases.underlying.get(tc_nominal_type_name(decl)) ?? -1
     tc_tid_subst_mono(target, node_type_params(decl), args)
 }
 
@@ -15060,8 +15068,8 @@ fn tc_settle_alias_decl(atd: Int) ! TypeCheck.Resolve, Diag.Report {
     // E0524 rejected the declaration, so the builtin keeps the name.
     if node_value(atd) == -1 || tc_type_name_is_undeclarable(node_name(atd)) { return }
     let key = tc_nominal_type_name(atd)
-    if tc_alias_underlying.contains_key(key) { return }
-    tc_alias_underlying.insert(key, -1)
+    if tc_aliases.underlying.contains_key(key) { return }
+    tc_aliases.underlying.insert(key, -1)
     let saved_module = nr_current_module
     let saved_frames = tc_tp_frames
     let saved_active = tc_active_tparams
@@ -15075,12 +15083,242 @@ fn tc_settle_alias_decl(atd: Int) ! TypeCheck.Resolve, Diag.Report {
     // variable there, not the constructor (§3.4:1259).
     let alias_tparams = node_type_params(atd)
     tc_push_tparam_scope(alias_tparams)
-    tc_alias_underlying.insert(key, resolve_type_ann(node_value(atd)))
+    // A cyclic alias still resolves its right-hand side, so an error there that the cycle does
+    // not cause is reported, but it means the poison type.
+    let underlying = resolve_type_ann(node_value(atd))
+    tc_aliases.underlying.insert(key, if tc_aliases.cyclic.contains(atd) { tc_error_recovery_tid() } else { underlying })
     tc_pop_tparam_scope(alias_tparams)
     tc_suppress_ann_validation = saved_suppress
     tc_active_tparams = saved_active
     tc_tp_frames = saved_frames
     nr_current_module = saved_module
+}
+
+// One reference in the right-hand side of an alias to an alias. `ctor` decides whether the help
+// offers a struct, and `suffix` is what the label says of the constructor around the reference.
+type AliasEdge {
+    from: Int
+    to: Int
+    site: Int
+    ctor: Bool
+    suffix: Str
+}
+
+fn tc_is_alias_decl(td: Int) -> Bool {
+    node_kind(td) == NodeKind.TypeDef && node_value(td) != -1 && !tc_type_name_is_undeclarable(node_name(td))
+}
+
+// The references to aliases in the right-hand side of `decl`, in source order. A binder of the
+// alias is a type variable, and a struct or enum name stops the walk, since its fields are not
+// read.
+fn tc_alias_edges_of(decl: Int) -> List[AliasEdge] {
+    let mut out: List[AliasEdge] = []
+    let saved = tc_enter_body_module(decl)
+    tc_alias_edges_in(decl, node_value(decl), false, "", out)
+    tc_leave_body_module(saved)
+    out
+}
+
+fn tc_alias_edges_in(decl: Int, ann: Int, ctor: Bool, suffix: Str, out: List[AliasEdge]) {
+    if ann == -1 || node_kind(ann) != NodeKind.TypeAnn { return }
+    let name = node_name(ann)
+    // The argument of `Handler[E]` names an effect, not a type.
+    if name == "Handler" && node_is_compiler_known_type_ann(ann) { return }
+    let elems = node_elements(ann)
+    let mut target = -1
+    if name != "" && !tc_alias_binds(decl, name) && tc_compiler_known_type_meant(name, ann) == "" {
+        target = tc_alias_decl_of_written(name)
+    }
+    if target != -1 { out.push(AliasEdge { from: decl, to: target, site: ann, ctor: ctor, suffix: suffix }) }
+    let inner = if name == "Tuple" && node_is_compiler_known_type_ann(ann) || name == "Fn" && node_is_compiler_known_type_ann(ann) {
+        suffix
+    } else if target != -1 && tc_alias_is_generic(target) {
+        ", through the generic alias `{name}`"
+    } else {
+        ", inside `{name}[...]`"
+    }
+    let mut i = 0
+    while elems != -1 && i < sublist_length(elems) {
+        tc_alias_edges_in(decl, sublist_get(elems, i), true, inner, out)
+        i = i + 1
+    }
+    if name == "Fn" && node_is_compiler_known_type_ann(ann) { tc_alias_edges_in(decl, node_type_ann(ann), true, inner, out) }
+}
+
+fn tc_alias_binds(decl: Int, name: Str) -> Bool {
+    let tps = node_type_params(decl)
+    let mut i = 0
+    while tps != -1 && i < sublist_length(tps) {
+        if node_name(sublist_get(tps, i)) == name { return true }
+        i = i + 1
+    }
+    false
+}
+
+// The aliases `start` reaches through right-hand sides; `start` is in the set only on a cycle.
+fn tc_alias_reach(start: Int, edges: Map[Int, List[AliasEdge]]) -> Set[Int] {
+    let mut seen: Set[Int] = Set()
+    let mut todo: List[Int] = [start]
+    while todo.len() > 0 {
+        let d = todo.pop().unwrap()
+        for e in edges.get(d) ?? [] {
+            if !seen.contains(e.to) {
+                seen.insert(e.to)
+                todo.push(e.to)
+            }
+        }
+    }
+    seen
+}
+
+// The order that picks the alias holding the error: the path of its file, then its place in it.
+fn tc_alias_decl_before(a: Int, b: Int) -> Bool {
+    let pa = diag_normalize_path(diag_file_for_node(a))
+    let pb = diag_normalize_path(diag_file_for_node(b))
+    if pa != pb { return pa < pb }
+    if node_line(a) != node_line(b) { return node_line(a) < node_line(b) }
+    node_col(a) < node_col(b)
+}
+
+// E0327 (§3.4): one error for each strongly connected component of aliases that has a cycle.
+// Runs after every type name is registered and before any alias is settled, so the poison is in
+// place before a use reads an alias.
+fn tc_check_alias_cycles(types_sl: Int) ! Diag.Report {
+    let mut aliases: List[Int] = []
+    let mut edges: Map[Int, List[AliasEdge]] = Map()
+    let mut i = 0
+    while i < sublist_length(types_sl) {
+        let td = sublist_get(types_sl, i)
+        if tc_is_alias_decl(td) {
+            aliases.push(td)
+            edges.insert(td, tc_alias_edges_of(td))
+        }
+        i = i + 1
+    }
+    let mut reach: Map[Int, Set[Int]] = Map()
+    for a in aliases { reach.insert(a, tc_alias_reach(a, edges)) }
+    let mut cyclic: Set[Int] = Set()
+    for a in aliases {
+        if (reach.get(a) ?? Set()).contains(a) { cyclic.insert(a) }
+    }
+    if cyclic.len() == 0 { return }
+    for a in aliases {
+        let r = reach.get(a) ?? Set()
+        if cyclic.contains(a) {
+            tc_aliases.cyclic.insert(a)
+        } else {
+            for c in cyclic {
+                if r.contains(c) { tc_aliases.cyclic.insert(a) }
+            }
+        }
+    }
+    for a in aliases {
+        if cyclic.contains(a) && tc_alias_is_component_first(a, aliases, reach) {
+            tc_report_alias_cycle(a, edges, reach)
+        }
+    }
+}
+
+// Whether `a` comes first among the aliases of its component.
+fn tc_alias_is_component_first(a: Int, aliases: List[Int], reach: Map[Int, Set[Int]]) -> Bool {
+    let ra = reach.get(a) ?? Set()
+    for b in aliases {
+        if b != a && ra.contains(b) && (reach.get(b) ?? Set()).contains(a) && tc_alias_decl_before(b, a) { return false }
+    }
+    true
+}
+
+// The name of `decl` as the error writes it: qualified when it is in another module than `home`.
+fn tc_alias_chain_name(decl: Int, home: Int) -> Str {
+    let m = node_module(decl)
+    if m == node_module(home) || m == "" || m == "__main__" { node_name(decl) } else { "{m}.{node_name(decl)}" }
+}
+
+fn tc_alias_link(decl: Int, home: Int) -> Str {
+    "`{tc_alias_chain_name(decl, home)}` ({diag_normalize_path(diag_file_for_node(decl))}:{node_line(decl)})"
+}
+
+fn tc_alias_in_component(d: Int, first: Int, reach: Map[Int, Set[Int]]) -> Bool {
+    d == first || (reach.get(d) ?? Set()).contains(first) && (reach.get(first) ?? Set()).contains(d)
+}
+
+fn tc_report_alias_cycle(first: Int, edges: Map[Int, List[AliasEdge]], reach: Map[Int, Set[Int]]) ! Diag.Report {
+    let mut lead = AliasEdge { from: first, to: -1, site: -1, ctor: false, suffix: "" }
+    for e in edges.get(first) ?? [] {
+        if lead.to == -1 && tc_alias_in_component(e.to, first, reach) { lead = e }
+    }
+    // The first way back from the target of the lead edge, in source order: a cycle, not the
+    // whole component.
+    let mut back: Map[Int, AliasEdge] = Map()
+    let mut todo: List[Int] = [lead.to]
+    let mut at = 0
+    while lead.to != first && at < todo.len() && !back.contains_key(first) {
+        let d = todo.get(at).unwrap()
+        for e in edges.get(d) ?? [] {
+            if tc_alias_in_component(e.to, first, reach) && e.to != lead.to && !back.contains_key(e.to) {
+                back.insert(e.to, e)
+                todo.push(e.to)
+            }
+        }
+        at = at + 1
+    }
+    let mut cycle: List[AliasEdge] = []
+    let mut d = first
+    while d != lead.to {
+        let e = back.get(d).unwrap()
+        cycle.insert(0, e)
+        d = e.from
+    }
+    cycle.insert(0, lead)
+    let mut links: List[Str] = []
+    let mut ctor = false
+    for e in cycle {
+        links.push(tc_alias_link(e.from, first))
+        if e.ctor { ctor = true }
+    }
+    links.push("`{node_name(first)}`")
+    let label = "`{node_name(first)}` names `{node_name(lead.site)}`{lead.suffix}"
+    let help = if ctor { "an alias creates no type, so it cannot hold itself; to make a recursive type, declare a struct: `{tc_alias_struct_form(first)}`" } else { "an alias gives a second name to a type; point one alias in the chain at a type that is not in the chain" }
+    let (line, col, end_line, end_col) = node_written_span(lead.site)
+    let before = diag_entry_count()
+    diag_error_span_label_at_notes("CyclicTypeAlias", CYCLIC_TYPE_ALIAS, "type alias `{node_name(first)}` expands to itself", lead.site,
+        line, col, if end_line == line { end_col } else { 0 }, label, help, ["the chain is {links.join(" -> ")}"])
+    let mut json_edges: List[DiagEdge] = []
+    for e in cycle {
+        let (el, ec, eel, eec) = node_written_span(e.site)
+        json_edges.push(DiagEdge {
+            decl: tc_alias_chain_name(e.from, first), param: "", becomes: node_name(e.site), keys: DiagEdgeKeys.Alias,
+            file: diag_file_for_node(e.site), line: el, col: ec, end_line: eel, end_col: eec,
+        })
+    }
+    diag_set_edges_since(before, json_edges)
+}
+
+// The struct that holds what the alias meant, as `type L { items: List[L] }`.
+fn tc_alias_struct_form(decl: Int) -> Str {
+    let rhs = node_value(decl)
+    let (line, col, end_line, end_col) = node_written_span(rhs)
+    // The help is one line, so a right-hand side written over more lines is joined.
+    let mut parts: List[Str] = []
+    for l in tc_source_text(diag_file_for_node(decl), line, col, end_line, end_col).split("\n") { parts.push(l.trim()) }
+    let field = if node_name(rhs) == "List" { "items" } else { "value" }
+    "type {node_name(decl)}{tc_type_param_names(node_type_params(decl))} \{ {field}: {parts.join(" ")} }"
+}
+
+// An impl on a cyclic alias is dropped with no error, so its methods leave method lookup (§3.4).
+fn tc_drop_impls_on_cyclic_aliases(program: Int) {
+    let impls_sl = node_methods(program)
+    if impls_sl == -1 || tc_aliases.cyclic.len() == 0 { return }
+    let mut drop: Set[Int] = Set()
+    let mut i = 0
+    while i < sublist_length(impls_sl) {
+        let im = sublist_get(impls_sl, i)
+        let decl = tc_impl_header_alias_decl(im)
+        if decl != -1 && tc_aliases.cyclic.contains(decl) { drop.insert(im) }
+        i = i + 1
+    }
+    if drop.len() == 0 { return }
+    sublist_remove_members(impls_sl, drop)
 }
 
 // Each associated type impl `im` binds, by name. The caller has the impl's binders in scope
@@ -15950,7 +16188,7 @@ fn alias_name_decidable(name: Str) -> Int {
 }
 
 fn resolve_alias_type_name(name0: Str) -> Str {
-    if tc_alias_underlying.len() == 0 { return name0 }
+    if tc_aliases.underlying.len() == 0 { return name0 }
     let mut name = name0
     let mut hops = 0
     while hops < 8 {
@@ -16218,6 +16456,8 @@ fn validate_keyed_ann(key_ann: Int, key_tid: Option[Int], role: HashRole) ! Diag
     if tc_name_is_tparam_in_scope(decl_name) != 0 { return }
     // A `Self` outside a trait or impl has its own report (E0569).
     if decl_name == "Self" && tc_current_self_tid == -1 { return }
+    // A cyclic alias (E0327) has the poison type.
+    if tc_aliases.cyclic.contains(tc_alias_decl_of_written(decl_name)) { return }
     // A name imported from blink.core under another name is the builtin (§10.6), and is judged
     // as the written builtin is. It names no declaration, so no declaration may answer for it,
     // not even one in this module that takes the builtin's name.
@@ -21488,7 +21728,7 @@ fn init_types() ! TypeCheck.Register {
     tc_walk_value_tail = 0
     tc_in_ensures_predicate = 0
     tc_trait_sig_poisoned.clear()
-    tc_alias_underlying = Map()
+    tc_aliases = AliasFacts { underlying: Map(), cyclic: Set() }
     sfield_pool.clear()
     evar_pool.clear()
     evar_decl_nodes.clear()
@@ -21606,6 +21846,7 @@ fn tc_register_type_decls(types_sl: Int) ! TypeCheck.Register, TypeCheck.Resolve
         }
         i = i + 1
     }
+    tc_check_alias_cycles(types_sl)
     // Before any annotation resolves, so an alias underlying or a field that applies a
     // generic type already sees which of its parameters must be hashable.
     tc_compute_type_hash_obligations(types_sl)
@@ -21620,7 +21861,7 @@ fn tc_register_type_decls(types_sl: Int) ! TypeCheck.Register, TypeCheck.Resolve
     // Third pass: resolve enum variant payloads and struct field types.
     // Deferred to here so a payload or field that names an alias
     // (`Wrap(o: MB)`, `items: List[MB]`) peels through a fully-populated
-    // tc_alias_underlying regardless of declaration order. An alias node has
+    // tc_aliases.underlying regardless of declaration order. An alias node has
     // no fields, so resolve_struct_fields is a no-op for it.
     let mut k = 0
     while k < sublist_length(types_sl) {
@@ -21682,6 +21923,7 @@ pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report, IO.Eprint {
     // Register all type definitions (structs and enums)
     let types_sl = node_fields(program)
     tc_register_type_decls(types_sl)
+    tc_drop_impls_on_cyclic_aliases(program)
     tc_drop_unprovided_closeable_impls(program)
 
     // Kind A: a struct name equal to an enum variant name is a hard error (E0518), within
@@ -25484,7 +25726,7 @@ fn nr_poisoned(mod_name: Str, namespace: Str, name: Str) -> Bool {
 // Whether `decl` is the module-scope type declaration (type, alias, trait, effect) a module
 // keeps of a name it declares more than once (E1016).
 fn tc_type_decl_poisoned(decl: Int) -> Bool {
-    nr_poisoned_first(decl, "type")
+    nr_poisoned_first(decl, "type") || tc_aliases.cyclic.contains(decl)
 }
 
 // Whether `decl` is the module-scope value declaration (fn, let, const) a module keeps of a
@@ -34283,7 +34525,7 @@ fn nr_check_pattern(node: Int, refutable: Bool) ! TypeCheck.Resolve, Diag.Report
 // ── Phase 2: Type compatibility ─────────────────────────────────────
 
 pub fn resolve_alias_tid(tid: Int) -> Int {
-    if tc_alias_underlying.len() == 0 { return tid }
+    if tc_aliases.underlying.len() == 0 { return tid }
     if tid < 0 || tid >= ty_pool.len() { return tid }
     let entry = ty_pool.get(tid).unwrap()
     // A type parameter named like an alias binds its own type: a program's `type K = List[Int]`
@@ -34325,7 +34567,7 @@ pub fn tc_resolve_transparent_alias_of_decl(name: Str) -> Int {
 }
 
 fn tc_transparent_alias_chain(name: Str, written: Bool) -> Int {
-    if tc_alias_underlying.len() == 0 { return -1 }
+    if tc_aliases.underlying.len() == 0 { return -1 }
     let mut cur_name = name
     let mut result = -1
     let mut hops = 0

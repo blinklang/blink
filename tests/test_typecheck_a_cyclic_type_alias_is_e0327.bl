@@ -1,0 +1,230 @@
+// A type alias whose expansion reaches itself is CyclicTypeAlias (E0327), one error for each
+// strongly connected component of aliases (sections/03_types.md §3.4, "A cycle of aliases").
+// The walk goes through aliases, type arguments, tuples, fn types and generic aliases, and
+// stops at a struct or enum name. The error sits on the first alias of the component by path,
+// then position, at the reference that leads round the cycle. Each alias in or leading into
+// the cycle has the poison type: a use gets no second error, and an impl on it is dropped.
+
+import std.fs
+import std.process.{ProcessResult}
+import compiler.{compile_to_program}
+import typecheck.{check_types, TypeCheck}
+import diagnostics.{diag_entries, diag_entry_text, diag_reset, Diag}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+import lexer.{Lex}
+import parser.{Parse}
+
+let PROBE: Str = "build/test_typecheck_a_cyclic_type_alias_probe.bl"
+
+fn typecheck_probe(path: Str, src: Str) ! FS, Env.Exit, Env.Read, IO {
+    with handler Diag {}, handler Lex {}, handler Parse {}, handler TypeCheck {} {
+        init_embedded_stdlib()
+        fs.write(path, src).unwrap()
+        diag_reset()
+        let program = compile_to_program(path, 1)
+        check_types(program)
+        let _ = fs.delete(path)
+    }
+}
+
+// Each error as "name code line:col: message | label | help | notes", in report order.
+fn errors_of(src: Str) -> List[Str] ! FS, Env.Exit, Env.Read, IO {
+    typecheck_probe(PROBE, src)
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" {
+            out.push("{d.name} {d.code} {d.line}:{d.col}: {d.message} | {d.label} | {d.help} | {d.notes.join("; ")}")
+        }
+    }
+    out
+}
+
+fn all_errors(src: Str) -> Str ! FS, Env.Exit, Env.Read, IO {
+    errors_of(src).join(" || ")
+}
+
+fn error_names(src: Str) -> Str ! FS, Env.Exit, Env.Read, IO {
+    typecheck_probe(PROBE, src)
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" { out.push(d.name) }
+    }
+    out.join(", ")
+}
+
+let NO_STRUCT_HELP: Str = "an alias gives a second name to a type; point one alias in the chain at a type that is not in the chain"
+
+fn struct_help(form: Str) -> Str {
+    "an alias creates no type, so it cannot hold itself; to make a recursive type, declare a struct: `{form}`"
+}
+
+fn cyclic(line: Int, col: Int, alias: Str, label: Str, help: Str, chain: Str) -> Str {
+    "CyclicTypeAlias E0327 {line}:{col}: type alias `{alias}` expands to itself | {label} | {help} | the chain is {chain}"
+}
+
+// One link of a chain note, in the probe file.
+fn link(name: Str, line: Int) -> Str {
+    "`{name}` ({PROBE}:{line})"
+}
+
+test "an alias that names itself is e0327 at the reference, and a use gets no second error" {
+    let src = "type A = A\nfn f(x: A) -> Int \{ x.len() }\nfn main() \{}\n"
+    assert_eq(all_errors(src), cyclic(1, 10, "A", "`A` names `A`", NO_STRUCT_HELP, "{link("A", 1)} -> `A`"))
+}
+
+test "two aliases that name each other give one error, on the first of them" {
+    let src = "type B = C\ntype C = B\nfn main() \{}\n"
+    assert_eq(all_errors(src), cyclic(1, 10, "B", "`B` names `C`", NO_STRUCT_HELP, "{link("B", 1)} -> {link("C", 2)} -> `B`"))
+}
+
+test "the first alias by position holds the error, not the first one the walk meets" {
+    let src = "type C = B\ntype B = C\nfn main() \{}\n"
+    assert_eq(all_errors(src), cyclic(1, 10, "C", "`C` names `B`", NO_STRUCT_HELP, "{link("C", 1)} -> {link("B", 2)} -> `C`"))
+}
+
+test "an alias inside a list type argument is e0327 with the struct help" {
+    let src = "type L = List[L]\nfn main() \{}\n"
+    assert_eq(all_errors(src), cyclic(1, 15, "L", "`L` names `L`, inside `List[...]`", struct_help("type L \{ items: List[L] }"), "{link("L", 1)} -> `L`"))
+}
+
+test "an alias inside an option is e0327 with the struct help" {
+    let src = "type O = O?\nfn main() \{}\n"
+    assert_eq(all_errors(src), cyclic(1, 10, "O", "`O` names `O`, inside `Option[...]`", struct_help("type O \{ value: O? }"), "{link("O", 1)} -> `O`"))
+}
+
+test "an alias in its own fn type is e0327 with the struct help" {
+    let src = "type F = fn(Int) -> F\nfn main() \{}\n"
+    assert_eq(all_errors(src), cyclic(1, 21, "F", "`F` names `F`", struct_help("type F \{ value: fn(Int) -> F }"), "{link("F", 1)} -> `F`"))
+}
+
+test "an alias through a generic alias is e0327 and the label names the generic alias" {
+    let src = "type Pair[T] = (T, T)\ntype PP = Pair[PP]\nfn main() \{}\n"
+    assert_eq(all_errors(src), cyclic(2, 16, "PP", "`PP` names `PP`, through the generic alias `Pair`", struct_help("type PP \{ value: Pair[PP] }"), "{link("PP", 2)} -> `PP`"))
+}
+
+test "a generic alias that grows its own argument is e0327 and not e0324" {
+    let src = "type G[T] = G[List[T]]\nfn main() \{}\n"
+    assert_eq(all_errors(src), cyclic(1, 13, "G", "`G` names `G`", NO_STRUCT_HELP, "{link("G", 1)} -> `G`"))
+}
+
+test "a generic alias inside a list of itself is e0327 and not e0324" {
+    let src = "type H[T] = List[H[T]]\nfn main() \{}\n"
+    assert_eq(all_errors(src), cyclic(1, 18, "H", "`H` names `H`, inside `List[...]`", struct_help("type H[T] \{ items: List[H[T]] }"), "{link("H", 1)} -> `H`"))
+}
+
+test "an alias inside a tuple inside a list keeps the list in the label" {
+    let src = "type M = List[(Int, M)]\nfn main() \{}\n"
+    assert_eq(all_errors(src), cyclic(1, 21, "M", "`M` names `M`, inside `List[...]`", struct_help("type M \{ items: List[(Int, M)] }"), "{link("M", 1)} -> `M`"))
+}
+
+test "the struct help joins a right-hand side written over two lines" {
+    let src = "type L = List[(Int,\n    L)]\nfn main() \{}\n"
+    assert_eq(all_errors(src), cyclic(2, 5, "L", "`L` names `L`, inside `List[...]`", struct_help("type L \{ items: List[(Int, L)] }"), "{link("L", 1)} -> `L`"))
+}
+
+test "a cyclic alias as the map key in its own right-hand side gets no second error" {
+    assert_eq(error_names("type K = Map[K, Int]\ntype E2 = Map[Str, Map[E2, Int]]\nfn main() \{}\n"), "CyclicTypeAlias, CyclicTypeAlias")
+}
+
+test "a component of three aliases gives one error with the chain of one cycle" {
+    let src = "type A = (B, C)\ntype B = A\ntype C = A\nfn main() \{}\n"
+    assert_eq(all_errors(src), cyclic(1, 11, "A", "`A` names `B`", struct_help("type A \{ value: (B, C) }"), "{link("A", 1)} -> {link("B", 2)} -> `A`"))
+}
+
+test "an alias that leads into a cycle gets no error of its own, and a use of it gets none" {
+    let src = "type C = A\ntype A = B\ntype B = A\nfn f(x: C) -> Int \{ x.len() }\nfn main() \{}\n"
+    assert_eq(all_errors(src), cyclic(2, 10, "A", "`A` names `B`", NO_STRUCT_HELP, "{link("A", 2)} -> {link("B", 3)} -> `A`"))
+}
+
+// The `--json` line of the one error, from its `"edges"` key on.
+fn json_edges(src: Str) -> Str ! FS, Env.Exit, Env.Read, IO {
+    typecheck_probe(PROBE, src)
+    let mut out = ""
+    let mut i = 0
+    while i < diag_entries.len() {
+        if diag_entries.get(i).unwrap().severity == "error" { out = diag_entry_text(i, 1) }
+        i = i + 1
+    }
+    let parts = out.split("\"edges\":")
+    if parts.len() < 2 { "" } else { "\"edges\":{parts.get(1).unwrap()}" }
+}
+
+test "the json form holds one edge for each alias of the cycle, with the alias, the name and its span" {
+    let got = json_edges("type A = (Int, B)\ntype B = List[A]\nfn main() \{}\n")
+    let a = "\{\"alias\":\"A\",\"names\":\"B\",\"span\":\{\"file\":\"{PROBE}\",\"line\":1,\"col\":16,\"end_line\":1,\"end_col\":17}}"
+    let b = "\{\"alias\":\"B\",\"names\":\"A\",\"span\":\{\"file\":\"{PROBE}\",\"line\":2,\"col\":15,\"end_line\":2,\"end_col\":16}}"
+    assert(got.starts_with("\"edges\":[{a},{b}]"), got)
+}
+
+test "an unused cyclic alias is still e0327" {
+    assert_eq(error_names("type A = A\nfn main() \{}\n"), "CyclicTypeAlias")
+}
+
+test "an impl on a cyclic alias is dropped with no error and nothing reaches the build" {
+    let src = "trait Sh \{ fn n(self) -> Int }\ntype A = A2\ntype A2 = A\nimpl Sh for A \{ fn n(self) -> Int \{ 1 } }\n\nfn main() \{ io.println(\"x\") }\n"
+    assert_eq(all_errors(src), cyclic(2, 10, "A", "`A` names `A2`", NO_STRUCT_HELP, "{link("A", 2)} -> {link("A2", 3)} -> `A`"))
+}
+
+test "a method call on a value of a cyclic alias gets no second error" {
+    let src = "trait Sh \{ fn n(self) -> Int }\ntype A = A\nimpl Sh for A \{ fn n(self) -> Int \{ 1 } }\nfn g(a: A) -> Int \{ a.n() }\nfn main() \{}\n"
+    assert_eq(error_names(src), "CyclicTypeAlias")
+}
+
+test "the poison does not hide an unrelated error at a use" {
+    let src = "type A = A\nfn f(x: A, y: Int) -> Int \{ y }\nfn main() \{ let _ = f(1) }\n"
+    let names = error_names(src)
+    assert(names.starts_with("CyclicTypeAlias, "))
+    assert_eq(names.split(", ").len(), 2)
+}
+
+test "a generic alias used at itself as an argument is legal" {
+    assert_eq(all_errors("type P[X] = List[X]\nfn main() \{\n    let grid: P[P[Int]] = [[1, 2], [3]]\n    io.println(\"\{grid.len()}\")\n}\n"), "")
+}
+
+test "a struct stops the walk, so an alias of a list of that struct is legal" {
+    assert_eq(all_errors("type Node \{ kids: Kids }\ntype Kids = List[Node]\nfn main() \{}\n"), "")
+}
+
+test "a generic enum stops the walk" {
+    assert_eq(all_errors("type Tree[T] \{ Leaf(v: T), Branch(kids: Forest[T]) }\ntype Forest[T] = List[Tree[T]]\nfn main() \{}\n"), "")
+}
+
+test "an alias chain with no cycle is legal" {
+    assert_eq(all_errors("type A = B\ntype B = List[C]\ntype C = Int\nfn main() \{}\n"), "")
+}
+
+fn sh(cmd: Str) -> ProcessResult ! Process.Spawn {
+    process.run("sh", ["-c", cmd]).unwrap()
+}
+
+// The errors of a package whose modules geo and road name each other's alias, each as
+// "file line:col: label | notes", with the file relative to the package. main imports road
+// first, so the primary alias is picked by path, not by load order.
+fn package_errors(geo: Str, road: Str) -> Str ! FS, Process.Spawn, Env.Exit, Env.Read, IO {
+    with handler Diag {}, handler Lex {}, handler Parse {}, handler TypeCheck {} {
+        init_embedded_stdlib()
+        let dir = sh("mktemp -d /tmp/blink_cyclic_alias.XXXXXX").out.trim()
+        let _ = sh("mkdir -p {dir}/src")
+        fs.write("{dir}/blink.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\n").unwrap()
+        fs.write("{dir}/src/geo.bl", geo).unwrap()
+        fs.write("{dir}/src/road.bl", road).unwrap()
+        let main_path = "{dir}/src/main.bl"
+        fs.write(main_path, "import road\nimport geo\n\nfn f(x: geo.B, y: road.A) -> Int \{ 0 }\n\nfn main() \{}\n").unwrap()
+        diag_reset()
+        let program = compile_to_program(main_path, 1)
+        check_types(program)
+        let mut out: List[Str] = []
+        for d in diag_entries {
+            if d.severity == "error" || d.severity == "ice" {
+                out.push("{d.file.replace("{dir}/", "")} {d.line}:{d.col}: {d.label} | {d.notes.join("; ").replace("{dir}/", "")}")
+            }
+        }
+        let _ = sh("rm -rf {dir}")
+        out.join(" || ")
+    }
+}
+
+test "a cycle across modules is one error on the first file by path, with qualified names" {
+    let got = package_errors("import road\n\npub type B = road.A\n", "import geo\n\npub type A = geo.B\n")
+    assert_eq(got, "src/geo.bl 3:14: `B` names `road.A` | the chain is `B` (src/geo.bl:3) -> `road.A` (src/road.bl:3) -> `B`")
+}

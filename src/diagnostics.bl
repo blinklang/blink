@@ -46,6 +46,7 @@ pub const RANGE_BOUND_NOT_CONST   = "E0323"
 pub const INSTANTIATION_CYCLE     = "E0324"
 pub const INSTANCE_LIMIT          = "E0325"
 pub const DUPLICATE_TYPE_PARAM    = "E0326"
+pub const CYCLIC_TYPE_ALIAS       = "E0327"
 pub const MISSING_PARAM_TYPE      = "E0328"
 
 // E0500+ — effects, capabilities, ?-propagation
@@ -524,12 +525,18 @@ pub type DiagFixEdit {
     text: Str
 }
 
-// One use of a generic declaration in the chain of an instance error: the parameter of the
-// declaration, what it becomes, and where.
+// The JSON keys of an edge, which the spec fixes per error: `decl`, `param`, `becomes` for an
+// instance chain (E0324), and `alias`, `names` for a cycle of aliases (E0327).
+pub type DiagEdgeKeys { Instance, Alias }
+
+// One edge of the chain of an error, and where. In an instance chain: the parameter of the
+// declaration and what it becomes. In a cycle of aliases: `decl` is the alias, and `becomes`
+// the name it writes.
 pub type DiagEdge {
     decl: Str
     param: Str
     becomes: Str
+    keys: DiagEdgeKeys = DiagEdgeKeys.Instance
     file: Str
     line: Int
     col: Int
@@ -1530,7 +1537,10 @@ pub fn diag_entry_text(idx: Int, format: Int) -> Str {
 
 fn diag_edge_json(e: DiagEdge) -> Str {
     let span = "\{\"file\":\"{json_escape(e.file)}\",\"line\":{e.line},\"col\":{e.col},\"end_line\":{e.end_line},\"end_col\":{e.end_col}}"
-    "\{\"decl\":\"{json_escape(e.decl)}\",\"param\":\"{json_escape(e.param)}\",\"becomes\":\"{json_escape(e.becomes)}\",\"span\":{span}}"
+    match e.keys {
+        DiagEdgeKeys.Alias => "\{\"alias\":\"{json_escape(e.decl)}\",\"names\":\"{json_escape(e.becomes)}\",\"span\":{span}}"
+        DiagEdgeKeys.Instance => "\{\"decl\":\"{json_escape(e.decl)}\",\"param\":\"{json_escape(e.param)}\",\"becomes\":\"{json_escape(e.becomes)}\",\"span\":{span}}"
+    }
 }
 
 fn diag_json_line(idx: Int) -> Str {
@@ -2268,6 +2278,9 @@ pub fn diag_explain(code: Str) -> Str {
     }
     if code == MISSING_PARAM_TYPE {
         return "E0328 -- MissingParamType\n\nA function signature writes the type of each parameter: types are\nwritten on signatures and inferred everywhere else (sections/03_types.md,\nType Inference). The rule covers a fn, a method in an impl or a trait,\nan `@ffi` fn, an effect operation and a handler clause. A method's first\nparameter `self` (its receiver) is the one parameter that may leave its\ntype out; a clause has no receiver. A clause does not take a type from\nits operation, but the fix writes the type the operation gives the\nparameter. A closure is an expression, so its parameters stay inferred.\n\n  fn double(x) -> Int \{ x * 2 \}        // E0328 at `x`\n\nFix: write the type after the name:\n\n  fn double(x: Int) -> Int \{ x * 2 \}\n  let double = fn(x) \{ x * 2 \}        // a closure: no type needed"
+    }
+    if code == CYCLIC_TYPE_ALIAS {
+        return "E0327 -- CyclicTypeAlias\n\nAn alias gives a second name to a type and creates no type, so the\ncompiler replaces it with its right-hand side. An alias whose\nright-hand side reaches the alias again has no end:\n\n    type A = B\n    type B = A\n    type L = List[L]\n    type F = fn(Int) -> F\n\nThe path can go through other aliases, type arguments, tuples, fn\ntypes and generic aliases. A struct or enum name stops it, so this is\nlegal:\n\n    type Node \{ kids: Kids }\n    type Kids = List[Node]\n\nIf you meant a recursive type, declare a struct:\n\n    type L \{ items: List[L] }\n\nElse point one alias of the chain at a type that is not in the chain.\nThe compiler reports one error for each cycle, and a use of an alias\nin or into the cycle gets no second error."
     }
     if code == DUPLICATE_TYPE_PARAM {
         return "E0326 -- DuplicateTypeParam\n\nTwo type parameters in one scope have the same name. The scope of a\nfunction or a method holds its own list, and for a method also the\nlist of its impl or its trait. One name must stand for one type.\n\n  fn f[T, T](a: T) -> Int \{ 1 \}          // E0326\n\n  impl[T] Wrap for List[T] \{\n      fn wrap[T](self, u: T) -> Int \{ 1 \}  // E0326: `T` of the impl\n  \}\n\nFix: rename the second one, and each use of it:\n\n  impl[T] Wrap for List[T] \{\n      fn wrap[U](self, u: U) -> Int \{ 1 \}\n  \}\n\nAn impl method's list matches its trait method's list by position, not\nby name, so the rename does not break the impl."
