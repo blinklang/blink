@@ -1665,8 +1665,7 @@ fn tc_bound_fact(concrete_tid: Int, trait_name: Str) -> Int {
     // The derivable traits are read at the instance, through its arguments and the bounds
     // of any impl written for it (tc_trait_need).
     if trait_name == "Hash" { return tc_hash_fact_by_bounds(concrete_tid) }
-    if trait_name == "Serialize" { return tc_derive_only_fact(concrete_tid, trait_name) }
-    if trait_name == "Deserialize" { return tc_deserialize_read_fact(concrete_tid) }
+    if trait_name == "Serialize" || trait_name == "Deserialize" { return tc_json_fact(concrete_tid, trait_name) }
     if trait_name == "Eq" || trait_name == "Ord" || trait_name == "Clone" || trait_name == "Debug" {
         if tc_tid_has_unbound_metavar(concrete_tid) != 0 { return 0 }
         if tc_trait_need(concrete_tid, trait_name, []).len() == 0 { return 1 }
@@ -1856,17 +1855,18 @@ fn tc_ann_tparam_fact(ann: Int, tps: Int, tid: Int, tr: Str) -> Int {
 // An argument at a type parameter's place is judged by what the derive writes there. For
 // Debug that is the trait itself: a tuple, a Set or a Result has Debug when its parts have
 // it, and a part whose text the compiler cannot build yet is tc_debug_unbuilt's answer,
-// given at the call. For Serialize it is narrower than the trait: a derived to_json writes no
-// Option or Char. The declaration check refuses those field types, and the instance check
-// must agree with it. Those two judgments do not stop at a type parameter, so an argument
-// that still holds one, such as `(T, Int)` in a field `b: B[(T, Int)]`, is left to each
-// instance. tc_derive_only_fact needs no such guard: it answers unknown at a type parameter
-// itself, and a cyclic alias, which holds one, has no Hash.
+// given at the call. Serialize and Deserialize are read from the one closed list of §3.6.2
+// (tc_json_fact), which answers unknown at a type parameter itself. tc_derive_only_fact needs
+// no guard either, and a cyclic alias, which holds a type parameter, has no Hash.
 fn tc_derive_arg_fact(arg: Int, tr: Str) -> Int {
     match tr {
-        "Deserialize" => tc_deserialize_read_fact(arg)
+        // The spec does not say if a derive is refused at the declaration when a part names a
+        // type parameter but no instance can meet the trait, as `b: B[(T, Int)]`. Until it
+        // does, this keeps the old split: Serialize waits for the instance, and Deserialize
+        // refuses at the declaration.
+        "Serialize" => if tc_tid_has_bare_typevar(arg) != 0 { 0 } else { tc_json_fact(arg, tr) }
+        "Deserialize" => tc_json_fact(arg, tr)
         "Debug" => if tc_tid_has_bare_typevar(arg) != 0 || tc_debug_need(arg, []).len() == 0 { 0 } else { -1 }
-        "Serialize" => if tc_tid_has_bare_typevar(arg) != 0 { 0 } else { tc_serialize_written_fact(arg) }
         _ => tc_derive_only_fact(arg, tr)
     }
 }
@@ -7312,14 +7312,21 @@ fn tc_check_one_bound(on: Str, bounds: Str, concrete: Int, node: Int, sink: Str,
         let tr = traits.get(i).unwrap()
         if tc_pipe_has(bounds, tr) != 0 && tc_type_satisfies_bound(concrete, tr) == -1 {
             let path = tc_trait_need(concrete, tr, [])
-            let fixes = if path.len() > 0 { tc_trait_need_fixes(path.get(path.len() - 1).unwrap(), tc_need_fix_trait(path, tr)) } else { [] }
-            let help = if tk_is_valueless_context(tc_tid_kind(tc_resolve(concrete))) { tc_context_bound_help(concrete, tr) } else if fixes.len() > 0 { fixes.join("\n") } else {
+            let leaf = if path.len() > 0 { path.get(path.len() - 1).unwrap() } else { -1 }
+            let fixes = if leaf >= 0 { tc_trait_need_fixes(leaf, tc_need_fix_trait(path, tr)) } else { [] }
+            // A type the closed JSON list refuses gets the help a derive field of it gets
+            // (§3.6.2 *Built-in Types in JSON*), with the value passed in the field's place.
+            let json = leaf >= 0 && (tr == "Serialize" || tr == "Deserialize") && tc_json_leaf_has_help(leaf)
+            // `at` is the call itself when no argument holds the type, as for a fn value.
+            let held = if at >= 0 && at != node && node_kind(at) == NodeKind.Ident { node_name(at) } else { "" }
+            let help = if tk_is_valueless_context(tc_tid_kind(tc_resolve(concrete))) { tc_context_bound_help(concrete, tr) } else if json { tc_json_refusal_help(leaf, tr, concrete, held) } else if fixes.len() > 0 { fixes.join("\n") } else {
                 "pass an argument whose type implements {tr}, or derive/implement {tr} for it; the arithmetic traits (Add/Sub/Mul/Div/Rem/Neg) are sealed to the built-in numeric types"
             }
             let shown = tc_core_trait_shown(tr)
             let mut notes: List[Str] = []
             if im >= 0 { notes.push(tc_impl_bound_note(im, carrier, shown)) }
             for n in tc_trait_need_notes(path, tr) { notes.push(n) }
+            if json { for n in tc_json_refusal_notes(leaf) { notes.push(n) } }
             diag_error_at_notes("TraitBoundNotSatisfied", TRAIT_BOUND_NOT_SATISFIED,
                 "`{type_to_str(concrete)}` does not satisfy the {shown} bound on {on}{tc_bound_writer_suffix(im)}", node, help, notes)
             return 1
@@ -17633,13 +17640,13 @@ fn tc_check_derive_fields(tr: Str) ! TypeCheck.Resolve, Diag.Report {
     }
 }
 
-// Debug and Serialize are judged by what the derive writes for a field, which is narrower
-// than the trait. Each other trait is judged by the trait itself.
+// Debug is judged by what the derive writes for a field, which is narrower than the trait.
+// Serialize and Deserialize are judged by the one closed list of §3.6.2, and each other trait
+// by the trait itself.
 fn tc_check_derive_field(tr: Str, f: Int, variant: Int, ftid: Int, tname: Str) ! TypeCheck.Resolve, Diag.Report {
     match tr {
         "Debug" => tc_check_one_debug_field(f, variant, ftid, tname)
-        "Serialize" => tc_check_one_serialize_field(f, variant, ftid, tname)
-        "Deserialize" => tc_check_one_deserialize_field(f, variant, ftid, tname)
+        "Serialize" | "Deserialize" => tc_check_one_json_field(f, variant, ftid, tname, tr)
         _ => tc_check_one_derive_trait_field(f, variant, ftid, tname, tr)
     }
 }
@@ -17737,95 +17744,94 @@ fn tc_check_derive_hash_eq_ord() ! TypeCheck.Resolve, Diag.Report {
 }
 
 // ---------------------------------------------------------------------------
-// E1401 NonDerivableTrait for @derive(Serialize) — spec §3.6.6, §3.6.2. A field type the
-// derived to_json has no writer for would fall through to a literal "null", the silent
-// fallback the per-field derive checks exist to prevent.
+// E1401 NonDerivableTrait for @derive(Serialize) and @derive(Deserialize) — spec §3.6.6, §3.6.2.
+// A field type with no JSON form is refused at the declaration, so the derived to_json and
+// from_json never meet a type they cannot write or read.
 
-// What a derived to_json writes for a value of type `tid` (cg_derive ser_part): Int, Float,
-// Bool and Str as JSON leaves, a List through its element, and a struct or enum through its
-// own derived to_json. Tri-state as tc_derive_only_fact: a type parameter or an unsolved type
-// is not judged. Char, the sized ints and every other kind have no writer and answer -1.
-fn tc_serialize_written_fact(tid: Int) -> Int {
-    let t = resolve_alias_tid(tc_resolve(tid))
-    let k = type_kind(t)
-    if k == TyKind.Typevar || k == TyKind.Unknown { return 0 }
-    if k == TyKind.Int || k == TyKind.Float || k == TyKind.Bool || k == TyKind.Str { return 1 }
-    if k == TyKind.List { return tc_serialize_written_fact(tc_tid_child(t, 0)) }
-    if k == TyKind.Struct || k == TyKind.Enum { return tc_derive_only_fact(t, "Serialize") }
-    -1
-}
-
-// The declaration check is stricter than the writer: a List element must be a leaf, not
-// another List.
-fn tc_serialize_leaf_tid_ok(tid: Int) -> Int {
-    let t = resolve_alias_tid(tc_resolve(tid))
-    if type_kind(t) == TyKind.List { return 0 }
-    if tc_serialize_written_fact(t) == -1 { 0 } else { 1 }
-}
-
-fn tc_serialize_field_tid_ok(tid: Int) -> Int {
-    let t = resolve_alias_tid(tc_resolve(tid))
-    if type_kind(t) == TyKind.List { tc_serialize_leaf_tid_ok(tc_tid_child(t, 0)) } else { tc_serialize_leaf_tid_ok(t) }
-}
-
-// An enum-variant field has a narrower set than a struct field: no List, and no enum.
-fn tc_serialize_variant_tid_ok(tid: Int) -> Int {
-    let t = resolve_alias_tid(tc_resolve(tid))
-    if type_kind(t) == TyKind.Enum { return 0 }
-    tc_serialize_leaf_tid_ok(t)
-}
-
-// A field is judged by its declared type `ftid`, not by the name the type is written with,
-// so `B[NoSer]` is refused though `B` derives Serialize. A tid the pools hold no entry for is
-// not judged.
-fn tc_check_one_serialize_field(f: Int, variant: Int, ftid: Int, tname: Str) ! Diag.Report {
-    if ftid < 0 { return }
-    let ok = if variant != -1 { tc_serialize_variant_tid_ok(ftid) } else { tc_serialize_field_tid_ok(ftid) }
-    if ok == 0 {
-        diag_error_at("NonDerivableTrait", NON_DERIVABLE_TRAIT, "@derive(Serialize) on `{tname}`: field `{tc_derive_field_label(variant, f)}` has type `{type_ann_text(node_value(f))}` which does not implement Serialize", f, "remove the field from the derive, give it a type that implements Serialize, or implement Serialize by hand")
+// The help for a type the closed list of §3.6.2 refuses, which names the repair for that
+// type. `whole` is the declared type of the field or value `name`. The repair names `name`
+// only when `leaf` is that whole type and `name` is one the user can write, since a
+// positional payload or a computed argument has no name, and `store h.to_hex()` is wrong
+// when `h` is a `Box[Bytes]`.
+fn tc_json_refusal_help(leaf: Int, tr: Str, whole: Int, name: Str) -> Str {
+    let t = resolve_alias_tid(tc_resolve(leaf))
+    let named = name != "" && resolve_alias_tid(tc_resolve(whole)) == t
+    match type_kind(t) {
+        TyKind.U64 => if named {
+            "write the value as text: make the field `{name}: Str` and store `\"\{{name}}\"`\nor make the field an `Int` and store `{name}.to_int_checked()`. That call fails when `{name}` is above 2^63 - 1, which is true of half of all `U64` values"
+        } else {
+            "hold the `U64` as text in a `Str`, or as an `Int` through `to_int_checked()`. That call fails above 2^63 - 1, which is true of half of all `U64` values"
+        }
+        TyKind.Bytes => if named {
+            "make the field a `Str` and store `{name}.to_hex()`, which writes the bytes as lower-case hex text"
+        } else {
+            "hold the `Bytes` in a `Str` as its `to_hex()` text, which writes the bytes as lower-case hex text"
+        }
+        TyKind.Range => {
+            let bound = type_to_str(tc_tid_child(t, 0))
+            let use = if named { "write the field as `{name}: Span`" } else { "use `Span` in place of `{type_to_str(t)}`" }
+            "write a struct with `start` and `end` fields:\n    @derive(Serialize, Deserialize)\n    type Span \{\n        start: {bound}\n        end: {bound}\n    }\nand {use}"
+        }
+        TyKind.Map | TyKind.Set | TyKind.Tuple => "JSON has no form for a `Map`, a `Set` or a tuple (§3.6.2); hold the values in a struct, or in a `List` of a struct"
+        _ => tc_derive_field_help(t, tr)
     }
 }
 
-// ---------------------------------------------------------------------------
-// E1401 NonDerivableTrait for @derive(Deserialize) — spec §3.6.2 *Type Mapping* and
-// *Option and Result in JSON*.
+// The built-in types §3.6.2 refuses by name have their own help; any other leaf a bound
+// refuses gets the bound's general help.
+fn tc_json_leaf_has_help(leaf: Int) -> Bool {
+    match type_kind(resolve_alias_tid(tc_resolve(leaf))) {
+        TyKind.U64 | TyKind.Bytes | TyKind.Range | TyKind.Map | TyKind.Set | TyKind.Tuple => true
+        _ => false
+    }
+}
 
-// Whether a value of type `tid` is Deserialize, tri-state as tc_derive_only_fact: Int,
-// Float, Bool and Str are, Option and List are when the element is, Result is when both
-// sides are, and a struct or enum is when it derives Deserialize at its arguments. A Map, a
-// Set or a tuple is not: §3.6.2 *Built-in Types in JSON* gives it no row. A kind that holds
-// no data JSON can carry is not. Each kind is named, so that a new one must get its answer
-// here.
-fn tc_deserialize_read_fact(tid: Int) -> Int {
+// A positional variant payload has a made-up name `_0` that the source never spells.
+fn tc_json_help_name(f: Int) -> Str {
+    if node_int_val(f) != 0 { "" } else { node_name(f) }
+}
+
+fn tc_json_refusal_notes(leaf: Int) -> List[Str] {
+    if type_kind(resolve_alias_tid(tc_resolve(leaf))) != TyKind.U64 { return [] }
+    ["`Hash.hash` gives a `U64`, and the hash seed is different in each process (§3.6 *Hash Contract and Seeding*). A `hash()` value is not stable between processes. For a stable digest use `Sha256`"]
+}
+
+// §3.6.2 *Built-in Types in JSON*: the one closed list of the built-in Serialize and
+// Deserialize impls, which the bound check, the derive field checks and the derive at an
+// instance all read. Tri-state as tc_derive_only_fact: a type parameter or an unsolved type is
+// not judged. A List, an Option or a Result has the impl when each part has it, and a struct or
+// enum when it derives the trait at its arguments. A kind with no row has no impl. Each kind is
+// named, so that a new one must get its answer here.
+fn tc_json_fact(tid: Int, tr: Str) -> Int {
     let t = resolve_alias_tid(tc_resolve(tid))
     match type_kind(t) {
-        TyKind.Int | TyKind.Float | TyKind.Bool | TyKind.Str => 1
-        TyKind.List | TyKind.Option | TyKind.Result => tc_deserialize_parts_fact(t, 1)
-        TyKind.Map | TyKind.Set | TyKind.Tuple => -1
-        TyKind.Struct | TyKind.Enum => tc_derive_only_fact(t, "Deserialize")
+        TyKind.Int | TyKind.Float | TyKind.Bool | TyKind.Str | TyKind.Char => 1
+        TyKind.I8 | TyKind.I16 | TyKind.I32 | TyKind.U8 | TyKind.U16 | TyKind.U32 => 1
+        TyKind.List | TyKind.Option | TyKind.Result => tc_json_parts_fact(t, tr)
+        TyKind.Struct | TyKind.Enum => tc_derive_only_fact(t, tr)
         TyKind.Typevar | TyKind.Unknown => 0
-        // §3.6.2 maps none of these and refuses none of them.
-        TyKind.Char | TyKind.I8 | TyKind.I16 | TyKind.I32 | TyKind.U8 | TyKind.U16 | TyKind.U32 | TyKind.U64 => 0
-        TyKind.Bytes | TyKind.Range | TyKind.Never => 0
+        // Never keeps its prelude impls (§3.2): it writes, as it holds no value, and reads nothing.
+        TyKind.Never => if tr == "Serialize" { 1 } else { -1 }
+        TyKind.U64 | TyKind.Bytes | TyKind.Range | TyKind.Map | TyKind.Set | TyKind.Tuple => -1
         TyKind.Void | TyKind.Fn | TyKind.Iterator | TyKind.Handle | TyKind.Channel | TyKind.Ptr | TyKind.Handler | TyKind.Effect | TyKind.TraitContext => -1
         TyKind.StringBuilder | TyKind.Template | TyKind.FfiScope | TyKind.Raw => -1
     }
 }
 
-// -1 when a part of `t` is not Deserialize, else `whole` when every part is, else 0.
-fn tc_deserialize_parts_fact(t: Int, whole: Int) -> Int {
-    let mut fact = whole
-    for part in tc_deserialize_parts(t) {
-        let f = tc_deserialize_read_fact(part)
+// -1 when a part of `t` lacks `tr`, else 1 when every part has it, else 0.
+fn tc_json_parts_fact(t: Int, tr: Str) -> Int {
+    let mut fact = 1
+    for part in tc_json_parts(t) {
+        let f = tc_json_fact(part, tr)
         if f == -1 { return -1 }
         if f == 0 { fact = 0 }
     }
     fact
 }
 
-// The parts a container's Deserialize rests on. A Map, a Set or a tuple rests on none, as
-// no part of it can make it Deserialize.
-fn tc_deserialize_parts(t: Int) -> List[Int] {
+// The parts a container's JSON impl rests on. A Map, a Set or a tuple rests on none, as no
+// part of it can give it the impl.
+fn tc_json_parts(t: Int) -> List[Int] {
     match type_kind(t) {
         TyKind.List | TyKind.Option => [tc_tid_child(t, 0)]
         TyKind.Result => [tc_tid_child(t, 0), tc_tid_child(t, 1)]
@@ -17833,17 +17839,18 @@ fn tc_deserialize_parts(t: Int) -> List[Int] {
     }
 }
 
-// The chain from `tid` to the innermost part that is not Deserialize, or empty when `tid` is
-// not refused. An instance of a type that derives Deserialize lacks it through a field read at
-// the instance, so the chain goes on to that field, and the fix names the type to change.
-fn tc_deserialize_need(tid0: Int, visiting: List[Int]) -> List[Int] {
+// The chain from `tid` to the innermost part that lacks `tr` (Serialize or Deserialize), or
+// empty when `tid` is not refused. An instance of a type that derives `tr` lacks it through a
+// field read at the instance, so the chain goes on to that field, and the fix names the type
+// to change.
+fn tc_json_need(tid0: Int, tr: Str, visiting: List[Int]) -> List[Int] {
     let t = resolve_alias_tid(tc_resolve(tid0))
-    if tc_deserialize_read_fact(t) != -1 { return [] }
-    let parts = if tc_tid_base_derives(t, "Deserialize") { tc_derived_field_tids_at(t) } else { tc_deserialize_parts(t) }
+    if tc_json_fact(t, tr) != -1 { return [] }
+    let parts = if tc_tid_base_derives(t, tr) { tc_derived_field_tids_at(t) } else { tc_json_parts(t) }
     if tc_need_visited(visiting, t) { return [] }
     let inner = tc_need_visiting(visiting, t)
     for part in parts {
-        let need = tc_deserialize_need(part, inner)
+        let need = tc_json_need(part, tr, inner)
         if need.len() > 0 { return eq_need_through(t, need) }
     }
     [t]
@@ -17866,26 +17873,22 @@ fn tc_derived_field_tids_at(t: Int) -> List[Int] {
     parts
 }
 
-fn tc_check_one_deserialize_field(f: Int, variant: Int, ftid: Int, tname: Str) ! Diag.Report {
+// A field is judged by its declared type `ftid` against the one closed list of §3.6.2, so
+// `B[NoSer]` is refused though `B` derives the trait. A tid the pools hold no entry for is
+// not judged.
+fn tc_check_one_json_field(f: Int, variant: Int, ftid: Int, tname: Str, tr: Str) ! Diag.Report {
     if ftid < 0 { return }
     let label = tc_derive_field_label(variant, f)
     let payload = tc_option_of_option_payload(ftid)
     if payload >= 0 {
-        tc_report_option_of_option_field(f, label, payload, tname, "Deserialize")
+        tc_report_option_of_option_field(f, label, payload, tname, tr)
         return
     }
-    let need = tc_deserialize_need(ftid, [])
+    let need = tc_json_need(ftid, tr, [])
     if need.len() == 0 { return }
     let leaf = need.get(need.len() - 1).unwrap()
-    // The list of §3.6.2 *Built-in Types in JSON* is closed, so no impl can give one of these
-    // a reader, and the help names a form JSON has.
-    let lk = type_kind(leaf)
-    let help = if lk == TyKind.Map || lk == TyKind.Set || lk == TyKind.Tuple {
-        "JSON has no form for a `Map`, a `Set` or a tuple (§3.6.2); hold the values in a struct, or in a `List` of a struct"
-    } else {
-        tc_derive_field_help(leaf, "Deserialize")
-    }
-    diag_error_at("NonDerivableTrait", NON_DERIVABLE_TRAIT, "@derive(Deserialize) on `{tname}`: field `{label}` has type `{type_ann_text(node_value(f))}` which does not implement Deserialize", f, help)
+    diag_error_at_notes("NonDerivableTrait", NON_DERIVABLE_TRAIT, "@derive({tr}) on `{tname}`: field `{label}` has type `{type_ann_text(node_value(f))}` which does not implement {tr}", f,
+        tc_json_refusal_help(leaf, tr, ftid, tc_json_help_name(f)), tc_json_refusal_notes(leaf))
 }
 
 // The `T` of a declared field type `Option[Option[T]]`, read after alias expansion, else -1.
@@ -35480,10 +35483,9 @@ fn tc_trait_need(tid: Int, tr: Str, visiting: List[Int]) -> List[Int] {
     match tr {
         "Eq" => tc_eq_need(tid, visiting)
         "Ord" => tc_ord_need(tid, visiting)
-        "Hash" => tc_derive_only_need(tid, tr)
+        "Hash" => tc_hash_need(tid)
         "Debug" => tc_debug_need(tid, visiting)
-        "Serialize" => tc_derive_only_need(tid, tr)
-        "Deserialize" => tc_deserialize_need(tid, visiting)
+        "Serialize" | "Deserialize" => tc_json_need(tid, tr, visiting)
         "Clone" => tc_clone_need(tid, visiting)
         _ => []
     }
@@ -35498,15 +35500,10 @@ pub fn tc_trait_has_need_rule(tr: Str) -> Bool {
     }
 }
 
-// Hash and Serialize have no chain: the closed Hash list and the derive answer for the type
-// as a whole.
-fn tc_derive_only_need(tid0: Int, tr: Str) -> List[Int] {
+// Hash has no chain: its closed list answers for the type as a whole.
+fn tc_hash_need(tid0: Int) -> List[Int] {
     let tid = resolve_alias_tid(tc_resolve(tid0))
-    let fact = match tr {
-        "Hash" => tc_hash_fact_by_bounds(tid)
-        _ => tc_derive_only_fact(tid, tr)
-    }
-    if fact == -1 { [tid] } else { [] }
+    if tc_hash_fact_by_bounds(tid) == -1 { [tid] } else { [] }
 }
 
 // What `debug` needs of `tid` that it lacks. A container, a tuple and a range are `Debug`

@@ -1,0 +1,184 @@
+// §3.6.2 *Built-in Types in JSON* gives one closed list of the built-in Serialize and
+// Deserialize impls, and the bound check (E0306) and the derive field check (E1401) both read
+// it. So for each built-in type, a `T: Serialize` bound refuses the type exactly when a
+// derive refuses a field of it, and the same holds for Deserialize. U64, Bytes and Range[T]
+// have no impl. Each refusal of one of them carries a help that names the repair for that
+// type, at a derive field and at a bound alike.
+
+import compile_test_helpers
+
+fn bound_and_derive_src(tr: Str, ty: Str) -> Str {
+    "import std.json\nfn need[T: {tr}](x: T) -> Int \{ 1 }\nfn at_bound(v: {ty}) -> Int \{ need(v) }\n@derive({tr})\ntype W \{ v: {ty} }\nfn main() \{ io.println(\"ok\") }\n"
+}
+
+// The answer of each check for one type, as "bound/derive", each "yes" or "no". Any other
+// error is "other", so a check that fails for an unrelated cause does not read as "yes".
+fn answers(tr: Str, ty: Str, tag: Str) -> Str ! FS.Write, Process.Spawn, FS.Delete, Env.Read {
+    let out = compile_test_helpers.check_via_cli(bound_and_derive_src(tr, ty), tag)
+    let errors = out.split("\"severity\":\"error\"").len() - 1
+    let bound = if out.contains("E0306") { "no" } else { "yes" }
+    let derive = if out.contains("E1401") { "no" } else { "yes" }
+    let known = (if bound == "no" { 1 } else { 0 }) + (if derive == "no" { 1 } else { 0 })
+    if errors != known { return "other: {out}" }
+    "{bound}/{derive}"
+}
+
+fn assert_has(tr: Str, ty: Str, tag: Str) ! FS.Write, Process.Spawn, FS.Delete, Env.Read {
+    assert_eq(answers(tr, ty, tag), "yes/yes")
+}
+
+fn assert_has_none(tr: Str, ty: Str, tag: Str) ! FS.Write, Process.Spawn, FS.Delete, Env.Read {
+    assert_eq(answers(tr, ty, tag), "no/no")
+}
+
+test "Char and each sized integer but U64 have Serialize at a bound and at a derive" {
+    for ty in ["Char", "I8", "I16", "I32", "U8", "U16", "U32"] {
+        assert_has("Serialize", ty, "bj_ser_{ty}")
+    }
+}
+
+test "Char and each sized integer but U64 have Deserialize at a bound and at a derive" {
+    for ty in ["Char", "I8", "I16", "I32", "U8", "U16", "U32"] {
+        assert_has("Deserialize", ty, "bj_de_{ty}")
+    }
+}
+
+test "U64, Bytes and Range have no Serialize and no Deserialize at a bound or at a derive" {
+    for ty in ["U64", "Bytes", "Range[Int]"] {
+        assert_has_none("Serialize", ty, "bj_ser_none_{ty.len()}")
+        assert_has_none("Deserialize", ty, "bj_de_none_{ty.len()}")
+    }
+}
+
+test "a Map, a Set and a tuple have no Serialize and no Deserialize at a bound or at a derive" {
+    let mut i = 0
+    for ty in ["Map[Str, Int]", "Set[Int]", "(Int, Str)"] {
+        assert_has_none("Serialize", ty, "bj_ser_container_{i}")
+        assert_has_none("Deserialize", ty, "bj_de_container_{i}")
+        i = i + 1
+    }
+}
+
+test "a List has an impl at a bound exactly when its element has one" {
+    assert_has("Serialize", "List[U8]", "bj_ser_list_u8")
+    assert_has_none("Serialize", "List[U64]", "bj_ser_list_u64")
+    assert_has("Deserialize", "List[Char]", "bj_de_list_char")
+    assert_has_none("Deserialize", "List[Bytes]", "bj_de_list_bytes")
+}
+
+test "an Option and a Result have an impl at a bound and at a derive exactly when their parts do" {
+    for tr in ["Serialize", "Deserialize"] {
+        assert_has(tr, "Option[U8]", "bj_opt_{tr}")
+        assert_has(tr, "Result[Char, Str]", "bj_res_{tr}")
+        assert_has(tr, "List[Option[Int]]", "bj_list_opt_{tr}")
+        assert_has_none(tr, "Option[U64]", "bj_opt_none_{tr}")
+        assert_has_none(tr, "Result[Int, Bytes]", "bj_res_none_{tr}")
+    }
+}
+
+test "a List of a user type with no impl has no impl at a bound" {
+    for tr in ["Serialize", "Deserialize"] {
+        let src = "import std.json\ntype N \{ x: Int }\nfn need[T: {tr}](x: T) -> Int \{ 1 }\nfn main() \{ io.println(\"\{need([N \{ x: 1 }])}\") }\n"
+        let out = compile_test_helpers.check_via_cli(src, "bj_list_user_{tr}")
+        assert(out.contains("E0306"), "a List of a type with no {tr} passed the bound\n{out}")
+    }
+}
+
+test "an Option of an Option field is refused at both derives" {
+    for tr in ["Serialize", "Deserialize"] {
+        let src = "import std.json\n@derive({tr})\ntype W \{ v: Option[Option[Int]] }\nfn main() \{ io.println(\"ok\") }\n"
+        let out = compile_test_helpers.check_via_cli(src, "bj_opt_opt_{tr}")
+        assert(out.contains("E1401") && out.contains("both encode as `null`"), "{tr}\n{out}")
+    }
+}
+
+test "a function has no Serialize at a bound" {
+    let out = compile_test_helpers.check_via_cli("import std.json\nfn need[T: Serialize](x: T) -> Int \{ 1 }\nfn id(x: Int) -> Int \{ x }\nfn at_bound() -> Int \{ need(id) }\nfn main() \{ io.println(\"ok\") }\n", "bj_ser_fn")
+    assert(out.contains("E0306"), "a function passed a Serialize bound\n{out}")
+    // A help that tells a caller to edit a derive is wrong at a bound with no derive.
+    assert(!out.contains("from the derive"), "a bound help names a derive\n{out}")
+}
+
+// Never holds no value (§3.2), so it writes nothing and Serialize holds, but no JSON text
+// reads back as a Never.
+test "Never has Serialize and no Deserialize at a bound and at a derive" {
+    assert_has("Serialize", "Never", "bj_ser_never")
+    assert_has("Serialize", "Result[Int, Never]", "bj_ser_res_never")
+    assert_has_none("Deserialize", "Never", "bj_de_never")
+    assert_has_none("Deserialize", "Result[Int, Never]", "bj_de_res_never")
+}
+
+fn u64_help_holds(out: Str) -> Bool {
+    // The check output is JSON, which escapes the quotes around the stored text.
+    let text = out.contains("make the field `h: Str` and store")
+    let checked = out.contains("h.to_int_checked()") && out.contains("2^63 - 1")
+    text && checked && out.contains("Sha256")
+}
+
+test "a U64 field gets the help that names a Str, to_int_checked and Sha256" {
+    let ser = compile_test_helpers.check_via_cli("import std.json\n@derive(Serialize)\ntype Cached \{\n    h: U64\n}\nfn main() \{ io.println(\"ok\") }\n", "bj_u64_ser_help")
+    assert(ser.contains("E1401"), "U64 field not refused\n{ser}")
+    assert(u64_help_holds(ser), "no U64 help at the Serialize derive\n{ser}")
+    let de = compile_test_helpers.check_via_cli("import std.json\n@derive(Deserialize)\ntype Cached \{\n    h: U64\n}\nfn main() \{ io.println(\"ok\") }\n", "bj_u64_de_help")
+    assert(de.contains("E1401"), "U64 field not refused for Deserialize\n{de}")
+    assert(u64_help_holds(de), "no U64 help at the Deserialize derive\n{de}")
+}
+
+test "a U64 at a Serialize bound gets the same help as at a derive" {
+    let out = compile_test_helpers.check_via_cli("import std.json\nfn store[T: Serialize](x: T) -> Int \{ 1 }\nfn keep(h: U64) -> Int \{\n    store(h)\n}\nfn main() \{ io.println(\"ok\") }\n", "bj_u64_bound_help")
+    assert(out.contains("E0306"), "U64 passed the bound\n{out}")
+    assert(u64_help_holds(out), "no U64 help at the bound\n{out}")
+}
+
+test "a Bytes field gets the help that names to_hex and nothing else" {
+    let out = compile_test_helpers.check_via_cli("import std.json\n@derive(Serialize)\ntype Blob \{\n    data: Bytes\n}\nfn main() \{ io.println(\"ok\") }\n", "bj_bytes_help")
+    assert(out.contains("E1401"), "Bytes field not refused\n{out}")
+    assert(out.contains("make the field a `Str` and store `data.to_hex()`"), "no to_hex help\n{out}")
+    assert(!out.contains("base64"), "the Bytes help names base64\n{out}")
+}
+
+test "a Range field gets the help that names a struct with start and end fields" {
+    let out = compile_test_helpers.check_via_cli("import std.json\n@derive(Serialize)\ntype Window \{\n    span: Range[Int]\n}\nfn main() \{ io.println(\"ok\") }\n", "bj_range_help")
+    assert(out.contains("E1401"), "Range field not refused\n{out}")
+    assert(out.contains("write a struct with `start` and `end` fields"), "no struct help\n{out}")
+    assert(out.contains("span: Span"), "the help does not name the new field type\n{out}")
+}
+
+test "a Bytes and a Range at a bound get the help they get at a derive" {
+    let bytes = compile_test_helpers.check_via_cli("import std.json\nfn store[T: Serialize](x: T) -> Int \{ 1 }\nfn keep(data: Bytes) -> Int \{\n    store(data)\n}\nfn main() \{ io.println(\"ok\") }\n", "bj_bytes_bound_help")
+    assert(bytes.contains("E0306"), "Bytes passed the bound\n{bytes}")
+    assert(bytes.contains("make the field a `Str` and store `data.to_hex()`"), "no to_hex help at the bound\n{bytes}")
+    let range = compile_test_helpers.check_via_cli("import std.json\nfn load[T: Deserialize](x: T) -> Int \{ 1 }\nfn keep(span: Range[Int]) -> Int \{\n    load(span)\n}\nfn main() \{ io.println(\"ok\") }\n", "bj_range_bound_help")
+    assert(range.contains("E0306"), "Range passed the bound\n{range}")
+    assert(range.contains("write the field as `span: Span`"), "no struct help at the bound\n{range}")
+}
+
+// The repair names the field only when the refused type is the whole field type, the field
+// has a name in the source, and at a bound only when the argument is a name.
+test "a help for a refused type inside another type names the type, not the field" {
+    let boxed = compile_test_helpers.check_via_cli("import std.json\n@derive(Serialize)\ntype Box \{ v: Bytes }\n@derive(Deserialize)\ntype Q \{ b: List[Bytes] }\nfn main() \{ io.println(\"ok\") }\n", "bj_nested_help")
+    assert(boxed.contains("E1401"), "List[Bytes] field not refused\n{boxed}")
+    assert(!boxed.contains("b.to_hex()"), "the help calls to_hex on the List\n{boxed}")
+    assert(boxed.contains("hold the `Bytes` in a `Str` as its `to_hex()` text"), "no help that names Bytes\n{boxed}")
+    let opt = compile_test_helpers.check_via_cli("import std.json\n@derive(Deserialize)\ntype Q \{ h: U64? }\nfn main() \{ io.println(\"ok\") }\n", "bj_nested_u64_help")
+    assert(!opt.contains("h.to_int_checked()"), "the help calls to_int_checked on the Option\n{opt}")
+    assert(opt.contains("hold the `U64` as text in a `Str`"), "no help that names U64\n{opt}")
+    let ranges = compile_test_helpers.check_via_cli("import std.json\n@derive(Deserialize)\ntype Q \{ rs: List[Range[U8]] }\nfn main() \{ io.println(\"ok\") }\n", "bj_nested_range_help")
+    assert(ranges.contains("use `Span` in place of `Range[U8]`"), "no help that names the Range\n{ranges}")
+}
+
+test "a help for a positional payload or a computed argument names no value" {
+    let pos = compile_test_helpers.check_via_cli("import std.json\n@derive(Serialize)\ntype V \{\n    A(U64)\n}\nfn main() \{ io.println(\"ok\") }\n", "bj_positional_help")
+    assert(pos.contains("E1401"), "U64 payload not refused\n{pos}")
+    assert(!pos.contains("_0: Str"), "the help names the made-up payload name\n{pos}")
+    assert(pos.contains("hold the `U64` as text in a `Str`"), "no help that names U64\n{pos}")
+    let call = compile_test_helpers.check_via_cli("import std.json\nfn store[T: Serialize](x: T) -> Int \{ 1 }\nfn seed() -> U64 \{ 1 }\nfn keep() -> Int \{\n    store(seed())\n}\nfn main() \{ io.println(\"ok\") }\n", "bj_call_arg_help")
+    assert(call.contains("E0306"), "U64 passed the bound\n{call}")
+    assert(!call.contains("`x: Str`"), "the help names a value that does not exist\n{call}")
+    assert(call.contains("hold the `U64` as text in a `Str`"), "no help that names U64\n{call}")
+    // A function value names no argument, so the help names no value: `store` is the
+    // function, not a U64.
+    let fval = compile_test_helpers.check_via_cli("import std.json\nfn store[T: Serialize](_x: T) -> Int \{ 1 }\nfn keep() -> Int \{\n    let f: fn(U64) -> Int = store\n    f(1)\n}\nfn main() \{ io.println(\"ok\") }\n", "bj_fn_value_help")
+    assert(fval.contains("E0306"), "U64 passed the bound of a function value\n{fval}")
+    assert(!fval.contains("store.to_int_checked()") && !fval.contains("`store: Str`"), "the help names the function as a value\n{fval}")
+}

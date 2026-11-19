@@ -1,0 +1,178 @@
+// A derived to_json and from_json handle a Char field and a field of each sized integer type
+// by §3.6.2 *Built-in Types in JSON*. A Char writes a JSON string of its one scalar value and
+// reads back only a string of exactly one scalar value. I8, I16, I32, U8, U16 and U32 write a
+// JSON integer and read back only an integer in the range of the type. The error for a value
+// out of range names the type, the range, the value and the field. No input wraps or
+// truncates, and a number with a fraction or an exponent is refused, also 3.0.
+
+@derive(Serialize, Deserialize)
+type Glyph {
+    c: Char
+}
+
+@derive(Serialize, Deserialize)
+type Person {
+    age: U8
+}
+
+@derive(Serialize, Deserialize)
+type Sized {
+    a: I8
+    b: I16
+    c: I32
+    d: U8
+    e: U16
+    f: U32
+}
+
+@derive(Deserialize)
+type Mixed {
+    cs: List[Char]
+    ns: List[U16]
+    o: I32?
+    r: Result[U8, Char]
+}
+
+@derive(Serialize, Deserialize)
+type Shape {
+    Dot(c: Char, n: I16)
+    Empty
+}
+
+fn message_of_person(r: Result[Person, Str]) -> Str {
+    match r {
+        Ok(_) => ""
+        Err(m) => m
+    }
+}
+
+fn message_of_glyph(r: Result[Glyph, Str]) -> Str {
+    match r {
+        Ok(_) => ""
+        Err(m) => m
+    }
+}
+
+fn sized_message(text: Str) -> Str {
+    match Sized.from_json(text) {
+        Ok(_) => ""
+        Err(m) => m
+    }
+}
+
+fn sized_text(a: Str, b: Str, c: Str, d: Str, e: Str, f: Str) -> Str {
+    "\{\"a\": {a}, \"b\": {b}, \"c\": {c}, \"d\": {d}, \"e\": {e}, \"f\": {f}}"
+}
+
+test "a Char field writes a JSON string of its one scalar value" {
+    assert_eq(Glyph { c: 'k' }.to_json(), #"{"c":"k"}"#)
+    assert_eq(Glyph { c: 'é' }.to_json(), #"{"c":"é"}"#)
+    assert_eq(Glyph { c: '"' }.to_json(), #"{"c":"\""}"#)
+}
+
+test "a Char field reads a string of exactly one scalar value" {
+    assert_eq(Glyph.from_json(#"{"c": "k"}"#).unwrap().c, 'k')
+    assert_eq(Glyph.from_json(#"{"c": "é"}"#).unwrap().c, 'é')
+    assert_eq(Glyph.from_json(#"{"c": "😀"}"#).unwrap().c, '😀')
+    assert_eq(Glyph.from_json(#"{"c": "\ud83d\ude00"}"#).unwrap().c, '😀')
+}
+
+test "a Char field refuses a string of zero or of two scalar values" {
+    let two = message_of_glyph(Glyph.from_json(#"{"c": "ab"}"#))
+    assert(two.contains("Char") && two.contains("'c'"), "no Char error for two scalar values: {two}")
+    // An e and a combining acute accent are two scalar values, though one glyph.
+    let combined = message_of_glyph(Glyph.from_json("\{\"c\": \"e\u{301}\"}"))
+    assert(combined.contains("Char") && combined.contains("'c'"), "read two scalar values as a Char: {combined}")
+    let none = message_of_glyph(Glyph.from_json(#"{"c": ""}"#))
+    assert(none.contains("Char") && none.contains("'c'"), "no Char error for no scalar value: {none}")
+}
+
+test "a Char field refuses a value that is not a string" {
+    assert(message_of_glyph(Glyph.from_json(#"{"c": 107}"#)) != "", "read a number as a Char")
+    assert(message_of_glyph(Glyph.from_json(#"{"c": null}"#)) != "", "read null as a Char")
+    assert(message_of_glyph(Glyph.from_json(#"{"c": ["k"]}"#)) != "", "read an array as a Char")
+}
+
+test "an absent Char key is the missing-field error" {
+    assert_eq(message_of_glyph(Glyph.from_json("\{}")), "field 'c' is missing")
+}
+
+test "a sized integer field writes a JSON integer" {
+    let a: U8 = 200
+    assert_eq(Person { age: a }.to_json(), #"{"age":200}"#)
+    let s = Sized { a: -128, b: -32768, c: -2147483648,
+        d: 255, e: 65535, f: 4294967295 }
+    assert_eq(s.to_json(), #"{"a":-128,"b":-32768,"c":-2147483648,"d":255,"e":65535,"f":4294967295}"#)
+}
+
+test "a sized integer field reads each end of its range" {
+    let lo = Sized.from_json(sized_text("-128", "-32768", "-2147483648", "0", "0", "0")).unwrap()
+    assert_eq(lo.a.to_int(), -128)
+    assert_eq(lo.b.to_int(), -32768)
+    assert_eq(lo.c.to_int(), -2147483648)
+    assert_eq(lo.d.to_int(), 0)
+    let hi = Sized.from_json(sized_text("127", "32767", "2147483647", "255", "65535", "4294967295")).unwrap()
+    assert_eq(hi.a.to_int(), 127)
+    assert_eq(hi.b.to_int(), 32767)
+    assert_eq(hi.c.to_int(), 2147483647)
+    assert_eq(hi.d.to_int(), 255)
+    assert_eq(hi.e.to_int(), 65535)
+    assert_eq(hi.f.to_int(), 4294967295)
+}
+
+test "a value one past either end of the range names the type, the range, the value and the field" {
+    assert_eq(message_of_person(Person.from_json(#"{"age": 300}"#)), "field 'age' expected U8 (0 to 255), got 300")
+    assert_eq(message_of_person(Person.from_json(#"{"age": -1}"#)), "field 'age' expected U8 (0 to 255), got -1")
+    assert_eq(sized_message(sized_text("128", "0", "0", "0", "0", "0")), "field 'a' expected I8 (-128 to 127), got 128")
+    assert_eq(sized_message(sized_text("0", "-32769", "0", "0", "0", "0")), "field 'b' expected I16 (-32768 to 32767), got -32769")
+    assert_eq(sized_message(sized_text("0", "0", "2147483648", "0", "0", "0")), "field 'c' expected I32 (-2147483648 to 2147483647), got 2147483648")
+    assert_eq(sized_message(sized_text("0", "0", "0", "0", "65536", "0")), "field 'e' expected U16 (0 to 65535), got 65536")
+    assert_eq(sized_message(sized_text("0", "0", "0", "0", "0", "4294967296")), "field 'f' expected U32 (0 to 4294967295), got 4294967296")
+    assert_eq(sized_message(sized_text("-129", "0", "0", "0", "0", "0")), "field 'a' expected I8 (-128 to 127), got -129")
+    assert_eq(sized_message(sized_text("0", "32768", "0", "0", "0", "0")), "field 'b' expected I16 (-32768 to 32767), got 32768")
+    assert_eq(sized_message(sized_text("0", "0", "-2147483649", "0", "0", "0")), "field 'c' expected I32 (-2147483648 to 2147483647), got -2147483649")
+    assert_eq(sized_message(sized_text("0", "0", "0", "256", "0", "0")), "field 'd' expected U8 (0 to 255), got 256")
+    assert_eq(sized_message(sized_text("0", "0", "0", "0", "-1", "0")), "field 'e' expected U16 (0 to 65535), got -1")
+    assert_eq(sized_message(sized_text("0", "0", "0", "0", "0", "-1")), "field 'f' expected U32 (0 to 4294967295), got -1")
+}
+
+test "a sized integer field refuses a number with a fraction or an exponent, also 3.0" {
+    let m = message_of_person(Person.from_json(#"{"age": 3.0}"#))
+    assert(m.contains("field 'age'") && m.contains("U8 (0 to 255)") && m.contains("3.0"), "3.0 not refused with the type, range and value: {m}")
+    assert(message_of_person(Person.from_json(#"{"age": 3e0}"#)) != "", "read 3e0 as a U8")
+}
+
+test "a sized integer field refuses a string, a Bool and null" {
+    assert(message_of_person(Person.from_json(#"{"age": "3"}"#)) != "", "read a string as a U8")
+    assert(message_of_person(Person.from_json(#"{"age": true}"#)) != "", "read a Bool as a U8")
+    assert(message_of_person(Person.from_json(#"{"age": null}"#)) != "", "read null as a U8")
+}
+
+test "an absent sized integer key is the missing-field error" {
+    assert_eq(message_of_person(Person.from_json("\{}")), "field 'age' is missing")
+}
+
+test "Char and sized integers round trip inside a List, an Option and a Result" {
+    let m = Mixed.from_json(#"{"cs": ["a", "ß"], "ns": [1, 65535], "o": -5, "r": {"Err": "x"}}"#).unwrap()
+    assert_eq(m.cs.len(), 2)
+    assert_eq(m.cs.get(1).unwrap(), 'ß')
+    assert_eq(m.ns.get(1).unwrap().to_int(), 65535)
+    assert_eq(m.o.unwrap().to_int(), -5)
+    assert_eq(m.r, Err('x'))
+    let bad = match Mixed.from_json(#"{"cs": [], "ns": [70000], "o": null, "r": {"Ok": 1}}"#) {
+        Ok(_) => ""
+        Err(e) => e
+    }
+    assert(bad.contains("U16 (0 to 65535)") && bad.contains("70000"), "no range error for a List element: {bad}")
+}
+
+test "an enum variant with a Char and a sized integer field round trips" {
+    let text = Shape.Dot(c: 'z', n: -7).to_json()
+    match Shape.from_json(text).unwrap() {
+        Shape.Dot(c, n) => {
+            assert_eq(c, 'z')
+            assert_eq(n.to_int(), -7)
+        }
+        Shape.Empty => assert(false, "read Empty")
+    }
+}

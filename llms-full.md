@@ -1264,6 +1264,13 @@ let json = task.to_json()                    // -> Str
 let back = Task.from_json(json)              // -> Result[Task, Str]
 ```
 
+A field type must have a JSON form. `Char` is a one-character string. `I8` to `U32` are
+integers, and `from_json` refuses a value out of range. `U64`, `Bytes`, `Range[T]`, `Map`,
+`Set`, tuples and functions have none: store a `U64` as a `Str`, `Bytes` as `b.to_hex()`, and
+a range as a struct with `start` and `end` fields.
+`None` is `null` and `Some(v)` is `v`. `Ok(v)` is `{"Ok": v}` and `Err(e)` is `{"Err": e}`.
+A field declared `T??` is refused, since `None` and `Some(None)` would both be `null`.
+
 Low-level JSON API (`import std.json`):
 
 | Function | Returns | Purpose |

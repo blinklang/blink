@@ -1,19 +1,13 @@
 import compile_test_helpers
 
-// @derive(Serialize) never checked that a field type is actually serializable.
-// A field of a non-serializable type (a Ptr, an @ffi.opaque handle, a user type with no
-// Serialize impl, or a container the emitter cannot yet produce) passed typecheck and reached
-// codegen, where emit_field_serialize silently emitted the literal "null" for it — the banned
-// silent-fallback the derive-field checks exist to prevent (spec 03_types.md container-Debug
-// no-silent-stand-in rule). This mirrors the existing per-field derive checks: @derive(Debug)
-// fires E0520 and @derive(Hash/Eq/Ord) fires E1401 NonDerivableTrait (spec 03_types.md:2850,
-// section 3.6.6). @derive(Serialize) now uses the same E1401 NonDerivableTrait per-field check.
-// The serializable v1 set for a struct field = Int/Float/Bool/Str, a List of a serializable
-// element, or a struct/enum that itself derives Serialize. An enum-variant field is stricter:
-// no List (emit_enum_to_json has no list branch) and only a derived struct (not an enum) may
-// recurse (its nested arm gates on is_struct_type) — the enum emitter is weaker than the struct
-// emitter, and the check mirrors each emitter's faithful set exactly. Char, the sized ints, and
-// F32/F64 (reserved, no type yet) are all rejected even though they are scalars.
+// @derive(Serialize) refuses, with E1401 NonDerivableTrait, a field whose type has no JSON
+// form (sections/03_types.md §3.6.2 *Built-in Types in JSON*, §3.6.6). Before this check, a
+// Ptr, an @ffi.opaque handle or a user type with no Serialize impl reached codegen, which
+// wrote the literal "null" for it, a silent stand-in for a value.
+// A field type has a JSON form when it is Int, Float, Bool, Str, Char, I8 to U32, or a List,
+// Option or Result of such types, or a struct or enum that derives Serialize. The same list
+// holds for a struct field and an enum-variant field. U64 has no JSON form, and F32/F64
+// (reserved, no type yet) are refused by name resolution.
 
 fn ptr_field_src() -> Str {
     #"@derive(Serialize)
@@ -57,19 +51,30 @@ test "derive Serialize with a non-Serialize user struct field is E1401" {
     compile_test_helpers.expect_compile_error(nonserialize_struct_field_src(), "derive_serialize_rejects_unserializable_field_userstruct", "E1401")
 }
 
-// A container the v1 emitter cannot faithfully produce (only List is emitted; Option/Map/Set/
-// Result fall through to the silent "null"). Rejected until codegen grows the support.
+// An Option field writes `null` for None and the value for Some(v) (sections/03_types.md
+// *Option and Result in JSON*).
 fn option_field_src() -> Str {
     #"@derive(Serialize)
 type Box { v: Option[Int] }
 fn main() {
-    io.println("hi")
+    io.println(Box { v: Some(1) }.to_json())
+    io.println(Box { v: None }.to_json())
 }
 "#
 }
 
-test "derive Serialize with an Option field is E1401" {
-    compile_test_helpers.expect_compile_error(option_field_src(), "derive_serialize_rejects_unserializable_field_option", "E1401")
+// Each row asserts the exact text the derived to_json writes, so a field that falls through
+// to a literal "null" fails it.
+fn writes(src: Str, tag: Str, want: Str) ! FS.Delete, FS.Write, Process.Spawn, FS.Read, Env.Read, IO.Print {
+    let r = compile_test_helpers.compile_and_run(src, tag)
+    if r.exit_code != 0 || r.out != want {
+        io.println("FAIL: {tag}: exit {r.exit_code}, out '{r.out}', err '{r.err_out}'")
+    }
+    assert(r.exit_code == 0 && r.out == want)
+}
+
+test "derive Serialize with an Option field writes null or the value" {
+    writes(option_field_src(), "derive_serialize_rejects_unserializable_field_option", "\{\"v\":1}\n\{\"v\":null}\n")
 }
 
 fn map_field_src() -> Str {
@@ -85,7 +90,7 @@ test "derive Serialize with a Map field is E1401" {
     compile_test_helpers.expect_compile_error(map_field_src(), "derive_serialize_rejects_unserializable_field_map", "E1401")
 }
 
-// Enum-variant fields take a stricter path than struct fields (emit_enum_to_json).
+// An enum-variant field is judged by the same list as a struct field.
 fn enum_variant_ptr_src() -> Str {
     #"@derive(Serialize)
 type E { V(p: Ptr[U8]) }
@@ -204,7 +209,8 @@ test "derive Serialize over a generic type param does not false-positive E1401" 
     compile_test_helpers.expect_no_error(generic_param_src(), "derive_serialize_rejects_unserializable_field_generic", "E1401")
 }
 
-// Char is a scalar but emit_field_serialize has no CT_CHAR branch — it serializes to "null".
+// A Char writes a JSON string of its one scalar value (sections/03_types.md *Built-in Types
+// in JSON*).
 fn char_field_src() -> Str {
     #"@derive(Serialize)
 type Box { c: Char }
@@ -214,12 +220,11 @@ fn main() {
 "#
 }
 
-test "derive Serialize with a Char field is E1401" {
-    compile_test_helpers.expect_compile_error(char_field_src(), "derive_serialize_rejects_unserializable_field_char", "E1401")
+test "derive Serialize with a Char field derives" {
+    compile_test_helpers.expect_compiles_clean(compile_test_helpers.check_via_cli(char_field_src(), "derive_serialize_rejects_unserializable_field_char"), "char field derives Serialize")
 }
 
-// A sized int keeps a distinct CT (CT_U8 here) that falls through to "null" — only Int/I64 are
-// faithful.
+// I8 to U32 write a JSON integer (sections/03_types.md *Built-in Types in JSON*).
 fn sized_int_field_src() -> Str {
     #"@derive(Serialize)
 type Box { n: U8 }
@@ -229,8 +234,15 @@ fn main() {
 "#
 }
 
-test "derive Serialize with a sized-int field is E1401" {
-    compile_test_helpers.expect_compile_error(sized_int_field_src(), "derive_serialize_rejects_unserializable_field_sized", "E1401")
+test "derive Serialize with a sized-int field derives" {
+    compile_test_helpers.expect_compiles_clean(compile_test_helpers.check_via_cli(sized_int_field_src(), "derive_serialize_rejects_unserializable_field_sized"), "sized field derives Serialize")
+}
+
+// A U64 can hold a value above 2^63 - 1, which a JSON reader would round, so it has no
+// JSON form (sections/03_types.md *Built-in Types in JSON*).
+test "derive Serialize with a U64 field is E1401" {
+    let src = "@derive(Serialize)\ntype Box \{ n: U64 }\nfn main() \{\n    io.println(\"hi\")\n}\n"
+    compile_test_helpers.expect_compile_error(src, "derive_serialize_rejects_unserializable_field_u64", "E1401")
 }
 
 // F32 is a reserved type name with no type behind it yet, so the field is refused by name
@@ -248,56 +260,50 @@ test "derive Serialize with an F32 field is refused as a reserved type" {
     compile_test_helpers.expect_compile_error(f32_field_src(), "derive_serialize_rejects_unserializable_field_f32", "E0507")
 }
 
-// A nested List: emit_list_serialize has no branch for a list-of-list element, so the inner list
-// serializes to "null". The element predicate is non-recursive.
+// A List is Serialize where its element is, so a List of a List writes each inner list.
 fn nested_list_field_src() -> Str {
     #"@derive(Serialize)
 type Box { grid: List[List[Int]] }
 fn main() {
-    io.println("hi")
+    io.println(Box { grid: [[1, 2], [], [3]] }.to_json())
 }
 "#
 }
 
-test "derive Serialize with a List of List field is E1401" {
-    compile_test_helpers.expect_compile_error(nested_list_field_src(), "derive_serialize_rejects_unserializable_field_nestedlist", "E1401")
+test "derive Serialize with a List of List field writes each inner list" {
+    writes(nested_list_field_src(), "derive_serialize_rejects_unserializable_field_nestedlist", "\{\"grid\":[[1,2],[],[3]]}\n")
 }
 
-// An enum-variant List field: emit_enum_to_json has NO list branch, so even a List of primitives
-// serializes to "null" — stricter than the struct path, which does render List[Int].
+// A variant field is written by the same rule as a struct field.
 fn enum_variant_list_src() -> Str {
     #"@derive(Serialize)
 type E { V(xs: List[Int]) }
 fn main() {
-    io.println("hi")
+    io.println(E.V(xs: [1, 2]).to_json())
 }
 "#
 }
 
-test "derive Serialize with an enum-variant List field is E1401" {
-    compile_test_helpers.expect_compile_error(enum_variant_list_src(), "derive_serialize_rejects_unserializable_field_enumlist", "E1401")
+test "derive Serialize with an enum-variant List field writes the list" {
+    writes(enum_variant_list_src(), "derive_serialize_rejects_unserializable_field_enumlist", "\{\"type\":\"V\",\"xs\":[1,2]}\n")
 }
 
-// An enum-variant field whose type is itself a derived-Serialize enum: emit_enum_to_json gates
-// its nested recursion on is_struct_type, so an enum-typed variant field serializes to "null"
-// even though the same field in a struct would be faithful.
 fn enum_variant_enum_field_src() -> Str {
     #"@derive(Serialize)
 type Inner { A, B }
 @derive(Serialize)
 type Outer { V(inner: Inner) }
 fn main() {
-    io.println("hi")
+    io.println(Outer.V(inner: Inner.B).to_json())
 }
 "#
 }
 
-test "derive Serialize with an enum-typed enum-variant field is E1401" {
-    compile_test_helpers.expect_compile_error(enum_variant_enum_field_src(), "derive_serialize_rejects_unserializable_field_enumenum", "E1401")
+test "derive Serialize with an enum-typed enum-variant field writes the inner enum" {
+    writes(enum_variant_enum_field_src(), "derive_serialize_rejects_unserializable_field_enumenum", "\{\"type\":\"V\",\"inner\":\"B\"}\n")
 }
 
-// Guard: a struct field whose type is a derived-Serialize ENUM is faithful (the CT_VOID +
-// has_derive_method arm covers enums), so it must not false-positive.
+// Guard: a struct field whose type is an enum that derives Serialize has a JSON form.
 fn struct_enum_field_src() -> Str {
     #"@derive(Serialize)
 type Status { Active, Idle }
@@ -313,8 +319,7 @@ test "derive Serialize with a struct field of derived-enum type still typechecks
     compile_test_helpers.expect_no_error(struct_enum_field_src(), "derive_serialize_rejects_unserializable_field_structenum", "E1401")
 }
 
-// Guard: a List whose element is a derived-Serialize enum is faithful (elem_struct +
-// has_derive_method resolves the enum), so it must not false-positive.
+// Guard: a List whose element is an enum that derives Serialize has a JSON form.
 fn list_of_enum_src() -> Str {
     #"@derive(Serialize)
 type Status { Active, Idle }
