@@ -743,12 +743,13 @@ A stop of `blink build` is outside the Blink source when the cause is in the hos
 | Cause | What `blink build` reports | Exit |
 |-------|----------------------------|------|
 | A header that an `@ffi` declaration names is not on the host | `ForeignHeaderNotFound` (E0859), at the `@ffi` line (§9.1) | `1` |
+| The prototype of an `@ffi` declaration does not match the C call: a `Ptr` to a different named C type | `ForeignPrototypeMismatch` (E0861), at the `@ffi` line (§9.1) | `1` |
 | The C name of an `@ffi let` is not an integer constant on the target, or its value does not fit | `ForeignConstInvalid` (E0855), at the declaration | `1` |
 | The link step fails: a native library is missing or lacks a symbol | `LinkFailed` (E0857) | `1` |
 | A vendored native dependency does not compile | `NativeDependencyBuildFailed` (E0858) | `1` |
 | The C compiler gave no verdict: it could not start, or a signal ended it | `CCompilerDidNotRun` (E0860), no span | `1` |
 
-An `@ffi` signature is the claim of the author about C (§9.1). `blink check` cannot test the claim. If the claim is wrong, the C compiler can reject the C that the compiler wrote. That stop is `GeneratedCDidNotCompile` (I0017), and its note names the `@ffi` declarations of the program (§8.10.5). A program with no `@ffi` declaration and no native dependency gets no such note: the cause is a bug of the compiler.
+An `@ffi` signature is the claim of the author about C (§9.1). `blink check` cannot test the claim. If the claim is wrong, `blink build` tests the prototype and can stop with E0861. A wrong claim that the test does not find can still make the C compiler reject the C that the compiler wrote. That stop is `GeneratedCDidNotCompile` (I0017), and its note names the `@ffi` declarations of the program (§8.10.5). A program with no `@ffi` declaration and no native dependency gets no such note: the cause is a bug of the compiler.
 
 ```blink
 @ffi("no_such_header_fn", header: "no_such_header.h")

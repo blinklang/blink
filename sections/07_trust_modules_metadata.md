@@ -58,7 +58,57 @@ fn c_compress(src: Ptr[U8], n: Int) -> Int ! ()
 //   help: install the library that provides `zstd.h`
 ```
 
-If the header is there and the C compiler still rejects the generated C, the stop is `GeneratedCDidNotCompile` (I0017). Its note names the `@ffi` declarations of the program and says that a wrong prototype can also cause it (§8.10.5).
+**The prototype test.** After the header test passes, `blink build` and `blink test` test the prototype of each `@ffi` declaration. The test compiles the C call that the declaration gives against the prototype in the header. It uses the same C compiler, target, include paths and vendored native directories as the unit compile. It reads only pass or fail, and it does not read the text of the C compiler. A declaration that fails is `ForeignPrototypeMismatch` (E0861) at the `@ffi` line, and the command exits `1`. The unit compile does not start (§6.7.3). `blink check` does not run the test.
+
+The test and the unit compile both pass `-Werror=incompatible-pointer-types -Werror=int-conversion`, so one source gives one verdict on every host. The supported C compilers are gcc 13 and later, clang and `zig cc`. `tcc` ignores these two flags: under `tcc` the test and the unit compile accept a mismatch that the other compilers refuse, so E0861 does not fire.
+
+The test finds what the C compiler rejects when the generated call meets the prototype. The usual cause is a pointer to a different named C type. *A `Ptr` at an `@ffi` Call* (§9.1.1) gives the pointee rules. The test does not find a wrong scalar width or a wrong scalar pointee (`Ptr[I32]` for a `long *`): those are the claim of the author (*Signature Types*, below), and `blink audit` marks them (§9.1, *`blink audit` — FFI Inventory*).
+
+```blink
+@ffi.struct(header: "netinet/in.h", name: "sockaddr_in")
+type SockIn { sin_family: U16, sin_port: U16, sin_addr: U32, sin_zero: I64 }
+
+@ffi("connect", header: "sys/socket.h")
+@trusted(audit: "NET-CONNECT")
+fn c_connect(fd: I32, addr: Ptr[SockIn], len: U32) -> I32 ! () {}
+// blink check: no error
+// blink build: error[ForeignPrototypeMismatch] (E0861) at the @ffi line, exit 1
+//   `connect` takes `const struct sockaddr *`; this declaration passes `struct sockaddr_in *`
+//   help: declare the parameter `addr: Ptr[Void]`. It takes a `Ptr` to any struct
+```
+
+```blink
+@ffi.struct(header: "netinet/in.h", name: "sockaddr_in")
+type SockIn { sin_family: U16, sin_port: U16, sin_addr: U32, sin_zero: I64 }
+
+@ffi.struct(header: "netinet/in.h", name: "sockaddr_in6")
+type SockIn6 { sin6_family: U16, sin6_port: U16, sin6_flowinfo: U32, sin6_addr0: U32, sin6_addr1: U32, sin6_addr2: U32, sin6_addr3: U32, sin6_scope_id: U32 }
+
+@ffi("connect", header: "sys/socket.h")
+@trusted(audit: "NET-CONNECT")
+fn c_connect(fd: I32, addr: Ptr[Void], len: U32) -> I32 ! () {}
+
+fn main() {
+    with ffi.scope() as scope {
+        let a4: Ptr[SockIn] = scope.alloc[SockIn]()
+        let a6: Ptr[SockIn6] = scope.alloc[SockIn6]()
+        io.println("{c_connect(-1, a4, 16)}")    // OK: `Ptr[SockIn]` passes to `Ptr[Void]`
+        io.println("{c_connect(-1, a6, 28)}")    // OK: so does `Ptr[SockIn6]`
+    }
+}
+```
+
+The help of E0861 offers `Ptr[Void]` only when the declaration passes a pointer to a different named C type, as above. It is the fix for that cause and for no other. A pointer to the wrong struct for a function that takes a plain `int *` is a wrong claim, not a case for `Ptr[Void]`:
+
+```blink
+@ffi("pipe", header: "unistd.h")
+@trusted(audit: "UNISTD-PIPE")
+fn c_pipe(fds: Ptr[SockIn]) -> I32 ! () {}
+// blink build: error[ForeignPrototypeMismatch] (E0861) at the @ffi line, exit 1
+//   `pipe` takes `int *`; this declaration passes `struct sockaddr_in *`
+```
+
+If the header is there and the prototype test passes, but the C compiler still rejects the generated C, the stop is `GeneratedCDidNotCompile` (I0017). Its note names the `@ffi` declarations of the program and says that a wrong prototype that the test did not find can also cause it (§8.10.5). An example is a build with `tcc`.
 
 #### `@ffi` Binds a Module-Level Function
 
@@ -1748,6 +1798,16 @@ This output is structured JSON when `--json` is passed. CI pipelines can enforce
 
 A plain `blink audit` also lists the orphan keys of each record: pin keys that no item carries now.
 
+**Pointees that no step checks.** For each `@ffi` declaration, `blink audit` marks every `Ptr` parameter and every `Ptr` result whose pointee is `Void` or a scalar, at any depth, "pointee not checked against the header". The prototype test (§9.1, *The prototype test*) does not check these. A pointee that is an `@ffi.struct` or `@ffi.opaque` type has no mark. In the JSON form, each such parameter has `"pointee_checked": false`.
+
+```
+  net/sock.bl:
+    c_connect   effects: ()   audit: NET-CONNECT   OK
+      addr: Ptr[Void]   pointee not checked against the header
+    c_time      effects: ()   audit: TIME-TIME     OK
+      t: Ptr[Int]       pointee not checked against the header
+```
+
 `blink audit pin K [key]` writes the pins of record `K` in `audits.toml`. See *`blink audit pin` — Writing Pins* above for what it scans, writes and refuses.
 
 #### CPU Baseline and Accelerated Code
@@ -1889,6 +1949,51 @@ error[E0810]: invalid Ptr type parameter
   |
   = help: use `Ptr[U8]` for C strings, convert with `.as_cstr()`
 ```
+
+#### A `Ptr` at an `@ffi` Call
+
+A `Ptr[T]` is `T*` in the C that the compiler writes (*The `Ptr[T]` Type*, above), but C sees the pointee type only for a pointee that names a C type. These rules hold at the C call of an `@ffi` function.
+
+**The coercion.** At an argument of a call to an `@ffi` function, and only there, a `Ptr[T]` passes to a parameter of type `Ptr[Void]`. It is one level deep: the argument's type is `Ptr[T]` for any `T`, and the parameter's type is `Ptr[Void]`. A `Ptr[Ptr[T]]` passes to `Ptr[Void]` (`T` is `Ptr[T]`), and it does not pass to `Ptr[Ptr[Void]]`. The coercion is not a subtype. `Ptr[SockIn]` is not `Ptr[Void]`: every other position keeps the types apart, and a `let`, a field, a return and a call of a fn that is not `@ffi` refuse the pass with `TypeError` (E0300). The scope check of E0601 (§9.1.1, *Scope tags*) reads the type that the argument has, `Ptr[SockIn]`, and not the type of the parameter.
+
+```blink
+@ffi("connect", header: "sys/socket.h")
+@trusted(audit: "NET-CONNECT")
+fn c_connect(fd: I32, addr: Ptr[Void], len: U32) -> I32 ! () {}
+
+fn main() {
+    with ffi.scope() as scope {
+        let a4: Ptr[SockIn] = scope.alloc[SockIn]()
+        io.println("{c_connect(-1, a4, 16)}")       // OK: an `@ffi` call argument
+        let v: Ptr[Void] = a4                       // ERROR E0300: expected `Ptr[Void]`, found `Ptr[SockIn]`
+    }
+}
+```
+
+**What C sees.** The C call keeps the pointee type of a pointee that names a C type by its name: an `@ffi.struct` or an `@ffi.opaque` type. The C type is the `name:` of the declaration. `name:` spells the C type exactly as the header of the target spells it, and the compiler writes it as it is written. Every other pointee becomes `void *` at every depth: `Void`, each scalar (`Int`, `Float`, `U8`, `I32` and the rest), and a `Ptr` to any of these. C converts a `void *` to any object pointer type with no diagnostic. A `Ptr` result is read through the same conversion, never through a cast.
+
+| Blink parameter | C type at the call | Checked against the header |
+|-----------------|--------------------|----------------------------|
+| `Ptr[SockIn]` (`@ffi.struct`, `name: "sockaddr_in"`) | `struct sockaddr_in *` | yes: E0861 when the header differs |
+| `Ptr[Sqlite3]` (`@ffi.opaque`, `name: "sqlite3"`) | `sqlite3 *` | yes |
+| `Ptr[Ptr[Sqlite3]]` | `sqlite3 **` | yes |
+| `Ptr[Void]` | `void *` | no |
+| `Ptr[Int]`, `Ptr[U8]`, `Ptr[F32]` | `void *` | no |
+| `Ptr[Ptr[U8]]`, `Ptr[Ptr[Void]]` | `void *` | no |
+
+A scalar pointee is not checked against the header because its C spelling depends on the target: `Int` is `int64_t`, which is `long` on one target and `long long` on another. A pointee that is checked has one spelling on every target, so the verdict is the same on every target. One caution about the spelling: a C name can differ by target. `FILE` is `struct _IO_FILE` with glibc and `struct __sFILE` on macOS. Write `name: "FILE"`, which every target has, and not the tag of one target.
+
+```blink
+@ffi("time", header: "time.h")
+@trusted(audit: "TIME-TIME")
+fn c_time(t: Ptr[Int]) -> Int ! ()                  // builds on every target: the pointee is a scalar
+
+@ffi("strtol", header: "stdlib.h")
+@trusted(audit: "STDLIB-STRTOL")
+fn c_strtol(s: Ptr[U8], end: Ptr[Ptr[U8]], base: I32) -> Int ! ()   // `end` is `char **`: builds
+```
+
+A scalar or `Void` pointee is the claim of the author. A wrong one builds and can corrupt memory at run time: `Ptr[I32]` for a `time_t *` writes eight bytes into a cell of four. Nothing checks it, and `blink audit` says so (§9.1, *`blink audit` — FFI Inventory*).
 
 #### Pointer Operations
 
