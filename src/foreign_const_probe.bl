@@ -333,7 +333,7 @@ pub fn probe_verdicts(fcs: List[ForeignConst], probe: Probe, cc_err: Str, file_n
             if n > 0 { included_at = n }
             continue
         }
-        let is_error = raw.contains(": error:") || raw.contains(": fatal error:")
+        let is_error = is_cc_error_line(raw)
         let line = probe_line_of(raw, marker)
         if raw.contains(": note:") && pending != -1 && line > 0 {
             match line_of(probe, line) {
@@ -561,8 +561,36 @@ pub fn typedef_names(names: List[Str], probe: SpellingProbe, cc_err: Str, file_n
     out
 }
 
-fn is_error_line(raw: Str) -> Bool {
-    raw.contains(": error:") || raw.contains(": fatal error:")
+// Whether a line the C compiler wrote is an error it reports with a source: a file position
+// (`<file>:<line>:<col>: error:` or `<file>:<line>: error:`) or the name of a tool
+// (`clang: error:`). gcc and clang write these from column 0. A source line they quote under a
+// diagnostic is not one, even when it holds the text "error:" and has no indent.
+pub fn is_cc_error_line(raw: Str) -> Bool {
+    let plain = raw.byte_index_of(": error:", 0) ?? -1
+    let fatal = raw.byte_index_of(": fatal error:", 0) ?? -1
+    let at = if plain < 0 { fatal } else if fatal < 0 { plain } else if plain < fatal { plain } else { fatal }
+    if at <= 0 { return false }
+    let head = raw.byte_slice(0, at)
+    // A diagnostic starts at column 0 and its file name is not in quotes; a quoted source line
+    // can still hold `<file>:<line>: error:` inside a string.
+    if raw.starts_with(" ") || raw.starts_with("\t") || head.contains("\"") { return false }
+    if !head.contains(" ") && !head.contains(":") { return true }
+    let mut end = head.byte_len()
+    let mut numbers = 0
+    while numbers < 2 {
+        let digits = digits_before(head, end)
+        if digits == 0 || end - digits < 1 || head.byte_at(end - digits - 1).to_int() != 58 { break }
+        end = end - digits - 1
+        numbers = numbers + 1
+    }
+    numbers > 0 && end > 0
+}
+
+// How many ASCII digits end `s` just before byte `end`.
+fn digits_before(s: Str, end: Int) -> Int {
+    let mut i = end
+    while i > 0 && s.byte_at(i - 1).to_int() >= 48 && s.byte_at(i - 1).to_int() <= 57 { i = i - 1 }
+    end - i
 }
 
 fn names_probe_file(raw: Str, marker: Str) -> Bool {
@@ -574,7 +602,7 @@ pub fn probe_failed_lines(cc_err: Str, file_name: Str) -> List[Int] {
     let marker = "{file_name}:"
     let mut failed: List[Int] = []
     for raw in cc_err.split("\n") {
-        if !is_error_line(raw) || !names_probe_file(raw, marker) { continue }
+        if !is_cc_error_line(raw) || !names_probe_file(raw, marker) { continue }
         let line = probe_line_of(raw, marker)
         if line > 0 && !failed.contains(line) { failed.push(line) }
     }
@@ -585,7 +613,7 @@ pub fn probe_failed_lines(cc_err: Str, file_name: Str) -> List[Int] {
 pub fn probe_has_foreign_error(cc_err: Str, file_name: Str) -> Bool {
     let marker = "{file_name}:"
     for raw in cc_err.split("\n") {
-        if is_error_line(raw) && !names_probe_file(raw, marker) { return true }
+        if is_cc_error_line(raw) && !names_probe_file(raw, marker) { return true }
     }
     false
 }

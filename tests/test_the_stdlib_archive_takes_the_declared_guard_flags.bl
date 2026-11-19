@@ -1,0 +1,61 @@
+// The stdlib archive's monolith.c declares each foreign prototype inside
+// `#ifndef BLINK_DECLARED_<sym>`, as a user unit does. Its compile, for the host and for a
+// cross target, must take the flags that drop each prototype a header it reads already
+// declares. Here a copy of lib/ adds an @ffi fn for `link` whose prototype conflicts with
+// unistd.h's, which runtime.h includes.
+import compile_test_helpers
+import std.process.{ProcessResult, ChildLimits}
+import std.time.{Duration}
+
+fn sh(cmd: Str) -> ProcessResult ! Process.Spawn {
+    process.run("sh", ["-c", cmd], limits: ChildLimits { timeout: Some(Duration.seconds(900)) }).unwrap()
+}
+
+let CONFLICTING_LINK = #"
+@ffi("link", header: "unistd.h")
+@trusted(audit: "Test only: wraps link(2) with byte pointers, so its prototype conflicts with unistd.h's.")
+fn c_link(a: Ptr[U8], b: Ptr[U8]) -> I32 ! FFI {}
+
+@trusted(audit: "Test only: passes the pointers through.")
+pub fn link_paths(a: Ptr[U8], b: Ptr[U8]) -> I32 ! FFI {
+    c_link(a, b)
+}
+"#
+
+let PROGRAM = #"fn main() {
+    io.println("hello")
+}
+"#
+
+// A root whose lib/std/libc.bl holds the conflicting fn, with its own copy of the compiler:
+// a compiler reads std from lib/std beside itself before BLINK_ROOT. The archive build reads
+// the one-file runtime.h of build/; bootstrap/runtime.h includes files it does not copy.
+fn root(name: Str) -> Str ! FS.Read, FS.Write, Process.Spawn, Env.Read {
+    let d = "{compile_test_helpers.scratch_root()}/_stdlib_archive_guard_{name}_{getpid()}"
+    sh("rm -rf {d} && mkdir -p {d}/bin {d}/build {d}/cache && cp -rL lib {d}/lib && ln -s $(pwd)/bootstrap {d}/bootstrap && cp -L build/runtime.h {d}/build/runtime.h && cp build/blink {d}/bin/blink")
+    let libc = fs.read("{d}/lib/std/libc.bl").unwrap()
+    fs.write("{d}/lib/std/libc.bl", libc.concat(CONFLICTING_LINK)).unwrap()
+    fs.write("{d}/main.bl", PROGRAM).unwrap()
+    d
+}
+
+fn blink(d: Str, args: Str) -> ProcessResult ! Process.Spawn {
+    sh("cd {d} && env -u BLINK_COMPILER_ARCHIVE BLINK_ROOT={d} BLINK_CACHE_DIR={d}/cache BLINK_BIN={d}/bin/blink {d}/bin/blink {args} < /dev/null 2>&1")
+}
+
+test "the host stdlib archive drops a prototype its headers declare" {
+    let d = root("host")
+    let r = blink(d, "__build-stdlib-archive")
+    sh("rm -rf {d}")
+    assert(r.success(), "the archive build failed:\n{r.out}")
+}
+
+test "the cross stdlib archive drops a prototype its headers declare" {
+    if !sh("zig version").success() { skip("zig is not on PATH") }
+    let d = root("cross")
+    let arc = blink(d, "__build-stdlib-archive")
+    let r = blink(d, "build main.bl --target x86_64-linux-gnu --output {d}/main")
+    sh("rm -rf {d}")
+    assert(arc.success(), "the host archive build failed:\n{arc.out}")
+    assert(r.success(), "the cross build failed:\n{r.out}")
+}
