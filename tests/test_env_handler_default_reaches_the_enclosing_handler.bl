@@ -1,0 +1,184 @@
+// `default.op` in a `handler Env` clause performs the operation through the handler this one
+// was installed over (§4.7.1): the runtime's for an outermost handler, the enclosing one for a
+// nested handler. A clause for `exit` must diverge (§4.4.3), and the §4.4.3 mock records the
+// exit code before it panics.
+
+import compile_test_helpers
+
+fn default_src() -> Str {
+    #"
+fn main() {
+    env.set_var("BLINK_ENV_DEFAULT_PROBE", "real")
+    let real_cwd = env.cwd()
+    let real_pid = env.pid()
+    let real_args = env.args().len()
+    with handler Env {
+        fn args() -> List[Str] { default.args() }
+        fn var(name: Str) -> Option[Str] { Some("wrapped {default.var(name) ?? "none"}") }
+        fn vars() -> Map[Str, Str] { default.vars() }
+        fn cwd() -> Str { default.cwd() }
+        fn pid() -> Int { default.pid() }
+        fn set_var(name: Str, value: Str) { default.set_var(name, "{value}!") }
+        fn remove_var(name: Str) { default.remove_var(name) }
+    } {
+        io.println("var: {env.var("BLINK_ENV_DEFAULT_PROBE") ?? "missing"}")
+        io.println("vars: {env.vars().get("BLINK_ENV_DEFAULT_PROBE") ?? "missing"}")
+        io.println("cwd: {env.cwd() == real_cwd}")
+        io.println("pid: {env.pid() == real_pid}")
+        io.println("args: {env.args().len() == real_args}")
+        env.set_var("BLINK_ENV_DEFAULT_SET", "v")
+        env.remove_var("BLINK_ENV_DEFAULT_PROBE")
+    }
+    io.println("set reached the OS: {env.var("BLINK_ENV_DEFAULT_SET") ?? "missing"}")
+    io.println("remove reached the OS: {env.var("BLINK_ENV_DEFAULT_PROBE").is_none()}")
+    with handler Env {
+        fn var(name: Str) -> Option[Str] { Some("outer {name}") }
+    } {
+        with handler Env {
+            fn var(name: Str) -> Option[Str] { Some("inner {default.var(name) ?? "none"}") }
+        } {
+            io.println("nested: {env.var("K") ?? "none"}")
+        }
+    }
+}
+"#
+}
+
+fn expect_default_output(out: Str) {
+    assert(out.contains("var: wrapped real\n"))
+    assert(out.contains("vars: real\n"))
+    assert(out.contains("cwd: true\n"))
+    assert(out.contains("pid: true\n"))
+    assert(out.contains("args: true\n"))
+    assert(out.contains("set reached the OS: v!\n"))
+    assert(out.contains("remove reached the OS: true\n"))
+    assert(out.contains("nested: inner outer K\n"))
+}
+
+test "default.op in an Env handler reaches the handler it was installed over" {
+    let r = compile_test_helpers.compile_and_run(default_src(), "env_default_each_op")
+    if r.exit_code != 0 { io.eprintln(r.err_out) }
+    assert_eq(r.exit_code, 0)
+    expect_default_output(r.out)
+}
+
+test "default.op in an Env handler gives the same answers under --per-module" {
+    let r = compile_test_helpers.run_via_cli(default_src(), "env_default_each_op_per_module", "--per-module")
+    if r.exit_code != 0 { io.eprintln(r.err_out) }
+    assert_eq(r.exit_code, 0)
+    expect_default_output(r.out)
+}
+
+test "default.op in a sub-effect handler reaches the enclosing handler from a callee" {
+    let r = compile_test_helpers.compile_and_run(#"
+fn look() -> Str ! Env.Read {
+    env.var("K") ?? "none"
+}
+
+fn store() ! Env.Write {
+    env.set_var("BLINK_ENV_DEFAULT_SUB", "v")
+}
+
+fn main() {
+    with handler Env {
+        fn var(name: Str) -> Option[Str] { Some("outer {name}") }
+        fn set_var(name: Str, value: Str) { io.println("outer set {name}={value}") }
+    } {
+        with handler Env.Read {
+            fn var(name: Str) -> Option[Str] { Some("read {default.var(name) ?? "none"}") }
+        } {
+            io.println(look())
+        }
+        with handler Env.Write {
+            fn set_var(name: Str, value: Str) { default.set_var(name, "{value}!") }
+        } {
+            store()
+        }
+    }
+}
+"#, "env_default_sub_effect")
+    if r.exit_code != 0 { io.eprintln(r.err_out) }
+    assert_eq(r.exit_code, 0)
+    assert_eq(r.out, "read outer K\nouter set BLINK_ENV_DEFAULT_SUB=v!\n")
+}
+
+test "default.exit in an Env exit clause ends the process with the code" {
+    let r = compile_test_helpers.compile_and_run(#"
+fn main() {
+    with handler Env {
+        fn exit(code: Int) -> Never {
+            io.println("leaving {code}")
+            default.exit(code + 1)
+        }
+    } {
+        env.exit(4)
+    }
+    io.println("not reached")
+}
+"#, "env_default_exit")
+    assert_eq(r.exit_code, 5)
+    assert_eq(r.out, "leaving 4\n")
+}
+
+test "an exit clause that does not diverge is refused" {
+    let out = compile_test_helpers.check_via_cli(#"
+fn main() ! Env, IO {
+    with handler Env {
+        fn exit(code: Int) -> Never { io.println("stay {code}") }
+    } {
+        env.exit(1)
+    }
+}
+"#, "env_exit_clause_returns")
+    if !out.contains("return type Never") { io.eprintln(out) }
+    assert(out.contains("does not match function `exit` return type Never"))
+}
+
+fn spec_mock_src() -> Str {
+    #"
+fn run_cli() ! Env, IO {
+    let args = env.args()
+    if args.len() < 2 {
+        io.println("usage: {args.get(0) ?? "tool"} <file>")
+        env.exit(1)
+    }
+    io.println("ok")
+}
+
+test "CLI exits with 1 on missing args" {
+    let mut exit_code = -1
+    let mock = handler Env {
+        fn args() -> List[Str] { ["mytool"] }
+        fn var(name: Str) -> Option[Str] { None }
+        fn vars() -> Map[Str, Str] { Map.new() }
+        fn cwd() -> Str { "/tmp" }
+        fn pid() -> Int { 4242 }
+        fn set_var(name: Str, value: Str) { }
+        fn remove_var(name: Str) { }
+        fn exit(code: Int) -> Never {
+            exit_code = code
+            panic("env.exit({code})")
+        }
+    }
+    assert_panics(matching: "env.exit(1)") {
+        with mock {
+            run_cli()
+        }
+    }
+    assert_eq(exit_code, 1)
+}
+"#
+}
+
+// The spec's own example is a test block, so it runs under `blink test`, not `blink run`.
+test.failing("the spec mock records the exit code and the test catches the exit", reason: "a handler clause that assigns a captured let mut has no cell yet") {
+    let path = "{compile_test_helpers.scratch_root()}/_env_spec_mock.bl"
+    fs.write(path, spec_mock_src()).unwrap()
+    let r = process.run("build/blink", ["test", path]).unwrap()
+    let _ = fs.delete(path)
+    let all = r.out.concat(r.err_out)
+    // Only the named ICE may fail this row; any other result passes it, so the runner reports
+    // the change as an unexpected pass.
+    assert(!all.contains("SharedMutableCaptureNotLowered"))
+    assert(r.out.contains("1 passed, 0 failed"))
+}
