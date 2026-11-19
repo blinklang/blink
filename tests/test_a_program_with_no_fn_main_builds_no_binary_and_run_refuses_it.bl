@@ -1,0 +1,350 @@
+// A program whose entry file declares no `fn main` (spec 6.7.7). `blink build` compiles
+// every module, writes no binary, prints one note on stderr and exits 0. `blink run` stops
+// with a usage error before any compile and exits 2. `blink check` and `blink test` do not
+// change. A `fn main` in an imported module, or a method named `main`, is not the entry
+// point. Each fixture lives in a fresh temporary directory, outside the test tree's project.
+
+import std.process.{ProcessResult, ChildEnd}
+import std.json.{json_clear, json_parse, json_get, json_as_str}
+
+let NOTE = "note: no fn main; compiled as a library, no binary written"
+
+fn sh(cmd: Str) -> ProcessResult ! Process.Spawn {
+    process.run("sh", ["-c", cmd]).unwrap()
+}
+
+fn fresh() -> Str ! Process.Spawn {
+    sh("mktemp -d /tmp/blink_no_entry_point.XXXXXX").out.trim()
+}
+
+// A directory that holds one loose file, `name`, with the text `src`.
+fn loose(name: Str, src: Str) -> Str ! FS.Write, Process.Spawn {
+    let dir = fresh()
+    fs.write("{dir}/{name}", src).unwrap()
+    dir
+}
+
+// A package `app` whose src/ holds each (file, text) pair.
+fn package(files: List[(Str, Str)]) -> Str ! FS.Write, Process.Spawn {
+    let dir = fresh()
+    let _ = sh("mkdir -p {dir}/src")
+    fs.write("{dir}/blink.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\n").unwrap()
+    fs.write("{dir}/blink.lock", "[metadata]\nlockfile-version = 1\n").unwrap()
+    for (name, text) in files {
+        fs.write("{dir}/src/{name}", text).unwrap()
+    }
+    dir
+}
+
+fn blink_in(dir: Str, args: Str) -> ProcessResult ! Process.Spawn {
+    sh("B=$(pwd)/build/blink; cd {dir} && $B {args}")
+}
+
+fn exists(path: Str) -> Bool ! Process.Spawn {
+    sh("test -e {path}").end == ChildEnd.Exited(0)
+}
+
+fn drop(dir: Str) ! Process.Spawn {
+    let _ = sh("rm -rf {dir}")
+}
+
+fn lines_of(text: Str) -> List[Str] {
+    text.trim().split("\n")
+}
+
+// What is wrong with a build that must take the no-main path, or "". `help` is the expected
+// help line, or "" when the note must have none.
+fn library_build_error(r: ProcessResult, help: Str) -> Str {
+    if r.end != ChildEnd.Exited(0) { return "build did not exit 0: {r.end}\n{r.err_out}" }
+    if r.out != "" { return "build wrote to stdout: {r.out}" }
+    let lines = lines_of(r.err_out)
+    if !lines.contains(NOTE) { return "no note line in stderr:\n{r.err_out}" }
+    let helps = lines.filter(fn(l) { l.trim().starts_with("help:") })
+    if help == "" && helps.len() > 0 { return "an unexpected help line:\n{r.err_out}" }
+    if help != "" && !lines.contains(help) { return "no help line `{help}` in stderr:\n{r.err_out}" }
+    ""
+}
+
+// What is wrong with a run that must stop with the no-main usage error, or "".
+fn usage_error_of_run(r: ProcessResult, file: Str, help: Str) -> Str {
+    if r.end != ChildEnd.Exited(2) { return "run did not exit 2: {r.end}\n{r.err_out}" }
+    if r.out != "" { return "run wrote to stdout: {r.out}" }
+    let lines = lines_of(r.err_out)
+    if !lines.contains("error: no fn main in {file}; nothing to run") { return "no usage error line in stderr:\n{r.err_out}" }
+    let helps = lines.filter(fn(l) { l.trim().starts_with("help:") })
+    if help == "" && helps.len() > 0 { return "an unexpected help line:\n{r.err_out}" }
+    if help != "" && !lines.contains(help) { return "no help line `{help}` in stderr:\n{r.err_out}" }
+    ""
+}
+
+fn did_you_mean(name: Str, file: Str) -> Str {
+    "  help: did you mean `main`? `{name}` in {file} is one edit from `main`"
+}
+
+test "build of a file with no fn main writes no binary, prints the note and exits 0" {
+    let dir = loose("stats.bl", "fn mean(xs: List[Int]) -> Int \{ xs.len() }\n")
+    let r = blink_in(dir, "build stats.bl")
+    let made = exists("{dir}/build/stats")
+    drop(dir)
+    assert_eq(library_build_error(r, ""), "")
+    assert(!made)
+}
+
+test "the one-unit build takes the same no-main path" {
+    let dir = loose("stats.bl", "fn mean(xs: List[Int]) -> Int \{ xs.len() }\n")
+    let r = blink_in(dir, "build --no-per-module stats.bl")
+    let made = exists("{dir}/build/stats")
+    drop(dir)
+    assert_eq(library_build_error(r, ""), "")
+    assert(!made)
+}
+
+// The corpus links a compiler archive layer in place of the modules it holds. A unit that
+// imports one includes the layer's header, so the compile with no link needs its -I too.
+test "a no-main unit that imports a module of a compiler archive layer compiles against the layer" {
+    let dir = package([
+        ("stats.bl", "pub fn one() -> Int \{ 1 }\n"),
+        ("lib.bl", "import stats\nfn use_it() -> Int \{ stats.one() }\n"),
+        ("app.bl", "import stats\nfn main() ! IO \{ io.println(\"\{stats.one()}\") }\n"),
+    ])
+    let layer = sh("B=$(pwd)/build/blink; cd {dir} && $B __build-compiler-archive {dir}/layer stats")
+    let lib = sh("B=$(pwd)/build/blink; cd {dir} && BLINK_COMPILER_ARCHIVE={dir}/layer $B build --no-per-module src/lib.bl")
+    let app = sh("B=$(pwd)/build/blink; cd {dir} && BLINK_COMPILER_ARCHIVE={dir}/layer $B build --no-per-module src/app.bl && ./build/app")
+    drop(dir)
+    assert_eq(layer.end, ChildEnd.Exited(0))
+    assert_eq(library_build_error(lib, ""), "")
+    assert_eq(app.end, ChildEnd.Exited(0))
+}
+
+test "a no-main build removes the binary an earlier build left at the output path" {
+    let dir = loose("stats.bl", "fn mean(xs: List[Int]) -> Int \{ xs.len() }\n")
+    fs.write("{dir}/old", "stale").unwrap()
+    let _ = sh("chmod +x {dir}/old")
+    let r = blink_in(dir, "build -o old stats.bl")
+    let made = exists("{dir}/old")
+    drop(dir)
+    assert_eq(library_build_error(r, ""), "")
+    assert(!made)
+}
+
+test "an empty file builds with the note and no binary" {
+    let dir = loose("empty.bl", "")
+    let r = blink_in(dir, "build empty.bl")
+    let one = blink_in(dir, "build --no-per-module empty.bl")
+    let made = exists("{dir}/build/empty")
+    drop(dir)
+    assert_eq(library_build_error(r, ""), "")
+    assert_eq(library_build_error(one, ""), "")
+    assert(!made)
+}
+
+test "a file with only a comment builds with the note and no binary" {
+    let dir = loose("note.bl", "// only a comment\n")
+    let r = blink_in(dir, "build note.bl")
+    let made = exists("{dir}/build/note")
+    drop(dir)
+    assert_eq(library_build_error(r, ""), "")
+    assert(!made)
+}
+
+test "the note names a top-level fn one edit from main" {
+    let dir = fresh()
+    fs.write("{dir}/typo.bl", "fn mian() ! IO \{ io.println(\"hi\") }\n").unwrap()
+    fs.write("{dir}/upper.bl", "fn Main() \{}\n").unwrap()
+    fs.write("{dir}/swap.bl", "fn amin() \{}\n").unwrap()
+    fs.write("{dir}/extra.bl", "fn mains() \{}\n").unwrap()
+    fs.write("{dir}/short.bl", "fn man() \{}\n").unwrap()
+    let typo = blink_in(dir, "build typo.bl")
+    let upper = blink_in(dir, "build upper.bl")
+    let swap = blink_in(dir, "build swap.bl")
+    let extra = blink_in(dir, "build extra.bl")
+    let short = blink_in(dir, "build short.bl")
+    drop(dir)
+    assert_eq(library_build_error(typo, did_you_mean("mian", "typo.bl")), "")
+    assert_eq(library_build_error(upper, did_you_mean("Main", "upper.bl")), "")
+    assert_eq(library_build_error(swap, did_you_mean("amin", "swap.bl")), "")
+    assert_eq(library_build_error(extra, did_you_mean("mains", "extra.bl")), "")
+    assert_eq(library_build_error(short, did_you_mean("man", "short.bl")), "")
+}
+
+test "the note gives no help for a name two edits from main or for a name that is not a fn" {
+    let dir = fresh()
+    fs.write("{dir}/far.bl", "fn mn() \{}\n").unwrap()
+    fs.write("{dir}/value.bl", "let mian = 1\nfn f() -> Int \{ mian }\n").unwrap()
+    let far = blink_in(dir, "build far.bl")
+    let value = blink_in(dir, "build value.bl")
+    drop(dir)
+    assert_eq(library_build_error(far, ""), "")
+    assert_eq(library_build_error(value, ""), "")
+}
+
+test "build --json writes the note as one diagnostics entry and the text on stderr, and only the status on stdout" {
+    let dir = loose("typo.bl", "fn mian() ! IO \{ io.println(\"hi\") }\n")
+    let r = blink_in(dir, "build --json typo.bl")
+    let one = blink_in(dir, "build --json --no-per-module typo.bl")
+    let made = exists("{dir}/build/typo")
+    drop(dir)
+    assert_eq(r.end, ChildEnd.Exited(0))
+    assert(!made)
+    assert(lines_of(r.err_out).contains(NOTE))
+    assert(lines_of(r.err_out).contains(did_you_mean("mian", "typo.bl")))
+    let out = lines_of(r.out)
+    assert_eq(out.len(), 1)
+    let mut entries: List[Str] = []
+    for line in lines_of(r.err_out) {
+        if line.starts_with("\{") { entries.push(line) }
+    }
+    assert_eq(entries.len(), 1)
+    json_clear()
+    let note = json_parse(entries.get(0).unwrap())
+    assert_eq(json_as_str(json_get(note, "severity")), "note")
+    assert_eq(json_as_str(json_get(note, "kind")), "no_entry_point")
+    assert_eq(json_as_str(json_get(note, "message")), "no fn main; compiled as a library, no binary written")
+    assert_eq(json_as_str(json_get(note, "help")), "did you mean `main`? `mian` in typo.bl is one edit from `main`")
+    assert(json_get(note, "code") < 0)
+    assert(json_get(note, "span") < 0)
+    json_clear()
+    let status = json_parse(out.get(0).unwrap())
+    assert_eq(json_as_str(json_get(status, "status")), "ok")
+    assert(json_get(status, "output") < 0)
+    assert_eq(one.end, ChildEnd.Exited(0))
+    assert_eq(one.out, r.out)
+}
+
+test "--strict does not turn the note into a failure" {
+    let dir = loose("stats.bl", "fn mean(xs: List[Int]) -> Int \{ xs.len() }\n")
+    let r = blink_in(dir, "build --strict stats.bl")
+    drop(dir)
+    assert_eq(library_build_error(r, ""), "")
+}
+
+test "a no-main file with a type error stops the build with the error and no note" {
+    let dir = loose("bad.bl", "fn f() -> Int \{ \"no\" }\n")
+    let r = blink_in(dir, "build bad.bl")
+    drop(dir)
+    assert_eq(r.end, ChildEnd.Exited(1))
+    assert(!r.err_out.contains(NOTE))
+}
+
+test "run of a file with no fn main is a usage error before any compile" {
+    let dir = loose("stats.bl", "fn mean(xs: List[Int]) -> Int \{ xs.len() }\n")
+    let r = blink_in(dir, "run stats.bl")
+    let built = exists("{dir}/build")
+    drop(dir)
+    assert_eq(usage_error_of_run(r, "stats.bl", ""), "")
+    assert(!built)
+}
+
+test "run names a top-level fn one edit from main" {
+    let dir = loose("typo.bl", "fn mian() ! IO \{ io.println(\"hi\") }\n")
+    let r = blink_in(dir, "run typo.bl")
+    drop(dir)
+    assert_eq(usage_error_of_run(r, "typo.bl", did_you_mean("mian", "typo.bl")), "")
+}
+
+test "run of an empty file is the same usage error with no help" {
+    let dir = loose("empty.bl", "")
+    let r = blink_in(dir, "run empty.bl")
+    drop(dir)
+    assert_eq(usage_error_of_run(r, "empty.bl", ""), "")
+}
+
+test "run stops before the compile, so a type error in a no-main file does not show" {
+    let dir = loose("bad.bl", "fn f() -> Int \{ \"no\" }\n")
+    let r = blink_in(dir, "run bad.bl")
+    drop(dir)
+    assert_eq(usage_error_of_run(r, "bad.bl", ""), "")
+}
+
+test "run --json writes one usage_error object on stdout and the text on stderr" {
+    let dir = loose("typo.bl", "fn mian() ! IO \{ io.println(\"hi\") }\n")
+    let r = blink_in(dir, "run --json typo.bl")
+    let plain = blink_in(dir, "run --json --no-per-module typo.bl")
+    let empty = loose("empty.bl", "")
+    let bare = blink_in(empty, "run --json empty.bl")
+    drop(dir)
+    drop(empty)
+    assert_eq(r.end, ChildEnd.Exited(2))
+    assert(lines_of(r.err_out).contains("error: no fn main in typo.bl; nothing to run"))
+    assert_eq(lines_of(r.out).len(), 1)
+    json_clear()
+    let root = json_parse(r.out.trim())
+    assert(root >= 0)
+    let ue = json_get(root, "usage_error")
+    assert(ue >= 0)
+    assert_eq(json_as_str(json_get(ue, "kind")), "no_entry_point")
+    assert_eq(json_as_str(json_get(ue, "message")), "no fn main in typo.bl; nothing to run")
+    assert_eq(json_as_str(json_get(ue, "help")), "did you mean `main`? `mian` in typo.bl is one edit from `main`")
+    assert_eq(plain.end, ChildEnd.Exited(2))
+    assert_eq(plain.out, r.out)
+    assert_eq(bare.end, ChildEnd.Exited(2))
+    assert_eq(lines_of(bare.out).len(), 1)
+    assert(!bare.out.contains("\"help\""))
+    json_clear()
+    let broot = json_parse(bare.out.trim())
+    assert_eq(json_as_str(json_get(json_get(broot, "usage_error"), "message")), "no fn main in empty.bl; nothing to run")
+}
+
+test "a fn main in an imported module is not the entry point" {
+    let dir = package([
+        ("stats.bl", "pub fn main() ! IO \{ io.println(\"stats\") }\npub fn one() -> Int \{ 1 }\n"),
+        ("app.bl", "import stats\nfn use_it() -> Int \{ stats.one() }\n"),
+    ])
+    let b = blink_in(dir, "build src/app.bl")
+    let made = exists("{dir}/build/app")
+    let r = blink_in(dir, "run src/app.bl")
+    drop(dir)
+    assert_eq(library_build_error(b, ""), "")
+    assert(!made)
+    assert_eq(usage_error_of_run(r, "src/app.bl", ""), "")
+}
+
+test "the entry main runs when an imported module also declares a main" {
+    let dir = package([
+        ("stats.bl", "pub fn main() ! IO \{ io.println(\"stats\") }\npub fn one() -> Int \{ 1 }\n"),
+        ("app.bl", "import stats\nfn main() ! IO \{ io.println(\"app \{stats.one()}\") }\n"),
+    ])
+    let r = blink_in(dir, "run src/app.bl")
+    let one = blink_in(dir, "run --no-per-module src/app.bl")
+    drop(dir)
+    assert_eq(r.end, ChildEnd.Exited(0))
+    assert_eq(r.out, "app 1\n")
+    assert_eq(one.end, ChildEnd.Exited(0))
+    assert_eq(one.out, "app 1\n")
+}
+
+test "a method named main is not the entry point" {
+    let src = "type Job \{ n: Int }\ntrait Start \{\n    fn main(self) -> Int\n}\nimpl Start for Job \{\n    fn main(self) -> Int \{ self.n }\n}\nfn make() -> Int \{ Job \{ n: 1 }.main() }\n"
+    let dir = loose("job.bl", src)
+    let b = blink_in(dir, "build job.bl")
+    let r = blink_in(dir, "run job.bl")
+    drop(dir)
+    assert_eq(library_build_error(b, ""), "")
+    assert_eq(usage_error_of_run(r, "job.bl", ""), "")
+}
+
+test "check of a file with no fn main is unchanged" {
+    let dir = loose("stats.bl", "fn mean(xs: List[Int]) -> Int \{ xs.len() }\n")
+    let r = blink_in(dir, "check stats.bl")
+    drop(dir)
+    assert_eq(r.end, ChildEnd.Exited(0))
+    assert(!r.err_out.contains("no fn main"))
+}
+
+test "test of a file with no fn main is unchanged" {
+    let dir = loose("stats.bl", "fn mean(xs: List[Int]) -> Int \{ xs.len() }\n\ntest \"mean\" \{\n    assert_eq(mean([1, 2]), 2)\n}\n")
+    let r = blink_in(dir, "test stats.bl")
+    drop(dir)
+    assert_eq(r.end, ChildEnd.Exited(0))
+    assert(!r.err_out.contains("no fn main"))
+}
+
+test "a file with fn main builds a binary and prints no note" {
+    let dir = loose("ok.bl", "fn main() ! IO \{ io.println(\"hi\") }\n")
+    let r = blink_in(dir, "build ok.bl")
+    let made = exists("{dir}/build/ok")
+    drop(dir)
+    assert_eq(r.end, ChildEnd.Exited(0))
+    assert(!r.err_out.contains("no fn main"))
+    assert(made)
+}

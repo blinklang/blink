@@ -99,6 +99,24 @@ expect 1 "build exit 0 with no binary goes red" "RED tests/check_clean/nobin.bl"
 reset; prog noexec check=0 build=0 binary=2
 expect 1 "build exit 0 with an output that does not execute goes red" "RED tests/check_clean/noexec.bl" "no executable output"
 
+NOTE='say=note: no fn main; compiled as a library, no binary written'
+reset; prog lib check=0 build=0 binary=0 "$NOTE"
+expect 0 "build exit 0 with the no-main note and no binary is green as a library" "1 built, 1 library"
+
+reset; prog libbin check=0 build=0 binary=1 "$NOTE"
+expect 1 "the no-main note with a binary goes red" "RED tests/check_clean/libbin.bl" "printed the no-main note and wrote an output"
+
+reset; prog libout check=0 build=0 binary=2 "$NOTE"
+expect 1 "the no-main note with an output that does not execute goes red" "RED tests/check_clean/libout.bl" "printed the no-main note and wrote an output"
+
+reset; prog libnear check=0 build=0 binary=0 'say=warning: no fn main; compiled as a library, no binary written'
+expect 1 "a line that is not the exact note does not make a library" "RED tests/check_clean/libnear.bl" "no executable output and no no-main note"
+
+reset; prog wasknown check=0 build=0 binary=0 "$NOTE"
+list "tests/check_clean/wasknown.bl LinkFailed: no main symbol"
+expect 1 "a listed program that now builds as a library goes red until its line leaves" \
+    "RED tests/check_clean/wasknown.bl: on the list but it builds now as a library"
+
 reset; prog other check=0 build=1 binary=0 'say=error[TypeError]: only build sees this'
 expect 1 "a stop that §6.7.3 does not list goes red under its own label" \
     "RED tests/check_clean/other.bl: check passed, then a stop that" "TypeError"

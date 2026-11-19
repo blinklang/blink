@@ -37,7 +37,7 @@ import parser.{
     node_condition, node_then_body, node_else_body, node_scrutinee,
     node_arms, node_guard, node_target, node_iterable, node_left,
     node_right, node_index, node_fields, node_handlers, node_start, node_end,
-    node_methods, node_captures, node_type_params, node_source_module,
+    node_methods, node_captures, node_type_params, node_source_module, is_entry_module_key,
     sublist_length, sublist_get, get_annotation,
     ann_str_val, positional_str_arg, positional_str_arg_count,
     parser_want_interface_text,
@@ -733,6 +733,144 @@ type CompiledText {
     headers: List[ForeignHeader]
     // Made while the checked program is at hand: the C compile that may need it runs later.
     ffi_note: Str
+    entry: EntryMain
+}
+
+// ── A program with no `fn main` (§6.7.7) ────────────────────────────────────
+
+// Whether the entry file declares a top-level `fn main`, and else the first top-level fn in
+// it, in source order, whose name is one edit from `main`, or "".
+type EntryMain {
+    has_main: Bool
+    near: Str
+}
+
+let NO_ENTRY_NOTE = "no fn main; compiled as a library, no binary written"
+
+// Reads the top-level fns of the entry module only: a `main` that an imported module
+// declares is not the entry point, and an impl method is not a top-level fn.
+fn entry_main_of(program: Int) -> EntryMain {
+    let fns = node_params(program)
+    let mut near = ""
+    if fns != -1 {
+        let mut i = 0
+        while i < sublist_length(fns) {
+            let f = sublist_get(fns, i)
+            if node_kind(f) == NodeKind.FnDef && is_entry_module_key(node_source_module(f)) {
+                let name = node_name(f)
+                if name == "main" {
+                    return EntryMain { has_main: true, near: "" }
+                }
+                if near == "" && one_edit_apart(name, "main") {
+                    near = name
+                }
+            }
+            i = i + 1
+        }
+    }
+    EntryMain { has_main: false, near: near }
+}
+
+// One edit is one char added, removed or changed, or two adjacent chars swapped. Equal
+// names are no edit apart. It counts chars, not bytes, so a non-ASCII char is one edit.
+// With the common head and tail cut off, the parts left are one char against at most one,
+// or two chars against the same two swapped.
+fn one_edit_apart(a: Str, b: Str) -> Bool {
+    let x: List[Char] = a.into_iter().collect()
+    let y: List[Char] = b.into_iter().collect()
+    let mut head = 0
+    while head < x.len() && head < y.len() && x.get(head).unwrap() == y.get(head).unwrap() {
+        head = head + 1
+    }
+    let mut tail = 0
+    while tail < x.len() - head && tail < y.len() - head && x.get(x.len() - 1 - tail).unwrap() == y.get(y.len() - 1 - tail).unwrap() {
+        tail = tail + 1
+    }
+    let rx = x.len() - head - tail
+    let ry = y.len() - head - tail
+    if rx + ry == 1 || (rx == 1 && ry == 1) {
+        return true
+    }
+    rx == 2 && ry == 2 && x.get(head).unwrap() == y.get(head + 1).unwrap() && x.get(head + 1).unwrap() == y.get(head).unwrap()
+}
+
+// The help text of the did-you-mean, or "" when no top-level fn is one edit from `main`.
+fn no_entry_help(entry: EntryMain, file: Str) -> Str {
+    if entry.near == "" {
+        return ""
+    }
+    "did you mean `main`? `{entry.near}` in {file} is one edit from `main`"
+}
+
+fn eprint_no_entry(severity: Str, message: Str, help: Str) ! IO {
+    io.eprintln("{severity}: {message}")
+    if help != "" {
+        io.eprintln("  help: {help}")
+    }
+}
+
+// The fields the build note and the run usage error share; help only for a did-you-mean.
+fn set_no_entry_fields(obj: Int, message: Str, help: Str) {
+    json_set(obj, "kind", json_new_str("no_entry_point"))
+    json_set(obj, "message", json_new_str(message))
+    if help != "" {
+        json_set(obj, "help", json_new_str(help))
+    }
+}
+
+// The note of a build that wrote no binary: text on stderr always, and under --json also one
+// diagnostics entry on stderr, where build writes every diagnostic, then the status line on
+// stdout, which names no output.
+fn report_no_entry_build(status_mode: Int, help: Str) ! IO {
+    eprint_no_entry("note", NO_ENTRY_NOTE, help)
+    if status_mode == BUILD_STATUS_JSON {
+        json_clear()
+        let note = json_new_object()
+        json_set(note, "severity", json_new_str("note"))
+        set_no_entry_fields(note, NO_ENTRY_NOTE, help)
+        io.eprintln(json_encode(note))
+        io.println("\{\"status\":\"ok\"}")
+    }
+}
+
+// `blink run` of an entry file with no `fn main` is a usage error before any compile, so
+// only the entry file is parsed here. A file that does not parse, or that is not there, goes
+// on to the build, which reports why.
+fn exit_if_run_has_no_entry(a: Args) ! Lex.Tokenize, Parse, Diag.Report, IO, FS.Read, Env.Read, Env.Exit {
+    let path = args_positional(a, 0)
+    if path == "" || !build_fs.path_exists(path) {
+        return
+    }
+    let source = match fs.read(path) {
+        Ok(text) => text
+        Err(_) => return
+    }
+    reset_compiler_state()
+    diag_reset()
+    diag_source_file = path
+    diag_register_source(path, source)
+    lex(source)
+    pos = 0
+    let program = parse_program()
+    let parsed = diag_count == 0
+    let entry = entry_main_of(program)
+    reset_compiler_state()
+    diag_reset()
+    if !parsed || entry.has_main {
+        return
+    }
+    let message = "no fn main in {path}; nothing to run"
+    let help = no_entry_help(entry, path)
+    eprint_no_entry("error", message, help)
+    if json_requested(a) {
+        json_clear()
+        let err = json_new_object()
+        set_no_entry_fields(err, message, help)
+        let root = json_new_object()
+        json_set(root, "usage_error", err)
+        io.println(json_encode(root))
+    }
+    env.exit(2)
 }
 
 fn compile_to_text(source_path: Str, debug_mode: Int, strict_mode: Int, test_build: Bool) -> Result[CompiledText, Int] ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit, Codegen, FS.Read, Env.Exit, Env.Read, IO {
@@ -795,7 +933,7 @@ fn compile_to_text(source_path: Str, debug_mode: Int, strict_mode: Int, test_bui
         }
     }
 
-    Ok(CompiledText { c: c_output, foreign: foreign, headers: foreign_headers_in(final_program), ffi_note: own_ffi_note(final_program) })
+    Ok(CompiledText { c: c_output, foreign: foreign, headers: foreign_headers_in(final_program), ffi_note: own_ffi_note(final_program), entry: entry_main_of(final_program) })
 }
 
 // Whether the compiler archive's evidence vector has a slot for every effect `program`
@@ -1648,7 +1786,7 @@ fn ensure_target_archive(arc_dir: Str, target: Str) -> Str ! IO, FS.Write, FS.Re
     archive
 }
 
-fn do_link_target(out: Str, c_path: Str, c_source: Str, link_flags: Str, obj_files: List[Str], include_flags: Str, debug_mode: Int, release_mode: Int, target: Str, compiler_archive: Str, test_build: Bool, ffi_note: Str) -> Int ! Diag.Report, IO, FS.Read, FS.Write, FS.Delete, Process.Spawn, Env.Exit, Env.Read, Time.Read {
+fn do_link_target(out: Str, c_path: Str, c_source: Str, link_flags: Str, obj_files: List[Str], include_flags: Str, debug_mode: Int, release_mode: Int, target: Str, compiler_archive: Str, test_build: Bool, ffi_note: Str, link: Bool) -> Int ! Diag.Report, IO, FS.Read, FS.Write, FS.Delete, Process.Spawn, Env.Exit, Env.Read, Time.Read {
     let mut objs = ""
     if obj_files.len() > 0 {
         objs = " {obj_files.join(" ")}"
@@ -1664,8 +1802,9 @@ fn do_link_target(out: Str, c_path: Str, c_source: Str, link_flags: Str, obj_fil
     if vrc != 0 {
         return vrc
     }
-    let std_archive = ensure_target_archive(arc_dir, target)
-    if std_archive == "" {
+    // A build with no link reads only the archive's header, so it does not build the archive.
+    let std_archive = if link { ensure_target_archive(arc_dir, target) } else { "" }
+    if link && std_archive == "" {
         return 1
     }
     // The layer goes ahead of the stdlib archive, whose symbols it uses.
@@ -1714,6 +1853,16 @@ fn do_link_target(out: Str, c_path: Str, c_source: Str, link_flags: Str, obj_fil
     let cached_o = if cache_dir != "" { cache_compile_snapshot(out, snap, c_path, snap_dir, debug_mode, release_mode, target, arc_dir, include_flags, test_build) } else { "" }
     // The map gives the binary the __FILE__ and debug paths a compile of c_path gives.
     let compile_input = if cached_o != "" { cached_o } else { "{snap} -ffile-prefix-map={snap_dir}={path_dirname(c_path)}" }
+    // A program with no `fn main` compiles its C and links nothing (§6.7.7). An object the
+    // cache gave has compiled already.
+    if !link {
+        let crc = if cached_o != "" { 0 } else { compile_unit_only(snap, "{snap_dir}/unit.o", snap_dir, c_path, includes, arc_dir, compiler_archive, debug_mode, release_mode, target, test_build, ffi_note) }
+        let _ = build_fs.remove_tree(snap_dir)
+        if crc == 0 && cache_did_store == 1 {
+            build_objcache.maybe_gc()
+        }
+        return crc
+    }
     if build_objcache.dev_evict_at("link") {
         trace.log("blink.build.units", "dev evict link")
     }
@@ -1727,6 +1876,18 @@ fn do_link_target(out: Str, c_path: Str, c_source: Str, link_flags: Str, obj_fil
         build_objcache.maybe_gc()
     }
     return 0
+}
+
+// Compiles the one-unit C to an object it does not keep, and reports a failure as the
+// generated C that did not compile.
+fn compile_unit_only(snap: Str, obj: Str, snap_dir: Str, c_path: Str, includes: Str, arc_dir: Str, compiler_archive: Str, debug_mode: Int, release_mode: Int, target: Str, test_build: Bool, ffi_note: Str) -> Int ! IO, Process.Spawn, FS.Read, Env.Read {
+    // A unit that imports a module of the compiler archive layer includes the layer's header.
+    let layer = if compiler_archive != "" { " -I{compiler_archive}" } else { "" }
+    let ran = run_cc_step("-c {snap} -o {obj} -ffile-prefix-map={snap_dir}={path_dirname(c_path)}{includes}{layer} -I{arc_dir}", debug_mode, release_mode, target, test_build)
+    if ran.rc != 0 {
+        return generated_c_failed("compiling the generated C", ran.output, ffi_note)
+    }
+    0
 }
 
 // Reports a failed one-unit link as the step that failed, and answers the exit code. The
@@ -2098,6 +2259,8 @@ fn do_build(source_path: Str, output_path: Str, c_path: Str, debug_mode: Int, re
     let used_deps = detect_native_deps(c_source)
     let ffi_libs = detect_ffi_libs(c_source)
     let compiler_archive = compiler_archive_of_unit(c_source)
+    // A test binary's main runs the tests, so only a program build reads the entry point.
+    let link = test_build || compiled.entry.has_main
 
     let vrc = validate_build_deps(ffi_libs, targets)
     if vrc != 0 {
@@ -2130,9 +2293,13 @@ fn do_build(source_path: Str, output_path: Str, c_path: Str, debug_mode: Int, re
             Some(f) => f
             None => return 1
         }
-        let lrc = do_link_target(output_path, c_path, c_source, link_flags, obj_files, inc_flags, debug_mode, release_mode, target, compiler_archive, test_build, compiled.ffi_note)
+        let lrc = do_link_target(output_path, c_path, c_source, link_flags, obj_files, inc_flags, debug_mode, release_mode, target, compiler_archive, test_build, compiled.ffi_note, link)
         if lrc != 0 {
             return lrc
+        }
+        if !link {
+            report_no_entry_build(status_mode, no_entry_help(compiled.entry, source_path))
+            return 0
         }
         if status_mode == BUILD_STATUS_JSON {
             io.println("\{\"status\":\"ok\",\"output\":\"{output_path}\"}")
@@ -2147,7 +2314,7 @@ fn do_build(source_path: Str, output_path: Str, c_path: Str, debug_mode: Int, re
         Some(f) => f
         None => return 1
     }
-    if status_mode == BUILD_STATUS_JSON {
+    if link && status_mode == BUILD_STATUS_JSON {
         io.print_raw("\{\"status\":\"ok\",\"outputs\":[")
     }
     let mut i = 0
@@ -2161,9 +2328,13 @@ fn do_build(source_path: Str, output_path: Str, c_path: Str, debug_mode: Int, re
         }
         let out = "{output_path}-{alias}"
         let _ = fs.delete(out)
-        let lrc = do_link_target(out, c_path, c_source, link_flags, obj_files, inc_flags, debug_mode, release_mode, triple, compiler_archive, test_build, compiled.ffi_note)
+        let lrc = do_link_target(out, c_path, c_source, link_flags, obj_files, inc_flags, debug_mode, release_mode, triple, compiler_archive, test_build, compiled.ffi_note, link)
         if lrc != 0 {
             return lrc
+        }
+        if !link {
+            i = i + 1
+            continue
         }
         if status_mode == BUILD_STATUS_JSON {
             if i > 0 {
@@ -2174,6 +2345,10 @@ fn do_build(source_path: Str, output_path: Str, c_path: Str, debug_mode: Int, re
             io.println("built: {out}")
         }
         i = i + 1
+    }
+    if !link {
+        report_no_entry_build(status_mode, no_entry_help(compiled.entry, source_path))
+        return 0
     }
     if status_mode == BUILD_STATUS_JSON {
         io.println("]}")
@@ -2406,6 +2581,7 @@ type CompiledUnits {
     headers: List[ForeignHeader]
     // Made while the checked program is at hand: the C compile that may need it runs later.
     ffi_note: Str
+    entry: EntryMain
 }
 
 // A build reuses or records units only when the emit would print nothing: no trace but the
@@ -2464,7 +2640,7 @@ fn do_compile_units(source_path: Str, dir: Str, last_dir: Str, debug_mode: Int, 
                 }
                 let wrc = units_flush_warnings(strict_mode)
                 if wrc != 0 { return Err(wrc) }
-                return Ok(CompiledUnits { units: r.units, inputs: inputs, shas: Some(r.shas), recordable: true, order: r.order, header_keys: r.header_keys, entry_key: r.entry_key, foreign: foreign, headers: foreign_headers_in(program), ffi_note: own_ffi_note(program) })
+                return Ok(CompiledUnits { units: r.units, inputs: inputs, shas: Some(r.shas), recordable: true, order: r.order, header_keys: r.header_keys, entry_key: r.entry_key, foreign: foreign, headers: foreign_headers_in(program), ffi_note: own_ffi_note(program), entry: entry_main_of(program) })
             }
             None => {}
         }
@@ -2618,7 +2794,7 @@ fn do_compile_units(source_path: Str, dir: Str, last_dir: Str, debug_mode: Int, 
     let recordable = diag_entry_count() == entries_before && diag_ice_count == ice_before
     let wrc = units_flush_warnings(strict_mode)
     if wrc != 0 { return Err(wrc) }
-    Ok(CompiledUnits { units: out, inputs: inputs, shas: shas, recordable: recordable, order: hs.order.join(","), header_keys: hs.keys, entry_key: entry_key, foreign: foreign, headers: foreign_headers_in(program), ffi_note: own_ffi_note(program) })
+    Ok(CompiledUnits { units: out, inputs: inputs, shas: shas, recordable: recordable, order: hs.order.join(","), header_keys: hs.keys, entry_key: entry_key, foreign: foreign, headers: foreign_headers_in(program), ffi_note: own_ffi_note(program), entry: entry_main_of(program) })
 }
 
 // BLINK_EMIT_REUSE_VERIFY=1 makes each per-module build emit the whole program again and fail
@@ -2875,7 +3051,7 @@ fn do_build_units(source_path: Str, output_path: Str, debug_mode: Int, release_m
     if shas.is_none() && cg_obj_cache_enabled != 0 && build_objcache.cache_enabled() {
         shas = build_objcache.unit_file_shas(work, resolve_archive_dir())
     }
-    let rc = link_units_all_targets(source_path, output_path, work, units_dir, compiled.units, compiled.foreign, compiled.headers, compiled.ffi_note, shas, debug_mode, release_mode, targets, status_mode, unit_jobs, test_build)
+    let rc = link_units_all_targets(source_path, output_path, work, units_dir, compiled.units, compiled.foreign, compiled.headers, compiled.ffi_note, compiled.entry, shas, debug_mode, release_mode, targets, status_mode, unit_jobs, test_build)
     // Written last, and into the directory that replaces units_dir only after this: a build
     // that stops before here leaves the last record beside the files it describes.
     if rc == 0 && compiled.inputs != "" && compiled.recordable {
@@ -2898,7 +3074,7 @@ fn do_build_units(source_path: Str, output_path: Str, debug_mode: Int, release_m
     rc
 }
 
-fn link_units_all_targets(source_path: Str, output_path: Str, work: Str, units_dir: Str, units: List[emit_record.EmittedUnit], foreign: List[ForeignConst], headers: List[ForeignHeader], ffi_note: Str, shas: Option[Map[Str, Str]], debug_mode: Int, release_mode: Int, targets: List[Str], status_mode: Int, unit_jobs: Int, test_build: Bool) -> Int ! Diag.Report, IO, FS.Write, FS.Read, FS.Delete, Process.Spawn, Env.Exit, Env.Read, Time.Read {
+fn link_units_all_targets(source_path: Str, output_path: Str, work: Str, units_dir: Str, units: List[emit_record.EmittedUnit], foreign: List[ForeignConst], headers: List[ForeignHeader], ffi_note: Str, entry: EntryMain, shas: Option[Map[Str, Str]], debug_mode: Int, release_mode: Int, targets: List[Str], status_mode: Int, unit_jobs: Int, test_build: Bool) -> Int ! Diag.Report, IO, FS.Write, FS.Read, FS.Delete, Process.Spawn, Env.Exit, Env.Read, Time.Read {
     // The scans below read what the one-unit build reads from its single C file: each unit
     // and each header a unit includes, which is all cc compiles. A marker the scans look
     // for starts a line, so each file starts one.
@@ -2916,6 +3092,8 @@ fn link_units_all_targets(source_path: Str, output_path: Str, work: Str, units_d
         }
     }
     let c_source = c_parts.join("\n")
+    // A test binary's main runs the tests, so only a program build reads the entry point.
+    let link = test_build || entry.has_main
     let has_async = detect_async(build_fs.read_or_empty(source_path))
     let used_deps = detect_native_deps(c_source)
     let ffi_libs = detect_ffi_libs(c_source)
@@ -2946,9 +3124,13 @@ fn link_units_all_targets(source_path: Str, output_path: Str, work: Str, units_d
             Some(f) => f
             None => return 1
         }
-        let lrc = link_units(output_path, work, units_dir, units, shas, link_flags, obj_files, inc_flags, debug_mode, release_mode, target, unit_jobs, test_build, ffi_note)
+        let lrc = link_units(output_path, work, units_dir, units, shas, link_flags, obj_files, inc_flags, debug_mode, release_mode, target, unit_jobs, test_build, ffi_note, link)
         if lrc != 0 {
             return lrc
+        }
+        if !link {
+            report_no_entry_build(status_mode, no_entry_help(entry, source_path))
+            return 0
         }
         if status_mode == BUILD_STATUS_JSON {
             io.println("\{\"status\":\"ok\",\"output\":\"{output_path}\"}")
@@ -2962,7 +3144,7 @@ fn link_units_all_targets(source_path: Str, output_path: Str, work: Str, units_d
         Some(f) => f
         None => return 1
     }
-    if status_mode == BUILD_STATUS_JSON {
+    if link && status_mode == BUILD_STATUS_JSON {
         io.print_raw("\{\"status\":\"ok\",\"outputs\":[")
     }
     let mut i = 0
@@ -2976,9 +3158,13 @@ fn link_units_all_targets(source_path: Str, output_path: Str, work: Str, units_d
         }
         let out = "{output_path}-{alias}"
         let _ = fs.delete(out)
-        let lrc = link_units(out, work, units_dir, units, shas, link_flags, obj_files, inc_flags, debug_mode, release_mode, triple, unit_jobs, test_build, ffi_note)
+        let lrc = link_units(out, work, units_dir, units, shas, link_flags, obj_files, inc_flags, debug_mode, release_mode, triple, unit_jobs, test_build, ffi_note, link)
         if lrc != 0 {
             return lrc
+        }
+        if !link {
+            i = i + 1
+            continue
         }
         if status_mode == BUILD_STATUS_JSON {
             if i > 0 {
@@ -2989,6 +3175,10 @@ fn link_units_all_targets(source_path: Str, output_path: Str, work: Str, units_d
             io.println("built: {out}")
         }
         i = i + 1
+    }
+    if !link {
+        report_no_entry_build(status_mode, no_entry_help(entry, source_path))
+        return 0
     }
     if status_mode == BUILD_STATUS_JSON {
         io.println("]}")
@@ -3239,14 +3429,15 @@ fn cc_is_clang() -> Bool ! IO, Process.Spawn {
 
 // Compiles the units the cache cannot answer, largest first, then links every unit's object
 // against the archive.
-fn link_units(out: Str, work: Str, units_dir: Str, units: List[emit_record.EmittedUnit], shas: Option[Map[Str, Str]], link_flags: Str, obj_files: List[Str], include_flags: Str, debug_mode: Int, release_mode: Int, target: Str, unit_jobs: Int, test_build: Bool, ffi_note: Str) -> Int ! Diag.Report, IO, FS.Write, FS.Read, FS.Delete, Process.Spawn, Env.Exit, Env.Read, Time.Read {
+fn link_units(out: Str, work: Str, units_dir: Str, units: List[emit_record.EmittedUnit], shas: Option[Map[Str, Str]], link_flags: Str, obj_files: List[Str], include_flags: Str, debug_mode: Int, release_mode: Int, target: Str, unit_jobs: Int, test_build: Bool, ffi_note: Str, link: Bool) -> Int ! Diag.Report, IO, FS.Write, FS.Read, FS.Delete, Process.Spawn, Env.Exit, Env.Read, Time.Read {
     let arc_dir = resolve_archive_dir()
     let vrc = verify_installed_archive(arc_dir)
     if vrc != 0 {
         return vrc
     }
-    let std_archive = ensure_target_archive(arc_dir, target)
-    if std_archive == "" {
+    // A build with no link reads only the archive's header, so it does not build the archive.
+    let std_archive = if link { ensure_target_archive(arc_dir, target) } else { "" }
+    if link && std_archive == "" {
         return 1
     }
     // Each file of a unit compiles to an object of its own, cached on its own.
@@ -3505,7 +3696,8 @@ fn link_units(out: Str, work: Str, units_dir: Str, units: List[emit_record.Emitt
     if build_objcache.dev_evict_at("link") {
         trace.log("blink.build.units", "dev evict link")
     }
-    let ran = run_cc_step("-o {out} {link_objs.join(" ")}{incl} -I{arc_dir} {std_archive} -Wl,--gc-sections {effective_link_flags}", debug_mode, release_mode, target, test_build)
+    // A program with no `fn main` compiles its units and links nothing (§6.7.7).
+    let ran = if link { run_cc_step("-o {out} {link_objs.join(" ")}{incl} -I{arc_dir} {std_archive} -Wl,--gc-sections {effective_link_flags}", debug_mode, release_mode, target, test_build) } else { CcRun { rc: 0, output: "" } }
     if finish_pch(run) {
         stored = true
     }
@@ -4752,6 +4944,7 @@ fn cmd_run(p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Repor
         io.eprintln(bad_trace)
         env.exit(2)
     }
+    exit_if_run_has_no_entry(a)
     let trace_note = run_trace_env_note(a)
     if trace_note != "" { io.eprintln(trace_note) }
     if build_through_daemon(a, "run") {

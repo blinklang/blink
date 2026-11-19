@@ -33,8 +33,11 @@
 # Verdict of one program:
 #   check 1                          not judged, named in the summary
 #   check other than 0 or 1          red: the check did not run clean
-#   build 0 and an executable output ok
-#   build 0 and no such output       red: exit 0 must mean a binary
+#   build 0 and an executable output ok, unless the build printed the
+#                                    no-main note: then red
+#   build 0, the no-main note and no
+#     output                         ok as a library (§6.7.7)
+#   build 0, no note and no output   red: exit 0 must mean a binary or the note
 #   build 1, each error in §6.7.3,
 #     and the program has a C side   outside cause, not red
 #   build 1, any other error         red, labelled apart from an ICE: §6.7.1
@@ -143,10 +146,14 @@ judge_one() {
         "$CHECK_CLEAN_CAPPED" --child --timeout "$CHECK_CLEAN_BUILD_LIMIT" "$CHECK_CLEAN_BLINKBIN" build -o "$w/out" "$entry" > "$w/b.out" 2>&1
         b=$?
         if [ "$b" = 0 ]; then
-            if [ -f "$w/out" ] && [ -x "$w/out" ]; then
+            if [ -e "$w/out" ] && has_no_main_note "$w/b.out"; then
+                printf '%s\tfailed\tbuild exit 0 printed the no-main note and wrote an output\n' "$path"
+            elif [ -f "$w/out" ] && [ -x "$w/out" ]; then
                 printf '%s\tbuilt\t\n' "$path"
+            elif has_no_main_note "$w/b.out"; then
+                printf '%s\tlibrary\t\n' "$path"
             else
-                printf '%s\tfailed\tbuild exit 0, no executable output\n' "$path"
+                printf '%s\tfailed\tbuild exit 0, no executable output and no no-main note\n' "$path"
             fi
         elif [ "$b" = 1 ]; then
             if is_outside "$w/b.out" && has_c_side "$path"; then
@@ -160,6 +167,7 @@ judge_one() {
     fi
     cd / && rm -rf "$w"
 }
+has_no_main_note() { grep -qxF 'note: no fn main; compiled as a library, no binary written' "$1"; }
 error_names() { sed -n 's/^error\[\([A-Za-z0-9_]*\)\].*/\1/p' "$1" | LC_ALL=C sort -u; }
 # Each error line must carry a §6.7.3 name. A line in another form, or a link
 # failure on a symbol the compiler owns, is not a cause on the host.
@@ -185,7 +193,7 @@ first_stop() {
     [ -n "$line" ] || line=$(tail -n 1 "$1")
     printf '%s' "$line" | cut -c1-200
 }
-export -f judge_one error_names is_outside has_c_side first_stop
+export -f judge_one has_no_main_note error_names is_outside has_c_side first_stop
 export CHECK_CLEAN_WORK="$work" CHECK_CLEAN_CAPPED="$capped" CHECK_CLEAN_BLINKBIN="$blink" CHECK_CLEAN_TREE="$root"
 export CHECK_CLEAN_BUILD_LIMIT="${CHECK_CLEAN_BUILD_LIMIT:-300}"
 
@@ -227,7 +235,7 @@ fi
 LC_ALL=C sort -o "$work/results" "$work/results"
 
 fail=0
-built=0 known=0 outside=0
+built=0 library=0 known=0 outside=0
 rejected=""
 stale() {
     if [ -n "$want" ]; then
@@ -246,6 +254,10 @@ while IFS=$'\t' read -r path verdict detail; do
         built)
             built=$((built + 1))
             stale "it builds now"
+            ;;
+        library)
+            library=$((library + 1))
+            stale "it builds now as a library with no fn main"
             ;;
         rejected)
             rejected="$rejected ${path#tests/check_clean/}"
@@ -279,14 +291,14 @@ for path in $(cut -f1 "$work/listed" | LC_ALL=C comm -23 - "$work/programs"); do
     fail=1
 done
 
-judged=$((built + known + outside))
+judged=$((built + library + known + outside))
 secs=$(printf '%.1f' "$(echo "$(date +%s.%N) - $start" | bc)")
 [ -n "$rejected" ] && echo "check-clean: not judged, check rejects:$rejected"
 if [ "$judged" = 0 ]; then
     echo "check-clean: no program passed check, so the row judged nothing" >&2
     exit 2
 fi
-summary="$judged judged: $built built, $known listed, $outside outside cause; $(wc -w <<< "$rejected") not judged; ${secs}s"
+summary="$judged judged: $built built, $library library, $known listed, $outside outside cause; $(wc -w <<< "$rejected") not judged; ${secs}s"
 if [ "$fail" -ne 0 ]; then
     echo "check-clean: FAIL ($summary)"
     exit 1

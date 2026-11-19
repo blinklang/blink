@@ -1681,6 +1681,18 @@ Run `blink doc --list` to list available modules.
 ```sh
 build/blink build src/main.bl     # compile to build/main
 build/blink run src/main.bl       # compile + run
+
+# The entry point is a top-level `fn main` in the file you name (§6.7.7). A `main` in an
+# imported module, or a method named `main`, is not it. With no entry point:
+#   build compiles every module, writes no binary (and removes an old one at the output
+#   path), prints `note: no fn main; compiled as a library, no binary written` on stderr
+#   and exits 0. --strict does not change that.
+#   run stops before the compile with `error: no fn main in x.bl; nothing to run`, exit 2.
+#   Both add `help: did you mean \`main\`?` when a top-level fn is one edit from `main`
+#   (`mian`, `Main`, `amin`, `mains`). check and test do not change.
+#   build --json writes the note on stderr, as every build diagnostic, one line {"severity":"note","kind":"no_entry_point",
+#   "message":...,"help":...}; stdout gets {"status":"ok"} with no "output". run --json writes
+#   {"usage_error":{"kind":"no_entry_point","message":...,"help":...}} on stdout.
 build/blink test                    # discover + run all test blocks
 # `blink test` makes the test build. No other command makes one, so every other build,
 # with any option, leaves out `test` blocks. Every build still typechecks each test body.
