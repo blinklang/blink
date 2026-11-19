@@ -21,14 +21,18 @@ fail=0
 R="$WORK/root"
 mkdir -p "$R/scripts" "$R/tests" "$R/lib/std" "$R/fake"
 mkdir -p "$R/tests/fmt"
-cp scripts/capped.sh scripts/run_fmt_semantic.sh scripts/run_fmt_idempotent.sh scripts/run_fmt_golden.sh "$R/scripts/"
+cp scripts/capped.sh scripts/cc_unit.sh scripts/run_fmt_semantic.sh scripts/run_fmt_idempotent.sh scripts/run_fmt_golden.sh "$R/scripts/"
 
 # The fake formatter turns SELFTEST_FMT_BREAKS_RUN into SELFTEST_FAILS and adds
 # a line, so line numbers in the formatted copy differ from the original. It
 # aborts on SELFTEST_FMT_ABORTS, and turns SELFTEST_FMT_OUTPUT_ABORTS into
 # SELFTEST_FMT_ABORTS, so the second pass of the idempotency check aborts.
+# The fake C takes no guard flags, so --build-probe-flags prints none; the usage text names the
+# flag, as cc_unit.sh checks for it.
 cat > "$R/fake/blinkc" <<'EOF'
 #!/bin/bash
+[ $# -eq 0 ] && { echo "usage: blinkc [--build-probe-flags <c> <cc words>] <in> <out>"; exit 1; }
+[ "$1" = "--build-probe-flags" ] && exit 0
 if [ "$3" = "--emit" ]; then
     grep -q SELFTEST_FMT_HANGS "$1" && exec sleep 30
     grep -q SELFTEST_FMT_ABORTS "$1" && exit 101

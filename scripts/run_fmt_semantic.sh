@@ -86,18 +86,21 @@ if ! blinkc_ok "$f" "$orig_c"; then
 fi
 
 # cc_ok <c file> <binary>
+# cc_unit.sh gives the C the -D flags that blink build gives it; a bare cc keeps each guarded
+# foreign prototype, which then conflicts with the header's own declaration.
+cc_unit="$(dirname "$0")/cc_unit.sh"
 if [ "$use_archive" = 1 ]; then
   # monolith.o is built with BLINK_USE_SQLITE=1 and pulls in curl-using stdlib
   # paths, so it has undefined refs to sqlite3_*/curl_* whenever a fixture
   # touches those symbols. --gc-sections drops the unreferenced ones; the rest
   # need real libs. Always linking both is cheaper than scanning fixtures.
-  cc_ok() { child cc -o "$2" "$1" -Ibuild "$archive_a" -lm -lgc -lsqlite3 -lcurl -pthread -Wl,--gc-sections; }
+  cc_ok() { child "$cc_unit" "$blinkc" cc -Ibuild -- "$1" -- -o "$2" "$archive_a" -lm -lgc -lsqlite3 -lcurl -pthread -Wl,--gc-sections; }
 else
   cc_ok() {
     link_flags="-lm -lgc"
     grep -q BLINK_USE_CURL "$1" && link_flags="$link_flags -lcurl"
     grep -q BLINK_USE_SQLITE "$1" && link_flags="$link_flags -lsqlite3"
-    child cc -o "$2" "$1" -I bootstrap $link_flags
+    child "$cc_unit" "$blinkc" cc -I bootstrap -- "$1" -- -o "$2" $link_flags
   }
 fi
 if ! cc_ok "$fmt_c" "$fmt_bin" || ! cc_ok "$orig_c" "$orig_bin"; then

@@ -64,8 +64,8 @@ echo "Self-compiling blinkc (Gen 1)..."
 "$GEN0_BLINKC" --link-archive "$BUILD_DIR/libblink_std.h" \
     "$ROOT_DIR/src/blinkc_main.bl" "$BUILD_DIR/blinkc_gen1.c"
 . "$ROOT_DIR/scripts/link_opt.sh"
-cc $BLINK_LINK_OPT $BLINK_SRC_CFLAGS -o "$BUILD_DIR/blinkc_gen1" "$BUILD_DIR/blinkc_gen1.c" \
-    -I"$BUILD_DIR" "$BUILD_DIR/libblink_std.a" -lm -lgc -pthread -Wl,--gc-sections
+"$ROOT_DIR/scripts/cc_unit.sh" "$GEN0_BLINKC" cc $BLINK_LINK_OPT -I"$BUILD_DIR" -- "$BUILD_DIR/blinkc_gen1.c" -- \
+    -o "$BUILD_DIR/blinkc_gen1" "$BUILD_DIR/libblink_std.a" -lm -lgc -pthread -Wl,--gc-sections
 
 echo "Self-compiling blinkc (Gen 2)..."
 "$BUILD_DIR/blinkc_gen1" --link-archive "$BUILD_DIR/libblink_std.h" \

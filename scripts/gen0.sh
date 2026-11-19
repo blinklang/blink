@@ -145,11 +145,27 @@ echo "gen0: bootstrapping $TAG @ $TAG_SHORT in $WT"
 stamp_version() {
     "$ROOT_DIR/scripts/stamp_cli_version.sh" "$1" "$STAMP"
 }
-# The tag's C goes through main's cc lines, so it takes main's src flags. A tag that guards
-# no `link` prototype ignores them.
-. "$ROOT_DIR/scripts/link_opt.sh"
+# Every C file below comes from the tag's build/blinkc, so that blinkc says which -D flags
+# the C needs. A blinkc whose usage text names --build-probe-flags (gen0-29 and later) gives
+# them through cc_unit.sh. An older blinkc cannot; its C takes the BLINK_SRC_CFLAGS of the
+# tag's own scripts/link_opt.sh, if that file sets it.
+if build/blinkc 2>&1 | grep -q -- --build-probe-flags; then
+    unit_cc() {
+        out="$1"; c="$2"; shift 2
+        "$ROOT_DIR/scripts/cc_unit.sh" build/blinkc cc -Ibuild -- "$c" -- -o "$out" "$@"
+    }
+else
+    tag_src_cflags=""
+    if [ -f scripts/link_opt.sh ]; then
+        tag_src_cflags=$(BLINK_SRC_CFLAGS="" && . ./scripts/link_opt.sh && printf '%s' "${BLINK_SRC_CFLAGS:-}")
+    fi
+    unit_cc() {
+        out="$1"; c="$2"; shift 2
+        cc $tag_src_cflags -Ibuild -o "$out" "$c" "$@"
+    }
+fi
 link_archived() {
-    cc $BLINK_SRC_CFLAGS -o "$1" "$2" -Ibuild build/libblink_std.a -lm -lgc -pthread -Wl,--gc-sections
+    unit_cc "$1" "$2" build/libblink_std.a -lm -lgc -pthread -Wl,--gc-sections
 }
 
 # bootstrap.sh leaves a stdlib archive from the SEED compiler and a blinkc
@@ -163,7 +179,7 @@ link_archived() {
 echo "gen0: building CLI from the tag"
 build/blinkc src/cli.bl build/cli.c
 stamp_version build/cli.c
-cc $BLINK_SRC_CFLAGS -o build/blink build/cli.c -lm -lgc
+unit_cc build/blink build/cli.c -lm -lgc
 echo "gen0: building the stdlib archive with the tag's compiler"
 BLINK_FORCE_STDLIB_REBUILD=1 build/blink __build-stdlib-archive
 build/blinkc --link-archive build/libblink_std.h src/blinkc_main.bl build/blinkc.c

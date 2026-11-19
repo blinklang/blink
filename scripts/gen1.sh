@@ -95,8 +95,8 @@ cc -flto="$lto_jobs" -o "$lto_probe/p" "$lto_probe/p.c" > /dev/null 2>&1 && lto=
 rm -rf "$lto_probe"
 # link_bin <binary> <c file>
 link_bin() {
-    if ! cc $BLINK_GEN1_LINK_OPT $BLINK_SRC_CFLAGS $lto -o "$out/bin/$1" "$out/$2" -I"$out/share/blink" "$archive_a" \
-            -lm -lgc -pthread -Wl,--gc-sections > "$out/link-$1.log" 2>&1; then
+    if ! scripts/cc_unit.sh "$gen0/blinkc" cc $BLINK_GEN1_LINK_OPT $lto -I"$out/share/blink" -- "$out/$2" -- \
+            -o "$out/bin/$1" "$archive_a" -lm -lgc -pthread -Wl,--gc-sections > "$out/link-$1.log" 2>&1; then
         echo "gen1: FAIL cc could not link $out/bin/$1; see $out/link-$1.log"
         head -20 "$out/link-$1.log"
         exit 1

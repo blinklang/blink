@@ -126,11 +126,12 @@ for o in "$root"/build/corpus/native/*.o; do
     [ -f "$o" ] || continue
     cp -pl "$o" "$work/build/native-cache/" 2>/dev/null || cp -p "$o" "$work/build/native-cache/"
 done
-# bootstrap/ is for tests that drive cc over the runtime headers directly, and
-# the llms docs for tests that hold the doc examples to what the compiler does.
+# bootstrap/ is for tests that drive cc over the runtime headers directly,
+# scripts/ for tests that drive the build's own scripts, and the llms docs for
+# tests that hold the doc examples to what the compiler does.
 # The spec is not linked: it leads the compiler, so no test may hold the
 # compiler to its text.
-for d in tests src lib bootstrap llms.md llms-full.md blink.toml; do
+for d in tests src lib bootstrap scripts llms.md llms-full.md blink.toml; do
     [ -e "$root/$d" ] && ln -s "$root/$d" "$work/$d"
 done
 # src/cli.bl embeds ../build/gc_unity.c; corpus.sh generates it once.

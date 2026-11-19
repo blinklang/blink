@@ -1,0 +1,132 @@
+// A cc line written by hand, as in the compiler's own build scripts, compiles C that blinkc
+// emitted through scripts/cc_unit.sh. The script asks `blinkc --build-probe-flags` for each C
+// file's flags under the same compiler words, then compiles with them. The C here has the
+// form blinkc emits: each foreign prototype sits inside `#ifndef BLINK_DECLARED_<sym>`, and
+// it conflicts with the header's own declaration unless the flag drops it.
+import compile_test_helpers
+import std.process.{ChildEnd, ProcessResult, ChildLimits}
+import std.time.{Duration}
+
+fn sh(cmd: Str) -> ProcessResult ! Process.Spawn {
+    process.run("sh", ["-c", cmd], limits: ChildLimits { timeout: Some(Duration.seconds(300)) }).unwrap()
+}
+
+fn diag(r: ProcessResult) -> Str {
+    "exit {r.end}\nstdout:\n{r.out}\nstderr:\n{r.err_out}"
+}
+
+// unistd.h declares `int link(const char *, const char *)`, and inc/count.h, found only
+// through -I, declares `count_of`. Both guarded prototypes conflict with those.
+let HEADER_UNIT = #"#include <unistd.h>
+#include "count.h"
+#ifndef BLINK_DECLARED_link
+int link(void *, void *);
+#endif
+#ifndef BLINK_DECLARED_count_of
+long long count_of(void *);
+#endif
+int count_of(const char *s) { int n = 0; while (s[n]) n++; return n; }
+int header_unit(void) { return link("/no-such-a", "/no-such-b") + count_of("abc"); }
+"#
+
+// No header here declares link, so this unit needs its own prototype: a flag that drops it
+// leaves the call with no declaration.
+let BARE_UNIT = #"#include <stdio.h>
+#ifndef BLINK_DECLARED_link
+int link(void *, void *);
+#endif
+int header_unit(void);
+int main(void) {
+    printf("%d %d\n", header_unit(), link("/no-such-c", "/no-such-d"));
+    return 0;
+}
+"#
+
+fn project() -> Str ! FS.Write, Process.Spawn, Env.Read {
+    let root = compile_test_helpers.scratch_root()
+    let dir = sh("mkdir -p {root} && mktemp -d {root}/blink_cc_unit.XXXXXX").out.trim()
+    let _ = sh("mkdir -p {dir}/inc")
+    fs.write("{dir}/inc/count.h", "int count_of(const char *s);\n").unwrap()
+    fs.write("{dir}/header_unit.c", HEADER_UNIT).unwrap()
+    fs.write("{dir}/bare_unit.c", BARE_UNIT).unwrap()
+    fs.write("{dir}/one.c", HEADER_UNIT.concat("int main(void) \{ return header_unit() == 2 ? 0 : 1; }\n")).unwrap()
+    dir
+}
+
+fn cc_unit(args: Str) -> ProcessResult ! Process.Spawn {
+    sh("scripts/cc_unit.sh $(pwd)/build/blinkc {args}")
+}
+
+test "a plain cc of the guarded C fails on the conflicting prototype" {
+    let dir = project()
+    let r = sh("cd {dir} && cc -pipe -Iinc -o one one.c")
+    let _ = sh("rm -rf {dir}")
+    assert(r.end != ChildEnd.Exited(0), "the test C must need the flags: {diag(r)}")
+    assert(r.err_out.contains("conflicting types"), diag(r))
+}
+
+test "cc_unit builds one C file with the flags its includes call for" {
+    let dir = project()
+    let r = cc_unit("cc -pipe -I{dir}/inc -- {dir}/one.c -- -o {dir}/one")
+    let run = sh("{dir}/one")
+    let _ = sh("rm -rf {dir}")
+    assert_eq(r.end, ChildEnd.Exited(0), diag(r))
+    assert_eq(run.end, ChildEnd.Exited(0), "run: {diag(run)}")
+}
+
+test "cc_unit gives each of two C files its own flags" {
+    let dir = project()
+    let r = cc_unit("cc -pipe -I{dir}/inc -- {dir}/header_unit.c {dir}/bare_unit.c -- -o {dir}/two")
+    let run = sh("{dir}/two")
+    let _ = sh("rm -rf {dir}")
+    assert_eq(r.end, ChildEnd.Exited(0), diag(r))
+    assert_eq(run.out.trim(), "2 -1", "run: {diag(run)}")
+}
+
+test "cc_unit stops before the compile when the probe refuses a cflag" {
+    let dir = project()
+    let r = cc_unit("cc -pipe -fdiagnostics-color=always -I{dir}/inc -- {dir}/one.c -- -o {dir}/one")
+    let made = sh("test -e {dir}/one")
+    let _ = sh("rm -rf {dir}")
+    assert_eq(r.end, ChildEnd.Exited(1), diag(r))
+    assert(r.err_out.contains("-fdiagnostics-color=always"), diag(r))
+    assert(made.end != ChildEnd.Exited(0), "cc_unit compiled with no probe flags: {diag(r)}")
+}
+
+test "cc_unit stops before the compile when the probe cannot run the C compiler" {
+    let dir = project()
+    let r = cc_unit("no-such-cc-for-cc-unit -I{dir}/inc -- {dir}/one.c -- -o {dir}/one")
+    let made = sh("test -e {dir}/one")
+    let _ = sh("rm -rf {dir}")
+    assert_eq(r.end, ChildEnd.Exited(1), diag(r))
+    assert(r.err_out.contains("no-such-cc-for-cc-unit"), diag(r))
+    assert(made.end != ChildEnd.Exited(0), diag(r))
+}
+
+test "cc_unit refuses a command line with no C file" {
+    let r = cc_unit("cc -pipe -- -- -o /tmp/blink_cc_unit_no_file")
+    assert_eq(r.end, ChildEnd.Exited(2), diag(r))
+    assert(r.err_out.contains("usage"), diag(r))
+}
+
+// A blinkc from before gen0-29 has no --build-probe-flags. Its usage text says so, and
+// cc_unit.sh must name the pin it needs, not compile the C with no flags.
+test "cc_unit refuses a blinkc with no --build-probe-flags and names gen0-29" {
+    let dir = project()
+    fs.write("{dir}/old_blinkc", "#!/bin/sh\necho 'Usage: blinkc <source.bl> [output.c]' >&2\nexit 1\n").unwrap()
+    let _ = sh("chmod +x {dir}/old_blinkc")
+    let r = sh("scripts/cc_unit.sh {dir}/old_blinkc cc -pipe -I{dir}/inc -- {dir}/one.c -- -o {dir}/one")
+    let made = sh("test -e {dir}/one")
+    let _ = sh("rm -rf {dir}")
+    assert_eq(r.end, ChildEnd.Exited(1), diag(r))
+    assert(r.err_out.contains("gen0-29"), diag(r))
+    assert(made.end != ChildEnd.Exited(0), diag(r))
+}
+
+test "cc_unit says so when the blinkc path names no executable file" {
+    let dir = project()
+    let r = sh("scripts/cc_unit.sh {dir}/no_such_blinkc cc -pipe -- {dir}/one.c -- -o {dir}/one")
+    let _ = sh("rm -rf {dir}")
+    assert_eq(r.end, ChildEnd.Exited(1), diag(r))
+    assert(r.err_out.contains("no_such_blinkc is not an executable file"), diag(r))
+}
