@@ -1,0 +1,127 @@
+// In a trait default body `Self` is abstract: the trait does not know the fields or the
+// variants of the type that implements it (sections/03_types.md, `Self` as the head of a value
+// path or a pattern). So a build form or a pattern that `Self` heads is SelfShapeInDefaultBody
+// (E0570), with one error at the `Self` token and no second error after it. A static call
+// `Self.f()` follows the guarantee set: legal when the trait declares `f`, else E0305.
+//
+// The traits here have no impl: an impl must write each default method today, and these
+// rows test only the check of the default body at the trait.
+
+import std.fs
+import compiler.{compile_to_program}
+import typecheck.{check_types, TypeCheck}
+import diagnostics.{diag_entries, diag_reset, Diag}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+import lexer.{Lex}
+import parser.{Parse}
+
+fn typecheck_probe(path: Str, src: Str) ! FS, Env.Exit, Env.Read, IO {
+    with handler Diag {}, handler Lex {}, handler Parse {}, handler TypeCheck {} {
+        init_embedded_stdlib()
+        fs.write(path, src).unwrap()
+        diag_reset()
+        let program = compile_to_program(path, 1)
+        check_types(program)
+        let _ = fs.delete(path)
+    }
+}
+
+// Each error as "name line:col-end: message | help | label | notes", in report order.
+fn errors_of(src: Str) -> List[Str] ! FS, Env.Exit, Env.Read, IO {
+    typecheck_probe("build/test_typecheck_self_shape_in_a_trait_default_body_probe.bl", src)
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" {
+            out.push("{d.name} {d.line}:{d.col}-{d.end_col}: {d.message} | {d.help} | {d.label} | {d.notes.join("; ")}")
+        }
+    }
+    out
+}
+
+fn all_errors(src: Str) -> Str ! FS, Env.Exit, Env.Read, IO {
+    errors_of(src).join(" || ")
+}
+
+// The error E0570 reports at line:col, as errors_of formats it.
+fn refused_at(line: Int, col: Int) -> Str {
+    "SelfShapeInDefaultBody {line}:{col}-{col + 4}: `Self` is abstract in a trait default body | declare `fn make() -> Self` in the trait and call `Self.make()` | `Self` is abstract in a trait default body; it has no fields or variants to build or match | the same form compiles in an impl body, where `Self` is the target type"
+}
+
+// A trait over a fieldless enum shape, with `body` as the default method `go`.
+fn with_default(body: Str) -> Str {
+    "trait Mk \{\n    fn make() -> Self\n{body}\n}\n\nfn main() \{}\n"
+}
+
+test "a payload-less variant build Self.V in a default body is e0570 at Self" {
+    let src = with_default("    fn origin() -> Self \{ Self.Low }")
+    assert_eq(all_errors(src), refused_at(3, 27))
+}
+
+test "a variant build with a payload Self.V(..) in a default body is e0570 at Self" {
+    let src = with_default("    fn high() -> Self \{ Self.High(2) }")
+    assert_eq(all_errors(src), refused_at(3, 25))
+}
+
+test "a struct build with labels in a default body is e0570 at Self" {
+    let src = with_default("    fn pair() -> Self \{ Self \{ x: 0 } }")
+    assert_eq(all_errors(src), refused_at(3, 25))
+}
+
+test "a struct build with no labels in a default body is e0570 at Self" {
+    let src = with_default("    fn blank() -> Self \{ Self \{} }")
+    assert_eq(all_errors(src), refused_at(3, 26))
+}
+
+test "a call of Self in a default body is e0570 at Self" {
+    let src = with_default("    fn wrap() -> Self \{ Self(1) }")
+    assert_eq(all_errors(src), refused_at(3, 25))
+}
+
+test "a Self.V pattern in a default body is e0570 and the match reports nothing more" {
+    let src = with_default("    fn is_low(self) -> Bool \{\n        match self \{\n            Self.Low => true\n            _ => false\n        }\n    }")
+    assert_eq(all_errors(src), refused_at(5, 13))
+}
+
+test "a Self.V(..) pattern in a default body is e0570 and its binder reports nothing more" {
+    let src = with_default("    fn level(self) -> Int \{\n        match self \{\n            Self.High(k) => k + 1\n            _ => 0\n        }\n    }")
+    assert_eq(all_errors(src), refused_at(5, 13))
+}
+
+test "a Self struct pattern in a match of a default body is e0570" {
+    let src = with_default("    fn has_x(self) -> Bool \{\n        match self \{\n            Self \{ x } => x == 0\n        }\n    }")
+    assert_eq(all_errors(src), refused_at(5, 13))
+}
+
+test "a Self build inside a closure of a default body is e0570" {
+    let src = with_default("    fn later() -> Self \{\n        let f = fn() -> Self \{ Self.Low }\n        f()\n    }")
+    assert_eq(all_errors(src), refused_at(4, 32))
+}
+
+test "each Self build in one default body gets its own error" {
+    let src = with_default("    fn both(n: Int) -> Self \{ if n == 0 \{ Self.Low } else \{ Self.High(n) } }")
+    assert_eq(all_errors(src), "{refused_at(3, 43)} || {refused_at(3, 61)}")
+}
+
+test "a static call of a trait fn through Self in a default body is legal" {
+    let src = with_default("    fn twice() -> List[Self] \{ [Self.make(), Self.make()] }")
+    assert_eq(all_errors(src), "")
+}
+
+test "a static call of a fn the trait does not declare is still e0305" {
+    let src = with_default("    fn other() -> Self \{ Self.nope() }")
+    let errors = errors_of(src)
+    assert_eq(errors.len(), 1)
+    assert(errors.get(0).unwrap().starts_with("UnlicensedSelfOperation 3:26"))
+}
+
+test "a Self build in a free fn is still e0569, not e0570" {
+    let src = "fn main() \{\n    let _l = Self.Low\n}\n"
+    let errors = errors_of(src)
+    assert_eq(errors.len(), 1)
+    assert(errors.get(0).unwrap().starts_with("SelfOutsideTraitOrImpl 2:14-18"))
+}
+
+test "a path through an associated type of Self in a default body is no e0570" {
+    let src = "trait Bag \{\n    type Item\n    fn mk(self) -> Self.Item \{ Self.Item.default() }\n}\n\nfn main() \{}\n"
+    for e in errors_of(src) { assert(!e.starts_with("SelfShapeInDefaultBody")) }
+}

@@ -6348,7 +6348,7 @@ impl Mk for Level {
 
 ```
 error[SelfShapeInDefaultBody]: `Self` is abstract in a trait default body
- --> mk.bl:9:30
+ --> mk.bl:9:27
   |
 9 |     fn origin() -> Self { Self.Low }
   |                           ^^^^ `Self` is abstract in a trait default body; it has no fields or variants to build or match

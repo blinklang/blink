@@ -37,7 +37,7 @@ import diagnostics.{
     UNSOLVED_TYPEVAR_AT_CODEGEN, CODEGEN_STAGE_NOT_BUILT, CODEGEN_STAGE_NOT_BUILT_NAME, CALL_NOT_ANSWERED, OPEN_TYPE_AFTER_CHECK, CALL_ROW_UNKNOWN, SEALED_OPS_REWRITE_INVARIANT, VARIANT_WITHOUT_ENUM,
     NO_SUCH_VARIANT, TYPE_ERROR, TEMPLATE_MISMATCH, UNEXPECTED_ANNOTATION, MISSING_RETURN, NO_CONVERSION_IMPL, CANNOT_INFER_TYPE, NOT_ITERABLE, MISSING_ELSE, UNLICENSED_SELF_OP, TRAIT_BOUND_NOT_SATISFIED, CAPABILITY_BUDGET, QM_INVALID_OPERAND, UNDEFINED_FUNCTION,
     UNRESOLVED_METHOD, AMBIGUOUS_METHOD_CALL, MISSING_DISPLAY_IMPL,
-    MUTATION_REQUIRES_MUT, MUT_ON_PATTERN, NOT_A_PLACE, PARAM_ASSIGN, diag_error_label_at_notes, diag_add_note_at_spots_since, diag_error_span_label_at_notes, diag_warn_label_at_notes, EMPTY_ROW_OUTSIDE_FFI, PANIC_HOOK_PLACEMENT, TRACE_MESSAGE_EFFECT, METHOD_THROUGH_TYPE_NAME, ASSOCIATED_FN_THROUGH_TRAIT, SELF_OUTSIDE_TRAIT_OR_IMPL, EFFECTS_ANNOTATION_REMOVED, ANNOTATION_ARGUMENTS, INVALID_RUNTIME_BINDING, UNKNOWN_EFFECT, SUB_EFFECT_AS_TYPE, diag_fix_before_starts_with, diag_drop_fix_over_others, diag_drop_fix_at,
+    MUTATION_REQUIRES_MUT, MUT_ON_PATTERN, NOT_A_PLACE, PARAM_ASSIGN, diag_error_label_at_notes, diag_add_note_at_spots_since, diag_error_span_label_at_notes, diag_warn_label_at_notes, EMPTY_ROW_OUTSIDE_FFI, PANIC_HOOK_PLACEMENT, TRACE_MESSAGE_EFFECT, METHOD_THROUGH_TYPE_NAME, ASSOCIATED_FN_THROUGH_TRAIT, SELF_OUTSIDE_TRAIT_OR_IMPL, SELF_SHAPE_IN_DEFAULT_BODY, EFFECTS_ANNOTATION_REMOVED, ANNOTATION_ARGUMENTS, INVALID_RUNTIME_BINDING, UNKNOWN_EFFECT, SUB_EFFECT_AS_TYPE, diag_fix_before_starts_with, diag_drop_fix_over_others, diag_drop_fix_at,
     UNDEFINED_VARIABLE, UNKNOWN_TYPE, QM_RESULT_IN_NON_RESULT,
     QM_OPTION_IN_NON_OPTION, QM_ERROR_MISMATCH,
     QM_TEST_DISPLAY_REQUIRED, TEST_ANNOTATED_RETURN, SKIP_OUTSIDE_TEST,
@@ -3663,6 +3663,11 @@ type CallFacts {
     infer_at: Int
     // The owner each static call's head names. Its spelling may not say it, as `Self` does not.
     static_owners: Map[Int, Str]
+    // The target each `Self` head of a variant read names, by the head's node. Codegen runs
+    // after the impl is closed, so it reads the target here and not through the name.
+    self_heads: Map[Int, Int]
+    // The build forms and patterns in a trait default body refused as headed by `Self`.
+    self_refused: Set[Int]
     // The static calls whose head means a compiler-known type in the module that writes them.
     // A later pass cannot ask the name again, as a namesake elsewhere shadows it by module.
     builtin_heads: Set[Int]
@@ -3772,7 +3777,7 @@ type UseJudge {
 }
 
 fn new_call_facts() -> CallFacts {
-    CallFacts { open_calls: [], open_group: Map(), open_tids: [], reported: Map(), self_views: Map(), view_sigs: Map(), hash_aliases_above: [], derive_facts_above: [], derive_facts_low: 0, derive_facts_open: [], derive_facts_open_low: Map(), debug_unbuilt_seen: Map(), hash_by_bounds: false, static_head_insts: Map(), static_head_binders: Map(), impl_bound_calls: [], impl_bound_binds: Map(), deferred_uses: [], deferred_use_at: Map(), late_keys: [], late_roots: Map(), late_roots_valid: false, late_refused: Map(), late_open: [], late_replay: -1, late_watch: Map(), late_fixed_at: Map(), infer_at: -1, static_owners: Map(), builtin_heads: Set(), builtin_static_reads: Map(), trait_heads: Map(), closure_expected_at: Map(), ret_ann: -1, missing_else: Map(), walk_returns: [], written_names: Map(), under_fn_type: Map(), method_reads: Map(), method_read_order: [], method_values: Map(), method_value_order: [], impl_binder_key_roles: Map(), key_body: -1, key_binders_reported: Map(), tpl_ctx: [], tpl_lit: [], errored: Map(), answers_after_report: 0, lost_to_error: Map(), row_unknown_at: -1 }
+    CallFacts { open_calls: [], open_group: Map(), open_tids: [], reported: Map(), self_views: Map(), view_sigs: Map(), hash_aliases_above: [], derive_facts_above: [], derive_facts_low: 0, derive_facts_open: [], derive_facts_open_low: Map(), debug_unbuilt_seen: Map(), hash_by_bounds: false, static_head_insts: Map(), static_head_binders: Map(), impl_bound_calls: [], impl_bound_binds: Map(), deferred_uses: [], deferred_use_at: Map(), late_keys: [], late_roots: Map(), late_roots_valid: false, late_refused: Map(), late_open: [], late_replay: -1, late_watch: Map(), late_fixed_at: Map(), infer_at: -1, static_owners: Map(), self_heads: Map(), self_refused: Set(), builtin_heads: Set(), builtin_static_reads: Map(), trait_heads: Map(), closure_expected_at: Map(), ret_ann: -1, missing_else: Map(), walk_returns: [], written_names: Map(), under_fn_type: Map(), method_reads: Map(), method_read_order: [], method_values: Map(), method_value_order: [], impl_binder_key_roles: Map(), key_body: -1, key_binders_reported: Map(), tpl_ctx: [], tpl_lit: [], errored: Map(), answers_after_report: 0, lost_to_error: Map(), row_unknown_at: -1 }
 }
 let mut tc_calls: CallFacts = new_call_facts()
 
@@ -6231,6 +6236,10 @@ fn tc_report_unconstructible_head(stid: Int, sname: Str, node: Int) ! Diag.Repor
     // The declaration that left the head with no type has its own report (E1016, UnknownType),
     // and so does a `Self` outside a trait or impl (E0569).
     if sname == "Self" && tc_current_self_tid == -1 { return }
+    if sname == "Self" && stid >= 0 && tc_type_name(stid) != "" {
+        tc_report_unconstructible_head(stid, tc_self_shown(stid), node)
+        return
+    }
     if tc_type_name_poisoned(sname) || (stid >= 0 && (tc_tid_is_no_info(stid) != 0 || type_kind(stid) == TyKind.Typevar)) { return }
     if stid >= 0 && ffi_opaque_type_set.contains_key(tc_resolve(stid)) {
         diag_error_at("TypeError", TYPE_ERROR, "cannot construct handle `{sname}` outside the FFI boundary", node, "a handle type (`@ffi.opaque`, or a `@runtime` type with no body) has no user-callable constructor; it is produced only at the FFI boundary (section 9.1.4)")
@@ -15039,6 +15048,7 @@ fn tc_alias_target_at(decl: Int, args: List[Int]) -> Int {
 // generic alias its target at open arguments that the value settles, so a value built through
 // `P = Pick[Int, Str]` or `Same[X] = Pick[X, X]` is held to what the alias says of them.
 fn tc_value_head_tid(name: Str) -> Int {
+    if name == "Self" { return tc_self_target_tid() }
     // A binder shadows a type of the same name, and a type parameter has no value head.
     if tc_name_is_tparam_in_scope(name) != 0 { return -1 }
     let named = lookup_named_type(name)
@@ -15046,6 +15056,14 @@ fn tc_value_head_tid(name: Str) -> Int {
     if decl == -1 { return named }
     let target = tc_alias_target_open(decl)
     if target == -1 { named } else { target }
+}
+
+// Whether a variant built through the head `name` is held to the instance the head names, not
+// inferred fresh. An alias names its target at its arguments, and `Self` in an impl body names
+// the target at the impl's own binders, so in `impl[T] .. for Opt[T]` the build `Self.Just(x)`
+// is an `Opt[T]` (§3.6).
+fn tc_head_pins_instance(name: Str) -> Bool {
+    name == "Self" || tc_alias_decl_of_written(name) != -1
 }
 
 fn tc_alias_target_open(decl: Int) -> Int {
@@ -15061,8 +15079,54 @@ fn tc_alias_target_open(decl: Int) -> Int {
 
 // The declared type a head written `name` reaches, through any alias and with no instance's
 // arguments: the tid its variants and its declaration are keyed on.
-pub fn tc_head_decl_tid(name: Str) -> Int {
-    tc_enum_base_tid(resolve_alias_tid(lookup_named_type(name)))
+fn tc_head_decl_tid(name: Str) -> Int {
+    let named = if name == "Self" { tc_self_target_tid() } else { resolve_alias_tid(lookup_named_type(name)) }
+    if named < 0 { -1 } else { tc_enum_base_tid(named) }
+}
+
+// The name an error shows for the head `name`: in an impl body `Self` is shown as the target
+// type, so the error reads as the same text with the type name does.
+fn tc_shown_head(name: Str) -> Str {
+    if name != "Self" { return name }
+    let t = tc_self_target_tid()
+    if t >= 0 && tc_type_name(t) != "" { tc_self_shown(t) } else { name }
+}
+
+// The name an error shows for the target `t` of `Self`: the name the code at hand writes for it,
+// so the text is the one the type name gives (§3.6). Its own module writes the bare name even
+// where another module declares a namesake. Elsewhere it shows as any type does.
+fn tc_self_shown(t: Int) -> Str {
+    let td = tc_tid_decl_node(t)
+    if td >= 0 && tc_same_module(node_module(td), nr_current_module) { node_name(td) } else { tc_tid_shown(t) }
+}
+
+// The declared type the dotted head `obj` reaches, as tc_head_decl_tid does for its name. Codegen
+// runs after the impl that gave `Self` its target is closed, so a `Self` head reads the target
+// that typecheck kept for that node.
+pub fn tc_head_decl_tid_at(obj: Int) -> Int {
+    let name = node_name(obj)
+    if name != "Self" { return tc_head_decl_tid(name) }
+    let st = tc_calls.self_heads.get(obj) ?? -1
+    if st < 0 { -1 } else { tc_enum_base_tid(st) }
+}
+
+// Codegen runs after the impl that gives `Self` its target is closed, so it cannot resolve the
+// name. A variant read `Self.V` reads its target from self_heads. A call `Self.V(..)` returns
+// before the static-call path records its owner, so it is recorded here.
+fn tc_note_self_head(node: Int, obj: Int) {
+    if obj == -1 || node_kind(obj) != NodeKind.Ident || node_name(obj) != "Self" { return }
+    let st = tc_self_target_tid()
+    if st < 0 { return }
+    if node_kind(node) == NodeKind.MethodCall { tc_calls.static_owners.insert(node, tc_static_owner("Self")) } else { tc_calls.self_heads.insert(obj, st) }
+}
+
+// The type `Self` names in an impl body: the target, by its type and not by its name, so a
+// local or a type parameter that has the target's name does not change it (§3.6). In a trait
+// default body `Self` is abstract, and outside a trait or impl it names nothing: both are -1.
+fn tc_self_target_tid() -> Int {
+    if tc_current_self_tid < 0 { return -1 }
+    let st = resolve_alias_tid(tc_current_self_tid)
+    if type_kind(st) == TyKind.Typevar { -1 } else { st }
 }
 
 // Whether the annotation names a generic alias at its arguments. Its resolved tid is already
@@ -19728,10 +19792,10 @@ fn tc_static_head(written: Str) -> StaticHead {
     let q = tc_static_qualifier(written)
     // In an impl, `Self` is an alias of the impl's type (§3c.2), so the call is the one on
     // that type. A trait's default body leaves `Self` a type parameter.
-    if q == "Self" && tc_current_self_tid >= 0 {
-        let st = resolve_alias_tid(tc_current_self_tid)
+    let st = if q == "Self" { tc_self_target_tid() } else { -1 }
+    if st >= 0 {
         let owner = tc_type_name(st)
-        if type_kind(st) != TyKind.Typevar && owner != "" && tc_type_has_receiver(st) {
+        if owner != "" && tc_type_has_receiver(st) {
             let decl = tc_tid_decl_node(st)
             return StaticHead { owner: owner, alias: -1, decl: decl, builtin: decl < 0, inst: st }
         }
@@ -26758,11 +26822,14 @@ type NrWalkContext {
     // True inside a trait declaration or an impl block, the only places `Self` names a type
     // (sections/03_types.md, The `Self` Type).
     in_trait_or_impl: Bool
+    // The target type of the impl being walked, or -1. An error about `Self` names this type,
+    // as the same text with the type name would.
+    self_target: Int
     // The signature parameters MissingParamType refused, so the walk of the body reports
     // nothing more about them.
     untyped_params: Set[Int]
 }
-let mut nr_walk: NrWalkContext = NrWalkContext { loop_depth: 0, closure_depth: 0, with_ptr_depth: 0, in_trait_or_impl: false, untyped_params: Set() }
+let mut nr_walk: NrWalkContext = NrWalkContext { loop_depth: 0, closure_depth: 0, with_ptr_depth: 0, in_trait_or_impl: false, self_target: -1, untyped_params: Set() }
 let mut nr_warn_unused: Int = 0
 // The E0301 region-boundary check must run ONLY in the type-inference
 // pass (tc_check_fn/tc_check_body), where annotations are honored (final_tid =
@@ -30405,7 +30472,8 @@ fn tc_path_members_listed(written: Str, members: List[PathMember]) -> Str {
 // (`form` 0) or a call (`form` 1), on the member name (§3.4 *An unknown member of a type
 // path*). The fix renames the member only when the rewritten site type-checks: the help
 // names the candidate either way.
-fn tc_report_unknown_member(node: Int, written: Str, head: StaticHead, member: Str, form: Int) ! Diag.Report {
+fn tc_report_unknown_member(node: Int, as_written: Str, head: StaticHead, member: Str, form: Int) ! Diag.Report {
+    let written = tc_shown_head(as_written)
     let members = tc_path_members(written, head)
     let nearest = tc_nearest_path_member(member, members)
     let near = nearest.name
@@ -30442,7 +30510,7 @@ fn tc_report_unknown_member(node: Int, written: Str, head: StaticHead, member: S
         notes.push("{said} `{member}`, and `{written}` does not implement it")
     }
     let line = node_line(node)
-    let col = tc_qualified_name_col(node, written, member)
+    let col = tc_qualified_name_col(node, as_written, member)
     let start = if col == -1 { node_col(node) } else { col }
     let end = start + member.byte_len()
     let before = diag_entry_count()
@@ -31440,8 +31508,9 @@ fn tc_report_method_through_type_name(node: Int, qual: Str, name: Str) -> Bool !
     let start = if col == -1 { node_col(node) } else { col }
     let end = start + name.byte_len()
     let before = diag_entry_count()
-    // The head is named as it is written (`Self`, an alias), since the fix edits that text.
-    diag_error_span_label_at_notes("MethodThroughTypeName", METHOD_THROUGH_TYPE_NAME, "`{name}` is a method of `{qual}`, not a function of the type", node, line, start, end, "`{name}` takes its receiver before the dot", r.helps.join("\n"), r.notes)
+    // An alias is named as it is written, since the fix edits that text. `Self` in an impl body
+    // is named as its target, so the error reads as it does with the type name (§3.6).
+    diag_error_span_label_at_notes("MethodThroughTypeName", METHOD_THROUGH_TYPE_NAME, "`{name}` is a method of `{tc_shown_head(qual)}`, not a function of the type", node, line, start, end, "`{name}` takes its receiver before the dot", r.helps.join("\n"), r.notes)
     if r.fix_text != "" {
         let args = node_args(node)
         let site = tc_type_head_call_site(node, qual, sublist_get(args, sublist_length(args) - 1))
@@ -31652,7 +31721,7 @@ fn tc_read_help(closures: List[Str], owners: List[SelfMethodOwner], several: Boo
 }
 
 fn tc_emit_method_read(node: Int, qual: Str, name: Str, start: Int, help: Str) ! Diag.Report {
-    diag_error_span_label_at_notes("MethodThroughTypeName", METHOD_THROUGH_TYPE_NAME, "`{name}` is a method of `{qual}`, not a function of the type", node, node_line(node), start, start + name.byte_len(), "`{name}` takes its receiver before the dot", help, [])
+    diag_error_span_label_at_notes("MethodThroughTypeName", METHOD_THROUGH_TYPE_NAME, "`{name}` is a method of `{tc_shown_head(qual)}`, not a function of the type", node, node_line(node), start, start + name.byte_len(), "`{name}` takes its receiver before the dot", help, [])
 }
 
 // A read through a generic head, at each walk of it. At an expected function type the report is
@@ -31935,7 +32004,7 @@ fn resolve_names(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repor
     nr_name_top.clear()
     nr_scope_frames = []
     nr_scope_depth = 0
-    nr_walk = NrWalkContext { loop_depth: 0, closure_depth: 0, with_ptr_depth: 0, in_trait_or_impl: false, untyped_params: Set() }
+    nr_walk = NrWalkContext { loop_depth: 0, closure_depth: 0, with_ptr_depth: 0, in_trait_or_impl: false, self_target: -1, untyped_params: Set() }
     nr_warn_unused = 1
     nr_impl_type_names = []
     nr_impl_method_names = []
@@ -32167,6 +32236,9 @@ fn resolve_names(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repor
             let im = sublist_get(impls_sl, i)
             nr_current_module = node_module(im)
             nr_walk.in_trait_or_impl = true
+            let recv = tc_impl_recv_tid(im)
+            nr_walk.self_target = -1
+            if recv >= 0 { nr_walk.self_target = resolve_alias_tid(recv) }
             nr_check_impl_trait_ref(im)
             let methods_sl = node_methods(im)
             let impl_binders_sl = node_impl_binders(im)
@@ -32184,6 +32256,7 @@ fn resolve_names(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repor
                 }
             }
             tc_pop_tparam_scope(impl_binders_sl)
+            nr_walk.self_target = -1
             nr_walk.in_trait_or_impl = false
             i = i + 1
         }
@@ -32676,6 +32749,58 @@ fn nr_refuse_self_outside(name: Str, at: Int) -> Bool ! Diag.Report {
     let (line, col) = tc_written_name_start(at)
     tc_report_refused_self(at, line, col, "`Self` outside trait or impl", "`Self` is only valid inside trait declarations and impl blocks", "")
     true
+}
+
+// Whether `node` is `Self.V`: a member of `Self` whose name is uppercase. An uppercase member
+// (Unicode Lu or Lt) of a type is a variant, a type-scoped constant or an associated type,
+// never a fn (§3.4 *Member case*). tc_name_is_upper's ASCII test gives the same answer, because
+// an identifier is ASCII. `Self` in a trait has no constants: `const T.X` needs a type the
+// module declares, and `Self` is no such type (§2.12.3). The trait's own associated types,
+// `assoc`, are types and no shape, so a path through one is left to inference.
+fn tc_is_self_variant_path(node: Int, assoc: Set[Str]) -> Bool {
+    let kind = node_kind(node)
+    if kind != NodeKind.FieldAccess && kind != NodeKind.MethodCall { return false }
+    let obj = node_obj(node)
+    let member = if kind == NodeKind.MethodCall { node_method(node) } else { node_name(node) }
+    obj != -1 && node_kind(obj) == NodeKind.Ident && node_name(obj) == "Self" && tc_name_is_upper(member) && !assoc.contains(member)
+}
+
+// In a trait default body `Self` is abstract, so a build form or a pattern that `Self` heads is
+// E0570 at the `Self` token (§3.6). `Self.V(..)` parses as a method call on `Self`.
+fn tc_refuse_self_shape(node: Int, assoc: Set[Str]) ! Diag.Report {
+    let kind = node_kind(node)
+    if kind == NodeKind.FieldAccess || kind == NodeKind.MethodCall {
+        if tc_is_self_variant_path(node, assoc) { tc_report_self_shape(node, node_obj(node)) }
+        return
+    }
+    if kind == NodeKind.Call {
+        let callee = node_left(node)
+        if callee != -1 && node_kind(callee) == NodeKind.Ident && node_name(callee) == "Self" {
+            tc_report_self_shape(node, callee)
+        }
+        return
+    }
+    let head = if kind == NodeKind.StructLit || kind == NodeKind.StructPattern { node_type_name(node) } else if kind == NodeKind.EnumPattern { node_name(node) } else { "" }
+    if tc_names_self(head) { tc_report_self_shape(node, node) }
+}
+
+// A parent is visited before its children, so the reports come in source order.
+fn tc_refuse_self_shapes_in(body: Int, assoc: Set[Str]) ! Diag.Report {
+    if body < 0 { return }
+    tc_refuse_self_shape(body, assoc)
+    for c in node_value_child_ids(body) { tc_refuse_self_shapes_in(c, assoc) }
+}
+
+// One E0570 report at the `Self` token that starts the text of `at`, for the refused `node`.
+fn tc_report_self_shape(node: Int, at: Int) ! Diag.Report {
+    tc_calls.self_refused.insert(node)
+    let (line, col) = tc_written_name_start(at)
+    let title = "`Self` is abstract in a trait default body"
+    tc_errors.push(title)
+    diag_error_span_label_at_notes("SelfShapeInDefaultBody", SELF_SHAPE_IN_DEFAULT_BODY, title, at, line, col, col + 4,
+        "`Self` is abstract in a trait default body; it has no fields or variants to build or match",
+        "declare `fn make() -> Self` in the trait and call `Self.make()`",
+        ["the same form compiles in an impl body, where `Self` is the target type"])
 }
 
 fn tc_names_self(name: Str) -> Bool {
@@ -33846,8 +33971,9 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                     } else if tc_names_type_without_call_form(fn_name) {
                         // Marking the call unresolved keeps the arity check off the same mistake.
                         tc_type_args_unresolved.insert(node, 1)
-                        tc_errors.push("undefined function `{fn_name}`")
-                        diag_error_at("UndefinedFunction", UNDEFINED_FUNCTION, "undefined function `{fn_name}`", node, tc_no_call_form_repair(fn_name))
+                        let shown = if fn_name == "Self" && nr_walk.self_target >= 0 && tc_type_name(nr_walk.self_target) != "" { tc_self_shown(nr_walk.self_target) } else { fn_name }
+                        tc_errors.push("undefined function `{shown}`")
+                        diag_error_at("UndefinedFunction", UNDEFINED_FUNCTION, "undefined function `{shown}`", node, tc_no_call_form_repair(shown))
                     } else if !defined && is_builtin_fn(fn_name) == 0 && is_variant_name(fn_name) == 0 && is_known_type(fn_name) == 0 && is_trait_name(fn_name) == 0 {
                         tc_errors.push("undefined function `{fn_name}`")
                         tc_report_undefined_fn(fn_name, node, callee)
@@ -37986,7 +38112,7 @@ fn tc_infer_struct_lit_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Rep
                     check_deprecated_type(qual, node)
                     if tc_report_unit_variant_braces(qvar, sname, node) { return tc_error_recovery_tid() }
                     tc_check_brace_literal(tc_variant_literal_owner(qvar), node)
-                    if tc_alias_decl_of_written(qual) != -1 {
+                    if tc_head_pins_instance(qual) {
                         return tc_note_open_value(node, tc_alias_brace_variant_tid(qtid, vname, node_fields(node)))
                     }
                     return tc_note_open_value(node, tc_enum_structlit_instance_tid(qtid, vname, node_fields(node)))
@@ -38014,7 +38140,7 @@ fn tc_infer_struct_lit_type(node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Rep
                 //    names (sections/03_types.md §3.4). The hint's enum may come from another
                 //    package, where a variant of the same name is legal (E0518 reach).
                 let in_scope_tid = tc_value_head_tid(sname)
-                if in_scope_tid != -1 && tc_head_constructible_struct(in_scope_tid) != 0 && tc_struct_head_in_scope(sname) {
+                if in_scope_tid != -1 && tc_head_constructible_struct(in_scope_tid) != 0 && (sname == "Self" || tc_struct_head_in_scope(sname)) {
                     check_deprecated_type(sname, node)
                     return tc_struct_lit_at_head(in_scope_tid, node)
                 }
@@ -38395,6 +38521,13 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
     // No node is an absence, not a type. Every caller reads it through tc_tid_is_no_info.
     if node == -1 { return -1 }
     let kind = node_kind(node)
+    // A build form that E0570 refused names no shape to check against. A call's arguments are
+    // typed by infer_type after this returns.
+    let refusable = kind == NodeKind.StructLit || kind == NodeKind.Call || kind == NodeKind.MethodCall || kind == NodeKind.FieldAccess
+    if refusable && tc_calls.self_refused.contains(node) {
+        if kind == NodeKind.StructLit { tc_infer_orphan_field_values(node_fields(node)) }
+        return tc_error_recovery_tid()
+    }
 
     // Scope is live here and nowhere later, so the one question the total-stamp pass cannot
     // answer for itself is settled now: whether this node's callee or qualifier names a value.
@@ -38836,6 +38969,7 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
     if kind == NodeKind.MethodCall {
         let obj_node = node_obj(node)
         let method = node_method(node)
+        tc_note_self_head(node, obj_node)
 
         // A local value shadowing a trait/module name makes `obj.method(args)` an
         // instance call, not a qualified trait call (§03c:590, §10.1:1164). Capture
@@ -38952,7 +39086,7 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
         // step 1), so neither the expected type nor a user enum's namesake variant is asked.
         if obj_node != -1 && node_kind(obj_node) == NodeKind.Ident && nr_receiver_has_binding(node_name(obj_node)) == 0 {
             if tc_qualified_carrier(node_name(obj_node), method).is_some() {
-                if tc_alias_decl_of_written(node_name(obj_node)) != -1 {
+                if tc_head_pins_instance(node_name(obj_node)) {
                     return tc_alias_carrier_call_tid(tc_value_head_tid(node_name(obj_node)), "{node_name(obj_node)}.{method}", method, node_args(node), node)
                 }
                 return tc_carrier_call_tid(method, node_args(node), node)
@@ -38976,11 +39110,12 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
                         if tc_report_unit_variant_parens(cvar_idx, method, node) { return tc_error_recovery_tid() }
                         if tc_report_brace_variant_parens(cvar_idx, "{cname}.{method}", node) { return tc_error_recovery_tid() }
                         tc_check_variant_paren_payload(cvar_idx, method, node)
-                        if tc_alias_decl_of_written(cname) != -1 {
-                            let _ = tc_check_variant_payload_values_at("{cname}.{method}", cvar_idx, cargs_sl, ctor_tid)
+                        let label = "{tc_shown_head(cname)}.{method}"
+                        if tc_head_pins_instance(cname) {
+                            let _ = tc_check_variant_payload_values_at(label, cvar_idx, cargs_sl, ctor_tid)
                             return tc_note_open_value(node, ctor_tid)
                         }
-                        let payload_tids = tc_check_variant_payload_values("{cname}.{method}", cvar_idx, cargs_sl)
+                        let payload_tids = tc_check_variant_payload_values(label, cvar_idx, cargs_sl)
                         // A generic-enum qualified ctor (`Tree.Leaf(1)`) reverse-infers
                         // its concrete instance tid; a non-generic enum keeps the bare
                         // ctor_tid.
@@ -40766,13 +40901,14 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
         let obj_node = node_obj(node)
         let fname = node_name(node)
         if obj_node == -1 { return -1 }
+        tc_note_self_head(node, obj_node)
 
         if node_kind(obj_node) == NodeKind.Ident {
             let obj_name = node_name(obj_node)
             // A value comes first at a dotted head, so a binder named like a type reads its own field.
             let head_is_type = nr_receiver_has_binding(obj_name) == 0
             if head_is_type && tc_qualified_carrier(obj_name, fname).is_some() {
-                if fname == "None" && tc_alias_decl_of_written(obj_name) != -1 {
+                if fname == "None" && tc_head_pins_instance(obj_name) {
                     return tc_note_open_value(node, tc_value_head_tid(obj_name))
                 }
                 return tc_carrier_nullary_tid(fname, "{obj_name}.{fname}", node)
@@ -40811,7 +40947,7 @@ fn infer_type_uncached(node: Int, incoming: Int) -> Int ! TypeCheck.Resolve, Typ
             if tid != -1 && type_kind(tid) == TyKind.Enum {
                 let vi = get_variant_by_name(tc_enum_base_tid(tid), fname)
                 if vi != -1 && variant_field_count(vi) != 0 { return tc_declared_variant_value_tid(tid, vi, "{obj_name}.{fname}", node) }
-                if tc_alias_decl_of_written(obj_name) != -1 { return tc_note_open_value(node, tid) }
+                if tc_head_pins_instance(obj_name) { return tc_note_open_value(node, tid) }
                 return tc_note_open_value(node, tc_nullary_variant_tid(tid, vi))
             }
             // A MODULE qualifier. This arm covers an enum type qualifier, a struct
@@ -43541,6 +43677,9 @@ fn tc_check_type_param_match_exhaustive(node: Int, tv: Int, arms_sl: Int) ! Type
 // no enum is the type at this position.
 fn tc_pattern_covers_type_param(pat: Int) -> Bool {
     if pat == -1 { return false }
+    // A pattern E0570 refused is already an error, and the same text in an impl body can be
+    // irrefutable, so a missing-arm report on it would be a follow-on.
+    if tc_calls.self_refused.contains(pat) { return true }
     let k = node_kind(pat)
     if k == NodeKind.WildcardPattern { return true }
     if k == NodeKind.IdentPattern { return !tc_name_is_upper(node_name(pat)) }
@@ -47309,9 +47448,16 @@ fn tc_pattern_payload_form(pat: Int) -> Int {
 
 // The struct a name declares, as its base tid, or -1.
 fn tc_named_struct_base(name: Str) -> Int ! TypeCheck.Resolve, Diag.Report {
-    let rt = resolve_alias_tid(resolve_type_name(name))
+    let rt = resolve_alias_tid(tc_pattern_head_tid(name))
     if rt == -1 || type_kind(rt) != TyKind.Struct { return -1 }
     tc_struct_base_tid(rt)
+}
+
+// The type a struct pattern's head names. `Self` is the impl's target (§3.6), or -1 where it is
+// abstract.
+fn tc_pattern_head_tid(name: Str) -> Int ! TypeCheck.Resolve, Diag.Report {
+    if name == "Self" { return tc_self_target_tid() }
+    resolve_type_name(name)
 }
 
 // A bare variant name, against the resolved type `h` at its position.
@@ -47358,7 +47504,7 @@ fn tc_non_enum_qualifier(qual: Str, h: Int) -> Option[(Str, Str)] ! TypeCheck.Re
     if qual == "Self" && (rt < 0 || type_kind(rt) == TyKind.Typevar) { return None }
     // A declared type that did not resolve was reported where it went wrong.
     if lookup_named_type(qual) != -1 && (rt < 0 || tc_tid_has_unknown(rt) != 0 || tc_tid_has_orphan_typevar(rt)) { return None }
-    let shown = if h >= 0 && lookup_named_type(qual) == -1 && tc_type_head_name(h) == qual { type_to_str(h) } else { qual }
+    let shown = if h >= 0 && lookup_named_type(qual) == -1 && tc_type_head_name(h) == qual { type_to_str(h) } else { tc_shown_head(qual) }
     if rt < 0 { return Some((shown, "not an enum")) }
     match type_kind(rt) {
         TyKind.Struct => Some((shown, "a struct"))
@@ -47766,7 +47912,9 @@ fn tc_check_pattern_types(node: Int, subject: Str, poisoned: Bool, refutable: Bo
     // and a nested variant pattern were the shapes nothing published for, and codegen asking
     // one of them for its type found no answer at all.
     if tc_pattern_binding_type >= 0 { tc_publish_node_tid(node, tc_pattern_binding_type) }
-    if !poisoned && tc_report_bool_int_pattern(node, tc_pattern_binding_type) { return true }
+    // A pattern E0570 refused has no shape to judge; its binders take the poison type.
+    let refused = tc_calls.self_refused.contains(node)
+    if !poisoned && !refused && tc_report_bool_int_pattern(node, tc_pattern_binding_type) { return true }
     if kind == NodeKind.IntPattern || kind == NodeKind.RangePattern { tc_check_int_pattern_range(node, tc_pattern_binding_type) }
     if kind == NodeKind.RangePattern { tc_check_range_bound_foreign(node) }
     // An uppercase name in a refutable pattern is a variant: it is judged below like `Red(x)`.
@@ -47787,7 +47935,7 @@ fn tc_check_pattern_types(node: Int, subject: Str, poisoned: Bool, refutable: Bo
     }
     // A pattern under a faulted one is not judged: its types are poison, and the one error
     // already covers it.
-    let fault = if poisoned { PatternFault.Clean } else { tc_pattern_fault(node, tc_pattern_binding_type) }
+    let fault = if poisoned || refused { PatternFault.Clean } else { tc_pattern_fault(node, tc_pattern_binding_type) }
     let faulted = match fault {
         PatternFault.Clean => false
         _ => true
@@ -47802,7 +47950,7 @@ fn tc_check_pattern_types(node: Int, subject: Str, poisoned: Bool, refutable: Bo
         _ => false
     }
     if kind == NodeKind.IdentPattern { return covers_nothing }
-    let bad = faulted || poisoned
+    let bad = faulted || poisoned || refused
     let poison = tc_error_recovery_tid()
     let mut child_bad = false
     if kind == NodeKind.EnumPattern {
@@ -47940,7 +48088,7 @@ fn tc_check_pattern_types(node: Int, subject: Str, poisoned: Bool, refutable: Bo
             var_idx = get_variant_by_name(tc_enum_base_tid(tc_tid_resolved(saved_binding)), tname)
         }
         if !bad && var_idx == -1 && struct_tid == -1 {
-            let rt = resolve_type_name(tname)
+            let rt = tc_pattern_head_tid(tname)
             if rt != -1 && type_kind(rt) == TyKind.Struct {
                 struct_tid = rt
             } else if tc_tid_is_no_info(saved_binding) != 0 {
@@ -48596,11 +48744,17 @@ fn tc_check_trait_method_defaults(trait_name: Str, tmethods_sl: Int) ! TypeCheck
     }
 }
 
-fn tc_check_trait_default_bodies(tmethods_sl: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+fn tc_check_trait_default_bodies(trn: Int, tmethods_sl: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    let mut assoc: Set[Str] = Set()
+    let assoc_sl = node_assoc_types(trn)
+    if assoc_sl != -1 {
+        for ai in 0..sublist_length(assoc_sl) { assoc.insert(node_name(sublist_get(assoc_sl, ai))) }
+    }
     let mut mj = 0
     while mj < sublist_length(tmethods_sl) {
         let dm = sublist_get(tmethods_sl, mj)
         if node_body(dm) != -1 {
+            tc_refuse_self_shapes_in(node_body(dm), assoc)
             // sig == -1 leaves tc_check_fn's declared-return install un-run, so
             // set it here (Self resolves to the abstract self typevar) — an
             // explicit `return expr` in the body is checked against it.
@@ -48773,7 +48927,7 @@ fn tc_infer_program_body(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Di
                 // `Self`. Only the operator / method licensing is wanted here.
                 tc_current_method_sig_key = "__trait_default_no_sig__"
                 tc_check_trait_method_defaults(node_name(trn), tmethods_sl)
-                tc_check_trait_default_bodies(tmethods_sl)
+                tc_check_trait_default_bodies(trn, tmethods_sl)
                 tc_current_method_sig_key = ""
                 tc_current_self_tid = -1
                 tc_pop_tparam_scope(node_type_params(trn))

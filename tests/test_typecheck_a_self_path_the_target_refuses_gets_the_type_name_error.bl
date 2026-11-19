@@ -1,0 +1,280 @@
+// In an impl body `Self` is the target type, so a value path or a pattern that `Self` heads
+// gets the same error that the type name gets (sections/03_types.md, `Self` as the head of a
+// value path or a pattern): `Self.Blue` on a `Color` with no `Blue` is E0547, as `Color.Blue`
+// is. Each row checks the `Self` text against the type-name text, and pins where the error
+// points in the `Self` text.
+
+import std.fs
+import std.process.{ProcessResult}
+import compiler.{compile_to_program}
+import typecheck.{check_types, TypeCheck}
+import diagnostics.{diag_entries, diag_reset, Diag}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+import lexer.{Lex}
+import parser.{Parse}
+
+fn typecheck_probe(path: Str, src: Str) ! FS, Env.Exit, Env.Read, IO {
+    with handler Diag {}, handler Lex {}, handler Parse {}, handler TypeCheck {} {
+        init_embedded_stdlib()
+        fs.write(path, src).unwrap()
+        diag_reset()
+        let program = compile_to_program(path, 1)
+        check_types(program)
+        let _ = fs.delete(path)
+    }
+}
+
+// Each error as "name: message | help | notes", in report order.
+fn error_texts(src: Str) -> List[Str] ! FS, Env.Exit, Env.Read, IO {
+    typecheck_probe("build/test_typecheck_a_self_path_the_target_refuses_probe.bl", src)
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" {
+            out.push("{d.name}: {d.message} | {d.help} | {d.notes.join("; ")}")
+        }
+    }
+    out
+}
+
+// Each error as "name line:col-end", in report order.
+fn error_sites(src: Str) -> List[Str] ! FS, Env.Exit, Env.Read, IO {
+    typecheck_probe("build/test_typecheck_a_self_path_the_target_refuses_probe.bl", src)
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" {
+            out.push("{d.name} {d.line}:{d.col}-{d.end_col}")
+        }
+    }
+    out
+}
+
+fn sh(cmd: Str) -> ProcessResult ! Process.Spawn {
+    process.run("sh", ["-c", cmd]).unwrap()
+}
+
+// Each error of a package whose src/main.bl is `main_src` and whose src/shapes.bl is
+// `shapes_src`, as "name: message", in report order.
+fn package_errors(shapes_src: Str, main_src: Str) -> List[Str] ! FS, Process.Spawn, Env.Exit, Env.Read, IO {
+    let mut out: List[Str] = []
+    with handler Diag {}, handler Lex {}, handler Parse {}, handler TypeCheck {} {
+        init_embedded_stdlib()
+        let dir = sh("mktemp -d /tmp/blink_self_path_target.XXXXXX").out.trim()
+        let _ = sh("mkdir -p {dir}/src")
+        fs.write("{dir}/blink.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\n").unwrap()
+        fs.write("{dir}/src/shapes.bl", shapes_src).unwrap()
+        let main_path = "{dir}/src/main.bl"
+        fs.write(main_path, main_src).unwrap()
+        diag_reset()
+        let program = compile_to_program(main_path, 1)
+        check_types(program)
+        for d in diag_entries {
+            if d.severity == "error" || d.severity == "ice" { out.push("{d.name}: {d.message}") }
+        }
+        let _ = sh("rm -rf {dir}")
+    }
+    out
+}
+
+fn decls() -> Str {
+    "type Color \{\n    Red\n    Rgb(Int)\n}\n\ntype Point \{\n    x: Int\n    y: Int\n}\n\ntrait Mk \{\n    fn make(n: Int) -> Self\n}\n\n"
+}
+
+// A generic struct and one impl over it, whose `again` has `body` after it binds `x: T`. The
+// body starts at line 12.
+fn generic_src(body: Str) -> Str {
+    "type Box[T] \{\n    v: T\n}\n\ntrait Again \{\n    fn again(self) -> Self\n}\n\nimpl[T] Again for Box[T] \{\n    fn again(self) -> Self \{\n        let x = self.v\n{body}\n    }\n}\n\nfn main() \{}\n"
+}
+
+// A generic enum and one impl over it, whose `again` has `body` in the arm that binds `x: T`.
+// The body starts at line 15.
+fn generic_enum_src(body: Str) -> Str {
+    "type Opt[T] \{\n    Just(T)\n    Nothing\n    Pair \{ a: T }\n}\n\ntrait Again \{\n    fn again(self) -> Self\n}\n\nimpl[T] Again for Opt[T] \{\n    fn again(self) -> Self \{\n        match self \{\n            Opt.Just(x) => \{\n{body}\n            }\n            _ => self\n        }\n    }\n}\n\nfn main() \{}\n"
+}
+
+// `decls` and one impl of Mk for `target`, whose `make` has `body`. The impl starts at line 15.
+fn impl_src(target: Str, body: Str) -> Str {
+    "{decls()}impl Mk for {target} \{\n    fn make(n: Int) -> Self \{\n{body}\n    }\n}\n\nfn main() \{}\n"
+}
+
+test "a Self.V the target enum lacks is the e0547 of the type name" {
+    let with_self = impl_src("Color", "        let _k = n\n        Self.Blue")
+    let with_name = impl_src("Color", "        let _k = n\n        Color.Blue")
+    assert_eq(error_texts(with_self), error_texts(with_name))
+    assert_eq(error_texts(with_self), ["NoSuchVariant: `Color` has no variant `Blue` | `Color` declares: Red, Rgb | "])
+    assert_eq(error_sites(with_self), ["NoSuchVariant 18:14-18"])
+}
+
+test "a Self.V(..) the target enum lacks is the error of the type name" {
+    let with_self = impl_src("Color", "        Self.Hsv(n)")
+    let with_name = impl_src("Color", "        Color.Hsv(n)")
+    let texts = error_texts(with_self)
+    assert_eq(texts, error_texts(with_name))
+    assert_eq(texts.len(), 1)
+}
+
+test "a Self struct build with a field the target lacks is the e0525 of the type name" {
+    let with_self = impl_src("Point", "        Self \{ x: n, y: n, z: n }")
+    let with_name = impl_src("Point", "        Point \{ x: n, y: n, z: n }")
+    let texts = error_texts(with_self)
+    assert_eq(texts, error_texts(with_name))
+    assert_eq(texts.len(), 1)
+    assert(texts.get(0).unwrap().starts_with("NoSuchField: `Point` has no field `z`"))
+    assert_eq(error_sites(with_self), ["NoSuchField 17:28-0"])
+}
+
+test "a Self struct build that leaves out a field is the error of the type name" {
+    let with_self = impl_src("Point", "        Self \{ x: n }")
+    let with_name = impl_src("Point", "        Point \{ x: n }")
+    let texts = error_texts(with_self)
+    assert_eq(texts, error_texts(with_name))
+    assert_eq(texts.len(), 1)
+}
+
+test "a call of Self on a struct target is the e0504 of the type name, at Self" {
+    let with_self = impl_src("Point", "        Self(n)")
+    let with_name = impl_src("Point", "        Point(n)")
+    let texts = error_texts(with_self)
+    assert_eq(texts, error_texts(with_name))
+    assert_eq(texts.len(), 1)
+    assert(texts.get(0).unwrap().starts_with("UndefinedFunction: "))
+    let sites = error_sites(with_self)
+    assert_eq(sites.len(), 1)
+    assert(sites.get(0).unwrap().starts_with("UndefinedFunction 17:9-"))
+}
+
+test "a Self.V pattern the target enum lacks is the error of the type name" {
+    let body = "        match Color.Red \{\n            Self.Blue => Color.Red\n            _ => Color.Rgb(n)\n        }"
+    let with_self = impl_src("Color", body)
+    let with_name = impl_src("Color", body.replace("Self.Blue", "Color.Blue"))
+    let texts = error_texts(with_self)
+    assert_eq(texts, error_texts(with_name))
+    assert_eq(texts.len(), 1)
+}
+
+test "a Self struct pattern with a field the target lacks is the error of the type name" {
+    let body = "        let p = Point \{ x: n, y: n }\n        match p \{\n            Self \{ x, z } => Point \{ x: x, y: z }\n        }"
+    let with_self = impl_src("Point", body)
+    let with_name = impl_src("Point", body.replace("Self \{ x, z }", "Point \{ x, z }"))
+    let texts = error_texts(with_self)
+    assert_eq(texts, error_texts(with_name))
+    assert_eq(texts.len(), 1)
+}
+
+test "a static call through Self of a fn the target lacks is the error of the type name" {
+    let with_self = impl_src("Color", "        Self.nope(n)")
+    let with_name = impl_src("Color", "        Color.nope(n)")
+    let texts = error_texts(with_self)
+    assert_eq(texts, error_texts(with_name))
+    assert_eq(texts.len(), 1)
+}
+
+test "Self and the type name in one impl body are both legal" {
+    let src = impl_src("Color", "        if n == 0 \{ Self.Red } else \{ Color.Rgb(n) }")
+    assert_eq(error_texts(src), [])
+}
+
+test "in a generic impl Self is the target at its own type parameters, so a field of T refuses an Int" {
+    let src = generic_src("        let _x = x\n        Self \{ v: 1 }")
+    let texts = error_texts(src)
+    assert_eq(texts.len(), 1)
+    assert(texts.get(0).unwrap().starts_with("TypeError: field `v` of `Box[T]`: declared type T but got Int"))
+    assert_eq(error_sites(src), ["TypeError 13:19-0"])
+}
+
+test "in a generic impl a Self struct build from a value of T passes" {
+    assert_eq(error_texts(generic_src("        Self \{ v: x }")), [])
+}
+
+test "a Self.V on a struct target is the no-variants error of the type name" {
+    let with_self = impl_src("Point", "        let _k = n\n        Self.Zed")
+    let with_name = impl_src("Point", "        let _k = n\n        Point.Zed")
+    let texts = error_texts(with_self)
+    assert_eq(texts, error_texts(with_name))
+    assert_eq(texts.len(), 1)
+    assert(texts.get(0).unwrap().starts_with("NoSuchVariant: `Point` is a struct; it has no variants"))
+}
+
+test "a Self.V(..) on a struct target is the no-variants error of the type name" {
+    let with_self = impl_src("Point", "        Self.Zed(n)")
+    let with_name = impl_src("Point", "        Point.Zed(n)")
+    let texts = error_texts(with_self)
+    assert_eq(texts, error_texts(with_name))
+    assert(texts.get(0).unwrap().starts_with("NoSuchVariant: `Point` is a struct; it has no variants"))
+}
+
+test "a Self.V on a builtin scalar target is the not-an-enum error of the type name" {
+    let with_self = impl_src("Int", "        let _k = n\n        Self.Zed")
+    let with_name = impl_src("Int", "        let _k = n\n        Int.Zed")
+    let texts = error_texts(with_self)
+    assert_eq(texts, error_texts(with_name))
+    assert_eq(texts.len(), 1)
+    assert(texts.get(0).unwrap().starts_with("NoSuchVariant: `Int` is not an enum; it has no variants"))
+}
+
+test "a Self.V pattern on a struct target is the no-variants error of the type name" {
+    let body = "        let p = Point \{ x: n, y: n }\n        match p \{\n            Self.Zed => p\n            _ => p\n        }"
+    let with_self = impl_src("Point", body)
+    let with_name = impl_src("Point", body.replace("Self.Zed", "Point.Zed"))
+    let texts = error_texts(with_self)
+    assert_eq(texts, error_texts(with_name))
+    assert_eq(texts.len(), 1)
+    assert(texts.get(0).unwrap().starts_with("NoSuchVariant: `Point` is a struct; it has no variants"))
+}
+
+test "a method called through Self in an impl is the e0567 of the type name" {
+    let src = "{decls()}trait Code \{\n    fn code(self) -> Int\n    fn twice(self) -> Int\n}\n\nimpl Code for Color \{\n    fn code(self) -> Int \{ 1 }\n    fn twice(self) -> Int \{ Self.code(self) * 2 }\n}\n\nfn main() \{}\n"
+    let texts = error_texts(src)
+    assert_eq(texts, error_texts(src.replace("Self.code(self)", "Color.code(self)")))
+    assert_eq(texts.len(), 1)
+    assert(texts.get(0).unwrap().starts_with("MethodThroughTypeName: `code` is a method of `Color`, not a function of the type"))
+}
+
+test "a Self target that another module also declares is shown as its own module writes it" {
+    let shapes = "pub type Point \{\n    x: Int\n    y: Int\n}\n\npub trait Mk \{\n    fn make(n: Int) -> Self\n}\n\nimpl Mk for Point \{\n    fn make(n: Int) -> Self \{\n        Self(n)\n    }\n}\n"
+    let main = "import shapes\n\ntype Point \{\n    z: Int\n}\n\nfn main() \{\n    let _p = Point \{ z: 1 }\n}\n"
+    let texts = package_errors(shapes, main)
+    assert_eq(texts, package_errors(shapes.replace("Self(n)", "Point(n)"), main))
+    assert_eq(texts, ["UndefinedFunction: undefined function `Point`"])
+    let variant = shapes.replace("Self(n)", "let _k = n\n        Self.Zed")
+    let vtexts = package_errors(variant, main)
+    assert_eq(vtexts, package_errors(variant.replace("Self.Zed", "Point.Zed"), main))
+    assert_eq(vtexts.len(), 1)
+}
+
+test "in a generic impl Self.V(..) is the target at its own type parameters, so a payload of T refuses an Int" {
+    let texts = error_texts(generic_enum_src("                let _y = x\n                Self.Just(1)"))
+    assert_eq(texts.len(), 1)
+    assert(texts.get(0).unwrap().starts_with("TypeError: "))
+}
+
+test "in a generic impl a Self.V(..) build from a value of T passes" {
+    assert_eq(error_texts(generic_enum_src("                Self.Just(x)")), [])
+}
+
+test "in a generic impl Self.V is the target at its own type parameters, so it is no Opt of Int" {
+    let texts = error_texts(generic_enum_src("                let _y = x\n                let _c: Opt[Int] = Self.Nothing\n                self"))
+    assert_eq(texts.len(), 1)
+    assert(texts.get(0).unwrap().starts_with("TypeError: "))
+}
+
+test "in a generic impl Self.V with fields is the target at its own type parameters, so a field of T refuses an Int" {
+    let texts = error_texts(generic_enum_src("                let _y = x\n                Self.Pair \{ a: 1 }"))
+    assert_eq(texts.len(), 1)
+    assert(texts.get(0).unwrap().starts_with("TypeError: "))
+}
+
+test "in a generic impl a Self.V with fields built from a value of T passes" {
+    assert_eq(error_texts(generic_enum_src("                Self.Pair \{ a: x }")), [])
+}
+
+test "in a generic impl the bare type name still builds a fresh instance" {
+    assert_eq(error_texts(generic_enum_src("                let _y = x\n                let _c: Opt[Int] = Opt.Just(1)\n                self")), [])
+}
+
+test "a Self.V(..) with a payload of the wrong type is the error of the type name" {
+    let with_self = impl_src("Color", "        let _k = n\n        Self.Rgb(\"x\")")
+    let with_name = impl_src("Color", "        let _k = n\n        Color.Rgb(\"x\")")
+    let texts = error_texts(with_self)
+    assert_eq(texts, error_texts(with_name))
+    assert_eq(texts.len(), 1)
+}
