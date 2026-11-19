@@ -932,7 +932,7 @@ fn sb_write(mut sb: StringBuilder, s: Str)
 - **It binds only runtime symbols.** The symbol must start with `blink_`. A symbol that does not is E0849 too. A C function, in `lib/std` or elsewhere, uses `@ffi`.
 - **It is not under the signature rule.** *Signature Types* applies to every `@ffi` declaration, with no exception.
 - **It is the only binding of a `blink_` symbol.** *A `blink_` Symbol Belongs to the Runtime* below.
-- **It declares a fn or a bodiless type.** `@runtime` on a fn binds a runtime function. `@runtime` on a type with no body declares a handle to a C type that the runtime owns (§9.1.4 *A Runtime-Owned Handle*). The same gates apply to both. `@runtime` on any other target is `UnexpectedAnnotation` (E1110, §11.1).
+- **It declares a fn or a bodiless type.** `@runtime` on a fn binds a runtime function. `@runtime` on a type with no body declares a handle to a C type that the runtime owns (§9.1.4 *A Runtime-Owned Handle*). The same gates apply to both. `@runtime` on any other target, or on a type with a body (empty braces included), is `UnexpectedAnnotation` (E1110, §11.1; §9.1.4 *A Handle Type Has No Body*).
 - **It writes its real effect row.** The row has the same meaning as on any Blink fn: no row means no effects (§4.2). A `@runtime` declaration is not an `@ffi` declaration, so `! ()` on it is `EmptyRowOutsideFfi` (E0564).
 - **It has no body.** The declaration is a signature, as for an `@ffi` fn. The runtime gives the body.
 - **It can be `pub`.** `FfiFunctionPublic` (E0801) applies to `@ffi` only. `lib/std` exports a runtime function directly or through a `pub` wrapper.
@@ -3257,9 +3257,70 @@ error[E1134]: `@ffi.opaque` needs both `header` and `name`
   = help: write `@ffi.opaque(header: "sqlite3.h", name: "sqlite3_blob")`
 ```
 
-`@ffi.opaque(header, name)` declares a **bare nominal, arity-0** handle type that mirrors a named, possibly-incomplete C type. The type has **no body** — no fields, no variants (a body is rejected). `header` and `name` are both required, in every package, `lib/std` included. A missing `header` or a missing `name` is `AnnotationArguments` (E1134) at `blink check`, and the help prints the full form `@ffi.opaque(header: "h.h", name: "c_type")`. A `name` that starts with `blink_` is E0849 (§9.1, *A `blink_` Symbol Belongs to the Runtime*): the handle to a runtime-owned C type uses `@runtime` (*A Runtime-Owned Handle*, below). `header` is resolved against `[native-dependencies].headers` exactly as for `@ffi.struct` (§9.1.3). `name` is the C type the handle points at; the Blink type maps to the C pointer type `name *`. Because the pointee is incomplete, **no size or offset check applies** (the deliberate contrast with `@ffi.struct`, whose whole purpose is a known layout).
+`@ffi.opaque(header, name)` declares a **bare nominal, arity-0** handle type that mirrors a named, possibly-incomplete C type. The type has **no body**: no fields, no variants, and no braces (*A Handle Type Has No Body*, below). `header` and `name` are both required, in every package, `lib/std` included. A missing `header` or a missing `name` is `AnnotationArguments` (E1134) at `blink check`, and the help prints the full form `@ffi.opaque(header: "h.h", name: "c_type")`. A `name` that starts with `blink_` is E0849 (§9.1, *A `blink_` Symbol Belongs to the Runtime*): the handle to a runtime-owned C type uses `@runtime` (*A Runtime-Owned Handle*, below). `header` is resolved against `[native-dependencies].headers` exactly as for `@ffi.struct` (§9.1.3). `name` is the C type the handle points at; the Blink type maps to the C pointer type `name *`. Because the pointee is incomplete, **no size or offset check applies** (the deliberate contrast with `@ffi.struct`, whose whole purpose is a known layout).
 
 Each `@ffi.opaque` declaration is its own **nominal type**. `Sqlite3` and `Sqlite3Stmt` are distinct and never interchangeable, even though both are C pointers at the boundary — the nominal distinctness `Ptr[Void]` could not provide.
+
+#### A Handle Type Has No Body
+
+`@ffi.opaque` and `@runtime` apply the same rule. A handle type has no body. Braces after the name are a body, and a body is `UnexpectedAnnotation` (E1110) at the `{`. This holds for empty braces, for braces that hold only a comment, and for braces that hold fields or variants. A plain `type T {}` with neither annotation is not changed: it is a struct with no fields, and `T {}` builds one. The annotation removes that meaning. A handle type has no literal, so `A {}` is never a value of a handle type.
+
+```blink
+@ffi.opaque(header: "stdio.h", name: "FILE")
+type A                                  // OK: no body
+
+@ffi.opaque(header: "stdio.h", name: "FILE")
+type B {}                               // ERROR E1110: empty braces are a body
+
+@ffi.opaque(header: "stdio.h", name: "FILE")
+type C {
+    // the stream handle of libc
+}                                       // ERROR E1110: a comment does not change this
+
+@ffi.opaque(header: "stdio.h", name: "FILE")
+type D { fd: Int }                      // ERROR E1110: a field is a body
+
+@runtime("blink_x")
+pub type E {}                           // ERROR E1110: the same rule for `@runtime`
+
+type M {}                               // OK: plain type; a struct with no fields
+```
+
+```
+error[E1110]: `@ffi.opaque` does not apply to a type with a body
+ --> app/io.bl:4:8
+  |
+4 | type B {}
+  |        ^ a handle type has no body
+  |
+  = help: write `type B`
+```
+
+The help names the exact text: `type B`. When the braces hold a comment, the help says to move the comment above the annotation and keeps its text. When the body holds a field and the C type has a layout that Blink knows, the help also points to `@ffi.struct` (§9.1.3). `blink fix` and the language server apply the help: they remove the braces, and they move a comment above the annotation with its text unchanged. `blink fmt` does not rewrite the braces. It leaves a type that has the error as it is, and does not change a plain `type M {}`.
+
+```blink
+// before `blink fix`
+@ffi.opaque(header: "stdio.h", name: "FILE")
+type C {
+    // the stream handle of libc
+}
+
+// after `blink fix`
+// the stream handle of libc
+@ffi.opaque(header: "stdio.h", name: "FILE")
+type C
+```
+
+A literal of a handle type is also refused, as *Construction — sealed to the FFI boundary* says below:
+
+```blink
+@ffi.opaque(header: "stdio.h", name: "FILE")
+type A
+
+fn make() -> A {
+    A {}                                // ERROR: a handle type has no literal
+}
+```
 
 #### Flows freely in non-FFI code — containment stays syntactic
 
@@ -3328,7 +3389,7 @@ fn tcp_handle_new(fd: Int) -> TcpHandle             // mints a `TcpHandle`
 pub type Sqlite3
 ```
 
-A bodiless `@runtime` type is a pointer handle: a bare nominal type of arity 0, held as a pointer to the C type `blink_x`. These rules hold:
+A `@runtime` type has no body, and braces are a body (*A Handle Type Has No Body*, above): `@runtime("blink_x") pub type T {}` is E1110. A bodiless `@runtime` type is a pointer handle: a bare nominal type of arity 0, held as a pointer to the C type `blink_x`. These rules hold:
 
 - **The `@runtime` gates apply.** Only `lib/std` may write it, and the symbol must start with `blink_`. Another package, or a symbol with another prefix, is `InvalidRuntimeBinding` (E0849), as for a `@runtime` fn (§9.1, *`@runtime` — The Runtime Bridge*).
 - **The compiler emits no `#include` for it.** The runtime text in the C declares the type. There is no `header` argument and no header lookup, so E0859 does not apply.
